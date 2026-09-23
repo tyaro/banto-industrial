@@ -888,8 +888,58 @@ impl PlcConnectionService {
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
+        let simulation = input.simulation;
+        self.update_with_simulation(id, input, Some(simulation))
+            .await
+    }
+
+    /// Like [`Self::update`], but **leaves the stored `simulation` column as
+    /// it is at the moment of the `UPDATE`** (`input.simulation` is ignored).
+    ///
+    /// chronogazer #413/#417: an update that does not mention `simulation`
+    /// must not change it. Reading the current value first and writing it
+    /// back would race a concurrent explicit toggle (the read-then-write
+    /// window overwrites the newer value), so the preservation happens in
+    /// the `UPDATE` statement itself (`simulation = COALESCE(NULL,
+    /// simulation)`) - there is no separate read of `simulation` at all.
+    ///
+    /// The protocol normalizations still win: a `"postgres"` (or
+    /// `"virtual"`) payload stores `simulation = false` exactly as
+    /// [`Self::update`] would, because those protocols have no meaningful
+    /// simulation (this module's doc comment). Added as a separate method so
+    /// [`Self::update`]'s behaviour (banto-hub, relay-wright) is unchanged.
+    pub async fn update_preserving_simulation(
+        &self,
+        id: i64,
+        input: PlcConnectionInput,
+    ) -> Result<PlcConnection, BantoError> {
+        self.update_with_simulation(id, input, None).await
+    }
+
+    /// Shared body of [`Self::update`] (`simulation = Some(value)`: store
+    /// `value`) and [`Self::update_preserving_simulation`] (`None`: keep the
+    /// stored value at `UPDATE` time).
+    async fn update_with_simulation(
+        &self,
+        id: i64,
+        mut input: PlcConnectionInput,
+        simulation: Option<bool>,
+    ) -> Result<PlcConnection, BantoError> {
+        // Validation/normalization see `false` when the caller keeps the
+        // stored value - `false` is valid for every protocol, and the kept
+        // value was already valid when it was stored.
+        input.simulation = simulation.unwrap_or(false);
         let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
+        // `None` binds SQL NULL -> `COALESCE(NULL, simulation)` keeps the
+        // column. Protocols without a meaningful simulation always store the
+        // normalized value, same as a plain `update`.
+        let simulation_to_store = match simulation {
+            None if input.protocol != POSTGRES_PROTOCOL && input.protocol != VIRTUAL_PROTOCOL => {
+                None
+            }
+            _ => Some(input.simulation),
+        };
 
         let existing: Option<(String, Option<String>)> =
             sqlx::query_as("SELECT protocol, password FROM plc_connections WHERE id = ?")
@@ -921,7 +971,7 @@ impl PlcConnectionService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ?, database = ?, username = ?, password = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = COALESCE(?, simulation), word_order = ?, database = ?, username = ?, password = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
@@ -930,7 +980,7 @@ impl PlcConnectionService {
         .bind(input.port)
         .bind(input.unit_id)
         .bind(input.enabled)
-        .bind(input.simulation)
+        .bind(simulation_to_store)
         .bind(&input.word_order)
         .bind(stored_database)
         .bind(stored_username)
@@ -1378,6 +1428,79 @@ mod tests {
             .await
             .expect("update back to modbus-tcp");
         assert_eq!(updated.protocol, "modbus-tcp");
+    }
+
+    /// chronogazer #417: [`PlcConnectionService::update_preserving_simulation`]
+    /// keeps the column **as stored at `UPDATE` time**, whatever
+    /// `input.simulation` says, while every other field is replaced. The
+    /// "stale" `input.simulation` below stands in for a value a caller read
+    /// before a concurrent explicit toggle: the explicit toggle wins.
+    ///
+    /// Regression check: binding `input.simulation` instead of NULL in the
+    /// preserving path makes the first `assert!` fail.
+    #[tokio::test]
+    async fn update_preserving_simulation_keeps_the_value_stored_at_update_time() {
+        let svc = service().await;
+        let created = svc.create(sample_input("Keeper")).await.unwrap();
+        assert!(!created.simulation);
+
+        // A concurrent explicit toggle lands first...
+        let mut on = sample_input("Keeper");
+        on.simulation = true;
+        assert!(svc.update(created.id, on).await.unwrap().simulation);
+
+        // ...then an update that did not mention simulation (carrying a
+        // stale `false`) must not undo it.
+        let mut stale = sample_input("Keeper renamed");
+        stale.simulation = false;
+        stale.port = 503;
+        let kept = svc
+            .update_preserving_simulation(created.id, stale)
+            .await
+            .expect("update_preserving_simulation");
+        assert!(kept.simulation, "stale value overwrote the explicit toggle");
+        assert_eq!(kept.name, "Keeper renamed", "other fields are replaced");
+        assert_eq!(kept.port, 503);
+
+        // The other direction: an explicit `false` is kept against a stale `true`.
+        let mut off = sample_input("Keeper renamed");
+        off.simulation = false;
+        assert!(!svc.update(created.id, off).await.unwrap().simulation);
+        let mut stale_true = sample_input("Keeper renamed");
+        stale_true.simulation = true;
+        assert!(
+            !svc.update_preserving_simulation(created.id, stale_true)
+                .await
+                .unwrap()
+                .simulation
+        );
+
+        // Missing id: the same NotFound as `update`.
+        let missing = svc
+            .update_preserving_simulation(999_999, sample_input("nobody"))
+            .await;
+        assert!(
+            matches!(missing, Err(BantoError::NotFound { .. })),
+            "{missing:?}"
+        );
+    }
+
+    /// The protocol normalization still wins in the preserving path: a
+    /// `"postgres"` payload stores `simulation = false` like `update` does.
+    #[tokio::test]
+    async fn update_preserving_simulation_still_normalizes_postgres_to_false() {
+        let svc = service().await;
+        let mut sim = sample_input("To postgres");
+        sim.simulation = true;
+        let created = svc.create(sim).await.unwrap();
+        assert!(created.simulation);
+
+        let updated = svc
+            .update_preserving_simulation(created.id, postgres_input("To postgres"))
+            .await
+            .expect("update to postgres");
+        assert_eq!(updated.protocol, POSTGRES_PROTOCOL);
+        assert!(!updated.simulation);
     }
 
     /// [`ALLOWED_PROTOCOLS`] and the SQL `CHECK` are two hand-written copies of

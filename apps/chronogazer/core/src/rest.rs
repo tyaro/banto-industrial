@@ -1750,7 +1750,7 @@ fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoErro
 /// `false` を書いていたが、「実機が無いときに設定できないのは使い物に
 /// ならない」ため。**省略できる**（`Option<bool>`）: **作成で省略 = `false`**
 /// （#413 の前と同じ）、**更新で省略 = 既存行の値を保つ**
-/// （[`plc_connection_update_input`]。#417 監査 P2）。他の項目は更新でも全項目の
+/// （[`update_plc_connection`]。UPDATE の時点の値を保つ - #417）。他の項目は更新でも全項目の
 /// 置き換えのままで、`simulation` だけを例外にしているのは、黙って `false` に
 /// 戻ると**登録済みのホスト（実機）へ実際に接続しに行き、記録も始まる**という
 /// 重い変化になるから - フィールドを知らない呼び出し元（スクリプト・E2E の
@@ -1787,7 +1787,7 @@ impl PlcConnectionPayload {
     /// 作成用の `PlcConnectionInput`。`simulation` の省略は `false`。
     ///
     /// `From` を実装しないのは、作成と更新で省略の意味が違うため - 呼び出し側
-    /// がどちらかを必ず選ぶようにする（更新は [`plc_connection_update_input`]）。
+    /// がどちらかを必ず選ぶようにする（更新は [`update_plc_connection`]）。
     pub fn into_create_input(self) -> PlcConnectionInput {
         let simulation = self.simulation.unwrap_or(false);
         self.into_input(simulation)
@@ -1812,24 +1812,32 @@ impl PlcConnectionPayload {
     }
 }
 
-/// 更新用の `PlcConnectionInput`（#417 監査 P2）。**`simulation` を省略した
-/// 更新は既存行の値を保つ**（他の項目は置き換え - [`PlcConnectionPayload`] の
+/// PLC 接続の更新（#417）。**`simulation` を省略した更新は、UPDATE の時点で
+/// 保存されている値を保つ**（他の項目は置き換え - [`PlcConnectionPayload`] の
 /// doc）。REST の `plc_connections_update` と Tauri の同名コマンドの**両方が
 /// これを呼ぶ** - 経路によって省略の意味が割れないように。
 ///
-/// 省略時だけ既存行を読む（存在しない `id` はここで `NotFound` - 更新そのもの
-/// が返すのと同じ種類）。読んでから書くまでの間に別の更新が `simulation` を
-/// 変えた場合は、こちらが読んだ値で上書きする（他の項目の後勝ちと同じ）。
-pub async fn plc_connection_update_input(
+/// **既存の値を先に読んで書き戻すことはしない**（オーナーレビュー P2）: 読んで
+/// から書くまでの間に別の更新が明示的に切り替えると、読んだ古い値でその切替を
+/// 取り消してしまう（黙って実機へ接続しに行く / 記録されなくなる）。省略時は
+/// `banto_tags::PlcConnectionService::update_preserving_simulation`
+/// （`simulation = COALESCE(NULL, simulation)`）を使い、保持を UPDATE 文
+/// そのものに任せる - `simulation` を読む手順がそもそも無いので、挟み込まれる
+/// 窓が無い。存在しない `id` は `update` と同じ `NotFound`。
+pub async fn update_plc_connection(
     plc_connections: &PlcConnectionService,
     id: i64,
     payload: PlcConnectionPayload,
-) -> Result<PlcConnectionInput, BantoError> {
-    let simulation = match payload.simulation {
-        Some(value) => value,
-        None => plc_connections.get(id).await?.simulation,
-    };
-    Ok(payload.into_input(simulation))
+) -> Result<PlcConnection, BantoError> {
+    match payload.simulation {
+        Some(value) => plc_connections.update(id, payload.into_input(value)).await,
+        // `into_input` に渡す値は使われない（保存されている値が残る）。
+        None => {
+            plc_connections
+                .update_preserving_simulation(id, payload.into_input(false))
+                .await
+        }
+    }
 }
 
 /// `plc_connections` の GET/list/create/update が返す読み取り DTO。
@@ -2086,8 +2094,7 @@ async fn plc_connections_update(
     )
     .await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    let input = plc_connection_update_input(&state.plc_connections, id, input).await?;
-    let updated = state.plc_connections.update(id, input).await?;
+    let updated = update_plc_connection(&state.plc_connections, id, input).await?;
     record_write(
         &state.audit,
         &state.auth,
@@ -4440,8 +4447,8 @@ mod tests {
     /// viewer の変更は 403。監査の `detail` に切替が残る。
     ///
     /// 反証（回帰の検出）: `PlcConnectionResponse` から `simulation` を消すと
-    /// 作成の応答の `assert_eq!` が落ちる。`plc_connection_update_input` の
-    /// `None` 分岐を `false` にすると「省略した更新」の `assert_eq!` が落ちる。
+    /// 作成の応答の `assert_eq!` が落ちる。`update_plc_connection` の
+    /// `None` 分岐を `update`（`false`）にすると「省略した更新」の `assert_eq!` が落ちる。
     /// `plc_connection_audit_detail` から `simulation` を消すと監査の
     /// `assert_eq!` が落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4534,6 +4541,26 @@ mod tests {
         .await;
         assert_eq!(updated["simulation"], false);
 
+        // 明示の切替（false）の**後**に届いた省略更新は、その切替を取り消さない
+        // （UPDATE の時点の値を保つ。オーナーレビュー P2 - 省略更新が先に古い
+        // true を読んでいた場合に相当。読む手順が無いので挟み込む窓は無い）。
+        let after_toggle = body_json(
+            router
+                .clone()
+                .oneshot(put_json(
+                    &format!("/api/plc-connections/{conn_id}"),
+                    &editor,
+                    plc_connection_payload("sim-plc-renamed"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            after_toggle["simulation"], false,
+            "省略更新が先行する明示の切替を取り消した"
+        );
+
         // 存在しない id への省略した更新は従来どおり not_found。
         let missing = router
             .clone()
@@ -4581,8 +4608,11 @@ mod tests {
             values
         };
         assert_eq!(simulations_of("create"), vec![json!(true)]);
-        // 省略した更新（保たれた true）と明示の false の 2 件。
-        assert_eq!(simulations_of("update"), vec![json!(false), json!(true)]);
+        // 省略した更新（保たれた true）・明示の false・切替後の省略更新（false）。
+        assert_eq!(
+            simulations_of("update"),
+            vec![json!(false), json!(false), json!(true)]
+        );
     }
 
     /// `GET /api/simulation-coverage` は viewer が読める（レジストリの読み取りと

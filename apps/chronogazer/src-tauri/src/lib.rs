@@ -39,9 +39,8 @@ use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
-    api_router, audited_credential_verifier, plc_connection_audit_detail,
-    plc_connection_update_input, CollectionGroupPayload, PlcConnectionPayload,
-    PlcConnectionResponse, TagPayload,
+    api_router, audited_credential_verifier, plc_connection_audit_detail, update_plc_connection,
+    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, TagPayload,
 };
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
@@ -1197,7 +1196,7 @@ async fn plc_connections_create_body(
 
 /// `editor`+ (R0 §3.6): create a PLC connection. `input.simulation`
 /// （#413、作成での省略は `false`。更新での省略は既存の値を保つ -
-/// `plc_connection_update_input`）は `chronogazer_core::rest::PlcConnectionPayload`
+/// `update_plc_connection`）は `chronogazer_core::rest::PlcConnectionPayload`
 /// の doc のとおり REST と同じ扱い。
 #[tauri::command]
 async fn plc_connections_create(
@@ -1216,8 +1215,7 @@ async fn plc_connections_update_body(
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
     // #417 監査 P2: `simulation` の省略は既存行の値を保つ（REST と同じ関数）。
-    let input = plc_connection_update_input(&state.plc_connections, id, input).await?;
-    let updated = state.plc_connections.update(id, input).await?;
+    let updated = update_plc_connection(&state.plc_connections, id, input).await?;
     state
         .audit
         .record(AuditEntry {
@@ -3531,7 +3529,7 @@ mod tests {
     ///
     /// 反証（回帰の検出）: `plc_connections_create_body` の監査を
     /// `json!({ "name", "enabled" })`（#413 の前）に戻すと `detail["simulation"]`
-    /// の `assert_eq!` が落ちる。`plc_connection_update_input` を通さず
+    /// の `assert_eq!` が落ちる。`update_plc_connection` を通さず
     /// `None` を `false` にすると「省略した更新」の `assert!` が落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plc_connection_simulation_is_saved_returned_and_audited_over_tauri() {
@@ -3574,6 +3572,17 @@ mod tests {
                 .expect("editor は切り替えられる");
         assert!(!updated.simulation);
 
+        // 明示の切替（false）の後に届いた省略更新は、その切替を取り消さない
+        // （UPDATE の時点の値を保つ。REST 側の双子と同じ主張）。
+        let after_toggle =
+            plc_connections_update_body(&state, created.id, sim_payload("renamed", None))
+                .await
+                .expect("editor は更新できる");
+        assert!(
+            !after_toggle.simulation,
+            "省略更新が先行する明示の切替を取り消した"
+        );
+
         let missing = plc_connections_update_body(&state, 999_999, sim_payload("x", None)).await;
         assert!(
             matches!(missing, Err(BantoError::NotFound { .. })),
@@ -3603,10 +3612,14 @@ mod tests {
             values
         };
         assert_eq!(simulations_of("create"), vec![serde_json::json!(true)]);
-        // 省略した更新（保たれた true）と明示の false の 2 件。
+        // 省略した更新（保たれた true）・明示の false・切替後の省略更新（false）。
         assert_eq!(
             simulations_of("update"),
-            vec![serde_json::json!(false), serde_json::json!(true)]
+            vec![
+                serde_json::json!(false),
+                serde_json::json!(false),
+                serde_json::json!(true)
+            ]
         );
 
         *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
