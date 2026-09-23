@@ -45,7 +45,7 @@ use chronogazer_core::rest::{
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
-    ensure_tag_fits_its_connection,
+    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, TagPlacement,
 };
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
@@ -1441,12 +1441,18 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
     let actor = require_role(state, Role::Editor, "tags").await?;
     // #414 段階1: REST の `tags_update` と同じ検査（両経路対称）。所属
     // グループを変える更新も、入力のグループから接続を辿るので同じ検査で拾う。
-    ensure_tag_fits_its_connection(
+    // 読む場所を変えずに無効化するだけの更新は検査しない（#418 P2）。
+    ensure_tag_update_fits_its_connection(
         &state.plc_connections,
         &state.collection_groups,
-        input.collection_group_id,
-        &input.address,
-        &input.data_type,
+        &state.tags,
+        id,
+        TagPlacement {
+            collection_group_id: input.collection_group_id,
+            address: &input.address,
+            data_type: &input.data_type,
+            enabled: input.enabled,
+        },
     )
     .await?;
     let updated = state.tags.update(id, input.into()).await?;
@@ -3725,5 +3731,79 @@ mod tests {
         );
         assert_eq!(field_error.field, "plcConnectionId");
         assert_eq!(field_error.message, "指定されたPLC接続が見つかりません");
+    }
+
+    /// **#418 オーナーレビュー P2 の回帰固定（Tauri 経路）**: 検査より前に
+    /// 保存された不正タグを、読む場所を変えずに無効化するだけの更新は通り、
+    /// 保存され、その後の `build_config` が成功して正常なタグだけが残る。
+    /// アドレスを直さずに再有効化すると、引き続き拒否される。
+    ///
+    /// 反証: `tags_update_body` の `ensure_tag_update_fits_its_connection` を
+    /// 無条件の `ensure_tag_fits_its_connection` に戻すと、無効化の
+    /// `expect` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabling_a_legacy_bad_tag_is_allowed_and_reenabling_is_refused() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let conn = state
+            .plc_connections
+            .create(connection_payload("modbus", "modbus-tcp").into())
+            .await
+            .expect("create connection");
+        let group = state
+            .collection_groups
+            .create(
+                CollectionGroupPayload {
+                    name: "group".to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 1000,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create collection group");
+        // 正常なタグと、検査より前に保存された不正なタグ（既存データ）。
+        state
+            .tags
+            .create(tag_payload("good", group.id, "40001").into())
+            .await
+            .expect("create good tag");
+        let legacy = state
+            .tags
+            .create(tag_payload("legacy", group.id, "D3000").into())
+            .await
+            .expect("create legacy tag");
+        assert!(
+            banto_collect::build_config(&state.pool).await.is_err(),
+            "前提が崩れている: 不正タグがあるのに build_config が通る"
+        );
+
+        // 無効化するだけの更新は通り、保存される。
+        let mut disable = tag_payload("legacy", group.id, "D3000");
+        disable.enabled = false;
+        tags_update_body(&state, legacy.id, disable)
+            .await
+            .expect("無効化だけの更新が拒否された");
+        assert!(!state.tags.get(legacy.id).await.unwrap().enabled);
+
+        // その後の build_config は成功し、正常なタグだけが収集対象に残る。
+        let config = banto_collect::build_config(&state.pool)
+            .await
+            .expect("不正タグを無効化した後は build_config が通ること");
+        assert_eq!(config.tag_count(), 1);
+
+        // アドレスを直さずに再有効化すると、引き続き拒否される。
+        let err = tags_update_body(&state, legacy.id, tag_payload("legacy", group.id, "D3000"))
+            .await
+            .expect_err("アドレスを直さない再有効化が通った");
+        assert_eq!(only_field_error(err).field, "address");
+        assert!(!state.tags.get(legacy.id).await.unwrap().enabled);
     }
 }

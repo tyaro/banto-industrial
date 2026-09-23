@@ -23,9 +23,13 @@
 //!
 //! ## 呼ぶ経路（REST と Tauri の両方）
 //!
-//! - タグの作成・更新: [`ensure_tag_fits_its_connection`]。更新で収集
+//! - タグの作成: [`ensure_tag_fits_its_connection`]。
+//! - タグの更新: [`ensure_tag_update_fits_its_connection`]。更新で収集
 //!   グループを変える（別プロトコルの接続の下へ移る）場合も、入力の
-//!   `collection_group_id` から辿るので同じ関数で拾える。
+//!   `collection_group_id` から辿るので同じ検査で拾える。ただし**読む場所
+//!   （グループ・アドレス・データ型）を変えずに無効化する**更新は検査しない
+//!   （[`update_needs_address_check`]。既存の不正タグを無効化するだけの
+//!   復旧操作を止めないため - #418 オーナーレビュー P2）。
 //! - 接続のプロトコル変更: [`ensure_protocol_change_keeps_tags_readable`]。
 //!   配下に新プロトコルで読めないタグがあれば、どのタグかを列挙して拒否する。
 //!   プロトコルが変わらない更新（名前・ホストの変更など）では調べない -
@@ -87,12 +91,20 @@ pub fn unreadable_tags<'a>(protocol: &str, tags: &[&'a Tag]) -> Vec<(&'a Tag, Ta
 }
 
 /// 読めなくなるタグの一覧（上限 [`LISTED_TAGS_LIMIT`] 件＋「ほか N 件」）を
-/// 「{lead}タグ N 件が読めなくなります: …。先にタグのアドレスを直して
-/// ください」の形で `field` に載せる。プロトコル変更とグループの接続変更で
-/// 文言の形を揃えるための共通部分。`conflicts` が空なら `None`。
+/// 「{lead}タグ N 件が読めなくなります: …。{remedy}」の形で `field` に
+/// 載せる。プロトコル変更とグループの接続変更で文言の形を揃えるための
+/// 共通部分。`conflicts` が空なら `None`。
+///
+/// `remedy` は**実際に通る手順**だけを書く（#418 オーナーレビュー P3）。
+/// 「先にアドレスだけ直す」はタグ側の保存時検査（今の接続のプロトコルで
+/// 読めるか）に弾かれ、「先に接続・グループを変える」はこの検査に弾かれる
+/// ので、どちらも案内しない。通るのは「移動先のプロトコルの接続と収集
+/// グループを別に用意し、各タグの所属グループとアドレスを**同時に**変える」
+/// こと（1 回の更新で、新しい所属先のプロトコルに対して検査される）。
 fn unreadable_tags_error(
     field: &str,
     lead: &str,
+    remedy: &str,
     conflicts: &[(&Tag, TagAddressIssue)],
 ) -> Option<BantoError> {
     if conflicts.is_empty() {
@@ -110,7 +122,7 @@ fn unreadable_tags_error(
         field_errors: vec![FieldError {
             field: field.to_string(),
             message: format!(
-                "{lead}タグ {} 件が読めなくなります: {}。先にタグのアドレスを直してください",
+                "{lead}タグ {} 件が読めなくなります: {}。{remedy}",
                 conflicts.len(),
                 listed.join("、")
             ),
@@ -127,6 +139,12 @@ pub fn protocol_change_error(
     unreadable_tags_error(
         "protocol",
         &format!("プロトコルを {new_protocol} に変更すると、この接続の下の"),
+        &format!(
+            "これらのタグが残っている間は、この接続のままプロトコルを変えることは\
+             できません。{new_protocol} の PLC接続と収集グループを別に作り、各タグの\
+             「収集グループ」と「デバイスアドレス」を同時に変えて移してください\
+             （不要なタグは削除してもかまいません）"
+        ),
         conflicts,
     )
 }
@@ -142,6 +160,12 @@ pub fn group_move_error(
     unreadable_tags_error(
         "plcConnectionId",
         &format!("PLC接続を {new_connection_name}（{new_protocol}）に変更すると、このグループの"),
+        &format!(
+            "これらのタグが残っている間は、このグループのまま接続を付け替えることは\
+             できません。{new_connection_name} の下に収集グループを別に作り、各タグの\
+             「収集グループ」と「デバイスアドレス」を同時に変えて移してください\
+             （不要なタグは削除してもかまいません）"
+        ),
         conflicts,
     )
 }
@@ -171,6 +195,72 @@ pub async fn ensure_tag_fits_its_connection(
     };
     check_tag_address(&connection.protocol, address, data_type)
         .map_err(|issue| issue_to_validation_error(&issue))
+}
+
+/// タグの「どこを読むか」と有効フラグ - [`update_needs_address_check`] の入力。
+#[derive(Debug, Clone, Copy)]
+pub struct TagPlacement<'a> {
+    pub collection_group_id: i64,
+    pub address: &'a str,
+    pub data_type: &'a str,
+    pub enabled: bool,
+}
+
+/// 純関数: タグの更新で、アドレスの検査が要るか（#418 オーナーレビュー P2）。
+///
+/// **所属グループ・アドレス・データ型が更新前と同じで、更新後に無効なら
+/// 検査しない**。それ以外（どれかが変わる、または更新後に有効）は検査する。
+///
+/// - 既存の不正タグ（検査より前に保存されたもの）を**無効化するだけ**の
+///   更新を通すため。`build_config_from` は無効なタグを収集対象から外すので、
+///   これは不正な設定を持ち込む操作ではなく、正常なタグの収集を再開する
+///   ための安全な復旧操作。
+/// - 無効のままの名前・単位などの編集も同じ理由で通す（無効なタグは収集の
+///   対象外。読む場所が変わらない以上、検査しても新しく分かることは無い）。
+/// - 再有効化（false → true）は検査する。有効にした瞬間に収集開始を止める
+///   ため。読む場所（グループ・アドレス・データ型）の変更も、有効・無効を
+///   問わず検査する - 新しい値を持ち込む更新だから。
+pub fn update_needs_address_check(before: &TagPlacement, after: &TagPlacement) -> bool {
+    let placement_unchanged = before.collection_group_id == after.collection_group_id
+        && before.address == after.address
+        && before.data_type == after.data_type;
+    !(placement_unchanged && !after.enabled)
+}
+
+/// タグの更新の前に呼ぶ: 更新前の行と比べ、[`update_needs_address_check`] が
+/// 検査を求めるときだけ [`ensure_tag_fits_its_connection`] を呼ぶ。
+///
+/// 更新前の行が見つからない場合は `Ok(())` で、`TagService::update` 自身の
+/// `NotFound` に任せる。
+pub async fn ensure_tag_update_fits_its_connection(
+    connections: &PlcConnectionService,
+    groups: &CollectionGroupService,
+    tags: &TagService,
+    tag_id: i64,
+    after: TagPlacement<'_>,
+) -> Result<(), BantoError> {
+    let before = match tags.get(tag_id).await {
+        Ok(tag) => tag,
+        Err(BantoError::NotFound { .. }) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let before_placement = TagPlacement {
+        collection_group_id: before.collection_group_id,
+        address: &before.address,
+        data_type: &before.data_type,
+        enabled: before.enabled,
+    };
+    if !update_needs_address_check(&before_placement, &after) {
+        return Ok(());
+    }
+    ensure_tag_fits_its_connection(
+        connections,
+        groups,
+        after.collection_group_id,
+        after.address,
+        after.data_type,
+    )
+    .await
 }
 
 /// 接続の更新の前に呼ぶ: プロトコルが変わるなら、この接続の下の全タグ
@@ -385,6 +475,113 @@ mod tests {
         assert!(message.contains("「t5」（40005）"), "{message}");
         assert!(!message.contains("「t6」"), "{message}");
         assert!(message.contains("ほか 1 件"), "{message}");
+    }
+
+    /// #418 P2: 更新で検査が要るかの判定表。読む場所（グループ・アドレス・
+    /// データ型）が変わらず、更新後に無効なときだけ検査しない。
+    #[test]
+    fn update_needs_address_check_table() {
+        let at = |group: i64, address: &'static str, data_type: &'static str, enabled: bool| {
+            TagPlacement {
+                collection_group_id: group,
+                address,
+                data_type,
+                enabled,
+            }
+        };
+        let before_enabled = at(1, "D3000", "i16", true);
+        let before_disabled = at(1, "D3000", "i16", false);
+        let table: &[(&str, TagPlacement, TagPlacement, bool)] = &[
+            // 無効化するだけ（既存の不正タグの復旧操作）: 検査しない。
+            (
+                "無効化だけ",
+                before_enabled,
+                at(1, "D3000", "i16", false),
+                false,
+            ),
+            // 無効のまま名前・単位などだけ変える: 検査しない（入力に現れない）。
+            (
+                "無効のまま",
+                before_disabled,
+                at(1, "D3000", "i16", false),
+                false,
+            ),
+            // 再有効化: 検査する。
+            (
+                "再有効化",
+                before_disabled,
+                at(1, "D3000", "i16", true),
+                true,
+            ),
+            // 有効のまま（名前などの変更）: 検査する。
+            (
+                "有効のまま",
+                before_enabled,
+                at(1, "D3000", "i16", true),
+                true,
+            ),
+            // 読む場所を変える: 無効にしても検査する。
+            (
+                "アドレス変更+無効",
+                before_enabled,
+                at(1, "D3001", "i16", false),
+                true,
+            ),
+            (
+                "データ型変更+無効",
+                before_enabled,
+                at(1, "D3000", "u16", false),
+                true,
+            ),
+            (
+                "グループ変更+無効",
+                before_enabled,
+                at(2, "D3000", "i16", false),
+                true,
+            ),
+            (
+                "アドレス変更+有効",
+                before_disabled,
+                at(1, "40001", "i16", true),
+                true,
+            ),
+        ];
+        for (label, before, after, expected) in table {
+            assert_eq!(
+                update_needs_address_check(before, after),
+                *expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// #418 P3: 拒否理由の案内は、実際に通る手順（移動先の接続・グループを
+    /// 用意し、所属グループとアドレスを同時に変える）で、「先にアドレスだけ
+    /// 直す」とは読めないこと。
+    #[test]
+    fn refusal_messages_guide_a_procedure_that_actually_passes() {
+        let tags = [tag(1, "t1", "D100", "i16")];
+        let refs: Vec<&Tag> = tags.iter().collect();
+        let conflicts = unreadable_tags("modbus-tcp", &refs);
+        for (err, same_entity) in [
+            (
+                protocol_change_error("modbus-tcp", &conflicts).unwrap(),
+                "この接続のままプロトコルを変えることはできません",
+            ),
+            (
+                group_move_error("plc2", "modbus-tcp", &conflicts).unwrap(),
+                "このグループのまま接続を付け替えることはできません",
+            ),
+        ] {
+            let message = field_errors(err).remove(0).message;
+            assert!(message.contains(same_entity), "{message}");
+            assert!(
+                message
+                    .contains("「収集グループ」と「デバイスアドレス」を同時に変えて移してください"),
+                "{message}"
+            );
+            assert!(!message.contains("先にタグのアドレスを直して"), "{message}");
+        }
     }
 
     struct Registry {
