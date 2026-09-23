@@ -510,7 +510,7 @@ use banto_collect::{
     build_config, ClientFactory, CollectError, CollectEvent, Collector, CollectorOptions,
     ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality,
 };
-use banto_core::{BantoError, ListResult};
+use banto_core::BantoError;
 use banto_tstore::{Clock, SystemClock};
 // ロールの下限（`COLLECT_OPERATION_ROLE` / `COLLECT_READ_ROLE`）だけ、この
 // service 層が名前を出す - 両経路の床を 1 か所で決めるため（transport の
@@ -944,8 +944,8 @@ pub struct CollectEventRow {
 /// R1-C「`collect_events` のイベント一覧ページ（banto 監査ログページの
 /// 流儀）」）:
 ///
-/// * 総件数は [`ListResult::total_count`] で返す（`crate::audit` と同じ型・
-///   同じ綴り `totalCount`）、
+/// * 総件数は [`CollectEventList::total_count`] で返す（`crate::audit` の
+///   `ListResult` と同じ綴り `totalCount`）、
 /// * 既定の取得件数は **50**（[`COLLECT_EVENTS_DEFAULT_LIMIT`]。
 ///   `banto_core::Pagination` の既定と同じ）、
 /// * 並び順は**新しい順**で固定（監査ログ画面の既定 `ts desc` と同じ）。
@@ -959,10 +959,19 @@ pub struct CollectEventRow {
 ///   URL に誰でも書けるので、`limit` を素通しにすると 1 リクエストで表全体を
 ///   読み出せてしまう。`crate::audit` の `POST` は `admin` 限定だが、この口は
 ///   `viewer` にも開いている。
+///
+/// **`as_of_id` = スナップショット境界**（#409 レビュー P2-2）: 指定すると
+/// `id <= as_of_id` の行**だけ**を数え、並べる。画面は 1 つの「世代」の
+/// 最初の応答で返ってきた境界（[`CollectEventList::as_of_id`]）を固定して、
+/// 同じ世代の後続ブロックすべてに渡す - そうしないと、ブロック取得の合間に
+/// 先頭へイベントが追加されたとき、`OFFSET` がずれて**境界で行が重複し、
+/// 末尾の行が一覧から漏れる**。未指定なら「その時点の最大 `id`」を境界に
+/// する（[`CollectorService::events`] の doc）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventPage {
     pub offset: u64,
     pub limit: u64,
+    pub as_of_id: Option<i64>,
 }
 
 impl EventPage {
@@ -983,7 +992,16 @@ impl EventPage {
             limit: limit
                 .unwrap_or(COLLECT_EVENTS_DEFAULT_LIMIT)
                 .clamp(1, COLLECT_EVENTS_MAX_LIMIT),
+            as_of_id: None,
         }
+    }
+
+    /// スナップショット境界を付ける（`None` = 付けない = その時点の最大
+    /// `id` を境界にする）。範囲は直さない - 負の値や存在しない大きな値は
+    /// 「その境界で数えた集合」をそのまま返すだけで（負なら 0 件）、読み出せる
+    /// 範囲は広がらない。
+    pub fn as_of(self, as_of_id: Option<i64>) -> Self {
+        Self { as_of_id, ..self }
     }
 }
 
@@ -991,6 +1009,29 @@ impl Default for EventPage {
     fn default() -> Self {
         Self::new(None, None)
     }
+}
+
+/// イベント一覧の 1 ページ分の応答（[`CollectorService::events`] の
+/// `Readout::Ready` の `data`）。
+///
+/// `rows` / `totalCount` は `banto_core::ListResult` と**同じ綴り**（監査ログ
+/// 一覧と同じ形）で、そこに**この応答が使ったスナップショット境界**
+/// `asOfId` を 1 つ足したもの（#409 レビュー P2-2）。`ListResult` は
+/// `banto-core` の型でフィールドを足せないので、同じ綴りの型をここに置く。
+/// `Readout` の形は変えていない。
+///
+/// * `total_count` も `rows` も **`id <= as_of_id` で絞った集合**から取る。
+/// * **表が空のときの `as_of_id` は `0`**: `collect_events.id` は
+///   `INTEGER PRIMARY KEY AUTOINCREMENT` で 1 から振られるので、`0` は
+///   「どの行も含まない境界」を意味する。`null` にしないのは、画面が
+///   「境界を受け取った」と「まだ受け取っていない」を取り違えないため
+///   （空の世代の後続ブロックも同じ `0` を渡せば、同じ空集合を読む）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectEventList {
+    pub rows: Vec<CollectEventRow>,
+    pub total_count: u64,
+    pub as_of_id: i64,
 }
 
 /// ライフサイクルタスクへの**操作**の依頼。応答はそれぞれの `oneshot` に返す。
@@ -1595,8 +1636,8 @@ impl CollectorService {
 
     /// **収集イベント一覧**（`GET /api/collect/events` /
     /// `collect_events_list`）: `collect_events` の 1 ページを**新しい順**で
-    /// 返す。総件数は [`ListResult::total_count`]（`crate::audit` の一覧と
-    /// 同じ型・同じ綴り）。
+    /// 返す。総件数は [`CollectEventList::total_count`]（`crate::audit` の一覧と
+    /// 同じ綴り）。
     ///
     /// * 読めた → [`Readout::Ready`]（**0 件でも `Ready`**）、
     /// * 読めなかった（DB エラー / [`COLLECT_READ_TIMEOUT`] で打ち切り）→
@@ -1610,7 +1651,28 @@ impl CollectorService {
     /// にも開いていて、`sqlx` のエラー文言は DB ファイルのパスを含みうる -
     /// C-2 の P2（`StartFailed.reason` の漏れ）と同じ類なので、理由はサーバー
     /// 側のログにだけ出す。
-    pub async fn events(&self, page: EventPage) -> Readout<ListResult<CollectEventRow>> {
+    ///
+    /// **スナップショット境界**（#409 レビュー P2-2。[`EventPage`] の
+    /// `as_of_id`）: 件数も行も `id <= as_of_id` で絞る。未指定なら
+    /// **その時点の最大 `id`** を境界にし、使った境界を
+    /// [`CollectEventList::as_of_id`] で返す。この境界が集合のメンバーを
+    /// 確定できるのは、`collect_events.id` が **`AUTOINCREMENT`**
+    /// （`banto-collect` の `0001_collect_events.sql`）で、単調増加かつ削除
+    /// されても再利用されないから - `ts` の並びとは無関係に「境界より後に
+    /// 足された行」は必ず境界より大きい `id` を持つ。
+    ///
+    /// **「件数が増えたら全体を取り直す」方式にしなかった理由**: イベントが
+    /// 流れ続けている間（接続が瞬断を繰り返しているなど、まさにこの一覧を
+    /// 見たいとき）は毎回取り直しになり、**一覧が永久に読み終わらない** -
+    /// 「回復導線が、必要なときだけ死ぬ」型になる。境界を固定すれば、新しい
+    /// イベントは利用者が「再読み込み」した（新しい世代を始めた）ときに入る。
+    ///
+    /// **将来の制約**: 保持期間による削除（R0 §3.4、**まだ未実装**）が入ると、
+    /// 古い行（小さい `id`）が消えて、境界を固定していても**末尾側の
+    /// `OFFSET` がずれる**（数え直した件数も減る）。削除を実装するときは、
+    /// この一覧の取得方法を見直すこと。今は何も消さないので、この問題は
+    /// 起きない。
+    pub async fn events(&self, page: EventPage) -> Readout<CollectEventList> {
         match tokio::time::timeout(COLLECT_READ_TIMEOUT, self.read_events(page)).await {
             Ok(Ok(result)) => Readout::Ready { data: result },
             Ok(Err(err)) => {
@@ -1634,26 +1696,43 @@ impl CollectorService {
     /// 並び順は `ts DESC, id DESC` 固定 - `ts` は同じミリ秒に複数行が並びうる
     /// ので、`id`（`AUTOINCREMENT` = 挿入順）で必ず一意に決める。ここが
     /// 曖昧だとページ境界で行が重複・欠落する。
-    async fn read_events(
-        &self,
-        page: EventPage,
-    ) -> Result<ListResult<CollectEventRow>, sqlx::Error> {
+    ///
+    /// **境界の決定・行・件数を 1 つの読み取りトランザクションで行う**
+    /// （#409 レビュー P2-2）: 境界を決めてから数えるまでの間に行が足されても、
+    /// 3 つの問い合わせは同じデータ集合を見る。加えて行も件数も
+    /// `id <= as_of_id` で絞っているので、境界より後の行はどちらにも入らない。
+    async fn read_events(&self, page: EventPage) -> Result<CollectEventList, sqlx::Error> {
+        let mut tx = self.inner.ctx.pool.begin().await?;
+        // 表が空なら MAX(id) は NULL → 境界 0（どの行も含まない。
+        // [`CollectEventList`] の doc）。
+        let as_of_id = match page.as_of_id {
+            Some(id) => id,
+            None => sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM collect_events")
+                .fetch_one(&mut *tx)
+                .await?
+                .unwrap_or(0),
+        };
         let rows = sqlx::query_as::<_, CollectEventRow>(
             "SELECT id, ts AS ts_ms, kind, connection_key, tag_key, level, value \
-             FROM collect_events ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+             FROM collect_events WHERE id <= ? ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
         )
+        .bind(as_of_id)
         .bind(page.limit as i64)
         .bind(page.offset as i64)
-        .fetch_all(&self.inner.ctx.pool)
+        .fetch_all(&mut *tx)
         .await?;
         // 総件数は**ページングの前**の件数（`crate::audit::AuditLogService::list`
-        // と同じ形）。画面のページャがこれを使う。
-        let total_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collect_events")
-            .fetch_one(&self.inner.ctx.pool)
-            .await?;
-        Ok(ListResult {
+        // と同じ形）で、**同じ境界で絞る**。画面のページャがこれを使う。
+        let total_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM collect_events WHERE id <= ?")
+                .bind(as_of_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(CollectEventList {
             rows,
             total_count: total_count as u64,
+            as_of_id,
         })
     }
 
@@ -3600,7 +3679,7 @@ mod tests {
     ///
     /// 反証（回帰の検出）: [`CollectorService::events`] の
     /// `Ok(Err(err)) => Readout::Unavailable` を
-    /// `Readout::Ready { data: ListResult { rows: vec![], total_count: 0 } }` に
+    /// `Readout::Ready { data: CollectEventList { rows: vec![], total_count: 0, as_of_id: 0 } }` に
     /// 変えると 3 の `assert_eq!` が落ちる（読めなかったのに「0 件です」と
     /// 答えている）。収集の状態を見て `NotRunning` を返す実装にすると 2 が落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3738,6 +3817,80 @@ mod tests {
             json["data"]["totalCount"], 1,
             "総件数の綴りは監査一覧と同じ"
         );
+        assert_eq!(
+            json["data"]["asOfId"], 1,
+            "使ったスナップショット境界が応答に無い: {json}"
+        );
+    }
+
+    /// **スナップショット境界**（#409 レビュー P2-2）: 画面は 1 つの世代の
+    /// 最初の応答で `asOfId` を固定し、後続ブロックに渡す。その間に足された
+    /// イベントは**件数にも行にも入らない**ので、ブロック境界で重複も欠落も
+    /// 起きない。表が空のときの境界は `0`（どの行も含まない）。
+    ///
+    /// 反証（回帰の検出）: `read_events` が `page.as_of_id` を無視して常に
+    /// その時点の最大 `id` を使うと、2 ブロック目が `id 2` を返し
+    /// （1 ブロック目の末尾と重複）、`id 1` が漏れて「全 id がちょうど 1 回
+    /// ずつ」と件数の `assert_eq!` が落ちる。`COUNT(*)` から `WHERE id <= ?` を
+    /// 外すと件数の `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_events_list_pins_a_snapshot_so_events_added_between_blocks_neither_shift_nor_count(
+    ) {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+
+        // 表が空: 境界は 0。後から足しても、境界 0 の集合は空のまま。
+        let empty = svc.events(EventPage::default()).await;
+        let page = empty.data().expect("ready");
+        assert_eq!(page.as_of_id, 0, "空の表の境界は 0: {page:?}");
+        assert_eq!(page.total_count, 0);
+
+        for ts in [100, 200, 300] {
+            seed_event(&pool, ts, "plc_connected", None).await;
+        }
+        let pinned_empty = svc.events(EventPage::default().as_of(Some(0))).await;
+        let page = pinned_empty.data().expect("ready");
+        assert!(page.rows.is_empty(), "境界 0 なのに行が入った: {page:?}");
+        assert_eq!(page.total_count, 0);
+        assert_eq!(page.as_of_id, 0, "渡した境界をそのまま返すこと");
+
+        // 1 ブロック目（境界未指定 = その時点の最大 id = 3）。
+        let first = svc.events(EventPage::new(Some(0), Some(2))).await;
+        let first = first.data().expect("ready").clone();
+        assert_eq!(first.as_of_id, 3);
+        assert_eq!(first.total_count, 3);
+
+        // ブロックの合間に新しいイベントが先頭へ足される（id 4、ts 最新）。
+        seed_event(&pool, 400, "plc_disconnected", None).await;
+
+        // 2 ブロック目は 1 ブロック目の境界で取る。
+        let second = svc
+            .events(EventPage::new(Some(2), Some(2)).as_of(Some(first.as_of_id)))
+            .await;
+        let second = second.data().expect("ready").clone();
+        assert_eq!(second.as_of_id, first.as_of_id);
+        assert_eq!(
+            second.total_count, 3,
+            "境界の後に足されたイベントが件数に入った: {second:?}"
+        );
+        let ids: Vec<i64> = first
+            .rows
+            .iter()
+            .chain(second.rows.iter())
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![3, 2, 1],
+            "ブロック境界で重複・欠落した（境界の後の行が混ざった）"
+        );
+
+        // 新しい世代（境界を外す）では新しいイベントが入る。
+        let fresh = svc.events(EventPage::new(Some(0), Some(2))).await;
+        let fresh = fresh.data().expect("ready").clone();
+        assert_eq!(fresh.as_of_id, 4);
+        assert_eq!(fresh.total_count, 4);
+        assert_eq!(fresh.rows[0].id, 4);
     }
 
     /// [`EventPage::new`] の丸め（純関数）。`?limit=` は URL に誰でも書けるので
@@ -3750,8 +3903,14 @@ mod tests {
             EventPage::new(None, None),
             EventPage {
                 offset: 0,
-                limit: COLLECT_EVENTS_DEFAULT_LIMIT
+                limit: COLLECT_EVENTS_DEFAULT_LIMIT,
+                as_of_id: None
             }
+        );
+        assert_eq!(
+            EventPage::new(None, None).as_of(Some(7)).as_of_id,
+            Some(7),
+            "スナップショット境界が落ちている"
         );
         assert_eq!(EventPage::new(Some(20), Some(10)).offset, 20);
         assert_eq!(EventPage::new(None, Some(10)).limit, 10);
