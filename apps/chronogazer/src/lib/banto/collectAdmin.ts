@@ -459,7 +459,7 @@ export function collectStateDetail(state: CollectorStateView): string {
 			// #414 段階2: 全部が設定の不正で外れた場合は、登録・有効化ではなく
 			// 「直す」が次の一手（一覧は `collectExclusionsHeadline` の下に出る）。
 			return state.exclusions.length > 0
-				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外した設定」を「タグ設定」で直してから「収集を再起動」を押してください。'
+				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の一覧の設定を「タグ設定」で直してから「収集を開始」を押してください。'
 				: '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「タグ設定」でタグを登録・有効化してから「収集を再起動」を押してください。';
 		case 'startFailed':
 			return '前回の開始が失敗したままです。失敗した理由はこの状態表示には含まれません - 「収集を開始」を押すと、その結果として理由が表示されます。';
@@ -490,6 +490,43 @@ export function collectExclusions(state: CollectorStateView): ExclusionView[] {
  */
 export function collectExclusionsHeadline(count: number): string | null {
 	return count === 0 ? null : `除外あり（${count} 件）`;
+}
+
+/**
+ * 除外欄の説明文（#414 段階2、#422 レビュー P2。純関数）。**状態ごとに
+ * 分ける** - 除外欄は `running` と `noTargets` の両方で出るが、全部外れた
+ * `noTargets` では収集エンジンが起動していないので、「残りは収集しています」
+ * と言うと同じ画面の状態表示と矛盾する。次の一手も違う（`running` は
+ * 「収集を再起動」、`noTargets` は走っていないので「収集を開始」）。
+ *
+ * - `summary`: 何が起きているか。
+ * - `fix`: 画面が「タグ設定」リンクの**直後**に続ける文。
+ *
+ * 除外欄を出さない状態（一覧が空・`running` / `noTargets` 以外）では `null`。
+ */
+export interface CollectExclusionsNote {
+	summary: string;
+	fix: string;
+}
+
+export function collectExclusionsNote(state: CollectorStateView): CollectExclusionsNote | null {
+	if (collectExclusions(state).length === 0) return null;
+	switch (state.state) {
+		case 'running':
+			return {
+				summary:
+					'次の設定は不正なため、収集の開始時に外しました。残りは収集しています（外したタグの値は記録されず、履歴は空欄になります）。',
+				fix: 'で直してから「収集を再起動」を押してください。'
+			};
+		case 'noTargets':
+			return {
+				summary:
+					'次の設定は不正なため、収集の開始時に外しました。収集対象が残らなかったため、現在は収集していません（値は記録されていません）。',
+				fix: 'で直してから「収集を開始」を押してください。'
+			};
+		default:
+			return null;
+	}
 }
 
 /** 除外の単位の表示（純関数）。`/tags` の 3 セクションの見出しと同じ語。 */

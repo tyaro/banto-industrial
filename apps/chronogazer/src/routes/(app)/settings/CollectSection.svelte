@@ -59,6 +59,7 @@
 		collectConnectionsNote,
 		collectExclusions,
 		collectExclusionsHeadline,
+		collectExclusionsNote,
 		exclusionUnitLabel,
 		collectStateDetail,
 		collectStateHeadline,
@@ -115,6 +116,7 @@
 	/** #414 段階2: 開始時に外した設定（状態が持つ一覧。読めていなければ空）。 */
 	const exclusions = $derived(status === null ? [] : collectExclusions(status));
 	const exclusionsHeadline = $derived(collectExclusionsHeadline(exclusions.length));
+	const exclusionsNote = $derived(status === null ? null : collectExclusionsNote(status));
 
 	const connectionEntries = $derived(
 		connections?.state === 'ready' ? Object.entries(connections.data) : []
@@ -307,10 +309,14 @@
 		{#if exclusionsHeadline}
 			<div class="collect-exclusions" role="status">
 				<h3 class="collect-subheading">{exclusionsHeadline}</h3>
-				<p class="note">
-					次の設定は不正なため、収集の開始時に外しました（残りは収集しています）。外したタグの値は記録されません（履歴は空欄になります）。
-					<a href="/tags">タグ設定</a>で直してから「収集を再起動」を押してください。
-				</p>
+				<!-- 説明文は状態ごと（`collectExclusionsNote`）。全部外れた noTargets で
+				「収集しています」と言わない（#422 レビュー P2）。 -->
+				{#if exclusionsNote}
+					<p class="note">
+						{exclusionsNote.summary}
+						<a href="/tags">タグ設定</a>{exclusionsNote.fix}
+					</p>
+				{/if}
 				<table class="collect-exclusion-list">
 					<thead>
 						<tr>

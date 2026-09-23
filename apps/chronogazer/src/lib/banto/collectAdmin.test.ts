@@ -22,6 +22,7 @@ import {
 	collectConnectionsNote,
 	collectExclusions,
 	collectExclusionsHeadline,
+	collectExclusionsNote,
 	exclusionUnitLabel,
 	qualityLabel,
 	collectEventsNote,
@@ -403,6 +404,40 @@ describe('除外の一覧（#414 段階2）', () => {
 		expect(exclusionUnitLabel('connection')).toBe('PLC接続');
 		expect(exclusionUnitLabel('group')).toBe('収集グループ');
 		expect(exclusionUnitLabel('tag')).toBe('タグ');
+	});
+
+	it('#422 P2: 全部外れた noTargets では、一覧は出るが説明文に「収集しています」を含まない', () => {
+		const state: CollectorStateView = { state: 'noTargets', exclusions: [legacy] };
+		expect(collectExclusions(state)).toEqual([legacy]);
+		expect(collectExclusionsHeadline(collectExclusions(state).length)).toBe('除外あり（1 件）');
+		const note = collectExclusionsNote(state);
+		expect(note).not.toBeNull();
+		const text = `${note?.summary}タグ設定${note?.fix}`;
+		expect(text).not.toContain('収集しています');
+		expect(text).toContain('現在は収集していません');
+		// 走っていないので「再起動」ではなく「開始」を案内する。
+		expect(text).toContain('「収集を開始」');
+		expect(text).not.toContain('再起動');
+	});
+
+	it('#422 P2: running では「残りは収集しています」の趣旨を出し、「収集を再起動」を案内する', () => {
+		const note = collectExclusionsNote({
+			state: 'running',
+			groups: 1,
+			tags: 1,
+			exclusions: [legacy]
+		});
+		expect(note?.summary).toContain('残りは収集しています');
+		expect(note?.fix).toContain('「収集を再起動」');
+	});
+
+	it('除外が無い・走っている構成が無いときは説明文を出さない', () => {
+		expect(
+			collectExclusionsNote({ state: 'running', groups: 1, tags: 1, exclusions: [] })
+		).toBeNull();
+		expect(collectExclusionsNote({ state: 'noTargets', exclusions: [] })).toBeNull();
+		expect(collectExclusionsNote({ state: 'stopped' })).toBeNull();
+		expect(collectExclusionsNote({ state: 'startFailed' })).toBeNull();
 	});
 
 	it('全部外れた noTargets は「登録・有効化」ではなく「直す」を案内する', () => {
