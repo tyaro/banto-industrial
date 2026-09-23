@@ -30,8 +30,17 @@ pub(crate) fn candidate_files(
     from_ms: i64,
     to_ms: i64,
 ) -> Result<Vec<DataFileInfo>, TsQueryError> {
-    let from_date = LocalDate::from_epoch_ms(from_ms - MAX_OFFSET_PAD_MS, 0);
-    let to_date = LocalDate::from_epoch_ms(to_ms + MAX_OFFSET_PAD_MS, 0);
+    // `from_ms`/`to_ms` can be arbitrary caller-supplied `i64` (R2 will take
+    // these from an API, not just this crate's own tests) - an unchecked `-`/
+    // `+` here panics on overflow at the extremes (`from_ms == i64::MIN`,
+    // `to_ms == i64::MAX`). Saturating is the right choice, not an error: the
+    // padding only ever widens the file-name pre-filter so real files near a
+    // genuine boundary are not missed, and saturating at `i64::MIN`/`i64::MAX`
+    // just means "the range already covers everything representable" - no
+    // real data file's date will ever be outside that, so the result is
+    // identical to what unpadded arithmetic would have found.
+    let from_date = LocalDate::from_epoch_ms(from_ms.saturating_sub(MAX_OFFSET_PAD_MS), 0);
+    let to_date = LocalDate::from_epoch_ms(to_ms.saturating_add(MAX_OFFSET_PAD_MS), 0);
     Ok(list_data_files(data_dir)?
         .into_iter()
         .filter(|f| f.date >= from_date && f.date <= to_date)
