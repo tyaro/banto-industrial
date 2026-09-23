@@ -971,6 +971,50 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
+	test('31c. 開いた直後（同じタスク内）にペインへ移すフォーカスが、visibility: hidden の間に空振りしない（#421）', async () => {
+		// #399/#420 は Sidebar の Esc 誤動作だったが、SplitPane の退避ペインは
+		// escLayering.ts の層判定の対象ではないので同じ誤動作は起きない。
+		// ただし SplitPane.svelte の開閉 `$effect` は、開いた直後に
+		// `focusFirstInLeftPane()` でペイン内の最初の要素へ `.focus()` を呼ぶ。
+		// この `$effect` は Svelte のマイクロタスクで実行され、CSS の
+		// `visibility` 遷移が最初のアニメーションフレームへ進むより前に走りうる
+		// ため、修正前は「`class="open"` は付いたのに計算値はまだ `hidden`」の
+		// 瞬間に `.focus()` を呼び、空振りする（`visibility: hidden` の要素は
+		// フォーカスを受けない）。
+		//
+		// ☰ トグルのクリックと直後の判定を `page.evaluate` の 1 タスク内で行い、
+		// フレームが進む前の状態を決定的に作る（テスト31b と同じ作法）。
+		await page.goto('/tags');
+		// ハイドレーション完了（`mobileNavStore.isNarrow` の反映）を Playwright の
+		// 自動待機で確認してから、評価の中では素の DOM 操作に切り替える —
+		// ここを待たずに `page.evaluate` へ入ると、トグル自体がまだ描画されて
+		// いない「no-toggle」を拾ってしまい、狙った競合と関係ない失敗になる。
+		await expect(treeToggle).toBeVisible();
+		await expect(treePane).toBeHidden();
+
+		const result = await page.evaluate(async () => {
+			const toggle = document.querySelector<HTMLElement>('[data-testid="tag-tree-toggle"]');
+			if (!toggle) return 'no-toggle';
+			toggle.click();
+			// Svelte の DOM 反映・$effect の実行はマイクロタスク。
+			// requestAnimationFrame は挟まない。
+			for (let i = 0; i < 50; i += 1) {
+				const pane = document.querySelector<HTMLElement>('#tags-tree-pane');
+				if (pane?.classList.contains('open')) break;
+				await Promise.resolve();
+			}
+			const pane = document.querySelector<HTMLElement>('#tags-tree-pane');
+			if (!pane) return 'no-pane';
+			if (!pane.classList.contains('open')) return 'pane-not-open';
+			const visibility = getComputedStyle(pane).visibility;
+			const focusedInside = pane.contains(document.activeElement);
+			return `${visibility}:${focusedInside}`;
+		});
+
+		expect(result).toBe('visible:true');
+		await expect(treePane).toBeVisible();
+	});
+
 	test('32. 狭幅→広幅でトグルにフォーカスがあっても body に落ちない（#381 レビュー対応15回目）', async () => {
 		// 狭幅のトグルは広幅への更新と同時にアンマウントされ、`focusFallback()` も
 		// 同じトグルを返すので戻し先が無くなる。広幅で普通に使えるようになった
