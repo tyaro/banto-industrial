@@ -216,7 +216,14 @@ async fn simulation_connection_values_are_live_but_never_recorded() {
     let svc = CollectorService::new(pool.clone(), data_dir.clone());
     let outcome = svc.start().await.expect("収集を開始できる");
     assert!(!outcome.pending, "開始が打ち切られた: {:?}", outcome.status);
-    assert_eq!(svc.state(), CollectorState::Running { groups: 2, tags: 2 });
+    assert_eq!(
+        svc.state(),
+        CollectorState::Running {
+            groups: 2,
+            tags: 2,
+            exclusions: vec![],
+        }
+    );
 
     // (a) 両方つながり、シミュレーションの印は本題の接続にだけ付く。
     wait_until("両方の接続が connected になること", || async {

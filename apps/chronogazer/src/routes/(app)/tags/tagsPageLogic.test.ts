@@ -23,10 +23,12 @@ import {
 	connectionSavedMessage,
 	unmovingSimulationTags,
 	simulationCoverageView,
+	configExclusionsView,
 	coverageReloadStarted,
 	coverageReloadSettled,
 	SIMULATION_CONNECTION_LABEL,
 	type SimulationCoverageView,
+	type ConfigExclusionsView,
 	type SaveGuardToken,
 	type DeleteGuardToken,
 	type ListLoadState,
@@ -663,5 +665,31 @@ describe('判定の再取得は前の設定の結果を持ち越さない（#417
 				reason: '範囲外です'
 			}
 		]);
+	});
+});
+
+describe('configExclusionsView（#414 段階2）', () => {
+	type Mark = { key: string };
+	const cases: [ListLoadState<Mark>, ConfigExclusionsView][] = [
+		// 読めていない / 読めなかったを「不正な設定は無い」に潰さない。
+		[{ items: null, error: null }, 'loading'],
+		[{ items: null, error: '失敗' }, 'failed'],
+		[{ items: [], error: null }, 'none'],
+		[{ items: [{ key: 'tag:1' }], error: null }, 'list']
+	];
+	it.each(cases)('%j → %s', (state, expected) => {
+		expect(configExclusionsView(state)).toBe(expected);
+	});
+
+	it('再取得の間は前回の結果を持ち越さない（直したのに印が残らない / 増えたのに none と言わない）', () => {
+		const before = coverageReloadSettled<Mark>(coverageReloadStarted<Mark>(), {
+			kind: 'applied',
+			items: [{ key: 'tag:1' }]
+		});
+		expect(configExclusionsView(before)).toBe('list');
+		const waiting = coverageReloadStarted<Mark>();
+		expect(configExclusionsView(waiting)).toBe('loading');
+		const failed = coverageReloadSettled(waiting, { kind: 'error', message: '読めない' });
+		expect(configExclusionsView(failed)).toBe('failed');
 	});
 });

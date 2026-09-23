@@ -26,6 +26,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getAuthProvider, isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER, getBantoMode } from './setup';
+import type { ExclusionView } from './collectAdmin';
+
+export type { ExclusionView };
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
@@ -295,6 +298,22 @@ export async function listSimulationCoverage(): Promise<SimulationCoverageEntry[
 		return invokeCommand<SimulationCoverageEntry[]>('simulation_coverage_list');
 	}
 	return httpRequest<SimulationCoverageEntry[]>('/api/simulation-coverage', { method: 'GET' });
+}
+
+// --- config exclusions (#414 段階2) -------------------------------------------
+
+/**
+ * 今のレジストリで収集を開始したら外される接続・グループ・タグ（`viewer`
+ * 以上）。`/tags` の印に使う。**判定は Rust（収集の開始と同じ
+ * `banto_collect::build_config_lenient_from`）だけ**で、画面は表示するだけ
+ * （`listSimulationCoverage` と同じ流儀）。収集が走っていなくても返る。
+ */
+export async function listConfigExclusions(): Promise<ExclusionView[]> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<ExclusionView[]>('config_exclusions_list');
+	}
+	return httpRequest<ExclusionView[]>('/api/config-exclusions', { method: 'GET' });
 }
 
 // --- collection groups ------------------------------------------------------

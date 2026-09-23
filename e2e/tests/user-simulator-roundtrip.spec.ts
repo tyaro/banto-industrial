@@ -76,6 +76,33 @@
  *   `id`（`asOfId`）を控え**、それより新しいイベントを REST で探し、その行が
  *   画面に**その時刻の表示で**出ていることを確かめる。
  *
+ * ## 不正なタグが残っていても、正常なタグは収集される（#414 段階2、テスト 6〜8）
+ *
+ * 2026-09-23 オーナー決定「開始時に不正なタグ・接続だけを外し、残りを動かす。
+ * 不正なものがあることは必ず分かるようにする」の一巡。一巡のグループに、
+ * **保存時の検証（#418）より前に入った**不正なタグ（Modbus 接続の下の
+ * `D3000`）を足して収集を開始し、
+ *
+ * - 開始は失敗せず「収集中（グループ1件 / タグ1件）」になり、データファイルに
+ *   書き込みが入る（正常なタグは収集される）、
+ * - `/settings/collect` に「除外あり（1 件）」と、種類・名前・理由の一覧と
+ *   `/tags` へのリンクが出る、
+ * - 現在値は正常なタグが `good`、不正なタグが `value: null`・`invalid`、
+ * - `/tags` に「収集の開始時に外される設定」が出る、
+ * - 停止すると収集の画面から除外の一覧が消える（古い一覧を残さない）
+ *
+ * を確かめる。
+ *
+ * **不正なタグの作り方**: REST は #418 で保存時に拒否するので、**正常な
+ * アドレスで作ってから DB の行を直接書き換える**（Node 組み込みの
+ * `node:sqlite` で `UPDATE tags SET address = ...` を 1 文だけ）。これが
+ * 「検証をくぐった既存データ」そのもの。DB は `playwright.config.ts` が
+ * この実行のために作った一時ディレクトリの中（所有マーカーで確かめて
+ * いる。`beforeAll`）で、banto-serve が開いたままなのでロック待ち
+ * （`busy_timeout`）を入れる。外したタグの**履歴が null で読める**ことは
+ * 画面から見えないので、Rust の `apps/chronogazer/core/tests/exclusion_roundtrip.rs`
+ * が確かめる。
+ *
  * ## ファイル名（実行順）
  *
  * `playwright.config.ts` は `workers: 1`/`fullyParallel: false` でファイル名の
@@ -89,6 +116,7 @@
 import { expect, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { RUN_DIR_ENV, RUN_TOKEN_ENV, ownsRunDir } from '../chronogazer-e2e-run-dir';
 
 // smoke.spec.ts が初回セットアップで作成する唯一の管理者アカウント。
@@ -101,6 +129,15 @@ const DEV_PLC_PORT = 8803;
 const CONNECTION_NAME = 'E2E-開発用PLC';
 const GROUP_NAME = 'E2E一巡グループ';
 const TAG_NAME = 'E2E一巡ランプ';
+/**
+ * #414 段階2（テスト 6〜8）: **保存時の検証（#418）より前に入った**不正な
+ * タグ。REST では作れないので、正常なアドレスで作ってから DB の行を直接
+ * 書き換える（ファイル冒頭の doc「不正なタグの作り方」）。
+ */
+const LEGACY_TAG_NAME = 'E2E検証前の不正タグ';
+/** Modbus 接続の下の MELSEC 表記（#418 以前に実際に残っていた形）。 */
+const LEGACY_ADDRESS = 'D3000';
+const DB_FILE_NAME = 'chronogazer-e2e.sqlite3';
 
 const CSRF_HEADERS = { 'X-Banto-Client': 'banto' };
 
@@ -231,6 +268,7 @@ async function cleanupFixtures(request: APIRequestContext, headers: ApiHeaders):
 		}
 	};
 	await attempt(failures, 'タグの削除', () => deleteByName('/api/tags', TAG_NAME));
+	await attempt(failures, '不正なタグの削除', () => deleteByName('/api/tags', LEGACY_TAG_NAME));
 	await attempt(failures, '収集グループの削除', () =>
 		deleteByName('/api/collection-groups', GROUP_NAME)
 	);
@@ -392,6 +430,8 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 	let eventIdBeforeStart: number;
 	/** テスト 3 でこの試行の書き込みを確かめたデータファイル（本体の名前）。 */
 	let writtenFiles: string[] = [];
+	/** テスト 6 で作った、検証をくぐった不正なタグの id。 */
+	let legacyTagId: number;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -425,7 +465,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 			`${dbDir} の所有マーカーがこの実行のトークンと一致しない`
 		).toBe(true);
 		expect(
-			fs.existsSync(path.join(dbDir, 'chronogazer-e2e.sqlite3')),
+			fs.existsSync(path.join(dbDir, DB_FILE_NAME)),
 			`${dbDir} に banto-serve の DB が無い（別の一時ディレクトリを見ている）`
 		).toBe(true);
 		dataDir = path.join(dbDir, 'data');
@@ -564,4 +604,115 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		expect(writtenFiles).not.toEqual([]);
 		expect(dataFiles(dataDir)).toEqual(expect.arrayContaining(writtenFiles));
 	});
+
+	test('6. 保存時の検証より前に入った不正なタグがあっても開始でき、「除外あり」と一覧が出る', async () => {
+		// 正常なアドレスで作ってから、DB の行を直接書き換える（REST は #418 で
+		// 拒否するので、検証をくぐった既存データはこうしてしか作れない）。
+		const group = (
+			await getList<NamedRow>(page.request, apiHeaders, '/api/collection-groups')
+		).find((g) => g.name === GROUP_NAME);
+		expect(group, '一巡のグループが無い').toBeDefined();
+		const created = await page.request.post('/api/tags', {
+			headers: apiHeaders,
+			data: {
+				name: LEGACY_TAG_NAME,
+				collectionGroupId: group?.id,
+				address: '40002',
+				dataType: 'u16',
+				decimals: 0,
+				enabled: true
+			}
+		});
+		expect(created.ok(), `POST /api/tags が ${created.status()}`).toBe(true);
+		legacyTagId = ((await created.json()) as NamedRow).id;
+		rewriteTagAddress(path.join(dbDir, DB_FILE_NAME), legacyTagId, LEGACY_ADDRESS);
+
+		await page.goto('/settings/collect');
+		await expect(statusLine(page)).toHaveText('状態: 停止');
+		const before = dataFileSignatures(dataDir);
+		await page.getByRole('button', { name: '収集を開始' }).click();
+
+		// 開始は失敗しない。正常なタグ 1 件で走る。
+		await expect(statusLine(page)).toHaveText('状態: 収集中（グループ1件 / タグ1件）');
+		const exclusions = page.locator('.collect-exclusions');
+		await expect(exclusions.getByRole('heading', { name: '除外あり（1 件）' })).toBeVisible();
+		const row = exclusions.getByRole('row').filter({ hasText: LEGACY_TAG_NAME });
+		await expect(row).toContainText('タグ');
+		await expect(row).toContainText('Modbus TCP のアドレスとして解釈できません');
+		await expect(exclusions.getByRole('link', { name: 'タグ設定' })).toHaveAttribute(
+			'href',
+			'/tags'
+		);
+
+		// 正常なタグは収集され、データファイルに書き込みが入る。
+		await expect
+			.poll(() => changedDataFiles(before, dataDir), {
+				message: '不正なタグがあっても、正常なタグの書き込みが入ること',
+				timeout: 20_000
+			})
+			.not.toEqual([]);
+	});
+
+	test('7. 現在値: 正常なタグは good、外したタグは value: null・品質 invalid', async () => {
+		const tagId = (await getList<NamedRow>(page.request, apiHeaders, '/api/tags')).find(
+			(t) => t.name === TAG_NAME
+		)?.id;
+		expect(tagId, '一巡のタグが無い').toBeDefined();
+		await expect(async () => {
+			const res = await page.request.get('/api/collect/values', { headers: apiHeaders });
+			expect(res.ok()).toBe(true);
+			const body = (await res.json()) as ValuesReadout;
+			expect(body.state).toBe('ready');
+			if (body.state !== 'ready') return;
+			expect(body.data[`tag:${tagId}`]?.quality).toBe('good');
+			expect(body.data[`tag:${legacyTagId}`]).toEqual({
+				value: null,
+				ptimeMs: null,
+				quality: 'invalid'
+			});
+		}).toPass({ timeout: 15_000 });
+	});
+
+	test('8. /tags に「収集の開始時に外される設定」が出て、停止すると収集の画面から除外が消える', async () => {
+		await page.goto('/tags');
+		const marks = page.getByRole('region', { name: '収集の開始時に外される設定' });
+		await expect(marks).toBeVisible();
+		const mark = marks.getByRole('listitem').filter({ hasText: LEGACY_TAG_NAME });
+		await expect(mark).toContainText('タグ');
+		await expect(mark).toContainText('Modbus TCP のアドレスとして解釈できません');
+
+		await page.goto('/settings/collect');
+		await expect(statusLine(page)).toHaveText(/^状態: 収集中/);
+		await page.getByRole('button', { name: '収集を停止' }).click();
+		await expect(statusLine(page)).toHaveText('状態: 停止');
+		// 走っていない状態に前回の一覧を残さない。
+		await expect(page.locator('.collect-exclusions')).toHaveCount(0);
+	});
 });
+
+/** `chronogazer_core::collect::CurrentSampleView` の読み出し（テスト 7）。 */
+type ValuesReadout =
+	| { state: 'notRunning' }
+	| { state: 'unavailable' }
+	| {
+			state: 'ready';
+			data: Record<
+				string,
+				{ value: number | null; ptimeMs: number | null; quality: string } | undefined
+			>;
+	  };
+
+/**
+ * DB のタグの行のアドレスを直接書き換える（テスト 6）。banto-serve が同じ
+ * ファイルを開いたままなので、ロックの待ちを入れて 1 文だけ書き、すぐ閉じる。
+ */
+function rewriteTagAddress(dbPath: string, tagId: number, address: string): void {
+	const db = new DatabaseSync(dbPath);
+	try {
+		db.exec('PRAGMA busy_timeout = 5000');
+		const result = db.prepare('UPDATE tags SET address = ? WHERE id = ?').run(address, tagId);
+		expect(Number(result.changes), `tags.id = ${tagId} の行を書き換えられなかった`).toBe(1);
+	} finally {
+		db.close();
+	}
+}

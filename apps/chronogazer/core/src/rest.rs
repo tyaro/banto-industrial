@@ -48,6 +48,7 @@
 //! | PUT    | `/api/tags/{id}` | `TagPayload`             | `Tag` (editor+)         |
 //! | DELETE | `/api/tags/{id}` | -                        | 204 (editor+)           |
 //! | GET    | `/api/simulation-coverage` | -              | `SimulationCoverageEntry[]` (viewer+, #413) |
+//! | GET    | `/api/config-exclusions` | -                | `ExclusionView[]` (viewer+, #414 段階2) |
 //! | GET    | `/api/collect`   | -                        | `CollectorStateView` (viewer+, #383 段階2b/R1-C) |
 //! | POST   | `/api/collect/start\|stop\|restart` | -     | `CollectOutcome` (editor+) |
 //! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
@@ -188,6 +189,7 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+use crate::collect::ExclusionView;
 use crate::collect::{
     CollectEventList, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
     CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE,
@@ -2175,6 +2177,24 @@ async fn simulation_coverage_list(
     ))
 }
 
+/// `GET /api/config-exclusions`（**`viewer` 以上**・監査しない、#414 段階2）:
+/// 今のレジストリで収集を開始したら外される接続・グループ・タグ（`/tags`
+/// の印）。判定は収集の開始と同じ `banto_collect::build_config_lenient_from`
+/// （[`crate::collect::registry_exclusions`] の doc）。Tauri の
+/// `config_exclusions_list` と同じ関数を呼ぶ。
+async fn config_exclusions_list(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<ExclusionView>>, ApiError> {
+    Ok(Json(
+        crate::collect::registry_exclusions(
+            &state.plc_connections,
+            &state.collection_groups,
+            &state.tags,
+        )
+        .await?,
+    ))
+}
+
 async fn collection_groups_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<CollectionGroup>>, ApiError> {
@@ -2453,6 +2473,7 @@ fn tag_registry_router(
             get(tags_get).put(tags_update).delete(tags_delete),
         )
         .route("/api/simulation-coverage", get(simulation_coverage_list))
+        .route("/api/config-exclusions", get(config_exclusions_list))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -2594,6 +2615,15 @@ mod tests {
     /// `admin_can_create_list_update_reset_password_and_delete_users`
     /// below.
     async fn router_with_role_tokens() -> (Router, String, String, String) {
+        let (router, admin, editor, viewer, _pool) = router_with_role_tokens_and_pool().await;
+        (router, admin, editor, viewer)
+    }
+
+    /// [`router_with_role_tokens`] plus the router's own pool - for tests
+    /// that must put a row in the registry the REST handlers would refuse
+    /// (#414 段階2: a tag saved before the save-time address check).
+    async fn router_with_role_tokens_and_pool() -> (Router, String, String, String, sqlx::SqlitePool)
+    {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(pool.clone());
@@ -2601,7 +2631,7 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -2662,6 +2692,7 @@ mod tests {
             admin_token,
             editor_token,
             viewer_token,
+            pool,
         )
     }
 
@@ -3462,6 +3493,22 @@ mod tests {
         String,
         String,
     ) {
+        router_with_role_tokens_audit_pool_and_data_dir(PathBuf::from("unused-in-tests")).await
+    }
+
+    /// 上と同じだが、収集サービスの `data.dir` を選べる（#414 段階2 で
+    /// 「不正なタグ」では起動が失敗しなくなったので、起動の失敗は
+    /// 「tstore を開けない `data.dir`」で作る）。
+    async fn router_with_role_tokens_audit_pool_and_data_dir(
+        data_dir: PathBuf,
+    ) -> (
+        Router,
+        AuditLogService,
+        sqlx::SqlitePool,
+        String,
+        String,
+        String,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let pool_for_tests = pool.clone();
         let (tx, _rx) = broadcast::channel(16);
@@ -3469,7 +3516,7 @@ mod tests {
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
-        let collect = test_collector_service(pool.clone());
+        let collect = CollectorService::new(pool.clone(), data_dir);
         let audit = AuditLogService::new(pool);
 
         users
@@ -5218,6 +5265,110 @@ mod tests {
         assert!(entries[1]["reason"].as_str().is_some_and(|r| !r.is_empty()));
     }
 
+    /// #414 段階2: `GET /api/config-exclusions` は viewer が読め、今の
+    /// レジストリで開始したら外されるタグだけを返す。**実際の JSON の鍵**を
+    /// 固定し、接続先ホストが載っていないことを確かめる（公開範囲は
+    /// `crate::collect::ExclusionView` の doc）。不正なタグは REST では
+    /// 保存できない（#418）ので、保存時の検証より前に入った行として
+    /// SQL で直接書き換えて作る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_exclusions_are_viewer_readable_and_carry_no_host() {
+        let (router, _admin, editor, viewer, pool) = router_with_role_tokens_and_pool().await;
+
+        let conn = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/plc-connections",
+                    &editor,
+                    plc_connection_payload("plc-x"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let group = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/collection-groups",
+                    &editor,
+                    json!({
+                        "name": "g",
+                        "plcConnectionId": conn["id"],
+                        "periodMs": 1000,
+                        "enabled": true
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let mut ids = Vec::new();
+        for name in ["good", "legacy"] {
+            let tag = body_json(
+                router
+                    .clone()
+                    .oneshot(post_json_auth(
+                        "/api/tags",
+                        &editor,
+                        json!({
+                            "name": name,
+                            "collectionGroupId": group["id"],
+                            "address": "40001",
+                            "dataType": "u16",
+                            "decimals": 0,
+                            "enabled": true
+                        }),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            ids.push(tag["id"].as_i64().expect("tag id"));
+        }
+
+        // Nothing is excluded yet.
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/config-exclusions", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, json!([]));
+
+        sqlx::query("UPDATE tags SET address = 'D3000' WHERE id = ?")
+            .bind(ids[1])
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = router
+            .oneshot(get_auth("/api/config-exclusions", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let expected_message = banto_collect::check_tag_address("modbus-tcp", "D3000", "u16")
+            .unwrap_err()
+            .message();
+        assert_eq!(
+            body,
+            json!([{
+                "unit": "tag",
+                "id": ids[1],
+                "key": format!("tag:{}", ids[1]),
+                "name": "legacy",
+                "reason": "invalidAddress",
+                "message": expected_message,
+            }])
+        );
+        assert!(
+            !body.to_string().contains("192.168.11.200"),
+            "the connection's host must not appear: {body}"
+        );
+    }
+
     // --- #383 段階2b / R1-C（C-2）: 収集の操作 -------------------------------
 
     /// `/api/collect*` の全ルートを admin / editor / viewer の 3 役で叩いて、
@@ -5339,14 +5490,14 @@ mod tests {
     /// **#407 レビュー P2-2 の受入条件（REST 側）**: 起動に失敗した後、
     /// **viewer が状態を読んでも失敗理由が見えない**。
     ///
-    /// 検証用の目印をタグのアドレスに埋めて `build_config` を失敗させる。
-    /// #414 段階1 で REST の保存時にアドレスを検査するようになったので、
-    /// 目印のタグは**検査より前に保存された既存データ**として `TagService`
-    /// でプールへ直接入れる（段階2 まではこの形のデータで起動が失敗しうる -
-    /// 起動失敗の理由の扱いを固定するこのテストの前提はそのまま）。
-    /// `CollectError::Config` の文言はアドレスを
-    /// そのまま含むので、**内部の `CollectorState` をワイヤに載せていれば
-    /// 目印が必ず出てくる**。
+    /// `data.dir` の場所に**ファイル**を置いて tstore の書き手を開けなくし
+    /// （`Collector::start` が失敗する）、**editor に返った理由の文言そのもの**
+    /// を目印にして、viewer の状態取得に出てこないことを確かめる。#414 段階2
+    /// で不正なアドレスのタグは「そのタグだけ外す」になり起動の失敗では
+    /// なくなったので、以前の「目印をアドレスに埋める」形から変えた。
+    /// **内部の `CollectorState` をワイヤに載せていれば、同じ文言が必ず
+    /// 出てくる**（パスにも目印を埋めてあるが、OS のエラー文がパスを含む
+    /// とは限らないので、判定の主役は返ってきた文言の方）。
     ///
     /// あわせて、**理由がどこで利用者に伝わるか**も同じテストで押さえる -
     /// 起動を実行した editor には `POST /api/collect/start` の**エラー応答**
@@ -5360,11 +5511,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_viewer_reading_the_state_never_sees_why_the_start_failed() {
         const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
-        let (router, _audit, pool, _admin, editor, viewer) =
-            router_with_role_tokens_audit_and_pool().await;
+        let dir = crate::test_support::TempDir::new();
+        let blocked_data_dir = dir.path().join(MARKER);
+        std::fs::write(&blocked_data_dir, b"not a directory").expect("block data dir");
+        let (router, _audit, _pool, _admin, editor, viewer) =
+            router_with_role_tokens_audit_pool_and_data_dir(blocked_data_dir).await;
 
-        // 収集対象を 1 件だけ作る。アドレスが解釈できないので
-        // `build_config` が失敗し、状態に理由（= 目印を含む）が焼き付く。
+        // 収集対象を 1 件だけ作る。`data.dir` がファイルなので tstore を
+        // 開けず、状態に理由（= 目印を含むパス）が焼き付く。
         let conn = body_json(
             router
                 .clone()
@@ -5394,20 +5548,23 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        // 検査より前に保存された既存データとして直接入れる（doc 参照）。
-        let legacy_tag: TagPayload = serde_json::from_value(json!({
-            "name": "tag1",
-            "collectionGroupId": group["id"].as_i64().unwrap(),
-            "address": MARKER,
-            "dataType": "i16",
-            "decimals": 0,
-            "enabled": true
-        }))
-        .unwrap();
-        TagService::new(pool)
-            .create(legacy_tag.into())
+        let tag = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "tag1",
+                    "collectionGroupId": group["id"].as_i64().unwrap(),
+                    "address": "40001",
+                    "dataType": "i16",
+                    "decimals": 0,
+                    "enabled": true
+                }),
+            ))
             .await
-            .expect("既存データとしてのタグを入れる");
+            .unwrap();
+        assert_eq!(tag.status(), StatusCode::OK);
 
         // 起動した本人（editor）には、エラー応答として理由が返る。
         let start = router
@@ -5420,9 +5577,15 @@ mod tests {
             StatusCode::OK,
             "前提が崩れている: 起動が失敗していない"
         );
-        let start_body = body_json(start).await.to_string();
+        let start_body = body_json(start).await;
+        // 理由の文言そのもの（OS のエラー文は環境で変わるので、返ってきた
+        // 文言を目印として使う）。
+        let reason = start_body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         assert!(
-            start_body.contains(MARKER),
+            reason.contains("時系列ストレージエラー"),
             "起動を実行した本人にも理由が伝わっていない（埋め合わせが無い）: {start_body}"
         );
 
@@ -5441,8 +5604,9 @@ mod tests {
             body.get("reason").is_none(),
             "`reason` フィールドがワイヤに出ている: {body}"
         );
+        let wire = body.to_string();
         assert!(
-            !body.to_string().contains(MARKER),
+            !wire.contains(&reason) && !wire.contains(MARKER),
             "起動失敗の理由が viewer に漏れている: {body}"
         );
     }

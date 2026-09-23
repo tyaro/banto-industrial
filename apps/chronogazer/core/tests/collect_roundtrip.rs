@@ -256,7 +256,11 @@ async fn roundtrip(protocol: Protocol, protocol_name: &str, address: &str) {
     );
     assert_eq!(
         svc.state(),
-        CollectorState::Running { groups: 1, tags: 1 },
+        CollectorState::Running {
+            groups: 1,
+            tags: 1,
+            exclusions: vec![],
+        },
         "開始後の状態"
     );
 

@@ -68,13 +68,43 @@ export {
  * 1 つに潰さない - どれも「動いていない」だが、次の一手が違う。
  *
  * **`startFailed` に理由は無い**（このモジュールの doc 参照）。
+ *
+ * **#414 段階2: `running` と `noTargets` は `exclusions`（開始時に外した設定の
+ * 一覧）を持つ**。一覧は状態の中にあるので、停止・再起動で状態が変われば
+ * 一緒に入れ替わる（前回の一覧は残らない）。
  */
 export type CollectorStateView =
 	| { state: 'stopped' }
 	| { state: 'starting' }
-	| { state: 'running'; groups: number; tags: number }
-	| { state: 'noTargets' }
+	| { state: 'running'; groups: number; tags: number; exclusions: ExclusionView[] }
+	| { state: 'noTargets'; exclusions: ExclusionView[] }
 	| { state: 'startFailed' };
+
+/** `chronogazer_core::collect::ExclusionUnitView`。 */
+export type ExclusionUnit = 'connection' | 'group' | 'tag';
+
+/**
+ * `chronogazer_core::collect::ExclusionView`（#414 段階2）: 開始時に外した
+ * 設定 1 件。**判定は Rust（`banto_collect::build_config_lenient_from`）
+ * だけ**で、画面は表示するだけ（ここに判定を書き写さない）。
+ *
+ * - `reason`: 機械可読な分類（`invalidAddress` / `unknownDataType` /
+ *   `bitAddressOnNonBitType` / `invalidPort` / `invalidUnitId` /
+ *   `unsupportedProtocol` / `invalidPeriod` / `connectionExcluded` /
+ *   `groupExcluded`）。
+ * - `message`: 人間向けの文言。タグは保存時の拒否理由（#418）と同じ文言。
+ *
+ * 接続先ホスト・資格情報・ファイルパスは載っていない（Rust 側の doc と
+ * テストが固定）。
+ */
+export interface ExclusionView {
+	unit: ExclusionUnit;
+	id: number;
+	key: string;
+	name: string;
+	reason: string;
+	message: string;
+}
 
 /**
  * `chronogazer_core::collect::CollectorState`（**内部型**）。
@@ -87,8 +117,8 @@ export type CollectorStateView =
 export type CollectorState =
 	| { state: 'stopped' }
 	| { state: 'starting' }
-	| { state: 'running'; groups: number; tags: number }
-	| { state: 'noTargets' }
+	| { state: 'running'; groups: number; tags: number; exclusions: ExclusionView[] }
+	| { state: 'noTargets'; exclusions: ExclusionView[] }
 	| { state: 'startFailed'; reason: string };
 
 /**
@@ -119,6 +149,28 @@ export type Readout<T> =
 
 /** [`Readout`] の 3 つのタグ（純関数の入力にするために名前を付けたもの）。 */
 export type ReadoutState = Readout<unknown>['state'];
+
+/**
+ * `chronogazer_core::collect::QualityView`（現在値の品質）。
+ *
+ * - `good` / `bad`（読みに行って失敗した = 待てば直りうる）/ `stale`（古い）。
+ * - **`invalid`**（#414 段階2）: 開始時に**設定が不正で外した**タグ。値も
+ *   時刻も無い。設定を直して「収集を再起動」するまで読まない - **`bad` と
+ *   混ぜない**。
+ */
+export type QualityView = 'good' | 'bad' | 'stale' | 'invalid';
+
+/**
+ * `chronogazer_core::collect::CurrentSampleView`（現在値 1 件）。
+ *
+ * `value` は読めなかった・外したときは `null`（**0 ではない**）。
+ * `ptimeMs` は `invalid` のときだけ `null`（一度も読んでいない）。
+ */
+export interface CurrentSampleView {
+	value: number | null;
+	ptimeMs: number | null;
+	quality: QualityView;
+}
 
 /** `chronogazer_core::collect::ConnectionStatusView`。 */
 export type ConnectionStatusView =
@@ -270,6 +322,20 @@ export async function getCollectStatus(signal?: AbortSignal): Promise<CollectorS
 }
 
 /**
+ * 現在値（`viewer` 以上）。キーは `tag:<id>`。`notRunning` と `ready` のみ
+ * （葉から読むので `unavailable` は返らない）。#414 段階2 で外したタグは
+ * `quality: 'invalid'`・`value: null` で載る。
+ */
+export async function getCollectValues(
+	signal?: AbortSignal
+): Promise<Readout<Record<string, CurrentSampleView>>> {
+	if (!isCollectAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri')
+		return invokeCommand<Readout<Record<string, CurrentSampleView>>>('collect_values');
+	return httpJson<Readout<Record<string, CurrentSampleView>>>('/api/collect/values', 'GET', signal);
+}
+
+/**
  * 接続ごとの状態（`viewer` 以上）。**3 つの結末すべてを返しうる唯一の口**
  * （走っていない / 読めなかった / 読めて 0 件）。
  */
@@ -390,7 +456,11 @@ export function collectStateDetail(state: CollectorStateView): string {
 		case 'running':
 			return 'タグの設定を変えたときは「収集を再起動」で反映します（自動では反映されません）。';
 		case 'noTargets':
-			return '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「タグ設定」でタグを登録・有効化してから「収集を再起動」を押してください。';
+			// #414 段階2: 全部が設定の不正で外れた場合は、登録・有効化ではなく
+			// 「直す」が次の一手（一覧は `collectExclusionsHeadline` の下に出る）。
+			return state.exclusions.length > 0
+				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外した設定」を「タグ設定」で直してから「収集を再起動」を押してください。'
+				: '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「タグ設定」でタグを登録・有効化してから「収集を再起動」を押してください。';
 		case 'startFailed':
 			return '前回の開始が失敗したままです。失敗した理由はこの状態表示には含まれません - 「収集を開始」を押すと、その結果として理由が表示されます。';
 	}
@@ -404,6 +474,52 @@ export function collectStateDetail(state: CollectorStateView): string {
  */
 export function toCollectStateView(state: CollectorState): CollectorStateView {
 	return state.state === 'startFailed' ? { state: 'startFailed' } : state;
+}
+
+/**
+ * 状態が持つ除外の一覧（#414 段階2、純関数）。`running` / `noTargets` 以外は
+ * 空（その時点で走っている構成が無い）。
+ */
+export function collectExclusions(state: CollectorStateView): ExclusionView[] {
+	return state.state === 'running' || state.state === 'noTargets' ? state.exclusions : [];
+}
+
+/**
+ * 除外の見出し（純関数）。0 件なら `null`（何も出さない）- 「除外なし」を
+ * 常に出すと、読み手が毎回確かめる行が 1 つ増えるだけなので出さない。
+ */
+export function collectExclusionsHeadline(count: number): string | null {
+	return count === 0 ? null : `除外あり（${count} 件）`;
+}
+
+/** 除外の単位の表示（純関数）。`/tags` の 3 セクションの見出しと同じ語。 */
+export function exclusionUnitLabel(unit: ExclusionUnit): string {
+	switch (unit) {
+		case 'connection':
+			return 'PLC接続';
+		case 'group':
+			return '収集グループ';
+		case 'tag':
+			return 'タグ';
+	}
+}
+
+/**
+ * 現在値の品質の表示（純関数）。**`invalid`（設定が不正で外した）と `bad`
+ * （通信エラー）を同じ文言にしない** - 次の一手が違う（設定を直す / 待つ・
+ * 接続を確かめる）。R1-D の監視画面が使う想定。
+ */
+export function qualityLabel(quality: QualityView): string {
+	switch (quality) {
+		case 'good':
+			return '正常';
+		case 'bad':
+			return '通信エラー';
+		case 'stale':
+			return '更新停止';
+		case 'invalid':
+			return '設定不正（収集対象外）';
+	}
 }
 
 /** 操作の応答に理由が載っていれば取り出す（純関数）。無ければ `null`。 */

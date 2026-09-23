@@ -513,6 +513,30 @@ export function coverageReloadSettled<T>(
 		: { items: started.items, error: outcome.message };
 }
 
+/**
+ * 「収集の開始時に外される設定」ブロックの見せ方（#414 段階2、純関数）:
+ * - `loading` / `failed`: 判定を**まだ読めていない / 読めなかった**。
+ *   「不正な設定はありません」と言わない（読めていないを 0 件に潰さない）。
+ * - `none`: 読めて 0 件（ブロックは出さない）。
+ * - `list`: 読めて 1 件以上。
+ *
+ * 判定の再取得は [`coverageReloadStarted`] / [`coverageReloadSettled`] と同じ
+ * 形で行う（**前回の結果を持ち越さない** - #417 の P2 と同じ理由。接続・
+ * グループ・タグのどれを変えても判定は変わる）。
+ */
+export type ConfigExclusionsView = 'loading' | 'failed' | 'none' | 'list';
+
+export function configExclusionsView<T>(state: ListLoadState<T>): ConfigExclusionsView {
+	switch (listSectionView(state)) {
+		case 'loading':
+			return 'loading';
+		case 'failed':
+			return 'failed';
+		default:
+			return (state.items as T[]).length > 0 ? 'list' : 'none';
+	}
+}
+
 export function simulationCoverageView<T extends { supported: boolean }>(
 	hasSimulationConnection: boolean,
 	state: ListLoadState<T>

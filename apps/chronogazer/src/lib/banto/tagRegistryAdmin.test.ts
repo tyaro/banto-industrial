@@ -80,6 +80,7 @@ import {
 	createTag,
 	deleteTag,
 	listSimulationCoverage,
+	listConfigExclusions,
 	isTagRegistryAvailable,
 	DEMO_MODE_MESSAGE,
 	ALLOWED_PERIOD_MS,
@@ -156,6 +157,7 @@ describe('デモモード（バックエンドが無い）', () => {
 		await expect(listTags()).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(createTag(tagInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(listSimulationCoverage()).rejects.toThrow(DEMO_MODE_MESSAGE);
+		await expect(listConfigExclusions()).rejects.toThrow(DEMO_MODE_MESSAGE);
 
 		expect(invoke).not.toHaveBeenCalled();
 		expect(fetchSpy).not.toHaveBeenCalled();
@@ -225,6 +227,13 @@ describe('Tauri モード', () => {
 		expect(invoke).toHaveBeenCalledWith('simulation_coverage_list', undefined);
 	});
 
+	it('#414 段階2: listConfigExclusions は invoke("config_exclusions_list") を引数なしで呼ぶ', async () => {
+		testState.bantoMode = 'tauri';
+		vi.mocked(invoke).mockResolvedValueOnce([]);
+		await listConfigExclusions();
+		expect(invoke).toHaveBeenCalledWith('config_exclusions_list', undefined);
+	});
+
 	it('invoke が例外を投げたら field_errors を保った ProviderError として reject する', async () => {
 		testState.bantoMode = 'tauri';
 		vi.mocked(invoke).mockRejectedValueOnce({
@@ -285,6 +294,13 @@ describe('サーバーモード（REST）', () => {
 		await listSimulationCoverage();
 		expect(fetch).toHaveBeenCalledWith(
 			'/api/simulation-coverage',
+			expect.objectContaining({ method: 'GET' })
+		);
+
+		mockFetchOnce({ status: 200, ok: true, body: [] });
+		await listConfigExclusions();
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/config-exclusions',
 			expect.objectContaining({ method: 'GET' })
 		);
 	});

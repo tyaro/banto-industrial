@@ -17,6 +17,22 @@
 //! (the tstore [`StoreConfig`], the per-connection tasks) is derived from
 //! this filtered set, so a disabled connection contributes nothing - no
 //! socket, no columns, no cache entries.
+//!
+//! ## Strict and lenient builds (#414 段階2, 2026-09-23 オーナー決定)
+//!
+//! [`build_config_from`] (and [`build_config`]) is **strict**: one unusable
+//! connection, group or tag fails the whole build with
+//! [`CollectError::Config`]. banto-hub relies on that (`last_config_error`
+//! keeps the previous catalog running) and its wording is frozen.
+//!
+//! [`build_config_lenient_from`] **leaves the unusable items out and builds
+//! the rest**, returning what it left out as [`ConfigExclusion`]s (a broken
+//! connection takes its groups and tags with it, a broken group its tags).
+//! ChronoGazer starts collection with it: "開始時に不正なタグ・接続だけを
+//! 外し、残りを動かす". There is one interpreter - the strict build *is* the
+//! lenient build failing on its first exclusion - so the two cannot
+//! disagree about what is unusable. An excluded tag gets no tstore column,
+//! so its history reads as `null` (not an error) through `banto-tsquery`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -447,7 +463,246 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
 /// This is the shared preflight path used by banto-hub's catalog commit and
 /// run application; it preserves the filtering and validation semantics of
 /// [`build_config`].
+///
+/// #414 段階2: this is now [`build_config_lenient_from`] plus "fail on the
+/// first exclusion". There is **one** interpreter - the lenient builder walks
+/// the registry in exactly the order this function always did (connections
+/// by id; per connection: protocol, then port/unit id; then its groups by
+/// id; per group: every tag by id, *then* the period), and records each
+/// failure as a [`ConfigExclusion`] where this function used to `?` out.
+/// So the first exclusion is exactly the item this function used to fail
+/// on, and [`ConfigExclusion::strict_error`] rebuilds the very same
+/// [`CollectError::Config`] text - banto-hub's `last_config_error` does not
+/// change by a character (the goldens in this module's tests were run
+/// against the pre-段階2 implementation first).
 pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, CollectError> {
+    let (config, exclusions) = build_config_lenient_from(snapshot);
+    match exclusions.iter().find_map(ConfigExclusion::strict_error) {
+        Some(err) => Err(err),
+        None => Ok(config),
+    }
+}
+
+/// Which level of the registry a [`ConfigExclusion`] took out of collection
+/// (#414 段階2) - the three units [`build_config_from`] can fail on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionUnit {
+    Connection,
+    Group,
+    Tag,
+}
+
+impl ExclusionUnit {
+    /// Stable wire spelling (`connection` / `group` / `tag`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExclusionUnit::Connection => "connection",
+            ExclusionUnit::Group => "group",
+            ExclusionUnit::Tag => "tag",
+        }
+    }
+}
+
+/// Why [`build_config_lenient_from`] left an item out (#414 段階2).
+///
+/// The first five variants are the item's *own* fault - each one is exactly
+/// one of the `CollectError::Config` cases [`build_config_from`] raises. The
+/// last two are cascades: the item itself may be fine, but its connection or
+/// group was excluded, so there is nothing to collect it through. A cascade
+/// names its parent so the list can be followed back to the item that needs
+/// fixing.
+///
+/// Every value in here (protocol string, port, unit id, period, address,
+/// data type, `banto_plc`'s parse error for the address, parent names) is
+/// registry data the row already carries - never a host name, credential or
+/// file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExclusionReason {
+    /// `plc_connections.protocol` is not `modbus-tcp` / `slmp`.
+    UnsupportedProtocol { protocol: String },
+    /// `plc_connections.port` does not fit a TCP port (`u16`).
+    InvalidPort { port: i64 },
+    /// `plc_connections.unit_id` does not fit a Modbus unit id (`u8`).
+    InvalidUnitId { unit_id: i64 },
+    /// `collection_groups.period_ms` does not fit `u32`.
+    InvalidPeriod { period_ms: i64 },
+    /// The tag's address/data type cannot be read under its connection's
+    /// protocol (the same [`TagAddressIssue`] the save-time check returns).
+    InvalidTag {
+        address: String,
+        data_type: String,
+        issue: TagAddressIssue,
+    },
+    /// The owning connection was excluded.
+    ConnectionExcluded { connection_name: String },
+    /// The owning group was excluded.
+    GroupExcluded { group_name: String },
+}
+
+impl ExclusionReason {
+    /// Machine-readable classification (stable wire spelling).
+    pub fn code(&self) -> &'static str {
+        match self {
+            ExclusionReason::UnsupportedProtocol { .. } => "unsupportedProtocol",
+            ExclusionReason::InvalidPort { .. } => "invalidPort",
+            ExclusionReason::InvalidUnitId { .. } => "invalidUnitId",
+            ExclusionReason::InvalidPeriod { .. } => "invalidPeriod",
+            ExclusionReason::InvalidTag { issue, .. } => match issue {
+                TagAddressIssue::InvalidAddress { .. } => "invalidAddress",
+                TagAddressIssue::UnknownDataType => "unknownDataType",
+                TagAddressIssue::BitAddressOnNonBitType => "bitAddressOnNonBitType",
+            },
+            ExclusionReason::ConnectionExcluded { .. } => "connectionExcluded",
+            ExclusionReason::GroupExcluded { .. } => "groupExcluded",
+        }
+    }
+
+    /// A human-readable reason, for a list that shows the item's unit and
+    /// name next to it (so, unlike the strict error text, it does not repeat
+    /// the name). For a tag it is **exactly** [`TagAddressIssue::message`] -
+    /// the wording the save-time check (#414 段階1) rejects the same tag with.
+    pub fn message(&self) -> String {
+        match self {
+            ExclusionReason::UnsupportedProtocol { protocol } => {
+                format!("プロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）")
+            }
+            ExclusionReason::InvalidPort { port } => format!("ポート番号が不正です: {port}"),
+            ExclusionReason::InvalidUnitId { unit_id } => {
+                format!("ユニットIDが不正です: {unit_id}")
+            }
+            ExclusionReason::InvalidPeriod { period_ms } => {
+                format!("収集周期（period_ms）が不正です: {period_ms}")
+            }
+            ExclusionReason::InvalidTag { issue, .. } => issue.message(),
+            ExclusionReason::ConnectionExcluded { connection_name } => {
+                format!("所属する PLC接続「{connection_name}」が除外されたため、収集しません")
+            }
+            ExclusionReason::GroupExcluded { group_name } => {
+                format!("所属する収集グループ「{group_name}」が除外されたため、収集しません")
+            }
+        }
+    }
+}
+
+/// One registry item [`build_config_lenient_from`] left out of the
+/// [`CollectorConfig`] it returned (#414 段階2).
+///
+/// Only enabled, otherwise-collected rows can be excluded: a disabled row, a
+/// `virtual`/`postgres` connection and a `string` tag are not collected in
+/// the first place (see [`build_config_from`]) and never show up here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigExclusion {
+    pub unit: ExclusionUnit,
+    /// The registry row id (`plc_connections.id` / `collection_groups.id` /
+    /// `tags.id`, according to `unit`).
+    pub id: i64,
+    /// `conn:<id>` / `grp:<id>` / `tag:<id>` - the same keys the collector
+    /// uses for its status map, events and current values.
+    pub key: String,
+    /// The row's `name`.
+    pub name: String,
+    pub reason: ExclusionReason,
+}
+
+impl ConfigExclusion {
+    fn connection(conn: &PlcConnection, reason: ExclusionReason) -> Self {
+        Self {
+            unit: ExclusionUnit::Connection,
+            id: conn.id,
+            key: connection_key(conn.id),
+            name: conn.name.clone(),
+            reason,
+        }
+    }
+
+    fn group(group: &CollectionGroup, reason: ExclusionReason) -> Self {
+        Self {
+            unit: ExclusionUnit::Group,
+            id: group.id,
+            key: group_key(group.id),
+            name: group.name.clone(),
+            reason,
+        }
+    }
+
+    fn tag(tag: &Tag, reason: ExclusionReason) -> Self {
+        Self {
+            unit: ExclusionUnit::Tag,
+            id: tag.id,
+            key: tag_key(tag.id),
+            name: tag.name.clone(),
+            reason,
+        }
+    }
+
+    /// The [`CollectError::Config`] the strict [`build_config_from`] raises
+    /// for this item - **the pre-#414-段階2 wording, character for
+    /// character** (it names the item, since a config-build failure has no
+    /// form field to sit next to). `None` for a cascade: the strict build
+    /// has already failed on the parent by then.
+    pub fn strict_error(&self) -> Option<CollectError> {
+        let name = &self.name;
+        let message = match &self.reason {
+            ExclusionReason::UnsupportedProtocol { protocol } => format!(
+                "接続 {name} のプロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）"
+            ),
+            ExclusionReason::InvalidPort { port } => {
+                format!("接続 {name} のポート番号が不正です: {port}")
+            }
+            ExclusionReason::InvalidUnitId { unit_id } => {
+                format!("接続 {name} のユニットIDが不正です: {unit_id}")
+            }
+            ExclusionReason::InvalidPeriod { period_ms } => {
+                format!("グループ {name} の period_ms が不正です: {period_ms}")
+            }
+            ExclusionReason::InvalidTag {
+                address,
+                data_type,
+                issue,
+            } => match issue {
+                TagAddressIssue::InvalidAddress { reason, .. } => {
+                    format!("タグ {name} のアドレス {address} が不正です: {reason}")
+                }
+                TagAddressIssue::UnknownDataType => {
+                    format!("タグ {name} のデータ型 {data_type} は未対応です")
+                }
+                TagAddressIssue::BitAddressOnNonBitType => format!(
+                    "タグ {name} のアドレス {address} はビット指定アドレスです。ビット指定アドレスは \
+                     data_type=bit のタグでのみ使えます（現在のデータ型: {data_type}）"
+                ),
+            },
+            ExclusionReason::ConnectionExcluded { .. } | ExclusionReason::GroupExcluded { .. } => {
+                return None
+            }
+        };
+        Some(CollectError::Config(message))
+    }
+}
+
+/// #414 段階2 (2026-09-23 オーナー決定「開始時に不正なタグ・接続だけを外し、
+/// 残りを動かす」): build a [`CollectorConfig`] from `snapshot`, **leaving
+/// out** every connection, group and tag [`build_config_from`] would fail
+/// on, and return what was left out.
+///
+/// - A connection whose protocol/port/unit id is unusable is excluded
+///   together with all of its enabled groups and their tags (each listed as
+///   [`ExclusionReason::ConnectionExcluded`]).
+/// - A group whose period is unusable is excluded together with its tags
+///   ([`ExclusionReason::GroupExcluded`] for the tags that were fine on
+///   their own; a tag that is also broken itself is listed with its own
+///   reason, ahead of the group - the order [`build_config_from`] checks in).
+/// - A tag whose address/data type is unusable is excluded alone; the rest
+///   of its group is collected. **It gets no tstore column**, so its history
+///   in files written while it was excluded reads as `null`
+///   (`banto-tsquery` resolves a `tag_key` a file does not describe to
+///   "no value", not to an error).
+///
+/// Same filtering, same order, same interpreter as [`build_config_from`]
+/// (which is this function plus "fail on the first exclusion"). banto-hub
+/// keeps using the strict one; chronogazer starts collection with this one.
+pub fn build_config_lenient_from(
+    snapshot: &RegistrySnapshot,
+) -> (CollectorConfig, Vec<ConfigExclusion>) {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
     let tags = &snapshot.tags;
@@ -500,6 +755,9 @@ pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig,
     // not) would make `parse_protocol` reject the whole config, since the
     // loop below runs over every enabled connection regardless of whether it
     // has any groups yet.
+    //
+    // (Neither of these is a `ConfigExclusion`: they are not collected by
+    // design, not "left out because broken".)
     let mut enabled_connections: Vec<&PlcConnection> = connections
         .iter()
         .filter(|c| c.enabled && c.protocol != "virtual" && !c.is_db_source())
@@ -508,16 +766,49 @@ pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig,
 
     let mut connection_plans = Vec::new();
     let mut store_groups = Vec::new();
+    let mut exclusions = Vec::new();
 
     for conn in enabled_connections {
-        let protocol = parse_protocol(&conn.protocol, &conn.name)?;
-        let client_config = match protocol {
-            Protocol::ModbusTcp => ProtocolConfig::ModbusTcp(modbus_config_for(conn)?),
-            Protocol::Slmp => ProtocolConfig::Slmp(slmp_config_for(conn)?),
-        };
-
         let mut conn_groups = groups_by_connection.remove(&conn.id).unwrap_or_default();
         conn_groups.sort_by_key(|g| g.id);
+
+        let resolved = parse_protocol(&conn.protocol).and_then(|protocol| {
+            let client_config = match protocol {
+                Protocol::ModbusTcp => ProtocolConfig::ModbusTcp(modbus_config_for(conn)?),
+                Protocol::Slmp => ProtocolConfig::Slmp(slmp_config_for(conn)?),
+            };
+            Ok((protocol, client_config))
+        });
+        let (protocol, client_config) = match resolved {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                // The connection first (it is what needs fixing), then
+                // everything that was to be collected through it.
+                exclusions.push(ConfigExclusion::connection(conn, reason));
+                for group in conn_groups {
+                    exclusions.push(ConfigExclusion::group(
+                        group,
+                        ExclusionReason::ConnectionExcluded {
+                            connection_name: conn.name.clone(),
+                        },
+                    ));
+                    let mut group_tags = tags_by_group.remove(&group.id).unwrap_or_default();
+                    group_tags.sort_by_key(|t| t.id);
+                    for tag in group_tags {
+                        if tag.data_type == banto_tags::STRING_DATA_TYPE {
+                            continue;
+                        }
+                        exclusions.push(ConfigExclusion::tag(
+                            tag,
+                            ExclusionReason::ConnectionExcluded {
+                                connection_name: conn.name.clone(),
+                            },
+                        ));
+                    }
+                }
+                continue;
+            }
+        };
 
         let mut group_plans = Vec::new();
         let mut conn_store_groups = Vec::new();
@@ -528,6 +819,9 @@ pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig,
             let mut requests = Vec::with_capacity(group_tags.len());
             let mut tag_plans = Vec::with_capacity(group_tags.len());
             let mut store_columns = Vec::with_capacity(group_tags.len());
+            // Tags that were fine on their own - listed as cascades if the
+            // group itself turns out to be excluded below.
+            let mut readable_tags = Vec::with_capacity(group_tags.len());
 
             for tag in group_tags {
                 // S1 (relay-wright 文字列タグ): "string" is registry-legal
@@ -543,7 +837,24 @@ pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig,
                 if tag.data_type == banto_tags::STRING_DATA_TYPE {
                     continue;
                 }
-                let request = build_request(tag, protocol)?;
+                let request = match build_request(tag, protocol) {
+                    Ok(request) => request,
+                    Err(issue) => {
+                        // #414 段階2: this tag alone is left out - no read,
+                        // no store column (its history reads as null), and
+                        // the rest of the group still collects.
+                        exclusions.push(ConfigExclusion::tag(
+                            tag,
+                            ExclusionReason::InvalidTag {
+                                address: tag.address.clone(),
+                                data_type: tag.data_type.clone(),
+                                issue,
+                            },
+                        ));
+                        continue;
+                    }
+                };
+                readable_tags.push(tag);
                 requests.push(request);
                 tag_plans.push(TagPlan {
                     key: tag_key(tag.id),
@@ -566,12 +877,26 @@ pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig,
                 });
             }
 
-            let period_ms = u32::try_from(group.period_ms).map_err(|_| {
-                CollectError::Config(format!(
-                    "グループ {} の period_ms が不正です: {}",
-                    group.name, group.period_ms
-                ))
-            })?;
+            // The period is checked after the tags - the order
+            // `build_config_from` has always failed in (a bad tag in a group
+            // with a bad period is reported as the tag's error).
+            let Ok(period_ms) = u32::try_from(group.period_ms) else {
+                exclusions.push(ConfigExclusion::group(
+                    group,
+                    ExclusionReason::InvalidPeriod {
+                        period_ms: group.period_ms,
+                    },
+                ));
+                for tag in readable_tags {
+                    exclusions.push(ConfigExclusion::tag(
+                        tag,
+                        ExclusionReason::GroupExcluded {
+                            group_name: group.name.clone(),
+                        },
+                    ));
+                }
+                continue;
+            };
 
             let gkey = group_key(group.id);
             conn_store_groups.push(GroupConfig {
@@ -605,21 +930,32 @@ pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig,
         });
     }
 
-    Ok(CollectorConfig {
-        connections: connection_plans,
-        store_config: StoreConfig {
-            groups: store_groups,
+    (
+        CollectorConfig {
+            connections: connection_plans,
+            store_config: StoreConfig {
+                groups: store_groups,
+            },
         },
-    })
+        exclusions,
+    )
 }
 
-fn parse_protocol(protocol: &str, conn_name: &str) -> Result<Protocol, CollectError> {
+/// #414 段階2: just the exclusions [`build_config_lenient_from`] would make
+/// for `snapshot` - "which registry items would be left out if collection
+/// were started now". For a registry editor's marks (chronogazer's `/tags`),
+/// so the verdict comes from the one builder instead of a re-implementation.
+pub fn config_exclusions(snapshot: &RegistrySnapshot) -> Vec<ConfigExclusion> {
+    build_config_lenient_from(snapshot).1
+}
+
+fn parse_protocol(protocol: &str) -> Result<Protocol, ExclusionReason> {
     match protocol {
         "modbus-tcp" => Ok(Protocol::ModbusTcp),
         "slmp" => Ok(Protocol::Slmp),
-        other => Err(CollectError::Config(format!(
-            "接続 {conn_name} のプロトコル {other} は未対応です（modbus-tcp / slmp のみ対応）"
-        ))),
+        other => Err(ExclusionReason::UnsupportedProtocol {
+            protocol: other.to_string(),
+        }),
     }
 }
 
@@ -653,18 +989,11 @@ fn parse_protocol(protocol: &str, conn_name: &str) -> Result<Protocol, CollectEr
 /// two register pairs exactly like the existing 32bit types do - there is no
 /// separate word-order concept for them. A real device that needs
 /// `'low_high'` here: the OMRON KM-D1-ETN power meter.
-fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, CollectError> {
-    let port = u16::try_from(conn.port).map_err(|_| {
-        CollectError::Config(format!(
-            "接続 {} のポート番号が不正です: {}",
-            conn.name, conn.port
-        ))
-    })?;
-    let unit_id = u8::try_from(conn.unit_id).map_err(|_| {
-        CollectError::Config(format!(
-            "接続 {} のユニットIDが不正です: {}",
-            conn.name, conn.unit_id
-        ))
+fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, ExclusionReason> {
+    let port =
+        u16::try_from(conn.port).map_err(|_| ExclusionReason::InvalidPort { port: conn.port })?;
+    let unit_id = u8::try_from(conn.unit_id).map_err(|_| ExclusionReason::InvalidUnitId {
+        unit_id: conn.unit_id,
     })?;
     Ok(ModbusTcpConfig {
         host: conn.host.clone(),
@@ -701,13 +1030,9 @@ fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, CollectErr
 /// `connect_timeout`/`response_timeout` are overridden uniformly by
 /// [`crate::collector::Collector::start`] from [`crate::collector::CollectorOptions`],
 /// exactly like [`modbus_config_for`]'s.
-fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, CollectError> {
-    let port = u16::try_from(conn.port).map_err(|_| {
-        CollectError::Config(format!(
-            "接続 {} のポート番号が不正です: {}",
-            conn.name, conn.port
-        ))
-    })?;
+fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, ExclusionReason> {
+    let port =
+        u16::try_from(conn.port).map_err(|_| ExclusionReason::InvalidPort { port: conn.port })?;
     Ok(SlmpConfig {
         host: conn.host.clone(),
         port,
@@ -766,36 +1091,24 @@ fn parse_word_order(value: &str) -> WordOrder {
 /// from `build_config` as an all-or-nothing failure that keeps the previous
 /// catalog/`Collector` running (`last_config_error`), so a tag registered
 /// this way simply never reaches the live catalog until fixed.
-fn build_request(tag: &Tag, protocol: Protocol) -> Result<ReadRequest, CollectError> {
-    // #414 段階1: the interpretation itself lives in [`parse_read_request`],
-    // shared verbatim with the save-time check [`check_tag_address`]. Only
-    // the *wording* differs - this path keeps its original messages (tag
-    // name included, since a config-build failure names no form field), so
-    // banto-hub's `last_config_error` text is unchanged.
-    parse_read_request(protocol, &tag.address, &tag.data_type).map_err(|issue| {
-        CollectError::Config(match issue {
-            TagAddressIssue::InvalidAddress { reason, .. } => format!(
-                "タグ {} のアドレス {} が不正です: {reason}",
-                tag.name, tag.address
-            ),
-            TagAddressIssue::UnknownDataType => format!(
-                "タグ {} のデータ型 {} は未対応です",
-                tag.name, tag.data_type
-            ),
-            TagAddressIssue::BitAddressOnNonBitType => format!(
-                "タグ {} のアドレス {} はビット指定アドレスです。ビット指定アドレスは \
-                 data_type=bit のタグでのみ使えます（現在のデータ型: {}）",
-                tag.name, tag.address, tag.data_type
-            ),
-        })
-    })
+///
+/// **The single interpreter** behind the config build
+/// ([`build_config_lenient_from`], and so [`build_config_from`]) and the
+/// save-time check [`check_tag_address`] (#414 段階1). Keeping one function
+/// means "what a registry editor accepts on save" and "what the config build
+/// accepts" cannot drift apart. Only the *wording* differs per caller: the
+/// strict build names the tag ([`ConfigExclusion::strict_error`] - the
+/// pre-段階2 text, so banto-hub's `last_config_error` is unchanged), a form
+/// or an exclusion list does not ([`TagAddressIssue::message`]). #414 段階2:
+/// a failure here no longer fails the lenient build - the tag alone is left
+/// out ([`ExclusionReason::InvalidTag`]).
+fn build_request(tag: &Tag, protocol: Protocol) -> Result<ReadRequest, TagAddressIssue> {
+    parse_read_request(protocol, &tag.address, &tag.data_type)
 }
 
-/// The single interpreter behind both [`build_request`] (config build) and
-/// [`check_tag_address`] (save-time check, #414 段階1). Keeping one function
-/// means "what a registry editor accepts on save" and "what
-/// [`build_config_from`] accepts" cannot drift apart - see
-/// [`build_request`]'s doc comment for the rules themselves.
+/// The interpreter itself (see [`build_request`] for the rules), on raw
+/// strings so [`check_tag_address`] can call it for a tag that is not saved
+/// yet.
 fn parse_read_request(
     protocol: Protocol,
     address: &str,
@@ -835,9 +1148,10 @@ pub enum TagAddressField {
 }
 
 /// Why [`check_tag_address`] rejected a tag (#414 段階1). Each variant is
-/// exactly one of the `CollectError::Config` cases [`build_request`] raises
-/// for a tag, so "rejected on save" and "would fail [`build_config_from`]"
-/// are the same predicate.
+/// exactly one of the `CollectError::Config` cases the strict
+/// [`build_config_from`] raises for a tag (via [`build_request`]), so
+/// "rejected on save" and "would fail [`build_config_from`]" are the same
+/// predicate. #414 段階2: also carried by [`ExclusionReason::InvalidTag`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagAddressIssue {
     /// The address text does not parse under the connection protocol's
@@ -862,10 +1176,12 @@ impl TagAddressIssue {
         }
     }
 
-    /// A human-readable reason for a form field. Unlike [`build_request`]'s
-    /// messages it does not name the tag (the operator is looking at that
-    /// tag's own form), but it does name the notation the connection
-    /// expects, with an example.
+    /// A human-readable reason for a form field (and, #414 段階2, for an
+    /// exclusion list - [`ExclusionReason::message`]). Unlike the strict
+    /// build's messages ([`ConfigExclusion::strict_error`]) it does not name
+    /// the tag (the operator is looking at that tag's own form, or at a list
+    /// row that already shows its name), but it does name the notation the
+    /// connection expects, with an example.
     pub fn message(&self) -> String {
         match self {
             TagAddressIssue::InvalidAddress { protocol, reason } => {
@@ -1993,5 +2309,395 @@ mod tests {
                 "{protocol} / {address} / {data_type}: build={built:?} check={checked:?}"
             );
         }
+    }
+
+    // --- #414 段階2: the strict builder's wording is frozen ----------------
+    //
+    // banto-hub's `last_config_error` shows `build_config`'s text verbatim,
+    // so the strict path must keep failing on the *same* item with the
+    // *same* words after `build_config_from` was rebuilt on top of the
+    // lenient builder. These goldens were run against the pre-#414-段階2
+    // implementation first (they passed there unchanged).
+
+    /// One valid Modbus connection "PLC1" (port 502) with group "G1"
+    /// (1000 ms) and tag "T1" (40001, i16), loaded as a snapshot - each
+    /// golden case then breaks exactly one field in memory (the registry
+    /// services would reject most of these values on write, which is the
+    /// point: they model rows that got in some other way).
+    async fn golden_snapshot() -> RegistrySnapshot {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input("PLC1", 502))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, "40001"))
+            .await
+            .unwrap();
+        RegistrySnapshot::load(&pool).await.unwrap()
+    }
+
+    fn strict_message(snapshot: &RegistrySnapshot) -> String {
+        match build_config_from(snapshot) {
+            Err(CollectError::Config(message)) => message,
+            other => panic!("expected CollectError::Config, got {other:?}"),
+        }
+    }
+
+    type Break = fn(&mut RegistrySnapshot);
+
+    /// `(label, how to break the golden snapshot, the strict message)`.
+    /// Shared with the lenient-builder tests, which check that the *first*
+    /// exclusion is exactly the item named here.
+    const GOLDEN_CASES: &[(&str, Break, &str)] = &[
+        (
+            "unsupported protocol",
+            |s| s.connections[0].protocol = "ethernet-ip".to_string(),
+            "接続 PLC1 のプロトコル ethernet-ip は未対応です（modbus-tcp / slmp のみ対応）",
+        ),
+        (
+            "modbus port",
+            |s| s.connections[0].port = 70_000,
+            "接続 PLC1 のポート番号が不正です: 70000",
+        ),
+        (
+            "modbus unit id",
+            |s| s.connections[0].unit_id = 300,
+            "接続 PLC1 のユニットIDが不正です: 300",
+        ),
+        (
+            "slmp port",
+            |s| {
+                s.connections[0].protocol = "slmp".to_string();
+                s.tags[0].address = "D100".to_string();
+                s.connections[0].port = -1;
+            },
+            "接続 PLC1 のポート番号が不正です: -1",
+        ),
+        (
+            "group period",
+            |s| s.groups[0].period_ms = -5,
+            "グループ G1 の period_ms が不正です: -5",
+        ),
+        (
+            "tag address",
+            |s| s.tags[0].address = "99999".to_string(),
+            "タグ T1 のアドレス 99999 が不正です: GOLDEN_ADDRESS_REASON",
+        ),
+        (
+            "tag data type",
+            |s| s.tags[0].data_type = "f128".to_string(),
+            "タグ T1 のデータ型 f128 は未対応です",
+        ),
+        (
+            "bit address on a non-bit tag",
+            |s| s.tags[0].address = "40001.3".to_string(),
+            "タグ T1 のアドレス 40001.3 はビット指定アドレスです。ビット指定アドレスは \
+             data_type=bit のタグでのみ使えます（現在のデータ型: i16）",
+        ),
+        (
+            // Within one group the tags are parsed before the period is
+            // checked, so a bad tag wins over a bad period.
+            "bad tag and bad period in one group",
+            |s| {
+                s.tags[0].data_type = "f128".to_string();
+                s.groups[0].period_ms = -5;
+            },
+            "タグ T1 のデータ型 f128 は未対応です",
+        ),
+        (
+            // The connection is checked before any of its groups.
+            "bad connection and bad tag under it",
+            |s| {
+                s.connections[0].port = 70_000;
+                s.tags[0].data_type = "f128".to_string();
+            },
+            "接続 PLC1 のポート番号が不正です: 70000",
+        ),
+        (
+            // A broken connection fails the strict build even when it has
+            // nothing to collect.
+            "bad connection without any group",
+            |s| {
+                s.connections[0].port = 70_000;
+                s.groups.clear();
+                s.tags.clear();
+            },
+            "接続 PLC1 のポート番号が不正です: 70000",
+        ),
+    ];
+
+    fn golden_expected(expected: &str) -> String {
+        let address_reason = Address::parse("99999").unwrap_err().to_string();
+        expected.replace("GOLDEN_ADDRESS_REASON", &address_reason)
+    }
+
+    #[tokio::test]
+    async fn strict_messages_are_unchanged_for_every_failure_unit() {
+        let base = golden_snapshot().await;
+        for (label, break_it, expected) in GOLDEN_CASES {
+            let mut snapshot = base.clone();
+            break_it(&mut snapshot);
+            assert_eq!(
+                strict_message(&snapshot),
+                golden_expected(expected),
+                "{label}"
+            );
+        }
+    }
+
+    /// Disabled rows never fail the strict build, whatever they contain.
+    #[tokio::test]
+    async fn strict_build_ignores_broken_disabled_rows() {
+        let base = golden_snapshot().await;
+
+        let mut snapshot = base.clone();
+        snapshot.connections[0].port = 70_000;
+        snapshot.connections[0].enabled = false;
+        assert_eq!(build_config_from(&snapshot).unwrap().tag_count(), 0);
+
+        let mut snapshot = base.clone();
+        snapshot.groups[0].period_ms = -5;
+        snapshot.groups[0].enabled = false;
+        assert_eq!(build_config_from(&snapshot).unwrap().tag_count(), 0);
+
+        let mut snapshot = base;
+        snapshot.tags[0].address = "99999".to_string();
+        snapshot.tags[0].enabled = false;
+        assert_eq!(build_config_from(&snapshot).unwrap().tag_count(), 0);
+        assert!(config_exclusions(&snapshot).is_empty());
+    }
+
+    // --- #414 段階2: the lenient builder ---------------------------------
+
+    /// The strict build is "the lenient build, failing on the first
+    /// exclusion": for every golden case the lenient build's first exclusion
+    /// rebuilds exactly the golden text, and a clean snapshot has none.
+    #[tokio::test]
+    async fn the_first_exclusion_is_the_item_the_strict_build_fails_on() {
+        let base = golden_snapshot().await;
+        let (config, exclusions) = build_config_lenient_from(&base);
+        assert!(exclusions.is_empty());
+        assert_eq!(config, build_config_from(&base).unwrap());
+
+        for (label, break_it, expected) in GOLDEN_CASES {
+            let mut snapshot = base.clone();
+            break_it(&mut snapshot);
+            let (_, exclusions) = build_config_lenient_from(&snapshot);
+            let first = exclusions.first().expect(label);
+            match first.strict_error() {
+                Some(CollectError::Config(message)) => {
+                    assert_eq!(message, golden_expected(expected), "{label}")
+                }
+                other => panic!("{label}: {other:?}"),
+            }
+        }
+    }
+
+    /// Everything that can go wrong at once, across two connections. Only
+    /// the good tag of the good group of the good connection is collected;
+    /// every other enabled item is listed, parent before its cascades, in
+    /// the order the strict build walks the registry.
+    #[tokio::test]
+    async fn broken_items_are_left_out_and_the_rest_is_built() {
+        let pool = registry().await;
+        let conns = PlcConnectionService::new(pool.clone());
+        let groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
+        let conn_a = conns.create(conn_input("PLC-A", 502)).await.unwrap();
+        let conn_b = conns.create(conn_input("PLC-B", 503)).await.unwrap();
+        let g1 = groups
+            .create(group_input("G1", conn_a.id, 1_000))
+            .await
+            .unwrap();
+        let g2 = groups
+            .create(group_input("G2", conn_b.id, 1_000))
+            .await
+            .unwrap();
+        let g3 = groups
+            .create(group_input("G3", conn_a.id, 1_000))
+            .await
+            .unwrap();
+        let t1 = tags.create(tag_input("T1", g1.id, "40001")).await.unwrap();
+        let t2 = tags.create(tag_input("T2", g1.id, "D3000")).await.unwrap();
+        let mut string_tag = tag_input("T-str", g1.id, "D3000");
+        string_tag.data_type = banto_tags::STRING_DATA_TYPE.to_string();
+        string_tag.string_length = Some(4);
+        tags.create(string_tag).await.unwrap();
+        let t4 = tags.create(tag_input("T4", g2.id, "40001")).await.unwrap();
+        let t5 = tags.create(tag_input("T5", g3.id, "40001")).await.unwrap();
+        let t6 = tags.create(tag_input("T6", g3.id, "40002")).await.unwrap();
+
+        let mut snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        let i = snapshot
+            .connections
+            .iter()
+            .position(|c| c.id == conn_b.id)
+            .unwrap();
+        snapshot.connections[i].port = 70_000;
+        let i = snapshot.groups.iter().position(|g| g.id == g3.id).unwrap();
+        snapshot.groups[i].period_ms = -5;
+        let i = snapshot.tags.iter().position(|t| t.id == t6.id).unwrap();
+        snapshot.tags[i].data_type = "f128".to_string();
+
+        let (config, exclusions) = build_config_lenient_from(&snapshot);
+
+        // What is left: PLC-A / G1 / T1 only (T2 out, the string tag
+        // skipped as always).
+        assert_eq!(config.connections.len(), 1);
+        assert_eq!(config.connections[0].key, format!("conn:{}", conn_a.id));
+        assert_eq!(config.group_count(), 1);
+        assert_eq!(config.tag_count(), 1);
+        assert_eq!(
+            config.connections[0].groups[0].tags[0].key,
+            format!("tag:{}", t1.id)
+        );
+        let columns: Vec<&str> = config.store_config.groups[0]
+            .tags
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(columns, vec![format!("tag:{}", t1.id).as_str()]);
+
+        let listed: Vec<(ExclusionUnit, String, &str)> = exclusions
+            .iter()
+            .map(|e| (e.unit, e.key.clone(), e.reason.code()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    ExclusionUnit::Tag,
+                    format!("tag:{}", t2.id),
+                    "invalidAddress"
+                ),
+                (
+                    ExclusionUnit::Tag,
+                    format!("tag:{}", t6.id),
+                    "unknownDataType"
+                ),
+                (
+                    ExclusionUnit::Group,
+                    format!("grp:{}", g3.id),
+                    "invalidPeriod"
+                ),
+                (
+                    ExclusionUnit::Tag,
+                    format!("tag:{}", t5.id),
+                    "groupExcluded"
+                ),
+                (
+                    ExclusionUnit::Connection,
+                    format!("conn:{}", conn_b.id),
+                    "invalidPort"
+                ),
+                (
+                    ExclusionUnit::Group,
+                    format!("grp:{}", g2.id),
+                    "connectionExcluded"
+                ),
+                (
+                    ExclusionUnit::Tag,
+                    format!("tag:{}", t4.id),
+                    "connectionExcluded"
+                ),
+            ]
+        );
+
+        // Names and ids are the rows' own; a cascade names its parent so the
+        // list can be followed back to what needs fixing.
+        assert_eq!(exclusions[0].name, "T2");
+        assert_eq!(exclusions[0].id, t2.id);
+        assert!(exclusions[3].reason.message().contains("「G3」"));
+        assert!(exclusions[5].reason.message().contains("「PLC-B」"));
+        assert!(exclusions[6].reason.message().contains("「PLC-B」"));
+        // Cascades never produce a strict error of their own.
+        assert!(exclusions[3].strict_error().is_none());
+        assert!(exclusions[5].strict_error().is_none());
+
+        // The strict build fails on the first one, with the pre-段階2 text.
+        match build_config_from(&snapshot) {
+            Err(CollectError::Config(message)) => {
+                assert!(message.starts_with("タグ T2 のアドレス D3000 が不正です: "))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(config_exclusions(&snapshot), exclusions);
+    }
+
+    /// A tag's exclusion reason is worded exactly like the save-time
+    /// rejection of the same tag (#414 段階1) - one vocabulary for "this
+    /// address cannot be read".
+    #[tokio::test]
+    async fn a_tag_exclusion_uses_the_save_time_wording() {
+        for (address, data_type) in [("D3000", "i16"), ("40001", "f128"), ("40001.3", "i16")] {
+            let mut snapshot = golden_snapshot().await;
+            snapshot.tags[0].address = address.to_string();
+            snapshot.tags[0].data_type = data_type.to_string();
+            let exclusions = config_exclusions(&snapshot);
+            assert_eq!(exclusions.len(), 1, "{address} / {data_type}");
+            let saved = check_tag_address("modbus-tcp", address, data_type).unwrap_err();
+            assert_eq!(exclusions[0].reason.message(), saved.message());
+            assert_eq!(exclusions[0].unit, ExclusionUnit::Tag);
+        }
+    }
+
+    /// Leaving a tag out is exactly "the same config without that tag": the
+    /// same plans and the same `StoreConfig` (so the same tstore config hash
+    /// - no column is kept for it, and fixing it later rotates the file like
+    /// adding a tag does).
+    #[tokio::test]
+    async fn an_excluded_tag_builds_the_same_config_as_not_having_it() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input("PLC1", 502))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        let tags = TagService::new(pool.clone());
+        tags.create(tag_input("T1", group.id, "40001"))
+            .await
+            .unwrap();
+        let bad = tags
+            .create(tag_input("T2", group.id, "D3000"))
+            .await
+            .unwrap();
+        tags.create(tag_input("T3", group.id, "40003"))
+            .await
+            .unwrap();
+
+        let with_bad = RegistrySnapshot::load(&pool).await.unwrap();
+        let mut without_bad = with_bad.clone();
+        without_bad.tags.retain(|t| t.id != bad.id);
+
+        let (lenient, exclusions) = build_config_lenient_from(&with_bad);
+        assert_eq!(exclusions.len(), 1);
+        assert_eq!(lenient, build_config_from(&without_bad).unwrap());
+    }
+
+    /// A broken connection with no groups is still listed (the strict build
+    /// fails on it too), with nothing cascading from it.
+    #[tokio::test]
+    async fn a_broken_connection_without_groups_is_listed_alone() {
+        let mut snapshot = golden_snapshot().await;
+        snapshot.connections[0].protocol = "ethernet-ip".to_string();
+        snapshot.groups.clear();
+        snapshot.tags.clear();
+        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        assert_eq!(config.tag_count(), 0);
+        assert_eq!(exclusions.len(), 1);
+        assert_eq!(exclusions[0].unit, ExclusionUnit::Connection);
+        assert_eq!(exclusions[0].reason.code(), "unsupportedProtocol");
+        assert_eq!(
+            exclusions[0].reason.message(),
+            "プロトコル ethernet-ip は未対応です（modbus-tcp / slmp のみ対応）"
+        );
     }
 }
