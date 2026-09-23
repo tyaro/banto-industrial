@@ -365,9 +365,28 @@
 		-webkit-backdrop-filter: var(--banto-backdrop, none);
 	}
 
+	/*
+	 * #399 / #420（Sidebar.svelte）/ #421: **開くときは `visibility` を
+	 * 遷移させず即座に `visible` にする**（遷移させるのは閉じるときだけ）。
+	 * `visibility` の補間は「p=0 は始点の値」なので、`hidden → visible` を
+	 * 0.2s で遷移させると、開いた直後・最初のアニメーションフレームが進む
+	 * までのあいだ計算値が `hidden` のままになる。
+	 *
+	 * このペインは `escLayering.ts` の層判定の対象ではないので #399 と同じ
+	 * Esc の誤動作は起きないが、開いた直後にこのペイン内へフォーカスを移す
+	 * `focusFirstInLeftPane()`（上の `$effect`）が、`visibility: hidden` の
+	 * ままの要素に対して `focus()` を呼ぶ余地がある（`hidden` な要素は
+	 * フォーカスを受けない）。`Sidebar.svelte` と同じ形に揃え、`.open` 側だけ
+	 * `visibility 0s` にする。`transition-*` は変化後のスタイルの値が使われる
+	 * ので、閉じるときは従来どおり `transition: visibility 0.2s ease` の
+	 * 定義（`.pane-left.offcanvas` 側）に戻り、遷移の最後に `hidden` へ切り替わる。
+	 */
 	.pane-left.offcanvas.open {
 		transform: translateX(0);
 		visibility: visible;
+		transition:
+			transform 0.2s ease,
+			visibility 0s;
 	}
 
 	.pane-backdrop {
