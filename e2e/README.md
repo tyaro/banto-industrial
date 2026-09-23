@@ -20,6 +20,7 @@ relay-wright は Tauri アプリだが、`relay-wright-serve`（`apps/relay-wrig
 | relay-wright                  | 8800   |
 | banto-hub-perf                | 8801   |
 | banto-hub（ロックダウン済み） | 8802   |
+| chronogazer 用の開発用 PLC    | 8803   |
 
 `pnpm e2e:banto-hub` は **2台**の banto-hub を起動する（#341、2026-09-14）。
 8799 は従来どおり試運転モード（未ロックダウン）のままで、スイートの大半が
@@ -32,6 +33,14 @@ relay-wright は Tauri アプリだが、`relay-wright-serve`（`apps/relay-wrig
 のように指定する。2台目は `BANTO_HUB_PROFILE`/`BANTO_HUB_ROOT` も分けてある
 （profile 排他ロックが1台目と衝突しないようにするため）。
 
+8803 は `pnpm e2e`（chronogazer）の 2 つ目の `webServer` で、開発用 PLC
+（`apps/chronogazer/core/examples/dev_plc.rs`、Modbus TCP のランプ波
+シミュレータ、`127.0.0.1` のみ）が待ち受ける。`user-simulator-roundtrip.spec.ts`
+（R1-C の C-4）がこれを普通の Modbus TCP 接続として登録し、収集の一巡
+（設定 → 開始 → データファイル生成 → イベント記録 → 停止）を画面から通す。
+手で画面を触るときは `pnpm dev:plc`（既定 Modbus `127.0.0.1:15020`。
+`pnpm dev:plc --protocol slmp` で SLMP `127.0.0.1:15000`、`--port` で変更）。
+
 ## ビルド前提
 
 いずれの config も `webServer` は `cargo run` ではなく**ビルド済みバイナリ**を直接起動する（起動をほぼ瞬時にし、テスト実行中の不意な再コンパイルを避けるため）。実行前に:
@@ -40,6 +49,7 @@ relay-wright は Tauri アプリだが、`relay-wright-serve`（`apps/relay-wrig
 pnpm install
 pnpm build                                                          # フロントの静的ビルド（assets.rs が embed する）
 cargo build -p chronogazer-core --bin banto-serve --features embed-ui   # pnpm e2e 用
+cargo build -p chronogazer-core --example dev_plc                      # pnpm e2e 用（開発用 PLC）
 cargo build -p banto-hub-core --bin banto-hub --features embed-ui       # pnpm e2e:banto-hub / :perf 用
 cargo build -p relay-wright-core --bin relay-wright-serve --features embed-ui  # pnpm e2e:relay-wright 用
 pnpm exec playwright install chromium                               # 初回のみ

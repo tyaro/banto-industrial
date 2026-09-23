@@ -17,6 +17,7 @@
   },
   "scripts": {
     "dev": "pnpm --filter chronogazer dev",
+    "dev:plc": "cargo run -p chronogazer-core --example dev_plc --",
     "build": "pnpm --recursive --if-present build",
     "check": "pnpm --recursive --if-present check",
     "test": "pnpm --recursive --if-present test",

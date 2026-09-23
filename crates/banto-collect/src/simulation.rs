@@ -170,37 +170,60 @@ impl SimulatorHandle {
 /// を接続先として使う。`pub`: `crate::collector::Collector`自身に加え、T9-2の
 /// `apps/banto-hub/core/src/broker_glue.rs`の`BrokerSimRegistry`もこれを直接
 /// 呼ぶ(このモジュールの「SLMP + banto-hub の broker 経路について」参照)。
+///
+/// 中身は [`start_on`] を `127.0.0.1:0` で呼ぶだけ(R1-C C-4 でのリファクタ。
+/// 挙動は変えていない)。OS 割り当てのポートで bind が失敗するのは資源枯渇
+/// 程度しか無いので、ここは従来どおり panic のままにしてある。
 pub async fn start(protocol: Protocol) -> SimulatorHandle {
+    start_on(
+        protocol,
+        "127.0.0.1:0".parse().expect("valid loopback address"),
+    )
+    .await
+    .expect("bind loopback listener")
+}
+
+/// [`start`] の、bind するアドレスを呼び出し側が決める版(ChronoGazer R1-C
+/// C-4、2026-09-23)。
+///
+/// 使い道は `apps/chronogazer/core/examples/dev_plc.rs`(開発用 PLC として
+/// **固定ポート**で待ち受け、ChronoGazer からは普通の Modbus TCP / SLMP 接続
+/// として登録させる)。**固定ポートは使用中でありうる**ので、bind の失敗は
+/// panic させずに `io::Error` で返す - 呼び出し側が「ポートが使用中」と
+/// 分かる形で終了できるように(下層の `start_on` と同じ判断)。
+///
+/// ランプ波/トグルの生成は [`start`] と同一(このモジュールの「値生成」節)。
+pub async fn start_on(protocol: Protocol, addr: SocketAddr) -> std::io::Result<SimulatorHandle> {
     match protocol {
-        Protocol::ModbusTcp => start_modbus().await,
-        Protocol::Slmp => start_slmp().await,
+        Protocol::ModbusTcp => start_modbus(addr).await,
+        Protocol::Slmp => start_slmp(addr).await,
     }
 }
 
-async fn start_modbus() -> SimulatorHandle {
-    let sim = Arc::new(ModbusSimulator::start().await);
+async fn start_modbus(addr: SocketAddr) -> std::io::Result<SimulatorHandle> {
+    let sim = Arc::new(ModbusSimulator::start_on(addr).await?);
     let addr = sim.addr;
     let (ramp_stop, stop_rx) = watch::channel(false);
     let ramp_task = tokio::spawn(modbus_ramp_task(sim.clone(), stop_rx));
-    SimulatorHandle {
+    Ok(SimulatorHandle {
         addr,
         ramp_stop,
         ramp_task,
         inner: SimulatorInner::Modbus(sim),
-    }
+    })
 }
 
-async fn start_slmp() -> SimulatorHandle {
-    let sim = Arc::new(SlmpSimulator::start().await);
+async fn start_slmp(addr: SocketAddr) -> std::io::Result<SimulatorHandle> {
+    let sim = Arc::new(SlmpSimulator::start_on(addr).await?);
     let addr = sim.addr;
     let (ramp_stop, stop_rx) = watch::channel(false);
     let ramp_task = tokio::spawn(slmp_ramp_task(sim.clone(), stop_rx));
-    SimulatorHandle {
+    Ok(SimulatorHandle {
         addr,
         ramp_stop,
         ramp_task,
         inner: SimulatorInner::Slmp(sim),
-    }
+    })
 }
 
 /// Modbus のランプ波/トグル生成ループ。holding/input register の両方に同じ
