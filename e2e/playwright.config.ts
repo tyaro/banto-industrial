@@ -25,10 +25,12 @@
  * over from a previous run would skip it.
  */
 import { defineConfig, devices } from '@playwright/test';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { RUN_DIR_ENV, RUN_MARKER_FILE, RUN_TOKEN_ENV, ownsRunDir } from './chronogazer-e2e-run-dir';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(dirname, '..');
@@ -45,19 +47,39 @@ const DB_FILE_NAME = 'chronogazer-e2e.sqlite3';
 // 2026-09-23): Playwright evaluates this module again in every worker
 // process. The main process evaluates it first (and starts `webServer` with
 // the path it picked); workers are spawned afterwards and inherit its
-// `process.env`, so reusing `BANTO_E2E_DB_DIR` when it is already set makes
-// a worker see **the same directory banto-serve is using**. Before C-4 each
-// worker made (and leaked) a fresh, unused temp dir here, which nothing
-// noticed because no spec looked at the path - `user-simulator-roundtrip
-// .spec.ts` now reads `<dbDir>/data` with Node's `fs` to check that the
-// collector really wrote a data file, and asserts that the DB file is there
-// too (i.e. that it is looking at the server's directory, not a stray one).
-if (!process.env.BANTO_E2E_DB_DIR) {
-	process.env.BANTO_E2E_DB_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'chronogazer-e2e-'));
+// `process.env`, so reusing the directory recorded there makes a worker see
+// **the same directory banto-serve is using**. Before C-4 each worker made
+// (and leaked) a fresh, unused temp dir here, which nothing noticed because
+// no spec looked at the path - `user-simulator-roundtrip.spec.ts` now reads
+// `<dbDir>/data` with Node's `fs` to check that the collector really wrote a
+// data file, and asserts that the DB file is there too (i.e. that it is
+// looking at the server's directory, not a stray one).
+//
+// **Only a directory this run created is shared and later deleted** (#412
+// owner review, 2026-09-23). `global-teardown.ts` removes the directory
+// recursively, so it must never be one that came from outside - an earlier
+// version of this block reused `BANTO_E2E_DB_DIR` whenever the caller's
+// shell had it set, which would have handed an arbitrary existing directory
+// to `fs.rmSync(..., { recursive: true })`. Now:
+// - the directory is always a fresh `mkdtempSync`, and the run owns it
+//   through a per-run token written into an ownership marker file inside it;
+// - the pair is passed to workers (and to the teardown) through **internal**
+//   variables `CHRONOGAZER_E2E_RUN_DIR` / `CHRONOGAZER_E2E_RUN_TOKEN`, and a
+//   worker reuses them **only if the marker in that directory holds that
+//   token** - a pair set from outside (no marker, or a different token)
+//   is ignored and a fresh directory is made instead;
+// - `BANTO_E2E_DB_DIR` is not read at all any more;
+// - the teardown deletes the directory only if the marker still matches.
+// The names and the marker check live in `chronogazer-e2e-run-dir.ts`
+// (shared with the teardown and the spec, and free of side effects).
+if (!ownsRunDir(process.env[RUN_DIR_ENV], process.env[RUN_TOKEN_ENV])) {
+	const token = crypto.randomUUID();
+	const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chronogazer-e2e-'));
+	fs.writeFileSync(path.join(runDir, RUN_MARKER_FILE), token, 'utf8');
+	process.env[RUN_DIR_ENV] = runDir;
+	process.env[RUN_TOKEN_ENV] = token;
 }
-// Read by global-teardown.ts to remove `dbDir` again after the run - see
-// that file's doc comment for why an env var, not a direct import.
-const dbDir = process.env.BANTO_E2E_DB_DIR;
+const dbDir = process.env[RUN_DIR_ENV] as string;
 const dbPath = path.join(dbDir, DB_FILE_NAME);
 
 // R1-C C-4: the dev PLC (`apps/chronogazer/core/examples/dev_plc.rs`, a

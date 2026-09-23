@@ -45,10 +45,31 @@
  *
  * `data.dir` の既定 `./data` は DB ファイルの置き場を基準に解決される
  * （`banto-serve` の `resolve_data_dir`）。DB の置き場は `playwright.config.ts`
- * が 1 回だけ作って `BANTO_E2E_DB_DIR` に入れた一時ディレクトリで、ワーカーは
- * それを継承する。ここでは Node の `fs` で `<dbDir>/data` に
- * `YYYYMMDD-NNN.sqlite3` ができたことを確かめる（中のサンプル行までは Rust の
+ * が実行ごとに 1 回だけ作った一時ディレクトリで、ワーカーは内部用の変数
+ * `CHRONOGAZER_E2E_RUN_DIR`（`e2e/chronogazer-e2e-run-dir.ts`）で受け取る。
+ * ここでは Node の `fs` で `<dbDir>/data` の `YYYYMMDD-NNN.sqlite3`（または
+ * その WAL `-wal`）に**この試行の収集中に書き込みがあったこと**（大きさか
+ * 更新時刻が変わったこと）を確かめる（中のサンプル行までは Rust の
  * `apps/chronogazer/core/tests/collect_roundtrip.rs` が確かめている）。
+ *
+ * ## CI の再試行（`retries: 1`）で同じサーバーに 2 回目が走る
+ *
+ * `describe.serial` は失敗すると**グループ全体**を同じサーバー・同じ DB で
+ * やり直す（#412 オーナーレビュー、2026-09-23）。そのため**初回だけ成り立つ
+ * 前提を置かない**:
+ *
+ * - 開始前の状態は「収集対象がありません」（起動直後）**か**「停止」
+ *   （前回の試行の `afterAll` が止めた）。起動直後が「収集対象がありません」で
+ *   あることの確認は `user-settings-collect.spec.ts` の担当。
+ * - データファイルは同じ日・同じ構成なら**同じファイルを使い回す**
+ *   （banto-tstore の `resolve_file`）ので、「ファイルがある」だけでは前回の
+ *   試行のファイルで通ってしまう。書き込みの確認は**この試行の中での変化**で
+ *   見る（上の節）。
+ * - イベント一覧には前回の試行の「収集開始」「PLC接続」「収集停止」が残る。
+ *   また接続を消して作り直すと、SQLite は同じ `id` を再び振ることがある
+ *   （`conn:<id>` も一致しうる）。そこで**操作の直前に REST でイベントの最新
+ *   `id`（`asOfId`）を控え**、それより新しいイベントを REST で探し、その行が
+ *   画面に**その時刻の表示で**出ていることを確かめる。
  *
  * ## ファイル名（実行順）
  *
@@ -63,6 +84,7 @@
 import { expect, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
+import { RUN_DIR_ENV, RUN_TOKEN_ENV, ownsRunDir } from '../chronogazer-e2e-run-dir';
 
 // smoke.spec.ts が初回セットアップで作成する唯一の管理者アカウント。
 const ADMIN_USERNAME = 'e2e-admin';
@@ -82,6 +104,12 @@ type ApiHeaders = Record<string, string>;
 
 /** `YYYYMMDD-NNN.sqlite3`（banto-tstore の `schema.rs` のファイル名）。 */
 const DATA_FILE_PATTERN = /^\d{8}-\d{3}\.sqlite3$/;
+/**
+ * 上に加えて WAL（`-wal`）。banto-tstore は WAL モードで書く
+ * （`schema::connect_writable`）ので、収集中の書き込みはまず `-wal` に入り、
+ * 本体の大きさ・更新時刻はチェックポイントまで変わらないことがある。
+ */
+const DATA_FILE_OR_WAL_PATTERN = /^(\d{8}-\d{3}\.sqlite3)(-wal)?$/;
 
 interface ConnectionRow {
 	id: number;
@@ -217,6 +245,132 @@ function dataFiles(dataDir: string): string[] {
 	return fs.readdirSync(dataDir).filter((name) => DATA_FILE_PATTERN.test(name));
 }
 
+/** データファイルと WAL の「大きさ:更新時刻」（書き込みがあったかの比較用）。 */
+function dataFileSignatures(dataDir: string): Map<string, string> {
+	const signatures = new Map<string, string>();
+	if (!fs.existsSync(dataDir)) return signatures;
+	for (const name of fs.readdirSync(dataDir)) {
+		if (!DATA_FILE_OR_WAL_PATTERN.test(name)) continue;
+		try {
+			const stat = fs.statSync(path.join(dataDir, name));
+			signatures.set(name, `${stat.size}:${stat.mtimeMs}`);
+		} catch {
+			// 列挙と stat の間に消えた（WAL が閉じられた）- 比較から外す。
+		}
+	}
+	return signatures;
+}
+
+/**
+ * `before` から変わった（新しくできた・大きさか更新時刻が変わった）ファイルの、
+ * 本体（`YYYYMMDD-NNN.sqlite3`）の名前。WAL が変わったら本体の名前で返す。
+ */
+function changedDataFiles(before: Map<string, string>, dataDir: string): string[] {
+	const changed = new Set<string>();
+	for (const [name, signature] of dataFileSignatures(dataDir)) {
+		if (before.get(name) === signature) continue;
+		const base = DATA_FILE_OR_WAL_PATTERN.exec(name)?.[1];
+		if (base) changed.add(base);
+	}
+	return [...changed].sort();
+}
+
+/** `chronogazer_core::collect::CollectEventRow`（`collectAdmin.ts` と同じ形）。 */
+interface CollectEventRow {
+	id: number;
+	tsMs: number;
+	kind: string;
+	connectionKey: string | null;
+}
+type EventsReadout =
+	| { state: 'notRunning' }
+	| { state: 'unavailable' }
+	| { state: 'ready'; data: { rows: CollectEventRow[]; totalCount: number; asOfId: number } };
+
+/**
+ * イベント一覧の先頭（新しい順）を REST で読む。`unavailable`（取り込み中で
+ * 読めなかった）は失敗ではないので、読めるまで待つ。
+ */
+async function readEvents(
+	request: APIRequestContext,
+	headers: ApiHeaders,
+	limit: number
+): Promise<{ rows: CollectEventRow[]; asOfId: number }> {
+	let result: { rows: CollectEventRow[]; asOfId: number } | undefined;
+	await expect(async () => {
+		const res = await request.get(`/api/collect/events?offset=0&limit=${limit}`, { headers });
+		expect(res.ok(), `GET /api/collect/events が ${res.status()}`).toBe(true);
+		const body = (await res.json()) as EventsReadout;
+		expect(body.state, 'イベント一覧を読めていない').toBe('ready');
+		if (body.state === 'ready') result = body.data;
+	}).toPass({ timeout: 15_000 });
+	if (!result) throw new Error('イベント一覧を読めなかった');
+	return result;
+}
+
+/** いま記録されている最新のイベントの `id`（空なら 0）。操作の直前に控える。 */
+async function latestEventId(request: APIRequestContext, headers: ApiHeaders): Promise<number> {
+	return (await readEvents(request, headers, 1)).asOfId;
+}
+
+/**
+ * `sinceId` より新しいイベントのうち、`kind`（と `connectionKey`）が一致する
+ * 最初の 1 件（新しい順）を、記録されるまで待って返す。イベントの書き込みは
+ * 状態の更新の直後に非同期で入る。
+ */
+async function waitForEventSince(
+	request: APIRequestContext,
+	headers: ApiHeaders,
+	sinceId: number,
+	kind: string,
+	connectionKey?: string
+): Promise<CollectEventRow> {
+	let found: CollectEventRow | undefined;
+	await expect(async () => {
+		const { rows } = await readEvents(request, headers, 500);
+		found = rows.find(
+			(r) =>
+				r.id > sinceId &&
+				r.kind === kind &&
+				(connectionKey === undefined || r.connectionKey === connectionKey)
+		);
+		expect(
+			found,
+			`id > ${sinceId} の ${kind} ${connectionKey ?? ''} が記録されること`
+		).toBeDefined();
+	}).toPass({ timeout: 15_000 });
+	if (!found) throw new Error(`${kind} が見つからない`);
+	return found;
+}
+
+/**
+ * 画面の「時刻」列と同じ表示（`collectAdmin.ts` の `collectTimeLabel` =
+ * ブラウザの `toLocaleString()`）。ロケール・タイムゾーンを画面と揃えるため、
+ * ブラウザの中で作る。
+ */
+async function timeLabelInPage(page: Page, tsMs: number): Promise<string> {
+	return page.evaluate((ms) => new Date(ms).toLocaleString(), tsMs);
+}
+
+/**
+ * イベント画面に、REST で見つけた**この試行の**イベントの行が出るまで
+ * 「再読み込み」する。種類の表示・時刻の表示（・接続）の全部で絞るので、
+ * 前回の試行の同じ種類の行には一致しない。
+ */
+async function expectEventRowVisible(
+	page: Page,
+	event: CollectEventRow,
+	kindLabel: string
+): Promise<void> {
+	const timeLabel = await timeLabelInPage(page, event.tsMs);
+	let row = page.getByRole('row').filter({ hasText: kindLabel }).filter({ hasText: timeLabel });
+	if (event.connectionKey) row = row.filter({ hasText: event.connectionKey });
+	await expect(async () => {
+		await page.getByRole('button', { name: '再読み込み' }).click();
+		await expect(row.first()).toBeVisible({ timeout: 1_000 });
+	}).toPass({ timeout: 15_000 });
+}
+
 test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C の C-4）', () => {
 	let page: Page;
 	let dbDir: string;
@@ -225,6 +379,10 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 	let disabledByUs: ConnectionRow[] = [];
 	let connectionId: number;
 	let apiHeaders: ApiHeaders;
+	/** 「収集を開始」を押す直前の最新イベント id（この試行のイベントの境界）。 */
+	let eventIdBeforeStart: number;
+	/** テスト 3 でこの試行の書き込みを確かめたデータファイル（本体の名前）。 */
+	let writtenFiles: string[] = [];
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -247,11 +405,16 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 			disabledByUs.push(conn);
 		}
 
-		// ワーカーが見ている一時ディレクトリが、banto-serve が使っているものと
-		// 同じであること（config を評価し直して別のディレクトリを作っていない
-		// こと）を、DB ファイルの存在で確かめる。
-		dbDir = process.env.BANTO_E2E_DB_DIR ?? '';
-		expect(dbDir, 'BANTO_E2E_DB_DIR がワーカーに渡っていない').not.toBe('');
+		// ワーカーが見ている一時ディレクトリが、この実行が作ったもの（所有
+		// マーカーが一致する）で、banto-serve が使っているものと同じであること
+		// （config を評価し直して別のディレクトリを作っていないこと）を、DB
+		// ファイルの存在で確かめる。
+		dbDir = process.env[RUN_DIR_ENV] ?? '';
+		expect(dbDir, `${RUN_DIR_ENV} がワーカーに渡っていない`).not.toBe('');
+		expect(
+			ownsRunDir(dbDir, process.env[RUN_TOKEN_ENV]),
+			`${dbDir} の所有マーカーがこの実行のトークンと一致しない`
+		).toBe(true);
 		expect(
 			fs.existsSync(path.join(dbDir, 'chronogazer-e2e.sqlite3')),
 			`${dbDir} に banto-serve の DB が無い（別の一時ディレクトリを見ている）`
@@ -316,9 +479,14 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 
 	test('2. 収集を開始すると「収集中」になり、開発用 PLC への接続が「接続中」になる', async () => {
 		await page.goto('/settings/collect');
-		// 起動時の自動開始は空のレジストリで終わっている（レジストリの CRUD では
-		// 自動再起動しない - C-2 の決定）ので、明示的に開始する。
-		await expect(statusLine(page)).toHaveText('状態: 収集対象がありません');
+		// レジストリの CRUD では自動再起動しない（C-2 の決定）ので、明示的に
+		// 開始する。開始前は、初回なら起動時の自動開始が空のレジストリで
+		// 終わった「収集対象がありません」、CI の再試行なら前回の試行の
+		// `afterAll` が止めた「停止」（ファイル冒頭の doc）。起動直後が
+		// 「収集対象がありません」であることの確認は
+		// `user-settings-collect.spec.ts` に任せる。
+		await expect(statusLine(page)).toHaveText(/^状態: (収集対象がありません|停止)$/);
+		eventIdBeforeStart = await latestEventId(page.request, apiHeaders);
 		await page.getByRole('button', { name: '収集を開始' }).click();
 
 		await expect(statusLine(page)).toHaveText('状態: 収集中（グループ1件 / タグ1件）');
@@ -331,46 +499,60 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		await expect(row).not.toContainText('再接続中');
 	});
 
-	test('3. データディレクトリに時系列ファイルができる', async () => {
+	test('3. データディレクトリの時系列ファイルに、この試行の書き込みが入る', async () => {
+		// 収集中（テスト 2 で「接続中」まで確かめた後）の状態を基準にして、
+		// そこから大きさか更新時刻が変わるのを待つ。前回の試行が残したファイルが
+		// あっても、この試行が書かなければ変わらない（ファイル冒頭の doc）。
+		// 書き込みは既定 1 秒ごとの flush（banto-tstore の `WriterOptions`）。
+		const before = dataFileSignatures(dataDir);
 		await expect
-			.poll(() => dataFiles(dataDir), {
-				message: `${dataDir} に YYYYMMDD-NNN.sqlite3 ができること`,
+			.poll(() => changedDataFiles(before, dataDir), {
+				message: `${dataDir} の YYYYMMDD-NNN.sqlite3（か -wal）に書き込みが入ること`,
 				timeout: 20_000
 			})
 			.not.toEqual([]);
+		writtenFiles = changedDataFiles(before, dataDir);
+		expect(dataFiles(dataDir)).toEqual(expect.arrayContaining(writtenFiles));
 	});
 
-	test('4. イベント画面に「収集開始」と、この接続の「PLC接続」が出る', async () => {
+	test('4. イベント画面に、この試行の「収集開始」と、この接続の「PLC接続」が出る', async () => {
+		const started = await waitForEventSince(
+			page.request,
+			apiHeaders,
+			eventIdBeforeStart,
+			'collection_started'
+		);
+		const connected = await waitForEventSince(
+			page.request,
+			apiHeaders,
+			eventIdBeforeStart,
+			'plc_connected',
+			`conn:${connectionId}`
+		);
 		await page.goto('/events');
 		await expect(page.getByRole('heading', { level: 2, name: 'イベント' })).toBeVisible();
-		const started = page.getByRole('row').filter({ hasText: '収集開始' });
-		const connected = page
-			.getByRole('row')
-			.filter({ hasText: 'PLC接続' })
-			.filter({ hasText: `conn:${connectionId}` });
-		// イベントの書き込みは接続状態の更新の直後に非同期で入るので、見えるまで
-		// 「再読み込み」で新しい世代を取り直す。
-		await expect(async () => {
-			await page.getByRole('button', { name: '再読み込み' }).click();
-			await expect(started.first()).toBeVisible({ timeout: 1_000 });
-			await expect(connected.first()).toBeVisible({ timeout: 1_000 });
-		}).toPass({ timeout: 15_000 });
+		await expectEventRowVisible(page, started, '収集開始');
+		await expectEventRowVisible(page, connected, 'PLC接続');
 	});
 
-	test('5. 停止すると「停止」になり、イベント画面に「収集停止」が出る', async () => {
+	test('5. 停止すると「停止」になり、イベント画面にこの試行の「収集停止」が出る', async () => {
 		await page.goto('/settings/collect');
 		await expect(statusLine(page)).toHaveText(/^状態: 収集中/);
+		const eventIdBeforeStop = await latestEventId(page.request, apiHeaders);
 		await page.getByRole('button', { name: '収集を停止' }).click();
 		await expect(statusLine(page)).toHaveText('状態: 停止');
 
+		const stopped = await waitForEventSince(
+			page.request,
+			apiHeaders,
+			eventIdBeforeStop,
+			'collection_stopped'
+		);
 		await page.goto('/events');
-		const stopped = page.getByRole('row').filter({ hasText: '収集停止' });
-		await expect(async () => {
-			await page.getByRole('button', { name: '再読み込み' }).click();
-			await expect(stopped.first()).toBeVisible({ timeout: 1_000 });
-		}).toPass({ timeout: 15_000 });
+		await expectEventRowVisible(page, stopped, '収集停止');
 
-		// 停止後もデータファイルは残っている（最終 flush 済み）。
-		expect(dataFiles(dataDir)).not.toEqual([]);
+		// 停止後も、この試行が書いたデータファイルは残っている（最終 flush 済み）。
+		expect(writtenFiles).not.toEqual([]);
+		expect(dataFiles(dataDir)).toEqual(expect.arrayContaining(writtenFiles));
 	});
 });
