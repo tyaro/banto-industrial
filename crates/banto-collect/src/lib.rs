@@ -73,8 +73,8 @@ mod task;
 
 pub use collector::{ApplyReport, Collector, CollectorOptions};
 pub use config::{
-    build_config, build_config_from, connections_with_collected_groups, CollectorConfig, Protocol,
-    RegistrySnapshot,
+    build_config, build_config_from, check_tag_address, connections_with_collected_groups,
+    CollectorConfig, Protocol, RegistrySnapshot, TagAddressField, TagAddressIssue,
 };
 pub use current::{CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR};
 pub use error::CollectError;

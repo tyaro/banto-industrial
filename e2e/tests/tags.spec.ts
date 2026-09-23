@@ -9,12 +9,10 @@
  *    （`plc_connections.name` は全体で一意、`crates/banto-tags/src/support.rs`
  *    の `map_write_error`）を、同名の PLC接続を2つ作ろうとして踏み、
  *    「既に使用されています」が名前欄のすぐ下に出ることを確認する。
- *    （`address`/`periodMs` は指示書の例だが、このアプリの UI ではどちらも
- *    実際には到達できない - `periodMs` は固定選択肢の `<select>` なので
- *    範囲外の値を選びようがなく、`plc` タグの `address` は banto-tags 側で
- *    非空しか検証しないため形式エラーが存在しない。名前の重複は同じ
- *    「サーバー側検証がフィールドへ人間可読で返る」経路を、実際に踏める
- *    形で固定したもの。）
+ *    （`periodMs` は固定選択肢の `<select>` なので範囲外の値を選びようが
+ *    無い。名前の重複は「サーバー側検証がフィールドへ人間可読で返る」経路を、
+ *    実際に踏める形で固定したもの。`address` の形式エラーは #414 段階1 で
+ *    踏めるようになったので、下の受入条件 8 で別に固定する。）
  * 3. viewer は閲覧のみで、新規作成フォーム・削除ボタンが一切出ないこと。
  * 4.（#391レビュー B の回帰固定）スケーリングを部分指定（生値下限だけ）で
  *    タグを作成しようとすると、`crates/banto-tags/src/scaling.rs`の
@@ -51,6 +49,13 @@
  *    収集グループ・タグの3状態は同じ純関数（`tagsPageLogic.ts`の
  *    `listSectionView`/`createFormGate`）を同じ形で通しており、その総当たりは
  *    vitest 側で固定してある。
+ * 8.（#414 段階1 の回帰固定）接続のプロトコルで読めないアドレスのタグは
+ *    保存できず、理由（「Modbus TCP のアドレスとして解釈できません」）が
+ *    デバイスアドレス欄に出ること。修正前は Modbus 接続の下に MELSEC 表記の
+ *    `D3000` を保存でき、収集開始が全体ごと失敗していた。このため 5・6 で
+ *    作るタグのアドレスも Modbus の参照番号（`40001`/`40011`）にしてある
+ *    （テストの意図 = CRUD とスケーリングの検証エラーの表示は変わらない）。
+ *    テスト `6b.` で固定する。
  *
  * ファイル名について: `smoke.spec.ts` が初回セットアップ（管理者アカウント
  * 作成）を実 DOM で行うため、このファイルは辞書順でそれより後でなければ
@@ -141,7 +146,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		const form = section.locator('div.create');
 		await form.getByLabel('名前').fill(TAG_NAME);
 		await form.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
-		await form.getByLabel('デバイスアドレス').fill('D3000');
+		await form.getByLabel('デバイスアドレス').fill('40001');
 		await form.getByRole('button', { name: '作成' }).click();
 		await expect(section.locator('div.list').getByText(TAG_NAME)).toBeVisible();
 	});
@@ -152,7 +157,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		const PARTIAL_SCALING_TAG_NAME = 'E2Eスケーリング欠落';
 		await form.getByLabel('名前').fill(PARTIAL_SCALING_TAG_NAME);
 		await form.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
-		await form.getByLabel('デバイスアドレス').fill('D3010');
+		await form.getByLabel('デバイスアドレス').fill('40011');
 		await form.getByLabel('スケーリング: 生値 下限').fill('0');
 		await form.getByRole('button', { name: '作成' }).click();
 		// `Scaling::from_parts()`（crates/banto-tags/src/scaling.rs）が返す
@@ -166,6 +171,22 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		).toBeVisible();
 		// 検証エラーで弾かれ、作成は成立していない。
 		await expect(section.locator('div.list').getByText(PARTIAL_SCALING_TAG_NAME)).toHaveCount(0);
+	});
+
+	test('6b. Modbus 接続の下に MELSEC 表記のアドレスは保存できず、理由がアドレス欄に見える（#414）', async () => {
+		const section = page.locator('section.registry-section').nth(2);
+		const form = section.locator('div.create');
+		const MELSEC_TAG_NAME = 'E2E-MELSEC表記';
+		await form.getByLabel('名前').fill(MELSEC_TAG_NAME);
+		await form.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
+		await form.getByLabel('デバイスアドレス').fill('D3000');
+		// 6 の部分スケーリングが残っていると、そちらの理由と混ざる。
+		await form.getByLabel('スケーリング: 生値 下限').fill('');
+		await form.getByRole('button', { name: '作成' }).click();
+		// `banto_collect::TagAddressIssue::message` の文言。
+		await expect(form.getByText('Modbus TCP のアドレスとして解釈できません')).toBeVisible();
+		// 保存は成立していない。
+		await expect(section.locator('div.list').getByText(MELSEC_TAG_NAME)).toHaveCount(0);
 	});
 
 	test('7. 収集グループが残っているPLC接続の削除は具体的な理由で拒否され、データは消えない', async () => {

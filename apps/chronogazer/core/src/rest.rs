@@ -194,6 +194,9 @@ use crate::collect::{
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::{AuditSettings, SettingsService};
+use crate::tag_address::{
+    ensure_protocol_change_keeps_tags_readable, ensure_tag_fits_its_connection,
+};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 
 /// Request-body size cap for `POST /api/backups/restore` (spec M17: "サイズ
@@ -1683,6 +1686,12 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
 // 「やらないこと」）。バニラな CRUD だけ。banto-tags 自身の削除ガード
 // （「まだ N 件のグループ/タグから参照されています」）がそのまま
 // `BantoError::Validation` として返る。
+//
+// #414 段階1: banto-tags はタグのアドレス書式を検証しないので、タグの
+// 作成・更新と接続のプロトコル変更の前に `crate::tag_address` の検査を
+// 挟む（Modbus 接続の下の `D3000` のような、収集開始で `build_config` を
+// 失敗させるタグを保存時に拒否する）。Tauri 側の同名コマンドも同じ検査を
+// 呼ぶ。
 
 fn default_payload_enabled() -> bool {
     true
@@ -2005,6 +2014,14 @@ async fn plc_connections_update(
     )
     .await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
+    ensure_protocol_change_keeps_tags_readable(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        id,
+        &input.protocol,
+    )
+    .await?;
     let updated = state.plc_connections.update(id, input.into()).await?;
     record_write(
         &state.audit,
@@ -2176,6 +2193,14 @@ async fn tags_create(
         "/api/tags",
     )
     .await?;
+    ensure_tag_fits_its_connection(
+        &state.plc_connections,
+        &state.collection_groups,
+        input.collection_group_id,
+        &input.address,
+        &input.data_type,
+    )
+    .await?;
     let created = state.tags.create(input.into()).await?;
     record_write(
         &state.audit,
@@ -2203,6 +2228,14 @@ async fn tags_update(
         "tags",
         "PUT",
         "/api/tags/{id}",
+    )
+    .await?;
+    ensure_tag_fits_its_connection(
+        &state.plc_connections,
+        &state.collection_groups,
+        input.collection_group_id,
+        &input.address,
+        &input.data_type,
     )
     .await?;
     let updated = state.tags.update(id, input.into()).await?;
@@ -2924,6 +2957,15 @@ mod tests {
             .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
             .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
+            .unwrap()
+    }
+
+    fn put_json_auth(path: &str, token: &str, body: serde_json::Value) -> HttpRequest<Body> {
+        HttpRequest::put(path)
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
             .unwrap()
     }
 
@@ -4111,7 +4153,7 @@ mod tests {
                 json!({
                     "name": "tag1",
                     "collectionGroupId": group_id,
-                    "address": "D3000",
+                    "address": "40001",
                     "dataType": "i16",
                     "decimals": 0,
                     "enabled": true
@@ -4233,6 +4275,150 @@ mod tests {
             .as_str()
             .unwrap()
             .is_empty());
+    }
+
+    /// **#414 段階1（REST 経路）**: 接続のプロトコルで読めないアドレスの
+    /// タグは保存時に `field_errors`（`address`）で拒否される。所属グループを
+    /// 別プロトコルの接続の下へ移す更新も、配下のタグが読めなくなる接続の
+    /// プロトコル変更（`protocol`、妨げているタグ名つき）も同じ。
+    ///
+    /// 反証: `tags_create`/`tags_update`/`plc_connections_update` から
+    /// `ensure_*` の呼び出しを消すと、それぞれの `assert_validation` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_routes_refuse_an_address_the_connection_cannot_read() {
+        let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
+
+        async fn send(
+            router: &Router,
+            request: HttpRequest<Body>,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = router.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+        fn assert_validation(
+            (status, body): &(StatusCode, serde_json::Value),
+            field: &str,
+        ) -> String {
+            assert!(
+                status.is_client_error(),
+                "拒否されていない: {status} {body}"
+            );
+            assert_eq!(body["kind"], "validation", "{body}");
+            assert_eq!(body["field_errors"][0]["field"], field, "{body}");
+            body["field_errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        let mut groups = Vec::new();
+        for (name, protocol) in [("modbus", "modbus-tcp"), ("slmp", "slmp")] {
+            let mut payload = plc_connection_payload(name);
+            payload["protocol"] = json!(protocol);
+            let (status, conn) = send(
+                &router,
+                post_json_auth("/api/plc-connections", &editor, payload),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{conn}");
+            let (status, group) = send(
+                &router,
+                post_json_auth(
+                    "/api/collection-groups",
+                    &editor,
+                    json!({
+                        "name": format!("{name}-group"),
+                        "plcConnectionId": conn["id"],
+                        "periodMs": 1000,
+                        "enabled": true
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{group}");
+            groups.push((conn["id"].as_i64().unwrap(), group["id"].as_i64().unwrap()));
+        }
+        let [(_, modbus_group), (slmp_conn, slmp_group)] = groups[..] else {
+            unreachable!()
+        };
+        let tag = |group: i64, address: &str| {
+            json!({
+                "name": "tag1",
+                "collectionGroupId": group,
+                "address": address,
+                "dataType": "i16",
+                "decimals": 0,
+                "enabled": true
+            })
+        };
+
+        // 作成: Modbus の下の D3000 は拒否（#414 の再現そのもの）、40001 は通る。
+        let message = assert_validation(
+            &send(
+                &router,
+                post_json_auth("/api/tags", &editor, tag(modbus_group, "D3000")),
+            )
+            .await,
+            "address",
+        );
+        assert!(message.contains("Modbus TCP"), "{message}");
+        let (status, created) = send(
+            &router,
+            post_json_auth("/api/tags", &editor, tag(modbus_group, "40001")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let tag_id = created["id"].as_i64().unwrap();
+
+        // 更新で SLMP のグループへ 40001 のまま移す: 拒否。
+        assert_validation(
+            &send(
+                &router,
+                put_json_auth(
+                    &format!("/api/tags/{tag_id}"),
+                    &editor,
+                    tag(slmp_group, "40001"),
+                ),
+            )
+            .await,
+            "address",
+        );
+        // アドレスも直して移すなら通る。
+        let (status, moved) = send(
+            &router,
+            put_json_auth(
+                &format!("/api/tags/{tag_id}"),
+                &editor,
+                tag(slmp_group, "D100"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{moved}");
+
+        // 接続のプロトコル変更: SLMP の下に D100 があるので Modbus へは変えられない。
+        let mut to_modbus = plc_connection_payload("slmp");
+        to_modbus["protocol"] = json!("modbus-tcp");
+        let message = assert_validation(
+            &send(
+                &router,
+                put_json_auth(
+                    &format!("/api/plc-connections/{slmp_conn}"),
+                    &editor,
+                    to_modbus,
+                ),
+            )
+            .await,
+            "protocol",
+        );
+        assert!(message.contains("「tag1」（D100）"), "{message}");
+        // 拒否された変更は保存されていない。
+        let (_, conn) = send(
+            &router,
+            get_auth(&format!("/api/plc-connections/{slmp_conn}"), &editor),
+        )
+        .await;
+        assert_eq!(conn["protocol"], "slmp", "{conn}");
     }
 
     /// R0 §3.6 の監査記録: PLC接続の作成・更新・削除がそれぞれ
@@ -4431,9 +4617,12 @@ mod tests {
     /// **#407 レビュー P2-2 の受入条件（REST 側）**: 起動に失敗した後、
     /// **viewer が状態を読んでも失敗理由が見えない**。
     ///
-    /// 検証用の目印をタグのアドレスに埋めて `build_config` を失敗させる
-    /// （`banto-tags` はアドレスの書式を検証しないので、REST 経由でも
-    /// そのまま登録できる）。`CollectError::Config` の文言はアドレスを
+    /// 検証用の目印をタグのアドレスに埋めて `build_config` を失敗させる。
+    /// #414 段階1 で REST の保存時にアドレスを検査するようになったので、
+    /// 目印のタグは**検査より前に保存された既存データ**として `TagService`
+    /// でプールへ直接入れる（段階2 まではこの形のデータで起動が失敗しうる -
+    /// 起動失敗の理由の扱いを固定するこのテストの前提はそのまま）。
+    /// `CollectError::Config` の文言はアドレスを
     /// そのまま含むので、**内部の `CollectorState` をワイヤに載せていれば
     /// 目印が必ず出てくる**。
     ///
@@ -4449,7 +4638,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_viewer_reading_the_state_never_sees_why_the_start_failed() {
         const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
-        let (router, _audit, _admin, editor, viewer) = router_with_role_tokens_and_audit().await;
+        let (router, _audit, pool, _admin, editor, viewer) =
+            router_with_role_tokens_audit_and_pool().await;
 
         // 収集対象を 1 件だけ作る。アドレスが解釈できないので
         // `build_config` が失敗し、状態に理由（= 目印を含む）が焼き付く。
@@ -4482,23 +4672,20 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        let create_tag = router
-            .clone()
-            .oneshot(post_json_auth(
-                "/api/tags",
-                &editor,
-                json!({
-                    "name": "tag1",
-                    "collectionGroupId": group["id"].as_i64().unwrap(),
-                    "address": MARKER,
-                    "dataType": "i16",
-                    "decimals": 0,
-                    "enabled": true
-                }),
-            ))
+        // 検査より前に保存された既存データとして直接入れる（doc 参照）。
+        let legacy_tag: TagPayload = serde_json::from_value(json!({
+            "name": "tag1",
+            "collectionGroupId": group["id"].as_i64().unwrap(),
+            "address": MARKER,
+            "dataType": "i16",
+            "decimals": 0,
+            "enabled": true
+        }))
+        .unwrap();
+        TagService::new(pool)
+            .create(legacy_tag.into())
             .await
-            .unwrap();
-        assert_eq!(create_tag.status(), StatusCode::OK);
+            .expect("既存データとしてのタグを入れる");
 
         // 起動した本人（editor）には、エラー応答として理由が返る。
         let start = router

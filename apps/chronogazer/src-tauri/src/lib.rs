@@ -43,6 +43,9 @@ use chronogazer_core::rest::{
     PlcConnectionResponse, TagPayload,
 };
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
+use chronogazer_core::tag_address::{
+    ensure_protocol_change_keeps_tags_readable, ensure_tag_fits_its_connection,
+};
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
 // re-export 経由（invariant: このクレートは banto-tags を直接 depend
@@ -1196,8 +1199,27 @@ async fn plc_connections_update(
     id: i64,
     input: PlcConnectionPayload,
 ) -> Result<PlcConnectionResponse, BantoError> {
-    let actor = require_role(&state, Role::Editor, "plc_connections").await?;
+    plc_connections_update_body(&state, id, input).await
+}
+
+/// Body of [`plc_connections_update`]（spec M14 split-function pattern -
+/// #414 段階1 のテストがコマンドの本体を直接呼ぶため）。
+async fn plc_connections_update_body(
+    state: &AppState,
+    id: i64,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnectionResponse, BantoError> {
+    let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
+    // #414 段階1: REST の `plc_connections_update` と同じ検査（両経路対称）。
+    ensure_protocol_change_keeps_tags_readable(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        id,
+        &input.protocol,
+    )
+    .await?;
     let updated = state.plc_connections.update(id, input.into()).await?;
     state
         .audit
@@ -1350,7 +1372,22 @@ async fn tags_get(state: State<'_, AppState>, id: i64) -> Result<Tag, BantoError
 /// `editor`+ (R0 §3.6): create a tag.
 #[tauri::command]
 async fn tags_create(state: State<'_, AppState>, input: TagPayload) -> Result<Tag, BantoError> {
-    let actor = require_role(&state, Role::Editor, "tags").await?;
+    tags_create_body(&state, input).await
+}
+
+/// Body of [`tags_create`]（spec M14 split-function pattern - #414 段階1 の
+/// テストがコマンドの本体を直接呼ぶため）。
+async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    // #414 段階1: REST の `tags_create` と同じ検査（両経路対称）。
+    ensure_tag_fits_its_connection(
+        &state.plc_connections,
+        &state.collection_groups,
+        input.collection_group_id,
+        &input.address,
+        &input.data_type,
+    )
+    .await?;
     let created = state.tags.create(input.into()).await?;
     state
         .audit
@@ -1375,7 +1412,23 @@ async fn tags_update(
     id: i64,
     input: TagPayload,
 ) -> Result<Tag, BantoError> {
-    let actor = require_role(&state, Role::Editor, "tags").await?;
+    tags_update_body(&state, id, input).await
+}
+
+/// Body of [`tags_update`]（spec M14 split-function pattern - #414 段階1 の
+/// テストがコマンドの本体を直接呼ぶため）。
+async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Result<Tag, BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    // #414 段階1: REST の `tags_update` と同じ検査（両経路対称）。所属
+    // グループを変える更新も、入力のグループから接続を辿るので同じ検査で拾う。
+    ensure_tag_fits_its_connection(
+        &state.plc_connections,
+        &state.collection_groups,
+        input.collection_group_id,
+        &input.address,
+        &input.data_type,
+    )
+    .await?;
     let updated = state.tags.update(id, input.into()).await?;
     state
         .audit
@@ -3446,5 +3499,125 @@ mod tests {
         let page = events.data().expect("ready");
         assert!(page.rows.is_empty());
         assert_eq!(page.total_count, 0);
+    }
+
+    fn tag_payload(name: &str, collection_group_id: i64, address: &str) -> TagPayload {
+        TagPayload {
+            name: name.to_string(),
+            collection_group_id,
+            address: address.to_string(),
+            data_type: "i16".to_string(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            enabled: true,
+        }
+    }
+
+    fn connection_payload(name: &str, protocol: &str) -> PlcConnectionPayload {
+        PlcConnectionPayload {
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            host: "192.168.11.200".to_string(),
+            port: 502,
+            unit_id: 1,
+            enabled: true,
+            word_order: String::new(),
+        }
+    }
+
+    fn only_field_error(err: BantoError) -> FieldError {
+        match err {
+            BantoError::Validation { mut field_errors } => {
+                assert_eq!(field_errors.len(), 1, "{field_errors:?}");
+                field_errors.remove(0)
+            }
+            other => panic!("検証エラーではない: {other:?}"),
+        }
+    }
+
+    /// **#414 段階1（Tauri 経路）**: REST と同じ検査が、コマンドの本体にも
+    /// 入っている（片方だけに書くと、もう片方の経路から通ってしまう）。
+    /// タグの作成・更新（所属グループの変更を含む）と接続のプロトコル変更。
+    ///
+    /// 反証: 3 つの `*_body` から `ensure_*` の呼び出しを消すと、
+    /// 3 つの `expect_err` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_commands_refuse_an_address_the_connection_cannot_read() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let modbus = state
+            .plc_connections
+            .create(connection_payload("modbus", "modbus-tcp").into())
+            .await
+            .expect("create modbus connection");
+        let slmp = state
+            .plc_connections
+            .create(connection_payload("slmp", "slmp").into())
+            .await
+            .expect("create slmp connection");
+        let mut group_ids = Vec::new();
+        for (name, conn) in [("modbus-group", modbus.id), ("slmp-group", slmp.id)] {
+            let group = state
+                .collection_groups
+                .create(
+                    CollectionGroupPayload {
+                        name: name.to_string(),
+                        plc_connection_id: conn,
+                        period_ms: 1000,
+                        enabled: true,
+                    }
+                    .into(),
+                )
+                .await
+                .expect("create collection group");
+            group_ids.push(group.id);
+        }
+        let (modbus_group, slmp_group) = (group_ids[0], group_ids[1]);
+
+        // 作成: Modbus の下の D3000 は `address` で拒否、40001 は通る。
+        let err = tags_create_body(&state, tag_payload("melsec", modbus_group, "D3000"))
+            .await
+            .expect_err("Modbus の下の D3000 が保存できてしまった");
+        assert_eq!(only_field_error(err).field, "address");
+        let tag = tags_create_body(&state, tag_payload("modbus", modbus_group, "40001"))
+            .await
+            .expect("Modbus の下の 40001 は保存できること");
+
+        // 更新で SLMP のグループへ移す: 40001 は SLMP では読めないので拒否。
+        let err = tags_update_body(&state, tag.id, tag_payload("modbus", slmp_group, "40001"))
+            .await
+            .expect_err("SLMP のグループへ 40001 のまま移せてしまった");
+        assert_eq!(only_field_error(err).field, "address");
+        // アドレスも直して移すなら通る。
+        tags_update_body(&state, tag.id, tag_payload("modbus", slmp_group, "D100"))
+            .await
+            .expect("アドレスを直して移すのは通ること");
+
+        // 接続のプロトコル変更: SLMP の下に D100 があるので Modbus へは変えられない。
+        let err =
+            plc_connections_update_body(&state, slmp.id, connection_payload("slmp", "modbus-tcp"))
+                .await
+                .expect_err("配下のタグが読めなくなるプロトコル変更が通ってしまった");
+        let field_error = only_field_error(err);
+        assert_eq!(field_error.field, "protocol");
+        assert!(
+            field_error.message.contains("「modbus」（D100）"),
+            "どのタグが妨げているかが分からない: {}",
+            field_error.message
+        );
+        // プロトコルを変えない更新（名前の変更）は通る。
+        plc_connections_update_body(&state, slmp.id, connection_payload("slmp-renamed", "slmp"))
+            .await
+            .expect("プロトコルを変えない更新は通ること");
     }
 }

@@ -18,6 +18,9 @@ pub mod events;
 pub mod hub;
 pub mod rest;
 pub mod settings;
+// #414 段階1: タグのアドレスが接続のプロトコルで読めるかを保存時に確かめる
+// （判定は banto-collect の `check_tag_address`。REST と Tauri の両方から呼ぶ）。
+pub mod tag_address;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod users;
