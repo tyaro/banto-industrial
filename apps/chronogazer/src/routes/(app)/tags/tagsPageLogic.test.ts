@@ -23,6 +23,8 @@ import {
 	connectionSavedMessage,
 	unmovingSimulationTags,
 	simulationCoverageView,
+	coverageReloadStarted,
+	coverageReloadSettled,
 	SIMULATION_CONNECTION_LABEL,
 	type SimulationCoverageView,
 	type SaveGuardToken,
@@ -605,11 +607,61 @@ describe('simulationCoverageView', () => {
 		[true, { items: null, error: '失敗' }, 'failed'],
 		[true, { items: [], error: null }, 'all-moving'],
 		[true, { items: [{ supported: true }], error: null }, 'all-moving'],
-		[true, { items: [{ supported: true }, { supported: false }], error: null }, 'list'],
-		// 更新に失敗しても、前回読めた内容は残す（D と同じ）。
-		[true, { items: [{ supported: false }], error: '更新失敗' }, 'list']
+		[true, { items: [{ supported: true }, { supported: false }], error: null }, 'list']
 	];
 	it.each(cases)('シミュ接続あり=%s / %j → %s', (has, state, expected) => {
 		expect(simulationCoverageView(has, state)).toBe(expected);
+	});
+});
+
+describe('判定の再取得は前の設定の結果を持ち越さない（#417 オーナーレビュー P2）', () => {
+	type Entry = {
+		tagId: number;
+		plcConnectionId: number;
+		supported: boolean;
+		reason: string | null;
+	};
+	const tags = [{ id: 1, name: '圧力', address: '40100' }];
+	const connections = [{ id: 9, name: 'ライン1' }];
+	// 実機接続だった頃に取得済みの判定（シミュレーション接続が無いので空）。
+	const fetchedWhileReal = coverageReloadSettled<Entry>(coverageReloadStarted<Entry>(), {
+		kind: 'applied',
+		items: []
+	});
+
+	it('前提: 実機接続のときは判定ブロック自体を出さない', () => {
+		expect(simulationCoverageView(false, fetchedWhileReal)).toBe('hidden');
+	});
+
+	it('simulation=true に変えて再取得を待つ間は all-moving にならない', () => {
+		const waiting = coverageReloadStarted<Entry>();
+		expect(simulationCoverageView(true, waiting)).toBe('loading');
+		// 反証の対照: 古い結果を持ち越すと、ここで all-moving になってしまう。
+		expect(simulationCoverageView(true, fetchedWhileReal)).toBe('all-moving');
+	});
+
+	it('再取得に失敗しても all-moving にならない', () => {
+		const started = coverageReloadStarted<Entry>();
+		const failed = coverageReloadSettled(started, { kind: 'error', message: '読めない' });
+		expect(simulationCoverageView(true, failed)).toBe('failed');
+		expect(failed.items).toBeNull();
+	});
+
+	it('再取得に成功したら範囲外タグが出る', () => {
+		const started = coverageReloadStarted<Entry>();
+		const done = coverageReloadSettled(started, {
+			kind: 'applied',
+			items: [{ tagId: 1, plcConnectionId: 9, supported: false, reason: '範囲外です' }]
+		});
+		expect(simulationCoverageView(true, done)).toBe('list');
+		expect(unmovingSimulationTags(done.items ?? [], tags, connections)).toEqual([
+			{
+				tagId: 1,
+				tagName: '圧力',
+				address: '40100',
+				connectionName: 'ライン1',
+				reason: '範囲外です'
+			}
+		]);
 	});
 });

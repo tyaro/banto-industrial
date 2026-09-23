@@ -485,8 +485,33 @@ export function unmovingSimulationTags(
  *   「全部動く」と言わない（D と同じ規律 - 読めていないを 0 件に潰さない）。
  * - `all-moving`: 読めて、動かないタグが 0 本。
  * - `list`: 読めて、動かないタグがある。
+ *
+ * **`all-moving` / `list` は「今の設定に対して取得した結果」にだけ出す**
+ * （#417 オーナーレビュー P2）。判定は接続の simulation・グループ・タグの
+ * どれが変わっても変わるので、再取得を始めるときに前回の結果を捨てる
+ * （[`coverageReloadStarted`]）。前回の空配列は「実機接続なので判定対象が
+ * 無かった」という意味でしかなく、新しい設定の判定としては使えない。
  */
 export type SimulationCoverageView = 'hidden' | 'loading' | 'failed' | 'all-moving' | 'list';
+
+/**
+ * 判定の再取得を始めた時点の状態（純関数）。**前回の結果は持ち越さない** -
+ * 応答待ちの間は `loading`、失敗したら `failed` になり、古い結果で
+ * 「すべて値が動く」と断定しない（[`SimulationCoverageView`] の doc）。
+ */
+export function coverageReloadStarted<T>(): ListLoadState<T> {
+	return { items: null, error: null };
+}
+
+/** 判定の再取得が終わった後の状態（純関数）。失敗しても結果を捏造しない（`items` は取得開始時の `null` のまま）。 */
+export function coverageReloadSettled<T>(
+	started: ListLoadState<T>,
+	outcome: { kind: 'applied'; items: T[] } | { kind: 'error'; message: string }
+): ListLoadState<T> {
+	return outcome.kind === 'applied'
+		? { items: outcome.items, error: null }
+		: { items: started.items, error: outcome.message };
+}
 
 export function simulationCoverageView<T extends { supported: boolean }>(
 	hasSimulationConnection: boolean,

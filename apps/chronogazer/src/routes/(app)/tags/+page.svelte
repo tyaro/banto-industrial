@@ -103,6 +103,8 @@
 		connectionSavedMessage,
 		unmovingSimulationTags,
 		simulationCoverageView,
+		coverageReloadStarted,
+		coverageReloadSettled,
 		type SaveGuardToken,
 		type DeleteGuardToken,
 		type ListLoadState
@@ -1031,6 +1033,11 @@
 	// 判定は Rust（`classify_plc_tag`）の結果を読むだけ。一覧と同じ
 	// 「未読込 / 失敗 / 読めた」の区別と世代照合（`runGuardedListLoad`）を使う -
 	// 読めていないのに「全部動きます」と言わないため。
+	//
+	// #417 オーナーレビュー P2: 一覧と違い、**再取得のたびに前回の結果を捨てる**
+	// （`coverageReloadStarted`）。再取得は接続・グループ・タグの変更で起きるので、
+	// 前回の結果は「前の設定の判定」でしかない（例: 実機接続だった頃の空配列で
+	// 「すべて値が動く」と断定してしまう）。
 
 	let coverage: SimulationCoverageEntry[] | null = $state(null);
 	let coverageError: string | null = $state(null);
@@ -1041,7 +1048,6 @@
 		error: coverageError
 	});
 	const coverageView = $derived(simulationCoverageView(hasSimulationConnection, coverageState));
-	const coverageRetry = $derived(showsRetry(coverageState));
 	const unmovingTags = $derived(
 		unmovingSimulationTags(listRows(coverageState), tagRows, connectionRows)
 	);
@@ -1051,23 +1057,31 @@
 		coverageGeneration += 1;
 		const generation = coverageGeneration;
 		coverageLoading = true;
-		coverageError = null;
+		const started = coverageReloadStarted<SimulationCoverageEntry>();
+		coverage = started.items;
+		coverageError = started.error;
 		const outcome = await runGuardedListLoad(
 			generation,
 			listSimulationCoverage(),
 			() => coverageGeneration
 		);
+		let settled: ListLoadState<SimulationCoverageEntry>;
 		switch (outcome.kind) {
 			case 'applied':
-				coverage = outcome.items;
+				settled = coverageReloadSettled(started, { kind: 'applied', items: outcome.items });
 				break;
 			case 'error':
 				// トーストは出さない（補助の情報で、画面の行に失敗と再試行を残す）。
-				coverageError = errorMessage(outcome.err);
+				settled = coverageReloadSettled(started, {
+					kind: 'error',
+					message: errorMessage(outcome.err)
+				});
 				break;
 			case 'stale':
 				return;
 		}
+		coverage = settled.items;
+		coverageError = settled.error;
 		coverageLoading = false;
 	}
 
@@ -1369,18 +1383,6 @@
 							</button>
 						</p>
 					{:else}
-						{#if coverageRetry}
-							<p class="load-error" role="alert">
-								判定を更新できませんでした（{coverageError}）。表示は最後に読み込めた内容です。
-								<button
-									type="button"
-									onclick={() => void reloadSimulationCoverage()}
-									disabled={coverageLoading}
-								>
-									再試行
-								</button>
-							</p>
-						{/if}
 						{#if coverageView === 'all-moving'}
 							<p class="note">
 								シミュレーション接続の配下のタグは、すべてシミュレータが値を動かす番地です。
