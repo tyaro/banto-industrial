@@ -195,7 +195,8 @@ use crate::collect::{
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::tag_address::{
-    ensure_protocol_change_keeps_tags_readable, ensure_tag_fits_its_connection,
+    ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
+    ensure_tag_fits_its_connection,
 };
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 
@@ -1688,7 +1689,8 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
 // `BantoError::Validation` として返る。
 //
 // #414 段階1: banto-tags はタグのアドレス書式を検証しないので、タグの
-// 作成・更新と接続のプロトコル変更の前に `crate::tag_address` の検査を
+// 作成・更新、接続のプロトコル変更、収集グループの接続変更の前に
+// `crate::tag_address` の検査を
 // 挟む（Modbus 接続の下の `D3000` のような、収集開始で `build_config` を
 // 失敗させるタグを保存時に拒否する）。Tauri 側の同名コマンドも同じ検査を
 // 呼ぶ。
@@ -2124,6 +2126,14 @@ async fn collection_groups_update(
         "collection_groups",
         "PUT",
         "/api/collection-groups/{id}",
+    )
+    .await?;
+    ensure_group_move_keeps_tags_readable(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        id,
+        input.plc_connection_id,
     )
     .await?;
     let updated = state.collection_groups.update(id, input.into()).await?;
@@ -4419,6 +4429,117 @@ mod tests {
         )
         .await;
         assert_eq!(conn["protocol"], "slmp", "{conn}");
+    }
+
+    /// **#414 段階1（REST 経路、グループの接続変更）**: 配下のタグが新しい
+    /// 接続のプロトコルで読めなくなる移動は `plcConnectionId` で拒否され、
+    /// 同じプロトコルの接続への移動は通り、存在しない接続は従来どおり
+    /// `CollectionGroupService` 自身のエラーになる。
+    ///
+    /// 反証: `collection_groups_update` から
+    /// `ensure_group_move_keeps_tags_readable` の呼び出しを消すと、最初の
+    /// 拒否の確認が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_update_route_refuses_a_move_that_leaves_tags_unreadable() {
+        let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
+
+        async fn send(
+            router: &Router,
+            request: HttpRequest<Body>,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = router.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+
+        let mut ids = Vec::new();
+        for (name, protocol) in [
+            ("modbus", "modbus-tcp"),
+            ("modbus2", "modbus-tcp"),
+            ("slmp", "slmp"),
+        ] {
+            let mut payload = plc_connection_payload(name);
+            payload["protocol"] = json!(protocol);
+            let (status, conn) = send(
+                &router,
+                post_json_auth("/api/plc-connections", &editor, payload),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{conn}");
+            ids.push(conn["id"].as_i64().unwrap());
+        }
+        let (modbus, modbus2, slmp) = (ids[0], ids[1], ids[2]);
+        let group_body = |plc_connection_id: i64| {
+            json!({
+                "name": "group",
+                "plcConnectionId": plc_connection_id,
+                "periodMs": 1000,
+                "enabled": true
+            })
+        };
+        let (status, group) = send(
+            &router,
+            post_json_auth("/api/collection-groups", &editor, group_body(modbus)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group}");
+        let group_id = group["id"].as_i64().unwrap();
+        // 無効なタグも調べる対象。
+        let (status, tag) = send(
+            &router,
+            post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "modbus-tag",
+                    "collectionGroupId": group_id,
+                    "address": "40001",
+                    "dataType": "i16",
+                    "decimals": 0,
+                    "enabled": false
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag}");
+        let path = format!("/api/collection-groups/{group_id}");
+
+        // SLMP の接続へ移す: 拒否、保存もされない。
+        let (status, body) = send(&router, put_json_auth(&path, &editor, group_body(slmp))).await;
+        assert!(
+            status.is_client_error(),
+            "拒否されていない: {status} {body}"
+        );
+        assert_eq!(body["kind"], "validation", "{body}");
+        assert_eq!(
+            body["field_errors"][0]["field"], "plcConnectionId",
+            "{body}"
+        );
+        let message = body["field_errors"][0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("「modbus-tag」（40001）") && message.contains("slmp"),
+            "{message}"
+        );
+        let (_, current) = send(&router, get_auth(&path, &editor)).await;
+        assert_eq!(current["plcConnectionId"], modbus, "{current}");
+
+        // 同じプロトコルの接続への移動は通る。
+        let (status, moved) =
+            send(&router, put_json_auth(&path, &editor, group_body(modbus2))).await;
+        assert_eq!(status, StatusCode::OK, "{moved}");
+        assert_eq!(moved["plcConnectionId"], modbus2, "{moved}");
+
+        // 存在しない接続は従来どおり CollectionGroupService のエラー。
+        let (status, body) = send(&router, put_json_auth(&path, &editor, group_body(9999))).await;
+        assert!(status.is_client_error(), "{status} {body}");
+        assert_eq!(
+            body["field_errors"][0]["field"], "plcConnectionId",
+            "{body}"
+        );
+        assert_eq!(
+            body["field_errors"][0]["message"], "指定されたPLC接続が見つかりません",
+            "{body}"
+        );
     }
 
     /// R0 §3.6 の監査記録: PLC接続の作成・更新・削除がそれぞれ

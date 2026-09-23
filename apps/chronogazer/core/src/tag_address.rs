@@ -18,7 +18,8 @@
 //! 「収集で通るもの」がずれない。このモジュールがやるのは
 //! (1) タグ → 収集グループ → 接続を辿ってプロトコルを引くことと、
 //! (2) 結果を `BantoError::Validation` の人間可読なフィールドエラーへ
-//! 載せ替えること（`field` はワイヤ名: `address`/`dataType`/`protocol`）だけ。
+//! 載せ替えること（`field` はワイヤ名: `address`/`dataType`/`protocol`/
+//! `plcConnectionId`）だけ。
 //!
 //! ## 呼ぶ経路（REST と Tauri の両方）
 //!
@@ -30,15 +31,17 @@
 //!   プロトコルが変わらない更新（名前・ホストの変更など）では調べない -
 //!   段階2 が扱う既存の不正データのせいで、無関係な編集まで保存できなく
 //!   なるのを避けるため。
+//! - 収集グループの接続変更（グループごと別プロトコルの接続へ移す）:
+//!   [`ensure_group_move_keeps_tags_readable`]。接続が変わり、かつ新旧の
+//!   プロトコルが違うときだけ、グループ配下の全タグを調べて
+//!   `plcConnectionId` で拒否する（文言の形はプロトコル変更と同じ）。
 //!
-//! どちらも `chronogazer_core::rest` の各ハンドラと、
+//! いずれも `chronogazer_core::rest` の各ハンドラと、
 //! `apps/chronogazer/src-tauri/src/lib.rs` の同名コマンドの**両方**から呼ぶ
 //! （片方だけに書くと、もう片方の経路から通ってしまう）。
 //!
 //! ## 制約（この段階ではやらないこと）
 //!
-//! - **収集グループの接続変更**（グループごと別プロトコルの接続へ移す）は
-//!   調べていない。#414 段階1 の指示の対象経路に無いため - PR 本文参照。
 //! - 調べてから書くまでは同じトランザクションではない（検査と書き込みの
 //!   間に別の要求が割り込む余地がある）。chronogazer の編集は少人数・
 //!   手動が前提で、取りこぼしても段階2（開始時に外して残りを動かす）が
@@ -83,10 +86,13 @@ pub fn unreadable_tags<'a>(protocol: &str, tags: &[&'a Tag]) -> Vec<(&'a Tag, Ta
         .collect()
 }
 
-/// 純関数: プロトコル変更を拒否する検証エラー（`field: "protocol"`）。
-/// `conflicts` が空なら `None`（拒否しない）。
-pub fn protocol_change_error(
-    new_protocol: &str,
+/// 読めなくなるタグの一覧（上限 [`LISTED_TAGS_LIMIT`] 件＋「ほか N 件」）を
+/// 「{lead}タグ N 件が読めなくなります: …。先にタグのアドレスを直して
+/// ください」の形で `field` に載せる。プロトコル変更とグループの接続変更で
+/// 文言の形を揃えるための共通部分。`conflicts` が空なら `None`。
+fn unreadable_tags_error(
+    field: &str,
+    lead: &str,
     conflicts: &[(&Tag, TagAddressIssue)],
 ) -> Option<BantoError> {
     if conflicts.is_empty() {
@@ -102,15 +108,42 @@ pub fn protocol_change_error(
     }
     Some(BantoError::Validation {
         field_errors: vec![FieldError {
-            field: "protocol".to_string(),
+            field: field.to_string(),
             message: format!(
-                "プロトコルを {new_protocol} に変更すると、この接続の下のタグ {} 件が\
-                 読めなくなります: {}。先にタグのアドレスを直してください",
+                "{lead}タグ {} 件が読めなくなります: {}。先にタグのアドレスを直してください",
                 conflicts.len(),
                 listed.join("、")
             ),
         }],
     })
+}
+
+/// 純関数: プロトコル変更を拒否する検証エラー（`field: "protocol"`）。
+/// `conflicts` が空なら `None`（拒否しない）。
+pub fn protocol_change_error(
+    new_protocol: &str,
+    conflicts: &[(&Tag, TagAddressIssue)],
+) -> Option<BantoError> {
+    unreadable_tags_error(
+        "protocol",
+        &format!("プロトコルを {new_protocol} に変更すると、この接続の下の"),
+        conflicts,
+    )
+}
+
+/// 純関数: 収集グループの接続変更を拒否する検証エラー
+/// （`field: "plcConnectionId"`）。文言の形は [`protocol_change_error`] と同じ。
+/// `conflicts` が空なら `None`（拒否しない）。
+pub fn group_move_error(
+    new_connection_name: &str,
+    new_protocol: &str,
+    conflicts: &[(&Tag, TagAddressIssue)],
+) -> Option<BantoError> {
+    unreadable_tags_error(
+        "plcConnectionId",
+        &format!("PLC接続を {new_connection_name}（{new_protocol}）に変更すると、このグループの"),
+        conflicts,
+    )
 }
 
 /// タグの作成・更新の前に呼ぶ: 入力のアドレス・データ型が、
@@ -180,6 +213,57 @@ pub async fn ensure_protocol_change_keeps_tags_readable(
         .collect();
     let conflicts = unreadable_tags(new_protocol, &under_connection);
     match protocol_change_error(new_protocol, &conflicts) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// 収集グループの更新の前に呼ぶ: `plc_connection_id` が変わり、**新しい
+/// 接続のプロトコルが古い接続と違う**ときだけ、グループ配下の全タグ
+/// （有効・無効を問わない）が新しいプロトコルで読めるか。接続が変わらない、
+/// またはプロトコルが同じなら何も調べない（既存の不正データで無関係な
+/// 編集を止めないため - [`ensure_protocol_change_keeps_tags_readable`] と
+/// 同じ理由）。
+///
+/// グループ・古い接続・新しい接続のどれかが見つからない場合は `Ok(())` で、
+/// `CollectionGroupService::update` 自身の応答（404 / 「指定されたPLC接続が
+/// 見つかりません」）に任せる。
+pub async fn ensure_group_move_keeps_tags_readable(
+    connections: &PlcConnectionService,
+    groups: &CollectionGroupService,
+    tags: &TagService,
+    group_id: i64,
+    new_connection_id: i64,
+) -> Result<(), BantoError> {
+    let group = match groups.get(group_id).await {
+        Ok(group) => group,
+        Err(BantoError::NotFound { .. }) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if group.plc_connection_id == new_connection_id {
+        return Ok(());
+    }
+    let old = match connections.get(group.plc_connection_id).await {
+        Ok(connection) => connection,
+        Err(BantoError::NotFound { .. }) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let new = match connections.get(new_connection_id).await {
+        Ok(connection) => connection,
+        Err(BantoError::NotFound { .. }) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if old.protocol == new.protocol {
+        return Ok(());
+    }
+    let mut all_tags = tags.list(ListParams::default()).await?.rows;
+    all_tags.sort_by_key(|tag| tag.id);
+    let in_group: Vec<&Tag> = all_tags
+        .iter()
+        .filter(|tag| tag.collection_group_id == group_id)
+        .collect();
+    let conflicts = unreadable_tags(&new.protocol, &in_group);
+    match group_move_error(&new.name, &new.protocol, &conflicts) {
         Some(err) => Err(err),
         None => Ok(()),
     }
@@ -278,6 +362,29 @@ mod tests {
         assert!(message.contains("「t5」（D5）"), "{message}");
         assert!(!message.contains("「t6」"), "{message}");
         assert!(message.contains("ほか 2 件"), "{message}");
+    }
+
+    /// グループの接続変更の文言は、プロトコル変更と同じ形（上限 5 件＋
+    /// 「ほか N 件」）で、`field` だけが `plcConnectionId`。
+    #[test]
+    fn group_move_error_has_the_same_shape_as_protocol_change_error() {
+        let tags: Vec<Tag> = (1..=6)
+            .map(|i| tag(i, &format!("t{i}"), &format!("4000{i}"), "i16"))
+            .collect();
+        let refs: Vec<&Tag> = tags.iter().collect();
+        assert!(group_move_error("plc2", "modbus-tcp", &[]).is_none());
+
+        let conflicts = unreadable_tags("slmp", &refs);
+        assert_eq!(conflicts.len(), 6);
+        let errors = field_errors(group_move_error("plc2", "slmp", &conflicts).unwrap());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "plcConnectionId");
+        let message = &errors[0].message;
+        assert!(message.contains("plc2（slmp）"), "{message}");
+        assert!(message.contains("6 件"), "{message}");
+        assert!(message.contains("「t5」（40005）"), "{message}");
+        assert!(!message.contains("「t6」"), "{message}");
+        assert!(message.contains("ほか 1 件"), "{message}");
     }
 
     struct Registry {

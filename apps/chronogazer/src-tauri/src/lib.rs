@@ -44,7 +44,8 @@ use chronogazer_core::rest::{
 };
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::tag_address::{
-    ensure_protocol_change_keeps_tags_readable, ensure_tag_fits_its_connection,
+    ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
+    ensure_tag_fits_its_connection,
 };
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
@@ -1314,7 +1315,26 @@ async fn collection_groups_update(
     id: i64,
     input: CollectionGroupPayload,
 ) -> Result<CollectionGroup, BantoError> {
-    let actor = require_role(&state, Role::Editor, "collection_groups").await?;
+    collection_groups_update_body(&state, id, input).await
+}
+
+/// Body of [`collection_groups_update`]（spec M14 split-function pattern -
+/// #414 段階1 のテストがコマンドの本体を直接呼ぶため）。
+async fn collection_groups_update_body(
+    state: &AppState,
+    id: i64,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    let actor = require_role(state, Role::Editor, "collection_groups").await?;
+    // #414 段階1: REST の `collection_groups_update` と同じ検査（両経路対称）。
+    ensure_group_move_keeps_tags_readable(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        id,
+        input.plc_connection_id,
+    )
+    .await?;
     let updated = state.collection_groups.update(id, input.into()).await?;
     state
         .audit
@@ -3619,5 +3639,91 @@ mod tests {
         plc_connections_update_body(&state, slmp.id, connection_payload("slmp-renamed", "slmp"))
             .await
             .expect("プロトコルを変えない更新は通ること");
+    }
+
+    /// **#414 段階1（Tauri 経路、グループの接続変更）**: 配下のタグが新しい
+    /// 接続のプロトコルで読めなくなる移動は `plcConnectionId` で拒否され、
+    /// 同じプロトコルの接続への移動は通り、存在しない接続は従来どおり
+    /// `CollectionGroupService` 自身のエラー（「指定されたPLC接続が見つかり
+    /// ません」）になる。
+    ///
+    /// 反証: `collection_groups_update_body` から
+    /// `ensure_group_move_keeps_tags_readable` の呼び出しを消すと、最初の
+    /// `expect_err` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_update_refuses_a_move_that_leaves_tags_unreadable() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let mut ids = Vec::new();
+        for (name, protocol) in [
+            ("modbus", "modbus-tcp"),
+            ("modbus2", "modbus-tcp"),
+            ("slmp", "slmp"),
+        ] {
+            let conn = state
+                .plc_connections
+                .create(connection_payload(name, protocol).into())
+                .await
+                .expect("create connection");
+            ids.push(conn.id);
+        }
+        let (modbus, modbus2, slmp) = (ids[0], ids[1], ids[2]);
+        let group_payload = |plc_connection_id: i64| CollectionGroupPayload {
+            name: "group".to_string(),
+            plc_connection_id,
+            period_ms: 1000,
+            enabled: true,
+        };
+        let group = state
+            .collection_groups
+            .create(group_payload(modbus).into())
+            .await
+            .expect("create collection group");
+        // 無効なタグも調べる対象。
+        let mut disabled = tag_payload("modbus-tag", group.id, "40001");
+        disabled.enabled = false;
+        tags_create_body(&state, disabled)
+            .await
+            .expect("Modbus の下の 40001 は保存できること");
+
+        // SLMP の接続へ移す: 40001 が読めなくなるので拒否、保存もされない。
+        let err = collection_groups_update_body(&state, group.id, group_payload(slmp))
+            .await
+            .expect_err("タグが読めなくなるグループの移動が通ってしまった");
+        let field_error = only_field_error(err);
+        assert_eq!(field_error.field, "plcConnectionId");
+        assert!(
+            field_error.message.contains("「modbus-tag」（40001）")
+                && field_error.message.contains("slmp"),
+            "どのタグが妨げているかが分からない: {}",
+            field_error.message
+        );
+        let unchanged = state
+            .collection_groups
+            .get(group.id)
+            .await
+            .expect("get group");
+        assert_eq!(unchanged.plc_connection_id, modbus);
+
+        // 同じプロトコルの接続への移動は通る。
+        let moved = collection_groups_update_body(&state, group.id, group_payload(modbus2))
+            .await
+            .expect("同じプロトコルの接続への移動は通ること");
+        assert_eq!(moved.plc_connection_id, modbus2);
+
+        // 存在しない接続は従来どおり CollectionGroupService のエラー。
+        let field_error = only_field_error(
+            collection_groups_update_body(&state, group.id, group_payload(9999))
+                .await
+                .expect_err("存在しない接続への移動が通ってしまった"),
+        );
+        assert_eq!(field_error.field, "plcConnectionId");
+        assert_eq!(field_error.message, "指定されたPLC接続が見つかりません");
     }
 }
