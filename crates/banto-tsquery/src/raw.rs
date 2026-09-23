@@ -23,7 +23,7 @@ use std::path::Path;
 use banto_tstore::{TsReader, TstoreError};
 
 use crate::error::TsQueryError;
-use crate::files::{candidate_files, clamp_query_bounds};
+use crate::files::candidate_files;
 use crate::types::{RawRange, RawRow};
 
 /// Default cap on [`crate::TsQuery::read_range`]'s total row count when the
@@ -44,14 +44,6 @@ pub(crate) async fn read_range(
         )));
     }
     let max_rows = max_rows.unwrap_or(DEFAULT_MAX_RAW_ROWS);
-
-    // No arithmetic here needs this (banto_tstore::TsReader::read_range only
-    // ever *compares* ptime to from_ms/to_ms, never subtracts - comparisons
-    // do not overflow), but read_range and read_decimated should agree on
-    // what "the whole representable timeline" means for the same extreme
-    // input rather than one clamping and the other not - see
-    // `files::clamp_query_bounds`'s doc comment.
-    let (from_ms, to_ms) = clamp_query_bounds(from_ms, to_ms);
 
     let files = candidate_files(data_dir, from_ms, to_ms)?;
     let mut rows: Vec<RawRow> = Vec::new();

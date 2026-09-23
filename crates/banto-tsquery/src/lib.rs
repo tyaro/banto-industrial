@@ -108,6 +108,14 @@ impl TsQuery {
     /// viewport pixel width) regardless of how many raw samples the range
     /// actually contains - see [`mod@decimate`]'s module doc for the full
     /// bin-width/gap/near-native-zoom design.
+    ///
+    /// Any `from_ms <= to_ms` is accepted, up to `i64::MIN..=i64::MAX`. The
+    /// returned range is always the requested one, the aligned bins start at
+    /// `from_ms` and the last one contains `to_ms`. The binned result has at
+    /// most `target_bins` bins, with one exception: when `target_bins <= 2`
+    /// and the range is so wide that `ceil(width / target_bins)` does not fit
+    /// `DecimatedRange::bin_ms` (`i64`), `bin_ms` is held at `i64::MAX` and
+    /// the result has up to 3 bins (`i64::MIN..=i64::MAX` gives exactly 3).
     pub async fn read_decimated(
         &self,
         group_key: &str,

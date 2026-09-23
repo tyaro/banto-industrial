@@ -60,7 +60,10 @@ pub struct Bin {
 pub struct DecimatedRange {
     pub tag_keys: Vec<String>,
     /// Ascending by `ptime_ms`, one entry per bin covering `[from_ms,
-    /// to_ms]` - including bins with no data at all (all-`Gap` `tags`), so
+    /// to_ms]` (in the aligned case the first bin starts at `from_ms` and the
+    /// last one contains `to_ms`; the count is at most `target_bins`, except
+    /// the up-to-3 case described on [`crate::TsQuery::read_decimated`]),
+    /// including bins with no data at all (all-`Gap` `tags`), so
     /// the bin sequence itself is a complete, evenly-spaced (in the aligned
     /// case) timeline a chart can walk without needing to infer missing
     /// bins from gaps in this `Vec`.
