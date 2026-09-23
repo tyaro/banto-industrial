@@ -52,6 +52,15 @@
 	 * 値で、**走っている収集への反映は「収集を再起動」**（保存時のトーストで
 	 * 案内する）。走っている収集が実際にシミュレータ相手かは
 	 * `/settings/collect` の接続ごとの状態に出る。
+	 *
+	 * **収集の開始時に外される設定（#414 段階2、2026-09-23 オーナー決定）**:
+	 * 保存時の検証（#418）より前に入った不正なタグなどは、収集の開始時に
+	 * 外されて残りだけが動く。それを編集中に分かるよう、ページの先頭に一覧を
+	 * 出す（収集が走っていなくても出す）。判定は画面では行わない
+	 * （`listConfigExclusions` = 収集の開始と同じ Rust の組み立ての結果）。
+	 * グリッドの列ではなく一覧にしたのは、接続・グループ・タグの 3 つの単位を
+	 * 1 か所で親から辿れるようにするため（接続が外れると配下のグループ・タグも
+	 * 外れ、その理由は親の名前を指す）。
 	 */
 	import { untrack } from 'svelte';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
@@ -74,6 +83,7 @@
 		updateTag,
 		deleteTag,
 		listSimulationCoverage,
+		listConfigExclusions,
 		isTagRegistryAvailable,
 		DEMO_MODE_MESSAGE,
 		ALLOWED_PERIOD_MS,
@@ -86,8 +96,10 @@
 		type Tag,
 		type TagInput,
 		type TagDataType,
-		type SimulationCoverageEntry
+		type SimulationCoverageEntry,
+		type ExclusionView
 	} from '$lib/banto/tagRegistryAdmin';
+	import { exclusionUnitLabel } from '$lib/banto/collectAdmin';
 	import {
 		runGuardedSave,
 		runGuardedDelete,
@@ -103,6 +115,7 @@
 		connectionSavedMessage,
 		unmovingSimulationTags,
 		simulationCoverageView,
+		configExclusionsView,
 		coverageReloadStarted,
 		coverageReloadSettled,
 		type SaveGuardToken,
@@ -329,6 +342,8 @@
 				connections = outcome.items;
 				// #413: 接続の simulation が変わると判定の対象が変わる。
 				void reloadSimulationCoverage();
+				// #414 段階2: どの一覧が変わっても「開始時に外される設定」の判定は変わる。
+				void reloadConfigExclusions();
 				break;
 			case 'error':
 				// 失敗を「0件」に潰さない: `connections` には触らない（未読込なら
@@ -613,6 +628,8 @@
 			case 'applied':
 				groups = outcome.items;
 				void reloadSimulationCoverage();
+				// #414 段階2: どの一覧が変わっても「開始時に外される設定」の判定は変わる。
+				void reloadConfigExclusions();
 				break;
 			case 'error':
 				groupsError = errorMessage(outcome.err);
@@ -889,6 +906,8 @@
 			case 'applied':
 				tags = outcome.items;
 				void reloadSimulationCoverage();
+				// #414 段階2: どの一覧が変わっても「開始時に外される設定」の判定は変わる。
+				void reloadConfigExclusions();
 				break;
 			case 'error':
 				tagsError = errorMessage(outcome.err);
@@ -1085,6 +1104,55 @@
 		coverageLoading = false;
 	}
 
+	// --- #414 段階2: 収集の開始時に外される設定 --------------------------------
+	//
+	// 判定は Rust（収集の開始と同じ `build_config_lenient_from`）の結果を読む
+	// だけ（`listConfigExclusions`）。収集が走っていなくても出す。再取得の
+	// 作法は上の「値が動かないタグ」と同じ: 前回の結果を持ち越さず、読めて
+	// いないのに「不正な設定はありません」と言わない。
+
+	let exclusionMarks: ExclusionView[] | null = $state(null);
+	let exclusionMarksError: string | null = $state(null);
+	let exclusionMarksLoading = $state(false);
+	let exclusionMarksGeneration = 0;
+	const exclusionMarksState: ListLoadState<ExclusionView> = $derived({
+		items: exclusionMarks,
+		error: exclusionMarksError
+	});
+	const exclusionMarksView = $derived(configExclusionsView(exclusionMarksState));
+
+	async function reloadConfigExclusions(): Promise<void> {
+		if (!available) return;
+		exclusionMarksGeneration += 1;
+		const generation = exclusionMarksGeneration;
+		exclusionMarksLoading = true;
+		const started = coverageReloadStarted<ExclusionView>();
+		exclusionMarks = started.items;
+		exclusionMarksError = started.error;
+		const outcome = await runGuardedListLoad(
+			generation,
+			listConfigExclusions(),
+			() => exclusionMarksGeneration
+		);
+		let settled: ListLoadState<ExclusionView>;
+		switch (outcome.kind) {
+			case 'applied':
+				settled = coverageReloadSettled(started, { kind: 'applied', items: outcome.items });
+				break;
+			case 'error':
+				settled = coverageReloadSettled(started, {
+					kind: 'error',
+					message: errorMessage(outcome.err)
+				});
+				break;
+			case 'stale':
+				return;
+		}
+		exclusionMarks = settled.items;
+		exclusionMarksError = settled.error;
+		exclusionMarksLoading = false;
+	}
+
 	$effect(() => {
 		void reloadConnections();
 		void reloadGroups();
@@ -1100,6 +1168,43 @@
 			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードにはレジストリDBが無いため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
 		</p>
 	{:else}
+		<!--
+			#414 段階2: 今の設定で収集を開始したら外されるもの。判定は Rust の
+			結果をそのまま出す（文言はタグなら保存時の拒否理由と同じ）。0 件なら
+			出さない。読めていない・読めなかったときは「無い」と言わない。
+		-->
+		{#if exclusionMarksView !== 'none'}
+			<section class="config-exclusions" aria-label="収集の開始時に外される設定">
+				<h3>収集の開始時に外される設定</h3>
+				{#if exclusionMarksView === 'loading'}
+					<p class="loading">判定を読み込み中…</p>
+				{:else if exclusionMarksView === 'failed'}
+					<p class="load-error" role="alert">
+						判定を読み込めませんでした（{exclusionMarksError}）。不正な設定が無いという意味ではありません。
+						<button
+							type="button"
+							onclick={() => void reloadConfigExclusions()}
+							disabled={exclusionMarksLoading}
+						>
+							再試行
+						</button>
+					</p>
+				{:else}
+					<p class="note exclusion-note">
+						次の設定は不正なため、収集の開始時に外されます（残りは収集されます）。直すと、次の「収集を再起動」から収集されます。
+					</p>
+					<ul class="exclusion-marks">
+						{#each listRows(exclusionMarksState) as mark (mark.key)}
+							<li>
+								<span class="exclusion-unit">{exclusionUnitLabel(mark.unit)}</span>
+								<strong>{mark.name}</strong>: {mark.message}
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</section>
+		{/if}
+
 		<section class="registry-section">
 			<h3>PLC接続</h3>
 			{#if canWrite}
@@ -1515,6 +1620,31 @@
 	.simulation-coverage {
 		border-top: 1px solid var(--banto-border);
 		padding-top: 0.75rem;
+	}
+
+	/* #414 段階2: 不正な設定は収集から外れる（黙って欠測する）ので、エラー
+	ほど強くはないが見落とさない色・枠で出す。 */
+	.config-exclusions {
+		background: var(--banto-surface);
+		border: 1px solid var(--banto-danger);
+		border-radius: calc(var(--banto-radius) * 2);
+		padding: 1rem 1.25rem;
+	}
+
+	.exclusion-note {
+		color: var(--banto-text);
+	}
+
+	.exclusion-marks {
+		margin: 0;
+		padding-left: 1.25rem;
+		font-size: 0.8rem;
+	}
+
+	.exclusion-unit {
+		display: inline-block;
+		min-width: 6.5em;
+		color: var(--banto-text-muted);
 	}
 
 	.unmoving-tags {

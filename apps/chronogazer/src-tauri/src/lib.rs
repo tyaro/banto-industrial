@@ -31,9 +31,9 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
-    resolve_data_dir, CollectEventList, CollectOutcome, CollectorService, CollectorStateView,
-    ConnectionView, CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE,
-    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    registry_exclusions, resolve_data_dir, CollectEventList, CollectOutcome, CollectorService,
+    CollectorStateView, ConnectionView, CurrentSampleView, EventPage, ExclusionView, Readout,
+    COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
@@ -1280,6 +1280,29 @@ async fn simulation_coverage_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<SimulationCoverageEntry>, BantoError> {
     simulation_coverage_list_body(&state).await
+}
+
+/// Body of [`config_exclusions_list`]（#414 段階2）。
+async fn config_exclusions_list_body(state: &AppState) -> Result<Vec<ExclusionView>, BantoError> {
+    require_role(state, Role::Viewer, "tags").await?;
+    registry_exclusions(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+    )
+    .await
+}
+
+/// `viewer`+（#414 段階2）: 今のレジストリで収集を開始したら外される接続・
+/// グループ・タグ（`/tags` の印）。REST の `GET /api/config-exclusions` と
+/// 同じ `chronogazer_core::collect::registry_exclusions` を呼ぶ（判定は
+/// 収集の開始と同じ `banto_collect::build_config_lenient_from`）。読み取り
+/// なので監査しない。
+#[tauri::command]
+async fn config_exclusions_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<ExclusionView>, BantoError> {
+    config_exclusions_list_body(&state).await
 }
 
 /// `editor`+ (R0 §3.6): delete a PLC connection. Refuses (friendly
@@ -2748,6 +2771,7 @@ pub fn run() {
             tags_update,
             tags_delete,
             simulation_coverage_list,
+            config_exclusions_list,
             collect_status,
             collect_start,
             collect_stop,
@@ -3346,7 +3370,7 @@ mod tests {
             .expect("収集対象 0 件は「エラー」ではない");
         assert_eq!(
             outcome.status,
-            chronogazer_core::collect::CollectorState::NoTargets
+            chronogazer_core::collect::CollectorState::NoTargets { exclusions: vec![] }
         );
         assert!(
             !outcome.pending,
@@ -3354,7 +3378,7 @@ mod tests {
         );
         assert_eq!(
             collect_status_body(&state).await.expect("collect_status"),
-            CollectorStateView::NoTargets
+            CollectorStateView::NoTargets { exclusions: vec![] }
         );
 
         let audit = state
@@ -3388,10 +3412,13 @@ mod tests {
     /// 同じ公開用の形を通している**ことの固定（床の定数・`resource` と
     /// 同じ作法）。
     ///
-    /// 検証用の目印をタグのアドレスに埋めて `build_config` を失敗させる
-    /// （`banto-tags` はアドレスの書式を検証しない）。`CollectError::Config`
-    /// の文言はアドレスをそのまま含むので、**内部の `CollectorState` を
-    /// 返していれば目印が必ず出てくる**。
+    /// `data.dir` の場所に**ファイル**を置いて tstore の書き手を開けなくし
+    /// （`Collector::start` が失敗する）、**editor に返った理由の文言そのもの**
+    /// を目印にして、viewer の状態取得に出てこないことを確かめる（#414
+    /// 段階2 で不正なアドレスのタグは「そのタグだけ外す」になり、起動の
+    /// 失敗ではなくなったので、以前の「目印をアドレスに埋める」形から
+    /// 変えた。REST 側の双子も同じ形）。**内部の `CollectorState` を
+    /// 返していれば、同じ文言が必ず出てくる**。
     ///
     /// あわせて、**理由がどこで利用者に伝わるか**も押さえる - 起動を実行した
     /// editor には [`collect_start`] の**戻り値のエラー**として理由が届く
@@ -3403,9 +3430,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_viewer_reading_the_state_never_sees_why_the_start_failed() {
         const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
-        let state = app_state().await;
+        let dir = TempDir::new();
+        let blocked_data_dir = dir.path().join(MARKER);
+        std::fs::write(&blocked_data_dir, b"not a directory").expect("block data dir");
+        let mut state = app_state().await;
+        state.collect = CollectorService::new(state.pool.clone(), blocked_data_dir);
 
-        // 収集対象を 1 件だけ作る（アドレスが解釈できない = 起動が失敗する）。
+        // 収集対象を 1 件だけ作る（`data.dir` がファイル = 起動が失敗する）。
         let conn = state
             .plc_connections
             .create(
@@ -3442,7 +3473,7 @@ mod tests {
                 TagPayload {
                     name: "tag1".to_string(),
                     collection_group_id: group.id,
-                    address: MARKER.to_string(),
+                    address: "40001".to_string(),
                     data_type: "i16".to_string(),
                     raw_lo: None,
                     raw_hi: None,
@@ -3473,8 +3504,9 @@ mod tests {
         let err = collect_start_body(&state)
             .await
             .expect_err("前提が崩れている: 起動が失敗していない");
+        let reason = err.to_string();
         assert!(
-            err.to_string().contains(MARKER),
+            reason.contains("時系列ストレージエラー"),
             "起動を実行した本人にも理由が伝わっていない（埋め合わせが無い）: {err}"
         );
 
@@ -3490,8 +3522,9 @@ mod tests {
             json.get("reason").is_none(),
             "`reason` フィールドがワイヤに出ている: {json}"
         );
+        let wire = json.to_string();
         assert!(
-            !json.to_string().contains(MARKER),
+            !wire.contains(&reason) && !wire.contains(MARKER),
             "起動失敗の理由が viewer に漏れている: {json}"
         );
     }
@@ -3709,6 +3742,35 @@ mod tests {
         simulation_coverage_list_body(&state)
             .await
             .expect("viewer は範囲外の判定を読める");
+    }
+
+    /// #414 段階2: `config_exclusions_list` は viewer 以上で読め（REST の
+    /// `GET /api/config-exclusions` と同じ床）、未ログインは拒否する。
+    /// 中身（不正なタグが載ること・JSON の形）は同じ関数
+    /// （`chronogazer_core::collect::registry_exclusions`）を叩く core 側の
+    /// テストと REST の `config_exclusions_are_viewer_readable_and_carry_no_host`
+    /// が固定している（このクレートは banto-tags に依存しないので、検証を
+    /// くぐった行をここでは作れない）。
+    #[tokio::test]
+    async fn config_exclusions_list_is_viewer_readable() {
+        let state = app_state().await;
+        assert!(
+            config_exclusions_list_body(&state).await.is_err(),
+            "未ログインで読めてしまう"
+        );
+
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        assert_eq!(
+            config_exclusions_list_body(&state)
+                .await
+                .expect("viewer は読める"),
+            Vec::<ExclusionView>::new()
+        );
     }
 
     // --- #414 段階1: タグのアドレス検査 -----------------------------------

@@ -39,6 +39,11 @@
 	 * 現在値（`collect_values`）はこの画面では扱わない - 値の表示は R1-D の
 	 * 監視画面。イベント一覧は `/events`（同じ PR）。
 	 *
+	 * #414 段階2: 開始時に不正な設定だけを外して残りを動かすようになったので、
+	 * 状態が持つ除外の一覧（`exclusions`）を「除外あり（N 件）」の見出しと
+	 * 表（種類・名前・理由）で出し、直す場所（`/tags`）へのリンクを添える。
+	 * 判定も文言も Rust が作ったもので、ここでは並べるだけ。
+	 *
 	 * #413: 接続ごとの状態の行に「シミュレーション中（値は記録されません）」を
 	 * 添える。出すのは**走っている収集が**その接続をシミュレータ相手に動かして
 	 * いるときだけ（`ConnectionView.simulation`。レジストリの今の値ではない -
@@ -52,6 +57,10 @@
 		COLLECT_UI_TIMEOUT_MS,
 		collectActionLabel,
 		collectConnectionsNote,
+		collectExclusions,
+		collectExclusionsHeadline,
+		collectExclusionsNote,
+		exclusionUnitLabel,
 		collectStateDetail,
 		collectStateHeadline,
 		collectStaleNote,
@@ -103,6 +112,11 @@
 	const statusHeadline = $derived(
 		status === null ? 'まだ取得できていません' : collectStateHeadline(status, statusStale)
 	);
+
+	/** #414 段階2: 開始時に外した設定（状態が持つ一覧。読めていなければ空）。 */
+	const exclusions = $derived(status === null ? [] : collectExclusions(status));
+	const exclusionsHeadline = $derived(collectExclusionsHeadline(exclusions.length));
+	const exclusionsNote = $derived(status === null ? null : collectExclusionsNote(status));
 
 	const connectionEntries = $derived(
 		connections?.state === 'ready' ? Object.entries(connections.data) : []
@@ -288,6 +302,43 @@
 		{/if}
 
 		<!--
+			#414 段階2: 開始時に外した設定。**不正なものがあることは必ず分かる
+			ようにする**（オーナー決定）ので、1 件でもあれば見出しと一覧を出す。
+			一覧は状態の中にあるので、停止・再起動で状態が変われば入れ替わる。
+		-->
+		{#if exclusionsHeadline}
+			<div class="collect-exclusions" role="status">
+				<h3 class="collect-subheading">{exclusionsHeadline}</h3>
+				<!-- 説明文は状態ごと（`collectExclusionsNote`）。全部外れた noTargets で
+				「収集しています」と言わない（#422 レビュー P2）。 -->
+				{#if exclusionsNote}
+					<p class="note">
+						{exclusionsNote.summary}
+						<a href="/tags">タグ設定</a>{exclusionsNote.fix}
+					</p>
+				{/if}
+				<table class="collect-exclusion-list">
+					<thead>
+						<tr>
+							<th scope="col">種類</th>
+							<th scope="col">名前</th>
+							<th scope="col">理由</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each exclusions as exclusion (exclusion.key)}
+							<tr>
+								<td>{exclusionUnitLabel(exclusion.unit)}</td>
+								<td>{exclusion.name}</td>
+								<td>{exclusion.message}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/if}
+
+		<!--
 			操作は editor 以上にだけ**出す**（`disabled` にして見せない）。
 			viewer に押せないボタンを並べても、できることが増えないため。
 		-->
@@ -394,7 +445,14 @@
 		font-weight: 600;
 	}
 
-	.collect-connections {
+	/* #414 段階2: 外した設定。エラーではない（残りは動いている）が、見落とすと
+	困るので注意喚起の色で見出しを出す。 */
+	.collect-exclusions h3 {
+		color: var(--banto-text);
+	}
+
+	.collect-connections,
+	.collect-exclusion-list {
 		margin-top: 0.5rem;
 		border-collapse: collapse;
 		width: 100%;
@@ -402,7 +460,9 @@
 	}
 
 	.collect-connections th,
-	.collect-connections td {
+	.collect-connections td,
+	.collect-exclusion-list th,
+	.collect-exclusion-list td {
 		text-align: left;
 		padding: 0.25rem 0.5rem;
 		border-bottom: 1px solid var(--banto-border);

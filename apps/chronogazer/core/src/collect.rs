@@ -65,6 +65,38 @@
 //! 収集対象なし / 起動失敗（理由付き）。起動失敗の `reason` は
 //! [`CollectError`] の文言をそのまま載せる（分類して捨てない）。
 //!
+//! # 開始時に不正な設定だけを外す（#414 段階2、2026-09-23 オーナー決定）
+//!
+//! 「開始時に不正なタグ・接続だけを外し、**残りを動かす**。不正なものが
+//! あることは**必ず分かるようにする**」。以前は `banto_collect::build_config`
+//! （厳格版。1 件でも不正なら全体が `CollectError::Config`）で組んでいたので、
+//! 保存時の検証（#418）より前に入った不正なタグが 1 本あるだけで、正常な
+//! 接続も含めて何も収集されなかった（docs/implementation-checklist.md §5
+//! 「1 件の事故で全体を止めない」）。
+//!
+//! * 組み立ては `banto_collect::build_config_lenient_from`。不正な接続は
+//!   配下のグループ・タグごと、不正なグループは配下のタグごと、不正なタグは
+//!   その 1 本だけを外し、外した一覧（[`ExclusionView`]）を返す。
+//!   **banto-hub が使う厳格版は変えていない**（厳格版は「緩い版の最初の除外で
+//!   失敗する」形になり、文言は一字一句同じ）。
+//! * 一覧は**状態の中に**持つ（[`CollectorState::Running`] /
+//!   [`CollectorState::NoTargets`] の `exclusions`）。状態と一覧が食い違う
+//!   組み合わせを型で作れなくするため - 停止・再起動で状態が変われば一覧も
+//!   一緒に消える（前回の一覧が残らない）。公開用の [`CollectorStateView`]
+//!   にもそのまま載せる（viewer に見せてよい理由は [`ExclusionView`] の doc）。
+//! * **有効なタグが 1 本でも残れば `Running`**、全部外れたら `NoTargets`
+//!   （`StartFailed` ではない - 失敗ではなく、動かすものが残らなかった）。
+//! * 現在値（[`CollectorService::values`]）には、外したタグを `value: null`・
+//!   品質 `invalid` で載せる（[`QualityView::Invalid`]。通信エラーの `bad` と
+//!   区別する）。
+//! * 外したタグには tstore の列を作らないので、その間のファイルを読むと
+//!   **null**（`banto-tsquery` は「そのファイルのスキーマに無い `tag_key`」を
+//!   欠測として返す）。`tests/exclusion_roundtrip.rs` が固定する。
+//! * **収集イベントには記録しない**（2026-09-23 オーナー決定。
+//!   `banto_collect::EventKind` は増やさない）。分かるようにするのは状態表示
+//!   （`/settings/collect` の除外一覧）と `/tags` の印（[`registry_exclusions`]）
+//!   だけ。
+//!
 //! # 内部の状態と、状態取得で公開する形を分ける
 //!
 //! [`CollectorState::StartFailed`] の `reason` は [`CollectError`] の文言
@@ -359,7 +391,8 @@
 //!
 //! | 公開型 | 載せるもの | 落としたもの |
 //! | --- | --- | --- |
-//! | [`CurrentSampleView`] | 値・`ptimeMs`・品質（`good`/`bad`/`stale`） | 無し（`banto_collect::CurrentSample` の全部。機微なものが無い） |
+//! | [`CurrentSampleView`] | 値・`ptimeMs`・品質（`good`/`bad`/`stale`、#414 段階2 で外したタグの `invalid`） | 無し（`banto_collect::CurrentSample` の全部。機微なものが無い） |
+//! | [`ExclusionView`]（#414 段階2、状態の `exclusions`） | 単位・行 id・キー・名前・理由の分類と文言 | 無し（元の `banto_collect::ConfigExclusion` にホスト・資格情報・パスが入っていない） |
 //! | [`ConnectionView`]（[`ConnectionStatusView`] + `simulation`） | `connected` / `reconnecting`（`attempt`）/ `stopped`、走っている収集がその接続をシミュレータ相手に動かしているか（#413） | 無し（接続先ホスト・ポートはそもそもこの型に無い。`simulation` は真偽 1 つで、同じ値はレジストリの一覧でも viewer に読める） |
 //! | [`CollectEventRow`] | `id`・`tsMs`・`kind`・`connectionKey`・`tagKey`・`level`・`value` | **`detail`（自由文）** |
 //!
@@ -508,10 +541,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_collect::{
-    build_config_from, ClientFactory, CollectError, CollectEvent, Collector, CollectorOptions,
-    ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality, RegistrySnapshot,
+    build_config_lenient_from, config_exclusions, ClientFactory, CollectError, CollectEvent,
+    Collector, CollectorOptions, ConfigExclusion, ConnectionStatus, CurrentSample,
+    CurrentValuesHandle, EventSink, ExclusionUnit, Quality, RegistrySnapshot,
 };
-use banto_core::BantoError;
+use banto_core::{BantoError, ListParams};
+use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
 use banto_tstore::{Clock, SystemClock};
 // ロールの下限（`COLLECT_OPERATION_ROLE` / `COLLECT_READ_ROLE`）だけ、この
 // service 層が名前を出す - 両経路の床を 1 か所で決めるため（transport の
@@ -553,14 +588,30 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 /// **状態の取得（`viewer` にも開いている経路）はこの型を載せない。**
 /// `reason` を落とした [`CollectorStateView`] を通す - 理由はこのモジュールの
 /// doc「内部の状態と、状態取得で公開する形を分ける」。
+///
+/// **#414 段階2: `Running` と `NoTargets` は、その起動で外した設定の一覧
+/// （`exclusions`）を持つ**（このモジュールの doc「開始時に不正な設定だけを
+/// 外す」）。状態の**中**に持たせているのは、状態と一覧が食い違う組み合わせ
+/// （「停止中なのに前回の除外一覧が残っている」「再起動したのに古い一覧」）を
+/// **型で作れなくする**ため - 別のフィールドに置くと、状態だけ書き換えて一覧を
+/// 書き忘れるコードが書けてしまう。停止・起動中・起動失敗には一覧が無い
+/// （その時点で走っている構成が無い）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum CollectorState {
     Stopped,
     Starting,
-    Running { groups: usize, tags: usize },
-    NoTargets,
-    StartFailed { reason: String },
+    Running {
+        groups: usize,
+        tags: usize,
+        exclusions: Vec<ExclusionView>,
+    },
+    NoTargets {
+        exclusions: Vec<ExclusionView>,
+    },
+    StartFailed {
+        reason: String,
+    },
 }
 
 /// [`CollectorState`] の**公開用**の形（#407 レビュー P2-2）。
@@ -588,6 +639,10 @@ pub enum CollectorState {
 /// 起動に失敗した理由が**どこで利用者に伝わるか**（と、画面を再読み込み
 /// すると分からなくなるという残る制約）は、このモジュールの doc
 /// 「理由はどこで利用者に伝わるか」を参照。
+///
+/// **#414 段階2: 除外の一覧（`exclusions`）は載せる**。中身は
+/// [`ExclusionView`] で、viewer に見せてよいもの（単位・キー・名前・理由の
+/// 分類と文言）だけ - 根拠は [`ExclusionView`] の doc。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum CollectorStateView {
@@ -596,8 +651,11 @@ pub enum CollectorStateView {
     Running {
         groups: usize,
         tags: usize,
+        exclusions: Vec<ExclusionView>,
     },
-    NoTargets,
+    NoTargets {
+        exclusions: Vec<ExclusionView>,
+    },
     /// 起動を試みて失敗した。**理由は載せない**（上の doc 参照）。
     StartFailed,
 }
@@ -607,15 +665,125 @@ impl From<&CollectorState> for CollectorStateView {
         match state {
             CollectorState::Stopped => Self::Stopped,
             CollectorState::Starting => Self::Starting,
-            CollectorState::Running { groups, tags } => Self::Running {
+            CollectorState::Running {
+                groups,
+                tags,
+                exclusions,
+            } => Self::Running {
                 groups: *groups,
                 tags: *tags,
+                exclusions: exclusions.clone(),
             },
-            CollectorState::NoTargets => Self::NoTargets,
+            CollectorState::NoTargets { exclusions } => Self::NoTargets {
+                exclusions: exclusions.clone(),
+            },
             // **ここが全部**: 理由を落とすのはこの 1 行だけ。
             CollectorState::StartFailed { .. } => Self::StartFailed,
         }
     }
+}
+
+/// 除外の単位（#414 段階2）。ワイヤの綴りは `connection` / `group` / `tag`
+/// （`banto_collect::ExclusionUnit::as_str` と同じ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExclusionUnitView {
+    Connection,
+    Group,
+    Tag,
+}
+
+impl From<ExclusionUnit> for ExclusionUnitView {
+    fn from(unit: ExclusionUnit) -> Self {
+        match unit {
+            ExclusionUnit::Connection => Self::Connection,
+            ExclusionUnit::Group => Self::Group,
+            ExclusionUnit::Tag => Self::Tag,
+        }
+    }
+}
+
+/// 開始時に外した設定 1 件の**公開用の形**（#414 段階2、
+/// `banto_collect::ConfigExclusion` から作る）。
+///
+/// JSON は `{"unit":"tag","id":7,"key":"tag:7","name":"温度",
+/// "reason":"invalidAddress","message":"Modbus TCP のアドレスとして…"}`。
+///
+/// **viewer に見せてよいか（確かめた範囲）**: 載せるのはレジストリの行 id・
+/// キー（`conn:<id>` 等。現在値・接続状態の地図と同じ鍵）・行の名前・理由の
+/// 分類（固定の綴り）・理由の文言。文言に入りうるのは、その行が持つ値
+/// （プロトコル名・ポート番号・ユニット ID・収集周期・アドレス・データ型）、
+/// `banto_plc` のアドレス解析エラー文（アドレス文字列について述べるだけ）、
+/// 親の接続・グループの名前 - どれも `GET /api/plc-connections` /
+/// `/api/collection-groups` / `/api/tags`（viewer 以上）で既に読める。
+/// **接続先ホスト・資格情報（`database`/`username`/`password`）・ファイル
+/// パスは、元の `ConfigExclusion` にそもそも入っていない**（ホスト名は理由の
+/// どの分類にも使っていない）。実際の JSON はテスト
+/// `exclusion_view_json_carries_only_registry_facts` が固定する。
+///
+/// 起動失敗の `reason`（[`CollectError`] の文言）とは**別物**: あちらは
+/// DB やファイルパスを含みうる自由文で、ここは発生源（`banto-collect`）で
+/// 分類した理由から作った文言だけを載せる（モジュール doc「公開用の型」の
+/// 「発生源で分ける」）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExclusionView {
+    pub unit: ExclusionUnitView,
+    /// レジストリの行 id（`unit` に応じて接続・グループ・タグの id）。
+    pub id: i64,
+    /// `conn:<id>` / `grp:<id>` / `tag:<id>`。
+    pub key: String,
+    pub name: String,
+    /// 機械可読な分類（`banto_collect::ExclusionReason::code`）。
+    pub reason: &'static str,
+    /// 人間向けの文言（`banto_collect::ExclusionReason::message`。タグは
+    /// #418 の保存時の拒否理由と同じ文言）。
+    pub message: String,
+}
+
+impl From<&ConfigExclusion> for ExclusionView {
+    fn from(exclusion: &ConfigExclusion) -> Self {
+        Self {
+            unit: exclusion.unit.into(),
+            id: exclusion.id,
+            key: exclusion.key.clone(),
+            name: exclusion.name.clone(),
+            reason: exclusion.reason.code(),
+            message: exclusion.reason.message(),
+        }
+    }
+}
+
+fn exclusion_views(exclusions: &[ConfigExclusion]) -> Vec<ExclusionView> {
+    exclusions.iter().map(ExclusionView::from).collect()
+}
+
+/// **今のレジストリで収集を開始したら外される設定**（#414 段階2、`/tags` の
+/// 印）。REST（`GET /api/config-exclusions`）と Tauri
+/// （`config_exclusions_list`）の両方がこれを呼ぶ。
+///
+/// 判定は `banto_collect::config_exclusions` - **収集の開始
+/// （[`Lifecycle::start`]）が使う `build_config_lenient_from` そのもの**で、
+/// 画面（TS）には書き写さない（#413 の `simulation_coverage` と同じ流儀）。
+/// 走っている収集の状態ではなく**レジストリの今の値**で判定する（収集が
+/// 止まっていても、編集中に分かるように）。走っている収集が実際に何を外して
+/// いるかは [`CollectorStateView`] の `exclusions`。
+///
+/// 3 つの一覧は別々の読み取りで、同じトランザクションではない
+/// （`RegistrySnapshot::load` や `simulation_coverage` と同じ）。間に編集が
+/// 挟まっても、画面は編集のたびに取り直す（`/tags` の再取得）ので次で
+/// 追いつく。
+pub async fn registry_exclusions(
+    plc_connections: &PlcConnectionService,
+    collection_groups: &CollectionGroupService,
+    tags: &TagService,
+) -> Result<Vec<ExclusionView>, BantoError> {
+    let snapshot = RegistrySnapshot {
+        connections: plc_connections.list(ListParams::default()).await?.rows,
+        groups: collection_groups.list(ListParams::default()).await?.rows,
+        tags: tags.list(ListParams::default()).await?.rows,
+    };
+    Ok(exclusion_views(&config_exclusions(&snapshot)))
 }
 
 impl CollectorState {
@@ -639,7 +807,7 @@ impl CollectorState {
             Self::Stopped => "stopped",
             Self::Starting => "starting",
             Self::Running { .. } => "running",
-            Self::NoTargets => "noTargets",
+            Self::NoTargets { .. } => "noTargets",
             Self::StartFailed { .. } => "startFailed",
         }
     }
@@ -812,12 +980,21 @@ impl<T> Readout<T> {
 /// **読み取り時に導出される**品質で、
 /// [`banto_collect::CurrentValuesHandle::snapshot`] が既に導出済みの値を
 /// くれる - ここでは詰め替えるだけ。
+///
+/// **`invalid` はこの公開型にだけある**（#414 段階2、2026-09-23 オーナー
+/// 決定）: 開始時に**設定が不正で外した**タグ（アドレスが読めない、所属する
+/// 接続・グループが外れた）。`banto_collect::Quality` には無い - 収集エンジン
+/// はそのタグを最初から読んでいないので、品質を付ける相手がいない。
+/// **通信エラーの `bad` と区別する**: `bad` は「読みに行って失敗した」
+/// （待てば直りうる）、`invalid` は「設定を直して収集を再起動するまで
+/// 読まない」。値は常に `null`（[`CurrentSampleView::invalid`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum QualityView {
     Good,
     Bad,
     Stale,
+    Invalid,
 }
 
 impl From<Quality> for QualityView {
@@ -850,8 +1027,24 @@ pub struct CurrentSampleView {
     /// `bad` に正規化されるので、`null` と `good` が同居することはない。
     pub value: Option<f64>,
     /// このサンプルの時刻（UTC epoch ミリ秒、収集 PC の時計）。
-    pub ptime_ms: i64,
+    ///
+    /// **`invalid` のときだけ `None`**（#414 段階2）: 外したタグは一度も
+    /// 読んでいないので、サンプルの時刻が無い。それ以外の品質では必ず
+    /// `Some`（収集エンジンのキャッシュの時刻そのまま）。
+    pub ptime_ms: Option<i64>,
     pub quality: QualityView,
+}
+
+impl CurrentSampleView {
+    /// 開始時に外したタグの現在値（#414 段階2）: 値も時刻も無く、品質は
+    /// [`QualityView::Invalid`]。
+    pub fn invalid() -> Self {
+        Self {
+            value: None,
+            ptime_ms: None,
+            quality: QualityView::Invalid,
+        }
+    }
 }
 
 impl From<&CurrentSample> for CurrentSampleView {
@@ -869,12 +1062,12 @@ impl From<&CurrentSample> for CurrentSampleView {
             // だから、`value` を落とすのと同時に品質も `bad` にする。
             Some(value) if !value.is_finite() => Self {
                 value: None,
-                ptime_ms: sample.ptime_ms,
+                ptime_ms: Some(sample.ptime_ms),
                 quality: QualityView::Bad,
             },
             _ => Self {
                 value: sample.value,
-                ptime_ms: sample.ptime_ms,
+                ptime_ms: Some(sample.ptime_ms),
                 quality: sample.quality.into(),
             },
         }
@@ -1388,6 +1581,19 @@ impl CollectorContext {
             .clone()
     }
 
+    /// 現在値ハンドルと、**同じ状態が持つ**外したタグのキー（#414 段階2）を
+    /// **1 回のロックで**読む。別々に読むと、間に再起動が挟まって「新しい
+    /// エンジンの現在値」に「前の起動の除外」を混ぜうる。走っていなければ
+    /// `None`。
+    fn current_with_excluded_tags(&self) -> Option<(CurrentValuesHandle, Vec<String>)> {
+        let published = self
+            .published
+            .lock()
+            .expect("collector published lock poisoned");
+        let handle = published.current.clone()?;
+        Some((handle, excluded_tag_keys(&published.state)))
+    }
+
     /// **状態と現在値を必ず一緒に書く**唯一の口（[`Published`] の doc）。
     /// `current` は「走っているなら `Some`」で、`Running` 以外は必ず `None`。
     fn publish(&self, state: CollectorState, current: Option<CurrentValuesHandle>) {
@@ -1663,8 +1869,17 @@ impl CollectorService {
     ///
     /// **[`Readout::Unavailable`] は返らない**（待つ相手が居ないので打ち切る
     /// ものが無い）。キーは `tag:<id>`。
+    ///
+    /// **#414 段階2: 開始時に外したタグも載る** - `value: null`・品質
+    /// `invalid`・`ptimeMs: null`（[`CurrentSampleView::invalid`]）。載せない
+    /// と「まだ 1 度も読めていない」（キーが無い）と区別が付かない。外した
+    /// タグの一覧は**走っている状態が持つもの**（[`CollectorState::Running`]
+    /// の `exclusions`）で、現在値ハンドルと同じロックで読む。
     pub fn values(&self) -> Readout<HashMap<String, CurrentSampleView>> {
-        values_readout(self.current_values().map(|handle| handle.snapshot()))
+        match self.inner.ctx.current_with_excluded_tags() {
+            None => values_readout(None, &[]),
+            Some((handle, excluded)) => values_readout(Some(handle.snapshot()), &excluded),
+        }
     }
 
     /// **接続状態**（`GET /api/collect/connections` / `collect_connections`）。
@@ -2078,29 +2293,37 @@ impl Lifecycle {
             gate.release.notified().await;
         }
 
-        // `banto_collect::build_config(&pool)` と同じ 2 段（読み込み →
-        // 組み立て）をここで分けて呼ぶのは、**計画を組んだのと同じ
-        // スナップショット**からシミュレータ相手の接続を控えるため（#413。
-        // 別に読み直すと、間に入った編集で表示と実体が食い違う）。失敗の
-        // 扱いは `build_config` と同じ（どちらの `Err` も `fail_start` へ）。
+        // 読み込み → 組み立て の 2 段をここで分けて呼ぶのは、**計画を組んだ
+        // のと同じスナップショット**からシミュレータ相手の接続を控えるため
+        // （#413。別に読み直すと、間に入った編集で表示と実体が食い違う）。
+        // 除外の一覧（#414 段階2）も**同じ組み立ての戻り値**なので、計画と
+        // 一覧が別のレジストリを見ることは無い。読み込みの失敗は従来どおり
+        // `fail_start` へ。
         let snapshot = match RegistrySnapshot::load(&self.ctx.pool).await {
             Ok(snapshot) => snapshot,
             Err(err) => return Err(self.fail_start(err)),
         };
-        let config = match build_config_from(&snapshot) {
-            Ok(config) => config,
-            Err(err) => return Err(self.fail_start(err)),
-        };
+        // #414 段階2（2026-09-23 オーナー決定）: 不正な接続・グループ・タグは
+        // **外して残りを動かす**。組み立て自体はもう失敗しない（外した分は
+        // `exclusions` に入る）。banto-hub が使う厳格版 `build_config_from`
+        // は変えていない。
+        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        let exclusions = exclusion_views(&exclusions);
 
         // 「収集対象なし」は **`Collector::start` に渡す前に**分岐する。
-        // 渡すと `CollectError::Config` になり、本物の構成エラー（アドレスが
-        // 解釈できない等）と同じ入れ物に入ってしまう。**数えるのはタグ** -
-        // `build_config` はタグが空の有効グループも計画に残すので、
-        // `group_count()` では「有効グループ 1・有効タグ 0」を素通りさせて
-        // しまう（#406 レビュー P2。このモジュール doc 参照）。
+        // 渡すと `CollectError::Config` になり、本物の構成エラーと同じ入れ物に
+        // 入ってしまう。**数えるのはタグ** - 組み立てはタグが空の有効グループも
+        // 計画に残すので、`group_count()` では「有効グループ 1・有効タグ 0」を
+        // 素通りさせてしまう（#406 レビュー P2。このモジュール doc 参照）。
+        //
+        // **全部外れた場合もここ**（#414 段階2）: 有効なタグが 1 件も残らない
+        // なら `NoTargets`。`StartFailed` にはしない - 起動を試みて失敗したの
+        // ではなく、動かすものが残らなかった。外した一覧は状態に持たせるので
+        // 画面から見える。
         if config.tag_count() == 0 {
-            self.ctx.publish(CollectorState::NoTargets, None);
-            return Ok(CollectorState::NoTargets);
+            let state = CollectorState::NoTargets { exclusions };
+            self.ctx.publish(state.clone(), None);
+            return Ok(state);
         }
 
         let groups = config.group_count();
@@ -2116,6 +2339,10 @@ impl Lifecycle {
         .await
         {
             Ok(collector) => collector,
+            // tstore を開けない等。除外の一覧は `StartFailed` に持たせない
+            // （走っている構成が無い）- 一覧は捨てられ、次の開始で組み直す
+            // ので、古い一覧が残ることもない。不正な設定そのものは `/tags`
+            // の印（[`registry_exclusions`]）で引き続き分かる。
             Err(err) => return Err(self.fail_start(err)),
         };
 
@@ -2129,7 +2356,11 @@ impl Lifecycle {
         let current = collector.current_values();
         self.collector = Some(collector);
         self.simulated = simulated_connection_keys(&snapshot);
-        let state = CollectorState::Running { groups, tags };
+        let state = CollectorState::Running {
+            groups,
+            tags,
+            exclusions,
+        };
         self.ctx.publish(state.clone(), Some(current));
         Ok(state)
     }
@@ -2186,17 +2417,41 @@ impl Lifecycle {
 /// 表で固定する**ため（docs/implementation-checklist.md §5「判断は純関数に
 /// 出して、状態の総当たりを表でテストする」）。`None` = 走っていない、
 /// `Some(空)` = 走っているがまだ 1 件も読めていない（**0 件という事実**）。
+///
+/// `excluded` は開始時に外したタグのキー（#414 段階2）で、走っているときだけ
+/// `invalid` として足す。外したタグは収集計画に入っていないので `samples` に
+/// 同じキーは来ないが、来ても `invalid` を優先する（設定が不正で読んでいない、
+/// が事実なので）。
 fn values_readout(
     snapshot: Option<HashMap<String, CurrentSample>>,
+    excluded: &[String],
 ) -> Readout<HashMap<String, CurrentSampleView>> {
     match snapshot {
         None => Readout::NotRunning,
-        Some(samples) => Readout::Ready {
-            data: samples
+        Some(samples) => {
+            let mut data: HashMap<String, CurrentSampleView> = samples
                 .iter()
                 .map(|(key, sample)| (key.clone(), CurrentSampleView::from(sample)))
-                .collect(),
-        },
+                .collect();
+            for key in excluded {
+                data.insert(key.clone(), CurrentSampleView::invalid());
+            }
+            Readout::Ready { data }
+        }
+    }
+}
+
+/// 状態が持つ除外のうち、**タグ**のキー（`tag:<id>`）。接続・グループごと
+/// 外れたタグ（`connectionExcluded` / `groupExcluded`）も含む - どれも
+/// 「設定のせいで読んでいないタグ」。`Running` 以外は空。
+fn excluded_tag_keys(state: &CollectorState) -> Vec<String> {
+    match state {
+        CollectorState::Running { exclusions, .. } => exclusions
+            .iter()
+            .filter(|exclusion| exclusion.unit == ExclusionUnitView::Tag)
+            .map(|exclusion| exclusion.key.clone())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2571,6 +2826,53 @@ mod tests {
         seed_tag(pool, group_id, address, true).await;
     }
 
+    /// [`seed_tag`] の名前を選べる版。戻り値はタグ id。**アドレスは
+    /// 検証されない**（`banto_tags` のサービスはアドレスの書式を見ない。
+    /// 保存時の検証（#418）は REST / Tauri の層にある）ので、保存時の検証より
+    /// 前に入った不正なタグ（#414 段階2 の対象）をそのまま作れる。
+    async fn seed_named_tag(pool: &SqlitePool, group_id: i64, name: &str, address: &str) -> i64 {
+        let input = TagInput {
+            name: name.to_string(),
+            collection_group_id: group_id,
+            address: address.to_string(),
+            data_type: "i16".to_string(),
+            string_length: None,
+            string_encoding: "utf8".to_string(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            threshold_h: None,
+            threshold_hh: None,
+            threshold_l: None,
+            threshold_ll: None,
+            enabled: true,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
+            expected_revision: None,
+        };
+        TagService::new(pool.clone())
+            .create(input)
+            .await
+            .expect("create tag")
+            .id
+    }
+
+    /// `data.dir`（[`service`] の `dir/data`）の場所に**ファイル**を置き、
+    /// tstore の書き手が開けない（= `Collector::start` が失敗する）ように
+    /// する。既にディレクトリがあれば消してから置く。
+    fn block_data_dir(dir: &TempDir) {
+        let path = dir.path().join("data");
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).expect("remove data dir");
+        }
+        std::fs::write(&path, b"not a directory").expect("block data dir");
+    }
+
     /// **C-1 の一番大事な受入条件**: 有効な収集対象が 1 件も無いときは
     /// 「収集対象なし」であって、**エラーではない**。
     ///
@@ -2587,8 +2889,11 @@ mod tests {
                 .await
                 .expect("収集対象 0 件は「エラー」ではない（Ok が返る）"),
         );
-        assert_eq!(state, CollectorState::NoTargets);
-        assert_eq!(svc.state(), CollectorState::NoTargets);
+        assert_eq!(state, CollectorState::NoTargets { exclusions: vec![] });
+        assert_eq!(
+            svc.state(),
+            CollectorState::NoTargets { exclusions: vec![] }
+        );
         // 「走っていない」ことが読み出し側からも分かる（空に潰さない）。
         assert!(statuses(&svc).await.is_none());
         assert!(svc.current_values().is_none());
@@ -2611,8 +2916,11 @@ mod tests {
         seed_enabled_group(&pool).await;
 
         let state = settled(svc.start().await.expect("有効タグ 0 件はエラーではない"));
-        assert_eq!(state, CollectorState::NoTargets);
-        assert_eq!(svc.state(), CollectorState::NoTargets);
+        assert_eq!(state, CollectorState::NoTargets { exclusions: vec![] });
+        assert_eq!(
+            svc.state(),
+            CollectorState::NoTargets { exclusions: vec![] }
+        );
         // **収集エンジンを起動していない** = PLC へ繋ぎにも行っていない。
         assert!(
             statuses(&svc).await.is_none(),
@@ -2634,8 +2942,11 @@ mod tests {
         seed_tag(&pool, group_id, "40001", false).await;
 
         let state = settled(svc.start().await.expect("有効タグ 0 件はエラーではない"));
-        assert_eq!(state, CollectorState::NoTargets);
-        assert_eq!(svc.state(), CollectorState::NoTargets);
+        assert_eq!(state, CollectorState::NoTargets { exclusions: vec![] });
+        assert_eq!(
+            svc.state(),
+            CollectorState::NoTargets { exclusions: vec![] }
+        );
         assert!(
             statuses(&svc).await.is_none(),
             "収集対象が無いのにエンジンが立っている"
@@ -2657,27 +2968,32 @@ mod tests {
         assert_eq!(svc.state(), CollectorState::Stopped);
 
         svc.start().await.expect("start");
-        assert_eq!(svc.state(), CollectorState::NoTargets);
+        assert_eq!(
+            svc.state(),
+            CollectorState::NoTargets { exclusions: vec![] }
+        );
 
         // 走っていないので「何もしない」= NoTargets のまま。
         assert_eq!(
             settled(svc.stop().await.expect("走っていない stop")),
-            CollectorState::NoTargets
+            CollectorState::NoTargets { exclusions: vec![] }
         );
         assert_eq!(
             settled(svc.stop().await.expect("2 回目の stop")),
-            CollectorState::NoTargets
+            CollectorState::NoTargets { exclusions: vec![] }
         );
     }
 
-    /// `start()` に失敗したら**理由が状態に残る**。解釈できないアドレスの
-    /// タグを 1 本入れて `build_config` を失敗させる（`banto-tags` は
-    /// アドレスの書式を検証しない - 書式は I2/I3b の担当）。
+    /// `start()` に失敗したら**理由が状態に残る**。`data.dir` の場所に
+    /// **ファイル**を置いて、tstore の書き手を開けなくする（#414 段階2 で
+    /// 解釈できないアドレスは「そのタグだけ外す」になり、起動の失敗では
+    /// なくなったので、失敗はこちらで作る）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_start_keeps_its_reason_in_the_state() {
         let dir = TempDir::new();
         let (pool, svc) = service(&dir).await;
-        seed_one_tag(&pool, "これはアドレスではない").await;
+        seed_one_tag(&pool, "40001").await;
+        block_data_dir(&dir);
 
         let err = svc.start().await.expect_err("構成が組み立てられない");
         let message = err.to_string();
@@ -2698,6 +3014,290 @@ mod tests {
         assert!(statuses(&svc).await.is_none());
     }
 
+    // --- #414 段階2: 開始時に不正な設定だけを外す ----------------------------
+
+    /// 期待する除外 1 件（タグのアドレスが読めない）。
+    fn invalid_address_exclusion(tag_id: i64, name: &str, address: &str) -> ExclusionView {
+        ExclusionView {
+            unit: ExclusionUnitView::Tag,
+            id: tag_id,
+            key: format!("tag:{tag_id}"),
+            name: name.to_string(),
+            reason: "invalidAddress",
+            message: banto_collect::check_tag_address("modbus-tcp", address, "i16")
+                .expect_err("不正なアドレスのはず")
+                .message(),
+        }
+    }
+
+    /// **段階2 の本体**: 不正なタグが 1 本あっても、残りは `Running` で
+    /// 動き、外したタグは状態（内部・公開の両方）の一覧と現在値
+    /// （`invalid`）に出る。停止すると一覧も消える。
+    ///
+    /// 反証（回帰の検出）: `Lifecycle::start` を厳格版
+    /// （`build_config_from`）に戻すと `start()` が `Err` になり、ここの
+    /// `expect` で落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_tag_is_left_out_and_the_rest_keeps_running() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        let good = seed_named_tag(&pool, group_id, "good", "40001").await;
+        let bad = seed_named_tag(&pool, group_id, "legacy", "D3000").await;
+        let expected = vec![invalid_address_exclusion(bad, "legacy", "D3000")];
+
+        let state = settled(
+            svc.start()
+                .await
+                .expect("不正なタグ 1 本で起動は失敗しない"),
+        );
+        assert_eq!(
+            state,
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: expected.clone(),
+            }
+        );
+        assert_eq!(
+            svc.state_view(),
+            CollectorStateView::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: expected,
+            }
+        );
+
+        // 現在値: 外したタグは `invalid`（値も時刻も無い）。正常なタグは
+        // 偽クライアントの値が届く。
+        let values = svc.values();
+        let data = values.data().expect("走っているので Ready");
+        assert_eq!(
+            data.get(&format!("tag:{bad}")),
+            Some(&CurrentSampleView::invalid())
+        );
+        wait_for_good_value(&svc, &format!("tag:{good}")).await;
+
+        svc.stop().await.expect("stop");
+        assert_eq!(svc.state(), CollectorState::Stopped);
+        assert_eq!(svc.values(), Readout::NotRunning);
+    }
+
+    /// 正常なタグの現在値が `good` になるまで待つ（偽クライアントは即答する
+    /// ので、最初の周期で届く。実時間の固定待ちはしない - 条件をポーリングし、
+    /// 上限を超えたら落とす）。
+    async fn wait_for_good_value(svc: &CollectorService, key: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(sample) = svc.values().data().and_then(|data| data.get(key).copied()) {
+                if sample.quality == QualityView::Good {
+                    assert!(sample.value.is_some());
+                    assert!(sample.ptime_ms.is_some());
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{key} の現在値が good にならない: {:?}",
+                svc.values()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 有効なタグが**全部**外れたら `NoTargets`（`StartFailed` ではない）で、
+    /// 外した一覧を持つ。エンジンは立てない。
+    ///
+    /// 反証: `tag_count() == 0` の分岐で一覧を捨てる（`exclusions: vec![]`）
+    /// と、最初の `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn when_every_tag_is_left_out_it_is_no_targets_with_the_list() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        let bad = seed_named_tag(&pool, group_id, "legacy", "D3000").await;
+
+        let state = settled(svc.start().await.expect("全部外れても失敗ではない"));
+        assert_eq!(
+            state,
+            CollectorState::NoTargets {
+                exclusions: vec![invalid_address_exclusion(bad, "legacy", "D3000")],
+            }
+        );
+        assert!(statuses(&svc).await.is_none(), "エンジンを立てていない");
+        assert_eq!(svc.values(), Readout::NotRunning);
+    }
+
+    /// **古い一覧を新しい判定として出さない**: 直してから再起動すると、
+    /// 前回の一覧は残らない。逆に、走っている間に直しただけ（再起動前）
+    /// なら、走っている構成の一覧のまま（状態は走っている構成を写す）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarting_after_a_fix_drops_the_previous_exclusions() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+        let bad = seed_named_tag(&pool, group_id, "legacy", "D3000").await;
+
+        svc.start().await.expect("start");
+        sqlx::query("UPDATE tags SET address = '40002' WHERE id = ?")
+            .bind(bad)
+            .execute(&pool)
+            .await
+            .expect("fix the tag");
+        match svc.state() {
+            CollectorState::Running { exclusions, .. } => assert_eq!(exclusions.len(), 1),
+            other => panic!("Running を期待したが {other:?}"),
+        }
+
+        let state = settled(svc.restart().await.expect("restart"));
+        assert_eq!(
+            state,
+            CollectorState::Running {
+                groups: 1,
+                tags: 2,
+                exclusions: vec![],
+            }
+        );
+        let values = svc.values();
+        assert!(
+            values
+                .data()
+                .expect("Ready")
+                .values()
+                .all(|sample| sample.quality != QualityView::Invalid),
+            "直したタグが invalid のまま残っている: {values:?}"
+        );
+        svc.stop().await.expect("stop");
+    }
+
+    /// **失敗経路で一覧と状態が食い違わない**: 除外ありで走っていた収集を
+    /// 再起動し、tstore が開けずに失敗したら、状態は `StartFailed` で、
+    /// 前回の一覧も現在値（`invalid` を含む）も残らない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_restart_leaves_no_stale_exclusions() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+        seed_named_tag(&pool, group_id, "legacy", "D3000").await;
+
+        svc.start().await.expect("start");
+        assert!(matches!(
+            svc.state(),
+            CollectorState::Running { ref exclusions, .. } if exclusions.len() == 1
+        ));
+        svc.stop().await.expect("stop");
+        block_data_dir(&dir);
+
+        svc.restart()
+            .await
+            .expect_err("tstore が開けないので失敗する");
+        assert!(matches!(svc.state(), CollectorState::StartFailed { .. }));
+        assert_eq!(svc.state_view(), CollectorStateView::StartFailed);
+        assert_eq!(svc.values(), Readout::NotRunning);
+    }
+
+    /// **公開する形に内部情報を載せない**（#414 段階2）: 除外ありの状態の
+    /// **実際の JSON** を見て、除外 1 件の鍵が `unit`/`id`/`key`/`name`/
+    /// `reason`/`message` だけであること、接続先ホストが出ないことを確かめる。
+    /// 現在値の `invalid` の JSON も固定する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclusion_view_json_carries_only_registry_facts() {
+        const HOST_CANARY: &str = "chronogazer-host-canary.invalid";
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "PLC1".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                // `offline_factory` なので誰も dial しない。
+                host: HOST_CANARY.to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .expect("create plc connection");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1000,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .expect("create group");
+        seed_named_tag(&pool, group.id, "good", "40001").await;
+        let bad = seed_named_tag(&pool, group.id, "legacy", "D3000").await;
+
+        svc.start().await.expect("start");
+        let json = serde_json::to_value(svc.state_view()).expect("serialize");
+        assert_eq!(json["state"], "running");
+        let exclusions = json["exclusions"].as_array().expect("exclusions");
+        assert_eq!(exclusions.len(), 1);
+        let mut keys: Vec<&str> = exclusions[0]
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["id", "key", "message", "name", "reason", "unit"]);
+        assert_eq!(exclusions[0]["unit"], "tag");
+        assert_eq!(exclusions[0]["key"], format!("tag:{bad}"));
+        assert_eq!(exclusions[0]["reason"], "invalidAddress");
+        assert!(
+            !json.to_string().contains(HOST_CANARY),
+            "接続先ホストが公開用の状態に出ている: {json}"
+        );
+
+        let values = serde_json::to_value(svc.values()).expect("serialize");
+        assert_eq!(
+            values["data"][format!("tag:{bad}")],
+            serde_json::json!({"value": null, "ptimeMs": null, "quality": "invalid"})
+        );
+        svc.stop().await.expect("stop");
+    }
+
+    /// `/tags` の印（[`registry_exclusions`]）は、**収集の開始が外すものと
+    /// 同じ**（同じ `build_config_lenient_from`）で、収集が走っていなくても
+    /// 返る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_exclusions_match_what_a_start_leaves_out() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+        let bad = seed_named_tag(&pool, group_id, "legacy", "D3000").await;
+
+        let marks = registry_exclusions(
+            &PlcConnectionService::new(pool.clone()),
+            &CollectionGroupService::new(pool.clone()),
+            &TagService::new(pool.clone()),
+        )
+        .await
+        .expect("registry_exclusions");
+        assert_eq!(
+            marks,
+            vec![invalid_address_exclusion(bad, "legacy", "D3000")]
+        );
+        assert_eq!(svc.state(), CollectorState::Stopped, "走っていなくても返る");
+
+        match settled(svc.start().await.expect("start")) {
+            CollectorState::Running { exclusions, .. } => assert_eq!(exclusions, marks),
+            other => panic!("Running を期待したが {other:?}"),
+        }
+        svc.stop().await.expect("stop");
+    }
+
     /// 収集対象があるときは本当に起動し、読み出しが「走っている」形になる。
     /// 二重 `start()` が 2 つ目のエンジンを立てないことも同時に固定する。
     ///
@@ -2715,7 +3315,14 @@ mod tests {
         let mut rx = svc.subscribe_events();
 
         let first = settled(svc.start().await.expect("1 回目の start"));
-        assert_eq!(first, CollectorState::Running { groups: 1, tags: 1 });
+        assert_eq!(
+            first,
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
+        );
         assert!(svc.state().is_running());
         assert!(
             statuses(&svc).await.is_some(),
@@ -2791,10 +3398,24 @@ mod tests {
 
         // 走っていない状態からの restart = ただの起動（停止は何もしない）。
         let state = settled(svc.restart().await.expect("restart"));
-        assert_eq!(state, CollectorState::Running { groups: 1, tags: 1 });
+        assert_eq!(
+            state,
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
+        );
 
         let again = settled(svc.restart().await.expect("2 回目の restart"));
-        assert_eq!(again, CollectorState::Running { groups: 1, tags: 1 });
+        assert_eq!(
+            again,
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
+        );
 
         let events = drain(&mut rx);
         assert_eq!(
@@ -2917,7 +3538,14 @@ mod tests {
             .await
             .expect("start の応答")
             .expect("キャンセル後の start");
-        assert_eq!(state, CollectorState::Running { groups: 1, tags: 1 });
+        assert_eq!(
+            state,
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
+        );
 
         let kinds = drain(&mut rx);
         let stopped = kinds
@@ -3043,7 +3671,7 @@ mod tests {
         );
         assert_eq!(
             svc.state(),
-            CollectorState::NoTargets,
+            CollectorState::NoTargets { exclusions: vec![] },
             "タスク側が決着した後も `Starting` のまま取り残されている"
         );
     }
@@ -3139,7 +3767,11 @@ mod tests {
         let started = starter.await.expect("start task").expect("start");
         assert_eq!(
             started.status,
-            CollectorState::Running { groups: 1, tags: 1 }
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
         );
         assert!(
             svc.state().is_running(),
@@ -3278,13 +3910,22 @@ mod tests {
             offline_factory(),
         );
         // タスクが消える直前に公開されていた状態。葉はこれを返し続ける。
-        svc.inner
-            .ctx
-            .publish(CollectorState::Running { groups: 1, tags: 1 }, None);
+        svc.inner.ctx.publish(
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![],
+            },
+            None,
+        );
 
         assert_eq!(
             svc.state_view(),
-            CollectorStateView::Running { groups: 1, tags: 1 },
+            CollectorStateView::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            },
             "葉は最後に公開された状態を返し続けるはず（前提）"
         );
 
@@ -3314,11 +3955,19 @@ mod tests {
 
         assert_eq!(
             settled(svc.start().await.expect("start")),
-            CollectorState::Running { groups: 1, tags: 1 }
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
         );
         assert_eq!(
             settled(svc.restart().await.expect("restart")),
-            CollectorState::Running { groups: 1, tags: 1 }
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
         );
         assert_eq!(
             settled(svc.stop().await.expect("stop")),
@@ -3346,8 +3995,9 @@ mod tests {
             CollectorState::Running {
                 groups: 2,
                 tags: 10,
+                exclusions: vec![],
             },
-            CollectorState::NoTargets,
+            CollectorState::NoTargets { exclusions: vec![] },
             CollectorState::StartFailed {
                 reason: format!("収集設定エラー: {marker} が開けません"),
             },
@@ -3374,6 +4024,7 @@ mod tests {
         let running = serde_json::to_value(CollectorStateView::from(&CollectorState::Running {
             groups: 2,
             tags: 10,
+            exclusions: vec![],
         }))
         .expect("serialize");
         assert_eq!(running["groups"], 2);
@@ -3395,7 +4046,14 @@ mod tests {
 
         svc.autostart().await;
 
-        assert_eq!(svc.state(), CollectorState::Running { groups: 1, tags: 1 });
+        assert_eq!(
+            svc.state(),
+            CollectorState::Running {
+                groups: 1,
+                tags: 1,
+                exclusions: vec![]
+            }
+        );
         assert!(statuses(&svc).await.is_some());
 
         svc.stop().await.expect("後始末の stop");
@@ -3415,13 +4073,14 @@ mod tests {
         svc.autostart().await;
         assert_eq!(
             svc.state(),
-            CollectorState::NoTargets,
+            CollectorState::NoTargets { exclusions: vec![] },
             "収集対象 0 件は失敗ではない"
         );
 
         let failing_dir = TempDir::new();
         let (pool, failing) = service(&failing_dir).await;
-        seed_one_tag(&pool, "これはアドレスではない").await;
+        seed_one_tag(&pool, "40001").await;
+        block_data_dir(&failing_dir);
         failing.autostart().await;
         match failing.state() {
             CollectorState::StartFailed { reason } => {
@@ -3520,14 +4179,14 @@ mod tests {
     /// [`CurrentSampleView`] から `quality` を外すと最後の `assert_eq!` が落ちる。
     #[test]
     fn the_values_readout_keeps_not_running_zero_and_real_samples_apart() {
-        let not_running = values_readout(None);
+        let not_running = values_readout(None, &[]);
         assert_eq!(not_running.as_str(), "notRunning");
         assert!(
             not_running.data().is_none(),
             "走っていないのに中身がある: {not_running:?}"
         );
 
-        let zero = values_readout(Some(HashMap::new()));
+        let zero = values_readout(Some(HashMap::new()), &[]);
         assert_eq!(zero.as_str(), "ready", "0 件は「読めた」: {zero:?}");
         assert!(zero.data().expect("ready").is_empty());
         assert_ne!(
@@ -3564,7 +4223,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let json = serde_json::to_value(values_readout(Some(samples))).expect("serialize");
+        let json = serde_json::to_value(values_readout(Some(samples), &[])).expect("serialize");
         assert_eq!(json["state"], "ready");
         assert_eq!(
             json["data"]["tag:1"],
@@ -3622,7 +4281,7 @@ mod tests {
             })
             .collect();
 
-        let json = serde_json::to_value(values_readout(Some(samples))).expect("serialize");
+        let json = serde_json::to_value(values_readout(Some(samples), &[])).expect("serialize");
         assert_eq!(json["state"], "ready");
         for (index, (key, value)) in non_finite.iter().enumerate() {
             let row = &json["data"][*key];
@@ -3667,7 +4326,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let json = serde_json::to_value(values_readout(Some(finite))).expect("serialize");
+        let json = serde_json::to_value(values_readout(Some(finite), &[])).expect("serialize");
         assert_eq!(
             json["data"]["tag:good"],
             serde_json::json!({ "value": 1.5, "ptimeMs": 42, "quality": "good" })
