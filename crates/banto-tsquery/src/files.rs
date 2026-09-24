@@ -7,20 +7,31 @@
 //! without opening the file (`tstore_meta` has no `utc_offset_ms` key - see
 //! `banto-tstore/src/clock.rs`'s doc on why the writer re-queries the OS
 //! offset on every rotation check rather than persisting it). Rather than
-//! guess or open every file to find out, this module pads the requested
-//! range by [`MAX_OFFSET_PAD_MS`] (24h - safely wider than any real-world UTC
-//! offset, which never exceeds +-14h) on each side before comparing against
-//! `date`, so a file is never wrongly excluded regardless of what offset
-//! produced its name. The cost of this conservative padding is at most one
-//! extra file opened at each end of a range, which the SQL `WHERE ptime
-//! BETWEEN ? AND ?` in every downstream query then trims to nothing anyway.
+//! guess or open every file to find out, the requested range is padded by
+//! [`banto_tstore::MAX_OFFSET_PAD_MS`] (24h - safely wider than any
+//! real-world UTC offset, which never exceeds +-14h) on each side before
+//! comparing against `date`, so a file is never wrongly excluded regardless
+//! of what offset produced its name. The cost of this conservative padding is
+//! at most one extra file opened at each end of a range, which the SQL
+//! `WHERE ptime BETWEEN ? AND ?` in every downstream query then trims to
+//! nothing anyway.
+//!
+//! ## Depends on the ptime/file-date contract (#424, owner decision 2026-09-24)
+//!
+//! Selecting by file-name date is only correct because every row's `ptime`
+//! is near its file's date. That is a contract `banto-tstore` owns and
+//! enforces on write: [`banto_tstore::TsWriter::append`] rejects a row for
+//! which [`banto_tstore::ptime_is_findable_in`] is false. The date range
+//! used here is [`banto_tstore::candidate_date_range`] - the *same*
+//! definition that predicate is built on - so what the writer accepts and
+//! what this module selects cannot drift apart (pinned by
+//! `tests::candidate_files_agree_with_the_write_side_predicate`). Do not
+//! compute the range here in any other way.
 use std::path::Path;
 
-use banto_tstore::{list_data_files, DataFileInfo, LocalDate};
+use banto_tstore::{candidate_date_range, list_data_files, DataFileInfo};
 
 use crate::error::TsQueryError;
-
-const MAX_OFFSET_PAD_MS: i64 = 24 * 3_600_000;
 
 /// Every recognized data file in `data_dir`, ascending by `(date, seq)`
 /// (`list_data_files`'s own order), filtered to those whose local date could
@@ -31,16 +42,10 @@ pub(crate) fn candidate_files(
     to_ms: i64,
 ) -> Result<Vec<DataFileInfo>, TsQueryError> {
     // `from_ms`/`to_ms` can be arbitrary caller-supplied `i64` (R2 will take
-    // these from an API, not just this crate's own tests) - an unchecked `-`/
-    // `+` here panics on overflow at the extremes (`from_ms == i64::MIN`,
-    // `to_ms == i64::MAX`). Saturating is the right choice, not an error: the
-    // padding only ever widens the file-name pre-filter so real files near a
-    // genuine boundary are not missed, and saturating at `i64::MIN`/`i64::MAX`
-    // just means "the range already covers everything representable" - no
-    // real data file's date will ever be outside that, so the result is
-    // identical to what unpadded arithmetic would have found.
-    let from_date = LocalDate::from_epoch_ms(from_ms.saturating_sub(MAX_OFFSET_PAD_MS), 0);
-    let to_date = LocalDate::from_epoch_ms(to_ms.saturating_add(MAX_OFFSET_PAD_MS), 0);
+    // these from an API, not just this crate's own tests) -
+    // `candidate_date_range` saturates rather than overflowing at the
+    // extremes (#423; see its doc).
+    let (from_date, to_date) = candidate_date_range(from_ms, to_ms);
     Ok(list_data_files(data_dir)?
         .into_iter()
         .filter(|f| f.date >= from_date && f.date <= to_date)
@@ -50,6 +55,7 @@ pub(crate) fn candidate_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_tstore::LocalDate;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -108,6 +114,88 @@ mod tests {
         let to_ms = from_ms;
         let files = candidate_files(dir.path(), from_ms, to_ms).unwrap();
         assert_eq!(files.len(), 3);
+    }
+
+    /// #424: the write side's acceptance test
+    /// (`banto_tstore::ptime_is_findable_in`) and this module's selection must
+    /// be the same condition. For every file date and every `ptime` in the
+    /// boundary table, "the point query `[ptime, ptime]` selects the file"
+    /// must equal "the writer would accept that row into that file" - and
+    /// both must match the closed form documented in `banto_tstore::findable`
+    /// (computed here independently, in `i128`), so shifting the shared
+    /// constant or the shared range is caught too.
+    #[test]
+    fn candidate_files_agree_with_the_write_side_predicate() {
+        use banto_tstore::ptime_is_findable_in;
+
+        const HOUR: i64 = 3_600_000;
+        const DAY: i64 = 86_400_000;
+
+        let dates = [
+            LocalDate::new(1969, 12, 30),
+            LocalDate::new(1969, 12, 31),
+            LocalDate::new(1970, 1, 1),
+            LocalDate::new(1970, 1, 2),
+            LocalDate::new(2026, 7, 10),
+            LocalDate::new(2026, 7, 11),
+            LocalDate::new(2026, 7, 12),
+            LocalDate::new(2026, 7, 13),
+            LocalDate::new(2026, 7, 14),
+        ];
+        let dir = TempDir::new("agree");
+        for date in dates {
+            dir.touch(&format!("{}-001.sqlite3", date.to_yyyymmdd()));
+        }
+        let start = |d: LocalDate| d.to_days_since_epoch() * DAY;
+
+        let mut ptimes = vec![i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+        for date in dates {
+            let s = start(date);
+            // Edges of the documented window (s - 24h, s + 48h), the file's
+            // own UTC day, and local midnights under UTC offsets of +-14h
+            // (local midnight of `date` is `s - offset` in UTC) - each
+            // +-1ms.
+            for base in [
+                s - 24 * HOUR,
+                s - 14 * HOUR,
+                s,
+                s + 14 * HOUR,
+                s + DAY,
+                s + DAY + 14 * HOUR,
+                s + 48 * HOUR,
+            ] {
+                ptimes.extend([base - 1, base, base + 1]);
+            }
+        }
+
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for p in ptimes {
+            let selected: Vec<LocalDate> = candidate_files(dir.path(), p, p)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.date)
+                .collect();
+            for date in dates {
+                let findable = ptime_is_findable_in(date, p);
+                assert_eq!(
+                    selected.contains(&date),
+                    findable,
+                    "date={date:?} ptime={p}: read-side selection and write-side predicate disagree"
+                );
+                let s = i128::from(start(date));
+                let closed = s - i128::from(24 * HOUR) <= i128::from(p)
+                    && i128::from(p) < s + i128::from(48 * HOUR);
+                assert_eq!(findable, closed, "date={date:?} ptime={p}: closed form");
+                if findable {
+                    accepted += 1;
+                } else {
+                    rejected += 1;
+                }
+            }
+        }
+        // The table really exercises both sides of the boundary.
+        assert!(accepted > 100 && rejected > 100, "{accepted}/{rejected}");
     }
 
     #[test]

@@ -100,7 +100,13 @@
 //!   `eprintln!` on every failure (operator-visible in logs immediately) plus
 //!   an event on the two edges (failing streak started / recovered). The
 //!   24/365 design is unchanged: a storage failure still never stops the tick
-//!   loop, it is just no longer silent.
+//!   loop, it is just no longer silent. This includes `banto-tstore`'s #424
+//!   rejection (`TstoreError::PtimeOutsideFileDate`, owner decision
+//!   2026-09-24): if the wall clock jumps by about a day between reading a
+//!   tick's `ptime_ms` and the `append`, that one sample cannot be stored
+//!   where the read side would find it, so it is dropped (not retried) and
+//!   reported through this same failure path; the next tick's `ptime_ms`
+//!   comes from the jumped clock and is written normally.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -982,7 +988,10 @@ fn classify_threshold(value: f64, tag: &crate::config::TagPlan) -> Option<Thresh
 mod tests {
     use super::*;
     use crate::config::Thresholds;
-    use banto_tstore::{GroupConfig, StoreConfig, SystemClock, TagColumn};
+    use banto_tstore::{GroupConfig, ManualClock, StoreConfig, TagColumn, TstoreError};
+
+    /// 2026-07-12T00:00:00Z - a fixed anchor for the append-health tests.
+    const T0_MS: i64 = 20_646 * 86_400_000;
 
     fn cfg() -> BackoffConfig {
         BackoffConfig {
@@ -1227,7 +1236,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn record_group_surfaces_a_real_append_failure_and_its_recovery() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        // #424: a fixed clock, with every `ptime` below taken relative to it -
+        // `TsWriter::append` rejects a `ptime` far from the file's date, so
+        // the bare `900`/`1_000`/... this test used to pass (1970, against a
+        // file dated by the real clock) would now fail for that reason
+        // instead of the one under test.
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(T0_MS, 9 * 3_600_000));
 
         // Writer #1 knows only "other-group" - every append for
         // "target-group" against it must genuinely fail with UnknownGroup.
@@ -1291,7 +1305,7 @@ mod tests {
         record_group(
             &group,
             Some(&good),
-            900,
+            T0_MS + 900,
             &ctx,
             "conn:1",
             &mut threshold_state,
@@ -1310,7 +1324,7 @@ mod tests {
         record_group(
             &group,
             Some(&good),
-            1_000,
+            T0_MS + 1_000,
             &ctx,
             "conn:1",
             &mut threshold_state,
@@ -1331,7 +1345,7 @@ mod tests {
         record_group(
             &group,
             Some(&good),
-            1_100,
+            T0_MS + 1_100,
             &ctx,
             "conn:1",
             &mut threshold_state,
@@ -1373,7 +1387,7 @@ mod tests {
         record_group(
             &group,
             Some(&good),
-            1_200,
+            T0_MS + 1_200,
             &ctx,
             "conn:1",
             &mut threshold_state,
@@ -1395,7 +1409,7 @@ mod tests {
         record_group(
             &group,
             Some(&good),
-            1_300,
+            T0_MS + 1_300,
             &ctx,
             "conn:1",
             &mut threshold_state,
@@ -1403,6 +1417,172 @@ mod tests {
         )
         .await;
         assert!(live.try_recv().is_err());
+    }
+
+    /// #424 (owner decision 2026-09-24): a wall-clock jump of a day or more
+    /// between reading a tick's `ptime` and the `append` call makes
+    /// `TsWriter::append` reject that one sample
+    /// (`TstoreError::PtimeOutsideFileDate` - the writer has already rotated
+    /// to the new date's file, which the old `ptime` cannot be found in).
+    /// The sample is dropped, the rejection goes through the ordinary
+    /// append-failure path (`eprintln!` + `AppendFailureEntered` on the edge),
+    /// and the very next tick - whose `ptime` comes from the jumped clock -
+    /// is written normally and emits `AppendFailureCleared`. No retry of the
+    /// dropped sample, and nothing stops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clock_jump_of_a_day_drops_one_sample_as_an_append_failure_and_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manual = Arc::new(ManualClock::new(T0_MS, 9 * 3_600_000));
+        let clock: Arc<dyn Clock> = manual.clone();
+        let config = StoreConfig {
+            groups: vec![GroupConfig {
+                key: "g".to_string(),
+                name: "G".to_string(),
+                period_ms: 100,
+                tags: vec![TagColumn {
+                    key: "t1".to_string(),
+                    name: "T1".to_string(),
+                    data_type: "f64".to_string(),
+                    unit: None,
+                    decimals: 0,
+                }],
+            }],
+        };
+        let writer = Arc::new(
+            TsWriter::open(dir.path(), config, clock.clone())
+                .await
+                .expect("writer should open"),
+        );
+        let (writer_tx, writer_rx) = watch::channel(writer.clone());
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("sqlite memory pool");
+        let events = EventSink::new(pool);
+        let mut live = events.subscribe();
+        let ctx = TaskContext {
+            writer_rx,
+            clock: clock.clone(),
+            current: CurrentValuesHandle::new(clock.clone()),
+            events,
+            status: Arc::new(RwLock::new(HashMap::new())),
+            backoff: BackoffConfig::default(),
+            simulation: false,
+            factory: default_client_factory(),
+        };
+        let group = GroupPlan {
+            key: "g".to_string(),
+            period: Duration::from_millis(100),
+            period_ms: 100,
+            requests: vec![],
+            tags: vec![crate::config::TagPlan {
+                key: "t1".to_string(),
+                scaling: None,
+                thresholds: Thresholds::default(),
+            }],
+        };
+        let mut threshold_state = vec![None];
+        let mut append_health = AppendHealth::default();
+        let value = |v: f64| [ReadResult::Value(TagValue::F64(v))];
+
+        // Tick 1: normal.
+        record_group(
+            &group,
+            Some(&value(1.0)),
+            manual.now_ms(),
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        assert!(live.try_recv().is_err());
+
+        // Tick 2: `ptime` read, then the clock jumps 3 days forward before
+        // the append (the writer rotates to the new date's file).
+        let stale_ptime = manual.now_ms() + 100;
+        manual.advance_ms(72 * 3_600_000);
+        record_group(
+            &group,
+            Some(&value(2.0)),
+            stale_ptime,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        let evt = live.try_recv().expect("the failure edge should be emitted");
+        assert_eq!(evt.kind, EventKind::AppendFailureEntered);
+        let detail = evt.detail.expect("detail");
+        assert!(
+            detail.contains("書き込めません"),
+            "the reason should be the #424 rejection: {detail}"
+        );
+        assert!(live.try_recv().is_err());
+        assert_eq!(append_health.streak, 1);
+
+        // Confirm the reason directly, too: the same append is rejected
+        // with the #424 error (and is still not written).
+        let err = writer
+            .append("g", stale_ptime, &[Some(2.0)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TstoreError::PtimeOutsideFileDate { .. }));
+
+        // Tick 3: `ptime` from the jumped clock - written, recovery edge.
+        let fresh_ptime = manual.now_ms();
+        record_group(
+            &group,
+            Some(&value(3.0)),
+            fresh_ptime,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        let evt = live
+            .try_recv()
+            .expect("the recovery edge should be emitted");
+        assert_eq!(evt.kind, EventKind::AppendFailureCleared);
+        assert!(live.try_recv().is_err());
+        assert_eq!(append_health.streak, 0);
+
+        // Tick 4: healthy, no event.
+        record_group(
+            &group,
+            Some(&value(4.0)),
+            fresh_ptime + 100,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        assert!(live.try_recv().is_err());
+
+        // On disk: ticks 1, 3, 4 - the dropped sample is nowhere.
+        drop(ctx);
+        drop(writer_tx);
+        let writer = Arc::try_unwrap(writer).unwrap_or_else(|_| panic!("sole owner"));
+        writer.close().await.unwrap();
+        let mut stored = Vec::new();
+        for file in banto_tstore::list_data_files(dir.path()).unwrap() {
+            let reader = banto_tstore::TsReader::open(&file.path).await.unwrap();
+            for sample in reader.read_range("g", i64::MIN, i64::MAX).await.unwrap() {
+                stored.push((sample.ptime_ms, sample.values[0]));
+            }
+        }
+        stored.sort_by_key(|(p, _)| *p);
+        assert_eq!(
+            stored,
+            vec![
+                (T0_MS, Some(1.0)),
+                (fresh_ptime, Some(3.0)),
+                (fresh_ptime + 100, Some(4.0)),
+            ]
+        );
     }
 
     // --- #334: `client_spec` must carry `word_order` through, for both

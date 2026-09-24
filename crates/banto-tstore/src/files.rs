@@ -130,6 +130,13 @@ pub fn plan_prune(
 /// "skip, don't fail" tolerance as [`list_data_files`]) - this function
 /// only ever deletes files it can positively identify as its own.
 ///
+/// Depends on the ptime/file-date contract ([`crate::findable`], #424, owner
+/// decision 2026-09-24): the age rule looks at the date in each file's
+/// *name* only, never at the `ptime` values inside, so "a file older than
+/// `retention_days`" only means "rows older than `retention_days`" because
+/// [`crate::writer::TsWriter::append`] guarantees every row's time is within
+/// about 24h of its file's date. Same dependency for [`plan_prune`].
+///
 /// The classification itself (which files are "deleted" vs "kept") is
 /// delegated to [`plan_prune`] so the dry-run preview and the real prune can
 /// never disagree; this function's only addition on top of the plan is
