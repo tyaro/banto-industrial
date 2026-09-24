@@ -89,7 +89,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::{Config, SwaggerUi};
 
-use crate::api_keys::{ApiKeyCheck, ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
+use crate::api_keys::{
+    api_key_verdict, ApiKeyContext, ApiKeyRejection, ApiKeysService, IssuedApiKey,
+};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::computed::ComputedEngine;
@@ -434,14 +436,33 @@ fn forbidden_response() -> Response {
 }
 
 /// T2-4（設計 §6-4「トリップ」）: トリップ中の API キーでの
-/// `/api/v1/*` アクセス - read/write いずれも 403。
-/// `crate::rest::require_tag_space_auth` から呼ぶ。
+/// `/api/v1/*` アクセス - read/write いずれも 403。#435 で `/api/sink/*` と
+/// MCP も同じ応答にそろえた（[`api_key_rejection_response`] 経由）。
 fn key_tripped_response() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(json!({ "error": "key_tripped" })),
     )
         .into_response()
+}
+
+/// #435: 使えない API キーへの HTTP 応答。REST のタグ空間 `/api/v1/*`・
+/// サイドカー用の `/api/sink/*`・MCP（`crate::mcp::require_mcp_auth`）が共通で
+/// 使う（gRPC は `crate::grpc::api_key_rejection_status`）。どう拒否するかは
+/// [`crate::api_keys::api_key_verdict`] が決める:
+/// - 失効・期限切れ・存在しない → 401（`ErrorBody::Unauthorized`）
+/// - トリップ → 403 `{"error": "key_tripped"}`（認証はできたが今は使えない。
+///   admin が解除すれば同じキーで戻るので、キーを捨てさせない）
+/// - 照合できない（#434）→ 500（`ApiError`、セッションの照合失敗と同じ形）
+pub(crate) fn api_key_rejection_response(rejection: ApiKeyRejection) -> Response {
+    match rejection {
+        ApiKeyRejection::Unauthenticated(_) => unauthorized_response(),
+        ApiKeyRejection::Tripped => key_tripped_response(),
+        ApiKeyRejection::Unavailable(err) => {
+            eprintln!("banto-hub: API キー照合に失敗しました: {err}");
+            ApiError(err).into_response()
+        }
+    }
 }
 
 /// T2-4（設計 §6-8、実装指示 §5「認証」）: `POST /api/v1/values/{tag}` を
@@ -6977,8 +6998,8 @@ async fn require_sink_admin(
         return Err(unauthorized_response());
     };
     if token.starts_with("bh_") {
-        match api_keys.check(token, now_ms).await {
-            ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
+        match api_key_verdict(api_keys.check(token, now_ms).await) {
+            Ok(ctx) => {
                 if let Err(err) = api_keys
                     .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
                     .await
@@ -6993,16 +7014,10 @@ async fn require_sink_admin(
                     Err(forbidden_response())
                 }
             }
-            // Revoked/Tripped/Expired/NotFound はいずれも一律401
-            // （`crate::mcp::require_mcp_auth`と同じ判断 - この2
-            // エンドポイントもサイドカー専用の機械アクセスで、拒否理由の
-            // 細分は必須ではない）。
-            ApiKeyCheck::Answered(_) => Err(unauthorized_response()),
-            // #434: 照合できなかったときは 401 にしない（500）。
-            ApiKeyCheck::Unavailable(err) => {
-                eprintln!("banto-hub: sink admin API キーの照合に失敗しました: {err}");
-                Err(ApiError(err).into_response())
-            }
+            // #435: 使えないキーの応答はタグ空間・MCP と同じ変換
+            // （[`api_key_rejection_response`]）。失効・期限切れ・存在しないは
+            // 401、トリップは 403 `key_tripped`、照合できないは 500（#434）。
+            Err((rejection, _denied)) => Err(api_key_rejection_response(rejection)),
         }
     } else {
         match actor_identity(headers, auth, commissioning) {
@@ -9500,8 +9515,11 @@ async fn require_tag_space_auth(
         // にも last_used_at 更新にも同じ「今」を使う - 呼び出しごとに
         // ずれないよう一度だけ取得する。
         let now_ms = state.manager.clock().now_ms();
-        match state.api_keys.check(&token, now_ms).await {
-            ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
+        // #435: 使えないキーの応答は `api_key_verdict` →
+        // `api_key_rejection_response` の 1 か所で決める（MCP・サイドカー用と
+        // 共通）。監査（denied）はこの経路だけが残す（従来どおり）。
+        match api_key_verdict(state.api_keys.check(&token, now_ms).await) {
+            Ok(ctx) => {
                 // H10 ③(Option B): この認証層のゲートは「read 系ルートに
                 // 入れるか」だけを見る(has_any_read = 素の read か任意の
                 // read:... を1つでも持つか)。個々のタグの値を読めるかどうか
@@ -9522,67 +9540,30 @@ async fn require_tag_space_auth(
                 req.extensions_mut().insert(ctx);
                 next.run(req).await
             }
-            ApiKeyCheck::Answered(ApiKeyLookup::Revoked { id, name }) => {
-                let method = req.method().as_str().to_string();
-                let path = req.uri().path().to_string();
-                state
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: None,
-                        actor_role: None,
-                        action: "denied",
-                        resource: "api_keys",
-                        entity_id: Some(&id.to_string()),
-                        detail: Some(json!({ "reason": "revoked", "name": name, "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
-                unauthorized_response()
-            }
-            ApiKeyCheck::Answered(ApiKeyLookup::Tripped { id, name }) => {
-                let method = req.method().as_str().to_string();
-                let path = req.uri().path().to_string();
-                state
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: None,
-                        actor_role: None,
-                        action: "denied",
-                        resource: "api_keys",
-                        entity_id: Some(&id.to_string()),
-                        detail: Some(json!({ "reason": "tripped", "name": name, "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
-                key_tripped_response()
-            }
-            ApiKeyCheck::Answered(ApiKeyLookup::Expired { id, name }) => {
-                let method = req.method().as_str().to_string();
-                let path = req.uri().path().to_string();
-                state
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: None,
-                        actor_role: None,
-                        action: "denied",
-                        resource: "api_keys",
-                        entity_id: Some(&id.to_string()),
-                        detail: Some(json!({ "reason": "expired", "name": name, "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
-                unauthorized_response()
-            }
-            ApiKeyCheck::Answered(ApiKeyLookup::NotFound) => unauthorized_response(),
-            // #434: 照合そのものができなかった（DB エラー・タイムアウト）ときは
-            // 401 にしない。セッションの照合失敗（下の `else` 節、#431）と同じ
-            // `ApiError` の 500。
-            ApiKeyCheck::Unavailable(err) => {
-                eprintln!("banto-hub: API キー照合に失敗しました: {err}");
-                ApiError(err).into_response()
+            Err((rejection, denied)) => {
+                if let Some(denied) = denied {
+                    let method = req.method().as_str().to_string();
+                    let path = req.uri().path().to_string();
+                    state
+                        .audit
+                        .record(AuditEntry {
+                            actor_username: None,
+                            actor_role: None,
+                            action: "denied",
+                            resource: "api_keys",
+                            entity_id: Some(&denied.id.to_string()),
+                            detail: Some(json!({
+                                "reason": denied.reason,
+                                "name": denied.name,
+                                "method": method,
+                                "path": path
+                            })),
+                            origin: "rest",
+                            result: "denied",
+                        })
+                        .await;
+                }
+                api_key_rejection_response(rejection)
             }
         }
     } else {
@@ -11121,6 +11102,60 @@ mod tests {
         assert_eq!(denied.entity_id.as_deref(), Some(id.to_string().as_str()));
     }
 
+    /// #435: 使えない API キーへの HTTP 応答の表（REST・サイドカー用・MCP で共通の
+    /// 変換）。失効・期限切れ・存在しないは 401、トリップは 403 `key_tripped`、
+    /// 照合できないは 500。
+    #[tokio::test]
+    async fn api_key_rejection_response_table() {
+        use crate::api_keys::{ApiKeyRejection as R, UnauthenticatedReason as U};
+        let table: Vec<(&str, R, StatusCode, serde_json::Value)> = vec![
+            (
+                "revoked",
+                R::Unauthenticated(U::Revoked),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!("unauthorized"),
+            ),
+            (
+                "expired",
+                R::Unauthenticated(U::Expired),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!("unauthorized"),
+            ),
+            (
+                "not found",
+                R::Unauthenticated(U::NotFound),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!("unauthorized"),
+            ),
+            (
+                "tripped",
+                R::Tripped,
+                StatusCode::FORBIDDEN,
+                serde_json::json!("key_tripped"),
+            ),
+            (
+                "unavailable",
+                R::Unavailable(BantoError::Storage("db down".to_string())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!("storage"),
+            ),
+        ];
+        for (label, rejection, status, marker) in table {
+            let response = api_key_rejection_response(rejection);
+            assert_eq!(response.status(), status, "{label}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let got = if body.get("error").is_some() {
+                &body["error"]
+            } else {
+                &body["kind"]
+            };
+            assert_eq!(*got, marker, "{label}: {body}");
+        }
+    }
+
     /// #434: `GET` を API キーで叩いてステータスと本文を返す。
     async fn get_with_key(
         router: &Router,
@@ -11192,7 +11227,7 @@ mod tests {
                 "tripped",
                 tripped.key,
                 StatusCode::FORBIDDEN,
-                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
             ),
             (
                 "expired",
@@ -11210,8 +11245,13 @@ mod tests {
         for (label, key, tags, sink) in &keys {
             let (status, body) = get_with_key(&env.router, "/api/v1/tags", key).await;
             assert_eq!(status, *tags, "tags {label}: {body:?}");
-            let (status, body) = get_with_key(&env.router, "/api/sink/config", key).await;
-            assert_eq!(status, *sink, "sink {label}: {body:?}");
+            let (status, sink_body) = get_with_key(&env.router, "/api/sink/config", key).await;
+            assert_eq!(status, *sink, "sink {label}: {sink_body:?}");
+            // #435: トリップはどちらも 403 `key_tripped`（同じ本文）。
+            if *label == "tripped" {
+                assert_eq!(body["error"], "key_tripped", "{body:?}");
+                assert_eq!(sink_body["error"], "key_tripped", "{sink_body:?}");
+            }
         }
 
         sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")

@@ -93,7 +93,9 @@ use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use crate::api_keys::{ApiKeyCheck, ApiKeyContext, ApiKeyLookup, ApiKeysService};
+use crate::api_keys::{
+    api_key_verdict, ApiKeyContext, ApiKeyRejection, ApiKeysService, UnauthenticatedReason,
+};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::computed::ServerTagStore;
 use crate::controller::CollectionController;
@@ -384,8 +386,10 @@ impl GrpcService {
         // `self.manager.clock()` から一度だけ取る(REST の
         // `require_tag_space_auth` と同じ規約)。
         let now_ms = self.manager.clock().now_ms();
-        match self.api_keys.check(token, now_ms).await {
-            ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
+        // #435: 使えないキーの応答は `api_key_verdict` →
+        // [`api_key_rejection_status`] の 1 か所で決める（REST・MCP と同じ分類）。
+        match api_key_verdict(self.api_keys.check(token, now_ms).await) {
+            Ok(ctx) => {
                 // H10 ③(Option B): 「read 系 RPC に入れるか」だけを見る
                 // ゲート(has_any_read = 素の read か任意の read:... を1つ
                 // でも持つか)。個々のタグの値を読めるか(can_read_value)は
@@ -405,28 +409,12 @@ impl GrpcService {
                 }
                 Ok(ctx)
             }
-            ApiKeyCheck::Answered(ApiKeyLookup::Revoked { id, name }) => {
-                self.record_denied(id, "revoked", &name).await;
-                Err(Status::unauthenticated("この API キーは失効しています"))
-            }
-            ApiKeyCheck::Answered(ApiKeyLookup::Tripped { id, name }) => {
-                self.record_denied(id, "tripped", &name).await;
-                Err(Status::permission_denied("key_tripped"))
-            }
-            ApiKeyCheck::Answered(ApiKeyLookup::Expired { id, name }) => {
-                self.record_denied(id, "expired", &name).await;
-                Err(Status::unauthenticated("この API キーは有効期限切れです"))
-            }
-            ApiKeyCheck::Answered(ApiKeyLookup::NotFound) => {
-                Err(Status::unauthenticated("無効な API キーです"))
-            }
-            // #434: 照合そのものができなかった（DB エラー・タイムアウト）ときは
-            // `UNAVAILABLE`（再試行してよい一時的な障害）。以前は `INTERNAL`。
-            ApiKeyCheck::Unavailable(err) => {
-                eprintln!("banto-hub: gRPC 用 API キー照合に失敗しました: {err}");
-                Err(Status::unavailable(
-                    "API キーを照合できませんでした（一時的な障害）。再試行してください",
-                ))
+            Err((rejection, denied)) => {
+                if let Some(denied) = denied {
+                    self.record_denied(denied.id, denied.reason, &denied.name)
+                        .await;
+                }
+                Err(api_key_rejection_status(rejection))
             }
         }
     }
@@ -852,10 +840,76 @@ impl GrpcServer {
     }
 }
 
+/// #435: 使えない API キーへの gRPC の応答（HTTP 側は
+/// `crate::rest::api_key_rejection_response`。分類は同じ
+/// [`crate::api_keys::api_key_verdict`]）:
+/// - 失効・期限切れ・存在しない → `UNAUTHENTICATED`
+/// - トリップ → `PERMISSION_DENIED`（`key_tripped`）
+/// - 照合できない（#434）→ `UNAVAILABLE`
+pub(crate) fn api_key_rejection_status(rejection: ApiKeyRejection) -> Status {
+    match rejection {
+        ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Revoked) => {
+            Status::unauthenticated("この API キーは失効しています")
+        }
+        ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Expired) => {
+            Status::unauthenticated("この API キーは有効期限切れです")
+        }
+        ApiKeyRejection::Unauthenticated(UnauthenticatedReason::NotFound) => {
+            Status::unauthenticated("無効な API キーです")
+        }
+        ApiKeyRejection::Tripped => Status::permission_denied("key_tripped"),
+        ApiKeyRejection::Unavailable(err) => {
+            eprintln!("banto-hub: gRPC 用 API キー照合に失敗しました: {err}");
+            Status::unavailable(
+                "API キーを照合できませんでした（一時的な障害）。再試行してください",
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::controller::CollectionState;
+
+    /// #435: 使えない API キーへの gRPC の応答の表（分類は REST・MCP と同じ
+    /// `api_key_verdict`）。
+    #[test]
+    fn api_key_rejection_status_table() {
+        use ApiKeyRejection as R;
+        use UnauthenticatedReason as U;
+        let table = vec![
+            (
+                "revoked",
+                R::Unauthenticated(U::Revoked),
+                tonic::Code::Unauthenticated,
+            ),
+            (
+                "expired",
+                R::Unauthenticated(U::Expired),
+                tonic::Code::Unauthenticated,
+            ),
+            (
+                "not found",
+                R::Unauthenticated(U::NotFound),
+                tonic::Code::Unauthenticated,
+            ),
+            ("tripped", R::Tripped, tonic::Code::PermissionDenied),
+            (
+                "unavailable",
+                R::Unavailable(banto_core::BantoError::Storage("db down".to_string())),
+                tonic::Code::Unavailable,
+            ),
+        ];
+        for (label, rejection, code) in table {
+            let status = api_key_rejection_status(rejection);
+            assert_eq!(status.code(), code, "{label}: {status:?}");
+        }
+        assert_eq!(
+            api_key_rejection_status(R::Tripped).message(),
+            "key_tripped"
+        );
+    }
 
     #[test]
     fn stopped_collection_rejection_maps_to_unavailable() {

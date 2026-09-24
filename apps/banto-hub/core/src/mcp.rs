@@ -82,7 +82,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
-use crate::api_keys::{ApiKeyCheck, ApiKeyContext, ApiKeyLookup, ApiKeysService};
+use crate::api_keys::{api_key_verdict, ApiKeyContext, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, RunMode};
@@ -90,13 +90,13 @@ use crate::hub::CollectorManager;
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::PendingChangesService;
 use crate::rest::{
-    bearer_token, commit_catalog_and_notify, compute_pending_base_fingerprint, compute_status,
-    parse_requested_value, preflight_transaction, run_plc_connection_test, unauthorized_response,
-    validate_grpc_settings_body, validate_mqtt_settings_request, validate_store_settings_request,
-    CollectionGroupPayload, CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse,
-    MqttSettingsRequest, MqttSettingsResponse, PlcConnectionPayload, PlcConnectionResponse,
-    PlcConnectionTestPayload, StoreSettingsRequest, StoreSettingsResponse, TagPayload,
-    TagSpaceState,
+    api_key_rejection_response, bearer_token, commit_catalog_and_notify,
+    compute_pending_base_fingerprint, compute_status, parse_requested_value, preflight_transaction,
+    run_plc_connection_test, unauthorized_response, validate_grpc_settings_body,
+    validate_mqtt_settings_request, validate_store_settings_request, CollectionGroupPayload,
+    CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse, MqttSettingsRequest,
+    MqttSettingsResponse, PlcConnectionPayload, PlcConnectionResponse, PlcConnectionTestPayload,
+    StoreSettingsRequest, StoreSettingsResponse, TagPayload, TagSpaceState,
 };
 use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
@@ -336,11 +336,12 @@ pub(crate) fn mcp_router(
 }
 
 /// `POST /mcp`専用の認証ミドルウェア - このモジュールの doc comment
-/// 「認証」節参照。`crate::rest::require_tag_space_auth`と違い、失敗系統は
-/// 一律 401 に潰す（revoked/tripped/expired/NotFound/セッション token の
-/// 区別を audit へ残す必要はここでは無い - 個々のツールのスコープ拒否は
-/// `tools/call`の結果として`isError`で返るので、HTTP 層は「認証できたか」
-/// だけを見ればよい）。
+/// 「認証」節参照。`crate::rest::require_tag_space_auth`と違い、拒否の監査
+/// （denied）は残さない（個々のツールのスコープ拒否は `tools/call`の結果として
+/// `isError`で返るので、HTTP 層は「認証できたか」だけを見ればよい）。応答は
+/// REST と同じ変換（#435、`crate::rest::api_key_rejection_response`）:
+/// 失効・期限切れ・存在しない・セッション token は 401、トリップは 403
+/// `key_tripped`、照合できない（#434）は 500。
 async fn require_mcp_auth(
     State(state): State<McpAuthState>,
     mut req: axum::extract::Request,
@@ -354,8 +355,8 @@ async fn require_mcp_auth(
         return unauthorized_response();
     }
     let now_ms = state.manager.clock().now_ms();
-    match state.api_keys.check(&token, now_ms).await {
-        ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
+    match api_key_verdict(state.api_keys.check(&token, now_ms).await) {
+        Ok(ctx) => {
             if let Err(err) = state
                 .api_keys
                 .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
@@ -366,17 +367,12 @@ async fn require_mcp_auth(
             req.extensions_mut().insert(ctx);
             next.run(req).await
         }
-        // Revoked/Tripped/Expired/NotFound はいずれも一律 401
-        // （このモジュールの doc comment「認証」節参照）。
-        ApiKeyCheck::Answered(_) => unauthorized_response(),
-        // #434: 照合そのものができなかった（DB エラー・タイムアウト）ときは、
-        // キーが無効だと分かったわけではないので 401 にしない。JSON-RPC に
-        // 入る前の HTTP 層の失敗（401 と同じ層）なので、REST と同じ 500
-        // （`ApiError`）を返す。
-        ApiKeyCheck::Unavailable(err) => {
-            eprintln!("banto-hub: MCP 用 API キー照合に失敗しました: {err}");
-            banto_server::ApiError(err).into_response()
-        }
+        // #435: 使えないキーの応答は REST のタグ空間と同じ変換
+        // （`crate::rest::api_key_rejection_response`）。JSON-RPC に入る前の
+        // HTTP 層の失敗なので、本文も REST と同じ形: 失効・期限切れ・存在しない
+        // は 401、トリップは 403 `key_tripped`（以前は 401）、照合できない
+        // （#434）は 500。
+        Err((rejection, _denied)) => api_key_rejection_response(rejection),
     }
 }
 

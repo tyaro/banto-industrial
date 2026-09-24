@@ -126,12 +126,18 @@
 //!
 //! - [`ApiKeyCheck::Answered`]: DB が答えた（有効・失効・トリップ・期限切れ・
 //!   存在しない）。無効なキーは従来どおり 401 / `UNAUTHENTICATED`（トリップは
-//!   従来どおり 403 / `PERMISSION_DENIED`）。
+//!   403 `key_tripped` / `PERMISSION_DENIED`。#435 で MCP と `/api/sink/*` も
+//!   401 から 403 にそろえた）。
 //! - [`ApiKeyCheck::Unavailable`]: 照合そのものができなかった（DB エラー・
 //!   タイムアウト）。REST と MCP は 500（`ApiError`、#431 でセッションの照合
 //!   失敗に返しているのと同じ形）、gRPC は `UNAVAILABLE`。以前は 401 だった
 //!   ため、401 を「キーが無効になった」と解釈するクライアントが一時的な障害で
 //!   再試行をやめたり、キーを捨てたりしうる。
+//!
+//! 応答への変換は、3 経路とも [`api_key_verdict`]（純関数。使える / どう拒否
+//! するか + 監査用の情報）を通し、HTTP（REST・MCP）は
+//! `crate::rest::api_key_rejection_response`、gRPC は
+//! `crate::grpc::api_key_rejection_status` の 1 か所で決める（#435）。
 
 use std::time::Duration;
 
@@ -631,6 +637,67 @@ pub fn classify_lookup(outcome: Option<Result<ApiKeyLookup, BantoError>>) -> Api
     }
 }
 
+/// #435: 使えないキーをどう拒否するか。3 経路（REST・MCP・gRPC）はこの分類
+/// だけを見て応答を決める（HTTP は `crate::rest::api_key_rejection_response`、
+/// gRPC は `crate::grpc::api_key_rejection_status`）。
+#[derive(Debug)]
+pub enum ApiKeyRejection {
+    /// キーとして認められない（失効・期限切れ・存在しない）。401 /
+    /// `UNAUTHENTICATED`。
+    Unauthenticated(UnauthenticatedReason),
+    /// 認証はできたが、今は使えない（トリップ中。admin が解除すれば同じキーで
+    /// 戻る）。403 `key_tripped` / `PERMISSION_DENIED`。
+    Tripped,
+    /// 照合そのものができなかった（#434）。500 / `UNAVAILABLE`。
+    Unavailable(BantoError),
+}
+
+/// [`ApiKeyRejection::Unauthenticated`] の理由（gRPC のメッセージの出し分け用。
+/// HTTP の応答はどれも同じ 401）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnauthenticatedReason {
+    Revoked,
+    Expired,
+    NotFound,
+}
+
+/// 拒否したキーの監査用の情報（id・名前・理由）。存在しないキーと照合でき
+/// なかったときは `None`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeniedKey {
+    pub id: i64,
+    pub name: String,
+    pub reason: &'static str,
+}
+
+/// #435: 照合の結果を「使える（コンテキスト）」か「どう拒否するか」に変換する
+/// 純関数。トリップ・失効・期限切れ・存在しない・照合できない、のすべてを
+/// ここ 1 か所で決める。拒否したときは監査用の [`DeniedKey`] も返す。
+pub fn api_key_verdict(
+    check: ApiKeyCheck,
+) -> Result<ApiKeyContext, (ApiKeyRejection, Option<DeniedKey>)> {
+    let denied = |id: i64, name: String, reason: &'static str| Some(DeniedKey { id, name, reason });
+    match check {
+        ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => Ok(ctx),
+        ApiKeyCheck::Answered(ApiKeyLookup::Revoked { id, name }) => Err((
+            ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Revoked),
+            denied(id, name, "revoked"),
+        )),
+        ApiKeyCheck::Answered(ApiKeyLookup::Expired { id, name }) => Err((
+            ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Expired),
+            denied(id, name, "expired"),
+        )),
+        ApiKeyCheck::Answered(ApiKeyLookup::Tripped { id, name }) => {
+            Err((ApiKeyRejection::Tripped, denied(id, name, "tripped")))
+        }
+        ApiKeyCheck::Answered(ApiKeyLookup::NotFound) => Err((
+            ApiKeyRejection::Unauthenticated(UnauthenticatedReason::NotFound),
+            None,
+        )),
+        ApiKeyCheck::Unavailable(err) => Err((ApiKeyRejection::Unavailable(err), None)),
+    }
+}
+
 impl ApiKeysService {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -977,6 +1044,78 @@ mod tests {
                 answered,
                 "{label}: {check:?}"
             );
+        }
+    }
+
+    /// #435: 照合の結果 → 使える / どう拒否するか（+ 監査用の情報）の表。
+    /// 3 経路（REST・MCP・gRPC）はこの分類だけを応答に変換する。
+    #[tokio::test]
+    async fn api_key_verdict_table() {
+        let pool = migrate_memory().await.unwrap();
+        let service = ApiKeysService::new(pool);
+        let issued = service
+            .issue("verdict", vec!["read".to_string()], None)
+            .await
+            .unwrap();
+        let valid = service.lookup(&issued.key, 0).await.unwrap();
+
+        let answered = ApiKeyCheck::Answered;
+        let k = || "k".to_string();
+        // (ラベル, 照合の結果, 期待: None = 使える / Some(拒否の種類), 監査の理由)
+        let table: Vec<(&str, ApiKeyCheck, Option<&str>, Option<&str>)> = vec![
+            ("valid", answered(valid), None, None),
+            (
+                "revoked",
+                answered(ApiKeyLookup::Revoked { id: 1, name: k() }),
+                Some("unauthenticated:revoked"),
+                Some("revoked"),
+            ),
+            (
+                "expired",
+                answered(ApiKeyLookup::Expired { id: 2, name: k() }),
+                Some("unauthenticated:expired"),
+                Some("expired"),
+            ),
+            (
+                "tripped",
+                answered(ApiKeyLookup::Tripped { id: 3, name: k() }),
+                Some("tripped"),
+                Some("tripped"),
+            ),
+            (
+                "not found",
+                answered(ApiKeyLookup::NotFound),
+                Some("unauthenticated:not_found"),
+                None,
+            ),
+            (
+                "unavailable",
+                ApiKeyCheck::Unavailable(BantoError::Storage("db down".to_string())),
+                Some("unavailable"),
+                None,
+            ),
+        ];
+        for (label, check, rejection, audit) in table {
+            match api_key_verdict(check) {
+                Ok(_) => assert_eq!(rejection, None, "{label}"),
+                Err((got, denied)) => {
+                    let got = match got {
+                        ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Revoked) => {
+                            "unauthenticated:revoked"
+                        }
+                        ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Expired) => {
+                            "unauthenticated:expired"
+                        }
+                        ApiKeyRejection::Unauthenticated(UnauthenticatedReason::NotFound) => {
+                            "unauthenticated:not_found"
+                        }
+                        ApiKeyRejection::Tripped => "tripped",
+                        ApiKeyRejection::Unavailable(_) => "unavailable",
+                    };
+                    assert_eq!(Some(got), rejection, "{label}");
+                    assert_eq!(denied.map(|d| d.reason), audit, "{label}");
+                }
+            }
         }
     }
 

@@ -562,12 +562,17 @@ async fn a_key_check_failure_is_500_while_invalid_keys_stay_401() {
     let keys = keys_in_each_state(&app.pool).await;
     for (label, key) in &keys {
         let (status, body) = mcp_post(&app.router, Some(key), rpc("ping", json!({}))).await;
-        let expected = if *label == "valid" {
-            StatusCode::OK
-        } else {
-            StatusCode::UNAUTHORIZED
+        // #435: トリップは「認証はできたが今は使えない」ので 403 `key_tripped`
+        // （REST のタグ空間と同じ。以前の MCP は 401）。
+        let expected = match *label {
+            "valid" => StatusCode::OK,
+            "tripped" => StatusCode::FORBIDDEN,
+            _ => StatusCode::UNAUTHORIZED,
         };
         assert_eq!(status, expected, "{label}: {body:?}");
+        if *label == "tripped" {
+            assert_eq!(body["error"], "key_tripped", "{body:?}");
+        }
     }
 
     sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")
