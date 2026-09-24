@@ -23,8 +23,8 @@
 # ## 影響範囲
 #
 # このワークスペースの Cargo.toml がある場所からの相対設定のため、
-# ワークスペース全体（テスト・proc macro・apps/chronogazer や
-# apps/relay-wright の src-tauri crate も含む）のビルドに効く。
+# ワークスペース全体（テスト・proc macro・apps/chronogazer の
+# src-tauri crate も含む）のビルドに効く。
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

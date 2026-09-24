@@ -2,7 +2,8 @@
 
 作成日: 2026-07-12（過去アプリ棚卸しと記録計構想の議論に基づく）
 状態: **進行中。I系（I0〜I6）実装済み（I6 = banto-broker として抽出済み）、
-W系（relay-wright）は W5 まで実装済みだが **2026-09-17 に凍結**（構想の練り直し、§4b）。T系（タグサーバー、
+W系（relay-wright）は W5 まで実装済みだったが **2026-09-17 に凍結**（構想の練り直し、§4b）、
+**2026-09-24 に main から外してタグ `archive/relay-wright-2026-09-24` に退避した**。T系（タグサーバー、
 §4c）は T0〜T21 実装済み（試運転モード/ロックダウン・収集開始停止 UI・タグ名
 一意性の収集グループ内一意への緩和・T19 UX 群・T20 文字列/構造体/レシピ/ビット・
 T21 構成補助 MCP 管理面を含む、2026-09-06）。残 T18-5c/d（Windows
@@ -13,7 +14,7 @@ T13〜T18 の詳細と最新の全体像は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
-地図は [README.md](README.md)**（2026-09-17 更新。本文の T 系表は 2026-08-08 時点の
+地図は [README.md](README.md)**（2026-09-24 更新。本文の T 系表は 2026-08-08 時点の
 まま — 実装状況の正は banto-hub-remaining-plan.md/banto-hub-desktop-plan.md）
 最終検証日(コード照合): 2026-09-01
 
@@ -100,21 +101,29 @@ PLC への書き込み / 汎用画面エディタ（表示は固定グループ�
 アラーム状態遷移管理（ACK 等。しきい値の表示とイベント一覧まで）/
 多段通知（メール等）。
 
-## 4b. 自動書き込みアプリ **relay-wright**（W系）— 凍結中
+## 4b. 自動書き込みアプリ **relay-wright**（W系）— 凍結・main から退避済み
 
 > **凍結（2026-09-17 オーナー決定）**: デバッグ用途として位置づけていたが、構想を練り直すため
 > しばし凍結する。W5 の実機検証も、#332（Hub 自動接続）の relay-wright への配線も止める
 > （配線の途中までの作業はローカルブランチ `feat/332-hub-bootstrap-relay-wright` に WIP として
 > 残してある。push はしていない）。
+>
+> **main から退避（2026-09-24 オーナー決定）**: 凍結が続いているため、`apps/relay-wright`・
+> 専用の E2E（`e2e/relay-wright.playwright.config.ts` 等）・CI の relay-wright 手順を main から
+> 外した。外す直前の main はタグ `archive/relay-wright-2026-09-24`、#332 配線の途中の作業は
+> ブランチ `archive/relay-wright-332-wip` にそれぞれ退避してある。復元は
+> `git checkout archive/relay-wright-2026-09-24 -- apps/relay-wright ...` で行う。
+> `crates/banto-broker`・`crates/banto-plc-write`・`crates/banto-tags` への依存はコメントのみで
+> コードの依存は無かったため、退避は他アプリに影響しない。
 
 条件付き PLC 自動書き込みアプリ（Tauri + banto テンプレート由来、詳細計画は
 セッション初期に作成したローカルの計画メモ `luminous-discovering-goblet.md`
 — Claude plan mode のローカル成果物でリポジトリには未収録。当時の Rule of
 Three 判断の経緯は本節と W1〜W5 実装（下表）に集約済み）: タグレジストリの読み取り値を条件に、
-設定ルールに従って別の PLC デバイスへ値を自動書き込みする。ChronoGazer が
+設定ルールに従って別の PLC デバイスへ値を自動書き込みする**構想だった**。ChronoGazer が
 「v1 で入れない」と護った書き込みを、**専用アプリ + 専用クレート（I5）+
 安全機構**（アーミング・dry-run・レート制限ブレーカ・log-before-write・
-サイクル検出）に隔離して引き受ける。安全上の注意は
+サイクル検出）に隔離して引き受ける設計。安全上の注意は退避タグの
 `apps/relay-wright/README.md` 参照。
 
 | #     | 内容                                                                                                                             | 依存    | 備考                                                                                                                               |
@@ -140,7 +149,8 @@ FA-Server 型の独立タグサーバー **banto-hub**（2026-08-04 起案・命
 外部システム連携（MES・クラウド・自作画面）と、同一 PC 同居時の PLC
 セッション多重化（W5 実機検証の同時セッション数上限の結果次第で必須化）が
 狙い。書き込みは per-tag opt-in + 監査 + レート制限のパススルーのみ
-（ルールエンジンは relay-wright の専管のまま）。**タグ定義の一次ソース**
+（ルールエンジンは持たない - relay-wright が構想していた領域で、同アプリは
+2026-09-24 に main から退避済み）。**タグ定義の一次ソース**
 として位置づけ、今後の関連アプリ（SCADA 等）は自前でアドレスを定義せず
 タグサーバーの catalog をバインドして使う（同 doc §4.1/§7、2026-08-04 決定）。
 **2026-09-17 追記**: これは「Hub があるときは Hub がタグ定義の一次ソース」という位置づけの

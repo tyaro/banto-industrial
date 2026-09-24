@@ -18,9 +18,10 @@
   管理 UI も同プロセスが配信する。このリポジトリで最も E2E 確認しやすい主力製品。
 - **ChronoGazer**（R系, `apps/chronogazer`）: 記録計。Tauri デスクトップ版と
   LAN/ヘッドレス版（`banto-serve` バイナリ）がある。
-- **relay-wright**（W系, `apps/relay-wright`）: 条件付き PLC 自動書き込み。
-  同じく Tauri 版と `relay-wright-serve` 版がある。**実 PLC へ書き込む**製品なので
-  [apps/relay-wright/README.md](apps/relay-wright/README.md) の安全上の注意を読むこと。
+- **relay-wright**（W系, 条件付き PLC 自動書き込み）は 2026-09-24 に main から
+  外し、タグ `archive/relay-wright-2026-09-24` に退避した（構想の練り直し、
+  オーナー決定。docs/plan.md §4b）。復元は
+  `git checkout archive/relay-wright-2026-09-24 -- apps/relay-wright ...`。
 - `crates/*` はライブラリのみ（`cargo test -p <crate>` で確認、常駐プロセスではない）。
 
 ### Node のバージョン（重要なハマりどころ）
@@ -71,16 +72,14 @@ cargo run -p banto-hub-core --bin banto-hub --features embed-ui
 - UI をホットリロードで触りたいときは、上記バックエンドを起動したまま
   `pnpm --filter banto-hub dev`（Vite が `/api` を `127.0.0.1:8722` へプロキシ）。
 
-### ChronoGazer / relay-wright（LAN・ヘッドレス）
+### ChronoGazer（LAN・ヘッドレス）
 
 ```sh
 pnpm --filter chronogazer build
 cargo run -p chronogazer-core --bin banto-serve --features embed-ui   # 既定 PORT=8721
 ```
 
-- Tauri デスクトップ版は `pnpm --filter <app> tauri dev`。**chronogazer と
-  relay-wright はどちらも Vite の既定ポートが 1420** なので、2 つ同時に
-  `tauri dev` するとポート衝突する。片方ずつ動かすこと。
+- Tauri デスクトップ版は `pnpm --filter <app> tauri dev`。
 
 ### テスト
 

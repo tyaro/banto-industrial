@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-09-23（§2-8 に「E2E は worktree やエージェントが違っても同時に 1 本だけ」を追加（オーナー指示）。§3 に #399 の「開く遷移に `visibility` を載せると開いた直後は hidden」を追加）
+最終更新: 2026-09-24（relay-wright を main から外しタグ `archive/relay-wright-2026-09-24` に退避したのに合わせて §7 を更新）
+2026-09-23（§2-8 に「E2E は worktree やエージェントが違っても同時に 1 本だけ」を追加（オーナー指示）。§3 に #399 の「開く遷移に `visibility` を載せると開いた直後は hidden」を追加）
 2026-09-23（§2-7 に chronogazer の E2E 前の `dev_plc` example のビルドを追加。R1-C の C-4 で E2E の `webServer` が 2 つになった）
 2026-09-23（§2-8 の「E2E は 1 回だけ」を「緑の確認は 1 回、反証は理由を書けば別」に直す。§5 の反証確認と構造的に衝突していた）
 2026-09-21（§5 に #408 のオーナーレビューで出た 2 件を追加。読み取りと操作のキュー共有、非有限の浮動小数点）
@@ -99,4 +100,6 @@
 ## 7. バージョン（banto-hub を変更したときだけ）
 
 - [ ] **4 点セット**を同じ PR で揃える: ルート `Cargo.toml` / `apps/banto-hub/package.json` / `apps/banto-hub/installer/src/main.rs` / `CHANGELOG.md` → 最後に `cargo update -w`。
-- [ ] chronogazer / relay-wright は 0.1.0 のまま（**bump も CHANGELOG も不要**）。
+- [ ] chronogazer は 0.1.0 のまま（**bump も CHANGELOG も不要**）。relay-wright は
+      2026-09-24 に main から外してタグ `archive/relay-wright-2026-09-24` に退避した
+      ため対象外（復元時に再検討）。

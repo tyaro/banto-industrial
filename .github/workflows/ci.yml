@@ -69,17 +69,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # rustfmt only parses/reformats - no compilation, so like the steps
       # below it covers every workspace member, including the
-      # `chronogazer`/`relay-wright` src-tauri crates.
+      # `chronogazer` src-tauri crate.
       - name: fmt
         run: cargo fmt --all --check
-      # Scope: the whole workspace, no --exclude. The two Tauri src-tauri
-      # crates (`chronogazer`, `relay-wright`) have real tests of their own
-      # (relay-wright: 25, chronogazer: 5) - PR #39 fixed a compile error in
-      # relay-wright's src-tauri tests that a prior narrower CI scope had let
-      # through undetected (a stale field reference left behind by T2-3).
-      # So they stay in scope rather than being excluded for build-time
-      # reasons: this job runs on windows-latest with Swatinem/rust-cache,
-      # where the Tauri/WebView2 dependency build time is acceptable.
+      # Scope: the whole workspace, no --exclude. The Tauri src-tauri crate
+      # (`chronogazer`) has real tests of its own (5) - PR #39 fixed a
+      # compile error in relay-wright's src-tauri tests (relay-wright has
+      # since been archived, see docs/plan.md) that a prior narrower CI
+      # scope had let through undetected (a stale field reference left
+      # behind by T2-3). So it stays in scope rather than being excluded for
+      # build-time reasons: this job runs on windows-latest with
+      # Swatinem/rust-cache, where the Tauri/WebView2 dependency build time
+      # is acceptable.
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
@@ -145,11 +146,6 @@ jobs:
     # `pnpm e2e:banto-hub`) covering first-run setup/login/logout and the
     # TAG-P0-1 continuous-registration DOM behavior - it runs in this same
     # job, after the chronogazer suite.
-    # H5: apps/relay-wright now has its own Playwright config too
-    # (e2e/relay-wright.playwright.config.ts, `pnpm e2e:relay-wright`),
-    # covering the Tauri-free embedded-server mode (spec §11.1 mode 2) -
-    # see that config's doc comment for why Tauri-webview-only paths (mode
-    # 1) are out of scope here.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -204,20 +200,6 @@ jobs:
       - name: Build banto-hub (embed-ui)
         run: cargo build -p banto-hub-core --bin banto-hub --features embed-ui
 
-      # e2e/relay-wright.playwright.config.ts's webServer launches this
-      # binary directly, same reasoning as banto-hub above - must exist
-      # before `pnpm e2e:relay-wright` below. `pnpm build` (above) already
-      # built apps/relay-wright/build recursively, but relay-wright is a
-      # Tauri app (unlike chronogazer/banto-hub's plain SvelteKit apps) so
-      # its own `pnpm --filter relay-wright build` is run explicitly here
-      # too, to keep this step self-contained if the recursive build step
-      # ever narrows its scope.
-      - name: Build relay-wright frontend
-        run: pnpm --filter relay-wright build
-
-      - name: Build relay-wright-serve (embed-ui)
-        run: cargo build -p relay-wright-core --bin relay-wright-serve --features embed-ui
-
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium
 
@@ -229,12 +211,6 @@ jobs:
       # failure here is distinguishable from the chronogazer suite above.
       - name: Run E2E suite (banto-hub)
         run: pnpm e2e:banto-hub
-
-      # H5: relay-wright's own suite (embedded-server mode first-run
-      # setup/login/logout + PLC接続 REST CRUD) - separate step, same
-      # reasoning as banto-hub above.
-      - name: Run E2E suite (relay-wright)
-        run: pnpm e2e:relay-wright
 
       - name: Upload Playwright report (chronogazer)
         if: failure()
@@ -250,12 +226,4 @@ jobs:
         with:
           name: playwright-report-banto-hub
           path: e2e/playwright-report-banto-hub/
-          retention-days: 7
-
-      - name: Upload Playwright report (relay-wright)
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: playwright-report-relay-wright
-          path: e2e/playwright-report-relay-wright/
           retention-days: 7

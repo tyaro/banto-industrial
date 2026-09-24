@@ -24,9 +24,12 @@ crates/
   banto-expr/        T6-1: 演算タグの式評価エンジン（tokio/レジストリ非依存、依存は thiserror のみ）実装済み
 apps/
   chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）
-  relay-wright/      W系: 条件付きPLC自動書き込みアプリ（Tauri、W1〜W5 実装済み・実機検証残）安全上の注意は同README参照
   banto-hub/         T系: タグサーバー banto-hub（Tauriなしのヘッドレス axum、REST/WS/MQTT/gRPC でタグ空間を外部公開。T18-6 まで実装済み・試運転モード/ロックダウン対応、残は実機/soak 系のみ）
 ```
+
+W系（条件付きPLC自動書き込みアプリ **relay-wright**）は 2026-09-24 に
+main から外し、タグ `archive/relay-wright-2026-09-24` に退避した（構想の
+練り直し、オーナー決定。docs/plan.md §4b 参照）。
 
 ### `banto-tags`（I1）
 
@@ -207,17 +210,19 @@ docs/plan.md §4）。PLC通信 + タグデータ保存 + リアルタイム/ヒ
 [docs/recorder-requirements.md](docs/recorder-requirements.md)を参照。詳細は
 [apps/chronogazer/README.md](apps/chronogazer/README.md)。
 
-### `apps/relay-wright`（W系）
+### `apps/relay-wright`（W系、2026-09-24 に main から退避）
 
 条件付き PLC 自動書き込みアプリ（Tauri + banto テンプレート由来、
 docs/plan.md §4b）。タグレジストリの読み取り値を条件に、設定ルールに
-従って別の PLC デバイスへ値を自動書き込みする。アーミング（再起動で
-必ず disarmed に戻る）・dry-run・レート制限ブレーカ（トリップで自動
-ディスアーム）・log-before-write・書き込みループのサイクル検出という
-安全機構をエンジン（`apps/relay-wright/core/src/engine/`）に持つ。
-**稼働中の実 PLC へ自動書き込みするアプリ**であるため、導入前に必ず
-[apps/relay-wright/README.md](apps/relay-wright/README.md) の安全上の
-注意を読むこと（下記「ライセンス」節にも要旨あり）。
+従って別の PLC デバイスへ値を自動書き込みする構想だった。アーミング
+（再起動で必ず disarmed に戻る）・dry-run・レート制限ブレーカ（トリップで
+自動ディスアーム）・log-before-write・書き込みループのサイクル検出という
+安全機構をエンジンに持つ設計だったが、**2026-09-17 に凍結、2026-09-24 に
+main から外してタグ `archive/relay-wright-2026-09-24` に退避した**（構想の
+練り直し、オーナー決定）。復元は
+`git checkout archive/relay-wright-2026-09-24 -- apps/relay-wright ...` で
+できる。詳細は docs/plan.md §4b、退避直前の内容は同タグの
+`apps/relay-wright/README.md` を参照。
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
 （2026-07-12 決定。GitHub 組織名 banto が取得不能だったため
@@ -244,7 +249,8 @@ FA-Server 型の独立タグサーバー **banto-hub**（Tauri を使わない�
 MQTT publish / gRPC** の4経路で外部（MES・クラウド・自作画面等）へ公開する。
 書き込みは per-tag opt-in（既定不可）+ API キースコープ + 監査 +
 レート制限ブレーカ付きのパススルーのみ（条件付き自動書き込みは
-relay-wright の専管のまま）。演算タグ・内部タグの一元実装、稼働中の
+banto-hub のスコープ外 - relay-wright が構想していた領域で、同アプリは
+2026-09-24 に main から退避済み）。演算タグ・内部タグの一元実装、稼働中の
 タグ定義変更（オンライン動的変更）にも対応する。
 
 実装状況は **T0〜T18-6 実装済み**（試運転モード・ロックダウン、収集の開始/停止 UI、
@@ -264,9 +270,12 @@ T18-5c/d・T5-5（Windows 実機往復・72h soak 実行 + 実機最終サイン
 
 ### relay-wright（PLC自動書き込み）に関する安全上の注意
 
-`apps/relay-wright` は設定されたルールに基づき **稼働中のPLCへ自動的に
-値を書き込む**アプリケーション。設定ミスや不具合は意図しない機器動作を
-引き起こす可能性がある。MIT ライセンスにより**無保証（AS IS）**で提供
-されるため、安全な導入（実機投入前の検証・アーミング/インターロック/
-非常停止の確保・適用法令の遵守）は利用者の責任で行うこと。
-詳細は [apps/relay-wright/README.md](apps/relay-wright/README.md) を参照。
+`apps/relay-wright` は 2026-09-24 に main から外し、タグ
+`archive/relay-wright-2026-09-24` に退避した（構想の練り直し、オーナー
+決定）。稼働中は設定されたルールに基づき **稼働中のPLCへ自動的に値を
+書き込む**アプリケーションだったため、退避タグから復元して使う場合も、
+設定ミスや不具合が意図しない機器動作を引き起こしうる点、MIT ライセンス
+により**無保証（AS IS）**で提供される点は変わらない。安全な導入（実機
+投入前の検証・アーミング/インターロック/非常停止の確保・適用法令の遵守）
+は利用者の責任で行うこと。詳細は退避タグの
+`apps/relay-wright/README.md` を参照。

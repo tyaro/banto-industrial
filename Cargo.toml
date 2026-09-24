@@ -41,8 +41,6 @@ members = [
     "crates/banto-hub-bootstrap",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
-    "apps/relay-wright/core",
-    "apps/relay-wright/src-tauri",
     "apps/banto-hub/core",
     "apps/banto-hub/src-tauri",
     "apps/banto-hub-sink",
