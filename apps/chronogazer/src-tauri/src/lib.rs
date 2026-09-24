@@ -39,7 +39,7 @@ use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
-    api_router, audited_credential_verifier, plc_connection_audit_detail, update_plc_connection,
+    api_router, plc_connection_audit_detail, update_plc_connection, user_auth_state,
     CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, TagPayload,
 };
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
@@ -71,8 +71,10 @@ struct AppState {
     /// `invoke()`, never through `/api/auth/login`. `Some` means logged in;
     /// carrying the full `UserIdentity` (not just a bool) lets
     /// `auth_change_password` recover the current `username` without a
-    /// second round trip.
-    auth: Mutex<Option<UserIdentity>>,
+    /// second round trip. banto v1.7.0 #204: a [`DesktopSession`], so every
+    /// place that establishes a session states which kind it is, and every
+    /// read goes through [`current_session`].
+    auth: Mutex<Option<DesktopSession>>,
     /// The local credential store (spec §8.2): argon2id-hashed accounts in
     /// the same SQLite settings DB as `settings` below. Shared with
     /// `rest_auth`'s verifier closure so the webview session and the
@@ -182,6 +184,136 @@ fn identity_from(user: &UserIdentity) -> Identity {
     }
 }
 
+/// `UserIdentity.id` shown for the synthetic auth-disabled-mode ("local")
+/// session (spec M11). Display only: whether a session is synthetic is the
+/// [`DesktopSession`] variant, never this value (a `users` row could in
+/// principle be inserted with id 0).
+const LOCAL_SESSION_ID: i64 = 0;
+
+/// The webview session (banto v1.7.0 #204, admin-template の同名の型を写した
+/// もの). An enum rather than a bare `UserIdentity` so there is no way to
+/// establish or read a session without saying whether it belongs to a
+/// `users` account - and therefore how [`current_session`] re-validates it.
+#[derive(Debug, Clone, PartialEq)]
+enum DesktopSession {
+    /// A `users` account (`auth_login`, `auth_setup`, autologin): bound to
+    /// the row's `id` + `auth_epoch` it was established with and
+    /// re-validated against that row on every command.
+    Account(UserIdentity),
+    /// The synthetic identity of auth-disabled mode (spec M11,
+    /// 「認証なしのローカルモード」). There is no account behind it; it is
+    /// valid exactly while auth-disabled mode is ON, with that mode's
+    /// CURRENT role - re-checked on every command too. Turning the mode OFF
+    /// ends it on the next command (the login screen takes over).
+    AuthDisabledLocal(UserIdentity),
+}
+
+impl DesktopSession {
+    fn identity(&self) -> &UserIdentity {
+        match self {
+            Self::Account(identity) | Self::AuthDisabledLocal(identity) => identity,
+        }
+    }
+}
+
+/// The webview session, re-validated on every command (banto v1.7.0 #204,
+/// the Tauri twin of `banto_server::AuthState::authenticate`):
+///
+/// - no session -> `Ok(None)`;
+/// - [`DesktopSession::Account`]: the `users` row is re-read. Account gone,
+///   or a different row id (deleted and re-created under the same username)
+///   or `auth_epoch` (role change, password change/reset - from EITHER
+///   transport) than the session was established with -> the session is
+///   cleared and `Ok(None)`; otherwise the account's CURRENT row (role
+///   included), which is also written back to the cached session;
+/// - [`DesktopSession::AuthDisabledLocal`]: auth-disabled mode is re-read.
+///   Turned off -> cleared and `Ok(None)` (the login screen takes over);
+///   otherwise the synthetic identity with the mode's CURRENT role.
+///
+/// A read failure is `Err` and leaves the session in place (a DB hiccup must
+/// not log the user out), failing the command instead. The decision after
+/// the read is [`settle_session`] (the session may have changed while the
+/// read was in flight). The lock is never held across an `.await`.
+async fn current_session(state: &AppState) -> Result<Option<DesktopSession>, BantoError> {
+    let Some(cached) = state.auth.lock().expect("auth mutex poisoned").clone() else {
+        return Ok(None);
+    };
+    let fresh = read_session_source(state, &cached).await?;
+    Ok(settle_session(state, &cached, fresh))
+}
+
+/// What the store says NOW about the session `cached` stands for: the
+/// `users` row for an account session, or - for the synthetic session - the
+/// synthetic identity with the mode's current role while auth-disabled mode
+/// is on (`None` once it is off).
+async fn read_session_source(
+    state: &AppState,
+    cached: &DesktopSession,
+) -> Result<Option<DesktopSession>, BantoError> {
+    Ok(match cached {
+        DesktopSession::Account(session) => state
+            .users
+            .get_by_username(&session.username)
+            .await?
+            .map(DesktopSession::Account),
+        DesktopSession::AuthDisabledLocal(session) => {
+            let config = state.settings.auth_config().await?;
+            config.disabled.then(|| {
+                DesktopSession::AuthDisabledLocal(UserIdentity {
+                    role: config.disabled_role,
+                    ..session.clone()
+                })
+            })
+        }
+    })
+}
+
+/// Do `a` and `b` carry the same session binding: the same kind and, for an
+/// account, the same row id and `auth_epoch`?
+fn same_binding(a: &DesktopSession, b: &DesktopSession) -> bool {
+    match (a, b) {
+        (DesktopSession::Account(a), DesktopSession::Account(b)) => {
+            a.id == b.id && a.auth_epoch == b.auth_epoch
+        }
+        (DesktopSession::AuthDisabledLocal(_), DesktopSession::AuthDisabledLocal(_)) => true,
+        _ => false,
+    }
+}
+
+/// Decide on `fresh` (read with no lock held) against the session as it is
+/// NOW, under one lock:
+///
+/// - valid iff the CURRENT session's own binding is exactly what `fresh`
+///   reports. Normally the current session is still `cached`; if it was
+///   re-bound meanwhile (`change_own_password` moving it to the epoch its
+///   change wrote), its new binding is what counts. A valid session is
+///   refreshed to `fresh` (current role and name);
+/// - otherwise: if the session is still the one `cached` snapshotted, it is
+///   stale and cleared; if it changed to something else meanwhile (a new
+///   login, ...), it is left for the next command to validate and only this
+///   command fails closed.
+///
+/// This never moves a session to the store's newest epoch on its behalf: a
+/// session that was not itself re-bound still ends.
+fn settle_session(
+    state: &AppState,
+    cached: &DesktopSession,
+    fresh: Option<DesktopSession>,
+) -> Option<DesktopSession> {
+    let mut auth = state.auth.lock().expect("auth mutex poisoned");
+    let unchanged = auth.as_ref() == Some(cached);
+    let valid = match auth.as_ref() {
+        Some(now) => fresh.filter(|fresh| same_binding(now, fresh)),
+        None => None,
+    };
+    if valid.is_some() {
+        *auth = valid.clone();
+    } else if unchanged {
+        *auth = None;
+    }
+    valid
+}
+
 /// Require an active webview session with at least role `min` (spec M10
 /// RBAC), returning the caller's [`UserIdentity`] on success so callers that
 /// also need "which account is this" (e.g. `users_delete`'s self-deletion
@@ -204,12 +336,20 @@ fn identity_from(user: &UserIdentity) -> Identity {
 /// `.await`, since `std::sync::MutexGuard` is `!Send` and holding one across
 /// an await point would make the command's future `!Send` (which `tauri`
 /// requires).
+///
+/// banto v1.7.0 #204: the session is re-validated against the `users` table
+/// first ([`current_session`]) - the role checked (and the identity
+/// returned) is the account's CURRENT one, and a deleted/re-keyed account's
+/// session is ended (`Unauthorized`), exactly like REST's `require_auth` +
+/// `RoleGuard`.
 async fn require_role(
     state: &AppState,
     min: Role,
     resource: &str,
 ) -> Result<UserIdentity, BantoError> {
-    let current = state.auth.lock().expect("auth mutex poisoned").clone();
+    let current = current_session(state)
+        .await?
+        .map(|session| session.identity().clone());
     match current {
         Some(identity) if identity.role.at_least(min) => Ok(identity),
         Some(identity) => {
@@ -280,7 +420,8 @@ async fn auth_setup(
                     result: "ok",
                 })
                 .await;
-            *state.auth.lock().expect("auth mutex poisoned") = Some(identity);
+            *state.auth.lock().expect("auth mutex poisoned") =
+                Some(DesktopSession::Account(identity));
             Ok(LoginResult {
                 success: true,
                 error: None,
@@ -315,7 +456,8 @@ async fn auth_login(
                     result: "ok",
                 })
                 .await;
-            *state.auth.lock().expect("auth mutex poisoned") = Some(identity);
+            *state.auth.lock().expect("auth mutex poisoned") =
+                Some(DesktopSession::Account(identity));
             Ok(LoginResult {
                 success: true,
                 error: None,
@@ -358,9 +500,9 @@ async fn auth_logout(state: State<'_, AppState>) -> Result<(), BantoError> {
     if state.settings.auth_config().await?.disabled {
         return Ok(());
     }
-    let previous = state.auth.lock().expect("auth mutex poisoned").clone();
-    *state.auth.lock().expect("auth mutex poisoned") = None;
-    if let Some(identity) = previous {
+    let previous = state.auth.lock().expect("auth mutex poisoned").take();
+    if let Some(session) = previous {
+        let identity = session.identity();
         state
             .audit
             .record(AuditEntry {
@@ -378,19 +520,23 @@ async fn auth_logout(state: State<'_, AppState>) -> Result<(), BantoError> {
     Ok(())
 }
 
+/// banto v1.7.0 #204: validated like every other command
+/// ([`current_session`]), so a session ended by a change to its account
+/// reports "logged out" here too, not just on the next guarded command. A DB
+/// failure is `Err` (the frontend's `check()` rejects instead of treating it
+/// as logged out - the session is kept).
 #[tauri::command]
-fn auth_check(state: State<'_, AppState>) -> bool {
-    state.auth.lock().expect("auth mutex poisoned").is_some()
+async fn auth_check(state: State<'_, AppState>) -> Result<bool, BantoError> {
+    Ok(current_session(&state).await?.is_some())
 }
 
+/// banto v1.7.0 #204: the CURRENT identity (role/display name as stored now).
 #[tauri::command]
-fn auth_identity(state: State<'_, AppState>) -> Option<Identity> {
-    state
-        .auth
-        .lock()
-        .expect("auth mutex poisoned")
+async fn auth_identity(state: State<'_, AppState>) -> Result<Option<Identity>, BantoError> {
+    Ok(current_session(&state)
+        .await?
         .as_ref()
-        .map(identity_from)
+        .map(|session| identity_from(session.identity())))
 }
 
 /// Body of [`auth_change_password`], split out so the audit-recording
@@ -398,22 +544,37 @@ fn auth_identity(state: State<'_, AppState>) -> Option<Identity> {
 /// own `cargo test` - `tauri::State` cannot be constructed outside a running
 /// tauri app, but it derefs to `&AppState`, so the command below is a
 /// one-line adapter.
+///
+/// banto v1.7.0 #204: the session is validated first ([`current_session`]).
+/// The change advances the account's `auth_epoch`, ending every session of
+/// it (REST tokens on other devices included); this webview session is then
+/// re-bound to the new epoch - it just proved the current password - unless
+/// something else changed the account in between (then it ends too). Same
+/// policy as REST's `/api/auth/change-password`.
 async fn change_own_password(
     state: &AppState,
     current_password: &str,
     new_password: &str,
 ) -> Result<(), BantoError> {
-    let identity = {
-        let guard = state.auth.lock().expect("auth mutex poisoned");
-        match guard.as_ref() {
-            Some(identity) => identity.clone(),
-            None => return Err(BantoError::Unauthorized),
-        }
+    let identity = match current_session(state).await? {
+        Some(DesktopSession::Account(identity)) => identity,
+        // The synthetic auth-disabled session owns no credentials: never let
+        // it change a real account that happens to be named "local".
+        Some(DesktopSession::AuthDisabledLocal(_)) => return Err(BantoError::Forbidden),
+        None => return Err(BantoError::Unauthorized),
     };
-    state
+    let new_epoch = state
         .users
         .change_password(&identity.username, current_password, new_password)
         .await?;
+    if new_epoch == identity.auth_epoch + 1 {
+        let mut auth = state.auth.lock().expect("auth mutex poisoned");
+        if let Some(DesktopSession::Account(session)) = auth.as_mut() {
+            if session.id == identity.id && session.auth_epoch == identity.auth_epoch {
+                session.auth_epoch = new_epoch;
+            }
+        }
+    }
     // Spec M14: a self-service password change is a security event (it is
     // also what naturally invalidates an M11 autologin credential), so it IS
     // audited - actor and entity are both the caller. `detail` stays `None`:
@@ -488,7 +649,13 @@ async fn auth_config_apply(
     // when possible, instead of skipping the escape-hatch path's write
     // entirely.
     let actor = if currently_disabled {
-        state.auth.lock().expect("auth mutex poisoned").clone()
+        // Audit label only (the escape hatch does not authorize by session).
+        state
+            .auth
+            .lock()
+            .expect("auth mutex poisoned")
+            .as_ref()
+            .map(|session| session.identity().clone())
     } else {
         Some(require_role(&state, Role::Admin, "settings").await?)
     };
@@ -1045,8 +1212,20 @@ async fn users_update(
     display_name: String,
     role: Role,
 ) -> Result<UserSummary, BantoError> {
-    let actor = require_role(&state, Role::Admin, "users").await?;
-    let updated = state.users.update_user(id, &display_name, role).await?;
+    users_update_body(&state, id, &display_name, role).await
+}
+
+/// Body of [`users_update`] (a plain `&AppState` so the banto v1.7.0 #204
+/// session-revocation tests can drive the Tauri path end to end - same
+/// split as [`change_own_password`]).
+async fn users_update_body(
+    state: &AppState,
+    id: i64,
+    display_name: &str,
+    role: Role,
+) -> Result<UserSummary, BantoError> {
+    let actor = require_role(state, Role::Admin, "users").await?;
+    let updated = state.users.update_user(id, display_name, role).await?;
     state
         .audit
         .record(AuditEntry {
@@ -1071,8 +1250,17 @@ async fn users_reset_password(
     id: i64,
     new_password: String,
 ) -> Result<(), BantoError> {
-    let actor = require_role(&state, Role::Admin, "users").await?;
-    state.users.reset_password(id, &new_password).await?;
+    users_reset_password_body(&state, id, &new_password).await
+}
+
+/// Body of [`users_reset_password`] (see [`users_update_body`]).
+async fn users_reset_password_body(
+    state: &AppState,
+    id: i64,
+    new_password: &str,
+) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Admin, "users").await?;
+    state.users.reset_password(id, new_password).await?;
     state
         .audit
         .record(AuditEntry {
@@ -1096,7 +1284,12 @@ async fn users_reset_password(
 /// a caller cannot spoof a different acting user.
 #[tauri::command]
 async fn users_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
-    let acting = require_role(&state, Role::Admin, "users").await?;
+    users_delete_body(&state, id).await
+}
+
+/// Body of [`users_delete`] (see [`users_update_body`]).
+async fn users_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let acting = require_role(state, Role::Admin, "users").await?;
     state.users.delete_user(id, acting.id).await?;
     state
         .audit
@@ -2406,8 +2599,10 @@ pub fn run() {
             // `chronogazer_core::rest::audited_credential_verifier`'s doc
             // comment. This is the embedded LAN server's OWN session
             // (`origin: "rest"`) - the webview's session goes through
-            // `auth_login` below instead.
-            let rest_auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+            // `auth_login` below instead. banto v1.7.0 #204: also re-checks
+            // the account on every request (`user_auth_state`), so a change
+            // made from the webview's commands ends LAN sessions too.
+            let rest_auth = user_auth_state(users.clone(), audit.clone());
 
             // Spec M17: record `restore_applied` now that a real
             // `AuditLogService` exists - `apply_pending_restore_at_startup`
@@ -2477,15 +2672,16 @@ pub fn run() {
             //   3. neither - the ordinary login screen (`auth: None`).
             let auth_config = tauri::async_runtime::block_on(settings.auth_config())
                 .expect("auth_config should succeed");
-            let initial_auth: Option<UserIdentity> = if auth_config.disabled {
+            let initial_auth: Option<DesktopSession> = if auth_config.disabled {
                 // `id: 0` is not a real `users` row - nothing here ever looks
                 // it up by id (no change-password/self-deletion flows apply
                 // to a synthetic session), so there is no real row to alias.
                 let local_identity = UserIdentity {
-                    id: 0,
+                    id: LOCAL_SESSION_ID,
                     username: "local".to_string(),
                     display_name: "ローカルユーザー".to_string(),
                     role: auth_config.disabled_role,
+                    auth_epoch: 0,
                 };
                 // Spec M14: auth-disabled mode still records a `login` for
                 // its synthetic session, same as a normal login would - it
@@ -2501,7 +2697,7 @@ pub fn run() {
                     origin: "tauri",
                     result: "ok",
                 }));
-                Some(local_identity)
+                Some(DesktopSession::AuthDisabledLocal(local_identity))
             } else if auth_config.autologin_enabled {
                 match &auth_config.autologin_username {
                     Some(username) => match keyring_store::get_password(username) {
@@ -2519,7 +2715,7 @@ pub fn run() {
                                         origin: "tauri",
                                         result: "ok",
                                     }));
-                                    Some(identity)
+                                    Some(DesktopSession::Account(identity))
                                 }
                                 Ok(None) => {
                                     // Credentials no longer valid (e.g. the
@@ -2884,6 +3080,14 @@ mod tests {
         let pool = chronogazer_core::db::init_db_memory()
             .await
             .expect("init_db_memory");
+        app_state_on(pool).await
+    }
+
+    /// [`app_state`] over a given pool. banto v1.7.0 #204: several
+    /// `AppState`s on ONE pool stand for several desktop windows/processes
+    /// sharing the same `users` table (each with its own webview session and
+    /// its own REST token space).
+    async fn app_state_on(pool: chronogazer_core::db::DbPool) -> AppState {
         let events = event_channel();
         let settings = SettingsService::new(pool.clone());
         // #332: tests never touch a real OS keyring - `UnavailableKeyStore`
@@ -2900,9 +3104,13 @@ mod tests {
             users: UsersService::new(pool.clone()),
             settings,
             events,
-            rest_auth: AuthState::new(|_u: String, _p: String| {
-                Box::pin(async { None::<banto_server::Identity> })
-            }),
+            // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
+            // Tauri のセッションが同じアカウントの変更で終わることを、
+            // 両経路をまたいで確かめるテストが使う。
+            rest_auth: chronogazer_core::rest::user_auth_state(
+                UsersService::new(pool.clone()),
+                AuditLogService::new(pool.clone()),
+            ),
             server: AsyncMutex::new(None),
             audit: AuditLogService::new(pool.clone()),
             backup: BackupService::new(
@@ -2954,9 +3162,13 @@ mod tests {
             users: UsersService::new(pool.clone()),
             settings,
             events,
-            rest_auth: AuthState::new(|_u: String, _p: String| {
-                Box::pin(async { None::<banto_server::Identity> })
-            }),
+            // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
+            // Tauri のセッションが同じアカウントの変更で終わることを、
+            // 両経路をまたいで確かめるテストが使う。
+            rest_auth: chronogazer_core::rest::user_auth_state(
+                UsersService::new(pool.clone()),
+                AuditLogService::new(pool.clone()),
+            ),
             server: AsyncMutex::new(None),
             audit: AuditLogService::new(pool.clone()),
             backup: BackupService::new(db_path, pool.clone()),
@@ -3013,7 +3225,7 @@ mod tests {
             .await
             .expect("setup_first_user");
         let owner_id = owner.id;
-        *state.auth.lock().expect("auth mutex poisoned") = Some(owner);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(owner));
 
         change_own_password(&state, "password123", "newpassword1")
             .await
@@ -3051,7 +3263,7 @@ mod tests {
             .setup_first_user("owner", "password123", "オーナー")
             .await
             .expect("setup_first_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(owner);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(owner));
 
         change_own_password(&state, "not-the-password", "newpassword1")
             .await
@@ -3081,7 +3293,7 @@ mod tests {
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(admin));
 
         let info = backups_create_body(&state)
             .await
@@ -3120,7 +3332,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
 
         let err = backups_create_body(&state).await.unwrap_err();
         assert!(matches!(err, BantoError::Forbidden));
@@ -3139,7 +3351,7 @@ mod tests {
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(admin));
 
         let info = backups_create_body(&state).await.expect("create");
         assert!(state.backup.pending_restore().await.is_none());
@@ -3202,7 +3414,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
 
         let err = require_hub_admin(&state)
             .await
@@ -3242,7 +3454,7 @@ mod tests {
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(admin));
 
         require_hub_admin(&state)
             .await
@@ -3297,7 +3509,7 @@ mod tests {
             .await
             .expect("create_user");
 
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
         // **viewer は状態を読める**（R0 §3.6 の「閲覧のみ」は「何も見えない」
         // ではない）。
         assert_eq!(
@@ -3347,7 +3559,7 @@ mod tests {
             .await
             .expect("get_by_username")
             .expect("editor exists");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
         require_collect_editor(&state)
             .await
             .expect("an editor must pass the collect operation guard");
@@ -3369,7 +3581,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
 
         let outcome = collect_start_body(&state)
             .await
@@ -3506,7 +3718,7 @@ mod tests {
             .expect("create_user");
 
         // 起動した本人（editor）には、エラーとして理由が届く。
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
         let err = collect_start_body(&state)
             .await
             .expect_err("前提が崩れている: 起動が失敗していない");
@@ -3517,7 +3729,7 @@ mod tests {
         );
 
         // viewer が状態を読む: 状態そのものは返るが、理由は返らない。
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
         let view = collect_status_body(&state)
             .await
             .expect("viewer は状態を読めること");
@@ -3581,7 +3793,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
 
         // viewer は 3 本とも読める。走っていないときの答えは
         // 「走っていない」であって「0 件」ではない。
@@ -3654,7 +3866,7 @@ mod tests {
             .await
             .expect("create_user");
 
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
         let created = plc_connections_create_body(&state, sim_payload("sim-plc", Some(true)))
             .await
             .expect("editor は作れる");
@@ -3731,7 +3943,7 @@ mod tests {
             ]
         );
 
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
         let denied =
             plc_connections_update_body(&state, created.id, sim_payload("renamed", Some(true)))
                 .await;
@@ -3770,7 +3982,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
         assert_eq!(
             config_exclusions_list_body(&state)
                 .await
@@ -3835,7 +4047,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
 
         let modbus = state
             .plc_connections
@@ -3920,7 +4132,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
 
         let mut ids = Vec::new();
         for (name, protocol) in [
@@ -4005,7 +4217,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
 
         let conn = state
             .plc_connections
@@ -4061,5 +4273,458 @@ mod tests {
             .expect_err("アドレスを直さない再有効化が通った");
         assert_eq!(only_field_error(err).field, "address");
         assert!(!state.tags.get(legacy.id).await.unwrap().enabled);
+    }
+
+    // --- banto v1.7.0 #204: session revocation (Tauri + REST) ---------------
+
+    /// What was changed about the target account.
+    #[derive(Debug, Clone, Copy)]
+    enum AccountChange {
+        Delete,
+        Demote,
+        PasswordChange,
+        PasswordReset,
+    }
+
+    /// Which transport made the change.
+    #[derive(Debug, Clone, Copy)]
+    enum Via {
+        Tauri,
+        Rest,
+    }
+
+    /// Everyone's sessions before the change. `admin`'s `rest_auth` is "the
+    /// LAN server" every REST token below lives in; the other `AppState`s
+    /// stand for other desktop windows/processes on the same DB.
+    struct Sessions {
+        admin: AppState,
+        /// The target's desktop session that makes its own password change
+        /// (`Via::Tauri` + `PasswordChange`); an ordinary target session
+        /// otherwise.
+        alice: AppState,
+        /// Another desktop session of the target ("別の端末").
+        alice_other: AppState,
+        /// A bystander's desktop session.
+        bob: AppState,
+        router: axum::Router,
+        admin_rest: String,
+        alice_rest: String,
+        alice_rest_remember: String,
+        /// The target's REST session that makes its own password change
+        /// (`Via::Rest` + `PasswordChange`); an ordinary one otherwise.
+        alice_self_rest: String,
+        bob_rest: String,
+        alice_id: i64,
+        _pool: chronogazer_core::db::DbPool,
+    }
+
+    async fn desktop_login(pool: &chronogazer_core::db::DbPool, username: &str) -> AppState {
+        let state = app_state_on(pool.clone()).await;
+        let identity = state
+            .users
+            .verify(username, "password123")
+            .await
+            .unwrap()
+            .expect("verify");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(identity));
+        state
+    }
+
+    async fn rest_login(auth: &AuthState, username: &str, remember: bool) -> String {
+        match auth
+            .login_rate_limited(None, username, "password123", remember)
+            .await
+        {
+            banto_server::LoginOutcome::Success(token) => token,
+            other => panic!("REST login for {username} failed: {other:?}"),
+        }
+    }
+
+    fn router_for(state: &AppState) -> axum::Router {
+        chronogazer_core::rest::api_router(
+            state.users.clone(),
+            state.settings.clone(),
+            state.audit.clone(),
+            state.backup.clone(),
+            state.hub.clone(),
+            state.plc_connections.clone(),
+            state.collection_groups.clone(),
+            state.tags.clone(),
+            state.collect.clone(),
+            state.rest_auth.clone(),
+            state.events.clone(),
+            false,
+        )
+    }
+
+    fn rest_request(
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let builder = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("X-Banto-Client", "banto")
+            .header("Authorization", format!("Bearer {token}"));
+        match body {
+            Some(body) => builder
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+            None => builder.body(axum::body::Body::empty()).unwrap(),
+        }
+    }
+
+    async fn rest_status(
+        router: &axum::Router,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        router.clone().oneshot(request).await.unwrap().status()
+    }
+
+    /// A protected route any role may read (viewer+).
+    async fn rest_can_read(router: &axum::Router, token: &str) -> axum::http::StatusCode {
+        rest_status(router, rest_request("GET", "/api/tags", token, None)).await
+    }
+
+    async fn sessions() -> Sessions {
+        let pool = chronogazer_core::db::init_db_memory()
+            .await
+            .expect("init_db_memory");
+        let users = UsersService::new(pool.clone());
+        users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .unwrap();
+        let alice = users
+            .create_user("alice", "password123", "Alice", Role::Editor)
+            .await
+            .unwrap();
+        users
+            .create_user("bob", "password123", "Bob", Role::Editor)
+            .await
+            .unwrap();
+
+        let admin = desktop_login(&pool, "admin").await;
+        let router = router_for(&admin);
+        let admin_rest = rest_login(&admin.rest_auth, "admin", false).await;
+        let alice_rest = rest_login(&admin.rest_auth, "alice", false).await;
+        let alice_rest_remember = rest_login(&admin.rest_auth, "alice", true).await;
+        let alice_self_rest = rest_login(&admin.rest_auth, "alice", false).await;
+        let bob_rest = rest_login(&admin.rest_auth, "bob", true).await;
+        Sessions {
+            alice: desktop_login(&pool, "alice").await,
+            alice_other: desktop_login(&pool, "alice").await,
+            bob: desktop_login(&pool, "bob").await,
+            admin,
+            router,
+            admin_rest,
+            alice_rest,
+            alice_rest_remember,
+            alice_self_rest,
+            bob_rest,
+            alice_id: alice.id,
+            _pool: pool,
+        }
+    }
+
+    async fn apply_change(s: &Sessions, change: AccountChange, via: Via) {
+        let id = s.alice_id;
+        match (change, via) {
+            (AccountChange::Delete, Via::Tauri) => {
+                users_delete_body(&s.admin, id).await.unwrap();
+            }
+            (AccountChange::Demote, Via::Tauri) => {
+                users_update_body(&s.admin, id, "Alice", Role::Viewer)
+                    .await
+                    .unwrap();
+            }
+            (AccountChange::PasswordReset, Via::Tauri) => {
+                users_reset_password_body(&s.admin, id, "reset-password1")
+                    .await
+                    .unwrap();
+            }
+            (AccountChange::PasswordChange, Via::Tauri) => {
+                change_own_password(&s.alice, "password123", "changed-password1")
+                    .await
+                    .unwrap();
+            }
+            (AccountChange::Delete, Via::Rest) => {
+                let status = rest_status(
+                    &s.router,
+                    rest_request("DELETE", &format!("/api/users/{id}"), &s.admin_rest, None),
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+            }
+            (AccountChange::Demote, Via::Rest) => {
+                let status = rest_status(
+                    &s.router,
+                    rest_request(
+                        "PUT",
+                        &format!("/api/users/{id}"),
+                        &s.admin_rest,
+                        Some(serde_json::json!({ "displayName": "Alice", "role": "viewer" })),
+                    ),
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+            }
+            (AccountChange::PasswordReset, Via::Rest) => {
+                let status = rest_status(
+                    &s.router,
+                    rest_request(
+                        "POST",
+                        &format!("/api/users/{id}/reset-password"),
+                        &s.admin_rest,
+                        Some(serde_json::json!({ "newPassword": "reset-password1" })),
+                    ),
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+            }
+            (AccountChange::PasswordChange, Via::Rest) => {
+                let status = rest_status(
+                    &s.router,
+                    rest_request(
+                        "POST",
+                        "/api/auth/change-password",
+                        &s.alice_self_rest,
+                        Some(serde_json::json!({
+                            "currentPassword": "password123",
+                            "newPassword": "changed-password1",
+                        })),
+                    ),
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+            }
+        }
+    }
+
+    /// Is the desktop session still accepted by a protected command?
+    async fn desktop_allowed(state: &AppState) -> Result<(), BantoError> {
+        require_role(state, Role::Viewer, "test").await.map(|_| ())
+    }
+
+    /// banto v1.7.0 #204 completion table: for each change (delete, demote,
+    /// password change, password reset) made over EACH transport, every
+    /// session the target held elsewhere - a normal REST token, a
+    /// "Remember me" REST token, and other desktop sessions - is refused by
+    /// protected routes/commands, while the bystander's and the acting
+    /// admin's sessions are untouched, and the session that changed its OWN
+    /// password keeps working.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_changes_end_the_accounts_other_sessions_on_both_transports() {
+        use axum::http::StatusCode;
+        for change in [
+            AccountChange::Delete,
+            AccountChange::Demote,
+            AccountChange::PasswordChange,
+            AccountChange::PasswordReset,
+        ] {
+            for via in [Via::Tauri, Via::Rest] {
+                let case = format!("{change:?} via {via:?}");
+                let s = sessions().await;
+                // Precondition: every session works before the change.
+                for token in [
+                    &s.alice_rest,
+                    &s.alice_rest_remember,
+                    &s.alice_self_rest,
+                    &s.bob_rest,
+                ] {
+                    assert_eq!(
+                        rest_can_read(&s.router, token).await,
+                        StatusCode::OK,
+                        "{case}"
+                    );
+                }
+                desktop_allowed(&s.alice).await.unwrap();
+                desktop_allowed(&s.alice_other).await.unwrap();
+
+                apply_change(&s, change, via).await;
+
+                let self_change = matches!(change, AccountChange::PasswordChange);
+                // The target's other sessions end - REST (normal and
+                // Remember me) and desktop.
+                assert_eq!(
+                    rest_can_read(&s.router, &s.alice_rest).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{case}: normal REST session"
+                );
+                assert_eq!(
+                    rest_can_read(&s.router, &s.alice_rest_remember).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{case}: Remember me REST session"
+                );
+                assert!(
+                    matches!(
+                        desktop_allowed(&s.alice_other).await,
+                        Err(BantoError::Unauthorized)
+                    ),
+                    "{case}: other desktop session"
+                );
+                assert!(
+                    s.alice_other.auth.lock().unwrap().is_none(),
+                    "{case}: the ended desktop session is cleared"
+                );
+                // The session that changed its own password stays; for every
+                // other change the target's sessions all end.
+                let alice_self_rest = rest_can_read(&s.router, &s.alice_self_rest).await;
+                let alice_desktop = desktop_allowed(&s.alice).await;
+                match (change, via) {
+                    (AccountChange::PasswordChange, Via::Rest) => {
+                        assert_eq!(alice_self_rest, StatusCode::OK, "{case}: changer (REST)");
+                        assert!(
+                            matches!(alice_desktop, Err(BantoError::Unauthorized)),
+                            "{case}"
+                        );
+                    }
+                    (AccountChange::PasswordChange, Via::Tauri) => {
+                        assert!(alice_desktop.is_ok(), "{case}: changer (desktop)");
+                        assert_eq!(alice_self_rest, StatusCode::UNAUTHORIZED, "{case}");
+                    }
+                    _ => {
+                        assert!(!self_change);
+                        assert_eq!(alice_self_rest, StatusCode::UNAUTHORIZED, "{case}");
+                        assert!(
+                            matches!(alice_desktop, Err(BantoError::Unauthorized)),
+                            "{case}"
+                        );
+                    }
+                }
+                // Untouched accounts keep their sessions.
+                assert_eq!(
+                    rest_can_read(&s.router, &s.bob_rest).await,
+                    StatusCode::OK,
+                    "{case}: bystander REST"
+                );
+                desktop_allowed(&s.bob)
+                    .await
+                    .unwrap_or_else(|err| panic!("{case}: bystander desktop: {err:?}"));
+                assert_eq!(
+                    rest_status(
+                        &s.router,
+                        rest_request("GET", "/api/users", &s.admin_rest, None)
+                    )
+                    .await,
+                    StatusCode::OK,
+                    "{case}: acting admin REST"
+                );
+                require_role(&s.admin, Role::Admin, "test")
+                    .await
+                    .unwrap_or_else(|err| panic!("{case}: acting admin desktop: {err:?}"));
+            }
+        }
+    }
+
+    /// #204: a demoted account that logs in again is authorized with its NEW
+    /// role (the re-read row), on both transports - the fresh session is not
+    /// ended, and an admin-only command/route is now refused as `Forbidden`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_session_after_a_demotion_uses_the_new_role() {
+        let s = sessions().await;
+        apply_change(&s, AccountChange::Demote, Via::Tauri).await;
+        let again = desktop_login(&s._pool, "alice").await;
+        assert_eq!(
+            require_role(&again, Role::Viewer, "test")
+                .await
+                .unwrap()
+                .role,
+            Role::Viewer
+        );
+        assert!(matches!(
+            require_role(&again, Role::Editor, "test").await,
+            Err(BantoError::Forbidden)
+        ));
+        let token = rest_login(&s.admin.rest_auth, "alice", false).await;
+        assert_eq!(
+            rest_can_read(&s.router, &token).await,
+            axum::http::StatusCode::OK
+        );
+    }
+
+    /// #204: when the DB cannot answer the re-check, the command fails but
+    /// the session is KEPT (a DB hiccup must not log anyone out), on both
+    /// transports; it works again once the DB answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_recheck_fails_the_request_but_keeps_the_session() {
+        let s = sessions().await;
+        sqlx_rename_users(&s._pool, "users", "users_away").await;
+
+        let err = desktop_allowed(&s.alice).await.expect_err("DB is gone");
+        assert!(
+            !matches!(err, BantoError::Unauthorized),
+            "a DB failure is not 'logged out': {err:?}"
+        );
+        assert!(s.alice.auth.lock().unwrap().is_some(), "session kept");
+        assert!(
+            s.admin.rest_auth.authenticate(&s.alice_rest).await.is_err(),
+            "REST re-check fails too"
+        );
+        assert_eq!(
+            rest_can_read(&s.router, &s.alice_rest).await,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        sqlx_rename_users(&s._pool, "users_away", "users").await;
+        desktop_allowed(&s.alice).await.expect("session resumes");
+        assert_eq!(
+            rest_can_read(&s.router, &s.alice_rest).await,
+            axum::http::StatusCode::OK
+        );
+    }
+
+    /// Make the `users` table unreadable (and readable again) - the
+    /// simplest way to have the account store fail the re-check.
+    async fn sqlx_rename_users(pool: &chronogazer_core::db::DbPool, from: &str, to: &str) {
+        let sql = match (from, to) {
+            ("users", "users_away") => "ALTER TABLE users RENAME TO users_away",
+            ("users_away", "users") => "ALTER TABLE users_away RENAME TO users",
+            _ => unreachable!(),
+        };
+        sqlx::query(sql).execute(pool).await.unwrap();
+    }
+
+    /// #204 + spec M11: the auth-disabled-mode ("認証なしのローカルモード")
+    /// synthetic session is valid only while the mode is ON. Turning it OFF
+    /// ends the session on the next command (the login screen takes over),
+    /// and the synthetic session can never change a real account's password.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_auth_disabled_session_ends_when_the_mode_is_turned_off() {
+        let state = app_state().await;
+        let mut config = state.settings.auth_config().await.unwrap();
+        config.disabled = true;
+        config.disabled_role = Role::Editor;
+        state.settings.set_auth_config(&config).await.unwrap();
+        *state.auth.lock().unwrap() = Some(DesktopSession::AuthDisabledLocal(UserIdentity {
+            id: LOCAL_SESSION_ID,
+            username: "local".to_string(),
+            display_name: "ローカルユーザー".to_string(),
+            role: Role::Editor,
+            auth_epoch: 0,
+        }));
+        assert_eq!(
+            require_role(&state, Role::Editor, "test")
+                .await
+                .unwrap()
+                .role,
+            Role::Editor
+        );
+        assert!(matches!(
+            change_own_password(&state, "x", "new-password1").await,
+            Err(BantoError::Forbidden)
+        ));
+
+        config.disabled = false;
+        state.settings.set_auth_config(&config).await.unwrap();
+        assert!(matches!(
+            require_role(&state, Role::Viewer, "test").await,
+            Err(BantoError::Unauthorized)
+        ));
+        assert!(state.auth.lock().unwrap().is_none(), "session cleared");
     }
 }

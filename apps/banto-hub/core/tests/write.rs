@@ -17,6 +17,8 @@
 //! 3. レート制限（タグ毎・全体）
 //! 4. log-before-write（成功/失敗）
 
+use banto_hub_core::rest::user_session_lookup;
+use banto_server::SessionValidation;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,19 +199,23 @@ async fn test_app(label: &str) -> TestApp {
         .expect("setup_first_user");
 
     let verify_users = users.clone();
-    let auth = AuthState::new(move |u: String, p: String| {
-        let users = verify_users.clone();
-        Box::pin(async move {
-            match users.verify(&u, &p).await {
-                Ok(Some(identity)) => Some(Identity {
-                    id: identity.username,
-                    name: identity.display_name,
-                    role: identity.role.to_string(),
-                }),
-                _ => None,
-            }
-        })
-    });
+    let verify_users_lookup = users.clone();
+    let auth = AuthState::new(
+        move |u: String, p: String| {
+            let users = verify_users.clone();
+            Box::pin(async move {
+                match users.verify(&u, &p).await {
+                    Ok(Some(identity)) => Some(Identity {
+                        id: identity.username,
+                        name: identity.display_name,
+                        role: identity.role.to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+        },
+        SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
+    );
     let admin_token = auth
         .login("admin", "password123")
         .await
@@ -1578,16 +1584,25 @@ async fn rest_enable_disable_round_trip_and_reflects_in_status() {
 
 /// #340 レビュー対応（2026-09-14）: `enabled_persisted` が次回起動時の
 /// ライブ値そのものになったため、enable は永続化に成功したときだけ
-/// ライブフラグを立てる。DB プールを閉じて `persist_enabled` を強制失敗
-/// させ、500 `write_control_persist_failed` を返しつつライブフラグは
-/// disabled のままであることを確認する（ハンドラが panic しないことも
-/// 同時に確認する - 監査書き込みも同じ理由で失敗するため）。
+/// ライブフラグを立てる。`persist_enabled` を強制失敗させ、500
+/// `write_control_persist_failed` を返しつつライブフラグは disabled の
+/// ままであることを確認する（ハンドラが panic しないことも同時に確認する）。
+///
+/// banto v1.7.0 #204 以降、管理 REST のセッションも**要求ごとに DB
+/// （`users`）と照合する**ため、以前のように pool を丸ごと閉じると、
+/// ハンドラに届く前に認証の照合が失敗する（500、セッションは残す）。MCP 版
+/// （`tests/mcp.rs`）と同じく `write_control_state` テーブルだけを drop し、
+/// `users`（→認証）と `audit_log`（→監査）は生かしたまま `persist_enabled`
+/// の UPDATE だけを失敗させる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rest_enable_returns_500_and_stays_disabled_when_persistence_fails() {
     let app = test_app("write-control-persist-fail-enable").await;
     assert!(!app.write_control.is_enabled());
 
-    app.pool.close().await;
+    sqlx::query("DROP TABLE write_control_state")
+        .execute(&app.pool)
+        .await
+        .expect("drop write_control_state");
 
     let (status, body) =
         admin_post_empty(&app.router, "/api/write-control/enable", &app.admin_token).await;
@@ -1602,14 +1617,18 @@ async fn rest_enable_returns_500_and_stays_disabled_when_persistence_fails() {
 /// #340 レビュー対応（2026-09-14）: disable（非常停止）はライブフラグを
 /// 先に落とすため、永続化が失敗しても書き込みは止まったままになる -
 /// 500 `write_control_persist_failed` を返しつつライブフラグは disabled
-/// （止まっている）ことを確認する。
+/// （止まっている）ことを確認する。上のテストと同じ理由（#204 の要求ごとの
+/// 照合）で、pool を閉じずに `write_control_state` だけを drop する。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rest_disable_returns_500_but_stays_disabled_when_persistence_fails() {
     let app = test_app("write-control-persist-fail-disable").await;
     app.write_control.enable();
     assert!(app.write_control.is_enabled());
 
-    app.pool.close().await;
+    sqlx::query("DROP TABLE write_control_state")
+        .execute(&app.pool)
+        .await
+        .expect("drop write_control_state");
 
     let (status, body) =
         admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;

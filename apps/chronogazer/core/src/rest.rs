@@ -175,7 +175,7 @@ use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
-    Identity, ServerEvent,
+    Identity, ServerEvent, SessionAccount, SessionStamp, SessionValidation,
 };
 use banto_tags::{
     CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
@@ -647,12 +647,12 @@ async fn auth_setup_handler(
         .setup_first_user(&body.username, &body.password, &body.display_name)
         .await
     {
-        Ok(identity) => {
-            let identity = Identity {
-                id: identity.username,
-                name: identity.display_name,
-                role: identity.role.to_string(),
-            };
+        Ok(user) => {
+            // banto v1.7.0 #204: 新しいアカウントの `(id, auth_epoch)` に結び
+            // 付けて発行する。`issue_token`（世代なし）は `Lookup` 付きの
+            // `AuthState` では最初の要求で拒否される。
+            let account = session_account(&user);
+            let identity = account.identity.clone();
             state
                 .audit
                 .record(AuditEntry {
@@ -666,7 +666,7 @@ async fn auth_setup_handler(
                     result: "ok",
                 })
                 .await;
-            let token = state.auth.issue_token(identity);
+            let token = state.auth.issue_account_token(account, false);
             Ok(Json(SetupResponse {
                 success: true,
                 error: None,
@@ -713,15 +713,31 @@ async fn auth_change_password_handler(
     headers: HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<Json<ChangePasswordResponse>, ApiError> {
-    let identity = bearer_token(&headers).and_then(|token| state.auth.identity_for(token));
-    let Some(identity) = identity else {
+    // banto v1.7.0 #204: `require_auth` の外なので、`identity_for`（メモリ上の
+    // 値だけ）ではなく `authenticate` でアカウントと照合する。削除・世代の
+    // 変わったアカウントのセッションは 401（パスワード変更に進ませない）。
+    let Some(token) = bearer_token(&headers) else {
         return Err(ApiError(BantoError::Unauthorized));
     };
+    let Some(session) = state.auth.authenticate(token).await? else {
+        return Err(ApiError(BantoError::Unauthorized));
+    };
+    let identity = session.identity;
 
-    state
+    let new_epoch = state
         .users
         .change_password(&identity.id, &body.current_password, &body.new_password)
         .await?;
+    // 変更で世代が進み、このアカウントのセッション（他の端末・Tauri・
+    // Remember me）はすべて終わる。現在のパスワードを示したこのトークンだけ
+    // 新しい世代へ付け替える - ただし照合してからの変更がこの 1 回だけの
+    // とき（あいだにロール変更などが挟まったら、他と同じく終わらせる）。
+    // 付け替えに失敗（その間に失効）しても、変更自体は成功している。
+    if let Some(stamp) = session.stamp {
+        if new_epoch == stamp.auth_epoch + 1 {
+            state.auth.rotate_session_epoch(token, stamp, new_epoch);
+        }
+    }
     // Spec M14: a self-service password change is a security event (it is
     // also what naturally invalidates an M11 autologin credential), so it IS
     // audited - `entity_id` is the caller's own numeric row id (matching the
@@ -904,6 +920,64 @@ pub fn audited_credential_verifier(
             }
         })
     }
+}
+
+/// banto v1.7.0 #204: `UserIdentity` -> セッションが結び付く `Identity` +
+/// [`SessionStamp`]（`Identity.id` はユーザー名 - `banto_server::Identity` の
+/// doc comment の規約）。セットアップ直後のログイン（`issue_account_token`）と
+/// [`user_session_lookup`] の両方が使う。
+pub(crate) fn session_account(user: &UserIdentity) -> SessionAccount {
+    SessionAccount {
+        identity: Identity {
+            id: user.username.clone(),
+            name: user.display_name.clone(),
+            role: user.role.to_string(),
+        },
+        stamp: SessionStamp {
+            account_id: user.id,
+            auth_epoch: user.auth_epoch,
+        },
+    }
+}
+
+/// banto v1.7.0 #204: 要求のたびにアカウントを読み直す `SessionLookup`。
+/// ユーザー名で `users` を引き、無ければ `Ok(None)`（セッションは失効）、DB が
+/// 答えられなければ `Err`（その要求は失敗、セッションは残す）。
+/// `UsersService::verify` はユーザー名を正規化しない（入力のまま照合する）
+/// ので、ここも入力のまま引く - ログイン時は入力どおりのユーザー名で呼ばれ、
+/// `verify` と同じアカウントを返すことが条件になる（`SessionValidation::Lookup`
+/// の doc comment）。
+pub fn user_session_lookup(
+    users: UsersService,
+) -> impl Fn(
+    String,
+) -> futures_util::future::BoxFuture<'static, Result<Option<SessionAccount>, BantoError>>
+       + Send
+       + Sync
+       + 'static {
+    move |username: String| {
+        let users = users.clone();
+        Box::pin(async move {
+            Ok(users
+                .get_by_username(&username)
+                .await?
+                .map(|user| session_account(&user)))
+        })
+    }
+}
+
+/// banto v1.7.0 #204: 実アカウント用の REST `AuthState`。ログインは
+/// [`audited_credential_verifier`]、要求ごとの照合は [`user_session_lookup`]
+/// （`SessionValidation::Lookup`）。削除・降格・パスワード変更/リセットで、
+/// そのアカウントのセッション（他の端末・Remember me を含む）は次の要求で
+/// 401 になる。本番の `AuthState` はすべてここで作り、照合の付け忘れを防ぐ
+/// （`SessionValidation::DisabledNoRevocation` は固定の検証関数を使うテスト
+/// 専用）。
+pub fn user_auth_state(users: UsersService, audit: AuditLogService) -> AuthState {
+    AuthState::new(
+        audited_credential_verifier(users.clone(), audit),
+        SessionValidation::lookup(user_session_lookup(users)),
+    )
 }
 
 /// State for [`audit_logout_middleware`]: needs `AuthState` to resolve the
@@ -2605,20 +2679,26 @@ mod tests {
         )
     }
 
+    /// 固定の検証関数（アカウントの保存先が無い）なので、照合なし
+    /// （`SessionValidation::DisabledNoRevocation`、banto v1.7.0 #204 の
+    /// 「テストで固定の検証関数を使う箇所」）。
     fn demo_auth() -> AuthState {
-        AuthState::new(|u: String, p: String| {
-            Box::pin(async move {
-                if u == "admin" && p == "admin" {
-                    Some(Identity {
-                        id: "admin".to_string(),
-                        name: "管理者".to_string(),
-                        role: "admin".to_string(),
-                    })
-                } else {
-                    None
-                }
-            })
-        })
+        AuthState::new(
+            |u: String, p: String| {
+                Box::pin(async move {
+                    if u == "admin" && p == "admin" {
+                        Some(Identity {
+                            id: "admin".to_string(),
+                            name: "管理者".to_string(),
+                            role: "admin".to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+            },
+            SessionValidation::DisabledNoRevocation,
+        )
     }
 
     /// Router + one bearer token per role (admin/editor/viewer), for the
@@ -2663,19 +2743,24 @@ mod tests {
             .expect("create viewer");
 
         let verify_users = users.clone();
-        let auth = AuthState::new(move |u: String, p: String| {
-            let users = verify_users.clone();
-            Box::pin(async move {
-                match users.verify(&u, &p).await {
-                    Ok(Some(identity)) => Some(Identity {
-                        id: identity.username,
-                        name: identity.display_name,
-                        role: identity.role.to_string(),
-                    }),
-                    _ => None,
-                }
-            })
-        });
+        // banto v1.7.0 #204: 実アカウントなので本番と同じ照合を入れる。
+        // 検証関数は監査を記録しない版のまま（既存テストの監査件数を変えない）。
+        let auth = AuthState::new(
+            move |u: String, p: String| {
+                let users = verify_users.clone();
+                Box::pin(async move {
+                    match users.verify(&u, &p).await {
+                        Ok(Some(identity)) => Some(Identity {
+                            id: identity.username,
+                            name: identity.display_name,
+                            role: identity.role.to_string(),
+                        }),
+                        _ => None,
+                    }
+                })
+            },
+            SessionValidation::lookup(user_session_lookup(users.clone())),
+        );
 
         let admin_token = auth
             .login("admin", "password123")
@@ -3041,7 +3126,7 @@ mod tests {
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(pool);
-        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let auth = user_auth_state(users.clone(), audit.clone());
         let hub = test_hub_service(settings.clone()).await;
         (
             api_router(
@@ -3548,7 +3633,7 @@ mod tests {
             .await
             .expect("create viewer");
 
-        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let auth = user_auth_state(users.clone(), audit.clone());
         let admin_token = auth
             .login("admin", "password123")
             .await
@@ -3642,7 +3727,7 @@ mod tests {
             .await
             .expect("create viewer");
 
-        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let auth = user_auth_state(users.clone(), audit.clone());
         let admin_token = auth
             .login("admin", "password123")
             .await
@@ -5994,5 +6079,42 @@ mod tests {
             .map(|row| row["id"].as_i64().unwrap())
             .collect();
         assert_eq!(ids, vec![2, 1], "境界の後の行が混ざった: {body}");
+    }
+
+    /// banto v1.7.0 #204: the first account's session from `POST
+    /// /api/auth/setup` is bound to the new account (`issue_account_token`),
+    /// so the production `AuthState` (`user_auth_state`, with the per-request
+    /// lookup) accepts it - an unstamped `issue_token` would be refused on
+    /// its first use. The revocation table itself (delete/demote/password
+    /// change/reset over REST and Tauri) lives in `src-tauri`'s tests, which
+    /// drive this module's `api_router` too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_setup_session_is_bound_to_the_new_account() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let users = UsersService::new(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+        let auth = user_auth_state(users.clone(), audit.clone());
+        let router = extra_auth_router(users, auth.clone(), audit, true);
+        let response = router
+            .oneshot(post_json(
+                "/api/auth/setup",
+                json!({
+                    "username": "owner",
+                    "password": "password123",
+                    "displayName": "Owner",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let token = body["token"].as_str().expect("setup token");
+        let session = auth
+            .authenticate(token)
+            .await
+            .unwrap()
+            .expect("the setup session is accepted");
+        assert_eq!(session.identity.id, "owner");
+        assert_eq!(session.identity.role, "admin");
     }
 }

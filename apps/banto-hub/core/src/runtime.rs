@@ -143,7 +143,7 @@ use std::time::Duration;
 
 use banto_collect::{CollectorOptions, Quality, RegistrySnapshot};
 use banto_core::BantoError;
-use banto_server::{lan_urls, start, static_router, AuthState, RunningServer, ServerConfig};
+use banto_server::{lan_urls, start, static_router, RunningServer, ServerConfig};
 use banto_tags::{
     CollectionGroupService, PlcConnectionInput, PlcConnectionService, TagService,
     CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
@@ -173,7 +173,7 @@ use crate::profile_lock::{
     try_acquire_profile_lock, HubHostKind, ProfileLockError, ProfileLockGuard,
 };
 use crate::profile_paths::{resolve_hub_root, resolve_profile_paths};
-use crate::rest::{api_router_with_controller, audited_credential_verifier};
+use crate::rest::{api_router_with_controller, user_auth_state};
 use crate::settings::SettingsService;
 use crate::subscribe_core::EVAL_TICK_MS;
 use crate::users::UsersService;
@@ -336,7 +336,7 @@ impl HubRuntime {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let audit = AuditLogService::new(pool.clone());
-        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let auth = user_auth_state(users.clone(), audit.clone());
 
         // PORT/BANTO_BIND/BANTO_HUB_DATA (via `*_override`) override the
         // persisted settings, which in turn fall back to their own defaults

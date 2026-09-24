@@ -25,6 +25,8 @@
 //! 実際に TCP 接続できるかを probe し、失敗したら新しいポートで最大3回
 //! 再試行する。
 
+use banto_hub_core::rest::user_session_lookup;
+use banto_server::SessionValidation;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -375,19 +377,23 @@ async fn test_app(label: &str) -> TestApp {
         .expect("setup_first_user");
 
     let verify_users = users.clone();
-    let auth = AuthState::new(move |u: String, p: String| {
-        let users = verify_users.clone();
-        Box::pin(async move {
-            match users.verify(&u, &p).await {
-                Ok(Some(identity)) => Some(Identity {
-                    id: identity.username,
-                    name: identity.display_name,
-                    role: identity.role.to_string(),
-                }),
-                _ => None,
-            }
-        })
-    });
+    let verify_users_lookup = users.clone();
+    let auth = AuthState::new(
+        move |u: String, p: String| {
+            let users = verify_users.clone();
+            Box::pin(async move {
+                match users.verify(&u, &p).await {
+                    Ok(Some(identity)) => Some(Identity {
+                        id: identity.username,
+                        name: identity.display_name,
+                        role: identity.role.to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+        },
+        SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
+    );
     let token = auth
         .login("admin", "password123")
         .await
@@ -500,19 +506,23 @@ async fn all_simulation_test_app(label: &str) -> AllSimulationTestApp {
         .expect("setup_first_user");
 
     let verify_users = users.clone();
-    let auth = AuthState::new(move |u: String, p: String| {
-        let users = verify_users.clone();
-        Box::pin(async move {
-            match users.verify(&u, &p).await {
-                Ok(Some(identity)) => Some(Identity {
-                    id: identity.username,
-                    name: identity.display_name,
-                    role: identity.role.to_string(),
-                }),
-                _ => None,
-            }
-        })
-    });
+    let verify_users_lookup = users.clone();
+    let auth = AuthState::new(
+        move |u: String, p: String| {
+            let users = verify_users.clone();
+            Box::pin(async move {
+                match users.verify(&u, &p).await {
+                    Ok(Some(identity)) => Some(Identity {
+                        id: identity.username,
+                        name: identity.display_name,
+                        role: identity.role.to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+        },
+        SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
+    );
     let token = auth
         .login("admin", "password123")
         .await

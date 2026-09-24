@@ -1,6 +1,7 @@
-import { redirect } from '@sveltejs/kit';
+import { error, redirect } from '@sveltejs/kit';
 import { getAuthProvider } from '@banto/admin-core';
 import { bantoReady } from '$lib/banto/setup';
+import { decideProtectedRoute, SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
 import {
 	fetchCommissioningStatusOrNull,
 	shouldBypassLoginForCommissioning
@@ -28,6 +29,13 @@ import { settings } from '$lib/settings.svelte';
 //   3. 状態取得に失敗（ネットワーク断など） → **安全側に倒し** 2. と同じ
 //      扱い（`fetchCommissioningStatusOrNull` が失敗を `null` にまとめる - 実装指示
 //      「取得に失敗した場合は安全側（ログインを要求する）に倒すこと」）。
+//
+// banto v1.7.0 #204: 2. の判断は `decideProtectedRoute`
+// （`resolveProtectedSession`）。セッションが無効だと**確認できたとき**だけ
+// `/login` へ送る。サーバーが照合できなかったとき（照合の 500・到達不能）は、
+// 保存しているトークン（Remember me を含む）を消さずに、再試行付きの
+// エラー画面（`routes/+error.svelte`）で止まる。3. でサーバーに届かない
+// ときも同じくエラー画面になる（ログイン画面にも進めない = 安全側のまま）。
 export async function load() {
 	await bantoReady;
 
@@ -35,7 +43,11 @@ export async function load() {
 	if (shouldBypassLoginForCommissioning(commissioningStatus)) {
 		sessionStore.enterCommissioningMode();
 	} else {
-		if (!(await getAuthProvider().check())) {
+		const decision = await decideProtectedRoute(getAuthProvider());
+		if (decision === 'unverified') {
+			error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
+		}
+		if (decision === 'login') {
 			redirect(307, '/login');
 		}
 		await sessionStore.load();
