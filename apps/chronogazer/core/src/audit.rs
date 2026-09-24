@@ -19,7 +19,7 @@
 //! type is a free-form `serde_json::Value`) - it is enforced by review at
 //! every call site instead.
 
-use banto_core::{BantoError, ListParams, ListResult};
+use banto_core::{BantoError, ListParams, SortDirection, SortState};
 use banto_storage::ColumnMap;
 use serde::Serialize;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -90,6 +90,47 @@ fn column_map() -> ColumnMap {
         .column("result", "result")
 }
 
+/// 監査ログ一覧の 1 ページ分の応答（#410）。`rows` / `totalCount` は
+/// `banto_core::ListResult` と**同じ綴り**で、そこに**この応答が使った
+/// スナップショット境界** `asOfId` を 1 つ足したもの（`ListResult` は
+/// `banto-core` の型でフィールドを足せないので、`crate::collect::CollectEventList`
+/// と同じく同じ綴りの型をここに置く）。フィールドを足しただけなので、
+/// `rows`/`totalCount` しか読まない既存の呼び出し元はそのまま動く。
+///
+/// * `total_count` も `rows` も **`id <= as_of_id` で絞った集合**から取る。
+/// * **表が空のときの `as_of_id` は `0`**（`id` は 1 から振られるので「どの行も
+///   含まない境界」。`null` にしないのは `CollectEventList` と同じ理由）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditLogList {
+    pub rows: Vec<AuditLogEntry>,
+    pub total_count: u64,
+    pub as_of_id: i64,
+}
+
+/// 並べ替えの最後に `id` を足して、並びを一意にする（#410。
+/// [`AuditLogService::list_as_of`] の doc）。すでに `id` で並べているなら
+/// 何もしない。向きは最後の（列として解決できる）並べ替えに揃える - 並べ替えが
+/// 無ければ `Desc`（新しい順）。
+fn with_id_tiebreaker(mut params: ListParams) -> ListParams {
+    if params.sort.iter().any(|s| s.field == "id") {
+        return params;
+    }
+    let columns = column_map();
+    let direction = params
+        .sort
+        .iter()
+        .rev()
+        .find(|s| columns.resolve(&s.field).is_some())
+        .map(|s| s.direction)
+        .unwrap_or(SortDirection::Desc);
+    params.sort.push(SortState {
+        field: "id".to_string(),
+        direction,
+    });
+    params
+}
+
 /// Audit trail service (spec M14): append-only writes, a filtered/sorted/
 /// paginated read (admin-only viewer), and retention-based pruning.
 ///
@@ -154,28 +195,88 @@ impl AuditLogService {
         }
     }
 
+    /// Filtered/sorted/paginated read (spec M14's admin-only viewer) with no
+    /// snapshot boundary - same as [`AuditLogService::list_as_of`] with
+    /// `as_of_id: None` (the boundary it picks is the newest row, so the
+    /// result covers the whole table exactly as before #410). Kept so the
+    /// many existing callers (tests, other services) stay unchanged.
+    pub async fn list(&self, params: ListParams) -> Result<AuditLogList, BantoError> {
+        self.list_as_of(params, None).await
+    }
+
     /// Filtered/sorted/paginated read (spec M14's admin-only viewer), using
     /// the same `banto_storage::list_query` pattern every other listable
     /// service in this crate does. Deliberately called only from the
     /// admin-gated `/api/audit-log/list` route / `audit_log_list` command -
     /// this service itself has no RBAC awareness (see this module's doc
     /// comment).
-    pub async fn list(&self, params: ListParams) -> Result<ListResult<AuditLogEntry>, BantoError> {
+    ///
+    /// **`as_of_id` = スナップショット境界**（#410。`/events` の #409 と同じ
+    /// 直し方）: 指定すると `id <= as_of_id` の行**だけ**を数え、並べる。
+    /// 未指定なら**この読み取りの時点の最大 `id`**（表が空なら `0`）を境界に
+    /// する - 全行を対象にするのと同じなので、省略した呼び出し元の結果は
+    /// 変わらない。使った境界は [`AuditLogList::as_of_id`] で返す。画面は
+    /// 世代の最初の応答で返ってきた境界を固定し、同じ世代の後続ブロックに
+    /// 渡す - ブロック取得の合間に行が**足されても**、同じ集合から取れる。
+    /// `audit_log.id` は `INTEGER PRIMARY KEY AUTOINCREMENT`
+    /// （`0004_audit_log.sql`）なので単調増加かつ**削除後も再利用されない**。
+    ///
+    /// **削除には効かない**: 保持期間の [`AuditLogService::prune`] が集合の
+    /// 行を消すと、同じ境界でも `OFFSET` がずれうる。それは画面側が「同じ境界・
+    /// 同じ条件の総件数が世代の最初と変わった」ことで検出して採らない
+    /// （行は書き換えられず、境界より後の行は集合に入らないので、件数が変わる
+    /// のは削除だけ）。
+    ///
+    /// **境界の決定・行・件数を 1 つの読み取りトランザクションで行う**:
+    /// 1 回の応答の中で行と件数の基準時点がずれない（件数の比較が上の検出の
+    /// 根拠なので、ここがずれると誤検出・見逃しになる）。
+    ///
+    /// **並びは必ず `id` で一意にする**（[`with_id_tiebreaker`]）: `ts` は
+    /// 秒単位で同じ値の行が並びうるので、`ts DESC` だけでは `OFFSET` で
+    /// 区切ったブロックの間で同順位の行の順序が SQL として保証されない。
+    pub async fn list_as_of(
+        &self,
+        params: ListParams,
+        as_of_id: Option<i64>,
+    ) -> Result<AuditLogList, BantoError> {
         let columns = column_map();
+        let params = with_id_tiebreaker(params);
 
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+
+        let as_of_id = match as_of_id {
+            Some(id) => id,
+            None => sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM audit_log")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(banto_storage::storage_error)?
+                .unwrap_or(0),
+        };
+
+        // 境界で絞った集合を `audit_log` という名前の副問い合わせにして、
+        // 列の許可リスト（`column_map`）と `apply_list_params` をそのまま使う
+        // （`append_where` は自分で ` WHERE ` を書くので、外側に条件を足せない）。
         let mut rows_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT id, ts, actor_username, actor_role, action, resource, entity_id, detail, origin, result \
-             FROM audit_log",
+             FROM (SELECT * FROM audit_log WHERE id <= ",
         );
+        rows_builder.push_bind(as_of_id);
+        rows_builder.push(") AS audit_log");
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<AuditLogEntry> = rows_builder
             .build_query_as::<AuditLogEntry>()
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(banto_storage::storage_error)?;
 
         let mut count_builder: QueryBuilder<Sqlite> =
-            QueryBuilder::new("SELECT COUNT(*) FROM audit_log");
+            QueryBuilder::new("SELECT COUNT(*) FROM (SELECT * FROM audit_log WHERE id <= ");
+        count_builder.push_bind(as_of_id);
+        count_builder.push(") AS audit_log");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
             &columns,
@@ -183,13 +284,16 @@ impl AuditLogService {
         )?;
         let total_count: i64 = count_builder
             .build_query_scalar()
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(banto_storage::storage_error)?;
 
-        Ok(ListResult {
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+
+        Ok(AuditLogList {
             rows,
             total_count: total_count as u64,
+            as_of_id,
         })
     }
 
@@ -413,6 +517,187 @@ mod tests {
         assert_eq!(result.total_count, 3);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].action, "c"); // most recently inserted first
+    }
+
+    // --- スナップショット境界と並びの一意性（#410） -------------------------
+
+    fn page(offset: u64, limit: u64, sort: Vec<SortState>) -> ListParams {
+        ListParams {
+            sort,
+            pagination: Some(Pagination { offset, limit }),
+            ..Default::default()
+        }
+    }
+
+    fn ts_desc() -> Vec<SortState> {
+        vec![SortState {
+            field: "ts".to_string(),
+            direction: SortDirection::Desc,
+        }]
+    }
+
+    fn ids(list: &AuditLogList) -> Vec<i64> {
+        list.rows.iter().map(|r| r.id).collect()
+    }
+
+    /// 境界を固定すると、ブロックの合間に足された行は件数にも行にも入らず、
+    /// 境界で重複せず末尾まで辿れる（#409 P2-2 と同じ欠陥の `/audit-log` 版）。
+    #[tokio::test]
+    async fn list_as_of_pins_the_set_across_blocks() {
+        let svc = service().await;
+        seed_n(&svc, 5).await;
+
+        let first = svc.list_as_of(page(0, 2, ts_desc()), None).await.unwrap();
+        assert_eq!(first.as_of_id, 5);
+        assert_eq!(first.total_count, 5);
+        assert_eq!(ids(&first), vec![5, 4]);
+
+        seed_n(&svc, 2).await; // id 6, 7 - 境界より後
+
+        let second = svc
+            .list_as_of(page(2, 2, ts_desc()), Some(first.as_of_id))
+            .await
+            .unwrap();
+        let third = svc
+            .list_as_of(page(4, 2, ts_desc()), Some(first.as_of_id))
+            .await
+            .unwrap();
+        assert_eq!(second.as_of_id, 5, "渡した境界をそのまま返すこと");
+        assert_eq!(second.total_count, 5);
+        assert_eq!(ids(&second), vec![3, 2]);
+        assert_eq!(ids(&third), vec![1], "末尾まで辿れる（欠落なし）");
+
+        // 省略すると従来どおり全行（新しい行もここで入る）。
+        let fresh = svc.list(page(0, 10, ts_desc())).await.unwrap();
+        assert_eq!(fresh.as_of_id, 7);
+        assert_eq!(fresh.total_count, 7);
+        assert_eq!(ids(&fresh), vec![7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    /// 表が空のときの境界は `0`（どの行も含まない）。`0` を渡せば同じ空集合。
+    #[tokio::test]
+    async fn list_as_of_on_an_empty_table_is_zero() {
+        let svc = service().await;
+        let empty = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(empty.as_of_id, 0);
+        assert_eq!(empty.total_count, 0);
+        seed_n(&svc, 2).await;
+        let pinned = svc
+            .list_as_of(ListParams::default(), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(pinned.total_count, 0);
+        assert!(pinned.rows.is_empty());
+    }
+
+    /// 絞り込みと境界は両方効く（件数も同じ条件で数える）。
+    #[tokio::test]
+    async fn list_as_of_combines_with_filters() {
+        let svc = service().await;
+        svc.record(sample_entry("create", "items", "alice")).await; // 1
+        svc.record(sample_entry("create", "items", "bob")).await; // 2
+        svc.record(sample_entry("create", "items", "alice")).await; // 3
+        svc.record(sample_entry("create", "items", "alice")).await; // 4 - 境界の後
+        let result = svc
+            .list_as_of(
+                ListParams {
+                    filters: vec![FilterState {
+                        field: "actorUsername".to_string(),
+                        op: FilterOp::Eq,
+                        value: json!("alice"),
+                    }],
+                    ..Default::default()
+                },
+                Some(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.total_count, 2);
+        assert_eq!(ids(&result), vec![3, 1]);
+    }
+
+    /// 保持期間の削除は境界に効かない - **同じ境界の件数が減る**ことで画面が
+    /// 検出する（`auditBlocks.ts` のスナップショット失効）。この前提を固定する。
+    #[tokio::test]
+    async fn prune_between_blocks_shrinks_the_pinned_count() {
+        let svc = service().await;
+        seed_n(&svc, 5).await;
+        let first = svc.list_as_of(page(0, 2, ts_desc()), None).await.unwrap();
+        seed_n(&svc, 1).await; // id 6
+        svc.prune(None, Some(5)).await.unwrap(); // id 1 が消える
+        let second = svc
+            .list_as_of(page(2, 2, ts_desc()), Some(first.as_of_id))
+            .await
+            .unwrap();
+        assert_eq!(second.total_count, first.total_count - 1);
+    }
+
+    /// 同じ `ts` の行が並んでも、並びは `id` で一意に決まる（`ts` は秒単位）。
+    /// 並べ替えの向きに揃えた `id` が最後に足される。
+    #[tokio::test]
+    async fn list_breaks_ts_ties_by_id_in_the_sort_direction() {
+        let svc = service().await;
+        seed_n(&svc, 4).await;
+        sqlx::query("UPDATE audit_log SET ts = '2026-09-24 00:00:00'")
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+
+        let desc = svc.list(page(0, 10, ts_desc())).await.unwrap();
+        assert_eq!(ids(&desc), vec![4, 3, 2, 1]);
+
+        let asc = svc
+            .list(page(
+                0,
+                10,
+                vec![SortState {
+                    field: "ts".to_string(),
+                    direction: SortDirection::Asc,
+                }],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ids(&asc), vec![1, 2, 3, 4]);
+
+        // 並べ替えが無ければ新しい順。
+        let none = svc.list(page(0, 10, vec![])).await.unwrap();
+        assert_eq!(ids(&none), vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn id_tiebreaker_is_added_once_and_follows_the_last_known_sort() {
+        let with = with_id_tiebreaker(page(0, 1, ts_desc()));
+        assert_eq!(with.sort.len(), 2);
+        assert_eq!(with.sort[1].field, "id");
+        assert_eq!(with.sort[1].direction, SortDirection::Desc);
+
+        // すでに `id` で並べているなら足さない。
+        let already = with_id_tiebreaker(page(
+            0,
+            1,
+            vec![SortState {
+                field: "id".to_string(),
+                direction: SortDirection::Asc,
+            }],
+        ));
+        assert_eq!(already.sort.len(), 1);
+
+        // 列として解決できない並べ替え（黙って無視される）は向きの根拠にしない。
+        let unknown = with_id_tiebreaker(page(
+            0,
+            1,
+            vec![
+                SortState {
+                    field: "action".to_string(),
+                    direction: SortDirection::Asc,
+                },
+                SortState {
+                    field: "nope".to_string(),
+                    direction: SortDirection::Desc,
+                },
+            ],
+        ));
+        assert_eq!(unknown.sort.last().unwrap().direction, SortDirection::Asc);
     }
 
     // --- prune (spec M14) ---------------------------------------------------
