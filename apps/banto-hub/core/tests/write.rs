@@ -1920,3 +1920,146 @@ async fn string_tag_write_over_capacity_is_a_value_out_of_range_error() {
 
     sim.stop();
 }
+
+// ---------------------------------------------------------------------------
+// #431: DB が応答しないときの緊急停止（banto v1.7.0 #204 の照合の例外）
+
+/// `users` を一時的に読めなくする（照合だけを失敗させる。`write_control_state`
+/// と `audit_log` は生かすので、停止の永続化と監査は動く）。
+async fn break_users(pool: &SqlitePool) {
+    sqlx::query("ALTER TABLE users RENAME TO users_away")
+        .execute(pool)
+        .await
+        .expect("rename users");
+}
+
+async fn restore_users(pool: &SqlitePool) {
+    sqlx::query("ALTER TABLE users_away RENAME TO users")
+        .execute(pool)
+        .await
+        .expect("restore users");
+}
+
+/// #431: DB がセッションを照合できないあいだも、それまで有効だった管理者の
+/// セッションなら緊急停止（disable）は通り、監査に「照合できなかったため、
+/// 停止のみ例外で許可」の印が残る。再開（enable）は例外にしない（500 のまま、
+/// 書き込みは止まったまま）。知らないトークンは例外でも通さない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disable_is_accepted_while_the_session_cannot_be_verified_but_enable_is_not() {
+    let app = test_app("write-control-unverified-stop").await;
+    app.write_control.enable();
+    assert!(app.write_control.is_enabled());
+
+    break_users(&app.pool).await;
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/enable", &app.admin_token).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "enable is not an exception: {body:?}"
+    );
+
+    let (status, _) = admin_post_empty(
+        &app.router,
+        "/api/write-control/disable",
+        "not-a-known-token",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "unknown token is never excepted"
+    );
+    assert!(app.write_control.is_enabled());
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["write_enabled"], false);
+    assert!(!app.write_control.is_enabled(), "writes are stopped");
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/enable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+    assert!(!app.write_control.is_enabled(), "enable stays refused");
+
+    let detail: String = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action = 'disable' AND resource = 'write_control' \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("disable audit row");
+    let detail: Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(
+        detail["sessionCheck"], "unverified_stop_exception",
+        "{detail}"
+    );
+    assert_eq!(detail["enabled"], false);
+
+    // The session survived the outage: once the DB answers, it works again
+    // (and a normal disable carries no exception mark).
+    restore_users(&app.pool).await;
+    let (status, _) =
+        admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK);
+    let detail: String = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action = 'disable' AND resource = 'write_control' \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    let detail: Value = serde_json::from_str(&detail).unwrap();
+    assert!(detail.get("sessionCheck").is_none(), "{detail}");
+}
+
+/// #431: 失効が**確認できた**セッションは、DB が応答していても緊急停止を
+/// 拒否する（例外は「照合できない」ときだけ）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_session_cannot_stop_writes() {
+    let app = test_app("write-control-revoked-stop").await;
+    app.write_control.enable();
+
+    let (status, body) = admin_post(
+        &app.router,
+        "/api/users",
+        &app.admin_token,
+        json!({
+            "username": "admin2",
+            "password": "password123",
+            "displayName": "Admin 2",
+            "role": "admin",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let admin2_id = body["id"].as_i64().unwrap();
+    let (status, body) = admin_post(
+        &app.router,
+        "/api/auth/login",
+        "",
+        json!({ "username": "admin2", "password": "password123" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let admin2_token = body["token"].as_str().unwrap().to_string();
+
+    let (status, _) = admin_post(
+        &app.router,
+        &format!("/api/users/{admin2_id}/reset-password"),
+        &app.admin_token,
+        json!({ "newPassword": "reset-password1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) =
+        admin_post_empty(&app.router, "/api/write-control/disable", &admin2_token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        app.write_control.is_enabled(),
+        "a revoked session stops nothing"
+    );
+}

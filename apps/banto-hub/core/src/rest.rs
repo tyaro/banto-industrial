@@ -159,7 +159,83 @@ fn actor_identity(
 struct AuthGate {
     auth: AuthState,
     commissioning: CommissioningState,
+    /// #431: このゲートの後ろにあるルートの操作の種類。照合できなかった
+    /// ときの扱いだけがこれで変わる。既定は [`OperationKind::Normal`]
+    /// （例外なし）で、[`OperationKind::StopWrites`] はハンドラの隣で
+    /// 明示的に宣言した定数からだけ渡す（`WRITE_CONTROL_DISABLE_OPERATION`）。
+    operation: OperationKind,
 }
+
+/// #431: ルートの操作の種類（ルート名ではなく、ハンドラの隣の定数で宣言する）。
+/// banto v1.7.0 #204 で要求ごとの照合を入れたため、DB が応答しないと緊急停止
+/// （`POST /api/write-control/disable`）まで 500 で通らなくなった。書き込みを
+/// **止める**操作だけは、照合できないときも例外で通す（オーナー決定
+/// 2026-09-24、issue #431）。ルートを足しても、宣言しない限り例外は広がらない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationKind {
+    /// 既定。照合できなければ（DB エラー）その要求は 500。
+    Normal,
+    /// 書き込みを止める操作。照合できない（DB エラー・タイムアウト）ときも、
+    /// それまで有効だった（メモリ上で有効な）セッションなら通す。失効が
+    /// **確認できた**セッションは拒否する。
+    StopWrites,
+}
+
+/// #431: `AuthState::authenticate` の結果の分類（タイムアウトを含む）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionCheck {
+    /// 照合できて、有効。
+    Valid,
+    /// トークンが無い・期限切れ、または照合でアカウントの削除・世代の変更が
+    /// **確認できた**。
+    Revoked,
+    /// DB が照合に答えられなかった（エラー・タイムアウト）。
+    Unverified,
+}
+
+/// #431: ゲートの判断。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    /// 照合できて有効。通す。
+    Allow,
+    /// 照合できなかったが、止める操作で、それまで有効だったセッション。
+    /// 例外で通し、監査に印を付ける（[`UnverifiedStopException`]）。
+    AllowUnverifiedStop,
+    /// 401。
+    Unauthorized,
+    /// 照合できなかった。その要求だけ 500（セッションは残す）。
+    Unavailable,
+}
+
+/// #431: ゲートの判断（純関数、表でテストする）。`previously_valid` は
+/// 照合できなかったとき、そのトークンがメモリ上でまだ有効（既知・期限内）
+/// だったか - 「それまで有効だったセッション」の意味。
+pub(crate) fn session_gate_decision(
+    check: SessionCheck,
+    operation: OperationKind,
+    previously_valid: bool,
+) -> GateDecision {
+    match (check, operation) {
+        (SessionCheck::Valid, _) => GateDecision::Allow,
+        (SessionCheck::Revoked, _) => GateDecision::Unauthorized,
+        (SessionCheck::Unverified, OperationKind::Normal) => GateDecision::Unavailable,
+        (SessionCheck::Unverified, OperationKind::StopWrites) if previously_valid => {
+            GateDecision::AllowUnverifiedStop
+        }
+        (SessionCheck::Unverified, OperationKind::StopWrites) => GateDecision::Unauthorized,
+    }
+}
+
+/// #431: 止める操作のルートで、照合を待つ上限。DB が応答しない（ハングする）
+/// ときも緊急停止を待たせない。banto の SSE の再照合と同じ 5 秒
+/// （`banto_server::events::REVALIDATE_TIMEOUT`）。通常のルートには掛けない
+/// （従来どおり）。
+const STOP_SESSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #431: 照合できなかったが止める操作として例外で通した要求に、ゲートが
+/// 載せる印。ハンドラはこれを見て監査に残す。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnverifiedStopException;
 
 /// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）: `banto_server::require_auth`
 /// をそのまま`.layer(middleware::from_fn_with_state(auth, require_auth))`
@@ -214,13 +290,47 @@ async fn require_auth_or_commissioning(
     let Some(token) = token else {
         return unauthorized_response();
     };
-    match gate.auth.authenticate(&token).await {
-        Ok(Some(session)) => {
-            req.extensions_mut().insert(session);
+    // #431: 止める操作だけ、照合に上限時間を掛ける（DB がハングしても停止を
+    // 待たせない）。通常の操作は従来どおり。
+    let outcome = match gate.operation {
+        OperationKind::Normal => Some(gate.auth.authenticate(&token).await),
+        OperationKind::StopWrites => {
+            tokio::time::timeout(STOP_SESSION_CHECK_TIMEOUT, gate.auth.authenticate(&token))
+                .await
+                .ok()
+        }
+    };
+    let (check, session, error) = match outcome {
+        Some(Ok(Some(session))) => (SessionCheck::Valid, Some(session), None),
+        Some(Ok(None)) => (SessionCheck::Revoked, None, None),
+        Some(Err(err)) => (SessionCheck::Unverified, None, Some(err)),
+        None => (SessionCheck::Unverified, None, None),
+    };
+    // 照合できなかったとき、トークンはメモリ上に残っている（`authenticate` は
+    // DB エラーでトークンを消さない）。まだ既知・期限内なら「それまで有効」。
+    let previously_valid =
+        check == SessionCheck::Unverified && gate.auth.identity_for(&token).is_some();
+    match session_gate_decision(check, gate.operation, previously_valid) {
+        GateDecision::Allow => {
+            if let Some(session) = session {
+                req.extensions_mut().insert(session);
+            }
             next.run(req).await
         }
-        Ok(None) => unauthorized_response(),
-        Err(err) => ApiError(err).into_response(),
+        GateDecision::AllowUnverifiedStop => {
+            eprintln!(
+                "banto-hub: セッションを照合できなかったため、書き込みの停止のみ例外で受け付けます"
+            );
+            req.extensions_mut().insert(UnverifiedStopException);
+            next.run(req).await
+        }
+        GateDecision::Unauthorized => unauthorized_response(),
+        GateDecision::Unavailable => {
+            ApiError(error.unwrap_or_else(|| {
+                BantoError::Other("セッションを照合できませんでした".to_string())
+            }))
+            .into_response()
+        }
     }
 }
 
@@ -671,6 +781,7 @@ fn users_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -1127,6 +1238,7 @@ fn audit_log_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -1360,6 +1472,7 @@ fn api_keys_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -1415,6 +1528,7 @@ async fn write_control_set(
     headers: &HeaderMap,
     enabled: bool,
     action: &str,
+    unverified_stop: bool,
 ) -> Response {
     let identity = actor_identity(headers, &state.auth, &state.commissioning);
     let actor_id = identity.as_ref().map(|i| i.id.as_str());
@@ -1431,6 +1545,7 @@ async fn write_control_set(
                 action,
                 true,
                 err.to_string(),
+                unverified_stop,
             )
             .await;
             return write_control_persist_failed_response(
@@ -1451,6 +1566,7 @@ async fn write_control_set(
                 action,
                 false,
                 err.to_string(),
+                unverified_stop,
             )
             .await;
             let _ = state.events.send(ServerEvent::ResourceChanged {
@@ -1470,7 +1586,10 @@ async fn write_control_set(
         action,
         "write_control",
         "1",
-        Some(json!({ "enabled": enabled, "persisted": true })),
+        Some(with_session_exception_mark(
+            json!({ "enabled": enabled, "persisted": true }),
+            unverified_stop,
+        )),
     )
     .await;
     let _ = state.events.send(ServerEvent::ResourceChanged {
@@ -1496,6 +1615,7 @@ async fn record_write_control_failure(
     action: &str,
     enabled: bool,
     error: String,
+    unverified_stop: bool,
 ) {
     let identity = actor_identity(headers, auth, commissioning);
     audit
@@ -1505,11 +1625,35 @@ async fn record_write_control_failure(
             action,
             resource: "write_control",
             entity_id: Some("1"),
-            detail: Some(json!({ "enabled": enabled, "persisted": false, "error": error })),
+            detail: Some(with_session_exception_mark(
+                json!({ "enabled": enabled, "persisted": false, "error": error }),
+                unverified_stop,
+            )),
             origin: "rest",
             result: "failed",
         })
         .await;
+}
+
+/// #431: 照合できなかったため停止のみ例外で通した要求の監査行に付ける印。
+/// `detail.sessionCheck = "unverified_stop_exception"` と、人が読む説明。
+fn with_session_exception_mark(
+    mut detail: serde_json::Value,
+    unverified_stop: bool,
+) -> serde_json::Value {
+    if unverified_stop {
+        if let Some(object) = detail.as_object_mut() {
+            object.insert(
+                "sessionCheck".to_string(),
+                json!("unverified_stop_exception"),
+            );
+            object.insert(
+                "sessionCheckNote".to_string(),
+                json!("照合できなかったため、停止のみ例外で許可"),
+            );
+        }
+    }
+    detail
 }
 
 /// #340: `write_control_set` の永続化失敗を伝える 500。`writes_disabled`
@@ -1527,18 +1671,27 @@ fn write_control_persist_failed_response(message: &str) -> Response {
         .into_response()
 }
 
+/// #431: 再開は「止める」操作ではない - 照合できなければ 500（例外なし）。
+const WRITE_CONTROL_ENABLE_OPERATION: OperationKind = OperationKind::Normal;
+
 async fn write_control_enable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
 ) -> Response {
-    write_control_set(&state, &headers, true, "enable").await
+    write_control_set(&state, &headers, true, "enable", false).await
 }
+
+/// #431: 緊急停止は「書き込みを止める」操作だと宣言する。DB が応答しない
+/// ときも、それまで有効だったセッションなら受け付ける
+/// （[`session_gate_decision`]）。この宣言が例外の唯一の入口。
+const WRITE_CONTROL_DISABLE_OPERATION: OperationKind = OperationKind::StopWrites;
 
 async fn write_control_disable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
+    exception: Option<axum::Extension<UnverifiedStopException>>,
 ) -> Response {
-    write_control_set(&state, &headers, false, "disable").await
+    write_control_set(&state, &headers, false, "disable", exception.is_some()).await
 }
 
 fn write_control_router(
@@ -1557,27 +1710,38 @@ fn write_control_router(
         audit: audit.clone(),
         events,
     };
-    Router::new()
-        .route("/api/write-control/enable", post(write_control_enable))
-        .route("/api/write-control/disable", post(write_control_disable))
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                commissioning: commissioning.clone(),
-                min: Role::Admin,
-                resource: "write_control",
-                audit,
-            },
-            require_role_at_least,
-        ))
-        .layer(middleware::from_fn_with_state(
-            AuthGate {
-                auth,
-                commissioning,
-            },
-            require_auth_or_commissioning,
-        ))
+    // #431: ルートごとに、ハンドラの隣で宣言した操作の種類でゲートを組む
+    // （同じゲートを 2 本のルートで共有しない - 例外が再開に漏れないように）。
+    let gated = |router: Router<WriteControlAdminState>, operation: OperationKind| {
+        router
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(
+                RoleGuard {
+                    auth: auth.clone(),
+                    commissioning: commissioning.clone(),
+                    min: Role::Admin,
+                    resource: "write_control",
+                    audit: audit.clone(),
+                },
+                require_role_at_least,
+            ))
+            .layer(middleware::from_fn_with_state(
+                AuthGate {
+                    auth: auth.clone(),
+                    commissioning: commissioning.clone(),
+                    operation,
+                },
+                require_auth_or_commissioning,
+            ))
+    };
+    gated(
+        Router::new().route("/api/write-control/enable", post(write_control_enable)),
+        WRITE_CONTROL_ENABLE_OPERATION,
+    )
+    .merge(gated(
+        Router::new().route("/api/write-control/disable", post(write_control_disable)),
+        WRITE_CONTROL_DISABLE_OPERATION,
+    ))
 }
 
 // --- collection lifecycle control (T14-4): admin + CSRF --------------------
@@ -1832,6 +1996,7 @@ fn collection_control_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -2052,6 +2217,7 @@ fn mqtt_settings_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -2325,6 +2491,7 @@ fn store_settings_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -2509,6 +2676,7 @@ fn grpc_settings_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -2554,6 +2722,7 @@ fn write_audit_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -5922,6 +6091,7 @@ fn pending_changes_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -6588,6 +6758,7 @@ fn tag_registry_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -6757,6 +6928,7 @@ fn sink_groups_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -8587,6 +8759,7 @@ fn admin_status_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -8678,6 +8851,7 @@ fn admin_tag_stream_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -9633,6 +9807,7 @@ fn commissioning_router(
             AuthGate {
                 auth,
                 commissioning: commissioning_state,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ));
@@ -17265,5 +17440,44 @@ mod tests {
             .expect("the setup session is accepted");
         assert_eq!(session.identity.id, "owner");
         assert_eq!(session.identity.role, "admin");
+    }
+
+    /// #431: ゲートの判断の総当たり表。例外（照合できないのに通す）は
+    /// 「止める操作」かつ「それまで有効だったセッション」の 1 行だけ。
+    #[test]
+    fn session_gate_decision_table() {
+        use GateDecision::*;
+        use OperationKind::*;
+        use SessionCheck::*;
+        let table = [
+            (Valid, Normal, false, Allow),
+            (Valid, Normal, true, Allow),
+            (Valid, StopWrites, false, Allow),
+            (Valid, StopWrites, true, Allow),
+            // 失効が確認できたら、止める操作でも拒否
+            (Revoked, Normal, false, Unauthorized),
+            (Revoked, Normal, true, Unauthorized),
+            (Revoked, StopWrites, false, Unauthorized),
+            (Revoked, StopWrites, true, Unauthorized),
+            // 照合できない: 通常は 500、止める操作だけ例外
+            (Unverified, Normal, false, Unavailable),
+            (Unverified, Normal, true, Unavailable),
+            (Unverified, StopWrites, false, Unauthorized),
+            (Unverified, StopWrites, true, AllowUnverifiedStop),
+        ];
+        for (check, operation, previously_valid, expected) in table {
+            assert_eq!(
+                session_gate_decision(check, operation, previously_valid),
+                expected,
+                "{check:?} / {operation:?} / previously_valid={previously_valid}"
+            );
+        }
+    }
+
+    /// #431: 例外の入口は宣言だけ。緊急停止は止める操作、再開は通常の操作。
+    #[test]
+    fn only_the_write_stop_route_is_declared_as_a_stop_operation() {
+        assert_eq!(WRITE_CONTROL_DISABLE_OPERATION, OperationKind::StopWrites);
+        assert_eq!(WRITE_CONTROL_ENABLE_OPERATION, OperationKind::Normal);
     }
 }
