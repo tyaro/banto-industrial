@@ -17,6 +17,8 @@ import { CSRF_HEADER } from './setup';
 export interface WriteControlStatusResponse {
 	write_enabled: boolean;
 	write_was_enabled_before_restart: boolean;
+	/** #433: 停止を片方にしか保存できなかったとき等の説明。無ければ `null`。 */
+	persistence_warning?: string | null;
 }
 
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';
@@ -64,6 +66,12 @@ async function httpPost(path: string): Promise<WriteControlStatusResponse> {
 			});
 		}
 		if (isErrorBody(body)) throw new ProviderError(body);
+		// `write_control_persist_failed` 等の `{"error", "message"}` 形（rest.rs の
+		// `write_control_persist_failed_response`）は、サーバーの説明をそのまま出す。
+		const message = (body as { message?: unknown } | null)?.message;
+		if (typeof message === 'string' && message !== '') {
+			throw new ProviderError({ kind: 'other', message });
+		}
 		throw new ProviderError({
 			kind: 'other',
 			message: `${response.status} ${response.statusText}`

@@ -1499,30 +1499,32 @@ struct WriteControlAdminState {
 
 /// `GET /api/v1/status` の `write_enabled`/`write_was_enabled_before_restart`
 /// と同じ形の応答（`POST /api/write-control/enable|disable` の応答）。
-/// `write_was_enabled_before_restart` は「起動時に永続テーブルから復元した
-/// 値」を指す（フィールド名は外部クライアント Thermal Monitor との互換の
-/// ため変更しない。2026-09-09 オーナー決定 #340）。
+/// `write_was_enabled_before_restart` は「起動時に復元した値」を指す
+/// （フィールド名は外部クライアント Thermal Monitor との互換のため変更
+/// しない。2026-09-09 オーナー決定 #340）。
+/// `persistence_warning`（#433）: 停止が片方にしか保存できなかったとき等の
+/// 説明（[`crate::write_control::WriteControlChange::warning`]）。無ければ `null`。
 #[derive(Debug, Serialize, ToSchema)]
 struct WriteControlStatusResponse {
     write_enabled: bool,
     write_was_enabled_before_restart: bool,
+    persistence_warning: Option<String>,
 }
 
-/// #340 レビュー対応（2026-09-14）: `enabled_persisted` は次回起動時の
-/// ライブ値そのものとして復元されるようになったため（`WriteControl` の
-/// モジュール doc comment参照）、永続化の失敗を握りつぶして 200 を返すと
-/// 「今は効いているが再起動すると黙って元に戻る」状態を作ってしまう。
-/// disable/enable で非対称に扱う:
-/// - **disable（非常停止）**: 先にライブフラグを `disable()` する(DB 障害
-///   があっても書き込みは必ず即座に止まる)。永続化が失敗しても無効化
-///   そのものは成功しているので、その旨を含めた 500 を返す。
-/// - **enable**: 先に `persist_enabled(true)` を試す。失敗したらライブ
-///   フラグには触れない(disabled のまま)。永続化が確認できてから
-///   `enable()` する。
+/// 停止・再開の本体は [`WriteControl::set_enabled`]（#433。DB と状態
+/// ファイルの 2 か所に保存する - `crate::write_control` のモジュール doc 参照）。
+/// このハンドラは結果を応答と監査に変換するだけ:
+/// - **disable（非常停止）**: ライブフラグは必ず即座に落ちる。どちらか一方に
+///   保存できれば 200（再起動しても停止のまま）。片方が失敗したときは
+///   `persistence_warning` にその旨を載せる。両方失敗したときだけ 500
+///   `write_control_persist_failed`（書き込みは止まったまま）。
+/// - **enable**: 両方に保存できたときだけライブフラグを立てて 200。片方でも
+///   失敗したら 500 `write_control_persist_failed`（ライブフラグには触れない）。
+///   保存中に停止が割り込んだら 409 `write_control_stop_interrupted`。
 ///
-/// どちらの分岐でも監査ログは成功/失敗の両方を記録する(失敗時は
-/// `detail.persisted = false` + `detail.error`)。`ServerEvent::ResourceChanged`
-/// はライブ状態が実際に変わった場合にのみ送る。
+/// 監査ログは成功/失敗の両方を記録する（[`write_control_audit_detail`]）。
+/// `ServerEvent::ResourceChanged` は停止では常に（ライブフラグは必ず落ちる）、
+/// 再開では成功したときだけ送る。
 async fn write_control_set(
     state: &WriteControlAdminState,
     headers: &HeaderMap,
@@ -1533,49 +1535,39 @@ async fn write_control_set(
     let identity = actor_identity(headers, &state.auth, &state.commissioning);
     let actor_id = identity.as_ref().map(|i| i.id.as_str());
 
-    if enabled {
-        if let Err(err) =
-            crate::write_control::persist_enabled(&state.manager.pool(), true, actor_id).await
-        {
-            record_write_control_failure(
-                &state.audit,
-                &state.auth,
-                &state.commissioning,
-                headers,
-                action,
-                true,
-                err.to_string(),
-                unverified_stop,
+    let change = state
+        .write_control
+        .set_enabled(&state.manager.pool(), enabled, actor_id)
+        .await;
+    let detail = with_session_exception_mark(write_control_audit_detail(&change), unverified_stop);
+
+    if !enabled || change.succeeded() {
+        let _ = state.events.send(ServerEvent::ResourceChanged {
+            resource: "write_control".to_string(),
+        });
+    }
+
+    if !change.succeeded() {
+        record_write_control_failure(
+            &state.audit,
+            &state.auth,
+            &state.commissioning,
+            headers,
+            action,
+            detail,
+        )
+        .await;
+        if change.interrupted_by_stop {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "write_control_stop_interrupted",
+                    "message": change.warning().unwrap_or_default()
+                })),
             )
-            .await;
-            return write_control_persist_failed_response(
-                "永続化に失敗したため有効化しませんでした。",
-            );
+                .into_response();
         }
-        state.write_control.enable();
-    } else {
-        state.write_control.disable();
-        if let Err(err) =
-            crate::write_control::persist_enabled(&state.manager.pool(), false, actor_id).await
-        {
-            record_write_control_failure(
-                &state.audit,
-                &state.auth,
-                &state.commissioning,
-                headers,
-                action,
-                false,
-                err.to_string(),
-                unverified_stop,
-            )
-            .await;
-            let _ = state.events.send(ServerEvent::ResourceChanged {
-                resource: "write_control".to_string(),
-            });
-            return write_control_persist_failed_response(
-                "書き込み受付は無効化しましたが永続化に失敗したため再起動後は前回の永続値に戻ります。",
-            );
-        }
+        return write_control_persist_failed_response(&change.warning().unwrap_or_default());
     }
 
     record_write(
@@ -1586,36 +1578,55 @@ async fn write_control_set(
         action,
         "write_control",
         "1",
-        Some(with_session_exception_mark(
-            json!({ "enabled": enabled, "persisted": true }),
-            unverified_stop,
-        )),
+        Some(detail),
     )
     .await;
-    let _ = state.events.send(ServerEvent::ResourceChanged {
-        resource: "write_control".to_string(),
-    });
 
     Json(WriteControlStatusResponse {
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+        persistence_warning: change.warning(),
     })
     .into_response()
 }
 
-/// [`write_control_set`] の永続化失敗時の監査行 - `record_write`（成功専用、
-/// `result: "ok"` 固定）とは別に、`result: "failed"` と
-/// `detail.persisted = false` / `detail.error` を記録する。
-#[allow(clippy::too_many_arguments)]
+/// 停止・再開の監査の `detail`（#433）。`persisted` は「再起動後も要求どおり
+/// に残るか」（停止はどちらか一方、再開は両方）。`persistedDb` /
+/// `persistedFile`（状態ファイルを持たない構成では `null`）と、失敗した側の
+/// `dbError` / `fileError`、停止に割り込まれた再開の `interruptedByStop`。
+/// MCP（`crate::mcp::tool_set_write_control`）も同じ形を使う。
+pub(crate) fn write_control_audit_detail(
+    change: &crate::write_control::WriteControlChange,
+) -> serde_json::Value {
+    let mut detail = json!({
+        "enabled": change.requested_enabled,
+        "persisted": change.succeeded(),
+        "persistedDb": change.db_saved(),
+        "persistedFile": change.file_saved(),
+    });
+    if let Some(object) = detail.as_object_mut() {
+        if let Some(err) = change.db_error() {
+            object.insert("dbError".to_string(), json!(err));
+        }
+        if let Some(err) = change.file_error() {
+            object.insert("fileError".to_string(), json!(err));
+        }
+        if change.interrupted_by_stop {
+            object.insert("interruptedByStop".to_string(), json!(true));
+        }
+    }
+    detail
+}
+
+/// [`write_control_set`] の失敗時の監査行 - `record_write`（成功専用、
+/// `result: "ok"` 固定）とは別に、`result: "failed"` を記録する。
 async fn record_write_control_failure(
     audit: &AuditLogService,
     auth: &AuthState,
     commissioning: &CommissioningState,
     headers: &HeaderMap,
     action: &str,
-    enabled: bool,
-    error: String,
-    unverified_stop: bool,
+    detail: serde_json::Value,
 ) {
     let identity = actor_identity(headers, auth, commissioning);
     audit
@@ -1625,10 +1636,7 @@ async fn record_write_control_failure(
             action,
             resource: "write_control",
             entity_id: Some("1"),
-            detail: Some(with_session_exception_mark(
-                json!({ "enabled": enabled, "persisted": false, "error": error }),
-                unverified_stop,
-            )),
+            detail: Some(detail),
             origin: "rest",
             result: "failed",
         })
@@ -8069,6 +8077,10 @@ pub(crate) struct StatusResponse {
     /// 参照。以後の enable/disable ではこの値自体は変わらない。
     /// 2026-09-09 オーナー決定 #340)。
     write_was_enabled_before_restart: bool,
+    /// #433: 書き込み受付の保存状態の注意書き（起動時に DB と状態ファイルが
+    /// 食い違っていた、直近の停止・再開を片方に保存できなかった等。
+    /// `crate::write_control::WriteControl::persistence_warning`）。無ければ `null`。
+    write_persistence_warning: Option<String>,
     /// T3（設計 §5.3）: MQTT publish の設定/接続状態。
     mqtt: MqttStatusEntry,
     /// T4（設計 §5.4）: gRPC サーバーの設定。
@@ -8224,6 +8236,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
         connections: entries,
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+        write_persistence_warning: state.write_control.persistence_warning(),
         mqtt: MqttStatusEntry {
             enabled: mqtt_settings.enabled,
             connected: state.mqtt.connected(),
@@ -8466,6 +8479,7 @@ struct AdminStatusResponse {
     connections: Vec<AdminConnectionStatusEntry>,
     write_enabled: bool,
     write_was_enabled_before_restart: bool,
+    write_persistence_warning: Option<String>,
     mqtt: MqttStatusEntry,
     grpc: GrpcStatusEntry,
     last_apply: Option<AdminLastApplyEntry>,
@@ -8543,6 +8557,7 @@ impl From<StatusResponse> for AdminStatusResponse {
             connections: status.connections.into_iter().map(Into::into).collect(),
             write_enabled: status.write_enabled,
             write_was_enabled_before_restart: status.write_was_enabled_before_restart,
+            write_persistence_warning: status.write_persistence_warning,
             mqtt: status.mqtt,
             grpc: status.grpc,
             last_apply: status.last_apply.map(Into::into),

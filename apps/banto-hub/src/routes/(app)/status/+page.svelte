@@ -465,8 +465,9 @@
 	async function handleEnableWrites(): Promise<void> {
 		writeControlBusy = true;
 		try {
-			await enableWriteControl();
+			const result = await enableWriteControl();
 			toastStore.push('success', '書き込み受付を有効化しました');
+			if (result.persistence_warning) toastStore.push('warning', result.persistence_warning);
 			await poll();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
@@ -478,8 +479,9 @@
 	async function handleDisableWrites(): Promise<void> {
 		writeControlBusy = true;
 		try {
-			await disableWriteControl();
+			const result = await disableWriteControl();
 			toastStore.push('success', '書き込み受付を無効化しました');
+			if (result.persistence_warning) toastStore.push('warning', result.persistence_warning);
 			await poll();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
@@ -989,7 +991,7 @@
 			<p class="note">
 				書き込み受付は既定で有効です。再起動しても前回の状態を復元します。無効化は運用者が
 				書き込みを止めるための非常停止スイッチで、無効の間は
-				<code>POST /api/v1/values/&#123;tag&#125;</code> が 503 を返します。
+				<code>POST /api/v1/values/&#123;tag&#125;</code> が 503 を返します。無効化した状態は DB とデータディレクトリの状態ファイルの両方に記録し、どちらか一方でも無効なら無効で起動します。
 			</p>
 			<dl class="summary">
 				<dt>現在の状態</dt>
@@ -1000,6 +1002,10 @@
 				</dd>
 				<dt>起動時に復元した状態</dt>
 				<dd>{status.write_was_enabled_before_restart ? '有効' : '無効'}</dd>
+				{#if status.write_persistence_warning}
+					<dt>保存状態の注意</dt>
+					<dd class="warn" role="alert">{status.write_persistence_warning}</dd>
+				{/if}
 			</dl>
 			<div class="write-control-actions">
 				<button

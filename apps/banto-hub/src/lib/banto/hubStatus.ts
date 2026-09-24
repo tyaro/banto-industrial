@@ -161,8 +161,11 @@ export interface StatusResponse {
 	 * 永続値を復元し、収集の開始/停止では変わらない。2026-09-09 オーナー
 	 * 決定 #340）。 */
 	write_enabled: boolean;
-	/** T2-4（設計 §6-6）: 起動時に永続テーブルから復元した値。 */
+	/** T2-4（設計 §6-6）: 起動時に復元した値。 */
 	write_was_enabled_before_restart: boolean;
+	/** #433: 書き込み受付の保存状態の注意書き（起動時に DB と状態ファイルが
+	 * 食い違っていた、直近の停止・再開を片方に保存できなかった等）。無ければ `null`。 */
+	write_persistence_warning: string | null;
 	/** T3（設計 §5.3）: MQTT publish の設定/接続状態。 */
 	mqtt: MqttStatusEntry;
 	/** T4（設計 §5.4）: gRPC サーバーの設定。 */
@@ -246,6 +249,7 @@ interface RawStatusResponse {
 	connections: ConnectionStatusEntry[];
 	writeEnabled: boolean;
 	writeWasEnabledBeforeRestart: boolean;
+	writePersistenceWarning?: string | null;
 	mqtt: MqttStatusEntry;
 	grpc: GrpcStatusEntry;
 	collectionState: string;
@@ -274,6 +278,7 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 		connections: raw.connections,
 		write_enabled: raw.writeEnabled,
 		write_was_enabled_before_restart: raw.writeWasEnabledBeforeRestart,
+		write_persistence_warning: raw.writePersistenceWarning ?? null,
 		mqtt: raw.mqtt,
 		grpc: raw.grpc,
 		collection_state: raw.collectionState,

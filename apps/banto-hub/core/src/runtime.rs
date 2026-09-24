@@ -178,7 +178,7 @@ use crate::settings::SettingsService;
 use crate::subscribe_core::EVAL_TICK_MS;
 use crate::users::UsersService;
 use crate::write_audit::WriteAuditService;
-use crate::write_control::{load_persisted_enabled, WriteControl};
+use crate::write_control::{load_startup_decision, WriteControl};
 use crate::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 
 /// 旧 `BANTO_DB`未設定時の相対既定 DB パス（後方互換・ドキュメント用）。
@@ -538,22 +538,27 @@ impl HubRuntime {
         let api_keys = ApiKeysService::new(pool.clone());
 
         // T2-4 (docs/tag-server-design.md §6-6)。2026-09-09 オーナー決定
-        // (#340) で「起動時は必ず disabled」ルールを撤回: the live
-        // write-acceptance flag is restored straight from the persisted
-        // value on construction. `was_enabled_before_restart` (displayed at
-        // `/api/v1/status`) is the same value the live flag was restored
-        // to. banto-hub is a rule-engine-free pass-through with no
-        // autonomous-resume risk, so a restart no longer needs to force
-        // write acceptance off; the global toggle is an operator-driven
-        // emergency stop whose persisted state now survives restarts.
-        let write_was_enabled_persisted =
-            load_persisted_enabled(&pool).await.unwrap_or_else(|err| {
-                log_err_line(&format!(
-                    "banto-hub: 書き込み受付の永続状態の読み取りに失敗しました: {err}"
-                ));
-                false
-            });
-        let write_control = Arc::new(WriteControl::new(write_was_enabled_persisted));
+        // (#340) で「起動時は必ず disabled」ルールを撤回し、永続値を復元する。
+        // #433 (2026-09-24): 停止の状態は DB とデータディレクトリ内の状態
+        // ファイルの 2 か所に記録し、起動時は「どちらか一方でも停止（または
+        // 読めない）なら停止」で起動する（`crate::write_control` のモジュール
+        // doc 参照）。食い違いはログに出し、管理画面にも同じ注意書きを出す
+        // （`WriteControl::persistence_warning`）。
+        let write_state_file = crate::write_control::state_file_path(&data_dir);
+        let write_decision = load_startup_decision(&pool, &write_state_file).await;
+        if let Some(warning) = &write_decision.warning {
+            log_err_line(&format!("banto-hub: [WARN] 書き込み受付: {warning}"));
+        }
+        log_line(&format!(
+            "banto-hub: 書き込み受付は{}で起動しました（状態ファイル: {}）",
+            if write_decision.enabled {
+                "有効"
+            } else {
+                "停止"
+            },
+            write_state_file.display()
+        ));
+        let write_control = Arc::new(WriteControl::restore(write_decision, write_state_file));
         let controller = Arc::new(CollectionController::new(manager.clone()));
         let write_audit = WriteAuditService::new(pool.clone());
 
