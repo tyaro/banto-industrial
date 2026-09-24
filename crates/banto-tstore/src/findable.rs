@@ -12,16 +12,21 @@
 //! [`MAX_OFFSET_PAD_MS`] on each side, converts both ends to a date **at UTC
 //! offset 0**, and only opens files whose date falls in between
 //! ([`candidate_date_range`]). A row whose `ptime` is far from its file's date
-//! is invisible to every query - it is on disk, but no range that contains
-//! its `ptime` ever opens that file.
+//! can be missed: a narrow range that contains its `ptime` but not the file's
+//! date never opens that file, so the row silently drops out of the result.
+//! (A range wide enough to also cover the file's date does open it, and the
+//! row is read normally - the problem is that whether it shows up depends on
+//! how wide the query happens to be.)
 //!
 //! ## The contract
 //!
-//! A row at `ptime_ms` may only be stored in a file dated `date` if
-//! [`ptime_is_findable_in`]`(date, ptime_ms)` holds, i.e. if a query for the
-//! single-point range `[ptime_ms, ptime_ms]` selects that file. Because
-//! [`candidate_date_range`] only widens as the range widens, the same file is
-//! then selected by **every** query range that contains `ptime_ms`.
+//! **Every accepted row's file is selected by every query range that
+//! contains the row's `ptime`.** Concretely, a row at `ptime_ms` may only be
+//! stored in a file dated `date` if [`ptime_is_findable_in`]`(date,
+//! ptime_ms)` holds, i.e. if a query for the single-point range
+//! `[ptime_ms, ptime_ms]` selects that file. Because [`candidate_date_range`]
+//! only widens as the range widens, the same file is then selected by
+//! **every** query range that contains `ptime_ms`.
 //!
 //! In closed form (away from the `i64` extremes, where the padding
 //! saturates), with `start(date)` = UTC midnight at the start of `date` as an

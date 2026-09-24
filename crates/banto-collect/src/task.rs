@@ -103,8 +103,8 @@
 //!   loop, it is just no longer silent. This includes `banto-tstore`'s #424
 //!   rejection (`TstoreError::PtimeOutsideFileDate`, owner decision
 //!   2026-09-24): if the wall clock jumps by about a day between reading a
-//!   tick's `ptime_ms` and the `append`, that one sample cannot be stored
-//!   where the read side would find it, so it is dropped (not retried) and
+//!   tick's `ptime_ms` and the `append`, that one sample would land in a
+//!   file a query covering its time could miss, so it is dropped (not retried) and
 //!   reported through this same failure path; the next tick's `ptime_ms`
 //!   comes from the jumped clock and is written normally.
 

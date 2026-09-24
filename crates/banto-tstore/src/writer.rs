@@ -95,15 +95,22 @@
 //! [`crate::findable`]'s doc). Otherwise `append` returns
 //! [`TstoreError::PtimeOutsideFileDate`], after `rotate_if_needed` (so the
 //! check is against the file the row would really land in) and before
-//! buffering: the row is not written, and the open file and the other
-//! buffered rows are untouched. Retention (`crate::files::prune_files`) also
+//! buffering: the rejected row is never added to the buffer or written. The
+//! ordinary rotation that runs *before* the check still happens, though - if
+//! the local date has changed since the last `append`, the rows already
+//! buffered are flushed to the outgoing day's file and the writer switches to
+//! the new day's file, and only then is the row rejected (pinned by
+//! `tests::a_rejected_append_after_a_date_change_still_rotates_first`).
+//! Without a date change, a rejection leaves the open file and the other
+//! buffered rows as they were. Retention (`crate::files::prune_files`) also
 //! relies on this contract, since it too goes by the file-name date alone.
 //!
 //! Relation to the wall-clock-wins upsert above: that decision says the
 //! *value* stored for a `ptime` is always the newest `append`'s, and `ptime`
 //! is never clamped or rewritten; this contract does not change that - it
-//! only refuses rows that would otherwise be stored where no query can see
-//! them. An ordinary backward clock jump (NTP, manual correction) keeps
+//! only refuses rows that a query covering their `ptime` could miss (a
+//! narrow range that does not also reach the file's date would not open
+//! the file). An ordinary backward clock jump (NTP, manual correction) keeps
 //! `ptime` and the rotation clock together (both come from the same clock),
 //! so it is still accepted and upserted as before. What gets rejected is a
 //! row whose `ptime` was taken more than about a day away from the clock
@@ -260,10 +267,13 @@ impl TsWriter {
     /// (local-midnight crossed) and/or flush (thresholds crossed) - see this
     /// module's doc comment.
     ///
-    /// Rejects a `ptime_ms` the read side could not find in the (post-
-    /// rotation) current file with [`TstoreError::PtimeOutsideFileDate`] -
-    /// see "The ptime/file-date contract" in this module's doc. A rejected
-    /// row is not buffered, and nothing else changes.
+    /// Rejects a `ptime_ms` that a query covering it could miss in the
+    /// (post-rotation) current file with
+    /// [`TstoreError::PtimeOutsideFileDate`]; see "The ptime/file-date
+    /// contract" in this module's doc. A rejected
+    /// row is never added to the buffer. The normal date rotation that runs
+    /// before the check (flushing the rows already buffered and switching
+    /// files) can still have happened by the time the error is returned.
     pub async fn append(
         &self,
         group_key: &str,
@@ -288,8 +298,8 @@ impl TsWriter {
         // #424 contract (this module's doc, "The ptime/file-date contract"):
         // checked against the file this row would actually land in - i.e.
         // *after* `rotate_if_needed` - and before anything is buffered, so a
-        // rejected row is never written and nothing else about the writer
-        // changes.
+        // rejected row is never written. Any rotation `rotate_if_needed` just
+        // did (flush of the old day's buffer, file switch) stands.
         if !ptime_is_findable_in(inner.current_date, ptime_ms) {
             return Err(TstoreError::PtimeOutsideFileDate {
                 ptime_ms,
@@ -1396,8 +1406,12 @@ mod tests {
         assert!(rows.iter().all(|(d, _, _)| *d == file_date));
     }
 
+    /// Rejection *without* a date change: nothing rotates, so the open file
+    /// and the other buffered rows are exactly as before. (With a date
+    /// change the rotation still happens first - see
+    /// `a_rejected_append_after_a_date_change_still_rotates_first`.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_rejected_append_leaves_the_file_and_the_other_buffered_rows_intact() {
+    async fn a_rejected_append_without_a_date_change_leaves_the_file_and_the_buffer_intact() {
         let dir = TempDir::new("ptime-reject-state");
         let clock = clock_at(DAY1_START_MS);
         let writer = TsWriter::open_with_options(
@@ -1451,6 +1465,92 @@ mod tests {
         let g2 = all_rows(dir.path(), "g2").await;
         assert_eq!(g2.len(), 1);
         assert_eq!(g2[0].2, vec![Some(2.0)]);
+    }
+
+    /// Rejection *with* a date change (#426 review): unflushed rows in the
+    /// 7/12 file, clock moved to 7/15, then a 7/12 `ptime` is appended. The
+    /// ordinary rotation runs before the check - the buffered rows are
+    /// flushed to the 7/12 file and the writer switches to a 7/15 file - and
+    /// only then is the row rejected. The rejected row is in neither file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_append_after_a_date_change_still_rotates_first() {
+        let dir = TempDir::new("ptime-reject-rotate");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open_with_options(
+            dir.path(),
+            two_group_config(),
+            clock.clone(),
+            WriterOptions {
+                max_buffered_rows: 1_000,
+                flush_interval_ms: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Buffered in the 7/12 file, not flushed.
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(2.0), None])
+            .await
+            .unwrap();
+        assert_eq!(list_data_files(dir.path()).unwrap().len(), 1);
+
+        // 7/15 local (+9h): three days later.
+        clock.advance_ms(72 * HOUR_MS);
+        let rejected_ptime = DAY1_START_MS + 2_000; // a 7/12 time
+        let err = writer
+            .append("g1", rejected_ptime, &[Some(99.0), None])
+            .await
+            .unwrap_err();
+        match err {
+            TstoreError::PtimeOutsideFileDate {
+                ptime_ms,
+                file_date,
+            } => {
+                assert_eq!(ptime_ms, rejected_ptime);
+                assert_eq!(
+                    file_date,
+                    LocalDate::new(2026, 7, 15),
+                    "judged against the post-rotation file"
+                );
+            }
+            other => panic!("expected PtimeOutsideFileDate, got {other:?}"),
+        }
+
+        // Before close(): the rotation already flushed 7/12's buffer and
+        // created the 7/15 file.
+        let files = list_data_files(dir.path()).unwrap();
+        let dates: Vec<LocalDate> = files.iter().map(|f| f.date).collect();
+        assert_eq!(
+            dates,
+            vec![LocalDate::new(2026, 7, 12), LocalDate::new(2026, 7, 15)]
+        );
+        let day12 = TsReader::open(&files[0].path).await.unwrap();
+        let day12_rows = day12.read_range("g1", i64::MIN, i64::MAX).await.unwrap();
+        assert_eq!(
+            day12_rows
+                .iter()
+                .map(|s| (s.ptime_ms, s.values[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (DAY1_START_MS, Some(1.0)),
+                (DAY1_START_MS + 1_000, Some(2.0))
+            ],
+            "the buffered rows were flushed to the 7/12 file by the rotation"
+        );
+        drop(day12);
+
+        writer.close().await.unwrap();
+        let rows = all_rows(dir.path(), "g1").await;
+        assert!(
+            rows.iter().all(|(_, p, _)| *p != rejected_ptime),
+            "the rejected row must be in neither file: {rows:?}"
+        );
+        assert_eq!(rows.len(), 2);
     }
 
     /// The collector's write pattern - `ptime` read from the same clock that

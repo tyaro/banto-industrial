@@ -63,7 +63,8 @@
 //!
 //! [`findable`][]: 記録時刻とファイル日付の契約（#424、2026-09-24 オーナー
 //! 決定）。[`findable::ptime_is_findable_in`] は「その時刻の行をその日付の
-//! ファイルに置けば読み出し側（`banto-tsquery`）が見つけられる」の述語で、
+//! ファイルに置けば、その時刻を含むどの検索範囲でも読み出し側
+//! （`banto-tsquery`）のファイル選択から漏れない」の述語で、
 //! [`writer::TsWriter::append`] はこれが偽の行を拒否する。読み出し側の候補
 //! ファイル選び（[`findable::candidate_date_range`]）と保持期間の削除
 //! （[`files::prune_files`]）はこの契約に依存する。
