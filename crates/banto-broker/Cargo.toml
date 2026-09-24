@@ -13,10 +13,12 @@ license.workspace = true
 publish.workspace = true
 
 # `test-util`: フェイクブローカー `spawn_test_handle_answering_ok`（ネットワーク
-# なし・即時応答）をこのクレート外にも公開するゲート。relay-wright の
+# なし・即時応答）をこのクレート外にも公開するゲート。もとは relay-wright の
 # engine 側テスト（writer.rs のレート制限テスト等）が W3-A から引き続き使う
-# ため dev-dependencies で有効化する。将来 banto-hub 側のテストが同種の
-# フェイクを要る場合も同じ口を使う想定。既定オフ（本番ビルドでは公開しない）。
+# ため設けたが、relay-wright は 2026-09-24 に main から外した（docs/plan.md）。
+# 現在は banto-hub 側のテストが同種のフェイクとして使っている
+# （apps/banto-hub/core/Cargo.toml の dev-dependencies 参照）。既定オフ
+# （本番ビルドでは公開しない）。
 [features]
 test-util = []
 

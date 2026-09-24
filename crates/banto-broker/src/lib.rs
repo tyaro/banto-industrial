@@ -20,10 +20,14 @@
 //! (safety invariant #2, "structural eval/exec separation" - only
 //! `writer::Writer` holds a write-capable [`BrokerHandle`]); this crate's doc
 //! is this module's *how*, now portable to any caller rather than
-//! relay-wright-specific. Relay-wright's pre-extraction test suite (`cargo
-//! test -p relay-wright-core`) is the regression net for the move: every
-//! relay-wright caller now reaches these types via `banto_broker::` instead
-//! of `crate::engine::broker::`, with zero behavioral change.
+//! relay-wright-specific. Relay-wright's pre-extraction test suite was the
+//! regression net for the move at the time (every relay-wright caller
+//! reached these types via `banto_broker::` instead of
+//! `crate::engine::broker::`, with zero behavioral change); relay-wright
+//! itself was archived on 2026-09-24 (`archive/relay-wright-2026-09-24`,
+//! see docs/plan.md) with its construct-and-drive-the-whole-stack behavior
+//! left to this crate's own `#[cfg(test)]` suite below and
+//! `modbus_driver`'s.
 //!
 //! ## Protocol abstraction (I9 / Issue #130, 2026-09-01) and the one driver
 //! registered today

@@ -3,9 +3,10 @@
 状態: **chronogazer 分のみ実装済み・実機確認済み（2026-09-17、§11）**（共有 crate `crates/banto-hub-bootstrap` + chronogazer の
 設定カテゴリ「Hub 接続」）。**選んだタグの購読（#383 段階1）まで実装済み** — §10 参照。
 **relay-wright への配線は保留**（relay-wright 自体を 2026-09-17 の
-オーナー決定で凍結、plan.md §4b）。
+オーナー決定で凍結、2026-09-24 に main から外してタグ
+`archive/relay-wright-2026-09-24` に退避、plan.md §4b）。
 **banto-hub 側は変更ゼロ**（`apps/banto-hub/core/tests/client_bootstrap.rs` が前提を回帰固定）。
-最終更新: 2026-09-17
+最終更新: 2026-09-24（relay-wright の main からの退避を反映。本文の実装状況に変更なし）
 
 ---
 
@@ -186,8 +187,9 @@ banto-hub は**未ロックダウンのまま非 loopback バインドで起動�
   トレンド・計器表示は引き続き未実装**（#383 段階3）、**SLMP / Modbus TCP 直結も未実装**（段階2）。
 - **relay-wright への配線**（**保留**）。crate は app 非依存なので、`KeyStore`/`BootstrapState` の
   実装と設定カテゴリを足すだけで同じものが使える — が、relay-wright 自体が 2026-09-17 の
-  オーナー決定で凍結（構想の練り直し、plan.md §4b）。途中まで書いた配線はローカルブランチ
-  `feat/332-hub-bootstrap-relay-wright` に WIP として残してある（未 push・未完成）。
+  オーナー決定で凍結（構想の練り直し、plan.md §4b）、2026-09-24 に main から外してタグ
+  `archive/relay-wright-2026-09-24` に退避した。途中まで書いた配線はブランチ
+  `archive/relay-wright-332-wip` に WIP として残してある（未 push・未完成）。
 - Named Pipe / 実行ファイル署名検証 / mTLS / LAN pairing / 独自 Trusted Client 認証。
 - **banto-hub 側の変更**。前提は `apps/banto-hub/core/tests/client_bootstrap.rs` が固定している
   （試運転中の status は未認証で読める / `X-Banto-Client` は必須 / 未認証で `read` キーを発行できる /
