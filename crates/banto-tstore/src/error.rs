@@ -44,6 +44,28 @@ pub enum TstoreError {
         actual: usize,
     },
 
+    /// [`crate::writer::TsWriter::append`] was given a `ptime_ms` that a
+    /// query covering it could miss in the currently open file (dated
+    /// `file_date`, i.e. *after* any rotation this same `append` did): the
+    /// ptime/file-date contract in [`crate::findable`] (#424, owner decision
+    /// 2026-09-24). The row was never added to the buffer or written. The
+    /// ordinary date rotation that `append` runs before this check may
+    /// already have happened (rows buffered earlier flushed to the old day's
+    /// file, writer switched to the new day's file); without a date change
+    /// the open file and the other buffered rows are as before. In collection this only happens when the wall clock jumps
+    /// by roughly a day between taking `ptime` and the `append` call - the
+    /// sample is dropped and the next one is written normally.
+    #[error(
+        "記録時刻 {ptime_ms}ms はデータファイルの日付 {}-{:02}-{:02} から離れすぎているため書き込めません（その時刻を指定した検索で取りこぼすため。時計が大きく飛んだ可能性があります）",
+        .file_date.year,
+        .file_date.month,
+        .file_date.day
+    )]
+    PtimeOutsideFileDate {
+        ptime_ms: i64,
+        file_date: crate::date::LocalDate,
+    },
+
     /// A data file's name did not match the `YYYYMMDD-NNN.sqlite3` pattern
     /// this crate itself always writes - either filesystem corruption or a
     /// foreign file placed in the data directory by something else.

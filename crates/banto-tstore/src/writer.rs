@@ -52,11 +52,13 @@
 //! *newest* write for a given `ptime` always wins, overwriting whatever was
 //! stored there before. This crate deliberately does not clamp `ptime_ms` to
 //! be monotonic anywhere - [`TsWriter::append`] stores exactly the `ptime_ms`
-//! its caller passes, every time. One consequence worth spelling out: for the
-//! stretch of time the clock had jumped back over, the regressed interval's
-//! old rows are only overwritten one `ptime` at a time as the corrected clock
-//! ticks back up through them - a reader querying mid-recovery sees a mix of
-//! old and already-overwritten samples, not an atomic cutover.
+//! its caller passes, every time (or rejects the row outright, never alters
+//! it - see "The ptime/file-date contract" below). One consequence worth
+//! spelling out: for the stretch of time the clock had jumped back over, the
+//! regressed interval's old rows are only overwritten one `ptime` at a time
+//! as the corrected clock ticks back up through them - a reader querying
+//! mid-recovery sees a mix of old and already-overwritten samples, not an
+//! atomic cutover.
 //!
 //! `ON CONFLICT ... DO UPDATE` rather than `INSERT OR REPLACE`: `OR REPLACE`
 //! is a delete-then-insert under the hood, which would needlessly perturb the
@@ -78,6 +80,47 @@
 //! `tests::same_ptime_within_one_flush_batch_last_value_wins` (and
 //! `tests::appending_the_same_ptime_twice_overwrites_the_stored_row` for the
 //! across-flush case).
+//!
+//! ## The ptime/file-date contract (#424, owner decision 2026-09-24)
+//!
+//! The file a row goes into is picked by the clock (rotation above), not by
+//! the row's own `ptime_ms`, while the read side (`banto-tsquery`'s
+//! `candidate_files`) picks the files to open by the date in their *name*
+//! alone. The two only agree if a row's time is near its file's date, so
+//! [`TsWriter::append`] enforces that: a row is accepted only if
+//! [`crate::findable::ptime_is_findable_in`]`(current file's date,
+//! ptime_ms)` - the very predicate the read side's file selection is defined
+//! by ([`crate::findable::candidate_date_range`]) - holds, i.e. roughly "the
+//! row's time is within 24h of the file's date" (exact closed form in
+//! [`crate::findable`]'s doc). Otherwise `append` returns
+//! [`TstoreError::PtimeOutsideFileDate`], after `rotate_if_needed` (so the
+//! check is against the file the row would really land in) and before
+//! buffering: the rejected row is never added to the buffer or written. The
+//! ordinary rotation that runs *before* the check still happens, though - if
+//! the local date has changed since the last `append`, the rows already
+//! buffered are flushed to the outgoing day's file and the writer switches to
+//! the new day's file, and only then is the row rejected (pinned by
+//! `tests::a_rejected_append_after_a_date_change_still_rotates_first`).
+//! Without a date change, a rejection leaves the open file and the other
+//! buffered rows as they were. Retention (`crate::files::prune_files`) also
+//! relies on this contract, since it too goes by the file-name date alone.
+//!
+//! Relation to the wall-clock-wins upsert above: that decision says the
+//! *value* stored for a `ptime` is always the newest `append`'s, and `ptime`
+//! is never clamped or rewritten; this contract does not change that - it
+//! only refuses rows that a query covering their `ptime` could miss (a
+//! narrow range that does not also reach the file's date would not open
+//! the file). An ordinary backward clock jump (NTP, manual correction) keeps
+//! `ptime` and the rotation clock together (both come from the same clock),
+//! so it is still accepted and upserted as before. What gets rejected is a
+//! row whose `ptime` was taken more than about a day away from the clock
+//! reading that dated the file - in collection that takes a clock jump (in
+//! either direction) of at least `24h - |UTC offset|` between reading
+//! `ptime` and calling `append`, which is the only way the two can drift that
+//! far apart. The owner decision is to drop that one sample (the collector
+//! records it through its existing append-failure path) rather than design a
+//! per-file min/max `ptime` index (案 B, deferred until PLC-side timestamps
+//! or back-filling historical data are needed).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -91,6 +134,7 @@ use crate::config::{compute_config_hash, StoreConfig};
 use crate::date::LocalDate;
 use crate::error::TstoreError;
 use crate::files::latest_file_for_date;
+use crate::findable::ptime_is_findable_in;
 use crate::schema::{self, column_name_for_index, table_name_for_index};
 
 /// Buffering thresholds - "既定: 1秒 or 500行" (design). Not part of
@@ -222,6 +266,14 @@ impl TsWriter {
     /// `None` = missing sample (NULL). May trigger an in-line rotation
     /// (local-midnight crossed) and/or flush (thresholds crossed) - see this
     /// module's doc comment.
+    ///
+    /// Rejects a `ptime_ms` that a query covering it could miss in the
+    /// (post-rotation) current file with
+    /// [`TstoreError::PtimeOutsideFileDate`]; see "The ptime/file-date
+    /// contract" in this module's doc. A rejected
+    /// row is never added to the buffer. The normal date rotation that runs
+    /// before the check (flushing the rows already buffered and switching
+    /// files) can still have happened by the time the error is returned.
     pub async fn append(
         &self,
         group_key: &str,
@@ -241,6 +293,17 @@ impl TsWriter {
                 group_key: group_key.to_string(),
                 expected,
                 actual: values.len(),
+            });
+        }
+        // #424 contract (this module's doc, "The ptime/file-date contract"):
+        // checked against the file this row would actually land in - i.e.
+        // *after* `rotate_if_needed` - and before anything is buffered, so a
+        // rejected row is never written. Any rotation `rotate_if_needed` just
+        // did (flush of the old day's buffer, file switch) stands.
+        if !ptime_is_findable_in(inner.current_date, ptime_ms) {
+            return Err(TstoreError::PtimeOutsideFileDate {
+                ptime_ms,
+                file_date: inner.current_date,
             });
         }
 
@@ -1269,6 +1332,326 @@ mod tests {
             .await
             .expect("flushing nothing twice should be fine");
         writer.close().await.unwrap();
+    }
+
+    // --- #424: the ptime/file-date contract ----------------------------
+    //
+    // Clock at DAY1_START_MS (2026-07-12T00:00Z, local 09:00 at +9h) -> the
+    // open file is dated 2026-07-12, whose UTC day starts at DAY1_START_MS.
+    // The contract window is [DAY1_START_MS - 24h, DAY1_START_MS + 48h)
+    // (`crate::findable`'s closed form).
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    type StoredRow = (LocalDate, i64, Vec<Option<f64>>);
+
+    async fn all_rows(dir: &Path, group: &str) -> Vec<StoredRow> {
+        let mut rows = Vec::new();
+        for file in list_data_files(dir).unwrap() {
+            let reader = TsReader::open(&file.path).await.unwrap();
+            for sample in reader.read_range(group, i64::MIN, i64::MAX).await.unwrap() {
+                rows.push((file.date, sample.ptime_ms, sample.values));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_rejects_a_ptime_outside_the_file_date_window_and_accepts_its_edges() {
+        let dir = TempDir::new("ptime-window");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+        let file_date = LocalDate::new(2026, 7, 12);
+
+        let lo = DAY1_START_MS - 24 * HOUR_MS;
+        let hi = DAY1_START_MS + 48 * HOUR_MS; // exclusive
+        for (ptime, ok) in [
+            (lo - 1, false),
+            (lo, true),
+            (lo + 1, true),
+            (DAY1_START_MS, true),
+            (hi - 1, true),
+            (hi, false),
+            (hi + 1, false),
+            (0, false),
+            (-1, false),
+            (i64::MIN, false),
+            (i64::MAX, false),
+        ] {
+            let result = writer
+                .append("g1", ptime, &[Some(ptime as f64), None])
+                .await;
+            if ok {
+                result.unwrap_or_else(|e| panic!("ptime {ptime} should be accepted: {e}"));
+            } else {
+                match result {
+                    Err(TstoreError::PtimeOutsideFileDate {
+                        ptime_ms,
+                        file_date: d,
+                    }) => {
+                        assert_eq!(ptime_ms, ptime);
+                        assert_eq!(d, file_date);
+                    }
+                    other => panic!("ptime {ptime} should be rejected, got {other:?}"),
+                }
+            }
+        }
+        writer.close().await.unwrap();
+
+        let rows = all_rows(dir.path(), "g1").await;
+        let stored: Vec<i64> = rows.iter().map(|(_, p, _)| *p).collect();
+        assert_eq!(stored, vec![lo, lo + 1, DAY1_START_MS, hi - 1]);
+        assert!(rows.iter().all(|(d, _, _)| *d == file_date));
+    }
+
+    /// Rejection *without* a date change: nothing rotates, so the open file
+    /// and the other buffered rows are exactly as before. (With a date
+    /// change the rotation still happens first - see
+    /// `a_rejected_append_after_a_date_change_still_rotates_first`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_append_without_a_date_change_leaves_the_file_and_the_buffer_intact() {
+        let dir = TempDir::new("ptime-reject-state");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open_with_options(
+            dir.path(),
+            two_group_config(),
+            clock,
+            WriterOptions {
+                max_buffered_rows: 1_000,
+                flush_interval_ms: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Buffered, not yet flushed.
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g2", DAY1_START_MS, &[Some(2.0)])
+            .await
+            .unwrap();
+
+        let err = writer
+            .append("g1", DAY1_START_MS + 72 * HOUR_MS, &[Some(99.0), None])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TstoreError::PtimeOutsideFileDate { .. }));
+        // Human-readable: names the file date, not a Debug dump.
+        let message = err.to_string();
+        assert!(message.contains("2026-07-12"), "{message}");
+
+        // The writer keeps working, on the same file.
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(3.0), None])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        let g1 = all_rows(dir.path(), "g1").await;
+        assert_eq!(
+            g1.iter().map(|(_, p, v)| (*p, v[0])).collect::<Vec<_>>(),
+            vec![
+                (DAY1_START_MS, Some(1.0)),
+                (DAY1_START_MS + 1_000, Some(3.0))
+            ]
+        );
+        let g2 = all_rows(dir.path(), "g2").await;
+        assert_eq!(g2.len(), 1);
+        assert_eq!(g2[0].2, vec![Some(2.0)]);
+    }
+
+    /// Rejection *with* a date change (#426 review): unflushed rows in the
+    /// 7/12 file, clock moved to 7/15, then a 7/12 `ptime` is appended. The
+    /// ordinary rotation runs before the check - the buffered rows are
+    /// flushed to the 7/12 file and the writer switches to a 7/15 file - and
+    /// only then is the row rejected. The rejected row is in neither file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_append_after_a_date_change_still_rotates_first() {
+        let dir = TempDir::new("ptime-reject-rotate");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open_with_options(
+            dir.path(),
+            two_group_config(),
+            clock.clone(),
+            WriterOptions {
+                max_buffered_rows: 1_000,
+                flush_interval_ms: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Buffered in the 7/12 file, not flushed.
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(2.0), None])
+            .await
+            .unwrap();
+        assert_eq!(list_data_files(dir.path()).unwrap().len(), 1);
+
+        // 7/15 local (+9h): three days later.
+        clock.advance_ms(72 * HOUR_MS);
+        let rejected_ptime = DAY1_START_MS + 2_000; // a 7/12 time
+        let err = writer
+            .append("g1", rejected_ptime, &[Some(99.0), None])
+            .await
+            .unwrap_err();
+        match err {
+            TstoreError::PtimeOutsideFileDate {
+                ptime_ms,
+                file_date,
+            } => {
+                assert_eq!(ptime_ms, rejected_ptime);
+                assert_eq!(
+                    file_date,
+                    LocalDate::new(2026, 7, 15),
+                    "judged against the post-rotation file"
+                );
+            }
+            other => panic!("expected PtimeOutsideFileDate, got {other:?}"),
+        }
+
+        // Before close(): the rotation already flushed 7/12's buffer and
+        // created the 7/15 file.
+        let files = list_data_files(dir.path()).unwrap();
+        let dates: Vec<LocalDate> = files.iter().map(|f| f.date).collect();
+        assert_eq!(
+            dates,
+            vec![LocalDate::new(2026, 7, 12), LocalDate::new(2026, 7, 15)]
+        );
+        let day12 = TsReader::open(&files[0].path).await.unwrap();
+        let day12_rows = day12.read_range("g1", i64::MIN, i64::MAX).await.unwrap();
+        assert_eq!(
+            day12_rows
+                .iter()
+                .map(|s| (s.ptime_ms, s.values[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (DAY1_START_MS, Some(1.0)),
+                (DAY1_START_MS + 1_000, Some(2.0))
+            ],
+            "the buffered rows were flushed to the 7/12 file by the rotation"
+        );
+        drop(day12);
+
+        writer.close().await.unwrap();
+        let rows = all_rows(dir.path(), "g1").await;
+        assert!(
+            rows.iter().all(|(_, p, _)| *p != rejected_ptime),
+            "the rejected row must be in neither file: {rows:?}"
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// The collector's write pattern - `ptime` read from the same clock that
+    /// dates the file, `append` a moment later - is never rejected across a
+    /// local-midnight crossing (under UTC offsets from -14h to +14h), a
+    /// DST-style offset change in either direction, or a backward clock jump
+    /// (NTP / manual correction) of any size. This is the "behavior does not
+    /// change" half of #424.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_style_appends_are_never_rejected() {
+        for offset_h in [-14i64, -8, 0, 9, 14] {
+            let offset = offset_h * HOUR_MS;
+            let dir = TempDir::new("collection-style");
+            // 2s before the local midnight that ends local 2026-07-12.
+            let local_midnight_utc = DAY1_START_MS + 86_400_000 - offset;
+            let clock = Arc::new(ManualClock::new(local_midnight_utc - 2_000, offset));
+            let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+                .await
+                .unwrap();
+
+            let mut expected = 0usize;
+            // One collection tick: read ptime, spend `lag_ms` reading the
+            // PLC, then append.
+            let tick = |lag_ms: i64| {
+                let ptime = clock.now_ms();
+                clock.advance_ms(lag_ms);
+                ptime
+            };
+
+            // Across local midnight, including a sample taken before and
+            // appended after it (lag up to 10s - a slow PLC read).
+            for lag in [0, 100, 1_500, 10_000] {
+                let ptime = tick(lag);
+                writer
+                    .append("g1", ptime, &[Some(1.0), None])
+                    .await
+                    .unwrap();
+                expected += 1;
+                clock.advance_ms(250);
+            }
+
+            // DST-style +1h then -1h offset change at local 23:30 (rotates
+            // forward to the next local date's file, then back).
+            clock.set_now_ms(local_midnight_utc + 86_400_000 - HOUR_MS / 2);
+            let ptime = tick(100);
+            writer
+                .append("g1", ptime, &[Some(2.0), None])
+                .await
+                .unwrap();
+            expected += 1;
+            clock.set_utc_offset_ms(offset + HOUR_MS);
+            let ptime = tick(100);
+            writer
+                .append("g1", ptime, &[Some(2.0), None])
+                .await
+                .unwrap();
+            expected += 1;
+            clock.set_utc_offset_ms(offset);
+            let ptime = tick(100);
+            writer
+                .append("g1", ptime, &[Some(3.0), None])
+                .await
+                .unwrap();
+            expected += 1;
+
+            // Backward clock jumps: 1h, 23h, 3 days (each re-dates the file
+            // from the same clock the sample's ptime comes from).
+            for back in [HOUR_MS, 23 * HOUR_MS, 72 * HOUR_MS] {
+                clock.advance_ms(-back);
+                let ptime = tick(100);
+                writer
+                    .append("g1", ptime, &[Some(4.0), None])
+                    .await
+                    .unwrap();
+                expected += 1;
+            }
+            writer.close().await.unwrap();
+
+            // The scenario really crossed local midnight (7/12 -> 7/13) and
+            // the DST step really rotated (7/13 -> 7/14).
+            let dates: Vec<LocalDate> = list_data_files(dir.path())
+                .unwrap()
+                .into_iter()
+                .map(|f| f.date)
+                .collect();
+            for d in [(2026, 7, 12), (2026, 7, 13), (2026, 7, 14)] {
+                assert!(
+                    dates.contains(&LocalDate::new(d.0, d.1, d.2)),
+                    "offset {offset_h}h: {d:?} not in {dates:?}"
+                );
+            }
+
+            let rows = all_rows(dir.path(), "g1").await;
+            assert_eq!(rows.len(), expected, "offset {offset_h}h");
+            for (date, ptime, _) in rows {
+                assert!(
+                    crate::findable::ptime_is_findable_in(date, ptime),
+                    "offset {offset_h}h: row {ptime} in file {date:?}"
+                );
+            }
+        }
     }
 
     // --- error cases -------------------------------------------------
