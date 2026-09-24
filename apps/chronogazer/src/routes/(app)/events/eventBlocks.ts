@@ -34,7 +34,18 @@
  *
  * **将来の制約**: 保持期間による削除（R0 §3.4、**まだ未実装**）が入ると、
  * 古い行（小さい `id`）が消えて末尾側の `OFFSET` がずれる。削除を実装する
- * ときは、この取得方法（サーバー側の `read_events` も含めて）を見直すこと。
+ * ときは、この取得方法（サーバー側の `read_events` も含めて）を見直すこと
+ * （`/audit-log` は削除があるので、同じ境界の総件数が減ったらスナップショット
+ * 失効として採らない - `routes/(app)/audit-log/auditBlocks.ts`）。
+ *
+ * ### 汎用部との関係（#410）
+ *
+ * 世代・境界・飛行中・ブロック単位の失敗・世代違いの応答の排除は、
+ * `/audit-log` と共通の `$lib/blockCache` に出した。ここに残るのは `/events`
+ * 固有の部分だけ: 失敗の型（`Readout` の 3 状態 + 往復の失敗）、境界の
+ * 食い違いの扱い（[`BOUNDARY_MISMATCH_MESSAGE`]）、画面に出す値
+ * （[`viewState`]）。**挙動は #409 のときから変えていない**（#409 の表テストが
+ * そのまま通ることで確かめている）。
  *
  * ### 自動では再試行しない
  *
@@ -44,9 +55,20 @@
  * ブロックの取得が成功するまで残る** - 別ブロックの成功では消さない。
  */
 import type { CollectEventList, CollectEventRow, ReadoutState } from '$lib/banto/collectAdmin';
+import {
+	BlockLoader,
+	applyOutcome as applyGenericOutcome,
+	blocksToFetch as genericBlocksToFetch,
+	initialCache as genericInitialCache,
+	markInFlight as genericMarkInFlight,
+	newGeneration as genericNewGeneration,
+	type ApplyResult as GenericApplyResult,
+	type BlockCache as GenericBlockCache,
+	type BlockPolicy,
+	type BlockRequest
+} from '$lib/blockCache';
 
-/** 1 ブロックの件数（`/audit-log` の `AuditLogWindow` と同じ 200）。 */
-export const BLOCK_SIZE = 200;
+export { BLOCK_SIZE, blockRequest, blocksFor, type BlockRequest } from '$lib/blockCache';
 
 /**
  * ブロック 1 つの取得が**行を入れられなかった**ときの持ち方。
@@ -61,30 +83,8 @@ export type BlockFailure =
 /** ブロック 1 つの取得の結末（`Readout` と往復の失敗を 1 つにしたもの）。 */
 export type BlockOutcome = { kind: 'ready'; list: CollectEventList } | BlockFailure;
 
-/** [`blockRequest`] が返す 1 ブロック分の要求。 */
-export interface BlockRequest {
-	block: number;
-	offset: number;
-	limit: number;
-	/** 世代のスナップショット境界。`null` = この世代の最初の取得（境界を決めさせる）。 */
-	asOfId: number | null;
-}
-
-/** ブロックキャッシュの状態（**不変**。純関数が新しい値を返す）。 */
-export interface BlockCache {
-	/** 「再読み込み」で進む。世代違いの応答は採らない。 */
-	generation: number;
-	/** この世代の境界と総件数。`null` = この世代はまだ 1 度も読めていない。 */
-	snapshot: { asOfId: number; totalCount: number } | null;
-	loaded: ReadonlySet<number>;
-	inFlight: ReadonlySet<number>;
-	/** ブロックごとの失敗と、それを記録した世代。 */
-	failed: ReadonlyMap<number, { failure: BlockFailure; generation: number }>;
-	/** 一度でも読めたか（「まだ読み込んでいない」と「0 件」の言い分け）。 */
-	everRead: boolean;
-	/** 画面に出している総件数（世代をまたいで保つ - 読めなかったときに 0 に潰さない）。 */
-	totalCount: number;
-}
+/** ブロックキャッシュの状態（汎用部の `BlockCache` を `/events` の失敗型で固定）。 */
+export type BlockCache = GenericBlockCache<BlockFailure>;
 
 /** 画面に出す値（[`viewState`] が [`BlockCache`] から導く）。 */
 export interface EventsViewState {
@@ -92,19 +92,13 @@ export interface EventsViewState {
 	/** `null` = まだ一度も読めていない（「0 件」と言い切らない）。 */
 	readout: ReadoutState | null;
 	errorText: string | null;
-	/** 取得に失敗したままのブロック数（0 なら「再読み込み」を出さない）。 */
+	/** 取得に失敗したままのブロック数。 */
 	failedBlockCount: number;
 	totalCount: number;
 }
 
 /** [`applyOutcome`] の結果。行の書き込みは画面（`$state`）に任せる。 */
-export interface ApplyResult {
-	cache: BlockCache;
-	/** 非 `null` なら、行の配列をこの長さで**作り直す**（世代の最初の応答）。 */
-	resetRows: number | null;
-	/** 非 `null` なら、この位置から行を書き込む。 */
-	write: { offset: number; rows: CollectEventRow[] } | null;
-}
+export type ApplyResult = GenericApplyResult<CollectEventRow, BlockFailure>;
 
 /**
  * 要求した境界と違う境界の応答が返ったときの文言。**採らない**（採ると
@@ -114,154 +108,45 @@ export interface ApplyResult {
 export const BOUNDARY_MISMATCH_MESSAGE =
 	'イベントの取得範囲がサーバー側で切り替わりました。「再読み込み」でもう一度読み込んでください。';
 
-export function initialCache(): BlockCache {
-	return {
-		generation: 0,
-		snapshot: null,
-		loaded: new Set(),
-		inFlight: new Set(),
-		failed: new Map(),
-		everRead: false,
-		totalCount: 0
-	};
-}
-
-/** 表示範囲 `[start, end)` が跨ぐブロック番号。空範囲は空配列。 */
-export function blocksFor(start: number, end: number): number[] {
-	if (end <= start) return [];
-	const firstBlock = Math.floor(Math.max(start, 0) / BLOCK_SIZE);
-	const lastBlock = Math.floor((end - 1) / BLOCK_SIZE);
-	const blocks: number[] = [];
-	for (let b = firstBlock; b <= lastBlock; b++) blocks.push(b);
-	return blocks;
-}
-
 /**
- * **何を取るかを決める唯一の述語**（スクロールでも「再読み込み」でも同じ）。
- *
- * 取りたいのは:
- * - 表示範囲のブロック、
- * - **総件数をまだ取れていない世代では先頭ブロック**（表示範囲が空でも）。
- *   初期状態は総件数 0 なので `BantoGrid` が通知する表示範囲は `{0, 0}` に
- *   なる - これを取りこぼすと、初回取得が失敗した後「再読み込み」を押しても
- *   **リクエストが 1 本も出ない**（サーバーが復旧しても回復できない）、
- * - **前の世代で失敗したブロック**（「再読み込み」が取り直す対象）。
- *
- * ただし、すでに取れている・飛行中・**今の世代で失敗した**ブロックは除く
- * （最後のひとつがモジュール doc の「自動では再試行しない」）。
- *
- * **この世代でまだ境界が決まっていない間は 1 ブロックしか投げない**: 並列に
- * 投げると、それぞれが別の境界（別のデータ集合）を返してしまい、直したはずの
- * 重複・欠落が戻る。最初の応答で境界が決まった後、残りは並列に取る。
+ * `/events` の方針: 境界が食い違った応答だけを採らない。**世代は止めない**
+ * （#409 の挙動のまま）。総件数の食い違いは見ない - `collect_events` には
+ * まだ削除が無い（モジュール doc「将来の制約」）。
  */
-export function blocksToFetch(cache: BlockCache, start: number, end: number): number[] {
-	const wanted = new Set<number>(blocksFor(start, end));
-	if (cache.snapshot === null) wanted.add(0);
-	for (const [block, record] of cache.failed) {
-		if (record.generation !== cache.generation) wanted.add(block);
+const EVENTS_POLICY: BlockPolicy<CollectEventRow, BlockFailure> = {
+	reject(snapshot, list) {
+		return list.asOfId !== snapshot.asOfId
+			? { kind: 'error', message: BOUNDARY_MISMATCH_MESSAGE }
+			: null;
 	}
-	const candidates = [...wanted]
-		.sort((a, b) => a - b)
-		.filter(
-			(block) =>
-				!cache.loaded.has(block) &&
-				!cache.inFlight.has(block) &&
-				cache.failed.get(block)?.generation !== cache.generation
-		);
-	if (cache.snapshot !== null) return candidates;
-	return cache.inFlight.size > 0 ? [] : candidates.slice(0, 1);
-}
+};
 
-/** 1 ブロックの要求（この世代の境界を必ず載せる）。 */
-export function blockRequest(cache: BlockCache, block: number): BlockRequest {
-	return {
-		block,
-		offset: block * BLOCK_SIZE,
-		limit: BLOCK_SIZE,
-		asOfId: cache.snapshot?.asOfId ?? null
-	};
+export function initialCache(): BlockCache {
+	return genericInitialCache<BlockFailure>();
 }
 
 export function markInFlight(cache: BlockCache, blocks: readonly number[]): BlockCache {
-	const inFlight = new Set(cache.inFlight);
-	for (const block of blocks) inFlight.add(block);
-	return { ...cache, inFlight };
+	return genericMarkInFlight(cache, blocks);
 }
 
-/**
- * 「再読み込み」= **新しい世代**。境界を外し（新しいイベントはここで入る）、
- * 取得済み・飛行中を捨てる。
- *
- * **失敗は捨てない**: 失敗の表示は、そのブロックの取得が成功するまで残す。
- * 世代が変わったことで [`blocksToFetch`] の対象に戻る（= 取り直す）。
- *
- * **飛行中を捨てるので `loading` はここで降りる**（#409 の C-3b 自己監査で
- * 直した「唯一の回復導線が、回復したいときだけ押せなくなる」の再発防止）。
- */
+/** 「再読み込み」= 新しい世代（汎用部の `newGeneration` そのもの。失敗は捨てない）。 */
 export function newGeneration(cache: BlockCache): BlockCache {
-	return {
-		...cache,
-		generation: cache.generation + 1,
-		snapshot: null,
-		loaded: new Set(),
-		inFlight: new Set()
-	};
+	return genericNewGeneration(cache);
 }
 
-/**
- * 1 ブロックの結末を取り込む。
- *
- * - **世代違いの応答は採らない**（飛行中の古い応答が新しい状態を巻き戻さない）、
- * - 失敗は**そのブロックに**記録する（別ブロックの成功で消えない）、
- * - 世代の最初の `ready` で境界と総件数を固定し、**行の配列を作り直す**
- *   （前の世代の行は境界がずれているので残さない）。
- */
+/** **何を取るかを決める唯一の述語**（汎用部の `blocksToFetch` そのもの）。 */
+export function blocksToFetch(cache: BlockCache, start: number, end: number): number[] {
+	return genericBlocksToFetch(cache, start, end, EVENTS_POLICY);
+}
+
+/** 1 ブロックの結末を取り込む（汎用部の `applyOutcome` に `/events` の方針を渡す）。 */
 export function applyOutcome(
 	cache: BlockCache,
 	block: number,
 	generation: number,
 	outcome: BlockOutcome
 ): ApplyResult {
-	if (generation !== cache.generation) return { cache, resetRows: null, write: null };
-
-	const inFlight = new Set(cache.inFlight);
-	inFlight.delete(block);
-	const failed = new Map(cache.failed);
-
-	if (outcome.kind !== 'ready') {
-		failed.set(block, { failure: outcome, generation });
-		return { cache: { ...cache, inFlight, failed }, resetRows: null, write: null };
-	}
-
-	if (cache.snapshot !== null && outcome.list.asOfId !== cache.snapshot.asOfId) {
-		failed.set(block, {
-			failure: { kind: 'error', message: BOUNDARY_MISMATCH_MESSAGE },
-			generation
-		});
-		return { cache: { ...cache, inFlight, failed }, resetRows: null, write: null };
-	}
-
-	failed.delete(block);
-	const loaded = new Set(cache.loaded);
-	loaded.add(block);
-	const firstOfGeneration = cache.snapshot === null;
-	const snapshot = cache.snapshot ?? {
-		asOfId: outcome.list.asOfId,
-		totalCount: outcome.list.totalCount
-	};
-	return {
-		cache: {
-			...cache,
-			inFlight,
-			failed,
-			loaded,
-			snapshot,
-			everRead: true,
-			totalCount: snapshot.totalCount
-		},
-		resetRows: firstOfGeneration ? snapshot.totalCount : null,
-		write: { offset: block * BLOCK_SIZE, rows: outcome.list.rows }
-	};
+	return applyGenericOutcome(cache, block, generation, outcome, EVENTS_POLICY);
 }
 
 /**
@@ -301,67 +186,20 @@ export interface EventBlockSink {
 }
 
 /**
- * 上の純関数を繋ぐだけの駆動役（Svelte に依存しないので vitest から素で
- * 回せる）。画面はこれに表示範囲と「再読み込み」を伝え、`sink` で受け取る。
+ * `/events` の駆動役（汎用部の `BlockLoader` に、`/events` の方針と
+ * [`viewState`] への変換を渡しただけ）。
  */
-export class EventBlockLoader {
-	#cache = initialCache();
-	#start = 0;
-	#end = 0;
-	readonly #fetcher: BlockFetcher;
-	readonly #sink: EventBlockSink;
-
+export class EventBlockLoader extends BlockLoader<CollectEventRow, BlockFailure> {
 	constructor(fetcher: BlockFetcher, sink: EventBlockSink) {
-		this.#fetcher = fetcher;
-		this.#sink = sink;
-	}
-
-	/** テストと画面の点検用（状態の読み取りだけ）。 */
-	get cache(): BlockCache {
-		return this.#cache;
-	}
-
-	/** 表示範囲が変わった（初回も含む）。 */
-	setRange(start: number, end: number): void {
-		this.#start = start;
-		this.#end = end;
-		this.#pump();
-	}
-
-	/** 手で押す「再読み込み」= 新しい世代（新しいイベントもここで入る）。 */
-	reload(): void {
-		this.#cache = newGeneration(this.#cache);
-		this.#sink.update(viewState(this.#cache));
-		this.#pump();
-	}
-
-	#pump(): void {
-		const blocks = blocksToFetch(this.#cache, this.#start, this.#end);
-		if (blocks.length === 0) {
-			this.#sink.update(viewState(this.#cache));
-			return;
-		}
-		const generation = this.#cache.generation;
-		const requests = blocks.map((block) => blockRequest(this.#cache, block));
-		this.#cache = markInFlight(this.#cache, blocks);
-		this.#sink.update(viewState(this.#cache));
-		for (const request of requests) {
-			void this.#fetcher(request)
-				// `fetcher` は結末を返す約束（画面側が `runWithLimit` で包む）。
-				// それでも reject したら、黙って `loading` を抱えたままにしない。
-				.catch((err: unknown): BlockOutcome => ({ kind: 'error', message: String(err) }))
-				.then((outcome) => this.#settle(request.block, generation, outcome));
-		}
-	}
-
-	#settle(block: number, generation: number, outcome: BlockOutcome): void {
-		const result = applyOutcome(this.#cache, block, generation, outcome);
-		this.#cache = result.cache;
-		if (result.resetRows !== null) this.#sink.resetRows(result.resetRows);
-		if (result.write) this.#sink.writeRows(result.write.offset, result.write.rows);
-		this.#sink.update(viewState(this.#cache));
-		// 境界が決まった直後に残りのブロックを投げる（世代の最初の 1 本だけを
-		// 待つ設計。[`blocksToFetch`]）。
-		this.#pump();
+		super(
+			fetcher,
+			{
+				resetRows: (length) => sink.resetRows(length),
+				writeRows: (offset, rows) => sink.writeRows(offset, rows),
+				update: (cache) => sink.update(viewState(cache))
+			},
+			EVENTS_POLICY,
+			(err) => ({ kind: 'error', message: String(err) })
+		);
 	}
 }

@@ -22,7 +22,7 @@
 //! | DELETE | `/api/users/{id}`    | -              | 204 (admin)             |
 //! | GET    | `/api/ui-settings/{key}` | -          | `{value: string \| null}` (any role) |
 //! | PUT    | `/api/ui-settings/{key}` | `{value}`  | 204 (any role)          |
-//! | POST   | `/api/audit-log/list` | `ListParams`   | `ListResult<AuditLogEntry>` (admin) |
+//! | POST   | `/api/audit-log/list?asOfId=` | `ListParams` | `AuditLogList` (`ListResult` + `asOfId`, admin) |
 //! | GET    | `/api/audit-log/config` | -            | `AuditSettings` (admin) |
 //! | PUT    | `/api/audit-log/config` | `AuditSettings` | `AuditSettings` (admin) |
 //! | POST   | `/api/backups`        | -              | `BackupInfo` (admin, spec M17) |
@@ -172,7 +172,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
+use banto_core::{BantoError, ErrorBody, FieldError, ListParams};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
     Identity, ServerEvent,
@@ -988,17 +988,33 @@ struct AuditLogState {
 /// sufficient - the audit-log viewer is an admin-only, infrequently-visited
 /// page, and each prune is a couple of indexed `DELETE`s, not an expensive
 /// scan.
+///
+/// `?asOfId=` （任意、#410）はスナップショット境界
+/// （[`crate::audit::AuditLogService::list_as_of`] の doc）。省略すると従来
+/// どおり全行が対象で、応答の `asOfId` にその時点の最大 `id` が入る。本文の
+/// `ListParams` は `banto-core` の型でフィールドを足せないので、`/api/collect/events`
+/// と同じくクエリで受ける。**床（`admin`）は変えていない**（ルーター側の
+/// `RoleGuard`）。
 async fn audit_log_list(
     State(state): State<AuditLogState>,
+    Query(query): Query<AuditLogListQuery>,
     Json(params): Json<ListParams>,
-) -> Result<Json<ListResult<crate::audit::AuditLogEntry>>, ApiError> {
+) -> Result<Json<crate::audit::AuditLogList>, ApiError> {
     if let Ok(config) = state.settings.audit_config().await {
         let _ = state
             .audit
             .prune(config.retention_days, config.retention_rows)
             .await;
     }
-    Ok(Json(state.audit.list(params).await?))
+    Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?))
+}
+
+/// `POST /api/audit-log/list?asOfId=` のクエリ（#410）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditLogListQuery {
+    #[serde(default)]
+    as_of_id: Option<i64>,
 }
 
 /// `GET /api/audit-log/config` (spec M14, `admin`-only): current retention
@@ -3704,6 +3720,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `?asOfId=`（#410）: 省略すると従来どおり全行 + 応答の `asOfId` に最大
+    /// `id`、指定するとその境界より後の行は件数にも行にも入らない。床は
+    /// `admin` のまま（クエリを付けても editor/viewer は 403）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_log_list_as_of_id_pins_the_snapshot() {
+        let (router, audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
+        for action in ["a", "b", "c"] {
+            audit
+                .try_record(AuditEntry {
+                    actor_username: Some("admin"),
+                    actor_role: Some("admin"),
+                    action,
+                    resource: "items",
+                    entity_id: None,
+                    detail: None,
+                    origin: "rest",
+                    result: "ok",
+                })
+                .await
+                .unwrap();
+        }
+
+        let first = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/audit-log/list",
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let as_of_id = first["asOfId"].as_i64().expect("asOfId が返ること");
+        let first_total = first["totalCount"].as_u64().unwrap();
+        let max_id = first["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .max()
+            .unwrap();
+        assert_eq!(as_of_id, max_id, "省略時の境界は最大 id: {first}");
+        assert_eq!(first["rows"].as_array().unwrap().len() as u64, first_total);
+
+        audit
+            .try_record(AuditEntry {
+                actor_username: Some("admin"),
+                actor_role: Some("admin"),
+                action: "after",
+                resource: "items",
+                entity_id: None,
+                detail: None,
+                origin: "rest",
+                result: "ok",
+            })
+            .await
+            .unwrap();
+
+        let pinned = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    &format!("/api/audit-log/list?asOfId={as_of_id}"),
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pinned["asOfId"], as_of_id);
+        assert_eq!(pinned["totalCount"].as_u64().unwrap(), first_total);
+        assert!(
+            pinned["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["action"] != "after"),
+            "境界より後の行が混ざった: {pinned}"
+        );
+
+        let fresh = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/audit-log/list",
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fresh["totalCount"].as_u64().unwrap(), first_total + 1);
+        assert!(fresh["asOfId"].as_i64().unwrap() > as_of_id);
+
+        for token in [&editor, &viewer] {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(
+                    &format!("/api/audit-log/list?asOfId={as_of_id}"),
+                    token,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     /// `GET /api/audit-log/config` is admin-only: 200 (with the default

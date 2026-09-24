@@ -20,12 +20,12 @@
 
 mod keyring_store;
 
-use banto_core::{BantoError, FieldError, ListParams, ListResult};
+use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::{
     lan_urls, start, static_router, AuthState, RunningServer, ServerConfig, ServerEvent,
 };
 use chronogazer_core::assets::FrontendAssets;
-use chronogazer_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
+use chronogazer_core::audit::{AuditEntry, AuditLogList, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // #383 段階2b / R1-C: 収集サービス。C-2 で `collect_*` コマンドと起動時の
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
@@ -1564,11 +1564,17 @@ async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoErr
 /// paginated read. Also opportunistically prunes first - same reasoning as
 /// `chronogazer_core::rest::audit_log_list` (see that function's doc
 /// comment).
+///
+/// `asOfId`（任意、#410）はスナップショット境界 - REST の
+/// `POST /api/audit-log/list?asOfId=` と同じ意味（
+/// `chronogazer_core::audit::AuditLogService::list_as_of` の doc）。省略すると
+/// 従来どおり全行が対象。床（`admin`）は変えていない。
 #[tauri::command]
 async fn audit_log_list(
     state: State<'_, AppState>,
     params: ListParams,
-) -> Result<ListResult<AuditLogEntry>, BantoError> {
+    as_of_id: Option<i64>,
+) -> Result<AuditLogList, BantoError> {
     require_role(&state, Role::Admin, "audit_log").await?;
     if let Ok(config) = state.settings.audit_config().await {
         let _ = state
@@ -1576,7 +1582,7 @@ async fn audit_log_list(
             .prune(config.retention_days, config.retention_rows)
             .await;
     }
-    state.audit.list(params).await
+    state.audit.list_as_of(params, as_of_id).await
 }
 
 /// Current audit-log retention policy (spec M14 Phase B). Any authenticated
