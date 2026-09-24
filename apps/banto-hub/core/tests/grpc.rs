@@ -1279,6 +1279,68 @@ async fn missing_authorization_metadata_is_unauthenticated() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
+/// #434: 無効なキーは DB が答えていれば従来どおり（失効・期限切れ・存在しない
+/// は `UNAUTHENTICATED`、トリップは `PERMISSION_DENIED`）。照合そのものが
+/// できない（DB エラー）ときは、どのキーでも `UNAVAILABLE`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_check_failure_is_unavailable_while_invalid_keys_stay_unauthenticated() {
+    let app = test_app("auth-check-failure").await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+    let service = ApiKeysService::new(app.pool.clone());
+    let scopes = || vec!["read".to_string()];
+    let valid = service.issue("state-valid", scopes(), None).await.unwrap();
+    let revoked = service
+        .issue("state-revoked", scopes(), None)
+        .await
+        .unwrap();
+    service.revoke(revoked.id).await.unwrap();
+    let tripped = service
+        .issue("state-tripped", scopes(), None)
+        .await
+        .unwrap();
+    service.trip(tripped.id).await.unwrap();
+    let expired = service
+        .issue("state-expired", scopes(), Some(1))
+        .await
+        .unwrap();
+    let keys: Vec<(&str, String, Option<tonic::Code>)> = vec![
+        ("valid", valid.key, None),
+        ("revoked", revoked.key, Some(tonic::Code::Unauthenticated)),
+        ("tripped", tripped.key, Some(tonic::Code::PermissionDenied)),
+        ("expired", expired.key, Some(tonic::Code::Unauthenticated)),
+        (
+            "unknown",
+            "bh_ZZZZZZZZ_well-formed-but-unregistered".to_string(),
+            Some(tonic::Code::Unauthenticated),
+        ),
+    ];
+    let catalog = || GetCatalogRequest {
+        connection: String::new(),
+        group: String::new(),
+    };
+    for (label, key, expected) in &keys {
+        let result = client.get_catalog(bearer_request(catalog(), key)).await;
+        assert_eq!(
+            result.as_ref().err().map(|status| status.code()),
+            *expected,
+            "{label}: {result:?}"
+        );
+    }
+
+    sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")
+        .execute(&app.pool)
+        .await
+        .expect("move api_keys away");
+    for (label, key, _) in &keys {
+        let err = client
+            .get_catalog(bearer_request(catalog(), key))
+            .await
+            .expect_err("the key cannot be checked");
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{label}: {err:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_token_shaped_bearer_is_rejected_as_unauthenticated() {
     // 設計 §5.4「セッション token は gRPC では受けない」- `bh_` で始まらない

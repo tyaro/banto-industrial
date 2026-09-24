@@ -89,7 +89,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::{Config, SwaggerUi};
 
-use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
+use crate::api_keys::{ApiKeyCheck, ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::computed::ComputedEngine;
@@ -6977,8 +6977,8 @@ async fn require_sink_admin(
         return Err(unauthorized_response());
     };
     if token.starts_with("bh_") {
-        match api_keys.lookup(token, now_ms).await {
-            Ok(ApiKeyLookup::Valid(ctx)) => {
+        match api_keys.check(token, now_ms).await {
+            ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
                 if let Err(err) = api_keys
                     .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
                     .await
@@ -6997,7 +6997,12 @@ async fn require_sink_admin(
             // （`crate::mcp::require_mcp_auth`と同じ判断 - この2
             // エンドポイントもサイドカー専用の機械アクセスで、拒否理由の
             // 細分は必須ではない）。
-            _ => Err(unauthorized_response()),
+            ApiKeyCheck::Answered(_) => Err(unauthorized_response()),
+            // #434: 照合できなかったときは 401 にしない（500）。
+            ApiKeyCheck::Unavailable(err) => {
+                eprintln!("banto-hub: sink admin API キーの照合に失敗しました: {err}");
+                Err(ApiError(err).into_response())
+            }
         }
     } else {
         match actor_identity(headers, auth, commissioning) {
@@ -9495,8 +9500,8 @@ async fn require_tag_space_auth(
         // にも last_used_at 更新にも同じ「今」を使う - 呼び出しごとに
         // ずれないよう一度だけ取得する。
         let now_ms = state.manager.clock().now_ms();
-        match state.api_keys.lookup(&token, now_ms).await {
-            Ok(ApiKeyLookup::Valid(ctx)) => {
+        match state.api_keys.check(&token, now_ms).await {
+            ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
                 // H10 ③(Option B): この認証層のゲートは「read 系ルートに
                 // 入れるか」だけを見る(has_any_read = 素の read か任意の
                 // read:... を1つでも持つか)。個々のタグの値を読めるかどうか
@@ -9517,7 +9522,7 @@ async fn require_tag_space_auth(
                 req.extensions_mut().insert(ctx);
                 next.run(req).await
             }
-            Ok(ApiKeyLookup::Revoked { id, name }) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::Revoked { id, name }) => {
                 let method = req.method().as_str().to_string();
                 let path = req.uri().path().to_string();
                 state
@@ -9535,7 +9540,7 @@ async fn require_tag_space_auth(
                     .await;
                 unauthorized_response()
             }
-            Ok(ApiKeyLookup::Tripped { id, name }) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::Tripped { id, name }) => {
                 let method = req.method().as_str().to_string();
                 let path = req.uri().path().to_string();
                 state
@@ -9553,7 +9558,7 @@ async fn require_tag_space_auth(
                     .await;
                 key_tripped_response()
             }
-            Ok(ApiKeyLookup::Expired { id, name }) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::Expired { id, name }) => {
                 let method = req.method().as_str().to_string();
                 let path = req.uri().path().to_string();
                 state
@@ -9571,10 +9576,13 @@ async fn require_tag_space_auth(
                     .await;
                 unauthorized_response()
             }
-            Ok(ApiKeyLookup::NotFound) => unauthorized_response(),
-            Err(err) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::NotFound) => unauthorized_response(),
+            // #434: 照合そのものができなかった（DB エラー・タイムアウト）ときは
+            // 401 にしない。セッションの照合失敗（下の `else` 節、#431）と同じ
+            // `ApiError` の 500。
+            ApiKeyCheck::Unavailable(err) => {
                 eprintln!("banto-hub: API キー照合に失敗しました: {err}");
-                unauthorized_response()
+                ApiError(err).into_response()
             }
         }
     } else {
@@ -11111,6 +11119,116 @@ mod tests {
             .find(|row| row.action == "denied" && row.resource == "api_keys")
             .expect("a denied/api_keys audit row should exist");
         assert_eq!(denied.entity_id.as_deref(), Some(id.to_string().as_str()));
+    }
+
+    /// #434: `GET` を API キーで叩いてステータスと本文を返す。
+    async fn get_with_key(
+        router: &Router,
+        path: &str,
+        key: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::get(path)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// #434: タグ空間 `/api/v1/*` とサイドカー用の `/api/sink/config`。無効な
+    /// キーは DB が答えていれば従来どおり（失効・期限切れ・存在しないは 401、
+    /// タグ空間のトリップは 403 `key_tripped`）。照合そのものができない（DB
+    /// エラー）ときは、どのキーでも 401 ではなく 500（`ApiError`、セッションの
+    /// 照合失敗と同じ形）。
+    #[tokio::test]
+    async fn api_key_check_failure_is_500_while_invalid_keys_stay_401() {
+        let env = test_env().await;
+        let scopes = || vec!["read".to_string(), "admin".to_string()];
+        let valid = env
+            .api_keys
+            .issue("state-valid", scopes(), None)
+            .await
+            .unwrap();
+        let revoked = env
+            .api_keys
+            .issue("state-revoked", scopes(), None)
+            .await
+            .unwrap();
+        env.api_keys.revoke(revoked.id).await.unwrap();
+        let tripped = env
+            .api_keys
+            .issue("state-tripped", scopes(), None)
+            .await
+            .unwrap();
+        env.api_keys.trip(tripped.id).await.unwrap();
+        let expired = env
+            .api_keys
+            .issue("state-expired", scopes(), Some(1))
+            .await
+            .unwrap();
+        let unknown = "bh_ZZZZZZZZ_well-formed-but-unregistered".to_string();
+        // (キー, `/api/v1/tags` の期待, `/api/sink/config` の期待)
+        let keys: Vec<(&str, String, StatusCode, StatusCode)> = vec![
+            ("valid", valid.key, StatusCode::OK, StatusCode::OK),
+            (
+                "revoked",
+                revoked.key,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "tripped",
+                tripped.key,
+                StatusCode::FORBIDDEN,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "expired",
+                expired.key,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "unknown",
+                unknown,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+        for (label, key, tags, sink) in &keys {
+            let (status, body) = get_with_key(&env.router, "/api/v1/tags", key).await;
+            assert_eq!(status, *tags, "tags {label}: {body:?}");
+            let (status, body) = get_with_key(&env.router, "/api/sink/config", key).await;
+            assert_eq!(status, *sink, "sink {label}: {body:?}");
+        }
+
+        sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")
+            .execute(&env.pool)
+            .await
+            .expect("move api_keys away");
+        for (label, key, _, _) in &keys {
+            for path in ["/api/v1/tags", "/api/sink/config"] {
+                let (status, body) = get_with_key(&env.router, path, key).await;
+                assert_eq!(
+                    status,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{path} {label}: the key could not be checked, so it is not a 401: {body:?}"
+                );
+                assert_eq!(body["kind"], "storage", "{path} {label}: {body:?}");
+            }
+        }
     }
 
     // --- H10 ①: 任意の有効期限 ----------------------------------------------

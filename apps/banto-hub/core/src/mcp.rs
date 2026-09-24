@@ -82,7 +82,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
-use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
+use crate::api_keys::{ApiKeyCheck, ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, RunMode};
@@ -354,8 +354,8 @@ async fn require_mcp_auth(
         return unauthorized_response();
     }
     let now_ms = state.manager.clock().now_ms();
-    match state.api_keys.lookup(&token, now_ms).await {
-        Ok(ApiKeyLookup::Valid(ctx)) => {
+    match state.api_keys.check(&token, now_ms).await {
+        ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
             if let Err(err) = state
                 .api_keys
                 .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
@@ -368,10 +368,14 @@ async fn require_mcp_auth(
         }
         // Revoked/Tripped/Expired/NotFound はいずれも一律 401
         // （このモジュールの doc comment「認証」節参照）。
-        Ok(_) => unauthorized_response(),
-        Err(err) => {
+        ApiKeyCheck::Answered(_) => unauthorized_response(),
+        // #434: 照合そのものができなかった（DB エラー・タイムアウト）ときは、
+        // キーが無効だと分かったわけではないので 401 にしない。JSON-RPC に
+        // 入る前の HTTP 層の失敗（401 と同じ層）なので、REST と同じ 500
+        // （`ApiError`）を返す。
+        ApiKeyCheck::Unavailable(err) => {
             eprintln!("banto-hub: MCP 用 API キー照合に失敗しました: {err}");
-            unauthorized_response()
+            banto_server::ApiError(err).into_response()
         }
     }
 }

@@ -93,7 +93,7 @@ use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
+use crate::api_keys::{ApiKeyCheck, ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::computed::ServerTagStore;
 use crate::controller::CollectionController;
@@ -384,8 +384,8 @@ impl GrpcService {
         // `self.manager.clock()` から一度だけ取る(REST の
         // `require_tag_space_auth` と同じ規約)。
         let now_ms = self.manager.clock().now_ms();
-        match self.api_keys.lookup(token, now_ms).await {
-            Ok(ApiKeyLookup::Valid(ctx)) => {
+        match self.api_keys.check(token, now_ms).await {
+            ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)) => {
                 // H10 ③(Option B): 「read 系 RPC に入れるか」だけを見る
                 // ゲート(has_any_read = 素の read か任意の read:... を1つ
                 // でも持つか)。個々のタグの値を読めるか(can_read_value)は
@@ -405,22 +405,28 @@ impl GrpcService {
                 }
                 Ok(ctx)
             }
-            Ok(ApiKeyLookup::Revoked { id, name }) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::Revoked { id, name }) => {
                 self.record_denied(id, "revoked", &name).await;
                 Err(Status::unauthenticated("この API キーは失効しています"))
             }
-            Ok(ApiKeyLookup::Tripped { id, name }) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::Tripped { id, name }) => {
                 self.record_denied(id, "tripped", &name).await;
                 Err(Status::permission_denied("key_tripped"))
             }
-            Ok(ApiKeyLookup::Expired { id, name }) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::Expired { id, name }) => {
                 self.record_denied(id, "expired", &name).await;
                 Err(Status::unauthenticated("この API キーは有効期限切れです"))
             }
-            Ok(ApiKeyLookup::NotFound) => Err(Status::unauthenticated("無効な API キーです")),
-            Err(err) => {
+            ApiKeyCheck::Answered(ApiKeyLookup::NotFound) => {
+                Err(Status::unauthenticated("無効な API キーです"))
+            }
+            // #434: 照合そのものができなかった（DB エラー・タイムアウト）ときは
+            // `UNAVAILABLE`（再試行してよい一時的な障害）。以前は `INTERNAL`。
+            ApiKeyCheck::Unavailable(err) => {
                 eprintln!("banto-hub: gRPC 用 API キー照合に失敗しました: {err}");
-                Err(Status::internal("認証処理に失敗しました"))
+                Err(Status::unavailable(
+                    "API キーを照合できませんでした（一時的な障害）。再試行してください",
+                ))
             }
         }
     }
