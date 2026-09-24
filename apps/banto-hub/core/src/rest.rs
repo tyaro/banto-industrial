@@ -1593,7 +1593,10 @@ async fn write_control_set(
 /// 停止・再開の監査の `detail`（#433）。`persisted` は「再起動後も要求どおり
 /// に残るか」（停止はどちらか一方、再開は両方）。`persistedDb` /
 /// `persistedFile`（状態ファイルを持たない構成では `null`）と、失敗した側の
-/// `dbError` / `fileError`、停止に割り込まれた再開の `interruptedByStop`。
+/// `dbError` / `fileError`、停止に割り込まれた再開の `interruptedByStop`、
+/// 停止の DB 保存が制限時間を超えた `dbTimedOut`（失敗ではなくタイムアウト。
+/// 書き込みは続いていて遅れて完了し得る - `crate::write_control` のモジュール
+/// doc「停止の DB 保存は 5 秒で打ち切る」）。
 /// MCP（`crate::mcp::tool_set_write_control`）も同じ形を使う。
 pub(crate) fn write_control_audit_detail(
     change: &crate::write_control::WriteControlChange,
@@ -1613,6 +1616,9 @@ pub(crate) fn write_control_audit_detail(
         }
         if change.interrupted_by_stop {
             object.insert("interruptedByStop".to_string(), json!(true));
+        }
+        if change.db_timed_out {
+            object.insert("dbTimedOut".to_string(), json!(true));
         }
     }
     detail
