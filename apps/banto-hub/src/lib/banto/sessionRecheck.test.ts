@@ -12,6 +12,12 @@
  * - ロックダウンされた（`commissioning_ended`）→ ログインが要る側へ進む
  * - 複数のストリームが同時に閉じても、確認は 1 回
  *
+ * #445: 再接続が続けて失敗したときの確認（`probeSessionAfterReconnectFailures`）
+ * は画面を動かさず（`invalidateAll()` を呼ばない）、ルートガードと同じ部品で
+ * `session` / `login` / `unverified` を返す。照合できない・状態を読めない・
+ * 返ってこない（時間切れ）は `unverified`（試運転モード中のネットワーク断で
+ * ログイン画面へ送らない）。
+ *
  * `invalidateAll()`（`$app/navigation`）は SvelteKit の実行時が無いと動かない
  * ので、呼ばれた回数だけ数える。ルートガードは `load()` を直接呼び、
  * `@banto/admin-core` は `sessionGuard.test.ts` と同じく**本物の** HTTP 認証
@@ -27,7 +33,8 @@ const state = vi.hoisted(() => ({
 	commissioning: { lockedDown: true } as { lockedDown: boolean } | null,
 	auth: null as unknown,
 	sessionLoad: vi.fn(async () => {}),
-	enterCommissioningMode: vi.fn()
+	enterCommissioningMode: vi.fn(),
+	commissioningMode: false
 }));
 
 vi.mock('$app/navigation', () => ({ invalidateAll: nav.invalidateAll }));
@@ -46,13 +53,23 @@ vi.mock('$lib/banto/commissioning', () => ({
 		status !== null && !status.lockedDown
 }));
 vi.mock('$lib/session.svelte', () => ({
-	sessionStore: { load: state.sessionLoad, enterCommissioningMode: state.enterCommissioningMode }
+	sessionStore: {
+		load: state.sessionLoad,
+		enterCommissioningMode: state.enterCommissioningMode,
+		get commissioningMode() {
+			return state.commissioningMode;
+		}
+	}
 }));
 vi.mock('$lib/settings.svelte', () => ({ settings: { syncFromProvider: async () => {} } }));
 
 import { createHttpAuthProvider } from '../../../node_modules/@banto/admin-core/src/providers/http';
 import { load } from '../../routes/(app)/+layout';
-import { recheckSessionAfterStreamClose } from './sessionRecheck';
+import {
+	probeSessionAfterReconnectFailures,
+	recheckSessionAfterStreamClose,
+	SESSION_PROBE_TIMEOUT_MS
+} from './sessionRecheck';
 import { SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
 
 const TOKEN_KEY = 'banto.auth.token';
@@ -105,6 +122,7 @@ beforeEach(() => {
 	vi.stubGlobal('sessionStorage', session);
 	vi.stubGlobal('localStorage', new MemoryStorage());
 	state.commissioning = { lockedDown: true };
+	state.commissioningMode = false;
 	state.sessionLoad.mockClear();
 	state.enterCommissioningMode.mockClear();
 	nav.invalidateAll.mockReset();
@@ -208,5 +226,114 @@ describe('走らせ直したルートガード（commissioning_ended の後）',
 		const thrown = await runGuard();
 		expect(isRedirect(thrown)).toBe(true);
 		expect(state.enterCommissioningMode).not.toHaveBeenCalled();
+	});
+});
+
+describe('probeSessionAfterReconnectFailures（#445: 再接続が続けて失敗したとき）', () => {
+	it.each([
+		['200 true', async () => jsonResponse(200, true), 'session'],
+		['200 false（失効したセッション）', async () => jsonResponse(200, false), 'login'],
+		['401', async () => jsonResponse(401, { kind: 'unauthorized' }), 'login'],
+		[
+			'照合の 500',
+			async () => jsonResponse(500, { kind: 'storage', message: 'database is locked' }),
+			'unverified'
+		],
+		[
+			'到達不能',
+			async (): Promise<Response> => {
+				throw new TypeError('Failed to fetch');
+			},
+			'unverified'
+		]
+	] as const)(
+		'ロックダウン済み・照合 %s → %s。画面は動かさない',
+		async (_label, check, expected) => {
+			session.setItem(TOKEN_KEY, 'tok');
+			useCheck(check);
+
+			expect(await probeSessionAfterReconnectFailures()).toBe(expected);
+			expect(nav.invalidateAll).not.toHaveBeenCalled();
+		}
+	);
+
+	it('照合できないときはトークンを消さない', async () => {
+		session.setItem(TOKEN_KEY, 'live-token');
+		useCheck(async () => jsonResponse(500, { kind: 'storage', message: 'x' }));
+
+		expect(await probeSessionAfterReconnectFailures()).toBe('unverified');
+		expect(session.getItem(TOKEN_KEY)).toBe('live-token');
+	});
+
+	it('トークンが無ければ login', async () => {
+		useCheck(async () => jsonResponse(200, true));
+		expect(await probeSessionAfterReconnectFailures()).toBe('login');
+	});
+
+	it('試運転モードの状態が読めなかった（ネットワーク断など）→ unverified（ガードと違い、ログインへ倒さない）', async () => {
+		state.commissioning = null;
+		state.commissioningMode = true;
+		useCheck(async () => jsonResponse(200, true));
+
+		expect(await probeSessionAfterReconnectFailures()).toBe('unverified');
+	});
+
+	it('試運転モードのまま → session（照合しない）', async () => {
+		state.commissioning = { lockedDown: false };
+		state.commissioningMode = true;
+		const check = vi.fn(async () => jsonResponse(401, { kind: 'unauthorized' }));
+		useCheck(check);
+
+		expect(await probeSessionAfterReconnectFailures()).toBe('session');
+		expect(check).not.toHaveBeenCalled();
+	});
+
+	it('試運転モードのつもりで繋いでいたが、ロックダウンされていた → login（ガードを走らせ直す）', async () => {
+		state.commissioning = { lockedDown: true };
+		state.commissioningMode = true;
+		session.setItem(TOKEN_KEY, 'tok');
+		useCheck(async () => jsonResponse(200, true));
+
+		expect(await probeSessionAfterReconnectFailures()).toBe('login');
+	});
+
+	it('返ってこなければ、時間切れで unverified（次の確認を起こせるように）', async () => {
+		vi.useFakeTimers();
+		try {
+			session.setItem(TOKEN_KEY, 'tok');
+			useCheck(() => new Promise<Response>(() => {}));
+
+			const result = probeSessionAfterReconnectFailures();
+			await vi.advanceTimersByTimeAsync(SESSION_PROBE_TIMEOUT_MS);
+			expect(await result).toBe('unverified');
+
+			// 時間切れの後は新しく確認できる。
+			useCheck(async () => jsonResponse(200, false));
+			expect(await probeSessionAfterReconnectFailures()).toBe('login');
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('同時に何度呼ばれても照合は 1 回（single-flight）', async () => {
+		session.setItem(TOKEN_KEY, 'tok');
+		let release: () => void = () => {};
+		const check = vi.fn(
+			() =>
+				new Promise<Response>((resolve) => {
+					release = () => resolve(jsonResponse(200, true));
+				})
+		);
+		useCheck(check);
+
+		const pending = [
+			probeSessionAfterReconnectFailures(),
+			probeSessionAfterReconnectFailures(),
+			probeSessionAfterReconnectFailures()
+		];
+		await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(1));
+		release();
+		expect(await Promise.all(pending)).toEqual(['session', 'session', 'session']);
+		expect(check).toHaveBeenCalledTimes(1);
 	});
 });

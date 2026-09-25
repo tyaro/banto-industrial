@@ -4,13 +4,19 @@
  * 守りたいこと: close `1008` は再接続しない（`session_revoked` /
  * `commissioning_ended` はログイン状態の確認、それ以外は理由の表示）。
  * `1008` 以外は理由文が何であっても従来どおり再接続する。
+ * #445: 再接続が続けて失敗したときの確認（いつ確かめるか・結果の扱い）。
  */
 import { describe, expect, it } from 'vitest';
 import {
 	classifyStreamClose,
 	createSingleFlight,
+	decideAfterSessionProbe,
+	RECONNECT_FAILURES_BEFORE_SESSION_PROBE,
 	REVOKED_CLOSE_CODE,
+	shouldProbeSession,
 	unknownRevocationMessage,
+	type SessionProbeResult,
+	type SessionProbeStep,
 	type StreamCloseAction
 } from './streamClose';
 
@@ -86,7 +92,58 @@ describe('classifyStreamClose', () => {
 	});
 });
 
+describe('再接続が続けて失敗したときの確認（#445）', () => {
+	it('2 回続けて失敗したら確かめる（1 回だけの失敗では確かめない）', () => {
+		expect(RECONNECT_FAILURES_BEFORE_SESSION_PROBE).toBe(2);
+		expect(shouldProbeSession(0)).toBe(false);
+		expect(shouldProbeSession(1)).toBe(false);
+		expect(shouldProbeSession(2)).toBe(true);
+		expect(shouldProbeSession(3)).toBe(true);
+	});
+
+	// [続けて失敗した回数, 確認の結果, 次の扱い]
+	const cases: Array<[number, SessionProbeResult, SessionProbeStep]> = [
+		[2, 'login', { kind: 'recheckSession', reason: 'reconnect_rejected' }],
+		[5, 'login', { kind: 'recheckSession', reason: 'reconnect_rejected' }],
+		// 有効: 数え直す（同じ状態が続いても、次の確認はまた 2 回失敗してから）。
+		[2, 'session', { kind: 'reconnect', consecutiveFailures: 0 }],
+		[7, 'session', { kind: 'reconnect', consecutiveFailures: 0 }],
+		// 照合できない: 数はそのまま（次の失敗 = 次のバックオフの後にまた確かめる）。
+		[2, 'unverified', { kind: 'reconnect', consecutiveFailures: 2 }],
+		[6, 'unverified', { kind: 'reconnect', consecutiveFailures: 6 }]
+	];
+
+	it.each(cases)('%i 回失敗 × 確認 %s', (failures, result, expected) => {
+		expect(decideAfterSessionProbe(result, failures)).toEqual(expected);
+	});
+
+	it('確認の後の数で、次に確かめるかが決まる（有効なら 2 回待ち、照合できなければ次の失敗で）', () => {
+		const afterSession = decideAfterSessionProbe('session', 2);
+		const afterUnverified = decideAfterSessionProbe('unverified', 2);
+		if (afterSession.kind !== 'reconnect' || afterUnverified.kind !== 'reconnect') {
+			throw new Error('reconnect のはず');
+		}
+		expect(shouldProbeSession(afterSession.consecutiveFailures + 1)).toBe(false);
+		expect(shouldProbeSession(afterSession.consecutiveFailures + 2)).toBe(true);
+		expect(shouldProbeSession(afterUnverified.consecutiveFailures + 1)).toBe(true);
+	});
+
+	it('クライアントの理由 reconnect_rejected をサーバーの 1008 の理由文としては受け付けない', () => {
+		expect(classifyStreamClose(1008, 'reconnect_rejected').kind).toBe('halt');
+	});
+});
+
 describe('createSingleFlight', () => {
+	it('結果を相乗りした全員に返す（#445 の確認の結果）', async () => {
+		let runs = 0;
+		const once = createSingleFlight(async () => {
+			runs += 1;
+			return 'login' as const;
+		});
+		expect(await Promise.all([once(), once()])).toEqual(['login', 'login']);
+		expect(runs).toBe(1);
+	});
+
 	it('実行中の呼び出しには相乗りし、1 回しか実行しない', async () => {
 		let runs = 0;
 		let release: () => void = () => {};

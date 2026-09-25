@@ -73,7 +73,10 @@
 		streamViewReducer,
 		type StreamViewEvent
 	} from '$lib/banto/monitorStreamView';
-	import { recheckSessionAfterStreamClose } from '$lib/banto/sessionRecheck';
+	import {
+		probeSessionAfterReconnectFailures,
+		recheckSessionAfterStreamClose
+	} from '$lib/banto/sessionRecheck';
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
@@ -398,6 +401,10 @@
 						connected ? { type: 'connected' } : { type: 'disconnected', code: closeCode }
 					);
 				},
+				// #445: 再接続が続けて失敗したら（切れている間の失効はブラウザには
+				// `1006` しか見えない）、画面を動かさずにログイン状態を確かめる。
+				// 失効を確認できたら `onHalt` の `recheckSession`（下）へ合流する。
+				probeSession: probeSessionAfterReconnectFailures,
 				onHalt: (action) => {
 					dispatchStreamView({ type: 'halted', action });
 					if (action.kind !== 'recheckSession') return;
@@ -473,6 +480,7 @@
 				接続中（リアルタイム更新中）
 			{:else if streamView.halt?.kind === 'recheckSession'}
 				<!-- #441: close 1008 + session_revoked / commissioning_ended。
+					#445: 再接続が続けて拒否され、確かめたら失効していた。
 					ルートガードの確認が終わるまでのあいだだけ出る。 -->
 				ログイン状態を確認しています…（リアルタイム更新は止まっています）
 			{:else if streamView.halt?.kind === 'halt'}
