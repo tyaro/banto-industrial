@@ -165,29 +165,64 @@ mod tests {
         );
     }
 
+    /// The part of `source` from `marker` up to the first `end` after it
+    /// (`"\n}\n"` = the closing brace of a top-level item).
+    fn item_body<'a>(source: &'a str, marker: &str, end: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("banto-hub `{marker}` moved; update this test"));
+        let body = &source[start..];
+        &body[..body
+            .find(end)
+            .unwrap_or_else(|| panic!("end of `{marker}`"))]
+    }
+
     /// The reason strings are written twice (here and in banto-hub). Fix the
     /// spelling in both directions against the Hub's source: every reason the
     /// Hub's API-key re-validation can send must be one this crate
     /// classifies, and every reason this crate classifies must be one the Hub
     /// sends. Also fix the close code.
+    ///
+    /// Since #444 the Hub names the reasons with `RevokedReason` and spells
+    /// them in `RevokedReason::as_str`: the variants
+    /// `api_key_recheck_verdict` returns are looked up there. (This test
+    /// caught that refactor: the old literal-scanning version found no
+    /// reasons at all once #444 was merged.)
     #[test]
     fn reason_strings_match_the_hub_source() {
         const HUB_STREAM_RS: &str = include_str!("../../../apps/banto-hub/core/src/stream.rs");
         // Tolerate a CRLF checkout.
         let source = HUB_STREAM_RS.replace("\r\n", "\n");
-        let start = source
-            .find("pub fn api_key_recheck_verdict")
-            .expect("banto-hub api_key_recheck_verdict moved; update this test");
-        let body = &source[start..];
-        let body = &body[..body.find("\n}\n").expect("end of api_key_recheck_verdict")];
-        let mut hub_reasons = Vec::new();
-        let mut rest = body;
-        while let Some(at) = rest.find("reason: \"") {
-            let after = &rest[at + "reason: \"".len()..];
-            let end = after.find('"').unwrap();
-            hub_reasons.push(&after[..end]);
+
+        // Which reasons the API-key re-validation returns.
+        let verdict = item_body(&source, "pub fn api_key_recheck_verdict", "\n}\n");
+        let mut variants: Vec<&str> = Vec::new();
+        let mut rest = verdict;
+        while let Some(at) = rest.find("RevokedReason::") {
+            let after = &rest[at + "RevokedReason::".len()..];
+            let end = after
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            variants.push(&after[..end]);
             rest = &after[end..];
         }
+        variants.sort_unstable();
+        variants.dedup();
+        assert!(!variants.is_empty(), "no RevokedReason in the verdict");
+
+        // How each of them is spelled on the wire.
+        let as_str = item_body(&source, "impl RevokedReason", "\n}\n");
+        let mut hub_reasons: Vec<&str> = variants
+            .iter()
+            .map(|variant| {
+                let arm = format!("Self::{variant} => \"");
+                let at = as_str
+                    .find(&arm)
+                    .unwrap_or_else(|| panic!("RevokedReason::{variant} is not a literal"));
+                let after = &as_str[at + arm.len()..];
+                &after[..after.find('"').unwrap()]
+            })
+            .collect();
         hub_reasons.sort_unstable();
         let mut ours = vec![
             REASON_API_KEY_REVOKED,
