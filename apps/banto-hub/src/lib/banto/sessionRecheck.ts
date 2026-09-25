@@ -30,7 +30,9 @@
  *   トークンまで消す。そこで確認は、開始時に読んだトークンで
  *   `/api/auth/check` を自分で呼び、結果を分類するだけにする
  *   （{@link classifySessionCheckResponse}、`check()` と同じ分類）。時間切れ
- *   では `AbortController` で要求そのものを止める。確認の最中にトークンが
+ *   では `AbortController` で要求そのものを止める。期限は確認の全体で共有し、
+ *   確認の中で待つ要求（試運転の状態・照合）の**すべて**に同じ `signal` を
+ *   渡す（PR #447 の再レビュー）。確認の最中にトークンが
  *   変わっていたら、その結果は古いトークンについての答えなので `unverified`
  *   にする（次の失敗でまた確かめる）。
  * - 試運転モードの状態は `fetchCommissioningStatusOrNull`（副作用なし）で読み、
@@ -78,7 +80,10 @@ async function probeOnce(signal: AbortSignal): Promise<SessionProbeResult> {
 	const assumedCommissioning = sessionStore.commissioningMode;
 	const token = storedToken();
 
-	const status = await fetchCommissioningStatusOrNull();
+	// 確認の中で待つ要求は、どれも同じ `signal`（全体で 10 秒の期限）で止める
+	// （PR #447 の再レビュー: ここに渡していなかったので、応答しない
+	// 試運転の状態の要求が時間切れの後も残り、確認のたびに積み重なった）。
+	const status = await fetchCommissioningStatusOrNull(signal);
 	if (signal.aborted) return 'unverified';
 	// ルートガードは取得の失敗を「ロックダウン済み」に倒す（安全側）が、
 	// ここでは画面を動かすかどうかの判断なので「照合できない」にする。

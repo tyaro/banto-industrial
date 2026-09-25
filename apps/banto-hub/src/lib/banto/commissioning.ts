@@ -77,14 +77,23 @@ function currentToken(): string | null {
 	return auth.getToken ? auth.getToken() : null;
 }
 
-async function httpRequest<T>(path: string, method: 'GET' | 'POST'): Promise<T> {
+/**
+ * `signal`（省略可）は `fetch` にそのまま渡す。中断すると要求そのもの
+ * （本文の読み出しを含む）が止まり、`ProviderError` で reject する
+ * （#445 の確認の時間切れ、PR #447 の再レビュー）。
+ */
+async function httpRequest<T>(
+	path: string,
+	method: 'GET' | 'POST',
+	signal?: AbortSignal
+): Promise<T> {
 	const headers: Record<string, string> = { ...CSRF_HEADER };
 	const token = currentToken();
 	if (token) headers.Authorization = `Bearer ${token}`;
 
 	let response: Response;
 	try {
-		response = await fetch(path, { method, headers });
+		response = await fetch(path, { method, headers, signal });
 	} catch {
 		throw new ProviderError({ kind: 'other', message: NETWORK_ERROR_MESSAGE });
 	}
@@ -109,9 +118,12 @@ async function httpRequest<T>(path: string, method: 'GET' | 'POST'): Promise<T> 
 	return (await response.json()) as T;
 }
 
-/** 現在の試運転モード/ロックダウン状態を取得する（未認証で呼べる）。 */
-export async function getCommissioningStatus(): Promise<CommissioningStatus> {
-	return httpRequest<CommissioningStatus>('/api/commissioning/status', 'GET');
+/**
+ * 現在の試運転モード/ロックダウン状態を取得する（未認証で呼べる）。
+ * `signal` を渡すと、中断で要求そのものを止める（省略可）。
+ */
+export async function getCommissioningStatus(signal?: AbortSignal): Promise<CommissioningStatus> {
+	return httpRequest<CommissioningStatus>('/api/commissioning/status', 'GET', signal);
 }
 
 /**
@@ -121,10 +133,15 @@ export async function getCommissioningStatus(): Promise<CommissioningStatus> {
  * 要求する）に倒すこと」という実装指示を、ここで一度だけ具体化する**
  * - 呼び出し側は `null` を「ロックダウン済みと同様に扱う」だけでよく、
  * try/catch をルートガード側に重複させない。
+ *
+ * #445 の確認（`sessionRecheck.ts`）も使う。確認は時間切れの `signal` を
+ * 渡し、中断された要求も `null` になる（ルートガードからは省略する）。
  */
-export async function fetchCommissioningStatusOrNull(): Promise<CommissioningStatus | null> {
+export async function fetchCommissioningStatusOrNull(
+	signal?: AbortSignal
+): Promise<CommissioningStatus | null> {
 	try {
-		return await getCommissioningStatus();
+		return await getCommissioningStatus(signal);
 	} catch {
 		return null;
 	}
