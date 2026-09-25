@@ -73,7 +73,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use banto_core::BantoError;
 use banto_hub_bootstrap::{
     error::{Error as BootstrapError, ErrorKind as BootstrapErrorKind},
-    BootstrapState, Bootstrapper, HubConnection, HubRecord, HubStatus, KeyStore,
+    BootstrapState, Bootstrapper, CredentialIdentity, HubConnection, HubRecord, HubStatus,
+    KeyStore,
 };
 use banto_tagclient::{
     BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind as TagErrorKind, StableTagId,
@@ -596,6 +597,10 @@ struct Generation {
     /// 同じでも張り直すことがある（資格情報の変更・終端状態）ので、同一性の
     /// 比較ではこれを使わない。
     sequence: usize,
+    /// この世代を張ったときに保存されていた資格情報（#446）。この世代が
+    /// close 1008 で止まったら、その理由はこのキーについての話として覚える
+    /// （[`RememberedRejection`]）。
+    credential: Option<CredentialIdentity>,
 }
 
 /// 現世代の [`TagClientState`] のうち、張り直しの判断に使う部分だけ。
@@ -872,19 +877,70 @@ fn takes_this_tick(pace: RetryPace, waited: &mut u32) -> bool {
     }
 }
 
+/// 覚えている「Hub がこのキーは使えないと言った理由」と、**それがどのキーに
+/// ついての話か**（#446）。
+///
+/// 理由だけを覚えると、別のキー・別の時点についての判定が混ざる（#449 の
+/// オーナーレビュー P2 3 件はすべてこの型）: 採用しなかった候補キーの判定で
+/// 保存中のキーの理由を上書きする、新しいキーを保存したのに古いキーの理由で
+/// 再試行を止め続ける、など。そこで理由には**判定の対象になった資格情報**
+/// （[`CredentialIdentity`]、接続先 + キーのプロセス内の識別子）を添え、
+/// 今保存している資格情報と一致するときだけ使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RememberedRejection {
+    kind: TagErrorKind,
+    /// 理由の対象の資格情報。世代の close 1008 なら、その世代を張ったキー。
+    /// `None` は「どのキーか確かめられなかった」（keyring が読めなかった等）。
+    credential: Option<CredentialIdentity>,
+}
+
 /// 覚えている close 1008 の分類を、世代の観測で進める（#446、純関数）。
 ///
 /// * 世代が 1008 の分類で止まっている → それを覚える（新しい理由で上書き）。
+///   対象の資格情報は**その世代を張ったキー**。
 /// * 世代が `Live` → 忘れる（このキーは今は使えている）。
 /// * それ以外（進行中・通信系の再試行中など）→ そのまま。
 fn advance_credential_rejection(
-    remembered: Option<TagErrorKind>,
+    remembered: Option<RememberedRejection>,
     state: TagClientConnectionState,
     last_error: Option<TagErrorKind>,
-) -> Option<TagErrorKind> {
+    generation_credential: Option<CredentialIdentity>,
+) -> Option<RememberedRejection> {
     match last_error {
-        Some(kind) if kind.is_credential_rejection() => Some(kind),
+        Some(kind) if kind.is_credential_rejection() => Some(RememberedRejection {
+            kind,
+            credential: generation_credential,
+        }),
         _ if state == TagClientConnectionState::Live => None,
+        _ => remembered,
+    }
+}
+
+/// 覚えている理由を、**今保存している資格情報**と、この往復の REST の判定で
+/// 直す（#446 / #449 レビュー、純関数）。
+///
+/// 1. 覚えている理由の対象が今保存している資格情報でなければ捨てる -
+///    キーが入れ替わった（`connect` の再発行・手動キーの採用。最後の検証が
+///    失敗していても、保存は済んでいる）か、無くなった（切断）。
+/// 2. REST の判定（`verdict`）は、**その判定の対象が今保存している資格情報で
+///    あるときだけ**使う（[`credential_rejection_after_status`]）。採用しな
+///    かった候補キーの判定は、保存中のキーについて何も言っていない。
+/// 3. それ以外はそのまま。
+fn settle_credential_rejection(
+    remembered: Option<RememberedRejection>,
+    verdict: Option<(&HubStatus, CredentialIdentity)>,
+    stored: Option<CredentialIdentity>,
+) -> Option<RememberedRejection> {
+    let remembered = remembered.filter(|memory| memory.credential == stored);
+    match (verdict, stored) {
+        (Some((status, judged)), Some(stored)) if judged == stored => {
+            credential_rejection_after_status(remembered.map(|memory| memory.kind), status).map(
+                |kind| RememberedRejection {
+                    kind,
+                    credential: Some(stored),
+                },
+            )
+        }
         _ => remembered,
     }
 }
@@ -899,13 +955,18 @@ fn advance_credential_rejection(
 /// | `KeyTripped`（403 `key_tripped`） | `KeyTripped` にする（1008 を受けていなくても、案内と見張りの頻度をトリップにそろえる） |
 /// | `AuthFailed`（401 = 失効・期限切れ・存在しない・キー無し） | `KeyTripped` なら捨てる（もうトリップではない）。失効などはそのまま（REST の 401 は理由を区別しないので、1008 の理由の方が詳しい） |
 /// | `Forbidden`（トリップ以外の 403 = キーは通るが読み取り権限が無い） | 失効・期限切れ・存在しない・トリップは捨てる（キーは認証できている）。理由不明はそのまま |
+/// | `Connected`（catalog を読めた） | 捨てる（このキーは今は使えている） |
 /// | それ以外 | そのまま |
+///
+/// **判定の対象が保存中の資格情報であることは、呼び出し側
+/// （[`settle_credential_rejection`]）が確かめる**。
 fn credential_rejection_after_status(
     remembered: Option<TagErrorKind>,
     status: &HubStatus,
 ) -> Option<TagErrorKind> {
     match (status, remembered) {
         (HubStatus::KeyTripped, _) => Some(TagErrorKind::KeyTripped),
+        (HubStatus::Connected { .. }, _) => None,
         (HubStatus::AuthFailed, Some(TagErrorKind::KeyTripped)) => None,
         (
             HubStatus::Forbidden,
@@ -954,11 +1015,13 @@ struct Subscription {
     /// られず、見張りも理由を忘れて 30 秒ごとに撃ち直す形に戻る。
     ///
     /// * 覚える: 世代を観測したとき・止めるとき
-    ///   （[`advance_credential_rejection`]）。
-    /// * 忘れる: 世代が `Live` になった／キーを入れ直して Hub に接続できた
-    ///   （[`Trigger::CredentialsChanged`] + `Connected`）／記録が無くなった
-    ///   （切断）。
-    credential_rejection: Option<TagErrorKind>,
+    ///   （[`advance_credential_rejection`]）、保存中のキーについての REST の
+    ///   判定がトリップだったとき（[`settle_credential_rejection`]）。
+    /// * 忘れる: 世代が `Live` になった／保存中の資格情報が入れ替わった・
+    ///   無くなった（最後の検証の成否に関わらない）／保存中のキーについての
+    ///   REST の判定が矛盾した。
+    /// * **どのキーの話かを必ず添える**（[`RememberedRejection`]）。
+    credential_rejection: Option<RememberedRejection>,
     /// [`RetryPace::Slowly`] の待ち周期のカウンタ（[`takes_this_tick`]）。
     slow_retry_ticks: u32,
 }
@@ -1025,6 +1088,7 @@ impl Subscription {
             self.credential_rejection,
             state.connection_state(),
             state.last_error(),
+            generation.credential,
         );
     }
 
@@ -1034,7 +1098,7 @@ impl Subscription {
         let pace = retry_pace(
             self.health(),
             self.reason.as_deref(),
-            self.credential_rejection,
+            self.credential_rejection.map(|memory| memory.kind),
         );
         takes_this_tick(pace, &mut self.slow_retry_ticks)
     }
@@ -1056,7 +1120,7 @@ impl Subscription {
                 self.reason.clone(),
                 self.unresolved.clone(),
                 self.unsupported.clone(),
-                self.credential_rejection,
+                self.credential_rejection.map(|memory| memory.kind),
                 last_value_at,
             );
         };
@@ -1331,12 +1395,10 @@ impl HubCall {
     /// スナップショットで表さないのは crate 側の `HubConnection` と同じ規律。
     fn timed_out(reason: String) -> Self {
         Self {
-            connection: HubConnection {
-                status: HubStatus::Unreachable {
-                    cause: banto_hub_bootstrap::UnreachableCause::Transport,
-                },
-                catalog: None,
-            },
+            // どのキーについても判定していない（`judged: None`）。
+            connection: HubConnection::failed(HubStatus::Unreachable {
+                cause: banto_hub_bootstrap::UnreachableCause::Transport,
+            }),
             reason_override: Some(reason),
         }
     }
@@ -1710,9 +1772,18 @@ impl HubService {
         if self.inner.mirror.current().is_none() {
             return;
         }
+        // 保存中の資格情報（keyring を読むだけ）。`connect` が新しいキーを
+        // 保存した後で打ち切られた／失敗した場合は突き合わせが走っていない
+        // ので、古いキーの理由が残っている - ここで捨てないと、保存済みの
+        // 新しいキーで再試行されない（#449 レビュー P2-1）。
+        let stored = self.inner.bootstrapper.stored_credential();
         {
-            // 頻度は close 1008 の理由まで見て決める（#446、[`retry_pace`]）。
             let mut slot = self.inner.subscription.lock().await;
+            if let Ok(stored) = stored {
+                slot.credential_rejection =
+                    settle_credential_rejection(slot.credential_rejection, None, stored);
+            }
+            // 頻度は close 1008 の理由まで見て決める（#446、[`retry_pace`]）。
             if !slot.takes_supervisor_tick() {
                 return;
             }
@@ -1962,6 +2033,7 @@ impl HubService {
             call.connection.catalog.as_ref(),
             trigger,
             call.reason_override.as_deref(),
+            call.connection.judged,
         )
         .await;
     }
@@ -1975,7 +2047,7 @@ impl HubService {
         catalog: Option<&CatalogSnapshot>,
         trigger: Trigger,
     ) {
-        self.reconcile_with_reason(status, catalog, trigger, None)
+        self.reconcile_with_reason(status, catalog, trigger, None, None)
             .await;
     }
 
@@ -1988,7 +2060,47 @@ impl HubService {
     ///
     /// 世代を張れる（`Connected` + catalog あり）経路では使われない: そこは
     /// 購読が成立しているので、打ち切りの話はもう関係ない。
+    ///
+    /// `judged` はこの往復の判定の対象になった資格情報（#446、
+    /// [`HubConnection::judged`]）。**今保存している資格情報と違うなら、この
+    /// 往復は保存中のキーについて何も言っていない**（採用しなかった候補キー）:
+    /// 世代・停止理由・覚えている理由のどれにも触らない。以前はここで候補の
+    /// 判定を保存中のキーに当てはめ、打ち間違えた候補 1 つで**受信中の購読まで
+    /// 止めていた**（#449 レビュー P2-3 の洗い出しで判明）。
     async fn reconcile_with_reason(
+        &self,
+        status: &HubStatus,
+        catalog: Option<&CatalogSnapshot>,
+        trigger: Trigger,
+        reason_override: Option<&str>,
+        judged: Option<CredentialIdentity>,
+    ) {
+        // keyring を読むだけ（ネットワークは叩かない）。読めなかったら
+        // 「どのキーか確かめられない」ので、覚えている理由は触らない。
+        let stored = self.inner.bootstrapper.stored_credential();
+        if let (Some(judged), Ok(stored)) = (judged, &stored) {
+            if *stored != Some(judged) {
+                return;
+            }
+        }
+        self.reconcile_generation(status, catalog, trigger, reason_override)
+            .await;
+        // 世代の停止（`stop` は止める前に観測する）で覚えた理由も含めて、
+        // 最後に「今保存している資格情報」と「この往復の判定」で直す。操作
+        // ロックの内側なので、ここまでの間に資格情報が入れ替わることはない。
+        if let Ok(stored) = stored {
+            let mut slot = self.inner.subscription.lock().await;
+            slot.credential_rejection = settle_credential_rejection(
+                slot.credential_rejection,
+                judged.map(|judged| (status, judged)),
+                stored,
+            );
+        }
+    }
+
+    /// [`Self::reconcile_with_reason`] の本体（世代・停止理由・未解決の
+    /// 突き合わせ）。覚えている close 1008 の理由は呼び出し側が最後に直す。
+    async fn reconcile_generation(
         &self,
         status: &HubStatus,
         catalog: Option<&CatalogSnapshot>,
@@ -2030,21 +2142,10 @@ impl HubService {
             };
             // `stop` は止める前に観測するので、世代が close 1008 で止まって
             // いたならその理由はここで覚えられ、`last_error` に残る（#446）。
+            // 保存中のキーとの突き合わせは呼び出し側が最後に行う。
             slot.stop(Some(reason)).await;
-            // 記録が無い（未設定・切断）= そのキーの話はもう無い。
-            if identity.is_none() {
-                slot.credential_rejection = None;
-            }
-            // REST の答え（今のキーについての最新の判定）と、覚えている
-            // close 1008 の理由を食い違わせない（#446）。
-            slot.credential_rejection =
-                credential_rejection_after_status(slot.credential_rejection, status);
             return;
         };
-        // キーを入れ直して Hub に接続できた: 前のキーについての close 1008 の
-        // 理由はもう何も語っていない（#446）。世代の停止（下の `stop`）が
-        // 古い世代から覚え直さないよう、止めた**後**で消す。
-        let forget_credential_rejection = trigger == Trigger::CredentialsChanged;
 
         // 2. 未解決タグ・購読できない名前は世代の有無に関わらず画面に出す。
         let plan = plan_bindings(&record.selected_tags, catalog);
@@ -2058,9 +2159,6 @@ impl HubService {
                 (false, false) => REASON_NONE_SUBSCRIBABLE,
             };
             slot.stop(Some(reason.to_owned())).await;
-            if forget_credential_rejection {
-                slot.credential_rejection = None;
-            }
             return;
         }
 
@@ -2087,9 +2185,6 @@ impl HubService {
         //    で、しかも毎回 keyring から作り直した `RestClient` を渡すため、
         //    素直に stop -> start する方が所有関係が単純になる。
         slot.stop(None).await;
-        if forget_credential_rejection {
-            slot.credential_rejection = None;
-        }
         // 終了中は**張り直さない**（[`Self::shutdown`]）。見張りの 1 周期が
         // Hub への往復の途中で終了処理と行き違ったときに、ここまで来てしまう
         // - そのまま `start()` すると、終了処理が閉じた直後に新しい WS が
@@ -2099,6 +2194,9 @@ impl HubService {
             slot.reason = Some(REASON_SHUTTING_DOWN.to_owned());
             return;
         }
+        // この世代を張るキー（#446）。`rest_client()` と同じ keyring を読む。
+        // 操作ロックの内側なので、2 回の読み取りの間に入れ替わることはない。
+        let credential = self.inner.bootstrapper.stored_credential().ok().flatten();
         let client = match self.inner.bootstrapper.rest_client() {
             Ok(Some(client)) => client,
             // keyring を持てない実行形態（`banto-serve`）やエントリ喪失。
@@ -2131,6 +2229,7 @@ impl HubService {
                         .generations_started
                         .fetch_add(1, Ordering::SeqCst)
                         + 1,
+                    credential,
                 });
                 slot.reason = None;
             }
@@ -3374,7 +3473,6 @@ mod tests {
             HubStatus::Unreachable {
                 cause: banto_hub_bootstrap::UnreachableCause::Transport,
             },
-            HubStatus::Connected { tag_count: 1 },
         ];
         let remembered: Vec<Option<TagErrorKind>> = std::iter::once(None)
             .chain(CREDENTIAL_REJECTIONS.into_iter().map(Some))
@@ -3409,6 +3507,12 @@ mod tests {
                 expected,
                 "{memory:?}"
             );
+            // catalog を読めた: このキーは今は使えている。
+            assert_eq!(
+                credential_rejection_after_status(memory, &HubStatus::Connected { tag_count: 1 }),
+                None,
+                "{memory:?}"
+            );
             for status in &not_connected {
                 assert_eq!(
                     credential_rejection_after_status(memory, status),
@@ -3417,6 +3521,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 同じ接続先に対する、別々の 2 本のキーの識別子（テスト用）。
+    fn two_credentials() -> (CredentialIdentity, CredentialIdentity) {
+        use banto_hub_bootstrap::state::memory::{MemoryKeyStore, MemoryState};
+
+        let keys = Arc::new(MemoryKeyStore::new());
+        let record = keyring_record("http://127.0.0.1:1", &[]);
+        let state = Arc::new(MemoryState::seeded(record));
+        let bootstrapper = Bootstrapper::new(
+            "chronogazer",
+            "inst",
+            Arc::clone(&keys) as Arc<dyn KeyStore>,
+            state,
+        );
+        keys.set(KEYRING_ACCOUNT, "bh_k1_opaque").unwrap();
+        let first = bootstrapper.stored_credential().unwrap().unwrap();
+        keys.set(KEYRING_ACCOUNT, "bh_k2_opaque").unwrap();
+        let second = bootstrapper.stored_credential().unwrap().unwrap();
+        assert_ne!(first, second);
+        (first, second)
+    }
+
+    fn remembered(
+        kind: TagErrorKind,
+        credential: CredentialIdentity,
+    ) -> Option<RememberedRejection> {
+        Some(RememberedRejection {
+            kind,
+            credential: Some(credential),
+        })
+    }
+
+    /// #449 レビュー: **別のキー・別の時点についての判定を、今保存している
+    /// キーの記憶に混ぜない**（表）。
+    #[test]
+    fn verdicts_about_another_key_never_touch_the_remembered_reason() {
+        use TagErrorKind as K;
+
+        let (k1, k2) = two_credentials();
+        let revoked = remembered(K::KeyRevoked, k1);
+
+        // P2-3: 採用しなかった候補 K2 の判定（トリップ・通常の 403・401・
+        // 接続できた）は、保存中の K1 の理由を変えない。
+        for status in [
+            HubStatus::KeyTripped,
+            HubStatus::Forbidden,
+            HubStatus::AuthFailed,
+            HubStatus::Connected { tag_count: 1 },
+        ] {
+            assert_eq!(
+                settle_credential_rejection(revoked, Some((&status, k2)), Some(k1)),
+                revoked,
+                "{status:?}"
+            );
+        }
+        // P2-1: 保存中の資格情報が K2 に入れ替わったら、最後の検証の成否に
+        // 関わらず K1 の理由は捨てる。
+        for verdict in [
+            None,
+            Some((
+                &HubStatus::Unreachable {
+                    cause: banto_hub_bootstrap::UnreachableCause::ServerError,
+                },
+                k2,
+            )),
+        ] {
+            assert_eq!(
+                settle_credential_rejection(revoked, verdict, Some(k2)),
+                None,
+                "{verdict:?}"
+            );
+        }
+        // 切断などで何も保存されていない。
+        assert_eq!(settle_credential_rejection(revoked, None, None), None);
+        // 保存中の K1 についての判定なら、表（`credential_rejection_after_status`）
+        // どおりに直す。
+        assert_eq!(
+            settle_credential_rejection(revoked, Some((&HubStatus::KeyTripped, k1)), Some(k1)),
+            remembered(K::KeyTripped, k1)
+        );
+        assert_eq!(
+            settle_credential_rejection(revoked, Some((&HubStatus::AuthFailed, k1)), Some(k1)),
+            revoked
+        );
+        assert_eq!(
+            settle_credential_rejection(revoked, Some((&HubStatus::Forbidden, k1)), Some(k1)),
+            None
+        );
+        // 判定が無ければ、保存中のキーの理由はそのまま。
+        assert_eq!(
+            settle_credential_rejection(revoked, None, Some(k1)),
+            revoked
+        );
+        // 保存中のキーのトリップは、記憶が無くても覚える。
+        assert_eq!(
+            settle_credential_rejection(None, Some((&HubStatus::KeyTripped, k2)), Some(k2)),
+            remembered(K::KeyTripped, k2)
+        );
     }
 
     /// 「ゆっくり」は [`SLOW_RETRY_EVERY_TICKS`] 周期に 1 回。ほかの頻度に
@@ -3440,28 +3643,32 @@ mod tests {
         assert!(takes_this_tick(RetryPace::EveryTick, &mut waited));
     }
 
-    /// 覚えている close 1008 の理由の進め方（#446）。
+    /// 覚えている close 1008 の理由の進め方（#446）。理由には、その世代を
+    /// 張ったキーを添える。
     #[test]
     fn the_remembered_close_reason_is_kept_until_the_key_works_again() {
         use TagClientConnectionState as State;
 
+        let (k1, k2) = two_credentials();
         for kind in CREDENTIAL_REJECTIONS {
-            // 1008 で止まったら覚える（前の理由は上書き）。
+            // 1008 で止まったら、その世代のキーについての理由として覚える
+            // （前の理由は上書き）。
             assert_eq!(
-                advance_credential_rejection(None, State::Unauthorized, Some(kind)),
-                Some(kind)
+                advance_credential_rejection(None, State::Unauthorized, Some(kind), Some(k1)),
+                remembered(kind, k1)
             );
             assert_eq!(
                 advance_credential_rejection(
-                    Some(TagErrorKind::KeyTripped),
+                    remembered(TagErrorKind::KeyTripped, k1),
                     State::Unauthorized,
-                    Some(kind)
+                    Some(kind),
+                    Some(k2)
                 ),
-                Some(kind)
+                remembered(kind, k2)
             );
             // 受信できたら忘れる。
             assert_eq!(
-                advance_credential_rejection(Some(kind), State::Live, None),
+                advance_credential_rejection(remembered(kind, k1), State::Live, None, Some(k1)),
                 None
             );
             // 進行中・通信系の再試行中・理由無しの 401/403 では、覚えたまま。
@@ -3473,8 +3680,8 @@ mod tests {
                 (State::Unauthorized, Some(TagErrorKind::Unauthorized)),
             ] {
                 assert_eq!(
-                    advance_credential_rejection(Some(kind), state, last_error),
-                    Some(kind),
+                    advance_credential_rejection(remembered(kind, k1), state, last_error, Some(k2)),
+                    remembered(kind, k1),
                     "{state} / {last_error:?}"
                 );
             }
@@ -3484,7 +3691,8 @@ mod tests {
             advance_credential_rejection(
                 None,
                 State::Unauthorized,
-                Some(TagErrorKind::Unauthorized)
+                Some(TagErrorKind::Unauthorized),
+                Some(k1)
             ),
             None
         );
@@ -4028,6 +4236,9 @@ mod tests {
             /// （#446: キーの失効・トリップを REST 側でも再現する。トリップは
             /// banto-hub と同じ `403 {"error":"key_tripped"}`）。
             rest_status: StdMutex<(u16, String)>,
+            /// `/api/v1/*` への次の応答を順に差し替える（空なら
+            /// `rest_status`）。「最後の検証だけ 503」を作るため（#449）。
+            rest_script: StdMutex<std::collections::VecDeque<(u16, String)>>,
             /// 開いている WS をこの close コードと理由文で閉じる合図（#446）。
             close: tokio::sync::watch::Sender<Option<(u16, String)>>,
         }
@@ -4039,6 +4250,7 @@ mod tests {
                     values: StdMutex::default(),
                     frame: StdMutex::default(),
                     rest_status: StdMutex::new((200, String::new())),
+                    rest_script: StdMutex::default(),
                     close: tokio::sync::watch::channel(None).0,
                 }
             }
@@ -4053,6 +4265,13 @@ mod tests {
 
             fn set_rest_status(&self, status: u16) {
                 *self.rest_status.lock().unwrap() = (status, String::new());
+            }
+
+            fn script_rest(&self, replies: &[u16]) {
+                *self.rest_script.lock().unwrap() = replies
+                    .iter()
+                    .map(|status| (*status, String::new()))
+                    .collect();
             }
 
             /// banto-hub のトリップの応答（`key_tripped_response`、#435）。
@@ -4175,12 +4394,31 @@ mod tests {
                     });
                     continue;
                 }
+                // `connect` の再発行経路（試運転中の Hub）。
+                let admin_reply = if head.contains("/api/commissioning/status") {
+                    Some(r#"{"lockedDown":false}"#.to_owned())
+                } else if head.starts_with("post /api/api-keys") {
+                    Some(
+                        r#"{"id":9,"name":"chronogazer-issued","key":"bh_issued00_new-opaque-secret"}"#
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                if let Some(body) = admin_reply {
+                    let mut stream = stream;
+                    read_http_request(&mut stream).await;
+                    write_response(&mut stream, body).await;
+                    continue;
+                }
                 let body = if head.contains("/api/v1/values") {
                     hub.values.lock().unwrap().clone()
                 } else {
                     hub.catalog.lock().unwrap().clone()
                 };
-                let (status, rejection) = hub.rest_status.lock().unwrap().clone();
+                let scripted = hub.rest_script.lock().unwrap().pop_front();
+                let (status, rejection) =
+                    scripted.unwrap_or_else(|| hub.rest_status.lock().unwrap().clone());
                 let mut stream = stream;
                 read_http_request(&mut stream).await;
                 if status == 200 {
@@ -4611,6 +4849,116 @@ mod tests {
             wait_live(&hub).await;
             assert_eq!(hub.subscription().await.last_error, None);
 
+            hub.inner.subscription.lock().await.stop(None).await;
+            server.abort();
+        }
+
+        /// K1 を close 1008（失効）で止めて、`status()` で世代まで止めた状態を
+        /// 作る。
+        async fn revoke_k1(mock: &MockHub, hub: &HubService) {
+            mock.set_rest_status(401);
+            mock.close_streams(1008, "api_key_revoked");
+            wait_generation(
+                hub,
+                TagClientConnectionState::Unauthorized,
+                Some(TagErrorKind::KeyRevoked),
+            )
+            .await;
+            assert_eq!(hub.status().await.unwrap().status, HubStatus::AuthFailed);
+            let view = hub.subscription().await;
+            assert_eq!(view.state, "stopped");
+            assert_eq!(view.last_error.as_deref(), Some("key_revoked"));
+        }
+
+        /// #449 レビュー P2-1: K1 が失効 → 「接続」で K2 を発行・保存 →
+        /// **最後の catalog 検証だけ 503** → 以後 200。K2 は保存されている
+        /// ので、K1 の失効の理由で再試行を止め続けてはいけない。明示操作・
+        /// 再発行なしに、見張りの 1 周期で K2 の購読が戻る。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_new_key_saved_before_a_failed_last_check_is_retried() {
+            let (mock, server, endpoint, _settings, hub) = live_hub_for_alpha().await;
+            revoke_k1(&mock, &hub).await;
+            let k1 = hub.inner.bootstrapper.stored_credential().unwrap();
+            assert!(!takes_tick(&hub).await, "失効した K1 では撃たない");
+
+            // `connect`: K1 の検証（401）→ 状態確認（401）→ 試運転中なので
+            // K2 を発行・保存 → K2 の検証だけ 503。
+            mock.set_rest_status(200);
+            mock.script_rest(&[401, 401, 503]);
+            let connected = hub.connect(&endpoint).await.unwrap();
+            assert!(
+                matches!(connected.status, HubStatus::Unreachable { .. }),
+                "{:?}",
+                connected.status
+            );
+            let k2 = hub.inner.bootstrapper.stored_credential().unwrap();
+            assert_ne!(k1, k2, "K2 は保存されている");
+            let view = hub.subscription().await;
+            assert_eq!(view.last_error, None, "K1 の理由は K2 には当てはめない");
+
+            // 以後 200。見張りの 1 周期（明示操作なし）で K2 の購読が戻る。
+            hub.supervise_once().await;
+            wait_live(&hub).await;
+            assert_eq!(hub.subscription().await.state, "live");
+            assert_eq!(hub.inner.bootstrapper.stored_credential().unwrap(), k2);
+
+            hub.inner.subscription.lock().await.stop(None).await;
+            server.abort();
+        }
+
+        /// #449 レビュー P2-3: 採用しなかった候補 K2 の判定（通常の 403 /
+        /// `403 key_tripped` / 401）で、保存中の K1 の理由を変えない。K1 の
+        /// 失効の理由と「再試行しない」が保たれる。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rejected_candidate_key_does_not_rewrite_the_stored_keys_reason() {
+            let (mock, server, endpoint, _settings, hub) = live_hub_for_alpha().await;
+            revoke_k1(&mock, &hub).await;
+            let k1 = hub.inner.bootstrapper.stored_credential().unwrap();
+
+            for (label, reply) in [
+                ("403 key_tripped", (403, r#"{"error":"key_tripped"}"#)),
+                ("403", (403, "")),
+                ("401", (401, "")),
+            ] {
+                *mock.rest_status.lock().unwrap() = (reply.0, reply.1.to_owned());
+                let rejected = hub
+                    .adopt_manual_key(&endpoint, "bh_cand0000_candidate-secret".to_owned())
+                    .await
+                    .unwrap();
+                assert!(!rejected.status.is_connected(), "{label}");
+                assert_eq!(
+                    hub.inner.bootstrapper.stored_credential().unwrap(),
+                    k1,
+                    "{label}: K1 は保存されたまま"
+                );
+                let view = hub.subscription().await;
+                assert_eq!(
+                    view.last_error.as_deref(),
+                    Some("key_revoked"),
+                    "{label}: K1 の理由を候補の判定で上書きしない"
+                );
+                for _ in 0..(SLOW_RETRY_EVERY_TICKS * 2) {
+                    assert!(!takes_tick(&hub).await, "{label}: Idle のまま");
+                }
+            }
+            server.abort();
+        }
+
+        /// #449 レビューの洗い出しで見つけた同じ型: 採用しなかった候補キーの
+        /// 判定で、**保存中の K1 の受信中の購読を止めない**。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rejected_candidate_key_leaves_a_live_subscription_alone() {
+            let (mock, server, endpoint, _settings, hub) = live_hub_for_alpha().await;
+            let first = generation_sequence(&hub).await.unwrap();
+            mock.set_rest_status(401);
+            let rejected = hub
+                .adopt_manual_key(&endpoint, "bh_typo0000_mistyped-secret".to_owned())
+                .await
+                .unwrap();
+            assert_eq!(rejected.status, HubStatus::AuthFailed);
+            let view = hub.subscription().await;
+            assert_eq!(view.state, "live", "打ち間違えた候補で購読を止めない");
+            assert_eq!(generation_sequence(&hub).await.unwrap(), first);
             hub.inner.subscription.lock().await.stop(None).await;
             server.abort();
         }

@@ -6,6 +6,7 @@
 //! [`KeyStore`], and prove the result by reading the catalog through
 //! `banto-tagclient`.
 
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,7 +18,7 @@ use crate::admin::{base_url, keyring_account, AdminClient, IssueOutcome, ProbedS
 use crate::error::{Error, ErrorKind, Result};
 use crate::scopes::{validate_issue_scopes, DEFAULT_SCOPES};
 use crate::state::{BootstrapState, HubRecord, KeyStore};
-use crate::status::{HubConnection, HubStatus, UnreachableCause};
+use crate::status::{CredentialIdentity, HubConnection, HubStatus, UnreachableCause};
 
 /// One app's Hub bootstrap.
 ///
@@ -29,6 +30,9 @@ pub struct Bootstrapper {
     installation_id: String,
     keys: Arc<dyn KeyStore>,
     state: Arc<dyn BootstrapState>,
+    /// Seed for [`CredentialIdentity`] (#446). Random per bootstrapper, so an
+    /// identity means nothing outside this process.
+    identity_seed: RandomState,
 }
 
 impl Bootstrapper {
@@ -53,7 +57,26 @@ impl Bootstrapper {
             installation_id: installation_id.into(),
             keys,
             state,
+            identity_seed: RandomState::new(),
         }
+    }
+
+    /// #446: the identity of the credential stored **now** (saved endpoint +
+    /// the key in the [`KeyStore`]), or `None` when nothing usable is stored.
+    /// Reads the record and the keyring only - no network. See
+    /// [`CredentialIdentity`] for what it is (and is not).
+    pub fn stored_credential(&self) -> Result<Option<CredentialIdentity>> {
+        let Some(record) = self.state.load()? else {
+            return Ok(None);
+        };
+        let Some(stored) = self.stored_key(&record.keyring_account)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.identity(&record.endpoint, &stored)))
+    }
+
+    fn identity(&self, endpoint: &str, key: &str) -> CredentialIdentity {
+        CredentialIdentity(self.identity_seed.hash_one((endpoint, key)))
     }
 
     /// Connect to `endpoint`, issuing a `read` key if this installation does
@@ -389,10 +412,11 @@ impl Bootstrapper {
         key: &Zeroizing<String>,
     ) -> Result<HubConnection> {
         let client = rest_client_for(endpoint, key)?;
+        let judged = self.identity(endpoint, key);
 
-        match client.fetch_catalog().await {
-            Ok(catalog) => Ok(HubConnection::connected(catalog)),
-            Err(error) => Ok(HubConnection::failed(match error.kind() {
+        let connection = match client.fetch_catalog().await {
+            Ok(catalog) => HubConnection::connected(catalog),
+            Err(error) => HubConnection::failed(match error.kind() {
                 // `banto-tagclient` collapses 401 and 403 into one kind;
                 // the split the UI needs is recovered with a status-only
                 // probe (see `AdminClient::probe_tags_status`).
@@ -405,8 +429,11 @@ impl Bootstrapper {
                     HubStatus::unreachable(UnreachableCause::InvalidEndpoint)
                 }
                 _ => HubStatus::unreachable(UnreachableCause::Transport),
-            })),
-        }
+            }),
+        };
+        // #446: the verdict is about exactly this (endpoint, key) - which may
+        // or may not be the stored one (see `HubConnection::judged`).
+        Ok(connection.judging(judged))
     }
 
     fn save_record(
@@ -671,6 +698,68 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
+    }
+
+    /// #449 review: every verdict says **which** credential it judged, and it
+    /// is compared with the stored one rather than assumed.
+    #[tokio::test]
+    async fn a_verdict_names_the_credential_it_judged() {
+        // The stored key: `refresh_catalog` judges exactly it.
+        let hub = MockHub::start(routes(vec![
+            (TAGS_ROUTE, vec![(401, String::from("{}"))]),
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (
+                ISSUE_ROUTE,
+                vec![(201, issued_body(43, "n2", "bh_second0_other-secret"))],
+            ),
+        ]));
+        let keys = Arc::new(MemoryKeyStore::new());
+        keys.set(&account_for(&hub), &key()).unwrap();
+        let state = Arc::new(MemoryState::seeded(seeded_record(&hub, None)));
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+        let k1 = bootstrapper.stored_credential().unwrap().unwrap();
+        let refreshed = bootstrapper.refresh_catalog().await.unwrap();
+        assert_eq!(refreshed.judged, Some(k1));
+
+        // A rejected candidate: judged, but never stored.
+        let candidate = bootstrapper
+            .adopt_manual_key(&hub.endpoint(), "bh_cand0000_candidate".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(candidate.status, HubStatus::AuthFailed);
+        assert!(candidate.judged.is_some());
+        assert_ne!(candidate.judged, Some(k1));
+        assert_eq!(bootstrapper.stored_credential().unwrap(), Some(k1));
+
+        // `connect` re-issues (the stored key is rejected): the new key is
+        // stored **before** its own check, and the verdict is about it even
+        // though that check fails here.
+        let connected = bootstrapper.connect(&hub.endpoint()).await.unwrap();
+        assert_eq!(connected.status, HubStatus::AuthFailed);
+        let k2 = bootstrapper.stored_credential().unwrap().unwrap();
+        assert_ne!(k2, k1);
+        assert_eq!(connected.judged, Some(k2));
+
+        // No key stored: nothing to identify.
+        bootstrapper.disconnect().unwrap();
+        assert_eq!(bootstrapper.stored_credential().unwrap(), None);
+    }
+
+    #[test]
+    fn a_credential_identity_does_not_print_its_value() {
+        let keys = Arc::new(MemoryKeyStore::new());
+        let hub_endpoint = "http://127.0.0.1:1";
+        let state = Arc::new(MemoryState::seeded(HubRecord {
+            endpoint: hub_endpoint.to_owned(),
+            installation_id: INSTALLATION.to_owned(),
+            key_id: None,
+            key_name: None,
+            keyring_account: "account".to_owned(),
+            selected_tags: Vec::new(),
+        }));
+        keys.set("account", &key()).unwrap();
+        let identity = harness(keys, state).stored_credential().unwrap().unwrap();
+        assert_eq!(format!("{identity:?}"), "CredentialIdentity(..)");
     }
 
     /// #446: a stored key the Hub reports as tripped (`403 key_tripped`) is

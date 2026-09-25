@@ -15,11 +15,16 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+	adoptionResult,
 	applyServerSelection,
 	hubAbandonedDisplay,
 	effectiveCredentialGuidance,
 	hubCredentialGuidance,
 	hubCredentialGuidanceLine,
+	hubStatusDisplay,
+	isHubStatusStale,
+	HUB_STATUS_RECHECKING_LABEL,
+	subscriptionCredentialSignal,
 	hubPollStaleNote,
 	hubStatusDetail,
 	hubStatusLabel,
@@ -53,6 +58,7 @@ import {
 	type HubStatus,
 	type HubSubscription,
 	type HubSubscriptionState,
+	type HubView,
 	type SelectionEvent,
 	type StatusRereadDetailedOutcome,
 	type StatusRereadOutcome
@@ -520,6 +526,166 @@ describe('接続の状態と購読の案内の組み合わせ', () => {
 				lastError
 			).toBe(true);
 		}
+	});
+});
+
+/**
+ * #449 レビュー P2-2: 画面を開き直さない時系列。接続の状態は画面を開いたとき・
+ * 明示操作のときにしか取り直さず、購読の状態だけが 2 秒ごとに更新される。
+ * 古い接続の状態で、新しい拒否の理由を抑えない。
+ */
+describe('接続の状態が購読より古くなったとき（時系列）', () => {
+	/** 画面が実際に出すもの（HubSection と同じ組み立て）。 */
+	function render(
+		status: HubStatus,
+		observedWith: HubSubscription | null,
+		current: HubSubscription
+	) {
+		const display = hubStatusDisplay(status, observedWith, current);
+		const texts = [
+			display.label,
+			display.detail,
+			hubSubscriptionDetail(current, display.guidance),
+			hubCredentialGuidanceLine(current, display.guidance) ?? ''
+		];
+		return {
+			display,
+			texts,
+			field: showManualKeyEntry(display.guidance, current),
+			keepKey: texts.some((text) => text.includes('解除を依頼'))
+		};
+	}
+
+	it('keyTripped で開く → 解除されて live → 開いたまま key_revoked', () => {
+		// 1. トリップ中に画面を開く（`status()` の応答に接続の状態と購読が一緒に来る）。
+		const status: HubStatus = { state: 'keyTripped' };
+		const opened = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+		let screen = render(status, opened, opened);
+		expect(screen.display.stale).toBe(false);
+		expect(screen.keepKey).toBe(true);
+		expect(screen.field).toBe(false);
+
+		// 2. 管理者が解除し、見張りが張り直して受信中（ポーリングで購読だけ更新）。
+		const live = subscription({ state: 'live', lastError: null });
+		screen = render(status, opened, live);
+		expect(screen.display.stale, '古いトリップの表示を残さない').toBe(true);
+		expect(screen.display.label).toBe(HUB_STATUS_RECHECKING_LABEL);
+		expect(screen.keepKey).toBe(false);
+
+		// 3. 画面を開いたまま、そのキーが失効する（close 1008 api_key_revoked）。
+		const revoked = subscription({ state: 'unauthorized', lastError: 'key_revoked' });
+		screen = render(status, opened, revoked);
+		expect(screen.display.stale).toBe(true);
+		expect(screen.keepKey, '古い keyTripped で「解除を依頼」と言わない').toBe(false);
+		expect(hubSubscriptionDetail(revoked, screen.display.guidance)).toBe(
+			hubCredentialGuidance('key_revoked')?.message
+		);
+		expect(screen.field, '交換用の入力欄を隠さない').toBe(true);
+
+		// 4. 取り直した接続の状態（401 = authFailed）が届けば、古くない状態に戻る。
+		screen = render({ state: 'authFailed' }, revoked, revoked);
+		expect(screen.display.stale).toBe(false);
+		expect(screen.keepKey).toBe(false);
+		expect(screen.field).toBe(true);
+	});
+
+	it('トリップ中に画面を開き、開いたままトリップが続く間は古くならない', () => {
+		const status: HubStatus = { state: 'keyTripped' };
+		const opened = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+		// ポーリングで同じ内容の購読が届き続ける。
+		const same = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+		expect(isHubStatusStale(status, opened, same)).toBe(false);
+	});
+
+	it('キーについて何も言っていない接続の状態は、購読が変わっても古いと扱わない', () => {
+		const opened = subscription({ state: 'connecting', lastError: null });
+		const live = subscription({ state: 'live', lastError: null });
+		for (const status of [
+			{ state: 'connected', tagCount: 1 },
+			{ state: 'unreachable', cause: 'transport' },
+			{ state: 'notConfigured' }
+		] as HubStatus[]) {
+			expect(isHubStatusStale(status, opened, live), status.state).toBe(false);
+		}
+		// キーについて言っている状態は、購読のキーに関わる部分が変われば古い。
+		for (const status of [
+			{ state: 'keyTripped' },
+			{ state: 'authFailed' },
+			{ state: 'forbidden' },
+			{ state: 'needsPairing' }
+		] as HubStatus[]) {
+			expect(isHubStatusStale(status, opened, live), status.state).toBe(true);
+		}
+	});
+
+	it('購読のキーに関わる部分', () => {
+		expect(subscriptionCredentialSignal(null)).toBeNull();
+		expect(subscriptionCredentialSignal(subscription({ state: 'live' }))).toBe('live');
+		expect(
+			subscriptionCredentialSignal(
+				subscription({ state: 'unauthorized', lastError: 'unauthorized' })
+			)
+		).toBe('unauthorized');
+		expect(
+			subscriptionCredentialSignal(subscription({ state: 'stopped', lastError: 'key_expired' }))
+		).toBe('key_expired');
+		expect(
+			subscriptionCredentialSignal(subscription({ state: 'reconnecting', lastError: 'transport' }))
+		).toBeNull();
+	});
+});
+
+describe('adoptionResult（採用しなかった候補キーの判定を、保存中のキーの状態にしない）', () => {
+	const view = (status: HubStatus): HubView => ({
+		status,
+		endpoint: 'http://hub',
+		keyName: null,
+		selectedTags: [],
+		tags: null,
+		subscription: subscription({ state: 'stopped', reason: 'r', lastError: 'key_revoked' })
+	});
+
+	it('候補が通らなければ接続の状態は前のまま、理由は別に伝える', () => {
+		const previous: HubStatus = { state: 'authFailed' };
+		for (const candidate of [
+			{ state: 'keyTripped' },
+			{ state: 'forbidden' },
+			{ state: 'authFailed' },
+			{ state: 'unreachable', cause: 'transport' }
+		] as HubStatus[]) {
+			const outcome = adoptionResult(previous, view(candidate));
+			expect(outcome.status, candidate.state).toBe(previous);
+			expect(outcome.adopted).toBe(false);
+			expect(outcome.notice).toContain(hubStatusLabel(candidate));
+			expect(outcome.notice).toContain('採用できませんでした');
+		}
+		// 連携が必要な Hub で候補が通らなくても、「連携が必要」と入力欄は残る。
+		const pairing = adoptionResult({ state: 'needsPairing' }, view({ state: 'forbidden' }));
+		expect(pairing.status).toEqual({ state: 'needsPairing' });
+	});
+
+	it('失効した K1 に対して候補 K2 がトリップしていても、「解除を依頼」と言わない', () => {
+		const outcome = adoptionResult({ state: 'authFailed' }, view({ state: 'keyTripped' }));
+		const current = view({ state: 'keyTripped' }).subscription;
+		const texts = [
+			hubStatusDetail(outcome.status),
+			hubSubscriptionDetail(current, outcome.status),
+			hubCredentialGuidanceLine(current, outcome.status) ?? ''
+		];
+		expect(texts.some((text) => text.includes('解除を依頼'))).toBe(false);
+		expect(showManualKeyEntry(outcome.status, current)).toBe(true);
+	});
+
+	it('採用できたら、その接続の状態を出す', () => {
+		const outcome = adoptionResult(
+			{ state: 'needsPairing' },
+			view({ state: 'connected', tagCount: 2 })
+		);
+		expect(outcome).toEqual({
+			status: { state: 'connected', tagCount: 2 },
+			adopted: true,
+			notice: null
+		});
 	});
 });
 

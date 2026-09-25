@@ -378,6 +378,31 @@ export function hubUnreachableCauseLabel(cause: HubUnreachableCause): string {
 	}
 }
 
+/**
+ * 手動キーの採用の結果を、画面の状態に写す（#449 レビューの洗い出し、純関数）。
+ *
+ * 採用しなかった候補キーの応答は、`status` に**候補キーの**判定を載せて返る
+ * （`banto_hub_bootstrap` の `adopt_manual_key` は、候補が通らなければ何も
+ * 保存しない）。これを接続の状態として出すと、保存中のキーの話と取り違える -
+ * 例えば失効した K1 に対して候補 K2 がトリップしていると、「キーがトリップ中・
+ * 管理者に解除を依頼」と出て、K1 の「新しいキーを」と逆のことを言う。
+ * そこで候補が通らなかったときは**接続の状態を前のまま**にし、候補の判定は
+ * 採用できなかった理由として別に伝える。
+ */
+export function adoptionResult(
+	previous: HubStatus,
+	view: HubView
+): { status: HubStatus; adopted: boolean; notice: string | null } {
+	if (view.status.state === 'connected') {
+		return { status: view.status, adopted: true, notice: null };
+	}
+	return {
+		status: previous,
+		adopted: false,
+		notice: `このAPIキーは採用できませんでした（${hubStatusLabel(view.status)}）。保存済みの設定は変わっていません。`
+	};
+}
+
 /** 手動キーの入力欄を出すべき接続状態か（純関数）。 */
 export function needsManualKey(status: HubStatus): boolean {
 	return status.state === 'needsPairing' || status.state === 'forbidden';
@@ -394,7 +419,7 @@ export function needsManualKey(status: HubStatus): boolean {
  * 認証・手動キーの導線へ合流させる」はこれを指す。
  */
 export function showManualKeyEntry(
-	status: HubStatus,
+	status: HubStatus | null,
 	subscription: HubSubscription | null
 ): boolean {
 	// #446: トリップ中はキーを捨てさせない（管理者が解除すれば同じキーで戻る）。
@@ -403,7 +428,7 @@ export function showManualKeyEntry(
 	// 返すので、下の 3 つの条件はどれも真にならない。
 	const guidance = effectiveCredentialGuidance(status, subscription?.lastError ?? null);
 	return (
-		needsManualKey(status) ||
+		(status !== null && needsManualKey(status)) ||
 		// 購読だけ拒否された（WS のハンドシェイクだけが 401/403）。ただし
 		// 理由がトリップなら、上と同じくキーを替えさせない。
 		(subscription?.state === 'unauthorized' && guidance?.action !== 'askAdmin') ||
@@ -489,6 +514,84 @@ export function hubCredentialGuidance(lastError: string | null): HubCredentialGu
 		default:
 			return null;
 	}
+}
+
+/**
+ * 購読の状態のうち、キーの扱いに関わる部分（#449 レビュー P2-2、純関数）。
+ * close 1008 の理由・理由の無い購読の拒否・受信中のどれか。これが変われば、
+ * 前に一緒に観測した接続の状態はもう今のキーの話をしていないかもしれない。
+ */
+export function subscriptionCredentialSignal(subscription: HubSubscription | null): string | null {
+	if (!subscription) return null;
+	const guidance = hubCredentialGuidance(subscription.lastError);
+	if (guidance) return guidance.reason;
+	if (subscription.state === 'unauthorized') return 'unauthorized';
+	if (subscription.state === 'live') return 'live';
+	return null;
+}
+
+/** キーについて何かを言っている接続の状態（案内や入力欄を左右するもの）。 */
+const CREDENTIAL_STATUSES: ReadonlySet<HubStatus['state']> = new Set([
+	'keyTripped',
+	'authFailed',
+	'forbidden',
+	'needsPairing'
+]);
+
+/**
+ * 画面が持っている接続の状態が、今の購読の状態より**古い**か（#449 レビュー
+ * P2-2、純関数）。
+ *
+ * 接続の状態は、画面を開いたときと明示操作のときにしか取り直さない
+ * （`status()` は Hub へ往復するのでポーリングしない）。購読の状態は 2 秒
+ * ごとに取り直す。そのため「トリップ中に画面を開く → 解除されて受信中 →
+ * 開いたままキーが失効」で、古い `keyTripped` と新しい `key_revoked` が並ぶ。
+ * 接続の状態を取ったときの購読（`observedWith`）と今の購読とで、キーに
+ * 関わる部分（[`subscriptionCredentialSignal`]）が変わっていれば古い。
+ * キーについて何も言っていない接続の状態（接続済み・到達不能・未設定）は
+ * 案内を左右しないので、古くても問題にしない。
+ */
+export function isHubStatusStale(
+	status: HubStatus,
+	observedWith: HubSubscription | null,
+	current: HubSubscription | null
+): boolean {
+	return (
+		CREDENTIAL_STATUSES.has(status.state) &&
+		subscriptionCredentialSignal(observedWith) !== subscriptionCredentialSignal(current)
+	);
+}
+
+/** 接続の状態を確認し直している間の見出しと説明（古い状態を出さない）。 */
+export const HUB_STATUS_RECHECKING_LABEL = '確認し直しています';
+export const HUB_STATUS_RECHECKING_DETAIL =
+	'購読の状態が変わったため、Hubへの接続の状態を確認し直しています。';
+
+/**
+ * 画面に出す接続の状態（#449 レビュー P2-2、純関数）。古い（[`isHubStatusStale`]）
+ * なら、見出しと説明は「確認し直しています」にし、購読の案内と入力欄の判断には
+ * 使わない（`guidance: null`）。**古い REST の状態で、新しい拒否の理由を抑え
+ * ない**ため。
+ */
+export function hubStatusDisplay(
+	status: HubStatus,
+	observedWith: HubSubscription | null,
+	current: HubSubscription | null
+): { label: string; detail: string; guidance: HubStatus | null; stale: boolean } {
+	if (isHubStatusStale(status, observedWith, current)) {
+		return {
+			label: HUB_STATUS_RECHECKING_LABEL,
+			detail: HUB_STATUS_RECHECKING_DETAIL,
+			guidance: null,
+			stale: true
+		};
+	}
+	return {
+		label: hubStatusLabel(status),
+		detail: hubStatusDetail(status),
+		guidance: status,
+		stale: false
+	};
 }
 
 /**

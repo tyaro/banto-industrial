@@ -78,4 +78,4 @@ pub use bootstrap::Bootstrapper;
 pub use error::{Error, ErrorKind, Result};
 pub use scopes::{validate_issue_scopes, DEFAULT_SCOPES, ISSUABLE_SCOPES};
 pub use state::{BootstrapState, HubRecord, KeyStore};
-pub use status::{HubConnection, HubStatus, UnreachableCause};
+pub use status::{CredentialIdentity, HubConnection, HubStatus, UnreachableCause};

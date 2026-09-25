@@ -54,6 +54,7 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import {
 		adoptHubKey,
+		adoptionResult,
 		applyServerSelection,
 		connectHub,
 		disconnectHub,
@@ -64,8 +65,7 @@
 		hubLastValueLabel,
 		hubPollStaleNote,
 		hubRemainderNote,
-		hubStatusDetail,
-		hubStatusLabel,
+		hubStatusDisplay,
 		hubSubscriptionDetail,
 		hubSubscriptionHeadline,
 		hubTimeLabel,
@@ -88,6 +88,7 @@
 		setHubSelectedTags,
 		showManualKeyEntry,
 		showsServerSelectionDiff,
+		subscriptionCredentialSignal,
 		type HubStatus,
 		type HubSubscription,
 		type HubTag,
@@ -101,6 +102,12 @@
 	const SUBSCRIPTION_POLL_MS = 2000;
 
 	let status = $state<HubStatus>({ state: 'notConfigured' });
+	/**
+	 * `status` を取ったときに一緒に届いた購読の状態（#449 レビュー P2-2）。
+	 * `status` はポーリングしないので、購読の状態がこれと食い違ったら
+	 * `status` は古い（`hubStatusDisplay`）。
+	 */
+	let statusObservedWith = $state<HubSubscription | null>(null);
 	let tags = $state<HubTag[] | null>(null);
 	let selected = $state<string[]>([]);
 	/**
@@ -146,7 +153,14 @@
 	 * 管理者に解除を依頼、失効・期限切れ・存在しないなら新しいキー）。
 	 * `unauthorized` のときは説明文そのものが案内なので出さない。
 	 */
-	const credentialGuidanceLine = $derived(hubCredentialGuidanceLine(subscription, status));
+	/**
+	 * 画面に出す接続の状態。古ければ「確認し直しています」になり、購読の
+	 * 案内と入力欄の判断には使わない（#449 レビュー P2-2）。
+	 */
+	const statusDisplay = $derived(hubStatusDisplay(status, statusObservedWith, subscription));
+	const credentialGuidanceLine = $derived(
+		hubCredentialGuidanceLine(subscription, statusDisplay.guidance)
+	);
 	const showLastErrorLine = $derived(
 		subscription !== null && !(subscription.state === 'stopped' && !subscription.reason)
 	);
@@ -216,6 +230,7 @@
 	function applyView(view: HubView): void {
 		beginExplicitChange();
 		status = view.status;
+		statusObservedWith = view.subscription;
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
 		serverSelected = [...view.selectedTags];
@@ -378,6 +393,38 @@
 		}
 	}
 
+	/**
+	 * 接続の状態が古くなったら（#449 レビュー P2-2）、1 回だけ取り直す。
+	 * 同じ購読の状態について何度も撃たない（失敗したら「確認し直しています」
+	 * のまま、次に購読の状態が変わるか明示操作があるまで待つ）。
+	 */
+	let staleRecheckFor: string | null = null;
+	$effect(() => {
+		if (!available) return;
+		if (!statusDisplay.stale) {
+			staleRecheckFor = null;
+			return;
+		}
+		if (busy) return;
+		const key = String(subscriptionCredentialSignal(subscription));
+		if (staleRecheckFor === key) return;
+		staleRecheckFor = key;
+		void recheckStaleStatus();
+	});
+
+	async function recheckStaleStatus(): Promise<void> {
+		busy = true;
+		try {
+			const outcome = await runWithLimit(
+				(signal) => getHubStatus(signal),
+				HUB_UI_REREAD_TIMEOUT_MS
+			);
+			if (outcome.kind === 'ok') applyView(outcome.value);
+		} finally {
+			busy = false;
+		}
+	}
+
 	$effect(() => {
 		if (!available) return;
 		void run(async (signal) => {
@@ -409,9 +456,13 @@
 			// 打ち切りの扱いは `connect` のコメント参照。
 			const view = await adoptHubKey(endpointDraft, manualKeyDraft, signal);
 			if (signal.aborted) return;
-			applyView(view);
+			// #449 レビューの洗い出し: 採用しなかった候補キーの判定を、保存中の
+			// キーの接続の状態として出さない（`adoptionResult`）。
+			const outcome = adoptionResult(status, view);
+			applyView({ ...view, status: outcome.status });
 			// 採用できたときだけ入力欄を空にする（失敗時に貼り直させない）。
-			if (view.status.state === 'connected') manualKeyDraft = '';
+			if (outcome.adopted) manualKeyDraft = '';
+			else hubError = outcome.notice;
 		});
 	}
 
@@ -669,9 +720,9 @@
 			</button>
 
 			<p class="status">
-				状態: <strong>{hubStatusLabel(status)}</strong>
+				状態: <strong>{statusDisplay.label}</strong>
 			</p>
-			<p class="note">{hubStatusDetail(status)}</p>
+			<p class="note">{statusDisplay.detail}</p>
 
 			{#if keyName}
 				<p class="note">このアプリのAPIキー名: <code>{keyName}</code></p>
@@ -709,7 +760,7 @@
 				<p class="note selection-discarded" role="status">{selectionDiscardedNotice}</p>
 			{/if}
 
-			{#if showManualKeyEntry(status, subscription)}
+			{#if showManualKeyEntry(statusDisplay.guidance, subscription)}
 				<div class="server-fields">
 					<label class="field hub-endpoint">
 						APIキー（Hubの管理画面で発行したもの）
@@ -821,7 +872,7 @@
 				{#if subscriptionStale}
 					<p class="note poll-stale" role="status">{hubPollStaleNote(lastPolledAt)}</p>
 				{/if}
-				<p class="note">{hubSubscriptionDetail(subscription, status)}</p>
+				<p class="note">{hubSubscriptionDetail(subscription, statusDisplay.guidance)}</p>
 				{#if credentialGuidanceLine}
 					<p class="note hub-credential-guidance" role="status">{credentialGuidanceLine}</p>
 				{/if}
