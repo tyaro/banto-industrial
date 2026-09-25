@@ -376,7 +376,18 @@ impl<T> Stream for GuardedStream<T> {
                 Poll::Pending => {}
             }
         }
-        this.values.poll_recv(cx)
+        match this.values.poll_recv(cx) {
+            // #444 レビュー（P2）: 値の側が終わっていても、終わり方のステータスが
+            // まだ確定していなければ終わりにしない。上の `terminal.poll` が
+            // `Pending` を返した直後に、別のワーカーの `drive_stream` が
+            // ステータスを送って値の送り手ごと消えると、ここで `None`（正常な
+            // 終わり）を返してステータスを取りこぼす。`terminal.poll` が登録した
+            // waker は、ステータスが送られたときにも、送られずに送り手が消えた
+            // ときにも起こされる（`drive_stream` はどの終わり方でも送り手を
+            // 送るか捨てるので、必ずどちらかになる）ので、再 poll で確定する。
+            Poll::Ready(None) if this.terminal.is_some() => Poll::Pending,
+            other => other,
+        }
     }
 }
 
@@ -1285,6 +1296,97 @@ mod tests {
             .await,
             "no recheck after disconnect"
         );
+    }
+
+    /// 起こされた回数を数える waker（手で poll する [`GuardedStream`] のテスト用）。
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl futures_util::task::ArcWake for CountingWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 手で組んだ [`GuardedStream`]（`drive_stream` の側の送り手を返す）。
+    #[allow(clippy::type_complexity)]
+    fn guarded_by_hand() -> (
+        GuardedStream<u64>,
+        mpsc::Sender<Result<u64, Status>>,
+        oneshot::Sender<Status>,
+    ) {
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        let stream = GuardedStream {
+            values: rx,
+            terminal: Some(terminal_rx),
+            finished: false,
+        };
+        (stream, tx, terminal_tx)
+    }
+
+    /// #444 レビュー（P2）: `terminal.poll` が `Pending` を返した後で、
+    /// `drive_stream` がステータスを送って値の送り手ごと消える順序を固定する。
+    /// 値の側の終わり（`None`）を先に見ても正常な終わりにせず、起こされた
+    /// 再 poll で、最初の終わりが必ずステータス、その次が `None` になる。
+    #[test]
+    fn a_status_sent_after_the_terminal_was_polled_is_not_lost_to_the_values_eof() {
+        let (mut stream, values_tx, terminal_tx) = guarded_by_hand();
+        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = futures_util::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        // 手順 1 の直後・手順 3 の前に当たる状態: ステータスはまだ未確定で、
+        // 値の送り手はもう消えている（値の側は EOF）。
+        drop(values_tx);
+        assert!(
+            Pin::new(&mut stream).poll_next(&mut cx).is_pending(),
+            "the values' EOF must not end the stream while the status is undetermined"
+        );
+        // 手順 2: ステータスが送られる → 登録済みの waker が起こされる。
+        terminal_tx
+            .send(Status::unauthenticated("revoked"))
+            .expect("the receiver is alive");
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "the task must be woken"
+        );
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Err(status))) => {
+                assert_eq!(status.code(), tonic::Code::Unauthenticated)
+            }
+            other => panic!("the first ending must be the status: {other:?}"),
+        }
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    /// 同じ順序で、ステータスを送らずに送り手が消えた（従来どおりの終わり方）
+    /// ときは、起こされた再 poll で `None`（正常な終わり）になる。
+    #[test]
+    fn a_terminal_dropped_without_a_status_ends_the_stream_normally() {
+        let (mut stream, values_tx, terminal_tx) = guarded_by_hand();
+        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = futures_util::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        values_tx.try_send(Ok(7)).unwrap();
+        drop(values_tx);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(7)))
+        ));
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        drop(terminal_tx);
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "the task must be woken"
+        );
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 
     /// 送り手が何も送らずに終わった（従来どおりの終わり方）ときは、残りの値を
