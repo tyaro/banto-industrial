@@ -64,6 +64,8 @@
 	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
 	import { subscriptionPatternsFor } from '$lib/banto/monitorSubscription';
 	import { applyTagValues, mergeTagValues, type RowValue } from '$lib/banto/monitorValues';
+	import type { StreamCloseAction } from '$lib/banto/streamClose';
+	import { recheckSessionAfterStreamClose } from '$lib/banto/sessionRecheck';
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
@@ -89,6 +91,15 @@
 	/** T18-4b: 直近の切断がバックプレッシャ切断（close code 1013、
 	 * `stream.rs::BACKPRESSURE_CLOSE_CODE`）だったか。再接続成功で解除する。 */
 	let wsBackpressure = $state(false);
+	/**
+	 * #441: サーバーが資格情報を使えないと確認して close `1008` で閉じ、
+	 * 購読が止まっている（再接続していない）あいだの理由。`null` なら止まって
+	 * いない。止まっているあいだ、状態の行は「接続中」「再接続中」ではなく
+	 * この理由を出す（`recheckSession` は確認中の表示、`halt` は理由と
+	 * 「再接続」ボタン）。
+	 */
+	let streamHalt = $state<Exclude<StreamCloseAction, { kind: 'reconnect' }> | null>(null);
+	let streamResume: (() => void) | null = null;
 	/** T18-4b: 接続確立/購読変更（resubscribe）直後から初期スナップショット
 	 * （最初の onData）を受けるまでの間 true。true の間、行の表示は
 	 * `displayQuality`/`displayValue` で stale 相当に強制する（`row.v`/`q`/`t`
@@ -357,7 +368,7 @@
 		void reloadCatalog();
 		void reloadAdmin();
 
-		const { disconnect, resubscribe } = connectTagStream(
+		const { disconnect, resubscribe, resume } = connectTagStream(
 			{
 				onData: (values) => {
 					applyStreamData(values);
@@ -383,17 +394,46 @@
 						// 文言を出す（テンプレート参照）。
 						wsBackpressure = true;
 					}
+				},
+				onHalt: (action) => {
+					streamHalt = action;
+					if (action.kind !== 'recheckSession') return;
+					// ルートガードを走らせ直す（`sessionRecheck.ts`）。失効なら
+					// `/login`、照合できなければエラー画面へ移り、この画面は
+					// 外れる（`disconnect()` 済みなので `resume()` は何もしない）。
+					// まだ有効ならこの画面に残るので、購読を再開する。
+					recheckSessionAfterStreamClose().then(
+						() => {
+							streamHalt = null;
+							resume();
+						},
+						() => {
+							streamHalt = {
+								kind: 'halt',
+								reason: action.reason,
+								message: 'ログイン状態を確認できなかったため、リアルタイム更新を止めています。'
+							};
+						}
+					);
 				}
 			},
 			() => subscriptionPatternsFor(treeFilter, connections, groups)
 		);
 		streamResubscribe = resubscribe;
+		streamResume = resume;
 
 		return () => {
 			streamResubscribe = null;
+			streamResume = null;
 			disconnect();
 		};
 	});
+
+	/** #441: `halt` で止まった購読を、利用者の操作で再開する。 */
+	function resumeStream(): void {
+		streamHalt = null;
+		streamResume?.();
+	}
 
 	// --- T18-4b: ツリー選択の変更を購読に反映する（再接続はしない） --------
 	//
@@ -459,10 +499,22 @@
 		<p class="note">
 			登録済みタグの現在値をリアルタイム表示します（WebSocket購読、書き込み機能はありません）。
 		</p>
-		<p class="note status-line" class:status-warning={!wsConnected && wsBackpressure}>
+		<p
+			class="note status-line"
+			class:status-warning={!wsConnected && (wsBackpressure || streamHalt !== null)}
+			data-testid="monitor-stream-status"
+		>
 			<span class="ws-dot" class:on={wsConnected} class:off={!wsConnected}></span>
 			{#if wsConnected}
 				接続中（リアルタイム更新中）
+			{:else if streamHalt?.kind === 'recheckSession'}
+				<!-- #441: close 1008 + session_revoked / commissioning_ended。
+					ルートガードの確認が終わるまでのあいだだけ出る。 -->
+				ログイン状態を確認しています…（リアルタイム更新は止まっています）
+			{:else if streamHalt?.kind === 'halt'}
+				<!-- #441: close 1008 + api_key_* / 未知の理由文。再接続はしない。 -->
+				{streamHalt.message}
+				<button type="button" class="resume-button" onclick={resumeStream}>再接続</button>
 			{:else if wsBackpressure}
 				<!-- T18-4b: BACKPRESSURE_CLOSE_CODE (1013) - 送信キュー溢れによる
 					強制切断。通常の再接続中と見た目・文言を変えて区別する。 -->
@@ -669,6 +721,16 @@
 	   色でも区別する - 既存の .ws-dot.off と同じ --banto-danger を流用。 */
 	.status-line.status-warning {
 		color: var(--banto-danger);
+	}
+
+	.resume-button {
+		padding: 0.1rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+		color: var(--banto-text);
+		font: inherit;
+		cursor: pointer;
 	}
 
 	.ws-dot {

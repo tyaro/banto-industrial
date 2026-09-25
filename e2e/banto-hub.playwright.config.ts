@@ -74,7 +74,10 @@ const LOCKED_DOWN_BASE_URL = `http://127.0.0.1:${LOCKED_DOWN_PORT}`;
  */
 const LOCKED_DOWN_SPECS = [
 	'**/banto-hub-status-pending-apply-cancel.spec.ts',
-	'**/banto-hub-settings-guard.spec.ts'
+	'**/banto-hub-settings-guard.spec.ts',
+	// #441: セッションで開いたストリーム（`/api/v1/stream`）の失効は
+	// ロックダウン済みでしか起きない。
+	'**/banto-hub-stream-revoked.spec.ts'
 ];
 
 // chronogazer の `BANTO_E2E_DB_DIR`/`dbDir` と同じ理由（SqliteConnectOptions::
