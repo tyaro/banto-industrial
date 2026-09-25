@@ -35,7 +35,7 @@
 	 * 再接続と区別して表示し、②再接続時は初期スナップショット受信まで
 	 * 「現在値」を古いまま出さず stale 扱いする（`awaitingSnapshot`）。
 	 * どちらも `row.v`/`row.q`/`row.t` 自体は書き換えず、表示用ヘルパー
-	 * `displayQuality`/`displayValue` でラップするだけ - 再接続後の初期
+	 * `monitorStreamView.ts` の `monitorCellDisplay` で包むだけ - 再接続後の初期
 	 * スナップショットが届けば通常どおり上書きされる。
 	 *
 	 * 権限: relay-wright のモニタは書き込みセルを editor 以上に限定するが、
@@ -43,6 +43,7 @@
 	 * 閲覧できる（ゲートすべき対象が無い）。ツリー・検索も同様に読み取り
 	 * 専用の絞り込みでしかないため、権限ゲートは追加しない。
 	 */
+	import { untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { toastStore } from '$lib/toast.svelte';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
@@ -64,6 +65,15 @@
 	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
 	import { subscriptionPatternsFor } from '$lib/banto/monitorSubscription';
 	import { applyTagValues, mergeTagValues, type RowValue } from '$lib/banto/monitorValues';
+	import {
+		cellDisplayMode,
+		initialStreamView,
+		monitorCellDisplay,
+		monitorColumnLabels,
+		streamViewReducer,
+		type StreamViewEvent
+	} from '$lib/banto/monitorStreamView';
+	import { recheckSessionAfterStreamClose } from '$lib/banto/sessionRecheck';
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
@@ -85,15 +95,25 @@
 	let rows = $state<Row[]>([]);
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
-	let wsConnected = $state(false);
-	/** T18-4b: 直近の切断がバックプレッシャ切断（close code 1013、
-	 * `stream.rs::BACKPRESSURE_CLOSE_CODE`）だったか。再接続成功で解除する。 */
-	let wsBackpressure = $state(false);
-	/** T18-4b: 接続確立/購読変更（resubscribe）直後から初期スナップショット
-	 * （最初の onData）を受けるまでの間 true。true の間、行の表示は
-	 * `displayQuality`/`displayValue` で stale 相当に強制する（`row.v`/`q`/`t`
-	 * 自体は書き換えない）。 */
-	let awaitingSnapshot = $state(true);
+	/**
+	 * ストリームの表示状態（接続中か・バックプレッシャ切断（1013）か・
+	 * 最初の値の待ち（T18-4b）・close `1008` で止まっている理由（#441））。
+	 * 出来事を `streamViewReducer`（`monitorStreamView.ts`、vitest で表に
+	 * して確認）で畳む。表のセルの表示は `cellDisplayMode` と
+	 * `monitorCellDisplay` で決め、`row.v`/`q`/`t` 自体は書き換えない。
+	 */
+	let streamView = $state(initialStreamView());
+	const displayMode = $derived(cellDisplayMode(streamView));
+	const columnLabels = $derived(monitorColumnLabels(displayMode));
+	let streamResume: (() => void) | null = null;
+
+	/** 出来事を状態へ畳む。`$effect` の中から呼んでも `streamView` を依存に
+	 * 加えない（読み書きする effect が自分を起こし続けないように）。 */
+	function dispatchStreamView(event: StreamViewEvent): void {
+		untrack(() => {
+			streamView = streamViewReducer(streamView, event);
+		});
+	}
 
 	/** 直近で値/品質が変化した外部名（一時的なハイライト表示用）。 */
 	let flashing = $state<Record<string, boolean>>({});
@@ -357,43 +377,62 @@
 		void reloadCatalog();
 		void reloadAdmin();
 
-		const { disconnect, resubscribe } = connectTagStream(
+		const { disconnect, resubscribe, resume } = connectTagStream(
 			{
 				onData: (values) => {
 					applyStreamData(values);
 					// 初期スナップショット（またはそれ以降の on_change）を
 					// 1回でも受けたら stale 強制表示を解除する。
-					awaitingSnapshot = false;
+					dispatchStreamView({ type: 'data' });
 				},
 				onConfigChanged: () => {
 					void reloadCatalog();
 					void reloadAdmin();
 				},
 				onStatusChange: (connected, closeCode) => {
-					wsConnected = connected;
-					if (connected) {
-						// 再接続確立 - 新しい購読の初期スナップショットが
-						// 届くまで stale 表示にし、バックプレッシャ表示は
-						// 解除する。
-						wsBackpressure = false;
-						awaitingSnapshot = true;
-					} else if (closeCode === 1013) {
-						// `stream.rs::BACKPRESSURE_CLOSE_CODE` - 送信キュー
-						// 溢れによる強制切断。通常の再接続中表示とは別の
-						// 文言を出す（テンプレート参照）。
-						wsBackpressure = true;
-					}
+					// 接続: 新しい購読の初期スナップショットが届くまで stale
+					// 表示にし、バックプレッシャ表示は解除する。切断: 1013
+					// （`stream.rs::BACKPRESSURE_CLOSE_CODE`、送信キュー溢れ）
+					// なら通常の再接続中とは別の文言を出す。
+					dispatchStreamView(
+						connected ? { type: 'connected' } : { type: 'disconnected', code: closeCode }
+					);
+				},
+				onHalt: (action) => {
+					dispatchStreamView({ type: 'halted', action });
+					if (action.kind !== 'recheckSession') return;
+					// ルートガードを走らせ直す（`sessionRecheck.ts`）。失効なら
+					// `/login`、照合できなければエラー画面へ移り、この画面は
+					// 外れる（`disconnect()` 済みなので `resume()` は何もしない）。
+					// まだ有効ならこの画面に残るので、購読を再開する。
+					recheckSessionAfterStreamClose().then(
+						() => {
+							dispatchStreamView({ type: 'resumed' });
+							resume();
+						},
+						() => {
+							dispatchStreamView({ type: 'recheckFailed', reason: action.reason });
+						}
+					);
 				}
 			},
 			() => subscriptionPatternsFor(treeFilter, connections, groups)
 		);
 		streamResubscribe = resubscribe;
+		streamResume = resume;
 
 		return () => {
 			streamResubscribe = null;
+			streamResume = null;
 			disconnect();
 		};
 	});
+
+	/** #441: `halt` で止まった購読を、利用者の操作で再開する。 */
+	function resumeStream(): void {
+		dispatchStreamView({ type: 'resumed' });
+		streamResume?.();
+	}
 
 	// --- T18-4b: ツリー選択の変更を購読に反映する（再接続はしない） --------
 	//
@@ -406,46 +445,10 @@
 	$effect(() => {
 		void treeFilter;
 		streamResubscribe?.();
-		awaitingSnapshot = true;
+		dispatchStreamView({ type: 'resubscribed' });
 	});
 
 	const filteredRows = $derived(filterMonitorRows(rows, treeFilter, searchQuery));
-
-	const qualityLabels: Record<string, string> = {
-		good: '良好',
-		bad: '不良',
-		stale: '陳腐化'
-	};
-
-	function qualityLabel(q: string): string {
-		return qualityLabels[q] ?? q;
-	}
-
-	/** status/+page.svelte と同じ規約: good=通常, bad=danger, stale=muted。 */
-	function qualityClass(q: string): string {
-		if (q === 'bad') return 'bad';
-		if (q === 'stale') return 'stale';
-		return 'good';
-	}
-
-	function formatValue(row: Row): string {
-		if (row.q !== 'good' || row.v === null) return '--';
-		return row.unit ? `${row.v} ${row.unit}` : String(row.v);
-	}
-
-	/** T18-4b: `awaitingSnapshot` の間は `row.q` を書き換えずに表示上だけ
-	 * `'stale'` 扱いする（`qualityClass`/`qualityLabel` はそのまま使い回す）。 */
-	function displayQuality(row: Row): string {
-		return awaitingSnapshot ? 'stale' : row.q;
-	}
-
-	/** T18-4b: `displayQuality` と対になる値表示版。`row.v`/`row.t` 自体は
-	 * 保持したまま、`awaitingSnapshot` の間だけ `formatValue` の
-	 * 「品質が good でない」の分岐と同じ `'--'` を返す。 */
-	function displayValue(row: Row): string {
-		if (awaitingSnapshot) return '--';
-		return formatValue(row);
-	}
 
 	function formatTime(epochMs: number): string {
 		if (!epochMs) return '--';
@@ -459,11 +462,24 @@
 		<p class="note">
 			登録済みタグの現在値をリアルタイム表示します（WebSocket購読、書き込み機能はありません）。
 		</p>
-		<p class="note status-line" class:status-warning={!wsConnected && wsBackpressure}>
-			<span class="ws-dot" class:on={wsConnected} class:off={!wsConnected}></span>
-			{#if wsConnected}
+		<p
+			class="note status-line"
+			class:status-warning={!streamView.connected &&
+				(streamView.backpressure || streamView.halt !== null)}
+			data-testid="monitor-stream-status"
+		>
+			<span class="ws-dot" class:on={streamView.connected} class:off={!streamView.connected}></span>
+			{#if streamView.connected}
 				接続中（リアルタイム更新中）
-			{:else if wsBackpressure}
+			{:else if streamView.halt?.kind === 'recheckSession'}
+				<!-- #441: close 1008 + session_revoked / commissioning_ended。
+					ルートガードの確認が終わるまでのあいだだけ出る。 -->
+				ログイン状態を確認しています…（リアルタイム更新は止まっています）
+			{:else if streamView.halt?.kind === 'halt'}
+				<!-- #441: close 1008 + api_key_* / 未知の理由文。再接続はしない。 -->
+				{streamView.halt.message}
+				<button type="button" class="resume-button" onclick={resumeStream}>再接続</button>
+			{:else if streamView.backpressure}
 				<!-- T18-4b: BACKPRESSURE_CLOSE_CODE (1013) - 送信キュー溢れによる
 					強制切断。通常の再接続中と見た目・文言を変えて区別する。 -->
 				サーバーが遅い購読者として切断しました（自動再接続中…）
@@ -566,13 +582,14 @@
 											<th>外部名</th>
 											<th>接続</th>
 											<th>グループ</th>
-											<th>値</th>
-											<th>品質</th>
+											<th>{columnLabels.value}</th>
+											<th>{columnLabels.quality}</th>
 											<th>時刻</th>
 										</tr>
 									</thead>
 									<tbody>
 										{#each filteredRows as row (row.external_name)}
+											{@const cell = monitorCellDisplay(row, displayMode)}
 											<tr
 												class:flash={flashing[row.external_name]}
 												class:confirm-target={focusSet.has(row.external_name)}
@@ -588,12 +605,8 @@
 													{/if}
 												</td>
 												<td>{row.group}</td>
-												<td class="value quality-{qualityClass(displayQuality(row))}"
-													>{displayValue(row)}</td
-												>
-												<td class="quality quality-{qualityClass(displayQuality(row))}"
-													>{qualityLabel(displayQuality(row))}</td
-												>
+												<td class="value quality-{cell.qualityClass}">{cell.value}</td>
+												<td class="quality quality-{cell.qualityClass}">{cell.qualityLabel}</td>
 												<td>{formatTime(row.t)}</td>
 											</tr>
 										{/each}
@@ -669,6 +682,16 @@
 	   色でも区別する - 既存の .ws-dot.off と同じ --banto-danger を流用。 */
 	.status-line.status-warning {
 		color: var(--banto-danger);
+	}
+
+	.resume-button {
+		padding: 0.1rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+		color: var(--banto-text);
+		font: inherit;
+		cursor: pointer;
 	}
 
 	.ws-dot {
