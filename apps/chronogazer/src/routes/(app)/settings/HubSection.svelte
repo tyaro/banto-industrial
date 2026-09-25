@@ -49,7 +49,7 @@
 	 * 平文の API キーは画面に出さない: 手動連携の入力欄は
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
 	 */
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
 	import {
@@ -88,8 +88,11 @@
 		setHubSelectedTags,
 		showManualKeyEntry,
 		showsServerSelectionDiff,
-		subscriptionCredentialSignal,
-		type HubStatus,
+		INITIAL_STATUS_SNAPSHOT,
+		snapshotAfterAdoption,
+		snapshotFromStoredView,
+		runStaleRecheck,
+		type HubStatusSnapshot,
 		type HubSubscription,
 		type HubTag,
 		type HubView
@@ -101,13 +104,16 @@
 	/** 購読状態のポーリング間隔（ms）。ネットワークを伴わない読み取り。 */
 	const SUBSCRIPTION_POLL_MS = 2000;
 
-	let status = $state<HubStatus>({ state: 'notConfigured' });
 	/**
-	 * `status` を取ったときに一緒に届いた購読の状態（#449 レビュー P2-2）。
-	 * `status` はポーリングしないので、購読の状態がこれと食い違ったら
-	 * `status` は古い（`hubStatusDisplay`）。
+	 * 接続の状態と、それを**いつ観測したか**（一緒に届いた購読）と、古く
+	 * なったときの確認し直しの段階（#449 レビュー P2-2 / 再レビュー P2）。
+	 * 3 つは必ず 1 つの値として書き換える（`HubStatusSnapshot` の doc）。
+	 * 書き換えるのは `applyView`（保存しているキーの応答）・`adopt`
+	 * （`snapshotAfterAdoption`）・確認し直し（`staleRecheckStep` /
+	 * `staleRecheckSettled`）だけ。
 	 */
-	let statusObservedWith = $state<HubSubscription | null>(null);
+	let statusSnapshot = $state<HubStatusSnapshot>(INITIAL_STATUS_SNAPSHOT);
+	const status = $derived(statusSnapshot.status);
 	let tags = $state<HubTag[] | null>(null);
 	let selected = $state<string[]>([]);
 	/**
@@ -157,7 +163,14 @@
 	 * 画面に出す接続の状態。古ければ「確認し直しています」になり、購読の
 	 * 案内と入力欄の判断には使わない（#449 レビュー P2-2）。
 	 */
-	const statusDisplay = $derived(hubStatusDisplay(status, statusObservedWith, subscription));
+	const statusDisplay = $derived(
+		hubStatusDisplay(
+			statusSnapshot.status,
+			statusSnapshot.observedWith,
+			subscription,
+			statusSnapshot.recheck
+		)
+	);
 	const credentialGuidanceLine = $derived(
 		hubCredentialGuidanceLine(subscription, statusDisplay.guidance)
 	);
@@ -227,10 +240,17 @@
 		lastPolledAt = Date.now();
 	}
 
-	function applyView(view: HubView): void {
+	/**
+	 * 応答を画面に反映する。`snapshot` は接続の状態の組をどう更新するか:
+	 * 既定は「保存しているキーについての応答」（`snapshotFromStoredView`）。
+	 * 採用できなかった候補キーの応答は `adopt` が前の組をそのまま渡す。
+	 */
+	function applyView(
+		view: HubView,
+		snapshot: HubStatusSnapshot = snapshotFromStoredView(view)
+	): void {
 		beginExplicitChange();
-		status = view.status;
-		statusObservedWith = view.subscription;
+		statusSnapshot = snapshot;
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
 		serverSelected = [...view.selectedTags];
@@ -394,35 +414,41 @@
 	}
 
 	/**
-	 * 接続の状態が古くなったら（#449 レビュー P2-2）、1 回だけ取り直す。
-	 * 同じ購読の状態について何度も撃たない（失敗したら「確認し直しています」
-	 * のまま、次に購読の状態が変わるか明示操作があるまで待つ）。
+	 * 接続の状態が古くなったら（#449 レビュー P2-2）取り直す。いつ行くかは
+	 * `staleRecheckStep`: 1 本ずつ、失敗したら「確認できませんでした」と
+	 * 「状態を再取得」を出し、自動では `STALE_RECHECK_RETRY_MS` ごとにしか
+	 * 試さない（#449 再レビュー P2）。購読のポーリング（2 秒）で `subscription`
+	 * が入れ替わるたびに評価し直すので、間隔の経過もそこで拾う。
 	 */
-	let staleRecheckFor: string | null = null;
 	$effect(() => {
 		if (!available) return;
-		if (!statusDisplay.stale) {
-			staleRecheckFor = null;
-			return;
-		}
+		const current = subscription;
 		if (busy) return;
-		const key = String(subscriptionCredentialSignal(subscription));
-		if (staleRecheckFor === key) return;
-		staleRecheckFor = key;
-		void recheckStaleStatus();
+		untrack(() => void recheckStaleStatus(current, false));
 	});
 
-	async function recheckStaleStatus(): Promise<void> {
-		busy = true;
-		try {
-			const outcome = await runWithLimit(
-				(signal) => getHubStatus(signal),
-				HUB_UI_REREAD_TIMEOUT_MS
-			);
-			if (outcome.kind === 'ok') applyView(outcome.value);
-		} finally {
-			busy = false;
-		}
+	/**
+	 * 取り直しを 1 回ぶん進める（`force` は「状態を再取得」ボタン）。手順は
+	 * `runStaleRecheck`（テストも同じ手順を通る）: 失敗・打ち切り・reject でも
+	 * 必ず段階を `failed` に進め、`busy` を降ろす。
+	 */
+	function recheckStaleStatus(current: HubSubscription | null, force: boolean): Promise<unknown> {
+		return runStaleRecheck(
+			{
+				snapshot: () => statusSnapshot,
+				apply: (snapshot, view) => {
+					if (view) applyView(view, snapshot);
+					else statusSnapshot = snapshot;
+				},
+				setBusy: (value) => {
+					busy = value;
+				},
+				fetchStatus: () => runWithLimit((signal) => getHubStatus(signal), HUB_UI_REREAD_TIMEOUT_MS),
+				now: () => Date.now()
+			},
+			current,
+			force
+		);
 	}
 
 	$effect(() => {
@@ -456,10 +482,12 @@
 			// 打ち切りの扱いは `connect` のコメント参照。
 			const view = await adoptHubKey(endpointDraft, manualKeyDraft, signal);
 			if (signal.aborted) return;
-			// #449 レビューの洗い出し: 採用しなかった候補キーの判定を、保存中の
-			// キーの接続の状態として出さない（`adoptionResult`）。
+			// #449 レビューの洗い出し / 再レビュー P2: 採用しなかった候補キーの
+			// 判定を、保存中のキーの接続の状態として出さない。**観測時点も
+			// 確認し直しの段階も前のまま**（`snapshotAfterAdoption`）- 片方だけ
+			// 新しくすると、古い状態を新しい購読と一緒に観測したことになる。
 			const outcome = adoptionResult(status, view);
-			applyView({ ...view, status: outcome.status });
+			applyView(view, snapshotAfterAdoption(statusSnapshot, view));
 			// 採用できたときだけ入力欄を空にする（失敗時に貼り直させない）。
 			if (outcome.adopted) manualKeyDraft = '';
 			else hubError = outcome.notice;
@@ -723,6 +751,19 @@
 				状態: <strong>{statusDisplay.label}</strong>
 			</p>
 			<p class="note">{statusDisplay.detail}</p>
+			{#if statusDisplay.recheckFailed}
+				<!--
+					#449 再レビュー P2: 取り直しに失敗したら、読み取り専用の再取得を
+					出す（`status()` は読み取りだけで、キーを発行しない）。
+				-->
+				<button
+					type="button"
+					onclick={() => recheckStaleStatus(subscription, true)}
+					disabled={busy}
+				>
+					状態を再取得
+				</button>
+			{/if}
 
 			{#if keyName}
 				<p class="note">このアプリのAPIキー名: <code>{keyName}</code></p>

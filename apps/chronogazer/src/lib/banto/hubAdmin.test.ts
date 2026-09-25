@@ -17,6 +17,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	adoptionResult,
 	applyServerSelection,
+	HUB_STATUS_RECHECK_FAILED_LABEL,
+	INITIAL_STATUS_SNAPSHOT,
+	runStaleRecheck,
+	snapshotAfterAdoption,
+	snapshotFromStoredView,
+	STALE_RECHECK_RETRY_MS,
+	type HubStatusSnapshot,
+	type RunWithLimitOutcome,
 	hubAbandonedDisplay,
 	effectiveCredentialGuidance,
 	hubCredentialGuidance,
@@ -686,6 +694,183 @@ describe('adoptionResult（採用しなかった候補キーの判定を、保�
 			adopted: true,
 			notice: null
 		});
+	});
+});
+
+/**
+ * #449 再レビュー P2 ×2: 画面の接続の状態の組（状態・観測時点・確認し直しの
+ * 段階）を、HubSection と同じ手順（`runStaleRecheck` / `snapshotAfterAdoption` /
+ * `snapshotFromStoredView`）で時系列に動かす。
+ */
+describe('画面の接続の状態の遷移（確認し直しの失敗・候補キーの不採用）', () => {
+	/** HubSection の状態の写し。`poll` は購読のポーリング 1 回（2 秒）。 */
+	function screenModel(fetchStatus: () => Promise<RunWithLimitOutcome<HubView>>, opened: HubView) {
+		const state = {
+			snapshot: snapshotFromStoredView(opened) as HubStatusSnapshot,
+			subscription: opened.subscription as HubSubscription,
+			busy: false,
+			now: 0,
+			fetches: 0
+		};
+		const host = {
+			snapshot: () => state.snapshot,
+			apply: (snapshot: HubStatusSnapshot, view?: HubView) => {
+				state.snapshot = snapshot;
+				if (view) state.subscription = view.subscription;
+			},
+			setBusy: (busy: boolean) => {
+				state.busy = busy;
+			},
+			fetchStatus: () => {
+				state.fetches += 1;
+				return fetchStatus();
+			},
+			now: () => state.now
+		};
+		const display = () =>
+			hubStatusDisplay(
+				state.snapshot.status,
+				state.snapshot.observedWith,
+				state.subscription,
+				state.snapshot.recheck
+			);
+		return {
+			state,
+			display,
+			/** 購読のポーリングが届き、画面の `$effect` が確認し直しを 1 回進める。 */
+			async poll(next: HubSubscription) {
+				state.now += 2_000;
+				state.subscription = next;
+				if (!state.busy) await runStaleRecheck(host, state.subscription);
+			},
+			/** 「状態を再取得」。 */
+			async retry() {
+				await runStaleRecheck(host, state.subscription, true);
+			},
+			/** 手動キーの採用の応答。 */
+			adopt(view: HubView) {
+				state.snapshot = snapshotAfterAdoption(state.snapshot, view);
+				state.subscription = view.subscription;
+			},
+			screen() {
+				const shown = display();
+				const texts = [
+					shown.label,
+					shown.detail,
+					hubSubscriptionDetail(state.subscription, shown.guidance),
+					hubCredentialGuidanceLine(state.subscription, shown.guidance) ?? ''
+				];
+				return {
+					shown,
+					keepKey: texts.some((text) => text.includes('解除を依頼')),
+					field: showManualKeyEntry(shown.guidance, state.subscription),
+					tagsBlock: state.snapshot.status.state === 'connected' && !shown.stale
+				};
+			}
+		};
+	}
+
+	const hubView = (status: HubStatus, sub: HubSubscription): HubView => ({
+		status,
+		endpoint: 'http://hub',
+		keyName: null,
+		selectedTags: [],
+		tags: null,
+		subscription: sub
+	});
+	const tripped = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+	const live = subscription({ state: 'live', lastError: null });
+	const revoked = subscription({ state: 'unauthorized', lastError: 'key_revoked' });
+
+	for (const failure of ['failed', 'timedOut', 'rejected'] as const) {
+		it(`確認し直しが ${failure} なら「確認できませんでした」と再取得を出し、ポーリングが成功し続けても連続では撃たない`, async () => {
+			let answer: 'fail' | 'connected' = 'fail';
+			const model = screenModel(
+				async () => {
+					if (answer === 'connected') {
+						return { kind: 'ok', value: hubView({ state: 'connected', tagCount: 1 }, live) };
+					}
+					if (failure === 'rejected') throw new Error('network');
+					return failure === 'failed'
+						? { kind: 'failed', error: new Error('x') }
+						: { kind: 'timedOut' };
+				},
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+
+			// 解除されて live に戻る → 古い keyTripped → 取り直しが失敗する。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			expect(model.state.busy).toBe(false);
+			let screen = model.screen();
+			expect(screen.shown.label).toBe(HUB_STATUS_RECHECK_FAILED_LABEL);
+			expect(screen.shown.recheckFailed, '再取得のボタンを出す').toBe(true);
+			expect(screen.keepKey).toBe(false);
+
+			// ポーリングは成功し続ける。間隔の間は撃たない（連続再試行しない）。
+			const pollsInInterval = STALE_RECHECK_RETRY_MS / 2_000 - 1;
+			for (let i = 0; i < pollsInInterval; i += 1) await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			expect(model.screen().shown.recheckFailed).toBe(true);
+
+			// 間隔が過ぎたら自動で 1 回だけ試し直す（まだ失敗）。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(2);
+			expect(model.screen().shown.recheckFailed).toBe(true);
+
+			// 「状態を再取得」は間隔を待たずに行く。今度は読める。
+			answer = 'connected';
+			await model.retry();
+			expect(model.state.fetches).toBe(3);
+			screen = model.screen();
+			expect(screen.shown.stale).toBe(false);
+			expect(screen.shown.recheckFailed).toBe(false);
+			expect(screen.tagsBlock, 'タグの操作欄が戻る').toBe(true);
+		});
+	}
+
+	for (const candidate of [
+		{ state: 'authFailed' },
+		{ state: 'forbidden' },
+		{ state: 'keyTripped' }
+	] as HubStatus[]) {
+		it(`確認し直しの失敗 → 古い keyTripped と新しい key_revoked → 候補 ${candidate.state} の不採用でも、交換の案内と入力欄が残る`, async () => {
+			const model = screenModel(
+				async () => ({ kind: 'failed', error: new Error('x') }),
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+			await model.poll(revoked);
+			let screen = model.screen();
+			expect(screen.shown.stale).toBe(true);
+			expect(screen.keepKey).toBe(false);
+			expect(screen.field).toBe(true);
+
+			// 候補キーの採用に失敗（バックエンドは保存中の K1 の購読を返す）。
+			model.adopt(hubView(candidate, revoked));
+			screen = model.screen();
+			expect(screen.shown.stale, '古い状態を新しい購読と一緒に観測したことにしない').toBe(true);
+			expect(screen.keepKey, '「解除を依頼」に戻さない').toBe(false);
+			expect(screen.field, '交換用の入力欄を残す').toBe(true);
+			expect(hubSubscriptionDetail(model.state.subscription, screen.shown.guidance)).toBe(
+				hubCredentialGuidance('key_revoked')?.message
+			);
+			// 失敗していたことも忘れない（再取得のボタンが残る）。
+			expect(screen.shown.recheckFailed).toBe(true);
+		});
+	}
+
+	it('採用できたら、その応答で組ごと新しくなる', () => {
+		const snapshot = snapshotFromStoredView(hubView({ state: 'keyTripped' }, tripped));
+		const adopted = snapshotAfterAdoption(
+			snapshot,
+			hubView({ state: 'connected', tagCount: 1 }, live)
+		);
+		expect(adopted).toEqual({
+			status: { state: 'connected', tagCount: 1 },
+			observedWith: live,
+			recheck: { phase: 'idle' }
+		});
+		expect(INITIAL_STATUS_SNAPSHOT.recheck).toEqual({ phase: 'idle' });
 	});
 });
 

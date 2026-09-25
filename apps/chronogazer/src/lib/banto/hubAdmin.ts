@@ -566,6 +566,181 @@ export function isHubStatusStale(
 export const HUB_STATUS_RECHECKING_LABEL = '確認し直しています';
 export const HUB_STATUS_RECHECKING_DETAIL =
 	'購読の状態が変わったため、Hubへの接続の状態を確認し直しています。';
+/** 確認し直しに失敗したときの見出しと説明（#449 再レビュー P2）。 */
+export const HUB_STATUS_RECHECK_FAILED_LABEL = '接続の状態を確認できませんでした';
+export const HUB_STATUS_RECHECK_FAILED_DETAIL =
+	'購読の状態が変わったため接続の状態を確認し直そうとしましたが、取得できませんでした。「状態を再取得」で取り直せます（自動でも30秒ごとに試します）。';
+
+/** 確認し直しに失敗したあと、自動で試し直すまでの間隔（#449 再レビュー P2）。 */
+export const STALE_RECHECK_RETRY_MS = 30_000;
+
+/**
+ * 古くなった接続の状態の「確認し直し」の段階（#449 再レビュー P2）。
+ *
+ * - `idle`: 確認し直していない（古くない、または確認し直せた）。
+ * - `pending`: 取り直しの要求が飛んでいる。
+ * - `failed`: 取り直しに失敗した・打ち切った。**失敗したことを画面に出し**、
+ *   読み取り専用の「状態を再取得」を出す。自動では `STALE_RECHECK_RETRY_MS`
+ *   ごとにしか試さない（連続では撃たない）。
+ *
+ * 「失敗した」と「いつ試し直すか」を別に持つ: 失敗を即座に忘れると連続で
+ * 撃ち、覚えたままだと「確認し直しています」のまま誰も試し直さない（以前の
+ * 実装がこれで、回復したいときに回復の導線が無かった）。
+ */
+export type StaleRecheck =
+	| { phase: 'idle' }
+	| { phase: 'pending'; signal: string }
+	| { phase: 'failed'; signal: string; failedAt: number };
+
+/**
+ * 画面が持つ接続の状態を、**いつ観測したものか**と対で持つ（#449 再レビュー
+ * P2）。`status` と `observedWith`（その `status` と一緒に届いた購読）は必ず
+ * 一緒に書き換える - 片方だけ新しくすると、古い接続の状態を新しい購読と
+ * 一緒に観測したことになり、古さを見落とす。
+ */
+export interface HubStatusSnapshot {
+	status: HubStatus;
+	observedWith: HubSubscription | null;
+	recheck: StaleRecheck;
+}
+
+export const INITIAL_STATUS_SNAPSHOT: HubStatusSnapshot = {
+	status: { state: 'notConfigured' },
+	observedWith: null,
+	recheck: { phase: 'idle' }
+};
+
+/**
+ * **保存しているキーについての** `status()` 系の応答（画面を開いたとき・接続・
+ * 一覧の更新・切断・確認し直し・打ち切り後の読み直し・採用できたとき）を
+ * 受け取った（純関数）。接続の状態と観測時点を一緒に新しくし、確認し直しの
+ * 段階も終える。
+ */
+export function snapshotFromStoredView(view: HubView): HubStatusSnapshot {
+	return { status: view.status, observedWith: view.subscription, recheck: { phase: 'idle' } };
+}
+
+/**
+ * 手動キーの採用の応答を受け取った（純関数）。採用できたら
+ * [`snapshotFromStoredView`] と同じ。**採用できなかったら何も変えない** - 応答の
+ * `status` は候補キーの判定で、保存しているキーを確認し直したわけではない。
+ * 観測時点（`observedWith`）も、確認し直しの段階（失敗していたなら失敗のまま）
+ * も前のまま残す。
+ */
+export function snapshotAfterAdoption(
+	snapshot: HubStatusSnapshot,
+	view: HubView
+): HubStatusSnapshot {
+	return view.status.state === 'connected' ? snapshotFromStoredView(view) : snapshot;
+}
+
+/**
+ * 今、古くなった接続の状態を取り直しに行くか（純関数）。`start` が真なら、
+ * 呼び出し側は取り直しを始め、`next`（`pending`）を持つ。
+ *
+ * - 古くない: 飛んでいる要求が無ければ `idle` に戻す（飛んでいるなら結果を待つ）。
+ * - `idle`: 取り直しに行く。
+ * - `pending`: 行かない（1 本だけ）。
+ * - `failed`: 購読のキーに関わる部分が失敗したときと違う、または
+ *   [`STALE_RECHECK_RETRY_MS`] 経った、または利用者が「状態を再取得」を押した
+ *   （`force`）ときだけ行く。
+ */
+export function staleRecheckStep(
+	snapshot: HubStatusSnapshot,
+	current: HubSubscription | null,
+	now: number,
+	force = false
+): { start: boolean; recheck: StaleRecheck } {
+	const recheck = snapshot.recheck;
+	if (!isHubStatusStale(snapshot.status, snapshot.observedWith, current)) {
+		// 同じ値なら同じオブジェクトを返す（呼び出し側が「変わったときだけ
+		// 書き換える」ため）。
+		return {
+			start: false,
+			recheck: recheck.phase === 'failed' ? { phase: 'idle' } : recheck
+		};
+	}
+	if (recheck.phase === 'pending') return { start: false, recheck };
+	const signal = String(subscriptionCredentialSignal(current));
+	const due =
+		recheck.phase === 'idle' ||
+		force ||
+		recheck.signal !== signal ||
+		now - recheck.failedAt >= STALE_RECHECK_RETRY_MS;
+	return due ? { start: true, recheck: { phase: 'pending', signal } } : { start: false, recheck };
+}
+
+/**
+ * 取り直しの結果（純関数）。読めたら [`snapshotFromStoredView`]、読めなかった
+ * （失敗・打ち切り）なら接続の状態と観測時点はそのままに、段階を `failed` に
+ * する。**`failed` にしないと「確認し直しています」のまま誰も試し直さない。**
+ */
+export function staleRecheckSettled(
+	snapshot: HubStatusSnapshot,
+	outcome: { kind: 'ok'; view: HubView } | { kind: 'failed' | 'timedOut' },
+	now: number
+): HubStatusSnapshot {
+	if (outcome.kind === 'ok') return snapshotFromStoredView(outcome.view);
+	// 待っている間に、保存しているキーの応答（明示操作）で組ごと新しくなって
+	// いたら、この失敗はもう何も語っていない。
+	if (snapshot.recheck.phase !== 'pending') return snapshot;
+	return {
+		...snapshot,
+		recheck: { phase: 'failed', signal: snapshot.recheck.signal, failedAt: now }
+	};
+}
+
+/** [`runStaleRecheck`] が画面の状態に触る口（画面とテストが同じ手順を通る）。 */
+export interface StaleRecheckHost {
+	snapshot(): HubStatusSnapshot;
+	/** 接続の状態の組を書き換える。`view` があれば、その応答で画面全体も更新する。 */
+	apply(snapshot: HubStatusSnapshot, view?: HubView): void;
+	setBusy(busy: boolean): void;
+	/** 保存しているキーの接続の状態を取り直す（上限付き。reject してもよい）。 */
+	fetchStatus(): Promise<RunWithLimitOutcome<HubView>>;
+	now(): number;
+}
+
+/**
+ * 古くなった接続の状態の確認し直しを 1 回ぶん進める（#449 再レビュー P2）。
+ * 画面は購読の状態が届くたび（`force = false`）と「状態を再取得」
+ * （`force = true`）で呼ぶ。行くかどうかは [`staleRecheckStep`]、結果は
+ * [`staleRecheckSettled`]。**取り直しが reject しても打ち切られても、必ず
+ * `failed` に進め、`busy` を降ろす。**
+ */
+export async function runStaleRecheck(
+	host: StaleRecheckHost,
+	current: HubSubscription | null,
+	force = false
+): Promise<'skipped' | 'ok' | 'failed'> {
+	const before = host.snapshot();
+	const step = staleRecheckStep(before, current, host.now(), force);
+	if (!step.start) {
+		if (step.recheck !== before.recheck) host.apply({ ...before, recheck: step.recheck });
+		return 'skipped';
+	}
+	host.apply({ ...before, recheck: step.recheck });
+	host.setBusy(true);
+	try {
+		let outcome: RunWithLimitOutcome<HubView>;
+		try {
+			outcome = await host.fetchStatus();
+		} catch (error) {
+			outcome = { kind: 'failed', error };
+		}
+		if (outcome.kind === 'ok') {
+			host.apply(
+				staleRecheckSettled(host.snapshot(), { kind: 'ok', view: outcome.value }, host.now()),
+				outcome.value
+			);
+			return 'ok';
+		}
+		host.apply(staleRecheckSettled(host.snapshot(), { kind: outcome.kind }, host.now()));
+		return 'failed';
+	} finally {
+		host.setBusy(false);
+	}
+}
 
 /**
  * 画面に出す接続の状態（#449 レビュー P2-2、純関数）。古い（[`isHubStatusStale`]）
@@ -576,21 +751,33 @@ export const HUB_STATUS_RECHECKING_DETAIL =
 export function hubStatusDisplay(
 	status: HubStatus,
 	observedWith: HubSubscription | null,
-	current: HubSubscription | null
-): { label: string; detail: string; guidance: HubStatus | null; stale: boolean } {
+	current: HubSubscription | null,
+	recheck: StaleRecheck = { phase: 'idle' }
+): {
+	label: string;
+	detail: string;
+	guidance: HubStatus | null;
+	stale: boolean;
+	recheckFailed: boolean;
+} {
 	if (isHubStatusStale(status, observedWith, current)) {
+		// 取り直しに失敗したなら、そう言う（「確認し直しています」のまま
+		// 放置しない）。画面は読み取り専用の「状態を再取得」を出す。
+		const failed = recheck.phase === 'failed';
 		return {
-			label: HUB_STATUS_RECHECKING_LABEL,
-			detail: HUB_STATUS_RECHECKING_DETAIL,
+			label: failed ? HUB_STATUS_RECHECK_FAILED_LABEL : HUB_STATUS_RECHECKING_LABEL,
+			detail: failed ? HUB_STATUS_RECHECK_FAILED_DETAIL : HUB_STATUS_RECHECKING_DETAIL,
 			guidance: null,
-			stale: true
+			stale: true,
+			recheckFailed: failed
 		};
 	}
 	return {
 		label: hubStatusLabel(status),
 		detail: hubStatusDetail(status),
 		guidance: status,
-		stale: false
+		stale: false,
+		recheckFailed: false
 	};
 }
 
