@@ -9538,6 +9538,14 @@ async fn require_tag_space_auth(
                     eprintln!("banto-hub: API キーの last_used_at 更新に失敗しました: {err}");
                 }
                 req.extensions_mut().insert(ctx);
+                // #430: `/api/v1/stream` が接続中も同じキーを照合し直せるよう、
+                // 照合に使う材料を載せる（`crate::stream::ApiKeyStreamCredential`）。
+                req.extensions_mut()
+                    .insert(crate::stream::ApiKeyStreamCredential::new(
+                        state.api_keys.clone(),
+                        token.clone(),
+                        state.manager.clone(),
+                    ));
                 next.run(req).await
             }
             Err((rejection, denied)) => {

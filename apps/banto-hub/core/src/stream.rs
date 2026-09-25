@@ -76,6 +76,39 @@
 //! どのみち送れない）」の大きい方（[`interval_floor_ms`]）。クランプは
 //! **subscribe 時点で1回だけ**計算し、購読の生存期間中は固定する
 //! （動的に変えると「一定間隔で届く」というクライアント側の期待を壊す）。
+//!
+//! ## 接続中の再検証（#430、banto #231 / #234 と同じ考え方）
+//!
+//! 認証（`crate::rest::require_tag_space_auth`）は**接続したときにしか**
+//! 走らない。ストリームは切断まで開いたままなので、失効したキーでも値の配信
+//! を受け取り続けてしまう。そこで各ストリームが [`REVALIDATE_INTERVAL`]
+//! （15 秒）ごとに自分の資格情報を照合し直し、使えないと**確認できたら**
+//! close フレーム（[`REVOKED_CLOSE_CODE`] = 1008 Policy Violation、理由文に
+//! `api_key_revoked` / `api_key_expired` / `api_key_tripped` /
+//! `api_key_not_found`）で閉じる。
+//!
+//! - **対象**: いまは API キーで開いたストリーム（`/api/v1/stream`）だけ。
+//!   照合は `crate::api_keys::ApiKeysService::check` →
+//!   `crate::api_keys::api_key_verdict`（#434 / #435 と同じ分類）。
+//!   セッションで開いたストリーム（`/api/v1/stream` のセッション・
+//!   `/api/tag-stream`）は、今は従来どおり接続時の検証だけ - banto-server の
+//!   `AuthState::revalidate`（アイドルのタイマーを延ばさない照合）が
+//!   公開されたら（tyaro/banto#239）、[`StreamCredential`] の実装を 1 つ
+//!   足して同じ仕組みに差し込む（`TODO(#239)`、[`ws_upgrade`] 参照）。
+//! - **照合できない（DB エラー・タイムアウト）ときは閉じない**。次の期限で
+//!   もう一度照合する。
+//! - **タイマーはストリーム 1 本につき 1 つ**（[`Revalidator`]、
+//!   [`handle_socket`] のローカル変数）。別タスクは起こさないので、切断で
+//!   `handle_socket` が終われば、期限も照合中の future も一緒に捨てられる。
+//! - 照合 1 回の上限は [`REVALIDATE_TIMEOUT`]（5 秒、周期より短い）。超えたら
+//!   「照合できない」扱い。打ち切った照合の future は捨てるだけで、API キーの
+//!   照合は読み取りのみ（`touch_last_used` も呼ばない）なので、あとから状態を
+//!   変えることはない。
+//! - **次の期限は照合が終わった時点から 1 周期後**。照合がどれだけ遅くても、
+//!   2 回の照合の間には必ず 1 周期ぶんの配信の時間がある。さらに banto の SSE
+//!   と違い、照合は `select!` の 1 分岐として**配信と並行に**進める（照合を
+//!   待つ間も 250ms の評価・受信は止まらない。値そのものを流すストリームで、
+//!   照合が返らない 5 秒間の配信停止を避けるため）。同時に走る照合は常に 1 つ。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,7 +126,10 @@ use tokio::time::MissedTickBehavior;
 
 use banto_collect::CollectEvent;
 
-use crate::api_keys::ApiKeyContext;
+use crate::api_keys::{
+    api_key_verdict, ApiKeyCheck, ApiKeyContext, ApiKeyRejection, ApiKeysService,
+    UnauthenticatedReason,
+};
 use crate::hub::{quality_str, CollectorManager};
 use crate::rest::TagSpaceState;
 use crate::subscribe_core::{
@@ -107,6 +143,197 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 /// Later) - 「サーバーは正常だがこのクライアントの処理が追いついていない」
 /// を最も素直に表す標準コード。
 const BACKPRESSURE_CLOSE_CODE: u16 = 1013;
+
+// --- 接続中の再検証（#430、このモジュールの doc comment 参照） ----------------
+
+/// 開いているストリームが資格情報を照合し直す間隔。banto の SSE
+/// （`banto_server::events::REVALIDATE_INTERVAL`）と同じ 15 秒。照合が
+/// **終わった時点**から数える。
+pub const REVALIDATE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 照合 1 回の上限。超えたら「照合できない」（閉じない）。周期より短い。
+pub const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const _: () = assert!(REVALIDATE_TIMEOUT.as_nanos() < REVALIDATE_INTERVAL.as_nanos());
+
+/// 資格情報が使えないと確認できたときの close code。RFC 6455 の 1008
+/// (Policy Violation) - 「このエンドポイントの方針に反する（もう認められて
+/// いない）」。理由は close フレームの理由文（`api_key_revoked` 等）で分ける。
+pub const REVOKED_CLOSE_CODE: u16 = 1008;
+
+/// 再検証の間隔と 1 回の上限。本番は [`Default`]（15 秒 / 5 秒）。テストは
+/// router に `Extension(StreamRevalidationTiming { .. })` を重ねて短くする
+/// （[`ws_upgrade`] が extensions から読む。外部のリクエストからは差し込め
+/// ない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamRevalidationTiming {
+    pub interval: Duration,
+    pub timeout: Duration,
+}
+
+impl Default for StreamRevalidationTiming {
+    fn default() -> Self {
+        Self {
+            interval: REVALIDATE_INTERVAL,
+            timeout: REVALIDATE_TIMEOUT,
+        }
+    }
+}
+
+/// 1 回の照合の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecheckVerdict {
+    /// まだ使える。
+    Valid,
+    /// 使えないと確認できた（閉じる）。`reason` は close フレームの理由文。
+    Revoked { reason: &'static str },
+    /// 照合できなかった（DB エラー・タイムアウト）。閉じない。
+    Unknown,
+}
+
+/// ストリームを開いた資格情報の照合し直し方。API キー用
+/// （[`ApiKeyStreamCredential`]）とセッション用（`TODO(#239)`）を差し替え
+/// られるようにする。照合は `'static` な future を返す（ストリームの
+/// ループが保持したまま、配信と並行に進めるため）。
+pub trait StreamCredential: Send + Sync + 'static {
+    fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict>;
+}
+
+/// API キーで開いたストリームの資格情報。`crate::rest::require_tag_space_auth`
+/// が API キーの認証に通った要求の extensions に載せる（[`Self::new`]）。
+///
+/// 平文のキーは、照合（[`ApiKeysService::check`]）に渡す以外に外へ出さない
+/// （フィールドは非公開、`Debug` も持たない）。持つ期間はストリームが開いて
+/// いる間だけ。
+#[derive(Clone)]
+pub(crate) struct ApiKeyStreamCredential {
+    api_keys: ApiKeysService,
+    token: String,
+    manager: Arc<CollectorManager>,
+}
+
+impl ApiKeyStreamCredential {
+    pub(crate) fn new(
+        api_keys: ApiKeysService,
+        token: String,
+        manager: Arc<CollectorManager>,
+    ) -> Self {
+        Self {
+            api_keys,
+            token,
+            manager,
+        }
+    }
+}
+
+impl StreamCredential for ApiKeyStreamCredential {
+    fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict> {
+        let api_keys = self.api_keys.clone();
+        let token = self.token.clone();
+        let manager = self.manager.clone();
+        Box::pin(async move {
+            let now_ms = manager.clock().now_ms();
+            api_key_recheck_verdict(api_keys.check(&token, now_ms).await)
+        })
+    }
+}
+
+/// API キーの照合の結果（#434 / #435 と同じ分類）を再検証の結果に変える純関数。
+pub fn api_key_recheck_verdict(check: ApiKeyCheck) -> RecheckVerdict {
+    match api_key_verdict(check) {
+        Ok(_) => RecheckVerdict::Valid,
+        Err((ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Revoked), _)) => {
+            RecheckVerdict::Revoked {
+                reason: "api_key_revoked",
+            }
+        }
+        Err((ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Expired), _)) => {
+            RecheckVerdict::Revoked {
+                reason: "api_key_expired",
+            }
+        }
+        Err((ApiKeyRejection::Unauthenticated(UnauthenticatedReason::NotFound), _)) => {
+            RecheckVerdict::Revoked {
+                reason: "api_key_not_found",
+            }
+        }
+        Err((ApiKeyRejection::Tripped, _)) => RecheckVerdict::Revoked {
+            reason: "api_key_tripped",
+        },
+        Err((ApiKeyRejection::Unavailable(err), _)) => {
+            eprintln!(
+                "banto-hub: ストリームの API キーを照合できませんでした（閉じずに続けます）: {err}"
+            );
+            RecheckVerdict::Unknown
+        }
+    }
+}
+
+/// ストリーム 1 本の再検証のタイマーと、照合中の future（このモジュールの
+/// doc comment「接続中の再検証」）。[`Self::next_verdict`] はキャンセルされても
+/// 状態（期限・照合中の future）を `self` に残すので、`select!` の分岐に
+/// そのまま置ける。
+pub(crate) struct Revalidator {
+    credential: Arc<dyn StreamCredential>,
+    timing: StreamRevalidationTiming,
+    next: tokio::time::Instant,
+    in_flight: Option<futures_util::future::BoxFuture<'static, RecheckVerdict>>,
+}
+
+impl Revalidator {
+    /// 最初の期限は開いてから 1 周期後（開いた時点は認証の層が照合済み）。
+    pub(crate) fn new(
+        credential: Arc<dyn StreamCredential>,
+        timing: StreamRevalidationTiming,
+    ) -> Self {
+        Self {
+            credential,
+            timing,
+            next: tokio::time::Instant::now() + timing.interval,
+            in_flight: None,
+        }
+    }
+
+    /// 次の照合が終わったら、その結果を返す。期限が来たら照合を 1 つ始め
+    /// （上限 `timing.timeout`、超えたら [`RecheckVerdict::Unknown`]）、
+    /// 終わった時点から次の期限を 1 周期後に置く。
+    pub(crate) async fn next_verdict(&mut self) -> RecheckVerdict {
+        if self.in_flight.is_none() {
+            tokio::time::sleep_until(self.next).await;
+            let check = self.credential.recheck();
+            let timeout = self.timing.timeout;
+            self.in_flight = Some(Box::pin(async move {
+                match tokio::time::timeout(timeout, check).await {
+                    Ok(verdict) => verdict,
+                    // 照合の future はここで捨てる（あとから何も変えない）。
+                    Err(_) => {
+                        eprintln!(
+                            "banto-hub: ストリームの資格情報の照合が {} ms 以内に終わりませんでした（閉じずに続けます）",
+                            timeout.as_millis()
+                        );
+                        RecheckVerdict::Unknown
+                    }
+                }
+            }));
+        }
+        let verdict = match self.in_flight.as_mut() {
+            Some(check) => check.await,
+            None => RecheckVerdict::Unknown,
+        };
+        self.in_flight = None;
+        self.next = tokio::time::Instant::now() + self.timing.interval;
+        verdict
+    }
+}
+
+/// [`Revalidator`] が無いストリーム（`TODO(#239)`: いまはセッション）では
+/// 永久に来ない分岐にする。
+async fn next_revalidation(revalidator: &mut Option<Revalidator>) -> RecheckVerdict {
+    match revalidator {
+        Some(revalidator) => revalidator.next_verdict().await,
+        None => std::future::pending().await,
+    }
+}
 
 // --- ルーティング -----------------------------------------------------------
 
@@ -131,9 +358,21 @@ pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<TagSpaceState>,
     ctx: Option<Extension<ApiKeyContext>>,
+    credential: Option<Extension<ApiKeyStreamCredential>>,
+    timing: Option<Extension<StreamRevalidationTiming>>,
 ) -> Response {
     let manager = state.manager;
     let scope = ctx.map(|Extension(ctx)| ctx);
+    // #430: API キーで開いたストリームは接続中も再検証する（このモジュールの
+    // doc comment「接続中の再検証」）。
+    // TODO(#239): セッションで開いたストリーム（`/api/v1/stream` のセッション・
+    // `/api/tag-stream`）は、banto-server の `AuthState::revalidate` が公開
+    // されたら、それを呼ぶ `StreamCredential` を足してここで同じく渡す。今は
+    // 従来どおり接続時の検証だけ。
+    let timing = timing.map(|Extension(timing)| timing).unwrap_or_default();
+    let revalidator = credential.map(|Extension(credential)| {
+        Revalidator::new(Arc::new(credential) as Arc<dyn StreamCredential>, timing)
+    });
     // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
     // doc comment も参照）: `.protocols(["bearer"])` は**選択**であって
     // **無条件エコー**ではない - axum の実装（`WebSocketUpgrade::protocols`）
@@ -155,13 +394,14 @@ pub(crate) async fn ws_upgrade(
     // `Sec-WebSocket-Protocol` 認証を使う全クライアント（ブラウザ・この
     // テストスイート）でハンドシェイクが一貫して成功するようにする。
     ws.protocols(["bearer"])
-        .on_upgrade(move |socket| handle_socket(socket, manager, scope))
+        .on_upgrade(move |socket| handle_socket(socket, manager, scope, revalidator))
 }
 
-async fn handle_socket(
+pub(crate) async fn handle_socket(
     socket: WebSocket,
     manager: Arc<CollectorManager>,
     scope: Option<ApiKeyContext>,
+    mut revalidator: Option<Revalidator>,
 ) {
     let (sink, mut incoming) = socket.split();
     let (data_tx, data_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
@@ -182,6 +422,19 @@ async fn handle_socket(
 
     loop {
         let should_continue = tokio::select! {
+            // #430: 照合が終わったら判定する（照合は配信と並行に進む -
+            // `Revalidator` のキャンセル安全性はその doc comment 参照）。
+            verdict = next_revalidation(&mut revalidator) => match verdict {
+                RecheckVerdict::Revoked { reason } => {
+                    let _ = close_tx.try_send(CloseFrame {
+                        code: REVOKED_CLOSE_CODE,
+                        reason: reason.into(),
+                    });
+                    false
+                }
+                // 照合できない（DB エラー・タイムアウト）ときは閉じない。
+                RecheckVerdict::Valid | RecheckVerdict::Unknown => true,
+            },
             msg = incoming.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     handle_text(
@@ -715,5 +968,482 @@ fn enqueue(
             });
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! #430: 接続中の再検証。照合を差し替えられる [`StreamCredential`] の
+    //! 偽物で、[`Revalidator`] の時間の規律（仮想時間）と、[`handle_socket`]
+    //! に載せたときの振る舞い（実 WebSocket）を確かめる。実際の API キーでの
+    //! 確認は `tests/stream.rs`（失効・トリップ・期限切れ・DB エラー・DB が
+    //! 答えない）。
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use crate::broker_glue::{BrokerSimRegistry, HubSessions};
+    use crate::computed::{ComputedEngine, ServerTagStore};
+    use crate::db::init_db;
+    use banto_collect::CollectorOptions;
+    use banto_tstore::SystemClock;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// 偽の照合が返すもの。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Answer {
+        Valid,
+        Revoked,
+        Unknown,
+        /// 返らない（上限で打ち切られるまで待つ）。
+        Hang,
+    }
+
+    /// 偽の照合の観測点。
+    struct Probe {
+        answer: Mutex<Answer>,
+        /// 照合 1 回にかかる時間（答えを返す前に待つ）。
+        delay: Duration,
+        /// 照合を始めた時刻。
+        starts: Mutex<Vec<tokio::time::Instant>>,
+        /// 始めた照合の数。
+        calls: AtomicUsize,
+        /// いま進行中の照合の数（終わるか、捨てられたら減る）。
+        in_flight: AtomicUsize,
+        /// 終わらずに捨てられた（打ち切り・切断）照合の数。
+        dropped: AtomicUsize,
+        /// 生きている偽の資格情報の数（ストリームが持つ）。
+        live: AtomicUsize,
+    }
+
+    impl Probe {
+        fn new(answer: Answer, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(answer),
+                delay,
+                starts: Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                dropped: AtomicUsize::new(0),
+                live: AtomicUsize::new(0),
+            })
+        }
+
+        fn set(&self, answer: Answer) {
+            *self.answer.lock().unwrap() = answer;
+        }
+
+        fn credential(self: &Arc<Self>) -> Arc<dyn StreamCredential> {
+            self.live.fetch_add(1, Ordering::SeqCst);
+            Arc::new(FakeCredential {
+                probe: self.clone(),
+            })
+        }
+    }
+
+    struct FakeCredential {
+        probe: Arc<Probe>,
+    }
+
+    impl Drop for FakeCredential {
+        fn drop(&mut self) {
+            self.probe.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 照合の future が、終わったか・終わらずに捨てられたかを数える。
+    struct InFlight {
+        probe: Arc<Probe>,
+        finished: bool,
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.probe.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if !self.finished {
+                self.probe.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl StreamCredential for FakeCredential {
+        fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict> {
+            let probe = self.probe.clone();
+            probe.calls.fetch_add(1, Ordering::SeqCst);
+            probe.in_flight.fetch_add(1, Ordering::SeqCst);
+            probe
+                .starts
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            // 作った時点から数える（一度も poll されずに捨てられても数える）。
+            let guard = InFlight {
+                probe: probe.clone(),
+                finished: false,
+            };
+            Box::pin(async move {
+                // フィールドだけでなく guard ごと future に持たせる。
+                let mut guard = guard;
+                tokio::time::sleep(probe.delay).await;
+                let answer = *probe.answer.lock().unwrap();
+                let verdict = match answer {
+                    Answer::Valid => RecheckVerdict::Valid,
+                    Answer::Revoked => RecheckVerdict::Revoked {
+                        reason: "api_key_revoked",
+                    },
+                    Answer::Unknown => RecheckVerdict::Unknown,
+                    Answer::Hang => std::future::pending().await,
+                };
+                guard.finished = true;
+                verdict
+            })
+        }
+    }
+
+    fn timing(interval_ms: u64, timeout_ms: u64) -> StreamRevalidationTiming {
+        StreamRevalidationTiming {
+            interval: Duration::from_millis(interval_ms),
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    // --- Revalidator の時間の規律（仮想時間） --------------------------------
+
+    /// 次の期限は照合が**終わった**時点から 1 周期後（開始からではない）。
+    #[tokio::test(start_paused = true)]
+    async fn the_next_deadline_is_one_interval_after_the_check_finished() {
+        let probe = Probe::new(Answer::Valid, Duration::from_millis(40));
+        let t0 = tokio::time::Instant::now();
+        let mut revalidator = Revalidator::new(probe.credential(), timing(100, 1_000));
+
+        assert_eq!(revalidator.next_verdict().await, RecheckVerdict::Valid);
+        assert_eq!(revalidator.next_verdict().await, RecheckVerdict::Valid);
+
+        let starts = probe.starts.lock().unwrap().clone();
+        assert_eq!(
+            starts,
+            vec![
+                t0 + Duration::from_millis(100),
+                // 1 回目が 140ms に終わり、その 1 周期後。
+                t0 + Duration::from_millis(240),
+            ]
+        );
+    }
+
+    /// 上限を超えた照合は「照合できない」。捨てた future はそれきりで、次の
+    /// 期限は打ち切った時点から 1 周期後。
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_does_not_return_is_abandoned_as_unknown() {
+        let probe = Probe::new(Answer::Hang, Duration::ZERO);
+        let t0 = tokio::time::Instant::now();
+        let mut revalidator = Revalidator::new(probe.credential(), timing(100, 30));
+
+        assert_eq!(revalidator.next_verdict().await, RecheckVerdict::Unknown);
+        assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(tokio::time::Instant::now(), t0 + Duration::from_millis(130));
+
+        probe.set(Answer::Revoked);
+        assert_eq!(
+            revalidator.next_verdict().await,
+            RecheckVerdict::Revoked {
+                reason: "api_key_revoked"
+            }
+        );
+        assert_eq!(
+            *probe.starts.lock().unwrap().last().unwrap(),
+            t0 + Duration::from_millis(230)
+        );
+    }
+
+    /// `select!` で何度キャンセルされても、照合は同時に 1 つだけで、その間も
+    /// ほかの分岐（配信）は進む。
+    #[tokio::test(start_paused = true)]
+    async fn the_check_runs_alongside_delivery_one_at_a_time() {
+        let probe = Probe::new(Answer::Valid, Duration::from_millis(40));
+        let mut revalidator = Some(Revalidator::new(probe.credential(), timing(100, 1_000)));
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        let mut verdicts = 0;
+        let mut ticks_during_checks = 0;
+        while verdicts < 3 {
+            tokio::select! {
+                _ = next_revalidation(&mut revalidator) => verdicts += 1,
+                _ = tick.tick() => {
+                    let in_flight = probe.in_flight.load(Ordering::SeqCst);
+                    assert!(in_flight <= 1, "two checks in flight at once");
+                    if in_flight == 1 {
+                        ticks_during_checks += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(probe.dropped.load(Ordering::SeqCst), 0);
+        assert!(
+            ticks_during_checks >= 3,
+            "delivery must go on while a check is in flight (got {ticks_during_checks} ticks)"
+        );
+    }
+
+    /// 資格情報の無いストリーム（`TODO(#239)`: いまはセッション）では再検証の
+    /// 分岐は来ない。
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_without_a_credential_never_rechecks() {
+        let mut revalidator: Option<Revalidator> = None;
+        let result = tokio::time::timeout(
+            Duration::from_secs(3600),
+            next_revalidation(&mut revalidator),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    /// API キーの照合の結果の分類（#434 / #435 と同じ）を表で確かめる。
+    #[test]
+    fn api_key_checks_map_to_recheck_verdicts() {
+        use crate::api_keys::ApiKeyLookup;
+        use banto_core::BantoError;
+        let ctx = ApiKeyContext {
+            id: 1,
+            name: "k".to_string(),
+            scopes: vec!["read".to_string()],
+            last_used_at_ms: None,
+        };
+        let key = || (1, "k".to_string());
+        let revoked = |reason| RecheckVerdict::Revoked { reason };
+        let cases = [
+            (
+                ApiKeyCheck::Answered(ApiKeyLookup::Valid(ctx)),
+                RecheckVerdict::Valid,
+            ),
+            (
+                ApiKeyCheck::Answered(ApiKeyLookup::Revoked {
+                    id: key().0,
+                    name: key().1,
+                }),
+                revoked("api_key_revoked"),
+            ),
+            (
+                ApiKeyCheck::Answered(ApiKeyLookup::Expired {
+                    id: key().0,
+                    name: key().1,
+                }),
+                revoked("api_key_expired"),
+            ),
+            (
+                ApiKeyCheck::Answered(ApiKeyLookup::Tripped {
+                    id: key().0,
+                    name: key().1,
+                }),
+                revoked("api_key_tripped"),
+            ),
+            (
+                ApiKeyCheck::Answered(ApiKeyLookup::NotFound),
+                revoked("api_key_not_found"),
+            ),
+            (
+                ApiKeyCheck::Unavailable(BantoError::Storage("db down".to_string())),
+                RecheckVerdict::Unknown,
+            ),
+        ];
+        for (check, expected) in cases {
+            assert_eq!(api_key_recheck_verdict(check), expected);
+        }
+    }
+
+    // --- handle_socket に載せたとき（実 WebSocket） --------------------------
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    struct Server {
+        server: banto_server::RunningServer,
+        _manager: Arc<CollectorManager>,
+        _dir: crate::test_support::TempDir,
+    }
+
+    /// `/ws` に、偽の資格情報で再検証する [`handle_socket`] を置いたサーバー。
+    async fn serve(probe: Arc<Probe>, timing: StreamRevalidationTiming) -> Server {
+        let dir = crate::test_support::TempDir::new("stream-revalidation");
+        let pool = init_db(&dir.path().join("registry.sqlite3"))
+            .await
+            .expect("init_db");
+        let manager = Arc::new(CollectorManager::new(
+            pool,
+            dir.path().join("data"),
+            Arc::new(SystemClock),
+            CollectorOptions::default(),
+            Arc::new(HubSessions::new(banto_broker::BackoffConfig::default())),
+            Arc::new(BrokerSimRegistry::new()),
+            Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
+        ));
+        let handler_manager = manager.clone();
+        let router = axum::Router::new().route(
+            "/ws",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let manager = handler_manager.clone();
+                let credential = probe.credential();
+                async move {
+                    ws.on_upgrade(move |socket| {
+                        handle_socket(
+                            socket,
+                            manager,
+                            None,
+                            Some(Revalidator::new(credential, timing)),
+                        )
+                    })
+                }
+            }),
+        );
+        let server = banto_server::start(
+            banto_server::ServerConfig {
+                bind: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            router,
+        )
+        .await
+        .expect("server should start");
+        Server {
+            server,
+            _manager: manager,
+            _dir: dir,
+        }
+    }
+
+    async fn connect(server: &Server) -> Client {
+        let url = format!("ws://127.0.0.1:{}/ws", server.server.local_addr().port());
+        tokio_tungstenite::connect_async(url)
+            .await
+            .expect("ws handshake")
+            .0
+    }
+
+    /// ping を送り、pong が返ることを確かめる（ストリームが開いていて、
+    /// ループが止まっていない）。
+    async fn assert_pong(ws: &mut Client) {
+        ws.send(WsMessage::Text(r#"{"op":"ping"}"#.into()))
+            .await
+            .expect("send ping");
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Text(text))) => return text.to_string(),
+                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                    other => panic!("stream ended while waiting for pong: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("pong within 5s");
+        assert!(reply.contains("pong"), "{reply}");
+    }
+
+    /// close フレームを待って (code, reason) を返す。
+    async fn wait_for_close(ws: &mut Client, bound: Duration) -> (u16, String) {
+        tokio::time::timeout(bound, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Close(Some(frame)))) => {
+                        return (u16::from(frame.code), frame.reason.to_string())
+                    }
+                    Some(Ok(WsMessage::Close(None))) | None | Some(Err(_)) => {
+                        panic!("stream ended without a close frame")
+                    }
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await
+        .expect("close frame within the bound")
+    }
+
+    async fn wait_until(bound: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        while tokio::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        condition()
+    }
+
+    /// 使えないと確認できたら、1 周期以内に 1008 と理由文で閉じる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revoked_credential_closes_the_stream_with_1008() {
+        let probe = Probe::new(Answer::Valid, Duration::ZERO);
+        let server = serve(probe.clone(), timing(100, 1_000)).await;
+        let mut ws = connect(&server).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || probe
+                .calls
+                .load(Ordering::SeqCst)
+                >= 1)
+            .await
+        );
+        assert_pong(&mut ws).await;
+
+        probe.set(Answer::Revoked);
+        let (code, reason) = wait_for_close(&mut ws, Duration::from_secs(2)).await;
+        assert_eq!(code, REVOKED_CLOSE_CODE);
+        assert_eq!(reason, "api_key_revoked");
+    }
+
+    /// 照合が返らない・照合できないあいだは閉じず、ループも止まらない。
+    /// 答えが戻って使えないと分かったら閉じる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_check_that_cannot_answer_keeps_the_stream_open_until_revocation_is_confirmed() {
+        let probe = Probe::new(Answer::Hang, Duration::ZERO);
+        let server = serve(probe.clone(), timing(100, 300)).await;
+        let mut ws = connect(&server).await;
+
+        // 返らない照合が 2 回打ち切られるまで、ping に応え続ける。
+        while probe.dropped.load(Ordering::SeqCst) < 2 {
+            assert_pong(&mut ws).await;
+        }
+        // 照合できない（DB エラー）が 2 回。
+        probe.set(Answer::Unknown);
+        let calls = probe.calls.load(Ordering::SeqCst);
+        while probe.calls.load(Ordering::SeqCst) < calls + 2 {
+            assert_pong(&mut ws).await;
+        }
+        assert_pong(&mut ws).await;
+
+        probe.set(Answer::Revoked);
+        let (code, reason) = wait_for_close(&mut ws, Duration::from_secs(2)).await;
+        assert_eq!(code, REVOKED_CLOSE_CODE);
+        assert_eq!(reason, "api_key_revoked");
+    }
+
+    /// クライアントが切断したら、照合中のものも含めて再検証が止まる
+    /// （資格情報と照合の future がストリームと一緒に捨てられる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_disconnect_stops_the_rechecks() {
+        let probe = Probe::new(Answer::Hang, Duration::ZERO);
+        let server = serve(probe.clone(), timing(50, 10_000)).await;
+        let ws = connect(&server).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || probe
+                .in_flight
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "a check should be in flight"
+        );
+        assert_eq!(probe.live.load(Ordering::SeqCst), 1);
+
+        drop(ws);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                probe.live.load(Ordering::SeqCst) == 0
+                    && probe.in_flight.load(Ordering::SeqCst) == 0
+            })
+            .await,
+            "the stream's credential and its in-flight check should be dropped on disconnect"
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
     }
 }

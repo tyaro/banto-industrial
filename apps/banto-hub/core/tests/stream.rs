@@ -27,6 +27,7 @@ use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
+use banto_hub_core::stream::{StreamRevalidationTiming, REVOKED_CLOSE_CODE};
 use banto_hub_core::users::UsersService;
 use banto_plc::modbus::simulator::Simulator;
 use banto_server::{start, AuthState, Identity, ServerConfig};
@@ -185,6 +186,20 @@ async fn test_app_unlocked(label: &str) -> TestApp {
 }
 
 async fn test_app_with_lock(label: &str, locked_down: bool) -> TestApp {
+    test_app_with(label, locked_down, None).await
+}
+
+/// #430: 再検証の間隔と上限を短くした [`test_app`]（`StreamRevalidationTiming`
+/// を router の extensions に重ねる。本番は 15 秒 / 5 秒）。
+async fn test_app_with_revalidation(label: &str, timing: StreamRevalidationTiming) -> TestApp {
+    test_app_with(label, true, Some(timing)).await
+}
+
+async fn test_app_with(
+    label: &str,
+    locked_down: bool,
+    revalidation: Option<StreamRevalidationTiming>,
+) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -297,6 +312,10 @@ async fn test_app_with_lock(label: &str, locked_down: bool) -> TestApp {
         rate_limiter,
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
+    let router = match revalidation {
+        Some(timing) => router.layer(axum::Extension(timing)),
+        None => router,
+    };
 
     let server = start(
         ServerConfig {
@@ -1624,4 +1643,228 @@ async fn admin_tag_stream_requires_auth_when_locked_down() {
         ok.is_ok(),
         "a valid session token via Sec-WebSocket-Protocol should be accepted: {ok:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #430: API キーで開いたストリームの接続中の再検証
+// ---------------------------------------------------------------------------
+
+/// テストの再検証の間隔と上限（本番は 15 秒 / 5 秒）。
+const TEST_REVALIDATION: StreamRevalidationTiming = StreamRevalidationTiming {
+    interval: Duration::from_millis(300),
+    timeout: Duration::from_millis(500),
+};
+
+/// 使えなくしてから close が届くまでの上限: 1 周期 + 照合 1 回の上限 + 余裕。
+fn close_bound() -> Duration {
+    TEST_REVALIDATION.interval + TEST_REVALIDATION.timeout + Duration::from_secs(1)
+}
+
+/// close フレームを待って (code, reason) を返す（テキスト・ping は読み飛ばす）。
+async fn wait_for_close(ws: &mut WsStream, bound: Duration) -> (u16, String) {
+    tokio::time::timeout(bound, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Close(Some(frame)))) => {
+                    return (u16::from(frame.code), frame.reason.to_string())
+                }
+                Some(Ok(WsMessage::Close(None))) | None | Some(Err(_)) => {
+                    panic!("stream ended without a close frame")
+                }
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no close frame within {bound:?}"))
+}
+
+/// タグ `line1.fast.temp01`（値 `value`）を 1 つ用意して、収集が値を読むまで
+/// 待つ。
+async fn seed_one_tag(app: &TestApp, sim: &Simulator, value: u16) {
+    sim.set_holding_register(0, value);
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(f64::from(value)))
+        })
+        .await,
+        "collector should observe the simulator value"
+    );
+}
+
+/// API キーで開き、`interval` 購読して最初の値を受け取ったストリーム。
+async fn open_interval_stream(app: &TestApp, key: &str) -> WsStream {
+    let mut ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(key))
+        .await
+        .expect("API-key WS handshake should succeed");
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "interval", "interval_ms": 250 }),
+    )
+    .await;
+    recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    ws
+}
+
+/// `count` 個の値を受け取る（途中で閉じたら `recv_matching` が失敗させる）。
+/// 購読は 250ms ごとなので、`count` 個で `count * 250ms` 以上かかる。
+async fn receive_values(ws: &mut WsStream, count: usize) {
+    for _ in 0..count {
+        recv_matching(ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// 失効・トリップ・期限切れのあと、そのキーで開いていたストリームは 1 周期
+/// 以内に 1008 と理由文で閉じる。ほかのキーのストリームは開いたまま。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_streams_close_within_an_interval_after_revoke_trip_or_expiry() {
+    let app = test_app_with_revalidation("revalidate-api-key", TEST_REVALIDATION).await;
+    let read = || vec!["read".to_string()];
+    let revoked = app.api_keys.issue("revoked", read(), None).await.unwrap();
+    let tripped = app.api_keys.issue("tripped", read(), None).await.unwrap();
+    let expired = app.api_keys.issue("expired", read(), None).await.unwrap();
+    let kept = app.api_keys.issue("kept", read(), None).await.unwrap();
+
+    let url = app.ws_url("/api/v1/stream");
+    let mut revoked_ws = connect_ws(&url, Some(&revoked.key)).await.unwrap();
+    let mut tripped_ws = connect_ws(&url, Some(&tripped.key)).await.unwrap();
+    let mut expired_ws = connect_ws(&url, Some(&expired.key)).await.unwrap();
+    let mut kept_ws = connect_ws(&url, Some(&kept.key)).await.unwrap();
+
+    app.api_keys.revoke(revoked.id).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let (code, reason) = wait_for_close(&mut revoked_ws, close_bound()).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (REVOKED_CLOSE_CODE, "api_key_revoked")
+    );
+    eprintln!("revoked: closed after {:?}", started.elapsed());
+
+    app.api_keys.trip(tripped.id).await.unwrap();
+    let (code, reason) = wait_for_close(&mut tripped_ws, close_bound()).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (REVOKED_CLOSE_CODE, "api_key_tripped")
+    );
+
+    sqlx::query("UPDATE api_keys SET expires_at = ? WHERE id = ?")
+        .bind((now_ms() - 1).to_string())
+        .bind(expired.id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let (code, reason) = wait_for_close(&mut expired_ws, close_bound()).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (REVOKED_CLOSE_CODE, "api_key_expired")
+    );
+
+    // 使えるキーのストリームは、いくつもの照合を経ても開いたまま。
+    send_json(&mut kept_ws, json!({ "op": "ping" })).await;
+    let pong = recv_matching(&mut kept_ws, |m| m["op"] == "pong").await;
+    assert_eq!(pong["op"], "pong");
+}
+
+/// キーを照合できない（DB エラー）あいだは値の配信が続き、閉じない。DB が
+/// 戻った後の照合で失効が分かれば閉じる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_stream_keeps_delivering_while_the_key_store_errors() {
+    let app = test_app_with_revalidation("revalidate-db-error", TEST_REVALIDATION).await;
+    let sim = Simulator::start().await;
+    seed_one_tag(&app, &sim, 11).await;
+    let issued = app
+        .api_keys
+        .issue("db-error", vec!["read".to_string()], None)
+        .await
+        .unwrap();
+    let mut ws = open_interval_stream(&app, &issued.key).await;
+
+    // 照合の SELECT が失敗するようにする（`api_keys` の #434 のテストと同じ手）。
+    sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    // 10 個 = 2.5 秒以上。そのあいだに照合（300ms ごと）は何度も失敗する。
+    receive_values(&mut ws, 10).await;
+
+    sqlx::query("ALTER TABLE api_keys_away RENAME TO api_keys")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    app.api_keys.revoke(issued.id).await.unwrap();
+    let (code, reason) = wait_for_close(&mut ws, close_bound()).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (REVOKED_CLOSE_CODE, "api_key_revoked")
+    );
+
+    sim.stop();
+}
+
+/// 照合が返らない（DB の接続をすべて塞ぐ）あいだも値の配信が続き、閉じない。
+/// 塞いでいる間に失効させ、塞ぎを解いた後の照合で閉じる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_stream_keeps_delivering_while_the_key_check_does_not_return() {
+    let app = test_app_with_revalidation("revalidate-db-hang", TEST_REVALIDATION).await;
+    let sim = Simulator::start().await;
+    seed_one_tag(&app, &sim, 12).await;
+    let issued = app
+        .api_keys
+        .issue("db-hang", vec!["read".to_string()], None)
+        .await
+        .unwrap();
+    let mut ws = open_interval_stream(&app, &issued.key).await;
+
+    // 接続プールを使い切る: 照合は接続の取得で止まり、上限（500ms）で打ち切られる。
+    let max = app.pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..max {
+        held.push(
+            tokio::time::timeout(Duration::from_secs(5), app.pool.acquire())
+                .await
+                .expect("acquire should not wait long")
+                .expect("acquire"),
+        );
+    }
+    // 12 個 = 3 秒以上。照合（1 周期 800ms: 待ち 300ms + 打ち切り 500ms）は
+    // 3 回以上返らない。
+    receive_values(&mut ws, 12).await;
+
+    sqlx::query("UPDATE api_keys SET revoked_at = datetime('now') WHERE id = ?")
+        .bind(issued.id)
+        .execute(&mut *held[0])
+        .await
+        .unwrap();
+    drop(held);
+    let (code, reason) = wait_for_close(&mut ws, close_bound()).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (REVOKED_CLOSE_CODE, "api_key_revoked")
+    );
+
+    sim.stop();
 }
