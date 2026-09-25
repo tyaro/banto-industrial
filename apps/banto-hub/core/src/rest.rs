@@ -73,7 +73,8 @@ use banto_plc::{
     PlcClient, PlcError, ReadRequest, ReadResult, SlmpClient, SlmpConfig,
 };
 use banto_server::{
-    auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, Identity, ServerEvent,
+    auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, Identity,
+    ServerEvent, SessionAccount, SessionStamp, SessionValidation,
 };
 use banto_tags::{
     BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup,
@@ -158,7 +159,83 @@ fn actor_identity(
 struct AuthGate {
     auth: AuthState,
     commissioning: CommissioningState,
+    /// #431: このゲートの後ろにあるルートの操作の種類。照合できなかった
+    /// ときの扱いだけがこれで変わる。既定は [`OperationKind::Normal`]
+    /// （例外なし）で、[`OperationKind::StopWrites`] はハンドラの隣で
+    /// 明示的に宣言した定数からだけ渡す（`WRITE_CONTROL_DISABLE_OPERATION`）。
+    operation: OperationKind,
 }
+
+/// #431: ルートの操作の種類（ルート名ではなく、ハンドラの隣の定数で宣言する）。
+/// banto v1.7.0 #204 で要求ごとの照合を入れたため、DB が応答しないと緊急停止
+/// （`POST /api/write-control/disable`）まで 500 で通らなくなった。書き込みを
+/// **止める**操作だけは、照合できないときも例外で通す（オーナー決定
+/// 2026-09-24、issue #431）。ルートを足しても、宣言しない限り例外は広がらない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationKind {
+    /// 既定。照合できなければ（DB エラー）その要求は 500。
+    Normal,
+    /// 書き込みを止める操作。照合できない（DB エラー・タイムアウト）ときも、
+    /// それまで有効だった（メモリ上で有効な）セッションなら通す。失効が
+    /// **確認できた**セッションは拒否する。
+    StopWrites,
+}
+
+/// #431: `AuthState::authenticate` の結果の分類（タイムアウトを含む）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionCheck {
+    /// 照合できて、有効。
+    Valid,
+    /// トークンが無い・期限切れ、または照合でアカウントの削除・世代の変更が
+    /// **確認できた**。
+    Revoked,
+    /// DB が照合に答えられなかった（エラー・タイムアウト）。
+    Unverified,
+}
+
+/// #431: ゲートの判断。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateDecision {
+    /// 照合できて有効。通す。
+    Allow,
+    /// 照合できなかったが、止める操作で、それまで有効だったセッション。
+    /// 例外で通し、監査に印を付ける（[`UnverifiedStopException`]）。
+    AllowUnverifiedStop,
+    /// 401。
+    Unauthorized,
+    /// 照合できなかった。その要求だけ 500（セッションは残す）。
+    Unavailable,
+}
+
+/// #431: ゲートの判断（純関数、表でテストする）。`previously_valid` は
+/// 照合できなかったとき、そのトークンがメモリ上でまだ有効（既知・期限内）
+/// だったか - 「それまで有効だったセッション」の意味。
+pub(crate) fn session_gate_decision(
+    check: SessionCheck,
+    operation: OperationKind,
+    previously_valid: bool,
+) -> GateDecision {
+    match (check, operation) {
+        (SessionCheck::Valid, _) => GateDecision::Allow,
+        (SessionCheck::Revoked, _) => GateDecision::Unauthorized,
+        (SessionCheck::Unverified, OperationKind::Normal) => GateDecision::Unavailable,
+        (SessionCheck::Unverified, OperationKind::StopWrites) if previously_valid => {
+            GateDecision::AllowUnverifiedStop
+        }
+        (SessionCheck::Unverified, OperationKind::StopWrites) => GateDecision::Unauthorized,
+    }
+}
+
+/// #431: 止める操作のルートで、照合を待つ上限。DB が応答しない（ハングする）
+/// ときも緊急停止を待たせない。banto の SSE の再照合と同じ 5 秒
+/// （`banto_server::events::REVALIDATE_TIMEOUT`）。通常のルートには掛けない
+/// （従来どおり）。
+const STOP_SESSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #431: 照合できなかったが止める操作として例外で通した要求に、ゲートが
+/// 載せる印。ハンドラはこれを見て監査に残す。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnverifiedStopException;
 
 /// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）: `banto_server::require_auth`
 /// をそのまま`.layer(middleware::from_fn_with_state(auth, require_auth))`
@@ -188,9 +265,20 @@ struct AuthGate {
 /// この関数を`.layer`として使う他の管理系ルーター（`/api/status`・
 /// `/api/users`等）には一切影響しない - それらのパスに対しては
 /// `extract_ws_protocol_token`が常に`None`を返す。
+///
+/// banto v1.7.0 #204: ロックダウン済みの判定は `banto_server::require_auth`
+/// と同じく `AuthState::authenticate` でアカウントと照合する（メモリ上の
+/// トークンだけを見る `verify` ではない）。削除・世代の変わった
+/// アカウントのセッションは 401、DB が照合に答えられないときはトークンを
+/// 残したままこの要求だけ失敗させる（`ApiError` の 500）。通過した要求には
+/// `require_auth` と同じく `AuthenticatedSession` を載せる。
+///
+/// 試運転モード（未ロックダウン）はトークンを発行しない（合成 identity を
+/// 要求ごとに返すだけ）ので、ロックダウンした時点で次の要求からこの照合に
+/// 切り替わる - 持ち越すセッションが無い。
 async fn require_auth_or_commissioning(
     State(gate): State<AuthGate>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     if !gate.commissioning.is_locked_down() {
@@ -199,9 +287,50 @@ async fn require_auth_or_commissioning(
     let token = bearer_token(req.headers())
         .map(str::to_string)
         .or_else(|| extract_ws_protocol_token(req.uri().path(), req.headers()));
-    match token {
-        Some(token) if gate.auth.verify(&token) => next.run(req).await,
-        _ => unauthorized_response(),
+    let Some(token) = token else {
+        return unauthorized_response();
+    };
+    // #431: 止める操作だけ、照合に上限時間を掛ける（DB がハングしても停止を
+    // 待たせない）。通常の操作は従来どおり。
+    let outcome = match gate.operation {
+        OperationKind::Normal => Some(gate.auth.authenticate(&token).await),
+        OperationKind::StopWrites => {
+            tokio::time::timeout(STOP_SESSION_CHECK_TIMEOUT, gate.auth.authenticate(&token))
+                .await
+                .ok()
+        }
+    };
+    let (check, session, error) = match outcome {
+        Some(Ok(Some(session))) => (SessionCheck::Valid, Some(session), None),
+        Some(Ok(None)) => (SessionCheck::Revoked, None, None),
+        Some(Err(err)) => (SessionCheck::Unverified, None, Some(err)),
+        None => (SessionCheck::Unverified, None, None),
+    };
+    // 照合できなかったとき、トークンはメモリ上に残っている（`authenticate` は
+    // DB エラーでトークンを消さない）。まだ既知・期限内なら「それまで有効」。
+    let previously_valid =
+        check == SessionCheck::Unverified && gate.auth.identity_for(&token).is_some();
+    match session_gate_decision(check, gate.operation, previously_valid) {
+        GateDecision::Allow => {
+            if let Some(session) = session {
+                req.extensions_mut().insert(session);
+            }
+            next.run(req).await
+        }
+        GateDecision::AllowUnverifiedStop => {
+            eprintln!(
+                "banto-hub: セッションを照合できなかったため、書き込みの停止のみ例外で受け付けます"
+            );
+            req.extensions_mut().insert(UnverifiedStopException);
+            next.run(req).await
+        }
+        GateDecision::Unauthorized => unauthorized_response(),
+        GateDecision::Unavailable => {
+            ApiError(error.unwrap_or_else(|| {
+                BantoError::Other("セッションを照合できませんでした".to_string())
+            }))
+            .into_response()
+        }
     }
 }
 
@@ -502,6 +631,8 @@ async fn acting_user(
             username: crate::commissioning::SYNTHETIC_ACTOR_ID.to_string(),
             display_name: "試運転モード".to_string(),
             role: Role::Admin,
+            // 合成の identity（実在の行ではない）。照合には使わない。
+            auth_epoch: 0,
         });
     }
     let username = bearer_token(headers)
@@ -650,6 +781,7 @@ fn users_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -708,12 +840,12 @@ async fn auth_setup_handler(
         .setup_first_user(&body.username, &body.password, &body.display_name)
         .await
     {
-        Ok(identity) => {
-            let identity = Identity {
-                id: identity.username,
-                name: identity.display_name,
-                role: identity.role.to_string(),
-            };
+        Ok(user) => {
+            // banto v1.7.0 #204: 新しいアカウントの `(id, auth_epoch)` に結び
+            // 付けて発行する。`issue_token`（世代なし）は `Lookup` 付きの
+            // `AuthState` では最初の要求で拒否される。
+            let account = session_account(&user);
+            let identity = account.identity.clone();
             state
                 .audit
                 .record(AuditEntry {
@@ -727,7 +859,7 @@ async fn auth_setup_handler(
                     result: "ok",
                 })
                 .await;
-            let token = state.auth.issue_token(identity);
+            let token = state.auth.issue_account_token(account, false);
             Ok(Json(SetupResponse {
                 success: true,
                 error: None,
@@ -762,15 +894,31 @@ async fn auth_change_password_handler(
     headers: HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<Json<ChangePasswordResponse>, ApiError> {
-    let identity = bearer_token(&headers).and_then(|token| state.auth.identity_for(token));
-    let Some(identity) = identity else {
+    // banto v1.7.0 #204: `require_auth` の外なので、`identity_for`（メモリ上の
+    // 値だけ）ではなく `authenticate` でアカウントと照合する。削除・世代の
+    // 変わったアカウントのセッションは 401（パスワード変更に進ませない）。
+    let Some(token) = bearer_token(&headers) else {
         return Err(ApiError(BantoError::Unauthorized));
     };
+    let Some(session) = state.auth.authenticate(token).await? else {
+        return Err(ApiError(BantoError::Unauthorized));
+    };
+    let identity = session.identity;
 
-    state
+    let new_epoch = state
         .users
         .change_password(&identity.id, &body.current_password, &body.new_password)
         .await?;
+    // 変更で世代が進み、このアカウントのセッション（他の端末・Tauri・
+    // Remember me）はすべて終わる。現在のパスワードを示したこのトークンだけ
+    // 新しい世代へ付け替える - ただし照合してからの変更がこの 1 回だけの
+    // とき（あいだにロール変更などが挟まったら、他と同じく終わらせる）。
+    // 付け替えに失敗（その間に失効）しても、変更自体は成功している。
+    if let Some(stamp) = session.stamp {
+        if new_epoch == stamp.auth_epoch + 1 {
+            state.auth.rotate_session_epoch(token, stamp, new_epoch);
+        }
+    }
     let entity_id = state
         .users
         .get_by_username(&identity.id)
@@ -869,6 +1017,64 @@ pub fn audited_credential_verifier(
             }
         })
     }
+}
+
+/// banto v1.7.0 #204: `UserIdentity` -> セッションが結び付く `Identity` +
+/// [`SessionStamp`]（`Identity.id` はユーザー名 - `banto_server::Identity` の
+/// doc comment の規約）。セットアップ直後のログイン（`issue_account_token`）と
+/// [`user_session_lookup`] の両方が使う。
+pub(crate) fn session_account(user: &UserIdentity) -> SessionAccount {
+    SessionAccount {
+        identity: Identity {
+            id: user.username.clone(),
+            name: user.display_name.clone(),
+            role: user.role.to_string(),
+        },
+        stamp: SessionStamp {
+            account_id: user.id,
+            auth_epoch: user.auth_epoch,
+        },
+    }
+}
+
+/// banto v1.7.0 #204: 要求のたびにアカウントを読み直す `SessionLookup`。
+/// ユーザー名で `users` を引き、無ければ `Ok(None)`（セッションは失効）、DB が
+/// 答えられなければ `Err`（その要求は失敗、セッションは残す）。
+/// `UsersService::verify` はユーザー名を正規化しない（入力のまま照合する）
+/// ので、ここも入力のまま引く - ログイン時は入力どおりのユーザー名で呼ばれ、
+/// `verify` と同じアカウントを返すことが条件になる（`SessionValidation::Lookup`
+/// の doc comment）。
+pub fn user_session_lookup(
+    users: UsersService,
+) -> impl Fn(
+    String,
+) -> futures_util::future::BoxFuture<'static, Result<Option<SessionAccount>, BantoError>>
+       + Send
+       + Sync
+       + 'static {
+    move |username: String| {
+        let users = users.clone();
+        Box::pin(async move {
+            Ok(users
+                .get_by_username(&username)
+                .await?
+                .map(|user| session_account(&user)))
+        })
+    }
+}
+
+/// banto v1.7.0 #204: 実アカウント用の REST `AuthState`。ログインは
+/// [`audited_credential_verifier`]、要求ごとの照合は [`user_session_lookup`]
+/// （`SessionValidation::Lookup`）。削除・降格・パスワード変更/リセットで、
+/// そのアカウントのセッション（他の端末・Remember me を含む）は次の要求で
+/// 401 になる。本番の `AuthState` はすべてここで作り、照合の付け忘れを防ぐ
+/// （`SessionValidation::DisabledNoRevocation` は固定の検証関数を使うテスト
+/// 専用）。
+pub fn user_auth_state(users: UsersService, audit: AuditLogService) -> AuthState {
+    AuthState::new(
+        audited_credential_verifier(users.clone(), audit),
+        SessionValidation::lookup(user_session_lookup(users)),
+    )
 }
 
 #[derive(Clone)]
@@ -1032,6 +1238,7 @@ fn audit_log_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -1265,6 +1472,7 @@ fn api_keys_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -1320,6 +1528,7 @@ async fn write_control_set(
     headers: &HeaderMap,
     enabled: bool,
     action: &str,
+    unverified_stop: bool,
 ) -> Response {
     let identity = actor_identity(headers, &state.auth, &state.commissioning);
     let actor_id = identity.as_ref().map(|i| i.id.as_str());
@@ -1336,6 +1545,7 @@ async fn write_control_set(
                 action,
                 true,
                 err.to_string(),
+                unverified_stop,
             )
             .await;
             return write_control_persist_failed_response(
@@ -1356,6 +1566,7 @@ async fn write_control_set(
                 action,
                 false,
                 err.to_string(),
+                unverified_stop,
             )
             .await;
             let _ = state.events.send(ServerEvent::ResourceChanged {
@@ -1375,7 +1586,10 @@ async fn write_control_set(
         action,
         "write_control",
         "1",
-        Some(json!({ "enabled": enabled, "persisted": true })),
+        Some(with_session_exception_mark(
+            json!({ "enabled": enabled, "persisted": true }),
+            unverified_stop,
+        )),
     )
     .await;
     let _ = state.events.send(ServerEvent::ResourceChanged {
@@ -1401,6 +1615,7 @@ async fn record_write_control_failure(
     action: &str,
     enabled: bool,
     error: String,
+    unverified_stop: bool,
 ) {
     let identity = actor_identity(headers, auth, commissioning);
     audit
@@ -1410,11 +1625,35 @@ async fn record_write_control_failure(
             action,
             resource: "write_control",
             entity_id: Some("1"),
-            detail: Some(json!({ "enabled": enabled, "persisted": false, "error": error })),
+            detail: Some(with_session_exception_mark(
+                json!({ "enabled": enabled, "persisted": false, "error": error }),
+                unverified_stop,
+            )),
             origin: "rest",
             result: "failed",
         })
         .await;
+}
+
+/// #431: 照合できなかったため停止のみ例外で通した要求の監査行に付ける印。
+/// `detail.sessionCheck = "unverified_stop_exception"` と、人が読む説明。
+fn with_session_exception_mark(
+    mut detail: serde_json::Value,
+    unverified_stop: bool,
+) -> serde_json::Value {
+    if unverified_stop {
+        if let Some(object) = detail.as_object_mut() {
+            object.insert(
+                "sessionCheck".to_string(),
+                json!("unverified_stop_exception"),
+            );
+            object.insert(
+                "sessionCheckNote".to_string(),
+                json!("照合できなかったため、停止のみ例外で許可"),
+            );
+        }
+    }
+    detail
 }
 
 /// #340: `write_control_set` の永続化失敗を伝える 500。`writes_disabled`
@@ -1432,18 +1671,27 @@ fn write_control_persist_failed_response(message: &str) -> Response {
         .into_response()
 }
 
+/// #431: 再開は「止める」操作ではない - 照合できなければ 500（例外なし）。
+const WRITE_CONTROL_ENABLE_OPERATION: OperationKind = OperationKind::Normal;
+
 async fn write_control_enable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
 ) -> Response {
-    write_control_set(&state, &headers, true, "enable").await
+    write_control_set(&state, &headers, true, "enable", false).await
 }
+
+/// #431: 緊急停止は「書き込みを止める」操作だと宣言する。DB が応答しない
+/// ときも、それまで有効だったセッションなら受け付ける
+/// （[`session_gate_decision`]）。この宣言が例外の唯一の入口。
+const WRITE_CONTROL_DISABLE_OPERATION: OperationKind = OperationKind::StopWrites;
 
 async fn write_control_disable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
+    exception: Option<axum::Extension<UnverifiedStopException>>,
 ) -> Response {
-    write_control_set(&state, &headers, false, "disable").await
+    write_control_set(&state, &headers, false, "disable", exception.is_some()).await
 }
 
 fn write_control_router(
@@ -1462,27 +1710,38 @@ fn write_control_router(
         audit: audit.clone(),
         events,
     };
-    Router::new()
-        .route("/api/write-control/enable", post(write_control_enable))
-        .route("/api/write-control/disable", post(write_control_disable))
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                commissioning: commissioning.clone(),
-                min: Role::Admin,
-                resource: "write_control",
-                audit,
-            },
-            require_role_at_least,
-        ))
-        .layer(middleware::from_fn_with_state(
-            AuthGate {
-                auth,
-                commissioning,
-            },
-            require_auth_or_commissioning,
-        ))
+    // #431: ルートごとに、ハンドラの隣で宣言した操作の種類でゲートを組む
+    // （同じゲートを 2 本のルートで共有しない - 例外が再開に漏れないように）。
+    let gated = |router: Router<WriteControlAdminState>, operation: OperationKind| {
+        router
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(
+                RoleGuard {
+                    auth: auth.clone(),
+                    commissioning: commissioning.clone(),
+                    min: Role::Admin,
+                    resource: "write_control",
+                    audit: audit.clone(),
+                },
+                require_role_at_least,
+            ))
+            .layer(middleware::from_fn_with_state(
+                AuthGate {
+                    auth: auth.clone(),
+                    commissioning: commissioning.clone(),
+                    operation,
+                },
+                require_auth_or_commissioning,
+            ))
+    };
+    gated(
+        Router::new().route("/api/write-control/enable", post(write_control_enable)),
+        WRITE_CONTROL_ENABLE_OPERATION,
+    )
+    .merge(gated(
+        Router::new().route("/api/write-control/disable", post(write_control_disable)),
+        WRITE_CONTROL_DISABLE_OPERATION,
+    ))
 }
 
 // --- collection lifecycle control (T14-4): admin + CSRF --------------------
@@ -1737,6 +1996,7 @@ fn collection_control_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -1957,6 +2217,7 @@ fn mqtt_settings_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -2230,6 +2491,7 @@ fn store_settings_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -2414,6 +2676,7 @@ fn grpc_settings_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -2459,6 +2722,7 @@ fn write_audit_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -5827,6 +6091,7 @@ fn pending_changes_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -6493,6 +6758,7 @@ fn tag_registry_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -6662,6 +6928,7 @@ fn sink_groups_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -8492,6 +8759,7 @@ fn admin_status_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -8583,6 +8851,7 @@ fn admin_tag_stream_router(
             AuthGate {
                 auth,
                 commissioning,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ))
@@ -9287,13 +9556,19 @@ async fn require_tag_space_auth(
                 unauthorized_response()
             }
         }
-    } else if state.auth.verify(&token) {
-        if is_write_route {
-            return session_token_cannot_write_response();
-        }
-        next.run(req).await
     } else {
-        unauthorized_response()
+        // banto v1.7.0 #204: セッション token もアカウントと照合する
+        // （`require_auth_or_commissioning` と同じ判断: 失効は 401、DB が
+        // 答えられなければトークンを残して 500）。
+        match state.auth.authenticate(&token).await {
+            Ok(Some(_)) if is_write_route => session_token_cannot_write_response(),
+            Ok(Some(session)) => {
+                req.extensions_mut().insert(session);
+                next.run(req).await
+            }
+            Ok(None) => unauthorized_response(),
+            Err(err) => ApiError(err).into_response(),
+        }
     }
 }
 
@@ -9532,6 +9807,7 @@ fn commissioning_router(
             AuthGate {
                 auth,
                 commissioning: commissioning_state,
+                operation: OperationKind::Normal,
             },
             require_auth_or_commissioning,
         ));
@@ -10140,19 +10416,24 @@ mod tests {
             .await
             .expect("create_user viewer");
         let verify_users = users.clone();
-        let auth = AuthState::new(move |u: String, p: String| {
-            let users = verify_users.clone();
-            Box::pin(async move {
-                match users.verify(&u, &p).await {
-                    Ok(Some(identity)) => Some(Identity {
-                        id: identity.username,
-                        name: identity.display_name,
-                        role: identity.role.to_string(),
-                    }),
-                    _ => None,
-                }
-            })
-        });
+        // banto v1.7.0 #204: 本番（`user_auth_state`）と同じ照合を入れる。
+        // 検証関数は監査を記録しない版のまま（既存テストの監査件数を変えない）。
+        let auth = AuthState::new(
+            move |u: String, p: String| {
+                let users = verify_users.clone();
+                Box::pin(async move {
+                    match users.verify(&u, &p).await {
+                        Ok(Some(identity)) => Some(Identity {
+                            id: identity.username,
+                            name: identity.display_name,
+                            role: identity.role.to_string(),
+                        }),
+                        _ => None,
+                    }
+                })
+            },
+            SessionValidation::lookup(user_session_lookup(users.clone())),
+        );
         let admin_token = auth
             .login("admin", "password123")
             .await
@@ -16800,5 +17081,403 @@ mod tests {
             admin_get(&env.router, "/api/status", &env.admin_token).await;
         assert_eq!(status, StatusCode::OK, "{admin_status_body:?}");
         assert_eq!(admin_status_body["sink"]["sidecar"]["state"], "unknown");
+    }
+
+    // --- banto v1.7.0 #204: session revocation -------------------------------
+
+    fn session_request(
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1);
+        if let Some(token) = token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        match body {
+            Some(body) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    async fn session_call(
+        router: &Router,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn session_login(router: &Router, username: &str, remember: bool) -> String {
+        let (status, body) = session_call(
+            router,
+            session_request(
+                "POST",
+                "/api/auth/login",
+                None,
+                Some(json!({ "username": username, "password": "password123", "remember": remember })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("login for {username} returned no token: {body}"))
+            .to_string()
+    }
+
+    /// One session per surface: the admin UI (`require_auth_or_commissioning`)
+    /// and the tag space (`require_tag_space_auth`'s session branch). Separate
+    /// tokens, because the first surface to notice a revocation drops the
+    /// token from memory - checking one token on both would let the second
+    /// surface pass without re-checking anything.
+    struct SurfaceTokens {
+        ui: String,
+        v1: String,
+    }
+
+    async fn surface_login(router: &Router, username: &str, remember: bool) -> SurfaceTokens {
+        SurfaceTokens {
+            ui: session_login(router, username, remember).await,
+            v1: session_login(router, username, remember).await,
+        }
+    }
+
+    /// `(admin UI, tag space)` statuses - both must refuse a revoked session.
+    async fn session_statuses(router: &Router, tokens: &SurfaceTokens) -> (StatusCode, StatusCode) {
+        let admin_ui = session_call(
+            router,
+            session_request("GET", "/api/tags", Some(&tokens.ui), None),
+        )
+        .await
+        .0;
+        let tag_space = session_call(
+            router,
+            session_request("GET", "/api/v1/tags", Some(&tokens.v1), None),
+        )
+        .await
+        .0;
+        (admin_ui, tag_space)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum AccountChange {
+        Delete,
+        Demote,
+        PasswordChange,
+        PasswordReset,
+    }
+
+    /// banto v1.7.0 #204 completion table (banto-hub has no Tauri command
+    /// surface for accounts - REST is its only transport): deleting,
+    /// demoting, resetting or changing the password of an account ends its
+    /// sessions held elsewhere - normal and "Remember me" - on both the admin
+    /// UI routes and the tag space, while other accounts' sessions are
+    /// untouched and the session that changed its OWN password keeps
+    /// working.
+    #[tokio::test]
+    async fn account_changes_end_the_accounts_other_sessions() {
+        let ok = (StatusCode::OK, StatusCode::OK);
+        let revoked = (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED);
+        for change in [
+            AccountChange::Delete,
+            AccountChange::Demote,
+            AccountChange::PasswordChange,
+            AccountChange::PasswordReset,
+        ] {
+            let env = test_env().await;
+            let router = &env.router;
+            let admin = &env.admin_token;
+            let (status, alice) = session_call(
+                router,
+                session_request(
+                    "POST",
+                    "/api/users",
+                    Some(admin),
+                    Some(json!({
+                        "username": "alice",
+                        "password": "password123",
+                        "displayName": "Alice",
+                        "role": "editor",
+                    })),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{alice}");
+            let alice_id = alice["id"].as_i64().unwrap();
+            let alice_normal = surface_login(router, "alice", false).await;
+            let alice_remember = surface_login(router, "alice", true).await;
+            // The session that makes its own password change (on the admin
+            // UI surface), plus one on the tag space.
+            let alice_self = surface_login(router, "alice", false).await;
+            let viewer = surface_login(router, "viewer1", false).await;
+            for tokens in [&alice_normal, &alice_remember, &alice_self, &viewer] {
+                assert_eq!(
+                    session_statuses(router, tokens).await,
+                    ok,
+                    "{change:?}: before"
+                );
+            }
+
+            let (status, body) = match change {
+                AccountChange::Delete => {
+                    session_call(
+                        router,
+                        session_request(
+                            "DELETE",
+                            &format!("/api/users/{alice_id}"),
+                            Some(admin),
+                            None,
+                        ),
+                    )
+                    .await
+                }
+                AccountChange::Demote => {
+                    session_call(
+                        router,
+                        session_request(
+                            "PUT",
+                            &format!("/api/users/{alice_id}"),
+                            Some(admin),
+                            Some(json!({ "displayName": "Alice", "role": "viewer" })),
+                        ),
+                    )
+                    .await
+                }
+                AccountChange::PasswordReset => {
+                    session_call(
+                        router,
+                        session_request(
+                            "POST",
+                            &format!("/api/users/{alice_id}/reset-password"),
+                            Some(admin),
+                            Some(json!({ "newPassword": "reset-password1" })),
+                        ),
+                    )
+                    .await
+                }
+                AccountChange::PasswordChange => {
+                    session_call(
+                        router,
+                        session_request(
+                            "POST",
+                            "/api/auth/change-password",
+                            Some(&alice_self.ui),
+                            Some(json!({
+                                "currentPassword": "password123",
+                                "newPassword": "changed-password1",
+                            })),
+                        ),
+                    )
+                    .await
+                }
+            };
+            assert!(status.is_success(), "{change:?}: {status} {body}");
+
+            assert_eq!(
+                session_statuses(router, &alice_normal).await,
+                revoked,
+                "{change:?}: normal session"
+            );
+            assert_eq!(
+                session_statuses(router, &alice_remember).await,
+                revoked,
+                "{change:?}: Remember me session"
+            );
+            // The changer keeps its session; its tag-space sibling (another
+            // session of the same account) ends like the rest.
+            let expected_self = match change {
+                AccountChange::PasswordChange => (StatusCode::OK, StatusCode::UNAUTHORIZED),
+                _ => revoked,
+            };
+            assert_eq!(
+                session_statuses(router, &alice_self).await,
+                expected_self,
+                "{change:?}: the session that made the change"
+            );
+            assert_eq!(
+                session_statuses(router, &viewer).await,
+                ok,
+                "{change:?}: bystander"
+            );
+            assert_eq!(
+                session_call(
+                    router,
+                    session_request("GET", "/api/users", Some(admin), None)
+                )
+                .await
+                .0,
+                StatusCode::OK,
+                "{change:?}: acting admin"
+            );
+        }
+    }
+
+    /// #204: a demoted account is authorized with its CURRENT role once it
+    /// logs in again - and a stale session cannot keep its old role even for
+    /// one request (it is refused outright, see the table test above).
+    #[tokio::test]
+    async fn a_fresh_session_after_a_demotion_uses_the_new_role() {
+        let env = test_env().await;
+        let router = &env.router;
+        let admin = &env.admin_token;
+        let (_, admin2) = session_call(
+            router,
+            session_request(
+                "POST",
+                "/api/users",
+                Some(admin),
+                Some(json!({
+                    "username": "admin2",
+                    "password": "password123",
+                    "displayName": "Admin 2",
+                    "role": "admin",
+                })),
+            ),
+        )
+        .await;
+        let admin2_id = admin2["id"].as_i64().unwrap();
+        let (status, _) = session_call(
+            router,
+            session_request(
+                "PUT",
+                &format!("/api/users/{admin2_id}"),
+                Some(admin),
+                Some(json!({ "displayName": "Admin 2", "role": "viewer" })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let fresh = surface_login(router, "admin2", false).await;
+        assert_eq!(
+            session_call(
+                router,
+                session_request("GET", "/api/users", Some(&fresh.ui), None)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            session_statuses(router, &fresh).await,
+            (StatusCode::OK, StatusCode::OK)
+        );
+    }
+
+    /// #204: when the DB cannot answer the re-check, the request fails (500)
+    /// but the session is KEPT - it works again as soon as the DB answers.
+    #[tokio::test]
+    async fn a_failed_recheck_fails_the_request_but_keeps_the_session() {
+        let env = test_env().await;
+        let router = &env.router;
+        let viewer = surface_login(router, "viewer1", true).await;
+        sqlx::query("ALTER TABLE users RENAME TO users_away")
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_statuses(router, &viewer).await,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR
+            )
+        );
+        sqlx::query("ALTER TABLE users_away RENAME TO users")
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_statuses(router, &viewer).await,
+            (StatusCode::OK, StatusCode::OK)
+        );
+    }
+
+    /// #204: the first account's session from `POST /api/auth/setup` is
+    /// bound to the new account (`issue_account_token`), so a lookup-enabled
+    /// `AuthState` accepts it - an unstamped token would be refused on its
+    /// first use.
+    #[tokio::test]
+    async fn the_setup_session_is_bound_to_the_new_account() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let users = UsersService::new(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+        let auth = user_auth_state(users.clone(), audit.clone());
+        let router = extra_auth_router(users, auth.clone(), audit, true);
+        let (status, body) = session_call(
+            &router,
+            session_request(
+                "POST",
+                "/api/auth/setup",
+                None,
+                Some(json!({
+                    "username": "owner",
+                    "password": "password123",
+                    "displayName": "Owner",
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let token = body["token"].as_str().expect("setup token");
+        let session = auth
+            .authenticate(token)
+            .await
+            .unwrap()
+            .expect("the setup session is accepted");
+        assert_eq!(session.identity.id, "owner");
+        assert_eq!(session.identity.role, "admin");
+    }
+
+    /// #431: ゲートの判断の総当たり表。例外（照合できないのに通す）は
+    /// 「止める操作」かつ「それまで有効だったセッション」の 1 行だけ。
+    #[test]
+    fn session_gate_decision_table() {
+        use GateDecision::*;
+        use OperationKind::*;
+        use SessionCheck::*;
+        let table = [
+            (Valid, Normal, false, Allow),
+            (Valid, Normal, true, Allow),
+            (Valid, StopWrites, false, Allow),
+            (Valid, StopWrites, true, Allow),
+            // 失効が確認できたら、止める操作でも拒否
+            (Revoked, Normal, false, Unauthorized),
+            (Revoked, Normal, true, Unauthorized),
+            (Revoked, StopWrites, false, Unauthorized),
+            (Revoked, StopWrites, true, Unauthorized),
+            // 照合できない: 通常は 500、止める操作だけ例外
+            (Unverified, Normal, false, Unavailable),
+            (Unverified, Normal, true, Unavailable),
+            (Unverified, StopWrites, false, Unauthorized),
+            (Unverified, StopWrites, true, AllowUnverifiedStop),
+        ];
+        for (check, operation, previously_valid, expected) in table {
+            assert_eq!(
+                session_gate_decision(check, operation, previously_valid),
+                expected,
+                "{check:?} / {operation:?} / previously_valid={previously_valid}"
+            );
+        }
+    }
+
+    /// #431: 例外の入口は宣言だけ。緊急停止は止める操作、再開は通常の操作。
+    #[test]
+    fn only_the_write_stop_route_is_declared_as_a_stop_operation() {
+        assert_eq!(WRITE_CONTROL_DISABLE_OPERATION, OperationKind::StopWrites);
+        assert_eq!(WRITE_CONTROL_ENABLE_OPERATION, OperationKind::Normal);
     }
 }

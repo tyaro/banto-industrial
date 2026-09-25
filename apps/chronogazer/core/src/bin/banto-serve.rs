@@ -29,7 +29,7 @@
 //! §8.2 - the Tauri app never sets this, since desktop first-run goes
 //! through the `auth_setup` command instead).
 
-use banto_server::{lan_urls, start, static_router, AuthState, ServerConfig};
+use banto_server::{lan_urls, start, static_router, ServerConfig};
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogService};
 use chronogazer_core::backup::BackupService;
@@ -41,7 +41,7 @@ use chronogazer_core::collect::{resolve_data_dir, CollectorService};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, UnavailableKeyStore};
-use chronogazer_core::rest::{api_router, audited_credential_verifier};
+use chronogazer_core::rest::{api_router, user_auth_state};
 use chronogazer_core::settings::SettingsService;
 use chronogazer_core::users::UsersService;
 // #383 段階2a / R1-B: レジストリ3サービス。`chronogazer_core::lib.rs`の
@@ -102,8 +102,10 @@ async fn main() {
     // Credential verifier from `chronogazer_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
     // fixed admin/admin check that used to live here directly. Also records
-    // `login`/`login_failed` audit entries (spec M14).
-    let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+    // `login`/`login_failed` audit entries (spec M14), and re-checks the
+    // account on every request so deleting/demoting/re-keying it ends its
+    // sessions (banto v1.7.0 #204).
+    let auth = user_auth_state(users.clone(), audit.clone());
 
     // Spec M17: record `restore_applied` now that a real `AuditLogService`
     // exists - `apply_pending_restore_at_startup` itself cannot do this (it

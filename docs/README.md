@@ -4,7 +4,11 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-24（relay-wright を main から外し、タグ `archive/relay-wright-2026-09-24`
+最終更新: 2026-09-25（追従先を banto **v1.7.1** に上げた。グリッドの初回クリックの修正 banto #236 を取り込む）。
+2026-09-24（banto v1.7.0 に追従し、ユーザーの削除・降格・パスワード変更・
+リセットでそのアカウントのセッションを失効させた（banto #204、banto-hub v0.2.0-alpha.24。
+chronogazer・banto-hub の両方、実装済み）。「現状ひとめ」の上流の版と、banto-hub-operations.md §1・
+apps/chronogazer/README.md を更新）。同日: relay-wright を main から外し、タグ `archive/relay-wright-2026-09-24`
 に退避した（構想の練り直し、オーナー決定）。復元は
 `git checkout archive/relay-wright-2026-09-24 -- apps/relay-wright ...`。
 plan.md §4b・implementation-checklist.md §7 を更新）。同日（#424: banto-tstore の**記録時刻とデータファイルの日付の契約**
@@ -53,7 +57,7 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   （記録計）。**relay-wright**（条件付き PLC 自動書き込み）は 2026-09-24 に main から外し、
   タグ `archive/relay-wright-2026-09-24` に退避した（構想の練り直し、オーナー決定。§4b）。
   上流 `banto` は git tag / `@banto/*` を消費（Rust クレート・npm
-  `@banto/*` とも現行 **v1.6.0** で揃っている。`Cargo.toml`/`package.json` を正とする）。
+  `@banto/*` とも現行 **v1.7.1** で揃っている（2026-09-25 追従）。`Cargo.toml`/`package.json` を正とする）。
   Rust と npm は別マニフェストで独立に追従できるが、**上げるときは揃えて上げる運用**とする
   （2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
 - **I 系（基盤 I0〜I6）**: 実装済み（I6 = banto-broker として抽出済み）。
@@ -246,6 +250,17 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   受ける（同部品のアプリ非依存規約は維持）。**広幅の DOM・CSS は不変**。フロントのみ、
   **wire 変更なし**。詳細は [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.4
   TAG-UX-G 2026-09-16 追補。
+- **banto v1.7.1 追従（2026-09-24〜25、banto-hub v0.2.0-alpha.24）— 実装済み**: banto #204 の
+  セッション失効（v1.7.0 で導入）を chronogazer・banto-hub の両方に組み込んだ。`users.auth_epoch`（認証の世代）を
+  足し、ロール変更・パスワード変更・リセットで同じ SQL 文の中で進める。セッションは要求・コマンド
+  のたびにアカウントと照合され、削除・降格・パスワード変更/リセットで**ほかの端末のセッション
+  （Remember me を含む）は次の操作で 401**、自分のパスワード変更では変更したセッションだけ続く。
+  DB が照合に答えないときはセッションを残してその要求だけ失敗させ、画面はログイン画面へ移らず
+  再試行を出す。chronogazer は REST と Tauri の両経路（「ログイン不要モード」の合成
+  セッションはモードを OFF にすると終わる）、banto-hub は REST（管理 UI とタグ空間の
+  セッション経路。API キーは対象外、試運転モードはトークンを発行しないので対象外）。
+  **未保存の変更の確認（banto #214）の画面への適用は次の PR**。運用上の説明は
+  [banto-hub-operations.md](banto-hub-operations.md) §1「ログインセッションの失効」。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

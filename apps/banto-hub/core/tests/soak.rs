@@ -90,6 +90,8 @@
 //! 同じ注記がある）。`TempEnv`は`tests/common/mod.rs`に集約済み
 //! （2026-08-08、テスト一時ディレクトリリークの根治）。
 
+use banto_hub_core::rest::user_session_lookup;
+use banto_server::SessionValidation;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -471,19 +473,23 @@ async fn test_app(label: &str) -> TestApp {
         .expect("setup_first_user");
 
     let verify_users = users.clone();
-    let auth = AuthState::new(move |u: String, p: String| {
-        let users = verify_users.clone();
-        Box::pin(async move {
-            match users.verify(&u, &p).await {
-                Ok(Some(identity)) => Some(Identity {
-                    id: identity.username,
-                    name: identity.display_name,
-                    role: identity.role.to_string(),
-                }),
-                _ => None,
-            }
-        })
-    });
+    let verify_users_lookup = users.clone();
+    let auth = AuthState::new(
+        move |u: String, p: String| {
+            let users = verify_users.clone();
+            Box::pin(async move {
+                match users.verify(&u, &p).await {
+                    Ok(Some(identity)) => Some(Identity {
+                        id: identity.username,
+                        name: identity.display_name,
+                        role: identity.role.to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+        },
+        SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
+    );
     let token = auth
         .login("admin", "password123")
         .await

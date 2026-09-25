@@ -39,11 +39,13 @@ use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::user_session_lookup;
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::{Role, UsersService};
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
+use banto_server::SessionValidation;
 use banto_server::{AuthState, Identity};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
 use serde_json::{json, Value};
@@ -112,19 +114,23 @@ async fn test_app(label: &str) -> TestApp {
         .expect("setup_first_user");
 
     let verify_users = users.clone();
-    let auth = AuthState::new(move |u: String, p: String| {
-        let users = verify_users.clone();
-        Box::pin(async move {
-            match users.verify(&u, &p).await {
-                Ok(Some(identity)) => Some(Identity {
-                    id: identity.username,
-                    name: identity.display_name,
-                    role: identity.role.to_string(),
-                }),
-                _ => None,
-            }
-        })
-    });
+    let verify_users_lookup = users.clone();
+    let auth = AuthState::new(
+        move |u: String, p: String| {
+            let users = verify_users.clone();
+            Box::pin(async move {
+                match users.verify(&u, &p).await {
+                    Ok(Some(identity)) => Some(Identity {
+                        id: identity.username,
+                        name: identity.display_name,
+                        role: identity.role.to_string(),
+                    }),
+                    _ => None,
+                }
+            })
+        },
+        SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
+    );
     let admin_token = auth
         .login("admin", "password123")
         .await

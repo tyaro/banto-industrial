@@ -177,6 +177,11 @@ pub struct UserIdentity {
     pub username: String,
     pub display_name: String,
     pub role: Role,
+    /// banto v1.7.0 #204（セッション失効）: この行の「認証の世代」。行の他の
+    /// 列と同じ文で読む。セッションは確立時の `(id, auth_epoch)` に結び付き、
+    /// 要求・コマンドのたびにこの表と照合され、値が違えば終わる -
+    /// [`UsersService`] の「セッション失効」節を参照。
+    pub auth_epoch: i64,
 }
 
 /// Public listing of an account (the admin `/api/users` grid): everything
@@ -199,6 +204,25 @@ pub struct UserSummary {
 ///
 /// `Clone` is cheap (`SqlitePool` is an `Arc`-backed handle), matching
 /// `SettingsService`.
+///
+/// ## セッション失効（banto v1.7.0 #204）
+///
+/// セッション（REST の bearer token も Tauri のウィンドウのセッションも）は
+/// `(id, auth_epoch)` に結び付き、要求・コマンドのたびにこの表と照合される
+/// ので、認可に使うのはアカウントの**今の**行になる。次の 3 つの書き込みが、
+/// 変更と同じ `UPDATE` の中で `auth_epoch` を進め、そのアカウントの既存の
+/// セッションをすべて終わらせる（読んでから書く 2 段にしない - 並行した変更を
+/// 古い世代で上書きしないため）:
+///
+/// - [`UsersService::update_user`] でロールが実際に変わったとき（表示名だけの
+///   変更ではセッションを残す）
+/// - [`UsersService::change_password`]（新しい世代を返すので、呼び出し側は
+///   変更した当のセッションだけを残せる）
+/// - [`UsersService::reset_password`]
+///
+/// [`UsersService::delete_user`] は世代を使わない: 行が無くなり、id は再利用
+/// されない（`AUTOINCREMENT`）ので、同じユーザー名で作り直したアカウントが
+/// 削除前のセッションを引き継ぐことはない。
 #[derive(Clone)]
 pub struct UsersService {
     pool: SqlitePool,
@@ -258,9 +282,9 @@ impl UsersService {
         // The very first account is always `admin` (spec M10): there is no
         // one else yet to have assigned it a lesser role, and the app needs
         // at least one admin to exist to manage everyone else.
-        let id: i64 = sqlx::query_scalar(
+        let (id, auth_epoch): (i64, i64) = sqlx::query_as(
             "INSERT INTO users (username, password_hash, display_name, role) VALUES (?, ?, ?, ?) \
-             RETURNING id",
+             RETURNING id, auth_epoch",
         )
         .bind(&username)
         .bind(&hash)
@@ -275,6 +299,7 @@ impl UsersService {
             username,
             display_name: display_name.to_string(),
             role: Role::Admin,
+            auth_epoch,
         })
     }
 
@@ -293,8 +318,8 @@ impl UsersService {
         username: &str,
         password: &str,
     ) -> Result<Option<UserIdentity>, BantoError> {
-        let row: Option<(i64, String, String, String)> = sqlx::query_as(
-            "SELECT id, password_hash, display_name, role FROM users WHERE username = ?",
+        let row: Option<(i64, String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, password_hash, display_name, role, auth_epoch FROM users WHERE username = ?",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -302,13 +327,14 @@ impl UsersService {
         .map_err(banto_storage::storage_error)?;
 
         match row {
-            Some((id, hash, display_name, role)) => {
+            Some((id, hash, display_name, role, auth_epoch)) => {
                 if verify_password(password, &hash) {
                     Ok(Some(UserIdentity {
                         id,
                         username: username.to_string(),
                         display_name,
                         role: Role::from_str(&role)?,
+                        auth_epoch,
                     }))
                 } else {
                     Ok(None)
@@ -330,7 +356,7 @@ impl UsersService {
         username: &str,
         current: &str,
         new: &str,
-    ) -> Result<(), BantoError> {
+    ) -> Result<i64, BantoError> {
         let row: Option<(i64, String)> =
             sqlx::query_as("SELECT id, password_hash FROM users WHERE username = ?")
                 .bind(username)
@@ -358,16 +384,24 @@ impl UsersService {
         validate_password_len(new, "newPassword")?;
         let new_hash = hash_password(new)?;
 
-        sqlx::query(
-            "UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?",
+        // #204: 世代を同じ UPDATE で進める（読んでから書くと、並行した変更を
+        // 古い世代で上書きし得る）。照合したハッシュがまだ現在の値であることも
+        // 条件にし、その間に変更・リセットされたパスワードを黙って上書きしない
+        // （その場合は「現在のパスワードが違う」- 実際にもう違う）。
+        let new_epoch: Option<i64> = sqlx::query_scalar(
+            "UPDATE users SET password_hash = ?, auth_epoch = auth_epoch + 1, \
+             updated_at = datetime('now') WHERE id = ? AND password_hash = ? \
+             RETURNING auth_epoch",
         )
         .bind(&new_hash)
         .bind(id)
-        .execute(&self.pool)
+        .bind(&hash)
+        .fetch_optional(&self.pool)
         .await
         .map_err(banto_storage::storage_error)?;
 
-        Ok(())
+        // 行が無い: その間にアカウントが削除されたか、パスワードが変わった。
+        new_epoch.ok_or_else(wrong_current)
     }
 
     // --- M10: user management (admin-only CRUD + RBAC) -------------------
@@ -406,19 +440,21 @@ impl UsersService {
         &self,
         username: &str,
     ) -> Result<Option<UserIdentity>, BantoError> {
-        let row: Option<(i64, String, String)> =
-            sqlx::query_as("SELECT id, display_name, role FROM users WHERE username = ?")
-                .bind(username)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(banto_storage::storage_error)?;
+        let row: Option<(i64, String, String, i64)> = sqlx::query_as(
+            "SELECT id, display_name, role, auth_epoch FROM users WHERE username = ?",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
 
         match row {
-            Some((id, display_name, role)) => Ok(Some(UserIdentity {
+            Some((id, display_name, role, auth_epoch)) => Ok(Some(UserIdentity {
                 id,
                 username: username.to_string(),
                 display_name,
                 role: Role::from_str(&role)?,
+                auth_epoch,
             })),
             None => Ok(None),
         }
@@ -456,9 +492,9 @@ impl UsersService {
         }
 
         let hash = hash_password(password)?;
-        let id: i64 = sqlx::query_scalar(
+        let (id, auth_epoch): (i64, i64) = sqlx::query_as(
             "INSERT INTO users (username, password_hash, display_name, role) VALUES (?, ?, ?, ?) \
-             RETURNING id",
+             RETURNING id, auth_epoch",
         )
         .bind(&username)
         .bind(&hash)
@@ -473,6 +509,7 @@ impl UsersService {
             username,
             display_name: display_name.to_string(),
             role,
+            auth_epoch,
         })
     }
 
@@ -531,10 +568,13 @@ impl UsersService {
         }
 
         let row: Option<(i64, String, String, String, String)> = sqlx::query_as(
-            "UPDATE users SET display_name = ?, role = ?, updated_at = datetime('now') WHERE id = ? \
+            "UPDATE users SET display_name = ?, \
+             auth_epoch = auth_epoch + CASE WHEN role = ? THEN 0 ELSE 1 END, \
+             role = ?, updated_at = datetime('now') WHERE id = ? \
              RETURNING id, username, display_name, role, created_at",
         )
         .bind(display_name)
+        .bind(role.as_str())
         .bind(role.as_str())
         .bind(id)
         .fetch_optional(&self.pool)
@@ -565,8 +605,11 @@ impl UsersService {
         validate_password_len(new_password, "newPassword")?;
         let hash = hash_password(new_password)?;
 
+        // #204: 世代を同じ UPDATE で進め、このアカウントの既存セッションを
+        // すべて終わらせる。
         let result = sqlx::query(
-            "UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?",
+            "UPDATE users SET password_hash = ?, auth_epoch = auth_epoch + 1, \
+             updated_at = datetime('now') WHERE id = ?",
         )
         .bind(&hash)
         .bind(id)
@@ -1048,5 +1091,88 @@ mod tests {
             .expect("owner should be found");
         assert_eq!(found.role, Role::Admin);
         assert!(svc.get_by_username("nobody").await.unwrap().is_none());
+    }
+
+    async fn epoch_of(svc: &UsersService, username: &str) -> i64 {
+        svc.get_by_username(username)
+            .await
+            .unwrap()
+            .expect("account should exist")
+            .auth_epoch
+    }
+
+    /// banto v1.7.0 #204: 新しいアカウントは世代 0。ロールが実際に変わる
+    /// 更新・パスワードのリセット・自分のパスワード変更で 1 ずつ進み、表示名
+    /// だけの更新と同じロールへの更新では進まない。`verify` と
+    /// `get_by_username` は同じ値を読む。
+    #[tokio::test]
+    async fn auth_epoch_advances_on_role_change_password_change_and_reset() {
+        let svc = service().await;
+        svc.setup_first_user("owner", "password123", "オーナー")
+            .await
+            .unwrap();
+        let alice = svc
+            .create_user("alice", "password123", "Alice", Role::Editor)
+            .await
+            .unwrap();
+        assert_eq!(alice.auth_epoch, 0);
+
+        // 表示名だけ / 同じロール: 進まない
+        svc.update_user(alice.id, "Alice 2", Role::Editor)
+            .await
+            .unwrap();
+        assert_eq!(epoch_of(&svc, "alice").await, 0);
+
+        // 降格: 進む
+        svc.update_user(alice.id, "Alice 2", Role::Viewer)
+            .await
+            .unwrap();
+        assert_eq!(epoch_of(&svc, "alice").await, 1);
+
+        // リセット: 進む
+        svc.reset_password(alice.id, "reset-password")
+            .await
+            .unwrap();
+        assert_eq!(epoch_of(&svc, "alice").await, 2);
+
+        // 自分の変更: 進み、新しい世代を返す
+        let new_epoch = svc
+            .change_password("alice", "reset-password", "changed-password")
+            .await
+            .unwrap();
+        assert_eq!(new_epoch, 3);
+        assert_eq!(epoch_of(&svc, "alice").await, 3);
+        let verified = svc
+            .verify("alice", "changed-password")
+            .await
+            .unwrap()
+            .expect("new password should verify");
+        assert_eq!(verified.auth_epoch, 3);
+
+        // 他のアカウントの世代は動かない
+        assert_eq!(epoch_of(&svc, "owner").await, 0);
+    }
+
+    /// #204: パスワード変更の `UPDATE` は、照合したハッシュがまだ現在の値で
+    /// あることを条件にする - 照合と更新のあいだにリセットされたパスワードを
+    /// 黙って上書きしない。ここでは「照合済みの古いハッシュ」を直接作れない
+    /// ので、リセット後に古いパスワードで変更しようとすると拒否される
+    /// （世代も進まない）ことを確かめる。
+    #[tokio::test]
+    async fn change_password_after_reset_with_old_password_is_rejected() {
+        let svc = service().await;
+        svc.setup_first_user("owner", "password123", "オーナー")
+            .await
+            .unwrap();
+        let owner = svc.get_by_username("owner").await.unwrap().unwrap();
+        svc.reset_password(owner.id, "reset-password")
+            .await
+            .unwrap();
+        let err = svc
+            .change_password("owner", "password123", "changed-password")
+            .await
+            .expect_err("old password must be rejected");
+        assert!(matches!(err, BantoError::Validation { .. }));
+        assert_eq!(epoch_of(&svc, "owner").await, 1);
     }
 }

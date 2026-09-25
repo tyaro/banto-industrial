@@ -69,6 +69,14 @@ tempfile = { workspace = true }
 # crate で、依存ツリーには既に入っているので Cargo.lock にパッケージは
 # 増えない（`chronogazer` の依存一覧に 1 行増えるだけ）。
 banto-collect = { path = "../../../crates/banto-collect" }
+# banto v1.7.0 #204 のセッション失効テスト専用: REST 経路（組み込みサーバーの
+# `chronogazer_core::rest::api_router`）で変更して Tauri のセッションが終わる
+# ことを、同じ `AppState` の上で確かめるため。どちらも `chronogazer-core` が
+# 既に使っている workspace の依存で、パッケージは増えない。
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+# 同じテストで、照合中の DB エラー（`users` を一時的に読めなくする）を作るため。
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 
 # Real window translucency for the glass theme (spec M12): Windows Acrylic
 # via `window_vibrancy::apply_acrylic`/`clear_acrylic`. Windows-only by

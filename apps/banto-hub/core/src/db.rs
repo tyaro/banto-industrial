@@ -106,6 +106,14 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
+    // banto v1.7.0 #204（セッション失効）: `users.auth_epoch` は認証の世代。
+    // セッションは確立時の `(id, auth_epoch)` に結び付き、ロール変更・
+    // パスワード変更・リセットで世代が進むと終わる（`crate::users::UsersService`
+    // の「セッション失効」節）。`users` は既に `CREATE TABLE IF NOT EXISTS`
+    // 済みの DB があるので、`api_keys.tripped_at` と同じく後追いの ADD COLUMN。
+    // 既存の行は 0 から始まる（セッションはメモリにしか無いので移行は不要）。
+    add_column_if_missing(pool, "users", "auth_epoch", "INTEGER NOT NULL DEFAULT 0").await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -507,6 +515,59 @@ mod tests {
         // Second run must not error (ALTER TABLE ADD COLUMN on an existing
         // column would fail if add_column_if_missing's check were skipped).
         run_migrations(&pool).await.unwrap();
+    }
+
+    /// banto v1.7.0 #204: `auth_epoch` の無い既存の DB（この PR より前の
+    /// `users`）から起動しても、既存の行が世代 0 で読め、ログインと世代の
+    /// 更新が動くこと。
+    #[tokio::test]
+    async fn auth_epoch_is_added_to_an_existing_users_table() {
+        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin','editor','viewer'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let hash = {
+            use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+            argon2::Argon2::default()
+                .hash_password(b"old-password", &SaltString::generate(&mut OsRng))
+                .unwrap()
+                .to_string()
+        };
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, display_name, role) \
+             VALUES ('legacy', ?, 'Legacy', 'editor')",
+        )
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap(); // 2 回目も列を重複させない
+
+        let users = crate::users::UsersService::new(pool.clone());
+        let legacy = users
+            .verify("legacy", "old-password")
+            .await
+            .unwrap()
+            .expect("既存のアカウントでログインできる");
+        assert_eq!(legacy.auth_epoch, 0);
+        let new_epoch = users
+            .change_password("legacy", "old-password", "new-password")
+            .await
+            .unwrap();
+        assert_eq!(new_epoch, 1);
     }
 
     /// H10 ①: `api_keys.expires_at` も `tripped_at` と同じ

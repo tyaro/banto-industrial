@@ -134,6 +134,22 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
         .map_err(banto_storage::storage_error)?;
     }
 
+    // 0005_user_auth_epoch.sql（banto v1.7.0 #204 のセッション失効）: 同じ
+    // `pragma_table_info` の冪等チェック。既存の行は 0 から始まる（セッションは
+    // プロセスのメモリにしか無いので、既存セッションの移行は要らない）。
+    let has_auth_epoch_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    if has_auth_epoch_column == 0 {
+        sqlx::query("ALTER TABLE users ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    }
+
     // 0004_audit_log.sql
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS audit_log (
@@ -251,5 +267,66 @@ mod tests {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
         run_migrations(&pool).await.unwrap();
         run_migrations(&pool).await.unwrap(); // second run: must not error
+    }
+
+    /// banto v1.7.0 #204: `auth_epoch` の無い既存の DB（v1.6.0 追従時点の
+    /// スキーマ = 0002 + 0003 だけの `users`）から起動しても、既存の行が
+    /// 世代 0 で読め、ログインと世代の更新が動くこと。
+    #[tokio::test]
+    async fn auth_epoch_is_added_to_an_existing_users_table() {
+        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin' \
+             CHECK (role IN ('admin','editor','viewer'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 旧スキーマのまま作られていたアカウント（旧版のハッシュ形式と同じ
+        // argon2id の PHC 文字列）。
+        let users = crate::users::UsersService::new(pool.clone());
+        let hash = {
+            use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+            argon2::Argon2::default()
+                .hash_password(b"old-password", &SaltString::generate(&mut OsRng))
+                .unwrap()
+                .to_string()
+        };
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, display_name, role) \
+             VALUES ('legacy', ?, 'Legacy', 'editor')",
+        )
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap(); // 2 回目も列を重複させない
+
+        let legacy = users
+            .verify("legacy", "old-password")
+            .await
+            .unwrap()
+            .expect("既存のアカウントでログインできる");
+        assert_eq!(legacy.auth_epoch, 0);
+        let new_epoch = users
+            .change_password("legacy", "old-password", "new-password")
+            .await
+            .unwrap();
+        assert_eq!(new_epoch, 1);
     }
 }

@@ -45,6 +45,7 @@ import type { AuthProvider, Notifier, UiSettingsProvider } from '@banto/admin-co
 // when isTauri() is true.
 import { invoke } from '@tauri-apps/api/core';
 import { toastStore } from '$lib/toast.svelte';
+import { isBantoAuthCheckResponse } from './sessionGuard';
 
 const AUTH_KEY = 'banto.auth.demo';
 
@@ -100,12 +101,17 @@ export function getUiSettings(): UiSettingsProvider {
  * `vite dev`'s dev server 404ing with an HTML page for an unknown path)
  * means this is not our server. Never true inside Tauri - `isTauri()` is
  * checked first there and takes priority.
+ *
+ * banto v1.7.0 #204: a response carrying Banto's JSON error body (e.g. a
+ * `500` when the server could not check an account) is still our server -
+ * see `isBantoAuthCheckResponse`. Falling back to the demo providers there
+ * would silently swap a real (if momentarily broken) backend for fake data.
  */
 async function isEmbeddedServer(): Promise<boolean> {
 	if (isTauri()) return false;
 	try {
 		const response = await fetch(`${location.origin}/api/auth/check`, { headers: CSRF_HEADER });
-		return response.status === 200 || response.status === 401;
+		return await isBantoAuthCheckResponse(response);
 	} catch {
 		return false;
 	}
