@@ -4,9 +4,10 @@
 	 * chronogazer の同名ファイルから複製し、以下を削除した:
 	 * - デモモード分岐（`isAuditLogAvailable()`/`DEMO_MODE_MESSAGE`） -
 	 *   banto-hub にはデモモードが存在しない。
-	 * - 保持ポリシー表示（`getAuditConfig()`） - banto-hub バックエンドに
-	 *   `/api/audit-log/config` が無い（`auditLogAdmin.ts` の doc comment
-	 *   参照）。
+	 * - 保持ポリシー表示（`getAuditConfig()`） - 複製した当時は banto-hub
+	 *   バックエンドに `/api/audit-log/config` が無かった。今はある（P3-a、
+	 *   admin 限定の `GET`/`PUT`）が、この画面の表示は戻していない
+	 *   （`auditLogAdmin.ts` の doc comment 参照）。
 	 *
 	 * 一覧は BantoGrid の「サーバーモード」: ソート/フィルタ/ページングは
 	 * すべて `listAuditLog()`（Rust側 `ListParams` -> SQL）が行い、ブロック

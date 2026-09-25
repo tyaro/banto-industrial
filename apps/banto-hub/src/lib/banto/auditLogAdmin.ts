@@ -3,10 +3,11 @@
  * から複製し、Tauri 分岐・デモモード分岐を削除して HTTP 一択にした。
  *
  * `getAuditConfig`/`setAuditConfig`（`GET`/`PUT /api/audit-log/config`）は
- * **削除した** — banto-hub バックエンドにはその保持ポリシー設定ルートが
- * 存在しない（`apps/banto-hub/core/src/rest.rs` は `/api/audit-log/list`
- * のみを公開している。実装指示: 「getAuditConfig/setAuditConfig は削除
- * （バックエンドに /api/audit-log/config が無い）」）。
+ * このファイルには**持っていない**。複製した当時は banto-hub にそのルートが
+ * 無かったため削除した。その後 P3-a（docs/banto-hub-remaining-plan.md）で
+ * `apps/banto-hub/core/src/rest.rs` に admin 限定の `GET`/`PUT
+ * /api/audit-log/config` が足されたが、この画面のクライアントには戻して
+ * いない（保持ポリシーの表示・変更の UI が banto-hub にはまだ無い）。
  */
 import {
 	getAuthProvider,

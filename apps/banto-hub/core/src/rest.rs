@@ -1179,11 +1179,23 @@ struct AuditLogState {
 /// 本文の `ListParams` は `banto-core` の型でフィールドを足せないので
 /// クエリで受ける。**床（`admin`）は変えていない**（ルーター側の
 /// `RoleGuard`）。
+///
+/// **`asOfId` 付きの取得（世代の 2 ブロック目以降）では剪定しない**（#428）。
+/// 画面は「同じ境界の総件数が世代の最初と変わった = 途中で削除が入った」を
+/// 失効として扱い、続きの読み込みを止める。ここで毎回剪定すると、保持件数の
+/// 上限に張り付いた常駐の banto-hub では記録が 1 件増えるたびに次の取得が
+/// 1 行消し、2 ブロック目以降がほぼ毎回失効する - **ログが一番多いときに
+/// 先頭ブロックより先へ進めなくなる**。剪定は `asOfId` なしの取得（世代の
+/// 最初・「再読み込み」）と、起動時・24 時間ごとの周期タスクに任せる（周期
+/// タスクが読み込みの途中に重なるのはまれで、そのときは失効の検出で扱う）。
 async fn audit_log_list(
     State(state): State<AuditLogState>,
     Query(query): Query<AuditLogListQuery>,
     Json(params): Json<ListParams>,
 ) -> Result<Json<crate::audit::AuditLogList>, ApiError> {
+    if query.as_of_id.is_some() {
+        return Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?));
+    }
     if let Ok(config) = SettingsService::new(state.manager.pool())
         .audit_config()
         .await
@@ -15437,6 +15449,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 2);
+    }
+
+    /// #428: `asOfId` 付きの取得（2 ブロック目以降）では剪定しない - 上限に
+    /// 張り付いた状態でも、読み込みの途中で行が消えて失効しない。`asOfId`
+    /// なし（世代の最初・再読み込み）では従来どおり剪定する。
+    #[tokio::test]
+    async fn audit_log_list_with_as_of_id_does_not_prune() {
+        let env = test_env().await;
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO audit_log (actor_username, actor_role, action, resource, entity_id, detail, origin, result) \
+                 VALUES ('admin', 'admin', 'create', 'items', ?, NULL, 'rest', 'ok')",
+            )
+            .bind(i.to_string())
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        }
+        // 保持件数の上限を 2 にする（`PUT` も 1 行記録する = 6 行、上限超過）。
+        let put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "retentionDays": null,
+                    "retentionRows": 2
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = env.router.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log")
+                .fetch_one(&env.pool)
+                .await
+                .unwrap()
+        };
+        let before = count().await;
+        assert_eq!(before, 6);
+        let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM audit_log")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+
+        let list = |uri: String| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {}", env.admin_token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        // `asOfId` 付き: 上限を超えていても消さない（件数も境界の集合のまま）。
+        let response = env
+            .router
+            .clone()
+            .oneshot(list(format!("/api/audit-log/list?asOfId={max_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["totalCount"], 6, "{body}");
+        assert_eq!(count().await, before, "asOfId 付きの取得で剪定された");
+
+        // `asOfId` なし: 従来どおり剪定する。
+        let response = env
+            .router
+            .clone()
+            .oneshot(list("/api/audit-log/list".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count().await, 2);
     }
 
     /// `?asOfId=`（#428）: 省略すると従来どおり全行 + 応答の `asOfId` に最大
