@@ -61,6 +61,7 @@
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
 import { sessionStore } from '$lib/session.svelte';
+import { classifyStreamClose, type StreamCloseAction } from './streamClose';
 
 /** `GET /api/v1/tags`（および管理系 `GET /api/tag-catalog`）の1タグ分
  * （`apps/banto-hub/core/src/hub.rs::TagEntry` と同型）。管理系応答は
@@ -248,6 +249,16 @@ export interface TagStreamHandlers {
 	 * 意味を持たないので渡さない（undefined でよい）。
 	 */
 	onStatusChange?: (connected: boolean, closeCode?: number) => void;
+	/**
+	 * #441: サーバーが資格情報を使えないと確認して close `1008` で閉じた
+	 * （`classifyStreamClose` が `reconnect` 以外を返した）ときに 1 回呼ばれる。
+	 * このとき**再接続はしない**（止まったまま）。呼び出し側は
+	 * `recheckSession` ならログイン状態を確かめ直し、`halt` なら
+	 * `action.message` を画面に出す。どちらも、続けてよいと分かったら
+	 * 戻り値の `resume()` で購読を再開する。`onStatusChange(false, 1008)` の
+	 * 後に呼ばれる。
+	 */
+	onHalt?: (action: Exclude<StreamCloseAction, { kind: 'reconnect' }>) => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -272,9 +283,12 @@ function wsUrl(path: string): string {
  * クロージャで包んだもの）で、このモジュール自身は絞り込みロジックを
  * 持たない。
  *
- * 戻り値は `{ disconnect, resubscribe }`:
+ * 戻り値は `{ disconnect, resubscribe, resume }`:
  * - `disconnect()`: ソケットを閉じ、保留中の再接続タイマーを止める
  *   （旧 API の戻り値そのもの）。
+ * - `resume()`（#441）: close `1008` で止まった購読を再開する（すぐに
+ *   接続し直し、バックオフも初期値へ戻す）。止まっていないとき・
+ *   `disconnect()` の後は何もしない。
  * - `resubscribe()`: 購読範囲（`getSubscriptionTags()` の結果）が変わった
  *   ときに呼ぶ。ソケットが開いていれば現在の購読 id を unsubscribe した上で
  *   id をインクリメントして新しい範囲で再 subscribe する。ソケットが
@@ -296,8 +310,10 @@ function wsUrl(path: string): string {
 export function connectTagStream(
 	handlers: TagStreamHandlers,
 	getSubscriptionTags: () => string[]
-): { disconnect: () => void; resubscribe: () => void } {
+): { disconnect: () => void; resubscribe: () => void; resume: () => void } {
 	let stopped = false;
+	/** #441: close `1008` で止まっている（再接続しない）。`resume()` で戻る。 */
+	let halted = false;
 	let ws: WebSocket | null = null;
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
@@ -362,6 +378,15 @@ export function connectTagStream(
 			if (ws === socket) ws = null;
 			handlers.onStatusChange?.(false, ev.code);
 			if (stopped) return;
+			// #441: 資格情報が使えないと確認された close（`1008`）は再接続
+			// しない - 失効したセッションでは再接続が認証で拒否され続ける
+			// だけで、利用者に理由も伝わらない。判断は `streamClose.ts`。
+			const action = classifyStreamClose(ev.code, ev.reason);
+			if (action.kind !== 'reconnect') {
+				halted = true;
+				handlers.onHalt?.(action);
+				return;
+			}
 			scheduleReconnect(reconnectDelayMs);
 			reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_DELAY_MS);
 		};
@@ -429,5 +454,12 @@ export function connectTagStream(
 		);
 	}
 
-	return { disconnect, resubscribe };
+	function resume(): void {
+		if (stopped || !halted) return;
+		halted = false;
+		reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
+		connectOnce();
+	}
+
+	return { disconnect, resubscribe, resume };
 }
