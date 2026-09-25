@@ -17,6 +17,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	applyServerSelection,
 	hubAbandonedDisplay,
+	hubCredentialGuidance,
+	hubCredentialGuidanceLine,
 	hubPollStaleNote,
 	hubStatusDetail,
 	hubStatusLabel,
@@ -301,6 +303,114 @@ describe('showManualKeyEntry', () => {
 			false
 		);
 		expect(showManualKeyEntry({ state: 'notConfigured' }, null)).toBe(false);
+	});
+});
+
+/**
+ * #446: Hub が close 1008 で購読を打ち切った理由（`lastError`）ごとの案内。
+ * トリップは「管理者に解除を依頼」（同じキーで戻る）、失効・期限切れ・存在
+ * しないは「新しい API キーを設定」（同じキーでは戻らない）。
+ */
+describe('hubCredentialGuidance', () => {
+	// [lastError, 次の一手, 案内に含む言葉, 含まない言葉]
+	const TABLE = [
+		[
+			'key_tripped',
+			'askAdmin',
+			['管理者に解除を依頼', '同じキーのまま', '自動で再開'],
+			['新しいAPIキー']
+		],
+		[
+			'key_revoked',
+			'replaceKey',
+			['失効', '新しいAPIキーを設定', '採用'],
+			['解除を依頼', '自動で再開します']
+		],
+		[
+			'key_expired',
+			'replaceKey',
+			['有効期限', '新しいAPIキーを設定', '採用'],
+			['解除を依頼', '自動で再開します']
+		],
+		[
+			'key_not_found',
+			'replaceKey',
+			['見つからない', '新しいAPIキーを設定', '採用'],
+			['解除を依頼', '自動で再開します']
+		],
+		[
+			'credential_rejected',
+			'checkHub',
+			['理由を判別できません', '管理者に確認'],
+			['新しいAPIキーを設定']
+		]
+	] as const;
+
+	it('理由ごとに次の一手と案内が決まる', () => {
+		for (const [lastError, action, includes, excludes] of TABLE) {
+			const guidance = hubCredentialGuidance(lastError);
+			expect(guidance, lastError).not.toBeNull();
+			expect(guidance?.reason, lastError).toBe(lastError);
+			expect(guidance?.action, lastError).toBe(action);
+			for (const word of includes) expect(guidance?.message, lastError).toContain(word);
+			for (const word of excludes) expect(guidance?.message, lastError).not.toContain(word);
+		}
+	});
+
+	it('理由ごとの案内は互いに潰れない', () => {
+		const messages = TABLE.map(([lastError]) => hubCredentialGuidance(lastError)?.message);
+		expect(new Set(messages).size).toBe(TABLE.length);
+	});
+
+	it('1008 の分類でなければ案内しない（従来の文言に任せる）', () => {
+		for (const lastError of [
+			null,
+			'unauthorized',
+			'transport',
+			'binding_unresolved',
+			'future_kind'
+		]) {
+			expect(hubCredentialGuidance(lastError), String(lastError)).toBeNull();
+		}
+	});
+
+	it('unauthorized の説明文が理由ごとの案内になる', () => {
+		for (const [lastError] of TABLE) {
+			expect(hubSubscriptionDetail(subscription({ state: 'unauthorized', lastError }))).toBe(
+				hubCredentialGuidance(lastError)?.message
+			);
+		}
+		// 理由の無い 401/403 は従来の文言のまま。
+		expect(
+			hubSubscriptionDetail(subscription({ state: 'unauthorized', lastError: 'unauthorized' }))
+		).toContain('認証が通っていません');
+	});
+
+	it('世代を止めた後（stopped + 理由）は、停止の理由と別の行で案内する', () => {
+		const stopped = subscription({
+			state: 'stopped',
+			reason: '保存済みのAPIキーがHubに拒否されたため購読できません。',
+			lastError: 'key_tripped'
+		});
+		expect(hubSubscriptionDetail(stopped)).toBe(stopped.reason);
+		expect(hubCredentialGuidanceLine(stopped)).toBe(hubCredentialGuidance('key_tripped')?.message);
+		// unauthorized では説明文が案内そのものなので、別の行は出さない。
+		expect(
+			hubCredentialGuidanceLine(subscription({ state: 'unauthorized', lastError: 'key_tripped' }))
+		).toBeNull();
+		expect(
+			hubCredentialGuidanceLine(subscription({ state: 'stopped', lastError: null }))
+		).toBeNull();
+		expect(hubCredentialGuidanceLine(null)).toBeNull();
+	});
+
+	it('失効・期限切れ・存在しないは、止めた後もキーの入力欄を出す（トリップは出さない）', () => {
+		for (const [lastError, action] of TABLE) {
+			expect(
+				showManualKeyEntry({ state: 'authFailed' }, subscription({ state: 'stopped', lastError })),
+				lastError
+			).toBe(action === 'replaceKey');
+		}
 	});
 });
 

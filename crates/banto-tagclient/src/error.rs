@@ -41,6 +41,28 @@ pub enum ErrorKind {
     /// constructed cannot succeed; the caller must change the tag, value, or
     /// timing before trying again.
     WriteRejected,
+    /// #446: banto-hub closed the stream with close code 1008 and the reason
+    /// `api_key_revoked` - an administrator revoked this key. Irreversible:
+    /// only a different key helps, so the worker stops instead of
+    /// reconnecting (see [`crate::close`]).
+    KeyRevoked,
+    /// #446: close 1008 `api_key_expired` - the key passed its
+    /// `expires_at`. Irreversible for this key; the worker stops.
+    KeyExpired,
+    /// #446: close 1008 `api_key_tripped` - the key was tripped (for
+    /// example by the write rate limit). **Reversible**: an administrator
+    /// can clear the trip and the same key works again. The worker still
+    /// stops (reconnecting immediately would be rejected); whether and how
+    /// slowly to try again is the application's decision.
+    KeyTripped,
+    /// #446: close 1008 `api_key_not_found` - the Hub no longer knows this
+    /// key (deleted, or the Hub's key table was replaced). The worker stops.
+    KeyNotFound,
+    /// #446: close 1008 with a reason this crate does not know (a newer Hub,
+    /// or a session reason such as `session_revoked` that an API-key client
+    /// should never receive). The Hub still said "this credential is no
+    /// longer accepted", so the worker stops rather than reconnecting.
+    CredentialRejected,
 }
 
 impl ErrorKind {
@@ -64,7 +86,31 @@ impl ErrorKind {
             Self::WriteForbidden => "write_forbidden",
             Self::WriteUnavailable => "write_unavailable",
             Self::WriteRejected => "write_rejected",
+            Self::KeyRevoked => "key_revoked",
+            Self::KeyExpired => "key_expired",
+            Self::KeyTripped => "key_tripped",
+            Self::KeyNotFound => "key_not_found",
+            Self::CredentialRejected => "credential_rejected",
         }
+    }
+
+    /// #446: the Hub closed an open stream saying this credential is no
+    /// longer accepted (close code 1008, classified by
+    /// [`crate::close::classify_close`]). The worker publishes these as
+    /// [`TagClientConnectionState::Unauthorized`](crate::TagClientConnectionState::Unauthorized)
+    /// with the specific kind in `last_error` and does not reconnect.
+    ///
+    /// Plain [`Self::Unauthorized`] (a 401/403 on the catalog request or the
+    /// handshake) is deliberately **not** included: it carries no reason.
+    pub const fn is_credential_rejection(self) -> bool {
+        matches!(
+            self,
+            Self::KeyRevoked
+                | Self::KeyExpired
+                | Self::KeyTripped
+                | Self::KeyNotFound
+                | Self::CredentialRejected
+        )
     }
 }
 

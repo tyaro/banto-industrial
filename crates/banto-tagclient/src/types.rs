@@ -329,10 +329,18 @@ impl TagClientState {
     }
 
     pub(crate) const fn unauthorized() -> Self {
+        Self::unauthorized_because(crate::error::ErrorKind::Unauthorized)
+    }
+
+    /// `Unauthorized` with the reason the credential stopped working
+    /// (#446): plain [`ErrorKind::Unauthorized`](crate::error::ErrorKind::Unauthorized)
+    /// for a 401/403, or one of the close-1008 kinds
+    /// ([`ErrorKind::is_credential_rejection`](crate::error::ErrorKind::is_credential_rejection)).
+    pub(crate) const fn unauthorized_because(error: crate::error::ErrorKind) -> Self {
         Self {
             state: TagClientConnectionState::Unauthorized,
             current: None,
-            last_error: Some(crate::error::ErrorKind::Unauthorized),
+            last_error: Some(error),
         }
     }
 

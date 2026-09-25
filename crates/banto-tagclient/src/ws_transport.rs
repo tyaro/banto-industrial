@@ -18,6 +18,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{
+    close::classify_close,
     endpoint::Endpoint,
     error::{Error, ErrorKind, Result},
     secret::SecretApiKey,
@@ -254,13 +255,31 @@ impl WebSocketConnection {
                     );
                     return Err(Error::new(ErrorKind::ProtocolError));
                 }
-                Some(Ok(Message::Close(_))) => {
-                    tracing::debug!(
-                        host = ?self.host,
-                        port = ?self.port,
-                        "banto-hub closed the WebSocket connection"
-                    );
-                    return Err(Error::new(ErrorKind::Transport));
+                Some(Ok(Message::Close(frame))) => {
+                    // #446: keep the close code and reason. A 1008 means the
+                    // Hub confirmed the credential is no longer usable; see
+                    // `crate::close`. The reason text is server-controlled,
+                    // so only the code and the resulting kind are logged.
+                    let code = frame.as_ref().map(|frame| u16::from(frame.code));
+                    let reason = frame.as_ref().map_or("", |frame| frame.reason.as_str());
+                    let kind = classify_close(code, reason);
+                    if kind.is_credential_rejection() {
+                        tracing::warn!(
+                            host = ?self.host,
+                            port = ?self.port,
+                            close_code = ?code,
+                            error_kind = kind.as_str(),
+                            "banto-hub closed the WebSocket connection: credential no longer accepted"
+                        );
+                    } else {
+                        tracing::debug!(
+                            host = ?self.host,
+                            port = ?self.port,
+                            close_code = ?code,
+                            "banto-hub closed the WebSocket connection"
+                        );
+                    }
+                    return Err(Error::new(kind));
                 }
                 None => {
                     tracing::warn!(
@@ -683,6 +702,62 @@ mod tests {
                 .kind(),
             ErrorKind::Transport
         );
+        server.await.unwrap();
+    }
+
+    fn close_frame(code: u16, reason: &str) -> Message {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        Message::Close(Some(CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.into(),
+        }))
+    }
+
+    /// #446: the close code and reason reach the caller as a kind. 1008 is
+    /// classified by reason; any other close stays an ordinary `Transport`
+    /// disconnect (reconnects as before).
+    #[tokio::test]
+    async fn a_close_frame_keeps_its_code_and_reason() {
+        for (code, reason, expected) in [
+            (1008, "api_key_revoked", ErrorKind::KeyRevoked),
+            (1008, "api_key_expired", ErrorKind::KeyExpired),
+            (1008, "api_key_tripped", ErrorKind::KeyTripped),
+            (1008, "api_key_not_found", ErrorKind::KeyNotFound),
+            (1008, "future_reason", ErrorKind::CredentialRejected),
+            (1000, "", ErrorKind::Transport),
+            (1013, "api_key_revoked", ErrorKind::Transport),
+        ] {
+            let (mut connection, server) =
+                connection_for_single_message(close_frame(code, reason)).await;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), connection.receive_text())
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .kind(),
+                expected,
+                "code={code} reason={reason}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    /// The reason text is server-controlled: it must not reach the log.
+    #[tokio::test]
+    async fn a_credential_close_logs_the_kind_but_not_the_reason_text() {
+        let (log, _guard) = crate::test_support::capture();
+        let (mut connection, server) =
+            connection_for_single_message(close_frame(1008, "private-reason-text")).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), connection.receive_text())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::CredentialRejected
+        );
+        assert!(log.contains("credential_rejected"));
+        assert!(!log.contains("private-reason-text"));
         server.await.unwrap();
     }
 

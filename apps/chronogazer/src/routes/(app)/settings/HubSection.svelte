@@ -60,6 +60,7 @@
 		getHubStatus,
 		getHubSubscription,
 		hubAbandonedDisplay,
+		hubCredentialGuidanceLine,
 		hubLastValueLabel,
 		hubPollStaleNote,
 		hubRemainderNote,
@@ -140,6 +141,12 @@
 	 * `lastError` を独立した行で出すか。`stopped` かつ `reason` が無いときは
 	 * `hubSubscriptionDetail` がエラーを文中に入れるので、二重に出さない。
 	 */
+	/**
+	 * #446: Hub が close 1008 で購読を打ち切った理由ごとの案内（トリップなら
+	 * 管理者に解除を依頼、失効・期限切れ・存在しないなら新しいキー）。
+	 * `unauthorized` のときは説明文そのものが案内なので出さない。
+	 */
+	const credentialGuidanceLine = $derived(hubCredentialGuidanceLine(subscription));
 	const showLastErrorLine = $derived(
 		subscription !== null && !(subscription.state === 'stopped' && !subscription.reason)
 	);
@@ -815,6 +822,9 @@
 					<p class="note poll-stale" role="status">{hubPollStaleNote(lastPolledAt)}</p>
 				{/if}
 				<p class="note">{hubSubscriptionDetail(subscription)}</p>
+				{#if credentialGuidanceLine}
+					<p class="note hub-credential-guidance" role="status">{credentialGuidanceLine}</p>
+				{/if}
 				<!--
 					購読全体の最終受信時刻。値の表の行ごとの `t` は
 					「この行がいつの値か」であって、購読が生きているかの

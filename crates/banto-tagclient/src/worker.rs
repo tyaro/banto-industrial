@@ -211,9 +211,16 @@ pub(crate) async fn run_supervisor_with_config(
             state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
             return Ok(());
         }
-        if error.kind() == ErrorKind::Unauthorized {
-            tracing::warn!("banto-tagclient worker stopping: banto-hub rejected credentials");
-            state_tx.send_replace(TagClientState::unauthorized());
+        // #446: a close 1008 (`is_credential_rejection`) stops here too, with
+        // its reason kept in `last_error`. The Hub sends 1008 only after it
+        // confirmed the credential is unusable, so reconnecting with the same
+        // key would only be rejected again (see `crate::close`).
+        if error.kind() == ErrorKind::Unauthorized || error.kind().is_credential_rejection() {
+            tracing::warn!(
+                error_kind = error.kind().as_str(),
+                "banto-tagclient worker stopping: banto-hub rejected credentials"
+            );
+            state_tx.send_replace(TagClientState::unauthorized_because(error.kind()));
             return Err(error);
         }
         if is_rebindable(error.kind()) {
@@ -1837,5 +1844,187 @@ mod tests {
         server.abort();
         assert!(!log.contains("test-token"));
         assert!(log.contains("scheduling a reconnect"));
+    }
+
+    // --- #446: close 1008 and the reason -----------------------------------
+
+    fn close_message(code: u16, reason: &str) -> Message {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        Message::Close(Some(CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.into(),
+        }))
+    }
+
+    fn one_request() -> Vec<BindingRequest> {
+        vec![BindingRequest {
+            binding_key: "stable".into(),
+            stable_id: StableTagId::new(1, 1, 1),
+        }]
+    }
+
+    /// Serve one live generation, close it with `code`/`reason`, then report
+    /// whether the worker came back for another catalog within `window`.
+    async fn serve_live_then_close(
+        listener: TcpListener,
+        code: u16,
+        reason: &'static str,
+        window: Duration,
+    ) -> bool {
+        let count = AtomicUsize::new(0);
+        let mut socket = serve_named_generation(
+            &listener,
+            "tag",
+            named_catalog("tag", 1, Some(7), CollectionMode::Configured),
+            named_values("tag", 10.0, 1, Some(7), CollectionMode::Configured),
+            &count,
+            None,
+        )
+        .await;
+        socket.send(close_message(code, reason)).await.unwrap();
+        // Let the client complete the closing handshake.
+        let _ = tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
+        tokio::time::timeout(window, listener.accept())
+            .await
+            .is_ok()
+    }
+
+    /// Every 1008 reason stops the worker as `Unauthorized` with the reason's
+    /// own kind in `last_error`, and never reconnects (no second catalog
+    /// request even with a 1 ms backoff). Tripped included: whether to try a
+    /// tripped key again is the application's decision.
+    #[tokio::test]
+    async fn a_1008_close_stops_with_its_reason_and_does_not_reconnect() {
+        for (reason, kind) in [
+            ("api_key_revoked", ErrorKind::KeyRevoked),
+            ("api_key_expired", ErrorKind::KeyExpired),
+            ("api_key_tripped", ErrorKind::KeyTripped),
+            ("api_key_not_found", ErrorKind::KeyNotFound),
+            ("future_reason", ErrorKind::CredentialRejected),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(serve_live_then_close(
+                listener,
+                1008,
+                reason,
+                Duration::from_millis(300),
+            ));
+            let (sender, mut receiver) =
+                watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+            let (_stop_tx, stop_rx) = oneshot::channel();
+            let rest_client = client(address);
+            let requests = one_request();
+            let worker_sender = sender.clone();
+            let task = tokio::spawn(async move {
+                run_supervisor_with_config(
+                    &rest_client,
+                    &requests,
+                    1,
+                    &worker_sender,
+                    stop_rx,
+                    BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5)),
+                )
+                .await
+            });
+            wait_state(
+                &mut receiver,
+                TagClientConnectionState::Unauthorized,
+                Some(kind),
+            )
+            .await;
+            assert_eq!(receiver.borrow().current(), None, "{reason}");
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.unwrap_err().kind(), kind, "{reason}");
+            assert!(
+                !server.await.unwrap(),
+                "{reason}: the worker reconnected after a 1008 close"
+            );
+            // The published state is still the classified one.
+            assert_eq!(
+                receiver.borrow().connection_state(),
+                TagClientConnectionState::Unauthorized
+            );
+            assert_eq!(receiver.borrow().last_error(), Some(kind));
+        }
+    }
+
+    /// An ordinary close (not 1008) keeps the existing behavior: reconnect
+    /// from the catalog and become live again - whatever the reason text.
+    #[tokio::test]
+    async fn an_ordinary_close_still_reconnects() {
+        for (code, reason) in [(1000, ""), (1013, "api_key_revoked")] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let catalog_count = Arc::new(AtomicUsize::new(0));
+            let server_count = Arc::clone(&catalog_count);
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let mut first = serve_named_generation(
+                    &listener,
+                    "tag",
+                    named_catalog("tag", 1, Some(7), CollectionMode::Configured),
+                    named_values("tag", 10.0, 1, Some(7), CollectionMode::Configured),
+                    &server_count,
+                    None,
+                )
+                .await;
+                first.send(close_message(code, reason)).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_millis(200), first.next()).await;
+                let second = serve_named_generation(
+                    &listener,
+                    "tag",
+                    named_catalog("tag", 1, Some(7), CollectionMode::Configured),
+                    named_values("tag", 20.0, 1, Some(7), CollectionMode::Configured),
+                    &server_count,
+                    None,
+                )
+                .await;
+                let _ = release_rx.await;
+                drop(second);
+            });
+            let (sender, mut receiver) =
+                watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let rest_client = client(address);
+            let requests = one_request();
+            let worker_sender = sender.clone();
+            let task = tokio::spawn(async move {
+                run_supervisor_with_config(
+                    &rest_client,
+                    &requests,
+                    1,
+                    &worker_sender,
+                    stop_rx,
+                    BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5)),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    {
+                        let state = receiver.borrow();
+                        if state.connection_state() == TagClientConnectionState::Live
+                            && state
+                                .current()
+                                .is_some_and(|current| current.values[0].v == Some(20.0))
+                        {
+                            return;
+                        }
+                    }
+                    receiver.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("code={code}: did not reconnect"));
+            assert_eq!(catalog_count.load(Ordering::SeqCst), 2);
+            stop_tx.send(()).unwrap();
+            assert!(task.await.unwrap().is_ok());
+            let _ = release_tx.send(());
+            server.await.unwrap();
+        }
     }
 }

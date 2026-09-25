@@ -386,7 +386,104 @@ export function showManualKeyEntry(
 	status: HubStatus,
 	subscription: HubSubscription | null
 ): boolean {
-	return needsManualKey(status) || subscription?.state === 'unauthorized';
+	return (
+		needsManualKey(status) ||
+		subscription?.state === 'unauthorized' ||
+		// #446: 失効・期限切れ・存在しないキーは、世代を止めた後（`stopped` +
+		// `lastError`）も「新しい API キーを設定」へ誘導する。案内だけ出して
+		// 入力欄が無い、という形にしない。
+		hubCredentialGuidance(subscription?.lastError ?? null)?.action === 'replaceKey'
+	);
+}
+
+/**
+ * Hub が close 1008 で購読を打ち切った理由（`banto_tagclient::ErrorKind` の
+ * `as_str`、#446）。`HubSubscription.lastError` に載る。
+ */
+export type HubCredentialRejection =
+	'key_revoked' | 'key_expired' | 'key_tripped' | 'key_not_found' | 'credential_rejected';
+
+/**
+ * 理由ごとの次の一手（#446）。
+ *
+ * - `askAdmin`: トリップ。Hub の管理者が解除すれば**同じキーで戻る**ので、
+ *   キーを捨てさせない。アプリは数分おきに自動で確かめる。
+ * - `replaceKey`: 失効・期限切れ・存在しない。**同じキーでは二度と戻らない**
+ *   ので、新しい API キーを設定してもらう（アプリは自動で再試行しない）。
+ * - `checkHub`: 理由を判別できない 1008（新しい Hub の理由など）。管理者に
+ *   確認してもらい、アプリは数分おきに自動で確かめる。
+ */
+export type HubCredentialAction = 'askAdmin' | 'replaceKey' | 'checkHub';
+
+export interface HubCredentialGuidance {
+	reason: HubCredentialRejection;
+	action: HubCredentialAction;
+	message: string;
+}
+
+const REPLACE_KEY_STEPS =
+	'新しいAPIキーを設定してください（「接続」でキーを再発行するか、Hubの管理画面で発行したAPIキーをこの画面の入力欄から採用してください）。同じキーのままでは自動で再開しません。';
+
+/**
+ * `lastError` から、Hub が購読を打ち切った理由ごとの案内を作る（純関数、
+ * `hubAdmin.test.ts` が表で固定する）。close 1008 の分類でなければ `null`
+ * （通信系のエラーや理由の無い 401/403 は従来の文言に任せる）。
+ *
+ * 「自動で再開します」と書くのはトリップと判別できない理由だけ - それぞれ
+ * 見張り（`chronogazer_core::hub` の `retry_pace`）が 2 分に 1 回確かめに
+ * 行く経路がある。失効・期限切れ・存在しないは見張りが再試行しないので、
+ * 自動で戻るとは書かない。
+ */
+export function hubCredentialGuidance(lastError: string | null): HubCredentialGuidance | null {
+	switch (lastError) {
+		case 'key_tripped':
+			return {
+				reason: 'key_tripped',
+				action: 'askAdmin',
+				message:
+					'HubがこのAPIキーをトリップ（一時停止）させたため、購読を止めています。Hubの管理者に解除を依頼してください。解除されると同じキーのまま、数分以内に自動で再開します（この画面を開き直すとすぐに確認します）。'
+			};
+		case 'key_revoked':
+			return {
+				reason: 'key_revoked',
+				action: 'replaceKey',
+				message: `HubでこのAPIキーが失効したため、購読を止めています。${REPLACE_KEY_STEPS}`
+			};
+		case 'key_expired':
+			return {
+				reason: 'key_expired',
+				action: 'replaceKey',
+				message: `このAPIキーの有効期限が切れたため、購読を止めています。${REPLACE_KEY_STEPS}`
+			};
+		case 'key_not_found':
+			return {
+				reason: 'key_not_found',
+				action: 'replaceKey',
+				message: `HubにこのAPIキーが見つからないため、購読を止めています。${REPLACE_KEY_STEPS}`
+			};
+		case 'credential_rejected':
+			return {
+				reason: 'credential_rejected',
+				action: 'checkHub',
+				message:
+					'Hubがこのキーでの購読を打ち切りました（理由を判別できません）。Hubの管理者に確認してください。数分おきに自動で確認します。'
+			};
+		default:
+			return null;
+	}
+}
+
+/**
+ * 購読ブロックに案内を**独立した行**で出すか（純関数）。
+ *
+ * `unauthorized` のときは [`hubSubscriptionDetail`] が案内そのものを説明文に
+ * するので、二重に出さない。`stopped`（`status()` などが世代を止めた後）は
+ * 説明文が停止の理由（「保存済みのAPIキーがHubに拒否された…」など）になる
+ * ので、理由ごとの案内を別の行で添える。
+ */
+export function hubCredentialGuidanceLine(subscription: HubSubscription | null): string | null {
+	if (!subscription || subscription.state === 'unauthorized') return null;
+	return hubCredentialGuidance(subscription.lastError)?.message ?? null;
 }
 
 /**
@@ -1074,6 +1171,10 @@ export function hubSubscriptionDetail(subscription: HubSubscription): string {
 		return '購読していません。';
 	}
 	if (subscription.state === 'unauthorized') {
+		// #446: Hub が close 1008 で理由を付けて打ち切ったなら、理由ごとの
+		// 案内（トリップは管理者に解除を依頼、失効などは新しいキー）を出す。
+		const guidance = hubCredentialGuidance(subscription.lastError);
+		if (guidance) return guidance.message;
 		// タグ一覧は読めていても購読だけ拒否されることがある（WS のハンド
 		// シェイクだけが 401/403）。ユーザーにとっては接続の状態表示が何で
 		// あれ「認証が通っていない」なので、接続側の `authFailed` と同じ
