@@ -1550,7 +1550,8 @@ struct WriteControlStatusResponse {
 ///   `write_control_persist_failed`（書き込みは止まったまま）。
 /// - **enable**: 両方に保存できたときだけライブフラグを立てて 200。片方でも
 ///   失敗したら 500 `write_control_persist_failed`（ライブフラグには触れない）。
-///   保存中に停止が割り込んだら 409 `write_control_stop_interrupted`。
+///   保存中、または保存を待っている間に停止が割り込んだら 409
+///   `write_control_stop_interrupted`。
 ///
 /// 監査ログは成功/失敗の両方を記録する（[`write_control_audit_detail`]）。
 /// `ServerEvent::ResourceChanged` は停止では常に（ライブフラグは必ず落ちる）、

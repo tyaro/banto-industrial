@@ -25,10 +25,10 @@
 //!
 //! - **起動**: 「どちらか一方でも停止なら停止」で起動する
 //!   ([`decide_startup`]、純関数。総当たりの表はテスト参照)。DB を読めない・
-//!   ファイルが壊れている・読めない場合も停止側に倒す。ファイルが無い
-//!   (#433 より前からの環境・初回起動) だけは DB の値に従う。食い違いは
-//!   [`StartupDecision::warning`] としてログと管理画面 (状態画面の
-//!   「書き込み受付」) に出す。
+//!   ファイルが壊れている・読めない・ファイルが「再開の途中」の場合も停止側に
+//!   倒す。ファイルが無い (#433 より前からの環境・初回起動) だけは DB の値に
+//!   従う。食い違いは [`StartupDecision::warning`] としてログと管理画面
+//!   (状態画面の「書き込み受付」) に出す。
 //! - **停止** ([`WriteControl::set_enabled`] の `false`): ライブフラグを
 //!   **ロックを取る前に**落とし (書き込みは即座に止まる)、状態ファイル → DB
 //!   の順に保存する。どちらか一方に保存できれば「停止した」(再起動しても
@@ -37,20 +37,61 @@
 //! - **再開** (`true`): 両方の保存に成功したときだけライブフラグを立てる。
 //!   片方でも失敗したらライブフラグには触れずにエラーを返す。
 //!
+//! ### 再開は、確定するまで停止の記録を消さない (#439 レビュー P1-1、2026-09-25)
+//!
+//! 停止の記録は DB と状態ファイルの**どちらか一方にしか無い**ことがある
+//! (停止の保存が片方だけ成功したとき)。再開が片方を「有効」にした後で
+//! もう片方の保存に失敗すると、唯一の停止の記録が消え、再起動で黙って有効に
+//! なる。保存の順番を入れ替えるだけでは、停止がもう片方にだけ残っている
+//! 場合に同じことが起きる。そこで再開は次の 3 段で保存する:
+//!
+//! 1. 状態ファイルに **「再開の途中」** (`writeEnabled: false` +
+//!    `resumePending: true`) を書く。起動時はこれを**停止**として扱う
+//!    ([`FileStartupState::ResumePending`])。書けなければ DB に触れずに
+//!    やめる。
+//! 2. DB を「有効」にする。失敗したらファイルは「再開の途中」のまま。
+//! 3. DB に保存できたときだけ、状態ファイルを「有効」にする。**この rename が
+//!    再開の確定点**で、失敗したらファイルは「再開の途中」のまま。
+//!
+//! 守る性質: **直前の永続状態が停止なら、再開が失敗として返った・確定点より
+//! 前で落ちた後の再起動は、必ず停止で起動する**。1 より前は元の状態 (停止)、
+//! 1 の途中は原子的な置き換えなので元の状態か「再開の途中」、1 の後から
+//! 3 の確定までは状態ファイルが「再開の途中」(DB の値によらず停止) だから。
+//! 確定点の後は両方が「有効」で、再開は成功を返す。状態ファイルを持たない構成
+//! ([`WriteControl::new`]) は DB だけで、この性質の対象外。
+//! 表で確かめるテスト: `tests::a_failed_or_crashed_resume_always_restarts_stopped`。
+//!
+//! 「再開の途中」は `writeEnabled: false` と組にして書くので、`resumePending`
+//! を知らない読み手にも停止に見える。項目の無い (足す前の) ファイルは従来
+//! どおり読める (形式番号は 1 のまま)。
+//!
 //! ### ロック順序 (一方向に固定)
 //!
 //! `op_lock` (tokio の非同期ロック。保存の一連を直列化) → `stop_generation`
-//! (std の同期ロック。ライブフラグの切り替えだけを囲む短い区間)。逆順に
-//! 取る経路は無い: 停止は `stop_generation` を取って世代を進めライブフラグを
-//! 落とし、**それを離してから** `op_lock` を待つ。再開は `op_lock` の中で
-//! 開始時の世代を覚え、保存が済んだら `stop_generation` を取って世代が
-//! 変わっていないときだけライブフラグを立てる。これで:
+//! (std の同期ロック。世代を読む・ライブフラグを切り替える短い区間だけ)。
+//! `stop_generation` を持ったまま `op_lock` を待つ経路は無い (同期ロックは
+//! await をまたいで持たない):
+//!
+//! - **停止**は `stop_generation` を取って世代を進めライブフラグを落とし、
+//!   **それを離してから** `op_lock` を待つ。`op_lock` を取れたら、もう一度
+//!   世代を進めてライブフラグを落としてから保存する (落としてから並ぶまでの
+//!   間に来た再開が先に並んでライブフラグを立てても、後で保存するこの停止が
+//!   ライブフラグも停止に戻す)。
+//! - **再開**は、**最初に待つ前に** (`op_lock`、遅れている停止の DB 書き込み)
+//!   世代を読んで覚え、すぐに離す (#439 レビュー P1-2)。待ち終えたら世代を
+//!   比べ、変わっていれば何も保存せずにやめる。保存が済んだら
+//!   `stop_generation` を取って、世代が変わっていないときだけライブフラグを
+//!   立てる。
+//!
+//! これで:
 //!
 //! - 再開の保存が DB 待ちで詰まっていても、停止はライブフラグを即座に
 //!   落とせる (停止が再開の後ろに並ばない)。
-//! - 再開の保存中に停止が割り込んだら、その再開はライブフラグを立てない
+//! - 再開の保存中・待機中 (`op_lock` や遅れている停止の DB 書き込みを
+//!   待っている間) に停止が割り込んだら、その再開はライブフラグを立てない
 //!   ([`WriteControlChange::interrupted_by_stop`])。割り込んだ停止は再開の
 //!   後で保存するので、最後に残る永続値も停止になる。
+//! - 停止が成功を返した後に、ライブフラグだけが有効で残ることは無い。
 //!
 //! ### 停止の DB 保存は 5 秒で打ち切る (#433 監査、2026-09-24)
 //!
@@ -115,6 +156,16 @@ pub const STATE_FILE_NAME: &str = "write-control-state.json";
 /// `STOP_SESSION_CHECK_TIMEOUT`) と同じ 5 秒。再開には使わない。
 pub const STOP_DB_SAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 再開が DB に保存しなかった理由 (状態ファイルに「再開の途中」を書けなかった)。
+const NOT_SAVED_FILE_FAILED: &str = "状態ファイルに保存できなかったため、DB には保存していません";
+
+/// 再開が状態ファイルを「有効」にしなかった理由 (DB に保存できなかった)。
+const KEPT_RESUME_PENDING: &str =
+    "DB に保存できなかったため「再開の途中」のままにしました（再起動すると停止で起動します）";
+
+/// 再開がどこにも保存しなかった理由 (待っている間に停止が来た)。
+const NOT_SAVED_INTERRUPTED: &str = "停止が要求されたため保存していません";
+
 /// 状態ファイルの形式番号。これ以外の値は「壊れている」として停止側に倒す。
 const STATE_FILE_FORMAT: u64 = 1;
 
@@ -141,6 +192,10 @@ pub enum FileStartupState {
     Absent,
     Enabled,
     Disabled,
+    /// 「再開の途中」(#439 レビュー P1-1)。再開が状態ファイルに書く最初の
+    /// 記録で、再開の両方の保存が済むまで停止の記録として残る。起動時は
+    /// 停止として扱う。
+    ResumePending,
     /// 読めない・壊れている (理由。パスを含む)。
     Corrupt(String),
 }
@@ -154,7 +209,8 @@ pub struct StartupDecision {
 }
 
 /// 起動時の判定 (#433)。**どちらか一方でも停止なら停止**。DB を読めない・
-/// ファイルが壊れているときも停止。ファイルが無いときだけ DB に従う。
+/// ファイルが壊れている・ファイルが「再開の途中」のときも停止。ファイルが
+/// 無いときだけ DB に従う。
 /// 総当たりの表は `tests::startup_decision_table` を参照。
 pub fn decide_startup(db: &DbStartupState, file: &FileStartupState) -> StartupDecision {
     let db_allows = matches!(db, DbStartupState::Enabled);
@@ -169,6 +225,10 @@ pub fn decide_startup(db: &DbStartupState, file: &FileStartupState) -> StartupDe
         problems.push(format!("状態ファイルを読めませんでした（{reason}）"));
     }
     match (db, file) {
+        (_, FileStartupState::ResumePending) => problems.push(
+            "前回の書き込み受付の再開が完了していませんでした（状態ファイルが「再開の途中」のままでした）"
+                .to_string(),
+        ),
         (DbStartupState::Enabled, FileStartupState::Disabled) => problems.push(
             "DB は「有効」、状態ファイルは「停止」でした（前回の停止を DB に保存できなかった可能性があります）"
                 .to_string(),
@@ -217,22 +277,47 @@ fn read_state_file_blocking(path: &Path) -> FileStartupState {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => FileStartupState::Absent,
         Err(err) => FileStartupState::Corrupt(format!("{}: {err}", path.display())),
         Ok(bytes) => match parse_state_file(&bytes) {
-            Ok(true) => FileStartupState::Enabled,
-            Ok(false) => FileStartupState::Disabled,
+            Ok(state) => state,
             Err(reason) => FileStartupState::Corrupt(format!("{}: {reason}", path.display())),
         },
     }
 }
 
-fn parse_state_file(bytes: &[u8]) -> Result<bool, String> {
+/// 状態ファイルの中身を読む。`resumePending` は #439 レビュー P1-1 で足した
+/// 省略可の項目 (無ければ `false`。足す前の形式もそのまま読める)。「再開の
+/// 途中」は必ず `writeEnabled: false` と組にして書くので、項目を知らない
+/// 読み手 (足す前の版) にも停止に見える。`resumePending: true` なのに
+/// `writeEnabled: true` のような食い違いは「壊れている」(停止) にする。
+fn parse_state_file(bytes: &[u8]) -> Result<FileStartupState, String> {
     let value: Value = serde_json::from_slice(bytes).map_err(|err| err.to_string())?;
     if value.get("format").and_then(Value::as_u64) != Some(STATE_FILE_FORMAT) {
         return Err("形式番号が違います".to_string());
     }
-    value
+    let enabled = value
         .get("writeEnabled")
         .and_then(Value::as_bool)
-        .ok_or_else(|| "writeEnabled がありません".to_string())
+        .ok_or_else(|| "writeEnabled がありません".to_string())?;
+    let resume_pending = match value.get("resumePending") {
+        None => false,
+        Some(flag) => flag
+            .as_bool()
+            .ok_or_else(|| "resumePending が真偽値ではありません".to_string())?,
+    };
+    match (enabled, resume_pending) {
+        (true, false) => Ok(FileStartupState::Enabled),
+        (false, false) => Ok(FileStartupState::Disabled),
+        (false, true) => Ok(FileStartupState::ResumePending),
+        (true, true) => Err("writeEnabled と resumePending が食い違っています".to_string()),
+    }
+}
+
+/// 状態ファイルに書く記録。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileRecord {
+    Enabled,
+    Disabled,
+    /// 「再開の途中」(`writeEnabled: false` + `resumePending: true`)。
+    ResumePending,
 }
 
 /// 状態ファイルを原子的に書く (一時ファイル → `sync_all` → `rename`)。
@@ -242,10 +327,23 @@ pub async fn write_state_file(
     enabled: bool,
     actor: Option<&str>,
 ) -> Result<(), String> {
+    let record = if enabled {
+        FileRecord::Enabled
+    } else {
+        FileRecord::Disabled
+    };
+    write_state_record(path, record, actor).await
+}
+
+async fn write_state_record(
+    path: &Path,
+    record: FileRecord,
+    actor: Option<&str>,
+) -> Result<(), String> {
     let owned = path.to_path_buf();
     let actor = actor.map(str::to_string);
     tokio::task::spawn_blocking(move || {
-        write_state_file_blocking(&owned, enabled, actor.as_deref())
+        write_state_file_blocking(&owned, record, actor.as_deref())
             .map_err(|err| format!("{}: {err}", owned.display()))
     })
     .await
@@ -254,7 +352,7 @@ pub async fn write_state_file(
 
 fn write_state_file_blocking(
     path: &Path,
-    enabled: bool,
+    record: FileRecord,
     actor: Option<&str>,
 ) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
@@ -268,13 +366,16 @@ fn write_state_file_blocking(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let body = serde_json::to_vec_pretty(&json!({
+    let mut body = json!({
         "format": STATE_FILE_FORMAT,
-        "writeEnabled": enabled,
+        "writeEnabled": record == FileRecord::Enabled,
         "changedAtUnixMs": changed_at_ms,
         "changedBy": actor,
-    }))
-    .map_err(std::io::Error::other)?;
+    });
+    if record == FileRecord::ResumePending {
+        body["resumePending"] = json!(true);
+    }
+    let body = serde_json::to_vec_pretty(&body).map_err(std::io::Error::other)?;
 
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
@@ -392,7 +493,10 @@ impl WriteControlChange {
     /// 応答・ログ・監査に出す説明。全部うまくいったときは `None`。
     pub fn warning(&self) -> Option<String> {
         if self.interrupted_by_stop {
-            return Some("再開の保存中に停止が要求されたため、再開しませんでした。".to_string());
+            return Some(
+                "再開の保存中、または保存を待っている間に停止が要求されたため、再開しませんでした。"
+                    .to_string(),
+            );
         }
         if self.fully_persisted() {
             return None;
@@ -523,64 +627,130 @@ impl WriteControl {
         F: Future<Output = Result<(), String>> + Send + 'static,
     {
         if enabled {
-            let _op = self.op_lock.lock().await;
-            // 遅れている停止の DB 書き込みが終わるまで待つ (再開の「有効」を
-            // 後から「停止」で上書きされないように)。再開に制限時間は無い。
-            let lagging: Vec<JoinHandle<()>> =
-                std::mem::take(&mut *lock_ignoring_poison(&self.lagging_stop_db));
-            for handle in lagging {
-                let _ = handle.await;
-            }
-            let started_generation = *lock_ignoring_poison(&self.stop_generation);
-            let file = self.persist_file(true, actor).await;
-            let db = persist_db.await;
-            let mut change = WriteControlChange {
-                requested_enabled: true,
-                db,
-                file,
-                interrupted_by_stop: false,
-                db_timed_out: false,
-            };
-            if change.fully_persisted() {
-                let generation = lock_ignoring_poison(&self.stop_generation);
-                if *generation == started_generation {
-                    self.enabled.store(true, Ordering::SeqCst);
-                } else {
-                    change.interrupted_by_stop = true;
-                }
-            }
-            self.record_outcome(&change);
-            change
+            self.resume(actor, persist_db).await
         } else {
             // ロックを取る前にライブフラグを落とす (書き込みは即座に止まる)。
             self.disable();
-            let _op = self.op_lock.lock().await;
-            let file = self.persist_file(false, actor).await;
-            let mut task = tokio::spawn(persist_db);
-            let (db, db_timed_out) =
-                match tokio::time::timeout(STOP_DB_SAVE_TIMEOUT, &mut task).await {
-                    Ok(joined) => (flatten_join(joined), false),
-                    Err(_) => (
-                        Err(format!(
-                            "{} 秒以内に応答がありませんでした",
-                            STOP_DB_SAVE_TIMEOUT.as_secs()
-                        )),
-                        true,
-                    ),
-                };
-            let change = WriteControlChange {
-                requested_enabled: false,
-                db,
-                file,
-                interrupted_by_stop: false,
-                db_timed_out,
-            };
-            let seq = self.record_outcome(&change);
-            if db_timed_out {
-                self.follow_lagging_stop_db(task, change.file.clone(), seq);
-            }
-            change
+            self.save_stop(actor, persist_db).await
         }
+    }
+
+    /// 再開 (このモジュール doc「再開は、確定するまで停止の記録を消さない」)。
+    async fn resume<F>(&self, actor: Option<&str>, persist_db: F) -> WriteControlChange
+    where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        // 停止の世代は、最初に待つ (`op_lock`・遅れている停止の DB 書き込み)
+        // **前に**覚える (#439 レビュー P1-2)。待っている間に来た停止を
+        // 「開始時からあった」ものとして取り込まないため。同期ロックは値を
+        // 読んだらすぐ離す (await をまたいで持たない)。
+        let started_generation = *lock_ignoring_poison(&self.stop_generation);
+        let _op = self.op_lock.lock().await;
+        // 遅れている停止の DB 書き込みが終わるまで待つ (再開の「有効」を
+        // 後から「停止」で上書きされないように)。再開に制限時間は無い。
+        let lagging: Vec<JoinHandle<()>> =
+            std::mem::take(&mut *lock_ignoring_poison(&self.lagging_stop_db));
+        for handle in lagging {
+            let _ = handle.await;
+        }
+        // 待っている間に停止が来ていたら、何も保存せずにやめる。
+        if self.stopped_since(started_generation) {
+            let not_saved = || Err(NOT_SAVED_INTERRUPTED.to_string());
+            let change = WriteControlChange {
+                requested_enabled: true,
+                db: not_saved(),
+                file: self.state_file.as_ref().map(|_| not_saved()),
+                interrupted_by_stop: true,
+                db_timed_out: false,
+            };
+            self.record_outcome(&change);
+            return change;
+        }
+
+        // 1. 状態ファイルに「再開の途中」(停止扱い) を書く。書けなければ
+        //    DB には触れずにやめる (停止の記録を DB から消さない)。
+        if let Some(path) = &self.state_file {
+            if let Err(err) = write_state_record(path, FileRecord::ResumePending, actor).await {
+                let change = WriteControlChange {
+                    requested_enabled: true,
+                    db: Err(NOT_SAVED_FILE_FAILED.to_string()),
+                    file: Some(Err(err)),
+                    interrupted_by_stop: false,
+                    db_timed_out: false,
+                };
+                self.record_outcome(&change);
+                return change;
+            }
+        }
+        // 2. DB を「有効」にする。
+        let db = persist_db.await;
+        // 3. DB に保存できたときだけ、状態ファイルを「有効」にする (ここが
+        //    再開の確定点)。DB が失敗したら「再開の途中」のまま残す。
+        let file = match &self.state_file {
+            None => None,
+            Some(_) if db.is_err() => Some(Err(KEPT_RESUME_PENDING.to_string())),
+            Some(path) => Some(write_state_record(path, FileRecord::Enabled, actor).await),
+        };
+        let mut change = WriteControlChange {
+            requested_enabled: true,
+            db,
+            file,
+            interrupted_by_stop: false,
+            db_timed_out: false,
+        };
+        if change.fully_persisted() {
+            let generation = lock_ignoring_poison(&self.stop_generation);
+            if *generation == started_generation {
+                self.enabled.store(true, Ordering::SeqCst);
+            } else {
+                change.interrupted_by_stop = true;
+            }
+        }
+        self.record_outcome(&change);
+        change
+    }
+
+    /// `started_generation` を覚えた後に停止が来たか。
+    fn stopped_since(&self, started_generation: u64) -> bool {
+        *lock_ignoring_poison(&self.stop_generation) != started_generation
+    }
+
+    /// 停止の保存 (ライブフラグを落とした後に呼ぶ)。
+    async fn save_stop<F>(&self, actor: Option<&str>, persist_db: F) -> WriteControlChange
+    where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let _op = self.op_lock.lock().await;
+        // `op_lock` を取れたら、もう一度落とす。ライブフラグを落としてから
+        // `op_lock` に並ぶまでの間に来た再開は、この停止の世代を開始時の世代と
+        // して覚えて先に並び得る。その再開がライブフラグを立てても、この停止が
+        // 後で保存する (永続値は停止になる) ので、ライブフラグもそれに合わせる
+        // (#439 レビュー P1-2: 停止が成功したのにライブフラグだけ有効、を残さない)。
+        self.disable();
+        let file = self.persist_file(false, actor).await;
+        let mut task = tokio::spawn(persist_db);
+        let (db, db_timed_out) = match tokio::time::timeout(STOP_DB_SAVE_TIMEOUT, &mut task).await {
+            Ok(joined) => (flatten_join(joined), false),
+            Err(_) => (
+                Err(format!(
+                    "{} 秒以内に応答がありませんでした",
+                    STOP_DB_SAVE_TIMEOUT.as_secs()
+                )),
+                true,
+            ),
+        };
+        let change = WriteControlChange {
+            requested_enabled: false,
+            db,
+            file,
+            interrupted_by_stop: false,
+            db_timed_out,
+        };
+        let seq = self.record_outcome(&change);
+        if db_timed_out {
+            self.follow_lagging_stop_db(task, change.file.clone(), seq);
+        }
+        change
     }
 
     /// 打ち切った停止の DB 書き込みを見届ける (`op_lock` の中で呼ぶ)。完了
@@ -695,9 +865,10 @@ mod tests {
 
     // --- 起動時の判定の総当たり (#433) ---------------------------------------
 
-    /// DB: 有効/停止/読めない × ファイル: 無い/有効/停止/壊れている の 12 通り。
-    /// 「どちらか一方でも停止（または読めない）なら停止」。ファイルが無い
-    /// ときだけ DB に従う。食い違い・読めないときは注意書きが付く。
+    /// DB: 有効/停止/読めない × ファイル: 無い/有効/停止/再開の途中/壊れている
+    /// の 15 通り。「どちらか一方でも停止（または読めない・再開の途中）なら
+    /// 停止」。ファイルが無いときだけ DB に従う。食い違い・読めない・再開の
+    /// 途中のときは注意書きが付く。
     #[test]
     fn startup_decision_table() {
         use DbStartupState as D;
@@ -709,14 +880,17 @@ mod tests {
             (D::Enabled, F::Absent, true, false),
             (D::Enabled, F::Enabled, true, false),
             (D::Enabled, F::Disabled, false, true),
+            (D::Enabled, F::ResumePending, false, true),
             (D::Enabled, file_corrupt.clone(), false, true),
             (D::Disabled, F::Absent, false, false),
             (D::Disabled, F::Enabled, false, true),
             (D::Disabled, F::Disabled, false, false),
+            (D::Disabled, F::ResumePending, false, true),
             (D::Disabled, file_corrupt.clone(), false, true),
             (db_unreadable.clone(), F::Absent, false, true),
             (db_unreadable.clone(), F::Enabled, false, true),
             (db_unreadable.clone(), F::Disabled, false, true),
+            (db_unreadable.clone(), F::ResumePending, false, true),
             (db_unreadable.clone(), file_corrupt.clone(), false, true),
         ];
         for (db, file, enabled, warns) in table {
@@ -771,6 +945,8 @@ mod tests {
             br#"{"format":2,"writeEnabled":true}"#,
             br#"{"format":1}"#,
             br#"{"format":1,"writeEnabled":"yes"}"#,
+            br#"{"format":1,"writeEnabled":true,"resumePending":true}"#,
+            br#"{"format":1,"writeEnabled":false,"resumePending":"yes"}"#,
         ] {
             std::fs::write(&path, broken).unwrap();
             assert!(
@@ -799,11 +975,66 @@ mod tests {
         assert!(!tmp.exists());
     }
 
+    /// 「再開の途中」の形式と互換 (#439 レビュー P1-1): `resumePending` の無い
+    /// (足す前の) ファイルは従来どおり読め、「再開の途中」は `writeEnabled:
+    /// false` と組で書かれる (項目を知らない読み手にも停止に見える)。
+    #[tokio::test]
+    async fn resume_pending_record_is_a_stop_for_old_and_new_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_file_path(dir.path());
+
+        for (old_format, expected) in [
+            (
+                &br#"{"format":1,"writeEnabled":true,"changedAtUnixMs":1,"changedBy":null}"#[..],
+                FileStartupState::Enabled,
+            ),
+            (
+                br#"{"format":1,"writeEnabled":false,"changedAtUnixMs":1,"changedBy":"admin"}"#,
+                FileStartupState::Disabled,
+            ),
+            (
+                br#"{"format":1,"writeEnabled":false,"resumePending":false}"#,
+                FileStartupState::Disabled,
+            ),
+        ] {
+            std::fs::write(&path, old_format).unwrap();
+            assert_eq!(read_state_file(&path).await, expected);
+        }
+
+        write_state_record(&path, FileRecord::ResumePending, Some("admin"))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_state_file(&path).await,
+            FileStartupState::ResumePending
+        );
+        let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["format"], json!(1), "the format number is unchanged");
+        assert_eq!(
+            raw["writeEnabled"],
+            json!(false),
+            "a reader that ignores resumePending still sees a stop"
+        );
+        assert_eq!(raw["resumePending"], json!(true));
+
+        write_state_file(&path, true, None).await.unwrap();
+        let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(raw.get("resumePending").is_none());
+    }
+
     /// 状態ファイルの場所がディレクトリになっている (書けない・読めない)。
     fn unwritable_state_file(dir: &Path) -> PathBuf {
         let path = state_file_path(dir);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// 状態ファイルの一時ファイルの場所をディレクトリにして、状態ファイルへの
+    /// 書き込みだけを失敗させる (状態ファイル自体はそのまま読める)。
+    fn block_state_file_writes(state_file: &Path) {
+        let mut tmp = state_file.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::fs::create_dir_all(PathBuf::from(tmp)).unwrap();
     }
 
     // --- 停止・再開 -----------------------------------------------------------
@@ -944,6 +1175,19 @@ mod tests {
             "precondition: the DB still says enabled"
         );
 
+        // 再開を試みるが、DB はまだ落ちている (#439 レビュー P1-1)。
+        let resumed = control.set_enabled_with(true, None, db_down()).await;
+        assert!(!resumed.succeeded(), "{resumed:?}");
+        assert!(!control.is_enabled());
+        assert!(
+            load_persisted_enabled(&pool).await.unwrap(),
+            "precondition: the DB recovers still saying enabled"
+        );
+        assert!(
+            !load_startup_decision(&pool, &state_file).await.enabled,
+            "a failed resume must not erase the only record of the stop"
+        );
+
         // 再起動。
         let decision = load_startup_decision(&pool, &state_file).await;
         assert!(!decision.enabled, "the stop must survive the restart");
@@ -951,6 +1195,181 @@ mod tests {
         let control = WriteControl::restore(decision, state_file);
         assert!(!control.is_enabled());
         assert!(control.persistence_warning().is_some());
+    }
+
+    /// 逆のケース (#439 レビュー P1-1): 停止が DB にだけ残り (状態ファイルの
+    /// 保存に失敗し、ファイルは前の「有効」のまま)、そこからの再開がまた
+    /// 状態ファイルの保存に失敗する。再開は失敗し、再起動しても停止のまま。
+    #[tokio::test]
+    async fn a_stop_that_only_reached_the_db_survives_a_failed_resume_and_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = init_db(dir.path().join("registry.sqlite3")).await.unwrap();
+        let state_file = state_file_path(&dir.path().join("data"));
+        write_state_file(&state_file, true, None).await.unwrap();
+        let control = WriteControl::restore(
+            load_startup_decision(&pool, &state_file).await,
+            state_file.clone(),
+        );
+        assert!(control.is_enabled());
+
+        block_state_file_writes(&state_file);
+        let stopped = control.set_enabled(&pool, false, Some("admin")).await;
+        assert!(
+            stopped.succeeded() && stopped.file_error().is_some(),
+            "{stopped:?}"
+        );
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Enabled,
+            "precondition: the file still says enabled; the DB holds the only stop"
+        );
+
+        let resumed = control.set_enabled(&pool, true, Some("admin")).await;
+        assert!(!resumed.succeeded(), "{resumed:?}");
+        assert!(resumed.file_error().is_some());
+        assert!(!control.is_enabled());
+        assert!(
+            !load_persisted_enabled(&pool).await.unwrap(),
+            "the DB (the only stop record) must not be switched to enabled"
+        );
+        assert!(!load_startup_decision(&pool, &state_file).await.enabled);
+    }
+
+    /// 再開の各段の失敗・落ちる時点の総当たり (#439 レビュー P1-1)。停止を
+    /// 記録した状態 (DB と状態ファイルの組み合わせ) から再開して、失敗として
+    /// 返った・確定点より前で落ちた、どの場合も再起動は停止で起動する。
+    /// 対照として、全部成功した再開は有効で起動する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_or_crashed_resume_always_restarts_stopped() {
+        #[derive(Debug, Clone, Copy)]
+        enum Initial {
+            Absent,
+            Enabled,
+            Disabled,
+            ResumePending,
+            Corrupt,
+        }
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Fault {
+            /// 1. 「再開の途中」を状態ファイルに書けない。
+            PendingWriteFails,
+            /// 2. DB の保存が失敗する。
+            DbFails,
+            /// 3. DB は保存できたが、状態ファイルを「有効」にできない。
+            FinalWriteFails,
+            /// 2 の途中で落ちる (DB はまだ書いていない)。
+            CrashBeforeDbCommit,
+            /// 2 の途中で落ちる (DB は書き終えたが、応答が返る前)。
+            CrashAfterDbCommit,
+            /// 対照: 全部成功。
+            None,
+        }
+        // 停止を記録した状態 (DB が有効か, 状態ファイル)。どれも起動時は停止。
+        let initials = [
+            (true, Initial::Disabled), // 停止がファイルにだけ残った (レビューの例)
+            (false, Initial::Enabled), // 停止が DB にだけ残った (逆のケース)
+            (false, Initial::Disabled),
+            (false, Initial::Absent),       // #433 より前からの環境
+            (true, Initial::ResumePending), // 前の再開が途中で終わった
+            (false, Initial::ResumePending),
+            (true, Initial::Corrupt),
+        ];
+        let faults = [
+            Fault::PendingWriteFails,
+            Fault::DbFails,
+            Fault::FinalWriteFails,
+            Fault::CrashBeforeDbCommit,
+            Fault::CrashAfterDbCommit,
+            Fault::None,
+        ];
+        for (db_enabled, initial) in initials {
+            for fault in faults {
+                let case = format!("DB enabled={db_enabled} file={initial:?} fault={fault:?}");
+                let dir = tempfile::tempdir().unwrap();
+                let pool = init_db(dir.path().join("registry.sqlite3")).await.unwrap();
+                let state_file = state_file_path(&dir.path().join("data"));
+                persist_enabled(&pool, db_enabled, None).await.unwrap();
+                std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+                match initial {
+                    Initial::Absent => {}
+                    Initial::Enabled => write_state_file(&state_file, true, None).await.unwrap(),
+                    Initial::Disabled => write_state_file(&state_file, false, None).await.unwrap(),
+                    Initial::ResumePending => {
+                        write_state_record(&state_file, FileRecord::ResumePending, None)
+                            .await
+                            .unwrap()
+                    }
+                    Initial::Corrupt => std::fs::write(&state_file, b"{broken").unwrap(),
+                }
+                let decision = load_startup_decision(&pool, &state_file).await;
+                assert!(!decision.enabled, "precondition (stopped): {case}");
+                let control = WriteControl::restore(decision, state_file.clone());
+
+                if fault == Fault::PendingWriteFails {
+                    block_state_file_writes(&state_file);
+                }
+                let crashed = Arc::new(tokio::sync::Notify::new());
+                let db_future = {
+                    let pool = pool.clone();
+                    let state_file = state_file.clone();
+                    let crashed = crashed.clone();
+                    async move {
+                        match fault {
+                            Fault::DbFails => return Err("database is down".to_string()),
+                            Fault::CrashBeforeDbCommit => {
+                                crashed.notify_one();
+                                std::future::pending::<()>().await;
+                            }
+                            Fault::CrashAfterDbCommit => {
+                                persist_enabled(&pool, true, None).await.unwrap();
+                                crashed.notify_one();
+                                std::future::pending::<()>().await;
+                            }
+                            Fault::FinalWriteFails => {
+                                persist_enabled(&pool, true, None).await.unwrap();
+                                block_state_file_writes(&state_file);
+                            }
+                            Fault::PendingWriteFails | Fault::None => {
+                                persist_enabled(&pool, true, None).await.unwrap();
+                            }
+                        }
+                        Ok(())
+                    }
+                };
+                let resume = control.set_enabled_with(true, None, db_future);
+                let outcome = tokio::select! {
+                    change = resume => Some(change),
+                    // 「落ちる」: 再開の future をそこで捨てる (以後は何も書かない)。
+                    _ = crashed.notified() => None,
+                };
+                let restart = load_startup_decision(&pool, &state_file).await;
+                match (fault, outcome) {
+                    (Fault::None, Some(change)) => {
+                        assert!(change.succeeded(), "{case}: {change:?}");
+                        assert!(control.is_enabled(), "{case}");
+                        assert!(
+                            restart.enabled,
+                            "{case}: a completed resume restarts enabled"
+                        );
+                        assert_eq!(restart.warning, None, "{case}");
+                    }
+                    (Fault::CrashBeforeDbCommit | Fault::CrashAfterDbCommit, None) => {
+                        assert!(!control.is_enabled(), "{case}");
+                        assert!(
+                            !restart.enabled,
+                            "{case}: a crashed resume restarts stopped"
+                        );
+                    }
+                    (_, Some(change)) => {
+                        assert!(!change.succeeded(), "{case}: {change:?}");
+                        assert!(!control.is_enabled(), "{case}");
+                        assert!(!restart.enabled, "{case}: a failed resume restarts stopped");
+                        assert!(restart.warning.is_some() || !db_enabled, "{case}");
+                    }
+                    (_, None) => panic!("{case}: unexpected crash"),
+                }
+            }
+        }
     }
 
     /// 停止の保存がファイルだけ失敗 → DB が停止を覚えているので停止のまま。
@@ -1226,6 +1645,213 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), vec!["stop", "resume"]);
         assert!(control.is_enabled());
         assert_eq!(control.persistence_warning(), None);
+    }
+
+    /// 再開が遅れている停止の DB 書き込みを待っている間に、別の停止が来た
+    /// (#439 レビュー P1-2)。再開は待つ前の世代と比べて割り込みを検出し、
+    /// 何も保存せずにやめる。両方の操作が終わった後、書き込みは止まっている。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_while_the_resume_waits_for_a_lagging_stop_db_write_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        // 停止 A: DB 保存が制限時間を超えて遅れる。
+        let stopped = control
+            .set_enabled_with(
+                false,
+                None,
+                db_held_until(release.clone(), order.clone(), "stop A", Ok(())),
+            )
+            .await;
+        assert!(stopped.db_timed_out && stopped.succeeded(), "{stopped:?}");
+
+        // 再開 B: A の DB 書き込みの完了を待つ。
+        let resume = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        order.lock().unwrap().push("resume B");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!resume.is_finished());
+
+        // 停止 C: B が待っている間に来る。
+        let stop = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(false, None, async move {
+                        order.lock().unwrap().push("stop C");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        release.notify_one();
+        let resumed = resume.await.unwrap();
+        let stopped = stop.await.unwrap();
+        assert!(resumed.interrupted_by_stop, "{resumed:?}");
+        assert!(!resumed.succeeded());
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        assert!(!control.is_enabled(), "the later stop wins");
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["stop A", "stop C"],
+            "the interrupted resume saves nothing"
+        );
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+    }
+
+    /// 再開が `op_lock` そのものを待っている間に停止が来た (#439 レビュー
+    /// P1-2)。再開は割り込みを検出し、両方の操作が終わった後、書き込みは
+    /// 止まっている。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_while_the_resume_waits_for_the_op_lock_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        // 停止 A: DB 保存中 (制限時間内) で `op_lock` を持ったまま。
+        let stop_a = {
+            let control = control.clone();
+            let release = release.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(false, None, db_held_until(release, order, "stop A", Ok(())))
+                    .await
+            })
+        };
+        wait_until("stop A takes effect", || !control.is_enabled()).await;
+
+        // 再開 B: `op_lock` を待つ。
+        let resume = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        order.lock().unwrap().push("resume B");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 停止 C: B が `op_lock` を待っている間に来る (B の後ろに並ぶ)。
+        let stop_c = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(false, None, async move {
+                        order.lock().unwrap().push("stop C");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        release.notify_one();
+        assert!(stop_a.await.unwrap().succeeded());
+        let resumed = resume.await.unwrap();
+        let stopped = stop_c.await.unwrap();
+        assert!(resumed.interrupted_by_stop, "{resumed:?}");
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        assert!(!control.is_enabled(), "the later stop wins");
+        assert_eq!(*order.lock().unwrap(), vec!["stop A", "stop C"]);
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+    }
+
+    /// 停止がライブフラグを落としてから `op_lock` に並ぶまでの間に再開が来て、
+    /// 停止より先に並んだ (#439 レビュー P1-2 の残り)。この再開は停止の後に
+    /// 来たので成功してよいが、後で保存する停止がライブフラグも停止に戻し、
+    /// 「停止が成功したのにライブフラグだけ有効」を残さない。停止の前半
+    /// (`disable`) と後半 (`save_stop`) を分けて、この順序を作る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_that_overtakes_a_stop_in_the_queue_is_undone_by_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let held = control.op_lock.lock().await;
+
+        // 停止 C の前半: ライブフラグを落とす (まだ `op_lock` に並んでいない)。
+        control.disable();
+        // 再開 B: C の後の世代を覚えて、先に `op_lock` に並ぶ。
+        let resume = {
+            let control = control.clone();
+            tokio::spawn(async move { control.set_enabled_with(true, None, db_ok()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // 停止 C の後半: B の後ろに並んで保存する。
+        let stop = {
+            let control = control.clone();
+            tokio::spawn(async move { control.save_stop(None, db_ok()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+
+        let resumed = resume.await.unwrap();
+        let stopped = stop.await.unwrap();
+        assert!(resumed.succeeded(), "{resumed:?}");
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        assert!(
+            !control.is_enabled(),
+            "the stop saved last, so the live flag must match it"
+        );
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
     }
 
     /// 遅れて完了した停止の DB 書き込みは、注意書きを自分の結果で更新する
