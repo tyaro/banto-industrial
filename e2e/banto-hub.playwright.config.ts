@@ -77,7 +77,9 @@ const LOCKED_DOWN_SPECS = [
 	'**/banto-hub-settings-guard.spec.ts',
 	// #441: セッションで開いたストリーム（`/api/v1/stream`）の失効は
 	// ロックダウン済みでしか起きない。
-	'**/banto-hub-stream-revoked.spec.ts'
+	'**/banto-hub-stream-revoked.spec.ts',
+	// #441 レビュー対応: 同じくセッションで開くストリームに close を注入する。
+	'**/banto-hub-stream-injected.spec.ts'
 ];
 
 // chronogazer の `BANTO_E2E_DB_DIR`/`dbDir` と同じ理由（SqliteConnectOptions::

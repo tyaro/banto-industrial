@@ -27,6 +27,13 @@ vi.mock('@banto/admin-core', () => ({
 }));
 
 import { connectTagStream } from './tagMonitorAdmin';
+import {
+	cellDisplayMode,
+	initialStreamView,
+	monitorCellDisplay,
+	streamViewReducer,
+	type StreamViewEvent
+} from './monitorStreamView';
 
 class FakeWebSocket {
 	static readonly CONNECTING = 0;
@@ -218,5 +225,54 @@ describe('connectTagStream: 通常の切断は従来どおり再接続する', (
 		vi.advanceTimersByTime(1000);
 		expect(FakeWebSocket.instances).toHaveLength(3);
 		expect(onHalt).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe('connectTagStream + streamViewReducer: 停止中の表の表示（#441 レビュー対応）', () => {
+	it('良好な値 → 未知の理由の 1008 → 最終受信値の表示 → 再接続ボタン → スナップショットで通常へ', () => {
+		let view = initialStreamView();
+		const dispatch = (event: StreamViewEvent) => {
+			view = streamViewReducer(view, event);
+		};
+		// モニタ画面（`monitor/+page.svelte`）と同じ配線。
+		const stream = connectTagStream(
+			{
+				onData: () => dispatch({ type: 'data' }),
+				onConfigChanged: () => {},
+				onStatusChange: (connected, code) =>
+					dispatch(connected ? { type: 'connected' } : { type: 'disconnected', code }),
+				onHalt: (action) => dispatch({ type: 'halted', action })
+			},
+			() => ['*']
+		);
+		const row = { v: 42, q: 'good', unit: null };
+		const shown = () => monitorCellDisplay(row, cellDisplayMode(view));
+		const snapshot = (v: number) =>
+			latest().onmessage?.({
+				data: JSON.stringify({ op: 'data', values: [{ tag: 'a', v, q: 'good', t: v }] })
+			});
+
+		latest().open();
+		snapshot(42);
+		expect(shown()).toEqual({ value: '42', qualityClass: 'good', qualityLabel: '良好' });
+
+		latest().serverClose(1008, 'e2e_unknown');
+		vi.advanceTimersByTime(WELL_PAST_BACKOFF_MS);
+		expect(FakeWebSocket.instances).toHaveLength(1);
+		expect(shown()).toEqual({
+			value: '42',
+			qualityClass: 'stale',
+			qualityLabel: '陳腐化（受信時: 良好）'
+		});
+
+		// 画面の「再接続」ボタン（`resumeStream`）と同じ順。
+		dispatch({ type: 'resumed' });
+		stream.resume();
+		expect(FakeWebSocket.instances).toHaveLength(2);
+		expect(shown().value).toBe('--');
+		latest().open();
+		expect(shown().value).toBe('--');
+		snapshot(43);
+		expect(shown()).toEqual({ value: '42', qualityClass: 'good', qualityLabel: '良好' });
 	});
 });
