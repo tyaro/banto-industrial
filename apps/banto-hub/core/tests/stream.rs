@@ -27,8 +27,10 @@ use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
-use banto_hub_core::stream::{StreamRevalidationTiming, REVOKED_CLOSE_CODE};
-use banto_hub_core::users::UsersService;
+use banto_hub_core::stream::{
+    StreamRevalidationTiming, REVOKED_CLOSE_CODE, SESSION_REVOKED_REASON,
+};
+use banto_hub_core::users::{Role, UsersService};
 use banto_plc::modbus::simulator::Simulator;
 use banto_server::{start, AuthState, Identity, ServerConfig};
 use banto_tags::{
@@ -155,6 +157,13 @@ struct TestApp {
     manager: std::sync::Arc<CollectorManager>,
     controller: std::sync::Arc<CollectionController>,
     api_keys: ApiKeysService,
+    /// #430: サーバーと同じ `AuthState`（ほかのアカウントのログイン用）。
+    auth: AuthState,
+    /// #430: アカウントの削除・降格・パスワードのリセット用。
+    users: UsersService,
+    /// #430: サーバーと同じ router（`/api/auth/change-password` を
+    /// `tower::ServiceExt::oneshot` で叩く。トークンの表はサーバーと共有）。
+    router: Router,
     _env: TempEnv,
 }
 
@@ -232,6 +241,10 @@ async fn test_app_with(
         .login("admin", "password123")
         .await
         .expect("admin login");
+    // #430: セッションの失効のテストが、ほかのアカウントでログインし、
+    // アカウントを変えるための手綱（`AuthState` はトークンの表を共有する）。
+    let auth_handle = auth.clone();
+    let users_handle = users.clone();
 
     let sessions = std::sync::Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
@@ -316,6 +329,7 @@ async fn test_app_with(
         Some(timing) => router.layer(axum::Extension(timing)),
         None => router,
     };
+    let router_handle = router.clone();
 
     let server = start(
         ServerConfig {
@@ -334,6 +348,9 @@ async fn test_app_with(
         manager,
         controller,
         api_keys,
+        auth: auth_handle,
+        users: users_handle,
+        router: router_handle,
         _env: env,
     }
 }
@@ -1711,9 +1728,15 @@ async fn seed_one_tag(app: &TestApp, sim: &Simulator, value: u16) {
 
 /// API キーで開き、`interval` 購読して最初の値を受け取ったストリーム。
 async fn open_interval_stream(app: &TestApp, key: &str) -> WsStream {
-    let mut ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(key))
+    open_interval_stream_at(app, "/api/v1/stream", key).await
+}
+
+/// `path` を `token`（API キーまたはセッション）で開き、`interval` 購読して
+/// 最初の値を受け取ったストリーム。
+async fn open_interval_stream_at(app: &TestApp, path: &str, token: &str) -> WsStream {
+    let mut ws = connect_ws(&app.ws_url(path), Some(token))
         .await
-        .expect("API-key WS handshake should succeed");
+        .expect("WS handshake should succeed");
     send_json(
         &mut ws,
         json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "interval", "interval_ms": 250 }),
@@ -1865,6 +1888,263 @@ async fn api_key_stream_keeps_delivering_while_the_key_check_does_not_return() {
         (code, reason.as_str()),
         (REVOKED_CLOSE_CODE, "api_key_revoked")
     );
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// #430: セッションで開いたストリームの接続中の再検証（`AuthState::revalidate`、
+// tyaro/banto#239）
+// ---------------------------------------------------------------------------
+
+/// このブロックのテストで作るアカウントのパスワード。
+const TEST_PASSWORD: &str = "password123";
+
+/// セッションで開けるストリームの経路（ロックダウン後）。
+const SESSION_STREAM_PATHS: [&str; 2] = ["/api/tag-stream", "/api/v1/stream"];
+
+/// アカウント `username`（ロール `role`）を作り、ログインしたトークンを返す。
+async fn create_and_login(app: &TestApp, username: &str, role: Role) -> (i64, String) {
+    let user = app
+        .users
+        .create_user(username, TEST_PASSWORD, username, role)
+        .await
+        .expect("create_user");
+    (user.id, login_as(app, username).await)
+}
+
+/// `username` でもう 1 つセッションを作る（ほかの端末）。
+async fn login_as(app: &TestApp, username: &str) -> String {
+    app.auth
+        .login(username, TEST_PASSWORD)
+        .await
+        .expect("login should succeed")
+}
+
+/// `token` で両方の経路を開く（購読はしない）。
+async fn open_session_streams(app: &TestApp, token: &str) -> Vec<WsStream> {
+    let mut streams = Vec::new();
+    for path in SESSION_STREAM_PATHS {
+        streams.push(
+            connect_ws(&app.ws_url(path), Some(token))
+                .await
+                .unwrap_or_else(|err| panic!("session WS handshake on {path}: {err}")),
+        );
+    }
+    streams
+}
+
+/// ストリームが開いていて、ループが止まっていない（ping に pong が返る）。
+async fn assert_open(ws: &mut WsStream) {
+    send_json(ws, json!({ "op": "ping" })).await;
+    let pong = recv_matching(ws, |m| m["op"] == "pong").await;
+    assert_eq!(pong["op"], "pong");
+}
+
+/// すべてのストリームが、1 周期 + 照合 1 回の上限 + 余裕のうちに 1008 /
+/// `session_revoked` で閉じる（同時に待つ）。
+async fn assert_all_closed_as_session_revoked(streams: &mut [WsStream], what: &str) {
+    let closes = futures_util::future::join_all(
+        streams
+            .iter_mut()
+            .map(|ws| wait_for_close(ws, close_bound())),
+    )
+    .await;
+    for (path, (code, reason)) in SESSION_STREAM_PATHS.iter().zip(closes) {
+        assert_eq!(
+            (code, reason.as_str()),
+            (REVOKED_CLOSE_CODE, SESSION_REVOKED_REASON),
+            "{what}: {path}"
+        );
+    }
+}
+
+/// `POST /api/auth/change-password` を `token` で呼ぶ（本番の経路。呼んだ
+/// トークンだけ新しい世代に付け替えられる）。
+async fn change_password_via_rest(app: &TestApp, token: &str, current: &str, new: &str) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/auth/change-password")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Banto-Client", "banto")
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(
+            json!({ "currentPassword": current, "newPassword": new }).to_string(),
+        ))
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+}
+
+async fn admin_id(app: &TestApp) -> i64 {
+    app.users
+        .get_by_username("admin")
+        .await
+        .unwrap()
+        .expect("admin exists")
+        .id
+}
+
+/// 削除・降格・（ほかの端末からの）パスワード変更・リセットのあと、その
+/// アカウントのセッションで開いていたストリーム（`/api/tag-stream` と
+/// `/api/v1/stream`）は 1 周期以内に 1008 / `session_revoked` で閉じる。
+/// ほかのアカウントのストリームは開いたまま。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_streams_close_within_an_interval_after_delete_demote_or_password_change() {
+    let app = test_app_with_revalidation("revalidate-session", TEST_REVALIDATION).await;
+    let admin_id = admin_id(&app).await;
+    let (deleted_id, deleted) = create_and_login(&app, "s-deleted", Role::Editor).await;
+    let (demoted_id, demoted) = create_and_login(&app, "s-demoted", Role::Editor).await;
+    let (_, changed) = create_and_login(&app, "s-changed", Role::Viewer).await;
+    let changer = login_as(&app, "s-changed").await;
+    let (reset_id, reset) = create_and_login(&app, "s-reset", Role::Viewer).await;
+    let (_, bystander) = create_and_login(&app, "s-bystander", Role::Viewer).await;
+
+    let mut deleted_ws = open_session_streams(&app, &deleted).await;
+    let mut demoted_ws = open_session_streams(&app, &demoted).await;
+    let mut changed_ws = open_session_streams(&app, &changed).await;
+    let mut reset_ws = open_session_streams(&app, &reset).await;
+    let mut bystander_ws = open_session_streams(&app, &bystander).await;
+    for ws in deleted_ws
+        .iter_mut()
+        .chain(demoted_ws.iter_mut())
+        .chain(changed_ws.iter_mut())
+        .chain(reset_ws.iter_mut())
+        .chain(bystander_ws.iter_mut())
+    {
+        assert_open(ws).await;
+    }
+
+    app.users.delete_user(deleted_id, admin_id).await.unwrap();
+    assert_all_closed_as_session_revoked(&mut deleted_ws, "delete").await;
+
+    app.users
+        .update_user(demoted_id, "s-demoted", Role::Viewer)
+        .await
+        .unwrap();
+    assert_all_closed_as_session_revoked(&mut demoted_ws, "demote").await;
+
+    // ほかの端末（`changer`）からのパスワード変更。
+    change_password_via_rest(&app, &changer, TEST_PASSWORD, "newpassword456").await;
+    assert_all_closed_as_session_revoked(&mut changed_ws, "password change").await;
+
+    app.users
+        .reset_password(reset_id, "resetpassword789")
+        .await
+        .unwrap();
+    assert_all_closed_as_session_revoked(&mut reset_ws, "password reset").await;
+
+    // ほかのアカウントのストリームは、いくつもの照合を経ても開いたまま。
+    for ws in &mut bystander_ws {
+        assert_open(ws).await;
+    }
+}
+
+/// 自分のパスワード変更では、変更に使ったセッションで開いたストリームは閉じず、
+/// 値の配信が続く（そのトークンは新しい世代に付け替えられる。照合の途中で
+/// 付け替えられる場合は `src/stream.rs` の単体テストで決定的に確かめる）。
+/// 同じアカウントのほかの端末のストリームは閉じる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_stream_survives_its_own_password_change() {
+    let app = test_app_with_revalidation("revalidate-session-self", TEST_REVALIDATION).await;
+    let sim = Simulator::start().await;
+    seed_one_tag(&app, &sim, 13).await;
+    let (_, own) = create_and_login(&app, "s-self", Role::Viewer).await;
+    let other = login_as(&app, "s-self").await;
+
+    let mut own_ws = Vec::new();
+    for path in SESSION_STREAM_PATHS {
+        own_ws.push(open_interval_stream_at(&app, path, &own).await);
+    }
+    let mut other_ws = open_session_streams(&app, &other).await;
+
+    change_password_via_rest(&app, &own, TEST_PASSWORD, "newpassword456").await;
+    // ほかの端末のストリームが閉じた = 変更後の照合が少なくとも 1 回済んだ。
+    assert_all_closed_as_session_revoked(&mut other_ws, "the account's other session").await;
+    // 自分のストリームは、そのあとも値を受け取り続ける（8 個 = 2 秒以上 =
+    // 照合 6 回以上）。
+    for ws in &mut own_ws {
+        receive_values(ws, 8).await;
+        assert_open(ws).await;
+    }
+
+    sim.stop();
+}
+
+/// アカウントを照合できない（DB エラー）あいだは、セッションで開いた
+/// ストリームも値の配信が続き、閉じない。DB が戻った後の照合で失効が分かれば
+/// 閉じる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_streams_keep_delivering_while_the_account_store_errors() {
+    let app = test_app_with_revalidation("revalidate-session-db-error", TEST_REVALIDATION).await;
+    let sim = Simulator::start().await;
+    seed_one_tag(&app, &sim, 14).await;
+    let admin_id = admin_id(&app).await;
+    let (id, token) = create_and_login(&app, "s-db-error", Role::Viewer).await;
+    let mut streams = Vec::new();
+    for path in SESSION_STREAM_PATHS {
+        streams.push(open_interval_stream_at(&app, path, &token).await);
+    }
+
+    // 照合の SELECT（`users` を引く）が失敗するようにする。
+    sqlx::query("ALTER TABLE users RENAME TO users_away")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    // 各 10 個 = 2.5 秒以上。そのあいだに照合（300ms ごと）は何度も失敗する。
+    for ws in &mut streams {
+        receive_values(ws, 10).await;
+    }
+
+    sqlx::query("ALTER TABLE users_away RENAME TO users")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    app.users.delete_user(id, admin_id).await.unwrap();
+    assert_all_closed_as_session_revoked(&mut streams, "delete after the DB is back").await;
+
+    sim.stop();
+}
+
+/// 照合が返らない（DB の接続をすべて塞ぐ）あいだも、セッションで開いた
+/// ストリームは値の配信が続き、閉じない。塞いでいる間にアカウントを消し、
+/// 塞ぎを解いた後の照合で閉じる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_streams_keep_delivering_while_the_account_check_does_not_return() {
+    let app = test_app_with_revalidation("revalidate-session-db-hang", TEST_REVALIDATION).await;
+    let sim = Simulator::start().await;
+    seed_one_tag(&app, &sim, 15).await;
+    let (id, token) = create_and_login(&app, "s-db-hang", Role::Viewer).await;
+    let mut streams = Vec::new();
+    for path in SESSION_STREAM_PATHS {
+        streams.push(open_interval_stream_at(&app, path, &token).await);
+    }
+
+    // 接続プールを使い切る: 照合は接続の取得で止まり、上限（500ms）で打ち切られる。
+    let max = app.pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..max {
+        held.push(
+            tokio::time::timeout(Duration::from_secs(5), app.pool.acquire())
+                .await
+                .expect("acquire should not wait long")
+                .expect("acquire"),
+        );
+    }
+    // 各 12 個 = 3 秒以上。照合（1 周期 800ms: 待ち 300ms + 打ち切り 500ms）は
+    // 3 回以上返らない。
+    for ws in &mut streams {
+        receive_values(ws, 12).await;
+    }
+
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(id)
+        .execute(&mut *held[0])
+        .await
+        .unwrap();
+    drop(held);
+    assert_all_closed_as_session_revoked(&mut streams, "delete after the pool is freed").await;
 
     sim.stop();
 }

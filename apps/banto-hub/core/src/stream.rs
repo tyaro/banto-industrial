@@ -79,22 +79,37 @@
 //!
 //! ## 接続中の再検証（#430、banto #231 / #234 と同じ考え方）
 //!
-//! 認証（`crate::rest::require_tag_space_auth`）は**接続したときにしか**
-//! 走らない。ストリームは切断まで開いたままなので、失効したキーでも値の配信
-//! を受け取り続けてしまう。そこで各ストリームが [`REVALIDATE_INTERVAL`]
-//! （15 秒）ごとに自分の資格情報を照合し直し、使えないと**確認できたら**
-//! close フレーム（[`REVOKED_CLOSE_CODE`] = 1008 Policy Violation、理由文に
-//! `api_key_revoked` / `api_key_expired` / `api_key_tripped` /
-//! `api_key_not_found`）で閉じる。
+//! 認証（`crate::rest::require_tag_space_auth` /
+//! `crate::rest` の `require_auth_or_commissioning`）は**接続したときにしか**
+//! 走らない。ストリームは切断まで開いたままなので、失効したキー・セッション
+//! でも値の配信を受け取り続けてしまう。そこで各ストリームが
+//! [`REVALIDATE_INTERVAL`]（15 秒）ごとに自分の資格情報を照合し直し、使えないと
+//! **確認できたら** close フレーム（[`REVOKED_CLOSE_CODE`] = 1008 Policy
+//! Violation）で閉じる。理由文は API キーなら `api_key_revoked` /
+//! `api_key_expired` / `api_key_tripped` / `api_key_not_found`、セッションなら
+//! [`SESSION_REVOKED_REASON`]（`session_revoked`）。
 //!
-//! - **対象**: いまは API キーで開いたストリーム（`/api/v1/stream`）だけ。
-//!   照合は `crate::api_keys::ApiKeysService::check` →
-//!   `crate::api_keys::api_key_verdict`（#434 / #435 と同じ分類）。
-//!   セッションで開いたストリーム（`/api/v1/stream` のセッション・
-//!   `/api/tag-stream`）は、今は従来どおり接続時の検証だけ - banto-server の
-//!   `AuthState::revalidate`（アイドルのタイマーを延ばさない照合）が
-//!   公開されたら（tyaro/banto#239）、[`StreamCredential`] の実装を 1 つ
-//!   足して同じ仕組みに差し込む（`TODO(#239)`、[`ws_upgrade`] 参照）。
+//! - **API キーで開いたストリーム**（`/api/v1/stream`）: 照合は
+//!   `crate::api_keys::ApiKeysService::check` →
+//!   `crate::api_keys::api_key_verdict`（#434 / #435 と同じ分類、
+//!   [`ApiKeyStreamCredential`]）。
+//! - **セッションで開いたストリーム**（`/api/v1/stream` のセッション経路と
+//!   `/api/tag-stream`。ロックダウン後にセッションで開けるものすべて）:
+//!   照合は banto-server の `AuthState::revalidate`（tyaro/banto#239、
+//!   [`SessionStreamCredential`]）。`authenticate` と同じ判定 - アカウントの
+//!   削除・行 ID か世代（`auth_epoch`）の変化（降格・パスワード変更・
+//!   リセット）、ログアウト・期限切れで `Ok(None)`、DB が答えられなければ
+//!   `Err` でトークンは残す、**照合の途中で自分のパスワード変更によって
+//!   付け替えられたトークンは有効** - だが、**アイドルのタイマーを延ばさない**
+//!   （開いているタブのストリームが、放置されたセッションを生かし続けない
+//!   ため）。したがって、ほかの操作が無いままアイドルの期限（通常 1 時間）が
+//!   来たセッションのストリームも、次の照合で閉じる（管理 UI はどの画面でも
+//!   REST を定期的に呼ぶので、画面を開いている間は期限が来ない）。
+//! - **アカウントに紐づかないストリーム**: 試運転モード（ロックダウン前）の
+//!   `/api/tag-stream` はトークン無しで開くので、照合するものが無く、
+//!   [`Revalidator`] を持たない（接続時の判断だけ）。banto-hub は公開閲覧の
+//!   セッションを発行しない（仮にあっても `revalidate` は期限だけを見て
+//!   `Ok(Some)` を返す）。
 //! - **照合できない（DB エラー・タイムアウト）ときは閉じない**。次の期限で
 //!   もう一度照合する。
 //! - **タイマーはストリーム 1 本につき 1 つ**（[`Revalidator`]、
@@ -102,8 +117,9 @@
 //!   `handle_socket` が終われば、期限も照合中の future も一緒に捨てられる。
 //! - 照合 1 回の上限は [`REVALIDATE_TIMEOUT`]（5 秒、周期より短い）。超えたら
 //!   「照合できない」扱い。打ち切った照合の future は捨てるだけで、API キーの
-//!   照合は読み取りのみ（`touch_last_used` も呼ばない）なので、あとから状態を
-//!   変えることはない。
+//!   照合は読み取りのみ（`touch_last_used` も呼ばない）、セッションの照合も
+//!   `users` を読むだけ（トークンの失効・識別情報の更新はメモリ上で、照合の
+//!   結果が出た時点でしか行わない）なので、あとから状態を変えることはない。
 //! - **次の期限は照合が終わった時点から 1 周期後**。照合がどれだけ遅くても、
 //!   2 回の照合の間には必ず 1 周期ぶんの配信の時間がある。さらに banto の SSE
 //!   と違い、照合は `select!` の 1 分岐として**配信と並行に**進める（照合を
@@ -125,6 +141,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
 
 use banto_collect::CollectEvent;
+use banto_core::BantoError;
+use banto_server::{AuthState, AuthenticatedSession};
 
 use crate::api_keys::{
     api_key_verdict, ApiKeyCheck, ApiKeyContext, ApiKeyRejection, ApiKeysService,
@@ -192,8 +210,8 @@ pub enum RecheckVerdict {
 }
 
 /// ストリームを開いた資格情報の照合し直し方。API キー用
-/// （[`ApiKeyStreamCredential`]）とセッション用（`TODO(#239)`）を差し替え
-/// られるようにする。照合は `'static` な future を返す（ストリームの
+/// （[`ApiKeyStreamCredential`]）とセッション用（[`SessionStreamCredential`]）
+/// を差し替えられるようにする。照合は `'static` な future を返す（ストリームの
 /// ループが保持したまま、配信と並行に進めるため）。
 pub trait StreamCredential: Send + Sync + 'static {
     fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict>;
@@ -269,6 +287,64 @@ pub fn api_key_recheck_verdict(check: ApiKeyCheck) -> RecheckVerdict {
     }
 }
 
+/// セッションで開いたストリームが使えないと確認できたときの close フレームの
+/// 理由文。`AuthState::revalidate` の `Ok(None)` は、アカウントの削除・降格・
+/// パスワード変更/リセット（世代の変化）とログアウト・期限切れを区別しない
+/// ので、理由文も 1 つ。
+pub const SESSION_REVOKED_REASON: &str = "session_revoked";
+
+/// セッション（管理 UI のログイン）で開いたストリームの資格情報（#430、
+/// tyaro/banto#239）。`crate::rest` の認証層 - `require_tag_space_auth` の
+/// セッション経路と、ロックダウン済みの `require_auth_or_commissioning` - が、
+/// 照合に通った要求の extensions に載せる（[`Self::new`]）。試運転モードで
+/// トークン無しに通した要求には載らない。
+///
+/// 照合は `AuthState::revalidate`（このモジュールの doc comment「接続中の
+/// 再検証」）。トークンは照合に渡す以外に外へ出さない（フィールドは非公開、
+/// `Debug` も持たない）。持つ期間はストリームが開いている間だけ。
+#[derive(Clone)]
+pub(crate) struct SessionStreamCredential {
+    auth: AuthState,
+    token: String,
+}
+
+impl SessionStreamCredential {
+    pub(crate) fn new(auth: AuthState, token: String) -> Self {
+        Self { auth, token }
+    }
+}
+
+impl StreamCredential for SessionStreamCredential {
+    fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict> {
+        let auth = self.auth.clone();
+        let token = self.token.clone();
+        Box::pin(async move { session_recheck_verdict(auth.revalidate(&token).await) })
+    }
+}
+
+/// `AuthState::revalidate` の結果を再検証の結果に変える純関数。
+///
+/// - `Ok(Some)` → 使える
+/// - `Ok(None)` → 使えないと確認できた（[`SESSION_REVOKED_REASON`] で閉じる）
+/// - `Err` → 照合できない（閉じない。呼び出し側のタイムアウトは
+///   [`Revalidator`] が同じく「照合できない」にする）
+pub fn session_recheck_verdict(
+    result: Result<Option<AuthenticatedSession>, BantoError>,
+) -> RecheckVerdict {
+    match result {
+        Ok(Some(_)) => RecheckVerdict::Valid,
+        Ok(None) => RecheckVerdict::Revoked {
+            reason: SESSION_REVOKED_REASON,
+        },
+        Err(err) => {
+            eprintln!(
+                "banto-hub: ストリームのセッションを照合できませんでした（閉じずに続けます）: {err}"
+            );
+            RecheckVerdict::Unknown
+        }
+    }
+}
+
 /// ストリーム 1 本の再検証のタイマーと、照合中の future（このモジュールの
 /// doc comment「接続中の再検証」）。[`Self::next_verdict`] はキャンセルされても
 /// 状態（期限・照合中の future）を `self` に残すので、`select!` の分岐に
@@ -326,8 +402,8 @@ impl Revalidator {
     }
 }
 
-/// [`Revalidator`] が無いストリーム（`TODO(#239)`: いまはセッション）では
-/// 永久に来ない分岐にする。
+/// [`Revalidator`] が無いストリーム（試運転モードでトークン無しに開いた
+/// `/api/tag-stream`）では永久に来ない分岐にする。
 async fn next_revalidation(revalidator: &mut Option<Revalidator>) -> RecheckVerdict {
     match revalidator {
         Some(revalidator) => revalidator.next_verdict().await,
@@ -358,21 +434,24 @@ pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<TagSpaceState>,
     ctx: Option<Extension<ApiKeyContext>>,
-    credential: Option<Extension<ApiKeyStreamCredential>>,
+    api_key: Option<Extension<ApiKeyStreamCredential>>,
+    session: Option<Extension<SessionStreamCredential>>,
     timing: Option<Extension<StreamRevalidationTiming>>,
 ) -> Response {
     let manager = state.manager;
     let scope = ctx.map(|Extension(ctx)| ctx);
-    // #430: API キーで開いたストリームは接続中も再検証する（このモジュールの
-    // doc comment「接続中の再検証」）。
-    // TODO(#239): セッションで開いたストリーム（`/api/v1/stream` のセッション・
-    // `/api/tag-stream`）は、banto-server の `AuthState::revalidate` が公開
-    // されたら、それを呼ぶ `StreamCredential` を足してここで同じく渡す。今は
-    // 従来どおり接続時の検証だけ。
+    // #430: API キーで開いたストリームも、セッションで開いたストリームも、
+    // 接続中に再検証する（このモジュールの doc comment「接続中の再検証」）。
+    // 1 つの要求に載るのはどちらか一方だけ（認証層が API キーとセッションの
+    // どちらか一方で通す）。どちらも無いのは試運転モードでトークン無しに
+    // 開いた `/api/tag-stream` だけで、照合するものが無いので再検証しない。
     let timing = timing.map(|Extension(timing)| timing).unwrap_or_default();
-    let revalidator = credential.map(|Extension(credential)| {
-        Revalidator::new(Arc::new(credential) as Arc<dyn StreamCredential>, timing)
-    });
+    let credential: Option<Arc<dyn StreamCredential>> = match (api_key, session) {
+        (Some(Extension(api_key)), _) => Some(Arc::new(api_key)),
+        (None, Some(Extension(session))) => Some(Arc::new(session)),
+        (None, None) => None,
+    };
+    let revalidator = credential.map(|credential| Revalidator::new(credential, timing));
     // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
     // doc comment も参照）: `.protocols(["bearer"])` は**選択**であって
     // **無条件エコー**ではない - axum の実装（`WebSocketUpgrade::protocols`）
@@ -1185,8 +1264,8 @@ mod tests {
         );
     }
 
-    /// 資格情報の無いストリーム（`TODO(#239)`: いまはセッション）では再検証の
-    /// 分岐は来ない。
+    /// 資格情報の無いストリーム（試運転モードでトークン無しに開いたもの）では
+    /// 再検証の分岐は来ない。
     #[tokio::test(start_paused = true)]
     async fn a_stream_without_a_credential_never_rechecks() {
         let mut revalidator: Option<Revalidator> = None;
@@ -1265,6 +1344,15 @@ mod tests {
 
     /// `/ws` に、偽の資格情報で再検証する [`handle_socket`] を置いたサーバー。
     async fn serve(probe: Arc<Probe>, timing: StreamRevalidationTiming) -> Server {
+        serve_with(move || probe.credential(), timing).await
+    }
+
+    /// `/ws` に、接続ごとに `credential()` の資格情報で再検証する
+    /// [`handle_socket`] を置いたサーバー。
+    async fn serve_with(
+        credential: impl Fn() -> Arc<dyn StreamCredential> + Clone + Send + Sync + 'static,
+        timing: StreamRevalidationTiming,
+    ) -> Server {
         let dir = crate::test_support::TempDir::new("stream-revalidation");
         let pool = init_db(&dir.path().join("registry.sqlite3"))
             .await
@@ -1283,7 +1371,7 @@ mod tests {
             "/ws",
             axum::routing::get(move |ws: WebSocketUpgrade| {
                 let manager = handler_manager.clone();
-                let credential = probe.credential();
+                let credential = credential();
                 async move {
                     ws.on_upgrade(move |socket| {
                         handle_socket(
@@ -1445,5 +1533,257 @@ mod tests {
         );
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.dropped.load(Ordering::SeqCst), 1);
+    }
+
+    // --- セッションの照合（`AuthState::revalidate`、tyaro/banto#239） --------
+
+    /// `AuthState::revalidate` の戻り値の契約どおりに分ける。
+    #[test]
+    fn session_results_map_to_recheck_verdicts() {
+        let session = AuthenticatedSession {
+            identity: banto_server::Identity {
+                id: "alice".to_string(),
+                name: "Alice".to_string(),
+                role: "editor".to_string(),
+            },
+            public_viewer: false,
+            stamp: None,
+        };
+        assert_eq!(
+            session_recheck_verdict(Ok(Some(session))),
+            RecheckVerdict::Valid
+        );
+        assert_eq!(
+            session_recheck_verdict(Ok(None)),
+            RecheckVerdict::Revoked {
+                reason: SESSION_REVOKED_REASON
+            }
+        );
+        assert_eq!(
+            session_recheck_verdict(Err(BantoError::Storage("db down".to_string()))),
+            RecheckVerdict::Unknown
+        );
+    }
+
+    /// 照合（`SessionLookup`）を途中で止められる、アカウント 1 つの保存先。
+    struct AccountStore {
+        account: Mutex<Option<banto_server::SessionAccount>>,
+        /// 次の照合を 1 回だけ止める: 照合に入ったら 1 つ目を送り、2 つ目を
+        /// 待ってから答える。
+        gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        /// 照合を返らなくする（DB が答えない）。
+        hang: std::sync::atomic::AtomicBool,
+        /// 始めた照合の数。
+        lookups: AtomicUsize,
+        /// いま進行中の照合の数（終わるか、捨てられたら減る）。
+        in_flight: AtomicUsize,
+    }
+
+    impl AccountStore {
+        fn new(account: banto_server::SessionAccount) -> Arc<Self> {
+            Arc::new(Self {
+                account: Mutex::new(Some(account)),
+                gate: Mutex::new(None),
+                hang: std::sync::atomic::AtomicBool::new(false),
+                lookups: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+            })
+        }
+
+        fn set(&self, account: banto_server::SessionAccount) {
+            *self.account.lock().unwrap() = Some(account);
+        }
+
+        /// 次の照合を止める。戻り値は（照合に入った合図, 答えさせる合図）。
+        fn hold_next_lookup(
+            &self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *self.gate.lock().unwrap() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
+    }
+
+    struct LookupInFlight(Arc<AccountStore>);
+
+    impl Drop for LookupInFlight {
+        fn drop(&mut self) {
+            self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 世代 `epoch` のアカウント `alice`（行 ID 7）。
+    fn alice(epoch: i64) -> banto_server::SessionAccount {
+        banto_server::SessionAccount {
+            identity: banto_server::Identity {
+                id: "alice".to_string(),
+                name: "Alice".to_string(),
+                role: "editor".to_string(),
+            },
+            stamp: banto_server::SessionStamp {
+                account_id: 7,
+                auth_epoch: epoch,
+            },
+        }
+    }
+
+    /// `store` をアカウントの保存先にした、照合付きの `AuthState`（本番の
+    /// `crate::rest::user_auth_state` と同じ `SessionValidation::Lookup`）。
+    fn auth_over(store: Arc<AccountStore>) -> AuthState {
+        AuthState::new(
+            |_u: String, _p: String| -> futures_util::future::BoxFuture<'static, Option<banto_server::Identity>> {
+                Box::pin(async { None })
+            },
+            banto_server::SessionValidation::lookup(
+                move |_username: String| -> futures_util::future::BoxFuture<
+                    'static,
+                    Result<Option<banto_server::SessionAccount>, BantoError>,
+                > {
+                    let store = store.clone();
+                    store.lookups.fetch_add(1, Ordering::SeqCst);
+                    store.in_flight.fetch_add(1, Ordering::SeqCst);
+                    let guard = LookupInFlight(store.clone());
+                    Box::pin(async move {
+                        let _guard = guard;
+                        let gate = store.gate.lock().unwrap().take();
+                        if let Some((entered, release)) = gate {
+                            let _ = entered.send(());
+                            let _ = release.await;
+                        }
+                        if store.hang.load(Ordering::SeqCst) {
+                            std::future::pending::<()>().await;
+                        }
+                        let account = store.account.lock().unwrap().clone();
+                        Ok(account)
+                    })
+                },
+            ),
+        )
+    }
+
+    /// 照合の途中で、そのトークン自身がパスワード変更で新しい世代に付け替え
+    /// られた（`rotate_session_epoch`、`/api/auth/change-password` と同じ）なら、
+    /// 照合は「使える」を返し、ストリームは閉じない。同じアカウントのほかの
+    /// トークン（付け替えられていない）は失効する。
+    #[tokio::test]
+    async fn a_session_rebound_by_its_own_password_change_mid_check_stays_valid() {
+        let store = AccountStore::new(alice(0));
+        let auth = auth_over(store.clone());
+        let own = auth.issue_account_token(alice(0), false);
+        let other = auth.issue_account_token(alice(0), false);
+        let own_credential = SessionStreamCredential::new(auth.clone(), own.clone());
+        let other_credential = SessionStreamCredential::new(auth.clone(), other);
+        assert_eq!(own_credential.recheck().await, RecheckVerdict::Valid);
+
+        let (entered, release) = store.hold_next_lookup();
+        let check = tokio::spawn(own_credential.recheck());
+        entered.await.expect("the check should reach the lookup");
+        // 照合が世代 0 のトークンで読みに行っている間に、自分のパスワード変更
+        // （世代 1）でトークンが付け替えられる。
+        store.set(alice(1));
+        assert!(auth.rotate_session_epoch(&own, alice(0).stamp, 1));
+        release.send(()).unwrap();
+        assert_eq!(check.await.unwrap(), RecheckVerdict::Valid);
+
+        // 付け替えられたトークンは、その後の照合でも使える。
+        assert_eq!(own_credential.recheck().await, RecheckVerdict::Valid);
+        // ほかの端末のトークンは世代 0 のままなので失効する。
+        assert_eq!(
+            other_credential.recheck().await,
+            RecheckVerdict::Revoked {
+                reason: SESSION_REVOKED_REASON
+            }
+        );
+    }
+
+    /// 対照: 照合の途中で世代が進んでも、そのトークンが付け替えられて
+    /// いなければ（ほかの端末からのパスワード変更・降格など）失効する。
+    #[tokio::test]
+    async fn a_session_whose_account_changed_mid_check_is_revoked() {
+        let store = AccountStore::new(alice(0));
+        let auth = auth_over(store.clone());
+        let token = auth.issue_account_token(alice(0), false);
+        let credential = SessionStreamCredential::new(auth.clone(), token);
+
+        let (entered, release) = store.hold_next_lookup();
+        let check = tokio::spawn(credential.recheck());
+        entered.await.expect("the check should reach the lookup");
+        store.set(alice(1));
+        release.send(()).unwrap();
+        assert_eq!(
+            check.await.unwrap(),
+            RecheckVerdict::Revoked {
+                reason: SESSION_REVOKED_REASON
+            }
+        );
+    }
+
+    /// 生きている数を数える資格情報の包み（中身の照合はそのまま使う）。
+    struct Tracked {
+        inner: SessionStreamCredential,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl StreamCredential for Tracked {
+        fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict> {
+            self.inner.recheck()
+        }
+    }
+
+    /// セッションで開いたストリームも、クライアントが切断したら、照合中の
+    /// ものも含めて再検証が止まる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_stream_stops_rechecking_on_disconnect() {
+        let store = AccountStore::new(alice(0));
+        store.hang.store(true, Ordering::SeqCst);
+        let auth = auth_over(store.clone());
+        let token = auth.issue_account_token(alice(0), false);
+        let live = Arc::new(AtomicUsize::new(0));
+        let make = {
+            let live = live.clone();
+            move || -> Arc<dyn StreamCredential> {
+                live.fetch_add(1, Ordering::SeqCst);
+                Arc::new(Tracked {
+                    inner: SessionStreamCredential::new(auth.clone(), token.clone()),
+                    live: live.clone(),
+                })
+            }
+        };
+        let server = serve_with(make, timing(50, 10_000)).await;
+        let ws = connect(&server).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || store
+                .in_flight
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "a session check should be in flight"
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+
+        drop(ws);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                live.load(Ordering::SeqCst) == 0 && store.in_flight.load(Ordering::SeqCst) == 0
+            })
+            .await,
+            "the stream's session credential and its in-flight check should be dropped on disconnect"
+        );
+        assert_eq!(store.lookups.load(Ordering::SeqCst), 1);
     }
 }

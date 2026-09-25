@@ -4,8 +4,9 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-25（#430: API キーで開いた WebSocket ストリームを接続中も 15 秒ごとに再検証し、
-失効・期限切れ・トリップで閉じる。セッションで開いたストリームは未対応。banto-hub-operations.md §1・§3 を更新）。
+最終更新: 2026-09-25（#430: 開いている WebSocket ストリームを接続中も 15 秒ごとに再検証し、
+API キーは失効・期限切れ・トリップで、セッションは削除・降格・パスワード変更/リセットで閉じる
+（セッションは banto v1.7.1 の `AuthState::revalidate`）。banto-hub-operations.md §1・§3 を更新）。
 同日: 追従先を banto **v1.7.1** に上げた。グリッドの初回クリックの修正 banto #236 を取り込む。
 2026-09-24（banto v1.7.0 に追従し、ユーザーの削除・降格・パスワード変更・
 リセットでそのアカウントのセッションを失効させた（banto #204、banto-hub v0.2.0-alpha.24。
@@ -263,9 +264,10 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   セッション経路。API キーは対象外、試運転モードはトークンを発行しないので対象外）。
   **未保存の変更の確認（banto #214）の画面への適用は次の PR**。運用上の説明は
   [banto-hub-operations.md](banto-hub-operations.md) §1「ログインセッションの失効」。
-  **開いている WebSocket ストリーム（#430）**: API キーで開いたものは 15 秒ごとに再検証し、
-  失効・期限切れ・トリップで close `1008` — 実装済み。セッションで開いたもの（`/api/tag-stream`
-  を含む）は接続時の照合だけ（banto の `AuthState::revalidate` の公開、tyaro/banto#239 待ち）。
+  **開いている WebSocket ストリーム（#430）— 実装済み**: 15 秒ごとに再検証し、API キーで開いたものは
+  失効・期限切れ・トリップで、セッションで開いたもの（`/api/tag-stream` を含む）は削除・降格・
+  パスワード変更/リセットで close `1008`（セッションは banto v1.7.1 の `AuthState::revalidate`、
+  tyaro/banto#239）。試運転モードでトークン無しに開いたストリームは対象外（照合するものが無い）。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

@@ -316,6 +316,15 @@ async fn require_auth_or_commissioning(
         GateDecision::Allow => {
             if let Some(session) = session {
                 req.extensions_mut().insert(session);
+                // #430: `/api/tag-stream` をセッションで開いたときも、接続中に
+                // 同じトークンを照合し直せるよう材料を載せる
+                // （`crate::stream::SessionStreamCredential`）。試運転モードで
+                // 素通しした要求（上の早期 return）には載らない。
+                req.extensions_mut()
+                    .insert(crate::stream::SessionStreamCredential::new(
+                        gate.auth.clone(),
+                        token,
+                    ));
             }
             next.run(req).await
         }
@@ -9582,6 +9591,14 @@ async fn require_tag_space_auth(
             Ok(Some(_)) if is_write_route => session_token_cannot_write_response(),
             Ok(Some(session)) => {
                 req.extensions_mut().insert(session);
+                // #430: `/api/v1/stream` をセッションで開いたときも、接続中に
+                // 同じトークンを照合し直せるよう材料を載せる
+                // （`crate::stream::SessionStreamCredential`）。
+                req.extensions_mut()
+                    .insert(crate::stream::SessionStreamCredential::new(
+                        state.auth.clone(),
+                        token.clone(),
+                    ));
                 next.run(req).await
             }
             Ok(None) => unauthorized_response(),
