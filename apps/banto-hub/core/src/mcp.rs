@@ -82,7 +82,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
-use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
+use crate::api_keys::{api_key_verdict, ApiKeyContext, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, RunMode};
@@ -90,13 +90,13 @@ use crate::hub::CollectorManager;
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::PendingChangesService;
 use crate::rest::{
-    bearer_token, commit_catalog_and_notify, compute_pending_base_fingerprint, compute_status,
-    parse_requested_value, preflight_transaction, run_plc_connection_test, unauthorized_response,
-    validate_grpc_settings_body, validate_mqtt_settings_request, validate_store_settings_request,
-    CollectionGroupPayload, CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse,
-    MqttSettingsRequest, MqttSettingsResponse, PlcConnectionPayload, PlcConnectionResponse,
-    PlcConnectionTestPayload, StoreSettingsRequest, StoreSettingsResponse, TagPayload,
-    TagSpaceState,
+    api_key_rejection_response, bearer_token, commit_catalog_and_notify,
+    compute_pending_base_fingerprint, compute_status, parse_requested_value, preflight_transaction,
+    run_plc_connection_test, unauthorized_response, validate_grpc_settings_body,
+    validate_mqtt_settings_request, validate_store_settings_request, CollectionGroupPayload,
+    CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse, MqttSettingsRequest,
+    MqttSettingsResponse, PlcConnectionPayload, PlcConnectionResponse, PlcConnectionTestPayload,
+    StoreSettingsRequest, StoreSettingsResponse, TagPayload, TagSpaceState,
 };
 use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
@@ -104,7 +104,7 @@ use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 use crate::settings::{MqttSettings, SettingsService, StoreSettings};
 use crate::system_info::SystemInfoSampler;
 use crate::write_audit::WriteAuditService;
-use crate::write_control::{persist_enabled, WriteControl};
+use crate::write_control::WriteControl;
 use crate::write_path::{execute_write, execute_write_batch, WriteDeps};
 use crate::write_rate::WriteRateLimiter;
 use banto_server::ServerEvent;
@@ -336,11 +336,12 @@ pub(crate) fn mcp_router(
 }
 
 /// `POST /mcp`専用の認証ミドルウェア - このモジュールの doc comment
-/// 「認証」節参照。`crate::rest::require_tag_space_auth`と違い、失敗系統は
-/// 一律 401 に潰す（revoked/tripped/expired/NotFound/セッション token の
-/// 区別を audit へ残す必要はここでは無い - 個々のツールのスコープ拒否は
-/// `tools/call`の結果として`isError`で返るので、HTTP 層は「認証できたか」
-/// だけを見ればよい）。
+/// 「認証」節参照。`crate::rest::require_tag_space_auth`と違い、拒否の監査
+/// （denied）は残さない（個々のツールのスコープ拒否は `tools/call`の結果として
+/// `isError`で返るので、HTTP 層は「認証できたか」だけを見ればよい）。応答は
+/// REST と同じ変換（#435、`crate::rest::api_key_rejection_response`）:
+/// 失効・期限切れ・存在しない・セッション token は 401、トリップは 403
+/// `key_tripped`、照合できない（#434）は 500。
 async fn require_mcp_auth(
     State(state): State<McpAuthState>,
     mut req: axum::extract::Request,
@@ -354,8 +355,8 @@ async fn require_mcp_auth(
         return unauthorized_response();
     }
     let now_ms = state.manager.clock().now_ms();
-    match state.api_keys.lookup(&token, now_ms).await {
-        Ok(ApiKeyLookup::Valid(ctx)) => {
+    match api_key_verdict(state.api_keys.check(&token, now_ms).await) {
+        Ok(ctx) => {
             if let Err(err) = state
                 .api_keys
                 .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
@@ -366,13 +367,12 @@ async fn require_mcp_auth(
             req.extensions_mut().insert(ctx);
             next.run(req).await
         }
-        // Revoked/Tripped/Expired/NotFound はいずれも一律 401
-        // （このモジュールの doc comment「認証」節参照）。
-        Ok(_) => unauthorized_response(),
-        Err(err) => {
-            eprintln!("banto-hub: MCP 用 API キー照合に失敗しました: {err}");
-            unauthorized_response()
-        }
+        // #435: 使えないキーの応答は REST のタグ空間と同じ変換
+        // （`crate::rest::api_key_rejection_response`）。JSON-RPC に入る前の
+        // HTTP 層の失敗なので、本文も REST と同じ形: 失効・期限切れ・存在しない
+        // は 401、トリップは 403 `key_tripped`（以前は 401）、照合できない
+        // （#434）は 500。
+        Err((rejection, _denied)) => api_key_rejection_response(rejection),
     }
 }
 
@@ -3207,7 +3207,7 @@ async fn tool_delete_tag(
 // レジストリの内容が変わる mutation 専用の経路）。REST の
 // `crate::rest::collection_start`/`collection_stop`/`write_control_set`と
 // 全く同じ呼び出し（`state.status.controller.start/stop`・
-// `state.write_control.enable/disable` + `persist_enabled`）を行い、
+// `state.write_control.set_enabled`）を行い、
 // 監査の宛先だけが違う（[`audit_config_action`]のdoc comment参照）。
 // 可逆操作なので他の構成ツールと違い confirm は要求しない（設計の
 // confirm 必須は delete 系の不可逆操作限定）。
@@ -3282,57 +3282,38 @@ async fn tool_set_write_control(
         .and_then(Value::as_bool)
         .ok_or_else(|| RpcError::invalid_params("arguments.enabled (boolean) is required"))?;
 
-    // `crate::rest::write_control_set`と同じ非対称な扱い（#340 レビュー
-    // 対応、2026-09-14）: `enabled_persisted` は次回起動時のライブ値
-    // そのものになったため、永続化の失敗を握りつぶして成功を返すと
-    // 「今は効いているが再起動すると黙って元に戻る」状態を作ってしまう。
-    // disable（非常停止）はライブフラグを先に落としてから永続化を試み、
-    // 失敗しても無効化自体は有効（fail-closed）。enable は永続化に
-    // 成功したときだけライブフラグを立てる（失敗時は disabled のまま）。
-    if enabled {
-        if let Err(err) =
-            persist_enabled(&state.manager.pool(), true, Some(ctx.name.as_str())).await
-        {
-            audit_write_control_failure(state, ctx, "enable", true, err.to_string()).await;
-            return Ok(tool_error("永続化に失敗したため有効化しませんでした。"));
-        }
-        state.write_control.enable();
-    } else {
-        state.write_control.disable();
-        if let Err(err) =
-            persist_enabled(&state.manager.pool(), false, Some(ctx.name.as_str())).await
-        {
-            audit_write_control_failure(state, ctx, "disable", false, err.to_string()).await;
-            return Ok(tool_error(
-                "書き込み受付は無効化しましたが永続化に失敗したため再起動後は前回の永続値に戻ります。",
-            ));
-        }
+    // `crate::rest::write_control_set`と同じ扱い（#340・#433）: 停止・再開の
+    // 本体は `WriteControl::set_enabled`（DB と状態ファイルの 2 か所に保存。
+    // `crate::write_control` のモジュール doc 参照）。停止はライブフラグを
+    // 必ず即座に落とし、どちらか一方に保存できれば成功（片方の失敗は
+    // `persistenceWarning` に出す）。再開は両方に保存できたときだけ有効にする。
+    let change = state
+        .write_control
+        .set_enabled(&state.manager.pool(), enabled, Some(ctx.name.as_str()))
+        .await;
+    let action = if enabled { "enable" } else { "disable" };
+    let detail = crate::rest::write_control_audit_detail(&change);
+
+    if !change.succeeded() {
+        audit_write_control_failure(state, ctx, action, detail).await;
+        return Ok(tool_error(change.warning().unwrap_or_default()));
     }
 
-    audit_config_action(
-        state,
-        ctx,
-        if enabled { "enable" } else { "disable" },
-        "write_control",
-        Some("1"),
-        Some(json!({ "writeEnabled": enabled, "persisted": true })),
-    )
-    .await;
-    Ok(tool_ok(
-        json!({ "writeEnabled": state.write_control.is_enabled() }),
-    ))
+    audit_config_action(state, ctx, action, "write_control", Some("1"), Some(detail)).await;
+    Ok(tool_ok(json!({
+        "writeEnabled": state.write_control.is_enabled(),
+        "persistenceWarning": change.warning(),
+    })))
 }
 
-/// [`tool_set_write_control`] の永続化失敗時の監査行 - [`audit_config_action`]
-/// （成功専用、`result: "ok"` 固定）とは別に、`result: "failed"` と
-/// `detail.persisted = false` / `detail.error` を記録する
+/// [`tool_set_write_control`] の失敗時の監査行 - [`audit_config_action`]
+/// （成功専用、`result: "ok"` 固定）とは別に、`result: "failed"` を記録する
 /// （`crate::rest::record_write_control_failure` と同じ形）。
 async fn audit_write_control_failure(
     state: &McpState,
     ctx: &ApiKeyContext,
     action: &str,
-    enabled: bool,
-    error: String,
+    detail: Value,
 ) {
     state
         .audit
@@ -3342,7 +3323,7 @@ async fn audit_write_control_failure(
             action,
             resource: "write_control",
             entity_id: Some("1"),
-            detail: Some(json!({ "enabled": enabled, "persisted": false, "error": error })),
+            detail: Some(detail),
             origin: "mcp",
             result: "failed",
         })

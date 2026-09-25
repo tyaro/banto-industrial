@@ -38,7 +38,7 @@ use banto_hub_core::rest::api_router;
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
-use banto_hub_core::write_control::WriteControl;
+use banto_hub_core::write_control::{self, WriteControl};
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 use banto_plc::slmp::address::SlmpDevice;
 use banto_plc_write::slmp::simulator::Simulator;
@@ -176,6 +176,8 @@ struct TestApp {
     /// exercise the broker session below `write_path::execute_write`'s own
     /// gates.
     sessions: Arc<HubSessions>,
+    /// #433: `write_control` の状態ファイル（`env.data_dir()` の中）。
+    state_file: std::path::PathBuf,
     _env: TempEnv,
 }
 
@@ -236,11 +238,20 @@ async fn test_app(label: &str) -> TestApp {
     manager.rebuild().await.expect("initial rebuild");
 
     let (events_tx, _rx) = broadcast::channel(16);
-    // T2-4 (docs/tag-server-design.md §6-6): live flag always constructs
-    // disabled, regardless of persisted state - each test explicitly calls
+    // T2-4 (docs/tag-server-design.md §6-6): this fixture constructs the
+    // live flag disabled - each test explicitly calls
     // `write_control.enable()` when it needs writes accepted (or exercises
     // the REST enable endpoint directly, see `rest_enable_disable_round_trip`).
-    let write_control = Arc::new(WriteControl::new(false));
+    // #433: built the way `crate::runtime` builds it (with the state file in
+    // the data dir), so the REST tests below exercise both saves.
+    let state_file = write_control::state_file_path(&env.data_dir());
+    let write_control = Arc::new(WriteControl::restore(
+        write_control::StartupDecision {
+            enabled: false,
+            warning: None,
+        },
+        state_file.clone(),
+    ));
     let write_audit = WriteAuditService::new(pool.clone());
     let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
     let api_keys = ApiKeysService::new(pool.clone());
@@ -298,6 +309,7 @@ async fn test_app(label: &str) -> TestApp {
         manager,
         write_control,
         sessions,
+        state_file,
         _env: env,
     }
 }
@@ -1576,10 +1588,22 @@ async fn rest_enable_disable_round_trip_and_reflects_in_status() {
         admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["write_enabled"], false);
+    assert_eq!(body["persistence_warning"], Value::Null, "{body:?}");
 
     let (status, json) = get_json(&app.router, "/api/v1/status", &app.admin_token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["write_enabled"], false);
+    assert_eq!(json["write_persistence_warning"], Value::Null);
+
+    // #433: both saves happened - a restart starts stopped without a warning.
+    let decision = write_control::load_startup_decision(&app.pool, &app.state_file).await;
+    assert_eq!(
+        decision,
+        write_control::StartupDecision {
+            enabled: false,
+            warning: None
+        }
+    );
 }
 
 /// #340 レビュー対応（2026-09-14）: `enabled_persisted` が次回起動時の
@@ -1614,29 +1638,98 @@ async fn rest_enable_returns_500_and_stays_disabled_when_persistence_fails() {
     );
 }
 
-/// #340 レビュー対応（2026-09-14）: disable（非常停止）はライブフラグを
-/// 先に落とすため、永続化が失敗しても書き込みは止まったままになる -
-/// 500 `write_control_persist_failed` を返しつつライブフラグは disabled
-/// （止まっている）ことを確認する。上のテストと同じ理由（#204 の要求ごとの
-/// 照合）で、pool を閉じずに `write_control_state` だけを drop する。
+/// #433: 停止を DB に保存できなくても、状態ファイルに保存できれば停止は
+/// 成功（200）で、DB に保存できなかったことを応答・状態・監査に出す。
+/// その後に再起動すると、DB は「有効」のままでも停止で起動する。
+/// 上のテストと同じ理由（#204 の要求ごとの照合）で、pool を閉じずに
+/// `write_control_state` だけを退避させる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rest_disable_returns_500_but_stays_disabled_when_persistence_fails() {
+async fn rest_disable_saved_only_to_the_file_is_200_and_survives_a_restart() {
     let app = test_app("write-control-persist-fail-disable").await;
     app.write_control.enable();
     assert!(app.write_control.is_enabled());
+
+    sqlx::query("ALTER TABLE write_control_state RENAME TO write_control_state_away")
+        .execute(&app.pool)
+        .await
+        .expect("move write_control_state away");
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["write_enabled"], false);
+    let warning = body["persistence_warning"].as_str().expect("a warning");
+    assert!(warning.contains("DB: 失敗"), "{warning}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "disable must fail closed (live flag stays off) even when the DB save fails"
+    );
+
+    let (_, json) = get_json(&app.router, "/api/v1/status", &app.admin_token).await;
+    assert!(json["write_persistence_warning"].is_string(), "{json}");
+
+    let (result, detail): (String, String) = sqlx::query_as(
+        "SELECT result, detail FROM audit_log          WHERE action = 'disable' AND resource = 'write_control' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("disable audit row");
+    let detail: Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(result, "ok");
+    assert_eq!(detail["persisted"], true, "{detail}");
+    assert_eq!(detail["persistedDb"], false, "{detail}");
+    assert_eq!(detail["persistedFile"], true, "{detail}");
+    assert!(detail["dbError"].is_string(), "{detail}");
+
+    // The DB comes back still saying "enabled"; the restart must start stopped.
+    sqlx::query("ALTER TABLE write_control_state_away RENAME TO write_control_state")
+        .execute(&app.pool)
+        .await
+        .expect("restore write_control_state");
+    assert!(write_control::load_persisted_enabled(&app.pool)
+        .await
+        .unwrap());
+    let decision = write_control::load_startup_decision(&app.pool, &app.state_file).await;
+    assert!(!decision.enabled, "the stop survives the restart");
+    assert!(decision.warning.is_some(), "the mismatch is reported");
+}
+
+/// #433: 停止をどちらにも保存できなかったときだけ 500
+/// `write_control_persist_failed`（書き込みは止まったまま）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_disable_saved_nowhere_returns_500_but_stays_disabled() {
+    let app = test_app("write-control-persist-fail-disable-both").await;
+    app.write_control.enable();
 
     sqlx::query("DROP TABLE write_control_state")
         .execute(&app.pool)
         .await
         .expect("drop write_control_state");
+    // A directory where the state file should be: it can be neither written
+    // nor read.
+    std::fs::create_dir_all(&app.state_file).unwrap();
 
     let (status, body) =
         admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
     assert_eq!(body["error"], "write_control_persist_failed");
+    assert!(!app.write_control.is_enabled());
+}
+
+/// #433: 再開は、状態ファイルに書けないと（DB に書けても）停止のまま。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_enable_stays_disabled_when_the_state_file_cannot_be_written() {
+    let app = test_app("write-control-persist-fail-enable-file").await;
+    assert!(!app.write_control.is_enabled());
+    std::fs::create_dir_all(&app.state_file).unwrap();
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/enable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+    assert_eq!(body["error"], "write_control_persist_failed");
     assert!(
         !app.write_control.is_enabled(),
-        "disable must fail closed (live flag stays off) even when persistence fails"
+        "enable must not flip the live flag when the file save fails"
     );
 }
 

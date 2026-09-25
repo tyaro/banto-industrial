@@ -89,7 +89,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::{Config, SwaggerUi};
 
-use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
+use crate::api_keys::{
+    api_key_verdict, ApiKeyContext, ApiKeyRejection, ApiKeysService, IssuedApiKey,
+};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::computed::ComputedEngine;
@@ -314,6 +316,15 @@ async fn require_auth_or_commissioning(
         GateDecision::Allow => {
             if let Some(session) = session {
                 req.extensions_mut().insert(session);
+                // #430: `/api/tag-stream` をセッションで開いたときも、接続中に
+                // 同じトークンを照合し直せるよう材料を載せる
+                // （`crate::stream::SessionStreamCredential`）。試運転モードで
+                // 素通しした要求（上の早期 return）には載らない。
+                req.extensions_mut()
+                    .insert(crate::stream::SessionStreamCredential::new(
+                        gate.auth.clone(),
+                        token,
+                    ));
             }
             next.run(req).await
         }
@@ -434,14 +445,33 @@ fn forbidden_response() -> Response {
 }
 
 /// T2-4（設計 §6-4「トリップ」）: トリップ中の API キーでの
-/// `/api/v1/*` アクセス - read/write いずれも 403。
-/// `crate::rest::require_tag_space_auth` から呼ぶ。
+/// `/api/v1/*` アクセス - read/write いずれも 403。#435 で `/api/sink/*` と
+/// MCP も同じ応答にそろえた（[`api_key_rejection_response`] 経由）。
 fn key_tripped_response() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(json!({ "error": "key_tripped" })),
     )
         .into_response()
+}
+
+/// #435: 使えない API キーへの HTTP 応答。REST のタグ空間 `/api/v1/*`・
+/// サイドカー用の `/api/sink/*`・MCP（`crate::mcp::require_mcp_auth`）が共通で
+/// 使う（gRPC は `crate::grpc::api_key_rejection_status`）。どう拒否するかは
+/// [`crate::api_keys::api_key_verdict`] が決める:
+/// - 失効・期限切れ・存在しない → 401（`ErrorBody::Unauthorized`）
+/// - トリップ → 403 `{"error": "key_tripped"}`（認証はできたが今は使えない。
+///   admin が解除すれば同じキーで戻るので、キーを捨てさせない）
+/// - 照合できない（#434）→ 500（`ApiError`、セッションの照合失敗と同じ形）
+pub(crate) fn api_key_rejection_response(rejection: ApiKeyRejection) -> Response {
+    match rejection {
+        ApiKeyRejection::Unauthenticated(_) => unauthorized_response(),
+        ApiKeyRejection::Tripped => key_tripped_response(),
+        ApiKeyRejection::Unavailable(err) => {
+            eprintln!("banto-hub: API キー照合に失敗しました: {err}");
+            ApiError(err).into_response()
+        }
+    }
 }
 
 /// T2-4（設計 §6-8、実装指示 §5「認証」）: `POST /api/v1/values/{tag}` を
@@ -1499,30 +1529,33 @@ struct WriteControlAdminState {
 
 /// `GET /api/v1/status` の `write_enabled`/`write_was_enabled_before_restart`
 /// と同じ形の応答（`POST /api/write-control/enable|disable` の応答）。
-/// `write_was_enabled_before_restart` は「起動時に永続テーブルから復元した
-/// 値」を指す（フィールド名は外部クライアント Thermal Monitor との互換の
-/// ため変更しない。2026-09-09 オーナー決定 #340）。
+/// `write_was_enabled_before_restart` は「起動時に復元した値」を指す
+/// （フィールド名は外部クライアント Thermal Monitor との互換のため変更
+/// しない。2026-09-09 オーナー決定 #340）。
+/// `persistence_warning`（#433）: 停止が片方にしか保存できなかったとき等の
+/// 説明（[`crate::write_control::WriteControlChange::warning`]）。無ければ `null`。
 #[derive(Debug, Serialize, ToSchema)]
 struct WriteControlStatusResponse {
     write_enabled: bool,
     write_was_enabled_before_restart: bool,
+    persistence_warning: Option<String>,
 }
 
-/// #340 レビュー対応（2026-09-14）: `enabled_persisted` は次回起動時の
-/// ライブ値そのものとして復元されるようになったため（`WriteControl` の
-/// モジュール doc comment参照）、永続化の失敗を握りつぶして 200 を返すと
-/// 「今は効いているが再起動すると黙って元に戻る」状態を作ってしまう。
-/// disable/enable で非対称に扱う:
-/// - **disable（非常停止）**: 先にライブフラグを `disable()` する(DB 障害
-///   があっても書き込みは必ず即座に止まる)。永続化が失敗しても無効化
-///   そのものは成功しているので、その旨を含めた 500 を返す。
-/// - **enable**: 先に `persist_enabled(true)` を試す。失敗したらライブ
-///   フラグには触れない(disabled のまま)。永続化が確認できてから
-///   `enable()` する。
+/// 停止・再開の本体は [`WriteControl::set_enabled`]（#433。DB と状態
+/// ファイルの 2 か所に保存する - `crate::write_control` のモジュール doc 参照）。
+/// このハンドラは結果を応答と監査に変換するだけ:
+/// - **disable（非常停止）**: ライブフラグは必ず即座に落ちる。どちらか一方に
+///   保存できれば 200（再起動しても停止のまま）。片方が失敗したときは
+///   `persistence_warning` にその旨を載せる。両方失敗したときだけ 500
+///   `write_control_persist_failed`（書き込みは止まったまま）。
+/// - **enable**: 両方に保存できたときだけライブフラグを立てて 200。片方でも
+///   失敗したら 500 `write_control_persist_failed`（ライブフラグには触れない）。
+///   保存中、または保存を待っている間に停止が割り込んだら 409
+///   `write_control_stop_interrupted`。
 ///
-/// どちらの分岐でも監査ログは成功/失敗の両方を記録する(失敗時は
-/// `detail.persisted = false` + `detail.error`)。`ServerEvent::ResourceChanged`
-/// はライブ状態が実際に変わった場合にのみ送る。
+/// 監査ログは成功/失敗の両方を記録する（[`write_control_audit_detail`]）。
+/// `ServerEvent::ResourceChanged` は停止では常に（ライブフラグは必ず落ちる）、
+/// 再開では成功したときだけ送る。
 async fn write_control_set(
     state: &WriteControlAdminState,
     headers: &HeaderMap,
@@ -1533,49 +1566,39 @@ async fn write_control_set(
     let identity = actor_identity(headers, &state.auth, &state.commissioning);
     let actor_id = identity.as_ref().map(|i| i.id.as_str());
 
-    if enabled {
-        if let Err(err) =
-            crate::write_control::persist_enabled(&state.manager.pool(), true, actor_id).await
-        {
-            record_write_control_failure(
-                &state.audit,
-                &state.auth,
-                &state.commissioning,
-                headers,
-                action,
-                true,
-                err.to_string(),
-                unverified_stop,
+    let change = state
+        .write_control
+        .set_enabled(&state.manager.pool(), enabled, actor_id)
+        .await;
+    let detail = with_session_exception_mark(write_control_audit_detail(&change), unverified_stop);
+
+    if !enabled || change.succeeded() {
+        let _ = state.events.send(ServerEvent::ResourceChanged {
+            resource: "write_control".to_string(),
+        });
+    }
+
+    if !change.succeeded() {
+        record_write_control_failure(
+            &state.audit,
+            &state.auth,
+            &state.commissioning,
+            headers,
+            action,
+            detail,
+        )
+        .await;
+        if change.interrupted_by_stop {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "write_control_stop_interrupted",
+                    "message": change.warning().unwrap_or_default()
+                })),
             )
-            .await;
-            return write_control_persist_failed_response(
-                "永続化に失敗したため有効化しませんでした。",
-            );
+                .into_response();
         }
-        state.write_control.enable();
-    } else {
-        state.write_control.disable();
-        if let Err(err) =
-            crate::write_control::persist_enabled(&state.manager.pool(), false, actor_id).await
-        {
-            record_write_control_failure(
-                &state.audit,
-                &state.auth,
-                &state.commissioning,
-                headers,
-                action,
-                false,
-                err.to_string(),
-                unverified_stop,
-            )
-            .await;
-            let _ = state.events.send(ServerEvent::ResourceChanged {
-                resource: "write_control".to_string(),
-            });
-            return write_control_persist_failed_response(
-                "書き込み受付は無効化しましたが永続化に失敗したため再起動後は前回の永続値に戻ります。",
-            );
-        }
+        return write_control_persist_failed_response(&change.warning().unwrap_or_default());
     }
 
     record_write(
@@ -1586,36 +1609,61 @@ async fn write_control_set(
         action,
         "write_control",
         "1",
-        Some(with_session_exception_mark(
-            json!({ "enabled": enabled, "persisted": true }),
-            unverified_stop,
-        )),
+        Some(detail),
     )
     .await;
-    let _ = state.events.send(ServerEvent::ResourceChanged {
-        resource: "write_control".to_string(),
-    });
 
     Json(WriteControlStatusResponse {
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+        persistence_warning: change.warning(),
     })
     .into_response()
 }
 
-/// [`write_control_set`] の永続化失敗時の監査行 - `record_write`（成功専用、
-/// `result: "ok"` 固定）とは別に、`result: "failed"` と
-/// `detail.persisted = false` / `detail.error` を記録する。
-#[allow(clippy::too_many_arguments)]
+/// 停止・再開の監査の `detail`（#433）。`persisted` は「再起動後も要求どおり
+/// に残るか」（停止はどちらか一方、再開は両方）。`persistedDb` /
+/// `persistedFile`（状態ファイルを持たない構成では `null`）と、失敗した側の
+/// `dbError` / `fileError`、停止に割り込まれた再開の `interruptedByStop`、
+/// 停止の DB 保存が制限時間を超えた `dbTimedOut`（失敗ではなくタイムアウト。
+/// 書き込みは続いていて遅れて完了し得る - `crate::write_control` のモジュール
+/// doc「停止の DB 保存は 5 秒で打ち切る」）。
+/// MCP（`crate::mcp::tool_set_write_control`）も同じ形を使う。
+pub(crate) fn write_control_audit_detail(
+    change: &crate::write_control::WriteControlChange,
+) -> serde_json::Value {
+    let mut detail = json!({
+        "enabled": change.requested_enabled,
+        "persisted": change.succeeded(),
+        "persistedDb": change.db_saved(),
+        "persistedFile": change.file_saved(),
+    });
+    if let Some(object) = detail.as_object_mut() {
+        if let Some(err) = change.db_error() {
+            object.insert("dbError".to_string(), json!(err));
+        }
+        if let Some(err) = change.file_error() {
+            object.insert("fileError".to_string(), json!(err));
+        }
+        if change.interrupted_by_stop {
+            object.insert("interruptedByStop".to_string(), json!(true));
+        }
+        if change.db_timed_out {
+            object.insert("dbTimedOut".to_string(), json!(true));
+        }
+    }
+    detail
+}
+
+/// [`write_control_set`] の失敗時の監査行 - `record_write`（成功専用、
+/// `result: "ok"` 固定）とは別に、`result: "failed"` を記録する。
 async fn record_write_control_failure(
     audit: &AuditLogService,
     auth: &AuthState,
     commissioning: &CommissioningState,
     headers: &HeaderMap,
     action: &str,
-    enabled: bool,
-    error: String,
-    unverified_stop: bool,
+    detail: serde_json::Value,
 ) {
     let identity = actor_identity(headers, auth, commissioning);
     audit
@@ -1625,10 +1673,7 @@ async fn record_write_control_failure(
             action,
             resource: "write_control",
             entity_id: Some("1"),
-            detail: Some(with_session_exception_mark(
-                json!({ "enabled": enabled, "persisted": false, "error": error }),
-                unverified_stop,
-            )),
+            detail: Some(detail),
             origin: "rest",
             result: "failed",
         })
@@ -6963,8 +7008,8 @@ async fn require_sink_admin(
         return Err(unauthorized_response());
     };
     if token.starts_with("bh_") {
-        match api_keys.lookup(token, now_ms).await {
-            Ok(ApiKeyLookup::Valid(ctx)) => {
+        match api_key_verdict(api_keys.check(token, now_ms).await) {
+            Ok(ctx) => {
                 if let Err(err) = api_keys
                     .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
                     .await
@@ -6979,11 +7024,10 @@ async fn require_sink_admin(
                     Err(forbidden_response())
                 }
             }
-            // Revoked/Tripped/Expired/NotFound はいずれも一律401
-            // （`crate::mcp::require_mcp_auth`と同じ判断 - この2
-            // エンドポイントもサイドカー専用の機械アクセスで、拒否理由の
-            // 細分は必須ではない）。
-            _ => Err(unauthorized_response()),
+            // #435: 使えないキーの応答はタグ空間・MCP と同じ変換
+            // （[`api_key_rejection_response`]）。失効・期限切れ・存在しないは
+            // 401、トリップは 403 `key_tripped`、照合できないは 500（#434）。
+            Err((rejection, _denied)) => Err(api_key_rejection_response(rejection)),
         }
     } else {
         match actor_identity(headers, auth, commissioning) {
@@ -8069,6 +8113,10 @@ pub(crate) struct StatusResponse {
     /// 参照。以後の enable/disable ではこの値自体は変わらない。
     /// 2026-09-09 オーナー決定 #340)。
     write_was_enabled_before_restart: bool,
+    /// #433: 書き込み受付の保存状態の注意書き（起動時に DB と状態ファイルが
+    /// 食い違っていた、直近の停止・再開を片方に保存できなかった等。
+    /// `crate::write_control::WriteControl::persistence_warning`）。無ければ `null`。
+    write_persistence_warning: Option<String>,
     /// T3（設計 §5.3）: MQTT publish の設定/接続状態。
     mqtt: MqttStatusEntry,
     /// T4（設計 §5.4）: gRPC サーバーの設定。
@@ -8224,6 +8272,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
         connections: entries,
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+        write_persistence_warning: state.write_control.persistence_warning(),
         mqtt: MqttStatusEntry {
             enabled: mqtt_settings.enabled,
             connected: state.mqtt.connected(),
@@ -8466,6 +8515,7 @@ struct AdminStatusResponse {
     connections: Vec<AdminConnectionStatusEntry>,
     write_enabled: bool,
     write_was_enabled_before_restart: bool,
+    write_persistence_warning: Option<String>,
     mqtt: MqttStatusEntry,
     grpc: GrpcStatusEntry,
     last_apply: Option<AdminLastApplyEntry>,
@@ -8543,6 +8593,7 @@ impl From<StatusResponse> for AdminStatusResponse {
             connections: status.connections.into_iter().map(Into::into).collect(),
             write_enabled: status.write_enabled,
             write_was_enabled_before_restart: status.write_was_enabled_before_restart,
+            write_persistence_warning: status.write_persistence_warning,
             mqtt: status.mqtt,
             grpc: status.grpc,
             last_apply: status.last_apply.map(Into::into),
@@ -9474,8 +9525,11 @@ async fn require_tag_space_auth(
         // にも last_used_at 更新にも同じ「今」を使う - 呼び出しごとに
         // ずれないよう一度だけ取得する。
         let now_ms = state.manager.clock().now_ms();
-        match state.api_keys.lookup(&token, now_ms).await {
-            Ok(ApiKeyLookup::Valid(ctx)) => {
+        // #435: 使えないキーの応答は `api_key_verdict` →
+        // `api_key_rejection_response` の 1 か所で決める（MCP・サイドカー用と
+        // 共通）。監査（denied）はこの経路だけが残す（従来どおり）。
+        match api_key_verdict(state.api_keys.check(&token, now_ms).await) {
+            Ok(ctx) => {
                 // H10 ③(Option B): この認証層のゲートは「read 系ルートに
                 // 入れるか」だけを見る(has_any_read = 素の read か任意の
                 // read:... を1つでも持つか)。個々のタグの値を読めるかどうか
@@ -9494,66 +9548,40 @@ async fn require_tag_space_auth(
                     eprintln!("banto-hub: API キーの last_used_at 更新に失敗しました: {err}");
                 }
                 req.extensions_mut().insert(ctx);
+                // #430: `/api/v1/stream` が接続中も同じキーを照合し直せるよう、
+                // 照合に使う材料を載せる（`crate::stream::ApiKeyStreamCredential`）。
+                req.extensions_mut()
+                    .insert(crate::stream::ApiKeyStreamCredential::new(
+                        state.api_keys.clone(),
+                        token.clone(),
+                        state.manager.clone(),
+                    ));
                 next.run(req).await
             }
-            Ok(ApiKeyLookup::Revoked { id, name }) => {
-                let method = req.method().as_str().to_string();
-                let path = req.uri().path().to_string();
-                state
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: None,
-                        actor_role: None,
-                        action: "denied",
-                        resource: "api_keys",
-                        entity_id: Some(&id.to_string()),
-                        detail: Some(json!({ "reason": "revoked", "name": name, "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
-                unauthorized_response()
-            }
-            Ok(ApiKeyLookup::Tripped { id, name }) => {
-                let method = req.method().as_str().to_string();
-                let path = req.uri().path().to_string();
-                state
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: None,
-                        actor_role: None,
-                        action: "denied",
-                        resource: "api_keys",
-                        entity_id: Some(&id.to_string()),
-                        detail: Some(json!({ "reason": "tripped", "name": name, "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
-                key_tripped_response()
-            }
-            Ok(ApiKeyLookup::Expired { id, name }) => {
-                let method = req.method().as_str().to_string();
-                let path = req.uri().path().to_string();
-                state
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: None,
-                        actor_role: None,
-                        action: "denied",
-                        resource: "api_keys",
-                        entity_id: Some(&id.to_string()),
-                        detail: Some(json!({ "reason": "expired", "name": name, "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
-                unauthorized_response()
-            }
-            Ok(ApiKeyLookup::NotFound) => unauthorized_response(),
-            Err(err) => {
-                eprintln!("banto-hub: API キー照合に失敗しました: {err}");
-                unauthorized_response()
+            Err((rejection, denied)) => {
+                if let Some(denied) = denied {
+                    let method = req.method().as_str().to_string();
+                    let path = req.uri().path().to_string();
+                    state
+                        .audit
+                        .record(AuditEntry {
+                            actor_username: None,
+                            actor_role: None,
+                            action: "denied",
+                            resource: "api_keys",
+                            entity_id: Some(&denied.id.to_string()),
+                            detail: Some(json!({
+                                "reason": denied.reason,
+                                "name": denied.name,
+                                "method": method,
+                                "path": path
+                            })),
+                            origin: "rest",
+                            result: "denied",
+                        })
+                        .await;
+                }
+                api_key_rejection_response(rejection)
             }
         }
     } else {
@@ -9564,6 +9592,14 @@ async fn require_tag_space_auth(
             Ok(Some(_)) if is_write_route => session_token_cannot_write_response(),
             Ok(Some(session)) => {
                 req.extensions_mut().insert(session);
+                // #430: `/api/v1/stream` をセッションで開いたときも、接続中に
+                // 同じトークンを照合し直せるよう材料を載せる
+                // （`crate::stream::SessionStreamCredential`）。
+                req.extensions_mut()
+                    .insert(crate::stream::SessionStreamCredential::new(
+                        state.auth.clone(),
+                        token.clone(),
+                    ));
                 next.run(req).await
             }
             Ok(None) => unauthorized_response(),
@@ -11090,6 +11126,175 @@ mod tests {
             .find(|row| row.action == "denied" && row.resource == "api_keys")
             .expect("a denied/api_keys audit row should exist");
         assert_eq!(denied.entity_id.as_deref(), Some(id.to_string().as_str()));
+    }
+
+    /// #435: 使えない API キーへの HTTP 応答の表（REST・サイドカー用・MCP で共通の
+    /// 変換）。失効・期限切れ・存在しないは 401、トリップは 403 `key_tripped`、
+    /// 照合できないは 500。
+    #[tokio::test]
+    async fn api_key_rejection_response_table() {
+        use crate::api_keys::{ApiKeyRejection as R, UnauthenticatedReason as U};
+        let table: Vec<(&str, R, StatusCode, serde_json::Value)> = vec![
+            (
+                "revoked",
+                R::Unauthenticated(U::Revoked),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!("unauthorized"),
+            ),
+            (
+                "expired",
+                R::Unauthenticated(U::Expired),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!("unauthorized"),
+            ),
+            (
+                "not found",
+                R::Unauthenticated(U::NotFound),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!("unauthorized"),
+            ),
+            (
+                "tripped",
+                R::Tripped,
+                StatusCode::FORBIDDEN,
+                serde_json::json!("key_tripped"),
+            ),
+            (
+                "unavailable",
+                R::Unavailable(BantoError::Storage("db down".to_string())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!("storage"),
+            ),
+        ];
+        for (label, rejection, status, marker) in table {
+            let response = api_key_rejection_response(rejection);
+            assert_eq!(response.status(), status, "{label}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let got = if body.get("error").is_some() {
+                &body["error"]
+            } else {
+                &body["kind"]
+            };
+            assert_eq!(*got, marker, "{label}: {body}");
+        }
+    }
+
+    /// #434: `GET` を API キーで叩いてステータスと本文を返す。
+    async fn get_with_key(
+        router: &Router,
+        path: &str,
+        key: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::get(path)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// #434: タグ空間 `/api/v1/*` とサイドカー用の `/api/sink/config`。無効な
+    /// キーは DB が答えていれば従来どおり（失効・期限切れ・存在しないは 401、
+    /// タグ空間のトリップは 403 `key_tripped`）。照合そのものができない（DB
+    /// エラー）ときは、どのキーでも 401 ではなく 500（`ApiError`、セッションの
+    /// 照合失敗と同じ形）。
+    #[tokio::test]
+    async fn api_key_check_failure_is_500_while_invalid_keys_stay_401() {
+        let env = test_env().await;
+        let scopes = || vec!["read".to_string(), "admin".to_string()];
+        let valid = env
+            .api_keys
+            .issue("state-valid", scopes(), None)
+            .await
+            .unwrap();
+        let revoked = env
+            .api_keys
+            .issue("state-revoked", scopes(), None)
+            .await
+            .unwrap();
+        env.api_keys.revoke(revoked.id).await.unwrap();
+        let tripped = env
+            .api_keys
+            .issue("state-tripped", scopes(), None)
+            .await
+            .unwrap();
+        env.api_keys.trip(tripped.id).await.unwrap();
+        let expired = env
+            .api_keys
+            .issue("state-expired", scopes(), Some(1))
+            .await
+            .unwrap();
+        let unknown = "bh_ZZZZZZZZ_well-formed-but-unregistered".to_string();
+        // (キー, `/api/v1/tags` の期待, `/api/sink/config` の期待)
+        let keys: Vec<(&str, String, StatusCode, StatusCode)> = vec![
+            ("valid", valid.key, StatusCode::OK, StatusCode::OK),
+            (
+                "revoked",
+                revoked.key,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "tripped",
+                tripped.key,
+                StatusCode::FORBIDDEN,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "expired",
+                expired.key,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "unknown",
+                unknown,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+        for (label, key, tags, sink) in &keys {
+            let (status, body) = get_with_key(&env.router, "/api/v1/tags", key).await;
+            assert_eq!(status, *tags, "tags {label}: {body:?}");
+            let (status, sink_body) = get_with_key(&env.router, "/api/sink/config", key).await;
+            assert_eq!(status, *sink, "sink {label}: {sink_body:?}");
+            // #435: トリップはどちらも 403 `key_tripped`（同じ本文）。
+            if *label == "tripped" {
+                assert_eq!(body["error"], "key_tripped", "{body:?}");
+                assert_eq!(sink_body["error"], "key_tripped", "{sink_body:?}");
+            }
+        }
+
+        sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")
+            .execute(&env.pool)
+            .await
+            .expect("move api_keys away");
+        for (label, key, _, _) in &keys {
+            for path in ["/api/v1/tags", "/api/sink/config"] {
+                let (status, body) = get_with_key(&env.router, path, key).await;
+                assert_eq!(
+                    status,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{path} {label}: the key could not be checked, so it is not a 401: {body:?}"
+                );
+                assert_eq!(body["kind"], "storage", "{path} {label}: {body:?}");
+            }
+        }
     }
 
     // --- H10 ①: 任意の有効期限 ----------------------------------------------

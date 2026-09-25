@@ -522,6 +522,74 @@ async fn invalid_api_key_is_401() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// #434: 各状態のキー（有効・失効・トリップ・期限切れ・存在しない）を DB に作る。
+async fn keys_in_each_state(pool: &SqlitePool) -> Vec<(&'static str, String)> {
+    let service = ApiKeysService::new(pool.clone());
+    let scopes = || vec!["admin".to_string()];
+    let valid = service.issue("state-valid", scopes(), None).await.unwrap();
+    let revoked = service
+        .issue("state-revoked", scopes(), None)
+        .await
+        .unwrap();
+    service.revoke(revoked.id).await.unwrap();
+    let tripped = service
+        .issue("state-tripped", scopes(), None)
+        .await
+        .unwrap();
+    service.trip(tripped.id).await.unwrap();
+    let expired = service
+        .issue("state-expired", scopes(), Some(1))
+        .await
+        .unwrap();
+    vec![
+        ("valid", valid.key),
+        ("revoked", revoked.key),
+        ("tripped", tripped.key),
+        ("expired", expired.key),
+        (
+            "unknown",
+            "bh_ZZZZZZZZ_well-formed-but-unregistered".to_string(),
+        ),
+    ]
+}
+
+/// #434: 無効なキー（失効・トリップ・期限切れ・存在しない）は、DB が答えて
+/// いれば 401 のまま。照合そのものができない（DB エラー）ときは、有効な
+/// キーでも 401 ではなく 500 を返す（キーが無効だと分かったわけではない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_check_failure_is_500_while_invalid_keys_stay_401() {
+    let app = test_app("auth-check-failure").await;
+    let keys = keys_in_each_state(&app.pool).await;
+    for (label, key) in &keys {
+        let (status, body) = mcp_post(&app.router, Some(key), rpc("ping", json!({}))).await;
+        // #435: トリップは「認証はできたが今は使えない」ので 403 `key_tripped`
+        // （REST のタグ空間と同じ。以前の MCP は 401）。
+        let expected = match *label {
+            "valid" => StatusCode::OK,
+            "tripped" => StatusCode::FORBIDDEN,
+            _ => StatusCode::UNAUTHORIZED,
+        };
+        assert_eq!(status, expected, "{label}: {body:?}");
+        if *label == "tripped" {
+            assert_eq!(body["error"], "key_tripped", "{body:?}");
+        }
+    }
+
+    sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")
+        .execute(&app.pool)
+        .await
+        .expect("move api_keys away");
+    for (label, key) in &keys {
+        let (status, body) = mcp_post(&app.router, Some(key), rpc("ping", json!({}))).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{label}: the key could not be checked, so it is not a 401: {body:?}"
+        );
+        assert_eq!(body["kind"], "storage", "{label}: {body:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_token_is_401_not_accepted_for_mcp() {
     let app = test_app("auth-session-token").await;
