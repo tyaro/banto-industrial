@@ -87,7 +87,13 @@
 //! **確認できたら** close フレーム（[`REVOKED_CLOSE_CODE`] = 1008 Policy
 //! Violation）で閉じる。理由文は API キーなら `api_key_revoked` /
 //! `api_key_expired` / `api_key_tripped` / `api_key_not_found`、セッションなら
-//! [`SESSION_REVOKED_REASON`]（`session_revoked`）。
+//! [`SESSION_REVOKED_REASON`]（`session_revoked`）、試運転モードなら
+//! [`COMMISSIONING_ENDED_REASON`]（`commissioning_ended`、#440）。
+//!
+//! 同じ仕組み（[`StreamCredential`] と [`Revalidator`]）を gRPC のストリーミング
+//! （`crate::grpc` の `StreamValues` / `StreamEvents`、#442）も使う。そちらは
+//! close フレームの代わりに、ストリームをステータス（`UNAUTHENTICATED` /
+//! `PERMISSION_DENIED`）で終える。
 //!
 //! - **API キーで開いたストリーム**（`/api/v1/stream`）: 照合は
 //!   `crate::api_keys::ApiKeysService::check` →
@@ -105,11 +111,15 @@
 //!   ため）。したがって、ほかの操作が無いままアイドルの期限（通常 1 時間）が
 //!   来たセッションのストリームも、次の照合で閉じる（管理 UI はどの画面でも
 //!   REST を定期的に呼ぶので、画面を開いている間は期限が来ない）。
-//! - **アカウントに紐づかないストリーム**: 試運転モード（ロックダウン前）の
-//!   `/api/tag-stream` はトークン無しで開くので、照合するものが無く、
-//!   [`Revalidator`] を持たない（接続時の判断だけ）。banto-hub は公開閲覧の
-//!   セッションを発行しない（仮にあっても `revalidate` は期限だけを見て
-//!   `Ok(Some)` を返す）。
+//! - **試運転モードでトークン無しに開いたストリーム**（ロックダウン前の
+//!   `/api/tag-stream`、#440）: 照合は「今も試運転モードか」
+//!   （[`CommissioningStreamCredential`]）。認証層が素通しを決めるのと同じ
+//!   プロセス内のフラグを読むので、ロックダウンの後の最初の照合（1 周期以内）
+//!   で閉じる。この読み取りは失敗しない（「照合できない」は無い）。
+//!   ロックダウンの操作から即座に閉じる通知は持たない（周期の照合だけ。
+//!   運用ガイド docs/banto-hub-operations.md「開いているストリームの再検証」）。
+//!   banto-hub は公開閲覧のセッションを発行しない（仮にあっても `revalidate`
+//!   は期限だけを見て `Ok(Some)` を返す）。
 //! - **照合できない（DB エラー・タイムアウト）ときは閉じない**。次の期限で
 //!   もう一度照合する。
 //! - **タイマーはストリーム 1 本につき 1 つ**（[`Revalidator`]、
@@ -119,7 +129,8 @@
 //!   「照合できない」扱い。打ち切った照合の future は捨てるだけで、API キーの
 //!   照合は読み取りのみ（`touch_last_used` も呼ばない）、セッションの照合も
 //!   `users` を読むだけ（トークンの失効・識別情報の更新はメモリ上で、照合の
-//!   結果が出た時点でしか行わない）なので、あとから状態を変えることはない。
+//!   結果が出た時点でしか行わない）、試運転モードの照合はフラグを読むだけ
+//!   （待たずに終わる）なので、あとから状態を変えることはない。
 //! - **次の期限は照合が終わった時点から 1 周期後**。照合がどれだけ遅くても、
 //!   2 回の照合の間には必ず 1 周期ぶんの配信の時間がある。さらに banto の SSE
 //!   と違い、照合は `select!` の 1 分岐として**配信と並行に**進める（照合を
@@ -148,6 +159,7 @@ use crate::api_keys::{
     api_key_verdict, ApiKeyCheck, ApiKeyContext, ApiKeyRejection, ApiKeysService,
     UnauthenticatedReason,
 };
+use crate::commissioning::CommissioningState;
 use crate::hub::{quality_str, CollectorManager};
 use crate::rest::TagSpaceState;
 use crate::subscribe_core::{
@@ -203,16 +215,51 @@ impl Default for StreamRevalidationTiming {
 pub enum RecheckVerdict {
     /// まだ使える。
     Valid,
-    /// 使えないと確認できた（閉じる）。`reason` は close フレームの理由文。
-    Revoked { reason: &'static str },
+    /// 使えないと確認できた（閉じる）。WebSocket は close フレームの理由文
+    /// （[`RevokedReason::as_str`]）、gRPC はステータス
+    /// （`crate::grpc::revoked_stream_status`）に変える。
+    Revoked { reason: RevokedReason },
     /// 照合できなかった（DB エラー・タイムアウト）。閉じない。
     Unknown,
 }
 
+/// 資格情報が使えないと確認できた理由。どれも、届く経路が 1 つずつある:
+///
+/// | 理由 | 経路 |
+/// | --- | --- |
+/// | `ApiKeyRevoked` / `ApiKeyExpired` / `ApiKeyNotFound` / `ApiKeyTripped` | [`ApiKeyStreamCredential`] → [`api_key_recheck_verdict`]（#434 / #435 と同じ分類） |
+/// | `SessionRevoked` | [`SessionStreamCredential`] → [`session_recheck_verdict`] |
+/// | `CommissioningEnded` | [`CommissioningStreamCredential`] → [`commissioning_recheck_verdict`]（#440） |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokedReason {
+    ApiKeyRevoked,
+    ApiKeyExpired,
+    ApiKeyNotFound,
+    ApiKeyTripped,
+    SessionRevoked,
+    CommissioningEnded,
+}
+
+impl RevokedReason {
+    /// WebSocket の close フレームの理由文。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKeyRevoked => "api_key_revoked",
+            Self::ApiKeyExpired => "api_key_expired",
+            Self::ApiKeyNotFound => "api_key_not_found",
+            Self::ApiKeyTripped => "api_key_tripped",
+            Self::SessionRevoked => SESSION_REVOKED_REASON,
+            Self::CommissioningEnded => COMMISSIONING_ENDED_REASON,
+        }
+    }
+}
+
 /// ストリームを開いた資格情報の照合し直し方。API キー用
-/// （[`ApiKeyStreamCredential`]）とセッション用（[`SessionStreamCredential`]）
-/// を差し替えられるようにする。照合は `'static` な future を返す（ストリームの
-/// ループが保持したまま、配信と並行に進めるため）。
+/// （[`ApiKeyStreamCredential`]）・セッション用（[`SessionStreamCredential`]）・
+/// 試運転モード用（[`CommissioningStreamCredential`]）を差し替えられるように
+/// する。照合は `'static` な future を返す（ストリームのループが保持したまま、
+/// 配信と並行に進めるため）。WebSocket（[`handle_socket`]）と gRPC
+/// （`crate::grpc` の `drive_stream`）が同じ [`Revalidator`] 越しに使う。
 pub trait StreamCredential: Send + Sync + 'static {
     fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict>;
 }
@@ -262,21 +309,21 @@ pub fn api_key_recheck_verdict(check: ApiKeyCheck) -> RecheckVerdict {
         Ok(_) => RecheckVerdict::Valid,
         Err((ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Revoked), _)) => {
             RecheckVerdict::Revoked {
-                reason: "api_key_revoked",
+                reason: RevokedReason::ApiKeyRevoked,
             }
         }
         Err((ApiKeyRejection::Unauthenticated(UnauthenticatedReason::Expired), _)) => {
             RecheckVerdict::Revoked {
-                reason: "api_key_expired",
+                reason: RevokedReason::ApiKeyExpired,
             }
         }
         Err((ApiKeyRejection::Unauthenticated(UnauthenticatedReason::NotFound), _)) => {
             RecheckVerdict::Revoked {
-                reason: "api_key_not_found",
+                reason: RevokedReason::ApiKeyNotFound,
             }
         }
         Err((ApiKeyRejection::Tripped, _)) => RecheckVerdict::Revoked {
-            reason: "api_key_tripped",
+            reason: RevokedReason::ApiKeyTripped,
         },
         Err((ApiKeyRejection::Unavailable(err), _)) => {
             eprintln!(
@@ -334,7 +381,7 @@ pub fn session_recheck_verdict(
     match result {
         Ok(Some(_)) => RecheckVerdict::Valid,
         Ok(None) => RecheckVerdict::Revoked {
-            reason: SESSION_REVOKED_REASON,
+            reason: RevokedReason::SessionRevoked,
         },
         Err(err) => {
             eprintln!(
@@ -342,6 +389,54 @@ pub fn session_recheck_verdict(
             );
             RecheckVerdict::Unknown
         }
+    }
+}
+
+/// 試運転モードでトークン無しに開いたストリームが、ロックダウンで閉じるときの
+/// close フレームの理由文（#440）。
+pub const COMMISSIONING_ENDED_REASON: &str = "commissioning_ended";
+
+/// 試運転モード（ロックダウン前）にトークン無しで開いたストリームの「資格
+/// 情報」（#440）。照合は「今も試運転モードか」。`crate::rest` の
+/// `require_auth_or_commissioning` が、試運転モードで素通しした要求の
+/// extensions に載せる（[`Self::new`]）。
+///
+/// 読むのは、認証層が要求ごとに見るのと同じ [`CommissioningState`]（プロセス
+/// 内の `AtomicBool`）。**素通しを決める述語と、閉じるかを決める述語が同じ**
+/// なので、「新しい接続は認証を求められるのに、古いストリームは開いたまま」
+/// （またはその逆）の食い違いが起きない。この読み取りは失敗しないので、
+/// この資格情報は [`RecheckVerdict::Unknown`] を返さない（DB の
+/// `commissioning.locked_down` は読まない。ロックダウンは
+/// `CommissioningService::lock_down` が DB に保存してからこのフラグを立てる
+/// ので、フラグが立っていれば DB にも保存済み）。
+#[derive(Clone)]
+pub(crate) struct CommissioningStreamCredential {
+    state: CommissioningState,
+}
+
+impl CommissioningStreamCredential {
+    pub(crate) fn new(state: CommissioningState) -> Self {
+        Self { state }
+    }
+}
+
+impl StreamCredential for CommissioningStreamCredential {
+    fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict> {
+        let verdict = commissioning_recheck_verdict(self.state.is_locked_down());
+        Box::pin(std::future::ready(verdict))
+    }
+}
+
+/// 「今ロックダウン済みか」を再検証の結果に変える純関数（#440）。
+/// ロックダウン済み → 使えないと確認できた（[`COMMISSIONING_ENDED_REASON`]
+/// で閉じる）、試運転モードのまま → 使える。
+pub fn commissioning_recheck_verdict(locked_down: bool) -> RecheckVerdict {
+    if locked_down {
+        RecheckVerdict::Revoked {
+            reason: RevokedReason::CommissioningEnded,
+        }
+    } else {
+        RecheckVerdict::Valid
     }
 }
 
@@ -402,8 +497,9 @@ impl Revalidator {
     }
 }
 
-/// [`Revalidator`] が無いストリーム（試運転モードでトークン無しに開いた
-/// `/api/tag-stream`）では永久に来ない分岐にする。
+/// [`Revalidator`] が無いストリームでは永久に来ない分岐にする。本番の経路は
+/// どれも資格情報を載せる（API キー・セッション・試運転モード、#440）ので、
+/// `None` になるのは認証層を通さずに [`handle_socket`] を呼ぶテストだけ。
 async fn next_revalidation(revalidator: &mut Option<Revalidator>) -> RecheckVerdict {
     match revalidator {
         Some(revalidator) => revalidator.next_verdict().await,
@@ -436,20 +532,22 @@ pub(crate) async fn ws_upgrade(
     ctx: Option<Extension<ApiKeyContext>>,
     api_key: Option<Extension<ApiKeyStreamCredential>>,
     session: Option<Extension<SessionStreamCredential>>,
+    commissioning: Option<Extension<CommissioningStreamCredential>>,
     timing: Option<Extension<StreamRevalidationTiming>>,
 ) -> Response {
     let manager = state.manager;
     let scope = ctx.map(|Extension(ctx)| ctx);
-    // #430: API キーで開いたストリームも、セッションで開いたストリームも、
-    // 接続中に再検証する（このモジュールの doc comment「接続中の再検証」）。
-    // 1 つの要求に載るのはどちらか一方だけ（認証層が API キーとセッションの
-    // どちらか一方で通す）。どちらも無いのは試運転モードでトークン無しに
-    // 開いた `/api/tag-stream` だけで、照合するものが無いので再検証しない。
+    // #430 / #440: API キー・セッション・試運転モード（トークン無し）の
+    // どれで開いたストリームも、接続中に再検証する（このモジュールの doc
+    // comment「接続中の再検証」）。1 つの要求に載るのはどれか 1 つだけ
+    // （認証層が API キー・セッション・試運転モードの素通しのどれか 1 つで
+    // 通す）。
     let timing = timing.map(|Extension(timing)| timing).unwrap_or_default();
-    let credential: Option<Arc<dyn StreamCredential>> = match (api_key, session) {
-        (Some(Extension(api_key)), _) => Some(Arc::new(api_key)),
-        (None, Some(Extension(session))) => Some(Arc::new(session)),
-        (None, None) => None,
+    let credential: Option<Arc<dyn StreamCredential>> = match (api_key, session, commissioning) {
+        (Some(Extension(api_key)), _, _) => Some(Arc::new(api_key)),
+        (None, Some(Extension(session)), _) => Some(Arc::new(session)),
+        (None, None, Some(Extension(commissioning))) => Some(Arc::new(commissioning)),
+        (None, None, None) => None,
     };
     let revalidator = credential.map(|credential| Revalidator::new(credential, timing));
     // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
@@ -507,7 +605,7 @@ pub(crate) async fn handle_socket(
                 RecheckVerdict::Revoked { reason } => {
                     let _ = close_tx.try_send(CloseFrame {
                         code: REVOKED_CLOSE_CODE,
-                        reason: reason.into(),
+                        reason: reason.as_str().into(),
                     });
                     false
                 }
@@ -1051,7 +1149,7 @@ fn enqueue(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! #430: 接続中の再検証。照合を差し替えられる [`StreamCredential`] の
     //! 偽物で、[`Revalidator`] の時間の規律（仮想時間）と、[`handle_socket`]
     //! に載せたときの振る舞い（実 WebSocket）を確かめる。実際の API キーでの
@@ -1070,7 +1168,7 @@ mod tests {
 
     /// 偽の照合が返すもの。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Answer {
+    pub(crate) enum Answer {
         Valid,
         Revoked,
         Unknown,
@@ -1079,24 +1177,24 @@ mod tests {
     }
 
     /// 偽の照合の観測点。
-    struct Probe {
+    pub(crate) struct Probe {
         answer: Mutex<Answer>,
         /// 照合 1 回にかかる時間（答えを返す前に待つ）。
         delay: Duration,
         /// 照合を始めた時刻。
         starts: Mutex<Vec<tokio::time::Instant>>,
         /// 始めた照合の数。
-        calls: AtomicUsize,
+        pub(crate) calls: AtomicUsize,
         /// いま進行中の照合の数（終わるか、捨てられたら減る）。
-        in_flight: AtomicUsize,
+        pub(crate) in_flight: AtomicUsize,
         /// 終わらずに捨てられた（打ち切り・切断）照合の数。
-        dropped: AtomicUsize,
+        pub(crate) dropped: AtomicUsize,
         /// 生きている偽の資格情報の数（ストリームが持つ）。
-        live: AtomicUsize,
+        pub(crate) live: AtomicUsize,
     }
 
     impl Probe {
-        fn new(answer: Answer, delay: Duration) -> Arc<Self> {
+        pub(crate) fn new(answer: Answer, delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 answer: Mutex::new(answer),
                 delay,
@@ -1108,11 +1206,11 @@ mod tests {
             })
         }
 
-        fn set(&self, answer: Answer) {
+        pub(crate) fn set(&self, answer: Answer) {
             *self.answer.lock().unwrap() = answer;
         }
 
-        fn credential(self: &Arc<Self>) -> Arc<dyn StreamCredential> {
+        pub(crate) fn credential(self: &Arc<Self>) -> Arc<dyn StreamCredential> {
             self.live.fetch_add(1, Ordering::SeqCst);
             Arc::new(FakeCredential {
                 probe: self.clone(),
@@ -1168,7 +1266,7 @@ mod tests {
                 let verdict = match answer {
                     Answer::Valid => RecheckVerdict::Valid,
                     Answer::Revoked => RecheckVerdict::Revoked {
-                        reason: "api_key_revoked",
+                        reason: RevokedReason::ApiKeyRevoked,
                     },
                     Answer::Unknown => RecheckVerdict::Unknown,
                     Answer::Hang => std::future::pending().await,
@@ -1179,7 +1277,7 @@ mod tests {
         }
     }
 
-    fn timing(interval_ms: u64, timeout_ms: u64) -> StreamRevalidationTiming {
+    pub(crate) fn timing(interval_ms: u64, timeout_ms: u64) -> StreamRevalidationTiming {
         StreamRevalidationTiming {
             interval: Duration::from_millis(interval_ms),
             timeout: Duration::from_millis(timeout_ms),
@@ -1226,7 +1324,7 @@ mod tests {
         assert_eq!(
             revalidator.next_verdict().await,
             RecheckVerdict::Revoked {
-                reason: "api_key_revoked"
+                reason: RevokedReason::ApiKeyRevoked
             }
         );
         assert_eq!(
@@ -1300,25 +1398,25 @@ mod tests {
                     id: key().0,
                     name: key().1,
                 }),
-                revoked("api_key_revoked"),
+                revoked(RevokedReason::ApiKeyRevoked),
             ),
             (
                 ApiKeyCheck::Answered(ApiKeyLookup::Expired {
                     id: key().0,
                     name: key().1,
                 }),
-                revoked("api_key_expired"),
+                revoked(RevokedReason::ApiKeyExpired),
             ),
             (
                 ApiKeyCheck::Answered(ApiKeyLookup::Tripped {
                     id: key().0,
                     name: key().1,
                 }),
-                revoked("api_key_tripped"),
+                revoked(RevokedReason::ApiKeyTripped),
             ),
             (
                 ApiKeyCheck::Answered(ApiKeyLookup::NotFound),
-                revoked("api_key_not_found"),
+                revoked(RevokedReason::ApiKeyNotFound),
             ),
             (
                 ApiKeyCheck::Unavailable(BantoError::Storage("db down".to_string())),
@@ -1327,6 +1425,35 @@ mod tests {
         ];
         for (check, expected) in cases {
             assert_eq!(api_key_recheck_verdict(check), expected);
+        }
+    }
+
+    /// #440: 試運転モードの照合。ロックダウン済みなら閉じる、試運転モードの
+    /// ままなら使える（「照合できない」は無い）。
+    #[test]
+    fn commissioning_state_maps_to_recheck_verdicts() {
+        assert_eq!(commissioning_recheck_verdict(false), RecheckVerdict::Valid);
+        assert_eq!(
+            commissioning_recheck_verdict(true),
+            RecheckVerdict::Revoked {
+                reason: RevokedReason::CommissioningEnded
+            }
+        );
+    }
+
+    /// close フレームの理由文（wire）の表。
+    #[test]
+    fn revoked_reasons_map_to_close_reasons() {
+        let table = [
+            (RevokedReason::ApiKeyRevoked, "api_key_revoked"),
+            (RevokedReason::ApiKeyExpired, "api_key_expired"),
+            (RevokedReason::ApiKeyNotFound, "api_key_not_found"),
+            (RevokedReason::ApiKeyTripped, "api_key_tripped"),
+            (RevokedReason::SessionRevoked, "session_revoked"),
+            (RevokedReason::CommissioningEnded, "commissioning_ended"),
+        ];
+        for (reason, wire) in table {
+            assert_eq!(reason.as_str(), wire);
         }
     }
 
@@ -1447,7 +1574,7 @@ mod tests {
         .expect("close frame within the bound")
     }
 
-    async fn wait_until(bound: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    pub(crate) async fn wait_until(bound: Duration, mut condition: impl FnMut() -> bool) -> bool {
         let deadline = tokio::time::Instant::now() + bound;
         while tokio::time::Instant::now() < deadline {
             if condition() {
@@ -1556,7 +1683,7 @@ mod tests {
         assert_eq!(
             session_recheck_verdict(Ok(None)),
             RecheckVerdict::Revoked {
-                reason: SESSION_REVOKED_REASON
+                reason: RevokedReason::SessionRevoked
             }
         );
         assert_eq!(
@@ -1700,7 +1827,7 @@ mod tests {
         assert_eq!(
             other_credential.recheck().await,
             RecheckVerdict::Revoked {
-                reason: SESSION_REVOKED_REASON
+                reason: RevokedReason::SessionRevoked
             }
         );
     }
@@ -1722,7 +1849,7 @@ mod tests {
         assert_eq!(
             check.await.unwrap(),
             RecheckVerdict::Revoked {
-                reason: SESSION_REVOKED_REASON
+                reason: RevokedReason::SessionRevoked
             }
         );
     }

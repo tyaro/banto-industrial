@@ -284,6 +284,14 @@ async fn require_auth_or_commissioning(
     next: axum::middleware::Next,
 ) -> Response {
     if !gate.commissioning.is_locked_down() {
+        // #440: `/api/tag-stream` をトークン無しで開いたストリームも、接続中に
+        // 「今も試運転モードか」を照合し直し、ロックダウンで閉じる
+        // （`crate::stream::CommissioningStreamCredential`。照合する述語は
+        // この分岐と同じ `is_locked_down`）。
+        req.extensions_mut()
+            .insert(crate::stream::CommissioningStreamCredential::new(
+                gate.commissioning.clone(),
+            ));
         return next.run(req).await;
     }
     let token = bearer_token(req.headers())
@@ -1172,10 +1180,30 @@ struct AuditLogState {
 /// タスクが同じ剪定を回すようになったため、このopportunistic剪定は
 /// もはや無制限成長を防ぐための唯一の保証ではないが、設定変更直後に
 /// 画面を開いた管理者へ即座に反映する効果があるため残している。
+///
+/// `?asOfId=`（任意、#428。chronogazer の #410 と同じ）はスナップショット
+/// 境界（[`crate::audit::AuditLogService::list_as_of`] の doc）。省略すると
+/// 従来どおり全行が対象で、応答の `asOfId` にその時点の最大 `id` が入る。
+/// 本文の `ListParams` は `banto-core` の型でフィールドを足せないので
+/// クエリで受ける。**床（`admin`）は変えていない**（ルーター側の
+/// `RoleGuard`）。
+///
+/// **`asOfId` 付きの取得（世代の 2 ブロック目以降）では剪定しない**（#428）。
+/// 画面は「同じ境界の総件数が世代の最初と変わった = 途中で削除が入った」を
+/// 失効として扱い、続きの読み込みを止める。ここで毎回剪定すると、保持件数の
+/// 上限に張り付いた常駐の banto-hub では記録が 1 件増えるたびに次の取得が
+/// 1 行消し、2 ブロック目以降がほぼ毎回失効する - **ログが一番多いときに
+/// 先頭ブロックより先へ進めなくなる**。剪定は `asOfId` なしの取得（世代の
+/// 最初・「再読み込み」）と、起動時・24 時間ごとの周期タスクに任せる（周期
+/// タスクが読み込みの途中に重なるのはまれで、そのときは失効の検出で扱う）。
 async fn audit_log_list(
     State(state): State<AuditLogState>,
+    Query(query): Query<AuditLogListQuery>,
     Json(params): Json<ListParams>,
-) -> Result<Json<ListResult<crate::audit::AuditLogEntry>>, ApiError> {
+) -> Result<Json<crate::audit::AuditLogList>, ApiError> {
+    if query.as_of_id.is_some() {
+        return Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?));
+    }
     if let Ok(config) = SettingsService::new(state.manager.pool())
         .audit_config()
         .await
@@ -1185,7 +1213,15 @@ async fn audit_log_list(
             .prune(config.retention_days, config.retention_rows)
             .await;
     }
-    Ok(Json(state.audit.list(params).await?))
+    Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?))
+}
+
+/// `POST /api/audit-log/list?asOfId=` のクエリ（#428）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditLogListQuery {
+    #[serde(default)]
+    as_of_id: Option<i64>,
 }
 
 /// `GET /api/audit-log/config`（admin 限定）: 現在の retention 設定。
@@ -15421,6 +15457,218 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 2);
+    }
+
+    /// #428: `asOfId` 付きの取得（2 ブロック目以降）では剪定しない - 上限に
+    /// 張り付いた状態でも、読み込みの途中で行が消えて失効しない。`asOfId`
+    /// なし（世代の最初・再読み込み）では従来どおり剪定する。
+    #[tokio::test]
+    async fn audit_log_list_with_as_of_id_does_not_prune() {
+        let env = test_env().await;
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO audit_log (actor_username, actor_role, action, resource, entity_id, detail, origin, result) \
+                 VALUES ('admin', 'admin', 'create', 'items', ?, NULL, 'rest', 'ok')",
+            )
+            .bind(i.to_string())
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        }
+        // 保持件数の上限を 2 にする（`PUT` も 1 行記録する = 6 行、上限超過）。
+        let put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "retentionDays": null,
+                    "retentionRows": 2
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = env.router.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log")
+                .fetch_one(&env.pool)
+                .await
+                .unwrap()
+        };
+        let before = count().await;
+        assert_eq!(before, 6);
+        let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM audit_log")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+
+        let list = |uri: String| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {}", env.admin_token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        // `asOfId` 付き: 上限を超えていても消さない（件数も境界の集合のまま）。
+        let response = env
+            .router
+            .clone()
+            .oneshot(list(format!("/api/audit-log/list?asOfId={max_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["totalCount"], 6, "{body}");
+        assert_eq!(count().await, before, "asOfId 付きの取得で剪定された");
+
+        // `asOfId` なし: 従来どおり剪定する。
+        let response = env
+            .router
+            .clone()
+            .oneshot(list("/api/audit-log/list".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(count().await, 2);
+    }
+
+    /// `?asOfId=`（#428）: 省略すると従来どおり全行 + 応答の `asOfId` に最大
+    /// `id`、指定するとその境界より後の行は件数にも行にも入らない。床は
+    /// `admin` のまま（クエリを付けても editor/viewer は 403）。
+    #[tokio::test]
+    async fn audit_log_list_as_of_id_pins_the_snapshot() {
+        let env = test_env().await;
+        let audit = AuditLogService::new(env.pool.clone());
+        let entry = |action: &'static str| AuditEntry {
+            actor_username: Some("admin"),
+            actor_role: Some("admin"),
+            action,
+            resource: "items",
+            entity_id: None,
+            detail: None,
+            origin: "rest",
+            result: "ok",
+        };
+        for action in ["a", "b", "c"] {
+            audit.try_record(entry(action)).await.unwrap();
+        }
+
+        let list = |uri: String, token: String| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                ))
+                .unwrap()
+        };
+        let call = |request: HttpRequest<Body>| {
+            let router = env.router.clone();
+            async move {
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            }
+        };
+
+        let (status, first) = call(list(
+            "/api/audit-log/list".to_string(),
+            env.admin_token.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let as_of_id = first["asOfId"].as_i64().expect("asOfId が返ること");
+        let first_total = first["totalCount"].as_u64().unwrap();
+        let max_id = first["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .max()
+            .unwrap();
+        assert_eq!(as_of_id, max_id, "省略時の境界は最大 id: {first}");
+        assert_eq!(first["rows"].as_array().unwrap().len() as u64, first_total);
+
+        audit.try_record(entry("after")).await.unwrap();
+
+        let (status, pinned) = call(list(
+            format!("/api/audit-log/list?asOfId={as_of_id}"),
+            env.admin_token.clone(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pinned}");
+        assert_eq!(pinned["asOfId"], as_of_id);
+        assert_eq!(pinned["totalCount"].as_u64().unwrap(), first_total);
+        assert!(
+            pinned["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["action"] != "after"),
+            "境界より後の行が混ざった: {pinned}"
+        );
+
+        let (_, fresh) = call(list(
+            "/api/audit-log/list".to_string(),
+            env.admin_token.clone(),
+        ))
+        .await;
+        assert_eq!(fresh["totalCount"].as_u64().unwrap(), first_total + 1);
+        assert!(fresh["asOfId"].as_i64().unwrap() > as_of_id);
+
+        // 床は admin のまま: editor（ここで作ってログイン）と viewer は 403。
+        UsersService::new(env.pool.clone())
+            .create_user("editor1", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user editor");
+        let (status, login) = call(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(
+                        &json!({ "username": "editor1", "password": "password123" }),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{login}");
+        let editor_token = login["token"].as_str().unwrap().to_string();
+        for token in [editor_token, env.viewer_token.clone()] {
+            let (status, body) = call(list(
+                format!("/api/audit-log/list?asOfId={as_of_id}"),
+                token,
+            ))
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
     }
 
     // --- T19 S2-d (docs/banto-hub-t19-design.md §5.1、UX-39): 履歴の保持

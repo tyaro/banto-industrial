@@ -4,7 +4,9 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-25（#430: 開いている WebSocket ストリームを接続中も 15 秒ごとに再検証し、
+最終更新: 2026-09-25（#440・#442: 試運転モードでトークン無しに開いた `/api/tag-stream` もロックダウンの
+後 1 周期以内に閉じ、gRPC のストリーミング（`StreamValues` / `StreamEvents`）も接続中に再検証する。
+banto-hub-operations.md §3・§8 を更新）。同日: #430: 開いている WebSocket ストリームを接続中も 15 秒ごとに再検証し、
 API キーは失効・期限切れ・トリップで、セッションは削除・降格・パスワード変更/リセットで閉じる
 （セッションは banto v1.7.1 の `AuthState::revalidate`）。banto-hub-operations.md §1・§3 を更新）。
 同日: 追従先を banto **v1.7.1** に上げた。グリッドの初回クリックの修正 banto #236 を取り込む。
@@ -267,7 +269,9 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   **開いている WebSocket ストリーム（#430）— 実装済み**: 15 秒ごとに再検証し、API キーで開いたものは
   失効・期限切れ・トリップで、セッションで開いたもの（`/api/tag-stream` を含む）は削除・降格・
   パスワード変更/リセットで close `1008`（セッションは banto v1.7.1 の `AuthState::revalidate`、
-  tyaro/banto#239）。試運転モードでトークン無しに開いたストリームは対象外（照合するものが無い）。
+  tyaro/banto#239）。試運転モードでトークン無しに開いたストリームはロックダウンで `commissioning_ended`
+  （#440）。gRPC のストリーミング（`StreamValues` / `StreamEvents`）も同じ仕組みで再検証し、失効・期限切れは
+  `UNAUTHENTICATED`、トリップは `PERMISSION_DENIED` で終わる（#442）。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き
