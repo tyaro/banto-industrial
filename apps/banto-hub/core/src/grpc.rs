@@ -63,6 +63,27 @@
 //! に `denied` を記録する(`origin: "grpc"`)。エラー写像は
 //! [`GrpcService::authenticate`] の doc comment参照。
 //!
+//! ## ストリーミングの接続中の再検証（#442）
+//!
+//! ストリーミングの RPC は `StreamValues` と `StreamEvents` の 2 つ（ほかは単発）。
+//! どちらも、開いた API キーを接続中も [`crate::stream::REVALIDATE_INTERVAL`]
+//! （15 秒）ごとに照合し直す。仕組みは WebSocket（`crate::stream` の doc comment
+//! 「接続中の再検証」）と同じ `Revalidator` と `ApiKeyStreamCredential`
+//! （照合 1 回の上限 5 秒・次の期限は照合が終わってから・照合は配信と並行・
+//! 照合できないときは続ける）で、gRPC 側が持つのは送信のループ
+//! （`drive_stream`）と、終わり方の変換（[`revoked_stream_status`]）だけ:
+//!
+//! - 失効・期限切れ・存在しない → `UNAUTHENTICATED`、トリップ →
+//!   `PERMISSION_DENIED`（`key_tripped`）。接続時の拒否（#435）と同じ分類・同じ
+//!   文面。値のキューが満杯でもこのステータスが先に届く（`GuardedStream`）。
+//! - 照合できない（DB エラー・タイムアウト）→ 続ける。
+//! - クライアントが切断したら（応答のストリームが捨てられたら）すぐ止まる。
+//!   以前の `StreamEvents` は次のイベントを送ろうとして初めて切断に気づいて
+//!   いた。
+//!
+//! gRPC はセッション token を受けない（上の「認証」）ので、セッションで開く
+//! ストリームは無い。
+//!
 //! ## H10 ③: per-tag read スコープ(Option B、
 //! docs/h10-3-read-scope-proposal.md §5・§6、REST/WS と同じ絞り方)
 //!
@@ -77,18 +98,20 @@
 //! （`crate::stream` の WebSocket 実装と同じ絞り方 - 同モジュールの doc
 //! comment「per-tag read スコープの交差」参照）。
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use banto_collect::Quality;
 use banto_server::ServerEvent;
+use futures_util::StreamExt;
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -101,6 +124,9 @@ use crate::computed::ServerTagStore;
 use crate::controller::CollectionController;
 use crate::hub::{read_current, CollectorManager, TagEntry};
 use crate::settings::GrpcSettings;
+use crate::stream::{
+    ApiKeyStreamCredential, RecheckVerdict, Revalidator, RevokedReason, StreamRevalidationTiming,
+};
 use crate::subscribe_core::{
     self, interval_floor_ms, Mode, Subscription, TagPattern, EVAL_TICK_MS,
 };
@@ -291,6 +317,165 @@ enum RequireScope {
     None,
 }
 
+/// metadata `authorization: Bearer bh_...` から API キーを取り出す
+/// （[`GrpcService::authenticate`] の doc comment 参照）。
+fn bearer_api_key<T>(request: &Request<T>) -> Result<&str, Status> {
+    let token = request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return Err(Status::unauthenticated(
+            "authorization メタデータ(Bearer bh_...)が必要です",
+        ));
+    };
+    if !token.starts_with("bh_") {
+        return Err(Status::unauthenticated(
+            "gRPC は API キー(bh_...)のみ認証できます。セッション token は使えません",
+        ));
+    }
+    Ok(token)
+}
+
+// --- ストリーミングの接続中の再検証（#442） --------------------------------------
+
+/// gRPC のストリーミングの応答。値のキュー（容量 [`STREAM_QUEUE_CAPACITY`]）とは
+/// 別に、終わり方のステータスを 1 つだけ受け取る口を持ち、**そちらを優先する**
+/// （WebSocket の `close_tx` を writer が `biased` で優先するのと同じ理由: 値の
+/// キューが満杯でも、失効のステータスは必ず届く。届けた時点で、キューに残った
+/// 値は捨てる - 失効が確認された後の値は渡さない）。
+///
+/// 終わり方のステータスの送り手が何も送らずに消えた（バックプレッシャ・
+/// 構成の終了など従来どおりの終わり方）ときは、キューに残った値を渡してから
+/// 普通に終わる（`OK`、従来どおり）。
+struct GuardedStream<T> {
+    values: mpsc::Receiver<Result<T, Status>>,
+    terminal: Option<oneshot::Receiver<Status>>,
+    finished: bool,
+}
+
+impl<T> Stream for GuardedStream<T> {
+    type Item = Result<T, Status>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if let Some(terminal) = this.terminal.as_mut() {
+            match Pin::new(terminal).poll(cx) {
+                Poll::Ready(Ok(status)) => {
+                    this.finished = true;
+                    this.terminal = None;
+                    this.values.close();
+                    return Poll::Ready(Some(Err(status)));
+                }
+                // 送り手が何も送らずに消えた: 従来どおりの終わり方。
+                Poll::Ready(Err(_)) => this.terminal = None,
+                Poll::Pending => {}
+            }
+        }
+        this.values.poll_recv(cx)
+    }
+}
+
+/// gRPC のストリーミング 1 本の送信側。`source` の値を流しながら、同じ
+/// [`Revalidator`]（WebSocket と共有、`crate::stream` の doc comment「接続中の
+/// 再検証」）で資格情報を照合し直す:
+///
+/// - **使えないと確認できた**（[`RecheckVerdict::Revoked`]）→ そのステータス
+///   （[`revoked_stream_status`]）でストリームを終える。
+/// - **照合できない**（[`RecheckVerdict::Unknown`]、DB エラー・タイムアウト）→
+///   続ける（次の期限でもう一度照合する）。
+/// - **切断**（クライアントが応答のストリームを捨てた = `values` の受け手が
+///   消えた）→ すぐ終わる。照合中の future も [`Revalidator`] ごと捨てる。
+///
+/// タイマーはストリーム 1 本につき 1 つ（この関数のローカルの `revalidator`）で、
+/// 別タスクは起こさない。照合は `select!` の 1 分岐として配信と並行に進む。
+async fn drive_stream<T: Send + 'static>(
+    mut source: Pin<Box<dyn Stream<Item = T> + Send>>,
+    values: mpsc::Sender<Result<T, Status>>,
+    terminal: oneshot::Sender<Status>,
+    mut revalidator: Revalidator,
+) {
+    let mut terminal = Some(terminal);
+    loop {
+        tokio::select! {
+            verdict = revalidator.next_verdict() => match verdict {
+                RecheckVerdict::Revoked { reason } => {
+                    if let Some(terminal) = terminal.take() {
+                        let _ = terminal.send(revoked_stream_status(reason));
+                    }
+                    return;
+                }
+                // 照合できない（DB エラー・タイムアウト）ときは終えない。
+                RecheckVerdict::Valid | RecheckVerdict::Unknown => {}
+            },
+            () = values.closed() => return,
+            item = source.next() => match item {
+                // 設計「バックプレッシャは送信バッファ満杯で切断」-
+                // `try_send` が `Full`(または受信側 drop 済みの `Closed`)なら
+                // ストリームを終える(従来どおり)。
+                Some(item) => {
+                    if values.try_send(Ok(item)).is_err() {
+                        return;
+                    }
+                }
+                None => return,
+            },
+        }
+    }
+}
+
+/// [`drive_stream`] を起こし、クライアントに返す応答のストリームを作る。
+/// `initial` は最初に必ず送る値（`StreamValues` の初期スナップショット）。
+fn spawn_guarded_stream<T: Send + 'static>(
+    initial: Option<T>,
+    source: Pin<Box<dyn Stream<Item = T> + Send>>,
+    revalidator: Revalidator,
+) -> GuardedStream<T> {
+    let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+    let (terminal_tx, terminal_rx) = oneshot::channel();
+    if let Some(initial) = initial {
+        // 作ったばかりのチャネルなので失敗しない。
+        let _ = tx.try_send(Ok(initial));
+    }
+    tokio::spawn(drive_stream(source, tx, terminal_tx, revalidator));
+    GuardedStream {
+        values: rx,
+        terminal: Some(terminal_rx),
+        finished: false,
+    }
+}
+
+/// #442: 使えないと確認できた資格情報で、gRPC のストリームを終えるステータス。
+/// 接続時の拒否（[`api_key_rejection_status`]、#435）と同じ分類・同じ文面:
+/// 失効・期限切れ・存在しない → `UNAUTHENTICATED`、トリップ →
+/// `PERMISSION_DENIED`（`key_tripped`）。
+///
+/// gRPC は API キーでしか開けない（[`GrpcService::authenticate`]）ので、
+/// セッション・試運転モードの理由はここへは届かない。型の上で網羅するために
+/// `UNAUTHENTICATED` を当てておく。
+pub(crate) fn revoked_stream_status(reason: RevokedReason) -> Status {
+    use UnauthenticatedReason as U;
+    match reason {
+        RevokedReason::ApiKeyRevoked => {
+            api_key_rejection_status(ApiKeyRejection::Unauthenticated(U::Revoked))
+        }
+        RevokedReason::ApiKeyExpired => {
+            api_key_rejection_status(ApiKeyRejection::Unauthenticated(U::Expired))
+        }
+        RevokedReason::ApiKeyNotFound => {
+            api_key_rejection_status(ApiKeyRejection::Unauthenticated(U::NotFound))
+        }
+        RevokedReason::ApiKeyTripped => api_key_rejection_status(ApiKeyRejection::Tripped),
+        RevokedReason::SessionRevoked | RevokedReason::CommissioningEnded => {
+            Status::unauthenticated(reason.as_str())
+        }
+    }
+}
+
 // --- サービス本体 ---------------------------------------------------------------
 
 /// `TagService`(gRPC)の実装。REST の `TagSpaceState`/`WriteState` を
@@ -308,6 +493,8 @@ pub struct GrpcService {
     write_control: Arc<WriteControl>,
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
     events: broadcast::Sender<ServerEvent>,
+    /// #442: ストリーミングの再検証の間隔と上限（本番は 15 秒 / 5 秒）。
+    revalidation: StreamRevalidationTiming,
 }
 
 impl GrpcService {
@@ -330,7 +517,16 @@ impl GrpcService {
             write_control,
             rate_limiter,
             events,
+            revalidation: StreamRevalidationTiming::default(),
         }
+    }
+
+    /// #442: ストリーミングの再検証の間隔と上限を差し替える（テスト用。本番は
+    /// 既定の 15 秒 / 5 秒のまま呼ばない。WebSocket 側で router に
+    /// `Extension(StreamRevalidationTiming)` を重ねるのと同じ役割）。
+    pub fn with_revalidation_timing(mut self, timing: StreamRevalidationTiming) -> Self {
+        self.revalidation = timing;
+        self
     }
 
     /// Enable the T14-4 stopped-state write gate for production wiring.
@@ -365,21 +561,7 @@ impl GrpcService {
         request: &Request<T>,
         require: RequireScope,
     ) -> Result<ApiKeyContext, Status> {
-        let token = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
-        let Some(token) = token else {
-            return Err(Status::unauthenticated(
-                "authorization メタデータ(Bearer bh_...)が必要です",
-            ));
-        };
-        if !token.starts_with("bh_") {
-            return Err(Status::unauthenticated(
-                "gRPC は API キー(bh_...)のみ認証できます。セッション token は使えません",
-            ));
-        }
+        let token = bearer_api_key(request)?;
 
         // H10 ①: 期限切れ判定 ([`crate::api_keys::ApiKeysService::lookup`])
         // に使う「今」も、last_used_at 更新に使う「今」も同じ
@@ -417,6 +599,24 @@ impl GrpcService {
                 Err(api_key_rejection_status(rejection))
             }
         }
+    }
+
+    /// #442: ストリーミングの RPC（`StreamValues` / `StreamEvents`）の認証。
+    /// [`Self::authenticate`]（`read` 必須）に通ったら、同じキーを接続中に
+    /// 照合し直す [`Revalidator`] も返す（照合は WebSocket の `/api/v1/stream` と
+    /// 同じ `ApiKeyStreamCredential`）。最初の期限はここから 1 周期後。
+    async fn authenticate_stream<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<(ApiKeyContext, Revalidator), Status> {
+        let ctx = self.authenticate(request, RequireScope::Read).await?;
+        let token = bearer_api_key(request)?.to_string();
+        let credential = Arc::new(ApiKeyStreamCredential::new(
+            self.api_keys.clone(),
+            token,
+            self.manager.clone(),
+        ));
+        Ok((ctx, Revalidator::new(credential, self.revalidation)))
     }
 
     async fn record_denied(&self, id: i64, reason: &str, name: &str) {
@@ -529,7 +729,7 @@ impl TagServiceTrait for GrpcService {
         &self,
         request: Request<StreamValuesRequest>,
     ) -> Result<Response<Self::StreamValuesStream>, Status> {
-        let ctx = self.authenticate(&request, RequireScope::Read).await?;
+        let (ctx, revalidator) = self.authenticate_stream(&request).await?;
         let req = request.into_inner();
 
         if req.tags.is_empty() {
@@ -603,73 +803,68 @@ impl TagServiceTrait for GrpcService {
             Mode::Interval { interval_ms } => now_ms + interval_ms,
             Mode::OnChange => 0,
         };
-        let mut subscription = Subscription {
+        let subscription = Subscription {
             patterns,
             mode,
             last,
             next_due_ms,
         };
 
-        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
-        // 設計「初期スナップショット必須」- subscribe 直後に必ず1回送る
-        // (空でも)。作ったばかりのチャネルなので `try_send` が失敗する
-        // ことは通常ない(防御的に失敗時は素直にストリームを終える)。
-        let _ = tx.try_send(Ok(to_proto_value_batch(now_ms, initial)));
-
         let manager = self.manager.clone();
-        let mut runtime_rx = self
+        let runtime_rx = self
             .collection_controller
             .as_ref()
             .map(|controller| controller.subscribe_status());
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
-            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = tick.tick() => {}
-                    changed = async {
-                        match runtime_rx.as_mut() {
-                            Some(receiver) => receiver.changed().await.map_err(|_| ()),
-                            None => std::future::pending::<Result<(), ()>>().await,
-                        }
-                    } => {
-                        if changed.is_err() {
-                            break;
+        let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // 250ms ごとに評価し、送るものがあればそれを 1 つ出す。収集の状態の
+        // 送り手が消えたら終わる。送信・切断・再検証は `drive_stream`（#442）。
+        let source = futures_util::stream::unfold(
+            (tick, runtime_rx, subscription, manager, ctx),
+            |(mut tick, mut runtime_rx, mut subscription, manager, ctx)| async move {
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        changed = async {
+                            match runtime_rx.as_mut() {
+                                Some(receiver) => receiver.changed().await.map_err(|_| ()),
+                                None => std::future::pending::<Result<(), ()>>().await,
+                            }
+                        } => {
+                            if changed.is_err() {
+                                return None;
+                            }
                         }
                     }
-                }
-                // 2026-09-15 オーナー決定（上記参照）: このストリームは
-                // run mode によらず配信を続ける（AllSimulation でも
-                // 打ち切らない）。
-                if tx.is_closed() {
-                    break;
-                }
-                let map = manager.tag_map();
-                let now_ms = manager.clock().now_ms();
-                let current = manager.current_values();
-                let server_store = manager.server_store();
-                if let Some(values) = subscribe_core::evaluate(
-                    &mut subscription,
-                    &map,
-                    current.as_ref(),
-                    &server_store,
-                    now_ms,
-                    Some(&ctx),
-                ) {
-                    // 設計「バックプレッシャは送信バッファ満杯で切断」-
-                    // `try_send` が `Full`(または受信側 drop 済みの
-                    // `Closed`)ならこのタスクを畳む = ストリーム終了。
-                    if tx
-                        .try_send(Ok(to_proto_value_batch(now_ms, values)))
-                        .is_err()
-                    {
-                        break;
+                    // 2026-09-15 オーナー決定（上記参照）: このストリームは
+                    // run mode によらず配信を続ける（AllSimulation でも
+                    // 打ち切らない）。
+                    let map = manager.tag_map();
+                    let now_ms = manager.clock().now_ms();
+                    let current = manager.current_values();
+                    let server_store = manager.server_store();
+                    if let Some(values) = subscribe_core::evaluate(
+                        &mut subscription,
+                        &map,
+                        current.as_ref(),
+                        &server_store,
+                        now_ms,
+                        Some(&ctx),
+                    ) {
+                        let batch = to_proto_value_batch(now_ms, values);
+                        return Some((batch, (tick, runtime_rx, subscription, manager, ctx)));
                     }
                 }
-            }
-        });
+            },
+        );
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        // 設計「初期スナップショット必須」- subscribe 直後に必ず1回送る(空でも)。
+        let stream = spawn_guarded_stream(
+            Some(to_proto_value_batch(now_ms, initial)),
+            Box::pin(source),
+            revalidator,
+        );
+        Ok(Response::new(Box::pin(stream)))
     }
 
     type StreamEventsStream =
@@ -679,29 +874,30 @@ impl TagServiceTrait for GrpcService {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        self.authenticate(&request, RequireScope::Read).await?;
+        let (_ctx, revalidator) = self.authenticate_stream(&request).await?;
 
-        let mut events_rx = self.manager.subscribe_events();
+        let events_rx = self.manager.subscribe_events();
         let pool = self.manager.pool();
-        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
-
-        tokio::spawn(async move {
-            loop {
-                match events_rx.recv().await {
-                    Ok(event) => {
-                        let proto_event = to_proto_event(&event, &pool).await;
-                        if tx.try_send(Ok(proto_event)).is_err() {
-                            break;
+        // 送信・切断・再検証は `drive_stream`（#442）。以前は次のイベントを
+        // 送ろうとして初めて切断に気づいていたが、`drive_stream` は切断で
+        // すぐ終わる（イベントが来ないあいだも照合を続けない）。
+        let source =
+            futures_util::stream::unfold((events_rx, pool), |(mut events_rx, pool)| async move {
+                loop {
+                    match events_rx.recv().await {
+                        Ok(event) => {
+                            let proto_event = to_proto_event(&event, &pool).await;
+                            return Some((proto_event, (events_rx, pool)));
                         }
+                        // WS と同じ「lag はスキップ」(設計 §5.2/§3.5)。
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
                     }
-                    // WS と同じ「lag はスキップ」(設計 §5.2/§3.5)。
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-            }
-        });
+            });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        let stream = spawn_guarded_stream(None, Box::pin(source), revalidator);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn write_value(
@@ -909,6 +1105,204 @@ mod tests {
             api_key_rejection_status(R::Tripped).message(),
             "key_tripped"
         );
+    }
+
+    /// #442: 使えないと確認できた理由から、ストリームを終えるステータスの表
+    /// （接続時の拒否と同じ分類・同じ文面）。
+    #[test]
+    fn revoked_stream_status_table() {
+        use tonic::Code;
+        let table = [
+            (RevokedReason::ApiKeyRevoked, Code::Unauthenticated),
+            (RevokedReason::ApiKeyExpired, Code::Unauthenticated),
+            (RevokedReason::ApiKeyNotFound, Code::Unauthenticated),
+            (RevokedReason::ApiKeyTripped, Code::PermissionDenied),
+        ];
+        for (reason, code) in table {
+            assert_eq!(revoked_stream_status(reason).code(), code, "{reason:?}");
+        }
+        assert_eq!(
+            revoked_stream_status(RevokedReason::ApiKeyTripped).message(),
+            "key_tripped"
+        );
+        assert_eq!(
+            revoked_stream_status(RevokedReason::ApiKeyRevoked).message(),
+            api_key_rejection_status(ApiKeyRejection::Unauthenticated(
+                UnauthenticatedReason::Revoked
+            ))
+            .message()
+        );
+    }
+
+    // --- drive_stream（#442）: 偽の資格情報（`crate::stream::tests` と共有） ---
+
+    use crate::stream::tests::{timing, wait_until, Answer, Probe};
+    use std::sync::atomic::Ordering;
+
+    /// 10ms ごとに通し番号を 1 つ出す（配信が続いていることを数えるための源）。
+    fn counter_source() -> Pin<Box<dyn Stream<Item = u64> + Send>> {
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Box::pin(futures_util::stream::unfold(
+            (tick, 0u64),
+            |(mut tick, n)| async move {
+                tick.tick().await;
+                Some((n, (tick, n + 1)))
+            },
+        ))
+    }
+
+    /// 何も出さない源（イベントが来ない `StreamEvents` と同じ）。
+    fn silent_source() -> Pin<Box<dyn Stream<Item = u64> + Send>> {
+        Box::pin(futures_util::stream::pending())
+    }
+
+    /// 次のステータスを待つ（値は読み飛ばす）。ステータス無しで終わったら失敗。
+    async fn next_status(stream: &mut GuardedStream<u64>, bound: Duration) -> Status {
+        tokio::time::timeout(bound, async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(status)) => return status,
+                    None => panic!("the stream ended without a status"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no status within {bound:?}"))
+    }
+
+    /// 使えないと確認できたら、キューに値が残っていても、そのステータスで
+    /// 先に終わる（残りの値は渡さない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revoked_credential_ends_the_stream_ahead_of_queued_values() {
+        let probe = Probe::new(Answer::Revoked, Duration::ZERO);
+        let source: Pin<Box<dyn Stream<Item = u64> + Send>> =
+            Box::pin(futures_util::stream::iter(0..10u64).chain(futures_util::stream::pending()));
+        let mut stream = spawn_guarded_stream(
+            None,
+            source,
+            Revalidator::new(probe.credential(), timing(50, 1_000)),
+        );
+        // 照合で失効が確認され、送り手（と資格情報）が消えるまで読まない。
+        assert!(
+            wait_until(Duration::from_secs(5), || probe.live.load(Ordering::SeqCst)
+                == 0)
+            .await,
+            "the stream should end after the revocation is confirmed"
+        );
+        match stream.next().await {
+            Some(Err(status)) => assert_eq!(status.code(), tonic::Code::Unauthenticated),
+            other => panic!("the status should come before the queued values: {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    /// 照合が返らない・照合できないあいだは終わらず、値が流れ続ける。答えが
+    /// 戻って使えないと分かったら、そのステータスで終わる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_check_that_cannot_answer_keeps_the_stream_delivering() {
+        let probe = Probe::new(Answer::Hang, Duration::ZERO);
+        let mut stream = spawn_guarded_stream(
+            None,
+            counter_source(),
+            Revalidator::new(probe.credential(), timing(50, 100)),
+        );
+        let mut received = 0usize;
+        // 各段の上限（周期 50ms・上限 100ms に対して十分に長い）。照合が
+        // 始まらない（再検証が外れている）ときに、値を読み続けて止まらない
+        // ようにする。
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+        // 返らない照合が 2 回打ち切られるまで、値を受け取り続ける。
+        let until = deadline();
+        while probe.dropped.load(Ordering::SeqCst) < 2 {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "no check was abandoned"
+            );
+            let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("values keep coming while the check hangs");
+            assert!(matches!(item, Some(Ok(_))), "{item:?}");
+            received += 1;
+        }
+        // 照合できない（DB エラー）が 2 回。
+        probe.set(Answer::Unknown);
+        let calls = probe.calls.load(Ordering::SeqCst);
+        let until = deadline();
+        while probe.calls.load(Ordering::SeqCst) < calls + 2 {
+            assert!(tokio::time::Instant::now() < until, "no check was made");
+            let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("values keep coming while the check cannot answer");
+            assert!(matches!(item, Some(Ok(_))), "{item:?}");
+            received += 1;
+        }
+        assert!(received > 0);
+
+        probe.set(Answer::Revoked);
+        let status = next_status(&mut stream, Duration::from_secs(2)).await;
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert!(stream.next().await.is_none());
+    }
+
+    /// クライアントが応答のストリームを捨てたら、値が来ないストリームでも
+    /// すぐ終わり、照合中のものも含めて再検証が止まる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_response_stops_the_rechecks() {
+        let probe = Probe::new(Answer::Hang, Duration::ZERO);
+        let stream = spawn_guarded_stream(
+            None,
+            silent_source(),
+            Revalidator::new(probe.credential(), timing(50, 10_000)),
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || probe
+                .in_flight
+                .load(Ordering::SeqCst)
+                == 1)
+            .await,
+            "a check should be in flight"
+        );
+        assert_eq!(probe.live.load(Ordering::SeqCst), 1);
+
+        drop(stream);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                probe.live.load(Ordering::SeqCst) == 0
+                    && probe.in_flight.load(Ordering::SeqCst) == 0
+            })
+            .await,
+            "the credential and its in-flight check should be dropped on disconnect"
+        );
+        let calls = probe.calls.load(Ordering::SeqCst);
+        // 周期（50ms）の何倍か待っても、照合は増えない。
+        assert!(
+            !wait_until(Duration::from_millis(300), || probe
+                .calls
+                .load(Ordering::SeqCst)
+                > calls)
+            .await,
+            "no recheck after disconnect"
+        );
+    }
+
+    /// 送り手が何も送らずに終わった（従来どおりの終わり方）ときは、残りの値を
+    /// 渡してから普通に終わる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_that_ends_drains_the_queue_and_ends_without_a_status() {
+        let probe = Probe::new(Answer::Valid, Duration::ZERO);
+        let stream = spawn_guarded_stream(
+            Some(100),
+            Box::pin(futures_util::stream::iter(0..3u64)),
+            Revalidator::new(probe.credential(), timing(10_000, 1_000)),
+        );
+        let items: Vec<_> =
+            tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+                .await
+                .expect("the stream should end");
+        let values: Vec<u64> = items.into_iter().map(|item| item.unwrap()).collect();
+        assert_eq!(values, vec![100, 0, 1, 2]);
     }
 
     #[test]

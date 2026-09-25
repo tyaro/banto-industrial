@@ -59,6 +59,7 @@ use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
 use banto_hub_core::settings::GrpcSettings;
 use banto_hub_core::settings::SettingsService;
+use banto_hub_core::stream::StreamRevalidationTiming;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -209,6 +210,16 @@ impl Drop for TestApp {
 }
 
 async fn test_app(label: &str) -> TestApp {
+    test_app_with(label, None).await
+}
+
+/// #442: ストリーミングの再検証の間隔と上限を短くした [`test_app`]（本番は
+/// 15 秒 / 5 秒）。
+async fn test_app_with_revalidation(label: &str, timing: StreamRevalidationTiming) -> TestApp {
+    test_app_with(label, Some(timing)).await
+}
+
+async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTiming>) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -278,6 +289,10 @@ async fn test_app(label: &str) -> TestApp {
         events_tx.clone(),
     )
     .with_controller(controller.clone());
+    let grpc_service = match revalidation {
+        Some(timing) => grpc_service.with_revalidation_timing(timing),
+        None => grpc_service,
+    };
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let settings = SettingsService::new(pool.clone());
@@ -1838,4 +1853,184 @@ async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
     assert_eq!(changed.values[0].tag, name1);
 
     sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// #442: ストリーミングの接続中の再検証
+// ---------------------------------------------------------------------------
+
+/// テストの再検証の間隔と上限（本番は 15 秒 / 5 秒）。
+const TEST_REVALIDATION: StreamRevalidationTiming = StreamRevalidationTiming {
+    interval: Duration::from_millis(300),
+    timeout: Duration::from_millis(500),
+};
+
+/// 使えなくしてからステータスが届くまでの上限: 1 周期 + 照合 1 回の上限 + 余裕。
+fn end_bound() -> Duration {
+    TEST_REVALIDATION.interval + TEST_REVALIDATION.timeout + Duration::from_secs(1)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// `*` を 250ms ごとに購読する `StreamValues`（タグが無くても空の
+/// `ValueBatch` が 250ms ごとに届く）。
+async fn open_values(
+    client: &mut TagServiceClient<Channel>,
+    key: &str,
+) -> tonic::Streaming<ValueBatch> {
+    client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec!["*".to_string()],
+                mode: SubscribeMode::Interval as i32,
+                interval_ms: 250,
+            },
+            key,
+        ))
+        .await
+        .expect("stream_values should open")
+        .into_inner()
+}
+
+async fn open_events(client: &mut TagServiceClient<Channel>, key: &str) -> tonic::Streaming<Event> {
+    client
+        .stream_events(bearer_request(StreamEventsRequest {}, key))
+        .await
+        .expect("stream_events should open")
+        .into_inner()
+}
+
+/// ストリームが `bound` のうちにステータスで終わるのを待つ（値は読み飛ばす）。
+/// ステータス無しで終わったら失敗。
+async fn wait_for_status<T>(stream: &mut tonic::Streaming<T>, bound: Duration) -> tonic::Status {
+    tokio::time::timeout(bound, async {
+        loop {
+            match stream.message().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("the stream ended without a status"),
+                Err(status) => return status,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the stream did not end within {bound:?}"))
+}
+
+/// `count` 個の `ValueBatch` を受け取る（途中で終わったら失敗）。250ms
+/// ごとなので、`count` 個で `count * 250ms` 以上かかる。
+async fn receive_batches(stream: &mut tonic::Streaming<ValueBatch>, count: usize) {
+    for _ in 0..count {
+        tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a batch should arrive")
+            .expect("the stream should not end with a status")
+            .expect("the stream should not end");
+    }
+}
+
+/// 失効・トリップ・期限切れのあと、そのキーで開いていた `StreamValues` と
+/// `StreamEvents` は 1 周期以内に、接続時の拒否と同じステータスで終わる
+/// （失効・期限切れ → `UNAUTHENTICATED`、トリップ → `PERMISSION_DENIED`）。
+/// ほかのキーのストリームは配信が続く。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_streams_end_within_an_interval_after_revoke_trip_or_expiry() {
+    let app = test_app_with_revalidation("revalidate-api-key", TEST_REVALIDATION).await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+    let service = ApiKeysService::new(app.pool.clone());
+    let read = || vec!["read".to_string()];
+    let revoked = service.issue("revoked", read(), None).await.unwrap();
+    let tripped = service.issue("tripped", read(), None).await.unwrap();
+    let expired = service.issue("expired", read(), None).await.unwrap();
+    let kept = service.issue("kept", read(), None).await.unwrap();
+
+    let mut revoked_values = open_values(&mut client, &revoked.key).await;
+    let mut revoked_events = open_events(&mut client, &revoked.key).await;
+    let mut tripped_values = open_values(&mut client, &tripped.key).await;
+    let mut tripped_events = open_events(&mut client, &tripped.key).await;
+    let mut expired_values = open_values(&mut client, &expired.key).await;
+    let mut expired_events = open_events(&mut client, &expired.key).await;
+    let mut kept_values = open_values(&mut client, &kept.key).await;
+    let mut kept_events = open_events(&mut client, &kept.key).await;
+
+    service.revoke(revoked.id).await.unwrap();
+    let started = tokio::time::Instant::now();
+    for status in [
+        wait_for_status(&mut revoked_values, end_bound()).await,
+        wait_for_status(&mut revoked_events, end_bound()).await,
+    ] {
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+    }
+    eprintln!("revoked: ended after {:?}", started.elapsed());
+
+    service.trip(tripped.id).await.unwrap();
+    for status in [
+        wait_for_status(&mut tripped_values, end_bound()).await,
+        wait_for_status(&mut tripped_events, end_bound()).await,
+    ] {
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+        assert_eq!(status.message(), "key_tripped");
+    }
+
+    sqlx::query("UPDATE api_keys SET expires_at = ? WHERE id = ?")
+        .bind((now_ms() - 1).to_string())
+        .bind(expired.id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    for status in [
+        wait_for_status(&mut expired_values, end_bound()).await,
+        wait_for_status(&mut expired_events, end_bound()).await,
+    ] {
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+    }
+
+    // 使えるキーのストリームは、いくつもの照合を経ても配信が続く。
+    receive_batches(&mut kept_values, 2).await;
+    // イベントのストリームも終わっていない（失効させれば、そのステータスで終わる）。
+    service.revoke(kept.id).await.unwrap();
+    let status = wait_for_status(&mut kept_events, end_bound()).await;
+    assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+}
+
+/// キーを照合できない（DB エラー）あいだは配信が続き、終わらない。DB が戻った
+/// 後の照合で失効が分かれば終わる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_streams_keep_delivering_while_the_key_store_errors() {
+    let app = test_app_with_revalidation("revalidate-db-error", TEST_REVALIDATION).await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+    let service = ApiKeysService::new(app.pool.clone());
+    let issued = service
+        .issue("db-error", vec!["read".to_string()], None)
+        .await
+        .unwrap();
+    let mut values = open_values(&mut client, &issued.key).await;
+    let mut events = open_events(&mut client, &issued.key).await;
+    receive_batches(&mut values, 1).await;
+
+    // 照合の SELECT が失敗するようにする（#434 のテストと同じ手）。
+    sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_away")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    // 10 個 = 2.5 秒以上。そのあいだに照合（300ms ごと）は何度も失敗する。
+    receive_batches(&mut values, 10).await;
+
+    sqlx::query("ALTER TABLE api_keys_away RENAME TO api_keys")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    service.revoke(issued.id).await.unwrap();
+    // イベントのストリームも、照合できないあいだに終わっていない（終わって
+    // いれば、ここで別のステータスか「ステータス無しの終わり」になる）。
+    for status in [
+        wait_for_status(&mut values, end_bound()).await,
+        wait_for_status(&mut events, end_bound()).await,
+    ] {
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+    }
 }
