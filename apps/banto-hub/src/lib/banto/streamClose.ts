@@ -34,11 +34,23 @@
  * | 確認の結果 | 扱い | 続けて失敗した回数 |
  * | --- | --- | --- |
  * | `login`（失効を確認できた） | 再接続をやめ、`1008` + `session_revoked` と同じ `recheckSession` へ合流する（ルートガードが `/login` へ送る） | - |
- * | `session`（まだ有効） | 再接続を続ける | 0 に戻す（次の確認はまた 2 回失敗してから） |
+ * | `session`（まだ有効） | 再接続を続ける | 確認を**始めた後**の失敗だけを残す（始める前の失敗は「有効」で説明済み。次の確認はまた 2 回失敗してから） |
  * | `unverified`（照合できない・到達不能・時間切れ） | 再接続を続ける（バックオフはそのまま伸びる） | そのまま（次の失敗でまた確かめる = 確認は再接続 1 回につき高々 1 回で、間隔はバックオフ以上） |
+ *
+ * 確認の最中に起きた失敗は、確認の前の結果で打ち消さない（#447 のレビュー
+ * 対応で洗い直し）: 確認中の失敗では確認を重ねずに数だけ増やし、結果が
+ * 返った後で、残った数がまだ確認に値すれば**すぐにもう一度**確かめる
+ * （`probeAgain`）。
  *
  * 接続が開いたら（`onopen`）数え直す。確認はバックオフの待ちと並行に走らせ、
  * 待ちそのものは短くも長くもしない。
+ *
+ * **再接続の最中にトークンが消えた（#447 のレビュー）**: ロックダウン済みで
+ * トークンを使って繋いでいたのに、次の再接続の時点で保存しているトークンが
+ * 無い（ほかの経路が `401` で消した・ほかのタブでログアウトした）ときは、
+ * 未ログインの待ち（最初の接続の前）とは区別し、待ち続けずに
+ * `recheckSession`（`token_cleared`）へ進む。ルートガードはトークンが無ければ
+ * `/login` へ送り、その間にログインし直していれば購読を再開する。
  */
 
 import type { ProtectedRouteDecision } from './sessionGuard';
@@ -48,11 +60,13 @@ export const REVOKED_CLOSE_CODE = 1008;
 
 /**
  * ログイン状態を確かめ直す理由。`session_revoked` / `commissioning_ended` は
- * サーバーの close の理由文。`reconnect_rejected`（#445）はクライアントが
- * 付ける: 再接続が続けて拒否され、確かめたら失効していた。サーバーが
- * この理由文で閉じることは無い（{@link classifyStreamClose} は受け付けない）。
+ * サーバーの close の理由文。`reconnect_rejected` / `token_cleared`（#445）は
+ * クライアントが付ける: 再接続が続けて拒否され、確かめたら失効していた／
+ * 再接続の最中に保存しているトークンが消えた。サーバーがこれらの理由文で
+ * 閉じることは無い（{@link classifyStreamClose} は受け付けない）。
  */
-export type SessionRecheckReason = 'session_revoked' | 'commissioning_ended' | 'reconnect_rejected';
+export type SessionRecheckReason =
+	'session_revoked' | 'commissioning_ended' | 'reconnect_rejected' | 'token_cleared';
 
 export type StreamCloseAction =
 	/** 通常の切断。従来どおり再接続する。 */
@@ -107,29 +121,64 @@ export const RECONNECT_FAILURES_BEFORE_SESSION_PROBE = 2;
  */
 export type SessionProbeResult = ProtectedRouteDecision;
 
+/**
+ * `/api/auth/check` の応答を分類する（`@banto/admin-core` の
+ * `createHttpAuthProvider().check()` と同じ分類。ただし副作用＝トークンの
+ * 消去は持たない。#447 のレビュー）:
+ * `401` と `200 false` は失効（`login`）、`200 true` は有効（`session`）、
+ * それ以外（`500` など・本文が真偽値でない）は照合できない（`unverified`）。
+ * `body` は `200` のときだけ意味を持つ。
+ */
+export function classifySessionCheckResponse(status: number, body: unknown): SessionProbeResult {
+	if (status === 401) return 'login';
+	if (status < 200 || status >= 300) return 'unverified';
+	if (body === true) return 'session';
+	if (body === false) return 'login';
+	return 'unverified';
+}
+
 /** 続けて `consecutiveFailures` 回失敗した今、ログイン状態を確かめるか。 */
 export function shouldProbeSession(consecutiveFailures: number): boolean {
 	return consecutiveFailures >= RECONNECT_FAILURES_BEFORE_SESSION_PROBE;
 }
 
 export type SessionProbeStep =
-	/** 再接続を続ける。失敗の回数を `consecutiveFailures` にする。 */
-	| { kind: 'reconnect'; consecutiveFailures: number }
+	/**
+	 * 再接続を続ける。失敗の回数を `consecutiveFailures` にする。`probeAgain`
+	 * なら、確認の最中に起きた失敗を確かめるため、すぐにもう一度確認する。
+	 */
+	| { kind: 'reconnect'; consecutiveFailures: number; probeAgain: boolean }
 	/** 再接続をやめ、`1008` + `session_revoked` と同じ確認の経路へ合流する。 */
 	| { kind: 'recheckSession'; reason: 'reconnect_rejected' };
 
-/** ログイン状態の確認の結果から、次の扱いを決める（表はこのファイルの冒頭）。 */
+/**
+ * ログイン状態の確認の結果から、次の扱いを決める（表はこのファイルの冒頭）。
+ * `failuresAtStart` は確認を始めたときの失敗の数、`failuresNow` は結果が
+ * 返ったときの数（同じ世代 = 途中で接続が開いていないこと）。
+ */
 export function decideAfterSessionProbe(
 	result: SessionProbeResult,
-	consecutiveFailures: number
+	failuresAtStart: number,
+	failuresNow: number
 ): SessionProbeStep {
+	const failedWhileProbing = failuresNow > failuresAtStart;
 	switch (result) {
 		case 'login':
 			return { kind: 'recheckSession', reason: 'reconnect_rejected' };
-		case 'session':
-			return { kind: 'reconnect', consecutiveFailures: 0 };
+		case 'session': {
+			const remaining = failuresNow - failuresAtStart;
+			return {
+				kind: 'reconnect',
+				consecutiveFailures: remaining,
+				probeAgain: failedWhileProbing && shouldProbeSession(remaining)
+			};
+		}
 		case 'unverified':
-			return { kind: 'reconnect', consecutiveFailures };
+			return {
+				kind: 'reconnect',
+				consecutiveFailures: failuresNow,
+				probeAgain: failedWhileProbing && shouldProbeSession(failuresNow)
+			};
 	}
 }
 

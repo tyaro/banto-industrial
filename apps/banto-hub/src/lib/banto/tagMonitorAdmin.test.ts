@@ -12,6 +12,9 @@
  *   にしか見えない）、`probeSession` を 1 回だけ呼ぶ。`session` なら再接続を
  *   続けて数え直す、`login` なら再接続をやめて `onHalt` の `recheckSession`
  *   へ合流する、`unverified` ならバックオフを守って続ける。
+ * - #447 のレビュー: 再接続の最中にトークンが消えたら `token_cleared` で確認へ
+ *   進む（最初の未ログインの待ちとは区別）。確認の最中の失敗を確認の前の結果で
+ *   打ち消さない。
  *
  * ブラウザの `WebSocket` は偽物に差し替える。`$lib/session.svelte`（Svelte 5
  * rune）と `@banto/admin-core` のパッケージ入口はこの最小 vitest 構成では
@@ -484,5 +487,139 @@ describe('connectTagStream: 切れている間の失効（#445、再接続が続
 		probe.resolve('login');
 		await flush();
 		expect(onHalt).not.toHaveBeenCalled();
+	});
+});
+
+describe('connectTagStream: #447 のレビュー対応（トークンの消失・確認の最中の失敗）', () => {
+	const flush = () => vi.advanceTimersByTimeAsync(0);
+
+	function deferred<T>() {
+		let resolve: (value: T) => void = () => {};
+		const promise = new Promise<T>((res) => {
+			resolve = res;
+		});
+		return { promise, resolve };
+	}
+
+	function startWithProbe(probe: () => Promise<SessionProbeResult>) {
+		const onHalt = vi.fn();
+		const probeSession = vi.fn(probe);
+		const stream = connectTagStream(
+			{ onData: () => {}, onConfigChanged: () => {}, onHalt, probeSession },
+			() => ['*']
+		);
+		return { stream, onHalt, probeSession };
+	}
+
+	it('再接続の最中にトークンが消えたら、待ち続けずに確認（token_cleared）へ進む', () => {
+		const { onHalt } = startWithProbe(async () => 'session');
+		latest().open();
+		latest().serverClose(1006);
+		// 例: 見捨てた確認や別の画面の check() が 401 で消した・別のタブでログアウトした。
+		auth.token = null;
+
+		vi.advanceTimersByTime(1000);
+		expect(onHalt).toHaveBeenCalledTimes(1);
+		expect(onHalt).toHaveBeenCalledWith({ kind: 'recheckSession', reason: 'token_cleared' });
+		const count = FakeWebSocket.instances.length;
+		vi.advanceTimersByTime(WELL_PAST_BACKOFF_MS);
+		expect(FakeWebSocket.instances).toHaveLength(count);
+		expect(onHalt).toHaveBeenCalledTimes(1);
+	});
+
+	it('ルートガードが「有効」と判断して resume() したら（ログインし直していた）、新しいトークンで繋ぐ', () => {
+		const { stream, onHalt } = startWithProbe(async () => 'session');
+		latest().open();
+		latest().serverClose(1006);
+		auth.token = null;
+		vi.advanceTimersByTime(1000);
+		expect(onHalt).toHaveBeenCalledTimes(1);
+
+		auth.token = 'tok-2';
+		stream.resume();
+		expect(latest().protocols).toEqual(['bearer', 'tok-2']);
+		expect(onHalt).toHaveBeenCalledTimes(1);
+	});
+
+	it('最初の接続の前の未ログインの待ちは、確認へ進まずに待つ（ログインしたら繋ぐ）', () => {
+		auth.token = null;
+		const { onHalt } = startWithProbe(async () => 'session');
+		expect(FakeWebSocket.instances).toHaveLength(0);
+		vi.advanceTimersByTime(5000);
+		expect(onHalt).not.toHaveBeenCalled();
+		expect(FakeWebSocket.instances).toHaveLength(0);
+
+		auth.token = 'tok-1';
+		vi.advanceTimersByTime(500);
+		expect(FakeWebSocket.instances).toHaveLength(1);
+	});
+
+	it('試運転モードの接続（トークンを使わない）は、トークンが無くても確認へ進まない', () => {
+		session.commissioningMode = true;
+		auth.token = null;
+		const { onHalt } = startWithProbe(async () => 'session');
+		latest().open();
+		latest().serverClose(1006);
+		vi.advanceTimersByTime(1000);
+		expect(onHalt).not.toHaveBeenCalled();
+		expect(FakeWebSocket.instances).toHaveLength(2);
+	});
+
+	it('確認（有効）の最中に 2 回失敗していたら、結果の後すぐにもう一度確かめる', async () => {
+		const first = deferred<SessionProbeResult>();
+		let calls = 0;
+		const { probeSession, onHalt } = startWithProbe(() => {
+			calls += 1;
+			return calls === 1 ? first.promise : Promise.resolve('login');
+		});
+		latest().open();
+		latest().serverClose(1006);
+		for (const delay of [1000, 2000]) {
+			vi.advanceTimersByTime(delay);
+			latest().serverClose(1006);
+		}
+		expect(probeSession).toHaveBeenCalledTimes(1);
+		// 確認の最中にさらに 2 回失敗（確認は重ねない）。
+		for (const delay of [4000, 8000]) {
+			vi.advanceTimersByTime(delay);
+			latest().serverClose(1006);
+		}
+		expect(probeSession).toHaveBeenCalledTimes(1);
+
+		// 始める前の失敗についての「有効」は、始めた後の失敗を打ち消さない。
+		first.resolve('session');
+		await flush();
+		expect(probeSession).toHaveBeenCalledTimes(2);
+		expect(onHalt).toHaveBeenCalledWith({ kind: 'recheckSession', reason: 'reconnect_rejected' });
+	});
+
+	it('確認の最中に接続が開いて結果を捨てたとき、新しい世代の失敗が確認に値すればすぐに確かめる', async () => {
+		const first = deferred<SessionProbeResult>();
+		let calls = 0;
+		const { probeSession } = startWithProbe(() => {
+			calls += 1;
+			return calls === 1 ? first.promise : new Promise(() => {});
+		});
+		latest().open();
+		latest().serverClose(1006);
+		vi.advanceTimersByTime(1000);
+		latest().serverClose(1006);
+		vi.advanceTimersByTime(2000);
+		latest().serverClose(1006);
+		expect(probeSession).toHaveBeenCalledTimes(1);
+		// 開いて（世代が進む）、また切れ、2 回失敗する。
+		vi.advanceTimersByTime(4000);
+		latest().open();
+		latest().serverClose(1006);
+		vi.advanceTimersByTime(1000);
+		latest().serverClose(1006);
+		vi.advanceTimersByTime(2000);
+		latest().serverClose(1006);
+		expect(probeSession).toHaveBeenCalledTimes(1);
+
+		first.resolve('login');
+		await flush();
+		// 古い login では止めないが、新しい 2 回の失敗は確かめる。
+		expect(probeSession).toHaveBeenCalledTimes(2);
 	});
 });

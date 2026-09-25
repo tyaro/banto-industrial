@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+	classifySessionCheckResponse,
 	classifyStreamClose,
 	createSingleFlight,
 	decideAfterSessionProbe,
@@ -101,25 +102,30 @@ describe('再接続が続けて失敗したときの確認（#445）', () => {
 		expect(shouldProbeSession(3)).toBe(true);
 	});
 
-	// [続けて失敗した回数, 確認の結果, 次の扱い]
-	const cases: Array<[number, SessionProbeResult, SessionProbeStep]> = [
-		[2, 'login', { kind: 'recheckSession', reason: 'reconnect_rejected' }],
-		[5, 'login', { kind: 'recheckSession', reason: 'reconnect_rejected' }],
-		// 有効: 数え直す（同じ状態が続いても、次の確認はまた 2 回失敗してから）。
-		[2, 'session', { kind: 'reconnect', consecutiveFailures: 0 }],
-		[7, 'session', { kind: 'reconnect', consecutiveFailures: 0 }],
+	// [確認を始めたときの失敗の数, 結果が返ったときの数, 確認の結果, 次の扱い]
+	const cases: Array<[number, number, SessionProbeResult, SessionProbeStep]> = [
+		[2, 2, 'login', { kind: 'recheckSession', reason: 'reconnect_rejected' }],
+		[5, 6, 'login', { kind: 'recheckSession', reason: 'reconnect_rejected' }],
+		// 有効: 確認の前の失敗は説明済み。次の確認はまた 2 回失敗してから。
+		[2, 2, 'session', { kind: 'reconnect', consecutiveFailures: 0, probeAgain: false }],
+		[7, 7, 'session', { kind: 'reconnect', consecutiveFailures: 0, probeAgain: false }],
+		// 有効でも、確認の最中に起きた失敗は打ち消さない（#447 のレビューで洗い直し）。
+		[2, 3, 'session', { kind: 'reconnect', consecutiveFailures: 1, probeAgain: false }],
+		[2, 4, 'session', { kind: 'reconnect', consecutiveFailures: 2, probeAgain: true }],
 		// 照合できない: 数はそのまま（次の失敗 = 次のバックオフの後にまた確かめる）。
-		[2, 'unverified', { kind: 'reconnect', consecutiveFailures: 2 }],
-		[6, 'unverified', { kind: 'reconnect', consecutiveFailures: 6 }]
+		[2, 2, 'unverified', { kind: 'reconnect', consecutiveFailures: 2, probeAgain: false }],
+		[6, 6, 'unverified', { kind: 'reconnect', consecutiveFailures: 6, probeAgain: false }],
+		// 確認の最中に失敗した（確認中なので重ねなかった）: すぐにもう一度。
+		[2, 3, 'unverified', { kind: 'reconnect', consecutiveFailures: 3, probeAgain: true }]
 	];
 
-	it.each(cases)('%i 回失敗 × 確認 %s', (failures, result, expected) => {
-		expect(decideAfterSessionProbe(result, failures)).toEqual(expected);
+	it.each(cases)('始め %i 回・終わり %i 回 × 確認 %s', (atStart, now, result, expected) => {
+		expect(decideAfterSessionProbe(result, atStart, now)).toEqual(expected);
 	});
 
 	it('確認の後の数で、次に確かめるかが決まる（有効なら 2 回待ち、照合できなければ次の失敗で）', () => {
-		const afterSession = decideAfterSessionProbe('session', 2);
-		const afterUnverified = decideAfterSessionProbe('unverified', 2);
+		const afterSession = decideAfterSessionProbe('session', 2, 2);
+		const afterUnverified = decideAfterSessionProbe('unverified', 2, 2);
 		if (afterSession.kind !== 'reconnect' || afterUnverified.kind !== 'reconnect') {
 			throw new Error('reconnect のはず');
 		}
@@ -128,8 +134,28 @@ describe('再接続が続けて失敗したときの確認（#445）', () => {
 		expect(shouldProbeSession(afterUnverified.consecutiveFailures + 1)).toBe(true);
 	});
 
-	it('クライアントの理由 reconnect_rejected をサーバーの 1008 の理由文としては受け付けない', () => {
-		expect(classifyStreamClose(1008, 'reconnect_rejected').kind).toBe('halt');
+	it.each(['reconnect_rejected', 'token_cleared'])(
+		'クライアントの理由 %s をサーバーの 1008 の理由文としては受け付けない',
+		(reason) => {
+			expect(classifyStreamClose(1008, reason).kind).toBe('halt');
+		}
+	);
+});
+
+describe('classifySessionCheckResponse（/api/auth/check の分類。check() と同じ、副作用なし）', () => {
+	const cases: Array<[number, unknown, SessionProbeResult]> = [
+		[200, true, 'session'],
+		[200, false, 'login'],
+		[401, undefined, 'login'],
+		[500, undefined, 'unverified'],
+		[503, undefined, 'unverified'],
+		[403, undefined, 'unverified'],
+		[200, undefined, 'unverified'],
+		[200, 'true', 'unverified'],
+		[200, null, 'unverified']
+	];
+	it.each(cases)('%i / 本文 %j → %s', (status, body, expected) => {
+		expect(classifySessionCheckResponse(status, body)).toBe(expected);
 	});
 });
 

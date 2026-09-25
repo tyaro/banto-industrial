@@ -29,7 +29,7 @@ import {
 	type Page,
 	type WebSocketRoute
 } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, TOKEN_STORAGE_KEY, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
 const USER_PREFIX = 'e2e-stream-reject-';
 const VIEWER_PASSWORD = 'E2eStreamReject1';
@@ -213,5 +213,24 @@ test.describe
 		expect(state.authChecks.length - checksBeforeCut).toBe(1);
 		expect(state.attempts).toHaveLength(4);
 		await expect(page).toHaveURL(/\/monitor$/);
+	});
+
+	test('3. 切れている間に保存しているトークンが消えたら（ほかの経路の 401・ほかのタブのログアウト）、待ち続けずにログイン画面へ移る（#447 のレビュー）', async ({
+		browser
+	}) => {
+		test.setTimeout(60_000);
+		const { page, state } = await openViewerMonitor(browser);
+
+		state.mode = 'reject';
+		await state.mocks[0].close({ code: 1001, reason: '' });
+		await page.evaluate((key) => {
+			sessionStorage.removeItem(key);
+			localStorage.removeItem(key);
+		}, TOKEN_STORAGE_KEY);
+
+		// 次の再接続（1 秒後）でトークンが無いと分かり、ルートガードが /login へ送る。
+		await expect(page).toHaveURL(/\/login$/, { timeout: DETECT_WITHIN_MS });
+		// ソケットは作らない（トークンが無いので）。
+		expect(state.attempts).toEqual(['mock']);
 	});
 });

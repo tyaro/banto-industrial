@@ -273,7 +273,13 @@ export interface TagStreamHandlers {
 	 * 結果が `login` なら再接続をやめ、`onHalt({ kind: 'recheckSession',
 	 * reason: 'reconnect_rejected' })` を呼ぶ（`1008` + `session_revoked` と
 	 * 同じ経路）。reject は `unverified` と同じ扱い。渡さなければ確かめない
-	 * （従来どおり再接続を続ける）。
+	 * （従来どおり再接続を続ける）。**認証の状態（保存しているトークン）を
+	 * 変えないこと**（#447 のレビュー: 見捨てた確認の遅れた `401` が
+	 * トークンを消すと、ログイン画面へ移らないまま待ち続ける）。
+	 *
+	 * なお、トークンで繋いでいたのに再接続の時点でトークンが消えていたら、
+	 * 確かめずに `onHalt({ kind: 'recheckSession', reason: 'token_cleared' })`
+	 * を呼ぶ（最初の接続の前の未ログインの待ちとは区別する）。
 	 */
 	probeSession?: () => Promise<SessionProbeResult>;
 }
@@ -349,6 +355,11 @@ export function connectTagStream(
 	 * 応答が、その後に開いた接続などの新しい状態を巻き戻さないように）。
 	 */
 	let generation = 0;
+	/**
+	 * #445（#447 のレビュー）: ロックダウン済みで最後に繋いだトークン。次の
+	 * 再接続でトークンが消えていたら、未ログインの待ちではなく確認へ進む。
+	 */
+	let usedToken: string | null = null;
 
 	function scheduleReconnect(delayMs: number): void {
 		if (stopped) return;
@@ -365,37 +376,55 @@ export function connectTagStream(
 		if (probe === undefined || probing) return;
 		probing = true;
 		const startedAt = generation;
+		const failuresAtStart = consecutiveFailures;
 		probe()
 			.catch((): SessionProbeResult => 'unverified')
 			.then((result) => {
 				probing = false;
-				if (stopped || halted || generation !== startedAt) return;
-				const step = decideAfterSessionProbe(result, consecutiveFailures);
+				if (stopped || halted) return;
+				if (generation !== startedAt) {
+					// 確認の最中に接続が開いた・再開した: 結果は古い状態についての
+					// もの。捨てる。ただし新しい世代で数えた失敗がすでに確認に値する
+					// なら（確認中だったので起こせなかった）、いま確かめる。
+					if (shouldProbeSession(consecutiveFailures)) probeSessionAfterFailures();
+					return;
+				}
+				const step = decideAfterSessionProbe(result, failuresAtStart, consecutiveFailures);
 				if (step.kind === 'reconnect') {
 					consecutiveFailures = step.consecutiveFailures;
+					// 確認の最中に起きた失敗を、確認の前の結果で打ち消さない。
+					if (step.probeAgain) probeSessionAfterFailures();
 					return;
 				}
 				// 失効を確認できた: 再接続をやめ、`1008` + `session_revoked` と
 				// 同じ確認の経路（`onHalt` → ルートガード）へ合流する。
-				halted = true;
-				if (timer !== null) {
-					clearTimeout(timer);
-					timer = null;
-				}
-				// 開く途中のソケットがあれば捨てる（開いていれば世代が進んで
-				// ここへは来ない）。後から届く close で再接続を起こさないよう、
-				// 先にハンドラを外す（`resume()` の後に届いても二重に張らない）。
-				const pending = ws;
-				ws = null;
-				if (pending !== null) {
-					pending.onopen = null;
-					pending.onmessage = null;
-					pending.onclose = null;
-					pending.onerror = null;
-					pending.close();
-				}
-				handlers.onHalt?.({ kind: 'recheckSession', reason: step.reason });
+				haltForRecheck(step.reason);
 			});
+	}
+
+	/**
+	 * #445: 再接続をやめて、ログイン状態の確認（`onHalt` の `recheckSession`
+	 * → ルートガード）へ進む。
+	 */
+	function haltForRecheck(reason: 'reconnect_rejected' | 'token_cleared'): void {
+		halted = true;
+		if (timer !== null) {
+			clearTimeout(timer);
+			timer = null;
+		}
+		// 開く途中のソケットがあれば捨てる（開いていれば世代が進んで
+		// ここへは来ない）。後から届く close で再接続を起こさないよう、
+		// 先にハンドラを外す（`resume()` の後に届いても二重に張らない）。
+		const pending = ws;
+		ws = null;
+		if (pending !== null) {
+			pending.onopen = null;
+			pending.onmessage = null;
+			pending.onclose = null;
+			pending.onerror = null;
+			pending.close();
+		}
+		handlers.onHalt?.({ kind: 'recheckSession', reason });
 	}
 
 	/**
@@ -505,9 +534,20 @@ export function connectTagStream(
 		// doc comment / `rest.rs::extract_ws_protocol_token` 参照。
 		const token = currentToken();
 		if (token === null) {
+			if (usedToken !== null) {
+				// #445（#447 のレビュー）: トークンで繋いでいたのに、再接続の
+				// 時点でトークンが消えている（ほかの経路が `401` で消した・
+				// ほかのタブでログアウトした）。未ログインの待ち（最初の接続の
+				// 前）と違い、待ち続けても誰もログイン状態を確かめないので、
+				// 確認へ進む。
+				usedToken = null;
+				haltForRecheck('token_cleared');
+				return;
+			}
 			scheduleReconnect(TOKEN_WAIT_DELAY_MS);
 			return;
 		}
+		usedToken = token;
 		attachHandlers(new WebSocket(wsUrl('/api/v1/stream'), ['bearer', token]));
 	}
 

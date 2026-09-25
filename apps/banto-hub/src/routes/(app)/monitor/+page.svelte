@@ -480,7 +480,8 @@
 				接続中（リアルタイム更新中）
 			{:else if streamView.halt?.kind === 'recheckSession'}
 				<!-- #441: close 1008 + session_revoked / commissioning_ended。
-					#445: 再接続が続けて拒否され、確かめたら失効していた。
+					#445: 再接続が続けて拒否され、確かめたら失効していた／再接続の
+					最中にトークンが消えた。
 					ルートガードの確認が終わるまでのあいだだけ出る。 -->
 				ログイン状態を確認しています…（リアルタイム更新は止まっています）
 			{:else if streamView.halt?.kind === 'halt'}

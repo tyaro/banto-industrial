@@ -18,6 +18,11 @@
  * 返ってこない（時間切れ）は `unverified`（試運転モード中のネットワーク断で
  * ログイン画面へ送らない）。
  *
+ * #447 のレビュー: 確認は保存しているトークンを**変えない**（`check()` を使わず、
+ * 開始時のトークンで照合するだけ）。時間切れで見捨てた確認に遅れて `401` が
+ * 返っても、確認の最中にログインし直した後で古い `401` が返っても、トークンは
+ * 残る。時間切れでは要求を `AbortSignal` で止める。
+ *
  * `invalidateAll()`（`$app/navigation`）は SvelteKit の実行時が無いと動かない
  * ので、呼ばれた回数だけ数える。ルートガードは `load()` を直接呼び、
  * `@banto/admin-core` は `sessionGuard.test.ts` と同じく**本物の** HTTP 認証
@@ -45,7 +50,10 @@ vi.mock('@banto/admin-core', async () => {
 		getAuthProvider: () => state.auth
 	};
 });
-vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
+vi.mock('$lib/banto/setup', () => ({
+	bantoReady: Promise.resolve(),
+	CSRF_HEADER: { 'X-Banto-Client': 'banto' }
+}));
 vi.mock('$lib/banto/sessionGuard', () => import('./sessionGuard'));
 vi.mock('$lib/banto/commissioning', () => ({
 	fetchCommissioningStatusOrNull: async () => state.commissioning,
@@ -99,12 +107,18 @@ function jsonResponse(status: number, body: unknown): Response {
 	});
 }
 
-function useCheck(check: () => Promise<Response>): void {
-	const fetchFn = vi.fn(async (url: string | URL | Request) => {
-		if (String(url).endsWith('/api/auth/check')) return check();
+/**
+ * `/api/auth/check` の応答を決める。ルートガード（本物の HTTP 認証プロバイダーの
+ * `check()`）と、#445 の確認（`fetch` を直接呼ぶ。#447 のレビュー）の両方が同じ
+ * 偽の `fetch` を通る。`init` で送ったヘッダ・`signal` を見られる。
+ */
+function useCheck(check: (init?: RequestInit) => Promise<Response>): void {
+	const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+		if (String(url).endsWith('/api/auth/check')) return check(init);
 		return jsonResponse(200, { initialized: true, viewerPublic: false });
 	}) as unknown as typeof fetch;
 	state.auth = createHttpAuthProvider({ fetchFn });
+	vi.stubGlobal('fetch', fetchFn);
 }
 
 /** ルートガードを走らせ、投げたもの（redirect / error）か `'passed'` を返す。 */
@@ -335,5 +349,94 @@ describe('probeSessionAfterReconnectFailures（#445: 再接続が続けて失敗
 		release();
 		expect(await Promise.all(pending)).toEqual(['session', 'session', 'session']);
 		expect(check).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe('probeSessionAfterReconnectFailures は認証の状態を変えない（#447 のレビュー）', () => {
+	it('開始時のトークンで照合する', async () => {
+		session.setItem(TOKEN_KEY, 'tok-a');
+		let sent: HeadersInit | undefined;
+		useCheck(async (init) => {
+			sent = init?.headers;
+			return jsonResponse(200, true);
+		});
+
+		expect(await probeSessionAfterReconnectFailures()).toBe('session');
+		expect(sent).toMatchObject({ Authorization: 'Bearer tok-a', 'X-Banto-Client': 'banto' });
+	});
+
+	it('401 でもトークンを消さない（消すのはルートガードの check()）', async () => {
+		session.setItem(TOKEN_KEY, 'revoked');
+		useCheck(async () => jsonResponse(401, { kind: 'unauthorized' }));
+
+		expect(await probeSessionAfterReconnectFailures()).toBe('login');
+		expect(session.getItem(TOKEN_KEY)).toBe('revoked');
+	});
+
+	it('時間切れの後に遅れて 401 が返っても、トークンは残り、要求は止められている', async () => {
+		vi.useFakeTimers();
+		try {
+			session.setItem(TOKEN_KEY, 'tok');
+			let signal: AbortSignal | null | undefined;
+			let lateAnswer: () => void = () => {};
+			useCheck(
+				(init) =>
+					new Promise<Response>((resolve) => {
+						signal = init?.signal;
+						// サーバーが中断を無視して遅れて答える、を再現する。
+						lateAnswer = () => resolve(jsonResponse(401, { kind: 'unauthorized' }));
+					})
+			);
+
+			const result = probeSessionAfterReconnectFailures();
+			await vi.advanceTimersByTimeAsync(SESSION_PROBE_TIMEOUT_MS);
+			expect(await result).toBe('unverified');
+			expect(signal?.aborted).toBe(true);
+
+			lateAnswer();
+			await vi.advanceTimersByTimeAsync(0);
+			expect(session.getItem(TOKEN_KEY)).toBe('tok');
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('確認の最中にログインし直し、その後で古い 401 が返っても、新しいトークンは残り、結果は unverified', async () => {
+		session.setItem(TOKEN_KEY, 'old-token');
+		let answer: () => void = () => {};
+		const check = vi.fn(
+			() =>
+				new Promise<Response>((resolve) => {
+					answer = () => resolve(jsonResponse(401, { kind: 'unauthorized' }));
+				})
+		);
+		useCheck(check);
+
+		const result = probeSessionAfterReconnectFailures();
+		await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(1));
+		session.setItem(TOKEN_KEY, 'new-token');
+		answer();
+
+		expect(await result).toBe('unverified');
+		expect(session.getItem(TOKEN_KEY)).toBe('new-token');
+	});
+
+	it('確認の最中にほかの経路でトークンが消えたら、古い答え（200 true）は使わない', async () => {
+		session.setItem(TOKEN_KEY, 'tok');
+		let answer: () => void = () => {};
+		const check = vi.fn(
+			() =>
+				new Promise<Response>((resolve) => {
+					answer = () => resolve(jsonResponse(200, true));
+				})
+		);
+		useCheck(check);
+
+		const result = probeSessionAfterReconnectFailures();
+		await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(1));
+		session.removeItem(TOKEN_KEY);
+		answer();
+
+		expect(await result).toBe('unverified');
 	});
 });
