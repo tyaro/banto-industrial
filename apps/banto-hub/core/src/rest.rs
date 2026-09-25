@@ -284,6 +284,14 @@ async fn require_auth_or_commissioning(
     next: axum::middleware::Next,
 ) -> Response {
     if !gate.commissioning.is_locked_down() {
+        // #440: `/api/tag-stream` をトークン無しで開いたストリームも、接続中に
+        // 「今も試運転モードか」を照合し直し、ロックダウンで閉じる
+        // （`crate::stream::CommissioningStreamCredential`。照合する述語は
+        // この分岐と同じ `is_locked_down`）。
+        req.extensions_mut()
+            .insert(crate::stream::CommissioningStreamCredential::new(
+                gate.commissioning.clone(),
+            ));
         return next.run(req).await;
     }
     let token = bearer_token(req.headers())

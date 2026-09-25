@@ -28,7 +28,8 @@ use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::stream::{
-    StreamRevalidationTiming, REVOKED_CLOSE_CODE, SESSION_REVOKED_REASON,
+    StreamRevalidationTiming, COMMISSIONING_ENDED_REASON, REVOKED_CLOSE_CODE,
+    SESSION_REVOKED_REASON,
 };
 use banto_hub_core::users::{Role, UsersService};
 use banto_plc::modbus::simulator::Simulator;
@@ -164,6 +165,8 @@ struct TestApp {
     /// #430: サーバーと同じ router（`/api/auth/change-password` を
     /// `tower::ServiceExt::oneshot` で叩く。トークンの表はサーバーと共有）。
     router: Router,
+    /// #440: サーバーと同じ試運転モードの状態（ロックダウンの操作用）。
+    commissioning: CommissioningService,
     _env: TempEnv,
 }
 
@@ -202,6 +205,14 @@ async fn test_app_with_lock(label: &str, locked_down: bool) -> TestApp {
 /// を router の extensions に重ねる。本番は 15 秒 / 5 秒）。
 async fn test_app_with_revalidation(label: &str, timing: StreamRevalidationTiming) -> TestApp {
     test_app_with(label, true, Some(timing)).await
+}
+
+/// #440: [`test_app_with_revalidation`] だが試運転モード（未ロックダウン）のまま。
+async fn test_app_unlocked_with_revalidation(
+    label: &str,
+    timing: StreamRevalidationTiming,
+) -> TestApp {
+    test_app_with(label, false, Some(timing)).await
 }
 
 async fn test_app_with(
@@ -304,6 +315,7 @@ async fn test_app_with(
             .await
             .expect("lock_down the test environment");
     }
+    let commissioning_handle = commissioning.clone();
 
     let router: Router = api_router_with_controller(
         users,
@@ -351,6 +363,7 @@ async fn test_app_with(
         auth: auth_handle,
         users: users_handle,
         router: router_handle,
+        commissioning: commissioning_handle,
         _env: env,
     }
 }
@@ -2145,6 +2158,47 @@ async fn session_streams_keep_delivering_while_the_account_check_does_not_return
         .unwrap();
     drop(held);
     assert_all_closed_as_session_revoked(&mut streams, "delete after the pool is freed").await;
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// #440: 試運転モードでトークン無しに開いたストリームの接続中の再検証
+// ---------------------------------------------------------------------------
+
+/// 試運転モードでトークン無しに開いた `/api/tag-stream` は、試運転モードの
+/// あいだは配信が続き（照合は何度も「使える」）、ロックダウンのあと 1 周期
+/// 以内に 1008 / `commissioning_ended` で閉じる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commissioning_stream_closes_within_an_interval_after_lock_down() {
+    let app =
+        test_app_unlocked_with_revalidation("revalidate-commissioning", TEST_REVALIDATION).await;
+    let sim = Simulator::start().await;
+    seed_one_tag(&app, &sim, 21).await;
+
+    let mut ws = connect_ws(&app.ws_url("/api/tag-stream"), None)
+        .await
+        .expect("unauthenticated ws handshake should succeed during commissioning mode");
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "interval", "interval_ms": 250 }),
+    )
+    .await;
+    recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    // 10 個 = 2.5 秒以上。そのあいだに照合（300ms ごと）は何度も「使える」。
+    receive_values(&mut ws, 10).await;
+
+    app.commissioning
+        .lock_down()
+        .await
+        .expect("lock_down should succeed");
+    let started = tokio::time::Instant::now();
+    let (code, reason) = wait_for_close(&mut ws, close_bound()).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (REVOKED_CLOSE_CODE, COMMISSIONING_ENDED_REASON)
+    );
+    eprintln!("commissioning: closed after {:?}", started.elapsed());
 
     sim.stop();
 }
