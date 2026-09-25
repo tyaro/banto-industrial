@@ -13,7 +13,7 @@ use banto_tagclient::{Endpoint, ErrorKind as TagErrorKind, RestClient, SecretApi
 use reqwest::Url;
 use zeroize::Zeroizing;
 
-use crate::admin::{base_url, keyring_account, AdminClient, IssueOutcome};
+use crate::admin::{base_url, keyring_account, AdminClient, IssueOutcome, ProbedStatus};
 use crate::error::{Error, ErrorKind, Result};
 use crate::scopes::{validate_issue_scopes, DEFAULT_SCOPES};
 use crate::state::{BootstrapState, HubRecord, KeyStore};
@@ -108,6 +108,11 @@ impl Bootstrapper {
                 // Nothing answered: do not escalate to issuing a second key
                 // against a Hub we cannot even talk to.
                 HubStatus::Unreachable { .. } => return Ok(connection),
+                // #446: a tripped key is still this installation's key - an
+                // administrator clears the trip and it works again. Revoking
+                // it and issuing another would throw away exactly what the
+                // screen tells the operator to keep.
+                HubStatus::KeyTripped => return Ok(connection),
                 // The stored key is invalid or unusable - fall through and
                 // re-issue (that is what "再接続で再発行" means on screen).
                 _ => {}
@@ -391,10 +396,7 @@ impl Bootstrapper {
                 // `banto-tagclient` collapses 401 and 403 into one kind;
                 // the split the UI needs is recovered with a status-only
                 // probe (see `AdminClient::probe_tags_status`).
-                TagErrorKind::Unauthorized => match admin.probe_tags_status(key).await {
-                    Some(403) => HubStatus::Forbidden,
-                    _ => HubStatus::AuthFailed,
-                },
+                TagErrorKind::Unauthorized => rejection_status(admin.probe_tags_status(key).await),
                 TagErrorKind::CatalogUnavailable => {
                     HubStatus::unreachable(UnreachableCause::ServerError)
                 }
@@ -445,6 +447,31 @@ enum IssueResult {
 /// [`Bootstrapper::rest_client`] (which hands the same client to the
 /// application for a subscription), so the two can never drift apart in how
 /// the endpoint is normalized or the key is wrapped.
+/// Which state a catalog rejection (`banto-tagclient`'s single
+/// `Unauthorized` for 401 and 403) becomes, from the status-only probe
+/// (pure, table-tested).
+///
+/// | probe | state |
+/// | --- | --- |
+/// | `403` + `{"error": "key_tripped"}` | [`HubStatus::KeyTripped`] (#446: the same key works again once an administrator clears the trip) |
+/// | `403` otherwise | [`HubStatus::Forbidden`] (authenticates, no read scope) |
+/// | `401`, anything else, or no answer | [`HubStatus::AuthFailed`] |
+///
+/// Revoked, expired, and unknown keys all answer the same `401` on REST
+/// (banto-hub does not tell them apart there, by design), so they stay one
+/// state; the reason only reaches a client through the stream's close frame
+/// (`banto_tagclient::close`).
+fn rejection_status(probe: Option<ProbedStatus>) -> HubStatus {
+    match probe {
+        Some(ProbedStatus {
+            status: 403,
+            key_tripped: true,
+        }) => HubStatus::KeyTripped,
+        Some(ProbedStatus { status: 403, .. }) => HubStatus::Forbidden,
+        _ => HubStatus::AuthFailed,
+    }
+}
+
 fn rest_client_for(endpoint: &str, key: &Zeroizing<String>) -> Result<RestClient> {
     let tag_endpoint =
         Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
@@ -597,6 +624,81 @@ mod tests {
         assert_eq!(hub.hit_count(ISSUE_ROUTE), 0);
         assert!(keys.is_empty());
         assert!(state.load().unwrap().is_none());
+    }
+
+    /// #446: the probe's answer -> state, as a table.
+    #[test]
+    fn a_rejected_catalog_is_classified_by_the_probe() {
+        let probe = |status, key_tripped| {
+            Some(ProbedStatus {
+                status,
+                key_tripped,
+            })
+        };
+        for (input, expected) in [
+            (probe(403, true), HubStatus::KeyTripped),
+            (probe(403, false), HubStatus::Forbidden),
+            (probe(401, false), HubStatus::AuthFailed),
+            // A `key_tripped` flag is only ever set for a 403; a 401 stays
+            // "the key is not valid".
+            (probe(401, true), HubStatus::AuthFailed),
+            (probe(500, false), HubStatus::AuthFailed),
+            (None, HubStatus::AuthFailed),
+        ] {
+            assert_eq!(rejection_status(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_hubs_key_tripped_body_counts_as_a_trip() {
+        use crate::admin::is_key_tripped_body;
+        assert!(is_key_tripped_body(br#"{"error":"key_tripped"}"#));
+        assert!(is_key_tripped_body(
+            br#"{ "error": "key_tripped", "extra": 1 }"#
+        ));
+        for body in [
+            &br#"{"error":"forbidden"}"#[..],
+            br#"{"kind":"forbidden","message":"key_tripped"}"#,
+            br#"{"error":"KEY_TRIPPED"}"#,
+            br#"{"error":null}"#,
+            br#"{}"#,
+            b"key_tripped",
+            b"",
+        ] {
+            assert!(
+                !is_key_tripped_body(body),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// #446: a stored key the Hub reports as tripped (`403 key_tripped`) is
+    /// `KeyTripped` for `status`, and `connect` keeps it - no revoke, no
+    /// issue, no commissioning check.
+    #[tokio::test]
+    async fn a_tripped_stored_key_is_key_tripped_and_connect_keeps_it() {
+        let hub = MockHub::start(routes(vec![(
+            TAGS_ROUTE,
+            vec![(403, String::from(r#"{"error":"key_tripped"}"#))],
+        )]));
+        let keys = Arc::new(MemoryKeyStore::new());
+        keys.set(&account_for(&hub), &key()).unwrap();
+        let state = Arc::new(MemoryState::seeded(seeded_record(&hub, Some(7))));
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+
+        assert_eq!(bootstrapper.status().await.unwrap(), HubStatus::KeyTripped);
+        let connection = bootstrapper.connect(&hub.endpoint()).await.unwrap();
+        assert_eq!(connection.status, HubStatus::KeyTripped);
+        assert!(connection.catalog.is_none());
+        assert_eq!(hub.hit_count(ISSUE_ROUTE), 0, "no second key");
+        assert!(
+            !hub.routes_seen()
+                .iter()
+                .any(|route| route.contains("/revoke")),
+            "the tripped key is not revoked"
+        );
+        assert_eq!(keys.get(&account_for(&hub)).unwrap(), Some(key()));
     }
 
     #[tokio::test]

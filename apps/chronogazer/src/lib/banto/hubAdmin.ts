@@ -32,6 +32,13 @@ export type HubStatus =
 	| { state: 'connected'; tagCount: number }
 	| { state: 'authFailed' }
 	| { state: 'forbidden' }
+	/**
+	 * #446: 保存済みのキーが Hub でトリップしている（REST が
+	 * `403 {"error":"key_tripped"}`）。`forbidden`（読み取り権限が無い）とも
+	 * `authFailed`（キーが無効）とも違い、**キーは捨てない** - 管理者が解除
+	 * すれば同じキーで戻る。
+	 */
+	| { state: 'keyTripped' }
 	| { state: 'unreachable'; cause: HubUnreachableCause }
 	| { state: 'needsPairing' };
 
@@ -324,6 +331,8 @@ export function hubStatusLabel(status: HubStatus): string {
 			return '認証に失敗';
 		case 'forbidden':
 			return '権限が不足';
+		case 'keyTripped':
+			return 'キーがトリップ中';
 		case 'unreachable':
 			return 'Hubに到達できません';
 		case 'needsPairing':
@@ -344,6 +353,8 @@ export function hubStatusDetail(status: HubStatus): string {
 			return '保存済みのAPIキーが無効です。「接続」でキーを再発行できます（Hubがロックダウン済みの場合は連携が必要です）。';
 		case 'forbidden':
 			return '保存済みのAPIキーに読み取り権限がありません。Hubの管理画面で読み取り権限のあるキーを発行し、下の欄から採用してください。';
+		case 'keyTripped':
+			return 'HubがこのAPIキーをトリップ（一時停止）させています。Hubの管理者に解除を依頼してください。解除されると同じキーのまま、数分以内に自動で購読を再開します（この画面を開き直すとすぐに確認します）。';
 		case 'unreachable':
 			return `${hubUnreachableCauseLabel(status.cause)} 接続先のURLとHubの稼働状況を確認してください。`;
 		case 'needsPairing':
@@ -386,13 +397,20 @@ export function showManualKeyEntry(
 	status: HubStatus,
 	subscription: HubSubscription | null
 ): boolean {
+	// #446: トリップ中はキーを捨てさせない（管理者が解除すれば同じキーで戻る）。
+	// 入力欄を出すと「新しいキーに替えよ」と読めるので出さない - 接続の状態が
+	// `keyTripped` なら `effectiveCredentialGuidance` が常にトリップの案内を
+	// 返すので、下の 3 つの条件はどれも真にならない。
+	const guidance = effectiveCredentialGuidance(status, subscription?.lastError ?? null);
 	return (
 		needsManualKey(status) ||
-		subscription?.state === 'unauthorized' ||
+		// 購読だけ拒否された（WS のハンドシェイクだけが 401/403）。ただし
+		// 理由がトリップなら、上と同じくキーを替えさせない。
+		(subscription?.state === 'unauthorized' && guidance?.action !== 'askAdmin') ||
 		// #446: 失効・期限切れ・存在しないキーは、世代を止めた後（`stopped` +
 		// `lastError`）も「新しい API キーを設定」へ誘導する。案内だけ出して
 		// 入力欄が無い、という形にしない。
-		hubCredentialGuidance(subscription?.lastError ?? null)?.action === 'replaceKey'
+		guidance?.action === 'replaceKey'
 	);
 }
 
@@ -474,6 +492,40 @@ export function hubCredentialGuidance(lastError: string | null): HubCredentialGu
 }
 
 /**
+ * 接続の状態と突き合わせた、購読の案内（#446、純関数）。
+ *
+ * 接続の状態（REST の答え）は**今のキーについての最新の判定**で、購読の
+ * `lastError`（close 1008 の理由）はそれより前の出来事のこともある。両者が
+ * 「キーを捨てるな」と「新しいキーを」を同時に言わないように、食い違うときは
+ * 接続の状態に合わせる:
+ *
+ * | 接続の状態 | 購読の案内 |
+ * | --- | --- |
+ * | `keyTripped` | 理由に関わらずトリップの案内（REST が「トリップ中」と言っている） |
+ * | `authFailed` / `forbidden` / `needsPairing` | トリップの案内は出さない（REST が「キーが無効／権限が無い／発行が要る」と言っている）。それ以外の理由はそのまま |
+ * | それ以外 | `lastError` の案内のまま |
+ *
+ * バックエンド（`chronogazer_core::hub` の `credential_rejection_after_status`）
+ * も同じ向きで記憶を直すので、ここは表示側の二重の守り。
+ */
+export function effectiveCredentialGuidance(
+	status: HubStatus | null,
+	lastError: string | null
+): HubCredentialGuidance | null {
+	if (status?.state === 'keyTripped') return hubCredentialGuidance('key_tripped');
+	const guidance = hubCredentialGuidance(lastError);
+	if (
+		guidance?.action === 'askAdmin' &&
+		(status?.state === 'authFailed' ||
+			status?.state === 'forbidden' ||
+			status?.state === 'needsPairing')
+	) {
+		return null;
+	}
+	return guidance;
+}
+
+/**
  * 購読ブロックに案内を**独立した行**で出すか（純関数）。
  *
  * `unauthorized` のときは [`hubSubscriptionDetail`] が案内そのものを説明文に
@@ -481,9 +533,16 @@ export function hubCredentialGuidance(lastError: string | null): HubCredentialGu
  * 説明文が停止の理由（「保存済みのAPIキーがHubに拒否された…」など）になる
  * ので、理由ごとの案内を別の行で添える。
  */
-export function hubCredentialGuidanceLine(subscription: HubSubscription | null): string | null {
+export function hubCredentialGuidanceLine(
+	subscription: HubSubscription | null,
+	status: HubStatus | null = null
+): string | null {
 	if (!subscription || subscription.state === 'unauthorized') return null;
-	return hubCredentialGuidance(subscription.lastError)?.message ?? null;
+	// 接続の状態の説明（`hubStatusDetail`）がトリップの案内そのものなので、
+	// 同じ画面に 2 回出さない。
+	if (status?.state === 'keyTripped') return null;
+	if (subscription.state === 'stopped' && !subscription.reason) return null;
+	return effectiveCredentialGuidance(status, subscription.lastError)?.message ?? null;
 }
 
 /**
@@ -1162,9 +1221,16 @@ export function hubSubscriptionLabel(state: HubSubscriptionState): string {
  * （`values` も空）進行中の状態なので、件数に触れるときも「購読しようと
  * しています」と、**まだ受信していないことが分かる**言い方にする。
  */
-export function hubSubscriptionDetail(subscription: HubSubscription): string {
+export function hubSubscriptionDetail(
+	subscription: HubSubscription,
+	status: HubStatus | null = null
+): string {
+	const guidance = effectiveCredentialGuidance(status, subscription.lastError);
 	if (subscription.state === 'stopped') {
 		if (subscription.reason) return subscription.reason;
+		// #446: 1008 の理由で止まっているなら「まもなく自動で再試行します」と
+		// 一律に言わない（失効などは再試行しない）。
+		if (guidance) return guidance.message;
 		if (subscription.lastError) {
 			return `購読は停止しています（エラー: ${subscription.lastError}）。まもなく自動で再試行します。`;
 		}
@@ -1173,7 +1239,8 @@ export function hubSubscriptionDetail(subscription: HubSubscription): string {
 	if (subscription.state === 'unauthorized') {
 		// #446: Hub が close 1008 で理由を付けて打ち切ったなら、理由ごとの
 		// 案内（トリップは管理者に解除を依頼、失効などは新しいキー）を出す。
-		const guidance = hubCredentialGuidance(subscription.lastError);
+		// 接続の状態と食い違うときは接続の状態に合わせる
+		// （`effectiveCredentialGuidance`）。
 		if (guidance) return guidance.message;
 		// タグ一覧は読めていても購読だけ拒否されることがある（WS のハンド
 		// シェイクだけが 401/403）。ユーザーにとっては接続の状態表示が何で

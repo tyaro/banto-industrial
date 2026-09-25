@@ -146,7 +146,7 @@
 	 * 管理者に解除を依頼、失効・期限切れ・存在しないなら新しいキー）。
 	 * `unauthorized` のときは説明文そのものが案内なので出さない。
 	 */
-	const credentialGuidanceLine = $derived(hubCredentialGuidanceLine(subscription));
+	const credentialGuidanceLine = $derived(hubCredentialGuidanceLine(subscription, status));
 	const showLastErrorLine = $derived(
 		subscription !== null && !(subscription.state === 'stopped' && !subscription.reason)
 	);
@@ -821,7 +821,7 @@
 				{#if subscriptionStale}
 					<p class="note poll-stale" role="status">{hubPollStaleNote(lastPolledAt)}</p>
 				{/if}
-				<p class="note">{hubSubscriptionDetail(subscription)}</p>
+				<p class="note">{hubSubscriptionDetail(subscription, status)}</p>
 				{#if credentialGuidanceLine}
 					<p class="note hub-credential-guidance" role="status">{credentialGuidanceLine}</p>
 				{/if}

@@ -64,8 +64,16 @@ pub enum HubStatus {
     /// while the Hub is still in commissioning mode.
     AuthFailed,
     /// The stored key authenticated but carries no usable `read` scope
-    /// (HTTP 403).
+    /// (HTTP 403 without `key_tripped`).
     Forbidden,
+    /// #446: the stored key is **tripped** - banto-hub answered
+    /// `403 {"error": "key_tripped"}` (#435). Unlike [`Self::Forbidden`] and
+    /// [`Self::AuthFailed`], the key itself is still good: an administrator
+    /// clears the trip and **the same key** works again. Nothing in this
+    /// crate discards, revokes, or re-issues a tripped key
+    /// ([`Bootstrapper::connect`](crate::Bootstrapper::connect) stops here
+    /// the way it stops at [`Self::Unreachable`]).
+    KeyTripped,
     /// Nothing usable came back. See [`UnreachableCause`].
     Unreachable { cause: UnreachableCause },
     /// The Hub is already locked down and this installation has no usable
@@ -83,6 +91,7 @@ impl HubStatus {
             Self::Connected { .. } => "connected",
             Self::AuthFailed => "auth_failed",
             Self::Forbidden => "forbidden",
+            Self::KeyTripped => "key_tripped",
             Self::Unreachable { .. } => "unreachable",
             Self::NeedsPairing => "needs_pairing",
         }
@@ -149,6 +158,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HubStatus::NotConfigured).unwrap(),
             r#"{"state":"notConfigured"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HubStatus::KeyTripped).unwrap(),
+            r#"{"state":"keyTripped"}"#
         );
     }
 

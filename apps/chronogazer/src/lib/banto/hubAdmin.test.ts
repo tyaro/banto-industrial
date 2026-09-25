@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	applyServerSelection,
 	hubAbandonedDisplay,
+	effectiveCredentialGuidance,
 	hubCredentialGuidance,
 	hubCredentialGuidanceLine,
 	hubPollStaleNote,
@@ -62,6 +63,8 @@ const ALL_STATES: HubStatus[] = [
 	{ state: 'connected', tagCount: 3 },
 	{ state: 'authFailed' },
 	{ state: 'forbidden' },
+	// #446: トリップ（キーは捨てない）。
+	{ state: 'keyTripped' },
 	{ state: 'unreachable', cause: 'transport' },
 	{ state: 'needsPairing' }
 ];
@@ -410,6 +413,112 @@ describe('hubCredentialGuidance', () => {
 				showManualKeyEntry({ state: 'authFailed' }, subscription({ state: 'stopped', lastError })),
 				lastError
 			).toBe(action === 'replaceKey');
+		}
+	});
+});
+
+/**
+ * #446（監査 P2）: 接続の状態 × 購読の状態 × `lastError` の全組み合わせで、
+ * 画面が「キーを捨てるな」（トリップ）と「キーを替えよ」を同時に言わない。
+ *
+ * 画面に出るもの = 接続の状態の説明（`hubStatusDetail`）・購読の説明
+ * （`hubSubscriptionDetail`）・案内の行（`hubCredentialGuidanceLine`）・
+ * 手動キーの入力欄（`showManualKeyEntry`）。
+ */
+describe('接続の状態と購読の案内の組み合わせ', () => {
+	const LAST_ERRORS = [
+		null,
+		'unauthorized',
+		'transport',
+		'key_tripped',
+		'key_revoked',
+		'key_expired',
+		'key_not_found',
+		'credential_rejected'
+	];
+	const SUBSCRIPTION_STATES = ['stopped', 'unauthorized', 'live', 'reconnecting'] as const;
+	// 「キーを捨てるな」（トリップの案内は必ずこれを含む。失効などの案内の
+	// 「同じキーのままでは自動で再開しません」は逆の意味なので数えない）
+	const KEEP_KEY = ['解除を依頼'];
+	// 「キーを替えよ」
+	const REPLACE_KEY = ['採用', '再発行', '新しいAPIキー', '貼り付け'];
+
+	function screen(status: HubStatus, sub: HubSubscription) {
+		const texts = [
+			hubStatusDetail(status),
+			hubSubscriptionDetail(sub, status),
+			hubCredentialGuidanceLine(sub, status) ?? ''
+		];
+		return { texts, field: showManualKeyEntry(status, sub) };
+	}
+
+	it('トリップを保てと言いながら、キーの入れ替えを勧めない（入力欄も出さない）', () => {
+		for (const status of ALL_STATES) {
+			for (const state of SUBSCRIPTION_STATES) {
+				for (const lastError of LAST_ERRORS) {
+					for (const reason of [null, '購読を止めています。']) {
+						const sub = subscription({ state, lastError, reason });
+						const { texts, field } = screen(status, sub);
+						const label = `${status.state} × ${state} × ${lastError} × reason=${reason}`;
+						const keep = texts.some((text) => KEEP_KEY.some((word) => text.includes(word)));
+						const replace =
+							field || texts.some((text) => REPLACE_KEY.some((word) => text.includes(word)));
+						expect(keep && replace, label).toBe(false);
+					}
+				}
+			}
+		}
+	});
+
+	it('トリップ中（keyTripped）は、購読の理由に関わらずトリップの案内に揃い、入力欄を出さない', () => {
+		for (const state of SUBSCRIPTION_STATES) {
+			for (const lastError of LAST_ERRORS) {
+				const sub = subscription({ state, lastError });
+				expect(showManualKeyEntry({ state: 'keyTripped' }, sub), `${state} × ${lastError}`).toBe(
+					false
+				);
+				expect(effectiveCredentialGuidance({ state: 'keyTripped' }, lastError)?.action).toBe(
+					'askAdmin'
+				);
+			}
+		}
+		expect(hubStatusLabel({ state: 'keyTripped' })).toBe('キーがトリップ中');
+		expect(hubStatusDetail({ state: 'keyTripped' })).toContain('解除を依頼');
+		expect(hubStatusDetail({ state: 'keyTripped' })).toContain('同じキーのまま');
+		// 案内の行は接続の状態の説明と重複するので出さない。
+		expect(
+			hubCredentialGuidanceLine(
+				subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' }),
+				{ state: 'keyTripped' }
+			)
+		).toBeNull();
+	});
+
+	it('REST が「キーが無効／権限が無い」と言っているときは、古いトリップの案内を出さない', () => {
+		for (const status of [
+			{ state: 'authFailed' },
+			{ state: 'forbidden' },
+			{ state: 'needsPairing' }
+		] as HubStatus[]) {
+			expect(effectiveCredentialGuidance(status, 'key_tripped'), status.state).toBeNull();
+			// 失効などの案内はそのまま（どちらも「キーを替えよ」で揃っている）。
+			expect(effectiveCredentialGuidance(status, 'key_revoked')?.action).toBe('replaceKey');
+		}
+		// 接続の状態が別の話（接続済み・到達不能）なら、購読の理由の案内のまま。
+		expect(
+			effectiveCredentialGuidance({ state: 'connected', tagCount: 1 }, 'key_tripped')?.action
+		).toBe('askAdmin');
+	});
+
+	it('失効・期限切れ・存在しないは、接続の状態が authFailed でも入力欄と案内が揃う', () => {
+		for (const lastError of ['key_revoked', 'key_expired', 'key_not_found']) {
+			const sub = subscription({ state: 'stopped', reason: 'r', lastError });
+			const { texts, field } = screen({ state: 'authFailed' }, sub);
+			expect(field, lastError).toBe(true);
+			expect(
+				texts.some((text) => text.includes('新しいAPIキー')),
+				lastError
+			).toBe(true);
 		}
 	});
 });

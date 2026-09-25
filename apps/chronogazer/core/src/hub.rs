@@ -413,6 +413,12 @@ const REASON_NO_KEY: &str =
 /// 一手も違うので混ぜない（こちらは再接続か手動キーの採用で直る）。
 const REASON_KEY_REJECTED: &str =
     "保存済みのAPIキーがHubに拒否されたため購読できません（「接続」で再発行するか、APIキーを採用してください）。";
+/// 保存済みのキーが Hub でトリップしている（`HubStatus::KeyTripped`、#446）。
+/// [`REASON_KEY_REJECTED`] と違い**キーは捨てない**（管理者が解除すれば同じ
+/// キーで戻る）。次の一手（管理者に解除を依頼）は画面が `lastError` の
+/// `key_tripped` から案内するので、ここでは事実だけを書く。
+const REASON_KEY_TRIPPED: &str =
+    "保存済みのAPIキーがHubでトリップ（一時停止）しているため購読できません。";
 /// アプリを終了している最中（[`HubService::shutdown`]）。**この理由になった
 /// 世代は二度と張り直されない** - 見張りは停止済みで、`resume()` も
 /// 起こし直さない。ほかの停止理由（環境が直れば復帰する）と混ぜないために
@@ -880,6 +886,37 @@ fn advance_credential_rejection(
         Some(kind) if kind.is_credential_rejection() => Some(kind),
         _ if state == TagClientConnectionState::Live => None,
         _ => remembered,
+    }
+}
+
+/// 覚えている close 1008 の理由を、REST の答え（[`HubStatus`]）で直す
+/// （#446、純関数）。REST は今のキーについての**最新の**判定なので、それと
+/// 矛盾する記憶は捨てる - 画面が「キーを捨てるな」（トリップ）と「新しい
+/// キーを」（失効など）を同時に出さないため。
+///
+/// | REST の答え | 覚えている理由 |
+/// | --- | --- |
+/// | `KeyTripped`（403 `key_tripped`） | `KeyTripped` にする（1008 を受けていなくても、案内と見張りの頻度をトリップにそろえる） |
+/// | `AuthFailed`（401 = 失効・期限切れ・存在しない・キー無し） | `KeyTripped` なら捨てる（もうトリップではない）。失効などはそのまま（REST の 401 は理由を区別しないので、1008 の理由の方が詳しい） |
+/// | `Forbidden`（トリップ以外の 403 = キーは通るが読み取り権限が無い） | 失効・期限切れ・存在しない・トリップは捨てる（キーは認証できている）。理由不明はそのまま |
+/// | それ以外 | そのまま |
+fn credential_rejection_after_status(
+    remembered: Option<TagErrorKind>,
+    status: &HubStatus,
+) -> Option<TagErrorKind> {
+    match (status, remembered) {
+        (HubStatus::KeyTripped, _) => Some(TagErrorKind::KeyTripped),
+        (HubStatus::AuthFailed, Some(TagErrorKind::KeyTripped)) => None,
+        (
+            HubStatus::Forbidden,
+            Some(
+                TagErrorKind::KeyTripped
+                | TagErrorKind::KeyRevoked
+                | TagErrorKind::KeyExpired
+                | TagErrorKind::KeyNotFound,
+            ),
+        ) => None,
+        (_, remembered) => remembered,
     }
 }
 
@@ -1988,6 +2025,7 @@ impl HubService {
                     Ok(None) => REASON_NO_KEY.to_owned(),
                     _ => REASON_KEY_REJECTED.to_owned(),
                 },
+                (None, HubStatus::KeyTripped) => REASON_KEY_TRIPPED.to_owned(),
                 (None, _) => REASON_NOT_CONNECTED.to_owned(),
             };
             // `stop` は止める前に観測するので、世代が close 1008 で止まって
@@ -1997,6 +2035,10 @@ impl HubService {
             if identity.is_none() {
                 slot.credential_rejection = None;
             }
+            // REST の答え（今のキーについての最新の判定）と、覚えている
+            // close 1008 の理由を食い違わせない（#446）。
+            slot.credential_rejection =
+                credential_rejection_after_status(slot.credential_rejection, status);
             return;
         };
         // キーを入れ直して Hub に接続できた: 前のキーについての close 1008 の
@@ -3320,6 +3362,63 @@ mod tests {
         }
     }
 
+    /// #446: REST の答えと覚えている 1008 の理由を食い違わせない（表）。
+    /// トリップ（キーを捨てるな）と失効など（新しいキーを）が同時に残らない。
+    #[test]
+    fn the_rest_answer_corrects_the_remembered_close_reason() {
+        use TagErrorKind as K;
+
+        let not_connected = [
+            HubStatus::NotConfigured,
+            HubStatus::NeedsPairing,
+            HubStatus::Unreachable {
+                cause: banto_hub_bootstrap::UnreachableCause::Transport,
+            },
+            HubStatus::Connected { tag_count: 1 },
+        ];
+        let remembered: Vec<Option<TagErrorKind>> = std::iter::once(None)
+            .chain(CREDENTIAL_REJECTIONS.into_iter().map(Some))
+            .collect();
+        for memory in remembered {
+            // トリップの答えは常にトリップ。
+            assert_eq!(
+                credential_rejection_after_status(memory, &HubStatus::KeyTripped),
+                Some(K::KeyTripped),
+                "{memory:?}"
+            );
+            // 401: トリップの記憶だけ捨てる。
+            let expected = if memory == Some(K::KeyTripped) {
+                None
+            } else {
+                memory
+            };
+            assert_eq!(
+                credential_rejection_after_status(memory, &HubStatus::AuthFailed),
+                expected,
+                "{memory:?}"
+            );
+            // トリップ以外の 403: キーは認証できているので、失効などと
+            // トリップの記憶は捨てる。理由不明だけ残す。
+            let expected = if memory == Some(K::CredentialRejected) {
+                memory
+            } else {
+                None
+            };
+            assert_eq!(
+                credential_rejection_after_status(memory, &HubStatus::Forbidden),
+                expected,
+                "{memory:?}"
+            );
+            for status in &not_connected {
+                assert_eq!(
+                    credential_rejection_after_status(memory, status),
+                    memory,
+                    "{status:?} / {memory:?}"
+                );
+            }
+        }
+    }
+
     /// 「ゆっくり」は [`SLOW_RETRY_EVERY_TICKS`] 周期に 1 回。ほかの頻度に
     /// 変わったら数え直す。
     #[test]
@@ -3925,9 +4024,10 @@ mod tests {
             catalog: StdMutex<String>,
             values: StdMutex<String>,
             frame: StdMutex<String>,
-            /// REST（`/api/v1/*`）の応答ステータス。200 以外なら本文無しで
-            /// 返す（#446: キーの失効・トリップを REST 側でも再現する）。
-            rest_status: StdMutex<u16>,
+            /// REST（`/api/v1/*`）の応答ステータスと、200 以外のときの本文
+            /// （#446: キーの失効・トリップを REST 側でも再現する。トリップは
+            /// banto-hub と同じ `403 {"error":"key_tripped"}`）。
+            rest_status: StdMutex<(u16, String)>,
             /// 開いている WS をこの close コードと理由文で閉じる合図（#446）。
             close: tokio::sync::watch::Sender<Option<(u16, String)>>,
         }
@@ -3938,7 +4038,7 @@ mod tests {
                     catalog: StdMutex::default(),
                     values: StdMutex::default(),
                     frame: StdMutex::default(),
-                    rest_status: StdMutex::new(200),
+                    rest_status: StdMutex::new((200, String::new())),
                     close: tokio::sync::watch::channel(None).0,
                 }
             }
@@ -3952,7 +4052,12 @@ mod tests {
             }
 
             fn set_rest_status(&self, status: u16) {
-                *self.rest_status.lock().unwrap() = status;
+                *self.rest_status.lock().unwrap() = (status, String::new());
+            }
+
+            /// banto-hub のトリップの応答（`key_tripped_response`、#435）。
+            fn trip_rest(&self) {
+                *self.rest_status.lock().unwrap() = (403, r#"{"error":"key_tripped"}"#.to_owned());
             }
 
             /// banto-hub の再検証（#430）が資格情報を使えないと確認したときと
@@ -4075,14 +4180,15 @@ mod tests {
                 } else {
                     hub.catalog.lock().unwrap().clone()
                 };
-                let status = *hub.rest_status.lock().unwrap();
+                let (status, rejection) = hub.rest_status.lock().unwrap().clone();
                 let mut stream = stream;
                 read_http_request(&mut stream).await;
                 if status == 200 {
                     write_response(&mut stream, body).await;
                 } else {
                     let response = format!(
-                        "HTTP/1.1 {status} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 {status} Rejected\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rejection}",
+                        rejection.len()
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                 }
@@ -4466,6 +4572,49 @@ mod tests {
             server.abort();
         }
 
+        /// #446: close 1008 を受ける前から（アプリの起動時など）キーが
+        /// トリップしていても、REST の `403 key_tripped` から同じ扱いになる:
+        /// 接続の状態は `KeyTripped`、購読の `lastError` は `key_tripped`、
+        /// 見張りはゆっくり。解除されたら同じキーで戻る。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_key_already_tripped_at_startup_is_reported_as_tripped() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let catalog = catalog(&["alpha"]);
+            let mock = Arc::new(MockHub::default());
+            mock.set(
+                &catalog,
+                &values_of(
+                    &catalog,
+                    vec![entry("alpha", 1.0, ValueQuality::Good, ValueSource::Real)],
+                ),
+                data_frame("alpha", 5.0, "good"),
+            );
+            mock.trip_rest();
+            let server = tokio::spawn(serve_hub(listener, Arc::clone(&mock)));
+            let (_settings, hub) = service_with_keyring(&endpoint, &["alpha"]).await;
+
+            let status = hub.status().await.unwrap();
+            assert_eq!(status.status, HubStatus::KeyTripped);
+            let view = hub.subscription().await;
+            assert_eq!(view.state, "stopped");
+            assert_eq!(view.reason.as_deref(), Some(REASON_KEY_TRIPPED));
+            assert_eq!(view.last_error.as_deref(), Some("key_tripped"));
+            for _ in 1..SLOW_RETRY_EVERY_TICKS {
+                assert!(!takes_tick(&hub).await, "トリップ中は毎周期は撃たない");
+            }
+            assert!(takes_tick(&hub).await);
+
+            mock.set_rest_status(200);
+            let status = hub.status().await.unwrap();
+            assert!(matches!(status.status, HubStatus::Connected { .. }));
+            wait_live(&hub).await;
+            assert_eq!(hub.subscription().await.last_error, None);
+
+            hub.inner.subscription.lock().await.stop(None).await;
+            server.abort();
+        }
+
         /// トリップ: 理由を画面まで運び、見張りは**ゆっくり**再試行する。
         /// 管理者が解除したら同じキーのまま戻る。
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4474,7 +4623,7 @@ mod tests {
             let first = generation_sequence(&hub).await.unwrap();
 
             // トリップ: REST は 403 `key_tripped`、開いている WS は 1008。
-            mock.set_rest_status(403);
+            mock.trip_rest();
             mock.close_streams(1008, "api_key_tripped");
             wait_generation(
                 &hub,
@@ -4502,7 +4651,14 @@ mod tests {
             hub.resume_locked().await.unwrap();
             let view = hub.subscription().await;
             assert_eq!(view.state, "stopped");
+            assert_eq!(view.reason.as_deref(), Some(REASON_KEY_TRIPPED));
             assert_eq!(view.last_error.as_deref(), Some("key_tripped"));
+            // 接続の状態も「トリップ」（「権限が不足」にしない）。
+            assert_eq!(hub.status().await.unwrap().status, HubStatus::KeyTripped);
+            assert_eq!(
+                hub.subscription().await.last_error.as_deref(),
+                Some("key_tripped")
+            );
             for _ in 1..SLOW_RETRY_EVERY_TICKS {
                 assert!(!takes_tick(&hub).await);
             }
@@ -4523,7 +4679,7 @@ mod tests {
             // もう一度トリップし、今度は設定画面を開いた（`status()`）ことで
             // 解除に気づく経路。見張りの周期を待たずに戻る（画面の案内の
             // 「この画面を開き直すとすぐに確認します」の根拠）。
-            mock.set_rest_status(403);
+            mock.trip_rest();
             mock.close_streams(1008, "api_key_tripped");
             wait_generation(
                 &hub,
