@@ -7,7 +7,8 @@
 	// （`enforce_loopback_when_commissioning`）ため、無認証のまま外部
 	// ネットワークへ露出することはない。状態を知る手段は
 	// `status/+page.svelte` の「サーバー状態」に事実として残した。
-	import { afterNavigate } from '$app/navigation';
+	import { afterNavigate, invalidateAll } from '$app/navigation';
+	import { onSessionEnded } from '@banto/admin-core';
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
@@ -79,6 +80,24 @@
 	$effect(() => {
 		return mobileNavStore.watchViewport();
 	});
+
+	// banto v1.7.2（tyaro/banto#241）: 開いている画面のセッションが裏で
+	// 失効したら（削除・降格・パスワードの変更/リセット）、ルートガード
+	// （`+layout.ts`）を走らせ直してログイン画面へ移る。失効に気づくのは
+	// admin-core の SSE（`/api/events`、`setup.ts` の `connectEvents`）で、
+	// `check()` で確認できたときだけ知らせる。タグモニタのストリームの
+	// 経路（#441 / #445、`sessionRecheck.ts`）とは独立に、どの画面でも効く。
+	//
+	// `recheckSessionAfterStreamClose`（single-flight）には合流させない:
+	// 飛行中の確認はこの知らせより前に始まっており、その答えは失効より前の
+	// 判断のことがある（banto の `sessionEnded.ts` の「Ordering」と同じ理由）。
+	// SvelteKit の `invalidateAll()` は重なると後の呼び出しが勝つので、
+	// ガードは必ずこの知らせの後の状態で判断する。先の呼び出しは結果を捨てて
+	// 解決するので、モニタは購読を再開しようとする。この知らせは `check()` が
+	// トークンを消した後に届くので、再開は `token_cleared` で止まって確認へ
+	// 戻り、最後に走るガードがトークン無しで `/login` へ送る（画面が外れれば
+	// `disconnect()` で止まる）。
+	$effect(() => onSessionEnded(() => void invalidateAll()));
 
 	// ルート変更時はオフキャンバスを必ず閉じる（設計の「閉じる契機」の1つ）。
 	afterNavigate(() => {
