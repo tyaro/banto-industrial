@@ -15,7 +15,7 @@
 //!
 //! There is one more request here, [`AdminClient::probe_tags_status`], which
 //! is *not* an admin route: see its doc comment for why the 401/403 split
-//! cannot come from `fetch_catalog` alone.
+//! (and, #446, the tripped-key 403) cannot come from `fetch_catalog` alone.
 
 use reqwest::{Client, ClientBuilder, StatusCode, Url};
 use serde::Deserialize;
@@ -23,6 +23,33 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::status::UnreachableCause;
+
+/// What [`AdminClient::probe_tags_status`] learned: the HTTP status, and for
+/// a `403` whether it was banto-hub's `key_tripped` (#446).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProbedStatus {
+    pub(crate) status: u16,
+    pub(crate) key_tripped: bool,
+}
+
+/// The stable error code banto-hub sends with `403` for a tripped API key
+/// (`key_tripped_response` in `apps/banto-hub/core/src/rest.rs`, #435).
+pub(crate) const KEY_TRIPPED_ERROR: &str = "key_tripped";
+
+/// Is this `403` body banto-hub's `{"error": "key_tripped"}`? Pure; anything
+/// that is not exactly that JSON shape (not JSON, another code, a missing
+/// field) is `false`, so an unknown `403` stays "権限が不足".
+pub(crate) fn is_key_tripped_body(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct ErrorCode<'a> {
+        #[serde(borrow)]
+        error: Option<std::borrow::Cow<'a, str>>,
+    }
+    serde_json::from_slice::<ErrorCode<'_>>(body)
+        .ok()
+        .and_then(|body| body.error)
+        .is_some_and(|code| code == KEY_TRIPPED_ERROR)
+}
 
 /// CSRF marker required by banto-hub's whole admin router. Not a secret and
 /// not a credential - it only asserts "this request came from a Banto
@@ -333,10 +360,31 @@ impl AdminClient {
     /// screen. `banto-tagclient` is not changed for this, so the split is
     /// recovered here with one extra status-only request, sent **only** on
     /// the failure path.
-    pub(crate) async fn probe_tags_status(&self, key: &str) -> Option<u16> {
+    ///
+    /// #446: a `403` is only "権限が不足" when it is **not** banto-hub's
+    /// `{"error": "key_tripped"}` (#435) - a tripped key authenticates and
+    /// will work again once an administrator clears the trip, so it must not
+    /// be shown as "issue a key with read scope". For a `403` only, the body
+    /// is read and matched against that one stable code
+    /// ([`is_key_tripped_body`]); nothing from it is logged or kept.
+    pub(crate) async fn probe_tags_status(&self, key: &str) -> Option<ProbedStatus> {
         let url = join(&self.base, &["api", "v1", "tags"]);
         match self.http.get(url).bearer_auth(key).send().await {
-            Ok(response) => Some(response.status().as_u16()),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let key_tripped = if status == 403 {
+                    response
+                        .bytes()
+                        .await
+                        .is_ok_and(|body| is_key_tripped_body(&body))
+                } else {
+                    false
+                };
+                Some(ProbedStatus {
+                    status,
+                    key_tripped,
+                })
+            }
             Err(error) => {
                 self.classify_send_failure("probe_tags_status", &error);
                 None

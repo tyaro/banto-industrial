@@ -16,12 +16,19 @@
 //! automatically (2026-09-01 owner decision), because resending a write the
 //! caller cannot confirm was lost risks a double write to the PLC.
 //!
+//! #446: when banto-hub closes an open stream with close code 1008 (the
+//! credential was revoked, expired, tripped, or is unknown), the worker keeps
+//! the reason ([`close::classify_close`]), publishes `Unauthorized` with the
+//! specific [`ErrorKind`] in `last_error`, and does not reconnect. Ordinary
+//! disconnects still reconnect with backoff.
+//!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are
 //! retained as unknown values so a future Hub cannot silently become a real
 //! value source or a good-quality value.
 
 pub mod binding;
+pub mod close;
 pub mod endpoint;
 pub mod error;
 mod handle;

@@ -15,8 +15,25 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+	adoptionResult,
 	applyServerSelection,
+	HUB_STATUS_RECHECK_FAILED_LABEL,
+	INITIAL_STATUS_SNAPSHOT,
+	runStaleRecheck,
+	showStatusRecheckButton,
+	snapshotAfterAdoption,
+	snapshotFromStoredView,
+	STALE_RECHECK_RETRY_MS,
+	type HubStatusSnapshot,
+	type RunWithLimitOutcome,
 	hubAbandonedDisplay,
+	effectiveCredentialGuidance,
+	hubCredentialGuidance,
+	hubCredentialGuidanceLine,
+	hubStatusDisplay,
+	isHubStatusStale,
+	HUB_STATUS_RECHECKING_LABEL,
+	subscriptionCredentialSignal,
 	hubPollStaleNote,
 	hubStatusDetail,
 	hubStatusLabel,
@@ -50,6 +67,7 @@ import {
 	type HubStatus,
 	type HubSubscription,
 	type HubSubscriptionState,
+	type HubView,
 	type SelectionEvent,
 	type StatusRereadDetailedOutcome,
 	type StatusRereadOutcome
@@ -60,6 +78,8 @@ const ALL_STATES: HubStatus[] = [
 	{ state: 'connected', tagCount: 3 },
 	{ state: 'authFailed' },
 	{ state: 'forbidden' },
+	// #446: トリップ（キーは捨てない）。
+	{ state: 'keyTripped' },
 	{ state: 'unreachable', cause: 'transport' },
 	{ state: 'needsPairing' }
 ];
@@ -301,6 +321,661 @@ describe('showManualKeyEntry', () => {
 			false
 		);
 		expect(showManualKeyEntry({ state: 'notConfigured' }, null)).toBe(false);
+	});
+});
+
+/**
+ * #446: Hub が close 1008 で購読を打ち切った理由（`lastError`）ごとの案内。
+ * トリップは「管理者に解除を依頼」（同じキーで戻る）、失効・期限切れ・存在
+ * しないは「新しい API キーを設定」（同じキーでは戻らない）。
+ */
+describe('hubCredentialGuidance', () => {
+	// [lastError, 次の一手, 案内に含む言葉, 含まない言葉]
+	const TABLE = [
+		[
+			'key_tripped',
+			'askAdmin',
+			['管理者に解除を依頼', '同じキーのまま', '自動で再開'],
+			['新しいAPIキー']
+		],
+		[
+			'key_revoked',
+			'replaceKey',
+			['失効', '新しいAPIキーを設定', '採用'],
+			['解除を依頼', '自動で再開します']
+		],
+		[
+			'key_expired',
+			'replaceKey',
+			['有効期限', '新しいAPIキーを設定', '採用'],
+			['解除を依頼', '自動で再開します']
+		],
+		[
+			'key_not_found',
+			'replaceKey',
+			['見つからない', '新しいAPIキーを設定', '採用'],
+			['解除を依頼', '自動で再開します']
+		],
+		[
+			'credential_rejected',
+			'checkHub',
+			['理由を判別できません', '管理者に確認'],
+			['新しいAPIキーを設定']
+		]
+	] as const;
+
+	it('理由ごとに次の一手と案内が決まる', () => {
+		for (const [lastError, action, includes, excludes] of TABLE) {
+			const guidance = hubCredentialGuidance(lastError);
+			expect(guidance, lastError).not.toBeNull();
+			expect(guidance?.reason, lastError).toBe(lastError);
+			expect(guidance?.action, lastError).toBe(action);
+			for (const word of includes) expect(guidance?.message, lastError).toContain(word);
+			for (const word of excludes) expect(guidance?.message, lastError).not.toContain(word);
+		}
+	});
+
+	it('理由ごとの案内は互いに潰れない', () => {
+		const messages = TABLE.map(([lastError]) => hubCredentialGuidance(lastError)?.message);
+		expect(new Set(messages).size).toBe(TABLE.length);
+	});
+
+	it('1008 の分類でなければ案内しない（従来の文言に任せる）', () => {
+		for (const lastError of [
+			null,
+			'unauthorized',
+			'transport',
+			'binding_unresolved',
+			'future_kind'
+		]) {
+			expect(hubCredentialGuidance(lastError), String(lastError)).toBeNull();
+		}
+	});
+
+	it('unauthorized の説明文が理由ごとの案内になる', () => {
+		for (const [lastError] of TABLE) {
+			expect(hubSubscriptionDetail(subscription({ state: 'unauthorized', lastError }))).toBe(
+				hubCredentialGuidance(lastError)?.message
+			);
+		}
+		// 理由の無い 401/403 は従来の文言のまま。
+		expect(
+			hubSubscriptionDetail(subscription({ state: 'unauthorized', lastError: 'unauthorized' }))
+		).toContain('認証が通っていません');
+	});
+
+	it('世代を止めた後（stopped + 理由）は、停止の理由と別の行で案内する', () => {
+		const stopped = subscription({
+			state: 'stopped',
+			reason: '保存済みのAPIキーがHubに拒否されたため購読できません。',
+			lastError: 'key_tripped'
+		});
+		expect(hubSubscriptionDetail(stopped)).toBe(stopped.reason);
+		expect(hubCredentialGuidanceLine(stopped)).toBe(hubCredentialGuidance('key_tripped')?.message);
+		// unauthorized では説明文が案内そのものなので、別の行は出さない。
+		expect(
+			hubCredentialGuidanceLine(subscription({ state: 'unauthorized', lastError: 'key_tripped' }))
+		).toBeNull();
+		expect(
+			hubCredentialGuidanceLine(subscription({ state: 'stopped', lastError: null }))
+		).toBeNull();
+		expect(hubCredentialGuidanceLine(null)).toBeNull();
+	});
+
+	it('失効・期限切れ・存在しないは、止めた後もキーの入力欄を出す（トリップは出さない）', () => {
+		for (const [lastError, action] of TABLE) {
+			expect(
+				showManualKeyEntry({ state: 'authFailed' }, subscription({ state: 'stopped', lastError })),
+				lastError
+			).toBe(action === 'replaceKey');
+		}
+	});
+});
+
+/**
+ * #446（監査 P2）: 接続の状態 × 購読の状態 × `lastError` の全組み合わせで、
+ * 画面が「キーを捨てるな」（トリップ）と「キーを替えよ」を同時に言わない。
+ *
+ * 画面に出るもの = 接続の状態の説明（`hubStatusDetail`）・購読の説明
+ * （`hubSubscriptionDetail`）・案内の行（`hubCredentialGuidanceLine`）・
+ * 手動キーの入力欄（`showManualKeyEntry`）。
+ */
+describe('接続の状態と購読の案内の組み合わせ', () => {
+	const LAST_ERRORS = [
+		null,
+		'unauthorized',
+		'transport',
+		'key_tripped',
+		'key_revoked',
+		'key_expired',
+		'key_not_found',
+		'credential_rejected'
+	];
+	const SUBSCRIPTION_STATES = ['stopped', 'unauthorized', 'live', 'reconnecting'] as const;
+	// 「キーを捨てるな」（トリップの案内は必ずこれを含む。失効などの案内の
+	// 「同じキーのままでは自動で再開しません」は逆の意味なので数えない）
+	const KEEP_KEY = ['解除を依頼'];
+	// 「キーを替えよ」
+	const REPLACE_KEY = ['採用', '再発行', '新しいAPIキー', '貼り付け'];
+
+	function screen(status: HubStatus, sub: HubSubscription) {
+		const texts = [
+			hubStatusDetail(status),
+			hubSubscriptionDetail(sub, status),
+			hubCredentialGuidanceLine(sub, status) ?? ''
+		];
+		return { texts, field: showManualKeyEntry(status, sub) };
+	}
+
+	it('トリップを保てと言いながら、キーの入れ替えを勧めない（入力欄も出さない）', () => {
+		for (const status of ALL_STATES) {
+			for (const state of SUBSCRIPTION_STATES) {
+				for (const lastError of LAST_ERRORS) {
+					for (const reason of [null, '購読を止めています。']) {
+						const sub = subscription({ state, lastError, reason });
+						const { texts, field } = screen(status, sub);
+						const label = `${status.state} × ${state} × ${lastError} × reason=${reason}`;
+						const keep = texts.some((text) => KEEP_KEY.some((word) => text.includes(word)));
+						const replace =
+							field || texts.some((text) => REPLACE_KEY.some((word) => text.includes(word)));
+						expect(keep && replace, label).toBe(false);
+					}
+				}
+			}
+		}
+	});
+
+	it('トリップ中（keyTripped）は、購読の理由に関わらずトリップの案内に揃い、入力欄を出さない', () => {
+		for (const state of SUBSCRIPTION_STATES) {
+			for (const lastError of LAST_ERRORS) {
+				const sub = subscription({ state, lastError });
+				expect(showManualKeyEntry({ state: 'keyTripped' }, sub), `${state} × ${lastError}`).toBe(
+					false
+				);
+				expect(effectiveCredentialGuidance({ state: 'keyTripped' }, lastError)?.action).toBe(
+					'askAdmin'
+				);
+			}
+		}
+		expect(hubStatusLabel({ state: 'keyTripped' })).toBe('キーがトリップ中');
+		expect(hubStatusDetail({ state: 'keyTripped' })).toContain('解除を依頼');
+		expect(hubStatusDetail({ state: 'keyTripped' })).toContain('同じキーのまま');
+		// 案内の行は接続の状態の説明と重複するので出さない。
+		expect(
+			hubCredentialGuidanceLine(
+				subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' }),
+				{ state: 'keyTripped' }
+			)
+		).toBeNull();
+	});
+
+	it('REST が「キーが無効／権限が無い」と言っているときは、古いトリップの案内を出さない', () => {
+		for (const status of [
+			{ state: 'authFailed' },
+			{ state: 'forbidden' },
+			{ state: 'needsPairing' }
+		] as HubStatus[]) {
+			expect(effectiveCredentialGuidance(status, 'key_tripped'), status.state).toBeNull();
+			// 失効などの案内はそのまま（どちらも「キーを替えよ」で揃っている）。
+			expect(effectiveCredentialGuidance(status, 'key_revoked')?.action).toBe('replaceKey');
+		}
+		// 接続の状態が別の話（接続済み・到達不能）なら、購読の理由の案内のまま。
+		expect(
+			effectiveCredentialGuidance({ state: 'connected', tagCount: 1 }, 'key_tripped')?.action
+		).toBe('askAdmin');
+	});
+
+	it('失効・期限切れ・存在しないは、接続の状態が authFailed でも入力欄と案内が揃う', () => {
+		for (const lastError of ['key_revoked', 'key_expired', 'key_not_found']) {
+			const sub = subscription({ state: 'stopped', reason: 'r', lastError });
+			const { texts, field } = screen({ state: 'authFailed' }, sub);
+			expect(field, lastError).toBe(true);
+			expect(
+				texts.some((text) => text.includes('新しいAPIキー')),
+				lastError
+			).toBe(true);
+		}
+	});
+});
+
+/**
+ * #449 レビュー P2-2: 画面を開き直さない時系列。接続の状態は画面を開いたとき・
+ * 明示操作のときにしか取り直さず、購読の状態だけが 2 秒ごとに更新される。
+ * 古い接続の状態で、新しい拒否の理由を抑えない。
+ */
+describe('接続の状態が購読より古くなったとき（時系列）', () => {
+	/** 画面が実際に出すもの（HubSection と同じ組み立て）。 */
+	function render(
+		status: HubStatus,
+		observedWith: HubSubscription | null,
+		current: HubSubscription
+	) {
+		const display = hubStatusDisplay(status, observedWith, current);
+		const texts = [
+			display.label,
+			display.detail,
+			hubSubscriptionDetail(current, display.guidance),
+			hubCredentialGuidanceLine(current, display.guidance) ?? ''
+		];
+		return {
+			display,
+			texts,
+			field: showManualKeyEntry(display.guidance, current),
+			keepKey: texts.some((text) => text.includes('解除を依頼'))
+		};
+	}
+
+	it('keyTripped で開く → 解除されて live → 開いたまま key_revoked', () => {
+		// 1. トリップ中に画面を開く（`status()` の応答に接続の状態と購読が一緒に来る）。
+		const status: HubStatus = { state: 'keyTripped' };
+		const opened = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+		let screen = render(status, opened, opened);
+		expect(screen.display.stale).toBe(false);
+		expect(screen.keepKey).toBe(true);
+		expect(screen.field).toBe(false);
+
+		// 2. 管理者が解除し、見張りが張り直して受信中（ポーリングで購読だけ更新）。
+		const live = subscription({ state: 'live', lastError: null });
+		screen = render(status, opened, live);
+		expect(screen.display.stale, '古いトリップの表示を残さない').toBe(true);
+		expect(screen.display.label).toBe(HUB_STATUS_RECHECKING_LABEL);
+		expect(screen.keepKey).toBe(false);
+
+		// 3. 画面を開いたまま、そのキーが失効する（close 1008 api_key_revoked）。
+		const revoked = subscription({ state: 'unauthorized', lastError: 'key_revoked' });
+		screen = render(status, opened, revoked);
+		expect(screen.display.stale).toBe(true);
+		expect(screen.keepKey, '古い keyTripped で「解除を依頼」と言わない').toBe(false);
+		expect(hubSubscriptionDetail(revoked, screen.display.guidance)).toBe(
+			hubCredentialGuidance('key_revoked')?.message
+		);
+		expect(screen.field, '交換用の入力欄を隠さない').toBe(true);
+
+		// 4. 取り直した接続の状態（401 = authFailed）が届けば、古くない状態に戻る。
+		screen = render({ state: 'authFailed' }, revoked, revoked);
+		expect(screen.display.stale).toBe(false);
+		expect(screen.keepKey).toBe(false);
+		expect(screen.field).toBe(true);
+	});
+
+	it('トリップ中に画面を開き、開いたままトリップが続く間は古くならない', () => {
+		const status: HubStatus = { state: 'keyTripped' };
+		const opened = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+		// ポーリングで同じ内容の購読が届き続ける。
+		const same = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+		expect(isHubStatusStale(status, opened, same)).toBe(false);
+	});
+
+	it('キーについて何も言っていない接続の状態は、購読のキーに関わる部分が変わっても古いと扱わない', () => {
+		const opened = subscription({ state: 'connecting', lastError: null });
+		const reconnecting = subscription({ state: 'reconnecting', lastError: 'transport' });
+		const live = subscription({ state: 'live', lastError: null });
+		for (const status of [
+			{ state: 'connected', tagCount: 1 },
+			{ state: 'unreachable', cause: 'transport' },
+			{ state: 'notConfigured' }
+		] as HubStatus[]) {
+			expect(isHubStatusStale(status, opened, reconnecting), status.state).toBe(false);
+		}
+		// #449 3 回目のレビュー: ただし購読が受信しているのに「接続済み」でない
+		// のは、どの状態でも古い（Hub が戻ったことを知る唯一のきっかけ）。
+		expect(isHubStatusStale({ state: 'connected', tagCount: 1 }, opened, live)).toBe(false);
+		for (const status of [
+			{ state: 'unreachable', cause: 'transport' },
+			{ state: 'unreachable', cause: 'server_error' },
+			{ state: 'notConfigured' }
+		] as HubStatus[]) {
+			expect(isHubStatusStale(status, opened, live), status.state).toBe(true);
+		}
+		// キーについて言っている状態は、購読のキーに関わる部分が変われば古い。
+		for (const status of [
+			{ state: 'keyTripped' },
+			{ state: 'authFailed' },
+			{ state: 'forbidden' },
+			{ state: 'needsPairing' }
+		] as HubStatus[]) {
+			expect(isHubStatusStale(status, opened, live), status.state).toBe(true);
+		}
+	});
+
+	it('購読のキーに関わる部分', () => {
+		expect(subscriptionCredentialSignal(null)).toBeNull();
+		expect(subscriptionCredentialSignal(subscription({ state: 'live' }))).toBe('live');
+		expect(
+			subscriptionCredentialSignal(
+				subscription({ state: 'unauthorized', lastError: 'unauthorized' })
+			)
+		).toBe('unauthorized');
+		expect(
+			subscriptionCredentialSignal(subscription({ state: 'stopped', lastError: 'key_expired' }))
+		).toBe('key_expired');
+		expect(
+			subscriptionCredentialSignal(subscription({ state: 'reconnecting', lastError: 'transport' }))
+		).toBeNull();
+	});
+});
+
+describe('adoptionResult（採用しなかった候補キーの判定を、保存中のキーの状態にしない）', () => {
+	const view = (status: HubStatus): HubView => ({
+		status,
+		endpoint: 'http://hub',
+		keyName: null,
+		selectedTags: [],
+		tags: null,
+		subscription: subscription({ state: 'stopped', reason: 'r', lastError: 'key_revoked' })
+	});
+
+	it('候補が通らなければ接続の状態は前のまま、理由は別に伝える', () => {
+		const previous: HubStatus = { state: 'authFailed' };
+		for (const candidate of [
+			{ state: 'keyTripped' },
+			{ state: 'forbidden' },
+			{ state: 'authFailed' },
+			{ state: 'unreachable', cause: 'transport' }
+		] as HubStatus[]) {
+			const outcome = adoptionResult(previous, view(candidate));
+			expect(outcome.status, candidate.state).toBe(previous);
+			expect(outcome.adopted).toBe(false);
+			expect(outcome.notice).toContain(hubStatusLabel(candidate));
+			expect(outcome.notice).toContain('採用できませんでした');
+		}
+		// 連携が必要な Hub で候補が通らなくても、「連携が必要」と入力欄は残る。
+		const pairing = adoptionResult({ state: 'needsPairing' }, view({ state: 'forbidden' }));
+		expect(pairing.status).toEqual({ state: 'needsPairing' });
+	});
+
+	it('失効した K1 に対して候補 K2 がトリップしていても、「解除を依頼」と言わない', () => {
+		const outcome = adoptionResult({ state: 'authFailed' }, view({ state: 'keyTripped' }));
+		const current = view({ state: 'keyTripped' }).subscription;
+		const texts = [
+			hubStatusDetail(outcome.status),
+			hubSubscriptionDetail(current, outcome.status),
+			hubCredentialGuidanceLine(current, outcome.status) ?? ''
+		];
+		expect(texts.some((text) => text.includes('解除を依頼'))).toBe(false);
+		expect(showManualKeyEntry(outcome.status, current)).toBe(true);
+	});
+
+	it('採用できたら、その接続の状態を出す', () => {
+		const outcome = adoptionResult(
+			{ state: 'needsPairing' },
+			view({ state: 'connected', tagCount: 2 })
+		);
+		expect(outcome).toEqual({
+			status: { state: 'connected', tagCount: 2 },
+			adopted: true,
+			notice: null
+		});
+	});
+});
+
+/**
+ * #449 再レビュー P2 ×2: 画面の接続の状態の組（状態・観測時点・確認し直しの
+ * 段階）を、HubSection と同じ手順（`runStaleRecheck` / `snapshotAfterAdoption` /
+ * `snapshotFromStoredView`）で時系列に動かす。
+ */
+describe('画面の接続の状態の遷移（確認し直しの失敗・候補キーの不採用）', () => {
+	/** HubSection の状態の写し。`poll` は購読のポーリング 1 回（2 秒）。 */
+	function screenModel(fetchStatus: () => Promise<RunWithLimitOutcome<HubView>>, opened: HubView) {
+		const state = {
+			snapshot: snapshotFromStoredView(opened) as HubStatusSnapshot,
+			subscription: opened.subscription as HubSubscription,
+			busy: false,
+			now: 0,
+			fetches: 0
+		};
+		const host = {
+			snapshot: () => state.snapshot,
+			apply: (snapshot: HubStatusSnapshot, view?: HubView) => {
+				state.snapshot = snapshot;
+				if (view) state.subscription = view.subscription;
+			},
+			setBusy: (busy: boolean) => {
+				state.busy = busy;
+			},
+			fetchStatus: () => {
+				state.fetches += 1;
+				return fetchStatus();
+			},
+			now: () => state.now
+		};
+		const display = () =>
+			hubStatusDisplay(
+				state.snapshot.status,
+				state.snapshot.observedWith,
+				state.subscription,
+				state.snapshot.recheck
+			);
+		return {
+			state,
+			display,
+			/** 購読のポーリングが届き、画面の `$effect` が確認し直しを 1 回進める。 */
+			async poll(next: HubSubscription) {
+				state.now += 2_000;
+				state.subscription = next;
+				if (!state.busy) await runStaleRecheck(host, state.subscription);
+			},
+			/** 「状態を再取得」。 */
+			async retry() {
+				await runStaleRecheck(host, state.subscription, true);
+			},
+			/** 手動キーの採用の応答。 */
+			adopt(view: HubView) {
+				state.snapshot = snapshotAfterAdoption(state.snapshot, view);
+				state.subscription = view.subscription;
+			},
+			screen() {
+				const shown = display();
+				const texts = [
+					shown.label,
+					shown.detail,
+					hubSubscriptionDetail(state.subscription, shown.guidance),
+					hubCredentialGuidanceLine(state.subscription, shown.guidance) ?? ''
+				];
+				return {
+					shown,
+					keepKey: texts.some((text) => text.includes('解除を依頼')),
+					field: showManualKeyEntry(shown.guidance, state.subscription),
+					tagsBlock: state.snapshot.status.state === 'connected' && !shown.stale
+				};
+			}
+		};
+	}
+
+	const hubView = (status: HubStatus, sub: HubSubscription): HubView => ({
+		status,
+		endpoint: 'http://hub',
+		keyName: null,
+		selectedTags: [],
+		tags: null,
+		subscription: sub
+	});
+	const tripped = subscription({ state: 'stopped', reason: 'r', lastError: 'key_tripped' });
+	const live = subscription({ state: 'live', lastError: null });
+	const revoked = subscription({ state: 'unauthorized', lastError: 'key_revoked' });
+
+	for (const failure of ['failed', 'timedOut', 'rejected'] as const) {
+		it(`確認し直しが ${failure} なら「確認できませんでした」と再取得を出し、ポーリングが成功し続けても連続では撃たない`, async () => {
+			let answer: 'fail' | 'connected' = 'fail';
+			const model = screenModel(
+				async () => {
+					if (answer === 'connected') {
+						return { kind: 'ok', value: hubView({ state: 'connected', tagCount: 1 }, live) };
+					}
+					if (failure === 'rejected') throw new Error('network');
+					return failure === 'failed'
+						? { kind: 'failed', error: new Error('x') }
+						: { kind: 'timedOut' };
+				},
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+
+			// 解除されて live に戻る → 古い keyTripped → 取り直しが失敗する。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			expect(model.state.busy).toBe(false);
+			let screen = model.screen();
+			expect(screen.shown.label).toBe(HUB_STATUS_RECHECK_FAILED_LABEL);
+			expect(screen.shown.recheckFailed, '再取得のボタンを出す').toBe(true);
+			expect(screen.keepKey).toBe(false);
+
+			// ポーリングは成功し続ける。間隔の間は撃たない（連続再試行しない）。
+			const pollsInInterval = STALE_RECHECK_RETRY_MS / 2_000 - 1;
+			for (let i = 0; i < pollsInInterval; i += 1) await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			expect(model.screen().shown.recheckFailed).toBe(true);
+
+			// 間隔が過ぎたら自動で 1 回だけ試し直す（まだ失敗）。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(2);
+			expect(model.screen().shown.recheckFailed).toBe(true);
+
+			// 「状態を再取得」は間隔を待たずに行く。今度は読める。
+			answer = 'connected';
+			await model.retry();
+			expect(model.state.fetches).toBe(3);
+			screen = model.screen();
+			expect(screen.shown.stale).toBe(false);
+			expect(screen.shown.recheckFailed).toBe(false);
+			expect(screen.tagsBlock, 'タグの操作欄が戻る').toBe(true);
+		});
+	}
+
+	for (const candidate of [
+		{ state: 'authFailed' },
+		{ state: 'forbidden' },
+		{ state: 'keyTripped' }
+	] as HubStatus[]) {
+		it(`確認し直しの失敗 → 古い keyTripped と新しい key_revoked → 候補 ${candidate.state} の不採用でも、交換の案内と入力欄が残る`, async () => {
+			const model = screenModel(
+				async () => ({ kind: 'failed', error: new Error('x') }),
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+			await model.poll(revoked);
+			let screen = model.screen();
+			expect(screen.shown.stale).toBe(true);
+			expect(screen.keepKey).toBe(false);
+			expect(screen.field).toBe(true);
+
+			// 候補キーの採用に失敗（バックエンドは保存中の K1 の購読を返す）。
+			model.adopt(hubView(candidate, revoked));
+			screen = model.screen();
+			expect(screen.shown.stale, '古い状態を新しい購読と一緒に観測したことにしない').toBe(true);
+			expect(screen.keepKey, '「解除を依頼」に戻さない').toBe(false);
+			expect(screen.field, '交換用の入力欄を残す').toBe(true);
+			expect(hubSubscriptionDetail(model.state.subscription, screen.shown.guidance)).toBe(
+				hubCredentialGuidance('key_revoked')?.message
+			);
+			// 失敗していたことも忘れない（再取得のボタンが残る）。
+			expect(screen.shown.recheckFailed).toBe(true);
+		});
+	}
+
+	for (const cause of ['server_error', 'transport'] as const) {
+		it(`確認し直しが ok + unreachable（${cause}）でも、その後の live で取り直し、タグの操作欄が戻る`, async () => {
+			const unreachable: HubStatus = { state: 'unreachable', cause };
+			// 確認し直しの catalog だけが落ちる。バックエンドは購読も止める。
+			const stopped = subscription({ state: 'stopped', reason: 'r', lastError: null });
+			let answer: 'unreachable' | 'connected' = 'unreachable';
+			const model = screenModel(
+				async () => ({
+					kind: 'ok',
+					value:
+						answer === 'unreachable'
+							? hubView(unreachable, stopped)
+							: hubView({ state: 'connected', tagCount: 1 }, live)
+				}),
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+
+			// 解除されて live → 古い keyTripped → 取り直しは往復成功・中身は到達不能。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			expect(model.state.snapshot.status).toEqual(unreachable);
+			let screen = model.screen();
+			expect(screen.shown.label, '到達不能という結果は出す').toBe(hubStatusLabel(unreachable));
+			expect(screen.tagsBlock).toBe(false);
+			expect(
+				showStatusRecheckButton(screen.shown, model.state.snapshot.status, true),
+				'到達不能のままでも「状態を再取得」を出す'
+			).toBe(true);
+
+			// Hub が戻り、見張りが購読を張り直して live（ポーリング）。
+			answer = 'connected';
+			await model.poll(live);
+			expect(model.state.fetches, '古い unreachable を live で取り直す').toBe(2);
+			screen = model.screen();
+			expect(screen.shown.stale).toBe(false);
+			expect(screen.tagsBlock, 'タグの操作欄が戻る').toBe(true);
+		});
+
+		it(`確認し直しが ok + unreachable（${cause}）のまま購読は live（食い違いが続く）なら、30 秒ごとに試し直し、再取得で戻る`, async () => {
+			const unreachable: HubStatus = { state: 'unreachable', cause };
+			let answer: 'unreachable' | 'connected' = 'unreachable';
+			const model = screenModel(
+				async () => ({
+					kind: 'ok',
+					value:
+						answer === 'unreachable'
+							? hubView(unreachable, live)
+							: hubView({ state: 'connected', tagCount: 1 }, live)
+				}),
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+			await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			let screen = model.screen();
+			expect(screen.shown.stale).toBe(true);
+			expect(screen.shown.label).toBe(hubStatusLabel(unreachable));
+			expect(screen.shown.recheckFailed).toBe(true);
+
+			// 間隔の間は撃たない。
+			for (let i = 0; i < STALE_RECHECK_RETRY_MS / 2_000 - 1; i += 1) await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			// 30 秒で 1 回だけ試し直す（まだ到達不能）。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(2);
+
+			// 「状態を再取得」で戻る。
+			answer = 'connected';
+			await model.retry();
+			expect(model.state.fetches).toBe(3);
+			screen = model.screen();
+			expect(screen.shown.stale).toBe(false);
+			expect(screen.tagsBlock).toBe(true);
+		});
+	}
+
+	it('画面を開いた時点で到達不能なら（確認し直しではない）、「状態を再取得」で取り直せる', async () => {
+		const stopped = subscription({ state: 'stopped', reason: 'r', lastError: null });
+		const model = screenModel(
+			async () => ({ kind: 'ok', value: hubView({ state: 'connected', tagCount: 1 }, live) }),
+			hubView({ state: 'unreachable', cause: 'transport' }, stopped)
+		);
+		// 購読は止まったまま（タグ未選択など）なので、live のきっかけは来ない。
+		await model.poll(stopped);
+		expect(model.state.fetches).toBe(0);
+		const shown = model.screen().shown;
+		expect(showStatusRecheckButton(shown, model.state.snapshot.status, true)).toBe(true);
+		// 保存済みの接続先が無い（「接続」が失敗しただけ）なら出さない。
+		expect(showStatusRecheckButton(shown, model.state.snapshot.status, false)).toBe(false);
+		await model.retry();
+		expect(model.state.fetches).toBe(1);
+		expect(model.screen().tagsBlock).toBe(true);
+	});
+
+	it('採用できたら、その応答で組ごと新しくなる', () => {
+		const snapshot = snapshotFromStoredView(hubView({ state: 'keyTripped' }, tripped));
+		const adopted = snapshotAfterAdoption(
+			snapshot,
+			hubView({ state: 'connected', tagCount: 1 }, live)
+		);
+		expect(adopted).toEqual({
+			status: { state: 'connected', tagCount: 1 },
+			observedWith: live,
+			recheck: { phase: 'idle' }
+		});
+		expect(INITIAL_STATUS_SNAPSHOT.recheck).toEqual({ phase: 'idle' });
 	});
 });
 

@@ -49,22 +49,23 @@
 	 * 平文の API キーは画面に出さない: 手動連携の入力欄は
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
 	 */
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
 	import {
 		adoptHubKey,
+		adoptionResult,
 		applyServerSelection,
 		connectHub,
 		disconnectHub,
 		getHubStatus,
 		getHubSubscription,
 		hubAbandonedDisplay,
+		hubCredentialGuidanceLine,
 		hubLastValueLabel,
 		hubPollStaleNote,
 		hubRemainderNote,
-		hubStatusDetail,
-		hubStatusLabel,
+		hubStatusDisplay,
 		hubSubscriptionDetail,
 		hubSubscriptionHeadline,
 		hubTimeLabel,
@@ -87,7 +88,12 @@
 		setHubSelectedTags,
 		showManualKeyEntry,
 		showsServerSelectionDiff,
-		type HubStatus,
+		INITIAL_STATUS_SNAPSHOT,
+		snapshotAfterAdoption,
+		snapshotFromStoredView,
+		runStaleRecheck,
+		showStatusRecheckButton,
+		type HubStatusSnapshot,
 		type HubSubscription,
 		type HubTag,
 		type HubView
@@ -99,7 +105,16 @@
 	/** 購読状態のポーリング間隔（ms）。ネットワークを伴わない読み取り。 */
 	const SUBSCRIPTION_POLL_MS = 2000;
 
-	let status = $state<HubStatus>({ state: 'notConfigured' });
+	/**
+	 * 接続の状態と、それを**いつ観測したか**（一緒に届いた購読）と、古く
+	 * なったときの確認し直しの段階（#449 レビュー P2-2 / 再レビュー P2）。
+	 * 3 つは必ず 1 つの値として書き換える（`HubStatusSnapshot` の doc）。
+	 * 書き換えるのは `applyView`（保存しているキーの応答）・`adopt`
+	 * （`snapshotAfterAdoption`）・確認し直し（`staleRecheckStep` /
+	 * `staleRecheckSettled`）だけ。
+	 */
+	let statusSnapshot = $state<HubStatusSnapshot>(INITIAL_STATUS_SNAPSHOT);
+	const status = $derived(statusSnapshot.status);
 	let tags = $state<HubTag[] | null>(null);
 	let selected = $state<string[]>([]);
 	/**
@@ -140,6 +155,26 @@
 	 * `lastError` を独立した行で出すか。`stopped` かつ `reason` が無いときは
 	 * `hubSubscriptionDetail` がエラーを文中に入れるので、二重に出さない。
 	 */
+	/**
+	 * #446: Hub が close 1008 で購読を打ち切った理由ごとの案内（トリップなら
+	 * 管理者に解除を依頼、失効・期限切れ・存在しないなら新しいキー）。
+	 * `unauthorized` のときは説明文そのものが案内なので出さない。
+	 */
+	/**
+	 * 画面に出す接続の状態。古ければ「確認し直しています」になり、購読の
+	 * 案内と入力欄の判断には使わない（#449 レビュー P2-2）。
+	 */
+	const statusDisplay = $derived(
+		hubStatusDisplay(
+			statusSnapshot.status,
+			statusSnapshot.observedWith,
+			subscription,
+			statusSnapshot.recheck
+		)
+	);
+	const credentialGuidanceLine = $derived(
+		hubCredentialGuidanceLine(subscription, statusDisplay.guidance)
+	);
 	const showLastErrorLine = $derived(
 		subscription !== null && !(subscription.state === 'stopped' && !subscription.reason)
 	);
@@ -206,9 +241,17 @@
 		lastPolledAt = Date.now();
 	}
 
-	function applyView(view: HubView): void {
+	/**
+	 * 応答を画面に反映する。`snapshot` は接続の状態の組をどう更新するか:
+	 * 既定は「保存しているキーについての応答」（`snapshotFromStoredView`）。
+	 * 採用できなかった候補キーの応答は `adopt` が前の組をそのまま渡す。
+	 */
+	function applyView(
+		view: HubView,
+		snapshot: HubStatusSnapshot = snapshotFromStoredView(view)
+	): void {
 		beginExplicitChange();
-		status = view.status;
+		statusSnapshot = snapshot;
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
 		serverSelected = [...view.selectedTags];
@@ -371,6 +414,44 @@
 		}
 	}
 
+	/**
+	 * 接続の状態が古くなったら（#449 レビュー P2-2）取り直す。いつ行くかは
+	 * `staleRecheckStep`: 1 本ずつ、失敗したら「確認できませんでした」と
+	 * 「状態を再取得」を出し、自動では `STALE_RECHECK_RETRY_MS` ごとにしか
+	 * 試さない（#449 再レビュー P2）。購読のポーリング（2 秒）で `subscription`
+	 * が入れ替わるたびに評価し直すので、間隔の経過もそこで拾う。
+	 */
+	$effect(() => {
+		if (!available) return;
+		const current = subscription;
+		if (busy) return;
+		untrack(() => void recheckStaleStatus(current, false));
+	});
+
+	/**
+	 * 取り直しを 1 回ぶん進める（`force` は「状態を再取得」ボタン）。手順は
+	 * `runStaleRecheck`（テストも同じ手順を通る）: 失敗・打ち切り・reject でも
+	 * 必ず段階を `failed` に進め、`busy` を降ろす。
+	 */
+	function recheckStaleStatus(current: HubSubscription | null, force: boolean): Promise<unknown> {
+		return runStaleRecheck(
+			{
+				snapshot: () => statusSnapshot,
+				apply: (snapshot, view) => {
+					if (view) applyView(view, snapshot);
+					else statusSnapshot = snapshot;
+				},
+				setBusy: (value) => {
+					busy = value;
+				},
+				fetchStatus: () => runWithLimit((signal) => getHubStatus(signal), HUB_UI_REREAD_TIMEOUT_MS),
+				now: () => Date.now()
+			},
+			current,
+			force
+		);
+	}
+
 	$effect(() => {
 		if (!available) return;
 		void run(async (signal) => {
@@ -402,9 +483,15 @@
 			// 打ち切りの扱いは `connect` のコメント参照。
 			const view = await adoptHubKey(endpointDraft, manualKeyDraft, signal);
 			if (signal.aborted) return;
-			applyView(view);
+			// #449 レビューの洗い出し / 再レビュー P2: 採用しなかった候補キーの
+			// 判定を、保存中のキーの接続の状態として出さない。**観測時点も
+			// 確認し直しの段階も前のまま**（`snapshotAfterAdoption`）- 片方だけ
+			// 新しくすると、古い状態を新しい購読と一緒に観測したことになる。
+			const outcome = adoptionResult(status, view);
+			applyView(view, snapshotAfterAdoption(statusSnapshot, view));
 			// 採用できたときだけ入力欄を空にする（失敗時に貼り直させない）。
-			if (view.status.state === 'connected') manualKeyDraft = '';
+			if (outcome.adopted) manualKeyDraft = '';
+			else hubError = outcome.notice;
 		});
 	}
 
@@ -662,9 +749,23 @@
 			</button>
 
 			<p class="status">
-				状態: <strong>{hubStatusLabel(status)}</strong>
+				状態: <strong>{statusDisplay.label}</strong>
 			</p>
-			<p class="note">{hubStatusDetail(status)}</p>
+			<p class="note">{statusDisplay.detail}</p>
+			{#if showStatusRecheckButton(statusDisplay, status, configured)}
+				<!--
+					#449 再レビュー P2 / 3 回目のレビュー: 取り直しに失敗した、または
+					Hub に到達できないときは、読み取り専用の再取得を出す（`status()` は
+					読み取りだけで、キーを発行しない）。
+				-->
+				<button
+					type="button"
+					onclick={() => recheckStaleStatus(subscription, true)}
+					disabled={busy}
+				>
+					状態を再取得
+				</button>
+			{/if}
 
 			{#if keyName}
 				<p class="note">このアプリのAPIキー名: <code>{keyName}</code></p>
@@ -702,7 +803,7 @@
 				<p class="note selection-discarded" role="status">{selectionDiscardedNotice}</p>
 			{/if}
 
-			{#if showManualKeyEntry(status, subscription)}
+			{#if showManualKeyEntry(statusDisplay.guidance, subscription)}
 				<div class="server-fields">
 					<label class="field hub-endpoint">
 						APIキー（Hubの管理画面で発行したもの）
@@ -814,7 +915,10 @@
 				{#if subscriptionStale}
 					<p class="note poll-stale" role="status">{hubPollStaleNote(lastPolledAt)}</p>
 				{/if}
-				<p class="note">{hubSubscriptionDetail(subscription)}</p>
+				<p class="note">{hubSubscriptionDetail(subscription, statusDisplay.guidance)}</p>
+				{#if credentialGuidanceLine}
+					<p class="note hub-credential-guidance" role="status">{credentialGuidanceLine}</p>
+				{/if}
 				<!--
 					購読全体の最終受信時刻。値の表の行ごとの `t` は
 					「この行がいつの値か」であって、購読が生きているかの

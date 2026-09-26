@@ -9,8 +9,33 @@
 //! `200 {"tags": []}` on a freshly installed Hub, and the operator must see
 //! "接続済み・利用可能なタグなし" rather than a failure.
 
+use std::fmt;
+
 use banto_tagclient::CatalogSnapshot;
 use serde::Serialize;
+
+/// #446: an opaque, in-process identity of one (Hub endpoint, API key) pair.
+///
+/// A verdict ([`HubConnection::judged`]) and whatever an app remembers about
+/// a key (a close-1008 reason, for instance) are only comparable when they
+/// are about **the same key**: `adopt_manual_key` judges a candidate that may
+/// never be stored, and `connect` may replace the stored key before its last
+/// check fails. The app compares identities
+/// ([`Bootstrapper::stored_credential`](crate::Bootstrapper::stored_credential))
+/// instead of guessing from which call it made.
+///
+/// It is a keyed hash made with a per-[`Bootstrapper`](crate::Bootstrapper)
+/// random seed ([`std::hash::RandomState`]): stable within one process,
+/// meaningless outside it, never persisted, and it does not reveal the key
+/// (`Debug` prints no value). There is no way to turn it back into a key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CredentialIdentity(pub(crate) u64);
+
+impl fmt::Debug for CredentialIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CredentialIdentity(..)")
+    }
+}
 
 /// Why the Hub could not be reached or did not answer usefully. A small,
 /// stable vocabulary - never a message built from a response body, a URL, or
@@ -64,8 +89,16 @@ pub enum HubStatus {
     /// while the Hub is still in commissioning mode.
     AuthFailed,
     /// The stored key authenticated but carries no usable `read` scope
-    /// (HTTP 403).
+    /// (HTTP 403 without `key_tripped`).
     Forbidden,
+    /// #446: the stored key is **tripped** - banto-hub answered
+    /// `403 {"error": "key_tripped"}` (#435). Unlike [`Self::Forbidden`] and
+    /// [`Self::AuthFailed`], the key itself is still good: an administrator
+    /// clears the trip and **the same key** works again. Nothing in this
+    /// crate discards, revokes, or re-issues a tripped key
+    /// ([`Bootstrapper::connect`](crate::Bootstrapper::connect) stops here
+    /// the way it stops at [`Self::Unreachable`]).
+    KeyTripped,
     /// Nothing usable came back. See [`UnreachableCause`].
     Unreachable { cause: UnreachableCause },
     /// The Hub is already locked down and this installation has no usable
@@ -83,6 +116,7 @@ impl HubStatus {
             Self::Connected { .. } => "connected",
             Self::AuthFailed => "auth_failed",
             Self::Forbidden => "forbidden",
+            Self::KeyTripped => "key_tripped",
             Self::Unreachable { .. } => "unreachable",
             Self::NeedsPairing => "needs_pairing",
         }
@@ -108,13 +142,26 @@ impl HubStatus {
 pub struct HubConnection {
     pub status: HubStatus,
     pub catalog: Option<CatalogSnapshot>,
+    /// #446: which credential `status` is a verdict about - the key that was
+    /// actually checked against `GET /api/v1/tags`. `None` when no key was
+    /// checked (not configured, no stored key, the commissioning check or
+    /// issuing failed, or the app gave up waiting).
+    ///
+    /// **It is not necessarily the stored key**: a rejected
+    /// `adopt_manual_key` candidate is judged but never stored. Compare it
+    /// with [`Bootstrapper::stored_credential`](crate::Bootstrapper::stored_credential)
+    /// before applying the verdict to anything remembered about the stored
+    /// key.
+    pub judged: Option<CredentialIdentity>,
 }
 
 impl HubConnection {
-    pub(crate) const fn failed(status: HubStatus) -> Self {
+    /// A result with no verdict about any key (`judged: None`).
+    pub const fn failed(status: HubStatus) -> Self {
         Self {
             status,
             catalog: None,
+            judged: None,
         }
     }
 
@@ -124,7 +171,13 @@ impl HubConnection {
                 tag_count: catalog.tags.len(),
             },
             catalog: Some(catalog),
+            judged: None,
         }
+    }
+
+    pub(crate) const fn judging(mut self, credential: CredentialIdentity) -> Self {
+        self.judged = Some(credential);
+        self
     }
 }
 
@@ -149,6 +202,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HubStatus::NotConfigured).unwrap(),
             r#"{"state":"notConfigured"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HubStatus::KeyTripped).unwrap(),
+            r#"{"state":"keyTripped"}"#
         );
     }
 

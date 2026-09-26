@@ -18,6 +18,10 @@ S4b-1互換候補では、`origin/main` 509bf0e（Banto v1.4.0）との統合検
 **実Hub接続は2026-09-01に検証済み**（`docs/real-machine-test-2026-09.md`、6項目すべて合格。
 403/503の区別を含む）、**配布サイズは§7.1、release tagは§7.2で確定**した。
 **private appへの固定は利用アプリの出現待ち**（上記）で、RTSPの別worktree/別履歴も含めない。
+**#446（2026-09-25）**: banto-hub がストリームを close 1008 と理由文（#430 / #439）で閉じたとき、
+close コードと理由文を捨てずに分類し（`close::classify_close`）、`unauthorized` + 理由ごとの
+`last_error`（`key_revoked` / `key_expired` / `key_tripped` / `key_not_found` /
+`credential_rejected`）で止まって**再接続しない**ようにした（§4 の分類表・§5 の状態機械）。
 **W1（2026-09-01）**では、Issue #123の残スコープだった単一タグ書き込み
 （`RestClient::write_tag`）を実装した。stable IDから外部名を都度re解決し、
 `POST /api/v1/values/{tag}`を1回送るだけで、`worker.rs`の再接続・backoff機構には
@@ -255,6 +259,11 @@ shutdownはそのエラーを返す。公開Handleによるcatalog起点の再�
 | `write_forbidden`               | 書き込みHTTP 403（`not_writable`/`missing_write_scope`/`session_token_cannot_write`/`key_tripped`、W1） | 設定・権限の問題。SDKは再試行しない。呼出側がタグ設定/APIキーscopeを直してから再度呼ぶ。 |
 | `write_unavailable`             | 書き込みHTTP 503（`writes_disabled`/`collection_not_running`、W1）                                      | 一時的なサーバー状態。SDKは再試行しない。呼出側の判断で後で再試行してよい。              |
 | `write_rejected`                | 書き込みのその他の拒否（404/409/422/429/501/502、W1）                                                   | リクエストの内容（タグ・値・timing）を直さない限り再試行しても成功しない。               |
+| `key_revoked`                   | Hubがストリームをclose 1008 `api_key_revoked`で閉じた（#446）                                           | 再接続しない（`unauthorized`で停止）。呼出側が新しいキーで再開始する。                   |
+| `key_expired`                   | close 1008 `api_key_expired`（#446）                                                                    | 同上。                                                                                   |
+| `key_not_found`                 | close 1008 `api_key_not_found`（#446）                                                                  | 同上。                                                                                   |
+| `key_tripped`                   | close 1008 `api_key_tripped`（#446、管理者が解除すれば同じキーで戻る）                                  | 再接続しない（`unauthorized`で停止）。解除後の再開始は呼出側が決める。                   |
+| `credential_rejected`           | close 1008 で理由文が上記以外（未知の理由、#446）                                                       | 再接続しない（`unauthorized`で停止）。                                                   |
 
 `Debug`/`Display`、エラー、ログにtokenを含めない。endpointについてもhost以外のpathや
 資格情報を露出しない。secret wrapperは値を常にredactする。
@@ -341,6 +350,7 @@ stateDiagram-v2
 	connecting --> unauthorized: 401 / 403
 	connecting --> reconnecting: transport / protocol error
 	live --> reconnecting: disconnect
+	live --> unauthorized: close 1008 + 理由文（#446、再接続しない）
 	live --> rebinding: config_changed
 	rebinding --> rebinding: coalesce further config_changed
 	rebinding --> live: catalog → resolve → WS subscribe → matching snapshot → publish gate
@@ -650,6 +660,7 @@ feature不使用、既定features）を対象に、一時的に`banto-tagclient`
 | endpoint boundary            | userinfo/query/fragment、禁止scheme、redirectを拒否する。                                         |
 | disconnect/reconnect         | bounded backoff後、catalog/snapshotから接続を再構築する。                                         |
 | 401/403                      | `unauthorized`になり、高速無限再試行しない。                                                      |
+| close 1008（#446）           | 理由文ごとの分類で`unauthorized`になり、再接続しない。1008以外のcloseは従来どおり再接続する。     |
 | malformed JSON               | `protocol_error`に分類し、secretを出さず回復経路へ入る。                                          |
 | invalid tag selection        | カンマを含む外部タグ名を通信前に`invalid_tag_selection`として拒否する。                           |
 | backpressure/latest-wins     | 遅いconsumerでもqueueが無制限に増えず、最新値を観測できる。                                       |

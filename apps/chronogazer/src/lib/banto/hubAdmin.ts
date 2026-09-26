@@ -32,6 +32,13 @@ export type HubStatus =
 	| { state: 'connected'; tagCount: number }
 	| { state: 'authFailed' }
 	| { state: 'forbidden' }
+	/**
+	 * #446: 保存済みのキーが Hub でトリップしている（REST が
+	 * `403 {"error":"key_tripped"}`）。`forbidden`（読み取り権限が無い）とも
+	 * `authFailed`（キーが無効）とも違い、**キーは捨てない** - 管理者が解除
+	 * すれば同じキーで戻る。
+	 */
+	| { state: 'keyTripped' }
 	| { state: 'unreachable'; cause: HubUnreachableCause }
 	| { state: 'needsPairing' };
 
@@ -324,6 +331,8 @@ export function hubStatusLabel(status: HubStatus): string {
 			return '認証に失敗';
 		case 'forbidden':
 			return '権限が不足';
+		case 'keyTripped':
+			return 'キーがトリップ中';
 		case 'unreachable':
 			return 'Hubに到達できません';
 		case 'needsPairing':
@@ -344,6 +353,8 @@ export function hubStatusDetail(status: HubStatus): string {
 			return '保存済みのAPIキーが無効です。「接続」でキーを再発行できます（Hubがロックダウン済みの場合は連携が必要です）。';
 		case 'forbidden':
 			return '保存済みのAPIキーに読み取り権限がありません。Hubの管理画面で読み取り権限のあるキーを発行し、下の欄から採用してください。';
+		case 'keyTripped':
+			return 'HubがこのAPIキーをトリップ（一時停止）させています。Hubの管理者に解除を依頼してください。解除されると同じキーのまま、数分以内に自動で購読を再開します（この画面を開き直すとすぐに確認します）。';
 		case 'unreachable':
 			return `${hubUnreachableCauseLabel(status.cause)} 接続先のURLとHubの稼働状況を確認してください。`;
 		case 'needsPairing':
@@ -367,6 +378,31 @@ export function hubUnreachableCauseLabel(cause: HubUnreachableCause): string {
 	}
 }
 
+/**
+ * 手動キーの採用の結果を、画面の状態に写す（#449 レビューの洗い出し、純関数）。
+ *
+ * 採用しなかった候補キーの応答は、`status` に**候補キーの**判定を載せて返る
+ * （`banto_hub_bootstrap` の `adopt_manual_key` は、候補が通らなければ何も
+ * 保存しない）。これを接続の状態として出すと、保存中のキーの話と取り違える -
+ * 例えば失効した K1 に対して候補 K2 がトリップしていると、「キーがトリップ中・
+ * 管理者に解除を依頼」と出て、K1 の「新しいキーを」と逆のことを言う。
+ * そこで候補が通らなかったときは**接続の状態を前のまま**にし、候補の判定は
+ * 採用できなかった理由として別に伝える。
+ */
+export function adoptionResult(
+	previous: HubStatus,
+	view: HubView
+): { status: HubStatus; adopted: boolean; notice: string | null } {
+	if (view.status.state === 'connected') {
+		return { status: view.status, adopted: true, notice: null };
+	}
+	return {
+		status: previous,
+		adopted: false,
+		notice: `このAPIキーは採用できませんでした（${hubStatusLabel(view.status)}）。保存済みの設定は変わっていません。`
+	};
+}
+
 /** 手動キーの入力欄を出すべき接続状態か（純関数）。 */
 export function needsManualKey(status: HubStatus): boolean {
 	return status.state === 'needsPairing' || status.state === 'forbidden';
@@ -383,10 +419,497 @@ export function needsManualKey(status: HubStatus): boolean {
  * 認証・手動キーの導線へ合流させる」はこれを指す。
  */
 export function showManualKeyEntry(
-	status: HubStatus,
+	status: HubStatus | null,
 	subscription: HubSubscription | null
 ): boolean {
-	return needsManualKey(status) || subscription?.state === 'unauthorized';
+	// #446: トリップ中はキーを捨てさせない（管理者が解除すれば同じキーで戻る）。
+	// 入力欄を出すと「新しいキーに替えよ」と読めるので出さない - 接続の状態が
+	// `keyTripped` なら `effectiveCredentialGuidance` が常にトリップの案内を
+	// 返すので、下の 3 つの条件はどれも真にならない。
+	const guidance = effectiveCredentialGuidance(status, subscription?.lastError ?? null);
+	return (
+		(status !== null && needsManualKey(status)) ||
+		// 購読だけ拒否された（WS のハンドシェイクだけが 401/403）。ただし
+		// 理由がトリップなら、上と同じくキーを替えさせない。
+		(subscription?.state === 'unauthorized' && guidance?.action !== 'askAdmin') ||
+		// #446: 失効・期限切れ・存在しないキーは、世代を止めた後（`stopped` +
+		// `lastError`）も「新しい API キーを設定」へ誘導する。案内だけ出して
+		// 入力欄が無い、という形にしない。
+		guidance?.action === 'replaceKey'
+	);
+}
+
+/**
+ * Hub が close 1008 で購読を打ち切った理由（`banto_tagclient::ErrorKind` の
+ * `as_str`、#446）。`HubSubscription.lastError` に載る。
+ */
+export type HubCredentialRejection =
+	'key_revoked' | 'key_expired' | 'key_tripped' | 'key_not_found' | 'credential_rejected';
+
+/**
+ * 理由ごとの次の一手（#446）。
+ *
+ * - `askAdmin`: トリップ。Hub の管理者が解除すれば**同じキーで戻る**ので、
+ *   キーを捨てさせない。アプリは数分おきに自動で確かめる。
+ * - `replaceKey`: 失効・期限切れ・存在しない。**同じキーでは二度と戻らない**
+ *   ので、新しい API キーを設定してもらう（アプリは自動で再試行しない）。
+ * - `checkHub`: 理由を判別できない 1008（新しい Hub の理由など）。管理者に
+ *   確認してもらい、アプリは数分おきに自動で確かめる。
+ */
+export type HubCredentialAction = 'askAdmin' | 'replaceKey' | 'checkHub';
+
+export interface HubCredentialGuidance {
+	reason: HubCredentialRejection;
+	action: HubCredentialAction;
+	message: string;
+}
+
+const REPLACE_KEY_STEPS =
+	'新しいAPIキーを設定してください（「接続」でキーを再発行するか、Hubの管理画面で発行したAPIキーをこの画面の入力欄から採用してください）。同じキーのままでは自動で再開しません。';
+
+/**
+ * `lastError` から、Hub が購読を打ち切った理由ごとの案内を作る（純関数、
+ * `hubAdmin.test.ts` が表で固定する）。close 1008 の分類でなければ `null`
+ * （通信系のエラーや理由の無い 401/403 は従来の文言に任せる）。
+ *
+ * 「自動で再開します」と書くのはトリップと判別できない理由だけ - それぞれ
+ * 見張り（`chronogazer_core::hub` の `retry_pace`）が 2 分に 1 回確かめに
+ * 行く経路がある。失効・期限切れ・存在しないは見張りが再試行しないので、
+ * 自動で戻るとは書かない。
+ */
+export function hubCredentialGuidance(lastError: string | null): HubCredentialGuidance | null {
+	switch (lastError) {
+		case 'key_tripped':
+			return {
+				reason: 'key_tripped',
+				action: 'askAdmin',
+				message:
+					'HubがこのAPIキーをトリップ（一時停止）させたため、購読を止めています。Hubの管理者に解除を依頼してください。解除されると同じキーのまま、数分以内に自動で再開します（この画面を開き直すとすぐに確認します）。'
+			};
+		case 'key_revoked':
+			return {
+				reason: 'key_revoked',
+				action: 'replaceKey',
+				message: `HubでこのAPIキーが失効したため、購読を止めています。${REPLACE_KEY_STEPS}`
+			};
+		case 'key_expired':
+			return {
+				reason: 'key_expired',
+				action: 'replaceKey',
+				message: `このAPIキーの有効期限が切れたため、購読を止めています。${REPLACE_KEY_STEPS}`
+			};
+		case 'key_not_found':
+			return {
+				reason: 'key_not_found',
+				action: 'replaceKey',
+				message: `HubにこのAPIキーが見つからないため、購読を止めています。${REPLACE_KEY_STEPS}`
+			};
+		case 'credential_rejected':
+			return {
+				reason: 'credential_rejected',
+				action: 'checkHub',
+				message:
+					'Hubがこのキーでの購読を打ち切りました（理由を判別できません）。Hubの管理者に確認してください。数分おきに自動で確認します。'
+			};
+		default:
+			return null;
+	}
+}
+
+/**
+ * 購読の状態のうち、キーの扱いに関わる部分（#449 レビュー P2-2、純関数）。
+ * close 1008 の理由・理由の無い購読の拒否・受信中のどれか。これが変われば、
+ * 前に一緒に観測した接続の状態はもう今のキーの話をしていないかもしれない。
+ */
+export function subscriptionCredentialSignal(subscription: HubSubscription | null): string | null {
+	if (!subscription) return null;
+	const guidance = hubCredentialGuidance(subscription.lastError);
+	if (guidance) return guidance.reason;
+	if (subscription.state === 'unauthorized') return 'unauthorized';
+	if (subscription.state === 'live') return 'live';
+	return null;
+}
+
+/** キーについて何かを言っている接続の状態（案内や入力欄を左右するもの）。 */
+const CREDENTIAL_STATUSES: ReadonlySet<HubStatus['state']> = new Set([
+	'keyTripped',
+	'authFailed',
+	'forbidden',
+	'needsPairing'
+]);
+
+/**
+ * 画面が持っている接続の状態が、今の購読の状態より**古い**か（#449 レビュー
+ * P2-2、純関数）。
+ *
+ * 接続の状態は、画面を開いたときと明示操作のときにしか取り直さない
+ * （`status()` は Hub へ往復するのでポーリングしない）。購読の状態は 2 秒
+ * ごとに取り直す。そのため「トリップ中に画面を開く → 解除されて受信中 →
+ * 開いたままキーが失効」で、古い `keyTripped` と新しい `key_revoked` が並ぶ。
+ * 接続の状態を取ったときの購読（`observedWith`）と今の購読とで、キーに
+ * 関わる部分（[`subscriptionCredentialSignal`]）が変わっていれば古い。
+ * キーについて何も言っていない接続の状態（接続済み・到達不能・未設定）は
+ * 案内を左右しないので、古くても問題にしない。
+ */
+export function isHubStatusStale(
+	status: HubStatus,
+	observedWith: HubSubscription | null,
+	current: HubSubscription | null
+): boolean {
+	// #449 3 回目のレビュー: 購読が受信しているのに接続の状態が「接続済み」で
+	// ない、という食い違いは、キー以外の状態（`unreachable` など）でも古い。
+	// 購読が受信できている = 今は Hub に届いてキーも通っている、なので、
+	// 到達不能・認証の失敗などの接続の状態はそれより前の出来事。これが
+	// 「Hub が戻った」ことを画面が知る唯一のきっかけになる（`status()` は
+	// ポーリングしない）。
+	if (current?.state === 'live' && status.state !== 'connected') return true;
+	return (
+		CREDENTIAL_STATUSES.has(status.state) &&
+		subscriptionCredentialSignal(observedWith) !== subscriptionCredentialSignal(current)
+	);
+}
+
+/** 接続の状態を確認し直している間の見出しと説明（古い状態を出さない）。 */
+export const HUB_STATUS_RECHECKING_LABEL = '確認し直しています';
+export const HUB_STATUS_RECHECKING_DETAIL =
+	'購読の状態が変わったため、Hubへの接続の状態を確認し直しています。';
+/** 確認し直しに失敗したときの見出しと説明（#449 再レビュー P2）。 */
+export const HUB_STATUS_RECHECK_FAILED_LABEL = '接続の状態を確認できませんでした';
+export const HUB_STATUS_RECHECK_FAILED_DETAIL =
+	'購読の状態が変わったため接続の状態を確認し直そうとしましたが、取得できませんでした。「状態を再取得」で取り直せます（自動でも30秒ごとに試します）。';
+
+/**
+ * 取り直せたが「接続済み」でなかったうえ、購読は受信している（食い違って
+ * いる）ときに説明へ添える（#449 3 回目のレビュー）。
+ */
+export const HUB_STATUS_RECHECK_ANSWERED_NOTE =
+	'購読は受信しているため、接続の状態を30秒ごとに確認し直します（「状態を再取得」ですぐに取り直せます）。';
+
+/** 確認し直しに失敗したあと、自動で試し直すまでの間隔（#449 再レビュー P2）。 */
+export const STALE_RECHECK_RETRY_MS = 30_000;
+
+/**
+ * 古くなった接続の状態の「確認し直し」の段階（#449 再レビュー P2）。
+ *
+ * - `idle`: 確認し直していない（古くない、または確認し直せた）。
+ * - `pending`: 取り直しの要求が飛んでいる。
+ * - `failed`: 取り直しに失敗した・打ち切った。**失敗したことを画面に出し**、
+ *   読み取り専用の「状態を再取得」を出す。自動では `STALE_RECHECK_RETRY_MS`
+ *   ごとにしか試さない（連続では撃たない）。
+ *
+ * 「失敗した」と「いつ試し直すか」を別に持つ: 失敗を即座に忘れると連続で
+ * 撃ち、覚えたままだと「確認し直しています」のまま誰も試し直さない（以前の
+ * 実装がこれで、回復したいときに回復の導線が無かった）。
+ */
+export type StaleRecheck =
+	| { phase: 'idle' }
+	| { phase: 'pending'; signal: string }
+	| {
+			phase: 'failed';
+			signal: string;
+			failedAt: number;
+			/**
+			 * `true`: 往復は成功したが、答えが「接続済み」ではなかった（Hub に到達
+			 * できない等。答えは接続の状態として出す）。`false`: 答えそのものが
+			 * 取れなかった（失敗・打ち切り・reject）。どちらも間隔を守って試し直す。
+			 */
+			answered: boolean;
+	  };
+
+/**
+ * 画面が持つ接続の状態を、**いつ観測したものか**と対で持つ（#449 再レビュー
+ * P2）。`status` と `observedWith`（その `status` と一緒に届いた購読）は必ず
+ * 一緒に書き換える - 片方だけ新しくすると、古い接続の状態を新しい購読と
+ * 一緒に観測したことになり、古さを見落とす。
+ */
+export interface HubStatusSnapshot {
+	status: HubStatus;
+	observedWith: HubSubscription | null;
+	recheck: StaleRecheck;
+}
+
+export const INITIAL_STATUS_SNAPSHOT: HubStatusSnapshot = {
+	status: { state: 'notConfigured' },
+	observedWith: null,
+	recheck: { phase: 'idle' }
+};
+
+/**
+ * **保存しているキーについての** `status()` 系の応答（画面を開いたとき・接続・
+ * 一覧の更新・切断・確認し直し・打ち切り後の読み直し・採用できたとき）を
+ * 受け取った（純関数）。接続の状態と観測時点を一緒に新しくし、確認し直しの
+ * 段階も終える。
+ */
+export function snapshotFromStoredView(view: HubView): HubStatusSnapshot {
+	return { status: view.status, observedWith: view.subscription, recheck: { phase: 'idle' } };
+}
+
+/**
+ * 手動キーの採用の応答を受け取った（純関数）。採用できたら
+ * [`snapshotFromStoredView`] と同じ。**採用できなかったら何も変えない** - 応答の
+ * `status` は候補キーの判定で、保存しているキーを確認し直したわけではない。
+ * 観測時点（`observedWith`）も、確認し直しの段階（失敗していたなら失敗のまま）
+ * も前のまま残す。
+ */
+export function snapshotAfterAdoption(
+	snapshot: HubStatusSnapshot,
+	view: HubView
+): HubStatusSnapshot {
+	return view.status.state === 'connected' ? snapshotFromStoredView(view) : snapshot;
+}
+
+/**
+ * 今、古くなった接続の状態を取り直しに行くか（純関数）。`start` が真なら、
+ * 呼び出し側は取り直しを始め、`next`（`pending`）を持つ。
+ *
+ * - 古くない: 飛んでいる要求が無ければ `idle` に戻す（飛んでいるなら結果を待つ）。
+ * - `idle`: 取り直しに行く。
+ * - `pending`: 行かない（1 本だけ）。
+ * - `failed`: 購読のキーに関わる部分が失敗したときと違う、または
+ *   [`STALE_RECHECK_RETRY_MS`] 経った、または利用者が「状態を再取得」を押した
+ *   （`force`）ときだけ行く。
+ */
+export function staleRecheckStep(
+	snapshot: HubStatusSnapshot,
+	current: HubSubscription | null,
+	now: number,
+	force = false
+): { start: boolean; recheck: StaleRecheck } {
+	const recheck = snapshot.recheck;
+	if (recheck.phase === 'pending') return { start: false, recheck };
+	const signal = String(subscriptionCredentialSignal(current));
+	// 「状態を再取得」は、古くなくても行く（到達不能のままの画面から、利用者が
+	// 取り直せるように。#449 3 回目のレビュー）。
+	if (force) return { start: true, recheck: { phase: 'pending', signal } };
+	if (!isHubStatusStale(snapshot.status, snapshot.observedWith, current)) {
+		// 同じ値なら同じオブジェクトを返す（呼び出し側が「変わったときだけ
+		// 書き換える」ため）。
+		return {
+			start: false,
+			recheck: recheck.phase === 'failed' ? { phase: 'idle' } : recheck
+		};
+	}
+	const due =
+		recheck.phase === 'idle' ||
+		recheck.signal !== signal ||
+		now - recheck.failedAt >= STALE_RECHECK_RETRY_MS;
+	return due ? { start: true, recheck: { phase: 'pending', signal } } : { start: false, recheck };
+}
+
+/**
+ * 取り直しの結果（純関数）。
+ *
+ * - 読めて「接続済み」: [`snapshotFromStoredView`]（確認し直しは終わり）。
+ * - **往復は成功したが「接続済み」ではない**（Hub に到達できない・キーが通らない
+ *   等。`Bootstrapper::verify` は catalog の 503 や通信障害を `Ok(Unreachable)`
+ *   で返す）: 答えは接続の状態として出す（組ごと新しくする）が、段階は
+ *   `failed`（`answered: true`）にする。「往復が成功した = 確認し直しが済んだ」
+ *   と扱うと、間隔を守った再試行も「状態を再取得」も消える（#449 3 回目の
+ *   レビュー）。
+ * - 読めなかった（失敗・打ち切り・reject）: 接続の状態と観測時点はそのままに、
+ *   段階を `failed`（`answered: false`）にする。**`failed` にしないと
+ *   「確認し直しています」のまま誰も試し直さない。**
+ */
+export function staleRecheckSettled(
+	snapshot: HubStatusSnapshot,
+	outcome: { kind: 'ok'; view: HubView } | { kind: 'failed' | 'timedOut' },
+	now: number
+): HubStatusSnapshot {
+	if (outcome.kind === 'ok') {
+		const settled = snapshotFromStoredView(outcome.view);
+		if (outcome.view.status.state === 'connected') return settled;
+		return {
+			...settled,
+			recheck: {
+				phase: 'failed',
+				signal: String(subscriptionCredentialSignal(outcome.view.subscription)),
+				failedAt: now,
+				answered: true
+			}
+		};
+	}
+	// 待っている間に、保存しているキーの応答（明示操作）で組ごと新しくなって
+	// いたら、この失敗はもう何も語っていない。
+	if (snapshot.recheck.phase !== 'pending') return snapshot;
+	return {
+		...snapshot,
+		recheck: { phase: 'failed', signal: snapshot.recheck.signal, failedAt: now, answered: false }
+	};
+}
+
+/**
+ * 読み取り専用の「状態を再取得」を出すか（純関数、#449 3 回目のレビュー）。
+ *
+ * - 確認し直しに失敗している（`recheckFailed`）。
+ * - 接続の状態が「Hub に到達できない」で、保存済みの接続先がある
+ *   （`configured`）。到達不能は、Hub が戻ったことを画面が知る手段が購読の
+ *   受信しか無く、タグを 1 つも選んでいなければそれも来ない。保存済みの
+ *   接続先が無い（「接続」が失敗しただけ）なら、取り直しても「未設定」に
+ *   なるだけなので出さない（そのときは「接続」がやり直しの導線）。
+ */
+export function showStatusRecheckButton(
+	display: { recheckFailed: boolean },
+	status: HubStatus,
+	configured: boolean
+): boolean {
+	return display.recheckFailed || (status.state === 'unreachable' && configured);
+}
+
+/** [`runStaleRecheck`] が画面の状態に触る口（画面とテストが同じ手順を通る）。 */
+export interface StaleRecheckHost {
+	snapshot(): HubStatusSnapshot;
+	/** 接続の状態の組を書き換える。`view` があれば、その応答で画面全体も更新する。 */
+	apply(snapshot: HubStatusSnapshot, view?: HubView): void;
+	setBusy(busy: boolean): void;
+	/** 保存しているキーの接続の状態を取り直す（上限付き。reject してもよい）。 */
+	fetchStatus(): Promise<RunWithLimitOutcome<HubView>>;
+	now(): number;
+}
+
+/**
+ * 古くなった接続の状態の確認し直しを 1 回ぶん進める（#449 再レビュー P2）。
+ * 画面は購読の状態が届くたび（`force = false`）と「状態を再取得」
+ * （`force = true`）で呼ぶ。行くかどうかは [`staleRecheckStep`]、結果は
+ * [`staleRecheckSettled`]。**取り直しが reject しても打ち切られても、必ず
+ * `failed` に進め、`busy` を降ろす。**
+ */
+export async function runStaleRecheck(
+	host: StaleRecheckHost,
+	current: HubSubscription | null,
+	force = false
+): Promise<'skipped' | 'ok' | 'failed'> {
+	const before = host.snapshot();
+	const step = staleRecheckStep(before, current, host.now(), force);
+	if (!step.start) {
+		if (step.recheck !== before.recheck) host.apply({ ...before, recheck: step.recheck });
+		return 'skipped';
+	}
+	host.apply({ ...before, recheck: step.recheck });
+	host.setBusy(true);
+	try {
+		let outcome: RunWithLimitOutcome<HubView>;
+		try {
+			outcome = await host.fetchStatus();
+		} catch (error) {
+			outcome = { kind: 'failed', error };
+		}
+		if (outcome.kind === 'ok') {
+			host.apply(
+				staleRecheckSettled(host.snapshot(), { kind: 'ok', view: outcome.value }, host.now()),
+				outcome.value
+			);
+			// 往復は成功しても、「接続済み」でなければ確認し直しは済んでいない。
+			return outcome.value.status.state === 'connected' ? 'ok' : 'failed';
+		}
+		host.apply(staleRecheckSettled(host.snapshot(), { kind: outcome.kind }, host.now()));
+		return 'failed';
+	} finally {
+		host.setBusy(false);
+	}
+}
+
+/**
+ * 画面に出す接続の状態（#449 レビュー P2-2、純関数）。古い（[`isHubStatusStale`]）
+ * なら、見出しと説明は「確認し直しています」にし、購読の案内と入力欄の判断には
+ * 使わない（`guidance: null`）。**古い REST の状態で、新しい拒否の理由を抑え
+ * ない**ため。
+ */
+export function hubStatusDisplay(
+	status: HubStatus,
+	observedWith: HubSubscription | null,
+	current: HubSubscription | null,
+	recheck: StaleRecheck = { phase: 'idle' }
+): {
+	label: string;
+	detail: string;
+	guidance: HubStatus | null;
+	stale: boolean;
+	recheckFailed: boolean;
+} {
+	if (isHubStatusStale(status, observedWith, current)) {
+		// 取り直しに失敗したなら、そう言う（「確認し直しています」のまま
+		// 放置しない）。画面は読み取り専用の「状態を再取得」を出す。
+		if (recheck.phase === 'failed' && recheck.answered) {
+			// 取り直せたが「接続済み」ではなかった: その答え（到達不能など）を
+			// 出しつつ、試し直すことを添える。
+			return {
+				label: hubStatusLabel(status),
+				detail: `${hubStatusDetail(status)} ${HUB_STATUS_RECHECK_ANSWERED_NOTE}`,
+				guidance: null,
+				stale: true,
+				recheckFailed: true
+			};
+		}
+		const failed = recheck.phase === 'failed';
+		return {
+			label: failed ? HUB_STATUS_RECHECK_FAILED_LABEL : HUB_STATUS_RECHECKING_LABEL,
+			detail: failed ? HUB_STATUS_RECHECK_FAILED_DETAIL : HUB_STATUS_RECHECKING_DETAIL,
+			guidance: null,
+			stale: true,
+			recheckFailed: failed
+		};
+	}
+	return {
+		label: hubStatusLabel(status),
+		detail: hubStatusDetail(status),
+		guidance: status,
+		stale: false,
+		recheckFailed: false
+	};
+}
+
+/**
+ * 接続の状態と突き合わせた、購読の案内（#446、純関数）。
+ *
+ * 接続の状態（REST の答え）は**今のキーについての最新の判定**で、購読の
+ * `lastError`（close 1008 の理由）はそれより前の出来事のこともある。両者が
+ * 「キーを捨てるな」と「新しいキーを」を同時に言わないように、食い違うときは
+ * 接続の状態に合わせる:
+ *
+ * | 接続の状態 | 購読の案内 |
+ * | --- | --- |
+ * | `keyTripped` | 理由に関わらずトリップの案内（REST が「トリップ中」と言っている） |
+ * | `authFailed` / `forbidden` / `needsPairing` | トリップの案内は出さない（REST が「キーが無効／権限が無い／発行が要る」と言っている）。それ以外の理由はそのまま |
+ * | それ以外 | `lastError` の案内のまま |
+ *
+ * バックエンド（`chronogazer_core::hub` の `credential_rejection_after_status`）
+ * も同じ向きで記憶を直すので、ここは表示側の二重の守り。
+ */
+export function effectiveCredentialGuidance(
+	status: HubStatus | null,
+	lastError: string | null
+): HubCredentialGuidance | null {
+	if (status?.state === 'keyTripped') return hubCredentialGuidance('key_tripped');
+	const guidance = hubCredentialGuidance(lastError);
+	if (
+		guidance?.action === 'askAdmin' &&
+		(status?.state === 'authFailed' ||
+			status?.state === 'forbidden' ||
+			status?.state === 'needsPairing')
+	) {
+		return null;
+	}
+	return guidance;
+}
+
+/**
+ * 購読ブロックに案内を**独立した行**で出すか（純関数）。
+ *
+ * `unauthorized` のときは [`hubSubscriptionDetail`] が案内そのものを説明文に
+ * するので、二重に出さない。`stopped`（`status()` などが世代を止めた後）は
+ * 説明文が停止の理由（「保存済みのAPIキーがHubに拒否された…」など）になる
+ * ので、理由ごとの案内を別の行で添える。
+ */
+export function hubCredentialGuidanceLine(
+	subscription: HubSubscription | null,
+	status: HubStatus | null = null
+): string | null {
+	if (!subscription || subscription.state === 'unauthorized') return null;
+	// 接続の状態の説明（`hubStatusDetail`）がトリップの案内そのものなので、
+	// 同じ画面に 2 回出さない。
+	if (status?.state === 'keyTripped') return null;
+	if (subscription.state === 'stopped' && !subscription.reason) return null;
+	return effectiveCredentialGuidance(status, subscription.lastError)?.message ?? null;
 }
 
 /**
@@ -1065,15 +1588,27 @@ export function hubSubscriptionLabel(state: HubSubscriptionState): string {
  * （`values` も空）進行中の状態なので、件数に触れるときも「購読しようと
  * しています」と、**まだ受信していないことが分かる**言い方にする。
  */
-export function hubSubscriptionDetail(subscription: HubSubscription): string {
+export function hubSubscriptionDetail(
+	subscription: HubSubscription,
+	status: HubStatus | null = null
+): string {
+	const guidance = effectiveCredentialGuidance(status, subscription.lastError);
 	if (subscription.state === 'stopped') {
 		if (subscription.reason) return subscription.reason;
+		// #446: 1008 の理由で止まっているなら「まもなく自動で再試行します」と
+		// 一律に言わない（失効などは再試行しない）。
+		if (guidance) return guidance.message;
 		if (subscription.lastError) {
 			return `購読は停止しています（エラー: ${subscription.lastError}）。まもなく自動で再試行します。`;
 		}
 		return '購読していません。';
 	}
 	if (subscription.state === 'unauthorized') {
+		// #446: Hub が close 1008 で理由を付けて打ち切ったなら、理由ごとの
+		// 案内（トリップは管理者に解除を依頼、失効などは新しいキー）を出す。
+		// 接続の状態と食い違うときは接続の状態に合わせる
+		// （`effectiveCredentialGuidance`）。
+		if (guidance) return guidance.message;
 		// タグ一覧は読めていても購読だけ拒否されることがある（WS のハンド
 		// シェイクだけが 401/403）。ユーザーにとっては接続の状態表示が何で
 		// あれ「認証が通っていない」なので、接続側の `authFailed` と同じ
