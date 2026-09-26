@@ -20,6 +20,7 @@ import {
 	HUB_STATUS_RECHECK_FAILED_LABEL,
 	INITIAL_STATUS_SNAPSHOT,
 	runStaleRecheck,
+	showStatusRecheckButton,
 	snapshotAfterAdoption,
 	snapshotFromStoredView,
 	STALE_RECHECK_RETRY_MS,
@@ -605,15 +606,26 @@ describe('接続の状態が購読より古くなったとき（時系列）', (
 		expect(isHubStatusStale(status, opened, same)).toBe(false);
 	});
 
-	it('キーについて何も言っていない接続の状態は、購読が変わっても古いと扱わない', () => {
+	it('キーについて何も言っていない接続の状態は、購読のキーに関わる部分が変わっても古いと扱わない', () => {
 		const opened = subscription({ state: 'connecting', lastError: null });
+		const reconnecting = subscription({ state: 'reconnecting', lastError: 'transport' });
 		const live = subscription({ state: 'live', lastError: null });
 		for (const status of [
 			{ state: 'connected', tagCount: 1 },
 			{ state: 'unreachable', cause: 'transport' },
 			{ state: 'notConfigured' }
 		] as HubStatus[]) {
-			expect(isHubStatusStale(status, opened, live), status.state).toBe(false);
+			expect(isHubStatusStale(status, opened, reconnecting), status.state).toBe(false);
+		}
+		// #449 3 回目のレビュー: ただし購読が受信しているのに「接続済み」でない
+		// のは、どの状態でも古い（Hub が戻ったことを知る唯一のきっかけ）。
+		expect(isHubStatusStale({ state: 'connected', tagCount: 1 }, opened, live)).toBe(false);
+		for (const status of [
+			{ state: 'unreachable', cause: 'transport' },
+			{ state: 'unreachable', cause: 'server_error' },
+			{ state: 'notConfigured' }
+		] as HubStatus[]) {
+			expect(isHubStatusStale(status, opened, live), status.state).toBe(true);
 		}
 		// キーについて言っている状態は、購読のキーに関わる部分が変われば古い。
 		for (const status of [
@@ -858,6 +870,99 @@ describe('画面の接続の状態の遷移（確認し直しの失敗・候補�
 			expect(screen.shown.recheckFailed).toBe(true);
 		});
 	}
+
+	for (const cause of ['server_error', 'transport'] as const) {
+		it(`確認し直しが ok + unreachable（${cause}）でも、その後の live で取り直し、タグの操作欄が戻る`, async () => {
+			const unreachable: HubStatus = { state: 'unreachable', cause };
+			// 確認し直しの catalog だけが落ちる。バックエンドは購読も止める。
+			const stopped = subscription({ state: 'stopped', reason: 'r', lastError: null });
+			let answer: 'unreachable' | 'connected' = 'unreachable';
+			const model = screenModel(
+				async () => ({
+					kind: 'ok',
+					value:
+						answer === 'unreachable'
+							? hubView(unreachable, stopped)
+							: hubView({ state: 'connected', tagCount: 1 }, live)
+				}),
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+
+			// 解除されて live → 古い keyTripped → 取り直しは往復成功・中身は到達不能。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			expect(model.state.snapshot.status).toEqual(unreachable);
+			let screen = model.screen();
+			expect(screen.shown.label, '到達不能という結果は出す').toBe(hubStatusLabel(unreachable));
+			expect(screen.tagsBlock).toBe(false);
+			expect(
+				showStatusRecheckButton(screen.shown, model.state.snapshot.status, true),
+				'到達不能のままでも「状態を再取得」を出す'
+			).toBe(true);
+
+			// Hub が戻り、見張りが購読を張り直して live（ポーリング）。
+			answer = 'connected';
+			await model.poll(live);
+			expect(model.state.fetches, '古い unreachable を live で取り直す').toBe(2);
+			screen = model.screen();
+			expect(screen.shown.stale).toBe(false);
+			expect(screen.tagsBlock, 'タグの操作欄が戻る').toBe(true);
+		});
+
+		it(`確認し直しが ok + unreachable（${cause}）のまま購読は live（食い違いが続く）なら、30 秒ごとに試し直し、再取得で戻る`, async () => {
+			const unreachable: HubStatus = { state: 'unreachable', cause };
+			let answer: 'unreachable' | 'connected' = 'unreachable';
+			const model = screenModel(
+				async () => ({
+					kind: 'ok',
+					value:
+						answer === 'unreachable'
+							? hubView(unreachable, live)
+							: hubView({ state: 'connected', tagCount: 1 }, live)
+				}),
+				hubView({ state: 'keyTripped' }, tripped)
+			);
+			await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			let screen = model.screen();
+			expect(screen.shown.stale).toBe(true);
+			expect(screen.shown.label).toBe(hubStatusLabel(unreachable));
+			expect(screen.shown.recheckFailed).toBe(true);
+
+			// 間隔の間は撃たない。
+			for (let i = 0; i < STALE_RECHECK_RETRY_MS / 2_000 - 1; i += 1) await model.poll(live);
+			expect(model.state.fetches).toBe(1);
+			// 30 秒で 1 回だけ試し直す（まだ到達不能）。
+			await model.poll(live);
+			expect(model.state.fetches).toBe(2);
+
+			// 「状態を再取得」で戻る。
+			answer = 'connected';
+			await model.retry();
+			expect(model.state.fetches).toBe(3);
+			screen = model.screen();
+			expect(screen.shown.stale).toBe(false);
+			expect(screen.tagsBlock).toBe(true);
+		});
+	}
+
+	it('画面を開いた時点で到達不能なら（確認し直しではない）、「状態を再取得」で取り直せる', async () => {
+		const stopped = subscription({ state: 'stopped', reason: 'r', lastError: null });
+		const model = screenModel(
+			async () => ({ kind: 'ok', value: hubView({ state: 'connected', tagCount: 1 }, live) }),
+			hubView({ state: 'unreachable', cause: 'transport' }, stopped)
+		);
+		// 購読は止まったまま（タグ未選択など）なので、live のきっかけは来ない。
+		await model.poll(stopped);
+		expect(model.state.fetches).toBe(0);
+		const shown = model.screen().shown;
+		expect(showStatusRecheckButton(shown, model.state.snapshot.status, true)).toBe(true);
+		// 保存済みの接続先が無い（「接続」が失敗しただけ）なら出さない。
+		expect(showStatusRecheckButton(shown, model.state.snapshot.status, false)).toBe(false);
+		await model.retry();
+		expect(model.state.fetches).toBe(1);
+		expect(model.screen().tagsBlock).toBe(true);
+	});
 
 	it('採用できたら、その応答で組ごと新しくなる', () => {
 		const snapshot = snapshotFromStoredView(hubView({ state: 'keyTripped' }, tripped));

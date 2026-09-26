@@ -92,6 +92,7 @@
 		snapshotAfterAdoption,
 		snapshotFromStoredView,
 		runStaleRecheck,
+		showStatusRecheckButton,
 		type HubStatusSnapshot,
 		type HubSubscription,
 		type HubTag,
@@ -751,10 +752,11 @@
 				状態: <strong>{statusDisplay.label}</strong>
 			</p>
 			<p class="note">{statusDisplay.detail}</p>
-			{#if statusDisplay.recheckFailed}
+			{#if showStatusRecheckButton(statusDisplay, status, configured)}
 				<!--
-					#449 再レビュー P2: 取り直しに失敗したら、読み取り専用の再取得を
-					出す（`status()` は読み取りだけで、キーを発行しない）。
+					#449 再レビュー P2 / 3 回目のレビュー: 取り直しに失敗した、または
+					Hub に到達できないときは、読み取り専用の再取得を出す（`status()` は
+					読み取りだけで、キーを発行しない）。
 				-->
 				<button
 					type="button"
