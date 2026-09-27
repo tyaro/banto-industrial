@@ -1753,6 +1753,12 @@ async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoErr
     Ok(())
 }
 
+/// Body of [`audit_log_list`], split out so the `asOfId`-gated prune
+/// (#463) is testable with a plain `&AppState` in this crate's own
+/// `cargo test` - same reasoning as [`change_own_password`] (`tauri::State`
+/// cannot be constructed outside a running tauri app, but it derefs to
+/// `&AppState`, so the command below is a one-line adapter).
+///
 /// `admin`-only (spec M14): the audit-log viewer's filtered/sorted/
 /// paginated read. Also opportunistically prunes first - same reasoning as
 /// `chronogazer_core::rest::audit_log_list` (see that function's doc
@@ -1762,20 +1768,37 @@ async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoErr
 /// `POST /api/audit-log/list?asOfId=` と同じ意味（
 /// `chronogazer_core::audit::AuditLogService::list_as_of` の doc）。省略すると
 /// 従来どおり全行が対象。床（`admin`）は変えていない。
+///
+/// **`asOfId` 付きの取得（世代の 2 ブロック目以降）では剪定しない**（#463、
+/// `chronogazer_core::rest::audit_log_list` と同じ理由）。剪定は `asOfId`
+/// なしの取得（世代の最初・「再読み込み」）と、起動時の剪定に任せる（ChronoGazer
+/// に監査ログ専用の周期タスクは無い）。
+async fn audit_log_list_body(
+    state: &AppState,
+    params: ListParams,
+    as_of_id: Option<i64>,
+) -> Result<AuditLogList, BantoError> {
+    require_role(state, Role::Admin, "audit_log").await?;
+    if as_of_id.is_none() {
+        if let Ok(config) = state.settings.audit_config().await {
+            let _ = state
+                .audit
+                .prune(config.retention_days, config.retention_rows)
+                .await;
+        }
+    }
+    state.audit.list_as_of(params, as_of_id).await
+}
+
+/// See [`audit_log_list_body`] for the actual logic and the doc comment
+/// (this is a one-line adapter so that body is unit-testable outside tauri).
 #[tauri::command]
 async fn audit_log_list(
     state: State<'_, AppState>,
     params: ListParams,
     as_of_id: Option<i64>,
 ) -> Result<AuditLogList, BantoError> {
-    require_role(&state, Role::Admin, "audit_log").await?;
-    if let Ok(config) = state.settings.audit_config().await {
-        let _ = state
-            .audit
-            .prune(config.retention_days, config.retention_rows)
-            .await;
-    }
-    state.audit.list_as_of(params, as_of_id).await
+    audit_log_list_body(&state, params, as_of_id).await
 }
 
 /// Current audit-log retention policy (spec M14 Phase B). Any authenticated
@@ -3211,6 +3234,78 @@ mod tests {
             chronogazer_core::collect::CollectorState::Stopped,
             "収集は止まっている"
         );
+    }
+
+    /// #463: `asOfId` 付きの取得（2 ブロック目以降）では剪定しない - 保持
+    /// 件数の上限に張り付いた状態でも、読み込みの途中で行が消えて失効しない
+    /// （`chronogazer_core::rest::audit_log_list` の同じ回帰テストと対の
+    /// Tauri 側）。`tauri::State` はこのテストのように tauri アプリを起動
+    /// せずには作れないので、[`audit_log_list_body`]（両方が委譲する共有の
+    /// 層）を直接呼ぶ - `#[tauri::command]` の薄いラッパ自身は
+    /// [`change_own_password`] と同じパターンでテストしない。`asOfId` なし
+    /// （世代の最初・再読み込み）では従来どおり剪定する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_log_list_body_with_as_of_id_does_not_prune() {
+        let state = app_state().await;
+        let owner = state
+            .users
+            .setup_first_user("owner", "password123", "オーナー")
+            .await
+            .expect("setup_first_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(owner));
+
+        for action in ["a", "b", "c", "d", "e"] {
+            state
+                .audit
+                .try_record(AuditEntry {
+                    actor_username: Some("owner"),
+                    actor_role: Some("admin"),
+                    action,
+                    resource: "items",
+                    entity_id: None,
+                    detail: None,
+                    origin: "tauri",
+                    result: "ok",
+                })
+                .await
+                .unwrap();
+        }
+        // #setup_first_user 自体は監査に残らないので、ここまでで 5 行。
+        state
+            .settings
+            .set_audit_config(&AuditSettings {
+                retention_days: None,
+                retention_rows: Some(2),
+            })
+            .await
+            .expect("set_audit_config");
+
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap()
+        };
+        let before = count().await;
+        assert_eq!(before, 5);
+        let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM audit_log")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        // `asOfId` 付き: 上限を超えていても消さない（件数も境界の集合のまま）。
+        let pinned = audit_log_list_body(&state, ListParams::default(), Some(max_id))
+            .await
+            .expect("audit_log_list_body (asOfId 付き)");
+        assert_eq!(pinned.total_count, before as u64, "{pinned:?}");
+        assert_eq!(count().await, before, "asOfId 付きの取得で剪定された");
+
+        // `asOfId` なし: 従来どおり剪定する。
+        let fresh = audit_log_list_body(&state, ListParams::default(), None)
+            .await
+            .expect("audit_log_list_body (asOfId なし)");
+        assert_eq!(fresh.total_count, 2);
+        assert_eq!(count().await, 2, "asOfId なしの取得で剪定されない");
     }
 
     /// Spec M14: the Tauri-side self-service password change must be
