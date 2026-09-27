@@ -1077,8 +1077,8 @@ struct AuditLogState {
 /// ここで毎回剪定すると、保持件数の上限に張り付いた常駐の chronogazer では
 /// 記録が 1 件増えるたびに次の取得が 1 行消し、2 ブロック目以降がほぼ毎回
 /// 失効する - **ログが一番多いときに先頭ブロックより先へ進めなくなる**。
-/// 剪定は `asOfId` なしの取得（世代の最初・「再読み込み」）と、起動時・
-/// 周期タスクに任せる。
+/// 剪定は `asOfId` なしの取得（世代の最初・「再読み込み」）と、起動時の
+/// 剪定に任せる（ChronoGazer に監査ログ専用の周期タスクは無い）。
 async fn audit_log_list(
     State(state): State<AuditLogState>,
     Query(query): Query<AuditLogListQuery>,

@@ -1771,7 +1771,8 @@ async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoErr
 ///
 /// **`asOfId` 付きの取得（世代の 2 ブロック目以降）では剪定しない**（#463、
 /// `chronogazer_core::rest::audit_log_list` と同じ理由）。剪定は `asOfId`
-/// なしの取得（世代の最初・「再読み込み」）と、起動時・周期タスクに任せる。
+/// なしの取得（世代の最初・「再読み込み」）と、起動時の剪定に任せる（ChronoGazer
+/// に監査ログ専用の周期タスクは無い）。
 async fn audit_log_list_body(
     state: &AppState,
     params: ListParams,
