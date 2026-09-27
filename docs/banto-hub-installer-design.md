@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。 v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
+状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。
