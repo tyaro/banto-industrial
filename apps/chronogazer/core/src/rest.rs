@@ -1061,7 +1061,8 @@ struct AuditLogState {
 /// (`bin/banto-serve.rs`'s `main`/`src-tauri`'s `run()`) is judged
 /// sufficient - the audit-log viewer is an admin-only, infrequently-visited
 /// page, and each prune is a couple of indexed `DELETE`s, not an expensive
-/// scan.
+/// scan. **Exception (#463): an `asOfId`-bounded fetch (block 2+ of a
+/// generation) skips the prune** - see below.
 ///
 /// `?asOfId=` （任意、#410）はスナップショット境界
 /// （[`crate::audit::AuditLogService::list_as_of`] の doc）。省略すると従来
@@ -1069,16 +1070,27 @@ struct AuditLogState {
 /// `ListParams` は `banto-core` の型でフィールドを足せないので、`/api/collect/events`
 /// と同じくクエリで受ける。**床（`admin`）は変えていない**（ルーター側の
 /// `RoleGuard`）。
+///
+/// **`asOfId` 付きの取得（世代の 2 ブロック目以降）では剪定しない**（#463、
+/// banto-hub の #428 と同じ問題）。画面は「同じ境界の総件数が世代の最初と
+/// 変わった = 途中で削除が入った」を失効として扱い、続きの読み込みを止める。
+/// ここで毎回剪定すると、保持件数の上限に張り付いた常駐の chronogazer では
+/// 記録が 1 件増えるたびに次の取得が 1 行消し、2 ブロック目以降がほぼ毎回
+/// 失効する - **ログが一番多いときに先頭ブロックより先へ進めなくなる**。
+/// 剪定は `asOfId` なしの取得（世代の最初・「再読み込み」）と、起動時・
+/// 周期タスクに任せる。
 async fn audit_log_list(
     State(state): State<AuditLogState>,
     Query(query): Query<AuditLogListQuery>,
     Json(params): Json<ListParams>,
 ) -> Result<Json<crate::audit::AuditLogList>, ApiError> {
-    if let Ok(config) = state.settings.audit_config().await {
-        let _ = state
-            .audit
-            .prune(config.retention_days, config.retention_rows)
-            .await;
+    if query.as_of_id.is_none() {
+        if let Ok(config) = state.settings.audit_config().await {
+            let _ = state
+                .audit
+                .prune(config.retention_days, config.retention_rows)
+                .await;
+        }
     }
     Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?))
 }
@@ -3917,6 +3929,96 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
+    }
+
+    /// #463: `asOfId` 付きの取得（2 ブロック目以降）では剪定しない - 保持
+    /// 件数の上限に張り付いた状態でも、読み込みの途中で行が消えて失効しない
+    /// （banto-hub の #428 と同じ問題・同じ直し方）。`asOfId` なし（世代の
+    /// 最初・再読み込み）では従来どおり剪定する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_log_list_with_as_of_id_does_not_prune() {
+        let (router, audit, pool, admin, _editor, _viewer) =
+            router_with_role_tokens_audit_and_pool().await;
+
+        for action in ["a", "b", "c", "d", "e"] {
+            audit
+                .try_record(AuditEntry {
+                    actor_username: Some("admin"),
+                    actor_role: Some("admin"),
+                    action,
+                    resource: "items",
+                    entity_id: None,
+                    detail: None,
+                    origin: "rest",
+                    result: "ok",
+                })
+                .await
+                .unwrap();
+        }
+
+        // 保持件数の上限を 2 にする（ここまでの admin/editor/viewer の
+        // ログイン監査分も含めて上限超過にする。`PUT` 自体も 1 行記録する）。
+        let apply_response = router
+            .clone()
+            .oneshot(put_json(
+                "/api/audit-log/config",
+                &admin,
+                json!({ "retentionDays": null, "retentionRows": 2 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(apply_response.status(), StatusCode::OK);
+
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let before = count().await;
+        assert!(
+            before > 2,
+            "前提: 保持件数の上限 2 を超えている（実際 {before}）"
+        );
+        let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM audit_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // `asOfId` 付き: 上限を超えていても消さない（件数も境界の集合のまま）。
+        let pinned = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    &format!("/api/audit-log/list?asOfId={max_id}"),
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            pinned["totalCount"].as_u64().unwrap(),
+            before as u64,
+            "{pinned}"
+        );
+        assert_eq!(count().await, before, "asOfId 付きの取得で剪定された");
+
+        // `asOfId` なし: 従来どおり剪定する。
+        let fresh = body_json(
+            router
+                .oneshot(post_json_auth(
+                    "/api/audit-log/list",
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fresh["totalCount"].as_u64().unwrap(), 2);
+        assert_eq!(count().await, 2, "asOfId なしの取得で剪定されない");
     }
 
     /// `GET /api/audit-log/config` is admin-only: 200 (with the default
