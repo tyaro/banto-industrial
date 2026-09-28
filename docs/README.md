@@ -4,7 +4,10 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-26（追従先を banto **v1.7.2** に上げ、開いている画面がセッションの失効で
+最終更新: 2026-09-28（追従先を banto **v1.7.3** に上げた。`banto-storage` の `ORDER BY` に
+一意キー（既定 `id`）を足す変更・`WindowedListResource` 回復の改善・admin-template の
+`systemInfoStore` 修正が中心で、banto-industrial 側の API に破壊的変更は無い（banto-hub は
+v0.2.0-alpha.25）。「現状ひとめ」の上流の版を更新）。2026-09-26（追従先を banto **v1.7.2** に上げ、開いている画面がセッションの失効で
 ログイン画面へ移るようにした（banto #241、chronogazer・banto-hub の保護レイアウトで `onSessionEnded` を購読）。
 「現状ひとめ」の上流の版・banto-hub-operations.md §1 を更新）。2026-09-25（#440・#442: 試運転モードでトークン無しに開いた `/api/tag-stream` もロックダウンの
 後 1 周期以内に閉じ、gRPC のストリーミング（`StreamValues` / `StreamEvents`）も接続中に再検証する。
@@ -64,7 +67,7 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   （記録計）。**relay-wright**（条件付き PLC 自動書き込み）は 2026-09-24 に main から外し、
   タグ `archive/relay-wright-2026-09-24` に退避した（構想の練り直し、オーナー決定。§4b）。
   上流 `banto` は git tag / `@banto/*` を消費（Rust クレート・npm
-  `@banto/*` とも現行 **v1.7.2** で揃っている（2026-09-26 追従）。`Cargo.toml`/`package.json` を正とする）。
+  `@banto/*` とも現行 **v1.7.3** で揃っている（2026-09-28 追従）。`Cargo.toml`/`package.json` を正とする）。
   Rust と npm は別マニフェストで独立に追従できるが、**上げるときは揃えて上げる運用**とする
   （2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
 - **I 系（基盤 I0〜I6）**: 実装済み（I6 = banto-broker として抽出済み）。
