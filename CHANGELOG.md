@@ -2,6 +2,34 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.25 — 2026-09-28（アルファ）
+
+banto v1.7.3 に追従した。`banto-storage` の `ORDER BY`（`apply_list_params` /
+`append_order_by`）が末尾に一意キー（既定 `id`、`ColumnMap` に登録されていれば）を
+足すようになり、並べ替え指定が無いときは一意キーの昇順で並ぶ（従来は `ORDER BY`
+無し）。`WindowedListResource` の回復の改善と、InMemory の `DataProvider` /
+grid の client sort の並びの規則をそろえる変更も含む。追加 API
+`ColumnMap::unique_key` / `without_unique_key` / `unique_key_column` が使える
+ようになったが、banto-industrial 側では未使用（現状の一覧はすべて既定の `id`
+一意キーで問題ない、調査結果は PR 本文を参照）。banto-industrial 側の API・wire に
+破壊的変更は無い。
+
+上流の v1.7.3 には、admin-template 固有の修正（`systemInfoStore.available`、banto
+#244）と、上流リポジトリの依存更新（banto #200〜#202）も含まれるが、これらは
+banto-industrial には反映されない。このアプリに反映されるのは、共有パッケージ
+（Rust の banto crate と `@banto/*`）の変更だけで、本リポジトリの推移的な依存は
+据え置いている。
+
+### 変更（内部、2026-09-28）
+
+- banto の依存（`banto-core` / `banto-storage` / `banto-server`、`@banto/*`）を
+  `v1.7.3` に上げた。`Cargo.lock` は banto の 4 crate（`banto-admin-services` /
+  `banto-core` / `banto-server` / `banto-storage`）の `version` と `source` の
+  みを手で書き換え、無関係な依存の付け替えを避けた（`cargo update -p` を使う
+  と #450/#465 と同様に `windows-sys` 等が巻き込まれるため）。`pnpm-lock.yaml`
+  は `pnpm install --lockfile-only` で更新し、変わったのは `@banto/*` の 5
+  パッケージの `version`/`resolution`/`specifier` のみと確認した。
+
 ## v0.2.0-alpha.24 — 2026-09-26（アルファ）
 
 **alpha.7 以降で最初に公開する版**（alpha.8〜alpha.23 は版を上げただけで、タグ・GitHub Release は作っていない。各版の変更は下の節を参照）。
