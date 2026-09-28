@@ -159,7 +159,7 @@ utoipa = "5"
 # 既存 allow 済みライセンス（MIT/Apache-2.0/Zlib）の範囲内で、deny.toml の
 # 変更は不要だった。実行時ネットワーク依存はゼロ（オフラインで動く要件を
 # 満たす）。`apps/banto-hub/core` のみが使う。
-utoipa-swagger-ui = { version = "9", default-features = false, features = [
+utoipa-swagger-ui = { version = "10", default-features = false, features = [
     "axum",
     "vendored",
 ] }
