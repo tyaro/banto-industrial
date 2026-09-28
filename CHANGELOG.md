@@ -11,10 +11,14 @@ banto v1.7.3 に追従した。`banto-storage` の `ORDER BY`（`apply_list_para
 grid の client sort の並びの規則をそろえる変更も含む。追加 API
 `ColumnMap::unique_key` / `without_unique_key` / `unique_key_column` が使える
 ようになったが、banto-industrial 側では未使用（現状の一覧はすべて既定の `id`
-一意キーで問題ない、調査結果は PR 本文を参照）。あわせて admin-template の
-`systemInfoStore.available` の固定不具合の修正（banto #244）と Dependabot 依存
-更新（banto #200〜#202）を取り込む。banto-industrial 側の API・wire に破壊的変更
-は無い。
+一意キーで問題ない、調査結果は PR 本文を参照）。banto-industrial 側の API・wire に
+破壊的変更は無い。
+
+上流の v1.7.3 には、admin-template 固有の修正（`systemInfoStore.available`、banto
+#244）と、上流リポジトリの依存更新（banto #200〜#202）も含まれるが、これらは
+banto-industrial には反映されない。このアプリに反映されるのは、共有パッケージ
+（Rust の banto crate と `@banto/*`）の変更だけで、本リポジトリの推移的な依存は
+据え置いている。
 
 ### 変更（内部、2026-09-28）
 
