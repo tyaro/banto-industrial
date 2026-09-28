@@ -145,7 +145,7 @@ base64 = "0.23"
 # クライアントとの互換性契約(§4.1)であるため、コードとスキーマを単一
 # ソース化する。axum 統合は使わず(パラメータは `#[utoipa::path]` に手で
 # 記述する)最小構成で導入 - `apps/banto-hub/core` のみが使う。
-utoipa = "5"
+utoipa = "6"
 # ux-plan.md §5 バックログ「OpenAPI の Swagger UI 同梱」（2026-08-12 オーナー
 # 決定）: `/api/v1/openapi.json`（上の utoipa 由来）をブラウザで閲覧・試打
 # できる Swagger UI をバイナリに同梱する。`default-features = false` +
