@@ -1,3 +1,37 @@
+# CI（#468 で「変更したパスに応じて選んで実行する」構成に分けた）。
+#
+# 構成:
+#   changes ──┬─ lint-format            （必ず。repo 全体の ESLint + Prettier）
+#             ├─ frontend-hub           （条件付き）
+#             ├─ frontend-chronogazer   （条件付き）
+#             ├─ rust                   （条件付き。対象は workspace 全体か -p に絞る）
+#             ├─ rust-db-source         （条件付き。PostgreSQL）
+#             ├─ e2e-chronogazer        （条件付き）
+#             └─ e2e-hub                （条件付き）
+#   ci-gate（必ず。if: always()）: 上の全ジョブを見て、failure / cancelled、または
+#   「走るべきなのに skipped」があれば fail。条件で skipped になったものは成功扱い。
+#   **ブランチ保護の Required Check は `ci-gate` 1 つに集約する**（ジョブを増減しても
+#   保護の設定を触らずに済む）。
+#
+# 判定は `.github/scripts/ci-changes.mjs`（純関数 + 判定表テスト
+# `ci-changes.test.mjs`。ローカルでは `node --test .github/scripts/ci-changes.test.mjs`）。
+# - push（main）と PR 以外の起動はフル CI（安全側）。
+# - `.github/**`・`scripts/**`・どの規則にも当たらないパスはフル CI。
+# - `crates/**`・Cargo.toml / Cargo.lock・toolchain・proto は Rust workspace 全体 +
+#   両アプリの E2E。root の package.json / pnpm-lock.yaml / lint・format・TS 設定は
+#   全 frontend + 両 E2E。
+#
+# 将来 `apps/banto-scada` を足すとき:
+#   1. ci-changes.mjs の RULES に `^apps/banto-scada/` → `scada`（E2E を足すなら
+#      `e2e/tests-banto-scada/` 等 → `e2e_scada`）を足し、AREAS・derive()
+#      （`run_frontend_scada` / `run_e2e_scada`）・RUST_PACKAGES.scada を足す。
+#   2. ci-changes.test.mjs に「scada だけの変更」の行を足す。
+#   3. 下の `changes.outputs` に新しい出力を足す。
+#   4. frontend-hub / e2e-hub を写して frontend-scada / e2e-scada ジョブを足す
+#      （`if:` は新しい出力を見る。Swatinem/rust-cache のキーはジョブ ID ごとに
+#      分かれるので、ジョブ ID を既存と重ねない）。
+#   5. ci-gate の `needs` と、ステップ内の `check` 行に新しいジョブを足す。
+#   Required Check は ci-gate のままなので、保護の設定は変えなくてよい。
 name: CI
 
 on:
@@ -10,15 +44,84 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  frontend:
-    name: Frontend (check / test / build)
+  changes:
+    name: changes (変更パス判定)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.classify.outputs.full }}
+      docs: ${{ steps.classify.outputs.docs }}
+      rust_all: ${{ steps.classify.outputs.rust_all }}
+      frontend_all: ${{ steps.classify.outputs.frontend_all }}
+      hub: ${{ steps.classify.outputs.hub }}
+      chronogazer: ${{ steps.classify.outputs.chronogazer }}
+      hub_sink: ${{ steps.classify.outputs.hub_sink }}
+      e2e_hub: ${{ steps.classify.outputs.e2e_hub }}
+      e2e_chronogazer: ${{ steps.classify.outputs.e2e_chronogazer }}
+      run_lint_format: ${{ steps.classify.outputs.run_lint_format }}
+      run_frontend_hub: ${{ steps.classify.outputs.run_frontend_hub }}
+      run_frontend_chronogazer: ${{ steps.classify.outputs.run_frontend_chronogazer }}
+      run_rust: ${{ steps.classify.outputs.run_rust }}
+      rust_args: ${{ steps.classify.outputs.rust_args }}
+      run_rust_db_source: ${{ steps.classify.outputs.run_rust_db_source }}
+      run_e2e_hub: ${{ steps.classify.outputs.run_e2e_hub }}
+      run_e2e_chronogazer: ${{ steps.classify.outputs.run_e2e_chronogazer }}
+    steps:
+      # pull_request では checkout は PR のマージコミット（refs/pull/N/merge）。
+      # fetch-depth: 2 でその 2 つの親（1 本目 = ベースの先端、2 本目 = PR の先端）
+      # まで取れるので、shallow clone のままでも「1 本目の親 → マージコミット」の
+      # 差分 = この PR がベースに持ち込む変更（CI が実際に検証する内容）を正しく
+      # 取れる。merge-base を探す `base...head` の三点差分は shallow では
+      # 失敗・誤判定しうるので使わない。
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # 判定表のテスト（判定の漏れは「必要なテストが走らない」側の失敗なので、
+      # 判定そのものを毎回検証してから使う）。
+      - name: Test classifier
+        run: node --test .github/scripts/ci-changes.test.mjs
+
+      - name: List changed files
+        id: diff
+        if: github.event_name == 'pull_request'
+        run: |
+          out="$RUNNER_TEMP/changed.txt"
+          # HEAD^2 が無い = マージコミットではない（想定外の checkout）。
+          # そのときは ok=false にして判定側でフル CI に倒す。
+          if git rev-parse --verify -q 'HEAD^2' >/dev/null \
+            && git -c core.quotePath=false diff --name-only --no-renames 'HEAD^1' HEAD > "$out"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "changed files: $(wc -l < "$out")"
+            cat "$out"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR の差分を取得できなかったのでフル CI にする"
+          fi
+
+      - name: Classify
+        id: classify
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_DIFF_OK: ${{ steps.diff.outputs.ok }}
+          CI_CHANGED_FILES: ${{ runner.temp }}/changed.txt
+        run: node .github/scripts/ci-changes.mjs
+
+  # 旧 frontend ジョブのうち repo 全体に掛かる ESLint / Prettier をここへ分けた。
+  # docs だけの変更でも Markdown の整形はここで検査する。
+  lint-format:
+    name: Lint / Format (repo 全体)
+    needs: changes
+    if: needs.changes.outputs.run_lint_format == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # apps/chronogazer's @banto/* dependencies are git subdirectory refs
-    # into tyaro/banto (github:tyaro/banto#v0.1.1&path:packages/...). banto
-    # went PUBLIC on 2026-07-12, so pnpm's default git fetcher resolves them
-    # with no credentials - no token setup is needed here (same reasoning as
-    # the rust job's banto-core/-storage/-server git-tag deps).
+    # apps/*/package.json の @banto/* は tyaro/banto への git subdirectory 参照。
+    # banto は 2026-07-12 に PUBLIC になったので、pnpm の既定の git fetcher が
+    # 資格情報なしで解決する（rust ジョブの banto-core 等の git タグ依存と同じ）。
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -43,17 +146,72 @@ jobs:
       - name: Format check (Prettier)
         run: pnpm format:check
 
+  frontend-hub:
+    name: Frontend banto-hub (check / test / build)
+    needs: changes
+    if: needs.changes.outputs.run_frontend_hub == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Type check (svelte-check + tsc)
-        run: pnpm check
+        run: pnpm --filter banto-hub check
 
       - name: Test
-        run: pnpm --recursive --if-present test
+        run: pnpm --filter banto-hub test
 
       - name: Build
-        run: pnpm build
+        run: pnpm --filter banto-hub build
+
+  frontend-chronogazer:
+    name: Frontend chronogazer (check / test / build)
+    needs: changes
+    if: needs.changes.outputs.run_frontend_chronogazer == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check (svelte-check + tsc)
+        run: pnpm --filter chronogazer check
+
+      - name: Test
+        run: pnpm --filter chronogazer test
+
+      - name: Build
+        run: pnpm --filter chronogazer build
 
   rust:
     name: Rust (fmt / clippy / test)
+    needs: changes
+    if: needs.changes.outputs.run_rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     # banto-tags (and every later I-series crate) depends on banto-core /
@@ -61,30 +219,36 @@ jobs:
     # crates/banto-tags/Cargo.toml, banto's docs/publishing.md). banto went
     # PUBLIC on 2026-07-12, so Cargo's default git fetcher resolves it with
     # no credentials - no token or insteadOf rewrite is needed here.
+    #
+    # #468: the job id stays `rust` so Swatinem/rust-cache keeps its existing
+    # key. main pushes always run the full workspace, so the cache main
+    # saves (and PRs restore) stays a full-workspace cache.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # rustfmt only parses/reformats - no compilation, so like the steps
-      # below it covers every workspace member, including the
-      # `chronogazer` src-tauri crate.
+      # rustfmt only parses/reformats - no compilation, so it always covers
+      # every workspace member (cheap), whatever the clippy/test scope below.
       - name: fmt
         run: cargo fmt --all --check
-      # Scope: the whole workspace, no --exclude. The Tauri src-tauri crate
-      # (`chronogazer`) has real tests of its own (5) - PR #39 fixed a
-      # compile error in relay-wright's src-tauri tests (relay-wright has
-      # since been archived, see docs/plan.md) that a prior narrower CI
-      # scope had let through undetected (a stale field reference left
-      # behind by T2-3). So it stays in scope rather than being excluded for
-      # build-time reasons: this job runs on windows-latest with
-      # Swatinem/rust-cache, where the Tauri/WebView2 dependency build time
-      # is acceptable.
+      # Scope (`rust_args`, from the changes job): `--workspace` when crates/**,
+      # Cargo.toml/Cargo.lock, toolchain, proto or .github changed (and on
+      # every push to main); otherwise `-p` for the touched app's packages
+      # plus their consumers (see RUST_PACKAGES in .github/scripts/ci-changes.mjs).
+      # The workspace scope has no --exclude: the Tauri src-tauri crate
+      # (`chronogazer`) has real tests of its own - PR #39 fixed a compile
+      # error in relay-wright's src-tauri tests (relay-wright has since been
+      # archived, see docs/plan.md) that a prior narrower CI scope had let
+      # through undetected (a stale field reference left behind by T2-3). So
+      # it stays in scope rather than being excluded for build-time reasons:
+      # this job runs on windows-latest with Swatinem/rust-cache, where the
+      # Tauri/WebView2 dependency build time is acceptable.
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy ${{ needs.changes.outputs.rust_args }} --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test ${{ needs.changes.outputs.rust_args }}
 
   # 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §7「S2 / S5 の統合
   # テストは CI で PostgreSQL のサービスコンテナを使う」）。上の `rust` ジョブ
@@ -96,11 +260,16 @@ jobs:
   # `rust` ジョブは緑のまま（ゲートの意味は
   # apps/banto-hub/core/tests/db_source.rs のモジュール doc 参照）。
   #
+  # #468: banto-hub・banto-hub-sink・crates・Cargo の共通設定を変えたとき
+  # （とフル CI のとき）だけ走る。
+  #
   # apt でのシステムパッケージ導入は不要: banto-hub-core は Tauri/WebKitGTK に
-  # 依存しない（`e2e` ジョブが同じ ubuntu-latest で
+  # 依存しない（`e2e-hub` ジョブが同じ ubuntu-latest で
   # `cargo build -p banto-hub-core --bin banto-hub` を素で通しているのが実証）。
   rust-db-source:
     name: Rust (db-source / PostgreSQL)
+    needs: changes
+    if: needs.changes.outputs.run_rust_db_source == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -137,15 +306,17 @@ jobs:
       - name: test (banto-hub-sink)
         run: cargo test -p banto-hub-sink
 
-  e2e:
-    name: E2E (Playwright smoke)
+  # #468: 旧 `e2e` ジョブ（chronogazer と banto-hub を 1 ジョブで）を 2 つに
+  # 分けた。hub だけの変更で chronogazer の build / Playwright を走らせない。
+  # ジョブ ID が変わったので Swatinem/rust-cache のキーも e2e-chronogazer /
+  # e2e-hub に分かれる（main の最初の push で作られる。互いのビルドで上書き
+  # し合わない）。
+  e2e-chronogazer:
+    name: E2E chronogazer (Playwright smoke)
+    needs: changes
+    if: needs.changes.outputs.run_e2e_chronogazer == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # T18-1 (docs/banto-hub-desktop-plan.md §16.3): apps/banto-hub now has
-    # its own Playwright config (e2e/banto-hub.playwright.config.ts,
-    # `pnpm e2e:banto-hub`) covering first-run setup/login/logout and the
-    # TAG-P0-1 continuous-registration DOM behavior - it runs in this same
-    # job, after the chronogazer suite.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -162,15 +333,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # `pnpm build` is recursive (`pnpm --recursive --if-present build`,
-      # root package.json) so it already produces both
-      # apps/chronogazer/build AND apps/banto-hub/build - the static
-      # SvelteKit outputs each app's `--features embed-ui` binary (below)
-      # embeds (apps/chronogazer/core/src/assets.rs,
-      # apps/banto-hub/core/src/assets.rs). No separate
-      # `pnpm --filter banto-hub build` step is needed.
-      - name: Build frontend
-        run: pnpm build
+      # The static SvelteKit output the `--features embed-ui` binary below
+      # embeds (apps/chronogazer/core/src/assets.rs).
+      - name: Build frontend (chronogazer)
+        run: pnpm --filter chronogazer build
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -190,27 +356,11 @@ jobs:
       - name: Build dev PLC example
         run: cargo build -p chronogazer-core --example dev_plc
 
-      # e2e/banto-hub.playwright.config.ts's webServer launches this binary
-      # directly, same reasoning - must exist before `pnpm e2e:banto-hub`
-      # below. banto-hub itself is Windows-service-oriented (§8「常駐」) but
-      # the console-mode binary this config runs is cross-platform (the
-      # Windows-only SCM code is `#[cfg(windows)]`-gated - see
-      # apps/banto-hub/core/src/bin/banto-hub.rs's doc comment), so it
-      # builds and runs fine here on ubuntu-latest.
-      - name: Build banto-hub (embed-ui)
-        run: cargo build -p banto-hub-core --bin banto-hub --features embed-ui
-
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Run E2E smoke suite (chronogazer)
         run: pnpm e2e
-
-      # T18-1: banto-hub's own suite (first-run setup/login/logout +
-      # TAG-P0-1 continuous-registration DOM behavior) - separate step so a
-      # failure here is distinguishable from the chronogazer suite above.
-      - name: Run E2E suite (banto-hub)
-        run: pnpm e2e:banto-hub
 
       - name: Upload Playwright report (chronogazer)
         if: failure()
@@ -220,6 +370,58 @@ jobs:
           path: e2e/playwright-report/
           retention-days: 7
 
+  # T18-1 (docs/banto-hub-desktop-plan.md §16.3): apps/banto-hub has its own
+  # Playwright config (e2e/banto-hub.playwright.config.ts,
+  # `pnpm e2e:banto-hub`) covering first-run setup/login/logout and the
+  # TAG-P0-1 continuous-registration DOM behavior.
+  e2e-hub:
+    name: E2E banto-hub (Playwright)
+    needs: changes
+    if: needs.changes.outputs.run_e2e_hub == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The static SvelteKit output the `--features embed-ui` binary below
+      # embeds (apps/banto-hub/core/src/assets.rs).
+      - name: Build frontend (banto-hub)
+        run: pnpm --filter banto-hub build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # e2e/banto-hub.playwright.config.ts's webServer launches this binary
+      # directly - must exist before `pnpm e2e:banto-hub` below. banto-hub
+      # itself is Windows-service-oriented (§8「常駐」) but the console-mode
+      # binary this config runs is cross-platform (the Windows-only SCM code
+      # is `#[cfg(windows)]`-gated - see apps/banto-hub/core/src/bin/banto-hub.rs's
+      # doc comment), so it builds and runs fine here on ubuntu-latest.
+      - name: Build banto-hub (embed-ui)
+        run: cargo build -p banto-hub-core --bin banto-hub --features embed-ui
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run E2E suite (banto-hub)
+        run: pnpm e2e:banto-hub
+
       - name: Upload Playwright report (banto-hub)
         if: failure()
         uses: actions/upload-artifact@v7
@@ -227,3 +429,67 @@ jobs:
           name: playwright-report-banto-hub
           path: e2e/playwright-report-banto-hub/
           retention-days: 7
+
+  # Required Check 用の最終ゲート（#468）。必ず走り、
+  # - changes が success でなければ fail（判定できていない = 何も保証できない）
+  # - どのジョブでも failure / cancelled があれば fail
+  # - changes が「走らせる」と判定したのに skipped なら fail
+  # - 条件で skipped になったものは成功扱い
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs:
+      - changes
+      - lint-format
+      - frontend-hub
+      - frontend-chronogazer
+      - rust
+      - rust-db-source
+      - e2e-chronogazer
+      - e2e-hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check required jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+
+          changes=$(jq -r '.changes.result' <<<"$NEEDS")
+          if [ "$changes" != "success" ]; then
+            echo "::error::changes が $changes（判定できていないので通さない）"
+            exit 1
+          fi
+
+          fail=0
+          # どのジョブでも failure / cancelled は fail。
+          while IFS=$'\t' read -r job result; do
+            case "$result" in
+              failure|cancelled)
+                echo "::error::$job が $result"
+                fail=1
+                ;;
+            esac
+          done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' <<<"$NEEDS")
+
+          # 走るべきジョブが skipped になっていないか（changes の判定と突き合わせる）。
+          check() {
+            local job=$1 key=$2 result want
+            result=$(jq -r --arg j "$job" '.[$j].result' <<<"$NEEDS")
+            want=$(jq -r --arg k "$key" '.changes.outputs[$k]' <<<"$NEEDS")
+            if [ "$want" = "true" ] && [ "$result" != "success" ]; then
+              echo "::error::$job は実行が必要（$key=true）なのに $result"
+              fail=1
+            fi
+          }
+          check lint-format run_lint_format
+          check frontend-hub run_frontend_hub
+          check frontend-chronogazer run_frontend_chronogazer
+          check rust run_rust
+          check rust-db-source run_rust_db_source
+          check e2e-chronogazer run_e2e_chronogazer
+          check e2e-hub run_e2e_hub
+
+          exit "$fail"
