@@ -61,10 +61,10 @@ PLC を設備制御の authoritative source とする。
 banto-hub / banto-scada は supervisory layer であり、
 PC 側の停止が設備停止条件にならないことを原則とする。
 
-~~~text
+```text
 PLC = Control Authority
 PC  = Supervisory / Monitoring / Operation Support
-~~~
+```
 
 SCADA から PLC に操作要求を出す場合も、最終的な実行可否は PLC が判定する。
 SCADA 側の permissive 表示は補助表示であり、安全・運転許可の authoritative 判定にはしない。
@@ -73,7 +73,7 @@ SCADA 側の permissive 表示は補助表示であり、安全・運転許可�
 
 原則:
 
-~~~text
+```text
 banto-scada
     |
     v
@@ -84,7 +84,7 @@ banto-hub
     |
     v
 PLC / DB / external systems
-~~~
+```
 
 SCADA が SLMP / Modbus 等の PLC ドライバを直接所有しない。
 PLC セッション、タグ解決、認証、監査、書き込み保護は Hub 側へ集約する。
@@ -106,7 +106,7 @@ PLC セッション、タグ解決、認証、監査、書き込み保護は Hub
 Editor は Project Model を生成・編集するツールであり、
 Runtime は Project Model を解釈して描画・動作する。
 
-~~~text
+```text
 Project Model
    |         \
    v          v
@@ -114,7 +114,7 @@ Renderer     Editor
    |
    v
 Runtime
-~~~
+```
 
 Editor が無くても手書き Project から Runtime が成立する境界を保つ。
 
@@ -122,7 +122,7 @@ Editor が無くても手書き Project から Runtime が成立する境界を�
 
 ## 2. 全体アーキテクチャ
 
-~~~text
+```text
 PLC / field devices
         |
         v
@@ -155,7 +155,7 @@ PLC / field devices
 | Event / Action Engine      |
 | Project Editor             |
 +----------------------------+
-~~~
+```
 
 ---
 
@@ -205,7 +205,7 @@ PLC / field devices
 
 ### 4.1 Project
 
-~~~text
+```text
 ScadaProject
 |
 +-- Manifest
@@ -223,7 +223,7 @@ ScadaProject
 +-- DB resource references
 +-- External connection references
 +-- Assets
-~~~
+```
 
 ### 4.2 Stable ID
 
@@ -246,7 +246,7 @@ rename で参照が壊れないことを必須とする。
 
 最低限以下を持つ。
 
-~~~text
+```text
 product            = banto-scada
 schemaVersion      = Project file format
 projectId          = same project identity
@@ -254,7 +254,7 @@ projectRevision    = project update generation
 minRuntimeVersion  = minimum compatible runtime
 exportedAt
 contentHash
-~~~
+```
 
 用途:
 
@@ -274,13 +274,13 @@ contentHash
 
 拡張子案:
 
-~~~text
+```text
 plant-a.bantoscada
-~~~
+```
 
 内部例:
 
-~~~text
+```text
 manifest.json
 project.json
 
@@ -293,7 +293,7 @@ actions/
 assets/
 
 checksums.json
-~~~
+```
 
 ### 5.2 更新判定
 
@@ -310,7 +310,7 @@ checksums.json
 
 例:
 
-~~~text
+```text
 Project revision 120 -> 127
 
 Screens
@@ -327,7 +327,7 @@ Faceplates
 Equipment
   + CV103
   ~ CV102
-~~~
+```
 
 以下は security-sensitive change として強調する。
 
@@ -354,7 +354,7 @@ Import 後に不足 secret を明示して設定させる。
 
 ### 5.5 Migration
 
-~~~text
+```text
 v1 project
    |
  migrate
@@ -364,7 +364,7 @@ v2
  migrate
    v
 current model
-~~~
+```
 
 読み込み時に in-memory migration -> validate -> diff -> apply の順とする。
 保存時は current schema で書き出す。
@@ -424,7 +424,7 @@ Motor / Valve / Pump は ObjectType へ直接増やさず Symbol と Equipment �
 
 ### 7.1 EquipmentType
 
-~~~text
+```text
 EquipmentType: Motor
 
 Binding Slots
@@ -436,11 +436,11 @@ Binding Slots
 
 Default Symbol
 Default Faceplate
-~~~
+```
 
 ### 7.2 EquipmentInstance
 
-~~~text
+```text
 Motor01
   type = Motor
 
@@ -449,7 +449,7 @@ bindings
   fault   -> StableTagId(...)
   command -> StableTagId(...)
   speed   -> StableTagId(...)
-~~~
+```
 
 Symbol と Faceplate に個別に tag を再設定せず、
 EquipmentInstance の binding context を共有する。
@@ -458,7 +458,7 @@ EquipmentInstance の binding context を共有する。
 
 同一 EquipmentType の多数配置を再利用する。
 
-~~~text
+```text
 EquipmentType
     |
     +-- SymbolDefinition
@@ -467,7 +467,7 @@ EquipmentType
      EquipmentInstance
              |
          BindingSet
-~~~
+```
 
 ### 7.4 Faceplate
 
@@ -508,12 +508,12 @@ Equipment に限定しない汎用 View。
 
 ### 7.6 View Stack
 
-~~~text
+```text
 System Overlay
 Modal Dialog Layer
 Faceplate / Popup Layer
 Process Screen
-~~~
+```
 
 Alarm banner 等は System Overlay とする。
 
@@ -527,7 +527,7 @@ Alarm banner 等は System Overlay とする。
 
 選択中 object に応じて context-sensitive に表示する。
 
-~~~text
+```text
 Inspector
 
 General
@@ -536,7 +536,7 @@ Appearance
 Binding
 Events
 Actions
-~~~
+```
 
 Editor panel は project data と分離した workspace state とする。
 
@@ -555,7 +555,7 @@ Project export には含めない。
 
 Hub catalog をそのまま階層表示する。
 
-~~~text
+```text
 Tags
   PLC01
     Fast
@@ -568,7 +568,7 @@ Tags
   Internal
   DB Values
   DB Tables
-~~~
+```
 
 表示候補:
 
@@ -591,11 +591,11 @@ Equipment slot には型検査を行う。
 
 例:
 
-~~~text
+```text
 running requires BOOL
 Temperature is F32
 => assignment rejected
-~~~
+```
 
 ### 8.4 未割付
 
@@ -615,11 +615,11 @@ Publish/Deploy 前の validation で warning/error をまとめて表示する�
 
 通常の画面 Binding は Hub の stable ID を保存する。
 
-~~~text
+```text
 connection_id
 group_id
 tag_id
-~~~
+```
 
 外部名は表示・再解決支援用 metadata とする。
 
@@ -631,13 +631,13 @@ Project には fallback hint を保持してよい。
 
 例:
 
-~~~text
+```text
 stableTagId
 hint:
   externalName
   dataType
   unit
-~~~
+```
 
 自動で別タグへ勝手に binding せず、
 未解決 -> candidate -> user confirmation とする。
@@ -646,13 +646,13 @@ hint:
 
 Binding を直接 property へつなぐだけでなく、
 
-~~~text
+```text
 Tag(s)
   |
 Expression
   |
 Property
-~~~
+```
 
 を許容する。
 
@@ -698,7 +698,7 @@ Property
 
 ### 10.3 execution target
 
-~~~text
+```text
 Local
   Navigate
   Dialog
@@ -710,7 +710,7 @@ Hub/Server
   HTTP webhook
   DB command
   alarm/tracking triggered action
-~~~
+```
 
 設備イベントに依存する常時実行 Action は SCADA Runtime ではなく Hub 側を優先する。
 SCADA を閉じたことで通知・記録が消える設計にしない。
@@ -721,7 +721,7 @@ SCADA を閉じたことで通知・記録が消える設計にしない。
 
 管理者が許可済み program definition を登録し、Project は ID を参照する。
 
-~~~text
+```text
 ExternalProgramDefinition
   id
   executable
@@ -729,7 +729,7 @@ ExternalProgramDefinition
   working directory
   single instance
   timeout
-~~~
+```
 
 shell.exe /c 相当を原則使用せず、実行ファイルを直接起動する。
 
@@ -737,14 +737,14 @@ shell.exe /c 相当を原則使用せず、実行ファイルを直接起動す�
 
 Project へ認証 secret / raw connection string を保存しない。
 
-~~~text
+```text
 HttpConnection
   id
   base URL
   auth type
   secret reference
   timeout
-~~~
+```
 
 Action は connection ID と relative path を参照する。
 
@@ -752,12 +752,12 @@ Action は connection ID と relative path を参照する。
 
 初版は複雑な node workflow にしない。
 
-~~~text
+```text
 ActionStep
   action
   on_success
   on_failure
-~~~
+```
 
 程度から開始する。
 
@@ -783,7 +783,7 @@ PLC write や non-idempotent POST は暗黙自動 retry しない。
 
 Alarm を tag_kind = alarm として本体化しない。
 
-~~~text
+```text
 Tag / PLC alarm source
        |
        v
@@ -793,7 +793,7 @@ Tag / PLC alarm source
        +-- AlarmState
        +-- AlarmEvent
        +-- AlarmHistory
-~~~
+```
 
 必要に応じて read-only alarm state tag を projection として公開してもよいが、
 Alarm entity の authoritative source にはしない。
@@ -802,14 +802,14 @@ Alarm entity の authoritative source にはしない。
 
 2 系統を正式に扱う。
 
-~~~text
+```text
 AlarmSource
   +-- Hub evaluated
   |      tag/expression -> alarm
   |
   +-- PLC generated
          PLC alarm state/event -> Hub
-~~~
+```
 
 ### 11.3 PLC-generated alarm
 
@@ -828,7 +828,7 @@ Hub はそれを ingest する。
 
 高信頼用途では以下を分離する。
 
-~~~text
+```text
 PLC
  |
  +-- UDP / event notification ---- low latency
@@ -839,7 +839,7 @@ PLC
              |
              v
         Alarm Ingest
-~~~
+```
 
 UDP は低レイテンシ用途であり唯一の真実にしない。
 
@@ -847,9 +847,9 @@ UDP は低レイテンシ用途であり唯一の真実にしない。
 
 Alarm state machine は独立 crate 候補:
 
-~~~text
+```text
 crates/banto-alarm
-~~~
+```
 
 当面は banto-hub process 内で動かす。
 別 process 化は durable event transport が必要になってから検討する。
@@ -882,12 +882,12 @@ Alarm Definition 候補:
 
 搬送系では Tracking を独立 domain とする。
 
-~~~text
+```text
 Tags       = current values
 History    = time series
 Alarm      = abnormal states
 Tracking   = identity / location / movement
-~~~
+```
 
 ### 12.1 PLC authoritative
 
@@ -901,26 +901,26 @@ SCADA / Hub が停止しても搬送継続できること。
 
 例:
 
-~~~text
+```text
 CV01.IN
 CV01.ZONE01
 CV01.ZONE02
 CV01.OUT
 STATION10
 LIFTER01
-~~~
+```
 
 SCADA は Logical Location を画面座標へ mapping する。
 
 ### 12.3 Tracking Unit
 
-~~~text
+```text
 TrackingUnit
   tracking_id
   carrier_type
   current_location
   state
-~~~
+```
 
 Hub 側には必要に応じて詳細 metadata を付加する。
 
@@ -951,11 +951,11 @@ PLC-A / PLC-B 間で ownership transfer を成立させる。
 
 Alarm と同様に、
 
-~~~text
+```text
 Current tracking table
 +
 Event sequence / FIFO
-~~~
+```
 
 を組み合わせる。
 
@@ -965,9 +965,9 @@ Hub は source run id + source sequence 等で重複排除・欠番検出でき�
 
 独立 crate 候補:
 
-~~~text
+```text
 crates/banto-tracking
-~~~
+```
 
 Tracking anomaly は banto-alarm へ接続する。
 
@@ -986,7 +986,7 @@ Tracking anomaly は banto-alarm へ接続する。
 
 既存資産を利用する。
 
-~~~text
+```text
 banto-tstore
     |
 banto-tsquery
@@ -996,7 +996,7 @@ banto-hub History API
 banto-tagclient
     |
 banto-scada Trend
-~~~
+```
 
 SCADA が tstore file を直接読む方式にはしない。
 
@@ -1010,13 +1010,13 @@ SCADA が tstore file を直接読む方式にはしない。
 
 SCADA Runtime は DB へ直接接続しない。
 
-~~~text
+```text
 SCADA
   |
 Hub API
   |
 DB
-~~~
+```
 
 DB credential / SQL / DB driver を SCADA Project に持ち込まない。
 
@@ -1024,12 +1024,12 @@ DB credential / SQL / DB driver を SCADA Project に持ち込まない。
 
 現行 Hub の DB Source は、
 
-~~~text
+```text
 PostgreSQL query
   -> result column
   -> db scalar tag
   -> current value
-~~~
+```
 
 として利用する。
 
@@ -1044,14 +1044,14 @@ UI 上は「DB タグ」として統合してもよいが、
 
 概念例:
 
-~~~text
+```text
 DB Resource
   +-- DB Value Tag
   |     scalar/current value
   |
   +-- DB Table Tag
         rows x columns
-~~~
+```
 
 tag kind 候補:
 
@@ -1060,7 +1060,7 @@ tag kind 候補:
 
 capability 例:
 
-~~~text
+```text
 PLC tag
   current_value = true
   history       = true
@@ -1071,7 +1071,7 @@ DB scalar tag
 DB table tag
   tabular       = true
   current_value = false
-~~~
+```
 
 db_table は通常の values WS/MQTT stream へ流さない。
 
@@ -1092,12 +1092,12 @@ DB 内部 schema と SCADA の契約境界を View に置くことで、
 
 例:
 
-~~~text
+```text
 GET /api/v1/db-resources
 GET /api/v1/db-resources/{id}
 GET /api/v1/db-resources/{id}/schema
 GET /api/v1/db-resources/{id}/rows
-~~~
+```
 
 rows では pagination / sort / allowed filter を提供する。
 
@@ -1107,7 +1107,7 @@ SCADA から任意 SQL を送る API は作らない。
 
 SCADA の一級 widget とする。
 
-~~~text
+```text
 DataGrid
   source
   columns
@@ -1115,17 +1115,17 @@ DataGrid
   page size
   sort
   row events
-~~~
+```
 
 row context を Dialog / Action へ渡せるようにする。
 
 例:
 
-~~~text
+```text
 row.order_id
 row.product
 row.status
-~~~
+```
 
 ---
 
@@ -1135,7 +1135,7 @@ DB Resource を Recipe / Production Result に活用する。
 
 ### 15.1 Recipe
 
-~~~text
+```text
 DB Recipe Table/View
        |
       Hub
@@ -1145,7 +1145,7 @@ DB Recipe Table/View
   Recipe Download Action
        |
       PLC
-~~~
+```
 
 PLC に転送後は Hub/SCADA が停止しても現在 Recipe で運転継続できること。
 
@@ -1158,11 +1158,11 @@ PLC 側にも active_recipe_id / active_recipe_revision を保持できる構造
 
 更新・登録は任意 SQL ではなく、登録済み DB Command / Server Action を使用する。
 
-~~~text
+```text
 ExecuteDbCommand
   command = complete-production
   typed params
-~~~
+```
 
 内部実装は parameterized SQL / stored procedure 等を許容する。
 
@@ -1231,7 +1231,7 @@ Audit 候補:
 
 banto-scada では以下を一般化する。
 
-~~~text
+```text
 MQTT topic             -> Hub StableTagId
 TopEquipmentObject     -> EquipmentInstance / SymbolInstance
 Equipment screen       -> Faceplate / Screen
@@ -1239,7 +1239,7 @@ Topic expression       -> Binding Expression / banto-expr
 portable-settings      -> Project Package
 direct DB trend        -> Hub History API
 alarm table viewer     -> Hub Alarm API
-~~~
+```
 
 ---
 
@@ -1247,29 +1247,29 @@ alarm table viewer     -> Hub Alarm API
 
 初期は一つの製品 executable でもよい。
 
-~~~text
+```text
 banto-scada
   Runtime mode
   Editor mode
-~~~
+```
 
 内部 module/package は分離する。
 
 候補:
 
-~~~text
+```text
 scada-model
 scada-renderer
 scada-editor
 scada-runtime
-~~~
+```
 
 将来、要求が出た場合に、
 
-~~~text
+```text
 banto-scada-runtime
 banto-scada-studio
-~~~
+```
 
 へ製品分離できるようにする。
 
@@ -1296,7 +1296,7 @@ banto-scada での AI 利用は **設計時を主対象**とする。
 Runtime で AI が常時設備を監視・自律操作することは本設計の必須要件にしない。
 運転データの取得・PLC write・Alarm・Tracking 等は既存の Hub API / Hub MCP の責務とする。
 
-~~~text
+```text
                AI / automation
                   /       \
                  /         \
@@ -1304,7 +1304,7 @@ Runtime で AI が常時設備を監視・自律操作することは本設計�
        project / screen     tags / values
        equipment / binding  alarm / tracking
        validate / plan      DB resources
-~~~
+```
 
 ### 19.2 API-first
 
@@ -1312,7 +1312,7 @@ AI 連携の本体を MCP に置かない。
 
 **Design API を一次契約**とし、以下が同じ domain service を利用する。
 
-~~~text
+```text
                  SCADA Design Domain
                  /       |        \
                 /        |         \
@@ -1320,7 +1320,7 @@ AI 連携の本体を MCP に置かない。
                          |
                          +-- AI Agent
                          +-- optional MCP adapter
-~~~
+```
 
 目的:
 
@@ -1334,7 +1334,7 @@ AI 連携の本体を MCP に置かない。
 
 候補:
 
-~~~text
+```text
 Project
   GET  /api/design/v1/project
   POST /api/design/v1/validate
@@ -1372,7 +1372,7 @@ Action
 Change set
   POST /api/design/v1/changes/plan
   POST /api/design/v1/changes/apply
-~~~
+```
 
 上記は方向性であり、URL・粒度は実装時に確定する。
 
@@ -1380,9 +1380,9 @@ Change set
 
 AI 向けに、
 
-~~~text
+```text
 update_json(path="screens[0].objects[17]...")
-~~~
+```
 
 のような raw JSON path mutation を主 API にしない。
 
@@ -1424,7 +1424,7 @@ OpenAPI には少なくとも以下を明示する。
 
 例:
 
-~~~text
+```text
 errors:
   - Motor01.running requires bool, bound tag is f32
   - Screen Line01 references deleted faceplate
@@ -1432,7 +1432,7 @@ errors:
 warnings:
   - Motor03.command is unassigned
   - Dialog RecipeSelect references unavailable DB resource
-~~~
+```
 
 validation 対象例:
 
@@ -1449,7 +1449,7 @@ validation 対象例:
 
 AI の典型フローを以下とする。
 
-~~~text
+```text
 inspect
   |
 plan/edit
@@ -1459,7 +1459,7 @@ validate
 fix
   |
 validate
-~~~
+```
 
 ### 19.7 Plan / Apply
 
@@ -1467,14 +1467,14 @@ AI による大規模変更は、原則として plan -> review -> apply を利�
 
 例:
 
-~~~text
+```text
 + Screen Line02
 + Motor x12
 + Valve x6
 + 54 bindings
 ~ Navigation
 + 3 write actions
-~~~
+```
 
 既存 Project Import の diff engine と共通化できる部分は共通化する。
 
@@ -1491,22 +1491,22 @@ AI による大規模変更は、原則として plan -> review -> apply を利�
 
 Design API mutation は projectRevision を利用する。
 
-~~~text
+```text
 read:
   projectRevision = 127
 
 apply:
   expectedRevision = 127
-~~~
+```
 
 人間または別 Agent が先に編集して currentRevision = 128 になっていれば、
 古い revision に基づく apply を拒否する。
 
 stable error 例:
 
-~~~text
+```text
 project_revision_conflict
-~~~
+```
 
 これにより AI と人間の同時編集による silent overwrite を防ぐ。
 
@@ -1527,7 +1527,7 @@ Editor が開いている Project file を AI がファイルシステム経由�
 
 AI は Hub catalog と EquipmentType の slot metadata を利用して Binding 候補を提示できる。
 
-~~~text
+```text
 EquipmentType: Motor
 
 running:
@@ -1542,17 +1542,17 @@ command:
   type: bool
   writable: true
   description: motor start command
-~~~
+```
 
 候補例:
 
-~~~text
+```text
 Motor01.running
   -> PLC01.Fast.Motor01_Run
 
 Motor01.fault
   -> PLC01.Fast.Motor01_Fault
-~~~
+```
 
 型、unit、writable、名前、description 等を候補評価に利用できる。
 
@@ -1564,12 +1564,12 @@ SCADA 専用 MCP は初期必須要件にしない。
 
 必要性が出た場合のみ、
 
-~~~text
+```text
 MCP Adapter
     |
     v
 Design API / Design Domain
-~~~
+```
 
 という薄い adapter として追加する。
 
@@ -1589,7 +1589,7 @@ SCADA Design API は設計時機能であり、Runtime の物理操作経路を�
 
 AI が運転データや PLC 操作を必要とする場合は、
 
-~~~text
+```text
 AI
  |
 Hub API / Hub MCP
@@ -1597,7 +1597,7 @@ Hub API / Hub MCP
 Hub permission / audit / write guard
  |
 PLC
-~~~
+```
 
 を利用する。
 
