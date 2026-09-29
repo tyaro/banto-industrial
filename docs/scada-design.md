@@ -34,6 +34,7 @@ ChronoGazer には時系列収集・トレンド資産がある。
 - 外部プログラム起動
 - Project Editor
 - Project Import / Export / Update
+- AI / automation friendly Design API
 
 単一案件にハードコードした HMI ではなく、
 **Editor で定義した Project を Runtime が実行する汎用 SCADA**を目標とする。
@@ -177,6 +178,8 @@ PLC / field devices
 - DataGrid
 - Alarm 表示基盤
 - Trend 表示基盤
+- Design API（Project / Screen / Equipment / Binding / Validate / Plan / Apply）
+- Design API の OpenAPI 公開
 
 ### 初版で限定する項目
 
@@ -194,6 +197,7 @@ PLC / field devices
 - SCADA からの任意 SQL 実行
 - Project に任意 shell command を埋め込む機構
 - 初版からの汎用 PLC プログラミング環境
+- AI による Runtime 常時監視・自律運転を必須機能とすること
 
 ---
 
@@ -1271,7 +1275,353 @@ banto-scada-studio
 
 ---
 
-## 19. Repository / CI
+## 19. AI / Design API
+
+### 19.1 AI の利用範囲
+
+banto-scada での AI 利用は **設計時を主対象**とする。
+
+主な用途:
+
+- Screen の作成・変更
+- Symbol / Faceplate / Dialog の生成
+- EquipmentInstance の作成
+- Hub tag catalog を使った Binding 候補提示・割付
+- Event / Action の設定
+- Project validation の修正支援
+- 既存画面・Equipment の複製、連番展開
+- Project 差分の説明
+- Import / migration の補助
+
+Runtime で AI が常時設備を監視・自律操作することは本設計の必須要件にしない。
+運転データの取得・PLC write・Alarm・Tracking 等は既存の Hub API / Hub MCP の責務とする。
+
+~~~text
+               AI / automation
+                  /       \
+                 /         \
+       SCADA Design API     Hub API / MCP
+       project / screen     tags / values
+       equipment / binding  alarm / tracking
+       validate / plan      DB resources
+~~~
+
+### 19.2 API-first
+
+AI 連携の本体を MCP に置かない。
+
+**Design API を一次契約**とし、以下が同じ domain service を利用する。
+
+~~~text
+                 SCADA Design Domain
+                 /       |        \
+                /        |         \
+          Editor UI     REST       CLI
+                         |
+                         +-- AI Agent
+                         +-- optional MCP adapter
+~~~
+
+目的:
+
+- Editor と AI で validation / mutation 規則を二重実装しない
+- Project schema の内部表現を外部ツールへ直接露出しすぎない
+- AI 以外の自動生成ツール・CLI からも利用可能にする
+- MCP が不要な環境でも同一機能を利用できる
+- 将来 MCP を追加しても薄い adapter で済む
+
+### 19.3 Design API の公開範囲
+
+候補:
+
+~~~text
+Project
+  GET  /api/design/v1/project
+  POST /api/design/v1/validate
+
+Screen
+  GET  /api/design/v1/screens
+  POST /api/design/v1/screens
+  GET  /api/design/v1/screens/{id}
+  PUT  /api/design/v1/screens/{id}
+
+Object
+  POST /api/design/v1/screens/{id}/objects
+  PUT  /api/design/v1/objects/{id}
+  DELETE /api/design/v1/objects/{id}
+
+Equipment
+  GET  /api/design/v1/equipment-types
+  GET  /api/design/v1/equipment
+  POST /api/design/v1/equipment
+  PUT  /api/design/v1/equipment/{id}/bindings
+
+Library
+  GET  /api/design/v1/symbols
+  GET  /api/design/v1/faceplates
+  GET  /api/design/v1/dialogs
+
+Binding
+  PUT  /api/design/v1/bindings/{id}
+  POST /api/design/v1/bindings/expression/check
+
+Action
+  GET  /api/design/v1/actions
+  POST /api/design/v1/actions
+
+Change set
+  POST /api/design/v1/changes/plan
+  POST /api/design/v1/changes/apply
+~~~
+
+上記は方向性であり、URL・粒度は実装時に確定する。
+
+### 19.4 Semantic API
+
+AI 向けに、
+
+~~~text
+update_json(path="screens[0].objects[17]...")
+~~~
+
+のような raw JSON path mutation を主 API にしない。
+
+代わりに、
+
+- create_screen
+- add_object
+- move_object
+- create_equipment
+- bind_equipment_slot
+- set_property_binding
+- create_faceplate
+- set_event_action
+
+等の SCADA domain operation を提供する。
+
+Project file の内部 schema と外部操作契約を分離し、
+schema migration が Design API consumer を不必要に壊さない構造とする。
+
+### 19.5 OpenAPI
+
+Design API は OpenAPI document を生成・公開する。
+
+AI Agent は OpenAPI から API 契約を取得できるため、
+**MCP が無くても機械操作可能**であることを設計目標とする。
+
+OpenAPI には少なくとも以下を明示する。
+
+- request / response schema
+- stable error code
+- project revision conflict
+- validation result
+- security-sensitive change classification
+- capability / enum
+
+### 19.6 Validate
+
+`validate_project` 相当の機能を Editor / API / AI で共有する。
+
+例:
+
+~~~text
+errors:
+  - Motor01.running requires bool, bound tag is f32
+  - Screen Line01 references deleted faceplate
+
+warnings:
+  - Motor03.command is unassigned
+  - Dialog RecipeSelect references unavailable DB resource
+~~~
+
+validation 対象例:
+
+- object reference
+- EquipmentType / slot type
+- StableTagId resolution
+- expression type
+- writable requirement
+- Faceplate / Dialog reference
+- Action target
+- DB Resource reference
+- Recipe / Tracking reference
+- unresolved secret requirement
+
+AI の典型フローを以下とする。
+
+~~~text
+inspect
+  |
+plan/edit
+  |
+validate
+  |
+fix
+  |
+validate
+~~~
+
+### 19.7 Plan / Apply
+
+AI による大規模変更は、原則として plan -> review -> apply を利用できるようにする。
+
+例:
+
+~~~text
++ Screen Line02
++ Motor x12
++ Valve x6
++ 54 bindings
+~ Navigation
++ 3 write actions
+~~~
+
+既存 Project Import の diff engine と共通化できる部分は共通化する。
+
+以下を security-sensitive change として plan 上で強調する。
+
+- writable tag binding
+- PLC Write Action
+- DB Command
+- HTTP endpoint / method
+- External Program
+- authentication / secret requirement
+
+### 19.8 Optimistic Concurrency
+
+Design API mutation は projectRevision を利用する。
+
+~~~text
+read:
+  projectRevision = 127
+
+apply:
+  expectedRevision = 127
+~~~
+
+人間または別 Agent が先に編集して currentRevision = 128 になっていれば、
+古い revision に基づく apply を拒否する。
+
+stable error 例:
+
+~~~text
+project_revision_conflict
+~~~
+
+これにより AI と人間の同時編集による silent overwrite を防ぐ。
+
+### 19.9 Editor との同期
+
+Design API から Project が変更された場合、Editor は変更を検知して最新 revision を読み直せること。
+
+方式候補:
+
+- local event
+- WebSocket / SSE
+- watch channel
+
+API mutation と Editor 内 mutation は同じ Project service / revision 管理を通す。
+Editor が開いている Project file を AI がファイルシステム経由で直接書き換える運用を標準経路にしない。
+
+### 19.10 Binding Assistance
+
+AI は Hub catalog と EquipmentType の slot metadata を利用して Binding 候補を提示できる。
+
+~~~text
+EquipmentType: Motor
+
+running:
+  type: bool
+  description: motor running feedback
+
+fault:
+  type: bool
+  description: motor fault status
+
+command:
+  type: bool
+  writable: true
+  description: motor start command
+~~~
+
+候補例:
+
+~~~text
+Motor01.running
+  -> PLC01.Fast.Motor01_Run
+
+Motor01.fault
+  -> PLC01.Fast.Motor01_Fault
+~~~
+
+型、unit、writable、名前、description 等を候補評価に利用できる。
+
+**writable slot の Binding は自動確定より明示的な確認を優先**する。
+
+### 19.11 MCP の位置づけ
+
+SCADA 専用 MCP は初期必須要件にしない。
+
+必要性が出た場合のみ、
+
+~~~text
+MCP Adapter
+    |
+    v
+Design API / Design Domain
+~~~
+
+という薄い adapter として追加する。
+
+MCP 固有の validation / mutation / permission logic は作らない。
+
+MCP の利点は主に以下に限定する。
+
+- tools/list による tool discovery
+- MCP 対応 AI client からの接続容易性
+- tool schema の標準化
+
+これらが OpenAPI / Agent tool integration で十分なら MCP は実装しなくてよい。
+
+### 19.12 Runtime との境界
+
+SCADA Design API は設計時機能であり、Runtime の物理操作経路を増やすものではない。
+
+AI が運転データや PLC 操作を必要とする場合は、
+
+~~~text
+AI
+ |
+Hub API / Hub MCP
+ |
+Hub permission / audit / write guard
+ |
+PLC
+~~~
+
+を利用する。
+
+SCADA Design API に PLC write の runtime bypass を作らない。
+
+### 19.13 公開範囲とセキュリティ
+
+Design API は Editor mode でのみ有効にすることを基本とし、
+初期実装では loopback bind を第一候補とする。
+
+Runtime-only deployment では Design API を無効化できる構造とする。
+
+Project 設計変更は operator runtime audit と区別し、
+必要に応じて design change history として以下を記録する。
+
+- actor / client
+- before revision
+- after revision
+- change summary
+- timestamp
+
+---
+
+## 20. Repository / CI
 
 SCADA の repository 分割は現時点では確定しない。
 
@@ -1295,13 +1645,14 @@ SCADA の repository 分割は現時点では確定しない。
 
 ---
 
-## 20. 実装ロードマップ案
+## 21. 実装ロードマップ案
 
 ### S0 Architecture
 
 - 本書を設計の基準文書として確定
 - Project schema の最小型を定義
 - Hub に必要な追加 API を洗い出す
+- Design API の最小契約を確定
 
 ### S1 scada-model
 
@@ -1339,7 +1690,18 @@ SCADA の repository 分割は現時点では確定しない。
 - diff preview
 - backup / rollback
 
-### S5 Editor Core
+### S5 Design API
+
+- Project inspect
+- semantic mutation
+- OpenAPI
+- validate
+- plan / apply
+- projectRevision optimistic concurrency
+- Editor change notification
+- loopback/editor-mode security boundary
+
+### S6 Editor Core
 
 - select
 - move
@@ -1347,8 +1709,9 @@ SCADA の repository 分割は現時点では確定しない。
 - zoom
 - inspector
 - undo / redo
+- Design API / Project service との共通 mutation 経路
 
-### S6 Tag Browser / Binding UX
+### S7 Tag Browser / Binding UX
 
 - Hub catalog tree
 - search
@@ -1356,8 +1719,9 @@ SCADA の repository 分割は現時点では確定しない。
 - double click
 - type validation
 - expression insertion
+- AI binding assistance 用 metadata
 
-### S7 Equipment / Symbol / Faceplate
+### S8 Equipment / Symbol / Faceplate
 
 - EquipmentType
 - EquipmentInstance
@@ -1365,7 +1729,7 @@ SCADA の repository 分割は現時点では確定しない。
 - Faceplate / Dialog
 - View Stack
 
-### S8 Action Engine
+### S9 Action Engine
 
 - Navigate
 - Dialog
@@ -1374,7 +1738,7 @@ SCADA の repository 分割は現時点では確定しない。
 - external program
 - audit
 
-### S9 Alarm
+### S10 Alarm
 
 - banto-alarm
 - Alarm API
@@ -1383,7 +1747,7 @@ SCADA の repository 分割は現時点では確定しない。
 - PLC generated alarm input
 - SLMP monitor / event recovery 設計
 
-### S10 Tracking
+### S11 Tracking
 
 - banto-tracking
 - logical location
@@ -1391,13 +1755,13 @@ SCADA の repository 分割は現時点では確定しない。
 - event FIFO/sequence
 - SCADA tracking presentation
 
-### S11 History
+### S12 History
 
 - Hub History API
 - banto-tagclient history extension
 - Trend widget
 
-### S12 DB Resources
+### S13 DB Resources
 
 - DB table/view registration
 - schema/rows API
@@ -1405,7 +1769,7 @@ SCADA の repository 分割は現時点では確定しない。
 - row context
 - pagination
 
-### S13 Recipe / Production Result
+### S14 Recipe / Production Result
 
 - Recipe selection/display
 - PLC download action
@@ -1413,9 +1777,15 @@ SCADA の repository 分割は現時点では確定しない。
 - DB commands
 - production result viewer
 
+### Optional: MCP Adapter
+
+Design API / OpenAPI だけでは AI client 統合が不十分という実要件が出た場合にのみ、
+SCADA MCP adapter を追加する。
+MCP 自体は roadmap の blocking milestone にしない。
+
 ---
 
-## 21. 未決事項
+## 22. 未決事項
 
 以下は実装前に個別決定する。
 
@@ -1429,10 +1799,12 @@ SCADA の repository 分割は現時点では確定しない。
 8. Tracking PLC block の標準 memory layout
 9. Server Action を Hub 本体に置く範囲
 10. Editor/Runtime の executable 分離時期
+11. Design API の最終 transport / bind policy（初期候補: editor mode + loopback REST）
+12. AI change plan の承認を必須にする変更範囲
 
 ---
 
-## 22. 現時点の主要決定
+## 23. 現時点の主要決定
 
 - PLC は control authority。PC 停止で設備制御を止めない
 - SCADA は PLC に直接接続せず Hub を介する
@@ -1453,3 +1825,11 @@ SCADA の repository 分割は現時点では確定しない。
 - Project Import/Export は projectId / projectRevision / schemaVersion を持つ
 - Project package へ secret を含めない
 - ems-apps の Editor UX を先行実装の知見として継承する
+- AI 利用は設計時を主対象とし、Runtime AI を必須要件にしない
+- AI 連携は MCP-first ではなく Design API-first とする
+- Editor / CLI / AI は同じ Design Domain / mutation / validation を共有する
+- Design API は OpenAPI を公開し、AI が MCP 無しでも操作できることを目標とする
+- AI の Project 変更は projectRevision による optimistic concurrency を使う
+- 大規模・security-sensitive な AI 変更は plan / diff / validate を経て apply できる構造とする
+- SCADA 専用 MCP は optional adapter とし、必要性が出るまで実装を必須にしない
+- SCADA Design API に PLC runtime write の bypass を作らない
