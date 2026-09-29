@@ -226,3 +226,5 @@ pub fn compile(source: &str) -> Result<CompiledExpr, CompileError> {
         result_type,
     })
 }
+
+// #468 CI 判定の検証用ダミー（crates の変更）。マージしない。
