@@ -11577,6 +11577,37 @@ mod tests {
         );
     }
 
+    /// `ApiDoc::openapi()` の出力を、コミット済みスナップショット
+    /// （`tests/snapshots/openapi.json`）と完全一致で比較する。utoipa の
+    /// メジャー更新などで API 契約（パス・パラメータ・必須性・型）が意図せず
+    /// 変わっていないことを検知するためのテスト。再生成は
+    /// `UPDATE_OPENAPI_SNAPSHOT=1 cargo test -p banto-hub-core openapi_snapshot`。
+    /// 比較は `serde_json::Value`（キー順非依存）、ファイルは pretty 出力。
+    #[test]
+    fn openapi_snapshot_matches() {
+        let actual = serde_json::to_value(ApiDoc::openapi()).expect("openapi serialize");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("snapshots")
+            .join("openapi.json");
+        if std::env::var_os("UPDATE_OPENAPI_SNAPSHOT").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut text = serde_json::to_string_pretty(&actual).unwrap();
+            text.push('\n');
+            std::fs::write(&path, text).unwrap();
+            return;
+        }
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .expect("snapshot missing; run with UPDATE_OPENAPI_SNAPSHOT=1"),
+        )
+        .expect("snapshot parse");
+        assert!(
+            actual == expected,
+            "OpenAPI output differs from tests/snapshots/openapi.json; review the diff and regenerate with UPDATE_OPENAPI_SNAPSHOT=1"
+        );
+    }
+
     /// `GET /api/v1/swagger-ui/`（末尾スラッシュあり）は認証不要で 200 の
     /// Swagger UI HTML を返し、それが読み込む `swagger-initializer.js`
     /// （同じく認証不要）が `/api/v1/openapi.json` を指すよう設定されている
