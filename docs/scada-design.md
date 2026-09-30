@@ -1337,7 +1337,7 @@ banto-hub の型（`HubRuntime` をライブラリとし、コンソール / サ
   プロセス内で core を起動してそのまま画面を出す。トレイと状態画面もここで持つ。詳しくない人は
   「アプリを起動すれば全部動く」で済む
 - **host 2 = headless コンソール**: ChronoGazer の `banto-serve` 相当
-- **host 3 = Windows サービス（後続）**: T17 の SCM 登録と `banto-hub-elev` の型を流用した薄い wrapper。
+- **host 3 = Windows サービス（v1.1。§3）**: T17 の SCM 登録と `banto-hub-elev` の型を流用した薄い wrapper。
   アプリはサービスを検出したら自分では起動せず、そこへ接続する（T16-2 と同じ判定）。複数 client の現場、
   アプリを閉じても記録を続けたい現場向け
 
@@ -2100,6 +2100,9 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 
 ## 21. 実装ロードマップ案
 
+スライス番号は付けた順で、実装順・依存関係を表さない。実装順は §3 の区分（Core v1 / v1.1 / 後続 Extension）と
+各見出しの注記、および本節の並び順に従う。
+
 ### S0 Architecture
 
 - 本書を設計の基準文書として確定
@@ -2210,13 +2213,15 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - operator ACK / Shelve
 - protocol-specific PLC alarm adapter は後続
 
-### S11 Tracking
+### S10b 常時実行 Event / Action（v1.1。host は S9b の scada-server core。§10.3）
 
-- banto-tracking
-- logical location
-- current tracking
-- event FIFO/sequence
-- SCADA tracking presentation
+- server-side Event: value edge / timer / alarm 起点（tracking 起点は Tracking の host 決定後）
+- scada-server core 上の常時実行 engine（UI が閉じていても成立。Project の revision を読み、
+  変更通知で再読込）
+- 基本的な Action execution（PLC Write / audit。§16 の execution record を共有）
+- 副作用のある Action を 1 台に限定する境界（将来リースで抑止。§13.2 の冗長化方針、§22 #19）。
+  v1.1 は単一インスタンス前提でよいが、engine が「自分が実行担当か」を問い合わせる口だけ置く
+- server-side HTTP / DB command は S9c
 
 ### S12 History / Trend（ChronoGazer と共有、v1.1。host は S9b の scada-server core）
 
@@ -2227,10 +2232,18 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - トレンド UI の共有 package 化
 - Trend widget（Project model、Faceplate からの呼出）
 
-### S12b SCADA server の追加 host（後続）
+### S12b SCADA server の追加 host（host 3 は v1.1、host 2 は後続）
 
-- host 2: headless コンソール
-- host 3: Windows サービス（T17 の SCM 登録・elev の型を流用）
+- host 3: Windows サービス（v1.1。§3。T17 の SCM 登録・elev の型を流用）
+- host 2: headless コンソール（後続）
+
+### S11 Tracking（後続 Extension。§3。host は §22 #20 の決定後）
+
+- banto-tracking
+- logical location
+- current tracking
+- event FIFO/sequence
+- SCADA tracking presentation
 
 ### S9c HTTP Action / External Program（後続 Extension。§3）
 
