@@ -214,14 +214,14 @@ Alarm は v1.1 に置く。
 
 全体設計には含めるが、v1 / v1.1 には含めない。
 
-- DataGrid / DB Table/View（§14。resource model 決定後）
+- DataGrid / DB Table/View（§14。Hub 側 Dataset API の設計後）
 - Tracking
 - Recipe / 実績
 - HTTP Action / External Program
 - Design API の REST / OpenAPI 露出（Editor / CLI / AI が共有する Design Domain 自体（§19.2）は Core に含める）
 - AI 設計支援
 - 高度な Event / Action flow
-- Replay（§13.3。有料版の機能候補。v1 に残す前提条件は §13.3 に列挙）
+- Replay（§13.3。有料版の機能候補。v1 に残すのは Project schema と Runtime の境界だけで、recorder 側の実装は v1.1）
 
 ### 初版で限定する項目
 
@@ -938,7 +938,7 @@ Local / UI
 退けられた「寿命が UI と同じ」問題を再び踏む。
 
 Core v1 の Event は click / double click / screen open/close 等の UI Event を中心に扱い、
-常時実行 Event をどこまで v1 に含めるかは §22 の #8（Core v1 の範囲）で決める。
+常時実行 Event / Action は v1.1（§3、2026-09-30 決定）。
 
 ### 10.4 External Program
 
@@ -1345,8 +1345,9 @@ banto-hub の型（`HubRuntime` をライブラリとし、コンソール / サ
 
 - core を画面プロセスの中身と混ぜない。画面 → core の呼び出しは可、逆は不可
 - アプリの起動モードを**起動前に**区別し、埋め込み起動の責任を分ける:
-  - **ローカルモード**: ローカルの SCM に SCADA server サービスがあれば接続、無ければ埋め込み起動
-    （T16-2 の判定をそのまま流用）。v1 時点ではサービスが無いので常に埋め込み起動になるが、この分岐が
+  - **ローカルモード**: ローカルの SCM の SCADA server サービスが Running かつ healthy のときだけ接続し、
+    Stopped / NotInstalled なら埋め込み起動、遷移中や判定できないときは安全側（埋め込み起動しない）
+    に倒す（T16-2 の判定をそのまま流用）。v1 時点ではサービスが無いので常に埋め込み起動になるが、この分岐が
     あればサービス化のときにアプリ側の変更がほぼ要らない
   - **共有サービス接続モード**: 設定で指定した別 PC の SCADA server に接続する閲覧・操作端末。
     **このモードではローカルサービス未検出や接続失敗を埋め込み起動の条件にしない**。接続失敗は
@@ -1355,7 +1356,8 @@ banto-hub の型（`HubRuntime` をライブラリとし、コンソール / サ
 - **論理サービスとインスタンスを分ける**: SCADA server は論理サービスの識別子（現場 / Project 単位）と
   インスタンスの識別子（プロセス / ホスト単位）を別に持つ。将来の冗長化（複数インスタンス）はこの前提で
   後続設計する。recorder の並行記録と履歴統合、Alarm の ACK / Shelve 状態の共有、Action の二重実行防止は
-  それぞれ別の契約として §22 に残し、Active/Standby か Active/Active かは本節では確定しない
+  それぞれ別の契約として §22 に残す。方式は次項のとおり**読み取りと評価は Active/Active** と決め、
+  未決なのは failover、状態複製、トポロジの詳細に絞る
 - **冗長化の方針（2026-09-30 オーナー方針、詳細は別設計）**: 冗長化は **PLC（ドライバ層）、Hub、SCADA server
   の 3 層で独立に扱う**。PLC の冗長系（系 A / 系 B）は `banto-plc` / `banto-collect` の接続層が複数
   endpoint と切替で隠し、Hub から見える接続とタグの外部名は変えない。Hub と SCADA server の冗長化は
@@ -1399,17 +1401,20 @@ Hub の代わりに **Replay ドライバが tstore / tsquery から時刻カー
 - Alarm の発生・復帰・ACK（§11）と execution record（§16）も同じ driver の時刻カーソルで切り出して流し、
   Alarm banner や Faceplate の Alarm 表示も出所を知らずに再現する
 
-**v1 に残す前提条件**（後から足すと高くつくもの）:
+**v1 に残す前提条件**（Project schema と Runtime の拡張可能な境界だけ。recorder 側の実装は v1.1、
+Replay 本体は将来）:
 
-1. **記録対象を Project の全 Binding の和集合に広げられること。** §13.1 の 4 は trend group を記録対象とするが、
-   Replay には画面・Equipment・Faceplate が束縛する全タグの履歴が要る。recorder の記録対象を
-   「trend group」と「Project の全 Binding」から選べる設定にし、その時点の catalog のメタデータ
-   （型、単位、writable）も記録する。Hub の購読は on_change なので記録量は変化点の数で決まる
-2. **Project の revision 保管。** 当時の画面で再生するため、recorder は記録に Project の revision を添え、
-   Project package を revision ごとに保管する（§5 の projectRevision が土台）
+1. **Project schema に「記録対象の範囲」の設定を持てること。** `trend group のみ` / `Project の全 Binding` を
+   選べる項目を Project model に置く（v1 は schema のみで、既定は trend group）。Replay には画面・
+   Equipment・Faceplate が束縛する全タグの履歴が要るため。この設定を読んで記録する recorder、および
+   その時点の catalog のメタデータ（型、単位、writable）と Project revision を記録に添える処理は
+   **v1.1 の recorder**（§13.1、S12）に置く
+2. **Project package を revision ごとに保管できる形。** §5 の projectRevision と package 形式を v1 で確定する。
+   当時の画面で再生するための revision 別の保管と参照は v1.1 以降
 3. **rename の名前履歴。** 履歴のキーは名前なので rename で履歴が分かれる。§9.3 の rename を Design operation に
-   した決定を活かし、Project に「旧名 → 新名、有効時刻」の名前履歴を持たせて Replay が引けるようにする
+   した決定を活かし、Project に「旧名 → 新名、有効時刻」の名前履歴を持てる schema を v1 で置く
 4. **Runtime が値の出所を差し替えられる境界。** ライブ client と Replay driver を同じ受け口で受ける
+   （v1 で境界だけ置く。driver 本体は将来）
 
 **SCADA 側に残る作業**（Replay 固有、画面の上に乗る薄い層）: タイムラインのスクラバ、再生 / 一時停止 / 速度 /
 コマ送り、再生中の表示（枠の色と時刻）、**副作用のある Action の全面無効化**（§1.3 の延長）、Alarm Viewer の
