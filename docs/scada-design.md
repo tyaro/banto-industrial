@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-09-30（v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -177,13 +177,14 @@ Hub を integration boundary として使うことと、
 
 ---
 
-## 3. v1 スコープ案（未決）
+## 3. v1 スコープ（2026-09-30 オーナー決定）
 
-v1 の完了条件はまだ決定しない。本節は PR 時点の**議論用たたき台**とする。
+**v1 は「画面を作り、Hub の値を安全に表示し、基本操作できる」縦切り**とする。Hub と組み合わせれば
+v1 だけで運転画面として価値が出ること、記録は当面 ChronoGazer が担えることが理由。
+scada-server core（§13.2）は**ライブラリ境界と起動モードの分岐だけを v1 に含め**、中身の recorder と
+Alarm は v1.1 に置く。
 
-### 案: Core v1
-
-まず「画面を作り、Hub の値を安全に表示し、基本操作できる」縦切りを成立させる案。
+### Core v1
 
 - Hub 接続
 - `external_name` Binding
@@ -199,14 +200,21 @@ v1 の完了条件はまだ決定しない。本節は PR 時点の**議論用�
 - 基本 Editor
 - Tag Browser / Binding UX
 - validation / diagnostics
+- scada-server core のライブラリ境界と起動モードの分岐（§13.2。ローカルモードの埋め込み起動と
+  共有サービス接続モードの区別。中身は空でよい）
 
-### 後続 Extension 候補
+### v1.1（scada-server 系）
 
-以下は全体設計には含めるが、Core v1 に含めるかは議論して決定する。
+- Historical Trend（recorder、履歴 API、Trend widget。§13）
+- Alarm（汎用 model、Alarm API、Alarm Viewer、ACK / Shelve。§11）
+- 常時実行 Event / Action（§10.3）
+- Windows サービス host（§13.2 host 3）
 
-- DataGrid / DB Table/View
-- Alarm
-- Historical Trend
+### 後続 Extension
+
+全体設計には含めるが、v1 / v1.1 には含めない。
+
+- DataGrid / DB Table/View（§14。resource model 決定後）
 - Tracking
 - Recipe / 実績
 - HTTP Action / External Program
@@ -214,7 +222,7 @@ v1 の完了条件はまだ決定しない。本節は PR 時点の**議論用�
 - AI 設計支援
 - 高度な Event / Action flow
 
-### 初版で限定する項目の案
+### 初版で限定する項目
 
 - Renderer は SVG + Svelte を第一候補とする
 - Editor の基本操作は select / move / resize / property / binding
@@ -2167,7 +2175,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 5. banto-expr を client/runtime でそのまま利用するか
 6. DB tabular resource の domain model（DB Table Tag / Dataset・DB Resource）
 7. 常時実行 Event / Action の実行主体 → 2026-09-30 決定済み（§13.2、scada-server core）
-8. Core v1 に含める Extension の範囲
+8. Core v1 に含める Extension の範囲 → 2026-09-30 決定済み（§3。v1 は画面とライブ値・操作まで、scada-server 系は v1.1）
 9. Tracking PLC block の標準 memory layout
 10. Editor/Runtime の executable 分離時期
 11. Design API の最終 transport / bind policy（初期候補: editor mode + loopback REST）
@@ -2185,7 +2193,6 @@ MCP 自体は roadmap の blocking milestone にしない。
 
 ## 23. 議論継続中の主要論点
 
-- Core v1 の完了範囲。§3 の案を叩き台として決定する
 - DB Table/View の表現を DB Table Tag とするか、独立 Dataset / DB Resource とするか
 - protocol-specific PLC Alarm adapter の順序・契約。MELSEC 対応は汎用 Alarm model 後
 
@@ -2194,6 +2201,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 ## 24. 現時点の主要決定（2026-09-30 オーナー決定。§9.6 の再検討中項目を除く）
 
 - PLC は control authority。PC 停止で設備制御を止めない
+- v1 は「画面を作り、Hub の値を安全に表示し、基本操作できる」縦切り。scada-server core はライブラリ境界と起動モードの分岐だけを v1 に含め、recorder / Alarm / 常時実行 Event / サービス host は v1.1（2026-09-30 オーナー決定、§3）
 - SCADA は PLC に直接接続せず Hub を介する
 - SCADA Project の永続 Tag Binding は Hub の `external_name`（`connection.group.tag`）を正とする（2026-09-30 再確認、§9.6）
 - 購読・書き込みも `external_name` で行い、Hub 内部の `StableTagId` は SCADA では使わない。banto-tagclient の binding 同一性も名前に改める（2026-09-30 オーナー決定、§9.6）
