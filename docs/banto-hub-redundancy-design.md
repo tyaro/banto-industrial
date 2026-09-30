@@ -1,7 +1,7 @@
 # banto-hub / SCADA server 冗長化 設計草案
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（オーナーレビュー 1 回目を反映: Alarm occurrence の採番を `alarm-authority` に（6.3）、役割を重複許容 / 排他必須に分け排他必須は競合窓の無い調停に限定（5.1）、設定不一致時の PLC 書き込みを fail-closed に（4.3）、イベントの順序を origin seq + HLC に（6.3）、履歴統合を区間ごとの正ソース方式に（6.2）。同日: 初版。scada-design.md §13.2 の原則を受けて、3 層の冗長化とリースの抽象を草案化）  
+最終更新: 2026-09-30（オーナーレビュー 2 回目を反映: リースの権利を副作用まで切れ目なく伝える。期限は最後に成功した Grant + ttl（5.1）、Sink はサイドカー自身が DB リースを持ち INSERT と同一トランザクションで検査（4.8）、設定の鮮度確認と `config-primary` のリース化（4.3）、ACK は別 1 台への同期複製後に応答（6.3）、`origin_seq` の永続化（6.3）、候補 B の MQTT 巻き戻りを許容条件として明記（4.7）。同日: オーナーレビュー 1 回目を反映: Alarm occurrence の採番を `alarm-authority` に（6.3）、役割を重複許容 / 排他必須に分け排他必須は競合窓の無い調停に限定（5.1）、設定不一致時の PLC 書き込みを fail-closed に（4.3）、イベントの順序を origin seq + HLC に（6.3）、履歴統合を区間ごとの正ソース方式に（6.2）。同日: 初版。scada-design.md §13.2 の原則を受けて、3 層の冗長化とリースの抽象を草案化）  
 状態: **草案（オーナー議論用）。実装は scada-server と Hub の単一構成が動いてから（scada-design.md §22 #19）**  
 対象: banto-hub（タグサーバー）、SCADA server core、PLC 接続層（banto-plc / banto-collect / banto-broker）、
 banto-tagclient
@@ -136,7 +136,7 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
 | 全台で同じでなければ困る | 接続・グループ・タグ定義、計算タグ、Sink グループ、MQTT / gRPC 設定、write-control、コミッショニング状態 | **設定パッケージ**で配布し、`config_fingerprint` の一致を状態で見せる（4.3）        |
 | 全台で同じだが機微       | API キー、ユーザー、PLC パスワード、MQTT パスワード                                                      | 設定パッケージには入れない（現状どおり）。**別経路**で配布（4.4）                   |
 | 各台が独立に持つ         | 現在値、品質、`revision`、`run_id`、Hub 内 tstore（7 日）、`collect_events`、`hub_write_audit`、監査ログ | 複製しない。読み出し側（運用者・SCADA）が必要なら統合する                           |
-| 1 台だけが行う           | MQTT publish、Sink の DB 書き込み、（将来）設定の編集                                                    | **リース**（§5）で役割を 1 台に限定                                                 |
+| 1 台だけが行う           | MQTT publish、Sink の DB 書き込み、設定の編集と配布の宣言（`config-primary`）                            | **リース**（§5）で役割を 1 台に限定。Sink はサイドカーが DB 上のリースを持つ（4.8） |
 | どちらとも言えない       | 内部タグ（`mem`）の値                                                                                    | 初版は**複製しない**（制約として明記）。後続で保持者からの転送を検討（4.6、§10 #4） |
 
 ### 4.2 読み取り: 各台が PLC を直接ポーリングする（Active/Active）
@@ -156,9 +156,16 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
 
 ### 4.3 設定の配布と一致確認
 
-- **設定の正は 1 台**（役割 `config-primary`）。初版は**固定**（設定で指定した instance が primary）、
-  リース化は後続。primary 以外の管理 UI は設定編集を読み取り専用にする（`/api/v1/status` の
-  `config_primary: false` を見て UI が閉じる）
+- **設定の正は 1 台**（役割 `config-primary`）。**リースで決める**（2026-09-30 レビュー 2 回目 #1 の帰結。
+  下の鮮度規則により primary が居ないと standby は書き込みを受けられないので、primary 固定では primary の
+  停止 = 全台で書き込み不可になる。primary がリースで移れば、新 primary の適用済み設定が配布対象になり
+  書き込みが再開する）。`config-primary` は**排他必須**（5.1。2 台が別の設定で書き込みを受けると名前と
+  アドレスの対応が割れる）。A / D の調停が無い現場は**固定 primary** を選べるが、その場合は primary 停止中は
+  全台で書き込み不可（安全側）と明記する。primary 以外の管理 UI は設定編集を読み取り専用にする
+  （`/api/v1/status` の `config_primary: false` を見て UI が閉じる）
+- primary が移ったあと旧 primary が復帰したときは standby になり、未配布の編集が残っていれば
+  `config_fingerprint != distributed_fingerprint` で書き込みを受けない側に倒れる。未配布の編集は捨てず
+  「未配布」として UI に出し、運用者が export して新 primary に取り込む
 - 配布は**設定パッケージ**（既存の export / import）を使う。ただし現状はクライアント側 TS の機能なので、
   **サーバー側の export / import API** を足す（scada-design.md §5 の Project package と同じ発想。
   SCADA の Hub 連携でも要る）。import は現状どおり非トランザクションで、失敗したら fingerprint 不一致として
@@ -172,9 +179,15 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
   アドレスを指したまま書き込みが届きうる。よって **primary 以外のインスタンスは
   `config_fingerprint == applied_fingerprint == distributed_fingerprint` が成り立つ間だけ書き込みを受け**、
   それ以外は `409 config_mismatch` で拒否する（`execute_write` のゲートに足す。内部タグへの書き込みも
-  同じ）。読み取りは続ける（値は出す、状態に警告）。primary は設定の正なので自分の fingerprint で受ける。
-  `distributed_fingerprint` は primary の状態から取り、ピアに届かないときは最後に知った値を使う
-  （「知らない」は許可、「違うと知っている」は拒否）。冗長構成でない（peers が空の）ときはこのゲートは無効
+  同じ）。読み取りは続ける（値は出す、状態に警告）。primary は `config-primary` のリースを保持している間
+  （5.1 の期限内）だけ自分の fingerprint で受ける
+- **鮮度**（2026-09-30 レビュー 2 回目 #1）: `distributed_fingerprint` は primary の状態を **5 s ごとに
+  読んで確認**し、確認できた時刻 `confirmed_at`（自分の単調時計）を持つ。standby の書き込み許可は
+  「3 つの fingerprint が一致」かつ **`now - confirmed_at < confirm_ttl`（既定 30 s）** の両方が要る。
+  **未確認（起動後まだ読めていない）と失効は拒否**する。「最後に知った値」で許可し続けると、standby が
+  primary から分断された後に primary 側で設定が変わっても standby の 3 つは古いまま一致し続けて fail-open に
+  なるため。分断中は standby の書き込みは止まり、primary が居ればそちらへ、primary が死ねばリースで
+  移った新 primary へ、client が切り替えて再開する。冗長構成でない（peers が空の）ときはこのゲートは無効
 - 既存の `revision`（プロセス内カウンタ）は**インスタンス間で比較しない**。client の publish gate
   （banto-tagclient の revision 一致判定）はインスタンス内で閉じているので、そのまま使える
 
@@ -216,18 +229,35 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
   `banto-hub-{instance_id}` にする
 - 取得時の全件 republish は既存の ConnAck 時の republish で足りる（retain=true なので購読側は最新値を
   受け取る）。切替の間の変化は失われる（MQTT は「最新値の鏡」であり履歴ではない、tag-server-design.md §5.3）
+- **候補 B で許容する不整合**（2026-09-30 レビュー 2 回目 #6）: B の競合窓（最大 2 周期）では 2 台が
+  独立にポーリングした値を publish するので、**retain 値が 1 サンプル分巻き戻る**ことがある（H1 が新値を
+  出した後に H2 が古い値を出す）。窓が閉じれば保持者の次の publish で直る。これを B での MQTT の**明示的な
+  許容条件**とし、ペイロードに `t` を含めて購読側が古い `t` を捨てられるようにする。巻き戻りも許容できない
+  現場は `mqtt_strict: true` で `mqtt-publisher` を排他必須（A / D のみ）に切り替える
 
 ### 4.8 DB Sink（リース対象）
 
 - Sink サイドカーは**インスタンスごとに 1 つ**置き、設定は各自の Hub から取る（現状どおり）
-- 役割 `sink-writer` の保持者に接続しているサイドカーだけが INSERT する。他はキューを溜めず購読だけ
-  続ける（切替時に古い値を大量投入しない）。保持者の Hub は `/api/sink/config` に `writer: true|false`
-  を含めて渡し、サイドカーは 5 s ごとの状態往復で変化を拾う
-- `sink-writer` は**排他必須の役割**（5.1）なので、調停は競合窓の無い候補 A または D を使う（候補 B は
-  使わない）。保持者の交代は ttl で区切られ、**重複は「同一インスタンス内の at-least-once 再送」だけ**に
-  なる。この重複は同じ `ts` を持つので一意制約で吸収できるが、**`tag_id` はインスタンスごとの SQLite id
-  なので台間で一致しない**。冗長構成の一意制約は **`(ts, external_name)`** を推奨し、行に `instance_id` と
-  `epoch` を足す（external-db-design.md §5.4 の追記、§10 #7）
+- **`sink-writer` のリースは、INSERT する当人であるサイドカーが Sink 用 DB の上で持つ**（候補 D。
+  2026-09-30 レビュー 2 回目 #3）。Hub が `writer` フラグを配る方式は、別プロセスのサイドカーが古い
+  `writer=true` のまま INSERT を続けられる（設定の再取得は既定 30 s、5 s なのは状態 push）ので fencing に
+  ならない。代わりに:
+  - DB に `banto_sink_lease(service_id, role, holder_instance_id, epoch, expires_at)` を 1 行置く。取得は
+    `UPDATE ... SET holder=$me, epoch=epoch+1, expires_at=now()+ttl WHERE expires_at < now()`（DB の時計で
+    期限を測る。0 行なら取れていない）、更新は `... WHERE holder=$me AND epoch=$epoch`
+  - **各 flush のトランザクションに lease の更新を同居させる**: `INSERT rows; UPDATE lease ... WHERE
+holder=$me AND epoch=$epoch` で、lease の更新が 0 行なら**トランザクションごと rollback**。INSERT は
+    「その時点で保持者である」ことと原子的にしか commit されない。これが真正な fencing で、時間の fencing
+    （5.1）はその上の保険
+  - サイドカーは自分の単調時計で `local_deadline = 最後に成功した lease 更新の時刻 + ttl` を持ち、期限を
+    過ぎたら flush を試みない（DB に届かない = 保持者でないと見なす）
+  - Hub は `/api/sink/config` で `lease_priority` と `service_id` を渡すだけで、保持の可否には関与しない。
+    サイドカーは状態 push に `sink_writer: {held, epoch, expires_in}` を含め、Hub はそれを状態に転記する
+  - 保持者でないサイドカーはキューを溜めず購読だけ続ける（切替時に古い値を大量投入しない）
+- 保持者の交代は ttl で区切られ、**重複は「同一インスタンス内の at-least-once 再送」だけ**になる。この重複は
+  同じ `ts` を持つので一意制約で吸収できるが、**`tag_id` はインスタンスごとの SQLite id なので台間で一致
+  しない**。冗長構成の一意制約は **`(ts, external_name)`** を推奨し、行に `instance_id` と `epoch` を足す
+  （external-db-design.md §5.4 の追記、§10 #7）
 - 台をまたぐ「同じ物理値が別の `ts` で 2 行」は、各台の `ts` が違うので一意制約では吸収できない
   （2026-09-30 レビュー #5）。A / D では保持者が同時に 2 台にならないのでこの重複は起きず、読み手が区間ごとの
   正を選びたいときは `epoch` で選べる（6.2 と同じ考え方）
@@ -235,7 +265,8 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
 
 ### 4.9 状態の見せ方
 
-`/api/v1/status` に足す: `service_id`、`instance_id`、`config_fingerprint`、`config_primary`、
+`/api/v1/status` に足す: `service_id`、`instance_id`、`config_fingerprint` / `applied_fingerprint` /
+`distributed_fingerprint`、`config_primary`、`config_confirmed_age_ms`、`write_gate: open|config_mismatch|unconfirmed`、
 `leases: [{role, held, epoch, holder_instance_id, expires_in_ms}]`、`peers: [{instance_id, endpoint,
 reachable}]`（peers は設定に書いた静的リスト。発見はしない）。管理 UI のトレイと状態画面はこれを表示する。
 
@@ -263,20 +294,31 @@ trait Lease {
 - **副作用は `renew` が成功している間だけ行い、`Lost` を受けたら即座に止める**。「止める」が安全側であることが
   前提（MQTT は publish 停止、Sink は INSERT 停止、Action は実行しない）
 - **fencing**: 副作用には `epoch` を添える。受け側が epoch を見られる場合（Sink の行、Action の
-  execution record、MQTT のペイロードのメタ）は古い epoch を捨てられる。PLC 書き込みは epoch を
-  見られないので、リース失効後の書き込みは**時間で**防ぐ（`ttl` の半分で renew、renew 失敗から
-  `ttl` 経過までに必ず止める。調停者の時計は使わない、自分の単調時計で数える）
+  execution record、MQTT のペイロードのメタ）は古い epoch を捨てられる。受け側が同じトランザクションで
+  検査できる場合（Sink、4.8）はそれが真正な fencing になる。PLC 書き込みは epoch を見られないので、
+  リース失効後の書き込みは**時間で**防ぐ
+- **時間の fencing の期限**（2026-09-30 レビュー 2 回目 #2）: 保持者の期限は
+  **`local_deadline = 最後に成功した Grant / renew を受けた時刻（自分の単調時計）+ ttl`**。renew の失敗は
+  期限を延ばさない（「renew 失敗から ttl」と数えると、調停者が新しい保持者を許可した後も旧保持者が
+  動ける時間ができる）。renew は `ttl / 3` ごとに行い、成功するたびに期限を更新する。調停者は保持者の
+  最後のハートビートから **`ttl + margin`**（margin は ttl の 20% 以上。時計の進み方の差と書き込み遅延の
+  分）を過ぎるまで次の保持者を許可しない。**副作用は `now < local_deadline` の間だけ**行い、PLC 書き込みや
+  Action の 1 ステップの直前には **`now + その操作のタイムアウト < local_deadline`** を必須の検査にする
+  （応答待ちの途中で期限が切れないように。Action の sequence は各ステップの前に検査する）。調停者の時計は
+  使わず自分の単調時計で数える
 - 取得の優先順位は**静的な優先度**（設定の `lease_priority`、小さいほど優先）で決め、同点は `instance_id` の
   辞書順。優先度の高い台が復帰しても**自動では奪わない**（fail-back しない。運用者が保持者を手放させる）。
   フラッピングを避けるため
-- ttl の既定は 10 s、renew 間隔は 3 s、取得の判定は「保持者の更新が ttl を超えて途切れた」
+- ttl の既定は 10 s、renew 間隔は ttl / 3（約 3 s）、取得の判定は「保持者の更新が ttl + margin を超えて
+  途切れた」（5.3 の `holder_ttl_ticks` にも margin を含める）
 - 役割ごとに独立（`mqtt-publisher` と `sink-writer` が別の台でもよい）。ただし既定では**全役割を同じ台に
   寄せる**（優先度が同じなら同じ台が取る）。分散させると障害時の状態が読みにくい
 - **役割を 2 種に分ける**（2026-09-30 レビュー #2）:
-  - **重複許容**: 同じ副作用が短時間 2 台から出ても害がない。`mqtt-publisher`（retain の最新値の鏡）、
-    `recorder-primary`（読み出し時に正のソースを選ぶための印、6.2）、`config-primary`
-  - **排他必須**: 2 台から出ると不可逆な害がある。`action-executor`（PLC 書き込み等）、`sink-writer`、
-    `alarm-authority`（6.3）
+  - **重複許容**: 同じ副作用が短時間 2 台から出ても害がない、または害を許容条件として明記した。
+    `mqtt-publisher`（retain の最新値の鏡。B での巻き戻りは 4.7 の許容条件）、`recorder-primary`
+    （読み出し時に正のソースを選ぶための印、6.2）
+  - **排他必須**: 2 台から出ると不可逆な害がある。`action-executor`（PLC 書き込み等）、`sink-writer`
+    （サイドカーが DB 上で保持、4.8）、`alarm-authority`（6.3）、`config-primary`（4.3）
   - 排他必須の役割は**競合窓の無い調停（5.2 の A または D）でしか付与しない**。競合窓のある調停（B、C）しか
     無い構成では排他必須の役割は誰にも付与されず、その副作用は動かない（fail-closed。状態に「調停が排他必須の
     役割に不十分」と出す）
@@ -319,8 +361,9 @@ D+10..   slot[i] { instance_hash(2W), heartbeat_counter(1W), priority(1W) }   i 
 - **B（ワードのみ）**: 各台が読み取り周期で全スロットを読み、保持者の counter が ttl を超えて止まって
   いたら「取得を試みる」= `holder_slot` と `epoch+1` を書く → 1 周期待って読み直し、`holder_slot` が
   自分なら取得成功、違えば負け。2 台が同時に書いた窓では**最大 2 周期の間、両方が保持者だと思う**。
-  この窓があるため **B は重複許容の役割にしか使わない**（5.1）。MQTT の二重 publish は同じ retain 値なので
-  害がない。排他必須の役割（Action、Sink、Alarm 採番）には A か D を使う
+  この窓があるため **B は重複許容の役割にしか使わない**（5.1）。MQTT の二重 publish は retain 値が
+  1 サンプル巻き戻りうるが、4.7 の許容条件の範囲。排他必須の役割（Action、Sink、Alarm 採番、config-primary）
+  には A か D を使う
 - 役割ごとにブロックを分けるか、1 ブロックで全役割を同じ台に寄せるかは 5.1 の「既定は同じ台」に従い、
   初版は **1 ブロック = 全役割**とする
 
@@ -386,11 +429,21 @@ D+10..   slot[i] { instance_hash(2W), heartbeat_counter(1W), priority(1W) }   i 
     ACK 済みの Alarm が S2 で未 ACK として再出現しない
   - 各台の評価結果が食い違う（一方だけが発報している）ときは authority の判断が正。authority 以外の台の
     仮 occurrence は、`opened` が来ないまま自分の評価で復帰したら黙って消す（履歴には残さない）
-- 操作者イベント（ACK / Shelve / Unshelve / コメント）は **append-only のイベントログ**として、受けた
-  インスタンスが**全ピアへ転送**する（HTTP、best-effort、再送あり）。各台は受け取ったイベントを自分の
-  Alarm 状態に適用する
+- 操作者イベント（ACK / Shelve / Unshelve / コメント）は **append-only のイベントログ**として各台が
+  永続化（SQLite、commit 後に応答）し、受けたインスタンスが**全ピアへ転送**する。各台は受け取った
+  イベントを自分の Alarm 状態に適用する
+- **ACK の耐久性は同期複製で作る**（2026-09-30 レビュー 2 回目 #4）: 受けた台はローカルに永続化した後、
+  ピアへ転送して**少なくとも `ack_replicas`（既定 1）台が永続化を確認するまで操作者へ成功を返さない**
+  （転送のタイムアウト 2 s）。best-effort の非同期転送では「ローカル保存 → 成功応答 → 転送前に停止」で
+  ACK が失われ、failover 後に未 ACK に戻る。保証は**「ACK 時点で別 1 台に届いていれば、1 台故障まで
+  ACK は残る」**。確認が取れないとき（ピアが全部落ちている）の既定は **degraded**: ローカルに永続化して
+  成功を返すが `replicated: false` を応答と UI に出す（単一台運用と同じ状態。§10 #13）。`strict` を選べば
+  拒否する。ピアが復帰したら差分同期で追いつく。authority が出す `opened` / `closed` も同じ経路で複製するが、
+  こちらは複製前に authority が死んでも新 authority が再評価して採番し直すだけなので同期は要らない
 - イベントの識別と順序（2026-09-30 レビュー #4）: `event_id = (origin_instance_id, origin_seq)`。
-  `origin_seq` は発生元ごとの単調増加番号。各台はピアごとに **watermark**（受け取った最大の `origin_seq`）を
+  `origin_seq` は発生元ごとの単調増加番号で、**イベント本体と同じトランザクションで永続化する**（ログの
+  `max(seq) + 1`。再起動で 1 に戻らないので、ピアの watermark と衝突しない。2026-09-30 レビュー 2 回目
+  #5。`boot_id` を id に含める案は不要）。各台はピアごとに **watermark**（受け取った最大の `origin_seq`）を
   持ち、差分同期は「watermark 以降」を取りに行く（UUID は順序が無いのでカーソルにしない）。競合（同じ
   occurrence に別の台で別の操作）の順序は **HLC（hybrid logical clock）+ `origin_instance_id`** の全順序で
   決め、最後が勝つ。wall-clock の順序は使わない
@@ -444,19 +497,20 @@ D+10..   slot[i] { instance_hash(2W), heartbeat_counter(1W), priority(1W) }   i 
 前提: Hub 2 台（H1 優先、H2）、SCADA server 2 台（S1 優先、S2）、PLC 冗長系（A / B）、調停は PLC
 （候補 A）。
 
-| #   | 事象                                        | 期待する振る舞い                                                                                                                                                                                                                                        |
-| --- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | H1 のプロセス停止                           | H1 のハートビートが止まり ttl 後に H2 が全役割を取得。MQTT は H2 が接続し全件 republish、Sink は H2 側が INSERT 開始（A / D なので台をまたぐ重複行は無い）。client は Transport 失敗で H2 へ切替、名前で再バインド。切替の間（ttl + backoff）の値は欠落 |
-| 2   | H1 の NIC 断（PLC には届くが LAN に出ない） | client は H2 へ。H1 は PLC には届くので調停上は保持者のまま → **MQTT / Sink は H1 が続ける**（外部 DB に届くかは別）。運用者が H1 の役割を手放させる。この事象は**調停が PLC 側にある弱点**として §10 #8 に残す                                         |
-| 3   | H1 と PLC の間の断（LAN は生きている）      | H1 の renew が失敗し副作用停止。H2 が取得。H1 の値は Bad、client は値が Bad でも接続は維持（H1 が PLC に届かないだけで Hub は生きている）→ **client 側の切替条件に「全接続が Bad」を足すか**は §10 #9                                                   |
-| 4   | PLC の系切替（A → B）                       | 各 Hub の接続層が endpoint を切替。切替中は Bad。調停ワードはトラッキングで引き継がれるので保持者は変わらない                                                                                                                                           |
-| 5   | H1 と H2 の相互断、両方 PLC には届く        | 調停は PLC なので保持者は 1 台のまま。client は自分が届く方へ。**分断しても副作用は 1 台**                                                                                                                                                              |
-| 6   | 全 Hub が PLC に届かない                    | 全役割が失効、副作用は全停止。client は値 Bad。安全側                                                                                                                                                                                                   |
-| 7   | S1 停止                                     | S2 が `action-executor` / `alarm-authority` を取得し、複製済みの `opened` から occurrence id を引き継ぐ（ACK 済みは ACK 済みのまま）。recorder は S2 が続けており、区間表で S2 が正になる。画面は S2 へ切替                                             |
-| 8   | 設定変更（primary H1 で編集、H2 に未配布）  | fingerprint 不一致を両方の状態と client の警告で検出。値は出続けるが、**H2 への PLC 書き込みは 409 で拒否**（4.3）。運用者が配布して解消                                                                                                                |
-| 9   | 全停止からの再起動                          | 起動順に依存しない。各台が起動 → 調停ワードを読む → 保持者が居なければ優先度順に取得。MQTT の `$state` は保持者が `online` にする                                                                                                                       |
-| 10  | 時計のずれ                                  | リースは各台の単調時計で数えるので影響なし。履歴の区間境界（6.2）に数百 ms の影響。Alarm イベントの順序は HLC なので影響なし → NTP を運用要件に                                                                                                         |
-| 11  | 調停が候補 B / C しか無い構成               | 重複許容の役割（MQTT、recorder-primary）だけが付与され、`action-executor` / `sink-writer` / `alarm-authority` は誰も持たない。常時実行 Action の副作用、Sink の書き込み、Alarm 操作は止まり、状態に理由が出る（fail-closed）                            |
+| #   | 事象                                        | 期待する振る舞い                                                                                                                                                                                                                                                                                                                                          |
+| --- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | H1 のプロセス停止                           | H1 のハートビートが止まり ttl + margin 後に H2 が Hub 側の役割（`config-primary`、MQTT）を取得。H1 側サイドカーの DB リースも期限切れになり H2 側サイドカーが取得して INSERT 開始（台をまたぐ重複行は無い）。client は Transport 失敗で H2 へ切替、名前で再バインド。H2 は新 primary なので書き込みを受ける。切替の間（ttl + margin + backoff）の値は欠落 |
+| 2   | H1 の NIC 断（PLC には届くが LAN に出ない） | client は H2 へ。H1 は PLC には届くので PLC 調停上は保持者のまま → **MQTT は H1 が続けようとする**（ブローカーに届くかは別）。Sink は H1 側サイドカーが DB に届かず DB リースが切れ、H2 側が取る。H2 は primary を確認できず（鮮度失効）書き込みを受けない → 運用者が H1 の役割を手放させる。この事象は**調停が PLC 側にある弱点**として §10 #8 に残す    |
+| 3   | H1 と PLC の間の断（LAN は生きている）      | H1 の renew が失敗し副作用停止。H2 が取得。H1 の値は Bad、client は値が Bad でも接続は維持（H1 が PLC に届かないだけで Hub は生きている）→ **client 側の切替条件に「全接続が Bad」を足すか**は §10 #9                                                                                                                                                     |
+| 4   | PLC の系切替（A → B）                       | 各 Hub の接続層が endpoint を切替。切替中は Bad。調停ワードはトラッキングで引き継がれるので保持者は変わらない                                                                                                                                                                                                                                             |
+| 5   | H1 と H2 の相互断、両方 PLC には届く        | 調停は PLC なので保持者は 1 台のまま。client は自分が届く方へ。**分断しても副作用は 1 台**                                                                                                                                                                                                                                                                |
+| 6   | 全 Hub が PLC に届かない                    | 全役割が失効、副作用は全停止。client は値 Bad。安全側                                                                                                                                                                                                                                                                                                     |
+| 7   | S1 停止                                     | S2 が `action-executor` / `alarm-authority` を取得し、複製済みの `opened` から occurrence id を引き継ぐ（ACK 済みは ACK 済みのまま）。recorder は S2 が続けており、区間表で S2 が正になる。画面は S2 へ切替                                                                                                                                               |
+| 8   | 設定変更（primary H1 で編集、H2 に未配布）  | fingerprint 不一致を両方の状態と client の警告で検出。値は出続けるが、**H2 への PLC 書き込みは 409 で拒否**（4.3）。運用者が配布して解消。H2 が H1 から分断されていても、鮮度が切れるので H2 は許可し続けない（fail-open にならない）                                                                                                                     |
+| 9   | 全停止からの再起動                          | 起動順に依存しない。各台が起動 → 調停ワードを読む → 保持者が居なければ優先度順に取得。MQTT の `$state` は保持者が `online` にする                                                                                                                                                                                                                         |
+| 10  | 時計のずれ                                  | リースは各台の単調時計で数えるので影響なし。履歴の区間境界（6.2）に数百 ms の影響。Alarm イベントの順序は HLC なので影響なし → NTP を運用要件に                                                                                                                                                                                                           |
+| 11  | 調停が候補 B / C しか無い構成               | 重複許容の役割（MQTT、recorder-primary）だけが付与され、`action-executor` / `alarm-authority` / `config-primary` は誰も持たない（Sink は DB があれば D で持てる）。常時実行 Action の副作用と Alarm 操作は止まり、書き込みは固定 primary を選んだときだけ primary で受ける。状態に理由が出る（fail-closed）                                               |
+| 12  | S1 が ACK 直後に停止                        | ACK は S2 の永続化確認後に成功を返しているので S2 に残る。S2 が ACK 時点で落ちていた（degraded で受けた）場合は失われうる。2 台同時故障は保証外                                                                                                                                                                                                           |
 
 ---
 
@@ -473,14 +527,15 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
   - banto-tagclient の endpoint リスト化（長さ 1 で既存と同じ）と `config_fingerprint` の観測
   - MQTT `client_id` の既定を `banto-hub-{instance_id}` に
   - scada-server core の engine に「自分が実行担当か」の口（scada-design.md §21 S10b）
-- **R1 リース**: `Lease` trait と役割の 2 種（5.1）、候補 B（PLC ワードのみ。重複許容の役割用）、候補 D
-  （DB 行ロック。排他必須の役割用）、候補 C（開発用）の実装。MQTT を B で、Sink を D でリース配下に。候補 A
-  のラダーは実機で試作
-- **R2 Hub 2 台**: primary 固定の設定配布と 3 つの fingerprint、書き込みの fail-closed（4.3）、API キーは
-  (b)、Sink の `writer` フラグ、状態画面。実機で §8 の #1 / #3 / #5 / #8 / #9 を確認
+- **R1 リース**: `Lease` trait と役割の 2 種（5.1）、期限の規則（最後に成功した Grant + ttl、操作前の
+  `now + timeout < deadline`）、候補 B（PLC ワードのみ。重複許容の役割用）、候補 D（DB 行の CAS。排他必須の
+  役割用）、候補 C（開発用）の実装。MQTT を B で。Sink サイドカーの DB リースと flush 同一トランザクションの
+  検査（4.8）。候補 A のラダーは実機で試作
+- **R2 Hub 2 台**: `config-primary` のリース化と固定 primary の選択肢、3 つの fingerprint と鮮度、書き込みの
+  fail-closed（4.3）、API キーは (b)、状態画面。実機で §8 の #1 / #2 / #3 / #5 / #8 / #9 を確認
 - **R3 SCADA server 2 台**: recorder の区間表による統合（`tstore_lease_log`）、`alarm-authority` の採番と
-  occurrence イベント、操作者イベントの複製（origin seq + watermark、HLC）、execution record の統合、
-  画面の切替
+  occurrence イベント、操作者イベントの同期複製（origin seq の永続化 + watermark、HLC、`ack_replicas`）、
+  execution record の統合、画面の切替
 - **R4 N≥3 と PLC 冗長系**: スロット 3 以上の実機確認、MELSEC 冗長系の `io_id` = 0x03D0 の確認、
   読み取り中継モード（接続数 1 の機器）
 - ChronoGazer 単体（記録計商品）は R3 の recorder 統合を crate 単位で共有するが、単体商品としての
@@ -506,18 +561,26 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
    調停が PLC だけで閉じなくなる。推奨: 混ぜず、運用者の手動切替と監視で対応
 9. **client の切替条件に「値が全部 Bad」を含めるか**（§8 #3）: 含めると PLC 停止時に client が Hub 間を
    往復する。推奨: 含めず、Bad は Bad として表示する
-10. **config-primary をリース化する時期**: 初版は固定。運用で困ってから
+10. **固定 primary を選択肢として残すか**（4.3）: A / D の無い現場向けに固定 primary を残す案でよいか
+    （primary 停止中は全台で書き込み不可）。残さないなら、そうした現場では冗長構成での書き込みは不可になる
 11. **id 未確定の Alarm の扱い**（6.3）: authority の `opened` が届くまで操作（ACK / Shelve）を受けない案で
     よいか（表示はする）。受ける案は、仮 id で受けて確定後に読み替える複雑さが増える
 12. **書き込み fail-closed の粒度**（4.3）: インスタンス単位（fingerprint 不一致なら全タグ拒否）でよいか。
     タグ単位（差分のあるタグだけ拒否）は設定差分の計算が要る。推奨: インスタンス単位
+13. **ACK の複製確認が取れないときの既定**（6.3）: degraded（ローカル永続化で成功を返し `replicated: false`
+    を表示）を既定にしてよいか。strict（拒否）を既定にすると、ピアが落ちている間は操作者が ACK できない
+14. **候補 B での MQTT の巻き戻りを許容条件にしてよいか**（4.7）: 許容できない現場は `mqtt_strict` で A / D に
+    寄せる。既定は許容
+15. **`confirm_ttl`（鮮度）の既定 30 s**（4.3）: primary の確認が 30 s 途切れたら standby は書き込みを止める。
+    短いほど安全で、長いほど一時的な遅延に強い
 
 ---
 
 ## 11. 決定記録
 
-| 日付       | 決定                                                                                                                                                                                                                                                                                | 出所                              |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| 2026-09-30 | 3 層独立、読み取り・評価は全台、副作用は 1 台（リース）、PLC 調停第一候補、名前束縛が前提、SCADA server だけ先行しない                                                                                                                                                              | scada-design.md §13.2（オーナー） |
-| 2026-09-30 | 本草案を作成。§3〜§9 は提案、§10 はオーナー判断待ち                                                                                                                                                                                                                                 | 本書                              |
-| 2026-09-30 | オーナーレビュー（PR #475 1 回目）の方向: クロスインスタンスの同一性、Action の真正な fencing、設定不一致時の write fail-closed を先に固める。→ 6.3 の `alarm-authority`、5.1 の役割 2 種と A / D 限定、4.3 の fail-closed、6.3 の origin seq + HLC、6.2 の区間ごとの正ソースに反映 | PR #475 レビュー（オーナー）      |
+| 日付       | 決定                                                                                                                                                                                                                                                                                                                                  | 出所                              |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| 2026-09-30 | 3 層独立、読み取り・評価は全台、副作用は 1 台（リース）、PLC 調停第一候補、名前束縛が前提、SCADA server だけ先行しない                                                                                                                                                                                                                | scada-design.md §13.2（オーナー） |
+| 2026-09-30 | 本草案を作成。§3〜§9 は提案、§10 はオーナー判断待ち                                                                                                                                                                                                                                                                                   | 本書                              |
+| 2026-09-30 | オーナーレビュー（PR #475 1 回目）の方向: クロスインスタンスの同一性、Action の真正な fencing、設定不一致時の write fail-closed を先に固める。→ 6.3 の `alarm-authority`、5.1 の役割 2 種と A / D 限定、4.3 の fail-closed、6.3 の origin seq + HLC、6.2 の区間ごとの正ソースに反映                                                   | PR #475 レビュー（オーナー）      |
+| 2026-09-30 | オーナーレビュー（PR #475 2 回目）の方向: リースの取得が排他でも、その権利が INSERT / PLC write / ACK の耐久性まで切れ目なく伝わっていなければならない。→ 5.1 の期限の規則、4.8 のサイドカー自身の DB リースと同一トランザクション検査、4.3 の鮮度と `config-primary` のリース化、6.3 の同期複製と seq の永続化、4.7 の許容条件に反映 | PR #475 レビュー（オーナー）      |
