@@ -159,34 +159,48 @@ PLC / field devices
 
 ---
 
-## 3. v1 の対象と非対象
+## 3. v1 スコープ案（未決）
 
-### 対象
+v1 の完了条件はまだ決定しない。本節は PR 時点の**議論用たたき台**とする。
+
+### 案: Core v1
+
+まず「画面を作り、Hub の値を安全に表示し、基本操作できる」縦切りを成立させる案。
 
 - Hub 接続
-- Stable Tag ID Binding
+- `external_name` Binding
 - Screen / Symbol
 - EquipmentType / EquipmentInstance
 - Faceplate
 - Dialog / Popup
 - SVG ベース Process Renderer
 - Data Binding
-- Event / Action
+- 基本 UI Event / Action
 - Project 保存・読込
 - Project Import / Export / update 判定
 - 基本 Editor
-- DataGrid
-- Alarm 表示基盤
-- Trend 表示基盤
-- Design API（Project / Screen / Equipment / Binding / Validate / Plan / Apply）
-- Design API の OpenAPI 公開
+- Tag Browser / Binding UX
+- validation / diagnostics
 
-### 初版で限定する項目
+### 後続 Extension 候補
+
+以下は全体設計には含めるが、Core v1 に含めるかは議論して決定する。
+
+- DataGrid / DB Table/View
+- Alarm
+- Historical Trend
+- Tracking
+- Recipe / 実績
+- HTTP Action / External Program
+- Design API / OpenAPI
+- AI 設計支援
+- 高度な Event / Action flow
+
+### 初版で限定する項目の案
 
 - Renderer は SVG + Svelte を第一候補とする
 - Editor の基本操作は select / move / resize / property / binding
 - Animation は value / color / visibility / state を中心に開始
-- DB Table/View は read-only 表示を先行
 - Action の workflow は単純 sequence + success/failure から開始
 - Recipe / Tracking / Alarm の高度機能は段階導入する
 
@@ -597,15 +611,38 @@ Temperature is F32
 => assignment rejected
 ```
 
-### 8.4 未割付
+### 8.4 未割付・不成立 Binding の安全な扱い
 
 Editor 中は未割付を許容する。
+Project に未解決 Binding や型不整合が残っていても、Runtime 全体を起動不能にはしない。
 
-Runtime display:
+表示系は **fail-safe / degraded presentation** とする。
 
-- unresolved -> -- / invalid presentation
+例:
 
-Publish/Deploy 前の validation で warning/error をまとめて表示する。
+- unresolved tag -> `--` / unresolved 表示
+- Bad / Stale -> quality を反映した表示
+- 型不整合 -> invalid 表示
+- Expression 評価不能 -> error/invalid 表示
+- 一部 Object の不成立が他の正常 Object の描画を止めない
+
+validation は Editor / Import / Design API から常時利用でき、
+warning/error をまとめて確認できるようにする。ただし「全項目が valid でなければ Runtime を
+動かせない」という hard publish gate は初期設計では採用しない。
+
+Action は対象 Binding・引数・権限等が成立しない場合に**実行しない**。
+失敗は利用者へ表示するとともに Action execution record / audit に残す。
+
+最低限の記録候補:
+
+- timestamp
+- screen / object / action
+- requested target
+- failure code
+- failure detail
+- user / actor（取得可能な場合）
+
+「表示の設定ミス」と「操作が実行された」を曖昧にしない。
 
 ---
 
@@ -757,24 +794,40 @@ Property
 - LaunchProgram
 - ExecuteDbCommand
 
-### 10.3 execution target
+### 10.3 execution target（議論中）
+
+UI に閉じた Action は SCADA Runtime で実行する。
 
 ```text
-Local
+Local / UI
   Navigate
   Dialog
   Faceplate
   LaunchProgram
-
-Hub/Server
-  PLC Write
-  HTTP webhook
-  DB command
-  alarm/tracking triggered action
+  operator initiated WriteTag
 ```
 
-設備イベントに依存する常時実行 Action は SCADA Runtime ではなく Hub 側を優先する。
-SCADA を閉じたことで通知・記録が消える設計にしない。
+一方、次のような「UI が閉じていても常時成立させたい Event / Action」を
+どこへ置くかは**未決**とする。
+
+- value edge 起点の処理
+- alarm 起点の外部通知
+- tracking 起点の処理
+- timer
+- server-side HTTP / DB command
+
+候補:
+
+1. banto-hub に Server Action/Event 機能を持たせる
+2. SCADA Runtime を常駐実行主体として扱う
+3. 独立した automation / event service を設ける
+4. 対象機能ごとの既存 domain service に委ねる
+
+**Hub に余計な責務を増やさないことを重要な評価軸**とし、
+「常時実行だから Hub に入れる」とは自動的に決めない。
+
+この論点が決まるまで、Core v1 の Event は click / double click / screen open/close 等の
+UI Event を中心に扱い、常時実行 Event の配置は後続設計とする。
 
 ### 10.4 External Program
 
@@ -840,80 +893,54 @@ PLC write や non-idempotent POST は暗黙自動 retry しない。
 
 ## 11. Alarm
 
-### 11.1 Alarm は tag kind ではない
+### 11.1 方針: まず汎用 Alarm model を作る
 
-Alarm を tag_kind = alarm として本体化しない。
+初版では MELSEC / SLMP 等の特定 PLC・プロトコルに依存しない
+**汎用 Alarm domain / state machine / API / UI** を先に設計する。
+
+Alarm を `tag_kind = alarm` として本体化しない。
 
 ```text
-Tag / PLC alarm source
-       |
-       v
-   Alarm Engine
-       |
-       +-- AlarmDefinition
-       +-- AlarmState
-       +-- AlarmEvent
-       +-- AlarmHistory
+Alarm Source
+    |
+    v
+Alarm Engine
+    |
+    +-- AlarmDefinition
+    +-- AlarmState
+    +-- AlarmEvent
+    +-- AlarmHistory
 ```
 
 必要に応じて read-only alarm state tag を projection として公開してもよいが、
 Alarm entity の authoritative source にはしない。
 
-### 11.2 Alarm Source
+### 11.2 Generic Alarm Source
 
-2 系統を正式に扱う。
+Alarm Engine は source の取り込み方式を protocol 固有にしない。
+
+候補:
 
 ```text
 AlarmSource
-  +-- Hub evaluated
-  |      tag/expression -> alarm
-  |
-  +-- PLC generated
-         PLC alarm state/event -> Hub
+  +-- expression / tag condition
+  +-- external discrete state
+  +-- external event
+  +-- future protocol adapter
 ```
 
-### 11.3 PLC-generated alarm
+初期実装は Hub が既に取得できる Tag / Expression を source とする方式から開始できる。
 
-重要設備 Alarm は PLC 側で判定する。
+例:
 
-PLC 側に Alarm bitmap / state を持ち、
-Hub はそれを ingest する。
+- `Tank.Level >= 90`
+- `Motor.Command && !Motor.Feedback`
+- bool tag の rising / falling state
 
-三菱向けでは、SLMP Monitor の Entry/Execute Monitor 機能を
-高速 snapshot 取得に利用する候補とする。
+将来 PLC 側で生成済みの Alarm state/event を取り込む場合も、
+Alarm Engine 本体へ MELSEC 固有情報を持ち込まず source adapter で接続する。
 
-ただし monitor は push ではないため、
-短時間 ON/OFF の完全保証にはしない。
-
-### 11.4 Fast notification + recovery
-
-高信頼用途では以下を分離する。
-
-```text
-PLC
- |
- +-- UDP / event notification ---- low latency
- |
- +-- SLMP Monitor ---------------- current state sync
- |
- +-- event FIFO + sequence ------- loss recovery
-             |
-             v
-        Alarm Ingest
-```
-
-UDP は低レイテンシ用途であり唯一の真実にしない。
-
-### 11.5 banto-alarm
-
-Alarm state machine は独立 crate 候補:
-
-```text
-crates/banto-alarm
-```
-
-当面は banto-hub process 内で動かす。
-別 process 化は durable event transport が必要になってから検討する。
+### 11.3 State model
 
 状態候補:
 
@@ -926,16 +953,63 @@ crates/banto-alarm
 
 Alarm Definition 候補:
 
-- source/expression
+- source / expression
 - severity
+- message
 - deadband
 - on delay
 - off delay
 - latch
 - enabled
-- message
 
-設定 UI は単純条件から始めても、内部 model は expression 拡張を阻害しない。
+設定 UI は単純条件から開始してよいが、内部 model は expression / external source 拡張を阻害しない。
+
+### 11.4 ACK / Shelve
+
+ACK / Shelve は汎用 Alarm Engine の operator state として設計する。
+
+初版では特定 PLC の ACK bit / reset handshake と直接結合しない。
+PLC 側 ACK が必要な設備では、将来 protocol/source adapter または明示 Action として
+接続できるよう境界を残す。
+
+### 11.5 Protocol-specific PLC Alarm は後続
+
+MELSEC / PX Developer を意識した以下は有力な将来案だが、初期 Alarm 実装の必須要件にしない。
+
+- SLMP Monitor Entry / Execute Monitor
+- Alarm bitmap
+- UDP event notification
+- PLC event FIFO / sequence
+- loss recovery
+- MELSEC 固有 ACK / reset handshake
+
+将来のイメージ:
+
+```text
+MELSEC PLC
+  +-- UDP event -------- low latency
+  +-- SLMP monitor ----- current state
+  +-- FIFO / sequence -- loss recovery
+             |
+             v
+      MELSEC Alarm Adapter
+             |
+             v
+      Generic Alarm Engine
+```
+
+汎用 Alarm Engine を先に固定し、MELSEC adapter はその契約へ後付けする。
+
+### 11.6 実装境界
+
+Alarm state machine は独立 crate 候補:
+
+```text
+crates/banto-alarm
+```
+
+どの process にホストするかは Event/Server responsibility（§10.3）と合わせて議論する。
+Alarm domain の汎用性と host process の選択を分離する。
 
 ---
 
@@ -1065,11 +1139,12 @@ SCADA が tstore file を直接読む方式にはしない。
 
 ---
 
-## 14. DB Resources
+## 14. DB Table / View 連携（モデルは議論中）
 
-### 14.1 原則
+### 14.1 決定済みの境界
 
-SCADA Runtime は DB へ直接接続しない。
+SCADA Runtime は DB へ直接接続せず、DB credential / SQL / DB driver を
+SCADA Project に持ち込まない。
 
 ```text
 SCADA
@@ -1079,11 +1154,9 @@ Hub API
 DB
 ```
 
-DB credential / SQL / DB driver を SCADA Project に持ち込まない。
+Hub を DB 接続境界として利用する方針は維持する。
 
-### 14.2 既存 DB scalar tag
-
-現行 Hub の DB Source は、
+既存 Hub の DB Source は、
 
 ```text
 PostgreSQL query
@@ -1092,81 +1165,74 @@ PostgreSQL query
   -> current value
 ```
 
-として利用する。
+として単一現在値用途に利用できる。
 
-これは単一現在値に向いている。
+### 14.2 未決: tabular data を何として表現するか
 
-### 14.3 DB Table / View
+Table / View の rows × columns を SCADA の DataGrid に提供する必要があるが、
+Hub 内の domain model はまだ決定しない。
 
-SCADA で表・View を表示する用途には tabular resource を追加する。
+#### 案A: DB Table Tag
 
-UI 上は「DB タグ」として統合してもよいが、
-実装では scalar/current-value と rowset を分離する。
-
-概念例:
+既存 Tag Browser / DB connection の概念へ寄せる。
 
 ```text
-DB Resource
-  +-- DB Value Tag
-  |     scalar/current value
-  |
-  +-- DB Table Tag
-        rows x columns
+DB Value Tag  -> scalar
+DB Table Tag  -> rows x columns
 ```
 
-tag kind 候補:
+利点:
 
-- db
-- db_table
+- 利用者から見て「Hub に登録した DB データ」で統一できる
+- Editor の Resource Browser に自然に統合しやすい
 
-capability 例:
+懸念:
+
+- current value / quality / WS/MQTT を前提とする Tag domain に tabular semantics が混ざる
+- 各層で `tabular` 特例が増える可能性がある
+
+#### 案B: Dataset / DB Resource
+
+Tag とは別の first-class resource とする。
 
 ```text
-PLC tag
-  current_value = true
-  history       = true
+Tags
+  PLC / computed / internal / db scalar
 
-DB scalar tag
-  current_value = true
-
-DB table tag
-  tabular       = true
-  current_value = false
+Datasets
+  table / view / registered query
 ```
 
-db_table は通常の values WS/MQTT stream へ流さない。
+利点:
 
-### 14.4 Table / View / Query
+- rows / columns / pagination / sort / filter の責務が明確
+- Tag の current-value semantics を壊さない
 
-source 候補:
+懸念:
 
-- table
-- view
-- registered query
+- Hub API / client / Editor Browser に新しい resource 系統が増える
+- Recipe / Result 等との naming / ownership を整理する必要がある
 
-実案件では View を推奨する。
+### 14.3 共通して必要な capability
 
-DB 内部 schema と SCADA の契約境界を View に置くことで、
-内部テーブル変更の影響を局所化できる。
+どちらを採る場合も、SCADA から任意 SQL を送る API は作らない。
 
-### 14.5 API
+必要な機能候補:
 
-例:
+- schema / column metadata
+- rows
+- pagination
+- sort
+- allowed filter
+- timeout / cancellation
+- query concurrency limit
+- read-only first
 
-```text
-GET /api/v1/db-resources
-GET /api/v1/db-resources/{id}
-GET /api/v1/db-resources/{id}/schema
-GET /api/v1/db-resources/{id}/rows
-```
+API の具体形は resource model 決定後に確定する。
 
-rows では pagination / sort / allowed filter を提供する。
+### 14.4 DataGrid
 
-SCADA から任意 SQL を送る API は作らない。
-
-### 14.6 DataGrid
-
-SCADA の一級 widget とする。
+SCADA 側には一級 widget として DataGrid を持つ案を維持する。
 
 ```text
 DataGrid
@@ -1799,14 +1865,15 @@ SCADA の repository 分割は現時点では確定しない。
 - external program
 - audit
 
-### S10 Alarm
+### S10 Alarm（汎用）
 
 - banto-alarm
+- generic AlarmDefinition / AlarmState / AlarmEvent
+- tag / expression based source
 - Alarm API
 - Alarm Viewer
-- ACK / Shelve
-- PLC generated alarm input
-- SLMP monitor / event recovery 設計
+- operator ACK / Shelve
+- protocol-specific PLC alarm adapter は後続
 
 ### S11 Tracking
 
@@ -1822,9 +1889,10 @@ SCADA の repository 分割は現時点では確定しない。
 - banto-tagclient history extension
 - Trend widget
 
-### S13 DB Resources
+### S13 DB Table/View（resource model 決定後）
 
-- DB table/view registration
+- DB Table Tag vs Dataset/DB Resource の設計決定
+- table/view registration
 - schema/rows API
 - DataGrid
 - row context
@@ -1855,17 +1923,27 @@ MCP 自体は roadmap の blocking milestone にしない。
 3. Stable ID の UUID/ULID 方式
 4. Screen coordinate の内部単位（normalized / logical pixel の併用方針）
 5. banto-expr を client/runtime でそのまま利用するか
-6. DB tabular resource の正式名称（db_table / dataset 等）
-7. Alarm PLC event FIFO の標準 PLC memory layout
-8. Tracking PLC block の標準 memory layout
-9. Server Action を Hub 本体に置く範囲
+6. DB tabular resource の domain model（DB Table Tag / Dataset・DB Resource）
+7. 常時実行 Event / Action の実行主体（Hub / SCADA Runtime / 独立 service / domain service）
+8. Core v1 に含める Extension の範囲
+9. Tracking PLC block の標準 memory layout
 10. Editor/Runtime の executable 分離時期
 11. Design API の最終 transport / bind policy（初期候補: editor mode + loopback REST）
 12. AI change plan の承認を必須にする変更範囲
+13. protocol-specific Alarm adapter の優先順位（MELSEC は汎用 Alarm 後）
 
 ---
 
-## 23. 現時点の主要決定
+## 23. 議論継続中の主要論点
+
+- 常時実行 Event / Action をどの process/domain が担うか。Hub の責務を安易に増やさない
+- Core v1 の完了範囲。§3 の案を叩き台として決定する
+- DB Table/View の表現を DB Table Tag とするか、独立 Dataset / DB Resource とするか
+- protocol-specific PLC Alarm adapter の順序・契約。MELSEC 対応は汎用 Alarm model 後
+
+---
+
+## 24. 現時点の主要決定
 
 - PLC は control authority。PC 停止で設備制御を止めない
 - SCADA は PLC に直接接続せず Hub を介する
@@ -1878,13 +1956,14 @@ MCP 自体は roadmap の blocking milestone にしない。
 - Symbol と Faceplate は同じ Equipment binding context を共有する
 - Faceplate / Dialog / Popup を Project model の一級要素とする
 - Binding / Event / Action Engine を Runtime の中心に置く
+- 不完全な Binding があっても Runtime 全体を止めず、表示は safe/degraded state とする
+- Action が成立しない場合は実行せず、失敗を表示・記録する
 - External API / External Program を Action として扱う
-- Alarm は tag kind ではなく独立 domain
-- PLC generated alarm と Hub evaluated alarm の両方を扱う
+- Alarm は tag kind ではなく独立した汎用 domain として先に設計する
+- 初期 Alarm は protocol 非依存とし、MELSEC 固有の Alarm ingest は後続 adapter とする
 - 搬送 Tracking は独立 domain。PLC authoritative
 - Historian は Hub History API 経由
-- DB Table/View は Hub 登録 resource として SCADA へ公開する
-- scalar DB tag と tabular DB resource は実行経路を分離する
+- SCADA の DB Table/View アクセスは Hub を接続境界とするが、DB Table Tag / Dataset のどちらで表現するかは未決
 - Recipe / 実績は DB Resource + Action/Command を再利用する
 - Project Import/Export は projectId / projectRevision / schemaVersion を持つ
 - Project package へ secret を含めない
