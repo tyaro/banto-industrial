@@ -9289,7 +9289,7 @@ struct BatchWriteEntryRequest {
     /// 参照)にもかかわらず、以前は OpenAPI スキーマ上 `f64` 固定になって
     /// おり、bit タグへの `true`/`false` が生成ドキュメント上表現できて
     /// いなかった。注釈を外すと `serde_json::Value` の既定の
-    /// `ToSchema`(utoipa 5 組み込み、`schema_type = AnyValue`)にフォール
+    /// `ToSchema`(utoipa 組み込み、`schema_type = AnyValue`)にフォール
     /// バックし、number・boolean のどちらも受理できることが正しく表れる。
     /// 単票 [`WriteValueRequest::v`] は同じ `f64` 固定の問題を抱えている
     /// が、今回の指摘対象はバッチのみなのでそちらは変更しない(別の既存
@@ -11590,7 +11590,7 @@ mod tests {
             .join("tests")
             .join("snapshots")
             .join("openapi.json");
-        if std::env::var_os("UPDATE_OPENAPI_SNAPSHOT").is_some() {
+        if matches!(std::env::var("UPDATE_OPENAPI_SNAPSHOT").as_deref(), Ok("1")) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             let mut text = serde_json::to_string_pretty(&actual).unwrap();
             text.push('\n');
