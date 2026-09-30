@@ -40,7 +40,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use banto_tagclient::StableTagId;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -56,10 +55,14 @@ use crate::hub_api::{
 };
 use crate::log::{log_err_line, log_line};
 use crate::status::{push_entry, GroupState, Redactor};
-use crate::values::{normalize_ids, Subscription, ValueView};
+use crate::values::{normalize_names, plan_subscription, BindingPlan, Subscription, ValueView};
 
 /// 購読の生存確認の間隔。
 const HEALTH_TICK: Duration = Duration::from_secs(1);
+
+/// unresolved なタグが残っている間の購読の再計画間隔（設定取得の既定と
+/// 同じ 30 秒相当）。
+const DEFAULT_REPLAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 停止時に flusher の join を待つ上限（これを超えたら abort - commit 前
 /// なので二重書き込みにはならない）。
@@ -76,6 +79,10 @@ pub struct SidecarOptions {
     pub table_recheck: Duration,
     /// 購読の生存確認の間隔。
     pub health_tick: Duration,
+    /// unresolved なタグが残っている間、catalog を引き直して購読の計画を
+    /// 作り直す間隔（同名で再作成されたタグ・rename 後に設定へ入った新名を
+    /// 拾う）。
+    pub replan_interval: Duration,
 }
 
 impl Default for SidecarOptions {
@@ -83,6 +90,7 @@ impl Default for SidecarOptions {
         Self {
             table_recheck: DEFAULT_TABLE_RECHECK,
             health_tick: HEALTH_TICK,
+            replan_interval: DEFAULT_REPLAN_INTERVAL,
         }
     }
 }
@@ -185,6 +193,8 @@ struct Engine {
     subscription_attempt: u32,
     /// 次に購読を作り直してよい時刻。
     subscription_retry_at: Option<Instant>,
+    /// unresolved が残っている購読を、次に再計画してよい時刻。
+    next_replan_at: Instant,
 }
 
 impl Engine {
@@ -212,6 +222,7 @@ impl Engine {
             status_failing: false,
             subscription_attempt: 0,
             subscription_retry_at: None,
+            next_replan_at: Instant::now(),
         })
     }
 
@@ -408,13 +419,42 @@ impl Engine {
     // --- 購読 ---------------------------------------------------------------
 
     /// 対象タグの和集合を購読し続ける（必要なら作り直す）。
+    ///
+    /// 作り直す条件は 3 つ:
+    ///
+    /// 1. `dead` - SDK の worker が終了した（バックオフあり）。
+    /// 2. `changed` / `needs_replan` - 購読したい名前の集合が変わった（設定
+    ///    変更）、または SDK が `BindingUnresolved` を報告した（購読中の
+    ///    rename 等）。SDK は 1 件でも unresolved だと世代全体を落とすので、
+    ///    Sink が catalog を引いて解決できる名前だけで**直ちに**張り直す
+    ///    （[`crate::values::plan_bindings`]。バックオフは掛けない）。
+    /// 3. 周期的 replan - 上のどれでもなく、unresolved が残っていて再計画の
+    ///    時刻（`replan_interval`）を過ぎた。同名再作成や新名の復帰を拾うための
+    ///    ものだが、**現在の購読を止める前に** catalog を取って計画だけを作り
+    ///    （[`plan_subscription`]）、計画が前回と同じなら `next_replan_at` を
+    ///    進めるだけで購読を維持する（正常タグの記録を 30 秒ごとに途切れ
+    ///    させない）。catalog を取得できなかったときも購読を維持して次の
+    ///    周期で再試行する（一時的な失敗で正常だった購読を失わない）。計画が
+    ///    変わったときだけ、取得済みの計画で張り直す（catalog を二度取らない）。
     async fn ensure_subscription(&mut self) {
-        let desired = self.desired_stable_ids();
+        let desired = self.desired_external_names();
+        // 即時の張り直し（`needs_replan`）のときの、前世代の計画（ログの
+        // 重複抑止用）。周期的 replan は計画が変わったときしか張り直さない
+        // ので、常にログを出せばよく、これは使わない。
+        let mut previous_plan: Option<BindingPlan> = None;
+        // 周期的 replan が先に作った新しい計画（`Some` なら catalog は取得済み）。
+        let mut fresh_plan: Option<BindingPlan> = None;
 
         if let Some(subscription) = &self.subscription {
             let dead = subscription.is_dead();
-            let changed = subscription.subscribed() != desired.as_slice();
-            if !dead && !changed {
+            let changed = subscription.desired() != desired.as_slice();
+            let needs_replan = subscription.needs_replan();
+            let periodic_due = !dead
+                && !changed
+                && !needs_replan
+                && !subscription.unresolved().is_empty()
+                && Instant::now() >= self.next_replan_at;
+            if !dead && !changed && !needs_replan && !periodic_due {
                 if self.view_rx.borrow().live {
                     // 一度でも Live になったら、次の障害は 1 秒から
                     // やり直す（`banto_tagclient` の RetryTracker と同じ
@@ -422,6 +462,33 @@ impl Engine {
                     self.subscription_attempt = 0;
                 }
                 return;
+            }
+            if periodic_due {
+                // 購読を止める前に計画だけを作る。
+                let current = subscription.plan();
+                let fresh = plan_subscription(&self.config, &desired).await;
+                let error_kind = fresh
+                    .as_ref()
+                    .err()
+                    .map(|err| err.kind().as_str().to_owned());
+                match replan_decision(&current, fresh) {
+                    ReplanDecision::Keep => {
+                        self.next_replan_at = Instant::now() + self.options.replan_interval;
+                        return;
+                    }
+                    ReplanDecision::KeepAfterError => {
+                        self.next_replan_at = Instant::now() + self.options.replan_interval;
+                        // 30 秒ごとなので rate limit はしない。
+                        log_err_line(&format!(
+                            "banto-hub-sink: warn: 未解決タグの再計画で catalog を取得できません（購読は維持します）: {}",
+                            error_kind.unwrap_or_default()
+                        ));
+                        return;
+                    }
+                    ReplanDecision::Restart(plan) => fresh_plan = Some(plan),
+                }
+            } else if !dead && !changed {
+                previous_plan = Some(subscription.plan());
             }
             if let Some(subscription) = self.subscription.take() {
                 subscription.stop().await;
@@ -448,15 +515,28 @@ impl Engine {
             }
         }
         self.subscription_retry_at = None;
-        match Subscription::start(&self.config, desired, self.view_tx.clone()) {
+        let started = match fresh_plan {
+            Some(plan) => {
+                Subscription::start_with_plan(&self.config, desired, plan, self.view_tx.clone())
+            }
+            None => Subscription::start(&self.config, desired, self.view_tx.clone()).await,
+        };
+        match started {
             Ok(subscription) => {
-                if subscription.is_some() {
-                    log_line(&format!(
-                        "banto-hub-sink: Hub の購読を開始しました（{} タグ）",
-                        self.subscribed_len()
-                    ));
-                }
+                self.next_replan_at = Instant::now() + self.options.replan_interval;
                 self.subscription = subscription;
+                if let Some(subscription) = &self.subscription {
+                    let plan = subscription.plan();
+                    // 即時の張り直しで結果が変わらなかったときは黙る
+                    // （SDK が落とす世代を繰り返し張り直す間、同じログが
+                    // 出続けない）。
+                    if previous_plan.as_ref() != Some(&plan) {
+                        log_line(&subscribed_message(
+                            subscription.resolved().len(),
+                            &plan.unresolved,
+                        ));
+                    }
+                }
             }
             Err(err) => {
                 self.subscription_attempt = self.subscription_attempt.saturating_add(1);
@@ -470,23 +550,17 @@ impl Engine {
         }
     }
 
-    fn subscribed_len(&self) -> usize {
-        self.desired_stable_ids().len()
-    }
-
-    /// 全 sink group の対象タグの和集合（重複除去・ソート済み）。
-    fn desired_stable_ids(&self) -> Vec<StableTagId> {
-        let mut ids = Vec::new();
+    /// 全 sink group の対象タグの和集合（`external_name`、重複除去・ソート済み）。
+    /// 購読の鍵は名前（2026-09-30 オーナー決定、docs/scada-design.md §9.6）で、
+    /// 安定 ID の 3 つ組は DB 行用に `SinkConfigTag` へ残っているだけ。
+    fn desired_external_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
         for group in self.applied_groups.values() {
             for tag in &group.tags {
-                ids.push(StableTagId::new(
-                    tag.connection_id,
-                    tag.group_id,
-                    tag.tag_id,
-                ));
+                names.push(tag.external_name.clone());
             }
         }
-        normalize_ids(ids)
+        normalize_names(names)
     }
 
     // --- 状態 push ----------------------------------------------------------
@@ -659,6 +733,55 @@ where
     Ok(())
 }
 
+/// 周期的な再計画の判定結果（[`replan_decision`]）。
+#[derive(Debug, PartialEq, Eq)]
+enum ReplanDecision {
+    /// 計画は前回と同じ。購読を維持して `next_replan_at` だけ進める。
+    Keep,
+    /// 計画が変わった。この計画で購読を張り直す（catalog は取得済み）。
+    Restart(BindingPlan),
+    /// catalog を取得できなかった。購読は維持して次の周期で再試行する。
+    KeepAfterError,
+}
+
+/// 周期的な再計画で、現在の購読（`current`）と新しく作った計画（`fresh`）を
+/// 比べ、購読を維持するか張り直すかを決める**純関数**。張り直しは購読中の
+/// 正常タグの記録を途切れさせるので、計画が変わったときだけに限る。
+fn replan_decision<E>(current: &BindingPlan, fresh: Result<BindingPlan, E>) -> ReplanDecision {
+    match fresh {
+        Ok(plan) if plan == *current => ReplanDecision::Keep,
+        Ok(plan) => ReplanDecision::Restart(plan),
+        Err(_) => ReplanDecision::KeepAfterError,
+    }
+}
+
+/// 未解決の名前を何件までログへ列挙するか。
+const UNRESOLVED_LOG_LIMIT: usize = 5;
+
+/// 購読開始ログの本文。未解決が 0 なら「N タグ」だけ、あれば名前を
+/// [`UNRESOLVED_LOG_LIMIT`] 件まで列挙し、超えた分は「ほか N 件」。
+fn subscribed_message(resolved_len: usize, unresolved: &[String]) -> String {
+    if unresolved.is_empty() {
+        return format!("banto-hub-sink: Hub の購読を開始しました（{resolved_len} タグ）");
+    }
+    let mut names = unresolved
+        .iter()
+        .take(UNRESOLVED_LOG_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unresolved.len() > UNRESOLVED_LOG_LIMIT {
+        names.push_str(&format!(
+            "、ほか {} 件",
+            unresolved.len() - UNRESOLVED_LOG_LIMIT
+        ));
+    }
+    format!(
+        "banto-hub-sink: Hub の購読を開始しました（{resolved_len} タグ。未解決 {}: {names}）",
+        unresolved.len()
+    )
+}
+
 /// 次の設定取得までの間隔。成功したら既定の間隔、失敗中は指数バック
 /// オフ（ただし既定の間隔は超えない - Hub が復帰したときに 30 秒以上
 /// 待たされないため）。
@@ -672,8 +795,66 @@ fn next_config_delay(ok: bool, config_refresh: Duration, attempt: u32) -> Durati
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscribed_message_lists_up_to_five_unresolved_names() {
+        assert_eq!(
+            subscribed_message(3, &[]),
+            "banto-hub-sink: Hub の購読を開始しました（3 タグ）"
+        );
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|n| (*n).to_owned()).collect();
+        assert_eq!(
+            subscribed_message(97, &names),
+            "banto-hub-sink: Hub の購読を開始しました（97 タグ。未解決 3: a, b, c）"
+        );
+        let many: Vec<String> = (1..=7).map(|n| format!("t{n}")).collect();
+        assert_eq!(
+            subscribed_message(0, &many),
+            "banto-hub-sink: Hub の購読を開始しました（0 タグ。未解決 7: t1, t2, t3, t4, t5、ほか 2 件）"
+        );
+    }
+
     use super::*;
     use crate::hub_api::SinkConfigTag;
+
+    fn plan(resolved: &[&str], unresolved: &[&str]) -> BindingPlan {
+        BindingPlan {
+            resolved: resolved.iter().map(|n| (*n).to_owned()).collect(),
+            unresolved: unresolved.iter().map(|n| (*n).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn replan_decision_keeps_the_subscription_when_the_plan_is_unchanged() {
+        let current = plan(&["a"], &["gone"]);
+        assert_eq!(
+            replan_decision::<()>(&current, Ok(plan(&["a"], &["gone"]))),
+            ReplanDecision::Keep
+        );
+    }
+
+    #[test]
+    fn replan_decision_restarts_with_the_fresh_plan_when_it_changed() {
+        let current = plan(&["a"], &["gone"]);
+        // 同名再作成で unresolved が resolved へ移った。
+        assert_eq!(
+            replan_decision::<()>(&current, Ok(plan(&["a", "gone"], &[]))),
+            ReplanDecision::Restart(plan(&["a", "gone"], &[]))
+        );
+        // 新たに catalog から消えた名前がある。
+        assert_eq!(
+            replan_decision::<()>(&current, Ok(plan(&[], &["a", "gone"]))),
+            ReplanDecision::Restart(plan(&[], &["a", "gone"]))
+        );
+    }
+
+    #[test]
+    fn replan_decision_keeps_the_subscription_when_the_catalog_fetch_failed() {
+        let current = plan(&["a"], &["gone"]);
+        assert_eq!(
+            replan_decision(&current, Err("timeout")),
+            ReplanDecision::KeepAfterError
+        );
+    }
 
     fn connection(id: i64, password: &str) -> SinkConfigConnection {
         SinkConfigConnection {

@@ -67,8 +67,11 @@ pub struct SinkConfigGroup {
     pub tags: Vec<SinkConfigTag>,
 }
 
-/// 対象タグ 1 件（Hub 側 `SinkConfigTagEntry`）。3 つ組は
-/// `banto_tagclient::StableTagId` と完全に同じ意味。
+/// 対象タグ 1 件（Hub 側 `SinkConfigTagEntry`）。3 つ組
+/// （`connection_id` / `group_id` / `tag_id`）は `banto_tagclient::StableTagId`
+/// と同じ意味で、**DB 行（`ts, tag_id, external_name, value, quality`）用**。
+/// **購読は `external_name` で行う**（2026-09-30 オーナー決定、
+/// docs/scada-design.md §9.6）。
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SinkConfigTag {
@@ -76,9 +79,10 @@ pub struct SinkConfigTag {
     pub group_id: i64,
     pub tag_id: i64,
     /// Hub の現在の catalog 上の外部名（`{connection}.{group}.{tag}`）。
-    /// Hub は `CollectorManager::tag_map()` から詰めるので、**取得時点の
-    /// 最新**である。リネーム直後は次の設定取得までこちらが古くなりうる
-    /// （[`crate::values`] のモジュール doc「リネームの追従」参照）。
+    /// **購読の鍵**でもある。Hub は `CollectorManager::tag_map()` から詰める
+    /// ので、**取得時点の最新**である。リネーム直後は次の設定取得までこちらが
+    /// 古くなりうる。その間その名前は unresolved になる
+    /// （[`crate::values`] のモジュール doc 参照）。
     pub external_name: String,
 }
 

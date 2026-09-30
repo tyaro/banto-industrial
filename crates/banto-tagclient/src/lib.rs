@@ -2,7 +2,7 @@
 //! connection generations, plus (Issue #123) a single-tag write path.
 //!
 //! This crate provides safe endpoint construction, Hub wire DTOs, an opaque
-//! API-key boundary, stable-ID binding resolution, REST requests (read and a
+//! API-key boundary, external-name binding resolution, REST requests (read and a
 //! single-tag write), network-free publish-gate core, direct authenticated
 //! WebSocket handshakes, and a public owner for one generation. The consumed
 //! `TagClientHandle::restart` API replaces credentials and endpoint ownership
@@ -10,6 +10,18 @@
 //! recipe writes, Tauri, and keyring integration remain outside this crate's
 //! boundary (batch/recipe writes are deferred until a real requirement
 //! appears - see the `write` module doc).
+//!
+//! **Bindings and writes are keyed by `external_name`
+//! (`{connection}.{group}.{tag}`), never by the Hub's numeric
+//! [`StableTagId`]** (2026-09-30 owner decision, docs/scada-design.md §9.6).
+//! Every Hub public contract (WebSocket subscribe, `POST /api/v1/values/{tag}`,
+//! the write scope, MQTT) already speaks names, and a numeric ID changes on
+//! delete-and-recreate or a CSV re-import and cannot be carried across
+//! environments. A rename therefore leaves the old name unresolved
+//! (`binding_unresolved`; tag-server-design.md §4.1 "rename is a breaking
+//! change") until the application supplies the new name, while a
+//! delete-and-recreate under the same name resolves again on the next rebind.
+//! [`StableTagId`] remains only as the Hub's wire shape in [`CatalogTag::ids`].
 //!
 //! [`RestClient::write_tag`] is deliberately independent of `worker.rs`'s
 //! reconnect/backoff supervisor: it is a single request that never retries

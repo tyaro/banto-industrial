@@ -581,6 +581,7 @@ fn fast_sidecar_options() -> SidecarOptions {
     SidecarOptions {
         table_recheck: Duration::from_secs(1),
         health_tick: Duration::from_millis(500),
+        replan_interval: Duration::from_secs(1),
     }
 }
 

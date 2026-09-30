@@ -4,7 +4,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-30（`scada-design.md` を文書地図へ追加。banto-scada の設計草案・決定/未決事項の正）。2026-09-28（追従先を banto **v1.7.3** に上げた。`banto-storage` の `ORDER BY` に
+最終更新: 2026-09-30（banto-tagclient の binding 同一性を StableTagId から external_name に変更（オーナー決定、scada-design.md §9.6）。banto-tagclient-design.md §3.1 / §4.4 を改訂）。2026-09-30（`scada-design.md` を文書地図へ追加。banto-scada の設計草案・決定/未決事項の正）。2026-09-28（追従先を banto **v1.7.3** に上げた。`banto-storage` の `ORDER BY` に
 一意キー（既定 `id`）を足す変更と `WindowedListResource` 回復の改善が中心で（上流の admin-template 固有の修正・依存更新は
 本リポジトリには反映されない）、banto-industrial 側の API に破壊的変更は無い（banto-hub は
 v0.2.0-alpha.25）。「現状ひとめ」の上流の版を更新）。2026-09-26（追従先を banto **v1.7.2** に上げ、開いている画面がセッションの失効で
@@ -282,7 +282,7 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   `UNAUTHENTICATED`、トリップは `PERMISSION_DENIED` で終わる（#442）。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
-  stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き
+  外部名（`external_name`）resolver（2026-09-30にstable IDから変更）、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き
   WebSocket handshake、on_change subscribe、単一世代workerとwatchによるatomic latest snapshot配信、
   公開Handle、worker所有権、明示shutdown、catalog起点の再接続・backoff・停止割り込み、rebinding、config_changed再解決、消費型restartによるcredential/endpoint置換を実装済み。S4b-1互換候補ではorigin/main 509bf0e（Banto v1.4.0）とのローカル統合でtokio-tungstenite 0.29系一本化を確認したが、未push・未mergeである。S4互換tag固定、実Hub/LAN統合検証、配布サイズ確認は残課題である。
   Hubのrelease tagは未確定。

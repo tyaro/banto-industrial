@@ -601,7 +601,16 @@ mod tests {
             serde_json::to_string(&catalog_snapshot).unwrap(),
         )
         .await;
+        serve_stream_after_catalog(listener, name, values_snapshot).await
+    }
 
+    /// The WS subscribe / first data frame / REST values part of one
+    /// generation, after its catalog response has been written.
+    async fn serve_stream_after_catalog(
+        listener: &TcpListener,
+        name: &str,
+        values_snapshot: crate::types::ValuesSnapshot,
+    ) -> WebSocketStream<tokio::net::TcpStream> {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
         let subscription = tokio::time::timeout(Duration::from_secs(1), socket.next())
@@ -708,6 +717,19 @@ mod tests {
         snapshot.revision = revision;
         snapshot.run_id = run_id;
         snapshot.collection_mode = mode;
+        snapshot
+    }
+
+    /// The same external name after a delete-and-recreate: a fresh numeric ID.
+    /// Binding is by name, so this must resolve exactly like the original.
+    fn recreated_catalog(
+        name: &str,
+        revision: u64,
+        run_id: Option<u64>,
+        mode: CollectionMode,
+    ) -> CatalogSnapshot {
+        let mut snapshot = named_catalog(name, revision, run_id, mode);
+        snapshot.tags[0].ids = StableTagId::new(1, 1, 9);
         snapshot
     }
 
@@ -889,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_changed_burst_rebinds_once_and_uses_new_external_name() {
+    async fn config_changed_burst_rebinds_once_and_resolves_the_recreated_same_name() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let catalog_count = Arc::new(AtomicUsize::new(0));
@@ -902,9 +924,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut old_socket = serve_named_generation(
                 &listener,
-                "old-name",
-                named_catalog("old-name", 1, Some(7), CollectionMode::Configured),
-                named_values("old-name", 10.0, 1, Some(7), CollectionMode::Configured),
+                "alpha",
+                named_catalog("alpha", 1, Some(7), CollectionMode::Configured),
+                named_values("alpha", 10.0, 1, Some(7), CollectionMode::Configured),
                 &server_count,
                 None,
             )
@@ -926,9 +948,9 @@ mod tests {
             drop(old_socket);
             let new_socket = serve_named_generation(
                 &listener,
-                "new-name",
-                named_catalog("new-name", 1, Some(7), CollectionMode::Configured),
-                named_values("new-name", 20.0, 1, Some(7), CollectionMode::Configured),
+                "alpha",
+                recreated_catalog("alpha", 1, Some(7), CollectionMode::Configured),
+                named_values("alpha", 20.0, 1, Some(7), CollectionMode::Configured),
                 &server_count,
                 Some(release_rebind_rx),
             )
@@ -972,7 +994,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -988,10 +1010,7 @@ mod tests {
         });
         first_live_rx.await.unwrap();
         wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
-        assert_eq!(
-            receiver.borrow().current().unwrap().values[0].tag,
-            "old-name"
-        );
+        assert_eq!(receiver.borrow().current().unwrap().values[0].tag, "alpha");
         release_old_tx.send(()).unwrap();
         wait_rebinding(&mut receiver, ErrorKind::RevisionMismatch).await;
         assert_eq!(receiver.borrow().current(), None);
@@ -999,7 +1018,7 @@ mod tests {
         second_live_rx.await.unwrap();
         wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
         let current = receiver.borrow().current().unwrap().clone();
-        assert_eq!(current.values[0].tag, "new-name");
+        assert_eq!(current.values[0].tag, "alpha");
         assert_eq!(current.values[0].v, Some(20.0));
         assert_eq!(catalog_count.load(Ordering::SeqCst), 2);
         second_live_seen_rx.await.unwrap();
@@ -1045,7 +1064,7 @@ mod tests {
             write_json(
                 &mut catalog_stream,
                 serde_json::to_string(&named_catalog(
-                    "old-name",
+                    "alpha",
                     1,
                     Some(7),
                     CollectionMode::Configured,
@@ -1060,7 +1079,7 @@ mod tests {
                 .unwrap();
             socket
                 .send(Message::Text(
-                    r#"{"op":"data","id":1,"t":10,"values":[{"tag":"old-name","v":10,"q":"good","t":10}]}"#.into(),
+                    r#"{"op":"data","id":1,"t":10,"values":[{"tag":"alpha","v":10,"q":"good","t":10}]}"#.into(),
                 ))
                 .await
                 .unwrap();
@@ -1077,7 +1096,7 @@ mod tests {
             write_json(
                 &mut values_stream,
                 serde_json::to_string(&named_values(
-                    "old-name",
+                    "alpha",
                     10.0,
                     1,
                     Some(7),
@@ -1089,9 +1108,9 @@ mod tests {
             drop(socket);
             let new_socket = serve_named_generation(
                 &listener,
-                "new-name",
-                named_catalog("new-name", 1, Some(7), CollectionMode::Configured),
-                named_values("new-name", 20.0, 1, Some(7), CollectionMode::Configured),
+                "alpha",
+                recreated_catalog("alpha", 1, Some(7), CollectionMode::Configured),
+                named_values("alpha", 20.0, 1, Some(7), CollectionMode::Configured),
                 &server_count,
                 None,
             )
@@ -1107,7 +1126,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -1127,10 +1146,8 @@ mod tests {
         release_values_tx.send(()).unwrap();
         live_rx.await.unwrap();
         wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
-        assert_eq!(
-            receiver.borrow().current().unwrap().values[0].tag,
-            "new-name"
-        );
+        assert_eq!(receiver.borrow().current().unwrap().values[0].tag, "alpha");
+        assert_eq!(receiver.borrow().current().unwrap().values[0].v, Some(20.0));
         release_new_tx.send(()).unwrap();
         stop_tx.send(()).unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(1), task)
@@ -1183,7 +1200,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -1224,7 +1241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_catalog_rebinds_and_recovers_with_same_stable_id() {
+    async fn unresolved_catalog_rebinds_and_recovers_once_the_name_exists() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let catalog_count = Arc::new(AtomicUsize::new(0));
@@ -1266,7 +1283,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "resolved-name".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -1296,6 +1313,141 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// 2026-09-30 owner decision (docs/scada-design.md §9.6): a rename makes
+    /// the old name unresolved (tag-server-design.md §4.1 "rename is a
+    /// breaking change"); the worker never follows the tag to its new name and
+    /// never publishes a value as current. Once a tag with the old name exists
+    /// again (delete-and-recreate, new numeric ID), the next rebind resolves.
+    #[tokio::test]
+    async fn rename_leaves_the_old_name_unresolved_until_the_same_name_is_recreated() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let catalog_count = Arc::new(AtomicUsize::new(0));
+        let server_count = Arc::clone(&catalog_count);
+        let recreated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_recreated = Arc::clone(&recreated);
+        let (first_live_tx, first_live_rx) = oneshot::channel();
+        let (rename_tx, rename_rx) = oneshot::channel();
+        let (live_again_tx, live_again_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut old_socket = serve_named_generation(
+                &listener,
+                "old-name",
+                named_catalog("old-name", 1, Some(7), CollectionMode::Configured),
+                named_values("old-name", 10.0, 1, Some(7), CollectionMode::Configured),
+                &server_count,
+                None,
+            )
+            .await;
+            first_live_tx.send(()).unwrap();
+            rename_rx.await.unwrap();
+            old_socket
+                .send(Message::Text(
+                    r#"{"op":"config_changed","revision":2}"#.into(),
+                ))
+                .await
+                .unwrap();
+            // Until the name is recreated, every catalog only has the tag under
+            // its new name, and no WebSocket may be opened for the old one.
+            let new_socket = loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                assert!(request.starts_with("GET /api/v1/tags HTTP/1.1"));
+                server_count.fetch_add(1, Ordering::SeqCst);
+                if server_recreated.load(Ordering::SeqCst) {
+                    write_json(
+                        &mut stream,
+                        serde_json::to_string(&recreated_catalog(
+                            "old-name",
+                            2,
+                            Some(7),
+                            CollectionMode::Configured,
+                        ))
+                        .unwrap(),
+                    )
+                    .await;
+                    break serve_stream_after_catalog(
+                        &listener,
+                        "old-name",
+                        named_values("old-name", 20.0, 2, Some(7), CollectionMode::Configured),
+                    )
+                    .await;
+                }
+                write_json(
+                    &mut stream,
+                    serde_json::to_string(&named_catalog(
+                        "new-name",
+                        2,
+                        Some(7),
+                        CollectionMode::Configured,
+                    ))
+                    .unwrap(),
+                )
+                .await;
+            };
+            live_again_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            drop(new_socket);
+            drop(old_socket);
+        });
+
+        let (sender, mut receiver) =
+            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let rest_client = client(address);
+        let requests = vec![BindingRequest {
+            binding_key: "stable".into(),
+            external_name: "old-name".into(),
+        }];
+        let worker_sender = sender.clone();
+        let task = tokio::spawn(async move {
+            run_supervisor_with_config(
+                &rest_client,
+                &requests,
+                1,
+                &worker_sender,
+                stop_rx,
+                BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5)),
+            )
+            .await
+        });
+        first_live_rx.await.unwrap();
+        wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
+        assert_eq!(
+            receiver.borrow().current().unwrap().values[0].tag,
+            "old-name"
+        );
+        rename_tx.send(()).unwrap();
+        wait_rebinding(&mut receiver, ErrorKind::BindingUnresolved).await;
+        assert_eq!(receiver.borrow().current(), None);
+        // The bounded rebind budget is spent on the missing name and the
+        // worker settles into normal backoff, still without a current value.
+        wait_state(
+            &mut receiver,
+            TagClientConnectionState::Reconnecting,
+            Some(ErrorKind::BindingUnresolved),
+        )
+        .await;
+        assert_eq!(receiver.borrow().current(), None);
+        assert!(catalog_count.load(Ordering::SeqCst) >= 4);
+
+        recreated.store(true, Ordering::SeqCst);
+        live_again_rx.await.unwrap();
+        wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
+        let current = receiver.borrow().current().unwrap().clone();
+        assert_eq!(current.values[0].tag, "old-name");
+        assert_eq!(current.values[0].v, Some(20.0));
+        release_tx.send(()).unwrap();
+        stop_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn four_rebind_failures_enter_normal_backoff_without_fast_fifth_attempt() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1310,7 +1462,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -1353,7 +1505,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -1401,9 +1553,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut first_socket = serve_named_generation(
                 &listener,
-                "old-name",
-                named_catalog("old-name", 1, Some(7), CollectionMode::Configured),
-                named_values("old-name", 10.0, 1, Some(7), CollectionMode::Configured),
+                "alpha",
+                named_catalog("alpha", 1, Some(7), CollectionMode::Configured),
+                named_values("alpha", 10.0, 1, Some(7), CollectionMode::Configured),
                 &server_count,
                 None,
             )
@@ -1424,9 +1576,9 @@ mod tests {
             reconnect_tx.send(()).unwrap();
             let second_socket = serve_named_generation(
                 &listener,
-                "new-name",
-                named_catalog("new-name", 1, Some(7), CollectionMode::Configured),
-                named_values("new-name", 20.0, 1, Some(7), CollectionMode::Configured),
+                "alpha",
+                recreated_catalog("alpha", 1, Some(7), CollectionMode::Configured),
+                named_values("alpha", 20.0, 1, Some(7), CollectionMode::Configured),
                 &server_count,
                 None,
             )
@@ -1441,7 +1593,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -1588,11 +1740,11 @@ mod tests {
         let requests = vec![
             BindingRequest {
                 binding_key: "a".into(),
-                stable_id: StableTagId::new(1, 1, 1),
+                external_name: "alpha".into(),
             },
             BindingRequest {
                 binding_key: "b".into(),
-                stable_id: StableTagId::new(1, 1, 2),
+                external_name: "beta".into(),
             },
         ];
         let rest_client = client(address);
@@ -1719,7 +1871,7 @@ mod tests {
             watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
         let request = BindingRequest {
             binding_key: "missing".into(),
-            stable_id: StableTagId::new(9, 9, 9),
+            external_name: "missing-name".into(),
         };
         let (_stop_tx, stop_rx) = oneshot::channel();
         let result = tokio::time::timeout(
@@ -1772,7 +1924,7 @@ mod tests {
             watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
         let request = BindingRequest {
             binding_key: "alpha".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         };
         let (_stop_tx, stop_rx) = oneshot::channel();
         let result = tokio::time::timeout(
@@ -1815,7 +1967,7 @@ mod tests {
         let rest_client = client(address);
         let requests = vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "alpha".into(),
         }];
         let worker_sender = sender.clone();
         let task = tokio::spawn(async move {
@@ -1859,7 +2011,7 @@ mod tests {
     fn one_request() -> Vec<BindingRequest> {
         vec![BindingRequest {
             binding_key: "stable".into(),
-            stable_id: StableTagId::new(1, 1, 1),
+            external_name: "tag".into(),
         }]
     }
 
