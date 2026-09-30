@@ -605,11 +605,11 @@
           "last_apply": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/LastApplyEntry",
                 "description": "T7-2（設計 §4.3）: 直近の `apply_config` 呼び出しの結果。最後に成功\nした rebuild が `apply_config` を経由しなかった場合（起動直後の初回\n成功、または空構成への遷移）は `null`\n(`crate::hub::CollectorManager::last_apply` のドキュメント参照)。"
+              },
+              {
+                "type": "null"
               }
             ]
           },
