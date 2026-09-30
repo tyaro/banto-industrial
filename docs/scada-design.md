@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-09-30（Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -221,6 +221,7 @@ Alarm は v1.1 に置く。
 - Design API の REST / OpenAPI 露出（Editor / CLI / AI が共有する Design Domain 自体（§19.2）は Core に含める）
 - AI 設計支援
 - 高度な Event / Action flow
+- Replay（§13.3。有料版の機能候補。v1 に残す前提条件は §13.3 に列挙）
 
 ### 初版で限定する項目
 
@@ -1375,6 +1376,46 @@ banto-hub の型（`HubRuntime` をライブラリとし、コンソール / サ
 - §22 #18 記録対象タグの所有者 = SCADA Project（§13.1 の 4）
 - §11.6 Alarm engine の host = scada-server core
 
+### 13.3 Replay（将来機能、有料版の候補。2026-09-30 オーナー方針）
+
+**狙い**: Alarm の前後や任意の時刻について、設備の状態をトレンドの線ではなく**運転画面そのもので再現して
+再生する**。他の SCADA との差別化機能と位置づけ、将来機能（有料版の候補）とする。v1 / v1.1 には含めないが、
+後から足せるように前提条件だけを v1 に残す。
+
+**方式: Replay ドライバ**。画面・Binding Engine・Equipment・Faceplate は値の出所を知らないまま動かし、
+Hub の代わりに **Replay ドライバが tstore / tsquery から時刻カーソルに従って値を流す**。SCADA 側の変更は
+再生の操作 UI と安全の規律に絞る。
+
+- **A. プロセス内の driver（先行）**: banto-tagclient が公開する状態ストリーム（`TagClientState` の watch。
+  catalog revision、current、品質）と同じ形を履歴から生成する実装を scada-server core に置き、Runtime は
+  ライブ client と Replay driver のどちらの watch でも受け取れるようにする。SDK 側で状態の構築子を公開する
+  小さな変更が要る。時刻カーソル、再生速度、コマ送りは driver の API
+- **B. 仮想 Hub（必要が出たら）**: SCADA server が Hub と同じ REST catalog と WS values を過去の時刻で提供し、
+  tagclient の接続先を切り替えるだけにする。他の client でも再生できるが、publish gate が要求する catalog
+  revision と values の整合を過去時点で再現する必要があり、書き込みは 403 で拒否する
+- Alarm の発生・復帰・ACK（§11）と execution record（§16）も同じ driver の時刻カーソルで切り出して流し、
+  Alarm banner や Faceplate の Alarm 表示も出所を知らずに再現する
+
+**v1 に残す前提条件**（後から足すと高くつくもの）:
+
+1. **記録対象を Project の全 Binding の和集合に広げられること。** §13.1 の 4 は trend group を記録対象とするが、
+   Replay には画面・Equipment・Faceplate が束縛する全タグの履歴が要る。recorder の記録対象を
+   「trend group」と「Project の全 Binding」から選べる設定にし、その時点の catalog のメタデータ
+   （型、単位、writable）も記録する。Hub の購読は on_change なので記録量は変化点の数で決まる
+2. **Project の revision 保管。** 当時の画面で再生するため、recorder は記録に Project の revision を添え、
+   Project package を revision ごとに保管する（§5 の projectRevision が土台）
+3. **rename の名前履歴。** 履歴のキーは名前なので rename で履歴が分かれる。§9.3 の rename を Design operation に
+   した決定を活かし、Project に「旧名 → 新名、有効時刻」の名前履歴を持たせて Replay が引けるようにする
+4. **Runtime が値の出所を差し替えられる境界。** ライブ client と Replay driver を同じ受け口で受ける
+
+**SCADA 側に残る作業**（Replay 固有、画面の上に乗る薄い層）: タイムラインのスクラバ、再生 / 一時停止 / 速度 /
+コマ送り、再生中の表示（枠の色と時刻）、**副作用のある Action の全面無効化**（§1.3 の延長）、Alarm Viewer の
+「この Alarm の前後を再生」とトレンドの時刻選択からの入口、再生位置（画面 + 時刻）を共有できる URL。
+
+**有料版の候補としての切り方**: Replay driver と再生 UI は独立した module / crate に置き、ライセンスで有効化
+できる形にする。記録側の前提条件 1〜3 はライセンスに関係なく v1 の基盤に含める（後から有効化したときに
+過去へ遡って再生できるかは、記録対象の設定次第）。
+
 ---
 
 ## 14. DB Table / View 連携（モデルは議論中）
@@ -2200,6 +2241,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 18. 記録対象タグの所有者 → 2026-09-30 決定済み（§13.1 の 4、SCADA Project）
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 `docs/banto-hub-redundancy-design.md`）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
+21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
 
 ---
 
