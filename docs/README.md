@@ -4,7 +4,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-30（banto-tagclient の binding 同一性を StableTagId から external_name に変更（オーナー決定、scada-design.md §9.6）。banto-tagclient-design.md §3.1 / §4.4 を改訂）。2026-09-30（`scada-design.md` を文書地図へ追加。banto-scada の設計草案・決定/未決事項の正）。2026-09-28（追従先を banto **v1.7.3** に上げた。`banto-storage` の `ORDER BY` に
+最終更新: 2026-09-30（scada-design.md §13.2: SCADA server の構成を決定。24/365 の処理は画面と別の core に置き、v1 は埋め込み起動、サービス host は後続）。2026-09-30（banto-tagclient の binding 同一性を StableTagId から external_name に変更（オーナー決定、scada-design.md §9.6）。banto-tagclient-design.md §3.1 / §4.4 を改訂）。2026-09-30（`scada-design.md` を文書地図へ追加。banto-scada の設計草案・決定/未決事項の正）。2026-09-28（追従先を banto **v1.7.3** に上げた。`banto-storage` の `ORDER BY` に
 一意キー（既定 `id`）を足す変更と `WindowedListResource` 回復の改善が中心で（上流の admin-template 固有の修正・依存更新は
 本リポジトリには反映されない）、banto-industrial 側の API に破壊的変更は無い（banto-hub は
 v0.2.0-alpha.25）。「現状ひとめ」の上流の版を更新）。2026-09-26（追従先を banto **v1.7.2** に上げ、開いている画面がセッションの失効で
