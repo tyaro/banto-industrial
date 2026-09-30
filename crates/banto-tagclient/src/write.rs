@@ -28,12 +28,15 @@
 //! fetches no catalog: it sends one POST and nothing else. Right after a
 //! rename the old name no longer exists, so the Hub answers 404
 //! ([`ErrorKind::WriteRejected`]) and nothing is written to the wrong tag.
-//! The remaining hole is "a different tag was registered under the old name
-//! right after the rename" - the write would then land on that tag. That is
-//! meant to be closed by attaching the expected catalog revision to the write
-//! request and having the Hub reject a mismatch (docs/scada-design.md §9.6);
-//! it is **not implemented yet**. Even then this crate does not retry (point 2
-//! above).
+//! The one case a name cannot distinguish is "a different tag was later
+//! registered under the old name" - a write would then land on that tag. This
+//! is **accepted by policy, not closed by the SDK** (2026-09-30 owner
+//! decision, docs/scada-design.md §9.6): under a name contract it is the same
+//! thing as a deliberate delete-and-recreate, and the Hub's per-tag `writable`
+//! opt-in (a newly created tag cannot be written), the caller's type check
+//! against the catalog, the Hub's rename warning and the write audit are the
+//! safeguards. No "expected catalog revision" parameter is planned. This
+//! crate does not retry either (point 2 above).
 
 use reqwest::{Client, StatusCode};
 use serde_json::json;
