@@ -1,0 +1,1281 @@
+{
+  "components": {
+    "schemas": {
+      "BatchWriteEntryRequest": {
+        "description": "`POST /api/v1/values/batch` の1エントリぶんの request body。`v` は単票\n[`WriteValueRequest::v`]・[`parse_requested_value`] と同じ正規化。",
+        "properties": {
+          "tag": {
+            "description": "外部名 `{connection}.{group}.{tag}`。",
+            "type": "string"
+          },
+          "v": {
+            "description": "書き込む工学値(単票と同じ - 数値タグには数値、bit タグには真偽値)。\n2026-09-05 レビュー対応: `#[schema(value_type = f64)]` を外した -\n数値タグには数値、bit タグには真偽値を送れる(`parse_requested_value`\n参照)にもかかわらず、以前は OpenAPI スキーマ上 `f64` 固定になって\nおり、bit タグへの `true`/`false` が生成ドキュメント上表現できて\nいなかった。注釈を外すと `serde_json::Value` の既定の\n`ToSchema`(utoipa 組み込み、`schema_type = AnyValue`)にフォール\nバックし、number・boolean のどちらも受理できることが正しく表れる。\n単票 [`WriteValueRequest::v`] は同じ `f64` 固定の問題を抱えている\nが、今回の指摘対象はバッチのみなのでそちらは変更しない(別の既存\n課題として残す)。"
+          }
+        },
+        "required": [
+          "tag",
+          "v"
+        ],
+        "type": "object"
+      },
+      "BatchWriteEntryResponse": {
+        "description": "per-entry 結果の1件分。成功時は `ok: true` のみ、失敗時は `ok: false` +\n[`crate::write_path::WriteRejection::rest_error_code`]/`detail`\n（単票のエラー本文と同じ語彙 - `error`/`detail` フィールド名も揃える）。",
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "ok"
+        ],
+        "type": "object"
+      },
+      "BatchWriteValueRequest": {
+        "description": "`POST /api/v1/values/batch` の request body（設計 §3.3\n「`[{tag, value}, ...]` を受ける」）。",
+        "properties": {
+          "writes": {
+            "items": {
+              "$ref": "#/components/schemas/BatchWriteEntryRequest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "writes"
+        ],
+        "type": "object"
+      },
+      "BatchWriteValuesResponse": {
+        "description": "`POST /api/v1/values/batch` の応答。**常に 200**（設計 §3.3・このモジュール\nの `BatchTagsResponse` doc comment と同じ判断 - 事前ゲート\nall-or-nothing による全体中止は例外ではなく通常の応答で、クライアントは\n`writes[].ok`/`error`/`detail` を行ごとに見る）。認証エラー(403)や JSON\nパース失敗(400)は既存の `ApiError`/`Json` extractor 経路のまま区別する。",
+        "properties": {
+          "writes": {
+            "items": {
+              "$ref": "#/components/schemas/BatchWriteEntryResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "writes"
+        ],
+        "type": "object"
+      },
+      "CatalogResponse": {
+        "description": "`GET /api/v1/tags` の応答: `{ \"revision\", \"run_id\",\n\"collection_mode\", \"tags\": [CatalogTagEntry...] }`。",
+        "properties": {
+          "collection_mode": {
+            "type": "string"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogTagEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "collection_mode",
+          "tags"
+        ],
+        "type": "object"
+      },
+      "CatalogTagEntry": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TagEntry"
+          },
+          {
+            "properties": {
+              "configured_simulation": {
+                "type": "boolean"
+              },
+              "effective_simulation": {
+                "type": "boolean"
+              },
+              "value_source": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "configured_simulation",
+              "effective_simulation",
+              "value_source"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "REST wire DTO for one catalog entry.\n\n`TagEntry` remains the saved/configured catalog owned by `CollectorManager`.\nThe runtime fields are layered here so an all-simulation run can be\nobserved without mutating the DB-backed catalog or the shared TagMap."
+      },
+      "ConnectionStatusEntry": {
+        "description": "`GET /api/v1/status` の `connections` 配列1件分。",
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "configured_simulation": {
+            "type": "boolean"
+          },
+          "effective_simulation": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "simulation": {
+            "description": "T9-2 (docs/ux-plan.md §1): mirrors `banto_tags::PlcConnection::simulation` -\nlets a monitoring client (or the admin UI) flag a connection whose\nlive values are synthetic, not from a real PLC.",
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "id",
+          "status",
+          "simulation",
+          "configured_simulation",
+          "effective_simulation"
+        ],
+        "type": "object"
+      },
+      "DbSourceGroupStatusEntry": {
+        "description": "[`DbSourceStatusEntry`] のグループ1件分。",
+        "properties": {
+          "group_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "group_name": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ok_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "row_count_last": {
+            "description": "直近の実行で取れた行数。生成 SQL が `LIMIT 2` を付けるので `2` は\n「2 行以上」を意味する（`crate::db_source::convert::build_wrapper_sql`）。",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "group_id",
+          "group_name"
+        ],
+        "type": "object"
+      },
+      "DbSourceStatusEntry": {
+        "description": "`GET /api/v1/status` の `db_source`（外部 DB 連携 S2、\ndocs/banto-hub-external-db-design.md §4.2・§4.3）: DB Source の接続ごとの\n運転状態。`crate::db_source::status` のプロセス内メモリをそのまま写した\nもので、**秘密は含まない**（`last_error` は\n`crate::db_source::sanitize_postgres_error` を通した文字列だけ）ため、\n`mqtt`/`grpc` 節と同じく admin 限定にはしていない。",
+        "properties": {
+          "connection_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "connection_name": {
+            "type": "string"
+          },
+          "consecutive_failures": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/DbSourceGroupStatusEntry"
+            },
+            "type": "array"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_poll_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_restart_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "restarts": {
+            "description": "S2b（§4.8・§6-17）: この接続のタスクが異常終了して supervisor に\n作り直された回数と、その最後の理由\n（`crate::db_source::DbConnectionStatus::restarts`）。",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "description": "`connected` / `backoff` / `disabled` / `error` / `stopped`\n（`crate::db_source::DbConnectionState`）。`stopped` は S2b\n（設計 §4.8・§6-16）: 収集が Running でないのでタスクを起動して\nいない（DB へ繋いでいない・配下のタグは Bad）。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "connection_name",
+          "state",
+          "consecutive_failures",
+          "restarts",
+          "groups"
+        ],
+        "type": "object"
+      },
+      "EventEntry": {
+        "description": "`GET /api/v1/events` の `events` 配列1件分\n(`crates/banto-collect/migrations/0001_collect_events.sql`'s columns)。",
+        "properties": {
+          "connection_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tag_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ts": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "ts",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "EventsResponse": {
+        "description": "`GET /api/v1/events` の応答。",
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EventEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "type": "object"
+      },
+      "GrpcStatusEntry": {
+        "description": "`GET /api/v1/status` の `grpc`（T4、設計実装指示「`/api/v1/status` に\n`grpc: { enabled, port }` を追加」）。MQTT と違い「実際に接続できて\nいるか」のライブ状態は持たない - gRPC サーバーは外部へ接続しに行く\nクライアントではなく listen するだけなので、設定値がそのまま意図した\n状態を表す(`crate::grpc::GrpcServer`のモジュール doc comment参照)。",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "enabled",
+          "port"
+        ],
+        "type": "object"
+      },
+      "LastApplyEntry": {
+        "description": "`GET /api/v1/status` の `last_apply`（T7-2、設計 §4.3実装指示「ApplyReport\nの内容を...`/api/v1/status` に出す」）: 直近の `apply_config` 呼び出しの\n結果 - どの接続が追加/削除/入れ替え/無変更だったか、tstore writer が\nローテートしたか。[`banto_collect::ApplyReport`] のワイヤ表現（同クレート\n側は `ToSchema`/`Serialize` を持たない内部型のため、ここで DTO 化する -\nこのファイルの他の DTO（[`ConnectionStatusEntry`] 等）と同じ流儀）。",
+        "properties": {
+          "added": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "replaced": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unchanged": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "writer_rotated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "added",
+          "removed",
+          "replaced",
+          "unchanged",
+          "writer_rotated"
+        ],
+        "type": "object"
+      },
+      "MqttStatusEntry": {
+        "description": "`GET /api/v1/status` の `mqtt`（T3、設計実装指示「`/api/v1/status` に\n`mqtt: { \"enabled\": bool, \"connected\": bool }` を追加」）。`enabled` は\n設定値（settings テーブルの `mqtt.enabled`）、`connected` は\n[`crate::mqtt::MqttPublisher::connected`]（実際に MQTT ブローカーへ接続\nできているかのライブ状態）- 両者は独立: `enabled=true` でもブローカー\n不通なら `connected=false` になる。",
+        "properties": {
+          "connected": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled",
+          "connected"
+        ],
+        "type": "object"
+      },
+      "ReadNowResponse": {
+        "description": "`GET /api/v1/values/{tag}/read-now` の応答(T20 ①b、\ndocs/banto-hub-t20-design.md §3.1)。[`SingleValueResponse`](cache 読み)\nと違い `v` は `serde_json::Value` - 数値・真偽値・文字列のいずれも\n表せる(文字列タグはこの経路でしか読めない - このモジュールの\n[`v1_value_read_now`] doc comment参照)。`SingleValueResponse` 自体は\n変更しない(既存の cache 読みの応答型を壊さない、実装指示の制約)。",
+        "properties": {
+          "q": {
+            "description": "その場読みが成功した時点の品質は常に `\"good\"` - キャッシュ読みと\n違い、この経路は失敗を `q: \"bad\"` の200応答ではなく HTTP エラーで\n表す(`read_now_rejection_response`参照)ので、200応答の`q`は常に\n`\"good\"`。フィールド自体は cache 読みの `ValueEntry`/`SingleValueResponse`\nと形を揃えるために残す。",
+            "type": "string"
+          },
+          "t": {
+            "description": "この読み取りが完了した時刻(ミリ秒epoch) - cache 読みの `t`\n(サンプル採取時刻)と違い、その場読みでは「サンプル時刻」という\n概念自体が無い(収集サイクルを経由しない)ので、応答組み立て時の\n時刻をそのまま使う。",
+            "format": "int64",
+            "type": "integer"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "v": {
+            "description": "数値・真偽値・文字列のいずれか(数値タグは scale 済みの工学値 -\n`crate::read_path`のモジュール doc comment「スケーリング」節参照)。"
+          }
+        },
+        "required": [
+          "tag",
+          "v",
+          "q",
+          "t"
+        ],
+        "type": "object"
+      },
+      "SingleValueResponse": {
+        "description": "Single-value response. The bulk response carries the same run metadata at\nthe response level, while each value carries its own source classification.",
+        "properties": {
+          "collection_mode": {
+            "type": "string"
+          },
+          "q": {
+            "type": "string"
+          },
+          "run_id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "t": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "v": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "value_source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "q",
+          "t",
+          "collection_mode",
+          "value_source"
+        ],
+        "type": "object"
+      },
+      "SinkGroupStatusEntry": {
+        "description": "`GET /api/v1/status`の`sink.groups`の1件分 - サイドカーが最後に push\nした内容をそのまま映す（`crate::sink::SinkGroupStatusPush`のwire形）。",
+        "properties": {
+          "dropped": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_flush_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "queued": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "queued",
+          "dropped"
+        ],
+        "type": "object"
+      },
+      "SinkSidecarStatusEntry": {
+        "description": "`GET /api/v1/status`の`sink.sidecar`（外部 DB 連携 S4、design §5.2・\n§5.5）。`crate::sink::status::SinkStatusSnapshot`のwire形。",
+        "properties": {
+          "last_seen_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`\"online\"`（[`crate::sink::SINK_SIDECAR_STALE_AFTER_MS`]以内に\n`PUT /api/sink/status`の push があった）か`\"unknown\"`（無い、または\n一度も push が無い）。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "SinkStatusEntry": {
+        "description": "`GET /api/v1/status`の`sink`節（外部 DB 連携 S4）。",
+        "properties": {
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/SinkGroupStatusEntry"
+            },
+            "type": "array"
+          },
+          "sidecar": {
+            "$ref": "#/components/schemas/SinkSidecarStatusEntry"
+          }
+        },
+        "required": [
+          "sidecar",
+          "groups"
+        ],
+        "type": "object"
+      },
+      "StatusResponse": {
+        "description": "`GET /api/v1/status` の応答。T19 S5: `crate::mcp`の`get_server_status`\nツールが[`compute_status`]をそのまま呼んで`serde_json::to_value`で\n包み直すため`pub(crate)`（フィールド自体へは触れない - トレイト経由の\nシリアライズのみ）。",
+        "properties": {
+          "collection_mode": {
+            "type": "string"
+          },
+          "collection_state": {
+            "type": "string"
+          },
+          "configured_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectionStatusEntry"
+            },
+            "type": "array"
+          },
+          "db_source": {
+            "description": "外部 DB 連携 S2（§4.2・§4.3）: DB Source の接続ごとの運転状態。\n`postgres` 接続が1つも無い通常構成では空配列。",
+            "items": {
+              "$ref": "#/components/schemas/DbSourceStatusEntry"
+            },
+            "type": "array"
+          },
+          "grpc": {
+            "$ref": "#/components/schemas/GrpcStatusEntry",
+            "description": "T4（設計 §5.4）: gRPC サーバーの設定。"
+          },
+          "last_apply": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LastApplyEntry",
+                "description": "T7-2（設計 §4.3）: 直近の `apply_config` 呼び出しの結果。最後に成功\nした rebuild が `apply_config` を経由しなかった場合（起動直後の初回\n成功、または空構成への遷移）は `null`\n(`crate::hub::CollectorManager::last_apply` のドキュメント参照)。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_config_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_runtime_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mqtt": {
+            "$ref": "#/components/schemas/MqttStatusEntry",
+            "description": "T3（設計 §5.3）: MQTT publish の設定/接続状態。"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "running_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sink": {
+            "$ref": "#/components/schemas/SinkStatusEntry",
+            "description": "外部 DB 連携 S4（design §5.2・§5.5）: DB Sink サイドカーの運転状態。\nサイドカーが1度も`PUT /api/sink/status`を push していない、または\n15秒以上 push が無ければ`sidecar.state == \"unknown\"`\n（`crate::sink::status`のモジュール doc comment参照）。"
+          },
+          "system": {
+            "$ref": "#/components/schemas/SystemInfoSnapshot",
+            "description": "T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の\n拡充」）: サーバー自身の CPU 使用率・メモリ使用量。\n`crate::system_info::SystemInfoSampler`のモジュール doc comment\n参照 - プロセス起動直後最初の呼び出しは `cpu_percent` が `0.0`に\nなりうる。"
+          },
+          "version": {
+            "type": "string"
+          },
+          "write_enabled": {
+            "description": "T2-4（設計 §6-6）: 書き込み受付が今いま有効かどうか(ライブフラグ)。",
+            "type": "boolean"
+          },
+          "write_persistence_warning": {
+            "description": "#433: 書き込み受付の保存状態の注意書き（起動時に DB と状態ファイルが\n食い違っていた、直近の停止・再開を片方に保存できなかった等。\n`crate::write_control::WriteControl::persistence_warning`）。無ければ `null`。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "write_was_enabled_before_restart": {
+            "description": "T2-4（設計 §6-6）: 起動時に永続テーブルから復元した値\n(`crate::write_control::WriteControl` のモジュール doc comment\n参照。以後の enable/disable ではこの値自体は変わらない。\n2026-09-09 オーナー決定 #340)。",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "version",
+          "revision",
+          "configured_revision",
+          "running_revision",
+          "collection_state",
+          "collection_mode",
+          "connections",
+          "write_enabled",
+          "write_was_enabled_before_restart",
+          "mqtt",
+          "grpc",
+          "db_source",
+          "system",
+          "sink"
+        ],
+        "type": "object"
+      },
+      "SystemInfoSnapshot": {
+        "description": "[`SystemInfoSampler::sample`]が返すスナップショット。単位はいずれも\nバイト・パーセントの生値 - MB/GB 表記やゲージ表示への整形はフロント側\n（`systemInfoFormat.ts`）の責務であり、ここでは行わない\n（`crate::rest`の他の DTO と同じ「サーバー側は生値、整形は UI 側」の\n分担）。\n\nあえて `#[serde(rename_all = \"camelCase\")]` を付けない -\n`GET /api/v1/status`（`crate::rest::StatusResponse`）が snake_case の\nまま埋め込むため（`crate::rest`冒頭のモジュール doc comment「`/api/v1/*`\n側は意図して snake_case のまま」参照）。管理系 `GET /api/status`\n（camelCase）向けには `crate::rest::AdminSystemInfoEntry` を別に用意し\n`From`で変換する - `ConnectionStatusEntry`/`AdminConnectionStatusEntry`\nと同じ二重定義の流儀（`crate::rest`の該当コメント参照）。",
+        "properties": {
+          "cpu_percent": {
+            "description": "このプロセス自身の CPU 使用率（%、論理コア1個 = 100%換算 -\n`sysinfo::Process::cpu_usage`の単位をそのまま転記する）。起動直後の\n最初のサンプルは前回スナップショットが無いため`0.0`になりうる\n（このモジュール doc comment参照）。",
+            "format": "float",
+            "type": "number"
+          },
+          "host_memory_total_bytes": {
+            "description": "ホスト全体の総メモリ（バイト）。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_memory_used_bytes": {
+            "description": "ホスト全体の使用中メモリ（バイト、他プロセス分も含む）。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "process_memory_bytes": {
+            "description": "このプロセス自身の常駐メモリ（RSS、バイト）。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cpu_percent",
+          "process_memory_bytes",
+          "host_memory_used_bytes",
+          "host_memory_total_bytes"
+        ],
+        "type": "object"
+      },
+      "TagEntry": {
+        "description": "One catalog entry: an external name bound to a stable internal tag,\ncarrying everything a REST client needs to display/interpret it (design\n§4.1 \"catalog はバインディング契約である\" + §5.1 \"PLC アドレスを既定で\n含める\", 2026-08-05 決定).\n\n`enabled` here is the *effective* collected state (`connection.enabled &&\ngroup.enabled && tag.enabled`), not just the tag row's own `enabled`\ncolumn - a tag under a disabled group/connection is just as uncollected\nas a tag that is itself disabled, and design §4 requires the catalog not\nhide that (\"欠測を隠さない\"). This is a T0-1 judgment call (the\nimplementation instructions specify a single `enabled: bool` field\nwithout pinning which of the three flags it reflects); documented here so\nthe REST layer and tests share the same understanding.\n\nField names are plain `snake_case` on the wire (no `camelCase` rename,\nunlike the admin-UI resources' JSON) - the `/api/v1/*` namespace is\nmachine-client-facing (design §5.1/§5.6) and the design doc's own\nexamples for sibling `/api/v1/*` payloads (`t`, `v`, `q`,\n`last_config_error`) are snake_case, not camelCase.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "connection": {
+            "type": "string"
+          },
+          "data_type": {
+            "type": "string"
+          },
+          "decimals": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expression": {
+            "description": "Computed-tag formula source (design §4.2, T6-2). `Some` only for\n`tag_kind == \"computed\"` - `None` for `\"plc\"`/`\"internal\"` (mirrors\n`banto_tags::Tag::expression`'s own invariant, enforced at\nregistration by `banto_tags::tag::validate_tag_input`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "external_name": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "ids": {
+            "description": "Stable `(connection_id, group_id, tag_id)` - the \"同じ ID なら\nリネームされた/消えたら削除された\" signal design §4.1 calls for.\n\n`#[schema(value_type = Vec<i64>)]` (T0-2, docs/tag-server-design.md\n§10-6 utoipa 採用): utoipa's `ToSchema` derive has no blanket impl for\narbitrary tuples, so the OpenAPI schema for this field is declared as\na 3-element JSON array of integers instead - this is a schema-only\nannotation, it does not touch how `serde` actually serializes the\ntuple (still a bare `[id, id, id]` JSON array either way, so the wire\nformat this crate's tests assert on is unchanged).",
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "period_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "retain": {
+            "description": "Internal-tag \"restore last value on restart\" flag (design §4.2,\nT6-2). Meaningless for `\"plc\"`/`\"computed\"` tags (always `false` for\nthem - mirrors `banto_tags::Tag::retain`).",
+            "type": "boolean"
+          },
+          "simulation": {
+            "description": "T9-2 (docs/ux-plan.md §1, accident-prevention requirement (b)):\nmirrors the tag's *owning connection's* `simulation` flag\n(`banto_tags::PlcConnection::simulation`), not the tag's own row -\ntags have no such column of their own. External clients (and the\nfuture T10 tag monitor) need this to tell that a tag's live value is\nsynthetic (produced by an in-process simulator,\n`banto_collect::simulation`/`crate::broker_glue::BrokerSimRegistry`),\nnot read from a real PLC.",
+            "type": "boolean"
+          },
+          "tag_key": {
+            "type": "string"
+          },
+          "tag_kind": {
+            "description": "One of `banto_tags::ALLOWED_TAG_KINDS` (`\"plc\"`/`\"computed\"`/\n`\"internal\"`, design §4.2). T2-3 deferred exposing this in the catalog\n(\"T6 まで非公開\" - `tag_kind` was always `\"plc\"` back then, so there\nwas nothing to distinguish); **T6-2 lifts that now that all three\nspecies exist** (catalog exposure decision, this field). This is also\nthe field [`crate::hub::read_current`] branches on - no other IF\nshould re-derive \"is this tag PLC-backed\" from anything else.",
+            "type": "string"
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "writable": {
+            "description": "Write opt-in (design §4 \"メタデータ: ...書き込み可否(§6)を catalog 系\nAPI で公開\", §6 item 1).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "external_name",
+          "tag_key",
+          "ids",
+          "connection",
+          "group",
+          "name",
+          "address",
+          "data_type",
+          "decimals",
+          "period_ms",
+          "enabled",
+          "writable",
+          "tag_kind",
+          "retain",
+          "simulation"
+        ],
+        "type": "object"
+      },
+      "ValueEntry": {
+        "description": "One `/api/v1/values*` entry's wire shape (design §5.1's route table:\n`{ \"tag\", \"v\", \"q\", \"t\" }`).",
+        "properties": {
+          "q": {
+            "type": "string"
+          },
+          "t": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "v": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "value_source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "q",
+          "t",
+          "value_source"
+        ],
+        "type": "object"
+      },
+      "ValuesResponse": {
+        "description": "`GET /api/v1/values` の応答: `{ \"revision\", \"t\", \"values\": [ValueEntry...] }`。",
+        "properties": {
+          "collection_mode": {
+            "type": "string"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "t": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/ValueEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "t",
+          "collection_mode",
+          "values"
+        ],
+        "type": "object"
+      },
+      "WriteValueRequest": {
+        "description": "`POST /api/v1/values/{tag}` の request body（設計 §5.1「body\n`{ \"v\": <number|bool> }`」、T20 ①a で文字列を追加 - docs/banto-hub-t20-design.md\n§3.1）。`v` は `serde_json::Value` のまま保持し、[`parse_requested_value`]\nで数値/真偽値/文字列のみを受理する（配列・オブジェクトは 422）—\n`bool`/`number`/`string` を1つの Rust 型に素直にマップする serde 表現が\nなく、utoipa の untagged enum サポートも弱いため、検証はハンドラ内で行う。",
+        "properties": {
+          "v": {
+            "description": "書き込む工学値。数値タグには数値、bit タグには真偽値、string タグ\nには文字列（T20 ①a）。（2026-08-06〜: 型が data_type と一致しない\n場合は 422 `unsupported_value_type` - 暗黙の型変換はしない）。",
+            "example": 1,
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "v"
+        ],
+        "type": "object"
+      },
+      "WriteValueResponse": {
+        "description": "`POST /api/v1/values/{tag}` の成功応答（設計 §6 実装指示 §5「応答\n`{ \"tag\", \"result\": \"ok\" }`」）。gRPC の `WriteValueResponse`\n（`crate::grpc`）も同じ2フィールドの型付き版。",
+        "properties": {
+          "result": {
+            "type": "string"
+          },
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "result"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。",
+    "license": {
+      "identifier": "MIT",
+      "name": "MIT"
+    },
+    "title": "banto-hub タグ空間 API",
+    "version": "v1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/events": {
+      "get": {
+        "operationId": "v1_events",
+        "parameters": [
+          {
+            "description": "範囲の下限（epoch ms、既定 0）",
+            "in": "query",
+            "name": "from_ms",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "範囲の上限（epoch ms、既定は無制限）",
+            "in": "query",
+            "name": "to_ms",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "最大件数（既定 100、1〜1000 にクランプ）",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsResponse"
+                }
+              }
+            },
+            "description": "collect_events の範囲クエリ結果"
+          }
+        },
+        "summary": "`GET /api/v1/events` - range query over `collect_events`, newest first,\ndefault `limit` 100 (clamped to a sane range so a misbehaving client\ncannot force an unbounded scan).",
+        "tags": [
+          "tag-space"
+        ]
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "operationId": "v1_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            },
+            "description": "サーバー状態"
+          }
+        },
+        "summary": "`GET /api/v1/status` ハンドラ本体 - [`compute_status`]をそのまま JSON へ\n包むだけ。ロジックは`compute_status`側にあり、ここでは wire 形式\n（snake_case、機械クライアント向け）を選ぶだけ - 管理系の\n[`admin_status`]はカラムは同じ`compute_status`を呼び、camelCase の\n[`AdminStatusResponse`]へ包み直す（二重管理を避けるための分離）。",
+        "tags": [
+          "tag-space"
+        ]
+      }
+    },
+    "/api/v1/tags": {
+      "get": {
+        "operationId": "v1_tags",
+        "parameters": [
+          {
+            "description": "接続名で絞り込む",
+            "in": "query",
+            "name": "connection",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "収集グループ名で絞り込む",
+            "in": "query",
+            "name": "group",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            },
+            "description": "catalog スナップショット"
+          }
+        },
+        "summary": "`GET /api/v1/tags` ハンドラ本体 - catalog: `{ \"revision\", \"run_id\",\n\"collection_mode\", \"tags\": [CatalogTagEntry...] }`,\noptionally filtered by `?connection=`/`?group=` (matched against the\nentry's connection/group *name*, design §5.1's route table). API-key\nrequests see exactly the same tags as session/admin requests（2026-09-14\nオーナー決定 #335、[`build_catalog_response`]のdoc comment参照）。\nロジックは[`build_catalog_response`]側にあり、ここでは`ctx`を受け取る\nだけ（catalog は API キー・セッションの別を判定しない） - 管理系の\n[`admin_tag_catalog`]も同じ関数を呼ぶ（二重管理を避けるための分離、\n`compute_status`/[`v1_status`]と同じ構成）。",
+        "tags": [
+          "tag-space"
+        ]
+      }
+    },
+    "/api/v1/values": {
+      "get": {
+        "description": "An unknown name in `?tags=` is a `400` enumerating every unresolved name\n(design instructions: 「未知の名前が混ざったら...部分成功で誤解させない」),\nnever a per-row `bad`/`unknown_tag` - the request as a whole is rejected\nso the caller cannot mistake \"misspelled tag\" for \"tag exists but is\ncurrently bad\". (This error body stays a raw `serde_json::Value` - only\nthe *successful* `/api/v1/*` bodies were in scope for the T0-2 typed-struct\nconversion.)\n\nH10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S4): API キー起因\nの読み取り(`ctx` あり)だけがタグ単位スコープで絞られる。`?tags=`\n省略(暗黙の全件)はスコープ外を**黙って除いた**集合を返す(「聞いても\nいないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら\n[`v1_value_single`] と同じ**403**(存在は catalog 経由で既知なので\n404 ではない)。セッション token(`ctx` 無し)は従来どおり全件(管理 UI\n不変)。2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と\n勘違いしていた」）: simulation / derived_simulation / computed をタグ\n単位で除外することはもう無く、run が AllSimulation 中でも無条件で\n値を返す - 外部への**読み取り**出力（REST/WS/gRPC/MQTT）はシミュレー\nションでゲートしない。呼び出し側は`value_source`/`collectionMode`で\n判別する。旧 T15-3 の`test_output`opt-in 機構は #362 で撤去済み\n（`docs/tag-server-design.md` §6.3参照）。",
+        "operationId": "v1_values",
+        "parameters": [
+          {
+            "description": "カンマ区切りの外部名。省略時は全タグ",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValuesResponse"
+                }
+              }
+            },
+            "description": "現在値スナップショット"
+          },
+          "400": {
+            "description": "?tags= に未知の外部名が含まれる"
+          },
+          "403": {
+            "description": "?tags= に per-tag read スコープ外の外部名が含まれる(API キー、H10 ③)"
+          }
+        },
+        "summary": "`GET /api/v1/values` - full or partial (`?tags=a,b,c`) snapshot.",
+        "tags": [
+          "tag-space"
+        ]
+      }
+    },
+    "/api/v1/values/batch": {
+      "post": {
+        "description": "事前段(a): セッション token では書けない([`v1_write_value`]と同じ)。\n事前段(b): **各エントリの** `write:{tag}` スコープを検査する - 1件でも\nスコープ不足なら(事前ゲート all-or-nothing の思想を認証にも適用)\n**全体を拒否**して 403 `missing_write_scope` を返し、1件も書かない\n(`crate::write_path::execute_write_batch` へは進まない)。\n\nスコープを通過した後は、`v` の正規化(単票と同じ\n[`parse_requested_value`])を済ませ、ゲート1〜8の本体をまるごと\n`crate::write_path::execute_write_batch` へ委譲する。",
+        "operationId": "v1_write_values_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchWriteValueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchWriteValuesResponse"
+                }
+              }
+            },
+            "description": "常に200 - per-entry の ok/error は writes[] を参照"
+          },
+          "403": {
+            "description": "missing_write_scope（1件でもスコープ不足）/ session_token_cannot_write"
+          }
+        },
+        "summary": "`POST /api/v1/values/batch` - レシピ一括書き込み（T20-3a）。",
+        "tags": [
+          "tag-space"
+        ]
+      }
+    },
+    "/api/v1/values/{tag}": {
+      "get": {
+        "description": "H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S3): タグは\ncatalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404\nではなく**403**(`forbidden_response`)。API キー起因の読み取り\n(`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は\n従来どおり全アクセス(管理 UI 不変)。2026-09-15 オーナー決定（#335 追補）:\nsimulation / derived_simulation / computed をタグ単位で隠すことはもう\n無く、run が AllSimulation 中でも無条件で値を返す（外部への読み取り\n出力はシミュレーションでゲートしない - `value_source`で判別させる）。",
+        "operationId": "v1_value_single",
+        "parameters": [
+          {
+            "description": "外部名 {connection}.{group}.{tag}",
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SingleValueResponse"
+                }
+              }
+            },
+            "description": "単一タグの現在値"
+          },
+          "403": {
+            "description": "per-tag read スコープ外(API キー、H10 ③)"
+          },
+          "404": {
+            "description": "catalog に存在しない外部名"
+          }
+        },
+        "summary": "`GET /api/v1/values/{tag}` - single tag. `404` only when the external\nname is not in the catalog at all (design: 「404 になるのは定義が存在\nしない外部名のみ」) - an undefined-but-uncollected tag is `200` with\n`q: \"bad\"`.",
+        "tags": [
+          "tag-space"
+        ]
+      },
+      "post": {
+        "description": "このハンドラ自身が担うのは REST 固有の前段だけ:\n\n事前段(番号なし、§6-8「認証」): `crate::rest::require_tag_space_auth`\nを通過した時点で「有効な `bh_` API キー」であることは確定しているが、\nこのハンドラ自身がさらに (a) セッション token では到達できない\n(ミドルウェア側で弾く - `ctx` extension が無ければ 403)、(b)\n`write:{tag}` スコープの完全一致、の2つを検査する。\n\nbody の `v` を [`parse_requested_value`] で工学値へ正規化した後は、\nゲート1〜8の本体(catalog 解決・writable・実効 enabled・プロトコル対応・\n受付トグル・レート制限・値変換・log-before-write)を\n`crate::write_path::execute_write` へそのまま委譲する(T4、実装指示\n「二重実装は絶対に不可」) - 結果を [`write_rejection_response`] で\nHTTP ステータス + JSON へ変換するだけ。ゲートの詳細な番号・意味論は\n`crate::write_path::execute_write` の doc comment を参照。",
+        "operationId": "v1_write_value",
+        "parameters": [
+          {
+            "description": "外部名 {connection}.{group}.{tag}",
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteValueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteValueResponse"
+                }
+              }
+            },
+            "description": "書き込み成功"
+          },
+          "403": {
+            "description": "not_writable / missing_write_scope / session_token_cannot_write / key_tripped"
+          },
+          "404": {
+            "description": "catalog に存在しない外部名"
+          },
+          "409": {
+            "description": "tag_disabled"
+          },
+          "422": {
+            "description": "unsupported_value_type / value_out_of_range"
+          },
+          "429": {
+            "description": "rate_limited"
+          },
+          "501": {
+            "description": "write_unsupported_protocol"
+          },
+          "502": {
+            "description": "write_failed"
+          },
+          "503": {
+            "description": "writes_disabled / collection_not_running"
+          }
+        },
+        "summary": "`POST /api/v1/values/{tag}` - 書き込み(設計 §5.1・§6 全体)。",
+        "tags": [
+          "tag-space"
+        ]
+      }
+    },
+    "/api/v1/values/{tag}/read-now": {
+      "get": {
+        "description": "認証は [`v1_value_single`]と同じ read ルート規律(`ctx.has_any_read()`\nはミドルウェア`require_tag_space_auth`、per-tag `ctx.can_read_value(tag)`\nはこのハンドラ自身)。エラーマッピングの詳細は\n[`crate::read_path::execute_read_now`]/[`read_now_rejection_response`]\n参照。2026-09-15 オーナー決定（#335 追補）: タグ単位の simulation /\nderived_simulation / computed 除外も、run 単位の AllSimulation ゲートも\n撤去済み - 外部への読み取り出力はシミュレーションで一切ゲートしない。",
+        "operationId": "v1_value_read_now",
+        "parameters": [
+          {
+            "description": "外部名 {connection}.{group}.{tag}",
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadNowResponse"
+                }
+              }
+            },
+            "description": "その場読みの結果(v は数値・真偽値・文字列のいずれか)"
+          },
+          "403": {
+            "description": "per-tag read スコープ外(API キー、H10 ③と同じ規律)"
+          },
+          "404": {
+            "description": "catalog に存在しない外部名"
+          },
+          "422": {
+            "description": "internal/computed タグ(PLC 接続を持たない)、またはアドレス不正"
+          },
+          "501": {
+            "description": "接続のプロトコルに broker ドライバが未対応"
+          },
+          "502": {
+            "description": "PLC からの読み取りに失敗"
+          },
+          "503": {
+            "description": "収集セッションが無い(新規にはダイヤルしない)"
+          }
+        },
+        "summary": "`GET /api/v1/values/{tag}/read-now` - T20 ①b(案A、\ndocs/banto-hub-t20-design.md §3.1「その場読み」)。`GET\n/api/v1/values/{tag}`(cache 読み、[`v1_value_single`]、\ncurrent_values/tstore 経由)とは別経路 - **この経路は毎回 PLC から直接\n読み、収集キャッシュ(current_values/tstore)には一切触れない**\n(`crate::read_path`のモジュール doc comment参照)。収集パイプラインから\n意図的に除外されている文字列タグを読める唯一の GET エンドポイント。",
+        "tags": [
+          "tag-space"
+        ]
+      }
+    }
+  }
+}

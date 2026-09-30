@@ -145,7 +145,7 @@ base64 = "0.23"
 # クライアントとの互換性契約(§4.1)であるため、コードとスキーマを単一
 # ソース化する。axum 統合は使わず(パラメータは `#[utoipa::path]` に手で
 # 記述する)最小構成で導入 - `apps/banto-hub/core` のみが使う。
-utoipa = "5"
+utoipa = "6"
 # ux-plan.md §5 バックログ「OpenAPI の Swagger UI 同梱」（2026-08-12 オーナー
 # 決定）: `/api/v1/openapi.json`（上の utoipa 由来）をブラウザで閲覧・試打
 # できる Swagger UI をバイナリに同梱する。`default-features = false` +
@@ -159,7 +159,12 @@ utoipa = "5"
 # 既存 allow 済みライセンス（MIT/Apache-2.0/Zlib）の範囲内で、deny.toml の
 # 変更は不要だった。実行時ネットワーク依存はゼロ（オフラインで動く要件を
 # 満たす）。`apps/banto-hub/core` のみが使う。
-utoipa-swagger-ui = { version = "9", default-features = false, features = [
+# 2026-09-30: utoipa 6 / utoipa-swagger-ui 10 へ同時更新（swagger-ui 10 は utoipa 6 を
+# 要求）。`vendored` feature は継続して有効で変更不要。`ApiDoc::openapi()` の出力は
+# `apps/banto-hub/core/tests/snapshots/openapi.json` のスナップショットテストで
+# 意味的同等性を確認済み（`Option<T>` の oneOf の並び順のみ変化）。zip が 8 系に
+# 上がり、arbitrary/derive_arbitrary は木から消え typed-path が加わった。
+utoipa-swagger-ui = { version = "10", default-features = false, features = [
     "axum",
     "vendored",
 ] }
