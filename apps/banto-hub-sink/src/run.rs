@@ -60,6 +60,10 @@ use crate::values::{normalize_names, Subscription, ValueView};
 /// 購読の生存確認の間隔。
 const HEALTH_TICK: Duration = Duration::from_secs(1);
 
+/// unresolved なタグが残っている間の購読の再計画間隔（設定取得の既定と
+/// 同じ 30 秒相当）。
+const DEFAULT_REPLAN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 停止時に flusher の join を待つ上限（これを超えたら abort - commit 前
 /// なので二重書き込みにはならない）。
 const FLUSHER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -75,6 +79,10 @@ pub struct SidecarOptions {
     pub table_recheck: Duration,
     /// 購読の生存確認の間隔。
     pub health_tick: Duration,
+    /// unresolved なタグが残っている間、catalog を引き直して購読の計画を
+    /// 作り直す間隔（同名で再作成されたタグ・rename 後に設定へ入った新名を
+    /// 拾う）。
+    pub replan_interval: Duration,
 }
 
 impl Default for SidecarOptions {
@@ -82,6 +90,7 @@ impl Default for SidecarOptions {
         Self {
             table_recheck: DEFAULT_TABLE_RECHECK,
             health_tick: HEALTH_TICK,
+            replan_interval: DEFAULT_REPLAN_INTERVAL,
         }
     }
 }
@@ -184,6 +193,8 @@ struct Engine {
     subscription_attempt: u32,
     /// 次に購読を作り直してよい時刻。
     subscription_retry_at: Option<Instant>,
+    /// unresolved が残っている購読を、次に再計画してよい時刻。
+    next_replan_at: Instant,
 }
 
 impl Engine {
@@ -211,6 +222,7 @@ impl Engine {
             status_failing: false,
             subscription_attempt: 0,
             subscription_retry_at: None,
+            next_replan_at: Instant::now(),
         })
     }
 
@@ -407,13 +419,27 @@ impl Engine {
     // --- 購読 ---------------------------------------------------------------
 
     /// 対象タグの和集合を購読し続ける（必要なら作り直す）。
+    ///
+    /// 作り直す条件は 3 つ:
+    ///
+    /// 1. `dead` - SDK の worker が終了した（バックオフあり）。
+    /// 2. `changed` - 購読したい名前の集合が変わった（設定変更）。
+    /// 3. `replan` - SDK が `BindingUnresolved` を報告した、または unresolved
+    ///    が残っていて再計画の時刻（`replan_interval`）を過ぎた。SDK は 1 件
+    ///    でも unresolved だと世代全体を落とすので、Sink が catalog を引いて
+    ///    解決できる名前だけで張り直す（[`crate::values::plan_bindings`]）。
+    ///    バックオフは掛けない。
     async fn ensure_subscription(&mut self) {
         let desired = self.desired_external_names();
+        // replan だけで作り直すときの、前世代の計画（ログの重複抑止用）。
+        let mut previous_plan: Option<(Vec<String>, Vec<String>)> = None;
 
         if let Some(subscription) = &self.subscription {
             let dead = subscription.is_dead();
-            let changed = subscription.subscribed() != desired.as_slice();
-            if !dead && !changed {
+            let changed = subscription.desired() != desired.as_slice();
+            let replan = subscription.needs_replan()
+                || (!subscription.unresolved().is_empty() && Instant::now() >= self.next_replan_at);
+            if !dead && !changed && !replan {
                 if self.view_rx.borrow().live {
                     // 一度でも Live になったら、次の障害は 1 秒から
                     // やり直す（`banto_tagclient` の RetryTracker と同じ
@@ -421,6 +447,12 @@ impl Engine {
                     self.subscription_attempt = 0;
                 }
                 return;
+            }
+            if !dead && !changed {
+                previous_plan = Some((
+                    subscription.resolved().to_vec(),
+                    subscription.unresolved().to_vec(),
+                ));
             }
             if let Some(subscription) = self.subscription.take() {
                 subscription.stop().await;
@@ -447,15 +479,21 @@ impl Engine {
             }
         }
         self.subscription_retry_at = None;
-        match Subscription::start(&self.config, desired, self.view_tx.clone()) {
+        match Subscription::start(&self.config, desired, self.view_tx.clone()).await {
             Ok(subscription) => {
-                if subscription.is_some() {
-                    log_line(&format!(
-                        "banto-hub-sink: Hub の購読を開始しました（{} タグ）",
-                        self.subscribed_len()
-                    ));
-                }
+                self.next_replan_at = Instant::now() + self.options.replan_interval;
                 self.subscription = subscription;
+                if let Some(subscription) = &self.subscription {
+                    let plan = (
+                        subscription.resolved().to_vec(),
+                        subscription.unresolved().to_vec(),
+                    );
+                    // 周期的な再計画で結果が変わらなかったときは黙る
+                    // （unresolved が残る間 30 秒ごとにログが出続けない）。
+                    if previous_plan.as_ref() != Some(&plan) {
+                        log_line(&subscribed_message(self.subscribed_len(), &plan.1));
+                    }
+                }
             }
             Err(err) => {
                 self.subscription_attempt = self.subscription_attempt.saturating_add(1);
@@ -469,8 +507,11 @@ impl Engine {
         }
     }
 
+    /// 実際に SDK へ渡している（catalog で解決できた）タグ数。
     fn subscribed_len(&self) -> usize {
-        self.desired_external_names().len()
+        self.subscription
+            .as_ref()
+            .map_or(0, |subscription| subscription.resolved().len())
     }
 
     /// 全 sink group の対象タグの和集合（`external_name`、重複除去・ソート済み）。
@@ -656,6 +697,33 @@ where
     Ok(())
 }
 
+/// 未解決の名前を何件までログへ列挙するか。
+const UNRESOLVED_LOG_LIMIT: usize = 5;
+
+/// 購読開始ログの本文。未解決が 0 なら「N タグ」だけ、あれば名前を
+/// [`UNRESOLVED_LOG_LIMIT`] 件まで列挙し、超えた分は「ほか N 件」。
+fn subscribed_message(resolved_len: usize, unresolved: &[String]) -> String {
+    if unresolved.is_empty() {
+        return format!("banto-hub-sink: Hub の購読を開始しました（{resolved_len} タグ）");
+    }
+    let mut names = unresolved
+        .iter()
+        .take(UNRESOLVED_LOG_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unresolved.len() > UNRESOLVED_LOG_LIMIT {
+        names.push_str(&format!(
+            "、ほか {} 件",
+            unresolved.len() - UNRESOLVED_LOG_LIMIT
+        ));
+    }
+    format!(
+        "banto-hub-sink: Hub の購読を開始しました（{resolved_len} タグ。未解決 {}: {names}）",
+        unresolved.len()
+    )
+}
+
 /// 次の設定取得までの間隔。成功したら既定の間隔、失敗中は指数バック
 /// オフ（ただし既定の間隔は超えない - Hub が復帰したときに 30 秒以上
 /// 待たされないため）。
@@ -669,6 +737,24 @@ fn next_config_delay(ok: bool, config_refresh: Duration, attempt: u32) -> Durati
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscribed_message_lists_up_to_five_unresolved_names() {
+        assert_eq!(
+            subscribed_message(3, &[]),
+            "banto-hub-sink: Hub の購読を開始しました（3 タグ）"
+        );
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|n| (*n).to_owned()).collect();
+        assert_eq!(
+            subscribed_message(97, &names),
+            "banto-hub-sink: Hub の購読を開始しました（97 タグ。未解決 3: a, b, c）"
+        );
+        let many: Vec<String> = (1..=7).map(|n| format!("t{n}")).collect();
+        assert_eq!(
+            subscribed_message(0, &many),
+            "banto-hub-sink: Hub の購読を開始しました（0 タグ。未解決 7: t1, t2, t3, t4, t5、ほか 2 件）"
+        );
+    }
+
     use super::*;
     use crate::hub_api::SinkConfigTag;
 

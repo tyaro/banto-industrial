@@ -207,7 +207,7 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 - サービス起動順は Hub → sink。sink は Hub 未起動なら SDK のバックオフで待ち、Hub の再起動（`config_changed` / 切断）にも SDK の再解決・再購読で追従する。
 - 停止時は残キューを最大 5 秒だけ flush して諦める（残りは `dropped` に計上して `warn`）。
 - 設定は exe 隣の `banto-hub-sink.toml`（Hub の URL と `admin` + `read` の API キー、hanger-finder と同じ置き方。環境変数 `BANTO_HUB_SINK_CONFIG` でパスを上書き可）。任意項目と既定値（S5 実装、2026-09-06）: `config_refresh_secs` 30（5〜3600）、`status_push_secs` 5（1〜**14**。Hub 側の 15 秒 `unknown` 判定より必ず短くする）、`queue_max_rows` 10,000、`flush_interval_ms` 1,000、`batch_size` 500、`shutdown_flush_secs` 5。未知のキーは拒否。それ以外の設定はすべて Hub 側。
-- **既知の制限（v1、2026-09-06）**: タグを rename すると、サイドカーが次に設定を取り直すまで（最大 `config_refresh_secs`）その タグの行が欠ける。購読の鍵が `external_name` だからで（2026-09-30 オーナー決定、[scada-design.md](scada-design.md) §9.6。旧名は catalog に無くなり unresolved、次の設定取得で新しい名前が来ると購読が張り直されて復帰する。タグの rename は破壊的変更、tag-server-design.md §4.1）、削除→同名再作成は名前が同じなので SDK が自動で解決する。
+- **既知の制限（v1、2026-09-06）**: タグを rename すると、サイドカーが次に設定を取り直すまで（最大 `config_refresh_secs`）その タグの行が欠ける。購読の鍵が `external_name` だからで（2026-09-30 オーナー決定、[scada-design.md](scada-design.md) §9.6。旧名は catalog に無くなり unresolved、次の設定取得で新しい名前が来ると購読が張り直されて復帰する。タグの rename は破壊的変更、tag-server-design.md §4.1）、削除→同名再作成は名前が同じなので SDK が自動で解決する。**2026-09-30（PR #473 レビュー対応）**: SDK は 1 件でも unresolved があると世代全体を落とすため、Sink は catalog を引いて解決できる名前だけで購読する（ChronoGazer の `plan_bindings` と同じ）。rename されたタグ以外の記録は続き、unresolved の名前は周期的（既定 30 秒）に catalog を引き直して同名再作成・新名で復帰する。上の「その タグの行が欠ける」は rename されたタグ自身に限る。
 - 実装は `apps/banto-hub-sink`（lib + bin、release 約 6.2 MiB、新規依存なし）。Windows サービス名 `BantoHubSink`（`install` / `uninstall` / `run-service` は banto-hub と同型）。
 
 ## 6. オーナー決定項目（2026-09-06 決定済み）
