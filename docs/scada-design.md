@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（レビュー反映: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみと決定（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-09-30（SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -164,7 +164,7 @@ Optional / future domains
   DB tabular resource
   always-on Event / Action
        |
-       +-- host process / ownership は個別に議論
+       +-- host は SCADA server core（§13.2、2026-09-30 決定）。Hub には置かない
 ```
 
 Hub を integration boundary として使うことと、
@@ -882,7 +882,7 @@ Hub との wire は既に名前（WS subscribe、`POST /api/v1/values/{tag}`）�
 - LaunchProgram
 - ExecuteDbCommand
 
-### 10.3 execution target（議論中）
+### 10.3 execution target（2026-09-30 オーナー決定）
 
 UI に閉じた Action は SCADA Runtime で実行する。
 
@@ -895,8 +895,8 @@ Local / UI
   operator initiated WriteTag
 ```
 
-一方、次のような「UI が閉じていても常時成立させたい Event / Action」を
-どこへ置くかは**未決**とする。
+次のような「UI が閉じていても常時成立させたい Event / Action」は
+**SCADA server core（§13.2）が担う**。Hub には置かない。
 
 - value edge 起点の処理
 - alarm 起点の外部通知
@@ -904,12 +904,13 @@ Local / UI
 - timer
 - server-side HTTP / DB command
 
-候補:
+検討した候補と判断:
 
-1. banto-hub に Server Action/Event 機能を持たせる
-2. SCADA Runtime を常駐実行主体として扱う
-3. 独立した automation / event service を設ける
-4. 対象機能ごとの既存 domain service に委ねる
+1. banto-hub に Server Action/Event 機能を持たせる → 採らない（Hub の責務を増やす）
+2. SCADA Runtime（UI プロセス）を常駐実行主体として扱う → 採らない（寿命が UI と同じ）
+3. 独立した automation / event service を設ける → **採用**。SCADA server core として、recorder・Alarm engine と
+   同じライブラリに置き、host は埋め込み / headless / Windows サービスの 3 通り（§13.2）
+4. 対象機能ごとの既存 domain service に委ねる → 採らない（分散すると運用が増える）
 
 **Hub に余計な責務を増やさないことを重要な評価軸**とし、
 「常時実行だから Hub に入れる」とは自動的に決めない。
@@ -920,8 +921,8 @@ Local / UI
 定義すれば「Hub に責務を増やさない」軸と両立する。候補 2（SCADA Runtime 常駐）は、同決定で
 退けられた「寿命が UI と同じ」問題を再び踏む。
 
-この論点が決まるまで、Core v1 の Event は click / double click / screen open/close 等の
-UI Event を中心に扱い、常時実行 Event の配置は後続設計とする。
+Core v1 の Event は click / double click / screen open/close 等の UI Event を中心に扱い、
+常時実行 Event をどこまで v1 に含めるかは §22 の #8（Core v1 の範囲）で決める。
 
 ### 10.4 External Program
 
@@ -1105,8 +1106,8 @@ Alarm state machine は独立 crate 候補:
 crates/banto-alarm
 ```
 
-どの process にホストするかは Event/Server responsibility（§10.3）と合わせて議論する。
-Alarm domain の汎用性と host process の選択を分離する。
+host は **SCADA server core（§13.2、2026-09-30 決定）**。Alarm domain の汎用性（crate）と
+host process の選択（§13.2 の 3 通り）は分離したままにする。
 
 ---
 
@@ -1214,7 +1215,7 @@ Tracking anomaly は banto-alarm へ接続する。
 
 ---
 
-## 13. Historian / Trend（2026-09-30 オーナー決定: ChronoGazer と共有）
+## 13. Historian / Trend と SCADA server（2026-09-30 オーナー決定: ChronoGazer と共有）
 
 ChronoGazer は記録計の単体商品として残す。banto-scada はトレンド機能を含む製品なので、
 記録・トレンドの資産の大部分を ChronoGazer と共有する。
@@ -1266,28 +1267,77 @@ Historical Trend を成立させる。
 - 商品の線引きが明快。ChronoGazer = 記録計単体、SCADA = 画面 + 記録計 core の同梱
 
 ただし次を満たさないと「寿命が UI と同じ」問題（2026-09-06 の Sink 決定で退けた構造）を SCADA に持ち込む。
+成立のさせ方は §13.2 で決めた。
 
-1. **記録は UI プロセスで行わない。** SCADA 同梱の recorder は `banto-serve` 相当のサービスとして動かし、
-   SCADA Runtime はその HTTP API を読む。SCADA Runtime が tstore ファイルを直接読む方式にはしない
+1. **記録は UI の中身と混ぜない。** recorder は SCADA server core（§13.2）に置き、SCADA の画面は
+   その API を読む。画面が tstore ファイルを直接読む方式にはしない。v1 の埋め込み起動（§13.2 host 1）は
+   同じプロセスに同居するが、ライブラリ境界は守る
 2. **現場の recorder は 1 つ。** 操作卓と事務所閲覧など SCADA client が複数ある現場で client ごとに記録すると、
-   履歴が重複し欠測もばらつく。recorder を現場単位の共有サービスとし、既存の ChronoGazer がある現場では
-   それをそのまま recorder として使えることを目標にする
-3. **履歴読み出し API は ChronoGazer core の REST に置く。** 現状の core REST には履歴読み出し
-   （I4 `read_decimated`）の endpoint が無い（R1-D 未着手）。ChronoGazer の LAN ブラウザ表示にも同じ
-   endpoint が要るので、SCADA 向けに別物を作らず R1-D で共通化する。「History API は要る。ただし所有者は
-   Hub ではなく recorder」が正確な言い方になる
-4. **記録対象タグの所有者を決める。** recorder の購読タグは `PUT /api/hub/selected-tags`（admin）で設定する。
-   SCADA Project の trend group が記録対象を決めるなら、Editor から recorder へ selected-tags を同期する
-   Design operation が要る（§9.3 の rename と同じ協調更新の型）
+   履歴が重複し欠測もばらつく。この現場は Windows サービス host（§13.2 host 3）を使い、client は接続する。
+   既存の ChronoGazer をそのまま recorder に流用することは要件にしない（共有は crate 単位）
+3. **履歴読み出し API は SCADA server core に置く。** 実装は ChronoGazer core の REST（I4 `read_decimated`、
+   R1-D 未着手）と共有 crate 化して二重実装を避ける。「History API は要る。ただし所有者は Hub ではなく
+   recorder」が正確な言い方になる
+4. **記録対象タグの所有者は SCADA Project。** server core は配布された Project の trend group を読んで購読する。
+   Editor から recorder へ selected-tags を同期する仕組みは作らない（§13.2）
 5. **キーの整合。** Hub 経由ドライバは Hub の `external_name` でタグを引く（`core/src/hub.rs`）ので、
    tstore の `tag_key` もこれに揃え、SCADA Binding（§9）と同じ語彙で履歴を引けるようにする。§9.6 の決定どおり
    履歴のキーも名前とする
 
 未決（§22 へ）:
 
-- SCADA の記録プロセスの寿命。UI 同居（ChronoGazer と同型）か、記録サービスとして分離するか（§13.1 はサービス分離を推奨）
 - 共有 UI の切り出し方。pnpm workspace は現在 `apps/*` のみで共有 package が無い
 - Hub の tstore を SCADA が読む場面を作るか（読まない方針で開始）
+
+### 13.2 SCADA server（常駐処理）の構成（2026-09-30 オーナー決定）
+
+**決定**: 24/365 で動かしたい処理（recorder、Alarm engine、常時実行 Event / Action、履歴・Alarm の
+読み出し API）は、SCADA の画面とは別の **SCADA server core** に置く。Hub には足さない。
+host は banto-hub と同じ 3 層とし、**v1 はアプリへの埋め込み起動で作り、Windows サービス host は後から足す**。
+
+```text
+                banto-hub（現在値 / catalog / write）
+                   ^                        ^
+      ライブ値・書き込み                    購読（recorder / Alarm / Event）
+                   |                        |
+  +----------------+-------+     +----------+------------------------+
+  |  banto-scada 画面      |     |  scada-server core（ライブラリ）    |
+  |  Runtime / Editor      |<--->|  recorder（tstore / tsquery）       |
+  |  画面・操作・Project    | 履歴 |  banto-alarm                       |
+  +------------------------+ Alarm|  常時実行 Event / Action            |
+                            設定  |  履歴 / Alarm / 状態 API            |
+                                 +-----------------------------------+
+                                     host は 3 通り（下記）
+```
+
+banto-hub の型（`HubRuntime` をライブラリとし、コンソール / サービス / デスクトップシェルの 3 つの host
+から呼ぶ。banto-hub-t16-design.md、banto-hub-t17-design.md）をそのまま使う。
+
+- **ライブラリ `scada-server` core**: Tauri にも axum の起動方法にも依存しない。設定・Project・記録ファイルは
+  サービスの実行ユーザーからも読める場所・権限に置く（Hub の profile / port lock の規約を流用）
+- **host 1 = SCADA アプリ本体への埋め込み（v1）**: `banto-scada.exe` を起動すると、サービスが見つからなければ
+  プロセス内で core を起動してそのまま画面を出す。トレイと状態画面もここで持つ。詳しくない人は
+  「アプリを起動すれば全部動く」で済む
+- **host 2 = headless コンソール**: ChronoGazer の `banto-serve` 相当
+- **host 3 = Windows サービス（後続）**: T17 の SCM 登録と `banto-hub-elev` の型を流用した薄い wrapper。
+  アプリはサービスを検出したら自分では起動せず、そこへ接続する（T16-2 と同じ判定）。複数 client の現場、
+  アプリを閉じても記録を続けたい現場向け
+
+規律:
+
+- core を画面プロセスの中身と混ぜない。画面 → core の呼び出しは可、逆は不可
+- 「サービス検出 → 接続、無ければ埋め込み起動」の分岐を v1 から入れる。v1 時点ではサービスが無いので常に
+  埋め込み起動になるが、この分岐があればサービス化のときにアプリ側の変更がほぼ要らない
+- v1 の埋め込み起動は「寿命が UI と同じ」を割り切りとして受容し、文書と UI で案内する。記録を止めたくない
+  現場はサービス化する
+
+これで決まること:
+
+- §22 #7 常時実行 Event / Action の実行主体 = scada-server core（§10.3）
+- §22 #15 記録プロセスの寿命 = v1 は UI 同居（割り切り）、サービス host で分離
+- §22 #17 recorder の配布形態 = SCADA 同梱（core）。ChronoGazer との共有は crate 単位、プロセスは別
+- §22 #18 記録対象タグの所有者 = SCADA Project（§13.1 の 4）
+- §11.6 Alarm engine の host = scada-server core
 
 ---
 
@@ -1554,6 +1604,7 @@ scada-model
 scada-renderer
 scada-editor
 scada-runtime
+scada-server（§13.2。recorder / alarm / 常時実行 Event / API。画面に依存しないライブラリ）
 ```
 
 将来、要求が出た場合に、
@@ -2051,9 +2102,17 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 ### S12 History / Trend（ChronoGazer と共有）
 
 - Hub 経由購読ドライバの共有化（#383 段階1 の切り出し）
-- tstore / tsquery を使う SCADA recorder
+- tstore / tsquery を使う SCADA recorder（scada-server core、§13.2）
+- 履歴読み出し API（ChronoGazer R1-D と共有 crate 化）
 - トレンド UI の共有 package 化
 - Trend widget（Project model、Faceplate からの呼出）
+
+### S12b SCADA server host
+
+- scada-server core のライブラリ境界（画面非依存、設定・Project・記録の置き場所と権限）
+- host 1: アプリ埋め込み起動、トレイ、状態画面、「サービス検出 → 接続、無ければ埋め込み起動」の分岐
+- host 2: headless コンソール
+- host 3: Windows サービス（T17 の SCM 登録・elev の型を流用）。後続
 
 ### S13 DB Table/View（resource model 決定後）
 
@@ -2090,7 +2149,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 4. Screen coordinate の内部単位（normalized / logical pixel の併用方針）
 5. banto-expr を client/runtime でそのまま利用するか
 6. DB tabular resource の domain model（DB Table Tag / Dataset・DB Resource）
-7. 常時実行 Event / Action の実行主体（Hub / SCADA Runtime / 独立 service / domain service）
+7. 常時実行 Event / Action の実行主体 → 2026-09-30 決定済み（§13.2、scada-server core）
 8. Core v1 に含める Extension の範囲
 9. Tracking PLC block の標準 memory layout
 10. Editor/Runtime の executable 分離時期
@@ -2098,16 +2157,15 @@ MCP 自体は roadmap の blocking milestone にしない。
 12. AI change plan の承認を必須にする変更範囲
 13. protocol-specific Alarm adapter の優先順位（MELSEC は汎用 Alarm 後）
 14. Binding identity の方式 → 2026-09-30 決定済み（§9.6、名前のみ。案 C の改名候補提示は必要が出たら拡張）
-15. SCADA 記録プロセスの寿命（UI 同居か記録サービス分離か、§13）
+15. SCADA 記録プロセスの寿命 → 2026-09-30 決定済み（§13.2、v1 は埋め込み起動、サービス host で分離）
 16. ChronoGazer と共有するトレンド UI の package 化の方法（§13）
-17. SCADA 同梱 recorder の配布形態（同梱サービスか、既存 ChronoGazer の流用か。§13.1）
-18. 記録対象タグの所有者（SCADA Project の trend group から recorder へ同期するか、§13.1）
+17. SCADA 同梱 recorder の配布形態 → 2026-09-30 決定済み（§13.2、SCADA 同梱の core。ChronoGazer の流用は要件にしない）
+18. 記録対象タグの所有者 → 2026-09-30 決定済み（§13.1 の 4、SCADA Project）
 
 ---
 
 ## 23. 議論継続中の主要論点
 
-- 常時実行 Event / Action をどの process/domain が担うか。Hub の責務を安易に増やさない
 - Core v1 の完了範囲。§3 の案を叩き台として決定する
 - DB Table/View の表現を DB Table Tag とするか、独立 Dataset / DB Resource とするか
 - protocol-specific PLC Alarm adapter の順序・契約。MELSEC 対応は汎用 Alarm model 後
@@ -2134,6 +2192,8 @@ MCP 自体は roadmap の blocking milestone にしない。
 - 初期 Alarm は protocol 非依存とし、MELSEC 固有の Alarm ingest は後続 adapter とする
 - 搬送 Tracking は独立 domain。PLC authoritative
 - Historian / Trend は Hub History API ではなく ChronoGazer と共有する記録・トレンド資産で実現し、Hub は履歴を持たない（2026-09-30 オーナー決定、§13）
+- 24/365 の処理（recorder、Alarm engine、常時実行 Event / Action、履歴・Alarm API）は画面と別の scada-server core に置き、Hub には足さない。host は埋め込み / headless / Windows サービスの 3 層で、v1 は埋め込み起動、サービス host は後続（2026-09-30 オーナー決定、§13.2）
+- 記録対象タグの所有者は SCADA Project。server core は配布された Project を読む（2026-09-30 オーナー決定、§13.1）
 - SCADA の DB Table/View アクセスは Hub を接続境界とするが、DB Table Tag / Dataset のどちらで表現するかは未決
 - Recipe / 実績は DB Resource + Action/Command を再利用する
 - Project Import/Export は projectId / projectRevision / schemaVersion を持つ
