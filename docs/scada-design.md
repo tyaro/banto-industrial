@@ -2133,6 +2133,8 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - external_name binding
 - quality / unresolved
 - reconnect / rebinding
+- live tag source を抽象化し、Runtime は具体的な banto-tagclient に直接依存しない（Replay driver を同じ
+  受け口で受けるための境界。§13.3 の前提条件 4。v1 は境界だけで、driver 本体は将来）
 
 ### S4 Project Package
 
@@ -2182,14 +2184,13 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - Faceplate / Dialog
 - View Stack
 
-### S9 Action Engine
+### S9 Action Engine（v1 の基本 Action。§3）
 
 - Navigate
 - Dialog
 - PLC Write
-- external API
-- external program
 - audit
+- workflow は単純 sequence + success/failure まで（§3「初版で限定する項目」）
 
 ### S9b scada-server core + host 1（v1 の基盤。S10 / S12 の前提）
 
@@ -2230,6 +2231,12 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 
 - host 2: headless コンソール
 - host 3: Windows サービス（T17 の SCM 登録・elev の型を流用）
+
+### S9c HTTP Action / External Program（後続 Extension。§3）
+
+- external API（HTTP Action）
+- external program
+- 高度な Event / Action flow
 
 ### S13 DB Table/View（Dataset、Hub 側の API 設計後）
 
