@@ -122,6 +122,10 @@ Editor が無くても手書き Project から Runtime が成立する境界を�
 
 ## 2. 全体アーキテクチャ
 
+SCADA は Hub を PLC / DB 等への接続境界として利用する。
+ただし Alarm / Tracking / automation 等の追加 domain を
+**すべて banto-hub 本体へ実装することは現時点では決定しない**。
+
 ```text
 PLC / field devices
         |
@@ -129,33 +133,42 @@ PLC / field devices
 +----------------------------+
 |         banto-hub          |
 |                            |
-| Tag Space                  |
-| Historian                  |
-| Alarm Engine               |
-| Tracking ingest/state      |
-| DB resources               |
-| Write / Audit              |
-| Server Actions             |
+| Tag Space / Catalog        |
+| PLC Read / Write           |
+| Auth / Write Audit         |
+| existing DB source/sink IF |
 +-------------+--------------+
               |
       REST / WS / future IF
               |
               v
-      banto-tagclient
+      Hub client layer
               |
               v
 +----------------------------+
 |        banto-scada         |
 |                            |
 | Screen Runtime             |
-| Alarm Viewer               |
-| Trend Viewer               |
-| Tracking Viewer            |
+| Trend / Alarm UI           |
+| Tracking UI                |
 | DataGrid / Form            |
-| Event / Action Engine      |
+| UI Event / Action          |
 | Project Editor             |
 +----------------------------+
+
+Optional / future domains
+  Alarm domain
+  Tracking domain
+  History API
+  DB tabular resource
+  always-on Event / Action
+       |
+       +-- host process / ownership は個別に議論
 ```
+
+Hub を integration boundary として使うことと、
+全 domain の実行主体を Hub process に集約することは同義ではない。
+追加機能は独立 crate / service を選択できる境界を維持する。
 
 ---
 
@@ -1309,7 +1322,10 @@ Tracking ID を中心に、
 
 ## 16. Security / Audit
 
-以下を共通の Operator Action Audit 対象とする。
+Action は成功時だけでなく、**実行前検証で拒否した失敗も記録対象**とする。
+「要求されたが安全に実行しなかった」ことを追跡できること。
+
+以下を共通の Operator Action Audit / execution record 対象とする。
 
 - PLC write
 - Alarm ACK / Shelve
@@ -1327,7 +1343,8 @@ Audit 候補:
 - object
 - action id
 - target
-- result
+- result / failure code
+- failure detail
 - duration
 - tracking id
 - equipment id
