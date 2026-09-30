@@ -1363,7 +1363,7 @@ banto-hub の型（`HubRuntime` をライブラリとし、コンソール / サ
 - **冗長化の方針（2026-09-30 オーナー方針、詳細は別設計）**: 冗長化は **PLC（ドライバ層）、Hub、SCADA server
   の 3 層で独立に扱う**。PLC の冗長系（系 A / 系 B）は `banto-plc` / `banto-collect` の接続層が複数
   endpoint と切替で隠し、Hub から見える接続とタグの外部名は変えない。Hub と SCADA server の冗長化は
-  一つの設計草案（`docs/banto-hub-redundancy-design.md`、未作成）に起こし、原則は両者とも
+  一つの設計草案（[banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成）に起こし、原則は両者とも
   **「読み取りと評価は全台、副作用は 1 台」**とする。recorder と Alarm 評価は台数無制限の Active/Active
   （履歴は読み出し時に統合、Alarm は操作者状態のイベントだけ複製）、常時実行 Action・MQTT publish・
   Sink の DB 書き込みのような副作用は**リースの抽象**で 1 台に限定し、リースの実装は後で選ぶ。
@@ -2302,7 +2302,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 16. ChronoGazer と共有するトレンド UI の package 化の方法（§13）
 17. SCADA 同梱 recorder の配布形態 → 2026-09-30 決定済み（§13.2、SCADA 同梱の core。ChronoGazer の流用は要件にしない）
 18. 記録対象タグの所有者 → 2026-09-30 決定済み（§13.1 の 4、SCADA Project）
-19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 `docs/banto-hub-redundancy-design.md`）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
+19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ち 10 件）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
 
