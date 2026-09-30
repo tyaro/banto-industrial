@@ -937,8 +937,10 @@ Local / UI
 定義すれば「Hub に責務を増やさない」軸と両立する。候補 2（SCADA Runtime 常駐）は、同決定で
 退けられた「寿命が UI と同じ」問題を再び踏む。
 
-Core v1 の Event は click / double click / screen open/close 等の UI Event を中心に扱い、
-常時実行 Event / Action は v1.1（§3、2026-09-30 決定）。
+Core v1 の Event は click / double click / screen open/close 等の UI Event を中心に扱う。
+v1.1 では value edge / alarm / timer を起点とする基本的な常時実行 Event / Action を実装する（§3、
+2026-09-30 決定。§21 S10b）。tracking 起点の処理、server-side HTTP / DB command は §3 の後続 Extension
+（§21 S11 / S9c）とする。
 
 ### 10.4 External Program
 
