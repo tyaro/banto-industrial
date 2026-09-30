@@ -2191,7 +2191,15 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - external program
 - audit
 
-### S10 Alarm（汎用）
+### S9b scada-server core + host 1（v1 の基盤。S10 / S12 の前提）
+
+- scada-server core のライブラリ境界（画面非依存、設定・Project・記録の置き場所と権限、§13.2）
+- 起動モードの区別: ローカルモード（サービス検出 → 接続、無ければ埋め込み起動。T16-2 の判定）と
+  共有サービス接続モード（埋め込み起動しない）
+- host 1: アプリ埋め込み起動、トレイ、状態画面。v1 時点では core の中身は空でよい
+- Replay の前提となる Project schema（記録対象の範囲、名前履歴。§13.3）
+
+### S10 Alarm（汎用、v1.1。host は S9b の scada-server core）
 
 - banto-alarm
 - generic AlarmDefinition / AlarmState / AlarmEvent
@@ -2209,20 +2217,19 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - event FIFO/sequence
 - SCADA tracking presentation
 
-### S12 History / Trend（ChronoGazer と共有）
+### S12 History / Trend（ChronoGazer と共有、v1.1。host は S9b の scada-server core）
 
 - Hub 経由購読ドライバの共有化（#383 段階1 の切り出し）
-- tstore / tsquery を使う SCADA recorder（scada-server core、§13.2）
+- tstore / tsquery を使う SCADA recorder（記録対象の範囲の設定を読む。catalog メタデータと
+  Project revision を記録に添える）
 - 履歴読み出し API（ChronoGazer R1-D と共有 crate 化）
 - トレンド UI の共有 package 化
 - Trend widget（Project model、Faceplate からの呼出）
 
-### S12b SCADA server host
+### S12b SCADA server の追加 host（後続）
 
-- scada-server core のライブラリ境界（画面非依存、設定・Project・記録の置き場所と権限）
-- host 1: アプリ埋め込み起動、トレイ、状態画面、「サービス検出 → 接続、無ければ埋め込み起動」の分岐
 - host 2: headless コンソール
-- host 3: Windows サービス（T17 の SCM 登録・elev の型を流用）。後続
+- host 3: Windows サービス（T17 の SCM 登録・elev の型を流用）
 
 ### S13 DB Table/View（Dataset、Hub 側の API 設計後）
 
