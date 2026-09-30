@@ -445,10 +445,10 @@ Motor01
   type = Motor
 
 bindings
-  running -> StableTagId(...)
-  fault   -> StableTagId(...)
-  command -> StableTagId(...)
-  speed   -> StableTagId(...)
+  running -> PLC01.Fast.Motor01.Run
+  fault   -> PLC01.Fast.Motor01.Fault
+  command -> PLC01.Fast.Motor01.Command
+  speed   -> PLC01.Slow.Motor01.Speed
 ```
 
 Symbol と Faceplate に個別に tag を再設定せず、
@@ -611,38 +611,99 @@ Publish/Deploy 前の validation で warning/error をまとめて表示する�
 
 ## 9. Binding Engine
 
-### 9.1 StableTagId
+### 9.1 永続 Binding ID は `external_name`
 
-通常の画面 Binding は Hub の stable ID を保存する。
+SCADA Project の永続 Binding は Hub の公開外部名を保存する。
 
 ```text
-connection_id
-group_id
-tag_id
+{connection}.{group}.{tag}
+
+例:
+PLC01.Fast.Motor01.Run
 ```
 
-外部名は表示・再解決支援用 metadata とする。
+この `external_name` は Hub が外部 API / write scope / catalog で利用する公開アドレスであり、
+SCADA Project と Hub の間の Binding 契約として扱う。
 
-### 9.2 Cross-environment import
+SCADA Project は Hub 内部 DB の数値 ID
+（`connection_id` / `group_id` / `tag_id`）を永続 Binding ID として保存しない。
 
-開発 Hub -> 現場 Hub では stable ID が一致しない場合がある。
+### 9.2 Runtime 解決
 
-Project には fallback hint を保持してよい。
+Runtime は Project に保存された `external_name` を Hub catalog へ照合し、
+実行中の内部参照として現在の `StableTagId` を取得してよい。
+
+```text
+Project
+  external_name
+       |
+       v
+Hub catalog
+       |
+       +-- StableTagId
+       +-- data type
+       +-- writable
+       +-- unit
+       |
+       v
+Runtime binding cache
+```
+
+`StableTagId` は Runtime / client SDK 内部の解決・購読・書き込み補助には利用してよいが、
+Project の portable identity にはしない。
+
+これにより Hub の config export/import で内部数値 ID が変わっても、
+`connection.group.tag` が同じなら SCADA Project の Binding は維持できる。
+
+### 9.3 Rename 契約
+
+Hub 上で `connection` / `group` / `tag` の名前を直接変更し、
+`external_name` が変わった場合は **SCADA Binding が unresolved になってよい**。
+外部名の変更を透過的に追従することは要件にしない。
+
+SCADA Editor から名称変更する場合は、単なる文字列編集ではなく
+**意味のある Design operation** として扱う。
 
 例:
 
 ```text
-stableTagId
-hint:
-  externalName
-  dataType
-  unit
+rename_tag
+
+1. 現在の Hub catalog / Project revision を確認
+2. Hub API で対象名を変更
+3. SCADA Project 内の該当参照を更新
+4. Expression / Action 等の構造化参照を更新
+5. validate
+6. Project revision を進める
 ```
 
-自動で別タグへ勝手に binding せず、
-未解決 -> candidate -> user confirmation とする。
+途中失敗時に Hub と Project のどちらが更新済みかを明示し、
+silent mismatch を作らない。可能なら plan / apply と validation を利用する。
 
-### 9.3 Expression
+Expression 中のタグ参照は単純な文字列置換ではなく、
+parser / structured reference を介して更新することを優先する。
+
+### 9.4 Cross-environment import
+
+開発 Hub -> 現場 Hub への移送では `external_name` を再解決キーとする。
+
+```text
+開発 Hub:
+  PLC01.Fast.Motor01.Run
+
+現場 Hub:
+  PLC01.Fast.Motor01.Run
+```
+
+であれば内部数値 ID が異なっても Binding は成立する。
+
+現場 Hub に同じ `external_name` が存在しない場合は unresolved とし、
+自動で類似名の別タグへ Binding しない。
+
+Project は validation 補助として期待型・writable 等の metadata を保持してよいが、
+それらを別タグへの自動再割付キーにはしない。
+
+### 9.5 Expression
 
 Binding を直接 property へつなぐだけでなく、
 
@@ -1232,7 +1293,7 @@ Audit 候補:
 banto-scada では以下を一般化する。
 
 ```text
-MQTT topic             -> Hub StableTagId
+MQTT topic             -> Hub external_name binding
 TopEquipmentObject     -> EquipmentInstance / SymbolInstance
 Equipment screen       -> Faceplate / Screen
 Topic expression       -> Binding Expression / banto-expr
@@ -1438,7 +1499,7 @@ validation 対象例:
 
 - object reference
 - EquipmentType / slot type
-- StableTagId resolution
+- external_name resolution
 - expression type
 - writable requirement
 - Faceplate / Dialog reference
@@ -1677,7 +1738,7 @@ SCADA の repository 分割は現時点では確定しない。
 ### S3 Hub Live Binding
 
 - banto-tagclient 接続
-- StableTagId binding
+- external_name binding
 - quality / unresolved
 - reconnect / rebinding
 
@@ -1808,6 +1869,9 @@ MCP 自体は roadmap の blocking milestone にしない。
 
 - PLC は control authority。PC 停止で設備制御を止めない
 - SCADA は PLC に直接接続せず Hub を介する
+- SCADA Project の永続 Tag Binding は Hub の `external_name`（`connection.group.tag`）を正とする
+- `StableTagId` は Runtime / SDK 内部の解決補助に限定し、Project の portable identity にはしない
+- Hub 側で直接 rename して Binding が切れることは許容する。SCADA Editor からの rename は Hub API と Project 参照更新を協調して行う
 - Screen model / Renderer / Editor を分離する
 - SVG + Svelte を Process Renderer の第一候補とする
 - EquipmentType / EquipmentInstance を持つ
