@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（レビュー反映: Historian は ChronoGazer と共有（§13）、Binding identity を再検討中（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-09-30（レビュー反映: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみと決定（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -698,29 +698,29 @@ SCADA Project は Hub 内部 DB の数値 ID
 ### 9.2 Runtime 解決
 
 Runtime は Project に保存された `external_name` を Hub catalog へ照合し、
-実行中の内部参照として現在の `StableTagId` を取得してよい。
+表示・書き込みの検証に使う metadata（data type / writable / unit）と catalog revision を得る。
+購読・書き込みも `external_name` で行う。Hub の公開契約（REST `POST /api/v1/values/{tag}`、
+WS subscribe、write scope、MQTT トピック）はすべて名前であり、SCADA は Hub 内部の数値 ID
+（`StableTagId`）を使わない（§9.6、2026-09-30 オーナー決定）。
 
 ```text
 Project
   external_name
        |
        v
-Hub catalog
+Hub catalog（revision 付き）
        |
-       +-- StableTagId
        +-- data type
        +-- writable
        +-- unit
        |
        v
-Runtime binding cache
+Runtime binding cache（名前 → metadata、解決時の revision）
 ```
 
-`StableTagId` は Runtime / client SDK 内部の解決・購読・書き込み補助には利用してよいが、
-Project の portable identity にはしない。
-
 これにより Hub の config export/import で内部数値 ID が変わっても、
-`connection.group.tag` が同じなら SCADA Project の Binding は維持できる。
+また Hub 側でタグを削除して同名で作り直しても、`connection.group.tag` が同じなら
+SCADA Project の Binding は維持できる。
 
 ### 9.3 Rename 契約
 
@@ -790,59 +790,54 @@ Property
 
 可能であれば既存 banto-expr を利用する。
 
-### 9.6 Binding identity の再検討（2026-09-30 議論中）
+### 9.6 Binding identity の決定（2026-09-30 オーナー決定: 名前のみ。書き込みも名前）
 
-本 PR で永続 Binding を `external_name` とした（§9.1）が、関連文書の想定が揃っていない。
+**決定**: SCADA の Binding の同一性は、購読も書き込みも Hub の `external_name` とし、
+Hub 内部の数値 ID（`StableTagId`）は SCADA では使わない。
 
-- tag-server-design.md §4.1: クライアントは**外部名 + 安定 ID を保存**し、表示・購読は外部名、
-  リネーム検出は安定 ID で行う
-- banto-tagclient-design.md §3.1: アプリは **stable ID を保存**し、外部名は catalog から都度解決する。
-  `BindingRequest` / `write_tag` は `StableTagId` しか受けない
+経緯: 本 PR 当初は「Project は `external_name`、Runtime / SDK 内部は `StableTagId`」としていたが、
+関連文書と揃っていなかった（tag-server-design.md §4.1 は外部名 + 安定 ID の併記、
+banto-tagclient-design.md §3.1 / §4.4 は stable ID のみ）。レビューで次の 4 案を比較した。
 
-オーナー指示（2026-09-30）により、どの方式が最善かを改めて検討する。
+#### 検討した案
 
-#### 前提事実
+| 案                                       | 内容                   | 判断                                                                        |
+| ---------------------------------------- | ---------------------- | --------------------------------------------------------------------------- |
+| A. `external_name` のみ                  | 購読・書き込みとも名前 | **採用**                                                                    |
+| B. `StableTagId` のみ                    | SDK の現行契約         | 環境をまたぐと id が変わる。Project が人間・AI に読めない                   |
+| C. Project は名前、環境別キャッシュに id | 改名候補の提示ができる | 案 A と Project 形式は同じ。必要が出たら後付けできる拡張として保留          |
+| D. Hub にタグ UUID を追加                | 環境をまたぐ同一性     | Hub のマイグレーション・CSV 互換（#264）・config package に波及する。将来案 |
 
-- `external_name` は Hub 全体で一意（接続名・グループ名は全体一意、タグ名はグループ内一意）
-- `StableTagId` は Hub DB の数値 id 3 層。Hub の config package は名前で往復し数値 id を
-  持ち越さない（`configPackage.ts`）。環境をまたぐと同じタグでも id が変わる
-- Hub の rename は警告のみで、参照追跡はしない（tag-server-design.md §4.1、2026-08-05）
-- SDK は `StableTagId` で bind / rebind / write する。write は書く直前に id → 名前を再解決するので、
-  rename の直後でも**同じ物理タグ**へ書く（名前で書くと、旧名を引き継いだ別タグへ書く事故があり得る）
-- SDK は `config_changed` の再バインドを `StableTagId` で解決するため、Hub 側で rename されても
-  SDK 上の binding は新しい名前で生き続ける。「rename で unresolved になる」は Runtime が名前を
-  照合しない限り成立しない
-- Hub に環境非依存のタグ UUID は無い
+#### ID を使わない理由（オーナー判断）
 
-#### 案
+- **ID に束縛が引っ張られると変更しにくい。** 削除して同名で作り直す、CSV を再取り込みする、接続を作り直す、
+  といった試運転中の操作で ID は変わる。名前が同じでも ID 束縛は切れる。ChronoGazer の Hub ドライバは
+  この回避策（`apps/chronogazer/core/src/hub.rs` の fingerprint）を既に抱えている
+- **環境をまたぐと ID は持ち越せない。** Hub の config package は名前で往復する
+- **Hub の公開契約はすべて名前。** REST の書き込み先、WS の subscribe、write scope のパターン、MQTT トピック、
+  Expression、Design API、AI の割付提案。SCADA が名前だけに依存すれば Hub の内部表現に結合しない
+- **改名は破壊的変更として利用者責任**（tag-server-design.md §4.1、2026-08-05）と整合する。改名で
+  Binding が unresolved になるのは仕様
+- ID が持つ利点（改名への追従、改名と削除の区別、旧名を引き継いだ別タグへの誤書き込み防止）は
+  以上の不利益に対して小さい。最後の 1 点は下記の revision 照合で代替する
 
-| 案                                                              | 可搬性（開発 Hub → 現場 Hub）               | Hub 側 rename                                         | 書き込みの安全                                       | SDK 適合                            | コスト                                                              |
-| --------------------------------------------------------------- | ------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------- |
-| A. `external_name` のみ（本 PR）                                | ○ 名前が同じなら成立                        | △ 検出は名前照合のみ。rename と delete を区別できない | △ 名前で追うと旧名を引き継いだ別タグに書き得る       | △ 解決層が要る                      | 低                                                                  |
-| B. `StableTagId` のみ（SDK と同型）                             | × id が環境で変わる。結局名前で再解決が要る | ○ 透過追従、delete と区別可                           | ○ 物理タグに追従                                     | ○                                   | 低。ただし Project が人間・AI に読めない                            |
-| C. Project は `external_name`、環境別キャッシュに `StableTagId` | ○                                           | ○ キャッシュの id で「renamed 候補」を出せる          | ○ セッション中は id で書き、名前不一致は fail-closed | ○                                   | 中。キャッシュの設計が要る                                          |
-| D. Hub にタグ UUID を追加（Hub 側変更）                         | ◎ 環境をまたいで同一性が保てる              | ◎                                                     | ◎                                                    | △ SDK・catalog・config package 変更 | 高。マイグレーション、CSV 互換（#264 の教訓）、ChronoGazer にも波及 |
+#### 名前で書き込む場合の安全規則
 
-#### 推奨: C
+- Runtime は書き込み前に、現在の catalog revision で対象名が解決済みであり、`writable` かつ型が一致する
+  ことを確認する。未解決、または `config_changed` 受信後の再解決が済んでいない間は書かない（fail-closed）
+- Hub は存在しない名前に 404、writable でない・scope 外に 403 を返す。いずれも失敗として表示・記録する
+  （§8.4、§16）
+- 改名の直後に旧名で別タグが登録された場合の誤書き込みは、**write 要求に期待 catalog revision を付け、
+  Hub が不一致を拒否する**拡張で塞ぐ。§21 S0 の Hub 追加 API 候補に含める（§16 の相関 ID と同じ要求に載せる）
+- 自動再割付はしない（§9.4）
 
-tag-server-design.md §4.1 が既に規定している「外部名 + 安定 ID」の二重化を、
-**Project package の外**に置く形で採る。
+#### SDK への影響
 
-- Project が保存するのは `external_name` のみ。可搬で、Expression / Design API / AI と同じ語彙
-- Hub endpoint ごとの **binding cache**（workspace state と同じく export 対象外）に
-  「`external_name` → 最後に解決した `StableTagId` + catalog revision」を持つ
-- 解決規則:
-  1. 名前が catalog に一致 → bind し cache を更新
-  2. 名前が無く、cache の id が catalog に**別名で**存在 → 「renamed 候補」。表示は unresolved の
-     まま、Editor で確認して受け入れた場合のみ Project 参照を更新する（§9.3 の Design operation、
-     revision を進める）
-  3. どちらも無し → deleted / unresolved
-- 書き込みは現在の binding の `StableTagId` で SDK に渡す。再バインドで名前不一致になった binding は
-  fail-closed（書かない）
-- 自動再割付はしない（§9.4 を維持）
-
-決定後は banto-tagclient-design.md §3.1 に「SCADA は `external_name` を保存し、SDK には解決済み
-`StableTagId` を渡す」旨を注記する。D は将来案として残す（ChronoGazer にも効くが Hub 側の変更が大きい）。
+banto-tagclient は `BindingRequest` と `write_tag` が `StableTagId` を要求している。
+この決定に合わせて **SDK の binding 同一性も `external_name` に改める**（2026-09-30 オーナー指示）。
+Hub との wire は既に名前（WS subscribe、`POST /api/v1/values/{tag}`）なので、変わるのは SDK の公開型と
+呼び出し側（ChronoGazer の Hub ドライバ、banto-hub-sink）である。banto-tagclient-design.md §3.1 / §4.4 の
+改訂と実装は別 PR で行う。
 
 ---
 
@@ -1280,8 +1275,8 @@ Historical Trend を成立させる。
    SCADA Project の trend group が記録対象を決めるなら、Editor から recorder へ selected-tags を同期する
    Design operation が要る（§9.3 の rename と同じ協調更新の型）
 5. **キーの整合。** Hub 経由ドライバは Hub の `external_name` でタグを引く（`core/src/hub.rs`）ので、
-   tstore の `tag_key` もこれに揃え、SCADA Binding（§9）と同じ語彙で履歴を引けるようにする。§9.6 で
-   `StableTagId` を併用しても履歴のキーは名前のままとする
+   tstore の `tag_key` もこれに揃え、SCADA Binding（§9）と同じ語彙で履歴を引けるようにする。§9.6 の決定どおり
+   履歴のキーも名前とする
 
 未決（§22 へ）:
 
@@ -2097,7 +2092,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 11. Design API の最終 transport / bind policy（初期候補: editor mode + loopback REST）
 12. AI change plan の承認を必須にする変更範囲
 13. protocol-specific Alarm adapter の優先順位（MELSEC は汎用 Alarm 後）
-14. Binding identity の方式（§9.6。案 A〜D、推奨 C）
+14. Binding identity の方式 → 2026-09-30 決定済み（§9.6、名前のみ。案 C の改名候補提示は必要が出たら拡張）
 15. SCADA 記録プロセスの寿命（UI 同居か記録サービス分離か、§13）
 16. ChronoGazer と共有するトレンド UI の package 化の方法（§13）
 17. SCADA 同梱 recorder の配布形態（同梱サービスか、既存 ChronoGazer の流用か。§13.1）
@@ -2111,7 +2106,6 @@ MCP 自体は roadmap の blocking milestone にしない。
 - Core v1 の完了範囲。§3 の案を叩き台として決定する
 - DB Table/View の表現を DB Table Tag とするか、独立 Dataset / DB Resource とするか
 - protocol-specific PLC Alarm adapter の順序・契約。MELSEC 対応は汎用 Alarm model 後
-- Binding identity を `external_name` のみとするか、環境別キャッシュに `StableTagId` を併せ持つか（§9.6）
 
 ---
 
@@ -2119,8 +2113,8 @@ MCP 自体は roadmap の blocking milestone にしない。
 
 - PLC は control authority。PC 停止で設備制御を止めない
 - SCADA は PLC に直接接続せず Hub を介する
-- SCADA Project の永続 Tag Binding は Hub の `external_name`（`connection.group.tag`）を正とする（**2026-09-30 再検討中、§9.6。推奨は案 C**）
-- `StableTagId` は Runtime / SDK 内部の解決補助に限定し、Project の portable identity にはしない（同上、§9.6）
+- SCADA Project の永続 Tag Binding は Hub の `external_name`（`connection.group.tag`）を正とする（2026-09-30 再確認、§9.6）
+- 購読・書き込みも `external_name` で行い、Hub 内部の `StableTagId` は SCADA では使わない。banto-tagclient の binding 同一性も名前に改める（2026-09-30 オーナー決定、§9.6）
 - Hub 側で直接 rename して Binding が切れることは許容する。SCADA Editor からの rename は Hub API と Project 参照更新を協調して行う
 - Screen model / Renderer / Editor を分離する
 - SVG + Svelte を Process Renderer の第一候補とする
