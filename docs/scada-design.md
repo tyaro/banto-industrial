@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-09-30（repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -2042,20 +2042,28 @@ Project 設計変更は operator runtime audit と区別し、
 
 ---
 
-## 20. Repository / CI
+## 20. Repository / CI（2026-09-30 オーナー決定: banto-industrial 内に置く）
 
-SCADA の repository 分割は現時点では確定しない。
+**banto-scada は banto-industrial の中に置く。** 配置は `apps/banto-scada`（画面と host）と
+`crates/scada-*`（§18 の scada-model / renderer / editor / runtime / server のうち Rust で書く部分）。
+理由:
+
+- path-aware CI（#469）が `apps/banto-scada` を足す手順を ci.yml と `ci-changes.mjs` の冒頭に既に
+  用意している（RULES・AREAS・RUST_PACKAGES と frontend-scada / e2e-scada ジョブの追加）
+- banto-tagclient、tstore / tsquery、banto-alarm など共有 crate を同じ workspace で参照でき、
+  ChronoGazer と共有するトレンド UI の package 化（§13）も同じ pnpm workspace で済む
+- Hub や ChronoGazer と横断する変更（SDK の契約変更など）を 1 つの PR で出せる
 
 banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09-30 時点の main）。現状は
 
 - Hub change -> Hub CI
 - ChronoGazer change -> ChronoGazer CI
-- SCADA change -> SCADA CI（SCADA のパスはまだ無いため未定義）
+- SCADA change -> SCADA CI（`apps/banto-scada` の追加時に上記手順で有効化する）
 - docs-only -> minimum CI
 
 を成立させる。
 
-その後、
+分割は確定事項ではなく、
 
 - independent release cycle
 - concurrent development conflicts
@@ -2221,7 +2229,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 
 以下は実装前に個別決定する。
 
-1. banto-scada を banto-industrial 内に置くか別 repository にするか
+1. banto-scada を banto-industrial 内に置くか別 repository にするか → 2026-09-30 決定済み（§20、banto-industrial 内。`apps/banto-scada` と `crates/scada-*`）
 2. Project package の正式拡張子
 3. Stable ID の UUID/ULID 方式
 4. Screen coordinate の内部単位（normalized / logical pixel の併用方針）
@@ -2255,6 +2263,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 ## 24. 現時点の主要決定（2026-09-30 オーナー決定。§9.6 の再検討中項目を除く）
 
 - PLC は control authority。PC 停止で設備制御を止めない
+- banto-scada は banto-industrial 内に置く（`apps/banto-scada` と `crates/scada-*`。2026-09-30 オーナー決定、§20）
 - v1 は「画面を作り、Hub の値を安全に表示し、基本操作できる」縦切り。scada-server core はライブラリ境界と起動モードの分岐だけを v1 に含め、recorder / Alarm / 常時実行 Event / サービス host は v1.1（2026-09-30 オーナー決定、§3）
 - SCADA は PLC に直接接続せず Hub を介する
 - SCADA Project の永続 Tag Binding は Hub の `external_name`（`connection.group.tag`）を正とする（2026-09-30 再確認、§9.6）
