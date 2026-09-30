@@ -164,7 +164,11 @@ Optional / future domains
   DB tabular resource
   always-on Event / Action
        |
-       +-- host は SCADA server core（§13.2、2026-09-30 決定）。Hub には置かない
+       +-- Alarm / History / always-on Event / Action の host は SCADA server core
+       |   （§13.2、2026-09-30 決定）。Hub には置かない
+       +-- DB tabular resource は Hub 側（§14。Hub API → DB を接続境界とする）
+       +-- Tracking domain の host は未決（§12。PLC authoritative。ingest を Hub 側に
+           置くか SCADA server に置くかは後続）
 ```
 
 Hub を integration boundary として使うことと、
@@ -1272,9 +1276,11 @@ Historical Trend を成立させる。
 1. **記録は UI の中身と混ぜない。** recorder は SCADA server core（§13.2）に置き、SCADA の画面は
    その API を読む。画面が tstore ファイルを直接読む方式にはしない。v1 の埋め込み起動（§13.2 host 1）は
    同じプロセスに同居するが、ライブラリ境界は守る
-2. **現場の recorder は 1 つ。** 操作卓と事務所閲覧など SCADA client が複数ある現場で client ごとに記録すると、
-   履歴が重複し欠測もばらつく。この現場は Windows サービス host（§13.2 host 3）を使い、client は接続する。
-   既存の ChronoGazer をそのまま recorder に流用することは要件にしない（共有は crate 単位）
+2. **現場の recorder は論理サービスとして 1 つ。** 操作卓と事務所閲覧など SCADA client が複数ある現場で
+   client ごとに記録すると、履歴が重複し欠測もばらつく。「1 つ」はプロセス数の制限ではなく**論理サービスの
+   単位**で、将来の冗長化（複数インスタンス）は許容する（§13.2）。この現場は Windows サービス host
+   （§13.2 host 3）を使い、client は共有サービス接続モードで接続する。既存の ChronoGazer をそのまま
+   recorder に流用することは要件にしない（共有は crate 単位）
 3. **履歴読み出し API は SCADA server core に置く。** 実装は ChronoGazer core の REST（I4 `read_decimated`、
    R1-D 未着手）と共有 crate 化して二重実装を避ける。「History API は要る。ただし所有者は Hub ではなく
    recorder」が正確な言い方になる
@@ -1326,8 +1332,18 @@ banto-hub の型（`HubRuntime` をライブラリとし、コンソール / サ
 規律:
 
 - core を画面プロセスの中身と混ぜない。画面 → core の呼び出しは可、逆は不可
-- 「サービス検出 → 接続、無ければ埋め込み起動」の分岐を v1 から入れる。v1 時点ではサービスが無いので常に
-  埋め込み起動になるが、この分岐があればサービス化のときにアプリ側の変更がほぼ要らない
+- アプリの起動モードを**起動前に**区別し、埋め込み起動の責任を分ける:
+  - **ローカルモード**: ローカルの SCM に SCADA server サービスがあれば接続、無ければ埋め込み起動
+    （T16-2 の判定をそのまま流用）。v1 時点ではサービスが無いので常に埋め込み起動になるが、この分岐が
+    あればサービス化のときにアプリ側の変更がほぼ要らない
+  - **共有サービス接続モード**: 設定で指定した別 PC の SCADA server に接続する閲覧・操作端末。
+    **このモードではローカルサービス未検出や接続失敗を埋め込み起動の条件にしない**。接続失敗は
+    「未接続」として表示して再試行する。協調しない別系統の recorder / Alarm / 常時実行 Event が端末ごとに
+    暗黙に起動し、履歴や ACK 状態が分裂したり外部処理が重複したりすることを防ぐため
+- **論理サービスとインスタンスを分ける**: SCADA server は論理サービスの識別子（現場 / Project 単位）と
+  インスタンスの識別子（プロセス / ホスト単位）を別に持つ。将来の冗長化（複数インスタンス）はこの前提で
+  後続設計する。recorder の並行記録と履歴統合、Alarm の ACK / Shelve 状態の共有、Action の二重実行防止は
+  それぞれ別の契約として §22 に残し、Active/Standby か Active/Active かは本節では確定しない
 - v1 の埋め込み起動は「寿命が UI と同じ」を割り切りとして受容し、文書と UI で案内する。記録を止めたくない
   現場はサービス化する
 
@@ -1580,7 +1596,7 @@ Equipment screen       -> Faceplate / Screen
 Topic expression       -> Binding Expression / banto-expr
 portable-settings      -> Project Package
 direct DB trend        -> 共有 tstore / tsquery + Trend UI（§13）
-alarm table viewer     -> Hub Alarm API
+alarm table viewer     -> SCADA server Alarm API（§13.2）
 ```
 
 ---
@@ -1637,16 +1653,17 @@ banto-scada での AI 利用は **設計時を主対象**とする。
 - Import / migration の補助
 
 Runtime で AI が常時設備を監視・自律操作することは本設計の必須要件にしない。
-運転データの取得・PLC write・Alarm・Tracking 等は既存の Hub API / Hub MCP の責務とする。
+運転データの取得・PLC write・DB resource は既存の Hub API / Hub MCP の責務、
+Alarm・履歴・常時実行 Event / Action は SCADA server API（§13.2）の責務とする。
+Tracking は §12 の host 決定に従う。
 
 ```text
-               AI / automation
-                  /       \
-                 /         \
-       SCADA Design API     Hub API / MCP
-       project / screen     tags / values
-       equipment / binding  alarm / tracking
-       validate / plan      DB resources
+                    AI / automation
+                /          |           \
+   SCADA Design API   Hub API / MCP   SCADA server API
+   project / screen   tags / values   alarm / history
+   equipment/binding  PLC write       always-on event
+   validate / plan    DB resources    (§13.2)
 ```
 
 ### 19.2 API-first
@@ -2161,6 +2178,8 @@ MCP 自体は roadmap の blocking milestone にしない。
 16. ChronoGazer と共有するトレンド UI の package 化の方法（§13）
 17. SCADA 同梱 recorder の配布形態 → 2026-09-30 決定済み（§13.2、SCADA 同梱の core。ChronoGazer の流用は要件にしない）
 18. 記録対象タグの所有者 → 2026-09-30 決定済み（§13.1 の 4、SCADA Project）
+19. SCADA server の冗長化方式（Active/Standby / Active/Active）と、recorder の並行記録・履歴統合、Alarm の ACK / Shelve 状態共有、Action の二重実行防止の契約（§13.2）
+20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 
 ---
 
@@ -2192,7 +2211,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 - 初期 Alarm は protocol 非依存とし、MELSEC 固有の Alarm ingest は後続 adapter とする
 - 搬送 Tracking は独立 domain。PLC authoritative
 - Historian / Trend は Hub History API ではなく ChronoGazer と共有する記録・トレンド資産で実現し、Hub は履歴を持たない（2026-09-30 オーナー決定、§13）
-- 24/365 の処理（recorder、Alarm engine、常時実行 Event / Action、履歴・Alarm API）は画面と別の scada-server core に置き、Hub には足さない。host は埋め込み / headless / Windows サービスの 3 層で、v1 は埋め込み起動、サービス host は後続（2026-09-30 オーナー決定、§13.2）
+- 24/365 の処理（recorder、Alarm engine、常時実行 Event / Action、履歴・Alarm API）は画面と別の scada-server core に置き、Hub には足さない。host は埋め込み / headless / Windows サービスの 3 層で、v1 は埋め込み起動、サービス host は後続。共有サービス接続モードでは埋め込み起動しない。論理サービスとインスタンスの識別子を分け、将来の冗長化を許容する（2026-09-30 オーナー決定、§13.2）
 - 記録対象タグの所有者は SCADA Project。server core は配布された Project を読む（2026-09-30 オーナー決定、§13.1）
 - SCADA の DB Table/View アクセスは Hub を接続境界とするが、DB Table Tag / Dataset のどちらで表現するかは未決
 - Recipe / 実績は DB Resource + Action/Command を再利用する
