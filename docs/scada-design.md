@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-09-30（DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -612,10 +612,13 @@ Tags
   Computed
   Internal
   DB Values
-  DB Tables
+
+Datasets（Tags と別系統。§14.2）
+  table / view / registered query
 ```
 
-`DB Tables` ノードは §14.2 の resource model 決定後に確定する（案 B なら Tags と別系統の Datasets ノードになる）。
+`Datasets` は Tag ではなく独立した resource（§14.2、案 B）なので、Tag Browser では Tags と別の
+最上位ノードに出す。DataGrid の source と Recipe / 実績（§15）の参照先になる。
 
 表示候補:
 
@@ -1418,7 +1421,7 @@ Hub の代わりに **Replay ドライバが tstore / tsquery から時刻カー
 
 ---
 
-## 14. DB Table / View 連携（モデルは議論中）
+## 14. DB Table / View 連携（2026-09-30 オーナー決定: Dataset / DB Resource）
 
 ### 14.1 決定済みの境界
 
@@ -1446,10 +1449,26 @@ PostgreSQL query
 
 として単一現在値用途に利用できる。
 
-### 14.2 未決: tabular data を何として表現するか
+### 14.2 tabular data は Dataset / DB Resource（案 B）で表現する
 
-Table / View の rows × columns を SCADA の DataGrid に提供する必要があるが、
-Hub 内の domain model はまだ決定しない。
+Table / View の rows × columns を SCADA の DataGrid に提供する。**Hub 内の domain model は
+Tag とは別の first-class resource「Dataset」とする**（2026-09-30 オーナー決定、案 B）。
+案 A（DB Table Tag）は採らない。理由は案 A の懸念に列挙したとおりで、Hub の非 PLC 値の経路
+（`ServerTagStore` の `Option<f64>`、250ms poll）に表形式は乗らず、「Tag で統一」は Editor 上の
+見え方だけになるため、Tag の current-value semantics を守って責務を分ける。
+
+置き場所と形:
+
+- Hub 側に置き、既存の DB 接続（banto-hub-external-db-design.md の DB connection）を Source / Sink と共有する
+- read-only の API から始める。候補: `GET /api/v1/datasets`、`GET /api/v1/datasets/{id}/schema`、
+  `GET /api/v1/datasets/{id}/rows`（pagination / sort / allowed filter）。具体形は Hub 側の設計で確定する
+- 登録できる source は table / view / registered query。任意 SQL は受けない（§14.3）。実案件では
+  View を推奨し、DB 内部 schema と SCADA の契約境界を View に置く
+- Recipe / 実績（§15）が使う登録済み DB Command も同じ resource 系統に置く（write 側は別 slice）
+- SCADA の Editor の Resource Browser では Tags と別の Datasets ノードに出す（§8.2）。Project は
+  Dataset を名前で参照する（Tag と同じく数値 id を持ち越さない）
+
+検討した案（記録）:
 
 #### 案A: DB Table Tag
 
@@ -1496,9 +1515,9 @@ Datasets
 - Hub API / client / Editor Browser に新しい resource 系統が増える
 - Recipe / Result 等との naming / ownership を整理する必要がある
 
-### 14.3 共通して必要な capability
+### 14.3 必要な capability
 
-どちらを採る場合も、SCADA から任意 SQL を送る API は作らない。
+SCADA から任意 SQL を送る API は作らない。
 
 必要な機能候補:
 
@@ -1511,7 +1530,7 @@ Datasets
 - query concurrency limit
 - read-only first
 
-API の具体形は resource model 決定後に確定する。
+API の具体形は Hub 側の設計（banto-hub-external-db-design.md への追補、または新規の設計文書）で確定する。
 
 ### 14.4 DataGrid
 
@@ -2200,9 +2219,10 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - host 2: headless コンソール
 - host 3: Windows サービス（T17 の SCM 登録・elev の型を流用）。後続
 
-### S13 DB Table/View（resource model 決定後）
+### S13 DB Table/View（Dataset、Hub 側の API 設計後）
 
-- DB Table Tag vs Dataset/DB Resource の設計決定
+- Hub 側: Dataset の登録（table / view / registered query）、schema / rows API、pagination / sort /
+  allowed filter、timeout / concurrency limit（banto-hub-external-db-design.md への追補）
 - table/view registration
 - schema/rows API
 - DataGrid
@@ -2234,7 +2254,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 3. Stable ID の UUID/ULID 方式
 4. Screen coordinate の内部単位（normalized / logical pixel の併用方針）
 5. banto-expr を client/runtime でそのまま利用するか
-6. DB tabular resource の domain model（DB Table Tag / Dataset・DB Resource）
+6. DB tabular resource の domain model → 2026-09-30 決定済み（§14.2、案 B の Dataset / DB Resource。API の具体形は Hub 側の設計で確定）
 7. 常時実行 Event / Action の実行主体 → 2026-09-30 決定済み（§13.2、scada-server core）
 8. Core v1 に含める Extension の範囲 → 2026-09-30 決定済み（§3。v1 は画面とライブ値・操作まで、scada-server 系は v1.1）
 9. Tracking PLC block の標準 memory layout
@@ -2255,7 +2275,6 @@ MCP 自体は roadmap の blocking milestone にしない。
 
 ## 23. 議論継続中の主要論点
 
-- DB Table/View の表現を DB Table Tag とするか、独立 Dataset / DB Resource とするか
 - protocol-specific PLC Alarm adapter の順序・契約。MELSEC 対応は汎用 Alarm model 後
 
 ---
@@ -2284,7 +2303,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 - Historian / Trend は Hub History API ではなく ChronoGazer と共有する記録・トレンド資産で実現し、Hub は履歴を持たない（2026-09-30 オーナー決定、§13）
 - 24/365 の処理（recorder、Alarm engine、常時実行 Event / Action、履歴・Alarm API）は画面と別の scada-server core に置き、Hub には足さない。host は埋め込み / headless / Windows サービスの 3 層で、v1 は埋め込み起動、サービス host は後続。共有サービス接続モードでは埋め込み起動しない。論理サービスとインスタンスの識別子を分け、将来の冗長化を許容する（2026-09-30 オーナー決定、§13.2）
 - 記録対象タグの所有者は SCADA Project。server core は配布された Project を読む（2026-09-30 オーナー決定、§13.1）
-- SCADA の DB Table/View アクセスは Hub を接続境界とするが、DB Table Tag / Dataset のどちらで表現するかは未決
+- SCADA の DB Table/View アクセスは Hub を接続境界とし、表形式データは Tag と別の first-class resource「Dataset」で表現する（案 B。2026-09-30 オーナー決定、§14.2）
 - Recipe / 実績は DB Resource + Action/Command を再利用する
 - Project Import/Export は projectId / projectRevision / schemaVersion を持つ
 - Project package へ secret を含めない
