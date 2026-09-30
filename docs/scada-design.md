@@ -939,8 +939,8 @@ Local / UI
 
 Core v1 の Event は click / double click / screen open/close 等の UI Event を中心に扱う。
 v1.1 では value edge / alarm / timer を起点とする基本的な常時実行 Event / Action を実装する（§3、
-2026-09-30 決定。§21 S10b）。tracking 起点の処理、server-side HTTP / DB command は §3 の後続 Extension
-（§21 S11 / S9c）とする。
+2026-09-30 決定。§21 S10b）。tracking 起点の処理、server-side HTTP、DB command は §3 の後続 Extension
+（§21 S11 / S9c / S14）とする。
 
 ### 10.4 External Program
 
@@ -2223,7 +2223,7 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - 基本的な Action execution（PLC Write / audit。§16 の execution record を共有）
 - 副作用のある Action を 1 台に限定する境界（将来リースで抑止。§13.2 の冗長化方針、§22 #19）。
   v1.1 は単一インスタンス前提でよいが、engine が「自分が実行担当か」を問い合わせる口だけ置く
-- server-side HTTP / DB command は S9c
+- server-side HTTP は S9c、DB command（登録済み DB Command の `ExecuteDbCommand`。§14.2 / §15.2）は S14
 
 ### S12 History / Trend（ChronoGazer と共有、v1.1。host は S9b の scada-server core）
 
