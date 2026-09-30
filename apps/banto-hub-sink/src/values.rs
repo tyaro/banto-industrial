@@ -1,6 +1,6 @@
 //! banto-tagclient SDK（設計 §5.1「Hub からの値の取得は banto-tagclient
 //! SDK」）の薄いラッパー。**サイドカーに 1 本だけ**クライアントを持ち、
-//! 全 sink group の対象タグの**和集合**を安定 ID で購読して、外部名で
+//! 全 sink group の対象タグの**和集合**を external name で購読して、外部名で
 //! 引ける最新スナップショット（[`ValueView`]）を全グループへ配る。
 //!
 //! ## なぜグループごとに 1 本ではないのか
@@ -9,7 +9,7 @@
 //! `EVAL_TICK_MS`）で回るので、購読を分けるとその評価が本数分だけ増える。
 //! sink group は同じタグを重複して選べる（グループ A と B が同じタグを
 //! 別テーブルへ書く）ため、和集合にすると Hub 側の負荷は「実際に使う
-//! タグの本数」で頭打ちになる。SDK 側も `BindingRequest` の安定 ID 重複を
+//! タグの本数」で頭打ちになる。SDK 側も `BindingRequest` の `external_name` 重複を
 //! 拒否する（`validate_start_requests`）ので、和集合化は必須でもある。
 //!
 //! ## 値の流れと SDK の性質（`docs/banto-tagclient-design.md` §4.5）
@@ -27,25 +27,30 @@
 //!   `None` になる。そのとき [`ValueView::live`] は false で、**行は 1 つも
 //!   作らない**（設計の実装指示「SDK が切断されていれば行は作られない」）。
 //!
-//! ## リネームの追従
+//! ## 購読の鍵は external name（リネームの扱い）
 //!
-//! SDK は安定 ID で再解決するので、タグをリネームしても購読は途切れない
-//! （`config_changed` → rebinding）。一方このモジュールが配る
-//! [`ValueView`] のキーは**外部名**なので、リネーム直後は
-//! `GET /api/sink/config` が返した古い外部名で引けなくなる。次の設定取得
-//! （既定 30 秒）で解消する - その間そのタグの行が落ちるのは
-//! 「rename 後の行は新しい名前になる」（§5.3）の範囲内の挙動として許容
-//! する。外部名ではなく安定 ID で引けるようにするには SDK が解決後の
-//! 外部名を公開する必要があり、そちらは SDK の API 拡張になるため v1 では
-//! 採らない。
+//! SDK の Binding は購読も書き込みも `external_name` で行い、Hub の安定 ID
+//! （`StableTagId`）は使わない（2026-09-30 オーナー決定、
+//! `docs/scada-design.md` §9.6）。ID は削除→同名再作成や CSV 再取り込みで
+//! 変わるが、名前は Hub の公開契約（WS subscribe 等）そのものだから。
+//! 安定 ID は DB 行（`ts, tag_id, external_name, value, quality`）用に
+//! [`crate::hub_api::SinkConfigTag`] へ残るだけで、購読には使わない。
+//!
+//! したがってタグをリネームすると、購読中の旧名は catalog に無くなり
+//! `binding_unresolved`（[`ValueView`] は live でなくなり行は作られない）に
+//! なる。**次の設定取得（既定 30 秒）で新しい `external_name` が来るまで
+//! unresolved のまま**で、設定取得後に購読集合が変わったことを検出して
+//! 張り直すと新しい名前で復帰する（tag-server-design.md §4.1「リネームは
+//! 破壊的変更」）。その間そのタグの行が落ちるのは「rename 後の行は新しい
+//! 名前になる」（§5.3）の範囲内の挙動として許容する。削除→同名再作成は
+//! 名前が同じなので SDK が再バインドで自動的に解決する。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use banto_tagclient::{
-    BindingRequest, Endpoint, RestClient, SecretApiKey, StableTagId, TagClientConnectionState,
-    TagClientHandle,
+    BindingRequest, Endpoint, RestClient, SecretApiKey, TagClientConnectionState, TagClientHandle,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -87,29 +92,29 @@ pub struct Subscription {
     pump: JoinHandle<()>,
     dead: Arc<AtomicBool>,
     /// 差分判定用の購読集合（順序正規化済み）。
-    subscribed: Vec<StableTagId>,
+    subscribed: Vec<String>,
 }
 
 impl Subscription {
-    /// 購読を開始する。`stable_ids` は重複除去・ソート済みであること
-    /// （[`normalize_ids`]）。空なら `None`（SDK は空の購読を拒否する）。
+    /// 購読を開始する。`external_names` は重複除去・ソート済みであること
+    /// （[`normalize_names`]）。空なら `None`（SDK は空の購読を拒否する）。
     pub fn start(
         config: &SidecarConfig,
-        stable_ids: Vec<StableTagId>,
+        external_names: Vec<String>,
         view_tx: watch::Sender<Arc<ValueView>>,
     ) -> Result<Option<Self>, banto_tagclient::Error> {
-        if stable_ids.is_empty() {
+        if external_names.is_empty() {
             let _ = view_tx.send(Arc::new(ValueView::default()));
             return Ok(None);
         }
         let endpoint = Endpoint::new(&config.hub_url)?;
         let secret = SecretApiKey::new(config.api_key.clone())?;
         let rest = RestClient::new(endpoint, secret)?;
-        let requests: Vec<BindingRequest> = stable_ids
+        let requests: Vec<BindingRequest> = external_names
             .iter()
-            .map(|id| BindingRequest {
-                binding_key: binding_key(*id),
-                stable_id: *id,
+            .map(|name| BindingRequest {
+                binding_key: name.clone(),
+                external_name: name.clone(),
             })
             .collect();
         let handle = rest.start(requests)?;
@@ -120,7 +125,7 @@ impl Subscription {
             handle: Some(handle),
             pump,
             dead,
-            subscribed: stable_ids,
+            subscribed: external_names,
         }))
     }
 
@@ -133,7 +138,7 @@ impl Subscription {
     }
 
     /// 現在の購読集合（差分判定用）。
-    pub fn subscribed(&self) -> &[StableTagId] {
+    pub fn subscribed(&self) -> &[String] {
         &self.subscribed
     }
 
@@ -206,18 +211,12 @@ async fn pump_values(
     }
 }
 
-/// SDK の `binding_key`（安定 ID の 3 つ組をそのまま文字列に）。SDK は
-/// キーの重複を拒否するので、一意であればよい。
-fn binding_key(id: StableTagId) -> String {
-    format!("{}:{}:{}", id.connection_id, id.group_id, id.tag_id)
-}
-
 /// 重複除去 + ソート。差分判定（`==` 比較）が順序に左右されないように
 /// する。
-pub fn normalize_ids(mut ids: Vec<StableTagId>) -> Vec<StableTagId> {
-    ids.sort_by_key(|id| (id.connection_id, id.group_id, id.tag_id));
-    ids.dedup_by_key(|id| (id.connection_id, id.group_id, id.tag_id));
-    ids
+pub fn normalize_names(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]
@@ -225,30 +224,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_ids_sorts_and_deduplicates() {
-        let ids = normalize_ids(vec![
-            StableTagId::new(2, 1, 1),
-            StableTagId::new(1, 1, 9),
-            StableTagId::new(2, 1, 1),
-            StableTagId::new(1, 1, 2),
+    fn normalize_names_sorts_and_deduplicates() {
+        let names = normalize_names(vec![
+            "line2.g.b".to_owned(),
+            "line1.g.z".to_owned(),
+            "line2.g.b".to_owned(),
+            "line1.g.a".to_owned(),
         ]);
-        assert_eq!(
-            ids,
-            vec![
-                StableTagId::new(1, 1, 2),
-                StableTagId::new(1, 1, 9),
-                StableTagId::new(2, 1, 1),
-            ]
-        );
-    }
-
-    #[test]
-    fn binding_keys_are_unique_per_stable_id() {
-        assert_eq!(binding_key(StableTagId::new(1, 2, 3)), "1:2:3");
-        assert_ne!(
-            binding_key(StableTagId::new(1, 2, 3)),
-            binding_key(StableTagId::new(1, 2, 4))
-        );
+        assert_eq!(names, vec!["line1.g.a", "line1.g.z", "line2.g.b"]);
     }
 
     #[test]

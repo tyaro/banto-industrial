@@ -264,7 +264,7 @@ async fn step3_subscribe(
 ) -> StepResult {
     println!("--- [3/6] 購読 (start / WebSocket) ---");
     let Some(catalog) = catalog else {
-        println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
+        println!("  スキップ: catalog取得に失敗したため対象タグを確認できません。");
         return StepResult::skipped("購読", "catalog未取得のためスキップ");
     };
     let Some(plc_tag) = find_tag(catalog, EXT_PLC_D3000) else {
@@ -278,11 +278,11 @@ async fn step3_subscribe(
     let requests = vec![
         BindingRequest {
             binding_key: "plc_d3000".to_owned(),
-            stable_id: plc_tag.ids,
+            external_name: plc_tag.external_name.clone(),
         },
         BindingRequest {
             binding_key: "mb_hr1".to_owned(),
-            stable_id: mb_tag.ids,
+            external_name: mb_tag.external_name.clone(),
         },
     ];
     let client = match build_client(hub_url, api_key) {
@@ -334,7 +334,7 @@ async fn step3_subscribe(
     let trigger_result = match build_client(hub_url, api_key) {
         Ok(trigger_client) => {
             trigger_client
-                .write_tag(plc_tag.ids, RequestedValue::Num(trigger_value))
+                .write_tag(&plc_tag.external_name, RequestedValue::Num(trigger_value))
                 .await
         }
         Err(error) => Err(error),
@@ -386,7 +386,7 @@ async fn step4_write(
 ) -> StepResult {
     println!("--- [4/6] 書き込み (write_tag) ---");
     let Some(catalog) = catalog else {
-        println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
+        println!("  スキップ: catalog取得に失敗したため対象タグを確認できません。");
         return StepResult::skipped("書き込み", "catalog未取得のためスキップ");
     };
     let Some(tag) = find_tag(catalog, EXT_PLC_D3000) else {
@@ -402,7 +402,7 @@ async fn step4_write(
     };
     let test_value = 4242.0;
     match client
-        .write_tag(tag.ids, RequestedValue::Num(test_value))
+        .write_tag(&tag.external_name, RequestedValue::Num(test_value))
         .await
     {
         Ok(()) => {
@@ -455,7 +455,7 @@ async fn step5_forbidden(
 ) -> StepResult {
     println!("--- [5/6] 403 (writable=false) 確認 ---");
     let Some(catalog) = catalog else {
-        println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
+        println!("  スキップ: catalog取得に失敗したため対象タグを確認できません。");
         return StepResult::skipped("403確認", "catalog未取得のためスキップ");
     };
     let Some(tag) = find_tag(catalog, EXT_MB_DI_RO) else {
@@ -472,7 +472,10 @@ async fn step5_forbidden(
             return StepResult::from_bool("403確認", false, error.kind().as_str().to_owned());
         }
     };
-    match client.write_tag(tag.ids, RequestedValue::Bool(true)).await {
+    match client
+        .write_tag(&tag.external_name, RequestedValue::Bool(true))
+        .await
+    {
         Ok(()) => {
             println!("  想定外: writable=false のタグへの書込が成功してしまいました。");
             StepResult::from_bool("403確認", false, "書込が成功してしまった（本来403のはず）")
@@ -544,7 +547,7 @@ async fn step6_unavailable(
 ) -> StepResult {
     println!("--- [6/6] 503 (write-control 無効化) 確認 ---");
     let Some(catalog) = catalog else {
-        println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
+        println!("  スキップ: catalog取得に失敗したため対象タグを確認できません。");
         return StepResult::skipped("503確認", "catalog未取得のためスキップ");
     };
     let Some(tag) = find_tag(catalog, EXT_PLC_D3000) else {
@@ -568,7 +571,10 @@ async fn step6_unavailable(
             println!("  無効化: 成功");
             let write_client = build_client(hub_url, api_key);
             let (write_ok, write_detail) = match write_client {
-                Ok(client) => match client.write_tag(tag.ids, RequestedValue::Num(1.0)).await {
+                Ok(client) => match client
+                    .write_tag(&tag.external_name, RequestedValue::Num(1.0))
+                    .await
+                {
                     Ok(()) => {
                         println!("  想定外: write-control無効時に書込が成功してしまいました。");
                         (false, "書込が成功してしまった（本来503のはず）".to_owned())
@@ -609,7 +615,7 @@ async fn step6_unavailable(
             // 復旧確認: 実際に書き込めることを確かめる（あくまで付随情報）。
             let restored = match build_client(hub_url, api_key) {
                 Ok(client) => client
-                    .write_tag(tag.ids, RequestedValue::Num(0.0))
+                    .write_tag(&tag.external_name, RequestedValue::Num(0.0))
                     .await
                     .is_ok(),
                 Err(_) => false,

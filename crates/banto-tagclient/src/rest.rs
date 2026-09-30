@@ -10,8 +10,8 @@ use crate::endpoint::Endpoint;
 use crate::error::{Error, ErrorKind, Result};
 use crate::handle::{validate_start_requests, TagClientHandle};
 use crate::secret::SecretApiKey;
-use crate::types::{CatalogSnapshot, StableTagId, ValuesSnapshot};
-use crate::write::{resolve_write_target, send_write, RequestedValue};
+use crate::types::{CatalogSnapshot, ValuesSnapshot};
+use crate::write::{send_write, validate_write_name, RequestedValue};
 use crate::ws_transport::WebSocketConnection;
 
 /// A banto-hub REST client that connects directly to its endpoint, without
@@ -113,26 +113,25 @@ impl RestClient {
         })
     }
 
-    /// Write one tag by its stable ID (Issue #123, tag-server-design.md §6).
+    /// Write one tag by its `external_name` (Issue #123, tag-server-design.md
+    /// §6; 2026-09-30 owner decision, docs/scada-design.md §9.6).
     ///
-    /// This is a single `POST /api/v1/values/{tag}` and nothing else - see
-    /// the `write` module doc for why it is not part of `worker.rs`'s
-    /// reconnect/backoff machinery and never retries automatically. The
-    /// `external_name` banto-hub currently uses is resolved fresh from
-    /// `GET /api/v1/tags` on every call (never cached, never accepted
-    /// directly from the caller) because a rename changes it independently
-    /// of the stable ID (design §4.1). A resolution failure
-    /// ([`ErrorKind::BindingUnresolved`], [`ErrorKind::DuplicateCatalogStableId`])
-    /// or a catalog fetch failure both return before any write request is
-    /// sent.
-    pub async fn write_tag(&self, stable_id: StableTagId, value: RequestedValue) -> Result<()> {
-        let catalog = self.fetch_catalog().await?;
-        let external_name = resolve_write_target(stable_id, &catalog.tags)?;
+    /// This is a single `POST /api/v1/values/{external_name}` and nothing
+    /// else - see the `write` module doc for why it is not part of
+    /// `worker.rs`'s reconnect/backoff machinery and never retries
+    /// automatically. No catalog is fetched: the name is what the Hub's write
+    /// contract is keyed by, so a name that no longer exists (for example
+    /// right after a rename) is answered by the Hub with 404 and surfaces as
+    /// [`ErrorKind::WriteRejected`]. An empty, whitespace-only, or
+    /// comma-containing name is rejected before any request is sent
+    /// ([`ErrorKind::InvalidTagSelection`]).
+    pub async fn write_tag(&self, external_name: &str, value: RequestedValue) -> Result<()> {
+        validate_write_name(external_name)?;
         send_write(
             &self.http,
             &self.endpoint,
             &self.secret,
-            &external_name,
+            external_name,
             value,
         )
         .await

@@ -40,7 +40,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use banto_tagclient::StableTagId;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -56,7 +55,7 @@ use crate::hub_api::{
 };
 use crate::log::{log_err_line, log_line};
 use crate::status::{push_entry, GroupState, Redactor};
-use crate::values::{normalize_ids, Subscription, ValueView};
+use crate::values::{normalize_names, Subscription, ValueView};
 
 /// 購読の生存確認の間隔。
 const HEALTH_TICK: Duration = Duration::from_secs(1);
@@ -409,7 +408,7 @@ impl Engine {
 
     /// 対象タグの和集合を購読し続ける（必要なら作り直す）。
     async fn ensure_subscription(&mut self) {
-        let desired = self.desired_stable_ids();
+        let desired = self.desired_external_names();
 
         if let Some(subscription) = &self.subscription {
             let dead = subscription.is_dead();
@@ -471,22 +470,20 @@ impl Engine {
     }
 
     fn subscribed_len(&self) -> usize {
-        self.desired_stable_ids().len()
+        self.desired_external_names().len()
     }
 
-    /// 全 sink group の対象タグの和集合（重複除去・ソート済み）。
-    fn desired_stable_ids(&self) -> Vec<StableTagId> {
-        let mut ids = Vec::new();
+    /// 全 sink group の対象タグの和集合（`external_name`、重複除去・ソート済み）。
+    /// 購読の鍵は名前（2026-09-30 オーナー決定、docs/scada-design.md §9.6）で、
+    /// 安定 ID の 3 つ組は DB 行用に `SinkConfigTag` へ残っているだけ。
+    fn desired_external_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
         for group in self.applied_groups.values() {
             for tag in &group.tags {
-                ids.push(StableTagId::new(
-                    tag.connection_id,
-                    tag.group_id,
-                    tag.tag_id,
-                ));
+                names.push(tag.external_name.clone());
             }
         }
-        normalize_ids(ids)
+        normalize_names(names)
     }
 
     // --- 状態 push ----------------------------------------------------------

@@ -21,8 +21,8 @@
 //!
 //! # 購読の世代（#383 段階1）
 //!
-//! **1 接続 = 1 世代**。世代の同一性は「接続先 + 購読するタグ集合（名前と
-//! stable ID の組）」（[`Generation::fingerprint`]）で決める。これが一致し、
+//! **1 接続 = 1 世代**。世代の同一性は「接続先 + 購読するタグ集合（external
+//! name のソート済み集合）」（[`Generation::fingerprint`]）で決める。これが一致し、
 //! かつ資格情報が変わっていない限り [`HubService::reconcile`] は**何もしない**。
 //! 設定画面が [`HubService::status`] をポーリングするたびに WS を張り直すのを
 //! 防ぐ、この節で一番大事な不変条件。
@@ -31,7 +31,7 @@
 //!
 //! * 選んだタグのうち catalog に無いもの（Hub から消えた／権限で見えない）
 //!   は `unresolved`、そのままでは購読要求に載せられないもの（名前にカンマを
-//!   含む・空白だけ、同じ安定 ID を指す重複）は `unsupported` に出し、
+//!   含む・空白だけ）は `unsupported` に出し、
 //!   **残りだけで購読する**。1 個の事故で
 //!   購読全体を殺さない・空表示に潰さない。
 //! * **購読の失敗で [`HubStatus`] の 6 状態を変えない**。接続設定の状態と
@@ -77,7 +77,7 @@ use banto_hub_bootstrap::{
     KeyStore,
 };
 use banto_tagclient::{
-    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind as TagErrorKind, StableTagId,
+    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind as TagErrorKind,
     TagClientConnectionState, TagClientHandle, TagClientState, ValuesSnapshot,
 };
 use serde::Serialize;
@@ -441,8 +441,7 @@ const REASON_SELECTION_CHANGED_REFRESH_FAILED: &str =
 /// rebindable でもない）。したがってアプリ側で先に落とし、**残りのタグは
 /// 購読する**。
 ///
-/// 名前の綴りだけを見る - 同じ安定 ID を指す重複は catalog を引いて初めて
-/// 分かるので [`plan_bindings`] 側で落とす。
+/// 名前の綴りだけを見る（catalog は引かない）。
 fn is_unsupported_tag_name(name: &str) -> bool {
     name.trim().is_empty() || name.contains(',')
 }
@@ -467,15 +466,15 @@ struct BindingPlan {
 /// * 購読プロトコルが受け付けない綴り（[`is_unsupported_tag_name`]）は
 ///   catalog を引く前に `unsupported` へ落とす。catalog にあっても購読は
 ///   できないので、「消えた」とは別の事実として扱う。
-/// * **同じ [`StableTagId`] を指す 2 つ目以降の名前**も `unsupported` へ
-///   落とす（先勝ち）。`start()` は重複 `stable_id` を
-///   `DuplicateRequestedStableId` で拒否するので、1 件混ざると**購読全体が
-///   立たない**。ここで落とせば残りは購読できる。
+/// * 購読の鍵は **external name**（2026-09-30 オーナー決定、
+///   docs/scada-design.md §9.6）。`BindingRequest` は
+///   `{ binding_key: name, external_name: name }` で、`StableTagId` は使わない。
+///   ID は削除→同名再作成で変わるが、名前は Hub の購読契約そのもので変わらない。
 /// * catalog に無い external name は `unresolved` に入れる。
 /// * どちらも**残りだけで購読する**。1 個の事故で購読全体を殺さない。
 /// * 重複する external name はここで 1 つに畳む
-///   （`resolve_bindings`/`start` は重複 `binding_key` / 重複 `stable_id` を
-///   エラーにするため、通す前に潰しておく）。
+///   （`resolve_bindings`/`start` は重複 `binding_key` / 重複 `external_name`
+///   をエラーにするため、通す前に潰しておく）。
 /// * `requests` が空なら購読しない（`start()` は空 requests を
 ///   `InvalidTagSelection` で拒否する）。
 fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan {
@@ -485,7 +484,6 @@ fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan 
         .map(|tag| (tag.external_name.as_str(), tag))
         .collect();
     let mut seen: HashSet<&str> = HashSet::with_capacity(selected.len());
-    let mut claimed: HashSet<StableTagId> = HashSet::with_capacity(selected.len());
     let mut requests = Vec::with_capacity(selected.len());
     let mut unresolved = Vec::new();
     let mut unsupported = Vec::new();
@@ -498,16 +496,13 @@ fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan 
             unsupported.push(name.clone());
             continue;
         }
-        match by_name.get(name.as_str()) {
-            // 別々の名前が同じ安定 ID を指すのは Hub 側の catalog の不整合
-            // だが、そのまま `start()` へ渡すと全体が拒否される。先勝ちで
-            // 1 つだけ購読し、残りは「購読できなかった名前」として見せる。
-            Some(tag) if !claimed.insert(tag.ids) => unsupported.push(name.clone()),
-            Some(tag) => requests.push(BindingRequest {
+        if by_name.contains_key(name.as_str()) {
+            requests.push(BindingRequest {
                 binding_key: name.clone(),
-                stable_id: tag.ids,
-            }),
-            None => unresolved.push(name.clone()),
+                external_name: name.clone(),
+            });
+        } else {
+            unresolved.push(name.clone());
         }
     }
     BindingPlan {
@@ -520,18 +515,20 @@ fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan 
 /// 世代の同一性。**接続先（正規化済み）+ 購読するタグ集合**で、これが一致
 /// するなら張り直さない。
 ///
-/// タグ集合は名前だけでなく **stable ID の組**（名前でソート）にする:
-/// Hub 側でタグを消して同じ名前で作り直すと `StableTagId` が変わるが、名前
-/// しか見ないと fingerprint が一致してしまい、**古い ID で購読し続けて
-/// unresolved になったまま復帰しない**（Copilot F4）。
-type Fingerprint = (String, Vec<(String, StableTagId)>);
+/// タグ集合は **external name のソート済み集合**。SDK は購読も再バインドも
+/// 名前で行う（2026-09-30 オーナー決定、docs/scada-design.md §9.6）ので、Hub
+/// 側でタグを消して同じ名前で作り直して `StableTagId` が変わっても、SDK が次の
+/// 再バインドで名前から解決し直す。したがって fingerprint に ID を含めなくても
+/// 「古い ID に固定されて unresolved のまま復帰しない」（Copilot F4）は起きない。
+type Fingerprint = (String, Vec<String>);
 
 /// [`Subscription::last_value_at`] が「どの購読についての事実か」を表す
 /// **粗い**同一性: 正規化した接続先 + 選択タグ（ソート済み）。
 ///
-/// [`Fingerprint`] と違って stable ID を含まない。catalog を読めていないとき
-/// （切断中・認証エラー中）にも計算できる必要があるため - 「同じ購読が止まって
-/// いるだけ」かどうかは、まさに catalog を読めない場面で判断したい。
+/// [`Fingerprint`] と違って選択タグ全部（購読できなかった名前も含む）から作り、
+/// catalog を要らない。catalog を読めていないとき（切断中・認証エラー中）にも
+/// 計算できる必要があるため - 「同じ購読が止まっているだけ」かどうかは、まさに
+/// catalog を読めない場面で判断したい。
 type SubscriptionIdentity = (String, Vec<String>);
 
 fn subscription_identity(record: Option<&HubRecord>) -> Option<SubscriptionIdentity> {
@@ -562,12 +559,12 @@ fn keeps_last_value_at(
 
 /// [`plan_bindings`] の要求から [`Fingerprint`] のタグ部分を作る（名前で
 /// ソートして、選択の並び替えだけで世代が入れ替わらないようにする）。
-fn fingerprint_tags(requests: &[BindingRequest]) -> Vec<(String, StableTagId)> {
-    let mut tags: Vec<(String, StableTagId)> = requests
+fn fingerprint_tags(requests: &[BindingRequest]) -> Vec<String> {
+    let mut tags: Vec<String> = requests
         .iter()
-        .map(|request| (request.binding_key.clone(), request.stable_id))
+        .map(|request| request.external_name.clone())
         .collect();
-    tags.sort_by(|left, right| left.0.cmp(&right.0));
+    tags.sort();
     tags
 }
 
@@ -2162,7 +2159,7 @@ impl HubService {
             return;
         }
 
-        // 3. 同じ接続先・同じタグ集合（名前と stable ID）なら張り直さない
+        // 3. 同じ接続先・同じタグ集合（external name）なら張り直さない
         //    （一番大事な不変条件。設定画面が `status()` を叩くたびに WS を
         //    再接続しない）。ただし**資格情報が変わったかもしれないとき**と
         //    **現世代が `Unauthorized` で終端しているとき**は、同一性が
@@ -3153,11 +3150,10 @@ mod tests {
         );
     }
 
-    /// 別々の名前が同じ安定 ID を指す catalog（Hub 側の不整合）。そのまま
-    /// `start()` へ渡すと `DuplicateRequestedStableId` で**購読全体が立たない**
-    /// ので、先勝ちで 1 つだけ購読し、残りは購読できなかった名前として出す。
+    /// 購読の鍵は external name。別々の名前が（Hub 側の不整合で）同じ
+    /// `StableTagId` を指していても、ID は購読に使わないので**両方とも購読する**。
     #[test]
-    fn plan_bindings_folds_names_that_point_at_the_same_stable_id() {
+    fn plan_bindings_keys_the_subscription_by_external_name_not_by_stable_id() {
         let ids = StableTagId::new(1, 1, 1);
         let duplicated = CatalogSnapshot {
             tags: vec![catalog_tag("alpha", ids), catalog_tag("beta", ids)],
@@ -3167,22 +3163,20 @@ mod tests {
         let plan = plan_bindings(&owned(&["alpha", "beta"]), &duplicated);
 
         assert_eq!(
-            plan.requests
-                .iter()
-                .map(|request| request.binding_key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha"],
-            "先に出てきた方だけを購読する"
+            plan.requests,
+            vec![
+                BindingRequest {
+                    binding_key: "alpha".into(),
+                    external_name: "alpha".into(),
+                },
+                BindingRequest {
+                    binding_key: "beta".into(),
+                    external_name: "beta".into(),
+                },
+            ]
         );
-        assert_eq!(
-            plan.unsupported,
-            owned(&["beta"]),
-            "落とした名前は黙って消さず一覧に出す"
-        );
-        assert!(
-            plan.unresolved.is_empty(),
-            "catalog にはあるので未解決ではない"
-        );
+        assert!(plan.unsupported.is_empty());
+        assert!(plan.unresolved.is_empty());
     }
 
     #[test]
@@ -3193,11 +3187,12 @@ mod tests {
         assert_eq!(plan.unresolved, owned(&["gone"]));
     }
 
-    /// Hub 側でタグを消して**同じ名前で作り直す**と `StableTagId` が変わる。
-    /// 名前しか見ない fingerprint だと「同じ」と判定されて張り直されず、
-    /// 古い ID で購読し続けて復帰しない（Copilot F4）。
+    /// Hub 側でタグを消して**同じ名前で作り直す**と `StableTagId` は変わるが、
+    /// SDK は名前で購読・再バインドする（2026-09-30 オーナー決定、
+    /// docs/scada-design.md §9.6）ので、fingerprint は変わらず張り直しも不要。
+    /// 旧設計（ID を含める）で必要だった Copilot F4 の対策は要らなくなった。
     #[test]
-    fn the_fingerprint_changes_when_a_tag_is_recreated_under_the_same_name() {
+    fn the_fingerprint_does_not_change_when_a_tag_is_recreated_under_the_same_name() {
         let before = plan_bindings(&owned(&["a"]), &catalog(&["a"]));
         let recreated = CatalogSnapshot {
             tags: vec![catalog_tag("a", StableTagId::new(1, 1, 99))],
@@ -3206,21 +3201,11 @@ mod tests {
         let after = plan_bindings(&owned(&["a"]), &recreated);
 
         assert_eq!(
-            fingerprint_tags(&before.requests)
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect::<Vec<_>>(),
-            fingerprint_tags(&after.requests)
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect::<Vec<_>>(),
-            "名前だけ見ると同じ"
-        );
-        assert_ne!(
             fingerprint_tags(&before.requests),
             fingerprint_tags(&after.requests),
-            "stable ID まで見れば別物"
+            "同名なら ID が変わっても同じ世代（SDK が名前で解決し直す）"
         );
+        assert_eq!(fingerprint_tags(&after.requests), owned(&["a"]));
     }
 
     #[test]
@@ -5133,10 +5118,12 @@ mod tests {
             .map(|generation| generation.sequence)
     }
 
-    /// 同じ接続先・同じタグなら据え置き、**同じ名前で作り直された**（stable
-    /// ID が変わった）タグがあれば張り直す（Copilot F4）。
+    /// 同じ接続先・同じタグ名なら据え置く。**同じ名前で作り直された**（stable
+    /// ID が変わった）タグでも張り直さない: SDK は名前で購読・再バインドする
+    /// ので古い ID に固定されず、Copilot F4 の懸念は起きない
+    /// （2026-09-30 オーナー決定、docs/scada-design.md §9.6）。
     #[tokio::test]
-    async fn a_recreated_tag_replaces_the_generation_while_an_unchanged_one_does_not() {
+    async fn a_recreated_tag_under_the_same_name_keeps_the_generation() {
         let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
         let connected = HubStatus::Connected { tag_count: 1 };
 
@@ -5151,7 +5138,7 @@ mod tests {
         assert_eq!(
             generation_sequence(&hub).await,
             Some(first),
-            "同じ接続先・同じタグ・同じ stable ID なら張り直さない"
+            "同じ接続先・同じタグ名なら張り直さない"
         );
 
         let recreated = CatalogSnapshot {
@@ -5162,8 +5149,8 @@ mod tests {
             .await;
         assert_eq!(
             generation_sequence(&hub).await,
-            Some(first + 1),
-            "同名で作り直されたら古い ID のまま購読し続けない"
+            Some(first),
+            "同名で作り直されても張り直さない（SDK が名前で再バインドする）"
         );
     }
 

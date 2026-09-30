@@ -208,13 +208,13 @@ pub(crate) fn validate_start_requests(requests: &[BindingRequest]) -> Result<()>
         return Err(Error::new(ErrorKind::InvalidTagSelection));
     }
     let mut binding_keys = HashSet::with_capacity(requests.len());
-    let mut stable_ids = HashSet::with_capacity(requests.len());
+    let mut external_names = HashSet::with_capacity(requests.len());
     for request in requests {
         if !binding_keys.insert(request.binding_key.as_str()) {
             return Err(Error::new(ErrorKind::DuplicateBindingKey));
         }
-        if !stable_ids.insert(request.stable_id) {
-            return Err(Error::new(ErrorKind::DuplicateRequestedStableId));
+        if !external_names.insert(request.external_name.as_str()) {
+            return Err(Error::new(ErrorKind::DuplicateRequestedExternalName));
         }
     }
     Ok(())
@@ -250,10 +250,10 @@ mod tests {
         },
     };
 
-    fn request(key: &str, id: StableTagId) -> BindingRequest {
+    fn request(key: &str, name: &str) -> BindingRequest {
         BindingRequest {
             binding_key: key.into(),
-            stable_id: id,
+            external_name: name.into(),
         }
     }
 
@@ -795,36 +795,31 @@ mod tests {
         let empty = client("http://127.0.0.1:1".into()).start(Vec::new());
         assert_eq!(empty.err().unwrap().kind(), ErrorKind::InvalidTagSelection);
 
-        let duplicate_key = client("http://127.0.0.1:1".into()).start(vec![
-            request("same", StableTagId::new(1, 1, 1)),
-            request("same", StableTagId::new(1, 1, 2)),
-        ]);
+        let duplicate_key = client("http://127.0.0.1:1".into())
+            .start(vec![request("same", "alpha"), request("same", "beta")]);
         assert_eq!(
             duplicate_key.err().unwrap().kind(),
             ErrorKind::DuplicateBindingKey
         );
 
-        let duplicate_id = client("http://127.0.0.1:1".into()).start(vec![
-            request("first", StableTagId::new(1, 1, 1)),
-            request("second", StableTagId::new(1, 1, 1)),
-        ]);
+        let duplicate_name = client("http://127.0.0.1:1".into())
+            .start(vec![request("first", "alpha"), request("second", "alpha")]);
         assert_eq!(
-            duplicate_id.err().unwrap().kind(),
-            ErrorKind::DuplicateRequestedStableId
+            duplicate_name.err().unwrap().kind(),
+            ErrorKind::DuplicateRequestedExternalName
         );
     }
 
     #[test]
     fn start_without_runtime_returns_transport_without_panicking() {
-        let result = client("http://127.0.0.1:1".into())
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))]);
+        let result = client("http://127.0.0.1:1".into()).start(vec![request("alpha", "alpha")]);
         assert_eq!(result.err().unwrap().kind(), ErrorKind::Transport);
     }
 
     #[tokio::test]
     async fn state_and_state_watch_start_stopped_without_sensitive_fields() {
         let handle = client("http://127.0.0.1:1".into())
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let state = handle.state();
         assert_eq!(state.connection_state(), TagClientConnectionState::Stopped);
@@ -850,7 +845,7 @@ mod tests {
         ));
         let handle = TagClientHandle::spawn_with_backoff(
             client(address),
-            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            vec![request("alpha", "alpha")],
             Handle::current(),
             worker::BackoffConfig::new(Duration::from_millis(5), Duration::from_millis(20)),
         );
@@ -909,7 +904,7 @@ mod tests {
         });
         let handle = TagClientHandle::spawn_with_backoff(
             client(address),
-            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            vec![request("alpha", "alpha")],
             Handle::current(),
             worker::BackoffConfig::new(Duration::from_millis(5), Duration::from_millis(20)),
         );
@@ -941,7 +936,7 @@ mod tests {
         ));
         let handle = TagClientHandle::spawn_with_backoff(
             client(address),
-            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            vec![request("alpha", "alpha")],
             Handle::current(),
             worker::BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(30)),
         );
@@ -967,7 +962,7 @@ mod tests {
         ));
         let handle = TagClientHandle::spawn_with_backoff(
             client(address),
-            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            vec![request("alpha", "alpha")],
             Handle::current(),
             worker::BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(30)),
         );
@@ -995,7 +990,7 @@ mod tests {
         let (second_started_tx, second_started_rx) = oneshot::channel();
         let server = tokio::spawn(serve_rebinding_drop(listener, second_started_tx));
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut receiver = handle.state_watch();
         tokio::time::timeout(Duration::from_secs(1), second_started_rx)
@@ -1024,7 +1019,7 @@ mod tests {
             listener, status, second_tx,
         ));
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut receiver = handle.state_watch();
         wait_failed(&mut receiver, ErrorKind::Unauthorized).await;
@@ -1062,7 +1057,7 @@ mod tests {
         ));
 
         let old_handle = client_with_secret(address.clone(), "old-restart-secret")
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut old_state = old_handle.state_watch();
         wait_failed(&mut old_state, ErrorKind::Unauthorized).await;
@@ -1110,7 +1105,7 @@ mod tests {
         let server = tokio::spawn(serve_two_generations(listener, old_close_tx, new_close_tx));
 
         let old_handle = client(address.clone())
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut old_state = old_handle.state_watch();
         wait_live(&mut old_state).await;
@@ -1162,7 +1157,7 @@ mod tests {
         ));
 
         let old_handle = client(address.clone())
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut old_state = old_handle.state_watch();
         wait_live(&mut old_state).await;
@@ -1218,7 +1213,7 @@ mod tests {
             state_tx,
             state_rx,
             task: Some(task),
-            requests: vec![request("alpha", StableTagId::new(1, 1, 1))],
+            requests: vec![request("alpha", "alpha")],
             explicit_shutdown: false,
         };
 
@@ -1256,7 +1251,7 @@ mod tests {
             close_seen_tx,
         ));
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut receiver = handle.state_watch();
         wait_live(&mut receiver).await;
@@ -1294,7 +1289,7 @@ mod tests {
             close_seen_tx,
         ));
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let receiver = handle.state_watch();
         ws_ready_rx.await.unwrap();
@@ -1328,7 +1323,7 @@ mod tests {
             close_seen_tx,
         ));
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let receiver = handle.state_watch();
         ws_ready_rx.await.unwrap();
@@ -1362,7 +1357,7 @@ mod tests {
             peer_closed_tx,
         ));
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut receiver = handle.state_watch();
         ws_ready_rx.await.unwrap();
@@ -1408,7 +1403,7 @@ mod tests {
             write_response(&mut stream, "401 Unauthorized", String::new()).await;
         });
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut receiver = handle.state_watch();
         wait_failed(&mut receiver, ErrorKind::Unauthorized).await;
@@ -1440,7 +1435,7 @@ mod tests {
             close_seen_tx,
         ));
         let handle = client(address)
-            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .start(vec![request("alpha", "alpha")])
             .unwrap();
         let mut receiver = handle.state_watch();
         wait_live(&mut receiver).await;

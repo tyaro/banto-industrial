@@ -1,7 +1,10 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S4統合ゲート完了（2026-09-02）。S4a・W1完了（2026-09-01）**。
+状態: **2026-09-30 オーナー決定（docs/scada-design.md §9.6）で、bindingと書き込みの同一性を
+Hub内部の数値ID（`StableTagId`）から外部名（`external_name`）に変更した（§3.1・§4.4。
+SDKと呼び出し側は追従済み）。改名でbindingがunresolvedになるのは仕様。**
+**S4統合ゲート完了（2026-09-02）。S4a・W1完了（2026-09-01）**。
 S4統合ゲートの5項目（本書§7冒頭）はすべて済んだ。依存グラフ・license/保守状況・
 Windows配布バイナリ増分・workspace feature整合の実測は§7.1、**5（Hubのrelease tag
 への固定）は 2026-09-02 オーナー決定で `v0.1.0` に固定**した（§7.2）。
@@ -23,9 +26,10 @@ close コードと理由文を捨てずに分類し（`close::classify_close`）
 `last_error`（`key_revoked` / `key_expired` / `key_tripped` / `key_not_found` /
 `credential_rejected`）で止まって**再接続しない**ようにした（§4 の分類表・§5 の状態機械）。
 **W1（2026-09-01）**では、Issue #123の残スコープだった単一タグ書き込み
-（`RestClient::write_tag`）を実装した。stable IDから外部名を都度re解決し、
-`POST /api/v1/values/{tag}`を1回送るだけで、`worker.rs`の再接続・backoff機構には
-一切乗せない（自動再送をしない、§4.4のオーナー決定）。バッチ・レシピ書き込みは
+（`RestClient::write_tag`）を実装した。`POST /api/v1/values/{tag}`を1回送るだけで、
+`worker.rs`の再接続・backoff機構には一切乗せない（自動再送をしない、§4.4のオーナー決定）。
+当初はstable IDから外部名を都度re解決していたが、2026-09-30に外部名を直接受け取る形へ
+変更した（catalogは取得しない、§4.4）。バッチ・レシピ書き込みは
 実装していない（同§のオーナー決定）。
 **2026-09-14/15追記（#335）**: `ValueSource`に`Computed`（`"computed"`）・`Db`（`"db"`、
 既存ギャップ対応）を追加（§4.4付近の型定義）。Hub側は2026-09-15オーナー決定で外部への
@@ -49,9 +53,9 @@ PLC、Modbus、SLMPへは直接接続しない。タグ定義と品質判定の�
 
 - RESTによるcatalogと明示タグの初期snapshot取得
 - WebSocketによる`on_change`購読と`config_changed`検知
-- stable IDを用いたbindingの解決・再解決
+- 外部名（`external_name`）を用いたbindingの解決・再解決
 - 最新値優先のアプリ内状態配信と停止可能な接続ライフサイクル
-- **W1（2026-09-01）**: stable IDを指定した単一タグのREST書き込み
+- **W1（2026-09-01）**: 外部名を指定した単一タグのREST書き込み
   （`RestClient::write_tag`）。詳細・オーナー決定は§4.4。
 
 次は初版の非スコープである。
@@ -92,7 +96,7 @@ flowchart LR
 | ----------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | catalog取得、明示タグの初期値 | REST                       | 再接続時も含め、要求と応答を明確に対応できる。                                                                   |
 | 値の継続受信                  | WebSocket `on_change`      | 最新値を低遅延で更新できる。                                                                                     |
-| binding再解決の契機           | WebSocket `config_changed` | stable ID bindingのrevision変更をHub変更なしで即時検知できる。                                                   |
+| binding再解決の契機           | WebSocket `config_changed` | bindingのrevision変更をHub変更なしで即時検知できる。                                                             |
 | gRPC                          | 初版不採用                 | Hub側`ValueBatch`にrevision / `config_changed`相当がない。catalog pollingかproto拡張の設計が固まるまで保留する。 |
 
 RESTだけの定期pollingは、rename・rebind・削除を検知するまでの遅延を作る。WebSocketの
@@ -102,28 +106,40 @@ RESTだけの定期pollingは、rename・rebind・削除を検知するまでの
 
 ### 3.1 binding
 
-アプリは案件固有の外部名ではなく、次のstable IDとアプリ内のbinding keyを保存する。
+アプリは、Hubの外部名（`external_name` = `{connection}.{group}.{tag}`）とアプリ内の
+binding keyを保存する。bindingの同一性は外部名であり、Hub内部の数値ID（`StableTagId`）は
+bindingにも書き込みにも使わない。
 
 ```rust
+pub struct BindingRequest {
+	pub binding_key: String,
+	pub external_name: String,
+}
+
+// Hubのwire形式（`CatalogTag.ids`）。bindingには使わない。
 pub struct StableTagId {
 	pub connection_id: i64,
 	pub group_id: i64,
 	pub tag_id: i64,
 }
-
-pub struct BindingRequest {
-	pub binding_key: String,
-	pub stable_id: StableTagId,
-}
 ```
 
-`external_name`はcatalogから都度解決する表示用・購読用情報であり、bindingの同一性には
-用いない。public文書・fixtureに案件固有のtag名、tag ID、接続情報を入れない。
+**2026-09-30 オーナー決定（docs/scada-design.md §9.6）**: 従来の「アプリは案件固有の外部名ではなく
+stable IDを保存する」を撤回し、SCADA・ChronoGazer・Sinkなど全クライアントのBindingは購読も
+書き込みも`external_name`で行う。根拠は、IDは削除→同名再作成やCSV再取り込みで変わり環境をまたいで
+持ち越せないこと、Hubの公開契約（WS subscribe、`POST /api/v1/values/{tag}`、write scope、MQTT）は
+すべて名前であること。**改名でbindingがunresolvedになるのは仕様**であり
+（tag-server-design.md §4.1「リネームは破壊的変更」）、`binding_unresolved`として値をcurrent扱い
+せず、アプリが新しい名前を設定し直すまで復帰しない。削除→同名再作成は名前が同じなので、次の
+再bindで自動的に解決される。`StableTagId`型と`CatalogTag.ids`はHubのwire形式なのでそのまま
+残す（DB行の識別子など、bindingと無関係な用途に使ってよい）。public文書・fixtureに案件固有の
+tag名、tag ID、接続情報を入れない。
 
-要求`BindingRequest`の`binding_key`重複、stable ID三つ組の重複、catalog内のstable ID
+要求`BindingRequest`の`binding_key`重複、要求`external_name`の重複、catalog内の`external_name`
 重複は全てfail-closedとする。部分的にbindingを作らず、安定分類
-`duplicate_binding_key` / `duplicate_requested_stable_id` / `duplicate_catalog_stable_id`
+`duplicate_binding_key` / `duplicate_requested_external_name` / `duplicate_catalog_external_name`
 （実装では`invalid_bindings`または`invalid_catalog`の下位理由としてもよい）で返す。
+catalogに無い外部名はfail-closedではなく、その要求だけが`unresolved`になる（§3.2）。
 
 ### 3.2 値と未解決
 
@@ -198,7 +214,8 @@ impl RestClient {
 	pub async fn fetch_catalog(&self) -> Result<CatalogSnapshot>;
 	pub async fn fetch_values(&self, tags: &[&str]) -> Result<ValuesSnapshot>;
 	// W1（2026-09-01、Issue #123）: 単一タグ書き込み。§4.4参照。
-	pub async fn write_tag(&self, stable_id: StableTagId, value: RequestedValue) -> Result<()>;
+	// 2026-09-30: 外部名で書く（catalogは取得しない）。
+	pub async fn write_tag(&self, external_name: &str, value: RequestedValue) -> Result<()>;
 	pub fn start(self, requests: Vec<BindingRequest>) -> Result<TagClientHandle>;
 }
 
@@ -241,42 +258,55 @@ shutdownはそのエラーを返す。公開Handleによるcatalog起点の再�
 
 エラーは文字列だけで判定しない。少なくとも次の安定分類を持たせる。
 
-| 分類                            | 意味                                                                                                    | 再試行                                                                                   |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `unauthorized`                  | 401/403または資格情報の拒否                                                                             | 無限高速再試行しない。呼出側が資格情報を更新して再開始する。                             |
-| `transport`                     | 接続、timeout、切断                                                                                     | bounded exponential backoffで再接続する。                                                |
-| `protocol_error`                | 不正JSON、期待外メッセージ、契約違反                                                                    | 接続を閉じ、backoff後にcatalogから再開する。                                             |
-| `catalog_unavailable`           | catalog取得不能                                                                                         | backoff後にcatalogから再開する。                                                         |
-| `binding_unresolved`            | stable IDがcatalogで解決不能                                                                            | 接続は継続可能。対象値をcurrent扱いしない。                                              |
-| `revision_mismatch`             | catalogとvalues/snapshotのrevision不一致                                                                | bounded retry。整合するまでcurrentを公開しない。                                         |
-| `runtime_metadata_mismatch`     | revision/run_id/collection_mode不一致、または未知collection_mode                                        | bounded retry。整合するまでcurrentを公開しない。                                         |
-| `duplicate_binding_key`         | 要求`binding_key`重複                                                                                   | fail-closed。部分bindingを公開しない。                                                   |
-| `duplicate_requested_stable_id` | 要求stable ID重複                                                                                       | fail-closed。部分bindingを公開しない。                                                   |
-| `duplicate_catalog_stable_id`   | catalog内stable ID重複                                                                                  | fail-closed。部分bindingを公開しない。                                                   |
-| `invalid_endpoint`              | 禁止scheme/URL部品、redirect応答                                                                        | 再試行せず設定を修正する。                                                               |
-| `invalid_tag_selection`         | カンマを含む外部タグ名（Hubの単一queryで曖昧になるため拒否）                                            | 入力を修正する。                                                                         |
-| `stopped`                       | 呼出側の停止または正常shutdown                                                                          | 再接続しない。                                                                           |
-| `write_forbidden`               | 書き込みHTTP 403（`not_writable`/`missing_write_scope`/`session_token_cannot_write`/`key_tripped`、W1） | 設定・権限の問題。SDKは再試行しない。呼出側がタグ設定/APIキーscopeを直してから再度呼ぶ。 |
-| `write_unavailable`             | 書き込みHTTP 503（`writes_disabled`/`collection_not_running`、W1）                                      | 一時的なサーバー状態。SDKは再試行しない。呼出側の判断で後で再試行してよい。              |
-| `write_rejected`                | 書き込みのその他の拒否（404/409/422/429/501/502、W1）                                                   | リクエストの内容（タグ・値・timing）を直さない限り再試行しても成功しない。               |
-| `key_revoked`                   | Hubがストリームをclose 1008 `api_key_revoked`で閉じた（#446）                                           | 再接続しない（`unauthorized`で停止）。呼出側が新しいキーで再開始する。                   |
-| `key_expired`                   | close 1008 `api_key_expired`（#446）                                                                    | 同上。                                                                                   |
-| `key_not_found`                 | close 1008 `api_key_not_found`（#446）                                                                  | 同上。                                                                                   |
-| `key_tripped`                   | close 1008 `api_key_tripped`（#446、管理者が解除すれば同じキーで戻る）                                  | 再接続しない（`unauthorized`で停止）。解除後の再開始は呼出側が決める。                   |
-| `credential_rejected`           | close 1008 で理由文が上記以外（未知の理由、#446）                                                       | 再接続しない（`unauthorized`で停止）。                                                   |
+| 分類                                | 意味                                                                                                              | 再試行                                                                                   |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `unauthorized`                      | 401/403または資格情報の拒否                                                                                       | 無限高速再試行しない。呼出側が資格情報を更新して再開始する。                             |
+| `transport`                         | 接続、timeout、切断                                                                                               | bounded exponential backoffで再接続する。                                                |
+| `protocol_error`                    | 不正JSON、期待外メッセージ、契約違反                                                                              | 接続を閉じ、backoff後にcatalogから再開する。                                             |
+| `catalog_unavailable`               | catalog取得不能                                                                                                   | backoff後にcatalogから再開する。                                                         |
+| `binding_unresolved`                | 外部名がcatalogで解決不能（改名・削除・未作成）                                                                   | 接続は継続可能。対象値をcurrent扱いしない。                                              |
+| `revision_mismatch`                 | catalogとvalues/snapshotのrevision不一致                                                                          | bounded retry。整合するまでcurrentを公開しない。                                         |
+| `runtime_metadata_mismatch`         | revision/run_id/collection_mode不一致、または未知collection_mode                                                  | bounded retry。整合するまでcurrentを公開しない。                                         |
+| `duplicate_binding_key`             | 要求`binding_key`重複                                                                                             | fail-closed。部分bindingを公開しない。                                                   |
+| `duplicate_requested_external_name` | 要求外部名重複                                                                                                    | fail-closed。部分bindingを公開しない。                                                   |
+| `duplicate_catalog_external_name`   | catalog内外部名重複                                                                                               | fail-closed。部分bindingを公開しない。                                                   |
+| `invalid_endpoint`                  | 禁止scheme/URL部品、redirect応答                                                                                  | 再試行せず設定を修正する。                                                               |
+| `invalid_tag_selection`             | カンマを含む外部タグ名（Hubの単一queryで曖昧になるため拒否）。`write_tag`は空・空白のみの名前も同様に通信前に拒否 | 入力を修正する。                                                                         |
+| `stopped`                           | 呼出側の停止または正常shutdown                                                                                    | 再接続しない。                                                                           |
+| `write_forbidden`                   | 書き込みHTTP 403（`not_writable`/`missing_write_scope`/`session_token_cannot_write`/`key_tripped`、W1）           | 設定・権限の問題。SDKは再試行しない。呼出側がタグ設定/APIキーscopeを直してから再度呼ぶ。 |
+| `write_unavailable`                 | 書き込みHTTP 503（`writes_disabled`/`collection_not_running`、W1）                                                | 一時的なサーバー状態。SDKは再試行しない。呼出側の判断で後で再試行してよい。              |
+| `write_rejected`                    | 書き込みのその他の拒否（404/409/422/429/501/502、W1）                                                             | リクエストの内容（タグ・値・timing）を直さない限り再試行しても成功しない。               |
+| `key_revoked`                       | Hubがストリームをclose 1008 `api_key_revoked`で閉じた（#446）                                                     | 再接続しない（`unauthorized`で停止）。呼出側が新しいキーで再開始する。                   |
+| `key_expired`                       | close 1008 `api_key_expired`（#446）                                                                              | 同上。                                                                                   |
+| `key_not_found`                     | close 1008 `api_key_not_found`（#446）                                                                            | 同上。                                                                                   |
+| `key_tripped`                       | close 1008 `api_key_tripped`（#446、管理者が解除すれば同じキーで戻る）                                            | 再接続しない（`unauthorized`で停止）。解除後の再開始は呼出側が決める。                   |
+| `credential_rejected`               | close 1008 で理由文が上記以外（未知の理由、#446）                                                                 | 再接続しない（`unauthorized`で停止）。                                                   |
 
 `Debug`/`Display`、エラー、ログにtokenを含めない。endpointについてもhost以外のpathや
 資格情報を露出しない。secret wrapperは値を常にredactする。
 
 ### 4.4 書き込み（W1、Issue #123、2026-09-01）
 
-`RestClient::write_tag(stable_id, value)`は`POST /api/v1/values/{tag}`
+`RestClient::write_tag(external_name, value)`は`POST /api/v1/values/{tag}`
 （tag-server-design.md §6「書き込み経路の安全設計」）を1回叩くだけの単一タグ書き込みで
-ある。`external_name`は直接受け取らず、呼び出しの都度`GET /api/v1/tags`を取得して
-`stable_id`から解決する（読取・購読と同じ`binding.rs`の`resolve_bindings`を再利用）。
-リネームで`external_name`が変わっても呼出側のコードは変更不要という読取・購読と同じ
-契約を書き込みにも及ぼすためであり、キャッシュした名前を書き込みに使うと「解決した
-時点では正しかったが、書く時点では別タグを指す」レースを埋め込む。
+ある。**catalogは取得しない**。外部名はHubの書き込み契約（パス、write scope）そのものの鍵
+なので、呼び出し側が渡した名前をそのまま送る。空・空白のみ・カンマを含む名前は
+`fetch_values`と同じ規則で送信前に`invalid_tag_selection`として拒否する。
+
+**2026-09-30 オーナー決定（docs/scada-design.md §9.6）**: 当初（W1、2026-09-01）は
+`write_tag(stable_id, value)`とし、呼び出しの都度`GET /api/v1/tags`を取得して`stable_id`から
+外部名を解決していた（キャッシュした名前を書き込みに使うと「解決した時点では正しかったが、
+書く時点では別タグを指す」レースを埋め込むため）。これを撤回し、bindingと同様に外部名で書く。
+根拠は§3.1のとおり（IDは削除→同名再作成やCSV再取り込みで変わる、Hubの公開契約はすべて名前）。
+改名直後は旧名がHubに存在しないので**Hubが404を返し（`write_rejected`）、誤書き込みには
+ならない**。
+
+残る穴は「改名直後に、旧名で別のタグが登録された」場合で、書き込みがその別タグに届いてしまう。
+これは、writeリクエストに**期待するcatalog revisionを付け、Hubが不一致を拒否する**拡張で塞ぐ
+予定である（docs/scada-design.md §9.6、**未実装**）。旧設計が都度catalogを取って塞ごうとして
+いた「解決した時点では正しかったが、書く時点では別タグを指す」レースの懸念は、この
+Hub側の照合で塞ぐ。SDK側でcatalogを取り直す方式には戻さない。SDKは書き込みを再試行しない
+（下のオーナー決定2）。
 
 **オーナー決定1: バッチ・レシピ書き込みは実装しない（2026-09-01）**。産業用途では
 設定値一式をまとめて流すレシピ書き込みの実需要があるが、サーバー側の
@@ -364,7 +394,7 @@ stateDiagram-v2
 ```
 
 接続開始・再接続・rebinding後の新世代確立は、同じrace-free publish gateを通る。catalogを
-取得してstable IDをresolveした後、先にWS接続とsubscribeを成立させる。WSの初期dataと
+取得して外部名をresolveした後、先にWS接続とsubscribeを成立させる。WSの初期dataと
 以後のdataは、無制限queueではなくbinding/tagごとに最新1件だけを保持するbounded pending
 mapへcoalesceし、この時点ではcurrentへ公開しない。その後REST snapshot
 を取得し、catalogとvaluesの`revision`、`run_id`、`collection_mode`が全て一致し、
@@ -384,7 +414,7 @@ sequenceDiagram
 	A->>C: start(bindings)
 	C->>H: GET catalog
 	H-->>C: catalog + revision + run_id + collection_mode + value_source
-	C->>C: stable ID resolve
+	C->>C: 外部名 resolve
 	C->>H: WS connect / subscribe(on_change)
 	H-->>C: initial data (buffer; do not publish)
 	C->>H: GET explicit tag snapshot
@@ -403,8 +433,9 @@ sequenceDiagram
 
 `config_changed`受信時は直ちに`rebinding`へ遷移し、旧値をcurrent扱いしない。rebinding中に
 同じまたは別revisionの通知が連打されても、通知をキューへ無制限に積まず「再解決が必要」
-という一つのpending状態へcoalesceする。1回の試行は必ずcatalog取得から始め、stable IDを
-再解決し、値snapshotのrevision、run_id、collection_modeがcatalogと一致した場合だけ新しい
+という一つのpending状態へcoalesceする。1回の試行は必ずcatalog取得から始め、外部名を
+再解決し（改名された名前は新しいcatalogに無いので`binding_unresolved`になり、値をcurrent扱いしない。
+削除→同名再作成は名前が同じなので自動的に解決される）、値snapshotのrevision、run_id、collection_modeがcatalogと一致した場合だけ新しい
 購読・currentを公開する。publish gate中のWS値はbinding/tagごとの最新1件だけを保持し、
 各値の`(source timestamp t, receive sequence)`を比較する。REST snapshotより古い、または
 同値で安定規則上古いpendingは破棄し、新しいpendingだけをsnapshotへ重ねて一つのsnapshot
@@ -647,8 +678,8 @@ feature不使用、既定features）を対象に、一時的に`banto-tagclient`
 
 | テスト                       | 確認する契約                                                                                      |
 | ---------------------------- | ------------------------------------------------------------------------------------------------- |
-| catalog resolve              | stable IDから外部名・購読対象を解決できる。                                                       |
-| unknown stable ID            | `binding_unresolved`になり、値をcurrent扱いしない。                                               |
+| catalog resolve              | 外部名でcatalogを引き、購読対象を解決できる。                                                     |
+| unknown external name        | `binding_unresolved`になり、値をcurrent扱いしない。                                               |
 | initial snapshot             | REST snapshotとWS初期dataでlatestが更新される。                                                   |
 | race-free publish gate       | WSを先に成立させ、snapshot後の通知取り逃しを防ぎ、gate確認前のdataを公開しない。                  |
 | handshake buffer latest-wins | pending mapはbinding/tagごとに最新1件だけを保持し、snapshotより古いWS frameは上書きせず破棄する。 |
@@ -656,7 +687,7 @@ feature不使用、既定features）を対象に、一時的に`banto-tagclient`
 | revision一致ゲート           | catalogとvalues/snapshotのrevision不一致を公開せず、catalogからbounded retryする。                |
 | runtime metadata一致         | revision/run_id/collection_modeを同一generationとして検証し、未知mode・不一致をfail-safeにする。  |
 | value_source未知値           | `Unknown(raw)`で保持し、実機値/`Real`と誤認しない。                                               |
-| duplicate拒否                | binding_key、要求stable ID、catalog stable IDの重複をfail-closedにする。                          |
+| duplicate拒否                | binding_key、要求外部名、catalog外部名の重複をfail-closedにする。                                 |
 | endpoint boundary            | userinfo/query/fragment、禁止scheme、redirectを拒否する。                                         |
 | disconnect/reconnect         | bounded backoff後、catalog/snapshotから接続を再構築する。                                         |
 | 401/403                      | `unauthorized`になり、高速無限再試行しない。                                                      |
@@ -666,30 +697,30 @@ feature不使用、既定features）を対象に、一時的に`banto-tagclient`
 | backpressure/latest-wins     | 遅いconsumerでもqueueが無制限に増えず、最新値を観測できる。                                       |
 | shutdown                     | task、socket、channelが残留しない。                                                               |
 | secret redaction             | Debug/Display/エラー/ログへtokenやendpoint pathを出さない。                                       |
-| write成功（W1）              | stable IDから解決した外部名へ`POST /api/v1/values/{tag}`が送られ、成功する。                      |
+| write成功（W1）              | 渡した外部名へ`GET /api/v1/tags`なしで`POST /api/v1/values/{tag}`が1回だけ送られ、成功する。      |
 | write 403/503区別（W1）      | HTTP 403は`write_forbidden`、503は`write_unavailable`として区別して返る。                         |
 | writeその他拒否（W1）        | 404/409/422/429/501/502が`write_rejected`へ集約される。                                           |
 | write不再試行（W1）          | 送信失敗後に2回目の接続が発生せず、backoffなしで即座にエラーが返る。                              |
-| write解決前fail-closed（W1） | catalog取得失敗・stable ID未解決の場合にPOSTを一切送らない。                                      |
+| write入力検査（W1）          | 空・空白のみ・カンマを含む外部名は通信前に`invalid_tag_selection`で拒否し、何も送らない。         |
 | write診断redaction（W1）     | 書き込み失敗の診断ログにsecretとendpoint pathが出ない。                                           |
 
 ## 9. 実装sliceと完了条件
 
-| slice  | 内容                                                           | 完了条件                                                                                                                                                                         |
-| ------ | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S1a    | crate骨格、共通DTO、SecretApiKey、Endpoint、stable ID resolver | URL境界・redaction・metadata保持・unknown値保持・重複fail-closed・catalog resolveテストが通る。REST送信、Authorization、redirect処理は含めない。                                 |
-| S1b    | REST catalog/values transport、Authorization、redirect拒否     | reqwestによる読み取り専用GET、認証ヘッダ、redirectを追従しない設定、HTTPエラー分類のテストが通る。                                                                               |
-| S2a    | WS wire解析、publish gate、latest snapshot、状態DTO            | malformed/unknown/id・tag拒否、bounded pending、handshake latest-wins、RESTとのtimestamp/sequence統合、metadata一致、非LIVE current抑止の純粋coreテストが通る。                  |
-| S2b-1  | 認証付きWebSocket handshake transport                          | prefix保持URL、Authorization、redirect非追従、HTTP/timeout分類、1MiB制限、秘密redactionのテストが通る。                                                                          |
-| S2b-2a | on_change subscribe送信、1フレーム受信                         | 厳密なsubscribe JSON、共通tag validation、native Ping/Pong、Text受信、Binary/Close/EOF/容量分類のテストが通る。                                                                  |
-| S2b-2b | 単一世代worker、watch latest snapshot配信、atomic publish      | catalog→WS subscribe→初回data→REST gateの順序、完全snapshotのatomic publish、live更新のlatest-wins、失敗時current消去のテストが通る。                                            |
-| S2     | WS購読、latest snapshot、状態機械                              | S2a/S2b-1/S2b-2a/S2b-2bの完了条件を満たし、WS先行接続から単一世代のatomic publishまでの全テストが通る。公開Handle、再接続、rebinding、shutdownはS3a/S3bで扱う。                  |
-| S3a    | 公開Handle、worker所有権、明示shutdown、Drop abort             | runtime外startのfail-closed、state/state_watch、Live後のgraceful close/join、in-flight stop、失敗error保持、Drop後のcurrent消去テストが通る。                                    |
-| S3b-1  | catalog起点の再接続、backoff、停止割り込み                     | Transport/ProtocolError/CatalogUnavailableを逐次retryし、Unauthorized等をterminal扱いにする。Live後のbackoff reset、Reconnecting中のcurrent消去、停止割り込みテストが通る。      |
-| S3b-2  | config_changed、rebinding/coalesce、再解決、retry拡張          | revision/runtime metadata不一致の再解決、coalesced rebind、旧値無効化、停止可能なrebind retryを実装し、テストが通る。                                                            |
-| S4a    | 公開restart、credential置換、旧世代join                        | terminal/Live世代の置換、旧watchのclean停止、旧join前の新接続抑止、restart cancellation、JoinError fail-closedのテストが通る。                                                   |
-| S4     | workspace統合と互換性固定                                      | S4互換tag固定、実Hub/LAN統合検証、依存レビューと最終互換性確認を完了する。                                                                                                       |
-| W1     | 単一タグ書き込み（Issue #123残スコープ）                       | stable ID解決・単一POST・403/503/その他拒否の分類・自動再試行なし・診断redactionのテストが通る。バッチ/レシピ書き込みは実装しない（本書§4.4オーナー決定1、需要が出るまで保留）。 |
+| slice  | 内容                                                       | 完了条件                                                                                                                                                                                                     |
+| ------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| S1a    | crate骨格、共通DTO、SecretApiKey、Endpoint、外部名resolver | URL境界・redaction・metadata保持・unknown値保持・重複fail-closed・外部名によるcatalog resolveテストが通る。REST送信、Authorization、redirect処理は含めない。                                                 |
+| S1b    | REST catalog/values transport、Authorization、redirect拒否 | reqwestによる読み取り専用GET、認証ヘッダ、redirectを追従しない設定、HTTPエラー分類のテストが通る。                                                                                                           |
+| S2a    | WS wire解析、publish gate、latest snapshot、状態DTO        | malformed/unknown/id・tag拒否、bounded pending、handshake latest-wins、RESTとのtimestamp/sequence統合、metadata一致、非LIVE current抑止の純粋coreテストが通る。                                              |
+| S2b-1  | 認証付きWebSocket handshake transport                      | prefix保持URL、Authorization、redirect非追従、HTTP/timeout分類、1MiB制限、秘密redactionのテストが通る。                                                                                                      |
+| S2b-2a | on_change subscribe送信、1フレーム受信                     | 厳密なsubscribe JSON、共通tag validation、native Ping/Pong、Text受信、Binary/Close/EOF/容量分類のテストが通る。                                                                                              |
+| S2b-2b | 単一世代worker、watch latest snapshot配信、atomic publish  | catalog→WS subscribe→初回data→REST gateの順序、完全snapshotのatomic publish、live更新のlatest-wins、失敗時current消去のテストが通る。                                                                        |
+| S2     | WS購読、latest snapshot、状態機械                          | S2a/S2b-1/S2b-2a/S2b-2bの完了条件を満たし、WS先行接続から単一世代のatomic publishまでの全テストが通る。公開Handle、再接続、rebinding、shutdownはS3a/S3bで扱う。                                              |
+| S3a    | 公開Handle、worker所有権、明示shutdown、Drop abort         | runtime外startのfail-closed、state/state_watch、Live後のgraceful close/join、in-flight stop、失敗error保持、Drop後のcurrent消去テストが通る。                                                                |
+| S3b-1  | catalog起点の再接続、backoff、停止割り込み                 | Transport/ProtocolError/CatalogUnavailableを逐次retryし、Unauthorized等をterminal扱いにする。Live後のbackoff reset、Reconnecting中のcurrent消去、停止割り込みテストが通る。                                  |
+| S3b-2  | config_changed、rebinding/coalesce、再解決、retry拡張      | revision/runtime metadata不一致の再解決、coalesced rebind、旧値無効化、停止可能なrebind retryを実装し、テストが通る。                                                                                        |
+| S4a    | 公開restart、credential置換、旧世代join                    | terminal/Live世代の置換、旧watchのclean停止、旧join前の新接続抑止、restart cancellation、JoinError fail-closedのテストが通る。                                                                               |
+| S4     | workspace統合と互換性固定                                  | S4互換tag固定、実Hub/LAN統合検証、依存レビューと最終互換性確認を完了する。                                                                                                                                   |
+| W1     | 単一タグ書き込み（Issue #123残スコープ）                   | 外部名指定（2026-09-30）・catalog取得なしの単一POST・403/503/その他拒否の分類・自動再試行なし・診断redactionのテストが通る。バッチ/レシピ書き込みは実装しない（本書§4.4オーナー決定1、需要が出るまで保留）。 |
 
 初版のDefinition of Doneは、全テスト表を自動化し、PLC直結が存在せず、
 demoへの自動fallbackがなく、認証情報が全観測可能面からredactされ、停止後にworkerが
