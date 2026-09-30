@@ -51,7 +51,11 @@
 //! 後の行は新しい名前になる - §5.3）。購読中に subscribed タグが rename された
 //! 場合は、SDK が世代を落として catalog から再試行し続けるので、
 //! [`Subscription::needs_replan`] で検出して直ちに計画を作り直し、残りの
-//! タグで復帰させる。
+//! タグで復帰させる。周期的な再計画は購読を止める**前**に catalog を引いて
+//! 計画だけを作り、計画が変わらなければ既存の購読は維持し、張り直さない
+//! （張り直すと正常なタグの記録が再ハンドシェイクの間だけ途切れ、その catalog
+//! 取得が一時失敗すると正常だった購読まで失うため。[`plan_subscription`] /
+//! [`Subscription::start_with_plan`]）。
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,6 +152,26 @@ pub fn plan_bindings(desired: &[String], catalog: &CatalogSnapshot) -> BindingPl
     }
 }
 
+fn rest_client(config: &SidecarConfig) -> Result<RestClient, banto_tagclient::Error> {
+    let endpoint = Endpoint::new(&config.hub_url)?;
+    let secret = SecretApiKey::new(config.api_key.clone())?;
+    RestClient::new(endpoint, secret)
+}
+
+/// catalog を 1 回取得して `desired` の購読計画を返す。**購読は張らない**
+/// （SDK も WS も触らない、REST 1 リクエストだけの問い合わせ）。
+///
+/// 周期的な再計画が、現在の購読を止める**前**に「計画が変わるか」を調べる
+/// ために使う。catalog を取得できなければ `Err`（その場合、呼び出し側は
+/// 既存の購読を維持できる）。
+pub async fn plan_subscription(
+    config: &SidecarConfig,
+    desired: &[String],
+) -> Result<BindingPlan, banto_tagclient::Error> {
+    let catalog = rest_client(config)?.fetch_catalog().await?;
+    Ok(plan_bindings(desired, &catalog))
+}
+
 /// 購読 1 世代（SDK ハンドル + 変換タスク）。設定変更で対象タグの集合が
 /// 変わったとき、SDK の worker が終了したとき、または計画を作り直す
 /// 必要が出たとき（[`Self::needs_replan`]、`unresolved` が残っている間の
@@ -176,9 +200,9 @@ impl Subscription {
     /// 購読を開始する。`desired` は重複除去・ソート済みであること
     /// （[`normalize_names`]）。空なら `None`（購読するものが無い）。
     ///
-    /// catalog を 1 度取得して [`plan_bindings`] で分け、**`resolved` だけ**を
-    /// SDK へ渡す。catalog を取得できなければ `Err`（呼び出し側の
-    /// バックオフに乗せる）。
+    /// catalog を 1 度取得して [`plan_bindings`] で分け（[`plan_subscription`]）、
+    /// **`resolved` だけ**を SDK へ渡す（[`Self::start_with_plan`]）。catalog を
+    /// 取得できなければ `Err`（呼び出し側のバックオフに乗せる）。
     pub async fn start(
         config: &SidecarConfig,
         desired: Vec<String>,
@@ -188,14 +212,30 @@ impl Subscription {
             let _ = view_tx.send(Arc::new(ValueView::default()));
             return Ok(None);
         }
-        let endpoint = Endpoint::new(&config.hub_url)?;
-        let secret = SecretApiKey::new(config.api_key.clone())?;
-        let rest = RestClient::new(endpoint, secret)?;
-        let catalog = rest.fetch_catalog().await?;
+        let plan = plan_subscription(config, &desired).await?;
+        Self::start_with_plan(config, desired, plan, view_tx)
+    }
+
+    /// 計画済みの `plan.resolved` だけで購読を開始する。catalog は取らない
+    /// （周期的な再計画が [`plan_subscription`] で先に引いた結果をそのまま
+    /// 使い、catalog を二度取らないため）。`desired` は [`Self::start`] と
+    /// 同じく正規化済みで、空なら `None`。
+    ///
+    /// `resolved` が空なら SDK は起動せず、ハンドル無しの購読を返す。
+    pub fn start_with_plan(
+        config: &SidecarConfig,
+        desired: Vec<String>,
+        plan: BindingPlan,
+        view_tx: watch::Sender<Arc<ValueView>>,
+    ) -> Result<Option<Self>, banto_tagclient::Error> {
+        if desired.is_empty() {
+            let _ = view_tx.send(Arc::new(ValueView::default()));
+            return Ok(None);
+        }
         let BindingPlan {
             resolved,
             unresolved,
-        } = plan_bindings(&desired, &catalog);
+        } = plan;
         let dead = Arc::new(AtomicBool::new(false));
         let replan = Arc::new(AtomicBool::new(false));
         if resolved.is_empty() {
@@ -218,7 +258,7 @@ impl Subscription {
                 external_name: name.clone(),
             })
             .collect();
-        let handle = rest.start(requests)?;
+        let handle = rest_client(config)?.start(requests)?;
         let state_rx = handle.state_watch();
         let pump = tokio::spawn(pump_values(state_rx, view_tx, dead.clone(), replan.clone()));
         Ok(Some(Self {
@@ -261,6 +301,15 @@ impl Subscription {
     /// 今は購読できない名前。
     pub fn unresolved(&self) -> &[String] {
         &self.unresolved
+    }
+
+    /// この世代の計画（`resolved` / `unresolved` のコピー）。周期的な再計画が
+    /// 新しい計画と比べて「変わらなければ購読を維持する」ために使う。
+    pub fn plan(&self) -> BindingPlan {
+        BindingPlan {
+            resolved: self.resolved.clone(),
+            unresolved: self.unresolved.clone(),
+        }
     }
 
     /// worker を停止して join し、変換タスクも畳む。
@@ -537,6 +586,102 @@ mod tests {
         // SDK を起動していないので、catalog 取得の 1 回だけ。
         assert_eq!(requests.lock().unwrap().len(), 1);
         subscription.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn plan_subscription_only_fetches_the_catalog() {
+        let (config, requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
+        let plan = plan_subscription(&config, &owned(&["a", "gone"]))
+            .await
+            .unwrap();
+        assert_eq!(plan.resolved, owned(&["a"]));
+        assert_eq!(plan.unresolved, owned(&["gone"]));
+        // 購読は張らない（WS 接続を試みない）ので、catalog 取得の 1 回だけ。
+        // SDK が起動していれば WS 接続の試行が追加で届くので、少し待って確認する。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("GET /api/v1/tags "));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn plan_subscription_fails_when_the_catalog_cannot_be_fetched() {
+        let (config, _requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
+        server.abort();
+        let _ = server.await;
+        assert!(plan_subscription(&config, &owned(&["a"])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn start_with_plan_without_resolved_names_has_no_handle() {
+        let (config, requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
+        let (view_tx, view_rx) = watch::channel(Arc::new(ValueView {
+            live: true,
+            values: HashMap::new(),
+        }));
+        let plan = BindingPlan {
+            resolved: Vec::new(),
+            unresolved: owned(&["gone"]),
+        };
+        let subscription =
+            Subscription::start_with_plan(&config, owned(&["gone"]), plan.clone(), view_tx)
+                .unwrap()
+                .expect("全部 unresolved でも Some");
+        assert!(subscription.handle.is_none());
+        assert!(subscription.pump.is_none());
+        assert_eq!(subscription.plan(), plan);
+        assert!(!view_rx.borrow().live);
+        // catalog は取らない。
+        assert!(requests.lock().unwrap().is_empty());
+        subscription.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn start_with_plan_with_resolved_names_starts_the_sdk_without_a_catalog_fetch() {
+        let (config, requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
+        let (view_tx, _view_rx) = watch::channel(Arc::new(ValueView::default()));
+        let plan = BindingPlan {
+            resolved: owned(&["a"]),
+            unresolved: owned(&["gone"]),
+        };
+        let subscription =
+            Subscription::start_with_plan(&config, owned(&["a", "gone"]), plan.clone(), view_tx)
+                .unwrap()
+                .expect("resolved があれば購読は作られる");
+        assert!(subscription.handle.is_some());
+        assert!(subscription.pump.is_some());
+        assert_eq!(subscription.plan(), plan);
+        assert_eq!(subscription.desired(), owned(&["a", "gone"]).as_slice());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("GET /api/v1/tags ")),
+            "計画済みなので catalog は取らない"
+        );
+        // SDK の WS 接続はモックが 404 で切るので失敗するが、ここでは無視して畳む。
+        tokio::time::timeout(std::time::Duration::from_secs(5), subscription.stop())
+            .await
+            .expect("stop は WS 接続の失敗待ちで詰まらない");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn start_with_plan_on_empty_desired_is_none() {
+        let (config, _requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
+        let (view_tx, _view_rx) = watch::channel(Arc::new(ValueView::default()));
+        assert!(Subscription::start_with_plan(
+            &config,
+            Vec::new(),
+            BindingPlan::default(),
+            view_tx
+        )
+        .unwrap()
+        .is_none());
         server.abort();
     }
 

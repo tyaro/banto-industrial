@@ -55,7 +55,7 @@ use crate::hub_api::{
 };
 use crate::log::{log_err_line, log_line};
 use crate::status::{push_entry, GroupState, Redactor};
-use crate::values::{normalize_names, Subscription, ValueView};
+use crate::values::{normalize_names, plan_subscription, BindingPlan, Subscription, ValueView};
 
 /// 購読の生存確認の間隔。
 const HEALTH_TICK: Duration = Duration::from_secs(1);
@@ -423,23 +423,38 @@ impl Engine {
     /// 作り直す条件は 3 つ:
     ///
     /// 1. `dead` - SDK の worker が終了した（バックオフあり）。
-    /// 2. `changed` - 購読したい名前の集合が変わった（設定変更）。
-    /// 3. `replan` - SDK が `BindingUnresolved` を報告した、または unresolved
-    ///    が残っていて再計画の時刻（`replan_interval`）を過ぎた。SDK は 1 件
-    ///    でも unresolved だと世代全体を落とすので、Sink が catalog を引いて
-    ///    解決できる名前だけで張り直す（[`crate::values::plan_bindings`]）。
-    ///    バックオフは掛けない。
+    /// 2. `changed` / `needs_replan` - 購読したい名前の集合が変わった（設定
+    ///    変更）、または SDK が `BindingUnresolved` を報告した（購読中の
+    ///    rename 等）。SDK は 1 件でも unresolved だと世代全体を落とすので、
+    ///    Sink が catalog を引いて解決できる名前だけで**直ちに**張り直す
+    ///    （[`crate::values::plan_bindings`]。バックオフは掛けない）。
+    /// 3. 周期的 replan - 上のどれでもなく、unresolved が残っていて再計画の
+    ///    時刻（`replan_interval`）を過ぎた。同名再作成や新名の復帰を拾うための
+    ///    ものだが、**現在の購読を止める前に** catalog を取って計画だけを作り
+    ///    （[`plan_subscription`]）、計画が前回と同じなら `next_replan_at` を
+    ///    進めるだけで購読を維持する（正常タグの記録を 30 秒ごとに途切れ
+    ///    させない）。catalog を取得できなかったときも購読を維持して次の
+    ///    周期で再試行する（一時的な失敗で正常だった購読を失わない）。計画が
+    ///    変わったときだけ、取得済みの計画で張り直す（catalog を二度取らない）。
     async fn ensure_subscription(&mut self) {
         let desired = self.desired_external_names();
-        // replan だけで作り直すときの、前世代の計画（ログの重複抑止用）。
-        let mut previous_plan: Option<(Vec<String>, Vec<String>)> = None;
+        // 即時の張り直し（`needs_replan`）のときの、前世代の計画（ログの
+        // 重複抑止用）。周期的 replan は計画が変わったときしか張り直さない
+        // ので、常にログを出せばよく、これは使わない。
+        let mut previous_plan: Option<BindingPlan> = None;
+        // 周期的 replan が先に作った新しい計画（`Some` なら catalog は取得済み）。
+        let mut fresh_plan: Option<BindingPlan> = None;
 
         if let Some(subscription) = &self.subscription {
             let dead = subscription.is_dead();
             let changed = subscription.desired() != desired.as_slice();
-            let replan = subscription.needs_replan()
-                || (!subscription.unresolved().is_empty() && Instant::now() >= self.next_replan_at);
-            if !dead && !changed && !replan {
+            let needs_replan = subscription.needs_replan();
+            let periodic_due = !dead
+                && !changed
+                && !needs_replan
+                && !subscription.unresolved().is_empty()
+                && Instant::now() >= self.next_replan_at;
+            if !dead && !changed && !needs_replan && !periodic_due {
                 if self.view_rx.borrow().live {
                     // 一度でも Live になったら、次の障害は 1 秒から
                     // やり直す（`banto_tagclient` の RetryTracker と同じ
@@ -448,11 +463,32 @@ impl Engine {
                 }
                 return;
             }
-            if !dead && !changed {
-                previous_plan = Some((
-                    subscription.resolved().to_vec(),
-                    subscription.unresolved().to_vec(),
-                ));
+            if periodic_due {
+                // 購読を止める前に計画だけを作る。
+                let current = subscription.plan();
+                let fresh = plan_subscription(&self.config, &desired).await;
+                let error_kind = fresh
+                    .as_ref()
+                    .err()
+                    .map(|err| err.kind().as_str().to_owned());
+                match replan_decision(&current, fresh) {
+                    ReplanDecision::Keep => {
+                        self.next_replan_at = Instant::now() + self.options.replan_interval;
+                        return;
+                    }
+                    ReplanDecision::KeepAfterError => {
+                        self.next_replan_at = Instant::now() + self.options.replan_interval;
+                        // 30 秒ごとなので rate limit はしない。
+                        log_err_line(&format!(
+                            "banto-hub-sink: warn: 未解決タグの再計画で catalog を取得できません（購読は維持します）: {}",
+                            error_kind.unwrap_or_default()
+                        ));
+                        return;
+                    }
+                    ReplanDecision::Restart(plan) => fresh_plan = Some(plan),
+                }
+            } else if !dead && !changed {
+                previous_plan = Some(subscription.plan());
             }
             if let Some(subscription) = self.subscription.take() {
                 subscription.stop().await;
@@ -479,19 +515,26 @@ impl Engine {
             }
         }
         self.subscription_retry_at = None;
-        match Subscription::start(&self.config, desired, self.view_tx.clone()).await {
+        let started = match fresh_plan {
+            Some(plan) => {
+                Subscription::start_with_plan(&self.config, desired, plan, self.view_tx.clone())
+            }
+            None => Subscription::start(&self.config, desired, self.view_tx.clone()).await,
+        };
+        match started {
             Ok(subscription) => {
                 self.next_replan_at = Instant::now() + self.options.replan_interval;
                 self.subscription = subscription;
                 if let Some(subscription) = &self.subscription {
-                    let plan = (
-                        subscription.resolved().to_vec(),
-                        subscription.unresolved().to_vec(),
-                    );
-                    // 周期的な再計画で結果が変わらなかったときは黙る
-                    // （unresolved が残る間 30 秒ごとにログが出続けない）。
+                    let plan = subscription.plan();
+                    // 即時の張り直しで結果が変わらなかったときは黙る
+                    // （SDK が落とす世代を繰り返し張り直す間、同じログが
+                    // 出続けない）。
                     if previous_plan.as_ref() != Some(&plan) {
-                        log_line(&subscribed_message(self.subscribed_len(), &plan.1));
+                        log_line(&subscribed_message(
+                            subscription.resolved().len(),
+                            &plan.unresolved,
+                        ));
                     }
                 }
             }
@@ -505,13 +548,6 @@ impl Engine {
                 ));
             }
         }
-    }
-
-    /// 実際に SDK へ渡している（catalog で解決できた）タグ数。
-    fn subscribed_len(&self) -> usize {
-        self.subscription
-            .as_ref()
-            .map_or(0, |subscription| subscription.resolved().len())
     }
 
     /// 全 sink group の対象タグの和集合（`external_name`、重複除去・ソート済み）。
@@ -697,6 +733,28 @@ where
     Ok(())
 }
 
+/// 周期的な再計画の判定結果（[`replan_decision`]）。
+#[derive(Debug, PartialEq, Eq)]
+enum ReplanDecision {
+    /// 計画は前回と同じ。購読を維持して `next_replan_at` だけ進める。
+    Keep,
+    /// 計画が変わった。この計画で購読を張り直す（catalog は取得済み）。
+    Restart(BindingPlan),
+    /// catalog を取得できなかった。購読は維持して次の周期で再試行する。
+    KeepAfterError,
+}
+
+/// 周期的な再計画で、現在の購読（`current`）と新しく作った計画（`fresh`）を
+/// 比べ、購読を維持するか張り直すかを決める**純関数**。張り直しは購読中の
+/// 正常タグの記録を途切れさせるので、計画が変わったときだけに限る。
+fn replan_decision<E>(current: &BindingPlan, fresh: Result<BindingPlan, E>) -> ReplanDecision {
+    match fresh {
+        Ok(plan) if plan == *current => ReplanDecision::Keep,
+        Ok(plan) => ReplanDecision::Restart(plan),
+        Err(_) => ReplanDecision::KeepAfterError,
+    }
+}
+
 /// 未解決の名前を何件までログへ列挙するか。
 const UNRESOLVED_LOG_LIMIT: usize = 5;
 
@@ -757,6 +815,46 @@ mod tests {
 
     use super::*;
     use crate::hub_api::SinkConfigTag;
+
+    fn plan(resolved: &[&str], unresolved: &[&str]) -> BindingPlan {
+        BindingPlan {
+            resolved: resolved.iter().map(|n| (*n).to_owned()).collect(),
+            unresolved: unresolved.iter().map(|n| (*n).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn replan_decision_keeps_the_subscription_when_the_plan_is_unchanged() {
+        let current = plan(&["a"], &["gone"]);
+        assert_eq!(
+            replan_decision::<()>(&current, Ok(plan(&["a"], &["gone"]))),
+            ReplanDecision::Keep
+        );
+    }
+
+    #[test]
+    fn replan_decision_restarts_with_the_fresh_plan_when_it_changed() {
+        let current = plan(&["a"], &["gone"]);
+        // 同名再作成で unresolved が resolved へ移った。
+        assert_eq!(
+            replan_decision::<()>(&current, Ok(plan(&["a", "gone"], &[]))),
+            ReplanDecision::Restart(plan(&["a", "gone"], &[]))
+        );
+        // 新たに catalog から消えた名前がある。
+        assert_eq!(
+            replan_decision::<()>(&current, Ok(plan(&[], &["a", "gone"]))),
+            ReplanDecision::Restart(plan(&[], &["a", "gone"]))
+        );
+    }
+
+    #[test]
+    fn replan_decision_keeps_the_subscription_when_the_catalog_fetch_failed() {
+        let current = plan(&["a"], &["gone"]);
+        assert_eq!(
+            replan_decision(&current, Err("timeout")),
+            ReplanDecision::KeepAfterError
+        );
+    }
 
     fn connection(id: i64, password: &str) -> SinkConfigConnection {
         SinkConfigConnection {
