@@ -1,6 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
+最終更新: 2026-09-30（レビュー反映: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみと決定（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -122,6 +123,10 @@ Editor が無くても手書き Project から Runtime が成立する境界を�
 
 ## 2. 全体アーキテクチャ
 
+SCADA は Hub を PLC / DB 等への接続境界として利用する。
+ただし Alarm / Tracking / automation 等の追加 domain を
+**すべて banto-hub 本体へ実装することは現時点では決定しない**。
+
 ```text
 PLC / field devices
         |
@@ -129,64 +134,87 @@ PLC / field devices
 +----------------------------+
 |         banto-hub          |
 |                            |
-| Tag Space                  |
-| Historian                  |
-| Alarm Engine               |
-| Tracking ingest/state      |
-| DB resources               |
-| Write / Audit              |
-| Server Actions             |
+| Tag Space / Catalog        |
+| PLC Read / Write           |
+| Auth / Write Audit         |
+| existing DB source/sink IF |
 +-------------+--------------+
               |
       REST / WS / future IF
               |
               v
-      banto-tagclient
+      Hub client layer
               |
               v
 +----------------------------+
 |        banto-scada         |
 |                            |
 | Screen Runtime             |
-| Alarm Viewer               |
-| Trend Viewer               |
-| Tracking Viewer            |
+| Trend / Alarm UI           |
+| Tracking UI                |
 | DataGrid / Form            |
-| Event / Action Engine      |
+| UI Event / Action          |
 | Project Editor             |
 +----------------------------+
+
+Optional / future domains
+  Alarm domain
+  Tracking domain
+  History（ChronoGazer と共有する記録・トレンド資産。Hub 外、§13）
+  DB tabular resource
+  always-on Event / Action
+       |
+       +-- host process / ownership は個別に議論
 ```
+
+Hub を integration boundary として使うことと、
+全 domain の実行主体を Hub process に集約することは同義ではない。
+追加機能は独立 crate / service を選択できる境界を維持する。
 
 ---
 
-## 3. v1 の対象と非対象
+## 3. v1 スコープ案（未決）
 
-### 対象
+v1 の完了条件はまだ決定しない。本節は PR 時点の**議論用たたき台**とする。
+
+### 案: Core v1
+
+まず「画面を作り、Hub の値を安全に表示し、基本操作できる」縦切りを成立させる案。
 
 - Hub 接続
-- Stable Tag ID Binding
+- `external_name` Binding
 - Screen / Symbol
 - EquipmentType / EquipmentInstance
 - Faceplate
 - Dialog / Popup
 - SVG ベース Process Renderer
 - Data Binding
-- Event / Action
+- 基本 UI Event / Action
 - Project 保存・読込
 - Project Import / Export / update 判定
 - 基本 Editor
-- DataGrid
-- Alarm 表示基盤
-- Trend 表示基盤
-- Design API（Project / Screen / Equipment / Binding / Validate / Plan / Apply）
-- Design API の OpenAPI 公開
+- Tag Browser / Binding UX
+- validation / diagnostics
 
-### 初版で限定する項目
+### 後続 Extension 候補
+
+以下は全体設計には含めるが、Core v1 に含めるかは議論して決定する。
+
+- DataGrid / DB Table/View
+- Alarm
+- Historical Trend
+- Tracking
+- Recipe / 実績
+- HTTP Action / External Program
+- Design API の REST / OpenAPI 露出（Editor / CLI / AI が共有する Design Domain 自体（§19.2）は Core に含める）
+- AI 設計支援
+- 高度な Event / Action flow
+
+### 初版で限定する項目の案
 
 - Renderer は SVG + Svelte を第一候補とする
 - Editor の基本操作は select / move / resize / property / binding
 - Animation は value / color / visibility / state を中心に開始
-- DB Table/View は read-only 表示を先行
 - Action の workflow は単純 sequence + success/failure から開始
 - Recipe / Tracking / Alarm の高度機能は段階導入する
 
@@ -352,6 +380,10 @@ Project package に秘密情報を含めない。
 
 Import 後に不足 secret を明示して設定させる。
 
+Runtime PC 側の保管先は、banto-hub-bootstrap が使う OS キーリング方式
+（banto-hub-client-bootstrap.md）の再利用を第一候補とする。§10.5 の `secret reference` はこの保管先の
+キーを指す。
+
 ### 5.5 Migration
 
 ```text
@@ -445,10 +477,10 @@ Motor01
   type = Motor
 
 bindings
-  running -> StableTagId(...)
-  fault   -> StableTagId(...)
-  command -> StableTagId(...)
-  speed   -> StableTagId(...)
+  running -> PLC01.Fast.Motor01.Run
+  fault   -> PLC01.Fast.Motor01.Fault
+  command -> PLC01.Fast.Motor01.Command
+  speed   -> PLC01.Slow.Motor01.Speed
 ```
 
 Symbol と Faceplate に個別に tag を再設定せず、
@@ -570,6 +602,8 @@ Tags
   DB Tables
 ```
 
+`DB Tables` ノードは §14.2 の resource model 決定後に確定する（案 B なら Tags と別系統の Datasets ノードになる）。
+
 表示候補:
 
 - quality
@@ -597,52 +631,150 @@ Temperature is F32
 => assignment rejected
 ```
 
-### 8.4 未割付
+Slot 型は SCADA 側の抽象型であり、Hub の `data_type` へ次のように対応させる。
+Hub に `bool` 型は無く、ビットは `bit` である（`banto-tags` の `ALLOWED_DATA_TYPES`:
+`bit` / `i16` / `u16` / `i32` / `u32` / `f32` / `i64` / `u64` / `f64` / `string`）。
+
+| Slot 型  | Hub `data_type`                                               | 備考                                                                   |
+| -------- | ------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `bool`   | `bit`                                                         | T20 のワードデバイスのビット指定（`.0`〜`.F`）も `bit` として扱う      |
+| `number` | `i16` / `u16` / `i32` / `u32` / `f32` / `i64` / `u64` / `f64` | 64bit 整数は Hub 内部で `f64` 搬送のため 2^53 超で精度が落ちる（§6.3） |
+| `string` | `string`                                                      | 現在値経路は T20 の read-on-demand（WS/MQTT には流れない）             |
+
+### 8.4 未割付・不成立 Binding の安全な扱い
 
 Editor 中は未割付を許容する。
+Project に未解決 Binding や型不整合が残っていても、Runtime 全体を起動不能にはしない。
 
-Runtime display:
+表示系は **fail-safe / degraded presentation** とする。
 
-- unresolved -> -- / invalid presentation
+例:
 
-Publish/Deploy 前の validation で warning/error をまとめて表示する。
+- unresolved tag -> `--` / unresolved 表示
+- Bad / Stale -> quality を反映した表示
+- 型不整合 -> invalid 表示
+- Expression 評価不能 -> error/invalid 表示
+- 一部 Object の不成立が他の正常 Object の描画を止めない
+
+validation は Editor / Import / Design API から常時利用でき、
+warning/error をまとめて確認できるようにする。ただし「全項目が valid でなければ Runtime を
+動かせない」という hard publish gate は初期設計では採用しない。
+
+Action は対象 Binding・引数・権限等が成立しない場合に**実行しない**。
+失敗は利用者へ表示するとともに Action execution record / audit に残す。
+
+最低限の記録候補:
+
+- timestamp
+- screen / object / action
+- requested target
+- failure code
+- failure detail
+- user / actor（取得可能な場合）
+
+「表示の設定ミス」と「操作が実行された」を曖昧にしない。
 
 ---
 
 ## 9. Binding Engine
 
-### 9.1 StableTagId
+### 9.1 永続 Binding ID は `external_name`
 
-通常の画面 Binding は Hub の stable ID を保存する。
+SCADA Project の永続 Binding は Hub の公開外部名を保存する。
 
 ```text
-connection_id
-group_id
-tag_id
+{connection}.{group}.{tag}
+
+例:
+PLC01.Fast.Motor01.Run
 ```
 
-外部名は表示・再解決支援用 metadata とする。
+この `external_name` は Hub が外部 API / write scope / catalog で利用する公開アドレスであり、
+SCADA Project と Hub の間の Binding 契約として扱う。
 
-### 9.2 Cross-environment import
+SCADA Project は Hub 内部 DB の数値 ID
+（`connection_id` / `group_id` / `tag_id`）を永続 Binding ID として保存しない。
 
-開発 Hub -> 現場 Hub では stable ID が一致しない場合がある。
+### 9.2 Runtime 解決
 
-Project には fallback hint を保持してよい。
+Runtime は Project に保存された `external_name` を Hub catalog へ照合し、
+表示・書き込みの検証に使う metadata（data type / writable / unit）と catalog revision を得る。
+購読・書き込みも `external_name` で行う。Hub の公開契約（REST `POST /api/v1/values/{tag}`、
+WS subscribe、write scope、MQTT トピック）はすべて名前であり、SCADA は Hub 内部の数値 ID
+（`StableTagId`）を使わない（§9.6、2026-09-30 オーナー決定）。
+
+```text
+Project
+  external_name
+       |
+       v
+Hub catalog（revision 付き）
+       |
+       +-- data type
+       +-- writable
+       +-- unit
+       |
+       v
+Runtime binding cache（名前 → metadata、解決時の revision）
+```
+
+これにより Hub の config export/import で内部数値 ID が変わっても、
+また Hub 側でタグを削除して同名で作り直しても、`connection.group.tag` が同じなら
+SCADA Project の Binding は維持できる。
+
+### 9.3 Rename 契約
+
+Hub 上で `connection` / `group` / `tag` の名前を直接変更し、
+`external_name` が変わった場合は **SCADA Binding が unresolved になってよい**。
+外部名の変更を透過的に追従することは要件にしない。
+
+SCADA Editor から名称変更する場合は、単なる文字列編集ではなく
+**意味のある Design operation** として扱う。
 
 例:
 
 ```text
-stableTagId
-hint:
-  externalName
-  dataType
-  unit
+rename_tag
+
+1. 現在の Hub catalog / Project revision を確認
+2. Hub API で対象名を変更
+3. SCADA Project 内の該当参照を更新
+4. Expression / Action 等の構造化参照を更新
+5. validate
+6. Project revision を進める
 ```
 
-自動で別タグへ勝手に binding せず、
-未解決 -> candidate -> user confirmation とする。
+途中失敗時に Hub と Project のどちらが更新済みかを明示し、
+silent mismatch を作らない。可能なら plan / apply と validation を利用する。
 
-### 9.3 Expression
+Hub 側の名称変更は構成 API（T21 の `admin` スコープ）を要する。Runtime が使う `read` /
+`write:{pattern}` キーとは別に、**Editor 専用の admin キー**を持つ前提とし、その保管場所は
+§19.13 の Design API の境界と合わせて決める。Runtime-only deployment には admin キーを配置しない。
+
+Expression 中のタグ参照は単純な文字列置換ではなく、
+parser / structured reference を介して更新することを優先する。
+
+### 9.4 Cross-environment import
+
+開発 Hub -> 現場 Hub への移送では `external_name` を再解決キーとする。
+
+```text
+開発 Hub:
+  PLC01.Fast.Motor01.Run
+
+現場 Hub:
+  PLC01.Fast.Motor01.Run
+```
+
+であれば内部数値 ID が異なっても Binding は成立する。
+
+現場 Hub に同じ `external_name` が存在しない場合は unresolved とし、
+自動で類似名の別タグへ Binding しない。
+
+Project は validation 補助として期待型・writable 等の metadata を保持してよいが、
+それらを別タグへの自動再割付キーにはしない。
+
+### 9.5 Expression
 
 Binding を直接 property へつなぐだけでなく、
 
@@ -657,6 +789,60 @@ Property
 を許容する。
 
 可能であれば既存 banto-expr を利用する。
+
+### 9.6 Binding identity の決定（2026-09-30 オーナー決定: 名前のみ。書き込みも名前）
+
+**決定**: SCADA の Binding の同一性は、購読も書き込みも Hub の `external_name` とし、
+Hub 内部の数値 ID（`StableTagId`）は SCADA では使わない。
+
+経緯: 本 PR 当初は「Project は `external_name`、Runtime / SDK 内部は `StableTagId`」としていたが、
+関連文書と揃っていなかった（tag-server-design.md §4.1 は外部名 + 安定 ID の併記、
+banto-tagclient-design.md §3.1 / §4.4 は stable ID のみ）。レビューで次の 4 案を比較した。
+
+#### 検討した案
+
+| 案                                       | 内容                   | 判断                                                                        |
+| ---------------------------------------- | ---------------------- | --------------------------------------------------------------------------- |
+| A. `external_name` のみ                  | 購読・書き込みとも名前 | **採用**                                                                    |
+| B. `StableTagId` のみ                    | SDK の現行契約         | 環境をまたぐと id が変わる。Project が人間・AI に読めない                   |
+| C. Project は名前、環境別キャッシュに id | 改名候補の提示ができる | 案 A と Project 形式は同じ。必要が出たら後付けできる拡張として保留          |
+| D. Hub にタグ UUID を追加                | 環境をまたぐ同一性     | Hub のマイグレーション・CSV 互換（#264）・config package に波及する。将来案 |
+
+#### ID を使わない理由（オーナー判断）
+
+- **ID に束縛が引っ張られると変更しにくい。** 削除して同名で作り直す、CSV を再取り込みする、接続を作り直す、
+  といった試運転中の操作で ID は変わる。名前が同じでも ID 束縛は切れる。ChronoGazer の Hub ドライバは
+  この回避策（`apps/chronogazer/core/src/hub.rs` の fingerprint）を既に抱えている
+- **環境をまたぐと ID は持ち越せない。** Hub の config package は名前で往復する
+- **Hub の公開契約はすべて名前。** REST の書き込み先、WS の subscribe、write scope のパターン、MQTT トピック、
+  Expression、Design API、AI の割付提案。SCADA が名前だけに依存すれば Hub の内部表現に結合しない
+- **改名は破壊的変更として利用者責任**（tag-server-design.md §4.1、2026-08-05）と整合する。改名で
+  Binding が unresolved になるのは仕様
+- ID が持つ利点（改名への追従、改名と削除の区別、旧名を引き継いだ別タグへの誤書き込み防止）は
+  以上の不利益に対して小さい。最後の 1 点は下記のとおり方針として受容する
+
+#### 名前で書き込む場合の安全規則
+
+- Runtime は書き込み前に、現在の catalog revision で対象名が解決済みであり、`writable` かつ型が一致する
+  ことを確認する。未解決、または `config_changed` 受信後の再解決が済んでいない間は書かない（fail-closed）
+- Hub は存在しない名前に 404、writable でない・scope 外に 403 を返す。いずれも失敗として表示・記録する
+  （§8.4、§16）
+- 「改名の後に旧名で別タグが登録された」場合、書き込みはその別タグに届く。これは **SCADA / SDK では塞がず、
+  方針として受容する**（2026-09-30 オーナー判断）。名前を契約にした以上、この状況は意図的な「削除→同名再作成」
+  と区別できず、区別すべきでもない。起きるには Hub 側で改名と同名の再登録を行い、さらにその新タグを
+  `writable` にし、型も一致させる必要がある。守りは既存機構に置く: Hub のタグごとの `writable` opt-in
+  （新規タグは既定で書けない）、上記の書き込み前の型・writable 照合と再解決中は書かない規則、Hub の改名時の
+  警告、Hub の write 監査と SCADA の execution record（§16）による事後追跡。write 要求に期待 catalog
+  revision を付けて Hub が照合する拡張は**採らない**
+- 自動再割付はしない（§9.4）
+
+#### SDK への影響
+
+banto-tagclient は `BindingRequest` と `write_tag` が `StableTagId` を要求している。
+この決定に合わせて **SDK の binding 同一性も `external_name` に改める**（2026-09-30 オーナー指示）。
+Hub との wire は既に名前（WS subscribe、`POST /api/v1/values/{tag}`）なので、変わるのは SDK の公開型と
+呼び出し側（ChronoGazer の Hub ドライバ、banto-hub-sink）である。banto-tagclient-design.md §3.1 / §4.4 の
+改訂と実装は別 PR で行う。
 
 ---
 
@@ -696,24 +882,46 @@ Property
 - LaunchProgram
 - ExecuteDbCommand
 
-### 10.3 execution target
+### 10.3 execution target（議論中）
+
+UI に閉じた Action は SCADA Runtime で実行する。
 
 ```text
-Local
+Local / UI
   Navigate
   Dialog
   Faceplate
   LaunchProgram
-
-Hub/Server
-  PLC Write
-  HTTP webhook
-  DB command
-  alarm/tracking triggered action
+  operator initiated WriteTag
 ```
 
-設備イベントに依存する常時実行 Action は SCADA Runtime ではなく Hub 側を優先する。
-SCADA を閉じたことで通知・記録が消える設計にしない。
+一方、次のような「UI が閉じていても常時成立させたい Event / Action」を
+どこへ置くかは**未決**とする。
+
+- value edge 起点の処理
+- alarm 起点の外部通知
+- tracking 起点の処理
+- timer
+- server-side HTTP / DB command
+
+候補:
+
+1. banto-hub に Server Action/Event 機能を持たせる
+2. SCADA Runtime を常駐実行主体として扱う
+3. 独立した automation / event service を設ける
+4. 対象機能ごとの既存 domain service に委ねる
+
+**Hub に余計な責務を増やさないことを重要な評価軸**とし、
+「常時実行だから Hub に入れる」とは自動的に決めない。
+
+先例として、2026-09-06 の DB Sink 決定（banto-hub-external-db-design.md §2.1 / §5）がある。
+24/365 で動くエンジンは Hub の運転基盤（トレイ・SCM サービス・状態画面・pending queue）に載せるが、
+重いエンジン本体は **Hub が設定と監視を持つ別プロセスのサイドカー**とした。候補 3 をこの形で
+定義すれば「Hub に責務を増やさない」軸と両立する。候補 2（SCADA Runtime 常駐）は、同決定で
+退けられた「寿命が UI と同じ」問題を再び踏む。
+
+この論点が決まるまで、Core v1 の Event は click / double click / screen open/close 等の
+UI Event を中心に扱い、常時実行 Event の配置は後続設計とする。
 
 ### 10.4 External Program
 
@@ -779,80 +987,57 @@ PLC write や non-idempotent POST は暗黙自動 retry しない。
 
 ## 11. Alarm
 
-### 11.1 Alarm は tag kind ではない
+### 11.1 方針: まず汎用 Alarm model を作る
 
-Alarm を tag_kind = alarm として本体化しない。
+初版では MELSEC / SLMP 等の特定 PLC・プロトコルに依存しない
+**汎用 Alarm domain / state machine / API / UI** を先に設計する。
+
+Alarm を `tag_kind = alarm` として本体化しない。
 
 ```text
-Tag / PLC alarm source
-       |
-       v
-   Alarm Engine
-       |
-       +-- AlarmDefinition
-       +-- AlarmState
-       +-- AlarmEvent
-       +-- AlarmHistory
+Alarm Source
+    |
+    v
+Alarm Engine
+    |
+    +-- AlarmDefinition
+    +-- AlarmState
+    +-- AlarmEvent
+    +-- AlarmHistory
 ```
 
 必要に応じて read-only alarm state tag を projection として公開してもよいが、
 Alarm entity の authoritative source にはしない。
 
-### 11.2 Alarm Source
+### 11.2 Generic Alarm Source
 
-2 系統を正式に扱う。
+Alarm Engine は source の取り込み方式を protocol 固有にしない。
+
+候補:
 
 ```text
 AlarmSource
-  +-- Hub evaluated
-  |      tag/expression -> alarm
-  |
-  +-- PLC generated
-         PLC alarm state/event -> Hub
+  +-- expression / tag condition
+  +-- external discrete state
+  +-- external event
+  +-- future protocol adapter
 ```
 
-### 11.3 PLC-generated alarm
+初期実装は Hub が既に取得できる Tag / Expression を source とする方式から開始できる。
 
-重要設備 Alarm は PLC 側で判定する。
+例:
 
-PLC 側に Alarm bitmap / state を持ち、
-Hub はそれを ingest する。
+- `Tank.Level >= 90`
+- `Motor.Command && !Motor.Feedback`
+- bool tag の rising / falling state
 
-三菱向けでは、SLMP Monitor の Entry/Execute Monitor 機能を
-高速 snapshot 取得に利用する候補とする。
+条件式の評価は Hub の computed tag（banto-expr、tag-server-design.md §4.2）に登録し、Alarm Engine は
+その `bit` を購読するだけにすると、式評価器を二重に持たずに済む。初期実装の最小形として検討する。
 
-ただし monitor は push ではないため、
-短時間 ON/OFF の完全保証にはしない。
+将来 PLC 側で生成済みの Alarm state/event を取り込む場合も、
+Alarm Engine 本体へ MELSEC 固有情報を持ち込まず source adapter で接続する。
 
-### 11.4 Fast notification + recovery
-
-高信頼用途では以下を分離する。
-
-```text
-PLC
- |
- +-- UDP / event notification ---- low latency
- |
- +-- SLMP Monitor ---------------- current state sync
- |
- +-- event FIFO + sequence ------- loss recovery
-             |
-             v
-        Alarm Ingest
-```
-
-UDP は低レイテンシ用途であり唯一の真実にしない。
-
-### 11.5 banto-alarm
-
-Alarm state machine は独立 crate 候補:
-
-```text
-crates/banto-alarm
-```
-
-当面は banto-hub process 内で動かす。
-別 process 化は durable event transport が必要になってから検討する。
+### 11.3 State model
 
 状態候補:
 
@@ -865,16 +1050,63 @@ crates/banto-alarm
 
 Alarm Definition 候補:
 
-- source/expression
+- source / expression
 - severity
+- message
 - deadband
 - on delay
 - off delay
 - latch
 - enabled
-- message
 
-設定 UI は単純条件から始めても、内部 model は expression 拡張を阻害しない。
+設定 UI は単純条件から開始してよいが、内部 model は expression / external source 拡張を阻害しない。
+
+### 11.4 ACK / Shelve
+
+ACK / Shelve は汎用 Alarm Engine の operator state として設計する。
+
+初版では特定 PLC の ACK bit / reset handshake と直接結合しない。
+PLC 側 ACK が必要な設備では、将来 protocol/source adapter または明示 Action として
+接続できるよう境界を残す。
+
+### 11.5 Protocol-specific PLC Alarm は後続
+
+MELSEC / PX Developer を意識した以下は有力な将来案だが、初期 Alarm 実装の必須要件にしない。
+
+- SLMP Monitor Entry / Execute Monitor
+- Alarm bitmap
+- UDP event notification
+- PLC event FIFO / sequence
+- loss recovery
+- MELSEC 固有 ACK / reset handshake
+
+将来のイメージ:
+
+```text
+MELSEC PLC
+  +-- UDP event -------- low latency
+  +-- SLMP monitor ----- current state
+  +-- FIFO / sequence -- loss recovery
+             |
+             v
+      MELSEC Alarm Adapter
+             |
+             v
+      Generic Alarm Engine
+```
+
+汎用 Alarm Engine を先に固定し、MELSEC adapter はその契約へ後付けする。
+
+### 11.6 実装境界
+
+Alarm state machine は独立 crate 候補:
+
+```text
+crates/banto-alarm
+```
+
+どの process にホストするかは Event/Server responsibility（§10.3）と合わせて議論する。
+Alarm domain の汎用性と host process の選択を分離する。
 
 ---
 
@@ -982,33 +1214,89 @@ Tracking anomaly は banto-alarm へ接続する。
 
 ---
 
-## 13. Historian / Trend
+## 13. Historian / Trend（2026-09-30 オーナー決定: ChronoGazer と共有）
 
-既存資産を利用する。
+ChronoGazer は記録計の単体商品として残す。banto-scada はトレンド機能を含む製品なので、
+記録・トレンドの資産の大部分を ChronoGazer と共有する。
+
+**Hub に History API は足さない。** tag-server-design.md §2 の「Hub は履歴を持たず読み返さない」
+（2026-08-04、2026-09-06 の部分撤回は Sink のみ）を維持し、Hub の tstore（§3.3、既定 7 日の
+バックフィル用）も SCADA からは読まない方針で開始する。
 
 ```text
-banto-tstore
-    |
-banto-tsquery
-    |
-banto-hub History API
-    |
-banto-tagclient
-    |
-banto-scada Trend
+banto-hub（現在値 / catalog）
+      |
+      v  Hub 経由購読ドライバ（ChronoGazer #383 段階1 と共有）
+   recorder（記録経路）
+      |
+      v
+  banto-tstore（日次ファイル）
+      |
+      v
+  banto-tsquery
+      |
+      v
+  Trend UI（ChronoGazer と共有）
 ```
 
-SCADA が tstore file を直接読む方式にはしない。
+共有する資産:
 
-これにより Hub PC と SCADA PC が分離していても Historical Trend を利用できる。
+- Hub 経由購読ドライバ（banto-tagclient の世代管理、未解決タグの扱い）
+- banto-tstore / banto-tsquery
+- トレンド UI（LineChart ストリーミング、`read_decimated` の初期窓 → append、
+  null を 0 と区別する規律。r1-plan.md R1-D）
+
+SCADA 固有:
+
+- Trend widget の Project model（trend group を Screen object / Faceplate から参照する）
+- trend group を Project package に含める
+- Faceplate / Dialog からの Trend 呼出
+
+これにより Hub PC と SCADA PC が分離していても、SCADA 側の recorder が Hub を購読して
+Historical Trend を成立させる。
+
+### 13.1 この方針の妥当性（2026-09-30 レビュー）
+
+方向性は妥当と判断する。根拠:
+
+- Hub を履歴非保持のまま保てる（2026-08-04 決定と整合）。保持期間・間引き・容量の方針を Hub に持ち込まない
+- ChronoGazer の core crate（`apps/chronogazer/core`）は tauri 非依存で、headless の `banto-serve`
+  バイナリと REST 層、Hub 経由購読ドライバ（#383 段階1）を既に持つ。「共有」は新規の切り出しではなく
+  既存の構造をそのまま使える
+- 商品の線引きが明快。ChronoGazer = 記録計単体、SCADA = 画面 + 記録計 core の同梱
+
+ただし次を満たさないと「寿命が UI と同じ」問題（2026-09-06 の Sink 決定で退けた構造）を SCADA に持ち込む。
+
+1. **記録は UI プロセスで行わない。** SCADA 同梱の recorder は `banto-serve` 相当のサービスとして動かし、
+   SCADA Runtime はその HTTP API を読む。SCADA Runtime が tstore ファイルを直接読む方式にはしない
+2. **現場の recorder は 1 つ。** 操作卓と事務所閲覧など SCADA client が複数ある現場で client ごとに記録すると、
+   履歴が重複し欠測もばらつく。recorder を現場単位の共有サービスとし、既存の ChronoGazer がある現場では
+   それをそのまま recorder として使えることを目標にする
+3. **履歴読み出し API は ChronoGazer core の REST に置く。** 現状の core REST には履歴読み出し
+   （I4 `read_decimated`）の endpoint が無い（R1-D 未着手）。ChronoGazer の LAN ブラウザ表示にも同じ
+   endpoint が要るので、SCADA 向けに別物を作らず R1-D で共通化する。「History API は要る。ただし所有者は
+   Hub ではなく recorder」が正確な言い方になる
+4. **記録対象タグの所有者を決める。** recorder の購読タグは `PUT /api/hub/selected-tags`（admin）で設定する。
+   SCADA Project の trend group が記録対象を決めるなら、Editor から recorder へ selected-tags を同期する
+   Design operation が要る（§9.3 の rename と同じ協調更新の型）
+5. **キーの整合。** Hub 経由ドライバは Hub の `external_name` でタグを引く（`core/src/hub.rs`）ので、
+   tstore の `tag_key` もこれに揃え、SCADA Binding（§9）と同じ語彙で履歴を引けるようにする。§9.6 の決定どおり
+   履歴のキーも名前とする
+
+未決（§22 へ）:
+
+- SCADA の記録プロセスの寿命。UI 同居（ChronoGazer と同型）か、記録サービスとして分離するか（§13.1 はサービス分離を推奨）
+- 共有 UI の切り出し方。pnpm workspace は現在 `apps/*` のみで共有 package が無い
+- Hub の tstore を SCADA が読む場面を作るか（読まない方針で開始）
 
 ---
 
-## 14. DB Resources
+## 14. DB Table / View 連携（モデルは議論中）
 
-### 14.1 原則
+### 14.1 決定済みの境界
 
-SCADA Runtime は DB へ直接接続しない。
+SCADA Runtime は DB へ直接接続せず、DB credential / SQL / DB driver を
+SCADA Project に持ち込まない。
 
 ```text
 SCADA
@@ -1018,11 +1306,9 @@ Hub API
 DB
 ```
 
-DB credential / SQL / DB driver を SCADA Project に持ち込まない。
+Hub を DB 接続境界として利用する方針は維持する。
 
-### 14.2 既存 DB scalar tag
-
-現行 Hub の DB Source は、
+既存 Hub の DB Source は、
 
 ```text
 PostgreSQL query
@@ -1031,81 +1317,78 @@ PostgreSQL query
   -> current value
 ```
 
-として利用する。
+として単一現在値用途に利用できる。
 
-これは単一現在値に向いている。
+### 14.2 未決: tabular data を何として表現するか
 
-### 14.3 DB Table / View
+Table / View の rows × columns を SCADA の DataGrid に提供する必要があるが、
+Hub 内の domain model はまだ決定しない。
 
-SCADA で表・View を表示する用途には tabular resource を追加する。
+#### 案A: DB Table Tag
 
-UI 上は「DB タグ」として統合してもよいが、
-実装では scalar/current-value と rowset を分離する。
-
-概念例:
+既存 Tag Browser / DB connection の概念へ寄せる。
 
 ```text
-DB Resource
-  +-- DB Value Tag
-  |     scalar/current value
-  |
-  +-- DB Table Tag
-        rows x columns
+DB Value Tag  -> scalar
+DB Table Tag  -> rows x columns
 ```
 
-tag kind 候補:
+利点:
 
-- db
-- db_table
+- 利用者から見て「Hub に登録した DB データ」で統一できる
+- Editor の Resource Browser に自然に統合しやすい
 
-capability 例:
+懸念:
+
+- current value / quality / WS/MQTT を前提とする Tag domain に tabular semantics が混ざる
+- 各層で `tabular` 特例が増える可能性がある
+- Hub の非 PLC 値は `ServerTagStore` の `Option<f64>` のみで、購読は 250ms poll の `read_current`、
+  グループ周期は CHECK の固定集合（banto-hub-external-db-design.md §3）。tabular は既存の値経路に
+  一切乗らないため、「統一」は UI 上の見え方だけになり、実装は案 B と同じく別経路が要る
+- 案 A を採っても値経路・API は新設になる点で案 B との実装コスト差は小さい
+
+#### 案B: Dataset / DB Resource
+
+Tag とは別の first-class resource とする。
 
 ```text
-PLC tag
-  current_value = true
-  history       = true
+Tags
+  PLC / computed / internal / db scalar
 
-DB scalar tag
-  current_value = true
-
-DB table tag
-  tabular       = true
-  current_value = false
+Datasets
+  table / view / registered query
 ```
 
-db_table は通常の values WS/MQTT stream へ流さない。
+利点:
 
-### 14.4 Table / View / Query
+- rows / columns / pagination / sort / filter の責務が明確
+- Tag の current-value semantics を壊さない
 
-source 候補:
+懸念:
 
-- table
-- view
-- registered query
+- Hub API / client / Editor Browser に新しい resource 系統が増える
+- Recipe / Result 等との naming / ownership を整理する必要がある
 
-実案件では View を推奨する。
+### 14.3 共通して必要な capability
 
-DB 内部 schema と SCADA の契約境界を View に置くことで、
-内部テーブル変更の影響を局所化できる。
+どちらを採る場合も、SCADA から任意 SQL を送る API は作らない。
 
-### 14.5 API
+必要な機能候補:
 
-例:
+- schema / column metadata
+- rows
+- pagination
+- sort
+- allowed filter
+- timeout / cancellation
+- query concurrency limit
+- read-only first
 
-```text
-GET /api/v1/db-resources
-GET /api/v1/db-resources/{id}
-GET /api/v1/db-resources/{id}/schema
-GET /api/v1/db-resources/{id}/rows
-```
+API の具体形は resource model 決定後に確定する。
 
-rows では pagination / sort / allowed filter を提供する。
+### 14.4 DataGrid
 
-SCADA から任意 SQL を送る API は作らない。
-
-### 14.6 DataGrid
-
-SCADA の一級 widget とする。
+SCADA 側には一級 widget として DataGrid を持つ案を維持する。
 
 ```text
 DataGrid
@@ -1182,7 +1465,15 @@ Tracking ID を中心に、
 
 ## 16. Security / Audit
 
-以下を共通の Operator Action Audit 対象とする。
+Action は成功時だけでなく、**実行前検証で拒否した失敗も記録対象**とする。
+「要求されたが安全に実行しなかった」ことを追跡できること。
+
+PLC write の監査は Hub 側（`write_audit`、log-before-write）にあるが、実行前検証で拒否した失敗は
+Hub に届かない。したがって SCADA 側に独自の **execution record store** を持ち、Hub の write 監査と
+突合できるよう write 要求に相関 ID を渡せることを Hub 側の追加候補とする（§21 S0 の
+「Hub に必要な追加 API」に含める）。
+
+以下を共通の Operator Action Audit / execution record 対象とする。
 
 - PLC write
 - Alarm ACK / Shelve
@@ -1200,7 +1491,8 @@ Audit 候補:
 - object
 - action id
 - target
-- result
+- result / failure code
+- failure detail
 - duration
 - tracking id
 - equipment id
@@ -1232,12 +1524,12 @@ Audit 候補:
 banto-scada では以下を一般化する。
 
 ```text
-MQTT topic             -> Hub StableTagId
+MQTT topic             -> Hub external_name binding
 TopEquipmentObject     -> EquipmentInstance / SymbolInstance
 Equipment screen       -> Faceplate / Screen
 Topic expression       -> Binding Expression / banto-expr
 portable-settings      -> Project Package
-direct DB trend        -> Hub History API
+direct DB trend        -> 共有 tstore / tsquery + Trend UI（§13）
 alarm table viewer     -> Hub Alarm API
 ```
 
@@ -1438,7 +1730,7 @@ validation 対象例:
 
 - object reference
 - EquipmentType / slot type
-- StableTagId resolution
+- external_name resolution
 - expression type
 - writable requirement
 - Faceplate / Dialog reference
@@ -1625,11 +1917,11 @@ Project 設計変更は operator runtime audit と区別し、
 
 SCADA の repository 分割は現時点では確定しない。
 
-まず banto-industrial Issue #468 の path-aware CI を導入し、
+banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09-30 時点の main）。現状は
 
 - Hub change -> Hub CI
 - ChronoGazer change -> ChronoGazer CI
-- SCADA change -> SCADA CI
+- SCADA change -> SCADA CI（SCADA のパスはまだ無いため未定義）
 - docs-only -> minimum CI
 
 を成立させる。
@@ -1651,8 +1943,8 @@ SCADA の repository 分割は現時点では確定しない。
 
 - 本書を設計の基準文書として確定
 - Project schema の最小型を定義
-- Hub に必要な追加 API を洗い出す
-- Design API の最小契約を確定
+- Hub に必要な追加 API を洗い出す（write 要求の相関 ID、§16）
+- Design Domain（共有 mutation / validation）の最小契約を確定。REST / OpenAPI 露出は S5
 
 ### S1 scada-model
 
@@ -1677,7 +1969,7 @@ SCADA の repository 分割は現時点では確定しない。
 ### S3 Hub Live Binding
 
 - banto-tagclient 接続
-- StableTagId binding
+- external_name binding
 - quality / unresolved
 - reconnect / rebinding
 
@@ -1738,14 +2030,15 @@ SCADA の repository 分割は現時点では確定しない。
 - external program
 - audit
 
-### S10 Alarm
+### S10 Alarm（汎用）
 
 - banto-alarm
+- generic AlarmDefinition / AlarmState / AlarmEvent
+- tag / expression based source
 - Alarm API
 - Alarm Viewer
-- ACK / Shelve
-- PLC generated alarm input
-- SLMP monitor / event recovery 設計
+- operator ACK / Shelve
+- protocol-specific PLC alarm adapter は後続
 
 ### S11 Tracking
 
@@ -1755,15 +2048,17 @@ SCADA の repository 分割は現時点では確定しない。
 - event FIFO/sequence
 - SCADA tracking presentation
 
-### S12 History
+### S12 History / Trend（ChronoGazer と共有）
 
-- Hub History API
-- banto-tagclient history extension
-- Trend widget
+- Hub 経由購読ドライバの共有化（#383 段階1 の切り出し）
+- tstore / tsquery を使う SCADA recorder
+- トレンド UI の共有 package 化
+- Trend widget（Project model、Faceplate からの呼出）
 
-### S13 DB Resources
+### S13 DB Table/View（resource model 決定後）
 
-- DB table/view registration
+- DB Table Tag vs Dataset/DB Resource の設計決定
+- table/view registration
 - schema/rows API
 - DataGrid
 - row context
@@ -1794,33 +2089,52 @@ MCP 自体は roadmap の blocking milestone にしない。
 3. Stable ID の UUID/ULID 方式
 4. Screen coordinate の内部単位（normalized / logical pixel の併用方針）
 5. banto-expr を client/runtime でそのまま利用するか
-6. DB tabular resource の正式名称（db_table / dataset 等）
-7. Alarm PLC event FIFO の標準 PLC memory layout
-8. Tracking PLC block の標準 memory layout
-9. Server Action を Hub 本体に置く範囲
+6. DB tabular resource の domain model（DB Table Tag / Dataset・DB Resource）
+7. 常時実行 Event / Action の実行主体（Hub / SCADA Runtime / 独立 service / domain service）
+8. Core v1 に含める Extension の範囲
+9. Tracking PLC block の標準 memory layout
 10. Editor/Runtime の executable 分離時期
 11. Design API の最終 transport / bind policy（初期候補: editor mode + loopback REST）
 12. AI change plan の承認を必須にする変更範囲
+13. protocol-specific Alarm adapter の優先順位（MELSEC は汎用 Alarm 後）
+14. Binding identity の方式 → 2026-09-30 決定済み（§9.6、名前のみ。案 C の改名候補提示は必要が出たら拡張）
+15. SCADA 記録プロセスの寿命（UI 同居か記録サービス分離か、§13）
+16. ChronoGazer と共有するトレンド UI の package 化の方法（§13）
+17. SCADA 同梱 recorder の配布形態（同梱サービスか、既存 ChronoGazer の流用か。§13.1）
+18. 記録対象タグの所有者（SCADA Project の trend group から recorder へ同期するか、§13.1）
 
 ---
 
-## 23. 現時点の主要決定
+## 23. 議論継続中の主要論点
+
+- 常時実行 Event / Action をどの process/domain が担うか。Hub の責務を安易に増やさない
+- Core v1 の完了範囲。§3 の案を叩き台として決定する
+- DB Table/View の表現を DB Table Tag とするか、独立 Dataset / DB Resource とするか
+- protocol-specific PLC Alarm adapter の順序・契約。MELSEC 対応は汎用 Alarm model 後
+
+---
+
+## 24. 現時点の主要決定（2026-09-30 オーナー決定。§9.6 の再検討中項目を除く）
 
 - PLC は control authority。PC 停止で設備制御を止めない
 - SCADA は PLC に直接接続せず Hub を介する
+- SCADA Project の永続 Tag Binding は Hub の `external_name`（`connection.group.tag`）を正とする（2026-09-30 再確認、§9.6）
+- 購読・書き込みも `external_name` で行い、Hub 内部の `StableTagId` は SCADA では使わない。banto-tagclient の binding 同一性も名前に改める（2026-09-30 オーナー決定、§9.6）
+- Hub 側で直接 rename して Binding が切れることは許容する。SCADA Editor からの rename は Hub API と Project 参照更新を協調して行う
 - Screen model / Renderer / Editor を分離する
 - SVG + Svelte を Process Renderer の第一候補とする
 - EquipmentType / EquipmentInstance を持つ
 - Symbol と Faceplate は同じ Equipment binding context を共有する
 - Faceplate / Dialog / Popup を Project model の一級要素とする
 - Binding / Event / Action Engine を Runtime の中心に置く
+- 不完全な Binding があっても Runtime 全体を止めず、表示は safe/degraded state とする
+- Action が成立しない場合は実行せず、失敗を表示・記録する
 - External API / External Program を Action として扱う
-- Alarm は tag kind ではなく独立 domain
-- PLC generated alarm と Hub evaluated alarm の両方を扱う
+- Alarm は tag kind ではなく独立した汎用 domain として先に設計する
+- 初期 Alarm は protocol 非依存とし、MELSEC 固有の Alarm ingest は後続 adapter とする
 - 搬送 Tracking は独立 domain。PLC authoritative
-- Historian は Hub History API 経由
-- DB Table/View は Hub 登録 resource として SCADA へ公開する
-- scalar DB tag と tabular DB resource は実行経路を分離する
+- Historian / Trend は Hub History API ではなく ChronoGazer と共有する記録・トレンド資産で実現し、Hub は履歴を持たない（2026-09-30 オーナー決定、§13）
+- SCADA の DB Table/View アクセスは Hub を接続境界とするが、DB Table Tag / Dataset のどちらで表現するかは未決
 - Recipe / 実績は DB Resource + Action/Command を再利用する
 - Project Import/Export は projectId / projectRevision / schemaVersion を持つ
 - Project package へ secret を含めない
