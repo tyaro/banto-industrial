@@ -5,15 +5,18 @@
  * `commissioning_ended` はログイン状態の確認、それ以外は理由の表示）。
  * `1008` 以外は理由文が何であっても従来どおり再接続する。
  * #445: 再接続が続けて失敗したときの確認（いつ確かめるか・結果の扱い）。
+ * banto v2.0.0 #260: 確認は SessionController の結果（`resolveSettled` /
+ * 試運転の policy runner）を 3 値に写す（`sessionProbeResultOf`、設計 §6.2 の表）。
+ * v1 の `/api/auth/check` の分類と single-flight は controller に寄せて削除した。
  */
 import { describe, expect, it } from 'vitest';
+import type { SessionSnapshot } from '@banto/admin-core';
 import {
-	classifySessionCheckResponse,
 	classifyStreamClose,
-	createSingleFlight,
 	decideAfterSessionProbe,
 	RECONNECT_FAILURES_BEFORE_SESSION_PROBE,
 	REVOKED_CLOSE_CODE,
+	sessionProbeResultOf,
 	shouldProbeSession,
 	unknownRevocationMessage,
 	type SessionProbeResult,
@@ -142,61 +145,51 @@ describe('再接続が続けて失敗したときの確認（#445）', () => {
 	);
 });
 
-describe('classifySessionCheckResponse（/api/auth/check の分類。check() と同じ、副作用なし）', () => {
-	const cases: Array<[number, unknown, SessionProbeResult]> = [
-		[200, true, 'session'],
-		[200, false, 'login'],
-		[401, undefined, 'login'],
-		[500, undefined, 'unverified'],
-		[503, undefined, 'unverified'],
-		[403, undefined, 'unverified'],
-		[200, undefined, 'unverified'],
-		[200, 'true', 'unverified'],
-		[200, null, 'unverified']
+describe('sessionProbeResultOf（controller の確定の結果 → 3 値。設計 §6.2 の表）', () => {
+	const snapshot = (
+		status: SessionSnapshot['status'],
+		kind: string | null = null
+	): SessionSnapshot =>
+		({
+			status,
+			owner: null,
+			generation: 1,
+			identity: status === 'active' ? { id: 'x', name: 'x', role: 'admin' } : null,
+			kind,
+			previousActiveOwner: null,
+			pendingOwnerChange: null,
+			verification: { state: 'idle', lastError: null }
+		}) as SessionSnapshot;
+	const ticket = { epoch: 1 };
+	const cases: Array<[string, Parameters<typeof sessionProbeResultOf>[0], SessionProbeResult]> = [
+		[
+			'confirmed / active（アカウント）',
+			{ outcome: 'confirmed', snapshot: snapshot('active', 'account'), ticket },
+			'session'
+		],
+		[
+			'confirmed / active（試運転の合成セッション）',
+			{ outcome: 'confirmed', snapshot: snapshot('active', 'commissioning'), ticket },
+			'session'
+		],
+		['confirmed / none', { outcome: 'confirmed', snapshot: snapshot('none'), ticket }, 'login'],
+		[
+			'confirmed / unknown（型の上だけ。確定ではない）',
+			{ outcome: 'confirmed', snapshot: snapshot('unknown'), ticket },
+			'unverified'
+		],
+		[
+			'unverified（active のまま）',
+			{ outcome: 'unverified', error: new Error('500'), snapshot: snapshot('active', 'account') },
+			'unverified'
+		],
+		[
+			'unverified（none のまま）',
+			{ outcome: 'unverified', error: new Error('x'), snapshot: snapshot('none') },
+			'unverified'
+		]
 	];
-	it.each(cases)('%i / 本文 %j → %s', (status, body, expected) => {
-		expect(classifySessionCheckResponse(status, body)).toBe(expected);
-	});
-});
-
-describe('createSingleFlight', () => {
-	it('結果を相乗りした全員に返す（#445 の確認の結果）', async () => {
-		let runs = 0;
-		const once = createSingleFlight(async () => {
-			runs += 1;
-			return 'login' as const;
-		});
-		expect(await Promise.all([once(), once()])).toEqual(['login', 'login']);
-		expect(runs).toBe(1);
-	});
-
-	it('実行中の呼び出しには相乗りし、1 回しか実行しない', async () => {
-		let runs = 0;
-		let release: () => void = () => {};
-		const once = createSingleFlight(async () => {
-			runs += 1;
-			await new Promise<void>((resolve) => {
-				release = resolve;
-			});
-		});
-		const a = once();
-		const b = once();
-		const c = once();
-		expect(a).toBe(b);
-		expect(b).toBe(c);
-		release();
-		await Promise.all([a, b, c]);
-		expect(runs).toBe(1);
-	});
-
-	it('終わった後の呼び出しは新しく実行する（失敗の後も）', async () => {
-		let runs = 0;
-		const once = createSingleFlight(async () => {
-			runs += 1;
-			if (runs === 1) throw new Error('boom');
-		});
-		await expect(once()).rejects.toThrow('boom');
-		await once();
-		expect(runs).toBe(2);
+	it.each(cases)('%s → %s', (_label, result, expected) => {
+		expect(sessionProbeResultOf(result)).toBe(expected);
 	});
 });
