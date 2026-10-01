@@ -318,6 +318,12 @@ metadata** とし、directory representation の manifest.json には置かな�
 古くなり、§5.2 の競合検知が手編集で残った古い hash に引っかかる）。export 時に算出して書き込み、import 時
 は archive の中身から再計算して照合する。directory を直接読み込む場合は読込時に算出する。
 
+`contentHash` の計算対象は、**archive-only metadata（`exportedAt`、`contentHash` 自身、`checksums.json`）を
+除いた、directory / ZIP 共通の論理内容**とし、serializer の canonical 表現に対して計算する。再 export や
+directory ↔ ZIP の変換で同じ Project が異なる hash になり競合扱いされることを防ぐため。Project 同一性判定
+用のこの hash と、archive 内の各ファイル単位の checksum（`checksums.json`、転送破損の検知用）は別物として
+区別する。
+
 ---
 
 ## 5. Project Import / Export
@@ -1778,6 +1784,12 @@ scada-server（§13.2。recorder / alarm / 常時実行 Event / API。画面に�
   Tauri 側では Editor / Runtime の window または webview capability を分離し、Runtime 側へ Editor command の
   permission を付与しない。加えて **Rust domain 側でも mode / capability を検証**し、Runtime mode からの
   Editor mutation を拒否する
+  - 前提: Tauri では `invoke_handler` に登録したアプリ独自 command は**既定で全 window / webview から
+    呼べる**。capability による分離を成立させるには、`build.rs` の `AppManifest::commands` で独自
+    command を ACL 対象として宣言し、`allow-<command>` permission を Editor 側 capability だけに付与する
+    （参考実装: `apps/banto-hub/src-tauri/build.rs`。navigate 後の webview から command を呼ぶために同じ
+    宣言をしている）。宣言漏れの command は capability で制限できないため、Rust domain 側の検証を
+    最後の砦として必ず置く
 - 別 executable 化の判断基準は、runtime-only distribution、security、licensing、update lifecycle、
   deployment size 等の要求が発生した場合とする。**host 3 の着手時を、分離要否を再確認する節目**とする
 
