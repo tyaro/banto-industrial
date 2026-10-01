@@ -16,6 +16,7 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { authSettingsStore } from './authSettingsStore.svelte';
+	import { pickPrimaryLanUrl } from './connectivityScope';
 
 	const tauri = isTauri();
 
@@ -56,12 +57,21 @@
 		}
 	}
 
-	// The QR code shown is for the first LAN-reachable URL (i.e. not the
-	// 127.0.0.1-only one) - that's the one another machine on the LAN would
-	// actually need to scan; showing every URL's QR would just be noise.
-	const firstLanUrl = $derived(
-		serverStatus?.urls.find((url) => !url.includes('127.0.0.1')) ?? null
-	);
+	// The QR code shown is for the first LAN-reachable URL - that's the one
+	// another machine on the LAN would actually need to scan; showing every
+	// URL's QR would just be noise. `serverStatus.urls` is already scoped to
+	// `bind` on the Rust side (`banto_server::lan_urls_for_bind`, PR1a), so a
+	// loopback-scoped bind's `urls` only ever contains a loopback entry and
+	// `pickPrimaryLanUrl` returns `null` for it.
+	//
+	// banto v2.0.0 (#216, owner review on banto PR #254): this used to pick
+	// `urls.find((url) => !url.includes('127.0.0.1'))`, a substring check that
+	// is not a loopback test - a `127.0.0.2` URL (still loopback) or the
+	// unspecified `0.0.0.0` would be chosen as "the LAN URL". `pickPrimaryLanUrl`
+	// (`connectivityScope.ts`, copied from banto v2.0.0's admin-template) uses
+	// a real IPv4 loopback test and excludes the unspecified address (IPv4
+	// only, owner decision 2026-09-29).
+	const firstLanUrl = $derived(serverStatus ? pickPrimaryLanUrl(serverStatus.urls) : null);
 	const firstLanQrSvg = $derived(
 		firstLanUrl
 			? (serverStatus?.qrSvgs.find((entry) => entry.url === firstLanUrl)?.svg ?? null)
