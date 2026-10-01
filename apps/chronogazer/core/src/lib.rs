@@ -36,6 +36,44 @@ pub mod users;
 // payload は `rest` 側（`rest::PlcConnectionPayload` 等）が持つ -
 // banto-tags 自身の `*Input` は snake_case で deserialize し、ワイヤを
 // 一切またがない。
+/// The URLs a client can use to reach a server that is ACTUALLY listening on
+/// `addr` (its `RunningServer::local_addr()`) - for the startup log's
+/// "listening at" list (`banto-serve`) and
+/// the desktop settings screen's URL/QR list while the embedded server runs. banto v2.0.0 移行（PR1a オーナーレビュー P3）: the
+/// bind setting is a free string handed to `TcpListener::bind`, so a host
+/// name such as `localhost` binds fine but `lan_urls_for_bind` cannot parse
+/// it as an IP and would list nothing. The bound address is always an IP;
+/// an unspecified `0.0.0.0` bind stays `0.0.0.0` here, so every interface is
+/// still listed. (An IPv6 bound address lists nothing, by banto's
+/// `lan_urls_for_bind` policy - IPv6 is out of scope for now.)
+pub fn listening_urls(addr: std::net::SocketAddr) -> Vec<String> {
+    banto_server::lan_urls_for_bind(&addr.ip().to_string(), addr.port())
+}
+
 pub use banto_tags::{
     CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
 };
+
+#[cfg(test)]
+mod listening_urls_tests {
+    use super::listening_urls;
+
+    /// PR1a オーナーレビュー P3: see [`listening_urls`].
+    #[test]
+    fn listening_urls_come_from_the_bound_address() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert_eq!(
+            listening_urls(addr),
+            vec![format!("http://127.0.0.1:{}", addr.port())]
+        );
+
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert!(
+            listening_urls(addr).contains(&format!("http://127.0.0.1:{}", addr.port())),
+            "{:?}",
+            listening_urls(addr)
+        );
+    }
+}

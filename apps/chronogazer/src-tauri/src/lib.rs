@@ -1611,8 +1611,19 @@ fn qr_svg_for(data: &str) -> String {
         .unwrap_or_default()
 }
 
-fn build_status(config: &ServerSettings, running: bool) -> ServerStatusResult {
-    let urls = lan_urls_for_bind(&config.bind, config.port);
+/// `running` is the embedded server's bound address while it runs. Its URLs
+/// then come from that address (`chronogazer_core::listening_urls`, the same
+/// as `banto-serve`'s startup log - PR1a オーナーレビュー P3); with no server
+/// running they come from the saved `bind`/`port` (the settings screen only
+/// offers IP choices for `bind`, so it parses).
+fn build_status(
+    config: &ServerSettings,
+    running: Option<std::net::SocketAddr>,
+) -> ServerStatusResult {
+    let urls = match running {
+        Some(addr) => chronogazer_core::listening_urls(addr),
+        None => lan_urls_for_bind(&config.bind, config.port),
+    };
     let qr_svgs = urls
         .iter()
         .map(|url| QrSvgEntry {
@@ -1622,7 +1633,7 @@ fn build_status(config: &ServerSettings, running: bool) -> ServerStatusResult {
         .collect();
     ServerStatusResult {
         enabled: config.enabled,
-        running,
+        running: running.is_some(),
         bind: config.bind.clone(),
         port: config.port,
         urls,
@@ -1691,7 +1702,12 @@ async fn start_embedded_server(
 async fn server_status(state: State<'_, AppState>) -> Result<ServerStatusResult, BantoError> {
     require_role(&state, Role::Admin, "settings").await?;
     let config = state.settings.server_config().await?;
-    let running = state.server.lock().await.is_some();
+    let running = state
+        .server
+        .lock()
+        .await
+        .as_ref()
+        .map(|server| server.local_addr());
     Ok(build_status(&config, running))
 }
 
@@ -1746,7 +1762,7 @@ async fn server_apply(
         None
     };
 
-    let running = started.is_some();
+    let running = started.as_ref().map(|server| server.local_addr());
     *state.server.lock().await = started;
     state
         .audit

@@ -632,20 +632,14 @@ impl HubRuntime {
         )
         .merge(static_router::<FrontendAssets>());
 
-        let server = start(
-            ServerConfig {
-                bind: bind.clone(),
-                port,
-            },
-            app,
-        )
-        .await
-        .map_err(HubStartError::ServerStart)?;
+        let server = start(ServerConfig { bind, port }, app)
+            .await
+            .map_err(HubStartError::ServerStart)?;
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
         log_line("banto-hub: listening at:");
-        for url in lan_urls_for_bind(&bind, server.local_addr().port()) {
+        for url in listening_urls(server.local_addr()) {
             log_line(&format!("  {url}"));
         }
         if grpc_settings.enabled {
@@ -918,9 +912,44 @@ async fn audit_prune_once(settings: &SettingsService, audit: &AuditLogService) {
     }
 }
 
+/// The URLs a client can use to reach a server that is ACTUALLY listening on
+/// `addr` (its `RunningServer::local_addr()`) - for the startup log's
+/// "listening at" list. banto v2.0.0 移行（PR1a オーナーレビュー P3）: the
+/// bind setting is a free string handed to `TcpListener::bind`, so a host
+/// name such as `localhost` binds fine but `lan_urls_for_bind` cannot parse
+/// it as an IP and would list nothing. The bound address is always an IP;
+/// an unspecified `0.0.0.0` bind stays `0.0.0.0` here, so every interface is
+/// still listed. (An IPv6 bound address lists nothing, by banto's
+/// `lan_urls_for_bind` policy - IPv6 is out of scope for now.)
+fn listening_urls(addr: std::net::SocketAddr) -> Vec<String> {
+    lan_urls_for_bind(&addr.ip().to_string(), addr.port())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR1a オーナーレビュー P3: the startup log's URLs come from the bound
+    /// address - a loopback bind lists exactly that URL, and an unspecified
+    /// bind still lists the loopback one (plus one per LAN interface).
+    #[test]
+    fn listening_urls_come_from_the_bound_address() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert_eq!(
+            listening_urls(addr),
+            vec![format!("http://127.0.0.1:{}", addr.port())]
+        );
+
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        assert_eq!(addr.ip().to_string(), "0.0.0.0");
+        assert!(
+            listening_urls(addr).contains(&format!("http://127.0.0.1:{}", addr.port())),
+            "{:?}",
+            listening_urls(addr)
+        );
+    }
 
     /// T14-1 実装指示 §7「テスト」の最小 smoke テスト:
     /// `HubRuntime::start` → `local_addr()` → `shutdown()` が一時 DB /
