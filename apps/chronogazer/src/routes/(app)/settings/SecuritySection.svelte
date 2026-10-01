@@ -81,8 +81,10 @@
 			//   `guardCategory` が先頭カテゴリへ送る（PR #372 の空ページ対策）。
 			// admin-template の `SecuritySection.svelte` と同じ形（PR1a の移行措置の
 			// 説明を v2 の形に戻した）。
-			await invalidateAll();
+			// トーストは load の再実行の前に出す（admin-template と同じ順）。後だと、
+			// OFF でログイン画面へ移った後に出る・確認できないとき最大 10 秒遅れる。
 			toastStore.push('success', '認証設定を更新しました');
+			await invalidateAll();
 		} catch (err) {
 			// 排他違反（LANアクセス有効中の有効化など）はサーバ側の日本語メッセージ
 			// (kind: 'other') をそのままトーストに出す（spec M11）。

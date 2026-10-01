@@ -31,7 +31,17 @@ import {
 } from '@banto/admin-core';
 
 vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
-vi.mock('$lib/settings.svelte', () => ({ settings: { syncFromProvider: async () => {} } }));
+// `afterConfirm`: a test hook run inside the guard right after its confirmation
+// (the guard calls `settings.syncFromProvider()` synchronously there), to move
+// the session on before `load()` returns.
+const hooks = vi.hoisted(() => ({ afterConfirm: null as null | (() => void) }));
+vi.mock('$lib/settings.svelte', () => ({
+	settings: {
+		syncFromProvider: async () => {
+			hooks.afterConfirm?.();
+		}
+	}
+}));
 
 import { load } from '../../routes/(app)/+layout';
 import { isBantoAuthCheckResponse, SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
@@ -66,6 +76,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.unstubAllGlobals();
+	hooks.afterConfirm = null;
 });
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -175,6 +186,40 @@ describe('(app) ガード: 確定したときだけ判断する', () => {
 		expect(snapshot).toMatchObject({ status: 'active', owner: 'account:alice' });
 		expect(result).toEqual({ kind: 'data', sessionGeneration: snapshot.generation });
 		expect(session.getItem(TOKEN_KEY)).toBe('live-token');
+	});
+
+	it('返す世代は「この load が確定した世代」で、load の後に動いた今の世代ではない（I-16）', async () => {
+		let revision = 1;
+		const listeners = new Set<() => void>();
+		const rev = () => `${revision}.0` as CredentialRevision;
+		useProvider({
+			login: async () => ({ success: true }),
+			logout: async () => {},
+			resolve: async () => ({
+				status: 'active',
+				checked: rev(),
+				current: rev(),
+				identity: { id: 'alice', name: 'Alice', role: 'admin' }
+			}),
+			credentialRevision: rev,
+			onCredentialChanged(listener) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			}
+		});
+		const controller = getSessionController();
+		let confirmedGeneration = -1;
+		// Another tab's login lands right after this load confirmed Alice: the
+		// controller holds (generation moves) before the load returns.
+		hooks.afterConfirm = () => {
+			confirmedGeneration = controller.snapshot.generation;
+			revision += 1;
+			for (const listener of [...listeners]) listener();
+		};
+
+		const result = await runGuard();
+		expect(controller.snapshot.generation).not.toBe(confirmedGeneration);
+		expect(result).toEqual({ kind: 'data', sessionGeneration: confirmedGeneration });
 	});
 });
 
