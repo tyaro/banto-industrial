@@ -1,41 +1,53 @@
+// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
+// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v2 移行 PR1c）。
+// chronogazer 固有の差: 閲覧公開（viewer-public）が無いので確定した `none` は
+// `publicViewerFallback` を経ずにそのまま /login（公開閲覧のナビ制限も無い）。
+// エラー画面の本文は i18n ではなく `SESSION_CHECK_FAILED_MESSAGE`（日本語）。
+// ロケールの同期（`syncLocaleFromProvider`）は無い。`base` は使わない。
 import { error, redirect } from '@sveltejs/kit';
-import { getAuthProvider } from '@banto/admin-core';
+import { getSessionController, resolveSettled } from '@banto/admin-core';
 import { bantoReady } from '$lib/banto/setup';
-import { decideProtectedRoute, SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
-import { sessionStore } from '$lib/session.svelte';
+import { SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
 import { settings } from '$lib/settings.svelte';
 
-// Auth guard for the whole (app) group (spec §8.1), backed by
-// AuthProvider.check() (spec §3.3). Must wait for provider
-// selection/detection (spec §11.1's three-way environment probe) to finish
-// before getAuthProvider() is safe to call.
+// Auth guard for the whole (app) group (spec §8.1), banto Issue #260 (design
+// §6.1, v2.0.0): the session is confirmed by the SessionController - the
+// only writer of "who is signed in" (ADR-0016). This load's only side
+// effect is the controller's confirmation; it writes no store
+// (`sessionStore` is derived from `controller.snapshot`). Must wait for
+// provider selection/detection (spec §11.1's three-way environment probe)
+// first.
 //
-// banto v1.7.0 #204: `decideProtectedRoute` (`resolveProtectedSession`) only
-// sends the user to the login screen when the session is CONFIRMED invalid.
-// When it could not be verified (the server's account check failed with a
-// 500, the server is unreachable, or Tauri's `auth_check` hit a DB error) the
-// guard stops with an error page that offers a retry (`routes/+error.svelte`)
-// - the stored token (Remember me included) is kept, and the session resumes
-// once the server answers.
-//
-// M10 RBAC: also populates `sessionStore` (identity + role) here, right
-// after the session is confirmed valid, so every page/component under (app)
-// can read `sessionStore.role` synchronously - see session.svelte.ts's doc
-// comment for the ordering guarantee this relies on.
+// - `resolveSettled()` asks again after `superseded` and returns only
+//   `confirmed` or `unverified` (I-16). `unverified` - the server could not
+//   verify the session (banto #204: a 500 / unreachable, Tauri's
+//   `auth_resolve` hitting a DB error), or it kept changing, or the 10 s
+//   deadline passed - is the retryable error page (`routes/+error.svelte`):
+//   nothing is cleared, the stored token (Remember me included) is kept, and
+//   "再試行" re-runs this load (S-36/S-60: after a switch of user it is NOT
+//   left automatically).
+// - A CONFIRMED `none` goes to /login. ChronoGazer has no public viewing
+//   (no `server.viewerPublic`), so there is no `publicViewerFallback` step.
 export async function load() {
 	await bantoReady;
-	const decision = await decideProtectedRoute(getAuthProvider());
-	if (decision === 'unverified') {
+	const controller = getSessionController();
+	const result = await resolveSettled(controller, { cause: 'navigation' });
+	if (result.outcome === 'unverified') {
 		error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
 	}
-	if (decision === 'login') {
-		redirect(307, '/login');
-	}
-	await sessionStore.load();
+	if (result.snapshot.status !== 'active') redirect(307, '/login');
 
 	// M12: now that the session is confirmed, pull theme settings from the
 	// UiSettingsProvider (settings DB) - a value saved from another
 	// client/session beats this tab's localStorage cache. Fire-and-forget:
 	// navigation must not wait on (or fail with) a settings read.
 	void settings.syncFromProvider();
+
+	// The generation THIS load confirmed (I-16) - never a `snapshot.generation`
+	// read now: after the awaits above another session may already have been
+	// confirmed, and this load's data belongs to the earlier one.
+	// `+layout.svelte` renders the page only while it is still the live
+	// generation (the generation gate) and re-runs the loads when it is not
+	// (wiring ①).
+	return { sessionGeneration: result.snapshot.generation };
 }

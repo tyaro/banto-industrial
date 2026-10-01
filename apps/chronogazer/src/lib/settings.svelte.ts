@@ -10,7 +10,7 @@
  *   every change (an unauthenticated write fails server-side and is
  *   swallowed - the local cache already has the value). Read back once per
  *   login via `syncFromProvider()` (called from the `(app)` route guard
- *   after `sessionStore.load()`), so a value saved from another
+ *   once the SessionController confirmed the session), so a value saved from another
  *   client/session wins over this tab's stale localStorage.
  */
 import {
@@ -96,7 +96,7 @@ class Settings {
 	 * Pull theme settings from the `UiSettingsProvider` and apply whatever it
 	 * holds (updating the localStorage cache too). Called once per login from
 	 * `routes/(app)/+layout.ts` - that's the earliest point the provider is
-	 * guaranteed authenticated (`sessionStore.load()` just succeeded). A
+	 * guaranteed authenticated (the controller just confirmed the session). A
 	 * missing key (never saved) or any provider failure leaves the current
 	 * (localStorage-seeded) values in place.
 	 */

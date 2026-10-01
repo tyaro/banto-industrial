@@ -11,8 +11,8 @@ import { sessionStore } from '$lib/session.svelte';
  * `await parent()` (rather than reading `sessionStore.role` directly) is
  * required here: SvelteKit does not wait for an ancestor layout's load() to
  * finish before running this one unless asked to, and `(app)/+layout.ts` is
- * what actually populates `sessionStore` - see that file and
- * `session.svelte.ts`'s doc comments.
+ * what confirms the session `sessionStore` is derived from (banto v2.0.0's
+ * SessionController) - see that file and `session.svelte.ts`'s doc comments.
  */
 export async function load({ parent }) {
 	await parent();
