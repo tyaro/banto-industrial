@@ -42,20 +42,20 @@ importers:
   apps/banto-hub:
     dependencies:
       '@banto/admin-core':
-        specifier: github:tyaro/banto#v1.7.3&path:packages/admin-core
-        version: https://codeload.github.com/tyaro/banto/tar.gz/7cafd7ff307dc6d6bf88bdcad2f219ce9fea47b1#path:packages/admin-core
+        specifier: github:tyaro/banto#v2.0.0&path:packages/admin-core
+        version: https://codeload.github.com/tyaro/banto/tar.gz/dc61fc1cf3b48ef9ddc2f89156643008973f7188#path:packages/admin-core
       '@banto/charts':
-        specifier: github:tyaro/banto#v1.7.3&path:packages/charts
-        version: https://codeload.github.com/tyaro/banto/tar.gz/7cafd7ff307dc6d6bf88bdcad2f219ce9fea47b1#path:packages/charts
+        specifier: github:tyaro/banto#v2.0.0&path:packages/charts
+        version: https://codeload.github.com/tyaro/banto/tar.gz/dc61fc1cf3b48ef9ddc2f89156643008973f7188#path:packages/charts
       '@banto/forms':
-        specifier: github:tyaro/banto#v1.7.3&path:packages/forms
-        version: https://codeload.github.com/tyaro/banto/tar.gz/7cafd7ff307dc6d6bf88bdcad2f219ce9fea47b1#path:packages/forms
+        specifier: github:tyaro/banto#v2.0.0&path:packages/forms
+        version: https://codeload.github.com/tyaro/banto/tar.gz/dc61fc1cf3b48ef9ddc2f89156643008973f7188#path:packages/forms
       '@banto/grid-svelte':
-        specifier: github:tyaro/banto#v1.7.3&path:packages/grid-svelte
-        version: https://codeload.github.com/tyaro/banto/tar.gz/7cafd7ff307dc6d6bf88bdcad2f219ce9fea47b1#path:packages/grid-svelte
+        specifier: github:tyaro/banto#v2.0.0&path:packages/grid-svelte
+        version: https://codeload.github.com/tyaro/banto/tar.gz/dc61fc1cf3b48ef9ddc2f89156643008973f7188#path:packages/grid-svelte
       '@banto/theme':
-        specifier: github:tyaro/banto#v1.7.3&path:packages/theme
-        version: https://codeload.github.com/tyaro/banto/tar.gz/7cafd7ff307dc6d6bf88bdcad2f219ce9fea47b1#path:packages/theme
+        specifier: github:tyaro/banto#v2.0.0&path:packages/theme
+        version: https://codeload.github.com/tyaro/banto/tar.gz/dc61fc1cf3b48ef9ddc2f89156643008973f7188#path:packages/theme
       '@tauri-apps/api':
         specifier: ^2.11.1
         version: 2.11.1
