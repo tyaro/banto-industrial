@@ -168,6 +168,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # @banto/* のうち .svelte.ts を持つものが vite.config.ts の optimizeDeps.exclude から
+      # 漏れていないか（漏れると pnpm dev だけが壊れ、build・E2E では見つからない。#478）。
+      - name: Check optimizeDeps.exclude (banto)
+        run: node scripts/check-banto-optimize-deps.mjs apps/banto-hub
+
+      - name: Test scripts
+        run: node --test scripts/check-banto-optimize-deps.test.mjs
+
       - name: Type check (svelte-check + tsc)
         run: pnpm --filter banto-hub check
 
@@ -198,6 +206,11 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # @banto/* のうち .svelte.ts を持つものが vite.config.ts の optimizeDeps.exclude から
+      # 漏れていないか（漏れると pnpm dev だけが壊れ、build・E2E では見つからない。#478）。
+      - name: Check optimizeDeps.exclude (banto)
+        run: node scripts/check-banto-optimize-deps.mjs apps/chronogazer
 
       - name: Type check (svelte-check + tsc)
         run: pnpm --filter chronogazer check

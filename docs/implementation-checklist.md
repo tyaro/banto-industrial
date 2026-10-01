@@ -39,6 +39,7 @@
 3. [ ] `cargo clippy -p <触ったクレート> --all-targets -- -D warnings`
 4. [ ] **`pnpm exec eslint <触った src と e2e>`** — **`pnpm --filter <app> check`（svelte-check）は ESLint を回さない。** CI には両方ある。
 5. [ ] `pnpm --filter <app> check` → `pnpm --filter <app> test`
+   - [ ] `@banto/*` を上げた・足したら `node scripts/check-banto-optimize-deps.mjs`（`.svelte.ts` を持つパッケージが `vite.config.ts` の `optimizeDeps.exclude` から漏れていないか。漏れは `pnpm dev` だけが壊れ、build・E2E では出ない。CI の frontend-hub / frontend-chronogazer も実行、#478）
 6. [ ] `pnpm exec prettier --write <編集した md/ts/svelte 全部>` → **整形後にもう一度 test と eslint**（整形が壊すことがある）
    - [ ] **`prettier --check .` をリポジトリ全体にかけない**（**`prettier --write .` は絶対にかけない**）。Windows の作業ツリーは CRLF なので、**main が CI で緑でもローカルでは 340 件の「差分あり」が出る**（CI は Linux/LF）。これを整形漏れと誤認して `--write .` を実行すると、**全ファイルの改行を書き換えた巨大な差分**になる。対象は**編集したファイルだけ**に絞る。全体を比べたいときは **`--end-of-line auto` を付ける**（2026-09-20: prettier 3.9.8 が整形結果を変えるかを調べて 340 件に当たった。**現行版で同じコマンドを回す対照**を取ったら同じ 340 件で、原因は版ではなく改行だった。**依存を上げる前後の比較は、必ず同じ条件で対照を取る**）。
 7. [ ] E2E の前に必ず: `pnpm --filter <app> build` → **`cargo build -p <core> --bin <bin> --features embed-ui`**（**`--features embed-ui` を落とすと smoke が全滅する**）
