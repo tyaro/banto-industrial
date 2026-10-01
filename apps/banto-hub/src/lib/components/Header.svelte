@@ -2,8 +2,7 @@
 	// relay-wright の同名コンポーネントから無改変で複製。
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { logoutAndLeave } from '$lib/banto/logout.svelte';
-	import { notifyLogoutOutcome } from '$lib/banto/logoutNotice';
+	import { hubLogout } from '$lib/banto/hubLogout';
 	import { pageTitle } from '$lib/navigation';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { sessionStore } from '$lib/session.svelte';
@@ -27,7 +26,8 @@
 		// /login only when it is confirmed `none` (another tab's login
 		// confirmed meanwhile stays). `'stayed'`/`'unverified'` are told with a
 		// toast - see `$lib/banto/logout.svelte.ts` for the full sequence.
-		await logoutAndLeave(() => goto('/login'), { notify: notifyLogoutOutcome });
+		// 試運転モードの合成セッションの間は v1 と同じ（`$lib/banto/hubLogout.ts`）。
+		await hubLogout(() => goto('/login'));
 	}
 </script>
 
@@ -62,12 +62,7 @@
 		🔍
 	</button>
 
-	<!--
-		試運転モードの合成セッション（`commissioningMode`）にはログアウトが無い
-		（設計 §5.1 の表「ログアウトの継続」: adopt 中の確定は常に試運転の
-		セッション）。終わらせるのは設定画面のロックダウンだけなので出さない。
-	-->
-	{#if !sessionStore.authDisabled && !sessionStore.commissioningMode}
+	{#if !sessionStore.authDisabled}
 		<button type="button" class="icon-button" onclick={logout}>ログアウト</button>
 	{/if}
 </header>

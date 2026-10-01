@@ -5,8 +5,7 @@
  */
 import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
-import { logoutAndLeave } from './banto/logout.svelte';
-import { notifyLogoutOutcome } from './banto/logoutNotice';
+import { hubLogout } from './banto/hubLogout';
 import { navItems } from './navigation';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
@@ -76,11 +75,10 @@ function sessionCommands(): PaletteCommand[] {
 			title: 'ログアウト',
 			group: 'セッション',
 			keywords: ['logout', 'sign out'],
-			// 試運転モードの合成セッションにはログアウトが無い（`Header.svelte` と同じ）。
-			visible: () => !sessionStore.authDisabled && !sessionStore.commissioningMode,
+			visible: () => !sessionStore.authDisabled,
 			run: async () => {
 				// banto v2.0.0 (#260): same as Header.svelte's logout.
-				await logoutAndLeave(() => goto('/login'), { notify: notifyLogoutOutcome });
+				await hubLogout(() => goto('/login'));
 			}
 		}
 	];
