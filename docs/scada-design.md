@@ -321,8 +321,11 @@ metadata** とし、directory representation の manifest.json には置かな�
 古くなり、§5.2 の競合検知が手編集で残った古い hash に引っかかる）。export 時に算出して書き込み、import 時
 は archive の中身から再計算して照合する。directory を直接読み込む場合は読込時に算出する。
 
-`contentHash` の計算対象は、**archive-only metadata（`exportedAt`、`contentHash` 自身、`checksums.json`）を
-除いた、directory / ZIP 共通の論理内容**とし、serializer の canonical 表現に対して計算する。再 export や
+`contentHash` の計算対象は、**archive-only metadata（`exportedAt`、`contentHash` 自身、`checksums.json`）と
+generation metadata である `projectRevision` を除いた、directory / ZIP 共通の論理内容**とし、serializer の
+canonical 表現に対して計算する。projectRevision を含めると、内容を変えずに Save しただけで hash が変わり
+（127 / AAA → 128 / BBB）、「contentHash = Project 内容の identity」という役割とずれ、§5.2 で同一内容の
+再保存が差分扱いになる。再 export や
 directory ↔ ZIP の変換で同じ Project が異なる hash になり競合扱いされることを防ぐため。Project 同一性判定
 用のこの hash と、archive 内の各ファイル単位の checksum（`checksums.json`、転送破損の検知用）は別物として
 区別する。
@@ -382,8 +385,27 @@ workingContentHash   現在の in-memory Project 内容の hash（未保存変�
 ```text
 external-modified の解除:
   Reload     disk 側を採用して Editor の状態を破棄する
-  Overwrite  差分を明示確認したうえで Editor 側を保存する（revision +1）
+  Overwrite  差分を明示確認したうえで Editor 側を保存する（revision +1。下記の専用手順）
   Save As    別の場所へ保存する（元の directory は触らない）
+```
+
+Overwrite は通常 Save とは**別の recovery operation**とする。通常 Save の freshness guard（disk の hash ≠
+`diskBaselineHash` なら persist しない）をそのまま通すと、同じ mismatch で必ず再拒否されるため。差分確認と
+書込みの間に別 PC が再度変更する TOCTOU を、承認時に確認した disk hash の再確認で閉じる。
+
+```text
+Overwrite:
+  1. disk の最新 hash / projectRevision を読む
+  2. 差分をユーザーへ提示
+  3. ユーザーが Overwrite を明示承認
+  4. 承認時に確認した disk hash を expectedDiskHash として保持
+  5. 書込み直前に disk hash を再確認
+       disk hash != expectedDiskHash  -> その間に再度外部変更された -> project_external_modified、上書きしない
+  6. revisionFloor = max(revisionFloor, disk の projectRevision)
+  7. working state を persist
+  8. projectRevision = max(currentRevision, revisionFloor) + 1
+  9. diskBaselineHash を更新
+ 10. external-modified を解除
 ```
 
 - 検出は file watcher だけに依存しない。**save 直前の canonical content hash の再計算と `diskBaselineHash`
@@ -2267,7 +2289,8 @@ Design API apply
   -> mutation commit                   workingRevision +1
 
 save（Editor の Save、または Design API の save endpoint）
-  -> full canonical hash check         disk の hash != diskBaselineHash -> external-modified（§4.3 の Reload / Overwrite / Save As）
+  -> full canonical hash check         disk の hash != diskBaselineHash -> external-modified、persist しない
+                                       （解除は §4.3 の Reload / Overwrite / Save As。Overwrite は expectedDiskHash を再確認する別 operation）
   -> persist                           projectRevision = max(current, revisionFloor) + 1、diskBaselineHash 更新
 ```
 
@@ -2679,7 +2702,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
-22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、案 B: projectRevision は永続化された generation、workingRevision は working state を変更 / 置換する操作（mutation、undo / redo、Reload、Import apply、merge）ごとに +1 する session 内 generation で Design API の optimistic concurrency token（§19.8、不一致は `working_revision_conflict`）、mutation commit と save は同一にしない。external-modified 中は Save も通常 mutation も拒否。contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須とし mutation commit 前の共通 freshness guard に置く、Design API は `project_external_modified`（§19.8）。observed revision の最大値 `revisionFloor`（external-modified 検出時の disk revision を含む）を内容切替で下げず次の save は max(current, floor) + 1。commit 前は安価な stale 検知、save 前は full hash。Reload は undo 履歴を破棄。Design API は save endpoint を持つ。環境別 cache は補助のみ）
+22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、案 B: projectRevision は永続化された generation、workingRevision は working state を変更 / 置換する操作（mutation、undo / redo、Reload、Import apply、merge）ごとに +1 する session 内 generation で Design API の optimistic concurrency token（§19.8、不一致は `working_revision_conflict`）、mutation commit と save は同一にしない。external-modified 中は Save も通常 mutation も拒否。contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須とし mutation commit 前の共通 freshness guard に置く、Design API は `project_external_modified`（§19.8）。observed revision の最大値 `revisionFloor`（external-modified 検出時の disk revision を含む）を内容切替で下げず次の save は max(current, floor) + 1。commit 前は安価な stale 検知、save 前は full hash。Reload は undo 履歴を破棄。Overwrite は expectedDiskHash を再確認する別 operation。contentHash は projectRevision を含めない。Design API は save endpoint を持つ。環境別 cache は補助のみ）
 23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーと NaN / ±Inf は Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、catalog 無しは warning、Runtime は評価せず Bad）
 24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心（`x + width / 2`、原点を含む一般の bounds。SymbolInstance は SymbolDefinition の design size）、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
 25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる。Runtime mode は Design API listener を bind しない）
