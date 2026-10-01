@@ -1,7 +1,7 @@
 # banto-hub / SCADA server 冗長化 設計草案
 
 作成日: 2026-09-30  
-最終更新: 2026-10-01（オーナーレビュー 7 回目を反映: commit は predecessor 付きの真正な CAS（expected committed + epoch 連番）、`config_epoch` は調停者の committed + 1 から採番、abort は「同じ fingerprint の次 epoch を commit する空の有効化」に統一して aborted 領域を廃止、未解決の pending は 1 件だけで解消まで次の prepare を拒否、command gate の `cmd` も double buffer + `cmd_index` で `ack` は別領域（4.3、5.3）、固定 primary は単一ノード版の手順を定義（4.3）。2026-09-30: オーナーレビュー 6 回目を反映: pending の abort は調停者上の fenced CAS だけで行いローカル timeout では開け直さない（4.3、5.3）、Alarm の範囲同期は任意の replica から origin ごとに回収し watermark は origin ごと（6.3）、authority 候補集合は固定で変更は計画停止の手順のみ（6.3）、PLC の多ワード値は double buffer + index word で一貫性を作る（5.3）、HLC はリモート受信時にも merge（6.3）。同日: オーナーレビュー 5 回目を反映: 書き込みゲートに調停者の committed generation を直接入れ prepare から switch 完了までは閉じる（4.3）、候補 A のワードは slot / committed / commit_req で同じ 96 bit の generation token を比較し epoch 類は 32 bit に（5.3）、Alarm の barrier は quorum 方式で fail-closed（6.3）、Sink の期限判定は `clock_timestamp()` と行ロック先行に（4.8）。同日: オーナーレビュー 4 回目を反映: 設定の有効化を prepare / commit に分け commit point を調停者に置く、primary 昇格は調停者の committed generation と一致する台だけ（4.3、5.3）、Alarm の watermark は欠番なく連続した最大 seq、新 authority はサービス開始前に catch-up barrier、同期複製の既定は到達可能な候補全台（6.3）、Sink の flush guard に `expires_at >= now()`（4.8）、client 側 write gate の解除条件（§7）。同日: オーナーレビュー 3 回目を反映: 設定の「配布」と「有効化」を分け generation で書き込みを開ける（primary も例外にしない、4.3）、操作者イベントの同期複製は依存する `opened` を束ねる因果複製に（6.3）、PLC Action の fencing は bounded-delay と明記し strict は PLC 側 command gate（5.1 / 5.3）、Sink のリースは sink group 単位（4.8）、HLC の永続化と MQTT `t` の記述削除（6.3 / 4.7）。同日: オーナーレビュー 2 回目を反映: リースの権利を副作用まで切れ目なく伝える。期限は最後に成功した Grant + ttl（5.1）、Sink はサイドカー自身が DB リースを持ち INSERT と同一トランザクションで検査（4.8）、設定の鮮度確認と `config-primary` のリース化（4.3）、ACK は別 1 台への同期複製後に応答（6.3）、`origin_seq` の永続化（6.3）、候補 B の MQTT 巻き戻りを許容条件として明記（4.7）。同日: オーナーレビュー 1 回目を反映: Alarm occurrence の採番を `alarm-authority` に（6.3）、役割を重複許容 / 排他必須に分け排他必須は競合窓の無い調停に限定（5.1）、設定不一致時の PLC 書き込みを fail-closed に（4.3）、イベントの順序を origin seq + HLC に（6.3）、履歴統合を区間ごとの正ソース方式に（6.2）。同日: 初版。scada-design.md §13.2 の原則を受けて、3 層の冗長化とリースの抽象を草案化）  
+最終更新: 2026-10-01（オーナーレビュー 8 回目を反映: command gate の ACK を `(epoch, seq)` の組に（5.3）、Sink group にクロスインスタンスで不変な `sink_group_uid` を持たせリースのキーに（4.8、§9 R0）、scada-design.md §22 #19 の参照を更新。同日: オーナーレビュー 7 回目を反映: commit は predecessor 付きの真正な CAS（expected committed + epoch 連番）、`config_epoch` は調停者の committed + 1 から採番、abort は「同じ fingerprint の次 epoch を commit する空の有効化」に統一して aborted 領域を廃止、未解決の pending は 1 件だけで解消まで次の prepare を拒否、command gate の `cmd` も double buffer + `cmd_index` で `ack` は別領域（4.3、5.3）、固定 primary は単一ノード版の手順を定義（4.3）。2026-09-30: オーナーレビュー 6 回目を反映: pending の abort は調停者上の fenced CAS だけで行いローカル timeout では開け直さない（4.3、5.3）、Alarm の範囲同期は任意の replica から origin ごとに回収し watermark は origin ごと（6.3）、authority 候補集合は固定で変更は計画停止の手順のみ（6.3）、PLC の多ワード値は double buffer + index word で一貫性を作る（5.3）、HLC はリモート受信時にも merge（6.3）。同日: オーナーレビュー 5 回目を反映: 書き込みゲートに調停者の committed generation を直接入れ prepare から switch 完了までは閉じる（4.3）、候補 A のワードは slot / committed / commit_req で同じ 96 bit の generation token を比較し epoch 類は 32 bit に（5.3）、Alarm の barrier は quorum 方式で fail-closed（6.3）、Sink の期限判定は `clock_timestamp()` と行ロック先行に（4.8）。同日: オーナーレビュー 4 回目を反映: 設定の有効化を prepare / commit に分け commit point を調停者に置く、primary 昇格は調停者の committed generation と一致する台だけ（4.3、5.3）、Alarm の watermark は欠番なく連続した最大 seq、新 authority はサービス開始前に catch-up barrier、同期複製の既定は到達可能な候補全台（6.3）、Sink の flush guard に `expires_at >= now()`（4.8）、client 側 write gate の解除条件（§7）。同日: オーナーレビュー 3 回目を反映: 設定の「配布」と「有効化」を分け generation で書き込みを開ける（primary も例外にしない、4.3）、操作者イベントの同期複製は依存する `opened` を束ねる因果複製に（6.3）、PLC Action の fencing は bounded-delay と明記し strict は PLC 側 command gate（5.1 / 5.3）、Sink のリースは sink group 単位（4.8）、HLC の永続化と MQTT `t` の記述削除（6.3 / 4.7）。同日: オーナーレビュー 2 回目を反映: リースの権利を副作用まで切れ目なく伝える。期限は最後に成功した Grant + ttl（5.1）、Sink はサイドカー自身が DB リースを持ち INSERT と同一トランザクションで検査（4.8）、設定の鮮度確認と `config-primary` のリース化（4.3）、ACK は別 1 台への同期複製後に応答（6.3）、`origin_seq` の永続化（6.3）、候補 B の MQTT 巻き戻りを許容条件として明記（4.7）。同日: オーナーレビュー 1 回目を反映: Alarm occurrence の採番を `alarm-authority` に（6.3）、役割を重複許容 / 排他必須に分け排他必須は競合窓の無い調停に限定（5.1）、設定不一致時の PLC 書き込みを fail-closed に（4.3）、イベントの順序を origin seq + HLC に（6.3）、履歴統合を区間ごとの正ソース方式に（6.2）。同日: 初版。scada-design.md §13.2 の原則を受けて、3 層の冗長化とリースの抽象を草案化）  
 状態: **草案（オーナー議論用）。実装は scada-server と Hub の単一構成が動いてから（scada-design.md §22 #19）**  
 対象: banto-hub（タグサーバー）、SCADA server core、PLC 接続層（banto-plc / banto-collect / banto-broker）、
 banto-tagclient
@@ -304,7 +304,11 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
 - Sink サイドカーは**インスタンスごとに 1 つ**置き、設定は各自の Hub から取る（現状どおり）
 - **リースの単位は Sink group**（2026-09-30 レビュー 3 回目 #4）: `hub_sink_groups` は group ごとに宛先
   DB（`db_connection_id`）を持ち、1 台の Hub が複数 DB へ書ける。よって役割は **`sink-writer:{sink_group}`**
-  とし、リース行はその group の宛先 DB に `(service_id, sink_group)` をキーに置く。group ごとに独立に
+  とし、リース行はその group の宛先 DB に **`(service_id, sink_group_uid)`** をキーに置く。**`sink_group_uid`
+  はクロスインスタンスで不変な論理 id（UUID）**で、`hub_sink_groups` に列を足して設定パッケージに含める
+  （2026-10-01 レビュー 8 回目 #2。現状の `SinkConfigGroup` は `id`（各 Hub の SQLite ローカル id。台ごとに
+  違うので別の lease 行になり両方 writer になれる）と `name`（可変。rename で旧サイドカーが旧名の lease を
+  持ったまま新サイドカーが新名の lease を取れる）しか持たず、どちらもキーにできない）。group ごとに独立に
   保持者が決まるので、H1 が group A、H2 が group B の書き手になることはあり、それでよい（group 内で 1 台
   なら「副作用は 1 台」を満たす）。全 group を 1 台に寄せたい場合は宛先 DB と別の共通の調停者が要るが、
   初版では提供しない。状態表示も group ごとの `{held, epoch, expires_in}` にする
@@ -312,13 +316,13 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
   2026-09-30 レビュー 2 回目 #3）。Hub が `writer` フラグを配る方式は、別プロセスのサイドカーが古い
   `writer=true` のまま INSERT を続けられる（設定の再取得は既定 30 s、5 s なのは状態 push）ので fencing に
   ならない。代わりに:
-  - 宛先 DB に `banto_sink_lease(service_id, sink_group, holder_instance_id, epoch, expires_at)` を group
+  - 宛先 DB に `banto_sink_lease(service_id, sink_group_uid, holder_instance_id, epoch, expires_at)` を group
     ごとに 1 行置く。期限の判定は**実際の現在時刻**で行う（PostgreSQL の `now()` / `CURRENT_TIMESTAMP` は
     トランザクション開始時刻で固定されるので使わない。**`clock_timestamp()`** を使う。2026-09-30 レビュー
     5 回目 #4）。取得は `UPDATE ... SET holder=$me, epoch=epoch+1, expires_at=clock_timestamp()+ttl WHERE
 expires_at < clock_timestamp()`（0 行なら取れていない）
   - **各 flush のトランザクションは lease 行のロックと検証を先に行う**:
-    `BEGIN; SELECT ... FROM lease WHERE service_id=$s AND sink_group=$g FOR UPDATE` で行をロックし、
+    `BEGIN; SELECT ... FROM lease WHERE service_id=$s AND sink_group_uid=$g FOR UPDATE` で行をロックし、
     `holder=$me AND epoch=$epoch AND expires_at >= clock_timestamp()` を検証（違えば ROLLBACK）→
     `INSERT rows` → `UPDATE lease SET expires_at=clock_timestamp()+ttl WHERE holder=$me AND epoch=$epoch
 AND expires_at >= clock_timestamp()`（0 行なら ROLLBACK）→ `COMMIT`。行ロックにより、取得を試みる
@@ -455,7 +459,8 @@ D+50..     slot[i] { instance_hash (32 bit), heartbeat_counter (32 bit), priorit
                      token_index (1W), generation token[2] (96 bit × 2) } = 19W、i = 1..8（D+50..D+201）
 D+210      cmd_index              cmd の有効バッファ（0 / 1）。action-executor が本体を書き終えてから 1W で切替
 D+211..226 cmd[2] { epoch (32 bit), seq (32 bit), target (2W), value (2W) } = 8W × 2（command gate、任意）
-D+230..231 cmd_ack_seq (32 bit)   ラダーだけが書く（Hub は読むだけ）。cmd と領域を分ける
+D+230      cmd_ack_index          cmd_ack の有効バッファ（0 / 1）。ラダーが本体を書き終えてから 1W で切替
+D+231..234 cmd_ack[2] { epoch (32 bit), seq (32 bit) }  ラダーだけが書く（Hub は読むだけ）。cmd と領域を分ける
 ```
 
 - abort 専用の領域は無い。abort は「committed と同じ fingerprint で epoch + 1」の generation を `req` で
@@ -495,9 +500,12 @@ D+230..231 cmd_ack_seq (32 bit)   ラダーだけが書く（Hub は読むだけ
   buffer + `cmd_index`**。2026-10-01 レビュー 7 回目 #3。部分更新が見えると「新しい epoch / seq + 古い
   target / value」の組み合わせを有効なコマンドとして実行してしまうため）に、`action-executor` は対象
   デバイスへ直接書かず **`epoch`（32 bit）付きで非有効側に本体を書き、`cmd_index` を 1W で切り替える**。
-  ラダーは `cmd_index` 側を読み、`cmd.epoch == epoch`（自分が決めた保持者の epoch）かつ `cmd.seq`
-  （32 bit、epoch ごとに 1 から）が未処理のときだけ `target` へ `value` を転記し、**別領域の
-  `cmd_ack_seq`**（ラダーだけが書く）を更新する。旧
+  ラダーは `cmd_index` 側を読み、`cmd.epoch == epoch`（自分が決めた保持者の epoch）かつ **`(cmd.epoch,
+cmd.seq)` が最後に処理した `cmd_ack` と異なる**ときだけ `target` へ `value` を転記し、**別領域の `cmd_ack`
+  に `(epoch, seq)` の組**を書く（double buffer + `cmd_ack_index`。ラダーだけが書く。2026-10-01 レビュー
+  8 回目 #1。ACK が `seq` だけだと、epoch 10 で seq=1 を処理済みのあと epoch 11 の最初の seq=1 が未実行でも
+  ACK 済みに見え、Hub の誤認かラダーの skip が起きる）。Hub は `cmd_ack == (自分の epoch, 送った seq)` で
+  完了を判定する。旧
   保持者の遅れたコマンドは epoch 不一致で捨てられる。1 コマンドずつ（seq の ack 待ち）なのでスループットは
   低いが、常時実行 Action の副作用は本来まれ。操作者の UI からの PLC Write はリースに縛られないので gate を
   通さない（scada-design.md §16 の相関 ID と監査が担う）
@@ -698,6 +706,7 @@ D+230..231 cmd_ack_seq (32 bit)   ラダーだけが書く（Hub は読むだけ
 | 20  | prepare 済みの H2 で 60 s 経過、その直前に commit                  | H2 はローカル timeout ではゲートを開け直さない（`stale pending` 表示のみ）。次の読み取りで調停者の committed == pending を見て switch する。空の有効化で abort されていれば committed.epoch >= pending.epoch かつ token 不一致を見て廃棄する                                                                                                              |
 | 22  | F2 → F3 と進んだ後に F2 の commit 要求が遅れて届く                 | 調停者は `committed == expected_committed`（F1）を満たさないので捨てる。F3 が F2 に戻ることはない                                                                                                                                                                                                                                                         |
 | 23  | H2 が F2 の prepare 後に長期離脱、その間に F2 abort と F3 の有効化 | 復帰した H2 は committed（F3、epoch 3）>= pending（F2、epoch 2）かつ token 不一致で pending を廃棄し、catch-up で F3 を取り込んでから書き込みを再開する                                                                                                                                                                                                   |
+| 24  | `action-executor` 交代直後の最初の command（新 epoch で seq=1）    | `cmd_ack` は `(epoch, seq)` の組なので、旧 epoch の seq=1 の ACK と区別できる。Hub は `(自分の epoch, 1)` の ACK を待ち、ラダーも組が異なるので実行する                                                                                                                                                                                                   |
 | 21  | ACK の origin S1 が停止、複製は S2 にだけ                          | 新 authority は S2 の replica API に origin=S1 の不足範囲を要求して回収する。origin にしか問い合わせない方式では取れない                                                                                                                                                                                                                                  |
 | 14  | `action-executor` の S1 が OS サスペンド                           | S1 の renew が止まり ttl + margin 後に S2 が取得。S1 が復帰した瞬間に期限前に発行済みだった PLC 書き込みが遅れて届く余地があり（bounded-delay、5.1）、S1 は単調時計の跳びを検知して即座にリースを放棄する。strict が要る Action は command gate（5.3）                                                                                                    |
 
@@ -712,6 +721,8 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
   - `service_id` / `instance_id` / `active_generation` / `config_fingerprint` を Hub の `/api/v1/status` に出す
   - 設定パッケージのサーバー側 export / import API（SCADA の Hub 連携でも使う）
   - SLMP の `io_id` / `network_id` / `pc_id` を registry から指定できるようにする（既知の制約の解消）
+  - `hub_sink_groups` に不変な `sink_group_uid`（UUID）を足し、設定パッケージに含める（4.8。単一構成でも
+    rename に強い識別子として価値がある）
   - `plc_connections` の endpoint リスト化（長さ 1 で既存と同じ）
   - banto-tagclient の endpoint リスト化（長さ 1 で既存と同じ）と `active_generation` の観測
   - MQTT `client_id` の既定を `banto-hub-{instance_id}` に
@@ -795,6 +806,7 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
 | 2026-09-30 | 3 層独立、読み取り・評価は全台、副作用は 1 台（リース）、PLC 調停第一候補、名前束縛が前提、SCADA server だけ先行しない                                                                                                                                                                                                                                                                                                                           | scada-design.md §13.2（オーナー） |
 | 2026-09-30 | 本草案を作成。§3〜§9 は提案、§10 はオーナー判断待ち                                                                                                                                                                                                                                                                                                                                                                                              | 本書                              |
 | 2026-09-30 | オーナーレビュー（PR #475 1 回目）の方向: クロスインスタンスの同一性、Action の真正な fencing、設定不一致時の write fail-closed を先に固める。→ 6.3 の `alarm-authority`、5.1 の役割 2 種と A / D 限定、4.3 の fail-closed、6.3 の origin seq + HLC、6.2 の区間ごとの正ソースに反映                                                                                                                                                              | PR #475 レビュー（オーナー）      |
+| 2026-10-01 | オーナーレビュー（PR #475 8 回目）: command gate の ACK を `(epoch, seq)` の組に、Sink group にクロスインスタンスで不変な論理 id を持たせリースのキーに。残件はこの 2 件で、設計レビューとしてはほぼ収束との判断。→ 5.3 の `cmd_ack`、4.8 の `sink_group_uid`、§9 R0 に反映                                                                                                                                                                      | PR #475 レビュー（オーナー）      |
 | 2026-10-01 | オーナーレビュー（PR #475 7 回目）の方向: commit を predecessor 付きの真正な CAS にする、未解決 pending を次の prepare で上書きさせない、strict command gate の payload も原子的に見せる。→ 4.3 / 5.3 の `expected_committed` 付き CAS と調停者基準の epoch 採番、未解決 1 件の制約、空の有効化による abort と aborted 領域の廃止、cmd の double buffer と `cmd_ack_seq` の分離、固定 primary の単一ノード版に反映                               | PR #475 レビュー（オーナー）      |
 | 2026-09-30 | オーナーレビュー（PR #475 6 回目）の方向: pending timeout と commit の競合を調停者上で解消する、Alarm quorum recovery が非 origin の replica からもイベントを回収できるようにする、quorum membership の変更規則を固定する。→ 4.3 / 5.3 の fenced abort と req / aborted のワード、6.3 の replica API と origin ごとの watermark、固定 membership と計画停止の手順、5.3 の double buffer、HLC の受信時 merge、heartbeat の 2 ワード表記に反映     | PR #475 レビュー（オーナー）      |
 | 2026-09-30 | オーナーレビュー（PR #475 5 回目）の方向: 書き込みゲートに調停者の committed generation を直接入れる、PLC 調停者が generation 全体を比較できる表現にする。→ 4.3 の 3 者一致ゲートと有効化中の閉鎖、5.3 の 96 bit generation token と 32 bit の epoch 類、6.3 の quorum barrier と `ack_replicas` = quorum、4.8 の `clock_timestamp()` と行ロック先行に反映                                                                                       | PR #475 レビュー（オーナー）      |
