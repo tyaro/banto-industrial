@@ -66,10 +66,11 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
 - **構成**: Rust workspace + SvelteKit/Tauri。アプリは **banto-hub**（タグサーバー）/ **chronogazer**
   （記録計）。**relay-wright**（条件付き PLC 自動書き込み）は 2026-09-24 に main から外し、
   タグ `archive/relay-wright-2026-09-24` に退避した（構想の練り直し、オーナー決定。§4b）。
-  上流 `banto` は git tag / `@banto/*` を消費（Rust クレート・npm
-  `@banto/*` とも現行 **v1.7.3** で揃っている（2026-09-28 追従）。`Cargo.toml`/`package.json` を正とする）。
-  Rust と npm は別マニフェストで独立に追従できるが、**上げるときは揃えて上げる運用**とする
-  （2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
+  上流 `banto` は git tag / `@banto/*` を消費（`Cargo.toml`/`package.json` を正とする）。
+  **banto v2.0.0 へ移行中（2026-10-02〜）**: Rust クレートは **v2.0.0**（v2 移行 PR1a）、npm `@banto/*` は
+  **v1.7.3** のまま（PR1c・PR1d でアプリごとに v2.0.0 へ上げる）。v2 の Rust は v1.7.3 の TS とも互換なので、
+  移行の間だけ版がずれる。Rust と npm は別マニフェストで独立に追従できるが、移行が終わったら
+  **揃えて上げる運用**に戻す（2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
 - **I 系（基盤 I0〜I6）**: 実装済み（I6 = banto-broker として抽出済み）。
 - **W 系（relay-wright）**: W5 まで実装済みだったが **2026-09-17 に凍結**（構想の練り直し、
   オーナー決定）、**2026-09-24 に main から外してタグ `archive/relay-wright-2026-09-24` に
