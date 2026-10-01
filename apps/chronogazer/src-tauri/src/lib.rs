@@ -1325,7 +1325,15 @@ async fn record_local_rebind(audit: &AuditLogService, outcome: &LocalRebind) {
 /// comment in `chronogazer_core::settings`).
 #[tauri::command]
 async fn auth_config_get(state: State<'_, AppState>) -> Result<AuthSettings, BantoError> {
-    require_role(&state, Role::Viewer, "settings").await?;
+    auth_config_get_body(&state).await
+}
+
+/// Body of [`auth_config_get`] (testable with a plain `&AppState`). Viewer
+/// floor on purpose: a kiosk's `viewer` synthetic session needs it to show
+/// the security screen it uses to turn the mode back off or raise its role
+/// (the ESCAPE HATCH of [`auth_config_apply_body`]).
+async fn auth_config_get_body(state: &AppState) -> Result<AuthSettings, BantoError> {
+    require_role(state, Role::Viewer, "settings").await?;
     state.settings.auth_config().await
 }
 
@@ -1760,12 +1768,28 @@ async fn server_apply(
     Ok(build_status(&config, running))
 }
 
+/// `admin`-only (banto v2.0.0 移行で admin-template に揃えた): the settings
+/// table holds privileged values (the embedded server's bind/port,
+/// `auth.disabled`/`auth.disabled_role`, `auth.autologin.username`, audit
+/// retention, the Hub connection, and every user's `ui.{username}.*`
+/// namespace), so reading an arbitrary key is as privileged as writing one.
+/// Without this guard an unauthenticated webview (the login screen is a real
+/// webview whose console can `invoke`), or a kiosk's `viewer` synthetic
+/// session, could read any of those. The frontend does not call this raw
+/// command (UI settings go through the Viewer-gated, caller-scoped
+/// `ui_settings_get`).
 #[tauri::command]
 async fn settings_get(
     state: State<'_, AppState>,
     key: String,
 ) -> Result<Option<String>, BantoError> {
-    state.settings.get(&key).await
+    settings_get_body(&state, &key).await
+}
+
+/// Body of [`settings_get`] (testable with a plain `&AppState`).
+async fn settings_get_body(state: &AppState, key: &str) -> Result<Option<String>, BantoError> {
+    require_role(state, Role::Admin, "settings").await?;
+    state.settings.get(key).await
 }
 
 /// `admin`-only (spec M10): writing settings (which include the embedded
@@ -7314,5 +7338,168 @@ mod tests {
         );
         assert_eq!(read_slot(&state).1, login.seq);
         assert!(read_slot(&state).0.is_some());
+    }
+
+    // --- banto v2.0.0 移行（PR1a 監査の追補）---------------------------------
+
+    /// オーナー決定（2026-10-02）: ログイン不要モードの `disabled_role` は残し、
+    /// キオスク（`viewer`）から UI で admin に戻れること。ESCAPE HATCH
+    /// （モードが今オンなら `auth_config_apply` は役割を問わず通る）を固定する:
+    /// admin の Account → apply(true, viewer) で Local(viewer)・seq + 1 →
+    /// **viewer のまま** apply(true, admin) が通って Local(admin)・seq + 1 →
+    /// viewer に戻して apply(false) が通って Local → None・seq + 1。Local(viewer)
+    /// は `auth_config_get` を読めて（画面表示に要る）、生の `settings_get` は
+    /// `Forbidden`。
+    #[tokio::test]
+    async fn kiosk_viewer_can_raise_its_role_and_turn_the_mode_off() {
+        let state = app_state().await;
+        let admin = state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
+        let (_, seq0) = read_slot(&state);
+
+        let local_role = |state: &AppState| match read_slot(state).0 {
+            Some(DesktopSession::AuthDisabledLocal(local)) => local.role,
+            other => panic!("expected Local, got {other:?}"),
+        };
+
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("admin turns the kiosk mode on");
+        assert_eq!(local_role(&state), Role::Viewer);
+        assert_eq!(read_slot(&state).1, seq0 + 1);
+
+        // The kiosk's viewer session can read the auth mode (the security
+        // screen shows it) but not the raw settings table.
+        let config = auth_config_get_body(&state)
+            .await
+            .expect("viewer reads auth_config");
+        assert!(config.disabled);
+        assert!(matches!(
+            settings_get_body(&state, "auth.disabled").await,
+            Err(BantoError::Forbidden)
+        ));
+
+        // Still viewer: the escape hatch lets it raise the role to admin.
+        auth_config_apply_body(&state, true, "admin")
+            .await
+            .expect("viewer raises the role (escape hatch)");
+        assert_eq!(local_role(&state), Role::Admin);
+        assert_eq!(read_slot(&state).1, seq0 + 2);
+        assert_eq!(
+            settings_get_body(&state, "auth.disabled")
+                .await
+                .expect("admin reads settings")
+                .as_deref(),
+            Some("true")
+        );
+
+        // Back to viewer, then viewer turns the mode off.
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("back to viewer");
+        assert_eq!(local_role(&state), Role::Viewer);
+        let (_, seq_viewer) = read_slot(&state);
+        auth_config_apply_body(&state, false, "viewer")
+            .await
+            .expect("viewer turns the mode off (escape hatch)");
+        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert_eq!(read_slot(&state), (None, seq_viewer + 1));
+
+        // With the mode off and no session, the escape hatch is closed.
+        assert!(matches!(
+            auth_config_apply_body(&state, true, "admin").await,
+            Err(BantoError::Unauthorized)
+        ));
+    }
+
+    /// `apply_mode_to_session` from an empty slot (`false -> true`):
+    /// `Installed`, seq + 1 (the shape of
+    /// `s98_turning_the_mode_on_always_advances_seq`).
+    #[tokio::test]
+    async fn turning_the_mode_on_with_no_session_installs_local() {
+        let state = app_state().await;
+        let (_, seq) = read_slot(&state);
+        let previous = AuthSettings {
+            disabled: false,
+            disabled_role: Role::Editor,
+            ..AuthSettings::default()
+        };
+        let saved = AuthSettings {
+            disabled: true,
+            ..previous.clone()
+        };
+        let (rebind, ended) = apply_mode_to_session(&state, &previous, &saved);
+        assert!(
+            matches!(&rebind, LocalRebind::Installed(local) if local.role == Role::Editor),
+            "{rebind:?}"
+        );
+        assert!(ended.is_none());
+        let (session, seq_after) = read_slot(&state);
+        assert!(is_local(&session));
+        assert_eq!(seq_after, seq + 1);
+    }
+
+    /// admin-template の
+    /// `a_desktop_session_rebound_while_its_check_was_in_flight_stays_valid`
+    /// の移植（banto v1.7.0 #204 の review of #230 + banto #260）: 確認の
+    /// 読み取りが飛行中に、このセッション自身のパスワード変更が rebind した
+    /// 場合、その確認は `Stale { valid_now: Some(Account) }` で有効のまま。
+    /// rebind されていない別ウィンドウの同じアカウントのセッションは、DB の
+    /// 新しい epoch を代わりに採用されず終わる。
+    #[tokio::test]
+    async fn a_desktop_session_rebound_while_its_check_was_in_flight_stays_valid() {
+        let pool = chronogazer_core::db::init_db_memory()
+            .await
+            .expect("init_db_memory");
+        let changer = app_state_on(pool.clone()).await;
+        let other = app_state_on(pool).await;
+        changer
+            .users
+            .setup_first_user("target", SLOT_PASSWORD, "Target")
+            .await
+            .unwrap();
+        for state in [&changer, &other] {
+            let login = login_body(state, "target".to_string(), SLOT_PASSWORD.to_string())
+                .await
+                .expect("login");
+            assert!(login.success);
+        }
+        let snapshot = |state: &AppState| {
+            let (session, seq) = read_slot(state);
+            (session.expect("a session"), seq)
+        };
+        let (changer_before, changer_seq) = snapshot(&changer);
+        let (other_before, other_seq) = snapshot(&other);
+
+        change_own_password(&changer, SLOT_PASSWORD, "newpassword1")
+            .await
+            .expect("password change");
+
+        let fresh = read_session_source(&changer, &changer_before)
+            .await
+            .unwrap();
+        match settle_session(&changer, &changer_before, fresh, changer_seq) {
+            Settled::Stale {
+                valid_now: Some(DesktopSession::Account(user)),
+            } => assert_eq!(user.auth_epoch, 1),
+            other => panic!("the re-bound session must stay valid, got {other:?}"),
+        }
+        assert!(require_role(&changer, Role::Admin, "users").await.is_ok());
+
+        let fresh = read_session_source(&other, &other_before).await.unwrap();
+        assert!(matches!(
+            settle_session(&other, &other_before, fresh, other_seq),
+            Settled::Settled { session: None, .. }
+        ));
+        assert!(other
+            .auth
+            .lock()
+            .expect("auth mutex poisoned")
+            .session
+            .is_none());
     }
 }
