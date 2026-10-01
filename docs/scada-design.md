@@ -312,7 +312,7 @@ contentHash
 
 - schemaVersion: migration 判定
 - projectId: 同一案件 Project 判定
-- projectRevision: 新旧判定
+- projectRevision: 保存 generation（contentHash と併用して更新判定。revision 単独では安全な新旧判定をしない）
 - minRuntimeVersion: Runtime 互換判定
 - contentHash: 同 revision なのに中身が異なる競合検知
 
@@ -356,6 +356,17 @@ external-modified の解除:
   PC-B: 121 / BBB。git 上で manifest.json が必ずテキスト conflict になるとは限らない）。revision を単純な
   全順序として扱わず、merge または明示採用後の**最初の Design Domain save は
   `max(observed revisions) + 1`** を発行する
+- そのために session は **`revisionFloor` = これまでに観測した revision の最大値**を保持し、Reload /
+  Overwrite / merge / Import の明示採用で Project 内容を切り替えても **revisionFloor は下げない**。
+  Editor が 127 を観測済みで、disk が 120 / BBB に外部変更され Reload した場合、current revision を 120 に
+  戻しても次の save を 121 にしない
+
+```text
+revisionFloor = max(observed revisions)        内容の切り替えで下げない
+次の Design Domain save:
+  projectRevision = max(currentRevision, revisionFloor) + 1
+```
+
 - Design API は `project_revision_conflict`（§19.8）とは別に、外部変更を表す stable error code
   **`project_external_modified`** を返し、client が Reload / Overwrite / Save As の復帰処理を選べるようにする
 
@@ -2194,6 +2205,18 @@ project_external_modified     directory が Design Domain の外から変更さ�
 
 これにより AI と人間の同時編集による silent overwrite を防ぐ。
 
+**freshness guard（2026-10-01 オーナー決定）**: §4.3 の「保存直前の content hash 再計算」は save だけの
+処理にせず、Editor 内 mutation / Design API mutation / save が通る共通の Project service で、**mutation
+commit 前の共通処理**として置く。watcher が外部変更を取りこぼしても Design API mutation を silent に
+適用しないため。
+
+```text
+Design API apply
+  -> expectedRevision check            不一致 -> project_revision_conflict
+  -> disk contentHash freshness check  外部変更あり -> project_external_modified、mutation を commit しない
+  -> mutation commit
+```
+
 ### 19.9 Editor との同期
 
 Design API から Project が変更された場合、Editor は変更を検知して最新 revision を読み直せること。
@@ -2598,7 +2621,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
-22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須、Design API は `project_external_modified`（§19.8）。環境別 cache は補助のみ）
+22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須とし mutation commit 前の共通 freshness guard に置く、Design API は `project_external_modified`（§19.8）。observed revision の最大値 `revisionFloor` を内容切替で下げず次の save は max(current, floor) + 1。環境別 cache は補助のみ）
 23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーと NaN / ±Inf は Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、catalog 無しは warning、Runtime は評価せず Bad）
 24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心（`x + width / 2`、原点を含む一般の bounds。SymbolInstance は SymbolDefinition の design size）、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
 25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる。Runtime mode は Design API listener を bind しない）
