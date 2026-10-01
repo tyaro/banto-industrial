@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-10-01（§22 の未決 6 件を決定: Project package は `.bantoscada` で directory / ZIP の 2 表現（§5.1）、Stable ID は UUID v7（§4.2）、Screen 座標は f64 design unit + SVG viewBox（§6.4）、式は banto-expr を Rust 側で評価し presentation semantics は宣言的 mapping（§9.5）、Editor / Runtime は v1 は同一 executable の mode で capability を分離（§18）、Design API は loopback REST + ephemeral bearer token のみ（§19.13）。AI 変更の承認要否は semantic risk を Design Domain が算出（§19.7）。決定の帰結として生じた残件 #22〜#27 を §22 に追加、manifest の `exportedAt` / `contentHash` を archive-only に（§4.3）。2026-09-30: DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-10-01（同日 2 回目: §22 の #22〜#27 を決定。projectRevision と contentHash の役割分離と `external-modified` 状態（§4.3）、式の Quality 導出と string 参照の拒否箇所（§9.5）、回転 pivot と `preserveAspectRatio`（§6.4）、mode は起動時に確定（§18）、session descriptor の脅威モデルと session probe（§19.13）、Symbol 取り込み時の SymbolId 保持と複製時の deep clone（§4.2 / §5.3）。同日 1 回目: §22 の未決 6 件を決定: Project package は `.bantoscada` で directory / ZIP の 2 表現（§5.1）、Stable ID は UUID v7（§4.2）、Screen 座標は f64 design unit + SVG viewBox（§6.4）、式は banto-expr を Rust 側で評価し presentation semantics は宣言的 mapping（§9.5）、Editor / Runtime は v1 は同一 executable の mode で capability を分離（§18）、Design API は loopback REST + ephemeral bearer token のみ（§19.13）。AI 変更の承認要否は semantic risk を Design Domain が算出（§19.7）。決定の帰結として生じた残件 #22〜#27 を §22 に追加、manifest の `exportedAt` / `contentHash` を archive-only に（§4.3）。2026-09-30: DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -290,6 +290,9 @@ Name は人間向け、ID は内部参照向けとする。rename で参照が�
 - UUID の大小・生成順を、表示順、z-order、Action 実行順、その他 domain 上の順序として**利用しない**。
   順序が必要な場合は `order` 等を明示的に持つ
 - Binding に独立 UUID を持たせるかは**未決**。Design API で Binding を直接参照する方式を確定する際に判断する
+- **Symbol を別 Project から取り込む場合は SymbolId を保持する**（2026-10-01 決定。判定規則は §5.3）。意図的な
+  複製は Editor の「複製」操作で行い、SymbolId だけでなくその Symbol が所有する ScreenObjectId 等も
+  **deep clone として新しい UUID を再発行**する。Design API / undo / redo 上で identity が衝突しないため
 
 ### 4.3 Project Manifest
 
@@ -323,6 +326,22 @@ metadata** とし、directory representation の manifest.json には置かな�
 directory ↔ ZIP の変換で同じ Project が異なる hash になり競合扱いされることを防ぐため。Project 同一性判定
 用のこの hash と、archive 内の各ファイル単位の checksum（`checksums.json`、転送破損の検知用）は別物として
 区別する。
+
+**projectRevision と contentHash の役割（2026-10-01 オーナー決定）**: directory representation を git や
+手編集で変更した利用者に projectRevision の bump を要求しない。両者の役割を分ける。
+
+```text
+projectRevision   Design Domain が保存のたびに発行する単調増加の generation
+contentHash       現在読み込んでいる Project 内容の identity（読込時に必ず算出）
+```
+
+- directory representation は**読込時に必ず canonical content hash を計算**する。Project の正しさを環境別
+  cache（§9.6 案 C の置き場）に依存させない。fresh clone や別 PC では cache が存在しないため。環境別 cache
+  は補助情報として使ってよいが、整合性判定に必須の情報にはしない
+- Editor session 中に Design Domain の外から directory 内容が変化した（再計算した hash が、session が
+  保持する hash と一致しない）場合は **`external-modified` 状態**として扱い、自動保存や Import による上書き
+  を行わない。次に Design Domain が保存するときに revision を +1 する
+- Import 判定（§5.2）では revision と算出した content hash を**併用**する
 
 ---
 
@@ -404,6 +423,18 @@ Equipment
 - HTTP endpoint
 - DB command
 - authentication type
+
+**Symbol の取り込み（2026-10-01 オーナー決定）**: 別 Project から Symbol を取り込む場合は SymbolId を保持し
+（§4.2）、次の規則で判定する。
+
+```text
+同一 SymbolId なし                 -> new
+同一 SymbolId あり + 内容同一       -> same（no-op）
+同一 SymbolId あり + 内容が異なる   -> update candidate / conflict
+```
+
+内容が異なる場合は Import Preview で差分を表示し、**明示確認後に replace** する。「同一 ID だから自動的に
+最新版として上書きする」とはしない。意図的な複製は新しい UUID を発行する（deep clone、§4.2）。
 
 ### 5.4 Secret
 
@@ -508,6 +539,25 @@ Renderer viewBox="0 0 1920 1080"
   （`100.00000000003` のような値）を抑える
 - ただし 0.001 unit 等の**量子化精度を Project schema の意味論として現時点では固定しない**。Editor の
   snap 精度、操作時の丸め、serialization 上の正規化規則は実装時に確定する
+
+**回転 pivot（2026-10-01 オーナー決定）**: 既定は object の中心。ここでの「中心」は SVG DOM から実行時に
+取得する BBox ではなく、**Project model 上の untransformed local layout bounds** の中心と定義する。
+
+```text
+pivot 省略時:
+  pivot.x = localBounds.width  / 2
+  pivot.y = localBounds.height / 2
+
+explicit pivot:
+  object-local の design unit で保存
+```
+
+- resize 時: pivot 省略なら resize 後の layout bounds の中心、explicit pivot なら object-local 座標として保持
+  する
+
+**`preserveAspectRatio`（2026-10-01 オーナー決定）**: v1 は **`xMidYMid meet`**（letterbox）を既定かつ
+正式対応とする。`none`（stretch）は全 Object と Text を非等方変形するため v1 必須にせず、要求が出た段階で
+Screen 単位の属性として追加する（schema を壊さず後付けできる）。
 
 ---
 
@@ -870,6 +920,28 @@ Renderer
   SCADA ローカルの expression は表示用の薄い演算・条件に限定する
 - **WASM は v1 では使用しない**。将来、browser-side evaluation や Tauri を使わない web client の要求が出た
   場合に、同じ banto-expr の WASM adapter を検討する
+
+**結果 Quality の導出（2026-10-01 オーナー決定）**: Hub の computed tag（`apps/banto-hub/core/src/computed.rs`）
+と同じ規則とする。Quality は banto-expr 自体には持ち込まない。
+
+```text
+入力に Bad または value なし  -> 式を評価しない      -> result = Bad
+Bad なし、Stale あり          -> 式を評価            -> result = Stale
+全入力 Good                   -> 式を評価            -> result = Good
+expression evaluation error   ->                      result = Bad
+```
+
+**string タグ参照の拒否（2026-10-01 オーナー決定）**: banto-expr は文字列型を持たず、string タグの参照拒否を
+登録側に委ねている。SCADA では次の段階で validation error とし、Editor / CLI / AI は同じ validation を使う
+（§19.2）。
+
+```text
+banto-expr compile
+  -> referenced_tags 取得
+  -> Design Domain が Hub catalog の data_type（§8.3 の対応表）を検証
+```
+
+Runtime 側にも防御を置き、catalog 変更等で string タグが式の入力に現れた場合は評価せず Bad として扱う。
 
 ### 9.6 Binding identity の決定（2026-09-30 オーナー決定: 名前のみ。書き込みも名前）
 
@@ -1790,6 +1862,13 @@ scada-server（§13.2。recorder / alarm / 常時実行 Event / API。画面に�
     （参考実装: `apps/banto-hub/src-tauri/build.rs`。navigate 後の webview から command を呼ぶために同じ
     宣言をしている）。宣言漏れの command は capability で制限できないため、Rust domain 側の検証を
     最後の砦として必ず置く
+- **mode は起動時に確定し、プロセス実行中には切り替えない**（2026-10-01 決定）。切り替えは別 mode での
+  再起動とする。mode は CLI 引数または deployment configuration から起動時に解決する。「未指定なら Editor」
+  のような既定は Project 設計上の契約にせず、未指定時の UX は installer / 実装側で決める
+- v1 では同じ executable を Editor mode で起動できること自体は**許容**する。ただし保護を OS のファイル権限
+  だけに依存させず、Runtime window / webview へ Editor permission を与えない、Rust domain 側で Runtime mode
+  からの Editor mutation を拒否する、**Runtime-only deployment へ Hub の admin credential を置かない**、
+  必要に応じ Project file を OS permission で read-only 化する、を組み合わせる
 - 別 executable 化の判断基準は、runtime-only distribution、security、licensing、update lifecycle、
   deployment size 等の要求が発生した場合とする。**host 3 の着手時を、分離要否を再確認する節目**とする
 
@@ -2168,7 +2247,24 @@ design-api/
 - `project_revision` は session descriptor へ保存しない（書いた瞬間に古くなる）。現在の revision は
   Design API の応答から取得する
 - session descriptor は Windows では current user 限定の ACL、Unix では 0600。Editor 終了時に削除し、
-  起動時に stale session（pid が生きていないもの）を掃除する
+  起動時に stale session を掃除する（判定は下記）
+- **脅威モデル（2026-10-01 オーナー決定）**: **同一 OS user のプロセスは trust boundary 内**とする。
+  descriptor の token を同一ユーザーの他プロセスが読める点は、VS Code や Docker の desktop 連携と同じ前提
+  として受容する。loopback API でこれを防ぐことは原理的にできず、防げると書くほうが危険
+- token は **Editor 起動ごとに生成し、Project 切替時も再生成**する。bearer token は通常の Design API 操作
+  にのみ使う
+- stale 判定は pid 確認に加えて、**session identity による liveness 確認**を行う。bearer token を未知の
+  port へ送る方式は採らない。probe endpoint は secret を返さない:
+
+```text
+GET /api/design/v1/session        -> { "session_id": "..." }
+
+pid なし                                   -> stale
+pid あり -> address:port へ session probe
+  session_id 一致                          -> live
+  応答なし / session_id 不一致             -> stale
+```
+
 - Runtime-only deployment では Design API を無効化できる構造とする
 
 Project 設計変更は operator runtime audit と区別し、
@@ -2418,12 +2514,12 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
-22. directory representation を git / 手編集した場合の projectRevision の扱い（§5.1 の 2 表現決定で生じた論点。Design API 経由なら Design Domain が bump するが、直接編集では誰も上げない。読込時に内容 hash の不一致を revision 不整合として扱う等の規則が要る）
-23. Expression の結果 Quality の導出規則（§9.5。banto-expr は NaN を伝播し品質を持たないため、Hub computed tag と同じく入力の最悪値を継承するのが候補）と、string タグ参照の拒否を SCADA 側 validation のどこで行うか（banto-expr は登録側に委ねる。§8.3 の対応表を使う。S3 で確定）
-24. 回転の pivot（object 中心か origin か）と `preserveAspectRatio`（画面比が違うモニタで letterbox か stretch か）（§6.4。snap 精度と違い schema の意味論なので、S2 の Screen schema 確定時に決める）
-25. Editor / Runtime mode の確定タイミング（§18。Tauri 2 の capability は window label に静的に束縛されるため「起動時に確定し、プロセス内で切り替えない（切替は再起動）」が素直。v1 では操作者が同じ executable を Editor mode で起動できることを許容するかを明示する）
-26. Design API session descriptor の脅威モデルの明記（§19.13。token を同一ユーザーの他プロセスが読める点は VS Code / Docker と同じ「同一ユーザーは信頼」の前提として受容するか。pid 再利用で stale 判定を誤る点は token で疎通確認してから掃除すれば回避できる）
-27. 別 Project から Symbol を取り込む際の SymbolId の扱い（§4.2。更新検知のため同じ UUID を保つか再発行するか。#3 の Binding UUID 未決と同時期に決める）
+22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態、Import は両者を併用。環境別 cache は補助のみ）
+23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーは Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、Runtime は評価せず Bad）
+24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
+25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる）
+26. Design API session descriptor の脅威モデル → 2026-10-01 決定済み（§19.13、同一 OS user のプロセスは trust boundary 内。token は起動ごと・Project 切替ごとに再生成。stale 判定は pid + secret を返さない session probe の session_id 一致）
+27. 別 Project から Symbol を取り込む際の SymbolId の扱い → 2026-10-01 決定済み（§4.2 / §5.3、SymbolId を保持し new / same / update candidate を判定、差分は Import Preview で明示確認後に replace。複製は所有する ScreenObjectId まで deep clone で再発行）
 
 ---
 
@@ -2477,3 +2573,9 @@ MCP 自体は roadmap の blocking milestone にしない。
 - 大規模・security-sensitive な AI 変更は plan / diff / validate を経て apply できる構造とする
 - SCADA 専用 MCP は optional adapter とし、必要性が出るまで実装を必須にしない
 - SCADA Design API に PLC runtime write の bypass を作らない
+- projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。directory の外部変更は `external-modified` として自動保存・Import 上書きを止め、Import は両者を併用する。環境別 cache を整合性判定に必須にしない（2026-10-01 オーナー決定、§4.3）
+- 式の結果 Quality は Hub computed tag と同じ規則（Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーは Bad）。string タグ参照は Design Domain の validation で拒否し Runtime でも評価せず Bad（2026-10-01 オーナー決定、§9.5）
+- 回転 pivot の既定は model 上の local layout bounds の中心、`preserveAspectRatio` は v1 は `xMidYMid meet` のみ（2026-10-01 オーナー決定、§6.4）
+- Editor / Runtime mode は起動時に確定しプロセス内で切り替えない。v1 は Editor 起動を許容し、capability・domain 検証・Runtime-only deployment に admin credential を置かない・read-only 化を組み合わせる（2026-10-01 オーナー決定、§18）
+- Design API は同一 OS user のプロセスを trust boundary 内とし、token は起動・Project 切替ごとに再生成、stale 判定は secret を返さない session probe で行う（2026-10-01 オーナー決定、§19.13）
+- Symbol の取り込みは SymbolId を保持し、内容が異なれば Import Preview で明示確認後に replace。複製は所有 object まで deep clone で UUID を再発行（2026-10-01 オーナー決定、§4.2 / §5.3）
