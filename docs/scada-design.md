@@ -333,9 +333,9 @@ directory ↔ ZIP の変換で同じ Project が異なる hash になり競合�
 ```text
 projectRevision   永続化された Project generation。save のたびに max(current, revisionFloor) + 1
                   Import / Export の更新判定（§5.2）に使う。mutation では変わらない
-workingRevision   Design Domain mutation（Editor 操作、Design API apply、undo / redo）ごとに +1
-                  session 内で単調増加し、Reload しても減らさない。Design API の optimistic
-                  concurrency token（§19.8）。永続化しない
+workingRevision   working state を変更 / 置換する操作ごとに +1（原因を問わない）:
+                  Editor mutation、Design API apply、undo / redo、Reload、Import apply、merge / 明示採用
+                  session 内で単調増加。Design API の optimistic concurrency token（§19.8）。永続化しない
 contentHash       現在読み込んでいる Project 内容の identity（読込時に必ず算出）
 ```
 
@@ -346,6 +346,19 @@ in-memory の working 状態を更新するだけで、disk への persist は�
 （§19.7）と一致する。CLI / headless の Design Domain 利用は「load → mutate → save」の 1 セッションで完結し、
 同じ model の退化形として扱う。save は content mutation ではないので workingRevision を変えず、
 projectRevision と `diskBaselineHash` を更新する。
+
+Reload / Import apply / merge のような **working state の置換**も workingRevision を進める。「減らさない」
+だけでは token として不十分で、AI が古い working state を前提に保持した plan が、Reload 後の新しい working
+state に対して workingRevision check と freshness check の両方を通って適用されてしまうため。Reload は次を
+一体の状態遷移とする。
+
+```text
+Reload:
+  disk 内容を working state に採用
+  diskBaselineHash   を更新
+  workingContentHash を更新
+  workingRevision    += 1
+```
 
 - directory representation は**読込時に必ず canonical content hash を計算**する。Project の正しさを環境別
   cache（§9.6 案 C の置き場）に依存させない。fresh clone や別 PC では cache が存在しないため。環境別 cache
@@ -360,8 +373,10 @@ workingContentHash   現在の in-memory Project 内容の hash（未保存変�
 
 - Editor session 中に Design Domain の外から directory 内容が変化した（disk から再計算した hash が
   `diskBaselineHash` と一致しない）場合は **`external-modified` 状態**として扱い、自動保存や Import による上書き
-  を行わない。**通常の Save も拒否する**（Editor 側の古い状態で外部変更を上書きしないため）。解除方法は
-  次の 3 つ。Overwrite または merge 後の保存で revision を +1 する
+  を行わない。**通常の Save も、通常の Design Domain mutation（Editor 操作、Design API apply）も拒否する**
+  （Editor 側の古い状態で外部変更を上書きしないため。§19.8 の freshness guard が mutation commit 前にも
+  走るため、Editor 内 mutation も同じ扱いになる）。Reload / Overwrite / Save As で状態を解消してから編集を
+  再開する。解除方法は次の 3 つ。Overwrite または merge 後の保存で revision を +1 する
 
 ```text
 external-modified の解除:
@@ -388,7 +403,7 @@ revisionFloor = max(observed revisions)        内容の切り替えで下げな
   projectRevision = max(currentRevision, revisionFloor) + 1
 ```
 
-- Design API は `project_revision_conflict`（§19.8）とは別に、外部変更を表す stable error code
+- Design API は `working_revision_conflict`（§19.8）とは別に、外部変更を表す stable error code
   **`project_external_modified`** を返し、client が Reload / Overwrite / Save As の復帰処理を選べるようにする
 
 - Import 判定（§5.2）では revision と算出した content hash を**併用**する
@@ -2223,7 +2238,7 @@ apply:
 stable error 例:
 
 ```text
-project_revision_conflict     expectedWorkingRevision が現在の workingRevision と一致しない
+working_revision_conflict     expectedWorkingRevision が現在の workingRevision と一致しない
 project_external_modified     directory が Design Domain の外から変更された（§4.3。Reload / Overwrite / Save As で復帰）
 ```
 
@@ -2236,7 +2251,7 @@ commit 前の共通処理**として置く。watcher が外部変更を取りこ
 
 ```text
 Design API apply
-  -> expectedWorkingRevision check     不一致 -> project_revision_conflict
+  -> expectedWorkingRevision check     不一致 -> working_revision_conflict
   -> disk contentHash freshness check  disk の hash != diskBaselineHash -> project_external_modified、mutation を commit しない
   -> mutation commit                   workingRevision +1
 
@@ -2649,7 +2664,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
-22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、案 B: projectRevision は永続化された generation、workingRevision は mutation ごとに +1 する session 内 generation で Design API の optimistic concurrency token（§19.8）、mutation commit と save は同一にしない。contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須とし mutation commit 前の共通 freshness guard に置く、Design API は `project_external_modified`（§19.8）。observed revision の最大値 `revisionFloor` を内容切替で下げず次の save は max(current, floor) + 1。環境別 cache は補助のみ）
+22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、案 B: projectRevision は永続化された generation、workingRevision は working state を変更 / 置換する操作（mutation、undo / redo、Reload、Import apply、merge）ごとに +1 する session 内 generation で Design API の optimistic concurrency token（§19.8、不一致は `working_revision_conflict`）、mutation commit と save は同一にしない。external-modified 中は Save も通常 mutation も拒否。contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須とし mutation commit 前の共通 freshness guard に置く、Design API は `project_external_modified`（§19.8）。observed revision の最大値 `revisionFloor` を内容切替で下げず次の save は max(current, floor) + 1。環境別 cache は補助のみ）
 23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーと NaN / ±Inf は Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、catalog 無しは warning、Runtime は評価せず Bad）
 24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心（`x + width / 2`、原点を含む一般の bounds。SymbolInstance は SymbolDefinition の design size）、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
 25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる。Runtime mode は Design API listener を bind しない）
@@ -2708,7 +2723,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 - 大規模・security-sensitive な AI 変更は plan / diff / validate を経て apply できる構造とする
 - SCADA 専用 MCP は optional adapter とし、必要性が出るまで実装を必須にしない
 - SCADA Design API に PLC runtime write の bypass を作らない
-- projectRevision は永続化された generation、workingRevision は mutation ごとに +1 する session 内 generation（Design API の optimistic concurrency token）、contentHash は読込時に必ず算出する内容 identity。mutation commit と save は同一にしない（案 B）。directory の外部変更は `external-modified` として自動保存・Import 上書きを止め、Import は両者を併用する。環境別 cache を整合性判定に必須にしない（2026-10-01 オーナー決定、§4.3）
+- projectRevision は永続化された generation、workingRevision は working state の変更 / 置換（Reload・Import apply を含む）ごとに +1 する session 内 generation（Design API の optimistic concurrency token）、contentHash は読込時に必ず算出する内容 identity。mutation commit と save は同一にしない（案 B）。directory の外部変更は `external-modified` として自動保存・Import 上書きを止め、Import は両者を併用する。環境別 cache を整合性判定に必須にしない（2026-10-01 オーナー決定、§4.3）
 - 式の結果 Quality は Hub computed tag と同じ規則（Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーは Bad）。string タグ参照は Design Domain の validation で拒否し Runtime でも評価せず Bad（2026-10-01 オーナー決定、§9.5）
 - 回転 pivot の既定は model 上の local layout bounds の中心、`preserveAspectRatio` は v1 は `xMidYMid meet` のみ（2026-10-01 オーナー決定、§6.4）
 - Editor / Runtime mode は起動時に確定しプロセス内で切り替えない。v1 は Editor 起動を許容し、capability・domain 検証・Runtime-only deployment に admin credential を置かない・read-only 化を組み合わせる（2026-10-01 オーナー決定、§18）
