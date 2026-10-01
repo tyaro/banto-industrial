@@ -6,12 +6,22 @@
 	 * 消していないので、「再試行」はガードをもう一度走らせるだけ - サーバーが
 	 * 答えられるようになれば、そのままセッションが続く。ログイン画面へは
 	 * 送らない（admin-template の `routes/+error.svelte` と同じ考え方）。
+	 *
+	 * banto v2.0.0（#260 実装-3、design §6.1、S-81、I-24）: 「再試行」は
+	 * `location.reload()` ではなく、この文書の中で load を走らせ直す
+	 * `invalidateAll()`。SessionController を保ったまま再試行するので、この
+	 * 画面の間に確定したユーザーの変更（`pendingOwnerChange`）は、保護
+	 * レイアウトが再び mount したときに通知される。ページ全体の再読み込み
+	 * （ブラウザの再読み込み）では controller が作り直され、その記録は残らない
+	 * （admin-template の同名ファイルと同じ）。
 	 */
+	import { invalidateAll } from '$app/navigation';
 	import { page } from '$app/state';
 
-	function retry() {
-		// 全体を読み直すと、ガードを含むすべての load が最初から走り直す。
-		location.reload();
+	// 再試行の間も無効にしない: 返ってこない再試行が出口まで塞がないように
+	// （もう一度押せば新しい再試行が始まる。ブラウザの再読み込みも使える）。
+	function retry(): void {
+		void invalidateAll();
 	}
 </script>
 

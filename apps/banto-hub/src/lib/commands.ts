@@ -4,7 +4,9 @@
  * 自動導出する構造は無改変（差分は navItems 自体の中身のみ）。
  */
 import { goto } from '$app/navigation';
-import { getAuthProvider, type PaletteCommand } from '@banto/admin-core';
+import type { PaletteCommand } from '@banto/admin-core';
+import { logoutAndLeave } from './banto/logout.svelte';
+import { notifyLogoutOutcome } from './banto/logoutNotice';
 import { navItems } from './navigation';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
@@ -74,10 +76,11 @@ function sessionCommands(): PaletteCommand[] {
 			title: 'ログアウト',
 			group: 'セッション',
 			keywords: ['logout', 'sign out'],
-			visible: () => !sessionStore.authDisabled,
+			// 試運転モードの合成セッションにはログアウトが無い（`Header.svelte` と同じ）。
+			visible: () => !sessionStore.authDisabled && !sessionStore.commissioningMode,
 			run: async () => {
-				await getAuthProvider().logout();
-				await goto('/login');
+				// banto v2.0.0 (#260): same as Header.svelte's logout.
+				await logoutAndLeave(() => goto('/login'), { notify: notifyLogoutOutcome });
 			}
 		}
 	];
