@@ -467,6 +467,10 @@ merge 後の最初の Design Domain save:
   projectRevision = max(currentRevision, revisionFloor) + 1    （上の例では 122）
 ```
 
+この契約は人手の競合解決に依存する。v1 必須ではないが、`.gitattributes` で manifest.json に custom merge
+driver を当て、`projectRevision` だけ max を取る小さなツールを first-party で用意すると、契約が「守られる」
+ものになる（後続の候補）
+
 - Design API は `working_revision_conflict`（§19.8）とは別に、外部変更を表す stable error code
   **`project_external_modified`** を返し、client が Reload / Overwrite / Save As の復帰処理を選べるようにする
 
@@ -2337,8 +2341,12 @@ CLI で persist する経路はこれになる。承認要否（§19.7）は app
 save endpoint は working state **全体**を persist する。Editor session で人間が未保存の編集中に AI が save を
 呼ぶと、人間の途中の編集も一緒に disk に書かれるため、**Editor mode では save endpoint は直接 persist せず
 Editor 側の確認を要求する**（応答は stable error `editor_confirmation_required`。人間が Editor で確認すると
-通常の Save と同じ経路で persist される）。headless / CLI mode では直接 persist する。案 B の「AI 変更は
+通常の Save と同じ経路で persist される）。headless / CLI では直接 persist する。案 B の「AI 変更は
 人間が確認してから save」と同じ原則。
+
+ここでの headless / CLI は第 3 の mode ではなく、**UI を持たない Editor mode の起動形態**（Editor capability
+のまま window を開かない）である。§18 の mode は Editor / Runtime の 2 つのままで、Runtime mode は引き続き
+Design API listener を bind しない（§19.13）。
 
 ### 19.9 Editor との同期
 
