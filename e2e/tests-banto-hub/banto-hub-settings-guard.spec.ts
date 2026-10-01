@@ -10,8 +10,10 @@
  *    使う既定サーバー）はロックダウンしないため `sessionStore.
  *    commissioningMode` が常に true で `security` カテゴリが常に可視になり、
  *    検証できない（同 spec の doc comment 参照）。ロックダウン済みサーバー
- *    なら `session.svelte.ts::load()` が `commissioningMode = false` を
- *    設定するので `security` が非可視になり、redirect を再現できる。
+ *    なら、ルートガードの試運転の policy runner が合成セッションを `adopt`
+ *    しない（banto v2.0.0 #260 から `commissioningMode` は SessionController の
+ *    snapshot の `kind === 'commissioning'` の導出）ので `security` が非可視に
+ *    なり、redirect を再現できる。
  *
  * 2. **`/settings/data` 直接遷移時の構成パッケージ import ガード回帰**
  *    （`hubStatusStore.svelte.ts` の doc comment参照）: 収集状態の5秒

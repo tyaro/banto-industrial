@@ -9,8 +9,9 @@
  * `session_revoked`）を送らせる手段は無いので、`page.routeWebSocket` で
  * `/api/v1/stream` を**丸ごと差し替え**（実サーバーへは繋がない）、値の
  * スナップショットと close を注入する。REST（カタログ・ルートガードの
- * `/api/auth/check`）は実サーバーを使い、照合できないケースだけ
- * `/api/auth/check` を `page.route` で 500 / 通信失敗にする。実サーバーの
+ * ログイン状態の確認）は実サーバーを使い、照合できないケースだけ確認の
+ * `/api/auth/identity`（banto v2.0.0 #260 から、SessionController の 1 往復。
+ * v1 は `/api/auth/check`）を `page.route` で 500 / 通信失敗にする。実サーバーの
  * 失効で閉じるケースは `banto-hub-stream-revoked.spec.ts`（注入しない）。
  *
  * 見ること:
@@ -243,7 +244,7 @@ test.describe
 		test(`3. session_revoked → 確認し直して ${label}: 再試行付きのエラー画面、トークンを保持、ソケットは増えない`, async () => {
 			await openMonitorWithGoodValue();
 			// 画面を開いた後で照合だけを失敗させる（開くときのガードは通す）。
-			await page.route('**/api/auth/check', failCheck);
+			await page.route('**/api/auth/identity', failCheck);
 			try {
 				await sockets[0].close({ code: 1008, reason: 'session_revoked' });
 				await expect(page.getByText(SESSION_CHECK_FAILED_TEXT)).toBeVisible();
@@ -255,7 +256,7 @@ test.describe
 				await page.waitForTimeout(LONGER_THAN_BACKOFF_MS);
 				expect(sockets).toHaveLength(1);
 			} finally {
-				await page.unroute('**/api/auth/check');
+				await page.unroute('**/api/auth/identity');
 			}
 		});
 	}

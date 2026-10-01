@@ -93,7 +93,8 @@ export async function injectAuthToken(page: Page, token: string): Promise<void> 
 
 /**
  * `fetchAuthToken` + `injectAuthToken` をまとめたショートカット。
- * `(app)/+layout.ts` の認証ガード（`AuthProvider.check()`）はこの
+ * `(app)/+layout.ts` の認証ガード（SessionController の確認、
+ * `AuthProvider.resolve()`）はこの
  * `sessionStorage` を読むので、この関数の後に保護下のルートへ
  * `page.goto`/リンククリックすれば `/login` へ弾かれない。
  */

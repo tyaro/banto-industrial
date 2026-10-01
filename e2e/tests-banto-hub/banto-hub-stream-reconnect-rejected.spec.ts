@@ -19,7 +19,16 @@
  *   サーバーがハンドシェイクを `401` で拒否し、ブラウザには `1006` になる。
  *
  * 失効は実サーバーで起こす（管理者が閲覧者のパスワードをリセットする）。
- * ログイン状態の確認（`/api/auth/check`）も実サーバー。
+ * ログイン状態の確認も実サーバー。
+ *
+ * banto v2.0.0（#260）から、確認は SessionController の `GET /api/auth/identity`
+ * の 1 往復（v1 は画面が自分で `/api/auth/check` を呼んでいた）。数えるのは
+ * identity の要求。期待の変化:
+ * - 有効と**確定**したら、確認はそれで終わる（切断後に 1 回。テスト 2）。
+ * - 照合できない（`unverified`）間は、画面を保って再接続を続け、controller が
+ *   背景で確認を続ける（1 秒から倍々で 30 秒まで）ので、確認は「1 回」では
+ *   終わらない（テスト 4）。ログイン画面にもエラー画面にも移らない。
+ * - 拒否（失効の確定）なら /login（テスト 1・3）。
  */
 import {
 	expect,
@@ -116,11 +125,13 @@ test.describe
 			/** 開かれた接続ごとの扱い。 */
 			attempts: [] as StreamMode[],
 			mocks: [] as WebSocketRoute[],
-			/** `/api/auth/check` の呼び出し時刻（ログイン状態の確認）。 */
-			authChecks: [] as number[]
+			/** `/api/auth/identity` の呼び出し時刻（ログイン状態の確認、v2 の controller の 1 往復）。 */
+			identityChecks: [] as number[]
 		};
 		page.on('request', (request) => {
-			if (new URL(request.url()).pathname === '/api/auth/check') state.authChecks.push(Date.now());
+			if (new URL(request.url()).pathname === '/api/auth/identity') {
+				state.identityChecks.push(Date.now());
+			}
 		});
 		await page.routeWebSocket(/\/api\/v1\/stream$/, async (ws) => {
 			const mode = state.mode;
@@ -186,22 +197,23 @@ test.describe
 		await expect(page).toHaveURL(/\/login$/);
 	});
 
-	test('2. 通常の一時的な切断（再接続が 2 回拒否された後に戻る）では、ログイン画面へ移らず、確認は 1 回だけ', async ({
+	test('2. 通常の一時的な切断（再接続が 2 回拒否された後に戻る）では、ログイン画面へ移らず、確認は identity の 1 回だけ（有効と確定したら背景の確認は起きない）', async ({
 		browser
 	}) => {
 		test.setTimeout(60_000);
 		const { page, state, status } = await openViewerMonitor(browser);
-		const checksBeforeCut = state.authChecks.length;
+		const checksBeforeCut = state.identityChecks.length;
 
 		state.mode = 'reject';
 		await state.mocks[0].close({ code: 1001, reason: '' });
 		await expect(status).toContainText('再接続中');
 		await expect(status).not.toContainText('接続中（');
 
-		// 2 回拒否されたら（1 秒 + 2 秒）確認が 1 回走り、有効なので再接続を続ける。
+		// 2 回拒否されたら（1 秒 + 2 秒）確認（identity）が 1 回走り、有効と確定したので
+		// 再接続を続ける。
 		await expect.poll(() => state.attempts.length, { timeout: 10_000 }).toBe(3);
 		state.mode = 'mock';
-		await expect.poll(() => state.authChecks.length - checksBeforeCut).toBe(1);
+		await expect.poll(() => state.identityChecks.length - checksBeforeCut).toBe(1);
 		await expect(status).not.toContainText('接続中（');
 
 		// 次の再接続（4 秒後）で戻る。
@@ -210,7 +222,7 @@ test.describe
 		await expect(page).toHaveURL(/\/monitor$/);
 
 		await page.waitForTimeout(LONGER_THAN_BACKOFF_MS);
-		expect(state.authChecks.length - checksBeforeCut).toBe(1);
+		expect(state.identityChecks.length - checksBeforeCut).toBe(1);
 		expect(state.attempts).toHaveLength(4);
 		await expect(page).toHaveURL(/\/monitor$/);
 	});
@@ -232,5 +244,46 @@ test.describe
 		await expect(page).toHaveURL(/\/login$/, { timeout: DETECT_WITHIN_MS });
 		// ソケットは作らない（トークンが無いので）。
 		expect(state.attempts).toEqual(['mock']);
+	});
+
+	test('4. 照合できない（identity が 500）間は、画面を保って再接続を続け、確認は背景でも続く（1 回では終わらない）。戻れば通常の表示へ', async ({
+		browser
+	}) => {
+		test.setTimeout(90_000);
+		const { page, state, status } = await openViewerMonitor(browser);
+		// 画面を開いた後で照合だけを失敗させる（開くときのガードは通す）。
+		await page.route('**/api/auth/identity', (route) =>
+			route.fulfill({
+				status: 500,
+				contentType: 'application/json',
+				body: JSON.stringify({ kind: 'storage', message: 'database is locked' })
+			})
+		);
+		try {
+			const checksBeforeCut = state.identityChecks.length;
+			state.mode = 'reject';
+			await state.mocks[0].close({ code: 1001, reason: '' });
+
+			// 2 回拒否された後の確認は unverified。v1 はここで確認が止まったが、v2 は
+			// controller が背景で確かめ続ける（1 秒・2 秒…）ので 2 回以上になる。
+			await expect
+				.poll(() => state.identityChecks.length - checksBeforeCut, { timeout: 15_000 })
+				.toBeGreaterThanOrEqual(2);
+			// 画面は保つ: ログイン画面にもエラー画面（503）にも移らず、再接続を続ける。
+			await expect(page).toHaveURL(/\/monitor$/);
+			await expect(page.getByRole('button', { name: '再試行' })).toHaveCount(0);
+			await expect(status).toContainText('再接続中');
+			expect(state.attempts.length).toBeGreaterThanOrEqual(3);
+		} finally {
+			await page.unroute('**/api/auth/identity');
+		}
+
+		// サーバーが戻れば、次の再接続で通常の表示へ戻る（ログインはそのまま）。
+		state.mode = 'mock';
+		await expect(status).toContainText('接続中（リアルタイム更新中）', { timeout: 30_000 });
+		await expect(page).toHaveURL(/\/monitor$/);
+		expect(
+			await page.evaluate((key) => window.sessionStorage.getItem(key), TOKEN_STORAGE_KEY)
+		).not.toBeNull();
 	});
 });

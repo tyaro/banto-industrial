@@ -4,9 +4,12 @@
  *
  * タグモニタは自分のストリーム（#441 の close `1008`、`banto-hub-stream-
  * revoked.spec.ts`）で失効に気づくが、ほかの画面にはそれが無い。気づくのは
- * `@banto/admin-core` の SSE（`/api/events`）で、`(app)/+layout.svelte` の
- * `onSessionEnded(() => void invalidateAll())` がルートガードを走らせ直す。
- * この購読が無いと、トークンは消えても画面は次の遷移まで残る。
+ * `@banto/admin-core` の SSE（`/api/events`）で、banto v2.0.0（#260）からは
+ * `connectEvents` が SessionController に `signal('unauthorized')` を送り、
+ * controller が確認して `none` を確定すると generation が動き、
+ * `(app)/+layout.svelte` の配線①（generation の照合 → `invalidateAll()`）が
+ * ルートガードを走らせ直す（v1 は `onSessionEnded(() => void invalidateAll())`）。
+ * この配線が無いと、トークンは消えても画面は次の遷移まで残る。
  *
  * `chromium-locked-down` プロジェクト専用（試運転モードではトークンを
  * 使わないので、SSE は失効を知らせない）。
@@ -14,8 +17,9 @@
  * 流れ: 管理者が閲覧者を作る → 閲覧者の別のブラウザコンテキストで
  * `/tags` を開き、SSE が繋がるのを待つ → 管理者が閲覧者のパスワードを
  * リセットする → banto-server の SSE の再検証（`REVALIDATE_INTERVAL` =
- * 15 秒）がストリームを閉じ、再接続が `401` → `check()` で確認（トークンを
- * 消す）→ `onSessionEnded` → `/login`。
+ * 15 秒）がストリームを閉じ、再接続が `401` → controller の確認
+ * （`GET /api/auth/identity`、送ったトークンを compare-and-set で消す）→
+ * `none` の確定 → 配線① → `/login`。
  */
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken, TOKEN_STORAGE_KEY } from './banto-hub-auth';
@@ -126,7 +130,7 @@ test.describe
 		// SSE の再接続が `401` で拒否された（ここで失効に気づいた）。
 		expect(eventStatuses).toContain(401);
 		expect(sockets).toHaveLength(0);
-		// v1.7.2 の `check()` は `200 false` でもトークンを消す。
+		// controller の確認（identity の `401` / `200 null`）が送ったトークンを消す。
 		expect(
 			await viewerPage.evaluate((key) => window.sessionStorage.getItem(key), TOKEN_STORAGE_KEY)
 		).toBeNull();
