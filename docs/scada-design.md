@@ -338,8 +338,16 @@ contentHash       現在読み込んでいる Project 内容の identity（読�
 - directory representation は**読込時に必ず canonical content hash を計算**する。Project の正しさを環境別
   cache（§9.6 案 C の置き場）に依存させない。fresh clone や別 PC では cache が存在しないため。環境別 cache
   は補助情報として使ってよいが、整合性判定に必須の情報にはしない
-- Editor session 中に Design Domain の外から directory 内容が変化した（再計算した hash が、session が
-  保持する hash と一致しない）場合は **`external-modified` 状態**として扱い、自動保存や Import による上書き
+- session は 2 つの hash を区別して保持する。Editor 自身の未保存変更を外部変更と誤判定しないため、
+  freshness guard が disk と比較するのは **`diskBaselineHash`** であり、`workingContentHash` ではない
+
+```text
+diskBaselineHash     最後に load / reload / successful save した disk 内容の hash
+workingContentHash   現在の in-memory Project 内容の hash（未保存変更を含む）
+```
+
+- Editor session 中に Design Domain の外から directory 内容が変化した（disk から再計算した hash が
+  `diskBaselineHash` と一致しない）場合は **`external-modified` 状態**として扱い、自動保存や Import による上書き
   を行わない。**通常の Save も拒否する**（Editor 側の古い状態で外部変更を上書きしないため）。解除方法は
   次の 3 つ。Overwrite または merge 後の保存で revision を +1 する
 
@@ -356,8 +364,9 @@ external-modified の解除:
   PC-B: 121 / BBB。git 上で manifest.json が必ずテキスト conflict になるとは限らない）。revision を単純な
   全順序として扱わず、merge または明示採用後の**最初の Design Domain save は
   `max(observed revisions) + 1`** を発行する
-- そのために session は **`revisionFloor` = これまでに観測した revision の最大値**を保持し、Reload /
-  Overwrite / merge / Import の明示採用で Project 内容を切り替えても **revisionFloor は下げない**。
+- そのために session は **`revisionFloor` = これまでに観測した revision の最大値**を **projectId ごと**に
+  保持し、Reload / Overwrite / merge / Import の明示採用で Project 内容を切り替えても **revisionFloor は
+  下げない**（Project A で 500 を観測した後に Project B（10）へ切り替えても、B の次回 save は 501 にしない）。
   Editor が 127 を観測済みで、disk が 120 / BBB に外部変更され Reload した場合、current revision を 120 に
   戻しても次の save を 121 にしない
 
@@ -2213,7 +2222,7 @@ commit 前の共通処理**として置く。watcher が外部変更を取りこ
 ```text
 Design API apply
   -> expectedRevision check            不一致 -> project_revision_conflict
-  -> disk contentHash freshness check  外部変更あり -> project_external_modified、mutation を commit しない
+  -> disk contentHash freshness check  disk の hash != diskBaselineHash -> project_external_modified、mutation を commit しない
   -> mutation commit
 ```
 
