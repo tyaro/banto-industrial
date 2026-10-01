@@ -350,6 +350,15 @@ external-modified の解除:
   Save As    別の場所へ保存する（元の directory は触らない）
 ```
 
+- 検出は file watcher だけに依存しない。**保存直前に canonical content hash を再計算し、session が保持する
+  hash と比較することを必須**とする。watch event の取りこぼしや debounce の race を最後に防ぐため
+- 同じ revision から複数環境が独立に保存すると、同一 revision に異なる内容が存在できる（PC-A: 121 / AAA、
+  PC-B: 121 / BBB。git 上で manifest.json が必ずテキスト conflict になるとは限らない）。revision を単純な
+  全順序として扱わず、merge または明示採用後の**最初の Design Domain save は
+  `max(observed revisions) + 1`** を発行する
+- Design API は `project_revision_conflict`（§19.8）とは別に、外部変更を表す stable error code
+  **`project_external_modified`** を返し、client が Reload / Overwrite / Save As の復帰処理を選べるようにする
+
 - Import 判定（§5.2）では revision と算出した content hash を**併用**する
 
 ---
@@ -412,6 +421,8 @@ incoming: revision = 121, hash = CCC
 - **hash が異なる場合、revision の大小だけを根拠に安全な上書きとは判断しない**。Import Preview（§5.3）で
   差分を提示し、既存内容を変更する場合は明示確認する
 - newer / older は「確認なしに適用してよい」の意味ではなく、Preview の見出しに使う分類にとどめる
+- `same projectId + same revision + different contentHash` は **divergent / conflict**（§4.3 の複数環境の
+  独立保存）。merge または明示採用後の最初の save は `max(observed revisions) + 1`
 
 ### 5.3 Import Preview
 
@@ -457,6 +468,15 @@ Equipment
 
 内容が異なる場合は Import Preview で差分を表示し、**明示確認後に replace** する。「同一 ID だから自動的に
 最新版として上書きする」とはしない。意図的な複製は新しい UUID を発行する（deep clone、§4.2）。
+
+SymbolDefinition の replace は slot の削除・型変更で既存 SymbolInstance / Equipment binding を壊しうるため、
+slot 差分を Symbol 内容の差分として埋もれさせず、Import Preview に少なくとも次を表示する。
+
+- 影響を受ける SymbolInstance 数
+- unresolved / incompatible になる Binding 数
+- 削除・型変更される slot
+
+replace 適用後は **Project 全体の validation を必ず再実行**する。
 
 ### 5.4 Secret
 
@@ -575,7 +595,21 @@ explicit pivot:
 ```
 
 `localBounds` は `(0, 0, width, height)` に正規化されている前提を置かず、一般の bounds（原点 `x`, `y` を
-持つ）として扱う。Path のように object-local 原点と bounds の左上が一致しない Object があるため。
+持つ）として扱う。Object 種別ごとの定義:
+
+```text
+Rectangle / Ellipse / Text / Image / ValueDisplay / Button
+    (0, 0, width, height)            layout size から決まる（正規化済み）
+Line / Path
+    geometry の bounds                object-local 原点と左上が一致しないため x / y を持つ
+Group
+    子 Object の union
+SymbolInstance
+    SymbolDefinition が宣言する design size / viewport
+```
+
+SymbolInstance を子 Object の union にしない理由: Symbol 内部の図形を少し編集しただけで既存 instance の既定
+pivot が変わり、配置済み画面の回転中心までずれるため。SymbolDefinition は design size を明示的に持つ。
 
 - resize 時: pivot 省略なら resize 後の layout bounds の中心、explicit pivot なら object-local 座標として保持
   する
@@ -954,7 +988,11 @@ Renderer
 Bad なし、Stale あり          -> 式を評価            -> result = Stale
 全入力 Good                   -> 式を評価            -> result = Good
 expression evaluation error   ->                      result = Bad
+評価結果が NaN / ±Inf         ->                      result = Bad
 ```
+
+最後の行は SCADA 側の追加規則。banto-expr は IEEE 754 のまま非有限値を伝播させるが、SCADA では描画・format・
+閾値比較へ非有限値をそのまま渡さないため、結果が有限でなければ Bad とする。
 
 **string タグ参照の拒否（2026-10-01 オーナー決定）**: banto-expr は文字列型を持たず、string タグの参照拒否を
 登録側に委ねている。SCADA では次の段階で validation error とし、Editor / CLI / AI は同じ validation を使う
@@ -964,6 +1002,14 @@ expression evaluation error   ->                      result = Bad
 banto-expr compile
   -> referenced_tags 取得
   -> Design Domain が Hub catalog の data_type（§8.3 の対応表）を検証
+```
+
+catalog が取得できない環境（fresh clone、Hub 未接続）では string かどうか判定できないため、offline validate が
+常に失敗しないよう重大度を分ける。
+
+```text
+catalog available + referenced tag is string   -> validation error
+catalog unavailable / unresolved metadata      -> warning / unresolved
 ```
 
 Runtime 側にも防御を置き、catalog 変更等で string タグが式の入力に現れた場合は評価せず Bad として扱う。
@@ -1893,7 +1939,8 @@ scada-server（§13.2。recorder / alarm / 常時実行 Event / API。画面に�
 - v1 では同じ executable を Editor mode で起動できること自体は**許容**する。ただし保護を OS のファイル権限
   だけに依存させず、Runtime window / webview へ Editor permission を与えない、Rust domain 側で Runtime mode
   からの Editor mutation を拒否する、**Runtime-only deployment へ Hub の admin credential を置かない**、
-  必要に応じ Project file を OS permission で read-only 化する、を組み合わせる
+  必要に応じ Project file を OS permission で read-only 化する、を組み合わせる。Runtime mode は Design API
+  listener を bind しない（§19.13）
 - 別 executable 化の判断基準は、runtime-only distribution、security、licensing、update lifecycle、
   deployment size 等の要求が発生した場合とする。**host 3 の着手時を、分離要否を再確認する節目**とする
 
@@ -2141,7 +2188,8 @@ apply:
 stable error 例:
 
 ```text
-project_revision_conflict
+project_revision_conflict     expectedRevision が現在の revision と一致しない
+project_external_modified     directory が Design Domain の外から変更された（§4.3。Reload / Overwrite / Save As で復帰）
 ```
 
 これにより AI と人間の同時編集による silent overwrite を防ぐ。
@@ -2278,6 +2326,16 @@ design-api/
   として受容する。loopback API でこれを防ぐことは原理的にできず、防げると書くほうが危険
 - token は **Editor 起動ごとに生成し、Project 切替時も再生成**する。bearer token は通常の Design API 操作
   にのみ使う
+- session descriptor は **listener の bind 成功後に公開**する。先に書くと、別 Editor が probe した瞬間に
+  listener がまだ無く、stale と誤判定して削除する可能性がある
+
+```text
+1. loopback listener を bind
+2. port 確定
+3. token / session_id 確定
+4. descriptor を atomic write（一時ファイルへ書いて rename）で公開
+```
+
 - stale 判定は pid 確認に加えて、**session identity による liveness 確認**を行う。bearer token を未知の
   port へ送る方式は採らない。probe endpoint は secret を返さない:
 
@@ -2290,7 +2348,8 @@ pid あり -> address:port へ session probe
   応答なし / session_id 不一致             -> stale
 ```
 
-- Runtime-only deployment では Design API を無効化できる構造とする
+- **Runtime mode は Design API listener を bind しない。Editor mode のみ Design API を起動できる**（§18 の
+  mode 起動時確定に伴う設計契約。2026-10-01）
 
 Project 設計変更は operator runtime audit と区別し、
 必要に応じて design change history として以下を記録する。
@@ -2539,12 +2598,12 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
-22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認（§5.2）。環境別 cache は補助のみ）
-23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーは Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、Runtime は評価せず Bad）
-24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心（`x + width / 2`、原点を含む一般の bounds）、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
-25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる）
-26. Design API session descriptor の脅威モデル → 2026-10-01 決定済み（§19.13、同一 OS user のプロセスは trust boundary 内。token は起動ごと・Project 切替ごとに再生成。stale 判定は pid + secret を返さない session probe の session_id 一致）
-27. 別 Project から Symbol を取り込む際の SymbolId の扱い → 2026-10-01 決定済み（§4.2 / §5.3、SymbolId を保持し new / same / update candidate を判定、差分は Import Preview で明示確認後に replace。複製は所有する ScreenObjectId まで deep clone で再発行）
+22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須、Design API は `project_external_modified`（§19.8）。環境別 cache は補助のみ）
+23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーと NaN / ±Inf は Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、catalog 無しは warning、Runtime は評価せず Bad）
+24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心（`x + width / 2`、原点を含む一般の bounds。SymbolInstance は SymbolDefinition の design size）、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
+25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる。Runtime mode は Design API listener を bind しない）
+26. Design API session descriptor の脅威モデル → 2026-10-01 決定済み（§19.13、同一 OS user のプロセスは trust boundary 内。token は起動ごと・Project 切替ごとに再生成。stale 判定は pid + secret を返さない session probe の session_id 一致。descriptor は listener bind 後に atomic write で公開）
+27. 別 Project から Symbol を取り込む際の SymbolId の扱い → 2026-10-01 決定済み（§4.2 / §5.3、SymbolId を保持し new / same / update candidate を判定、差分は Import Preview で明示確認後に replace。Preview に影響 instance 数 / 壊れる Binding 数 / 削除・型変更 slot を表示し、適用後に全体 validation を再実行。複製は所有する ScreenObjectId まで deep clone で再発行）
 
 ---
 
