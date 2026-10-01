@@ -159,6 +159,11 @@ export async function runCommissioningPolicy(
 	const timer = setTimeout(() => abort.abort(), deadlineMs);
 	const deadlineAt = clock() + deadlineMs;
 	const remaining = (): number => deadlineAt - clock();
+	// 期限は取得関数が signal に従うかどうかに依らず守る（中断に応じない取得でも
+	// 待ち続けない）。見捨てる取得は読むだけ（副作用なし）なので、遅れて返っても害は無い。
+	const deadlineReached = new Promise<null>((resolve) => {
+		abort.signal.addEventListener('abort', () => resolve(null), { once: true });
+	});
 
 	// 既存の snapshot は保つ。confirmed にはしない（S-70）。
 	const incomplete = (error: Error): SettledResult => ({
@@ -180,7 +185,7 @@ export async function runCommissioningPolicy(
 	try {
 		for (let round = 0; round < maxRounds; round++) {
 			const ticket = controller.ticket();
-			const status = await fetchStatus(abort.signal);
+			const status = await Promise.race([fetchStatus(abort.signal), deadlineReached]);
 			if (abort.signal.aborted || remaining() <= 0) return incomplete(new PolicyTimeoutError());
 			const step = decideCommissioningStep(
 				mode,

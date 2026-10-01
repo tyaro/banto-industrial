@@ -272,6 +272,16 @@ describe('runCommissioningPolicy: 期限（全体で共有する絶対時刻）'
 		expect(s.provider.resolve).not.toHaveBeenCalled(); // resolveSettled に落とさない（S-70）
 	});
 
+	it('取得関数が中断に応じなくても、期限で unverified（待ち続けない）', async () => {
+		const s = setup(noneAnswer);
+		s.setStatus(() => new Promise<CommissioningStatus | null>(() => {}));
+		const pending = s.run('recheck');
+		await vi.advanceTimersByTimeAsync(COMMISSIONING_POLICY_DEADLINE_MS);
+		const result = await pending;
+		expect(result.outcome).toBe('unverified');
+		if (result.outcome === 'unverified') expect(result.error).toBeInstanceOf(PolicyTimeoutError);
+	});
+
 	it('期限は状態の取得と通常の確認の全体で共有する（6 秒 + 返らない確認 → 合計 10 秒で unverified）', async () => {
 		const s = setup(() => new Promise(() => {})); // provider の確認は返らない
 		s.setStatus(

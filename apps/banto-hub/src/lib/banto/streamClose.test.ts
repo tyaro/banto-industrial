@@ -189,7 +189,9 @@ describe('sessionProbeResultOf（controller の確定の結果 → 3 値。設�
 			'unverified'
 		]
 	];
-	it.each(cases)('%s → %s', (_label, result, expected) => {
-		expect(sessionProbeResultOf(result)).toBe(expected);
-	});
+	for (const [label, result, expected] of cases) {
+		it(`${label} → ${expected}`, () => {
+			expect(sessionProbeResultOf(result)).toBe(expected);
+		});
+	}
 });
