@@ -14,7 +14,9 @@
  * zero server round-trip.
  */
 import { goto } from '$app/navigation';
-import { getAuthProvider, type PaletteCommand } from '@banto/admin-core';
+import type { PaletteCommand } from '@banto/admin-core';
+import { logoutAndLeave } from './banto/logout.svelte';
+import { notifyLogoutOutcome } from './banto/logoutNotice';
 import { navItems } from './navigation';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
@@ -88,8 +90,8 @@ function sessionCommands(): PaletteCommand[] {
 			// login-not-required mode (spec M11 - there's no session to end).
 			visible: () => !sessionStore.authDisabled,
 			run: async () => {
-				await getAuthProvider().logout();
-				await goto('/login');
+				// banto v2.0.0 (#260): same as Header.svelte's logout.
+				await logoutAndLeave(() => goto('/login'), { notify: notifyLogoutOutcome });
 			}
 		}
 	];
