@@ -340,7 +340,16 @@ contentHash       現在読み込んでいる Project 内容の identity（読�
   は補助情報として使ってよいが、整合性判定に必須の情報にはしない
 - Editor session 中に Design Domain の外から directory 内容が変化した（再計算した hash が、session が
   保持する hash と一致しない）場合は **`external-modified` 状態**として扱い、自動保存や Import による上書き
-  を行わない。次に Design Domain が保存するときに revision を +1 する
+  を行わない。**通常の Save も拒否する**（Editor 側の古い状態で外部変更を上書きしないため）。解除方法は
+  次の 3 つ。Overwrite または merge 後の保存で revision を +1 する
+
+```text
+external-modified の解除:
+  Reload     disk 側を採用して Editor の状態を破棄する
+  Overwrite  差分を明示確認したうえで Editor 側を保存する（revision +1）
+  Save As    別の場所へ保存する（元の directory は触らない）
+```
+
 - Import 判定（§5.2）では revision と算出した content hash を**併用**する
 
 ---
@@ -390,6 +399,19 @@ archive-only の扱いとする（§4.3）。
 - incoming < local: older
 - incoming == local && hash equal: same
 - incoming == local && hash differs: conflict
+
+**補足（2026-10-01 オーナー決定）**: directory を git / 手編集しても projectRevision は上がらない（§4.3）ため、
+revision の大小だけでは「incoming が local の直系更新か、local 側にも外部変更が入った分岐か」を判定できない。
+
+```text
+local:    revision = 120, hash = BBB   （git / 手編集済み）
+incoming: revision = 121, hash = CCC
+```
+
+- revision は Design Domain が発行する保存 generation、contentHash は内容 identity
+- **hash が異なる場合、revision の大小だけを根拠に安全な上書きとは判断しない**。Import Preview（§5.3）で
+  差分を提示し、既存内容を変更する場合は明示確認する
+- newer / older は「確認なしに適用してよい」の意味ではなく、Preview の見出しに使う分類にとどめる
 
 ### 5.3 Import Preview
 
@@ -545,12 +567,15 @@ Renderer viewBox="0 0 1920 1080"
 
 ```text
 pivot 省略時:
-  pivot.x = localBounds.width  / 2
-  pivot.y = localBounds.height / 2
+  pivot.x = localBounds.x + localBounds.width  / 2
+  pivot.y = localBounds.y + localBounds.height / 2
 
 explicit pivot:
   object-local の design unit で保存
 ```
+
+`localBounds` は `(0, 0, width, height)` に正規化されている前提を置かず、一般の bounds（原点 `x`, `y` を
+持つ）として扱う。Path のように object-local 原点と bounds の左上が一致しない Object があるため。
 
 - resize 時: pivot 省略なら resize 後の layout bounds の中心、explicit pivot なら object-local 座標として保持
   する
@@ -2514,9 +2539,9 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
-22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態、Import は両者を併用。環境別 cache は補助のみ）
+22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、projectRevision は Design Domain が発行する保存 generation、contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認（§5.2）。環境別 cache は補助のみ）
 23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーは Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、Runtime は評価せず Bad）
-24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
+24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心（`x + width / 2`、原点を含む一般の bounds）、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
 25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる）
 26. Design API session descriptor の脅威モデル → 2026-10-01 決定済み（§19.13、同一 OS user のプロセスは trust boundary 内。token は起動ごと・Project 切替ごとに再生成。stale 判定は pid + secret を返さない session probe の session_id 一致）
 27. 別 Project から Symbol を取り込む際の SymbolId の扱い → 2026-10-01 決定済み（§4.2 / §5.3、SymbolId を保持し new / same / update candidate を判定、差分は Import Preview で明示確認後に replace。複製は所有する ScreenObjectId まで deep clone で再発行）
