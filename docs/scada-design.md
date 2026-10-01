@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-10-01（§22 の未決 6 件を決定: Project package は `.bantoscada` で directory / ZIP の 2 表現（§5.1）、Stable ID は UUID v7（§4.2）、Screen 座標は f64 design unit + SVG viewBox（§6.4）、式は banto-expr を Rust 側で評価し presentation semantics は宣言的 mapping（§9.5）、Editor / Runtime は v1 は同一 executable の mode で capability を分離（§18）、Design API は loopback REST + ephemeral bearer token のみ（§19.13）。AI 変更の承認要否は semantic risk を Design Domain が算出（§19.7）。決定の帰結として生じた残件 #22〜#27 を §22 に追加、manifest の `exportedAt` / `contentHash` を archive-only に（§4.3）。2026-09-30: DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-10-01（同日 2 回目: §22 の #22〜#27 を決定。projectRevision と contentHash の役割分離と `external-modified` 状態（§4.3）、式の Quality 導出と string 参照の拒否箇所（§9.5）、回転 pivot と `preserveAspectRatio`（§6.4）、mode は起動時に確定（§18）、session descriptor の脅威モデルと session probe（§19.13）、Symbol 取り込み時の SymbolId 保持と複製時の deep clone（§4.2 / §5.3）。同日 1 回目: §22 の未決 6 件を決定: Project package は `.bantoscada` で directory / ZIP の 2 表現（§5.1）、Stable ID は UUID v7（§4.2）、Screen 座標は f64 design unit + SVG viewBox（§6.4）、式は banto-expr を Rust 側で評価し presentation semantics は宣言的 mapping（§9.5）、Editor / Runtime は v1 は同一 executable の mode で capability を分離（§18）、Design API は loopback REST + ephemeral bearer token のみ（§19.13）。AI 変更の承認要否は semantic risk を Design Domain が算出（§19.7）。決定の帰結として生じた残件 #22〜#27 を §22 に追加、manifest の `exportedAt` / `contentHash` を archive-only に（§4.3）。2026-09-30: DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -290,6 +290,9 @@ Name は人間向け、ID は内部参照向けとする。rename で参照が�
 - UUID の大小・生成順を、表示順、z-order、Action 実行順、その他 domain 上の順序として**利用しない**。
   順序が必要な場合は `order` 等を明示的に持つ
 - Binding に独立 UUID を持たせるかは**未決**。Design API で Binding を直接参照する方式を確定する際に判断する
+- **Symbol を別 Project から取り込む場合は SymbolId を保持する**（2026-10-01 決定。判定規則は §5.3）。意図的な
+  複製は Editor の「複製」操作で行い、SymbolId だけでなくその Symbol が所有する ScreenObjectId 等も
+  **deep clone として新しい UUID を再発行**する。Design API / undo / redo 上で identity が衝突しないため
 
 ### 4.3 Project Manifest
 
@@ -309,7 +312,7 @@ contentHash
 
 - schemaVersion: migration 判定
 - projectId: 同一案件 Project 判定
-- projectRevision: 新旧判定
+- projectRevision: 保存 generation（contentHash と併用して更新判定。revision 単独では安全な新旧判定をしない）
 - minRuntimeVersion: Runtime 互換判定
 - contentHash: 同 revision なのに中身が異なる競合検知
 
@@ -318,11 +321,160 @@ metadata** とし、directory representation の manifest.json には置かな�
 古くなり、§5.2 の競合検知が手編集で残った古い hash に引っかかる）。export 時に算出して書き込み、import 時
 は archive の中身から再計算して照合する。directory を直接読み込む場合は読込時に算出する。
 
-`contentHash` の計算対象は、**archive-only metadata（`exportedAt`、`contentHash` 自身、`checksums.json`）を
-除いた、directory / ZIP 共通の論理内容**とし、serializer の canonical 表現に対して計算する。再 export や
+`contentHash` の計算対象は、**archive-only metadata（`exportedAt`、`contentHash` 自身、`checksums.json`）と
+generation metadata である `projectRevision` を除いた、directory / ZIP 共通の論理内容**とし、serializer の
+canonical 表現に対して計算する。projectRevision を含めると、内容を変えずに Save しただけで hash が変わり
+（127 / AAA → 128 / BBB）、「contentHash = Project 内容の identity」という役割とずれ、§5.2 で同一内容の
+再保存が差分扱いになる。再 export や
 directory ↔ ZIP の変換で同じ Project が異なる hash になり競合扱いされることを防ぐため。Project 同一性判定
 用のこの hash と、archive 内の各ファイル単位の checksum（`checksums.json`、転送破損の検知用）は別物として
 区別する。
+
+**projectRevision と contentHash の役割（2026-10-01 オーナー決定）**: directory representation を git や
+手編集で変更した利用者に projectRevision の bump を要求しない。両者の役割を分ける。
+
+```text
+projectRevision   永続化された Project generation。save のたびに max(current, revisionFloor) + 1
+                  Import / Export の更新判定（§5.2）に使う。mutation では変わらない
+workingRevision   working state を変更 / 置換する操作ごとに +1（原因を問わない）:
+                  Editor mutation、Design API apply、undo / redo、Reload、Import apply、merge / 明示採用
+                  session 内で単調増加。Design API の optimistic concurrency token（§19.8）。永続化しない
+contentHash       現在読み込んでいる Project 内容の identity（読込時に必ず算出）
+```
+
+**mutation commit と save の境界（2026-10-01 オーナー決定、案 B）**: Design Domain の mutation commit は
+in-memory の working 状態を更新するだけで、disk への persist は明示的な save で行う。両者を同一にしない。
+理由: 明示 Save、undo / redo（S6）、`external-modified` 中の Save 拒否はいずれも mutation ≠ persist を前提に
+しており、AI の Design API mutation も Editor の working 状態に乗せて人間が確認してから save する流れ
+（§19.7）と一致する。CLI / headless の Design Domain 利用は「load → mutate → save」の 1 セッションで完結し、
+同じ model の退化形として扱う。save は content mutation ではないので workingRevision を変えず、
+projectRevision と `diskBaselineHash` を更新する。
+
+Reload / Import apply / merge のような **working state の置換**も workingRevision を進める。「減らさない」
+だけでは token として不十分で、AI が古い working state を前提に保持した plan が、Reload 後の新しい working
+state に対して workingRevision check と freshness check の両方を通って適用されてしまうため。Reload は次を
+一体の状態遷移とする。
+
+```text
+Reload:
+  disk 内容を working state に採用
+  diskBaselineHash   を更新
+  workingContentHash を更新
+  workingRevision    += 1
+  undo 履歴を破棄（旧 working state を前提にした entry を新 state に適用しない）
+```
+
+- directory representation は**読込時に必ず canonical content hash を計算**する。Project の正しさを環境別
+  cache（§9.6 案 C の置き場）に依存させない。fresh clone や別 PC では cache が存在しないため。環境別 cache
+  は補助情報として使ってよいが、整合性判定に必須の情報にはしない
+- session は 2 つの hash を区別して保持する。Editor 自身の未保存変更を外部変更と誤判定しないため、
+  freshness guard が disk と比較するのは **`diskBaselineHash`** であり、`workingContentHash` ではない
+
+```text
+diskBaselineHash     最後に load / reload / successful save した disk 内容の hash
+workingContentHash   現在の in-memory Project 内容の hash（未保存変更を含む）
+```
+
+- Editor session 中に Design Domain の外から directory 内容が変化した（disk から再計算した hash が
+  `diskBaselineHash` と一致しない）場合は **`external-modified` 状態**として扱い、自動保存や Import による上書き
+  を行わない。**通常の Save も、通常の Design Domain mutation（Editor 操作、Design API apply）も拒否する**
+  （Editor 側の古い状態で外部変更を上書きしないため。§19.8 の freshness guard が mutation commit 前にも
+  走るため、Editor 内 mutation も同じ扱いになる）。Reload / Overwrite / Save As で状態を解消してから編集を
+  再開する。解除方法は次の 3 つ。Overwrite または merge 後の保存で revision を +1 する
+
+```text
+external-modified の解除:
+  Reload     disk 側を採用して Editor の状態を破棄する
+  Overwrite  差分を明示確認したうえで Editor 側を保存する（revision +1。下記の専用手順）
+  Save As    別の場所へ保存する（元の directory は触らない）
+```
+
+Overwrite は通常 Save とは**別の recovery operation**とする。通常 Save の freshness guard（disk の hash ≠
+`diskBaselineHash` なら persist しない）をそのまま通すと、同じ mismatch で必ず再拒否されるため。差分確認と
+書込みの間に別 PC が再度変更する TOCTOU を、承認時に確認した disk hash の再確認で閉じる。
+
+persist（通常 Save、Overwrite、Save As、Design API の save）は directory の複数ファイルを書くため全体を
+atomic にはできない。temp directory へ書いてから swap する実装を推奨する。途中失敗で directory が混在状態に
+なった場合は、次回 load の hash / schema 検証で「不正な Project」として検出される、で受容する。
+
+```text
+Overwrite:
+  1. disk の最新 hash / projectRevision を読む
+  2. 差分をユーザーへ提示
+  3. ユーザーが Overwrite を明示承認
+  4. 承認時に確認した disk hash を expectedDiskHash として保持
+  5. 書込み直前に disk state（hash / projectRevision）を再取得して確認
+       disk hash != expectedDiskHash  -> その間に再度外部変更された -> project_external_modified、上書きしない
+  6. revisionFloor = max(revisionFloor, 再取得した最新の disk projectRevision)   新 revision 発行の前に反映
+  7. working state を persist
+  8. projectRevision = max(currentRevision, revisionFloor) + 1
+  9. diskBaselineHash を更新
+ 10. external-modified を解除
+```
+
+- 検出は file watcher だけに依存しない。**save 直前の canonical content hash の再計算と `diskBaselineHash`
+  との比較を必須**とする。watch event の取りこぼしや debounce の race を最後に防ぐため。外部変更を上書き
+  しうるのは save だけなので、安全性を担保するのはこの save 前の full hash である。mutation commit 前の
+  check（§19.8）は「古い working state に積み上げないための早期通知」の役割で、watcher フラグや mtime /
+  size の走査など**安価な検知を full hash を走らせる trigger** とし、疑いがあった操作だけ full hash を
+  計算する（drag や文字入力ごとに Project 全体を読み直さない）。**判定は常に full canonical hash ≠
+  `diskBaselineHash`** であり、疑いだけで `external-modified` に入れない。mtime は `git stash` / `git stash
+pop`、formatter、touch で内容が変わらなくても動くため、疑いで止めると不要な Reload（undo 履歴の破棄を
+  伴う）を強いる
+- 同じ revision から複数環境が独立に保存すると、同一 revision に異なる内容が存在できる（PC-A: 121 / AAA、
+  PC-B: 121 / BBB。git 上で manifest.json が必ずテキスト conflict になるとは限らない）。revision を単純な
+  全順序として扱わず、merge または明示採用後の**最初の Design Domain save は
+  `max(observed revisions) + 1`** を発行する
+- そのために session は **`revisionFloor` = これまでに観測した revision の最大値**を **projectId ごと**に
+  保持し、Reload / Overwrite / merge / Import の明示採用で Project 内容を切り替えても **revisionFloor は
+  下げない**（Project A で 500 を観測した後に Project B（10）へ切り替えても、B の次回 save は 501 にしない）。
+  Editor が 127 を観測済みで、disk が 120 / BBB に外部変更され Reload した場合、current revision を 120 に
+  戻しても次の save を 121 にしない
+
+```text
+revisionFloor = max(observed revisions)        内容の切り替えで下げない
+
+disk state を読むたび（freshness guard、Reload、Overwrite の再確認を含む）:
+  diskProjectId / diskProjectRevision / diskContentHash を取得
+  if diskProjectId == currentProjectId:
+    revisionFloor = max(revisionFloor, diskProjectRevision)     hash が一致していても更新する
+  if diskContentHash != diskBaselineHash:
+    -> project_external_modified
+
+次の Design Domain save:
+  projectRevision = max(currentRevision, revisionFloor) + 1
+```
+
+- disk 側の revision も観測に含めないと、session が 127（未保存変更あり）で disk が別 PC の save で 130 に
+  なった後に Overwrite すると 128 を書き、§5.2 の判定で古い側が newer に見える
+- **hash が一致していても revisionFloor は更新する**。projectRevision は contentHash の計算対象外なので、
+  別 PC が内容を変えずに数回 Save すると disk は 130 / AAA、session baseline は 127 / AAA となり、freshness
+  check は通る。このとき floor が 127 のままだと 128 を書いて generation が逆行する。「external-modified を
+  検出した時だけ更新」ではなく「同じ projectId の disk revision を観測した時点で常に更新」とする
+- disk の `projectId` が別 Project に変わっていた場合、その revision は現在 Project の revisionFloor に混ぜない
+
+- **Editor を閉じた状態での git / 手動 merge の契約**: session 内の revisionFloor では、Editor を閉じている間
+  に git merge された親 revision を観測できない（branch A が 128、branch B が 135 で、manifest の競合解決で
+  誤って 128 を残すと、起動後の Editor は 135 の存在を知る手段がない）。Design Domain 内では復元できないため、
+  directory representation を merge する側の契約として次を置く
+
+```text
+同一 projectId の Project を merge する場合:
+  merged manifest.projectRevision = max(merge inputs の projectRevision)
+  （同 revision 同士、121 / AAA と 121 / BBB なら 121 のまま）
+
+merge 後の最初の Design Domain save:
+  projectRevision = max(currentRevision, revisionFloor) + 1    （上の例では 122）
+```
+
+この契約は人手の競合解決に依存する。v1 必須ではないが、`.gitattributes` で manifest.json に custom merge
+driver を当て、`projectRevision` だけ max を取る小さなツールを first-party で用意すると、契約が「守られる」
+ものになる（後続の候補）
+
+- Design API は `working_revision_conflict`（§19.8）とは別に、外部変更を表す stable error code
+  **`project_external_modified`** を返し、client が Reload / Overwrite / Save As の復帰処理を選べるようにする
+
+- Import 判定（§5.2）では revision と算出した content hash を**併用**する
 
 ---
 
@@ -372,6 +524,21 @@ archive-only の扱いとする（§4.3）。
 - incoming == local && hash equal: same
 - incoming == local && hash differs: conflict
 
+**補足（2026-10-01 オーナー決定）**: directory を git / 手編集しても projectRevision は上がらない（§4.3）ため、
+revision の大小だけでは「incoming が local の直系更新か、local 側にも外部変更が入った分岐か」を判定できない。
+
+```text
+local:    revision = 120, hash = BBB   （git / 手編集済み）
+incoming: revision = 121, hash = CCC
+```
+
+- revision は Design Domain が発行する保存 generation、contentHash は内容 identity
+- **hash が異なる場合、revision の大小だけを根拠に安全な上書きとは判断しない**。Import Preview（§5.3）で
+  差分を提示し、既存内容を変更する場合は明示確認する
+- newer / older は「確認なしに適用してよい」の意味ではなく、Preview の見出しに使う分類にとどめる
+- `same projectId + same revision + different contentHash` は **divergent / conflict**（§4.3 の複数環境の
+  独立保存）。merge または明示採用後の最初の save は `max(observed revisions) + 1`
+
 ### 5.3 Import Preview
 
 適用前に差分を表示する。
@@ -404,6 +571,27 @@ Equipment
 - HTTP endpoint
 - DB command
 - authentication type
+
+**Symbol の取り込み（2026-10-01 オーナー決定）**: 別 Project から Symbol を取り込む場合は SymbolId を保持し
+（§4.2）、次の規則で判定する。
+
+```text
+同一 SymbolId なし                 -> new
+同一 SymbolId あり + 内容同一       -> same（no-op）
+同一 SymbolId あり + 内容が異なる   -> update candidate / conflict
+```
+
+内容が異なる場合は Import Preview で差分を表示し、**明示確認後に replace** する。「同一 ID だから自動的に
+最新版として上書きする」とはしない。意図的な複製は新しい UUID を発行する（deep clone、§4.2）。
+
+SymbolDefinition の replace は slot の削除・型変更で既存 SymbolInstance / Equipment binding を壊しうるため、
+slot 差分を Symbol 内容の差分として埋もれさせず、Import Preview に少なくとも次を表示する。
+
+- 影響を受ける SymbolInstance 数
+- unresolved / incompatible になる Binding 数
+- 削除・型変更される slot
+
+replace 適用後は **Project 全体の validation を必ず再実行**する。
 
 ### 5.4 Secret
 
@@ -508,6 +696,42 @@ Renderer viewBox="0 0 1920 1080"
   （`100.00000000003` のような値）を抑える
 - ただし 0.001 unit 等の**量子化精度を Project schema の意味論として現時点では固定しない**。Editor の
   snap 精度、操作時の丸め、serialization 上の正規化規則は実装時に確定する
+
+**回転 pivot（2026-10-01 オーナー決定）**: 既定は object の中心。ここでの「中心」は SVG DOM から実行時に
+取得する BBox ではなく、**Project model 上の untransformed local layout bounds** の中心と定義する。
+
+```text
+pivot 省略時:
+  pivot.x = localBounds.x + localBounds.width  / 2
+  pivot.y = localBounds.y + localBounds.height / 2
+
+explicit pivot:
+  object-local の design unit で保存
+```
+
+`localBounds` は `(0, 0, width, height)` に正規化されている前提を置かず、一般の bounds（原点 `x`, `y` を
+持つ）として扱う。Object 種別ごとの定義:
+
+```text
+Rectangle / Ellipse / Text / Image / ValueDisplay / Button
+    (0, 0, width, height)            layout size から決まる（正規化済み）
+Line / Path
+    geometry の bounds                object-local 原点と左上が一致しないため x / y を持つ
+Group
+    子 Object の union
+SymbolInstance
+    SymbolDefinition が宣言する design size / viewport
+```
+
+SymbolInstance を子 Object の union にしない理由: Symbol 内部の図形を少し編集しただけで既存 instance の既定
+pivot が変わり、配置済み画面の回転中心までずれるため。SymbolDefinition は design size を明示的に持つ。
+
+- resize 時: pivot 省略なら resize 後の layout bounds の中心、explicit pivot なら object-local 座標として保持
+  する
+
+**`preserveAspectRatio`（2026-10-01 オーナー決定）**: v1 は **`xMidYMid meet`**（letterbox）を既定かつ
+正式対応とする。`none`（stretch）は全 Object と Text を非等方変形するため v1 必須にせず、要求が出た段階で
+Screen 単位の属性として追加する（schema を壊さず後付けできる）。
 
 ---
 
@@ -870,6 +1094,40 @@ Renderer
   SCADA ローカルの expression は表示用の薄い演算・条件に限定する
 - **WASM は v1 では使用しない**。将来、browser-side evaluation や Tauri を使わない web client の要求が出た
   場合に、同じ banto-expr の WASM adapter を検討する
+
+**結果 Quality の導出（2026-10-01 オーナー決定）**: Hub の computed tag（`apps/banto-hub/core/src/computed.rs`）
+と同じ規則とする。Quality は banto-expr 自体には持ち込まない。
+
+```text
+入力に Bad または value なし  -> 式を評価しない      -> result = Bad
+Bad なし、Stale あり          -> 式を評価            -> result = Stale
+全入力 Good                   -> 式を評価            -> result = Good
+expression evaluation error   ->                      result = Bad
+評価結果が NaN / ±Inf         ->                      result = Bad
+```
+
+最後の行は SCADA 側の追加規則。banto-expr は IEEE 754 のまま非有限値を伝播させるが、SCADA では描画・format・
+閾値比較へ非有限値をそのまま渡さないため、結果が有限でなければ Bad とする。
+
+**string タグ参照の拒否（2026-10-01 オーナー決定）**: banto-expr は文字列型を持たず、string タグの参照拒否を
+登録側に委ねている。SCADA では次の段階で validation error とし、Editor / CLI / AI は同じ validation を使う
+（§19.2）。
+
+```text
+banto-expr compile
+  -> referenced_tags 取得
+  -> Design Domain が Hub catalog の data_type（§8.3 の対応表）を検証
+```
+
+catalog が取得できない環境（fresh clone、Hub 未接続）では string かどうか判定できないため、offline validate が
+常に失敗しないよう重大度を分ける。
+
+```text
+catalog available + referenced tag is string   -> validation error
+catalog unavailable / unresolved metadata      -> warning / unresolved
+```
+
+Runtime 側にも防御を置き、catalog 変更等で string タグが式の入力に現れた場合は評価せず Bad として扱う。
 
 ### 9.6 Binding identity の決定（2026-09-30 オーナー決定: 名前のみ。書き込みも名前）
 
@@ -1790,6 +2048,14 @@ scada-server（§13.2。recorder / alarm / 常時実行 Event / API。画面に�
     （参考実装: `apps/banto-hub/src-tauri/build.rs`。navigate 後の webview から command を呼ぶために同じ
     宣言をしている）。宣言漏れの command は capability で制限できないため、Rust domain 側の検証を
     最後の砦として必ず置く
+- **mode は起動時に確定し、プロセス実行中には切り替えない**（2026-10-01 決定）。切り替えは別 mode での
+  再起動とする。mode は CLI 引数または deployment configuration から起動時に解決する。「未指定なら Editor」
+  のような既定は Project 設計上の契約にせず、未指定時の UX は installer / 実装側で決める
+- v1 では同じ executable を Editor mode で起動できること自体は**許容**する。ただし保護を OS のファイル権限
+  だけに依存させず、Runtime window / webview へ Editor permission を与えない、Rust domain 側で Runtime mode
+  からの Editor mutation を拒否する、**Runtime-only deployment へ Hub の admin credential を置かない**、
+  必要に応じ Project file を OS permission で read-only 化する、を組み合わせる。Runtime mode は Design API
+  listener を bind しない（§19.13）
 - 別 executable 化の判断基準は、runtime-only distribution、security、licensing、update lifecycle、
   deployment size 等の要求が発生した場合とする。**host 3 の着手時を、分離要否を再確認する節目**とする
 
@@ -2021,26 +2287,66 @@ plan 結果に risk class と承認要否を含め、**apply 時にも server �
 
 ### 19.8 Optimistic Concurrency
 
-Design API mutation は projectRevision を利用する。
+Design API mutation は **workingRevision**（§4.3。mutation ごとに +1 する session 内の generation）を
+利用する。projectRevision は save ごとにしか変わらないため、Editor の未保存 mutation を検出できない
+（2026-10-01 オーナー決定、案 B）。
 
 ```text
 read:
-  projectRevision = 127
+  projectRevision  = 127     永続化された generation
+  workingRevision  = 3041    現在の working 状態
 
 apply:
-  expectedRevision = 127
+  expectedWorkingRevision = 3041
 ```
 
-人間または別 Agent が先に編集して currentRevision = 128 になっていれば、
-古い revision に基づく apply を拒否する。
+人間または別 Agent が先に編集して workingRevision = 3042 になっていれば、
+古い working revision に基づく apply を拒否する。read 応答は両方の revision を返す。
 
 stable error 例:
 
 ```text
-project_revision_conflict
+working_revision_conflict     expectedWorkingRevision が現在の workingRevision と一致しない
+project_external_modified     directory が Design Domain の外から変更された（§4.3。Reload / Overwrite / Save As で復帰）
 ```
 
 これにより AI と人間の同時編集による silent overwrite を防ぐ。
+
+**freshness guard（2026-10-01 オーナー決定）**: 外部変更の check は save だけの処理にせず、Editor 内
+mutation / Design API mutation / save が通る共通の Project service で、**mutation commit 前と save 前の共通
+処理**として置く。watcher が外部変更を取りこぼしても Design API mutation を silent に適用しないため。
+ただし 2 段の重さは分ける（§4.3）: commit 前は安価な検知（watcher フラグ、mtime / size）を trigger にして
+疑いがあるときだけ full hash を計算し、save 前は full canonical hash と `diskBaselineHash` の比較を必須と
+する。判定はどちらも full hash の不一致であり、疑いだけで `external-modified` に入れない。案 B では外部変更
+を上書きしうるのは save だけなので、安全性を担保するのは後者である。
+
+```text
+Design API apply
+  -> expectedWorkingRevision check     不一致 -> working_revision_conflict
+  -> stale trigger（安価）            watcher フラグ / mtime / size に疑いがあれば full hash を計算
+       full hash != diskBaselineHash   -> project_external_modified、mutation を commit しない
+  -> mutation commit                   workingRevision +1
+
+save（Editor の Save、または Design API の save endpoint）
+  -> full canonical hash check         disk の hash / projectRevision を読み、同じ projectId なら revisionFloor を更新（§4.3）
+                                       disk の hash != diskBaselineHash -> external-modified、persist しない
+                                       （解除は §4.3 の Reload / Overwrite / Save As。Overwrite は expectedDiskHash を再確認する別 operation）
+  -> persist                           projectRevision = max(current, revisionFloor) + 1、diskBaselineHash 更新
+```
+
+Design API は **明示的な save endpoint** を持つ。案 B では apply は working 状態を変えるだけなので、headless /
+CLI で persist する経路はこれになる。承認要否（§19.7）は apply 時に判定・強制済みで、save は承認を再要求
+しない（承認必須の変更は apply の時点で承認なしには working 状態に入らない）。
+
+save endpoint は working state **全体**を persist する。Editor session で人間が未保存の編集中に AI が save を
+呼ぶと、人間の途中の編集も一緒に disk に書かれるため、**Editor mode では save endpoint は直接 persist せず
+Editor 側の確認を要求する**（応答は stable error `editor_confirmation_required`。人間が Editor で確認すると
+通常の Save と同じ経路で persist される）。headless / CLI では直接 persist する。案 B の「AI 変更は
+人間が確認してから save」と同じ原則。
+
+ここでの headless / CLI は第 3 の mode ではなく、**UI を持たない Editor mode の起動形態**（Editor capability
+のまま window を開かない）である。§18 の mode は Editor / Runtime の 2 つのままで、Runtime mode は引き続き
+Design API listener を bind しない（§19.13）。
 
 ### 19.9 Editor との同期
 
@@ -2168,8 +2474,36 @@ design-api/
 - `project_revision` は session descriptor へ保存しない（書いた瞬間に古くなる）。現在の revision は
   Design API の応答から取得する
 - session descriptor は Windows では current user 限定の ACL、Unix では 0600。Editor 終了時に削除し、
-  起動時に stale session（pid が生きていないもの）を掃除する
-- Runtime-only deployment では Design API を無効化できる構造とする
+  起動時に stale session を掃除する（判定は下記）
+- **脅威モデル（2026-10-01 オーナー決定）**: **同一 OS user のプロセスは trust boundary 内**とする。
+  descriptor の token を同一ユーザーの他プロセスが読める点は、VS Code や Docker の desktop 連携と同じ前提
+  として受容する。loopback API でこれを防ぐことは原理的にできず、防げると書くほうが危険
+- token は **Editor 起動ごとに生成し、Project 切替時も再生成**する。bearer token は通常の Design API 操作
+  にのみ使う
+- session descriptor は **listener の bind 成功後に公開**する。先に書くと、別 Editor が probe した瞬間に
+  listener がまだ無く、stale と誤判定して削除する可能性がある
+
+```text
+1. loopback listener を bind
+2. port 確定
+3. token / session_id 確定
+4. descriptor を atomic write（一時ファイルへ書いて rename）で公開
+```
+
+- stale 判定は pid 確認に加えて、**session identity による liveness 確認**を行う。bearer token を未知の
+  port へ送る方式は採らない。probe endpoint は secret を返さない:
+
+```text
+GET /api/design/v1/session        -> { "session_id": "..." }
+
+pid なし                                   -> stale
+pid あり -> address:port へ session probe
+  session_id 一致                          -> live
+  応答なし / session_id 不一致             -> stale
+```
+
+- **Runtime mode は Design API listener を bind しない。Editor mode のみ Design API を起動できる**（§18 の
+  mode 起動時確定に伴う設計契約。2026-10-01）
 
 Project 設計変更は operator runtime audit と区別し、
 必要に応じて design change history として以下を記録する。
@@ -2271,7 +2605,7 @@ banto-industrial Issue #468 の path-aware CI は #469 で導入済み（2026-09
 - OpenAPI
 - validate
 - plan / apply
-- projectRevision optimistic concurrency
+- workingRevision optimistic concurrency（§19.8。projectRevision は save generation）
 - Editor change notification
 - loopback/editor-mode security boundary
 
@@ -2418,12 +2752,12 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
-22. directory representation を git / 手編集した場合の projectRevision の扱い（§5.1 の 2 表現決定で生じた論点。Design API 経由なら Design Domain が bump するが、直接編集では誰も上げない。読込時に内容 hash の不一致を revision 不整合として扱う等の規則が要る）
-23. Expression の結果 Quality の導出規則（§9.5。banto-expr は NaN を伝播し品質を持たないため、Hub computed tag と同じく入力の最悪値を継承するのが候補）と、string タグ参照の拒否を SCADA 側 validation のどこで行うか（banto-expr は登録側に委ねる。§8.3 の対応表を使う。S3 で確定）
-24. 回転の pivot（object 中心か origin か）と `preserveAspectRatio`（画面比が違うモニタで letterbox か stretch か）（§6.4。snap 精度と違い schema の意味論なので、S2 の Screen schema 確定時に決める）
-25. Editor / Runtime mode の確定タイミング（§18。Tauri 2 の capability は window label に静的に束縛されるため「起動時に確定し、プロセス内で切り替えない（切替は再起動）」が素直。v1 では操作者が同じ executable を Editor mode で起動できることを許容するかを明示する）
-26. Design API session descriptor の脅威モデルの明記（§19.13。token を同一ユーザーの他プロセスが読める点は VS Code / Docker と同じ「同一ユーザーは信頼」の前提として受容するか。pid 再利用で stale 判定を誤る点は token で疎通確認してから掃除すれば回避できる）
-27. 別 Project から Symbol を取り込む際の SymbolId の扱い（§4.2。更新検知のため同じ UUID を保つか再発行するか。#3 の Binding UUID 未決と同時期に決める）
+22. directory representation を git / 手編集した場合の projectRevision の扱い → 2026-10-01 決定済み（§4.3、案 B: projectRevision は永続化された generation、workingRevision は working state を変更 / 置換する操作（mutation、undo / redo、Reload、Import apply、merge）ごとに +1 する session 内 generation で Design API の optimistic concurrency token（§19.8、不一致は `working_revision_conflict`）、mutation commit と save は同一にしない。external-modified 中は Save も通常 mutation も拒否。contentHash は読込時に必ず算出する内容 identity。外部変更は `external-modified` 状態として Save も拒否し Reload / Overwrite / Save As で解除、Import は両者を併用し hash が異なれば revision の大小で上書きせず Preview で明示確認、同 revision 異 hash は divergent、merge 後の save は max + 1（§5.2）。保存直前の hash 再計算を必須とし mutation commit 前の共通 freshness guard に置く、Design API は `project_external_modified`（§19.8）。observed revision の最大値 `revisionFloor`（同じ projectId の disk revision を観測するたび hash 一致でも更新）を内容切替で下げず次の save は max(current, floor) + 1。commit 前は安価な検知を trigger に疑いがあれば full hash、save 前は full hash 必須、判定は常に full hash の不一致。Editor mode の save endpoint は `editor_confirmation_required`。persist は temp dir + swap 推奨。Reload は undo 履歴を破棄。Overwrite は expectedDiskHash を再確認する別 operation。contentHash は projectRevision を含めない。git / 手動 merge は manifest.projectRevision = max(inputs) を契約とする。Design API は save endpoint を持つ。環境別 cache は補助のみ）
+23. Expression の結果 Quality の導出規則と string タグ参照の拒否箇所 → 2026-10-01 決定済み（§9.5、Hub computed tag と同じ規則。Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーと NaN / ±Inf は Bad。string 参照は compile 後に Design Domain が catalog の data_type で validation error、catalog 無しは warning、Runtime は評価せず Bad）
+24. 回転の pivot と `preserveAspectRatio` → 2026-10-01 決定済み（§6.4、既定 pivot は model 上の local layout bounds の中心（`x + width / 2`、原点を含む一般の bounds。SymbolInstance は SymbolDefinition の design size）、explicit pivot は object-local。v1 は `xMidYMid meet` のみ、`none` は要求時に後付け）
+25. Editor / Runtime mode の確定タイミング → 2026-10-01 決定済み（§18、起動時に確定しプロセス内で切り替えない。CLI 引数 / deployment configuration で解決、未指定時の UX は実装側。Editor 起動は許容し、capability / domain 検証 / admin credential を置かない / read-only 化を組み合わせる。Runtime mode は Design API listener を bind しない）
+26. Design API session descriptor の脅威モデル → 2026-10-01 決定済み（§19.13、同一 OS user のプロセスは trust boundary 内。token は起動ごと・Project 切替ごとに再生成。stale 判定は pid + secret を返さない session probe の session_id 一致。descriptor は listener bind 後に atomic write で公開）
+27. 別 Project から Symbol を取り込む際の SymbolId の扱い → 2026-10-01 決定済み（§4.2 / §5.3、SymbolId を保持し new / same / update candidate を判定、差分は Import Preview で明示確認後に replace。Preview に影響 instance 数 / 壊れる Binding 数 / 削除・型変更 slot を表示し、適用後に全体 validation を再実行。複製は所有する ScreenObjectId まで deep clone で再発行）
 
 ---
 
@@ -2473,7 +2807,13 @@ MCP 自体は roadmap の blocking milestone にしない。
 - AI 連携は MCP-first ではなく Design API-first とする
 - Editor / CLI / AI は同じ Design Domain / mutation / validation を共有する
 - Design API は OpenAPI を公開し、AI が MCP 無しでも操作できることを目標とする
-- AI の Project 変更は projectRevision による optimistic concurrency を使う
+- AI の Project 変更は workingRevision による optimistic concurrency を使う（§19.8。projectRevision は永続化 generation で、mutation では変わらない）
 - 大規模・security-sensitive な AI 変更は plan / diff / validate を経て apply できる構造とする
 - SCADA 専用 MCP は optional adapter とし、必要性が出るまで実装を必須にしない
 - SCADA Design API に PLC runtime write の bypass を作らない
+- projectRevision は永続化された generation、workingRevision は working state の変更 / 置換（Reload・Import apply を含む）ごとに +1 する session 内 generation（Design API の optimistic concurrency token）、contentHash は読込時に必ず算出する内容 identity。mutation commit と save は同一にしない（案 B）。directory の外部変更は `external-modified` として自動保存・Import 上書きを止め、Import は両者を併用する。環境別 cache を整合性判定に必須にしない（2026-10-01 オーナー決定、§4.3）
+- 式の結果 Quality は Hub computed tag と同じ規則（Bad / value なしは評価せず Bad、Stale は評価して Stale、評価エラーと NaN / ±Inf は Bad）。string タグ参照は Design Domain の validation で拒否し Runtime でも評価せず Bad（2026-10-01 オーナー決定、§9.5）
+- 回転 pivot の既定は model 上の local layout bounds の中心（SymbolInstance は SymbolDefinition の design size）、`preserveAspectRatio` は v1 は `xMidYMid meet` のみ（2026-10-01 オーナー決定、§6.4）
+- Editor / Runtime mode は起動時に確定しプロセス内で切り替えない。v1 は Editor 起動を許容し、capability・domain 検証・Runtime-only deployment に admin credential を置かない・read-only 化を組み合わせる（2026-10-01 オーナー決定、§18）
+- Design API は同一 OS user のプロセスを trust boundary 内とし、token は起動・Project 切替ごとに再生成、stale 判定は secret を返さない session probe で行う（2026-10-01 オーナー決定、§19.13）
+- Symbol の取り込みは SymbolId を保持し、内容が異なれば Import Preview で明示確認後に replace。複製は所有 object まで deep clone で UUID を再発行（2026-10-01 オーナー決定、§4.2 / §5.3）
