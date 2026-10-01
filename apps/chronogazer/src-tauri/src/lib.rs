@@ -22,7 +22,7 @@ mod keyring_store;
 
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::{
-    lan_urls, start, static_router, AuthState, RunningServer, ServerConfig, ServerEvent,
+    lan_urls_for_bind, start, static_router, AuthState, RunningServer, ServerConfig, ServerEvent,
 };
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogList, AuditLogService};
@@ -60,7 +60,7 @@ use qrcode::QrCode;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -74,7 +74,33 @@ struct AppState {
     /// second round trip. banto v1.7.0 #204: a [`DesktopSession`], so every
     /// place that establishes a session states which kind it is, and every
     /// read goes through [`current_session`].
-    auth: Mutex<Option<DesktopSession>>,
+    ///
+    /// banto v2.0.0（banto #260, banto の docs/session-controller-design.md
+    /// §5.3, I-11 - admin-template の同名フィールドを写したもの）: wrapped in
+    /// an [`AuthSlot`] with a write sequence, so a command that `.await`s
+    /// between reading the slot and writing it (login's argon2 verify,
+    /// logout's settings read) only writes when nothing re-bound the slot
+    /// meanwhile ([`cas_session`]).
+    auth: Mutex<AuthSlot>,
+    /// The slow `.await`s the session-changing commands make before they
+    /// write [`AppState::auth`] (credential verification / first-user setup,
+    /// the auth-mode read, and `auth_config_apply`'s save), injected so tests
+    /// can hold a command at that point and fix the completion order (banto
+    /// design §8.3). Production wraps `users`/`settings` below
+    /// ([`AuthIo::production`]).
+    auth_io: AuthIo,
+    /// Serializes "read the auth-mode settings, decide, act on the decision"
+    /// (banto PR #264 re-review P2): [`auth_config_apply_body`] holds it from
+    /// its first settings read through the save and the session re-bind,
+    /// [`logout_body`] holds it around its post-clear re-read and install,
+    /// [`install_account_unless_auth_disabled`] around its mode check and
+    /// install, and the autologin toggles around their read-modify-write of
+    /// the same settings rows.
+    ///
+    /// LOCK ORDER: `auth_config_lock` -> [`AppState::auth`]. `auth` is a
+    /// std `Mutex` that is never held across an `.await`, so nothing can
+    /// hold it while waiting for this lock - the reverse order cannot occur.
+    auth_config_lock: AsyncMutex<()>,
     /// The local credential store (spec §8.2): argon2id-hashed accounts in
     /// the same SQLite settings DB as `settings` below. Shared with
     /// `rest_auth`'s verifier closure so the webview session and the
@@ -148,10 +174,154 @@ struct AppState {
     pool: chronogazer_core::db::DbPool,
 }
 
+/// Result of `auth_login`/`auth_setup`. `superseded`/`seq` (banto #260,
+/// design §5.3/I-19): `superseded` is `true` when the credentials were
+/// valid but another command re-bound the session slot while this one was
+/// verifying, so the session was NOT installed ([`cas_session`]); `seq` is
+/// the slot's write sequence after this command, so the frontend provider
+/// can tell whether the session changed without a second round trip.
 #[derive(Debug, Clone, Serialize)]
 struct LoginResult {
     success: bool,
     error: Option<String>,
+    superseded: bool,
+    seq: u64,
+}
+
+/// Result of `auth_logout` (banto #260): the slot's write sequence after the
+/// command - unchanged when it did nothing (auth-disabled mode, or another
+/// command re-bound the slot while the logout was reading settings).
+#[derive(Debug, Clone, Serialize)]
+struct LogoutResult {
+    seq: u64,
+}
+
+/// Result of `auth_change_password` (banto #260): the slot's write sequence
+/// after the command - advanced when the session was re-bound to the new
+/// `auth_epoch`.
+#[derive(Debug, Clone, Serialize)]
+struct ChangePasswordResult {
+    seq: u64,
+}
+
+/// Result of `auth_resolve` (banto #260, design §5.3): the whole session in
+/// one round trip, tagged with which slot write it is about.
+///
+/// - `checked`: the slot's `seq` read before the first `.await` (the session
+///   this answer validated);
+/// - `current`: the `seq` after this call's own settle - `checked + 1` iff
+///   this call cleared a revoked session, otherwise `checked`;
+/// - `stale`: another command re-bound the slot while this call was reading
+///   the store, so nothing was written and the answer is about nothing
+///   current (the frontend provider rejects it and asks again).
+#[derive(Debug, Clone, Serialize)]
+struct AuthResolveResult {
+    identity: Option<Identity>,
+    /// `"account"` or `"local"` (auth-disabled mode's synthetic session);
+    /// `None` when there is no session.
+    kind: Option<&'static str>,
+    checked: u64,
+    current: u64,
+    stale: bool,
+}
+
+/// The webview session slot (banto #260, design §5.3, I-11).
+///
+/// このファイルで「design §x」「I-n」「S-n」と書くのは banto リポジトリの
+/// `docs/session-controller-design.md`（v2.0.0）の節・不変条件・シナリオ番号。
+/// 実装は admin-template（`apps/admin-template/src-tauri/src/lib.rs`）の写し。
+///
+/// `seq` advances on every write that is MEANT to change the binding -
+/// login/setup/config-apply installing a session, logout/settle clearing
+/// one, `change_own_password` re-binding one - even when the value does not
+/// change (a logout of `None` still advances it, so a login that started
+/// before it can no longer install). It does NOT advance on a refresh of the
+/// same binding (`settle_session` updating role/display name), nor on the
+/// auth-disabled-mode logout no-op.
+#[derive(Debug, Default)]
+struct AuthSlot {
+    session: Option<DesktopSession>,
+    seq: u64,
+}
+
+impl AuthSlot {
+    fn new(session: Option<DesktopSession>) -> Self {
+        Self { session, seq: 0 }
+    }
+}
+
+type AuthFuture<T> = futures_util::future::BoxFuture<'static, Result<T, BantoError>>;
+/// `auth_login`'s credential check (design §8.3 `CredentialVerifier`).
+type CredentialVerifier =
+    Arc<dyn Fn(String, String) -> AuthFuture<Option<UserIdentity>> + Send + Sync>;
+/// `auth_setup`'s first-account creation. Not in design §8.3's sketch (which
+/// names only the verifier and the auth-mode read): `auth_setup` awaits
+/// `setup_first_user`, not `verify`, so S-18/S-19 need their own hold point.
+type FirstUserSetup = Arc<dyn Fn(String, String, String) -> AuthFuture<UserIdentity> + Send + Sync>;
+/// `auth_logout`'s auth-mode read (design §8.3 `AuthModeSource`).
+type AuthModeSource = Arc<dyn Fn() -> AuthFuture<AuthSettings> + Send + Sync>;
+/// `auth_config_apply`'s settings save. Not in design §8.3's sketch: injected
+/// so a test can hold an apply right AFTER it saved (banto PR #264 re-review P2).
+type AuthConfigSave = Arc<dyn Fn(AuthSettings) -> AuthFuture<()> + Send + Sync>;
+
+/// See [`AppState::auth_io`].
+struct AuthIo {
+    verify: CredentialVerifier,
+    setup_first_user: FirstUserSetup,
+    auth_mode: AuthModeSource,
+    save_auth_config: AuthConfigSave,
+}
+
+impl AuthIo {
+    fn production(users: &UsersService, settings: &SettingsService) -> Self {
+        let verify_users = users.clone();
+        let setup_users = users.clone();
+        let save_settings = settings.clone();
+        let settings = settings.clone();
+        Self {
+            verify: Arc::new(move |username, password| {
+                let users = verify_users.clone();
+                Box::pin(async move { users.verify(&username, &password).await })
+            }),
+            setup_first_user: Arc::new(move |username, password, display_name| {
+                let users = setup_users.clone();
+                Box::pin(async move {
+                    users
+                        .setup_first_user(&username, &password, &display_name)
+                        .await
+                })
+            }),
+            auth_mode: Arc::new(move || {
+                let settings = settings.clone();
+                Box::pin(async move { settings.auth_config().await })
+            }),
+            save_auth_config: Arc::new(move |config| {
+                let settings = save_settings.clone();
+                Box::pin(async move { settings.set_auth_config(&config).await })
+            }),
+        }
+    }
+}
+
+/// Read the slot's `seq` (and session) under one lock. Session-changing
+/// commands call this BEFORE their first `.await` (I-11).
+fn read_slot(state: &AppState) -> (Option<DesktopSession>, u64) {
+    let slot = state.auth.lock().expect("auth mutex poisoned");
+    (slot.session.clone(), slot.seq)
+}
+
+/// Compare-and-set the session slot (design §5.3, I-7/I-11): under one lock,
+/// write `next` and advance `seq` only when `seq` is still `expected_seq`.
+/// Advances even when `next` equals the current value. Returns whether it
+/// wrote, and the `seq` after the call.
+fn cas_session(state: &AppState, expected_seq: u64, next: Option<DesktopSession>) -> (bool, u64) {
+    let mut slot = state.auth.lock().expect("auth mutex poisoned");
+    if slot.seq != expected_seq {
+        return (false, slot.seq);
+    }
+    slot.session = next;
+    slot.seq += 1;
+    (true, slot.seq)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,8 +386,8 @@ impl DesktopSession {
     }
 }
 
-/// The webview session, re-validated on every command (banto v1.7.0 #204,
-/// the Tauri twin of `banto_server::AuthState::authenticate`):
+/// The webview session, re-validated on every command (banto v1.7.0 #204, the Tauri
+/// twin of `banto_server::AuthState::authenticate`):
 ///
 /// - no session -> `Ok(None)`;
 /// - [`DesktopSession::Account`]: the `users` row is re-read. Account gone,
@@ -234,12 +404,22 @@ impl DesktopSession {
 /// not log the user out), failing the command instead. The decision after
 /// the read is [`settle_session`] (the session may have changed while the
 /// read was in flight). The lock is never held across an `.await`.
+///
+/// banto #260: when the slot was re-bound while the read was in flight
+/// ([`Settled::Stale`]), nothing is written and this command decides on the
+/// CURRENT session's binding (valid iff `fresh` reports exactly it) - the
+/// same answer the pre-#260 `settle_session` gave in that case, so ordinary
+/// commands keep their behavior; only `auth_resolve` reports the staleness.
 async fn current_session(state: &AppState) -> Result<Option<DesktopSession>, BantoError> {
-    let Some(cached) = state.auth.lock().expect("auth mutex poisoned").clone() else {
+    let (cached, seq_at_entry) = read_slot(state);
+    let Some(cached) = cached else {
         return Ok(None);
     };
     let fresh = read_session_source(state, &cached).await?;
-    Ok(settle_session(state, &cached, fresh))
+    Ok(match settle_session(state, &cached, fresh, seq_at_entry) {
+        Settled::Settled { session, .. } => session,
+        Settled::Stale { valid_now } => valid_now,
+    })
 }
 
 /// What the store says NOW about the session `cached` stands for: the
@@ -280,38 +460,92 @@ fn same_binding(a: &DesktopSession, b: &DesktopSession) -> bool {
     }
 }
 
+/// Outcome of [`settle_session`] (banto #260, design §5.3).
+#[derive(Debug)]
+enum Settled {
+    /// The slot's `seq` moved since `seq_at_entry` (another command
+    /// installed, cleared or re-bound the session while the store was being
+    /// read). Nothing was written. `valid_now` is the CURRENT session (the
+    /// slot's value, newer than `fresh`) if its own binding is exactly what
+    /// `fresh` reports (e.g. a re-bind by `change_own_password` that `fresh`
+    /// already reflects), for the
+    /// ordinary commands' [`current_session`]; `auth_resolve` reports
+    /// `stale` instead of using it.
+    Stale { valid_now: Option<DesktopSession> },
+    /// The slot was not re-bound meanwhile, and was settled from `fresh`.
+    /// `seq_after == seq_before + 1` iff this call cleared the session.
+    Settled {
+        session: Option<DesktopSession>,
+        seq_before: u64,
+        seq_after: u64,
+    },
+}
+
 /// Decide on `fresh` (read with no lock held) against the session as it is
 /// NOW, under one lock:
 ///
-/// - valid iff the CURRENT session's own binding is exactly what `fresh`
-///   reports. Normally the current session is still `cached`; if it was
-///   re-bound meanwhile (`change_own_password` moving it to the epoch its
-///   change wrote), its new binding is what counts. A valid session is
-///   refreshed to `fresh` (current role and name);
-/// - otherwise: if the session is still the one `cached` snapshotted, it is
-///   stale and cleared; if it changed to something else meanwhile (a new
-///   login, ...), it is left for the next command to validate and only this
-///   command fails closed.
+/// - if the slot's `seq` is no longer `seq_at_entry` (read together with
+///   `cached`, before the store read), the session was re-bound meanwhile:
+///   write nothing and return [`Settled::Stale`] (banto #260, I-11/I-23);
+/// - otherwise the slot still holds `cached`'s binding (only same-binding
+///   refreshes, which do not move `seq`, can have happened). Valid iff that
+///   binding is exactly what `fresh` reports: refreshed to `fresh` (current
+///   role and name) WITHOUT advancing `seq`. Not valid (account gone,
+///   re-keyed, `auth_epoch` advanced - role change included - or
+///   auth-disabled mode turned off): cleared, advancing `seq`.
 ///
 /// This never moves a session to the store's newest epoch on its behalf: a
 /// session that was not itself re-bound still ends.
+///
+/// Why a refresh never writes an old answer back over a newer write: every
+/// write to the slot that changes what the session is authorized as advances
+/// `seq` - a (re-)bind, a clear, and (re-review of banto #266 P1, S-96) a role
+/// change of the synthetic session by [`rebind_local_session`]. So an
+/// unchanged `seq` means nothing was written since `cached`/`fresh` were
+/// read, and `fresh` is at least as new as the slot. (An account's role
+/// change advances its `auth_epoch`, so `fresh` is not the same binding and
+/// the session is cleared instead.) The one thing a refresh can still put
+/// back is an account's `display_name` (freshness audit of banto #266, P3-1): two
+/// concurrent refreshes of the same binding do not move `seq`, so the one
+/// that read the store first may write last. That is accepted: the name is
+/// display only (authorization reads role/epoch, which a refresh cannot
+/// rewind), and the next check refreshes it again; there is no version on
+/// the name to compare.
 fn settle_session(
     state: &AppState,
     cached: &DesktopSession,
     fresh: Option<DesktopSession>,
-) -> Option<DesktopSession> {
-    let mut auth = state.auth.lock().expect("auth mutex poisoned");
-    let unchanged = auth.as_ref() == Some(cached);
-    let valid = match auth.as_ref() {
+    seq_at_entry: u64,
+) -> Settled {
+    let mut slot = state.auth.lock().expect("auth mutex poisoned");
+    let valid = match slot.session.as_ref() {
         Some(now) => fresh.filter(|fresh| same_binding(now, fresh)),
         None => None,
     };
-    if valid.is_some() {
-        *auth = valid.clone();
-    } else if unchanged {
-        *auth = None;
+    if slot.seq != seq_at_entry {
+        // The slot was written after `fresh` was read, so the slot's own
+        // value is the newer one: report IT (not `fresh`) when the binding
+        // matches - e.g. a Local role changed by an apply after this read
+        // (freshness audit of banto #266, P3-2, S-102).
+        let valid_now = valid.and(slot.session.clone());
+        return Settled::Stale { valid_now };
     }
-    valid
+    debug_assert!(slot
+        .session
+        .as_ref()
+        .is_some_and(|now| same_binding(now, cached)));
+    let seq_before = slot.seq;
+    if valid.is_some() {
+        slot.session = valid.clone();
+    } else {
+        slot.session = None;
+        slot.seq += 1;
+    }
+    Settled::Settled {
+        session: valid,
+        seq_before,
+        seq_after: slot.seq,
+    }
 }
 
 /// Require an active webview session with at least role `min` (spec M10
@@ -372,6 +606,34 @@ async fn require_role(
     }
 }
 
+/// Record a successful, actor-attributed audit event from a Tauri command
+/// (spec M14): `origin` is always `"tauri"` and `result` always `"ok"`.
+/// banto v2.0.0 移行で admin-template の同名ヘルパーを写したもの - 認証の
+/// コマンド（login/setup/logout、認証モードの切替に伴うセッションの付け替え、
+/// autologin・settings_set）だけが使う。それ以外の既存コマンドは従来どおり
+/// `AuditEntry` を手で組み立てている（この PR では書き換えない）。
+async fn record_ok(
+    audit: &AuditLogService,
+    actor: &UserIdentity,
+    action: &str,
+    resource: &str,
+    entity_id: Option<&str>,
+    detail: Option<serde_json::Value>,
+) {
+    audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action,
+            resource,
+            entity_id,
+            detail,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+}
+
 /// Smoke-test command used by the frontend to verify the bridge.
 #[tauri::command]
 fn ping() -> &'static str {
@@ -394,6 +656,11 @@ async fn auth_status(state: State<'_, AppState>) -> Result<AuthStatusResult, Ban
 /// "already initialized" (or any other non-validation failure) surfaces as
 /// `Ok(LoginResult { success: false, .. })` instead, since that is an
 /// expected/retryable outcome, not a form error.
+///
+/// banto #260 (design §5.3, S-18/S-19): the session is installed only if no
+/// other command re-bound the slot while the account was being created
+/// ([`cas_session`] against the `seq` read before the first `.await`);
+/// otherwise the account still exists but the result is `superseded`.
 #[tauri::command]
 async fn auth_setup(
     state: State<'_, AppState>,
@@ -401,67 +668,149 @@ async fn auth_setup(
     password: String,
     display_name: String,
 ) -> Result<LoginResult, BantoError> {
-    match state
-        .users
-        .setup_first_user(&username, &password, &display_name)
-        .await
-    {
+    setup_body(&state, username, password, display_name).await
+}
+
+/// Message for a `LoginResult { superseded: true }` (the credentials were
+/// valid, but another session was established first).
+const SUPERSEDED_LOGIN_MESSAGE: &str =
+    "別のセッションが先に確定したため、このログインは適用されませんでした";
+
+/// Body of [`auth_setup`] (testable with a plain `&AppState`, design §8.3).
+/// Slot-clearing errors: none - every `Err` is returned before the slot is
+/// written (the TS provider's revision relies on this, design I-19).
+async fn setup_body(
+    state: &AppState,
+    username: String,
+    password: String,
+    display_name: String,
+) -> Result<LoginResult, BantoError> {
+    let (_, seq_at_entry) = read_slot(state);
+    // Owner decision on banto #266 (S-95): in auth-disabled mode no account session
+    // is ever installed. Checked on entry so no account is created for a
+    // setup that could not sign in; checked again at the install below
+    // (the mode can be switched on while the account is being created).
+    if state.settings.auth_config().await?.disabled {
+        return Ok(auth_disabled_login_result(state));
+    }
+    match (state.auth_io.setup_first_user)(username, password, display_name).await {
         Ok(identity) => {
-            state
-                .audit
-                .record(AuditEntry {
-                    actor_username: Some(&identity.username),
-                    actor_role: Some(identity.role.as_str()),
-                    action: "setup",
-                    resource: "auth",
-                    entity_id: None,
-                    detail: None,
-                    origin: "tauri",
-                    result: "ok",
-                })
-                .await;
-            *state.auth.lock().expect("auth mutex poisoned") =
-                Some(DesktopSession::Account(identity));
-            Ok(LoginResult {
-                success: true,
-                error: None,
-            })
+            record_ok(&state.audit, &identity, "setup", "auth", None, None).await;
+            install_account_unless_auth_disabled(state, seq_at_entry, identity).await
         }
         Err(err @ BantoError::Validation { .. }) => Err(err),
         Err(other) => Ok(LoginResult {
             success: false,
             error: Some(other.to_string()),
+            superseded: false,
+            seq: read_slot(state).1,
         }),
     }
 }
 
+/// `LoginResult.error` of a login/setup refused because auth-disabled mode is
+/// on (S-95).
+const AUTH_DISABLED_LOGIN_MESSAGE: &str =
+    "ログイン不要モード中はアカウントでログインできません。設定で通常のログインに戻してください";
+
+/// The refusal of a login/setup in auth-disabled mode (owner decision on
+/// banto #266, S-95): `success: false`, not `superseded` (no other session won a
+/// race - the mode forbids it), nothing written, the current `seq`. An `Ok`
+/// result rather than an `Err`, so the TS provider observes the unchanged
+/// `seq` and reports nothing (I-19), and the login screen shows `error`.
+fn auth_disabled_login_result(state: &AppState) -> LoginResult {
+    LoginResult {
+        success: false,
+        error: Some(AUTH_DISABLED_LOGIN_MESSAGE.to_string()),
+        superseded: false,
+        seq: read_slot(state).1,
+    }
+}
+
+/// Install a verified account session only while auth-disabled mode is off
+/// (owner decision on banto #266, S-95): so that
+/// `auth.disabled == true <=> DesktopSession::AuthDisabledLocal` holds
+/// always. Under `auth_config_lock` (taken AFTER the password check, never
+/// held across it), the mode is read and, if it is off, the session is
+/// installed with the `seq` compare-and-set ([`install_login`]); if it is on,
+/// nothing is written. `auth_config_apply(true)` re-binds under the same lock
+/// right after its save, so the two cannot interleave: an apply first leaves
+/// Local (this refuses), a login first leaves Account (the apply then
+/// replaces it). A failed mode read is an `Err` returned before any slot
+/// write (I-19). Lock order: `auth_config_lock` -> `state.auth`.
+async fn install_account_unless_auth_disabled(
+    state: &AppState,
+    seq_at_entry: u64,
+    identity: UserIdentity,
+) -> Result<LoginResult, BantoError> {
+    let _auth_config = state.auth_config_lock.lock().await;
+    if state.settings.auth_config().await?.disabled {
+        return Ok(auth_disabled_login_result(state));
+    }
+    Ok(install_login(
+        state,
+        seq_at_entry,
+        DesktopSession::Account(identity),
+    ))
+}
+
+/// Install a verified login/setup session with [`cas_session`] and build the
+/// command result: `superseded` when the slot was re-bound after
+/// `seq_at_entry`.
+fn install_login(state: &AppState, seq_at_entry: u64, session: DesktopSession) -> LoginResult {
+    let (written, seq) = cas_session(state, seq_at_entry, Some(session));
+    if written {
+        LoginResult {
+            success: true,
+            error: None,
+            superseded: false,
+            seq,
+        }
+    } else {
+        LoginResult {
+            success: false,
+            error: Some(SUPERSEDED_LOGIN_MESSAGE.to_string()),
+            superseded: true,
+            seq,
+        }
+    }
+}
+
+/// banto #260 (design §5.3, S-16): the session is installed only if no other
+/// command (a logout, another login) re-bound the slot while the password
+/// was being verified. The `login` audit entry is still recorded at
+/// verification success, before the install (design §1.7, decision 7).
 #[tauri::command]
 async fn auth_login(
     state: State<'_, AppState>,
     username: String,
     password: String,
 ) -> Result<LoginResult, BantoError> {
-    match state.users.verify(&username, &password).await? {
+    login_body(&state, username, password).await
+}
+
+/// Body of [`auth_login`] (testable with a plain `&AppState`, design §8.3).
+/// Slot-clearing errors: none - every `Err` is returned before the slot is
+/// written (the TS provider's revision relies on this, design I-19).
+async fn login_body(
+    state: &AppState,
+    username: String,
+    password: String,
+) -> Result<LoginResult, BantoError> {
+    let (_, seq_at_entry) = read_slot(state);
+    // Owner decision on banto #266 (S-95): refused in auth-disabled mode - before
+    // the (slow) password check, which then records nothing; and again at
+    // the install, after the check (see
+    // [`install_account_unless_auth_disabled`]).
+    if state.settings.auth_config().await?.disabled {
+        return Ok(auth_disabled_login_result(state));
+    }
+    match (state.auth_io.verify)(username.clone(), password).await? {
         Some(identity) => {
-            state
-                .audit
-                .record(AuditEntry {
-                    actor_username: Some(&identity.username),
-                    actor_role: Some(identity.role.as_str()),
-                    action: "login",
-                    resource: "auth",
-                    entity_id: None,
-                    detail: None,
-                    origin: "tauri",
-                    result: "ok",
-                })
-                .await;
-            *state.auth.lock().expect("auth mutex poisoned") =
-                Some(DesktopSession::Account(identity));
-            Ok(LoginResult {
-                success: true,
-                error: None,
-            })
+            // Recorded at verification success, before the install decides
+            // (design §1.7, decision 7) - as for a superseded login.
+            record_ok(&state.audit, &identity, "login", "auth", None, None).await;
+            install_account_unless_auth_disabled(state, seq_at_entry, identity).await
         }
         None => {
             state
@@ -480,6 +829,8 @@ async fn auth_login(
             Ok(LoginResult {
                 success: false,
                 error: Some("ユーザー名またはパスワードが違います".to_string()),
+                superseded: false,
+                seq: read_slot(state).1,
             })
         }
     }
@@ -495,36 +846,98 @@ async fn auth_login(
 /// framing as "this whole device is trusted, there is no session to log out
 /// of". Spec M14: that no-op path deliberately records no `logout` entry
 /// either - nothing actually changed.
+///
+/// banto #260 (design §5.3, S-17/S-67): the slot is cleared only if no other
+/// command re-bound it while the auth mode was being read ([`cas_session`]
+/// against the `seq` read before the first `.await`, advancing `seq` even
+/// when there was no session). A logout overtaken by a login leaves that
+/// login's session in place and records no `logout`. The auth-disabled
+/// no-op does not advance `seq`. A logout that cleared re-reads the mode
+/// and, if auth-disabled mode was switched on meanwhile, installs the
+/// synthetic session (banto PR #264 review P1, see [`logout_body`]). Either way
+/// the result carries the `seq` after the command.
 #[tauri::command]
-async fn auth_logout(state: State<'_, AppState>) -> Result<(), BantoError> {
-    if state.settings.auth_config().await?.disabled {
-        return Ok(());
-    }
-    let previous = state.auth.lock().expect("auth mutex poisoned").take();
-    if let Some(session) = previous {
-        let identity = session.identity();
-        state
-            .audit
-            .record(AuditEntry {
-                actor_username: Some(&identity.username),
-                actor_role: Some(identity.role.as_str()),
-                action: "logout",
-                resource: "auth",
-                entity_id: None,
-                detail: None,
-                origin: "tauri",
-                result: "ok",
-            })
-            .await;
-    }
-    Ok(())
+async fn auth_logout(state: State<'_, AppState>) -> Result<LogoutResult, BantoError> {
+    logout_body(&state).await
 }
 
-/// banto v1.7.0 #204: validated like every other command
-/// ([`current_session`]), so a session ended by a change to its account
-/// reports "logged out" here too, not just on the next guarded command. A DB
-/// failure is `Err` (the frontend's `check()` rejects instead of treating it
-/// as logged out - the session is kept).
+/// Body of [`auth_logout`] (testable with a plain `&AppState`, design §8.3).
+/// Slot-clearing errors: none - every `Err` is returned before the slot is
+/// written (the TS provider's revision relies on this, design I-19).
+async fn logout_body(state: &AppState) -> Result<LogoutResult, BantoError> {
+    let (previous, seq_at_entry) = read_slot(state);
+    if (state.auth_io.auth_mode)().await?.disabled {
+        return Ok(LogoutResult {
+            seq: read_slot(state).1,
+        });
+    }
+    let (written, mut seq) = cas_session(state, seq_at_entry, None);
+    if !written {
+        return Ok(LogoutResult { seq });
+    }
+    // banto PR #264 review P1: the mode read above may be stale - auth-disabled
+    // mode can have been switched on before this clear. (Since the owner
+    // review of banto #266 P1 an apply re-binds the session right after its save,
+    // which moves `seq` so this clear would not have been written; the
+    // re-read is kept as the defense for any path that saves the mode
+    // without re-binding.) Re-read the mode and, if it is now disabled, install
+    // the synthetic session - but only while the slot is still exactly what
+    // this clear left (`seq` unchanged and empty), so a later login or a
+    // config-apply that already installed it is never overwritten and the
+    // synthetic session is never installed twice ([`rebind_local_session`]
+    // with this clear's `seq`: an unchanged `seq` means the slot is still
+    // the empty one this clear left).
+    //
+    // A failed re-read is NOT an error of this logout: the clear has
+    // happened (and an `Err` after a slot write would break the TS
+    // provider's "errors are returned before the slot is written" contract,
+    // design I-19), so the logout reports success and installs nothing. The
+    // gap is then filled by the next `auth_config_apply`, or by `run()`'s
+    // bootstrap on the next launch.
+    //
+    // banto PR #264 re-review P2: the re-read and the install run under
+    // `auth_config_lock`, so an `apply(false)` cannot complete between the
+    // value read here and the install based on it. The FIRST read (the
+    // auth-disabled no-op decision above) stays outside the lock: it writes
+    // nothing on its own, and a stale "enabled" answer there is exactly what
+    // this re-read corrects; a stale "disabled" answer only makes this
+    // logout a no-op that the frontend re-resolves.
+    let rebind = {
+        let _auth_config = state.auth_config_lock.lock().await;
+        match (state.auth_io.auth_mode)().await {
+            Ok(config) if config.disabled => {
+                let (rebind, seq_now) =
+                    rebind_local_session(state, config.disabled_role, Some(seq), false);
+                seq = seq_now;
+                rebind
+            }
+            Ok(_) => LocalRebind::Skipped,
+            Err(err) => {
+                eprintln!("banto: ログアウト後の認証モードの再読み込みに失敗しました: {err}");
+                LocalRebind::Skipped
+            }
+        }
+    };
+    if let Some(session) = previous {
+        record_ok(
+            &state.audit,
+            session.identity(),
+            "logout",
+            "auth",
+            None,
+            None,
+        )
+        .await;
+    }
+    // Only `Installed` can happen here: with `seq` unchanged since the clear,
+    // the slot is empty.
+    record_local_rebind(&state.audit, &rebind).await;
+    Ok(LogoutResult { seq })
+}
+
+/// banto v1.7.0 #204: validated like every other command ([`current_session`]), so
+/// a session ended by a change to its account reports "logged out" here
+/// too, not just on the next guarded command.
 #[tauri::command]
 async fn auth_check(state: State<'_, AppState>) -> Result<bool, BantoError> {
     Ok(current_session(&state).await?.is_some())
@@ -539,23 +952,93 @@ async fn auth_identity(state: State<'_, AppState>) -> Result<Option<Identity>, B
         .map(|session| identity_from(session.identity())))
 }
 
+/// banto #260 (design §5.3): the frontend provider's `resolve()` - the
+/// session, its kind, and which slot write the answer is about, in one round
+/// trip. Validated like [`auth_identity`] (the account row / auth-disabled
+/// mode is re-read, so role and display name are current), but the `seq` is
+/// read BEFORE the store read and the settle happens under one lock:
+/// `current == checked + 1` iff this call cleared a revoked session, and a
+/// slot re-bound meanwhile is reported as `stale` with nothing written.
+#[tauri::command]
+async fn auth_resolve(state: State<'_, AppState>) -> Result<AuthResolveResult, BantoError> {
+    resolve_body(&state).await
+}
+
+fn session_kind(session: &DesktopSession) -> &'static str {
+    match session {
+        DesktopSession::Account(_) => "account",
+        DesktopSession::AuthDisabledLocal(_) => "local",
+    }
+}
+
+/// Body of [`auth_resolve`] (testable with a plain `&AppState`, design §8.3).
+/// Its `Ok` answer carries any clear it made (`current`); an `Err` is
+/// returned before the slot is written.
+async fn resolve_body(state: &AppState) -> Result<AuthResolveResult, BantoError> {
+    let (cached, seq_at_entry) = read_slot(state);
+    let Some(cached) = cached else {
+        return Ok(AuthResolveResult {
+            identity: None,
+            kind: None,
+            checked: seq_at_entry,
+            current: seq_at_entry,
+            stale: false,
+        });
+    };
+    let fresh = read_session_source(state, &cached).await?;
+    Ok(match settle_session(state, &cached, fresh, seq_at_entry) {
+        Settled::Stale { .. } => AuthResolveResult {
+            identity: None,
+            kind: None,
+            checked: seq_at_entry,
+            current: read_slot(state).1,
+            stale: true,
+        },
+        Settled::Settled {
+            session,
+            seq_before,
+            seq_after,
+        } => AuthResolveResult {
+            identity: session
+                .as_ref()
+                .map(|session| identity_from(session.identity())),
+            kind: session.as_ref().map(session_kind),
+            checked: seq_before,
+            current: seq_after,
+            stale: false,
+        },
+    })
+}
+
 /// Body of [`auth_change_password`], split out so the audit-recording
 /// behavior (spec M14) is testable with a plain `&AppState` in this crate's
 /// own `cargo test` - `tauri::State` cannot be constructed outside a running
 /// tauri app, but it derefs to `&AppState`, so the command below is a
 /// one-line adapter.
 ///
-/// banto v1.7.0 #204: the session is validated first ([`current_session`]).
-/// The change advances the account's `auth_epoch`, ending every session of
-/// it (REST tokens on other devices included); this webview session is then
+/// banto v1.7.0 #204: the session is validated first ([`current_session`]). The
+/// change advances the account's `auth_epoch`, ending every session of it
+/// (REST tokens on other devices included); this webview session is then
 /// re-bound to the new epoch - it just proved the current password - unless
 /// something else changed the account in between (then it ends too). Same
 /// policy as REST's `/api/auth/change-password`.
+///
+/// banto #260 (design §5.3, I-11, S-68): the re-bind is a write that changes
+/// the binding, so it advances the slot's `seq`; the result carries the
+/// `seq` after the command (unchanged when the re-bind did not happen).
+///
+/// Slot-clearing errors: ONLY `BantoError::Unauthorized` can be returned
+/// after the slot was written - the session check at the start
+/// ([`current_session`]) clears a revoked session (advancing `seq`) and this
+/// then fails with `Unauthorized`. Every other `Err` (`Forbidden`, the
+/// `Validation` of a wrong current password, storage errors) is returned
+/// with the slot unwritten by this command. The TS provider's revision
+/// relies on this split (design I-19).
 async fn change_own_password(
     state: &AppState,
     current_password: &str,
     new_password: &str,
-) -> Result<(), BantoError> {
+) -> Result<ChangePasswordResult, BantoError> {
     let identity = match current_session(state).await? {
         Some(DesktopSession::Account(identity)) => identity,
         // The synthetic auth-disabled session owns no credentials: never let
@@ -567,33 +1050,37 @@ async fn change_own_password(
         .users
         .change_password(&identity.username, current_password, new_password)
         .await?;
-    if new_epoch == identity.auth_epoch + 1 {
-        let mut auth = state.auth.lock().expect("auth mutex poisoned");
-        if let Some(DesktopSession::Account(session)) = auth.as_mut() {
-            if session.id == identity.id && session.auth_epoch == identity.auth_epoch {
-                session.auth_epoch = new_epoch;
+    let seq = {
+        let mut slot = state.auth.lock().expect("auth mutex poisoned");
+        if new_epoch == identity.auth_epoch + 1 {
+            let mut rebound = false;
+            if let Some(DesktopSession::Account(session)) = slot.session.as_mut() {
+                if session.id == identity.id && session.auth_epoch == identity.auth_epoch {
+                    session.auth_epoch = new_epoch;
+                    rebound = true;
+                }
+            }
+            if rebound {
+                slot.seq += 1;
             }
         }
-    }
+        slot.seq
+    };
     // Spec M14: a self-service password change is a security event (it is
     // also what naturally invalidates an M11 autologin credential), so it IS
     // audited - actor and entity are both the caller. `detail` stays `None`:
     // neither the old nor the new password (nor any hash) may ever be
     // recorded.
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&identity.username),
-            actor_role: Some(identity.role.as_str()),
-            action: "password_change",
-            resource: "users",
-            entity_id: Some(&identity.id.to_string()),
-            detail: None,
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
-    Ok(())
+    record_ok(
+        &state.audit,
+        &identity,
+        "password_change",
+        "users",
+        Some(&identity.id.to_string()),
+        None,
+    )
+    .await;
+    Ok(ChangePasswordResult { seq })
 }
 
 /// Requires an active webview session (spec §8.2): looks up the logged-in
@@ -605,11 +1092,232 @@ async fn auth_change_password(
     state: State<'_, AppState>,
     current_password: String,
     new_password: String,
-) -> Result<(), BantoError> {
+) -> Result<ChangePasswordResult, BantoError> {
     change_own_password(&state, &current_password, &new_password).await
 }
 
 // --- M11: auth-disabled mode + desktop autologin ---------------------------
+
+/// The synthetic identity of auth-disabled mode (spec M11). The ONE
+/// definition shared by `run()`'s bootstrap and [`rebind_local_session`]
+/// (used by [`auth_config_apply_body`] and [`logout_body`]), so they can
+/// never drift apart. `id: 0` is not a
+/// real `users` row - nothing ever looks a synthetic session up by id (no
+/// change-password/self-deletion flows apply to it), so there is no real
+/// row to alias.
+fn local_identity(role: Role) -> UserIdentity {
+    UserIdentity {
+        id: LOCAL_SESSION_ID,
+        username: "local".to_string(),
+        display_name: "ローカルユーザー".to_string(),
+        role,
+        auth_epoch: 0,
+    }
+}
+
+/// Spec M14: auth-disabled mode still records a `login` for its synthetic
+/// session, same as a normal login would - it is still "someone" starting to
+/// use the app, just without a credential check.
+async fn record_local_login(audit: &AuditLogService, identity: &UserIdentity) {
+    record_ok(
+        audit,
+        identity,
+        "login",
+        "auth",
+        None,
+        Some(serde_json::json!({ "mode": "auth_disabled" })),
+    )
+    .await;
+}
+
+/// What [`rebind_local_session`] did to the slot.
+#[derive(Debug, Clone, PartialEq)]
+enum LocalRebind {
+    /// Nothing written: `expected_seq` was given and the slot had moved.
+    Skipped,
+    /// The slot was empty; the synthetic session was installed (`seq` + 1).
+    Installed(UserIdentity),
+    /// An account session was replaced by the synthetic one (`seq` + 1). The
+    /// caller records the account's end and the synthetic `login`.
+    Replaced {
+        previous: UserIdentity,
+        local: UserIdentity,
+    },
+    /// The synthetic session was there with another role: its role was
+    /// changed (`seq` + 1 - an authorization-context change, re-review of
+    /// banto #266 P1, S-96). No session audit (the `settings_change` records it).
+    RoleChanged,
+    /// The synthetic session was there with this role: nothing written,
+    /// `seq` unchanged.
+    Unchanged,
+}
+
+/// The auth-mode change's session rebind (banto #260 実装-3, owner review of
+/// banto #266 P1, design §5.3): make the slot hold the auth-disabled synthetic
+/// session for `role`, under ONE lock, so that
+/// `auth.disabled == true <=> DesktopSession::AuthDisabledLocal <=>
+/// auth_resolve kind == "local"` holds as soon as the mode is saved:
+///
+/// - `None -> Local` and `Account(A) -> Local`: written, `seq` + 1 (a
+///   binding change: a login that read the old `seq` can no longer install
+///   over it, S-94);
+/// - `Local(r) -> Local(r')` with `r != r'`: the role is written and `seq`
+///   advances (re-review of banto #266 P1, S-96). [`same_binding`] treats every
+///   synthetic session as one binding, so `seq` is the only thing that tells
+///   an in-flight [`settle_session`] that the slot was written after it read
+///   the store; without the advance, an `auth_resolve` that had read the old
+///   role would write it back over the new one;
+/// - `Local(r) -> Local(r)`: nothing written, `seq` unchanged - UNLESS
+///   `role_changed` (S-98): the caller's own change of the mode's role,
+///   decided from the settings BEFORE its save, not from the slot. Between
+///   the save and this call, an `auth_resolve`/`current_session` that does
+///   not take `auth_config_lock` can read the new role from the store and
+///   refresh the slot to it ([`settle_session`] writes the role but never
+///   advances `seq` - advancing there would break "`current != checked` iff
+///   this call cleared", I-23). The slot then already holds the new role,
+///   yet an even older settle that read the OLD role still sees the same
+///   `seq`; so the role change is advanced here regardless of the slot. A
+///   settle's refresh writes the role without advancing `seq`; telling
+///   in-flight settles about a role change is this forced advance's job.
+///
+/// With `expected_seq` (the logout's re-read), nothing is written unless
+/// `seq` is still that value (the slot is then exactly what the logout's
+/// clear left: empty). The guard never lives across an `.await` (banto PR #182 の
+/// Copilot review). Returns the outcome and the `seq` after the call.
+fn rebind_local_session(
+    state: &AppState,
+    role: Role,
+    expected_seq: Option<u64>,
+    role_changed: bool,
+) -> (LocalRebind, u64) {
+    let mut slot = state.auth.lock().expect("auth mutex poisoned");
+    if expected_seq.is_some_and(|seq| seq != slot.seq) {
+        return (LocalRebind::Skipped, slot.seq);
+    }
+    let (outcome, next) = match slot.session.as_ref() {
+        Some(DesktopSession::AuthDisabledLocal(local)) if local.role == role && !role_changed => {
+            return (LocalRebind::Unchanged, slot.seq);
+        }
+        Some(DesktopSession::AuthDisabledLocal(local)) => (
+            LocalRebind::RoleChanged,
+            UserIdentity {
+                role,
+                ..local.clone()
+            },
+        ),
+        Some(DesktopSession::Account(previous)) => {
+            let local = local_identity(role);
+            (
+                LocalRebind::Replaced {
+                    previous: previous.clone(),
+                    local: local.clone(),
+                },
+                local,
+            )
+        }
+        None => {
+            let local = local_identity(role);
+            (LocalRebind::Installed(local.clone()), local)
+        }
+    };
+    slot.session = Some(DesktopSession::AuthDisabledLocal(next));
+    slot.seq += 1;
+    (outcome, slot.seq)
+}
+
+/// Make the session follow a saved auth mode (`saved`), compared with the
+/// mode before the save (`previous`) - synchronous, under `state.auth`'s
+/// lock only (the caller holds `auth_config_lock`):
+/// - mode on: [`rebind_local_session`], with `seq` forced to advance when
+///   `(disabled, disabled_role)` changed in this save (S-98; freshness audit
+///   of banto #266 P2-2: `false -> true` included, even if the slot already holds
+///   Local);
+/// - mode turned off (`true -> false`): [`end_local_session`] (S-99);
+/// - mode off before and after: nothing.
+fn apply_mode_to_session(
+    state: &AppState,
+    previous: &AuthSettings,
+    saved: &AuthSettings,
+) -> (LocalRebind, Option<UserIdentity>) {
+    if saved.disabled {
+        let changed =
+            (previous.disabled, previous.disabled_role) != (saved.disabled, saved.disabled_role);
+        (
+            rebind_local_session(state, saved.disabled_role, None, changed).0,
+            None,
+        )
+    } else if previous.disabled {
+        (LocalRebind::Skipped, end_local_session(state))
+    } else {
+        (LocalRebind::Skipped, None)
+    }
+}
+
+/// Audit [`apply_mode_to_session`]'s outcome (spec M14): the rebind's
+/// entries ([`record_local_rebind`]) and an ended synthetic session's
+/// `logout` with `detail: { "reason": "auth_enabled" }` (told apart from a
+/// user's logout, whose `detail` is empty).
+async fn record_mode_session_change(
+    audit: &AuditLogService,
+    rebind: &LocalRebind,
+    ended_local: Option<UserIdentity>,
+) {
+    record_local_rebind(audit, rebind).await;
+    if let Some(local) = ended_local {
+        record_ok(
+            audit,
+            &local,
+            "logout",
+            "auth",
+            None,
+            Some(serde_json::json!({ "reason": "auth_enabled" })),
+        )
+        .await;
+    }
+}
+
+/// End the auth-disabled synthetic session because the mode was turned off
+/// (re-review of banto #266 P1, S-99): under ONE lock, `Local -> None`, advancing
+/// `seq`, returning the ended identity (the caller records its end). Anything
+/// else is left alone: `None` has nothing to end, and an `Account` is not
+/// the mode's session (with `auth.disabled == true <=> AuthDisabledLocal`
+/// holding, the slot cannot hold one while the mode was on; were it there,
+/// the account's own re-validation decides its fate).
+fn end_local_session(state: &AppState) -> Option<UserIdentity> {
+    let mut slot = state.auth.lock().expect("auth mutex poisoned");
+    let Some(DesktopSession::AuthDisabledLocal(local)) = slot.session.as_ref() else {
+        return None;
+    };
+    let local = local.clone();
+    slot.session = None;
+    slot.seq += 1;
+    Some(local)
+}
+
+/// Audit what [`rebind_local_session`] did (spec M14): the synthetic
+/// `login` for an install; for a replaced account, that account's session
+/// end as `logout` with `detail: { "reason": "auth_disabled" }` (not a
+/// logout the user asked for - the detail tells the two apart) and then the
+/// synthetic `login`. A role change records nothing here (the synthetic
+/// session goes on; the apply's `settings_change` records the change).
+async fn record_local_rebind(audit: &AuditLogService, outcome: &LocalRebind) {
+    match outcome {
+        LocalRebind::Installed(local) => record_local_login(audit, local).await,
+        LocalRebind::Replaced { previous, local } => {
+            record_ok(
+                audit,
+                previous,
+                "logout",
+                "auth",
+                None,
+                Some(serde_json::json!({ "reason": "auth_disabled" })),
+            )
+            .await;
+            record_local_login(audit, local).await;
+        }
+        LocalRebind::Skipped | LocalRebind::RoleChanged | LocalRebind::Unchanged => {}
+    }
+}
 
 /// Current auth-mode settings (spec M11): any authenticated role may read
 /// this (it only feeds a settings-screen display), and it never carries the
@@ -617,7 +1325,15 @@ async fn auth_change_password(
 /// comment in `chronogazer_core::settings`).
 #[tauri::command]
 async fn auth_config_get(state: State<'_, AppState>) -> Result<AuthSettings, BantoError> {
-    require_role(&state, Role::Viewer, "settings").await?;
+    auth_config_get_body(&state).await
+}
+
+/// Body of [`auth_config_get`] (testable with a plain `&AppState`). Viewer
+/// floor on purpose: a kiosk's `viewer` synthetic session needs it to show
+/// the security screen it uses to turn the mode back off or raise its role
+/// (the ESCAPE HATCH of [`auth_config_apply_body`]).
+async fn auth_config_get_body(state: &AppState) -> Result<AuthSettings, BantoError> {
+    require_role(state, Role::Viewer, "settings").await?;
     state.settings.auth_config().await
 }
 
@@ -636,15 +1352,39 @@ async fn auth_config_get(state: State<'_, AppState>) -> Result<AuthSettings, Ban
 /// device" (spec M11), so not gating the one command that re-locks it down
 /// behind a role that mode itself may have suppressed is consistent with
 /// that trust model, not a weakening of it.
-#[tauri::command]
-async fn auth_config_apply(
-    state: State<'_, AppState>,
+///
+/// admin-template にある「BOOTSTRAP WINDOW」（アカウント 0 件・セッション
+/// なしでも呼べる初回画面の「ログインなしで使い始める」経路、banto
+/// choiapp-feedback-2026-09 §5）は ChronoGazer には**移植していない**
+/// （v2 移行 PR1a の範囲外。この経路の有無はオーナー判断で別に決める）。
+/// したがってセッションなしの呼び出しは、従来どおり `Unauthorized`。
+///
+/// Enabling the mode re-binds the session to the same synthetic local
+/// identity `run()`'s bootstrap would create on the next launch (and
+/// records the same synthetic `login` entry), so the webview enters the app
+/// without a restart - also when an account session was signed in: that
+/// session is replaced (owner review of banto #266 P1, [`rebind_local_session`]),
+/// so `auth.disabled == true` always goes with the synthetic session.
+///
+/// Body of [`auth_config_apply`] (spec M14 pattern) so its escape-hatch
+/// authz (the actor may be `None`) + audit behavior is testable with a
+/// plain `&AppState`.
+async fn auth_config_apply_body(
+    state: &AppState,
     disabled: bool,
-    disabled_role: String,
+    disabled_role: &str,
 ) -> Result<AuthSettings, BantoError> {
-    let currently_disabled = state.settings.auth_config().await?.disabled;
-    // Spec M14: the escape hatch means `require_role` may not run at all
-    // (see this command's doc comment) - capture whatever actor identity
+    // banto PR #264 re-review P2: held from the first settings read through the
+    // save and the synthetic-session install below (see
+    // `AppState::auth_config_lock`), so no other apply (or a logout's
+    // re-read + install) can interleave with this decision.
+    let _auth_config = state.auth_config_lock.lock().await;
+    // Read through the injectable `auth_mode` (production: the same
+    // `SettingsService::auth_config`) so tests can fix this command's order
+    // against a concurrent logout (design §8.3).
+    let currently_disabled = (state.auth_io.auth_mode)().await?.disabled;
+    // Spec M14: the escape hatch (see this command's doc comment) means
+    // `require_role` may not run at all - capture whatever actor identity
     // exists directly in that case, so the audit entry below still has one
     // when possible, instead of skipping the escape-hatch path's write
     // entirely.
@@ -654,22 +1394,62 @@ async fn auth_config_apply(
             .auth
             .lock()
             .expect("auth mutex poisoned")
+            .session
             .as_ref()
             .map(|session| session.identity().clone())
     } else {
-        Some(require_role(&state, Role::Admin, "settings").await?)
+        Some(require_role(state, Role::Admin, "settings").await?)
     };
 
     // An unrecognized role string falls back to `admin` (same convention as
     // `SettingsService::auth_config`'s own read-time fallback) rather than
     // failing the whole command - a bad value here must never leave the app
     // unable to determine ANY role for the synthetic identity.
-    let role = Role::from_str(&disabled_role).unwrap_or(Role::Admin);
+    let role = Role::from_str(disabled_role).unwrap_or(Role::Admin);
 
     let mut config = state.settings.auth_config().await?;
+    // The settings before this apply (read under `auth_config_lock`, so no
+    // other apply changes them meanwhile): a change of the mode's role while
+    // the mode stays on always advances `seq` at the rebind below (S-98).
+    let previous = config.clone();
     config.disabled = disabled;
     config.disabled_role = role;
-    state.settings.set_auth_config(&config).await?;
+    if let Err(err) = (state.auth_io.save_auth_config)(config.clone()).await {
+        // Freshness audit of banto #266 (P2-3, S-104): the save is one transaction
+        // (`SettingsService::set_auth_config`), but should any save fail
+        // part-way, the session must still follow what IS stored: re-read
+        // it and re-bind/end from that, then report the error.
+        if let Ok(stored) = state.settings.auth_config().await {
+            let (rebind, ended_local) = apply_mode_to_session(state, &previous, &stored);
+            record_mode_session_change(&state.audit, &rebind, ended_local).await;
+        }
+        return Err(err);
+    }
+    // Owner review of banto #266 P1 (design §5.3, S-94): turning the mode on
+    // re-binds the session to the synthetic one RIGHT after the save, with
+    // no `.await` in between (still under `auth_config_lock`), so
+    // `auth.disabled == true` is never observable together with an account
+    // session. None -> Local and Account -> Local advance `seq` (a login
+    // that started before can no longer install over it); Local -> Local
+    // advances `seq` only when the role changes (S-96).
+    //
+    // banto #260 (banto PR #264 review P1, kept): no "`seq` still the one read at
+    // entry" condition - a logout that cleared the slot after this command
+    // started would otherwise leave the mode with no session at all.
+    // [`logout_body`] re-reads the mode after its clear for the other order;
+    // both run under `auth_config_lock`, and the rebind is idempotent for
+    // `Local`, so the synthetic session is never installed twice.
+    //
+    // Turning the mode OFF (re-review of banto #266 P1, S-99) ends the synthetic
+    // session in the same step as the save (`Local -> None`, `seq` + 1), so
+    // `auth.disabled == false` is never observable together with it - an
+    // `auth_resolve` that had read `disabled = true` before the save then
+    // settles `Stale` instead of confirming `local`. (This used to be left to
+    // the next `auth_resolve`, on the grounds that the apply's answer carries
+    // no `seq`; the frontend provider absorbs an unobserved `seq` advance
+    // anyway - the catch-up of S-84.) Only on a `true -> false` change: a
+    // re-save of `false` touches nothing.
+    let (rebind, ended_local) = apply_mode_to_session(state, &previous, &config);
     state
         .audit
         .record(AuditEntry {
@@ -683,7 +1463,21 @@ async fn auth_config_apply(
             result: "ok",
         })
         .await;
+
+    // The session change is recorded after the settings change it follows
+    // from: from the settings screen, the admin's session end (`logout`,
+    // reason `auth_disabled`) and the synthetic `login`.
+    record_mode_session_change(&state.audit, &rebind, ended_local).await;
     Ok(config)
+}
+
+#[tauri::command]
+async fn auth_config_apply(
+    state: State<'_, AppState>,
+    disabled: bool,
+    disabled_role: String,
+) -> Result<AuthSettings, BantoError> {
+    auth_config_apply_body(&state, disabled, &disabled_role).await
 }
 
 /// Enable desktop autologin for `username` (spec M11): verifies the
@@ -692,15 +1486,18 @@ async fn auth_config_apply(
 /// actually know), stores the password in the OS keyring (never in the
 /// settings DB - see `keyring_store`), and flips the setting on. `admin`-only,
 /// same floor as every other server/settings-mutating command.
-#[tauri::command]
-async fn autologin_enable(
-    state: State<'_, AppState>,
-    username: String,
-    password: String,
+/// Body of [`autologin_enable`] (spec M14 pattern) so its authz + keyring +
+/// audit behavior is testable with a plain `&AppState` (the test installs an
+/// in-memory keyring so `keyring_store::set_password` does not hit the OS
+/// store on a headless runner).
+async fn autologin_enable_body(
+    state: &AppState,
+    username: &str,
+    password: &str,
 ) -> Result<(), BantoError> {
-    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let actor = require_role(state, Role::Admin, "settings").await?;
 
-    if state.users.verify(&username, &password).await?.is_none() {
+    if state.users.verify(username, password).await?.is_none() {
         return Err(BantoError::Validation {
             field_errors: vec![FieldError {
                 field: "password".to_string(),
@@ -709,39 +1506,53 @@ async fn autologin_enable(
         });
     }
 
-    keyring_store::set_password(&username, &password)?;
+    keyring_store::set_password(username, password)?;
 
+    // The same settings row as `auth_config_apply`: its read-modify-write
+    // must not interleave with an apply's (a lost update of `disabled`).
+    let auth_config_guard = state.auth_config_lock.lock().await;
     let mut config = state.settings.auth_config().await?;
     config.autologin_enabled = true;
-    config.autologin_username = Some(username.clone());
+    config.autologin_username = Some(username.to_string());
     state.settings.set_auth_config(&config).await?;
+    drop(auth_config_guard);
     // Spec M14: the target `username` (never the password) is fine to
     // record - it identifies WHICH account autologin now applies to, no
     // different from `users_update`'s `role` detail.
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(serde_json::json!({ "autologinEnabled": true, "username": username })),
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
+    record_ok(
+        &state.audit,
+        &actor,
+        "settings_change",
+        "settings",
+        None,
+        Some(serde_json::json!({ "autologinEnabled": true, "username": username })),
+    )
+    .await;
     Ok(())
+}
+
+#[tauri::command]
+async fn autologin_enable(
+    state: State<'_, AppState>,
+    username: String,
+    password: String,
+) -> Result<(), BantoError> {
+    autologin_enable_body(&state, &username, &password).await
 }
 
 /// Disable desktop autologin (spec M11): removes the stored credential from
 /// the OS keyring (best-effort - a keyring delete failure is logged, not
 /// propagated, so the setting is still turned off even if the OS store is,
 /// say, already gone) and clears the setting.
-#[tauri::command]
-async fn autologin_disable(state: State<'_, AppState>) -> Result<(), BantoError> {
-    let actor = require_role(&state, Role::Admin, "settings").await?;
+/// Body of [`autologin_disable`] (spec M14 pattern) so its authz + audit
+/// behavior is testable with a plain `&AppState`. No keyring is needed when
+/// `autologin_username` is unset (the delete is skipped) and is best-effort
+/// regardless.
+async fn autologin_disable_body(state: &AppState) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Admin, "settings").await?;
 
+    // See `autologin_enable_body`: same row as `auth_config_apply`.
+    let auth_config_guard = state.auth_config_lock.lock().await;
     let mut config = state.settings.auth_config().await?;
     if let Some(username) = config.autologin_username.take() {
         if let Err(err) = keyring_store::delete_password(&username) {
@@ -750,20 +1561,22 @@ async fn autologin_disable(state: State<'_, AppState>) -> Result<(), BantoError>
     }
     config.autologin_enabled = false;
     state.settings.set_auth_config(&config).await?;
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(serde_json::json!({ "autologinEnabled": false })),
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
+    drop(auth_config_guard);
+    record_ok(
+        &state.audit,
+        &actor,
+        "settings_change",
+        "settings",
+        None,
+        Some(serde_json::json!({ "autologinEnabled": false })),
+    )
+    .await;
     Ok(())
+}
+
+#[tauri::command]
+async fn autologin_disable(state: State<'_, AppState>) -> Result<(), BantoError> {
+    autologin_disable_body(&state).await
 }
 
 /// One LAN access URL plus its QR code, rendered as an inline SVG string
@@ -798,8 +1611,19 @@ fn qr_svg_for(data: &str) -> String {
         .unwrap_or_default()
 }
 
-fn build_status(config: &ServerSettings, running: bool) -> ServerStatusResult {
-    let urls = lan_urls(config.port);
+/// `running` is the embedded server's bound address while it runs. Its URLs
+/// then come from that address (`chronogazer_core::listening_urls`, the same
+/// as `banto-serve`'s startup log - PR1a オーナーレビュー P3); with no server
+/// running they come from the saved `bind`/`port` (the settings screen only
+/// offers IP choices for `bind`, so it parses).
+fn build_status(
+    config: &ServerSettings,
+    running: Option<std::net::SocketAddr>,
+) -> ServerStatusResult {
+    let urls = match running {
+        Some(addr) => chronogazer_core::listening_urls(addr),
+        None => lan_urls_for_bind(&config.bind, config.port),
+    };
     let qr_svgs = urls
         .iter()
         .map(|url| QrSvgEntry {
@@ -809,7 +1633,7 @@ fn build_status(config: &ServerSettings, running: bool) -> ServerStatusResult {
         .collect();
     ServerStatusResult {
         enabled: config.enabled,
-        running,
+        running: running.is_some(),
         bind: config.bind.clone(),
         port: config.port,
         urls,
@@ -878,7 +1702,12 @@ async fn start_embedded_server(
 async fn server_status(state: State<'_, AppState>) -> Result<ServerStatusResult, BantoError> {
     require_role(&state, Role::Admin, "settings").await?;
     let config = state.settings.server_config().await?;
-    let running = state.server.lock().await.is_some();
+    let running = state
+        .server
+        .lock()
+        .await
+        .as_ref()
+        .map(|server| server.local_addr());
     Ok(build_status(&config, running))
 }
 
@@ -933,7 +1762,7 @@ async fn server_apply(
         None
     };
 
-    let running = started.is_some();
+    let running = started.as_ref().map(|server| server.local_addr());
     *state.server.lock().await = started;
     state
         .audit
@@ -955,12 +1784,28 @@ async fn server_apply(
     Ok(build_status(&config, running))
 }
 
+/// `admin`-only (banto v2.0.0 移行で admin-template に揃えた): the settings
+/// table holds privileged values (the embedded server's bind/port,
+/// `auth.disabled`/`auth.disabled_role`, `auth.autologin.username`, audit
+/// retention, the Hub connection, and every user's `ui.{username}.*`
+/// namespace), so reading an arbitrary key is as privileged as writing one.
+/// Without this guard an unauthenticated webview (the login screen is a real
+/// webview whose console can `invoke`), or a kiosk's `viewer` synthetic
+/// session, could read any of those. The frontend does not call this raw
+/// command (UI settings go through the Viewer-gated, caller-scoped
+/// `ui_settings_get`).
 #[tauri::command]
 async fn settings_get(
     state: State<'_, AppState>,
     key: String,
 ) -> Result<Option<String>, BantoError> {
-    state.settings.get(&key).await
+    settings_get_body(&state, &key).await
+}
+
+/// Body of [`settings_get`] (testable with a plain `&AppState`).
+async fn settings_get_body(state: &AppState, key: &str) -> Result<Option<String>, BantoError> {
+    require_role(state, Role::Admin, "settings").await?;
+    state.settings.get(key).await
 }
 
 /// `admin`-only (spec M10): writing settings (which include the embedded
@@ -973,23 +1818,41 @@ async fn settings_set(
     value: String,
 ) -> Result<(), BantoError> {
     let actor = require_role(&state, Role::Admin, "settings").await?;
+    settings_set_body(&state, &actor, key, value).await
+}
+
+/// Body of [`settings_set`]. banto v2.0.0 移行（freshness audit of banto
+/// #266, P2-2, S-103 - admin-template の同名関数の写し）: keys in the
+/// `auth.` namespace are refused - they are written only by
+/// [`auth_config_apply`] (which re-binds the session under
+/// `auth_config_lock`, keeping `auth.disabled == true <=> AuthDisabledLocal`)
+/// and the `autologin_*` commands. A raw write would bypass both.
+/// ChronoGazer 固有のキー（`data.dir`・`retention.days` など）はこれまでどおり
+/// 書ける。
+async fn settings_set_body(
+    state: &AppState,
+    actor: &UserIdentity,
+    key: String,
+    value: String,
+) -> Result<(), BantoError> {
+    if SettingsService::is_auth_key(&key) {
+        return Err(BantoError::BadRequest(format!(
+            "設定 {key} はこのコマンドでは変更できません。認証モードは auth_config_apply（自動ログインは autologin_enable/autologin_disable）で変更してください"
+        )));
+    }
     state.settings.set(&key, &value).await?;
     // Spec M14: only the KEY is recorded, never the value - this is a
     // generic key/value store and the value could be anything, including
     // something sensitive a future setting might store here.
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(serde_json::json!({ "key": key })),
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
+    record_ok(
+        &state.audit,
+        actor,
+        "settings_change",
+        "settings",
+        None,
+        Some(serde_json::json!({ "key": key })),
+    )
+    .await;
     Ok(())
 }
 
@@ -2696,30 +3559,12 @@ pub fn run() {
             let auth_config = tauri::async_runtime::block_on(settings.auth_config())
                 .expect("auth_config should succeed");
             let initial_auth: Option<DesktopSession> = if auth_config.disabled {
-                // `id: 0` is not a real `users` row - nothing here ever looks
-                // it up by id (no change-password/self-deletion flows apply
-                // to a synthetic session), so there is no real row to alias.
-                let local_identity = UserIdentity {
-                    id: LOCAL_SESSION_ID,
-                    username: "local".to_string(),
-                    display_name: "ローカルユーザー".to_string(),
-                    role: auth_config.disabled_role,
-                    auth_epoch: 0,
-                };
-                // Spec M14: auth-disabled mode still records a `login` for
-                // its synthetic session, same as a normal login would - it
-                // is still "someone" starting to use the app, just without a
-                // credential check.
-                tauri::async_runtime::block_on(audit.record(AuditEntry {
-                    actor_username: Some(&local_identity.username),
-                    actor_role: Some(local_identity.role.as_str()),
-                    action: "login",
-                    resource: "auth",
-                    entity_id: None,
-                    detail: Some(serde_json::json!({ "mode": "auth_disabled" })),
-                    origin: "tauri",
-                    result: "ok",
-                }));
+                // The ONE definition of the synthetic identity and its
+                // `login` entry, shared with `auth_config_apply_body` /
+                // `logout_body` (banto v2.0.0 移行): `local_identity` /
+                // `record_local_login`.
+                let local_identity = local_identity(auth_config.disabled_role);
+                tauri::async_runtime::block_on(record_local_login(&audit, &local_identity));
                 Some(DesktopSession::AuthDisabledLocal(local_identity))
             } else if auth_config.autologin_enabled {
                 match &auth_config.autologin_username {
@@ -2920,7 +3765,9 @@ pub fn run() {
             }
 
             app.manage(AppState {
-                auth: Mutex::new(initial_auth),
+                auth: Mutex::new(AuthSlot::new(initial_auth)),
+                auth_io: AuthIo::production(&users, &settings),
+                auth_config_lock: AsyncMutex::new(()),
                 users,
                 settings,
                 events,
@@ -2946,6 +3793,7 @@ pub fn run() {
             auth_logout,
             auth_check,
             auth_identity,
+            auth_resolve,
             auth_change_password,
             auth_config_get,
             auth_config_apply,
@@ -3052,6 +3900,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    impl AppState {
+        /// Install `session` as if a session-changing command had written it
+        /// (advancing `seq`, banto #260 I-11).
+        fn set_session_for_test(&self, session: Option<DesktopSession>) {
+            let mut slot = self.auth.lock().expect("auth mutex poisoned");
+            slot.session = session;
+            slot.seq += 1;
+        }
+    }
+
     /// A retry-cleanup temp dir wrapper - see `chronogazer_core::backup`'s
     /// `crate::test_support` module doc (this crate's `AppState` tests hit
     /// the exact same Windows WAL-close-timing leak: measured, one
@@ -3123,7 +3981,12 @@ mod tests {
         .await
         .expect("HubService::new");
         AppState {
-            auth: Mutex::new(None),
+            auth: Mutex::new(AuthSlot::default()),
+            auth_config_lock: AsyncMutex::new(()),
+            auth_io: AuthIo::production(
+                &UsersService::new(pool.clone()),
+                &SettingsService::new(pool.clone()),
+            ),
             users: UsersService::new(pool.clone()),
             settings,
             events,
@@ -3181,7 +4044,12 @@ mod tests {
         .await
         .expect("HubService::new");
         let state = AppState {
-            auth: Mutex::new(None),
+            auth: Mutex::new(AuthSlot::default()),
+            auth_config_lock: AsyncMutex::new(()),
+            auth_io: AuthIo::production(
+                &UsersService::new(pool.clone()),
+                &SettingsService::new(pool.clone()),
+            ),
             users: UsersService::new(pool.clone()),
             settings,
             events,
@@ -3252,7 +4120,7 @@ mod tests {
             .setup_first_user("owner", "password123", "オーナー")
             .await
             .expect("setup_first_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(owner));
+        state.set_session_for_test(Some(DesktopSession::Account(owner)));
 
         for action in ["a", "b", "c", "d", "e"] {
             state
@@ -3320,7 +4188,7 @@ mod tests {
             .await
             .expect("setup_first_user");
         let owner_id = owner.id;
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(owner));
+        state.set_session_for_test(Some(DesktopSession::Account(owner)));
 
         change_own_password(&state, "password123", "newpassword1")
             .await
@@ -3358,7 +4226,7 @@ mod tests {
             .setup_first_user("owner", "password123", "オーナー")
             .await
             .expect("setup_first_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(owner));
+        state.set_session_for_test(Some(DesktopSession::Account(owner)));
 
         change_own_password(&state, "not-the-password", "newpassword1")
             .await
@@ -3388,7 +4256,7 @@ mod tests {
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(admin));
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
 
         let info = backups_create_body(&state)
             .await
@@ -3427,7 +4295,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
 
         let err = backups_create_body(&state).await.unwrap_err();
         assert!(matches!(err, BantoError::Forbidden));
@@ -3446,7 +4314,7 @@ mod tests {
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(admin));
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
 
         let info = backups_create_body(&state).await.expect("create");
         assert!(state.backup.pending_restore().await.is_none());
@@ -3509,7 +4377,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
 
         let err = require_hub_admin(&state)
             .await
@@ -3549,7 +4417,7 @@ mod tests {
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(admin));
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
 
         require_hub_admin(&state)
             .await
@@ -3604,7 +4472,7 @@ mod tests {
             .await
             .expect("create_user");
 
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
         // **viewer は状態を読める**（R0 §3.6 の「閲覧のみ」は「何も見えない」
         // ではない）。
         assert_eq!(
@@ -3654,7 +4522,7 @@ mod tests {
             .await
             .expect("get_by_username")
             .expect("editor exists");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
         require_collect_editor(&state)
             .await
             .expect("an editor must pass the collect operation guard");
@@ -3676,7 +4544,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
 
         let outcome = collect_start_body(&state)
             .await
@@ -3813,7 +4681,7 @@ mod tests {
             .expect("create_user");
 
         // 起動した本人（editor）には、エラーとして理由が届く。
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
         let err = collect_start_body(&state)
             .await
             .expect_err("前提が崩れている: 起動が失敗していない");
@@ -3824,7 +4692,7 @@ mod tests {
         );
 
         // viewer が状態を読む: 状態そのものは返るが、理由は返らない。
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
         let view = collect_status_body(&state)
             .await
             .expect("viewer は状態を読めること");
@@ -3888,7 +4756,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
 
         // viewer は 3 本とも読める。走っていないときの答えは
         // 「走っていない」であって「0 件」ではない。
@@ -3961,7 +4829,7 @@ mod tests {
             .await
             .expect("create_user");
 
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
         let created = plc_connections_create_body(&state, sim_payload("sim-plc", Some(true)))
             .await
             .expect("editor は作れる");
@@ -4038,7 +4906,7 @@ mod tests {
             ]
         );
 
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
         let denied =
             plc_connections_update_body(&state, created.id, sim_payload("renamed", Some(true)))
                 .await;
@@ -4077,7 +4945,7 @@ mod tests {
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(viewer));
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
         assert_eq!(
             config_exclusions_list_body(&state)
                 .await
@@ -4142,7 +5010,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
 
         let modbus = state
             .plc_connections
@@ -4227,7 +5095,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
 
         let mut ids = Vec::new();
         for (name, protocol) in [
@@ -4312,7 +5180,7 @@ mod tests {
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(editor));
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
 
         let conn = state
             .plc_connections
@@ -4421,7 +5289,7 @@ mod tests {
             .await
             .unwrap()
             .expect("verify");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(DesktopSession::Account(identity));
+        state.set_session_for_test(Some(DesktopSession::Account(identity)));
         state
     }
 
@@ -4663,7 +5531,7 @@ mod tests {
                     "{case}: other desktop session"
                 );
                 assert!(
-                    s.alice_other.auth.lock().unwrap().is_none(),
+                    s.alice_other.auth.lock().unwrap().session.is_none(),
                     "{case}: the ended desktop session is cleared"
                 );
                 // The session that changed its own password stays; for every
@@ -4755,7 +5623,10 @@ mod tests {
             !matches!(err, BantoError::Unauthorized),
             "a DB failure is not 'logged out': {err:?}"
         );
-        assert!(s.alice.auth.lock().unwrap().is_some(), "session kept");
+        assert!(
+            s.alice.auth.lock().unwrap().session.is_some(),
+            "session kept"
+        );
         assert!(
             s.admin.rest_auth.authenticate(&s.alice_rest).await.is_err(),
             "REST re-check fails too"
@@ -4795,13 +5666,13 @@ mod tests {
         config.disabled = true;
         config.disabled_role = Role::Editor;
         state.settings.set_auth_config(&config).await.unwrap();
-        *state.auth.lock().unwrap() = Some(DesktopSession::AuthDisabledLocal(UserIdentity {
+        state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(UserIdentity {
             id: LOCAL_SESSION_ID,
             username: "local".to_string(),
             display_name: "ローカルユーザー".to_string(),
             role: Role::Editor,
             auth_epoch: 0,
-        }));
+        })));
         assert_eq!(
             require_role(&state, Role::Editor, "test")
                 .await
@@ -4820,6 +5691,1831 @@ mod tests {
             require_role(&state, Role::Viewer, "test").await,
             Err(BantoError::Unauthorized)
         ));
-        assert!(state.auth.lock().unwrap().is_none(), "session cleared");
+        assert!(
+            state.auth.lock().unwrap().session.is_none(),
+            "session cleared"
+        );
+    }
+
+    // --- banto v2.0.0 移行: 認証コマンドの監査（admin-template から移植） ---
+
+    /// [`auth_config_apply_body`]'s normal (non-escape-hatch) path records a
+    /// `settings_change`/`settings` entry attributed to the admin, with an
+    /// `{authDisabled}` detail (banto M-review 2026-08 M-5).
+    #[tokio::test]
+    async fn auth_config_apply_is_recorded_as_settings_change() {
+        let state = app_state().await;
+        let admin = state
+            .users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup_first_user");
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
+
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("auth_config_apply should succeed");
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let entry = audit
+            .rows
+            .iter()
+            .find(|r| r.action == "settings_change" && r.resource == "settings")
+            .unwrap_or_else(|| panic!("expected a settings_change entry, got {:?}", audit.rows));
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.actor_role.as_deref(), Some("admin"));
+        assert_eq!(entry.entity_id, None);
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.result, "ok");
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail present"))
+                .expect("detail is json");
+        assert_eq!(detail, serde_json::json!({ "authDisabled": true }));
+    }
+
+    /// [`autologin_enable_body`] records a `settings_change`/`settings` entry
+    /// with an `{autologinEnabled,username}` detail (banto M-review 2026-08 M-5).
+    /// Installs the in-memory keyring first so `keyring_store::set_password`
+    /// does not hit the OS secret service on a headless CI runner (the Linux
+    /// leg has no D-Bus/secret-service).
+    #[tokio::test]
+    async fn autologin_enable_is_recorded_as_settings_change() {
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        let state = app_state().await;
+        let admin = state
+            .users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup_first_user");
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
+
+        autologin_enable_body(&state, "admin", "password123")
+            .await
+            .expect("autologin_enable should succeed");
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let entry = audit
+            .rows
+            .iter()
+            .find(|r| r.action == "settings_change" && r.resource == "settings")
+            .unwrap_or_else(|| panic!("expected a settings_change entry, got {:?}", audit.rows));
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.entity_id, None);
+        assert_eq!(entry.result, "ok");
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail present"))
+                .expect("detail is json");
+        assert_eq!(
+            detail,
+            serde_json::json!({ "autologinEnabled": true, "username": "admin" })
+        );
+    }
+
+    /// [`autologin_disable_body`] records a `settings_change`/`settings` entry
+    /// with an `{autologinEnabled:false}` detail (banto M-review 2026-08 M-5). No
+    /// keyring is touched: with `autologin_username` unset the delete is
+    /// skipped.
+    #[tokio::test]
+    async fn autologin_disable_is_recorded_as_settings_change() {
+        let state = app_state().await;
+        let admin = state
+            .users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup_first_user");
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
+
+        autologin_disable_body(&state)
+            .await
+            .expect("autologin_disable should succeed");
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let entry = audit
+            .rows
+            .iter()
+            .find(|r| r.action == "settings_change" && r.resource == "settings")
+            .unwrap_or_else(|| panic!("expected a settings_change entry, got {:?}", audit.rows));
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+        assert_eq!(entry.entity_id, None);
+        assert_eq!(entry.result, "ok");
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail present"))
+                .expect("detail is json");
+        assert_eq!(detail, serde_json::json!({ "autologinEnabled": false }));
+    }
+
+    // --- banto #260: the session slot's seq and compare-and-set ------------
+    //
+    // docs/session-controller-design.md §4.3/§8.3: the command BODIES are
+    // driven with their slow `.await` (verify / first-user setup / auth-mode
+    // read) held at an injected gate, so the completion order is fixed by
+    // the test, not by the scheduler.
+
+    use tokio::sync::oneshot;
+
+    const SLOT_PASSWORD: &str = "password123";
+
+    /// The test's end of a one-shot gate: `entered` resolves once the held
+    /// command reached the injected `.await`; sending on `release` lets it
+    /// continue.
+    struct Hold {
+        entered: oneshot::Receiver<()>,
+        release: oneshot::Sender<()>,
+    }
+
+    type GateSlot = Arc<Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>>;
+
+    fn gate() -> (GateSlot, Hold) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        (
+            Arc::new(Mutex::new(Some((entered_tx, release_rx)))),
+            Hold {
+                entered: entered_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    /// The FIRST caller through `gate` stops here until released; later
+    /// callers pass straight through.
+    async fn pass_gate(gate: &GateSlot) {
+        let taken = gate.lock().expect("gate mutex").take();
+        if let Some((entered, release)) = taken {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    /// Hold the first `auth_login` verification of `state`.
+    fn hold_verify(state: &mut AppState) -> Hold {
+        let (slot, hold) = gate();
+        let users = state.users.clone();
+        state.auth_io.verify = Arc::new(move |username, password| {
+            let slot = slot.clone();
+            let users = users.clone();
+            Box::pin(async move {
+                pass_gate(&slot).await;
+                users.verify(&username, &password).await
+            })
+        });
+        hold
+    }
+
+    /// Hold the first `auth_setup` account creation of `state`.
+    fn hold_setup(state: &mut AppState) -> Hold {
+        let (slot, hold) = gate();
+        let users = state.users.clone();
+        state.auth_io.setup_first_user = Arc::new(move |username, password, display_name| {
+            let slot = slot.clone();
+            let users = users.clone();
+            Box::pin(async move {
+                pass_gate(&slot).await;
+                users
+                    .setup_first_user(&username, &password, &display_name)
+                    .await
+            })
+        });
+        hold
+    }
+
+    /// Hold the first `auth_logout` auth-mode read of `state`.
+    fn hold_auth_mode(state: &mut AppState) -> Hold {
+        let (slot, hold) = gate();
+        let settings = state.settings.clone();
+        state.auth_io.auth_mode = Arc::new(move || {
+            let slot = slot.clone();
+            let settings = settings.clone();
+            Box::pin(async move {
+                pass_gate(&slot).await;
+                settings.auth_config().await
+            })
+        });
+        hold
+    }
+
+    /// Hold the `nth` (1-based) auth-mode read of `state` - whichever command
+    /// makes it - either before the settings read (`after_read: false`, the
+    /// held read sees what is stored when it is released) or after it
+    /// (`true`, the held command carries the value read BEFORE the hold).
+    fn hold_auth_mode_call(state: &mut AppState, nth: usize, after_read: bool) -> Hold {
+        let (slot, hold) = gate();
+        let settings = state.settings.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state.auth_io.auth_mode = Arc::new(move || {
+            let (slot, settings, calls) = (slot.clone(), settings.clone(), calls.clone());
+            Box::pin(async move {
+                let this = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if this != nth {
+                    return settings.auth_config().await;
+                }
+                if after_read {
+                    let config = settings.auth_config().await;
+                    pass_gate(&slot).await;
+                    config
+                } else {
+                    pass_gate(&slot).await;
+                    settings.auth_config().await
+                }
+            })
+        });
+        hold
+    }
+
+    fn is_local(session: &Option<DesktopSession>) -> bool {
+        matches!(session, Some(DesktopSession::AuthDisabledLocal(user)) if user.username == "local")
+    }
+
+    async fn audit_action_count(state: &AppState, action: &str) -> usize {
+        state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list")
+            .rows
+            .iter()
+            .filter(|row| row.action == action)
+            .count()
+    }
+
+    /// Poll `$fut` until the command reaches its gate (it must not finish
+    /// first).
+    macro_rules! run_until_held {
+        ($fut:expr, $hold:expr) => {{
+            tokio::select! {
+                biased;
+                out = &mut $fut => panic!("finished before reaching the gate: {out:?}"),
+                _ = &mut $hold.entered => {}
+            }
+        }};
+    }
+
+    fn is_account(session: &Option<DesktopSession>, username: &str) -> bool {
+        matches!(session, Some(DesktopSession::Account(user)) if user.username == username)
+    }
+
+    /// admin-template のテストが「BOOTSTRAP WINDOW」（アカウント 0 件・
+    /// セッションなしの `auth_config_apply`）で認証なしモードを入れている箇所の
+    /// 置き換え。ChronoGazer にはその経路が無い（`auth_config_apply_body` の
+    /// doc）ので、管理者アカウント `admin` を作ってそのセッションから入れる。
+    /// 結果は同じ `Local(role)` だが、監査には `logout`（管理者の、reason
+    /// `auth_disabled`。S-94 の付け替え）が 1 件増える。
+    async fn enable_local_from_an_admin_session(state: &AppState, role: &str) {
+        let admin = state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .expect("setup_first_user");
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
+        auth_config_apply_body(state, true, role)
+            .await
+            .expect("enable auth-disabled mode from the admin's session");
+        assert!(is_local(&read_slot(state).0));
+    }
+
+    /// S-16: a login whose verification is overtaken by a completed logout
+    /// must not revive a session (design §1.3 order 1).
+    #[tokio::test]
+    async fn s16_a_slow_login_does_not_undo_a_completed_logout() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .await
+            .unwrap();
+        let mut hold = hold_verify(&mut state);
+
+        let login = login_body(&state, "b".to_string(), SLOT_PASSWORD.to_string());
+        tokio::pin!(login);
+        run_until_held!(login, hold);
+
+        let logout = logout_body(&state).await.expect("logout");
+        assert_eq!(logout.seq, 1, "a logout of no session still advances seq");
+        hold.release.send(()).unwrap();
+        let result = login.await.expect("login");
+
+        assert!(!result.success);
+        assert!(result.superseded);
+        assert_eq!(result.seq, 1);
+        assert_eq!(read_slot(&state), (None, 1));
+        assert_eq!(audit_action_count(&state, "login").await, 1, "verified");
+        assert_eq!(audit_action_count(&state, "logout").await, 0);
+    }
+
+    /// S-16 (wiring): the login must compare against the seq read BEFORE its
+    /// first `.await` - any seq advance while it is held makes it superseded.
+    #[tokio::test]
+    async fn s16_login_reads_seq_before_its_first_await() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .await
+            .unwrap();
+        let mut hold = hold_verify(&mut state);
+
+        let login = login_body(&state, "b".to_string(), SLOT_PASSWORD.to_string());
+        tokio::pin!(login);
+        run_until_held!(login, hold);
+
+        let (_, seq) = read_slot(&state);
+        assert_eq!(cas_session(&state, seq, None), (true, seq + 1));
+        hold.release.send(()).unwrap();
+        let result = login.await.expect("login");
+
+        assert!(result.superseded);
+        assert_eq!(read_slot(&state), (None, seq + 1));
+    }
+
+    /// S-16 (control): the same login with nothing in between installs the
+    /// session and advances seq; a failed login leaves the slot alone.
+    #[tokio::test]
+    async fn s16_an_uncontested_login_installs_and_advances_seq() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .await
+            .unwrap();
+
+        let result = login_body(&state, "b".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+
+        assert!(result.success);
+        assert!(!result.superseded);
+        assert_eq!(result.seq, 1);
+        let (session, seq) = read_slot(&state);
+        assert_eq!(seq, 1);
+        assert!(is_account(&session, "b"));
+
+        let failed = login_body(&state, "b".to_string(), "wrong-password".to_string())
+            .await
+            .expect("login");
+        assert!(!failed.success);
+        assert!(!failed.superseded);
+        assert_eq!(failed.seq, 1, "a failed login does not touch the slot");
+    }
+
+    /// S-17: a logout whose settings read is overtaken by a completed login
+    /// must not clear that login's session, and records no `logout`.
+    #[tokio::test]
+    async fn s17_a_slow_logout_does_not_clear_a_later_login() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("b", SLOT_PASSWORD, "B")
+            .await
+            .unwrap();
+        let mut hold = hold_auth_mode(&mut state);
+
+        let logout = logout_body(&state);
+        tokio::pin!(logout);
+        run_until_held!(logout, hold);
+
+        let login = login_body(&state, "b".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        assert!(login.success);
+        hold.release.send(()).unwrap();
+        let result = logout.await.expect("logout");
+
+        assert_eq!(
+            result.seq, login.seq,
+            "the overtaken logout changes nothing"
+        );
+        let (session, seq) = read_slot(&state);
+        assert_eq!(seq, login.seq);
+        assert!(is_account(&session, "b"));
+        assert_eq!(audit_action_count(&state, "logout").await, 0);
+    }
+
+    /// S-17 (wiring): the logout compares against the seq read before its
+    /// first `.await` - a re-bind while it is held (even to the same
+    /// account) keeps the session.
+    #[tokio::test]
+    async fn s17_logout_reads_seq_before_its_first_await() {
+        let mut state = app_state().await;
+        let a = state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(a.clone())));
+        let mut hold = hold_auth_mode(&mut state);
+
+        let logout = logout_body(&state);
+        tokio::pin!(logout);
+        run_until_held!(logout, hold);
+
+        let (_, seq) = read_slot(&state);
+        let rebound = Some(DesktopSession::Account(a));
+        assert_eq!(cas_session(&state, seq, rebound.clone()), (true, seq + 1));
+        hold.release.send(()).unwrap();
+        let result = logout.await.expect("logout");
+
+        assert_eq!(result.seq, seq + 1);
+        assert_eq!(read_slot(&state), (rebound, seq + 1));
+    }
+
+    /// S-17 (control): an uncontested logout clears, advances seq, and is
+    /// audited.
+    #[tokio::test]
+    async fn s17_an_uncontested_logout_clears_and_advances_seq() {
+        let state = app_state().await;
+        let a = state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(a)));
+
+        let result = logout_body(&state).await.expect("logout");
+
+        assert_eq!(result.seq, 2);
+        assert_eq!(read_slot(&state), (None, 2));
+        assert_eq!(audit_action_count(&state, "logout").await, 1);
+    }
+
+    /// S-18: `auth_setup` overtaken by a completed logout: the account is
+    /// created, the session is not installed.
+    #[tokio::test]
+    async fn s18_a_slow_setup_does_not_undo_a_completed_logout() {
+        let mut state = app_state().await;
+        let mut hold = hold_setup(&mut state);
+
+        let setup = setup_body(
+            &state,
+            "b".to_string(),
+            SLOT_PASSWORD.to_string(),
+            "B".to_string(),
+        );
+        tokio::pin!(setup);
+        run_until_held!(setup, hold);
+
+        logout_body(&state).await.expect("logout");
+        hold.release.send(()).unwrap();
+        let result = setup.await.expect("setup");
+
+        assert!(!result.success);
+        assert!(result.superseded);
+        assert_eq!(read_slot(&state), (None, 1));
+        assert!(state.users.is_initialized().await.unwrap());
+        assert!(state.users.get_by_username("b").await.unwrap().is_some());
+    }
+
+    /// S-19: a logout overtaken by a completed `auth_setup` keeps the setup's
+    /// session.
+    #[tokio::test]
+    async fn s19_a_slow_logout_does_not_clear_a_later_setup() {
+        let mut state = app_state().await;
+        let mut hold = hold_auth_mode(&mut state);
+
+        let logout = logout_body(&state);
+        tokio::pin!(logout);
+        run_until_held!(logout, hold);
+
+        let setup = setup_body(
+            &state,
+            "b".to_string(),
+            SLOT_PASSWORD.to_string(),
+            "B".to_string(),
+        )
+        .await
+        .expect("setup");
+        assert!(setup.success);
+        hold.release.send(()).unwrap();
+        let result = logout.await.expect("logout");
+
+        assert_eq!(result.seq, setup.seq);
+        assert!(is_account(&read_slot(&state).0, "b"));
+    }
+
+    /// S-54: re-resolving the same session - including after a display-name
+    /// edit (a refresh of the same binding) - never advances seq.
+    #[tokio::test]
+    async fn s54_resolving_the_same_session_does_not_advance_seq() {
+        let state = app_state().await;
+        let a = state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+
+        for _ in 0..3 {
+            let answer = resolve_body(&state).await.expect("resolve");
+            assert!(!answer.stale);
+            assert_eq!((answer.checked, answer.current), (login.seq, login.seq));
+            assert_eq!(answer.kind, Some("account"));
+            assert_eq!(answer.identity.expect("active").name, "A");
+        }
+
+        state
+            .users
+            .update_user(a.id, "A（改名）", Role::Admin)
+            .await
+            .unwrap();
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert!(!answer.stale);
+        assert_eq!((answer.checked, answer.current), (login.seq, login.seq));
+        assert_eq!(answer.identity.expect("still active").name, "A（改名）");
+        assert_eq!(read_slot(&state).1, login.seq);
+    }
+
+    /// S-64: a role change advances `auth_epoch` (ADR-0014), so the next
+    /// resolve reports no session and advances seq (the clear) - unlike the
+    /// display-name refresh of S-54.
+    #[tokio::test]
+    async fn s64_a_role_change_resolves_to_none_and_advances_seq() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("owner", SLOT_PASSWORD, "オーナー")
+            .await
+            .unwrap();
+        let a = state
+            .users
+            .create_user("a", SLOT_PASSWORD, "A", Role::Editor)
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        assert!(resolve_body(&state).await.unwrap().identity.is_some());
+
+        state
+            .users
+            .update_user(a.id, "A", Role::Viewer)
+            .await
+            .unwrap();
+        let answer = resolve_body(&state).await.expect("resolve");
+
+        assert!(!answer.stale);
+        assert!(answer.identity.is_none(), "not the new role's session");
+        assert_eq!(answer.kind, None);
+        assert_eq!(answer.checked, login.seq);
+        assert_eq!(answer.current, login.seq + 1, "this call cleared it");
+        assert_eq!(read_slot(&state), (None, login.seq + 1));
+    }
+
+    /// S-77 (Rust half): a settle whose slot was re-bound after its entry
+    /// read writes nothing and reports `Stale`; `auth_resolve` of no session
+    /// answers `checked == current`.
+    #[tokio::test]
+    async fn s77_a_settle_overtaken_by_a_rebind_writes_nothing() {
+        let state = app_state().await;
+        let empty = resolve_body(&state).await.expect("resolve");
+        assert!(empty.identity.is_none() && !empty.stale);
+        assert_eq!((empty.checked, empty.current), (0, 0));
+
+        let a = state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(a)));
+        let (cached, seq_at_entry) = read_slot(&state);
+        let cached = cached.unwrap();
+        let fresh = read_session_source(&state, &cached).await.unwrap();
+        // Another command re-binds the slot while the read was "in flight".
+        assert!(cas_session(&state, seq_at_entry, None).0);
+
+        assert!(matches!(
+            settle_session(&state, &cached, fresh, seq_at_entry),
+            Settled::Stale { valid_now: None }
+        ));
+        assert_eq!(read_slot(&state), (None, seq_at_entry + 1));
+    }
+
+    /// S-47 / S-67: auth-disabled mode's synthetic session resolves as
+    /// `kind: "local"` with the mode's CURRENT role, and its logout is a
+    /// no-op that does not advance seq.
+    #[tokio::test]
+    async fn s47_s67_the_auth_disabled_session_resolves_local_and_logout_keeps_seq() {
+        let state = app_state().await;
+        let set_mode = |role: Role| {
+            let settings = state.settings.clone();
+            async move {
+                let config = settings.auth_config().await.unwrap();
+                settings
+                    .set_auth_config(&AuthSettings {
+                        disabled: true,
+                        disabled_role: role,
+                        ..config
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        set_mode(Role::Viewer).await;
+        state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(UserIdentity {
+            id: LOCAL_SESSION_ID,
+            username: "local".to_string(),
+            display_name: "ローカルユーザー".to_string(),
+            role: Role::Viewer,
+            auth_epoch: 0,
+        })));
+        let (_, seq) = read_slot(&state);
+
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert_eq!(answer.kind, Some("local"));
+        assert_eq!(answer.identity.expect("active").role, "viewer");
+        set_mode(Role::Editor).await;
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert_eq!(answer.kind, Some("local"));
+        assert_eq!(answer.identity.expect("active").role, "editor");
+        assert_eq!((answer.checked, answer.current), (seq, seq));
+
+        let logout = logout_body(&state).await.expect("logout");
+        assert_eq!(logout.seq, seq, "S-67: the no-op does not advance seq");
+        assert!(read_slot(&state).0.is_some());
+    }
+
+    /// S-68: a self-service password change re-binds the session and
+    /// advances seq; the result carries the new seq.
+    #[tokio::test]
+    async fn s68_change_password_rebinds_and_advances_seq() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+
+        let result = change_own_password(&state, SLOT_PASSWORD, "newpassword1")
+            .await
+            .expect("change password");
+
+        assert_eq!(result.seq, login.seq + 1);
+        let (session, seq) = read_slot(&state);
+        assert_eq!(seq, result.seq);
+        assert!(matches!(session, Some(DesktopSession::Account(ref u)) if u.auth_epoch == 1));
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert_eq!((answer.checked, answer.current), (result.seq, result.seq));
+        assert!(answer.identity.is_some());
+    }
+
+    // admin-template の `drive_until!` は、移植しなかった
+    // `s67_config_apply_installs_local_after_a_logout_advanced_seq` だけが使う
+    // ので持ってこない。
+
+    /// Poll `$fut` for a while and assert it is still pending (waiting on
+    /// `auth_config_lock`).
+    macro_rules! assert_stays_pending {
+        ($fut:expr) => {{
+            for _ in 0..30 {
+                tokio::select! {
+                    biased;
+                    out = &mut $fut => panic!("expected to wait, but finished: {out:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }};
+    }
+
+    /// Hold the first `auth_config_apply` of `state` right AFTER its settings
+    /// save (the apply still holds `auth_config_lock`).
+    fn hold_after_save(state: &mut AppState) -> Hold {
+        let (slot, hold) = gate();
+        let settings = state.settings.clone();
+        state.auth_io.save_auth_config = Arc::new(move |config| {
+            let (slot, settings) = (slot.clone(), settings.clone());
+            Box::pin(async move {
+                settings.set_auth_config(&config).await?;
+                pass_gate(&slot).await;
+                Ok(())
+            })
+        });
+        hold
+    }
+
+    /// Auth-mode reads for a logout that races an `apply(true)`: the FIRST
+    /// read returns what is stored (`disabled = false`) and then stores
+    /// `disabled = true` - an apply(true) that completed right after it -
+    /// and the SECOND read (the logout's post-clear re-read, under
+    /// `auth_config_lock`) is held before reading. Later reads pass.
+    fn mode_turned_on_after_first_read_and_reread_held(state: &mut AppState) -> Hold {
+        let (slot, hold) = gate();
+        let settings = state.settings.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state.auth_io.auth_mode = Arc::new(move || {
+            let (slot, settings, calls) = (slot.clone(), settings.clone(), calls.clone());
+            Box::pin(async move {
+                match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => {
+                        let config = settings.auth_config().await?;
+                        settings
+                            .set_auth_config(&AuthSettings {
+                                disabled: true,
+                                ..config.clone()
+                            })
+                            .await?;
+                        Ok(config)
+                    }
+                    1 => {
+                        pass_gate(&slot).await;
+                        settings.auth_config().await
+                    }
+                    _ => settings.auth_config().await,
+                }
+            })
+        });
+        hold
+    }
+
+    // admin-template の `s67_config_apply_installs_local_after_a_logout_advanced_seq`
+    // は移植しない: 「セッションなし・アカウント 0 件の `auth_config_apply`」
+    // （BOOTSTRAP WINDOW）から始まる順序で、ChronoGazer ではその apply が
+    // `Unauthorized` になり到達できない。アカウントのセッションから始めても、
+    // 先に完了した logout がそのセッションを消すので apply は `Unauthorized`
+    // （正しい拒否）になり、同じ順序は作れない。
+
+    /// S-67 / banto PR #264 review P1 (ii), updated by the owner review of banto #266
+    /// P1: a logout reads the OLD `disabled = false` and is held;
+    /// `auth_config_apply` then switches the mode on while A's session is
+    /// still there - and re-binds it to the synthetic session right away
+    /// (`seq` + 1). The logout resumes: its compare-and-set no longer holds,
+    /// so it changes nothing. Disabled mode never ends with no session, nor
+    /// with A's.
+    #[tokio::test]
+    async fn s67_a_logout_that_read_the_old_mode_is_overtaken_by_the_apply_rebind() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        assert!(login.success);
+        // Call 1 = the logout's first mode read (held AFTER reading false).
+        let mut hold = hold_auth_mode_call(&mut state, 1, true);
+
+        let logout = logout_body(&state);
+        tokio::pin!(logout);
+        run_until_held!(logout, hold);
+
+        let config = auth_config_apply_body(&state, true, "editor")
+            .await
+            .expect("apply");
+        assert!(config.disabled);
+        assert!(
+            is_local(&read_slot(&state).0),
+            "the apply re-bound A's session"
+        );
+        hold.release.send(()).unwrap();
+        let result = logout.await.expect("logout");
+
+        let (session, seq) = read_slot(&state);
+        let Some(DesktopSession::AuthDisabledLocal(local)) = session else {
+            panic!("expected the synthetic session: {session:?}")
+        };
+        assert_eq!(local.role, Role::Editor);
+        assert_eq!(local.id, LOCAL_SESSION_ID);
+        assert_eq!(
+            seq,
+            login.seq + 1,
+            "the rebind only; the logout wrote nothing"
+        );
+        assert_eq!(result.seq, seq, "the logout reports the final seq");
+        assert_eq!(
+            audit_action_count(&state, "logout").await,
+            1,
+            "A's session end by the rebind (reason auth_disabled), none by the logout"
+        );
+        assert_eq!(
+            audit_action_count(&state, "login").await,
+            2,
+            "A's login + one synthetic login"
+        );
+    }
+
+    /// The audit rows for `action` (any order), as `(actor, detail)`.
+    async fn audit_rows(state: &AppState, action: &str) -> Vec<(Option<String>, Option<String>)> {
+        state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list")
+            .rows
+            .into_iter()
+            .filter(|row| row.action == action)
+            .map(|row| (row.actor_username, row.detail))
+            .collect()
+    }
+
+    /// S-94 (owner review of banto #266 P1, design §5.3): an admin signed in with an
+    /// account turns auth-disabled mode on from the settings screen. The
+    /// apply re-binds the slot to the synthetic session with the new role in
+    /// the same step as the save (`seq` + 1), and records the account's
+    /// session end (`logout`, reason `auth_disabled`) and the synthetic
+    /// `login`. `auth_resolve` then answers `kind: "local"` with that role -
+    /// `auth.disabled == true` never goes with an account session.
+    #[tokio::test]
+    async fn s94_config_apply_true_rebinds_an_account_session_to_local() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        let login = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        assert!(login.success);
+        assert!(is_account(&read_slot(&state).0, "admin"));
+
+        let config = auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("apply");
+        assert!(config.disabled);
+
+        let (session, seq) = read_slot(&state);
+        let Some(DesktopSession::AuthDisabledLocal(local)) = session else {
+            panic!("expected the synthetic session: {session:?}")
+        };
+        assert_eq!(local.role, Role::Viewer);
+        assert_eq!(seq, login.seq + 1, "Account -> Local advances seq once");
+
+        let logouts = audit_rows(&state, "logout").await;
+        assert_eq!(logouts.len(), 1);
+        assert_eq!(logouts[0].0.as_deref(), Some("admin"));
+        let detail: serde_json::Value =
+            serde_json::from_str(logouts[0].1.as_deref().expect("detail")).unwrap();
+        assert_eq!(detail, serde_json::json!({ "reason": "auth_disabled" }));
+        let logins = audit_rows(&state, "login").await;
+        assert_eq!(logins.len(), 2, "the admin's login + the synthetic login");
+        assert!(
+            logins
+                .iter()
+                .any(|(actor, detail)| actor.as_deref() == Some("local")
+                    && detail
+                        .as_deref()
+                        .is_some_and(|d| d.contains("auth_disabled"))),
+            "{logins:?}"
+        );
+        assert_eq!(audit_action_count(&state, "settings_change").await, 1);
+
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert_eq!(answer.kind, Some("local"));
+        assert_eq!(answer.identity.expect("active").role, "viewer");
+        assert_eq!((answer.checked, answer.current), (seq, seq));
+    }
+
+    /// S-94/S-96: applying `disabled = true` again while the synthetic
+    /// session is already there: with the same role nothing is written and
+    /// `seq` does not move; with another role the role is written and `seq`
+    /// advances (an authorization-context change, re-review of banto #266 P1). No
+    /// session audit either way (the apply's `settings_change` records it).
+    #[tokio::test]
+    async fn s96_config_apply_true_again_keeps_seq_for_the_same_role_and_advances_it_for_another() {
+        let state = app_state().await;
+        enable_local_from_an_admin_session(&state, "admin").await;
+        let (session, seq) = read_slot(&state);
+        assert!(is_local(&session));
+        let logins = audit_action_count(&state, "login").await;
+        let logouts = audit_action_count(&state, "logout").await;
+
+        auth_config_apply_body(&state, true, "admin")
+            .await
+            .expect("same apply");
+        assert_eq!(
+            read_slot(&state),
+            (session, seq),
+            "same role: nothing written"
+        );
+
+        auth_config_apply_body(&state, true, "editor")
+            .await
+            .expect("role change");
+        let (session, seq_after) = read_slot(&state);
+        assert_eq!(seq_after, seq + 1, "another role: seq advances");
+        let Some(DesktopSession::AuthDisabledLocal(local)) = session else {
+            panic!("{session:?}")
+        };
+        assert_eq!(local.role, Role::Editor);
+        assert_eq!(audit_action_count(&state, "login").await, logins);
+        assert_eq!(audit_action_count(&state, "logout").await, logouts);
+        assert_eq!(audit_action_count(&state, "settings_change").await, 3);
+    }
+
+    /// S-96 (re-review of banto #266 P1): an `auth_resolve` of Local(admin) reads
+    /// the slot and the store (role admin) and is held; the role is changed
+    /// to viewer meanwhile; the held resolve then settles. The role change
+    /// advanced `seq`, so the settle is `Stale` and writes nothing - it does
+    /// not put admin back over viewer - and the next resolve answers viewer.
+    /// The steps are `resolve_body`'s own, run one by one (as in S-77).
+    #[tokio::test]
+    async fn s96_a_resolve_that_read_the_old_local_role_does_not_write_it_back() {
+        let state = app_state().await;
+        enable_local_from_an_admin_session(&state, "admin").await;
+
+        // The old resolve: slot and store read (admin), then held.
+        let (cached, seq_at_entry) = read_slot(&state);
+        let cached = cached.expect("Local(admin)");
+        let fresh = read_session_source(&state, &cached).await.unwrap();
+        assert!(matches!(
+            &fresh,
+            Some(DesktopSession::AuthDisabledLocal(local)) if local.role == Role::Admin
+        ));
+
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("role change");
+        assert_eq!(read_slot(&state).1, seq_at_entry + 1);
+
+        assert!(matches!(
+            settle_session(&state, &cached, fresh, seq_at_entry),
+            Settled::Stale { .. }
+        ));
+        let Some(DesktopSession::AuthDisabledLocal(local)) = read_slot(&state).0 else {
+            panic!("expected Local")
+        };
+        assert_eq!(local.role, Role::Viewer, "admin was not written back");
+
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert!(!answer.stale);
+        assert_eq!(answer.kind, Some("local"));
+        assert_eq!(answer.identity.expect("active").role, "viewer");
+    }
+
+    /// S-103 (freshness audit of banto #266, P2-2): the generic `settings_set`
+    /// refuses the `auth.` keys (only `auth_config_apply` / `autologin_*`
+    /// write them, with the session re-bind); other keys still work.
+    #[tokio::test]
+    async fn s103_settings_set_refuses_auth_keys() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        let admin = state.users.get_by_username("admin").await.unwrap().unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(admin.clone())));
+        let before = read_slot(&state);
+        for key in [
+            "auth.disabled",
+            "auth.disabled_role",
+            "auth.autologin.enabled",
+        ] {
+            let result =
+                settings_set_body(&state, &admin, key.to_string(), "true".to_string()).await;
+            assert!(
+                matches!(result, Err(BantoError::BadRequest(_))),
+                "{key}: {result:?}"
+            );
+        }
+        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert_eq!(read_slot(&state), before);
+        settings_set_body(
+            &state,
+            &admin,
+            "audit.retention_days".to_string(),
+            "30".to_string(),
+        )
+        .await
+        .expect("a non-auth key");
+    }
+
+    /// Replace `auth_config_apply`'s save with one that stores only
+    /// `auth.disabled` and then fails (a save interrupted part-way).
+    fn save_fails_after_the_mode(state: &mut AppState) {
+        let settings = state.settings.clone();
+        state.auth_io.save_auth_config = Arc::new(move |config| {
+            let settings = settings.clone();
+            Box::pin(async move {
+                settings
+                    .set(
+                        "auth.disabled",
+                        if config.disabled { "true" } else { "false" },
+                    )
+                    .await?;
+                Err(BantoError::Storage("disk full (test)".to_string()))
+            })
+        });
+    }
+
+    /// S-104 (freshness audit of banto #266, P2-3): a save that stored the mode and
+    /// then failed still leaves the session following what is stored -
+    /// apply(true) over an account session re-binds it to Local; apply(false)
+    /// over Local ends it - and the error is reported.
+    #[tokio::test]
+    async fn s104_a_save_failing_part_way_still_rebinds_the_session_to_what_is_stored() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(
+            state.users.get_by_username("admin").await.unwrap().unwrap(),
+        )));
+        save_fails_after_the_mode(&mut state);
+        let (_, seq) = read_slot(&state);
+
+        let result = auth_config_apply_body(&state, true, "admin").await;
+        assert!(matches!(result, Err(BantoError::Storage(_))), "{result:?}");
+        assert!(state.settings.auth_config().await.unwrap().disabled);
+        let (session, seq_on) = read_slot(&state);
+        assert!(is_local(&session), "follows disabled = true: {session:?}");
+        assert_eq!(seq_on, seq + 1);
+
+        let result = auth_config_apply_body(&state, false, "admin").await;
+        assert!(result.is_err());
+        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert_eq!(
+            read_slot(&state),
+            (None, seq_on + 1),
+            "follows disabled = false"
+        );
+    }
+
+    /// S-102 (freshness audit of banto #266, P3-2): a check that read Local(admin)
+    /// and is overtaken by apply(true, viewer) reports, for the ordinary
+    /// commands, the slot's CURRENT session (viewer) - not its older read.
+    #[tokio::test]
+    async fn s102_a_stale_settle_reports_the_slot_value_not_the_older_read() {
+        let state = app_state().await;
+        enable_local_from_an_admin_session(&state, "admin").await;
+        let (cached, seq_at_entry) = read_slot(&state);
+        let cached = cached.expect("Local(admin)");
+        let fresh = read_session_source(&state, &cached).await.unwrap();
+
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("role change");
+
+        let Settled::Stale {
+            valid_now: Some(DesktopSession::AuthDisabledLocal(local)),
+        } = settle_session(&state, &cached, fresh, seq_at_entry)
+        else {
+            panic!("expected Stale with the current Local session")
+        };
+        assert_eq!(local.role, Role::Viewer);
+    }
+
+    /// Hardening (freshness audit of banto #266, P2-2): `false -> true` advances
+    /// `seq` even if the slot somehow already holds Local with that role.
+    ///
+    /// admin-template はこれを BOOTSTRAP WINDOW の `auth_config_apply` で
+    /// 確かめるが、ChronoGazer ではモードがオフの間 `Local` のセッションは
+    /// `require_role` の照合で消える（`Unauthorized`）ので、その apply には
+    /// 到達できない。判定そのもの（apply が保存の直後に呼ぶ
+    /// [`apply_mode_to_session`]）を直接確かめる。
+    #[tokio::test]
+    async fn s98_turning_the_mode_on_always_advances_seq() {
+        let state = app_state().await;
+        state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(local_identity(
+            Role::Admin,
+        ))));
+        let (_, seq) = read_slot(&state);
+        let previous = AuthSettings {
+            disabled: false,
+            disabled_role: Role::Admin,
+            ..AuthSettings::default()
+        };
+        let saved = AuthSettings {
+            disabled: true,
+            ..previous.clone()
+        };
+        let (rebind, ended) = apply_mode_to_session(&state, &previous, &saved);
+        assert_eq!(rebind, LocalRebind::RoleChanged);
+        assert!(ended.is_none());
+        assert_eq!(read_slot(&state).1, seq + 1);
+
+        // Control: the same Local with nothing changed in the save keeps seq.
+        let (rebind, _) = apply_mode_to_session(&state, &saved, &saved);
+        assert_eq!(rebind, LocalRebind::Unchanged);
+        assert_eq!(read_slot(&state).1, seq + 1);
+    }
+
+    /// S-98 (re-review of banto #266 P1): between `auth_config_apply`'s save and
+    /// its rebind, another `auth_resolve` (B) reads the new role from the
+    /// store and refreshes the slot to it - without advancing `seq` (a
+    /// settle's refresh never does, I-23). The rebind then finds the new role
+    /// already there, but the role DID change in this apply (decided from
+    /// the settings before the save), so it still advances `seq`. An even
+    /// older resolve (A) that had read the old role therefore settles
+    /// `Stale` and does not write admin back.
+    #[tokio::test]
+    async fn s98_a_role_change_advances_seq_even_if_a_settle_refreshed_the_slot_first() {
+        let mut state = app_state().await;
+        // Local(admin): the mode on with role admin, and its synthetic session.
+        let config = state.settings.auth_config().await.unwrap();
+        state
+            .settings
+            .set_auth_config(&AuthSettings {
+                disabled: true,
+                disabled_role: Role::Admin,
+                ..config
+            })
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(local_identity(
+            Role::Admin,
+        ))));
+        let mut hold = hold_after_save(&mut state);
+
+        // Resolve A: slot and store read (admin), then held.
+        let (cached_a, seq_n) = read_slot(&state);
+        let cached_a = cached_a.expect("Local(admin)");
+        let fresh_a = read_session_source(&state, &cached_a).await.unwrap();
+
+        // apply(true, viewer): held after its save, before its rebind.
+        let apply = auth_config_apply_body(&state, true, "viewer");
+        tokio::pin!(apply);
+        run_until_held!(apply, hold);
+
+        // Resolve B runs whole: it reads viewer from the store and refreshes.
+        let b = resolve_body(&state).await.expect("resolve B");
+        assert_eq!(b.identity.expect("active").role, "viewer");
+        assert_eq!((b.checked, b.current), (seq_n, seq_n), "a refresh: no seq");
+        assert_eq!(read_slot(&state).1, seq_n);
+
+        hold.release.send(()).unwrap();
+        apply.await.expect("apply");
+        assert_eq!(
+            read_slot(&state).1,
+            seq_n + 1,
+            "the role change advanced seq anyway"
+        );
+
+        assert!(matches!(
+            settle_session(&state, &cached_a, fresh_a, seq_n),
+            Settled::Stale { .. }
+        ));
+        let Some(DesktopSession::AuthDisabledLocal(local)) = read_slot(&state).0 else {
+            panic!("expected Local")
+        };
+        assert_eq!(local.role, Role::Viewer, "admin was not written back");
+    }
+
+    /// S-99 (re-review of banto #266 P1): an `auth_resolve` that read Local(admin)
+    /// and `disabled = true` is held; `auth_config_apply(false)` then ends the
+    /// synthetic session in the same step as its save (`None`, `seq` + 1) and
+    /// records its end (`logout`, reason `auth_enabled`). The held resolve
+    /// settles `Stale` (it does not confirm `local` under `disabled = false`),
+    /// and the next resolve answers `none`.
+    #[tokio::test]
+    async fn s99_config_apply_false_ends_local_at_once_and_an_old_resolve_is_stale() {
+        let state = app_state().await;
+        enable_local_from_an_admin_session(&state, "admin").await;
+        let (cached, seq_n) = read_slot(&state);
+        let cached = cached.expect("Local(admin)");
+        let fresh = read_session_source(&state, &cached).await.unwrap();
+        assert!(fresh.is_some(), "read while the mode was on");
+
+        auth_config_apply_body(&state, false, "admin")
+            .await
+            .expect("disable");
+        assert_eq!(read_slot(&state), (None, seq_n + 1));
+        // The admin's session end when the mode was turned on is the other
+        // `logout` (reason `auth_disabled`, see
+        // `enable_local_from_an_admin_session`); only Local's is asserted.
+        let logouts: Vec<_> = audit_rows(&state, "logout")
+            .await
+            .into_iter()
+            .filter(|(actor, _)| actor.as_deref() == Some("local"))
+            .collect();
+        assert_eq!(logouts.len(), 1);
+        let detail: serde_json::Value =
+            serde_json::from_str(logouts[0].1.as_deref().expect("detail")).unwrap();
+        assert_eq!(detail, serde_json::json!({ "reason": "auth_enabled" }));
+
+        assert!(matches!(
+            settle_session(&state, &cached, fresh, seq_n),
+            Settled::Stale { .. }
+        ));
+        assert_eq!(read_slot(&state), (None, seq_n + 1));
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert!(answer.identity.is_none());
+        assert!(!answer.stale);
+        assert_eq!((answer.checked, answer.current), (seq_n + 1, seq_n + 1));
+    }
+
+    /// S-99: re-saving `disabled = false` (the mode already off) touches
+    /// nothing: `seq` unchanged, no session audit.
+    #[tokio::test]
+    async fn s99_config_apply_false_again_is_a_no_op_for_the_session() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        let login = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        assert!(login.success);
+        let before = read_slot(&state);
+
+        auth_config_apply_body(&state, false, "admin")
+            .await
+            .expect("re-save false");
+        assert_eq!(read_slot(&state), before);
+        assert!(is_account(&before.0, "admin"));
+        assert_eq!(audit_action_count(&state, "logout").await, 0);
+    }
+
+    /// S-94/S-95: a login starts (reads `seq = N`) and is held in its
+    /// password check; the mode is switched on meanwhile (the admin's account
+    /// session re-bound to Local, `seq = N + 1`); the login then completes.
+    /// Its install checks the mode under `auth_config_lock` and refuses - no
+    /// account session in auth-disabled mode (and its compare-and-set would
+    /// not hold either). The synthetic session stays; `seq` does not move.
+    #[tokio::test]
+    async fn s95_a_login_whose_check_was_overtaken_by_apply_true_is_refused() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(
+            state.users.get_by_username("admin").await.unwrap().unwrap(),
+        )));
+        let (_, seq_before) = read_slot(&state);
+        let mut hold = hold_verify(&mut state);
+
+        let login = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string());
+        tokio::pin!(login);
+        run_until_held!(login, hold);
+
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("apply");
+        assert_eq!(read_slot(&state).1, seq_before + 1);
+        hold.release.send(()).unwrap();
+        let result = login.await.expect("login");
+
+        assert!(!result.success);
+        assert!(!result.superseded, "refused by the mode, not a lost race");
+        assert_eq!(result.error.as_deref(), Some(AUTH_DISABLED_LOGIN_MESSAGE));
+        let (session, seq) = read_slot(&state);
+        assert!(
+            is_local(&session),
+            "Local is not turned back into the account: {session:?}"
+        );
+        assert_eq!(seq, seq_before + 1);
+        assert_eq!(result.seq, seq);
+    }
+
+    /// S-95: `auth_login` while auth-disabled mode is on is refused before the
+    /// password check: the slot stays Local, `seq` does not move, and nothing
+    /// is recorded (no credential was checked).
+    #[tokio::test]
+    async fn s95_login_in_auth_disabled_mode_is_refused_before_the_check() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(
+            state.users.get_by_username("admin").await.unwrap().unwrap(),
+        )));
+        auth_config_apply_body(&state, true, "editor")
+            .await
+            .expect("apply");
+        let before = read_slot(&state);
+        let logins = audit_action_count(&state, "login").await;
+
+        let result = login_body(&state, "admin".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+
+        assert!(!result.success);
+        assert!(!result.superseded);
+        assert_eq!(result.error.as_deref(), Some(AUTH_DISABLED_LOGIN_MESSAGE));
+        assert_eq!(result.seq, before.1);
+        assert_eq!(read_slot(&state), before);
+        assert!(is_local(&before.0));
+        assert_eq!(audit_action_count(&state, "login").await, logins);
+        assert_eq!(audit_action_count(&state, "login_failed").await, 0);
+    }
+
+    /// S-95: `auth_setup` while auth-disabled mode is on (the first-run
+    /// 「ログインなしで使い始める」 already chosen) is refused on entry and
+    /// creates no account.
+    #[tokio::test]
+    async fn s95_setup_in_auth_disabled_mode_creates_no_account() {
+        let state = app_state().await;
+        // ChronoGazer has no bootstrap window: with no account yet, the mode
+        // and its synthetic session are set up directly (as `run()`'s
+        // bootstrap would on a launch with `auth.disabled = true`).
+        let config = state.settings.auth_config().await.unwrap();
+        state
+            .settings
+            .set_auth_config(&AuthSettings {
+                disabled: true,
+                ..config
+            })
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(local_identity(
+            Role::Admin,
+        ))));
+        let before = read_slot(&state);
+        assert!(is_local(&before.0));
+
+        let result = setup_body(
+            &state,
+            "b".to_string(),
+            SLOT_PASSWORD.to_string(),
+            "B".to_string(),
+        )
+        .await
+        .expect("setup");
+
+        assert!(!result.success);
+        assert!(!result.superseded);
+        assert_eq!(result.error.as_deref(), Some(AUTH_DISABLED_LOGIN_MESSAGE));
+        assert_eq!(read_slot(&state), before);
+        assert!(
+            !state.users.is_initialized().await.unwrap(),
+            "no account created"
+        );
+        assert_eq!(audit_action_count(&state, "setup").await, 0);
+    }
+
+    // admin-template の `s95_a_setup_overtaken_by_apply_true_keeps_the_account_but_installs_nothing`
+    // は移植しない: 割り込む `auth_config_apply(true)` が BOOTSTRAP WINDOW
+    // （アカウント 0 件・セッションなし）頼み。ChronoGazer ではアカウント 0 件の
+    // 間にモードを入れる apply は、セッションが無いので `Unauthorized`、既に
+    // モードがオンなら `setup` が入口で断る
+    // （`s95_setup_in_auth_disabled_mode_creates_no_account`）ので、この順序は
+    // 起きない。
+
+    /// banto PR #264 review P1 / re-review P2: a logout whose first read saw
+    /// `disabled = false` (and after which the mode was switched on) clears
+    /// A and re-reads the mode under `auth_config_lock`; an
+    /// `auth_config_apply(true)` started meanwhile waits for that lock. The
+    /// logout installs the synthetic session, and the apply - seeing it -
+    /// does not install again: one `seq` step, one synthetic `login`.
+    #[tokio::test]
+    async fn s67_config_apply_and_logout_install_local_only_once() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        let mut hold = mode_turned_on_after_first_read_and_reread_held(&mut state);
+
+        let logout = logout_body(&state);
+        tokio::pin!(logout);
+        run_until_held!(logout, hold);
+        assert_eq!(read_slot(&state), (None, login.seq + 1), "A is cleared");
+
+        let apply = auth_config_apply_body(&state, true, "admin");
+        tokio::pin!(apply);
+        assert_stays_pending!(apply);
+        hold.release.send(()).unwrap();
+        let result = logout.await.expect("logout");
+        assert!(is_local(&read_slot(&state).0), "the logout installed");
+        assert_eq!(result.seq, login.seq + 2);
+        apply.await.expect("apply");
+
+        let (session, seq) = read_slot(&state);
+        assert!(is_local(&session), "{session:?}");
+        assert_eq!(seq, login.seq + 2, "installed once");
+        assert_eq!(
+            audit_action_count(&state, "login").await,
+            2,
+            "A's login + one synthetic login"
+        );
+    }
+
+    /// banto PR #264 re-review P2 (a): `apply(true)` has saved and is still inside
+    /// its decision (held after the save, `auth_config_lock` held) when an
+    /// `apply(false)` starts. The second apply waits for the first to finish
+    /// - it cannot save `false` between the first one's save and its install
+    /// - so the install is based on the value still stored, and the final
+    /// `disabled = false` is saved after it. Since S-99 that `apply(false)`
+    /// ends the local session itself, in the same step as its save.
+    #[tokio::test]
+    async fn config_apply_true_then_false_are_serialized_by_the_auth_config_lock() {
+        let mut state = app_state().await;
+        // admin-template starts from no session (bootstrap window); here the
+        // first apply is an admin's, so the slot starts at `Account`, seq 1.
+        let admin = state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
+        let mut hold = hold_after_save(&mut state);
+
+        let apply_on = auth_config_apply_body(&state, true, "admin");
+        tokio::pin!(apply_on);
+        run_until_held!(apply_on, hold);
+
+        let apply_off = auth_config_apply_body(&state, false, "admin");
+        tokio::pin!(apply_off);
+        assert_stays_pending!(apply_off);
+        assert!(
+            state.settings.auth_config().await.unwrap().disabled,
+            "apply(false) is waiting: it has not saved"
+        );
+        let (session, seq) = read_slot(&state);
+        assert!(
+            is_account(&session, "admin"),
+            "not re-bound yet: {session:?}"
+        );
+        assert_eq!(seq, 1);
+
+        hold.release.send(()).unwrap();
+        apply_on.await.expect("apply(true)");
+        assert!(
+            is_local(&read_slot(&state).0),
+            "installed under disabled = true"
+        );
+        let config = apply_off.await.expect("apply(false)");
+
+        assert!(!config.disabled);
+        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert_eq!(read_slot(&state), (None, 3), "apply(false) ended it (S-99)");
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert!(answer.identity.is_none());
+        assert_eq!((answer.checked, answer.current), (3, 3));
+        assert!(current_session(&state).await.unwrap().is_none());
+    }
+
+    /// banto PR #264 re-review P2 (b): a logout's post-clear re-read sees
+    /// `disabled = true` and is held (under `auth_config_lock`); an
+    /// `apply(false)` started then waits for the logout's install to finish
+    /// before it saves. Final: `disabled = false`, and the local session the
+    /// logout installed under `true` is ended by that `apply(false)` (S-99).
+    #[tokio::test]
+    async fn s67_a_logout_reread_and_a_later_apply_false_are_serialized() {
+        let mut state = app_state().await;
+        state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        let mut hold = mode_turned_on_after_first_read_and_reread_held(&mut state);
+
+        let logout = logout_body(&state);
+        tokio::pin!(logout);
+        run_until_held!(logout, hold);
+
+        let apply_off = auth_config_apply_body(&state, false, "admin");
+        tokio::pin!(apply_off);
+        assert_stays_pending!(apply_off);
+        assert!(
+            state.settings.auth_config().await.unwrap().disabled,
+            "apply(false) is waiting: it has not saved"
+        );
+        hold.release.send(()).unwrap();
+        let result = logout.await.expect("logout");
+        assert!(
+            is_local(&read_slot(&state).0),
+            "installed under disabled = true"
+        );
+        assert_eq!(result.seq, login.seq + 2);
+        apply_off.await.expect("apply(false)");
+
+        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert_eq!(
+            read_slot(&state),
+            (None, login.seq + 3),
+            "apply(false) ended it (S-99)"
+        );
+        let answer = resolve_body(&state).await.expect("resolve");
+        assert!(answer.identity.is_none());
+        assert_eq!(answer.current, answer.checked);
+    }
+
+    /// banto PR #264 review P1: a logout whose re-read of the mode fails still
+    /// succeeds (the clear has happened) and installs nothing.
+    #[tokio::test]
+    async fn s67_a_logout_whose_mode_reread_fails_still_succeeds() {
+        let mut state = app_state().await;
+        let a = state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(a)));
+        let settings = state.settings.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state.auth_io.auth_mode = Arc::new(move || {
+            let (settings, calls) = (settings.clone(), calls.clone());
+            Box::pin(async move {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    settings.auth_config().await
+                } else {
+                    Err(BantoError::Storage("injected".to_string()))
+                }
+            })
+        });
+
+        let result = logout_body(&state).await.expect("logout still succeeds");
+
+        assert_eq!(result.seq, 2);
+        assert_eq!(read_slot(&state), (None, 2));
+        assert_eq!(audit_action_count(&state, "logout").await, 1);
+    }
+
+    /// Supplementary (design §8.3, not order-fixing): login and logout
+    /// started together, both having read seq before either proceeds past
+    /// its injected `.await`, end in exactly one of the two consistent
+    /// states.
+    #[tokio::test]
+    async fn concurrent_login_and_logout_end_in_one_of_two_consistent_states() {
+        for _ in 0..3 {
+            let mut state = app_state().await;
+            state
+                .users
+                .setup_first_user("b", SLOT_PASSWORD, "B")
+                .await
+                .unwrap();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let (verify_barrier, users) = (barrier.clone(), state.users.clone());
+            state.auth_io.verify = Arc::new(move |username, password| {
+                let (barrier, users) = (verify_barrier.clone(), users.clone());
+                Box::pin(async move {
+                    barrier.wait().await;
+                    users.verify(&username, &password).await
+                })
+            });
+            let (mode_barrier, settings) = (barrier.clone(), state.settings.clone());
+            // Only the logout's FIRST mode read meets the login at the
+            // barrier - a logout that cleared re-reads the mode (banto PR #264
+            // review P1), and that second read has no partner.
+            let first_read = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            state.auth_io.auth_mode = Arc::new(move || {
+                let (barrier, settings, first_read) =
+                    (mode_barrier.clone(), settings.clone(), first_read.clone());
+                Box::pin(async move {
+                    if first_read.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        barrier.wait().await;
+                    }
+                    settings.auth_config().await
+                })
+            });
+
+            let (login, logout) = tokio::join!(
+                login_body(&state, "b".to_string(), SLOT_PASSWORD.to_string()),
+                logout_body(&state)
+            );
+            let (login, logout) = (login.unwrap(), logout.unwrap());
+            match read_slot(&state).0 {
+                None => assert!(login.superseded, "logged out, so the login was superseded"),
+                Some(_) => {
+                    assert!(login.success);
+                    assert_eq!(logout.seq, login.seq, "the logout was a no-op");
+                }
+            }
+        }
+    }
+
+    /// S-55 (Rust half): a password change from a session that was revoked
+    /// meanwhile clears the slot (advancing `seq`) and THEN fails with
+    /// `Unauthorized` - the one error kind returned after a slot write, which
+    /// the TS provider therefore treats as "the revision may have changed".
+    #[tokio::test]
+    async fn s55_change_password_on_a_revoked_session_advances_seq_then_fails_unauthorized() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("owner", SLOT_PASSWORD, "オーナー")
+            .await
+            .unwrap();
+        let a = state
+            .users
+            .create_user("a", SLOT_PASSWORD, "A", Role::Editor)
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+        state
+            .users
+            .update_user(a.id, "A", Role::Viewer)
+            .await
+            .unwrap();
+
+        let result = change_own_password(&state, SLOT_PASSWORD, "newpassword1").await;
+
+        assert!(
+            matches!(result, Err(BantoError::Unauthorized)),
+            "{result:?}"
+        );
+        assert_eq!(read_slot(&state), (None, login.seq + 1));
+    }
+
+    /// S-55 (Rust half): a wrong current password is a `Validation` error
+    /// returned without touching the slot.
+    #[tokio::test]
+    async fn s55_change_password_with_a_wrong_current_password_leaves_seq() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("a", SLOT_PASSWORD, "A")
+            .await
+            .unwrap();
+        let login = login_body(&state, "a".to_string(), SLOT_PASSWORD.to_string())
+            .await
+            .expect("login");
+
+        let result = change_own_password(&state, "wrong-password", "newpassword1").await;
+
+        assert!(
+            matches!(result, Err(BantoError::Validation { .. })),
+            "{result:?}"
+        );
+        assert_eq!(read_slot(&state).1, login.seq);
+        assert!(read_slot(&state).0.is_some());
+    }
+
+    // --- banto v2.0.0 移行（PR1a 監査の追補）---------------------------------
+
+    /// オーナー決定（2026-10-02）: ログイン不要モードの `disabled_role` は残し、
+    /// キオスク（`viewer`）から UI で admin に戻れること。ESCAPE HATCH
+    /// （モードが今オンなら `auth_config_apply` は役割を問わず通る）を固定する:
+    /// admin の Account → apply(true, viewer) で Local(viewer)・seq + 1 →
+    /// **viewer のまま** apply(true, admin) が通って Local(admin)・seq + 1 →
+    /// viewer に戻して apply(false) が通って Local → None・seq + 1。Local(viewer)
+    /// は `auth_config_get` を読めて（画面表示に要る）、生の `settings_get` は
+    /// `Forbidden`。
+    #[tokio::test]
+    async fn kiosk_viewer_can_raise_its_role_and_turn_the_mode_off() {
+        let state = app_state().await;
+        let admin = state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(admin)));
+        let (_, seq0) = read_slot(&state);
+
+        let local_role = |state: &AppState| match read_slot(state).0 {
+            Some(DesktopSession::AuthDisabledLocal(local)) => local.role,
+            other => panic!("expected Local, got {other:?}"),
+        };
+
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("admin turns the kiosk mode on");
+        assert_eq!(local_role(&state), Role::Viewer);
+        assert_eq!(read_slot(&state).1, seq0 + 1);
+
+        // The kiosk's viewer session can read the auth mode (the security
+        // screen shows it) but not the raw settings table.
+        let config = auth_config_get_body(&state)
+            .await
+            .expect("viewer reads auth_config");
+        assert!(config.disabled);
+        assert!(matches!(
+            settings_get_body(&state, "auth.disabled").await,
+            Err(BantoError::Forbidden)
+        ));
+
+        // Still viewer: the escape hatch lets it raise the role to admin.
+        auth_config_apply_body(&state, true, "admin")
+            .await
+            .expect("viewer raises the role (escape hatch)");
+        assert_eq!(local_role(&state), Role::Admin);
+        assert_eq!(read_slot(&state).1, seq0 + 2);
+        assert_eq!(
+            settings_get_body(&state, "auth.disabled")
+                .await
+                .expect("admin reads settings")
+                .as_deref(),
+            Some("true")
+        );
+
+        // Back to viewer, then viewer turns the mode off.
+        auth_config_apply_body(&state, true, "viewer")
+            .await
+            .expect("back to viewer");
+        assert_eq!(local_role(&state), Role::Viewer);
+        let (_, seq_viewer) = read_slot(&state);
+        auth_config_apply_body(&state, false, "viewer")
+            .await
+            .expect("viewer turns the mode off (escape hatch)");
+        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert_eq!(read_slot(&state), (None, seq_viewer + 1));
+
+        // With the mode off and no session, the escape hatch is closed.
+        assert!(matches!(
+            auth_config_apply_body(&state, true, "admin").await,
+            Err(BantoError::Unauthorized)
+        ));
+    }
+
+    /// `apply_mode_to_session` from an empty slot (`false -> true`):
+    /// `Installed`, seq + 1 (the shape of
+    /// `s98_turning_the_mode_on_always_advances_seq`).
+    #[tokio::test]
+    async fn turning_the_mode_on_with_no_session_installs_local() {
+        let state = app_state().await;
+        let (_, seq) = read_slot(&state);
+        let previous = AuthSettings {
+            disabled: false,
+            disabled_role: Role::Editor,
+            ..AuthSettings::default()
+        };
+        let saved = AuthSettings {
+            disabled: true,
+            ..previous.clone()
+        };
+        let (rebind, ended) = apply_mode_to_session(&state, &previous, &saved);
+        assert!(
+            matches!(&rebind, LocalRebind::Installed(local) if local.role == Role::Editor),
+            "{rebind:?}"
+        );
+        assert!(ended.is_none());
+        let (session, seq_after) = read_slot(&state);
+        assert!(is_local(&session));
+        assert_eq!(seq_after, seq + 1);
+    }
+
+    /// admin-template の
+    /// `a_desktop_session_rebound_while_its_check_was_in_flight_stays_valid`
+    /// の移植（banto v1.7.0 #204 の review of #230 + banto #260）: 確認の
+    /// 読み取りが飛行中に、このセッション自身のパスワード変更が rebind した
+    /// 場合、その確認は `Stale { valid_now: Some(Account) }` で有効のまま。
+    /// rebind されていない別ウィンドウの同じアカウントのセッションは、DB の
+    /// 新しい epoch を代わりに採用されず終わる。
+    #[tokio::test]
+    async fn a_desktop_session_rebound_while_its_check_was_in_flight_stays_valid() {
+        let pool = chronogazer_core::db::init_db_memory()
+            .await
+            .expect("init_db_memory");
+        let changer = app_state_on(pool.clone()).await;
+        let other = app_state_on(pool).await;
+        changer
+            .users
+            .setup_first_user("target", SLOT_PASSWORD, "Target")
+            .await
+            .unwrap();
+        for state in [&changer, &other] {
+            let login = login_body(state, "target".to_string(), SLOT_PASSWORD.to_string())
+                .await
+                .expect("login");
+            assert!(login.success);
+        }
+        let snapshot = |state: &AppState| {
+            let (session, seq) = read_slot(state);
+            (session.expect("a session"), seq)
+        };
+        let (changer_before, changer_seq) = snapshot(&changer);
+        let (other_before, other_seq) = snapshot(&other);
+
+        change_own_password(&changer, SLOT_PASSWORD, "newpassword1")
+            .await
+            .expect("password change");
+
+        let fresh = read_session_source(&changer, &changer_before)
+            .await
+            .unwrap();
+        match settle_session(&changer, &changer_before, fresh, changer_seq) {
+            Settled::Stale {
+                valid_now: Some(DesktopSession::Account(user)),
+            } => assert_eq!(user.auth_epoch, 1),
+            other => panic!("the re-bound session must stay valid, got {other:?}"),
+        }
+        assert!(require_role(&changer, Role::Admin, "users").await.is_ok());
+
+        let fresh = read_session_source(&other, &other_before).await.unwrap();
+        assert!(matches!(
+            settle_session(&other, &other_before, fresh, other_seq),
+            Settled::Settled { session: None, .. }
+        ));
+        assert!(other
+            .auth
+            .lock()
+            .expect("auth mutex poisoned")
+            .session
+            .is_none());
     }
 }

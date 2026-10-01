@@ -29,7 +29,7 @@
 //! §8.2 - the Tauri app never sets this, since desktop first-run goes
 //! through the `auth_setup` command instead).
 
-use banto_server::{lan_urls, start, static_router, ServerConfig};
+use banto_server::{start, static_router, ServerConfig};
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogService};
 use chronogazer_core::backup::BackupService;
@@ -223,7 +223,7 @@ async fn main() {
 
     println!("banto-serve: DB at {db_path}");
     println!("banto-serve: listening at:");
-    for url in lan_urls(server.local_addr().port()) {
+    for url in chronogazer_core::listening_urls(server.local_addr()) {
         println!("  {url}");
     }
     if allow_setup {

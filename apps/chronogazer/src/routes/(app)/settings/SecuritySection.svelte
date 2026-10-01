@@ -17,10 +17,9 @@
 	 * `authError` 表示と同じ見た目（`authSettingsStore.svelte.ts` の doc
 	 * comment参照）。保存操作自体の失敗は従来どおりトーストのみ。
 	 */
-	import { invalidate } from '$app/navigation';
+	import { invalidateAll } from '$app/navigation';
 	import { isTauri } from '$lib/banto/setup';
 	import { toastStore } from '$lib/toast.svelte';
-	import { sessionStore } from '$lib/session.svelte';
 	import { applyAuthSettings, type AuthDisabledRole } from '$lib/banto/authAdmin';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { canManageAuthMode, errorMessage } from './shared';
@@ -64,15 +63,26 @@
 		try {
 			const next = await applyAuthSettings(disabledDraft, disabledRoleDraft);
 			authSettingsStore.apply(next);
-			sessionStore.authDisabled = next.disabled;
-			// `+layout.ts` の `canManageAuthMode()` 判定は load が再実行されるまで
-			// 古いまま残る（PR #372 Copilot レビュー指摘）。admin 未満のロールが
-			// エスケープハッチ（`authDisabled`）で見えていた `security` カテゴリを
-			// ここで OFF に戻すと `canManageAuthMode()` が false になるので、
-			// invalidate してナビを再計算させる - この画面が非可視になった場合は
-			// `security/+page.ts` の `guardCategory` が再実行されて先頭カテゴリへ
-			// redirect する（空ページに留まらせない）。
-			await invalidate('settings:categories');
+			// banto v2.0.0 の Rust（PR1a）は、この適用の中でデスクトップの
+			// セッションそのものを付け替える: ON にすると Account -> Local(役割)、
+			// ON のまま役割を変えると Local の役割変更、OFF にすると Local を終了。
+			// `authDisabled` だけを書き換えていた従来のやり方では、ナビ・権限・
+			// ESCAPE HATCH（`canManageAuthMode()`）が古い役割のまま残るので、
+			// すべての load を再実行して追従させる:
+			// - `(app)/+layout.ts` が `decideProtectedRoute` で照合し直し、
+			//   `sessionStore.load()` で今のセッションの identity・役割・
+			//   `authDisabled` を読み直す（v1.7.3 の `auth_identity` は Local の
+			//   今の役割を返す）。OFF にして Local が終わった場合はここで
+			//   `/login` へ送られる。
+			// - `settings/+layout.ts`（`await parent()` の後に評価）がカテゴリと
+			//   `canManageAuthMode()` を再計算する。この画面が非可視になれば
+			//   `security/+page.ts` の `guardCategory` が先頭カテゴリへ送る
+			//   （PR #372 Copilot レビュー指摘の空ページ対策。従来の
+			//   `invalidate('settings:categories')` はこれに含まれるので外した）。
+			// `sessionStore.load()` を別に呼ばないのは、上の layout の load が
+			// 必ず呼ぶため（二重に identity を読まない）。
+			// 1c で v2 の SessionController に置き換えるまでの移行措置。
+			await invalidateAll();
 			toastStore.push('success', '認証設定を更新しました');
 		} catch (err) {
 			// 排他違反（LANアクセス有効中の有効化など）はサーバ側の日本語メッセージ
