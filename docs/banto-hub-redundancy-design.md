@@ -1,7 +1,7 @@
 # banto-hub / SCADA server 冗長化 設計草案
 
 作成日: 2026-09-30  
-最終更新: 2026-09-30（オーナーレビュー 6 回目を反映: pending の abort は調停者上の fenced CAS だけで行いローカル timeout では開け直さない（4.3、5.3）、Alarm の範囲同期は任意の replica から origin ごとに回収し watermark は origin ごと（6.3）、authority 候補集合は固定で変更は計画停止の手順のみ（6.3）、PLC の多ワード値は double buffer + index word で一貫性を作る（5.3）、HLC はリモート受信時にも merge（6.3）。同日: オーナーレビュー 5 回目を反映: 書き込みゲートに調停者の committed generation を直接入れ prepare から switch 完了までは閉じる（4.3）、候補 A のワードは slot / committed / commit_req で同じ 96 bit の generation token を比較し epoch 類は 32 bit に（5.3）、Alarm の barrier は quorum 方式で fail-closed（6.3）、Sink の期限判定は `clock_timestamp()` と行ロック先行に（4.8）。同日: オーナーレビュー 4 回目を反映: 設定の有効化を prepare / commit に分け commit point を調停者に置く、primary 昇格は調停者の committed generation と一致する台だけ（4.3、5.3）、Alarm の watermark は欠番なく連続した最大 seq、新 authority はサービス開始前に catch-up barrier、同期複製の既定は到達可能な候補全台（6.3）、Sink の flush guard に `expires_at >= now()`（4.8）、client 側 write gate の解除条件（§7）。同日: オーナーレビュー 3 回目を反映: 設定の「配布」と「有効化」を分け generation で書き込みを開ける（primary も例外にしない、4.3）、操作者イベントの同期複製は依存する `opened` を束ねる因果複製に（6.3）、PLC Action の fencing は bounded-delay と明記し strict は PLC 側 command gate（5.1 / 5.3）、Sink のリースは sink group 単位（4.8）、HLC の永続化と MQTT `t` の記述削除（6.3 / 4.7）。同日: オーナーレビュー 2 回目を反映: リースの権利を副作用まで切れ目なく伝える。期限は最後に成功した Grant + ttl（5.1）、Sink はサイドカー自身が DB リースを持ち INSERT と同一トランザクションで検査（4.8）、設定の鮮度確認と `config-primary` のリース化（4.3）、ACK は別 1 台への同期複製後に応答（6.3）、`origin_seq` の永続化（6.3）、候補 B の MQTT 巻き戻りを許容条件として明記（4.7）。同日: オーナーレビュー 1 回目を反映: Alarm occurrence の採番を `alarm-authority` に（6.3）、役割を重複許容 / 排他必須に分け排他必須は競合窓の無い調停に限定（5.1）、設定不一致時の PLC 書き込みを fail-closed に（4.3）、イベントの順序を origin seq + HLC に（6.3）、履歴統合を区間ごとの正ソース方式に（6.2）。同日: 初版。scada-design.md §13.2 の原則を受けて、3 層の冗長化とリースの抽象を草案化）  
+最終更新: 2026-10-01（オーナーレビュー 7 回目を反映: commit は predecessor 付きの真正な CAS（expected committed + epoch 連番）、`config_epoch` は調停者の committed + 1 から採番、abort は「同じ fingerprint の次 epoch を commit する空の有効化」に統一して aborted 領域を廃止、未解決の pending は 1 件だけで解消まで次の prepare を拒否、command gate の `cmd` も double buffer + `cmd_index` で `ack` は別領域（4.3、5.3）、固定 primary は単一ノード版の手順を定義（4.3）。2026-09-30: オーナーレビュー 6 回目を反映: pending の abort は調停者上の fenced CAS だけで行いローカル timeout では開け直さない（4.3、5.3）、Alarm の範囲同期は任意の replica から origin ごとに回収し watermark は origin ごと（6.3）、authority 候補集合は固定で変更は計画停止の手順のみ（6.3）、PLC の多ワード値は double buffer + index word で一貫性を作る（5.3）、HLC はリモート受信時にも merge（6.3）。同日: オーナーレビュー 5 回目を反映: 書き込みゲートに調停者の committed generation を直接入れ prepare から switch 完了までは閉じる（4.3）、候補 A のワードは slot / committed / commit_req で同じ 96 bit の generation token を比較し epoch 類は 32 bit に（5.3）、Alarm の barrier は quorum 方式で fail-closed（6.3）、Sink の期限判定は `clock_timestamp()` と行ロック先行に（4.8）。同日: オーナーレビュー 4 回目を反映: 設定の有効化を prepare / commit に分け commit point を調停者に置く、primary 昇格は調停者の committed generation と一致する台だけ（4.3、5.3）、Alarm の watermark は欠番なく連続した最大 seq、新 authority はサービス開始前に catch-up barrier、同期複製の既定は到達可能な候補全台（6.3）、Sink の flush guard に `expires_at >= now()`（4.8）、client 側 write gate の解除条件（§7）。同日: オーナーレビュー 3 回目を反映: 設定の「配布」と「有効化」を分け generation で書き込みを開ける（primary も例外にしない、4.3）、操作者イベントの同期複製は依存する `opened` を束ねる因果複製に（6.3）、PLC Action の fencing は bounded-delay と明記し strict は PLC 側 command gate（5.1 / 5.3）、Sink のリースは sink group 単位（4.8）、HLC の永続化と MQTT `t` の記述削除（6.3 / 4.7）。同日: オーナーレビュー 2 回目を反映: リースの権利を副作用まで切れ目なく伝える。期限は最後に成功した Grant + ttl（5.1）、Sink はサイドカー自身が DB リースを持ち INSERT と同一トランザクションで検査（4.8）、設定の鮮度確認と `config-primary` のリース化（4.3）、ACK は別 1 台への同期複製後に応答（6.3）、`origin_seq` の永続化（6.3）、候補 B の MQTT 巻き戻りを許容条件として明記（4.7）。同日: オーナーレビュー 1 回目を反映: Alarm occurrence の採番を `alarm-authority` に（6.3）、役割を重複許容 / 排他必須に分け排他必須は競合窓の無い調停に限定（5.1）、設定不一致時の PLC 書き込みを fail-closed に（4.3）、イベントの順序を origin seq + HLC に（6.3）、履歴統合を区間ごとの正ソース方式に（6.2）。同日: 初版。scada-design.md §13.2 の原則を受けて、3 層の冗長化とリースの抽象を草案化）  
 状態: **草案（オーナー議論用）。実装は scada-server と Hub の単一構成が動いてから（scada-design.md §22 #19）**  
 対象: banto-hub（タグサーバー）、SCADA server core、PLC 接続層（banto-plc / banto-collect / banto-broker）、
 banto-tagclient
@@ -164,8 +164,10 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
 - **配布と有効化を分ける**（2026-09-30 レビュー 3 回目 #1）。primary を書き込みゲートの例外にすると、
   未配布や部分適用の設定で primary が書き込み、その後 failover した新 primary が古い設定を「正」として
   戻す事故が起きる。よって:
-  - **`config_generation = (config_epoch, fingerprint)`**。`config_epoch` は有効化のたびに primary が +1 する
-    単調な番号、`fingerprint` はパッケージ内容の正規化ハッシュ（数値 id と機微情報を除く）
+  - **`config_generation = (config_epoch, fingerprint)`**。`config_epoch` は有効化のたびに **調停者の committed
+    の epoch + 1** として primary が採番する単調な番号（ローカル値 + 1 ではない。primary が交代しても連番が
+    途切れず、commit の CAS 条件に使える。2026-10-01 レビュー 7 回目 #1）、`fingerprint` はパッケージ内容の
+    正規化ハッシュ（数値 id と機微情報を除く）
   - 各インスタンスは **`active_generation`**（収集と書き込みゲートが使う設定）と **`staged_package`**（配布
     されたが未有効化のパッケージ）を持つ。編集は primary でも **staging に入り、running には触れない**
     （現状の `pending_changes` / `configured_revision` と `running_revision` の区別を流用する）
@@ -185,19 +187,31 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
        **ack した台は書き込みゲートを閉じる**（`write_gate: activating`）。primary も prepare を始めた時点で
        閉じる。commit と switch の間に旧 generation で書く窓を、調停者の読み取り周期に頼らず無くすため。
        有効化は運用者が起こす短い操作なので、その間の書き込み停止は受容する（UI に「有効化中」）。
-       **abort は調停者上の fenced CAS でだけ行う**（2026-09-30 レビュー 6 回目 #1）: primary（または
-       昇格した新 primary）が `config-primary` のリース epoch 付きで調停者の `aborted_generation` に pending
-       の token を書く（`committed != pending` のときだけ成功。commit と同じ調停者の状態を CAS するので
-       両立しない）。prepare 済みの台は**ローカルの経過時間だけでゲートを開け直さない**。調停者を読んで
-       `committed == pending` なら switch、`aborted == pending` なら pending を捨てて開け直す。60 s 経っても
-       決まらない pending は状態に `stale pending` と出すだけ。ローカル timeout で捨てると、commit 直後
-       （次の読み取り前）に timeout が発火し、キャッシュ上は 3 者一致に見える旧 generation でゲートを
-       開け直すレースが起きる
+       **1 サービスにつき未解決の activation は 1 件だけ**（2026-10-01 レビュー 7 回目 #2）: 前の pending が
+       解消（下の規則で switch 済みか廃棄済み）するまで、primary は次の prepare を**拒否**する。「次の
+       prepare で pending を上書き」すると、commit 要求の応答を失った後に調停者側で遅れて commit が成立し、
+       committed の package を誰も staged に持たない（全台 `active != committed` で書き込み不能）状態になる
+       **abort は「空の有効化」として commit と同じ経路で行う**（2026-09-30 レビュー 6 回目 #1、2026-10-01
+       レビュー 7 回目 #4）: primary（または昇格した新 primary）が、**committed と同じ fingerprint で epoch
+       だけ +1 した generation** を下の commit の CAS で書く。これで pending の epoch は committed の epoch
+       以下になり、token が違うので「廃棄」と判定できる。専用の `aborted_generation` は持たない（1 件だけだと
+       abort の通知を長く取り逃した台が `aborted == pending` に一致せず永久に `stale pending` になる）。
+       **pending の解消規則**（各台が調停者を読んで判定。ローカルの経過時間では判定しない）:
+       `committed == pending` → switch。`committed.epoch >= pending.epoch` かつ `committed != pending` →
+       pending を廃棄して開け直す（epoch は調停者基準の連番なので、より新しい commit があれば自分の pending は
+       解消済み）。`committed.epoch < pending.epoch` → 未解決のまま待つ（60 s を超えたら状態に
+       `stale pending` と出すだけ）。空の有効化の switch は fingerprint が同じなので running を作り直さず
+       `active_generation.epoch` を進めるだけ
     2. **commit**: 全員の ack が揃ったら、primary が調停者の **committed generation**（5.3 の
-       `committed_generation` の 96 bit token。候補 D なら `config-primary` のリース行の列）を
-       `config-primary` のリース epoch 付きの CAS で書く。**この 1 回の書き込みが唯一の commit point**。
-       失敗（リースを失っていた、調停者に届かない）なら activate は失敗で、全台は旧 generation のまま
-       （pending は次の prepare で上書きされるか、primary が明示的に abort する）
+       `committed_generation` の 96 bit token。候補 D なら `config-primary` のリース行の列）を **predecessor
+       付きの CAS** で書く（2026-10-01 レビュー 7 回目 #1）: 要求は `{lease_epoch, expected_committed, new}`
+       で、調停者は **`lease_epoch == 現在のリース epoch` かつ `committed == expected_committed` かつ
+       `new.config_epoch == expected_committed.config_epoch + 1`** の全部が成り立つときだけ `committed` を
+       `new` に置き換える。リース epoch だけの検査では、同じリースの間に F2 → F3 と進んだ後に再送・遅延した
+       F2 の要求が F3 を F2 に戻せる。**この 1 回の CAS が唯一の commit point**。失敗（条件不一致、リースを
+       失っていた、調停者に届かない）なら activate は失敗で、全台は旧 generation のまま。pending は上の解消
+       規則で片付ける（応答を失っただけで実際には commit が成立していた場合も、各台は調停者を読んで switch
+       するので取りこぼさない）
     3. **switch**: 各台は commit の通知を受けるか、**自分で調停者の committed generation を読んで**（5 s
        ごとの確認で）、それが自分の pending と一致したときだけ staged から running を作り直して切り替える。
        通知を取りこぼしても調停者を読めば追いつく。切り替えの原子性は、running 用の SQLite を staged から
@@ -212,8 +226,14 @@ PLC の冗長系がどう切り替わるか（PLC の責務）。Hub が複数�
     「自分の知る最大の record」を基準にすると、最新を知らずに分断された台が primary 停止後に古い generation
     で昇格して旧設定を正に戻せる。共有された commit point を基準にすればこれは起きない。誰も一致しなければ
     primary 不在 = 全台で書き込み不可（安全側）
-  - **固定 primary**（A / D の無い現場）には調停者が無いので commit point も無い。primary が 1 台だけなら
-    巻き戻りは「primary 自身を古いバックアップから復元した」場合にしか起きず、それは運用の責任と明記する
+  - **固定 primary（A / D の無い現場）は単一ノード版の手順で同じ契約に接続する**（2026-10-01 レビュー
+    7 回目 #5）: 調停者の役割を **primary ローカルの耐久な `committed_generation` レコード**（SQLite、同じ
+    predecessor 付き CAS）が担い、これが唯一の commit point。prepare / commit / switch と pending の解消規則は
+    同じで、standby は primary のレコードを 5 s ごとに読んで `committed` とする（鮮度の規則も同じ）。
+    standby は昇格しない（`config-primary` は固定）。primary が止まれば commit point を読めないので
+    standby の書き込みは鮮度切れで止まり、primary 復帰まで全台で書き込み不可（安全側）。巻き戻りは
+    「primary 自身を古いバックアップから復元した」場合にしか起きず、それは運用の責任と明記する。この版を
+    持たないなら固定 primary は初版から外す（§10 #10）
   - 旧 primary が復帰したとき、staging に未有効化の編集が残っていれば「未有効化」として UI に出す。running は
     最後に有効化した generation なので、他と同じなら standby として書き込みを受けられる
 - **鮮度**（2026-09-30 レビュー 2 回目 #1）: standby は primary の `active_generation` を **5 s ごとに読んで
@@ -429,23 +449,17 @@ D+3        holder_slot            保持者のスロット番号（0 = 無し）
 D+4        holder_ttl_ticks       保持者の更新猶予（PLC の 100 ms tick 単位、既定 120 = ttl 10 s + margin 2 s）
 D+5        committed_index        committed_generation の有効バッファ（0 / 1）。ラダーが本体を書き終えてから 1W で切替
 D+6..17    committed_generation[2]  generation token（96 bit = config_epoch 32 bit + fingerprint 先頭 64 bit）× 2
-D+18       aborted_index          aborted_generation の有効バッファ（0 / 1）。ラダーが書く
-D+19..30   aborted_generation[2]  fenced abort された pending の token × 2（4.3）
-D+31       req_index              req の有効バッファ（0 / 1）。primary が本体を書き終えてから 1W で切替
-D+32..49   req[2] { kind (1W: 1 = commit, 2 = abort), lease_epoch (32 bit), generation token (96 bit) } = 9W × 2
+D+18       req_index              req の有効バッファ（0 / 1）。primary が本体を書き終えてから 1W で切替
+D+19..46   req[2] { lease_epoch (32 bit), expected_committed (96 bit), new_generation (96 bit) } = 14W × 2
 D+50..     slot[i] { instance_hash (32 bit), heartbeat_counter (32 bit), priority (16 bit),
                      token_index (1W), generation token[2] (96 bit × 2) } = 19W、i = 1..8（D+50..D+201）
-D+210..    cmd（command gate、任意）{ epoch (32 bit), seq (32 bit), target (2W), value (2W), ack_seq (32 bit) }
+D+210      cmd_index              cmd の有効バッファ（0 / 1）。action-executor が本体を書き終えてから 1W で切替
+D+211..226 cmd[2] { epoch (32 bit), seq (32 bit), target (2W), value (2W) } = 8W × 2（command gate、任意）
+D+230..231 cmd_ack_seq (32 bit)   ラダーだけが書く（Hub は読むだけ）。cmd と領域を分ける
 ```
 
-- **多ワード値の一貫性**（2026-09-30 レビュー 6 回目 #4）: 96 bit の token や 9W の req を「1 つの値」として
-  比較するので、SLMP の一括書き込みや PLC のスキャンの間で多ワード値が原子的に見えることに**暗黙には
-  依存しない**（MELSEC はデバイスへの外部アクセスを END 処理で反映するので実機では概ね原子的に見えるが、
-  仕様として保証を確認できるまで前提にしない。§10 #1 の実機確認項目に加える）。代わりに **double buffer +
-  index word** で作る: 書き手は**有効でない側**のバッファに本体を書き終えてから、1 ワードの `*_index` を
-  切り替える（1 ワードの書き込みは原子的）。読み手は index を読み、その側のバッファを読み、index を再読して
-  一致していなければ読み直す。有効側のバッファには書き手は触らないので、途中読みは起きない。commit point 用
-  データ（`committed_generation`、`req`、`aborted_generation`、slot の token）は全部この形
+- abort 専用の領域は無い。abort は「committed と同じ fingerprint で epoch + 1」の generation を `req` で
+  commit する（4.3）。
 - **語長と wrap**（2026-09-30 レビュー 5 回目 #2 / #5）: 排他や fencing に使う番号（`epoch`、`config_epoch`、
   `heartbeat_counter`、`cmd.seq`）は **32 bit（2W）**。16 bit だと 65,536 で再利用され、「古い epoch の
   コマンドは必ず拒否する」strict fencing が成り立たない。32 bit は 1 秒に 1 回進めても約 136 年なので
@@ -461,12 +475,14 @@ D+210..    cmd（command gate、任意）{ epoch (32 bit), seq (32 bit), target 
   失格、生きているスロットのうち最小の priority を `holder_slot` に書き `epoch` を +1。Hub は
   `holder_slot` と `epoch` を読むだけ。書き手が PLC 1 つなので競合が無い。`config-primary` の判定では
   さらに `slot.generation_token == committed_generation`（6W 全部の一致）のスロットだけを候補にする
-  （4.3 の昇格条件）。commit（4.3）は primary が `req`（非有効側）に `kind = 1`、自分のリース epoch、新
-  generation token を書いて `req_index` を切り替え、ラダーが `req.lease_epoch == epoch` のときだけ token を
-  `committed_generation`（非有効側）へ転記して `committed_index` を切り替える（保持者以外の req は捨てる）。
-  abort（4.3）は `kind = 2` で同じ経路を通り、ラダーは `req.lease_epoch == epoch` かつ `committed != token`
-  のときだけ `aborted_generation` へ転記する。commit と abort は同じ req バッファと同じラダーの判定を通るので
-  両立しない。各台は自分の slot の token を switch 完了時に更新する（非有効側へ書いて `token_index` を切替）
+  （4.3 の昇格条件）。commit（4.3）は primary が `req`（非有効側）に自分のリース epoch、
+  `expected_committed`、`new_generation` を書いて `req_index` を切り替え、ラダーは
+  **`req.lease_epoch == epoch` かつ `committed_generation == req.expected_committed` かつ
+  `req.new_generation.config_epoch == req.expected_committed.config_epoch + 1`** の全部が成り立つときだけ
+  `new_generation` を `committed_generation`（非有効側）へ転記して `committed_index` を切り替える
+  （2026-10-01 レビュー 7 回目 #1。条件のどれかが欠ければ捨てる。処理済みの req は `expected` が古くなるので
+  再送・遅延で二度処理されない）。abort は同じ経路で「同じ fingerprint の epoch + 1」を commit するだけ
+  （4.3）。各台は自分の slot の token を switch 完了時に更新する（非有効側へ書いて `token_index` を切替）
 - **B（ワードのみ）**: 各台が読み取り周期で全スロットを読み、保持者の counter が ttl を超えて止まって
   いたら「取得を試みる」= `holder_slot` と `epoch+1` を書く → 1 周期待って読み直し、`holder_slot` が
   自分なら取得成功、違えば負け。2 台が同時に書いた窓では**最大 2 周期の間、両方が保持者だと思う**。
@@ -475,10 +491,13 @@ D+210..    cmd（command gate、任意）{ epoch (32 bit), seq (32 bit), target 
   には A か D を使う
 - 役割ごとにブロックを分けるか、1 ブロックで全役割を同じ台に寄せるかは 5.1 の「既定は同じ台」に従い、
   初版は **1 ブロック = 全役割**とする
-- **command gate（任意、strict fencing が要る PLC Action 用）**: 同じブロックの `cmd`（上の表）に、
-  `action-executor` は対象デバイスへ直接書かず **`epoch`（32 bit）付きで書く**。ラダーは
-  `cmd.epoch == epoch`（自分が決めた保持者の epoch）かつ `cmd.seq`（32 bit、epoch ごとに 1 から）が
-  未処理のときだけ `target` へ `value` を転記し `ack_seq` を更新する。旧
+- **command gate（任意、strict fencing が要る PLC Action 用）**: 同じブロックの `cmd`（上の表、**double
+  buffer + `cmd_index`**。2026-10-01 レビュー 7 回目 #3。部分更新が見えると「新しい epoch / seq + 古い
+  target / value」の組み合わせを有効なコマンドとして実行してしまうため）に、`action-executor` は対象
+  デバイスへ直接書かず **`epoch`（32 bit）付きで非有効側に本体を書き、`cmd_index` を 1W で切り替える**。
+  ラダーは `cmd_index` 側を読み、`cmd.epoch == epoch`（自分が決めた保持者の epoch）かつ `cmd.seq`
+  （32 bit、epoch ごとに 1 から）が未処理のときだけ `target` へ `value` を転記し、**別領域の
+  `cmd_ack_seq`**（ラダーだけが書く）を更新する。旧
   保持者の遅れたコマンドは epoch 不一致で捨てられる。1 コマンドずつ（seq の ack 待ち）なのでスループットは
   低いが、常時実行 Action の副作用は本来まれ。操作者の UI からの PLC Write はリースに縛られないので gate を
   通さない（scada-design.md §16 の相関 ID と監査が担う）
@@ -656,29 +675,31 @@ D+210..    cmd（command gate、任意）{ epoch (32 bit), seq (32 bit), target 
 前提: Hub 2 台（H1 優先、H2）、SCADA server 2 台（S1 優先、S2）、PLC 冗長系（A / B）、調停は PLC
 （候補 A）。
 
-| #   | 事象                                                             | 期待する振る舞い                                                                                                                                                                                                                                                                                                                                          |
-| --- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | H1 のプロセス停止                                                | H1 のハートビートが止まり ttl + margin 後に H2 が Hub 側の役割（`config-primary`、MQTT）を取得。H1 側サイドカーの DB リースも期限切れになり H2 側サイドカーが取得して INSERT 開始（台をまたぐ重複行は無い）。client は Transport 失敗で H2 へ切替、名前で再バインド。H2 は新 primary なので書き込みを受ける。切替の間（ttl + margin + backoff）の値は欠落 |
-| 2   | H1 の NIC 断（PLC には届くが LAN に出ない）                      | client は H2 へ。H1 は PLC には届くので PLC 調停上は保持者のまま → **MQTT は H1 が続けようとする**（ブローカーに届くかは別）。Sink は H1 側サイドカーが DB に届かず DB リースが切れ、H2 側が取る。H2 は primary を確認できず（鮮度失効）書き込みを受けない → 運用者が H1 の役割を手放させる。この事象は**調停が PLC 側にある弱点**として §10 #8 に残す    |
-| 3   | H1 と PLC の間の断（LAN は生きている）                           | H1 の renew が失敗し副作用停止。H2 が取得。H1 の値は Bad、client は値が Bad でも接続は維持（H1 が PLC に届かないだけで Hub は生きている）→ **client 側の切替条件に「全接続が Bad」を足すか**は §10 #9                                                                                                                                                     |
-| 4   | PLC の系切替（A → B）                                            | 各 Hub の接続層が endpoint を切替。切替中は Bad。調停ワードはトラッキングで引き継がれるので保持者は変わらない                                                                                                                                                                                                                                             |
-| 5   | H1 と H2 の相互断、両方 PLC には届く                             | 調停は PLC なので保持者は 1 台のまま。client は自分が届く方へ。**分断しても副作用は 1 台**                                                                                                                                                                                                                                                                |
-| 6   | 全 Hub が PLC に届かない                                         | 全役割が失効、副作用は全停止。client は値 Bad。安全側                                                                                                                                                                                                                                                                                                     |
-| 7   | S1 停止                                                          | S2 が `action-executor` / `alarm-authority` を取得し、複製済みの `opened` から occurrence id を引き継ぐ（ACK 済みは ACK 済みのまま）。recorder は S2 が続けており、区間表で S2 が正になる。画面は S2 へ切替                                                                                                                                               |
-| 8   | 設定変更（primary H1 で編集、H2 に未有効化）                     | 編集は H1 の staging に入り running には触れない。activate は H2 の ack が要るので、H2 が分断されていれば失敗して全台が旧 generation のまま。**H1 も新設定では書けない**（primary の例外なし）。運用者が有効化を完了させる。除外運用で H2 抜きに有効化した場合、H2 は `excluded` で書き込みを受けず primary にもなれない                                  |
-| 9   | 全停止からの再起動                                               | 起動順に依存しない。各台が起動 → 調停ワードを読む → 保持者が居なければ優先度順に取得。MQTT の `$state` は保持者が `online` にする                                                                                                                                                                                                                         |
-| 10  | 時計のずれ                                                       | リースは各台の単調時計で数えるので影響なし。履歴の区間境界（6.2）に数百 ms の影響。Alarm イベントの順序は HLC なので影響なし → NTP を運用要件に                                                                                                                                                                                                           |
-| 11  | 調停が候補 B / C しか無い構成                                    | 重複許容の役割（MQTT、recorder-primary）だけが付与され、`action-executor` / `alarm-authority` / `config-primary` は誰も持たない（Sink は DB があれば D で持てる）。常時実行 Action の副作用と Alarm 操作は止まり、書き込みは固定 primary を選んだときだけ primary で受ける。状態に理由が出る（fail-closed）                                               |
-| 12  | S1 が ACK 直後に停止                                             | ACK は依存する `opened` と束ねて S2 の永続化確認後に成功を返しているので、S2 は同じ occurrence id で ACK 済みを引き継ぐ。S2 が ACK 時点で落ちていた（degraded で受けた）場合は失われうる。2 台同時故障は保証外                                                                                                                                            |
-| 13  | primary H1 が staging に未有効化の編集を残して停止               | 調停者の committed generation は最後に commit したもの。H2 の `active_generation` がそれと一致するので H2 が primary を取得し書き込みを受ける。H1 の編集は復帰後に「未有効化」として残る                                                                                                                                                                  |
-| 15  | 有効化の途中で配布失敗（H2 は prepare 済み、H3 に届かない）      | commit point に達していないので誰も切り替えない。H2 の pending は次の prepare で上書きされる。primary は旧 generation のまま書き込みを受ける                                                                                                                                                                                                              |
-| 16  | H2 が最新の有効化を知らないまま分断され、その間に primary が停止 | H2 の `active_generation` は調停者の committed generation と一致しないので `config-primary` を取れない。誰も一致しなければ書き込み不可（安全側）。H2 は復帰後に catch-up                                                                                                                                                                                  |
-| 17  | N=3 で S1 が ACK 直後に停止、S3 が authority を取得              | ACK は quorum（2 台）に同期複製済み。S3 は barrier で S2 と同期してから採番するので同じ id を引き継ぐ。S2 にも届かなければ quorum が揃わず fail-closed（採番せず待つ）                                                                                                                                                                                    |
-| 18  | commit 直後、H2 の switch が遅れる                               | H2 は prepare ack の時点で書き込みを閉じており、switch 完了まで開けない。仮に閉じ忘れても調停者の committed generation と自分の active が違うのでゲートは閉じる。旧 generation のアドレスへの書き込みは起きない                                                                                                                                           |
-| 19  | S3 が分断中に S1 / S2 で ACK、その後 S1 停止                     | S3 が調停者に届いて authority を取っても、S2 と同期できなければ barrier を抜けられない（fail-closed）。S2 と通じれば S2 の replica API から origin=S1 の範囲を回収して引き継ぐ。`force-authority` は保証外                                                                                                                                                |
-| 20  | prepare 済みの H2 で 60 s 経過、その直前に commit                | H2 はローカル timeout ではゲートを開け直さない（`stale pending` 表示のみ）。次の読み取りで調停者の committed == pending を見て switch する。abort されていれば aborted == pending を見て開け直す                                                                                                                                                          |
-| 21  | ACK の origin S1 が停止、複製は S2 にだけ                        | 新 authority は S2 の replica API に origin=S1 の不足範囲を要求して回収する。origin にしか問い合わせない方式では取れない                                                                                                                                                                                                                                  |
-| 14  | `action-executor` の S1 が OS サスペンド                         | S1 の renew が止まり ttl + margin 後に S2 が取得。S1 が復帰した瞬間に期限前に発行済みだった PLC 書き込みが遅れて届く余地があり（bounded-delay、5.1）、S1 は単調時計の跳びを検知して即座にリースを放棄する。strict が要る Action は command gate（5.3）                                                                                                    |
+| #   | 事象                                                               | 期待する振る舞い                                                                                                                                                                                                                                                                                                                                          |
+| --- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | H1 のプロセス停止                                                  | H1 のハートビートが止まり ttl + margin 後に H2 が Hub 側の役割（`config-primary`、MQTT）を取得。H1 側サイドカーの DB リースも期限切れになり H2 側サイドカーが取得して INSERT 開始（台をまたぐ重複行は無い）。client は Transport 失敗で H2 へ切替、名前で再バインド。H2 は新 primary なので書き込みを受ける。切替の間（ttl + margin + backoff）の値は欠落 |
+| 2   | H1 の NIC 断（PLC には届くが LAN に出ない）                        | client は H2 へ。H1 は PLC には届くので PLC 調停上は保持者のまま → **MQTT は H1 が続けようとする**（ブローカーに届くかは別）。Sink は H1 側サイドカーが DB に届かず DB リースが切れ、H2 側が取る。H2 は primary を確認できず（鮮度失効）書き込みを受けない → 運用者が H1 の役割を手放させる。この事象は**調停が PLC 側にある弱点**として §10 #8 に残す    |
+| 3   | H1 と PLC の間の断（LAN は生きている）                             | H1 の renew が失敗し副作用停止。H2 が取得。H1 の値は Bad、client は値が Bad でも接続は維持（H1 が PLC に届かないだけで Hub は生きている）→ **client 側の切替条件に「全接続が Bad」を足すか**は §10 #9                                                                                                                                                     |
+| 4   | PLC の系切替（A → B）                                              | 各 Hub の接続層が endpoint を切替。切替中は Bad。調停ワードはトラッキングで引き継がれるので保持者は変わらない                                                                                                                                                                                                                                             |
+| 5   | H1 と H2 の相互断、両方 PLC には届く                               | 調停は PLC なので保持者は 1 台のまま。client は自分が届く方へ。**分断しても副作用は 1 台**                                                                                                                                                                                                                                                                |
+| 6   | 全 Hub が PLC に届かない                                           | 全役割が失効、副作用は全停止。client は値 Bad。安全側                                                                                                                                                                                                                                                                                                     |
+| 7   | S1 停止                                                            | S2 が `action-executor` / `alarm-authority` を取得し、複製済みの `opened` から occurrence id を引き継ぐ（ACK 済みは ACK 済みのまま）。recorder は S2 が続けており、区間表で S2 が正になる。画面は S2 へ切替                                                                                                                                               |
+| 8   | 設定変更（primary H1 で編集、H2 に未有効化）                       | 編集は H1 の staging に入り running には触れない。activate は H2 の ack が要るので、H2 が分断されていれば失敗して全台が旧 generation のまま。**H1 も新設定では書けない**（primary の例外なし）。運用者が有効化を完了させる。除外運用で H2 抜きに有効化した場合、H2 は `excluded` で書き込みを受けず primary にもなれない                                  |
+| 9   | 全停止からの再起動                                                 | 起動順に依存しない。各台が起動 → 調停ワードを読む → 保持者が居なければ優先度順に取得。MQTT の `$state` は保持者が `online` にする                                                                                                                                                                                                                         |
+| 10  | 時計のずれ                                                         | リースは各台の単調時計で数えるので影響なし。履歴の区間境界（6.2）に数百 ms の影響。Alarm イベントの順序は HLC なので影響なし → NTP を運用要件に                                                                                                                                                                                                           |
+| 11  | 調停が候補 B / C しか無い構成                                      | 重複許容の役割（MQTT、recorder-primary）だけが付与され、`action-executor` / `alarm-authority` / `config-primary` は誰も持たない（Sink は DB があれば D で持てる）。常時実行 Action の副作用と Alarm 操作は止まり、書き込みは固定 primary を選んだときだけ primary で受ける。状態に理由が出る（fail-closed）                                               |
+| 12  | S1 が ACK 直後に停止                                               | ACK は依存する `opened` と束ねて S2 の永続化確認後に成功を返しているので、S2 は同じ occurrence id で ACK 済みを引き継ぐ。S2 が ACK 時点で落ちていた（degraded で受けた）場合は失われうる。2 台同時故障は保証外                                                                                                                                            |
+| 13  | primary H1 が staging に未有効化の編集を残して停止                 | 調停者の committed generation は最後に commit したもの。H2 の `active_generation` がそれと一致するので H2 が primary を取得し書き込みを受ける。H1 の編集は復帰後に「未有効化」として残る                                                                                                                                                                  |
+| 15  | 有効化の途中で配布失敗（H2 は prepare 済み、H3 に届かない）        | commit point に達していないので誰も切り替えない。primary は次の prepare を出せず（未解決の pending が 1 件ある）、空の有効化（同じ fingerprint の epoch + 1）を commit して pending を解消させてから再試行する。primary は旧 generation のまま書き込みを受ける                                                                                            |
+| 16  | H2 が最新の有効化を知らないまま分断され、その間に primary が停止   | H2 の `active_generation` は調停者の committed generation と一致しないので `config-primary` を取れない。誰も一致しなければ書き込み不可（安全側）。H2 は復帰後に catch-up                                                                                                                                                                                  |
+| 17  | N=3 で S1 が ACK 直後に停止、S3 が authority を取得                | ACK は quorum（2 台）に同期複製済み。S3 は barrier で S2 と同期してから採番するので同じ id を引き継ぐ。S2 にも届かなければ quorum が揃わず fail-closed（採番せず待つ）                                                                                                                                                                                    |
+| 18  | commit 直後、H2 の switch が遅れる                                 | H2 は prepare ack の時点で書き込みを閉じており、switch 完了まで開けない。仮に閉じ忘れても調停者の committed generation と自分の active が違うのでゲートは閉じる。旧 generation のアドレスへの書き込みは起きない                                                                                                                                           |
+| 19  | S3 が分断中に S1 / S2 で ACK、その後 S1 停止                       | S3 が調停者に届いて authority を取っても、S2 と同期できなければ barrier を抜けられない（fail-closed）。S2 と通じれば S2 の replica API から origin=S1 の範囲を回収して引き継ぐ。`force-authority` は保証外                                                                                                                                                |
+| 20  | prepare 済みの H2 で 60 s 経過、その直前に commit                  | H2 はローカル timeout ではゲートを開け直さない（`stale pending` 表示のみ）。次の読み取りで調停者の committed == pending を見て switch する。空の有効化で abort されていれば committed.epoch >= pending.epoch かつ token 不一致を見て廃棄する                                                                                                              |
+| 22  | F2 → F3 と進んだ後に F2 の commit 要求が遅れて届く                 | 調停者は `committed == expected_committed`（F1）を満たさないので捨てる。F3 が F2 に戻ることはない                                                                                                                                                                                                                                                         |
+| 23  | H2 が F2 の prepare 後に長期離脱、その間に F2 abort と F3 の有効化 | 復帰した H2 は committed（F3、epoch 3）>= pending（F2、epoch 2）かつ token 不一致で pending を廃棄し、catch-up で F3 を取り込んでから書き込みを再開する                                                                                                                                                                                                   |
+| 21  | ACK の origin S1 が停止、複製は S2 にだけ                          | 新 authority は S2 の replica API に origin=S1 の不足範囲を要求して回収する。origin にしか問い合わせない方式では取れない                                                                                                                                                                                                                                  |
+| 14  | `action-executor` の S1 が OS サスペンド                           | S1 の renew が止まり ttl + margin 後に S2 が取得。S1 が復帰した瞬間に期限前に発行済みだった PLC 書き込みが遅れて届く余地があり（bounded-delay、5.1）、S1 は単調時計の跳びを検知して即座にリースを放棄する。strict が要る Action は command gate（5.3）                                                                                                    |
 
 ---
 
@@ -700,7 +721,8 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
   役割用）、候補 C（開発用）の実装、保証レベル（strict / bounded-delay）の表示。MQTT を B で。Sink サイドカーの
   group ごとの DB リースと flush 同一トランザクションの検査（4.8）。候補 A のラダーは実機で試作
 - **R2 Hub 2 台**: 設定の generation（staging / prepare / 調停者の commit point / switch / 昇格条件）と鮮度、
-  3 者一致の書き込みゲートと有効化中の閉鎖、fenced abort（4.3）、PLC ワードの double buffer（5.3）、`config-primary` のリース化と固定 primary の選択肢、API キーは (b)、client の
+  3 者一致の書き込みゲートと有効化中の閉鎖、predecessor 付き CAS と空の有効化による abort、未解決 pending
+  1 件の制約（4.3）、PLC ワードの double buffer（req / cmd を含む、5.3）、`config-primary` のリース化と固定 primary の選択肢、API キーは (b)、client の
   `accepted_generation`（§7）、状態画面。実機で §8 の #1 / #2 / #3 / #5 / #8 / #9 / #13 / #15 / #16 を確認
 - **R3 SCADA server 2 台**: recorder の区間表による統合（`tstore_lease_log`）、`alarm-authority` の採番と
   occurrence イベント、操作者イベントの因果複製（依存する `opened` を束ねる、origin seq と HLC の永続化、
@@ -732,7 +754,8 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
    調停が PLC だけで閉じなくなる。推奨: 混ぜず、運用者の手動切替と監視で対応
 9. **client の切替条件に「値が全部 Bad」を含めるか**（§8 #3）: 含めると PLC 停止時に client が Hub 間を
    往復する。推奨: 含めず、Bad は Bad として表示する
-10. **固定 primary を選択肢として残すか**（4.3）: A / D の無い現場向けに固定 primary を残す案でよいか
+10. **固定 primary を選択肢として残すか**（4.3）: A / D の無い現場向けに、primary ローカルの耐久レコードを
+    commit point とする単一ノード版の手順で残す案でよいか。外せば設計は単純になる
     （primary 停止中は全台で書き込み不可）。残さないなら、そうした現場では冗長構成での書き込みは不可になる
 11. **id 未確定の Alarm の扱い**（6.3）: authority の `opened` が届くまで操作（ACK / Shelve）を受けない案で
     よいか（表示はする）。受ける案は、仮 id で受けて確定後に読み替える複雑さが増える
@@ -760,6 +783,8 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
     できずに死んだ場合は、新 primary の昇格（committed と一致する台）を待って fenced abort する
 21. **Alarm の membership 変更を計画停止のみにする**（6.3）: 初版は候補の追加・削除に authority の停止と
     watermark の一致確認を要求する。無停止の joint transition は後続でよいか
+22. **abort を「空の有効化」で表す**（4.3、5.3）: 専用の aborted 領域を持たず、同じ fingerprint の epoch + 1 を
+    commit して pending を解消する案でよいか。epoch が abort のたびに進む（運用上の害は無い）
 
 ---
 
@@ -770,6 +795,7 @@ scada-design.md §22 #19 の「単一構成が動いてから」に従い、**�
 | 2026-09-30 | 3 層独立、読み取り・評価は全台、副作用は 1 台（リース）、PLC 調停第一候補、名前束縛が前提、SCADA server だけ先行しない                                                                                                                                                                                                                                                                                                                           | scada-design.md §13.2（オーナー） |
 | 2026-09-30 | 本草案を作成。§3〜§9 は提案、§10 はオーナー判断待ち                                                                                                                                                                                                                                                                                                                                                                                              | 本書                              |
 | 2026-09-30 | オーナーレビュー（PR #475 1 回目）の方向: クロスインスタンスの同一性、Action の真正な fencing、設定不一致時の write fail-closed を先に固める。→ 6.3 の `alarm-authority`、5.1 の役割 2 種と A / D 限定、4.3 の fail-closed、6.3 の origin seq + HLC、6.2 の区間ごとの正ソースに反映                                                                                                                                                              | PR #475 レビュー（オーナー）      |
+| 2026-10-01 | オーナーレビュー（PR #475 7 回目）の方向: commit を predecessor 付きの真正な CAS にする、未解決 pending を次の prepare で上書きさせない、strict command gate の payload も原子的に見せる。→ 4.3 / 5.3 の `expected_committed` 付き CAS と調停者基準の epoch 採番、未解決 1 件の制約、空の有効化による abort と aborted 領域の廃止、cmd の double buffer と `cmd_ack_seq` の分離、固定 primary の単一ノード版に反映                               | PR #475 レビュー（オーナー）      |
 | 2026-09-30 | オーナーレビュー（PR #475 6 回目）の方向: pending timeout と commit の競合を調停者上で解消する、Alarm quorum recovery が非 origin の replica からもイベントを回収できるようにする、quorum membership の変更規則を固定する。→ 4.3 / 5.3 の fenced abort と req / aborted のワード、6.3 の replica API と origin ごとの watermark、固定 membership と計画停止の手順、5.3 の double buffer、HLC の受信時 merge、heartbeat の 2 ワード表記に反映     | PR #475 レビュー（オーナー）      |
 | 2026-09-30 | オーナーレビュー（PR #475 5 回目）の方向: 書き込みゲートに調停者の committed generation を直接入れる、PLC 調停者が generation 全体を比較できる表現にする。→ 4.3 の 3 者一致ゲートと有効化中の閉鎖、5.3 の 96 bit generation token と 32 bit の epoch 類、6.3 の quorum barrier と `ack_replicas` = quorum、4.8 の `clock_timestamp()` と行ロック先行に反映                                                                                       | PR #475 レビュー（オーナー）      |
 | 2026-09-30 | オーナーレビュー（PR #475 4 回目）の方向: 設定の generation に共有された単一の commit point を置く（有効化の途中故障と stale primary の昇格を同じ仕組みで解消）、Alarm は連続 watermark と authority 昇格前の catch-up barrier。→ 4.3 の prepare / commit / switch と調停者基準の昇格、5.3 の committed generation ワード、6.3 の連続 watermark・範囲同期・barrier・`ack_replicas` 既定、4.8 の `expires_at >= now()` guard、§7 の解除条件に反映 | PR #475 レビュー（オーナー）      |
