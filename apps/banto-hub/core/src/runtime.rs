@@ -143,7 +143,7 @@ use std::time::Duration;
 
 use banto_collect::{CollectorOptions, Quality, RegistrySnapshot};
 use banto_core::BantoError;
-use banto_server::{lan_urls, start, static_router, RunningServer, ServerConfig};
+use banto_server::{lan_urls_for_bind, start, static_router, RunningServer, ServerConfig};
 use banto_tags::{
     CollectionGroupService, PlcConnectionInput, PlcConnectionService, TagService,
     CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
@@ -632,14 +632,20 @@ impl HubRuntime {
         )
         .merge(static_router::<FrontendAssets>());
 
-        let server = start(ServerConfig { bind, port }, app)
-            .await
-            .map_err(HubStartError::ServerStart)?;
+        let server = start(
+            ServerConfig {
+                bind: bind.clone(),
+                port,
+            },
+            app,
+        )
+        .await
+        .map_err(HubStartError::ServerStart)?;
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
         log_line("banto-hub: listening at:");
-        for url in lan_urls(server.local_addr().port()) {
+        for url in lan_urls_for_bind(&bind, server.local_addr().port()) {
             log_line(&format!("  {url}"));
         }
         if grpc_settings.enabled {

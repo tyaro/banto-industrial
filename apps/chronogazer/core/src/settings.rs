@@ -269,6 +269,43 @@ impl SettingsService {
         Ok(())
     }
 
+    /// Upsert several keys in ONE transaction: either every pair is stored or
+    /// none is. banto v2.0.0 移行（freshness audit of banto #266, P2-3 -
+    /// `banto-admin-services` の同名メソッドの写し。ChronoGazer は SQLite
+    /// のみなので分岐はない）: [`SettingsService::set_auth_config`] must not
+    /// leave `auth.disabled` saved and `auth.disabled_role` not, since the
+    /// desktop app re-binds its session from what it saved.
+    pub async fn set_many(&self, pairs: &[(&str, &str)]) -> Result<(), BantoError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        for (key, value) in pairs {
+            sqlx::query(
+                "INSERT INTO settings (key, value) VALUES (?, ?)                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(*key)
+            .bind(*value)
+            .execute(&mut *tx)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        }
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(())
+    }
+
+    /// Is `key` one of the auth-mode keys only
+    /// [`SettingsService::set_auth_config`] may write (the `auth.`
+    /// namespace)? The desktop app's generic `settings_set` refuses them
+    /// (freshness audit of banto #266, P2-2): a raw write would bypass its
+    /// session re-bind and lock. `banto-admin-services` の
+    /// `SettingsService::is_auth_key` と同じ判定（ChronoGazer はその crate に
+    /// 依存していないので自前で持つ）。
+    pub fn is_auth_key(key: &str) -> bool {
+        key.starts_with("auth.")
+    }
+
     /// Read a per-user UI setting (spec M12 SettingsProvider migration):
     /// theme/preset/dock-layout, namespaced per authenticated account so two
     /// users sharing one app instance never see each other's UI state.
@@ -408,28 +445,29 @@ impl SettingsService {
             ));
         }
 
-        self.set(
-            KEY_AUTH_DISABLED,
-            if config.disabled { "true" } else { "false" },
-        )
-        .await?;
-        self.set(KEY_AUTH_DISABLED_ROLE, config.disabled_role.as_str())
-            .await?;
-        self.set(
-            KEY_AUTOLOGIN_ENABLED,
-            if config.autologin_enabled {
-                "true"
-            } else {
-                "false"
-            },
-        )
-        .await?;
-        self.set(
-            KEY_AUTOLOGIN_USERNAME,
-            config.autologin_username.as_deref().unwrap_or(""),
-        )
-        .await?;
-        Ok(())
+        // One transaction (banto v2.0.0 移行, freshness audit of banto #266,
+        // P2-3): all four keys or none, so a failure part-way never leaves a
+        // mode saved that the desktop app's session re-bind did not follow.
+        self.set_many(&[
+            (
+                KEY_AUTH_DISABLED,
+                if config.disabled { "true" } else { "false" },
+            ),
+            (KEY_AUTH_DISABLED_ROLE, config.disabled_role.as_str()),
+            (
+                KEY_AUTOLOGIN_ENABLED,
+                if config.autologin_enabled {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+            (
+                KEY_AUTOLOGIN_USERNAME,
+                config.autologin_username.as_deref().unwrap_or(""),
+            ),
+        ])
+        .await
     }
 
     /// 収集ランタイムの保存設定を読む（#383 段階2b / R1-C）。未設定のキーは
@@ -605,6 +643,24 @@ mod tests {
         svc.set(KEY_AUTH_DISABLED_ROLE, "not-a-role").await.unwrap();
         let config = svc.auth_config().await.unwrap();
         assert_eq!(config.disabled_role, Role::Admin);
+    }
+
+    /// banto v2.0.0 移行（freshness audit of banto #266, P2-3）: `set_many`
+    /// stores every pair (one transaction), and `is_auth_key` marks the
+    /// `auth.` namespace - but not ChronoGazer's own keys.
+    #[tokio::test]
+    async fn set_many_stores_every_pair_and_auth_keys_are_marked() {
+        let svc = service().await;
+        svc.set_many(&[("a.one", "1"), ("a.two", "2")])
+            .await
+            .unwrap();
+        assert_eq!(svc.get("a.one").await.unwrap().as_deref(), Some("1"));
+        assert_eq!(svc.get("a.two").await.unwrap().as_deref(), Some("2"));
+        assert!(SettingsService::is_auth_key("auth.disabled"));
+        assert!(SettingsService::is_auth_key("auth.autologin.username"));
+        assert!(!SettingsService::is_auth_key("audit.retention_days"));
+        assert!(!SettingsService::is_auth_key(KEY_DATA_DIR));
+        assert!(!SettingsService::is_auth_key(KEY_RETENTION_DAYS));
     }
 
     #[tokio::test]
