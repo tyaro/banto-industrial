@@ -4,8 +4,9 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
 
 /**
  * `settings/` route group 全体の可視カテゴリを計算する（#359 段階2）。
- * `await parent()` で `(app)/+layout.ts` が `sessionStore` を初期化済みで
- * あることを保証してから判定する（`users/+page.ts` と同じ順序要件）。
+ * `await parent()` で `(app)/+layout.ts` がセッションを確定済み（`sessionStore`
+ * は SessionController の snapshot からの導出）であることを保証してから判定する
+ * （`users/+page.ts` と同じ順序要件）。
  *
  * 可視条件は元 `+page.svelte`（段階1の各 section）の `{#if}` ガードを
  * そのまま踏襲しただけで、新しい判定は作っていない:

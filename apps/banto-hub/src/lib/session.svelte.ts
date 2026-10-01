@@ -1,63 +1,69 @@
+// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
+// `apps/admin-template/src/lib/session.svelte.ts` を写した（v2 移行 PR1d）。
+// banto-hub 固有の差:
+// - `publicViewer` を削った（このアプリには閲覧公開（viewer-public）が無く、
+//   `(app)/+layout.ts` も `publicViewerFallback` を使わない）。
+// - `authDisabled` は `false` 固定（Tauri のログイン不要モードは無い。banto-hub
+//   は headless の axum サーバーが配信する UI だけ。v1 から同じ）。
+// - `commissioningMode` を足した（試運転モード、設計 §5.6・2026-08-30 オーナー
+//   決定）。controller が `adopt(..., 'commissioning', ticket)` で確定した合成
+//   セッションかどうか。確定させるのは `$lib/banto/commissioningPolicy.ts` の
+//   policy runner だけ（v1 の `enterCommissioningMode()` の直接代入は廃止）。
 /**
- * relay-wright の同名ファイルから複製。現在セッションの identity/role
- * （Svelte 5 runes）。
+ * Current session's identity/role (Svelte 5 runes), spec M10 RBAC.
  *
- * 差分1: `authDisabled` は常に false 固定に単純化した。relay-wright の
- * ログイン不要モード（Tauri のみ・spec M11）は banto-hub のスコープ外
- * （実装指示「スコープ外: ...自動ログイン設定セクション」）なので、
- * `isTauri()`/`getAuthSettings()` への依存自体を削除している（banto-hub
- * は Tauri を持たない headless axum サーバーのみ）。
+ * Issue #260 (v2.0.0, design §6.1, I-12): every field is DERIVED from the
+ * default `SessionController`'s snapshot - the one writer of "who is signed
+ * in". Nothing here is assigned from a `load` any more (the pre-v2 `load()`
+ * wrote identity/role and read `authDisabled` separately after an `await`,
+ * which could apply a stale answer - S-61). So every page/component under
+ * the `(app)` route group reads the confirmed session reactively, all fields
+ * from the SAME snapshot.
  *
- * 差分2（試運転モード、設計 §5.6・2026-08-30 オーナー決定）: `commissioningMode`
- * と `enterCommissioningMode()` を追加した。`(app)/+layout.ts` のルート
- * ガードが `$lib/banto/commissioning.ts` の `shouldBypassLoginForCommissioning`
- * でログインを迂回すると判断したときだけ呼ばれる。
+ * Ordering note: SvelteKit does NOT guarantee a child route's `load()` waits
+ * for an ancestor layout's `load()` to finish unless it calls `await
+ * parent()` - so `routes/(app)/users/+page.ts` (and the other loads that
+ * need `role`) do exactly that rather than reading `sessionStore.role`
+ * optimistically: after `(app)/+layout.ts` resolved, the controller has
+ * confirmed the session. Components render only after that load resolved.
+ *
+ * While the session is not confirmed (`unknown`, e.g. the hold after
+ * another tab's login) or confirmed `none`, `identity` is `null` and `role`
+ * is the least-privileged `viewer` (fail closed, `parseRole`).
  */
-import { getAuthProvider, type Identity } from '@banto/admin-core';
+import { getSessionController, type Identity } from '@banto/admin-core';
 import { parseRole, type Role } from './permissions';
-import { COMMISSIONING_IDENTITY } from './banto/commissioning';
 
 class SessionStore {
-	identity: Identity | null = $state(null);
-	role: Role = $state('viewer');
+	/** The confirmed identity, or `null` unless the session is `active`. */
+	readonly identity: Identity | null = $derived.by(() => {
+		const snapshot = getSessionController().snapshot;
+		return snapshot.status === 'active' ? snapshot.identity : null;
+	});
+
+	readonly role: Role = $derived(parseRole(this.identity));
 
 	/** banto-hub には Tauri のログイン不要モードが無いため常に false。 */
-	authDisabled = $state(false);
+	readonly authDisabled: boolean = false;
 
 	/**
-	 * 試運転モード（未ロックダウン）中か。設定画面のロックダウンセクション
-	 * の表示条件はこのフラグで決まる（`status/+page.svelte`「サーバー状態」
-	 * の表示にも使う）。
+	 * 試運転モード（未ロックダウン）の合成セッションが確定しているか
+	 * （`kind === 'commissioning'` かつ `active`）。設定画面のロックダウン
+	 * セクションの表示条件（`settings/+layout.ts`・`SecuritySection.svelte`）、
+	 * `status/+page.svelte`「サーバー状態」の表示、タグストリームの接続先
+	 * （`tagMonitorAdmin.ts`）、再接続の失敗後の確認（`sessionRecheck.ts`）が
+	 * 読む。
 	 *
-	 * T19 S1-d（UX-45、2026-09-03）: 常時表示していた警告バナー
-	 * （`(app)/+layout.svelte` の `CommissioningBanner.svelte`）は撤去した
-	 * - このフラグ自体・ロックダウンセクションの表示条件は変えていない。
+	 * サーバーは試運転モード中、認証の有無に関わらず全リクエストを合成 admin
+	 * として受け付ける（`actor_identity`）が、`/api/auth/identity` はその合成
+	 * identity を返さない（`$lib/banto/commissioning.ts` の
+	 * `COMMISSIONING_IDENTITY` の doc）。そこで provider には問い合わせず、
+	 * policy runner が `adopt()` で確定する（設計 §6.2、S-44）。
 	 */
-	commissioningMode = $state(false);
-
-	/** 現在の identity を取得し、role を導出する（フェイルクローズ - parseRole 参照）。 */
-	async load(): Promise<void> {
-		this.commissioningMode = false;
-		this.identity = await getAuthProvider().getIdentity();
-		this.role = parseRole(this.identity);
-	}
-
-	/**
-	 * 試運転モード用の初期化。**ネットワークを叩かない** - `getIdentity()`
-	 * はローカルに bearer トークンが無いと `/api/auth/identity` すら呼ばず
-	 * `null` を返す（`$lib/banto/commissioning.ts` の `COMMISSIONING_IDENTITY`
-	 * の doc comment参照）ため、通常の `load()` を試運転モードで呼んでも
-	 * 「セッション無し（role: viewer）」にしかならず、admin-only の
-	 * ナビゲーション項目（設定画面のロックダウン操作を含む）が軒並み
-	 * 見えなくなってしまう。サーバー側が試運転モード中は無条件に admin
-	 * 相当としてリクエストを受け付ける（`actor_identity`）事実をフロント
-	 * 側の RBAC 表示に反映するため、合成 identity をその場で設定する。
-	 */
-	enterCommissioningMode(): void {
-		this.identity = COMMISSIONING_IDENTITY;
-		this.role = parseRole(this.identity);
-		this.commissioningMode = true;
-	}
+	readonly commissioningMode: boolean = $derived.by(() => {
+		const snapshot = getSessionController().snapshot;
+		return snapshot.status === 'active' && snapshot.kind === 'commissioning';
+	});
 }
 
 export const sessionStore = new SessionStore();
