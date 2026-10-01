@@ -1,7 +1,7 @@
 # banto-scada 設計ドキュメント（草案）
 
 作成日: 2026-09-30  
-最終更新: 2026-10-01（§22 の未決 6 件を決定: Project package は `.bantoscada` で directory / ZIP の 2 表現（§5.1）、Stable ID は UUID v7（§4.2）、Screen 座標は f64 design unit + SVG viewBox（§6.4）、式は banto-expr を Rust 側で評価し presentation semantics は宣言的 mapping（§9.5）、Editor / Runtime は v1 は同一 executable の mode で capability を分離（§18）、Design API は loopback REST + ephemeral bearer token のみ（§19.13）。AI 変更の承認要否は semantic risk を Design Domain が算出（§19.7）。2026-09-30: DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
+最終更新: 2026-10-01（§22 の未決 6 件を決定: Project package は `.bantoscada` で directory / ZIP の 2 表現（§5.1）、Stable ID は UUID v7（§4.2）、Screen 座標は f64 design unit + SVG viewBox（§6.4）、式は banto-expr を Rust 側で評価し presentation semantics は宣言的 mapping（§9.5）、Editor / Runtime は v1 は同一 executable の mode で capability を分離（§18）、Design API は loopback REST + ephemeral bearer token のみ（§19.13）。AI 変更の承認要否は semantic risk を Design Domain が算出（§19.7）。決定の帰結として生じた残件 #22〜#27 を §22 に追加、manifest の `exportedAt` / `contentHash` を archive-only に（§4.3）。2026-09-30: DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
 状態: **設計中（初版ドラフト）**
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
@@ -313,6 +313,11 @@ contentHash
 - minRuntimeVersion: Runtime 互換判定
 - contentHash: 同 revision なのに中身が異なる競合検知
 
+**注（2026-10-01）**: `exportedAt` と `contentHash` は `checksums.json`（§5.1）と同じ **archive-only
+metadata** とし、directory representation の manifest.json には置かない（置くと git で 1 行直すたびに
+古くなり、§5.2 の競合検知が手編集で残った古い hash に引っかかる）。export 時に算出して書き込み、import 時
+は archive の中身から再計算して照合する。directory を直接読み込む場合は読込時に算出する。
+
 ---
 
 ## 5. Project Import / Export
@@ -349,7 +354,8 @@ checksums.json      （archive-only metadata。下記）
 
 `checksums.json` は **`.bantoscada` の export 時だけ生成する archive-only metadata** とし、directory
 representation には置かない（置くと git で 1 行直すたびに壊れる）。export 時に生成し、import 時に検証する。
-`checksums.json` 自身は checksum の対象に含めない。
+`checksums.json` 自身は checksum の対象に含めない。manifest.json の `exportedAt` / `contentHash` も同じ
+archive-only の扱いとする（§4.3）。
 
 ### 5.2 更新判定
 
@@ -2119,10 +2125,11 @@ SCADA Design API に PLC write の runtime bypass を作らない。
 
 ### 19.13 公開範囲とセキュリティ（2026-10-01 オーナー決定: v1 は loopback のみ）
 
-v1 の Design API は **Editor mode only / REST / `127.0.0.1` loopback only / OpenAPI / ephemeral bearer
-token** とする。
+Design API の初版は **Editor mode only / REST / `127.0.0.1` loopback only / OpenAPI / ephemeral bearer
+token** とする（REST / OpenAPI の露出時期は §3 のとおり後続 Extension。Editor / CLI / AI が共有する Design
+Domain 自体は Core）。
 
-- **remote bind は v1 では提供しない**。必要になった場合に、TLS、client authentication、authorization、
+- **remote bind は初版では提供しない**。必要になった場合に、TLS、client authentication、authorization、
   audit、network exposure policy をまとめて別設計する
 - bearer token は `Authorization: Bearer <token>` **でのみ**受け付け、query string には載せない
 - CORS は原則拒否する（localhost 経由のブラウザからの攻撃対策）
@@ -2388,7 +2395,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 8. Core v1 に含める Extension の範囲 → 2026-09-30 決定済み（§3。v1 は画面とライブ値・操作まで、scada-server 系は v1.1）
 9. Tracking PLC block の標準 memory layout
 10. Editor/Runtime の executable 分離時期 → 2026-10-01 決定済み（§18、v1 は同一 executable の mode。分離は配布・security・licensing 等の要求が出た時点で判断、host 3 着手時に再確認）
-11. Design API の最終 transport / bind policy → 2026-10-01 決定済み（§19.13、Editor mode + loopback REST + OpenAPI + ephemeral bearer token。remote bind は v1 で提供しない）
+11. Design API の最終 transport / bind policy → 2026-10-01 決定済み（§19.13、Editor mode + loopback REST + OpenAPI + ephemeral bearer token。remote bind は初版で提供しない。REST の露出時期は §3 の後続 Extension）
 12. AI change plan の承認を必須にする変更範囲 → 2026-10-01 方針決定（§19.7、semantic risk を Design Domain が算出し plan / apply で判定）。risk class の具体表は AI 設計支援の実装時に確定
 13. protocol-specific Alarm adapter の優先順位（MELSEC は汎用 Alarm 後）
 14. Binding identity の方式 → 2026-09-30 決定済み（§9.6、名前のみ。案 C の改名候補提示は必要が出たら拡張）
@@ -2399,6 +2406,12 @@ MCP 自体は roadmap の blocking milestone にしない。
 19. 冗長化の詳細設計（Hub と SCADA server を横断する別草案 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、2026-09-30 草案作成、§10 にオーナー判断待ちの一覧）: リースの実装方式（PLC 調停を第一候補）、Hub の warm standby と構成・API キー・internal タグの同期、client の複数エンドポイント切替、recorder の履歴統合、Alarm の操作者状態の複製、PLC 冗長系のドライバ対応（複数 endpoint、MELSEC の制御系指定の確認）。原則は §13.2 で決定済み。scada-server と Hub の単一構成が動いてから着手する
 20. Tracking domain の host（Hub 側の ingest か SCADA server か。§12、§2）
 21. Replay の実装時期とライセンス上の扱い（§13.3。将来機能、有料版候補。前提条件 1〜4 は v1 に残す）
+22. directory representation を git / 手編集した場合の projectRevision の扱い（§5.1 の 2 表現決定で生じた論点。Design API 経由なら Design Domain が bump するが、直接編集では誰も上げない。読込時に内容 hash の不一致を revision 不整合として扱う等の規則が要る）
+23. Expression の結果 Quality の導出規則（§9.5。banto-expr は NaN を伝播し品質を持たないため、Hub computed tag と同じく入力の最悪値を継承するのが候補）と、string タグ参照の拒否を SCADA 側 validation のどこで行うか（banto-expr は登録側に委ねる。§8.3 の対応表を使う。S3 で確定）
+24. 回転の pivot（object 中心か origin か）と `preserveAspectRatio`（画面比が違うモニタで letterbox か stretch か）（§6.4。snap 精度と違い schema の意味論なので、S2 の Screen schema 確定時に決める）
+25. Editor / Runtime mode の確定タイミング（§18。Tauri 2 の capability は window label に静的に束縛されるため「起動時に確定し、プロセス内で切り替えない（切替は再起動）」が素直。v1 では操作者が同じ executable を Editor mode で起動できることを許容するかを明示する）
+26. Design API session descriptor の脅威モデルの明記（§19.13。token を同一ユーザーの他プロセスが読める点は VS Code / Docker と同じ「同一ユーザーは信頼」の前提として受容するか。pid 再利用で stale 判定を誤る点は token で疎通確認してから掃除すれば回避できる）
+27. 別 Project から Symbol を取り込む際の SymbolId の扱い（§4.2。更新検知のため同じ UUID を保つか再発行するか。#3 の Binding UUID 未決と同時期に決める）
 
 ---
 
@@ -2440,7 +2453,7 @@ MCP 自体は roadmap の blocking milestone にしない。
 - Screen 座標は f64 design unit + SVG viewBox。top-left origin / +x right / +y down / rotation degree（2026-10-01 オーナー決定、§6.4）
 - 式は banto-expr の parser / typecheck / evaluator を Rust 側で再利用し、TypeScript へ再実装しない。presentation semantics は宣言的 mapping で表し、別の式言語を作らない。WASM は v1 で使わない（2026-10-01 オーナー決定、§9.5）
 - v1 の Editor / Runtime は同一 executable の mode。Tauri capability と Rust domain の両方で Runtime mode から Editor mutation を拒否する。別 executable 化は配布・security・licensing 等の要求が出た時点で判断（2026-10-01 オーナー決定、§18）
-- v1 の Design API は Editor mode + 127.0.0.1 loopback REST + OpenAPI + ephemeral bearer token のみ。remote bind は提供しない（2026-10-01 オーナー決定、§19.13）
+- Design API の初版は Editor mode + 127.0.0.1 loopback REST + OpenAPI + ephemeral bearer token のみ。remote bind は提供しない。露出時期は §3 の後続 Extension（2026-10-01 オーナー決定、§19.13）
 - AI 変更の承認要否は semantic risk で判断し、risk class は Design Domain が算出して plan / apply で判定する（2026-10-01 オーナー決定、§19.7）
 - Project package へ secret を含めない
 - ems-apps の Editor UX を先行実装の知見として継承する
