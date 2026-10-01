@@ -4,7 +4,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-10-02（banto v2.0.0 への移行中は Rust クレートが v2.0.0・npm `@banto/*` が v1.7.3 とずれることを「現状ひとめ」に書いた。移行 PR1a）。2026-10-01（scada-design.md §22 の #22〜#27 を決定: projectRevision と contentHash の役割分離、式の Quality 導出、回転 pivot、mode は起動時に確定、session descriptor の脅威モデル、Symbol 取り込み時の SymbolId 保持）。2026-10-01（scada-design.md §22 の未決 6 件を決定: Project package `.bantoscada` の 2 表現、Stable ID は UUID v7、座標は f64 design unit、式は banto-expr を Rust 側で再利用、Editor / Runtime は同一 executable の mode、Design API は loopback のみ。AI 変更の承認は semantic risk）。2026-09-30（banto-hub-redundancy-design.md を新設: PLC / Hub / SCADA server の 3 層冗長化とリースの抽象の草案。scada-design.md §13.2 / §22 #19 から参照）。2026-09-30（scada-design.md §13.2: SCADA server の構成を決定。24/365 の処理は画面と別の core に置き、v1 は埋め込み起動、サービス host は後続）。2026-09-30（banto-tagclient の binding 同一性を StableTagId から external_name に変更（オーナー決定、scada-design.md §9.6）。banto-tagclient-design.md §3.1 / §4.4 を改訂）。2026-09-30（`scada-design.md` を文書地図へ追加。banto-scada の設計草案・決定/未決事項の正）。2026-09-28（追従先を banto **v1.7.3** に上げた。`banto-storage` の `ORDER BY` に
+最終更新: 2026-10-02（ChronoGazer の npm `@banto/*` を v2.0.0 に上げ、画面のセッションを SessionController に移した。banto-hub の npm は v1.7.3 のまま。移行 PR1c）。2026-10-02（banto v2.0.0 への移行中は Rust クレートが v2.0.0・npm `@banto/*` が v1.7.3 とずれることを「現状ひとめ」に書いた。移行 PR1a）。2026-10-01（scada-design.md §22 の #22〜#27 を決定: projectRevision と contentHash の役割分離、式の Quality 導出、回転 pivot、mode は起動時に確定、session descriptor の脅威モデル、Symbol 取り込み時の SymbolId 保持）。2026-10-01（scada-design.md §22 の未決 6 件を決定: Project package `.bantoscada` の 2 表現、Stable ID は UUID v7、座標は f64 design unit、式は banto-expr を Rust 側で再利用、Editor / Runtime は同一 executable の mode、Design API は loopback のみ。AI 変更の承認は semantic risk）。2026-09-30（banto-hub-redundancy-design.md を新設: PLC / Hub / SCADA server の 3 層冗長化とリースの抽象の草案。scada-design.md §13.2 / §22 #19 から参照）。2026-09-30（scada-design.md §13.2: SCADA server の構成を決定。24/365 の処理は画面と別の core に置き、v1 は埋め込み起動、サービス host は後続）。2026-09-30（banto-tagclient の binding 同一性を StableTagId から external_name に変更（オーナー決定、scada-design.md §9.6）。banto-tagclient-design.md §3.1 / §4.4 を改訂）。2026-09-30（`scada-design.md` を文書地図へ追加。banto-scada の設計草案・決定/未決事項の正）。2026-09-28（追従先を banto **v1.7.3** に上げた。`banto-storage` の `ORDER BY` に
 一意キー（既定 `id`）を足す変更と `WindowedListResource` 回復の改善が中心で（上流の admin-template 固有の修正・依存更新は
 本リポジトリには反映されない）、banto-industrial 側の API に破壊的変更は無い（banto-hub は
 v0.2.0-alpha.25）。「現状ひとめ」の上流の版を更新）。2026-09-26（追従先を banto **v1.7.2** に上げ、開いている画面がセッションの失効で
@@ -67,8 +67,10 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   （記録計）。**relay-wright**（条件付き PLC 自動書き込み）は 2026-09-24 に main から外し、
   タグ `archive/relay-wright-2026-09-24` に退避した（構想の練り直し、オーナー決定。§4b）。
   上流 `banto` は git tag / `@banto/*` を消費（`Cargo.toml`/`package.json` を正とする）。
-  **banto v2.0.0 へ移行中（2026-10-02〜）**: Rust クレートは **v2.0.0**（v2 移行 PR1a）、npm `@banto/*` は
-  **v1.7.3** のまま（PR1c・PR1d でアプリごとに v2.0.0 へ上げる）。v2 の Rust は v1.7.3 の TS とも互換なので、
+  **banto v2.0.0 へ移行中（2026-10-02〜）**: Rust クレートは **v2.0.0**（v2 移行 PR1a）。npm `@banto/*` は
+  **ChronoGazer が v2.0.0**（PR1c。banto の「派生アプリの移行の手順」のうち 1・2・3・4・5・7 を
+  admin-template から写して実装済み。6 は ChronoGazer に独自の再確認・試運転が無いので該当なし）、
+  **banto-hub は v1.7.3 のまま**（PR1d で上げる）。v2 の Rust は v1.7.3 の TS とも互換なので、
   移行の間だけ版がずれる。Rust と npm は別マニフェストで独立に追従できるが、移行が終わったら
   **揃えて上げる運用**に戻す（2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
 - **I 系（基盤 I0〜I6）**: 実装済み（I6 = banto-broker として抽出済み）。
