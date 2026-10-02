@@ -273,7 +273,7 @@ test.describe
 			await expect(page).toHaveURL(/\/monitor$/);
 			await expect(page.getByRole('button', { name: '再試行' })).toHaveCount(0);
 			await expect(status).toContainText('再接続中');
-			expect(state.attempts.length).toBeGreaterThanOrEqual(3);
+			await expect.poll(() => state.attempts.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(3);
 		} finally {
 			await page.unroute('**/api/auth/identity');
 		}
