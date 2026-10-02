@@ -3025,7 +3025,7 @@ mod tests {
     /// Modbus connection back to `"low_high"`, and re-running `migrate` (i.e.
     /// the next process start - `migrate_is_idempotent` at the crate root
     /// covers the "does not error" half) must leave that choice alone.
-    /// sqlx's `_sqlx_migrations` bookkeeping is what guarantees this; this
+    /// sqlx's bookkeeping (`crate::MIGRATIONS_TABLE`) is what guarantees this; this
     /// test pins the consequence rather than the mechanism.
     #[tokio::test]
     async fn rerunning_migrate_does_not_reapply_the_0017_backfill() {
