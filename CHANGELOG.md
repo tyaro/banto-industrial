@@ -9,7 +9,7 @@ banto v2.1.1 に追従した（v2.0.0 → v2.1.0 → v2.1.1、経路 A のみ。
 ### 変更（banto v2.1.0・v2.1.1 から banto-hub に入るもの）
 
 - **ログインの同時検証に上限が付いた**（banto-server、banto #279）。ログイン要求は、検証（argon2）を待つ前に試行枠を予約し、処理中の試行も失敗回数と同じようにしきい値の判定に数える。同時に検証できる数は IP ごとに 4・全体で 8 までで、超えた要求は待たされず、通常のレート制限と同じ答え（`RateLimited`）を即座に返す。banto-hub の `POST /api/auth/login` は banto-server の `auth_routes` をそのまま使っているので、この上限が掛かる。
-- **SSE の接続が開いたままでも、banto-server の `RunningServer::stop()` が完了する**（banto #283）。banto-hub と ChronoGazer の製品のコードは `RunningServer` / `banto_server::start` を使っていない（使うのは banto-hub の `stream.rs` のテスト用の WebSocket サーバーだけ）ので、この変更は本アプリの停止の挙動には影響しない。
+- **SSE の接続が開いたままでも、banto-server の `RunningServer::stop()` が完了する**（banto #283）。banto-hub（`apps/banto-hub/core/src/runtime.rs` の起動と停止）と ChronoGazer（`banto-serve`、Tauri の LAN サーバーの停止・再起動）は本番の経路で `banto_server::start` / `RunningServer::stop()` を使っているので、SSE の接続が開いていても停止が終わるようになる。
 - **試運転モードへの切り替えで「別のユーザーでログインされました」が出なくなった**（`@banto/admin-core`、banto #308。#291 の続き）。`SessionController` が owner の変化を比べる対象は `kind === 'account'` の active だけになり、`publicViewer`・`local`・`commissioning` などは通知を立てず、最後の具体的な owner も更新しない。管理 UI を開いたままアカウントから試運転の合成セッションへ切り替わっても通知は出ない。アカウントから別のアカウントへの切り替えは従来どおり通知する。v2.1.0 の #291 が `kind: 'local'` だけを外していたのを、#308 で `account` 以外の全般に広げた。banto-hub に効くのは `commissioning` の除外。
 - `@banto/admin-core` に `invalidateAll()` と型 `InvalidateReason` が加わった（banto #289。SSE の再接続後に購読中のリソースを再取得する上流の機能）。banto-hub 側のコードはこれらを使っていない。
 
