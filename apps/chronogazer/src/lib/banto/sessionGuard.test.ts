@@ -1,32 +1,50 @@
 /**
- * `sessionGuard.ts` のユニットテスト（banto v1.7.0 #204）。
+ * (app) ルートガード（`routes/(app)/+layout.ts`）と `sessionGuard.ts` の
+ * ユニットテスト（banto v1.7.0 #204、v2.0.0 #260 で書き直し）。
  *
  * 守りたいこと: サーバーがセッションを**照合できなかった**とき（照合の
  * `500`・到達不能）、ルートガードは
- * - `'unverified'`（エラー画面と再試行）にし、`'login'` にしない
+ * - 503（エラー画面と再試行）にし、/login へ送らない
  * - 保存しているトークン（通常の `sessionStorage` も Remember me の
  *   `localStorage` も）を消さない
  * - `status()` / `enterPublicViewer()`（閲覧者への切り替え）を呼ばない
+ *   （ChronoGazer には閲覧公開が無い）
  *
- * **本物の** `@banto/admin-core` の HTTP 認証プロバイダーと
- * `resolveProtectedSession` を使う（v1.7.0 で `check()` が 500 を reject する
- * ようになった挙動そのものを固定したいため）。ただし admin-core のパッケージ
- * 入口は Svelte 5 rune の `.svelte.ts` を推移的に読み込み、このリポジトリの
- * 最小限の読み込みで済むよう、依存の無い 2 ファイルをパッケージ内のパスから
- * 直接読む（banto-hub の同名テストと同じ形）。
+ * v1 は `resolveProtectedSession` を包んだ `decideProtectedRoute` を直接
+ * テストしていたが、v2 で確定は SessionController の役目になったので、
+ * **本物の** `@banto/admin-core` の HTTP 認証プロバイダーと既定の controller
+ * （`initBanto`）の上で、ガードの `load()` そのものを呼ぶ。`bantoReady` と
+ * テーマ設定の同期だけを差し替える。
  *
- * 後半は、デスクトップ（Tauri の `auth_check` が DB エラーで reject する）と、
+ * 後半は、デスクトップ（Tauri の `auth_resolve` が DB エラーで reject する）と、
  * 起動時の「組み込みサーバーか」の判定（`isBantoAuthCheckResponse`）。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { isHttpError, isRedirect } from '@sveltejs/kit';
+import {
+	createHttpAuthProvider,
+	getSessionController,
+	initBanto,
+	type AuthProvider,
+	type CredentialRevision,
+	type DataProvider
+} from '@banto/admin-core';
 
-vi.mock('@banto/admin-core', async () => {
-	const gate = await import('../../../node_modules/@banto/admin-core/src/sessionGate');
-	return { resolveProtectedSession: gate.resolveProtectedSession };
-});
+vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
+// `afterConfirm`: a test hook run inside the guard right after its confirmation
+// (the guard calls `settings.syncFromProvider()` synchronously there), to move
+// the session on before `load()` returns.
+const hooks = vi.hoisted(() => ({ afterConfirm: null as null | (() => void) }));
+vi.mock('$lib/settings.svelte', () => ({
+	settings: {
+		syncFromProvider: async () => {
+			hooks.afterConfirm?.();
+		}
+	}
+}));
 
-import { createHttpAuthProvider } from '../../../node_modules/@banto/admin-core/src/providers/http';
-import { decideProtectedRoute, isBantoAuthCheckResponse } from './sessionGuard';
+import { load } from '../../routes/(app)/+layout';
+import { isBantoAuthCheckResponse, SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
 
 const TOKEN_KEY = 'banto.auth.token';
 
@@ -58,6 +76,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.unstubAllGlobals();
+	hooks.afterConfirm = null;
 });
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -67,16 +86,39 @@ function jsonResponse(status: number, body: unknown): Response {
 	});
 }
 
-/** A provider whose `fetch` answers `/api/auth/check` with `check`, and records every path asked for. */
-function providerWith(check: () => Promise<Response>) {
+function useProvider(authProvider: AuthProvider): void {
+	initBanto({ dataProvider: {} as DataProvider, authProvider, resources: [] });
+}
+
+/** A real HTTP provider whose `fetch` answers `/api/auth/identity` with `identity`, recording every path asked for. */
+function httpProviderWith(identity: () => Promise<Response>) {
 	const paths: string[] = [];
 	const fetchFn = vi.fn(async (url: string | URL | Request) => {
 		const path = String(url);
 		paths.push(path);
-		if (path.endsWith('/api/auth/check')) return check();
+		if (path.endsWith('/api/auth/identity')) return identity();
 		return jsonResponse(200, { initialized: true, viewerPublic: true });
 	}) as unknown as typeof fetch;
-	return { auth: createHttpAuthProvider({ fetchFn }), paths };
+	useProvider(createHttpAuthProvider({ fetchFn }));
+	return { paths };
+}
+
+/** Run the guard; return what it threw (or its data). */
+async function runGuard(): Promise<
+	| { kind: 'data'; sessionGeneration: number }
+	| { kind: 'redirect'; location: string }
+	| { kind: 'error'; status: number; message: string }
+> {
+	try {
+		const data = await load();
+		return { kind: 'data', sessionGeneration: data.sessionGeneration };
+	} catch (thrown) {
+		if (isRedirect(thrown)) return { kind: 'redirect', location: thrown.location };
+		if (isHttpError(thrown)) {
+			return { kind: 'error', status: thrown.status, message: thrown.body.message };
+		}
+		throw thrown;
+	}
 }
 
 const unverifiedCases: [string, () => Promise<Response>][] = [
@@ -92,74 +134,127 @@ const unverifiedCases: [string, () => Promise<Response>][] = [
 	]
 ];
 
-describe('decideProtectedRoute: 照合できないときはトークンを残してエラー画面', () => {
-	for (const [label, check] of unverifiedCases) {
+describe('(app) ガード: 照合できないときはトークンを残してエラー画面（503）', () => {
+	for (const [label, identity] of unverifiedCases) {
 		it(`${label}: 通常のセッション`, async () => {
 			session.setItem(TOKEN_KEY, 'normal-token');
-			const { auth, paths } = providerWith(check);
+			const { paths } = httpProviderWith(identity);
 
-			expect(await decideProtectedRoute(auth)).toBe('unverified');
+			expect(await runGuard()).toEqual({
+				kind: 'error',
+				status: 503,
+				message: SESSION_CHECK_FAILED_MESSAGE
+			});
 			expect(session.getItem(TOKEN_KEY)).toBe('normal-token');
 			// 閲覧者への切り替え（status → enterPublicViewer）もしない
-			expect(paths.every((path) => path.endsWith('/api/auth/check'))).toBe(true);
+			expect(paths.every((path) => path.endsWith('/api/auth/identity'))).toBe(true);
 		});
 
 		it(`${label}: Remember me のセッション`, async () => {
 			local.setItem(TOKEN_KEY, 'remembered-token');
-			const { auth, paths } = providerWith(check);
+			const { paths } = httpProviderWith(identity);
 
-			expect(await decideProtectedRoute(auth)).toBe('unverified');
+			expect(await runGuard()).toMatchObject({ kind: 'error', status: 503 });
 			expect(local.getItem(TOKEN_KEY)).toBe('remembered-token');
-			expect(paths.every((path) => path.endsWith('/api/auth/check'))).toBe(true);
+			expect(paths.every((path) => path.endsWith('/api/auth/identity'))).toBe(true);
 		});
 	}
 });
 
-describe('decideProtectedRoute: 確認できたときだけ判断する', () => {
-	it('401（失効）はログイン画面へ。トークンは消える', async () => {
+describe('(app) ガード: 確定したときだけ判断する', () => {
+	it('401（失効）はログイン画面へ。トークンは消える。閲覧者への切り替えはしない', async () => {
 		local.setItem(TOKEN_KEY, 'revoked-token');
-		const { auth } = providerWith(async () => jsonResponse(401, { kind: 'unauthorized' }));
+		const { paths } = httpProviderWith(async () => jsonResponse(401, { kind: 'unauthorized' }));
 
-		expect(await decideProtectedRoute(auth)).toBe('login');
+		expect(await runGuard()).toEqual({ kind: 'redirect', location: '/login' });
 		expect(local.getItem(TOKEN_KEY)).toBeNull();
+		expect(paths.every((path) => path.endsWith('/api/auth/identity'))).toBe(true);
 	});
 
-	it('トークンが無ければログイン画面へ', async () => {
-		const { auth } = providerWith(async () => jsonResponse(200, true));
-		expect(await decideProtectedRoute(auth)).toBe('login');
+	it('トークンが無ければ問い合わせずにログイン画面へ', async () => {
+		const { paths } = httpProviderWith(async () => jsonResponse(200, null));
+		expect(await runGuard()).toEqual({ kind: 'redirect', location: '/login' });
+		expect(paths).toEqual([]);
 	});
 
-	it('200 true はそのまま進む', async () => {
+	it('確定した identity はそのまま進み、確定した世代を返す（ストアは snapshot から読む）', async () => {
 		session.setItem(TOKEN_KEY, 'live-token');
-		const { auth } = providerWith(async () => jsonResponse(200, true));
+		httpProviderWith(async () => jsonResponse(200, { id: 'alice', name: 'Alice', role: 'admin' }));
 
-		expect(await decideProtectedRoute(auth)).toBe('session');
+		const result = await runGuard();
+		const snapshot = getSessionController().snapshot;
+		expect(snapshot).toMatchObject({ status: 'active', owner: 'account:alice' });
+		expect(result).toEqual({ kind: 'data', sessionGeneration: snapshot.generation });
 		expect(session.getItem(TOKEN_KEY)).toBe('live-token');
+	});
+
+	it('返す世代は「この load が確定した世代」で、load の後に動いた今の世代ではない（I-16）', async () => {
+		let revision = 1;
+		const listeners = new Set<() => void>();
+		const rev = () => `${revision}.0` as CredentialRevision;
+		useProvider({
+			login: async () => ({ success: true }),
+			logout: async () => {},
+			resolve: async () => ({
+				status: 'active',
+				checked: rev(),
+				current: rev(),
+				identity: { id: 'alice', name: 'Alice', role: 'admin' }
+			}),
+			credentialRevision: rev,
+			onCredentialChanged(listener) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			}
+		});
+		const controller = getSessionController();
+		let confirmedGeneration = -1;
+		// Another tab's login lands right after this load confirmed Alice: the
+		// controller holds (generation moves) before the load returns.
+		hooks.afterConfirm = () => {
+			confirmedGeneration = controller.snapshot.generation;
+			revision += 1;
+			for (const listener of [...listeners]) listener();
+		};
+
+		const result = await runGuard();
+		expect(controller.snapshot.generation).not.toBe(confirmedGeneration);
+		expect(result).toEqual({ kind: 'data', sessionGeneration: confirmedGeneration });
 	});
 });
 
-describe('decideProtectedRoute: Tauri の auth_check が DB エラーで reject したとき', () => {
-	it('エラー画面にし、閲覧者への切り替えもログイン画面も選ばない', async () => {
+describe('(app) ガード: Tauri の auth_resolve が DB エラーで reject したとき', () => {
+	/** A standard provider (as the Tauri one) whose `resolve()` is `answer`. */
+	function tauriLike(answer: AuthProvider['resolve']) {
 		const status = vi.fn(async () => ({ initialized: true, viewerPublic: true }));
-		const enterPublicViewer = vi.fn(async () => true);
-		const auth = {
-			check: vi.fn(async () => {
-				throw new Error('storage: database is locked');
-			}),
+		const enterPublicViewer = vi.fn(async () => ({ success: true }));
+		const revision = '1.0' as CredentialRevision;
+		useProvider({
+			login: async () => ({ success: true }),
+			logout: async () => {},
+			resolve: answer,
+			credentialRevision: () => revision,
+			onCredentialChanged: () => () => {},
 			status,
 			enterPublicViewer
-		} as unknown as Parameters<typeof decideProtectedRoute>[0];
+		} as AuthProvider);
+		return { status, enterPublicViewer, revision };
+	}
 
-		expect(await decideProtectedRoute(auth)).toBe('unverified');
+	it('エラー画面にし、閲覧者への切り替えもログイン画面も選ばない', async () => {
+		const { status, enterPublicViewer } = tauriLike(async () => {
+			throw new Error('storage: database is locked');
+		});
+
+		expect(await runGuard()).toMatchObject({ kind: 'error', status: 503 });
 		expect(status).not.toHaveBeenCalled();
 		expect(enterPublicViewer).not.toHaveBeenCalled();
 	});
 
-	it('false（セッション無し）はログイン画面へ', async () => {
-		const auth = {
-			check: vi.fn(async () => false)
-		} as unknown as Parameters<typeof decideProtectedRoute>[0];
-		expect(await decideProtectedRoute(auth)).toBe('login');
+	it('セッション無し（none）はログイン画面へ', async () => {
+		const revision = '1.0' as CredentialRevision;
+		tauriLike(async () => ({ status: 'none', checked: revision, current: revision }));
+		expect(await runGuard()).toEqual({ kind: 'redirect', location: '/login' });
 	});
 });
 

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { getAuthProvider } from '@banto/admin-core';
+	import { getAuthProvider, notify } from '@banto/admin-core';
 	import { bantoReady, getBantoMode } from '$lib/banto/setup';
 
 	// Undecided until `status()` resolves (or is absent, treated as
@@ -27,6 +27,13 @@
 	let showRemember = $state(false);
 	let remember = $state(false);
 
+	// banto v2.0.0（#260、design §6.1）: ログイン・初回セットアップが
+	// `superseded`（別のログイン・ログアウトが先に確定し、このログインは何も
+	// 保存しなかった）を返したら、エラーではなく通知して /monitor へ移る。保護
+	// ガード（`(app)/+layout.ts`）が今保存されている資格情報で確定する。
+	// admin-template の `routes/login/+page.svelte` と同じ扱い（文言も同じ）。
+	const LOGIN_SUPERSEDED_MESSAGE = '別のセッションが先に確定しました。現在のセッションで開きます。';
+
 	$effect(() => {
 		void (async () => {
 			await bantoReady; // provider selection (spec §11.1's three-way probe) must finish first
@@ -52,6 +59,9 @@
 			if (showRemember && remember) params.remember = true;
 			const result = await getAuthProvider().login(params);
 			if (result.success) {
+				goto('/monitor');
+			} else if (result.superseded) {
+				notify('info', LOGIN_SUPERSEDED_MESSAGE);
 				goto('/monitor');
 			} else {
 				error = result.error ?? 'ログインに失敗しました';
@@ -83,6 +93,9 @@
 			}
 			const result = await setup({ username, password, displayName });
 			if (result.success) {
+				goto('/monitor');
+			} else if (result.superseded) {
+				notify('info', LOGIN_SUPERSEDED_MESSAGE);
 				goto('/monitor');
 			} else {
 				error = result.error ?? 'セットアップに失敗しました';

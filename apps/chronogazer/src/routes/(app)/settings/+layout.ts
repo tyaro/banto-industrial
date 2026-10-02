@@ -42,18 +42,18 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   稼働状態はそれとは性質が違う（`COLLECT_READ_ROLE` の Rust doc と同じ
  *   考え方）。
  *
- * `depends('settings:categories')` を宣言し、`SecuritySection.svelte` が
- * 認証モードの変更に成功したあと `invalidate('settings:categories')` を
- * 呼べるようにする（PR #372 Copilot レビュー指摘）。`canManageAuthMode()`
- * は `sessionStore.authDisabled`（エスケープハッチ、spec M11）を参照する
- * ため、admin 未満のロールでログイン不要モードを OFF に戻すと
- * `canManageAuthMode()` の結果が変わる - この `load` は再実行されるまで
- * 結果を再計算しないので、依存キーで明示的に再実行できるようにしておかない
- * とナビに `セキュリティ` が残ったまま `SecuritySection` が何も描画しない
- * 空のページになる。
+ * 認証モードの変更後の再計算: `canManageAuthMode()` は
+ * `sessionStore.authDisabled`（エスケープハッチ、spec M11）を参照するため、
+ * admin 未満のロールでログイン不要モードを OFF に戻すと結果が変わる - この
+ * `load` は再実行されるまで結果を再計算しないので、そのままだとナビに
+ * `セキュリティ` が残ったまま `SecuritySection` が何も描画しない空のページに
+ * なる（PR #372 Copilot レビュー指摘）。`SecuritySection.svelte` が変更の
+ * 成功後に `invalidateAll()` を呼び、この `load` は `(app)/+layout.ts` の
+ * 確定（banto v2.0.0 の SessionController）の後に再実行される（以前の
+ * `depends('settings:categories')` と `invalidate(...)` は v2 移行で
+ * `invalidateAll()` に置き換えたので外した）。
  */
-export async function load({ parent, depends }) {
-	depends('settings:categories');
+export async function load({ parent }) {
 	await parent();
 
 	const admin = isAdmin(sessionStore.role);

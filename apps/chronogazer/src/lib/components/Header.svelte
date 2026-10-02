@@ -1,15 +1,19 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { getAuthProvider } from '@banto/admin-core';
+	import { logoutAndLeave } from '$lib/banto/logout.svelte';
+	import { notifyLogoutOutcome } from '$lib/banto/logoutNotice';
 	import { pageTitle } from '$lib/navigation';
 	import { settings } from '$lib/settings.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
 
 	async function logout() {
-		await getAuthProvider().logout();
-		goto('/login');
+		// banto v2.0.0 (#260, design §6.1): logout() -> confirm the session ->
+		// /login only when it is confirmed `none` (another tab's login
+		// confirmed meanwhile stays). `'stayed'`/`'unverified'` are told with a
+		// toast - see `$lib/banto/logout.svelte.ts` for the full sequence.
+		await logoutAndLeave(() => goto('/login'), { notify: notifyLogoutOutcome });
 	}
 </script>
 

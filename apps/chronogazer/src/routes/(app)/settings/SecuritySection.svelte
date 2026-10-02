@@ -63,27 +63,28 @@
 		try {
 			const next = await applyAuthSettings(disabledDraft, disabledRoleDraft);
 			authSettingsStore.apply(next);
-			// banto v2.0.0 の Rust（PR1a）は、この適用の中でデスクトップの
-			// セッションそのものを付け替える: ON にすると Account -> Local(役割)、
-			// ON のまま役割を変えると Local の役割変更、OFF にすると Local を終了。
-			// `authDisabled` だけを書き換えていた従来のやり方では、ナビ・権限・
-			// ESCAPE HATCH（`canManageAuthMode()`）が古い役割のまま残るので、
-			// すべての load を再実行して追従させる:
-			// - `(app)/+layout.ts` が `decideProtectedRoute` で照合し直し、
-			//   `sessionStore.load()` で今のセッションの identity・役割・
-			//   `authDisabled` を読み直す（v1.7.3 の `auth_identity` は Local の
-			//   今の役割を返す）。OFF にして Local が終わった場合はここで
-			//   `/login` へ送られる。
+			// banto v2.0.0（#260、S-94/S-96/S-99）: Rust はこの適用の中でデスクトップの
+			// セッションそのものを付け替え、セッションの `seq` を進める（ON にすると
+			// Account -> Local(役割)、ON のまま役割を変えると Local の役割変更、OFF に
+			// すると Local を終了）。画面の側は何も書かない: `sessionStore` の
+			// identity・役割・`authDisabled` は SessionController の確定からの
+			// `$derived`（`authDisabled` は `auth_resolve` の `kind === 'local'`）で、
+			// この適用の答えから代入すると古い答えが書き戻しうる（S-61）。
+			// `invalidateAll()` で load をすべて走らせ直す:
+			// - `(app)/+layout.ts` の `resolveSettled` が確定し直す。provider は
+			//   この `seq` の前進を観測していないので最初の答えは捨てられ、
+			//   追いつき（S-84）の後の答えで確定する。OFF にして Local が終わって
+			//   いれば `none` で /login へ移る。
 			// - `settings/+layout.ts`（`await parent()` の後に評価）がカテゴリと
-			//   `canManageAuthMode()` を再計算する。この画面が非可視になれば
-			//   `security/+page.ts` の `guardCategory` が先頭カテゴリへ送る
-			//   （PR #372 Copilot レビュー指摘の空ページ対策。従来の
-			//   `invalidate('settings:categories')` はこれに含まれるので外した）。
-			// `sessionStore.load()` を別に呼ばないのは、上の layout の load が
-			// 必ず呼ぶため（二重に identity を読まない）。
-			// 1c で v2 の SessionController に置き換えるまでの移行措置。
-			await invalidateAll();
+			//   ESCAPE HATCH（`canManageAuthMode()`）を確定した役割・`authDisabled`
+			//   から計算し直す。この画面が非可視になれば `security/+page.ts` の
+			//   `guardCategory` が先頭カテゴリへ送る（PR #372 の空ページ対策）。
+			// admin-template の `SecuritySection.svelte` と同じ形（PR1a の移行措置の
+			// 説明を v2 の形に戻した）。
+			// トーストは load の再実行の前に出す（admin-template と同じ順）。後だと、
+			// OFF でログイン画面へ移った後に出る・確認できないとき最大 10 秒遅れる。
 			toastStore.push('success', '認証設定を更新しました');
+			await invalidateAll();
 		} catch (err) {
 			// 排他違反（LANアクセス有効中の有効化など）はサーバ側の日本語メッセージ
 			// (kind: 'other') をそのままトーストに出す（spec M11）。

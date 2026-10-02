@@ -40,14 +40,17 @@ import {
 	createTauriUiSettings,
 	initBanto
 } from '@banto/admin-core';
-import type { AuthProvider, Notifier, UiSettingsProvider } from '@banto/admin-core';
+import type { Notifier, UiSettingsProvider } from '@banto/admin-core';
 // Safe to import in a plain browser (no Tauri runtime): only ever *called*
 // when isTauri() is true.
 import { invoke } from '@tauri-apps/api/core';
 import { toastStore } from '$lib/toast.svelte';
 import { isBantoAuthCheckResponse } from './sessionGuard';
-
-const AUTH_KEY = 'banto.auth.demo';
+// banto v2.0.0（#260）: demo の AuthProvider は標準の契約（resolve・
+// credentialRevision・onCredentialChanged）を満たす admin-template の
+// `providers/demo.ts` の写し。v1 の check/getIdentity だけの provider のままだと
+// v2 の `initBanto` が TypeError を投げ、demo 起動が白画面になる。
+import { demoAuthProvider } from './providers/demo';
 
 /** True inside the Tauri webview, false in a plain browser tab (spec §11.1). */
 export function isTauri(): boolean {
@@ -118,54 +121,6 @@ async function isEmbeddedServer(): Promise<boolean> {
 }
 
 const notifier: Notifier = { notify: (kind, message) => toastStore.push(kind, message) };
-
-function isSessionAuthed(): boolean {
-	return typeof sessionStorage !== 'undefined' && sessionStorage.getItem(AUTH_KEY) === '1';
-}
-
-/**
- * Demo AuthProvider (spec §3.3): fixed admin/admin credentials backed by
- * sessionStorage. Used in plain-browser dev only (mode 3 above); Tauri and
- * embedded-server modes use the real `auth_*` Rust commands/REST routes
- * instead (same admin/admin demo credentials, checked server-side).
- */
-const demoAuthProvider: AuthProvider = {
-	async login(params) {
-		const { username, password } = params as { username?: string; password?: string };
-		if (username === 'admin' && password === 'admin') {
-			sessionStorage.setItem(AUTH_KEY, '1');
-			return { success: true };
-		}
-		return { success: false, error: 'ユーザー名またはパスワードが違います' };
-	},
-	async logout() {
-		sessionStorage.removeItem(AUTH_KEY);
-	},
-	async check() {
-		return isSessionAuthed();
-	},
-	async getIdentity() {
-		// Spec M10 RBAC: the demo provider's one fixed account is always
-		// full 'admin' - this is the only environment where usersAdmin.ts is
-		// unconditionally unavailable anyway (see isUsersAdminAvailable()),
-		// so this only matters for permissions.ts-gated UI elsewhere (nav,
-		// items page, settings page), which should behave exactly as if a
-		// real admin were logged in.
-		return isSessionAuthed() ? { id: 'admin', name: '管理者', role: 'admin' } : null;
-	},
-	// Always "initialized": the demo provider's admin/admin account always
-	// exists, so the login page never shows the first-run setup form here
-	// (spec §8.2's setup flow only applies to Tauri/embedded-server modes).
-	async status() {
-		return { initialized: true };
-	},
-	// No account store to change a password on in pure-browser demo mode;
-	// the settings page hides the password-change section when this
-	// resolves to `success: false` (see its "note" fallback).
-	async changePassword() {
-		return { success: false, error: 'デモモードでは変更できません' };
-	}
-};
 
 /**
  * Resolves once `initBanto()` has run AND the matching `EventProvider` (if
