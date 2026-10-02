@@ -3425,6 +3425,81 @@ async fn shutdown_app_state(state: &AppState) {
     }
 }
 
+/// tauri.conf.json の `app.windows` のうち label が `main` の窓を、その設定の
+/// まま作る。設定側は `create: false`（Tauri が setup の前に自動で作らない）。
+fn create_main_window(app: &tauri::App) -> tauri::Result<()> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .expect("tauri.conf.json defines the main window");
+    tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.build()?;
+    Ok(())
+}
+
+/// 旧形式の DB を拒否したときの窓の label。capabilities（`main` だけ）の
+/// 対象外なので、この窓からはコマンドを呼べない。
+const LEGACY_DB_WINDOW_LABEL: &str = "legacy-db";
+
+/// 旧形式の DB を拒否したときに出す文（`static/legacy-db.html` が表示する）。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct LegacyDbNotice {
+    title: String,
+    message: String,
+    path: String,
+    steps: String,
+    closing: String,
+}
+
+impl LegacyDbNotice {
+    fn new(legacy: &chronogazer_core::db::LegacyDatabase) -> Self {
+        Self {
+            title: "ChronoGazer を起動できません".to_string(),
+            message: legacy.to_string(),
+            path: legacy.path.display().to_string(),
+            steps: concat!(
+                "ChronoGazer を終了してから、上のファイルを（同じ場所に「-wal」「-shm」が",
+                "付いたファイルがあれば一緒に）削除するか別の名前へ退避し、起動し直して",
+                "ください。新しい DB はアカウントも接続・タグも空なので、初回セットアップ",
+                "からやり直します。"
+            )
+            .to_string(),
+            closing: "このウィンドウを閉じると ChronoGazer は終了します。".to_string(),
+        }
+    }
+
+    /// ページを読む前に走らせる JS（`window.__CHRONOGAZER_LEGACY_DB__` に入れる）。
+    /// JSON はそのまま JS の式として有効で、ページ側は `textContent` で入れる
+    /// ので、パスにどんな文字が入っても HTML として解釈されない。
+    fn initialization_script(&self) -> String {
+        let json = serde_json::to_string(self).expect("LegacyDbNotice serializes");
+        format!("window.__CHRONOGAZER_LEGACY_DB__ = {json};")
+    }
+}
+
+/// 旧形式の DB を拒否したことを、メインの窓の代わりに小さな窓で見せる。
+fn open_legacy_db_window(
+    app: &tauri::App,
+    legacy: &chronogazer_core::db::LegacyDatabase,
+) -> tauri::Result<()> {
+    let notice = LegacyDbNotice::new(legacy);
+    tauri::WebviewWindowBuilder::new(
+        app,
+        LEGACY_DB_WINDOW_LABEL,
+        tauri::WebviewUrl::App("legacy-db.html".into()),
+    )
+    .title(notice.title.clone())
+    .inner_size(620.0, 360.0)
+    .resizable(true)
+    .center()
+    .initialization_script(notice.initialization_script())
+    .build()?;
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -3453,17 +3528,32 @@ pub fn run() {
             // Windows paths with drive letters/backslashes work unchanged.
             //
             // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は無い）。
-            // panic のメッセージで済ませず、何をすればよいかを stderr に出して
-            // 終了する（`chronogazer_core::db` のモジュール doc「旧形式の DB の
-            // 拒否」、手順は apps/chronogazer/README.md）。
+            // panic のメッセージで済ませず、何をすればよいかを出して終了する
+            // （`chronogazer_core::db` のモジュール doc「旧形式の DB の拒否」、
+            // 手順は apps/chronogazer/README.md）。リリースビルドは
+            // `windows_subsystem = "windows"` で stderr が見えないので、メインの
+            // 画面の代わりにエラー専用の窓を開く（[`open_legacy_db_window`]）。
+            // stderr にも出す（開発ビルド用）。
             let pool = match tauri::async_runtime::block_on(init_db(&db_path)) {
                 Ok(pool) => pool,
                 Err(InitDbError::Legacy(legacy)) => {
                     eprintln!("banto: {legacy}");
-                    std::process::exit(1);
+                    if let Err(err) = open_legacy_db_window(app, &legacy) {
+                        eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
+                        std::process::exit(1);
+                    }
+                    // `AppState` は manage しない。開くのはコマンドを呼ばない
+                    // 静的ページだけで、閉じると最後の窓なのでプロセスが終わる
+                    // （`RunEvent::Exit` の後始末は `try_state` で何もしない）。
+                    return Ok(());
                 }
                 Err(err) => panic!("init_db should succeed: {err}"),
             };
+
+            // メインの窓は tauri.conf.json で `create: false` にしてあり、DB を
+            // 開けた後にだけここで作る（旧形式の DB のときに空の画面が先に
+            // 出ないように）。設定は tauri.conf.json の定義をそのまま使う。
+            create_main_window(app)?;
 
             let events = event_channel();
             let users = UsersService::new(pool.clone());
@@ -3909,6 +3999,65 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DB スキーマの整理（2026-10-02）: 旧形式の DB を拒否したときの窓に出す
+    /// 文は、DB のパスと対処（削除または退避して起動し直す）を含み、ページへ
+    /// 渡す JS は `window.__CHRONOGAZER_LEGACY_DB__ = <JSON>;` の形で、パスに
+    /// 引用符や `</script>` が入っても JSON として読み戻せる。
+    #[test]
+    fn legacy_db_notice_carries_the_path_and_what_to_do() {
+        let legacy = chronogazer_core::db::LegacyDatabase {
+            path: std::path::PathBuf::from(r#"C:\Users\a "b"\</script>\chronogazer.sqlite3"#),
+        };
+        let notice = LegacyDbNotice::new(&legacy);
+        assert_eq!(notice.path, legacy.path.display().to_string());
+        assert!(notice.message.contains("旧形式"), "{}", notice.message);
+        assert!(notice.message.contains(&notice.path), "{}", notice.message);
+        assert!(
+            notice.message.contains("削除または退避"),
+            "{}",
+            notice.message
+        );
+        assert!(notice.steps.contains("起動し直して"), "{}", notice.steps);
+        assert!(notice.closing.contains("終了"), "{}", notice.closing);
+
+        let script = notice.initialization_script();
+        let json = script
+            .strip_prefix("window.__CHRONOGAZER_LEGACY_DB__ = ")
+            .and_then(|rest| rest.strip_suffix(';'))
+            .expect("script shape");
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        assert_eq!(parsed["path"], notice.path);
+        assert_eq!(parsed["message"], notice.message);
+        assert_eq!(parsed["steps"], notice.steps);
+    }
+
+    /// エラー専用のページは Tauri のコマンドを呼ばない（そのとき `AppState`
+    /// は manage されていない）、文は `textContent` で入れる、の 2 点を
+    /// ページの中身で固定する。
+    #[test]
+    fn legacy_db_page_calls_no_commands_and_inserts_text_only() {
+        let page = include_str!("../../static/legacy-db.html");
+        assert!(page.contains("__CHRONOGAZER_LEGACY_DB__"));
+        for forbidden in ["invoke", "__TAURI", "innerHTML"] {
+            assert!(!page.contains(forbidden), "page must not use {forbidden}");
+        }
+    }
+
+    /// メインの窓は tauri.conf.json で自動作成を止め、DB を開けた後に
+    /// `create_main_window` で作る（旧形式の DB で空の画面が先に出ないように）。
+    #[test]
+    fn main_window_is_not_created_by_tauri_before_setup() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let windows = conf["app"]["windows"].as_array().expect("windows");
+        let main = windows
+            .iter()
+            .find(|window| window["label"] == "main")
+            .expect("main window");
+        assert_eq!(main["create"], false);
+        assert_eq!(windows.len(), 1);
+    }
     use std::path::PathBuf;
 
     impl AppState {
