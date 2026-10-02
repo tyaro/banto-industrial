@@ -35,15 +35,16 @@ export interface CommissioningStatus {
  * 試運転モード中に `crate::commissioning::synthetic_identity()` がサーバー
  * 側で使う合成 identity と**値を一致させた**クライアント側の定数。
  *
- * 注意（実装上ハマった点）: `createHttpAuthProvider().getIdentity()` は
- * ローカルに保存された bearer トークンが無いと `GET /api/auth/identity` を
- * 呼ぶことすらせず即座に `null` を返す（`@banto/admin-core` の
- * `providers/http.ts` 参照）。`/api/auth/*` は `banto_server` クレート側の
- * 別ルーターで、`commissioning` の認証バイパスは admin/tag-space 側の
- * ミドルウェア（`actor_identity`）にしか配線されていない - つまり試運転
- * モード中に「サーバーから合成 identity が返ってくる」経路は実在しない。
- * そのため `sessionStore`（`$lib/session.svelte.ts`）はこの定数をルート
- * ガード側でその場で設定する形にした。これは権限を勝手に底上げしている
+ * 注意（実装上ハマった点）: `createHttpAuthProvider()` の確認（v2 の
+ * `resolve()`）は、ローカルに保存された bearer トークンが無ければ
+ * `GET /api/auth/identity` を呼ぶことすらせず「セッション無し」を返す
+ * （`@banto/admin-core` の `providers/http.ts` 参照）。`/api/auth/*` は
+ * `banto_server` クレート側の別ルーターで、`commissioning` の認証バイパスは
+ * admin/tag-space 側のミドルウェア（`actor_identity`）にしか配線されていない
+ * - つまり試運転モード中に「サーバーから合成 identity が返ってくる」経路は
+ * 実在しない。そのため試運転の policy runner（`commissioningPolicy.ts`）が
+ * この定数を SessionController に `adopt(..., 'commissioning', ticket)` で
+ * 確定させる（banto v2.0.0 #260、設計 §6.2）。これは権限を勝手に底上げしている
  * わけではない: 試運転モード中はサーバー側がどのみち無条件に admin 相当
  * として全リクエストを受け付ける（`actor_identity`参照）ので、フロント
  * 側の RBAC 表示（`$lib/permissions.ts` の `isAdmin`/`canWriteResources`）
@@ -134,8 +135,9 @@ export async function getCommissioningStatus(signal?: AbortSignal): Promise<Comm
  * - 呼び出し側は `null` を「ロックダウン済みと同様に扱う」だけでよく、
  * try/catch をルートガード側に重複させない。
  *
- * #445 の確認（`sessionRecheck.ts`）も使う。確認は時間切れの `signal` を
- * 渡し、中断された要求も `null` になる（ルートガードからは省略する）。
+ * 試運転の policy runner（`commissioningPolicy.ts`）が、ルートガード
+ * （`guard`）と #445 の確認（`recheck`）の両方で使う。runner は自分の期限の
+ * `signal` を必ず渡し、中断された要求も `null` になる。
  */
 export async function fetchCommissioningStatusOrNull(
 	signal?: AbortSignal

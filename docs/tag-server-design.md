@@ -1,7 +1,10 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-09-30 更新: §4.1 のバインディングキーを外部名のみに改め、安定 ID によるリネーム検出を撤回（オーナー決定、scada-design.md §9.6）。2026-09-24 更新: §6 の 6 項に、書き込み受付の停止を DB と状態ファイルの
+状態: **実装追従中（2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
+セッションの確定は banto v2.0.0 の SessionController に寄せ、試運転は policy runner の `adopt`/`end` で
+確定・終了することを追記（v2 移行 PR1d、banto-hub v0.2.0-alpha.26。サーバー側の設計・wire は変更なし）。
+2026-09-30 更新: §4.1 のバインディングキーを外部名のみに改め、安定 ID によるリネーム検出を撤回（オーナー決定、scada-design.md §9.6）。2026-09-24 更新: §6 の 6 項に、書き込み受付の停止を DB と状態ファイルの
 2 か所に記録するようにしたこと（#433）と運用ガイド §4 への参照を追記。同日: relay-wright は main から外してタグ
 `archive/relay-wright-2026-09-24` に退避した。§6・非スコープ節の relay-wright への
 言及を「凍結・退避済み」に更新（banto-hub 側の設計・実装に変更なし）。
@@ -1119,6 +1122,25 @@ FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
 `POST /api/commissioning/lock-down`）・UI（ルートガード迂回
 `shouldBypassLoginForCommissioning`、閉じるボタンの無い
 `CommissioningBanner`、設定画面のロックダウン操作）とも実装済み。
+
+**管理 UI のセッションの確定（2026-10-02、banto v2.0.0 #260 追従、v2 移行 PR1d・
+banto-hub v0.2.0-alpha.26）**: フロントの「誰がログインしているか」の確定は
+`@banto/admin-core` の **SessionController** だけが行う（ADR-0016、banto の
+`docs/session-controller-design.md` §6.1・§6.2）。試運転モードの合成 identity
+（`COMMISSIONING_IDENTITY`）は `/api/auth/identity` が返さないので provider では確定
+できず、アプリ層の **policy runner**（`apps/banto-hub/src/lib/banto/commissioningPolicy.ts`）が
+`GET /api/commissioning/status` を見て controller に **`adopt(..., 'commissioning', ticket)`** で
+確定し、ロックダウンが確定したら **`end('commissioning-locked', ticket)`** で終わらせる
+（`adopt`/`end` を呼ぶのはこの runner とロックダウンの順序 `commissioningLockDown.ts` だけ。
+banto 本体には入れない）。runner はルートガード（`guard`: 状態の取得に失敗したら迂回しない＝
+従来の安全側）とタグモニタの再接続の失敗後の確認（`recheck`: 取得に失敗したら `unverified` で
+画面を保つ）の 2 つの mode を持ち、ticket が失効したら新しい ticket でやり直し（上限 3 回）、
+期限は全体で 10 秒（方針の要求はすべて runner の `AbortSignal` で止める）。試運転中は毎回の
+読み込みで同じ合成セッションを確定し直すが世代（generation）は変わらず、SSE の `401` などの
+signal も provider に問い合わせない（試運転はトークンで決まらない）。ロックダウンの後は
+「ロックダウン前に取った ticket で `end` → 確定 → `none` ならログイン画面」の順で、移動の間は
+保護レイアウトの世代の照合による読み直しを止める。`sessionStore.commissioningMode` は
+controller の snapshot（`kind === 'commissioning'` かつ `active`）からの導出。
 
 #### 管理 UI と `/api/v1/*` の境界（2026-08-31 オーナー決定・案A）
 

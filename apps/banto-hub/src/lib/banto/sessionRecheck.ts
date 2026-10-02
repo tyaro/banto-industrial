@@ -1,154 +1,73 @@
 /**
- * ストリームが `1008` + `session_revoked` / `commissioning_ended` で閉じられた
- * ときに、ログイン状態を確かめ直す（#441）。
+ * ストリームの close・再接続の失敗の後に、ログイン状態を確かめ直す（#441・#445）。
  *
- * 新しい判断は持たない: `invalidateAll()` で `(app)/+layout.ts` のルート
- * ガードを走らせ直すだけ。ガードは画面を開いたときと同じ経路
- * （`fetchCommissioningStatusOrNull` → `decideProtectedRoute` =
- * `resolveProtectedSession`、#436）で判断する:
+ * banto v2.0.0（#260、設計 §6.2）から、確認そのものは SessionController の
+ * 役目（`GET /api/auth/identity` の 1 往復、期限 10 秒、同時の確認は 1 本に
+ * まとめる、答えは開始時の資格情報と照合してから採る、確認できなければ
+ * 1 秒から倍々で 30 秒までの背景の確認）。v1 でここに持っていた独自の照合
+ * （`/api/auth/check` の直接 `fetch`・開始時のトークンとの照合・single-flight・
+ * 期限の `AbortController`）は削除した。ここに残るのは、ストリームの出来事を
+ * controller に伝える配線と、試運転モードの扱い（policy runner）だけ。
  *
- * - 失効を確認できた（`401` など）→ `/login` へ移る
- * - 照合できなかった（`500`・到達不能）→ 再試行付きのエラー画面
+ * ## `1008` + `session_revoked` / `commissioning_ended` で閉じられた（#441）
+ *
+ * {@link recheckSessionAfterStreamClose}: `controller.signal('app:stream-closed')`
+ * で失効の可能性を伝え、`invalidateAll()` でルートガード（`(app)/+layout.ts`）を
+ * 走らせ直す。ガードは画面を開いたときと同じ経路（試運転の policy runner の
+ * `guard` → 通常の確認）で判断する:
+ *
+ * - 失効を確認できた（確定した `none`）→ `/login` へ移る
+ * - 照合できなかった（`500`・到達不能・期限切れ）→ 再試行付きのエラー画面
  *   （`routes/+error.svelte`）。保存しているトークンは消さない
  * - まだ有効 → 画面はそのまま（呼び出し側がストリームを再開する）
- * - `commissioning_ended`: 試運転モードではなくなったので、ガードは
- *   ログインを求める側へ進む（トークンが無ければ `/login`）
+ * - `commissioning_ended`: ガードの policy runner がロックダウンを確認して
+ *   試運転の合成セッションを `end` し、通常の確認へ進む（トークンが無ければ
+ *   `/login`）
  *
- * {@link createSingleFlight} で包み、複数のストリームが同時に閉じられても
- * 確認（= 画面の移動・エラー表示）は 1 回にする。
+ * signal の後に始めた確認だけがこの要求に答える（controller の I-9）ので、
+ * 複数のストリームが同時に閉じても確認はまとまる（v1 の single-flight は不要）。
+ * 試運転の合成セッションの間（adopt 中）は signal は provider に問い合わせない
+ * （S-45）。終了の判断はガードの policy runner が行う。
  *
- * **再接続が続けて失敗したとき（#445）** は {@link probeSessionAfterReconnectFailures}
- * で先に確かめる。こちらは**画面も認証の状態も動かさない**（結果を返すだけ）:
+ * ## 再接続が続けて失敗した（#445）
  *
- * - 再接続が失敗するのは多くはネットワークの一時的な切断・サーバーの再起動で、
- *   そのときに上の `invalidateAll()` を走らせると、照合できないのでエラー画面
- *   へ移ってしまう（一時的な切断でモニタを失う）。
- * - 照合は `AuthProvider.check()` を**使わない**（#447 のレビュー）。`check()`
- *   は `401` を受けると**その時点で保存されている**トークンを消す。時間切れで
- *   見捨てた確認に遅れて `401` が返ると、トークンだけが消えてログイン画面へ
- *   移らないまま待ち続ける、または確認の最中にログインし直した新しい
- *   トークンまで消す。そこで確認は、開始時に読んだトークンで
- *   `/api/auth/check` を自分で呼び、結果を分類するだけにする
- *   （{@link classifySessionCheckResponse}、`check()` と同じ分類）。時間切れ
- *   では `AbortController` で要求そのものを止める。期限は確認の全体で共有し、
- *   確認の中で待つ要求（試運転の状態・照合）の**すべて**に同じ `signal` を
- *   渡す（PR #447 の再レビュー）。確認の最中にトークンが
- *   変わっていたら、その結果は古いトークンについての答えなので `unverified`
- *   にする（次の失敗でまた確かめる）。
- * - 試運転モードの状態は `fetchCommissioningStatusOrNull`（副作用なし）で読み、
- *   ルートガードと同じ `shouldBypassLoginForCommissioning` で判断する。
+ * {@link probeSessionAfterReconnectFailures}: **画面を動かさずに**確かめ、
+ * `session` / `login` / `unverified` を返す（写し方は `streamClose.ts` の
+ * `sessionProbeResultOf`、扱いは同じファイルの `decideAfterSessionProbe`）。
  *
- * 失効を確認できた（`login`）ときだけ、呼び出し側（`connectTagStream`）が
- * `onHalt` → 上の {@link recheckSessionAfterStreamClose} へ合流する（ガードが
- * 改めて**その時点のトークンで**判断して `/login` へ送る。トークンを消すのも
- * ガードの `check()`）。`1008` の経路と同時に起きても、画面の移動は同じ
- * single-flight で 1 回になる。
+ * - 試運転の合成セッションが確定している間: policy runner の `recheck`
+ *   （試運転の状態が読めなければ `unverified` で画面を保つ。ロックダウンが
+ *   確定していれば `end` してから通常の確認）。
+ * - それ以外: `resolveSettled(controller, { cause: 'signal' })`（要求自体が
+ *   signal の stamp を進める、S-58）。確認できなければ `unverified`（画面と
+ *   トークンはそのまま。controller は背景の確認を続け、その間に `none` が
+ *   確定すれば保護レイアウトの配線①が /login へ送る）。
+ *
+ * 失効を確認できた（`login`）ときは、呼び出し側（`connectTagStream`）が
+ * `onHalt` → 上の {@link recheckSessionAfterStreamClose} へ合流する。`none` の
+ * 確定で generation が動くので、配線①の `invalidateAll()` とここの
+ * `invalidateAll()` が重なることがあるが、どちらもガードを走らせ直すだけで
+ * 無害（SvelteKit は後の呼び出しを勝たせる）。
  */
 import { invalidateAll } from '$app/navigation';
-import { getAuthProvider } from '@banto/admin-core';
-import {
-	fetchCommissioningStatusOrNull,
-	shouldBypassLoginForCommissioning
-} from '$lib/banto/commissioning';
-import { CSRF_HEADER } from '$lib/banto/setup';
-import { sessionStore } from '$lib/session.svelte';
-import {
-	classifySessionCheckResponse,
-	createSingleFlight,
-	type SessionProbeResult
-} from './streamClose';
+import { getSessionController, resolveSettled } from '@banto/admin-core';
+import { isCommissioningSession, runCommissioningPolicy } from '$lib/banto/commissioningPolicy';
+import { sessionProbeResultOf, type SessionProbeResult } from './streamClose';
 
-export const recheckSessionAfterStreamClose: () => Promise<void> = createSingleFlight(() =>
-	invalidateAll()
-);
-
-/**
- * 確認がこの時間で終わらなければ `unverified`（照合できない）として扱い、
- * 要求を止める。ネットワークが切れている間の要求は、失敗せずに返ってこない
- * ことがある。上限が無いと飛行中のまま次の確認が起こせず、失効に気づけなくなる。
- */
-export const SESSION_PROBE_TIMEOUT_MS = 10_000;
-
-/** 保存されているトークン（`createHttpAuthProvider` の `getToken`）。読むだけ。 */
-function storedToken(): string | null {
-	const auth = getAuthProvider() as { getToken?: () => string | null };
-	return auth.getToken ? auth.getToken() : null;
-}
-
-async function probeOnce(signal: AbortSignal): Promise<SessionProbeResult> {
-	// 開始時点の事実で判断する（途中で変わったら、下で結果を捨てる）。
-	const assumedCommissioning = sessionStore.commissioningMode;
-	const token = storedToken();
-
-	// 確認の中で待つ要求は、どれも同じ `signal`（全体で 10 秒の期限）で止める
-	// （PR #447 の再レビュー: ここに渡していなかったので、応答しない
-	// 試運転の状態の要求が時間切れの後も残り、確認のたびに積み重なった）。
-	const status = await fetchCommissioningStatusOrNull(signal);
-	if (signal.aborted) return 'unverified';
-	// ルートガードは取得の失敗を「ロックダウン済み」に倒す（安全側）が、
-	// ここでは画面を動かすかどうかの判断なので「照合できない」にする。
-	// 試運転モード中にネットワークが切れただけでログイン画面へ送らないため。
-	if (status === null) return 'unverified';
-	if (shouldBypassLoginForCommissioning(status)) return 'session';
-	// ストリームは試運転モードのつもり（資格情報なしで `/api/tag-stream`）で
-	// 繋ごうとしているが、サーバーはロックダウン済み: ガードを走らせ直さない
-	// と繋がらない（`commissioning_ended` と同じ）。ガードがログインを求める
-	// 側へ進める。
-	if (assumedCommissioning) return 'login';
-	if (token === null) return 'login';
-
-	let result: SessionProbeResult;
-	try {
-		const response = await fetch('/api/auth/check', {
-			method: 'GET',
-			headers: { ...CSRF_HEADER, Authorization: `Bearer ${token}` },
-			signal
-		});
-		let body: unknown = undefined;
-		if (response.ok) {
-			try {
-				body = await response.json();
-			} catch {
-				body = undefined;
-			}
-		}
-		result = classifySessionCheckResponse(response.status, body);
-	} catch {
-		// 到達不能、または時間切れで止めた。
-		return 'unverified';
-	}
-	// 確認の最中にトークンが変わった（ログインし直した・ほかの経路が消した）:
-	// この答えは古いトークンについてのもの。
-	if (storedToken() !== token) return 'unverified';
-	return result;
-}
-
-function withTimeout(
-	run: (signal: AbortSignal) => Promise<SessionProbeResult>,
-	timeoutMs: number
-): Promise<SessionProbeResult> {
-	const controller = new AbortController();
-	return new Promise((resolve) => {
-		const timer = setTimeout(() => {
-			controller.abort();
-			resolve('unverified');
-		}, timeoutMs);
-		run(controller.signal).then(
-			(result) => {
-				clearTimeout(timer);
-				resolve(controller.signal.aborted ? 'unverified' : result);
-			},
-			() => {
-				clearTimeout(timer);
-				resolve('unverified');
-			}
-		);
-	});
+/** ストリームが `1008` + `session_revoked` / `commissioning_ended` で閉じられた（#441）。 */
+export async function recheckSessionAfterStreamClose(): Promise<void> {
+	getSessionController().signal('app:stream-closed');
+	await invalidateAll();
 }
 
 /**
  * 再接続が続けて失敗したときの確認（#445）。画面も保存しているトークンも
- * 動かさず、`session` / `login` / `unverified` を返す。single-flight。
+ * 動かさず、`session` / `login` / `unverified` を返す。reject しない。
  */
-export const probeSessionAfterReconnectFailures: () => Promise<SessionProbeResult> =
-	createSingleFlight(() => withTimeout(probeOnce, SESSION_PROBE_TIMEOUT_MS));
+export async function probeSessionAfterReconnectFailures(): Promise<SessionProbeResult> {
+	const controller = getSessionController();
+	const result = isCommissioningSession(controller.snapshot)
+		? await runCommissioningPolicy(controller, { mode: 'recheck' })
+		: await resolveSettled(controller, { cause: 'signal' });
+	return sessionProbeResultOf(result);
+}

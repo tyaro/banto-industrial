@@ -6,7 +6,7 @@
 	// あった `showRemember = getBantoMode() === 'server'` という環境分岐は
 	// 不要 - 「ログイン状態を保持」チェックは実装指示どおり常時表示する。
 	import { goto } from '$app/navigation';
-	import { getAuthProvider } from '@banto/admin-core';
+	import { getAuthProvider, notify } from '@banto/admin-core';
 	import { bantoReady } from '$lib/banto/setup';
 	import { APP_NAME } from '$lib/appName';
 
@@ -21,6 +21,13 @@
 	let error: string | null = $state(null);
 	let submitting = $state(false);
 	let remember = $state(false);
+
+	// banto v2.0.0（#260、design §6.1）: ログイン・初回セットアップが
+	// `superseded`（別のログイン・ログアウトが先に確定し、このログインは何も
+	// 保存しなかった）を返したら、エラーではなく通知して /status へ移る。保護
+	// ガード（`(app)/+layout.ts`）が今保存されている資格情報で確定する。
+	// admin-template の `routes/login/+page.svelte` と同じ扱い（文言も同じ）。
+	const LOGIN_SUPERSEDED_MESSAGE = '別のセッションが先に確定しました。現在のセッションで開きます。';
 
 	$effect(() => {
 		void (async () => {
@@ -41,6 +48,9 @@
 			if (remember) params.remember = true;
 			const result = await getAuthProvider().login(params);
 			if (result.success) {
+				goto('/status');
+			} else if (result.superseded) {
+				notify('info', LOGIN_SUPERSEDED_MESSAGE);
 				goto('/status');
 			} else {
 				error = result.error ?? 'ログインに失敗しました';
@@ -72,6 +82,9 @@
 			}
 			const result = await setup({ username, password, displayName });
 			if (result.success) {
+				goto('/status');
+			} else if (result.superseded) {
+				notify('info', LOGIN_SUPERSEDED_MESSAGE);
 				goto('/status');
 			} else {
 				error = result.error ?? 'セットアップに失敗しました';

@@ -1,5 +1,6 @@
 <script lang="ts">
-	// relay-wright の同名ファイルから無改変で複製。
+	// relay-wright の同名ファイルから複製（banto v2.0.0 の配線①②と世代ゲートは
+	// admin-template から写した。下の「3 本の配線」）。
 	// T19 S1-d（UX-45、docs/banto-hub-t19-design.md §3.6、2026-09-03）:
 	// `CommissioningBanner`（試運転モードの常時表示バナー）を撤去した
 	// （2026-09-02 オーナー決定「常時表示しない」）。安全性は損なわれない -
@@ -7,8 +8,11 @@
 	// （`enforce_loopback_when_commissioning`）ため、無認証のまま外部
 	// ネットワークへ露出することはない。状態を知る手段は
 	// `status/+page.svelte` の「サーバー状態」に事実として残した。
-	import { afterNavigate, invalidateAll } from '$app/navigation';
-	import { onSessionEnded } from '@banto/admin-core';
+	import { untrack } from 'svelte';
+	import { afterNavigate, goto, invalidateAll } from '$app/navigation';
+	import { getSessionController, notify } from '@banto/admin-core';
+	import { isLeavingForLogin, leaveForLogin } from '$lib/banto/logout.svelte';
+	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '$lib/banto/ownerChange';
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
@@ -24,7 +28,7 @@
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
 
-	let { children } = $props();
+	let { children, data } = $props();
 	let pendingCount = $state(0);
 
 	const POLL_INTERVAL_MS = 3000;
@@ -81,23 +85,72 @@
 		return mobileNavStore.watchViewport();
 	});
 
-	// banto v1.7.2（tyaro/banto#241）: 開いている画面のセッションが裏で
-	// 失効したら（削除・降格・パスワードの変更/リセット）、ルートガード
-	// （`+layout.ts`）を走らせ直してログイン画面へ移る。失効に気づくのは
-	// admin-core の SSE（`/api/events`、`setup.ts` の `connectEvents`）で、
-	// `check()` で確認できたときだけ知らせる。タグモニタのストリームの
-	// 経路（#441 / #445、`sessionRecheck.ts`）とは独立に、どの画面でも効く。
+	// banto v2.0.0（#260、設計 §6.1・§6.2）: 保護レイアウトの 3 本の配線。
+	// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
+	// `routes/(app)/+layout.svelte` から写した（v2 移行 PR1d）。banto-hub 固有の差:
+	// 通知は日本語の直書き（i18n なし）、`base` は無い。テンプレートの他の
+	// シェル機能（未保存の変更の離脱ガード・コマンド履歴の所有者・ナビの
+	// バッジ）は写していない（このシェルには元から無い、または別の実装）。
 	//
-	// `recheckSessionAfterStreamClose`（single-flight）には合流させない:
-	// 飛行中の確認はこの知らせより前に始まっており、その答えは失効より前の
-	// 判断のことがある（banto の `sessionEnded.ts` の「Ordering」と同じ理由）。
-	// SvelteKit の `invalidateAll()` は重なると後の呼び出しが勝つので、
-	// ガードは必ずこの知らせの後の状態で判断する。先の呼び出しは結果を捨てて
-	// 解決するので、モニタは購読を再開しようとする。この知らせは `check()` が
-	// トークンを消した後に届くので、再開は `token_cleared` で止まって確認へ
-	// 戻り、最後に走るガードがトークン無しで `/login` へ送る（画面が外れれば
-	// `disconnect()` で止まる）。
-	$effect(() => onSessionEnded(() => void invalidateAll()));
+	// ページは、それを作ったセッションのもの。load が確認した generation
+	// （`data.sessionGeneration`、`+layout.ts`）がまだ生きている間だけ描き、
+	// 次のセッションの load が終わったら作り直す（`{#key}`）。前のユーザーの
+	// 画面（メモリ上の状態・未保存の入力）を次のセッションへ持ち越さない。
+	// 同じセッションを確認し直しただけなら generation は変わらないので、普通の
+	// `invalidateAll()` で画面が作り直されることはない。**試運転モード中**は、
+	// ガードの policy runner が毎回同じ合成セッションを `adopt` し直すが
+	// generation は据え置き（S-44）、SSE の `401` などの signal も adopt 中は
+	// provider に問い合わせない（S-45）ので、タグ画面などが作り直されることは
+	// ない。
+	//
+	// 配線①: controller の generation が、このページの load が確認したものと
+	// 違えば load を走らせ直す（`invalidateAll()`）。ガードがもう一度確定し、
+	// /login・再試行のエラー画面・（新しい）ユーザーで作り直した画面のどれかへ
+	// 進む。generation が動くあらゆる経路をこれで拾う: 裏での失効の確定
+	// （banto #241。admin-core の SSE の `401`・トークンの消去 → `signal()`。
+	// v1 の `onSessionEnded` の役目）、このレイアウトの mount 前に確定した終了
+	// （S-34/S-74）、`none` を経ない別タブのログイン（S-79/S-80、Remember me の
+	// `localStorage` の `storage` イベント）、タグストリームの確認
+	// （`sessionRecheck.ts`）が確定した `none`、試運転の `end`。`requestedFor` で
+	// 1 つの generation につき 1 回。ログアウト中（・/login へ移る途中、試運転の
+	// ロックダウンの後を含む）は走らせない: その手順が自分で /login へ移り、
+	// ここで始めた invalidation は遷移に勝ってしまう（`$lib/banto/logout.svelte.ts`）。
+	// `isLeavingForLogin()` はリアクティブなので、その間に飛ばした変化は終わった
+	// ときに扱われる。
+	const sessionController = getSessionController();
+	let requestedFor = -1;
+	$effect(() => {
+		const generation = sessionController.snapshot.generation;
+		if (isLeavingForLogin()) return;
+		if (generation !== data.sessionGeneration && requestedFor !== generation) {
+			requestedFor = generation;
+			void invalidateAll();
+		}
+	});
+
+	// 配線②: 別のタブが別のユーザーでログインした。controller が処理するまで
+	// 変更を持つ（`snapshot.pendingOwnerChange`）ので、このレイアウトが mount
+	// していない間（間の 503 画面、S-81）に確定した変更も mount で知らせる。
+	// 確定した `none` で破棄される（S-83）。画面の作り直しは配線①が行い、ここは
+	// 知らせるだけ（`OWNER_CHANGE_POLICY = 'rebuild'`、オーナー決定: 現場の共有
+	// 端末で使われうる）。共有のトークンは消さない（I-17）。配線③（切り替えの
+	// 後の確認の失敗）は load の 503（`+layout.ts`）: 自動では戻らない
+	// （S-36/S-60）。`untrack`: mount ごとに 1 回（以後は購読が扱う）。
+	$effect(() =>
+		untrack(() =>
+			watchOwnerChanges(sessionController, {
+				policy: OWNER_CHANGE_POLICY,
+				notify: (policy) =>
+					notify(
+						'info',
+						policy === 'relogin'
+							? '別のユーザーでログインされました。もう一度ログインしてください。'
+							: '別のユーザーでログインされました。画面をそのユーザーで開き直しました。'
+					),
+				goToLogin: () => leaveForLogin(() => goto('/login'))
+			})
+		)
+	);
 
 	// ルート変更時はオフキャンバスを必ず閉じる（設計の「閉じる契機」の1つ）。
 	afterNavigate(() => {
@@ -160,7 +213,11 @@
 	<div class="main">
 		<Header {pendingCount} />
 		<main>
-			{@render children()}
+			{#if data.sessionGeneration === sessionController.snapshot.generation}
+				{#key data.sessionGeneration}
+					{@render children()}
+				{/key}
+			{/if}
 		</main>
 	</div>
 </div>

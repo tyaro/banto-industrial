@@ -28,8 +28,11 @@
  * ので、上の表だけでは通常の切断として再接続を繰り返す。そこで「開く前に
  * 閉じた」再接続（= 失敗した再接続）を数え、続けて
  * {@link RECONNECT_FAILURES_BEFORE_SESSION_PROBE} 回失敗したらログイン状態を
- * 確かめる（{@link shouldProbeSession}）。確かめた結果の扱いは
- * {@link decideAfterSessionProbe}:
+ * 確かめる（{@link shouldProbeSession}）。確かめるのは `sessionRecheck.ts` の
+ * `probeSessionAfterReconnectFailures`（banto v2.0.0 #260 からは SessionController
+ * の確認、`GET /api/auth/identity` の 1 往復。試運転中は policy runner の
+ * `recheck`）で、その結果を {@link sessionProbeResultOf} で 3 値に写す。
+ * 3 値の扱いは {@link decideAfterSessionProbe}:
  *
  * | 確認の結果 | 扱い | 続けて失敗した回数 |
  * | --- | --- | --- |
@@ -53,7 +56,7 @@
  * `/login` へ送り、その間にログインし直していれば購読を再開する。
  */
 
-import type { ProtectedRouteDecision } from './sessionGuard';
+import type { ResolveResult } from '@banto/admin-core';
 
 /** 資格情報が使えないと確認できたときの close コード（`stream.rs` の `REVOKED_CLOSE_CODE`）。 */
 export const REVOKED_CLOSE_CODE = 1008;
@@ -72,8 +75,9 @@ export type StreamCloseAction =
 	/** 通常の切断。従来どおり再接続する。 */
 	| { kind: 'reconnect' }
 	/**
-	 * 再接続しない。ログイン状態を確かめ直す（`(app)/+layout.ts` のルート
-	 * ガード = `resolveProtectedSession` の経路）。
+	 * 再接続しない。ログイン状態を確かめ直す（`sessionRecheck.ts` の
+	 * `recheckSessionAfterStreamClose` = `controller.signal()` + ルートガードの
+	 * 再実行）。
 	 */
 	| { kind: 'recheckSession'; reason: SessionRecheckReason }
 	/** 再接続しない。`message` を画面に出す（利用者の操作で再接続できる）。 */
@@ -116,25 +120,36 @@ export function classifyStreamClose(code: number, reason: string): StreamCloseAc
 export const RECONNECT_FAILURES_BEFORE_SESSION_PROBE = 2;
 
 /**
- * 再接続が失敗したときの、ログイン状態の確認の結果。ルートガードと同じ
- * 3 分類（`sessionGuard.ts` の `decideProtectedRoute`）をそのまま使う。
+ * 再接続が失敗したときの、ログイン状態の確認の結果（3 値）。
+ *
+ * - `session`: まだ有効（確定した `active`。試運転の合成セッションを含む）
+ * - `login`: 失効を確認できた（確定した `none`）
+ * - `unverified`: 照合できない（到達不能・`500`・期限切れ・試運転の状態が
+ *   読めない）。確定状態は変わっていない
  */
-export type SessionProbeResult = ProtectedRouteDecision;
+export type SessionProbeResult = 'session' | 'login' | 'unverified';
 
 /**
- * `/api/auth/check` の応答を分類する（`@banto/admin-core` の
- * `createHttpAuthProvider().check()` と同じ分類。ただし副作用＝トークンの
- * 消去は持たない。#447 のレビュー）:
- * `401` と `200 false` は失効（`login`）、`200 true` は有効（`session`）、
- * それ以外（`500` など・本文が真偽値でない）は照合できない（`unverified`）。
- * `body` は `200` のときだけ意味を持つ。
+ * SessionController の確定の結果（`resolveSettled` または試運転の policy runner
+ * の `recheck`）を 3 値に写す（設計 §6.2 の表: `confirmed/none → 'login'`、
+ * `confirmed/active → 'session'`、`unverified → 'unverified'`）。純関数。
+ *
+ * `confirmed` の snapshot は `none` か `active` だけ（`unknown` は確定ではない）。
+ * 型の上では `unknown` も来うるので、来たら確定していないものとして
+ * `unverified` に倒す（画面を動かさない側）。
  */
-export function classifySessionCheckResponse(status: number, body: unknown): SessionProbeResult {
-	if (status === 401) return 'login';
-	if (status < 200 || status >= 300) return 'unverified';
-	if (body === true) return 'session';
-	if (body === false) return 'login';
-	return 'unverified';
+export function sessionProbeResultOf(
+	result: Exclude<ResolveResult, { outcome: 'superseded' }>
+): SessionProbeResult {
+	if (result.outcome === 'unverified') return 'unverified';
+	switch (result.snapshot.status) {
+		case 'active':
+			return 'session';
+		case 'none':
+			return 'login';
+		default:
+			return 'unverified';
+	}
 }
 
 /** 続けて `consecutiveFailures` 回失敗した今、ログイン状態を確かめるか。 */
@@ -180,26 +195,4 @@ export function decideAfterSessionProbe(
 				probeAgain: failedWhileProbing && shouldProbeSession(failuresNow)
 			};
 	}
-}
-
-/**
- * 同時に何度呼ばれても、実行中の 1 回に相乗りさせる（#441: 複数の
- * ストリームが同時に `1008` を受けても、ログイン状態の確認 = ログイン画面
- * への移動やエラー画面の表示を 1 回にする。#445: 再接続の失敗からの確認も
- * 同じ）。実行が終われば（成功でも失敗でも）次の呼び出しは新しく実行する。
- */
-export function createSingleFlight<T>(run: () => Promise<T>): () => Promise<T> {
-	let inFlight: Promise<T> | null = null;
-	return () => {
-		if (inFlight === null) {
-			inFlight = (async () => {
-				try {
-					return await run();
-				} finally {
-					inFlight = null;
-				}
-			})();
-		}
-		return inFlight;
-	};
 }

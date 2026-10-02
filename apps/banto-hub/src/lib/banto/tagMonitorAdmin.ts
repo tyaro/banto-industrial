@@ -37,8 +37,8 @@
  * という CSRF レイヤーの外側の専用ルーターを新設し、`/api/tag-stream` を
  * 用意した（ハンドラ自体は `/api/v1/stream` と共有 - `crate::stream::ws_upgrade`）。
  * このクライアントは接続のたびに `sessionStore.commissioningMode`
- * （`$lib/session.svelte.ts`、`$lib/banto/commissioning.ts` の判定結果を
- * ルートガードがキャッシュしたもの）を見て分岐する:
+ * （`$lib/session.svelte.ts`。ルートガードの試運転の policy runner が
+ * SessionController に `adopt` で確定させた合成セッションか）を見て分岐する:
  *
  * - **試運転モード中**（`commissioningMode === true`）: サーバー側
  *   （`require_auth_or_commissioning`）が未ロックダウン中は無条件で
@@ -511,8 +511,8 @@ export function connectTagStream(
 
 	/**
 	 * `sessionStore.commissioningMode`（`$lib/session.svelte.ts` - ルート
-	 * ガードが `$lib/banto/commissioning.ts` の判定結果をキャッシュした
-	 * もの）を接続のたびに読み直して分岐する。再接続ループの中で毎回
+	 * ガードの試運転の policy runner が `adopt` で確定させた合成セッションか）を
+	 * 接続のたびに読み直して分岐する。再接続ループの中で毎回
 	 * 評価するので、途中でロックダウンが完了した場合も次の接続試行から
 	 * 自然に「ロックダウン済み」側の経路（トークン必須）へ切り替わる -
 	 * このファイル冒頭の doc comment「WS 購読は難所だった」参照。

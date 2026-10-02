@@ -1,252 +1,159 @@
 /**
- * `sessionRecheck.ts` と、それが走らせ直すルートガード（`(app)/+layout.ts`）
- * のユニットテスト（#441）。
+ * `sessionRecheck.ts` のユニットテスト（#441・#445、banto v2.0.0 #260 で書き直し）。
  *
- * 守りたいこと: ストリームが `1008` + `session_revoked` /
- * `commissioning_ended` で閉じたときの確認は、画面を開いたときと同じルート
- * ガードを通る。
- * - 失効を確認できた（`401`）→ `/login` へ。トークンは消える
- * - 照合できなかった（`500`・到達不能）→ 再試行付きのエラー画面（`503`）。
- *   トークンは消さない
- * - まだ有効 → そのまま（画面に残る）
- * - ロックダウンされた（`commissioning_ended`）→ ログインが要る側へ進む
- * - 複数のストリームが同時に閉じても、確認は 1 回
+ * v2 で確認そのものは SessionController の役目（`GET /api/auth/identity` の
+ * 1 往復・期限・同時の確認の合流・開始時の資格情報との照合・背景の確認）。
+ * v1 の独自の照合（`/api/auth/check` の直接 `fetch`・トークンの照合・
+ * single-flight・期限）は削除したので、ここでは**本物の** `@banto/admin-core`
+ * （HTTP 認証プロバイダーと既定の controller）と**本物の** `commissioning.ts` の
+ * 上で、ストリームの出来事がどう写るかを確かめる。差し替えるのは `fetch`
+ * （偽のサーバー、`testing/hubHttp.ts`）と `invalidateAll()`（SvelteKit の
+ * 実行時が無いと動かないので回数を数える）。
  *
- * #445: 再接続が続けて失敗したときの確認（`probeSessionAfterReconnectFailures`）
- * は画面を動かさず（`invalidateAll()` を呼ばない）、ルートガードと同じ部品で
- * `session` / `login` / `unverified` を返す。照合できない・状態を読めない・
- * 返ってこない（時間切れ）は `unverified`（試運転モード中のネットワーク断で
- * ログイン画面へ送らない）。
- *
- * #447 のレビュー: 確認は保存しているトークンを**変えない**（`check()` を使わず、
- * 開始時のトークンで照合するだけ）。時間切れで見捨てた確認に遅れて `401` が
- * 返っても、確認の最中にログインし直した後で古い `401` が返っても、トークンは
- * 残る。時間切れでは要求を `AbortSignal` で止める。
- *
- * `invalidateAll()`（`$app/navigation`）は SvelteKit の実行時が無いと動かない
- * ので、呼ばれた回数だけ数える。ルートガードは `load()` を直接呼び、
- * `@banto/admin-core` は `sessionGuard.test.ts` と同じく**本物の** HTTP 認証
- * プロバイダーと `resolveProtectedSession` を使う。
+ * 守りたいこと:
+ * - `1008` で閉じられた（#441）: `controller.signal('app:stream-closed')` +
+ *   `invalidateAll()`。走らせ直したガードは signal の**後に**始めた確認で
+ *   判断する（失効なら /login）。
+ * - 再接続が続けて失敗した（#445）: 画面を動かさず（`invalidateAll()` を
+ *   呼ばない）、`session` / `login` / `unverified` を返す。
+ *   - 試運転中は policy runner の `recheck`（状態が読めなければ `unverified`、
+ *     ネットワーク断でログイン画面へ送らない）。
+ *   - 照合できない・返ってこない（10 秒）は `unverified`。トークンは消さない。
+ *     その後も controller が背景で確認を続ける（E2E の「切断後ちょうど 1 回」は
+ *     成り立たない）。
+ *   - 確認の最中に資格情報が変わったら、古い答えは使わない（新しい資格情報で
+ *     確かめ直す）。古い `401` が新しいトークンを消さない（compare-and-set）。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { isHttpError, isRedirect } from '@sveltejs/kit';
+import { isRedirect } from '@sveltejs/kit';
+import { getSessionController } from '@banto/admin-core';
 
 const nav = vi.hoisted(() => ({
 	invalidateAll: vi.fn<() => Promise<void>>(async () => {})
 }));
-const state = vi.hoisted(() => ({
-	commissioning: { lockedDown: true } as { lockedDown: boolean } | null,
-	auth: null as unknown,
-	sessionLoad: vi.fn(async () => {}),
-	enterCommissioningMode: vi.fn(),
-	commissioningMode: false
-}));
 
 vi.mock('$app/navigation', () => ({ invalidateAll: nav.invalidateAll }));
-vi.mock('@banto/admin-core', async () => {
-	const gate = await import('../../../node_modules/@banto/admin-core/src/sessionGate');
-	return {
-		resolveProtectedSession: gate.resolveProtectedSession,
-		getAuthProvider: () => state.auth
-	};
-});
-vi.mock('$lib/banto/setup', () => ({
-	bantoReady: Promise.resolve(),
-	CSRF_HEADER: { 'X-Banto-Client': 'banto' }
-}));
+vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
+vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
+// この最小 vitest 構成には `$lib` の別名が無いので、本物のモジュールへ向ける（差し替えではない）。
 vi.mock('$lib/banto/sessionGuard', () => import('./sessionGuard'));
-vi.mock('$lib/banto/commissioning', () => ({
-	fetchCommissioningStatusOrNull: async () => state.commissioning,
-	shouldBypassLoginForCommissioning: (status: { lockedDown: boolean } | null) =>
-		status !== null && !status.lockedDown
-}));
-vi.mock('$lib/session.svelte', () => ({
-	sessionStore: {
-		load: state.sessionLoad,
-		enterCommissioningMode: state.enterCommissioningMode,
-		get commissioningMode() {
-			return state.commissioningMode;
-		}
-	}
-}));
+vi.mock('$lib/banto/commissioningPolicy', () => import('./commissioningPolicy'));
 vi.mock('$lib/settings.svelte', () => ({ settings: { syncFromProvider: async () => {} } }));
 
-import { createHttpAuthProvider } from '../../../node_modules/@banto/admin-core/src/providers/http';
 import { load } from '../../routes/(app)/+layout';
+import { COMMISSIONING_KIND } from './commissioningPolicy';
 import {
 	probeSessionAfterReconnectFailures,
-	recheckSessionAfterStreamClose,
-	SESSION_PROBE_TIMEOUT_MS
+	recheckSessionAfterStreamClose
 } from './sessionRecheck';
-import { SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
+import {
+	identityByToken,
+	identityOf,
+	installHub,
+	jsonResponse,
+	TOKEN_KEY,
+	type SentRequest
+} from './testing/hubHttp';
 
-const TOKEN_KEY = 'banto.auth.token';
-
-class MemoryStorage {
-	private map = new Map<string, string>();
-	getItem(key: string): string | null {
-		return this.map.get(key) ?? null;
-	}
-	setItem(key: string, value: string): void {
-		this.map.set(key, value);
-	}
-	removeItem(key: string): void {
-		this.map.delete(key);
-	}
-	clear(): void {
-		this.map.clear();
-	}
-}
-
-let session: MemoryStorage;
-
-function jsonResponse(status: number, body: unknown): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: { 'content-type': 'application/json' }
-	});
-}
-
-/**
- * `/api/auth/check` の応答を決める。ルートガード（本物の HTTP 認証プロバイダーの
- * `check()`）と、#445 の確認（`fetch` を直接呼ぶ。#447 のレビュー）の両方が同じ
- * 偽の `fetch` を通る。`init` で送ったヘッダ・`signal` を見られる。
- */
-function useCheck(check: (init?: RequestInit) => Promise<Response>): void {
-	const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-		if (String(url).endsWith('/api/auth/check')) return check(init);
-		return jsonResponse(200, { initialized: true, viewerPublic: false });
-	}) as unknown as typeof fetch;
-	state.auth = createHttpAuthProvider({ fetchFn });
-	vi.stubGlobal('fetch', fetchFn);
-}
-
-/** ルートガードを走らせ、投げたもの（redirect / error）か `'passed'` を返す。 */
-async function runGuard(): Promise<unknown> {
-	try {
-		await load();
-		return 'passed';
-	} catch (thrown) {
-		return thrown;
-	}
-}
+let hub: ReturnType<typeof installHub>;
 
 beforeEach(() => {
-	session = new MemoryStorage();
-	vi.stubGlobal('sessionStorage', session);
-	vi.stubGlobal('localStorage', new MemoryStorage());
-	state.commissioning = { lockedDown: true };
-	state.commissioningMode = false;
-	state.sessionLoad.mockClear();
-	state.enterCommissioningMode.mockClear();
+	hub = installHub();
 	nav.invalidateAll.mockReset();
 	nav.invalidateAll.mockImplementation(async () => {});
 });
 
 afterEach(() => {
+	vi.useRealTimers();
 	vi.unstubAllGlobals();
 });
 
-describe('recheckSessionAfterStreamClose', () => {
-	it('ルートガードを走らせ直す（invalidateAll）', async () => {
-		await recheckSessionAfterStreamClose();
-		expect(nav.invalidateAll).toHaveBeenCalledTimes(1);
-	});
+async function runGuard(): Promise<unknown> {
+	try {
+		return await load();
+	} catch (thrown) {
+		return thrown;
+	}
+}
 
-	it('複数のストリームが同時に閉じても、確認は 1 回', async () => {
-		let release: () => void = () => {};
-		nav.invalidateAll.mockImplementation(
-			() =>
-				new Promise<void>((resolve) => {
-					release = resolve;
-				})
+const identityRequests = (): SentRequest[] =>
+	hub.sent.filter((r) => r.path.endsWith('/api/auth/identity'));
+
+/** alice でログインして、ガードを 1 回通した状態にする。 */
+async function signedInAsAlice(): Promise<void> {
+	hub.session.setItem(TOKEN_KEY, 'alice-token');
+	hub.routes.identity = identityByToken({ 'alice-token': identityOf('alice') });
+	await runGuard();
+	expect(getSessionController().snapshot.identity?.id).toBe('alice');
+}
+
+/** 試運転の合成セッションを確定した状態にする。 */
+async function commissioning(): Promise<void> {
+	hub.routes.status = async () => jsonResponse(200, { lockedDown: false });
+	await runGuard();
+	expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
+}
+
+/** 中断されたら reject する、応答しない要求（本物の `fetch` と同じ）。 */
+function hanging(request: SentRequest): Promise<Response> {
+	return new Promise<Response>((_resolve, reject) => {
+		request.signal?.addEventListener('abort', () =>
+			reject(new DOMException('The operation was aborted.', 'AbortError'))
 		);
-		const pending = [
-			recheckSessionAfterStreamClose(),
-			recheckSessionAfterStreamClose(),
-			recheckSessionAfterStreamClose()
-		];
-		release();
-		await Promise.all(pending);
-		expect(nav.invalidateAll).toHaveBeenCalledTimes(1);
+	});
+}
 
-		// 終わった後にまた閉じられたら、改めて確認する。
-		nav.invalidateAll.mockImplementation(async () => {});
+describe('recheckSessionAfterStreamClose（#441: 1008 で閉じられた）', () => {
+	it('controller に signal を送り、ルートガードを走らせ直す（invalidateAll）', async () => {
+		await signedInAsAlice();
+		const controller = getSessionController();
+		const signal = vi.spyOn(controller, 'signal');
+
 		await recheckSessionAfterStreamClose();
-		expect(nav.invalidateAll).toHaveBeenCalledTimes(2);
+
+		expect(signal).toHaveBeenCalledWith('app:stream-closed');
+		expect(nav.invalidateAll).toHaveBeenCalledTimes(1);
 	});
-});
 
-describe('走らせ直したルートガード（session_revoked の後）', () => {
-	it('失効を確認できた（401）→ /login へ。トークンは消える', async () => {
-		session.setItem(TOKEN_KEY, 'revoked-token');
-		useCheck(async () => jsonResponse(401, { kind: 'unauthorized' }));
+	it('session_revoked: 走らせ直したガードは signal の後の確認で失効を確定し、/login へ', async () => {
+		await signedInAsAlice();
+		hub.routes.identity = async () => jsonResponse(401, { kind: 'unauthorized' });
 
+		await recheckSessionAfterStreamClose();
 		const thrown = await runGuard();
+
 		expect(isRedirect(thrown)).toBe(true);
 		if (isRedirect(thrown)) expect(thrown.location).toBe('/login');
-		expect(session.getItem(TOKEN_KEY)).toBeNull();
-		expect(state.sessionLoad).not.toHaveBeenCalled();
+		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
 	});
 
-	it.each([
-		[
-			'照合の 500',
-			async () => jsonResponse(500, { kind: 'storage', message: 'database is locked' })
-		],
-		[
-			'到達不能',
-			async (): Promise<Response> => {
-				throw new TypeError('Failed to fetch');
-			}
-		]
-	])('照合できなかった（%s）→ 再試行付きのエラー画面。トークンは残る', async (_label, check) => {
-		session.setItem(TOKEN_KEY, 'live-token');
-		useCheck(check);
+	it('まだ有効なら、ガードはそのまま進む（同じ generation、画面は作り直さない）', async () => {
+		await signedInAsAlice();
+		const generation = getSessionController().snapshot.generation;
 
-		const thrown = await runGuard();
-		expect(isHttpError(thrown)).toBe(true);
-		if (isHttpError(thrown)) {
-			expect(thrown.status).toBe(503);
-			expect(thrown.body.message).toBe(SESSION_CHECK_FAILED_MESSAGE);
-		}
-		expect(session.getItem(TOKEN_KEY)).toBe('live-token');
+		await recheckSessionAfterStreamClose();
+		const data = (await runGuard()) as { sessionGeneration: number };
+
+		expect(data.sessionGeneration).toBe(generation);
 	});
 
-	it('まだ有効（200 true）→ そのまま進む（画面に残り、呼び出し側が購読を再開する）', async () => {
-		session.setItem(TOKEN_KEY, 'live-token');
-		useCheck(async () => jsonResponse(200, true));
+	it('S-45: 試運転中の signal は provider に問い合わせない。commissioning_ended はガードの policy runner が end する', async () => {
+		await commissioning();
+		await recheckSessionAfterStreamClose();
+		expect(identityRequests()).toHaveLength(0);
+		expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
 
-		expect(await runGuard()).toBe('passed');
-		expect(state.sessionLoad).toHaveBeenCalledTimes(1);
-	});
-});
-
-describe('走らせ直したルートガード（commissioning_ended の後）', () => {
-	it('ロックダウン済みでトークンが無ければ /login へ（試運転モードの迂回はしない）', async () => {
-		state.commissioning = { lockedDown: true };
-		useCheck(async () => jsonResponse(200, true));
-
+		hub.routes.status = async () => jsonResponse(200, { lockedDown: true });
 		const thrown = await runGuard();
 		expect(isRedirect(thrown)).toBe(true);
-		if (isRedirect(thrown)) expect(thrown.location).toBe('/login');
-		expect(state.enterCommissioningMode).not.toHaveBeenCalled();
-	});
-
-	it('状態を読めなかったときも安全側（ログインが要る側）へ倒す', async () => {
-		state.commissioning = null;
-		useCheck(async () => jsonResponse(200, true));
-
-		const thrown = await runGuard();
-		expect(isRedirect(thrown)).toBe(true);
-		expect(state.enterCommissioningMode).not.toHaveBeenCalled();
+		expect(getSessionController().snapshot.status).toBe('none');
 	});
 });
 
 describe('probeSessionAfterReconnectFailures（#445: 再接続が続けて失敗したとき）', () => {
-	it.each([
-		['200 true', async () => jsonResponse(200, true), 'session'],
-		['200 false（失効したセッション）', async () => jsonResponse(200, false), 'login'],
+	const cases: [string, () => Promise<Response>, 'session' | 'login' | 'unverified'][] = [
+		['200 identity', async () => jsonResponse(200, identityOf('alice')), 'session'],
+		['200 null（失効したセッション）', async () => jsonResponse(200, null), 'login'],
 		['401', async () => jsonResponse(401, { kind: 'unauthorized' }), 'login'],
 		[
 			'照合の 500',
@@ -255,188 +162,172 @@ describe('probeSessionAfterReconnectFailures（#445: 再接続が続けて失敗
 		],
 		[
 			'到達不能',
-			async (): Promise<Response> => {
+			async () => {
 				throw new TypeError('Failed to fetch');
 			},
 			'unverified'
 		]
-	] as const)(
-		'ロックダウン済み・照合 %s → %s。画面は動かさない',
-		async (_label, check, expected) => {
-			session.setItem(TOKEN_KEY, 'tok');
-			useCheck(check);
-
+	];
+	for (const [label, identity, expected] of cases) {
+		it(`ロックダウン済み・identity ${label} → ${expected}。画面は動かさない`, async () => {
+			await signedInAsAlice();
+			hub.routes.identity = identity;
 			expect(await probeSessionAfterReconnectFailures()).toBe(expected);
 			expect(nav.invalidateAll).not.toHaveBeenCalled();
-		}
-	);
+		});
+	}
 
-	it('照合できないときはトークンを消さない', async () => {
-		session.setItem(TOKEN_KEY, 'live-token');
-		useCheck(async () => jsonResponse(500, { kind: 'storage', message: 'x' }));
+	it('確認は identity の 1 往復（/api/auth/check は使わない）', async () => {
+		await signedInAsAlice();
+		const before = hub.sent.length;
+		expect(await probeSessionAfterReconnectFailures()).toBe('session');
+		expect(hub.paths().slice(before)).toEqual(['/api/auth/identity']);
+	});
+
+	it('照合できないときはトークンを消さない。controller は背景で確認を続ける', async () => {
+		vi.useFakeTimers();
+		await signedInAsAlice();
+		hub.routes.identity = async () => jsonResponse(500, { kind: 'storage', message: 'x' });
+		const before = identityRequests().length;
 
 		expect(await probeSessionAfterReconnectFailures()).toBe('unverified');
-		expect(session.getItem(TOKEN_KEY)).toBe('live-token');
+		expect(hub.session.getItem(TOKEN_KEY)).toBe('alice-token');
+		expect(getSessionController().snapshot.identity?.id).toBe('alice'); // 確定状態は変えない
+
+		// 背景の確認（1 秒から倍々）。サーバーが失効を答えたら none が確定する（配線①が /login へ）。
+		hub.routes.identity = async () => jsonResponse(401, { kind: 'unauthorized' });
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(identityRequests().length).toBeGreaterThan(before + 1);
+		expect(getSessionController().snapshot.status).toBe('none');
 	});
 
 	it('トークンが無ければ login', async () => {
-		useCheck(async () => jsonResponse(200, true));
+		await signedInAsAlice();
+		hub.session.removeItem(TOKEN_KEY);
 		expect(await probeSessionAfterReconnectFailures()).toBe('login');
 	});
 
-	it('試運転モードの状態が読めなかった（ネットワーク断など）→ unverified（ガードと違い、ログインへ倒さない）', async () => {
-		state.commissioning = null;
-		state.commissioningMode = true;
-		useCheck(async () => jsonResponse(200, true));
-
-		expect(await probeSessionAfterReconnectFailures()).toBe('unverified');
-	});
-
-	it('試運転モードのまま → session（照合しない）', async () => {
-		state.commissioning = { lockedDown: false };
-		state.commissioningMode = true;
-		const check = vi.fn(async () => jsonResponse(401, { kind: 'unauthorized' }));
-		useCheck(check);
-
-		expect(await probeSessionAfterReconnectFailures()).toBe('session');
-		expect(check).not.toHaveBeenCalled();
-	});
-
-	it('試運転モードのつもりで繋いでいたが、ロックダウンされていた → login（ガードを走らせ直す）', async () => {
-		state.commissioning = { lockedDown: true };
-		state.commissioningMode = true;
-		session.setItem(TOKEN_KEY, 'tok');
-		useCheck(async () => jsonResponse(200, true));
-
-		expect(await probeSessionAfterReconnectFailures()).toBe('login');
-	});
-
-	it('返ってこなければ、時間切れで unverified（次の確認を起こせるように）', async () => {
-		vi.useFakeTimers();
-		try {
-			session.setItem(TOKEN_KEY, 'tok');
-			useCheck(() => new Promise<Response>(() => {}));
-
-			const result = probeSessionAfterReconnectFailures();
-			await vi.advanceTimersByTimeAsync(SESSION_PROBE_TIMEOUT_MS);
-			expect(await result).toBe('unverified');
-
-			// 時間切れの後は新しく確認できる。
-			useCheck(async () => jsonResponse(200, false));
-			expect(await probeSessionAfterReconnectFailures()).toBe('login');
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it('同時に何度呼ばれても照合は 1 回（single-flight）', async () => {
-		session.setItem(TOKEN_KEY, 'tok');
-		let release: () => void = () => {};
-		const check = vi.fn(
-			() =>
-				new Promise<Response>((resolve) => {
-					release = () => resolve(jsonResponse(200, true));
-				})
-		);
-		useCheck(check);
+	it('同時に呼ばれても、生きている要求は 1 本だけ（signal の後の確認だけが答える。古い要求は中断して待ち手を移す）', async () => {
+		await signedInAsAlice();
+		const releases: Array<() => void> = [];
+		hub.routes.identity = () =>
+			new Promise<Response>((resolve) => {
+				releases.push(() => resolve(jsonResponse(200, identityOf('alice'))));
+			});
+		const before = identityRequests().length;
 
 		const pending = [
 			probeSessionAfterReconnectFailures(),
 			probeSessionAfterReconnectFailures(),
 			probeSessionAfterReconnectFailures()
 		];
-		await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(1));
-		release();
+		// `cause: 'signal'` はそれぞれ signal の stamp を進める（I-9、S-58）ので、
+		// 先に出た要求は合流できず中断され、待ち手は最後の要求へ移る。
+		await vi.waitFor(() => expect(identityRequests().length).toBe(before + 3));
+		const sent = identityRequests().slice(before);
+		expect(sent.slice(0, 2).every((r) => r.signal?.aborted === true)).toBe(true);
+		expect(sent[2].signal?.aborted).toBe(false);
+		for (const release of releases) release();
 		expect(await Promise.all(pending)).toEqual(['session', 'session', 'session']);
-		expect(check).toHaveBeenCalledTimes(1);
+	});
+
+	it('返ってこなければ 10 秒で unverified。止めた要求は中断されている', async () => {
+		vi.useFakeTimers();
+		await signedInAsAlice();
+		hub.routes.identity = async (request) => hanging(request);
+
+		const result = probeSessionAfterReconnectFailures();
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(await result).toBe('unverified');
+		const first = identityRequests().at(-1);
+		expect(first?.signal?.aborted).toBe(true);
+		expect(hub.session.getItem(TOKEN_KEY)).toBe('alice-token');
+	});
+
+	it('S-31: 時間切れの後に遅れて 401 が返ったら、トークンは消え、controller が背景で none を確定する（待ち続けない）', async () => {
+		vi.useFakeTimers();
+		await signedInAsAlice();
+		let lateAnswer: () => void = () => {};
+		let calls = 0;
+		hub.routes.identity = () => {
+			calls += 1;
+			if (calls > 1) return Promise.resolve(jsonResponse(401, { kind: 'unauthorized' }));
+			// サーバーが中断を無視して遅れて答える、を再現する。
+			return new Promise<Response>((resolve) => {
+				lateAnswer = () => resolve(jsonResponse(401, { kind: 'unauthorized' }));
+			});
+		};
+
+		const result = probeSessionAfterReconnectFailures();
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(await result).toBe('unverified');
+
+		lateAnswer();
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
+		expect(getSessionController().snapshot.status).toBe('none');
+	});
+
+	it('確認の最中に別タブでログインし直したら、古い答えは使わず新しい資格情報で確かめる。古い 401 は新しいトークンを消さない', async () => {
+		hub.local.setItem(TOKEN_KEY, 'old-token');
+		hub.routes.identity = identityByToken({ 'old-token': identityOf('alice') });
+		await runGuard();
+
+		let answerOld: () => void = () => {};
+		hub.routes.identity = (request) => {
+			if (request.headers.Authorization === 'Bearer old-token') {
+				return new Promise<Response>((resolve) => {
+					answerOld = () => resolve(jsonResponse(401, { kind: 'unauthorized' }));
+				});
+			}
+			return Promise.resolve(jsonResponse(200, identityOf('bob')));
+		};
+
+		const result = probeSessionAfterReconnectFailures();
+		await vi.waitFor(() =>
+			expect(identityRequests().at(-1)?.headers.Authorization).toBe('Bearer old-token')
+		);
+		hub.otherTabWrites('new-token');
+		answerOld();
+
+		expect(await result).toBe('session');
+		expect(getSessionController().snapshot.identity?.id).toBe('bob');
+		expect(hub.local.getItem(TOKEN_KEY)).toBe('new-token');
 	});
 });
 
-describe('probeSessionAfterReconnectFailures は認証の状態を変えない（#447 のレビュー）', () => {
-	it('開始時のトークンで照合する', async () => {
-		session.setItem(TOKEN_KEY, 'tok-a');
-		let sent: HeadersInit | undefined;
-		useCheck(async (init) => {
-			sent = init?.headers;
-			return jsonResponse(200, true);
-		});
-
+describe('probeSessionAfterReconnectFailures: 試運転中（policy runner の recheck）', () => {
+	it('試運転モードのまま → session（identity は呼ばない、generation 据え置き）', async () => {
+		await commissioning();
+		const generation = getSessionController().snapshot.generation;
 		expect(await probeSessionAfterReconnectFailures()).toBe('session');
-		expect(sent).toMatchObject({ Authorization: 'Bearer tok-a', 'X-Banto-Client': 'banto' });
+		expect(identityRequests()).toHaveLength(0);
+		expect(getSessionController().snapshot.generation).toBe(generation);
 	});
 
-	it('401 でもトークンを消さない（消すのはルートガードの check()）', async () => {
-		session.setItem(TOKEN_KEY, 'revoked');
-		useCheck(async () => jsonResponse(401, { kind: 'unauthorized' }));
+	it('状態が読めなかった（ネットワーク断など）→ unverified。ガードと違い、試運転を終わらせない', async () => {
+		await commissioning();
+		hub.routes.status = async () => {
+			throw new TypeError('Failed to fetch');
+		};
+		expect(await probeSessionAfterReconnectFailures()).toBe('unverified');
+		expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
+		expect(nav.invalidateAll).not.toHaveBeenCalled();
+	});
 
+	it('試運転のつもりで繋いでいたがロックダウンされていた → end → login', async () => {
+		await commissioning();
+		hub.routes.status = async () => jsonResponse(200, { lockedDown: true });
 		expect(await probeSessionAfterReconnectFailures()).toBe('login');
-		expect(session.getItem(TOKEN_KEY)).toBe('revoked');
+		expect(getSessionController().snapshot.status).toBe('none');
 	});
 
-	it('時間切れの後に遅れて 401 が返っても、トークンは残り、要求は止められている', async () => {
-		vi.useFakeTimers();
-		try {
-			session.setItem(TOKEN_KEY, 'tok');
-			let signal: AbortSignal | null | undefined;
-			let lateAnswer: () => void = () => {};
-			useCheck(
-				(init) =>
-					new Promise<Response>((resolve) => {
-						signal = init?.signal;
-						// サーバーが中断を無視して遅れて答える、を再現する。
-						lateAnswer = () => resolve(jsonResponse(401, { kind: 'unauthorized' }));
-					})
-			);
-
-			const result = probeSessionAfterReconnectFailures();
-			await vi.advanceTimersByTimeAsync(SESSION_PROBE_TIMEOUT_MS);
-			expect(await result).toBe('unverified');
-			expect(signal?.aborted).toBe(true);
-
-			lateAnswer();
-			await vi.advanceTimersByTimeAsync(0);
-			expect(session.getItem(TOKEN_KEY)).toBe('tok');
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it('確認の最中にログインし直し、その後で古い 401 が返っても、新しいトークンは残り、結果は unverified', async () => {
-		session.setItem(TOKEN_KEY, 'old-token');
-		let answer: () => void = () => {};
-		const check = vi.fn(
-			() =>
-				new Promise<Response>((resolve) => {
-					answer = () => resolve(jsonResponse(401, { kind: 'unauthorized' }));
-				})
-		);
-		useCheck(check);
-
-		const result = probeSessionAfterReconnectFailures();
-		await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(1));
-		session.setItem(TOKEN_KEY, 'new-token');
-		answer();
-
-		expect(await result).toBe('unverified');
-		expect(session.getItem(TOKEN_KEY)).toBe('new-token');
-	});
-
-	it('確認の最中にほかの経路でトークンが消えたら、古い答え（200 true）は使わない', async () => {
-		session.setItem(TOKEN_KEY, 'tok');
-		let answer: () => void = () => {};
-		const check = vi.fn(
-			() =>
-				new Promise<Response>((resolve) => {
-					answer = () => resolve(jsonResponse(200, true));
-				})
-		);
-		useCheck(check);
-
-		const result = probeSessionAfterReconnectFailures();
-		await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(1));
-		session.removeItem(TOKEN_KEY);
-		answer();
-
-		expect(await result).toBe('unverified');
+	it('ロックダウン済みで、保存していたトークンが有効なら session（そのアカウントで続ける）', async () => {
+		await commissioning();
+		hub.session.setItem(TOKEN_KEY, 'alice-token');
+		hub.routes.identity = identityByToken({ 'alice-token': identityOf('alice') });
+		hub.routes.status = async () => jsonResponse(200, { lockedDown: true });
+		expect(await probeSessionAfterReconnectFailures()).toBe('session');
+		expect(getSessionController().snapshot.identity?.id).toBe('alice');
 	});
 });

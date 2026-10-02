@@ -4,7 +4,8 @@
  * 自動導出する構造は無改変（差分は navItems 自体の中身のみ）。
  */
 import { goto } from '$app/navigation';
-import { getAuthProvider, type PaletteCommand } from '@banto/admin-core';
+import type { PaletteCommand } from '@banto/admin-core';
+import { hubLogout } from './banto/hubLogout';
 import { navItems } from './navigation';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
@@ -76,8 +77,8 @@ function sessionCommands(): PaletteCommand[] {
 			keywords: ['logout', 'sign out'],
 			visible: () => !sessionStore.authDisabled,
 			run: async () => {
-				await getAuthProvider().logout();
-				await goto('/login');
+				// banto v2.0.0 (#260): same as Header.svelte's logout.
+				await hubLogout(() => goto('/login'));
 			}
 		}
 	];

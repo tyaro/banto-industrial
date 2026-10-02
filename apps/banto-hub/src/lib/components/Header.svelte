@@ -2,7 +2,7 @@
 	// relay-wright の同名コンポーネントから無改変で複製。
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { getAuthProvider } from '@banto/admin-core';
+	import { hubLogout } from '$lib/banto/hubLogout';
 	import { pageTitle } from '$lib/navigation';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { sessionStore } from '$lib/session.svelte';
@@ -22,8 +22,12 @@
 	);
 
 	async function logout() {
-		await getAuthProvider().logout();
-		goto('/login');
+		// banto v2.0.0 (#260, design §6.1): logout() -> confirm the session ->
+		// /login only when it is confirmed `none` (another tab's login
+		// confirmed meanwhile stays). `'stayed'`/`'unverified'` are told with a
+		// toast - see `$lib/banto/logout.svelte.ts` for the full sequence.
+		// 試運転モードの合成セッションの間は v1 と同じ（`$lib/banto/hubLogout.ts`）。
+		await hubLogout(() => goto('/login'));
 	}
 </script>
 

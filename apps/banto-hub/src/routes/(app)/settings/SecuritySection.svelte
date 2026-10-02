@@ -19,10 +19,10 @@
 	 * 他クライアントが最後の admin を消す、というレースも理論上あり得る）。
 	 */
 	import { goto } from '$app/navigation';
-	import { getAuthProvider } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { lockDown } from '$lib/banto/commissioning';
+	import { lockDownAndLeave } from '$lib/banto/commissioningLockDown';
 	import { listUsers } from '$lib/banto/usersAdmin';
 	import { errorMessage } from './shared';
 
@@ -77,16 +77,25 @@
 		lockingDown = true;
 		lockDownError = null;
 		try {
-			await lockDown();
-			toastStore.push('success', 'ロックダウンしました。ログイン画面へ移動します。');
 			// ロックダウン後は以後の全リクエストで認証が必須になる - この画面に
 			// 留まらせると後続の管理 API 呼び出しが軒並み 401 になって壊れて
-			// 見えるため、即座にログイン画面へ誘導する（実装指示のとおり）。
-			// ここまで来た時点で試運転モード中の合成セッションしか無い可能性が
-			// 高いが、万一実トークンを保持していた場合に備えて `logout()` で
-			// 確実に破棄してから遷移する（`Header.svelte` の logout と同じ手順）。
-			await getAuthProvider().logout();
-			goto('/login');
+			// 見えるため、ログイン画面へ誘導する（実装指示のとおり）。
+			// banto v2.0.0（#260）: 試運転の合成セッションは controller が `adopt` で
+			// 確定しているので、ログアウト（`logout()` → 確認）では終わらない。
+			// ロックダウンの前に取った ticket で `end()` → 確定 → `none` なら
+			// /login、の順序は `commissioningLockDown.ts` の doc。
+			const outcome = await lockDownAndLeave({ lockDown, goToLogin: () => goto('/login') });
+			if (outcome === 'left') {
+				toastStore.push('success', 'ロックダウンしました。ログイン画面へ移動します。');
+			} else if (outcome === 'stayed') {
+				// 保存していたトークンが有効だった: そのアカウントで続ける。
+				toastStore.push('success', 'ロックダウンしました。ログイン中のアカウントで続けます。');
+			} else {
+				toastStore.push(
+					'error',
+					'ロックダウンしましたが、ログイン状態を確認できませんでした。しばらくしてから再試行してください。'
+				);
+			}
 		} catch (err) {
 			lockDownError = errorMessage(err);
 		} finally {

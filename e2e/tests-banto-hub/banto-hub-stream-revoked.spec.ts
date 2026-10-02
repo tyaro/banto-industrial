@@ -111,11 +111,10 @@ test.describe.serial('banto-hub ストリームの失効（ロックダウン済
 		expect(resetRes.ok(), await resetRes.text()).toBe(true);
 
 		await expect(viewerPage).toHaveURL(/\/login$/, { timeout: ONE_INTERVAL_WITH_MARGIN_MS });
-		// トークンが消えたかはここでは見ない: 失効したセッションの
-		// `/api/auth/check` は `200 false` で、`@banto/admin-core` が
-		// それでもトークンを消すのは banto v1.7.2 から（v1.7.1 までは
-		// `401` のときだけ）。消えることは `banto-hub-user-session-ended.spec.ts`
-		// が見ている。
+		// トークンが消えたかはここでは見ない: 消えることは
+		// `banto-hub-user-session-ended.spec.ts` が見ている（banto v2.0.0 #260
+		// からは SessionController の確認 `GET /api/auth/identity` が `401` /
+		// `200 null` で、送ったトークンを compare-and-set で消す）。
 		// 1008 の後に再接続していない（修正前は 1 秒・2 秒…のバックオフで
 		// 張り直し、認証で拒否され続けた）。
 		expect(sockets).toHaveLength(1);
