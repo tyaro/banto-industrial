@@ -2,6 +2,26 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.27 — 2026-10-02（アルファ）
+
+banto v2.1.1 に追従した（v2.0.0 → v2.1.0 → v2.1.1、経路 A のみ。Rust の `banto-*` と npm の `@banto/*` を同じタグに）。banto-hub の REST の wire・設定・DB は変わらない。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 変更（banto v2.1.0・v2.1.1 から banto-hub に入るもの）
+
+- **ログインの同時検証に上限が付いた**（banto-server、banto #279）。ログイン要求は、検証（argon2）を待つ前に試行枠を予約し、処理中の試行も失敗回数と同じようにしきい値の判定に数える。同時に検証できる数は IP ごとに 4・全体で 8 までで、超えた要求は待たされず、通常のレート制限と同じ答え（`RateLimited`）を即座に返す。banto-hub の `POST /api/auth/login` は banto-server の `auth_routes` をそのまま使っているので、この上限が掛かる。
+- **SSE の接続が開いたままでも、banto-server の `RunningServer::stop()` が完了する**（banto #283）。banto-hub（`apps/banto-hub/core/src/runtime.rs` の起動と停止）と ChronoGazer（`banto-serve`、Tauri の LAN サーバーの停止・再起動）は本番の経路で `banto_server::start` / `RunningServer::stop()` を使っているので、SSE の接続が開いていても停止が終わるようになる。
+- **試運転モードへの切り替えで「別のユーザーでログインされました」が出なくなった**（`@banto/admin-core`、banto #308。#291 の続き）。`SessionController` が owner の変化を比べる対象は `kind === 'account'` の active だけになり、`publicViewer`・`local`・`commissioning` などは通知を立てず、最後の具体的な owner も更新しない。管理 UI を開いたままアカウントから試運転の合成セッションへ切り替わっても通知は出ない。アカウントから別のアカウントへの切り替えは従来どおり通知する。v2.1.0 の #291 が `kind: 'local'` だけを外していたのを、#308 で `account` 以外の全般に広げた。banto-hub に効くのは `commissioning` の除外。
+- `@banto/admin-core` に `invalidateAll()` と型 `InvalidateReason` が加わった（banto #289。SSE の再接続後に購読中のリソースを再取得する上流の機能）。banto-hub 側のコードはこれらを使っていない。
+
+### 変わらないもの
+
+- **banto-hub の監査ログは変わらない。** 上流 v2.1.0 は「有効なセッションを終えない `POST /api/auth/logout` を監査に記録しない」（banto #278）を `banto-server` に入れたが、banto-hub は独自の `audit_logout_middleware`（`apps/banto-hub/core/src/rest.rs`）でログアウトを記録しており、この PR ではそこに手を入れていない。したがって未認証のログアウトも従来どおり記録される。
+- SQLite のバックアップの保存先の変更（banto #280）は、banto-hub がバックアップ機能（`banto-admin-services` の `backup`）を使っていないため影響しない。
+
+### 変更（内部）
+
+- banto の依存（`banto-core` / `banto-storage` / `banto-server`、`@banto/*`）を `v2.0.0` から `v2.1.1` に上げた。`Cargo.lock` は banto の 4 crate の `version` と `source` のみ、`pnpm-lock.yaml` は `@banto/*` のみ（外部の依存は動かしていない）。ChronoGazer の `@banto/*` も同じタグに上げた（ChronoGazer 自体の版と変更履歴は無い）。
+
 ## v0.2.0-alpha.26 — 2026-10-02（アルファ）
 
 banto v2.0.0 に追従した（v2 移行 PR1a・PR1d）。管理 UI の「誰がログインしているか」の確定を、banto の SessionController（`@banto/admin-core`）1 か所に寄せた。試運転モード（ロックダウン前）の合成セッションは、このアプリの方針（policy runner）が controller に `adopt` で確定し、ロックダウンで `end` する。配布物の構成・前提ランタイムは alpha.3 以降と同じ。**サーバーの wire 変更なし**（管理 UI がログイン状態の確認に使う要求が `GET /api/auth/check` から `GET /api/auth/identity` に変わったが、どちらも従来からある banto のルート）。
