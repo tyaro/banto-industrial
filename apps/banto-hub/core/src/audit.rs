@@ -1,6 +1,6 @@
 //! Audit trail service, copied near-verbatim from
 //! `apps/chronogazer/core/src/audit.rs`: who did what, when, and whether it
-//! was allowed. Backed by the `audit_log` table (`db.rs::apply_app_schema`),
+//! was allowed. Backed by the `audit_log` table (`migrations-sqlite/0005_audit_log.sql`),
 //! same service-layer pattern as [`crate::users::UsersService`] - testable in
 //! a plain `cargo test`, no `axum` dependency.
 //!
@@ -221,7 +221,7 @@ impl AuditLogService {
     /// 世代の最初の応答で返ってきた境界を固定し、同じ世代の後続ブロックに
     /// 渡す - ブロック取得の合間に行が**足されても**、同じ集合から取れる。
     /// `audit_log.id` は `INTEGER PRIMARY KEY AUTOINCREMENT`
-    /// （`crate::db` の `apply_app_schema`）なので単調増加かつ**削除後も
+    /// （`migrations-sqlite/0005_audit_log.sql`）なので単調増加かつ**削除後も
     /// 再利用されない**。
     ///
     /// **削除には効かない**: 保持期間の [`AuditLogService::prune`] が集合の

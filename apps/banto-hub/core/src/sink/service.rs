@@ -45,7 +45,7 @@ const MAX_TABLE_IDENTIFIER_LEN: usize = 63;
 
 /// `hub_sink_groups.mode`（設計 §5.2「MQTT と同じ語彙」）。SQL の `CHECK` と
 /// 二重管理になる関係は `banto_tags::plc_connection::ALLOWED_PROTOCOLS` と
-/// 同じ - 変更する際は `crate::db`の`apply_app_schema`のCHECKも合わせる。
+/// 同じ - 変更する際は新しい migration（`migrations-sqlite/`）で CHECK も合わせる。
 pub const ALLOWED_SINK_MODES: &[&str] = &["interval", "on_change"];
 
 fn default_enabled() -> bool {

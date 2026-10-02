@@ -7,7 +7,7 @@
 //! - **ロックダウン済み**: 従来どおり bearer セッションのログインが必要。
 //!
 //! 永続先は既存の `settings` テーブル（`crate::settings::SettingsService`と
-//! 同じ key/value ストア、`db.rs::apply_app_schema`で作成済み）に相乗りする。
+//! 同じ key/value ストア、`migrations-sqlite/0002_settings.sql`で作成済み）に相乗りする。
 //! このためだけの新規テーブルは作らない（実装指示: 「既存の設定テーブルが
 //! あればそこへ」）。値は `"true"`/`"false"` の文字列。
 //!

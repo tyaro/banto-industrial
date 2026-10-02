@@ -1,42 +1,140 @@
 //! Database bootstrap for banto-hub (docs/tag-server-design.md §3.2 table
 //! "タグ定義・CRUD | banto-tags | サーバー自身の SQLite に同居"): connect,
-//! apply this app's own schema (settings/users/audit_log), then
-//! `banto_tags::migrate` (I1's PLC connection/collection group/tag registry
-//! tables), then `banto_collect::migrate` (I3b's `collect_events` table) -
-//! all three against the SAME pool. banto-hub shares one SQLite database
-//! across its own tables and every I-series crate's tables, exactly like
-//! ChronoGazer (`apps/chronogazer/core/src/db.rs`, which this module is
-//! copied from almost verbatim) - this is the one place that bootstraps the
-//! whole schema.
+//! refuse a database in the pre-I1 format, then apply this app's own
+//! migrations (`migrations-sqlite/`), then `banto_tags::migrate` (I1's PLC
+//! connection/collection group/tag registry tables), then
+//! `banto_collect::migrate` (I3b's `collect_events` table) - all three against
+//! the SAME pool. banto-hub shares one SQLite database across its own tables
+//! and every I-series crate's tables, exactly like ChronoGazer
+//! (`apps/chronogazer/core/src/db.rs`) - this is the one place that
+//! bootstraps the whole schema.
 //!
-//! This app's own tables are applied as plain **idempotent DDL** (`CREATE
-//! TABLE IF NOT EXISTS` etc.), not through `sqlx::migrate!`: **only
-//! `banto_tags::migrate` may use `sqlx::migrate!` against this pool.**
-//! `sqlx`'s migration bookkeeping table (`_sqlx_migrations`) is a single,
-//! database-wide table with no per-crate namespacing (`sqlx` 0.8 has no
-//! `Migrator::set_table_name`), so a second independent `sqlx::migrate!`
-//! source sharing this pool would collide on overlapping version numbers -
-//! this is exactly why `banto_collect::migrate` itself applies its one table
-//! (`collect_events`) via `CREATE TABLE IF NOT EXISTS` rather than its own
-//! migrator (see `banto-collect`'s `lib.rs` doc comment), and why this
-//! module's own schema does the same. See `apps/chronogazer/core/src/db.rs`
-//! for the fuller writeup of the empirically-confirmed
-//! `MigrateError::VersionMismatch` this avoids.
+//! ## スキーマの出所（I1、2026-10-02 オーナー決定）
+//!
+//! `migrations-sqlite/` は 2 種類:
+//!
+//! - `0002`〜`0007`（settings/users/user_roles/audit_log/user_auth_epoch の
+//!   5 本）は、当面
+//!   `banto v2.1.1 apps/admin-template/core/migrations-sqlite/<同じファイル名>`
+//!   を **byte 等価**でコピーしたもの（banto 側には手を入れない。番号の飛び -
+//!   `0001_items`・`0006_attachments` が無い - は上流の番号をそのまま残して
+//!   いるため）。中身を書き換えないこと: 上流と食い違うと「banto に寄せる」
+//!   土台にならず、`sqlx` の checksum も変わる。上流を上げるときは同じ名前で
+//!   コピーし直す。ChronoGazer と同じ 5 本。
+//! - `0101_*` 以降は banto-hub 固有のテーブル（api_keys・write_control_state
+//!   と seed・hub_write_audit・hub_retained_values・pending_changes・
+//!   hub_sink_groups/hub_sink_group_tags）。I1 で、それまでの冪等 DDL と後追いの
+//!   `ADD COLUMN`（`api_keys.tripped_at`/`expires_at`・
+//!   `hub_write_audit.value_requested_text`・`pending_changes.base_fingerprint`）
+//!   を反映した**最終形**で書き直した。列の意味は各ファイルの先頭コメントと、
+//!   それぞれを扱うモジュールの doc 参照。上流の番号と重ならないよう 0101 から
+//!   始める。今後の列追加は新しい番号のファイルで足す（既存のファイルは
+//!   書き換えない）。
+//!
+//! ## なぜ `sqlx::migrate!` に戻せたか
+//!
+//! 以前はこの app の分を手書きの冪等 DDL で作っていた。`sqlx` 0.8 の
+//! migration 記録テーブル（`_sqlx_migrations`）は DB に 1 つで名前を変えられず、
+//! 同じ pool で `banto_tags::migrate` の `sqlx::migrate!` と番号が衝突する
+//! （`MigrateError::VersionMismatch`、docs/r1a-readme-gaps.md）ため。
+//! `sqlx` 0.9 には `Migrator::dangerous_set_table_name` があるので、記録
+//! テーブルを migrator ごとに分けて衝突を無くした:
+//!
+//! - この app: [`MIGRATIONS_TABLE`]（`_sqlx_migrations_banto_hub`）
+//! - `banto_tags::migrate`: `_sqlx_migrations_banto_tags`
+//! - `banto_collect::migrate`: 記録テーブルを使わない（冪等 DDL のまま）
+//!
+//! `dangerous_` が警告しているのは「既存 DB の記録を見失い、適用済みの
+//! migration を流し直そうとする」こと。**既存の DB は壊してよい**（アルファ版。
+//! 2026-10-02 オーナー決定）ので受け入れた。その代わり、古い形式の DB は
+//! 黙って流さずに起動を拒否する（次節）。
+//!
+//! ## 旧形式の DB の拒否
+//!
+//! [`init_db`] は接続直後・migrate の前に、「この app の記録テーブル
+//! （[`MIGRATIONS_TABLE`]）が無いのに `users` または `settings` がある」DB を
+//! 旧形式とみなし、[`InitDbError::Legacy`] を返す（自動移行はしない）。
+//! そのまま流すと `CREATE TABLE users` が「既にある」で落ち、何が起きたか
+//! 分からないため。新規の空ファイルと新しい形式の DB は通る。
+//! `crate::runtime::HubRuntime::start` はこれを `HubStartError::LegacyDatabase`
+//! にして既存の起動失敗のログ経路（コンソールの stderr・サービスのログ）に
+//! 乗せる。作り直しの操作は作らず、手順を docs/banto-hub-operations.md に
+//! 書くだけにした（2026-10-02 オーナー決定）。
 
 use banto_core::BantoError;
 use sqlx::SqlitePool;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
-/// Connect to the SQLite database at `path` and apply the full schema (this
-/// app's own, then `banto_tags`, then `banto_collect`). Used by
-/// `bin/banto-hub.rs` with a path under the app's data directory.
-pub async fn init_db(path: impl AsRef<std::path::Path>) -> Result<SqlitePool, BantoError> {
+/// この app の migration 記録テーブルの名前（モジュール doc「なぜ
+/// `sqlx::migrate!` に戻せたか」）。旧形式の判定にも使う。
+pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_banto_hub";
+
+/// 旧形式（I1 より前）の DB を開こうとした（モジュール doc「旧形式の DB の
+/// 拒否」）。`Display` がそのまま利用者向けの説明になる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyDatabase {
+    /// 拒否した DB ファイルのパス。
+    pub path: PathBuf,
+}
+
+impl fmt::Display for LegacyDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "この DB は旧形式です。{} を削除または退避して起動し直してください\
+             （アルファ版のため自動移行はありません。手順は docs/banto-hub-operations.md）",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for LegacyDatabase {}
+
+/// [`init_db`] の失敗。旧形式の DB（[`InitDbError::Legacy`]）と、それ以外の
+/// 接続・migration の失敗（[`InitDbError::Storage`]）を呼び出し側で分けられる
+/// ようにする。
+#[derive(Debug, thiserror::Error)]
+pub enum InitDbError {
+    /// 旧形式の DB。起動を拒否する。
+    #[error(transparent)]
+    Legacy(#[from] LegacyDatabase),
+    /// 接続または migration の失敗。
+    #[error(transparent)]
+    Storage(#[from] BantoError),
+}
+
+/// `BantoError` で受ける呼び出し側（`crate::service_elevated` 等）のため。
+/// 旧形式は説明文ごと `BantoError::Other` に入れる。
+impl From<InitDbError> for BantoError {
+    fn from(err: InitDbError) -> Self {
+        match err {
+            InitDbError::Legacy(legacy) => BantoError::Other(legacy.to_string()),
+            InitDbError::Storage(err) => err,
+        }
+    }
+}
+
+/// Connect to the SQLite database at `path`, refuse it if it is in the
+/// pre-I1 format, and apply the full schema (this app's own, then
+/// `banto_tags`, then `banto_collect`). Used by `bin/banto-hub.rs` with a
+/// path under the app's data directory.
+pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> {
+    let path = path.as_ref();
     let pool = banto_storage::connect_sqlite(path).await?;
+    if is_legacy_schema(&pool).await? {
+        pool.close().await;
+        return Err(InitDbError::Legacy(LegacyDatabase {
+            path: path.to_path_buf(),
+        }));
+    }
     run_migrations(&pool).await?;
     Ok(pool)
 }
 
 /// Same as [`init_db`] but against a private in-memory database. Used by
-/// unit tests so each test gets an isolated, fully-migrated database.
+/// unit tests so each test gets an isolated, fully-migrated database (always
+/// empty, so the pre-I1 check is not needed).
 ///
 /// NOTE: `banto-collect`'s own registry/config-build tests require a
 /// *file-backed* database (its pool hands out multiple connections and each
@@ -63,382 +161,40 @@ pub(crate) async fn migrate_memory() -> Result<SqlitePool, BantoError> {
     Ok(pool)
 }
 
+/// 「この app の記録テーブルが無いのに `users` か `settings` がある」か
+/// （モジュール doc「旧形式の DB の拒否」）。
+async fn is_legacy_schema(pool: &SqlitePool) -> Result<bool, BantoError> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, 'users', 'settings')",
+    )
+    .bind(MIGRATIONS_TABLE)
+    .fetch_all(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    let has_record = tables.iter().any(|name| name == MIGRATIONS_TABLE);
+    Ok(!has_record && !tables.is_empty())
+}
+
 async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
-    apply_app_schema(pool).await?;
+    // この app 自身の分（admin-template のコピー + 0101 以降の Hub 固有）。
+    // 記録テーブルを分ける理由はモジュール doc 参照。
+    let mut migrator = sqlx::migrate!("./migrations-sqlite");
+    migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
+    migrator
+        .run(pool)
+        .await
+        .map_err(|err| BantoError::Storage(err.to_string()))?;
     // I1: banto-tags owns its own migrations/ directory and is applied here,
-    // right after this app's own schema - see banto_tags::migrate's doc
-    // comment for why it is designed to be called this way, and this
-    // module's own doc comment for why THIS app's half is deliberately NOT
-    // also a `sqlx::migrate!` source.
+    // right after this app's own schema. It records into its own
+    // `_sqlx_migrations_banto_tags`, so it no longer collides with this
+    // app's migrator.
     banto_tags::migrate(pool).await?;
     // I3b: banto-collect's one table (`collect_events`), applied via its own
-    // idempotent `CREATE TABLE IF NOT EXISTS` for the same shared-migrator
-    // reason as above (see banto-collect's `lib.rs` doc comment).
+    // idempotent `CREATE TABLE IF NOT EXISTS` (no bookkeeping table - see
+    // banto-collect's `lib.rs` doc comment).
     banto_collect::migrate(pool)
         .await
         .map_err(|err| BantoError::Storage(err.to_string()))?;
-    Ok(())
-}
-
-/// This app's own tables, applied as idempotent DDL - see this module's doc
-/// comment for why. Mirrors ChronoGazer's `settings`/`users`/`audit_log`
-/// shape exactly (same schema, same reasoning): banto-hub has no product
-/// requirement that differs here, so there is no value in inventing a
-/// different shape.
-async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
-    sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-            role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin','editor','viewer'))
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    // banto v1.7.0 #204（セッション失効）: `users.auth_epoch` は認証の世代。
-    // セッションは確立時の `(id, auth_epoch)` に結び付き、ロール変更・
-    // パスワード変更・リセットで世代が進むと終わる（`crate::users::UsersService`
-    // の「セッション失効」節）。`users` は既に `CREATE TABLE IF NOT EXISTS`
-    // 済みの DB があるので、`api_keys.tripped_at` と同じく後追いの ADD COLUMN。
-    // 既存の行は 0 から始まる（セッションはメモリにしか無いので移行は不要）。
-    add_column_if_missing(pool, "users", "auth_epoch", "INTEGER NOT NULL DEFAULT 0").await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS audit_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL DEFAULT (datetime('now')),
-          actor_username TEXT,
-          actor_role TEXT,
-          action TEXT NOT NULL,
-          resource TEXT NOT NULL,
-          entity_id TEXT,
-          detail TEXT,
-          origin TEXT NOT NULL,
-          result TEXT NOT NULL DEFAULT 'ok'
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts)")
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_username)")
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource, entity_id)",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    // T0-2 (docs/tag-server-design.md §5.6): /api/v1/* の機械クライアント
-    // 認証用 API キー。列の意味は `crate::api_keys` のモジュール doc 参照
-    // (特に `last_used_at` の保存形式は同モジュールの判断で epoch ミリ秒の
-    // 10進文字列 - `created_at`/`revoked_at` の ISO 日時文字列とは異なる)。
-    // 失効は物理削除でなく `revoked_at` を立てるだけ(履歴を残す方針、同
-    // モジュール参照)。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS api_keys (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL UNIQUE,
-          prefix TEXT NOT NULL UNIQUE,
-          key_hash TEXT NOT NULL,
-          scopes TEXT NOT NULL,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          last_used_at TEXT,
-          revoked_at TEXT
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    // T2-4 (docs/tag-server-design.md §6-4「レート制限ブレーカ」・2026-08-05
-    // 決定): `tripped_at` はキーの「トリップ」状態 - `revoked_at`(不可逆・
-    // T0-2 の失効設計)とは別の**解除可能な**状態。`api_keys` は T0-2 で
-    // 既に `CREATE TABLE IF NOT EXISTS` 済みなので、新しい列は
-    // `ALTER TABLE ... ADD COLUMN` で後追いする必要がある - SQLite の
-    // `ADD COLUMN` には `IF NOT EXISTS` 相当の構文がないため、
-    // [`add_column_if_missing`] で `PRAGMA table_info` を見て「無ければ
-    // 足す」形の冪等処理にしている(2回目以降の起動で列が既にあれば
-    // 何もしない)。
-    add_column_if_missing(pool, "api_keys", "tripped_at", "TEXT").await?;
-
-    // H10 ①(docs/improvement-plan.md・2026-08-08 オーナー決定):
-    // `expires_at` は任意のキー有効期限 - `last_used_at` と同じく epoch
-    // ミリ秒の10進文字列で保存し、`NULL` = 無期限(既定、動作不変)。
-    // `tripped_at` と同じ理由で `add_column_if_missing` の後追い ADD
-    // COLUMN(`api_keys` は T0-2 で既に `CREATE TABLE IF NOT EXISTS`
-    // 済みのため)。列の意味・判定順の詳細は `crate::api_keys` のモジュール
-    // doc comment「有効期限」参照。
-    add_column_if_missing(pool, "api_keys", "expires_at", "TEXT").await?;
-
-    // T2-4 (docs/tag-server-design.md §6-6)。2026-09-09 オーナー決定 (#340)
-    // で「起動時は必ず disabled」ルールを撤回: 書き込み受付フラグの永続値
-    // (`crate::write_control` のモジュール doc 参照) は起動時にライブ
-    // フラグへそのまま復元される。既定は「書き込み可」なので seed は
-    // `enabled_persisted = 1`。`armed_state`(relay-wright)と同じ id=1
-    // 単一行パターン。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS write_control_state (
-          id INTEGER PRIMARY KEY CHECK (id = 1),
-          enabled_persisted INTEGER NOT NULL DEFAULT 1,
-          last_changed_at TEXT,
-          last_changed_by TEXT
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-    sqlx::query("INSERT OR IGNORE INTO write_control_state (id, enabled_persisted) VALUES (1, 1)")
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-    // #340: 既存 DB 向けの引き上げ。旧既定 (`enabled_persisted = 0`) の
-    // seed のままで、運用者が一度も enable/disable を操作していない行
-    // (`last_changed_at IS NULL` で判定) だけを新既定の 1 へ引き上げる。
-    // 明示的に disable した行は `last_changed_at` が入っているので、
-    // このステートメントの対象外のまま保持される。
-    sqlx::query(
-        "UPDATE write_control_state SET enabled_persisted = 1 \
-         WHERE id = 1 AND last_changed_at IS NULL",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    // T2-4 (docs/tag-server-design.md §6-3「log-before-write」): 書き込み
-    // 監査ログ。列の意味・log-before-write の2段挿入パターンは
-    // `crate::write_audit` のモジュール doc 参照。`action`/`result` の
-    // 許容値は同モジュールの `WriteAuditAction`/`WriteAuditResult` の
-    // `CHECK` 制約と一致させる。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS hub_write_audit (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL DEFAULT (datetime('now')),
-          api_key_id INTEGER NOT NULL,
-          api_key_name_snapshot TEXT NOT NULL,
-          tag_id INTEGER NOT NULL,
-          external_name_snapshot TEXT NOT NULL,
-          value_requested REAL,
-          action TEXT NOT NULL CHECK (action IN ('write', 'rate_limit_tripped')),
-          result TEXT NOT NULL CHECK (
-            result IN ('ok', 'failed', 'suppressed_disabled', 'suppressed_rate_limited')
-          ),
-          detail TEXT
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_hub_write_audit_ts ON hub_write_audit(ts)")
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_hub_write_audit_tag ON hub_write_audit(tag_id)")
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-
-    // T20-HW1（宿題#1）: `value_requested` は REAL 専用のため文字列書き込み
-    // （`RequestedValue::Str`/`ConvertedValue::Str`）では NULL のままになり、
-    // 「何を書いたか」が監査に残らない。そのテキストを別列に残す。
-    // `hub_write_audit` は本モジュールで既に `CREATE TABLE IF NOT EXISTS`
-    // 済みのため、`tripped_at`/`expires_at`/`base_fingerprint` と同じ理由で
-    // `add_column_if_missing` の後追い ADD COLUMN にする(新規 DB では次回の
-    // `CREATE TABLE` 定義更新までは無関係 - 既存 DB への非破壊追加)。
-    add_column_if_missing(pool, "hub_write_audit", "value_requested_text", "TEXT").await?;
-
-    // T6-2 (docs/tag-server-design.md §4.2「retain フラグで再起動時の最終値
-    // 復元」): `retain = true` の内部タグの最終値。`tag_id` を主キーにする
-    // （`crate::computed::ServerTagStore`のキー`"tag:{id}"`と同じidを使う -
-    // `crate::computed::upsert_retained_value`/`load_retained_values`
-    // 参照）。**`tags(id)` への FOREIGN KEY は張らない** - このテーブルは
-    // `apply_app_schema`（このモジュール）の一部として
-    // `banto_tags::migrate`（`tags` テーブルを作る側）より**先に**走る
-    // (`run_migrations`のこのモジュール冒頭の doc comment参照) ため、その
-    // 時点では参照先テーブルがまだ存在しない。タグ削除時に古い行が残っても
-    // 実害はない(ロード時に該当 `tag_id` が catalog に無ければ
-    // `ServerTagStore` へは書かれず、単に無視される)。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS hub_retained_values (
-          tag_id INTEGER PRIMARY KEY,
-          value REAL NOT NULL,
-          ptime_ms INTEGER NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    // TAG-P0-3（2026-08-11 方針改定）: 運転中編集の pending queue。
-    // `payload` は提案変更を JSON 文字列で保持し、実行構成への反映は
-    // 後続スライス（手動 apply/cancel API）で行う。
-    sqlx::query(
-                "CREATE TABLE IF NOT EXISTS pending_changes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    state TEXT NOT NULL CHECK (state IN ('pending','applying','applied','canceled','failed')),
-                    source TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    base_configured_revision INTEGER NOT NULL,
-                    requested_by_username TEXT,
-                    requested_by_role TEXT,
-                    failure_reason TEXT,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    base_fingerprint TEXT
-                )",
-        )
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_pending_changes_state_created_at
-                 ON pending_changes(state, created_at)",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_pending_changes_created_at
-                 ON pending_changes(created_at)",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    // TAG-P0-3 follow-up（2026-08-12）: pending change 適用時の per-resource
-    // ステイル検出ガード。`base_fingerprint` は enqueue 時点の対象行の
-    // スナップショット文字列（`crate::rest::compute_pending_base_fingerprint`
-    // 参照）で、`plc_connections`/`collection_groups` の update/delete のみ
-    // 値を持つ（`tags.*` と `*.create` は NULL のまま - 詳細は同関数の
-    // doc comment）。`pending_changes` は本モジュールで既に
-    // `CREATE TABLE IF NOT EXISTS` 済みのため、`tripped_at`/`expires_at`
-    // と同じ理由で `add_column_if_missing` の後追い ADD COLUMN にする
-    // (新規 DB では上の CREATE TABLE で既に列があるため no-op)。
-    add_column_if_missing(pool, "pending_changes", "base_fingerprint", "TEXT").await?;
-
-    // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）: DB Sink
-    // の設定エンティティ。`logger_groups`（設計の呼称）は Hub 専用の設定で
-    // あって PLC 収集レジストリ（`banto_tags`）の一部ではないため、
-    // `plc_connections`/`collection_groups`/`tags` と同じ3階層には乗せず、
-    // 本モジュールの「この app 自身のテーブル」として持つ - 名前は他の
-    // Hub 専用テーブル（`hub_write_audit`/`hub_retained_values`）と同じ
-    // `hub_` 接頭辞に揃える（`crate::sink`のモジュール doc comment参照）。
-    //
-    // `db_connection_id` は `plc_connections(id)` を指すが、**FOREIGN KEY は
-    // 張らない** - `hub_retained_values.tag_id`のこの関数内の doc comment
-    // と同じ判断（このテーブルは`banto_tags::migrate`より先に走る
-    // `apply_app_schema`の一部なので、CREATE TABLE 時点では参照先が
-    // まだ存在しない）に加え、SQLite の FK 解決自体は DML 時点まで遅延する
-    // ため技術的には後から張っても動くが、既存の Hub 専用テーブルの慣行
-    // （レジストリ側の生存確認はサービス層で行う）に揃えて一貫させる。
-    // 存在確認・削除拒否（この接続を使う sink group がある間は
-    // `plc_connections` の削除を拒否する）は `crate::sink::service` が
-    // 担う（`crate::sink`のモジュール doc comment参照）。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS hub_sink_groups (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL UNIQUE,
-          db_connection_id INTEGER NOT NULL,
-          mode TEXT NOT NULL CHECK (mode IN ('interval', 'on_change')),
-          interval_ms INTEGER NOT NULL,
-          table_name TEXT NOT NULL,
-          store_bad INTEGER NOT NULL DEFAULT 0,
-          enabled INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_hub_sink_groups_db_connection_id \
-         ON hub_sink_groups(db_connection_id)",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    // `hub_sink_groups` ↔ `tags` の多対多。`sink_group_id` は同じ
-    // `apply_app_schema`内で直前に作った Hub 専用テーブルを指すため FK を
-    // 張れる（`ON DELETE CASCADE` - グループ削除で行ごと消える）。
-    // `tag_id` は上と同じ理由で `tags(id)` への FK を張らない -
-    // タグ削除時のクリーンアップは `crate::sink::service` 側で行う
-    // （単体/一括のタグ削除経路で明示的に削除する。グループ/接続の
-    // カスケード削除経路で残る可能性がある古い行は `hub_retained_values`
-    // と同じ扱い - 実害なく無視される、`crate::sink`のモジュール doc
-    // comment参照）。
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS hub_sink_group_tags (
-          sink_group_id INTEGER NOT NULL REFERENCES hub_sink_groups(id) ON DELETE CASCADE,
-          tag_id INTEGER NOT NULL,
-          PRIMARY KEY (sink_group_id, tag_id)
-        )",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_hub_sink_group_tags_tag_id \
-         ON hub_sink_group_tags(tag_id)",
-    )
-    .execute(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
-
-    Ok(())
-}
-
-/// `table` に `column` 列が無ければ `ddl_type` で `ALTER TABLE ... ADD
-/// COLUMN` する冪等ヘルパー(この関数の呼び出し元 doc comment 参照: SQLite
-/// の `ADD COLUMN` には `IF NOT EXISTS` が無いため、`PRAGMA table_info` で
-/// 列の存在を見てから判断する)。`table`/`column`/`ddl_type` は呼び出し元が
-/// 埋め込む固定のスキーマ定数のみを渡す想定(ユーザー入力を通さない)。
-async fn add_column_if_missing(
-    pool: &SqlitePool,
-    table: &str,
-    column: &str,
-    ddl_type: &str,
-) -> Result<(), BantoError> {
-    use sqlx::Row;
-
-    // AssertSqlSafe: この関数の doc comment の通り、`table`/`column`/
-    // `ddl_type` は呼び出し元が埋め込む固定のスキーマ定数のみを渡す
-    // （呼び出し元一覧を確認済み）- ユーザー入力は通さない。
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
-        .fetch_all(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-    let exists = rows.iter().any(|row| {
-        row.try_get::<String, _>("name")
-            .map(|name| name == column)
-            .unwrap_or(false)
-    });
-    if !exists {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"
-        )))
-        .execute(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-    }
     Ok(())
 }
 
@@ -481,10 +237,8 @@ mod tests {
         }
     }
 
-    /// Running schema application twice against the same pool must not
-    /// error - both this app's idempotent DDL, `banto_tags::migrate`'s
-    /// bookkeeping table, and `banto_collect::migrate`'s idempotent DDL all
-    /// tolerate being called again.
+    /// 2 回流しても失敗しない（どの migrator も自分の記録テーブルで適用済みを
+    /// 覚えている。`banto_collect` は冪等 DDL）。
     #[tokio::test]
     async fn schema_application_is_idempotent_across_two_runs_on_the_same_db() {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
@@ -492,112 +246,62 @@ mod tests {
         run_migrations(&pool).await.unwrap();
     }
 
-    /// T2-4: `api_keys.tripped_at` は `ALTER TABLE ADD COLUMN` の冪等ヘルパー
-    /// ([`add_column_if_missing`]) 経由で足される。列が存在すること、かつ
-    /// 二回目の `run_migrations` で `ALTER TABLE` エラー(重複列)を起こさない
-    /// ことの両方を確認する。
+    /// I1: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
+    /// は作られない。この app の分は上流 admin-template の 5 本 + Hub 固有。
     #[tokio::test]
-    async fn api_keys_tripped_at_column_is_added_idempotently() {
-        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
-        run_migrations(&pool).await.unwrap();
-
-        use sqlx::Row;
-        let rows = sqlx::query("PRAGMA table_info(api_keys)")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert!(
-            rows.iter()
-                .any(|row| row.get::<String, _>("name") == "tripped_at"),
-            "api_keys should gain a tripped_at column"
-        );
-
-        // Second run must not error (ALTER TABLE ADD COLUMN on an existing
-        // column would fail if add_column_if_missing's check were skipped).
-        run_migrations(&pool).await.unwrap();
-    }
-
-    /// banto v1.7.0 #204: `auth_epoch` の無い既存の DB（この PR より前の
-    /// `users`）から起動しても、既存の行が世代 0 で読め、ログインと世代の
-    /// 更新が動くこと。
-    #[tokio::test]
-    async fn auth_epoch_is_added_to_an_existing_users_table() {
-        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
-        sqlx::query(
-            "CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin','editor','viewer'))
-            )",
+    async fn migrations_are_recorded_in_per_migrator_tables() {
+        let pool = init_db_memory().await.unwrap();
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '\\_sqlx%' \
+             ESCAPE '\\' ORDER BY name",
         )
-        .execute(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
-        let hash = {
-            use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-            argon2::Argon2::default()
-                .hash_password(b"old-password", &SaltString::generate(&mut OsRng))
-                .unwrap()
-                .to_string()
-        };
-        sqlx::query(
-            "INSERT INTO users (username, password_hash, display_name, role) \
-             VALUES ('legacy', ?, 'Legacy', 'editor')",
-        )
-        .bind(&hash)
-        .execute(&pool)
+        assert_eq!(
+            tables,
+            vec![
+                MIGRATIONS_TABLE.to_string(),
+                "_sqlx_migrations_banto_tags".to_string(),
+            ]
+        );
+        let versions: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT version FROM {MIGRATIONS_TABLE} ORDER BY version"
+        )))
+        .fetch_all(&pool)
         .await
         .unwrap();
-
-        run_migrations(&pool).await.unwrap();
-        run_migrations(&pool).await.unwrap(); // 2 回目も列を重複させない
-
-        let users = crate::users::UsersService::new(pool.clone());
-        let legacy = users
-            .verify("legacy", "old-password")
-            .await
-            .unwrap()
-            .expect("既存のアカウントでログインできる");
-        assert_eq!(legacy.auth_epoch, 0);
-        let new_epoch = users
-            .change_password("legacy", "old-password", "new-password")
-            .await
-            .unwrap();
-        assert_eq!(new_epoch, 1);
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 101, 102, 103, 104, 105, 106]);
     }
 
-    /// H10 ①: `api_keys.expires_at` も `tripped_at` と同じ
-    /// `add_column_if_missing` 経由で足される - 上のテストと同じ形で列の
-    /// 存在と冪等性を確認する。
+    /// I1: 以前は後追いの `ADD COLUMN` で足していた列が、新しい DB では
+    /// 最初から（`CREATE TABLE` の最終形として）ある。
     #[tokio::test]
-    async fn api_keys_expires_at_column_is_added_idempotently() {
-        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
-        run_migrations(&pool).await.unwrap();
-
-        use sqlx::Row;
-        let rows = sqlx::query("PRAGMA table_info(api_keys)")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert!(
-            rows.iter()
-                .any(|row| row.get::<String, _>("name") == "expires_at"),
-            "api_keys should gain an expires_at column"
-        );
-
-        // Second run must not error (ALTER TABLE ADD COLUMN on an existing
-        // column would fail if add_column_if_missing's check were skipped).
-        run_migrations(&pool).await.unwrap();
+    async fn formerly_added_columns_are_part_of_the_final_shape() {
+        let pool = init_db_memory().await.unwrap();
+        for (table, column) in [
+            ("users", "role"),
+            ("users", "auth_epoch"),
+            ("api_keys", "tripped_at"),
+            ("api_keys", "expires_at"),
+            ("hub_write_audit", "value_requested_text"),
+            ("pending_changes", "base_fingerprint"),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+                    .bind(table)
+                    .bind(column)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 1, "expected {table}.{column} to exist");
+        }
     }
 
     /// T2-4 (§6-6)。2026-09-09 オーナー決定 (#340): `write_control_state` は
-    /// 起動時に id=1 の1行を必ず seed し、`enabled_persisted = 1`
-    /// (既定「書き込み可」) から始まる - `crate::write_control::WriteControl`
-    /// がこの値をそのままライブフラグへ復元する前提。
+    /// id=1 の1行を seed し、`enabled_persisted = 1` (既定「書き込み可」) から
+    /// 始まる - `crate::write_control::WriteControl` がこの値をそのまま
+    /// ライブフラグへ復元する前提。
     #[tokio::test]
     async fn write_control_state_seeds_a_single_enabled_row() {
         let pool = init_db_memory().await.unwrap();
@@ -609,57 +313,74 @@ mod tests {
         assert_eq!(enabled, 1);
     }
 
-    /// #340: 既存 DB の引き上げ挙動。旧既定のまま (`enabled_persisted = 0`,
-    /// `last_changed_at IS NULL`) の未操作行は `apply_app_schema` の再実行で
-    /// 1 へ引き上げられる。一方、運用者が明示的に disable した行
-    /// (`last_changed_at` あり) は 0 のまま保持される。
+    /// 新規の空ファイルは通り、2 回目の起動（同じファイル）も migrate が
+    /// 冪等で、1 回目に書いた行（運用者が止めた書き込み受付を含む）が残る -
+    /// seed が二度流れて上書きしないこと。
     #[tokio::test]
-    async fn apply_app_schema_upgrades_only_untouched_rows_to_enabled() {
-        let pool = init_db_memory().await.unwrap();
+    async fn a_new_file_passes_and_the_second_startup_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("registry.sqlite3");
 
-        // 未操作行を旧既定 (0) に巻き戻して「まだ誰も触っていない既存 DB」
-        // を模す。
+        let pool = init_db(&db_path).await.expect("a new file must pass");
         sqlx::query(
-            "UPDATE write_control_state SET enabled_persisted = 0, last_changed_at = NULL \
-             WHERE id = 1",
+            "UPDATE write_control_state SET enabled_persisted = 0, \
+             last_changed_at = datetime('now'), last_changed_by = 'admin' WHERE id = 1",
         )
         .execute(&pool)
         .await
         .unwrap();
+        pool.close().await;
 
-        apply_app_schema(&pool).await.unwrap();
-
+        let pool = init_db(&db_path)
+            .await
+            .expect("the new-format DB must pass on the second startup");
         let enabled: i64 =
             sqlx::query_scalar("SELECT enabled_persisted FROM write_control_state WHERE id = 1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(
-            enabled, 1,
-            "untouched row (no last_changed_at) must be upgraded to the new default"
-        );
+        assert_eq!(enabled, 0, "the operator's choice must survive a restart");
+        pool.close().await;
+    }
 
-        // 明示的に disable した行 (last_changed_at あり) を模す。
-        sqlx::query(
-            "UPDATE write_control_state \
-             SET enabled_persisted = 0, last_changed_at = datetime('now'), \
-                 last_changed_by = 'admin' \
-             WHERE id = 1",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+    /// 旧形式（記録テーブルが無いのに `users` か `settings` がある）は
+    /// [`InitDbError::Legacy`] で拒否され、DB には何も足されない。
+    #[tokio::test]
+    async fn a_legacy_database_is_refused_without_being_touched() {
+        for legacy_table in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL)",
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("registry.sqlite3");
+            let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+            sqlx::query(legacy_table).execute(&pool).await.unwrap();
+            pool.close().await;
 
-        apply_app_schema(&pool).await.unwrap();
-
-        let enabled: i64 =
-            sqlx::query_scalar("SELECT enabled_persisted FROM write_control_state WHERE id = 1")
-                .fetch_one(&pool)
+            let err = init_db(&db_path)
                 .await
-                .unwrap();
-        assert_eq!(
-            enabled, 0,
-            "explicitly disabled row (last_changed_at set) must be preserved"
-        );
+                .expect_err("a legacy DB must be refused");
+            match &err {
+                InitDbError::Legacy(legacy) => assert_eq!(legacy.path, db_path),
+                other => panic!("expected InitDbError::Legacy, got {other:?}"),
+            }
+            let message = err.to_string();
+            assert!(message.contains("旧形式"), "{message}");
+            assert!(
+                message.contains(&db_path.display().to_string()),
+                "{message}"
+            );
+
+            let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(tables.len(), 1, "nothing may be added: {tables:?}");
+            pool.close().await;
+        }
     }
 }

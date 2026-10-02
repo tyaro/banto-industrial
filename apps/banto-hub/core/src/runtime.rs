@@ -162,7 +162,7 @@ use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::commissioning::CommissioningService;
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use crate::controller::CollectionController;
-use crate::db::init_db;
+use crate::db::{init_db, InitDbError, LegacyDatabase};
 use crate::diag_log::DiagLog;
 use crate::events::event_channel;
 use crate::grpc::{GrpcServer, GrpcService};
@@ -244,6 +244,12 @@ pub enum HubStartError {
     /// `db::init_db`失敗（旧: `"init_db should succeed"`で `expect`）。
     #[error("banto-hub: DB 初期化に失敗しました: {0}")]
     InitDb(BantoError),
+    /// I1（2026-10-02 オーナー決定）: 旧形式（I1 より前）の DB を開こうと
+    /// した - 自動移行はせず起動を拒否する（`crate::db` のモジュール doc
+    /// 「旧形式の DB の拒否」）。メッセージ自体に DB のパスと対処（削除
+    /// または退避して起動し直す、手順は docs/banto-hub-operations.md）を含む。
+    #[error("banto-hub: {0}")]
+    LegacyDatabase(LegacyDatabase),
     /// `SettingsService::server_config`失敗（旧: `"server_config should
     /// succeed"`で `expect`）。
     #[error("banto-hub: サーバー設定の読み取りに失敗しました: {0}")]
@@ -320,7 +326,10 @@ impl HubRuntime {
             Some(guard)
         };
 
-        let pool = init_db(&db_path).await.map_err(HubStartError::InitDb)?;
+        let pool = init_db(&db_path).await.map_err(|err| match err {
+            InitDbError::Legacy(legacy) => HubStartError::LegacyDatabase(legacy),
+            InitDbError::Storage(err) => HubStartError::InitDb(err),
+        })?;
 
         // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): auto-provision the
         // reserved `calc`/`mem` virtual connections BEFORE the first rebuild

@@ -144,7 +144,8 @@
 //! 上書きされる仕組みのため、仮置きしても成功時に消える - `write_audit.rs`
 //! のモジュール doc comment参照)。当初はこの制約により文字列書き込みの
 //! テキストが監査に一切残らなかったが、専用列 `hub_write_audit.value_requested_text`
-//! (`db.rs::apply_app_schema` の `ALTER TABLE ADD COLUMN`)を追加し、
+//! (当初は後追いの `ALTER TABLE ADD COLUMN`、I1 以降は
+//! `migrations-sqlite/0103_hub_write_audit.sql` の列)を追加し、
 //! [`RequestedValue::as_audit_text`]/[`ConvertedValue::as_audit_text`] が
 //! そのテキストを `WriteAuditRow::with_value_requested_text` 経由で
 //! `insert_pending`/`insert_row` 時点に書き込むことで解消した(`set_result`
