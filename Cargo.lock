@@ -442,8 +442,8 @@ dependencies = [
 
 [[package]]
 name = "banto-admin-services"
-version = "2.0.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v2.0.0#dc61fc1cf3b48ef9ddc2f89156643008973f7188"
+version = "2.1.1"
+source = "git+https://github.com/tyaro/banto.git?tag=v2.1.1#34e65bd0b6eb594c9926428a937ed84aec5ea62c"
 dependencies = [
  "argon2",
  "banto-core",
@@ -486,8 +486,8 @@ dependencies = [
 
 [[package]]
 name = "banto-core"
-version = "2.0.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v2.0.0#dc61fc1cf3b48ef9ddc2f89156643008973f7188"
+version = "2.1.1"
+source = "git+https://github.com/tyaro/banto.git?tag=v2.1.1#34e65bd0b6eb594c9926428a937ed84aec5ea62c"
 dependencies = [
  "serde",
  "serde_json",
@@ -636,8 +636,8 @@ dependencies = [
 
 [[package]]
 name = "banto-server"
-version = "2.0.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v2.0.0#dc61fc1cf3b48ef9ddc2f89156643008973f7188"
+version = "2.1.1"
+source = "git+https://github.com/tyaro/banto.git?tag=v2.1.1#34e65bd0b6eb594c9926428a937ed84aec5ea62c"
 dependencies = [
  "async-stream",
  "axum 0.8.9",
@@ -654,8 +654,8 @@ dependencies = [
 
 [[package]]
 name = "banto-storage"
-version = "2.0.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v2.0.0#dc61fc1cf3b48ef9ddc2f89156643008973f7188"
+version = "2.1.1"
+source = "git+https://github.com/tyaro/banto.git?tag=v2.1.1#34e65bd0b6eb594c9926428a937ed84aec5ea62c"
 dependencies = [
  "banto-core",
  "serde_json",
