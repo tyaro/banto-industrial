@@ -14,6 +14,9 @@
  *   また試運転として通す（v1 と同じ）。`logout()` は adopt 中の資格情報の変化
  *   なので保留にならず generation も動かない（S-46）が、/login への遷移の間は
  *   念のため配線①を止める（`leaveForLogin`）。
+ *   この挙動（試運転中のログアウトは保存しているログインを捨てるだけで、試運転は
+ *   終わらない）は 2026-10-02 のオーナー決定（banto-hub-operations.md §19
+ *   「試運転中のログアウト」）。
  */
 import { getAuthProvider, getSessionController } from '@banto/admin-core';
 import { isCommissioningSession } from './commissioningPolicy';
