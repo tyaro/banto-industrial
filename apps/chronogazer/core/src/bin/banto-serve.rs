@@ -38,7 +38,7 @@ use chronogazer_core::backup::BackupService;
 // `/api/collect*` を生やす以上、ここを配線しないと「呼べるが何も走って
 // いない」口になる）。
 use chronogazer_core::collect::{resolve_data_dir, CollectorService};
-use chronogazer_core::db::init_db;
+use chronogazer_core::db::{init_db, InitDbError};
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, UnavailableKeyStore};
 use chronogazer_core::rest::{api_router, user_auth_state};
@@ -83,7 +83,20 @@ async fn main() {
         }
     };
 
-    let pool = init_db(&db_path).await.expect("init_db should succeed");
+    // I1（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は無い）。
+    // panic のメッセージで済ませず、何をすればよいかを stderr に出して終了する
+    // （`chronogazer_core::db` のモジュール doc「旧形式の DB の拒否」）。
+    let pool = match init_db(&db_path).await {
+        Ok(pool) => pool,
+        Err(InitDbError::Legacy(legacy)) => {
+            eprintln!("banto-serve: {legacy}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("banto-serve: DB の初期化に失敗しました: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let events = event_channel();
     let users = UsersService::new(pool.clone());

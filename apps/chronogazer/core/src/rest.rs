@@ -3712,10 +3712,10 @@ mod tests {
     ) -> (crate::test_support::TempDir, Router, String, String, String) {
         let dir = crate::test_support::TempDir::new();
         let db_path = dir.path().join("chronogazer.sqlite3");
-        // `crate::db::init_db` (not a raw `sqlx::migrate!` call here) - see
-        // that module's doc comment for why this app's own schema is NOT
-        // applied via `sqlx::migrate!` (it would collide with
-        // `banto_tags::migrate`'s own bookkeeping on this same pool).
+        // `crate::db::init_db` (not a raw `sqlx::migrate!` call here) - it
+        // applies the whole schema (this app's migrations, then
+        // `banto_tags`/`banto_collect`), each migrator recording into its
+        // own bookkeeping table (see that module's doc comment).
         let pool = crate::db::init_db(&db_path).await.expect("init_db");
 
         let (tx, _rx) = broadcast::channel(16);

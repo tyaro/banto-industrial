@@ -35,7 +35,7 @@ use chronogazer_core::collect::{
     CollectorStateView, ConnectionView, CurrentSampleView, EventPage, ExclusionView, Readout,
     COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
-use chronogazer_core::db::init_db;
+use chronogazer_core::db::{init_db, InitDbError};
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
@@ -3451,8 +3451,19 @@ pub fn run() {
 
             // init_db takes a filesystem path (not a sqlite:// URL) so
             // Windows paths with drive letters/backslashes work unchanged.
-            let pool =
-                tauri::async_runtime::block_on(init_db(&db_path)).expect("init_db should succeed");
+            //
+            // I1（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は無い）。
+            // panic のメッセージで済ませず、何をすればよいかを stderr に出して
+            // 終了する（`chronogazer_core::db` のモジュール doc「旧形式の DB の
+            // 拒否」、手順は apps/chronogazer/README.md）。
+            let pool = match tauri::async_runtime::block_on(init_db(&db_path)) {
+                Ok(pool) => pool,
+                Err(InitDbError::Legacy(legacy)) => {
+                    eprintln!("banto: {legacy}");
+                    std::process::exit(1);
+                }
+                Err(err) => panic!("init_db should succeed: {err}"),
+            };
 
             let events = event_channel();
             let users = UsersService::new(pool.clone());

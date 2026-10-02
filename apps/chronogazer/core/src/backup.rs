@@ -670,10 +670,10 @@ mod tests {
     /// this codebase's tests. Production code never hits this: `db_path` in
     /// `src-tauri`/`bin/banto-serve.rs` is always a real on-disk file.
     async fn migrated_file_db(path: &Path) -> SqlitePool {
-        // `crate::db::init_db` (not a raw `sqlx::migrate!` call here) - see
-        // that module's doc comment for why this app's own schema is NOT
-        // applied via `sqlx::migrate!` (it would collide with
-        // `banto_tags::migrate`'s own bookkeeping on this same pool).
+        // `crate::db::init_db` (not a raw `sqlx::migrate!` call here) - it
+        // applies the whole schema (this app's migrations, then
+        // `banto_tags`/`banto_collect`), each migrator recording into its
+        // own bookkeeping table (see that module's doc comment).
         let pool = crate::db::init_db(path).await.expect("init_db");
         // Force the migration's schema writes out of the WAL and into the
         // main file, so a plain `tokio::fs::read(path)` afterward (as every
