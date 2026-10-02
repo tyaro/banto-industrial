@@ -44,8 +44,9 @@
 //! 旧形式とみなし、[`InitDbError::Legacy`] を返す（自動移行はしない）。
 //! そのまま流すと `CREATE TABLE users` が「既にある」で落ち、何が起きたか
 //! 分からないため。新規の空ファイルと新しい形式の DB は通る。呼び出し側
-//! （`src-tauri` の起動・`bin/banto-serve.rs`）はメッセージを stderr に出して
-//! 終了する。作り直しの手順は `apps/chronogazer/README.md` 参照。
+//! はメッセージを stderr に出して終了する（`bin/banto-serve.rs`）。`src-tauri`
+//! はリリースビルドで stderr が見えないので、加えてメインの窓の代わりにエラー
+//! 専用の窓を開き、閉じると終了する。作り直しの手順は `apps/chronogazer/README.md` 参照。
 
 use banto_core::BantoError;
 use sqlx::SqlitePool;
