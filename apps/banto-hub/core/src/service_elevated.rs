@@ -403,7 +403,7 @@ pub enum ElevatedError {
     #[error(transparent)]
     Db(#[from] banto_core::BantoError),
     /// 対象 profile の DB を`crate::db::init_db`で開けなかった。旧形式
-    /// （I1 より前）の DB は`crate::db::InitDbError::Legacy`で、メッセージに
+    /// （2026-10-02 のスキーマ整理より前）の DB は`crate::db::InitDbError::Legacy`で、メッセージに
     /// DB のパスと対処（削除または退避）を含む（`crate::db`のモジュール doc
     /// 「旧形式の DB の拒否」）。
     #[error(transparent)]

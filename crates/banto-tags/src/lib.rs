@@ -61,7 +61,7 @@ use sqlx::SqlitePool;
 /// same pool, and two migrators sharing one bookkeeping table collide on
 /// overlapping version numbers (`MigrateError::VersionMismatch`,
 /// docs/r1a-readme-gaps.md). sqlx 0.9's `Migrator::dangerous_set_table_name`
-/// lets each migrator keep its own table (I1, 2026-10-02). The `dangerous_`
+/// lets each migrator keep its own table (schema cleanup, 2026-10-02). The `dangerous_`
 /// part - a database migrated under the old shared table loses track of what
 /// was applied - is accepted because existing alpha databases may be thrown
 /// away (2026-10-02 owner decision); the apps refuse such a database before
@@ -113,7 +113,7 @@ mod tests {
         );
     }
 
-    /// I1: applied versions are recorded in this crate's own
+    /// Schema cleanup (2026-10-02): applied versions are recorded in this crate's own
     /// [`MIGRATIONS_TABLE`], never in the shared default `_sqlx_migrations`
     /// that the consuming app's migrator would otherwise collide on.
     #[tokio::test]

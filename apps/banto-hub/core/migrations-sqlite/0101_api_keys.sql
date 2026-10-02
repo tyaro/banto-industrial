@@ -6,7 +6,7 @@
 -- `tripped_at` は T2-4（§6-4「レート制限ブレーカ」）の解除可能なトリップ
 -- 状態、`expires_at` は H10 ①（docs/improvement-plan.md）の任意の有効期限
 -- （NULL = 無期限）。どちらも以前は後追いの ADD COLUMN だったものを、
--- I1（2026-10-02）で最終形の列として CREATE TABLE に含めた。
+-- DB スキーマの整理（2026-10-02）で最終形の列として CREATE TABLE に含めた。
 CREATE TABLE api_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,

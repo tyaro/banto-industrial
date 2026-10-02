@@ -244,7 +244,7 @@ pub enum HubStartError {
     /// `db::init_db`失敗（旧: `"init_db should succeed"`で `expect`）。
     #[error("banto-hub: DB 初期化に失敗しました: {0}")]
     InitDb(BantoError),
-    /// I1（2026-10-02 オーナー決定）: 旧形式（I1 より前）の DB を開こうと
+    /// DB スキーマの整理（2026-10-02 オーナー決定）: 旧形式（整理より前）の DB を開こうと
     /// した - 自動移行はせず起動を拒否する（`crate::db` のモジュール doc
     /// 「旧形式の DB の拒否」）。メッセージ自体に DB のパスと対処（削除
     /// または退避して起動し直す、手順は docs/banto-hub-operations.md）を含む。

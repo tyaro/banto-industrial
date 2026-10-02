@@ -1,6 +1,6 @@
 //! Database bootstrap for banto-hub (docs/tag-server-design.md §3.2 table
 //! "タグ定義・CRUD | banto-tags | サーバー自身の SQLite に同居"): connect,
-//! refuse a database in the pre-I1 format, then apply this app's own
+//! refuse a database in the pre-2026-10-02 format, then apply this app's own
 //! migrations (`migrations-sqlite/`), then `banto_tags::migrate` (I1's PLC
 //! connection/collection group/tag registry tables), then
 //! `banto_collect::migrate` (I3b's `collect_events` table) - all three against
@@ -9,7 +9,7 @@
 //! (`apps/chronogazer/core/src/db.rs`) - this is the one place that
 //! bootstraps the whole schema.
 //!
-//! ## スキーマの出所（I1、2026-10-02 オーナー決定）
+//! ## スキーマの出所（DB スキーマの整理、2026-10-02 オーナー決定）
 //!
 //! `migrations-sqlite/` は 2 種類:
 //!
@@ -23,7 +23,7 @@
 //!   コピーし直す。ChronoGazer と同じ 5 本。
 //! - `0101_*` 以降は banto-hub 固有のテーブル（api_keys・write_control_state
 //!   と seed・hub_write_audit・hub_retained_values・pending_changes・
-//!   hub_sink_groups/hub_sink_group_tags）。I1 で、それまでの冪等 DDL と後追いの
+//!   hub_sink_groups/hub_sink_group_tags）。スキーマの整理（2026-10-02）で、それまでの冪等 DDL と後追いの
 //!   `ADD COLUMN`（`api_keys.tripped_at`/`expires_at`・
 //!   `hub_write_audit.value_requested_text`・`pending_changes.base_fingerprint`）
 //!   を反映した**最終形**で書き直した。列の意味は各ファイルの先頭コメントと、
@@ -70,7 +70,7 @@ use std::path::{Path, PathBuf};
 /// `sqlx::migrate!` に戻せたか」）。旧形式の判定にも使う。
 pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_banto_hub";
 
-/// 旧形式（I1 より前）の DB を開こうとした（モジュール doc「旧形式の DB の
+/// 旧形式（2026-10-02 のスキーマ整理より前）の DB を開こうとした（モジュール doc「旧形式の DB の
 /// 拒否」）。`Display` がそのまま利用者向けの説明になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyDatabase {
@@ -116,7 +116,7 @@ impl From<InitDbError> for BantoError {
 }
 
 /// Connect to the SQLite database at `path`, refuse it if it is in the
-/// pre-I1 format, and apply the full schema (this app's own, then
+/// pre-2026-10-02 format, and apply the full schema (this app's own, then
 /// `banto_tags`, then `banto_collect`). Used by `bin/banto-hub.rs` with a
 /// path under the app's data directory.
 pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> {
@@ -134,7 +134,7 @@ pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> 
 
 /// Same as [`init_db`] but against a private in-memory database. Used by
 /// unit tests so each test gets an isolated, fully-migrated database (always
-/// empty, so the pre-I1 check is not needed).
+/// empty, so the old-format check is not needed).
 ///
 /// NOTE: `banto-collect`'s own registry/config-build tests require a
 /// *file-backed* database (its pool hands out multiple connections and each
@@ -246,7 +246,7 @@ mod tests {
         run_migrations(&pool).await.unwrap();
     }
 
-    /// I1: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
+    /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
     /// は作られない。この app の分は上流 admin-template の 5 本 + Hub 固有。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(versions, vec![2, 3, 4, 5, 7, 101, 102, 103, 104, 105, 106]);
     }
 
-    /// I1: 以前は後追いの `ADD COLUMN` で足していた列が、新しい DB では
+    /// スキーマ整理（2026-10-02）: 以前は後追いの `ADD COLUMN` で足していた列が、新しい DB では
     /// 最初から（`CREATE TABLE` の最終形として）ある。
     #[tokio::test]
     async fn formerly_added_columns_are_part_of_the_final_shape() {

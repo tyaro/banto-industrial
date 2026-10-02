@@ -83,7 +83,7 @@ async fn main() {
         }
     };
 
-    // I1（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は無い）。
+    // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は無い）。
     // panic のメッセージで済ませず、何をすればよいかを stderr に出して終了する
     // （`chronogazer_core::db` のモジュール doc「旧形式の DB の拒否」）。
     let pool = match init_db(&db_path).await {

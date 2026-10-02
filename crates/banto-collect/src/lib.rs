@@ -56,12 +56,12 @@
 //! note calling for that method predates noticing the shared-migrator
 //! collision).
 //!
-//! Since I1 (2026-10-02, sqlx 0.9) each migrator keeps its own bookkeeping
+//! Since the 2026-10-02 schema cleanup (sqlx 0.9) each migrator keeps its own bookkeeping
 //! table (`Migrator::dangerous_set_table_name`: `banto_tags::MIGRATIONS_TABLE`,
 //! the apps' `db::MIGRATIONS_TABLE`), so the collision no longer forces this.
 //! The single idempotent table is kept as-is anyway: it has nothing to
 //! migrate yet, and keeping it out of any bookkeeping table means it never
-//! participates in the apps' "is this a pre-I1 database?" check.
+//! participates in the apps' "is this an old-format database?" check.
 
 pub mod collector;
 pub mod config;

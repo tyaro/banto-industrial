@@ -1,5 +1,5 @@
 //! Database bootstrap for the chronogazer app (spec §12): connect, refuse a
-//! database in the pre-I1 format, then apply this app's own migrations
+//! database in the pre-2026-10-02 format, then apply this app's own migrations
 //! (`migrations-sqlite/`), then `banto_tags::migrate` (the PLC connection/
 //! collection group/tag registry tables), then `banto_collect::migrate`
 //! (`collect_events`, #383 段階2b) against the SAME pool - ChronoGazer shares
@@ -8,7 +8,7 @@
 //! app-data file"), so this is the one place that bootstraps the whole
 //! schema.
 //!
-//! ## スキーマの出所（I1、2026-10-02 オーナー決定）
+//! ## スキーマの出所（DB スキーマの整理、2026-10-02 オーナー決定）
 //!
 //! この app 自身のテーブルは banto の admin-template と**同じ形**にする。
 //! `migrations-sqlite/` の 5 本は、当面
@@ -64,7 +64,7 @@ pub type DbPool = SqlitePool;
 /// `sqlx::migrate!` に戻せたか」）。旧形式の判定にも使う。
 pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_chronogazer";
 
-/// 旧形式（I1 より前）の DB を開こうとした（モジュール doc「旧形式の DB の
+/// 旧形式（2026-10-02 のスキーマ整理より前）の DB を開こうとした（モジュール doc「旧形式の DB の
 /// 拒否」）。`Display` がそのまま利用者向けの説明になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyDatabase {
@@ -132,7 +132,7 @@ impl From<InitDbError> for BantoError {
 }
 
 /// Connect to the SQLite database at `path`, refuse it if it is in the
-/// pre-I1 format, and apply the full schema (this app's own, then
+/// pre-2026-10-02 format, and apply the full schema (this app's own, then
 /// `banto_tags`'s, then `banto_collect`'s). Used by the `src-tauri` adapter
 /// with a path under the app's data directory.
 pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> {
@@ -150,7 +150,7 @@ pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> 
 
 /// Same as [`init_db`] but against a private in-memory database. Used by
 /// tests so each test gets an isolated, fully-migrated database (always
-/// empty, so the pre-I1 check is not needed).
+/// empty, so the old-format check is not needed).
 pub async fn init_db_memory() -> Result<SqlitePool, BantoError> {
     let pool = banto_storage::connect_sqlite_memory().await?;
     run_migrations(&pool).await?;
@@ -289,7 +289,7 @@ mod tests {
         run_migrations(&pool).await.unwrap(); // second run: must not error
     }
 
-    /// I1: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
+    /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
     /// は作られない。この app の分は上流 admin-template の 5 本。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {

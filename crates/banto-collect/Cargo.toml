@@ -34,8 +34,8 @@ serde = { workspace = true }
 # one table with an idempotent `CREATE TABLE IF NOT EXISTS` rather than
 # sqlx::migrate! - the consuming app shares ONE SQLite database across I1's
 # migrator and this crate. Under sqlx 0.8 two independent `sqlx::migrate!`
-# sets collided on the shared `_sqlx_migrations` bookkeeping table; since I1
-# (2026-10-02, sqlx 0.9) each migrator has its own table, but this crate keeps
+# sets collided on the shared `_sqlx_migrations` bookkeeping table; since the
+# 2026-10-02 schema cleanup (sqlx 0.9) each migrator has its own table, but this crate keeps
 # the idempotent DDL (see lib.rs's module doc "Why `migrate` is not
 # `sqlx::migrate!`" for the full reasoning).
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
