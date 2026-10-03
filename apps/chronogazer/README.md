@@ -50,6 +50,20 @@ cargo run -p chronogazer-core --bin banto-serve
 `./banto-dev.sqlite3`）・`BANTO_ALLOW_SETUP=1`（初回セットアップの許可）も
 環境変数で指定できる（`core/src/bin/banto-serve.rs`）。
 
+### 旧形式の DB で起動しないとき（2026-10-02〜）
+
+DB スキーマを banto の admin-template と同じ形に整理した（2026-10-02）ため、それより
+前の版で作った DB では起動を拒否し、「この DB は旧形式です。<パス> を削除
+または退避して起動し直してください（アルファ版のため自動移行はありません）」を
+出す（デスクトップ版はメインの画面の代わりにこの文と対処を書いた小さな窓を開き、
+閉じると終了する。`banto-serve` は標準エラーに出して終了する。2026-10-02 オーナー決定: 既存の DB は壊してよい。
+自動移行は作らない）。アプリを終了してから、そのパスの DB を（`-wal`・`-shm`
+があれば一緒に）削除または別名へ退避し、起動し直す。新しい DB はアカウントも
+接続・タグも空なので、初回セットアップからやり直す。DB の場所はデスクトップ版が
+アプリのデータディレクトリの `chronogazer.sqlite3`（Windows は
+`%APPDATA%\dev.tyaro.chronogazer\chronogazer.sqlite3`）、`banto-serve` が
+`BANTO_DB`（既定 `./banto-dev.sqlite3`）。
+
 ## ログインとセッション
 
 ログイン（デスクトップの窓・LAN モードのブラウザ、「ログインしたままにする」

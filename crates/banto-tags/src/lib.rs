@@ -56,11 +56,25 @@ pub use tag::{
 use banto_core::BantoError;
 use sqlx::SqlitePool;
 
+/// This crate's migration bookkeeping table. Not the default
+/// `_sqlx_migrations`: the consuming app runs its OWN `sqlx::migrate!` on the
+/// same pool, and two migrators sharing one bookkeeping table collide on
+/// overlapping version numbers (`MigrateError::VersionMismatch`,
+/// docs/r1a-readme-gaps.md). sqlx 0.9's `Migrator::dangerous_set_table_name`
+/// lets each migrator keep its own table (schema cleanup, 2026-10-02). The `dangerous_`
+/// part - a database migrated under the old shared table loses track of what
+/// was applied - is accepted because existing alpha databases may be thrown
+/// away (2026-10-02 owner decision); the apps refuse such a database before
+/// calling [`migrate`] (`apps/*/core/src/db.rs`).
+pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_banto_tags";
+
 /// Run this crate's embedded migrations against `pool`. Idempotent (`sqlx`'s
-/// migrator tracks applied versions in its own bookkeeping table), so it is
-/// safe to call on every app startup, same as banto's `db.rs::init_db`.
+/// migrator tracks applied versions in [`MIGRATIONS_TABLE`]), so it is safe
+/// to call on every app startup, same as banto's `db.rs::init_db`.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), BantoError> {
-    sqlx::migrate!("./migrations")
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
+    migrator
         .run(pool)
         .await
         .map_err(|err| BantoError::Storage(err.to_string()))
@@ -97,6 +111,35 @@ mod tests {
                 "tags".to_string(),
             ]
         );
+    }
+
+    /// Schema cleanup (2026-10-02): applied versions are recorded in this crate's own
+    /// [`MIGRATIONS_TABLE`], never in the shared default `_sqlx_migrations`
+    /// that the consuming app's migrator would otherwise collide on.
+    #[tokio::test]
+    async fn migrate_records_into_its_own_bookkeeping_table() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        migrate(&pool).await.expect("migrate should succeed");
+
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '\\_sqlx%' \
+             ESCAPE '\\' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query tables");
+        assert_eq!(tables, vec![MIGRATIONS_TABLE.to_string()]);
+
+        let applied: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {MIGRATIONS_TABLE}"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("count applied");
+        let embedded = sqlx::migrate!("./migrations").iter().count();
+        assert_eq!(applied as usize, embedded);
     }
 
     /// Calling `migrate` twice on the same pool must not error (spec: apps

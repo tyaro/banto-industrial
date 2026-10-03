@@ -4,7 +4,7 @@
 > 本リポジトリの実装仕様ではない。現行の banto 依存は（2026-09-01 時点）npm `@banto/*` が
 > `v1.2.0`、Rust クレートが `v1.4.0`（両者は独立に追従するため一致しない）。経緯として保存。
 
-状態: **アーカイブ（役目終了・経緯として保存）**。
+状態: **アーカイブ（役目終了・経緯として保存）**。2026-10-02: 最重要項目（`sqlx::migrate!` の二重使用）に、sqlx 0.9 で記録テーブルを分けて `sqlx::migrate!` に戻したことを追記。
 最終検証日(コード照合): 2026-09-01
 
 作成日: 2026-07-13。R1-A（`apps/admin-template` → `apps/chronogazer`
@@ -48,6 +48,18 @@
     I系クレートを consuming app が `sqlx::migrate!` と併用する前提のドキュメント
     （banto_tags のdocコメント、あるいは banto 本体のREADME/publishing.md）に、
     この衝突と回避策（冪等DDL、または消費側も migrate! を使わない）を明記すべき。
+  - **その後（2026-10-02、DB スキーマの整理）**: `sqlx` 0.9 には
+    `Migrator::dangerous_set_table_name` があり、記録テーブルを migrator ごとに
+    分けられる。これで衝突が無くなったので、両アプリ（chronogazer・banto-hub）の
+    自前テーブルを `sqlx::migrate!` に戻した。記録テーブルはアプリが
+    `_sqlx_migrations_chronogazer` / `_sqlx_migrations_banto_hub`、`banto_tags::migrate`
+    が `_sqlx_migrations_banto_tags`（`banto-collect` は冪等 DDL のまま）。スキーマは
+    上流 banto v2.1.1 の `apps/admin-template/core/migrations-sqlite/` を byte 等価で
+    コピーした（`apps/*/core/migrations-sqlite/`。banto-hub 固有は `0101_*` 以降）。
+    `dangerous_` の「既存 DB の記録を見失う」は、既存 DB は壊してよいという
+    2026-10-02 のオーナー決定で受け入れ、古い形式の DB は起動を拒否する
+    （`apps/*/core/src/db.rs` のモジュール doc）。冪等 DDL と、ドキュメント扱いだった
+    `apps/chronogazer/core/migrations/` は削除した。
 
 - [ ] **npm git依存（`github:owner/repo#tag&path:subdir`）は問題なく動作した**
   - `pnpm install` は `@banto/admin-core` 等5パッケージすべてを
@@ -246,7 +258,7 @@
 
 ## 実施箇所への参照（本リポジトリ側）
 
-- `apps/chronogazer/core/src/db.rs`: migrate!衝突の回避（冪等DDL化）
+- `apps/chronogazer/core/src/db.rs`: migrate!衝突の回避（冪等DDL化。2026-10-02 に記録テーブルを分けて `sqlx::migrate!` へ戻した）
 - `Cargo.toml`（root）: `banto-core`/`banto-storage`/`banto-server` の
   git依存追加、`repository`フィールド問題の回避
 - `apps/chronogazer/core/Cargo.toml`・`src-tauri/Cargo.toml`:

@@ -1,5 +1,5 @@
 //! banto-hub 用アプリ設定 (docs/tag-server-design.md §8): `settings` テーブル
-//! （migration `db.rs::apply_app_schema` 内、key/value）に対する型付きラッパ。
+//! （`migrations-sqlite/0002_settings.sql`、key/value）に対する型付きラッパ。
 //! `apps/chronogazer/core/src/settings.rs` の `SettingsService`
 //! get/set/upsert パターンをそのまま流用するが、ChronoGazer の
 //! `ServerSettings`（LAN 公開トグル付き、既定オフ）とは違い、**hub は常時

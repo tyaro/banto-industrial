@@ -8,7 +8,8 @@ W系（relay-wright）は W5 まで実装済みだったが **2026-09-17 に凍�
 一意性の収集グループ内一意への緩和・T19 UX 群・T20 文字列/構造体/レシピ/ビット・
 T21 構成補助 MCP 管理面を含む、2026-09-06）。残 T18-5c/d（Windows
 実機往復・72h soak = 実機必須）と実機・需要待ちの #210/#211/#123/#201。2026-09-24: I3a に記録時刻と
-ファイル日付の契約（#424 案 A、§5）を追記。
+ファイル日付の契約（#424 案 A、§5）を追記。2026-10-02: §5 に両アプリの DB スキーマの整理（admin-template の
+migration のコピー・旧形式の DB の拒否、オーナー決定・実装済み）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -229,6 +230,28 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     時計が 24h 規模で飛んだ瞬間の 1 サンプルは捨て、収集は既存の書き込み
     失敗として記録する。ファイルに時刻の最小・最大を持たせる案（案 B）は
     今回やらない（詳細は recorder-requirements.md §3.4）
+- **アプリの DB スキーマ（2026-10-02 オーナー決定、実装済み）**: banto-industrial の
+  独自実装は banto に寄せる（移植で直さない）。その土台として、両アプリ（chronogazer・
+  banto-hub）の自前テーブル（settings・users・audit_log）を **banto の admin-template と
+  同じ形**にした。決定は 3 点:
+  - **既存の DB は壊してよい**（アルファ版。互換の移行は作らない）。ただし古い DB を
+    開いたら黙って動かさず、**起動を拒否**して DB のパスと「削除または退避して起動し直す」
+    を出す（判定: アプリの migration 記録テーブルが無いのに `users` か `settings` がある）。
+  - **スキーマの置き場は、当面上流 admin-template の SQL を byte 等価でコピー**する
+    （banto v2.1.1 `apps/admin-template/core/migrations-sqlite/` の 0002・0003・0004・0005・
+    0007 → `apps/*/core/migrations-sqlite/`。banto 側には手を入れない）。banto-hub 固有の
+    テーブルは `0101_*` 以降に最終形で置く。
+  - **banto-hub の旧 DB 拒否はログと手順書だけ**（インストーラ等に作り直しの操作は
+    作らない）。手順は [banto-hub-operations.md](banto-hub-operations.md) §1
+    「旧形式の DB で起動を拒否されたとき」、chronogazer は
+    [apps/chronogazer/README.md](../apps/chronogazer/README.md)。
+
+  実装: sqlx 0.9 の `Migrator::dangerous_set_table_name` で記録テーブルを migrator ごとに
+  分け（`_sqlx_migrations_chronogazer` / `_sqlx_migrations_banto_hub` /
+  `_sqlx_migrations_banto_tags`。`banto-collect` は冪等 DDL のまま）、手書きの冪等 DDL を
+  `sqlx::migrate!` に戻した。経緯と理由は各アプリの `core/src/db.rs` のモジュール doc と
+  [r1a-readme-gaps.md](r1a-readme-gaps.md)
+
 - **ハイブリッドトレンド**: メモリ上のローリング窓（直近）+ DB（過去、
   間引き済み）を、チャート viewport の参照位置で継ぎ目なく合成する
   クエリ層。M13 の「全域表示中のみ追従/ズーム中は窓維持」が前段

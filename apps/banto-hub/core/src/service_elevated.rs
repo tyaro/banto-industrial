@@ -402,6 +402,12 @@ pub enum ElevatedError {
     /// 透過する（モジュール doc「ロックダウン回復アクション」節参照）。
     #[error(transparent)]
     Db(#[from] banto_core::BantoError),
+    /// 対象 profile の DB を`crate::db::init_db`で開けなかった。旧形式
+    /// （2026-10-02 のスキーマ整理より前）の DB は`crate::db::InitDbError::Legacy`で、メッセージに
+    /// DB のパスと対処（削除または退避）を含む（`crate::db`のモジュール doc
+    /// 「旧形式の DB の拒否」）。
+    #[error(transparent)]
+    InitDb(#[from] crate::db::InitDbError),
     /// `reset-password`の対象ユーザーが`users`テーブルに存在しない
     /// （[`crate::users::UsersService::get_by_username`]が`None`を返した）。
     /// パスワードを紛失した状況での操作なので、「どのユーザー名を

@@ -33,10 +33,11 @@ serde = { workspace = true }
 # collect_events persistence. No `macros`/`migrate`: this crate creates its
 # one table with an idempotent `CREATE TABLE IF NOT EXISTS` rather than
 # sqlx::migrate! - the consuming app shares ONE SQLite database across I1's
-# migrator and this crate, and two independent `sqlx::migrate!` sets would
-# collide on the shared `_sqlx_migrations` bookkeeping table (see lib.rs's
-# `migrate` doc comment for the full reasoning - this is the one deliberate
-# deviation from "banto-tags の migrate 方式に倣う").
+# migrator and this crate. Under sqlx 0.8 two independent `sqlx::migrate!`
+# sets collided on the shared `_sqlx_migrations` bookkeeping table; since the
+# 2026-10-02 schema cleanup (sqlx 0.9) each migrator has its own table, but this crate keeps
+# the idempotent DDL (see lib.rs's module doc "Why `migrate` is not
+# `sqlx::migrate!`" for the full reasoning).
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 thiserror = { workspace = true }
 # The concurrent collection engine itself: one spawned task per connection

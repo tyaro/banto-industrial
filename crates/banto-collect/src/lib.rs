@@ -46,14 +46,22 @@
 //! ## Why `migrate` is not `sqlx::migrate!`
 //!
 //! The ChronoGazer app shares one SQLite database across I1's tables and this
-//! crate's `collect_events`. `banto-tags` already applies its schema via
-//! `sqlx::migrate!`, which records applied versions in a shared
-//! `_sqlx_migrations` bookkeeping table. A second independent `sqlx::migrate!`
-//! set against the same database would collide there (overlapping version
-//! numbers, mismatched checksums). So this crate applies its one table with an
-//! idempotent `CREATE TABLE IF NOT EXISTS` instead - the one deliberate
-//! deviation from "banto-tags の migrate 方式に倣う" (the design note calling
-//! for that method predates noticing the shared-migrator collision).
+//! crate's `collect_events`. `banto-tags` applies its schema via
+//! `sqlx::migrate!`. With sqlx 0.8 every migrator recorded applied versions in
+//! one shared `_sqlx_migrations` bookkeeping table, so a second independent
+//! `sqlx::migrate!` set against the same database would collide there
+//! (overlapping version numbers, mismatched checksums). So this crate applies
+//! its one table with an idempotent `CREATE TABLE IF NOT EXISTS` instead - the
+//! one deliberate deviation from "banto-tags の migrate 方式に倣う" (the design
+//! note calling for that method predates noticing the shared-migrator
+//! collision).
+//!
+//! Since the 2026-10-02 schema cleanup (sqlx 0.9) each migrator keeps its own bookkeeping
+//! table (`Migrator::dangerous_set_table_name`: `banto_tags::MIGRATIONS_TABLE`,
+//! the apps' `db::MIGRATIONS_TABLE`), so the collision no longer forces this.
+//! The single idempotent table is kept as-is anyway: it has nothing to
+//! migrate yet, and keeping it out of any bookkeeping table means it never
+//! participates in the apps' "is this an old-format database?" check.
 
 pub mod collector;
 pub mod config;

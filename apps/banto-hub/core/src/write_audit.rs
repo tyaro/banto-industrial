@@ -1,5 +1,5 @@
 //! 書き込み監査 (docs/tag-server-design.md §6-3「log-before-write」)。
-//! `hub_write_audit` テーブル (`db.rs::apply_app_schema` の冪等 DDL) の
+//! `hub_write_audit` テーブル (`migrations-sqlite/0103_hub_write_audit.sql`) の
 //! 唯一のアクセス経路。relay-wright の `engine/write_audit.rs` と同じ
 //! **log-before-write** 規律を、hub の書き込みエンドポイント
 //! (`crate::rest` の `POST /api/v1/values/{tag}`) 向けに読み替えたもの。

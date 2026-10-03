@@ -20,20 +20,20 @@
 //! （`protocol = "postgres"`）を共有する - 接続の登録・接続テスト・資格情報
 //! の扱いを1つに保つため。sink 固有の設定は `hub_sink_groups`（1グループ =
 //! 1保存先テーブル + 1周期/モード）と、その対象タグを持つ
-//! `hub_sink_group_tags`（多対多）の2テーブルに新設する（`crate::db`の
-//! `apply_app_schema`参照）。テーブル名は設計 §5.2 の呼称
+//! `hub_sink_group_tags`（多対多）の2テーブルに新設する
+//! （`migrations-sqlite/0106_hub_sink_groups.sql`参照）。テーブル名は設計 §5.2 の呼称
 //! （`logger_groups`/`logger_group_tags`）ではなく他の Hub 専用テーブル
 //! （`hub_write_audit`/`hub_retained_values`）と同じ `hub_` 接頭辞に揃えた
 //! （指示: S4 実装指示）。
 //!
-//! ## FK を張らない理由（`crate::db`の doc comment と同じ判断）
+//! ## FK を張らない理由（`hub_retained_values` と同じ判断）
 //!
 //! `hub_sink_groups.db_connection_id`（→ `plc_connections.id`）、
 //! `hub_sink_group_tags.tag_id`（→ `tags.id`）のいずれも SQL の
 //! `FOREIGN KEY` を張らない。理由は `hub_retained_values.tag_id` と同じ
-//! 慣行に揃えるため: この2テーブルは `apply_app_schema` の一部として
-//! `banto_tags::migrate`（`plc_connections`/`tags` を作る側）より**先**に
-//! 走る。参照整合性はサービス層で担保する:
+//! 慣行に揃えるため: この2テーブルはこの app の migration
+//! （`crate::db`）の一部として `banto_tags::migrate`（`plc_connections`/
+//! `tags` を作る側）より**先**に走る。参照整合性はサービス層で担保する:
 //!
 //! - `db_connection_id` の存在確認と `protocol == "postgres"` 検証は
 //!   [`service::validate_sink_group_input`] が create/update の入口で行う。

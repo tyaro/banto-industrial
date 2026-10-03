@@ -64,7 +64,7 @@
 //!
 //! `retain = true` の内部タグは、書き込み成功時（`crate::write_path::execute_write`
 //! の内部タグ分岐）に [`upsert_retained_value`] で `hub_retained_values`
-//! テーブル（`crate::db` の冪等 DDL）へ最終値を upsert する。起動時
+//! テーブル（`migrations-sqlite/0104_hub_retained_values.sql`）へ最終値を upsert する。起動時
 //! （`bin/banto-hub.rs`）は [`load_retained_values`] で読み出し、
 //! `ServerTagStore::set` で品質 `Good`・時刻は保存時刻として初期化する。
 //! `retain = false` の内部タグは何もロードしない - [`ServerTagStore::get`]
@@ -412,7 +412,7 @@ fn severity(q: Quality) -> u8 {
 }
 
 /// `retain = true` の内部タグの最終値を `hub_retained_values`
-/// （`crate::db` の冪等 DDL）へ upsert する（このモジュールの doc comment
+/// （`migrations-sqlite/0104_hub_retained_values.sql`）へ upsert する（このモジュールの doc comment
 /// 「retain の永続化」参照）。`tag_id` は `crate::hub::TagEntry::ids` の
 /// 第3要素 - `ServerTagStore` のキー（`tag_key` = `"tag:{id}"`）と同じ id
 /// を主キーに使う（`load_retained_values` がそのまま `tag_key` を組み立て

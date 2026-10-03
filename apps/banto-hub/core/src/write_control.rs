@@ -7,7 +7,7 @@
 //! (2026-09-09 オーナー決定, #340 - 旧ルール「起動時は必ず disabled」を撤回)
 //!
 //! 永続値の seed は `write_control_state.enabled_persisted = 1`
-//! (`db.rs::apply_app_schema` 参照、既定で書き込み可)。banto-hub は
+//! (`migrations-sqlite/0102_write_control_state.sql` 参照、既定で書き込み可)。banto-hub は
 //! relay-wright のようなルールエンジンを持たない、外部クライアントの明示
 //! 要求を1回転送するだけのパススルーであり、再起動後に条件が揃えば自律的に
 //! 書き込みを再開するという危険が存在しない。書き込みの可否は per-tag
@@ -825,7 +825,7 @@ fn lock_ignoring_poison<T>(mutex: &SyncMutex<T>) -> std::sync::MutexGuard<'_, T>
 // --- DB (write_control_state) ----------------------------------------------
 
 /// `write_control_state.enabled_persisted` (id=1 の単一行) を読む。
-/// `db.rs::apply_app_schema` が起動時に必ず1行 seed するので
+/// `migrations-sqlite/0102_write_control_state.sql` が必ず1行 seed するので
 /// `fetch_one` で問題ない。
 pub async fn load_persisted_enabled(pool: &SqlitePool) -> Result<bool, BantoError> {
     let enabled: i64 =

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ja">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>ChronoGazer を起動できません</title>
+		<!--
+			旧形式の DB を拒否したときにだけ開く、エラー専用のページ
+			（src-tauri/src/lib.rs の open_legacy_db_window）。SvelteKit の
+			ルートを経由しない静的ページで、Tauri のコマンドは一切呼ばない
+			（このとき AppState は manage されていない）。文言は Rust 側が
+			initialization_script で window.__CHRONOGAZER_LEGACY_DB__ に入れる。
+		-->
+		<style>
+			:root {
+				color-scheme: light dark;
+				--bg: #ffffff;
+				--fg: #1f2328;
+				--muted: #59636e;
+				--accent: #b42318;
+				--code-bg: #f3f4f6;
+			}
+			@media (prefers-color-scheme: dark) {
+				:root {
+					--bg: #1b1d21;
+					--fg: #e6e8eb;
+					--muted: #a3aab3;
+					--accent: #f97066;
+					--code-bg: #2a2d33;
+				}
+			}
+			body {
+				margin: 0;
+				padding: 20px 24px;
+				background: var(--bg);
+				color: var(--fg);
+				font-family: 'Segoe UI', 'Yu Gothic UI', 'Meiryo', sans-serif;
+				font-size: 14px;
+				line-height: 1.6;
+			}
+			h1 {
+				margin: 0 0 12px;
+				font-size: 18px;
+				color: var(--accent);
+			}
+			p {
+				margin: 0 0 10px;
+			}
+			code {
+				display: block;
+				padding: 8px 10px;
+				margin: 0 0 12px;
+				background: var(--code-bg);
+				border-radius: 4px;
+				word-break: break-all;
+				user-select: all;
+				font-family: Consolas, 'Cascadia Mono', monospace;
+			}
+			.muted {
+				color: var(--muted);
+			}
+		</style>
+	</head>
+	<body>
+		<h1 id="title">ChronoGazer を起動できません</h1>
+		<p id="message"></p>
+		<code id="path"></code>
+		<p id="steps"></p>
+		<p class="muted" id="closing"></p>
+		<script>
+			(function () {
+				var info = window.__CHRONOGAZER_LEGACY_DB__;
+				if (!info) {
+					document.getElementById('message').textContent =
+						'データベースを開けませんでした。詳しくは標準エラー出力を確認してください。';
+					return;
+				}
+				document.getElementById('title').textContent = info.title;
+				document.getElementById('message').textContent = info.message;
+				document.getElementById('path').textContent = info.path;
+				document.getElementById('steps').textContent = info.steps;
+				document.getElementById('closing').textContent = info.closing;
+			})();
+		</script>
+	</body>
+</html>
