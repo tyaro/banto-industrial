@@ -6,18 +6,24 @@
 //! automates exactly that, and nothing more:
 //!
 //! ```text
-//! GET /api/commissioning/status   -> still in commissioning?
-//!   yes -> POST /api/api-keys  (scopes: ["read"])   -> plaintext key, once
-//!          KeyStore::set                            -> OS keyring
-//!          GET /api/v1/tags (via banto-tagclient)   -> proof it works
+//! GET /api/commissioning/status          -> still in commissioning?
+//!   yes -> POST /api/auth/grant/commissioning     -> admin grant bearer (loopback only)
+//!          POST /api/api-keys  (scopes: ["read"], under the grant) -> plaintext key, once
+//!          POST /api/auth/logout (the grant)       -> the grant is dropped
+//!          KeyStore::set                           -> OS keyring
+//!          GET /api/v1/tags (via banto-tagclient)  -> proof it works
 //!   no  -> HubStatus::NeedsPairing (an administrator hands over a key)
 //! ```
 //!
-//! **banto-hub needs no changes for this.** Every endpoint above already
-//! exists with exactly these semantics (verified in issue #332's 2026-09-08
-//! comment): the commissioning status route is deliberately unauthenticated,
-//! the admin router bypasses bearer auth while commissioning is open, and
-//! `GET /api/v1/tags` answers `200 {"tags": []}` on a Hub with no tags yet.
+//! Every endpoint above is banto-hub's own, with exactly these semantics
+//! (pinned by `apps/banto-hub/core/tests/client_bootstrap.rs`): the
+//! commissioning status route is deliberately unauthenticated; since banto
+//! v3.0.0 (ADR-0017, 2026-10-04) the admin router no longer bypasses bearer
+//! auth while commissioning is open - instead the Hub hands a **loopback**
+//! caller the commissioning grant (a short-lived bearer of the synthetic
+//! `admin` identity), which this crate takes for the issue and logs out right
+//! after; `GET /api/v1/tags` answers `200 {"tags": []}` on a Hub with no tags
+//! yet.
 //!
 //! # 境界
 //!
@@ -59,10 +65,11 @@
 //! # 同一 PC 限定
 //!
 //! banto-hub refuses to start on a non-loopback bind while commissioning is
-//! open (`enforce_loopback_when_commissioning`, tag-server-design.md §5.6).
-//! Self-issuing is therefore structurally limited to an app running on the
-//! same machine as the Hub - a third party on the LAN cannot reach the open
-//! window at all. An app on another machine uses
+//! open (`enforce_loopback_when_commissioning`, tag-server-design.md §5.6),
+//! and the commissioning grant is issued only to a loopback peer
+//! (`require_loopback_peer`, ADR-0017). Self-issuing is therefore limited to
+//! an app running on the same machine as the Hub - a third party on the LAN
+//! cannot reach the open window at all. An app on another machine uses
 //! [`Bootstrapper::adopt_manual_key`] with a key an administrator issued.
 
 mod admin;

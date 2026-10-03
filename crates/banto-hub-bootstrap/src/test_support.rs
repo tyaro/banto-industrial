@@ -4,8 +4,8 @@
 //! `TcpListener` on `127.0.0.1:0` driven from a background thread - rather
 //! than an HTTP mocking crate, so the crate's dependency tree stays exactly
 //! the production one. The difference is that a bootstrap run makes
-//! *several* requests to the same origin (commissioning status, issue,
-//! revoke, catalog), so this harness serves a whole session: it accepts
+//! *several* requests to the same origin (commissioning status, grant,
+//! issue, revoke, logout, catalog), so this harness serves a whole session: it accepts
 //! connections in a loop, answers each request from a route table, and
 //! records what it was asked.
 //!
@@ -219,6 +219,11 @@ pub fn catalog_body(count: usize) -> String {
 /// `GET /api/commissioning/status`'s body.
 pub fn commissioning_body(locked_down: bool) -> String {
     format!(r#"{{"lockedDown":{locked_down}}}"#)
+}
+
+/// `POST /api/auth/grant/commissioning`'s success body (banto v3.0.0).
+pub fn grant_body(token: &str) -> String {
+    format!(r#"{{"success":true,"token":"{token}"}}"#)
 }
 
 /// `POST /api/api-keys`'s success body.
