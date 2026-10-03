@@ -7,13 +7,10 @@
  *    直接 URL アクセスは先頭の可視カテゴリへ 307 redirect される。この
  *    経路は「非可視カテゴリが実際に存在する」状態でないと固定できない -
  *    メイン E2E サーバー（`banto-hub-viewport-settings-routes.spec.ts` が
- *    使う既定サーバー）はロックダウンしないため、ガードの `grantFallback` が
- *    試運転の grant（kind `commissioning`）に入り `sessionStore.
- *    commissioningMode` が true で `security` カテゴリが常に可視になり、
- *    検証できない（同 spec の doc comment 参照）。ロックダウン済みサーバー
- *    なら、サーバーが試運転の grant を出さない（banto v3.0.0 から
- *    `commissioningMode` は SessionController の snapshot の
- *    `kind === 'commissioning'` の導出で、kind はサーバーの identity 由来）ので
+ *    使う既定サーバー）はロックダウンしないため、`security` カテゴリ（可視は
+ *    サーバーの `GET /api/commissioning/status` の `lockedDown` で決まる、
+ *    `commissioningState.svelte.ts`）が常に可視になり、検証できない（同 spec の
+ *    doc comment 参照）。ロックダウン済みサーバーなら `lockedDown: true` で
  *    `security` が非可視になり、redirect を再現できる。
  *
  * 2. **`/settings/data` 直接遷移時の構成パッケージ import ガード回帰**

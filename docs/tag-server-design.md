@@ -1167,9 +1167,12 @@ provider の確認（`GET /api/auth/identity` → `kind: "commissioning"`）で�
 失効 → 確認が 401 → `none` → ログイン画面」（`commissioningLockDown.ts`）。試運転中の
 ログアウトはトークンを捨てるだけで、次の保護画面への遷移でガードが grant を無言で取り直す
 （試運転はロックダウンでしか終わらない、2026-10-02 オーナー決定）。
-`sessionStore.commissioningMode` は controller の snapshot（サーバー由来の
-`kind === 'commissioning'` かつ `active`）からの導出 - アカウントでログインしているときは
-試運転中でも false（そのアカウントの権限で動く）。タグモニタの WS は試運転中も
+「サーバーが試運転中か」と「このタブが試運転の grant で操作しているか」は別の軸
+（2026-10-04 オーナー指示）: ロックダウンの欄（設定の「セキュリティ」カテゴリ）と試運転の
+表示は**サーバーの状態**（`GET /api/commissioning/status`、`commissioningState.svelte.ts`）で
+出し分け、アカウントでログインしたままでもロックダウンできる（本人のトークンは残り、
+画面は「ログイン中のアカウントで続けます」）。`sessionStore.commissioningGrant`（snapshot の
+`kind === 'commissioning'`）は「誰として操作しているか」だけ。タグモニタの WS は試運転中も
 `Sec-WebSocket-Protocol: bearer, <token>` でトークンを運ぶ（トークン無しの分岐は無い）。
 
 #### 管理 UI と `/api/v1/*` の境界（2026-08-31 オーナー決定・案A）

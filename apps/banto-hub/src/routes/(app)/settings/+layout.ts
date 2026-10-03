@@ -1,5 +1,6 @@
 import { isAdmin } from '$lib/permissions';
 import { sessionStore } from '$lib/session.svelte';
+import { commissioningState } from '$lib/banto/commissioningState.svelte';
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
 
 /**
@@ -17,12 +18,17 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  * - `data`: 元の `canManageStore || (canManageMqtt || canManageGrpc)`
  *   （DataSection.svelte、データ保持と構成パッケージの両ガード。全て
  *   `isAdmin(sessionStore.role)` と同値）。
- * - `security`: 元の `sessionStore.commissioningMode`
- *   （SecuritySection.svelte。banto v3.0.0 から、サーバーが発行した試運転の
- *   grant のセッション = identity の `kind === 'commissioning'`）。
+ * - `security`: **サーバーが試運転モード（未ロックダウン）か**
+ *   （`commissioningState.serverCommissioning`、`GET /api/commissioning/status` を
+ *   この load のたびに読み直す）。セッションの種別（試運転の grant か、アカウントか）
+ *   では決めない: 初回セットアップで作った admin はアカウントのセッションのままで、
+ *   ロックダウンにはまさにその admin が要る（2026-10-04 オーナー指示。v3.0.0 追従の
+ *   最初の実装が `kind === 'commissioning'` で出し分けていたのを戻した）。
+ *   取得に失敗したら欄を出さない側（安全側）。
  */
 export async function load({ parent }) {
 	await parent();
+	await commissioningState.refresh();
 
 	const admin = isAdmin(sessionStore.role);
 
@@ -31,7 +37,7 @@ export async function load({ parent }) {
 		account: true,
 		connectivity: admin,
 		data: admin,
-		security: sessionStore.commissioningMode
+		security: commissioningState.serverCommissioning
 	};
 
 	return { categories: SETTINGS_CATEGORIES.filter((category) => visible[category.id]) };

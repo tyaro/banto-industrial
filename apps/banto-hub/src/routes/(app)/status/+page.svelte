@@ -64,6 +64,7 @@
 	} from '$lib/banto/pendingChangesAdmin';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
+	import { commissioningState } from '$lib/banto/commissioningState.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import {
 		getHubStatus,
@@ -103,6 +104,11 @@
 	} from '$lib/banto/sinkServiceShell';
 
 	const canManageWriteControl = $derived(isAdmin(sessionStore.role));
+	// 「試運転モード」の表示はサーバーの状態（`GET /api/commissioning/status`）から。
+	// このタブのセッションの種別（試運転の grant か、アカウントか）では決めない。
+	$effect(() => {
+		void commissioningState.refresh();
+	});
 	const localShell = isLocalShell();
 	const hubAdmin = $derived(isAdmin(sessionStore.role));
 
@@ -729,10 +735,12 @@
 				-->
 				<dt>試運転モード</dt>
 				<dd>
-					{#if sessionStore.commissioningMode}
+					{#if commissioningState.lockedDown === null}
+						確認中…
+					{:else if commissioningState.serverCommissioning}
 						有効（未ロックダウン・この PC からは試運転の grant で管理操作が可能）
 					{:else}
-						無効（認証必須）
+						無効（ロックダウン済み・ログイン必須）
 					{/if}
 				</dd>
 			</dl>
@@ -744,7 +752,7 @@
 				T19 S1-d（UX-45）で撤去済みなので、状態が読めるこの場所に置く。
 			-->
 			<p class="note" data-testid="registry-change-contract-note">
-				{#if sessionStore.commissioningMode}
+				{#if commissioningState.serverCommissioning}
 					試運転中は構成変更（接続・グループ・タグ）が収集中でも即時反映されます。ロックダウン後は未適用の変更として保存され、明示的に適用するまで反映されません（適用時も収集は止まりません）。
 				{:else}
 					ロックダウン済みのため、収集中の構成変更（接続・グループ・タグ）は未適用の変更として保存され、下の「未適用の変更」から明示的に適用するまで反映されません（適用時も収集は止まりません）。

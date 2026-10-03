@@ -73,6 +73,10 @@ const LOCKED_DOWN_BASE_URL = `http://127.0.0.1:${LOCKED_DOWN_PORT}`;
  * 行う（同 spec の doc comment参照）。
  */
 const LOCKED_DOWN_SPECS = [
+	// 2026-10-04: アカウントでログインしたままのロックダウン。このプロジェクトの
+	// spec の中で辞書順の先頭に来るので、専用サーバーがまだ試運転モードのうちに走る
+	// （ほかの spec は `beforeAll` で冪等にロックダウンする）。
+	'**/banto-hub-lockdown-by-account.spec.ts',
 	'**/banto-hub-status-pending-apply-cancel.spec.ts',
 	'**/banto-hub-settings-guard.spec.ts',
 	// #441: セッションで開いたストリーム（`/api/v1/stream`）の失効は

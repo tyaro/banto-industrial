@@ -4,9 +4,12 @@
 	 * 2026-08-30 オーナー決定）（#359 段階1）。元 `+page.svelte` の該当
 	 * セクションから markup・state・関数を無改変で移した。
 	 *
-	 * 表示条件は `sessionStore.commissioningMode` の1つ（ロックダウン済み
-	 * なら元々このフラグが false なのでセクションごと非表示になる - 実装
-	 * 指示「ロックダウン済みのときはこの操作を表示しないこと」）。
+	 * 表示条件は **サーバーが試運転モード（未ロックダウン）か**
+	 * （`commissioningState.serverCommissioning`）の1つ（ロックダウン済みなら
+	 * false なのでセクションごと非表示になる - 実装指示「ロックダウン済みのときは
+	 * この操作を表示しないこと」）。セッションの種別では決めない: アカウントで
+	 * ログインしたままでもロックダウンできる（操作の権限は admin、アカウントでも
+	 * 試運転の grant でも可。2026-10-04 オーナー指示）。
 	 *
 	 * admin アカウントが1件も無いとサーバーが拒否する（詰み防止、
 	 * `apps/banto-hub/core/src/commissioning.rs` の `no_admin_account_error`）。
@@ -18,9 +21,9 @@
 	 * validation エラーを表示するのはそのため - 事前チェックと実行の間に
 	 * 他クライアントが最後の admin を消す、というレースも理論上あり得る）。
 	 */
-	import { goto } from '$app/navigation';
+	import { goto, invalidateAll } from '$app/navigation';
 	import { toastStore } from '$lib/toast.svelte';
-	import { sessionStore } from '$lib/session.svelte';
+	import { commissioningState } from '$lib/banto/commissioningState.svelte';
 	import { lockDown } from '$lib/banto/commissioning';
 	import { lockDownAndLeave } from '$lib/banto/commissioningLockDown';
 	import { listUsers } from '$lib/banto/usersAdmin';
@@ -38,7 +41,7 @@
 	let lockDownError: string | null = $state(null);
 
 	$effect(() => {
-		if (!sessionStore.commissioningMode) return;
+		if (!commissioningState.serverCommissioning) return;
 		let cancelled = false;
 		(async () => {
 			try {
@@ -80,16 +83,21 @@
 			// ロックダウン後は以後の全リクエストで認証が必須になる - この画面に
 			// 留まらせると後続の管理 API 呼び出しが軒並み 401 になって壊れて
 			// 見えるため、ログイン画面へ誘導する（実装指示のとおり）。
-			// banto v3.0.0（ADR-0017）: 試運転のセッションはサーバーが発行した grant の
-			// トークン。ロックダウンの保存の直後にサーバーがそのトークンを全部
-			// 失効させるので、確認 → 確定した `none` なら /login、の順序は
-			// `commissioningLockDown.ts` の doc。
+			// banto v3.0.0（ADR-0017）: 試運転の grant のセッションなら、ロックダウンの
+			// 保存の直後にサーバーがそのトークンを全部失効させるので、確認 → 確定した
+			// `none` なら /login、の順序は `commissioningLockDown.ts` の doc。アカウントで
+			// ログインしたままなら本人のトークンは有効なままで 'stayed'。
 			const outcome = await lockDownAndLeave({ lockDown, goToLogin: () => goto('/login') });
 			if (outcome === 'left') {
 				toastStore.push('success', 'ロックダウンしました。ログイン画面へ移動します。');
 			} else if (outcome === 'stayed') {
-				// 保存していたトークンが有効だった: そのアカウントで続ける。
+				// 保存していたトークンが有効だった: そのアカウントで続ける。サーバーは
+				// もうロックダウン済みなので、この欄（security カテゴリ）を消す:
+				// 設定グループの load を走らせ直し、`guardCategory` が先頭の可視
+				// カテゴリへ送る。
 				toastStore.push('success', 'ロックダウンしました。ログイン中のアカウントで続けます。');
+				commissioningState.markLockedDown();
+				await invalidateAll();
 			} else {
 				toastStore.push(
 					'error',
@@ -104,7 +112,7 @@
 	}
 </script>
 
-{#if sessionStore.commissioningMode}
+{#if commissioningState.serverCommissioning}
 	<section class="commissioning">
 		<h2>試運転モードのロックダウン</h2>
 		<p class="note">
