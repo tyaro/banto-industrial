@@ -1653,8 +1653,12 @@ mod tests {
             .setup_first_user("owner", "password123", "オーナー")
             .await
             .expect("setup_first_user");
+        let auth = banto_server::AuthState::new(
+            |_u: String, _p: String| Box::pin(async { None }),
+            banto_server::SessionValidation::DisabledNoRevocation,
+        );
         let commissioning =
-            crate::commissioning::CommissioningService::load(settings.clone(), users.clone())
+            crate::commissioning::CommissioningService::load(settings.clone(), users.clone(), auth)
                 .await
                 .expect("load");
         commissioning.lock_down().await.expect("lock_down");

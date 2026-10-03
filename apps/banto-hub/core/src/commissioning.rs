@@ -3,8 +3,22 @@
 //!
 //! ## 状態は2つだけ
 //!
-//! - **試運転モード（初期状態）**: 管理 UI / 管理 REST は認証なしで操作できる。
+//! - **試運転モード（初期状態）**: 管理 UI / 管理 REST は、**資格情報なしで発行
+//!   される合成 admin の grant セッション**（banto v3.0.0 ADR-0017、kind
+//!   [`COMMISSIONING_GRANT_KIND`] = `commissioning`、`POST
+//!   /api/auth/grant/commissioning`）で操作できる。発行できるのは loopback の
+//!   peer だけ（[`commissioning_grant_spec`]）。発行後は通常の bearer セッション
+//!   として `crate::rest::require_session`・`RoleGuard`・監査・ストリームの
+//!   再検証にそのまま乗る - **認証を迂回する分岐は無い**（2026-10-04 までは
+//!   `require_auth_or_commissioning` 等 34 か所が未ロックダウン中の要求を
+//!   無認証で通していた。banto-industrial の v3.0.0 追従で廃止、オーナー決定
+//!   2026-10-02〜04）。
 //! - **ロックダウン済み**: 従来どおり bearer セッションのログインが必要。
+//!   grant の条件（未ロックダウン）が閉じるので、以後 `commissioning` の
+//!   発行は 403 になり、発行済みのトークンは[`CommissioningService::lock_down`]
+//!   が**フラグの保存の直後に同じ関数内で**失効させる（ADR-0017 §2・§5。
+//!   「保存 → `revoke_grant_tokens`」の順。並行する発行との競合は `AuthState`
+//!   の世代が閉じる）。
 //!
 //! 永続先は既存の `settings` テーブル（`crate::settings::SettingsService`と
 //! 同じ key/value ストア、`migrations-sqlite/0002_settings.sql`で作成済み）に相乗りする。
@@ -48,7 +62,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use banto_core::{BantoError, FieldError};
-use banto_server::Identity;
+use banto_server::{AuthState, GrantCondition, GrantKind, GrantSpec, Identity};
 
 use crate::settings::SettingsService;
 use crate::users::{Role, UsersService};
@@ -58,8 +72,8 @@ use crate::users::{Role, UsersService};
 /// でユーザー数によるフォールバック判定は撤回した）。
 const KEY_LOCKED_DOWN: &str = "commissioning.locked_down";
 
-/// 試運転モード中、`crate::rest::actor_identity`が bearer token の代わりに
-/// 返す合成 identity の `id`。実在ユーザーの `username`（`users.username`は
+/// 試運転モードの grant セッション（[`commissioning_grant_spec`]）の固定
+/// identity の `id`。実在ユーザーの `username`（`users.username`は
 /// 空文字を許さない・`MIN_USERNAME_LEN = 1`）とは絶対に衝突しない固定値と
 /// して、実運用のユーザー名と紛れないよう `_` を含む形にしてある。監査ログ
 /// (`audit_log.actor_username`)にこの値がそのまま残ることで、後から
@@ -67,11 +81,11 @@ const KEY_LOCKED_DOWN: &str = "commissioning.locked_down";
 /// 合成 identity がそのまま記録される」・意図した挙動）。
 pub const SYNTHETIC_ACTOR_ID: &str = "commissioning";
 
-/// 試運転モード中に使う合成 identity を組み立てる。role は常に
-/// `Role::Admin`相当 - 設計 §5.6「actor_identity() が合成の管理者 identity
-/// を返す」・「これにより require_editor などの下流が現行のまま動く」の
-/// とおり、下流の RBAC ガード（`require_role_at_least`/`require_editor`）が
-/// 一切分岐を増やさずに「admin 相当」として通すための唯一の仕掛け。
+/// 試運転モードの grant セッションが持つ固定の identity。role は常に
+/// `Role::Admin` 相当（設計 §5.6）。banto v3.0.0 の grant は発行口で
+/// identity/role を一切受け取らず（ADR-0017「帰結」）、この値が
+/// `GrantSpec.identity` としてトークンに結び付く。監査の `actor_username` は
+/// 従来（要求ごとの合成 identity）と同じ `commissioning` になる。
 pub fn synthetic_identity() -> Identity {
     Identity {
         id: SYNTHETIC_ACTOR_ID.to_string(),
@@ -80,10 +94,54 @@ pub fn synthetic_identity() -> Identity {
     }
 }
 
+/// 試運転モードの grant の kind（ADR-0017 §2「kind の識別子」: URL
+/// `POST /api/auth/grant/commissioning`・`GET /api/auth/status` の
+/// `grants.commissioning`・`GET /api/auth/identity` の `kind`・画面の
+/// `SessionKind` で**同じ文字列**を使う）。
+pub const COMMISSIONING_GRANT_KIND: &str = "commissioning";
+
+/// 試運転 grant の種別ごとの FIFO 上限（ADR-0017 §5「`max_sessions` は閲覧公開の
+/// 256 より小さくしてよい。admin 相当のトークンの数は少ないほどよい」）。管理 UI
+/// のタブと bootstrap の自己発行（`crates/banto-hub-bootstrap`、発行後すぐ
+/// logout する）が同時に使う数として十分に大きく、上限を超えた最古は失効する。
+pub const COMMISSIONING_GRANT_MAX_SESSIONS: usize = 16;
+
+/// [`COMMISSIONING_GRANT_KIND`] を `GrantKind` として返す。
+pub fn commissioning_grant_kind() -> GrantKind {
+    GrantKind::new(COMMISSIONING_GRANT_KIND).expect("`commissioning` は grant kind の文法に合う")
+}
+
+/// 試運転モードの grant（ADR-0017 の 2 種類目）の仕様。レビューはまずここを見る:
+///
+/// - identity: [`synthetic_identity`]（固定・admin）。
+/// - 条件: **未ロックダウン**（[`CommissioningState::is_locked_down`] の否定。
+///   要求ごとにプロセス内のフラグを読むだけで DB は読まない。失敗しない）。
+/// - `require_loopback_peer: true`: 発行は loopback の peer だけ。peer 不明
+///   （`ConnectInfo` の無い起動経路・`tower::oneshot` のテスト）も 403
+///   （fail closed）。試運転モードは loopback バインドでしか起動できない
+///   （[`enforce_loopback_when_commissioning`]）が、ロックダウン後に LAN へ
+///   出してから elev で試運転へ戻した構成でも、LAN の第三者が admin 相当の
+///   トークンを得られないようにする（ADR-0017「注意点 2」）。同一ホストの
+///   リバースプロキシ配下では peer が常にプロキシなので守れない - 運用条件
+///   （ADR-0017 §6、運用ガイド §6・§19）。
+/// - `max_sessions`: [`COMMISSIONING_GRANT_MAX_SESSIONS`]。
+/// - 寿命: 既定（8h / idle 1h、remembered にしない）。
+pub fn commissioning_grant_spec(state: CommissioningState) -> GrantSpec {
+    let enabled: GrantCondition = Arc::new(move || {
+        let state = state.clone();
+        Box::pin(async move { Ok(!state.is_locked_down()) })
+    });
+    let mut spec = GrantSpec::new(commissioning_grant_kind(), synthetic_identity(), enabled);
+    spec.max_sessions = COMMISSIONING_GRANT_MAX_SESSIONS;
+    spec.require_loopback_peer = true;
+    spec
+}
+
 /// ロックダウン済みかどうかの軽量な共有ハンドル（`Arc<AtomicBool>`・
-/// `Clone`は安価）。`crate::rest`の各ルーター構築関数へ配って、リクエスト
-/// ごとの認証ミドルウェア（`actor_identity`/`require_auth_or_commissioning`/
-/// `require_role_at_least`）が DB を叩かずに毎回チェックできるようにする -
+/// `Clone`は安価）。試運転 grant の条件（[`commissioning_grant_spec`]）と、
+/// `crate::rest` の「試運転中は構成変更を即時反映する」判断
+/// （`registry_change_should_queue`、#341）・`crate::mcp` の write 系ツールの
+/// アドバイザリ化が、DB を叩かずに毎回チェックできるようにする -
 /// 状態が変わるのは [`CommissioningService::lock_down`]（プロセス内、
 /// 明示的なロックダウン操作）のときだけなので、`Arc<AtomicBool>`で
 /// 十分（`revert_to_commissioning`は elev 用で別プロセス実行前提 - 実行中の
@@ -210,23 +268,39 @@ pub struct CommissioningService {
     settings: SettingsService,
     users: UsersService,
     state: CommissioningState,
+    /// 試運転 grant のトークンを持つ `AuthState`（REST の本番の `AuthState` と
+    /// **同じもの**）。[`Self::lock_down`] がフラグの保存の直後に
+    /// `revoke_grant_tokens` を呼ぶために持つ（ADR-0017 §5「同じ関数内で」）。
+    auth: AuthState,
 }
 
 impl CommissioningService {
     /// 起動時に一度だけ呼ぶ: DB から現在の状態を解決し（[`resolve_locked_down`]）、
-    /// 以後リクエストごとに参照する[`CommissioningState`]を構築する。
-    pub async fn load(settings: SettingsService, users: UsersService) -> Result<Self, BantoError> {
+    /// 以後リクエストごとに参照する[`CommissioningState`]を構築する。`auth` は
+    /// REST に渡すものと同じ `AuthState`（試運転 grant のトークンの置き場。別の
+    /// `AuthState` を渡すとロックダウンが本物のトークンを失効できない）。
+    pub async fn load(
+        settings: SettingsService,
+        users: UsersService,
+        auth: AuthState,
+    ) -> Result<Self, BantoError> {
         let locked_down = resolve_locked_down(&settings).await?;
         Ok(Self {
             settings,
             users,
             state: CommissioningState::new(locked_down),
+            auth,
         })
     }
 
     /// リクエスト処理側（ミドルウェア・ハンドラ）に配るための軽量ハンドル。
     pub fn state(&self) -> CommissioningState {
         self.state.clone()
+    }
+
+    /// `GrantRegistry` に登録する試運転 grant の仕様（[`commissioning_grant_spec`]）。
+    pub fn grant_spec(&self) -> GrantSpec {
+        commissioning_grant_spec(self.state.clone())
     }
 
     pub fn is_locked_down(&self) -> bool {
@@ -241,16 +315,25 @@ impl CommissioningService {
     /// ログインできない状態のまま施錠して詰むことを防ぐガード
     /// （実装指示「実行時に管理者アカウントが1件以上存在することを必須と
     /// する」）。
-    pub async fn lock_down(&self) -> Result<(), BantoError> {
-        if self.is_locked_down() {
-            return Ok(());
+    ///
+    /// 順序は **「フラグの保存（DB → プロセス内）→ 直後に同じ関数内で
+    /// `revoke_grant_tokens(commissioning)`」**（ADR-0017 §2「発行と失効の
+    /// 直列化」・§5。2026-10-04 オーナー決定）。逆にしない: 先に失効すると、
+    /// 保存までの間に `enabled()` がまだ true を返し、その発行は失効の後の世代で
+    /// 挿入されて残る。保存が先なら、保存後の判定は false、保存前に true を取った
+    /// 発行は `AuthState` の世代の前進で弾かれ、どちらも残らない。戻り値は失効
+    /// させた試運転 grant のトークン数（呼び出し側が監査の detail に
+    /// `revokedGrants: n` として残す）。既にロックダウン済みなら保存はせず
+    /// 失効だけ行う（通常 0。冪等）。
+    pub async fn lock_down(&self) -> Result<usize, BantoError> {
+        if !self.is_locked_down() {
+            if !self.users.has_admin().await? {
+                return Err(no_admin_account_error());
+            }
+            self.settings.set(KEY_LOCKED_DOWN, "true").await?;
+            self.state.set_locked_down(true);
         }
-        if !self.users.has_admin().await? {
-            return Err(no_admin_account_error());
-        }
-        self.settings.set(KEY_LOCKED_DOWN, "true").await?;
-        self.state.set_locked_down(true);
-        Ok(())
+        Ok(self.auth.revoke_grant_tokens(&commissioning_grant_kind()))
     }
 
     /// ロックダウン済み → 試運転モードへ戻す**内部関数**。
@@ -270,7 +353,8 @@ impl CommissioningService {
     /// 呼び出し元は、戻した直後に「非 loopback バインドのままだと次回
     /// 起動が拒否される」（[`enforce_loopback_when_commissioning`]、設計
     /// §5.6「復帰させた場合は制約1が再び効く」・意図した副作用）ことを
-    /// 利用者に案内する責務を持つ。
+    /// 利用者に案内する責務を持つ。既存のアカウントのトークンは失効させない
+    /// （2026-10-04 オーナー決定。従来どおり）。
     #[allow(dead_code)]
     pub async fn revert_to_commissioning(&self) -> Result<(), BantoError> {
         self.settings.set(KEY_LOCKED_DOWN, "false").await?;
@@ -304,6 +388,15 @@ mod tests {
     async fn services() -> (SettingsService, UsersService) {
         let (settings, users, _pool) = services_with_pool().await;
         (settings, users)
+    }
+
+    /// テスト用の `AuthState`（ログインは常に失敗、照合なし）。試運転 grant の
+    /// トークンの置き場としてだけ使う。
+    fn auth() -> AuthState {
+        AuthState::new(
+            |_u: String, _p: String| Box::pin(async { None }),
+            banto_server::SessionValidation::DisabledNoRevocation,
+        )
     }
 
     /// [`services`]と同じだが、生の`SqlitePool`も返す - `lock_down_fails_
@@ -377,7 +470,7 @@ mod tests {
             .await
             .expect("set locked_down=true");
 
-        let service = CommissioningService::load(settings, users)
+        let service = CommissioningService::load(settings, users, auth())
             .await
             .expect("load");
         assert!(service.is_locked_down());
@@ -400,7 +493,7 @@ mod tests {
             .await
             .expect("downgrade to editor via raw SQL");
 
-        let service = CommissioningService::load(settings, users)
+        let service = CommissioningService::load(settings, users, auth())
             .await
             .expect("load");
         assert!(!service.is_locked_down());
@@ -424,7 +517,7 @@ mod tests {
             .await
             .expect("setup_first_user");
 
-        let service = CommissioningService::load(settings.clone(), users)
+        let service = CommissioningService::load(settings.clone(), users, auth())
             .await
             .expect("load");
         assert!(!service.is_locked_down());
@@ -447,7 +540,7 @@ mod tests {
             .setup_first_user("owner", "password123", "オーナー")
             .await
             .expect("setup_first_user");
-        let service = CommissioningService::load(settings, users)
+        let service = CommissioningService::load(settings, users, auth())
             .await
             .expect("load");
         service.lock_down().await.expect("first lock_down");
@@ -465,7 +558,7 @@ mod tests {
             .setup_first_user("owner", "password123", "オーナー")
             .await
             .expect("setup_first_user");
-        let service = CommissioningService::load(settings, users)
+        let service = CommissioningService::load(settings, users, auth())
             .await
             .expect("load");
         service.lock_down().await.expect("lock_down");
@@ -476,6 +569,59 @@ mod tests {
             .await
             .expect("revert_to_commissioning");
         assert!(!service.is_locked_down());
+    }
+
+    /// ADR-0017 §2・§5: ロックダウンは「保存 → 失効」。発行済みの試運転 grant の
+    /// トークンは同じ関数の中で消え、件数が戻り、以後の発行は世代の不一致でも
+    /// 条件でも通らない。
+    #[tokio::test]
+    async fn lock_down_revokes_the_commissioning_grant_tokens_after_persisting_the_flag() {
+        let (settings, users) = services().await;
+        users
+            .setup_first_user("owner", "password123", "オーナー")
+            .await
+            .expect("setup_first_user");
+        let auth = auth();
+        let service = CommissioningService::load(settings.clone(), users, auth.clone())
+            .await
+            .expect("load");
+        let spec = service.grant_spec();
+        assert!(spec.require_loopback_peer);
+        assert_eq!(spec.max_sessions, COMMISSIONING_GRANT_MAX_SESSIONS);
+        assert_eq!(spec.identity.id, SYNTHETIC_ACTOR_ID);
+        assert_eq!(spec.identity.role, Role::Admin.as_str());
+        assert!((spec.enabled)().await.expect("condition never fails"));
+
+        let observed = auth.grant_generation(&spec.kind);
+        let token_a = auth
+            .issue_grant_token(&spec, observed)
+            .expect("issued while commissioning");
+        let token_b = auth
+            .issue_grant_token(&spec, observed)
+            .expect("issued while commissioning");
+        assert_eq!(
+            auth.identity_for(&token_a).map(|i| i.id),
+            Some(SYNTHETIC_ACTOR_ID.to_string())
+        );
+
+        // 判定（true）だけ済ませて保留した発行があったとする（世代は保存前のもの）。
+        let parked = auth.grant_generation(&spec.kind);
+
+        let revoked = service.lock_down().await.expect("lock_down");
+        assert_eq!(revoked, 2);
+        assert!(service.is_locked_down());
+        assert_eq!(
+            settings.get(KEY_LOCKED_DOWN).await.expect("get").as_deref(),
+            Some("true")
+        );
+        assert!(auth.identity_for(&token_a).is_none());
+        assert!(auth.identity_for(&token_b).is_none());
+        // 保留していた発行を再開しても、世代が進んでいるので挿入されない。
+        assert!(auth.issue_grant_token(&spec, parked).is_none());
+        // 条件も閉じている。
+        assert!(!(spec.enabled)().await.expect("condition never fails"));
+        // 2 回目は保存せず失効だけ（0 件）。
+        assert_eq!(service.lock_down().await.expect("idempotent"), 0);
     }
 
     #[test]

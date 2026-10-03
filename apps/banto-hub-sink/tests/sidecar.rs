@@ -327,7 +327,7 @@ async fn test_app() -> TestApp {
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
     let settings = SettingsService::new(pool.clone());
-    let commissioning = CommissioningService::load(settings, users.clone())
+    let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
     commissioning

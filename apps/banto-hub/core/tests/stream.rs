@@ -28,8 +28,7 @@ use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::stream::{
-    StreamRevalidationTiming, COMMISSIONING_ENDED_REASON, REVOKED_CLOSE_CODE,
-    SESSION_REVOKED_REASON,
+    StreamRevalidationTiming, REVOKED_CLOSE_CODE, SESSION_REVOKED_REASON,
 };
 use banto_hub_core::users::{Role, UsersService};
 use banto_plc::modbus::simulator::Simulator;
@@ -165,8 +164,6 @@ struct TestApp {
     /// #430: サーバーと同じ router（`/api/auth/change-password` を
     /// `tower::ServiceExt::oneshot` で叩く。トークンの表はサーバーと共有）。
     router: Router,
-    /// #440: サーバーと同じ試運転モードの状態（ロックダウンの操作用）。
-    commissioning: CommissioningService,
     _env: TempEnv,
 }
 
@@ -306,7 +303,7 @@ async fn test_app_with(
     );
     let grpc_server = std::sync::Arc::new(banto_hub_core::grpc::GrpcServer::new(grpc_service));
     let settings = SettingsService::new(pool.clone());
-    let commissioning = CommissioningService::load(settings, users.clone())
+    let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
     if locked_down {
@@ -315,7 +312,6 @@ async fn test_app_with(
             .await
             .expect("lock_down the test environment");
     }
-    let commissioning_handle = commissioning.clone();
 
     let router: Router = api_router_with_controller(
         users,
@@ -363,7 +359,6 @@ async fn test_app_with(
         auth: auth_handle,
         users: users_handle,
         router: router_handle,
-        commissioning: commissioning_handle,
         _env: env,
     }
 }
@@ -1580,11 +1575,13 @@ async fn group_wildcard_subscription_only_receives_its_own_group_tag() {
 //     1〜11 で既に確認済み - ここでは認証境界だけを確認する。
 // ---------------------------------------------------------------------------
 
-/// 試運転モード中は `/api/tag-stream` が `Authorization` も
-/// `Sec-WebSocket-Protocol` も無しで接続でき、購読・データ受信まで通しで
-/// 動く - `tagMonitorAdmin.ts` が試運転モード中に行う接続と同型。
+/// 試運転モード中の `/api/tag-stream`（banto v3.0.0 ADR-0017、2026-10-04）:
+/// トークン無しの接続は **401**（迂回は無い）。試運転の grant トークン
+/// （`POST /api/auth/grant/commissioning`、loopback の peer）を
+/// `Sec-WebSocket-Protocol: bearer, <token>` で運べば接続でき、購読・データ受信
+/// まで通しで動く - `tagMonitorAdmin.ts` がブラウザから行う接続と同型。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_tag_stream_allows_unauthenticated_connection_during_commissioning() {
+async fn admin_tag_stream_accepts_the_commissioning_grant_via_subprotocol() {
     let app = test_app_unlocked("admin-stream-commissioning").await;
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 7); // 40001
@@ -1615,12 +1612,23 @@ async fn admin_tag_stream_allows_unauthenticated_connection_during_commissioning
         "collector should observe the initial simulator value"
     );
 
-    // No `Authorization` header, no `Sec-WebSocket-Protocol` offer at all -
-    // exactly what `tagMonitorAdmin.ts::connectOnce` sends while
-    // `sessionStore.commissioningMode` is true.
-    let mut ws = connect_ws(&app.ws_url("/api/tag-stream"), None)
+    // No credential at all is refused even while commissioning (the bypass is gone).
+    let err = connect_ws(&app.ws_url("/api/tag-stream"), None)
         .await
-        .expect("unauthenticated ws handshake should succeed during commissioning mode");
+        .expect_err("no auth at all must be rejected during commissioning too");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status().as_u16(), 401, "{response:?}");
+        }
+        other => panic!("expected an HTTP-level rejection, got {other:?}"),
+    }
+
+    // Exactly what `tagMonitorAdmin.ts::connectOnce` sends: the grant token the
+    // route guard obtained through `grantFallback`, as the subprotocol.
+    let token = commissioning_grant(&app).await;
+    let mut ws = connect_ws_via_subprotocol(&app.ws_url("/api/tag-stream"), &token)
+        .await
+        .expect("the commissioning grant should open the admin stream");
 
     send_json(
         &mut ws,
@@ -1642,7 +1650,7 @@ async fn admin_tag_stream_allows_unauthenticated_connection_during_commissioning
 /// `Authorization`/`Sec-WebSocket-Protocol` どちらも無い接続は401、有効な
 /// セッション bearer を `Sec-WebSocket-Protocol: bearer, <token>` で運べば
 /// 接続できる（`valid_session_token_via_subprotocol_header_authenticates_and_streams_data`
-/// と同型 - `require_auth_or_commissioning`側に追加した
+/// と同型 - `require_session`側に追加した
 /// `extract_ws_protocol_token`フォールバックの確認）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_tag_stream_requires_auth_when_locked_down() {
@@ -2029,7 +2037,10 @@ async fn session_streams_close_within_an_interval_after_delete_demote_or_passwor
         assert_open(ws).await;
     }
 
-    app.users.delete_user(deleted_id, admin_id).await.unwrap();
+    app.users
+        .delete_user(deleted_id, Some(admin_id))
+        .await
+        .unwrap();
     assert_all_closed_as_session_revoked(&mut deleted_ws, "delete").await;
 
     app.users
@@ -2114,7 +2125,7 @@ async fn session_streams_keep_delivering_while_the_account_store_errors() {
         .execute(&app.pool)
         .await
         .unwrap();
-    app.users.delete_user(id, admin_id).await.unwrap();
+    app.users.delete_user(id, Some(admin_id)).await.unwrap();
     assert_all_closed_as_session_revoked(&mut streams, "delete after the DB is back").await;
 
     sim.stop();
@@ -2163,22 +2174,99 @@ async fn session_streams_keep_delivering_while_the_account_check_does_not_return
 }
 
 // ---------------------------------------------------------------------------
-// #440: 試運転モードでトークン無しに開いたストリームの接続中の再検証
+// #440 → banto v3.0.0 ADR-0017: 試運転の grant セッションで開いたストリームの
+// 接続中の再検証（ロックダウンで `revoke_grant_tokens` → `session_revoked`）
 // ---------------------------------------------------------------------------
 
-/// 試運転モードでトークン無しに開いた `/api/tag-stream` は、試運転モードの
-/// あいだは配信が続き（照合は何度も「使える」）、ロックダウンのあと 1 周期
-/// 以内に 1008 / `commissioning_ended` で閉じる。
+/// `POST /api/auth/grant/commissioning` を loopback の peer として叩き、試運転の
+/// grant トークンを受け取る（`tower::oneshot` には `ConnectInfo` が無いので、
+/// 本番の `banto_server::start` の経路と同じ `ConnectInfo<SocketAddr>` を extensions
+/// に明示する - banto の `rest/tests.rs` と同じ手筋）。
+async fn commissioning_grant(app: &TestApp) -> String {
+    use tower::ServiceExt;
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/auth/grant/commissioning")
+        .header("X-Banto-Client", "banto")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))));
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "the commissioning grant is issued to a loopback peer while commissioning"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["success"], true, "{body}");
+    body["token"]
+        .as_str()
+        .expect("grant token in the body")
+        .to_string()
+}
+
+/// `token` で管理 REST を 1 回叩いたときの status（`GET /api/users`、admin 限定）。
+async fn admin_users_status(app: &TestApp, token: &str) -> axum::http::StatusCode {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/users")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Banto-Client", "banto")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.router.clone().oneshot(request).await.unwrap().status()
+}
+
+/// `GET /api/auth/identity` を `token` で叩いたときの (status, body)。
+async fn identity_of(app: &TestApp, token: &str) -> (axum::http::StatusCode, Value) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/auth/identity")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Banto-Client", "banto")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// 試運転の grant トークンで開いた `/api/tag-stream`（ブラウザ相当の
+/// `Sec-WebSocket-Protocol`）は、試運転モードのあいだは配信が続き（照合は
+/// 何度も「使える」）、`POST /api/commissioning/lock-down`（保存 → 失効）の
+/// あと 1 周期以内に 1008 / `session_revoked` で閉じる。ロックダウンの直後、
+/// 同じトークンでの管理 REST は 401、`GET /api/auth/identity` は `200 null`。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_commissioning_stream_closes_within_an_interval_after_lock_down() {
+async fn a_commissioning_grant_stream_closes_within_an_interval_after_lock_down() {
+    use tower::ServiceExt;
     let app =
         test_app_unlocked_with_revalidation("revalidate-commissioning", TEST_REVALIDATION).await;
     let sim = Simulator::start().await;
     seed_one_tag(&app, &sim, 21).await;
 
-    let mut ws = connect_ws(&app.ws_url("/api/tag-stream"), None)
+    let token = commissioning_grant(&app).await;
+    let (status, identity) = identity_of(&app, &token).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(identity["kind"], "commissioning", "{identity}");
+    assert_eq!(identity["id"], "commissioning", "{identity}");
+    assert_eq!(identity["role"], "admin", "{identity}");
+
+    let mut ws = connect_ws_via_subprotocol(&app.ws_url("/api/tag-stream"), &token)
         .await
-        .expect("unauthenticated ws handshake should succeed during commissioning mode");
+        .expect("the commissioning grant should open the admin stream");
     send_json(
         &mut ws,
         json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "interval", "interval_ms": 250 }),
@@ -2188,17 +2276,34 @@ async fn a_commissioning_stream_closes_within_an_interval_after_lock_down() {
     // 10 個 = 2.5 秒以上。そのあいだに照合（300ms ごと）は何度も「使える」。
     receive_values(&mut ws, 10).await;
 
-    app.commissioning
-        .lock_down()
-        .await
-        .expect("lock_down should succeed");
+    // ロックダウンは本番と同じ REST 経路（試運転の grant 自身で叩く。
+    // `CommissioningService::lock_down` が保存の直後に失効させる）。
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/commissioning/lock-down")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Banto-Client", "banto")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     let started = tokio::time::Instant::now();
+
+    // 直後: 同じトークンは失効済み。
+    assert_eq!(
+        admin_users_status(&app, &token).await,
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    let (status, identity) = identity_of(&app, &token).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(identity.is_null(), "{identity}");
+
     let (code, reason) = wait_for_close(&mut ws, close_bound()).await;
     assert_eq!(
         (code, reason.as_str()),
-        (REVOKED_CLOSE_CODE, COMMISSIONING_ENDED_REASON)
+        (REVOKED_CLOSE_CODE, SESSION_REVOKED_REASON)
     );
-    eprintln!("commissioning: closed after {:?}", started.elapsed());
+    eprintln!("commissioning grant: closed after {:?}", started.elapsed());
 
     sim.stop();
 }

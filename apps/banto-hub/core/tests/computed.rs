@@ -359,7 +359,7 @@ async fn test_app(label: &str) -> TestApp {
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let settings = SettingsService::new(pool.clone());
-    let commissioning = CommissioningService::load(settings, users.clone())
+    let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
     commissioning
@@ -1079,7 +1079,7 @@ async fn controller_test_app(label: &str) -> ControllerTestApp {
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let settings = SettingsService::new(pool.clone());
-    let commissioning = CommissioningService::load(settings, users.clone())
+    let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
     commissioning

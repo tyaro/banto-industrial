@@ -370,9 +370,10 @@ impl HubRuntime {
         // 解決する（`CommissioningService::load`・`crate::commissioning`の
         // モジュール doc 参照 - フラグ未設定は常に試運転モード、ユーザーの
         // 有無は判定に関与しない）。
-        let commissioning = CommissioningService::load(settings.clone(), users.clone())
-            .await
-            .map_err(HubStartError::Commissioning)?;
+        let commissioning =
+            CommissioningService::load(settings.clone(), users.clone(), auth.clone())
+                .await
+                .map_err(HubStartError::Commissioning)?;
 
         // 制約1（設計 §5.6）: 非 loopback バインド（`bind`が`0.0.0.0`等）
         // かつ未ロックダウンの構成は起動そのものを拒否する -
