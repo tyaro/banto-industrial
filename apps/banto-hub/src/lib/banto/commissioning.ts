@@ -4,22 +4,23 @@
  * `POST /api/commissioning/lock-down`、`apps/banto-hub/core/src/rest.rs` の
  * `commissioning_router`/`apps/banto-hub/core/src/commissioning.rs` 参照）。
  *
- * `usersAdmin.ts` と同じ規約（CSRF ヘッダ + Bearer 併用の `httpRequest`）
- * だが、この2ルートは他の admin エンドポイントと違う点が2つある:
+ * banto v3.0.0（ADR-0017）から、試運転モードはサーバーが発行する grant
+ * （`POST /api/auth/grant/commissioning`）で入る通常のセッションになった
+ * （kind は `'commissioning'`）。ルートガード（`(app)/+layout.ts`）は
+ * `grantFallback` で grant を取るだけで、この `status` は読まない。ここの
+ * `status` を読むのはタグ画面の「即時反映」の表示だけ。
  *
- * 1. `status` は**未認証でも読める**（バックエンド側で
- *    `require_auth_or_commissioning` を掛けていない - `commissioning_router`
- *    のdoc comment参照）。ただし CSRF ヘッダ（`X-Banto-Client`）は admin
- *    ルーター全体に掛かる `require_banto_client_header` の対象内なので、
- *    ここでは付ける必要がある。
- * 2. `(app)/+layout.ts` のルートガードはログイン判定より**前**にこれを
- *    叩く。まだ `AuthProvider` のトークンが存在しない/使えない前提の
- *    呼び出しなので、`fetchCommissioningStatusOrNull` は例外を握りつぶして
- *    `null`（＝取得失敗）を返す薄いラッパーとして用意する - 呼び出し側
- *    （ルートガード）が「取得に失敗したら安全側（ログイン必須）に倒す」
- *    という実装指示をこの1関数の戻り値だけで判断できるようにするため。
+ * `usersAdmin.ts` と同じ規約（CSRF ヘッダ + Bearer 併用の `httpRequest`）。
+ * `status` は未認証でも読める（`commissioning_router` の doc 参照）が、
+ * CSRF ヘッダ（`X-Banto-Client`）は admin ルーター全体に掛かるので付ける。
+ * `lock-down` は admin の bearer（試運転の grant でも可）が要る。
  */
-import { getAuthProvider, ProviderError, type ErrorBody, type Identity } from '@banto/admin-core';
+import {
+	getAuthProvider,
+	ProviderError,
+	type ErrorBody,
+	type SessionSnapshot
+} from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
 
 /**
@@ -31,30 +32,13 @@ export interface CommissioningStatus {
 	lockedDown: boolean;
 }
 
-/**
- * 試運転モード中に `crate::commissioning::synthetic_identity()` がサーバー
- * 側で使う合成 identity と**値を一致させた**クライアント側の定数。
- *
- * 注意（実装上ハマった点）: `createHttpAuthProvider()` の確認（v2 の
- * `resolve()`）は、ローカルに保存された bearer トークンが無ければ
- * `GET /api/auth/identity` を呼ぶことすらせず「セッション無し」を返す
- * （`@banto/admin-core` の `providers/http.ts` 参照）。`/api/auth/*` は
- * `banto_server` クレート側の別ルーターで、`commissioning` の認証バイパスは
- * admin/tag-space 側のミドルウェア（`actor_identity`）にしか配線されていない
- * - つまり試運転モード中に「サーバーから合成 identity が返ってくる」経路は
- * 実在しない。そのため試運転の policy runner（`commissioningPolicy.ts`）が
- * この定数を SessionController に `adopt(..., 'commissioning', ticket)` で
- * 確定させる（banto v2.0.0 #260、設計 §6.2）。これは権限を勝手に底上げしている
- * わけではない: 試運転モード中はサーバー側がどのみち無条件に admin 相当
- * として全リクエストを受け付ける（`actor_identity`参照）ので、フロント
- * 側の RBAC 表示（`$lib/permissions.ts` の `isAdmin`/`canWriteResources`）
- * をサーバーの実際の挙動に合わせているだけである。
- */
-export const COMMISSIONING_IDENTITY: Identity = {
-	id: 'commissioning',
-	name: '試運転モード',
-	role: 'admin'
-};
+/** 試運転の grant のセッションの kind（サーバーの `GET /api/auth/identity` の `kind`、grant の種別）。 */
+export const COMMISSIONING_KIND = 'commissioning';
+
+/** 試運転の grant のセッションが確定しているか（`active` かつ kind が `commissioning`）。 */
+export function isCommissioningSession(snapshot: SessionSnapshot): boolean {
+	return snapshot.status === 'active' && snapshot.kind === COMMISSIONING_KIND;
+}
 
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';
 
@@ -128,16 +112,10 @@ export async function getCommissioningStatus(signal?: AbortSignal): Promise<Comm
 }
 
 /**
- * ルートガード（`(app)/+layout.ts`）専用: `getCommissioningStatus` の
- * 例外（ネットワーク断・非2xx・応答形状不正 等、原因を問わない全て）を
- * 握りつぶして `null` にする。**「取得に失敗した場合は安全側（ログインを
- * 要求する）に倒すこと」という実装指示を、ここで一度だけ具体化する**
- * - 呼び出し側は `null` を「ロックダウン済みと同様に扱う」だけでよく、
- * try/catch をルートガード側に重複させない。
- *
- * 試運転の policy runner（`commissioningPolicy.ts`）が、ルートガード
- * （`guard`）と #445 の確認（`recheck`）の両方で使う。runner は自分の期限の
- * `signal` を必ず渡し、中断された要求も `null` になる。
+ * `getCommissioningStatus` の例外（ネットワーク断・非2xx・応答形状不正 等、
+ * 原因を問わない全て）を握りつぶして `null`（＝取得失敗）にする。表示用の
+ * 読み取りで、取得できなくても画面を止めたくない呼び出し側のための薄い
+ * ラッパー（ルートガードは使わない。認証の判断は grant の経路）。
  */
 export async function fetchCommissioningStatusOrNull(
 	signal?: AbortSignal
@@ -161,21 +139,4 @@ export async function fetchCommissioningStatusOrNull(
  */
 export async function lockDown(): Promise<CommissioningStatus> {
 	return httpRequest<CommissioningStatus>('/api/commissioning/lock-down', 'POST');
-}
-
-/**
- * ルートガードの分岐判定（純関数、`(app)/+layout.ts` と vitest が共有）。
- *
- * 3分岐:
- * - `status` が取得できて `lockedDown: false`（試運転モード確定）→
- *   ログインを迂回してよい。
- * - `status` が取得できて `lockedDown: true`（ロックダウン済み確定）→
- *   通常どおりログイン必須。
- * - `status` が `null`（取得失敗）→ **安全側に倒し**通常どおりログイン
- *   必須（ロックダウン済みと同じ扱い）。通信エラー1つで認証が丸ごと
- *   外れる事態を避けるため、「わからない」は「ロックダウン済み」と
- *   同じ扱いにする（試運転モードだと誤認する方向には絶対に倒さない）。
- */
-export function shouldBypassLoginForCommissioning(status: CommissioningStatus | null): boolean {
-	return status !== null && !status.lockedDown;
 }

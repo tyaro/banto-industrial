@@ -1,12 +1,12 @@
 /**
  * `streamClose.ts` のユニットテスト（#441）。
  *
- * 守りたいこと: close `1008` は再接続しない（`session_revoked` /
- * `commissioning_ended` はログイン状態の確認、それ以外は理由の表示）。
+ * 守りたいこと: close `1008` は再接続しない（`session_revoked` は
+ * ログイン状態の確認、それ以外は理由の表示。banto v3.0.0 で `commissioning_ended` は
+ * 無くなり、来ても未知の理由文として表示する）。
  * `1008` 以外は理由文が何であっても従来どおり再接続する。
  * #445: 再接続が続けて失敗したときの確認（いつ確かめるか・結果の扱い）。
- * banto v2.0.0 #260: 確認は SessionController の結果（`resolveSettled` /
- * 試運転の policy runner）を 3 値に写す（`sessionProbeResultOf`、設計 §6.2 の表）。
+ * banto v2.0.0 #260: 確認は SessionController の結果（`resolveSettled`）を 3 値に写す（`sessionProbeResultOf`、設計 §6.2 の表）。
  * v1 の `/api/auth/check` の分類と single-flight は controller に寄せて削除した。
  */
 import { describe, expect, it } from 'vitest';
@@ -28,7 +28,7 @@ describe('classifyStreamClose', () => {
 	const cases: Array<[number, string, StreamCloseAction['kind'], string?]> = [
 		// [close コード, 理由文, 扱い, halt のときの理由文]
 		[1008, 'session_revoked', 'recheckSession'],
-		[1008, 'commissioning_ended', 'recheckSession'],
+		[1008, 'commissioning_ended', 'halt', 'commissioning_ended'],
 		[1008, 'api_key_revoked', 'halt', 'api_key_revoked'],
 		[1008, 'api_key_expired', 'halt', 'api_key_expired'],
 		[1008, 'api_key_tripped', 'halt', 'api_key_tripped'],
@@ -168,7 +168,7 @@ describe('sessionProbeResultOf（controller の確定の結果 → 3 値。設�
 			'session'
 		],
 		[
-			'confirmed / active（試運転の合成セッション）',
+			'confirmed / active（試運転の grant のセッション）',
 			{ outcome: 'confirmed', snapshot: snapshot('active', 'commissioning'), ticket },
 			'session'
 		],

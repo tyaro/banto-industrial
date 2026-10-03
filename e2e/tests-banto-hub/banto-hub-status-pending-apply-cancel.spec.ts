@@ -10,7 +10,7 @@
  * （`docs/tag-server-design.md` §4.3）。このスイートの webServer は一度も
  * ロックダウンしないので、そのままだと `queueTagWhileRunning` が 202 ではなく
  * 200 を受け取って成立しない。かといって共有サーバーを途中でロックダウンすると
- * 後続の spec（初回セットアップ前提の smoke、認証バイパス前提のもの）が壊れる。
+ * 後続の spec（初回セットアップ前提の smoke、未ロックダウン（試運転の grant）前提のもの）が壊れる。
  * そこで `banto-hub.playwright.config.ts` に**別ポート・別 profile の2台目**と
  * `chromium-locked-down` プロジェクトを用意し、この spec だけをそこで実行する
  * （upstream banto の e2e `public-viewer` プロジェクトと同じ型）。下の

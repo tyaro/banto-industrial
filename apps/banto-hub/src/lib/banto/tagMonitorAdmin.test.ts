@@ -3,7 +3,7 @@
  *
  * 守りたいこと:
  * - close `1008` を受けたら**再接続しない**（新しい `WebSocket` を作らない）。
- *   `session_revoked` / `commissioning_ended` は `onHalt` に
+ *   `session_revoked` は `onHalt` に
  *   `recheckSession`、`api_key_*`・未知の理由文は `halt` を渡す。
  * - 通常の切断（`1006`・`1000`・`1013`）は従来どおり再接続する。
  * - 止まった購読は `resume()` で戻る（回復導線）。`disconnect()` の後の
@@ -16,17 +16,14 @@
  *   進む（最初の未ログインの待ちとは区別）。確認の最中の失敗を確認の前の結果で
  *   打ち消さない。
  *
- * ブラウザの `WebSocket` は偽物に差し替える。`$lib/session.svelte`（Svelte 5
- * rune）と `@banto/admin-core` のパッケージ入口はこの最小 vitest 構成では
- * 読めない（`commissioning.test.ts` の doc comment 参照）ので、使う部分だけ
+ * ブラウザの `WebSocket` は偽物に差し替える。`@banto/admin-core` のパッケージ入口は
+ * この最小 vitest 構成では読めない（`commissioning.test.ts` の doc comment 参照）ので、使う部分だけ
  * 差し替える。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const session = vi.hoisted(() => ({ commissioningMode: false }));
 const auth = vi.hoisted(() => ({ token: 'tok-1' as string | null }));
 
-vi.mock('$lib/session.svelte', () => ({ sessionStore: session }));
 vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
 vi.mock('@banto/admin-core', () => ({
 	getAuthProvider: () => ({ getToken: () => auth.token }),
@@ -95,7 +92,6 @@ function latest(): FakeWebSocket {
 beforeEach(() => {
 	vi.useFakeTimers();
 	FakeWebSocket.instances = [];
-	session.commissioningMode = false;
 	auth.token = 'tok-1';
 	vi.stubGlobal('WebSocket', FakeWebSocket);
 	vi.stubGlobal('location', { protocol: 'http:', host: 'hub.test' });
@@ -120,19 +116,16 @@ function start() {
 const WELL_PAST_BACKOFF_MS = 120_000;
 
 describe('connectTagStream: close 1008 で再接続しない（#441）', () => {
-	it.each([
-		['session_revoked', { kind: 'recheckSession', reason: 'session_revoked' }],
-		['commissioning_ended', { kind: 'recheckSession', reason: 'commissioning_ended' }]
-	])('1008 + %s は再接続せず、ログイン状態の確認を求める', (reason, expected) => {
+	it('1008 + session_revoked は再接続せず、ログイン状態の確認を求める', () => {
 		const { onHalt, onStatusChange } = start();
 		expect(FakeWebSocket.instances).toHaveLength(1);
 		latest().open();
-		latest().serverClose(1008, reason);
+		latest().serverClose(1008, 'session_revoked');
 
 		vi.advanceTimersByTime(WELL_PAST_BACKOFF_MS);
 		expect(FakeWebSocket.instances).toHaveLength(1);
 		expect(onHalt).toHaveBeenCalledTimes(1);
-		expect(onHalt).toHaveBeenCalledWith(expected);
+		expect(onHalt).toHaveBeenCalledWith({ kind: 'recheckSession', reason: 'session_revoked' });
 		// 画面が「接続中」のまま残らない。
 		expect(onStatusChange).toHaveBeenLastCalledWith(false, 1008);
 	});
@@ -151,18 +144,19 @@ describe('connectTagStream: close 1008 で再接続しない（#441）', () => {
 		}
 	);
 
-	it('試運転モードの /api/tag-stream でも 1008 で止まる', () => {
-		session.commissioningMode = true;
+	it('試運転の grant のトークンでも /api/v1/stream に bearer で繋ぎ、1008 + session_revoked で止まる', () => {
+		auth.token = 'grant-token';
 		const { onHalt } = start();
-		expect(latest().url).toBe('ws://hub.test/api/tag-stream');
+		expect(latest().url).toBe('ws://hub.test/api/v1/stream');
+		expect(latest().protocols).toEqual(['bearer', 'grant-token']);
 		latest().open();
-		latest().serverClose(1008, 'commissioning_ended');
+		latest().serverClose(1008, 'session_revoked');
 
 		vi.advanceTimersByTime(WELL_PAST_BACKOFF_MS);
 		expect(FakeWebSocket.instances).toHaveLength(1);
 		expect(onHalt).toHaveBeenCalledWith({
 			kind: 'recheckSession',
-			reason: 'commissioning_ended'
+			reason: 'session_revoked'
 		});
 	});
 
@@ -554,15 +548,11 @@ describe('connectTagStream: #447 のレビュー対応（トークンの消失�
 		expect(FakeWebSocket.instances).toHaveLength(1);
 	});
 
-	it('試運転モードの接続（トークンを使わない）は、トークンが無くても確認へ進まない', () => {
-		session.commissioningMode = true;
-		auth.token = null;
-		const { onHalt } = startWithProbe(async () => 'session');
-		latest().open();
-		latest().serverClose(1006);
-		vi.advanceTimersByTime(1000);
-		expect(onHalt).not.toHaveBeenCalled();
-		expect(FakeWebSocket.instances).toHaveLength(2);
+	it('試運転の grant のトークンも同じ運び方で付ける（トークン無しの接続は無い）', () => {
+		auth.token = 'grant-token';
+		startWithProbe(async () => 'session');
+		expect(latest().url).toBe('ws://hub.test/api/v1/stream');
+		expect(latest().protocols).toEqual(['bearer', 'grant-token']);
 	});
 
 	it('確認（有効）の最中に 2 回失敗していたら、結果の後すぐにもう一度確かめる', async () => {

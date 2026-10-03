@@ -32,12 +32,11 @@ vi.mock('./setup', () => ({
 }));
 
 import {
-	COMMISSIONING_IDENTITY,
+	COMMISSIONING_KIND,
 	fetchCommissioningStatusOrNull,
 	getCommissioningStatus,
 	lockDown,
-	shouldBypassLoginForCommissioning,
-	type CommissioningStatus
+	isCommissioningSession
 } from './commissioning';
 
 function mockFetchOnce(response: { status: number; ok: boolean; body: unknown }): void {
@@ -54,22 +53,6 @@ function mockFetchOnce(response: { status: number; ok: boolean; body: unknown })
 
 afterEach(() => {
 	vi.unstubAllGlobals();
-});
-
-describe('shouldBypassLoginForCommissioning（ルートガードの3分岐）', () => {
-	it('試運転モード（lockedDown: false）ならログインを迂回する', () => {
-		const status: CommissioningStatus = { lockedDown: false };
-		expect(shouldBypassLoginForCommissioning(status)).toBe(true);
-	});
-
-	it('ロックダウン済み（lockedDown: true）なら通常どおりログインを要求する', () => {
-		const status: CommissioningStatus = { lockedDown: true };
-		expect(shouldBypassLoginForCommissioning(status)).toBe(false);
-	});
-
-	it('取得失敗（null）なら安全側に倒してログインを要求する', () => {
-		expect(shouldBypassLoginForCommissioning(null)).toBe(false);
-	});
 });
 
 describe('getCommissioningStatus / fetchCommissioningStatusOrNull', () => {
@@ -134,12 +117,19 @@ describe('lockDown', () => {
 	});
 });
 
-describe('COMMISSIONING_IDENTITY', () => {
-	it('サーバー側の synthetic_identity()（id: "commissioning", role: "admin"）と値が一致する', () => {
-		expect(COMMISSIONING_IDENTITY).toEqual({
-			id: 'commissioning',
-			name: '試運転モード',
-			role: 'admin'
-		});
+describe('isCommissioningSession', () => {
+	const identity = { id: 'commissioning', name: '試運転モード', role: 'admin' };
+	it('active かつ kind が commissioning のときだけ true', () => {
+		expect(
+			isCommissioningSession({
+				status: 'active',
+				kind: COMMISSIONING_KIND,
+				identity
+			} as never)
+		).toBe(true);
+		expect(isCommissioningSession({ status: 'active', kind: 'account', identity } as never)).toBe(
+			false
+		);
+		expect(isCommissioningSession({ status: 'none', kind: null } as never)).toBe(false);
 	});
 });

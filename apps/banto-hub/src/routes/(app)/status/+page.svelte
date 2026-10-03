@@ -723,13 +723,14 @@
 					やめた代わりに、事実として状態を確認できる場所をここに残す -
 					警告ではなく「サーバー状態」の一項目として並べる。安全性は
 					損なわれない: 試運転モード中は非 loopback バインドが構造的に
-					拒否される（`enforce_loopback_when_commissioning`）ため、無認証の
-					まま外部ネットワークへ露出することはない（設計 §3.6）。
+					拒否される（`enforce_loopback_when_commissioning`）ため、外部
+					ネットワークへ露出することはない（設計 §3.6。banto v3.0.0 以降は
+					試運転中も bearer が必須で、grant は loopback の接続元にだけ出る）。
 				-->
 				<dt>試運転モード</dt>
 				<dd>
 					{#if sessionStore.commissioningMode}
-						有効（未ロックダウン・認証なしでアクセス可能）
+						有効（未ロックダウン・この PC からは試運転の grant で管理操作が可能）
 					{:else}
 						無効（認証必須）
 					{/if}

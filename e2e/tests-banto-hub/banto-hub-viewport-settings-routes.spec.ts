@@ -1,34 +1,34 @@
 /**
  * #359 段階2（設定画面のカテゴリ別ルート化）の実 DOM 固定。
  *
- * ファイル名について: `banto-hub-auth.ts` の doc comment のとおり、
- * `ensureLoggedIn` を使う新規 spec は smoke より辞書順で後になる名前にする
- * 必要がある。「settings」は `banto-hub-smoke` より辞書順で前に来てしまう
- * ため（`se` < `sm`）、`banto-hub-viewport-offcanvas.spec.ts` と同じ
- * `viewport-` prefix を借りた（このファイルもレール/タブの viewport 切替を
- * 検証する）。
+ * ファイル名について: このファイルはもう `ensureLoggedIn` を使わないが、
+ * `banto-hub-viewport-offcanvas.spec.ts` と同じ `viewport-` prefix のまま
+ * 残している（レール/タブの viewport 切替を検証する spec としての名前）。
  *
- * **実測で判明した点**: このメイン E2E サーバー（port 8799、`lock_down()`
- * を一度も呼ばない）は `ensureLoggedIn`（`POST /api/auth/setup`→`login`の
- * 実ログイン）を使っても、`(app)/+layout.ts` の試運転モードバイパス判定が
- * 「ロックダウン未実行＝試運転モード」を優先するため、`sessionStore.
- * commissioningMode` が常に true になる（合成 admin identity 経由）。
- * そのため `security` カテゴリ（試運転モードのロックダウン）は**このメイン
- * サーバーでは常に可視**で、5カテゴリ全てが揃う - 実装当初「admin ログイン
- * では commissioningMode は false」と誤って想定していたが誤りだったため
- * 修正した。ロックダウン済みサーバー（`chromium-locked-down` プロジェクト、
- * port 8802）は当初 `banto-hub-status-pending-apply-cancel.spec.ts` 専用に
- * `testMatch` で固定されていたため、「非可視カテゴリへの直接 URL は先頭の
- * 可視カテゴリへ弾かれる」ケース（`guardCategory`）はこの spec（メイン
- * サーバー）からは検証できなかった（`categories.ts` の `guardCategory`
- * 自体は appearance/account 側の `+page.ts` が「常に可視でも呼ぶ」形で
- * 経路自体は毎回通っている）。この回帰ケースは PR #371 の Copilot レビュー
- * 是正で `banto-hub-settings-guard.spec.ts` を新設し、`chromium-locked-down`
+ * **ログインしない（banto v3.0.0、ADR-0017）**: このメイン E2E サーバー（port
+ * 8799、`lock_down()` を一度も呼ばない）は未ロックダウン＝試運転モードで、
+ * loopback から繋ぐので `GET /api/auth/status` の `grants.commissioning` が
+ * true になる。この spec はトークンを注入せず（`ensureLoggedIn`/
+ * `injectAuthToken` を呼ばず）に保護画面へ `page.goto` し、`(app)/+layout.ts`
+ * のガードの `grantFallback`（`POST /api/auth/grant/commissioning`）で試運転の
+ * grant に入る。v3 ではアカウントのトークンを注入すると identity の kind が
+ * `account` になり `sessionStore.commissioningMode` が false になって
+ * `security` カテゴリが出ない（v2 までは未ロックダウンなら合成 admin が
+ * 優先されていた）。grant の経路なので kind は `commissioning` で、
+ * `security` カテゴリ（試運転モードのロックダウン）を含む5カテゴリが揃う。
+ * ロックダウン済みサーバー（`chromium-locked-down` プロジェクト、port 8802）は
+ * 当初 `banto-hub-status-pending-apply-cancel.spec.ts` 専用に `testMatch` で
+ * 固定されていたため、「非可視カテゴリへの直接 URL は先頭の可視カテゴリへ
+ * 弾かれる」ケース（`guardCategory`）はこの spec（メインサーバー）からは
+ * 検証できなかった（`categories.ts` の `guardCategory` 自体は appearance/
+ * account 側の `+page.ts` が「常に可視でも呼ぶ」形で経路自体は毎回通っている）。
+ * この回帰ケースは PR #371 の Copilot レビュー是正で
+ * `banto-hub-settings-guard.spec.ts` を新設し、`chromium-locked-down`
  * プロジェクトの `testMatch` にそちらも加える形で固定した（ロックダウン後は
- * `commissioningMode` が false になり `security` が非可視になるため）。
+ * grant が出ず `commissioningMode` が false になり `security` が非可視に
+ * なるため）。
  */
 import { expect, test, type Page } from '@playwright/test';
-import { ensureLoggedIn } from './banto-hub-auth';
 
 const WIDE_VIEWPORT = { width: 1280, height: 900 };
 const NARROW_VIEWPORT = { width: 700, height: 900 };
@@ -37,9 +37,9 @@ test.describe.serial('banto-hub 設定画面のカテゴリ別ルート', () => 
 	let page: Page;
 
 	test.beforeAll(async ({ browser }) => {
+		// ログインしない: 最初の保護画面への `page.goto` で、ガードが試運転の
+		// grant に入る（上の doc comment）。
 		page = await browser.newPage({ viewport: WIDE_VIEWPORT });
-		await page.goto('/login');
-		await ensureLoggedIn(page);
 	});
 
 	test.afterAll(async () => {
@@ -67,9 +67,9 @@ test.describe.serial('banto-hub 設定画面のカテゴリ別ルート', () => 
 		await expect(page).toHaveURL(/\/settings\/data$/);
 		await expect(page.getByRole('heading', { level: 2, name: 'データ保持' })).toBeVisible();
 
-		// このメインサーバーは lock_down() されないため commissioningMode が
-		// 常に true で、`セキュリティ` カテゴリもナビに出る（上の doc comment
-		// 参照）。
+		// このメインサーバーは lock_down() されず、grant（kind `commissioning`）で
+		// 入っているため commissioningMode が true で、`セキュリティ` カテゴリも
+		// ナビに出る（上の doc comment 参照）。
 		await page.getByRole('link', { name: 'セキュリティ' }).click();
 		await expect(page).toHaveURL(/\/settings\/security$/);
 		await expect(

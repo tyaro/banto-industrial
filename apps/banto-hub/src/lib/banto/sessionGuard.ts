@@ -3,9 +3,9 @@
  *
  * banto v2.0.0（#260）でセッションの確定は SessionController の役目になり、
  * v1 の `resolveProtectedSession` を包んでいた `decideProtectedRoute` は
- * 削除した。ガード本体は `routes/(app)/+layout.ts`（試運転の policy runner
- * `commissioningPolicy.ts` を `mode: 'guard'` で走らせ、`unverified` は 503、
- * 確定した `none` は /login）。ここに残るのは、照合できなかったとき
+ * 削除した。ガード本体は `routes/(app)/+layout.ts`（`resolveSettled` →
+ * 確定した `none` なら試運転の grant（`grantFallback`、banto v3.0.0）→ `unverified`
+ * は 503、`none` のままなら /login）。ここに残るのは、照合できなかったとき
  * （`unverified`: 照合の `500`・到達不能・10 秒の期限切れ・セッションが
  * 動き続けた）のエラー画面の本文だけ。トークン（Remember me を含む）は
  * 消さず、`routes/+error.svelte` の「再試行」でガードをもう一度走らせる。

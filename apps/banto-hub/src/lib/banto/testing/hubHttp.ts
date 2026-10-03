@@ -7,10 +7,12 @@
  * - `window` を `storage` イベントを配れる最小の偽物に差し替える（HTTP
  *   provider は作るときに `window.addEventListener('storage', ...)` で別タブの
  *   Remember me の変化を聞く。#257）。
- * - `fetch` を差し替え、`/api/commissioning/status` と `/api/auth/identity` に
+ * - `fetch` を差し替え、`/api/commissioning/status`・`/api/auth/identity`・
+ *   `/api/auth/status`・`/api/auth/grant/commissioning`・`/api/auth/logout` に
  *   答える（`commissioning.ts` の本物の HTTP ヘルパーも、provider の
- *   `resolve()` も同じ `fetch` を通る）。送った要求（パス・ヘッダ・signal）を
- *   記録する。
+ *   `resolve()`/`enterGrant()`/`status()` も同じ `fetch` を通る）。送った要求
+ *   （パス・ヘッダ・signal）を記録する。試運転モードの偽サーバーは
+ *   {@link commissioningHub}。
  * - 既定の controller を作り直し（`resetDefaultSessionController`）、新しい
  *   provider で `initBanto` する（テストごとに独立）。
  */
@@ -71,7 +73,14 @@ export function installHub() {
 		/** `GET /api/commissioning/status`。既定はロックダウン済み。 */
 		status: (async () => jsonResponse(200, { lockedDown: true })) as Route,
 		/** `GET /api/auth/identity`。既定は「セッション無し」（`200 null`）。 */
-		identity: (async () => jsonResponse(200, null)) as Route
+		identity: (async () => jsonResponse(200, null)) as Route,
+		/** `GET /api/auth/status`。既定は「初期化済み・試運転の grant は出せない」。 */
+		authStatus: (async () =>
+			jsonResponse(200, { initialized: true, grants: { commissioning: false } })) as Route,
+		/** `POST /api/auth/grant/commissioning`。既定は `403`（ロックダウン済み／loopback でない）。 */
+		grant: (async () => jsonResponse(403, { kind: 'forbidden' })) as Route,
+		/** `POST /api/auth/logout`。 */
+		logout: (async () => jsonResponse(200, { success: true })) as Route
 	};
 	const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
 		const request: SentRequest = {
@@ -82,6 +91,9 @@ export function installHub() {
 		sent.push(request);
 		if (request.path.endsWith('/api/commissioning/status')) return routes.status(request);
 		if (request.path.endsWith('/api/auth/identity')) return routes.identity(request);
+		if (request.path.endsWith('/api/auth/status')) return routes.authStatus(request);
+		if (request.path.endsWith('/api/auth/grant/commissioning')) return routes.grant(request);
+		if (request.path.endsWith('/api/auth/logout')) return routes.logout(request);
 		return jsonResponse(404, { kind: 'not_found', message: request.path });
 	});
 	vi.stubGlobal('fetch', fetchFn);
@@ -109,7 +121,12 @@ export function installHub() {
 	};
 }
 
-export const identityOf = (id: string, role = 'admin') => ({ id, name: id, role });
+export const identityOf = (id: string, role = 'admin', kind?: string) => ({
+	id,
+	name: id,
+	role,
+	...(kind === undefined ? {} : { kind })
+});
 
 /** 送られた Bearer トークンで答えを分ける `/api/auth/identity`。表に無いトークンは `401`。 */
 export function identityByToken(table: Record<string, ReturnType<typeof identityOf>>): Route {
@@ -118,4 +135,29 @@ export function identityByToken(table: Record<string, ReturnType<typeof identity
 		const identity = table[token];
 		return identity ? jsonResponse(200, identity) : jsonResponse(401, { kind: 'unauthorized' });
 	};
+}
+
+/** 試運転の grant のトークンに対する identity（サーバーの `kind: 'commissioning'`）。 */
+export const COMMISSIONING_GRANT_IDENTITY = {
+	id: 'commissioning',
+	name: '試運転モード',
+	role: 'admin',
+	kind: 'commissioning'
+};
+
+/**
+ * 試運転モード（未ロックダウン・loopback）の偽サーバー: `status` が
+ * `grants.commissioning: true`、`grant` が `{ success: true, token }`、
+ * `identity` は grant のトークンだけを試運転の identity にし、他のトークンは `401`。
+ * `extra` でアカウントのトークンなど、ほかのトークンの答えを足せる。
+ */
+export function commissioningHub(
+	hub: ReturnType<typeof installHub>,
+	token = 'grant-token',
+	extra: Record<string, ReturnType<typeof identityOf>> = {}
+): void {
+	hub.routes.authStatus = async () =>
+		jsonResponse(200, { initialized: true, grants: { commissioning: true } });
+	hub.routes.grant = async () => jsonResponse(200, { success: true, token });
+	hub.routes.identity = identityByToken({ ...extra, [token]: COMMISSIONING_GRANT_IDENTITY });
 }

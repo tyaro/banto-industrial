@@ -1,6 +1,10 @@
 /**
  * 管理系状態 API（`GET /api/status`・`GET /api/values`）のクライアント。
  *
+ * （banto v3.0.0 以降: 試運転中も管理系ルーターは bearer が必須で、画面は
+ * 試運転の grant のトークン（`(app)/+layout.ts` の `grantFallback`）で呼ぶ。
+ * 下の「未ログイン」の記述は v2 までの、認証を迂回していた時代のもの。）
+ *
  * **2026-08-31 オーナー決定（案A）: `/api/v1/*` から管理系エンドポイントへ
  * 切り替えた。** 元々は `GET /api/v1/status`・`GET /api/v1/values`（タグ
  * 空間 API）を叩いていたが、`/api/v1/*` は `require_tag_space_auth`（API
@@ -12,9 +16,7 @@
  * 要求するため、切替ウィザードまで連鎖的に塞がれる）。
  *
  * `/api/status`・`/api/values`（`apps/banto-hub/core/src/rest.rs` の
- * `admin_status`/`admin_values`、新規）は管理系ルーター（試運転モードの
- * バイパスが効き、ロックダウン済みならセッション認証が要る側）に置かれて
- * おり、ロジックは `/api/v1/*` ハンドラと共有（`compute_status`/
+ * `admin_status`/`admin_values`、新規）は管理系ルーターに置かれており、ロジックは `/api/v1/*` ハンドラと共有（`compute_status`/
  * `build_values_response`）した上で camelCase に包み直したもの。
  * `/api/v1/*` 自体はルート・認証・レスポンス形状とも一切変更していない
  * （機械クライアントの互換性を壊さないため）。

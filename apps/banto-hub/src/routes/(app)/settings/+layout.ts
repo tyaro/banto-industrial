@@ -18,7 +18,8 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   （DataSection.svelte、データ保持と構成パッケージの両ガード。全て
  *   `isAdmin(sessionStore.role)` と同値）。
  * - `security`: 元の `sessionStore.commissioningMode`
- *   （SecuritySection.svelte）。
+ *   （SecuritySection.svelte。banto v3.0.0 から、サーバーが発行した試運転の
+ *   grant のセッション = identity の `kind === 'commissioning'`）。
  */
 export async function load({ parent }) {
 	await parent();

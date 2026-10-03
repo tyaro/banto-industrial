@@ -1,14 +1,13 @@
-// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
-// `apps/admin-template/src/lib/session.svelte.ts` を写した（v2 移行 PR1d）。
+// banto v3.0.0 の admin-template
+// `apps/admin-template/src/lib/session.svelte.ts` を写した（v3 移行）。
 // banto-hub 固有の差:
 // - `publicViewer` を削った（このアプリには閲覧公開（viewer-public）が無く、
-//   `(app)/+layout.ts` も `publicViewerFallback` を使わない）。
+//   `(app)/+layout.ts` の `grantFallback` の kind は `commissioning` だけ）。
 // - `authDisabled` は `false` 固定（Tauri のログイン不要モードは無い。banto-hub
 //   は headless の axum サーバーが配信する UI だけ。v1 から同じ）。
 // - `commissioningMode` を足した（試運転モード、設計 §5.6・2026-08-30 オーナー
-//   決定）。controller が `adopt(..., 'commissioning', ticket)` で確定した合成
-//   セッションかどうか。確定させるのは `$lib/banto/commissioningPolicy.ts` の
-//   policy runner だけ（v1 の `enterCommissioningMode()` の直接代入は廃止）。
+//   決定）。サーバーが発行した試運転の grant（kind `commissioning`）で確定した
+//   セッションかどうか（v3.0.0 で policy runner の `adopt` は廃止）。
 /**
  * Current session's identity/role (Svelte 5 runes), spec M10 RBAC.
  *
@@ -47,18 +46,13 @@ class SessionStore {
 	readonly authDisabled: boolean = false;
 
 	/**
-	 * 試運転モード（未ロックダウン）の合成セッションが確定しているか
-	 * （`kind === 'commissioning'` かつ `active`）。設定画面のロックダウン
-	 * セクションの表示条件（`settings/+layout.ts`・`SecuritySection.svelte`）、
-	 * `status/+page.svelte`「サーバー状態」の表示、タグストリームの接続先
-	 * （`tagMonitorAdmin.ts`）、再接続の失敗後の確認（`sessionRecheck.ts`）が
-	 * 読む。
-	 *
-	 * サーバーは試運転モード中、認証の有無に関わらず全リクエストを合成 admin
-	 * として受け付ける（`actor_identity`）が、`/api/auth/identity` はその合成
-	 * identity を返さない（`$lib/banto/commissioning.ts` の
-	 * `COMMISSIONING_IDENTITY` の doc）。そこで provider には問い合わせず、
-	 * policy runner が `adopt()` で確定する（設計 §6.2、S-44）。
+	 * 試運転モード（未ロックダウン）の grant のセッションが確定しているか
+	 * （`kind === 'commissioning'` かつ `active`）。kind はサーバーの
+	 * `GET /api/auth/identity` の `kind`（grant の種別）由来で、アカウントの
+	 * トークンなら `'account'` になる。設定画面のロックダウンセクションの表示条件
+	 * （`settings/+layout.ts`・`SecuritySection.svelte`）、`status/+page.svelte`
+	 * 「サーバー状態」の表示が読む。確定させるのは `(app)/+layout.ts` の
+	 * `grantFallback` で、policy runner の `adopt` は廃止された（banto v3.0.0）。
 	 */
 	readonly commissioningMode: boolean = $derived.by(() => {
 		const snapshot = getSessionController().snapshot;
