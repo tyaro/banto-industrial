@@ -481,9 +481,7 @@ pub(crate) fn revoked_stream_status(reason: RevokedReason) -> Status {
             api_key_rejection_status(ApiKeyRejection::Unauthenticated(U::NotFound))
         }
         RevokedReason::ApiKeyTripped => api_key_rejection_status(ApiKeyRejection::Tripped),
-        RevokedReason::SessionRevoked | RevokedReason::CommissioningEnded => {
-            Status::unauthenticated(reason.as_str())
-        }
+        RevokedReason::SessionRevoked => Status::unauthenticated(reason.as_str()),
     }
 }
 

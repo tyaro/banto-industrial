@@ -18,12 +18,15 @@
  * ままロックダウン（`docs/tag-server-design.md` §5.6「試運転モードと
  * ロックダウン」の `POST /api/commissioning/lock-down`）を一度も行わない
  * ため、常に**試運転モード**で動く。試運転モード中は
- * `commissioning.rs::synthetic_identity` がどんなリクエスト（viewer で
- * ログインしたものも含む）も合成 admin identity として扱うため、viewer
- * ユーザーでログインしても `canWrite` は常に true になり、role による
- * 差が一切現れない（実機で確認済み - viewer ログイン後も「収集グループを
- * 追加」の常設ボタンが表示され続けた）。**このスイート全体が試運転モードの
- * バイパスに依存して動いている**（このファイル以外の全 spec も実ログイン
+ * banto v2 まで `commissioning.rs::synthetic_identity` がどんなリクエスト
+ * （viewer でログインしたものも含む）も合成 admin identity として扱い、viewer
+ * ユーザーでログインしても `canWrite` が常に true で role による差が現れな
+ * かった（実機で確認済み - viewer ログイン後も「収集グループを追加」の常設
+ * ボタンが表示され続けた）。banto v3.0.0（ADR-0017）で合成 identity は無くなり、
+ * 試運転も grant のトークン（identity は admin 相当、kind `commissioning`）に
+ * なったが、この spec の前提（常に未ロックダウンのサーバーで admin として動く）
+ * は変わらず、viewer の権限差はやはりここでは検証できない。**このスイート全体が
+ * 未ロックダウンのサーバーで動いている**（このファイル以外の全 spec も実ログイン
  * 経由のトークンを使うだけでロックダウンはしない）ため、viewer 検証のためだけに
  * ここでロックダウンすると、以降走る他 spec のふるまいを変えてしまう
  * リスクがある一方、このファイルはスイートの最後に走る前提を将来の

@@ -80,15 +80,15 @@
 //! ## 接続中の再検証（#430、banto #231 / #234 と同じ考え方）
 //!
 //! 認証（`crate::rest::require_tag_space_auth` /
-//! `crate::rest` の `require_auth_or_commissioning`）は**接続したときにしか**
+//! `crate::rest` の `require_session`）は**接続したときにしか**
 //! 走らない。ストリームは切断まで開いたままなので、失効したキー・セッション
 //! でも値の配信を受け取り続けてしまう。そこで各ストリームが
 //! [`REVALIDATE_INTERVAL`]（15 秒）ごとに自分の資格情報を照合し直し、使えないと
 //! **確認できたら** close フレーム（[`REVOKED_CLOSE_CODE`] = 1008 Policy
 //! Violation）で閉じる。理由文は API キーなら `api_key_revoked` /
 //! `api_key_expired` / `api_key_tripped` / `api_key_not_found`、セッションなら
-//! [`SESSION_REVOKED_REASON`]（`session_revoked`）、試運転モードなら
-//! [`COMMISSIONING_ENDED_REASON`]（`commissioning_ended`、#440）。
+//! [`SESSION_REVOKED_REASON`]（`session_revoked`。試運転の grant セッションも
+//! 同じ - banto v3.0.0 追従で #440 の `commissioning_ended` は無くなった）。
 //!
 //! 同じ仕組み（[`StreamCredential`] と [`Revalidator`]）を gRPC のストリーミング
 //! （`crate::grpc` の `StreamValues` / `StreamEvents`、#442）も使う。そちらは
@@ -111,15 +111,16 @@
 //!   ため）。したがって、ほかの操作が無いままアイドルの期限（通常 1 時間）が
 //!   来たセッションのストリームも、次の照合で閉じる（管理 UI はどの画面でも
 //!   REST を定期的に呼ぶので、画面を開いている間は期限が来ない）。
-//! - **試運転モードでトークン無しに開いたストリーム**（ロックダウン前の
-//!   `/api/tag-stream`、#440）: 照合は「今も試運転モードか」
-//!   （[`CommissioningStreamCredential`]）。認証層が素通しを決めるのと同じ
-//!   プロセス内のフラグを読むので、ロックダウンの後の最初の照合（1 周期以内）
-//!   で閉じる。この読み取りは失敗しない（「照合できない」は無い）。
+//! - **試運転モードの grant セッションで開いたストリーム**（ロックダウン前の
+//!   `/api/tag-stream`。banto v3.0.0 ADR-0017、2026-10-04）: 上のセッションと
+//!   同じ経路（[`SessionStreamCredential`]）。grant セッションはアカウント照合を
+//!   飛ばすので照合は期限だけを見るが、ロックダウン（`CommissioningService::
+//!   lock_down`）が `revoke_grant_tokens` でトークンを消すので、その後の最初の
+//!   照合（1 周期以内）で `session_revoked` として閉じる。#440 で持っていた
+//!   トークン無しのストリーム用の `CommissioningStreamCredential`
+//!   （`commissioning_ended`）は、トークン無しの経路が無くなったので削除した。
 //!   ロックダウンの操作から即座に閉じる通知は持たない（周期の照合だけ。
 //!   運用ガイド docs/banto-hub-operations.md「開いているストリームの再検証」）。
-//!   banto-hub は公開閲覧のセッションを発行しない（仮にあっても `revalidate`
-//!   は期限だけを見て `Ok(Some)` を返す）。
 //! - **照合できない（DB エラー・タイムアウト）ときは閉じない**。次の期限で
 //!   もう一度照合する。
 //! - **タイマーはストリーム 1 本につき 1 つ**（[`Revalidator`]、
@@ -159,7 +160,6 @@ use crate::api_keys::{
     api_key_verdict, ApiKeyCheck, ApiKeyContext, ApiKeyRejection, ApiKeysService,
     UnauthenticatedReason,
 };
-use crate::commissioning::CommissioningState;
 use crate::hub::{quality_str, CollectorManager};
 use crate::rest::TagSpaceState;
 use crate::subscribe_core::{
@@ -228,8 +228,7 @@ pub enum RecheckVerdict {
 /// | 理由 | 経路 |
 /// | --- | --- |
 /// | `ApiKeyRevoked` / `ApiKeyExpired` / `ApiKeyNotFound` / `ApiKeyTripped` | [`ApiKeyStreamCredential`] → [`api_key_recheck_verdict`]（#434 / #435 と同じ分類） |
-/// | `SessionRevoked` | [`SessionStreamCredential`] → [`session_recheck_verdict`] |
-/// | `CommissioningEnded` | [`CommissioningStreamCredential`] → [`commissioning_recheck_verdict`]（#440） |
+/// | `SessionRevoked` | [`SessionStreamCredential`] → [`session_recheck_verdict`]（試運転の grant セッションを含む） |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokedReason {
     ApiKeyRevoked,
@@ -237,7 +236,6 @@ pub enum RevokedReason {
     ApiKeyNotFound,
     ApiKeyTripped,
     SessionRevoked,
-    CommissioningEnded,
 }
 
 impl RevokedReason {
@@ -249,14 +247,13 @@ impl RevokedReason {
             Self::ApiKeyNotFound => "api_key_not_found",
             Self::ApiKeyTripped => "api_key_tripped",
             Self::SessionRevoked => SESSION_REVOKED_REASON,
-            Self::CommissioningEnded => COMMISSIONING_ENDED_REASON,
         }
     }
 }
 
 /// ストリームを開いた資格情報の照合し直し方。API キー用
-/// （[`ApiKeyStreamCredential`]）・セッション用（[`SessionStreamCredential`]）・
-/// 試運転モード用（[`CommissioningStreamCredential`]）を差し替えられるように
+/// （[`ApiKeyStreamCredential`]）・セッション用（[`SessionStreamCredential`]）を
+/// 差し替えられるように
 /// する。照合は `'static` な future を返す（ストリームのループが保持したまま、
 /// 配信と並行に進めるため）。WebSocket（[`handle_socket`]）と gRPC
 /// （`crate::grpc` の `drive_stream`）が同じ [`Revalidator`] 越しに使う。
@@ -340,11 +337,10 @@ pub fn api_key_recheck_verdict(check: ApiKeyCheck) -> RecheckVerdict {
 /// ので、理由文も 1 つ。
 pub const SESSION_REVOKED_REASON: &str = "session_revoked";
 
-/// セッション（管理 UI のログイン）で開いたストリームの資格情報（#430、
-/// tyaro/banto#239）。`crate::rest` の認証層 - `require_tag_space_auth` の
-/// セッション経路と、ロックダウン済みの `require_auth_or_commissioning` - が、
-/// 照合に通った要求の extensions に載せる（[`Self::new`]）。試運転モードで
-/// トークン無しに通した要求には載らない。
+/// セッション（管理 UI のログイン、または試運転の grant）で開いたストリームの
+/// 資格情報（#430、tyaro/banto#239）。`crate::rest` の認証層 -
+/// `require_tag_space_auth` のセッション経路と `require_session` - が、
+/// 照合に通った要求の extensions に載せる（[`Self::new`]）。
 ///
 /// 照合は `AuthState::revalidate`（このモジュールの doc comment「接続中の
 /// 再検証」）。トークンは照合に渡す以外に外へ出さない（フィールドは非公開、
@@ -389,54 +385,6 @@ pub fn session_recheck_verdict(
             );
             RecheckVerdict::Unknown
         }
-    }
-}
-
-/// 試運転モードでトークン無しに開いたストリームが、ロックダウンで閉じるときの
-/// close フレームの理由文（#440）。
-pub const COMMISSIONING_ENDED_REASON: &str = "commissioning_ended";
-
-/// 試運転モード（ロックダウン前）にトークン無しで開いたストリームの「資格
-/// 情報」（#440）。照合は「今も試運転モードか」。`crate::rest` の
-/// `require_auth_or_commissioning` が、試運転モードで素通しした要求の
-/// extensions に載せる（[`Self::new`]）。
-///
-/// 読むのは、認証層が要求ごとに見るのと同じ [`CommissioningState`]（プロセス
-/// 内の `AtomicBool`）。**素通しを決める述語と、閉じるかを決める述語が同じ**
-/// なので、「新しい接続は認証を求められるのに、古いストリームは開いたまま」
-/// （またはその逆）の食い違いが起きない。この読み取りは失敗しないので、
-/// この資格情報は [`RecheckVerdict::Unknown`] を返さない（DB の
-/// `commissioning.locked_down` は読まない。ロックダウンは
-/// `CommissioningService::lock_down` が DB に保存してからこのフラグを立てる
-/// ので、フラグが立っていれば DB にも保存済み）。
-#[derive(Clone)]
-pub(crate) struct CommissioningStreamCredential {
-    state: CommissioningState,
-}
-
-impl CommissioningStreamCredential {
-    pub(crate) fn new(state: CommissioningState) -> Self {
-        Self { state }
-    }
-}
-
-impl StreamCredential for CommissioningStreamCredential {
-    fn recheck(&self) -> futures_util::future::BoxFuture<'static, RecheckVerdict> {
-        let verdict = commissioning_recheck_verdict(self.state.is_locked_down());
-        Box::pin(std::future::ready(verdict))
-    }
-}
-
-/// 「今ロックダウン済みか」を再検証の結果に変える純関数（#440）。
-/// ロックダウン済み → 使えないと確認できた（[`COMMISSIONING_ENDED_REASON`]
-/// で閉じる）、試運転モードのまま → 使える。
-pub fn commissioning_recheck_verdict(locked_down: bool) -> RecheckVerdict {
-    if locked_down {
-        RecheckVerdict::Revoked {
-            reason: RevokedReason::CommissioningEnded,
-        }
-    } else {
-        RecheckVerdict::Valid
     }
 }
 
@@ -532,22 +480,19 @@ pub(crate) async fn ws_upgrade(
     ctx: Option<Extension<ApiKeyContext>>,
     api_key: Option<Extension<ApiKeyStreamCredential>>,
     session: Option<Extension<SessionStreamCredential>>,
-    commissioning: Option<Extension<CommissioningStreamCredential>>,
     timing: Option<Extension<StreamRevalidationTiming>>,
 ) -> Response {
     let manager = state.manager;
     let scope = ctx.map(|Extension(ctx)| ctx);
-    // #430 / #440: API キー・セッション・試運転モード（トークン無し）の
-    // どれで開いたストリームも、接続中に再検証する（このモジュールの doc
-    // comment「接続中の再検証」）。1 つの要求に載るのはどれか 1 つだけ
-    // （認証層が API キー・セッション・試運転モードの素通しのどれか 1 つで
-    // 通す）。
+    // #430: API キー・セッション（試運転の grant を含む）のどちらで開いた
+    // ストリームも、接続中に再検証する（このモジュールの doc comment「接続中の
+    // 再検証」）。1 つの要求に載るのはどちらか 1 つだけ（認証層が API キー・
+    // セッションのどちらか 1 つで通す）。
     let timing = timing.map(|Extension(timing)| timing).unwrap_or_default();
-    let credential: Option<Arc<dyn StreamCredential>> = match (api_key, session, commissioning) {
-        (Some(Extension(api_key)), _, _) => Some(Arc::new(api_key)),
-        (None, Some(Extension(session)), _) => Some(Arc::new(session)),
-        (None, None, Some(Extension(commissioning))) => Some(Arc::new(commissioning)),
-        (None, None, None) => None,
+    let credential: Option<Arc<dyn StreamCredential>> = match (api_key, session) {
+        (Some(Extension(api_key)), _) => Some(Arc::new(api_key)),
+        (None, Some(Extension(session))) => Some(Arc::new(session)),
+        (None, None) => None,
     };
     let revalidator = credential.map(|credential| Revalidator::new(credential, timing));
     // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
@@ -1428,19 +1373,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// #440: 試運転モードの照合。ロックダウン済みなら閉じる、試運転モードの
-    /// ままなら使える（「照合できない」は無い）。
-    #[test]
-    fn commissioning_state_maps_to_recheck_verdicts() {
-        assert_eq!(commissioning_recheck_verdict(false), RecheckVerdict::Valid);
-        assert_eq!(
-            commissioning_recheck_verdict(true),
-            RecheckVerdict::Revoked {
-                reason: RevokedReason::CommissioningEnded
-            }
-        );
-    }
-
     /// close フレームの理由文（wire）の表。
     #[test]
     fn revoked_reasons_map_to_close_reasons() {
@@ -1450,7 +1382,6 @@ pub(crate) mod tests {
             (RevokedReason::ApiKeyNotFound, "api_key_not_found"),
             (RevokedReason::ApiKeyTripped, "api_key_tripped"),
             (RevokedReason::SessionRevoked, "session_revoked"),
-            (RevokedReason::CommissioningEnded, "commissioning_ended"),
         ];
         for (reason, wire) in table {
             assert_eq!(reason.as_str(), wire);
@@ -1673,7 +1604,7 @@ pub(crate) mod tests {
                 name: "Alice".to_string(),
                 role: "editor".to_string(),
             },
-            public_viewer: false,
+            grant: None,
             stamp: None,
         };
         assert_eq!(

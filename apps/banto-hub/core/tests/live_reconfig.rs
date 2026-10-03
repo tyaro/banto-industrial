@@ -195,7 +195,7 @@ async fn test_app(label: &str) -> TestApp {
     let settings = SettingsService::new(pool.clone());
     // 既定は**試運転モードのまま**（`tests/mcp.rs`と同じ方針）- ロックダウン
     // 済みの挙動を見るテストだけが `app.commissioning.lock_down()` を呼ぶ。
-    let commissioning = CommissioningService::load(settings, users.clone())
+    let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
 

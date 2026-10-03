@@ -1,10 +1,11 @@
 //! [`Bootstrapper`]: the whole "zero-config" flow, app-independent.
 //!
 //! Reuse an already-issued key if there is one; otherwise ask the Hub
-//! whether it is still in commissioning mode and, only then, mint exactly
-//! one `read` key for this installation, hand the plaintext straight to the
-//! [`KeyStore`], and prove the result by reading the catalog through
-//! `banto-tagclient`.
+//! whether it is still in commissioning mode and, only then, take the
+//! commissioning grant (`POST /api/auth/grant/commissioning`, banto v3.0.0
+//! ADR-0017), mint exactly one `read` key for this installation under it,
+//! log the grant out, hand the plaintext straight to the [`KeyStore`], and
+//! prove the result by reading the catalog through `banto-tagclient`.
 
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
@@ -14,7 +15,9 @@ use banto_tagclient::{Endpoint, ErrorKind as TagErrorKind, RestClient, SecretApi
 use reqwest::Url;
 use zeroize::Zeroizing;
 
-use crate::admin::{base_url, keyring_account, AdminClient, IssueOutcome, ProbedStatus};
+use crate::admin::{
+    base_url, keyring_account, AdminClient, GrantOutcome, IssueOutcome, ProbedStatus,
+};
 use crate::error::{Error, ErrorKind, Result};
 use crate::scopes::{validate_issue_scopes, DEFAULT_SCOPES};
 use crate::state::{BootstrapState, HubRecord, KeyStore};
@@ -150,45 +153,102 @@ impl Bootstrapper {
             Err(cause) => return Ok(HubConnection::failed(HubStatus::unreachable(cause))),
         }
 
-        // 3. Revoke the key this installation issued last time **against this
+        // 3. The commissioning grant (banto v3.0.0 ADR-0017): the admin
+        //    router takes no request without a bearer, and this is the one
+        //    bearer a credential-less, same-machine caller can get. Refused
+        //    (locked down meanwhile, not loopback, no such grant) is "needs
+        //    pairing" - exactly like a locked-down status.
+        let grant = match admin.grant().await {
+            GrantOutcome::Granted(grant) => grant,
+            GrantOutcome::Refused => return Ok(HubConnection::failed(HubStatus::NeedsPairing)),
+            GrantOutcome::Failed(cause) => {
+                return Ok(HubConnection::failed(HubStatus::unreachable(cause)))
+            }
+        };
+
+        // 4.-7. Everything that needs the grant, then the grant is logged out
+        //    on EVERY path (success, refusal, keyring failure) before the
+        //    result is acted on - an admin-equivalent token must not outlive
+        //    the few requests it was taken for.
+        let issued = self
+            .issue_under_grant(
+                &admin,
+                endpoint,
+                scopes,
+                previous.as_ref(),
+                &account,
+                &grant,
+            )
+            .await;
+        admin.logout(&grant).await;
+        drop(grant);
+        let key = match issued? {
+            IssuedUnderGrant::Key(key) => key,
+            IssuedUnderGrant::Failed(connection) => return Ok(connection),
+        };
+
+        // 8. Prove it. Reachability alone is not "authenticated".
+        self.verify(&admin, endpoint, &key).await
+    }
+
+    /// Steps 4-7 of [`connect_with_scopes`](Self::connect_with_scopes) - the
+    /// part that runs under the commissioning grant. Returns the plaintext
+    /// of the new key (already in the keyring, record saved) or the failed
+    /// connection to report; `Err` only for a keyring failure (the key is
+    /// revoked again first). Split out so the caller can log the grant out
+    /// on every path with one statement.
+    async fn issue_under_grant(
+        &self,
+        admin: &AdminClient,
+        endpoint: &str,
+        scopes: &[&str],
+        previous: Option<&HubRecord>,
+        account: &str,
+        grant: &str,
+    ) -> Result<IssuedUnderGrant> {
+        // 4. Revoke the key this installation issued last time **against this
         //    same Hub**, if any. Best effort, and only ever by id (see
         //    `AdminClient::revoke` and `previous_for`).
-        if let Some(previous_id) = previous.as_ref().and_then(|record| record.key_id) {
-            if !admin.revoke(previous_id).await {
+        if let Some(previous_id) = previous.and_then(|record| record.key_id) {
+            if !admin.revoke(previous_id, grant).await {
                 tracing::info!(
                     "the previously issued banto-hub API key could not be revoked; continuing"
                 );
             }
         }
 
-        // 4. Issue, retrying once with a later timestamp if the name clashed.
-        let issued = match self.issue_with_retry(&admin, scopes).await {
+        // 5. Issue, retrying once with a later timestamp if the name clashed.
+        let issued = match self.issue_with_retry(admin, scopes, grant).await {
             IssueResult::Issued(issued) => issued,
-            IssueResult::NeedsPairing => return Ok(HubConnection::failed(HubStatus::NeedsPairing)),
+            IssueResult::NeedsPairing => {
+                return Ok(IssuedUnderGrant::Failed(HubConnection::failed(
+                    HubStatus::NeedsPairing,
+                )))
+            }
             IssueResult::Failed(cause) => {
-                return Ok(HubConnection::failed(HubStatus::unreachable(cause)))
+                return Ok(IssuedUnderGrant::Failed(HubConnection::failed(
+                    HubStatus::unreachable(cause),
+                )))
             }
         };
 
-        // 5. The plaintext goes straight to the keyring. If it cannot be
+        // 6. The plaintext goes straight to the keyring. If it cannot be
         //    kept, the key is revoked again rather than left dangling on the
         //    Hub with nobody holding it.
-        if let Err(error) = self.keys.set(&account, &issued.key) {
-            admin.revoke(issued.id).await;
+        if let Err(error) = self.keys.set(account, &issued.key) {
+            admin.revoke(issued.id, grant).await;
             return Err(error);
         }
 
-        // 6. Persist the non-secret record.
+        // 7. Persist the non-secret record.
         self.save_record(
             endpoint,
-            &account,
-            previous.as_ref(),
+            account,
+            previous,
             Some(issued.id),
             Some(issued.name.clone()),
         )?;
-
-        // 7. Prove it. Reachability alone is not "authenticated".
-        self.verify(&admin, endpoint, &issued.key).await
+        Ok(IssuedUnderGrant::Key(issued.key))
     }
 
     /// Adopt a key an administrator issued by hand - the way out of
@@ -377,9 +437,14 @@ impl Bootstrapper {
         format!("{}-{}-{issued_at}", self.app_id, self.installation_id)
     }
 
-    async fn issue_with_retry(&self, admin: &AdminClient, scopes: &[&str]) -> IssueResult {
+    async fn issue_with_retry(
+        &self,
+        admin: &AdminClient,
+        scopes: &[&str],
+        grant: &str,
+    ) -> IssueResult {
         let issued_at = unix_seconds();
-        match admin.issue(&self.key_name(issued_at), scopes).await {
+        match admin.issue(&self.key_name(issued_at), scopes, grant).await {
             IssueOutcome::Issued(issued) => IssueResult::Issued(issued),
             IssueOutcome::Unauthenticated => IssueResult::NeedsPairing,
             IssueOutcome::Failed(cause) => IssueResult::Failed(cause),
@@ -387,7 +452,10 @@ impl Bootstrapper {
             // this; one bumped-timestamp retry covers it without a loop
             // that could hammer the Hub.
             IssueOutcome::DuplicateName => {
-                match admin.issue(&self.key_name(issued_at + 1), scopes).await {
+                match admin
+                    .issue(&self.key_name(issued_at + 1), scopes, grant)
+                    .await
+                {
                     IssueOutcome::Issued(issued) => IssueResult::Issued(issued),
                     IssueOutcome::Unauthenticated => IssueResult::NeedsPairing,
                     IssueOutcome::DuplicateName => {
@@ -469,6 +537,14 @@ enum IssueResult {
     Failed(UnreachableCause),
 }
 
+/// What [`Bootstrapper::issue_under_grant`] produced.
+enum IssuedUnderGrant {
+    /// A new key, already in the keyring and recorded.
+    Key(Zeroizing<String>),
+    /// The connection to report instead (needs pairing / unreachable).
+    Failed(HubConnection),
+}
+
 /// The one place a [`RestClient`] is assembled: shared by
 /// [`Bootstrapper::verify`] (which proves a key by reading the catalog) and
 /// [`Bootstrapper::rest_client`] (which hands the same client to the
@@ -521,24 +597,42 @@ mod tests {
     use super::*;
     use crate::state::memory::{MemoryKeyStore, MemoryState};
     use crate::test_support::{
-        catalog_body, commissioning_body, duplicate_name_body, issued_body, MockHub, Reply,
+        catalog_body, commissioning_body, duplicate_name_body, grant_body, issued_body, MockHub,
+        Reply,
     };
 
     const APP_ID: &str = "chronogazer";
     const INSTALLATION: &str = "11111111-2222-4333-8444-555555555555";
     const STATUS_ROUTE: &str = "GET /api/commissioning/status";
+    const GRANT_ROUTE: &str = "POST /api/auth/grant/commissioning";
+    const LOGOUT_ROUTE: &str = "POST /api/auth/logout";
     const ISSUE_ROUTE: &str = "POST /api/api-keys";
     const TAGS_ROUTE: &str = "GET /api/v1/tags";
+    /// The commissioning grant the scripted Hub hands out (see [`routes`]).
+    const GRANT_TOKEN: &str = "grant-token-0001";
 
     fn key() -> String {
         ["bh", "_", "abcd1234", "_", "opaque-secret"].concat()
     }
 
+    /// A route table. Unless a test scripts them itself, the commissioning
+    /// grant (banto v3.0.0) is handed out and the logout is accepted, so the
+    /// pre-v3 tests keep describing the issue/revoke/catalog turns they are
+    /// about; the grant turns themselves are pinned by
+    /// `a_fresh_install_issues_one_read_key_and_zero_tags_is_connected` and
+    /// `a_refused_grant_is_needs_pairing_and_nothing_is_issued`.
     fn routes(pairs: Vec<(&str, Vec<Reply>)>) -> HashMap<String, Vec<Reply>> {
-        pairs
+        let mut table: HashMap<String, Vec<Reply>> = pairs
             .into_iter()
             .map(|(route, replies)| (route.to_owned(), replies))
-            .collect()
+            .collect();
+        table
+            .entry(GRANT_ROUTE.to_owned())
+            .or_insert_with(|| vec![(200, grant_body(GRANT_TOKEN))]);
+        table
+            .entry(LOGOUT_ROUTE.to_owned())
+            .or_insert_with(|| vec![(200, String::from(r#"{"success":true}"#))]);
+        table
     }
 
     fn harness(keys: Arc<MemoryKeyStore>, state: Arc<MemoryState>) -> Bootstrapper {
@@ -574,6 +668,7 @@ mod tests {
         assert_eq!(connection.catalog.unwrap().tags.len(), 2);
         assert_eq!(hub.hit_count(ISSUE_ROUTE), 0, "no key may be issued");
         assert_eq!(hub.hit_count(STATUS_ROUTE), 0);
+        assert_eq!(hub.hit_count(GRANT_ROUTE), 0, "no grant is taken either");
         // The operator's selection survives a reconnect.
         assert_eq!(
             state.load().unwrap().unwrap().selected_tags,
@@ -613,6 +708,38 @@ mod tests {
         );
         assert!(issue.body.contains(&format!("{APP_ID}-{INSTALLATION}-")));
         assert_eq!(issue.banto_client.as_deref(), Some("banto"));
+        // banto v3.0.0: the issue runs under the commissioning grant's bearer
+        // (status -> grant -> issue -> logout), and the grant is logged out
+        // exactly once, after the issue.
+        assert_eq!(
+            issue.authorization.as_deref(),
+            Some(&format!("Bearer {GRANT_TOKEN}")[..])
+        );
+        let grant = hub
+            .seen()
+            .into_iter()
+            .find(|request| request.route() == GRANT_ROUTE)
+            .expect("the grant must have been taken");
+        assert_eq!(grant.authorization, None, "the grant needs no bearer");
+        assert_eq!(grant.banto_client.as_deref(), Some("banto"));
+        let order: Vec<String> = hub
+            .routes_seen()
+            .into_iter()
+            .filter(|route| route != TAGS_ROUTE)
+            .collect();
+        assert_eq!(
+            order,
+            vec![STATUS_ROUTE, GRANT_ROUTE, ISSUE_ROUTE, LOGOUT_ROUTE]
+        );
+        let logout = hub
+            .seen()
+            .into_iter()
+            .find(|request| request.route() == LOGOUT_ROUTE)
+            .expect("the grant must have been logged out");
+        assert_eq!(
+            logout.authorization.as_deref(),
+            Some(&format!("Bearer {GRANT_TOKEN}")[..])
+        );
 
         // The plaintext went to the keyring and only to the keyring.
         assert_eq!(keys.len(), 1);
@@ -632,6 +759,35 @@ mod tests {
             catalog.authorization.as_deref(),
             Some(&format!("Bearer {}", key())[..])
         );
+    }
+
+    /// banto v3.0.0: the Hub reports commissioning but refuses the grant to
+    /// this caller (`403` - locked down meanwhile, or the app is not on the
+    /// Hub's machine; `404` - a Hub without the grant). That is "needs
+    /// pairing": nothing is issued, nothing is logged out, nothing is stored.
+    #[tokio::test]
+    async fn a_refused_grant_is_needs_pairing_and_nothing_is_issued() {
+        for status in [403_u16, 404] {
+            let hub = MockHub::start(routes(vec![
+                (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+                (
+                    GRANT_ROUTE,
+                    vec![(status, String::from(r#"{"kind":"forbidden"}"#))],
+                ),
+                (ISSUE_ROUTE, vec![(201, issued_body(42, "n", &key()))]),
+            ]));
+            let keys = Arc::new(MemoryKeyStore::new());
+            let state = Arc::new(MemoryState::new());
+            let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+
+            let connection = bootstrapper.connect(&hub.endpoint()).await.unwrap();
+
+            assert_eq!(connection.status, HubStatus::NeedsPairing, "grant {status}");
+            assert_eq!(hub.hit_count(ISSUE_ROUTE), 0);
+            assert_eq!(hub.hit_count(LOGOUT_ROUTE), 0);
+            assert!(keys.is_empty());
+            assert!(state.load().unwrap().is_none());
+        }
     }
 
     #[tokio::test]

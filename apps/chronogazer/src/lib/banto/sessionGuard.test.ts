@@ -7,8 +7,8 @@
  * - 503（エラー画面と再試行）にし、/login へ送らない
  * - 保存しているトークン（通常の `sessionStorage` も Remember me の
  *   `localStorage` も）を消さない
- * - `status()` / `enterPublicViewer()`（閲覧者への切り替え）を呼ばない
- *   （ChronoGazer には閲覧公開が無い）
+ * - `status()` / `enterGrant()`（grant の発行、`grantFallback`）を呼ばない
+ *   （ChronoGazer は grant を使わない。確定した `none` はそのまま /login）
  *
  * v1 は `resolveProtectedSession` を包んだ `decideProtectedRoute` を直接
  * テストしていたが、v2 で確定は SessionController の役目になったので、
@@ -97,7 +97,7 @@ function httpProviderWith(identity: () => Promise<Response>) {
 		const path = String(url);
 		paths.push(path);
 		if (path.endsWith('/api/auth/identity')) return identity();
-		return jsonResponse(200, { initialized: true, viewerPublic: true });
+		return jsonResponse(200, { initialized: true, grants: {} });
 	}) as unknown as typeof fetch;
 	useProvider(createHttpAuthProvider({ fetchFn }));
 	return { paths };
@@ -146,7 +146,7 @@ describe('(app) ガード: 照合できないときはトークンを残して�
 				message: SESSION_CHECK_FAILED_MESSAGE
 			});
 			expect(session.getItem(TOKEN_KEY)).toBe('normal-token');
-			// 閲覧者への切り替え（status → enterPublicViewer）もしない
+			// grant の発行（status → enterGrant）もしない
 			expect(paths.every((path) => path.endsWith('/api/auth/identity'))).toBe(true);
 		});
 
@@ -226,8 +226,8 @@ describe('(app) ガード: 確定したときだけ判断する', () => {
 describe('(app) ガード: Tauri の auth_resolve が DB エラーで reject したとき', () => {
 	/** A standard provider (as the Tauri one) whose `resolve()` is `answer`. */
 	function tauriLike(answer: AuthProvider['resolve']) {
-		const status = vi.fn(async () => ({ initialized: true, viewerPublic: true }));
-		const enterPublicViewer = vi.fn(async () => ({ success: true }));
+		const status = vi.fn(async () => ({ initialized: true, grants: {} }));
+		const enterGrant = vi.fn(async () => ({ success: true }));
 		const revision = '1.0' as CredentialRevision;
 		useProvider({
 			login: async () => ({ success: true }),
@@ -236,19 +236,19 @@ describe('(app) ガード: Tauri の auth_resolve が DB エラーで reject し
 			credentialRevision: () => revision,
 			onCredentialChanged: () => () => {},
 			status,
-			enterPublicViewer
+			enterGrant
 		} as AuthProvider);
-		return { status, enterPublicViewer, revision };
+		return { status, enterGrant, revision };
 	}
 
-	it('エラー画面にし、閲覧者への切り替えもログイン画面も選ばない', async () => {
-		const { status, enterPublicViewer } = tauriLike(async () => {
+	it('エラー画面にし、grant の発行もログイン画面も選ばない', async () => {
+		const { status, enterGrant } = tauriLike(async () => {
 			throw new Error('storage: database is locked');
 		});
 
 		expect(await runGuard()).toMatchObject({ kind: 'error', status: 503 });
 		expect(status).not.toHaveBeenCalled();
-		expect(enterPublicViewer).not.toHaveBeenCalled();
+		expect(enterGrant).not.toHaveBeenCalled();
 	});
 
 	it('セッション無し（none）はログイン画面へ', async () => {

@@ -174,8 +174,9 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams};
 use banto_server::{
-    auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
-    Identity, ServerEvent, SessionAccount, SessionStamp, SessionValidation,
+    auth_routes, grant_router, require_auth, require_banto_client_header, sse_route, ApiError,
+    AuthState, AuthenticatedSession, GrantKind, GrantRegistry, Identity, ServerEvent,
+    SessionAccount, SessionStamp, SessionValidation,
 };
 use banto_tags::{
     CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
@@ -185,6 +186,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
@@ -529,13 +531,28 @@ async fn users_reset_password(
     Ok(Json(ResetPasswordResponse { success: true }))
 }
 
+/// `DELETE /api/users/{id}`. The self-deletion guard needs the caller's own
+/// row id ([`UsersService::delete_user`]); a grant session (banto v3.0.0
+/// ADR-0017 §3) has a fixed identity and no row, so for it - and ONLY for it,
+/// judged by the [`AuthenticatedSession`] `require_auth` validated for this
+/// request, never by the identity's name - no acting id is passed. ChronoGazer
+/// registers no grant kind today (its `GrantRegistry` is empty), so this branch
+/// is the template's shape kept for parity with banto; an account session whose
+/// row cannot be resolved stays `Unauthorized`. The `admin` floor and "the last
+/// admin cannot be deleted" apply unchanged.
 async fn users_delete(
     State(state): State<UsersAdminState>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let acting = acting_user(&headers, &state.auth, &state.users).await?;
-    state.users.delete_user(id, acting.id).await?;
+    let is_grant = session.is_some_and(|axum::Extension(session)| session.grant.is_some());
+    let acting_id = if is_grant {
+        None
+    } else {
+        Some(acting_user(&headers, &state.auth, &state.users).await?.id)
+    };
+    state.users.delete_user(id, acting_id).await?;
     record_write(
         &state.audit,
         &state.auth,
@@ -583,25 +600,60 @@ fn users_router(users: UsersService, audit: AuditLogService, auth: AuthState) ->
 /// `UsersService` (the credential store, spec §8.2) and `AuthState` (to
 /// issue a token on `setup`'s implicit login, and to resolve the calling
 /// account on `change-password`), neither of which `banto_server::auth`
-/// knows about on its own.
+/// knows about on its own, plus the [`GrantRegistry`] (`status` reports
+/// which grant kinds may be issued to this peer, banto v3.0.0 ADR-0017 -
+/// empty for ChronoGazer, which has neither 閲覧公開 nor a commissioning mode).
 #[derive(Clone)]
 struct UsersAuthState {
     users: UsersService,
     auth: AuthState,
     audit: AuditLogService,
     allow_setup: bool,
+    registry: Arc<GrantRegistry>,
 }
 
+/// `GET /api/auth/status`: `{ initialized, grants }` (the v3.0.0 shape of
+/// banto's `AuthStatusResponse`; `viewerPublic` is gone). `grants` is `{}`
+/// here because ChronoGazer registers no grant kind - the login screen reads a
+/// missing kind as "not available" (fail closed).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthStatusResponse {
     initialized: bool,
+    grants: std::collections::BTreeMap<GrantKind, bool>,
+}
+
+/// The connection's peer address (a copy of banto-server's `pub(crate)`
+/// `MaybePeerAddr`): `Some` under `banto_server::start`'s
+/// `into_make_service_with_connect_info`, `None` under `tower::oneshot`.
+struct MaybePeerAddr(Option<std::net::SocketAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybePeerAddr {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(MaybePeerAddr(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0),
+        ))
+    }
 }
 
 async fn auth_status_handler(
     State(state): State<UsersAuthState>,
+    MaybePeerAddr(peer): MaybePeerAddr,
 ) -> Result<Json<AuthStatusResponse>, ApiError> {
     let initialized = state.users.is_initialized().await?;
-    Ok(Json(AuthStatusResponse { initialized }))
+    let grants = state.registry.availability(peer).await;
+    Ok(Json(AuthStatusResponse {
+        initialized,
+        grants,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -767,17 +819,25 @@ async fn auth_change_password_handler(
     Ok(Json(ChangePasswordResponse { success: true }))
 }
 
+/// Copy of banto v3.0.0's `banto_server::routes::extra_auth_router` (status /
+/// setup / change-password + `grant_router`), kept because ChronoGazer has its
+/// own `UsersService` (ADR-0017 "移行手順" 3). `registry` is empty today, so
+/// `POST /api/auth/grant/{kind}` answers `404` for every kind; the route is
+/// merged anyway so the wire matches the template (a future grant is one
+/// `register` call, not a new router).
 fn extra_auth_router(
     users: UsersService,
     auth: AuthState,
     audit: AuditLogService,
     allow_setup: bool,
+    registry: Arc<GrantRegistry>,
 ) -> Router {
     let state = UsersAuthState {
         users,
-        auth,
+        auth: auth.clone(),
         audit,
         allow_setup,
+        registry: registry.clone(),
     };
     Router::new()
         .route("/api/auth/status", get(auth_status_handler))
@@ -787,6 +847,7 @@ fn extra_auth_router(
             post(auth_change_password_handler),
         )
         .with_state(state)
+        .merge(grant_router(auth, registry))
 }
 
 /// State for the `/api/ui-settings/*` handlers (spec M12): `SettingsService`
@@ -2641,6 +2702,9 @@ pub fn api_router(
             auth.clone(),
             audit.clone(),
             allow_setup,
+            // banto v3.0.0 ADR-0017: ChronoGazer issues no credential-less
+            // grant (no 閲覧公開, no commissioning mode) - an empty registry.
+            Arc::new(GrantRegistry::new()),
         ))
         .merge(sse_route(auth.clone(), events))
         .merge(users_router(users, audit.clone(), auth.clone()))
@@ -6196,7 +6260,13 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let auth = user_auth_state(users.clone(), audit.clone());
-        let router = extra_auth_router(users, auth.clone(), audit, true);
+        let router = extra_auth_router(
+            users,
+            auth.clone(),
+            audit,
+            true,
+            Arc::new(GrantRegistry::new()),
+        );
         let response = router
             .oneshot(post_json(
                 "/api/auth/setup",

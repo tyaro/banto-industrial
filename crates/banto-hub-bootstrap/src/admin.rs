@@ -1,16 +1,27 @@
-//! The thin banto-hub admin layer: exactly the three requests this crate
-//! needs that `banto-tagclient` does not expose, and nothing else.
+//! The thin banto-hub admin layer: exactly the requests this crate needs
+//! that `banto-tagclient` does not expose, and nothing else.
 //!
 //! * `GET /api/commissioning/status` - readable without authentication by
 //!   design (tag-server-design.md §5.6).
-//! * `POST /api/api-keys` - authentication is bypassed while the Hub is in
-//!   commissioning mode; once locked down this answers `401` and this crate
-//!   reports [`HubStatus::NeedsPairing`](crate::HubStatus::NeedsPairing)
-//!   instead of trying anything else.
+//! * `POST /api/auth/grant/commissioning` - banto v3.0.0 (ADR-0017): while
+//!   the Hub is in commissioning mode it issues, to a **loopback** caller and
+//!   without credentials, a short-lived bearer of the synthetic `admin`
+//!   identity. Nothing on the admin router is reachable without a bearer
+//!   any more (the pre-v3 "authentication is bypassed while commissioning"
+//!   is gone), so this is the first request of every self-issue. `403`
+//!   (locked down, not loopback, or the condition closed meanwhile) and
+//!   `404` (a Hub without the grant) both end in
+//!   [`HubStatus::NeedsPairing`](crate::HubStatus::NeedsPairing).
+//! * `POST /api/api-keys` - under that grant bearer. Once locked down the
+//!   grant itself is refused, and a stale grant answers `401`; both are
+//!   reported as "needs pairing", never worked around.
 //! * `POST /api/api-keys/{id}/revoke` - idempotent, and only ever called
-//!   with an id this installation issued itself.
+//!   with an id this installation issued itself (under the same grant).
+//! * `POST /api/auth/logout` - best effort, always sent once the grant has
+//!   done its job, so an admin-equivalent token never outlives the bootstrap
+//!   (the Hub also expires it on its own).
 //!
-//! Both admin routes need `X-Banto-Client: banto` (a CSRF marker applied to
+//! Every admin route needs `X-Banto-Client: banto` (a CSRF marker applied to
 //! the whole admin router, not a credential); `/api/v1/*` does not.
 //!
 //! There is one more request here, [`AdminClient::probe_tags_status`], which
@@ -63,6 +74,14 @@ struct CommissioningStatusBody {
     locked_down: bool,
 }
 
+/// `POST /api/auth/grant/commissioning`'s success body (banto v3.0.0
+/// `grant_router`): `{ success: true, token }`.
+#[derive(Debug, Deserialize)]
+struct GrantBody {
+    success: bool,
+    token: Option<String>,
+}
+
 /// `POST /api/api-keys`'s success body. `key` is the plaintext, returned
 /// only here, only once.
 #[derive(Debug, Deserialize)]
@@ -94,6 +113,18 @@ pub(crate) struct IssuedKey {
     pub(crate) id: i64,
     pub(crate) name: String,
     pub(crate) key: Zeroizing<String>,
+}
+
+/// What `POST /api/auth/grant/commissioning` did.
+pub(crate) enum GrantOutcome {
+    /// The commissioning grant's bearer. Lives only for the issue/revoke
+    /// requests of one bootstrap and is logged out afterwards.
+    Granted(Zeroizing<String>),
+    /// `403`/`404`: the Hub will not hand out the commissioning grant to this
+    /// caller (locked down, not loopback, no such grant). Commissioning is -
+    /// for this installation - over: "needs pairing".
+    Refused,
+    Failed(UnreachableCause),
 }
 
 /// What `POST /api/api-keys` did.
@@ -259,10 +290,87 @@ impl AdminClient {
             })
     }
 
-    /// `POST /api/api-keys`. The caller has already run the scope
-    /// whitelist ([`validate_issue_scopes`](crate::validate_issue_scopes));
-    /// this function performs no policy of its own.
-    pub(crate) async fn issue(&self, name: &str, scopes: &[&str]) -> IssueOutcome {
+    /// `POST /api/auth/grant/commissioning` (banto v3.0.0 ADR-0017). No body,
+    /// no bearer; the Hub judges "still commissioning" and "peer is loopback"
+    /// itself. The token is the only credential this crate ever holds that is
+    /// not an API key, and only between this call and [`Self::logout`].
+    pub(crate) async fn grant(&self) -> GrantOutcome {
+        let url = join(&self.base, &["api", "auth", "grant", "commissioning"]);
+        let response = match self
+            .http
+            .post(url)
+            .header(BANTO_CLIENT_HEADER.0, BANTO_CLIENT_HEADER.1)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return GrantOutcome::Failed(
+                    self.classify_send_failure("commissioning_grant", &error),
+                )
+            }
+        };
+        let status = response.status();
+        if status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND {
+            self.warn_status("commissioning_grant", status);
+            return GrantOutcome::Refused;
+        }
+        if status.is_redirection() {
+            self.warn_status("commissioning_grant", status);
+            return GrantOutcome::Failed(UnreachableCause::InvalidEndpoint);
+        }
+        if !status.is_success() {
+            self.warn_status("commissioning_grant", status);
+            return GrantOutcome::Failed(UnreachableCause::ServerError);
+        }
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return GrantOutcome::Failed(
+                    self.classify_send_failure("commissioning_grant_body", &error),
+                )
+            }
+        };
+        match serde_json::from_slice::<GrantBody>(&bytes) {
+            Ok(GrantBody {
+                success: true,
+                token: Some(token),
+            }) => GrantOutcome::Granted(Zeroizing::new(token)),
+            Ok(_) => GrantOutcome::Refused,
+            Err(_) => {
+                self.warn_body("commissioning_grant", bytes.len());
+                GrantOutcome::Failed(UnreachableCause::Protocol)
+            }
+        }
+    }
+
+    /// `POST /api/auth/logout` with the commissioning grant, best effort: the
+    /// Hub answers `200` whether or not the token was still live, and a
+    /// failure here changes nothing for the caller (the token expires on its
+    /// own, and lock-down revokes it).
+    pub(crate) async fn logout(&self, grant: &str) {
+        let url = join(&self.base, &["api", "auth", "logout"]);
+        match self
+            .http
+            .post(url)
+            .header(BANTO_CLIENT_HEADER.0, BANTO_CLIENT_HEADER.1)
+            .bearer_auth(grant)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => self.warn_status("logout_grant", response.status()),
+            Err(error) => {
+                self.classify_send_failure("logout_grant", &error);
+            }
+        }
+    }
+
+    /// `POST /api/api-keys` under the commissioning `grant`. The caller has
+    /// already run the scope whitelist
+    /// ([`validate_issue_scopes`](crate::validate_issue_scopes)); this
+    /// function performs no policy of its own.
+    pub(crate) async fn issue(&self, name: &str, scopes: &[&str], grant: &str) -> IssueOutcome {
         let url = join(&self.base, &["api", "api-keys"]);
         // Serialized by hand rather than with reqwest's `json` feature:
         // `banto-tagclient` pulls reqwest in with `default-features = false`
@@ -274,6 +382,7 @@ impl AdminClient {
             .post(url)
             .header(BANTO_CLIENT_HEADER.0, BANTO_CLIENT_HEADER.1)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .bearer_auth(grant)
             .body(body)
             .send()
             .await
@@ -320,19 +429,21 @@ impl AdminClient {
         }
     }
 
-    /// `POST /api/api-keys/{id}/revoke`, best effort.
+    /// `POST /api/api-keys/{id}/revoke` under the commissioning `grant`, best
+    /// effort.
     ///
     /// Only ever called with an id read back from this installation's own
     /// [`HubRecord`](crate::HubRecord). There is deliberately no "list keys
     /// and revoke the ones whose name looks like mine" path: names are not
     /// unique to an installation the way an id is, and guessing would take
     /// another machine's credential away.
-    pub(crate) async fn revoke(&self, id: i64) -> bool {
+    pub(crate) async fn revoke(&self, id: i64, grant: &str) -> bool {
         let url = join(&self.base, &["api", "api-keys", &id.to_string(), "revoke"]);
         match self
             .http
             .post(url)
             .header(BANTO_CLIENT_HEADER.0, BANTO_CLIENT_HEADER.1)
+            .bearer_auth(grant)
             .send()
             .await
         {
@@ -483,6 +594,14 @@ mod tests {
         assert_eq!(
             join(&base, &["api", "commissioning", "status"]).as_str(),
             "http://example.test/hub/api/commissioning/status"
+        );
+        assert_eq!(
+            join(&base, &["api", "auth", "grant", "commissioning"]).as_str(),
+            "http://example.test/hub/api/auth/grant/commissioning"
+        );
+        assert_eq!(
+            join(&base, &["api", "auth", "logout"]).as_str(),
+            "http://example.test/hub/api/auth/logout"
         );
         assert_eq!(
             join(&base, &["api", "api-keys"]).as_str(),

@@ -14,7 +14,6 @@
  * | close | 理由文 | 扱い |
  * | --- | --- | --- |
  * | `1008` | `session_revoked` | 再接続しない。ログイン状態を確かめ直す（`recheckSession`） |
- * | `1008` | `commissioning_ended` | 同上（ロックダウンされたのでログインが要る状態へ） |
  * | `1008` | `api_key_*`・未知・空 | 再接続しない。理由を画面に出す（`halt`） |
  * | `1008` 以外（`1006`・`1000`・`1013` など） | 何でも | 従来どおり再接続（`reconnect`） |
  *
@@ -30,8 +29,7 @@
  * {@link RECONNECT_FAILURES_BEFORE_SESSION_PROBE} 回失敗したらログイン状態を
  * 確かめる（{@link shouldProbeSession}）。確かめるのは `sessionRecheck.ts` の
  * `probeSessionAfterReconnectFailures`（banto v2.0.0 #260 からは SessionController
- * の確認、`GET /api/auth/identity` の 1 往復。試運転中は policy runner の
- * `recheck`）で、その結果を {@link sessionProbeResultOf} で 3 値に写す。
+ * の確認、`GET /api/auth/identity` の 1 往復。試運転の grant も同じ）で、その結果を {@link sessionProbeResultOf} で 3 値に写す。
  * 3 値の扱いは {@link decideAfterSessionProbe}:
  *
  * | 確認の結果 | 扱い | 続けて失敗した回数 |
@@ -62,14 +60,13 @@ import type { ResolveResult } from '@banto/admin-core';
 export const REVOKED_CLOSE_CODE = 1008;
 
 /**
- * ログイン状態を確かめ直す理由。`session_revoked` / `commissioning_ended` は
- * サーバーの close の理由文。`reconnect_rejected` / `token_cleared`（#445）は
+ * ログイン状態を確かめ直す理由。`session_revoked` はサーバーの close の理由文
+ * （試運転の grant の失効も同じ。banto v3.0.0 で `commissioning_ended` は無くなった）。`reconnect_rejected` / `token_cleared`（#445）は
  * クライアントが付ける: 再接続が続けて拒否され、確かめたら失効していた／
  * 再接続の最中に保存しているトークンが消えた。サーバーがこれらの理由文で
  * 閉じることは無い（{@link classifyStreamClose} は受け付けない）。
  */
-export type SessionRecheckReason =
-	'session_revoked' | 'commissioning_ended' | 'reconnect_rejected' | 'token_cleared';
+export type SessionRecheckReason = 'session_revoked' | 'reconnect_rejected' | 'token_cleared';
 
 export type StreamCloseAction =
 	/** 通常の切断。従来どおり再接続する。 */
@@ -85,8 +82,7 @@ export type StreamCloseAction =
 
 /** サーバーが送る理由文のうち、ログイン状態を確かめ直すもの。 */
 const SESSION_RECHECK_REASONS: ReadonlySet<string> = new Set<SessionRecheckReason>([
-	'session_revoked',
-	'commissioning_ended'
+	'session_revoked'
 ]);
 
 /** `api_key_*` の理由文ごとの説明（`stream.rs` の `api_key_verdict` の分類と同じ 4 つ）。 */
@@ -122,16 +118,14 @@ export const RECONNECT_FAILURES_BEFORE_SESSION_PROBE = 2;
 /**
  * 再接続が失敗したときの、ログイン状態の確認の結果（3 値）。
  *
- * - `session`: まだ有効（確定した `active`。試運転の合成セッションを含む）
+ * - `session`: まだ有効（確定した `active`。試運転の grant のセッションを含む）
  * - `login`: 失効を確認できた（確定した `none`）
- * - `unverified`: 照合できない（到達不能・`500`・期限切れ・試運転の状態が
- *   読めない）。確定状態は変わっていない
+ * - `unverified`: 照合できない（到達不能・`500`・期限切れ）。確定状態は変わっていない
  */
 export type SessionProbeResult = 'session' | 'login' | 'unverified';
 
 /**
- * SessionController の確定の結果（`resolveSettled` または試運転の policy runner
- * の `recheck`）を 3 値に写す（設計 §6.2 の表: `confirmed/none → 'login'`、
+ * SessionController の確定の結果（`resolveSettled`）を 3 値に写す（設計 §6.2 の表: `confirmed/none → 'login'`、
  * `confirmed/active → 'session'`、`unverified → 'unverified'`）。純関数。
  *
  * `confirmed` の snapshot は `none` か `active` だけ（`unknown` は確定ではない）。

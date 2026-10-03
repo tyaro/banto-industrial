@@ -304,7 +304,7 @@ async fn test_app(label: &str) -> TestApp {
     // （queue + 明示適用、こちらも無停止）は `tests/live_reconfig.rs` が
     // 受け持つ。認証そのものは各リクエストが `token` を送るので、
     // 試運転モードのバイパスがあっても従来どおり通る。
-    let commissioning = CommissioningService::load(settings, users.clone())
+    let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
 

@@ -1,13 +1,13 @@
 /**
- * banto-hub のログアウトの入口（`hubLogout.ts`、banto v2.0.0 #260）のテスト。
+ * banto-hub のログアウトの入口（`hubLogout.ts`、banto v3.0.0）のテスト。
  * 既定の SessionController を本物のまま使う。
  *
  * 守りたいこと:
  * - 通常: admin-template の `logoutAndLeave` と同じ（確定した `none` のときだけ /login、
  *   別のセッションが確定していれば留まる）。
- * - 試運転の合成セッションの間: `logoutAndLeave` では /login に行けない（adopt 中の確定は
- *   常に試運転のセッション）ので、v1 と同じくトークンを捨ててログイン画面を見せる。
- *   試運転の合成セッションは終わらない（generation も動かない）。
+ * - 試運転の grant のセッション（kind `commissioning`）の間も同じ: `logout()` が
+ *   トークンを捨て、確定した `none` → /login。試運転のセッションは残らない
+ *   （次の保護画面への遷移でガードの `grantFallback` が無言で再発行する）。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -20,18 +20,23 @@ import { resetDefaultSessionController } from '../../../node_modules/@banto/admi
 
 vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
 
-import { COMMISSIONING_IDENTITY } from './commissioning';
-import { COMMISSIONING_KIND, isCommissioningSession } from './commissioningPolicy';
+import { isCommissioningSession } from './commissioning';
 import { hubLogout } from './hubLogout';
 import { isLeavingForLogin } from './logout.svelte';
-import { accountAnswer, ALICE, fakeAuthProvider, noneAnswer } from './testing/fakeAuthProvider';
+import {
+	accountAnswer,
+	ALICE,
+	fakeAuthProvider,
+	grantAnswer,
+	noneAnswer
+} from './testing/fakeAuthProvider';
 
 let provider: ReturnType<typeof fakeAuthProvider>;
 let logout: ReturnType<typeof vi.fn<() => Promise<void>>>;
 
-beforeEach(() => {
+function setup(initial = accountAnswer(ALICE)): void {
 	resetDefaultSessionController();
-	provider = fakeAuthProvider(accountAnswer(ALICE));
+	provider = fakeAuthProvider(initial);
 	logout = vi.fn(async () => {
 		// ログアウトでトークンが消えた: 次の確認は none、資格情報の変化を通知する。
 		provider.setAnswer(noneAnswer);
@@ -39,7 +44,9 @@ beforeEach(() => {
 	});
 	provider.auth.logout = logout;
 	initBanto({ dataProvider: {} as DataProvider, authProvider: provider.auth, resources: [] });
-});
+}
+
+beforeEach(() => setup());
 
 describe('hubLogout', () => {
 	it('通常: logout → 確定した none → /login', async () => {
@@ -68,12 +75,11 @@ describe('hubLogout', () => {
 		expect(controller.snapshot.identity?.id).toBe('bob');
 	});
 
-	it('試運転の合成セッションの間: トークンを捨ててログイン画面を見せる。試運転は終わらない', async () => {
+	it('試運転の grant のセッションの間: logout → none → /login。試運転のセッションは残らない', async () => {
+		setup(grantAnswer());
 		const controller = getSessionController();
-		expect(controller.adopt(COMMISSIONING_IDENTITY, COMMISSIONING_KIND, controller.ticket())).toBe(
-			true
-		);
-		const generation = controller.snapshot.generation;
+		await resolveSettled(controller);
+		expect(isCommissioningSession(controller.snapshot)).toBe(true);
 		let leavingWhileGoing = false;
 		const goToLogin = vi.fn(async () => {
 			leavingWhileGoing = isLeavingForLogin();
@@ -83,14 +89,19 @@ describe('hubLogout', () => {
 		expect(logout).toHaveBeenCalledTimes(1);
 		expect(goToLogin).toHaveBeenCalledTimes(1);
 		expect(leavingWhileGoing).toBe(true);
-		expect(isCommissioningSession(controller.snapshot)).toBe(true);
-		expect(controller.snapshot.generation).toBe(generation);
+		expect(isCommissioningSession(controller.snapshot)).toBe(false);
+		expect(controller.snapshot.status).toBe('none');
 	});
 
-	it('試運転の間はトークンの破棄に失敗しても、ログイン画面へは移れる', async () => {
+	it('試運転の間はトークンの破棄（logout）が失敗しても、確認が none なら /login へ移る', async () => {
+		setup(grantAnswer());
 		const controller = getSessionController();
-		controller.adopt(COMMISSIONING_IDENTITY, COMMISSIONING_KIND, controller.ticket());
-		logout.mockRejectedValue(new Error('network'));
+		await resolveSettled(controller);
+		logout.mockImplementation(async () => {
+			provider.setAnswer(noneAnswer);
+			provider.change();
+			throw new Error('network');
+		});
 		const goToLogin = vi.fn(async () => {});
 		expect(await hubLogout(goToLogin)).toBe('left');
 		expect(goToLogin).toHaveBeenCalledTimes(1);

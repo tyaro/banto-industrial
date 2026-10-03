@@ -2,8 +2,9 @@
  * テスト専用（アプリからは import しない）: v2 の標準 `AuthProvider`
  * （`resolve`・`credentialRevision`・`onCredentialChanged`）のメモリ上の偽物。
  * SessionController（`createSessionController`）を**本物のまま**走らせて、
- * 試運転の policy runner・ロックダウンの順序・再接続の失敗後の確認を確かめる
- * ために使う（モックの controller では adopt/end・ticket・世代の規則が見えない）。
+ * ログアウトの順序・ロックダウンの後の確認を確かめるために使う（モックの
+ * controller では ticket・世代の規則が見えない）。試運転の grant のセッション
+ * （kind `commissioning`）は {@link grantAnswer}。
  *
  * - `answer`: 次の `resolve()` が返す答えを決める（既定は `none`）。revision を
  *   受け取り、`checked`/`current` に入れる。
@@ -21,6 +22,19 @@ export const noneAnswer: Answer = (r) => ({ status: 'none', checked: r, current:
 export const accountAnswer =
 	(identity: Identity): Answer =>
 	(r) => ({ status: 'active', checked: r, current: r, identity, kind: 'account' });
+
+/**
+ * サーバーが発行した grant のセッションの答え（`GET /api/auth/identity` の
+ * `kind` が grant の種別。banto v3.0.0、ADR-0017）。既定は試運転の grant。
+ */
+export const grantAnswer =
+	(kind = 'commissioning'): Answer =>
+	(r) => ({
+		status: 'active',
+		checked: r,
+		current: r,
+		identity: { id: 'commissioning', name: '試運転モード', role: 'admin', kind }
+	});
 
 export const ALICE: Identity = { id: 'alice', name: 'Alice', role: 'admin' };
 

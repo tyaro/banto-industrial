@@ -3723,10 +3723,21 @@ async fn tool_lock_down(
         ));
     }
 
-    if let Err(err) = state.commissioning_service.lock_down().await {
-        return Ok(banto_error_tool_error(&err));
-    }
-    audit_config_action(state, ctx, "lock_down", "commissioning", Some("1"), None).await;
+    // ADR-0017 §5: `lock_down` は保存の直後に試運転 grant のトークンを失効させる。
+    // 件数は REST（`commissioning_lock_down`）と同じく監査の detail に残す。
+    let revoked = match state.commissioning_service.lock_down().await {
+        Ok(revoked) => revoked,
+        Err(err) => return Ok(banto_error_tool_error(&err)),
+    };
+    audit_config_action(
+        state,
+        ctx,
+        "lock_down",
+        "commissioning",
+        Some("1"),
+        Some(json!({ "revokedGrants": revoked })),
+    )
+    .await;
     Ok(tool_ok(json!({ "lockedDown": true })))
 }
 

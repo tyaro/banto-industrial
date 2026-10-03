@@ -370,9 +370,10 @@ impl HubRuntime {
         // 解決する（`CommissioningService::load`・`crate::commissioning`の
         // モジュール doc 参照 - フラグ未設定は常に試運転モード、ユーザーの
         // 有無は判定に関与しない）。
-        let commissioning = CommissioningService::load(settings.clone(), users.clone())
-            .await
-            .map_err(HubStartError::Commissioning)?;
+        let commissioning =
+            CommissioningService::load(settings.clone(), users.clone(), auth.clone())
+                .await
+                .map_err(HubStartError::Commissioning)?;
 
         // 制約1（設計 §5.6）: 非 loopback バインド（`bind`が`0.0.0.0`等）
         // かつ未ロックダウンの構成は起動そのものを拒否する -
@@ -397,8 +398,9 @@ impl HubRuntime {
         // モードで動いていることを一目で分かるように警告を出す。
         if !commissioning.is_locked_down() {
             log_line(
-                "banto-hub: [WARN] 試運転モード: 認証なしで誰でも管理 UI / 管理 REST を\
-                 操作できます。運用に入る前に管理 UI からロックダウンを実行してください\
+                "banto-hub: [WARN] 試運転モード: この PC からはログインなしで（試運転の grant で）\
+                 管理 UI / 管理 REST を操作できます。運用に入る前に管理 UI からロックダウンを\
+                 実行してください\
                  （docs/tag-server-design.md §5.6「試運転モードとロックダウン」）。",
             );
         }

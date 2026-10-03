@@ -261,8 +261,8 @@ describe('resolveReadOnlyTreeContextMenuItems', () => {
  * が `canWrite` の値で `resolveTreeContextMenuItems`/
  * `resolveReadOnlyTreeContextMenuItems` のどちらに委譲するかを固定する。
  * E2E（`banto-hub-tags-tree-context-menu.spec.ts`）は E2E 環境が常に試運転
- * モード（`commissioning.rs::synthetic_identity` が全リクエストを admin
- * 相当として扱う - 設計 §5.6）で動くため、viewer ロールの実際の権限差を
+ * モード（試運転の grant の identity が admin 相当 - 設計 §5.6、banto
+ * v3.0.0）で動くため、viewer ロールの実際の権限差を
  * 検証できない。この分岐が「viewer には書き込み系メニューが絶対に出ない」
  * ことを保証する最終防衛線になる - `canWriteResources('viewer')` が
  * `false` であることも合わせて固定し、`$lib/permissions.ts` 側の定義が

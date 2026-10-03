@@ -1,7 +1,9 @@
-// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
-// `apps/admin-template/src/lib/session.svelte.ts` からコピー（v2 移行 PR1c）。
+// banto v3.0.0 の admin-template
+// `apps/admin-template/src/lib/session.svelte.ts` からコピー（v3 移行）。
 // chronogazer 固有の差: `publicViewer` を削った（このアプリには閲覧公開
-// （viewer-public）が無い。`(app)/+layout.ts` も `publicViewerFallback` を使わない）。
+// （viewer-public）が無い。`(app)/+layout.ts` も `grantFallback` を使わない。
+// セッションの種別は `Identity.kind`/`snapshot.kind`（サーバー由来）で、ここでは
+// 読まない）。
 /**
  * Current session's identity/role (Svelte 5 runes), spec M10 RBAC.
  *

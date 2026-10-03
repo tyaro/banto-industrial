@@ -26,7 +26,7 @@
 		// /login only when it is confirmed `none` (another tab's login
 		// confirmed meanwhile stays). `'stayed'`/`'unverified'` are told with a
 		// toast - see `$lib/banto/logout.svelte.ts` for the full sequence.
-		// 試運転モードの合成セッションの間は v1 と同じ（`$lib/banto/hubLogout.ts`）。
+		// 試運転の grant のセッションも同じ流れ（`$lib/banto/hubLogout.ts`）。
 		await hubLogout(() => goto('/login'));
 	}
 </script>

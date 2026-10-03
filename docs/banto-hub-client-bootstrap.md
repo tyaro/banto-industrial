@@ -1,12 +1,12 @@
 # Banto クライアントの Hub 自動接続（#332）
 
-状態: **chronogazer 分のみ実装済み・実機確認済み（2026-09-17、§11）**（共有 crate `crates/banto-hub-bootstrap` + chronogazer の
+状態: **2026-10-04: banto v3.0.0（ADR-0017）追従で、自己発行は「status → 試運転の grant → grant の bearer で発行 → logout」の 4 手順になった（§1・§3・§4・§8）。banto-hub 側は `POST /api/auth/grant/commissioning` が増え、試運転中の `POST /api/api-keys` に bearer が要るようになった（実機未確認、Rust の単体・統合テストで固定）。** chronogazer 分のみ実装済み・実機確認済み（2026-09-17、§11）（共有 crate `crates/banto-hub-bootstrap` + chronogazer の
 設定カテゴリ「Hub 接続」）。**選んだタグの購読（#383 段階1）まで実装済み** — §10 参照（2026-09-30: 購読の鍵は stable ID から external name に変わった、§10.1）。
 **Hub がキーを使えないと言って購読を打ち切ったときの理由ごとの案内（#446）まで実装済み** — §10.6 参照。
 **relay-wright への配線は保留**（relay-wright 自体を 2026-09-17 の
 オーナー決定で凍結、2026-09-24 に main から外してタグ
 `archive/relay-wright-2026-09-24` に退避、plan.md §4b）。
-**banto-hub 側は変更ゼロ**（`apps/banto-hub/core/tests/client_bootstrap.rs` が前提を回帰固定）。
+**banto-hub 側の前提は `apps/banto-hub/core/tests/client_bootstrap.rs` が回帰固定**（2026-10-04 までは「変更ゼロ」だったが、grant 化で Hub 側にも発行口が増えた）。
 最終更新: 2026-09-26（#449 のオーナーレビュー: 判定の対象のキーを名指しし、別のキー・別の時点の判定を混ぜない。再レビュー: 画面の接続の状態を観測時点と対で持ち、確認し直しの失敗を画面に出す。3 回目: 往復は成功したが中身は失敗、でも再取得の導線を残す。§10.6）
 2026-09-25（#446: close 1008 の理由の保持・見張りの再試行の頻度・画面の案内を §10.5 / §10.6 に追加。接続の状態に `keyTripped` を足した（§5、wire 追加））
 2026-09-24（relay-wright の main からの退避を反映。本文の実装状況に変更なし）
@@ -21,16 +21,24 @@ Banto アプリ（chronogazer / relay-wright）が banto-hub のタグを読む�
 なくす。
 
 ```text
-アプリ                                   banto-hub
-  │  GET /api/commissioning/status  ──▶   未認証で読める（設計 §5.6）
+アプリ                                        banto-hub
+  │  GET /api/commissioning/status        ──▶  未認証で読める（設計 §5.6）
   │  ◀── { "lockedDown": false }
-  │  POST /api/api-keys              ──▶  試運転中は bearer 認証をバイパス
-  │      { name, scopes: ["read"] }        （synthetic admin identity）
-  │  ◀── { id, name, prefix, scopes, key }  平文 key はこの応答限り
-  │  KeyStore::set                          → OS キーリング
-  │  GET /api/v1/tags（banto-tagclient） ─▶ API キー認証（従来どおり）
-  │  ◀── 200 { "tags": [...] }              タグ 0 件でも 200 + []
+  │  POST /api/auth/grant/commissioning   ──▶  試運転中・loopback の接続元にだけ
+  │  ◀── { "success": true, "token" }          合成 admin の grant（banto v3.0.0 ADR-0017）
+  │  POST /api/api-keys  (Bearer <grant>) ──▶  grant の bearer で発行
+  │      { name, scopes: ["read"] }
+  │  ◀── { id, name, prefix, scopes, key }     平文 key はこの応答限り
+  │  POST /api/auth/logout (Bearer <grant>) ─▶ grant を捨てる（best effort、必ず送る）
+  │  KeyStore::set                             → OS キーリング
+  │  GET /api/v1/tags（banto-tagclient） ────▶ API キー認証（従来どおり）
+  │  ◀── 200 { "tags": [...] }                 タグ 0 件でも 200 + []
 ```
+
+2026-10-04 までは試運転中の `POST /api/api-keys` に bearer が要らなかった（Hub が未ロック
+ダウン中の管理 REST を無認証で通していた）。banto v3.0.0 追従でその迂回は無くなり、
+代わりに試運転の grant を先に取る。grant の 403（ロックダウン済み・loopback でない・
+Hub に無い = 404）は `NeedsPairing`。
 
 ## 2. issue の採用方針との対応
 
@@ -91,9 +99,11 @@ pub struct HubRecord {                     // ← キー欄が無いことが「
 
 HTTP の内訳:
 
-- 管理 API 2 つ（`/api/commissioning/status`、`/api/api-keys[/{id}/revoke]`）だけを crate 内の
-  薄い `reqwest` 層で叩く。どちらにも `X-Banto-Client: banto` を付ける（管理ルーター全体に
-  掛かる CSRF マーカー。`/api/v1/*` には付けない）。
+- 管理 API（`/api/commissioning/status`、`/api/auth/grant/commissioning`、
+  `/api/api-keys[/{id}/revoke]`、`/api/auth/logout`）だけを crate 内の薄い `reqwest` 層で
+  叩く。どれにも `X-Banto-Client: banto` を付ける（管理ルーター全体に掛かる CSRF マーカー。
+  `/api/v1/*` には付けない）。grant のトークンは `issue`/`revoke`/`logout` に `Authorization`
+  として付け、`Zeroizing` に包んで logout の直後に捨てる。
 - **catalog は `banto_tagclient::RestClient::fetch_catalog()` を使う**。この crate は catalog の
   ボディを自前で解釈しない。
 - 例外が 1 つだけある: `fetch_catalog` は 401 と 403 を `ErrorKind::Unauthorized` 1 つに畳むため、
@@ -107,10 +117,11 @@ HTTP の内訳:
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | スコープ             | `["read"]` 固定。`ISSUABLE_SCOPES` のホワイトリストに無いものはネットワーク呼び出し前に `Err`。`admin` / `write:*` は将来も追加しない（`admin` キーは MCP 経由でロックダウンを恒久的に迂回できるため）。                                                                                                                                                                                                                                                                                                                                          |
 | 再利用               | `connect` はまず keyring を見る。使えるキーがあれば `POST /api/api-keys` を一切呼ばない（起動ごとの発行をしない）。                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| 発行の条件           | キーが無い（または無効）かつ `lockedDown: false` のときだけ。`lockedDown: true` なら発行せず `NeedsPairing`。状態が取れないとき（通信障害）も発行しない。                                                                                                                                                                                                                                                                                                                                                                                         |
+| 発行の条件           | キーが無い（または無効）かつ `lockedDown: false` かつ試運転の grant が取れた（`POST /api/auth/grant/commissioning` が 200）ときだけ。`lockedDown: true`・grant が 403/404 なら発行せず `NeedsPairing`。状態が取れないとき（通信障害）も発行しない。                                                                                                                                                                                                                                                                                               |
+| grant の後始末       | 発行（と旧キーの失効、keyring 失敗時の失効）が終わったら、成否に関わらず `POST /api/auth/logout` で grant を捨てる（best effort）。admin 相当のトークンを bootstrap の数要求より長く持たない。                                                                                                                                                                                                                                                                                                                                                    |
 | キー名               | `{app_id}-{installation_id}-{発行時刻(unix秒)}`。時刻を含むので keyring 喪失後の再発行で同名衝突しない。                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | 名前重複             | Hub は 409 ではなく `Validation { field: "name" }` を返す。時刻を 1 秒進めて **1 回だけ**再試行する。                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| 旧キーの失効         | 設定に前回の `key_id` があり、未ロックダウンなら `POST /api/api-keys/{id}/revoke` を best effort で呼ぶ。失敗しても続行。                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 旧キーの失効         | 設定に前回の `key_id` があり、未ロックダウン（grant が取れた）なら `POST /api/api-keys/{id}/revoke` を grant の bearer で best effort で呼ぶ。失敗しても続行。                                                                                                                                                                                                                                                                                                                                                                                    |
 | 失効の対象           | **自分が発行した id だけ**、しかも**同じ接続先に対して発行したものだけ**。`GET /api/api-keys` で名前から探して失効することは絶対にしない（他インストールのキーを巻き込まないため）。                                                                                                                                                                                                                                                                                                                                                              |
 | 接続先の切り替え     | `key_id` / `key_name` / `keyring_account` は接続先に従属する（`api_keys.id` は Hub ごとの行 ID なので、別 Hub で同じ数字が別のキーを指す）。保存済みレコードと**正規化して比較**した接続先が違うときは、前のレコードの `key_id`/`key_name`/選択タグを一切持ち越さず、失効もしない。                                                                                                                                                                                                                                                               |
 | keyring のアカウント | `hub:{host}:{port}{path}:{installation_id}`。`path` は正規化後の値なので必ず `/` で始まり `/` で終わる（ルートは `/`、接頭辞付きは `/hub/`）。**パス接頭辞まで含める**のは、リバースプロキシ配下で `host:port` が同じでも接頭辞だけ違う 2 つの Hub があり得るため（含めないと keyring のエントリを共有して上書きし合う）。`/` はエスケープしない（keyring のアカウントはどのバックエンドでも不透明な文字列で、この値を解析し直すこともない）。保存済みレコードの `keyring_account` は**そのまま使う**ので、古い綴りで保存されたエントリも読める。 |
@@ -179,7 +190,9 @@ HTTP の内訳:
 
 banto-hub は**未ロックダウンのまま非 loopback バインドで起動することを拒否する**
 （`commissioning::enforce_loopback_when_commissioning`、[tag-server-design.md](tag-server-design.md) §5.6 制約1）。
-したがって自己発行の窓が開いている間、Hub はネットワークに露出していない。
+したがって自己発行の窓が開いている間、Hub はネットワークに露出していない。加えて
+試運転の grant は **loopback の接続元にしか発行されない**（banto v3.0.0 ADR-0017、
+`require_loopback_peer`）。
 
 - 利点: 「LAN 越しに第三者が勝手にキーを取る」は起動時点で構造的に不可能。
 - 限界: **別 PC の Banto アプリはこの方式ではカバーされない**。別 PC からは、管理者が Hub の
@@ -204,10 +217,13 @@ banto-hub は**未ロックダウンのまま非 loopback バインドで起動�
   `archive/relay-wright-2026-09-24` に退避した。途中まで書いた配線はブランチ
   `archive/relay-wright-332-wip` に WIP として残してある（未 push・未完成）。
 - Named Pipe / 実行ファイル署名検証 / mTLS / LAN pairing / 独自 Trusted Client 認証。
-- **banto-hub 側の変更**。前提は `apps/banto-hub/core/tests/client_bootstrap.rs` が固定している
-  （試運転中の status は未認証で読める / `X-Banto-Client` は必須 / 未認証で `read` キーを発行できる /
-  タグ 0 件でも `/api/v1/tags` は 200 + `[]` / 重複名は `validation` の `name` エラー /
-  ロックダウン後は未認証の発行が 401）。
+- **banto-hub 側の変更**（2026-10-04 までは変更ゼロ。banto v3.0.0 追従で Hub に
+  `POST /api/auth/grant/commissioning` が増えた）。前提は
+  `apps/banto-hub/core/tests/client_bootstrap.rs` が固定している（試運転中の status は未認証で
+  読める / `X-Banto-Client` は必須 / 試運転中でも `POST /api/api-keys` は未認証なら 401 /
+  grant は loopback にだけ 200、LAN・peer 不明は 403 / grant の bearer で `read` キーを発行できる /
+  logout で grant は無効になる / タグ 0 件でも `/api/v1/tags` は 200 + `[]` / 重複名は
+  `validation` の `name` エラー / ロックダウン後は grant が 403、以前の grant も 401）。
 
 ## 9. テスト
 

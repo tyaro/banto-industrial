@@ -5,8 +5,8 @@
 	// `CommissioningBanner`（試運転モードの常時表示バナー）を撤去した
 	// （2026-09-02 オーナー決定「常時表示しない」）。安全性は損なわれない -
 	// 試運転モード中は非 loopback バインドが構造的に拒否される
-	// （`enforce_loopback_when_commissioning`）ため、無認証のまま外部
-	// ネットワークへ露出することはない。状態を知る手段は
+	// （`enforce_loopback_when_commissioning`）ため、試運転の grant を出す
+	// 接続元は loopback に限られる（banto v3.0.0）。状態を知る手段は
 	// `status/+page.svelte` の「サーバー状態」に事実として残した。
 	import { untrack } from 'svelte';
 	import { afterNavigate, goto, invalidateAll } from '$app/navigation';
@@ -97,11 +97,10 @@
 	// 次のセッションの load が終わったら作り直す（`{#key}`）。前のユーザーの
 	// 画面（メモリ上の状態・未保存の入力）を次のセッションへ持ち越さない。
 	// 同じセッションを確認し直しただけなら generation は変わらないので、普通の
-	// `invalidateAll()` で画面が作り直されることはない。**試運転モード中**は、
-	// ガードの policy runner が毎回同じ合成セッションを `adopt` し直すが
-	// generation は据え置き（S-44）、SSE の `401` などの signal も adopt 中は
-	// provider に問い合わせない（S-45）ので、タグ画面などが作り直されることは
-	// ない。
+	// `invalidateAll()` で画面が作り直されることはない。**試運転モード中**も、
+	// grant のトークンによる通常のセッション（kind `commissioning`、banto v3.0.0）
+	// なので、同じトークンを確認し直しただけなら generation は据え置きで、タグ
+	// 画面などが作り直されることはない。
 	//
 	// 配線①: controller の generation が、このページの load が確認したものと
 	// 違えば load を走らせ直す（`invalidateAll()`）。ガードがもう一度確定し、
@@ -111,7 +110,7 @@
 	// v1 の `onSessionEnded` の役目）、このレイアウトの mount 前に確定した終了
 	// （S-34/S-74）、`none` を経ない別タブのログイン（S-79/S-80、Remember me の
 	// `localStorage` の `storage` イベント）、タグストリームの確認
-	// （`sessionRecheck.ts`）が確定した `none`、試運転の `end`。`requestedFor` で
+	// （`sessionRecheck.ts`）が確定した `none`、試運転の grant の失効（ロックダウン）。`requestedFor` で
 	// 1 つの generation につき 1 回。ログアウト中（・/login へ移る途中、試運転の
 	// ロックダウンの後を含む）は走らせない: その手順が自分で /login へ移り、
 	// ここで始めた invalidation は遷移に勝ってしまう（`$lib/banto/logout.svelte.ts`）。

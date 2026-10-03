@@ -3,26 +3,26 @@
  * v1.7.0 #204、v2.0.0 #260 で書き直し）。
  *
  * v1 は `resolveProtectedSession` を包んだ `decideProtectedRoute` を、その
- * モックの上でテストしていた。v2 で確定は SessionController の役目になり、
- * ガードは試運転の policy runner（`mode: 'guard'`）を通るので、**本物の**
- * `@banto/admin-core`（HTTP 認証プロバイダーと既定の controller、`initBanto`）
- * と**本物の** `commissioning.ts` の HTTP ヘルパーの上で、ガードの `load()`
- * そのものを呼ぶ。差し替えるのは `fetch`（偽のサーバー、`testing/hubHttp.ts`）・
- * `bantoReady`・テーマ設定の同期だけ。
+ * モックの上でテストしていた。v2 で確定は SessionController の役目になり、v3.0.0
+ * でガードは確定した `none` に `grantFallback(..., { kind: 'commissioning' })` を
+ * 掛ける形になったので、**本物の** `@banto/admin-core`（HTTP 認証プロバイダーと
+ * 既定の controller、`initBanto`）の上で、ガードの `load()` そのものを呼ぶ。
+ * 差し替えるのは `fetch`（偽のサーバー、`testing/hubHttp.ts`）・`bantoReady`・
+ * テーマ設定の同期だけ。
  *
  * 守りたいこと:
  * - サーバーがセッションを**照合できなかった**とき（照合の `500`・到達不能・
  *   期限切れ）は 503（エラー画面と再試行）にし、/login へ送らない。保存して
  *   いるトークン（通常の `sessionStorage` も Remember me の `localStorage` も）を
- *   消さない。閲覧者への切り替え（`/api/auth/status`）もしない。
+ *   消さない。grant（`/api/auth/status`）も試みない。
  * - 確認は `GET /api/auth/identity` の 1 往復。確定した `none`（`401`・トークン
- *   無し）だけ /login。
- * - 試運転モード: 状態の取得 → `adopt`（provider に問い合わせない、generation は
- *   据え置き）。ロックダウン済み・取得の失敗は迂回しない（v1 と同じ安全側）。
+ *   無し）は、grant が出せなければ /login。
+ * - 試運転モード（`GET /api/auth/status` の `grants.commissioning` が true）: grant
+ *   を受け取って確定する（kind `commissioning`、role admin）。ロックダウン済み・
+ *   状態の取得の失敗では grant を試みず /login（安全側）。
  * - 返す generation は、この load が確認したもの。
  * - Remember me で別タブがユーザーを切り替えたら、このタブも確定し直して
- *   未処理のユーザーの変更を記録する（v2 移行の完了条件 8、#257）。試運転中は
- *   対象外（S-46）。
+ *   未処理のユーザーの変更を記録する（v2 移行の完了条件 8、#257）。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isHttpError, isRedirect } from '@sveltejs/kit';
@@ -32,13 +32,15 @@ vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
 vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
 // この最小 vitest 構成には `$lib` の別名が無いので、本物のモジュールへ向ける（差し替えではない）。
 vi.mock('$lib/banto/sessionGuard', () => import('./sessionGuard'));
-vi.mock('$lib/banto/commissioningPolicy', () => import('./commissioningPolicy'));
+vi.mock('$lib/banto/commissioning', () => import('./commissioning'));
 vi.mock('$lib/settings.svelte', () => ({ settings: { syncFromProvider: async () => {} } }));
 
 import { load } from '../../routes/(app)/+layout';
 import { SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
-import { COMMISSIONING_KIND } from './commissioningPolicy';
+import { COMMISSIONING_KIND } from './commissioning';
 import {
+	commissioningHub,
+	COMMISSIONING_GRANT_IDENTITY,
 	identityByToken,
 	identityOf,
 	installHub,
@@ -100,8 +102,8 @@ describe('ガード: 照合できないときはトークンを残してエラ�
 
 			expect503(await runGuard());
 			expect(hub.session.getItem(TOKEN_KEY)).toBe('normal-token');
-			// 確認は identity の 1 往復だけ。閲覧者への切り替え（/api/auth/status）もしない
-			expect(hub.paths()).toEqual(['/api/commissioning/status', '/api/auth/identity']);
+			// 確認は identity の 1 往復だけ。grant（/api/auth/status）も試みない
+			expect(hub.paths()).toEqual(['/api/auth/identity']);
 		});
 
 		it(`${label}: Remember me のセッション`, async () => {
@@ -138,9 +140,9 @@ describe('ガード: 確定したときだけ判断する', () => {
 		expect(hub.local.getItem(TOKEN_KEY)).toBeNull();
 	});
 
-	it('トークンが無ければログイン画面へ（identity を呼ばない）', async () => {
+	it('トークンが無く、grant も出せなければログイン画面へ（identity を呼ばない。status は読む）', async () => {
 		expectLogin(await runGuard());
-		expect(hub.paths()).toEqual(['/api/commissioning/status']);
+		expect(hub.paths()).toEqual(['/api/auth/status']);
 	});
 
 	it('有効なら進み、この load が確認した generation を返す', async () => {
@@ -160,31 +162,57 @@ describe('ガード: 確定したときだけ判断する', () => {
 	});
 });
 
-describe('ガード: 試運転モード（policy runner の guard）', () => {
-	it('試運転モードなら adopt で確定して進む。identity には問い合わせない', async () => {
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: false });
+describe('ガード: 試運転モード（grantFallback の commissioning）', () => {
+	it('試運転モードなら grant を取って確定して進む（kind commissioning、role admin）', async () => {
+		commissioningHub(hub);
 
 		const data = (await runGuard()) as { sessionGeneration: number };
 		const snapshot = getSessionController().snapshot;
+		expect(snapshot.status).toBe('active');
 		expect(snapshot.kind).toBe(COMMISSIONING_KIND);
-		expect(snapshot.identity?.role).toBe('admin');
+		expect(snapshot.identity).toMatchObject({ id: 'commissioning', role: 'admin' });
 		expect(data.sessionGeneration).toBe(snapshot.generation);
-		expect(hub.paths()).toEqual(['/api/commissioning/status']);
-
-		// 毎回の load で adopt し直しても generation は据え置き（S-44）。
-		const again = (await runGuard()) as { sessionGeneration: number };
-		expect(again.sessionGeneration).toBe(data.sessionGeneration);
+		expect(hub.session.getItem(TOKEN_KEY)).toBe('grant-token');
+		// トークンが無い最初の load: status → grant → grant のトークンで identity。
+		expect(hub.paths()).toEqual([
+			'/api/auth/status',
+			'/api/auth/grant/commissioning',
+			'/api/auth/identity'
+		]);
+		expect(hub.sent[2].headers.Authorization).toBe('Bearer grant-token');
+		expect(hub.sent[1].headers).toMatchObject({ 'X-Banto-Client': expect.any(String) });
 	});
 
-	it('commissioning_ended の後: ロックダウン済みでトークンが無ければ end → /login', async () => {
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: false });
-		await runGuard();
-		const generation = getSessionController().snapshot.generation;
+	it('2 回目の load は identity の 1 往復だけで、同じ generation', async () => {
+		commissioningHub(hub);
+		const first = (await runGuard()) as { sessionGeneration: number };
+		hub.sent.length = 0;
 
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: true });
+		const again = (await runGuard()) as { sessionGeneration: number };
+		expect(again.sessionGeneration).toBe(first.sessionGeneration);
+		expect(hub.paths()).toEqual(['/api/auth/identity']);
+	});
+
+	it('ロックダウン後（grant のトークンが 401、grants.commissioning が false）→ トークンが消え /login', async () => {
+		commissioningHub(hub);
+		await runGuard();
+
+		hub.routes.identity = async () => jsonResponse(401, { kind: 'unauthorized' });
+		hub.routes.authStatus = async () =>
+			jsonResponse(200, { initialized: true, grants: { commissioning: false } });
+		hub.routes.grant = async () => jsonResponse(403, { kind: 'forbidden' });
+
 		expectLogin(await runGuard());
 		expect(getSessionController().snapshot.status).toBe('none');
-		expect(getSessionController().snapshot.generation).toBeGreaterThan(generation);
+		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
+	});
+
+	it('grants.commissioning が false（ロックダウン済み・loopback でない）なら grant を試みず /login', async () => {
+		hub.routes.authStatus = async () =>
+			jsonResponse(200, { initialized: true, grants: { commissioning: false } });
+		expectLogin(await runGuard());
+		expect(hub.paths()).toEqual(['/api/auth/status']);
+		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
 	});
 
 	const statusFailures: [string, () => Promise<Response>][] = [
@@ -196,22 +224,38 @@ describe('ガード: 試運転モード（policy runner の guard）', () => {
 			}
 		]
 	];
-	for (const [label, status] of statusFailures) {
-		it(`状態を読めなかった（${label}）ときは安全側（迂回しない）。トークンが無ければ /login`, async () => {
-			hub.routes.status = status;
+	for (const [label, authStatus] of statusFailures) {
+		it(`状態を読めなかった（${label}）ときは grant を試みず /login（トークン無し）`, async () => {
+			commissioningHub(hub);
+			hub.routes.authStatus = authStatus;
 			expectLogin(await runGuard());
-			expect(getSessionController().snapshot.kind).not.toBe(COMMISSIONING_KIND);
+			expect(hub.paths()).toEqual(['/api/auth/status']);
+			expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
 		});
 	}
 
-	it('状態を読めなかったときは、試運転の合成セッションも end してから確認する（v1 と同じ安全側）', async () => {
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: false });
-		await runGuard();
-		hub.routes.status = async () => {
-			throw new TypeError('Failed to fetch');
-		};
+	it('grant の発行が 403 なら /login（status が true でも、none のまま）', async () => {
+		commissioningHub(hub);
+		hub.routes.grant = async () => jsonResponse(403, { kind: 'forbidden' });
 		expectLogin(await runGuard());
-		expect(getSessionController().snapshot.status).toBe('none');
+		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
+	});
+
+	it('アカウントのトークンで確定していれば kind は account（試運転の grant は取らない）', async () => {
+		commissioningHub(hub, 'grant-token', {
+			'alice-token': identityOf('alice', 'admin', 'account')
+		});
+		hub.session.setItem(TOKEN_KEY, 'alice-token');
+
+		await runGuard();
+		expect(getSessionController().snapshot.kind).toBe('account');
+		expect(hub.paths()).toEqual(['/api/auth/identity']);
+	});
+
+	it('grant の identity はサーバー由来（kind はトークンの種別）', async () => {
+		commissioningHub(hub);
+		await runGuard();
+		expect(getSessionController().snapshot.identity).toMatchObject(COMMISSIONING_GRANT_IDENTITY);
 	});
 });
 
@@ -252,19 +296,7 @@ describe('Remember me: 別タブのユーザーの切り替え（完了条件 8�
 		expect(getSessionController().snapshot.status).toBe('none');
 	});
 
-	it('S-46: 試運転中は別タブのログインで保留にしない（generation 据え置き、試運転のまま）', async () => {
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: false });
-		hub.routes.identity = identityByToken({ 'bob-token': identityOf('bob') });
-		const first = (await runGuard()) as { sessionGeneration: number };
-
-		hub.otherTabWrites('bob-token');
-		const controller = getSessionController();
-		expect(controller.snapshot.kind).toBe(COMMISSIONING_KIND);
-		expect(controller.snapshot.generation).toBe(first.sessionGeneration);
-
-		const second = (await runGuard()) as { sessionGeneration: number };
-		expect(second.sessionGeneration).toBe(first.sessionGeneration);
-		expect(controller.snapshot.kind).toBe(COMMISSIONING_KIND);
-		expect(hub.paths()).not.toContain('/api/auth/identity');
-	});
+	// S-46（試運転中は別タブのログインで保留にしない）は無くなった: 試運転も grant の
+	// トークンを持つ通常のセッションなので、別タブが別のトークンを書けば上と同じ
+	// 規則（保留 → 再 load で新しいセッション）に従う。
 });

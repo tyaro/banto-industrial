@@ -1,6 +1,7 @@
-// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
-// `apps/admin-template/src/lib/session.test.ts` からコピー（v2 移行 PR1c）。
-// chronogazer 固有の差: `publicViewer` のケースを削った（このアプリには閲覧公開が無く、
+// banto v3.0.0 の admin-template
+// `apps/admin-template/src/lib/session.test.ts` からコピー（v3 移行）。
+// chronogazer 固有の差: `publicViewer` のケースを削った（このアプリは grant
+// （`grantFallback`、閲覧公開の `publicViewer` を含む）を使わず、
 // `session.svelte.ts` も `publicViewer` を持たない）。`authDisabled` の導出が壊れると
 // キオスクの ESCAPE HATCH（`canManageAuthMode()`）が偽になるので、ここで固定する。
 /**

@@ -615,9 +615,16 @@ impl UsersService {
     /// itself (`acting_user_id`, the caller's own numeric row id, is
     /// resolved by the REST/Tauri layer before calling this - see
     /// [`UsersService::get_by_username`] for the REST side, which only has
-    /// the caller's username from the session token).
-    pub async fn delete_user(&self, id: i64, acting_user_id: i64) -> Result<(), BantoError> {
-        if id == acting_user_id {
+    /// the caller's username from the session token). `None` is for a
+    /// verified grant session (banto v3.0.0 ADR-0017 §3, same shape as
+    /// `banto-admin-services` v3.0.0): no row to compare against. The
+    /// last-admin guard applies either way.
+    pub async fn delete_user(
+        &self,
+        id: i64,
+        acting_user_id: Option<i64>,
+    ) -> Result<(), BantoError> {
+        if acting_user_id == Some(id) {
             return Err(BantoError::Other(
                 "自分自身を削除することはできません".to_string(),
             ));
@@ -928,7 +935,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        svc.delete_user(created.id, owner.id)
+        svc.delete_user(created.id, Some(owner.id))
             .await
             .expect("delete_user should succeed");
         assert_eq!(svc.list_users().await.unwrap().len(), 1);
@@ -1008,7 +1015,10 @@ mod tests {
             .unwrap();
 
         // `editor1` deletes `owner` (the only admin) - must be rejected.
-        let err = svc.delete_user(owner.id, editor.id).await.unwrap_err();
+        let err = svc
+            .delete_user(owner.id, Some(editor.id))
+            .await
+            .unwrap_err();
         assert!(matches!(err, BantoError::Other(_)));
         assert_eq!(svc.list_users().await.unwrap().len(), 2);
     }
@@ -1025,7 +1035,7 @@ mod tests {
             .unwrap();
 
         // Even though a second admin exists, `owner` may not delete itself.
-        let err = svc.delete_user(owner.id, owner.id).await.unwrap_err();
+        let err = svc.delete_user(owner.id, Some(owner.id)).await.unwrap_err();
         assert!(matches!(err, BantoError::Other(_)));
         assert_eq!(svc.list_users().await.unwrap().len(), 2);
     }
@@ -1037,7 +1047,7 @@ mod tests {
             .setup_first_user("owner", "password123", "オーナー")
             .await
             .unwrap();
-        let err = svc.delete_user(999, owner.id).await.unwrap_err();
+        let err = svc.delete_user(999, Some(owner.id)).await.unwrap_err();
         assert!(
             matches!(err, BantoError::NotFound { resource, id } if resource == "users" && id == "999")
         );

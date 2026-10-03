@@ -4379,9 +4379,16 @@ mod tests {
                     });
                     continue;
                 }
-                // `connect` の再発行経路（試運転中の Hub）。
+                // `connect` の再発行経路（試運転中の Hub）。banto v3.0.0
+                // （ADR-0017）から bootstrap は status → 試運転の grant →
+                // grant の bearer で発行 → logout の 4 手順
+                // （`crates/banto-hub-bootstrap`）。
                 let admin_reply = if head.contains("/api/commissioning/status") {
                     Some(r#"{"lockedDown":false}"#.to_owned())
+                } else if head.starts_with("post /api/auth/grant/commissioning") {
+                    Some(r#"{"success":true,"token":"grant-token-for-test"}"#.to_owned())
+                } else if head.starts_with("post /api/auth/logout") {
+                    Some(r#"{"success":true}"#.to_owned())
                 } else if head.starts_with("post /api/api-keys") {
                     Some(
                         r#"{"id":9,"name":"chronogazer-issued","key":"bh_issued00_new-opaque-secret"}"#

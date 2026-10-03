@@ -13,9 +13,9 @@
  * 出ない不具合の直接の原因だった。
  *
  * `getCatalog` は `apps/banto-hub/core/src/rest.rs` の `admin_tag_catalog`
- * （`GET /api/tag-catalog`、`hubStatus.ts`と同じ管理系ルーター - 試運転
- * モードのバイパスが効き、ロックダウン済みならセッション認証が要る側）を
- * 叩く。ロジックは `/api/v1/tags`（`v1_tags`）ハンドラと
+ * （`GET /api/tag-catalog`、`hubStatus.ts`と同じ管理系ルーター）を叩く。
+ * banto v3.0.0 以降は試運転中も bearer が必須（grant のトークンを付ける。
+ * 上の経緯は認証を迂回していた v2 までのもの）。ロジックは `/api/v1/tags`（`v1_tags`）ハンドラと
  * `build_catalog_response` を共有しており、`/api/v1/*` 自体はルート・
  * 認証・レスポンス形状とも一切変更していない（機械クライアントの互換性を
  * 壊さないため）。
@@ -36,31 +36,22 @@
  * なる。そこでサーバー側は `admin_tag_stream_router`（`apps/banto-hub/core/src/rest.rs`）
  * という CSRF レイヤーの外側の専用ルーターを新設し、`/api/tag-stream` を
  * 用意した（ハンドラ自体は `/api/v1/stream` と共有 - `crate::stream::ws_upgrade`）。
- * このクライアントは接続のたびに `sessionStore.commissioningMode`
- * （`$lib/session.svelte.ts`。ルートガードの試運転の policy runner が
- * SessionController に `adopt` で確定させた合成セッションか）を見て分岐する:
+ * このクライアントは**常に** `/api/v1/stream` へ、セッションの token を
+ * `Sec-WebSocket-Protocol: bearer, <token>` で運ぶ（`apps/banto-hub/core/src/rest.rs`
+ * の `extract_ws_protocol_token` が受け付ける方式。`new WebSocket(url,
+ * ['bearer', token])` と書くと、ブラウザが自動的にこの形式のヘッダを送る -
+ * トークンが URL やクエリ文字列に出ないので、サーバーのアクセスログや
+ * ブラウザ履歴に残らない）。
  *
- * - **試運転モード中**（`commissioningMode === true`）: サーバー側
- *   （`require_auth_or_commissioning`）が未ロックダウン中は無条件で
- *   通すため、トークン無し・`Sec-WebSocket-Protocol` オファー無しで
- *   `/api/tag-stream` へ即接続する。
- * - **ロックダウン済み**（従来どおり）: `/api/v1/stream` へ、セッション
- *   token を `Sec-WebSocket-Protocol: bearer, <token>` で運ぶ - 元々の
- *   仕組みをそのまま維持する（`apps/banto-hub/core/src/rest.rs` の
- *   `extract_ws_protocol_token` が受け付ける方式。`new WebSocket(url,
- *   ['bearer', token])` と書くと、ブラウザが自動的にこの形式のヘッダを
- *   送る - トークンが URL やクエリ文字列に出ないので、サーバーの
- *   アクセスログやブラウザ履歴に残らない）。
- *
- * ロックダウン済みでも `/api/tag-stream` 自体は接続できる（サーバー側は
- * 同じ`Sec-WebSocket-Protocol`方式で有効なセッション bearer を要求する -
- * `require_auth_or_commissioning`のdoc comment参照）が、このクライアントは
- * 「ロックダウン済みでは従来どおり」の方針に合わせて`/api/v1/stream`を
- * 使い続ける（変更範囲を試運転モード中の不具合修正だけに絞るため）。
+ * banto v3.0.0（ADR-0017）から試運転モードも grant のトークンを持つ通常の
+ * セッションで、サーバーは試運転中でも WS に bearer を要求する（認証を迂回する
+ * 分岐は無くなった。以前の「試運転中はトークン無しで `/api/tag-stream` へ即接続」
+ * は廃止）。だから試運転中も、grant で受け取ったトークンを同じ運び方で付けて
+ * `/api/v1/stream` に繋ぐ（`/api/tag-stream` も同じ方式の bearer が要るが、この
+ * クライアントは従来のロックダウン済みの経路をそのまま使い続ける）。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
-import { sessionStore } from '$lib/session.svelte';
 import {
 	classifyStreamClose,
 	decideAfterSessionProbe,
@@ -510,28 +501,16 @@ export function connectTagStream(
 	}
 
 	/**
-	 * `sessionStore.commissioningMode`（`$lib/session.svelte.ts` - ルート
-	 * ガードの試運転の policy runner が `adopt` で確定させた合成セッションか）を
-	 * 接続のたびに読み直して分岐する。再接続ループの中で毎回
-	 * 評価するので、途中でロックダウンが完了した場合も次の接続試行から
-	 * 自然に「ロックダウン済み」側の経路（トークン必須）へ切り替わる -
-	 * このファイル冒頭の doc comment「WS 購読は難所だった」参照。
+	 * 接続のたびに保存されているセッションのトークン（アカウントのものも、
+	 * 試運転の grant のものも同じ）を読み直し、`Sec-WebSocket-Protocol: bearer,
+	 * <token>` で運んで `/api/v1/stream` に繋ぐ。再接続ループの中で毎回評価する
+	 * ので、ロックダウンで grant のトークンが失効した後も、ログインし直した
+	 * 後も、次の接続試行から自然に新しいトークンで繋ぐ - このファイル冒頭の
+	 * doc comment「WS 購読は難所だった」参照。
 	 */
 	function connectOnce(): void {
 		if (stopped) return;
 
-		if (sessionStore.commissioningMode) {
-			// サーバー側（`require_auth_or_commissioning`）は未ロックダウン中
-			// 無条件で通すので、トークンもサブプロトコルオファーも不要 -
-			// `apps/banto-hub/core/src/rest.rs` の `admin_tag_stream_router`
-			// のdoc comment参照。
-			attachHandlers(new WebSocket(wsUrl('/api/tag-stream')));
-			return;
-		}
-
-		// ロックダウン済み: 従来どおり `/api/v1/stream` へ、セッション token
-		// を `Sec-WebSocket-Protocol: bearer, <token>` で運ぶ - this module's
-		// doc comment / `rest.rs::extract_ws_protocol_token` 参照。
 		const token = currentToken();
 		if (token === null) {
 			if (usedToken !== null) {

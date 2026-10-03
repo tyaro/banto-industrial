@@ -1,7 +1,7 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
+状態: **実装追従中（2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
 セッションの確定は banto v2.0.0 の SessionController に寄せ、試運転は policy runner の `adopt`/`end` で
 確定・終了することを追記（v2 移行 PR1d、banto-hub v0.2.0-alpha.26。サーバー側の設計・wire は変更なし）。
 2026-09-30 更新: §4.1 のバインディングキーを外部名のみに改め、安定 ID によるリネーム検出を撤回（オーナー決定、scada-design.md §9.6）。2026-09-24 更新: §6 の 6 項に、書き込み受付の停止を DB と状態ファイルの
@@ -1074,8 +1074,22 @@ FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
 
 **状態は2つだけ**:
 
-- **試運転モード（初期状態）**: 管理 UI / 管理 REST は認証なしで操作できる。
-- **ロックダウン済み**: 従来どおり bearer セッションのログインが必要。
+- **試運転モード（初期状態）**: 管理 UI / 管理 REST は、Hub と同じ PC からなら
+  ログインなしで操作できる。**2026-10-04（banto v3.0.0 ADR-0017 追従、
+  v0.2.0-alpha.28）からは「認証を迂回する」のではなく、資格情報なしで発行される
+  合成 admin の grant セッション**（kind `commissioning`、
+  `POST /api/auth/grant/commissioning`。条件 = 未ロックダウン かつ 接続元が
+  loopback、上限 16、寿命は既定の 8h / idle 1h）で操作する。発行後は通常の
+  bearer として認証ゲート・`RoleGuard`・監査・ストリームの再検証に乗る。
+  2026-08-30〜10-04 の実装（`require_auth_or_commissioning` 等 34 か所が
+  未ロックダウン中の要求を無認証で通し、要求ごとに合成 identity を返す）は
+  廃止した。
+- **ロックダウン済み**: 従来どおり bearer セッションのログインが必要。grant の
+  条件が閉じ、発行済みの grant トークンはロックダウンの操作が**フラグの保存の
+  直後に同じ関数内で**失効させる（`CommissioningService::lock_down` →
+  `AuthState::revoke_grant_tokens`、ADR-0017 §2・§5「保存 → revoke」の順。
+  並行する発行との競合は `AuthState` の世代が閉じる。監査の detail に
+  `revokedGrants: n`）。
 
 **遷移**: 「ロックダウン」操作でのみ試運転モード → ロックダウン済みへ移る。
 アカウント作成そのものは遷移条件にしない（試運転中に運用者アカウントを
@@ -1098,7 +1112,17 @@ FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
 1. **試運転モードは loopback バインド時のみ許可する。** `BANTO_BIND` が
    `0.0.0.0` 等の非 loopback で、かつ未ロックダウンの構成は**起動時に拒否**
    する。認証なしの状態がネットワークへ露出する経路を原理的に塞ぐ
-   （試運転は Hub が動いている機械の前で行う前提）。
+   （試運転は Hub が動いている機械の前で行う前提）。grant 化後は加えて、
+   **試運転の grant は loopback の接続元にしか発行しない**
+   （`require_loopback_peer: true`。peer 不明も 403）ので、elev で試運転へ
+   戻した LAN バインドの構成でも LAN の第三者は admin 相当のトークンを得られ
+   ない。**同一ホストのリバースプロキシ配下では接続元が常にプロキシ**なので
+   この判定は守りにならず、運用条件で補う（ADR-0017 §6、オーナー決定
+   2026-10-04）: (a) **外部公開（プロキシから外へ出す）の前にロックダウンする**、
+   (b) **再試運転の間も `/api/auth/grant/{kind}` をプロキシから外部へ公開しない**
+   （プロキシでそのパスを遮断するか、試運転中はプロキシを止める）。技術的に
+   防げるものではなく、運用に委ねる判断であることを明記する
+   （banto-hub-operations.md §6・§19）。
 2. **未ロックダウンの間は画面に消せない警告を常時表示する。** 最大のリスクは
    「試運転モードのまま出荷される」ことなので、状態が一目で分かるようにする。
    起動ログにも出す。
@@ -1116,31 +1140,40 @@ FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
 失われるのは管理操作（タグ定義変更・収集開始停止）の主体記録のみで、
 試運転中は許容する。
 
-**実装状況（2026-08-30〜31）**: バックエンド（`crate::commissioning` の
-`CommissioningService`、起動時ガード、`require_auth_or_commissioning`/
-`RoleGuard`、`GET /api/commissioning/status`、
-`POST /api/commissioning/lock-down`）・UI（ルートガード迂回
-`shouldBypassLoginForCommissioning`、閉じるボタンの無い
-`CommissioningBanner`、設定画面のロックダウン操作）とも実装済み。
+**実装状況（2026-08-30〜31、2026-10-04 に grant 方式へ）**: バックエンド
+（`crate::commissioning` の `CommissioningService`・`commissioning_grant_spec`、
+起動時ガード、`crate::rest` の `require_session`（旧
+`require_auth_or_commissioning`。試運転の分岐は無い）/`RoleGuard`、
+`GET /api/commissioning/status`（未認証で読める）、
+`POST /api/auth/grant/commissioning`（banto の `grant_router`）、
+`GET /api/auth/status` の `grants.commissioning`、
+`POST /api/commissioning/lock-down`（保存 → 失効））・UI（ルートガードの
+`grantFallback(..., { kind: 'commissioning' })`、設定画面のロックダウン操作）とも
+実装済み。bootstrap（`crates/banto-hub-bootstrap`）の自己発行は
+「status → grant → bearer で `POST /api/api-keys` → logout」。
 
 **管理 UI のセッションの確定（2026-10-02、banto v2.0.0 #260 追従、v2 移行 PR1d・
-banto-hub v0.2.0-alpha.26）**: フロントの「誰がログインしているか」の確定は
-`@banto/admin-core` の **SessionController** だけが行う（ADR-0016、banto の
-`docs/session-controller-design.md` §6.1・§6.2）。試運転モードの合成 identity
-（`COMMISSIONING_IDENTITY`）は `/api/auth/identity` が返さないので provider では確定
-できず、アプリ層の **policy runner**（`apps/banto-hub/src/lib/banto/commissioningPolicy.ts`）が
-`GET /api/commissioning/status` を見て controller に **`adopt(..., 'commissioning', ticket)`** で
-確定し、ロックダウンが確定したら **`end('commissioning-locked', ticket)`** で終わらせる
-（`adopt`/`end` を呼ぶのはこの runner とロックダウンの順序 `commissioningLockDown.ts` だけ。
-banto 本体には入れない）。runner はルートガード（`guard`: 状態の取得に失敗したら迂回しない＝
-従来の安全側）とタグモニタの再接続の失敗後の確認（`recheck`: 取得に失敗したら `unverified` で
-画面を保つ）の 2 つの mode を持ち、ticket が失効したら新しい ticket でやり直し（上限 3 回）、
-期限は全体で 10 秒（方針の要求はすべて runner の `AbortSignal` で止める）。試運転中は毎回の
-読み込みで同じ合成セッションを確定し直すが世代（generation）は変わらず、SSE の `401` などの
-signal も provider に問い合わせない（試運転はトークンで決まらない）。ロックダウンの後は
-「ロックダウン前に取った ticket で `end` → 確定 → `none` ならログイン画面」の順で、移動の間は
-保護レイアウトの世代の照合による読み直しを止める。`sessionStore.commissioningMode` は
-controller の snapshot（`kind === 'commissioning'` かつ `active`）からの導出。
+banto-hub v0.2.0-alpha.26。2026-10-04 に banto v3.0.0 の grant へ、v0.2.0-alpha.28）**:
+フロントの「誰がログインしているか」の確定は `@banto/admin-core` の
+**SessionController** だけが行う（ADR-0016、banto の `docs/session-controller-design.md`
+§6.1）。v2 では `/api/auth/identity` が試運転の合成 identity を返さなかったので、アプリ層の
+policy runner が controller に `adopt`/`end` で確定・終了していたが、v3.0.0 で `adopt`/`end` は
+削除され、試運転は閲覧公開と同じ経路になった: ルートガード（`(app)/+layout.ts`）は
+`resolveSettled` で確定した `none` のあと **`grantFallback(..., { kind: 'commissioning' })`**
+を呼び、`GET /api/auth/status` の `grants.commissioning` が true なら
+`POST /api/auth/grant/commissioning` でトークンを受け取って `sessionStorage` に保存し、
+provider の確認（`GET /api/auth/identity` → `kind: "commissioning"`）で確定する。
+ロックダウンの後は「`POST /api/commissioning/lock-down` → 自分の grant トークンもサーバーで
+失効 → 確認が 401 → `none` → ログイン画面」（`commissioningLockDown.ts`）。試運転中の
+ログアウトはトークンを捨てるだけで、次の保護画面への遷移でガードが grant を無言で取り直す
+（試運転はロックダウンでしか終わらない、2026-10-02 オーナー決定）。
+「サーバーが試運転中か」と「このタブが試運転の grant で操作しているか」は別の軸
+（2026-10-04 オーナー指示）: ロックダウンの欄（設定の「セキュリティ」カテゴリ）と試運転の
+表示は**サーバーの状態**（`GET /api/commissioning/status`、`commissioningState.svelte.ts`）で
+出し分け、アカウントでログインしたままでもロックダウンできる（本人のトークンは残り、
+画面は「ログイン中のアカウントで続けます」）。`sessionStore.commissioningGrant`（snapshot の
+`kind === 'commissioning'`）は「誰として操作しているか」だけ。タグモニタの WS は試運転中も
+`Sec-WebSocket-Protocol: bearer, <token>` でトークンを運ぶ（トークン無しの分岐は無い）。
 
 #### 管理 UI と `/api/v1/*` の境界（2026-08-31 オーナー決定・案A）
 
@@ -1149,9 +1182,9 @@ controller の snapshot（`kind === 'commissioning'` かつ `active`）からの
 
 - **管理 UI（ブラウザ）は `/api/status`・`/api/values`・
   `/api/tag-catalog`・`/api/tag-stream`（WS）を使う。** 認可は
-  `require_auth_or_commissioning`（`RoleGuard` を掛けない = role 不問、
-  読み取り専用）のみで、未ロックダウン中は無条件に通し、ロックダウン後は
-  セッション bearer を要求する。
+  `require_session`（`RoleGuard` を掛けない = role 不問、読み取り専用）のみで、
+  セッション bearer（試運転中は grant のトークン、ロックダウン後はアカウント）を
+  要求する（2026-10-04 までは未ロックダウン中は無条件に通していた）。
 - **`/api/v1/*`（`GET /api/v1/tags`・`/api/v1/values`・`/api/v1/status`、
   WS の `/api/v1/stream` 等）は機械クライアント専用のまま**
   `require_tag_space_auth`（API キー or セッション bearer）固定とし、

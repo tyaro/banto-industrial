@@ -1,53 +1,60 @@
-// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
-// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v2 移行 PR1d）。
+// banto v3.0.0（タグ v3.0.0）の admin-template
+// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v3 移行）。
 // banto-hub 固有の差:
-// - 確定の入口は `resolveSettled` を直接ではなく、試運転の policy runner
-//   （`$lib/banto/commissioningPolicy.ts`、`mode: 'guard'`）。試運転モード
-//   （未ロックダウン）なら合成セッションを `adopt` で確定し、そうでなければ
-//   通常の確認（`resolveSettled`）へ残りの期限で引き継ぐ（設計 §6.2）。
-// - 閲覧公開（viewer-public）が無いので、確定した `none` は
-//   `publicViewerFallback` を経ずにそのまま /login（公開閲覧のナビ制限も無い）。
+// - 確定した `none` のあとの grant の kind が `commissioning`（試運転モード、
+//   サーバーが未ロックダウンかつ loopback のときだけ発行する、ADR-0017）。
+// - 閲覧公開（viewer-public）が無いので、閲覧公開のナビ制限も無い。
 // - エラー画面の本文は i18n ではなく `SESSION_CHECK_FAILED_MESSAGE`（日本語）。
 //   ロケールの同期は無い。`base` は使わない。
 import { error, redirect } from '@sveltejs/kit';
-import { getSessionController } from '@banto/admin-core';
+import {
+	getAuthProvider,
+	getSessionController,
+	grantFallback,
+	resolveSettled
+} from '@banto/admin-core';
 import { bantoReady } from '$lib/banto/setup';
 import { SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
-import { runCommissioningPolicy } from '$lib/banto/commissioningPolicy';
+import { COMMISSIONING_KIND } from '$lib/banto/commissioning';
 import { settings } from '$lib/settings.svelte';
 
-// (app) グループ全体の認証ガード（banto #260、設計 §6.1・§6.2）。セッションの
-// 確定は SessionController（「誰がログインしているか」の唯一の書き手、ADR-0016）。
-// この load の副作用は controller の確定（と方針の `adopt`/`end`）だけで、ストアには
-// 書かない（`sessionStore` は `controller.snapshot` からの導出）。
+// (app) グループ全体の認証ガード（banto #260、設計 §6.1。v3.0.0 で grant 方式）。
+// セッションの確定は SessionController（「誰がログインしているか」の唯一の
+// 書き手、ADR-0016）。この load の副作用は controller の確認と、確定した
+// `none` に対する grant の発行（ADR-0017）だけで、ストアには書かない
+// （`sessionStore` は `controller.snapshot` からの導出）。
 //
-// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）: 認証の確認より**前**に
-// `GET /api/commissioning/status`（未認証で読める）を問い合わせ、試運転モード
-// （未ロックダウン）だと確認できた場合だけログインを迂回する。バックエンドは
-// 未ロックダウン中、認証ヘッダの有無に関わらず全リクエストを合成 admin として
-// 受け付ける（`actor_identity`、`apps/banto-hub/core/src/commissioning.rs`）。
-// 判断は policy runner（`mode: 'guard'`）:
-//   1. 試運転モード確定 → `adopt(COMMISSIONING_IDENTITY, 'commissioning', ticket)`
-//      （同じ C の再 adopt は generation 据え置き、S-44）
-//   2. ロックダウン済み確定 → 試運転の合成セッションがあれば `end` してから、
-//      通常の確認（`resolveSettled`）
-//   3. 状態の取得に失敗（ネットワーク断など）→ **安全側に倒し** 2. と同じ扱い
-//      （迂回しない。v1 から同じ）
+// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）は v3.0.0 から、サーバーが
+// 発行する grant で入る通常のセッション（kind `commissioning`）になった。
+// 管理 REST・管理 WS は試運転中でも bearer が必須で、認証を迂回する経路は
+// 無い。確定した `none` のとき `grantFallback(..., { kind: 'commissioning' })`
+// が `GET /api/auth/status` の `grants.commissioning` を読み、true（未ロック
+// ダウン かつ 接続元が loopback）なら `POST /api/auth/grant/commissioning` で
+// トークンを受け取って確定する。ロックダウン済み・loopback でない・状態が読め
+// ない・発行に失敗、のときは `none` のまま（`grantFallback` は何も足さない）
+// なので /login へ送る。ロックダウンではサーバーが grant のトークンを全部失効
+// させ、次の要求は 401 → `none` → ここで再び grant を試みて、今度は
+// `grants.commissioning` が false なので /login になる。
 //
 // banto v1.7.0 #204 から: セッションが無効だと**確認できたとき**（確定した
 // `none`）だけ `/login` へ送る。確認できなかったとき（照合の 500・到達不能・
-// 10 秒の期限切れ・セッションが動き続けた・方針のやり直しの上限）は、保存して
-// いるトークン（Remember me を含む）を消さずに、再試行付きのエラー画面
+// 10 秒の期限切れ・セッションが動き続けた）は、保存しているトークン
+// （Remember me を含む）を消さずに、再試行付きのエラー画面
 // （`routes/+error.svelte`）で止まる（S-36/S-60: 切り替えの後でも自動では
-// 戻らない）。
+// 戻らない）。`grantFallback` の結果の `unverified` も同じ（S-66）。
 export async function load() {
 	await bantoReady;
 	const controller = getSessionController();
-	const result = await runCommissioningPolicy(controller, { mode: 'guard' });
-	if (result.outcome === 'unverified') {
-		error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
+	let result = await resolveSettled(controller, { cause: 'navigation' });
+	if (result.outcome === 'unverified') sessionCheckFailed();
+	if (result.snapshot.status === 'none') {
+		result = await grantFallback(controller, getAuthProvider(), result.ticket, {
+			kind: COMMISSIONING_KIND
+		});
+		if (result.outcome === 'unverified') sessionCheckFailed();
+		if (result.snapshot.status !== 'active') redirect(307, '/login');
 	}
-	if (result.snapshot.status !== 'active') redirect(307, '/login');
+	const snapshot = result.snapshot;
 
 	// セッション確定後に UiSettingsProvider から設定を読み直す
 	// （他クライアントで保存された値がこのタブの localStorage キャッシュに
@@ -59,5 +66,10 @@ export async function load() {
 	// この load のデータは前のセッションのもの。`+layout.svelte` はこれが
 	// 生きている generation の間だけページを描き（世代ゲート）、違えば load を
 	// 走らせ直す（配線①）。
-	return { sessionGeneration: result.snapshot.generation };
+	return { sessionGeneration: snapshot.generation };
+}
+
+/** 再試行付きのエラー画面（Issue #204）: ログイン状態を確認できなかった。 */
+function sessionCheckFailed(): never {
+	error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
 }

@@ -2153,7 +2153,7 @@ async fn users_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoEr
 /// Body of [`users_delete`] (see [`users_update_body`]).
 async fn users_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
     let acting = require_role(state, Role::Admin, "users").await?;
-    state.users.delete_user(id, acting.id).await?;
+    state.users.delete_user(id, Some(acting.id)).await?;
     state
         .audit
         .record(AuditEntry {

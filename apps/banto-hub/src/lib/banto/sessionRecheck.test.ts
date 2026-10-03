@@ -1,12 +1,11 @@
 /**
- * `sessionRecheck.ts` のユニットテスト（#441・#445、banto v2.0.0 #260 で書き直し）。
+ * `sessionRecheck.ts` のユニットテスト（#441・#445、banto v2.0.0 #260 で書き直し、v3.0.0 で試運転の policy runner を削除）。
  *
  * v2 で確認そのものは SessionController の役目（`GET /api/auth/identity` の
  * 1 往復・期限・同時の確認の合流・開始時の資格情報との照合・背景の確認）。
  * v1 の独自の照合（`/api/auth/check` の直接 `fetch`・トークンの照合・
  * single-flight・期限）は削除したので、ここでは**本物の** `@banto/admin-core`
- * （HTTP 認証プロバイダーと既定の controller）と**本物の** `commissioning.ts` の
- * 上で、ストリームの出来事がどう写るかを確かめる。差し替えるのは `fetch`
+ * （HTTP 認証プロバイダーと既定の controller）の上で、ストリームの出来事がどう写るかを確かめる。差し替えるのは `fetch`
  * （偽のサーバー、`testing/hubHttp.ts`）と `invalidateAll()`（SvelteKit の
  * 実行時が無いと動かないので回数を数える）。
  *
@@ -16,8 +15,9 @@
  *   判断する（失効なら /login）。
  * - 再接続が続けて失敗した（#445）: 画面を動かさず（`invalidateAll()` を
  *   呼ばない）、`session` / `login` / `unverified` を返す。
- *   - 試運転中は policy runner の `recheck`（状態が読めなければ `unverified`、
- *     ネットワーク断でログイン画面へ送らない）。
+ *   - 試運転の grant（kind `commissioning`）も通常のセッションと同じ確認
+ *     （identity の 1 往復）。失効が確定すれば `login`、照合できなければ
+ *     `unverified`（試運転のセッションのまま、画面は動かさない）。
  *   - 照合できない・返ってこない（10 秒）は `unverified`。トークンは消さない。
  *     その後も controller が背景で確認を続ける（E2E の「切断後ちょうど 1 回」は
  *     成り立たない）。
@@ -37,16 +37,17 @@ vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
 vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
 // この最小 vitest 構成には `$lib` の別名が無いので、本物のモジュールへ向ける（差し替えではない）。
 vi.mock('$lib/banto/sessionGuard', () => import('./sessionGuard'));
-vi.mock('$lib/banto/commissioningPolicy', () => import('./commissioningPolicy'));
+vi.mock('$lib/banto/commissioning', () => import('./commissioning'));
 vi.mock('$lib/settings.svelte', () => ({ settings: { syncFromProvider: async () => {} } }));
 
 import { load } from '../../routes/(app)/+layout';
-import { COMMISSIONING_KIND } from './commissioningPolicy';
+import { COMMISSIONING_KIND } from './commissioning';
 import {
 	probeSessionAfterReconnectFailures,
 	recheckSessionAfterStreamClose
 } from './sessionRecheck';
 import {
+	commissioningHub,
 	identityByToken,
 	identityOf,
 	installHub,
@@ -87,11 +88,20 @@ async function signedInAsAlice(): Promise<void> {
 	expect(getSessionController().snapshot.identity?.id).toBe('alice');
 }
 
-/** 試運転の合成セッションを確定した状態にする。 */
+/** 試運転の grant で確定した状態にする（ガードの `grantFallback` が grant のトークンを受け取る）。 */
 async function commissioning(): Promise<void> {
-	hub.routes.status = async () => jsonResponse(200, { lockedDown: false });
+	commissioningHub(hub, 'grant-token');
 	await runGuard();
 	expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
+	expect(hub.session.getItem(TOKEN_KEY)).toBe('grant-token');
+}
+
+/** ロックダウン: サーバーが grant のトークンを全部失効させ、grant ももう出さない。 */
+function lockedDown(): void {
+	hub.routes.identity = async () => jsonResponse(401, { kind: 'unauthorized' });
+	hub.routes.authStatus = async () =>
+		jsonResponse(200, { initialized: true, grants: { commissioning: false } });
+	hub.routes.grant = async () => jsonResponse(403, { kind: 'forbidden' });
 }
 
 /** 中断されたら reject する、応答しない要求（本物の `fetch` と同じ）。 */
@@ -137,16 +147,50 @@ describe('recheckSessionAfterStreamClose（#441: 1008 で閉じられた）', ()
 		expect(data.sessionGeneration).toBe(generation);
 	});
 
-	it('S-45: 試運転中の signal は provider に問い合わせない。commissioning_ended はガードの policy runner が end する', async () => {
+	it('試運転の grant: signal の後の確認が通常のセッションと同じに走り、まだ有効ならガードはそのまま進む', async () => {
 		await commissioning();
-		await recheckSessionAfterStreamClose();
-		expect(identityRequests()).toHaveLength(0);
-		expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
+		const generation = getSessionController().snapshot.generation;
+		const before = identityRequests().length;
 
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: true });
+		await recheckSessionAfterStreamClose();
+		const data = (await runGuard()) as { sessionGeneration: number };
+
+		expect(identityRequests().length).toBeGreaterThan(before);
+		expect(data.sessionGeneration).toBe(generation);
+		expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
+	});
+
+	it('試運転の grant が失効し（ロックダウン）、grant ももう出ないなら、ガードは /login へ', async () => {
+		await commissioning();
+		lockedDown();
+
+		await recheckSessionAfterStreamClose();
 		const thrown = await runGuard();
+
 		expect(isRedirect(thrown)).toBe(true);
+		if (isRedirect(thrown)) expect(thrown.location).toBe('/login');
 		expect(getSessionController().snapshot.status).toBe('none');
+		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
+	});
+
+	it('試運転の grant だけが失効して grant はまだ出るなら、ガードは新しい grant で続ける', async () => {
+		await commissioning();
+		hub.routes.identity = identityByToken({
+			'grant-token-2': {
+				id: 'commissioning',
+				name: '試運転モード',
+				role: 'admin',
+				kind: 'commissioning'
+			}
+		});
+		hub.routes.grant = async () => jsonResponse(200, { success: true, token: 'grant-token-2' });
+
+		await recheckSessionAfterStreamClose();
+		const data = (await runGuard()) as { sessionGeneration: number };
+
+		expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
+		expect(hub.session.getItem(TOKEN_KEY)).toBe('grant-token-2');
+		expect(data.sessionGeneration).toBe(getSessionController().snapshot.generation);
 	});
 });
 
@@ -296,38 +340,32 @@ describe('probeSessionAfterReconnectFailures（#445: 再接続が続けて失敗
 	});
 });
 
-describe('probeSessionAfterReconnectFailures: 試運転中（policy runner の recheck）', () => {
-	it('試運転モードのまま → session（identity は呼ばない、generation 据え置き）', async () => {
+describe('probeSessionAfterReconnectFailures: 試運転の grant（通常のセッションと同じ確認）', () => {
+	it('grant のトークンが有効 → session（generation 据え置き）', async () => {
 		await commissioning();
 		const generation = getSessionController().snapshot.generation;
 		expect(await probeSessionAfterReconnectFailures()).toBe('session');
-		expect(identityRequests()).toHaveLength(0);
+		expect(identityRequests().length).toBeGreaterThan(0);
 		expect(getSessionController().snapshot.generation).toBe(generation);
 	});
 
-	it('状態が読めなかった（ネットワーク断など）→ unverified。ガードと違い、試運転を終わらせない', async () => {
+	it('照合できなかった（ネットワーク断など）→ unverified。試運転のセッションのまま、トークンも消さない', async () => {
 		await commissioning();
-		hub.routes.status = async () => {
+		hub.routes.identity = async () => {
 			throw new TypeError('Failed to fetch');
 		};
 		expect(await probeSessionAfterReconnectFailures()).toBe('unverified');
 		expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
+		expect(hub.session.getItem(TOKEN_KEY)).toBe('grant-token');
 		expect(nav.invalidateAll).not.toHaveBeenCalled();
 	});
 
-	it('試運転のつもりで繋いでいたがロックダウンされていた → end → login', async () => {
+	it('ロックダウンで grant のトークンが失効していた（401）→ login。トークンは消える', async () => {
 		await commissioning();
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: true });
+		lockedDown();
 		expect(await probeSessionAfterReconnectFailures()).toBe('login');
 		expect(getSessionController().snapshot.status).toBe('none');
-	});
-
-	it('ロックダウン済みで、保存していたトークンが有効なら session（そのアカウントで続ける）', async () => {
-		await commissioning();
-		hub.session.setItem(TOKEN_KEY, 'alice-token');
-		hub.routes.identity = identityByToken({ 'alice-token': identityOf('alice') });
-		hub.routes.status = async () => jsonResponse(200, { lockedDown: true });
-		expect(await probeSessionAfterReconnectFailures()).toBe('session');
-		expect(getSessionController().snapshot.identity?.id).toBe('alice');
+		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
+		expect(nav.invalidateAll).not.toHaveBeenCalled();
 	});
 });
