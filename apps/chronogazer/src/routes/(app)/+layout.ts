@@ -1,7 +1,8 @@
-// banto v2.0.0（タグ v2.0.0 = dc61fc1）の admin-template
-// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v2 移行 PR1c）。
-// chronogazer 固有の差: 閲覧公開（viewer-public）が無いので確定した `none` は
-// `publicViewerFallback` を経ずにそのまま /login（公開閲覧のナビ制限も無い）。
+// banto v3.0.0 の admin-template
+// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v3 移行）。
+// chronogazer 固有の差: grant を使わない（閲覧公開 `publicViewer` も試運転も無い）
+// ので、確定した `none` は `grantFallback` を経ずにそのまま /login
+// （公開閲覧のナビ制限も無い）。
 // エラー画面の本文は i18n ではなく `SESSION_CHECK_FAILED_MESSAGE`（日本語）。
 // ロケールの同期（`syncLocaleFromProvider`）は無い。`base` は使わない。
 import { error, redirect } from '@sveltejs/kit';
@@ -26,8 +27,9 @@ import { settings } from '$lib/settings.svelte';
 //   nothing is cleared, the stored token (Remember me included) is kept, and
 //   "再試行" re-runs this load (S-36/S-60: after a switch of user it is NOT
 //   left automatically).
-// - A CONFIRMED `none` goes to /login. ChronoGazer has no public viewing
-//   (no `server.viewerPublic`), so there is no `publicViewerFallback` step.
+// - A CONFIRMED `none` goes to /login. ChronoGazer issues no grant (no
+//   public viewing, no commissioning mode), so there is no `grantFallback`
+//   step.
 export async function load() {
 	await bantoReady;
 	const controller = getSessionController();
