@@ -398,8 +398,9 @@ impl HubRuntime {
         // モードで動いていることを一目で分かるように警告を出す。
         if !commissioning.is_locked_down() {
             log_line(
-                "banto-hub: [WARN] 試運転モード: 認証なしで誰でも管理 UI / 管理 REST を\
-                 操作できます。運用に入る前に管理 UI からロックダウンを実行してください\
+                "banto-hub: [WARN] 試運転モード: この PC からはログインなしで（試運転の grant で）\
+                 管理 UI / 管理 REST を操作できます。運用に入る前に管理 UI からロックダウンを\
+                 実行してください\
                  （docs/tag-server-design.md §5.6「試運転モードとロックダウン」）。",
             );
         }
