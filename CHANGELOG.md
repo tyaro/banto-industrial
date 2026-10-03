@@ -2,6 +2,38 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.28 — 2026-10-04（アルファ）
+
+banto v3.0.0（2026-10-04、ADR-0017「資格情報なしのセッション発行は grant に一本化」、破壊的変更）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A と、コピーしていた `extra_auth_router`・保護レイアウトの経路 B をセットで書き換えた）。**試運転モードを「認証を迂回する」仕組みから「試運転中だけ資格情報なしで発行される合成 admin の grant セッション」に切り替えた**（オーナー決定 2026-10-02〜04）。配布物の構成・前提ランタイムは alpha.3 以降と同じ。DB の移行は無い（既存の DB は壊してよい、アルファ）。
+
+### 外から見える変化（試運転モード）
+
+- **試運転中（未ロックダウン）でも、管理 REST・管理 WS（`/api/tag-stream`）はすべて bearer が必須になった。** トークン無しで管理 REST を叩いていた外部ツールは、先に `POST /api/auth/grant/commissioning`（`X-Banto-Client` ヘッダ、本文なし）で試運転の grant を取り、その `token` を `Authorization: Bearer` で付ける。応答は `{ success: true, token }`。
+- grant の条件は **未ロックダウン かつ 接続元が loopback**。LAN からの要求・接続元が分からない要求は 403。`GET /api/auth/status` が `grants: { commissioning: bool }` を返す（同じ判定）。同時に有効なトークンは 16 本まで、寿命は通常のセッションと同じ（8h / idle 1h）。
+- `GET /api/auth/identity` は grant のセッションを `{ id: "commissioning", name: "試運転モード", role: "admin", kind: "commissioning" }` で返す（アカウントは `kind: "account"`）。監査の actor は従来どおり `commissioning`。
+- **ロックダウン（`POST /api/commissioning/lock-down`、MCP の `lock_down`）は、フラグの保存の直後に試運転の grant のトークンをすべて失効させる。** 以後そのトークンは 401、`GET /api/auth/identity` は `200 null`、開いていたストリームは次の再検証（15 秒以内）で `1008` / `session_revoked` で閉じる。監査の `detail` に `revokedGrants: n`。ロックダウンの操作自体に試運転中は grant のトークンが要る（アカウントの admin でも可）。
+- WebSocket の close の理由文 `commissioning_ended`（#440）は無くなった（試運転の grant も `session_revoked`）。
+- 試運転中のログアウトはトークンを捨てるだけで、次に保護画面を開くと画面が grant を黙って取り直す（試運転はロックダウンでしか終わらない。2026-10-02 のオーナー決定どおり）。アカウントでログインしているときは試運転中でもそのアカウントの権限で動き、設定画面の「セキュリティ」カテゴリ（ロックダウン）は grant のセッションのときだけ出る。
+- 試運転の grant セッションでもユーザーを削除できる（自己削除ガードの行 id 照合だけが外れる。admin 限定と「最後の admin は消せない」はそのまま）。
+- ユーザー削除以外の管理 REST の wire・設定・DB は変わらない。`/api/v1/*`（API キー）・MCP・gRPC は従来どおり試運転モードの対象外。
+
+### Banto アプリの自動発行（`crates/banto-hub-bootstrap`、#332）
+
+- 自己発行は「`GET /api/commissioning/status` → `POST /api/auth/grant/commissioning` → grant の bearer で `POST /api/api-keys`（旧キーの失効も同じ bearer）→ `POST /api/auth/logout`」の 4 手順になった。grant の 403/404 は `NeedsPairing`。grant は発行が終わったら成否に関わらず logout する。
+
+### 運用条件（リバースプロキシ配下、ADR-0017 §6）
+
+- 同一ホストのリバースプロキシの後ろでは外部の要求も loopback に見えるため、grant の loopback 判定は守りにならない。**外部公開の前にロックダウンする／再試運転の間も `/api/auth/grant/{kind}` をプロキシから外へ出さない**の 2 点を運用ガイド §6・§19 に書いた（技術的には防げない、運用に委ねる判断）。
+
+### 変更（内部）
+
+- banto の依存（`banto-core` / `banto-storage` / `banto-server` / `banto-admin-services`、`@banto/*`）を `v2.1.1` から `v3.0.0` に上げた。`Cargo.lock` は banto の 4 crate と workspace の版だけ、`pnpm-lock.yaml` は `@banto/*` のみ。
+- `apps/banto-hub/core/src/rest.rs`: `require_auth_or_commissioning` を `require_session` に改名し、未ロックダウン中の無認証の素通し・要求ごとの合成 identity・`RoleGuard` の試運転分岐・`acting_user` の合成を削除した。残したもの（#431）: `OperationKind::StopWrites`、`SessionCheck` の `Unverified`/`Revoked`、`session_gate_decision`、`STOP_SESSION_CHECK_TIMEOUT`、`UnverifiedStopException`、`/api/write-control/disable` だけへの適用。`extract_ws_protocol_token` と `SessionStreamCredential` も残し、grant のトークンを同じ `AuthState` の検証に接続した。`CommissioningStreamCredential` と `RevokedReason::CommissioningEnded` は削除。
+- `apps/banto-hub/core/src/commissioning.rs`: `commissioning_grant_spec`（kind `commissioning`、合成 admin 固定、条件 = 未ロックダウン、`require_loopback_peer: true`、`max_sessions` 16）。`CommissioningService::load` が `AuthState` を受け取り、`lock_down` が保存の直後に `revoke_grant_tokens` を呼んで件数を返す。
+- 管理 UI: `commissioningPolicy.ts`（policy runner、`adopt`/`end`）を削除し、`(app)/+layout.ts` は `grantFallback(..., { kind: 'commissioning' })`。`commissioningLockDown.ts` は「lock-down → 確認が `none` → /login」。`hubLogout.ts` は `logoutAndLeave` に委ねる。`tagMonitorAdmin.ts` のトークン無しの WS 分岐を削除。
+- ChronoGazer: コピーしていた `extra_auth_router` に空の `GrantRegistry` と `grant_router` を merge し、`GET /api/auth/status` は `{ initialized, grants: {} }`。`UsersService::delete_user` の acting id を `Option<i64>` に（grant セッションの分岐は banto v3.0.0 と同じ形。ChronoGazer に grant は無い）。閲覧公開は使わない。
+- テスト（ADR-0017 の必須項目）: 競合の統合テスト `an_issuance_parked_before_the_insert_loses_to_a_lock_down_that_completed_meanwhile`（`rest.rs`）、`tests/stream.rs` のブラウザ相当（`Sec-WebSocket-Protocol`）の接続とロックダウン後の `session_revoked`、grant の loopback 判定・ロックダウン後の 403、`tests/client_bootstrap.rs` の 4 手順、bootstrap crate の grant/logout の順序。
+
 ## v0.2.0-alpha.27 — 2026-10-02（アルファ）
 
 banto v2.1.1 に追従した（v2.0.0 → v2.1.0 → v2.1.1、経路 A のみ。Rust の `banto-*` と npm の `@banto/*` を同じタグに）。banto-hub の REST の wire・設定・DB は変わらない。配布物の構成・前提ランタイムは alpha.3 以降と同じ。

@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "banto-broker"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "banto-plc",
  "banto-plc-write",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "banto-collect"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "banto-core",
  "banto-plc",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "banto-expr"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "banto-hub-core"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "argon2",
  "axum 0.8.9",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "banto-hub-shell"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "banto-hub-core",
  "serde",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "banto-hub-sink"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "axum 0.8.9",
  "banto-broker",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "banto-plc"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "banto-plc-address",
  "encoding_rs",
@@ -614,11 +614,11 @@ dependencies = [
 
 [[package]]
 name = "banto-plc-address"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 
 [[package]]
 name = "banto-plc-write"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "banto-plc",
  "encoding_rs",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "banto-rtsp"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "banto-tagclient"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "futures-util",
  "reqwest",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "banto-tags"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "banto-core",
  "banto-plc-address",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "banto-tsquery"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "banto-tstore",
  "sqlx",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "banto-tstore"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "sqlx",
  "thiserror 2.0.21",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "chronogazer"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "axum 0.8.9",
  "banto-collect",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "chronogazer-core"
-version = "0.2.0-alpha.27"
+version = "0.2.0-alpha.28"
 dependencies = [
  "argon2",
  "axum 0.8.9",
