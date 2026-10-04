@@ -371,4 +371,64 @@ mod tests {
             pool.close().await;
         }
     }
+
+    /// バックアップと復元の往復を ChronoGazer の実際の migration の上で
+    /// （I2a #498 のレビューの任意提案、I2b で追加）: `init_db` で開いた DB で
+    /// バックアップを作る → 値を変える → そのバックアップの復元を予約する →
+    /// プールを閉じる → 起動時の適用（`apply_pending_restore_at_startup`）→
+    /// `init_db` でもう一度開く。復元した DB は新形式として通り（旧形式の
+    /// 拒否に当たらない・migrate は冪等）、値はバックアップ時のものに戻り、
+    /// 適用前の自動バックアップが残る。
+    #[tokio::test]
+    async fn backup_restore_round_trip_reopens_with_init_db() {
+        use crate::backup::BackupService;
+
+        let dir = crate::test_support::TempDir::new();
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        let pool = init_db(&db_path).await.expect("init_db");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('probe', 'at-backup')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()));
+        let created = backup.create().await.expect("create backup");
+        sqlx::query("UPDATE settings SET value = 'after-backup' WHERE key = 'probe'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        backup
+            .stage_restore_from_file(&created.file_name)
+            .await
+            .expect("stage restore");
+        assert!(backup.pending_restore().await.is_some());
+        pool.close().await;
+
+        let applied = BackupService::apply_pending_restore_at_startup(&db_path)
+            .await
+            .expect("apply at startup")
+            .expect("a staged restore is applied");
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("the restored DB must pass init_db");
+        let value: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'probe'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "at-backup");
+        let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()));
+        assert!(backup.pending_restore().await.is_none());
+        let names: Vec<String> = backup
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|info| info.file_name)
+            .collect();
+        assert!(
+            names.contains(&applied.pre_restore_backup_file_name),
+            "{names:?}"
+        );
+        pool.close().await;
+    }
 }
