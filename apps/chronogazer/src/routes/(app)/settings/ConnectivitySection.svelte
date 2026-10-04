@@ -28,6 +28,7 @@
 	import { isAdmin } from '$lib/permissions';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { pickPrimaryLanUrl } from './connectivityScope';
+	import { lanToggleLocked } from './lanToggle';
 
 	const tauri = isTauri();
 
@@ -102,6 +103,9 @@
 	// (`connectivityScope.ts`, copied from banto v2.0.0's admin-template) uses
 	// a real IPv4 loopback test and excludes the unspecified address (IPv4
 	// only, owner decision 2026-09-29).
+	const lanLocked = $derived(
+		lanToggleLocked(authSettingsStore.value?.disabled, viewerPublicDraft, enabledDraft)
+	);
 	const firstLanUrl = $derived(serverStatus ? pickPrimaryLanUrl(serverStatus.urls) : null);
 	const firstLanQrSvg = $derived(
 		firstLanUrl
@@ -126,15 +130,10 @@
 				を利用できます。書き込みは引き続きログインが必要です。
 			</p>
 
-			<label
-				class="toggle"
-				class:disabled={authSettingsStore.value?.disabled && !viewerPublicDraft}
-			>
-				<input
-					type="checkbox"
-					bind:checked={enabledDraft}
-					disabled={authSettingsStore.value?.disabled && !viewerPublicDraft}
-				/>
+			<!-- 「現在 OFF で有効化できない」ときだけ操作不可にする。ON のまま
+			     閲覧公開を先に外しても、LAN を止める操作は残す（PR #499 レビュー）。 -->
+			<label class="toggle" class:disabled={lanLocked}>
+				<input type="checkbox" bind:checked={enabledDraft} disabled={lanLocked} />
 				LANアクセスを有効にする
 			</label>
 			{#if authSettingsStore.value?.disabled}

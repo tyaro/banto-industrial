@@ -2018,6 +2018,11 @@ async fn settings_set(
     settings_set_body(&state, &actor, key, value).await
 }
 
+/// banto の閲覧公開の設定キー（`banto_admin_services::settings` の非公開の
+/// 定数と同じ綴り）。[`settings_set_body`] が拒否し、変更は [`server_apply`]
+/// だけが行う。
+const VIEWER_PUBLIC_KEY: &str = "server.viewer_public";
+
 /// Body of [`settings_set`]. banto v2.0.0 移行（freshness audit of banto
 /// #266, P2-2, S-103 - admin-template の同名関数の写し）: keys in the
 /// `auth.` namespace are refused - they are written only by
@@ -2035,6 +2040,15 @@ async fn settings_set_body(
     if SettingsService::is_auth_key(&key) {
         return Err(BantoError::BadRequest(format!(
             "設定 {key} はこのコマンドでは変更できません。認証モードは auth_config_apply（自動ログインは autologin_enable/autologin_disable）で変更してください"
+        )));
+    }
+    // I2b: 閲覧公開（`server.viewer_public`）は `server_apply` だけが変える。
+    // ここから書くと、保存後の閲覧者トークンの失効と、認証モードとの組み合わせの
+    // 検証（`auth_server_combination_allowed`）を通らず、OFF にしても発行済みの
+    // トークンが生き残る（PR #499 レビュー）。`auth.*` の拒否と同じ形。
+    if key == VIEWER_PUBLIC_KEY {
+        return Err(BantoError::BadRequest(format!(
+            "設定 {key}（閲覧公開）はこのコマンドでは変更できません。LAN の設定（server_apply）で変更してください"
         )));
     }
     state.settings.set(&key, &value).await?;
@@ -7099,29 +7113,48 @@ mod tests {
             .any(|(name, _)| name.as_deref() == Some("admin")));
     }
 
-    /// I2b（2026-10-04 オーナー決定で閲覧公開を使う）: I2a の暫定の拒否を
-    /// 外し、汎用の `settings_set` は admin-template v3.0.0 と同じく
-    /// `server.viewer_public` も書ける（`auth.*` だけを拒否する）。画面は
-    /// `server_apply` を使い、閲覧公開の OFF に伴う閲覧者のトークンの失効は
-    /// そちらが行う（`server_apply_viewer_public_round_trip_and_revocation`）。
-    #[tokio::test]
-    async fn settings_set_writes_the_viewer_public_key_like_admin_template() {
-        let state = app_state().await;
-        state
-            .users
-            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+    /// I2b（PR #499 レビュー P2）: 汎用の `settings_set` は閲覧公開
+    /// （`server.viewer_public`）を書けない。書けると `server_apply` の保存後の
+    /// 失効と組み合わせ検証を通らず、OFF にしても発行済みの閲覧者のトークンが
+    /// 生き残る。ON → 発行 → 汎用で OFF しようとすると拒否され、保存は ON の
+    /// まま、トークンも有効なまま（状態が一致）。反証: `settings_set_body` の
+    /// `VIEWER_PUBLIC_KEY` の拒否を外すと、保存が OFF になって落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settings_set_refuses_the_viewer_public_key() {
+        let state = admin_app_state().await;
+        let admin = state.users.get_by_username("admin").await.unwrap().unwrap();
+        let port = free_port();
+        apply(&state, true, port, true).await.expect("ON");
+        let (status, body) = http_on(port, "POST", "/api/auth/grant/publicViewer", None)
+            .await
+            .expect("answers");
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let viewer = body["token"].as_str().expect("token").to_string();
+
+        for value in ["false", "true"] {
+            let err = settings_set_body(
+                &state,
+                &admin,
+                "server.viewer_public".to_string(),
+                value.to_string(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, BantoError::BadRequest(_)), "{err:?}");
+        }
+
+        assert!(state.settings.server_config().await.unwrap().viewer_public);
+        assert!(
+            state.rest_auth.verify(&viewer),
+            "保存と同じくトークンも有効"
+        );
+        let (status, _) = http_on(port, "GET", "/api/tags", Some(&viewer))
             .await
             .unwrap();
-        let admin = state.users.get_by_username("admin").await.unwrap().unwrap();
-        settings_set_body(
-            &state,
-            &admin,
-            "server.viewer_public".to_string(),
-            "true".to_string(),
-        )
-        .await
-        .expect("settings_set");
-        assert!(state.settings.server_config().await.unwrap().viewer_public);
+        assert_eq!(status, 200);
+
+        stop_running_server(&state).await;
     }
 
     /// I2a（banto #280）: Tauri のバックアップも DB ファイルごとの
@@ -8335,6 +8368,35 @@ mod tests {
             .expect("apply");
 
         assert!(!state.rest_auth.verify(&token));
+    }
+
+    /// I2b（PR #499 レビュー P2）: ログイン不要モード + LAN + 閲覧公開が全部
+    /// ON の状態から、閲覧公開を外し LAN も止めて適用する（画面で閲覧公開を
+    /// 先に外した場合の操作順）。適用は通り、サーバーは止まり、発行済みの
+    /// 閲覧者のトークンは失効する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_apply_auth_disabled_stop_lan_and_viewer_public_revokes_tokens() {
+        let state = admin_app_state().await;
+        let port = free_port();
+        apply(&state, true, port, true).await.expect("ON");
+        let mut auth = state.settings.auth_config().await.unwrap();
+        auth.disabled = true;
+        state.settings.set_auth_config(&auth).await.expect("auth");
+        let (_, body) = http_on(port, "POST", "/api/auth/grant/publicViewer", None)
+            .await
+            .expect("answers");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let viewer = body["token"].as_str().expect("token").to_string();
+        assert!(state.rest_auth.verify(&viewer));
+
+        let status = apply(&state, false, port, false).await.expect("stop");
+
+        assert!(!status.running);
+        assert!(state.server.lock().await.is_none());
+        let saved = state.settings.server_config().await.unwrap();
+        assert!(!saved.enabled && !saved.viewer_public);
+        assert!(!state.rest_auth.verify(&viewer), "閲覧者のトークンは失効");
+        assert!(port_is_free(port));
     }
 
     /// `enabled = false` stops the running server (its port is released) and
