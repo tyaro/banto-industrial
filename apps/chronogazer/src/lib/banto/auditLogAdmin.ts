@@ -64,6 +64,7 @@ export function isAuditLogAvailable(): boolean {
 
 const ERROR_KINDS = new Set([
 	'not_found',
+	'bad_request',
 	'validation',
 	'unauthorized',
 	'forbidden',
@@ -147,8 +148,11 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 }
 
 /**
- * Mirrors `chronogazer_core::audit::AuditLogList` (#410): `ListResult` の綴り
- * そのままに、**この応答が使ったスナップショット境界** `asOfId` を足したもの。
+ * Mirrors `banto_admin_services::audit::AuditLogList`（I2a で banto のものに
+ * 置き換えた。#410）: `ListResult` の綴りそのままに、**この応答が使った
+ * スナップショット境界** `asOfId` を足したもの。サーバーは加えて剪定の世代
+ * `deletionEpoch`（banto #248 の受け皿）も返すが、この画面はまだ使わない
+ * ので型にも載せていない。
  */
 export interface AuditLogList extends ListResult<AuditLogEntry> {
 	asOfId: number;
