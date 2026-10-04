@@ -3,6 +3,9 @@
 	import { bantoReady } from '$lib/banto/setup'; // initBanto() (+ EventProvider) before any route guard runs (spec §3, §11.1)
 	import { settings } from '$lib/settings.svelte';
 	import ToastHost from '$lib/components/ToastHost.svelte';
+	// banto v3.0.0（#286）: 起動待ちは「起動中…」と「サーバーに接続できません
+	// ＋再接続」の 2 状態（`startup.ts` / `startupState.svelte.ts`）。
+	import StartupSplash from '$lib/components/StartupSplash.svelte';
 
 	let { children } = $props();
 
@@ -13,17 +16,8 @@
 </script>
 
 {#await bantoReady}
-	<p class="banto-splash">起動中…</p>
+	<StartupSplash />
 {:then}
 	{@render children()}
 	<ToastHost />
 {/await}
-
-<style>
-	.banto-splash {
-		min-height: 100vh;
-		display: grid;
-		place-items: center;
-		color: var(--banto-text-muted);
-	}
-</style>

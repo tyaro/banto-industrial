@@ -22,8 +22,10 @@
  * （`initBanto`）の上で、ガードの `load()` そのものを呼ぶ。`bantoReady` と
  * テーマ設定の同期だけを差し替える。
  *
- * 後半は、デスクトップ（Tauri の `auth_resolve` が DB エラーで reject する）と、
- * 起動時の「組み込みサーバーか」の判定（`isBantoAuthCheckResponse`）。
+ * 後半は、デスクトップ（Tauri の `auth_resolve` が DB エラーで reject する）。
+ * 起動時の「組み込みサーバーか」の判定（旧 `isBantoAuthCheckResponse`）は
+ * banto v3.0.0（#286、I2c）で `environment.ts` の `probeBackend` に置き換え、
+ * テストも `startup.test.ts` に移した。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isHttpError, isRedirect } from '@sveltejs/kit';
@@ -50,7 +52,7 @@ vi.mock('$lib/settings.svelte', () => ({
 }));
 
 import { load } from '../../routes/(app)/+layout';
-import { isBantoAuthCheckResponse, SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
+import { SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
 
 const TOKEN_KEY = 'banto.auth.token';
 
@@ -334,29 +336,5 @@ describe('(app) ガード: Tauri の auth_resolve が DB エラーで reject し
 		const revision = '1.0' as CredentialRevision;
 		tauriLike(async () => ({ status: 'none', checked: revision, current: revision }));
 		expect(await runGuard()).toEqual({ kind: 'redirect', location: '/login' });
-	});
-});
-
-describe('isBantoAuthCheckResponse: 組み込みサーバーの判定', () => {
-	it('200 / 401 はこのサーバー', async () => {
-		expect(await isBantoAuthCheckResponse(jsonResponse(200, false))).toBe(true);
-		expect(await isBantoAuthCheckResponse(jsonResponse(401, { kind: 'unauthorized' }))).toBe(true);
-	});
-
-	it('照合の 500（Banto のエラー本文）もこのサーバー - デモ用プロバイダーへ落ちない', async () => {
-		expect(
-			await isBantoAuthCheckResponse(
-				jsonResponse(500, { kind: 'storage', message: 'database is locked' })
-			)
-		).toBe(true);
-	});
-
-	it('Banto の本文を持たない応答（vite dev の HTML 404 など）はサーバー無し', async () => {
-		expect(
-			await isBantoAuthCheckResponse(
-				new Response('<!doctype html><title>404</title>', { status: 404 })
-			)
-		).toBe(false);
-		expect(await isBantoAuthCheckResponse(jsonResponse(500, { error: 'x' }))).toBe(false);
 	});
 });

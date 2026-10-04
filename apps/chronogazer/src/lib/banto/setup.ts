@@ -8,9 +8,10 @@
  * 1. **Tauri webview** (`isTauri()`) — `TauriDataProvider`/
  *    `TauriAuthProvider` over `invoke()`, `TauriEventProvider` over the
  *    `banto://event` Tauri event (no network either way).
- * 2. **LAN browser served by the embedded server** (`isEmbeddedServer()`,
- *    async probe) — `HttpDataProvider`/`HttpAuthProvider` over `fetch()`
- *    against the same REST API `admin-template-core::rest` exposes, and
+ * 2. **LAN browser served by the embedded server** (`probeBackend()`,
+ *    async probe; a failed probe is retried/surfaced, never read as demo —
+ *    Issue #286, `startup.ts`) — `HttpDataProvider`/`HttpAuthProvider` over
+ *    `fetch()` against the same REST API `admin-template-core::rest` exposes, and
  *    `SseEventProvider` over `GET /api/events`. This is what a second
  *    machine on the LAN gets, and it's also what `banto-serve` (this repo's
  *    Tauri-free dev vehicle) serves.
@@ -25,6 +26,19 @@
  * resource/schema definitions and AuthProvider/DataProvider/EventProvider
  * contracts stay identical across all three - UI code never branches on
  * environment (spec §11.1).
+ *
+ * banto v3.0.0（#286、I2c）: 環境の判定は admin-template と同じ形にした。
+ * 判定そのもの（`isTauri` / `probeBackend` / `isDemoBuild` / `CSRF_HEADER`）
+ * は `environment.ts`、判定の流れ（`resolveStartupTarget`）は `startup.ts`、
+ * 起動待ちの画面の状態は `startupState.svelte.ts`（いずれも banto v3.0.0 の
+ * 写し）。以前の `isEmbeddedServer()` は fetch の失敗・例外を「サーバー無し」
+ * と読み、LAN ビルドで一時的に届かないだけでも demo（メモリ上の空データ）に
+ * 落ちて二度と戻らなかった。今は demo になるのは `VITE_BANTO_DEMO=1` の
+ * ビルドか、同じオリジンが「`/api` は無い」と確定的に答えた（静的ホスト・
+ * `vite dev`/`vite preview` の 404）ときだけで、届かないときは起動待ちで
+ * 再試行し、届かなければ「サーバーに接続できません」と再接続ボタンを出す。
+ * 外へ出す名前（`isTauri` / `CSRF_HEADER` / `getBantoMode` など）はこのファイル
+ * から再エクスポートし、`*Admin.ts` の import は変えない。
  */
 import {
 	connectEvents,
@@ -45,20 +59,18 @@ import type { Notifier, UiSettingsProvider } from '@banto/admin-core';
 // when isTauri() is true.
 import { invoke } from '@tauri-apps/api/core';
 import { toastStore } from '$lib/toast.svelte';
-import { isBantoAuthCheckResponse } from './sessionGuard';
+import { CSRF_HEADER, isDemoBuild, isTauri, probeBackend } from './environment';
+import { resolveStartupTarget } from './startup';
+import { setStartupStatus, waitForStartupRetry } from './startupState.svelte';
 // banto v2.0.0（#260）: demo の AuthProvider は標準の契約（resolve・
 // credentialRevision・onCredentialChanged）を満たす admin-template の
 // `providers/demo.ts` の写し。v1 の check/getIdentity だけの provider のままだと
 // v2 の `initBanto` が TypeError を投げ、demo 起動が白画面になる。
 import { demoAuthProvider } from './providers/demo';
 
-/** True inside the Tauri webview, false in a plain browser tab (spec §11.1). */
-export function isTauri(): boolean {
-	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-}
-
-/** Shared with usersAdmin.ts (spec M10's `/api/users/*` calls need the same CSRF header every other fetch() here sends). */
-export const CSRF_HEADER = { 'X-Banto-Client': 'banto' } as const;
+// Re-exported so the rest of the app keeps importing from './setup' (one
+// public entry point; the split into environment.ts is an internal detail).
+export { CSRF_HEADER, isTauri };
 
 /**
  * Which of the three spec §11.1 environments this tab ended up wired to -
@@ -92,34 +104,6 @@ export function getUiSettings(): UiSettingsProvider {
 	return uiSettings;
 }
 
-/**
- * Is this plain-browser tab being served by the embedded Banto server
- * (`banto-server`/`admin-template-core::rest`, spec §11.1), as opposed to a
- * bare `vite dev`/`vite preview` tab with no Banto backend at all? Probed by
- * calling the one `/api` route that needs no auth token
- * (`GET /api/auth/check`): any HTTP response at all (`200` with a boolean
- * body when unauthenticated/authenticated, or an unexpected `401`/`403`)
- * means an `/api/*` route answered on the other end. A network error (no
- * server listening) or anything that isn't a plain HTTP response (e.g.
- * `vite dev`'s dev server 404ing with an HTML page for an unknown path)
- * means this is not our server. Never true inside Tauri - `isTauri()` is
- * checked first there and takes priority.
- *
- * banto v1.7.0 #204: a response carrying Banto's JSON error body (e.g. a
- * `500` when the server could not check an account) is still our server -
- * see `isBantoAuthCheckResponse`. Falling back to the demo providers there
- * would silently swap a real (if momentarily broken) backend for fake data.
- */
-async function isEmbeddedServer(): Promise<boolean> {
-	if (isTauri()) return false;
-	try {
-		const response = await fetch(`${location.origin}/api/auth/check`, { headers: CSRF_HEADER });
-		return await isBantoAuthCheckResponse(response);
-	} catch {
-		return false;
-	}
-}
-
 const notifier: Notifier = { notify: (kind, message) => toastStore.push(kind, message) };
 
 /**
@@ -132,7 +116,20 @@ const notifier: Notifier = { notify: (kind, message) => toastStore.push(kind, me
  * already safe.
  */
 export const bantoReady: Promise<void> = (async () => {
-	if (isTauri()) {
+	// Deployment kind is decided explicitly (Tauri / `VITE_BANTO_DEMO` build /
+	// a definitive "no Banto API here" answer); a transient probe failure is
+	// NOT "demo" - it stays on the splash screen with a retry button until the
+	// server answers (Issue #286, startup.ts).
+	const target = await resolveStartupTarget({
+		isTauri,
+		isDemoBuild,
+		probe: () => probeBackend(),
+		sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+		setStatus: setStartupStatus,
+		waitForRetry: waitForStartupRetry
+	});
+
+	if (target === 'tauri') {
 		bantoMode = 'tauri';
 		const dataProvider = createTauriDataProvider({ invoke });
 		const authProvider = createTauriAuthProvider({ invoke });
@@ -147,7 +144,7 @@ export const bantoReady: Promise<void> = (async () => {
 		return;
 	}
 
-	if (await isEmbeddedServer()) {
+	if (target === 'server') {
 		bantoMode = 'server';
 		const authProvider = createHttpAuthProvider();
 		const dataProvider = createHttpDataProvider({ getToken: authProvider.getToken });
@@ -157,7 +154,8 @@ export const bantoReady: Promise<void> = (async () => {
 		return;
 	}
 
-	// Plain `vite dev`/`vite preview`: no Banto backend at all, no EventProvider.
+	// Intended demo (static hosting / `vite dev`/`vite preview`, or a
+	// `VITE_BANTO_DEMO=1` build): no Banto backend at all, no EventProvider.
 	// No resources registered yet (R1-B adds the first real ones - PLC
 	// connections/collection groups/tags/display groups); an empty seed is a
 	// valid InMemoryDataProvider input.

@@ -13,7 +13,8 @@ migration のコピー・旧形式の DB の拒否、オーナー決定・実装
 ChronoGazer のサービスと REST ルーターを banto のものに置き換えたこと（実装済み）と、
 それに伴うオーナー決定 2 点（#280 の旧バックアップは警告のみ・閲覧公開は画面に出さない）を追記。
 同日: §5 に LAN 設定の適用を banto に寄せたこと（I2b、実装済み）と、閲覧公開を使うオーナー決定
-（前の決定を変更）を追記。
+（前の決定を変更）を追記。同日: §5 に起動時の環境判定を banto に寄せたこと
+（I2c、実装済み。一時的に届かないときは demo に落とさず起動待ちで再試行）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -292,7 +293,21 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     ユーザー管理・監査ログ・設定は出さない（`navigation.ts` の `NavItem.publicViewer`）。
     I2a の暫定の塞ぎ（`settings_set` の拒否・常に OFF で保存）は外した。
 
-  続き（未着手）: 初回セットアップ画面・起動時の環境判定の I2c、banto-hub 側の I3'。手順と
+- **起動時の環境判定を banto に寄せる（2026-10-04、実装済み）**: banto に寄せる作業の段階名では
+  I2c（banto v2.1.0 の #286）。ChronoGazer の `setup.ts` の `isEmbeddedServer()` は
+  `GET /api/auth/check` の fetch の失敗・例外を「サーバー無し」と読み、LAN/REST のビルドで一時的に
+  届かないだけで demo（メモリ上の空データ）に落ちて戻らなかった。admin-template v3.0.0 の
+  `environment.ts`（`probeBackend` の 3 値 server / none / unreachable、`isDemoBuild` =
+  `VITE_BANTO_DEMO=1`）・`startup.ts`（`resolveStartupTarget`）・`startupState.svelte.ts`・
+  `StartupSplash.svelte` を写し（文言は日本語の直書き）、届かないときは起動待ちで自動再試行
+  （2 回）→「サーバーに接続できません」+「再接続」にした。demo になるのは `VITE_BANTO_DEMO=1` の
+  ビルドと、同じオリジンが「`/api` は無い」と確定的に答えたときだけ。ChronoGazer には demo を
+  静的に公開する経路が無いので、`VITE_BANTO_DEMO=1` を設定する場所は無い。banto-hub は `server`
+  固定で probe しないので対象外。既知の制約（上流と同じ）: スプラッシュが出るのは `/login` など
+  保護されていない画面だけで、`/`・`/monitor` などを開くと `(app)` のガードの `load` が判定を待つため
+  届かない間は真っ白のまま（demo には落ちない。再読み込みで開く）。
+
+  続き（未着手）: 初回セットアップ画面、banto-hub 側の I3'。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
   監査ログ・バックアップ」「LAN アクセスと閲覧公開」と `apps/chronogazer/core/src/rest.rs` の
   モジュール doc
