@@ -12,12 +12,14 @@ T21 構成補助 MCP 管理面を含む、2026-09-06）。残 T18-5c/d（Windows
 migration のコピー・旧形式の DB の拒否、オーナー決定・実装済み）を追記。2026-10-04: §5 に
 ChronoGazer のサービスと REST ルーターを banto のものに置き換えたこと（実装済み）と、
 それに伴うオーナー決定 2 点（#280 の旧バックアップは警告のみ・閲覧公開は画面に出さない）を追記。
+同日: §5 に LAN 設定の適用を banto に寄せたこと（I2b、実装済み）と、閲覧公開を使うオーナー決定
+（前の決定を変更）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
-地図は [README.md](README.md)**（2026-09-24 更新。本文の T 系表は 2026-08-08 時点の
+地図は [README.md](README.md)**（2026-10-04 更新。本文の T 系表は 2026-08-08 時点の
 まま — 実装状況の正は banto-hub-remaining-plan.md/banto-hub-desktop-plan.md）
 最終検証日(コード照合): 2026-09-01
 
@@ -266,15 +268,34 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   バックアップ保存先の DB ごとの分離）が入った。オーナー決定は 2 点:
   - **#280 の旧バックアップは起動時の警告のみ**（banto の既定どおり。共有領域
     `<DB のフォルダ>/backups/` 直下に残ったファイルを移す処理は作らない）。
-  - **閲覧公開（`server.viewer_public`・`POST /api/auth/grant/publicViewer`）は設定画面に
-    出さない**（既定 OFF）。`GrantRegistry` は空のまま（grant の口は常に 404）で、加えて
-    汎用の `settings_set` から `server.viewer_public` を書かせず、LAN 公開の保存では常に OFF を
-    書く - 書けると banto の「認証無効 + LAN 有効は閲覧公開のときだけ可」の緩和が効くため。
+  - ~~**閲覧公開（`server.viewer_public`・`POST /api/auth/grant/publicViewer`）は設定画面に
+    出さない**（既定 OFF）~~ → **同日のオーナー決定で変更**（下の I2b）。I2a の時点では
+    `GrantRegistry` を空にし、汎用の `settings_set` から `server.viewer_public` を書かせず、
+    LAN 公開の保存では常に OFF を書いていた（暫定の塞ぎ。I2b で外した）。
 
-  続き（未着手）: 埋め込みサーバーの適用（`server_apply`）を banto に寄せる I2b、初回
-  セットアップ画面・起動時の環境判定の I2c、banto-hub 側の I3'。手順と wire の変化は
-  [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・監査ログ・
-  バックアップ」と `apps/chronogazer/core/src/rest.rs` のモジュール doc
+- **LAN 設定の適用を banto に寄せ、閲覧公開を使う（2026-10-04、実装済み）**: banto に寄せる
+  作業の段階名では I2b。
+  - **適用の順序**: ChronoGazer の `server_apply`（`src-tauri`）は「保存 → 停止 → 起動」で
+    ロールバックが無く、使用中のポートで適用すると新しい値が保存されたまま旧サーバーも
+    止まっていた。admin-template v3.0.0 の形（banto v2.1.0 の #287・#288・#294）に揃えた:
+    検証 → 旧サーバー停止 → `banto_server::bind` → 保存（`auth_config_lock` の下）→
+    `BoundServer::serve`。bind か保存に失敗したら何も保存せず旧設定でサーバーを起こし直し、
+    `settings_change` / `failed` を監査する。起動時の自動開始の判定も banto の
+    `auth_server_combination_allowed` に揃えた。
+  - **オーナー決定（2026-10-04）: ChronoGazer でも閲覧公開を使う**（同日 I2a の「画面に
+    出さない」を変更）。手元の端末はログイン不要モード、LAN の相手には閲覧だけ、という
+    banto の使い方をする。REST（`core/src/rest.rs`・`banto-serve`・デスクトップの組み込み
+    サーバー）は `GrantSpec::public_viewer` を登録し、設定の「接続」に admin-template と
+    同じ項目を出す。閲覧公開を OFF で適用すると保存の直後に発行済みの閲覧者のトークンを
+    失効させる（ADR-0017 の順序）。「ログイン不要モード + LAN」は閲覧公開 ON のときだけ。
+    閲覧者に見せる画面は監視・ヒストリカル・イベントで、タグ設定（PLC の接続先を含む）・
+    ユーザー管理・監査ログ・設定は出さない（`navigation.ts` の `NavItem.publicViewer`）。
+    I2a の暫定の塞ぎ（`settings_set` の拒否・常に OFF で保存）は外した。
+
+  続き（未着手）: 初回セットアップ画面・起動時の環境判定の I2c、banto-hub 側の I3'。手順と
+  wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
+  監査ログ・バックアップ」「LAN アクセスと閲覧公開」と `apps/chronogazer/core/src/rest.rs` の
+  モジュール doc
 
 - **ハイブリッドトレンド**: メモリ上のローリング窓（直近）+ DB（過去、
   間引き済み）を、チャート viewport の参照位置で継ぎ目なく合成する
