@@ -32,6 +32,7 @@
 //!    不正な bind は 422 で拒否・保存されない、DB に不正値が直接書かれた
 //!    状態で `apply` してもプロセスは落ちない
 
+use banto_hub_core::db::Db;
 use banto_hub_core::rest::user_session_lookup;
 use banto_server::SessionValidation;
 use std::sync::Arc;
@@ -223,8 +224,8 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
-    let users = UsersService::new(pool.clone());
-    let audit = AuditLogService::new(pool.clone());
+    let users = UsersService::new(Db::Sqlite(pool.clone()));
+    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
         .setup_first_user("admin", "password123", "管理者")
         .await
@@ -295,7 +296,7 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
     };
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
-    let settings = SettingsService::new(pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");

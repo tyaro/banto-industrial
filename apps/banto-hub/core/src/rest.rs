@@ -26,6 +26,43 @@
 //!   （`openapi_json` 関数の doc comment・`openapi_router` の doc comment
 //!   参照）。
 //!
+//! ## banto のルーターをそのまま使う（I3'、2026-10-04）
+//!
+//! 管理系のうち `/api/auth/{status,setup,change-password}`（+ 試運転の
+//! `POST /api/auth/grant/commissioning`）・`/api/users/*`・`/api/audit-log/*`
+//! と、ログイン/ログアウトの監査・成功の監査（`record_write`）・監査の actor の
+//! 解決（`actor_identity`）は `banto_server::routes` のものを使う（以前は
+//! chronogazer/relay-wright からのコピーを持っていた。独自実装は banto に
+//! 寄せる、2026-10-01 オーナー方針。ChronoGazer の I2a #498 と同じ）。
+//! サービス（users/audit/settings）も banto の `banto-admin-services` のもの
+//! （`crate::users`・`crate::audit`・`crate::settings` の doc comment）。
+//!
+//! 自前のまま残しているもの（banto-hub 固有）: 管理系の認証ゲート
+//! [`require_session`]（#431 の `StopWrites`・[`SessionCheck`] の区別・5 秒の
+//! 上限・[`UnverifiedStopException`]）とその後ろの RBAC の床
+//! [`SessionRoleGuard`]（banto の `RoleGuard` に替えない理由はその doc
+//! comment）、[`extract_ws_protocol_token`] と `crate::stream` の
+//! `SessionStreamCredential`、[`require_editor`]、API キー・MCP・gRPC・
+//! 書き込み監査・pending changes・sink・タグ空間などの各ルーター。
+//!
+//! banto のものに替えて変わった振る舞い（wire・監査の語彙を含む）:
+//!
+//! - 初回セットアップが 1 文で原子的になった（banto #277）。同時に来ても
+//!   アカウントは 1 つだけで、残りは `200 { success: false, error }`。
+//! - 失敗ログインの監査の `actorUsername` は 32 文字に切り詰められ
+//!   （末尾が `…`）、存在しない長い名前でもダミーの検証が走る。トークン
+//!   無し・無効なトークンのログアウトは記録されない（banto #278）。
+//! - 監査ログ一覧の応答に `deletionEpoch` が乗る（#248 の受け皿。画面は
+//!   まだ使わない）。`asOfId` が読めないときは axum 既定の平文の 400 では
+//!   なく JSON の `400 { kind: "bad_request" }`。
+//! - `PUT /api/audit-log/config` の成功の監査は `action: "settings_change"`・
+//!   `resource: "settings"`・`entityId: null`（以前は `update` /
+//!   `audit_log_config` / `"1"`）。`/api/audit-log/config` の権限拒否の
+//!   `resource` も `settings`（一覧の拒否は従来どおり `audit_log`）。
+//! - `POST /api/auth/change-password` を grant のセッション（試運転）で
+//!   呼ぶと `403` と `password_change` の `denied` の監査（ADR-0017: grant は
+//!   資格情報の持ち主ではない）。
+//!
 //! ## I1 CRUD 書き込み後の catalog commit（T14-3）
 //!
 //! `tag_registry_router` の書き込みハンドラ（create/update/delete、3
@@ -72,10 +109,13 @@ use banto_plc::{
     Address, BatchReadRequest, BatchReadResult, DataType, ModbusTcpClient, ModbusTcpConfig,
     PlcClient, PlcError, ReadRequest, ReadResult, SlmpClient, SlmpConfig,
 };
+use banto_server::routes::{
+    actor_identity, audit_log_router, audit_logout_middleware, extra_auth_router, record_write,
+    users_router, LogoutAuditState,
+};
 use banto_server::{
-    auth_routes, grant_router, require_banto_client_header, sse_route, ApiError, AuthState,
-    AuthenticatedSession, GrantKind, GrantRegistry, Identity, ServerEvent, SessionAccount,
-    SessionStamp, SessionValidation,
+    auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, AuthenticatedSession,
+    GrantRegistry, ServerEvent,
 };
 use banto_tags::{
     BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup,
@@ -97,29 +137,46 @@ use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::computed::ComputedEngine;
 use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
+use crate::db::Db;
 use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::{PendingChange, PendingChangesService};
-use crate::settings::{AuditSettings, MqttSettings, SettingsService, StoreSettings};
+use crate::settings::{HubSettingsExt, MqttSettings, SettingsService, StoreSettings};
 use crate::sink::{
     reject_delete_if_referenced_by_sink_group, remove_tag_from_all_sink_groups, SinkGroup,
     SinkGroupInput, SinkGroupService, SinkGroupStatusPush, SinkStatusSnapshot, SinkStatusStore,
 };
 use crate::system_info::{SystemInfoSampler, SystemInfoSnapshot};
-use crate::users::{Role, UserIdentity, UserSummary, UsersService};
+use crate::users::{Role, UsersService};
 use crate::value_source::{effective_simulation_for_tag, value_source_for_tag};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
 use crate::write_control::WriteControl;
 use crate::write_rate::WriteRateLimiter;
 
-// --- shared helpers (users/audit/RBAC - copied from chronogazer/relay-wright's rest.rs) ---
+// --- shared helpers -------------------------------------------------------
+//
+// I3'（2026-10-04）: bearer の取り出し（[`bearer_token`]）・監査の actor の解決
+// （`actor_identity`）・成功の監査（`record_write`）は `banto_server::routes` の
+// ものを使う（以前は chronogazer/relay-wright からのコピーを持っていた）。
+// `crate::mcp`・`crate::stream` などが `crate::rest::bearer_token` のパスで
+// 使うので re-export する。
+//
+// 試運転モード（未ロックダウン）でも **合成 identity を要求ごとに返す分岐は
+// 無い**（banto v3.0.0 追従、2026-10-04、ADR-0017）。試運転中の操作は
+// `POST /api/auth/grant/commissioning` で発行された grant トークン
+// （`crate::commissioning::commissioning_grant_spec`、identity は
+// `synthetic_identity()` 固定）で行われ、`AuthState` のトークン表に載っている
+// ので、`actor_identity` はロックダウンの前後を問わず同じ 1 本の経路でよい。
+// 監査ログ (`audit_log.actor_username`) に残る値は従来と同じ `commissioning`
+// （設計 §5.6「試運転モード中に行われた操作」だと後から判別できる）。
 
-pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-}
+pub(crate) use banto_server::routes::bearer_token;
+
+// I3': `/api/auth/{status,setup,change-password}`・`/api/users/*`・
+// `/api/audit-log/*` とログイン/ログアウトの監査は banto のルーターを使う。
+// 各ホスト（`crate::runtime`・テスト）が使う 3 つは、これまでの
+// `banto_hub_core::rest::*` のパスのまま呼べるよう re-export する。
+pub use banto_server::routes::{audited_credential_verifier, user_auth_state, user_session_lookup};
 
 /// `banto_server::require_auth`'s own 401 body, reproduced here for
 /// `require_tag_space_auth` (T0-2's `/api/v1/*` auth middleware below) since
@@ -128,20 +185,6 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// for all of its (simplified, single-status) auth failure branches.
 pub(crate) fn unauthorized_response() -> Response {
     (StatusCode::UNAUTHORIZED, Json(ErrorBody::Unauthorized)).into_response()
-}
-
-/// bearer token から identity を引く（監査の actor・`require_editor` の判定用）。
-///
-/// banto v3.0.0 追従（2026-10-04、ADR-0017）: 試運転モード（未ロックダウン）でも
-/// **合成 identity を要求ごとに返す分岐は無い**。試運転中の操作は
-/// `POST /api/auth/grant/commissioning` で発行された grant トークン
-/// （`crate::commissioning::commissioning_grant_spec`、identity は
-/// `synthetic_identity()` 固定）で行われ、`AuthState` のトークン表に載っている
-/// ので、ここはロックダウンの前後を問わず同じ 1 本の経路でよい。監査ログ
-/// (`audit_log.actor_username`) に残る値は従来と同じ `commissioning`
-/// （設計 §5.6「試運転モード中に行われた操作」だと後から判別できる）。
-fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
-    bearer_token(headers).and_then(|token| auth.identity_for(token))
 }
 
 /// [`require_session`]の`middleware::from_fn_with_state`用 state。従来の
@@ -385,35 +428,27 @@ fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> 
     Some(parts[1].to_string())
 }
 
-/// Record a successful write once the service call it follows has already
-/// succeeded - same convention as chronogazer/relay-wright's `record_write`.
-#[allow(clippy::too_many_arguments)]
-async fn record_write(
-    audit: &AuditLogService,
-    auth: &AuthState,
-    headers: &HeaderMap,
-    action: &str,
-    resource: &str,
-    entity_id: &str,
-    detail: Option<serde_json::Value>,
-) {
-    let identity = actor_identity(headers, auth);
-    audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action,
-            resource,
-            entity_id: Some(entity_id),
-            detail,
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-}
-
+/// [`require_session_role`] の state: [`require_session`] の後ろに積む
+/// RBAC の床（`banto_server::routes::RoleGuard` と同じ 4 フィールド）。
+///
+/// **banto の `RoleGuard`/`require_role_at_least` に置き換えない**（I3'、
+/// 2026-10-04 の判断）。banto のものは、手前のゲートが
+/// `AuthenticatedSession` を載せていないとき `AuthState::authenticate`
+/// （DB でのアカウント照合）でやり直し、DB が答えなければ 500 にする。
+/// [`require_session`] は #431 の例外（[`GateDecision::AllowUnverifiedStop`]、
+/// DB が照合に答えられないときの緊急停止 `POST /api/write-control/disable`）で
+/// まさにそのセッションを載せずに通すので、banto の床に替えると緊急停止が
+/// 床で 500 になり、#431 が無効になる（tests/write.rs の
+/// 「照合できないときも止められる」テストが落ちる）。こちらはメモリ上の
+/// トークン（`identity_for`）に戻る。`/api/tag-stream` の
+/// `Sec-WebSocket-Protocol` からの bearer も見る（[`extract_ws_protocol_token`]）。
+///
+/// banto のルーター（`users_router`・`audit_log_router`）は banto の
+/// `require_auth` + `RoleGuard` を自分で積んでいるので、この型は使わない
+/// （どちらも #431 の例外の無い通常の操作で、`require_auth` は
+/// [`require_session`] の [`OperationKind::Normal`] と同じ判断をする）。
 #[derive(Clone)]
-struct RoleGuard {
+struct SessionRoleGuard {
     auth: AuthState,
     min: Role,
     resource: &'static str,
@@ -479,8 +514,8 @@ fn missing_write_scope_response() -> Response {
         .into_response()
 }
 
-async fn require_role_at_least(
-    State(guard): State<RoleGuard>,
+async fn require_session_role(
+    State(guard): State<SessionRoleGuard>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -563,751 +598,6 @@ async fn require_editor(
         }
         None => Err(BantoError::Unauthorized),
     }
-}
-
-// --- users admin (spec-equivalent of chronogazer's M10 users_router) ------
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UserIdentityResponse {
-    id: i64,
-    username: String,
-    display_name: String,
-    role: Role,
-}
-
-impl From<UserIdentity> for UserIdentityResponse {
-    fn from(identity: UserIdentity) -> Self {
-        Self {
-            id: identity.id,
-            username: identity.username,
-            display_name: identity.display_name,
-            role: identity.role,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateUserRequest {
-    username: String,
-    password: String,
-    display_name: String,
-    role: Role,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateUserRequest {
-    display_name: String,
-    role: Role,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResetPasswordRequest {
-    new_password: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ResetPasswordResponse {
-    success: bool,
-}
-
-#[derive(Clone)]
-struct UsersAdminState {
-    users: UsersService,
-    auth: AuthState,
-    audit: AuditLogService,
-}
-
-/// `users_delete`専用: 呼び出し元自身の numeric row id を解決する
-/// （自己削除ガード`UsersService::delete_user`のdoc comment参照）。grant
-/// セッション（試運転）は行を持たないので呼ばない（[`users_delete`]）。
-async fn acting_user(
-    headers: &HeaderMap,
-    auth: &AuthState,
-    users: &UsersService,
-) -> Result<UserIdentity, BantoError> {
-    let username = bearer_token(headers)
-        .and_then(|token| auth.identity_for(token))
-        .map(|identity| identity.id);
-    let Some(username) = username else {
-        return Err(BantoError::Unauthorized);
-    };
-    users
-        .get_by_username(&username)
-        .await?
-        .ok_or(BantoError::Unauthorized)
-}
-
-async fn users_list(
-    State(state): State<UsersAdminState>,
-) -> Result<Json<Vec<UserSummary>>, ApiError> {
-    Ok(Json(state.users.list_users().await?))
-}
-
-async fn users_create(
-    State(state): State<UsersAdminState>,
-    headers: HeaderMap,
-    Json(body): Json<CreateUserRequest>,
-) -> Result<Json<UserIdentityResponse>, ApiError> {
-    let identity = state
-        .users
-        .create_user(
-            &body.username,
-            &body.password,
-            &body.display_name,
-            body.role,
-        )
-        .await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "create",
-        "users",
-        &identity.id.to_string(),
-        Some(json!({ "username": identity.username, "role": identity.role })),
-    )
-    .await;
-    Ok(Json(identity.into()))
-}
-
-async fn users_update(
-    State(state): State<UsersAdminState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(body): Json<UpdateUserRequest>,
-) -> Result<Json<UserSummary>, ApiError> {
-    let updated = state
-        .users
-        .update_user(id, &body.display_name, body.role)
-        .await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        "users",
-        &id.to_string(),
-        Some(json!({ "role": updated.role })),
-    )
-    .await;
-    Ok(Json(updated))
-}
-
-async fn users_reset_password(
-    State(state): State<UsersAdminState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(body): Json<ResetPasswordRequest>,
-) -> Result<Json<ResetPasswordResponse>, ApiError> {
-    state.users.reset_password(id, &body.new_password).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "password_reset",
-        "users",
-        &id.to_string(),
-        None,
-    )
-    .await;
-    Ok(Json(ResetPasswordResponse { success: true }))
-}
-
-/// `DELETE /api/users/{id}`。自己削除ガードには呼び出し元の行 id が要る
-/// （`UsersService::delete_user`）が、grant セッション（ADR-0017 §3。試運転の
-/// 合成 admin）は固定 identity で行を持たない。**手前の [`require_session`] が
-/// 照合した `AuthenticatedSession` の `grant.is_some()` で判定したときだけ**
-/// （identity の名前では判定しない）行 id を渡さない。アカウントのセッション
-/// で行を引けなければ従来どおり `Unauthorized`。admin の床（`RoleGuard`）と
-/// 「最後の admin は消せない」は grant でも変わらない。
-async fn users_delete(
-    State(state): State<UsersAdminState>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    let is_grant = session.is_some_and(|axum::Extension(session)| session.grant.is_some());
-    let acting_id = if is_grant {
-        None
-    } else {
-        Some(acting_user(&headers, &state.auth, &state.users).await?.id)
-    };
-    state.users.delete_user(id, acting_id).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "delete",
-        "users",
-        &id.to_string(),
-        None,
-    )
-    .await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn users_router(users: UsersService, audit: AuditLogService, auth: AuthState) -> Router {
-    let state = UsersAdminState {
-        users,
-        auth: auth.clone(),
-        audit: audit.clone(),
-    };
-    Router::new()
-        .route("/api/users", get(users_list).post(users_create))
-        .route(
-            "/api/users/{id}",
-            axum::routing::put(users_update).delete(users_delete),
-        )
-        .route("/api/users/{id}/reset-password", post(users_reset_password))
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                min: Role::Admin,
-                resource: "users",
-                audit,
-            },
-            require_role_at_least,
-        ))
-        .layer(middleware::from_fn_with_state(
-            AuthGate {
-                auth,
-                operation: OperationKind::Normal,
-            },
-            require_session,
-        ))
-}
-
-// --- extra auth routes (status/setup/change-password) ---------------------
-
-#[derive(Clone)]
-struct UsersAuthState {
-    users: UsersService,
-    auth: AuthState,
-    audit: AuditLogService,
-    allow_setup: bool,
-    /// ADR-0017: この Hub が資格情報なしで発行する grant の登録
-    /// （試運転の `commissioning` だけ。閲覧公開は無い）。`status` が
-    /// `availability(peer)` を `grants` として載せ、`grant_router` が発行する。
-    registry: Arc<GrantRegistry>,
-}
-
-/// `GET /api/auth/status` の応答: `{ initialized, grants: { commissioning: bool } }`
-/// （banto v3.0.0 の `AuthStatusResponse` と同じ形。`viewerPublic` は無い）。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthStatusResponse {
-    initialized: bool,
-    /// この peer にいま発行できる grant（`GrantRegistry::availability`。発行
-    /// 処理と同じ判定）。`commissioning` は「未ロックダウン かつ peer が
-    /// loopback」。画面の `grantFallback(..., { kind: 'commissioning' })` が
-    /// これを見て `POST /api/auth/grant/commissioning` を叩く。
-    grants: std::collections::BTreeMap<GrantKind, bool>,
-}
-
-/// 接続の peer アドレス（banto-server の `MaybePeerAddr` の写し。あちらは
-/// `pub(crate)`）。`ConnectInfo<SocketAddr>` は `banto_server::start` の起動経路
-/// では常にあり、`tower::oneshot` のテストでは無い（`None`）。grant の判定は
-/// peer 不明を「発行しない」に倒す（ADR-0017 §2「peer の検査」）。
-struct MaybePeerAddr(Option<std::net::SocketAddr>);
-
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybePeerAddr {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(MaybePeerAddr(
-            parts
-                .extensions
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|info| info.0),
-        ))
-    }
-}
-
-async fn auth_status_handler(
-    State(state): State<UsersAuthState>,
-    MaybePeerAddr(peer): MaybePeerAddr,
-) -> Result<Json<AuthStatusResponse>, ApiError> {
-    let initialized = state.users.is_initialized().await?;
-    let grants = state.registry.availability(peer).await;
-    Ok(Json(AuthStatusResponse {
-        initialized,
-        grants,
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetupRequest {
-    username: String,
-    password: String,
-    display_name: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SetupResponse {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
-}
-
-async fn auth_setup_handler(
-    State(state): State<UsersAuthState>,
-    Json(body): Json<SetupRequest>,
-) -> Result<Response, ApiError> {
-    if !state.allow_setup {
-        let message = "このサーバーでは初期セットアップが許可されていません".to_string();
-        return Ok((StatusCode::FORBIDDEN, Json(ErrorBody::Other { message })).into_response());
-    }
-
-    match state
-        .users
-        .setup_first_user(&body.username, &body.password, &body.display_name)
-        .await
-    {
-        Ok(user) => {
-            // banto v1.7.0 #204: 新しいアカウントの `(id, auth_epoch)` に結び
-            // 付けて発行する。`issue_token`（世代なし）は `Lookup` 付きの
-            // `AuthState` では最初の要求で拒否される。
-            let account = session_account(&user);
-            let identity = account.identity.clone();
-            state
-                .audit
-                .record(AuditEntry {
-                    actor_username: Some(&identity.id),
-                    actor_role: Some(&identity.role),
-                    action: "setup",
-                    resource: "auth",
-                    entity_id: None,
-                    detail: None,
-                    origin: "rest",
-                    result: "ok",
-                })
-                .await;
-            let token = state.auth.issue_account_token(account, false);
-            Ok(Json(SetupResponse {
-                success: true,
-                error: None,
-                token: Some(token),
-            })
-            .into_response())
-        }
-        Err(err @ BantoError::Validation { .. }) => Err(ApiError(err)),
-        Err(other) => Ok(Json(SetupResponse {
-            success: false,
-            error: Some(other.to_string()),
-            token: None,
-        })
-        .into_response()),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChangePasswordRequest {
-    current_password: String,
-    new_password: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ChangePasswordResponse {
-    success: bool,
-}
-
-async fn auth_change_password_handler(
-    State(state): State<UsersAuthState>,
-    headers: HeaderMap,
-    Json(body): Json<ChangePasswordRequest>,
-) -> Result<Json<ChangePasswordResponse>, ApiError> {
-    // banto v1.7.0 #204: `require_auth` の外なので、`identity_for`（メモリ上の
-    // 値だけ）ではなく `authenticate` でアカウントと照合する。削除・世代の
-    // 変わったアカウントのセッションは 401（パスワード変更に進ませない）。
-    let Some(token) = bearer_token(&headers) else {
-        return Err(ApiError(BantoError::Unauthorized));
-    };
-    let Some(session) = state.auth.authenticate(token).await? else {
-        return Err(ApiError(BantoError::Unauthorized));
-    };
-    let identity = session.identity;
-
-    let new_epoch = state
-        .users
-        .change_password(&identity.id, &body.current_password, &body.new_password)
-        .await?;
-    // 変更で世代が進み、このアカウントのセッション（他の端末・Tauri・
-    // Remember me）はすべて終わる。現在のパスワードを示したこのトークンだけ
-    // 新しい世代へ付け替える - ただし照合してからの変更がこの 1 回だけの
-    // とき（あいだにロール変更などが挟まったら、他と同じく終わらせる）。
-    // 付け替えに失敗（その間に失効）しても、変更自体は成功している。
-    if let Some(stamp) = session.stamp {
-        if new_epoch == stamp.auth_epoch + 1 {
-            state.auth.rotate_session_epoch(token, stamp, new_epoch);
-        }
-    }
-    let entity_id = state
-        .users
-        .get_by_username(&identity.id)
-        .await
-        .ok()
-        .flatten()
-        .map(|user| user.id.to_string());
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&identity.id),
-            actor_role: Some(&identity.role),
-            action: "password_change",
-            resource: "users",
-            entity_id: entity_id.as_deref(),
-            detail: None,
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-    Ok(Json(ChangePasswordResponse { success: true }))
-}
-
-/// banto v3.0.0 の `banto_server::routes::extra_auth_router` のコピー（status /
-/// setup / change-password + `grant_router`）。banto 側は `UsersService` が
-/// `banto-admin-services` のものなので、自前の `UsersService` を持つ banto-hub は
-/// コピーを保つ（ADR-0017「移行手順」3）。`grant_router` は
-/// `POST /api/auth/grant/{kind}` の 1 本で、`registry` に無い kind は 404、条件
-/// （未ロックダウン）が閉じている・peer が loopback でない・不明・判定の間に
-/// ロックダウンが完了した（世代の不一致）は 403。CSRF（`X-Banto-Client`）は
-/// 呼び出し側が `admin` ルーター全体に掛ける層が効く。
-fn extra_auth_router(
-    users: UsersService,
-    auth: AuthState,
-    audit: AuditLogService,
-    allow_setup: bool,
-    registry: Arc<GrantRegistry>,
-) -> Router {
-    let state = UsersAuthState {
-        users,
-        auth: auth.clone(),
-        audit,
-        allow_setup,
-        registry: registry.clone(),
-    };
-    Router::new()
-        .route("/api/auth/status", get(auth_status_handler))
-        .route("/api/auth/setup", post(auth_setup_handler))
-        .route(
-            "/api/auth/change-password",
-            post(auth_change_password_handler),
-        )
-        .with_state(state)
-        .merge(grant_router(auth, registry))
-}
-
-/// Wraps `UsersService::verify` as the async credential verifier
-/// `banto_server::AuthState::new` expects, additionally recording a
-/// `login`/`login_failed` audit entry - copied from chronogazer's
-/// `audited_credential_verifier`.
-pub fn audited_credential_verifier(
-    users: UsersService,
-    audit: AuditLogService,
-) -> impl Fn(String, String) -> futures_util::future::BoxFuture<'static, Option<Identity>>
-       + Send
-       + Sync
-       + 'static {
-    move |username: String, password: String| {
-        let users = users.clone();
-        let audit = audit.clone();
-        Box::pin(async move {
-            match users.verify(&username, &password).await {
-                Ok(Some(identity)) => {
-                    audit
-                        .record(AuditEntry {
-                            actor_username: Some(&identity.username),
-                            actor_role: Some(identity.role.as_str()),
-                            action: "login",
-                            resource: "auth",
-                            entity_id: None,
-                            detail: None,
-                            origin: "rest",
-                            result: "ok",
-                        })
-                        .await;
-                    Some(Identity {
-                        id: identity.username,
-                        name: identity.display_name,
-                        role: identity.role.to_string(),
-                    })
-                }
-                _ => {
-                    audit
-                        .record(AuditEntry {
-                            actor_username: Some(&username),
-                            actor_role: None,
-                            action: "login_failed",
-                            resource: "auth",
-                            entity_id: None,
-                            detail: None,
-                            origin: "rest",
-                            result: "failed",
-                        })
-                        .await;
-                    None
-                }
-            }
-        })
-    }
-}
-
-/// banto v1.7.0 #204: `UserIdentity` -> セッションが結び付く `Identity` +
-/// [`SessionStamp`]（`Identity.id` はユーザー名 - `banto_server::Identity` の
-/// doc comment の規約）。セットアップ直後のログイン（`issue_account_token`）と
-/// [`user_session_lookup`] の両方が使う。
-pub(crate) fn session_account(user: &UserIdentity) -> SessionAccount {
-    SessionAccount {
-        identity: Identity {
-            id: user.username.clone(),
-            name: user.display_name.clone(),
-            role: user.role.to_string(),
-        },
-        stamp: SessionStamp {
-            account_id: user.id,
-            auth_epoch: user.auth_epoch,
-        },
-    }
-}
-
-/// banto v1.7.0 #204: 要求のたびにアカウントを読み直す `SessionLookup`。
-/// ユーザー名で `users` を引き、無ければ `Ok(None)`（セッションは失効）、DB が
-/// 答えられなければ `Err`（その要求は失敗、セッションは残す）。
-/// `UsersService::verify` はユーザー名を正規化しない（入力のまま照合する）
-/// ので、ここも入力のまま引く - ログイン時は入力どおりのユーザー名で呼ばれ、
-/// `verify` と同じアカウントを返すことが条件になる（`SessionValidation::Lookup`
-/// の doc comment）。
-pub fn user_session_lookup(
-    users: UsersService,
-) -> impl Fn(
-    String,
-) -> futures_util::future::BoxFuture<'static, Result<Option<SessionAccount>, BantoError>>
-       + Send
-       + Sync
-       + 'static {
-    move |username: String| {
-        let users = users.clone();
-        Box::pin(async move {
-            Ok(users
-                .get_by_username(&username)
-                .await?
-                .map(|user| session_account(&user)))
-        })
-    }
-}
-
-/// banto v1.7.0 #204: 実アカウント用の REST `AuthState`。ログインは
-/// [`audited_credential_verifier`]、要求ごとの照合は [`user_session_lookup`]
-/// （`SessionValidation::Lookup`）。削除・降格・パスワード変更/リセットで、
-/// そのアカウントのセッション（他の端末・Remember me を含む）は次の要求で
-/// 401 になる。本番の `AuthState` はすべてここで作り、照合の付け忘れを防ぐ
-/// （`SessionValidation::DisabledNoRevocation` は固定の検証関数を使うテスト
-/// 専用）。
-pub fn user_auth_state(users: UsersService, audit: AuditLogService) -> AuthState {
-    AuthState::new(
-        audited_credential_verifier(users.clone(), audit),
-        SessionValidation::lookup(user_session_lookup(users)),
-    )
-}
-
-#[derive(Clone)]
-struct LogoutAuditState {
-    auth: AuthState,
-    audit: AuditLogService,
-}
-
-async fn audit_logout_middleware(
-    State(state): State<LogoutAuditState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let is_logout =
-        req.method() == axum::http::Method::POST && req.uri().path() == "/api/auth/logout";
-    let identity = if is_logout {
-        actor_identity(req.headers(), &state.auth)
-    } else {
-        None
-    };
-
-    let response = next.run(req).await;
-
-    if is_logout {
-        state
-            .audit
-            .record(AuditEntry {
-                actor_username: identity.as_ref().map(|i| i.id.as_str()),
-                actor_role: identity.as_ref().map(|i| i.role.as_str()),
-                action: "logout",
-                resource: "auth",
-                entity_id: None,
-                detail: None,
-                origin: "rest",
-                result: "ok",
-            })
-            .await;
-    }
-
-    response
-}
-
-// --- audit log (docs/banto-hub-remaining-plan.md P3-a: retention-config
-// endpoints added - chronogazer/relay-wright と同型の `AuditSettings`
-// 配線) -----------------------------------------------------------------
-
-#[derive(Clone)]
-struct AuditLogState {
-    audit: AuditLogService,
-    // `mqtt_settings_router`/`grpc_settings_router`と同じ規約:
-    // `SettingsService`自体は持たず、ハンドラ内で
-    // `SettingsService::new(state.manager.pool())`を都度構築する。
-    manager: Arc<CollectorManager>,
-    auth: AuthState,
-}
-
-/// `POST /api/audit-log/list`（admin 限定）: フィルタ/ソート/ページング
-/// 済みの監査ログ一覧。読む前に retention 設定に従って opportunistic に
-/// 剪定する（chronogazer/relay-wright の`audit_log_list`と同じ「list実行
-/// 時に軽く」規約 - `crate::audit::AuditLogService::prune`のdoc comment
-/// 参照）。剪定に失敗しても一覧の取得自体は続行する（best-effort）。
-/// P3-a 追補（2026-08-12）: `crate::runtime::HubRuntime::start`の24h周期
-/// タスクが同じ剪定を回すようになったため、このopportunistic剪定は
-/// もはや無制限成長を防ぐための唯一の保証ではないが、設定変更直後に
-/// 画面を開いた管理者へ即座に反映する効果があるため残している。
-///
-/// `?asOfId=`（任意、#428。chronogazer の #410 と同じ）はスナップショット
-/// 境界（[`crate::audit::AuditLogService::list_as_of`] の doc）。省略すると
-/// 従来どおり全行が対象で、応答の `asOfId` にその時点の最大 `id` が入る。
-/// 本文の `ListParams` は `banto-core` の型でフィールドを足せないので
-/// クエリで受ける。**床（`admin`）は変えていない**（ルーター側の
-/// `RoleGuard`）。
-///
-/// **`asOfId` 付きの取得（世代の 2 ブロック目以降）では剪定しない**（#428）。
-/// 画面は「同じ境界の総件数が世代の最初と変わった = 途中で削除が入った」を
-/// 失効として扱い、続きの読み込みを止める。ここで毎回剪定すると、保持件数の
-/// 上限に張り付いた常駐の banto-hub では記録が 1 件増えるたびに次の取得が
-/// 1 行消し、2 ブロック目以降がほぼ毎回失効する - **ログが一番多いときに
-/// 先頭ブロックより先へ進めなくなる**。剪定は `asOfId` なしの取得（世代の
-/// 最初・「再読み込み」）と、起動時・24 時間ごとの周期タスクに任せる（周期
-/// タスクが読み込みの途中に重なるのはまれで、そのときは失効の検出で扱う）。
-async fn audit_log_list(
-    State(state): State<AuditLogState>,
-    Query(query): Query<AuditLogListQuery>,
-    Json(params): Json<ListParams>,
-) -> Result<Json<crate::audit::AuditLogList>, ApiError> {
-    if query.as_of_id.is_some() {
-        return Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?));
-    }
-    if let Ok(config) = SettingsService::new(state.manager.pool())
-        .audit_config()
-        .await
-    {
-        let _ = state
-            .audit
-            .prune(config.retention_days, config.retention_rows)
-            .await;
-    }
-    Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?))
-}
-
-/// `POST /api/audit-log/list?asOfId=` のクエリ（#428）。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AuditLogListQuery {
-    #[serde(default)]
-    as_of_id: Option<i64>,
-}
-
-/// `GET /api/audit-log/config`（admin 限定）: 現在の retention 設定。
-/// 読み取り専用のため監査エントリは記録しない（read routes are never
-/// audited - `crate::audit`のモジュール doc comment参照）。
-async fn audit_log_config_get(
-    State(state): State<AuditLogState>,
-) -> Result<Json<AuditSettings>, ApiError> {
-    Ok(Json(
-        SettingsService::new(state.manager.pool())
-            .audit_config()
-            .await?,
-    ))
-}
-
-/// `PUT /api/audit-log/config`（admin 限定）: retention 設定を保存する。
-/// `retentionDays`/`retentionRows`いずれも省略・`null`可（そのフィールド
-/// を無制限にする - `crate::settings::AuditSettings`のdoc comment参照）。
-/// `mqtt_settings_put`/`grpc_settings_put`と同じ「保存 → 監査エントリ
-/// 記録」の形だが、こちらは即時適用するランタイム状態を持たないため
-/// （`prune`は次回の24h周期タスク/起動時/list実行時のいずれかで読まれる
-/// だけ - `crate::runtime::audit_prune_once`のdoc comment参照）、`apply`
-/// 相当の呼び出しは無い。
-async fn audit_log_config_put(
-    State(state): State<AuditLogState>,
-    headers: HeaderMap,
-    Json(config): Json<AuditSettings>,
-) -> Result<Json<AuditSettings>, ApiError> {
-    let settings_service = SettingsService::new(state.manager.pool());
-    settings_service.set_audit_config(&config).await?;
-
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        "audit_log_config",
-        "1",
-        Some(json!({
-            "retentionDays": config.retention_days,
-            "retentionRows": config.retention_rows,
-        })),
-    )
-    .await;
-
-    Ok(Json(settings_service.audit_config().await?))
-}
-
-fn audit_log_router(
-    audit: AuditLogService,
-    auth: AuthState,
-    manager: Arc<CollectorManager>,
-) -> Router {
-    let state = AuditLogState {
-        audit: audit.clone(),
-        manager,
-        auth: auth.clone(),
-    };
-    Router::new()
-        .route("/api/audit-log/list", post(audit_log_list))
-        .route(
-            "/api/audit-log/config",
-            get(audit_log_config_get).put(audit_log_config_put),
-        )
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                min: Role::Admin,
-                resource: "audit_log",
-                audit,
-            },
-            require_role_at_least,
-        ))
-        .layer(middleware::from_fn_with_state(
-            AuthGate {
-                auth,
-                operation: OperationKind::Normal,
-            },
-            require_session,
-        ))
 }
 
 // --- API キー管理 (docs/tag-server-design.md §5.6・T0-2 実装指示 §1「管理
@@ -1431,7 +721,7 @@ async fn api_keys_create(
         &headers,
         "create",
         "api_keys",
-        &issued.id.to_string(),
+        Some(&issued.id.to_string()),
         Some(json!({
             "name": issued.name,
             "scopes": issued.scopes,
@@ -1464,7 +754,7 @@ async fn api_keys_revoke(
         &headers,
         "revoke",
         "api_keys",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -1487,7 +777,7 @@ async fn api_keys_clear_trip(
         &headers,
         "clear_trip",
         "api_keys",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -1497,7 +787,7 @@ async fn api_keys_clear_trip(
 /// `/api/api-keys/*`（設計 §5.6・T0-2 実装指示: 「管理系ルーターに追加 —
 /// CSRF + bearer + RBAC admin 限定」）。T0-2 実装指示は発行/一覧/失効
 /// いずれも admin 限定と明記しているため、[`require_editor`]（editor 以上）
-/// ではなく [`RoleGuard`]（admin ちょうど）をルーター全体に掛ける -
+/// ではなく [`SessionRoleGuard`]（admin ちょうど）をルーター全体に掛ける -
 /// `users_router`/`audit_log_router` と同型（ハンドラ内で個別に role
 /// チェックし直さない: 到達した時点で呼び出し元は admin であることが
 /// ルーター層で保証済み）。
@@ -1519,13 +809,13 @@ fn api_keys_router(
         .route("/api/api-keys/{id}/clear-trip", post(api_keys_clear_trip))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "api_keys",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -1626,7 +916,7 @@ async fn write_control_set(
         headers,
         action,
         "write_control",
-        "1",
+        Some("1"),
         Some(detail),
     )
     .await;
@@ -1776,13 +1066,13 @@ fn write_control_router(
         router
             .with_state(state.clone())
             .layer(middleware::from_fn_with_state(
-                RoleGuard {
+                SessionRoleGuard {
                     auth: auth.clone(),
                     min: Role::Admin,
                     resource: "write_control",
                     audit: audit.clone(),
                 },
-                require_role_at_least,
+                require_session_role,
             ))
             .layer(middleware::from_fn_with_state(
                 AuthGate {
@@ -1858,7 +1148,7 @@ async fn collection_control_result(
         headers,
         action,
         "collection",
-        "1",
+        Some("1"),
         Some(json!({
             "state": status.state.as_str(),
             "mode": status.mode.as_str(),
@@ -2037,13 +1327,13 @@ fn collection_control_router(
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "collection",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -2132,7 +1422,7 @@ impl From<MqttSettings> for MqttSettingsResponse {
 async fn mqtt_settings_get(
     State(state): State<MqttSettingsAdminState>,
 ) -> Result<Json<MqttSettingsResponse>, ApiError> {
-    let config = SettingsService::new(state.manager.pool())
+    let config = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .mqtt_config()
         .await?;
     Ok(Json(config.into()))
@@ -2187,7 +1477,7 @@ async fn mqtt_settings_put(
         return Err(ApiError(BantoError::Validation { field_errors }));
     }
 
-    let settings_service = SettingsService::new(state.manager.pool());
+    let settings_service = SettingsService::new(Db::Sqlite(state.manager.pool()));
     // 空文字パスワードは「変更なし」- 現在の永続値を読んでフォールバック
     // する（`MqttSettingsRequest::password`のdoc comment参照）。
     let existing = settings_service.mqtt_config().await?;
@@ -2220,7 +1510,7 @@ async fn mqtt_settings_put(
         &headers,
         "update",
         "mqtt_settings",
-        "1",
+        Some("1"),
         Some(json!({ "enabled": config.enabled })),
     )
     .await;
@@ -2252,13 +1542,13 @@ fn mqtt_settings_router(
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "mqtt_settings",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -2350,7 +1640,7 @@ pub(crate) fn validate_store_settings_request(body: &StoreSettingsRequest) -> Ve
 async fn store_settings_get(
     State(state): State<StoreSettingsAdminState>,
 ) -> Result<Json<StoreSettingsResponse>, ApiError> {
-    let config = SettingsService::new(state.manager.pool())
+    let config = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .store_config()
         .await?;
     Ok(Json(config.into()))
@@ -2371,7 +1661,7 @@ async fn store_settings_put(
         return Err(ApiError(BantoError::Validation { field_errors }));
     }
 
-    let settings_service = SettingsService::new(state.manager.pool());
+    let settings_service = SettingsService::new(Db::Sqlite(state.manager.pool()));
     let existing = settings_service.store_config().await?;
     let config = StoreSettings {
         data_dir: existing.data_dir,
@@ -2385,7 +1675,7 @@ async fn store_settings_put(
         &headers,
         "update",
         "store_settings",
-        "1",
+        Some("1"),
         Some(json!({ "retentionDays": config.retention_days })),
     )
     .await;
@@ -2423,7 +1713,7 @@ fn resolve_prune_retention_days(retention_days: Option<i64>) -> Option<u32> {
 async fn store_settings_prune_preview(
     State(state): State<StoreSettingsAdminState>,
 ) -> Result<Json<PrunePreviewResponse>, ApiError> {
-    let config = SettingsService::new(state.manager.pool())
+    let config = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .store_config()
         .await?;
     let Some(retention_days) = resolve_prune_retention_days(config.retention_days) else {
@@ -2456,7 +1746,7 @@ async fn store_settings_prune_now(
     State(state): State<StoreSettingsAdminState>,
     headers: HeaderMap,
 ) -> Result<Json<PruneNowResponse>, ApiError> {
-    let config = SettingsService::new(state.manager.pool())
+    let config = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .store_config()
         .await?;
     let deleted_count = match resolve_prune_retention_days(config.retention_days) {
@@ -2486,7 +1776,7 @@ async fn store_settings_prune_now(
         &headers,
         "delete",
         "store_settings_prune",
-        "1",
+        Some("1"),
         Some(json!({ "deletedCount": deleted_count })),
     )
     .await;
@@ -2519,13 +1809,13 @@ fn store_settings_router(
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "store_settings",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -2597,7 +1887,7 @@ impl From<crate::settings::GrpcSettings> for GrpcSettingsBody {
 async fn grpc_settings_get(
     State(state): State<GrpcSettingsAdminState>,
 ) -> Result<Json<GrpcSettingsBody>, ApiError> {
-    let config = SettingsService::new(state.manager.pool())
+    let config = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .grpc_config()
         .await?;
     Ok(Json(config.into()))
@@ -2641,7 +1931,7 @@ async fn grpc_settings_put(
         return Err(ApiError(BantoError::Validation { field_errors }));
     }
 
-    let settings_service = SettingsService::new(state.manager.pool());
+    let settings_service = SettingsService::new(Db::Sqlite(state.manager.pool()));
     // `bind` 省略時は現在値を維持する(`GrpcSettingsBody::bind`のdoc
     // comment参照 - `mqtt_settings_put`が`password`の「変更なし」を
     // 解決するために既存値を読むのと同じ形)。
@@ -2666,7 +1956,7 @@ async fn grpc_settings_put(
         &headers,
         "update",
         "grpc_settings",
-        "1",
+        Some("1"),
         Some(json!({ "enabled": config.enabled, "bind": config.bind, "port": config.port })),
     )
     .await;
@@ -2698,13 +1988,13 @@ fn grpc_settings_router(
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "grpc_settings",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -2741,13 +2031,13 @@ fn write_audit_router(
         .route("/api/write-audit/list", post(write_audit_list))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "write_audit",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -3531,7 +2821,7 @@ async fn plc_connections_create(
         &headers,
         "create",
         "plc_connections",
-        &created.id.to_string(),
+        Some(&created.id.to_string()),
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
@@ -3601,7 +2891,7 @@ async fn plc_connections_update(
         &headers,
         "update",
         "plc_connections",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
@@ -3684,7 +2974,7 @@ async fn plc_connections_delete(
         &headers,
         "delete",
         "plc_connections",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({
             "cascade": {
                 "deletedGroups": cascade.deleted_groups,
@@ -4419,7 +3709,7 @@ async fn collection_groups_create(
         &headers,
         "create",
         "collection_groups",
-        &created.id.to_string(),
+        Some(&created.id.to_string()),
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
@@ -4489,7 +3779,7 @@ async fn collection_groups_update(
         &headers,
         "update",
         "collection_groups",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
@@ -4558,7 +3848,7 @@ async fn collection_groups_delete(
         &headers,
         "delete",
         "collection_groups",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({
             "cascade": { "deletedTags": cascade.deleted_tags },
         })),
@@ -4575,7 +3865,7 @@ async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag
 }
 
 /// `POST /api/tags/list`（T18-5a 第2段、docs/banto-hub-t18-design.md §4
-/// 決定6「薄い部品の先行配線」）: `write_audit_list`/`audit_log_list` と同型の
+/// 決定6「薄い部品の先行配線」）: `write_audit_list`/banto の `audit_log_list` と同型の
 /// 素通しハンドラ - `ListParams` をそのままサービスへ渡し `ListResult<Tag>`
 /// を返すだけ。認可は `GET /api/tags` と同じくルーター全体の
 /// `require_auth`（viewer 以上で読み取り可）のみで、`require_editor` は
@@ -5176,7 +4466,7 @@ async fn tags_create(
         &headers,
         "create",
         "tags",
-        &created.id.to_string(),
+        Some(&created.id.to_string()),
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
@@ -5247,7 +4537,7 @@ async fn tags_update(
         &headers,
         "update",
         "tags",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
@@ -5316,7 +4606,7 @@ async fn tags_delete(
         &headers,
         "delete",
         "tags",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -5915,7 +5205,7 @@ async fn pending_changes_cancel(
         &headers,
         "cancel",
         "pending_changes",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -5934,7 +5224,7 @@ async fn pending_changes_requeue(
         &headers,
         "requeue",
         "pending_changes",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -6031,7 +5321,7 @@ async fn pending_changes_apply(
         &headers,
         "apply",
         "pending_changes",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({ "source": applying.source })),
     )
     .await;
@@ -6079,13 +5369,13 @@ fn pending_changes_router(
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "pending_changes",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -6265,7 +5555,7 @@ async fn tags_batch(
                     &headers,
                     "batch_create",
                     "tags",
-                    "-",
+                    Some("-"),
                     Some(json!({ "count": count })),
                 )
                 .await;
@@ -6453,7 +5743,7 @@ async fn tags_batch_update(
                     &headers,
                     "batch_update",
                     "tags",
-                    "-",
+                    Some("-"),
                     Some(json!({ "count": count })),
                 )
                 .await;
@@ -6618,7 +5908,7 @@ async fn tags_batch_delete(
                 &headers,
                 "batch_delete",
                 "tags",
-                "-",
+                Some("-"),
                 Some(json!({ "count": count })),
             )
             .await;
@@ -6810,7 +6100,7 @@ async fn sink_groups_create(
         &headers,
         "create",
         "sink_groups",
-        &created.id.to_string(),
+        Some(&created.id.to_string()),
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
@@ -6842,7 +6132,7 @@ async fn sink_groups_update(
         &headers,
         "update",
         "sink_groups",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
@@ -6873,7 +6163,7 @@ async fn sink_groups_delete(
         &headers,
         "delete",
         "sink_groups",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -6925,7 +6215,7 @@ fn sink_groups_router(
 // API キーしか経路がない）と同じ「admin のみ」判定を、REST では
 // API キー/セッションの両方に対して行う点だけが違う。`/api/v1/*`の
 // `require_tag_space_auth`（read/write スコープ）とも、管理系ルーターの
-// `RoleGuard`（セッションのみ）とも異なる、この2エンドポイント専用の
+// `SessionRoleGuard`（セッションのみ）とも異なる、この2エンドポイント専用の
 // ゲート。
 
 /// [`require_sink_admin`]の判定結果。`Err`はそのまま返せる`Response`
@@ -8108,10 +7398,10 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
             .await?
             .rows,
     );
-    let mqtt_settings = SettingsService::new(state.manager.pool())
+    let mqtt_settings = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .mqtt_config()
         .await?;
-    let grpc_settings = SettingsService::new(state.manager.pool())
+    let grpc_settings = SettingsService::new(Db::Sqlite(state.manager.pool()))
         .grpc_config()
         .await?;
 
@@ -8260,14 +7550,14 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
 // （[`crate::stream::ws_upgrade`]）を`/api/v1/stream`とそのまま共有する -
 // `admin_tag_stream_router`のdoc comment参照。
 //
-// 認可レベル: `RoleGuard`（admin 限定）は掛けない。理由:
+// 認可レベル: `SessionRoleGuard`（admin 限定）は掛けない。理由:
 // 1. `/api/v1/status`・`/api/v1/values`自体がそもそもロール制約の無い
-//    読み取り専用エンドポイント（`tag_space_router`参照、`RoleGuard`は
+//    読み取り専用エンドポイント（`tag_space_router`参照、`SessionRoleGuard`は
 //    一切登場しない）。管理系に持ち込むだけでロールを新設するのは
 //    「同じ情報を管理 UI からも読めるようにする」というこの変更の趣旨から
 //    外れる。
 // 2. 管理系ルーターの既存の慣行でも、書き込み系（`write-control`・
-//    `collection`等）は`RoleGuard{min: Role::Admin}`を掛ける一方、
+//    `collection`等）は`SessionRoleGuard{min: Role::Admin}`を掛ける一方、
 //    読み取り専用の一覧系（`/api/tags`・`/api/plc-connections`・
 //    `/api/pending-changes`の`GET`等、`tag_registry_router`/
 //    `pending_changes_router`参照）は`require_session`のみ
@@ -8684,7 +7974,7 @@ async fn admin_tag_catalog(
 }
 
 /// [`admin_status`]・[`admin_values`]・[`admin_tag_catalog`]用ルーター -
-/// 管理系（試運転モードのバイパスが効く側）に配置する。`RoleGuard`は
+/// 管理系（試運転モードのバイパスが効く側）に配置する。`SessionRoleGuard`は
 /// 掛けない理由はこのセクション冒頭のdoc comment参照（読み取り専用・
 /// ロール不問、`tag_registry_router`の`GET`系と同じ扱い）。状態は
 /// [`TagSpaceState`]を[`tag_space_router`]とは別に組み立てる - こちらは
@@ -9664,7 +8954,7 @@ fn openapi_router(profile_id: String) -> Router {
 //
 // `POST /api/commissioning/lock-down`: 試運転モード → ロックダウン済みへの
 // 唯一の正方向遷移（`CommissioningService::lock_down`）。他の admin
-// エンドポイントと同じ`RoleGuard`（admin ちょうど）+
+// エンドポイントと同じ`SessionRoleGuard`（admin ちょうど）+
 // `require_session`を掛ける - 試運転モード中はその
 // ガード自体が素通しになるので実質誰でも叩けるが、ロックダウン済みに
 // なった後は admin セッションが無いと叩けなくなる（＝ロックダウン後に
@@ -9733,7 +9023,7 @@ fn commissioning_router(
     };
 
     // status は未認証で読める必要がある（設計 §5.6）ので、他の admin
-    // ルーターと違い `require_session`/`RoleGuard` を一切
+    // ルーターと違い `require_session`/`SessionRoleGuard` を一切
     // 掛けない - `require_banto_client_header`（CSRF、`admin`ルーター全体に
     // 掛かる）だけは他の admin エンドポイントと同様に適用される
     // （`X-Banto-Client`ヘッダはログイン資格情報ではなく「自前のフロント
@@ -9751,13 +9041,13 @@ fn commissioning_router(
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
-            RoleGuard {
+            SessionRoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "commissioning",
                 audit,
             },
-            require_role_at_least,
+            require_session_role,
         ))
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -9872,12 +9162,16 @@ fn api_router_with_controller_mode(
 
     let admin = Router::new()
         .merge(audited_auth_routes)
+        // I3': banto の `extra_auth_router`（status/setup/change-password +
+        // `grant_router`）。`status_extras` は無し（`GET /api/auth/status` は
+        // `{ initialized, grants }` のまま）。
         .merge(extra_auth_router(
             users.clone(),
             auth.clone(),
             audit.clone(),
             allow_setup,
             grants,
+            None,
         ))
         .merge(sse_route(auth.clone(), events.clone()))
         .merge(commissioning_router(
@@ -9892,8 +9186,8 @@ fn api_router_with_controller_mode(
         .merge(users_router(users, audit.clone(), auth.clone()))
         .merge(audit_log_router(
             audit.clone(),
+            SettingsService::new(Db::Sqlite(manager.pool())),
             auth.clone(),
-            manager.clone(),
         ))
         .merge(api_keys_router(
             api_keys.clone(),
@@ -10256,6 +9550,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use banto_collect::CollectorOptions;
+    use banto_server::{Identity, SessionValidation};
     use banto_tstore::{Clock, ManualClock, SystemClock};
     use tokio::sync::broadcast as tokio_broadcast;
     use tower::ServiceExt;
@@ -10346,8 +9641,8 @@ mod tests {
     async fn test_env_with_clock_and_lock(clock: Arc<dyn Clock>, locked_down: bool) -> TestEnv {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = tokio_broadcast::channel(16);
-        let users = UsersService::new(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
@@ -10420,7 +9715,7 @@ mod tests {
         // ロックダウン済み状態では一切変えないこと」）。試運転モード側の
         // 挙動は`commissioning_mode_tests`（このモジュール下部）で別途
         // 専用のテスト環境を組んで検証する。
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
             .await
             .expect("CommissioningService::load");
@@ -11029,7 +10324,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let audit = AuditLogService::new(env.pool.clone());
+        let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
         let entries = audit.list(ListParams::default()).await.unwrap();
         let denied = entries
             .rows
@@ -11321,7 +10616,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let audit = AuditLogService::new(env.pool.clone());
+        let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
         let entries = audit.list(ListParams::default()).await.unwrap();
         let denied = entries
             .rows
@@ -15198,8 +14493,9 @@ mod tests {
 
     /// `GET/PUT /api/audit-log/config`: admin 限定（viewer は403）、既定値
     /// （90日/100,000件）、保存した値の round-trip、PUT が
-    /// `audit_log_config`リソースへの`update`監査エントリを1件だけ記録する
-    /// ことを1本のテストで固定する（`collection_control_requires_admin_and_csrf_and_is_idempotent`
+    /// `settings`リソースへの`settings_change`監査エントリを1件だけ記録する
+    /// （I3' で banto の `audit_log_router` に替えてからの語彙）ことを1本の
+    /// テストで固定する（`collection_control_requires_admin_and_csrf_and_is_idempotent`
     /// と同じ「1テストで RBAC + 挙動 + 監査を通して確認する」形）。
     #[tokio::test]
     async fn audit_log_config_round_trips_and_requires_admin() {
@@ -15284,19 +14580,34 @@ mod tests {
         assert_eq!(refetched["retentionDays"], 30);
         assert_eq!(refetched["retentionRows"], 5000);
 
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT action, resource, result FROM audit_log WHERE resource = 'audit_log_config' ORDER BY id",
+        // I3'（banto の `audit_log_router`）: 設定の読み書きは `settings`
+        // リソース。viewer の拒否 2 件（GET・PUT）と、保存の
+        // `settings_change` 1 件（`entityId` なし）。以前の写しは
+        // `update`/`audit_log_config`/`"1"` で、拒否は `audit_log` だった。
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT action, resource, result, entity_id FROM audit_log              WHERE resource IN ('settings', 'audit_log', 'audit_log_config') ORDER BY id",
         )
         .fetch_all(&env.pool)
         .await
         .unwrap();
+        let denied = (
+            "denied".to_string(),
+            "settings".to_string(),
+            "denied".to_string(),
+            None,
+        );
         assert_eq!(
             rows,
-            vec![(
-                "update".to_string(),
-                "audit_log_config".to_string(),
-                "ok".to_string()
-            )]
+            vec![
+                denied.clone(),
+                denied,
+                (
+                    "settings_change".to_string(),
+                    "settings".to_string(),
+                    "ok".to_string(),
+                    None
+                ),
+            ]
         );
     }
 
@@ -15457,7 +14768,7 @@ mod tests {
     #[tokio::test]
     async fn audit_log_list_as_of_id_pins_the_snapshot() {
         let env = test_env().await;
-        let audit = AuditLogService::new(env.pool.clone());
+        let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
         let entry = |action: &'static str| AuditEntry {
             actor_username: Some("admin"),
             actor_role: Some("admin"),
@@ -15546,7 +14857,7 @@ mod tests {
         assert!(fresh["asOfId"].as_i64().unwrap() > as_of_id);
 
         // 床は admin のまま: editor（ここで作ってログイン）と viewer は 403。
-        UsersService::new(env.pool.clone())
+        UsersService::new(Db::Sqlite(env.pool.clone()))
             .create_user("editor1", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user editor");
@@ -15699,7 +15010,7 @@ mod tests {
         assert_eq!(refetched["retentionDays"], serde_json::Value::Null);
 
         // `resource = 'store_settings'`は成功した更新（action='update'）に
-        // 加えて、viewer の403（`require_role_at_least`が同じ`resource`名で
+        // 加えて、viewer の403（`require_session_role`が同じ`resource`名で
         // 記録する`action='denied'`エントリ）も含む - ここでは「保存が
         // 何回成功したか」だけを見るため`action='update'`に絞る。
         let rows: Vec<(String, String, String)> = sqlx::query_as(
@@ -15927,7 +15238,7 @@ mod tests {
         // `PUT /api/store-settings`のバリデーション（1〜3650）を経由せず、
         // 保存経路そのものへ想定外の巨大値を直接書き込む - レビュー指摘が
         // 想定する「設定が壊れている・DBを直接編集された」状況の再現。
-        SettingsService::new(env.pool.clone())
+        SettingsService::new(Db::Sqlite(env.pool.clone()))
             .set_store_config(&StoreSettings {
                 data_dir: "./data".to_string(),
                 retention_days: Some(u32::MAX as i64 + 1),
@@ -16742,14 +16053,14 @@ mod tests {
     async fn an_issuance_parked_before_the_insert_loses_to_a_lock_down_that_completed_meanwhile() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let pool = migrate_memory().await.expect("migrate_memory");
-        let users = UsersService::new(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
         users
             .setup_first_user("admin", "password123", "管理者")
             .await
             .expect("setup_first_user");
         let auth = user_auth_state(users.clone(), audit.clone());
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
             .await
             .expect("CommissioningService::load");
@@ -16788,6 +16099,7 @@ mod tests {
             audit.clone(),
             false,
             Arc::new(registry),
+            None,
         )
         .merge(auth_routes(auth.clone()))
         .merge(users_router(users, audit, auth.clone()));
@@ -17829,8 +17141,8 @@ mod tests {
     #[tokio::test]
     async fn the_setup_session_is_bound_to_the_new_account() {
         let pool = migrate_memory().await.expect("migrate_memory");
-        let users = UsersService::new(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
         let auth = user_auth_state(users.clone(), audit.clone());
         let router = extra_auth_router(
             users,
@@ -17838,6 +17150,7 @@ mod tests {
             audit,
             true,
             Arc::new(GrantRegistry::new()),
+            None,
         );
         let (status, body) = session_call(
             &router,

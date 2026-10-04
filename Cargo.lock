@@ -518,8 +518,8 @@ dependencies = [
 name = "banto-hub-core"
 version = "0.2.0-alpha.28"
 dependencies = [
- "argon2",
  "axum 0.8.9",
+ "banto-admin-services",
  "banto-broker",
  "banto-collect",
  "banto-core",
@@ -536,7 +536,6 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "libc",
- "password-hash",
  "prost",
  "protoc-bin-vendored",
  "rumqttc",

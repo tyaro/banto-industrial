@@ -3,6 +3,7 @@
 //! E2E。足場（`TempEnv`/`fast_options`/`wait_until`）は
 //! `crates/banto-collect/tests/integration.rs` を流用している。
 
+use banto_hub_core::db::Db;
 use banto_hub_core::rest::user_session_lookup;
 use banto_server::SessionValidation;
 use std::sync::Arc;
@@ -20,7 +21,9 @@ use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
-use banto_hub_core::settings::{SettingsService, DEFAULT_PORT, DEFAULT_RETENTION_DAYS};
+use banto_hub_core::settings::{
+    HubSettingsExt, SettingsService, DEFAULT_PORT, DEFAULT_RETENTION_DAYS,
+};
 use banto_hub_core::users::UsersService;
 use banto_plc::modbus::simulator::Simulator;
 use banto_plc::slmp::address::SlmpDevice;
@@ -181,8 +184,8 @@ async fn test_app(label: &str) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
-    let users = UsersService::new(pool.clone());
-    let audit = AuditLogService::new(pool.clone());
+    let users = UsersService::new(Db::Sqlite(pool.clone()));
+    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
         .setup_first_user("admin", "password123", "管理者")
         .await
@@ -251,7 +254,7 @@ async fn test_app(label: &str) -> TestApp {
         events_tx.clone(),
     );
     let grpc_server = Arc::new(banto_hub_core::grpc::GrpcServer::new(grpc_service));
-    let settings = SettingsService::new(pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
@@ -1028,12 +1031,12 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
 async fn settings_defaults_are_port_8722_and_retention_7_days() {
     let env = TempEnv::new(TEMP_ENV_PREFIX, "settings-defaults");
     let pool = init_db(env.registry_path()).await.expect("init_db");
-    let settings = SettingsService::new(pool);
+    let settings = SettingsService::new(Db::Sqlite(pool));
 
     assert_eq!(DEFAULT_PORT, 8722);
     assert_eq!(DEFAULT_RETENTION_DAYS, 7);
 
-    let server = settings.server_config().await.unwrap();
+    let server = settings.hub_server_config().await.unwrap();
     assert_eq!(server.port, DEFAULT_PORT);
     assert_eq!(server.bind, "127.0.0.1");
 

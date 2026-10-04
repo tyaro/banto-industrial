@@ -66,6 +66,14 @@ use sqlx::SqlitePool;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// banto のサービス（`banto_admin_services` の users/settings/audit。I3' で
+/// 自前のコピーから置き換えた）が受け取る、バックエンドを問わない接続
+/// ハンドル。banto-hub は SQLite 固定なので、いつも `Db::Sqlite(pool.clone())`
+/// で組む（`sqlx` の pool は `Arc` なので、同じ pool を共有する）。
+/// `banto_hub_core::db::Db` として引けるよう re-export する（ChronoGazer の
+/// `db.rs` と同じ）。
+pub use banto_storage::Db;
+
 /// この app の migration 記録テーブルの名前（モジュール doc「なぜ
 /// `sqlx::migrate!` に戻せたか」）。旧形式の判定にも使う。
 pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_banto_hub";

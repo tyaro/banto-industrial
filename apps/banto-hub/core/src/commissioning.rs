@@ -8,7 +8,7 @@
 //!   [`COMMISSIONING_GRANT_KIND`] = `commissioning`、`POST
 //!   /api/auth/grant/commissioning`）で操作できる。発行できるのは loopback の
 //!   peer だけ（[`commissioning_grant_spec`]）。発行後は通常の bearer セッション
-//!   として `crate::rest::require_session`・`RoleGuard`・監査・ストリームの
+//!   として `crate::rest::require_session`・`SessionRoleGuard`・監査・ストリームの
 //!   再検証にそのまま乗る - **認証を迂回する分岐は無い**（2026-10-04 までは
 //!   `require_auth_or_commissioning` 等 34 か所が未ロックダウン中の要求を
 //!   無認証で通していた。banto-industrial の v3.0.0 追従で廃止、オーナー決定
@@ -64,6 +64,7 @@ use std::sync::Arc;
 use banto_core::{BantoError, FieldError};
 use banto_server::{AuthState, GrantCondition, GrantKind, GrantSpec, Identity};
 
+use crate::db::Db;
 use crate::settings::SettingsService;
 use crate::users::{Role, UsersService};
 
@@ -377,7 +378,7 @@ impl CommissioningService {
 /// アクションの中核処理）から配線された - 対象 profile の DB を直接開いて
 /// この関数を呼び、直後に監査ログへ1行記録する（§5.6 制約4）。
 pub async fn revert_to_commissioning(pool: &sqlx::SqlitePool) -> Result<(), BantoError> {
-    let settings = SettingsService::new(pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     settings.set(KEY_LOCKED_DOWN, "false").await
 }
 
@@ -406,8 +407,8 @@ mod tests {
     async fn services_with_pool() -> (SettingsService, UsersService, sqlx::SqlitePool) {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
         (
-            SettingsService::new(pool.clone()),
-            UsersService::new(pool.clone()),
+            SettingsService::new(Db::Sqlite(pool.clone())),
+            UsersService::new(Db::Sqlite(pool.clone())),
             pool,
         )
     }

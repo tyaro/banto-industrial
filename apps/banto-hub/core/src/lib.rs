@@ -22,11 +22,13 @@
 //! - [`db`]: SQLite 起動 - この app 自身のスキーマ（settings/users/
 //!   audit_log）→ `banto_tags::migrate` → `banto_collect::migrate` の順で
 //!   1つの共有プールに適用する
-//! - [`settings`]: hub 用設定（`server.bind`/`server.port`/`data.dir`/
-//!   `retention.days`）。hub は常時サーバーなので ChronoGazer の
-//!   `server.enabled` トグルは持たない
-//! - [`users`] / [`audit`]: chronogazer からほぼそのまま流用した
-//!   ローカルアカウント（RBAC: admin/editor/viewer）と監査ログ
+//! - [`settings`]: 汎用の key/value 設定（banto の `SettingsService`）と、
+//!   その上の hub 用の型付きラッパ（`server.bind`/`server.port`/`data.dir`/
+//!   `retention.days`/`mqtt.*`/`grpc.*`）。hub は常時サーバーなので
+//!   ChronoGazer の `server.enabled` トグルは持たない
+//! - [`users`] / [`audit`]: ローカルアカウント（RBAC: admin/editor/viewer）と
+//!   監査ログ。I3'（2026-10-04）から banto の `banto-admin-services` のものを
+//!   そのまま使う（下の re-export）
 //! - [`assets`]: 管理 UI 静的ファイルの埋め込み枠（`embed-ui` feature）。
 //!   T0 では中身（フロントエンド）は作らない — 枠だけ用意する
 //! - [`computed`]: T6-2（設計 §4.2/§4.3(a)）。演算タグ・内部タグの評価
@@ -167,7 +169,6 @@
 
 pub mod api_keys;
 pub mod assets;
-pub mod audit;
 pub mod broker_glue;
 pub mod commissioning;
 pub mod computed;
@@ -202,7 +203,6 @@ pub mod subscribe_core;
 pub mod system_info;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub mod users;
 /// #335（2026-09-15 追補）: `value_source_for_tag`/`effective_simulation_for_tag`
 /// を `crate::rest` と `crate::mqtt` が共有するための crate 内限定モジュール
 /// （`pub(crate) mod`）。
@@ -211,6 +211,19 @@ pub mod write_audit;
 pub mod write_control;
 pub mod write_path;
 pub mod write_rate;
+
+// I3'（2026-10-04）: 領域に依らないサービス（アカウント・監査ログ）は自前の
+// コピーをやめ、banto の `banto-admin-services` のものをそのまま使う（独自
+// 実装は banto に寄せる、2026-10-01 オーナー方針。ChronoGazer の I2a #498 と
+// 同じ re-export）。`crate::{audit,users}::*` のパスは変わらずに解決する
+// （`Role` も `users::Role` として引ける）。`settings` だけは hub 固有の設定
+// キーの型付きラッパを足すため自前のモジュールにして、その中で banto の
+// `SettingsService` を re-export している。
+// 自前のコピーに入っていなかった banto v2.1.0 のセキュリティ修正 - 初回
+// セットアップの原子化（banto #277）、未認証ログアウト・失敗ログインの監査の
+// 増幅（banto #278）- は、`crate::rest` が使う banto のルーターと合わせて
+// これで入る。
+pub use banto_admin_services::{audit, users};
 
 pub use controller::{
     CollectionController, CollectionState, CollectionStatus, RunContext, RunId, RunMode,

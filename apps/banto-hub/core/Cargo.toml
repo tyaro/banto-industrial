@@ -21,6 +21,12 @@ embed-ui = ["dep:rust-embed"]
 banto-core = { workspace = true }
 banto-storage = { workspace = true, features = ["sqlite"] }
 banto-server = { workspace = true }
+# I3'（2026-10-04）: users/settings/audit の 3 サービスは banto のものを使う
+# （`src/lib.rs` の re-export。hub 固有の設定キー `server.*`・`data.dir`・
+# `retention.days`・`mqtt.*`・`grpc.*` は `src/settings.rs` に型付きのラッパと
+# して残す）。argon2/password-hash はこの crate から直接は使わなくなった
+# （パスワードのハッシュは `UsersService` の中）。
+banto-admin-services = { workspace = true }
 # I1: tag registry (PlcConnection/CollectionGroup/Tag) - hub's own SQLite
 # DB doubles as the registry DB (docs/tag-server-design.md §3.2 table).
 banto-tags = { path = "../../../crates/banto-tags" }
@@ -72,8 +78,6 @@ thiserror = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 rust-embed = { workspace = true, optional = true }
-argon2 = { workspace = true }
-password-hash = { workspace = true }
 futures-util = { workspace = true }
 # T0-2 (docs/tag-server-design.md §5.6): api_keys.rs のキー生成・ハッシュ照合。
 getrandom = { workspace = true }
