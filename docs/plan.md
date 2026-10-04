@@ -14,7 +14,8 @@ ChronoGazer のサービスと REST ルーターを banto のものに置き換�
 それに伴うオーナー決定 2 点（#280 の旧バックアップは警告のみ・閲覧公開は画面に出さない）を追記。
 同日: §5 に LAN 設定の適用を banto に寄せたこと（I2b、実装済み）と、閲覧公開を使うオーナー決定
 （前の決定を変更）を追記。同日: §5 に起動時の環境判定を banto に寄せたこと
-（I2c、実装済み。一時的に届かないときは demo に落とさず起動待ちで再試行）を追記。
+（I2c、実装済み。一時的に届かないときは demo に落とさず起動待ちで再試行）を追記。同日: §5 に
+banto-hub のサービスと REST ルーターを banto のものに置き換えたこと（I3'、実装済み）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -307,10 +308,34 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   保護されていない画面だけで、`/`・`/monitor` などを開くと `(app)` のガードの `load` が判定を待つため
   届かない間は真っ白のまま（demo には落ちない。再読み込みで開く）。
 
-  続き（未着手）: 初回セットアップ画面、banto-hub 側の I3'。手順と
+  続き（未着手）: 初回セットアップ画面。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
   監査ログ・バックアップ」「LAN アクセスと閲覧公開」と `apps/chronogazer/core/src/rest.rs` の
   モジュール doc
+
+- **banto-hub のサービスと REST ルーターを banto のものに（2026-10-04、実装済み）**: banto に
+  寄せる作業の段階名では I3'。I2a と同じやり方で、banto-hub core が持っていた ChronoGazer 由来の
+  コピー（`users`・`audit` の 2 サービス、`settings` の汎用部分、`rest.rs` の auth（status/setup/
+  change-password）・users・audit-log の各ルーター、ログイン/ログアウトの監査、`record_write` などの
+  ヘルパ）を削除し、`banto-admin-services` と `banto_server::routes` のものを使う。これで banto
+  v2.1.0 の #277（初回セットアップの原子化）と #278（失敗ログインの名前の切り詰めとダミー検証、
+  未認証・無効なトークンのログアウトを記録しない）が banto-hub にも入った。
+  - **残した固有部分**: hub 固有の設定キー（`server.bind/port`・`data.dir`・`retention.days`・
+    `mqtt.*`・`grpc.*`）の型付きラッパ（`HubSettingsExt`。hub の bind/port は `server.enabled` を
+    持たず既定 8722 なので、banto の `server_config` と別名の `hub_server_config`）、#431 の
+    `require_session` とその後ろの RBAC の床、`Sec-WebSocket-Protocol` の bearer、API キー・MCP・
+    gRPC・書き込み監査・pending changes・sink・タグ空間の各ルーター。
+  - **RBAC の床は banto の `RoleGuard` にしない**: banto のものはゲートがセッションを載せないと DB で
+    照合し直すので、#431 の「DB が答えないときも緊急停止は通す」例外が床で 500 になる（入れ替えると
+    #431 のテストが落ちることを確認）。`require_session` の後ろは自前の `SessionRoleGuard` のまま。
+    banto のルーター（users・audit-log）は banto の `require_auth` + `RoleGuard` を自分で積む（どちらも
+    #431 の例外が無い通常の操作で、判断は `require_session` の通常の操作と同じ）。
+  - **wire・監査の語彙の変化**: `PUT /api/audit-log/config` の成功は `settings_change` / `settings`
+    （以前は `update` / `audit_log_config`）、`/api/audit-log/config` の拒否の resource も `settings`。
+    監査ログ一覧の応答に `deletionEpoch`（#248 の受け皿）、読めない `asOfId` は JSON の 400。試運転の
+    grant での change-password は 403。詳細は [banto-hub-operations.md](banto-hub-operations.md)
+    §1「初回セットアップの運用」・§9「監査ログに残るもの」と `apps/banto-hub/core/src/rest.rs` の
+    モジュール doc。版（v0.2.0-alpha.28）は上げていない。
 
 - **ハイブリッドトレンド**: メモリ上のローリング窓（直近）+ DB（過去、
   間引き済み）を、チャート viewport の参照位置で継ぎ目なく合成する
