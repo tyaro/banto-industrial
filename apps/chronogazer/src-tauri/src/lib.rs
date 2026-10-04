@@ -2018,10 +2018,13 @@ async fn settings_set(
     settings_set_body(&state, &actor, key, value).await
 }
 
-/// banto の閲覧公開の設定キー（`banto_admin_services::settings` の非公開の
-/// 定数と同じ綴り）。[`settings_set_body`] が拒否し、変更は [`server_apply`]
-/// だけが行う。
-const VIEWER_PUBLIC_KEY: &str = "server.viewer_public";
+/// 組み込みサーバーの設定キー（`server.enabled`・`server.bind`・`server.port`・
+/// `server.viewer_public`）か。banto の `SettingsService` には該当の判定関数が
+/// 無い（キーの定数は非公開）ので、`auth.` の `is_auth_key` と同じく接頭辞で
+/// 判定する。[`settings_set_body`] が拒否し、変更は [`server_apply`] だけが行う。
+fn is_server_key(key: &str) -> bool {
+    key.starts_with("server.")
+}
 
 /// Body of [`settings_set`]. banto v2.0.0 移行（freshness audit of banto
 /// #266, P2-2, S-103 - admin-template の同名関数の写し）: keys in the
@@ -2042,13 +2045,14 @@ async fn settings_set_body(
             "設定 {key} はこのコマンドでは変更できません。認証モードは auth_config_apply（自動ログインは autologin_enable/autologin_disable）で変更してください"
         )));
     }
-    // I2b: 閲覧公開（`server.viewer_public`）は `server_apply` だけが変える。
-    // ここから書くと、保存後の閲覧者トークンの失効と、認証モードとの組み合わせの
-    // 検証（`auth_server_combination_allowed`）を通らず、OFF にしても発行済みの
-    // トークンが生き残る（PR #499 レビュー）。`auth.*` の拒否と同じ形。
-    if key == VIEWER_PUBLIC_KEY {
+    // I2b: `server.*`（LAN の有効化・バインド・ポート・閲覧公開）は
+    // `server_apply` だけが変える。ここから書くと、認証モードとの組み合わせ検証
+    // （`auth_server_combination_allowed`）と、閲覧公開 OFF の保存後の閲覧者
+    // トークンの失効を通らず、保存と実際の状態がずれる（PR #499 レビュー）。
+    // `auth.*` の拒否と同じ形。
+    if is_server_key(&key) {
         return Err(BantoError::BadRequest(format!(
-            "設定 {key}（閲覧公開）はこのコマンドでは変更できません。LAN の設定（server_apply）で変更してください"
+            "設定 {key} はこのコマンドでは変更できません。LAN 設定は接続の画面（server_apply）から変更してください"
         )));
     }
     state.settings.set(&key, &value).await?;
@@ -7113,12 +7117,12 @@ mod tests {
             .any(|(name, _)| name.as_deref() == Some("admin")));
     }
 
-    /// I2b（PR #499 レビュー P2）: 汎用の `settings_set` は閲覧公開
-    /// （`server.viewer_public`）を書けない。書けると `server_apply` の保存後の
+    /// I2b（PR #499 レビュー P2）: 汎用の `settings_set` は `server.*`
+    /// （`enabled`・`bind`・`port`・`viewer_public`）を書けない。書けると `server_apply` の保存後の
     /// 失効と組み合わせ検証を通らず、OFF にしても発行済みの閲覧者のトークンが
     /// 生き残る。ON → 発行 → 汎用で OFF しようとすると拒否され、保存は ON の
     /// まま、トークンも有効なまま（状態が一致）。反証: `settings_set_body` の
-    /// `VIEWER_PUBLIC_KEY` の拒否を外すと、保存が OFF になって落ちる。
+    /// `is_server_key` の拒否を外すと、保存が変わって落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn settings_set_refuses_the_viewer_public_key() {
         let state = admin_app_state().await;
@@ -7132,19 +7136,25 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         let viewer = body["token"].as_str().expect("token").to_string();
 
-        for value in ["false", "true"] {
-            let err = settings_set_body(
-                &state,
-                &admin,
-                "server.viewer_public".to_string(),
-                value.to_string(),
-            )
-            .await
-            .unwrap_err();
-            assert!(matches!(err, BantoError::BadRequest(_)), "{err:?}");
+        let before = state.settings.server_config().await.unwrap();
+        let attempts = [
+            ("server.viewer_public", "false"),
+            ("server.viewer_public", "true"),
+            ("server.enabled", "false"),
+            ("server.enabled", "true"),
+            ("server.bind", "0.0.0.0"),
+            ("server.port", "65000"),
+        ];
+        for (key, value) in attempts {
+            let err = settings_set_body(&state, &admin, key.to_string(), value.to_string())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BantoError::BadRequest(_)), "{key}: {err:?}");
         }
 
-        assert!(state.settings.server_config().await.unwrap().viewer_public);
+        let after = state.settings.server_config().await.unwrap();
+        assert_eq!(after, before, "どのキーも保存されていない");
+        assert!(after.viewer_public);
         assert!(
             state.rest_auth.verify(&viewer),
             "保存と同じくトークンも有効"
