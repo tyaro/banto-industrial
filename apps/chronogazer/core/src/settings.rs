@@ -19,17 +19,24 @@
 //!   [`SettingsService::set_many`] の上に乗る。
 //! - `hub.*` は `crate::hub` が同じく汎用の `get`/`set` で読み書きする。
 //!
-//! ## 閲覧公開（`server.viewer_public`）は使わない
+//! ## 閲覧公開（`server.viewer_public`）を使う（2026-10-04 オーナー決定）
 //!
-//! banto の [`ServerSettings`] には `viewer_public`（閲覧公開、ADR-0012）が
-//! あるが、**ChronoGazer は閲覧公開を提供しない**（2026-10-04 オーナー決定:
-//! 設定画面に出さない・既定 OFF）。`crate::rest::api_router` の
-//! `GrantRegistry` は空で、`POST /api/auth/grant/publicViewer` は常に 404
-//! になる。保存するときは常に `false` を書き（`src-tauri` の `server_apply`）、
-//! 汎用の `settings_set` からは書けない（同 `settings_set_body`）。これは
-//! banto の「認証無効 + LAN 有効は閲覧公開のときだけ可」という緩和
-//! （[`auth_server_combination_allowed`]）が ChronoGazer では効かないように
-//! するため - ChronoGazer にとって、その組み合わせは常に不可のまま。
+//! banto の [`ServerSettings`] の `viewer_public`（閲覧公開、ADR-0012）を、
+//! admin-template と同じ形で使う（同日の I2a で「画面に出さない」と決めた
+//! のを、I2b で変更した）。手元の端末はログイン不要モード、LAN の相手には
+//! 閲覧だけ、という banto の使い方ができる:
+//!
+//! - `crate::rest::api_router` が `GrantSpec::public_viewer` を登録し、
+//!   `POST /api/auth/grant/publicViewer` が ON の間だけ固定の viewer の
+//!   セッションを発行する（条件はリクエストのたびにこの設定を読む）。
+//! - 書き込みは `src-tauri` の `server_apply`（LAN 設定の「保存して適用」）。
+//!   OFF にしたら保存の直後に発行済みの閲覧者のトークンを失効させる
+//!   （ADR-0017 の順序）。
+//! - 「認証無効 + LAN 有効」は閲覧公開が ON のときだけ許される
+//!   （[`auth_server_combination_allowed`]、banto #288。保存時は banto の
+//!   [`SettingsService::set_server_config`] / `set_auth_config` が、起動時の
+//!   自動開始は `src-tauri` がこの述語で判定する）。
+//! - 既定は OFF（banto の [`ServerSettings`] の既定）。
 
 use banto_core::BantoError;
 use serde::{Deserialize, Serialize};
@@ -197,7 +204,7 @@ mod tests {
     }
 
     /// 閲覧公開（`server.viewer_public`）は既定で OFF（モジュール doc
-    /// 「閲覧公開は使わない」）。banto の `ServerSettings` の既定がそうで
+    /// 「閲覧公開を使う」）。banto の `ServerSettings` の既定がそうで
     /// あることを、この app のスキーマの上で固定する。
     #[tokio::test]
     async fn viewer_public_is_off_by_default() {

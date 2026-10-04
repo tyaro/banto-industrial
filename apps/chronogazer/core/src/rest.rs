@@ -7,8 +7,8 @@
 //!
 //! | Method | Path               | Body           | Response              |
 //! |--------|--------------------|----------------|------------------------|
-//! | GET    | `/api/auth/status`   | -              | `{initialized,grants}` (NO auth required; `grants` is always `{}` - no grant kind is registered) |
-//! | POST   | `/api/auth/grant/{kind}` | -          | always 404 (banto v3.0.0 ADR-0017; ChronoGazer registers no grant kind - no 閲覧公開, 2026-10-04 owner decision) |
+//! | GET    | `/api/auth/status`   | -              | `{initialized,grants}` (NO auth required; `grants` is `{ publicViewer: bool }` - the live `server.viewer_public`) |
+//! | POST   | `/api/auth/grant/{kind}` | -          | `{success,token}` for `publicViewer` while 閲覧公開 is ON (`403` while OFF, `404` for any other kind; banto v3.0.0 ADR-0017, 2026-10-04 owner decision) |
 //! | POST   | `/api/auth/setup`     | `{username,password,displayName}` | `{success,error?,token?}` (needs `allow_setup`) |
 //! | POST   | `/api/auth/login`    | `{username,password}` | `{success,error?,token?}` |
 //! | POST   | `/api/auth/logout`   | -              | 200                    |
@@ -207,7 +207,7 @@ use banto_server::routes::{
 };
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
-    GrantRegistry, ServerEvent,
+    GrantRegistry, GrantSpec, ServerEvent,
 };
 use banto_tags::{
     CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
@@ -1566,6 +1566,21 @@ pub fn api_router(
         audit_logout_middleware,
     ));
 
+    // banto v3.0.0 ADR-0017: the grant kinds this app issues without
+    // credentials. admin-template v3.0.0 の `rest/mod.rs::api_router` と同じ
+    // 形で、閲覧公開（`publicViewer`、ADR-0012）だけを登録する（2026-10-04
+    // オーナー決定: ChronoGazer でも閲覧公開を使う。`crate::settings` の
+    // モジュール doc）。条件は `server.viewer_public` をリクエストのたびに
+    // 読むので、設定画面の切り替えは再起動なしで効く。`GET /api/auth/status`
+    // が `grants.publicViewer` で可否を返し、`POST
+    // /api/auth/grant/publicViewer` が固定の `{id:"public",role:"viewer"}` の
+    // セッションを発行する。読み書きの境界は各ルーターの RBAC（viewer）で、
+    // 発行はそれを緩めない。試運転モードは ChronoGazer に無いので登録しない。
+    let mut grants = GrantRegistry::new();
+    grants
+        .register(GrantSpec::public_viewer(settings.clone()))
+        .expect("the viewer-public grant registers on an empty registry");
+
     Router::new()
         .merge(audited_auth_routes)
         .merge(extra_auth_router(
@@ -1573,11 +1588,7 @@ pub fn api_router(
             auth.clone(),
             audit.clone(),
             allow_setup,
-            // banto v3.0.0 ADR-0017: ChronoGazer issues no credential-less
-            // grant (no 閲覧公開, no commissioning mode) - an empty registry.
-            // 閲覧公開を登録しないのは 2026-10-04 のオーナー決定（設定画面に
-            // 出さない・既定 OFF。`crate::settings` のモジュール doc）。
-            Arc::new(GrantRegistry::new()),
+            Arc::new(grants),
             // `GET /api/auth/status` に足す app 固有の項目は無い。
             None,
         ))
@@ -1606,6 +1617,7 @@ pub fn api_router(
 mod tests {
     use super::*;
     use crate::db::{migrate_memory, Db};
+    use crate::settings::ServerSettings;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use banto_core::BantoError;
@@ -5396,18 +5408,22 @@ mod tests {
         assert_eq!(body_json(response).await["kind"], "bad_request");
     }
 
-    /// 閲覧公開は提供しない（2026-10-04 オーナー決定）: `GrantRegistry` は空で、
-    /// `GET /api/auth/status` の `grants` は空、`POST
-    /// /api/auth/grant/publicViewer` は 404。設定に `server.viewer_public` が
-    /// 残っていても（汎用の書き込みで入った等）同じ。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn public_viewer_is_never_issued() {
+    // --- 閲覧公開（publicViewer grant、2026-10-04 オーナー決定） ----------
+    //
+    // admin-template v3.0.0 と同じく `api_router` が `GrantSpec::public_viewer`
+    // を登録する。条件は保存されている `server.viewer_public` をリクエストの
+    // たびに読む。発行されたセッションは固定の `{id:"public",role:"viewer"}`
+    // で、読み書きの境界は各ルーターの RBAC。
+
+    /// `api_router` over an in-memory DB with real-account auth
+    /// (`user_auth_state`), returning the settings handle so a test can flip
+    /// `server.viewer_public`, plus the audit service.
+    async fn public_viewer_router() -> (Router, SettingsService, AuditLogService) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let db = Db::Sqlite(pool.clone());
         let users = UsersService::new(db.clone());
         let settings = SettingsService::new(db.clone());
-        settings.set("server.viewer_public", "true").await.unwrap();
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(db);
@@ -5415,8 +5431,8 @@ mod tests {
         let hub = test_hub_service(settings.clone()).await;
         let router = api_router(
             users,
-            settings,
-            audit,
+            settings.clone(),
+            audit.clone(),
             unused_backup_service(pool),
             hub,
             plc_connections,
@@ -5427,6 +5443,28 @@ mod tests {
             tx,
             false,
         );
+        (router, settings, audit)
+    }
+
+    async fn set_viewer_public(settings: &SettingsService, on: bool) {
+        let config = settings.server_config().await.unwrap();
+        settings
+            .set_server_config(&ServerSettings {
+                viewer_public: on,
+                ..config
+            })
+            .await
+            .unwrap();
+    }
+
+    /// 閲覧公開 OFF（既定）: `status.grants.publicViewer` は `false`、発行は
+    /// `403`。ON にすると（再起動なしで）`true` になり、発行されたトークンは
+    /// viewer として読めて（`/api/tags`）、書けない（`DELETE /api/tags/{id}`
+    /// は `403` で `denied` が監査に残る）・admin の口（`/api/users`）も
+    /// `403`。登録していない kind は `404`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_viewer_follows_the_saved_setting_and_reads_as_viewer() {
+        let (router, settings, audit) = public_viewer_router().await;
 
         let status = body_json(
             router
@@ -5436,12 +5474,193 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(status["grants"], json!({}), "{status}");
-
+        assert_eq!(
+            status["grants"],
+            json!({ "publicViewer": false }),
+            "{status}"
+        );
         let response = router
+            .clone()
             .oneshot(post_json("/api/auth/grant/publicViewer", json!({})))
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = router
+            .clone()
+            .oneshot(post_json("/api/auth/grant/commissioning", json!({})))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        set_viewer_public(&settings, true).await;
+
+        let status = body_json(
+            router
+                .clone()
+                .oneshot(get("/api/auth/status"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status["grants"],
+            json!({ "publicViewer": true }),
+            "{status}"
+        );
+        let response = router
+            .clone()
+            .oneshot(post_json("/api/auth/grant/publicViewer", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let token = body_json(response).await["token"]
+            .as_str()
+            .expect("grant token")
+            .to_string();
+
+        let identity = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/auth/identity", &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(identity["id"], "public", "{identity}");
+        assert_eq!(identity["role"], "viewer", "{identity}");
+        assert_eq!(identity["kind"], "publicViewer", "{identity}");
+
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/tags", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router
+            .clone()
+            .oneshot(delete_auth("/api/tags/1", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/users", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let denied = audit
+            .list(ListParams::default())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .filter(|row| row.action == "denied" && row.resource == "tags")
+            .collect::<Vec<_>>();
+        assert_eq!(denied.len(), 1, "{denied:?}");
+        assert_eq!(denied[0].actor_username.as_deref(), Some("public"));
+    }
+
+    /// One HTTP/1.1 request over a real TCP connection to `addr`; returns
+    /// (status, body). Same shape as admin-template v3.0.0 の src-tauri の
+    /// テストの `http`（このクレートの dev 依存の reqwest は JSON 機能無し）。
+    async fn raw_http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+             X-Banto-Client: banto\r\nContent-Type: application/json\r\n\
+             Content-Length: 2\r\n"
+        );
+        if let Some(token) = token {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        request.push_str("\r\n{}");
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.expect("read");
+        let text = String::from_utf8_lossy(&response).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("malformed response: {text}"));
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    /// This machine's first non-loopback IPv4 address (the LAN side), if any.
+    fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+        banto_server::lan_urls_for_bind("0.0.0.0", 1)
+            .into_iter()
+            .filter_map(|url| {
+                url.strip_prefix("http://")?
+                    .strip_suffix(":1")?
+                    .parse::<std::net::Ipv4Addr>()
+                    .ok()
+            })
+            .find(|ip| !ip.is_loopback())
+    }
+
+    /// 閲覧公開 ON の LAN（非 loopback）の未ログインのクライアント: 本物の
+    /// TCP（`banto_server::start`、`ConnectInfo` 付き）で `0.0.0.0` に
+    /// 待ち受け、この PC の LAN 側の IPv4 から繋ぐ。status が
+    /// `publicViewer: true` を返し、未ログインのままでは読めず、発行された
+    /// トークンで読めて書けない。OFF に戻すと新しい発行は断られる。
+    /// LAN 側のアドレスが無い環境（ネットワークの無いコンテナ）では、
+    /// 確かめられないことを出力して終える。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_viewer_is_issued_to_an_anonymous_lan_client() {
+        let Some(lan_ip) = first_lan_ipv4() else {
+            eprintln!("skip: この環境には非 loopback の IPv4 アドレスが無い");
+            return;
+        };
+        let (router, settings, _audit) = public_viewer_router().await;
+        set_viewer_public(&settings, true).await;
+        let server = banto_server::start(
+            banto_server::ServerConfig {
+                bind: "0.0.0.0".to_string(),
+                port: 0,
+            },
+            router,
+        )
+        .await
+        .expect("start");
+        let addr = std::net::SocketAddr::from((lan_ip, server.local_addr().port()));
+
+        let (status, body) = raw_http(addr, "GET", "/api/auth/status", None).await;
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["grants"]["publicViewer"], true, "{body}");
+
+        let (status, body) = raw_http(addr, "GET", "/api/tags", None).await;
+        assert_eq!(status, 401, "未ログインのままでは読めない: {body}");
+
+        let (status, body) = raw_http(addr, "POST", "/api/auth/grant/publicViewer", None).await;
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let token = body["token"].as_str().expect("token").to_string();
+
+        let (status, body) = raw_http(addr, "GET", "/api/tags", Some(&token)).await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = raw_http(addr, "DELETE", "/api/tags/1", Some(&token)).await;
+        assert_eq!(status, 403, "{body}");
+
+        // OFF に戻すと新しい発行は断られる（既存のトークンの失効は
+        // `src-tauri` の `server_apply` の役目 - ADR-0017 の順序。そちらで
+        // 確かめる）。
+        set_viewer_public(&settings, false).await;
+        let (status, body) = raw_http(addr, "POST", "/api/auth/grant/publicViewer", None).await;
+        assert_eq!(status, 403, "{body}");
+
+        server.stop().await;
     }
 }
