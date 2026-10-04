@@ -819,7 +819,14 @@ async fn login_body(
             state
                 .audit
                 .record(AuditEntry {
-                    actor_username: Some(&username),
+                    // Bounded like the REST path (banto #278, admin-template
+                    // v3.0.0 の `login_body` と同じ形): the name is
+                    // caller-supplied and need not be a real account. The
+                    // dummy argon2 verify for an over-long name happens inside
+                    // `UsersService::verify` (`auth_io.verify`).
+                    actor_username: Some(&chronogazer_core::users::bound_username_for_audit(
+                        &username,
+                    )),
                     actor_role: None,
                     action: "login_failed",
                     resource: "auth",
@@ -1829,6 +1836,10 @@ async fn settings_set(
     settings_set_body(&state, &actor, key, value).await
 }
 
+/// banto の閲覧公開の設定キー（`banto_admin_services::settings` の非公開の
+/// 定数と同じ綴り）。[`settings_set_body`] が拒否する。
+const VIEWER_PUBLIC_KEY: &str = "server.viewer_public";
+
 /// Body of [`settings_set`]. banto v2.0.0 移行（freshness audit of banto
 /// #266, P2-2, S-103 - admin-template の同名関数の写し）: keys in the
 /// `auth.` namespace are refused - they are written only by
@@ -1846,6 +1857,15 @@ async fn settings_set_body(
     if SettingsService::is_auth_key(&key) {
         return Err(BantoError::BadRequest(format!(
             "設定 {key} はこのコマンドでは変更できません。認証モードは auth_config_apply（自動ログインは autologin_enable/autologin_disable）で変更してください"
+        )));
+    }
+    // I2a: 閲覧公開（banto の `server.viewer_public`）は ChronoGazer では提供
+    // しない（2026-10-04 オーナー決定）。ここから `true` を書けると、banto の
+    // `SettingsService::set_auth_config` の「認証無効 + LAN 有効」の拒否が
+    // 緩む（`chronogazer_core::settings` のモジュール doc）ので、書かせない。
+    if key == VIEWER_PUBLIC_KEY {
+        return Err(BantoError::BadRequest(format!(
+            "設定 {key}（閲覧公開）は ChronoGazer では使えません"
         )));
     }
     state.settings.set(&key, &value).await?;
@@ -6870,6 +6890,82 @@ mod tests {
         )
         .await
         .expect("a non-auth key");
+    }
+
+    /// I2a（banto #278）: Tauri のログインの失敗も、REST と同じく監査ログの
+    /// 名前を 32 文字に切り詰めて記録する（admin-template v3.0.0 の
+    /// `login_body` と同じ形）。以前は送られてきた名前をそのまま書いていた。
+    #[tokio::test]
+    async fn i2a_an_oversized_failed_login_username_is_bounded_in_the_audit_log() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+
+        let result = login_body(&state, "y".repeat(10_000), "wrong-password".to_string())
+            .await
+            .expect("login");
+        assert!(!result.success);
+
+        let rows = audit_rows(&state, "login_failed").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let recorded = rows[0].0.as_deref().expect("actor_username");
+        assert_eq!(
+            recorded.chars().count(),
+            chronogazer_core::users::MAX_USERNAME_LEN
+        );
+        assert!(recorded.ends_with('…'), "{recorded}");
+        // 上限以内の名前はそのまま（切り詰めは長すぎるときだけ）。
+        login_body(&state, "admin".to_string(), "wrong-password".to_string())
+            .await
+            .expect("login");
+        assert!(audit_rows(&state, "login_failed")
+            .await
+            .iter()
+            .any(|(name, _)| name.as_deref() == Some("admin")));
+    }
+
+    /// I2a: 閲覧公開（`server.viewer_public`）は汎用の `settings_set` から
+    /// 書けない（2026-10-04 オーナー決定 - ChronoGazer は閲覧公開を提供しない）。
+    /// 書けると banto の「認証無効 + LAN 有効」の拒否が緩むため。
+    #[tokio::test]
+    async fn i2a_settings_set_refuses_the_viewer_public_key() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        let admin = state.users.get_by_username("admin").await.unwrap().unwrap();
+        let result = settings_set_body(
+            &state,
+            &admin,
+            VIEWER_PUBLIC_KEY.to_string(),
+            "true".to_string(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(BantoError::BadRequest(_))),
+            "{result:?}"
+        );
+        assert!(!state.settings.server_config().await.unwrap().viewer_public);
+    }
+
+    /// I2a（banto #280）: Tauri のバックアップも DB ファイルごとの
+    /// `<DB の親>/backups/<DB ファイル名>/` に作られ、「フォルダを開く」が
+    /// 開く場所（`backups_dir_display`）もそこ。
+    #[tokio::test]
+    async fn i2a_backups_are_created_in_the_per_database_directory() {
+        let (dir, state) = app_state_with_tempdir().await;
+        let created = state.backup.create().await.expect("create");
+        let scope = dir.path().join("backups").join("chronogazer.sqlite3");
+        assert!(scope.join(&created.file_name).is_file());
+        assert_eq!(
+            state.backup.backups_dir_display(),
+            scope.display().to_string()
+        );
     }
 
     /// Replace `auth_config_apply`'s save with one that stores only
