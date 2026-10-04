@@ -84,6 +84,35 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
 開き直され、その旨が通知される（banto v2.0.0 の SessionController。ログアウトで
 ログイン画面へ移れなかったときも通知する）。
 
+## アカウント・監査ログ・バックアップ（banto のもの、2026-10-04〜）
+
+アカウント（`users`）・設定（`settings`）・監査ログ（`audit_log`）・バックアップの
+サービスと、その REST の口（`/api/auth/*`・`/api/users/*`・`/api/audit-log/*`・
+`/api/backups/*`・`/api/ui-settings/*`）は、banto の `banto-admin-services` と
+`banto_server::routes` のものをそのまま使う（以前は admin-template からのコピーを
+持っていた。独自実装は banto に寄せる、2026-10-01 オーナー方針）。ChronoGazer 側に
+残っているのは、固有の設定キー（`data.dir`・`retention.days`、`hub.*`）の型付きの
+読み書きと、Hub・収集・タグレジストリの口だけ（`core/src/settings.rs`・
+`core/src/rest.rs`）。これで banto v2.1.0 の次の修正が入った:
+
+- 初回セットアップは 1 つしか成功しない（同時に送っても管理者は 1 人。banto #277）。
+- 失敗したログインの監査ログのユーザー名は 32 文字までに切り詰める。トークン無し・
+  無効なトークンのログアウトは監査ログに記録しない（banto #278）。
+- バックアップとリストアの予約は DB ファイルごとのフォルダ
+  `<DB のフォルダ>/backups/<DB ファイル名>/`（デスクトップ版は
+  `%APPDATA%\dev.tyaro.chronogazer\backups\chronogazer.sqlite3\`）に置く（banto #280）。
+  **それより前の版で作ったバックアップ**（`<DB のフォルダ>/backups/` 直下の
+  `*.sqlite3`、`<DB のフォルダ>/restore-pending.sqlite3`）は一覧に出ず、自動では
+  適用されない。起動時に標準エラーへ警告が出るだけで、移しも消しもしない
+  （2026-10-04 オーナー決定: banto の既定どおり）。使いたいときは手で上のフォルダへ
+  移す。
+
+**閲覧公開（ログインなしの閲覧）は ChronoGazer には無い**（2026-10-04 オーナー決定:
+設定画面に出さない・既定 OFF）。banto のルーターにある
+`POST /api/auth/grant/publicViewer` は常に 404 で、`GET /api/auth/status` の
+`grants` は空。設定キー `server.viewer_public` は書けない（`settings_set` が拒否し、
+LAN 公開の保存では常に OFF を書く）。
+
 ## Hub 接続：キーが使えなくなったとき
 
 設定の「Hub 接続」で選んだタグを banto-hub から購読しているとき、Hub が

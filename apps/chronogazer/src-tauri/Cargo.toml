@@ -59,7 +59,7 @@ banto-hub-bootstrap = { path = "../../../crates/banto-hub-bootstrap" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 # Spec M17 backup tests: `BackupService::create`'s `VACUUM INTO` needs a
-# real on-disk pool (see `chronogazer-core::backup`'s test module doc
+# real on-disk pool (see `banto_admin_services::backup`'s test module doc
 # comment for why `:memory:` does not work), so these tests cannot reuse
 # `app_state()`'s in-memory `init_db_memory()` - see `app_state_with_tempdir`.
 tempfile = { workspace = true }

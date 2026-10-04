@@ -61,6 +61,14 @@ use std::path::{Path, PathBuf};
 /// `relay_wright_core::db::DbPool`.
 pub type DbPool = SqlitePool;
 
+/// banto のサービス（`banto_admin_services` の users/settings/audit/backup。
+/// I2a で自前のコピーから置き換えた）が受け取る、バックエンドを問わない
+/// 接続ハンドル。ChronoGazer は SQLite 固定なので、いつも
+/// `Db::Sqlite(pool.clone())` で [`DbPool`] から組む（`sqlx` の pool は
+/// `Arc` なので、同じ pool を共有する）。[`DbPool`] と同じ理由で re-export
+/// する（`src-tauri` は `banto-storage` に直接依存しない）。
+pub use banto_storage::Db;
+
 /// この app の migration 記録テーブルの名前（モジュール doc「なぜ
 /// `sqlx::migrate!` に戻せたか」）。旧形式の判定にも使う。
 pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_chronogazer";
@@ -211,36 +219,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     Ok(())
 }
 
-/// Days-since-epoch (1970-01-01) -> `YYYY-MM-DD`, using Howard Hinnant's
-/// `civil_from_days` algorithm (http://howardhinnant.github.io/date_algorithms.html).
-/// No date/time crate dependency for one small conversion.
-///
-/// `pub(crate)` (not private) since `crate::backup` (spec M17) reuses this to
-/// turn a backup file's filesystem mtime into an ISO date for display.
-pub(crate) fn iso_date_from_days_since_epoch(days: i64) -> String {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn iso_date_round_trips_known_epoch_days() {
-        assert_eq!(iso_date_from_days_since_epoch(0), "1970-01-01");
-        assert_eq!(iso_date_from_days_since_epoch(1), "1970-01-02");
-        assert_eq!(iso_date_from_days_since_epoch(-1), "1969-12-31");
-    }
 
     /// End-to-end proof that `init_db_memory` applies BOTH this app's own
     /// schema (`settings`/`users`/`audit_log`, including the `role` column)

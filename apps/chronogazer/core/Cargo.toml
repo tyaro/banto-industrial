@@ -18,6 +18,11 @@ embed-ui = ["dep:rust-embed"]
 banto-core = { workspace = true }
 banto-storage = { workspace = true, features = ["sqlite"] }
 banto-server = { workspace = true }
+# I2a（2026-10-04）: users/settings/audit/backup の 4 サービスは banto の
+# ものを使う（`src/lib.rs` の re-export。ChronoGazer 固有の設定キーだけ
+# `src/settings.rs` に型付きのラッパとして残す）。argon2/password-hash は
+# この crate から直接は使わなくなった（ハッシュは `UsersService` の中）。
+banto-admin-services = { workspace = true }
 # I-series crates (docs/r1-plan.md R1-A): not wired into any Tauri command or
 # REST route yet - that lands in R1-B (registry CRUD)/R1-C (collector
 # runtime)/R1-D (monitor screens). Added now as path deps so the workspace
@@ -39,25 +44,19 @@ sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "mig
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
-# `fs` (spec M17): `crate::backup::BackupService` reads/writes `backups/`
-# and the pending-restore file directly via `tokio::fs`. Cargo's feature
-# unification already pulls this in transitively via `sqlx`'s
-# `runtime-tokio` feature, but naming it explicitly here means this crate
-# does not silently depend on another dependency's feature choices.
+# （`fs` は I2a で外した: 使っていたのは `crate::backup` だけで、バックアップ
+# は banto の `BackupService` に移った。）
 # `time` (#394 レビュー P1-1): `crate::hub` の見張りの `sleep` と、Hub への
-# 1 往復を包む `tokio::time::timeout`（`HUB_OPERATION_TIMEOUT`）。`fs` と
-# 同じ理由で、他の依存の feature 選択に黙って乗らないよう明示する。
+# 1 往復を包む `tokio::time::timeout`（`HUB_OPERATION_TIMEOUT`）。他の依存の
+# feature 選択に黙って乗らないよう明示する。
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "sync",
     "signal",
-    "fs",
     "time",
 ] }
 rust-embed = { workspace = true, optional = true }
-argon2 = { workspace = true }
-password-hash = { workspace = true }
 futures-util = { workspace = true }
 # #332: `crate::hub` の `installation_id`（UUID v4 相当の 128 ビット）。
 # `uuid` を新規に足す代わりに、`apps/banto-hub/core::api_keys` が API キー

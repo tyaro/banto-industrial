@@ -1,36 +1,45 @@
-//! App settings storage (spec §12.1 `SettingsProvider` role): a
-//! `key`/`value` table in the local SQLite settings DB, plus a typed view
-//! over the embedded-server settings (spec §11.4's LAN-access toggle +
-//! bind/port fields).
+//! App settings storage (spec §12.1 `SettingsProvider` role): the generic
+//! `key`/`value` store and the typed views over it.
+//!
+//! ## 中身はほぼ banto のもの（I2a、2026-10-04）
+//!
+//! [`SettingsService`] と、その上の型付きの設定（LAN 公開 [`ServerSettings`]・
+//! 認証モード [`AuthSettings`]・監査ログの保持 [`AuditSettings`]）は
+//! `banto_admin_services::settings` をそのまま re-export している（以前は
+//! admin-template からのコピーを持っていた。独自実装は banto に寄せる、
+//! 2026-10-01 オーナー方針）。テーブル（`settings`）の定義はこの app の
+//! `migrations-sqlite/`（admin-template の byte 等価コピー、`crate::db`）が
+//! 持つ - banto conventions §11「テーブルはアプリが持つ」。
+//!
+//! このモジュールに自前で残しているのは、ChronoGazer 固有の設定キーの
+//! **型付きラッパ**だけ:
+//!
+//! - [`StoreSettings`]（`data.dir`・`retention.days`）- [`store_config`] /
+//!   [`set_store_config`]。banto の汎用 [`SettingsService::get`] /
+//!   [`SettingsService::set_many`] の上に乗る。
+//! - `hub.*` は `crate::hub` が同じく汎用の `get`/`set` で読み書きする。
+//!
+//! ## 閲覧公開（`server.viewer_public`）は使わない
+//!
+//! banto の [`ServerSettings`] には `viewer_public`（閲覧公開、ADR-0012）が
+//! あるが、**ChronoGazer は閲覧公開を提供しない**（2026-10-04 オーナー決定:
+//! 設定画面に出さない・既定 OFF）。`crate::rest::api_router` の
+//! `GrantRegistry` は空で、`POST /api/auth/grant/publicViewer` は常に 404
+//! になる。保存するときは常に `false` を書き（`src-tauri` の `server_apply`）、
+//! 汎用の `settings_set` からは書けない（同 `settings_set_body`）。これは
+//! banto の「認証無効 + LAN 有効は閲覧公開のときだけ可」という緩和
+//! （[`auth_server_combination_allowed`]）が ChronoGazer では効かないように
+//! するため - ChronoGazer にとって、その組み合わせは常に不可のまま。
 
-use std::str::FromStr;
-
-use banto_core::{BantoError, FieldError};
+use banto_core::BantoError;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 
-use crate::users::Role;
+pub use banto_admin_services::settings::*;
 
-const KEY_SERVER_ENABLED: &str = "server.enabled";
-const KEY_SERVER_BIND: &str = "server.bind";
-const KEY_SERVER_PORT: &str = "server.port";
-const KEY_AUTH_DISABLED: &str = "auth.disabled";
-const KEY_AUTH_DISABLED_ROLE: &str = "auth.disabled_role";
-const KEY_AUTOLOGIN_ENABLED: &str = "auth.autologin.enabled";
-const KEY_AUTOLOGIN_USERNAME: &str = "auth.autologin.username";
-const KEY_AUDIT_RETENTION_DAYS: &str = "audit.retention_days";
-const KEY_AUDIT_RETENTION_ROWS: &str = "audit.retention_rows";
 /// #383 段階2b / R1-C: 収集ランタイムの保存先と保持期間
 /// （`apps/banto-hub/core/src/settings.rs` の `StoreSettings` と同じキー名）。
 const KEY_DATA_DIR: &str = "data.dir";
 const KEY_RETENTION_DAYS: &str = "retention.days";
-
-/// Default audit-log retention (spec M14): 90 days / 100,000 rows. There is
-/// deliberately no "audit enabled" toggle - the audit trail is a standard
-/// part of the template (spec: "監査ログを標準装備する"), only its retention
-/// is configurable.
-const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
-const DEFAULT_AUDIT_RETENTION_ROWS: i64 = 100_000;
 
 /// 時系列ファイルの既定の置き場（#383 段階2b / R1-C）。banto-hub の
 /// `StoreSettings` に倣った相対パス。**相対パスの解決先**は
@@ -46,152 +55,18 @@ const DEFAULT_DATA_DIR: &str = "./data";
 /// 真似しない。ChronoGazer は記録計そのものであり、要件の 90 日が正。
 const DEFAULT_RETENTION_DAYS: i64 = 90;
 
-/// `0以下は「無制限」として None 扱い` (spec M14): normalizes a parsed
-/// retention value so a non-positive number always reads back as "no
-/// limit" on this dimension, both right after `set_audit_config` and on any
-/// later read.
-fn normalize_retention(value: i64) -> Option<i64> {
-    if value > 0 {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-/// Shared by [`SettingsService::audit_config`]'s two fields: an unset key
-/// falls back to `default`; a set-but-corrupt (non-numeric) value ALSO falls
-/// back to `default` (same convention as `auth_config`'s `disabled_role`
-/// fallback); a set, parseable value is normalized (see
-/// [`normalize_retention`]) - notably a value of `"0"` here means "the user
-/// explicitly chose unlimited", which must NOT fall back to `default`.
+/// 保存されている保持期間の読み方。banto の `AuditSettings` と同じ約束
+/// （banto 側の同名の関数は非公開なので、ここに写している）: 未設定は
+/// `default`、数値として読めない値も `default`、読めた値は `0` 以下を
+/// 「無制限」（`None`）に正規化する - とくに `"0"` は「利用者が無制限を
+/// 選んだ」なので `default` に戻してはいけない。
 fn parse_retention(raw: Option<String>, default: Option<i64>) -> Option<i64> {
     match raw {
         Some(value) => value
             .parse::<i64>()
-            .map(normalize_retention)
+            .map(|days| if days > 0 { Some(days) } else { None })
             .unwrap_or(default),
         None => default,
-    }
-}
-
-/// Max length (in `char`s) of a per-user UI-settings `key` (spec M12).
-const MAX_UI_KEY_LEN: usize = 64;
-/// Max length (in bytes) of a per-user UI-settings `value` (spec M12): a
-/// dock-layout JSON blob is the largest expected payload; 64KB is generous
-/// headroom over that while still bounding the row size.
-const MAX_UI_VALUE_LEN: usize = 64 * 1024;
-
-/// Validates a UI-settings `key` (spec M12): `[A-Za-z0-9._-]{1,64}`. Guards
-/// against both nonsense input and (defense in depth, not the primary
-/// mechanism) a key containing a literal `.` that could otherwise be crafted
-/// to look like part of the `ui.{username}.` prefix.
-fn validate_ui_key(key: &str) -> Result<(), BantoError> {
-    let ok = !key.is_empty()
-        && key.chars().count() <= MAX_UI_KEY_LEN
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "key".to_string(),
-                message: format!(
-                    "キーは英数字・`.`・`_`・`-` のみ、1〜{MAX_UI_KEY_LEN}文字で指定してください"
-                ),
-            }],
-        })
-    }
-}
-
-fn validate_ui_value(value: &str) -> Result<(), BantoError> {
-    if value.len() > MAX_UI_VALUE_LEN {
-        return Err(BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "value".to_string(),
-                message: format!("値は{}KB以内で指定してください", MAX_UI_VALUE_LEN / 1024),
-            }],
-        });
-    }
-    Ok(())
-}
-
-/// Embedded-server settings (spec §11.2, §11.4): whether LAN access is
-/// enabled, and the bind address/port. Defaults to disabled,
-/// localhost-only - "attack surface zero" until the user opts in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerSettings {
-    pub enabled: bool,
-    pub bind: String,
-    pub port: u16,
-}
-
-impl Default for ServerSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bind: "127.0.0.1".to_string(),
-            port: 8721,
-        }
-    }
-}
-
-/// Auth-mode settings (spec M11): the "ログイン不要モード" (auth-disabled)
-/// toggle + its synthetic-identity role, and the desktop "自動ログイン"
-/// (autologin) opt-in + which account it targets. Defaults to today's
-/// behavior (a real login screen, no autologin) so an existing DB with none
-/// of these keys set behaves exactly as before M11.
-///
-/// Deliberately does NOT carry the autologin password: that lives only in
-/// the OS keyring (`src-tauri`'s `keyring_store` module), never in this
-/// SQLite settings DB (spec M11: "設定DBには保存しない").
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthSettings {
-    pub disabled: bool,
-    pub disabled_role: Role,
-    pub autologin_enabled: bool,
-    pub autologin_username: Option<String>,
-}
-
-impl Default for AuthSettings {
-    fn default() -> Self {
-        Self {
-            disabled: false,
-            disabled_role: Role::Admin,
-            autologin_enabled: false,
-            autologin_username: None,
-        }
-    }
-}
-
-/// Audit-log retention settings (spec M14): a days cap and/or a row-count
-/// cap for [`crate::audit::AuditLogService::prune`]. `None` on either field
-/// means unlimited on that dimension (see [`normalize_retention`]).
-/// Defaults to 90 days / 100,000 rows - generous enough not to surprise a
-/// fresh install, bounded enough that the table does not grow forever with
-/// no configuration at all.
-///
-/// `Deserialize` (in addition to `Serialize`) is needed from M14 Phase B: the
-/// REST layer's `PUT /api/audit-log/config` (`crate::rest::audit_config_apply`)
-/// decodes the request body straight into this type rather than a bespoke
-/// request struct - it is a plain two-field settings value with no fields
-/// that must never round-trip over the wire (unlike `AuthSettings`, which
-/// deliberately has no password field to begin with).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuditSettings {
-    pub retention_days: Option<i64>,
-    pub retention_rows: Option<i64>,
-}
-
-impl Default for AuditSettings {
-    fn default() -> Self {
-        Self {
-            retention_days: Some(DEFAULT_AUDIT_RETENTION_DAYS),
-            retention_rows: Some(DEFAULT_AUDIT_RETENTION_ROWS),
-        }
     }
 }
 
@@ -204,7 +79,7 @@ impl Default for AuditSettings {
 ///   [`crate::collect::resolve_data_dir`]（アプリのデータディレクトリ基準）。
 /// * `retention_days`: 保持期間。既定 **90 日**
 ///   （docs/recorder-requirements.md §3.4）。`None` は「無制限」
-///   （[`normalize_retention`] - [`AuditSettings`] と同じ約束）。
+///   （[`AuditSettings`] と同じ約束 - [`parse_retention`]）。
 ///
 /// # このコードはファイルを一切削除しない
 ///
@@ -228,673 +103,57 @@ impl Default for StoreSettings {
     }
 }
 
-/// Generic key/value settings store, backed by the `settings` table
-/// (migration `0001_settings.sql`). Shares the same sqlite pool as every
-/// other service in this crate (spec §12.1: app settings live in the local
-/// SQLite settings DB alongside/instead of a separate file).
-///
-/// `Clone` is cheap (`SqlitePool` is an `Arc`-backed handle), matching
-/// `UsersService` - needed since M12, when the REST layer's
-/// `/api/ui-settings/*` router started carrying its own handle.
-#[derive(Clone)]
-pub struct SettingsService {
-    pool: SqlitePool,
+/// 収集ランタイムの保存設定を読む（#383 段階2b / R1-C）。未設定のキーは
+/// [`StoreSettings::default`] にフォールバックする。`retention_days` の
+/// 読み方は [`parse_retention`]（`0` 以下は「無制限」= `None`）。
+pub async fn store_config(settings: &SettingsService) -> Result<StoreSettings, BantoError> {
+    let defaults = StoreSettings::default();
+    let data_dir = settings
+        .get(KEY_DATA_DIR)
+        .await?
+        .unwrap_or(defaults.data_dir);
+    let retention_days = parse_retention(
+        settings.get(KEY_RETENTION_DAYS).await?,
+        defaults.retention_days,
+    );
+    Ok(StoreSettings {
+        data_dir,
+        retention_days,
+    })
 }
 
-impl SettingsService {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
-    }
-
-    /// Read a single setting by key, or `None` if it has never been set.
-    pub async fn get(&self, key: &str) -> Result<Option<String>, BantoError> {
-        sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(banto_storage::storage_error)
-    }
-
-    /// Upsert a single setting.
-    pub async fn set(&self, key: &str, value: &str) -> Result<(), BantoError> {
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES (?, ?) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-        Ok(())
-    }
-
-    /// Upsert several keys in ONE transaction: either every pair is stored or
-    /// none is. banto v2.0.0 移行（freshness audit of banto #266, P2-3 -
-    /// `banto-admin-services` の同名メソッドの写し。ChronoGazer は SQLite
-    /// のみなので分岐はない）: [`SettingsService::set_auth_config`] must not
-    /// leave `auth.disabled` saved and `auth.disabled_role` not, since the
-    /// desktop app re-binds its session from what it saved.
-    pub async fn set_many(&self, pairs: &[(&str, &str)]) -> Result<(), BantoError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(banto_storage::storage_error)?;
-        for (key, value) in pairs {
-            sqlx::query(
-                "INSERT INTO settings (key, value) VALUES (?, ?)                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            )
-            .bind(*key)
-            .bind(*value)
-            .execute(&mut *tx)
-            .await
-            .map_err(banto_storage::storage_error)?;
-        }
-        tx.commit().await.map_err(banto_storage::storage_error)?;
-        Ok(())
-    }
-
-    /// Is `key` one of the auth-mode keys only
-    /// [`SettingsService::set_auth_config`] may write (the `auth.`
-    /// namespace)? The desktop app's generic `settings_set` refuses them
-    /// (freshness audit of banto #266, P2-2): a raw write would bypass its
-    /// session re-bind and lock. `banto-admin-services` の
-    /// `SettingsService::is_auth_key` と同じ判定（ChronoGazer はその crate に
-    /// 依存していないので自前で持つ）。
-    pub fn is_auth_key(key: &str) -> bool {
-        key.starts_with("auth.")
-    }
-
-    /// Read a per-user UI setting (spec M12 SettingsProvider migration):
-    /// theme/preset/dock-layout, namespaced per authenticated account so two
-    /// users sharing one app instance never see each other's UI state.
-    /// Stored in the same generic `key`/`value` table as every other
-    /// setting, under the key `ui.{username}.{key}` (simple concatenation -
-    /// see [`SettingsService::ui_set`]'s doc comment for the `username`
-    /// containing `.` caveat this implies).
-    ///
-    /// `key` is validated (`[A-Za-z0-9._-]{1,64}`); `username` is not - it is
-    /// an existing account name already accepted by `UsersService` at
-    /// setup/creation time, not a fresh user-supplied value at this layer.
-    pub async fn ui_get(&self, username: &str, key: &str) -> Result<Option<String>, BantoError> {
-        validate_ui_key(key)?;
-        let storage_key = format!("ui.{username}.{key}");
-        self.get(&storage_key).await
-    }
-
-    /// Upsert a per-user UI setting. See [`SettingsService::ui_get`] for the
-    /// namespacing scheme.
-    ///
-    /// `username` is simply concatenated into the storage key
-    /// (`ui.{username}.{key}`) with no escaping - a username containing `.`
-    /// is technically possible (`UsersService::validate_username` only
-    /// enforces length, not charset) and could in principle make two distinct
-    /// `(username, key)` pairs collide on the same storage key (e.g.
-    /// username `"a.b"` key `"c"` and username `"a"` key `"b.c"` both produce
-    /// `"ui.a.b.c"`). This is accepted as-is for M12 Phase A (per-user
-    /// isolation is "best effort keyed on today's username charset", not a
-    /// hard security boundary) - see the M12 handoff report for the
-    /// investigation of whether `.` is actually reachable in practice.
-    pub async fn ui_set(&self, username: &str, key: &str, value: &str) -> Result<(), BantoError> {
-        validate_ui_key(key)?;
-        validate_ui_value(value)?;
-        let storage_key = format!("ui.{username}.{key}");
-        self.set(&storage_key, value).await
-    }
-
-    /// Read the embedded-server settings, falling back to
-    /// [`ServerSettings::default`] for any key that has not been set yet
-    /// (e.g. on a fresh database).
-    pub async fn server_config(&self) -> Result<ServerSettings, BantoError> {
-        let defaults = ServerSettings::default();
-
-        let enabled = self
-            .get(KEY_SERVER_ENABLED)
-            .await?
-            .map(|value| value == "true")
-            .unwrap_or(defaults.enabled);
-        let bind = self.get(KEY_SERVER_BIND).await?.unwrap_or(defaults.bind);
-        let port = self
-            .get(KEY_SERVER_PORT)
-            .await?
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(defaults.port);
-
-        Ok(ServerSettings {
-            enabled,
-            bind,
-            port,
-        })
-    }
-
-    /// Persist the embedded-server settings as individual keys
-    /// (`server.enabled`/`server.bind`/`server.port`).
-    ///
-    /// Refuses to enable LAN access while auth-disabled mode is on (spec
-    /// M11: auth-disabled mode is v1-scoped to the Tauri window only - it
-    /// must never be combined with an unauthenticated LAN-exposed server).
-    /// See [`SettingsService::set_auth_config`] for the mirror-image guard.
-    pub async fn set_server_config(&self, config: &ServerSettings) -> Result<(), BantoError> {
-        if config.enabled && self.auth_config().await?.disabled {
-            return Err(BantoError::Other(
-                "認証無効モード中はLANアクセスを有効化できません".to_string(),
-            ));
-        }
-
-        self.set(
-            KEY_SERVER_ENABLED,
-            if config.enabled { "true" } else { "false" },
-        )
-        .await?;
-        self.set(KEY_SERVER_BIND, &config.bind).await?;
-        self.set(KEY_SERVER_PORT, &config.port.to_string()).await?;
-        Ok(())
-    }
-
-    /// Read the auth-mode settings (spec M11), falling back to
-    /// [`AuthSettings::default`] for any key that has not been set yet, and
-    /// falling back the same way for `auth.disabled_role` specifically if it
-    /// holds a value [`Role::from_str`] does not recognize (e.g. a future
-    /// downgrade, or a hand-edited DB) - a corrupt role value degrades to the
-    /// safe default (`admin`) rather than failing the whole read.
-    pub async fn auth_config(&self) -> Result<AuthSettings, BantoError> {
-        let defaults = AuthSettings::default();
-
-        let disabled = self
-            .get(KEY_AUTH_DISABLED)
-            .await?
-            .map(|value| value == "true")
-            .unwrap_or(defaults.disabled);
-        let disabled_role = self
-            .get(KEY_AUTH_DISABLED_ROLE)
-            .await?
-            .and_then(|value| Role::from_str(&value).ok())
-            .unwrap_or(defaults.disabled_role);
-        let autologin_enabled = self
-            .get(KEY_AUTOLOGIN_ENABLED)
-            .await?
-            .map(|value| value == "true")
-            .unwrap_or(defaults.autologin_enabled);
-        // "" is the sentinel for "unset" (see set_auth_config below) - a real
-        // username is never empty (UsersService enforces a minimum length),
-        // so this cannot collide with an actual configured username.
-        let autologin_username = self
-            .get(KEY_AUTOLOGIN_USERNAME)
-            .await?
-            .filter(|value| !value.is_empty());
-
-        Ok(AuthSettings {
-            disabled,
-            disabled_role,
-            autologin_enabled,
-            autologin_username,
-        })
-    }
-
-    /// Persist the auth-mode settings (spec M11).
-    ///
-    /// Refuses to turn auth-disabled mode ON while LAN access is currently
-    /// enabled (mirror image of [`SettingsService::set_server_config`]'s
-    /// guard) - both directions are checked so whichever settings screen the
-    /// user acts on second is the one that catches the conflict.
-    pub async fn set_auth_config(&self, config: &AuthSettings) -> Result<(), BantoError> {
-        if config.disabled && self.server_config().await?.enabled {
-            return Err(BantoError::Other(
-                "LANアクセスが有効な間は認証無効モードを有効化できません".to_string(),
-            ));
-        }
-
-        // One transaction (banto v2.0.0 移行, freshness audit of banto #266,
-        // P2-3): all four keys or none, so a failure part-way never leaves a
-        // mode saved that the desktop app's session re-bind did not follow.
-        self.set_many(&[
-            (
-                KEY_AUTH_DISABLED,
-                if config.disabled { "true" } else { "false" },
-            ),
-            (KEY_AUTH_DISABLED_ROLE, config.disabled_role.as_str()),
-            (
-                KEY_AUTOLOGIN_ENABLED,
-                if config.autologin_enabled {
-                    "true"
-                } else {
-                    "false"
-                },
-            ),
-            (
-                KEY_AUTOLOGIN_USERNAME,
-                config.autologin_username.as_deref().unwrap_or(""),
-            ),
+/// 収集ランタイムの保存設定を保存する。`None`（無制限）は `"0"` として
+/// 書き戻す - banto の `SettingsService::set_audit_config` と同じ約束。2 つの
+/// キーは 1 つのトランザクションで書く（[`SettingsService::set_many`]）。
+pub async fn set_store_config(
+    settings: &SettingsService,
+    config: &StoreSettings,
+) -> Result<(), BantoError> {
+    let retention_days = config.retention_days.unwrap_or(0).to_string();
+    settings
+        .set_many(&[
+            (KEY_DATA_DIR, config.data_dir.as_str()),
+            (KEY_RETENTION_DAYS, retention_days.as_str()),
         ])
         .await
-    }
-
-    /// 収集ランタイムの保存設定を読む（#383 段階2b / R1-C）。未設定のキーは
-    /// [`StoreSettings::default`] にフォールバックする。`retention_days` の
-    /// 読み方は [`parse_retention`]（`0` 以下は「無制限」= `None`）。
-    pub async fn store_config(&self) -> Result<StoreSettings, BantoError> {
-        let defaults = StoreSettings::default();
-        let data_dir = self.get(KEY_DATA_DIR).await?.unwrap_or(defaults.data_dir);
-        let retention_days =
-            parse_retention(self.get(KEY_RETENTION_DAYS).await?, defaults.retention_days);
-        Ok(StoreSettings {
-            data_dir,
-            retention_days,
-        })
-    }
-
-    /// 収集ランタイムの保存設定を保存する。`None`（無制限）は `"0"` として
-    /// 書き戻す - [`SettingsService::set_audit_config`] と同じ約束。
-    pub async fn set_store_config(&self, config: &StoreSettings) -> Result<(), BantoError> {
-        self.set(KEY_DATA_DIR, &config.data_dir).await?;
-        self.set(
-            KEY_RETENTION_DAYS,
-            &config.retention_days.unwrap_or(0).to_string(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Read the audit-log retention settings (spec M14), falling back to
-    /// [`AuditSettings::default`] for any key that has never been set. See
-    /// [`parse_retention`] for how a stored value maps to `Option<i64>`.
-    pub async fn audit_config(&self) -> Result<AuditSettings, BantoError> {
-        let defaults = AuditSettings::default();
-
-        let retention_days = parse_retention(
-            self.get(KEY_AUDIT_RETENTION_DAYS).await?,
-            defaults.retention_days,
-        );
-        let retention_rows = parse_retention(
-            self.get(KEY_AUDIT_RETENTION_ROWS).await?,
-            defaults.retention_rows,
-        );
-
-        Ok(AuditSettings {
-            retention_days,
-            retention_rows,
-        })
-    }
-
-    /// Persist the audit-log retention settings (spec M14). `None` is
-    /// written back as `"0"` - [`parse_retention`] treats a stored `0` (or
-    /// any non-positive value) as unlimited on read, so this round-trips
-    /// correctly without a separate "is this key even set" sentinel (unlike
-    /// [`SettingsService::set_auth_config`]'s `autologin_username`, which
-    /// uses `""` because `0` is not a meaningful username).
-    pub async fn set_audit_config(&self, config: &AuditSettings) -> Result<(), BantoError> {
-        self.set(
-            KEY_AUDIT_RETENTION_DAYS,
-            &config.retention_days.unwrap_or(0).to_string(),
-        )
-        .await?;
-        self.set(
-            KEY_AUDIT_RETENTION_ROWS,
-            &config.retention_rows.unwrap_or(0).to_string(),
-        )
-        .await?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migrate_memory;
+    use crate::db::{migrate_memory, Db};
 
     async fn service() -> SettingsService {
         let pool = migrate_memory().await.expect("migrate_memory");
-        SettingsService::new(pool)
+        SettingsService::new(Db::Sqlite(pool))
     }
 
-    #[tokio::test]
-    async fn get_missing_key_is_none() {
-        let svc = service().await;
-        assert_eq!(svc.get("nope").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn set_then_get_round_trips() {
-        let svc = service().await;
-        svc.set("theme", "dark").await.unwrap();
-        assert_eq!(svc.get("theme").await.unwrap(), Some("dark".to_string()));
-    }
-
-    #[tokio::test]
-    async fn set_twice_overwrites_via_upsert() {
-        let svc = service().await;
-        svc.set("theme", "dark").await.unwrap();
-        svc.set("theme", "light").await.unwrap();
-        assert_eq!(svc.get("theme").await.unwrap(), Some("light".to_string()));
-    }
-
-    #[tokio::test]
-    async fn server_config_defaults_when_unset() {
-        let svc = service().await;
-        let config = svc.server_config().await.unwrap();
-        assert_eq!(config, ServerSettings::default());
-        assert!(!config.enabled);
-        assert_eq!(config.bind, "127.0.0.1");
-        assert_eq!(config.port, 8721);
-    }
-
-    #[tokio::test]
-    async fn server_config_round_trips_through_set() {
-        let svc = service().await;
-        let config = ServerSettings {
-            enabled: true,
-            bind: "0.0.0.0".to_string(),
-            port: 9000,
-        };
-        svc.set_server_config(&config).await.unwrap();
-        assert_eq!(svc.server_config().await.unwrap(), config);
-    }
-
-    // --- Auth-mode settings (spec M11) -------------------------------------
-
-    #[tokio::test]
-    async fn auth_config_defaults_when_unset() {
-        let svc = service().await;
-        let config = svc.auth_config().await.unwrap();
-        assert_eq!(config, AuthSettings::default());
-        assert!(!config.disabled);
-        assert_eq!(config.disabled_role, Role::Admin);
-        assert!(!config.autologin_enabled);
-        assert_eq!(config.autologin_username, None);
-    }
-
-    #[tokio::test]
-    async fn auth_config_round_trips_through_set() {
-        let svc = service().await;
-        let config = AuthSettings {
-            disabled: true,
-            disabled_role: Role::Viewer,
-            autologin_enabled: true,
-            autologin_username: Some("kiosk".to_string()),
-        };
-        svc.set_auth_config(&config).await.unwrap();
-        assert_eq!(svc.auth_config().await.unwrap(), config);
-    }
-
-    #[tokio::test]
-    async fn auth_config_round_trips_when_autologin_username_is_cleared() {
-        let svc = service().await;
-        svc.set_auth_config(&AuthSettings {
-            disabled: false,
-            disabled_role: Role::Admin,
-            autologin_enabled: true,
-            autologin_username: Some("kiosk".to_string()),
-        })
-        .await
-        .unwrap();
-
-        // Disabling autologin and clearing the username should round-trip
-        // back to `None`, not an empty-string username.
-        svc.set_auth_config(&AuthSettings::default()).await.unwrap();
-        let config = svc.auth_config().await.unwrap();
-        assert_eq!(config.autologin_username, None);
-    }
-
-    #[tokio::test]
-    async fn auth_config_falls_back_to_default_role_on_an_invalid_stored_value() {
-        let svc = service().await;
-        // Simulate a corrupt/hand-edited DB value bypassing the typed setter.
-        svc.set(KEY_AUTH_DISABLED_ROLE, "not-a-role").await.unwrap();
-        let config = svc.auth_config().await.unwrap();
-        assert_eq!(config.disabled_role, Role::Admin);
-    }
-
-    /// banto v2.0.0 移行（freshness audit of banto #266, P2-3）: `set_many`
-    /// stores every pair (one transaction), and `is_auth_key` marks the
-    /// `auth.` namespace - but not ChronoGazer's own keys.
-    #[tokio::test]
-    async fn set_many_stores_every_pair_and_auth_keys_are_marked() {
-        let svc = service().await;
-        svc.set_many(&[("a.one", "1"), ("a.two", "2")])
-            .await
-            .unwrap();
-        assert_eq!(svc.get("a.one").await.unwrap().as_deref(), Some("1"));
-        assert_eq!(svc.get("a.two").await.unwrap().as_deref(), Some("2"));
-        assert!(SettingsService::is_auth_key("auth.disabled"));
-        assert!(SettingsService::is_auth_key("auth.autologin.username"));
-        assert!(!SettingsService::is_auth_key("audit.retention_days"));
-        assert!(!SettingsService::is_auth_key(KEY_DATA_DIR));
-        assert!(!SettingsService::is_auth_key(KEY_RETENTION_DAYS));
-    }
-
-    #[tokio::test]
-    async fn set_server_config_rejects_enabling_lan_while_auth_is_disabled() {
-        let svc = service().await;
-        svc.set_auth_config(&AuthSettings {
-            disabled: true,
-            ..AuthSettings::default()
-        })
-        .await
-        .unwrap();
-
-        let err = svc
-            .set_server_config(&ServerSettings {
-                enabled: true,
-                ..ServerSettings::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BantoError::Other(_)));
-
-        // The rejected write must not have taken effect.
-        assert!(!svc.server_config().await.unwrap().enabled);
-    }
-
-    #[tokio::test]
-    async fn set_server_config_allows_disabling_lan_while_auth_is_disabled() {
-        // The exclusivity guard only blocks turning LAN access ON while
-        // auth-disabled mode is active - turning it OFF (or leaving it off)
-        // must always be allowed, otherwise a user could get stuck unable to
-        // ever persist `enabled: false`.
-        let svc = service().await;
-        svc.set_auth_config(&AuthSettings {
-            disabled: true,
-            ..AuthSettings::default()
-        })
-        .await
-        .unwrap();
-
-        svc.set_server_config(&ServerSettings::default())
-            .await
-            .expect("disabling (or leaving disabled) LAN access should always be allowed");
-    }
-
-    #[tokio::test]
-    async fn set_auth_config_rejects_disabling_auth_while_lan_is_enabled() {
-        let svc = service().await;
-        svc.set_server_config(&ServerSettings {
-            enabled: true,
-            ..ServerSettings::default()
-        })
-        .await
-        .unwrap();
-
-        let err = svc
-            .set_auth_config(&AuthSettings {
-                disabled: true,
-                ..AuthSettings::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BantoError::Other(_)));
-
-        // The rejected write must not have taken effect.
-        assert!(!svc.auth_config().await.unwrap().disabled);
-    }
-
-    // --- Per-user UI settings (spec M12) -----------------------------------
-
-    #[tokio::test]
-    async fn ui_get_missing_key_is_none() {
-        let svc = service().await;
-        assert_eq!(svc.ui_get("alice", "theme").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn ui_set_then_ui_get_round_trips() {
-        let svc = service().await;
-        svc.ui_set("alice", "theme", "glass-dark").await.unwrap();
-        assert_eq!(
-            svc.ui_get("alice", "theme").await.unwrap(),
-            Some("glass-dark".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn ui_set_twice_overwrites_via_upsert() {
-        let svc = service().await;
-        svc.ui_set("alice", "theme", "standard").await.unwrap();
-        svc.ui_set("alice", "theme", "glass").await.unwrap();
-        assert_eq!(
-            svc.ui_get("alice", "theme").await.unwrap(),
-            Some("glass".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn ui_settings_are_isolated_between_users() {
-        let svc = service().await;
-        svc.ui_set("alice", "theme", "glass").await.unwrap();
-        svc.ui_set("bob", "theme", "standard").await.unwrap();
-
-        assert_eq!(
-            svc.ui_get("alice", "theme").await.unwrap(),
-            Some("glass".to_string())
-        );
-        assert_eq!(
-            svc.ui_get("bob", "theme").await.unwrap(),
-            Some("standard".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn ui_get_rejects_invalid_key() {
-        let svc = service().await;
-        let err = svc.ui_get("alice", "not a valid key!").await.unwrap_err();
-        match err {
-            BantoError::Validation { field_errors } => {
-                assert_eq!(field_errors[0].field, "key");
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ui_set_rejects_invalid_key() {
-        let svc = service().await;
-        let err = svc
-            .ui_set("alice", "not/a/valid/key", "value")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BantoError::Validation { .. }));
-    }
-
-    #[tokio::test]
-    async fn ui_set_rejects_oversized_value() {
-        let svc = service().await;
-        let too_big = "x".repeat(MAX_UI_VALUE_LEN + 1);
-        let err = svc.ui_set("alice", "dock", &too_big).await.unwrap_err();
-        match err {
-            BantoError::Validation { field_errors } => {
-                assert_eq!(field_errors[0].field, "value");
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ui_set_accepts_value_at_the_max_size() {
-        let svc = service().await;
-        let max_sized = "x".repeat(MAX_UI_VALUE_LEN);
-        svc.ui_set("alice", "dock", &max_sized).await.unwrap();
-        assert_eq!(svc.ui_get("alice", "dock").await.unwrap(), Some(max_sized));
-    }
-
-    #[tokio::test]
-    async fn set_auth_config_allows_non_disabling_changes_while_lan_is_enabled() {
-        // Only `disabled: true` is guarded - autologin settings (and
-        // `disabled: false`) must be freely settable regardless of LAN
-        // state.
-        let svc = service().await;
-        svc.set_server_config(&ServerSettings {
-            enabled: true,
-            ..ServerSettings::default()
-        })
-        .await
-        .unwrap();
-
-        svc.set_auth_config(&AuthSettings {
-            disabled: false,
-            disabled_role: Role::Admin,
-            autologin_enabled: true,
-            autologin_username: Some("kiosk".to_string()),
-        })
-        .await
-        .expect("non-disabling auth config changes should not be blocked by LAN state");
-    }
-
-    // --- Audit-log retention settings (spec M14) ---------------------------
-
-    #[tokio::test]
-    async fn audit_config_defaults_when_unset() {
-        let svc = service().await;
-        let config = svc.audit_config().await.unwrap();
-        assert_eq!(config, AuditSettings::default());
-        assert_eq!(config.retention_days, Some(90));
-        assert_eq!(config.retention_rows, Some(100_000));
-    }
-
-    #[tokio::test]
-    async fn audit_config_round_trips_through_set() {
-        let svc = service().await;
-        let config = AuditSettings {
-            retention_days: Some(30),
-            retention_rows: Some(5_000),
-        };
-        svc.set_audit_config(&config).await.unwrap();
-        assert_eq!(svc.audit_config().await.unwrap(), config);
-    }
-
-    #[tokio::test]
-    async fn audit_config_none_round_trips_as_unlimited() {
-        let svc = service().await;
-        svc.set_audit_config(&AuditSettings {
-            retention_days: None,
-            retention_rows: None,
-        })
-        .await
-        .unwrap();
-        let config = svc.audit_config().await.unwrap();
-        assert_eq!(config.retention_days, None);
-        assert_eq!(config.retention_rows, None);
-    }
-
-    #[tokio::test]
-    async fn audit_config_treats_a_stored_zero_as_unlimited_not_the_default() {
-        // A directly-stored "0" (bypassing the typed setter) must NOT fall
-        // back to the default (90/100_000) - it means the user explicitly
-        // chose unlimited, which is a real, distinct value from "unset".
-        let svc = service().await;
-        svc.set(KEY_AUDIT_RETENTION_DAYS, "0").await.unwrap();
-        let config = svc.audit_config().await.unwrap();
-        assert_eq!(config.retention_days, None);
-        assert_eq!(config.retention_rows, Some(100_000)); // untouched key still defaults
-    }
-
-    // --- 収集ランタイムの保存設定（#383 段階2b / R1-C） --------------------
-
-    /// **保持期間の既定は 90 日**（docs/recorder-requirements.md §3.4）。
+    /// 既定は `./data`・**90 日**（docs/recorder-requirements.md §3.4）。
     /// banto-hub の 7 日を真似していないことを固定する。
     #[tokio::test]
     async fn store_config_defaults_when_unset() {
         let svc = service().await;
-        let config = svc.store_config().await.unwrap();
+        let config = store_config(&svc).await.unwrap();
         assert_eq!(config, StoreSettings::default());
         assert_eq!(config.data_dir, "./data");
         assert_eq!(config.retention_days, Some(90));
@@ -907,29 +166,42 @@ mod tests {
             data_dir: "D:/chronogazer-data".to_string(),
             retention_days: Some(365),
         };
-        svc.set_store_config(&config).await.unwrap();
-        assert_eq!(svc.store_config().await.unwrap(), config);
+        set_store_config(&svc, &config).await.unwrap();
+        assert_eq!(store_config(&svc).await.unwrap(), config);
     }
 
     #[tokio::test]
     async fn store_config_none_round_trips_as_unlimited() {
         let svc = service().await;
-        svc.set_store_config(&StoreSettings {
-            data_dir: "./data".to_string(),
-            retention_days: None,
-        })
+        set_store_config(
+            &svc,
+            &StoreSettings {
+                data_dir: "./data".to_string(),
+                retention_days: None,
+            },
+        )
         .await
         .unwrap();
-        assert_eq!(svc.store_config().await.unwrap().retention_days, None);
+        assert_eq!(store_config(&svc).await.unwrap().retention_days, None);
     }
 
+    /// 数値として読めない値は既定に戻り、`"0"` は「無制限」のまま（既定に
+    /// 戻さない）。
     #[tokio::test]
-    async fn audit_config_falls_back_to_default_on_a_corrupt_stored_value() {
+    async fn store_config_corrupt_value_falls_back_but_zero_stays_unlimited() {
         let svc = service().await;
-        svc.set(KEY_AUDIT_RETENTION_DAYS, "not-a-number")
-            .await
-            .unwrap();
-        let config = svc.audit_config().await.unwrap();
-        assert_eq!(config.retention_days, Some(90));
+        svc.set(KEY_RETENTION_DAYS, "not-a-number").await.unwrap();
+        assert_eq!(store_config(&svc).await.unwrap().retention_days, Some(90));
+        svc.set(KEY_RETENTION_DAYS, "0").await.unwrap();
+        assert_eq!(store_config(&svc).await.unwrap().retention_days, None);
+    }
+
+    /// 閲覧公開（`server.viewer_public`）は既定で OFF（モジュール doc
+    /// 「閲覧公開は使わない」）。banto の `ServerSettings` の既定がそうで
+    /// あることを、この app のスキーマの上で固定する。
+    #[tokio::test]
+    async fn viewer_public_is_off_by_default() {
+        let svc = service().await;
+        assert!(!svc.server_config().await.unwrap().viewer_public);
     }
 }

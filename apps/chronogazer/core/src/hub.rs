@@ -2411,7 +2411,7 @@ mod tests {
     /// テスト（#394 のレビュー P1-2）に使う。
     async fn service_with_pool() -> (sqlx::SqlitePool, SettingsService, HubService) {
         let pool = init_db_memory().await.expect("init_db_memory");
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
         let hub = HubService::new(settings.clone(), Arc::new(UnavailableKeyStore))
             .await
             .expect("HubService::new");
@@ -5099,7 +5099,7 @@ mod tests {
         use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 
         let pool = init_db_memory().await.expect("init_db_memory");
-        let settings = SettingsService::new(pool);
+        let settings = SettingsService::new(crate::db::Db::Sqlite(pool));
         let keys = Arc::new(MemoryKeyStore::new());
         keys.set(KEYRING_ACCOUNT, "bh_abcd1234_opaque-secret")
             .unwrap();

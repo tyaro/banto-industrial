@@ -9,7 +9,9 @@ W系（relay-wright）は W5 まで実装済みだったが **2026-09-17 に凍�
 T21 構成補助 MCP 管理面を含む、2026-09-06）。残 T18-5c/d（Windows
 実機往復・72h soak = 実機必須）と実機・需要待ちの #210/#211/#123/#201。2026-09-24: I3a に記録時刻と
 ファイル日付の契約（#424 案 A、§5）を追記。2026-10-02: §5 に両アプリの DB スキーマの整理（admin-template の
-migration のコピー・旧形式の DB の拒否、オーナー決定・実装済み）を追記。
+migration のコピー・旧形式の DB の拒否、オーナー決定・実装済み）を追記。2026-10-04: §5 に
+ChronoGazer のサービスと REST ルーターを banto のものに置き換えたこと（実装済み）と、
+それに伴うオーナー決定 2 点（#280 の旧バックアップは警告のみ・閲覧公開は画面に出さない）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -251,6 +253,28 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   `_sqlx_migrations_banto_tags`。`banto-collect` は冪等 DDL のまま）、手書きの冪等 DDL を
   `sqlx::migrate!` に戻した。経緯と理由は各アプリの `core/src/db.rs` のモジュール doc と
   [r1a-readme-gaps.md](r1a-readme-gaps.md)
+
+- **ChronoGazer のサービスと REST ルーターを banto のものに（2026-10-04、実装済み）**:
+  banto に寄せる作業の段階名では I2a（§4 の I2a = SLMP 読み取りクライアントとは別物）。
+  上のスキーマの整理を土台に、ChronoGazer core が持っていた admin-template のコピー
+  （`users`・`settings`・`audit`・`backup` の 4 サービスと、`rest.rs` の users/auth/ui-settings/
+  audit-log/backups の各ルーター・RBAC と監査のヘルパ）を削除し、banto v3.0.0 の
+  `banto-admin-services` と `banto_server::routes` のものを使う。ChronoGazer に残るのは固有の
+  設定キー（`data.dir`・`retention.days` の `StoreSettings`、`hub.*`）の型付きラッパと、Hub・
+  収集・タグレジストリの口だけ。これで自前のコピーに入っていなかった banto v2.1.0 のセキュリティ
+  修正（#277 初回セットアップの原子化、#278 未認証ログアウト・失敗ログインの監査の増幅、#280
+  バックアップ保存先の DB ごとの分離）が入った。オーナー決定は 2 点:
+  - **#280 の旧バックアップは起動時の警告のみ**（banto の既定どおり。共有領域
+    `<DB のフォルダ>/backups/` 直下に残ったファイルを移す処理は作らない）。
+  - **閲覧公開（`server.viewer_public`・`POST /api/auth/grant/publicViewer`）は設定画面に
+    出さない**（既定 OFF）。`GrantRegistry` は空のまま（grant の口は常に 404）で、加えて
+    汎用の `settings_set` から `server.viewer_public` を書かせず、LAN 公開の保存では常に OFF を
+    書く - 書けると banto の「認証無効 + LAN 有効は閲覧公開のときだけ可」の緩和が効くため。
+
+  続き（未着手）: 埋め込みサーバーの適用（`server_apply`）を banto に寄せる I2b、初回
+  セットアップ画面・起動時の環境判定の I2c、banto-hub 側の I3'。手順と wire の変化は
+  [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・監査ログ・
+  バックアップ」と `apps/chronogazer/core/src/rest.rs` のモジュール doc
 
 - **ハイブリッドトレンド**: メモリ上のローリング窓（直近）+ DB（過去、
   間引き済み）を、チャート viewport の参照位置で継ぎ目なく合成する

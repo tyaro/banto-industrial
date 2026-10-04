@@ -7,7 +7,8 @@
 //!
 //! | Method | Path               | Body           | Response              |
 //! |--------|--------------------|----------------|------------------------|
-//! | GET    | `/api/auth/status`   | -              | `{initialized}` (NO auth required) |
+//! | GET    | `/api/auth/status`   | -              | `{initialized,grants}` (NO auth required; `grants` is always `{}` - no grant kind is registered) |
+//! | POST   | `/api/auth/grant/{kind}` | -          | always 404 (banto v3.0.0 ADR-0017; ChronoGazer registers no grant kind - no 閲覧公開, 2026-10-04 owner decision) |
 //! | POST   | `/api/auth/setup`     | `{username,password,displayName}` | `{success,error?,token?}` (needs `allow_setup`) |
 //! | POST   | `/api/auth/login`    | `{username,password}` | `{success,error?,token?}` |
 //! | POST   | `/api/auth/logout`   | -              | 200                    |
@@ -22,7 +23,7 @@
 //! | DELETE | `/api/users/{id}`    | -              | 204 (admin)             |
 //! | GET    | `/api/ui-settings/{key}` | -          | `{value: string \| null}` (any role) |
 //! | PUT    | `/api/ui-settings/{key}` | `{value}`  | 204 (any role)          |
-//! | POST   | `/api/audit-log/list?asOfId=` | `ListParams` | `AuditLogList` (`ListResult` + `asOfId`, admin) |
+//! | POST   | `/api/audit-log/list?asOfId=` | `ListParams` | `AuditLogList` (`ListResult` + `asOfId` + `deletionEpoch`, admin; unreadable query = `400 bad_request`) |
 //! | GET    | `/api/audit-log/config` | -            | `AuditSettings` (admin) |
 //! | PUT    | `/api/audit-log/config` | `AuditSettings` | `AuditSettings` (admin) |
 //! | POST   | `/api/backups`        | -              | `BackupInfo` (admin, spec M17) |
@@ -99,12 +100,12 @@
 //!
 //! Every mutating handler above (`users` create/update/delete, password
 //! reset, self-service password change) records a `crate::audit::AuditEntry`
-//! to [`crate::audit::AuditLogService`] once its underlying service call has
+//! to [`AuditLogService`] once its underlying service call has
 //! already succeeded (`origin: "rest"`); [`require_role_at_least`] records
 //! `action: "denied"` when an authenticated caller's role is too low;
 //! [`audited_credential_verifier`] records `login`/`login_failed`;
-//! [`audit_logout_middleware`] records `logout`; and `auth_setup_handler`
-//! records `setup`. Read routes (`list`/`get`) are never audited. The trail
+//! [`audit_logout_middleware`] records `logout` (only when a valid session
+//! is ended - banto #278); and `POST /api/auth/setup` records `setup`. Read routes (`list`/`get`) are never audited. The trail
 //! itself is only readable via `POST /api/audit-log/list`, `admin`-only.
 //!
 //! `/api/plc-connections/*`/`/api/collection-groups/*`/`/api/tags/*` (#383
@@ -153,7 +154,7 @@
 //! deliberately NEVER recorded from here - a staged restore is only ever
 //! APPLIED at the next process start, before any REST router (or pool) even
 //! exists yet (spec M17: "稼働中のプールの差し替えはしない") - see
-//! `crate::backup::BackupService::apply_pending_restore_at_startup`'s doc
+//! `banto_admin_services::backup::BackupService::apply_pending_restore_at_startup`'s doc
 //! comment and its callers in `src-tauri`'s `run()`/`bin/banto-serve.rs`'s
 //! `main`, which record that entry themselves once a fresh `AuditLogService`
 //! exists. `POST /api/backups/restore`'s request body is raw bytes
@@ -163,20 +164,50 @@
 //! `?fileName=` query parameter purely for the audit `detail`/error
 //! messages, never as a filesystem path (the actual bytes are always staged
 //! under the service's own fixed `restore-pending.sqlite3` name - see
-//! `crate::backup::BackupService::stage_restore_from_bytes`).
+//! `banto_admin_services::backup::BackupService::stage_restore_from_bytes`).
+//!
+//! ## banto のルーターをそのまま使う（I2a、2026-10-04）
+//!
+//! 上の表のうち `/api/auth/*`・`/api/users/*`・`/api/ui-settings/*`・
+//! `/api/audit-log/*`・`/api/backups/*` と、ログイン/ログアウトの監査・
+//! RBAC の床（[`RoleGuard`] / [`require_role_at_least`]）・成功の監査
+//! （[`record_write`]）は `banto_server::routes` のものを使う（以前は
+//! admin-template からのコピーを持っていた）。この module が自前で持つのは
+//! ChronoGazer 固有の口（Hub・収集・タグレジストリ）と、その `editor` の床
+//! （[`require_editor`]）と、全体を組む [`api_router`] だけ。
+//!
+//! banto のものに替えて変わった振る舞い（wire を含む）:
+//!
+//! - 初回セットアップが 1 文で原子的になった（banto #277）。同時に来ても
+//!   アカウントは 1 つだけ。
+//! - 失敗ログインの監査の `actorUsername` は 32 文字に切り詰められ、
+//!   トークン無し・無効なトークンのログアウトは記録されない（banto #278）。
+//! - バックアップとリストア予約は `<DB の親>/backups/<DB ファイル名>/` に
+//!   置かれる（banto #280）。それより前の `<DB の親>/backups/` 直下は一覧・
+//!   取得・自動適用の対象外で、起動時に警告が出るだけ（2026-10-04 オーナー
+//!   決定）。
+//! - 監査ログ一覧の応答に `deletionEpoch` が乗る（#248 の受け皿。画面は
+//!   まだ使わない）。`asOfId` が読めないときは axum 既定の平文の 400 では
+//!   なく JSON の `400 { kind: "bad_request" }`。
+//! - `/api/audit-log/config` の権限拒否の監査の `resource` は `settings`
+//!   （一覧の拒否は従来どおり `audit_log`）。
+//! - RBAC の床は、ログイン時に覚えた role ではなく、そのリクエストで
+//!   照合した**今の** role で判定する（banto #204 の `AuthenticatedSession`）。
 
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use banto_core::{BantoError, ErrorBody, FieldError, ListParams};
+use banto_core::{BantoError, FieldError, ListParams};
+use banto_server::routes::{
+    actor_identity, audit_log_router, audit_logout_middleware, backups_router, extra_auth_router,
+    record_write, require_role_at_least, ui_settings_router, users_router, LogoutAuditState,
+    RoleGuard,
+};
 use banto_server::{
-    auth_routes, grant_router, require_auth, require_banto_client_header, sse_route, ApiError,
-    AuthState, AuthenticatedSession, GrantKind, GrantRegistry, Identity, ServerEvent,
-    SessionAccount, SessionStamp, SessionValidation,
+    auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
+    GrantRegistry, ServerEvent,
 };
 use banto_tags::{
     CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
@@ -190,7 +221,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
-use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+use crate::backup::BackupService;
 use crate::collect::ExclusionView;
 use crate::collect::{
     CollectEventList, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
@@ -198,131 +229,21 @@ use crate::collect::{
     COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
-use crate::settings::{AuditSettings, SettingsService};
+use crate::settings::SettingsService;
 use crate::simulation::SimulationCoverageEntry;
 use crate::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
     ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, TagPlacement,
 };
-use crate::users::{Role, UserIdentity, UserSummary, UsersService};
+use crate::users::{Role, UsersService};
 
-/// Request-body size cap for `POST /api/backups/restore` (spec M17: "サイズ
-/// 上限（例256MB）を設ける"). Applied via `DefaultBodyLimit` on
-/// [`backups_router`] - axum's own built-in default is 2MB
-/// (`axum::extract::DefaultBodyLimit`), far too small for an uploaded DB
-/// backup.
-const MAX_RESTORE_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
-
-/// Resolve the caller's [`Identity`] from its bearer token, best-effort
-/// (spec M14): every audit-recording call site needs "who did this", and
-/// every one of them runs AFTER `require_auth`/`require_role_at_least` has
-/// already proven the token valid, so this should always resolve - `None`
-/// here is a defensive fallback (e.g. the token expired in the instant
-/// between the guard and the handler running), not an expected path. Shared
-/// by the users write handlers below; auth-flow events (login/setup/
-/// logout) resolve their own actor differently since they run before or
-/// without a caller session.
-fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
-    bearer_token(headers).and_then(|token| auth.identity_for(token))
-}
-
-/// Record a successful write (spec M14: create/update/delete/password_reset
-/// etc.) once the service call it follows has already succeeded. Resolves
-/// the actor from the same bearer token `require_auth`/`require_role_at_least`
-/// validated - see [`actor_identity`]. `origin` is always `"rest"` at every
-/// call site in this module (the REST layer); kept as a parameter rather
-/// than hardcoded only so this helper reads the same as the audit
-/// entry it builds.
-async fn record_write(
-    audit: &AuditLogService,
-    auth: &AuthState,
-    headers: &HeaderMap,
-    action: &str,
-    resource: &str,
-    entity_id: &str,
-    detail: Option<serde_json::Value>,
-) {
-    let identity = actor_identity(headers, auth);
-    audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action,
-            resource,
-            entity_id: Some(entity_id),
-            detail,
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-}
-
-/// `State` for [`require_role_at_least`]: the `AuthState` needed to resolve
-/// a bearer token back to an [`Identity`], the minimum [`Role`] the guarded
-/// routes require, the `resource` name to tag a denial with (spec M14), and
-/// the `AuditLogService` to record that denial to.
-#[derive(Clone)]
-struct RoleGuard {
-    auth: AuthState,
-    min: Role,
-    resource: &'static str,
-    audit: AuditLogService,
-}
-
-fn forbidden_response() -> Response {
-    (StatusCode::FORBIDDEN, Json(ErrorBody::Forbidden)).into_response()
-}
-
-/// Axum middleware (spec M10 RBAC): stacked *after* `require_auth` on a
-/// router, so a request has already been proven to carry a valid bearer
-/// token by the time this runs. Re-resolves that token to an [`Identity`],
-/// parses `Identity.role`, and rejects with `403
-/// { "kind": "forbidden" }` unless the caller's role is at least
-/// `guard.min`. Attach via
-/// `middleware::from_fn_with_state(RoleGuard { auth, min, resource, audit }, require_role_at_least)`.
-///
-/// A missing/invalid token at this point (the identity lookup failing) means
-/// `require_auth` did not actually run first - treated as `Forbidden` rather
-/// than panicking, so a misconfigured router fails closed instead of open.
-/// Spec M14: a denial is only recorded to the audit log when there IS a
-/// resolved identity whose role is simply too low - the defensive
-/// missing-token case above is not a meaningful RBAC decision to audit (it
-/// means the router itself is misconfigured, not that a real user got
-/// rejected).
-async fn require_role_at_least(
-    State(guard): State<RoleGuard>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let identity = bearer_token(req.headers()).and_then(|token| guard.auth.identity_for(token));
-    let role = identity
-        .as_ref()
-        .and_then(|identity| Role::from_str(&identity.role).ok());
-
-    match role {
-        Some(role) if role.at_least(guard.min) => next.run(req).await,
-        _ => {
-            if let Some(identity) = &identity {
-                let method = req.method().as_str().to_string();
-                let path = req.uri().path().to_string();
-                guard
-                    .audit
-                    .record(AuditEntry {
-                        actor_username: Some(&identity.id),
-                        actor_role: Some(&identity.role),
-                        action: "denied",
-                        resource: guard.resource,
-                        entity_id: None,
-                        detail: Some(json!({ "method": method, "path": path })),
-                        origin: "rest",
-                        result: "denied",
-                    })
-                    .await;
-            }
-            forbidden_response()
-        }
-    }
-}
+// I2a（2026-10-04）: 領域に依らない REST の口（`/api/auth/{status,setup,
+// change-password}`・`/api/users/*`・`/api/audit-log/*`・`/api/backups/*`・
+// `/api/ui-settings/*`、ログイン/ログアウトの監査）は banto の
+// `banto_server::routes` のものをそのまま使う（以前は admin-template からの
+// コピーを持っていた）。`src-tauri`・`banto-serve` が使う 3 つは、これまでの
+// `chronogazer_core::rest::*` のパスのまま呼べるよう re-export する。
+pub use banto_server::routes::{audited_credential_verifier, user_auth_state, user_session_lookup};
 
 /// Resolve the caller's identity and require role >= `editor` (R0 §3.6:
 /// resources are viewer-read / editor-write). Records a `denied` audit entry
@@ -370,1056 +291,6 @@ async fn require_editor(
         }
         None => Err(BantoError::Unauthorized),
     }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UserIdentityResponse {
-    id: i64,
-    username: String,
-    display_name: String,
-    role: Role,
-}
-
-impl From<UserIdentity> for UserIdentityResponse {
-    fn from(identity: UserIdentity) -> Self {
-        Self {
-            id: identity.id,
-            username: identity.username,
-            display_name: identity.display_name,
-            role: identity.role,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateUserRequest {
-    username: String,
-    password: String,
-    display_name: String,
-    role: Role,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateUserRequest {
-    display_name: String,
-    role: Role,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResetPasswordRequest {
-    new_password: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ResetPasswordResponse {
-    success: bool,
-}
-
-/// State for the `/api/users/*` handlers: `UsersService` for the CRUD
-/// itself, `AuthState` so `users_delete` can resolve the acting caller's
-/// numeric row id from its bearer token (spec M10's self-deletion guard,
-/// see `UsersService::delete_user`'s doc comment), and `AuditLogService`
-/// (spec M14) so every mutation here records a `create`/`update`/
-/// `password_reset`/`delete` entry once it has already succeeded.
-#[derive(Clone)]
-struct UsersAdminState {
-    users: UsersService,
-    auth: AuthState,
-    audit: AuditLogService,
-}
-
-/// Resolve the [`UserIdentity`] of the caller making this request, from its
-/// bearer token. `require_auth`/`require_role_at_least` have already proven
-/// the token is valid and `admin`-roled by the time a `/api/users/*` handler
-/// runs, so this should always succeed - `Unauthorized` here is a defensive
-/// fallback (e.g. the account was deleted by another admin between the
-/// token being issued and this request), not an expected path.
-async fn acting_user(
-    headers: &HeaderMap,
-    auth: &AuthState,
-    users: &UsersService,
-) -> Result<UserIdentity, BantoError> {
-    let username = bearer_token(headers)
-        .and_then(|token| auth.identity_for(token))
-        .map(|identity| identity.id);
-    let Some(username) = username else {
-        return Err(BantoError::Unauthorized);
-    };
-    users
-        .get_by_username(&username)
-        .await?
-        .ok_or(BantoError::Unauthorized)
-}
-
-async fn users_list(
-    State(state): State<UsersAdminState>,
-) -> Result<Json<Vec<UserSummary>>, ApiError> {
-    Ok(Json(state.users.list_users().await?))
-}
-
-async fn users_create(
-    State(state): State<UsersAdminState>,
-    headers: HeaderMap,
-    Json(body): Json<CreateUserRequest>,
-) -> Result<Json<UserIdentityResponse>, ApiError> {
-    let identity = state
-        .users
-        .create_user(
-            &body.username,
-            &body.password,
-            &body.display_name,
-            body.role,
-        )
-        .await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "create",
-        "users",
-        &identity.id.to_string(),
-        Some(json!({ "username": identity.username, "role": identity.role })),
-    )
-    .await;
-    Ok(Json(identity.into()))
-}
-
-async fn users_update(
-    State(state): State<UsersAdminState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(body): Json<UpdateUserRequest>,
-) -> Result<Json<UserSummary>, ApiError> {
-    let updated = state
-        .users
-        .update_user(id, &body.display_name, body.role)
-        .await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        "users",
-        &id.to_string(),
-        Some(json!({ "role": updated.role })),
-    )
-    .await;
-    Ok(Json(updated))
-}
-
-async fn users_reset_password(
-    State(state): State<UsersAdminState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(body): Json<ResetPasswordRequest>,
-) -> Result<Json<ResetPasswordResponse>, ApiError> {
-    state.users.reset_password(id, &body.new_password).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "password_reset",
-        "users",
-        &id.to_string(),
-        None,
-    )
-    .await;
-    Ok(Json(ResetPasswordResponse { success: true }))
-}
-
-/// `DELETE /api/users/{id}`. The self-deletion guard needs the caller's own
-/// row id ([`UsersService::delete_user`]); a grant session (banto v3.0.0
-/// ADR-0017 §3) has a fixed identity and no row, so for it - and ONLY for it,
-/// judged by the [`AuthenticatedSession`] `require_auth` validated for this
-/// request, never by the identity's name - no acting id is passed. ChronoGazer
-/// registers no grant kind today (its `GrantRegistry` is empty), so this branch
-/// is the template's shape kept for parity with banto; an account session whose
-/// row cannot be resolved stays `Unauthorized`. The `admin` floor and "the last
-/// admin cannot be deleted" apply unchanged.
-async fn users_delete(
-    State(state): State<UsersAdminState>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    let is_grant = session.is_some_and(|axum::Extension(session)| session.grant.is_some());
-    let acting_id = if is_grant {
-        None
-    } else {
-        Some(acting_user(&headers, &state.auth, &state.users).await?.id)
-    };
-    state.users.delete_user(id, acting_id).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "delete",
-        "users",
-        &id.to_string(),
-        None,
-    )
-    .await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// `/api/users/*` (spec M10): `admin`-only account management. Guarded with
-/// `require_auth` then `require_role_at_least`, with `Role::Admin` as the
-/// floor.
-fn users_router(users: UsersService, audit: AuditLogService, auth: AuthState) -> Router {
-    let state = UsersAdminState {
-        users,
-        auth: auth.clone(),
-        audit: audit.clone(),
-    };
-    Router::new()
-        .route("/api/users", get(users_list).post(users_create))
-        .route(
-            "/api/users/{id}",
-            axum::routing::put(users_update).delete(users_delete),
-        )
-        .route("/api/users/{id}/reset-password", post(users_reset_password))
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                min: Role::Admin,
-                resource: "users",
-                audit,
-            },
-            require_role_at_least,
-        ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
-}
-
-/// State shared by `/api/auth/status`, `/api/auth/setup` and
-/// `/api/auth/change-password` (see [`extra_auth_router`]): these need both
-/// `UsersService` (the credential store, spec §8.2) and `AuthState` (to
-/// issue a token on `setup`'s implicit login, and to resolve the calling
-/// account on `change-password`), neither of which `banto_server::auth`
-/// knows about on its own, plus the [`GrantRegistry`] (`status` reports
-/// which grant kinds may be issued to this peer, banto v3.0.0 ADR-0017 -
-/// empty for ChronoGazer, which has neither 閲覧公開 nor a commissioning mode).
-#[derive(Clone)]
-struct UsersAuthState {
-    users: UsersService,
-    auth: AuthState,
-    audit: AuditLogService,
-    allow_setup: bool,
-    registry: Arc<GrantRegistry>,
-}
-
-/// `GET /api/auth/status`: `{ initialized, grants }` (the v3.0.0 shape of
-/// banto's `AuthStatusResponse`; `viewerPublic` is gone). `grants` is `{}`
-/// here because ChronoGazer registers no grant kind - the login screen reads a
-/// missing kind as "not available" (fail closed).
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthStatusResponse {
-    initialized: bool,
-    grants: std::collections::BTreeMap<GrantKind, bool>,
-}
-
-/// The connection's peer address (a copy of banto-server's `pub(crate)`
-/// `MaybePeerAddr`): `Some` under `banto_server::start`'s
-/// `into_make_service_with_connect_info`, `None` under `tower::oneshot`.
-struct MaybePeerAddr(Option<std::net::SocketAddr>);
-
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybePeerAddr {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(MaybePeerAddr(
-            parts
-                .extensions
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|info| info.0),
-        ))
-    }
-}
-
-async fn auth_status_handler(
-    State(state): State<UsersAuthState>,
-    MaybePeerAddr(peer): MaybePeerAddr,
-) -> Result<Json<AuthStatusResponse>, ApiError> {
-    let initialized = state.users.is_initialized().await?;
-    let grants = state.registry.availability(peer).await;
-    Ok(Json(AuthStatusResponse {
-        initialized,
-        grants,
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetupRequest {
-    username: String,
-    password: String,
-    display_name: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SetupResponse {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
-}
-
-/// `POST /api/auth/setup`: creates the first account, then behaves like a
-/// successful login (spec §8.2/§3.3). Three distinct outcomes:
-/// - `allow_setup` is `false` -> `403` with a plain `{kind,message}` body
-///   (not the `{success,error?}` shape below - this is a server
-///   configuration rejection, not a "try again" outcome).
-/// - `UsersService::setup_first_user` returns `BantoError::Validation` (bad
-///   username/password) -> `422` with `field_errors` (spec: form fields
-///   should be able to map these), same convention every other mutating
-///   handler in this module uses.
-/// - Anything else (already initialized, storage error) -> `200` with
-///   `{success:false,error}`, mirroring `login_handler`'s "expected,
-///   retryable failure" convention.
-async fn auth_setup_handler(
-    State(state): State<UsersAuthState>,
-    Json(body): Json<SetupRequest>,
-) -> Result<Response, ApiError> {
-    if !state.allow_setup {
-        let message = "このサーバーでは初期セットアップが許可されていません".to_string();
-        return Ok((StatusCode::FORBIDDEN, Json(ErrorBody::Other { message })).into_response());
-    }
-
-    match state
-        .users
-        .setup_first_user(&body.username, &body.password, &body.display_name)
-        .await
-    {
-        Ok(user) => {
-            // banto v1.7.0 #204: 新しいアカウントの `(id, auth_epoch)` に結び
-            // 付けて発行する。`issue_token`（世代なし）は `Lookup` 付きの
-            // `AuthState` では最初の要求で拒否される。
-            let account = session_account(&user);
-            let identity = account.identity.clone();
-            state
-                .audit
-                .record(AuditEntry {
-                    actor_username: Some(&identity.id),
-                    actor_role: Some(&identity.role),
-                    action: "setup",
-                    resource: "auth",
-                    entity_id: None,
-                    detail: None,
-                    origin: "rest",
-                    result: "ok",
-                })
-                .await;
-            let token = state.auth.issue_account_token(account, false);
-            Ok(Json(SetupResponse {
-                success: true,
-                error: None,
-                token: Some(token),
-            })
-            .into_response())
-        }
-        Err(err @ BantoError::Validation { .. }) => Err(ApiError(err)),
-        Err(other) => Ok(Json(SetupResponse {
-            success: false,
-            error: Some(other.to_string()),
-            token: None,
-        })
-        .into_response()),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChangePasswordRequest {
-    current_password: String,
-    new_password: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ChangePasswordResponse {
-    success: bool,
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-}
-
-/// `POST /api/auth/change-password`: authenticated via the same bearer
-/// token as every other guarded route, but implemented as a plain handler
-/// (not `require_auth` middleware) since it also needs the token's bound
-/// `Identity` to know *which* account to update - `require_auth` only
-/// proves the token is valid, it does not thread the identity through.
-async fn auth_change_password_handler(
-    State(state): State<UsersAuthState>,
-    headers: HeaderMap,
-    Json(body): Json<ChangePasswordRequest>,
-) -> Result<Json<ChangePasswordResponse>, ApiError> {
-    // banto v1.7.0 #204: `require_auth` の外なので、`identity_for`（メモリ上の
-    // 値だけ）ではなく `authenticate` でアカウントと照合する。削除・世代の
-    // 変わったアカウントのセッションは 401（パスワード変更に進ませない）。
-    let Some(token) = bearer_token(&headers) else {
-        return Err(ApiError(BantoError::Unauthorized));
-    };
-    let Some(session) = state.auth.authenticate(token).await? else {
-        return Err(ApiError(BantoError::Unauthorized));
-    };
-    let identity = session.identity;
-
-    let new_epoch = state
-        .users
-        .change_password(&identity.id, &body.current_password, &body.new_password)
-        .await?;
-    // 変更で世代が進み、このアカウントのセッション（他の端末・Tauri・
-    // Remember me）はすべて終わる。現在のパスワードを示したこのトークンだけ
-    // 新しい世代へ付け替える - ただし照合してからの変更がこの 1 回だけの
-    // とき（あいだにロール変更などが挟まったら、他と同じく終わらせる）。
-    // 付け替えに失敗（その間に失効）しても、変更自体は成功している。
-    if let Some(stamp) = session.stamp {
-        if new_epoch == stamp.auth_epoch + 1 {
-            state.auth.rotate_session_epoch(token, stamp, new_epoch);
-        }
-    }
-    // Spec M14: a self-service password change is a security event (it is
-    // also what naturally invalidates an M11 autologin credential), so it IS
-    // audited - `entity_id` is the caller's own numeric row id (matching the
-    // other `users` entries), recovered from the username since the bearer
-    // token only carries the latter. `detail` stays `None`: neither the old
-    // nor the new password (nor any hash) may ever be recorded.
-    let entity_id = state
-        .users
-        .get_by_username(&identity.id)
-        .await
-        .ok()
-        .flatten()
-        .map(|user| user.id.to_string());
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&identity.id),
-            actor_role: Some(&identity.role),
-            action: "password_change",
-            resource: "users",
-            entity_id: entity_id.as_deref(),
-            detail: None,
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-    Ok(Json(ChangePasswordResponse { success: true }))
-}
-
-/// Copy of banto v3.0.0's `banto_server::routes::extra_auth_router` (status /
-/// setup / change-password + `grant_router`), kept because ChronoGazer has its
-/// own `UsersService` (ADR-0017 "移行手順" 3). `registry` is empty today, so
-/// `POST /api/auth/grant/{kind}` answers `404` for every kind; the route is
-/// merged anyway so the wire matches the template (a future grant is one
-/// `register` call, not a new router).
-fn extra_auth_router(
-    users: UsersService,
-    auth: AuthState,
-    audit: AuditLogService,
-    allow_setup: bool,
-    registry: Arc<GrantRegistry>,
-) -> Router {
-    let state = UsersAuthState {
-        users,
-        auth: auth.clone(),
-        audit,
-        allow_setup,
-        registry: registry.clone(),
-    };
-    Router::new()
-        .route("/api/auth/status", get(auth_status_handler))
-        .route("/api/auth/setup", post(auth_setup_handler))
-        .route(
-            "/api/auth/change-password",
-            post(auth_change_password_handler),
-        )
-        .with_state(state)
-        .merge(grant_router(auth, registry))
-}
-
-/// State for the `/api/ui-settings/*` handlers (spec M12): `SettingsService`
-/// for the per-user key/value store itself, plus `AuthState` to resolve the
-/// caller's own `username` from the bearer token `require_auth` already
-/// validated (same pattern as [`UsersAuthState`]/[`acting_user`] above).
-#[derive(Clone)]
-struct UiSettingsState {
-    settings: SettingsService,
-    auth: AuthState,
-}
-
-#[derive(Debug, Serialize)]
-struct UiSettingValueResponse {
-    value: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UiSettingSetRequest {
-    value: String,
-}
-
-/// Resolve the calling session's `username` (spec convention: bearer-token
-/// `Identity.id` IS the username, see `banto_server::auth::Identity`'s doc
-/// comment) from its bearer token. `require_auth` has already proven the
-/// token valid by the time a `/api/ui-settings/*` handler runs, so this
-/// should always succeed; `Unauthorized` here is a defensive fallback (e.g.
-/// the token expired between `require_auth` and this handler running), not
-/// an expected path - mirrors [`acting_user`] above.
-fn acting_username(headers: &HeaderMap, auth: &AuthState) -> Result<String, BantoError> {
-    bearer_token(headers)
-        .and_then(|token| auth.identity_for(token))
-        .map(|identity| identity.id)
-        .ok_or(BantoError::Unauthorized)
-}
-
-async fn ui_settings_get(
-    State(state): State<UiSettingsState>,
-    headers: HeaderMap,
-    Path(key): Path<String>,
-) -> Result<Json<UiSettingValueResponse>, ApiError> {
-    let username = acting_username(&headers, &state.auth)?;
-    let value = state.settings.ui_get(&username, &key).await?;
-    Ok(Json(UiSettingValueResponse { value }))
-}
-
-async fn ui_settings_set(
-    State(state): State<UiSettingsState>,
-    headers: HeaderMap,
-    Path(key): Path<String>,
-    Json(body): Json<UiSettingSetRequest>,
-) -> Result<StatusCode, ApiError> {
-    let username = acting_username(&headers, &state.auth)?;
-    state.settings.ui_set(&username, &key, &body.value).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// `/api/ui-settings/*` (spec M12): `require_auth` only, no
-/// [`require_role_at_least`] floor - see this module's doc comment for why
-/// (every route here only ever touches the caller's OWN namespaced keys).
-fn ui_settings_router(settings: SettingsService, auth: AuthState) -> Router {
-    let state = UiSettingsState {
-        settings,
-        auth: auth.clone(),
-    };
-    Router::new()
-        .route(
-            "/api/ui-settings/{key}",
-            get(ui_settings_get).put(ui_settings_set),
-        )
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(auth, require_auth))
-}
-
-// --- M14: audit log ---------------------------------------------------------
-
-/// Wraps `UsersService::verify` as the async credential verifier
-/// `banto_server::AuthState::new` expects (spec §8.2), additionally
-/// recording a `login`/`login_failed` audit entry for every attempt (spec
-/// M14). Shared by `banto-serve` (the standalone REST dev server) and
-/// `src-tauri`'s embedded LAN server auth state - both are `origin: "rest"`
-/// sessions (the Tauri webview's OWN session goes through the `auth_login`
-/// command instead, which records its own login/login_failed entries with
-/// `origin: "tauri"`).
-pub fn audited_credential_verifier(
-    users: UsersService,
-    audit: AuditLogService,
-) -> impl Fn(String, String) -> futures_util::future::BoxFuture<'static, Option<Identity>>
-       + Send
-       + Sync
-       + 'static {
-    move |username: String, password: String| {
-        let users = users.clone();
-        let audit = audit.clone();
-        Box::pin(async move {
-            match users.verify(&username, &password).await {
-                Ok(Some(identity)) => {
-                    audit
-                        .record(AuditEntry {
-                            actor_username: Some(&identity.username),
-                            actor_role: Some(identity.role.as_str()),
-                            action: "login",
-                            resource: "auth",
-                            entity_id: None,
-                            detail: None,
-                            origin: "rest",
-                            result: "ok",
-                        })
-                        .await;
-                    Some(Identity {
-                        id: identity.username,
-                        name: identity.display_name,
-                        role: identity.role.to_string(),
-                    })
-                }
-                _ => {
-                    audit
-                        .record(AuditEntry {
-                            actor_username: Some(&username),
-                            actor_role: None,
-                            action: "login_failed",
-                            resource: "auth",
-                            entity_id: None,
-                            detail: None,
-                            origin: "rest",
-                            result: "failed",
-                        })
-                        .await;
-                    None
-                }
-            }
-        })
-    }
-}
-
-/// banto v1.7.0 #204: `UserIdentity` -> セッションが結び付く `Identity` +
-/// [`SessionStamp`]（`Identity.id` はユーザー名 - `banto_server::Identity` の
-/// doc comment の規約）。セットアップ直後のログイン（`issue_account_token`）と
-/// [`user_session_lookup`] の両方が使う。
-pub(crate) fn session_account(user: &UserIdentity) -> SessionAccount {
-    SessionAccount {
-        identity: Identity {
-            id: user.username.clone(),
-            name: user.display_name.clone(),
-            role: user.role.to_string(),
-        },
-        stamp: SessionStamp {
-            account_id: user.id,
-            auth_epoch: user.auth_epoch,
-        },
-    }
-}
-
-/// banto v1.7.0 #204: 要求のたびにアカウントを読み直す `SessionLookup`。
-/// ユーザー名で `users` を引き、無ければ `Ok(None)`（セッションは失効）、DB が
-/// 答えられなければ `Err`（その要求は失敗、セッションは残す）。
-/// `UsersService::verify` はユーザー名を正規化しない（入力のまま照合する）
-/// ので、ここも入力のまま引く - ログイン時は入力どおりのユーザー名で呼ばれ、
-/// `verify` と同じアカウントを返すことが条件になる（`SessionValidation::Lookup`
-/// の doc comment）。
-pub fn user_session_lookup(
-    users: UsersService,
-) -> impl Fn(
-    String,
-) -> futures_util::future::BoxFuture<'static, Result<Option<SessionAccount>, BantoError>>
-       + Send
-       + Sync
-       + 'static {
-    move |username: String| {
-        let users = users.clone();
-        Box::pin(async move {
-            Ok(users
-                .get_by_username(&username)
-                .await?
-                .map(|user| session_account(&user)))
-        })
-    }
-}
-
-/// banto v1.7.0 #204: 実アカウント用の REST `AuthState`。ログインは
-/// [`audited_credential_verifier`]、要求ごとの照合は [`user_session_lookup`]
-/// （`SessionValidation::Lookup`）。削除・降格・パスワード変更/リセットで、
-/// そのアカウントのセッション（他の端末・Remember me を含む）は次の要求で
-/// 401 になる。本番の `AuthState` はすべてここで作り、照合の付け忘れを防ぐ
-/// （`SessionValidation::DisabledNoRevocation` は固定の検証関数を使うテスト
-/// 専用）。
-pub fn user_auth_state(users: UsersService, audit: AuditLogService) -> AuthState {
-    AuthState::new(
-        audited_credential_verifier(users.clone(), audit),
-        SessionValidation::lookup(user_session_lookup(users)),
-    )
-}
-
-/// State for [`audit_logout_middleware`]: needs `AuthState` to resolve the
-/// logging-out session's identity BEFORE the token is invalidated, plus
-/// `AuditLogService` to record it (spec M14).
-#[derive(Clone)]
-struct LogoutAuditState {
-    auth: AuthState,
-    audit: AuditLogService,
-}
-
-/// Wraps the WHOLE `banto_server::auth_routes` sub-router (login/logout/
-/// check/identity) rather than adding a competing `/api/auth/logout` route
-/// of its own (spec M14): `axum::Router::merge` panics if two routers both
-/// register the same path+method, and `banto_server::auth_routes` bundles
-/// all four routes into one `Router` with no way to omit just `logout` - so
-/// this instead inspects each request's path/method, resolving the caller's
-/// identity (before the real handler invalidates the token) only when the
-/// request IS the logout route, letting `next` run the real handler
-/// completely unmodified either way, then recording the `logout` entry
-/// after.
-///
-/// `POST /api/auth/login`'s own login/login_failed events are NOT recorded
-/// here - see [`audited_credential_verifier`], which records those from
-/// inside the credential-verifier closure instead (simpler: no need to peek
-/// at the response body to learn success/failure).
-async fn audit_logout_middleware(
-    State(state): State<LogoutAuditState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let is_logout =
-        req.method() == axum::http::Method::POST && req.uri().path() == "/api/auth/logout";
-    let identity = if is_logout {
-        actor_identity(req.headers(), &state.auth)
-    } else {
-        None
-    };
-
-    let response = next.run(req).await;
-
-    if is_logout {
-        state
-            .audit
-            .record(AuditEntry {
-                actor_username: identity.as_ref().map(|i| i.id.as_str()),
-                actor_role: identity.as_ref().map(|i| i.role.as_str()),
-                action: "logout",
-                resource: "auth",
-                entity_id: None,
-                detail: None,
-                origin: "rest",
-                result: "ok",
-            })
-            .await;
-    }
-
-    response
-}
-
-/// State for the `/api/audit-log/*` handlers (spec M14): `AuditLogService`
-/// for the read/write itself, `SettingsService` for the retention-policy
-/// config endpoints (and the list route's opportunistic prune), plus
-/// `AuthState` so `audit_config_apply` can resolve the calling actor (via
-/// [`actor_identity`]) for its own `settings_change` audit entry, same as
-/// the users write handlers' `record_write` helper.
-#[derive(Clone)]
-struct AuditLogState {
-    audit: AuditLogService,
-    settings: SettingsService,
-    auth: AuthState,
-}
-
-/// `POST /api/audit-log/list` (spec M14, `admin`-only): filtered/sorted/
-/// paginated read of the audit trail (spec: read routes themselves are
-/// never audited, only mutations/denials/auth events are). Also
-/// opportunistically prunes (spec: "list実行時に軽く") before answering -
-/// best-effort, a prune failure must never block an admin from viewing
-/// existing entries, so its result is discarded. There is deliberately no
-/// separate background pruning task: this plus a once-at-startup prune
-/// (`bin/banto-serve.rs`'s `main`/`src-tauri`'s `run()`) is judged
-/// sufficient - the audit-log viewer is an admin-only, infrequently-visited
-/// page, and each prune is a couple of indexed `DELETE`s, not an expensive
-/// scan. **Exception (#463): an `asOfId`-bounded fetch (block 2+ of a
-/// generation) skips the prune** - see below.
-///
-/// `?asOfId=` （任意、#410）はスナップショット境界
-/// （[`crate::audit::AuditLogService::list_as_of`] の doc）。省略すると従来
-/// どおり全行が対象で、応答の `asOfId` にその時点の最大 `id` が入る。本文の
-/// `ListParams` は `banto-core` の型でフィールドを足せないので、`/api/collect/events`
-/// と同じくクエリで受ける。**床（`admin`）は変えていない**（ルーター側の
-/// `RoleGuard`）。
-///
-/// **`asOfId` 付きの取得（世代の 2 ブロック目以降）では剪定しない**（#463、
-/// banto-hub の #428 と同じ問題）。画面は「同じ境界の総件数が世代の最初と
-/// 変わった = 途中で削除が入った」を失効として扱い、続きの読み込みを止める。
-/// ここで毎回剪定すると、保持件数の上限に張り付いた常駐の chronogazer では
-/// 記録が 1 件増えるたびに次の取得が 1 行消し、2 ブロック目以降がほぼ毎回
-/// 失効する - **ログが一番多いときに先頭ブロックより先へ進めなくなる**。
-/// 剪定は `asOfId` なしの取得（世代の最初・「再読み込み」）と、起動時の
-/// 剪定に任せる（ChronoGazer に監査ログ専用の周期タスクは無い）。
-async fn audit_log_list(
-    State(state): State<AuditLogState>,
-    Query(query): Query<AuditLogListQuery>,
-    Json(params): Json<ListParams>,
-) -> Result<Json<crate::audit::AuditLogList>, ApiError> {
-    if query.as_of_id.is_none() {
-        if let Ok(config) = state.settings.audit_config().await {
-            let _ = state
-                .audit
-                .prune(config.retention_days, config.retention_rows)
-                .await;
-        }
-    }
-    Ok(Json(state.audit.list_as_of(params, query.as_of_id).await?))
-}
-
-/// `POST /api/audit-log/list?asOfId=` のクエリ（#410）。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AuditLogListQuery {
-    #[serde(default)]
-    as_of_id: Option<i64>,
-}
-
-/// `GET /api/audit-log/config` (spec M14, `admin`-only): current retention
-/// policy - read-only, so unlike `audit_config_apply` this records nothing
-/// (spec: read routes are never audited).
-async fn audit_config_get(
-    State(state): State<AuditLogState>,
-) -> Result<Json<AuditSettings>, ApiError> {
-    Ok(Json(state.settings.audit_config().await?))
-}
-
-/// `PUT /api/audit-log/config` (spec M14, `admin`-only): persist a new
-/// retention policy (days and/or row-count cap; either may be `null` for
-/// "unlimited" on that dimension, see [`crate::settings::AuditSettings`]),
-/// mirroring `src-tauri`'s `audit_config_apply` command - same
-/// `settings_change`/`settings` audit entry shape, just `origin: "rest"` and
-/// the actor resolved from the bearer token (`actor_identity`) instead of
-/// from Tauri's session mutex.
-async fn audit_config_apply(
-    State(state): State<AuditLogState>,
-    headers: HeaderMap,
-    Json(config): Json<AuditSettings>,
-) -> Result<Json<AuditSettings>, ApiError> {
-    state.settings.set_audit_config(&config).await?;
-    let identity = actor_identity(&headers, &state.auth);
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(serde_json::json!({
-                "retentionDays": config.retention_days,
-                "retentionRows": config.retention_rows,
-            })),
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-    Ok(Json(state.settings.audit_config().await?))
-}
-
-/// `/api/audit-log/*` (spec M14): `admin`-only, guarded the same way
-/// `users_router` is (`require_auth` then `require_role_at_least`).
-fn audit_log_router(audit: AuditLogService, settings: SettingsService, auth: AuthState) -> Router {
-    let state = AuditLogState {
-        audit: audit.clone(),
-        settings,
-        auth: auth.clone(),
-    };
-    Router::new()
-        .route("/api/audit-log/list", post(audit_log_list))
-        .route(
-            "/api/audit-log/config",
-            get(audit_config_get).put(audit_config_apply),
-        )
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                min: Role::Admin,
-                resource: "audit_log",
-                audit,
-            },
-            require_role_at_least,
-        ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
-}
-
-// --- M17: SQLite backup/restore ---------------------------------------------
-
-/// State for the `/api/backups/*` handlers (spec M17): `BackupService` for
-/// the operation itself, plus `AuditLogService`/`AuthState` so
-/// `backups_create_handler`/`backups_restore_from_upload`/
-/// `backups_restore_from_existing`/`backups_cancel_pending` can each record
-/// their own audit entry once the underlying service call has already
-/// succeeded (same pattern as `UsersAdminState`). Read
-/// handlers (`backups_list`/`backups_download`/`backups_pending_status`)
-/// also take this state (rather than a narrower read-only one) purely to
-/// avoid a second near-identical struct - they simply never touch `audit`.
-#[derive(Clone)]
-struct BackupsState {
-    backup: BackupService,
-    audit: AuditLogService,
-    auth: AuthState,
-}
-
-async fn backups_create_handler(
-    State(state): State<BackupsState>,
-    headers: HeaderMap,
-) -> Result<Json<BackupInfo>, ApiError> {
-    let info = state.backup.create().await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "backup",
-        "backups",
-        &info.file_name,
-        Some(json!({ "sizeBytes": info.size_bytes })),
-    )
-    .await;
-    Ok(Json(info))
-}
-
-async fn backups_list_handler(
-    State(state): State<BackupsState>,
-) -> Result<Json<Vec<BackupInfo>>, ApiError> {
-    Ok(Json(state.backup.list().await?))
-}
-
-/// `GET /api/backups/{fileName}` (spec M17): LAN download. Not audited -
-/// same "read routes are never audited" convention as everywhere else (see
-/// this module's doc comment).
-async fn backups_download_handler(
-    State(state): State<BackupsState>,
-    Path(file_name): Path<String>,
-) -> Result<Response, ApiError> {
-    let bytes = state.backup.read(&file_name).await?;
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
-        .header(
-            axum::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{file_name}\""),
-        )
-        .body(axum::body::Body::from(bytes))
-        .map_err(|err| ApiError(BantoError::Other(err.to_string())))?;
-    Ok(response)
-}
-
-#[derive(Debug, Deserialize)]
-struct RestoreUploadQuery {
-    #[serde(rename = "fileName")]
-    file_name: Option<String>,
-}
-
-/// `POST /api/backups/restore?fileName=` (spec M17): stage a restore from a
-/// raw uploaded file. `fileName` (if present) is ONLY ever used for the
-/// audit `detail` - the uploaded bytes are always staged under
-/// `BackupService`'s own fixed `restore-pending.sqlite3` name, never under
-/// the client-supplied name (see this module's doc comment).
-async fn backups_restore_from_upload(
-    State(state): State<BackupsState>,
-    headers: HeaderMap,
-    Query(query): Query<RestoreUploadQuery>,
-    body: Bytes,
-) -> Result<StatusCode, ApiError> {
-    state.backup.stage_restore_from_bytes(&body).await?;
-    let identity = actor_identity(&headers, &state.auth);
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action: "restore_staged",
-            resource: "backups",
-            entity_id: None,
-            detail: Some(json!({ "source": "upload", "fileName": query.file_name })),
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// `POST /api/backups/{fileName}/restore` (spec M17): stage a restore from
-/// an existing backup already in `backups/`.
-async fn backups_restore_from_existing(
-    State(state): State<BackupsState>,
-    headers: HeaderMap,
-    Path(file_name): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    state.backup.stage_restore_from_file(&file_name).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "restore_staged",
-        "backups",
-        &file_name,
-        Some(json!({ "source": "existing", "fileName": file_name })),
-    )
-    .await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn backups_pending_status(
-    State(state): State<BackupsState>,
-) -> Json<Option<PendingRestoreInfo>> {
-    Json(state.backup.pending_restore().await)
-}
-
-async fn backups_cancel_pending(
-    State(state): State<BackupsState>,
-    headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
-    state.backup.cancel_pending_restore().await?;
-    let identity = actor_identity(&headers, &state.auth);
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: identity.as_ref().map(|i| i.id.as_str()),
-            actor_role: identity.as_ref().map(|i| i.role.as_str()),
-            action: "restore_cancelled",
-            resource: "backups",
-            entity_id: None,
-            detail: None,
-            origin: "rest",
-            result: "ok",
-        })
-        .await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// `/api/backups/*` (spec M17): `admin`-only, guarded the same way
-/// `users_router`/`audit_log_router` are. `DefaultBodyLimit::max` raises the
-/// upload route's body cap from axum's 2MB default to
-/// [`MAX_RESTORE_UPLOAD_BYTES`] - applied to the whole router (the other
-/// routes here have no meaningful request body, so this is harmless for
-/// them).
-fn backups_router(backup: BackupService, audit: AuditLogService, auth: AuthState) -> Router {
-    let state = BackupsState {
-        backup,
-        audit: audit.clone(),
-        auth: auth.clone(),
-    };
-    Router::new()
-        .route(
-            "/api/backups",
-            post(backups_create_handler).get(backups_list_handler),
-        )
-        .route("/api/backups/restore", post(backups_restore_from_upload))
-        .route(
-            "/api/backups/pending-restore",
-            get(backups_pending_status).delete(backups_cancel_pending),
-        )
-        .route("/api/backups/{fileName}", get(backups_download_handler))
-        .route(
-            "/api/backups/{fileName}/restore",
-            post(backups_restore_from_existing),
-        )
-        .with_state(state)
-        .layer(axum::extract::DefaultBodyLimit::max(
-            MAX_RESTORE_UPLOAD_BYTES,
-        ))
-        .layer(middleware::from_fn_with_state(
-            RoleGuard {
-                auth: auth.clone(),
-                min: Role::Admin,
-                resource: "backups",
-                audit,
-            },
-            require_role_at_least,
-        ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
 // --- #332: Hub 接続 ----------------------------------------------------------
@@ -2247,7 +1118,7 @@ async fn plc_connections_create(
         &headers,
         "create",
         "plc_connections",
-        &created.id.to_string(),
+        Some(&created.id.to_string()),
         Some(plc_connection_audit_detail(&created)),
     )
     .await;
@@ -2288,7 +1159,7 @@ async fn plc_connections_update(
         &headers,
         "update",
         "plc_connections",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(plc_connection_audit_detail(&updated)),
     )
     .await;
@@ -2316,7 +1187,7 @@ async fn plc_connections_delete(
         &headers,
         "delete",
         "plc_connections",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -2398,7 +1269,7 @@ async fn collection_groups_create(
         &headers,
         "create",
         "collection_groups",
-        &created.id.to_string(),
+        Some(&created.id.to_string()),
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
@@ -2435,7 +1306,7 @@ async fn collection_groups_update(
         &headers,
         "update",
         "collection_groups",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
@@ -2463,7 +1334,7 @@ async fn collection_groups_delete(
         &headers,
         "delete",
         "collection_groups",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -2510,7 +1381,7 @@ async fn tags_create(
         &headers,
         "create",
         "tags",
-        &created.id.to_string(),
+        Some(&created.id.to_string()),
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
@@ -2552,7 +1423,7 @@ async fn tags_update(
         &headers,
         "update",
         "tags",
-        &id.to_string(),
+        Some(&id.to_string()),
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
@@ -2580,7 +1451,7 @@ async fn tags_delete(
         &headers,
         "delete",
         "tags",
-        &id.to_string(),
+        Some(&id.to_string()),
         None,
     )
     .await;
@@ -2704,7 +1575,11 @@ pub fn api_router(
             allow_setup,
             // banto v3.0.0 ADR-0017: ChronoGazer issues no credential-less
             // grant (no 閲覧公開, no commissioning mode) - an empty registry.
+            // 閲覧公開を登録しないのは 2026-10-04 のオーナー決定（設定画面に
+            // 出さない・既定 OFF。`crate::settings` のモジュール doc）。
             Arc::new(GrantRegistry::new()),
+            // `GET /api/auth/status` に足す app 固有の項目は無い。
+            None,
         ))
         .merge(sse_route(auth.clone(), events))
         .merge(users_router(users, audit.clone(), auth.clone()))
@@ -2730,10 +1605,11 @@ pub fn api_router(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migrate_memory;
+    use crate::db::{migrate_memory, Db};
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use banto_core::BantoError;
+    use banto_server::{Identity, SessionValidation};
     use serde_json::json;
     use std::path::PathBuf;
     use tower::ServiceExt;
@@ -2751,7 +1627,7 @@ mod tests {
     fn unused_backup_service(pool: sqlx::SqlitePool) -> BackupService {
         BackupService::new(
             PathBuf::from("unused-in-tests").join("chronogazer.sqlite3"),
-            pool,
+            Db::Sqlite(pool),
         )
     }
 
@@ -2798,12 +1674,12 @@ mod tests {
     {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
-        let users = UsersService::new(pool.clone());
-        let settings = SettingsService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -2876,12 +1752,12 @@ mod tests {
     async fn router_with_token() -> (Router, String) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
-        let users = UsersService::new(pool.clone());
-        let settings = SettingsService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(Db::Sqlite(pool));
         let auth = demo_auth();
         let token = auth
             .login("admin", "admin")
@@ -2989,12 +1865,12 @@ mod tests {
     async fn router_with_setup(allow_setup: bool) -> Router {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
-        let users = UsersService::new(pool.clone());
-        let settings = SettingsService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(Db::Sqlite(pool));
         let auth = demo_auth();
         let hub = test_hub_service(settings.clone()).await;
         api_router(
@@ -3196,12 +2072,12 @@ mod tests {
     async fn router_with_real_login(allow_setup: bool) -> (Router, AuditLogService) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
-        let users = UsersService::new(pool.clone());
-        let settings = SettingsService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(Db::Sqlite(pool));
         let auth = user_auth_state(users.clone(), audit.clone());
         let hub = test_hub_service(settings.clone()).await;
         (
@@ -3689,12 +2565,12 @@ mod tests {
         let pool = migrate_memory().await.expect("migrate_memory");
         let pool_for_tests = pool.clone();
         let (tx, _rx) = broadcast::channel(16);
-        let users = UsersService::new(pool.clone());
-        let settings = SettingsService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = CollectorService::new(pool.clone(), data_dir);
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(Db::Sqlite(pool));
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -3756,7 +2632,7 @@ mod tests {
     /// - The router's own pool must be a real ON-DISK sqlite file, not
     ///   `:memory:` (`migrate_memory()`) - `VACUUM INTO` (which
     ///   `BackupService::create` uses) silently writes nothing when its
-    ///   SOURCE connection is `:memory:` (see `crate::backup`'s test module
+    ///   SOURCE connection is `:memory:` (see `banto_admin_services::backup`'s test module
     ///   doc comment for the empirically-verified reason).
     /// - The returned `crate::test_support::TempDir` guard must be kept
     ///   alive by the caller for as long as the router is in use - dropping
@@ -3783,12 +2659,12 @@ mod tests {
         let pool = crate::db::init_db(&db_path).await.expect("init_db");
 
         let (tx, _rx) = broadcast::channel(16);
-        let users = UsersService::new(pool.clone());
-        let settings = SettingsService::new(pool.clone());
-        let backup = BackupService::new(db_path, pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        let backup = BackupService::new(db_path, Db::Sqlite(pool.clone()));
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let collect = test_collector_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(Db::Sqlite(pool));
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -6257,8 +5133,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_setup_session_is_bound_to_the_new_account() {
         let pool = migrate_memory().await.expect("migrate_memory");
-        let users = UsersService::new(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
         let auth = user_auth_state(users.clone(), audit.clone());
         let router = extra_auth_router(
             users,
@@ -6266,6 +5142,7 @@ mod tests {
             audit,
             true,
             Arc::new(GrantRegistry::new()),
+            None,
         );
         let response = router
             .oneshot(post_json(
@@ -6288,5 +5165,283 @@ mod tests {
             .expect("the setup session is accepted");
         assert_eq!(session.identity.id, "owner");
         assert_eq!(session.identity.role, "admin");
+    }
+
+    // --- I2a: banto のサービス・ルーターに置き換えて入った修正 -------------
+    //
+    // 修正そのもののテストは banto 側にある（banto-admin-services /
+    // banto-server）。ここでは「ChronoGazer の配線（`api_router`・この app の
+    // スキーマ）の上でも効いている」ことを確かめる。
+
+    /// [`router_with_real_login`] と同じ配線を、**ディスク上の** DB で組む
+    /// （複数の接続が本当に並行して書き込めるように - `migrate_memory` の
+    /// pool では競合が起きにくい）。戻り値の順序は
+    /// [`router_with_role_tokens_and_backup`] と同じ理由で `dir` が先。
+    async fn on_disk_router_with_real_login(
+        allow_setup: bool,
+    ) -> (crate::test_support::TempDir, Router, UsersService) {
+        let dir = crate::test_support::TempDir::new();
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        let pool = crate::db::init_db(&db_path).await.expect("init_db");
+        let (tx, _rx) = broadcast::channel(16);
+        let db = Db::Sqlite(pool.clone());
+        let users = UsersService::new(db.clone());
+        let settings = SettingsService::new(db.clone());
+        let backup = BackupService::new(db_path, db.clone());
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool);
+        let audit = AuditLogService::new(db);
+        let auth = user_auth_state(users.clone(), audit.clone());
+        let hub = test_hub_service(settings.clone()).await;
+        let router = api_router(
+            users.clone(),
+            settings,
+            audit,
+            backup,
+            hub,
+            plc_connections,
+            collection_groups,
+            tags,
+            collect,
+            auth,
+            tx,
+            allow_setup,
+        );
+        (dir, router, users)
+    }
+
+    /// banto #277（初回セットアップの原子化）: 別々のユーザー名で同時に
+    /// `POST /api/auth/setup` しても、作られるアカウントは 1 つだけで、成功も
+    /// 1 回だけ。以前のコピーは「空か確かめる」と「INSERT」が別の文で、
+    /// 同時に来ると両方が空を見て admin が 2 人できた。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_setups_create_exactly_one_account() {
+        let (_dir, router, users) = on_disk_router_with_real_login(true).await;
+        let mut handles = Vec::new();
+        for n in 0..8 {
+            let router = router.clone();
+            handles.push(tokio::spawn(async move {
+                let response = router
+                    .oneshot(post_json(
+                        "/api/auth/setup",
+                        json!({
+                            "username": format!("owner{n}"),
+                            "password": "password123",
+                            "displayName": "Owner",
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                body_json(response).await["success"] == true
+            }));
+        }
+        let mut successes = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1, "setup must succeed exactly once");
+        assert_eq!(users.list_users().await.unwrap().len(), 1);
+    }
+
+    /// banto #278（失敗ログインの監査の増幅）: アカウント名の上限（32 文字）を
+    /// 超える名前でのログイン失敗は、監査ログに**切り詰めて**記録される
+    /// （末尾が `…`、合計 32 文字）。以前のコピーは送られてきた名前をそのまま
+    /// 書いていた（数 MB の名前でも）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_failed_login_username_is_bounded_in_the_audit_log() {
+        let (router, audit) = router_with_real_login(true).await;
+        setup_and_get_token(&router).await;
+
+        let huge = "x".repeat(10_000);
+        let response = router
+            .oneshot(post_json(
+                "/api/auth/login",
+                json!({ "username": huge, "password": "wrong-password" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(response).await["success"], false);
+
+        let result = audit.list(ListParams::default()).await.unwrap();
+        let entry = result
+            .rows
+            .iter()
+            .find(|r| r.action == "login_failed")
+            .unwrap_or_else(|| panic!("expected a login_failed entry, got {:?}", result.rows));
+        let recorded = entry.actor_username.as_deref().expect("actor_username");
+        assert_eq!(recorded.chars().count(), crate::users::MAX_USERNAME_LEN);
+        assert!(recorded.ends_with('…'), "{recorded}");
+    }
+
+    /// banto #278（未認証ログアウトの監査の増幅）: トークン無し・無効な
+    /// トークンの `POST /api/auth/logout` は `logout` を記録しない（終える
+    /// セッションが無い）。以前のコピーは actor 無しの `logout` を毎回書いて
+    /// いて、誰でも監査ログを膨らませられた。有効なセッションのログアウトは
+    /// これまでどおり記録される（[`logout_is_recorded`]）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_logout_without_a_valid_session_is_not_recorded() {
+        let (router, audit) = router_with_real_login(true).await;
+        setup_and_get_token(&router).await;
+
+        for authorization in [None, Some("Bearer not-a-real-token")] {
+            let mut request =
+                HttpRequest::post("/api/auth/logout").header(CLIENT_HEADER.0, CLIENT_HEADER.1);
+            if let Some(value) = authorization {
+                request = request.header("Authorization", value);
+            }
+            router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let result = audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            !result.rows.iter().any(|r| r.action == "logout"),
+            "no logout may be recorded without a session: {:?}",
+            result.rows
+        );
+    }
+
+    /// banto #280（バックアップ保存先の分離）: バックアップは DB ファイルごとの
+    /// `<DB の親>/backups/<DB ファイル名>/` に作られる。それより前の共有領域
+    /// （`<DB の親>/backups/` 直下）に残ったファイルは一覧に出ず、取得も
+    /// できない（起動時の警告のみ、2026-10-04 オーナー決定）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backups_live_in_a_per_database_directory_and_ignore_the_legacy_shared_area() {
+        let (dir, router, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
+        let shared = dir.path().join("backups");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("banto-20260101-000000.sqlite3"), b"legacy").unwrap();
+
+        let created = body_json(
+            router
+                .clone()
+                .oneshot(post_bytes_auth("/api/backups", &admin, Vec::new()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let file_name = created["fileName"].as_str().expect("fileName").to_string();
+        assert!(
+            shared
+                .join("chronogazer.sqlite3")
+                .join(&file_name)
+                .is_file(),
+            "the backup must be under backups/chronogazer.sqlite3/"
+        );
+        assert!(!shared.join(&file_name).exists());
+
+        let listed = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/backups", &admin))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let names: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["fileName"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec![file_name.as_str()]);
+
+        let legacy = router
+            .oneshot(get_auth(
+                "/api/backups/banto-20260101-000000.sqlite3",
+                &admin,
+            ))
+            .await
+            .unwrap();
+        assert_ne!(legacy.status(), StatusCode::OK);
+    }
+
+    /// banto のルーターに置き換えて変わった wire: 監査ログ一覧は
+    /// `deletionEpoch`（#248 の受け皿）を返し、`asOfId` が読めないときは
+    /// JSON の `400 { kind: "bad_request" }` になる（以前は axum の既定の
+    /// 平文の 400）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_log_list_carries_the_deletion_epoch_and_rejects_a_bad_query_as_json() {
+        let (router, _audit, admin, _editor, _viewer) = router_with_role_tokens_and_audit().await;
+
+        let response = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/audit-log/list",
+                &admin,
+                json!({ "offset": 0, "limit": 10 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(body["deletionEpoch"].is_i64(), "{body}");
+        assert!(body["asOfId"].is_i64(), "{body}");
+
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/audit-log/list?asOfId=not-a-number",
+                &admin,
+                json!({ "offset": 0, "limit": 10 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["kind"], "bad_request");
+    }
+
+    /// 閲覧公開は提供しない（2026-10-04 オーナー決定）: `GrantRegistry` は空で、
+    /// `GET /api/auth/status` の `grants` は空、`POST
+    /// /api/auth/grant/publicViewer` は 404。設定に `server.viewer_public` が
+    /// 残っていても（汎用の書き込みで入った等）同じ。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_viewer_is_never_issued() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let (tx, _rx) = broadcast::channel(16);
+        let db = Db::Sqlite(pool.clone());
+        let users = UsersService::new(db.clone());
+        let settings = SettingsService::new(db.clone());
+        settings.set("server.viewer_public", "true").await.unwrap();
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
+        let audit = AuditLogService::new(db);
+        let auth = user_auth_state(users.clone(), audit.clone());
+        let hub = test_hub_service(settings.clone()).await;
+        let router = api_router(
+            users,
+            settings,
+            audit,
+            unused_backup_service(pool),
+            hub,
+            plc_connections,
+            collection_groups,
+            tags,
+            collect,
+            auth,
+            tx,
+            false,
+        );
+
+        let status = body_json(
+            router
+                .clone()
+                .oneshot(get("/api/auth/status"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status["grants"], json!({}), "{status}");
+
+        let response = router
+            .oneshot(post_json("/api/auth/grant/publicViewer", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

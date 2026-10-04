@@ -35,14 +35,16 @@ use chronogazer_core::collect::{
     CollectorStateView, ConnectionView, CurrentSampleView, EventPage, ExclusionView, Readout,
     COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
-use chronogazer_core::db::{init_db, InitDbError};
+use chronogazer_core::db::{init_db, Db, InitDbError};
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
     api_router, plc_connection_audit_detail, update_plc_connection, user_auth_state,
     CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, TagPayload,
 };
-use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
+use chronogazer_core::settings::{
+    store_config, AuditSettings, AuthSettings, ServerSettings, SettingsService,
+};
 use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
 use chronogazer_core::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
@@ -142,12 +144,13 @@ struct AppState {
     /// ブラウザの `/api/hub/*` とデスクトップの `hub_*` コマンドが同じ
     /// 設定・同じキーリングを見るようにする。
     hub: HubService,
-    /// Backup/restore (spec M17): `VACUUM INTO` snapshots into `backups/`
-    /// next to the DB file, plus the restore staging flow. Shares the same
-    /// pool as `users`/`settings`/`audit` - only its `db_path` is
-    /// unique to this service (needed to resolve `backups/` and
-    /// `restore-pending.sqlite3`'s location, see `crate::backup`'s doc
-    /// comment).
+    /// Backup/restore (spec M17): `VACUUM INTO` snapshots into
+    /// `backups/<DB file name>/` next to the DB file (banto #280: per DB
+    /// file), plus the restore staging flow. banto's
+    /// `banto_admin_services::backup::BackupService` since I2a. Shares the
+    /// same pool as `users`/`settings`/`audit` - only its `db_path` is
+    /// unique to this service (needed to resolve that directory and the
+    /// `restore-pending.sqlite3` inside it, see that module's doc comment).
     backup: BackupService,
     /// #383 段階2a / R1-B: レジストリ3サービス（PLC接続/収集グループ/
     /// タグ）。`users`/`settings`/`audit` と同じ pool を共有する `Clone`
@@ -816,7 +819,14 @@ async fn login_body(
             state
                 .audit
                 .record(AuditEntry {
-                    actor_username: Some(&username),
+                    // Bounded like the REST path (banto #278, admin-template
+                    // v3.0.0 の `login_body` と同じ形): the name is
+                    // caller-supplied and need not be a real account. The
+                    // dummy argon2 verify for an over-long name happens inside
+                    // `UsersService::verify` (`auth_io.verify`).
+                    actor_username: Some(&chronogazer_core::users::bound_username_for_audit(
+                        &username,
+                    )),
                     actor_role: None,
                     action: "login_failed",
                     resource: "auth",
@@ -1730,6 +1740,11 @@ async fn server_apply(
         enabled,
         bind,
         port,
+        // ChronoGazer は閲覧公開を提供しない（2026-10-04 オーナー決定、
+        // `chronogazer_core::settings` のモジュール doc）。常に `false` を
+        // 書くので、banto の「認証無効 + LAN 有効は閲覧公開のときだけ可」の
+        // 緩和は効かず、その組み合わせはこれまでどおり拒否される。
+        viewer_public: false,
     };
     state.settings.set_server_config(&config).await?;
 
@@ -1821,6 +1836,10 @@ async fn settings_set(
     settings_set_body(&state, &actor, key, value).await
 }
 
+/// banto の閲覧公開の設定キー（`banto_admin_services::settings` の非公開の
+/// 定数と同じ綴り）。[`settings_set_body`] が拒否する。
+const VIEWER_PUBLIC_KEY: &str = "server.viewer_public";
+
 /// Body of [`settings_set`]. banto v2.0.0 移行（freshness audit of banto
 /// #266, P2-2, S-103 - admin-template の同名関数の写し）: keys in the
 /// `auth.` namespace are refused - they are written only by
@@ -1838,6 +1857,15 @@ async fn settings_set_body(
     if SettingsService::is_auth_key(&key) {
         return Err(BantoError::BadRequest(format!(
             "設定 {key} はこのコマンドでは変更できません。認証モードは auth_config_apply（自動ログインは autologin_enable/autologin_disable）で変更してください"
+        )));
+    }
+    // I2a: 閲覧公開（banto の `server.viewer_public`）は ChronoGazer では提供
+    // しない（2026-10-04 オーナー決定）。ここから `true` を書けると、banto の
+    // `SettingsService::set_auth_config` の「認証無効 + LAN 有効」の拒否が
+    // 緩む（`chronogazer_core::settings` のモジュール doc）ので、書かせない。
+    if key == VIEWER_PUBLIC_KEY {
+        return Err(BantoError::BadRequest(format!(
+            "設定 {key}（閲覧公開）は ChronoGazer では使えません"
         )));
     }
     state.settings.set(&key, &value).await?;
@@ -2757,8 +2785,9 @@ async fn backups_list(state: State<'_, AppState>) -> Result<Vec<BackupInfo>, Ban
 }
 
 /// `backups_open_folder`'s response shape (spec M17): `path` is always the
-/// resolved `backups/` directory; `opened` tells the frontend whether an
-/// actual file-explorer window was launched, so it can show a fallback
+/// resolved `backups/<DB file name>/` directory (banto #280); `opened`
+/// tells the frontend whether an actual file-explorer window was launched,
+/// so it can show a fallback
 /// message (e.g. "このOSでは非対応です。手動で開いてください: {path}") on
 /// platforms this command deliberately does not attempt to support.
 #[derive(Debug, Clone, Serialize)]
@@ -3514,6 +3543,12 @@ pub fn run() {
             // failure here must never prevent the desktop app from starting
             // at all - the current db (if any) is left untouched on error,
             // per that function's own per-step safety notes.
+            //
+            // I2a（banto #280）: 予約もバックアップも
+            // `<データディレクトリ>/backups/chronogazer.sqlite3/` に置かれる。
+            // それより前の共有領域（`backups/` 直下・`restore-pending.sqlite3`）
+            // に残ったファイルは、この呼び出しが警告を出すだけで、移しも適用も
+            // しない（2026-10-04 オーナー決定: banto の既定どおり）。
             let applied_restore = match tauri::async_runtime::block_on(
                 BackupService::apply_pending_restore_at_startup(&db_path),
             ) {
@@ -3556,9 +3591,9 @@ pub fn run() {
             create_main_window(app)?;
 
             let events = event_channel();
-            let users = UsersService::new(pool.clone());
-            let settings = SettingsService::new(pool.clone());
-            let backup = BackupService::new(db_path.clone(), pool.clone());
+            let users = UsersService::new(Db::Sqlite(pool.clone()));
+            let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+            let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()));
             // #383 段階2a / R1-B: レジストリ3サービス。テーブルは
             // `init_db` が呼ぶ `banto_tags::migrate` で既に作成済み。
             let plc_connections = PlcConnectionService::new(pool.clone());
@@ -3574,13 +3609,13 @@ pub fn run() {
             //
             // 開始は下の `autostart` まで待つ（`AppState` の他の材料が
             // 揃ってから、ランタイムの上で spawn したいため）。
-            let store_settings = tauri::async_runtime::block_on(settings.store_config())
+            let store_settings = tauri::async_runtime::block_on(store_config(&settings))
                 .expect("store_config should succeed");
             let collect = CollectorService::new(
                 pool.clone(),
                 resolve_data_dir(&data_dir, &store_settings.data_dir),
             );
-            let audit = AuditLogService::new(pool.clone());
+            let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
             // `chronogazer_core::rest::audited_credential_verifier`'s doc
@@ -4070,7 +4105,7 @@ mod tests {
         }
     }
 
-    /// A retry-cleanup temp dir wrapper - see `chronogazer_core::backup`'s
+    /// A retry-cleanup temp dir wrapper - see `chronogazer_core`'s
     /// `crate::test_support` module doc (this crate's `AppState` tests hit
     /// the exact same Windows WAL-close-timing leak: measured, one
     /// `cargo test -p chronogazer --lib` run left directories behind, one
@@ -4130,7 +4165,7 @@ mod tests {
     /// its own REST token space).
     async fn app_state_on(pool: chronogazer_core::db::DbPool) -> AppState {
         let events = event_channel();
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         // #332: tests never touch a real OS keyring - `UnavailableKeyStore`
         // reads as "no entry" and refuses to write, so no test can leave a
         // plaintext key in the developer's keychain.
@@ -4144,24 +4179,24 @@ mod tests {
             auth: Mutex::new(AuthSlot::default()),
             auth_config_lock: AsyncMutex::new(()),
             auth_io: AuthIo::production(
-                &UsersService::new(pool.clone()),
-                &SettingsService::new(pool.clone()),
+                &UsersService::new(Db::Sqlite(pool.clone())),
+                &SettingsService::new(Db::Sqlite(pool.clone())),
             ),
-            users: UsersService::new(pool.clone()),
+            users: UsersService::new(Db::Sqlite(pool.clone())),
             settings,
             events,
             // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
             // Tauri のセッションが同じアカウントの変更で終わることを、
             // 両経路をまたいで確かめるテストが使う。
             rest_auth: chronogazer_core::rest::user_auth_state(
-                UsersService::new(pool.clone()),
-                AuditLogService::new(pool.clone()),
+                UsersService::new(Db::Sqlite(pool.clone())),
+                AuditLogService::new(Db::Sqlite(pool.clone())),
             ),
             server: AsyncMutex::new(None),
-            audit: AuditLogService::new(pool.clone()),
+            audit: AuditLogService::new(Db::Sqlite(pool.clone())),
             backup: BackupService::new(
                 PathBuf::from("unused-in-tests").join("chronogazer.sqlite3"),
-                pool.clone(),
+                Db::Sqlite(pool.clone()),
             ),
             hub,
             plc_connections: PlcConnectionService::new(pool.clone()),
@@ -4178,7 +4213,7 @@ mod tests {
     /// directory rather than `:memory:` - required for the M17 backup tests
     /// below, since `BackupService::create`'s `VACUUM INTO` silently writes
     /// nothing when its source pool is `:memory:` (see
-    /// `chronogazer_core::backup`'s test module doc comment for the
+    /// `banto_admin_services::backup`'s test module doc comment for the
     /// empirically-verified reason). The returned `TempDir` guard must be
     /// kept alive by the caller for as long as `AppState` is still in use.
     ///
@@ -4196,7 +4231,7 @@ mod tests {
             .await
             .expect("init_db");
         let events = event_channel();
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let hub = HubService::new(
             settings.clone(),
             std::sync::Arc::new(chronogazer_core::hub::UnavailableKeyStore),
@@ -4207,22 +4242,22 @@ mod tests {
             auth: Mutex::new(AuthSlot::default()),
             auth_config_lock: AsyncMutex::new(()),
             auth_io: AuthIo::production(
-                &UsersService::new(pool.clone()),
-                &SettingsService::new(pool.clone()),
+                &UsersService::new(Db::Sqlite(pool.clone())),
+                &SettingsService::new(Db::Sqlite(pool.clone())),
             ),
-            users: UsersService::new(pool.clone()),
+            users: UsersService::new(Db::Sqlite(pool.clone())),
             settings,
             events,
             // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
             // Tauri のセッションが同じアカウントの変更で終わることを、
             // 両経路をまたいで確かめるテストが使う。
             rest_auth: chronogazer_core::rest::user_auth_state(
-                UsersService::new(pool.clone()),
-                AuditLogService::new(pool.clone()),
+                UsersService::new(Db::Sqlite(pool.clone())),
+                AuditLogService::new(Db::Sqlite(pool.clone())),
             ),
             server: AsyncMutex::new(None),
-            audit: AuditLogService::new(pool.clone()),
-            backup: BackupService::new(db_path, pool.clone()),
+            audit: AuditLogService::new(Db::Sqlite(pool.clone())),
+            backup: BackupService::new(db_path, Db::Sqlite(pool.clone())),
             hub,
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
@@ -5517,7 +5552,7 @@ mod tests {
         let pool = chronogazer_core::db::init_db_memory()
             .await
             .expect("init_db_memory");
-        let users = UsersService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
         users
             .setup_first_user("admin", "password123", "管理者")
             .await
@@ -6855,6 +6890,82 @@ mod tests {
         )
         .await
         .expect("a non-auth key");
+    }
+
+    /// I2a（banto #278）: Tauri のログインの失敗も、REST と同じく監査ログの
+    /// 名前を 32 文字に切り詰めて記録する（admin-template v3.0.0 の
+    /// `login_body` と同じ形）。以前は送られてきた名前をそのまま書いていた。
+    #[tokio::test]
+    async fn i2a_an_oversized_failed_login_username_is_bounded_in_the_audit_log() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+
+        let result = login_body(&state, "y".repeat(10_000), "wrong-password".to_string())
+            .await
+            .expect("login");
+        assert!(!result.success);
+
+        let rows = audit_rows(&state, "login_failed").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let recorded = rows[0].0.as_deref().expect("actor_username");
+        assert_eq!(
+            recorded.chars().count(),
+            chronogazer_core::users::MAX_USERNAME_LEN
+        );
+        assert!(recorded.ends_with('…'), "{recorded}");
+        // 上限以内の名前はそのまま（切り詰めは長すぎるときだけ）。
+        login_body(&state, "admin".to_string(), "wrong-password".to_string())
+            .await
+            .expect("login");
+        assert!(audit_rows(&state, "login_failed")
+            .await
+            .iter()
+            .any(|(name, _)| name.as_deref() == Some("admin")));
+    }
+
+    /// I2a: 閲覧公開（`server.viewer_public`）は汎用の `settings_set` から
+    /// 書けない（2026-10-04 オーナー決定 - ChronoGazer は閲覧公開を提供しない）。
+    /// 書けると banto の「認証無効 + LAN 有効」の拒否が緩むため。
+    #[tokio::test]
+    async fn i2a_settings_set_refuses_the_viewer_public_key() {
+        let state = app_state().await;
+        state
+            .users
+            .setup_first_user("admin", SLOT_PASSWORD, "Admin")
+            .await
+            .unwrap();
+        let admin = state.users.get_by_username("admin").await.unwrap().unwrap();
+        let result = settings_set_body(
+            &state,
+            &admin,
+            VIEWER_PUBLIC_KEY.to_string(),
+            "true".to_string(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(BantoError::BadRequest(_))),
+            "{result:?}"
+        );
+        assert!(!state.settings.server_config().await.unwrap().viewer_public);
+    }
+
+    /// I2a（banto #280）: Tauri のバックアップも DB ファイルごとの
+    /// `<DB の親>/backups/<DB ファイル名>/` に作られ、「フォルダを開く」が
+    /// 開く場所（`backups_dir_display`）もそこ。
+    #[tokio::test]
+    async fn i2a_backups_are_created_in_the_per_database_directory() {
+        let (dir, state) = app_state_with_tempdir().await;
+        let created = state.backup.create().await.expect("create");
+        let scope = dir.path().join("backups").join("chronogazer.sqlite3");
+        assert!(scope.join(&created.file_name).is_file());
+        assert_eq!(
+            state.backup.backups_dir_display(),
+            scope.display().to_string()
+        );
     }
 
     /// Replace `auth_config_apply`'s save with one that stores only

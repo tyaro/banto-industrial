@@ -2,9 +2,10 @@
  * Client for the `admin`-only SQLite backup/restore API (spec M17,
  * `docs/roadmap.md`). Same Tauri/REST split as `usersAdmin.ts`/
  * `auditLogAdmin.ts`: the Tauri webview calls `invoke()` directly (the
- * `backups_*` commands, `apps/admin-template/src-tauri/src/lib.rs`), a LAN
+ * `backups_*` commands, `apps/chronogazer/src-tauri/src/lib.rs`), a LAN
  * browser client served by the embedded server calls `fetch()` against
- * `/api/backups/*` (`apps/admin-template/core/src/rest.rs`), reusing the
+ * `/api/backups/*` (banto's `banto_server::routes::backups_router`, merged
+ * by `apps/chronogazer/core/src/rest.rs` since I2a), reusing the
  * same bearer-token/CSRF-header mechanism `@banto/admin-core`'s
  * `createHttpDataProvider`/`createHttpAuthProvider` use.
  *
@@ -19,7 +20,8 @@
  * call for downloads - see each function's doc comment):
  * - `downloadBackup` only works in REST/LAN mode. In Tauri there is no
  *   browser download mechanism to speak of - the desktop equivalent is
- *   `openBackupsFolder` (Windows Explorer on the real `backups/` dir), so
+ *   `openBackupsFolder` (Windows Explorer on the real
+ *   `backups/<DB file name>/` dir - per DB file since banto #280), so
  *   this rejects with a message pointing the caller at that button instead.
  * - `uploadAndStageRestore` only works in REST/LAN mode (spec: "アップロード
  *   or 一覧から選択" but only the LAN browser can arbitrarily pick a local
@@ -67,6 +69,7 @@ export function isBackupsAvailable(): boolean {
 
 const ERROR_KINDS = new Set([
 	'not_found',
+	'bad_request',
 	'validation',
 	'unauthorized',
 	'forbidden',

@@ -38,11 +38,11 @@ use chronogazer_core::backup::BackupService;
 // `/api/collect*` を生やす以上、ここを配線しないと「呼べるが何も走って
 // いない」口になる）。
 use chronogazer_core::collect::{resolve_data_dir, CollectorService};
-use chronogazer_core::db::{init_db, InitDbError};
+use chronogazer_core::db::{init_db, Db, InitDbError};
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, UnavailableKeyStore};
 use chronogazer_core::rest::{api_router, user_auth_state};
-use chronogazer_core::settings::SettingsService;
+use chronogazer_core::settings::{store_config, SettingsService};
 use chronogazer_core::users::UsersService;
 // #383 段階2a / R1-B: レジストリ3サービス。`chronogazer_core::lib.rs`の
 // re-export 経由（`db::DbPool`と同じ理由 - このバイナリ自身は banto-tags を
@@ -74,6 +74,12 @@ async fn main() {
     // a failure here must not prevent the server from starting at all (the
     // old db, if any, is left untouched on error - see that function's
     // per-step safety notes).
+    //
+    // I2a（banto #280）: バックアップとリストア予約は DB ファイルごとの
+    // `<DB の親>/backups/<DB ファイル名>/` に置かれる。それより前の共有領域
+    // （`<DB の親>/backups/` 直下・`<DB の親>/restore-pending.sqlite3`）に
+    // ファイルが残っていると、ここで警告を出すだけで、移しも適用もしない
+    // （2026-10-04 オーナー決定: banto の既定どおり、移す処理は作らない）。
     let applied_restore = match BackupService::apply_pending_restore_at_startup(&db_path_buf).await
     {
         Ok(applied) => applied,
@@ -99,9 +105,13 @@ async fn main() {
     };
 
     let events = event_channel();
-    let users = UsersService::new(pool.clone());
-    let settings = SettingsService::new(pool.clone());
-    let backup = BackupService::new(db_path_buf.clone(), pool.clone());
+    // I2a: users/settings/audit/backup は banto の `banto_admin_services` の
+    // サービス。バックエンドを問わない `Db` ハンドルを受けるので、同じ pool
+    // を `Db::Sqlite` で包んで渡す。
+    let db = Db::Sqlite(pool.clone());
+    let users = UsersService::new(db.clone());
+    let settings = SettingsService::new(db.clone());
+    let backup = BackupService::new(db_path_buf.clone(), db.clone());
     // #383 段階2b / R1-C（C-2）: 収集サービス用の pool ハンドル。`audit` が
     // 下で `pool` を消費するので、その前に取っておく。
     let pool_for_collect = pool.clone();
@@ -111,7 +121,7 @@ async fn main() {
     let plc_connections = PlcConnectionService::new(pool.clone());
     let collection_groups = CollectionGroupService::new(pool.clone());
     let tags = TagService::new(pool.clone());
-    let audit = AuditLogService::new(pool);
+    let audit = AuditLogService::new(db);
     // Credential verifier from `chronogazer_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
     // fixed admin/admin check that used to live here directly. Also records
@@ -191,7 +201,7 @@ async fn main() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let store_settings = settings.store_config().await.unwrap_or_else(|err| {
+    let store_settings = store_config(&settings).await.unwrap_or_else(|err| {
         eprintln!("banto-serve: 時系列データの保存設定の読み取りに失敗しました（既定値で続行します）: {err}");
         Default::default()
     });
