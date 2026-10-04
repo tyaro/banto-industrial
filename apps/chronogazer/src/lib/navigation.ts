@@ -20,6 +20,13 @@
  * 合わせ、ヒストリカルの直後・イベントの手前に置く。`adminOnly` は付けない -
  * viewer も閲覧できる（R0 §3.6: 読み取りは viewer 以上、書き込みは editor
  * 以上）。
+ *
+ * I2b（2026-10-04 オーナー決定: ChronoGazer でも閲覧公開を使う）: banto v3.0.0
+ * の admin-template `navigation.ts` の `NavItem.publicViewer` と
+ * `publicNavItems()` を写した。閲覧公開のセッションに見せるのは、計測値を
+ * 見るだけの画面（監視・ヒストリカル・イベント）。タグ設定（PLC の接続先・
+ * アドレスを含む設定画面）・ユーザー管理・監査ログ・設定は出さない
+ * （admin-template が「ツリー」と設定を出さないのと同じ考え方）。
  */
 export interface NavItem {
 	path: string;
@@ -36,17 +43,33 @@ export interface NavItem {
 	 * サブパスでも、判定は親パス配下すべてを対象にしたい場合に分ける。
 	 */
 	activeMatch?: string;
+	/**
+	 * Opt-in allowlist for the LAN "viewer-public" session
+	 * (viewer-public-plan §3.1-6, ADR-0012): `sessionStore.publicViewer`
+	 * sessions see ONLY entries with `publicViewer: true` in the sidebar, and
+	 * `(app)/+layout.ts`'s guard redirects any other path to the first such
+	 * entry. This narrows the SCREEN surface only - the actual data boundary
+	 * is RBAC's `viewer` role (ADR-0012 §帰結), so this flag must never be
+	 * treated as an authorization check. Undefined/false = hidden from a
+	 * public-viewer session.
+	 */
+	publicViewer?: boolean;
 }
 
 export const navItems: NavItem[] = [
-	{ path: '/monitor', label: '監視', icon: '📈' },
-	{ path: '/historical', label: 'ヒストリカル', icon: '🕰️' },
+	{ path: '/monitor', label: '監視', icon: '📈', publicViewer: true },
+	{ path: '/historical', label: 'ヒストリカル', icon: '🕰️', publicViewer: true },
 	{ path: '/tags', label: 'タグ設定', icon: '🏷️' },
-	{ path: '/events', label: 'イベント', icon: '🔔' },
+	{ path: '/events', label: 'イベント', icon: '🔔', publicViewer: true },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },
 	{ path: '/settings/appearance', label: '設定', icon: '⚙️', activeMatch: '/settings' }
 ];
+
+/** `navItems` entries visible to a LAN "viewer-public" session (see `NavItem.publicViewer`'s doc comment). Order preserved - the first entry is the guard's redirect target. */
+export function publicNavItems(): NavItem[] {
+	return navItems.filter((item) => item.publicViewer);
+}
 
 export function pageTitle(pathname: string): string {
 	const item = navItems.find((entry) => {

@@ -8,7 +8,13 @@
  * - 保存しているトークン（通常の `sessionStorage` も Remember me の
  *   `localStorage` も）を消さない
  * - `status()` / `enterGrant()`（grant の発行、`grantFallback`）を呼ばない
- *   （ChronoGazer は grant を使わない。確定した `none` はそのまま /login）
+ *   （照合できないうちは閲覧公開へも切り替えない）
+ *
+ * I2b（2026-10-04 オーナー決定: ChronoGazer でも閲覧公開を使う）: 確定した
+ * `none` は admin-template と同じく `grantFallback(..., { kind: 'publicViewer' })`
+ * を通る。閲覧公開が ON（`status()` の `grants.publicViewer`）なら閲覧者の
+ * セッションに入り、許可リスト（`NavItem.publicViewer`）の外の画面は
+ * 先頭（/monitor）へ移す。OFF なら /login。
  *
  * v1 は `resolveProtectedSession` を包んだ `decideProtectedRoute` を直接
  * テストしていたが、v2 で確定は SessionController の役目になったので、
@@ -90,27 +96,63 @@ function useProvider(authProvider: AuthProvider): void {
 	initBanto({ dataProvider: {} as DataProvider, authProvider, resources: [] });
 }
 
-/** A real HTTP provider whose `fetch` answers `/api/auth/identity` with `identity`, recording every path asked for. */
-function httpProviderWith(identity: () => Promise<Response>) {
+const GRANT_TOKEN = 'public-viewer-grant-token';
+
+/**
+ * A real HTTP provider whose `fetch` answers `/api/auth/identity` with
+ * `identity`, recording every path asked for. `viewerPublic` is what
+ * `/api/auth/status` reports as `grants.publicViewer`; while it is `true`,
+ * `POST /api/auth/grant/publicViewer` issues `GRANT_TOKEN` (else `403`), and
+ * `/api/auth/identity` with that token answers the fixed public identity.
+ */
+function httpProviderWith(identity: () => Promise<Response>, options = { viewerPublic: false }) {
 	const paths: string[] = [];
-	const fetchFn = vi.fn(async (url: string | URL | Request) => {
+	const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
 		const path = String(url);
 		paths.push(path);
-		if (path.endsWith('/api/auth/identity')) return identity();
-		return jsonResponse(200, { initialized: true, grants: {} });
+		const headers = new Headers(init?.headers);
+		if (path.endsWith('/api/auth/identity')) {
+			if (headers.get('Authorization') === `Bearer ${GRANT_TOKEN}`) {
+				return jsonResponse(200, {
+					id: 'public',
+					name: 'public',
+					role: 'viewer',
+					kind: 'publicViewer'
+				});
+			}
+			return identity();
+		}
+		if (path.endsWith('/api/auth/grant/publicViewer')) {
+			return options.viewerPublic
+				? jsonResponse(200, { success: true, token: GRANT_TOKEN })
+				: jsonResponse(403, { kind: 'forbidden', message: 'forbidden' });
+		}
+		return jsonResponse(200, {
+			initialized: true,
+			grants: { publicViewer: options.viewerPublic }
+		});
 	}) as unknown as typeof fetch;
 	useProvider(createHttpAuthProvider({ fetchFn }));
 	return { paths };
 }
 
+/** Whether a grant was requested (`POST /api/auth/grant/...`). */
+function askedForGrant(paths: string[]): boolean {
+	return paths.some((path) => path.includes('/api/auth/grant/'));
+}
+
 /** Run the guard; return what it threw (or its data). */
-async function runGuard(): Promise<
+async function runGuard(
+	pathname = '/monitor'
+): Promise<
 	| { kind: 'data'; sessionGeneration: number }
 	| { kind: 'redirect'; location: string }
 	| { kind: 'error'; status: number; message: string }
 > {
 	try {
-		const data = await load();
+		const data = await load({
+			url: new URL(`http://127.0.0.1:8721${pathname}`)
+		} as Parameters<typeof load>[0]);
 		return { kind: 'data', sessionGeneration: data.sessionGeneration };
 	} catch (thrown) {
 		if (isRedirect(thrown)) return { kind: 'redirect', location: thrown.location };
@@ -162,19 +204,20 @@ describe('(app) ガード: 照合できないときはトークンを残して�
 });
 
 describe('(app) ガード: 確定したときだけ判断する', () => {
-	it('401（失効）はログイン画面へ。トークンは消える。閲覧者への切り替えはしない', async () => {
+	it('401（失効）はログイン画面へ。トークンは消える。閲覧公開 OFF なら閲覧者への切り替えはしない', async () => {
 		local.setItem(TOKEN_KEY, 'revoked-token');
 		const { paths } = httpProviderWith(async () => jsonResponse(401, { kind: 'unauthorized' }));
 
 		expect(await runGuard()).toEqual({ kind: 'redirect', location: '/login' });
 		expect(local.getItem(TOKEN_KEY)).toBeNull();
-		expect(paths.every((path) => path.endsWith('/api/auth/identity'))).toBe(true);
+		expect(askedForGrant(paths)).toBe(false);
 	});
 
-	it('トークンが無ければ問い合わせずにログイン画面へ', async () => {
+	it('トークンが無く閲覧公開 OFF なら、identity を問い合わせずにログイン画面へ', async () => {
 		const { paths } = httpProviderWith(async () => jsonResponse(200, null));
 		expect(await runGuard()).toEqual({ kind: 'redirect', location: '/login' });
-		expect(paths).toEqual([]);
+		expect(paths.some((path) => path.endsWith('/api/auth/identity'))).toBe(false);
+		expect(askedForGrant(paths)).toBe(false);
 	});
 
 	it('確定した identity はそのまま進み、確定した世代を返す（ストアは snapshot から読む）', async () => {
@@ -220,6 +263,42 @@ describe('(app) ガード: 確定したときだけ判断する', () => {
 		const result = await runGuard();
 		expect(controller.snapshot.generation).not.toBe(confirmedGeneration);
 		expect(result).toEqual({ kind: 'data', sessionGeneration: confirmedGeneration });
+	});
+});
+
+describe('(app) ガード: 閲覧公開（publicViewer grant、I2b）', () => {
+	it('ON なら未ログインは閲覧者のセッションに入り、許可された画面はそのまま開く', async () => {
+		const { paths } = httpProviderWith(async () => jsonResponse(200, null), {
+			viewerPublic: true
+		});
+
+		const result = await runGuard('/historical');
+		const snapshot = getSessionController().snapshot;
+		expect(snapshot).toMatchObject({ status: 'active', kind: 'publicViewer' });
+		expect(result).toEqual({ kind: 'data', sessionGeneration: snapshot.generation });
+		expect(askedForGrant(paths)).toBe(true);
+		// 閲覧公開のトークンは Remember me しない（sessionStorage だけ）
+		expect(session.getItem(TOKEN_KEY)).toBe(GRANT_TOKEN);
+		expect(local.getItem(TOKEN_KEY)).toBeNull();
+	});
+
+	it('許可リストの外（タグ設定・設定・ユーザー管理）は先頭の /monitor へ移す', async () => {
+		for (const pathname of ['/tags', '/settings/appearance', '/users', '/audit-log']) {
+			session.clear();
+			httpProviderWith(async () => jsonResponse(200, null), { viewerPublic: true });
+			expect(await runGuard(pathname)).toEqual({ kind: 'redirect', location: '/monitor' });
+		}
+	});
+
+	it('ログイン済みのアカウントは閲覧公開 ON でも grant を求めず、どの画面も開く', async () => {
+		session.setItem(TOKEN_KEY, 'live-token');
+		const { paths } = httpProviderWith(
+			async () => jsonResponse(200, { id: 'alice', name: 'Alice', role: 'viewer' }),
+			{ viewerPublic: true }
+		);
+
+		expect(await runGuard('/tags')).toMatchObject({ kind: 'data' });
+		expect(askedForGrant(paths)).toBe(false);
 	});
 });
 

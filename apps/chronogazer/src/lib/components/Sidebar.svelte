@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { navItems, type NavItem } from '$lib/navigation';
+	import { navItems, publicNavItems, type NavItem } from '$lib/navigation';
 	import { settings } from '$lib/settings.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { isAdmin } from '$lib/permissions';
@@ -18,8 +18,15 @@
 	// showing them disabled - navigation-level hiding, same as
 	// routes/(app)/users/+page.ts redirecting a non-admin instead of
 	// rendering a 403 screen.
+	//
+	// I2b（admin-template v3.0.0 の `Sidebar.svelte` と同じ、ADR-0012）: LAN の
+	// 閲覧公開のセッションは `publicViewer` の許可リストだけを見る。役割に
+	// よらない（閲覧公開の役割は常に `viewer` なので admin の項目はどのみち
+	// 出ないが、明示しておけば将来それが変わっても正しい）。
 	const visibleItems = $derived(
-		navItems.filter((item) => !item.adminOnly || isAdmin(sessionStore.role))
+		sessionStore.publicViewer
+			? publicNavItems()
+			: navItems.filter((item) => !item.adminOnly || isAdmin(sessionStore.role))
 	);
 </script>
 

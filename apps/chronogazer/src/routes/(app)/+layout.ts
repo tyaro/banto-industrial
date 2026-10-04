@@ -1,23 +1,30 @@
 // banto v3.0.0 の admin-template
-// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v3 移行）。
-// chronogazer 固有の差: grant を使わない（閲覧公開 `publicViewer` も試運転も無い）
-// ので、確定した `none` は `grantFallback` を経ずにそのまま /login
-// （公開閲覧のナビ制限も無い）。
-// エラー画面の本文は i18n ではなく `SESSION_CHECK_FAILED_MESSAGE`（日本語）。
-// ロケールの同期（`syncLocaleFromProvider`）は無い。`base` は使わない。
+// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v3 移行、I2b で
+// 閲覧公開の `grantFallback` を戻した - 2026-10-04 オーナー決定で ChronoGazer
+// でも閲覧公開を使う）。
+// chronogazer 固有の差: エラー画面の本文は i18n ではなく
+// `SESSION_CHECK_FAILED_MESSAGE`（日本語）。ロケールの同期
+// （`syncLocaleFromProvider`）は無い。`base` は使わない（ChronoGazer は
+// ルート直下に配信する）。
 import { error, redirect } from '@sveltejs/kit';
-import { getSessionController, resolveSettled } from '@banto/admin-core';
+import {
+	getAuthProvider,
+	getSessionController,
+	grantFallback,
+	resolveSettled
+} from '@banto/admin-core';
 import { bantoReady } from '$lib/banto/setup';
 import { SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
 import { settings } from '$lib/settings.svelte';
+import { publicNavItems } from '$lib/navigation';
 
 // Auth guard for the whole (app) group (spec §8.1), banto Issue #260 (design
 // §6.1, v2.0.0): the session is confirmed by the SessionController - the
 // only writer of "who is signed in" (ADR-0016). This load's only side
-// effect is the controller's confirmation; it writes no store
-// (`sessionStore` is derived from `controller.snapshot`). Must wait for
-// provider selection/detection (spec §11.1's three-way environment probe)
-// first.
+// effects are the controller's confirmation and, for a confirmed `none`,
+// the grant policy's issuance (ADR-0017); it writes no store (`sessionStore`
+// is derived from `controller.snapshot`). Must wait for provider
+// selection/detection (spec §11.1's three-way environment probe) first.
 //
 // - `resolveSettled()` asks again after `superseded` and returns only
 //   `confirmed` or `unverified` (I-16). `unverified` - the server could not
@@ -27,17 +34,45 @@ import { settings } from '$lib/settings.svelte';
 //   nothing is cleared, the stored token (Remember me included) is kept, and
 //   "再試行" re-runs this load (S-36/S-60: after a switch of user it is NOT
 //   left automatically).
-// - A CONFIRMED `none` goes to /login. ChronoGazer issues no grant (no
-//   public viewing, no commissioning mode), so there is no `grantFallback`
-//   step.
-export async function load() {
+// - viewer-public-plan §3.1-6 (ADR-0012): a CONFIRMED `none` goes through
+//   `grantFallback(..., { kind: 'publicViewer' })` - when `server.viewerPublic`
+//   is ON (`status()`'s `grants.publicViewer`) it enters the `publicViewer`
+//   grant (`enterGrant('publicViewer')`): the fixed-identity
+//   `{id:'public',role:'viewer'}` session bound to this confirmation's ticket
+//   (S-42/S-52) and confirms it. Its result is handled the same way:
+//   `unverified` is the error page, not /login (S-66); only a confirmed
+//   `none` goes to /login. Only the HTTP provider implements `status()`'s
+//   `grants` and `enterGrant()`; Tauri/demo go straight to /login.
+export async function load({ url }) {
 	await bantoReady;
 	const controller = getSessionController();
-	const result = await resolveSettled(controller, { cause: 'navigation' });
-	if (result.outcome === 'unverified') {
-		error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
+	let result = await resolveSettled(controller, { cause: 'navigation' });
+	if (result.outcome === 'unverified') sessionCheckFailed();
+	if (result.snapshot.status === 'none') {
+		result = await grantFallback(controller, getAuthProvider(), result.ticket, {
+			kind: 'publicViewer'
+		});
+		if (result.outcome === 'unverified') sessionCheckFailed();
+		if (result.snapshot.status !== 'active') redirect(307, '/login');
 	}
-	if (result.snapshot.status !== 'active') redirect(307, '/login');
+	const snapshot = result.snapshot;
+
+	// viewer-public-plan §3.1-6: a public-viewer session may only browse the
+	// nav allowlist (`navigation.ts`'s `NavItem.publicViewer`) - RBAC's
+	// `viewer` role remains the real data-access boundary (ADR-0012 §帰結),
+	// this only keeps the SCREEN a bookmarked/typed URL lands on inside the
+	// allowed area, same intent as `users/+page.ts`'s own role redirect but
+	// applied to every path under (app) at once.
+	if (snapshot.kind === 'publicViewer') {
+		const pathname = url.pathname;
+		const allowed = publicNavItems().some(
+			(item) => pathname === item.path || pathname.startsWith(item.path + '/')
+		);
+		if (!allowed) {
+			const firstPublicNavItem = publicNavItems()[0];
+			if (firstPublicNavItem) redirect(307, firstPublicNavItem.path);
+		}
+	}
 
 	// M12: now that the session is confirmed, pull theme settings from the
 	// UiSettingsProvider (settings DB) - a value saved from another
@@ -47,9 +82,14 @@ export async function load() {
 
 	// The generation THIS load confirmed (I-16) - never a `snapshot.generation`
 	// read now: after the awaits above another session may already have been
-	// confirmed, and this load's data belongs to the earlier one.
+	// confirmed (e.g. a login in another tab during the settings sync), and
 	// `+layout.svelte` renders the page only while it is still the live
 	// generation (the generation gate) and re-runs the loads when it is not
 	// (wiring ①).
-	return { sessionGeneration: result.snapshot.generation };
+	return { sessionGeneration: snapshot.generation };
+}
+
+/** The retryable error page (banto #204): the session could not be verified. */
+function sessionCheckFailed(): never {
+	error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
 }

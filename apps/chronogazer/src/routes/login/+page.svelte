@@ -32,6 +32,13 @@
 	// 保存しなかった）を返したら、エラーではなく通知して /monitor へ移る。保護
 	// ガード（`(app)/+layout.ts`）が今保存されている資格情報で確定する。
 	// admin-template の `routes/login/+page.svelte` と同じ扱い（文言も同じ）。
+	// 「閲覧のみで続ける」（I2b、admin-template v3.0.0 の login と同じ、
+	// ADR-0012）: LAN のブラウザ（`server` モード、`showRemember` と同じ条件）
+	// だけ - Tauri の窓には LAN 向けの閲覧公開の面は無く（この窓の「ログイン
+	// 不要」は M11 が受け持つ）、単体ブラウザのデモにはトークンを発行する
+	// バックエンドが無い。`status()` が返ってから決める。
+	let showContinueAsViewer = $state(false);
+
 	const LOGIN_SUPERSEDED_MESSAGE = '別のセッションが先に確定しました。現在のセッションで開きます。';
 
 	$effect(() => {
@@ -44,8 +51,16 @@
 			// behave as if an account already exists, i.e. the normal login
 			// form.
 			mode = status && !status.initialized ? 'setup' : 'login';
+			showContinueAsViewer = getBantoMode() === 'server' && status?.grants?.publicViewer === true;
 		})();
 	});
+
+	// (app) のガードが閲覧者のセッションを自分で発行する（`+layout.ts` の
+	// `grantFallback` → `enterGrant('publicViewer')`）ので、ここはガードの
+	// かかる画面へ移るだけ。
+	function continueAsViewer(): void {
+		goto('/monitor');
+	}
 
 	async function submitLogin(event: SubmitEvent) {
 		event.preventDefault();
@@ -169,6 +184,12 @@
 			{/if}
 
 			<button type="submit" disabled={submitting}>ログイン</button>
+
+			{#if showContinueAsViewer}
+				<button type="button" class="continue-as-viewer" onclick={continueAsViewer}>
+					閲覧のみで続ける
+				</button>
+			{/if}
 		</form>
 	{/if}
 </div>
@@ -276,5 +297,21 @@
 	:global([data-banto-preset='glass']) button:hover:not(:disabled) {
 		background: var(--banto-accent-gradient);
 		filter: brightness(1.08);
+	}
+
+	/* 「閲覧のみで続ける」は主操作（ログイン）と並ぶ副操作なので、塗らずに
+	   枠だけにする（admin-template では ghost ボタン）。ガラスのプリセットの
+	   グラデーションより後に置いて、そちらでも枠だけにする。 */
+	button.continue-as-viewer,
+	:global([data-banto-preset='glass']) button.continue-as-viewer {
+		background: none;
+		border: 1px solid var(--banto-border);
+		color: var(--banto-text);
+		font-weight: 400;
+	}
+
+	button.continue-as-viewer:hover:not(:disabled),
+	:global([data-banto-preset='glass']) button.continue-as-viewer:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
 	}
 </style>
