@@ -117,7 +117,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 use banto_hub_bootstrap::{HubRecord, KeyStore};
 use banto_tagclient::Endpoint;
-use chronogazer_core::db::init_db;
+use chronogazer_core::db::{init_db, Db};
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubTagView, HubValueView};
 use chronogazer_core::settings::SettingsService;
 use tokio::time::sleep;
@@ -363,10 +363,9 @@ impl QualityTally {
 /// [`unix_seconds_to_utc_string`] が使う、日数since-epoch -> `YYYY-MM-DD`。
 /// Howard Hinnant の `civil_from_days` アルゴリズム
 /// (http://howardhinnant.github.io/date_algorithms.html)。日付/時刻クレート
-/// を1箇所の変換のためだけに増やさない、という方針は
-/// `chronogazer_core::db::iso_date_from_days_since_epoch` と同じ（あちらは
-/// `pub(crate)` で他クレートの example からは呼べないため、ここに同じ
-/// アルゴリズムを複製する）。
+/// を1箇所の変換のためだけに増やさない（banto の
+/// `banto_admin_services::backup` も同じアルゴリズムを非公開で持っていて、
+/// 他クレートの example からは呼べないため、ここに同じアルゴリズムを複製する）。
 fn iso_date_from_days_since_epoch(days: i64) -> String {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -1127,7 +1126,7 @@ async fn main() {
             std::process::exit(if all_pass { 0 } else { 1 });
         }
     };
-    let settings1 = SettingsService::new(pool1.clone());
+    let settings1 = SettingsService::new(Db::Sqlite(pool1.clone()));
     let hub1 = match HubService::new(settings1.clone(), keys.clone()).await {
         Ok(hub) => hub,
         Err(err) => {
@@ -1392,7 +1391,7 @@ async fn main() {
                 // まま終わってしまう。失敗を記録して最後まで進む。
             }
             Ok(pool2) => {
-                let settings2 = SettingsService::new(pool2.clone());
+                let settings2 = SettingsService::new(Db::Sqlite(pool2.clone()));
                 match HubService::new(settings2.clone(), keys.clone()).await {
                     Ok(hub2) => {
                         // 指示どおり connect() は呼ばない。resume() だけで復帰する

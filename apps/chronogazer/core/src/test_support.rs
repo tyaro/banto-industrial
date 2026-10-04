@@ -1,5 +1,7 @@
 //! Shared `#[cfg(test)]`-only helpers for this crate's unit test modules
-//! (`backup::tests`/`rest::tests`).
+//! (`rest::tests`/`db::tests`/`collect::tests`). The `backup::tests` this
+//! history refers to moved to banto with the service itself (I2a,
+//! 2026-10-04: `crate::backup` is now `banto_admin_services::backup`).
 //!
 //! ## Why this exists (2026-08-08 audit finding)
 //!
