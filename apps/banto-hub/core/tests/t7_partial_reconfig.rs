@@ -39,6 +39,7 @@
 //! 5. `/api/v1/status` の `last_apply` が実態を反映（起動直後の初回成功 →
 //!    null、apply_config 実行 → 内容を反映、空構成への遷移 → null に戻る）
 
+use banto_hub_core::db::Db;
 use banto_hub_core::rest::user_session_lookup;
 use banto_server::SessionValidation;
 use std::sync::Arc;
@@ -233,8 +234,8 @@ async fn test_app(label: &str) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
-    let users = UsersService::new(pool.clone());
-    let audit = AuditLogService::new(pool.clone());
+    let users = UsersService::new(Db::Sqlite(pool.clone()));
+    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
         .setup_first_user("admin", "password123", "管理者")
         .await
@@ -295,7 +296,7 @@ async fn test_app(label: &str) -> TestApp {
         events_tx.clone(),
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
-    let settings = SettingsService::new(pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     // #341（2026-09-14）: **意図的にロックダウンしない**（試運転モードの
     // まま）。このファイルの1〜3番は「REST の CRUD が走行中の収集へ
     // そのまま反映される」ことを見るテストで、ロックダウン済みだと

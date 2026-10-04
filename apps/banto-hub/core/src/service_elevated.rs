@@ -507,7 +507,7 @@ pub async fn reset_user_password(
     username: &str,
     new_password: &str,
 ) -> Result<(), ElevatedError> {
-    let users = crate::users::UsersService::new(pool.clone());
+    let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
     let target = users
         .get_by_username(username)
         .await?
@@ -540,7 +540,7 @@ pub async fn revert_to_commissioning_with_audit(
 ) -> Result<(), ElevatedError> {
     crate::commissioning::revert_to_commissioning(pool).await?;
 
-    let audit = crate::audit::AuditLogService::new(pool.clone());
+    let audit = crate::audit::AuditLogService::new(crate::db::Db::Sqlite(pool.clone()));
     audit
         .try_record(crate::audit::AuditEntry {
             actor_username: Some(actor),
@@ -1606,7 +1606,7 @@ mod tests {
     #[tokio::test]
     async fn reset_user_password_lets_new_password_verify() {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
-        let users = crate::users::UsersService::new(pool.clone());
+        let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
             .setup_first_user("owner", "old-password-1", "オーナー")
             .await
@@ -1647,8 +1647,8 @@ mod tests {
     #[tokio::test]
     async fn revert_to_commissioning_with_audit_flips_locked_down_state_back() {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
-        let settings = crate::settings::SettingsService::new(pool.clone());
-        let users = crate::users::UsersService::new(pool.clone());
+        let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
+        let users = crate::users::UsersService::new(crate::db::Db::Sqlite(pool.clone()));
         users
             .setup_first_user("owner", "password123", "オーナー")
             .await
@@ -1693,7 +1693,7 @@ mod tests {
             .await
             .expect("revert_to_commissioning_with_audit should succeed");
 
-        let audit = crate::audit::AuditLogService::new(pool.clone());
+        let audit = crate::audit::AuditLogService::new(crate::db::Db::Sqlite(pool.clone()));
         let result = audit
             .list(banto_core::ListParams::default())
             .await
@@ -1721,7 +1721,7 @@ mod tests {
             .expect("revert should be a harmless no-op when already commissioning");
 
         assert!(!crate::commissioning::resolve_locked_down(
-            &crate::settings::SettingsService::new(pool.clone())
+            &crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()))
         )
         .await
         .expect("resolve_locked_down"));

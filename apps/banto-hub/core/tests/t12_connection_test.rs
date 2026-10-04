@@ -23,6 +23,7 @@
 //! 7. simulation 拒否
 //! 8. 権限(viewer は 403、CSRF ヘッダ無しは拒否)
 
+use banto_hub_core::db::Db;
 use banto_hub_core::rest::user_session_lookup;
 use banto_server::SessionValidation;
 use std::sync::Arc;
@@ -187,8 +188,8 @@ async fn test_app(label: &str) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
-    let users = UsersService::new(pool.clone());
-    let audit = AuditLogService::new(pool.clone());
+    let users = UsersService::new(Db::Sqlite(pool.clone()));
+    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
         .setup_first_user("admin", "password123", "管理者")
         .await
@@ -251,7 +252,7 @@ async fn test_app(label: &str) -> TestApp {
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
-    let settings = SettingsService::new(pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");

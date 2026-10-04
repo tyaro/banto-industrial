@@ -162,7 +162,7 @@ use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::commissioning::CommissioningService;
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use crate::controller::CollectionController;
-use crate::db::{init_db, InitDbError, LegacyDatabase};
+use crate::db::{init_db, Db, InitDbError, LegacyDatabase};
 use crate::diag_log::DiagLog;
 use crate::events::event_channel;
 use crate::grpc::{GrpcServer, GrpcService};
@@ -174,7 +174,7 @@ use crate::profile_lock::{
 };
 use crate::profile_paths::{resolve_hub_root, resolve_profile_paths};
 use crate::rest::{api_router_with_controller, user_auth_state};
-use crate::settings::SettingsService;
+use crate::settings::{HubSettingsExt, SettingsService};
 use crate::subscribe_core::EVAL_TICK_MS;
 use crate::users::UsersService;
 use crate::write_audit::WriteAuditService;
@@ -342,9 +342,9 @@ impl HubRuntime {
         ensure_virtual_connection(&pool, MEM_CONNECTION_NAME).await;
 
         let events = event_channel();
-        let users = UsersService::new(pool.clone());
-        let settings = SettingsService::new(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let users = UsersService::new(Db::Sqlite(pool.clone()));
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
         let auth = user_auth_state(users.clone(), audit.clone());
 
         // PORT/BANTO_BIND/BANTO_HUB_DATA (via `*_override`) override the
@@ -354,7 +354,7 @@ impl HubRuntime {
         // `CollectorManager` so the collector and the retention sweep below
         // agree on the same `data_dir`.
         let server_config = settings
-            .server_config()
+            .hub_server_config()
             .await
             .map_err(HubStartError::ServerConfig)?;
         let store_config = settings
@@ -901,10 +901,12 @@ async fn prune_once(
 /// - once at startup ([`HubRuntime::start`]),
 /// - every tick of the existing 24h tstore retention loop
 ///   ([`HubRuntime::start`]'s `prune_handle`), and
-/// - opportunistically before every `POST /api/audit-log/list`
-///   (`crate::rest::audit_log_list`) - kept for low-latency effect on an
-///   admin who just changed the retention policy and immediately reopens
-///   the viewer, even though the 24h loop now makes it non-load-bearing.
+/// - opportunistically before every `POST /api/audit-log/list` without
+///   `asOfId` (the list handler of banto's
+///   `banto_server::routes::audit_log_router`, I3') - kept for low-latency
+///   effect on an admin who just changed the retention policy and
+///   immediately reopens the viewer, even though the 24h loop now makes it
+///   non-load-bearing.
 async fn audit_prune_once(settings: &SettingsService, audit: &AuditLogService) {
     let config = match settings.audit_config().await {
         Ok(config) => config,
@@ -1149,8 +1151,8 @@ mod tests {
     #[tokio::test]
     async fn audit_prune_once_prunes_down_to_the_configured_row_cap() {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
-        let settings = SettingsService::new(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
 
         for i in 0..5 {
             sqlx::query(
@@ -1194,8 +1196,8 @@ mod tests {
     #[tokio::test]
     async fn audit_prune_once_with_unlimited_policy_is_a_no_op() {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
-        let settings = SettingsService::new(pool.clone());
-        let audit = AuditLogService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
 
         sqlx::query(
             "INSERT INTO audit_log (actor_username, actor_role, action, resource, entity_id, detail, origin, result) \
@@ -1247,7 +1249,7 @@ mod tests {
     #[tokio::test]
     async fn prune_once_deletes_aged_out_files_with_a_finite_policy() {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         settings
             .set_store_config(&crate::settings::StoreSettings {
                 data_dir: "./data".to_string(),
@@ -1276,7 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn prune_once_with_unlimited_policy_is_a_no_op() {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         settings
             .set_store_config(&crate::settings::StoreSettings {
                 data_dir: "./data".to_string(),
@@ -1310,7 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn prune_once_with_out_of_range_retention_days_is_a_no_op() {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
-        let settings = SettingsService::new(pool.clone());
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         settings
             .set_store_config(&crate::settings::StoreSettings {
                 data_dir: "./data".to_string(),

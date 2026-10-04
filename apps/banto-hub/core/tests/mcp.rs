@@ -12,6 +12,7 @@
 //! まま）で返す - ロックダウン前後の両方の挙動を1ファイルでテストしたい
 //! ため、各テストが必要なときだけ`app.commissioning.lock_down()`を呼ぶ。
 
+use banto_hub_core::db::Db;
 use banto_hub_core::rest::user_session_lookup;
 use banto_server::SessionValidation;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
-use banto_hub_core::settings::SettingsService;
+use banto_hub_core::settings::{HubSettingsExt, SettingsService};
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -182,8 +183,8 @@ async fn test_app(label: &str) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
-    let users = UsersService::new(pool.clone());
-    let audit = AuditLogService::new(pool.clone());
+    let users = UsersService::new(Db::Sqlite(pool.clone()));
+    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
         .setup_first_user("admin", "password123", "管理者")
         .await
@@ -245,7 +246,7 @@ async fn test_app(label: &str) -> TestApp {
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
-    let settings = SettingsService::new(pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
@@ -3771,7 +3772,7 @@ async fn settings_tools_without_admin_scope_are_rejected_and_change_nothing() {
     )
     .await;
 
-    let settings = SettingsService::new(app.pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
     let grpc_before = settings.grpc_config().await.unwrap();
     let mqtt_before = settings.mqtt_config().await.unwrap();
     let store_before = settings.store_config().await.unwrap();
@@ -3907,7 +3908,7 @@ async fn set_retention_persists_and_audits_then_round_trips_through_get() {
         Some("admin-key")
     );
 
-    let settings = SettingsService::new(app.pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
     assert_eq!(
         settings.store_config().await.unwrap().retention_days,
         Some(30)
@@ -3932,7 +3933,7 @@ async fn set_retention_persists_and_audits_then_round_trips_through_get() {
 async fn set_retention_out_of_range_is_rejected_and_unchanged() {
     let app = test_app("settings-retention-range").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
-    let settings = SettingsService::new(app.pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
     let before = settings.store_config().await.unwrap();
 
     for bad in [0, -1, 3651] {
@@ -3998,7 +3999,7 @@ async fn set_mqtt_settings_persists_and_audits_then_round_trips_through_get() {
         Some("mcp")
     );
 
-    let settings = SettingsService::new(app.pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
     let persisted = settings.mqtt_config().await.unwrap();
     assert_eq!(persisted.host, "mqtt.example.local");
     assert_eq!(persisted.password.as_deref(), Some("s3cret"));
@@ -4034,7 +4035,7 @@ async fn set_mqtt_settings_persists_and_audits_then_round_trips_through_get() {
 async fn set_mqtt_settings_rejects_invalid_qos_and_leaves_settings_unchanged() {
     let app = test_app("settings-mqtt-invalid").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
-    let settings = SettingsService::new(app.pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
     let before = settings.mqtt_config().await.unwrap();
 
     let (status, body) = mcp_post(
@@ -4096,7 +4097,7 @@ async fn set_grpc_settings_persists_and_audits_then_round_trips_through_get() {
         Some("mcp")
     );
 
-    let settings = SettingsService::new(app.pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
     let persisted = settings.grpc_config().await.unwrap();
     assert_eq!(persisted.bind, "0.0.0.0");
     assert_eq!(persisted.port, 51000);
@@ -4126,7 +4127,7 @@ async fn set_grpc_settings_persists_and_audits_then_round_trips_through_get() {
 async fn set_grpc_settings_rejects_invalid_bind_and_leaves_settings_unchanged() {
     let app = test_app("settings-grpc-invalid").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
-    let settings = SettingsService::new(app.pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
     let before = settings.grpc_config().await.unwrap();
 
     let (status, body) = mcp_post(

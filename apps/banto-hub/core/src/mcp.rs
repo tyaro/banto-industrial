@@ -86,6 +86,7 @@ use crate::api_keys::{api_key_verdict, ApiKeyContext, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, RunMode};
+use crate::db::Db;
 use crate::hub::CollectorManager;
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::PendingChangesService;
@@ -101,7 +102,7 @@ use crate::rest::{
 use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
 // - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
-use crate::settings::{MqttSettings, SettingsService, StoreSettings};
+use crate::settings::{HubSettingsExt, MqttSettings, SettingsService, StoreSettings};
 use crate::system_info::SystemInfoSampler;
 use crate::write_audit::WriteAuditService;
 use crate::write_control::WriteControl;
@@ -306,7 +307,7 @@ pub(crate) fn mcp_router(
     let pending_changes = PendingChangesService::new(manager.pool());
     // T21 S2-b: REST の各設定ハンドラ（`crate::rest::mqtt_settings_get`等）
     // と同じ生成方法（`SettingsService::new(manager.pool())`）。
-    let settings = SettingsService::new(manager.pool());
+    let settings = SettingsService::new(Db::Sqlite(manager.pool()));
     let state = McpState {
         manager: manager.clone(),
         collection_controller: enforce_collection_state.then_some(controller),

@@ -114,7 +114,7 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
 ### Phase 3 — バックログ実装（採番済み・実装系）
 
 - **P3-a（完了、2026-08-12、ブランチ `claude/audit-retention`）**: audit ログ retention の配線
-  （低リスク・影響大）。[audit.rs:200](../apps/banto-hub/core/src/audit.rs) の `prune` は休眠実装で
+  （低リスク・影響大）。当時の `apps/banto-hub/core/src/audit.rs`（2026-10-04 の I3' で削除し、今は banto の `banto-admin-services`）の `prune` は休眠実装で
   REST/起動パスに未配線 → 監査ログ無制限成長、だった問題を解消。chronogazer/relay-wright と同等の
   `AuditSettings`（`crate::settings`、既定 90日/100,000件）を追加し、`GET/PUT /api/audit-log/config`
   （admin 限定）と `crate::runtime::HubRuntime::start` の起動時剪定 + `POST /api/audit-log/list` の

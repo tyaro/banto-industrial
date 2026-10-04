@@ -36,6 +36,7 @@ use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
+use banto_hub_core::db::Db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
@@ -106,8 +107,8 @@ async fn test_app(label: &str) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
-    let users = UsersService::new(pool.clone());
-    let audit = AuditLogService::new(pool.clone());
+    let users = UsersService::new(Db::Sqlite(pool.clone()));
+    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
     users
         .setup_first_user("admin", "password123", "管理者")
         .await
@@ -170,7 +171,7 @@ async fn test_app(label: &str) -> TestApp {
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
-    let settings = SettingsService::new(pool.clone());
+    let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     let commissioning = CommissioningService::load(settings, users.clone(), auth.clone())
         .await
         .expect("CommissioningService::load");
