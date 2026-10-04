@@ -17,7 +17,7 @@ import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
 import { logoutAndLeave } from './banto/logout.svelte';
 import { notifyLogoutOutcome } from './banto/logoutNotice';
-import { navItems } from './navigation';
+import { navItems, publicNavItems } from './navigation';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
 import { isAdmin } from './permissions';
@@ -29,8 +29,12 @@ function navigationCommands(): PaletteCommand[] {
 		group: 'ナビゲーション',
 		keywords: [item.path],
 		// Spec M10 RBAC: same condition as Sidebar.svelte's `visibleItems`
-		// (adminOnly entries hidden from non-admin roles).
-		visible: item.adminOnly ? () => isAdmin(sessionStore.role) : undefined,
+		// (adminOnly entries hidden from non-admin roles). 閲覧公開のセッション
+		// （I2b）はサイドバーと同じ許可リスト（`publicNavItems`）だけ。
+		visible: () =>
+			sessionStore.publicViewer
+				? publicNavItems().some((entry) => entry.path === item.path)
+				: !item.adminOnly || isAdmin(sessionStore.role),
 		run: () => {
 			void goto(item.path);
 		}
@@ -87,11 +91,23 @@ function sessionCommands(): PaletteCommand[] {
 			group: 'セッション',
 			keywords: ['logout', 'sign out'],
 			// Same condition as Header.svelte's logout button: hidden in
-			// login-not-required mode (spec M11 - there's no session to end).
-			visible: () => !sessionStore.authDisabled,
+			// login-not-required mode (spec M11 - there's no session to end) and
+			// for a 閲覧公開 session (I2b - the header shows 「ログイン」 instead).
+			visible: () => !sessionStore.authDisabled && !sessionStore.publicViewer,
 			run: async () => {
 				// banto v2.0.0 (#260): same as Header.svelte's logout.
 				await logoutAndLeave(() => goto('/login'), { notify: notifyLogoutOutcome });
+			}
+		},
+		{
+			id: 'session.login',
+			title: 'ログイン',
+			group: 'セッション',
+			keywords: ['login', 'sign in'],
+			// Header.svelte の「ログイン」と同じ: 閲覧公開のセッションだけ。
+			visible: () => sessionStore.publicViewer,
+			run: () => {
+				void goto('/login');
 			}
 		}
 	];

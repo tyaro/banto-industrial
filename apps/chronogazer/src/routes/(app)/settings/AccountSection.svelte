@@ -143,7 +143,13 @@
 
 <section>
 	<h2>アカウント</h2>
-	{#if sessionStore.authDisabled}
+	{#if sessionStore.publicViewer}
+		<!-- I2b（admin-template v3.0.0 の AccountSection.svelte と同じ）: 閲覧公開の
+		     セッションには users の行が無く、パスワード変更は必ず失敗する。この
+		     画面は閲覧公開のナビの許可リストに無く、ガードが監視へ移すので届かない
+		     はずだが、二重の守りとしてアカウントの UI を出さない。 -->
+		<p class="note">閲覧公開のセッションではアカウントの操作はできません。</p>
+	{:else if sessionStore.authDisabled}
 		<p class="note">ログイン不要モードではアカウントがないため、パスワード変更はできません。</p>
 	{:else if changePassword}
 		<form onsubmit={submitChangePassword}>

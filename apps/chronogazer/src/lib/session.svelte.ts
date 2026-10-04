@@ -1,9 +1,7 @@
 // banto v3.0.0 の admin-template
 // `apps/admin-template/src/lib/session.svelte.ts` からコピー（v3 移行）。
-// chronogazer 固有の差: `publicViewer` を削った（このアプリには閲覧公開
-// （viewer-public）が無い。`(app)/+layout.ts` も `grantFallback` を使わない。
-// セッションの種別は `Identity.kind`/`snapshot.kind`（サーバー由来）で、ここでは
-// 読まない）。
+// chronogazer 固有の差: なし（I2b で閲覧公開を使うことになり、v3 移行時に
+// 削った `publicViewer` を戻した。2026-10-04 オーナー決定）。
 /**
  * Current session's identity/role (Svelte 5 runes), spec M10 RBAC.
  *
@@ -47,6 +45,20 @@ class SessionStore {
 	 * section) never disappears on a guess.
 	 */
 	readonly authDisabled: boolean = $derived(getSessionController().snapshot.kind === 'local');
+
+	/**
+	 * Is this the synthetic LAN "viewer-public" session (viewer-public-plan
+	 * §2.2/§3.1-6, ADR-0012)? The issuer explicitly marks synthetic sessions
+	 * with `identity.kind === 'publicViewer'` (ADR-0017; the controller keys them `publicViewer`);
+	 * usernames (including `public`) and roles cannot distinguish them from
+	 * ordinary accounts (Issue #209). Consumed by the nav allowlist
+	 * (`navigation.ts`), `Header.svelte`'s login button, and
+	 * `settings/AccountSection.svelte`'s account-UI guard.
+	 */
+	readonly publicViewer: boolean = $derived.by(() => {
+		const snapshot = getSessionController().snapshot;
+		return snapshot.status === 'active' && snapshot.kind === 'publicViewer';
+	});
 }
 
 export const sessionStore = new SessionStore();

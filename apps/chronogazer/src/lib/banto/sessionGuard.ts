@@ -4,7 +4,8 @@
  * banto v2.0.0（#260）でセッションの確定は SessionController の役目になり、
  * v1 の `resolveProtectedSession` を包んでいた `decideProtectedRoute` は
  * 削除した。ガード本体は `routes/(app)/+layout.ts`（`resolveSettled` →
- * `unverified` は 503、確定した `none` は /login）。ここに残るのは:
+ * `unverified` は 503、確定した `none` は閲覧公開の `grantFallback` を経て、
+ * 入れなければ /login - I2b）。ここに残るのは:
  *
  * - 照合できなかったとき（`unverified`: 照合の `500`・到達不能、Tauri の
  *   `auth_resolve` の DB エラー、10 秒の期限切れ）のエラー画面の本文。

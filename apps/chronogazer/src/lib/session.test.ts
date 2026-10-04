@@ -1,8 +1,7 @@
 // banto v3.0.0 の admin-template
 // `apps/admin-template/src/lib/session.test.ts` からコピー（v3 移行）。
-// chronogazer 固有の差: `publicViewer` のケースを削った（このアプリは grant
-// （`grantFallback`、閲覧公開の `publicViewer` を含む）を使わず、
-// `session.svelte.ts` も `publicViewer` を持たない）。`authDisabled` の導出が壊れると
+// chronogazer 固有の差: なし（I2b で閲覧公開を使うことになり、v3 移行時に削った
+// `publicViewer` のケースを戻した）。`authDisabled` の導出が壊れると
 // キオスクの ESCAPE HATCH（`canManageAuthMode()`）が偽になるので、ここで固定する。
 /**
  * Issue #260 実装-3 (design §6.1, I-12): `sessionStore` is derived from the
@@ -86,11 +85,27 @@ describe('sessionStore (derived from the controller snapshot)', () => {
 		expect(sessionStore.role).toBe('editor');
 	});
 
+	it('publicViewer follows the confirmed kind (the issuer marker), not the id', async () => {
+		const p = provider([
+			(r) => ({
+				status: 'active',
+				checked: r,
+				current: r,
+				identity: { id: 'public', name: 'public', role: 'viewer', kind: 'publicViewer' }
+			})
+		]);
+		initBanto({ dataProvider: {} as DataProvider, authProvider: p.auth, resources: [] });
+		await resolveSettled(getSessionController());
+		expect(sessionStore.publicViewer).toBe(true);
+		expect(sessionStore.authDisabled).toBe(false);
+	});
+
 	it('`none` leaves no identity and the least-privileged role', async () => {
 		const p = provider([(r) => ({ status: 'none', checked: r, current: r })]);
 		initBanto({ dataProvider: {} as DataProvider, authProvider: p.auth, resources: [] });
 		await resolveSettled(getSessionController());
 		expect(sessionStore.identity).toBeNull();
 		expect(sessionStore.role).toBe('viewer');
+		expect(sessionStore.publicViewer).toBe(false);
 	});
 });

@@ -27,7 +27,18 @@
 //! `BANTO_DB` (default `./banto-dev.sqlite3`), `BANTO_ALLOW_SETUP` (`1` to
 //! enable `POST /api/auth/setup`; unset/anything else keeps it `403`'d, spec
 //! §8.2 - the Tauri app never sets this, since desktop first-run goes
-//! through the `auth_setup` command instead).
+//! through the `auth_setup` command instead), `BANTO_VIEWER_PUBLIC` (`1` to
+//! seed `server.viewer_public = true` at startup so LAN clients may mint a
+//! viewer-public grant session through `POST /api/auth/grant/publicViewer`
+//! without logging in - ADR-0012 / ADR-0017; 2026-10-04 オーナー決定で
+//! ChronoGazer でも閲覧公開を使う).
+//!
+//! `BANTO_VIEWER_PUBLIC` は admin-template v3.0.0 の `banto-serve.rs` の同名の
+//! 入口を写したもの（`BANTO_ALLOW_SETUP` と同じく開発・E2E 用）。保存されて
+//! いる設定を**書く**（プロセス内の上書きではない - 条件は
+//! `SettingsService` から毎回読まれるため）ので、変数を外しても閲覧公開は
+//! OFF に戻らない（設定画面か新しい DB で戻す）。書くのはこの 1 項目だけで、
+//! `server.enabled`・bind・port はそのまま残す。
 
 use banto_server::{start, static_router, ServerConfig};
 use chronogazer_core::assets::FrontendAssets;
@@ -42,7 +53,7 @@ use chronogazer_core::db::{init_db, Db, InitDbError};
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, UnavailableKeyStore};
 use chronogazer_core::rest::{api_router, user_auth_state};
-use chronogazer_core::settings::{store_config, SettingsService};
+use chronogazer_core::settings::{store_config, ServerSettings, SettingsService};
 use chronogazer_core::users::UsersService;
 // #383 段階2a / R1-B: レジストリ3サービス。`chronogazer_core::lib.rs`の
 // re-export 経由（`db::DbPool`と同じ理由 - このバイナリ自身は banto-tags を
@@ -63,6 +74,9 @@ async fn main() {
     let bind = std::env::var("BANTO_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let db_path = std::env::var("BANTO_DB").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
     let allow_setup = std::env::var("BANTO_ALLOW_SETUP")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let seed_viewer_public = std::env::var("BANTO_VIEWER_PUBLIC")
         .map(|value| value == "1")
         .unwrap_or(false);
 
@@ -171,6 +185,27 @@ async fn main() {
         Err(err) => eprintln!("banto-serve: 監査ログの保持設定の読み取りに失敗しました: {err}"),
     }
 
+    // 閲覧公開の種まき（admin-template v3.0.0 の `banto-serve.rs` と同じ）。
+    // 新しい `ServerSettings` を作らず読み書きするので、前の実行や設定画面が
+    // 保存した `enabled`/bind/port は残る - このバイナリの待ち受けは
+    // `BANTO_BIND`/`PORT` から決まり、これらのキーは使わないので、ここで
+    // `enabled` を変えると同じ DB を開くデスクトップ版の挙動が黙って変わる。
+    // 剪定と同じく best-effort（失敗しても起動は止めない）。
+    if seed_viewer_public {
+        match settings.server_config().await {
+            Ok(config) => {
+                let seeded = ServerSettings {
+                    viewer_public: true,
+                    ..config
+                };
+                if let Err(err) = settings.set_server_config(&seeded).await {
+                    eprintln!("banto-serve: 閲覧公開設定の保存に失敗しました: {err}");
+                }
+            }
+            Err(err) => eprintln!("banto-serve: サーバー設定の読み取りに失敗しました: {err}"),
+        }
+    }
+
     // #332: この開発用サーバーには OS キーリングが無い（keyring は
     // `src-tauri` だけの依存 - ワークスペース `Cargo.toml` の注記参照）ので、
     // 書き込みが必ず失敗する `UnavailableKeyStore` を渡す。到達確認・
@@ -255,6 +290,9 @@ async fn main() {
         println!(
             "banto-serve: first-run setup is DISABLED - set BANTO_ALLOW_SETUP=1 to allow POST /api/auth/setup"
         );
+    }
+    if seed_viewer_public {
+        println!("banto-serve: public viewing is ENABLED (BANTO_VIEWER_PUBLIC=1) - POST /api/auth/grant/publicViewer will hand out anonymous viewer sessions");
     }
     println!("banto-serve: press Ctrl-C to stop");
 

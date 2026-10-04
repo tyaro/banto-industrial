@@ -41,7 +41,12 @@
 		🔍
 	</button>
 
-	{#if !sessionStore.authDisabled}
+	{#if sessionStore.publicViewer}
+		<!-- I2b（admin-template v3.0.0 の Header.svelte と同じ、ADR-0012）: LAN の
+		     閲覧公開のセッションにはアカウントもログアウトも無いので、代わりに
+		     本当のログインへ戻る口を出す。 -->
+		<button type="button" class="icon-button" onclick={() => goto('/login')}>ログイン</button>
+	{:else if !sessionStore.authDisabled}
 		<button type="button" class="icon-button" onclick={logout}>ログアウト</button>
 	{/if}
 </header>
