@@ -1,5 +1,6 @@
 // banto v3.0.0 の admin-template
-// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v3 移行、I2b で
+// `apps/admin-template/src/routes/(app)/+layout.ts` を写した（v3.0.1 の #321 で
+// 起動待ちの延期に差し替え）（v3 移行、I2b で
 // 閲覧公開の `grantFallback` を戻した - 2026-10-04 オーナー決定で ChronoGazer
 // でも閲覧公開を使う）。
 // chronogazer 固有の差: エラー画面の本文は i18n ではなく
@@ -13,8 +14,12 @@ import {
 	grantFallback,
 	resolveSettled
 } from '@banto/admin-core';
-import { bantoReady } from '$lib/banto/setup';
+import { isBantoReady } from '$lib/banto/setup';
+import { deferUntilStarted } from '$lib/banto/startupGate';
 import { SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
+
+// 延期の 503 の本文（エラー画面は出さずスプラッシュが出るので実際には見えない）。
+const STARTING_MESSAGE = '起動中…';
 import { settings } from '$lib/settings.svelte';
 import { publicNavItems } from '$lib/navigation';
 
@@ -23,8 +28,16 @@ import { publicNavItems } from '$lib/navigation';
 // only writer of "who is signed in" (ADR-0016). This load's only side
 // effects are the controller's confirmation and, for a confirmed `none`,
 // the grant policy's issuance (ADR-0017); it writes no store (`sessionStore`
-// is derived from `controller.snapshot`). Must wait for provider
-// selection/detection (spec §11.1's three-way environment probe) first.
+// is derived from `controller.snapshot`). Runs only after provider
+// selection/detection (spec §11.1's three-way environment probe) has
+// finished - but never WAITS for it (banto #321): while startup is still
+// running the guard throws the startup deferral (`startupGate.ts`) before
+// touching any provider or the session, so the root layout can show the
+// startup splash ("起動中…" -> "サーバーに接続できません" + 再接続, #286) and
+// re-run this load once startup has finished. Awaiting `bantoReady` here
+// kept the first load - and with it the whole screen - blank while the
+// server was unreachable. The child loads all `await parent()`, so none of
+// them (and no protected component) runs before this guard has passed.
 //
 // - `resolveSettled()` asks again after `superseded` and returns only
 //   `confirmed` or `unverified` (I-16). `unverified` - the server could not
@@ -44,7 +57,7 @@ import { publicNavItems } from '$lib/navigation';
 //   `none` goes to /login. Only the HTTP provider implements `status()`'s
 //   `grants` and `enterGrant()`; Tauri/demo go straight to /login.
 export async function load({ url }) {
-	await bantoReady;
+	deferUntilStarted(isBantoReady(), () => STARTING_MESSAGE);
 	const controller = getSessionController();
 	let result = await resolveSettled(controller, { cause: 'navigation' });
 	if (result.outcome === 'unverified') sessionCheckFailed();

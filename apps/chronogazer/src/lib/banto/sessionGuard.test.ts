@@ -38,7 +38,8 @@ import {
 	type DataProvider
 } from '@banto/admin-core';
 
-vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
+// banto v3.0.1（#321）: ガードは `isBantoReady()` で起動の完了を見る（待たない）。
+vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve(), isBantoReady: () => true }));
 // `afterConfirm`: a test hook run inside the guard right after its confirmation
 // (the guard calls `settings.syncFromProvider()` synchronously there), to move
 // the session on before `load()` returns.
