@@ -2,6 +2,20 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.29 — 2026-10-05（アルファ）
+
+banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A）。banto-hub への影響は依存の版だけで、REST の wire・設定・DB は変わらない。配布物の構成・前提ランタイムは alpha.3 以降と同じ。alpha.28 の「旧形式の DB は起動を拒否する」はそのまま（上げる手順は alpha.28 の節）。
+
+### 変更（ChronoGazer。banto-hub の配布物には入らない）
+
+- 保護画面（`/monitor` など）を直接開いたとき、サーバーに届かない間も真っ白にならず「起動中…」→「サーバーに接続できません」＋「再接続」が出るようにした（banto #321、経路 B。`startupGate.ts`・`isBantoReady()`・ルートのレイアウトを admin-template v3.0.1 から写した）。再接続するとその保護画面がそのまま開く。banto-hub は起動判定をせず `server` 固定（`bantoReady` は待つ処理を持たない）なので、この修正は不要で取り込んでいない。
+- 前回の公開（alpha.28）以降に main に入った ChronoGazer の変更: users/settings/audit/backup のサービスと REST ルーターを banto v3.0.0 のものに置き換えた（#498。banto v2.1.0 の #277・#278・#280）、LAN 設定の適用を banto の形にし閲覧公開（grant `publicViewer`）を使えるようにした（#499。#287・#288・#294）、起動時の環境判定を banto の形にした（#501。届かないときは demo に落とさず起動待ちで再試行する。#286）。ChronoGazer は 0.1.0 のまま。
+
+### 変更（banto-hub）
+
+- users/settings/audit のサービスと、auth（status/setup/change-password）・users・audit-log の REST の口を banto v3.0.0 のものに置き換えた（#502、I3'）。banto v2.1.0 の #277（初回セットアップの原子化）・#278（失敗ログインの名前の切り詰め、無効なログアウトを記録しない）が入る。保持設定の変更の監査は `settings_change` / `settings` になった。#431 の認証ゲートと RBAC の床、hub 固有の設定キー・各ルーターは自前のまま。
+- banto の依存（`banto-core` / `banto-storage` / `banto-server` / `banto-admin-services`、`@banto/*`）を `v3.0.0` から `v3.0.1` に上げた。`Cargo.lock` は banto の 4 crate と workspace の版だけ、`pnpm-lock.yaml` は `@banto/*` のみ。
+
 ## v0.2.0-alpha.28 — 2026-10-04（アルファ）
 
 banto v3.0.0（2026-10-04、ADR-0017「資格情報なしのセッション発行は grant に一本化」、破壊的変更）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A と、コピーしていた `extra_auth_router`・保護レイアウトの経路 B をセットで書き換えた）。**試運転モードを「認証を迂回する」仕組みから「試運転中だけ資格情報なしで発行される合成 admin の grant セッション」に切り替えた**（オーナー決定 2026-10-02〜04）。配布物の構成・前提ランタイムは alpha.3 以降と同じ。DB の移行は無い（既存の DB は壊してよい、アルファ）。
