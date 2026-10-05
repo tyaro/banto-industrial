@@ -29,7 +29,7 @@
  * 表示する」という元の見た目を変えないため、`value` とは別にエラーだけを
  * 共有する（`SecuritySection.svelte` が読む）。
  */
-import { getAuthSettings, type AuthSettings } from '$lib/banto/authAdmin';
+import { getAuthSettings, type AuthSettings } from '#lib/banto/authAdmin.js';
 
 class AuthSettingsStore {
 	value: AuthSettings | null = $state(null);

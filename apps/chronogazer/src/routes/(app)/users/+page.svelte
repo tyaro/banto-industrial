@@ -16,7 +16,7 @@
 	import { BantoForm, createFormStore } from '@banto/forms';
 	import type { FormSchema } from '@banto/forms';
 	import { isProviderError } from '@banto/admin-core';
-	import { toastStore } from '$lib/toast.svelte';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import {
 		createUser,
 		deleteUser,
@@ -27,7 +27,7 @@
 		DEMO_MODE_MESSAGE,
 		type Role as UserRole,
 		type UserSummary
-	} from '$lib/banto/usersAdmin';
+	} from '#lib/banto/usersAdmin.js';
 
 	const roleOptions: { value: UserRole; label: string }[] = [
 		{ value: 'admin', label: '管理者' },

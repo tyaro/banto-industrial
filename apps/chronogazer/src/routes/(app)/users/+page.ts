@@ -1,6 +1,7 @@
 import { redirect } from '@sveltejs/kit';
-import { isAdmin } from '$lib/permissions';
-import { sessionStore } from '$lib/session.svelte';
+import { resolveAppPath } from '#lib/navigation.js';
+import { isAdmin } from '#lib/permissions.js';
+import { sessionStore } from '#lib/session.svelte.js';
 
 /**
  * `admin`-only page (spec M10 RBAC): non-admins are sent to `/monitor`
@@ -17,6 +18,6 @@ import { sessionStore } from '$lib/session.svelte';
 export async function load({ parent }) {
 	await parent();
 	if (!isAdmin(sessionStore.role)) {
-		redirect(307, '/monitor');
+		redirect(307, resolveAppPath('/monitor'));
 	}
 }

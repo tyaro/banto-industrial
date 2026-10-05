@@ -39,12 +39,12 @@ import {
 } from '@banto/admin-core';
 
 // banto v3.0.1（#321）: ガードは `isBantoReady()` で起動の完了を見る（待たない）。
-vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve(), isBantoReady: () => true }));
+vi.mock('#lib/banto/setup.js', () => ({ bantoReady: Promise.resolve(), isBantoReady: () => true }));
 // `afterConfirm`: a test hook run inside the guard right after its confirmation
 // (the guard calls `settings.syncFromProvider()` synchronously there), to move
 // the session on before `load()` returns.
 const hooks = vi.hoisted(() => ({ afterConfirm: null as null | (() => void) }));
-vi.mock('$lib/settings.svelte', () => ({
+vi.mock('#lib/settings.svelte.js', () => ({
 	settings: {
 		syncFromProvider: async () => {
 			hooks.afterConfirm?.();

@@ -1,4 +1,5 @@
 import { redirect } from '@sveltejs/kit';
+import { resolveAppPath } from '#lib/navigation.js';
 
 /**
  * `/settings` 自体は何も描画せず、先頭の可視カテゴリ（`+layout.ts` が
@@ -9,5 +10,5 @@ import { redirect } from '@sveltejs/kit';
 export async function load({ parent }) {
 	const { categories } = await parent();
 	const first = categories[0];
-	if (first) redirect(307, first.path);
+	if (first) redirect(307, resolveAppPath(first.path));
 }

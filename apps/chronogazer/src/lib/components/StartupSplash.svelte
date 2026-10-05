@@ -5,7 +5,7 @@
 	// chronogazer 固有の差: chronogazer は i18n（Paraglide）を持たないので、
 	// 文言は admin-template の `messages/ja.json` の `app.starting` /
 	// `app.startup.*` を日本語で直書きしている。それ以外は無改変。
-	import { startupState, retryStartup } from '$lib/banto/startupState.svelte';
+	import { startupState, retryStartup } from '#lib/banto/startupState.svelte.js';
 </script>
 
 {#if startupState.status === 'unreachable'}

@@ -25,7 +25,8 @@
 	 * `SecuritySection.svelte` 側で保つため）。
 	 */
 	import { page } from '$app/state';
-	import { isTauri } from '$lib/banto/setup';
+	import { isTauri } from '#lib/banto/setup.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { errorMessage } from './shared';
 	import type { SettingsCategory } from './categories';
@@ -36,7 +37,8 @@
 
 	/** Sidebar.svelte の `isActive` と同じ「自分自身 or 配下のパスなら active」判定。 */
 	function isActive(category: SettingsCategory): boolean {
-		return page.url.pathname === category.path || page.url.pathname.startsWith(category.path + '/');
+		const fullPath = resolveAppPath(category.path);
+		return page.url.pathname === fullPath || page.url.pathname.startsWith(fullPath + '/');
 	}
 
 	const tauri = isTauri();
@@ -53,7 +55,7 @@
 	<nav class="section-nav" aria-label="設定のカテゴリ">
 		{#each data.categories as category (category.id)}
 			<a
-				href={category.path}
+				href={resolveAppPath(category.path)}
 				class:active={isActive(category)}
 				aria-current={isActive(category) ? 'page' : undefined}
 			>

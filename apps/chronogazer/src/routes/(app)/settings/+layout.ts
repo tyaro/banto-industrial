@@ -1,8 +1,8 @@
-import { isAdmin } from '$lib/permissions';
-import { isTauri } from '$lib/banto/setup';
-import { isAuditLogAvailable } from '$lib/banto/auditLogAdmin';
-import { isBackupsAvailable } from '$lib/banto/backupsAdmin';
-import { sessionStore } from '$lib/session.svelte';
+import { isAdmin } from '#lib/permissions.js';
+import { isTauri } from '#lib/banto/setup.js';
+import { isAuditLogAvailable } from '#lib/banto/auditLogAdmin.js';
+import { isBackupsAvailable } from '#lib/banto/backupsAdmin.js';
+import { sessionStore } from '#lib/session.svelte.js';
 import { canManageAuthMode } from './shared';
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
 
@@ -48,10 +48,10 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  * `load` は再実行されるまで結果を再計算しないので、そのままだとナビに
  * `セキュリティ` が残ったまま `SecuritySection` が何も描画しない空のページに
  * なる（PR #372 Copilot レビュー指摘）。`SecuritySection.svelte` が変更の
- * 成功後に `invalidateAll()` を呼び、この `load` は `(app)/+layout.ts` の
+ * 成功後に `refreshAll()` を呼び、この `load` は `(app)/+layout.ts` の
  * 確定（banto v2.0.0 の SessionController）の後に再実行される（以前の
  * `depends('settings:categories')` と `invalidate(...)` は v2 移行で
- * `invalidateAll()` に置き換えたので外した）。
+ * `invalidateAll()`（v4 移行で `refreshAll()`）に置き換えたので外した）。
  */
 export async function load({ parent }) {
 	await parent();

@@ -1,16 +1,16 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { navItems, publicNavItems, type NavItem } from '$lib/navigation';
-	import { settings } from '$lib/settings.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
+	import { navItems, publicNavItems, resolveAppPath, type NavItem } from '#lib/navigation.js';
+	import { settings } from '#lib/settings.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
 
 	// #359 chronogazer 分: `item.activeMatch`（無ければ `item.path`）を基準に
 	// 前方一致判定する - `navigation.ts` の doc comment参照（`設定` は
 	// 遷移先が `/settings/appearance` でも `/settings` 配下ならハイライト
 	// させたい）。
 	function isActive(item: NavItem): boolean {
-		const match = item.activeMatch ?? item.path;
+		const match = resolveAppPath(item.activeMatch ?? item.path);
 		return page.url.pathname === match || page.url.pathname.startsWith(match + '/');
 	}
 
@@ -41,7 +41,7 @@
 	<nav>
 		{#each visibleItems as item (item.path)}
 			<a
-				href={item.path}
+				href={resolveAppPath(item.path)}
 				class:active={isActive(item)}
 				title={settings.sidebarCollapsed ? item.label : undefined}
 			>

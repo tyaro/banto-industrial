@@ -15,7 +15,7 @@
 	 * 画面の上から下への流れに一致させられること。
 	 *
 	 * viewer は閲覧のみ（`canWriteResources` = editor 以上の判定、
-	 * `$lib/permissions` 既存）: 新規作成フォーム・編集パネル・削除ボタンを
+	 * `#lib/permissions.ts` 既存）: 新規作成フォーム・編集パネル・削除ボタンを
 	 * 出さない。削除は `window.confirm`（users 画面と同じ出し方）。
 	 *
 	 * 収集グループの周期は `banto_tags::ALLOWED_PERIOD_MS` と一致する固定選択
@@ -66,9 +66,9 @@
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { BantoForm, createFormStore, type FormSchema } from '@banto/forms';
 	import { isProviderError } from '@banto/admin-core';
-	import { toastStore } from '$lib/toast.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { canWriteResources } from '$lib/permissions';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { canWriteResources } from '#lib/permissions.js';
 	import {
 		listPlcConnections,
 		createPlcConnection,
@@ -98,8 +98,8 @@
 		type TagDataType,
 		type SimulationCoverageEntry,
 		type ExclusionView
-	} from '$lib/banto/tagRegistryAdmin';
-	import { exclusionUnitLabel } from '$lib/banto/collectAdmin';
+	} from '#lib/banto/tagRegistryAdmin.js';
+	import { exclusionUnitLabel } from '#lib/banto/collectAdmin.js';
 	import {
 		runGuardedSave,
 		runGuardedDelete,

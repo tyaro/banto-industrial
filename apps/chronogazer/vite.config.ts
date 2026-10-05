@@ -1,9 +1,18 @@
+import adapter from '@sveltejs/adapter-static';
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 import { sveltekit } from '@sveltejs/kit/vite';
 import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-	plugins: [tailwindcss(), sveltekit()],
+	plugins: [
+		tailwindcss(),
+		sveltekit({
+			preprocess: vitePreprocess(),
+			// Tauri has no SSR server: static build with SPA fallback (spec §8.1).
+			adapter: adapter({ pages: 'build', assets: 'build', fallback: 'index.html' })
+		})
+	],
 	// @banto/* are git dependencies here (real node_modules packages, not
 	// workspace links), so Vite's dep optimizer tries to esbuild-prebundle
 	// their uncompiled .svelte/.svelte.ts sources and fails. Exclude them so

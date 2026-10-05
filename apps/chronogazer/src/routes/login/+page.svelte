@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { getAuthProvider, notify } from '@banto/admin-core';
-	import { bantoReady, getBantoMode } from '$lib/banto/setup';
+	import { resolveAppPath } from '#lib/navigation.js';
+	import { bantoReady, getBantoMode } from '#lib/banto/setup.js';
 
 	// Undecided until `status()` resolves (or is absent, treated as
 	// "already initialized" - see below): render nothing rather than
@@ -59,7 +60,7 @@
 	// `grantFallback` → `enterGrant('publicViewer')`）ので、ここはガードの
 	// かかる画面へ移るだけ。
 	function continueAsViewer(): void {
-		goto('/monitor');
+		goto(resolveAppPath('/monitor'));
 	}
 
 	async function submitLogin(event: SubmitEvent) {
@@ -74,10 +75,10 @@
 			if (showRemember && remember) params.remember = true;
 			const result = await getAuthProvider().login(params);
 			if (result.success) {
-				goto('/monitor');
+				goto(resolveAppPath('/monitor'));
 			} else if (result.superseded) {
 				notify('info', LOGIN_SUPERSEDED_MESSAGE);
-				goto('/monitor');
+				goto(resolveAppPath('/monitor'));
 			} else {
 				error = result.error ?? 'ログインに失敗しました';
 			}
@@ -108,10 +109,10 @@
 			}
 			const result = await setup({ username, password, displayName });
 			if (result.success) {
-				goto('/monitor');
+				goto(resolveAppPath('/monitor'));
 			} else if (result.superseded) {
 				notify('info', LOGIN_SUPERSEDED_MESSAGE);
-				goto('/monitor');
+				goto(resolveAppPath('/monitor'));
 			} else {
 				error = result.error ?? 'セットアップに失敗しました';
 			}

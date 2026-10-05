@@ -14,7 +14,7 @@
  *    かかわらず**失敗の表示と再試行手段が残る。
  */
 import { describe, expect, it } from 'vitest';
-import type { CollectEventRow } from '$lib/banto/collectAdmin';
+import type { CollectEventRow } from '#lib/banto/collectAdmin.js';
 import {
 	BLOCK_SIZE,
 	EventBlockLoader,

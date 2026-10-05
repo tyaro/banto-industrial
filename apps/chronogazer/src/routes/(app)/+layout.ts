@@ -14,14 +14,14 @@ import {
 	grantFallback,
 	resolveSettled
 } from '@banto/admin-core';
-import { isBantoReady } from '$lib/banto/setup';
-import { deferUntilStarted } from '$lib/banto/startupGate';
-import { SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
+import { isBantoReady } from '#lib/banto/setup.js';
+import { deferUntilStarted } from '#lib/banto/startupGate.js';
+import { SESSION_CHECK_FAILED_MESSAGE } from '#lib/banto/sessionGuard.js';
 
 // 延期の 503 の本文（エラー画面は出さずスプラッシュが出るので実際には見えない）。
 const STARTING_MESSAGE = '起動中…';
-import { settings } from '$lib/settings.svelte';
-import { publicNavItems } from '$lib/navigation';
+import { settings } from '#lib/settings.svelte.js';
+import { publicNavItems, resolveAppPath } from '#lib/navigation.js';
 
 // Auth guard for the whole (app) group (spec §8.1), banto Issue #260 (design
 // §6.1, v2.0.0): the session is confirmed by the SessionController - the
@@ -66,7 +66,7 @@ export async function load({ url }) {
 			kind: 'publicViewer'
 		});
 		if (result.outcome === 'unverified') sessionCheckFailed();
-		if (result.snapshot.status !== 'active') redirect(307, '/login');
+		if (result.snapshot.status !== 'active') redirect(307, resolveAppPath('/login'));
 	}
 	const snapshot = result.snapshot;
 
@@ -76,14 +76,22 @@ export async function load({ url }) {
 	// this only keeps the SCREEN a bookmarked/typed URL lands on inside the
 	// allowed area, same intent as `users/+page.ts`'s own role redirect but
 	// applied to every path under (app) at once.
+	// banto v4.0.0（#325）: `url.pathname` carries the base path, so compare it
+	// with each entry resolved the same way (`resolveAppPath`). ChronoGazer has
+	// no base path today, but the form is the template's: SvelteKit 3's
+	// `resolve('')` is `base + '/'`, not `base`, so stripping that prefix (what
+	// `sv migrate` turns a "strip `base`" step into) also strips the leading
+	// `/` of the remainder - nothing matches and every screen bounces to the
+	// first entry, a redirect loop on that entry itself. `guard.test.ts` pins
+	// this down.
 	if (snapshot.kind === 'publicViewer') {
-		const pathname = url.pathname;
-		const allowed = publicNavItems().some(
-			(item) => pathname === item.path || pathname.startsWith(item.path + '/')
-		);
+		const allowed = publicNavItems().some((item) => {
+			const itemPath = resolveAppPath(item.path);
+			return url.pathname === itemPath || url.pathname.startsWith(itemPath + '/');
+		});
 		if (!allowed) {
 			const firstPublicNavItem = publicNavItems()[0];
-			if (firstPublicNavItem) redirect(307, firstPublicNavItem.path);
+			if (firstPublicNavItem) redirect(307, resolveAppPath(firstPublicNavItem.path));
 		}
 	}
 
@@ -104,5 +112,5 @@ export async function load({ url }) {
 
 /** The retryable error page (banto #204): the session could not be verified. */
 function sessionCheckFailed(): never {
-	error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
+	error(503, SESSION_CHECK_FAILED_MESSAGE);
 }

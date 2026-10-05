@@ -13,8 +13,8 @@
 	 */
 	import { onMount } from 'svelte';
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
-	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '$lib/commands';
-	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '#lib/commands.js';
+	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 
 	// Built/read once per mount (i.e. once per open) - navItems is static and
 	// recency only needs to reflect what was true when the palette opened.

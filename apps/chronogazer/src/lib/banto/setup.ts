@@ -63,7 +63,7 @@ import type { Notifier, UiSettingsProvider } from '@banto/admin-core';
 // Safe to import in a plain browser (no Tauri runtime): only ever *called*
 // when isTauri() is true.
 import { invoke } from '@tauri-apps/api/core';
-import { toastStore } from '$lib/toast.svelte';
+import { toastStore } from '#lib/toast.svelte.js';
 import { CSRF_HEADER, isDemoBuild, isTauri, probeBackend } from './environment';
 import { resolveStartupTarget } from './startup';
 import { setStartupStatus, waitForStartupRetry } from './startupState.svelte';

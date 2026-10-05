@@ -16,7 +16,7 @@
  *    `error` がそもそも無かった）。
  *
  * 世代・境界・飛行中・ブロック単位の失敗・世代違いの応答の排除は
- * `$lib/blockCache`（`/events` と共通）が行い、ここには `/audit-log` 固有の
+ * `#lib/blockCache`（`/events` と共通）が行い、ここには `/audit-log` 固有の
  * 部分だけを置く:
  *
  * - **保持期間の削除によるスナップショット失効**（[`AUDIT_POLICY`]）。境界
@@ -36,7 +36,7 @@
  * （`core/migrations/0004_audit_log.sql`）なので単調増加かつ削除後も
  * 再利用されない - 境界が「集合のメンバー」を決められる前提はこれ。
  */
-import type { AuditLogEntry } from '$lib/banto/auditLogAdmin';
+import type { AuditLogEntry } from '#lib/banto/auditLogAdmin.js';
 import {
 	BlockLoader,
 	isGenerationHalted,
@@ -44,7 +44,7 @@ import {
 	type BlockFetcher,
 	type BlockOutcome,
 	type BlockPolicy
-} from '$lib/blockCache';
+} from '#lib/blockCache.js';
 
 /**
  * ブロック 1 つの取得が行を入れられなかったときの持ち方。

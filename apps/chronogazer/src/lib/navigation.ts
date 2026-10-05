@@ -27,9 +27,40 @@
  * 見るだけの画面（監視・ヒストリカル・イベント）。タグ設定（PLC の接続先・
  * アドレスを含む設定画面）・ユーザー管理・監査ログ・設定は出さない
  * （admin-template が「ツリー」と設定を出さないのと同じ考え方）。
+ *
+ * banto v4.0.0（SvelteKit 3、#325）: admin-template v4.0.0 の `navigation.ts` の
+ * `AppPath` と `resolveAppPath()` を写した。表の `path`・`activeMatch` は
+ * SvelteKit 3 が生成する `Path` から作る `AppPath` で型付けし（存在しない
+ * ルートは型エラー）、URL にするとき（`href`・`goto()`・`redirect()`）は
+ * `resolveAppPath()` を通す。ChronoGazer は `base` を使わない（ルート直下に
+ * 配信する）ので今は `path` そのままと同じ URL になるが、比べる側
+ * （`(app)/+layout.ts` の閲覧公開のガード）も `resolveAppPath()` を通した
+ * 値と `url.pathname` を比べる形にしておく（上流の移行で、自動移行が
+ * `resolve('')` で「base を外す」処理に書き換えてガードが壊れた、#325）。
  */
+import { resolve } from '$app/paths';
+import type { Path, ResolvedPathname } from '$app/types';
+
+/**
+ * An app route's pathname as written in the nav/category tables: a leading
+ * `/` and no base path (e.g. `/monitor`, `/settings/appearance`). Typed from
+ * SvelteKit 3's generated `Path` union, so a table entry pointing at a route
+ * that does not exist is a type error.
+ */
+export type AppPath = `/${Path}`;
+
+/**
+ * `AppPath` -> the href / `goto()` / `redirect()` target with the base path
+ * prefixed (SvelteKit 3 `resolve()`, which takes the pathname without its
+ * leading `/`). Use this, not string concatenation, wherever an `AppPath`
+ * leaves the app as a URL.
+ */
+export function resolveAppPath(path: AppPath): ResolvedPathname {
+	return resolve(path.slice(1) as Path);
+}
+
 export interface NavItem {
-	path: string;
+	path: AppPath;
 	label: string;
 	/** Placeholder icon (emoji) until an icon set is decided. */
 	icon: string;
@@ -42,7 +73,7 @@ export interface NavItem {
 	 * prefix」を表す - 通常は同じだが、`設定` のようにクリック時の遷移先が
 	 * サブパスでも、判定は親パス配下すべてを対象にしたい場合に分ける。
 	 */
-	activeMatch?: string;
+	activeMatch?: AppPath;
 	/**
 	 * Opt-in allowlist for the LAN "viewer-public" session
 	 * (viewer-public-plan §3.1-6, ADR-0012): `sessionStore.publicViewer`

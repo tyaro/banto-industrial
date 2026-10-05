@@ -10,8 +10,8 @@
  * でしか使えないため、プレーン TS のこのファイルには置けない。
  */
 import { isProviderError } from '@banto/admin-core';
-import { isAdmin } from '$lib/permissions';
-import { sessionStore } from '$lib/session.svelte';
+import { isAdmin } from '#lib/permissions.js';
+import { sessionStore } from '#lib/session.svelte.js';
 
 /**
  * 元 `+page.svelte` に重複していた `errorMessage()` を1本化しただけで、

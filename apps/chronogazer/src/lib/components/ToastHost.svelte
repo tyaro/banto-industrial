@@ -1,6 +1,6 @@
 <script lang="ts">
 	/** Fixed bottom-right toast stack (spec §3.4 notification sink), mounted once in the root layout. */
-	import { toastStore } from '$lib/toast.svelte';
+	import { toastStore } from '#lib/toast.svelte.js';
 </script>
 
 <div class="toast-host" role="status" aria-live="polite">

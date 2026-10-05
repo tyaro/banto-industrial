@@ -17,10 +17,10 @@
 	 * `authError` 表示と同じ見た目（`authSettingsStore.svelte.ts` の doc
 	 * comment参照）。保存操作自体の失敗は従来どおりトーストのみ。
 	 */
-	import { invalidateAll } from '$app/navigation';
-	import { isTauri } from '$lib/banto/setup';
-	import { toastStore } from '$lib/toast.svelte';
-	import { applyAuthSettings, type AuthDisabledRole } from '$lib/banto/authAdmin';
+	import { refreshAll } from '$app/navigation';
+	import { isTauri } from '#lib/banto/setup.js';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { applyAuthSettings, type AuthDisabledRole } from '#lib/banto/authAdmin.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { canManageAuthMode, errorMessage } from './shared';
 
@@ -70,7 +70,7 @@
 			// identity・役割・`authDisabled` は SessionController の確定からの
 			// `$derived`（`authDisabled` は `auth_resolve` の `kind === 'local'`）で、
 			// この適用の答えから代入すると古い答えが書き戻しうる（S-61）。
-			// `invalidateAll()` で load をすべて走らせ直す:
+			// `refreshAll()`（banto v4.0.0 で `invalidateAll()` から置き換え）で load をすべて走らせ直す:
 			// - `(app)/+layout.ts` の `resolveSettled` が確定し直す。provider は
 			//   この `seq` の前進を観測していないので最初の答えは捨てられ、
 			//   追いつき（S-84）の後の答えで確定する。OFF にして Local が終わって
@@ -84,7 +84,7 @@
 			// トーストは load の再実行の前に出す（admin-template と同じ順）。後だと、
 			// OFF でログイン画面へ移った後に出る・確認できないとき最大 10 秒遅れる。
 			toastStore.push('success', '認証設定を更新しました');
-			await invalidateAll();
+			await refreshAll();
 		} catch (err) {
 			// 排他違反（LANアクセス有効中の有効化など）はサーバ側の日本語メッセージ
 			// (kind: 'other') をそのままトーストに出す（spec M11）。
