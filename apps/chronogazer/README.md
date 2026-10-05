@@ -174,6 +174,19 @@ banto の**セキュリティヘッダー**（CSP・`X-Content-Type-Options: nos
 `with_security_headers`、#500）が付く。CSP は `connect-src 'self'` などで同一
 オリジンの通信だけを許す（admin-template と同じ）。
 
+デスクトップ版の窓（WebView）にも、同じ CSP に Tauri の IPC（`connect-src` の
+`ipc: http://ipc.localhost`）を足したものを掛けている（`src-tauri/tauri.conf.json` の
+`app.security.csp`、#505。admin-template と同じ）。2 つは揃えておくこと
+（`src-tauri` のテスト `window_csp_is_the_served_csp_plus_tauri_ipc` が banto の応答の
+CSP と突き合わせる）。Tauri はビルド時に HTML のインライン script のハッシュ（と
+`<style>` の nonce）を CSP に足すので、`script-src` の `'unsafe-inline'` は実際には
+効かない（インライン script は `app.html` の先頭のテーマ設定と SvelteKit の起動処理、
+`static/legacy-db.html` の 1 つで、どれもハッシュで通る）。Hub への接続は Rust 側で
+行うので、窓から Hub へ直接つなぐことはない。**`tauri dev`（Vite の devUrl）では窓の
+CSP は掛からない**（Tauri は自前のアセットの応答にだけ CSP を付ける）ので、CSP の
+確認はリリース相当のビルド（`pnpm tauri build --no-bundle`、手早くは `--debug` も可）で
+行う。
+
 ## Hub 接続：キーが使えなくなったとき
 
 設定の「Hub 接続」で選んだタグを banto-hub から購読しているとき、Hub が

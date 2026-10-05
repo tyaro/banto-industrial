@@ -4287,6 +4287,45 @@ mod tests {
         assert_eq!(main["create"], false);
         assert_eq!(windows.len(), 1);
     }
+
+    /// #505: 窓（WebView）の CSP は、組み込みサーバーの応答の CSP（banto の
+    /// `with_security_headers`、#500）に Tauri の IPC（`connect-src` の
+    /// `ipc: http://ipc.localhost`）を足しただけのものにする（admin-template の
+    /// `tauri.conf.json` と同じ形）。banto が応答の CSP を変えたら、ここが落ちて
+    /// 窓の側を揃え忘れないようにする。
+    #[tokio::test]
+    async fn window_csp_is_the_served_csp_plus_tauri_ipc() {
+        use tower::ServiceExt;
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let window_csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("app.security.csp is set");
+
+        let router = with_security_headers(
+            axum::Router::new().route("/", axum::routing::get(|| async { "" })),
+        );
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let served_csp = response
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .expect("served CSP");
+
+        let expected = served_csp.replace(
+            "connect-src 'self'",
+            "connect-src 'self' ipc: http://ipc.localhost",
+        );
+        assert_ne!(expected, served_csp, "served CSP: {served_csp}");
+        assert_eq!(window_csp, expected);
+    }
     use std::path::PathBuf;
 
     impl AppState {
