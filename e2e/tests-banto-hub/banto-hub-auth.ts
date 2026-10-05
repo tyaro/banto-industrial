@@ -16,7 +16,7 @@
  */
 import type { APIRequestContext, Locator, Page } from '@playwright/test';
 
-/** 管理系 REST 全体で共通の CSRF ヘッダー（`$lib/banto/setup.ts::CSRF_HEADER` と同型）。 */
+/** 管理系 REST 全体で共通の CSRF ヘッダー（`#lib/banto/setup.ts::CSRF_HEADER` と同型）。 */
 export const CSRF_HEADERS = { 'X-Banto-Client': 'banto' } as const;
 
 /** `createHttpAuthProvider` の既定 `storageKey`（`remember` 未指定時の保存先）。 */
