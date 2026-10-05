@@ -23,7 +23,11 @@
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import { isTauri } from '#lib/banto/setup.js';
-	import { applyServerSettings, getServerStatus, type ServerStatus } from '#lib/banto/serverAdmin.js';
+	import {
+		applyServerSettings,
+		getServerStatus,
+		type ServerStatus
+	} from '#lib/banto/serverAdmin.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';

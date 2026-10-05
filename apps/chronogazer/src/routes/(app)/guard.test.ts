@@ -30,7 +30,9 @@ vi.mock('@banto/admin-core', () => ({
 	resolveSettled: mocks.resolveSettled,
 	grantFallback: mocks.grantFallback
 }));
-vi.mock('#lib/settings.svelte.js', () => ({ settings: { syncFromProvider: vi.fn(async () => {}) } }));
+vi.mock('#lib/settings.svelte.js', () => ({
+	settings: { syncFromProvider: vi.fn(async () => {}) }
+}));
 vi.mock('#lib/navigation.js', () => ({ publicNavItems: () => [] }));
 
 import { load } from './+layout';

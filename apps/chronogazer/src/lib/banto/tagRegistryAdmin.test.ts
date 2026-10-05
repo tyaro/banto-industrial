@@ -5,7 +5,7 @@
  * の doc comment 参照）が採る回避策に倣う: `tagRegistryAdmin.ts` は
  * `@tauri-apps/api/core`（Tauri IPC、テスト環境には無い）・`@banto/admin-core`
  * （Svelte 5 rune を使う `.svelte.ts` を推移的に import する）・`./setup`
- * （`#lib/toast.svelte.js` を import する）をトップレベルで import しており、
+ * （`#lib/toast.svelte.ts` を import する）をトップレベルで import しており、
  * このリポジトリの最小 vitest 構成（`@sveltejs/vite-plugin-svelte` 無し、
  * `#lib` エイリアス無し）ではそのままロードできない。3つとも `vi.mock` で
  * 軽量なフェイクに差し替えることで、実モジュールの副作用を評価せずに
