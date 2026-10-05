@@ -79,7 +79,7 @@ struct AppState {
     /// place that establishes a session states which kind it is, and every
     /// read goes through [`current_session`].
     ///
-    /// banto v2.0.0（banto #260, banto の docs/session-controller-design.md
+    /// banto v2.0.0（banto #260, banto の docs/design/session-controller-design.md
     /// §5.3, I-11 - admin-template の同名フィールドを写したもの）: wrapped in
     /// an [`AuthSlot`] with a write sequence, so a command that `.await`s
     /// between reading the slot and writing it (login's argon2 verify,
@@ -233,7 +233,7 @@ struct AuthResolveResult {
 /// The webview session slot (banto #260, design §5.3, I-11).
 ///
 /// このファイルで「design §x」「I-n」「S-n」と書くのは banto リポジトリの
-/// `docs/session-controller-design.md`（v2.0.0）の節・不変条件・シナリオ番号。
+/// `docs/design/session-controller-design.md`（v2.0.0）の節・不変条件・シナリオ番号。
 /// 実装は admin-template（`apps/admin-template/src-tauri/src/lib.rs`）の写し。
 ///
 /// `seq` advances on every write that is MEANT to change the binding -
@@ -6207,7 +6207,7 @@ mod tests {
 
     // --- banto #260: the session slot's seq and compare-and-set ------------
     //
-    // docs/session-controller-design.md §4.3/§8.3: the command BODIES are
+    // docs/design/session-controller-design.md §4.3/§8.3: the command BODIES are
     // driven with their slow `.await` (verify / first-user setup / auth-mode
     // read) held at an injected gate, so the completion order is fixed by
     // the test, not by the scheduler.
