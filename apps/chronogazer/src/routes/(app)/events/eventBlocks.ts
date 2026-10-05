@@ -36,12 +36,13 @@
  * 古い行（小さい `id`）が消えて末尾側の `OFFSET` がずれる。削除を実装する
  * ときは、この取得方法（サーバー側の `read_events` も含めて）を見直すこと
  * （`/audit-log` は削除があるので、同じ境界の総件数が減ったらスナップショット
- * 失効として採らない - `routes/(app)/audit-log/auditBlocks.ts`）。
+ * 失効として採らない - 今は banto の `SnapshotListResource` が判断する）。
  *
  * ### 汎用部との関係（#410）
  *
  * 世代・境界・飛行中・ブロック単位の失敗・世代違いの応答の排除は、
- * `/audit-log` と共通の `#lib/blockCache` に出した。ここに残るのは `/events`
+ * `#lib/blockCache` に出した（当時は `/audit-log` と共通。`/audit-log` は
+ * その後 banto の `SnapshotListResource` に寄せた）。ここに残るのは `/events`
  * 固有の部分だけ: 失敗の型（`Readout` の 3 状態 + 往復の失敗）、境界の
  * 食い違いの扱い（[`BOUNDARY_MISMATCH_MESSAGE`]）、画面に出す値
  * （[`viewState`]）。**挙動は #409 のときから変えていない**（#409 の表テストが

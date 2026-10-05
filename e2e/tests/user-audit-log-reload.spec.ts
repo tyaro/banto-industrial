@@ -4,8 +4,10 @@
  * 修正前は「再読み込み」ボタンが無く、総件数が 0 のあいだ `BantoGrid` が
  * 通知する表示範囲 `{0, 0}` では要求が 1 本も出なかった。そのため
  * **絞り込みで 0 件になった後に絞り込みを外しても 0 件のまま**、一覧を開いた
- * 後に記録された操作も画面からは取り込めなかった。ブロックキャッシュの判断は
- * `auditBlocks.test.ts`（vitest）が固定しているが、ボタンが**出ているか**と、
+ * 後に記録された操作も画面からは取り込めなかった。ブロック読み込みの判断は
+ * banto の `SnapshotListResource`（banto #248）に寄せてあり、ChronoGazer 側の
+ * 継ぎ目は `apps/chronogazer/src/lib/banto/auditLogAdmin.test.ts`（vitest）が
+ * 固定しているが、ボタンが**出ているか**と、
  * `BantoGrid` が実際に `{0, 0}` を通知する経路は、画面を操作しないと確かめ
  * られない（このリポジトリには DOM テストの足場が無く、Playwright が等価物 -
  * `user-events-reload.spec.ts` と同じ判断）。
