@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-04（§2 に「banto を上げるときの `cargo update -p banto-*` は無関係な crate を付け替える」を追加。banto v3.0.0 追従で `windows-sys`/`socket2` が降格された）
+最終更新: 2026-10-05（§2-6 に「`sv migrate` は最後にルートの `pnpm run format`（= `prettier --write .`）を自動で走らせる」を追加。banto-hub の SvelteKit 3 移行で対象外の 4 ファイルが改行だけ書き換わった）
+2026-10-04（§2 に「banto を上げるときの `cargo update -p banto-*` は無関係な crate を付け替える」を追加。banto v3.0.0 追従で `windows-sys`/`socket2` が降格された）
 2026-09-25（§5 に「時間切れで見捨てた非同期処理の副作用は残る」を追加。#447 のオーナーレビュー）
 2026-09-24（§2-8 の「E2E は同時に 1 本だけ」に「リポジトリをまたいでも」を追記。banto と banto-industrial の E2E が同じポートを使い、#234 と #429 の作業でぶつかった）
 2026-09-24（relay-wright を main から外しタグ `archive/relay-wright-2026-09-24` に退避したのに合わせて §7 を更新）
@@ -43,6 +44,7 @@
    - [ ] `@banto/*` を上げた・足したら `node scripts/check-banto-optimize-deps.mjs`（`.svelte.ts` を持つパッケージが `vite.config.ts` の `optimizeDeps.exclude` から漏れていないか。漏れは `pnpm dev` だけが壊れ、build・E2E では出ない。CI の frontend-hub / frontend-chronogazer も実行、#478）
 6. [ ] `pnpm exec prettier --write <編集した md/ts/svelte 全部>` → **整形後にもう一度 test と eslint**（整形が壊すことがある）
    - [ ] **`prettier --check .` をリポジトリ全体にかけない**（**`prettier --write .` は絶対にかけない**）。Windows の作業ツリーは CRLF なので、**main が CI で緑でもローカルでは 340 件の「差分あり」が出る**（CI は Linux/LF）。これを整形漏れと誤認して `--write .` を実行すると、**全ファイルの改行を書き換えた巨大な差分**になる。対象は**編集したファイルだけ**に絞る。全体を比べたいときは **`--end-of-line auto` を付ける**（2026-09-20: prettier 3.9.8 が整形結果を変えるかを調べて 340 件に当たった。**現行版で同じコマンドを回す対照**を取ったら同じ 340 件で、原因は版ではなく改行だった。**依存を上げる前後の比較は、必ず同じ条件で対照を取る**）。
+   - [ ] **`npx sv migrate ...` は最後にルートの `pnpm run format`（= `prettier --write .`）を自分で走らせる**（`--no-install` でも止まらない）。2026-10-05 の banto-hub の SvelteKit 3 移行で、移行対象外の `.github/scripts/*.mjs`・`scripts/*.mjs` 4 ファイルが改行だけの差分になった。実行後は `git status --short` で対象アプリ外の変更を `git checkout --` で戻してからコミットする。
 7. [ ] E2E の前に必ず: `pnpm --filter <app> build` → **`cargo build -p <core> --bin <bin> --features embed-ui`**（**`--features embed-ui` を落とすと smoke が全滅する**）
    - [ ] **chronogazer の E2E（`pnpm e2e`）は、加えて `cargo build -p chronogazer-core --example dev_plc`**（2 つ目の `webServer` = 開発用 PLC。R1-C の C-4 で追加。ビルドし忘れると `webServer` の起動で全体が落ちる）
 8. [ ] **緑の確認は 1 回だけ**（通るまで回し直さない）。**反証（修正を戻して落ちるかの確認、§5）は、理由を書けば別に回してよい**。`describe.serial` は最初の失敗で以降を skip するので、反証が複数本あると 1 回では取れない（#409 で 3 回実行した。2026-09-23 オーナー決定）。反証の実行は PR 本文に「何を戻して、どのテストが落ちたか」を書く。実行前に残プロセスが 0 で、ポートが空いていることを確認（Windows: `Get-Process <bin>` / POSIX: `pgrep -f <bin>`）。**同時に 2 つ走らせない**。**E2E は worktree やエージェントが違っても同時に 1 本だけ**（同じ固定ポートを取り合う。2026-09-23 オーナー指示）。**リポジトリをまたいでも**（banto と banto-industrial の E2E は同じポート 8798 / 8799 / 4173 を使う。2026-09-24 に #234 と #429 の作業でぶつかった）。失敗の詳細は `e2e/test-results-*/<test>/error-context.md`

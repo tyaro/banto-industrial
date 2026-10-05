@@ -18,7 +18,8 @@ ChronoGazer のサービスと REST ルーターを banto のものに置き換�
 banto-hub のサービスと REST ルーターを banto のものに置き換えたこと（I3'、実装済み）を追記。
 2026-10-05: §5 の起動時の環境判定に、banto v3.0.1（#321）で保護画面を直接開いたときの
 真っ白が解消したこと（実装済み）を反映。同日: §5 に ChronoGazer の SvelteKit 3 移行（banto v4.0.0、
-実装済み。banto-hub の npm は v3.0.1 のままの移行中）を追記。
+実装済み。banto-hub の npm は v3.0.1 のままの移行中）を追記。同日: §5 に banto-hub の SvelteKit 3 移行
+（実装済み。両アプリの npm が v4.0.0 に揃い、移行中のずれは解消）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -324,6 +325,16 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   `navigationSettled.svelte.ts` を写し、#321 の起動待ちのやり直しと配線①はナビゲーションが終わるまで
   `refreshAll()` を始めない。banto-hub の npm は v3.0.1・SvelteKit 2 のまま（移行中の一時的なずれ。
   [README.md](README.md)「現状ひとめ」。banto-hub の移行は次の PR）。
+
+- **banto-hub を SvelteKit 3 に移行（2026-10-05、実装済み。banto v4.0.0 の #325・#326）**: banto-hub の npm
+  `@banto/*` を v4.0.0 に上げ、ChronoGazer と同じ手順（`sv migrate sveltekit-3` → 手直し）で移行した。これで
+  両アプリの Rust・npm が v4.0.0 に揃い、上の移行中のずれは解消。`AppPath` / `resolveAppPath()` を写し、アプリ内の
+  `goto()`・`redirect()`・`href` はすべて `resolveAppPath()` 経由（存在しないルートは型エラー）。banto-hub には
+  閲覧公開が無く、ガード（`(app)/+layout.ts`）にパスの比較は無いので、自動移行の `resolve('')` の罠は
+  /login への redirect の行き先で確かめた（`resolveAppPath()` を `resolve('')` への連結に壊すとガード・
+  `monitorHref` の単体テストが落ちる）。#326 の `navigationSettled.svelte.ts` を写し、配線①はナビゲーションが
+  終わるまで `refreshAll()` を始めない（タグ画面の未保存の変更の確認 `beforeNavigate` を飛ばさせない）。
+  単体テストの vitest は `$app/paths` を読むため `sveltekit()` プラグインに替えた。
 
   続き（未着手）: 初回セットアップ画面。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
