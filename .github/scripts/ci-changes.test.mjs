@@ -66,8 +66,6 @@ const TABLE = [
 		['apps/chronogazer/src/lib/foo.ts', 'apps/chronogazer/core/src/lib.rs'],
 		{
 			...NONE,
-			// hub の blockCache.sync.test.ts が chronogazer の blockCache.ts を読む
-			run_frontend_hub: true,
 			run_frontend_chronogazer: true,
 			run_rust: true,
 			rust_args: CHRONO_RUST,

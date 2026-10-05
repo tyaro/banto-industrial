@@ -141,9 +141,7 @@ export function derive(a) {
 	return {
 		// 判定したら必ず走る（repo 全体の ESLint + Prettier。docs の整形もここ）。
 		run_lint_format: true,
-		// apps/banto-hub/src/lib/blockCache.sync.test.ts が chronogazer の
-		// blockCache.ts を読むので、chronogazer の変更でも hub の frontend を回す。
-		run_frontend_hub: full || a.frontend_all || a.hub || a.chronogazer,
+		run_frontend_hub: full || a.frontend_all || a.hub,
 		run_frontend_chronogazer: full || a.frontend_all || a.chronogazer,
 		run_rust: runRust,
 		rust_args: !runRust
