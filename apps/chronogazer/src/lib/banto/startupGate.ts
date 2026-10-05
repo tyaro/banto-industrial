@@ -1,5 +1,5 @@
-// banto v3.0.1（タグ v3.0.1 = 7eea5bc）の admin-template
-// `apps/admin-template/src/lib/banto/startupGate.ts` を無改変でコピー（banto #321）。
+// banto v4.0.0（タグ v4.0.0 = 4df169c）の admin-template
+// `apps/admin-template/src/lib/banto/startupGate.ts` を無改変でコピー（banto #321、#325 の `error()` の形）。
 /**
  * Startup gate for route guards (Issue #321, follow-up to #286).
  *
@@ -19,7 +19,7 @@
  * - keeps the splash up ("starting…" -> "cannot connect" + reconnect, #286),
  *   never the error page, while the deferral is the current error
  *   ({@link isStartupDeferral}), and
- * - re-runs the loads (`invalidateAll()`) once `bantoReady` resolves - the
+ * - re-runs the loads (`refreshAll()`) once `bantoReady` resolves - the
  *   guard then confirms the session as usual and the SAME URL opens (or goes
  *   to /login, the public viewer, or the session-check retry page).
  *
@@ -35,7 +35,7 @@ import { error } from '@sveltejs/kit';
  */
 export function deferUntilStarted(ready: boolean, message: () => string): void {
 	if (ready) return;
-	error(503, { message: message(), startupPending: true });
+	error(503, message(), { startupPending: true });
 }
 
 /** Whether the current page error is the startup deferral (and not a real error). */

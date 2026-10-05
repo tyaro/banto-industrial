@@ -12,13 +12,14 @@
  * `labelKey` ではなく日本語の `label` を直接持たせている。
  */
 import { redirect } from '@sveltejs/kit';
+import { resolveAppPath, type AppPath } from '#lib/navigation.js';
 
 export type SettingsCategoryId =
 	'appearance' | 'account' | 'connectivity' | 'data' | 'security' | 'hub' | 'collect';
 
 export interface SettingsCategory {
 	id: SettingsCategoryId;
-	path: string;
+	path: AppPath;
 	label: string;
 }
 
@@ -46,5 +47,5 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
 export function guardCategory(categories: SettingsCategory[], id: SettingsCategoryId): void {
 	if (categories.some((category) => category.id === id)) return;
 	const first = categories[0];
-	if (first) redirect(307, first.path);
+	if (first) redirect(307, resolveAppPath(first.path));
 }

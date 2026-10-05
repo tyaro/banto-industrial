@@ -12,7 +12,7 @@
  * ため、`toThrow`/`try-catch` で status/location を検証する。
  *
  * PR #372 Copilot レビュー指摘（認証モード変更後に load を再実行して
- * categories を再計算する修正。banto v2 移行 PR1a 以降は `invalidateAll()`）の回帰固定も
+ * categories を再計算する修正。banto v2 移行 PR1a 以降は `invalidateAll()`、banto v4.0.0 から `refreshAll()`）の回帰固定も
  * ここに含める: `security` を含む可視カテゴリから `security` が抜けた
  * 状態で `guardCategory` を呼ぶケース。実 DOM での固定は `security`
  * セクションの表示・トグル自体が Tauri デスクトップ backend を要求し、
@@ -84,9 +84,9 @@ describe('guardCategory', () => {
 		expect(() => guardCategory([], 'appearance')).not.toThrow();
 	});
 
-	it('認証モード OFF 後に invalidateAll() で再計算された categories（security が抜けた配列）でも先頭の可視カテゴリへ redirect する（PR #372 Copilot レビュー指摘の回帰固定）', () => {
+	it('認証モード OFF 後に refreshAll() で再計算された categories（security が抜けた配列）でも先頭の可視カテゴリへ redirect する（PR #372 Copilot レビュー指摘の回帰固定）', () => {
 		// `SecuritySection.svelte` が認証モードの変更成功後に呼ぶ
-		// `invalidateAll()` は `+layout.ts` の `load` を
+		// `refreshAll()` は `+layout.ts` の `load` を
 		// 再実行させ、`security/+page.ts` はその再実行後の新しい `categories`
 		// （security を含まない）で `guardCategory` を呼ぶ - ここではその
 		// 「invalidate 後」の状態を直接再現する。実 DOM 固定は `security`

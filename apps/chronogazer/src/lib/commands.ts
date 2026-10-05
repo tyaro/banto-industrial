@@ -17,7 +17,7 @@ import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
 import { logoutAndLeave } from './banto/logout.svelte';
 import { notifyLogoutOutcome } from './banto/logoutNotice';
-import { navItems, publicNavItems } from './navigation';
+import { navItems, publicNavItems, resolveAppPath } from './navigation';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
 import { isAdmin } from './permissions';
@@ -36,7 +36,7 @@ function navigationCommands(): PaletteCommand[] {
 				? publicNavItems().some((entry) => entry.path === item.path)
 				: !item.adminOnly || isAdmin(sessionStore.role),
 		run: () => {
-			void goto(item.path);
+			void goto(resolveAppPath(item.path));
 		}
 	}));
 }

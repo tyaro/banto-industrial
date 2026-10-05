@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { goto, invalidateAll } from '$app/navigation';
+	import { goto, refreshAll } from '$app/navigation';
 	import { getSessionController, notify } from '@banto/admin-core';
 	import { isLeavingForLogin, leaveForLogin } from '#lib/banto/logout.svelte.js';
 	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
+	import { isNavigationSettled } from '#lib/banto/navigationSettled.svelte.js';
 	import Header from '#lib/components/Header.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
@@ -25,11 +26,11 @@
 	// is rebuilt from scratch (`{#key}`) once the next session's loads
 	// complete - so nothing of the old user's page (in-memory state, unsaved
 	// input) survives into the next session. A guard re-run that confirms the
-	// same session keeps the generation, so an ordinary `invalidateAll()`
+	// same session keeps the generation, so an ordinary `refreshAll()`
 	// never rebuilds the page.
 	//
 	// Wiring ①: whenever the controller's generation differs from the one
-	// this page's load confirmed, re-run the loads (`invalidateAll()`), which
+	// this page's load confirmed, re-run the loads (`refreshAll()`), which
 	// confirm the session again and send the screen to /login, the retryable
 	// error page, or the rebuilt page of the (new) user. This covers every
 	// way the generation moves - a background revocation confirmed `none`
@@ -43,14 +44,23 @@
 	// and an invalidation started here would win over the navigation
 	// (`#lib/banto/logout.svelte.ts`). `isLeavingForLogin()` is reactive, so a
 	// generation change skipped meanwhile is handled once it ends.
+	// banto #326（v4.0.0）: nor while a navigation is in flight (another tab's
+	// login or a background revocation can land in the middle of one, and
+	// this layout is mounted at the end of one). A `refreshAll()` started then
+	// makes SvelteKit abort the navigation - the user's move is lost - and
+	// skip `beforeNavigate` afterwards (`#lib/banto/navigationSettled.svelte.ts`).
+	// `isNavigationSettled()` is reactive too: once the navigation completes,
+	// this compares the generation ITS load confirmed and re-runs only if that
+	// one is stale.
 	const sessionController = getSessionController();
 	let requestedFor = -1;
 	$effect(() => {
 		const generation = sessionController.snapshot.generation;
 		if (isLeavingForLogin()) return;
+		if (!isNavigationSettled()) return;
 		if (generation !== data.sessionGeneration && requestedFor !== generation) {
 			requestedFor = generation;
-			void invalidateAll();
+			void refreshAll();
 		}
 	});
 

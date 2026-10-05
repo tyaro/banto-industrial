@@ -9,19 +9,19 @@
 	 *
 	 * banto v2.0.0（#260 実装-3、design §6.1、S-81、I-24）: 「再試行」は
 	 * `location.reload()` ではなく、この文書の中で load を走らせ直す
-	 * `invalidateAll()`。SessionController を保ったまま再試行するので、この
+	 * `refreshAll()`（v4.0.0 まで `invalidateAll()`）。SessionController を保ったまま再試行するので、この
 	 * 画面の間に確定したユーザーの変更（`pendingOwnerChange`）は、保護
 	 * レイアウトが再び mount したときに通知される。ページ全体の再読み込み
 	 * （ブラウザの再読み込み）では controller が作り直され、その記録は残らない
 	 * （admin-template の同名ファイルと同じ）。
 	 */
-	import { invalidateAll } from '$app/navigation';
+	import { refreshAll } from '$app/navigation';
 	import { page } from '$app/state';
 
 	// 再試行の間も無効にしない: 返ってこない再試行が出口まで塞がないように
 	// （もう一度押せば新しい再試行が始まる。ブラウザの再読み込みも使える）。
 	function retry(): void {
-		void invalidateAll();
+		void refreshAll();
 	}
 </script>
 
