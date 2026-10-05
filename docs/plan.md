@@ -16,12 +16,14 @@ ChronoGazer のサービスと REST ルーターを banto のものに置き換�
 （前の決定を変更）を追記。同日: §5 に起動時の環境判定を banto に寄せたこと
 （I2c、実装済み。一時的に届かないときは demo に落とさず起動待ちで再試行）を追記。同日: §5 に
 banto-hub のサービスと REST ルーターを banto のものに置き換えたこと（I3'、実装済み）を追記。
+2026-10-05: §5 の起動時の環境判定に、banto v3.0.1（#321）で保護画面を直接開いたときの
+真っ白が解消したこと（実装済み）を反映。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
-地図は [README.md](README.md)**（2026-10-04 更新。本文の T 系表は 2026-08-08 時点の
+地図は [README.md](README.md)**（2026-10-05 更新。本文の T 系表は 2026-08-08 時点の
 まま — 実装状況の正は banto-hub-remaining-plan.md/banto-hub-desktop-plan.md）
 最終検証日(コード照合): 2026-09-01
 
@@ -304,9 +306,10 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   （2 回）→「サーバーに接続できません」+「再接続」にした。demo になるのは `VITE_BANTO_DEMO=1` の
   ビルドと、同じオリジンが「`/api` は無い」と確定的に答えたときだけ。ChronoGazer には demo を
   静的に公開する経路が無いので、`VITE_BANTO_DEMO=1` を設定する場所は無い。banto-hub は `server`
-  固定で probe しないので対象外。既知の制約（上流と同じ）: スプラッシュが出るのは `/login` など
-  保護されていない画面だけで、`/`・`/monitor` などを開くと `(app)` のガードの `load` が判定を待つため
-  届かない間は真っ白のまま（demo には落ちない。再読み込みで開く）。
+  固定で probe しないので対象外。保護画面を直接開いたとき、届かない間は真っ白のまま
+  だった既知の制約は、banto v3.0.1（#321）の追従で解消した（2026-10-05、`(app)` のガードが判定を待たず
+  起動待ちの印付きの 503 で延期し、ルートのレイアウトがスプラッシュを出して起動後に同じ URL をやり直す。
+  `startupGate.ts`）。
 
   続き（未着手）: 初回セットアップ画面。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・

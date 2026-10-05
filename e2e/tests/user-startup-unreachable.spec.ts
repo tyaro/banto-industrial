@@ -14,12 +14,14 @@
  * は全スペックで共有しているので、止めると後続が壊れる。「サーバーに届かない」
  * は `GET /api/auth/check`（起動時の probe）を `abort` して作る。
  *
- * **なぜ `/login` を開くのか**: スプラッシュは root の `+layout.svelte` の
- * `{#await bantoReady}` が出す。`/`・`/monitor` などは `(app)/+layout.ts` の
- * `load` が `bantoReady` を待つので、SvelteKit はその間 root のレイアウトも
- * 描かず、届かない間は真っ白のまま（admin-template v3.0.0 と同じ既知の制約。
- * apps/chronogazer/README.md「起動時の判定」）。スプラッシュが出るのは保護
- * されていない画面だけなので、ここでは `/login` で確かめる。
+ * **なぜ `/login` と `/monitor` の両方を開くのか**: スプラッシュは root の
+ * `+layout.svelte` の `{#await bantoReady}` が出す。保護画面（`/monitor` など）は
+ * 以前は `(app)/+layout.ts` の `load` が `bantoReady` を待ち、SvelteKit はその間
+ * root のレイアウトも描かず、届かない間は真っ白のままだった（banto v3.0.0 の
+ * 既知の制約）。banto v3.0.1（#321）で、ガードは待たずに起動待ちの印付きの 503
+ * を投げて延期し、root のレイアウトがその間スプラッシュを出して、起動が終わると
+ * `invalidateAll()` で同じ URL をやり直すようになった。テスト 1 は保護されて
+ * いない `/login`、テスト 2 は保護画面を直接開く経路を確かめる。
  *
  * **server モードで開いたことの確かめ方**: 再接続の後、smoke.spec.ts が作った
  * 実アカウント（`e2e-admin`）でログインできること。demo の AuthProvider は
@@ -30,13 +32,13 @@
  * ならない（`playwright.config.ts` は `workers: 1`/`fullyParallel: false` で
  * ファイル名の辞書順に実行する）。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type Route } from '@playwright/test';
 
 // smoke.spec.ts が初回セットアップで作成する唯一の管理者アカウント。
 const ADMIN_USERNAME = 'e2e-admin';
 const ADMIN_PASSWORD = 'E2eAdminPass1';
 
-test.describe.serial('chronogazer 起動時の環境判定（banto #286）', () => {
+test.describe.serial('chronogazer 起動時の環境判定（banto #286・#321）', () => {
 	let page: Page;
 
 	test.beforeAll(async ({ browser }) => {
@@ -78,5 +80,32 @@ test.describe.serial('chronogazer 起動時の環境判定（banto #286）', () 
 		await page.getByLabel('パスワード').fill(ADMIN_PASSWORD);
 		await page.getByRole('button', { name: 'ログイン' }).click();
 		await expect(page).toHaveURL(/\/monitor$/);
+	});
+
+	// banto #321: 保護画面を直接開いたとき、サーバーに届かない間も真っ白に
+	// ならず「起動中…」→「サーバーに接続できません」＋再接続が出て、届くように
+	// なってから再接続すると、その保護画面（`/monitor`）がセッションを保ったまま
+	// 開く。テスト 1 でログイン済み（同じタブの sessionStorage にトークンがある）。
+	test('2. 保護画面を直接開いても、届かない間は起動待ち → 接続できません、再接続で開く', async () => {
+		const serverDown = (route: Route) => route.abort('connectionrefused');
+		await page.route('**/api/**', serverDown);
+		try {
+			await page.goto('/monitor');
+			await expect(page.getByRole('status')).toHaveText('起動中…');
+			const alert = page.getByRole('alert');
+			await expect(alert.getByRole('heading', { name: 'サーバーに接続できません' })).toBeVisible({
+				timeout: 15_000
+			});
+			// 保護画面の URL のまま（/login へ飛ばない）。画面本体は描かれていない。
+			await expect(page).toHaveURL(/\/monitor$/);
+			await expect(page.getByRole('button', { name: 'ログアウト' })).toHaveCount(0);
+		} finally {
+			await page.unroute('**/api/**', serverDown);
+		}
+
+		await page.getByRole('alert').getByRole('button', { name: '再接続' }).click();
+		await expect(page).toHaveURL(/\/monitor$/);
+		await expect(page.getByRole('button', { name: 'ログアウト' })).toBeVisible();
+		await expect(page.getByText('サーバーに接続できません')).toHaveCount(0);
 	});
 });

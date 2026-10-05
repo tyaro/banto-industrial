@@ -21,7 +21,7 @@
  *
  * Detecting (2) requires an async network probe, so provider selection as a
  * whole is now async: `bantoReady` is the promise every entry point
- * (`routes/+layout.svelte`, the `(app)` route guard, the login page) awaits
+ * (`routes/+layout.svelte`, the login page) awaits
  * before touching `getDataProvider()`/`getAuthProvider()`. The
  * resource/schema definitions and AuthProvider/DataProvider/EventProvider
  * contracts stay identical across all three - UI code never branches on
@@ -39,6 +39,11 @@
  * 再試行し、届かなければ「サーバーに接続できません」と再接続ボタンを出す。
  * 外へ出す名前（`isTauri` / `CSRF_HEADER` / `getBantoMode` など）はこのファイル
  * から再エクスポートし、`*Admin.ts` の import は変えない。
+ *
+ * banto v3.0.1（#321）: `(app)` のガードは `bantoReady` を待たず、`isBantoReady()`
+ * で終わっていなければ起動待ちの印付きの 503 を投げて延期する
+ * （`startupGate.ts`）。保護画面を直接開いたとき、届かない間も真っ白にならず
+ * スプラッシュと再接続が出る。
  */
 import {
 	connectEvents,
@@ -106,14 +111,23 @@ export function getUiSettings(): UiSettingsProvider {
 
 const notifier: Notifier = { notify: (kind, message) => toastStore.push(kind, message) };
 
+/** Set once {@link bantoReady} resolves - see {@link isBantoReady}. */
+let ready = false;
+
 /**
  * Resolves once `initBanto()` has run AND the matching `EventProvider` (if
  * any) is connected. Every place that calls `getDataProvider()`/
  * `getAuthProvider()` before the root layout has definitely mounted (the
- * `(app)` route guard's `load()`, the login page's submit handler) must
- * `await` this first; `routes/+layout.svelte` awaits it with `{#await}`
- * before rendering `children()` at all, so everything downstream of that is
- * already safe.
+ * login page's submit handler) must `await` this first;
+ * `routes/+layout.svelte` awaits it with `{#await}` before rendering
+ * `children()` at all, so everything downstream of that is already safe.
+ *
+ * banto v3.0.1（#321）: a route guard must NOT simply `await` this while it is
+ * pending - on a first load SvelteKit renders nothing (not even the root
+ * layout's splash) until every load has finished, and while the server is
+ * unreachable this waits for the user's "reconnect" on that very splash. The
+ * `(app)` guard checks {@link isBantoReady} instead and defers
+ * (`startupGate.ts`).
  */
 export const bantoReady: Promise<void> = (async () => {
 	// Deployment kind is decided explicitly (Tauri / `VITE_BANTO_DEMO` build /
@@ -166,4 +180,17 @@ export const bantoReady: Promise<void> = (async () => {
 		notifier,
 		resources: []
 	});
-})();
+})().then(() => {
+	ready = true;
+});
+
+/**
+ * Whether {@link bantoReady} has resolved (banto v3.0.1、#321): a synchronous
+ * read for the `(app)` route guard, which must decide WITHOUT waiting whether
+ * it can run now or has to defer to the startup splash (`startupGate.ts`). Set
+ * in the promise's own continuation, so it is already true for anything
+ * chained on `bantoReady` (the root layout's re-run).
+ */
+export function isBantoReady(): boolean {
+	return ready;
+}
