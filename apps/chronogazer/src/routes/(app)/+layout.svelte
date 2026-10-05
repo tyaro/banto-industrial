@@ -5,6 +5,7 @@
 	import { isLeavingForLogin, leaveForLogin } from '#lib/banto/logout.svelte.js';
 	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
 	import { isNavigationSettled } from '#lib/banto/navigationSettled.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 	import Header from '#lib/components/Header.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
@@ -85,7 +86,7 @@
 							? '別のユーザーでログインされました。もう一度ログインしてください。'
 							: '別のユーザーでログインされました。画面をそのユーザーで開き直しました。'
 					),
-				goToLogin: () => leaveForLogin(() => goto('/login'))
+				goToLogin: () => leaveForLogin(() => goto(resolveAppPath('/login')))
 			})
 		)
 	);

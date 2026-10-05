@@ -52,6 +52,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { canWriteResources } from '#lib/permissions.js';
 	import { sessionStore } from '#lib/session.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 	import {
 		COLLECT_READ_TIMEOUT_MS,
 		COLLECT_UI_TIMEOUT_MS,
@@ -314,7 +315,7 @@
 				{#if exclusionsNote}
 					<p class="note">
 						{exclusionsNote.summary}
-						<a href="/tags">タグ設定</a>{exclusionsNote.fix}
+						<a href={resolveAppPath('/tags')}>タグ設定</a>{exclusionsNote.fix}
 					</p>
 				{/if}
 				<table class="collect-exclusion-list">

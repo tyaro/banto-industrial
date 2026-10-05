@@ -96,7 +96,7 @@ function sessionCommands(): PaletteCommand[] {
 			visible: () => !sessionStore.authDisabled && !sessionStore.publicViewer,
 			run: async () => {
 				// banto v2.0.0 (#260): same as Header.svelte's logout.
-				await logoutAndLeave(() => goto('/login'), { notify: notifyLogoutOutcome });
+				await logoutAndLeave(() => goto(resolveAppPath('/login')), { notify: notifyLogoutOutcome });
 			}
 		},
 		{
@@ -107,7 +107,7 @@ function sessionCommands(): PaletteCommand[] {
 			// Header.svelte の「ログイン」と同じ: 閲覧公開のセッションだけ。
 			visible: () => sessionStore.publicViewer,
 			run: () => {
-				void goto('/login');
+				void goto(resolveAppPath('/login'));
 			}
 		}
 	];

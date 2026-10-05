@@ -9,7 +9,7 @@ banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし
 ### 変更（ChronoGazer。banto-hub の配布物には入らない）
 
 - 保護画面（`/monitor` など）を直接開いたとき、サーバーに届かない間も真っ白にならず「起動中…」→「サーバーに接続できません」＋「再接続」が出るようにした（banto #321、経路 B。`startupGate.ts`・`isBantoReady()`・ルートのレイアウトを admin-template v3.0.1 から写した）。再接続するとその保護画面がそのまま開く。banto-hub は起動判定をせず `server` 固定（`bantoReady` は待つ処理を持たない）なので、この修正は不要で取り込んでいない。
-- ChronoGazer を SvelteKit 3（`@sveltejs/kit` 3・`@sveltejs/adapter-static` 4）と TypeScript 6 に移行し、npm の `@banto/*` を banto v4.0.0 に上げた（banto #325 の経路 B: `svelte.config.js` を廃止して `vite.config.ts` に、`$lib` → `#lib`、ナビ・設定カテゴリの表の `AppPath` / `resolveAppPath()`、閲覧公開のガードを上流の形に、`invalidateAll()` → `refreshAll()`、`error(status, message, …)`。あわせて #326 の `navigationSettled.svelte.ts` を写し、ナビゲーションの途中で配線①の再 load を始めない）。Rust の `banto-*` は v4.0.0（版数のみ、両アプリ共通）。banto-hub の npm は v3.0.1・SvelteKit 2 のまま（次の PR で移行する）。
+- ChronoGazer を SvelteKit 3（`@sveltejs/kit` 3・`@sveltejs/adapter-static` 4）と TypeScript 6 に移行し、npm の `@banto/*` を banto v4.0.0 に上げた（banto #325 の経路 B: `svelte.config.js` を廃止して `vite.config.ts` に、`$lib` → `#lib`、ナビ・設定カテゴリの表の `AppPath` / `resolveAppPath()`（アプリ内の遷移先 `goto()`・`redirect()`・`href` もすべて `resolveAppPath()` 経由）、閲覧公開のガードを上流の形に、`invalidateAll()` → `refreshAll()`、`error(status, message, …)`。あわせて #326 の `navigationSettled.svelte.ts` を写し、ナビゲーションの途中で配線①の再 load を始めない）。Rust の `banto-*` は v4.0.0（版数のみ、両アプリ共通）。banto-hub の npm は v3.0.1・SvelteKit 2 のまま（次の PR で移行する）。
 - 前回の公開（alpha.28）以降に main に入った ChronoGazer の変更: users/settings/audit/backup のサービスと REST ルーターを banto v3.0.0 のものに置き換えた（#498。banto v2.1.0 の #277・#278・#280）、LAN 設定の適用を banto の形にし閲覧公開（grant `publicViewer`）を使えるようにした（#499。#287・#288・#294）、起動時の環境判定を banto の形にした（#501。届かないときは demo に落とさず起動待ちで再試行する。#286）。ChronoGazer は 0.1.0 のまま。
 
 ### 変更（banto-hub）

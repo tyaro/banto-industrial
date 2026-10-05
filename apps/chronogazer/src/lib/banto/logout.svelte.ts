@@ -5,7 +5,7 @@
  * The logout, and leaving the protected screens for /login (Issue #260
  * 実装-3, design §6.1, I-10/I-18).
  *
- * Order: `logout()` -> `resolveSettled()` -> `goto('/login')` only when that
+ * Order: `logout()` -> `resolveSettled()` -> `goto(resolveAppPath('/login'))` only when that
  * confirmed `none`, with `isLeavingForLogin()` true for the whole sequence.
  *
  * - The logout does not decide the outcome. The provider clears only the
@@ -22,7 +22,7 @@
  * - While leaving, the protected layout's generation check (wiring ①,
  *   `(app)/+layout.svelte`) does not call `refreshAll()`. The logout's
  *   own hold moves the generation, and SvelteKit lets such an invalidation
- *   win over the `goto('/login')` started right after it - with public
+ *   win over the `goto(resolveAppPath('/login'))` started right after it - with public
  *   viewing on, the re-run minted a public-viewer session and the tab stayed
  *   on the protected screen (E2E public-viewer 5a, found in 実装-2).
  * - The login screen appears only AFTER the logout and its confirmation

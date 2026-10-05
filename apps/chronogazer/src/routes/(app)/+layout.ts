@@ -66,7 +66,7 @@ export async function load({ url }) {
 			kind: 'publicViewer'
 		});
 		if (result.outcome === 'unverified') sessionCheckFailed();
-		if (result.snapshot.status !== 'active') redirect(307, '/login');
+		if (result.snapshot.status !== 'active') redirect(307, resolveAppPath('/login'));
 	}
 	const snapshot = result.snapshot;
 

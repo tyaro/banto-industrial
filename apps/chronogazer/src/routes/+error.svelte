@@ -17,6 +17,7 @@
 	 */
 	import { refreshAll } from '$app/navigation';
 	import { page } from '$app/state';
+	import { resolveAppPath } from '#lib/navigation.js';
 
 	// 再試行の間も無効にしない: 返ってこない再試行が出口まで塞がないように
 	// （もう一度押せば新しい再試行が始まる。ブラウザの再読み込みも使える）。
@@ -32,7 +33,7 @@
 		<p class="message">{page.error?.message ?? ''}</p>
 		<div class="actions">
 			<button type="button" onclick={retry}>再試行</button>
-			<a href="/">トップへ戻る</a>
+			<a href={resolveAppPath('/')}>トップへ戻る</a>
 		</div>
 	</div>
 </div>
