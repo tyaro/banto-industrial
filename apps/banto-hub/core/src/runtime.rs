@@ -143,7 +143,9 @@ use std::time::Duration;
 
 use banto_collect::{CollectorOptions, Quality, RegistrySnapshot};
 use banto_core::BantoError;
-use banto_server::{lan_urls_for_bind, start, static_router, RunningServer, ServerConfig};
+use banto_server::{
+    lan_urls_for_bind, start, static_router, with_security_headers, RunningServer, ServerConfig,
+};
 use banto_tags::{
     CollectionGroupService, PlcConnectionInput, PlcConnectionService, TagService,
     CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
@@ -621,27 +623,32 @@ impl HubRuntime {
         });
         grpc_server.apply(&grpc_settings).await;
 
-        let app = api_router_with_controller(
-            users,
-            audit,
-            plc_connections,
-            collection_groups,
-            tags,
-            api_keys,
-            manager.clone(),
-            controller.clone(),
-            auth,
-            commissioning,
-            events,
-            allow_setup,
-            write_control,
-            write_audit,
-            mqtt.clone(),
-            grpc_server.clone(),
-            rate_limiter,
-            profile_id,
-        )
-        .merge(static_router::<FrontendAssets>());
+        // `with_security_headers`（banto #500）は最後（最外）に掛け、静的 UI・
+        // `/api/*`・SSE・WebSocket の upgrade 応答のすべてに付ける（ヘッダーを
+        // 足すだけで、ルーティング・認証・本文には触らない）。
+        let app = with_security_headers(
+            api_router_with_controller(
+                users,
+                audit,
+                plc_connections,
+                collection_groups,
+                tags,
+                api_keys,
+                manager.clone(),
+                controller.clone(),
+                auth,
+                commissioning,
+                events,
+                allow_setup,
+                write_control,
+                write_audit,
+                mqtt.clone(),
+                grpc_server.clone(),
+                rate_limiter,
+                profile_id,
+            )
+            .merge(static_router::<FrontendAssets>()),
+        );
 
         let server = start(ServerConfig { bind, port }, app)
             .await
@@ -1008,6 +1015,77 @@ mod tests {
         let addr = hub.local_addr();
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0, "the OS should have assigned a real port");
+
+        hub.shutdown().await;
+    }
+
+    /// #500: `HubRuntime::start` が組み立てる Router（コンソール/サービス/
+    /// デスクトップ版の共通経路）の応答に、banto のセキュリティヘッダーが
+    /// 付く。静的 UI（`/`）と `/api/*` の JSON の両方を、実際にバインドした
+    /// ソケットへの素の HTTP/1.0 要求で確かめる（`with_security_headers` を
+    /// 外すとここが落ちる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_responses_carry_security_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = crate::test_support::TempDir::new("hub-runtime-security-headers");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let config = HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-security-headers".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let hub = HubRuntime::start(config)
+            .await
+            .expect("HubRuntime::start should succeed against a fresh temp DB");
+        let addr = hub.local_addr();
+
+        for path in ["/", "/api/auth/status"] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(
+                    format!(
+                        "GET {path} HTTP/1.0
+Host: {addr}
+
+"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.expect("read");
+            let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+            let head = head
+                .split(
+                    "
+
+",
+                )
+                .next()
+                .unwrap_or_default();
+            for expected in [
+                "x-content-type-options: nosniff",
+                "x-frame-options: deny",
+                "referrer-policy: same-origin",
+                "content-security-policy: default-src 'self'",
+            ] {
+                assert!(
+                    head.contains(expected),
+                    "{path}: missing `{expected}` in {head}"
+                );
+            }
+        }
 
         hub.shutdown().await;
     }

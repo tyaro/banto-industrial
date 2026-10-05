@@ -22,8 +22,8 @@ mod keyring_store;
 
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::{
-    bind as bind_listener, lan_urls_for_bind, static_router, AuthState, BoundServer, GrantKind,
-    RunningServer, ServerConfig, ServerEvent,
+    bind as bind_listener, lan_urls_for_bind, static_router, with_security_headers, AuthState,
+    BoundServer, GrantKind, RunningServer, ServerConfig, ServerEvent,
 };
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogList, AuditLogService};
@@ -1705,21 +1705,26 @@ async fn start_embedded_server(
     // the `auth_setup` command above (`invoke()`, no network involved), not
     // this REST endpoint. Only `banto-serve` (this repo's Tauri-free dev
     // vehicle) opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`.
-    let router = api_router(
-        users,
-        settings,
-        audit,
-        backup,
-        hub,
-        plc_connections,
-        collection_groups,
-        tags,
-        collect,
-        auth,
-        events,
-        false,
-    )
-    .merge(static_router::<FrontendAssets>());
+    //
+    // `with_security_headers`（banto #500）は admin-template と同じく**最後（最外）**
+    // に掛け、静的 UI・`/api/*` の JSON・SSE のどれにも CSP などが付くようにする。
+    let router = with_security_headers(
+        api_router(
+            users,
+            settings,
+            audit,
+            backup,
+            hub,
+            plc_connections,
+            collection_groups,
+            tags,
+            collect,
+            auth,
+            events,
+            false,
+        )
+        .merge(static_router::<FrontendAssets>()),
+    );
     bound.serve(router)
 }
 

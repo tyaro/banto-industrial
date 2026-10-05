@@ -13,6 +13,7 @@ banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし
 
 ### 変更（banto-hub）
 
+- ChronoGazer の組み込みサーバー（デスクトップ版の LAN アクセスと `banto-serve`）と banto-hub のサーバー（コンソール/サービス/デスクトップ版の共通経路）の応答に、banto のセキュリティヘッダー（`with_security_headers`: CSP・`nosniff`・`X-Frame-Options: DENY`・`Referrer-Policy: same-origin`）を付けた（#500）。admin-template と同じく Router の最外に掛ける。
 - users/settings/audit のサービスと、auth（status/setup/change-password）・users・audit-log の REST の口を banto v3.0.0 のものに置き換えた（#502、I3'）。banto v2.1.0 の #277（初回セットアップの原子化）・#278（失敗ログインの名前の切り詰め、無効なログアウトを記録しない）が入る。保持設定の変更の監査は `settings_change` / `settings` になった。#431 の認証ゲートと RBAC の床、hub 固有の設定キー・各ルーターは自前のまま。
 - banto の依存（`banto-core` / `banto-storage` / `banto-server` / `banto-admin-services`、`@banto/*`）を `v3.0.0` から `v3.0.1` に上げた。`Cargo.lock` は banto の 4 crate と workspace の版だけ、`pnpm-lock.yaml` は `@banto/*` のみ。
 
