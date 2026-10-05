@@ -1,24 +1,27 @@
 <script lang="ts">
 	/**
 	 * 監査ログ閲覧画面（spec M14）。`admin` のみ到達（+page.ts が非adminを
-	 * ダッシュボードへリダイレクト）。
+	 * `/monitor` へリダイレクト）。banto の admin-template の同名画面
+	 * （`apps/admin-template/src/routes/(app)/audit-log/+page.svelte`、v4.0.0）の
+	 * 形に合わせ、以下だけを ChronoGazer 向けに変えている:
+	 * - 文言は日本語の直書き（ChronoGazer は paraglide を持たない）。件数の表示は
+	 *   0 件でも「0件の記録があります。」（E2E が固定している）。
+	 * - 経路の表示名（`tauri` = デスクトップ、`rest` = LAN/ブラウザ）。
 	 *
 	 * 一覧は BantoGrid の「サーバーモード」（items 一覧ページの
 	 * ItemsServerGrid.svelte と同じ発想）: ソート/フィルタ/ページングは
-	 * すべて `listAuditLog()`（Rust側 `ListParams` -> SQL）が行い、
-	 * ブロック単位（`BLOCK_SIZE`件）でスクロールに応じて遅延取得する。
-	 * `@banto/admin-core` の `createWindowedListResource` は使わない
-	 * （`getDataProvider()` の汎用レジストリ経由の資源が前提で、監査ログは
-	 * usersAdmin.ts と同じ理由 - 専用のワイヤ形状・Tauriコマンド名 - でその外に
-	 * ある）。
+	 * すべて `listAuditLog()`（banto の `audit_log_router` / Tauri の
+	 * `audit_log_list` -> SQL）が行い、ブロック単位でスクロールに応じて
+	 * 遅延取得する。
 	 *
-	 * **ブロックキャッシュの判断は `./auditBlocks.ts`（と `/events` と共通の
-	 * `#lib/blockCache.ts`）に出してある**（#410。以前はこのページ内に
-	 * `AuditLogWindow` として複製していて、`/events` の #409 と同じ欠陥を
-	 * 持っていた）。どのブロックを取るか、世代のスナップショット境界
-	 * （`asOfId`）、保持期間の削除による失効、失敗の持ち方、並べ替え・絞り込みの
-	 * 変更と「再読み込み」で何を取り直すかは全部あちらの純関数が決め、表テストで
-	 * 固定してある。
+	 * ブロック読み込みは `@banto/admin-core` の `createSnapshotListResource`
+	 * （banto #248）に任せる。監査ログは通知（`invalidate`）なしに行が増え、
+	 * 保持期間の削除で減るので、世代の最初の応答で境界（`asOfId`）を固定し、
+	 * 後続のブロックに渡す（ブロックの合間の追加で重複・欠落しない）。境界の
+	 * 中で件数か `deletionEpoch` が変わったら失効として続きを読まず、
+	 * 「再読み込み」で新しい世代にする。以前は同じ判断を自前で持っていた
+	 * （`auditBlocks.ts` と `/events` と共通の `#lib/blockCache.ts`、#410）。
+	 * `/events` は今も `#lib/blockCache.ts` を使う。
 	 *
 	 * デモモード（プレーンな vite dev/preview、バックエンドなし）では
 	 * 監査ログDBそのものが存在しないため、案内文のみ表示する
@@ -32,29 +35,16 @@
 		type GridColumn,
 		type SortState
 	} from '@banto/grid-svelte';
-	import { isProviderError } from '@banto/admin-core';
-	import {
-		AUDIT_LIST_TIMEOUT_MS,
-		DEMO_MODE_MESSAGE,
-		getAuditConfig,
-		isAuditLogAvailable,
-		listAuditLog,
-		type AuditLogEntry
-	} from '#lib/banto/auditLogAdmin.js';
-	import { runWithLimit } from '#lib/banto/hubAdmin.js';
-	import { initialCache, type BlockRequest } from '#lib/blockCache.js';
+	import { createSnapshotListResource } from '@banto/admin-core';
 	import {
 		AUDIT_SNAPSHOT_EXPIRED_MESSAGE,
-		AuditBlockLoader,
-		auditViewState,
-		type AuditBlockFailure,
-		type AuditBlockOutcome,
-		type AuditViewState
-	} from './auditBlocks';
-
-	function errorMessage(err: unknown): string {
-		return isProviderError(err) ? err.message : String(err);
-	}
+		DEMO_MODE_MESSAGE,
+		auditErrorText,
+		createAuditLogFetcher,
+		getAuditConfig,
+		isAuditLogAvailable,
+		type AuditLogEntry
+	} from '#lib/banto/auditLogAdmin.js';
 
 	const available = isAuditLogAvailable();
 
@@ -155,96 +145,57 @@
 	gridState.sort = [{ field: 'ts', direction: 'desc' }];
 
 	/**
-	 * 今の問い合わせ（並べ替え・絞り込み）。取得 1 本はこれを**投げる時点で**
-	 * 読む - `AuditBlockLoader` は問い合わせが変わると世代を進めるので、前の
-	 * 問い合わせで投げた応答は世代違いとして採られない。
+	 * 監査ログのブロック読み込み（banto #248）。取得 1 本は
+	 * `createAuditLogFetcher()`（`listAuditLog(params, asOfId, signal)` に
+	 * 15 秒の上限を掛けたもの）: 世代の最初は `asOfId: null`（サーバーが境界を
+	 * 決めて返す）、後続は固定した境界。境界付きの取得ではサーバーは保持期間の
+	 * 削除を走らせない。失敗の持ち方・世代違いの応答の破棄・新しい世代での
+	 * 中断はリソース側が行う。
 	 */
-	let query: { sort: SortState[]; filters: FilterState[] } = {
-		sort: gridState.sort,
-		filters: []
-	};
-
-	let rows = $state<(AuditLogEntry | undefined)[]>([]);
-	let view = $state<AuditViewState>(auditViewState(initialCache<AuditBlockFailure>()));
-
-	/**
-	 * 1 ブロックの取得。**結末を返し、reject しない**。読み取り 1 回に上限を
-	 * 掛ける（`AUDIT_LIST_TIMEOUT_MS`）- **reject ではなく無応答**の相手だと
-	 * 飛行中のブロックが残り続け、`loading` が降りず「再読み込み」が押せなく
-	 * なるため（`/events` と同じ）。
-	 */
-	async function fetchBlock(request: BlockRequest): Promise<AuditBlockOutcome> {
-		const params = {
-			pagination: { offset: request.offset, limit: request.limit },
-			sort: query.sort,
-			filters: query.filters
-		};
-		const outcome = await runWithLimit(
-			(signal) => listAuditLog(params, request.asOfId, signal),
-			AUDIT_LIST_TIMEOUT_MS
-		);
-		if (outcome.kind === 'failed') return { kind: 'error', message: errorMessage(outcome.error) };
-		if (outcome.kind === 'timedOut') {
-			return {
-				kind: 'error',
-				message: `監査ログの読み取りが${Math.round(AUDIT_LIST_TIMEOUT_MS / 1000)}秒以内に返りませんでした。待つのをやめただけなので、「再読み込み」でもう一度試せます。`
-			};
-		}
-		return { kind: 'ready', list: outcome.value };
-	}
-
-	const loader = new AuditBlockLoader(fetchBlock, {
-		resetRows(length) {
-			// 世代の最初の応答 / 問い合わせの変更。前の行は残さない。
-			rows = new Array<AuditLogEntry | undefined>(length);
-		},
-		writeRows(offset, block) {
-			if (rows.length < offset + block.length) rows.length = offset + block.length;
-			for (let i = 0; i < block.length; i++) rows[offset + i] = block[i];
-		},
-		update(next) {
-			view = next;
-		}
+	const auditLog = createSnapshotListResource<AuditLogEntry>(createAuditLogFetcher(), {
+		params: { sort: gridState.sort, filters: [] }
 	});
 
-	// `untrack`: 取得は effect の追跡スコープ内で `rows`/`view` を読み書きする
-	// ので、これが無いと自分の書き込みで再実行し続ける（初回に 1 度だけ読む。
-	// `onMount` と同じ意図だが、effect なのでクライアントでだけ走る）。
+	// `untrack` (spec M14, mirrors ItemsServerGrid.svelte's split-effects
+	// comment): the initial load runs once on mount. The resource reads only
+	// private copies of its params, but the effect must not start depending on
+	// the state `ensureRange()` publishes (`loading` etc.) either. The cleanup
+	// aborts whatever is still in flight when the page is left.
 	$effect(() => {
 		if (!available) return;
-		untrack(() => loader.setRange(0, 100));
+		untrack(() => auditLog.ensureRange(0, 100));
+		return () => auditLog.dispose();
 	});
 
-	/**
-	 * 並べ替え・絞り込みの変更 = **新しい問い合わせ**。前の問い合わせの行・
-	 * 件数・失敗は持ち越さない（`restart`）。表示範囲が `{0, 0}`（0 件の後）でも
-	 * 先頭ブロックを取る（`blocksToFetch` - 以前はここで要求が 1 本も出ず、
-	 * 絞り込みを外しても 0 件のままだった）。
-	 */
+	// 並べ替え・絞り込みの変更 = 新しい問い合わせ（前の行・件数・失敗は
+	// 持ち越さない）。表示範囲が `{0, 0}`（0 件の後）でも先頭ブロックを取る。
 	function handleParamsChange(params: { sort: SortState[]; filters: FilterState[] }): void {
-		query = { sort: params.sort, filters: params.filters };
-		loader.restart();
+		auditLog.setParams(params);
 	}
 
 	function handleVisibleRangeChange(range: { start: number; end: number }): void {
-		loader.setRange(range.start, range.end);
+		auditLog.ensureRange(range.start, range.end);
 	}
 
-	/**
-	 * 手で押す「再読み込み」= 新しい世代（同じ問い合わせのまま、新しい記録も
-	 * ここで入る）。取り直す対象（失敗したブロック / 総件数が未取得なら先頭
-	 * ブロック）は `blocksToFetch` が決める。
-	 */
+	// 「再読み込み」= 新しい世代（同じ問い合わせのまま新しい記録も入る）。
+	// 失敗したブロックも取り直す。処理中でも押せる: 処理中の要求は中断され、
+	// 新しい世代の要求に置き換わる（応答しない要求のせいで回復の手段が
+	// 使えなくならない）。
 	function reload(): void {
-		loader.reload();
+		auditLog.refresh();
 	}
 
 	// spec M14: result='denied'/'failed' の行を控えめな左ボーダーで視覚的に
 	// 区別する（生色禁止・--banto-danger を使用）。BantoGrid の rowClass
 	// prop が返すクラスに対して、下のスタイル内で :global() セレクタを
 	// 当てている。
+	// 選択中の行も強調する（下の詳細パネルとの対応が分かるように。
+	// admin-template と同じ）。
 	function auditRowClass(row: AuditLogEntry): string | undefined {
-		return row.result === 'denied' || row.result === 'failed' ? 'audit-row-alert' : undefined;
+		const classes: string[] = [];
+		if (row.result === 'denied' || row.result === 'failed') classes.push('audit-row-alert');
+		if (selected?.id === row.id) classes.push('audit-row-selected');
+		return classes.length > 0 ? classes.join(' ') : undefined;
 	}
 
 	let selected: AuditLogEntry | null = $state(null);
@@ -297,24 +248,24 @@
 		{/if}
 
 		<!--
-			「まだ読めていない」「読めなかった」「0 件」を別々に出す（#410）。
+			「まだ読めていない」「読めなかった」「0 件」を別々に出す（#410、banto #248）。
 			件数が `null` のうちは件数を言わない（0 件と言い切らない）。
 		-->
 		<p class="note">
-			{#if view.totalCount === null}
-				{view.failedBlockCount > 0
+			{#if auditLog.totalCount === null}
+				{auditLog.failedBlocks.length > 0
 					? '監査ログを読み込めていません。'
 					: '監査ログを読み込んでいます。'}
 			{:else}
-				{view.totalCount.toLocaleString()}件の記録があります。行をクリックすると下に詳細が表示されます。
+				{auditLog.totalCount.toLocaleString()}件の記録があります。行をクリックすると下に詳細が表示されます。
 			{/if}
 		</p>
 
-		{#if view.errorText}
-			<p class="error">{view.errorText}</p>
+		{#if auditLog.error}
+			<p class="error" role="alert">{auditErrorText(auditLog.error)}</p>
 		{/if}
-		{#if view.expired}
-			<p class="error">{AUDIT_SNAPSHOT_EXPIRED_MESSAGE}</p>
+		{#if auditLog.expired}
+			<p class="error" role="alert">{AUDIT_SNAPSHOT_EXPIRED_MESSAGE}</p>
 		{/if}
 
 		<!--
@@ -322,19 +273,18 @@
 			同じ理由）: 失敗からの再試行だけでなく、**新しい記録を取り込む唯一の
 			導線**でもある - 一覧は世代の最初の応答で `asOfId`（スナップショット
 			境界）を固定するので、新しい世代を始めない限り後から記録された行は
-			入らない。失敗の表示はブロック単位で、そのブロックが読めるまで残る。
-			自動ポーリングは足さない。
+			入らない。処理中でも押せる（banto #248）。自動ポーリングは足さない。
 		-->
 		<div class="actions">
-			<button type="button" onclick={reload} disabled={view.loading}>再読み込み</button>
+			<button type="button" onclick={reload}>再読み込み</button>
 		</div>
 
 		<section class="grid-wrap">
 			<BantoGrid
 				mode="server"
 				state={gridState}
-				{rows}
-				totalRows={view.totalCount ?? 0}
+				rows={auditLog.rows}
+				totalRows={auditLog.totalCount ?? 0}
 				{columns}
 				getRowId={(row) => row.id}
 				rowClass={auditRowClass}
@@ -423,11 +373,6 @@
 		cursor: pointer;
 	}
 
-	.actions button:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
-	}
-
 	.grid-wrap {
 		flex: 1;
 		min-height: 0;
@@ -440,6 +385,11 @@
 	   left border only, theme-variable based - no raw colors (spec M14). */
 	:global(.row.audit-row-alert) {
 		border-left: 3px solid var(--banto-danger);
+	}
+
+	:global(.row.audit-row-selected) {
+		background: color-mix(in srgb, var(--banto-primary) 10%, transparent);
+		border-left: 3px solid var(--banto-primary);
 	}
 
 	.detail {

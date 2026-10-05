@@ -4,6 +4,10 @@
  * 切り離してここへ出したもの（#410: `/audit-log` が同じ欠陥を持っていた
  * ので、同じ直し方を二度書かない）。
  *
+ * **今の利用者は `/events` だけ**。`/audit-log` は banto の
+ * `SnapshotListResource`（`@banto/admin-core`、banto #248）に寄せたので
+ * ここを使っていない（下の `/audit-log` の記述は経緯として残す）。
+ *
  * ここが決めるのは:
  *
  * 1. **どのブロックを取るか**（[`blocksToFetch`]。表示範囲・総件数の有無・
