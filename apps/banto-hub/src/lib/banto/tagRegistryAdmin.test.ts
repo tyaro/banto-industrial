@@ -7,14 +7,14 @@
  *
  * **vitest 制約の回避について**（`apiKeysAdmin.test.ts` の doc comment 参照）:
  * `tagRegistryAdmin.ts` は `@banto/admin-core`（Svelte 5 rune を使う
- * `.svelte.ts` を推移的に import する）と `./setup`（`#lib/toast.svelte.js` を
+ * `.svelte.ts` を推移的に import する）と `./setup`（`$lib/toast.svelte` を
  * import する）をトップレベルで import しており、そのままではこのリポジトリ
- * の最小 vitest 構成（`@sveltejs/vite-plugin-svelte` 無し、`#lib` エイリアス
+ * の最小 vitest 構成（`@sveltejs/vite-plugin-svelte` 無し、`$lib` エイリアス
  * 無し）で `ReferenceError: $state is not defined` / `Cannot find module
- * '#lib/toast.svelte'` になる。だが `@banto/admin-core` の値としての利用
+ * '$lib/toast.svelte'` になる。だが `@banto/admin-core` の値としての利用
  * 箇所は `getAuthProvider`/`ProviderError` の2つだけ、`./setup` は
  * `CSRF_HEADER` 定数だけなので、`vi.mock` でこの2モジュールを軽量な
- * フェイクに差し替えれば実モジュール（`$state`/`#lib` 依存の副作用）を
+ * フェイクに差し替えれば実モジュール（`$state`/`$lib` 依存の副作用）を
  * 一切評価せずに `tagRegistryAdmin.ts` 本体（`httpRequest` を含む）を
  * そのままロード・テストできる。`httpRequest` を抽出/リファクタしてまで
  * テスト可能にする必要はなかった。

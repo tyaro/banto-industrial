@@ -1,7 +1,7 @@
 /**
  * 監査ログ一覧（`/audit-log`）の**ブロックキャッシュの判断**（#428）。
  * chronogazer の同名ファイル（#410）と同じ方針・同じ形で、違いは import の
- * 書き方だけ（banto-hub の vitest は `#lib` の別名を解決しないので、値の
+ * 書き方だけ（banto-hub の vitest は `$lib` の別名を解決しないので、値の
  * import は相対パス）。
  *
  * banto-hub の修正前の `AuditLogWindow`（`+page.svelte` に埋め込み）で、

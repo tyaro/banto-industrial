@@ -684,7 +684,6 @@
 			if (kind === 'computed') return name === CALC_CONNECTION_NAME;
 			if (kind === 'internal') return name === MEM_CONNECTION_NAME;
 			if (kind === 'db') return conn !== undefined && isDbSourceConnection(conn);
-
 			return (
 				name !== CALC_CONNECTION_NAME &&
 				name !== MEM_CONNECTION_NAME &&
@@ -1961,7 +1960,6 @@
 			((drawerMode === 'create' && createForm.tagKind === 'computed') ||
 				(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed'))
 	);
-
 	/** #379 レビュー対応: 表示はするが押せない状態（表編集モード中・複数選択モード中）。 */
 	const insertToggleEnabled = $derived(insertToggleAvailable && !gridEditMode && !selectionMode);
 
@@ -2566,7 +2564,6 @@
 		// 干渉しない。
 		const replaceFrom =
 			candidate.canonicalPrefix === null ? context.replaceFrom : context.tokenStart;
-
 		const insertText =
 			candidate.canonicalPrefix === null ? text : `${candidate.canonicalPrefix}${text}`;
 
@@ -2948,7 +2945,6 @@
 	// いなくても、表編集の保留バッファは未保存の変更のため）。
 	beforeNavigate((nav) => {
 		if (nav.shallow) return;
-
 		if (drawerMode !== null && !confirmDiscardIfNeeded()) {
 			nav.cancel();
 			return;
@@ -3570,7 +3566,7 @@
 	// --- T11-1: 連続登録 (docs/ux-plan.md §3) ------------------------------
 	//
 	// 名前パターン・開始番号・開始アドレス・点数・共通設定から
-	// `generateContinuousTags`（純関数、$lib/banto/continuousRegistration.ts）
+	// `generateContinuousTags`（純関数、#lib/banto/continuousRegistration.ts）
 	// でプレビュー行を組み立て、確認後に一括 API を叩く。連続登録は PLC
 	// アドレスを前提とする機能のため tagKind は常に 'plc'（TagInput 側の
 	// 既定と同じ、フォーム自体に種別選択は出さない）。
@@ -3580,7 +3576,7 @@
 	// `namePattern`/`startNumber` はもう固定の初期値（旧 `temp{n}`/`1`）を
 	// 持たず空で始め、開始アドレス欄の入力に追従して
 	// `nextNamePatternOnAddressChange`/`nextStartNumberOnAddressChange`
-	// （touched 追跡方式、`$lib/banto/tagNamePrefill.ts::
+	// （touched 追跡方式、`#lib/banto/tagNamePrefill.ts::
 	// nextTagNameOnAddressChange` と同じ設計）でプリフィルする。
 
 	function blankContinuousForm(): ContinuousFormState {
@@ -3735,7 +3731,7 @@
 	// 連続登録が「1タグをN連番」なのに対し、構造体登録は「複数の異なる
 	// フィールド」を1つのベースアドレスから連続ワード領域へ割り付ける
 	// （自動割付）か、各フィールドのアドレスを個別指定する（手動割付）。
-	// 割付・衝突検出はすべて依存ゼロの純関数（$lib/banto/structRegistration.ts）
+	// 割付・衝突検出はすべて依存ゼロの純関数（#lib/banto/structRegistration.ts）
 	// に切り出してあり、ここはフォーム状態と `createTagsBatch` への配線のみ。
 
 	interface StructFieldFormRow {
@@ -4647,14 +4643,7 @@
 	const columns = $derived.by((): GridColumn<Tag>[] => {
 		const cellEditable = () => gridEditMode && gridEditAllowed;
 		const base: GridColumn<Tag>[] = [
-			{
-				id: 'id',
-				header: 'ID',
-				accessor: 'id',
-				width: 60,
-				align: 'right'
-			},
-
+			{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
 			{
 				id: 'name',
 				header: '名前',
@@ -4669,15 +4658,14 @@
 				accessor: (row) => groupName(row.collectionGroupId),
 				width: 140
 			},
-
-			{
-				id: 'address',
-				header: 'アドレス',
-				accessor: 'address',
-				width: 100
-			},
+			{ id: 'address', header: 'アドレス', accessor: 'address', width: 100 },
 			{ id: 'dataType', header: '型', accessor: 'dataType', width: 80 },
-			{ id: 'tagKind', header: '種別', accessor: 'tagKind', width: 90 },
+			{
+				id: 'tagKind',
+				header: '種別',
+				accessor: 'tagKind',
+				width: 90
+			},
 			{
 				id: 'enabled',
 				header: '有効',
@@ -4908,7 +4896,6 @@
 				: addressPreflight.result?.ok
 					? '検証OK'
 					: (preflightFieldErrors.address ?? null)}
-
 			<div class="field">
 				<label for="tag-address">アドレス<span class="required">*</span></label>
 				<input
@@ -4977,7 +4964,6 @@
 				: addressPreflight.result?.ok
 					? '検証OK'
 					: (preflightFieldErrors.address ?? null)}
-
 			<div class="field">
 				<label for="tag-address">結果列名<span class="required">*</span></label>
 				<input
@@ -5575,7 +5561,6 @@
 				<dt>外部名</dt>
 				<dd>{confirmExternalName(form)}</dd>
 			</div>
-
 			<div class="confirm-row">
 				<dt>実機 / SIM</dt>
 				<dd>{confirmEnvironmentLabel(form)}</dd>
@@ -6121,7 +6106,6 @@
 				<button type="button" onclick={handleValidateContinuous} disabled={isDrawerBusy()}
 					>検証</button
 				>
-
 				<button
 					type="button"
 					onclick={handleApplyContinuous}
@@ -6679,7 +6663,6 @@
 							<div class="onboarding-banner">
 								<span>モニタで値・品質・時刻を確認できます。</span>
 								<a class="onboarding-cta" href={monitorCtaHref}>確認: 値・品質・時刻を見る</a>
-
 								<button type="button" class="secondary" onclick={() => (monitorCtaHref = null)}
 									>閉じる</button
 								>
@@ -7463,7 +7446,6 @@
 
 				<div class="actions">
 					<button type="button" onclick={handleValidateCsv} disabled={isDrawerBusy()}>検証</button>
-
 					<button
 						type="button"
 						onclick={handleApplyCsv}

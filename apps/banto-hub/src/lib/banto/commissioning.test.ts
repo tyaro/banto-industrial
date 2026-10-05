@@ -3,7 +3,7 @@
  *
  * **vitest 制約の回避について**（`tagRegistryAdmin.test.ts` の doc comment
  * 参照）: `commissioning.ts` は `@banto/admin-core`（Svelte 5 rune を使う
- * `.svelte.ts` を推移的に import する）と `./setup`（`#lib/toast.svelte.js` を
+ * `.svelte.ts` を推移的に import する）と `./setup`（`$lib/toast.svelte` を
  * import する）をトップレベルで import しており、そのままではこのリポジトリ
  * の最小 vitest 構成では読み込めない。値としての利用箇所は
  * `getAuthProvider`/`ProviderError`/`Identity`（型のみ）と `CSRF_HEADER`
