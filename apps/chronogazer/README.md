@@ -5,7 +5,11 @@
 1台に統合する、banto-industrial 最初の製品アプリ（docs/plan.md §4）。
 要件定義は
 [../../docs/recorder-requirements.md](../../docs/recorder-requirements.md)。
-banto テンプレート（Tauri + SvelteKit）由来。
+banto テンプレート（Tauri + SvelteKit）由来。SvelteKit 3・TypeScript 6（banto v4.0.0 の admin-template に
+追従、2026-10-05〜）。アプリ内の import は `#lib/...`（`package.json` の `imports`。`.ts` は `.js` を付けて
+書く、`.svelte` はそのまま）で、SvelteKit の設定は `vite.config.ts` の `sveltekit({...})` にある
+（`svelte.config.js` は無い）。ナビ・設定カテゴリの表の `path` は `AppPath`（存在しないルートは型エラー）、
+URL にするときは `resolveAppPath()`（`src/lib/navigation.ts`）を通す。
 
 ## 現状（R1-A 段階）
 
@@ -92,7 +96,9 @@ admin-template と同じ形。banto #286、`src/lib/banto/environment.ts`・
 出る。ルートガード（`routes/(app)/+layout.ts`）は起動の判定を待たず（待つと SvelteKit が
 最初の load の完了まで何も描かないため真っ白になっていた）、終わっていなければ起動待ちの印付きの
 503 を投げて延期する（`startupGate.ts`）。ルートのレイアウトはその間エラー画面ではなくスプラッシュを
-出し、起動の判定が終わってから `invalidateAll()` で同じ URL を開き直す。保護ルートの子の
+出し、起動の判定が終わってから `refreshAll()`（SvelteKit 3。以前の `invalidateAll()`）で同じ URL を
+開き直す。やり直しはナビゲーションが終わってから始める（banto v4.0.0 の #326、
+`navigationSettled.svelte.ts`。保護レイアウトの「セッションが変わったら load をやり直す」も同じ条件で待つ）。保護ルートの子の
 `load` は `await parent()` してから provider に触れること（この順序がガードより前に子の load を
 動かさない条件）。
 
@@ -153,7 +159,8 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
 見られる（2026-10-04 オーナー決定。同日の I2a で「画面に出さない」としたのを変更）。
 ログイン画面にも「閲覧のみで続ける」が出る。書き込みや管理画面（タグ設定・
 ユーザー管理・監査ログ・設定）にはログインが要る（閲覧者のセッションのナビには
-出さず、開こうとすると監視へ移る。読める API は viewer の権限のまま）。手元の
+出さず、開こうとすると監視へ移る。読める API は viewer の権限のまま。この画面の絞り込みは
+`(app)/+layout.ts` のガードが `url.pathname` と `resolveAppPath()` で解決した許可リストを比べて行う）。手元の
 端末はログイン不要モード、LAN の相手には閲覧だけ、という使い方ができる:
 「ログイン不要モード + LAN アクセス」は閲覧公開が ON のときだけ許され、起動時の
 自動開始も同じ条件で判断する。閲覧公開を OFF にして適用すると、発行済みの

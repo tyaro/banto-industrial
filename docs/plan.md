@@ -17,7 +17,8 @@ ChronoGazer のサービスと REST ルーターを banto のものに置き換�
 （I2c、実装済み。一時的に届かないときは demo に落とさず起動待ちで再試行）を追記。同日: §5 に
 banto-hub のサービスと REST ルーターを banto のものに置き換えたこと（I3'、実装済み）を追記。
 2026-10-05: §5 の起動時の環境判定に、banto v3.0.1（#321）で保護画面を直接開いたときの
-真っ白が解消したこと（実装済み）を反映。
+真っ白が解消したこと（実装済み）を反映。同日: §5 に ChronoGazer の SvelteKit 3 移行（banto v4.0.0、
+実装済み。banto-hub の npm は v3.0.1 のままの移行中）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -310,6 +311,19 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   だった既知の制約は、banto v3.0.1（#321）の追従で解消した（2026-10-05、`(app)` のガードが判定を待たず
   起動待ちの印付きの 503 で延期し、ルートのレイアウトがスプラッシュを出して起動後に同じ URL をやり直す。
   `startupGate.ts`）。
+
+- **ChronoGazer を SvelteKit 3 に移行（2026-10-05、実装済み。banto v4.0.0 の #325・#326）**: Rust の
+  `banto-*`（両アプリ共通）と ChronoGazer の npm `@banto/*` を v4.0.0 に上げ、`sv migrate sveltekit-3` の
+  後に admin-template v4.0.0 の形を写した: `svelte.config.js` を廃止して `vite.config.ts` の
+  `sveltekit({...})` に、`$lib` → `#lib`（`package.json` の `imports`、拡張子が必須）、`tsconfig.json` は
+  `$app/tsconfig`、`invalidateAll()` → `refreshAll()`、`error(status, message, { … })`。ナビ・設定カテゴリの
+  表の `path` は `AppPath`（`` `/${Path}` ``。存在しないルートは型エラー）にし、URL にするときは
+  `resolveAppPath()` を通す。ChronoGazer は `base` を使わないので自動移行はガードを書き換えなかったが、
+  閲覧公開のガード（`(app)/+layout.ts`）も上流の形（`url.pathname` と `resolveAppPath()` の結果を比べる）に
+  揃え、上流で自動移行が入れた `resolve('')` の形に戻すと単体テストが落ちることを確かめた。#326 の
+  `navigationSettled.svelte.ts` を写し、#321 の起動待ちのやり直しと配線①はナビゲーションが終わるまで
+  `refreshAll()` を始めない。banto-hub の npm は v3.0.1・SvelteKit 2 のまま（移行中の一時的なずれ。
+  [README.md](README.md)「現状ひとめ」。banto-hub の移行は次の PR）。
 
   続き（未着手）: 初回セットアップ画面。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
