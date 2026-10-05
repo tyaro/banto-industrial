@@ -7,8 +7,8 @@
 	// 不要 - 「ログイン状態を保持」チェックは実装指示どおり常時表示する。
 	import { goto } from '$app/navigation';
 	import { getAuthProvider, notify } from '@banto/admin-core';
-	import { bantoReady } from '$lib/banto/setup';
-	import { APP_NAME } from '$lib/appName';
+	import { bantoReady } from '#lib/banto/setup.js';
+	import { APP_NAME } from '#lib/appName.js';
 
 	// status() が解決するまでは未確定: 一瞬でも片方のフォームを描画して
 	// 出し直す「フラッシュ」を避けるため何も出さない。

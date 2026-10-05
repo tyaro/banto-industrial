@@ -11,7 +11,7 @@
  * ConnectivitySection にしか要らないのでローカルのまま残す - 1つの
  * section に閉じる state は共有に出さない方針）。
  */
-import { getMqttSettings, type MqttSettings } from '$lib/banto/mqttSettingsAdmin';
+import { getMqttSettings, type MqttSettings } from '#lib/banto/mqttSettingsAdmin.js';
 
 class MqttSettingsStore {
 	enabled = $state(false);

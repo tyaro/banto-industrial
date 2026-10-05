@@ -25,24 +25,24 @@
 	import { page } from '$app/state';
 	import { BantoGrid, type CellEdit, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
-	import { toastStore } from '$lib/toast.svelte';
-	import { deferredDelete, UNDO_WINDOW_MS } from '$lib/banto/deferredDelete.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { mobileNavStore } from '$lib/mobileNav.svelte';
-	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
-	import { canRestoreFocusTo, restoreFocus } from '$lib/components/focusRestore';
-	import { focusablesIn } from '$lib/components/focusTrap';
-	import { hasVisibleLayerAbove } from '$lib/components/escLayering';
-	import { canWriteResources } from '$lib/permissions';
-	import Drawer from '$lib/components/Drawer.svelte';
-	import Modal from '$lib/components/Modal.svelte';
-	import SplitPane from '$lib/components/SplitPane.svelte';
-	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
-	import TreeContextMenu from '$lib/components/TreeContextMenu.svelte';
-	import ConnectionDrawer from '$lib/components/ConnectionDrawer.svelte';
-	import CollectionGroupDrawer from '$lib/components/CollectionGroupDrawer.svelte';
-	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
-	import type { TreeNode } from '$lib/components/treeTypes';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { deferredDelete, UNDO_WINDOW_MS } from '#lib/banto/deferredDelete.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { pruneTreeFilter } from '#lib/banto/treeFilterPrune.js';
+	import { canRestoreFocusTo, restoreFocus } from '#lib/components/focusRestore.js';
+	import { focusablesIn } from '#lib/components/focusTrap.js';
+	import { hasVisibleLayerAbove } from '#lib/components/escLayering.js';
+	import { canWriteResources } from '#lib/permissions.js';
+	import Drawer from '#lib/components/Drawer.svelte';
+	import Modal from '#lib/components/Modal.svelte';
+	import SplitPane from '#lib/components/SplitPane.svelte';
+	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
+	import TreeContextMenu from '#lib/components/TreeContextMenu.svelte';
+	import ConnectionDrawer from '#lib/components/ConnectionDrawer.svelte';
+	import CollectionGroupDrawer from '#lib/components/CollectionGroupDrawer.svelte';
+	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
+	import type { TreeNode } from '#lib/components/treeTypes.js';
 	import {
 		listTags,
 		createTag,
@@ -82,7 +82,7 @@
 		type BatchTagsDeleteResult,
 		type BatchTagUpdateRow,
 		type BatchTagFieldError
-	} from '$lib/banto/tagRegistryAdmin';
+	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		buildBulkEnableRows,
 		buildBulkMoveRows,
@@ -90,16 +90,16 @@
 		hasMixedTagKinds,
 		summarizeBulkChange,
 		type BulkChangeSummary
-	} from '$lib/banto/tagBulkOps';
+	} from '#lib/banto/tagBulkOps.js';
 	import {
 		applyTagCellOverrides,
 		buildTagCellEditBatch,
 		mergeTagCellEdits,
 		type EditableTagField,
 		type TagCellEditInput
-	} from '$lib/banto/tagCellEdit';
-	import { getHubStatus, type StatusResponse } from '$lib/banto/hubStatus';
-	import { getCommissioningStatus, type CommissioningStatus } from '$lib/banto/commissioning';
+	} from '#lib/banto/tagCellEdit.js';
+	import { getHubStatus, type StatusResponse } from '#lib/banto/hubStatus.js';
+	import { getCommissioningStatus, type CommissioningStatus } from '#lib/banto/commissioning.js';
 	import {
 		buildContinuousParams,
 		generateContinuousTags,
@@ -108,7 +108,7 @@
 		nextStartNumberOnAddressChange,
 		type ContinuousFormState,
 		type ContinuousRegistrationResult
-	} from '$lib/banto/continuousRegistration';
+	} from '#lib/banto/continuousRegistration.js';
 	import {
 		allocateStructFields,
 		detectStructAddressCollisions,
@@ -117,12 +117,12 @@
 		type StructAllocationResult,
 		type StructCollision,
 		type StructField
-	} from '$lib/banto/structRegistration';
+	} from '#lib/banto/structRegistration.js';
 	import {
 		buildOffsetCopyRows,
 		offsetCopyRowsToTagInputs,
 		type OffsetCopyResult
-	} from '$lib/banto/offsetCopy';
+	} from '#lib/banto/offsetCopy.js';
 	import {
 		exportTagsCsv,
 		parseTagsCsv,
@@ -135,14 +135,14 @@
 		type ImportTagsCsvResult,
 		type ParsedCsvTagRow,
 		type CsvRowError
-	} from '$lib/banto/tagCsv';
+	} from '#lib/banto/tagCsv.js';
 	import {
 		classifyCsvUpdate,
 		type CsvUpdateClassification,
 		type CsvUpdateRow,
 		type CsvRowCategory
-	} from '$lib/banto/tagCsvDiff';
-	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
+	} from '#lib/banto/tagCsvDiff.js';
+	import { parseOptionalNumber } from '#lib/banto/tagFormNumeric.js';
 	import {
 		DISPLAY_SCALING_FIELDS,
 		DISPLAY_SCALING_VALUE_FIELDS,
@@ -154,30 +154,30 @@
 		environmentLabel,
 		writePermissionLabel,
 		fieldErrorsFromList
-	} from '$lib/banto/tagFormLayout';
-	import { addressHelpFor } from '$lib/banto/tagAddressHelp';
-	import { carryFormForNext } from '$lib/banto/tagFormCarry';
-	import { buildDuplicateFormValues } from '$lib/banto/tagDuplicate';
-	import { nextTagNameOnAddressChange } from '$lib/banto/tagNamePrefill';
-	import { canDefaultWritable, writableDefaultBlockedReason } from '$lib/banto/writableDefault';
+	} from '#lib/banto/tagFormLayout.js';
+	import { addressHelpFor } from '#lib/banto/tagAddressHelp.js';
+	import { carryFormForNext } from '#lib/banto/tagFormCarry.js';
+	import { buildDuplicateFormValues } from '#lib/banto/tagDuplicate.js';
+	import { nextTagNameOnAddressChange } from '#lib/banto/tagNamePrefill.js';
+	import { canDefaultWritable, writableDefaultBlockedReason } from '#lib/banto/writableDefault.js';
 	import {
 		monitorHref,
 		resolvePresetGroupId,
 		resolveRegistrationTarget,
 		type RegistrationTarget,
 		type TreeSelectionForPreset
-	} from '$lib/banto/tagOnboarding';
-	import { isFormDirty } from '$lib/banto/formDirty';
+	} from '#lib/banto/tagOnboarding.js';
+	import { isFormDirty } from '#lib/banto/formDirty.js';
 	import {
 		buildExternalName,
 		findReferencingComputedTags,
 		formatDeleteConfirmMessage
-	} from '$lib/banto/tagDeleteImpact';
-	import { diffFormRecords, type ConflictFieldDiff } from '$lib/banto/tagConflictDiff';
+	} from '#lib/banto/tagDeleteImpact.js';
+	import { diffFormRecords, type ConflictFieldDiff } from '#lib/banto/tagConflictDiff.js';
 	import {
 		resolveTreeContextMenuItemsForRole,
 		type TreeContextMenuItemAction
-	} from '$lib/banto/tagTreeContextMenu';
+	} from '#lib/banto/tagTreeContextMenu.js';
 	import { beforeNavigate } from '$app/navigation';
 	import {
 		checkExpression,
@@ -186,8 +186,8 @@
 		ExpressionCheckController,
 		type ExpressionCheckResult,
 		type ExpressionFunction
-	} from '$lib/banto/expressionCheck';
-	import { blockedInsertTargets, type InsertCandidateTag } from '$lib/banto/expressionInsert';
+	} from '#lib/banto/expressionCheck.js';
+	import { blockedInsertTargets, type InsertCandidateTag } from '#lib/banto/expressionInsert.js';
 	import {
 		buildCompletionIndex,
 		completionCandidates,
@@ -198,11 +198,11 @@
 		shouldOpenCompletion,
 		type CompletionCandidate,
 		type CompletionContext
-	} from '$lib/banto/expressionCompletion';
+	} from '#lib/banto/expressionCompletion.js';
 	import CompletionPopup, {
 		COMPLETION_LISTBOX_ID,
 		completionOptionId
-	} from '$lib/components/CompletionPopup.svelte';
+	} from '#lib/components/CompletionPopup.svelte';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -402,7 +402,7 @@
 
 	/**
 	 * T18-1（TAG-UX-C 4点目「差分表示 UI」）: revision 競合パネルの表に出す
-	 * フィールドラベル（日本語）。`diffFormRecords`（`$lib/banto/tagConflictDiff.ts`）
+	 * フィールドラベル（日本語）。`diffFormRecords`（`#lib/banto/tagConflictDiff.ts`）
 	 * 自体は `FormState` のキー名を知らない汎用ヘルパーのため、ラベルマップは
 	 * このページ側で持つ。
 	 */
@@ -493,7 +493,7 @@
 	 * 実機／SIM、書き込み許可を固定領域で確認できるようにする」）:
 	 * `tagFields` スニペット末尾の「保存前の確認」領域（`.confirm-panel`）
 	 * を駆動する3つの薄いラッパー。実際の組み立てロジックは
-	 * `$lib/banto/tagFormLayout.ts` の純関数へ切り出してあり、ここは
+	 * `#lib/banto/tagFormLayout.ts` の純関数へ切り出してあり、ここは
 	 * `groups`/`connections`（このページの `$state`）からフォームの
 	 * `collectionGroupId` に対応する接続・グループを引くだけの責務。
 	 */
@@ -506,7 +506,7 @@
 
 	/**
 	 * #342 段階A: 式チェック API の `externalName`（この式を保存する予定の
-	 * タグの完全名 - 循環参照の判定にだけ使う、`$lib/banto/expressionCheck.ts`
+	 * タグの完全名 - 循環参照の判定にだけ使う、`#lib/banto/expressionCheck.ts`
 	 * 参照）。接続・グループが未選択、またはタグ名が未入力（前後空白のみ
 	 * 含む）の間は組み立てようがないので `null`（サーバー側は省略可 -
 	 * その場合は単に循環判定をスキップするだけで安全）。`confirmExternalName`
@@ -684,6 +684,7 @@
 			if (kind === 'computed') return name === CALC_CONNECTION_NAME;
 			if (kind === 'internal') return name === MEM_CONNECTION_NAME;
 			if (kind === 'db') return conn !== undefined && isDbSourceConnection(conn);
+
 			return (
 				name !== CALC_CONNECTION_NAME &&
 				name !== MEM_CONNECTION_NAME &&
@@ -843,7 +844,7 @@
 	 * 2026-09-01 オーナー要望「タグ名が空欄のままならアドレスをタグ名として
 	 * 使う」: create Drawer 専用の「名前欄をユーザーが直接編集したか」の
 	 * 追跡フラグ。`ConnectionDrawer.svelte` の `portTouched` と同じ設計
-	 * （`$lib/banto/tagNamePrefill.ts` モジュール doc comment 参照）。
+	 * （`#lib/banto/tagNamePrefill.ts` モジュール doc comment 参照）。
 	 *
 	 * - `false`（既定）の間だけ、アドレス欄の入力に追従して名前欄を
 	 *   プリフィルする（`nextTagNameOnAddressChange`）。
@@ -909,7 +910,7 @@
 	/**
 	 * T19 S1-b（UX-34）: create Drawer が開いている間、`createForm.writable`
 	 * を「PLC タグかどうか」（{@link canDefaultWritable}、
-	 * `$lib/banto/writableDefault.ts`）とグループ単位の既定値
+	 * `#lib/banto/writableDefault.ts`）とグループ単位の既定値
 	 * （`CollectionGroup.defaultWritable` - 2026-09-02 オーナー判断
 	 * 「グループ単位の既定値は DB 列に持つ」により、既に読み込み済みの
 	 * `groups` 配列から直接引く。以前の実装は `localStorage` を使っていた
@@ -1043,7 +1044,7 @@
 	 *
 	 * 「登録して閉じる」＝保存成功後に `closeDrawer()`（現状の Drawer
 	 * `×`/Esc と同じ後始末）。「登録して次へ」＝保存成功後も Drawer は
-	 * 開いたまま、`carryFormForNext`（`$lib/banto/tagFormCarry.ts`）で
+	 * 開いたまま、`carryFormForNext`（`#lib/banto/tagFormCarry.ts`）で
 	 * 名前・アドレスだけ空にした次フォームへ差し替える -
 	 * タグ種別・収集グループ（「親設定」）を含むそれ以外のフィールドは
 	 * すべて直前の入力のまま引き継ぐ（TAG-UX-2「親設定と明示選択した共通値を
@@ -1960,6 +1961,7 @@
 			((drawerMode === 'create' && createForm.tagKind === 'computed') ||
 				(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed'))
 	);
+
 	/** #379 レビュー対応: 表示はするが押せない状態（表編集モード中・複数選択モード中）。 */
 	const insertToggleEnabled = $derived(insertToggleAvailable && !gridEditMode && !selectionMode);
 
@@ -2075,7 +2077,7 @@
 
 	/**
 	 * 挿入をブロックする行（`id -> 理由`）。判定は純関数
-	 * `blockedInsertTargets`（`$lib/banto/expressionInsert.ts`、**正は段階A
+	 * `blockedInsertTargets`（`#lib/banto/expressionInsert.ts`、**正は段階A
 	 * のサーバチェック**）。段階C の「一覧から挿入」（淡色行・理由トースト）と
 	 * 段階B のセグメント補完（候補から除外）が**同じ1つの derived を共有する**。
 	 *
@@ -2157,8 +2159,8 @@
 	// --- #342 段階B: 式欄のセグメント補完 -------------------------------------
 	//
 	// 判定そのもの（何を補完するか・候補・除外）は純関数
-	// `$lib/banto/expressionCompletion.ts`、描画は
-	// `$lib/components/CompletionPopup.svelte`。ここにあるのは「式欄の DOM と
+	// `#lib/banto/expressionCompletion.ts`、描画は
+	// `#lib/components/CompletionPopup.svelte`。ここにあるのは「式欄の DOM と
 	// それらを繋ぐ配線」だけ。段階A の `.expr-mirror`（キャレット座標）、
 	// 段階C の `blockedInsertTargets`（除外）と `setRangeText` + input 再送
 	// （挿入）を**そのまま再利用する**（作り直さない）。
@@ -2564,6 +2566,7 @@
 		// 干渉しない。
 		const replaceFrom =
 			candidate.canonicalPrefix === null ? context.replaceFrom : context.tokenStart;
+
 		const insertText =
 			candidate.canonicalPrefix === null ? text : `${candidate.canonicalPrefix}${text}`;
 
@@ -2944,6 +2947,8 @@
 	// T18-3e: 保留中のセル編集がある場合も同様に確認する（Drawer は開いて
 	// いなくても、表編集の保留バッファは未保存の変更のため）。
 	beforeNavigate((nav) => {
+		if (nav.shallow) return;
+
 		if (drawerMode !== null && !confirmDiscardIfNeeded()) {
 			nav.cancel();
 			return;
@@ -2991,7 +2996,7 @@
 	 * 戻す。** `reload()` はカタログを取り直すだけで `treeFilter` を見ていなかった
 	 * ため、削除された id で絞られたまま（＝グリッドが常に空）になり、#378 で
 	 * 足した選択中表示はその id の名前を引けずに「すべて」と出て食い違っていた。
-	 * 判定は依存ゼロの純関数 `pruneTreeFilter`（`$lib/banto/treeFilterPrune.ts`、
+	 * 判定は依存ゼロの純関数 `pruneTreeFilter`（`#lib/banto/treeFilterPrune.ts`、
 	 * vitest 済み）で、同一参照を返してくれるので変わったときだけ書き戻す。
 	 */
 	$effect(() => {
@@ -3641,7 +3646,7 @@
 	/** 入力が変わるたびに再計算される、適用前プレビュー(設計「適用前にプレビュー表示」)。
 	 *
 	 * パラメータ組み立て自体（`form.count` 等の number|null 混入への対応、
-	 * TAG-P0-1）は `$lib/banto/continuousRegistration.ts` の
+	 * TAG-P0-1）は `#lib/banto/continuousRegistration.ts` の
 	 * {@link buildContinuousParams} に切り出してある。 */
 	let continuousPreview: ContinuousRegistrationResult | null = $derived.by(() => {
 		const params = buildContinuousParams(continuousForm);
@@ -3929,12 +3934,12 @@
 	// (docs/ux-plan.md §3, docs/banto-hub-t18-design.md「T18-3d CSV
 	// 新規/更新分離＋テンプレート」) -------------------------------------
 	//
-	// エクスポートはこのページが Blob/DOM 操作を担当し（`$lib/banto/tagCsv.ts`
+	// エクスポートはこのページが Blob/DOM 操作を担当し（`#lib/banto/tagCsv.ts`
 	// はブラウザ API に依存しない純関数のまま保つ）、インポートは連続登録と
 	// 同じ「プレビュー → 検証(dry-run) → 登録」の2段階フローを踏襲する。
 	// T18-3d でモードを「新規追加(create)」「既存更新(update)」に分離した -
 	// 新規追加は既存どおり `createTagsBatch`、既存更新は
-	// `$lib/banto/tagCsvDiff.ts::classifyCsvUpdate` で分類してから
+	// `#lib/banto/tagCsvDiff.ts::classifyCsvUpdate` で分類してから
 	// `updateTagsBatch`（changed 行のみ）を叩く。
 
 	/** ローカル日付での `banto-hub-tags-YYYY-MM-DD.csv`（設計: ux-plan.md §3）。 */
@@ -4293,7 +4298,7 @@
 	//
 	// 連続登録・CSVインポートの「プレビュー→確認→適用」の流儀を踏襲するが、
 	// ここでは対象件数・差分の計算はサーバー往復なしのクライアント純関数
-	// （`$lib/banto/tagBulkOps.ts::summarizeBulkChange`）で行う - 選択済み
+	// （`#lib/banto/tagBulkOps.ts::summarizeBulkChange`）で行う - 選択済み
 	// タグの現在値は既にこのページの `tags` にあるため、dry-run を別途
 	// 叩かなくても「対象N件・差分」を確認パネルに出せる（実装指示「過剰
 	// 実装は避け、最低限『件数＋主要差分を見せてから適用』を満たす」）。
@@ -4497,7 +4502,7 @@
 	// --- T20 ②b オフセットコピー (docs/banto-hub-t20-design.md §3.2、
 	// 2026-09-05 オーナー決定「命名ルール」) --------------------------------
 	//
-	// 一括操作バーの追加ボタン。選択済みタグ群を `$lib/banto/offsetCopy.ts`
+	// 一括操作バーの追加ボタン。選択済みタグ群を `#lib/banto/offsetCopy.ts`
 	// の純関数でオフセット複製し、構造体登録②aと同じ「プレビュー→
 	// 検証(dry-run)→登録」の2段階フローで `createTagsBatch` へ渡す。
 	// `bulkRows`/`bulkResult`（enable/disable/move/delete が使う
@@ -4642,7 +4647,14 @@
 	const columns = $derived.by((): GridColumn<Tag>[] => {
 		const cellEditable = () => gridEditMode && gridEditAllowed;
 		const base: GridColumn<Tag>[] = [
-			{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
+			{
+				id: 'id',
+				header: 'ID',
+				accessor: 'id',
+				width: 60,
+				align: 'right'
+			},
+
 			{
 				id: 'name',
 				header: '名前',
@@ -4657,14 +4669,15 @@
 				accessor: (row) => groupName(row.collectionGroupId),
 				width: 140
 			},
-			{ id: 'address', header: 'アドレス', accessor: 'address', width: 100 },
-			{ id: 'dataType', header: '型', accessor: 'dataType', width: 80 },
+
 			{
-				id: 'tagKind',
-				header: '種別',
-				accessor: 'tagKind',
-				width: 90
+				id: 'address',
+				header: 'アドレス',
+				accessor: 'address',
+				width: 100
 			},
+			{ id: 'dataType', header: '型', accessor: 'dataType', width: 80 },
+			{ id: 'tagKind', header: '種別', accessor: 'tagKind', width: 90 },
 			{
 				id: 'enabled',
 				header: '有効',
@@ -4861,7 +4874,7 @@
 				`protocol`（`slmp`/`modbus-tcp`/未選択）と `dataType` から、
 				アドレス例・対応デバイス・占有範囲・bit 指定可否をここで
 				切り替える。マッピング自体は依存ゼロの純関数
-				`$lib/banto/tagAddressHelp.ts::addressHelpFor` に切り出してあり
+				`#lib/banto/tagAddressHelp.ts::addressHelpFor` に切り出してあり
 				（受け入れ条件「Modbus 選択時に D100 を推奨例にしない」は
 				そちら側のユニットテストで固定）、ここは表示だけを担う。
 				`preflightFieldErrors`/`preflightMessage` は入力中の
@@ -4895,6 +4908,7 @@
 				: addressPreflight.result?.ok
 					? '検証OK'
 					: (preflightFieldErrors.address ?? null)}
+
 			<div class="field">
 				<label for="tag-address">アドレス<span class="required">*</span></label>
 				<input
@@ -4963,6 +4977,7 @@
 				: addressPreflight.result?.ok
 					? '検証OK'
 					: (preflightFieldErrors.address ?? null)}
+
 			<div class="field">
 				<label for="tag-address">結果列名<span class="required">*</span></label>
 				<input
@@ -5495,7 +5510,7 @@
 			（`AddressArea`）・`banto-tags`（`modbus_read_only_area`）に
 			続く3つ目の手書き複製になってしまうため、プロトコル層の
 			データをサーバーから受け取れるようになる別スライス S1-b0 まで
-			保留する（`$lib/banto/writableDefault.ts` の doc comment
+			保留する（`#lib/banto/writableDefault.ts` の doc comment
 			参照）。そのため現状 `writableBlockedReason` は `tagKind ===
 			'computed'` のときしか非 `null` にならない（このセクション自体
 			が computed では非表示なので、実質ここには来ない） -
@@ -5560,6 +5575,7 @@
 				<dt>外部名</dt>
 				<dd>{confirmExternalName(form)}</dd>
 			</div>
+
 			<div class="confirm-row">
 				<dt>実機 / SIM</dt>
 				<dd>{confirmEnvironmentLabel(form)}</dd>
@@ -5786,7 +5802,7 @@
 								送った `csvParseResult.rows` 配列の添字。連続登録の「index+1」
 								（プレビュー行番号）とは意味が違うので、実際の CSV ファイル行番号
 								に変換するには `parsedRows[index].lineNumber` を引く必要がある
-								（`$lib/banto/tagCsv.ts::ParsedCsvTagRow.lineNumber` — ヘッダ行=1,
+								（`#lib/banto/tagCsv.ts::ParsedCsvTagRow.lineNumber` — ヘッダ行=1,
 								最初のデータ行=2）。
 							-->
 							<td>{parsedRows[rowError.index]?.lineNumber ?? `#${rowError.index}`}</td>
@@ -6105,6 +6121,7 @@
 				<button type="button" onclick={handleValidateContinuous} disabled={isDrawerBusy()}
 					>検証</button
 				>
+
 				<button
 					type="button"
 					onclick={handleApplyContinuous}
@@ -6662,6 +6679,7 @@
 							<div class="onboarding-banner">
 								<span>モニタで値・品質・時刻を確認できます。</span>
 								<a class="onboarding-cta" href={monitorCtaHref}>確認: 値・品質・時刻を見る</a>
+
 								<button type="button" class="secondary" onclick={() => (monitorCtaHref = null)}
 									>閉じる</button
 								>
@@ -6968,7 +6986,7 @@
 			() => {
 				// 2026-09-01 オーナー要望: アドレス欄の入力に追従して名前欄を
 				// プリフィルする（`createNameTouched` が false の間だけ、
-				// `$lib/banto/tagNamePrefill.ts` 参照）。`scheduleAddressPreflight`
+				// `#lib/banto/tagNamePrefill.ts` 参照）。`scheduleAddressPreflight`
 				// より先に行うことで、プリフィルで名前欄が埋まった直後の
 				// 入力から preflight の実行条件（`form.name.trim() !== ''`、
 				// 下の `scheduleAddressPreflight` 定義参照）を満たせるように
@@ -7445,6 +7463,7 @@
 
 				<div class="actions">
 					<button type="button" onclick={handleValidateCsv} disabled={isDrawerBusy()}>検証</button>
+
 					<button
 						type="button"
 						onclick={handleApplyCsv}

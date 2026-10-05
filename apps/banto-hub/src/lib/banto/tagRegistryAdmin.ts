@@ -67,7 +67,7 @@ export type WordOrder = 'low_high' | 'high_low';
  * 既定はプロトコルにより異なる（2026-09-08 オーナー決定）: `slmp` は
  * `low_high`（MELSEC標準、D0=下位/D1=上位、従来どおり）、`modbus-tcp` は
  * `high_low`（Modbus/IEEE慣習に統一 - 上のモジュール doc comment 参照）。
- * `$lib/banto/plcConnectionForm.ts::DEFAULT_WORD_ORDERS` 参照。
+ * `#lib/banto/plcConnectionForm.ts::DEFAULT_WORD_ORDERS` 参照。
  */
 export const WORD_ORDER_OPTIONS: { value: WordOrder; label: string }[] = [
 	{ value: 'low_high', label: 'low_high（MELSEC標準）' },
@@ -177,7 +177,7 @@ export interface PlcConnectionInput {
 	 * - update: 省略（キー自体を送らない = `undefined`）は「現在のパスワードを
 	 *   変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」。
 	 *
-	 * `$lib/banto/plcConnectionForm.ts::passwordForSubmit`がフォーム状態
+	 * `#lib/banto/plcConnectionForm.ts::passwordForSubmit`がフォーム状態
 	 * からこの3値を組み立てる - 呼び出し側は生の `form.password`/
 	 * `form.clearPassword` をここへ直接詰めない。
 	 */
@@ -223,7 +223,7 @@ export interface CollectionGroup {
 	 * 登録するときの `writable` チェックボックスの既定値。`tags.writable`
 	 * 自体の検証（computed タグ拒否・Modbus 読み取り専用領域拒否）とは
 	 * 無関係 - あくまで新規タグフォームを開いた瞬間の UI 上の初期値だけを
-	 * 決める（`$lib/banto/writableDefault.ts` 参照）。
+	 * 決める（`#lib/banto/writableDefault.ts` 参照）。
 	 */
 	defaultWritable: boolean;
 	/**
@@ -859,7 +859,7 @@ export interface BatchTagsResult {
 }
 
 /**
- * T11-1 の一括登録 API。連続登録（`$lib/banto/continuousRegistration.ts`
+ * T11-1 の一括登録 API。連続登録（`#lib/banto/continuousRegistration.ts`
  * が展開した `TagInput[]`）と、将来の T11-2 CSV インポートが共有する。
  * `dryRun: true` は検証のみで DB 無変更（プレビュー確認後に
  * `dryRun: false` で本適用する2段階フロー — 設計「dry-run 必須」）。
@@ -878,7 +878,7 @@ export async function createTagsBatch(tags: TagInput[], dryRun: boolean): Promis
  * `banto_hub_core::rest::TagBatchUpdatePayload`（`#[serde(flatten)]` で
  * {@link TagInput} の全フィールドを JSON 直下に展開し、`id` だけ乗せる形。
  * 単票 PUT（`updateTag`）と同じく `expectedRevision` は任意 - 一括操作の
- * 呼び出し元（`+page.svelte`/`$lib/banto/tagBulkOps.ts`）は常に選択時点の
+ * 呼び出し元（`+page.svelte`/`#lib/banto/tagBulkOps.ts`）は常に選択時点の
  * {@link Tag.revision} を明示的に渡す。
  */
 export interface BatchTagUpdateRow extends TagInput {

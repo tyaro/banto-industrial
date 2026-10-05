@@ -5,7 +5,7 @@
 	 * だけで、挙動は変えない。常に表示（権限ガード無し）。
 	 */
 	import type { ThemeMode, ThemePreset } from '@banto/theme';
-	import { settings } from '$lib/settings.svelte';
+	import { settings } from '#lib/settings.svelte.js';
 
 	const modes: { value: ThemeMode; label: string }[] = [
 		{ value: 'light', label: 'ライト' },

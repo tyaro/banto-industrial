@@ -27,8 +27,8 @@
 	 * ConnectivitySection の元の `$effect` から変えずに移す。
 	 */
 	import { page } from '$app/state';
-	import { isAdmin } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
 	import { hubStatusStore } from './hubStatusStore.svelte';
 	import type { SettingsCategory } from './categories';
 	import type { LayoutProps } from './$types';

@@ -4,7 +4,7 @@
  * スクリプトから export せず素の .ts ファイルに置く（呼び出し側の
  * tags ページがこの型を import できるようにするため）。
  */
-import type { PlcConnection, CollectionGroup } from '$lib/banto/tagRegistryAdmin';
+import type { PlcConnection, CollectionGroup } from '#lib/banto/tagRegistryAdmin.js';
 
 export type ConnectionTreeNodeData =
 	| { kind: 'all' }

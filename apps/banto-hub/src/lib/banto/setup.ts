@@ -31,7 +31,7 @@ import {
 	initBanto
 } from '@banto/admin-core';
 import type { Notifier, UiSettingsProvider } from '@banto/admin-core';
-import { toastStore } from '$lib/toast.svelte';
+import { toastStore } from '#lib/toast.svelte.js';
 
 /** usersAdmin.ts 等の CSRF ヘッダー（管理系 REST 全体で共通）。 */
 export const CSRF_HEADER = { 'X-Banto-Client': 'banto' } as const;

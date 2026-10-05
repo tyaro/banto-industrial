@@ -2,12 +2,12 @@
 	// relay-wright の同名コンポーネントから無改変で複製。
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { navItems, type NavItem } from '$lib/navigation';
-	import { settings } from '$lib/settings.svelte';
-	import { mobileNavStore } from '$lib/mobileNav.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
-	import { APP_NAME } from '$lib/appName';
+	import { navItems, type NavItem } from '#lib/navigation.js';
+	import { settings } from '#lib/settings.svelte.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
+	import { APP_NAME } from '#lib/appName.js';
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
 

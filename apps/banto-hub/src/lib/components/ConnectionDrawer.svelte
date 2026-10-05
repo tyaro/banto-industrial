@@ -33,7 +33,7 @@
 	 * ロジックはどちらの提示先でも変更していない。
 	 *
 	 * 純関数部分（連番採番・既定ポート・フォーム⇄API入力変換）は
-	 * `$lib/banto/plcConnectionForm.ts` へ切り出し済み（そちらでユニット
+	 * `#lib/banto/plcConnectionForm.ts` へ切り出し済み（そちらでユニット
 	 * テスト済み）。
 	 *
 	 * **連番プリフィルは pending queue も見る**（実機で再現した不具合の修正1、
@@ -80,12 +80,12 @@
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
 	import Modal from './Modal.svelte';
-	import { toastStore } from '$lib/toast.svelte';
-	import { isAdmin } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
-	import { listPendingChanges, type PendingChange } from '$lib/banto/pendingChangesAdmin';
-	import { pendingCreateNames } from '$lib/banto/pendingCreateNames';
-	import { isFormDirty } from '$lib/banto/formDirty';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { listPendingChanges, type PendingChange } from '#lib/banto/pendingChangesAdmin.js';
+	import { pendingCreateNames } from '#lib/banto/pendingCreateNames.js';
+	import { isFormDirty } from '#lib/banto/formDirty.js';
 	import {
 		createPlcConnection,
 		deletePlcConnection,
@@ -99,7 +99,7 @@
 		type DbConnectionTestOutcome,
 		type PlcConnection,
 		type PlcConnectionTestResult
-	} from '$lib/banto/tagRegistryAdmin';
+	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		PROTOCOL_OPTIONS,
 		blankConnectionForm,
@@ -112,12 +112,12 @@
 		nextConnectionName,
 		validatePostgresFields,
 		type PlcConnectionFormState
-	} from '$lib/banto/plcConnectionForm';
+	} from '#lib/banto/plcConnectionForm.js';
 	import {
 		countConnectionCascadeImpact,
 		formatConnectionDeleteConfirmMessage
-	} from '$lib/banto/registryCascadeImpact';
-	import type { CollectionGroup, Tag } from '$lib/banto/tagRegistryAdmin';
+	} from '#lib/banto/registryCascadeImpact.js';
+	import type { CollectionGroup, Tag } from '#lib/banto/tagRegistryAdmin.js';
 
 	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::plc_connections_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
 	const PENDING_SOURCE = 'plc_connections.create';

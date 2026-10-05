@@ -13,10 +13,10 @@ import {
 	grantFallback,
 	resolveSettled
 } from '@banto/admin-core';
-import { bantoReady } from '$lib/banto/setup';
-import { SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
-import { COMMISSIONING_KIND } from '$lib/banto/commissioning';
-import { settings } from '$lib/settings.svelte';
+import { bantoReady } from '#lib/banto/setup.js';
+import { SESSION_CHECK_FAILED_MESSAGE } from '#lib/banto/sessionGuard.js';
+import { COMMISSIONING_KIND } from '#lib/banto/commissioning.js';
+import { settings } from '#lib/settings.svelte.js';
 
 // (app) グループ全体の認証ガード（banto #260、設計 §6.1。v3.0.0 で grant 方式）。
 // セッションの確定は SessionController（「誰がログインしているか」の唯一の

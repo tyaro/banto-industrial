@@ -14,7 +14,7 @@
  * `apiKeyWarnings.test.ts` が `@banto/admin-core` を一切経由せずに読み込める
  * ようにしてある（`apiKeysAdmin.ts` は既存の import 元互換のため、この
  * モジュールを re-export する - `+page.svelte` は今までどおり
- * `$lib/banto/apiKeysAdmin` から `apiKeyWarnings` を使える）。
+ * `#lib/banto/apiKeysAdmin` から `apiKeyWarnings` を使える）。
  */
 
 /**

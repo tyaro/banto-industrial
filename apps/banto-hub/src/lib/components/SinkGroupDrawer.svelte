@@ -17,7 +17,7 @@
 	 * `QueuedWhileRunningError`（202応答）の分岐は無い（常に確定応答）。
 	 *
 	 * 純関数部分（検証・DDL 組み立て・フォーム⇄API入力変換）は
-	 * `$lib/banto/sinkGroupForm.ts` へ切り出し済み（そちらでユニットテスト
+	 * `#lib/banto/sinkGroupForm.ts` へ切り出し済み（そちらでユニットテスト
 	 * 済み）。
 	 *
 	 * **2026-09-15 追補（誤爆防止、#376 取りこぼしの回収）**:
@@ -32,20 +32,20 @@
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
-	import { toastStore } from '$lib/toast.svelte';
-	import { isFormDirty } from '$lib/banto/formDirty';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { isFormDirty } from '#lib/banto/formDirty.js';
 	import {
 		createSinkGroup,
 		deleteSinkGroup,
 		updateSinkGroup,
 		type SinkGroup
-	} from '$lib/banto/sinkGroupsAdmin';
+	} from '#lib/banto/sinkGroupsAdmin.js';
 	import {
 		isDbSourceConnection,
 		type CollectionGroup,
 		type PlcConnection,
 		type Tag
-	} from '$lib/banto/tagRegistryAdmin';
+	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		SINK_MODE_OPTIONS,
 		blankSinkGroupForm,
@@ -55,8 +55,8 @@
 		sinkGroupToForm,
 		validateSinkGroupForm,
 		type SinkGroupFormState
-	} from '$lib/banto/sinkGroupForm';
-	import { nextSequentialName } from '$lib/banto/sequentialName';
+	} from '#lib/banto/sinkGroupForm.js';
+	import { nextSequentialName } from '#lib/banto/sequentialName.js';
 
 	interface Props {
 		open: boolean;

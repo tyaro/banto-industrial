@@ -29,11 +29,11 @@ import { isHttpError, isRedirect } from '@sveltejs/kit';
 import { getSessionController } from '@banto/admin-core';
 
 vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
-vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
-// この最小 vitest 構成には `$lib` の別名が無いので、本物のモジュールへ向ける（差し替えではない）。
-vi.mock('$lib/banto/sessionGuard', () => import('./sessionGuard'));
-vi.mock('$lib/banto/commissioning', () => import('./commissioning'));
-vi.mock('$lib/settings.svelte', () => ({ settings: { syncFromProvider: async () => {} } }));
+vi.mock('#lib/banto/setup.js', () => ({ bantoReady: Promise.resolve() }));
+// この最小 vitest 構成には `#lib` の別名が無いので、本物のモジュールへ向ける（差し替えではない）。
+vi.mock('#lib/banto/sessionGuard', () => import('./sessionGuard'));
+vi.mock('#lib/banto/commissioning', () => import('./commissioning'));
+vi.mock('#lib/settings.svelte.js', () => ({ settings: { syncFromProvider: async () => {} } }));
 
 import { load } from '../../routes/(app)/+layout';
 import { SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';

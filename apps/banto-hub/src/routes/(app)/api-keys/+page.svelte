@@ -44,7 +44,7 @@
 	 */
 	import { page } from '$app/state';
 	import { isProviderError } from '@banto/admin-core';
-	import { toastStore } from '$lib/toast.svelte';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import {
 		listApiKeys,
 		createApiKey,
@@ -53,7 +53,7 @@
 		apiKeyWarnings,
 		type ApiKeySummary,
 		type IssuedApiKey
-	} from '$lib/banto/apiKeysAdmin';
+	} from '#lib/banto/apiKeysAdmin.js';
 
 	function errorMessage(err: unknown): string {
 		return isProviderError(err) ? err.message : String(err);

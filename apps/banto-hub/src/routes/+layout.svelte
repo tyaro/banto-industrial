@@ -1,9 +1,9 @@
 <script lang="ts">
 	// relay-wright の同名ファイルから複製。
 	import '../app.css';
-	import { bantoReady } from '$lib/banto/setup'; // initBanto() (+ EventProvider) をどのルートガードより先に完了させる
-	import { settings } from '$lib/settings.svelte';
-	import ToastHost from '$lib/components/ToastHost.svelte';
+	import { bantoReady } from '#lib/banto/setup.js'; // initBanto() (+ EventProvider) をどのルートガードより先に完了させる
+	import { settings } from '#lib/settings.svelte.js';
+	import ToastHost from '#lib/components/ToastHost.svelte';
 
 	let { children } = $props();
 

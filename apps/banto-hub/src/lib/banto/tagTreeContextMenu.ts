@@ -56,7 +56,7 @@
  * 再設定・削除」項目を追加する本体は、この関数を土台にする
  * `resolveTreeContextMenuItems`（本ファイル下部）に実装している。
  */
-import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
+import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 
 /**
  * `PlcConnection.protocol === 'virtual'` 判定。`tagOnboarding.ts::isVirtual`
@@ -267,7 +267,7 @@ export function resolveReadOnlyTreeContextMenuItems(
  * ため（`tags/+page.svelte` は Svelte コンポーネントで DOM 実 E2E でしか
  * 検証できないが、この分岐だけは純関数として抜き出せる）。
  *
- * `canWrite` は呼び出し側（`$lib/permissions.ts::canWriteResources(role)`）
+ * `canWrite` は呼び出し側（`#lib/permissions.ts::canWriteResources(role)`）
  * が計算済みの真偽値をそのまま渡す - このファイルは「依存ゼロ」方針
  * （冒頭 doc comment 参照）のため `permissions.ts` を import せず、role の
  * 意味（'admin'/'editor'/'viewer'）そのものはここでは扱わない。

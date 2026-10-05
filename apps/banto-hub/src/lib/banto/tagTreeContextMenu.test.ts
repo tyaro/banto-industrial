@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { PlcConnection, CollectionGroup } from './tagRegistryAdmin';
-import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
+import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 import {
 	resolveTagTreeContextMenuAction,
 	resolveTreeContextMenuItems,
@@ -265,7 +265,7 @@ describe('resolveReadOnlyTreeContextMenuItems', () => {
  * v3.0.0）で動くため、viewer ロールの実際の権限差を
  * 検証できない。この分岐が「viewer には書き込み系メニューが絶対に出ない」
  * ことを保証する最終防衛線になる - `canWriteResources('viewer')` が
- * `false` であることも合わせて固定し、`$lib/permissions.ts` 側の定義が
+ * `false` であることも合わせて固定し、`#lib/permissions.ts` 側の定義が
  * 変わってもここで検知できるようにする。
  */
 describe('resolveTreeContextMenuItemsForRole', () => {

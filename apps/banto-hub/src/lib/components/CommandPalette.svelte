@@ -2,8 +2,8 @@
 	// relay-wright の同名コンポーネントから無改変で複製。
 	import { onMount, tick } from 'svelte';
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
-	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '$lib/commands';
-	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '#lib/commands.js';
+	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 	import { attachFocusTrap } from './focusTrap';
 	import { restoreFocus } from './focusRestore';
 

@@ -11,22 +11,22 @@
 	import { untrack } from 'svelte';
 	import { afterNavigate, goto, invalidateAll } from '$app/navigation';
 	import { getSessionController, notify } from '@banto/admin-core';
-	import { isLeavingForLogin, leaveForLogin } from '$lib/banto/logout.svelte';
-	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '$lib/banto/ownerChange';
-	import Header from '$lib/components/Header.svelte';
-	import Sidebar from '$lib/components/Sidebar.svelte';
-	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import { isLeavingForLogin, leaveForLogin } from '#lib/banto/logout.svelte.js';
+	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
+	import Header from '#lib/components/Header.svelte';
+	import Sidebar from '#lib/components/Sidebar.svelte';
+	import CommandPalette from '#lib/components/CommandPalette.svelte';
 	import {
 		hasVisibleLayerAbove,
 		hasVisibleMenuLayer,
 		LAYER_MARKER_ATTR
-	} from '$lib/components/escLayering';
-	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
-	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
-	import { commandPaletteStore } from '$lib/commandPalette.svelte';
-	import { mobileNavStore } from '$lib/mobileNav.svelte';
-	import { isAdmin } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
+	} from '#lib/components/escLayering.js';
+	import { listPendingChanges } from '#lib/banto/pendingChangesAdmin.js';
+	import { countUnappliedPendingChanges } from '#lib/banto/pendingUnappliedCount.js';
+	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
 
 	let { children, data } = $props();
 	let pendingCount = $state(0);
@@ -113,7 +113,7 @@
 	// （`sessionRecheck.ts`）が確定した `none`、試運転の grant の失効（ロックダウン）。`requestedFor` で
 	// 1 つの generation につき 1 回。ログアウト中（・/login へ移る途中、試運転の
 	// ロックダウンの後を含む）は走らせない: その手順が自分で /login へ移り、
-	// ここで始めた invalidation は遷移に勝ってしまう（`$lib/banto/logout.svelte.ts`）。
+	// ここで始めた invalidation は遷移に勝ってしまう（`#lib/banto/logout.svelte.ts`）。
 	// `isLeavingForLogin()` はリアクティブなので、その間に飛ばした変化は終わった
 	// ときに扱われる。
 	const sessionController = getSessionController();
@@ -152,7 +152,9 @@
 	);
 
 	// ルート変更時はオフキャンバスを必ず閉じる（設計の「閉じる契機」の1つ）。
-	afterNavigate(() => {
+	afterNavigate(({ shallow }) => {
+		if (shallow) return;
+
 		mobileNavStore.closeNav();
 	});
 

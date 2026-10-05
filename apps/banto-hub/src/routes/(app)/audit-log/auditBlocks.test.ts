@@ -12,7 +12,7 @@
  * 3. 失敗が状態に残らない（トーストだけ）。
  */
 import { describe, expect, it } from 'vitest';
-import type { AuditLogEntry, AuditLogList } from '$lib/banto/auditLogAdmin';
+import type { AuditLogEntry, AuditLogList } from '#lib/banto/auditLogAdmin.js';
 import {
 	BLOCK_SIZE,
 	blocksToFetch,

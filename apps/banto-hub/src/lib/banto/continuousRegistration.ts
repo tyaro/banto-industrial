@@ -278,7 +278,7 @@ export function defaultStartNumberFromAddress(address: string): number | null {
 
 /**
  * T19 S1-b（UX-35）: 開始アドレス欄の `oninput` から呼ぶ、名前パターン欄の
- * プリフィル判定。`$lib/banto/tagNamePrefill.ts::nextTagNameOnAddressChange`
+ * プリフィル判定。`#lib/banto/tagNamePrefill.ts::nextTagNameOnAddressChange`
  * と同じ「touched 追跡」方式 - ユーザーが名前パターン欄を一度でも直接編集
  * したら `namePatternTouched` を立て、以後はアドレス入力に追従させない。
  * `null` を返せば呼び出し側は名前パターン欄に触れない。

@@ -22,11 +22,11 @@
 	 * 済みなので、この section 側は保存直後の即時反映のためだけに
 	 * `hubStatusStore.load()` を呼ぶ。
 	 */
-	import { isAdmin } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
-	import { saveMqttSettings } from '$lib/banto/mqttSettingsAdmin';
-	import { saveGrpcSettings } from '$lib/banto/grpcSettingsAdmin';
-	import { toastStore } from '$lib/toast.svelte';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { saveMqttSettings } from '#lib/banto/mqttSettingsAdmin.js';
+	import { saveGrpcSettings } from '#lib/banto/grpcSettingsAdmin.js';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import { errorMessage } from './shared';
 	import { mqttSettingsStore } from './mqttSettingsStore.svelte';
 	import { grpcSettingsStore } from './grpcSettingsStore.svelte';

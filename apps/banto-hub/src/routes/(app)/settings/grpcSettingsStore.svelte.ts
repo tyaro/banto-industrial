@@ -5,7 +5,7 @@
  * 反映する必要がある）で、フォーム送信中フラグ・エラー文言は
  * ConnectivitySection にしか要らないのでローカルのまま残す。
  */
-import { getGrpcSettings, type GrpcSettings } from '$lib/banto/grpcSettingsAdmin';
+import { getGrpcSettings, type GrpcSettings } from '#lib/banto/grpcSettingsAdmin.js';
 
 class GrpcSettingsStore {
 	enabled = $state(false);

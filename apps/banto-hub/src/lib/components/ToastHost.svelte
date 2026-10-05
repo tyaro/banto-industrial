@@ -1,7 +1,7 @@
 <script lang="ts">
 	// relay-wright の同名コンポーネントから複製（当初は無改変）。
 	// T19 S2-c2（UX-40）でアクションボタン（取り消し等）の描画を追加。
-	import { toastStore } from '$lib/toast.svelte';
+	import { toastStore } from '#lib/toast.svelte.js';
 </script>
 
 <div class="toast-host" role="status" aria-live="polite">

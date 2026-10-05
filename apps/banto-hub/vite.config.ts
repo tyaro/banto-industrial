@@ -1,9 +1,17 @@
+import adapter from '@sveltejs/adapter-static';
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 import { sveltekit } from '@sveltejs/kit/vite';
 import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-	plugins: [tailwindcss(), sveltekit()],
+	plugins: [
+		tailwindcss(),
+		sveltekit({
+			preprocess: vitePreprocess(),
+			adapter: adapter({ pages: 'build', assets: 'build', fallback: 'index.html' })
+		})
+	],
 	// relay-wright の vite.config.ts から複製: @banto/* は git 依存（実体の
 	// node_modules パッケージ）なので、Vite の dep optimizer が未コンパイル
 	// の .svelte/.svelte.ts ソースを esbuild で事前バンドルしようとして失敗

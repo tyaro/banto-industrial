@@ -27,7 +27,7 @@
  * ため、判定専用の `activeMatch`（既定は `path` 自身、他の項目は今までと
  * 同じ挙動）を導入し、`設定` だけ `/settings` を明示している。
  */
-import { APP_NAME } from '$lib/appName';
+import { APP_NAME } from '#lib/appName.js';
 
 export interface NavItem {
 	path: string;

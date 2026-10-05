@@ -22,11 +22,11 @@
 	 * 他クライアントが最後の admin を消す、というレースも理論上あり得る）。
 	 */
 	import { goto, invalidateAll } from '$app/navigation';
-	import { toastStore } from '$lib/toast.svelte';
-	import { commissioningState } from '$lib/banto/commissioningState.svelte';
-	import { lockDown } from '$lib/banto/commissioning';
-	import { lockDownAndLeave } from '$lib/banto/commissioningLockDown';
-	import { listUsers } from '$lib/banto/usersAdmin';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { commissioningState } from '#lib/banto/commissioningState.svelte.js';
+	import { lockDown } from '#lib/banto/commissioning.js';
+	import { lockDownAndLeave } from '#lib/banto/commissioningLockDown.js';
+	import { listUsers } from '#lib/banto/usersAdmin.js';
 	import { errorMessage } from './shared';
 
 	const NO_ADMIN_MESSAGE =

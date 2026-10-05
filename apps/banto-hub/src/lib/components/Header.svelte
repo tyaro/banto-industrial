@@ -2,11 +2,11 @@
 	// relay-wright の同名コンポーネントから無改変で複製。
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { hubLogout } from '$lib/banto/hubLogout';
-	import { pageTitle } from '$lib/navigation';
-	import { mobileNavStore } from '$lib/mobileNav.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { hubLogout } from '#lib/banto/hubLogout.js';
+	import { pageTitle } from '#lib/navigation.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
 
@@ -25,8 +25,8 @@
 		// banto v2.0.0 (#260, design §6.1): logout() -> confirm the session ->
 		// /login only when it is confirmed `none` (another tab's login
 		// confirmed meanwhile stays). `'stayed'`/`'unverified'` are told with a
-		// toast - see `$lib/banto/logout.svelte.ts` for the full sequence.
-		// 試運転の grant のセッションも同じ流れ（`$lib/banto/hubLogout.ts`）。
+		// toast - see `#lib/banto/logout.svelte.ts` for the full sequence.
+		// 試運転の grant のセッションも同じ流れ（`#lib/banto/hubLogout.ts`）。
 		await hubLogout(() => goto('/login'));
 	}
 </script>

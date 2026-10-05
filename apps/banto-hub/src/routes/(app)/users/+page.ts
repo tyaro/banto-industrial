@@ -1,6 +1,6 @@
 import { redirect } from '@sveltejs/kit';
-import { isAdmin } from '$lib/permissions';
-import { sessionStore } from '$lib/session.svelte';
+import { isAdmin } from '#lib/permissions.js';
+import { sessionStore } from '#lib/session.svelte.js';
 
 // chronogazer の同名ファイルから複製。差分はリダイレクト先のみ
 // （chronogazer の /monitor 相当が banto-hub では /status）。

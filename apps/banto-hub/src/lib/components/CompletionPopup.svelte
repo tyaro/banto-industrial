@@ -47,9 +47,9 @@
 	 * `stopPropagation` して担保する。
 	 *
 	 * 候補の中身（何を出すか・何を除外するか）は一切持たない - 純関数
-	 * `$lib/banto/expressionCompletion.ts` が決めたものを描くだけ。
+	 * `#lib/banto/expressionCompletion.ts` が決めたものを描くだけ。
 	 */
-	import type { CompletionCandidate } from '$lib/banto/expressionCompletion';
+	import type { CompletionCandidate } from '#lib/banto/expressionCompletion.js';
 
 	interface Props {
 		/** 一覧の左上（クライアント座標）。呼び出し元が `.expr-mirror` から算出する。 */

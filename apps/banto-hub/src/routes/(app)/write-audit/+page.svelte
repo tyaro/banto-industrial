@@ -9,8 +9,8 @@
 	 * 速くない想定 - 収集ではなく能動的な書き込み操作のみが対象）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
-	import { toastStore } from '$lib/toast.svelte';
-	import { listWriteAudit, type WriteAuditEntry } from '$lib/banto/writeAuditAdmin';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { listWriteAudit, type WriteAuditEntry } from '#lib/banto/writeAuditAdmin.js';
 
 	function errorMessage(err: unknown): string {
 		return isProviderError(err) ? err.message : String(err);
