@@ -19,7 +19,8 @@ banto-hub のサービスと REST ルーターを banto のものに置き換え
 2026-10-05: §5 の起動時の環境判定に、banto v3.0.1（#321）で保護画面を直接開いたときの
 真っ白が解消したこと（実装済み）を反映。同日: §5 に ChronoGazer の SvelteKit 3 移行（banto v4.0.0、
 実装済み。banto-hub の npm は v3.0.1 のままの移行中）を追記。同日: §5 に banto-hub の SvelteKit 3 移行
-（実装済み。両アプリの npm が v4.0.0 に揃い、移行中のずれは解消）を追記。
+（実装済み。両アプリの npm が v4.0.0 に揃い、移行中のずれは解消）を追記。2026-10-06: §5 に
+両アプリの監査ログ画面を banto の `SnapshotListResource` に寄せたこと（実装済み）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -335,6 +336,19 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   `monitorHref` の単体テストが落ちる）。#326 の `navigationSettled.svelte.ts` を写し、配線①はナビゲーションが
   終わるまで `refreshAll()` を始めない（タグ画面の未保存の変更の確認 `beforeNavigate` を飛ばさせない）。
   単体テストの vitest は `$app/paths` を読むため `sveltekit()` プラグインに替えた。
+
+- **監査ログ画面を banto の `SnapshotListResource` に寄せる（2026-10-06、実装済み。banto #248、
+  「重複実装は banto に寄せる」の続き）**: 両アプリの `/audit-log` は、ブロックの遅延取得・世代の
+  スナップショット境界（`asOfId`）・剪定による失効・ブロック単位の失敗・処理中の中断を自前で持っていた
+  （ChronoGazer #410 の `auditBlocks.ts` + `#lib/blockCache.ts`、banto-hub #428 のその複製）。banto v2 以降の
+  `@banto/admin-core` の `createSnapshotListResource` が同じ判断を持つので、画面を admin-template の
+  `/audit-log` の形に写して置き換え、`auditBlocks.ts`（+ テスト）と banto-hub の `blockCache.ts`（+ 複製の
+  一致を見ていた `blockCache.sync.test.ts`）を削除した。ChronoGazer の `blockCache.ts` は `/events` が使うので
+  残す。サーバー側は I2a / I3' で既に banto の `audit_log_router`（Tauri は `list_as_of`）なので変更なし。
+  挙動の差: 応答の `deletionEpoch` でも失効を見る（件数が変わらない剪定 + 遅れたコミットも検出）、
+  「再読み込み」は処理中でも押せる（処理中の要求を中断して新しい世代に）、選択中の行を強調する。
+  文言（日本語の直書き・「0件の記録があります。」）と 15 秒の読み取りの上限は残した（banto の上限の
+  文言は英語の固定文なので、`auditLogAdmin.ts` の `createAuditLogFetcher` がこちらの上限を先に掛ける）。
 
   続き（未着手）: 初回セットアップ画面。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
