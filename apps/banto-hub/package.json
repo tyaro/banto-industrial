@@ -17,7 +17,7 @@
     "@banto/forms": "github:tyaro/banto#v4.0.0&path:packages/forms",
     "@banto/grid-svelte": "github:tyaro/banto#v4.0.0&path:packages/grid-svelte",
     "@banto/theme": "github:tyaro/banto#v4.0.0&path:packages/theme",
-    "@tauri-apps/api": "^2.11.1"
+    "@tauri-apps/api": "^2.12.1"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^4.0.0",
@@ -28,8 +28,8 @@
     "svelte-check": "^4.7.6",
     "tailwindcss": "^4.3.3",
     "typescript": "^6.0.3",
-    "vite": "^8.3.0",
-    "vitest": "^5.0.1"
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
   },
   "imports": {
     "#lib": "./src/lib/index.js",
