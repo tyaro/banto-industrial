@@ -40,7 +40,7 @@
 //! OFF に戻らない（設定画面か新しい DB で戻す）。書くのはこの 1 項目だけで、
 //! `server.enabled`・bind・port はそのまま残す。
 
-use banto_server::{start, static_router, ServerConfig};
+use banto_server::{start, static_router, with_security_headers, ServerConfig};
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogService};
 use chronogazer_core::backup::BackupService;
@@ -259,21 +259,26 @@ async fn main() {
         tokio::spawn(async move { collect.autostart().await });
     }
 
-    let app = api_router(
-        users,
-        settings,
-        audit,
-        backup,
-        hub,
-        plc_connections,
-        collection_groups,
-        tags,
-        collect.clone(),
-        auth,
-        events,
-        allow_setup,
-    )
-    .merge(static_router::<FrontendAssets>());
+    // `with_security_headers`（banto #500）は最後（最外）に掛ける
+    // （静的 UI・`/api/*`・SSE のすべてに付く。デスクトップ側の
+    // `start_embedded_server` と同じ構成）。
+    let app = with_security_headers(
+        api_router(
+            users,
+            settings,
+            audit,
+            backup,
+            hub,
+            plc_connections,
+            collection_groups,
+            tags,
+            collect.clone(),
+            auth,
+            events,
+            allow_setup,
+        )
+        .merge(static_router::<FrontendAssets>()),
+    );
 
     let server = start(ServerConfig { bind, port }, app)
         .await

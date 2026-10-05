@@ -161,6 +161,12 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
 残る）。仕組みは banto の grant（ADR-0012・ADR-0017、`POST
 /api/auth/grant/publicViewer`）。信頼できる LAN でのみ有効にすること。
 
+組み込みサーバー（デスクトップ版の LAN アクセスと `banto-serve`）の応答には、
+banto の**セキュリティヘッダー**（CSP・`X-Content-Type-Options: nosniff`・
+`X-Frame-Options: DENY`・`Referrer-Policy: same-origin`。banto の
+`with_security_headers`、#500）が付く。CSP は `connect-src 'self'` などで同一
+オリジンの通信だけを許す（admin-template と同じ）。
+
 ## Hub 接続：キーが使えなくなったとき
 
 設定の「Hub 接続」で選んだタグを banto-hub から購読しているとき、Hub が
