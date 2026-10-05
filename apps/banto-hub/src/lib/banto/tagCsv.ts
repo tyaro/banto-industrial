@@ -2,7 +2,7 @@
  * T11-2 CSV インポート/エクスポート（docs/ux-plan.md §3「T11: タグの一括
  * 登録（連続登録 + CSV インポート/エクスポート）」）: タグ定義を CSV で
  * バックアップ/複製/レビューする。T11-1 の一括登録 API
- * （`POST /api/tags/batch`、`$lib/banto/tagRegistryAdmin.ts::createTagsBatch`）
+ * （`POST /api/tags/batch`、`#lib/banto/tagRegistryAdmin.ts::createTagsBatch`）
  * をそのまま消費する第2の呼び出し元 — サーバー側の変更はない
  * （`apps/banto-hub/core/src/rest.rs::tags_batch` のコメントに「CSV
  * インポート(T11-2)ではこの index がそのまま CSV の行番号(ヘッダ行を

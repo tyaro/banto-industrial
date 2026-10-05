@@ -5,7 +5,7 @@
 	 * だけで、挙動は変えない。常に表示（権限ガード無し）。
 	 */
 	import { getAuthProvider } from '@banto/admin-core';
-	import { toastStore } from '$lib/toast.svelte';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import { errorMessage } from './shared';
 
 	const changePassword = getAuthProvider().changePassword;

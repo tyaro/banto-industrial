@@ -7,8 +7,9 @@
 	// 不要 - 「ログイン状態を保持」チェックは実装指示どおり常時表示する。
 	import { goto } from '$app/navigation';
 	import { getAuthProvider, notify } from '@banto/admin-core';
-	import { bantoReady } from '$lib/banto/setup';
-	import { APP_NAME } from '$lib/appName';
+	import { bantoReady } from '#lib/banto/setup.js';
+	import { APP_NAME } from '#lib/appName.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 
 	// status() が解決するまでは未確定: 一瞬でも片方のフォームを描画して
 	// 出し直す「フラッシュ」を避けるため何も出さない。
@@ -48,10 +49,10 @@
 			if (remember) params.remember = true;
 			const result = await getAuthProvider().login(params);
 			if (result.success) {
-				goto('/status');
+				goto(resolveAppPath('/status'));
 			} else if (result.superseded) {
 				notify('info', LOGIN_SUPERSEDED_MESSAGE);
-				goto('/status');
+				goto(resolveAppPath('/status'));
 			} else {
 				error = result.error ?? 'ログインに失敗しました';
 			}
@@ -82,10 +83,10 @@
 			}
 			const result = await setup({ username, password, displayName });
 			if (result.success) {
-				goto('/status');
+				goto(resolveAppPath('/status'));
 			} else if (result.superseded) {
 				notify('info', LOGIN_SUPERSEDED_MESSAGE);
-				goto('/status');
+				goto(resolveAppPath('/status'));
 			} else {
 				error = result.error ?? 'セットアップに失敗しました';
 			}

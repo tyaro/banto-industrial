@@ -1,7 +1,7 @@
 /**
  * relay-wright の同名ファイルから複製。永続化の二層構成（localStorage の
  * FOUC キャッシュ + UiSettingsProvider）はそのまま — banto-hub では
- * `getUiSettings()` が `createLocalUiSettings()`（$lib/banto/setup.ts 参照:
+ * `getUiSettings()` が `createLocalUiSettings()`（#lib/banto/setup.ts 参照:
  * バックエンドに /api/ui-settings が無いため）に固定されるので、
  * `persistRemote`/`syncFromProvider` は実質 localStorage への二重書き込み
  * になるが、将来サーバー側 UiSettingsProvider を追加したときに無改変で

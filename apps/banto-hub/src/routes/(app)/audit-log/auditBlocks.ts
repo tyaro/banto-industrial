@@ -19,7 +19,7 @@
  *    未取得・取得失敗・正常な 0 件の区別も再試行の手段も無かった。
  *
  * 世代・境界・飛行中・ブロック単位の失敗・世代違いの応答の排除は
- * `$lib/blockCache`（chronogazer の複製）が行い、ここには `/audit-log` 固有の
+ * `#lib/blockCache`（chronogazer の複製）が行い、ここには `/audit-log` 固有の
  * 部分だけを置く:
  *
  * - **保持期間の削除によるスナップショット失効**（[`AUDIT_POLICY`]）。境界
@@ -38,7 +38,7 @@
  * （`core/src/db.rs` の `apply_app_schema`）なので単調増加かつ削除後も
  * 再利用されない - 境界が「集合のメンバー」を決められる前提はこれ。
  */
-import type { AuditLogEntry } from '$lib/banto/auditLogAdmin';
+import type { AuditLogEntry } from '#lib/banto/auditLogAdmin.js';
 import {
 	BlockLoader,
 	isGenerationHalted,

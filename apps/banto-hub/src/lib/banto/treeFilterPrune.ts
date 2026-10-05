@@ -3,7 +3,7 @@
  * すべて）が**消えた対象を指したままにならない**ようにする純関数。
  *
  * タグ登録（`(app)/tags/+page.svelte` の `TreeFilter`）とタグモニタ
- * （`$lib/banto/monitorFilter.ts` の `MonitorTreeFilter`）は同じ3値の判別共用体で、
+ * （`#lib/banto/monitorFilter.ts` の `MonitorTreeFilter`）は同じ3値の判別共用体で、
  * どちらもカタログ再取得（`reload()`）のあとも選択 id をそのまま持ち続けていた。
  * 選択中の接続・収集グループが削除されると、
  *

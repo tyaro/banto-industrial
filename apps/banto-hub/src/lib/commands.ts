@@ -6,7 +6,7 @@
 import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
 import { hubLogout } from './banto/hubLogout';
-import { navItems } from './navigation';
+import { navItems, resolveAppPath } from './navigation';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
 import { isAdmin } from './permissions';
@@ -21,7 +21,7 @@ function navigationCommands(): PaletteCommand[] {
 		keywords: [item.path],
 		visible: item.adminOnly ? () => isAdmin(sessionStore.role) : undefined,
 		run: () => {
-			void goto(item.path);
+			void goto(resolveAppPath(item.path));
 		}
 	}));
 }
@@ -78,7 +78,7 @@ function sessionCommands(): PaletteCommand[] {
 			visible: () => !sessionStore.authDisabled,
 			run: async () => {
 				// banto v2.0.0 (#260): same as Header.svelte's logout.
-				await hubLogout(() => goto('/login'));
+				await hubLogout(() => goto(resolveAppPath('/login')));
 			}
 		}
 	];
@@ -120,7 +120,7 @@ function configCommands(): PaletteCommand[] {
 			visible: () => isAdmin(sessionStore.role),
 			run: () => {
 				// #359 段階2: 構成パッケージのセクションは data カテゴリへ移設。
-				void goto('/settings/data#config-package');
+				void goto(`${resolveAppPath('/settings/data')}#config-package`);
 			}
 		}
 	];

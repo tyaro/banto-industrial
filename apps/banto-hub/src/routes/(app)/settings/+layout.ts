@@ -1,6 +1,6 @@
-import { isAdmin } from '$lib/permissions';
-import { sessionStore } from '$lib/session.svelte';
-import { commissioningState } from '$lib/banto/commissioningState.svelte';
+import { isAdmin } from '#lib/permissions.js';
+import { sessionStore } from '#lib/session.svelte.js';
+import { commissioningState } from '#lib/banto/commissioningState.svelte.js';
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
 
 /**

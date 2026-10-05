@@ -21,12 +21,13 @@
 	 * validation エラーを表示するのはそのため - 事前チェックと実行の間に
 	 * 他クライアントが最後の admin を消す、というレースも理論上あり得る）。
 	 */
-	import { goto, invalidateAll } from '$app/navigation';
-	import { toastStore } from '$lib/toast.svelte';
-	import { commissioningState } from '$lib/banto/commissioningState.svelte';
-	import { lockDown } from '$lib/banto/commissioning';
-	import { lockDownAndLeave } from '$lib/banto/commissioningLockDown';
-	import { listUsers } from '$lib/banto/usersAdmin';
+	import { goto, refreshAll } from '$app/navigation';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
+	import { commissioningState } from '#lib/banto/commissioningState.svelte.js';
+	import { lockDown } from '#lib/banto/commissioning.js';
+	import { lockDownAndLeave } from '#lib/banto/commissioningLockDown.js';
+	import { listUsers } from '#lib/banto/usersAdmin.js';
 	import { errorMessage } from './shared';
 
 	const NO_ADMIN_MESSAGE =
@@ -87,7 +88,10 @@
 			// 保存の直後にサーバーがそのトークンを全部失効させるので、確認 → 確定した
 			// `none` なら /login、の順序は `commissioningLockDown.ts` の doc。アカウントで
 			// ログインしたままなら本人のトークンは有効なままで 'stayed'。
-			const outcome = await lockDownAndLeave({ lockDown, goToLogin: () => goto('/login') });
+			const outcome = await lockDownAndLeave({
+				lockDown,
+				goToLogin: () => goto(resolveAppPath('/login'))
+			});
 			if (outcome === 'left') {
 				toastStore.push('success', 'ロックダウンしました。ログイン画面へ移動します。');
 			} else if (outcome === 'stayed') {
@@ -97,7 +101,7 @@
 				// カテゴリへ送る。
 				toastStore.push('success', 'ロックダウンしました。ログイン中のアカウントで続けます。');
 				commissioningState.markLockedDown();
-				await invalidateAll();
+				await refreshAll();
 			} else {
 				toastStore.push(
 					'error',

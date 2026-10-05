@@ -12,7 +12,7 @@
  * doc comment と同じ理由）。
  */
 import { isProviderError } from '@banto/admin-core';
-import { isConfigPackageImportAbortedError } from '$lib/banto/configPackageAdmin';
+import { isConfigPackageImportAbortedError } from '#lib/banto/configPackageAdmin.js';
 
 /**
  * 元 `+page.svelte` に重複していた `errorMessage()` を1本化しただけで、

@@ -22,7 +22,7 @@
 	 * 渡す `connections`/`groups`/`adminTags` は tagRegistryAdmin.ts の既存
 	 * 一覧 API から読むだけの補助データで、値表示自体は従来どおり
 	 * catalog（`rows`）+ WS が正。絞り込みロジックは依存ゼロの純関数
-	 * `filterMonitorRows`（`$lib/banto/monitorFilter.ts`）に切り出してある。
+	 * `filterMonitorRows`（`#lib/banto/monitorFilter.ts`）に切り出してある。
 	 *
 	 * T18-4b（docs/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
 	 * TAG-UX-H の一部）: T18-4a まで WS 購読（`connectTagStream`）は常に
@@ -45,14 +45,15 @@
 	 */
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { toastStore } from '$lib/toast.svelte';
-	import { mobileNavStore } from '$lib/mobileNav.svelte';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import {
 		getCatalog,
 		connectTagStream,
 		type CatalogTagEntry,
 		type StreamValue
-	} from '$lib/banto/tagMonitorAdmin';
+	} from '#lib/banto/tagMonitorAdmin.js';
 	import {
 		listPlcConnections,
 		listCollectionGroups,
@@ -60,11 +61,11 @@
 		type PlcConnection,
 		type CollectionGroup,
 		type Tag
-	} from '$lib/banto/tagRegistryAdmin';
-	import { filterMonitorRows, type MonitorTreeFilter } from '$lib/banto/monitorFilter';
-	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
-	import { subscriptionPatternsFor } from '$lib/banto/monitorSubscription';
-	import { applyTagValues, mergeTagValues, type RowValue } from '$lib/banto/monitorValues';
+	} from '#lib/banto/tagRegistryAdmin.js';
+	import { filterMonitorRows, type MonitorTreeFilter } from '#lib/banto/monitorFilter.js';
+	import { pruneTreeFilter } from '#lib/banto/treeFilterPrune.js';
+	import { subscriptionPatternsFor } from '#lib/banto/monitorSubscription.js';
+	import { applyTagValues, mergeTagValues, type RowValue } from '#lib/banto/monitorValues.js';
 	import {
 		cellDisplayMode,
 		initialStreamView,
@@ -72,14 +73,14 @@
 		monitorColumnLabels,
 		streamViewReducer,
 		type StreamViewEvent
-	} from '$lib/banto/monitorStreamView';
+	} from '#lib/banto/monitorStreamView.js';
 	import {
 		probeSessionAfterReconnectFailures,
 		recheckSessionAfterStreamClose
-	} from '$lib/banto/sessionRecheck';
-	import SplitPane from '$lib/components/SplitPane.svelte';
-	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
-	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
+	} from '#lib/banto/sessionRecheck.js';
+	import SplitPane from '#lib/components/SplitPane.svelte';
+	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
+	import type { ConnectionTreeNodeData } from '#lib/components/connectionTreeTypes.js';
 	import { isProviderError } from '@banto/admin-core';
 
 	/** catalog の1タグ + WS から届く最新の現在値。 */
@@ -132,7 +133,7 @@
 	 * WS `data` から届いた最新値のキャッシュ（`external_name` → 値）。
 	 *
 	 * **2026-08-31 実機診断で特定した不具合の修正の核心**
-	 * （`$lib/banto/monitorValues.ts` 冒頭 doc comment に詳細）: 下の
+	 * （`#lib/banto/monitorValues.ts` 冒頭 doc comment に詳細）: 下の
 	 * 初期化 `$effect` は `reloadCatalog()`（catalog の HTTP 取得、非同期・
 	 * 未 await）を呼んだ直後に `connectTagStream()`（WS 接続、即座に
 	 * `subscribe` して初期スナップショットを受ける）を呼ぶ。実機の速度では
@@ -312,7 +313,7 @@
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
 	//
 	// タグ登録ページ（`(app)/tags/+page.svelte`）の CTA（`monitorHref`、
-	// `$lib/banto/tagOnboarding.ts`）から `?group=`/`?connection=`/`?focus=`
+	// `#lib/banto/tagOnboarding.ts`）から `?group=`/`?connection=`/`?focus=`
 	// 付きで遷移してきたときに、ツリー選択と「確認対象」ハイライトへ反映
 	// する。tags ページの `onboardingQueryApplied` パターン（同ファイル
 	// 1164〜1171行目付近）と同型 - 一度だけ適用し、以後のユーザー操作
@@ -580,7 +581,7 @@
 							<p class="note">
 								登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
 							</p>
-							<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
+							<a class="onboarding-cta" href={resolveAppPath('/tags')}>タグの登録画面へ移動</a>
 						{:else if filteredRows.length === 0}
 							<p class="note">条件に一致するタグがありません。</p>
 						{:else}

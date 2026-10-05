@@ -26,7 +26,7 @@
 	 * T19 S1-d（docs/banto-hub-t19-design.md UX-44、2026-09-03）: T18-2d で
 	 * 「サーバー状態」の上に置いていた初回チェックリスト（PLC接続作成→収集
 	 * グループ作成→タグ登録→収集開始→モニタで値確認、完了判定は
-	 * `$lib/banto/tagOnboarding.ts::computeOnboardingSteps` の純関数）を撤去
+	 * `#lib/banto/tagOnboarding.ts::computeOnboardingSteps` の純関数）を撤去
 	 * した（2026-09-02 オーナー決定「起動直後は何も出さない」）。設定操作の
 	 * 入口はタグ画面（`/tags`）へ既に一本化済み（S1-a〜S1-c）で、案内が無くても
 	 * ツリーの右クリックから接続・グループ・タグを作成できる。管理アカウント
@@ -61,31 +61,32 @@
 		listPendingChanges,
 		requeuePendingChange,
 		type PendingChange
-	} from '$lib/banto/pendingChangesAdmin';
-	import { toastStore } from '$lib/toast.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { commissioningState } from '$lib/banto/commissioningState.svelte';
-	import { isAdmin } from '$lib/permissions';
+	} from '#lib/banto/pendingChangesAdmin.js';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { commissioningState } from '#lib/banto/commissioningState.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
 	import {
 		getHubStatus,
 		type ConnectionStatusEntry,
 		type StatusResponse
-	} from '$lib/banto/hubStatus';
-	import { formatBytes, formatPercent } from '$lib/banto/systemInfoFormat';
-	import { listPlcConnections, isVirtualConnection } from '$lib/banto/tagRegistryAdmin';
-	import { enableWriteControl, disableWriteControl } from '$lib/banto/writeControlAdmin';
+	} from '#lib/banto/hubStatus.js';
+	import { formatBytes, formatPercent } from '#lib/banto/systemInfoFormat.js';
+	import { listPlcConnections, isVirtualConnection } from '#lib/banto/tagRegistryAdmin.js';
+	import { enableWriteControl, disableWriteControl } from '#lib/banto/writeControlAdmin.js';
 	import {
 		startCollection,
 		startAllSimulationCollection,
 		stopCollection
-	} from '$lib/banto/collectionControlAdmin';
+	} from '#lib/banto/collectionControlAdmin.js';
 	import {
 		canSwitchToDesktop,
 		canSwitchToService,
 		canToggleAutostart,
 		hostSwitchDisabledReason,
 		type HostSwitchGateInput
-	} from '$lib/banto/hostSwitchGate';
+	} from '#lib/banto/hostSwitchGate.js';
 	import {
 		getHostSwitchStatus,
 		isLocalShell,
@@ -95,13 +96,13 @@
 		switchToService,
 		type HostSwitchProgress,
 		type HostSwitchStatus
-	} from '$lib/banto/hostSwitchShell';
+	} from '#lib/banto/hostSwitchShell.js';
 	import {
 		getSinkServiceStatus,
 		startSinkService,
 		stopSinkService,
 		type SinkServiceStatus
-	} from '$lib/banto/sinkServiceShell';
+	} from '#lib/banto/sinkServiceShell.js';
 
 	const canManageWriteControl = $derived(isAdmin(sessionStore.role));
 	// 「試運転モード」の表示はサーバーの状態（`GET /api/commissioning/status`）から。
@@ -902,7 +903,7 @@
 			</dl>
 			{#if status.sink.groups.length === 0}
 				<p class="note">
-					sink group が登録されていません（<a href="/sink">DB Sink</a> 画面から作成できます）。
+					sink group が登録されていません（<a href={resolveAppPath('/sink')}>DB Sink</a> 画面から作成できます）。
 				</p>
 			{:else}
 				<table class="conn-table">
@@ -1249,8 +1250,9 @@
 				</tbody>
 			</table>
 			<p class="note">
-				BantoHubSink は「サービス」一覧・DB Sink サイドカー（<a href="/sink">DB Sink</a>画面参照）の
-				Windows サービスです。インストールは
+				BantoHubSink は「サービス」一覧・DB Sink サイドカー（<a href={resolveAppPath('/sink')}
+					>DB Sink</a
+				>画面参照）の Windows サービスです。インストールは
 				<code>banto-hub-sink.exe install</code> を管理者権限で実行してください（本画面からは行えません）。
 			</p>
 		{/if}

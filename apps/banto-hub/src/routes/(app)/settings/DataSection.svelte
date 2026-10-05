@@ -14,15 +14,15 @@
 	 */
 	import { onMount } from 'svelte';
 	import { afterNavigate } from '$app/navigation';
-	import { isAdmin } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
-	import { toastStore } from '$lib/toast.svelte';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import {
 		getStoreSettings,
 		setStoreSettings,
 		previewPrune,
 		pruneNow
-	} from '$lib/banto/storeSettingsAdmin';
+	} from '#lib/banto/storeSettingsAdmin.js';
 	import {
 		formToRetentionDays,
 		formatPruneConfirmMessage,
@@ -33,18 +33,18 @@
 		retentionDaysToForm,
 		validateRetentionForm,
 		type RetentionFormState
-	} from '$lib/banto/storeRetentionForm';
+	} from '#lib/banto/storeRetentionForm.js';
 	import {
 		applyConfigPackage,
 		inspectConfigPackage,
 		exportConfigPackageToDownload
-	} from '$lib/banto/configPackageAdmin';
+	} from '#lib/banto/configPackageAdmin.js';
 	import {
 		parseConfigPackage,
 		type ConfigPackage,
 		type ConfigPackageInspection,
 		type ConfigPackageImportSummary
-	} from '$lib/banto/configPackage';
+	} from '#lib/banto/configPackage.js';
 	import { errorMessage } from './shared';
 	import { mqttSettingsStore } from './mqttSettingsStore.svelte';
 	import { grpcSettingsStore } from './grpcSettingsStore.svelte';

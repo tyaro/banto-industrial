@@ -2,7 +2,7 @@
  * `expressionCheck.ts` のユニットテスト。`apiKeysAdmin.test.ts`/
  * `tagRegistryAdmin.test.ts` の doc comment にあるとおり、`@banto/admin-core`
  * （`$state` を使う `.svelte.ts` を推移的に import する）と `./setup`
- * （`$lib/toast.svelte` を import する）は `vi.mock` で軽量フェイクに
+ * （`#lib/toast.svelte` を import する）は `vi.mock` で軽量フェイクに
  * 差し替える - このリポジトリの最小 vitest 構成（`@sveltejs/vite-plugin-svelte`
  * 無し）では実モジュールをロードすると `ReferenceError: $state is not
  * defined` になるため。

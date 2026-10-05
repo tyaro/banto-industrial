@@ -30,7 +30,7 @@
 		type PlcConnection,
 		type CollectionGroup,
 		type Tag
-	} from '$lib/banto/tagRegistryAdmin';
+	} from '#lib/banto/tagRegistryAdmin.js';
 
 	interface Props {
 		connections: PlcConnection[];

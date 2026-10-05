@@ -27,7 +27,7 @@
  * 読むだけにする（MQTT 設定の保存直後だけは即時反映のため個別に
  * `load()` を呼ぶ - `ConnectivitySection.svelte` 参照）。
  */
-import { getHubStatus, type StatusResponse } from '$lib/banto/hubStatus';
+import { getHubStatus, type StatusResponse } from '#lib/banto/hubStatus.js';
 
 class HubStatusStore {
 	collectionState: string | null = $state(null);

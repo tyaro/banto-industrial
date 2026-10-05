@@ -14,10 +14,11 @@
 	 * `status/+page.svelte`の「サービス一覧」（ローカルシェル限定）が担う。
 	 */
 	import { isProviderError } from '@banto/admin-core';
-	import { toastStore } from '$lib/toast.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { canWriteResources, isAdmin } from '$lib/permissions';
-	import SinkGroupDrawer from '$lib/components/SinkGroupDrawer.svelte';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { canWriteResources, isAdmin } from '#lib/permissions.js';
+	import SinkGroupDrawer from '#lib/components/SinkGroupDrawer.svelte';
 	import {
 		listPlcConnections,
 		listCollectionGroups,
@@ -26,9 +27,9 @@
 		type PlcConnection,
 		type CollectionGroup,
 		type Tag
-	} from '$lib/banto/tagRegistryAdmin';
-	import { listSinkGroups, deleteSinkGroup, type SinkGroup } from '$lib/banto/sinkGroupsAdmin';
-	import { SINK_MODE_OPTIONS } from '$lib/banto/sinkGroupForm';
+	} from '#lib/banto/tagRegistryAdmin.js';
+	import { listSinkGroups, deleteSinkGroup, type SinkGroup } from '#lib/banto/sinkGroupsAdmin.js';
+	import { SINK_MODE_OPTIONS } from '#lib/banto/sinkGroupForm.js';
 
 	const canWrite = $derived(canWriteResources(sessionStore.role));
 	const hubAdmin = $derived(isAdmin(sessionStore.role));
@@ -85,7 +86,7 @@
 
 	/**
 	 * #381 レビュー対応20回目: Drawer を閉じたときのフォーカスの戻し先の代替
-	 * （層の約束・項目5、`$lib/components/escLayering.ts`）。削除では開いた元の行
+	 * （層の約束・項目5、`#lib/components/escLayering.ts`）。削除では開いた元の行
 	 * （「編集」ボタン）が一覧から消えるので、常に在るツールバーの「新規作成」
 	 * ボタンへ逃がす（`canWrite` が無い利用者には無いので、その場合は見出しへは
 	 * 行かず何もしない - 削除ボタン自体が出ないため経路も無い）。
@@ -142,7 +143,7 @@
 
 	// --- サイドカー用 API キー（設計 §5.2・実装指示3） ---
 	const SINK_API_KEY_PRESET_NAME = 'banto-hub-sink';
-	const sinkApiKeyIssueHref = `/api-keys?presetName=${encodeURIComponent(SINK_API_KEY_PRESET_NAME)}&presetScopes=admin,read`;
+	const sinkApiKeyIssueHref = `${resolveAppPath('/api-keys')}?presetName=${encodeURIComponent(SINK_API_KEY_PRESET_NAME)}&presetScopes=admin,read`;
 </script>
 
 <div class="page">
@@ -153,7 +154,8 @@
 				>banto-hub-sink</code
 			>）はこの変更を <code>config_refresh_secs</code>（既定30秒）以内に
 			取り込みます。サイドカー自体の起動・停止は
-			<a href="/status#collection-control">状態画面</a>の「サービス一覧」から行えます。
+			<a href={`${resolveAppPath('/status')}#collection-control`}>状態画面</a
+			>の「サービス一覧」から行えます。
 		</p>
 
 		{#if loading && sinkGroups.length === 0}

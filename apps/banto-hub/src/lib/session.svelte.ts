@@ -52,7 +52,7 @@ class SessionStore {
 	 *
 	 * **「サーバーが試運転モード（未ロックダウン）か」ではない**（2026-10-04 オーナー
 	 * 指示で軸を分けた）。ロックダウンの欄や試運転の表示の出し分けは
-	 * `$lib/banto/commissioningState.svelte` の `serverCommissioning` を読むこと -
+	 * `#lib/banto/commissioningState.svelte` の `serverCommissioning` を読むこと -
 	 * アカウントでログインしたままでも、サーバーが試運転中ならロックダウンできる。
 	 * いまこの値を読む画面は無い（監査・デバッグ用に残す）。確定させるのは
 	 * `(app)/+layout.ts` の `grantFallback`（policy runner の `adopt` は廃止、banto v3.0.0）。

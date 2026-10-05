@@ -2,12 +2,12 @@
 	// relay-wright の同名コンポーネントから無改変で複製。
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
-	import { navItems, type NavItem } from '$lib/navigation';
-	import { settings } from '$lib/settings.svelte';
-	import { mobileNavStore } from '$lib/mobileNav.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
-	import { APP_NAME } from '$lib/appName';
+	import { navItems, resolveAppPath, type NavItem } from '#lib/navigation.js';
+	import { settings } from '#lib/settings.svelte.js';
+	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
+	import { APP_NAME } from '#lib/appName.js';
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
 
@@ -17,7 +17,7 @@
 	// 判定する - `navigation.ts` の doc comment参照（`設定` は遷移先が
 	// `/settings/appearance` でも `/settings` 配下ならハイライトさせたい）。
 	function isActive(item: NavItem): boolean {
-		const match = item.activeMatch ?? item.path;
+		const match = resolveAppPath(item.activeMatch ?? item.path);
 		return page.url.pathname === match || page.url.pathname.startsWith(match + '/');
 	}
 
@@ -102,7 +102,7 @@
 	<nav>
 		{#each visibleItems as item (item.path)}
 			<a
-				href={item.path}
+				href={resolveAppPath(item.path)}
 				class:active={isActive(item)}
 				title={collapsed ? item.label : undefined}
 				onclick={handleNavClick}

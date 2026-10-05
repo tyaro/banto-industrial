@@ -30,7 +30,7 @@
 	 * Modal を開いている間に値が変わることはない前提）。
 	 *
 	 * 純関数部分（連番採番・フォーム⇄API入力変換）は
-	 * `$lib/banto/collectionGroupForm.ts` へ切り出し済み（そちらでユニット
+	 * `#lib/banto/collectionGroupForm.ts` へ切り出し済み（そちらでユニット
 	 * テスト済み）。採番ロジック自体は `plcConnectionForm.ts::nextConnectionName`
 	 * と共通の `sequentialName.ts::nextSequentialName` を使う。
 	 *
@@ -67,12 +67,12 @@
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
 	import Modal from './Modal.svelte';
-	import { toastStore } from '$lib/toast.svelte';
-	import { isAdmin } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
-	import { listPendingChanges, type PendingChange } from '$lib/banto/pendingChangesAdmin';
-	import { pendingCreateNames } from '$lib/banto/pendingCreateNames';
-	import { isFormDirty } from '$lib/banto/formDirty';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { listPendingChanges, type PendingChange } from '#lib/banto/pendingChangesAdmin.js';
+	import { pendingCreateNames } from '#lib/banto/pendingCreateNames.js';
+	import { isFormDirty } from '#lib/banto/formDirty.js';
 	import {
 		createCollectionGroup,
 		deleteCollectionGroup,
@@ -83,7 +83,7 @@
 		type CollectionGroup,
 		type PlcConnection,
 		type Tag
-	} from '$lib/banto/tagRegistryAdmin';
+	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		blankGroupForm,
 		DEFAULT_PERIOD_MS,
@@ -92,11 +92,11 @@
 		nextGroupName,
 		validateQuerySql,
 		type CollectionGroupFormState
-	} from '$lib/banto/collectionGroupForm';
+	} from '#lib/banto/collectionGroupForm.js';
 	import {
 		countGroupCascadeImpact,
 		formatGroupDeleteConfirmMessage
-	} from '$lib/banto/registryCascadeImpact';
+	} from '#lib/banto/registryCascadeImpact.js';
 
 	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::collection_groups_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
 	const PENDING_SOURCE = 'collection_groups.create';
@@ -560,7 +560,7 @@
 			`periodMs`/`enabled` と同じ、`form` の通常フィールドの1つ。
 			`writable` の実際の登録可否（computed タグ拒否、および
 			Modbus 読み取り専用領域拒否を含む8段ゲート - 後者は S1-b0 で
-			UI に配線予定、`$lib/banto/writableDefault.ts` 参照）には
+			UI に配線予定、`#lib/banto/writableDefault.ts` 参照）には
 			一切影響しない - あくまで新規タグフォームを開いた瞬間の
 			チェックボックスの初期値だけを決める。
 		-->

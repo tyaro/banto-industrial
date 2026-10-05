@@ -28,12 +28,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isHttpError, isRedirect } from '@sveltejs/kit';
 import { getSessionController } from '@banto/admin-core';
 
-vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
-vi.mock('$lib/banto/setup', () => ({ bantoReady: Promise.resolve() }));
-// この最小 vitest 構成には `$lib` の別名が無いので、本物のモジュールへ向ける（差し替えではない）。
-vi.mock('$lib/banto/sessionGuard', () => import('./sessionGuard'));
-vi.mock('$lib/banto/commissioning', () => import('./commissioning'));
-vi.mock('$lib/settings.svelte', () => ({ settings: { syncFromProvider: async () => {} } }));
+// SvelteKit 3（#lib はサブパス import）では、ガードが import する `#lib/banto/setup.js` と
+// 管理 API が import する `./setup` は同じモジュールに解決されるので、1 つのモックにまとめる。
+vi.mock('./setup', () => ({
+	CSRF_HEADER: { 'X-Banto-Client': 'banto' },
+	bantoReady: Promise.resolve()
+}));
+vi.mock('#lib/settings.svelte.js', () => ({ settings: { syncFromProvider: async () => {} } }));
 
 import { load } from '../../routes/(app)/+layout';
 import { SESSION_CHECK_FAILED_MESSAGE } from './sessionGuard';
@@ -72,7 +73,10 @@ function expect503(thrown: unknown): void {
 	expect(isHttpError(thrown)).toBe(true);
 	if (isHttpError(thrown)) {
 		expect(thrown.status).toBe(503);
-		expect(thrown.body.message).toBe(SESSION_CHECK_FAILED_MESSAGE);
+		// 本体まるごと（banto v4.0.0 / SvelteKit 3 の `error(status, message)` の形が
+		// `error(status, { message })` と同じ本文になることを固定する。kit 3 は本体にも
+		// `status` を入れる）。
+		expect(thrown.body).toEqual({ status: 503, message: SESSION_CHECK_FAILED_MESSAGE });
 	}
 }
 
