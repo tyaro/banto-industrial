@@ -50,8 +50,8 @@
 	 * 切替を保存しただけでは、再起動までこの表示は変わらない）。
 	 */
 	import { onDestroy, onMount } from 'svelte';
-	import { canWriteResources } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
+	import { canWriteResources } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
 	import {
 		COLLECT_READ_TIMEOUT_MS,
 		COLLECT_UI_TIMEOUT_MS,
@@ -81,7 +81,7 @@
 		type CollectorStateView,
 		type ConnectionView,
 		type Readout
-	} from '$lib/banto/collectAdmin';
+	} from '#lib/banto/collectAdmin.js';
 	import { errorMessage } from './shared';
 
 	const available = isCollectAvailable();

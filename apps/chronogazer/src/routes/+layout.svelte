@@ -2,13 +2,13 @@
 	import '../app.css';
 	import { afterNavigate, invalidateAll } from '$app/navigation';
 	import { navigating, page } from '$app/state';
-	import { bantoReady } from '$lib/banto/setup'; // initBanto() (+ EventProvider) before any route guard runs (spec §3, §11.1)
-	import { settings } from '$lib/settings.svelte';
-	import ToastHost from '$lib/components/ToastHost.svelte';
+	import { bantoReady } from '#lib/banto/setup.js'; // initBanto() (+ EventProvider) before any route guard runs (spec §3, §11.1)
+	import { settings } from '#lib/settings.svelte.js';
+	import ToastHost from '#lib/components/ToastHost.svelte';
 	// banto v3.0.0（#286）: 起動待ちは「起動中…」と「サーバーに接続できません
 	// ＋再接続」の 2 状態（`startup.ts` / `startupState.svelte.ts`）。
-	import StartupSplash from '$lib/components/StartupSplash.svelte';
-	import { isStartupDeferral } from '$lib/banto/startupGate';
+	import StartupSplash from '#lib/components/StartupSplash.svelte';
+	import { isStartupDeferral } from '#lib/banto/startupGate.js';
 
 	let { children } = $props();
 
@@ -18,7 +18,7 @@
 	});
 
 	// banto v3.0.1（#321）: a protected route opened before startup finished was
-	// deferred by its guard (`$lib/banto/startupGate.ts`) - nothing of it has
+	// deferred by its guard (`#lib/banto/startupGate.ts`) - nothing of it has
 	// run. Keep the splash up instead of the error page, and re-run the loads
 	// once startup has finished, so the same URL opens (or goes where the
 	// guard sends it). A deferral can only come from a load started before
@@ -37,7 +37,10 @@
 	void bantoReady.then(() => {
 		started = true;
 	});
-	afterNavigate(() => {
+
+	afterNavigate(({ shallow }) => {
+		if (shallow) return;
+
 		navigationDone = true;
 	});
 	$effect(() => {

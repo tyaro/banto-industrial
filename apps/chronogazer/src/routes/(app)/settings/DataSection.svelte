@@ -6,16 +6,16 @@
 	 * 関数を無改変で移した。いずれも admin 限定 かつ 各機能の可用性
 	 * （`auditAvailable`/`backupsAvailable`）ガード付き。
 	 */
-	import { isTauri } from '$lib/banto/setup';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
-	import { toastStore } from '$lib/toast.svelte';
+	import { isTauri } from '#lib/banto/setup.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import {
 		getAuditConfig,
 		isAuditLogAvailable,
 		setAuditConfig,
 		type AuditSettings
-	} from '$lib/banto/auditLogAdmin';
+	} from '#lib/banto/auditLogAdmin.js';
 	import {
 		cancelPendingRestore,
 		createBackup,
@@ -28,7 +28,7 @@
 		uploadAndStageRestore,
 		type BackupInfo,
 		type PendingRestoreInfo
-	} from '$lib/banto/backupsAdmin';
+	} from '#lib/banto/backupsAdmin.js';
 	import { errorMessage } from './shared';
 
 	const tauri = isTauri();

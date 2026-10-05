@@ -1,8 +1,8 @@
-import { isAdmin } from '$lib/permissions';
-import { isTauri } from '$lib/banto/setup';
-import { isAuditLogAvailable } from '$lib/banto/auditLogAdmin';
-import { isBackupsAvailable } from '$lib/banto/backupsAdmin';
-import { sessionStore } from '$lib/session.svelte';
+import { isAdmin } from '#lib/permissions.js';
+import { isTauri } from '#lib/banto/setup.js';
+import { isAuditLogAvailable } from '#lib/banto/auditLogAdmin.js';
+import { isBackupsAvailable } from '#lib/banto/backupsAdmin.js';
+import { sessionStore } from '#lib/session.svelte.js';
 import { canManageAuthMode } from './shared';
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
 

@@ -14,11 +14,11 @@
 	 * `authSettingsStore.load()` を呼び直す。
 	 */
 	import { getAuthProvider } from '@banto/admin-core';
-	import { isTauri } from '$lib/banto/setup';
-	import { disableAutologin, enableAutologin } from '$lib/banto/authAdmin';
-	import { toastStore } from '$lib/toast.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
+	import { isTauri } from '#lib/banto/setup.js';
+	import { disableAutologin, enableAutologin } from '#lib/banto/authAdmin.js';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { errorMessage } from './shared';
 

@@ -51,7 +51,7 @@
 		listCollectEvents,
 		runWithLimit,
 		type CollectEventRow
-	} from '$lib/banto/collectAdmin';
+	} from '#lib/banto/collectAdmin.js';
 	import {
 		EventBlockLoader,
 		initialCache,

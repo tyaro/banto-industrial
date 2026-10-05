@@ -35,7 +35,7 @@
  *   another login was confirmed meanwhile) or `'unverified'` (the session
  *   could not be confirmed). A rejected `logout()` is decided the same way -
  *   the confirmation still runs. `options.notify` hears `'stayed'` and
- *   `'unverified'` so the UI can tell the user (`$lib/banto/logoutNotice.ts`);
+ *   `'unverified'` so the UI can tell the user (`#lib/banto/logoutNotice.ts`);
  *   before, a rejection was rethrown into a click handler nobody caught.
  */
 import {
@@ -55,7 +55,7 @@ export function isLeavingForLogin(): boolean {
 
 /**
  * Navigate to the login screen with wiring ① held until the navigation
- * settled (`ownerChangePolicy: 'relogin'`, `$lib/banto/ownerChange.ts`).
+ * settled (`ownerChangePolicy: 'relogin'`, `#lib/banto/ownerChange.ts`).
  */
 export async function leaveForLogin(goToLogin: () => Promise<void>): Promise<void> {
 	leaving += 1;

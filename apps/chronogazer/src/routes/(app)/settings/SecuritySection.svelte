@@ -18,9 +18,9 @@
 	 * comment参照）。保存操作自体の失敗は従来どおりトーストのみ。
 	 */
 	import { invalidateAll } from '$app/navigation';
-	import { isTauri } from '$lib/banto/setup';
-	import { toastStore } from '$lib/toast.svelte';
-	import { applyAuthSettings, type AuthDisabledRole } from '$lib/banto/authAdmin';
+	import { isTauri } from '#lib/banto/setup.js';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { applyAuthSettings, type AuthDisabledRole } from '#lib/banto/authAdmin.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { canManageAuthMode, errorMessage } from './shared';
 

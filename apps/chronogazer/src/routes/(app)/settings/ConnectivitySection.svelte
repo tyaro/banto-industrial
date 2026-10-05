@@ -22,10 +22,10 @@
 	 * 編集不可・システム情報カードは無い（従来どおり）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
-	import { isTauri } from '$lib/banto/setup';
-	import { applyServerSettings, getServerStatus, type ServerStatus } from '$lib/banto/serverAdmin';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
+	import { isTauri } from '#lib/banto/setup.js';
+	import { applyServerSettings, getServerStatus, type ServerStatus } from '#lib/banto/serverAdmin.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { pickPrimaryLanUrl } from './connectivityScope';
 	import { lanToggleLocked } from './lanToggle';

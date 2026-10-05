@@ -41,7 +41,7 @@
  * ### 汎用部との関係（#410）
  *
  * 世代・境界・飛行中・ブロック単位の失敗・世代違いの応答の排除は、
- * `/audit-log` と共通の `$lib/blockCache` に出した。ここに残るのは `/events`
+ * `/audit-log` と共通の `#lib/blockCache` に出した。ここに残るのは `/events`
  * 固有の部分だけ: 失敗の型（`Readout` の 3 状態 + 往復の失敗）、境界の
  * 食い違いの扱い（[`BOUNDARY_MISMATCH_MESSAGE`]）、画面に出す値
  * （[`viewState`]）。**挙動は #409 のときから変えていない**（#409 の表テストが
@@ -54,7 +54,7 @@
  * 押したとき（= 新しい世代）だけで、**失敗の表示と再試行手段は、その
  * ブロックの取得が成功するまで残る** - 別ブロックの成功では消さない。
  */
-import type { CollectEventList, CollectEventRow, ReadoutState } from '$lib/banto/collectAdmin';
+import type { CollectEventList, CollectEventRow, ReadoutState } from '#lib/banto/collectAdmin.js';
 import {
 	BlockLoader,
 	applyOutcome as applyGenericOutcome,
@@ -66,9 +66,9 @@ import {
 	type BlockCache as GenericBlockCache,
 	type BlockPolicy,
 	type BlockRequest
-} from '$lib/blockCache';
+} from '#lib/blockCache.js';
 
-export { BLOCK_SIZE, blockRequest, blocksFor, type BlockRequest } from '$lib/blockCache';
+export { BLOCK_SIZE, blockRequest, blocksFor, type BlockRequest } from '#lib/blockCache.js';
 
 /**
  * ブロック 1 つの取得が**行を入れられなかった**ときの持ち方。

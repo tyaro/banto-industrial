@@ -13,7 +13,7 @@
 	 * ある）。
 	 *
 	 * **ブロックキャッシュの判断は `./auditBlocks.ts`（と `/events` と共通の
-	 * `$lib/blockCache`）に出してある**（#410。以前はこのページ内に
+	 * `#lib/blockCache.js`）に出してある**（#410。以前はこのページ内に
 	 * `AuditLogWindow` として複製していて、`/events` の #409 と同じ欠陥を
 	 * 持っていた）。どのブロックを取るか、世代のスナップショット境界
 	 * （`asOfId`）、保持期間の削除による失効、失敗の持ち方、並べ替え・絞り込みの
@@ -40,9 +40,9 @@
 		isAuditLogAvailable,
 		listAuditLog,
 		type AuditLogEntry
-	} from '$lib/banto/auditLogAdmin';
-	import { runWithLimit } from '$lib/banto/hubAdmin';
-	import { initialCache, type BlockRequest } from '$lib/blockCache';
+	} from '#lib/banto/auditLogAdmin.js';
+	import { runWithLimit } from '#lib/banto/hubAdmin.js';
+	import { initialCache, type BlockRequest } from '#lib/blockCache.js';
 	import {
 		AUDIT_SNAPSHOT_EXPIRED_MESSAGE,
 		AuditBlockLoader,

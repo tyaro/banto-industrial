@@ -1,6 +1,6 @@
 import { redirect } from '@sveltejs/kit';
-import { isAdmin } from '$lib/permissions';
-import { sessionStore } from '$lib/session.svelte';
+import { isAdmin } from '#lib/permissions.js';
+import { sessionStore } from '#lib/session.svelte.js';
 
 /**
  * `admin`-only page (spec M10 RBAC): non-admins are sent to `/monitor`

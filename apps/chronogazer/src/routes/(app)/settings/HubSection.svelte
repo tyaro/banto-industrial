@@ -50,8 +50,8 @@
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
 	 */
 	import { onDestroy, onMount, untrack } from 'svelte';
-	import { isAdmin } from '$lib/permissions';
-	import { sessionStore } from '$lib/session.svelte';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
 	import {
 		adoptHubKey,
 		adoptionResult,
@@ -97,7 +97,7 @@
 		type HubSubscription,
 		type HubTag,
 		type HubView
-	} from '$lib/banto/hubAdmin';
+	} from '#lib/banto/hubAdmin.js';
 	import { errorMessage } from './shared';
 
 	const available = isHubAvailable();

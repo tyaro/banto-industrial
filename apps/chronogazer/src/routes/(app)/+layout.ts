@@ -14,14 +14,14 @@ import {
 	grantFallback,
 	resolveSettled
 } from '@banto/admin-core';
-import { isBantoReady } from '$lib/banto/setup';
-import { deferUntilStarted } from '$lib/banto/startupGate';
-import { SESSION_CHECK_FAILED_MESSAGE } from '$lib/banto/sessionGuard';
+import { isBantoReady } from '#lib/banto/setup.js';
+import { deferUntilStarted } from '#lib/banto/startupGate.js';
+import { SESSION_CHECK_FAILED_MESSAGE } from '#lib/banto/sessionGuard.js';
 
 // 延期の 503 の本文（エラー画面は出さずスプラッシュが出るので実際には見えない）。
 const STARTING_MESSAGE = '起動中…';
-import { settings } from '$lib/settings.svelte';
-import { publicNavItems } from '$lib/navigation';
+import { settings } from '#lib/settings.svelte.js';
+import { publicNavItems } from '#lib/navigation.js';
 
 // Auth guard for the whole (app) group (spec §8.1), banto Issue #260 (design
 // §6.1, v2.0.0): the session is confirmed by the SessionController - the

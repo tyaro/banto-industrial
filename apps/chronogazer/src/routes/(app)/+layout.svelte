@@ -2,12 +2,12 @@
 	import { untrack } from 'svelte';
 	import { goto, invalidateAll } from '$app/navigation';
 	import { getSessionController, notify } from '@banto/admin-core';
-	import { isLeavingForLogin, leaveForLogin } from '$lib/banto/logout.svelte';
-	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '$lib/banto/ownerChange';
-	import Header from '$lib/components/Header.svelte';
-	import Sidebar from '$lib/components/Sidebar.svelte';
-	import CommandPalette from '$lib/components/CommandPalette.svelte';
-	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { isLeavingForLogin, leaveForLogin } from '#lib/banto/logout.svelte.js';
+	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
+	import Header from '#lib/components/Header.svelte';
+	import Sidebar from '#lib/components/Sidebar.svelte';
+	import CommandPalette from '#lib/components/CommandPalette.svelte';
+	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 
 	let { children, data } = $props();
 
@@ -41,7 +41,7 @@
 	// one invalidation per generation. While this tab is logging out (or
 	// leaving for /login), no re-load: that sequence goes to /login itself,
 	// and an invalidation started here would win over the navigation
-	// (`$lib/banto/logout.svelte.ts`). `isLeavingForLogin()` is reactive, so a
+	// (`#lib/banto/logout.svelte.ts`). `isLeavingForLogin()` is reactive, so a
 	// generation change skipped meanwhile is handled once it ends.
 	const sessionController = getSessionController();
 	let requestedFor = -1;

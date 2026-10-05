@@ -6,12 +6,12 @@
 	 * `tauri && isAdmin && vibrancyStatus?.supported` のときだけ内部で描画）。
 	 */
 	import type { ThemeMode, ThemePreset } from '@banto/theme';
-	import { settings } from '$lib/settings.svelte';
-	import { isTauri } from '$lib/banto/setup';
-	import { applyVibrancy, getVibrancyStatus, type VibrancyStatus } from '$lib/banto/vibrancy';
-	import { toastStore } from '$lib/toast.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
+	import { settings } from '#lib/settings.svelte.js';
+	import { isTauri } from '#lib/banto/setup.js';
+	import { applyVibrancy, getVibrancyStatus, type VibrancyStatus } from '#lib/banto/vibrancy.js';
+	import { toastStore } from '#lib/toast.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
 	import { errorMessage } from './shared';
 
 	const modes: { value: ThemeMode; label: string }[] = [

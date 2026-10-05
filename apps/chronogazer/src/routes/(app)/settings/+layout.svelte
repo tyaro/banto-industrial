@@ -25,7 +25,7 @@
 	 * `SecuritySection.svelte` 側で保つため）。
 	 */
 	import { page } from '$app/state';
-	import { isTauri } from '$lib/banto/setup';
+	import { isTauri } from '#lib/banto/setup.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { errorMessage } from './shared';
 	import type { SettingsCategory } from './categories';

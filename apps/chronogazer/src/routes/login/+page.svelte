@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { getAuthProvider, notify } from '@banto/admin-core';
-	import { bantoReady, getBantoMode } from '$lib/banto/setup';
+	import { bantoReady, getBantoMode } from '#lib/banto/setup.js';
 
 	// Undecided until `status()` resolves (or is absent, treated as
 	// "already initialized" - see below): render nothing rather than

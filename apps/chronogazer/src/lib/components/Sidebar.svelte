@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { navItems, publicNavItems, type NavItem } from '$lib/navigation';
-	import { settings } from '$lib/settings.svelte';
-	import { sessionStore } from '$lib/session.svelte';
-	import { isAdmin } from '$lib/permissions';
+	import { navItems, publicNavItems, type NavItem } from '#lib/navigation.js';
+	import { settings } from '#lib/settings.svelte.js';
+	import { sessionStore } from '#lib/session.svelte.js';
+	import { isAdmin } from '#lib/permissions.js';
 
 	// #359 chronogazer 分: `item.activeMatch`（無ければ `item.path`）を基準に
 	// 前方一致判定する - `navigation.ts` の doc comment参照（`設定` は
