@@ -1155,7 +1155,7 @@ FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
 **管理 UI のセッションの確定（2026-10-02、banto v2.0.0 #260 追従、v2 移行 PR1d・
 banto-hub v0.2.0-alpha.26。2026-10-04 に banto v3.0.0 の grant へ、v0.2.0-alpha.28）**:
 フロントの「誰がログインしているか」の確定は `@banto/admin-core` の
-**SessionController** だけが行う（ADR-0016、banto の `docs/session-controller-design.md`
+**SessionController** だけが行う（ADR-0016、banto の `docs/design/session-controller-design.md`
 §6.1）。v2 では `/api/auth/identity` が試運転の合成 identity を返さなかったので、アプリ層の
 policy runner が controller に `adopt`/`end` で確定・終了していたが、v3.0.0 で `adopt`/`end` は
 削除され、試運転は閲覧公開と同じ経路になった: ルートガード（`(app)/+layout.ts`）は
