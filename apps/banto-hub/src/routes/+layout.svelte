@@ -4,12 +4,21 @@
 	import { bantoReady } from '#lib/banto/setup.js'; // initBanto() (+ EventProvider) をどのルートガードより先に完了させる
 	import { settings } from '#lib/settings.svelte.js';
 	import ToastHost from '#lib/components/ToastHost.svelte';
+	import { trackFirstNavigation } from '#lib/banto/navigationSettled.svelte.js';
 
 	let { children } = $props();
 
 	$effect(() => {
 		settings.init();
 	});
+
+	// banto v4.0.0（#326）: このレイアウトは最初のナビゲーションで mount される
+	// ので、その終わりをアプリ全体のために記録する（`trackFirstNavigation`）。
+	// `(app)/+layout.svelte` の配線①が `isNavigationSettled()` で使う
+	// （`#lib/banto/navigationSettled.svelte.ts`）。SvelteKit は最初の
+	// ナビゲーションを `navigating` に出さないので、これが無いとその間を
+	// 「ナビゲーション中でない」と読んでしまう。
+	trackFirstNavigation();
 </script>
 
 {#await bantoReady}

@@ -6,14 +6,14 @@
  * v1 の独自の照合（`/api/auth/check` の直接 `fetch`・トークンの照合・
  * single-flight・期限）は削除したので、ここでは**本物の** `@banto/admin-core`
  * （HTTP 認証プロバイダーと既定の controller）の上で、ストリームの出来事がどう写るかを確かめる。差し替えるのは `fetch`
- * （偽のサーバー、`testing/hubHttp.ts`）と `invalidateAll()`（SvelteKit の
+ * （偽のサーバー、`testing/hubHttp.ts`）と `refreshAll()`（SvelteKit の
  * 実行時が無いと動かないので回数を数える）。
  *
  * 守りたいこと:
  * - `1008` で閉じられた（#441）: `controller.signal('app:stream-closed')` +
- *   `invalidateAll()`。走らせ直したガードは signal の**後に**始めた確認で
+ *   `refreshAll()`。走らせ直したガードは signal の**後に**始めた確認で
  *   判断する（失効なら /login）。
- * - 再接続が続けて失敗した（#445）: 画面を動かさず（`invalidateAll()` を
+ * - 再接続が続けて失敗した（#445）: 画面を動かさず（`refreshAll()` を
  *   呼ばない）、`session` / `login` / `unverified` を返す。
  *   - 試運転の grant（kind `commissioning`）も通常のセッションと同じ確認
  *     （identity の 1 往復）。失効が確定すれば `login`、照合できなければ
@@ -29,15 +29,16 @@ import { isRedirect } from '@sveltejs/kit';
 import { getSessionController } from '@banto/admin-core';
 
 const nav = vi.hoisted(() => ({
-	invalidateAll: vi.fn<() => Promise<void>>(async () => {})
+	refreshAll: vi.fn<() => Promise<void>>(async () => {})
 }));
 
-vi.mock('$app/navigation', () => ({ invalidateAll: nav.invalidateAll }));
-vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
-vi.mock('#lib/banto/setup.js', () => ({ bantoReady: Promise.resolve() }));
-// この最小 vitest 構成には `#lib` の別名が無いので、本物のモジュールへ向ける（差し替えではない）。
-vi.mock('#lib/banto/sessionGuard', () => import('./sessionGuard'));
-vi.mock('#lib/banto/commissioning', () => import('./commissioning'));
+vi.mock('$app/navigation', () => ({ refreshAll: nav.refreshAll }));
+// SvelteKit 3（#lib はサブパス import）では、ガードが import する `#lib/banto/setup.js` と
+// 管理 API が import する `./setup` は同じモジュールに解決されるので、1 つのモックにまとめる。
+vi.mock('./setup', () => ({
+	CSRF_HEADER: { 'X-Banto-Client': 'banto' },
+	bantoReady: Promise.resolve()
+}));
 vi.mock('#lib/settings.svelte.js', () => ({ settings: { syncFromProvider: async () => {} } }));
 
 import { load } from '../../routes/(app)/+layout';
@@ -60,8 +61,8 @@ let hub: ReturnType<typeof installHub>;
 
 beforeEach(() => {
 	hub = installHub();
-	nav.invalidateAll.mockReset();
-	nav.invalidateAll.mockImplementation(async () => {});
+	nav.refreshAll.mockReset();
+	nav.refreshAll.mockImplementation(async () => {});
 });
 
 afterEach(() => {
@@ -114,7 +115,7 @@ function hanging(request: SentRequest): Promise<Response> {
 }
 
 describe('recheckSessionAfterStreamClose（#441: 1008 で閉じられた）', () => {
-	it('controller に signal を送り、ルートガードを走らせ直す（invalidateAll）', async () => {
+	it('controller に signal を送り、ルートガードを走らせ直す（refreshAll）', async () => {
 		await signedInAsAlice();
 		const controller = getSessionController();
 		const signal = vi.spyOn(controller, 'signal');
@@ -122,7 +123,7 @@ describe('recheckSessionAfterStreamClose（#441: 1008 で閉じられた）', ()
 		await recheckSessionAfterStreamClose();
 
 		expect(signal).toHaveBeenCalledWith('app:stream-closed');
-		expect(nav.invalidateAll).toHaveBeenCalledTimes(1);
+		expect(nav.refreshAll).toHaveBeenCalledTimes(1);
 	});
 
 	it('session_revoked: 走らせ直したガードは signal の後の確認で失効を確定し、/login へ', async () => {
@@ -217,7 +218,7 @@ describe('probeSessionAfterReconnectFailures（#445: 再接続が続けて失敗
 			await signedInAsAlice();
 			hub.routes.identity = identity;
 			expect(await probeSessionAfterReconnectFailures()).toBe(expected);
-			expect(nav.invalidateAll).not.toHaveBeenCalled();
+			expect(nav.refreshAll).not.toHaveBeenCalled();
 		});
 	}
 
@@ -357,7 +358,7 @@ describe('probeSessionAfterReconnectFailures: 試運転の grant（通常のセ�
 		expect(await probeSessionAfterReconnectFailures()).toBe('unverified');
 		expect(getSessionController().snapshot.kind).toBe(COMMISSIONING_KIND);
 		expect(hub.session.getItem(TOKEN_KEY)).toBe('grant-token');
-		expect(nav.invalidateAll).not.toHaveBeenCalled();
+		expect(nav.refreshAll).not.toHaveBeenCalled();
 	});
 
 	it('ロックダウンで grant のトークンが失効していた（401）→ login。トークンは消える', async () => {
@@ -366,6 +367,6 @@ describe('probeSessionAfterReconnectFailures: 試運転の grant（通常のセ�
 		expect(await probeSessionAfterReconnectFailures()).toBe('login');
 		expect(getSessionController().snapshot.status).toBe('none');
 		expect(hub.session.getItem(TOKEN_KEY)).toBeNull();
-		expect(nav.invalidateAll).not.toHaveBeenCalled();
+		expect(nav.refreshAll).not.toHaveBeenCalled();
 	});
 });

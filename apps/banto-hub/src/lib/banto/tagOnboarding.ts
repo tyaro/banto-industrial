@@ -8,6 +8,11 @@
  * `tagRegistryAdmin` からは型だけを取り込み（`import type`）、実行時の
  * 依存は無い。
  *
+ * banto v4.0.0（SvelteKit 3、#325）: 例外は `monitorHref()` の遷移先の
+ * `/monitor` だけで、アプリ内の遷移先はすべて `../navigation` の
+ * `resolveAppPath()`（SvelteKit の `resolve()`）を通す方針に揃えた
+ * （banto-hub は `base` を使わないので URL は変わらない）。
+ *
  * T19 S1-d（docs/banto-hub-t19-design.md UX-44、2026-09-03）: 初回
  * チェックリスト本体（PLC接続作成→収集グループ作成→タグ登録→収集開始→
  * モニタで値確認の完了判定・次工程算出、`computeOnboardingSteps`/
@@ -25,6 +30,7 @@
  * T18-2d/T19 S1-c）なので変更していない。
  */
 import type { CollectionGroup, PlcConnection, TagKind } from './tagRegistryAdmin';
+import { resolveAppPath } from '../navigation';
 
 /** `PlcConnection.protocol === "virtual"`（`calc`/`mem`）かどうか。型だけの
  * 依存に留めるため、`tagRegistryAdmin.isVirtualConnection` は呼ばず同じ判定
@@ -85,7 +91,8 @@ export function monitorHref(opts: {
 	if (opts.focus && opts.focus.length > 0) {
 		params.push(`focus=${opts.focus.map((name) => encodeURIComponent(name)).join(',')}`);
 	}
-	return params.length === 0 ? '/monitor' : `/monitor?${params.join('&')}`;
+	const monitor = resolveAppPath('/monitor');
+	return params.length === 0 ? monitor : `${monitor}?${params.join('&')}`;
 }
 
 // --- 親設定プリセット（ツリー選択・URLクエリ → フォームへの引継ぎ） --------

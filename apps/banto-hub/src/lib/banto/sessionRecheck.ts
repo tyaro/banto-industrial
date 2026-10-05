@@ -11,7 +11,7 @@
  * ## `1008` + `session_revoked` で閉じられた（#441）
  *
  * {@link recheckSessionAfterStreamClose}: `controller.signal('app:stream-closed')`
- * で失効の可能性を伝え、`invalidateAll()` でルートガード（`(app)/+layout.ts`）を
+ * で失効の可能性を伝え、`refreshAll()` でルートガード（`(app)/+layout.ts`）を
  * 走らせ直す:
  *
  * - 失効を確認できた（確定した `none`）→ ガードが `grantFallback` を試み、試運転の
@@ -37,18 +37,18 @@
  *
  * 失効を確認できた（`login`）ときは、呼び出し側（`connectTagStream`）が
  * `onHalt` → 上の {@link recheckSessionAfterStreamClose} へ合流する。`none` の
- * 確定で generation が動くので、配線①の `invalidateAll()` とここの
- * `invalidateAll()` が重なることがあるが、どちらもガードを走らせ直すだけで
+ * 確定で generation が動くので、配線①の `refreshAll()` とここの
+ * `refreshAll()` が重なることがあるが、どちらもガードを走らせ直すだけで
  * 無害（SvelteKit は後の呼び出しを勝たせる）。
  */
-import { invalidateAll } from '$app/navigation';
+import { refreshAll } from '$app/navigation';
 import { getSessionController, resolveSettled } from '@banto/admin-core';
 import { sessionProbeResultOf, type SessionProbeResult } from './streamClose';
 
 /** ストリームが `1008` + `session_revoked` で閉じられた（#441）。 */
 export async function recheckSessionAfterStreamClose(): Promise<void> {
 	getSessionController().signal('app:stream-closed');
-	await invalidateAll();
+	await refreshAll();
 }
 
 /**

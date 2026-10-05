@@ -9,9 +9,11 @@
 	// 接続元は loopback に限られる（banto v3.0.0）。状態を知る手段は
 	// `status/+page.svelte` の「サーバー状態」に事実として残した。
 	import { untrack } from 'svelte';
-	import { afterNavigate, goto, invalidateAll } from '$app/navigation';
+	import { afterNavigate, goto, refreshAll } from '$app/navigation';
 	import { getSessionController, notify } from '@banto/admin-core';
 	import { isLeavingForLogin, leaveForLogin } from '#lib/banto/logout.svelte.js';
+	import { isNavigationSettled } from '#lib/banto/navigationSettled.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 	import { OWNER_CHANGE_POLICY, watchOwnerChanges } from '#lib/banto/ownerChange.js';
 	import Header from '#lib/components/Header.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
@@ -97,15 +99,15 @@
 	// 次のセッションの load が終わったら作り直す（`{#key}`）。前のユーザーの
 	// 画面（メモリ上の状態・未保存の入力）を次のセッションへ持ち越さない。
 	// 同じセッションを確認し直しただけなら generation は変わらないので、普通の
-	// `invalidateAll()` で画面が作り直されることはない。**試運転モード中**も、
+	// `refreshAll()` で画面が作り直されることはない。**試運転モード中**も、
 	// grant のトークンによる通常のセッション（kind `commissioning`、banto v3.0.0）
 	// なので、同じトークンを確認し直しただけなら generation は据え置きで、タグ
 	// 画面などが作り直されることはない。
 	//
 	// 配線①: controller の generation が、このページの load が確認したものと
-	// 違えば load を走らせ直す（`invalidateAll()`）。ガードがもう一度確定し、
-	// /login・再試行のエラー画面・（新しい）ユーザーで作り直した画面のどれかへ
-	// 進む。generation が動くあらゆる経路をこれで拾う: 裏での失効の確定
+	// 違えば load を走らせ直す（`refreshAll()`、v4.0.0 まで `invalidateAll()`）。
+	// ガードがもう一度確定し、/login・再試行のエラー画面・（新しい）ユーザーで
+	// 作り直した画面のどれかへ進む。generation が動くあらゆる経路をこれで拾う: 裏での失効の確定
 	// （banto #241。admin-core の SSE の `401`・トークンの消去 → `signal()`。
 	// v1 の `onSessionEnded` の役目）、このレイアウトの mount 前に確定した終了
 	// （S-34/S-74）、`none` を経ない別タブのログイン（S-79/S-80、Remember me の
@@ -116,14 +118,23 @@
 	// ここで始めた invalidation は遷移に勝ってしまう（`#lib/banto/logout.svelte.ts`）。
 	// `isLeavingForLogin()` はリアクティブなので、その間に飛ばした変化は終わった
 	// ときに扱われる。
+	// banto #326（v4.0.0）: ナビゲーションの途中も走らせない（別タブのログインや
+	// 裏での失効の確定はナビゲーションの途中にも来るし、このレイアウトは
+	// ナビゲーションの終わりに mount される）。そのとき始めた `refreshAll()` は
+	// SvelteKit にそのナビゲーションを捨てさせ - 利用者の移動が失われる - その後の
+	// `beforeNavigate`（タグ画面の未保存の変更の確認）を飛ばさせる
+	// （`#lib/banto/navigationSettled.svelte.ts`）。`isNavigationSettled()` も
+	// リアクティブなので、ナビゲーションが終わったら、その load が確認した
+	// generation と比べ、それが古いときだけ走らせ直す。
 	const sessionController = getSessionController();
 	let requestedFor = -1;
 	$effect(() => {
 		const generation = sessionController.snapshot.generation;
 		if (isLeavingForLogin()) return;
+		if (!isNavigationSettled()) return;
 		if (generation !== data.sessionGeneration && requestedFor !== generation) {
 			requestedFor = generation;
-			void invalidateAll();
+			void refreshAll();
 		}
 	});
 
@@ -146,7 +157,7 @@
 							? '別のユーザーでログインされました。もう一度ログインしてください。'
 							: '別のユーザーでログインされました。画面をそのユーザーで開き直しました。'
 					),
-				goToLogin: () => leaveForLogin(() => goto('/login'))
+				goToLogin: () => leaveForLogin(() => goto(resolveAppPath('/login')))
 			})
 		)
 	);

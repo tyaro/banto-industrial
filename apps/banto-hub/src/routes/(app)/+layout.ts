@@ -6,6 +6,10 @@
 // - 閲覧公開（viewer-public）が無いので、閲覧公開のナビ制限も無い。
 // - エラー画面の本文は i18n ではなく `SESSION_CHECK_FAILED_MESSAGE`（日本語）。
 //   ロケールの同期は無い。`base` は使わない。
+// banto v4.0.0（SvelteKit 3、#325）: `error(status, message)` の形にし、/login への
+// redirect は `resolveAppPath()` を通す（上流と同じ）。上流で自動移行が壊した
+// 閲覧公開の許可リスト（`url.pathname` と表の path を比べる所）は banto-hub には
+// 無いので、比べ方の書き換えも無い。
 import { error, redirect } from '@sveltejs/kit';
 import {
 	getAuthProvider,
@@ -17,6 +21,7 @@ import { bantoReady } from '#lib/banto/setup.js';
 import { SESSION_CHECK_FAILED_MESSAGE } from '#lib/banto/sessionGuard.js';
 import { COMMISSIONING_KIND } from '#lib/banto/commissioning.js';
 import { settings } from '#lib/settings.svelte.js';
+import { resolveAppPath } from '#lib/navigation.js';
 
 // (app) グループ全体の認証ガード（banto #260、設計 §6.1。v3.0.0 で grant 方式）。
 // セッションの確定は SessionController（「誰がログインしているか」の唯一の
@@ -52,7 +57,7 @@ export async function load() {
 			kind: COMMISSIONING_KIND
 		});
 		if (result.outcome === 'unverified') sessionCheckFailed();
-		if (result.snapshot.status !== 'active') redirect(307, '/login');
+		if (result.snapshot.status !== 'active') redirect(307, resolveAppPath('/login'));
 	}
 	const snapshot = result.snapshot;
 
@@ -71,5 +76,5 @@ export async function load() {
 
 /** 再試行付きのエラー画面（Issue #204）: ログイン状態を確認できなかった。 */
 function sessionCheckFailed(): never {
-	error(503, { message: SESSION_CHECK_FAILED_MESSAGE });
+	error(503, SESSION_CHECK_FAILED_MESSAGE);
 }

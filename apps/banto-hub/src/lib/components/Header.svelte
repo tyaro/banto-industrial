@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { hubLogout } from '#lib/banto/hubLogout.js';
-	import { pageTitle } from '#lib/navigation.js';
+	import { pageTitle, resolveAppPath } from '#lib/navigation.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
@@ -27,7 +27,7 @@
 		// confirmed meanwhile stays). `'stayed'`/`'unverified'` are told with a
 		// toast - see `#lib/banto/logout.svelte.ts` for the full sequence.
 		// 試運転の grant のセッションも同じ流れ（`#lib/banto/hubLogout.ts`）。
-		await hubLogout(() => goto('/login'));
+		await hubLogout(() => goto(resolveAppPath('/login')));
 	}
 </script>
 

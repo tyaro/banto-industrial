@@ -68,14 +68,13 @@ export default tseslint.config(
 			// conventions already in the codebase - not worth enforcing one
 			// over the other.
 			'@typescript-eslint/consistent-type-definitions': 'off',
-			// SvelteKit's typed-routing `resolve()` helper (the thing this rule
-			// pushes every goto()/href toward) isn't adopted across the apps
-			// (ChronoGazer, on SvelteKit 3 since banto v4.0.0, routes only its
-			// nav/category tables through `resolveAppPath` in `#lib/navigation.ts`
-			// and has no base path; banto-hub is still on SvelteKit 2) - the rule
-			// would flag every other navigation call site. It is also a no-op
-			// under kit 3 either way: eslint-plugin-svelte (3.23) only runs it for
-			// SvelteKit 1/2 (banto v4.0.0's eslint.config.js note).
+			// Both apps (SvelteKit 3 since banto v4.0.0) route their app-internal
+			// goto()/redirect()/href through `resolveAppPath` in
+			// `#lib/navigation.ts` (SvelteKit's `resolve()`), not through the
+			// bare `resolve()` this rule looks for, and neither has a base path.
+			// The rule is also a no-op under kit 3 either way: eslint-plugin-svelte
+			// (3.23) only runs it for SvelteKit 1/2 (banto v4.0.0's
+			// eslint.config.js note).
 			'svelte/no-navigation-without-resolve': 'off',
 			// Flags every `new Map()`/`new Set()` regardless of whether it
 			// escapes into reactive state - in this codebase every hit so far

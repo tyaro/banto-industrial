@@ -26,11 +26,41 @@
  * （`path='/settings/appearance'` は `/settings/data` の prefix ではない）
  * ため、判定専用の `activeMatch`（既定は `path` 自身、他の項目は今までと
  * 同じ挙動）を導入し、`設定` だけ `/settings` を明示している。
+ *
+ * banto v4.0.0（SvelteKit 3、#325）: admin-template v4.0.0 の `navigation.ts` の
+ * `AppPath` と `resolveAppPath()` を写した（ChronoGazer の同名ファイルと同じ）。
+ * 表の `path`・`activeMatch` は SvelteKit 3 が生成する `Path` から作る
+ * `AppPath` で型付けし（存在しないルートは型エラー）、URL にするとき
+ * （`href`・`goto()`・`redirect()`）は `resolveAppPath()` を通す。banto-hub は
+ * `base` を使わない（axum がルート直下に配信する）ので今は `path` そのままと
+ * 同じ URL になるが、文字列の連結で base を足し引きしない（上流の移行で、
+ * 自動移行が `resolve('')` で「base を外す」処理に書き換えてガードが壊れた、
+ * #325。SvelteKit 3 の `resolve('')` は `base` ではなく `base + '/'`）。
  */
+import { resolve } from '$app/paths';
+import type { Path, ResolvedPathname } from '$app/types';
 import { APP_NAME } from '#lib/appName.js';
 
+/**
+ * An app route's pathname as written in the nav/category tables: a leading
+ * `/` and no base path (e.g. `/status`, `/settings/appearance`). Typed from
+ * SvelteKit 3's generated `Path` union, so a table entry pointing at a route
+ * that does not exist is a type error.
+ */
+export type AppPath = `/${Path}`;
+
+/**
+ * `AppPath` -> the href / `goto()` / `redirect()` target with the base path
+ * prefixed (SvelteKit 3 `resolve()`, which takes the pathname without its
+ * leading `/`). Use this, not string concatenation, wherever an `AppPath`
+ * leaves the app as a URL.
+ */
+export function resolveAppPath(path: AppPath): ResolvedPathname {
+	return resolve(path.slice(1) as Path);
+}
+
 export interface NavItem {
-	path: string;
+	path: AppPath;
 	label: string;
 	/** Placeholder icon (emoji) until an icon set is decided. */
 	icon: string;
@@ -43,7 +73,7 @@ export interface NavItem {
 	 * prefix」を表す - 通常は同じだが、`設定` のようにクリック時の遷移先が
 	 * サブパスでも、判定は親パス配下すべてを対象にしたい場合に分ける。
 	 */
-	activeMatch?: string;
+	activeMatch?: AppPath;
 }
 
 export const navItems: NavItem[] = [

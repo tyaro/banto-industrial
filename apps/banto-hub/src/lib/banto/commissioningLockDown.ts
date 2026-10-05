@@ -13,7 +13,7 @@
  * 1. `lockDown()`（`POST /api/commissioning/lock-down`）。失敗したら投げ直す
  *    （何も変えない。呼び出し側がエラーを表示する）。
  * 2. ここから /login への遷移が終わるまで、保護レイアウトの配線①の
- *    `invalidateAll()` を止める（`leaveForLogin`）。確定で generation が動くので、
+ *    `refreshAll()` を止める（`leaveForLogin`）。確定で generation が動くので、
  *    止めないと配線①の再 load が `goto('/login')` に勝つ（banto の E2E「5a」と
  *    同型、`logout.svelte.ts` の doc）。
  * 3. `resolveSettled(controller, { cause: 'signal' })` で今の資格情報について
@@ -36,7 +36,7 @@ export type LockDownOutcome = 'left' | 'stayed' | 'unverified';
 export interface LockDownAndLeaveOptions {
 	/** `POST /api/commissioning/lock-down`。reject はそのまま投げ直す。 */
 	lockDown: () => Promise<unknown>;
-	/** /login へ移る（`() => goto('/login')`）。 */
+	/** /login へ移る（`() => goto(resolveAppPath('/login'))`）。 */
 	goToLogin: () => Promise<void>;
 	controller?: SessionController;
 }

@@ -20,7 +20,7 @@
  *   it cannot confirm. No `end()` (I-10): v2.0.0 removed `endSession()`, and
  *   `end()` is for app policies holding their own ticket, never a logout.
  * - While leaving, the protected layout's generation check (wiring ①,
- *   `(app)/+layout.svelte`) does not call `invalidateAll()`. The logout's
+ *   `(app)/+layout.svelte`) does not call `refreshAll()`. The logout's
  *   own hold moves the generation, and SvelteKit lets such an invalidation
  *   win over the `goto('/login')` started right after it - with public
  *   viewing on, the re-run minted a public-viewer session and the tab stayed

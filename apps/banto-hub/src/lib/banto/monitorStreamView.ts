@@ -43,7 +43,7 @@ export type StreamViewEvent =
 	| { type: 'halted'; action: StreamHalt }
 	/** 手動の再開、またはログイン状態の確認で有効と分かって再開した。 */
 	| { type: 'resumed' }
-	/** ログイン状態の確認そのものが失敗した（`invalidateAll()` の reject）。 */
+	/** ログイン状態の確認そのものが失敗した（`refreshAll()` の reject）。 */
 	| { type: 'recheckFailed'; reason: string };
 
 /** `recheckFailed` のときの説明。 */

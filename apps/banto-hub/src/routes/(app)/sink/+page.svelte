@@ -15,6 +15,7 @@
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { canWriteResources, isAdmin } from '#lib/permissions.js';
 	import SinkGroupDrawer from '#lib/components/SinkGroupDrawer.svelte';
@@ -142,7 +143,7 @@
 
 	// --- サイドカー用 API キー（設計 §5.2・実装指示3） ---
 	const SINK_API_KEY_PRESET_NAME = 'banto-hub-sink';
-	const sinkApiKeyIssueHref = `/api-keys?presetName=${encodeURIComponent(SINK_API_KEY_PRESET_NAME)}&presetScopes=admin,read`;
+	const sinkApiKeyIssueHref = `${resolveAppPath('/api-keys')}?presetName=${encodeURIComponent(SINK_API_KEY_PRESET_NAME)}&presetScopes=admin,read`;
 </script>
 
 <div class="page">
@@ -153,7 +154,8 @@
 				>banto-hub-sink</code
 			>）はこの変更を <code>config_refresh_secs</code>（既定30秒）以内に
 			取り込みます。サイドカー自体の起動・停止は
-			<a href="/status#collection-control">状態画面</a>の「サービス一覧」から行えます。
+			<a href={`${resolveAppPath('/status')}#collection-control`}>状態画面</a
+			>の「サービス一覧」から行えます。
 		</p>
 
 		{#if loading && sinkGroups.length === 0}

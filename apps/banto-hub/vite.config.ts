@@ -9,6 +9,12 @@ export default defineConfig({
 		tailwindcss(),
 		sveltekit({
 			preprocess: vitePreprocess(),
+			// 旧 svelte.config.js（SvelteKit 3 で vite.config.ts に統合）のコメントをそのまま:
+			// relay-wright の svelte.config.js から複製。banto-hub は Tauri を持たず、
+			// axum (apps/banto-hub/core/src/assets.rs) が静的ビルドを配信するだけだが、
+			// adapter-static + フォールバックによる SPA 構成はそちらと同一（core 側の
+			// `#[folder = "../build"]` が `apps/banto-hub/build` を期待するため、出力先
+			// もそのまま合わせる）。
 			adapter: adapter({ pages: 'build', assets: 'build', fallback: 'index.html' })
 		})
 	],

@@ -13,12 +13,24 @@
  * テストは**本物の** controller の上で走らせたい（モックの controller では
  * adopt/end・ticket・世代の規則が見えない）ため。SvelteKit のプラグイン
  * （`sveltekit()`）は入れない（`$app/*` は各テストが `vi.mock` で差し替える）。
+ *
+ * banto v4.0.0（SvelteKit 3、#325）: `svelte()` を `sveltekit()` に替えた
+ * （`sveltekit()` は Svelte のプラグインを含む）。アプリ内の遷移先は
+ * `#lib/navigation.ts` の `resolveAppPath()`（SvelteKit の `resolve()`、
+ * `$app/paths`）を通すようになり、ルートガード（`routes/(app)/+layout.ts`）の
+ * テストが `$app/paths` を読むため - モックではなく本物の `resolve()`
+ * （base は ''）で /login への redirect の行き先を確かめる。`$app/navigation`
+ * などは今までどおり各テストが `vi.mock` で差し替える。`#lib/…` は
+ * package.json の `imports`（Node のサブパス import）なので、プラグイン無しでも
+ * テストから解決できる（上の「`$lib` を使わない」は SvelteKit 2 の頃の制約）。
+ * アプリのビルド設定（adapter・preprocess）は `vite.config.ts` 側にあり、
+ * ここでは要らない。
  */
-import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
-	plugins: [svelte()],
+	plugins: [sveltekit()],
 	test: {
 		include: ['src/**/*.test.ts']
 	}

@@ -63,6 +63,7 @@
 		type PendingChange
 	} from '#lib/banto/pendingChangesAdmin.js';
 	import { toastStore } from '#lib/toast.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { commissioningState } from '#lib/banto/commissioningState.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
@@ -902,7 +903,7 @@
 			</dl>
 			{#if status.sink.groups.length === 0}
 				<p class="note">
-					sink group が登録されていません（<a href="/sink">DB Sink</a> 画面から作成できます）。
+					sink group が登録されていません（<a href={resolveAppPath('/sink')}>DB Sink</a> 画面から作成できます）。
 				</p>
 			{:else}
 				<table class="conn-table">
@@ -1249,8 +1250,9 @@
 				</tbody>
 			</table>
 			<p class="note">
-				BantoHubSink は「サービス」一覧・DB Sink サイドカー（<a href="/sink">DB Sink</a>画面参照）の
-				Windows サービスです。インストールは
+				BantoHubSink は「サービス」一覧・DB Sink サイドカー（<a href={resolveAppPath('/sink')}
+					>DB Sink</a
+				>画面参照）の Windows サービスです。インストールは
 				<code>banto-hub-sink.exe install</code> を管理者権限で実行してください（本画面からは行えません）。
 			</p>
 		{/if}

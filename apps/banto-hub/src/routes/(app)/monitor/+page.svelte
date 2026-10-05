@@ -46,6 +46,7 @@
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { toastStore } from '#lib/toast.svelte.js';
+	import { resolveAppPath } from '#lib/navigation.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import {
 		getCatalog,
@@ -580,7 +581,7 @@
 							<p class="note">
 								登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
 							</p>
-							<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
+							<a class="onboarding-cta" href={resolveAppPath('/tags')}>タグの登録画面へ移動</a>
 						{:else if filteredRows.length === 0}
 							<p class="note">条件に一致するタグがありません。</p>
 						{:else}

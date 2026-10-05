@@ -14,7 +14,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('$app/navigation', () => ({ invalidateAll: async () => {} }));
+vi.mock('$app/navigation', () => ({ refreshAll: async () => {} }));
 vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
 
 import { probeSessionAfterReconnectFailures } from './sessionRecheck';

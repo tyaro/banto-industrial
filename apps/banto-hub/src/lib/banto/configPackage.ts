@@ -1,16 +1,22 @@
-import {
-	type CollectionGroup,
-	type CollectionGroupInput,
-	type PlcConnection,
-	type PlcConnectionInput,
-	type PlcProtocol,
-	type WordOrder,
-	type StringEncoding,
-	type Tag,
-	type TagInput
+// 型だけの import は `import type` で書く: SvelteKit 3 への移行（tsconfig が
+// `$app/tsconfig` を継ぐ形）の後、vitest の変換でも `verbatimModuleSyntax` が
+// 効くようになり、`import { type X } from './tagRegistryAdmin'` は空の import と
+// して残る - `configPackage.test.ts` で `./setup` が評価され、EventProvider の
+// 接続（`localStorage`）が未処理の reject になった。このモジュールは型以外を
+// import しない純関数のまま保つ。
+import type {
+	CollectionGroup,
+	CollectionGroupInput,
+	PlcConnection,
+	PlcConnectionInput,
+	PlcProtocol,
+	WordOrder,
+	StringEncoding,
+	Tag,
+	TagInput
 } from './tagRegistryAdmin';
-import { type GrpcSettings } from './grpcSettingsAdmin';
-import { type MqttSettings } from './mqttSettingsAdmin';
+import type { GrpcSettings } from './grpcSettingsAdmin';
+import type { MqttSettings } from './mqttSettingsAdmin';
 import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
 
 export const CONFIG_PACKAGE_SCHEMA_VERSION = 1 as const;
