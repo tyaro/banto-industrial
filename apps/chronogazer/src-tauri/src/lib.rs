@@ -4289,42 +4289,27 @@ mod tests {
     }
 
     /// #505: 窓（WebView）の CSP は、組み込みサーバーの応答の CSP（banto の
-    /// `with_security_headers`、#500）に Tauri の IPC（`connect-src` の
-    /// `ipc: http://ipc.localhost`）を足しただけのものにする（admin-template の
-    /// `tauri.conf.json` と同じ形）。banto が応答の CSP を変えたら、ここが落ちて
-    /// 窓の側を揃え忘れないようにする。
-    #[tokio::test]
-    async fn window_csp_is_the_served_csp_plus_tauri_ipc() {
-        use tower::ServiceExt;
+    /// `CONTENT_SECURITY_POLICY`、#500）に Tauri の IPC（`connect-src` の
+    /// `ipc: http://ipc.localhost`、`TAURI_IPC_CONNECT_SRC`）を足しただけのものに
+    /// する（admin-template の `tauri.conf.json` と同じ形）。ChronoGazer の窓は
+    /// Tauri のアセットを表示し、組み込みサーバーの画面へは移らないので、
+    /// 組み込みサーバーの応答の CSP は厳格なまま（広げない）。banto が応答の CSP を変えたら、ここが落ちて窓の側を
+    /// 揃え忘れないようにする。期待値は banto の `SecurityHeaders` で組み立てる
+    /// （banto v5.0.0。文字列の置き換えはしない）。
+    #[test]
+    fn window_csp_is_the_served_csp_plus_tauri_ipc() -> Result<(), banto_server::InvalidCspSource> {
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
         let window_csp = conf["app"]["security"]["csp"]
             .as_str()
             .expect("app.security.csp is set");
 
-        let router = with_security_headers(
-            axum::Router::new().route("/", axum::routing::get(|| async { "" })),
-        );
-        let response = router
-            .oneshot(
-                axum::http::Request::get("/")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let served_csp = response
-            .headers()
-            .get(axum::http::header::CONTENT_SECURITY_POLICY)
-            .and_then(|value| value.to_str().ok())
-            .expect("served CSP");
-
-        let expected = served_csp.replace(
-            "connect-src 'self'",
-            "connect-src 'self' ipc: http://ipc.localhost",
-        );
-        assert_ne!(expected, served_csp, "served CSP: {served_csp}");
+        let expected = banto_server::SecurityHeaders::new()
+            .extra_connect_src(banto_server::TAURI_IPC_CONNECT_SRC)?
+            .content_security_policy();
+        assert_ne!(expected, banto_server::CONTENT_SECURITY_POLICY);
         assert_eq!(window_csp, expected);
+        Ok(())
     }
     use std::path::PathBuf;
 

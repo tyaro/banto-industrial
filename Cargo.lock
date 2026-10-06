@@ -565,7 +565,6 @@ dependencies = [
 name = "banto-hub-shell"
 version = "0.2.0-alpha.29"
 dependencies = [
- "axum 0.8.9",
  "banto-hub-core",
  "banto-server",
  "serde",
@@ -576,7 +575,6 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
  "tokio",
- "tower",
  "windows-sys 0.61.2",
 ]
 

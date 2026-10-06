@@ -144,7 +144,9 @@ use std::time::Duration;
 use banto_collect::{CollectorOptions, Quality, RegistrySnapshot};
 use banto_core::BantoError;
 use banto_server::{
-    lan_urls_for_bind, start, static_router, with_security_headers, RunningServer, ServerConfig,
+    lan_urls_for_bind, request_from_loopback_peer, start, static_router,
+    with_security_headers_using, RunningServer, SecurityHeaders, ServerConfig,
+    TAURI_IPC_CONNECT_SRC,
 };
 use banto_tags::{
     CollectionGroupService, PlcConnectionInput, PlcConnectionService, TagService,
@@ -623,10 +625,12 @@ impl HubRuntime {
         });
         grpc_server.apply(&grpc_settings).await;
 
-        // `with_security_headers`（banto #500）は最後（最外）に掛け、静的 UI・
+        // セキュリティヘッダー（banto #500）は最後（最外）に掛け、静的 UI・
         // `/api/*`・SSE・WebSocket の upgrade 応答のすべてに付ける（ヘッダーを
-        // 足すだけで、ルーティング・認証・本文には触らない）。
-        let app = with_security_headers(
+        // 足すだけで、ルーティング・認証・本文には触らない）。loopback の
+        // 接続元にだけ CSP の `connect-src` に Tauri IPC を足す
+        // （[`hub_security_headers`]、#505）。
+        let app = with_hub_security_headers(
             api_router_with_controller(
                 users,
                 audit,
@@ -945,6 +949,38 @@ fn listening_urls(addr: std::net::SocketAddr) -> Vec<String> {
     lan_urls_for_bind(&addr.ip().to_string(), addr.port())
 }
 
+/// Hub の HTTP 応答に付けるセキュリティヘッダー（banto の `SecurityHeaders`、
+/// #500・#505）。既定は banto の厳格な CSP（`connect-src 'self'`）で、
+/// **TCP の接続元が loopback の要求にだけ** `connect-src` に Tauri IPC
+/// （`ipc:`・`http://ipc.localhost`、`TAURI_IPC_CONNECT_SRC`）を足す。
+///
+/// なぜ広げるか: デスクトップ版（`banto-hub-shell`）は起動後に窓を
+/// `http://127.0.0.1:<port>/` へ navigate するので、管理画面には窓の CSP では
+/// なくこの応答の CSP が掛かる。`/status` の「Windows サービス」カードが使う
+/// Tauri IPC の fetch が `connect-src 'self'` に止められ、読み込むたびに CSP
+/// 違反が出ていた（Tauri が postMessage に切り替えるので動作はしていた）。
+///
+/// なぜ loopback だけか: 接続元は TCP の接続から決まり、リモートのページや
+/// リンクからは選べない（ヘッダー・クエリ・`Host` は相手が決められるので
+/// 使わない）。LAN から直接つなぐブラウザは厳格なまま。広げた CSP を普通の
+/// ブラウザが受け取っても、`ipc:` は扱えない scheme で、`http://ipc.localhost`
+/// は**閲覧者自身の** loopback の 80/443 番を指すだけ（外への持ち出し先には
+/// ならない）。ただし同一ホストのリバースプロキシの後ろでは全要求が loopback
+/// に見えるので、LAN の閲覧者にも広げた CSP が届く - その扱いは
+/// docs/banto-hub-operations.md §6・tag-server-design.md §5.6 の運用条件
+/// （banto の `security_headers.rs` 冒頭の doc も参照）。
+pub(crate) fn hub_security_headers() -> SecurityHeaders {
+    SecurityHeaders::new()
+        .extra_connect_src(TAURI_IPC_CONNECT_SRC)
+        .expect("TAURI_IPC_CONNECT_SRC is a fixed, valid set of CSP sources")
+        .extra_connect_src_when(request_from_loopback_peer)
+}
+
+/// `router` に [`hub_security_headers`] を最外で掛ける。
+fn with_hub_security_headers(router: axum::Router) -> axum::Router {
+    with_security_headers_using(router, hub_security_headers())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,11 +1110,22 @@ Host: {addr}
                 )
                 .next()
                 .unwrap_or_default();
+            // #505: このテストの接続元は loopback（`127.0.0.1`）なので、CSP は
+            // `connect-src` に Tauri IPC を足したもの（デスクトップ版の窓が
+            // navigate する経路）。LAN からの要求が厳格なままであることは
+            // `hub_security_headers_widen_connect_src_only_for_loopback_peers`。
+            let widened = format!(
+                "content-security-policy: {}",
+                hub_security_headers()
+                    .content_security_policy()
+                    .to_ascii_lowercase()
+            );
+            assert!(widened.contains("connect-src 'self' ipc: http://ipc.localhost;"));
             for expected in [
                 "x-content-type-options: nosniff",
                 "x-frame-options: deny",
                 "referrer-policy: same-origin",
-                "content-security-policy: default-src 'self'",
+                widened.as_str(),
             ] {
                 assert!(
                     head.contains(expected),
@@ -1088,6 +1135,66 @@ Host: {addr}
         }
 
         hub.shutdown().await;
+    }
+
+    /// #505: [`hub_security_headers`] は TCP の接続元が loopback の要求にだけ
+    /// `connect-src` に Tauri IPC を足し、LAN（非 loopback）からの要求と、
+    /// 接続元が分からない要求（`ConnectInfo` の無い起動経路）には banto の
+    /// 厳格な CSP をそのまま返す。ほかの 3 つのヘッダーは変わらない。
+    /// `HubRuntime::start` がこの設定を掛けていることは
+    /// `served_responses_carry_security_headers`（実ソケット・loopback）が見る。
+    #[tokio::test]
+    async fn hub_security_headers_widen_connect_src_only_for_loopback_peers() {
+        use std::net::SocketAddr;
+
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{header, Request};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let router =
+            with_hub_security_headers(axum::Router::new().route("/", get(|| async { "ok" })));
+        let widened = SecurityHeaders::new()
+            .extra_connect_src(TAURI_IPC_CONNECT_SRC)
+            .expect("valid sources")
+            .content_security_policy();
+        assert_ne!(widened, banto_server::CONTENT_SECURITY_POLICY);
+
+        let csp_for = |peer: Option<&str>| {
+            let router = router.clone();
+            let mut request = Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("request");
+            if let Some(peer) = peer {
+                let addr: SocketAddr = peer.parse().expect("socket addr");
+                request.extensions_mut().insert(ConnectInfo(addr));
+            }
+            async move {
+                let response = router.oneshot(request).await.expect("response");
+                let headers = response.headers();
+                assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+                assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
+                assert_eq!(headers[header::REFERRER_POLICY], "same-origin");
+                headers[header::CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .expect("ascii")
+                    .to_owned()
+            }
+        };
+
+        // デスクトップ版のシェル（同じ機械の WebView）= loopback。
+        assert_eq!(csp_for(Some("127.0.0.1:50000")).await, widened);
+        assert_eq!(csp_for(Some("[::1]:50000")).await, widened);
+        // LAN のブラウザ（直接つなぐ）・接続元が分からない要求は厳格なまま。
+        for peer in [Some("192.168.11.20:50000"), Some("10.0.0.5:50000"), None] {
+            assert_eq!(
+                csp_for(peer).await,
+                banto_server::CONTENT_SECURITY_POLICY,
+                "peer {peer:?} must keep the strict CSP"
+            );
+        }
     }
 
     /// 試運転モードとロックダウン（設計 §5.6 制約1・2026-08-30 オーナー決定）:

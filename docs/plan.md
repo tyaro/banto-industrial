@@ -20,7 +20,8 @@ banto-hub のサービスと REST ルーターを banto のものに置き換え
 真っ白が解消したこと（実装済み）を反映。同日: §5 に ChronoGazer の SvelteKit 3 移行（banto v4.0.0、
 実装済み。banto-hub の npm は v3.0.1 のままの移行中）を追記。同日: §5 に banto-hub の SvelteKit 3 移行
 （実装済み。両アプリの npm が v4.0.0 に揃い、移行中のずれは解消）を追記。2026-10-06: §5 に
-両アプリの監査ログ画面を banto の `SnapshotListResource` に寄せたこと（実装済み）を追記。
+両アプリの監査ログ画面を banto の `SnapshotListResource` に寄せたこと（実装済み）を追記。同日: §5 に
+banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -349,6 +350,11 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   「再読み込み」は処理中でも押せる（処理中の要求を中断して新しい世代に）、選択中の行を強調する。
   文言（日本語の直書き・「0件の記録があります。」）と 15 秒の読み取りの上限は残した（banto の上限の
   文言は英語の固定文なので、`auditLogAdmin.ts` の `createAuditLogFetcher` がこちらの上限を先に掛ける）。
+  **banto v5.0.0 追従（2026-10-06、実装済み）**: この回避策（取得関数の側の二重の上限 `runWithLimit` と、
+  境界の食い違いの英語の固定文との文字列比較 `auditErrorText`）を外した。15 秒はリソースの
+  `requestTimeoutMs` に、上限切れ・境界の食い違い・応答の形の不正の日本語の文言は `messages` に渡し
+  （`createAuditLogResource`）、画面の失敗表示は `failures` の最も前の `'error'` から出す（admin-template v5 と
+  同じ）。banto-hub の `runWithLimit.ts` は削除（ChronoGazer の `hubAdmin.ts` のものは `/events` などが使うので残す）。
 
   続き（未着手）: 初回セットアップ画面。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・

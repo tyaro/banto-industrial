@@ -43,15 +43,13 @@ tokio = { workspace = true, features = ["sync"] }
 serde = { workspace = true }
 
 # #505 のテスト専用: 窓の CSP（`tauri.conf.json`）が Hub の応答の CSP（banto の
-# `with_security_headers`）に Tauri の IPC を足しただけか、実際の応答のヘッダーと
-# 突き合わせる。どれも `banto-hub-core` が既に使っている workspace の依存で、
-# パッケージは増えない。
+# `CONTENT_SECURITY_POLICY`）に Tauri の IPC を足しただけか、banto の
+# `SecurityHeaders::content_security_policy()` と突き合わせる（banto v5.0.0）。
+# どれも `banto-hub-core` が既に使っている workspace の依存で、パッケージは
+# 増えない。
 [dev-dependencies]
 banto-server = { workspace = true }
-axum = { workspace = true }
-tower = { workspace = true, features = ["util"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
 
 # `set_service_autostart` invoke が `banto-hub-elev.exe` を UAC 昇格して
 # 起動する（`ShellExecuteExW`、verb "runas"）ためだけの Windows API 依存。

@@ -4,7 +4,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ## v0.2.0-alpha.29 — 2026-10-05（アルファ）
 
-banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A）。banto-hub への影響は依存の版だけで、REST の wire・設定・DB は変わらない。配布物の構成・前提ランタイムは alpha.3 以降と同じ。alpha.28 の「旧形式の DB は起動を拒否する」はそのまま（上げる手順は alpha.28 の節）。
+banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A）。その後 v4.0.0 を経て、banto v5.0.0（2026-10-06、`SnapshotListResource` の失敗の形の破壊的変更と、`banto-server` の CSP の `connect-src` を要求ごとに広げる API の追加）に追従した。banto-hub への影響は依存の版・監査ログ画面の失敗の扱い・デスクトップ版の `/status` の CSP で、REST の wire・設定・DB は変わらない。配布物の構成・前提ランタイムは alpha.3 以降と同じ。alpha.28 の「旧形式の DB は起動を拒否する」はそのまま（上げる手順は alpha.28 の節）。
 
 ### 変更（ChronoGazer。banto-hub の配布物には入らない）
 
@@ -13,11 +13,15 @@ banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし
 - 監査ログ画面のブロック読み込みを banto の `SnapshotListResource` に寄せ、画面を admin-template の形にした（banto #248。自前の `auditBlocks.ts` を削除。`/events` の `blockCache.ts` は残す）。剪定の `deletionEpoch` でも失効を見る、「再読み込み」は処理中でも押せる、選択中の行を強調する。
 - 前回の公開（alpha.28）以降に main に入った ChronoGazer の変更: users/settings/audit/backup のサービスと REST ルーターを banto v3.0.0 のものに置き換えた（#498。banto v2.1.0 の #277・#278・#280）、LAN 設定の適用を banto の形にし閲覧公開（grant `publicViewer`）を使えるようにした（#499。#287・#288・#294）、起動時の環境判定を banto の形にした（#501。届かないときは demo に落とさず起動待ちで再試行する。#286）。ChronoGazer は 0.1.0 のまま。
 - デスクトップ版の窓（WebView）に CSP を設定した（#505。`tauri.conf.json` の `app.security.csp`。組み込みサーバーの応答の CSP（#500）に Tauri の IPC の `connect-src ipc: http://ipc.localhost` を足しただけの、admin-template と同じもの）。リリース相当のビルドで全画面・アクリル効果・旧形式の DB のエラーの窓に違反が無いことを確かめた。`tauri dev`（Vite の devUrl）では窓の CSP は掛からない（Tauri の仕様）。
+- 監査ログ画面を banto v5.0.0 の `SnapshotListResource` の API に寄せた（#511 の回避策の撤去）。読み取りの上限（15 秒）はリソースの `requestTimeoutMs` に渡し、取得関数の側の二重の上限（`runWithLimit`）をやめた。上限切れ・境界の食い違い・応答の形の不正の文言は `messages` で日本語にし（英語の固定文との文字列比較をやめた）、画面の失敗表示は `failures` の最も前のブロックの失敗から出す（admin-template v5 と同じ）。トーストと失効の案内は従来どおり。`/events` などが使う `runWithLimit`（`hubAdmin.ts`）は残す。組み込みサーバーの応答の CSP は厳格なまま（ChronoGazer の窓は Tauri のアセットを表示し、組み込みサーバーの画面へは移らないため）。
 
 ### 変更（banto-hub）
 
 - ChronoGazer の組み込みサーバー（デスクトップ版の LAN アクセスと `banto-serve`）と banto-hub のサーバー（コンソール/サービス/デスクトップ版の共通経路）の応答に、banto のセキュリティヘッダー（`with_security_headers`: CSP・`nosniff`・`X-Frame-Options: DENY`・`Referrer-Policy: same-origin`）を付けた（#500）。admin-template と同じく Router の最外に掛ける。
-- デスクトップ版（`banto-hub-shell`）の窓に CSP を設定した（#505。ChronoGazer と同じ値）。この CSP が掛かるのは起動中・起動失敗のプレースホルダ（`ui/index.html`）だけで、navigate した後の管理画面には Hub の応答の CSP（#500）が掛かる。その応答の CSP は `connect-src 'self'` なので、デスクトップ版で `/status` を読み込む（起動直後・再読み込み）たびに、サービス状態を取る IPC（`host_switch_status`・`sink_service_status`）の最初の fetch がコンソールに CSP 違反を出し、Tauri が postMessage に切り替えて表示は出る（実機で確認。扱いはオーナー判断待ち）。
+- デスクトップ版（`banto-hub-shell`）の窓に CSP を設定した（#505。ChronoGazer と同じ値）。この CSP が掛かるのは起動中・起動失敗のプレースホルダ（`ui/index.html`）だけで、navigate した後の管理画面には Hub の応答の CSP（#500）が掛かる。その応答の CSP は `connect-src 'self'` なので、デスクトップ版で `/status` を読み込む（起動直後・再読み込み）たびに、サービス状態を取る IPC（`host_switch_status`・`sink_service_status`）の最初の fetch がコンソールに CSP 違反を出し、Tauri が postMessage に切り替えて表示は出ていた。→ 下の banto v5.0.0 追従で解消した。
+- **#505 の残り（`/status` の CSP 違反）を解消した。** Hub の応答の CSP を banto v5.0.0 の `with_security_headers_using` に替え、**TCP の接続元が loopback の要求にだけ** `connect-src` に Tauri IPC（`ipc: http://ipc.localhost`）を足す（`request_from_loopback_peer`）。LAN から直接つなぐブラウザ・接続元の分からない要求は厳格なまま。広げた CSP を普通のブラウザが受け取っても、`ipc:` は扱えない scheme で、`http://ipc.localhost` は閲覧者自身の loopback の 80/443 番を指すだけ。**同一ホストのリバースプロキシ（Caddy など）の後ろでは全要求が loopback に見えるので、LAN の閲覧者にも広げた CSP が届く**（運用条件は banto-hub-operations.md §6）。デスクトップ版の `/status` で違反 0 件・サービス状態の表示を実機で確認した。
+- 監査ログ画面を banto v5.0.0 の `SnapshotListResource` の API に寄せた（ChronoGazer と同じ。#511 の回避策の撤去）。banto-hub だけが使っていた `runWithLimit.ts` を削除した。
+- banto の依存（`banto-core` / `banto-storage` / `banto-server` / `banto-admin-services`、`@banto/*`）を `v4.0.0` から `v5.0.0` に上げた。`Cargo.lock` は banto の 4 crate だけ（`cargo update -p` が無関係な `windows-sys`・`socket2`・`heck` の参照を入れ替えたので、banto の行だけに戻した）と、デスクトップ版のテスト専用の依存の整理（`axum`・`tower`・`tokio` を外した）、`pnpm-lock.yaml` は `@banto/*` のみ。
 - 監査ログ画面のブロック読み込みを banto の `SnapshotListResource` に寄せ、画面を admin-template の形にした（banto #248。自前の `auditBlocks.ts`・`blockCache.ts` を削除）。剪定の `deletionEpoch` でも失効を見る、「再読み込み」は処理中でも押せる、選択中の行を強調する。REST の wire は変わらない。
 - users/settings/audit のサービスと、auth（status/setup/change-password）・users・audit-log の REST の口を banto v3.0.0 のものに置き換えた（#502、I3'）。banto v2.1.0 の #277（初回セットアップの原子化）・#278（失敗ログインの名前の切り詰め、無効なログアウトを記録しない）が入る。保持設定の変更の監査は `settings_change` / `settings` になった。#431 の認証ゲートと RBAC の床、hub 固有の設定キー・各ルーターは自前のまま。
 - 管理 UI を SvelteKit 3（`@sveltejs/kit` 3・`@sveltejs/adapter-static` 4）と TypeScript 6 に移行し、npm の `@banto/*` を banto v4.0.0 に上げた（ChronoGazer と同じ banto #325 の経路 B: `svelte.config.js` を廃止して `vite.config.ts` に、`$lib` → `#lib`、ナビ・設定カテゴリの表の `AppPath` とアプリ内の遷移先 `goto()`・`redirect()`・`href` の `resolveAppPath()` 経由、`invalidateAll()` → `refreshAll()`、`error(status, message)`。あわせて #326 の `navigationSettled.svelte.ts` を写し、ナビゲーションの途中で配線①の再 load を始めない）。画面の URL・挙動は変わらない。これで両アプリの Rust・npm が banto v4.0.0 に揃った。
