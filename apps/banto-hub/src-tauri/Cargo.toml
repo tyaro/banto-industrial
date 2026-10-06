@@ -44,7 +44,7 @@ serde = { workspace = true }
 
 # #505 のテスト専用: 窓の CSP（`tauri.conf.json`）が Hub の応答の CSP（banto の
 # `CONTENT_SECURITY_POLICY`）に Tauri の IPC を足しただけか、banto の
-# `SecurityHeaders::content_security_policy()` と突き合わせる（banto v5.0.0）。
+# `SecurityHeaders::content_security_policy()` と突き合わせる（banto v5.1.0）。
 # どれも `banto-hub-core` が既に使っている workspace の依存で、パッケージは
 # 増えない。
 [dev-dependencies]
