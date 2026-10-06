@@ -1464,6 +1464,47 @@ mod tests {
     use super::*;
     use banto_hub_core::profile_paths::resolve_profile_paths_from_env;
 
+    /// #505: 窓（WebView）の CSP は、Hub の応答の CSP（banto の
+    /// `with_security_headers`、#500）に Tauri の IPC（`connect-src` の
+    /// `ipc: http://ipc.localhost`）を足しただけのものにする（admin-template の
+    /// `tauri.conf.json` と同じ形）。この CSP が掛かるのは `frontendDist` の
+    /// プレースホルダ（`ui/index.html`）だけで、navigate した後の Hub の画面には
+    /// Hub の応答の CSP が掛かる。banto が応答の CSP を変えたら、ここが落ちて
+    /// 窓の側を揃え忘れないようにする。
+    #[tokio::test]
+    async fn window_csp_is_the_served_csp_plus_tauri_ipc() {
+        use tower::ServiceExt;
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let window_csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("app.security.csp is set");
+
+        let router = banto_server::with_security_headers(
+            axum::Router::new().route("/", axum::routing::get(|| async { "" })),
+        );
+        let response = router
+            .oneshot(
+                axum::http::Request::get("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let served_csp = response
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .expect("served CSP");
+
+        let expected = served_csp.replace(
+            "connect-src 'self'",
+            "connect-src 'self' ipc: http://ipc.localhost",
+        );
+        assert_ne!(expected, served_csp, "served CSP: {served_csp}");
+        assert_eq!(window_csp, expected);
+    }
+
     /// [`build_hub_config_from_env`] は3ホスト共通の関数（T17-1、
     /// `apps/banto-hub/core/src/profile_paths.rs`）を呼ぶだけになった -
     /// このシェル crate 固有の複製ロジックは無い。`HubRuntime::start`
