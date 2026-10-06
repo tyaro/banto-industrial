@@ -4,20 +4,20 @@
  * ChronoGazer 側の継ぎ目だけ:
  *
  * - `createAuditLogFetcher` が要求の並べ替え・絞り込み・ページングと**境界
- *   （`asOfId`）をそのまま**サーバーへ渡すこと（落とすとブロックの合間の追加で
- *   行がずれる - 下の「リソースと組み合わせて」で実際に確かめる）、
- * - 上限（15 秒）に当たったら日本語の文言で失敗し、要求を中断すること、
- * - リソースの `signal`（新しい世代・`dispose()`）でも要求を中断すること、
+ *   （`asOfId`）**、リソースの `signal` を**そのまま**サーバーへ渡すこと
+ *   （境界を落とすとブロックの合間の追加で行がずれる - 下の「リソースと
+ *   組み合わせて」で実際に確かめる）、
+ * - `createAuditLogResource` の上限（15 秒）と、リソース自身が作る失敗
+ *   （上限切れ・境界の食い違い・応答の形の不正）の日本語の文言（banto v5.0.0
+ *   の `messages`）。本物の `createSnapshotListResource` で確かめる、
  * - `listAuditLog` の URL（`?asOfId=`）と Tauri の `audit_log_list` の引数。
  *
- * 無応答は「解決しない Promise」と `vi.useFakeTimers()` で作る
- * （`runWithLimit.test.ts` と同じ）。
+ * 無応答は「解決しない Promise」と `vi.useFakeTimers()` で作る。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-	createSnapshotListResource,
+	isSnapshotListError,
 	ProviderError,
-	SNAPSHOT_BOUNDARY_MISMATCH_MESSAGE,
 	type ListParams,
 	type SnapshotListRequest
 } from '@banto/admin-core';
@@ -38,9 +38,10 @@ vi.mock('@banto/admin-core', async (importOriginal) => ({
 
 import {
 	AUDIT_BOUNDARY_MISMATCH_MESSAGE,
-	auditErrorText,
+	AUDIT_MALFORMED_MESSAGE,
 	auditListTimeoutMessage,
 	createAuditLogFetcher,
+	createAuditLogResource,
 	listAuditLog,
 	type AuditLogEntry,
 	type AuditLogLister,
@@ -75,15 +76,10 @@ function request(over: Partial<SnapshotListRequest> = {}): SnapshotListRequest {
 }
 
 describe('createAuditLogFetcher', () => {
-	afterEach(() => {
-		vi.useRealTimers();
-		vi.unstubAllGlobals();
-	});
-
 	it('並べ替え・絞り込み・ページングと境界（asOfId）をそのまま渡す', async () => {
 		const answer: AuditLogList = { rows: [entry(1)], totalCount: 1, asOfId: 42, deletionEpoch: 0 };
 		const list = vi.fn<AuditLogLister>(async () => answer);
-		const fetcher = createAuditLogFetcher(list, LIMIT_MS);
+		const fetcher = createAuditLogFetcher(list);
 
 		const req = request();
 		await expect(fetcher(req, new AbortController().signal)).resolves.toBe(answer);
@@ -96,46 +92,15 @@ describe('createAuditLogFetcher', () => {
 
 	it('世代の最初（asOfId: null）は null のまま渡す', async () => {
 		const list = vi.fn<AuditLogLister>(async () => ({ rows: [], totalCount: 0, asOfId: 0 }));
-		await createAuditLogFetcher(list, LIMIT_MS)(
-			request({ asOfId: null }),
-			new AbortController().signal
-		);
+		await createAuditLogFetcher(list)(request({ asOfId: null }), new AbortController().signal);
 		expect(list.mock.calls[0]?.[1]).toBeNull();
 	});
 
-	it('上限を過ぎても返ってこない要求は日本語の文言で失敗し、要求を中断する', async () => {
-		vi.useFakeTimers();
-		let captured: AbortSignal | undefined;
-		const list = vi.fn<AuditLogLister>((_params, _asOfId, signal) => {
-			captured = signal;
-			return new Promise<AuditLogList>(() => {});
-		});
-		const pending = createAuditLogFetcher(list, LIMIT_MS)(request(), new AbortController().signal);
-		const settled = pending.then(
-			() => null,
-			(err: unknown) => err
-		);
-
-		await vi.advanceTimersByTimeAsync(LIMIT_MS);
-		const err = await settled;
-		expect(err).toBeInstanceOf(ProviderError);
-		expect((err as ProviderError).message).toBe(auditListTimeoutMessage(LIMIT_MS));
-		expect((err as ProviderError).message).toContain('15秒以内に返りませんでした');
-		expect(captured?.aborted).toBe(true);
-	});
-
-	it('リソースの signal（新しい世代・dispose）が畳まれたら要求も中断する', async () => {
-		let captured: AbortSignal | undefined;
-		const list = vi.fn<AuditLogLister>((_params, _asOfId, signal) => {
-			captured = signal;
-			return new Promise<AuditLogList>(() => {});
-		});
+	it('リソースの signal（上限切れ・新しい世代・dispose）をそのまま渡す', async () => {
+		const list = vi.fn<AuditLogLister>(async () => ({ rows: [], totalCount: 0, asOfId: 0 }));
 		const controller = new AbortController();
-		void createAuditLogFetcher(list, LIMIT_MS)(request(), controller.signal);
-		await Promise.resolve();
-		expect(captured?.aborted).toBe(false);
-		controller.abort();
-		expect(captured?.aborted).toBe(true);
+		await createAuditLogFetcher(list)(request(), controller.signal);
+		expect(list.mock.calls[0]?.[2]).toBe(controller.signal);
 	});
 
 	it('サーバーの失敗はそのまま投げる（握り潰さない）', async () => {
@@ -143,22 +108,9 @@ describe('createAuditLogFetcher', () => {
 		const list = vi.fn<AuditLogLister>(async () => {
 			throw failure;
 		});
-		await expect(
-			createAuditLogFetcher(list, LIMIT_MS)(request(), new AbortController().signal)
-		).rejects.toBe(failure);
-	});
-});
-
-describe('auditErrorText', () => {
-	it('banto の境界の食い違い（英語の固定文）だけを日本語にする', () => {
-		expect(
-			auditErrorText(
-				new ProviderError({ kind: 'other', message: SNAPSHOT_BOUNDARY_MISMATCH_MESSAGE })
-			)
-		).toBe(AUDIT_BOUNDARY_MISMATCH_MESSAGE);
-		expect(
-			auditErrorText(new ProviderError({ kind: 'other', message: 'サーバーに接続できません' }))
-		).toBe('サーバーに接続できません');
+		await expect(createAuditLogFetcher(list)(request(), new AbortController().signal)).rejects.toBe(
+			failure
+		);
 	});
 });
 
@@ -211,18 +163,30 @@ describe('listAuditLog', () => {
 });
 
 /**
- * banto の `SnapshotListResource` と組み合わせた確認。ブロックの合間に記録が
- * 増えても、同じ世代の 2 ブロック目は**最初の境界の集合**から読まれ、境界の
- * 行と重ならない。`createAuditLogFetcher` が `asOfId` を落とすと、偽の
- * サーバーは新しい境界で答え、リソースは境界の食い違いとして 2 ブロック目を
- * 採らない（このテストが落ちる）。
+ * `createAuditLogResource`（本物の `createSnapshotListResource`）と組み合わせた
+ * 確認。ブロックの合間に記録が増えても、同じ世代の 2 ブロック目は**最初の
+ * 境界の集合**から読まれ、境界の行と重ならない。`createAuditLogFetcher` が
+ * `asOfId` を落とすと、偽のサーバーは新しい境界で答え、リソースは境界の
+ * 食い違いとして 2 ブロック目を採らない（下の 1 本目が落ちる）。`messages` を
+ * 渡し忘れると、上限切れ・境界の食い違い・応答の形の不正が英語の既定の文言に
+ * なる（下の 2〜4 本目が落ちる）。
  */
 describe('SnapshotListResource と組み合わせて', () => {
-	/** id 降順で返す偽のサーバー（`audit_log_router` と同じ境界の約束）。 */
-	function fakeServer(initial: number) {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	const PARAMS = { sort: [{ field: 'ts', direction: 'desc' as const }], filters: [] };
+
+	/**
+	 * id 降順で返す偽のサーバー（`audit_log_router` と同じ境界の約束）。
+	 * `ignoreBoundary` は要求の `asOfId` を無視して、その時点の最大 id を境界に
+	 * 答える（境界の食い違いを起こす）。
+	 */
+	function fakeServer(initial: number, ignoreBoundary = false) {
 		let maxId = initial;
 		const list = vi.fn<AuditLogLister>(async (params, asOfId) => {
-			const boundary = asOfId ?? maxId;
+			const boundary = ignoreBoundary ? maxId : (asOfId ?? maxId);
 			const ids: number[] = [];
 			for (let id = boundary; id >= 1; id--) ids.push(id);
 			const { offset, limit } = params.pagination ?? { offset: 0, limit: 200 };
@@ -248,10 +212,7 @@ describe('SnapshotListResource と組み合わせて', () => {
 
 	it('ブロックの合間に記録が増えても、2 ブロック目は最初の境界から読まれ、重複しない', async () => {
 		const server = fakeServer(300);
-		const resource = createSnapshotListResource<AuditLogEntry>(
-			createAuditLogFetcher(server.list, LIMIT_MS),
-			{ params: { sort: [{ field: 'ts', direction: 'desc' }], filters: [] } }
-		);
+		const resource = createAuditLogResource(PARAMS, server.list);
 		try {
 			resource.ensureRange(0, 100);
 			await settle();
@@ -264,8 +225,7 @@ describe('SnapshotListResource と組み合わせて', () => {
 			resource.ensureRange(150, 260);
 			await settle();
 
-			expect(resource.error).toBeNull();
-			expect(resource.failedBlocks).toEqual([]);
+			expect(resource.failures).toEqual([]);
 			expect(resource.totalCount).toBe(300);
 			expect(resource.rows[199]?.id).toBe(101);
 			expect(resource.rows[200]?.id).toBe(100);
@@ -278,6 +238,93 @@ describe('SnapshotListResource と組み合わせて', () => {
 			await settle();
 			expect(resource.totalCount).toBe(305);
 			expect(resource.rows[0]?.id).toBe(305);
+		} finally {
+			resource.dispose();
+		}
+	});
+
+	it('15 秒以内に返ってこないブロックは code: timeout・日本語の文言で失敗し、要求を中断する', async () => {
+		vi.useFakeTimers();
+		let captured: AbortSignal | undefined;
+		const list = vi.fn<AuditLogLister>((_params, _asOfId, signal) => {
+			captured = signal;
+			return new Promise<AuditLogList>(() => {});
+		});
+		const resource = createAuditLogResource(PARAMS, list);
+		try {
+			resource.ensureRange(0, 100);
+			// banto の既定（30 秒）ではなく 15 秒で切れる。
+			await vi.advanceTimersByTimeAsync(LIMIT_MS - 1);
+			expect(resource.failures).toEqual([]);
+			expect(captured?.aborted).toBe(false);
+
+			await vi.advanceTimersByTimeAsync(1);
+			const failure = resource.failures[0];
+			if (failure?.kind !== 'error') throw new Error('expected an error failure');
+			expect(failure.code).toBe('timeout');
+			expect(isSnapshotListError(failure.error)).toBe(true);
+			expect(failure.error.message).toBe(auditListTimeoutMessage(LIMIT_MS));
+			expect(failure.error.message).toContain('15秒以内に返りませんでした');
+			expect(captured?.aborted).toBe(true);
+			expect(resource.totalCount).toBeNull();
+		} finally {
+			resource.dispose();
+		}
+	});
+
+	it('境界の食い違い（サーバーが asOfId を無視した）は日本語の文言で失敗する', async () => {
+		const server = fakeServer(300, true);
+		const resource = createAuditLogResource(PARAMS, server.list);
+		try {
+			resource.ensureRange(0, 100);
+			await settle();
+			server.record(5);
+			resource.ensureRange(150, 260);
+			await settle();
+
+			expect(resource.failures).toHaveLength(1);
+			const failure = resource.failures[0];
+			if (failure?.kind !== 'error') throw new Error('expected an error failure');
+			expect(failure.block).toBe(1);
+			expect(failure.code).toBe('boundaryMismatch');
+			expect(failure.error.message).toBe(AUDIT_BOUNDARY_MISMATCH_MESSAGE);
+			// 食い違った応答の行は採らない。
+			expect(resource.rows[200]).toBeUndefined();
+		} finally {
+			resource.dispose();
+		}
+	});
+
+	it('形の正しくない応答は日本語の文言で失敗する', async () => {
+		const list = vi.fn<AuditLogLister>(
+			async () => ({ rows: 'broken', totalCount: 1, asOfId: 1 }) as unknown as AuditLogList
+		);
+		const resource = createAuditLogResource(PARAMS, list);
+		try {
+			resource.ensureRange(0, 100);
+			await settle();
+			const failure = resource.failures[0];
+			if (failure?.kind !== 'error') throw new Error('expected an error failure');
+			expect(failure.code).toBe('malformed');
+			expect(failure.error.message).toBe(AUDIT_MALFORMED_MESSAGE);
+		} finally {
+			resource.dispose();
+		}
+	});
+
+	it('サーバーの失敗は code: request で、サーバーの ProviderError のまま残る', async () => {
+		const serverError = new ProviderError({ kind: 'storage', message: 'データベースを読めません' });
+		const list = vi.fn<AuditLogLister>(async () => {
+			throw serverError;
+		});
+		const resource = createAuditLogResource(PARAMS, list);
+		try {
+			resource.ensureRange(0, 100);
+			await settle();
+			const failure = resource.failures[0];
+			if (failure?.kind !== 'error') throw new Error('expected an error failure');
+			expect(failure.code).toBe('request');
+			expect(failure.error).toBe(serverError);
 		} finally {
 			resource.dispose();
 		}

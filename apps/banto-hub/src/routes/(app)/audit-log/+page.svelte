@@ -2,7 +2,7 @@
 	/**
 	 * 監査ログ閲覧画面。`admin` のみ到達（+page.ts が非adminをリダイレクト）。
 	 * banto の admin-template の同名画面（`apps/admin-template/src/routes/(app)/
-	 * audit-log/+page.svelte`、v4.0.0）の形に合わせ、以下だけを banto-hub 向けに
+	 * audit-log/+page.svelte`、v5.0.0）の形に合わせ、以下だけを banto-hub 向けに
 	 * 変えている:
 	 * - 文言は日本語の直書き（banto-hub は paraglide を持たない）。件数の表示は
 	 *   0 件でも「0件の記録があります。」（E2E が固定している）。
@@ -32,11 +32,9 @@
 		type GridColumn,
 		type SortState
 	} from '@banto/grid-svelte';
-	import { createSnapshotListResource } from '@banto/admin-core';
 	import {
 		AUDIT_SNAPSHOT_EXPIRED_MESSAGE,
-		auditErrorText,
-		createAuditLogFetcher,
+		createAuditLogResource,
 		type AuditLogEntry
 	} from '#lib/banto/auditLogAdmin.js';
 
@@ -137,16 +135,20 @@
 	gridState.sort = [{ field: 'ts', direction: 'desc' }];
 
 	/**
-	 * 監査ログのブロック読み込み（banto #248）。取得 1 本は
-	 * `createAuditLogFetcher()`（`listAuditLog(params, asOfId, signal)` に
-	 * 15 秒の上限を掛けたもの）: 世代の最初は `asOfId: null`（サーバーが境界を
-	 * 決めて返す）、後続は固定した境界。境界付きの取得ではサーバーは保持期間の
-	 * 削除を走らせない。失敗の持ち方・世代違いの応答の破棄・新しい世代での
+	 * 監査ログのブロック読み込み（banto #248）。`createAuditLogResource()` は
+	 * `listAuditLog(params, asOfId, signal)` を取得 1 本にし、15 秒の上限
+	 * （`requestTimeoutMs`）と日本語の失敗の文言（`messages`、banto v5.0.0）を
+	 * 渡したもの: 世代の最初は `asOfId: null`（サーバーが境界を決めて返す）、
+	 * 後続は固定した境界。境界付きの取得ではサーバーは保持期間の削除を
+	 * 走らせない。上限・失敗の持ち方・世代違いの応答の破棄・新しい世代での
 	 * 中断はリソース側が行う。
 	 */
-	const auditLog = createSnapshotListResource<AuditLogEntry>(createAuditLogFetcher(), {
-		params: { sort: gridState.sort, filters: [] }
-	});
+	const auditLog = createAuditLogResource({ sort: gridState.sort, filters: [] });
+
+	// 画面に出す読み込み失敗: 失敗したままのブロックのうち、いちばん前のもの
+	// （`failures` はブロック順。banto の admin-template と同じ）。失効
+	// （`expired`）は別の案内で出す。
+	const loadFailure = $derived(auditLog.failures.find((failure) => failure.kind === 'error'));
 
 	// `untrack`: 初回の読み込みはマウント時に 1 度だけ。リソースは引数の
 	// 非リアクティブな写しだけを読むが、`ensureRange()` が公開する状態
@@ -211,7 +213,7 @@
 	-->
 	<p class="note">
 		{#if auditLog.totalCount === null}
-			{auditLog.failedBlocks.length > 0
+			{auditLog.failures.length > 0
 				? '監査ログを読み込めていません。'
 				: '監査ログを読み込んでいます。'}
 		{:else}
@@ -219,8 +221,8 @@
 		{/if}
 	</p>
 
-	{#if auditLog.error}
-		<p class="error" role="alert">{auditErrorText(auditLog.error)}</p>
+	{#if loadFailure?.kind === 'error'}
+		<p class="error" role="alert">{loadFailure.error.message}</p>
 	{/if}
 	{#if auditLog.expired}
 		<p class="error" role="alert">{AUDIT_SNAPSHOT_EXPIRED_MESSAGE}</p>
