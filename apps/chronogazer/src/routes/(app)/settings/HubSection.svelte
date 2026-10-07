@@ -98,6 +98,8 @@
 		type HubTag,
 		type HubView
 	} from '#lib/banto/hubAdmin.js';
+	import { UnsavedChangesNotice } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { errorMessage } from './shared';
 
 	const available = isHubAvailable();
@@ -172,6 +174,8 @@
 			statusSnapshot.recheck
 		)
 	);
+	/** APIキーの入力欄（手動採用）を出すか。未保存の判定もこれに合わせる。 */
+	const manualKeyShown = $derived(showManualKeyEntry(statusDisplay.guidance, subscription));
 	const credentialGuidanceLine = $derived(
 		hubCredentialGuidanceLine(subscription, statusDisplay.guidance)
 	);
@@ -188,6 +192,17 @@
 	let endpointDraft = $state('');
 	let manualKeyDraft = $state('');
 	let busy = $state(false);
+	/**
+	 * **設定を書き換える操作の最中**（接続・切断・キーの採用・選択の保存）だけ真。
+	 * 未保存の確認（`guardUnsavedChanges`）の `isSaving` にはこちらを渡す。
+	 *
+	 * `busy` は**操作の排他**用で、初期の接続状態の読み取り（`getHubStatus`、最長
+	 * 90 秒）・読み取り専用の「状態を再取得」・自動の取り直し・「一覧を更新」でも
+	 * 立つ。それを `isSaving` に渡すと、入力が何も無いのに画面を開いた直後に
+	 * 離れようとして「保存していない変更があります」が出る（#520 のレビュー P2。
+	 * 通知は `unsavedInput` しか見ないので、理由も画面に出ない）。
+	 */
+	let mutationInFlight = $state(false);
 	let hubError = $state<string | null>(null);
 	let savedNotice = $state<string | null>(null);
 	/**
@@ -208,6 +223,24 @@
 	 * 警告がこの操作を止める役割を果たさない。
 	 */
 	let statusUnconfirmedNotice = $state<string | null>(null);
+
+	/**
+	 * 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）。次のいずれかが
+	 * あれば未保存: 選択の下書き（`selectionUnsaved`、戻す導線は既存の
+	 * 「サーバーの内容に戻す」）、採用前のAPIキー欄、接続していない接続先URL
+	 * （サーバーが返した接続先 `selectionEndpoint` と違う入力）。接続先URLは
+	 * `applyView` が接続できた値で上書きするので、接続できれば自然に消える。
+	 */
+	const unsavedInput = $derived(
+		available &&
+			(selectionUnsaved ||
+				// 入力欄が**見えている間だけ**数える。隠れた欄の下書きは、利用者から見えず
+				// 取り消す手段も無いので、数えると消せない「未保存」になる（#520 のレビュー
+				// P2）。加えて、接続・切断の成功で欄が消えるときは下書きも空にする。
+				(manualKeyShown && manualKeyDraft !== '') ||
+				endpointDraft.trim() !== (selectionEndpoint ?? ''))
+	);
+	guardUnsavedChanges({ isDirty: () => unsavedInput, isSaving: () => mutationInFlight });
 
 	/**
 	 * 明示操作の結果を何回反映したか。飛行中のポーリングはこの番号を覚えて
@@ -402,14 +435,21 @@
 	 * 触る前に `signal.aborted` を見る）。見ないと、打ち切りの文言を出した
 	 * あとに「保存しました」が上書きで出る。
 	 */
-	async function run(action: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	async function run(
+		action: (signal: AbortSignal) => Promise<void>,
+		// 設定を書き換える操作か（未保存の確認の `isSaving`）。読み取りだけの操作は
+		// `false` にして、離れるときの確認を出さない。
+		mutating = true
+	): Promise<void> {
 		beginRun();
+		mutationInFlight = mutating;
 		try {
 			const outcome = await runWithLimit(action, HUB_UI_TIMEOUT_MS);
 			// 打ち切りは**失敗ではない**ので、通常のエラー文言と混ぜない。
 			if (outcome.kind === 'failed') hubError = errorMessage(outcome.error);
 			else if (outcome.kind === 'timedOut') await rereadAfterAbandon();
 		} finally {
+			mutationInFlight = false;
 			busy = false;
 		}
 	}
@@ -458,7 +498,7 @@
 			const view = await getHubStatus(signal);
 			if (signal.aborted) return;
 			applyView(view);
-		});
+		}, false);
 	});
 
 	async function connect(): Promise<void> {
@@ -474,6 +514,12 @@
 			const view = await connectHub(endpointDraft, signal);
 			if (signal.aborted) return;
 			applyView(view);
+			// 接続**できた**ときだけ、採用の入力欄は消えるので下書きも空にする。応答が返った
+			// ことは接続できたことではない（Hub が施錠されていて使える保存済みキーが無いと
+			// `needsPairing` の応答が**正常に**返る）。その応答で消すと、「接続」は入力欄の
+			// キーを送らない（送るのは「このキーを採用」）ので、何も送られず保存もされない
+			// のに入力だけが消える（#520 のレビュー P2）。
+			if (view.status.state === 'connected') manualKeyDraft = '';
 		});
 	}
 
@@ -500,7 +546,7 @@
 			const view = await refreshHubCatalog(signal);
 			if (signal.aborted) return;
 			applyView(view);
-		});
+		}, false);
 	}
 
 	/**
@@ -518,6 +564,7 @@
 	 */
 	async function saveSelection(): Promise<void> {
 		beginRun();
+		mutationInFlight = true;
 		// 保存は view を返さない（204）が、設定も購読も変える明示操作。
 		// 保存中に飛んでいたポーリング応答を捨てるために番号を進める。
 		beginExplicitChange();
@@ -550,6 +597,7 @@
 				else pollFailures = nextPollFailureCount(pollFailures, pollFailureOutcome(reread));
 			}
 		} finally {
+			mutationInFlight = false;
 			busy = false;
 		}
 	}
@@ -575,6 +623,7 @@
 			tags = null;
 			configured = false;
 			endpointDraft = '';
+			manualKeyDraft = '';
 		});
 	}
 
@@ -747,6 +796,7 @@
 			>
 				接続
 			</button>
+			<UnsavedChangesNotice pending={unsavedInput} label={UNSAVED_NOTICE} />
 
 			<p class="status">
 				状態: <strong>{statusDisplay.label}</strong>
@@ -803,7 +853,7 @@
 				<p class="note selection-discarded" role="status">{selectionDiscardedNotice}</p>
 			{/if}
 
-			{#if showManualKeyEntry(statusDisplay.guidance, subscription)}
+			{#if manualKeyShown}
 				<div class="server-fields">
 					<label class="field hub-endpoint">
 						APIキー（Hubの管理画面で発行したもの）

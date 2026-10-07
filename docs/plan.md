@@ -22,7 +22,8 @@ banto-hub のサービスと REST ルーターを banto のものに置き換え
 （実装済み。両アプリの npm が v4.0.0 に揃い、移行中のずれは解消）を追記。2026-10-06: §5 に
 両アプリの監査ログ画面を banto の `SnapshotListResource` に寄せたこと（実装済み）を追記。同日: §5 に
 banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）を追記。2026-10-07: §5 に ChronoGazer の
-イベント一覧（`/events`）も `SnapshotListResource` に寄せたこと（実装済み）を追記。
+イベント一覧（`/events`）も `SnapshotListResource` に寄せたこと（実装済み）を追記。同日: §5 に ChronoGazer の
+未保存の入力の確認（`beforeNavigate`、#508、実装済み）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -338,6 +339,12 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   `monitorHref` の単体テストが落ちる）。#326 の `navigationSettled.svelte.ts` を写し、配線①はナビゲーションが
   終わるまで `refreshAll()` を始めない（タグ画面の未保存の変更の確認 `beforeNavigate` を飛ばさせない）。
   単体テストの vitest は `$app/paths` を読むため `sveltekit()` プラグインに替えた。
+
+- **ChronoGazer の未保存の入力の確認（`beforeNavigate`、2026-10-07、実装済み。#508、経路 B）**: admin-template の
+  `unsavedChanges.ts`（`@banto/forms` の `guardUnsavedChanges` / `UnsavedChangesNotice`）を写し、タグ設定・ユーザー管理・
+  設定の入力のある画面に適用した（banto-hub は #214 より前に独自の仕組みを持つので対象外）。ログイン画面への移動は
+  確認しない。E2E は `e2e/tests/user-unsaved-changes.spec.ts`。**Tauri のウィンドウを閉じるときの確認（上流の
+  `windowCloseGuard.ts`）は入れていない** - close-requested を JS が握るとネイティブの閉じる動作が JS 任せになるため、別に決める。
 
 - **監査ログ画面を banto の `SnapshotListResource` に寄せる（2026-10-06、実装済み。banto #248、
   「重複実装は banto に寄せる」の続き）**: 両アプリの `/audit-log` は、ブロックの遅延取得・世代の

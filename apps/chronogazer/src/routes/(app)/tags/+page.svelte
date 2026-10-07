@@ -64,7 +64,8 @@
 	 */
 	import { untrack } from 'svelte';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
-	import { BantoForm, createFormStore, type FormSchema } from '@banto/forms';
+	import { BantoForm, createFormStore, UnsavedChangesNotice, type FormSchema } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
@@ -466,6 +467,7 @@
 					// 判定は**サーバーが返した行**で行う（失敗したら `error` 分岐に
 					// 行き、ここは通らない - 画面は切り替わったように見せない）。
 					toastStore.push('success', connectionSavedMessage(before, outcome.entity));
+					editConnectionStore.markClean();
 					selectedConnection = outcome.entity;
 					await reloadConnections();
 					break;
@@ -732,6 +734,7 @@
 			switch (outcome.kind) {
 				case 'applied':
 					toastStore.push('success', '更新しました');
+					editGroupStore.markClean();
 					selectedGroup = outcome.entity;
 					await reloadGroups();
 					break;
@@ -998,6 +1001,7 @@
 			switch (outcome.kind) {
 				case 'applied':
 					toastStore.push('success', '更新しました');
+					editTagStore.markClean();
 					selectedTag = outcome.entity;
 					await reloadTags();
 					break;
@@ -1057,6 +1061,29 @@
 	// （`coverageReloadStarted`）。再取得は接続・グループ・タグの変更で起きるので、
 	// 前回の結果は「前の設定の判定」でしかない（例: 実機接続だった頃の空配列で
 	// 「すべて値が動く」と断定してしまう）。
+
+	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 6 つのフォーム
+	// （接続・グループ・タグの新規作成と編集）のどれかに、読み込み/保存時の値と
+	// 違う入力があれば未保存。編集フォームは行を選んでいる間だけ数える（削除や
+	// 選択解除で消えたフォームの入力は捨てたものなので数えない）。保存の成功は
+	// `markClean()`（編集）か新しいストアへの差し替え（新規作成）で消す。保存・
+	// 作成の最中も「保存が落ちるかもしれない」ので未保存として扱う。
+	guardUnsavedChanges({
+		isDirty: () =>
+			createConnectionStore.isDirty ||
+			createGroupStore.isDirty ||
+			createTagStore.isDirty ||
+			(selectedConnection !== null && editConnectionStore.isDirty) ||
+			(selectedGroup !== null && editGroupStore.isDirty) ||
+			(selectedTag !== null && editTagStore.isDirty),
+		isSaving: () =>
+			creatingConnection ||
+			creatingGroup ||
+			creatingTag ||
+			savingConnection ||
+			savingGroup ||
+			savingTag
+	});
 
 	let coverage: SimulationCoverageEntry[] | null = $state(null);
 	let coverageError: string | null = $state(null);
@@ -1210,6 +1237,7 @@
 			{#if canWrite}
 				<div class="create">
 					<h4>新規作成</h4>
+					<UnsavedChangesNotice pending={createConnectionStore.isDirty} label={UNSAVED_NOTICE} />
 					<BantoForm
 						schema={connectionSchema(PLC_CREATE)}
 						store={createConnectionStore}
@@ -1282,6 +1310,7 @@
 			{#if selectedConnection && canWrite}
 				<div class="detail">
 					<h4>{selectedConnection.name} を編集</h4>
+					<UnsavedChangesNotice pending={editConnectionStore.isDirty} label={UNSAVED_NOTICE} />
 					<BantoForm
 						schema={connectionSchema(PLC_EDIT)}
 						store={editConnectionStore}
@@ -1326,6 +1355,7 @@
 							</button>
 						</p>
 					{:else}
+						<UnsavedChangesNotice pending={createGroupStore.isDirty} label={UNSAVED_NOTICE} />
 						<BantoForm
 							schema={groupSchema(GROUP_CREATE)}
 							store={createGroupStore}
@@ -1379,6 +1409,7 @@
 			{#if selectedGroup && canWrite}
 				<div class="detail">
 					<h4>{selectedGroup.name} を編集</h4>
+					<UnsavedChangesNotice pending={editGroupStore.isDirty} label={UNSAVED_NOTICE} />
 					<BantoForm
 						schema={groupSchema(GROUP_EDIT)}
 						store={editGroupStore}
@@ -1416,6 +1447,7 @@
 							</button>
 						</p>
 					{:else}
+						<UnsavedChangesNotice pending={createTagStore.isDirty} label={UNSAVED_NOTICE} />
 						<BantoForm
 							schema={tagSchema(TAG_CREATE)}
 							store={createTagStore}
@@ -1513,6 +1545,7 @@
 			{#if selectedTag && canWrite}
 				<div class="detail">
 					<h4>{selectedTag.name} を編集</h4>
+					<UnsavedChangesNotice pending={editTagStore.isDirty} label={UNSAVED_NOTICE} />
 					<BantoForm
 						schema={tagSchema(TAG_EDIT)}
 						store={editTagStore}

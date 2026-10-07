@@ -30,6 +30,8 @@
 	} from '#lib/banto/serverAdmin.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
+	import { UnsavedChangesNotice } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_DISCARD, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { pickPrimaryLanUrl } from './connectivityScope';
 	import { lanToggleLocked } from './lanToggle';
@@ -52,6 +54,24 @@
 		bindDraft = status.bind;
 		portDraft = status.port;
 		viewerPublicDraft = status.viewerPublic;
+	}
+
+	// banto #214（admin-template と同じ）: 未保存の確認。下書きが最後に適用
+	// された状態（`serverStatus`）と違えば未保存。状態を読めていない間は
+	// 比べる相手が無いので未保存にしない（`tauri` でないブラウザでは入力欄
+	// そのものが出ない）。
+	const dirty = $derived(
+		serverStatus !== null &&
+			(enabledDraft !== serverStatus.enabled ||
+				bindDraft !== serverStatus.bind ||
+				portDraft !== serverStatus.port ||
+				viewerPublicDraft !== serverStatus.viewerPublic)
+	);
+	const guard = guardUnsavedChanges({ isDirty: () => dirty, isSaving: () => applying });
+
+	/** 「変更を取り消す」: 下書きを最後に適用した状態へ戻す。 */
+	function resetDraftsToSaved(): void {
+		if (serverStatus) applyStatusToDrafts(serverStatus);
 	}
 
 	function messageOf(err: unknown): string {
@@ -161,7 +181,15 @@
 				</label>
 			</div>
 
-			<button type="button" onclick={saveAndApply} disabled={applying}>保存して適用</button>
+			<div class="save-row">
+				<button type="button" onclick={saveAndApply} disabled={applying}>保存して適用</button>
+				{#if dirty}
+					<button type="button" onclick={resetDraftsToSaved} disabled={applying}>
+						{UNSAVED_DISCARD}
+					</button>
+				{/if}
+				<UnsavedChangesNotice pending={guard.pending} label={UNSAVED_NOTICE} />
+			</div>
 
 			{#if serverError}
 				<p class="error">{serverError}</p>

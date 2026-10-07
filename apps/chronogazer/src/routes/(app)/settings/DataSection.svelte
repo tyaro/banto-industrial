@@ -29,6 +29,8 @@
 		type BackupInfo,
 		type PendingRestoreInfo
 	} from '#lib/banto/backupsAdmin.js';
+	import { UnsavedChangesNotice } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_DISCARD, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { errorMessage } from './shared';
 
 	const tauri = isTauri();
@@ -51,6 +53,24 @@
 	let retentionRowsDraft = $state(100_000);
 	let applyingAudit = $state(false);
 	let auditError: string | null = $state(null);
+
+	// banto #214 の流儀（ChronoGazer #508）: 未保存の確認。保持ポリシーの下書きが
+	// 最後に保存した値（`auditConfig`）と違えば未保存。読み込めていない間は
+	// 比べる相手が無いので未保存にしない。`0` は無期限（上の注記）。
+	const auditDirty = $derived(
+		auditConfig !== null &&
+			(retentionDaysDraft !== (auditConfig.retentionDays ?? 0) ||
+				retentionRowsDraft !== (auditConfig.retentionRows ?? 0))
+	);
+	const auditGuard = guardUnsavedChanges({
+		isDirty: () => auditDirty,
+		isSaving: () => applyingAudit
+	});
+
+	/** 「変更を取り消す」: 下書きを最後に保存した値へ戻す。 */
+	function resetAuditDraftsToSaved(): void {
+		if (auditConfig) applyAuditConfigToDrafts(auditConfig);
+	}
 
 	function applyAuditConfigToDrafts(config: AuditSettings): void {
 		auditConfig = config;
@@ -246,7 +266,15 @@
 			</label>
 		</div>
 
-		<button type="button" onclick={saveAuditConfig} disabled={applyingAudit}>保存</button>
+		<div class="save-row">
+			<button type="button" onclick={saveAuditConfig} disabled={applyingAudit}>保存</button>
+			{#if auditDirty}
+				<button type="button" onclick={resetAuditDraftsToSaved} disabled={applyingAudit}>
+					{UNSAVED_DISCARD}
+				</button>
+			{/if}
+			<UnsavedChangesNotice pending={auditGuard.pending} label={UNSAVED_NOTICE} />
+		</div>
 
 		{#if auditError}
 			<p class="error">{auditError}</p>

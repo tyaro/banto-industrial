@@ -19,6 +19,8 @@
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
+	import { UnsavedChangesNotice } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_DISCARD, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { errorMessage } from './shared';
 
@@ -35,6 +37,29 @@
 	let newPasswordConfirm = $state('');
 	let passwordError: string | null = $state(null);
 	let changingPassword = $state(false);
+
+	// banto #214（admin-template と同じ）: 入力したまま送信していないパスワード欄。
+	// フォームが実際に出ている間だけ（下の markup と同じ条件）。変更に失敗した
+	// ときは欄を残すので未保存の表示も残り、成功すれば欄を空にして消える。
+	// （Tauri 専用の自動ログインのフォームは上流と同じく対象外。）
+	const passwordFormShown = $derived(
+		!sessionStore.publicViewer && !sessionStore.authDisabled && !!changePassword
+	);
+	const passwordDirty = $derived(
+		passwordFormShown && (currentPassword !== '' || newPassword !== '' || newPasswordConfirm !== '')
+	);
+	const passwordGuard = guardUnsavedChanges({
+		isDirty: () => passwordDirty,
+		isSaving: () => changingPassword
+	});
+
+	/** 「変更を取り消す」: 入力したパスワード欄を空にする。 */
+	function discardPasswordDraft(): void {
+		currentPassword = '';
+		newPassword = '';
+		newPasswordConfirm = '';
+		passwordError = null;
+	}
 
 	async function submitChangePassword(event: SubmitEvent): Promise<void> {
 		event.preventDefault();
@@ -170,7 +195,15 @@
 				<p class="error">{passwordError}</p>
 			{/if}
 
-			<button type="submit" disabled={changingPassword}>パスワードを変更</button>
+			<div class="save-row">
+				<button type="submit" disabled={changingPassword}>パスワードを変更</button>
+				{#if passwordGuard.pending}
+					<button type="button" onclick={discardPasswordDraft} disabled={changingPassword}>
+						{UNSAVED_DISCARD}
+					</button>
+				{/if}
+				<UnsavedChangesNotice pending={passwordGuard.pending} label={UNSAVED_NOTICE} />
+			</div>
 		</form>
 	{:else}
 		<p class="note">この環境ではパスワード変更に対応していません。</p>

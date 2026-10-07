@@ -13,7 +13,8 @@
 	 * にしたもの）。
 	 */
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
-	import { BantoForm, createFormStore } from '@banto/forms';
+	import { BantoForm, createFormStore, UnsavedChangesNotice } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import type { FormSchema } from '@banto/forms';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
@@ -173,6 +174,23 @@
 	let resetPassword = $state('');
 	let resetting = $state(false);
 
+	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 新規作成フォームの
+	// 入力、選択中のユーザーの表示名・ロールの編集（選んだ行の値と違う）、入力した
+	// ままのリセット用パスワード。保存の成功で `selected` が保存後の値に変わるので
+	// 編集は消え、リセットは成功時に欄を空にして消える。
+	const editDirty = $derived.by(() => {
+		const current = selected as UserSummary | null;
+		return (
+			current !== null && (editDisplayName !== current.displayName || editRole !== current.role)
+		);
+	});
+	const resetDirty = $derived(selected !== null && resetPassword !== '');
+	const createDirty = $derived(createStore.isDirty);
+	guardUnsavedChanges({
+		isDirty: () => createDirty || editDirty || resetDirty,
+		isSaving: () => creating || saving || resetting
+	});
+
 	async function saveReset(): Promise<void> {
 		if (!selected) return;
 		if (resetPassword.length < 8) {
@@ -215,6 +233,7 @@
 	{:else}
 		<section class="create">
 			<h3>新規作成</h3>
+			<UnsavedChangesNotice pending={createDirty} label={UNSAVED_NOTICE} />
 			<BantoForm
 				schema={createSchema}
 				store={createStore}
@@ -239,6 +258,7 @@
 		{#if selected}
 			<section class="detail">
 				<h3>{selected.username} を編集</h3>
+				<UnsavedChangesNotice pending={editDirty || resetDirty} label={UNSAVED_NOTICE} />
 				<label class="field">
 					表示名
 					<input type="text" bind:value={editDisplayName} />

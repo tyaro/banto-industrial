@@ -21,6 +21,8 @@
 	import { isTauri } from '#lib/banto/setup.js';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { applyAuthSettings, type AuthDisabledRole } from '#lib/banto/authAdmin.js';
+	import { UnsavedChangesNotice } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_DISCARD, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { canManageAuthMode, errorMessage } from './shared';
 
@@ -35,6 +37,26 @@
 	let disabledDraft = $state(false);
 	let disabledRoleDraft = $state<AuthDisabledRole>('admin');
 	let applyingAuth = $state(false);
+
+	// banto #214（admin-template と同じ）: 未保存の確認。保存済みの値
+	// （`authSettingsStore.value`）と下書きが違えば未保存。保存が成功すると
+	// 値が更新されて偽に戻り、失敗なら両方そのままで未保存の表示が残る。
+	const dirty = $derived.by(() => {
+		const value = authSettingsStore.value;
+		return (
+			value !== null &&
+			(disabledDraft !== value.disabled || disabledRoleDraft !== value.disabledRole)
+		);
+	});
+	const guard = guardUnsavedChanges({ isDirty: () => dirty, isSaving: () => applyingAuth });
+
+	/** 保存済みの認証設定へ下書きを戻す（「変更を取り消す」）。 */
+	function resetDraftsToSaved(): void {
+		const value = authSettingsStore.value;
+		if (!value) return;
+		disabledDraft = value.disabled;
+		disabledRoleDraft = value.disabledRole;
+	}
 
 	$effect(() => {
 		const next = authSettingsStore.value;
@@ -84,6 +106,12 @@
 			// トーストは load の再実行の前に出す（admin-template と同じ順）。後だと、
 			// OFF でログイン画面へ移った後に出る・確認できないとき最大 10 秒遅れる。
 			toastStore.push('success', '認証設定を更新しました');
+			// banto #214（admin-template と同じ）: 保存は済んだので、未保存の状態を
+			// `refreshAll()` の前に消す。`refreshAll()` の `guardCategory` による
+			// 遷移（セキュリティが見えなくなったとき）も `beforeNavigate` を通るので、
+			// 未保存のまま残すと確認が出てしまう。
+			resetDraftsToSaved();
+			applyingAuth = false;
 			await refreshAll();
 		} catch (err) {
 			// 排他違反（LANアクセス有効中の有効化など）はサーバ側の日本語メッセージ
@@ -115,7 +143,15 @@
 			</label>
 		</div>
 
-		<button type="button" onclick={saveAuthSettings} disabled={applyingAuth}>保存して適用</button>
+		<div class="save-row">
+			<button type="button" onclick={saveAuthSettings} disabled={applyingAuth}>保存して適用</button>
+			{#if dirty}
+				<button type="button" onclick={resetDraftsToSaved} disabled={applyingAuth}>
+					{UNSAVED_DISCARD}
+				</button>
+			{/if}
+			<UnsavedChangesNotice pending={guard.pending} label={UNSAVED_NOTICE} />
+		</div>
 
 		{#if authSettingsStore.error}
 			<p class="error">{authSettingsStore.error}</p>
