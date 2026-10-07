@@ -16,7 +16,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-	isSnapshotListError,
+	isListBlockError,
 	ProviderError,
 	type ListParams,
 	type SnapshotListRequest
@@ -236,7 +236,7 @@ describe('SnapshotListResource と組み合わせて', () => {
 			const failure = resource.failures[0];
 			if (failure?.kind !== 'error') throw new Error('expected an error failure');
 			expect(failure.code).toBe('timeout');
-			expect(isSnapshotListError(failure.error)).toBe(true);
+			expect(isListBlockError(failure.error)).toBe(true);
 			expect(failure.error.message).toBe(auditListTimeoutMessage(LIMIT_MS));
 			expect(failure.error.message).toContain('15秒以内に返りませんでした');
 			expect(captured?.aborted).toBe(true);
