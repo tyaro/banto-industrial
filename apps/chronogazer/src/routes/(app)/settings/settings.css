@@ -120,3 +120,11 @@
 	color: var(--banto-text-muted);
 	font-size: 0.8rem;
 }
+
+/* 未保存の確認（#508）: 保存ボタン・「変更を取り消す」・未保存の表示を横に並べる。 */
+.settings-layout .save-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem;
+}

@@ -98,6 +98,8 @@
 		type HubTag,
 		type HubView
 	} from '#lib/banto/hubAdmin.js';
+	import { UnsavedChangesNotice } from '@banto/forms';
+	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { errorMessage } from './shared';
 
 	const available = isHubAvailable();
@@ -208,6 +210,21 @@
 	 * 警告がこの操作を止める役割を果たさない。
 	 */
 	let statusUnconfirmedNotice = $state<string | null>(null);
+
+	/**
+	 * 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）。次のいずれかが
+	 * あれば未保存: 選択の下書き（`selectionUnsaved`、戻す導線は既存の
+	 * 「サーバーの内容に戻す」）、採用前のAPIキー欄、接続していない接続先URL
+	 * （サーバーが返した接続先 `selectionEndpoint` と違う入力）。接続先URLは
+	 * `applyView` が接続できた値で上書きするので、接続できれば自然に消える。
+	 */
+	const unsavedInput = $derived(
+		available &&
+			(selectionUnsaved ||
+				manualKeyDraft !== '' ||
+				endpointDraft.trim() !== (selectionEndpoint ?? ''))
+	);
+	guardUnsavedChanges({ isDirty: () => unsavedInput, isSaving: () => busy });
 
 	/**
 	 * 明示操作の結果を何回反映したか。飛行中のポーリングはこの番号を覚えて
@@ -747,6 +764,7 @@
 			>
 				接続
 			</button>
+			<UnsavedChangesNotice pending={unsavedInput} label={UNSAVED_NOTICE} />
 
 			<p class="status">
 				状態: <strong>{statusDisplay.label}</strong>

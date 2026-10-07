@@ -1,7 +1,7 @@
 // banto v4.0.0（タグ v4.0.0 = 4df169c）の admin-template
 // `apps/admin-template/src/lib/banto/navigationSettled.svelte.ts` を写した（banto #326）。
-// chronogazer 固有の差: 未保存の変更の確認（`beforeNavigate`）は今は持たないので、
-// doc の `#lib/unsavedChanges.ts` への参照は template のもの（判定そのものは同じ）。
+// chronogazer 固有の差: なし（本文は無改変）。未保存の変更の確認（`beforeNavigate`）は
+// ChronoGazer #508 で `#lib/unsavedChanges.ts`（template の写し）として入った。
 /**
  * "No navigation in progress" for the layouts' `refreshAll()` (Issue
  * #326, first met in #321).
