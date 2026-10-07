@@ -278,6 +278,46 @@ test.describe.serial('chronogazer 未保存の入力の確認', () => {
 		}
 	});
 
+	test('5f. Hub接続: 「接続」が接続できなかった応答（needsPairing）では、入力したAPIキーを消さず未保存のまま確認も出す', async () => {
+		const ENDPOINT = 'http://127.0.0.1:3100';
+		await page.route('**/api/hub', async (route) => {
+			if (route.request().method() === 'GET') {
+				await route.fulfill({ json: hubView({ state: 'needsPairing' }, ENDPOINT) });
+				return;
+			}
+			await route.continue();
+		});
+		let connects = 0;
+		await page.route('**/api/hub/connect', async (route) => {
+			connects += 1;
+			await route.fulfill({ json: hubView({ state: 'needsPairing' }, ENDPOINT) });
+		});
+		try {
+			await page.goto('/settings/hub');
+			const keyInput = page.locator('input[type="password"]');
+			await keyInput.fill('typed-not-adopted');
+			await expect(page.locator('.banto-unsaved')).toHaveText('未保存の変更があります');
+
+			await page.getByRole('button', { name: '接続', exact: true }).click();
+			await expect.poll(() => connects).toBe(1);
+			// 何も送られず保存もされていないので、入力は残り、未保存の表示も残る。
+			await expect(keyInput).toHaveValue('typed-not-adopted');
+			await expect(page.locator('.banto-unsaved')).toHaveText('未保存の変更があります');
+
+			await sidebarLink(/監視/).click();
+			await expect.poll(() => dialogs).toEqual([CONFIRM_MESSAGE]);
+			await expect(page).toHaveURL(/\/settings\/hub$/);
+
+			// 後始末: 入力を残したままだと次のテストの `goto` が確認で止まる。「離れる」で出る。
+			answer = 'leave';
+			await sidebarLink(/監視/).click();
+			await expect(page).toHaveURL(/\/monitor$/);
+		} finally {
+			await page.unroute('**/api/hub/connect');
+			await page.unroute('**/api/hub');
+		}
+	});
+
 	test('6. ログアウト（/login への移動）は、未保存の入力があっても確認を出さない', async () => {
 		await page.goto('/settings/account');
 		await page.getByLabel('新しいパスワード（8文字以上）').fill('typed-not-saved');

@@ -514,8 +514,12 @@
 			const view = await connectHub(endpointDraft, signal);
 			if (signal.aborted) return;
 			applyView(view);
-			// 接続できると採用の入力欄は消える。隠れた下書きを残さない。
-			manualKeyDraft = '';
+			// 接続**できた**ときだけ、採用の入力欄は消えるので下書きも空にする。応答が返った
+			// ことは接続できたことではない（Hub が施錠されていて使える保存済みキーが無いと
+			// `needsPairing` の応答が**正常に**返る）。その応答で消すと、「接続」は入力欄の
+			// キーを送らない（送るのは「このキーを採用」）ので、何も送られず保存もされない
+			// のに入力だけが消える（#520 のレビュー P2）。
+			if (view.status.state === 'connected') manualKeyDraft = '';
 		});
 	}
 
