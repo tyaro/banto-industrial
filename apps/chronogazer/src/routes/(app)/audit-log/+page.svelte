@@ -21,7 +21,7 @@
 	 * 中で件数か `deletionEpoch` が変わったら失効として続きを読まず、
 	 * 「再読み込み」で新しい世代にする。以前は同じ判断を自前で持っていた
 	 * （`auditBlocks.ts` と `/events` と共通の `#lib/blockCache.ts`、#410）。
-	 * `/events` は今も `#lib/blockCache.ts` を使う。
+	 * `/events` も同じリソースに寄せたので、`#lib/blockCache.ts` は削除した。
 	 *
 	 * デモモード（プレーンな vite dev/preview、バックエンドなし）では
 	 * 監査ログDBそのものが存在しないため、案内文のみ表示する

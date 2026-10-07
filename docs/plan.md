@@ -21,7 +21,8 @@ banto-hub のサービスと REST ルーターを banto のものに置き換え
 実装済み。banto-hub の npm は v3.0.1 のままの移行中）を追記。同日: §5 に banto-hub の SvelteKit 3 移行
 （実装済み。両アプリの npm が v4.0.0 に揃い、移行中のずれは解消）を追記。2026-10-06: §5 に
 両アプリの監査ログ画面を banto の `SnapshotListResource` に寄せたこと（実装済み）を追記。同日: §5 に
-banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）を追記。
+banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）を追記。2026-10-07: §5 に ChronoGazer の
+イベント一覧（`/events`）も `SnapshotListResource` に寄せたこと（実装済み）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -345,7 +346,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   `@banto/admin-core` の `createSnapshotListResource` が同じ判断を持つので、画面を admin-template の
   `/audit-log` の形に写して置き換え、`auditBlocks.ts`（+ テスト）と banto-hub の `blockCache.ts`（+ 複製の
   一致を見ていた `blockCache.sync.test.ts`）を削除した。ChronoGazer の `blockCache.ts` は `/events` が使うので
-  残す。サーバー側は I2a / I3' で既に banto の `audit_log_router`（Tauri は `list_as_of`）なので変更なし。
+  残した（2026-10-07 に `/events` も寄せて削除。下の「イベント一覧」の段落）。サーバー側は I2a / I3' で既に banto の `audit_log_router`（Tauri は `list_as_of`）なので変更なし。
   挙動の差: 応答の `deletionEpoch` でも失効を見る（件数が変わらない剪定 + 遅れたコミットも検出）、
   「再読み込み」は処理中でも押せる（処理中の要求を中断して新しい世代に）、選択中の行を強調する。
   文言（日本語の直書き・「0件の記録があります。」）と 15 秒の読み取りの上限は残した（banto の上限の
@@ -354,7 +355,21 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   境界の食い違いの英語の固定文との文字列比較 `auditErrorText`）を外した。15 秒はリソースの
   `requestTimeoutMs` に、上限切れ・境界の食い違い・応答の形の不正の日本語の文言は `messages` に渡し
   （`createAuditLogResource`）、画面の失敗表示は `failures` の最も前の `'error'` から出す（admin-template v5 と
-  同じ）。banto-hub の `runWithLimit.ts` は削除（ChronoGazer の `hubAdmin.ts` のものは `/events` などが使うので残す）。
+  同じ）。banto-hub の `runWithLimit.ts` は削除（ChronoGazer の `hubAdmin.ts` のものは収集・Hub の設定画面の
+  ポーリングが使うので残す）。
+
+  **ChronoGazer のイベント一覧（`/events`）も同じリソースに（2026-10-07、実装済み。オーナー決定 2026-10-06）**:
+  `/events` に残っていた自前のブロックキャッシュ（`routes/(app)/events/eventBlocks.ts` と `#lib/blockCache.ts`、
+  #409/#410）を `createSnapshotListResource` に置き換え、両ファイル（+ テスト）を削除した。継ぎ目は
+  `collectAdmin.ts` の `createCollectEventsResource`: 取得関数が `Readout` の `unavailable` / `notRunning` を
+  `EventsReadoutError`（`ProviderError` の派生）として投げ、リソースが同じオブジェクトのまま `failures` に残すので、
+  画面（`eventsView`）は「読めなかった」（注記「読み取れませんでした（0件ではありません）」）と往復の失敗・
+  上限切れ（赤字）を言い分け、**両方を同時に出せる**（従来どおり。どちらもいちばん前のブロックの失敗）。上限は
+  4 秒（`COLLECT_READ_TIMEOUT_MS`）を `requestTimeoutMs` に渡し、文言は `messages` の日本語（取得関数の側の
+  `runWithLimit` はやめた）。オーナー決定: **トーストは出さない**（`notify: false`）、「再読み込み」は**処理中でも
+  押せる**（監査ログ画面・banto と同じ）。挙動の差: 最初のブロックが失敗した世代では次のブロックへ進まない、
+  応答の形の不正も失敗として出す、境界の中の件数が変わったら失効として止める（`collect_events` には削除が
+  まだ無いので今は起きない）。wire（Tauri `collect_events_list` / REST `GET /api/collect/events`）は変わらない。
 
   続き（未着手）: 初回セットアップ画面。手順と
   wire の変化は [apps/chronogazer/README.md](../apps/chronogazer/README.md)「アカウント・
