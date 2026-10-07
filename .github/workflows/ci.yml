@@ -375,12 +375,20 @@ jobs:
       - name: Run E2E smoke suite (chronogazer)
         run: pnpm e2e
 
+      # #507: 閲覧公開（grant publicViewer）の E2E。banto-serve は
+      # BANTO_VIEWER_PUBLIC を起動時にしか読まないので、別の config（ポート 8804、
+      # 閲覧公開 ON の 2 台目の banto-serve）。同じ banto-serve バイナリを使う。
+      - name: Run E2E public-viewer suite (chronogazer)
+        run: pnpm e2e:public-viewer
+
       - name: Upload Playwright report (chronogazer)
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: playwright-report
-          path: e2e/playwright-report/
+          path: |
+            e2e/playwright-report/
+            e2e/playwright-report-public-viewer/
           retention-days: 7
 
   # T18-1 (docs/banto-hub-desktop-plan.md §16.3): apps/banto-hub has its own

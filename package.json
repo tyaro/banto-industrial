@@ -25,6 +25,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "e2e": "playwright test --config=e2e/playwright.config.ts",
+    "e2e:public-viewer": "playwright test --config=e2e/public-viewer.playwright.config.ts",
     "e2e:banto-hub": "playwright test --config=e2e/banto-hub.playwright.config.ts",
     "e2e:banto-hub:perf": "playwright test --config=e2e/banto-hub-perf.playwright.config.ts"
   },

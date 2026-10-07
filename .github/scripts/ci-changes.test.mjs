@@ -129,6 +129,11 @@ const TABLE = [
 		{ ...NONE, run_e2e_chronogazer: true }
 	],
 	[
+		'chronogazer の閲覧公開 E2E（spec と config）',
+		['e2e/tests-public-viewer/public-viewer.spec.ts', 'e2e/public-viewer.playwright.config.ts'],
+		{ ...NONE, run_e2e_chronogazer: true }
+	],
+	[
 		'E2E 共通（tsconfig）は両方',
 		['e2e/tsconfig.json'],
 		{ ...NONE, run_e2e_hub: true, run_e2e_chronogazer: true }
