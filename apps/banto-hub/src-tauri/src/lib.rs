@@ -215,7 +215,8 @@ use banto_hub_core::service_manager::{ServiceManager, WindowsServiceManager};
 use banto_hub_core::service_operators::{is_current_process_admin, is_current_process_operator};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent, Wry};
+use tauri::webview::PageLoadEvent;
+use tauri::{AppHandle, Manager, Runtime, Webview, WebviewWindow, WindowEvent, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex as AsyncMutex;
@@ -318,6 +319,18 @@ pub(crate) struct AppState {
     /// プロセス再起動が前提（Windows のトークンはプロセス生存中に
     /// 再評価されないため、このスライスでは再評価の仕組みは作らない）。
     pub(crate) can_operate_service: bool,
+    /// #514: プレースホルダ（`ui/index.html`）の`#banto-hub-status`に出すべき
+    /// 文言（[`set_status_text`]が最後に書いたもの）。`None`は「書き込んで
+    /// いない」か「Hub の画面へ navigate した後」（[`navigate_to_hub`]が消す）。
+    ///
+    /// [`WebviewWindow::eval`]は「その時点の文書」で一度だけ走り、失敗しても
+    /// Err にならない。起動判定（`setup`内）はプレースホルダの読み込みと
+    /// 並行して走るため、読み込みの前（`document.readyState`が`loading`で
+    /// 要素がまだ無い時点）に eval が走ると文言が捨てられ、「起動中…」のまま
+    /// 残っていた（#514、実機の計測で確認）。そこで文言をここに持っておき、
+    /// ページの読み込みが終わるたびに[`reapply_status_text`]が書き直す -
+    /// eval が読み込みの前でも後でも、ページを再読み込みしても文言が残る。
+    status_text: StdMutex<Option<String>>,
 }
 
 /// JS 文字列リテラルへの最小エスケープ。[`show_startup_error`]・
@@ -337,15 +350,61 @@ fn js_string_literal(value: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// [`WebviewWindow::eval`]で`#banto-hub-status`の文言を書き換える共通ヘルパー
-/// （[`show_startup_error`]・[`render_fallback`]の重複を避ける）。
-fn set_status_text(window: &WebviewWindow, message: &str) {
-    let js = format!(
-        "document.getElementById('banto-hub-status').textContent = {};",
+/// `#banto-hub-status`の文言を`message`にする JS を組み立てる純粋関数
+/// （#514、Tauri の型に依存しないため単体テストできる）。
+///
+/// 文書の読み込み中（`document.readyState === 'loading'`、要素がまだ無い
+/// ことがある）なら`DOMContentLoaded`を待ってから書き込み、それ以外なら
+/// すぐ書き込む。要素が無い文書（navigate した後の Hub の画面など）では
+/// 何もしない - 例外を投げない。
+fn status_text_script(message: &str) -> String {
+    format!(
+        "(function () {{var message = {};function apply() {{var el = document.getElementById('banto-hub-status');if (el) {{ el.textContent = message; }}}}if (document.readyState === 'loading') {{document.addEventListener('DOMContentLoaded', apply, {{ once: true }});}} else {{ apply(); }}}})();",
         js_string_literal(message)
-    );
-    if let Err(err) = window.eval(js) {
+    )
+}
+
+/// `#banto-hub-status`の文言を書き換える共通ヘルパー（[`show_startup_error`]・
+/// [`render_fallback`]の重複を避ける）。
+///
+/// #514: 文言を[`AppState::status_text`]に持ってから eval する。eval が
+/// プレースホルダの読み込みの前に走って捨てられても、読み込みの完了で
+/// [`reapply_status_text`]が書き直す（順序はどちらが先でもよい: 先に
+/// 文言を保存するので、読み込みの完了がこの保存より前なら eval の時点で
+/// 文書は読み込み済み、後なら完了時の書き直しが保存済みの文言を読む）。
+fn set_status_text(window: &WebviewWindow, message: &str) {
+    if let Some(state) = window.try_state::<AppState>() {
+        *state
+            .status_text
+            .lock()
+            .expect("status_text mutex poisoned") = Some(message.to_string());
+    }
+    if let Err(err) = window.eval(status_text_script(message)) {
         eprintln!("banto-hub-shell: 画面表示の更新に失敗しました: {err}");
+    }
+}
+
+/// #514: メインウィンドウのページの読み込みが終わるたびに（`Builder::on_page_load`、
+/// [`PageLoadEvent::Finished`]）、[`AppState::status_text`]に持っている
+/// 文言を書き直す。初回の読み込みより前に[`set_status_text`]の eval が
+/// 走って捨てられた場合と、プレースホルダを再読み込みした場合の両方を
+/// 拾う。文言が無い（Hub の画面へ navigate した後など）ときは何もしない。
+fn reapply_status_text<R: Runtime>(webview: &Webview<R>, event: PageLoadEvent) {
+    if event != PageLoadEvent::Finished || webview.label() != MAIN_WINDOW_LABEL {
+        return;
+    }
+    let Some(state) = webview.try_state::<AppState>() else {
+        return;
+    };
+    let message = state
+        .status_text
+        .lock()
+        .expect("status_text mutex poisoned")
+        .clone();
+    if let Some(message) = message {
+        if let Err(err) = webview.eval(status_text_script(&message)) {
+            eprintln!("banto-hub-shell: 画面表示の更新に失敗しました: {err}");
+        }
     }
 }
 
@@ -418,6 +477,14 @@ fn navigate_to_hub(window: &WebviewWindow, host_port: &str) {
             return;
         }
     };
+    // #514: Hub の画面へ移るので、プレースホルダ用の文言はもう書き直さない
+    // （navigate に失敗したら下の`show_startup_error`がまた保存する）。
+    if let Some(state) = window.try_state::<AppState>() {
+        *state
+            .status_text
+            .lock()
+            .expect("status_text mutex poisoned") = None;
+    }
     if let Err(err) = window.navigate(url) {
         show_startup_error(
             window,
@@ -1351,6 +1418,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // T16-1: `×` でトレイ格納した初回だけの継続通知用（実装指示 4.、UX-7）。
         .plugin(tauri_plugin_notification::init())
+        // #514: プレースホルダの読み込みが終わったら、起動判定が先に書いた
+        // 文言（`AppState::status_text`）を書き直す（[`reapply_status_text`]）。
+        .on_page_load(|webview, payload| reapply_status_text(webview, payload.event()))
         .invoke_handler(tauri::generate_handler![
             host_switch_ipc::host_switch_status,
             host_switch_ipc::switch_to_service,
@@ -1380,6 +1450,7 @@ pub fn run() {
             // §8.3 の意図）。
             can_operate_service: is_current_process_operator().unwrap_or(false)
                 || is_current_process_admin().unwrap_or(false),
+            status_text: StdMutex::new(None),
         })
         .setup(|app| {
             let window = app
@@ -1570,6 +1641,25 @@ mod tests {
     fn js_string_literal_escapes_quotes_and_newlines() {
         let literal = js_string_literal("banto-hub: line1\nline2 it's \\ok\\");
         assert_eq!(literal, "'banto-hub: line1\\nline2 it\\'s \\\\ok\\\\'");
+    }
+
+    /// #514: [`status_text_script`]は、読み込み中の文書では`DOMContentLoaded`を
+    /// 待ってから書き込み、要素が無い文書では何もしない JS を返す。文言は
+    /// [`js_string_literal`]でエスケープした形で一度だけ埋め込まれ、生の
+    /// 改行が JS ソースへ漏れない（一行の式になる）。
+    #[test]
+    fn status_text_script_waits_for_dom_and_embeds_escaped_message() {
+        let message = "起動できませんでした。\nit's \\ok";
+        let script = status_text_script(message);
+
+        assert_eq!(script.matches(&js_string_literal(message)).count(), 1);
+        assert!(!script.contains('\n'), "生の改行を含まない: {script}");
+        assert!(script.contains("document.readyState === 'loading'"));
+        assert!(script.contains("addEventListener('DOMContentLoaded', apply, { once: true })"));
+        assert!(script.contains("document.getElementById('banto-hub-status')"));
+        assert!(script.contains("if (el) { el.textContent = message; }"));
+        assert!(script.starts_with("(function () {"));
+        assert!(script.ends_with("})();"));
     }
 
     /// T16-2: [`expected_probe_target`]は`resolve_profile_paths_from_env`と
