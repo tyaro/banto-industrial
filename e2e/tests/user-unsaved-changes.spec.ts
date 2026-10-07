@@ -83,7 +83,7 @@ test.describe.serial('chronogazer 未保存の入力の確認', () => {
 
 	test('3. 入力が無いときは確認を出さずに移動する', async () => {
 		await page.goto('/users');
-		await expect(page.getByRole('heading', { name: 'ユーザー管理' })).toBeVisible();
+		await expect(page.getByRole('heading', { level: 1, name: 'ユーザー管理' })).toBeVisible();
 		await sidebarLink(/監視/).click();
 		await expect(page).toHaveURL(/\/monitor$/);
 		expect(dialogs).toEqual([]);
@@ -128,6 +128,34 @@ test.describe.serial('chronogazer 未保存の入力の確認', () => {
 			.click();
 		await expect(page).toHaveURL(/\/settings\/appearance$/);
 		expect(dialogs).toEqual([]);
+	});
+
+	test('5b. 設定の全カテゴリは、開いた直後（入力なし）は「未保存」でなく、離れても確認を出さない', async () => {
+		const labels = ['外観', 'アカウント', '接続', 'データ', 'セキュリティ', 'Hub接続', '収集'];
+		let checked = 0;
+		for (const label of labels) {
+			dialogs = [];
+			await page.goto('/settings/appearance');
+			const nav = page.getByRole('navigation', { name: '設定のカテゴリ' });
+			// ナビが描画される（= カテゴリの一覧が確定する）まで待ってから数える。
+			await expect(nav.getByRole('link', { name: '外観', exact: true })).toBeVisible();
+			const link = nav.getByRole('link', { name: label, exact: true });
+			// この環境で見えないカテゴリ（例: セキュリティは非表示）は飛ばす。
+			if ((await link.count()) === 0) continue;
+			checked += 1;
+			await link.click();
+			await expect(link).toHaveAttribute('aria-current', 'page');
+			// 初期読み込み（非同期の取得）が反映されてから確かめる（購読の通信が続くので
+			// networkidle は使えない）。
+			await page.waitForTimeout(700);
+			await expect(page.locator('.banto-unsaved'), `${label}: 開いた直後`).toHaveCount(0);
+
+			await sidebarLink(/監視/).click();
+			await expect(page, `${label}: 離れる`).toHaveURL(/\/monitor$/);
+			expect(dialogs, `${label}: 確認が出ない`).toEqual([]);
+		}
+		// 外観・アカウント・接続・データ・Hub接続・収集のうち、少なくとも 5 つは見えている。
+		expect(checked).toBeGreaterThanOrEqual(5);
 	});
 
 	test('6. ログアウト（/login への移動）は、未保存の入力があっても確認を出さない', async () => {
