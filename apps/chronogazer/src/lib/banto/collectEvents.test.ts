@@ -24,7 +24,7 @@ import {
 	adaptLegacyAuthProvider,
 	createSnapshotListResource,
 	initBanto,
-	isSnapshotListError,
+	isListBlockError,
 	ProviderError,
 	type DataProvider,
 	type SnapshotListFailure,
@@ -543,7 +543,7 @@ describe('createCollectEventsResource（本物の SnapshotListResource）', () =
 			const failure = events.failures[0];
 			if (failure?.kind !== 'error') throw new Error('expected an error failure');
 			expect(failure.code).toBe('timeout');
-			expect(isSnapshotListError(failure.error)).toBe(true);
+			expect(isListBlockError(failure.error)).toBe(true);
 			expect(failure.error.message).toBe(eventsTimeoutMessage(COLLECT_READ_TIMEOUT_MS));
 			expect(failure.error.message).toContain('4秒以内に返りませんでした');
 			expect(captured?.aborted).toBe(true);
