@@ -13,7 +13,8 @@ banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし
 - 監査ログ画面のブロック読み込みを banto の `SnapshotListResource` に寄せ、画面を admin-template の形にした（banto #248。自前の `auditBlocks.ts` を削除。`/events` の `blockCache.ts` は残す）。剪定の `deletionEpoch` でも失効を見る、「再読み込み」は処理中でも押せる、選択中の行を強調する。
 - 前回の公開（alpha.28）以降に main に入った ChronoGazer の変更: users/settings/audit/backup のサービスと REST ルーターを banto v3.0.0 のものに置き換えた（#498。banto v2.1.0 の #277・#278・#280）、LAN 設定の適用を banto の形にし閲覧公開（grant `publicViewer`）を使えるようにした（#499。#287・#288・#294）、起動時の環境判定を banto の形にした（#501。届かないときは demo に落とさず起動待ちで再試行する。#286）。ChronoGazer は 0.1.0 のまま。
 - デスクトップ版の窓（WebView）に CSP を設定した（#505。`tauri.conf.json` の `app.security.csp`。組み込みサーバーの応答の CSP（#500）に Tauri の IPC の `connect-src ipc: http://ipc.localhost` を足しただけの、admin-template と同じもの）。リリース相当のビルドで全画面・アクリル効果・旧形式の DB のエラーの窓に違反が無いことを確かめた。`tauri dev`（Vite の devUrl）では窓の CSP は掛からない（Tauri の仕様）。
-- 監査ログ画面を banto v5.0.0 の `SnapshotListResource` の API に寄せた（#511 の回避策の撤去）。読み取りの上限（15 秒）はリソースの `requestTimeoutMs` に渡し、取得関数の側の二重の上限（`runWithLimit`）をやめた。上限切れ・境界の食い違い・応答の形の不正の文言は `messages` で日本語にし（英語の固定文との文字列比較をやめた）、画面の失敗表示は `failures` の最も前のブロックの失敗から出す（admin-template v5 と同じ）。トーストと失効の案内は従来どおり。`/events` などが使う `runWithLimit`（`hubAdmin.ts`）は残す。組み込みサーバーの応答の CSP は厳格なまま（ChronoGazer の窓は Tauri のアセットを表示し、組み込みサーバーの画面へは移らないため）。
+- 監査ログ画面を banto v5.0.0 の `SnapshotListResource` の API に寄せた（#511 の回避策の撤去）。読み取りの上限（15 秒）はリソースの `requestTimeoutMs` に渡し、取得関数の側の二重の上限（`runWithLimit`）をやめた。上限切れ・境界の食い違い・応答の形の不正の文言は `messages` で日本語にし（英語の固定文との文字列比較をやめた）、画面の失敗表示は `failures` の最も前のブロックの失敗から出す（admin-template v5 と同じ）。トーストと失効の案内は従来どおり。収集・Hub の設定画面のポーリングが使う `runWithLimit`（`hubAdmin.ts`）は残す。組み込みサーバーの応答の CSP は厳格なまま（ChronoGazer の窓は Tauri のアセットを表示し、組み込みサーバーの画面へは移らないため）。
+- イベント一覧（`/events`）のブロック読み込みも banto の `SnapshotListResource` に寄せ、自前の `eventBlocks.ts`・`blockCache.ts` を削除した。「読み取れませんでした（0件ではありません）」の注記と往復の失敗の赤字は従来どおり出し分け、トーストは出さない、「再読み込み」は処理中でも押せる。
 
 ### 変更（banto-hub）
 
