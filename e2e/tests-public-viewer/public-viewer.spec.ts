@@ -105,12 +105,27 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 		await loginButton(page).click();
 		await expect(page).toHaveURL(/\/login$/);
 
-		// Zero users -> setup form (same as smoke scenario 1).
-		await page.getByLabel('表示名').fill(ADMIN_DISPLAY_NAME);
-		await page.getByLabel('ユーザー名').fill(ADMIN_USERNAME);
-		await page.getByLabel('パスワード（8文字以上）').fill(ADMIN_PASSWORD);
-		await page.getByLabel('パスワード（確認）').fill(ADMIN_PASSWORD);
-		await page.getByRole('button', { name: 'アカウントを作成' }).click();
+		// Zero users -> setup form (same as smoke scenario 1). Playwright's CI
+		// retry re-runs this whole serial group against the SAME server and DB
+		// (the admin already exists after a first attempt got this far), so
+		// the screen is a login form then: accept either, with the same
+		// credentials. Scenarios 1-3 are unaffected by an existing account -
+		// an anonymous visit is still the synthetic viewer while the flag is on.
+		const displayName = page.getByLabel('表示名');
+		const usernameField = page.getByLabel('ユーザー名');
+		// Both forms have the username field; 表示名 exists only in the setup form.
+		await expect(usernameField).toBeVisible();
+		if (await displayName.isVisible()) {
+			await displayName.fill(ADMIN_DISPLAY_NAME);
+			await usernameField.fill(ADMIN_USERNAME);
+			await page.getByLabel('パスワード（8文字以上）').fill(ADMIN_PASSWORD);
+			await page.getByLabel('パスワード（確認）').fill(ADMIN_PASSWORD);
+			await page.getByRole('button', { name: 'アカウントを作成' }).click();
+		} else {
+			await usernameField.fill(ADMIN_USERNAME);
+			await page.getByLabel('パスワード').fill(ADMIN_PASSWORD);
+			await page.getByRole('button', { name: 'ログイン', exact: true }).click();
+		}
 
 		await expect(page).toHaveURL(/\/monitor$/);
 		await expect(page.getByRole('button', { name: 'ログアウト' })).toBeVisible();

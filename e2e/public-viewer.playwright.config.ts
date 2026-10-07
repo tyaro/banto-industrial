@@ -66,6 +66,8 @@ export default defineConfig({
 	globalTeardown: path.join(dirname, 'global-teardown.ts'),
 	fullyParallel: false,
 	workers: 1,
+	// A retry re-runs the serial group on the same server/DB, after scenario 4
+	// created the admin; the spec's scenario 4 accepts the login form for that.
 	retries: process.env.CI ? 1 : 0,
 	reporter: process.env.CI
 		? [
