@@ -3,9 +3,10 @@
  * DOM 固定（#409 オーナーレビュー P2-4）。
  *
  * **なぜ画面をクリックして確かめるのか**: 欠陥は「表示条件」にあった
- * （`{#if view.failedBlockCount > 0}`）。ロジック側の `loader.reload()` を
- * 直接呼ぶテストでは、ボタンが**出ていない**ことを検出できない。このリポジトリ
- * には DOM/コンポーネントテストの足場が無い（jsdom・happy-dom・
+ * （当時の `{#if view.failedBlockCount > 0}`）。ロジック側の再読み込み（今は
+ * banto の `SnapshotListResource` の `refresh()`）を直接呼ぶテストでは、
+ * ボタンが**出ていない**ことを検出できない。このリポジトリには
+ * DOM/コンポーネントテストの足場が無い（jsdom・happy-dom・
  * testing-library のいずれも未導入）ので、**Playwright の E2E が「DOM
  * テスト」の等価物**。この 1 件のために足場を入れるのは、アプリ全体のテスト
  * 構成の話なのでここではやらない。

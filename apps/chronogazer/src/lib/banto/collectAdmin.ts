@@ -38,8 +38,18 @@
  * 再エクスポートして、画面側の import 元を 1 つに保つ。
  */
 import { invoke } from '@tauri-apps/api/core';
-import type { ListResult } from '@banto/admin-core';
-import { getAuthProvider, isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
+import {
+	createSnapshotListResource,
+	getAuthProvider,
+	isProviderError,
+	ProviderError,
+	type ErrorBody,
+	type ListResult,
+	type SnapshotListFailure,
+	type SnapshotListFetcher,
+	type SnapshotListMessages,
+	type SnapshotListResource
+} from '@banto/admin-core';
 import { CSRF_HEADER, getBantoMode } from './setup';
 import {
 	isPollGenerationCurrent,
@@ -365,7 +375,8 @@ export async function getCollectConnections(
  * [`CollectEventList.asOfId`] で返す。画面は 1 つの「世代」の最初の応答で
  * それを固定し、同じ世代の後続ブロックにすべて渡す - 渡さないと、ブロック
  * 取得の合間に足されたイベントで `offset` がずれ、**境界で行が重複し、末尾の
- * 行が一覧から漏れる**（判断は `routes/(app)/events/eventBlocks.ts`）。
+ * 行が一覧から漏れる**（世代と境界の判断は banto の `SnapshotListResource`。
+ * 画面への繋ぎは [`createCollectEventsResource`]）。
  */
 export async function listCollectEvents(
 	offset: number,
@@ -732,6 +743,183 @@ export function collectEventsNote(state: ReadoutState, totalCount: number): stri
 				? 'イベントはまだ1件も記録されていません。'
 				: `${totalCount.toLocaleString()}件の記録があります（新しい順）。`;
 	}
+}
+
+// --- イベント一覧（`/events`）のブロック読み込み -------------------------------
+
+/**
+ * イベント一覧のブロック読み込みは banto の `SnapshotListResource`
+ * （`@banto/admin-core`、banto #248。監査ログ画面と同じもの）に任せる。世代・
+ * スナップショット境界（`asOfId`）・ブロック単位の失敗・世代違いの応答の
+ * 破棄・上限切れと新しい世代での中断はリソースが持ち、ここに残るのは
+ * `/events` 固有の継ぎ目だけ:
+ *
+ * - **`Readout` を失敗の型に載せる**（[`EventsReadoutError`]）。リソースが
+ *   知っているのは「行を返した」か「投げた」かだけなので、`unavailable` /
+ *   `notRunning`（サーバーは答えたが読めなかった）は取得関数が**専用の
+ *   `ProviderError` を投げて**伝える。リソースは投げられた `ProviderError` を
+ *   **同じオブジェクトのまま** `failures` に残す（banto v5.0.0 の約束）ので、
+ *   画面は `instanceof` で往復の失敗と区別できる - **空一覧に潰さない**
+ *   （docs/implementation-checklist.md §5）。
+ * - **上限は [`COLLECT_READ_TIMEOUT_MS`]（4 秒）をリソースの
+ *   `requestTimeoutMs` に渡す**だけ（取得関数の側では掛けない - 二重に掛けると
+ *   どちらの文言が出るかが競争になる）。上限切れ・境界の食い違い・応答の形の
+ *   不正の文言は [`EVENTS_MESSAGES`] の日本語。
+ * - **トーストは出さない**（`notify: false`、2026-10-06 オーナー決定）。失敗は
+ *   画面の注記と赤字で出す（[`eventsView`]）。
+ *
+ * サーバーは境界・行・件数を 1 つのトランザクションで読み、件数も行も
+ * `id <= asOfId` で絞る。`collect_events` には削除がまだ無い（保持期間による
+ * 削除は R0 §3.4 で未実装）ので、境界の中の件数は世代の中で変わらない - 変わったら
+ * リソースが失効（`expired`）として続きを読まない（[`EVENTS_SNAPSHOT_EXPIRED_MESSAGE`]。
+ * 今は起きない経路だが、削除を実装したときに黙って行がずれないための備え）。
+ */
+
+/**
+ * サーバーは答えたが「読めなかった」/「走っていない」ブロックの失敗
+ * （[`createCollectEventsFetcher`] が投げる）。`readout` に `Readout` の
+ * タグをそのまま持つ。`message` は画面の注記と同じ文言（トーストは出さないが、
+ * 文言だけを見る経路があっても嘘にならないように）。
+ */
+export class EventsReadoutError extends ProviderError {
+	readonly readout: Exclude<ReadoutState, 'ready'>;
+
+	constructor(readout: Exclude<ReadoutState, 'ready'>) {
+		super({ kind: 'other', message: collectEventsNote(readout, 0) });
+		this.name = 'EventsReadoutError';
+		this.readout = readout;
+	}
+}
+
+export function isEventsReadoutError(error: unknown): error is EventsReadoutError {
+	return error instanceof EventsReadoutError;
+}
+
+/** イベントの読み取りが [`COLLECT_READ_TIMEOUT_MS`] 以内に返らなかったときの文言。 */
+export function eventsTimeoutMessage(timeoutMs: number = COLLECT_READ_TIMEOUT_MS): string {
+	return `イベントの読み取りが${Math.round(timeoutMs / 1000)}秒以内に返りませんでした。待つのをやめただけなので、「再読み込み」でもう一度試せます。`;
+}
+
+/**
+ * 要求した境界と違う境界の応答が返ったときの文言。**採らない**（採ると
+ * 重複・欠落が戻る）。サーバーが `asOfId` を無視している場合にここへ来る。
+ */
+export const EVENTS_BOUNDARY_MISMATCH_MESSAGE =
+	'イベントの取得範囲がサーバー側で切り替わりました。「再読み込み」でもう一度読み込んでください。';
+
+/** 応答の形が正しくない（一覧として書き込めない）ときの文言。 */
+export const EVENTS_MALFORMED_MESSAGE =
+	'イベントの読み取り結果の形が正しくありませんでした。「再読み込み」でもう一度試せます。';
+
+/**
+ * 境界の中の件数が世代の途中で変わった（失効）ときの文言。`collect_events` に
+ * 削除が無い今は起きない（上の節の doc）。
+ */
+export const EVENTS_SNAPSHOT_EXPIRED_MESSAGE =
+	'読み込みの途中で、イベントの件数が変わりました。このまま続きを読むと行がずれるため、続きの読み込みを止めています。「再読み込み」で最新の状態から読み直してください。';
+
+/** リソース自身が作る失敗の日本語の文言（banto v5.0.0 の `messages`）。 */
+export const EVENTS_MESSAGES: SnapshotListMessages = {
+	timeout: (ms) => eventsTimeoutMessage(ms),
+	boundaryMismatch: () => EVENTS_BOUNDARY_MISMATCH_MESSAGE,
+	malformed: () => EVENTS_MALFORMED_MESSAGE
+};
+
+/** [`listCollectEvents`] の形（テストで偽のサーバーに差し替える口）。 */
+export type CollectEventsLister = (
+	offset: number,
+	limit: number,
+	asOfId: number | null,
+	signal?: AbortSignal
+) => Promise<Readout<CollectEventList>>;
+
+/**
+ * `createSnapshotListResource` に渡す取得 1 本（ブロック 1 つ）。要求の
+ * `offset`/`limit` と**境界（`asOfId`）**、リソースの `signal`（上限切れ・
+ * 世代の切り替え・`dispose()` で畳まれる。効くのは REST のみ）をそのまま
+ * [`listCollectEvents`] に渡す。`ready` なら一覧をそのまま返し、それ以外は
+ * [`EventsReadoutError`] を投げる（行も件数も触らせない）。往復の失敗は
+ * そのまま投げる（握り潰さない）。
+ */
+export function createCollectEventsFetcher(
+	list: CollectEventsLister = listCollectEvents
+): SnapshotListFetcher<CollectEventRow> {
+	return async (request, signal) => {
+		const { offset, limit } = request.pagination;
+		const readout = await list(offset, limit, request.asOfId, signal);
+		if (readout.state !== 'ready') throw new EventsReadoutError(readout.state);
+		return readout.data;
+	};
+}
+
+/**
+ * イベント一覧画面のブロック読み込み。取得は [`createCollectEventsFetcher`]、
+ * 上限は [`COLLECT_READ_TIMEOUT_MS`]、文言は [`EVENTS_MESSAGES`]、トーストは
+ * 出さない（`notify: false`）。`list` はテストで偽のサーバーに差し替える口。
+ */
+export function createCollectEventsResource(
+	list: CollectEventsLister = listCollectEvents
+): SnapshotListResource<CollectEventRow> {
+	return createSnapshotListResource<CollectEventRow>(createCollectEventsFetcher(list), {
+		requestTimeoutMs: COLLECT_READ_TIMEOUT_MS,
+		messages: EVENTS_MESSAGES,
+		notify: false
+	});
+}
+
+/** まだ一度も読めていない間の注記（「0 件」と言い切らない）。 */
+export const EVENTS_LOADING_NOTE = 'イベントを読み込んでいます。';
+
+/** イベント一覧の画面に出す文（[`eventsView`] が導く）。 */
+export interface EventsView {
+	/** 件数・状態の注記（いつも出す）。 */
+	note: string;
+	/** 赤字で出す失敗（`null` = 出さない）。 */
+	errorText: string | null;
+	/** 失効の案内（`null` = 出さない）。 */
+	expiredText: string | null;
+}
+
+/**
+ * 画面に出す文（純関数。リソースの `failures`・`totalCount`・`expired` から
+ * 導く）。**失敗しているブロックが 1 つでもあれば、失敗を出し続ける**
+ * （別ブロックが成功していても「N 件の記録があります」で塗り潰さない）。
+ *
+ * - 注記: いちばん前のブロックの**読めなかった**失敗（[`EventsReadoutError`]）が
+ *   あればその `Readout` の文言。無ければ、まだ一度も読めていない
+ *   （`totalCount === null`）うちは「読み込んでいます」- **0 件と言い切らない**。
+ *   読めていれば件数。
+ * - 赤字: いちばん前のブロックの**それ以外の**失敗（往復の失敗・上限切れ・
+ *   境界の食い違い・応答の形の不正）の文言。
+ * - 注記と赤字は**両方出ることがある**（別のブロックが別の理由で失敗したとき）。
+ */
+export function eventsView(state: {
+	failures: readonly SnapshotListFailure[];
+	totalCount: number | null;
+	expired: boolean;
+}): EventsView {
+	let readout: Exclude<ReadoutState, 'ready'> | null = null;
+	let errorText: string | null = null;
+	// `failures` はブロック順（昇順）。それぞれの種類でいちばん前のものを採る。
+	for (const failure of state.failures) {
+		if (failure.kind !== 'error') continue;
+		if (isEventsReadoutError(failure.error)) {
+			readout ??= failure.error.readout;
+		} else {
+			errorText ??= failure.error.message;
+		}
+	}
+	const note =
+		readout !== null
+			? collectEventsNote(readout, state.totalCount ?? 0)
+			: state.totalCount === null
+				? EVENTS_LOADING_NOTE
+				: collectEventsNote('ready', state.totalCount);
+	return {
+		note,
+		errorText,
+		expiredText: state.expired ? EVENTS_SNAPSHOT_EXPIRED_MESSAGE : null
+	};
 }
 
 /**

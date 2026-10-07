@@ -6,15 +6,15 @@
 	 *
 	 * **監査ログ画面（`/audit-log`）の流儀にそのまま倣う**。新しい作法は
 	 * 発明していない:
-	 * - 一覧は `BantoGrid` の「サーバーモード」で、ブロック単位
-	 *   （`BLOCK_SIZE` 件）にスクロールへ応じて遅延取得する。`@banto/admin-core`
-	 *   の `createWindowedListResource` を使わない理由も同じ（専用のワイヤ形状・
-	 *   専用の Tauri コマンド名で、汎用レジストリの外にある）。
-	 * - 件数は総件数（`ListResult.totalCount`）を一覧の上に出す。
+	 * - 一覧は `BantoGrid` の「サーバーモード」で、ブロック単位（200 件）に
+	 *   スクロールへ応じて遅延取得する。ブロック読み込みは `@banto/admin-core`
+	 *   の `createSnapshotListResource`（banto #248。監査ログ画面と同じもの）に
+	 *   任せる（`collectAdmin.ts` の `createCollectEventsResource`）。
+	 * - 件数は総件数を一覧の上に出す。
 	 * - 並びは**新しい順**でサーバー側に固定。
 	 * - デモモード（プレーンな `vite dev`/`preview`、backend 無し）では案内文だけ。
 	 *
-	 * **監査ログ画面と違うところは 3 つ**で、いずれもこの口の性質から来る:
+	 * **監査ログ画面と違うところは 4 つ**で、いずれもこの口の性質から来る:
 	 *
 	 * 1. **並べ替え・絞り込みが無い**（`GET /api/collect/events?offset=&limit=`
 	 *    には列名を渡す口が無い）。列に `sortable: false` を明示するのは、
@@ -23,48 +23,36 @@
 	 * 2. **`Readout` の 3 状態をそのまま見せる**。`unavailable`（読めなかった）を
 	 *    **空一覧に潰さない** - 潰すと「0 件です」としか言えず、利用者は本当に
 	 *    記録が無いのか読めなかったのかを区別できない
-	 *    （docs/implementation-checklist.md §5）。読めなかったときは**行も件数も
-	 *    消さず**、注記と「再読み込み」を出す。
-	 * 3. **`detail` 列が無い**。C-3a が型でも SQL でも落としている（自由文で、
+	 *    （docs/implementation-checklist.md §5）。読めなかったブロックは取得関数が
+	 *    `EventsReadoutError` を投げて**ブロック単位の失敗**にし、**行も件数も
+	 *    消さず**、注記と「再読み込み」を出す（`collectAdmin.ts` の `eventsView`）。
+	 * 3. **失敗のトーストを出さない**（2026-10-06 オーナー決定、`notify: false`）。
+	 *    失敗は注記と赤字で出す。読めなかったブロックの注記と、別のブロックの
+	 *    往復の失敗の赤字は**両方出ることがある**。
+	 * 4. **`detail` 列が無い**。C-3a が型でも SQL でも落としている（自由文で、
 	 *    切断理由や書き込み先のファイルパスを含みうる）ので、**無い列を作らない** -
 	 *    行をクリックしても出す詳細が無いため、監査ログ画面のような詳細ペインも
 	 *    置いていない。切断理由が画面に要ると判断したら、発生源
 	 *    （`banto-collect`）で「見せてよい理由」を分類するのが筋で、ここでは
 	 *    やらない。
 	 *
-	 * **ブロックキャッシュの判断は `./eventBlocks.ts` に出してある**（#409
-	 * オーナーレビュー P2 の 3 件: 初回失敗からの回復・ブロック境界の重複と
-	 * 欠落・別ブロックの成功が失敗を消すこと）。どのブロックを取るか、世代の
-	 * スナップショット境界（`asOfId`）、失敗の持ち方、「再読み込み」で何を
-	 * 取り直すかは全部あちらの純関数が決め、表テストで固定してある。
+	 * 以前はブロックキャッシュの判断を自前で持っていた（`./eventBlocks.ts` と
+	 * `#lib/blockCache.ts`、#409/#410）。挙動の約束（世代の最初の応答で境界を
+	 * 固定する・失敗はブロック単位でそのブロックが読めるまで残る・自動では
+	 * 再試行しない・初回失敗の後も「再読み込み」で先頭ブロックを取り直す）は
+	 * banto の `SnapshotListResource` が同じものを持つ。
 	 */
 	import { untrack } from 'svelte';
 	import { BantoGrid, GridState, type GridColumn } from '@banto/grid-svelte';
-	import { isProviderError } from '@banto/admin-core';
 	import {
-		COLLECT_READ_TIMEOUT_MS,
 		DEMO_MODE_MESSAGE,
-		collectEventsNote,
 		collectTimeLabel,
+		createCollectEventsResource,
 		eventKindLabel,
+		eventsView,
 		isCollectAvailable,
-		listCollectEvents,
-		runWithLimit,
 		type CollectEventRow
 	} from '#lib/banto/collectAdmin.js';
-	import {
-		EventBlockLoader,
-		initialCache,
-		viewState,
-		type BlockOutcome,
-		type BlockRequest,
-		type EventsViewState
-	} from './eventBlocks';
-
-	/** `/audit-log` の同名関数と同じ（この画面に検証エラーは返らない）。 */
-	function errorMessage(err: unknown): string {
-		return isProviderError(err) ? err.message : String(err);
-	}
 
 	const available = isCollectAvailable();
 
@@ -124,77 +112,47 @@
 	const gridState = new GridState<CollectEventRow>(columns);
 
 	/**
-	 * ブロックキャッシュの**判断**は `./eventBlocks.ts`（純関数 +
-	 * `EventBlockLoader`）に出してあり、この画面はそれを呼んで `$state` に
-	 * 書き戻すだけ（#409 オーナーレビュー P2 の 3 件。`tagsPageLogic.ts` と
-	 * 同じ作法で、状態遷移を表テストで固定する）。ここに残っているのは:
-	 *
-	 * - 取得 1 本の作り方（**読み取り 1 回に上限を掛ける** -
-	 *   `COLLECT_READ_TIMEOUT_MS`。backend は 2 秒で必ず `unavailable` を
-	 *   返すが、**reject ではなく無応答**の相手だと `catch` に入らないまま
-	 *   `loading` が降りず、一覧が永久に「読み込み中」で固まる。
-	 *   `HubSection.svelte` のポーリングで踏んだのと同じ型）、
-	 * - 行の配列（`$state`）への書き戻し。
+	 * イベント一覧のブロック読み込み（banto #248 の `SnapshotListResource`）。
+	 * 読み取り 1 回の上限は `COLLECT_READ_TIMEOUT_MS`（4 秒。backend は 2 秒で
+	 * 必ず `unavailable` を返すので、それを超えて何も返らないのは「届いて
+	 * いない」）をリソースの `requestTimeoutMs` で掛ける - **reject ではなく
+	 * 無応答**の相手でも `loading` が降り、失敗として残る。上限・失敗の
+	 * 持ち方・世代違いの応答の破棄・新しい世代での中断はリソース側が行う。
 	 */
-	let rows = $state<(CollectEventRow | undefined)[]>([]);
-	let view = $state<EventsViewState>(viewState(initialCache()));
+	const events = createCollectEventsResource();
 
-	/** 1 ブロックの取得。**結末を返し、reject しない**（`runWithLimit` の約束）。 */
-	async function fetchBlock(request: BlockRequest): Promise<BlockOutcome> {
-		const outcome = await runWithLimit(
-			(signal) => listCollectEvents(request.offset, request.limit, request.asOfId, signal),
-			COLLECT_READ_TIMEOUT_MS
-		);
-		if (outcome.kind === 'failed') return { kind: 'error', message: errorMessage(outcome.error) };
-		if (outcome.kind === 'timedOut') {
-			// 打ち切りは**失敗ではない**（アプリ側の読み取りは続いている）。
-			// それでも画面にとっては「今は読めていない」なので、黙らない。
-			return {
-				kind: 'error',
-				message: `イベントの読み取りが${Math.round(COLLECT_READ_TIMEOUT_MS / 1000)}秒以内に返りませんでした。待つのをやめただけなので、「再読み込み」でもう一度試せます。`
-			};
-		}
-		// 読めなかった（`unavailable`）ときは**行も件数も触らない** -
-		// 0 件に潰すと「記録がありません」という別の嘘になる。
-		if (outcome.value.state !== 'ready') return { kind: 'readout', readout: outcome.value.state };
-		return { kind: 'ready', list: outcome.value.data };
-	}
+	// 注記・赤字・失効の案内（`failures` はブロック順。いちばん前の失敗を出す）。
+	const view = $derived(
+		eventsView({
+			failures: events.failures,
+			totalCount: events.totalCount,
+			expired: events.expired
+		})
+	);
 
-	const loader = new EventBlockLoader(fetchBlock, {
-		resetRows(length) {
-			// 世代の最初の応答。前の世代の行は境界がずれているので残さない。
-			rows = new Array<CollectEventRow | undefined>(length);
-		},
-		writeRows(offset, block) {
-			if (rows.length < offset + block.length) rows.length = offset + block.length;
-			for (let i = 0; i < block.length; i++) rows[offset + i] = block[i];
-		},
-		update(next) {
-			view = next;
-		}
-	});
-
-	// `untrack`: 取得は effect の追跡スコープ内で `rows`/`view` を読み書きする
-	// ので、これが無いと自分の書き込みで再実行し続ける（`/audit-log` の同じ
-	// effect と同じ理由・同じ書き方）。
+	// `untrack`: 初回の読み込みはマウント時に 1 回。`ensureRange()` が公開する
+	// 状態（`loading` など）にこの effect を依存させない（`/audit-log` の同じ
+	// effect と同じ理由・同じ書き方）。後始末で飛行中の要求を中断する。
 	$effect(() => {
 		if (!available) return;
-		untrack(() => loader.setRange(0, 100));
+		untrack(() => events.ensureRange(0, 100));
+		return () => events.dispose();
 	});
 
 	function handleVisibleRangeChange(range: { start: number; end: number }): void {
-		loader.setRange(range.start, range.end);
+		events.ensureRange(range.start, range.end);
 	}
 
 	/**
-	 * 手で押す「再読み込み」。**自動では再試行しない**ので（「自動で再試行
-	 * します」と書いたら本当にやる、の裏返し）、読めなかったときに利用者が
-	 * 抜け出せる手段をここに 1 つだけ置く。取り直す対象（失敗したブロック /
-	 * 総件数が未取得なら先頭ブロック）は `eventBlocks.ts` の
-	 * `blocksToFetch` が決める。
+	 * 手で押す「再読み込み」= 新しい世代。**自動では再試行しない**ので
+	 * （「自動で再試行します」と書いたら本当にやる、の裏返し）、読めなかった
+	 * ときに利用者が抜け出せる手段をここに 1 つだけ置く。失敗したブロック
+	 * （総件数が未取得なら先頭ブロック）も取り直す。**処理中でも押せる**
+	 * （2026-10-06 オーナー決定。監査ログ画面・banto と同じ）: 処理中の要求は
+	 * 中断され、新しい世代の要求に置き換わる。
 	 */
 	function reload(): void {
-		loader.reload();
+		events.refresh();
 	}
 </script>
 
@@ -210,18 +168,15 @@
 	{:else}
 		<!--
 			「読めなかった」「0 件」「まだ一度も読めていない」を別々に出す。
-			`readout` が `null` のうちは件数を言わない（0 件と言い切らない）。
+			まだ一度も読めていないうちは件数を言わない（0 件と言い切らない）。
 		-->
-		<p class="note">
-			{#if view.readout === null}
-				イベントを読み込んでいます。
-			{:else}
-				{collectEventsNote(view.readout, view.totalCount)}
-			{/if}
-		</p>
+		<p class="note">{view.note}</p>
 
 		{#if view.errorText}
 			<p class="error">{view.errorText}</p>
+		{/if}
+		{#if view.expiredText}
+			<p class="error">{view.expiredText}</p>
 		{/if}
 
 		<!--
@@ -239,17 +194,19 @@
 
 			**自動ポーリングは足さない**（オーナー指定）: 明示的に世代を始め
 			られれば十分で、勝手に世代を切ると読んでいる途中で行が入れ替わる。
+
+			**処理中でも押せる**（2026-10-06 オーナー決定。監査ログ画面と同じ）。
 		-->
 		<div class="actions">
-			<button type="button" onclick={reload} disabled={view.loading}>再読み込み</button>
+			<button type="button" onclick={reload}>再読み込み</button>
 		</div>
 
 		<section class="grid-wrap">
 			<BantoGrid
 				mode="server"
 				state={gridState}
-				{rows}
-				totalRows={view.totalCount}
+				rows={events.rows}
+				totalRows={events.totalCount ?? 0}
 				{columns}
 				getRowId={(row) => row.id}
 				onVisibleRangeChange={handleVisibleRangeChange}
@@ -303,11 +260,6 @@
 		font-size: 0.8rem;
 		font-weight: 600;
 		cursor: pointer;
-	}
-
-	.actions button:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
 	}
 
 	.grid-wrap {
