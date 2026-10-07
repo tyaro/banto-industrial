@@ -1464,45 +1464,29 @@ mod tests {
     use super::*;
     use banto_hub_core::profile_paths::resolve_profile_paths_from_env;
 
-    /// #505: 窓（WebView）の CSP は、Hub の応答の CSP（banto の
-    /// `with_security_headers`、#500）に Tauri の IPC（`connect-src` の
-    /// `ipc: http://ipc.localhost`）を足しただけのものにする（admin-template の
-    /// `tauri.conf.json` と同じ形）。この CSP が掛かるのは `frontendDist` の
+    /// #505: 窓（WebView）の CSP は、Hubの応答の CSP（banto の
+    /// `CONTENT_SECURITY_POLICY`、#500）に Tauri の IPC（`connect-src` の
+    /// `ipc: http://ipc.localhost`、`TAURI_IPC_CONNECT_SRC`）を足しただけのものに
+    /// する（admin-template の `tauri.conf.json` と同じ形）。この CSP が掛かるのは `frontendDist` の
     /// プレースホルダ（`ui/index.html`）だけで、navigate した後の Hub の画面には
-    /// Hub の応答の CSP が掛かる。banto が応答の CSP を変えたら、ここが落ちて
-    /// 窓の側を揃え忘れないようにする。
-    #[tokio::test]
-    async fn window_csp_is_the_served_csp_plus_tauri_ipc() {
-        use tower::ServiceExt;
+    /// Hub の応答の CSP（loopback の接続元には同じく IPC を足したもの、
+    /// `banto_hub_core::runtime` の `hub_security_headers`）が掛かる。banto が応答の CSP を変えたら、ここが落ちて窓の側を
+    /// 揃え忘れないようにする。期待値は banto の `SecurityHeaders` で組み立てる
+    /// （banto v5.0.0。文字列の置き換えはしない）。
+    #[test]
+    fn window_csp_is_the_served_csp_plus_tauri_ipc() -> Result<(), banto_server::InvalidCspSource> {
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
         let window_csp = conf["app"]["security"]["csp"]
             .as_str()
             .expect("app.security.csp is set");
 
-        let router = banto_server::with_security_headers(
-            axum::Router::new().route("/", axum::routing::get(|| async { "" })),
-        );
-        let response = router
-            .oneshot(
-                axum::http::Request::get("/")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let served_csp = response
-            .headers()
-            .get(axum::http::header::CONTENT_SECURITY_POLICY)
-            .and_then(|value| value.to_str().ok())
-            .expect("served CSP");
-
-        let expected = served_csp.replace(
-            "connect-src 'self'",
-            "connect-src 'self' ipc: http://ipc.localhost",
-        );
-        assert_ne!(expected, served_csp, "served CSP: {served_csp}");
+        let expected = banto_server::SecurityHeaders::new()
+            .extra_connect_src(banto_server::TAURI_IPC_CONNECT_SRC)?
+            .content_security_policy();
+        assert_ne!(expected, banto_server::CONTENT_SECURITY_POLICY);
         assert_eq!(window_csp, expected);
+        Ok(())
     }
 
     /// [`build_hub_config_from_env`] は3ホスト共通の関数（T17-1、

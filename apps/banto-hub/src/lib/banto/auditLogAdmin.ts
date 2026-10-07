@@ -12,13 +12,15 @@
 import {
 	getAuthProvider,
 	ProviderError,
-	SNAPSHOT_BOUNDARY_MISMATCH_MESSAGE,
+	createSnapshotListResource,
 	type ErrorBody,
 	type ListParams,
 	type SnapshotListFetcher,
-	type SnapshotListResult
+	type SnapshotListMessages,
+	type SnapshotListResource,
+	type SnapshotListResult,
+	type WindowedParams
 } from '@banto/admin-core';
-import { runWithLimit } from './runWithLimit';
 import { CSRF_HEADER } from './setup';
 
 /** Mirrors `banto_hub_core::audit::AuditLogEntry`（wire は camelCase）。 */
@@ -118,9 +120,11 @@ export type AuditLogList = SnapshotListResult<AuditLogEntry>;
  * 期間）と `SELECT` だけなので、これに当たるのは「遅い」ではなく「返って
  * こない」。
  *
- * banto の `SnapshotListResource` にも上限（`requestTimeoutMs`、既定 30 秒）が
- * あるが、その失敗の文言は英語の固定文なので、画面に出す日本語の文言を持つ
- * ためにこちらの上限（[`createAuditLogFetcher`]）を短く掛けている。
+ * banto の `SnapshotListResource` の `requestTimeoutMs`（既定 30 秒）にこの値を
+ * 渡す（[`createAuditLogResource`]）。上限に当たったブロックは `code: 'timeout'`
+ * の失敗になり、文言は [`AUDIT_LIST_MESSAGES`] の日本語になる（banto v5.0.0
+ * の `messages`。以前は英語の固定文を避けるため、取得関数の側でも同じ上限を
+ * 二重に掛けていた）。
  */
 export const AUDIT_LIST_TIMEOUT_MS = 15000;
 
@@ -137,17 +141,21 @@ export const AUDIT_BOUNDARY_MISMATCH_MESSAGE =
 export const AUDIT_SNAPSHOT_EXPIRED_MESSAGE =
 	'読み込みの途中で、保持ポリシーにより古い記録が削除されました。このまま続きを読むと行がずれるため、続きの読み込みを止めています。「再読み込み」で最新の状態から読み直してください。';
 
+/** 応答の形が正しくない（一覧として書き込めない）ときの文言。 */
+export const AUDIT_MALFORMED_MESSAGE =
+	'監査ログの読み取り結果の形が正しくありませんでした。「再読み込み」でもう一度試せます。';
+
 /**
- * 画面に出す失敗の文言。banto の `SnapshotListResource` が自分で記録する
- * 境界の食い違い（英語の固定文 `SNAPSHOT_BOUNDARY_MISMATCH_MESSAGE`）だけを
- * 日本語に置き換え、それ以外（サーバーの `ErrorBody`・接続できない・
- * [`auditListTimeoutMessage`]）はそのまま出す。
+ * banto の `SnapshotListResource` が自分で作る失敗（上限切れ・境界の食い違い・
+ * 応答の形の不正）の文言を日本語にする `messages`（banto v5.0.0）。サーバーの
+ * `ErrorBody`・接続できない、はサーバー・[`listAuditLog`] の文言がそのまま
+ * 出る。
  */
-export function auditErrorText(error: ProviderError): string {
-	return error.message === SNAPSHOT_BOUNDARY_MISMATCH_MESSAGE
-		? AUDIT_BOUNDARY_MISMATCH_MESSAGE
-		: error.message;
-}
+export const AUDIT_LIST_MESSAGES: SnapshotListMessages = {
+	timeout: (ms) => auditListTimeoutMessage(ms),
+	boundaryMismatch: () => AUDIT_BOUNDARY_MISMATCH_MESSAGE,
+	malformed: () => AUDIT_MALFORMED_MESSAGE
+};
 
 /**
  * フィルタ/ソート/ページングつきの監査ログ読み取り（admin限定の閲覧画面用）。
@@ -179,27 +187,35 @@ export type AuditLogLister = (
 
 /**
  * `createSnapshotListResource` に渡す取得 1 本（ブロック 1 つ）。要求の
- * 並べ替え・絞り込み・ページングと境界（`asOfId`）をそのまま
- * [`listAuditLog`] に渡し、[`AUDIT_LIST_TIMEOUT_MS`] の上限を掛ける
- * （上限に当たったら日本語の文言で失敗させる）。リソースの `signal`（世代の
- * 切り替え・`dispose()`）と上限のどちらでも要求を中断する。
+ * 並べ替え・絞り込み・ページングと境界（`asOfId`）、リソースの `signal`
+ * （上限切れ・世代の切り替え・`dispose()` で畳まれる）をそのまま
+ * [`listAuditLog`] に渡す。上限はリソースの
+ * `requestTimeoutMs` が掛ける（[`createAuditLogResource`]）。
  */
 export function createAuditLogFetcher(
-	list: AuditLogLister = listAuditLog,
-	timeoutMs: number = AUDIT_LIST_TIMEOUT_MS
+	list: AuditLogLister = listAuditLog
 ): SnapshotListFetcher<AuditLogEntry> {
-	return async (request, signal) => {
-		const params: ListParams = {
-			pagination: request.pagination,
-			sort: request.sort,
-			filters: request.filters
-		};
-		const outcome = await runWithLimit(
-			(limitSignal) => list(params, request.asOfId, AbortSignal.any([signal, limitSignal])),
-			timeoutMs
+	return (request, signal) =>
+		list(
+			{ pagination: request.pagination, sort: request.sort, filters: request.filters },
+			request.asOfId,
+			signal
 		);
-		if (outcome.kind === 'ok') return outcome.value;
-		if (outcome.kind === 'failed') throw outcome.error;
-		throw new ProviderError({ kind: 'other', message: auditListTimeoutMessage(timeoutMs) });
-	};
+}
+
+/**
+ * 監査ログ画面のブロック読み込み（banto #248 の `SnapshotListResource`）。
+ * 取得は [`createAuditLogFetcher`]、上限は [`AUDIT_LIST_TIMEOUT_MS`]、
+ * リソース自身が作る失敗の文言は [`AUDIT_LIST_MESSAGES`]。失敗のトースト
+ * （`notify`）は既定のまま出す。`list` はテストで偽のサーバーに差し替える口。
+ */
+export function createAuditLogResource(
+	params: Partial<WindowedParams>,
+	list: AuditLogLister = listAuditLog
+): SnapshotListResource<AuditLogEntry> {
+	return createSnapshotListResource<AuditLogEntry>(createAuditLogFetcher(list), {
+		params,
+		requestTimeoutMs: AUDIT_LIST_TIMEOUT_MS,
+		messages: AUDIT_LIST_MESSAGES
+	});
 }
