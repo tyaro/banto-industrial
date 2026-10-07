@@ -158,6 +158,126 @@ test.describe.serial('chronogazer 未保存の入力の確認', () => {
 		expect(checked).toBeGreaterThanOrEqual(5);
 	});
 
+	// #520 のレビュー P2: `isSaving` に `busy`（読み取りでも立つ）を渡していたため、
+	// 入力が何も無いのに、接続状態の読み取り中に離れようとすると確認が出た。
+	// 要求を**握ったまま**にして（即時に返すモックでは再現しない）離れる。
+	function hubView(status: object, endpoint: string, subscriptionState = 'stopped') {
+		return {
+			status,
+			endpoint,
+			keyName: 'chronogazer-e2e',
+			selectedTags: [],
+			tags: [],
+			subscription: {
+				state: subscriptionState,
+				reason: '購読していません。',
+				subscribedCount: 0,
+				unresolved: [],
+				unsupported: [],
+				lastError: null,
+				lastValueAt: null,
+				values: []
+			}
+		};
+	}
+
+	test('5c. Hub接続: 接続状態の初回読み取り中（入力なし）に離れても確認を出さない', async () => {
+		const release: (() => void)[] = [];
+		let held = 0;
+		await page.route('**/api/hub', async (route) => {
+			if (route.request().method() !== 'GET') {
+				await route.continue();
+				return;
+			}
+			held += 1;
+			await new Promise<void>((resolve) => release.push(resolve));
+			await route.abort().catch(() => {});
+		});
+		try {
+			await page.goto('/settings/hub', { waitUntil: 'commit' });
+			await expect.poll(() => held).toBeGreaterThan(0);
+			await sidebarLink(/監視/).click();
+			await expect(page).toHaveURL(/\/monitor$/);
+			expect(dialogs).toEqual([]);
+		} finally {
+			for (const resolve of release) resolve();
+			await page.unroute('**/api/hub');
+		}
+	});
+
+	test('5d. Hub接続: 自動の取り直し（読み取り専用）の最中に離れても確認を出さない', async () => {
+		const release: (() => void)[] = [];
+		let gets = 0;
+		const unreachable = hubView(
+			{ state: 'unreachable', cause: 'transport' },
+			'http://127.0.0.1:3100'
+		);
+		await page.route('**/api/hub', async (route) => {
+			if (route.request().method() !== 'GET') {
+				await route.continue();
+				return;
+			}
+			gets += 1;
+			// 1 回目（初回読み取り）は即時に返す。2 回目以降（取り直し）は握る。
+			if (gets === 1) {
+				await route.fulfill({ json: unreachable });
+				return;
+			}
+			await new Promise<void>((resolve) => release.push(resolve));
+			await route.abort().catch(() => {});
+		});
+		// 購読が「受信中」なのに接続状態が「接続済み」でない食い違い = 古い状態 →
+		// 自動で取り直しに行く（`isHubStatusStale`）。
+		await page.route('**/api/hub/subscription', async (route) => {
+			await route.fulfill({
+				json: hubView({ state: 'connected', tagCount: 0 }, '', 'live').subscription
+			});
+		});
+		try {
+			await page.goto('/settings/hub');
+			await expect.poll(() => gets, { timeout: 15_000 }).toBeGreaterThanOrEqual(2);
+			await sidebarLink(/監視/).click();
+			await expect(page).toHaveURL(/\/monitor$/);
+			expect(dialogs).toEqual([]);
+		} finally {
+			for (const resolve of release) resolve();
+			await page.unroute('**/api/hub/subscription');
+			await page.unroute('**/api/hub');
+		}
+	});
+
+	test('5e. Hub接続: 入力したAPIキーの欄が「接続」の成功で消えたあと、見えない下書きで未保存扱いにならない', async () => {
+		const ENDPOINT = 'http://127.0.0.1:3100';
+		await page.route('**/api/hub', async (route) => {
+			if (route.request().method() === 'GET') {
+				await route.fulfill({ json: hubView({ state: 'needsPairing' }, ENDPOINT) });
+				return;
+			}
+			await route.continue();
+		});
+		await page.route('**/api/hub/connect', async (route) => {
+			await route.fulfill({ json: hubView({ state: 'connected', tagCount: 0 }, ENDPOINT) });
+		});
+		try {
+			await page.goto('/settings/hub');
+			const keyInput = page.locator('input[type="password"]');
+			await keyInput.fill('typed-not-adopted');
+			await expect(page.locator('.banto-unsaved')).toHaveText('未保存の変更があります');
+
+			await page.getByRole('button', { name: '接続', exact: true }).click();
+			// 接続できると採用の入力欄は消える。
+			await expect(keyInput).toHaveCount(0);
+			await expect(page.locator('.banto-unsaved')).toHaveCount(0);
+
+			await sidebarLink(/監視/).click();
+			await expect(page).toHaveURL(/\/monitor$/);
+			expect(dialogs).toEqual([]);
+		} finally {
+			await page.unroute('**/api/hub/connect');
+			await page.unroute('**/api/hub');
+		}
+	});
+
 	test('6. ログアウト（/login への移動）は、未保存の入力があっても確認を出さない', async () => {
 		await page.goto('/settings/account');
 		await page.getByLabel('新しいパスワード（8文字以上）').fill('typed-not-saved');

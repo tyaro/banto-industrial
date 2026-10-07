@@ -22,7 +22,8 @@ banto-hub のサービスと REST ルーターを banto のものに置き換え
 （実装済み。両アプリの npm が v4.0.0 に揃い、移行中のずれは解消）を追記。2026-10-06: §5 に
 両アプリの監査ログ画面を banto の `SnapshotListResource` に寄せたこと（実装済み）を追記。同日: §5 に
 banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）を追記。2026-10-07: §5 に ChronoGazer の
-イベント一覧（`/events`）も `SnapshotListResource` に寄せたこと（実装済み）を追記。
+イベント一覧（`/events`）も `SnapshotListResource` に寄せたこと（実装済み）を追記。同日: §5 に ChronoGazer の
+未保存の入力の確認（`beforeNavigate`、#508、実装済み）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
