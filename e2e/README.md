@@ -1,10 +1,11 @@
 # e2e/ — Playwright E2E スイート
 
-このリポジトリには独立した3つの Playwright config がある。いずれも「LAN/REST モードの実サーバーに対する DOM テスト」で、モックした frontend ではない。ポート・一時 DB・出力ディレクトリは互いに分離してあるので、同一マシンで独立に実行できる。
+このリポジトリには独立した4つの Playwright config がある。いずれも「LAN/REST モードの実サーバーに対する DOM テスト」で、モックした frontend ではない。ポート・一時 DB・出力ディレクトリは互いに分離してあるので、同一マシンで独立に実行できる。
 
 | config                                | 対象                          | コマンド                  | CI             |
 | ------------------------------------- | ----------------------------- | ------------------------- | -------------- |
 | `playwright.config.ts`                | ChronoGazer smoke             | `pnpm e2e`                | ✅             |
+| `public-viewer.playwright.config.ts`  | ChronoGazer 閲覧公開 (#507)   | `pnpm e2e:public-viewer`  | ✅             |
 | `banto-hub.playwright.config.ts`      | banto-hub 本体 (T18 機能一式) | `pnpm e2e:banto-hub`      | ✅             |
 | `banto-hub-perf.playwright.config.ts` | banto-hub 性能計測（後述）    | `pnpm e2e:banto-hub:perf` | ❌ opt-in のみ |
 
@@ -19,6 +20,7 @@
 | banto-hub-perf                | 8801   |
 | banto-hub（ロックダウン済み） | 8802   |
 | chronogazer 用の開発用 PLC    | 8803   |
+| chronogazer 閲覧公開          | 8804   |
 
 `pnpm e2e:banto-hub` は **2台**の banto-hub を起動する（#341、2026-09-14）。
 8799 は従来どおり試運転モード（未ロックダウン）のままで、スイートの大半が
@@ -38,6 +40,13 @@
 （設定 → 開始 → データファイル生成 → イベント記録 → 停止）を画面から通す。
 手で画面を触るときは `pnpm dev:plc`（既定 Modbus `127.0.0.1:15020`。
 `pnpm dev:plc --protocol slmp` で SLMP `127.0.0.1:15000`、`--port` で変更）。
+
+8804 は `pnpm e2e:public-viewer`（#507）の `banto-serve`。`BANTO_VIEWER_PUBLIC=1`
+（閲覧公開 ON）で起動する 2 台目で、`pnpm e2e` のスモークスイート（8798）とは
+別の config・別の一時 DB。`banto-serve` は `BANTO_VIEWER_PUBLIC` を起動時にしか
+読まず、8798 側で ON にするとスモークの「未ログインならセットアップ画面」の前提が
+変わるため分けてある。同じ `banto-serve` バイナリを使うので追加のビルドは要らない
+（開発用 PLC も不要）。出力先は `e2e/test-results-public-viewer/`。
 
 ## ビルド前提
 

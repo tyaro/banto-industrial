@@ -77,7 +77,7 @@ export const RULES = [
 		why: 'banto-hub の E2E'
 	},
 	{
-		re: /^e2e\/(tests\/|playwright\.config\.ts$|global-teardown\.ts$|chronogazer-e2e-run-dir\.ts$)/,
+		re: /^e2e\/(tests(-public-viewer)?\/|(public-viewer\.)?playwright\.config\.ts$|global-teardown\.ts$|chronogazer-e2e-run-dir\.ts$)/,
 		areas: ['e2e_chronogazer'],
 		why: 'chronogazer の E2E'
 	},
