@@ -50,7 +50,8 @@ use chronogazer_core::settings::{
 use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
 use chronogazer_core::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
-    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, TagPlacement,
+    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, update_tag_checked,
+    TagPlacement,
 };
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
@@ -2798,7 +2799,7 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
         },
     )
     .await?;
-    let updated = state.tags.update(id, input.into()).await?;
+    let updated = update_tag_checked(&state.tags, id, input.into()).await?;
     state
         .audit
         .record(AuditEntry {
@@ -5075,7 +5076,12 @@ mod tests {
                     eng_hi: None,
                     unit: None,
                     decimals: 0,
+                    threshold_h: None,
+                    threshold_hh: None,
+                    threshold_l: None,
+                    threshold_ll: None,
                     enabled: true,
+                    expected_revision: None,
                 }
                 .into(),
             )
@@ -5381,7 +5387,12 @@ mod tests {
             eng_hi: None,
             unit: None,
             decimals: 0,
+            threshold_h: None,
+            threshold_hh: None,
+            threshold_l: None,
+            threshold_ll: None,
             enabled: true,
+            expected_revision: None,
         }
     }
 
@@ -5407,6 +5418,75 @@ mod tests {
             }
             other => panic!("検証エラーではない: {other:?}"),
         }
+    }
+
+    /// **#525（Tauri 経路）**: しきい値は保存され、古い `expectedRevision` の
+    /// 更新は `expectedRevision` の検証エラー（REST の 409 と同じ中身）で拒否される。
+    ///
+    /// 反証: `tags_update_body` を `state.tags.update` に戻すと、最後の
+    /// `is_revision_conflict` が落ちる（`Other` のまま返る）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_commands_carry_thresholds_and_enforce_the_expected_revision() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+        let conn = state
+            .plc_connections
+            .create(connection_payload("modbus", "modbus-tcp").into_create_input())
+            .await
+            .expect("create connection");
+        let group = state
+            .collection_groups
+            .create(
+                CollectionGroupPayload {
+                    name: "g".to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 1000,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create collection group");
+
+        let mut payload = tag_payload("t", group.id, "40001");
+        payload.threshold_h = Some(8.0);
+        let tag = tags_create_body(&state, payload.clone())
+            .await
+            .expect("create");
+        assert_eq!(tag.threshold_h, Some(8.0));
+
+        // 大小関係が崩れる更新は拒否。
+        let mut bad = payload.clone();
+        bad.threshold_l = Some(9.0);
+        bad.expected_revision = Some(tag.revision);
+        assert!(matches!(
+            tags_update_body(&state, tag.id, bad).await,
+            Err(BantoError::Validation { .. })
+        ));
+
+        let mut ok = payload.clone();
+        ok.threshold_h = Some(7.0);
+        ok.expected_revision = Some(tag.revision);
+        let updated = tags_update_body(&state, tag.id, ok).await.expect("update");
+        assert_eq!(updated.threshold_h, Some(7.0));
+
+        // 古い版での更新は食い違いとして拒否され、保存は変わらない。
+        let mut stale = payload;
+        stale.threshold_h = Some(8.5);
+        stale.expected_revision = Some(tag.revision);
+        let err = tags_update_body(&state, tag.id, stale)
+            .await
+            .expect_err("古い版の更新が通ってしまった");
+        assert!(
+            chronogazer_core::tag_address::is_revision_conflict(&err),
+            "{err:?}"
+        );
+        assert_eq!(state.tags.get(tag.id).await.unwrap().threshold_h, Some(7.0));
     }
 
     /// **#414 段階1（Tauri 経路）**: REST と同じ検査が、コマンドの本体にも

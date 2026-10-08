@@ -64,6 +64,8 @@
  *    動かないタグの見せ方（判定そのものは Rust 側。下記「E」）。
  */
 
+import type { Tag, TagDataType, TagInput } from '#lib/banto/tagRegistryAdmin.js';
+
 export interface FieldError {
 	field: string;
 	message: string;
@@ -550,4 +552,86 @@ export function simulationCoverageView<T extends { supported: boolean }>(
 		default:
 			return (state.items as T[]).some((entry) => !entry.supported) ? 'list' : 'all-moving';
 	}
+}
+
+// --- F: タグのフォーム値 <-> 送受信の形（#525） ---------------------------------
+//
+// しきい値（H/HH/L/LL）と楽観ロック用の版（`revision`）を扱う。`PUT` は置換
+// （省略したしきい値は消える）なので、**更新では 4 項目を必ず載せ**、編集を
+// 始めた時点の版を `expectedRevision` として送る。判断は `+page.svelte` の
+// 外（ここ）に置いて、vitest で総当たりする。
+
+const THRESHOLD_SUFFIXES = ['ThresholdH', 'ThresholdHh', 'ThresholdL', 'ThresholdLl'] as const;
+
+function numOrNull(v: unknown): number | null {
+	return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * フォームの値から送信用の `TagInput` を作る。しきい値は空欄 = `null`（設定なし）で
+ * **常に 4 項目とも載せる**。`expectedRevision` を渡すと更新用（楽観ロック）、
+ * 渡さないと作成用（版を持たない）。
+ */
+export function buildTagInput(
+	prefix: string,
+	values: Record<string, unknown>,
+	expectedRevision?: number
+): TagInput {
+	const rawUnit = values[`${prefix}Unit`];
+	const unit = typeof rawUnit === 'string' ? rawUnit.trim() : '';
+	const collectionGroupId = values[`${prefix}CollectionGroupId`];
+	const decimals = values[`${prefix}Decimals`];
+	const input: TagInput = {
+		name: String(values[`${prefix}Name`] ?? ''),
+		collectionGroupId: typeof collectionGroupId === 'number' ? collectionGroupId : 0,
+		address: String(values[`${prefix}Address`] ?? ''),
+		dataType: (values[`${prefix}DataType`] as TagDataType) ?? 'i16',
+		rawLo: numOrNull(values[`${prefix}RawLo`]),
+		rawHi: numOrNull(values[`${prefix}RawHi`]),
+		engLo: numOrNull(values[`${prefix}EngLo`]),
+		engHi: numOrNull(values[`${prefix}EngHi`]),
+		unit: unit === '' ? null : unit,
+		decimals: typeof decimals === 'number' ? decimals : 0,
+		thresholdH: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[0]}`]),
+		thresholdHh: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[1]}`]),
+		thresholdL: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[2]}`]),
+		thresholdLl: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[3]}`]),
+		enabled: Boolean(values[`${prefix}Enabled`])
+	};
+	if (expectedRevision !== undefined) input.expectedRevision = expectedRevision;
+	return input;
+}
+
+/** 既存のタグから編集フォームの初期値を作る（しきい値も含む）。 */
+export function tagFormValues(prefix: string, tag: Tag): Record<string, unknown> {
+	return {
+		[`${prefix}Name`]: tag.name,
+		[`${prefix}CollectionGroupId`]: tag.collectionGroupId,
+		[`${prefix}Address`]: tag.address,
+		[`${prefix}DataType`]: tag.dataType,
+		[`${prefix}RawLo`]: tag.rawLo,
+		[`${prefix}RawHi`]: tag.rawHi,
+		[`${prefix}EngLo`]: tag.engLo,
+		[`${prefix}EngHi`]: tag.engHi,
+		[`${prefix}Unit`]: tag.unit,
+		[`${prefix}Decimals`]: tag.decimals,
+		[`${prefix}ThresholdH`]: tag.thresholdH,
+		[`${prefix}ThresholdHh`]: tag.thresholdHh,
+		[`${prefix}ThresholdL`]: tag.thresholdL,
+		[`${prefix}ThresholdLl`]: tag.thresholdLl,
+		[`${prefix}Enabled`]: tag.enabled
+	};
+}
+
+/**
+ * 保存の失敗が「版の食い違い（他者が先に更新した）」か。サーバーは REST（409）も
+ * Tauri も `field: "expectedRevision"` の検証エラーで返す。
+ */
+export function isRevisionConflict(err: unknown): boolean {
+	if (typeof err !== 'object' || err === null) return false;
+	const body = (err as { body?: { kind?: unknown; field_errors?: unknown } }).body;
+	if (!body || body.kind !== 'validation' || !Array.isArray(body.field_errors)) return false;
+	return body.field_errors.some(
+		(fe) => typeof fe === 'object' && fe !== null && (fe as FieldError).field === 'expectedRevision'
+	);
 }

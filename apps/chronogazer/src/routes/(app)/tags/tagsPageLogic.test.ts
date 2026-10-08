@@ -26,6 +26,9 @@ import {
 	configExclusionsView,
 	coverageReloadStarted,
 	coverageReloadSettled,
+	buildTagInput,
+	tagFormValues,
+	isRevisionConflict,
 	SIMULATION_CONNECTION_LABEL,
 	type SimulationCoverageView,
 	type ConfigExclusionsView,
@@ -35,6 +38,7 @@ import {
 	type ListSectionView,
 	type CreateFormGate
 } from './tagsPageLogic';
+import type { Tag } from '#lib/banto/tagRegistryAdmin.js';
 
 // --- A: isSaveStillCurrent / runGuardedSave --------------------------------
 
@@ -691,5 +695,108 @@ describe('configExclusionsView（#414 段階2）', () => {
 		expect(configExclusionsView(waiting)).toBe('loading');
 		const failed = coverageReloadSettled(waiting, { kind: 'error', message: '読めない' });
 		expect(configExclusionsView(failed)).toBe('failed');
+	});
+});
+
+// --- F: buildTagInput / tagFormValues / isRevisionConflict（#525） ------------
+
+const SAMPLE_TAG: Tag = {
+	id: 7,
+	name: 'T1',
+	collectionGroupId: 3,
+	address: '40001',
+	dataType: 'i16',
+	rawLo: null,
+	rawHi: null,
+	engLo: null,
+	engHi: null,
+	unit: 'degC',
+	decimals: 1,
+	thresholdH: 80,
+	thresholdHh: 90,
+	thresholdL: 10,
+	thresholdLl: null,
+	enabled: true,
+	revision: 4
+};
+
+describe('tagFormValues -> buildTagInput（編集して保存しても、触っていないしきい値が消えない）', () => {
+	it('既存のしきい値が往復で保たれる（null は null のまま）', () => {
+		const input = buildTagInput(
+			'tagEdit',
+			tagFormValues('tagEdit', SAMPLE_TAG),
+			SAMPLE_TAG.revision
+		);
+		expect(input.thresholdH).toBe(80);
+		expect(input.thresholdHh).toBe(90);
+		expect(input.thresholdL).toBe(10);
+		expect(input.thresholdLl).toBeNull();
+	});
+
+	it('更新は編集を始めた時点の版を expectedRevision に載せる', () => {
+		const input = buildTagInput('tagEdit', tagFormValues('tagEdit', SAMPLE_TAG), 4);
+		expect(input.expectedRevision).toBe(4);
+	});
+
+	it('作成（版を渡さない）は expectedRevision を載せない', () => {
+		const input = buildTagInput('tagCreate', tagFormValues('tagCreate', SAMPLE_TAG));
+		expect('expectedRevision' in input).toBe(false);
+	});
+
+	it('0 は有効なしきい値（空欄と区別する）', () => {
+		const values = { ...tagFormValues('tagEdit', SAMPLE_TAG), tagEditThresholdL: 0 };
+		expect(buildTagInput('tagEdit', values, 1).thresholdL).toBe(0);
+	});
+
+	it('空欄・未入力・非有限は null（= 設定なし）で、4 項目とも必ず載る', () => {
+		const values = {
+			...tagFormValues('tagEdit', SAMPLE_TAG),
+			tagEditThresholdH: '',
+			tagEditThresholdHh: undefined,
+			tagEditThresholdL: Number.NaN,
+			tagEditThresholdLl: null
+		};
+		const input = buildTagInput('tagEdit', values, 1);
+		for (const key of ['thresholdH', 'thresholdHh', 'thresholdL', 'thresholdLl'] as const) {
+			expect(key in input, key).toBe(true);
+			expect(input[key], key).toBeNull();
+		}
+	});
+
+	it('既存の項目（単位の trim・空単位は null・小数桁）は変わらない', () => {
+		const values = {
+			...tagFormValues('tagEdit', SAMPLE_TAG),
+			tagEditUnit: '  ',
+			tagEditDecimals: 2
+		};
+		const input = buildTagInput('tagEdit', values, 1);
+		expect(input.unit).toBeNull();
+		expect(input.decimals).toBe(2);
+		expect(input.name).toBe('T1');
+	});
+});
+
+describe('isRevisionConflict', () => {
+	const conflict = {
+		body: {
+			kind: 'validation',
+			field_errors: [{ field: 'expectedRevision', message: '先に更新されました' }]
+		}
+	};
+
+	it('expectedRevision の検証エラーなら true', () => {
+		expect(isRevisionConflict(conflict)).toBe(true);
+	});
+
+	it('ほかの検証エラー・検証以外・無関係な値は false', () => {
+		expect(
+			isRevisionConflict({
+				body: { kind: 'validation', field_errors: [{ field: 'thresholdH', message: 'x' }] }
+			})
+		).toBe(false);
+		expect(isRevisionConflict({ body: { kind: 'other', message: 'x' } })).toBe(false);
+		expect(isRevisionConflict(new Error('x'))).toBe(false);
+		expect(isRevisionConflict(null)).toBe(false);
+		expect(isRevisionConflict('expectedRevision')).toBe(false);
 	});
 });

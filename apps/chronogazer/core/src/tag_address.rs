@@ -263,6 +263,58 @@ pub async fn ensure_tag_update_fits_its_connection(
     .await
 }
 
+/// 楽観ロック（`expectedRevision`）が食い違ったときにフォームへ出すフィールド名。
+pub const REVISION_CONFLICT_FIELD: &str = "expectedRevision";
+
+/// 版の食い違いの案内（画面にそのまま出る）。
+pub const REVISION_CONFLICT_MESSAGE: &str =
+    "他の人（または別の画面）がこのタグを先に更新しました。一覧を再読み込みしてから、もう一度編集して保存してください。";
+
+/// 版の食い違いを表すエラー。REST は `409 Conflict`、Tauri は通常の検証エラーと
+/// 同じ形（`kind: "validation"`）で返し、画面は両経路を同じに扱える。
+pub fn revision_conflict_error() -> BantoError {
+    BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: REVISION_CONFLICT_FIELD.to_string(),
+            message: REVISION_CONFLICT_MESSAGE.to_string(),
+        }],
+    }
+}
+
+/// [`revision_conflict_error`] が作ったエラーか（REST が `409` にするための判定）。
+pub fn is_revision_conflict(err: &BantoError) -> bool {
+    matches!(err, BantoError::Validation { field_errors }
+        if field_errors.iter().any(|fe| fe.field == REVISION_CONFLICT_FIELD))
+}
+
+/// タグを更新する（REST・Tauri 共通）。`input.expected_revision` が `Some` で
+/// 他者が先に更新していたら、`TagService::update` の汎用エラー（`Other` =
+/// 500 になる）ではなく [`revision_conflict_error`] を返す。
+///
+/// `TagService::update` は「版の食い違い」と「その他の失敗」をどちらも
+/// `BantoError::Other` にするので、`Other` が返ったときだけ現在の行を読み直し、
+/// 版が進んでいれば食い違いと判定する（メッセージの文字列には依存しない）。
+pub async fn update_tag_checked(
+    tags: &TagService,
+    id: i64,
+    input: banto_tags::TagInput,
+) -> Result<Tag, BantoError> {
+    let expected = input.expected_revision;
+    match tags.update(id, input).await {
+        Err(BantoError::Other(message)) => {
+            if let Some(expected) = expected {
+                if let Ok(current) = tags.get(id).await {
+                    if current.revision != expected {
+                        return Err(revision_conflict_error());
+                    }
+                }
+            }
+            Err(BantoError::Other(message))
+        }
+        other => other,
+    }
+}
+
 /// 接続の更新の前に呼ぶ: プロトコルが変わるなら、この接続の下の全タグ
 /// （有効・無効を問わない - 無効なタグも有効にした瞬間に収集を止める）が
 /// 新しいプロトコルで読めるか。プロトコルが変わらないなら何も調べない。
