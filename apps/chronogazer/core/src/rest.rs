@@ -56,6 +56,7 @@
 //! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
 //! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionView}>` (viewer+, C-3a / `simulation` = #413) |
 //! | GET    | `/api/collect/events?offset=&limit=&asOfId=` | -    | `Readout<CollectEventList>` (viewer+, C-3a / `asOfId` = #409) |
+//! | GET    | `/api/collect/history?tagIds=&fromMs=&toMs=&bins=` | - | `Readout<CollectHistory>` (viewer+, R1-D の D-3a) |
 //!
 //! `/api/ui-settings/*` (spec M12 SettingsProvider migration): per-user UI
 //! settings (theme/preset/dock layout), namespaced by the caller's own
@@ -230,9 +231,9 @@ use crate::display_groups::DisplayGroupService;
 mod display_groups;
 use crate::collect::ExclusionView;
 use crate::collect::{
-    CollectEventList, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
-    CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE,
-    COLLECT_READ_ROLE,
+    parse_tag_ids, validate_history_request, CollectEventList, CollectHistory, CollectOutcome,
+    CollectorService, CollectorStateView, ConnectionView, CurrentSampleView, EventPage,
+    HistoryRequest, Readout, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::SettingsService;
@@ -613,6 +614,67 @@ async fn collect_events_handler(
     )
 }
 
+/// `GET /api/collect/history?tagIds=1,2&fromMs=&toMs=&bins=` のクエリ
+/// （R1-D の D-3a）。数値でない値は axum のクエリ解釈が 400 で拒否する。
+/// 欠けている値と上限外は [`history_request_from_query`] が
+/// `BantoError::Validation`（422）にする。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectHistoryQuery {
+    #[serde(default)]
+    tag_ids: Option<String>,
+    #[serde(default)]
+    from_ms: Option<i64>,
+    #[serde(default)]
+    to_ms: Option<i64>,
+    #[serde(default)]
+    bins: Option<u64>,
+}
+
+/// REST のクエリを検証済みの要求にする。上限の判定は Tauri の
+/// `collect_history` と同じ [`validate_history_request`] 1 本。
+fn history_request_from_query(query: &CollectHistoryQuery) -> Result<HistoryRequest, BantoError> {
+    let missing: Vec<FieldError> = [
+        ("fromMs", query.from_ms.is_none()),
+        ("toMs", query.to_ms.is_none()),
+        ("bins", query.bins.is_none()),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(field, _)| FieldError {
+        field: field.to_string(),
+        message: "必須です".to_string(),
+    })
+    .collect();
+    if !missing.is_empty() {
+        return Err(BantoError::Validation {
+            field_errors: missing,
+        });
+    }
+    let tag_ids = parse_tag_ids(query.tag_ids.as_deref().unwrap_or(""))?;
+    validate_history_request(
+        &tag_ids,
+        query.from_ms.unwrap_or_default(),
+        query.to_ms.unwrap_or_default(),
+        query.bins.unwrap_or_default(),
+    )
+}
+
+/// `GET /api/collect/history`（**`viewer` 以上**、R1-D の D-3a）: タグごとの
+/// 直近の履歴（間引いた最小・最大）。リアルタイムトレンドの初期窓に使う。
+///
+/// **収集が止まっていても読める**（`notRunning` を返さない）。データファイルか
+/// レジストリを読めなかったときは `unavailable` で、理由（ファイルのパスを
+/// 含みうる）は返さない。収集の操作キューは通らない。上限・形・割り切りは
+/// `crate::collect` の `history` モジュールの doc。読み取りなので監査しない。
+async fn collect_history_handler(
+    State(state): State<CollectState>,
+    Query(query): Query<CollectHistoryQuery>,
+) -> Result<Json<Readout<CollectHistory>>, ApiError> {
+    let request = history_request_from_query(&query)?;
+    Ok(Json(state.collect.history(&request).await))
+}
+
 /// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 async fn collect_start_handler(
     State(state): State<CollectState>,
@@ -681,7 +743,7 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         audit: audit.clone(),
         auth: auth.clone(),
     };
-    // 読み取りの床（`viewer` 以上）。**4 ルートまとめて 1 つの `RoleGuard`**
+    // 読み取りの床（`viewer` 以上）。**5 ルートまとめて 1 つの `RoleGuard`**
     // で、ここが「読み取りは誰まで」の唯一の決まり場所（変更側と同じ作法 -
     // 次に読み出しを足しても床が散らない）。
     let reads = Router::new()
@@ -691,6 +753,8 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         .route("/api/collect/values", get(collect_values_handler))
         .route("/api/collect/connections", get(collect_connections_handler))
         .route("/api/collect/events", get(collect_events_handler))
+        // R1-D の D-3a: 直近の履歴。同じ床・監査しない・キューを通らない。
+        .route("/api/collect/history", get(collect_history_handler))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             RoleGuard {
@@ -5287,6 +5351,87 @@ mod tests {
         );
         assert_eq!(events["data"]["rows"].as_array().unwrap().len(), 0);
         assert_eq!(events["data"]["totalCount"], 0);
+    }
+
+    /// R1-D の D-3a: 履歴（`GET /api/collect/history`）も**読み取りと同じ床**
+    /// （`viewer` 以上・トークン無しは 401）。収集が走っていなくても
+    /// `ready`（`notRunning` にしない）、レジストリに居ないタグは
+    /// `unknownTagIds` に出る。上限外・欠けた値は 422、数値でない値は 400。
+    /// `src-tauri` 側に同じ床を主張する双子のテストがある。
+    ///
+    /// 反証（回帰の検出）: ルートを読み取りの `RoleGuard` の外（変更側）に
+    /// 置くと viewer が 403 になって落ちる。`history_request_from_query` の
+    /// 欠けた値の判定を外すと、`fromMs` 無しが 0 として通って 200 になり落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_history_is_viewer_readable_validated_and_ready_without_collection() {
+        let (router, _audit, _admin, _editor, viewer) = router_with_role_tokens_and_audit().await;
+        // `tagIds` のカンマは TS の `URLSearchParams` がエンコードする形（`%2C`）で
+        // 送る - 画面のクライアントが実際に送る綴り。
+        let path = "/api/collect/history?tagIds=42%2C42&fromMs=1000&toMs=61000&bins=60";
+
+        let anonymous = router.clone().oneshot(get(path)).await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router
+            .clone()
+            .oneshot(get_auth(path, &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "viewer が履歴を読めない");
+        let body = body_json(response).await;
+        assert_eq!(
+            body,
+            json!({
+                "state": "ready",
+                "data": { "fromMs": 1000, "toMs": 61000, "series": [], "unknownTagIds": [42] }
+            })
+        );
+
+        for (bad, field) in [
+            (
+                "/api/collect/history?tagIds=1&fromMs=0&toMs=3600001&bins=10",
+                "toMs",
+            ),
+            (
+                "/api/collect/history?tagIds=1,2,3,4,5,6,7,8,9&fromMs=0&toMs=1&bins=10",
+                "tagIds",
+            ),
+            (
+                "/api/collect/history?tagIds=1&fromMs=0&toMs=1&bins=0",
+                "bins",
+            ),
+            ("/api/collect/history?tagIds=1&toMs=1&bins=10", "fromMs"),
+            ("/api/collect/history?fromMs=0&toMs=1&bins=10", "tagIds"),
+            (
+                "/api/collect/history?tagIds=1,x&fromMs=0&toMs=1&bins=10",
+                "tagIds",
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(get_auth(bad, &viewer))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad} が拒否されない"
+            );
+            let body = body_json(response).await;
+            assert!(
+                body.to_string().contains(field),
+                "{bad} の誤りが {field} に付いていない: {body}"
+            );
+        }
+
+        let not_a_number = router
+            .oneshot(get_auth(
+                "/api/collect/history?tagIds=1&fromMs=abc&toMs=1&bins=10",
+                &viewer,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(not_a_number.status(), StatusCode::BAD_REQUEST);
     }
 
     /// イベント一覧の**ワイヤ形**（#383 段階2b / R1-C の C-3a）:

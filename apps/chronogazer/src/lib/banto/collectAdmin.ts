@@ -240,6 +240,85 @@ export interface CollectEventList extends ListResult<CollectEventRow> {
 	asOfId: number;
 }
 
+/**
+ * `chronogazer_core::collect::HistoryPoint`（R1-D の D-3a）: 間引いた 1 区間の
+ * 最小・最大。**欠測と非有限の値は `min`/`max` とも `null`**（0 ではない。
+ * 線を切る）。`tMs` は区間の始まり、拡大しきって 1 区間 1 サンプル程度のときは
+ * サンプルそのものの時刻（`banto-tsquery` の素通し）。
+ */
+export interface HistoryPoint {
+	tMs: number;
+	min: number | null;
+	max: number | null;
+}
+
+/**
+ * `chronogazer_core::collect::HistorySeries`: タグ 1 本の系列。
+ *
+ * - `simulation` は**レジストリの今の値**（走っている収集の値ではない）。
+ *   シミュレーション接続の値は記録されないので、その区間は `null` になる。
+ * - `binMs` は実際に使われた区間の幅で、**系列ごとに違いうる**（収集周期の
+ *   違うグループのタグを混ぜたとき）。点の時刻も系列ごとに揃うとは限らない。
+ */
+export interface HistorySeries {
+	tagId: number;
+	simulation: boolean;
+	binMs: number;
+	points: HistoryPoint[];
+}
+
+/**
+ * `chronogazer_core::collect::CollectHistory`: 履歴の読み出し結果。
+ * `series` は要求順（重複は除く）で、レジストリに居ないタグは
+ * `unknownTagIds` に出る（1 本の誤りで全体を落とさない）。
+ */
+export interface CollectHistory {
+	fromMs: number;
+	toMs: number;
+	series: HistorySeries[];
+	unknownTagIds: number[];
+}
+
+/** 履歴 1 回で読めるタグの本数の上限（`HISTORY_MAX_TAGS`）。 */
+export const HISTORY_MAX_TAGS = 8;
+/** 履歴 1 回で読める期間の幅の上限（ミリ秒、`HISTORY_MAX_WINDOW_MS`）。 */
+export const HISTORY_MAX_WINDOW_MS = 3_600_000;
+/**
+ * 系列 1 本あたりの `bins` の上限（`HISTORY_MAX_BINS`。返る点の数も系列ごとに
+ * これ以下）。描画の 1 ピクセルに 1 区間あれば山を落とさないので、描画幅に
+ * 合わせた値（`banto-tsquery` の内部の上限 20 万とは別）。
+ */
+export const HISTORY_MAX_BINS = 2000;
+/**
+ * 1 回の応答全体の予算: **タグの本数（重複を除く）× `bins`** の上限
+ * （`HISTORY_MAX_POINTS`）。8 ペンなら 1 本 1000 区間まで。超えると
+ * `validation`（`bins` の誤り）。
+ */
+export const HISTORY_MAX_POINTS = 8000;
+
+/** [`getCollectHistory`] の引数。期間は両端を含み、`fromMs < toMs`。 */
+export interface CollectHistoryParams {
+	tagIds: readonly number[];
+	fromMs: number;
+	toMs: number;
+	/** 区間の数の目安（≒ 描画幅のピクセル数）。 */
+	bins: number;
+}
+
+/**
+ * `GET /api/collect/history` のクエリ文字列。`tagIds` はカンマ区切り
+ * （`?tagIds=1,2`）。上限の検証はサーバーが行う（ここで丸めない - 丸めると
+ * 頼んだのと違う期間を黙って表示することになる）。
+ */
+export function collectHistoryQuery(params: CollectHistoryParams): string {
+	return new URLSearchParams({
+		tagIds: params.tagIds.join(','),
+		fromMs: String(params.fromMs),
+		toMs: String(params.toMs),
+		bins: String(params.bins)
+	}).toString();
+}
+
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
 
 function demoModeError(): ProviderError {
@@ -402,6 +481,38 @@ export async function listCollectEvents(
 	const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
 	if (asOfId !== null) query.set('asOfId', String(asOfId));
 	return httpJson<Readout<CollectEventList>>(`/api/collect/events?${query}`, 'GET', signal);
+}
+
+/**
+ * タグごとの直近の履歴（`viewer` 以上、R1-D の D-3a）。リアルタイムトレンドの
+ * 初期窓に使う。
+ *
+ * - **`notRunning` は返らない**（収集が止まっていても過去の記録は読める）。
+ *   `unavailable` はデータファイルか設定 DB を読めなかったとき（理由は
+ *   返らない）。
+ * - 上限（タグ 8 本・期間 1 時間・`bins` ≤ [`HISTORY_MAX_BINS`]・
+ *   本数 × `bins` ≤ [`HISTORY_MAX_POINTS`]）を外れると `validation` のエラー。
+ *   系列の点の数は `bins` 以下（素通しの経路でもサーバーが畳む）。
+ * - 収集の操作キューを通らない。直近 1 秒ほどはまだデータファイルに無い
+ *   ことがある（書き手の flush 間隔）ので、以後は現在値のポーリングで足す。
+ */
+export async function getCollectHistory(
+	params: CollectHistoryParams,
+	signal?: AbortSignal
+): Promise<Readout<CollectHistory>> {
+	if (!isCollectAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri')
+		return invokeCommand<Readout<CollectHistory>>('collect_history', {
+			tagIds: [...params.tagIds],
+			fromMs: params.fromMs,
+			toMs: params.toMs,
+			bins: params.bins
+		});
+	return httpJson<Readout<CollectHistory>>(
+		`/api/collect/history?${collectHistoryQuery(params)}`,
+		'GET',
+		signal
+	);
 }
 
 // --- 操作（editor 以上） ----------------------------------------------------
