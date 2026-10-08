@@ -151,6 +151,13 @@ pub struct CollectEvent {
     pub level: Option<ThresholdLevel>,
     /// The scaled value involved (`Some` only for `threshold_*`).
     pub value: Option<f64>,
+    /// The limit the judgement was made against - the `level` band's own
+    /// H/HH/L/LL value at the time (`Some` only for `threshold_*`; for
+    /// `threshold_cleared`, the limit of the band that was left). #532
+    /// (2026-10-08 owner decision): thresholds are a user-side setting that
+    /// can be edited later, so the alarm record keeps the value it was judged
+    /// by rather than leaving readers to look up today's setting.
+    pub limit_value: Option<f64>,
     /// Free-text detail (e.g. a disconnect reason).
     pub detail: Option<String>,
 }
@@ -165,6 +172,7 @@ impl CollectEvent {
             tag_key: None,
             level: None,
             value: None,
+            limit_value: None,
             detail: None,
         }
     }
@@ -184,11 +192,13 @@ impl CollectEvent {
             tag_key: None,
             level: None,
             value: None,
+            limit_value: None,
             detail,
         }
     }
 
-    /// A threshold-edge event for one tag.
+    /// A threshold-edge event for one tag. `limit_value` is the `level`
+    /// band's limit the reading was judged against (#532).
     pub(crate) fn threshold(
         ts_ms: i64,
         kind: EventKind,
@@ -196,6 +206,7 @@ impl CollectEvent {
         tag_key: impl Into<String>,
         level: ThresholdLevel,
         value: f64,
+        limit_value: Option<f64>,
     ) -> Self {
         Self {
             ts_ms,
@@ -204,6 +215,7 @@ impl CollectEvent {
             tag_key: Some(tag_key.into()),
             level: Some(level),
             value: Some(value),
+            limit_value,
             detail: None,
         }
     }
@@ -253,8 +265,9 @@ impl EventSink {
     /// the row already existing.
     pub(crate) async fn emit(&self, event: CollectEvent) {
         let _ = sqlx::query(
-            "INSERT INTO collect_events (ts, kind, connection_key, tag_key, level, value, detail) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO collect_events \
+             (ts, kind, connection_key, tag_key, level, value, limit_value, detail) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.ts_ms)
         .bind(event.kind.as_str())
@@ -262,6 +275,7 @@ impl EventSink {
         .bind(&event.tag_key)
         .bind(event.level.map(|l| l.as_str()))
         .bind(event.value)
+        .bind(event.limit_value)
         .bind(&event.detail)
         .execute(&self.pool)
         .await;

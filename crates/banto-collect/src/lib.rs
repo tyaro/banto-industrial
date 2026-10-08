@@ -81,9 +81,10 @@ mod task;
 
 pub use collector::{ApplyReport, Collector, CollectorOptions};
 pub use config::{
-    build_config, build_config_from, build_config_lenient_from, check_tag_address,
-    config_exclusions, connections_with_collected_groups, CollectorConfig, ConfigExclusion,
-    ExclusionReason, ExclusionUnit, Protocol, RegistrySnapshot, TagAddressField, TagAddressIssue,
+    build_config, build_config_from, build_config_lenient_from,
+    build_config_lenient_with_thresholds, check_tag_address, config_exclusions,
+    connections_with_collected_groups, CollectorConfig, ConfigExclusion, ExclusionReason,
+    ExclusionUnit, Protocol, RegistrySnapshot, TagAddressField, TagAddressIssue, Thresholds,
 };
 pub use current::{
     CurrentReading, CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR,
@@ -114,6 +115,35 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), CollectError> {
         .execute(pool)
         .await
         .map_err(|err| CollectError::Migrate(err.to_string()))?;
+    add_limit_value_column(pool).await
+}
+
+/// #532 (2026-10-08 owner decision): `threshold_*` events record the limit
+/// they were judged against, in `collect_events.limit_value`.
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, and this table is created by the
+/// idempotent DDL above rather than a migrator with bookkeeping, so the
+/// column is added here only when `pragma_table_info` does not list it yet: a
+/// database created before #532 gets it on its next startup, a new one gets it
+/// right after the `CREATE TABLE`, and a second run is a no-op. The embedded
+/// `0001_collect_events.sql` is left as-is (it is the original table shape;
+/// this function is the one place that extends it). The column is nullable
+/// and old rows read as `NULL` ("limit not recorded"). banto-hub shares this
+/// table and gets the column too; its events also carry the limit (it still
+/// judges against the tag columns until #533).
+async fn add_limit_value_column(pool: &SqlitePool) -> Result<(), CollectError> {
+    let present: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('collect_events') WHERE name = 'limit_value'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|err| CollectError::Migrate(err.to_string()))?;
+    if present == 0 {
+        sqlx::query("ALTER TABLE collect_events ADD COLUMN limit_value REAL")
+            .execute(pool)
+            .await
+            .map_err(|err| CollectError::Migrate(err.to_string()))?;
+    }
     Ok(())
 }
 
@@ -133,6 +163,41 @@ mod tests {
             .await
             .expect("collect_events should exist");
         assert_eq!(count, 0);
+    }
+
+    /// #532: a database whose `collect_events` predates `limit_value` gets
+    /// the column on the next `migrate` (existing rows keep `NULL`), and a
+    /// fresh one has it too. Running twice stays a no-op.
+    #[tokio::test]
+    async fn migrate_adds_limit_value_to_a_table_created_before_it() {
+        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0001_collect_events.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO collect_events (ts, kind) VALUES (1, 'collection_started')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        migrate(&pool).await.expect("migrate adds the column");
+        migrate(&pool).await.expect("second migrate is a no-op");
+
+        let old: Option<f64> = sqlx::query_scalar("SELECT limit_value FROM collect_events")
+            .fetch_one(&pool)
+            .await
+            .expect("limit_value should exist");
+        assert_eq!(old, None);
+
+        let fresh = banto_storage::connect_sqlite_memory().await.unwrap();
+        migrate(&fresh).await.unwrap();
+        let present: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('collect_events') WHERE name = 'limit_value'",
+        )
+        .fetch_one(&fresh)
+        .await
+        .unwrap();
+        assert_eq!(present, 1);
     }
 
     #[tokio::test]

@@ -135,11 +135,9 @@ export interface Tag {
 	engHi: number | null;
 	unit: string | null;
 	decimals: number;
-	/** #525: しきい値（タグ定義の属性、`null` = 設定なし）。 */
-	thresholdH: number | null;
-	thresholdHh: number | null;
-	thresholdL: number | null;
-	thresholdLl: number | null;
+	// しきい値は持たない（#532: タグ定義の属性ではなく、記録計の側の設定。
+	// `tagThresholdsAdmin.ts`）。サーバーの応答には banto-tags の列
+	// （`thresholdH` など）がまだ載るが、ChronoGazer は常に空で保存し、読まない。
 	enabled: boolean;
 	/** #525: 楽観ロック用の版。更新のたびに +1 される（更新時は `TagInput.expectedRevision` に載せる）。 */
 	revision: number;
@@ -148,9 +146,10 @@ export interface Tag {
 /**
  * Mirrors `chronogazer_core::rest::TagPayload`。
  *
- * `PUT` は**置換**: しきい値を省略（`undefined`）または `null` で送ると、既存の
- * しきい値は消える（banto-hub の `PUT` と同じ）。更新では常に今の値を送ること
- * （`tagsPageLogic.ts` の `buildTagInput` は全 4 項目を必ず載せる）。
+ * `PUT` は**置換**（省略した項目は既定値）。更新では常に今の値を送ること。
+ * **しきい値は送らない**（#532。値付きで送るとサーバーが `thresholdH` などの
+ * 検証エラーで断る）。しきい値の保存は `tagThresholdsAdmin.ts` の
+ * `updateTagThresholds`。
  */
 export interface TagInput {
 	name: string;
@@ -163,10 +162,6 @@ export interface TagInput {
 	engHi?: number | null;
 	unit?: string | null;
 	decimals: number;
-	thresholdH?: number | null;
-	thresholdHh?: number | null;
-	thresholdL?: number | null;
-	thresholdLl?: number | null;
 	enabled: boolean;
 	/** #525: 更新のとき、編集を始めた時点の `Tag.revision`。他者が先に更新していれば `409`（`expectedRevision` の検証エラー）で拒否される。省略すると版を確かめない。 */
 	expectedRevision?: number;

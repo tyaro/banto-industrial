@@ -159,7 +159,10 @@ export function tagsUsedByOtherPens(draft: GroupDraft, index: number): Set<numbe
 	return used;
 }
 
-/** タグのしきい値（タグ定義の属性。`/api/tags` が返す形の一部）。 */
+/**
+ * タグのしきい値（#532: 記録計の側のタグごとの設定。`/api/tag-thresholds` が返す形の
+ * 一部。タグ定義の属性ではない）。
+ */
 export interface TagThresholds {
 	thresholdLl?: number | null;
 	thresholdL?: number | null;
@@ -169,7 +172,8 @@ export interface TagThresholds {
 
 /**
  * しきい値の読み取り専用の表示（LL / L / H / HH の順）。1 つも無ければ
- * 「しきい値なし」。編集はタグ設定（タグ定義の経路）で行う。
+ * 「しきい値なし」。編集はタグ設定画面の「しきい値（記録計の設定）」で行う
+ * （保存は記録計の側の設定の経路。§3.7.6）。
  */
 export function thresholdSummary(tag: TagThresholds | undefined): string {
 	if (!tag) return '—';
@@ -183,6 +187,29 @@ export function thresholdSummary(tag: TagThresholds | undefined): string {
 	return parts
 		.map(([label, value]) => `${label} ${value === null || value === undefined ? '—' : value}`)
 		.join(' / ');
+}
+
+/** しきい値を読めなかったときのペンの表示。 */
+export const THRESHOLDS_UNREADABLE = '読み込めませんでした';
+
+/**
+ * ペン 1 本のしきい値の表示（純関数、#532）。
+ *
+ * - タグ未選択・タグが見つからない → 「—」
+ * - しきい値の一覧をまだ読めていない → 読み込み中は「—」、読めなかったら
+ *   [`THRESHOLDS_UNREADABLE`]（「しきい値なし」と混ぜない - 読めなかったことを
+ *   設定なしに潰さない）
+ * - 一覧に無いタグは設定なし（既定）→ 「しきい値なし」
+ */
+export function penThresholdText(
+	tagId: number | null,
+	tagKnown: boolean,
+	thresholds: ReadonlyMap<number, TagThresholds> | null,
+	thresholdsFailed: boolean
+): string {
+	if (tagId === null || !tagKnown) return '—';
+	if (thresholds === null) return thresholdsFailed ? THRESHOLDS_UNREADABLE : '—';
+	return thresholdSummary(thresholds.get(tagId) ?? {});
 }
 
 /**

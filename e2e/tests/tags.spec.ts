@@ -56,10 +56,13 @@
  *    作るタグのアドレスも Modbus の参照番号（`40001`/`40011`）にしてある
  *    （テストの意図 = CRUD とスケーリングの検証エラーの表示は変わらない）。
  *    テスト `6b.` で固定する。
- * 9.（#525）タグのしきい値（LL/L/H/HH）を画面から設定でき、再読み込みしても
- *    残ること、大小関係が崩れると理由が欄に出ること（`5b.`）。別の画面が先に
- *    更新したタグを古い版で保存すると、再読み込みを促す案内が出て上書き
- *    されないこと（楽観ロック、`5c.`）。
+ * 9.（#525 → #532）しきい値（LL/L/H/HH）を画面から設定でき、再読み込みしても
+ *    残ること、大小関係が崩れると理由が欄に出ること（`5b.`）。#532 から
+ *    しきい値はタグ定義ではなく**記録計の側の設定**で、タグの編集ペインの下の
+ *    「しきい値（記録計の設定）」のフォームで**別に保存する**（「しきい値を保存」）。
+ *    タグの「保存」はしきい値を消さない（`5b.`）。別の画面が先に保存した
+ *    しきい値を古い版で保存すると、再読み込みを促す案内が出て上書きされない
+ *    こと（楽観ロック、`5c.`）。
  *
  * ファイル名について: `smoke.spec.ts` が初回セットアップ（管理者アカウント
  * 作成）を実 DOM で行うため、このファイルは辞書順でそれより後でなければ
@@ -155,7 +158,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await expect(section.locator('div.list').getByText(TAG_NAME)).toBeVisible();
 	});
 
-	test('5b. タグにしきい値を設定して保存でき、再読み込みしても残る。大小関係が崩れると理由が欄に出る（#525）', async () => {
+	test('5b. しきい値（記録計の設定）を別に保存でき、再読み込みしても残る。大小関係が崩れると理由が欄に出る。タグの保存はしきい値を消さない（#525 / #532）', async () => {
 		const section = page.locator('section.registry-section').nth(2);
 		await section
 			.locator('div.list')
@@ -165,45 +168,55 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await expect(
 			detail.getByRole('heading', { level: 4, name: `${TAG_NAME} を編集` })
 		).toBeVisible();
+		const thresholds = detail.locator('div.thresholds-pane');
+		await expect(
+			thresholds.getByRole('heading', { level: 4, name: 'しきい値（記録計の設定）' })
+		).toBeVisible();
+		// 新しいタグは設定なし（既定）。
+		await expect(thresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('');
 
-		// 大小関係が崩れた組（L > H）はサーバー（banto-tags）が拒否し、欄の下に理由が出る。
-		await detail.getByLabel('しきい値 L（下限）', { exact: true }).fill('50');
-		await detail.getByLabel('しきい値 H（上限）', { exact: true }).fill('10');
-		await detail.getByRole('button', { name: '保存' }).click();
-		// `validate_thresholds`（crates/banto-tags/src/tag.rs）の文言が H 欄に出る。
-		await expect(detail.getByText('thresholdL 以上の値にしてください')).toBeVisible();
+		// 大小関係が崩れた組（L > H）はサーバーが拒否し、欄の下に理由が出る。
+		await thresholds.getByLabel('しきい値 L（下限）', { exact: true }).fill('50');
+		await thresholds.getByLabel('しきい値 H（上限）', { exact: true }).fill('10');
+		await thresholds.getByRole('button', { name: 'しきい値を保存', exact: true }).click();
+		// `validate_thresholds`（crates/banto-tags/src/tag.rs、ChronoGazer も同じ規則）の文言が H 欄に出る。
+		await expect(thresholds.getByText('thresholdL 以上の値にしてください')).toBeVisible();
 
-		// 正しい組で保存する。
-		await detail.getByLabel('しきい値 LL（下下限）', { exact: true }).fill('5');
-		await detail.getByLabel('しきい値 L（下限）', { exact: true }).fill('10');
-		await detail.getByLabel('しきい値 H（上限）', { exact: true }).fill('80');
-		await detail.getByLabel('しきい値 HH（上上限）', { exact: true }).fill('90');
-		await detail.getByRole('button', { name: '保存' }).click();
+		// 正しい組で保存する。案内は「収集を再起動」で反映すること。
+		await thresholds.getByLabel('しきい値 LL（下下限）', { exact: true }).fill('5');
+		await thresholds.getByLabel('しきい値 L（下限）', { exact: true }).fill('10');
+		await thresholds.getByLabel('しきい値 H（上限）', { exact: true }).fill('80');
+		await thresholds.getByLabel('しきい値 HH（上上限）', { exact: true }).fill('90');
+		await thresholds.getByRole('button', { name: 'しきい値を保存', exact: true }).click();
+		await expect(page.getByText('しきい値を保存しました')).toBeVisible();
+
+		// タグの定義だけを保存しても、しきい値は消えない（別の保存）。
+		await detail.getByLabel('単位', { exact: true }).fill('kPa');
+		await detail.getByRole('button', { name: '保存', exact: true }).click();
 		await expect(page.getByText('更新しました')).toBeVisible();
 
-		// 再読み込みしても、行を選び直しても値が残る（更新でしきい値が消えない）。
+		// 再読み込みしても、行を選び直しても値が残る。
 		await page.reload();
 		await section
 			.locator('div.list')
 			.getByRole('gridcell', { name: TAG_NAME, exact: true })
 			.click();
-		await expect(detail.getByLabel('しきい値 LL（下下限）', { exact: true })).toHaveValue('5');
-		await expect(detail.getByLabel('しきい値 L（下限）', { exact: true })).toHaveValue('10');
-		await expect(detail.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('80');
-		await expect(detail.getByLabel('しきい値 HH（上上限）', { exact: true })).toHaveValue('90');
+		await expect(thresholds.getByLabel('しきい値 LL（下下限）', { exact: true })).toHaveValue('5');
+		await expect(thresholds.getByLabel('しきい値 L（下限）', { exact: true })).toHaveValue('10');
+		await expect(thresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('80');
+		await expect(thresholds.getByLabel('しきい値 HH（上上限）', { exact: true })).toHaveValue('90');
+		await expect(detail.getByLabel('単位', { exact: true })).toHaveValue('kPa');
 	});
 
-	test('5c. 別の画面が先に更新したタグを古い版で保存すると、再読み込みを促す案内が出て上書きされない（#525）', async ({
+	test('5c. 別の画面が先に保存したしきい値を古い版で保存すると、再読み込みを促す案内が出て上書きされない（#525 / #532）', async ({
 		browser
 	}) => {
 		const section = page.locator('section.registry-section').nth(2);
-		const detail = section.locator('div.detail');
-		// 1 枚目の画面で編集フォームを開いたまま（この時点の版を持っている）。
-		await expect(
-			detail.getByRole('heading', { level: 4, name: `${TAG_NAME} を編集` })
-		).toBeVisible();
+		const thresholds = section.locator('div.detail div.thresholds-pane');
+		// 1 枚目の画面でしきい値のフォームを開いたまま（この時点の版を持っている）。
+		await expect(thresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('80');
 
-		// 2 枚目の画面が先に H を 85 へ更新する。
+		// 2 枚目の画面が先に H を 85 へ保存する。
 		const other = await browser.newPage();
 		try {
 			await login(other, ADMIN_USERNAME, ADMIN_PASSWORD);
@@ -213,17 +226,20 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 				.locator('div.list')
 				.getByRole('gridcell', { name: TAG_NAME, exact: true })
 				.click();
-			const otherDetail = otherSection.locator('div.detail');
-			await otherDetail.getByLabel('しきい値 H（上限）', { exact: true }).fill('85');
-			await otherDetail.getByRole('button', { name: '保存' }).click();
-			await expect(other.getByText('更新しました')).toBeVisible();
+			const otherThresholds = otherSection.locator('div.detail div.thresholds-pane');
+			await expect(otherThresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue(
+				'80'
+			);
+			await otherThresholds.getByLabel('しきい値 H（上限）', { exact: true }).fill('85');
+			await otherThresholds.getByRole('button', { name: 'しきい値を保存', exact: true }).click();
+			await expect(other.getByText('しきい値を保存しました')).toBeVisible();
 		} finally {
 			await other.close();
 		}
 
 		// 1 枚目が古い版のまま H を 88 にして保存 -> 拒否される。
-		await detail.getByLabel('しきい値 H（上限）', { exact: true }).fill('88');
-		await detail.getByRole('button', { name: '保存' }).click();
+		await thresholds.getByLabel('しきい値 H（上限）', { exact: true }).fill('88');
+		await thresholds.getByRole('button', { name: 'しきい値を保存', exact: true }).click();
 		await expect(page.getByText('先に更新しました')).toBeVisible();
 
 		// 先に保存された 85 が残っている（88 で上書きされていない）。
@@ -232,7 +248,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 			.locator('div.list')
 			.getByRole('gridcell', { name: TAG_NAME, exact: true })
 			.click();
-		await expect(detail.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('85');
+		await expect(thresholds.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('85');
 	});
 
 	test('6. スケーリングを部分指定（生値下限だけ）で作成しようとすると、理由が画面に見える', async () => {

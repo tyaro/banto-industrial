@@ -40,11 +40,16 @@
  */
 import { niceTicks, type GaugeThresholds } from '@banto/charts';
 import type { Tag } from '../banto/tagRegistryAdmin';
+import type {
+	TagWithThresholds,
+	ThresholdFields as TagThresholdFields
+} from '../banto/tagThresholdsAdmin';
 import { formatValue, type PenView, type ThresholdLevel } from './monitorLogic';
 
 // --- レンジ ----------------------------------------------------------------
 
-type RangeFields = Pick<Tag, 'engLo' | 'engHi' | 'thresholdLl' | 'thresholdHh'>;
+type RangeFields = Pick<Tag, 'engLo' | 'engHi'> &
+	Pick<TagThresholdFields, 'thresholdLl' | 'thresholdHh'>;
 
 /** バー・計器のレンジ。 */
 export type MeterRange =
@@ -136,7 +141,7 @@ function nextDown(x: number): number {
 	return view.getFloat64(0);
 }
 
-type ThresholdFields = Pick<Tag, 'thresholdH' | 'thresholdHh' | 'thresholdL' | 'thresholdLl'>;
+type ThresholdFields = TagThresholdFields;
 
 /**
  * banto の `Gauge` に渡すしきい値（純関数）。H → `warning`、HH → `danger`、
@@ -366,7 +371,10 @@ export function meterView(
 }
 
 /** グループの全ペンのバー・計器の表示（純関数）。 */
-export function meterViews(pens: readonly PenView[], tags: readonly Tag[]): MeterView[] {
+export function meterViews(
+	pens: readonly PenView[],
+	tags: readonly TagWithThresholds[]
+): MeterView[] {
 	return pens.map((pen) =>
 		meterView(
 			pen,

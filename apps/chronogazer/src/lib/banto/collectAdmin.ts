@@ -224,6 +224,12 @@ export interface CollectEventRow {
 	/** `H`/`HH`/`L`/`LL`（`threshold_*` だけ）。 */
 	level: string | null;
 	value: number | null;
+	/**
+	 * #532: 判定に使ったしきい値（その段の値。`threshold_*` だけ。`threshold_cleared`
+	 * では離れた段の値）。しきい値は後から変えられるので、記録の時点の値を残す。
+	 * #532 より前に記録された行は `null`。
+	 */
+	limitValue: number | null;
 }
 
 /**
@@ -1135,4 +1141,27 @@ const eventKindLabels: Record<string, string> = {
 
 export function eventKindLabel(kind: string): string {
 	return eventKindLabels[kind] ?? kind;
+}
+
+/**
+ * イベント一覧の「水準」列の文言（#532、純関数）。しきい値のイベントは、判定に
+ * 使ったしきい値を添える: 超過は `H 80 以上` / `L 10 以下`（上側は `>=`、下側は
+ * `<=` で判定する - `banto-collect` の `classify_threshold`）、復帰は
+ * `H 80 から復帰`。しきい値が記録されていない行（#532 より前）は段の名前だけ。
+ * 段の無いイベントは `-`。
+ */
+export function eventLevelLabel(
+	row: Pick<CollectEventRow, 'kind' | 'level' | 'limitValue'>
+): string {
+	if (row.level === null) return '-';
+	if (row.limitValue === null || !Number.isFinite(row.limitValue)) return row.level;
+	const limit = `${row.level} ${row.limitValue}`;
+	switch (row.kind) {
+		case 'threshold_entered':
+			return `${limit} ${row.level === 'H' || row.level === 'HH' ? '以上' : '以下'}`;
+		case 'threshold_cleared':
+			return `${limit} から復帰`;
+		default:
+			return limit;
+	}
 }

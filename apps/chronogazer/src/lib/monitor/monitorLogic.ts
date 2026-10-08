@@ -21,7 +21,9 @@
  *
  * ## しきい値（Q5）
  *
- * タグに**今登録されている**しきい値で、画面側で判定する。判定の向きと優先順位は
+ * **記録計の側のタグごとの設定**（#532。`tagThresholdsAdmin.ts`、タグ定義の属性では
+ * ない）に今登録されているしきい値で、画面側で判定する。設定の無いタグは判定しない
+ * （色も文字も出さない）。判定の向きと優先順位は
  * 収集のしきい値イベント（`crates/banto-collect/src/task.rs` の
  * `classify_threshold`）と同じ: 上側が下側より優先、HH/LL が H/L より優先、
  * 上側は `>=`、下側は `<=`。色だけで伝えない（パネルは文言も出す）。
@@ -34,6 +36,12 @@
 import { qualityLabel, type CurrentSampleView } from '../banto/collectAdmin';
 import type { DisplayGroup, DisplayKind } from '../banto/displayGroupsAdmin';
 import type { CollectionGroup, Tag } from '../banto/tagRegistryAdmin';
+import {
+	withThresholds,
+	type TagThresholds as TagThresholdRow,
+	type TagWithThresholds,
+	type ThresholdFields
+} from '../banto/tagThresholdsAdmin';
 
 // --- グループの並びと選択 ----------------------------------------------------
 
@@ -206,7 +214,7 @@ export function formatValue(value: number, decimals: number): string {
 	return Number(text) === 0 ? (0).toFixed(digits) : text;
 }
 
-type TagThresholds = Pick<Tag, 'thresholdH' | 'thresholdHh' | 'thresholdL' | 'thresholdLl'>;
+type TagThresholds = ThresholdFields;
 
 /**
  * しきい値の判定（純関数）。`classify_threshold`（収集のしきい値イベント）と同じ
@@ -345,7 +353,7 @@ export function penView(
 export function groupPenViews(
 	group: Pick<DisplayGroup, 'pens'>,
 	values: Readonly<Record<string, CurrentSampleView>> | null,
-	tags: readonly Tag[]
+	tags: readonly TagWithThresholds[]
 ): PenView[] {
 	if (values === null) return [];
 	return group.pens.map((pen, index) =>
@@ -385,4 +393,80 @@ export function valuesStaleNote(
 ): string {
 	if (lastOkAt === null) return '現在値を取得できていません（まだ一度も取得できていません）。';
 	return `現在値を取得できていません。下の表示は${timeLabel(lastOkAt)}に取得したもので、最新ではありません。`;
+}
+
+// --- タグ情報としきい値の読み込み（#532 のレビュー P2） ---------------------------
+
+/** 1 つの読み込みの結果（成功なら値、失敗なら理由の文字列）。 */
+export type LoadResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
+/**
+ * 監視画面が持つタグ情報としきい値。**2 つは別の失敗の軸**で、片方が読めなくても
+ * もう片方は使う（`Promise.all` で 1 つにまとめると、しきい値だけの失敗でタグの
+ * 名前・単位・小数桁まで捨ててしまう）。
+ */
+export interface TagMetaState {
+	tags: Tag[];
+	collectionGroups: CollectionGroup[];
+	/** 判定に使うしきい値。読めなかったときは空（= 判定しない）で、前の値を残さない。 */
+	thresholds: TagThresholdRow[];
+	tagsError: string | null;
+	thresholdsError: string | null;
+}
+
+export const INITIAL_TAG_META: TagMetaState = {
+	tags: [],
+	collectionGroups: [],
+	thresholds: [],
+	tagsError: null,
+	thresholdsError: null
+};
+
+/**
+ * 読み込みの結果を状態に当てる（純関数）。
+ *
+ * - タグ情報（タグ + 収集グループ）: 読めたら置き換える。読めなかったら前に読めた
+ *   ものを残す（名前・単位・小数桁は古くても無いより正しい）。
+ * - しきい値: 読めたら置き換える。**読めなかったら空にする**（古いしきい値で色分け・
+ *   判定を続けると、設定を変えた後も古い判定を正しいように見せてしまう）。
+ */
+export function applyTagMetaLoad(
+	prev: TagMetaState,
+	meta: LoadResult<{ tags: Tag[]; collectionGroups: CollectionGroup[] }>,
+	thresholds: LoadResult<TagThresholdRow[]>
+): TagMetaState {
+	return {
+		tags: meta.ok ? meta.value.tags : prev.tags,
+		collectionGroups: meta.ok ? meta.value.collectionGroups : prev.collectionGroups,
+		tagsError: meta.ok ? null : meta.error,
+		thresholds: thresholds.ok ? thresholds.value : [],
+		thresholdsError: thresholds.ok ? null : thresholds.error
+	};
+}
+
+/** 判定・描画に使うタグ（しきい値を添えた形）。 */
+export function tagsForDisplay(state: TagMetaState): TagWithThresholds[] {
+	return withThresholds(state.tags, state.thresholds);
+}
+
+/**
+ * 読めなかったときの注記（純関数）。出す順に並べる。タグ情報は、まだ一度も読めて
+ * いなければ従来の文言、前に読めたものを使っているならそう書く。しきい値は別の
+ * 一文（色分け・判定をしていないことを言う）。
+ */
+export function tagMetaNotices(state: TagMetaState): string[] {
+	const notices: string[] = [];
+	if (state.tagsError !== null) {
+		notices.push(
+			state.tags.length === 0
+				? `タグの情報を読み込めませんでした（${state.tagsError}）。単位・小数桁・しきい値なしで表示しています。`
+				: `タグの情報を読み直せませんでした（${state.tagsError}）。前に読めたタグの情報で表示しています。`
+		);
+	}
+	if (state.thresholdsError !== null) {
+		notices.push(
+			`しきい値を読み込めませんでした（${state.thresholdsError}）。色分け・しきい値の判定なしで表示しています。`
+		);
+	}
+	return notices;
 }

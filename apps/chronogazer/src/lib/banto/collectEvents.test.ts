@@ -62,7 +62,8 @@ function row(id: number): CollectEventRow {
 		connectionKey: 'conn:1',
 		tagKey: null,
 		level: null,
-		value: null
+		value: null,
+		limitValue: null
 	};
 }
 

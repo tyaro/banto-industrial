@@ -13,7 +13,9 @@
 import { gaugeColorVar } from '@banto/charts';
 import { describe, expect, it } from 'vitest';
 import type { CurrentSampleView } from '../banto/collectAdmin';
-import type { Tag } from '../banto/tagRegistryAdmin';
+// #532: しきい値はタグではなく記録計の側の設定。画面はタグにしきい値を添えた形
+// （`withThresholds`）で判定するので、テストもその形で組む。
+import type { TagWithThresholds as Tag } from '../banto/tagThresholdsAdmin';
 import {
 	OVER_RANGE_LABEL,
 	RANGE_NO_TAG_MESSAGE,

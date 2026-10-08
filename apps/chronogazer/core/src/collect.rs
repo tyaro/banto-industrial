@@ -74,7 +74,9 @@
 //! 接続も含めて何も収集されなかった（docs/implementation-checklist.md §5
 //! 「1 件の事故で全体を止めない」）。
 //!
-//! * 組み立ては `banto_collect::build_config_lenient_from`。不正な接続は
+//! * 組み立ては `banto_collect::build_config_lenient_with_thresholds`（#532 で
+//!   `build_config_lenient_from` から替えた。解釈器は同じで、しきい値だけを
+//!   タグの列ではなく記録計の側の設定 `crate::tag_thresholds` から渡す）。不正な接続は
 //!   配下のグループ・タグごと、不正なグループは配下のタグごと、不正なタグは
 //!   その 1 本だけを外し、外した一覧（[`ExclusionView`]）を返す。
 //!   **banto-hub が使う厳格版は変えていない**（厳格版は「緩い版の最初の除外で
@@ -394,7 +396,7 @@
 //! | [`CurrentSampleView`] | 値・`ptimeMs`・品質（`good`/`bad`/`stale`、#414 段階2 で外したタグの `invalid`）・`lastGoodMs`（#531） | 無し（`banto_collect::CurrentSample` の全部。機微なものが無い） |
 //! | [`ExclusionView`]（#414 段階2、状態の `exclusions`） | 単位・行 id・キー・名前・理由の分類と文言 | 無し（元の `banto_collect::ConfigExclusion` にホスト・資格情報・パスが入っていない） |
 //! | [`ConnectionView`]（[`ConnectionStatusView`] + `simulation`） | `connected` / `reconnecting`（`attempt`）/ `stopped`、走っている収集がその接続をシミュレータ相手に動かしているか（#413） | 無し（接続先ホスト・ポートはそもそもこの型に無い。`simulation` は真偽 1 つで、同じ値はレジストリの一覧でも viewer に読める） |
-//! | [`CollectEventRow`] | `id`・`tsMs`・`kind`・`connectionKey`・`tagKey`・`level`・`value` | **`detail`（自由文）** |
+//! | [`CollectEventRow`] | `id`・`tsMs`・`kind`・`connectionKey`・`tagKey`・`level`・`value`・`limitValue`（#532） | **`detail`（自由文）** |
 //!
 //! 地図の鍵（`conn:<id>` / `tag:<id>`）は**そのまま載せる** - これは
 //! レジストリの行 id であって接続先の情報ではなく、画面がタグ名・接続名と
@@ -541,8 +543,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_collect::{
-    build_config_lenient_from, config_exclusions, ClientFactory, CollectError, CollectEvent,
-    Collector, CollectorOptions, ConfigExclusion, ConnectionStatus, CurrentReading,
+    build_config_lenient_with_thresholds, config_exclusions, ClientFactory, CollectError,
+    CollectEvent, Collector, CollectorOptions, ConfigExclusion, ConnectionStatus, CurrentReading,
     CurrentValuesHandle, EventSink, ExclusionUnit, Quality, RegistrySnapshot,
 };
 use banto_core::{BantoError, ListParams};
@@ -1181,7 +1183,8 @@ fn simulated_connection_keys(snapshot: &RegistrySnapshot) -> HashSet<String> {
 ///
 /// 列は `crates/banto-collect/migrations/0001_collect_events.sql` のとおり
 /// （`id` / `ts` / `kind` / `connection_key` / `tag_key` / `level` / `value` /
-/// `detail`）で、**`detail` だけを落としている** - 理由はこのモジュールの doc
+/// `detail`）に、#532 で `banto_collect::migrate` が足した `limit_value` を加えたもので、
+/// **`detail` だけを落としている** - 理由はこのモジュールの doc
 /// 「公開用の型 - 何を載せ、何を落としたか」（自由文で、接続先やファイルパスを
 /// 含みうる）。落とすのは型だけでなく
 /// [`CollectorService::events`] の **SQL でも**（`SELECT` に `detail` が無い）。
@@ -1208,6 +1211,9 @@ pub struct CollectEventRow {
     pub level: Option<String>,
     /// しきい値を跨いだ値（`threshold_*` だけ）。
     pub value: Option<f64>,
+    /// 判定に使ったしきい値（その段の値。`threshold_*` だけ。#532）。
+    /// `threshold_cleared` では離れた段の値。#532 より前に記録された行は `None`。
+    pub limit_value: Option<f64>,
 }
 
 /// イベント一覧の 1 ページ分の要求。
@@ -2007,7 +2013,7 @@ impl CollectorService {
                 .unwrap_or(0),
         };
         let rows = sqlx::query_as::<_, CollectEventRow>(
-            "SELECT id, ts AS ts_ms, kind, connection_key, tag_key, level, value \
+            "SELECT id, ts AS ts_ms, kind, connection_key, tag_key, level, value, limit_value \
              FROM collect_events WHERE id <= ? ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(as_of_id)
@@ -2327,11 +2333,21 @@ impl Lifecycle {
             Ok(snapshot) => snapshot,
             Err(err) => return Err(self.fail_start(err)),
         };
+        // #532（2026-10-08 オーナー決定）: しきい値はタグ定義の列ではなく、記録計の
+        // 側のタグごとの設定（`crate::tag_thresholds`）から読む。**開始の時点の**
+        // 設定で判定する（保存しても走っている収集には反映されず、「収集を再起動」で
+        // 反映 - タグの保存と同じ約束）。読めなければ開始の失敗にする（しきい値を
+        // 黙って外して動かすと、警報が出ないことに気付けない）。
+        let thresholds = match crate::tag_thresholds::collect_thresholds(&self.ctx.pool).await {
+            Ok(thresholds) => thresholds,
+            Err(err) => return Err(self.fail_start(CollectError::Registry(err))),
+        };
         // #414 段階2（2026-09-23 オーナー決定）: 不正な接続・グループ・タグは
         // **外して残りを動かす**。組み立て自体はもう失敗しない（外した分は
         // `exclusions` に入る）。banto-hub が使う厳格版 `build_config_from`
-        // は変えていない。
-        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        // は変えていない。除外の判定はしきい値に依らない
+        // （`build_config_lenient_from` と同じ解釈器）。
+        let (config, exclusions) = build_config_lenient_with_thresholds(&snapshot, &thresholds);
         let exclusions = exclusion_views(&exclusions);
 
         // 「収集対象なし」は **`Collector::start` に渡す前に**分岐する。

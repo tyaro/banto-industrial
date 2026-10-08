@@ -33,9 +33,9 @@
 //!   （1..=8、`--banto-chart-N`）。`null` は既定（ペンの位置 + 1 の枠、
 //!   `@banto/charts` の `seriesColorVar(index)` と同じ割り当て）。任意の色コード
 //!   にしないのは、テーマ（ライト / ダーク）に追従させるため。
-//! - **しきい値は持たない**。しきい値はタグ定義の属性（§3.7.1、2026-10-08
-//!   オーナー決定）で、表示グループからは参照するだけ（画面はタグの値を
-//!   読み取り専用で見せる）。
+//! - **しきい値は持たない**。しきい値は記録計の側のタグごとの設定
+//!   （`crate::tag_thresholds`、#532。2026-10-08 オーナー決定）で、表示グループ
+//!   からは参照するだけ（画面はその設定を読み取り専用で見せる）。
 //! - `sortOrder`: 一覧の並び順（昇順、同じ値は `id` 順。0〜[`MAX_SORT_ORDER`]、
 //!   DB の CHECK でも縛る）。作成で省略すると末尾（溢れるなら振り直す）。
 //!   **更新（PUT）の本文の `sortOrder` は無視する** - 並びを変える口は
@@ -779,8 +779,17 @@ impl DisplayGroupService {
             return Err(tag_referenced_error(&referrers));
         }
         tags.delete_tx(&mut tx, tag_id).await?;
+        // #532: 記録計の側のしきい値の行も同じトランザクションで消す（FK は
+        // 張っていない - `0102_recorder_tag_settings.sql` の注記）。
+        crate::tag_thresholds::delete_for_tag_on(&mut tx, tag_id).await?;
         tx.commit().await.map_err(storage)?;
         Ok(())
+    }
+
+    /// この service の pool（#532: `crate::rest::api_router` が、同じ pool の
+    /// `TagThresholdService` を組むのに使う。呼び出し元の引数を増やさないため）。
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 }
 
