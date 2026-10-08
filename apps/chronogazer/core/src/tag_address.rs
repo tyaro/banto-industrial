@@ -55,7 +55,7 @@
 
 use banto_collect::{check_tag_address, TagAddressField, TagAddressIssue};
 use banto_core::{BantoError, FieldError, ListParams};
-use banto_tags::{CollectionGroupService, PlcConnectionService, Tag, TagService};
+use banto_tags::{CollectionGroupService, PlcConnectionService, Tag, TagService, TagUpdateError};
 
 /// プロトコル変更の拒否メッセージに名前を並べるタグの上限。これを超えた分は
 /// 「ほか N 件」にまとめる（1 件ずつ全部並べるとトーストが読めなくなる）。
@@ -261,6 +261,49 @@ pub async fn ensure_tag_update_fits_its_connection(
         after.data_type,
     )
     .await
+}
+
+/// 楽観ロック（`expectedRevision`）が食い違ったときにフォームへ出すフィールド名。
+pub const REVISION_CONFLICT_FIELD: &str = "expectedRevision";
+
+/// 版の食い違いの案内（画面にそのまま出る）。
+pub const REVISION_CONFLICT_MESSAGE: &str =
+    "他の人（または別の画面）がこのタグを先に更新しました。一覧を再読み込みしてから、もう一度編集して保存してください。";
+
+/// 版の食い違いを表すエラー。REST は `409 Conflict`、Tauri は通常の検証エラーと
+/// 同じ形（`kind: "validation"`）で返し、画面は両経路を同じに扱える。
+pub fn revision_conflict_error() -> BantoError {
+    BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: REVISION_CONFLICT_FIELD.to_string(),
+            message: REVISION_CONFLICT_MESSAGE.to_string(),
+        }],
+    }
+}
+
+/// [`revision_conflict_error`] が作ったエラーか（REST が `409` にするための判定）。
+pub fn is_revision_conflict(err: &BantoError) -> bool {
+    matches!(err, BantoError::Validation { field_errors }
+        if field_errors.iter().any(|fe| fe.field == REVISION_CONFLICT_FIELD))
+}
+
+/// タグを更新する（REST・Tauri 共通）。`input.expected_revision` が `Some` で
+/// 他者が先に更新していたら、[`revision_conflict_error`] を返す（REST は 409）。
+///
+/// 判定は `TagService::update_checked`（`update_tx` を自前のトランザクションで
+/// 実行する）が返す構造化エラーに従う。更新の結果そのもので分類するので、
+/// 失敗後に読み直す間に別の要求が割り込む余地が無い（削除されていれば
+/// `NotFound`、404 のまま）。
+pub async fn update_tag_checked(
+    tags: &TagService,
+    id: i64,
+    input: banto_tags::TagInput,
+) -> Result<Tag, BantoError> {
+    match tags.update_checked(id, input).await {
+        Ok(tag) => Ok(tag),
+        Err(TagUpdateError::RevisionConflict(_)) => Err(revision_conflict_error()),
+        Err(TagUpdateError::Banto(err)) => Err(err),
+    }
 }
 
 /// 接続の更新の前に呼ぶ: プロトコルが変わるなら、この接続の下の全タグ

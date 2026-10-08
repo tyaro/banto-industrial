@@ -56,6 +56,10 @@
  *    作るタグのアドレスも Modbus の参照番号（`40001`/`40011`）にしてある
  *    （テストの意図 = CRUD とスケーリングの検証エラーの表示は変わらない）。
  *    テスト `6b.` で固定する。
+ * 9.（#525）タグのしきい値（LL/L/H/HH）を画面から設定でき、再読み込みしても
+ *    残ること、大小関係が崩れると理由が欄に出ること（`5b.`）。別の画面が先に
+ *    更新したタグを古い版で保存すると、再読み込みを促す案内が出て上書き
+ *    されないこと（楽観ロック、`5c.`）。
  *
  * ファイル名について: `smoke.spec.ts` が初回セットアップ（管理者アカウント
  * 作成）を実 DOM で行うため、このファイルは辞書順でそれより後でなければ
@@ -149,6 +153,86 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await form.getByLabel('デバイスアドレス').fill('40001');
 		await form.getByRole('button', { name: '作成' }).click();
 		await expect(section.locator('div.list').getByText(TAG_NAME)).toBeVisible();
+	});
+
+	test('5b. タグにしきい値を設定して保存でき、再読み込みしても残る。大小関係が崩れると理由が欄に出る（#525）', async () => {
+		const section = page.locator('section.registry-section').nth(2);
+		await section
+			.locator('div.list')
+			.getByRole('gridcell', { name: TAG_NAME, exact: true })
+			.click();
+		const detail = section.locator('div.detail');
+		await expect(
+			detail.getByRole('heading', { level: 4, name: `${TAG_NAME} を編集` })
+		).toBeVisible();
+
+		// 大小関係が崩れた組（L > H）はサーバー（banto-tags）が拒否し、欄の下に理由が出る。
+		await detail.getByLabel('しきい値 L（下限）', { exact: true }).fill('50');
+		await detail.getByLabel('しきい値 H（上限）', { exact: true }).fill('10');
+		await detail.getByRole('button', { name: '保存' }).click();
+		// `validate_thresholds`（crates/banto-tags/src/tag.rs）の文言が H 欄に出る。
+		await expect(detail.getByText('thresholdL 以上の値にしてください')).toBeVisible();
+
+		// 正しい組で保存する。
+		await detail.getByLabel('しきい値 LL（下下限）', { exact: true }).fill('5');
+		await detail.getByLabel('しきい値 L（下限）', { exact: true }).fill('10');
+		await detail.getByLabel('しきい値 H（上限）', { exact: true }).fill('80');
+		await detail.getByLabel('しきい値 HH（上上限）', { exact: true }).fill('90');
+		await detail.getByRole('button', { name: '保存' }).click();
+		await expect(page.getByText('更新しました')).toBeVisible();
+
+		// 再読み込みしても、行を選び直しても値が残る（更新でしきい値が消えない）。
+		await page.reload();
+		await section
+			.locator('div.list')
+			.getByRole('gridcell', { name: TAG_NAME, exact: true })
+			.click();
+		await expect(detail.getByLabel('しきい値 LL（下下限）', { exact: true })).toHaveValue('5');
+		await expect(detail.getByLabel('しきい値 L（下限）', { exact: true })).toHaveValue('10');
+		await expect(detail.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('80');
+		await expect(detail.getByLabel('しきい値 HH（上上限）', { exact: true })).toHaveValue('90');
+	});
+
+	test('5c. 別の画面が先に更新したタグを古い版で保存すると、再読み込みを促す案内が出て上書きされない（#525）', async ({
+		browser
+	}) => {
+		const section = page.locator('section.registry-section').nth(2);
+		const detail = section.locator('div.detail');
+		// 1 枚目の画面で編集フォームを開いたまま（この時点の版を持っている）。
+		await expect(
+			detail.getByRole('heading', { level: 4, name: `${TAG_NAME} を編集` })
+		).toBeVisible();
+
+		// 2 枚目の画面が先に H を 85 へ更新する。
+		const other = await browser.newPage();
+		try {
+			await login(other, ADMIN_USERNAME, ADMIN_PASSWORD);
+			await other.goto('/tags');
+			const otherSection = other.locator('section.registry-section').nth(2);
+			await otherSection
+				.locator('div.list')
+				.getByRole('gridcell', { name: TAG_NAME, exact: true })
+				.click();
+			const otherDetail = otherSection.locator('div.detail');
+			await otherDetail.getByLabel('しきい値 H（上限）', { exact: true }).fill('85');
+			await otherDetail.getByRole('button', { name: '保存' }).click();
+			await expect(other.getByText('更新しました')).toBeVisible();
+		} finally {
+			await other.close();
+		}
+
+		// 1 枚目が古い版のまま H を 88 にして保存 -> 拒否される。
+		await detail.getByLabel('しきい値 H（上限）', { exact: true }).fill('88');
+		await detail.getByRole('button', { name: '保存' }).click();
+		await expect(page.getByText('先に更新しました')).toBeVisible();
+
+		// 先に保存された 85 が残っている（88 で上書きされていない）。
+		await page.reload();
+		await section
+			.locator('div.list')
+			.getByRole('gridcell', { name: TAG_NAME, exact: true })
+			.click();
+		await expect(detail.getByLabel('しきい値 H（上限）', { exact: true })).toHaveValue('85');
 	});
 
 	test('6. スケーリングを部分指定（生値下限だけ）で作成しようとすると、理由が画面に見える', async () => {

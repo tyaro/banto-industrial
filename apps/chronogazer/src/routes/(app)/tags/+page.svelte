@@ -95,7 +95,6 @@
 		type CollectionGroup,
 		type CollectionGroupInput,
 		type Tag,
-		type TagInput,
 		type TagDataType,
 		type SimulationCoverageEntry,
 		type ExclusionView
@@ -112,6 +111,9 @@
 		listRows,
 		createFormGate,
 		runGuardedListLoad,
+		buildTagInput,
+		tagFormValues,
+		isRevisionConflict,
 		connectionModeLabel,
 		connectionSavedMessage,
 		unmovingSimulationTags,
@@ -839,45 +841,15 @@
 				// クライアントを通った値がサーバーで人間可読エラーとして
 				// 跳ね返るだけの手戻りになる）。
 				{ name: `${prefix}Decimals`, label: '小数桁', type: 'number', min: 0, max: 6, default: 0 },
+				// #525: しきい値はタグ定義の属性（recorder-requirements §3.7）。空欄 =
+				// 設定なし。大小関係（LL <= L <= H <= HH）はサーバー（banto-tags）が
+				// 検証し、各欄のすぐ下に出る。
+				{ name: `${prefix}ThresholdLl`, label: 'しきい値 LL（下下限）', type: 'number' },
+				{ name: `${prefix}ThresholdL`, label: 'しきい値 L（下限）', type: 'number' },
+				{ name: `${prefix}ThresholdH`, label: 'しきい値 H（上限）', type: 'number' },
+				{ name: `${prefix}ThresholdHh`, label: 'しきい値 HH（上上限）', type: 'number' },
 				{ name: `${prefix}Enabled`, label: '有効', type: 'checkbox', default: true }
 			]
-		};
-	}
-
-	function toTagInput(prefix: string, values: Record<string, unknown>): TagInput {
-		const numOrNull = (v: unknown): number | null => (typeof v === 'number' ? v : null);
-		const rawUnit = values[`${prefix}Unit`];
-		const unit = typeof rawUnit === 'string' ? rawUnit.trim() : '';
-		const collectionGroupId = values[`${prefix}CollectionGroupId`];
-		const decimals = values[`${prefix}Decimals`];
-		return {
-			name: String(values[`${prefix}Name`] ?? ''),
-			collectionGroupId: typeof collectionGroupId === 'number' ? collectionGroupId : 0,
-			address: String(values[`${prefix}Address`] ?? ''),
-			dataType: (values[`${prefix}DataType`] as TagDataType) ?? 'i16',
-			rawLo: numOrNull(values[`${prefix}RawLo`]),
-			rawHi: numOrNull(values[`${prefix}RawHi`]),
-			engLo: numOrNull(values[`${prefix}EngLo`]),
-			engHi: numOrNull(values[`${prefix}EngHi`]),
-			unit: unit === '' ? null : unit,
-			decimals: typeof decimals === 'number' ? decimals : 0,
-			enabled: Boolean(values[`${prefix}Enabled`])
-		};
-	}
-
-	function tagFormValues(prefix: string, tag: Tag): Record<string, unknown> {
-		return {
-			[`${prefix}Name`]: tag.name,
-			[`${prefix}CollectionGroupId`]: tag.collectionGroupId,
-			[`${prefix}Address`]: tag.address,
-			[`${prefix}DataType`]: tag.dataType,
-			[`${prefix}RawLo`]: tag.rawLo,
-			[`${prefix}RawHi`]: tag.rawHi,
-			[`${prefix}EngLo`]: tag.engLo,
-			[`${prefix}EngHi`]: tag.engHi,
-			[`${prefix}Unit`]: tag.unit,
-			[`${prefix}Decimals`]: tag.decimals,
-			[`${prefix}Enabled`]: tag.enabled
 		};
 	}
 
@@ -928,7 +900,7 @@
 	async function handleCreateTag(values: Record<string, unknown>): Promise<void> {
 		creatingTag = true;
 		try {
-			await createTag(toTagInput(TAG_CREATE, values));
+			await createTag(buildTagInput(TAG_CREATE, values));
 			toastStore.push('success', '作成しました');
 			createTagStore = createFormStore(tagSchema(TAG_CREATE));
 			await reloadTags();
@@ -995,7 +967,10 @@
 		try {
 			const outcome = await runGuardedSave(
 				pending,
-				updateTag(selectedTag.id, toTagInput(TAG_EDIT, editTagStore.values)),
+				updateTag(
+					selectedTag.id,
+					buildTagInput(TAG_EDIT, editTagStore.values, selectedTag.revision)
+				),
 				() => ({ id: selectedTag?.id, store: editTagStore })
 			);
 			switch (outcome.kind) {
@@ -1010,6 +985,10 @@
 					break;
 				case 'error':
 					applyServerErrors(TAG_EDIT, TAG_WIRE_FIELDS, outcome.err, editTagStore);
+					// #525: 他者が先に更新していた。案内はトーストに出ている（`expectedRevision`
+					// はフォームの項目ではない）。一覧を最新にして、入力中の値は消さない
+					// （再読込後に行を選び直すと最新の版で編集できる）。
+					if (isRevisionConflict(outcome.err)) await reloadTags();
 					break;
 				case 'stale-error':
 					break;

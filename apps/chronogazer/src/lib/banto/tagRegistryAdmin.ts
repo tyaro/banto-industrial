@@ -135,10 +135,23 @@ export interface Tag {
 	engHi: number | null;
 	unit: string | null;
 	decimals: number;
+	/** #525: しきい値（タグ定義の属性、`null` = 設定なし）。 */
+	thresholdH: number | null;
+	thresholdHh: number | null;
+	thresholdL: number | null;
+	thresholdLl: number | null;
 	enabled: boolean;
+	/** #525: 楽観ロック用の版。更新のたびに +1 される（更新時は `TagInput.expectedRevision` に載せる）。 */
+	revision: number;
 }
 
-/** Mirrors `chronogazer_core::rest::TagPayload`. */
+/**
+ * Mirrors `chronogazer_core::rest::TagPayload`。
+ *
+ * `PUT` は**置換**: しきい値を省略（`undefined`）または `null` で送ると、既存の
+ * しきい値は消える（banto-hub の `PUT` と同じ）。更新では常に今の値を送ること
+ * （`tagsPageLogic.ts` の `buildTagInput` は全 4 項目を必ず載せる）。
+ */
 export interface TagInput {
 	name: string;
 	collectionGroupId: number;
@@ -150,7 +163,13 @@ export interface TagInput {
 	engHi?: number | null;
 	unit?: string | null;
 	decimals: number;
+	thresholdH?: number | null;
+	thresholdHh?: number | null;
+	thresholdL?: number | null;
+	thresholdLl?: number | null;
 	enabled: boolean;
+	/** #525: 更新のとき、編集を始めた時点の `Tag.revision`。他者が先に更新していれば `409`（`expectedRevision` の検証エラー）で拒否される。省略すると版を確かめない。 */
+	expectedRevision?: number;
 }
 
 // --- environment/error plumbing (usersAdmin.ts と同じ作法) ------------------
