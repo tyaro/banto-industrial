@@ -96,12 +96,25 @@ pub fn plan_prune(
     retention_days: u32,
     today: LocalDate,
 ) -> Result<PruneReport, TstoreError> {
+    plan_prune_excluding(data_dir, retention_days, today, &[])
+}
+
+/// [`plan_prune`] with `pinned` dates that are always classified as "kept"
+/// regardless of age (#538: a file a live [`crate::writer::TsWriter`] still
+/// holds open, or still has unflushed buffered rows for, must not be
+/// deleted - see [`crate::writer::TsWriter::prune_files`]).
+pub(crate) fn plan_prune_excluding(
+    data_dir: &Path,
+    retention_days: u32,
+    today: LocalDate,
+    pinned: &[LocalDate],
+) -> Result<PruneReport, TstoreError> {
     let mut report = PruneReport::default();
     let today_days = today.to_days_since_epoch();
 
     for file in list_data_files(data_dir)? {
         let age_days = today_days - file.date.to_days_since_epoch();
-        if age_days > retention_days as i64 {
+        if age_days > retention_days as i64 && !pinned.contains(&file.date) {
             report.deleted.push(file.path);
         } else {
             report.kept.push(file.path);
@@ -146,7 +159,17 @@ pub fn prune_files(
     retention_days: u32,
     today: LocalDate,
 ) -> Result<PruneReport, TstoreError> {
-    let plan = plan_prune(data_dir, retention_days, today)?;
+    prune_files_excluding(data_dir, retention_days, today, &[])
+}
+
+/// [`prune_files`] that never deletes a file dated in `pinned`.
+pub(crate) fn prune_files_excluding(
+    data_dir: &Path,
+    retention_days: u32,
+    today: LocalDate,
+    pinned: &[LocalDate],
+) -> Result<PruneReport, TstoreError> {
+    let plan = plan_prune_excluding(data_dir, retention_days, today, pinned)?;
     for path in &plan.deleted {
         fs::remove_file(path)?;
     }

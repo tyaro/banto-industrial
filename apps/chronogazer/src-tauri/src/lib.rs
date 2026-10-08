@@ -4070,18 +4070,16 @@ pub fn run() {
             // **相対パスはこのアプリのデータディレクトリ基準**で解決する
             // （既定 `"./data"` をそのまま使うと、プロセスの作業ディレクトリ
             // という当てにならない場所に時系列ファイルを作ってしまう）。
-            // `retention.days` はここでは読まない - **収集はファイルを一切
-            // 削除しない**（`chronogazer_core::settings::StoreSettings` の
-            // doc 参照）。
+            // `retention.days` は収集では読まない - 古いファイルの削除は
+            // `chronogazer_core::retention`（下の spawn。#538）が、掃除のたびに
+            // 設定から読み直して行う。
             //
             // 開始は下の `autostart` まで待つ（`AppState` の他の材料が
             // 揃ってから、ランタイムの上で spawn したいため）。
             let store_settings = tauri::async_runtime::block_on(store_config(&settings))
                 .expect("store_config should succeed");
-            let collect = CollectorService::new(
-                pool.clone(),
-                resolve_data_dir(&data_dir, &store_settings.data_dir),
-            );
+            let collect_data_dir = resolve_data_dir(&data_dir, &store_settings.data_dir);
+            let collect = CollectorService::new(pool.clone(), collect_data_dir);
             let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
@@ -4277,6 +4275,15 @@ pub fn run() {
                 let collect = collect.clone();
                 tauri::async_runtime::spawn(async move { collect.autostart().await });
             }
+
+            // 保持期間を過ぎた時系列データファイルの削除（#538）。起動時に 1 回、
+            // その後は日付が変わるたびに 1 回。失敗してもログに出すだけで収集は
+            // 止めない。削除は収集サービス経由（書き手が今開いている日付のファイルは
+            // 消さない）。
+            tauri::async_runtime::spawn(chronogazer_core::retention::run(
+                settings.clone(),
+                collect.clone(),
+            ));
 
             // If LAN access was left enabled on a previous run, start the
             // server immediately (spec §11.4) - from here on, the settings
