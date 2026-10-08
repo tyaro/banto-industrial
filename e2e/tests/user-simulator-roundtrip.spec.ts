@@ -668,7 +668,8 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 			expect(body.data[`tag:${legacyTagId}`]).toEqual({
 				value: null,
 				ptimeMs: null,
-				quality: 'invalid'
+				quality: 'invalid',
+				lastGoodMs: null
 			});
 		}).toPass({ timeout: 15_000 });
 	});
@@ -698,7 +699,13 @@ type ValuesReadout =
 			state: 'ready';
 			data: Record<
 				string,
-				{ value: number | null; ptimeMs: number | null; quality: string } | undefined
+				| {
+						value: number | null;
+						ptimeMs: number | null;
+						quality: string;
+						lastGoodMs: number | null;
+				  }
+				| undefined
 			>;
 	  };
 

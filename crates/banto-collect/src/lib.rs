@@ -85,7 +85,9 @@ pub use config::{
     config_exclusions, connections_with_collected_groups, CollectorConfig, ConfigExclusion,
     ExclusionReason, ExclusionUnit, Protocol, RegistrySnapshot, TagAddressField, TagAddressIssue,
 };
-pub use current::{CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR};
+pub use current::{
+    CurrentReading, CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR,
+};
 pub use error::CollectError;
 pub use event::{
     CollectEvent, EventKind, EventSink, ThresholdLevel, DEFAULT_EVENT_CHANNEL_CAPACITY,

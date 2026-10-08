@@ -391,7 +391,7 @@
 //!
 //! | 公開型 | 載せるもの | 落としたもの |
 //! | --- | --- | --- |
-//! | [`CurrentSampleView`] | 値・`ptimeMs`・品質（`good`/`bad`/`stale`、#414 段階2 で外したタグの `invalid`） | 無し（`banto_collect::CurrentSample` の全部。機微なものが無い） |
+//! | [`CurrentSampleView`] | 値・`ptimeMs`・品質（`good`/`bad`/`stale`、#414 段階2 で外したタグの `invalid`）・`lastGoodMs`（#531） | 無し（`banto_collect::CurrentSample` の全部。機微なものが無い） |
 //! | [`ExclusionView`]（#414 段階2、状態の `exclusions`） | 単位・行 id・キー・名前・理由の分類と文言 | 無し（元の `banto_collect::ConfigExclusion` にホスト・資格情報・パスが入っていない） |
 //! | [`ConnectionView`]（[`ConnectionStatusView`] + `simulation`） | `connected` / `reconnecting`（`attempt`）/ `stopped`、走っている収集がその接続をシミュレータ相手に動かしているか（#413） | 無し（接続先ホスト・ポートはそもそもこの型に無い。`simulation` は真偽 1 つで、同じ値はレジストリの一覧でも viewer に読める） |
 //! | [`CollectEventRow`] | `id`・`tsMs`・`kind`・`connectionKey`・`tagKey`・`level`・`value` | **`detail`（自由文）** |
@@ -542,7 +542,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_collect::{
     build_config_lenient_from, config_exclusions, ClientFactory, CollectError, CollectEvent,
-    Collector, CollectorOptions, ConfigExclusion, ConnectionStatus, CurrentSample,
+    Collector, CollectorOptions, ConfigExclusion, ConnectionStatus, CurrentReading,
     CurrentValuesHandle, EventSink, ExclusionUnit, Quality, RegistrySnapshot,
 };
 use banto_core::{BantoError, ListParams};
@@ -1012,7 +1012,8 @@ impl From<Quality> for QualityView {
 /// **品質と時刻を必ず載せる**: 値だけ返すと、画面は「通信エラーで古い値を
 /// 表示し続けている」のか「今読めた値」なのかを言えない
 /// （recorder-requirements.md §3.2 の Stale / Bad 表示）。落としたものは
-/// **無い** - `CurrentSample` は値・時刻・品質しか持たず、機微なものが無い
+/// **無い** - `CurrentSample` は値・時刻・品質しか持たず（#531 で最後に使える
+/// 値を受け取った時刻 `last_good_ms` を足した）、機微なものが無い
 /// （このモジュールの doc「公開用の型」）。
 ///
 /// **非有限の値（NaN・±∞）はここで正規化する** - このモジュールの doc
@@ -1026,13 +1027,22 @@ pub struct CurrentSampleView {
     /// **常に有限**（`is_finite()`）。非有限の値は [`From`] で `None` +
     /// `bad` に正規化されるので、`null` と `good` が同居することはない。
     pub value: Option<f64>,
-    /// このサンプルの時刻（UTC epoch ミリ秒、収集 PC の時計）。
+    /// このサンプルの時刻（UTC epoch ミリ秒、収集 PC の時計）。**読みに行った
+    /// 時刻**で、`bad` でも失敗した読み取りの時刻が入る（切断中は毎周期
+    /// 進む）。「最後に値を受け取った時刻」は [`Self::last_good_ms`]。
     ///
     /// **`invalid` のときだけ `None`**（#414 段階2）: 外したタグは一度も
     /// 読んでいないので、サンプルの時刻が無い。それ以外の品質では必ず
     /// `Some`（収集エンジンのキャッシュの時刻そのまま）。
     pub ptime_ms: Option<i64>,
     pub quality: QualityView,
+    /// **最後に使える値を受け取った時刻**（UTC epoch ミリ秒。#531 レビュー）:
+    /// 品質 good・有限値のサンプルでだけ進み、`bad` の間は止まる
+    /// （`banto_collect::CurrentReading::last_good_ms`）。`None` = 収集を
+    /// 開始してから一度も受け取っていない（`invalid` も `None`）。画面の
+    /// 「最後に受け取った値」はこれだけを使う（`ptimeMs` を使うと、切断中も
+    /// 時刻が進み、一度も読めていないタグも何か受け取ったように見える）。
+    pub last_good_ms: Option<i64>,
 }
 
 impl CurrentSampleView {
@@ -1043,18 +1053,21 @@ impl CurrentSampleView {
             value: None,
             ptime_ms: None,
             quality: QualityView::Invalid,
+            last_good_ms: None,
         }
     }
 }
 
-impl From<&CurrentSample> for CurrentSampleView {
+impl From<&CurrentReading> for CurrentSampleView {
     /// **非有限の値をここで畳む**（#408 レビュー P2-2。理由はこのモジュールの
     /// doc「非有限の浮動小数点は公開する形で正規化する」）。
     ///
     /// `ptime_ms` は**そのまま**残す - 「いつのサンプルか」は値が使えなくても
     /// 正しい情報で、`Quality::Bad` の既存のサンプル（`value: None`）でも
     /// 同じように載せている。
-    fn from(sample: &CurrentSample) -> Self {
+    fn from(reading: &CurrentReading) -> Self {
+        let sample = &reading.sample;
+        let last_good_ms = reading.last_good_ms;
         match sample.value {
             // NaN・+∞・-∞: `serde_json` はこれを `null` にするので、
             // そのまま写すと「**値が無いのに品質は good**」になり、画面が
@@ -1064,11 +1077,13 @@ impl From<&CurrentSample> for CurrentSampleView {
                 value: None,
                 ptime_ms: Some(sample.ptime_ms),
                 quality: QualityView::Bad,
+                last_good_ms,
             },
             _ => Self {
                 value: sample.value,
                 ptime_ms: Some(sample.ptime_ms),
                 quality: sample.quality.into(),
+                last_good_ms,
             },
         }
     }
@@ -1878,7 +1893,7 @@ impl CollectorService {
     pub fn values(&self) -> Readout<HashMap<String, CurrentSampleView>> {
         match self.inner.ctx.current_with_excluded_tags() {
             None => values_readout(None, &[]),
-            Some((handle, excluded)) => values_readout(Some(handle.snapshot()), &excluded),
+            Some((handle, excluded)) => values_readout(Some(handle.snapshot_readings()), &excluded),
         }
     }
 
@@ -2423,7 +2438,7 @@ impl Lifecycle {
 /// 同じキーは来ないが、来ても `invalid` を優先する（設定が不正で読んでいない、
 /// が事実なので）。
 fn values_readout(
-    snapshot: Option<HashMap<String, CurrentSample>>,
+    snapshot: Option<HashMap<String, CurrentReading>>,
     excluded: &[String],
 ) -> Readout<HashMap<String, CurrentSampleView>> {
     match snapshot {
@@ -2530,7 +2545,7 @@ mod tests {
     use super::*;
     use crate::db::init_db_memory;
     use crate::test_support::TempDir;
-    use banto_collect::BackoffConfig;
+    use banto_collect::{BackoffConfig, CurrentSample};
     use banto_plc::{BoxFuture, PlcClient, PlcError, ReadRequest, ReadResult, TagValue};
     use banto_tags::{
         CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
@@ -2540,6 +2555,76 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    /// 現在値の表テスト用: `last_good_ms` を持たない（`None`）読み取りに包む。
+    fn readings(samples: HashMap<String, CurrentSample>) -> HashMap<String, CurrentReading> {
+        samples
+            .into_iter()
+            .map(|(key, sample)| {
+                (
+                    key,
+                    CurrentReading {
+                        sample,
+                        last_good_ms: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// **#531 レビュー**: 「最後に値を受け取った時刻」（`lastGoodMs`）は
+    /// `ptimeMs`（読みに行った時刻。`bad` でも進む）とは別にそのまま載る。
+    /// 切断中（`bad`）は最後の good の時刻、一度も受け取っていなければ `null`、
+    /// 外したタグ（`invalid`）も `null`。
+    #[test]
+    fn values_carry_the_last_good_time_separately_from_the_attempt_time() {
+        let reading = |value, ptime_ms, quality, last_good_ms| CurrentReading {
+            sample: CurrentSample {
+                value,
+                ptime_ms,
+                quality,
+            },
+            last_good_ms,
+        };
+        let data: HashMap<String, CurrentReading> = [
+            (
+                "tag:1".to_string(),
+                reading(None, 9_000, Quality::Bad, Some(1_000)),
+            ),
+            (
+                "tag:2".to_string(),
+                reading(None, 9_000, Quality::Bad, None),
+            ),
+            (
+                "tag:3".to_string(),
+                reading(Some(2.0), 1_000, Quality::Stale, Some(1_000)),
+            ),
+            (
+                "tag:4".to_string(),
+                reading(Some(3.0), 9_000, Quality::Good, Some(9_000)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let json = serde_json::to_value(values_readout(Some(data), &["tag:5".to_string()]))
+            .expect("serialize");
+        let row = |key: &str| json["data"][key].clone();
+        assert_eq!(
+            row("tag:1"),
+            serde_json::json!({ "value": null, "ptimeMs": 9_000, "quality": "bad", "lastGoodMs": 1_000 })
+        );
+        assert_eq!(
+            row("tag:2"),
+            serde_json::json!({ "value": null, "ptimeMs": 9_000, "quality": "bad", "lastGoodMs": null }),
+            "一度も受け取っていないのに時刻が付いている"
+        );
+        assert_eq!(row("tag:3")["lastGoodMs"], 1_000);
+        assert_eq!(row("tag:4")["lastGoodMs"], 9_000);
+        assert_eq!(
+            row("tag:5"),
+            serde_json::json!({ "value": null, "ptimeMs": null, "quality": "invalid", "lastGoodMs": null })
+        );
+    }
 
     /// 速い・決定的なチューニング。`banto-collect` の `tests/integration.rs`
     /// の `fast_options` と同じ意図（**テストの中で実時間を待たない**ための
@@ -3262,7 +3347,7 @@ mod tests {
         let values = serde_json::to_value(svc.values()).expect("serialize");
         assert_eq!(
             values["data"][format!("tag:{bad}")],
-            serde_json::json!({"value": null, "ptimeMs": null, "quality": "invalid"})
+            serde_json::json!({"value": null, "ptimeMs": null, "quality": "invalid", "lastGoodMs": null})
         );
         svc.stop().await.expect("stop");
     }
@@ -4223,20 +4308,21 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let json = serde_json::to_value(values_readout(Some(samples), &[])).expect("serialize");
+        let json =
+            serde_json::to_value(values_readout(Some(readings(samples)), &[])).expect("serialize");
         assert_eq!(json["state"], "ready");
         assert_eq!(
             json["data"]["tag:1"],
-            serde_json::json!({ "value": 1.5, "ptimeMs": 42, "quality": "good" })
+            serde_json::json!({ "value": 1.5, "ptimeMs": 42, "quality": "good" , "lastGoodMs": null })
         );
         assert_eq!(
             json["data"]["tag:2"],
-            serde_json::json!({ "value": null, "ptimeMs": 43, "quality": "bad" }),
+            serde_json::json!({ "value": null, "ptimeMs": 43, "quality": "bad" , "lastGoodMs": null }),
             "読めなかったサンプルの値を 0 に潰していないか"
         );
         assert_eq!(
             json["data"]["tag:3"],
-            serde_json::json!({ "value": 2.0, "ptimeMs": 44, "quality": "stale" })
+            serde_json::json!({ "value": 2.0, "ptimeMs": 44, "quality": "stale" , "lastGoodMs": null })
         );
     }
 
@@ -4281,7 +4367,8 @@ mod tests {
             })
             .collect();
 
-        let json = serde_json::to_value(values_readout(Some(samples), &[])).expect("serialize");
+        let json =
+            serde_json::to_value(values_readout(Some(readings(samples)), &[])).expect("serialize");
         assert_eq!(json["state"], "ready");
         for (index, (key, value)) in non_finite.iter().enumerate() {
             let row = &json["data"][*key];
@@ -4291,6 +4378,7 @@ mod tests {
                     "value": serde_json::Value::Null,
                     "ptimeMs": 100 + index as i64,
                     "quality": "bad",
+                    "lastGoodMs": serde_json::Value::Null,
                 }),
                 "非有限値（{value}）が「値は null なのに品質は good」で公開されている: {row}"
             );
@@ -4326,19 +4414,20 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let json = serde_json::to_value(values_readout(Some(finite), &[])).expect("serialize");
+        let json =
+            serde_json::to_value(values_readout(Some(readings(finite)), &[])).expect("serialize");
         assert_eq!(
             json["data"]["tag:good"],
-            serde_json::json!({ "value": 1.5, "ptimeMs": 42, "quality": "good" })
+            serde_json::json!({ "value": 1.5, "ptimeMs": 42, "quality": "good" , "lastGoodMs": null })
         );
         assert_eq!(
             json["data"]["tag:bad"],
-            serde_json::json!({ "value": null, "ptimeMs": 43, "quality": "bad" }),
+            serde_json::json!({ "value": null, "ptimeMs": 43, "quality": "bad" , "lastGoodMs": null }),
             "読めなかったサンプルの品質が正規化で書き換わっている"
         );
         assert_eq!(
             json["data"]["tag:stale"],
-            serde_json::json!({ "value": -0.0, "ptimeMs": 44, "quality": "stale" }),
+            serde_json::json!({ "value": -0.0, "ptimeMs": 44, "quality": "stale" , "lastGoodMs": null }),
             "有限値（`-0.0` も有限）を非有限と取り違えている"
         );
     }

@@ -16,6 +16,25 @@
 //! "更新停止"); Stale only appears when updates genuinely stop arriving - e.g.
 //! a collection task that is no longer ticking at all.
 //!
+//! ## Last successful receive time (`last_good_ms`)
+//!
+//! [`CurrentSample::ptime_ms`] is the time of the **latest attempt**, whatever
+//! its quality: a Bad sample carries the time of the read that failed (a
+//! PLC-down feed writes a fresh Bad sample every tick, so this keeps
+//! advancing). To answer "when did this tag last deliver a usable value?"
+//! the cache also keeps, per tag, the `ptime_ms` of the last **Good sample
+//! with a finite value** ([`CurrentReading::last_good_ms`]). It is updated
+//! only by such samples, kept unchanged across Bad samples (and across Stale,
+//! which is a read-time derivation and never written), and is `None` when the
+//! tag has not delivered a usable value since this cache was created (i.e.
+//! since collection started - a restart builds a fresh collector and a fresh
+//! cache). A non-finite Good value (NaN/±∞ from a float register) does not
+//! count: the display layers publish it as Bad (no usable value).
+//! Exposed through [`CurrentValuesHandle::snapshot_readings`]; the plain
+//! [`CurrentValuesHandle::get`]/[`CurrentValuesHandle::snapshot`] and
+//! [`CurrentSample`] are unchanged (banto-hub's computed/internal tag store
+//! builds [`CurrentSample`]s itself and does not track this).
+//!
 //! `std::sync::RwLock` (not `tokio::sync::RwLock`): reads come from the
 //! synchronous UI/render path and writes are short, non-`await` critical
 //! sections inside the collection tasks - an async lock would buy nothing and
@@ -54,9 +73,22 @@ pub enum Quality {
 pub struct CurrentSample {
     /// The scaled engineering value, or `None` for a missing/failed reading.
     pub value: Option<f64>,
-    /// UTC epoch milliseconds of this sample (the collection PC's clock).
+    /// UTC epoch milliseconds of this sample (the collection PC's clock) -
+    /// the time of the latest **attempt**, also for a Bad sample (a failed
+    /// read). Not "when a value was last received": see
+    /// [`CurrentReading::last_good_ms`].
     pub ptime_ms: i64,
     pub quality: Quality,
+}
+
+/// A [`CurrentSample`] plus the time of the tag's last usable value (module
+/// doc "Last successful receive time").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentReading {
+    pub sample: CurrentSample,
+    /// `ptime_ms` of the last Good sample with a finite value; `None` = none
+    /// since this cache was created. Never advanced by Bad samples.
+    pub last_good_ms: Option<i64>,
 }
 
 /// What the collection tasks store (before Stale derivation) plus the period
@@ -68,6 +100,8 @@ struct Entry {
     /// Good or Bad only - never Stale (Stale is a read-time derivation).
     stored_quality: Quality,
     period_ms: u32,
+    /// See [`CurrentReading::last_good_ms`].
+    last_good_ms: Option<i64>,
 }
 
 /// Cheaply-cloneable shared handle onto the current-value cache. Clones share
@@ -109,6 +143,12 @@ impl CurrentValuesHandle {
             .map
             .write()
             .expect("current-value cache lock poisoned (a writer panicked)");
+        let usable = stored_quality == Quality::Good && value.is_some_and(f64::is_finite);
+        let last_good_ms = if usable {
+            Some(ptime_ms)
+        } else {
+            map.get(tag_key).and_then(|previous| previous.last_good_ms)
+        };
         map.insert(
             tag_key.to_string(),
             Entry {
@@ -116,6 +156,7 @@ impl CurrentValuesHandle {
                 ptime_ms,
                 stored_quality,
                 period_ms,
+                last_good_ms,
             },
         );
     }
@@ -166,6 +207,28 @@ impl CurrentValuesHandle {
             .expect("current-value cache lock poisoned (a writer panicked)");
         map.iter()
             .map(|(k, entry)| (k.clone(), Self::derive(entry, now_ms)))
+            .collect()
+    }
+
+    /// Like [`Self::snapshot`], with each tag's last usable-value time
+    /// ([`CurrentReading::last_good_ms`]). Same single "now" and single read
+    /// lock, so the sample and its `last_good_ms` are from the same instant.
+    pub fn snapshot_readings(&self) -> HashMap<String, CurrentReading> {
+        let now_ms = self.clock.now_ms();
+        let map = self
+            .map
+            .read()
+            .expect("current-value cache lock poisoned (a writer panicked)");
+        map.iter()
+            .map(|(k, entry)| {
+                (
+                    k.clone(),
+                    CurrentReading {
+                        sample: Self::derive(entry, now_ms),
+                        last_good_ms: entry.last_good_ms,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -275,5 +338,63 @@ mod tests {
         let s = handle.get("t1").unwrap();
         assert_eq!(s.value, Some(2.0));
         assert_eq!(s.ptime_ms, 500);
+    }
+
+    fn last_good(handle: &CurrentValuesHandle, key: &str) -> Option<i64> {
+        handle.snapshot_readings()[key].last_good_ms
+    }
+
+    #[test]
+    fn last_good_ms_freezes_at_the_last_good_sample_while_bad() {
+        // Good -> Bad -> Bad: ptime keeps advancing with every failed attempt,
+        // last_good_ms stays at the last Good sample.
+        let (handle, clock) = handle_at(1_000);
+        handle.set("t1", Some(5.0), 1_000, Quality::Good, 1_000);
+        assert_eq!(last_good(&handle, "t1"), Some(1_000));
+        handle.set("t1", None, 2_000, Quality::Bad, 1_000);
+        handle.set("t1", None, 3_000, Quality::Bad, 1_000);
+        clock.set_now_ms(3_000);
+        let reading = handle.snapshot_readings()["t1"];
+        assert_eq!(reading.sample.ptime_ms, 3_000);
+        assert_eq!(reading.sample.quality, Quality::Bad);
+        assert_eq!(reading.last_good_ms, Some(1_000));
+    }
+
+    #[test]
+    fn last_good_ms_is_none_when_bad_from_the_start() {
+        let (handle, _clock) = handle_at(1_000);
+        handle.set("t1", None, 1_000, Quality::Bad, 1_000);
+        handle.set("t1", None, 2_000, Quality::Bad, 1_000);
+        assert_eq!(last_good(&handle, "t1"), None);
+    }
+
+    #[test]
+    fn last_good_ms_advances_again_once_good_returns() {
+        let (handle, _clock) = handle_at(1_000);
+        handle.set("t1", None, 1_000, Quality::Bad, 1_000);
+        handle.set("t1", Some(1.0), 2_000, Quality::Good, 1_000);
+        assert_eq!(last_good(&handle, "t1"), Some(2_000));
+        handle.set("t1", None, 3_000, Quality::Bad, 1_000);
+        handle.set("t1", Some(2.0), 4_000, Quality::Good, 1_000);
+        assert_eq!(last_good(&handle, "t1"), Some(4_000));
+    }
+
+    #[test]
+    fn last_good_ms_is_kept_while_stale() {
+        // Stale is derived on read; it never touches last_good_ms.
+        let (handle, clock) = handle_at(1_000);
+        handle.set("t1", Some(1.0), 1_000, Quality::Good, 1_000);
+        clock.set_now_ms(100_000);
+        let reading = handle.snapshot_readings()["t1"];
+        assert_eq!(reading.sample.quality, Quality::Stale);
+        assert_eq!(reading.last_good_ms, Some(1_000));
+    }
+
+    #[test]
+    fn a_non_finite_good_value_does_not_count_as_received() {
+        let (handle, _clock) = handle_at(1_000);
+        handle.set("t1", Some(1.0), 1_000, Quality::Good, 1_000);
+        handle.set("t1", Some(f64::NAN), 2_000, Quality::Good, 1_000);
+        assert_eq!(last_good(&handle, "t1"), Some(1_000));
     }
 }

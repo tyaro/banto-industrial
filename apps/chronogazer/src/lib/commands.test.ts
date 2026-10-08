@@ -10,7 +10,8 @@ const state = vi.hoisted(() => ({
 	publicViewer: false
 }));
 
-vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
+const gotoMock = vi.hoisted(() => vi.fn());
+vi.mock('$app/navigation', () => ({ goto: gotoMock }));
 vi.mock('./banto/logout.svelte', () => ({ logoutAndLeave: vi.fn() }));
 vi.mock('./banto/logoutNotice', () => ({ notifyLogoutOutcome: vi.fn() }));
 vi.mock('./settings.svelte', () => ({ settings: {} }));
@@ -28,7 +29,7 @@ vi.mock('./session.svelte', () => ({
 	}
 }));
 
-import { buildCommands } from './commands';
+import { buildCommands, displayGroupCommands } from './commands';
 import { publicNavItems } from './navigation';
 
 function visibleIds(): string[] {
@@ -78,5 +79,36 @@ describe('buildCommands の表示規則', () => {
 		expect(ids).not.toContain('nav./tags');
 		expect(ids).not.toContain('session.logout');
 		expect(ids).toContain('session.login');
+	});
+});
+
+describe('表示グループのコマンド（R1-D）', () => {
+	beforeEach(() => {
+		state.role = 'viewer';
+		state.authDisabled = false;
+		state.publicViewer = false;
+		gotoMock.mockClear();
+	});
+
+	it('グループの数だけ「グループ: ◯◯ を表示」が並び、監視画面の ?group= へ移る', async () => {
+		const commands = displayGroupCommands([
+			{ id: 3, name: 'ライン1' },
+			{ id: 8, name: 'ライン2' }
+		]);
+		expect(commands.map((c) => [c.id, c.title])).toEqual([
+			['monitor.group.3', 'グループ: ライン1 を表示'],
+			['monitor.group.8', 'グループ: ライン2 を表示']
+		]);
+		await commands[1].run();
+		expect(gotoMock).toHaveBeenCalledWith('/monitor?group=8');
+	});
+
+	it('buildCommands に渡した一覧に追従する（省略なら 0 件）。閲覧公開にも出る', () => {
+		expect(buildCommands().some((c) => c.id.startsWith('monitor.group.'))).toBe(false);
+		state.publicViewer = true;
+		const ids = buildCommands([{ id: 1, name: 'A' }])
+			.filter((command) => (command.visible ? command.visible() : true))
+			.map((command) => command.id);
+		expect(ids).toContain('monitor.group.1');
 	});
 });
