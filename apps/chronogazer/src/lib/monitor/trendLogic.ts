@@ -24,8 +24,21 @@
  *   1 回の要求で格子と同じ数の区間で読むため。
  *
  * 時刻は**サーバーの時計**（現在値の `ptimeMs`、履歴の `tMs`）で揃える。端末の時計を
- * 使うと、LAN の別の端末で時計がずれているとき履歴と現在値が食い違う
- * （[`serverNowMs`]）。
+ * 使うと、LAN の別の端末で時計がずれているとき履歴と現在値が食い違う。表示の時計は
+ * [`observeServerClock`] / [`serverClockNow`]: 受け取った `ptimeMs` の最大を基準にし、
+ * その後は**端末の単調な経過時間**（`performance.now()`）で進める。
+ *
+ * - `ptimeMs` だけを時計にすると、表示中のタグがすべて収集周期 60 秒のとき、ポーリングが
+ *   成功し続けても `ptimeMs` は 60 秒間止まったままで、同じ刻みを書き直し続け、次の
+ *   サンプルで間の刻みが `null` になって**毎分線が切れる**（PR #543 のオーナーレビュー P2）。
+ *   経過時間で進めれば、同じ good のサンプルが続く間も今の刻みに書く（下の「収集周期の
+ *   長いタグも、ポーリングのたびに今の値を書く」、履歴の `max(binMs, 周期)` と同じ扱い）。
+ * - 基準はより新しい `ptimeMs` が来たときだけ前へ付け替える（戻さない）。
+ * - **サーバーの時刻を 1 つも受け取っていない間は時計が無い**（`null`）。そのあいだ格子を
+ *   作らず、履歴も要求しない。端末の時計で格子を作ると、端末の時計が進んでいるとき後から
+ *   来たサーバーの時刻が「過去」に見え、`appendLive` が捨ててしまう（PR #543 のレビュー P2）。
+ * - 読み取りの失敗（ポーリングが成功しない）・`bad`・`stale` は今までどおり線を切る:
+ *   失敗の間は書き足さないので刻みは `null`、`bad` / `stale` の値は `null`。
  *
  * ## 履歴（初期窓）と現在値の合わせ方
  *
@@ -360,20 +373,44 @@ export function historyRequest(
 	return { tagIds, fromMs, toMs, bins: buffer.rows.length };
 }
 
-/**
- * サーバーの「今」の見積もり（純関数）: 現在値の `ptimeMs`（収集が読みに行った時刻、
- * サーバーの時計）の最大。1 つも無ければ `fallback`（端末の時計）。
- */
-export function serverNowMs(
-	values: Readonly<Record<string, Pick<CurrentSampleView, 'ptimeMs'>>>,
-	fallback: number
-): number {
+/** 現在値の `ptimeMs`（収集が読みに行った時刻、サーバーの時計）の最大。無ければ `null`。 */
+export function maxPtimeMs(
+	values: Readonly<Record<string, Pick<CurrentSampleView, 'ptimeMs'>>>
+): number | null {
 	let max: number | null = null;
 	for (const sample of Object.values(values)) {
 		const t = sample.ptimeMs;
 		if (t !== null && Number.isFinite(t) && (max === null || t > max)) max = t;
 	}
-	return max ?? fallback;
+	return max;
+}
+
+/**
+ * 表示の時計（サーバーの時刻の基準と、それを受け取ったときの端末の単調な時刻）。
+ * `null` = まだサーバーの時刻を受け取っていない。
+ */
+export type ServerClock = { serverMs: number; localMs: number } | null;
+
+/** 時計の今（純関数）: 基準 + 端末の経過時間。時計が無ければ `null`。 */
+export function serverClockNow(clock: ServerClock, localNowMs: number): number | null {
+	return clock === null ? null : clock.serverMs + Math.max(0, localNowMs - clock.localMs);
+}
+
+/**
+ * 現在値を受け取ったときに時計を更新する（純関数）。`ptimeMs` の最大が今の見積もりより
+ * 新しければ基準をそこへ付け替え、そうでなければそのまま（後ろへは戻さない）。
+ * `ptimeMs` が 1 つも無ければ時計はそのまま（無ければ `null` のまま）。
+ */
+export function observeServerClock(
+	clock: ServerClock,
+	values: Readonly<Record<string, Pick<CurrentSampleView, 'ptimeMs'>>>,
+	localNowMs: number
+): ServerClock {
+	const latest = maxPtimeMs(values);
+	if (latest === null) return clock;
+	const now = serverClockNow(clock, localNowMs);
+	if (now !== null && latest <= now) return clock;
+	return { serverMs: latest, localMs: localNowMs };
 }
 
 /** 値の範囲（全ペン・全行の最小と最大）。値が 1 つも無ければ `null`。 */

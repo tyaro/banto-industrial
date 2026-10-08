@@ -198,6 +198,28 @@ describe('TrendFeed', () => {
 		expect(feed.key).toBeNull();
 	});
 
+	it('sync: 同じスナップショットは 2 回書かないが、格子を作り直したら今のスナップショットを書き直す', async () => {
+		const feed = new TrendFeed({
+			fetchHistory: () => Promise.resolve({ state: 'unavailable' }),
+			graceMs: GRACE,
+			timeoutMs: TIMEOUT
+		});
+		const snapshot = {};
+		feed.sync(config({ windowMs: 5000 }), 14_000, snapshot, [5]);
+		expect(rowValues(feed)?.at(-1)).toBe(5);
+		// ポーリングが失敗している間（同じスナップショットのまま）に窓を変える（PR #543 のレビュー P2）。
+		feed.sync(config({ windowMs: 3000 }), 15_000, snapshot, [5]);
+		expect(rowValues(feed)).toEqual([null, null, 5]);
+		// 同じ構成・同じスナップショットでは書き足さない（次の刻みに複写しない）。
+		feed.sync(config({ windowMs: 3000 }), 16_000, snapshot, [5]);
+		expect(rowValues(feed)).toEqual([null, null, 5]);
+		// 新しいスナップショットは書く。
+		feed.sync(config({ windowMs: 3000 }), 16_500, {}, [6]);
+		expect(rowValues(feed)).toEqual([null, 5, 6]);
+		await vi.advanceTimersByTimeAsync(GRACE);
+		expect(feed.historyState).toBe('unavailable');
+	});
+
 	it('構成のキーはグループ・窓・刻み・ペンの並びで変わる', () => {
 		const base = trendConfigKey(config());
 		expect(trendConfigKey(config({ groupId: 2 }))).not.toBe(base);

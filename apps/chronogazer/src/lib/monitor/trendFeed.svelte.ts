@@ -88,6 +88,13 @@ export class TrendFeed {
 	#controller: AbortController | null = null;
 	#timer: ReturnType<typeof setTimeout> | null = null;
 	#config: TrendConfig | null = null;
+	/**
+	 * 書き足し済みの現在値のスナップショット（ポーラーは成功のたびに新しいオブジェクトを
+	 * 作る）。格子を作り直したら `null` に戻す - 戻さないと、ポーリングが失敗している間に
+	 * 窓・幅を変えたとき、今のスナップショットが新しい格子に一度も書かれず、履歴も無い
+	 * （読めない・シミュレーション）と空のままになる（PR #543 のレビュー P2）。
+	 */
+	#appliedSnapshot: object | null = null;
 
 	constructor(options: TrendFeedOptions = {}) {
 		this.#fetch = options.fetchHistory ?? ((params, signal) => getCollectHistory(params, signal));
@@ -97,15 +104,16 @@ export class TrendFeed {
 
 	/**
 	 * 構成を当てる。同じ構成なら何もしない。変わったら格子を `nowMs`（サーバーの時計）
-	 * で作り直し、履歴を [`HISTORY_FLUSH_GRACE_MS`] 後に 1 回読む。
+	 * で作り直し、履歴を [`HISTORY_FLUSH_GRACE_MS`] 後に 1 回読む。作り直したら `true`。
 	 */
-	configure(config: TrendConfig, nowMs: number): void {
+	configure(config: TrendConfig, nowMs: number): boolean {
 		const key = trendConfigKey(config);
 		if (key === this.key) {
 			this.#config = config;
-			return;
+			return false;
 		}
 		this.#cancel();
+		this.#appliedSnapshot = null;
 		const generation = this.#generation;
 		this.#config = config;
 		this.key = key;
@@ -118,6 +126,24 @@ export class TrendFeed {
 			this.#timer = null;
 			void this.#loadHistory(generation);
 		}, this.#graceMs);
+		return true;
+	}
+
+	/**
+	 * 構成を当て、まだ書いていないスナップショットなら書き足す（画面はこれだけを呼ぶ）。
+	 * `snapshot` は現在値の表（同じオブジェクトは 2 回書かない）、`values` はペンの並び
+	 * どおりの値、`nowMs` は表示の時計（`serverClockNow`）。
+	 */
+	sync(
+		config: TrendConfig,
+		nowMs: number,
+		snapshot: object,
+		values: readonly (number | null)[]
+	): void {
+		this.configure(config, nowMs);
+		if (snapshot === this.#appliedSnapshot) return;
+		this.#appliedSnapshot = snapshot;
+		this.append(nowMs, values);
 	}
 
 	/** 現在値を 1 回分書き足す（`values` はペンの並びどおり、`nowMs` はサーバーの時計）。 */
@@ -129,6 +155,7 @@ export class TrendFeed {
 	/** 止めて捨てる（画面を離れた・トレンドでないグループになった）。 */
 	reset(): void {
 		this.#cancel();
+		this.#appliedSnapshot = null;
 		this.#config = null;
 		this.key = null;
 		this.groupId = null;

@@ -81,7 +81,9 @@
 		resolveBandPen,
 		resolveTrendWindowSec,
 		saveTrendWindowOverride,
-		serverNowMs,
+		observeServerClock,
+		serverClockNow,
+		type ServerClock,
 		trendNotices,
 		trendPenInfos
 	} from '#lib/monitor/trendLogic.js';
@@ -258,8 +260,14 @@
 		return cg && Number.isFinite(cg.periodMs) && cg.periodMs > 0 ? cg.periodMs : null;
 	}
 
-	/** 書き足し済みの現在値（同じ応答を 2 回書かない。成功のたびに新しいオブジェクト）。 */
-	let appliedValues: object | null = null;
+	/**
+	 * 表示の時計（`trendLogic.ts` の `observeServerClock`）。サーバーの時刻（`ptimeMs` の最大）を
+	 * 基準に、端末の単調な経過時間で進める。サーバーの時刻を受け取るまでは `null` で、格子を
+	 * 作らない（端末の時計で作らない）。時計はサーバー全体のものなので、グループを替えても残す。
+	 */
+	let serverClock: ServerClock = null;
+	/** 時計に反映済みの現在値のスナップショット（成功のたびに新しいオブジェクト）。 */
+	let observedValues: object | null = null;
 
 	$effect(() => {
 		const target = trendTarget;
@@ -271,19 +279,19 @@
 		untrack(() => {
 			if (target === null) {
 				trendFeed.reset();
-				appliedValues = null;
 				return;
 			}
 			// グループが替わったら、新しいグループの値が来る前でも前の線を捨てる。
-			if (trendFeed.groupId !== null && trendFeed.groupId !== target.id) {
-				trendFeed.reset();
-				appliedValues = null;
+			if (trendFeed.groupId !== null && trendFeed.groupId !== target.id) trendFeed.reset();
+			if (current === null || current.phase !== 'ready' || current.values === null) return;
+			if (current.values !== observedValues) {
+				observedValues = current.values;
+				serverClock = observeServerClock(serverClock, current.values, performance.now());
 			}
-			if (current === null || current.phase !== 'ready' || current.values === null || width <= 0)
-				return;
-			const now = serverNowMs(current.values, Date.now());
+			const now = serverClockNow(serverClock, performance.now());
+			if (now === null || width <= 0) return;
 			const penTagIds = target.pens.map((pen) => pen.tagId);
-			trendFeed.configure(
+			trendFeed.sync(
 				{
 					groupId: target.id,
 					windowMs: windowSec * 1000,
@@ -296,15 +304,10 @@
 					penTagIds,
 					periodMsOf: collectPeriodOf
 				},
-				now
+				now,
+				current.values,
+				views.map((view) => view.value)
 			);
-			if (current.values !== appliedValues) {
-				appliedValues = current.values;
-				trendFeed.append(
-					now,
-					views.map((view) => view.value)
-				);
-			}
 		});
 	});
 

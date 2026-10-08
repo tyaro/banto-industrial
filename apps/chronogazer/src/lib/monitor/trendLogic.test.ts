@@ -32,7 +32,10 @@ import {
 	resolveBandPen,
 	resolveTrendWindowSec,
 	saveTrendWindowOverride,
-	serverNowMs,
+	maxPtimeMs,
+	observeServerClock,
+	serverClockNow,
+	type ServerClock,
 	thresholdBands,
 	trendDescription,
 	trendNotices,
@@ -264,7 +267,7 @@ describe('mergeHistory（初期窓 + 現在値）', () => {
 	});
 });
 
-describe('historyRequest / serverNowMs / valueExtent', () => {
+describe('historyRequest / maxPtimeMs / valueExtent', () => {
 	it('期間は格子の全体（両端を含む）、区間の数は行数、タグは重複を除く', () => {
 		const b = emptyTrendBuffer(1000, 600_000, 2, 1_000_000);
 		expect(historyRequest(b, [3, 3, 4])).toEqual({
@@ -276,14 +279,11 @@ describe('historyRequest / serverNowMs / valueExtent', () => {
 		expect(historyRequest(b, [])).toBeNull();
 	});
 
-	it('サーバーの今 = ptimeMs の最大。無ければ端末の時計', () => {
+	it('ptimeMs の最大。無ければ null', () => {
 		expect(
-			serverNowMs(
-				{ 'tag:1': { ptimeMs: 5 }, 'tag:2': { ptimeMs: 9 }, 'tag:3': { ptimeMs: null } },
-				100
-			)
+			maxPtimeMs({ 'tag:1': { ptimeMs: 5 }, 'tag:2': { ptimeMs: 9 }, 'tag:3': { ptimeMs: null } })
 		).toBe(9);
-		expect(serverNowMs({ 'tag:3': { ptimeMs: null } }, 100)).toBe(100);
+		expect(maxPtimeMs({ 'tag:3': { ptimeMs: null } })).toBeNull();
 	});
 
 	it('値の範囲は null を飛ばす。値が無ければ null', () => {
@@ -509,5 +509,59 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			'次のタグは登録が見つからないため履歴がありません: タグ ID 9',
 			`${SIMULATION_NOTE}（温度、圧力）。`
 		]);
+	});
+});
+
+describe('表示の時計（observeServerClock / serverClockNow、PR #543 のレビュー P2）', () => {
+	const sample = (ptimeMs: number | null) => ({ 'tag:1': { ptimeMs } });
+
+	it('サーバーの時刻を受け取るまでは時計が無い（端末の時計を使わない）', () => {
+		expect(observeServerClock(null, sample(null), 123_456)).toBeNull();
+		expect(serverClockNow(null, 123_456)).toBeNull();
+	});
+
+	it('基準 + 端末の経過時間で進む。新しい ptimeMs で前へ付け替え、古い ptimeMs では戻さない', () => {
+		let clock: ServerClock = observeServerClock(null, sample(1_000_000), 50);
+		expect(serverClockNow(clock, 50)).toBe(1_000_000);
+		expect(serverClockNow(clock, 5050)).toBe(1_005_000);
+		// 同じ ptimeMs（周期の長いタグ）: 基準はそのまま、時計は進み続ける。
+		clock = observeServerClock(clock, sample(1_000_000), 5050);
+		expect(serverClockNow(clock, 10_050)).toBe(1_010_000);
+		// 見積もりより新しい ptimeMs: 付け替える。
+		clock = observeServerClock(clock, sample(1_020_000), 12_050);
+		expect(serverClockNow(clock, 12_050)).toBe(1_020_000);
+		// 見積もりより古い ptimeMs: 戻さない。
+		clock = observeServerClock(clock, sample(1_000_000), 13_050);
+		expect(serverClockNow(clock, 13_050)).toBe(1_021_000);
+		// 端末の時刻が戻っても（単調でない入力でも）基準より前にしない。
+		expect(serverClockNow(clock, 0)).toBe(1_020_000);
+	});
+
+	it('収集周期 60 秒のタグだけでも、5 秒ごとのポーリングで線が切れない', () => {
+		// 窓 1 分・刻み 10 秒（周期 5 秒の 2 倍）。ptimeMs は 60 秒ごとにしか進まない。
+		const step = 10_000;
+		let clock: ServerClock = null;
+		let buffer: TrendBuffer | null = null;
+		for (let local = 0; local <= 180_000; local += 5000) {
+			const ptime = 3_600_000 + Math.floor(local / 60_000) * 60_000;
+			clock = observeServerClock(clock, sample(ptime), local);
+			const now = serverClockNow(clock, local);
+			if (now === null) throw new Error('時計が無い');
+			buffer ??= emptyTrendBuffer(step, 60_000, 1, now);
+			buffer = appendLive(buffer, now, [42]);
+		}
+		expect(values(buffer!).flat()).toEqual([42, 42, 42, 42, 42, 42]);
+	});
+
+	it('最初の ptimeMs が null で端末の時計が進んでいても、後のサーバーの時刻を捨てない', () => {
+		// 端末の時計（Date.now 相当）はサーバーより 1 時間進んでいるが、時計は使わない。
+		let clock: ServerClock = observeServerClock(null, sample(null), 0);
+		expect(serverClockNow(clock, 0)).toBeNull();
+		clock = observeServerClock(clock, sample(1_000_000), 1000);
+		const now = serverClockNow(clock, 1000)!;
+		let buffer = emptyTrendBuffer(1000, 5000, 1, now);
+		buffer = appendLive(buffer, now, [7]);
+		buffer = appendLive(buffer, serverClockNow(clock, 2000)!, [8]);
+		expect(values(buffer).flat()).toEqual([null, null, null, 7, 8]);
 	});
 });
