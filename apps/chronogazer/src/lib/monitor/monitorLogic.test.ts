@@ -11,7 +11,9 @@
 import { describe, expect, it } from 'vitest';
 import type { CurrentSampleView } from '../banto/collectAdmin';
 import type { DisplayGroup } from '../banto/displayGroupsAdmin';
-import type { Tag } from '../banto/tagRegistryAdmin';
+// #532: しきい値はタグではなく記録計の側の設定。画面はタグにしきい値を添えた形
+// （`withThresholds`）で判定するので、テストもその形で組む。
+import type { TagWithThresholds as Tag } from '../banto/tagThresholdsAdmin';
 import {
 	LAST_GROUP_STORAGE_KEY,
 	MONITOR_POLL_DEFAULT_MS,
@@ -32,9 +34,17 @@ import {
 	thresholdLevel,
 	thresholdLevelLabel,
 	valuesStaleNote,
+	INITIAL_TAG_META,
+	applyTagMetaLoad,
+	tagMetaNotices,
+	tagsForDisplay,
+	type LoadResult,
 	type PenState,
+	type TagMetaState,
 	type ThresholdLevel
 } from './monitorLogic';
+import type { CollectionGroup } from '../banto/tagRegistryAdmin';
+import type { TagThresholds } from '../banto/tagThresholdsAdmin';
 
 function tag(overrides: Partial<Tag> = {}): Tag {
 	return {
@@ -463,5 +473,107 @@ describe('isKindRendered / valuesStaleNote', () => {
 	it('いつの表示かを必ず出す', () => {
 		expect(valuesStaleNote(null, () => 'X')).toContain('まだ一度も取得できていません');
 		expect(valuesStaleNote(1, () => '12:00:00')).toContain('12:00:00に取得したもの');
+	});
+});
+
+// --- タグ情報としきい値の読み込み（#532 のレビュー P2） ---------------------------
+
+describe('applyTagMetaLoad / tagsForDisplay / tagMetaNotices（タグ情報としきい値は別の失敗の軸）', () => {
+	const base = tag({ id: 1, name: '温度', unit: '℃' });
+	const cg: CollectionGroup = {
+		id: 10,
+		name: 'cg',
+		plcConnectionId: 1,
+		periodMs: 1000,
+		enabled: true
+	} as CollectionGroup;
+	const h80: TagThresholds = {
+		tagId: 1,
+		thresholdLl: null,
+		thresholdL: null,
+		thresholdH: 80,
+		thresholdHh: null,
+		revision: 1
+	};
+	const metaOk: LoadResult<{ tags: (typeof base)[]; collectionGroups: CollectionGroup[] }> = {
+		ok: true,
+		value: { tags: [base], collectionGroups: [cg] }
+	};
+	const metaFail = { ok: false as const, error: 'tags 500' };
+	const thrOk: LoadResult<TagThresholds[]> = { ok: true, value: [h80] };
+	const thrFail = { ok: false as const, error: 'thresholds 500' };
+	const TAGS_INITIAL =
+		'タグの情報を読み込めませんでした（tags 500）。単位・小数桁・しきい値なしで表示しています。';
+	const TAGS_STALE =
+		'タグの情報を読み直せませんでした（tags 500）。前に読めたタグの情報で表示しています。';
+	const THR =
+		'しきい値を読み込めませんでした（thresholds 500）。色分け・しきい値の判定なしで表示しています。';
+
+	it.each<
+		[
+			string,
+			TagMetaState,
+			typeof metaOk | typeof metaFail,
+			typeof thrOk | typeof thrFail,
+			number,
+			number | null,
+			string[]
+		]
+	>([
+		['両方読めた', INITIAL_TAG_META, metaOk, thrOk, 1, 80, []],
+		[
+			'しきい値だけ失敗: タグは使い、しきい値なし',
+			INITIAL_TAG_META,
+			metaOk,
+			thrFail,
+			1,
+			null,
+			[THR]
+		],
+		[
+			'タグだけ失敗（初回）: タグなし、従来の文言',
+			INITIAL_TAG_META,
+			metaFail,
+			thrOk,
+			0,
+			null,
+			[TAGS_INITIAL]
+		],
+		['両方失敗（初回）', INITIAL_TAG_META, metaFail, thrFail, 0, null, [TAGS_INITIAL, THR]]
+	])('%s', (_label, prev, meta, thr, tagCount, h, notices) => {
+		const state = applyTagMetaLoad(prev, meta, thr);
+		const display = tagsForDisplay(state);
+		expect(display).toHaveLength(tagCount);
+		if (tagCount > 0) {
+			expect(display[0].name).toBe('温度');
+			expect(display[0].unit).toBe('℃');
+			expect(display[0].thresholdH).toBe(h);
+		}
+		expect(tagMetaNotices(state)).toEqual(notices);
+	});
+
+	it('一度読めた後の読み直しでしきい値だけ失敗: 前のしきい値を残さない（判定なし）', () => {
+		const ok = applyTagMetaLoad(INITIAL_TAG_META, metaOk, thrOk);
+		expect(tagsForDisplay(ok)[0].thresholdH).toBe(80);
+		const later = applyTagMetaLoad(ok, metaOk, thrFail);
+		expect(later.thresholds).toEqual([]);
+		expect(tagsForDisplay(later)[0].thresholdH).toBeNull();
+		expect(thresholdLevel(90, tagsForDisplay(later)[0])).toBe('none');
+		expect(tagMetaNotices(later)).toEqual([THR]);
+	});
+
+	it('一度読めた後の読み直しでタグだけ失敗: 前のタグ情報を残し、文言もそう言う', () => {
+		const ok = applyTagMetaLoad(INITIAL_TAG_META, metaOk, thrOk);
+		const later = applyTagMetaLoad(ok, metaFail, thrOk);
+		expect(later.collectionGroups).toEqual([cg]);
+		expect(tagsForDisplay(later)[0].thresholdH).toBe(80);
+		expect(tagMetaNotices(later)).toEqual([TAGS_STALE]);
+	});
+
+	it('失敗の後に両方読めれば注記は消える', () => {
+		const failed = applyTagMetaLoad(INITIAL_TAG_META, metaFail, thrFail);
+		const ok = applyTagMetaLoad(failed, metaOk, thrOk);
+		expect(tagMetaNotices(ok)).toEqual([]);
+		expect(tagsForDisplay(ok)[0].thresholdH).toBe(80);
 	});
 });

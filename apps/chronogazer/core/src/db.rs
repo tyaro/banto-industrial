@@ -251,6 +251,8 @@ mod tests {
             // #393: この app 固有の migration（0101_display_groups.sql）。
             "display_groups",
             "display_group_pens",
+            // #532: 記録計の側のタグごとの設定（0102_recorder_tag_settings.sql）。
+            "recorder_tag_settings",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -305,8 +307,9 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        // 2〜7 は admin-template のコピー、101 からはこの app 固有（#393 の表示グループ）。
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 101]);
+        // 2〜7 は admin-template のコピー、101 からはこの app 固有（#393 の表示グループ、
+        // #532 の記録計の側のタグごとの設定）。
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 101, 102]);
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
         )

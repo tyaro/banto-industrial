@@ -39,6 +39,7 @@
 		type Tag,
 		type CollectionGroup
 	} from '#lib/banto/tagRegistryAdmin.js';
+	import { listTagThresholds, type TagThresholds } from '#lib/banto/tagThresholdsAdmin.js';
 	import {
 		listDisplayGroups,
 		createDisplayGroup,
@@ -72,9 +73,8 @@
 		reloadLatestGroup,
 		sortFieldErrors,
 		tagsUsedByOtherPens,
-		thresholdSummary,
-		type GroupDraft,
-		type TagThresholds
+		penThresholdText,
+		type GroupDraft
 	} from './groupsPageLogic';
 
 	const available = isTagRegistryAvailable();
@@ -112,6 +112,7 @@
 	}
 
 	async function reloadTags(): Promise<void> {
+		void reloadThresholds();
 		try {
 			const [tagRows, groupRows] = await Promise.all([listTags(), listCollectionGroups()]);
 			tags = tagRows;
@@ -119,6 +120,24 @@
 			tagsError = null;
 		} catch (err) {
 			tagsError = errorMessage(err);
+		}
+	}
+
+	// #532: しきい値は記録計の側の設定（`/api/tag-thresholds`）から読む（読み取り
+	// 専用の表示）。タグの一覧とは別に読み、読めなかったことは「しきい値なし」と
+	// 区別して出す（`penThresholdText`）。読み直しに失敗したら前の値は捨てる（古い
+	// しきい値を今の設定のように見せない。監視画面の `applyTagMetaLoad` と同じ）。
+	let thresholdsByTag = $state<Map<number, TagThresholds> | null>(null);
+	let thresholdsError = $state<string | null>(null);
+
+	async function reloadThresholds(): Promise<void> {
+		try {
+			const rows = await listTagThresholds();
+			thresholdsByTag = new Map(rows.map((row) => [row.tagId, row]));
+			thresholdsError = null;
+		} catch (err) {
+			thresholdsByTag = null;
+			thresholdsError = errorMessage(err);
 		}
 	}
 
@@ -583,12 +602,16 @@
 												{/each}
 											</select>
 										</label>
-										<span class="thresholds" title="しきい値はタグの設定で変更します">
-											しきい値: {pen.tagId === null
-												? '—'
-												: thresholdSummary(
-														tagsById.get(pen.tagId) as (Tag & TagThresholds) | undefined
-													)}
+										<span
+											class="thresholds"
+											title="しきい値はタグ設定画面の「しきい値（記録計の設定）」で変更します"
+										>
+											しきい値: {penThresholdText(
+												pen.tagId,
+												pen.tagId !== null && tagsById.has(pen.tagId),
+												thresholdsByTag,
+												thresholdsError !== null
+											)}
 										</span>
 										{#if canWrite}
 											<span class="pen-actions">

@@ -108,9 +108,15 @@ pub(crate) enum ProtocolConfig {
 
 /// A tag's fixed H/HH/L/LL limits (any subset may be set), compared against
 /// the *scaled* value. Ordering (`ll <= l <= h <= hh` among the set ones) is
-/// already guaranteed by `banto-tags` validation at write time.
+/// the source's job to guarantee at write time: `banto-tags` validation for
+/// the tag columns ([`build_config_lenient_from`]), the caller's own
+/// validation for limits it supplies ([`build_config_lenient_with_thresholds`]).
+///
+/// `pub` since #532 (2026-10-08 owner decision: しきい値は使う側の設定): a
+/// caller that keeps thresholds outside the tag registry (ChronoGazer's
+/// recorder-side per-tag settings) builds these itself and hands them in.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct Thresholds {
+pub struct Thresholds {
     pub hh: Option<f64>,
     pub h: Option<f64>,
     pub l: Option<f64>,
@@ -120,8 +126,46 @@ pub(crate) struct Thresholds {
 impl Thresholds {
     /// True when no limit is set - the hot loop skips threshold
     /// classification entirely for such tags.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.hh.is_none() && self.h.is_none() && self.l.is_none() && self.ll.is_none()
+    }
+
+    /// The limit that defines `level`'s band (#532: recorded on every
+    /// `threshold_*` event as the value the judgement was made against).
+    /// `None` only if that level's limit is unset - which cannot happen for a
+    /// level [`crate::task`]'s classifier actually returned for these limits.
+    pub fn limit_for(&self, level: crate::event::ThresholdLevel) -> Option<f64> {
+        use crate::event::ThresholdLevel;
+        match level {
+            ThresholdLevel::Hh => self.hh,
+            ThresholdLevel::H => self.h,
+            ThresholdLevel::L => self.l,
+            ThresholdLevel::Ll => self.ll,
+        }
+    }
+}
+
+/// Where [`build_config_lenient_inner`] takes each tag's [`Thresholds`] from.
+#[derive(Clone, Copy)]
+enum ThresholdSource<'a> {
+    /// The tag registry's own `threshold_*` columns (banto-hub until #533).
+    TagColumns,
+    /// Limits supplied by the caller, keyed by tag id. A tag with no entry
+    /// has no limits (#532: 既定は設定なし). The tag columns are ignored.
+    Supplied(&'a HashMap<i64, Thresholds>),
+}
+
+impl ThresholdSource<'_> {
+    fn for_tag(&self, tag: &Tag) -> Thresholds {
+        match self {
+            Self::TagColumns => Thresholds {
+                hh: tag.threshold_hh,
+                h: tag.threshold_h,
+                l: tag.threshold_l,
+                ll: tag.threshold_ll,
+            },
+            Self::Supplied(map) => map.get(&tag.id).copied().unwrap_or_default(),
+        }
     }
 }
 
@@ -703,6 +747,31 @@ impl ConfigExclusion {
 pub fn build_config_lenient_from(
     snapshot: &RegistrySnapshot,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
+    build_config_lenient_inner(snapshot, ThresholdSource::TagColumns)
+}
+
+/// [`build_config_lenient_from`] with the tags' H/HH/L/LL limits **supplied
+/// by the caller** instead of read from the tag registry's `threshold_*`
+/// columns (#532, 2026-10-08 owner decision: しきい値はタグ定義の属性ではなく、
+/// 使う側（記録計・SCADA）が持つ設定). `thresholds` is keyed by tag id; a tag
+/// with no entry gets no limits (既定は設定なし) - whatever its columns say.
+///
+/// Everything else - filtering, order, exclusions - is identical (same
+/// interpreter): thresholds never cause an exclusion. ChronoGazer uses this;
+/// banto-hub keeps reading the columns ([`build_config_from`]) until #533
+/// removes them. The caller is responsible for the `ll <= l <= h <= hh`
+/// ordering of what it supplies (see [`Thresholds`]).
+pub fn build_config_lenient_with_thresholds(
+    snapshot: &RegistrySnapshot,
+    thresholds: &HashMap<i64, Thresholds>,
+) -> (CollectorConfig, Vec<ConfigExclusion>) {
+    build_config_lenient_inner(snapshot, ThresholdSource::Supplied(thresholds))
+}
+
+fn build_config_lenient_inner(
+    snapshot: &RegistrySnapshot,
+    threshold_source: ThresholdSource<'_>,
+) -> (CollectorConfig, Vec<ConfigExclusion>) {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
     let tags = &snapshot.tags;
@@ -859,12 +928,7 @@ pub fn build_config_lenient_from(
                 tag_plans.push(TagPlan {
                     key: tag_key(tag.id),
                     scaling: tag.scaling(),
-                    thresholds: Thresholds {
-                        hh: tag.threshold_hh,
-                        h: tag.threshold_h,
-                        l: tag.threshold_l,
-                        ll: tag.threshold_ll,
-                    },
+                    thresholds: threshold_source.for_tag(tag),
                 });
                 store_columns.push(TagColumn {
                     key: tag_key(tag.id),
@@ -1526,6 +1590,85 @@ mod tests {
         assert_eq!(group.requests[0].data_type, DataType::I16);
         assert!(group.tags[1].scaling.is_none());
         assert_eq!(group.requests[1].data_type, DataType::Bit);
+    }
+
+    /// #532: the tag columns feed the classic builds (banto-hub, unchanged
+    /// until #533); [`build_config_lenient_with_thresholds`] takes only what
+    /// the caller supplies - a tag missing from the map has no limits even if
+    /// its columns are set, and the columns never leak into a supplied entry.
+    /// Everything other than the limits is the same plan.
+    #[tokio::test]
+    async fn supplied_thresholds_replace_the_tag_columns() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input("PLC1", 502))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        let tag_svc = TagService::new(pool.clone());
+        let mut with_columns = tag_input("Columns", group.id, "40001");
+        with_columns.threshold_h = Some(80.0);
+        with_columns.threshold_hh = Some(90.0);
+        let with_columns = tag_svc.create(with_columns).await.unwrap();
+        let plain = tag_svc
+            .create(tag_input("Plain", group.id, "40002"))
+            .await
+            .unwrap();
+
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+
+        // Classic: the columns.
+        let (classic, _) = build_config_lenient_from(&snapshot);
+        let classic_tags = &classic.connections[0].groups[0].tags;
+        assert_eq!(classic_tags[0].thresholds.h, Some(80.0));
+        assert_eq!(classic_tags[0].thresholds.hh, Some(90.0));
+        assert!(classic_tags[1].thresholds.is_empty());
+
+        // Supplied: only the map. `with_columns` is absent -> no limits.
+        let supplied = HashMap::from([(
+            plain.id,
+            Thresholds {
+                hh: None,
+                h: None,
+                l: Some(10.0),
+                ll: Some(5.0),
+            },
+        )]);
+        let (config, exclusions) = build_config_lenient_with_thresholds(&snapshot, &supplied);
+        assert!(exclusions.is_empty());
+        let tags = &config.connections[0].groups[0].tags;
+        assert_eq!(tags[0].key, format!("tag:{}", with_columns.id));
+        assert!(
+            tags[0].thresholds.is_empty(),
+            "the tag columns must not be used when thresholds are supplied"
+        );
+        assert_eq!(tags[1].thresholds, supplied[&plain.id]);
+
+        // Same plan apart from the limits.
+        assert_eq!(config.store_config, classic.store_config);
+        assert_eq!(
+            config.connections[0].groups[0].requests,
+            classic.connections[0].groups[0].requests
+        );
+    }
+
+    #[test]
+    fn limit_for_names_each_levels_own_limit() {
+        use crate::event::ThresholdLevel;
+        let t = Thresholds {
+            hh: Some(4.0),
+            h: Some(3.0),
+            l: Some(2.0),
+            ll: Some(1.0),
+        };
+        assert_eq!(t.limit_for(ThresholdLevel::Hh), Some(4.0));
+        assert_eq!(t.limit_for(ThresholdLevel::H), Some(3.0));
+        assert_eq!(t.limit_for(ThresholdLevel::L), Some(2.0));
+        assert_eq!(t.limit_for(ThresholdLevel::Ll), Some(1.0));
+        assert_eq!(Thresholds::default().limit_for(ThresholdLevel::H), None);
     }
 
     /// The S1 hard constraint (ChronoGazer safety): a `"string"` tag in the

@@ -28,6 +28,9 @@ import {
 	coverageReloadSettled,
 	buildTagInput,
 	tagFormValues,
+	buildThresholdsInput,
+	thresholdFormValues,
+	THRESHOLD_WIRE_FIELDS,
 	isRevisionConflict,
 	SIMULATION_CONNECTION_LABEL,
 	type SimulationCoverageView,
@@ -712,27 +715,11 @@ const SAMPLE_TAG: Tag = {
 	engHi: null,
 	unit: 'degC',
 	decimals: 1,
-	thresholdH: 80,
-	thresholdHh: 90,
-	thresholdL: 10,
-	thresholdLl: null,
 	enabled: true,
 	revision: 4
 };
 
-describe('tagFormValues -> buildTagInput（編集して保存しても、触っていないしきい値が消えない）', () => {
-	it('既存のしきい値が往復で保たれる（null は null のまま）', () => {
-		const input = buildTagInput(
-			'tagEdit',
-			tagFormValues('tagEdit', SAMPLE_TAG),
-			SAMPLE_TAG.revision
-		);
-		expect(input.thresholdH).toBe(80);
-		expect(input.thresholdHh).toBe(90);
-		expect(input.thresholdL).toBe(10);
-		expect(input.thresholdLl).toBeNull();
-	});
-
+describe('tagFormValues -> buildTagInput', () => {
 	it('更新は編集を始めた時点の版を expectedRevision に載せる', () => {
 		const input = buildTagInput('tagEdit', tagFormValues('tagEdit', SAMPLE_TAG), 4);
 		expect(input.expectedRevision).toBe(4);
@@ -743,24 +730,15 @@ describe('tagFormValues -> buildTagInput（編集して保存しても、触っ�
 		expect('expectedRevision' in input).toBe(false);
 	});
 
-	it('0 は有効なしきい値（空欄と区別する）', () => {
-		const values = { ...tagFormValues('tagEdit', SAMPLE_TAG), tagEditThresholdL: 0 };
-		expect(buildTagInput('tagEdit', values, 1).thresholdL).toBe(0);
-	});
-
-	it('空欄・未入力・非有限は null（= 設定なし）で、4 項目とも必ず載る', () => {
-		const values = {
-			...tagFormValues('tagEdit', SAMPLE_TAG),
-			tagEditThresholdH: '',
-			tagEditThresholdHh: undefined,
-			tagEditThresholdL: Number.NaN,
-			tagEditThresholdLl: null
-		};
+	it('#532: しきい値は載せない（フォームに値が残っていても。記録計の側の設定で別に保存する）', () => {
+		const values = { ...tagFormValues('tagEdit', SAMPLE_TAG), tagEditThresholdH: 80 };
 		const input = buildTagInput('tagEdit', values, 1);
-		for (const key of ['thresholdH', 'thresholdHh', 'thresholdL', 'thresholdLl'] as const) {
-			expect(key in input, key).toBe(true);
-			expect(input[key], key).toBeNull();
+		for (const key of ['thresholdH', 'thresholdHh', 'thresholdL', 'thresholdLl']) {
+			expect(key in input, key).toBe(false);
 		}
+		expect(Object.keys(tagFormValues('tagEdit', SAMPLE_TAG)).some((k) => /Threshold/.test(k))).toBe(
+			false
+		);
 	});
 
 	it('既存の項目（単位の trim・空単位は null・小数桁）は変わらない', () => {
@@ -773,6 +751,52 @@ describe('tagFormValues -> buildTagInput（編集して保存しても、触っ�
 		expect(input.unit).toBeNull();
 		expect(input.decimals).toBe(2);
 		expect(input.name).toBe('T1');
+	});
+});
+
+// --- G: しきい値のフォーム（#532） ---------------------------------------------
+
+describe('thresholdFormValues -> buildThresholdsInput（記録計の側のしきい値）', () => {
+	const saved = { thresholdLl: null, thresholdL: 10, thresholdH: 80, thresholdHh: 90 };
+
+	it('読んだ値が往復で保たれ（null は null のまま）、版を expectedRevision に載せる', () => {
+		const input = buildThresholdsInput('tagThr', thresholdFormValues('tagThr', saved), 3);
+		expect(input).toEqual({ ...saved, expectedRevision: 3 });
+	});
+
+	it('欄の名前は接頭辞 + Threshold*（サーバーの thresholdLl などと 1 対 1）', () => {
+		expect(Object.keys(thresholdFormValues('tagThr', saved))).toEqual([
+			'tagThrThresholdLl',
+			'tagThrThresholdL',
+			'tagThrThresholdH',
+			'tagThrThresholdHh'
+		]);
+		expect(THRESHOLD_WIRE_FIELDS).toEqual([
+			'thresholdLl',
+			'thresholdL',
+			'thresholdH',
+			'thresholdHh'
+		]);
+	});
+
+	it('0 は有効なしきい値（空欄と区別する）', () => {
+		const values = { ...thresholdFormValues('tagThr', saved), tagThrThresholdL: 0 };
+		expect(buildThresholdsInput('tagThr', values, 0).thresholdL).toBe(0);
+	});
+
+	it('空欄・未入力・非有限は null（= 設定なし）で、4 項目とも必ず載る（全項目置換）', () => {
+		const values = {
+			tagThrThresholdH: '',
+			tagThrThresholdHh: undefined,
+			tagThrThresholdL: Number.NaN,
+			tagThrThresholdLl: null
+		};
+		const input = buildThresholdsInput('tagThr', values, 0);
+		for (const key of THRESHOLD_WIRE_FIELDS) {
+			expect(key in input, key).toBe(true);
+			expect(input[key], key).toBeNull();
+		}
+		expect(input.expectedRevision).toBe(0);
 	});
 });
 

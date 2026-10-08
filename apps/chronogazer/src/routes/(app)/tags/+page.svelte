@@ -101,6 +101,11 @@
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import { exclusionUnitLabel } from '#lib/banto/collectAdmin.js';
 	import {
+		getTagThresholds,
+		updateTagThresholds,
+		type TagThresholds
+	} from '#lib/banto/tagThresholdsAdmin.js';
+	import {
 		runGuardedSave,
 		runGuardedDelete,
 		schemaWireFields,
@@ -113,6 +118,10 @@
 		runGuardedListLoad,
 		buildTagInput,
 		tagFormValues,
+		buildThresholdsInput,
+		thresholdFormValues,
+		THRESHOLD_WIRE_FIELDS,
+		THRESHOLDS_SAVED_MESSAGE,
 		isRevisionConflict,
 		connectionModeLabel,
 		connectionSavedMessage,
@@ -841,13 +850,8 @@
 				// クライアントを通った値がサーバーで人間可読エラーとして
 				// 跳ね返るだけの手戻りになる）。
 				{ name: `${prefix}Decimals`, label: '小数桁', type: 'number', min: 0, max: 6, default: 0 },
-				// #525: しきい値はタグ定義の属性（recorder-requirements §3.7）。空欄 =
-				// 設定なし。大小関係（LL <= L <= H <= HH）はサーバー（banto-tags）が
-				// 検証し、各欄のすぐ下に出る。
-				{ name: `${prefix}ThresholdLl`, label: 'しきい値 LL（下下限）', type: 'number' },
-				{ name: `${prefix}ThresholdL`, label: 'しきい値 L（下限）', type: 'number' },
-				{ name: `${prefix}ThresholdH`, label: 'しきい値 H（上限）', type: 'number' },
-				{ name: `${prefix}ThresholdHh`, label: 'しきい値 HH（上上限）', type: 'number' },
+				// しきい値はここに無い（#532: タグ定義の属性ではなく、記録計の側の設定。
+				// 編集ペインの下の「しきい値」のフォームで別に保存する）。
 				{ name: `${prefix}Enabled`, label: '有効', type: 'checkbox', default: true }
 			]
 		};
@@ -950,14 +954,108 @@
 
 	/** #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
 	function selectTag(tag: Tag): void {
-		if (!canWrite || savingTag || deletingTag) return;
+		if (!canWrite || savingTag || deletingTag || savingThresholds) return;
 		selectedTag = tag;
 		editTagStore = createFormStore(tagSchema(TAG_EDIT), tagFormValues(TAG_EDIT, tag));
+		void loadThresholds(tag.id);
+	}
+
+	// --- #532: 記録計の側のしきい値（タグとは別の保存） -------------------------
+	//
+	// しきい値はタグ定義の属性ではなく、記録計の側のタグごとの設定。タグの編集
+	// ペインの下に**別のフォーム**（別の「しきい値を保存」・別の版）として置く。
+	// タグのフォームに混ぜて 1 回の保存で 2 つを書くと、片方だけ通ったときの
+	// 状態（タグは保存されたがしきい値は断られた）を画面が説明しきれないため。
+	// 新しいタグには、作成した後に行を選んで設定する（既定は設定なし）。
+	//
+	// - 読み込みは行を選んだとき。応答が返った時点で別の行を選んでいたら捨てる
+	//   （`thresholdsGeneration` と選択中のタグ ID の両方で照合）。
+	// - 読めなかったときはフォームを出さず、理由と「再読み込み」を出す（空の
+	//   フォームを出すと「設定なし」と区別できず、保存で既存の値を消してしまう）。
+	// - 保存の取り違え対策はタグと同じ `runGuardedSave`。版の食い違いは
+	//   トーストで案内し（`expectedRevision` はフォームの欄ではない）、入力は
+	//   消さない。行を選び直すと最新の版で編集できる。
+
+	const TAG_THR = 'tagThr';
+
+	function thresholdSchema(prefix: string): FormSchema {
+		return {
+			fields: [
+				// 空欄 = 設定なし。大小関係（LL <= L <= H <= HH）はサーバーが検証し、
+				// 崩れた側の欄のすぐ下に出る。
+				{ name: `${prefix}ThresholdLl`, label: 'しきい値 LL（下下限）', type: 'number' },
+				{ name: `${prefix}ThresholdL`, label: 'しきい値 L（下限）', type: 'number' },
+				{ name: `${prefix}ThresholdH`, label: 'しきい値 H（上限）', type: 'number' },
+				{ name: `${prefix}ThresholdHh`, label: 'しきい値 HH（上上限）', type: 'number' }
+			]
+		};
+	}
+
+	let selectedThresholds: TagThresholds | null = $state(null);
+	let thresholdsError: string | null = $state(null);
+	let thresholdsGeneration = 0;
+	let editThresholdsStore = $state(untrack(() => createFormStore(thresholdSchema(TAG_THR))));
+	let savingThresholds = $state(false);
+
+	async function loadThresholds(tagId: number): Promise<void> {
+		thresholdsGeneration += 1;
+		const generation = thresholdsGeneration;
+		selectedThresholds = null;
+		thresholdsError = null;
+		try {
+			const loaded = await getTagThresholds(tagId);
+			if (generation !== thresholdsGeneration || selectedTag?.id !== tagId) return;
+			selectedThresholds = loaded;
+			editThresholdsStore = createFormStore(
+				thresholdSchema(TAG_THR),
+				thresholdFormValues(TAG_THR, loaded)
+			);
+		} catch (err) {
+			if (generation !== thresholdsGeneration || selectedTag?.id !== tagId) return;
+			thresholdsError = errorMessage(err);
+		}
+	}
+
+	async function saveThresholds(): Promise<void> {
+		if (!selectedTag || !selectedThresholds || savingThresholds || savingTag || deletingTag) {
+			return;
+		}
+		if (!editThresholdsStore.validateAll()) return;
+		const pending: SaveGuardToken<typeof editThresholdsStore> = {
+			id: selectedTag.id,
+			store: editThresholdsStore
+		};
+		savingThresholds = true;
+		try {
+			const outcome = await runGuardedSave(
+				pending,
+				updateTagThresholds(
+					selectedTag.id,
+					buildThresholdsInput(TAG_THR, editThresholdsStore.values, selectedThresholds.revision)
+				),
+				() => ({ id: selectedTag?.id, store: editThresholdsStore })
+			);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', THRESHOLDS_SAVED_MESSAGE);
+					editThresholdsStore.markClean();
+					selectedThresholds = outcome.entity;
+					break;
+				case 'error':
+					applyServerErrors(TAG_THR, THRESHOLD_WIRE_FIELDS, outcome.err, editThresholdsStore);
+					break;
+				case 'stale-success':
+				case 'stale-error':
+					break;
+			}
+		} finally {
+			savingThresholds = false;
+		}
 	}
 
 	/** #394 レビュー（追補2）: 削除中も保存を素通しさせない（理由は `saveConnection` 参照）。 */
 	async function saveTag(): Promise<void> {
-		if (!selectedTag || savingTag || deletingTag) return;
+		if (!selectedTag || savingTag || deletingTag || savingThresholds) return;
 		if (!editTagStore.validateAll()) return;
 		const pending: SaveGuardToken<typeof editTagStore> = {
 			id: selectedTag.id,
@@ -1000,7 +1098,7 @@
 
 	/** #394 追補: 削除中の応答取り違え対策（理由は `handleDeleteConnection` 参照）。 */
 	async function handleDeleteTag(): Promise<void> {
-		if (!selectedTag || savingTag || deletingTag) return;
+		if (!selectedTag || savingTag || deletingTag || savingThresholds) return;
 		if (!window.confirm(`${selectedTag.name} を削除しますか？`)) return;
 		const pending: DeleteGuardToken = { id: selectedTag.id };
 		deletingTag = true;
@@ -1054,14 +1152,17 @@
 			createTagStore.isDirty ||
 			(selectedConnection !== null && editConnectionStore.isDirty) ||
 			(selectedGroup !== null && editGroupStore.isDirty) ||
-			(selectedTag !== null && editTagStore.isDirty),
+			(selectedTag !== null && editTagStore.isDirty) ||
+			// #532: しきい値のフォームは読めたときだけ出るので、そのときだけ数える。
+			(selectedTag !== null && selectedThresholds !== null && editThresholdsStore.isDirty),
 		isSaving: () =>
 			creatingConnection ||
 			creatingGroup ||
 			creatingTag ||
 			savingConnection ||
 			savingGroup ||
-			savingTag
+			savingTag ||
+			savingThresholds
 	});
 
 	let coverage: SimulationCoverageEntry[] | null = $state(null);
@@ -1536,11 +1637,37 @@
 							type="button"
 							class="danger"
 							onclick={handleDeleteTag}
-							disabled={savingTag || deletingTag}
+							disabled={savingTag || deletingTag || savingThresholds}
 						>
 							削除
 						</button>
 					</BantoForm>
+
+					<div class="thresholds-pane">
+						<h4>しきい値（記録計の設定）</h4>
+						<p class="note">
+							タグの定義とは別に保存します。空欄は設定なしです（色・帯・しきい値のイベントを出しません）。収集中なら「収集を再起動」で反映されます。
+						</p>
+						{#if thresholdsError !== null}
+							<p class="load-error" role="alert">
+								しきい値を読めませんでした（{thresholdsError}）。
+								<button type="button" onclick={() => selectedTag && loadThresholds(selectedTag.id)}>
+									再読み込み
+								</button>
+							</p>
+						{:else if selectedThresholds === null}
+							<p class="loading">しきい値を読み込んでいます…</p>
+						{:else}
+							<UnsavedChangesNotice pending={editThresholdsStore.isDirty} label={UNSAVED_NOTICE} />
+							<BantoForm
+								schema={thresholdSchema(TAG_THR)}
+								store={editThresholdsStore}
+								onSubmit={saveThresholds}
+								submitting={savingThresholds || savingTag || deletingTag}
+								submitLabel="しきい値を保存"
+							/>
+						{/if}
+					</div>
 				</div>
 			{/if}
 		</section>
@@ -1573,6 +1700,12 @@
 	h3 {
 		margin: 0;
 		font-size: 0.95rem;
+	}
+
+	.thresholds-pane {
+		margin-top: 1rem;
+		padding-top: 0.75rem;
+		border-top: 1px solid var(--banto-border);
 	}
 
 	h4 {

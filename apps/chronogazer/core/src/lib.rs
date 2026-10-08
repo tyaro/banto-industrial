@@ -30,6 +30,9 @@ pub mod simulation;
 // #414 段階1: タグのアドレスが接続のプロトコルで読めるかを保存時に確かめる
 // （判定は banto-collect の `check_tag_address`。REST と Tauri の両方から呼ぶ）。
 pub mod tag_address;
+// #532: 記録計の側のタグごとのしきい値（タグ定義の外の設定）。検証・保存は
+// REST と Tauri の両方が同じサービスを使い、収集の開始がここから判定値を読む。
+pub mod tag_thresholds;
 #[cfg(test)]
 pub(crate) mod test_support;
 

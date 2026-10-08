@@ -51,6 +51,7 @@
 //! | GET    | `/api/simulation-coverage` | -              | `SimulationCoverageEntry[]` (viewer+, #413) |
 //! | GET    | `/api/config-exclusions` | -                | `ExclusionView[]` (viewer+, #414 段階2) |
 //! | *      | `/api/display-groups[/order\|/{id}]` | `DisplayGroupPayload` | 表示グループ（viewer+ 読み取り / editor+ 書き込み、#393。表は `rest::display_groups` の doc） |
+//! | *      | `/api/tag-thresholds[/{tagId}]` | `TagThresholdsPayload` | 記録計の側のしきい値（viewer+ 読み取り / editor+ 書き込み、#532。表は `rest::tag_thresholds` の doc） |
 //! | GET    | `/api/collect`   | -                        | `CollectorStateView` (viewer+, #383 段階2b/R1-C) |
 //! | POST   | `/api/collect/start\|stop\|restart` | -     | `CollectOutcome` (editor+) |
 //! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
@@ -229,6 +230,10 @@ use crate::backup::BackupService;
 // #393: 表示グループ。ルーターは子モジュール（`rest/display_groups.rs`）に置く。
 use crate::display_groups::DisplayGroupService;
 mod display_groups;
+// #532: 記録計の側のタグごとのしきい値。ルーターは子モジュール
+// （`rest/tag_thresholds.rs`）に置く。
+use crate::tag_thresholds::TagThresholdService;
+mod tag_thresholds;
 use crate::collect::ExclusionView;
 use crate::collect::{
     parse_tag_ids, validate_history_request, CollectEventList, CollectHistory, CollectOutcome,
@@ -1059,10 +1064,17 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
 /// Wire-shaped (camelCase) create/update payload for `tags`。
 ///
 /// R1-B 指示書の「残すもの」（名前/接続/デバイスアドレス/データ型/
-/// スケーリング/単位/小数桁）に、**しきい値（`thresholdH`/`Hh`/`L`/`Ll`）と
-/// 楽観ロック用の `expectedRevision`**（#525）を加えた形。しきい値は
-/// タグ定義の属性で、収集のしきい値イベントが `tags` テーブルの値を使う
-/// （recorder-requirements.md §3.7。表示グループ #393 は参照するだけ）。
+/// スケーリング/単位/小数桁）に、楽観ロック用の `expectedRevision`（#525）を
+/// 加えた形。
+///
+/// **しきい値は持たない**（#532、2026-10-08 オーナー決定: しきい値はタグ定義の
+/// 属性ではなく、記録計の側のタグごとの設定）。保存は `crate::tag_thresholds`
+/// （`PUT /api/tag-thresholds/{tagId}`・Tauri の `tag_thresholds_update`）で行い、
+/// banto-tags の `tags.threshold_*` の列には常に `None` を渡す（列は banto-hub の
+/// ために #533 まで残るが、ChronoGazer は読みも書きもしない）。`thresholdH` など
+/// を**値付きで**送ってきたクライアント（#532 より前の画面など）は、黙って捨てずに
+/// 検証エラーで断る（[`TagPayload::reject_thresholds`]）。`null` は通す（前の画面は
+/// 空欄を `null` で送っていた）。
 /// 文字列タグ（`stringLength`/`stringEncoding`）は扱わない。
 /// `writable`/`tagKind`/`expression`/`retain` は指示書が明示的に落とす
 /// もの（演算タグ・書き込みは banto-hub 固有 / R0 §7 非スコープ）。
@@ -1070,9 +1082,8 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
 ///
 /// ## 省略したときの意味（banto-hub の `PUT` と同じ「全項目置換」）
 ///
-/// `PUT /api/tags/{id}` は**置換**で、省略した項目は既定値（しきい値なら
-/// 「設定なし」）になる。つまり**しきい値を省略した更新は、既存のしきい値を
-/// 消す**。画面（`/tags`）は常に今の値を送る。これを直接呼ぶクライアントは、
+/// `PUT /api/tags/{id}` は**置換**で、省略した項目は既定値になる。画面
+/// （`/tags`）は常に今の値を送る。これを直接呼ぶクライアントは、
 /// `GET /api/tags/{id}` で取った値を全項目送り返すこと。`expectedRevision` を
 /// 付けると、他者が先に更新していた場合は `409` で拒否する（省略すると
 /// 版を確かめない後勝ち）。
@@ -1095,8 +1106,8 @@ pub struct TagPayload {
     pub unit: Option<String>,
     #[serde(default = "default_tag_decimals")]
     pub decimals: i64,
-    /// しきい値（省略可。範囲外の大小関係は `banto-tags` が `ll <= l <= h <= hh`
-    /// で検証する）。
+    /// #532: 受け取るのは「値付きで送られたら断る」ためだけ
+    /// （[`TagPayload::reject_thresholds`]）。`tags` の列には渡さない。
     #[serde(default)]
     pub threshold_h: Option<f64>,
     #[serde(default)]
@@ -1111,6 +1122,35 @@ pub struct TagPayload {
     /// 省略すると版を確かめない。
     #[serde(default)]
     pub expected_revision: Option<i64>,
+}
+
+/// [`TagPayload::reject_thresholds`] の案内（画面にそのまま出る）。
+pub const TAG_THRESHOLDS_MOVED_MESSAGE: &str =
+    "しきい値はタグの定義ではなく、記録計のしきい値の設定で保存します（/api/tag-thresholds/{tagId}）";
+
+impl TagPayload {
+    /// #532: しきい値を値付きで送ってきたら断る（黙って捨てると、送った側は
+    /// 設定できたと思い込む）。REST・Tauri のタグの作成・更新の最初に呼ぶ。
+    pub fn reject_thresholds(&self) -> Result<(), BantoError> {
+        let field_errors: Vec<FieldError> = [
+            ("thresholdLl", self.threshold_ll),
+            ("thresholdL", self.threshold_l),
+            ("thresholdH", self.threshold_h),
+            ("thresholdHh", self.threshold_hh),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.is_some())
+        .map(|(field, _)| FieldError {
+            field: field.to_string(),
+            message: TAG_THRESHOLDS_MOVED_MESSAGE.to_string(),
+        })
+        .collect();
+        if field_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(BantoError::Validation { field_errors })
+        }
+    }
 }
 
 impl From<TagPayload> for TagInput {
@@ -1133,10 +1173,12 @@ impl From<TagPayload> for TagInput {
             eng_hi: payload.eng_hi,
             unit: payload.unit,
             decimals: payload.decimals,
-            threshold_h: payload.threshold_h,
-            threshold_hh: payload.threshold_hh,
-            threshold_l: payload.threshold_l,
-            threshold_ll: payload.threshold_ll,
+            // #532: しきい値はタグ定義に含めない（記録計の側の設定、
+            // `crate::tag_thresholds`）。列は常に空にする。
+            threshold_h: None,
+            threshold_hh: None,
+            threshold_l: None,
+            threshold_ll: None,
             enabled: payload.enabled,
             writable: false,
             tag_kind: "plc".to_string(),
@@ -1459,6 +1501,7 @@ async fn tags_create(
         "/api/tags",
     )
     .await?;
+    input.reject_thresholds()?;
     ensure_tag_fits_its_connection(
         &state.plc_connections,
         &state.collection_groups,
@@ -1534,6 +1577,7 @@ async fn tags_update(
         "/api/tags/{id}",
     )
     .await?;
+    input.reject_thresholds()?;
     ensure_tag_update_fits_its_connection(
         &state.plc_connections,
         &state.collection_groups,
@@ -1744,6 +1788,13 @@ pub fn api_router(
         .merge(collect_router(collect, audit.clone(), auth.clone()))
         .merge(display_groups::display_groups_router(
             display_groups.clone(),
+            audit.clone(),
+            auth.clone(),
+        ))
+        // #532: しきい値は表示グループと同じ pool（呼び出し元の引数は増やさない。
+        // `DisplayGroupService::pool` の doc）。
+        .merge(tag_thresholds::tag_thresholds_router(
+            TagThresholdService::new(display_groups.pool().clone()),
             audit.clone(),
             auth.clone(),
         ))
@@ -4426,16 +4477,18 @@ mod tests {
 
     // --- #413: 接続単位シミュレーション -------------------------------------
 
-    /// **#525**: タグのしきい値と楽観ロックが REST を通る。
-    /// (1) しきい値を付けて作成・更新でき、読み直しても残る
-    /// (2) 大小関係が崩れた組は `field_errors`（`thresholdH` など）で拒否される
-    /// (3) 古い `expectedRevision` の更新は `409` で拒否され、保存は変わらない
-    /// (4) しきい値を省略した更新は置換（消える）= banto-hub の `PUT` と同じ。
+    /// **#525 / #532**: タグの楽観ロックが REST を通り、しきい値は**タグでは
+    /// 受け取らない**（#532: 記録計の側の設定 `/api/tag-thresholds` へ移った）。
+    /// (1) しきい値を値付きで送った作成・更新は、黙って捨てずに `thresholdH` などの
+    ///     `field_errors` で拒否される（`null` は通る - #532 より前の画面は空欄を
+    ///     `null` で送っていた）。タグの `threshold_*` の列は常に空
+    /// (2) 古い `expectedRevision` の更新は `409` で拒否され、保存は変わらない
+    /// (3) 存在しない・削除済みの id は 404。
     ///
-    /// 反証: `From<TagPayload>` のしきい値・`expected_revision` を `None` に戻すと
-    /// (1)(3) が落ちる。
+    /// 反証（2026-10-08 実施）: `TagPayload::reject_thresholds` を常に `Ok(())`
+    /// にすると (1) の 422 が 200 になって落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tag_routes_carry_thresholds_and_enforce_the_expected_revision() {
+    async fn tag_routes_refuse_thresholds_and_enforce_the_expected_revision() {
         let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
         async fn send(
             router: &Router,
@@ -4473,73 +4526,85 @@ mod tests {
             }
             body
         };
+        let field_names = |body: &serde_json::Value| -> Vec<String> {
+            body["field_errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|fe| fe["field"].as_str().unwrap().to_string())
+                .collect()
+        };
 
-        // (1) しきい値つきで作成できる。
-        let (status, created) = send(
+        // (1) 値付きのしきい値を送った作成は断られる（作られない）。
+        let (status, body) = send(
             &router,
             post_json_auth(
                 "/api/tags",
                 &editor,
-                tag_body(json!({"thresholdLl": 1.0, "thresholdL": 2.0, "thresholdH": 8.0, "thresholdHh": 9.0})),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{created}");
-        assert_eq!(created["thresholdH"], 8.0);
-        assert_eq!(created["thresholdLl"], 1.0);
-        let id = created["id"].as_i64().unwrap();
-        let path = format!("/api/tags/{id}");
-        let revision = created["revision"].as_i64().unwrap();
-
-        // (2) 大小関係が崩れた更新は拒否され、保存は変わらない。
-        let (status, body) = send(
-            &router,
-            put_json_auth(
-                &path,
-                &editor,
-                tag_body(
-                    json!({"thresholdL": 5.0, "thresholdH": 3.0, "expectedRevision": revision}),
-                ),
+                tag_body(json!({"thresholdL": 2.0, "thresholdH": 8.0, "thresholdHh": null})),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["kind"], "validation", "{body}");
-        let fields: Vec<&str> = body["field_errors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|fe| fe["field"].as_str().unwrap())
-            .collect();
-        assert!(
-            fields.iter().any(|f| f.starts_with("threshold")),
-            "しきい値のフィールドエラーが無い: {body}"
-        );
+        assert_eq!(field_names(&body), ["thresholdL", "thresholdH"]);
+        let (_, list) = send(&router, get_auth("/api/tags", &editor)).await;
+        assert!(list.as_array().unwrap().is_empty(), "{list}");
 
-        // しきい値を変えて更新（版は進む）。
-        let (status, updated) = send(
+        // `null` は通り、タグの列は空のまま。
+        let (status, created) = send(
             &router,
-            put_json_auth(
-                &path,
+            post_json_auth(
+                "/api/tags",
                 &editor,
-                tag_body(json!({"thresholdLl": 1.0, "thresholdL": 2.0, "thresholdH": 7.0, "thresholdHh": 9.0, "expectedRevision": revision})),
+                tag_body(json!({"thresholdLl": null, "thresholdL": null, "thresholdH": null, "thresholdHh": null})),
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{updated}");
-        assert_eq!(updated["thresholdH"], 7.0);
-        let new_revision = updated["revision"].as_i64().unwrap();
-        assert!(new_revision > revision);
-        let (_, reread) = send(&router, get_auth(&path, &editor)).await;
-        assert_eq!(reread["thresholdH"], 7.0, "読み直してもしきい値が残る");
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert!(created["thresholdH"].is_null(), "{created}");
+        let id = created["id"].as_i64().unwrap();
+        let path = format!("/api/tags/{id}");
+        let revision = created["revision"].as_i64().unwrap();
 
-        // (3) 古い版での更新は 409。保存は変わらない。
+        // 値付きのしきい値を送った更新も断られ、版も進まない。
         let (status, body) = send(
             &router,
             put_json_auth(
                 &path,
                 &editor,
-                tag_body(json!({"thresholdH": 8.5, "expectedRevision": revision})),
+                tag_body(json!({"thresholdH": 3.0, "expectedRevision": revision})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(field_names(&body), ["thresholdH"]);
+        let (_, reread) = send(&router, get_auth(&path, &editor)).await;
+        assert_eq!(reread["revision"], revision);
+        assert!(reread["thresholdH"].is_null());
+
+        // 版を合わせた更新は通る（版は進む）。
+        let (status, updated) = send(
+            &router,
+            put_json_auth(
+                &path,
+                &editor,
+                tag_body(json!({"unit": "kPa", "expectedRevision": revision})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["unit"], "kPa");
+        let new_revision = updated["revision"].as_i64().unwrap();
+        assert!(new_revision > revision);
+
+        // (2) 古い版での更新は 409。保存は変わらない。
+        let (status, body) = send(
+            &router,
+            put_json_auth(
+                &path,
+                &editor,
+                tag_body(json!({"unit": "MPa", "expectedRevision": revision})),
             ),
         )
         .await;
@@ -4550,10 +4615,10 @@ mod tests {
             "{body}"
         );
         let (_, reread) = send(&router, get_auth(&path, &editor)).await;
-        assert_eq!(reread["thresholdH"], 7.0, "拒否された更新が保存された");
+        assert_eq!(reread["unit"], "kPa", "拒否された更新が保存された");
         assert_eq!(reread["revision"], new_revision);
 
-        // 存在しない id は（版を付けても）409 ではなく 404。
+        // (3) 存在しない id は（版を付けても）409 ではなく 404。
         let (status, body) = send(
             &router,
             put_json_auth(
@@ -4564,12 +4629,6 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-
-        // (4) 省略した更新は置換: しきい値が消える（版を付けない呼び出し）。
-        let (status, cleared) =
-            send(&router, put_json_auth(&path, &editor, tag_body(json!({})))).await;
-        assert_eq!(status, StatusCode::OK, "{cleared}");
-        assert!(cleared["thresholdH"].is_null(), "{cleared}");
 
         // 削除済みのタグへの古い版の更新は 404（409 や 500 ではない）。
         let deleted = router
