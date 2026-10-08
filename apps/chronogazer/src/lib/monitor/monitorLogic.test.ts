@@ -403,6 +403,32 @@ describe('penView（値・品質・しきい値の総当たり）', () => {
 	});
 });
 
+describe('penView の value（バー・計器の描画用、D-2）', () => {
+	const sample = (s: Partial<CurrentSampleView>): CurrentSampleView => ({
+		value: 1,
+		ptimeMs: 1000,
+		quality: 'good',
+		lastGoodMs: 1000,
+		...s
+	});
+	const pen = { tagId: 1, colorSlot: null };
+
+	it.each<[string, CurrentSampleView | undefined, number | null]>([
+		['good・値あり', sample({ value: 12.5 }), 12.5],
+		['good・値 0 は 0（null にしない）', sample({ value: 0 }), 0],
+		['good・値 null', sample({ value: null }), null],
+		['bad は値があっても null（最後の値を描かない）', sample({ value: 42, quality: 'bad' }), null],
+		['stale は値があっても null', sample({ value: 42, quality: 'stale' }), null],
+		['invalid', sample({ value: null, quality: 'invalid', ptimeMs: null, lastGoodMs: null }), null],
+		['未収集（キーが無い）', undefined, null]
+	])('%s', (_label, s, expected) => {
+		const view = penView(pen, 0, s, tag());
+		expect(view.value).toBe(expected);
+		// 「—」と value null は同じ条件（描画と文字が食い違わない）。
+		expect(view.display === NO_VALUE).toBe(expected === null);
+	});
+});
+
 describe('groupPenViews', () => {
 	const g = group({
 		pens: [
@@ -427,11 +453,11 @@ describe('groupPenViews', () => {
 });
 
 describe('isKindRendered / valuesStaleNote', () => {
-	it('D-1 はデジタルだけ', () => {
+	it('デジタル（D-1）とバー・計器（D-2）を描く。トレンドは D-3 まで描かない', () => {
 		expect(isKindRendered('digital')).toBe(true);
 		expect(isKindRendered('trend')).toBe(false);
-		expect(isKindRendered('bar')).toBe(false);
-		expect(isKindRendered('gauge')).toBe(false);
+		expect(isKindRendered('bar')).toBe(true);
+		expect(isKindRendered('gauge')).toBe(true);
 	});
 
 	it('いつの表示かを必ず出す', () => {

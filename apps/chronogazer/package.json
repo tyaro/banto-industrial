@@ -13,12 +13,12 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@banto/admin-core": "github:tyaro/banto#v6.2.0&path:packages/admin-core",
-    "@banto/charts": "github:tyaro/banto#v6.2.0&path:packages/charts",
-    "@banto/forms": "github:tyaro/banto#v6.2.0&path:packages/forms",
-    "@banto/grid-svelte": "github:tyaro/banto#v6.2.0&path:packages/grid-svelte",
-    "@banto/theme": "github:tyaro/banto#v6.2.0&path:packages/theme",
-    "@banto/ui": "github:tyaro/banto#v6.2.0&path:packages/ui",
+    "@banto/admin-core": "github:tyaro/banto#v6.3.0&path:packages/admin-core",
+    "@banto/charts": "github:tyaro/banto#v6.3.0&path:packages/charts",
+    "@banto/forms": "github:tyaro/banto#v6.3.0&path:packages/forms",
+    "@banto/grid-svelte": "github:tyaro/banto#v6.3.0&path:packages/grid-svelte",
+    "@banto/theme": "github:tyaro/banto#v6.3.0&path:packages/theme",
+    "@banto/ui": "github:tyaro/banto#v6.3.0&path:packages/ui",
     "@tauri-apps/api": "^2.12.1"
   },
   "devDependencies": {

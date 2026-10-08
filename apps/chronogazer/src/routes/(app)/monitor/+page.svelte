@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * 監視画面（R1-D の D-1、docs/r1-plan.md）。ログイン後の既定ページ
+	 * 監視画面（R1-D の D-1・D-2、docs/r1-plan.md）。ログイン後の既定ページ
 	 * （`routes/+page.ts`、`routes/login/+page.svelte`）。閲覧公開のセッションにも
 	 * 開いている（`navigation.ts` の `publicViewer: true`）。
 	 *
@@ -11,8 +11,9 @@
 	 *   最初に開いたとき URL は書き換えない（`/monitor` のまま、覚えたグループか
 	 *   先頭を出す）。コマンドパレットの「グループ: ◯◯ を表示」も同じ URL へ移る
 	 *   （`commands.ts` の `displayGroupCommands`。一覧は `displayGroupCatalog` で共有）。
-	 * - **デジタル表示**だけを描く。ほかの種別は「この表示種別は準備中です」
-	 *   （D-2 でバー・計器、D-3 でトレンド）。
+	 * - **デジタル表示**を描く。**バー・計器**は D-2 で足した（`BarPanel.svelte`・
+	 *   `GaugePanel.svelte`。レンジ・色の判断は `meterLogic.ts`）。トレンドは
+	 *   「この表示種別は準備中です」（D-3）。
 	 * - **現在値のポーリング**（`valuesPoller.svelte.ts`）。周期はグループのペンの
 	 *   収集周期の最短を 500ms〜5s に丸めたもの（2026-10-08 オーナー決定 Q1）。
 	 *   描かない種別・ペンが無いグループ・タブが隠れている間は止める。
@@ -54,7 +55,10 @@
 		valuesStaleNote
 	} from '#lib/monitor/monitorLogic.js';
 	import { kindLabel } from '../groups/groupsPageLogic';
+	import { meterViews } from '#lib/monitor/meterLogic.js';
 	import DigitalPanel from '#lib/monitor/DigitalPanel.svelte';
+	import BarPanel from '#lib/monitor/BarPanel.svelte';
+	import GaugePanel from '#lib/monitor/GaugePanel.svelte';
 
 	const available = isTagRegistryAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
@@ -155,6 +159,12 @@
 	const penViews = $derived(
 		pollTarget && values ? groupPenViews(pollTarget, values.values, tags) : []
 	);
+	/** バー・計器の表示（レンジ・色、D-2）。デジタルでは使わない。 */
+	const meters = $derived(
+		pollTarget && (pollTarget.kind === 'bar' || pollTarget.kind === 'gauge')
+			? meterViews(penViews, tags)
+			: []
+	);
 
 	function onVisibilityChange(): void {
 		pageVisible = document.visibilityState === 'visible';
@@ -253,7 +263,7 @@
 						<p class="empty-hint">
 							「{kindLabel(
 								selectedGroup.kind
-							)}」の表示は準備中です。デジタル表示のグループは表示できます。
+							)}」の表示は準備中です。デジタル・バー・計器のグループは表示できます。
 						</p>
 					</div>
 				{:else if selectedGroup.pens.length === 0}
@@ -289,6 +299,15 @@
 								{/if}
 							</p>
 						</div>
+					{:else if selectedGroup.kind === 'bar'}
+						<BarPanel group={selectedGroup} pens={meters} timeLabel={collectTimeLabel} {tagsHref} />
+					{:else if selectedGroup.kind === 'gauge'}
+						<GaugePanel
+							group={selectedGroup}
+							pens={meters}
+							timeLabel={collectTimeLabel}
+							{tagsHref}
+						/>
 					{:else}
 						<DigitalPanel
 							group={selectedGroup}
