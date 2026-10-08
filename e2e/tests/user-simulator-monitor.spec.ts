@@ -574,9 +574,10 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(rampPath).toHaveAttribute('d', /L/, { timeout: 20_000 });
 		const firstD = await rampPath.getAttribute('d');
 		await expect(rampPath).not.toHaveAttribute('d', firstD ?? '', { timeout: 15_000 });
-		// 時刻の目盛（時:分:秒）。
+		// 時刻の目盛（時:分:秒。書式は端末のロケールに任せる。Playwright の既定の en-US では
+		// 「03:41:50 AM」）。
 		await expect(trend.locator('.chart-host svg text.x-tick').first()).toHaveText(
-			/^\d{1,2}:\d{2}:\d{2}$/
+			/^\d{1,2}:\d{2}:\d{2}( [AP]M)?$/
 		);
 
 		// 帯の既定は、しきい値のある最初のペン（上限 = H 0、上が開いた注意の帯）。
