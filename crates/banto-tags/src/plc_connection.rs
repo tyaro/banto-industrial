@@ -1275,9 +1275,10 @@ impl PlcConnectionService {
     /// relates to [`Self::delete_tx`], except `delete`/`delete_tx` do not
     /// need a transaction since each is a single row-affecting statement).
     pub async fn cascade_delete(&self, id: i64) -> Result<PlcConnectionCascadeOutcome, BantoError> {
+        // 先に SELECT するので BEGIN IMMEDIATE（checklist §5 / `update_checked` と同じ理由）。
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
         let outcome = self.cascade_delete_tx(&mut tx, id).await?;
