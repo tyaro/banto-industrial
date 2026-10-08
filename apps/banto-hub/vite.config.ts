@@ -28,7 +28,8 @@ export default defineConfig({
 			'@banto/charts',
 			'@banto/forms',
 			'@banto/grid-svelte',
-			'@banto/theme'
+			'@banto/theme',
+			'@banto/ui'
 		]
 	},
 	// banto-hub 固有の新設: Tauri を持たず axum サーバーが実体なので、

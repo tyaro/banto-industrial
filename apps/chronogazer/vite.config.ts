@@ -23,7 +23,8 @@ export default defineConfig({
 			'@banto/charts',
 			'@banto/forms',
 			'@banto/grid-svelte',
-			'@banto/theme'
+			'@banto/theme',
+			'@banto/ui'
 		]
 	},
 	// Fixed port so tauri.conf.json's devUrl always matches.

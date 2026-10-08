@@ -1720,7 +1720,8 @@
 		onExecuted: () => void;
 		onError: (err: unknown) => void;
 	}): void {
-		let undoToastId: number | undefined;
+		// トーストの id は文字列（`@banto/ui` の `createToastStore()`、banto #220 段階 3）。
+		let undoToastId: string | undefined;
 		deferredDelete.schedule({
 			ids: options.ids,
 			run: options.run,
@@ -1736,7 +1737,7 @@
 		undoToastId = toastStore.push('info', `${options.ids.length}件のタグを削除します`, {
 			action: {
 				label: '取り消し',
-				onClick: () => {
+				onAction: () => {
 					if (deferredDelete.undo()) {
 						toastStore.push('success', '削除を取り消しました');
 					} else {

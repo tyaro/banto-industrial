@@ -173,15 +173,15 @@ utoipa-swagger-ui = { version = "10", default-features = false, features = [
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
 # Cargo.lock に無関係な第2系統を増やさない。
 tokio-tungstenite = "0.29"
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v6.0.0" }
-banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v6.0.0" }
-banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v6.0.0" }
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v6.2.0" }
+banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v6.2.0" }
+banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v6.2.0" }
 # I2a（2026-10-04）: ChronoGazer の users/settings/audit/backup サービスを
 # 自前のコピーから banto のものに置き換えた（独自実装は banto に寄せる、
 # 2026-10-01 オーナー方針）。`banto-server` が既に依存しているので
 # Cargo.lock にパッケージは増えない。`apps/chronogazer/core` と、I3'
 # （2026-10-04）で同じく置き換えた `apps/banto-hub/core` が使う。
-banto-admin-services = { git = "https://github.com/tyaro/banto.git", tag = "v6.0.0" }
+banto-admin-services = { git = "https://github.com/tyaro/banto.git", tag = "v6.2.0" }
 # T3（docs/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
 # カーへ接続するクライアントモードのみ - 組み込みブローカーは §10-4 の判断
 # 待ち）。plan.md §3 で保留になっていた「MQTT クライアント（rumqttc +

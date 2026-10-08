@@ -4,7 +4,9 @@
 	import { page } from '$app/state';
 	import { bantoReady } from '#lib/banto/setup.js'; // initBanto() (+ EventProvider) before any route guard runs (spec §3, §11.1)
 	import { settings } from '#lib/settings.svelte.js';
-	import ToastHost from '#lib/components/ToastHost.svelte';
+	// Toast stack: `@banto/ui`'s ToastHost over the app's single store (banto #220 phase 3).
+	import { ToastHost } from '@banto/ui';
+	import { toastStore } from '#lib/toast.svelte.js';
 	// banto v3.0.0（#286）: 起動待ちは「起動中…」と「サーバーに接続できません
 	// ＋再接続」の 2 状態（`startup.ts` / `startupState.svelte.ts`）。
 	import StartupSplash from '#lib/components/StartupSplash.svelte';
@@ -57,6 +59,6 @@
 		<StartupSplash />
 	{:else}
 		{@render children()}
-		<ToastHost />
+		<ToastHost store={toastStore} />
 	{/if}
 {/await}

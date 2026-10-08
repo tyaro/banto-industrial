@@ -11,7 +11,7 @@
  * は成功させたまま `tags` の読込だけを落とす（`Promise.all` 全体が catch
  * されて `loadError` になる想定どおりの挙動）。
  *
- * トーストの通知文（`ToastHost.svelte` の `.message`）も同じエラー文言を
+ * トーストの通知文（`@banto/ui` の `ToastHost` の `.message`）も同じエラー文言を
  * 一時的に表示するため、画面内バナーの検証は `.right-pane .err`
  * （右ペイン内のインラインエラーのみ）に限定し、トーストとの重複マッチを
  * 避ける。

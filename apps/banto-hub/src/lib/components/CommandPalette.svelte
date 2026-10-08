@@ -1,325 +1,73 @@
 <script lang="ts">
-	// relay-wright の同名コンポーネントから無改変で複製。
-	import { onMount, tick } from 'svelte';
+	/**
+	 * コマンドパレット（Ctrl+K）のアプリ側の半分（banto #220 段階 3、2026-10-08）。
+	 * ダイアログ本体（検索欄・グループ分けした一覧・キー操作・フォーカス
+	 * トラップと戻し・window で受ける Esc・外側クリック・見た目）は `@banto/ui`
+	 * の `CommandPalette`（banto ADR-0018 §8・段階 2b）。ここに残すのは
+	 * banto-hub を知っている部分だけ: コマンドの一覧（`#lib/commands.ts`）、
+	 * admin-core の点数付き検索、最近使ったコマンドの記録、失敗の通知、
+	 * 閉じたときの戻し先が死んでいたときの代わり（ヘッダーの先頭ボタン）。
+	 *
+	 * `(app)/+layout.svelte` が `commandPaletteStore.open` のあいだだけ
+	 * マウントする（`{#if}`）ので、開くたびに新しいインスタンスになり、
+	 * コマンドの一覧と最近使った記録は開いた時点のものを読む。
+	 *
+	 * ## 層の約束（`escLayering.ts` の doc が正）との合わせ方
+	 *
+	 * `@banto/ui` のパレットは #381 の約束 1〜5 を banto-hub から移したもので、
+	 * 層の印（`role="dialog"` / `role="menu"` / `data-esc-layer` /
+	 * `data-layer-inactive`）も同じものを見る。z-index は `--banto-z-overlay`
+	 * （1000、以前の直書きと同じ値）。
+	 *
+	 * - Esc（約束 1〜3）: window で受け、閉じるときは `preventDefault` する。
+	 *   **自分より手前の層（z が大きい、同じ z なら DOM で後ろ）にだけ譲る**。
+	 *   以前のこの部品は「譲る相手を見ない」実装だった（パレットが最上位で、
+	 *   z だけ見る判定が無かったため）。banto 側は z 順で比べるので、下にある
+	 *   Drawer/Modal（900）・オフキャンバスサイドバー（710）を手前と誤認しない。
+	 *   同じ z（1000）の `TreeContextMenu` とは同時に出さない
+	 *   （`(app)/+layout.svelte` の `Ctrl+K` の抑止）のは従来どおり。
+	 * - フォーカストラップ（約束 4）: Tab の循環 + document の `focusin` の
+	 *   引き戻しの 2 段構え（`focusTrap.ts` と同じ形）。
+	 * - フォーカスの戻し（約束 5）: 閉じたら開いた元へ、`tick()` の後に判定する
+	 *   （ナビ系コマンドの `goto()` → `afterNavigate` でサイドバーが畳まれ、
+	 *   戻し先が同じ流れの中で `inert` になるため）。戻し先が消えている /
+	 *   `inert` / 不可視なら `focusFallback`（ヘッダーの先頭ボタン ☰ - 常設で
+	 *   どの画面にもある）へ。`<body>` には落とさない。
+	 */
+	import { CommandPalette } from '@banto/ui';
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
 	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '#lib/commands.js';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
-	import { attachFocusTrap } from './focusTrap';
-	import { restoreFocus } from './focusRestore';
 
+	// 開くたびにマウントされるので、どちらも開いた時点の値。
 	const commands = buildCommands();
 	const recentIds = loadRecentCommandIds();
 
-	let query = $state('');
-	let selectedIndex = $state(0);
-	let executing = $state(false);
-	let inputEl: HTMLInputElement | undefined = $state();
-	let paletteEl: HTMLDivElement | undefined = $state();
-
-	const flatResults = $derived(searchCommands(commands, query, recentIds));
-
-	interface DisplayItem {
-		command: PaletteCommand;
-		index: number;
-	}
-	interface DisplayGroup {
-		group: string;
-		items: DisplayItem[];
+	// admin-core の点数付き検索（最近使ったものは同点の並びと空の検索語で先頭に
+	// 来る）。最近使ったものは「並び順」であって別の見出しではないので、
+	// パッケージの `recentIds`（「最近使ったもの」の見出し）は使わない - 以前の
+	// 表示と同じ。
+	function search(query: string, items: readonly PaletteCommand[]): PaletteCommand[] {
+		return searchCommands([...items], query, recentIds);
 	}
 
-	const displayGroups = $derived.by((): DisplayGroup[] => {
-		const groupOrder: string[] = [];
-		const byGroup = new Map<string, PaletteCommand[]>();
-		for (const command of flatResults) {
-			if (!byGroup.has(command.group)) {
-				byGroup.set(command.group, []);
-				groupOrder.push(command.group);
-			}
-			byGroup.get(command.group)!.push(command);
-		}
-		let index = 0;
-		return groupOrder.map((group) => ({
-			group,
-			items: byGroup.get(group)!.map((command) => ({ command, index: index++ }))
-		}));
-	});
-
-	const orderedCommands = $derived(
-		displayGroups.flatMap((g) => g.items.map((item) => item.command))
-	);
-	const selectedCommand = $derived(orderedCommands[selectedIndex]);
-
-	$effect(() => {
-		// eslint-disable-next-line @typescript-eslint/no-unused-expressions
-		query;
-		selectedIndex = 0;
-	});
-
-	/**
-	 * #381 レビュー対応9回目: パレットを開く前にフォーカスがあった要素。閉じる
-	 * ときにここへ戻す（層の約束・項目5、`escLayering.ts`）。`Ctrl+K` は Drawer や
-	 * コンテキストメニューの中からでも効くので、戻さないとフォーカスが
-	 * `<body>` に落ち、**次の Tab が Drawer のトラップをすり抜ける**（body 起点の
-	 * Tab はパネルの keydown を通らない）。`$state` にしない（描画に使わない）。
-	 */
-	let triggerEl: HTMLElement | null = null;
-
-	onMount(() => {
-		const active = document.activeElement;
-		triggerEl = active instanceof HTMLElement ? active : null;
-		inputEl?.focus();
-		// アンマウント時（＝閉じたとき）に開いた元へ戻す。戻り先が消えている /
-		// `inert` の中なら何もしない（`focusRestore.ts` - `<body>` へは落とさない）。
-		return () => {
-			const previous = triggerEl;
-			triggerEl = null;
-			// #381 レビュー対応12回目: 戻し先が死んでいる（コマンドが画面遷移して
-			// 消えた・閉じたサイドバーの中で `inert` になった等）ときは、ヘッダーの
-			// 先頭ボタン（☰ - 常設でどの画面にもある）へ逃がす。`<body>` には
-			// 落とさない（層の約束・項目5）。
-			//
-			// **`tick()` の後に判定する**: ナビ系コマンドは `goto()` のあと
-			// `afterNavigate` がサイドバーを畳む、というように**同じ流れの中で
-			// 戻し先の生死が変わる**。先に戻してしまうと、直後に `inert` が付いて
-			// フォーカスが `<body>` へ落ちる（`Drawer`/`Modal` と同じ理由）。
-			void tick().then(() =>
-				restoreFocus(previous, () =>
-					restoreFocus(document.querySelector<HTMLElement>('header button'))
-				)
-			);
-		};
-	});
-
-	/**
-	 * #381 レビュー対応9回目: `aria-modal="true"` を名乗る層は必ずフォーカス
-	 * トラップを持つ（層の約束・項目4）。`Drawer.svelte`/`Modal.svelte` と同じ
-	 * 張り方（`focusTrap.ts`）。この部品は開いている間だけマウントされる。
-	 */
-	$effect(() => {
-		const node = paletteEl;
-		if (!node) return;
-		return attachFocusTrap(node);
-	});
-
-	function clampIndex(next: number): number {
-		const count = orderedCommands.length;
-		if (count === 0) return 0;
-		return ((next % count) + count) % count;
-	}
-
-	async function executeCommand(command: PaletteCommand): Promise<void> {
-		executing = true;
+	// 実行中は行が無効になり、終わるとパッケージが閉じる（下の `onClose`）。
+	// 失敗はここで通知し、投げ直さない。
+	async function execute(command: PaletteCommand): Promise<void> {
 		try {
 			await command.run();
 		} catch (err) {
 			notify('error', isProviderError(err) ? err.message : String(err));
-		} finally {
-			executing = false;
 		}
 		recordRecentCommand(command.id);
-		commandPaletteStore.hide();
-	}
-
-	function handleKeydown(event: KeyboardEvent): void {
-		switch (event.key) {
-			case 'ArrowDown':
-				event.preventDefault();
-				selectedIndex = clampIndex(selectedIndex + 1);
-				break;
-			case 'ArrowUp':
-				event.preventDefault();
-				selectedIndex = clampIndex(selectedIndex - 1);
-				break;
-			case 'Enter':
-				event.preventDefault();
-				if (selectedCommand) void executeCommand(selectedCommand);
-				break;
-			// Escape は**window 側**（`handleWindowKeydown`）で処理する -
-			// 層の約束（`escLayering.ts` の doc、項目3）。ここ（検索 input の
-			// `onkeydown`）だけで閉じていると、フォーカスがパレットの外にある
-			// 状態の Esc でパレットが閉じず、かつ下の層はみな「可視な上位層が
-			// ある」と見て譲るので、**Esc が何も閉じない**状態になる。Tab 移動
-			// 自体はフォーカストラップ（`focusTrap.ts`、レビュー9回目で追加）で
-			// 閉じ込めているが、外部要因（プログラム的な `focus()` 等）で外れる
-			// ことはあるので、window 側の処理は保険として要る。
-		}
-	}
-
-	/**
-	 * #381 レビュー対応6回目: フォーカス位置に依存しない Esc（層の約束・項目3、
-	 * フォーカスが外部要因でパネルの外にあっても閉じられるようにする保険 -
-	 * `escLayering.ts`）。閉じるときは `preventDefault` して下の層へ伝える
-	 * （項目1）ところは `Drawer.svelte`/`Modal.svelte` と同じ。
-	 *
-	 * **譲る相手は見ない**（`hasVisibleLayerAbove` を使わない）: パレットは
-	 * この app の**最上位層**（z-index 1000。同じ 1000 の `TreeContextMenu` は
-	 * パレットの外側クリックで閉じるため同時に開かない）なので、自分より手前の
-	 * 層が存在しない。`hasVisibleLayerAbove({ except: 自分 })` は「自分以外の
-	 * 可視な層」しか見ないので、**下にある Drawer を「手前の層」と誤認して譲り、
-	 * Esc で何も閉じなくなる**（E2E で実測）。パレットより手前に出る UI を将来
-	 * 足すなら、ここに上下関係の判定を入れること。
-	 *
-	 * この部品は `commandPaletteStore.open` のときだけマウントされるので
-	 * `open` の判定は不要。
-	 */
-	function handleWindowKeydown(event: KeyboardEvent): void {
-		if (event.key !== 'Escape' || event.defaultPrevented) return;
-		event.preventDefault();
-		commandPaletteStore.hide();
-	}
-
-	function handleWindowPointerDown(event: PointerEvent): void {
-		if (paletteEl && event.target instanceof Node && !paletteEl.contains(event.target)) {
-			commandPaletteStore.hide();
-		}
 	}
 </script>
 
-<svelte:window onpointerdown={handleWindowPointerDown} onkeydown={handleWindowKeydown} />
-
-<div class="overlay">
-	<div
-		class="palette"
-		role="dialog"
-		aria-modal="true"
-		aria-label="コマンドパレット"
-		bind:this={paletteEl}
-	>
-		<input
-			type="text"
-			class="search"
-			placeholder="コマンドを検索…"
-			autocomplete="off"
-			spellcheck="false"
-			role="combobox"
-			aria-expanded="true"
-			aria-controls="command-palette-list"
-			aria-activedescendant={selectedCommand
-				? `command-palette-item-${selectedCommand.id}`
-				: undefined}
-			bind:value={query}
-			bind:this={inputEl}
-			onkeydown={handleKeydown}
-		/>
-
-		<div class="results" id="command-palette-list" role="listbox" aria-label="コマンド一覧">
-			{#if orderedCommands.length === 0}
-				<p class="empty">一致するコマンドがありません</p>
-			{/if}
-			{#each displayGroups as group (group.group)}
-				<div class="group-heading">{group.group}</div>
-				{#each group.items as item (item.command.id)}
-					<button
-						id={`command-palette-item-${item.command.id}`}
-						type="button"
-						class="result"
-						class:selected={item.index === selectedIndex}
-						role="option"
-						aria-selected={item.index === selectedIndex}
-						disabled={executing}
-						onmouseenter={() => (selectedIndex = item.index)}
-						onclick={() => executeCommand(item.command)}
-					>
-						{item.command.title}
-					</button>
-				{/each}
-			{/each}
-		</div>
-	</div>
-</div>
-
-<style>
-	.overlay {
-		position: fixed;
-		inset: 0;
-		z-index: 1000;
-		display: flex;
-		justify-content: center;
-		align-items: flex-start;
-		padding-top: 12vh;
-		background: rgba(0, 0, 0, 0.35);
-	}
-
-	.palette {
-		display: flex;
-		flex-direction: column;
-		width: min(560px, calc(100vw - 2rem));
-		max-height: min(60vh, 480px);
-		background: var(--banto-surface-raised, var(--banto-surface));
-		border: 1px solid var(--banto-border);
-		border-radius: calc(var(--banto-radius) * 2);
-		box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
-		overflow: hidden;
-		backdrop-filter: var(--banto-backdrop, none);
-		-webkit-backdrop-filter: var(--banto-backdrop, none);
-	}
-
-	.search {
-		flex: 0 0 auto;
-		width: 100%;
-		box-sizing: border-box;
-		padding: 0.9rem 1rem;
-		border: none;
-		border-bottom: 1px solid var(--banto-border);
-		background: transparent;
-		color: var(--banto-text);
-		font-size: 1rem;
-	}
-
-	.search:focus {
-		outline: none;
-	}
-
-	.results {
-		flex: 1;
-		min-height: 0;
-		overflow-y: auto;
-		padding: 0.4rem;
-	}
-
-	.empty {
-		margin: 0;
-		padding: 1rem;
-		text-align: center;
-		color: var(--banto-text-muted);
-		font-size: 0.85rem;
-	}
-
-	.group-heading {
-		padding: 0.5rem 0.6rem 0.25rem;
-		color: var(--banto-text-muted);
-		font-size: 0.7rem;
-		font-weight: 700;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-
-	.result {
-		display: block;
-		width: 100%;
-		box-sizing: border-box;
-		padding: 0.55rem 0.7rem;
-		border: none;
-		border-radius: var(--banto-radius);
-		background: transparent;
-		color: var(--banto-text);
-		font-size: 0.875rem;
-		text-align: left;
-		cursor: pointer;
-	}
-
-	.result:disabled {
-		cursor: not-allowed;
-		opacity: 0.6;
-	}
-
-	.result.selected {
-		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
-		color: var(--banto-primary);
-	}
-
-	:global([data-banto-preset='glass']) .result.selected {
-		background: var(--banto-accent-gradient);
-		color: var(--banto-text-inverse);
-	}
-</style>
+<CommandPalette
+	open
+	items={commands}
+	{search}
+	onExecute={execute}
+	onClose={() => commandPaletteStore.hide()}
+	focusFallback={() => document.querySelector<HTMLElement>('header button')}
+/>
