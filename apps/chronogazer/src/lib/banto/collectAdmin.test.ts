@@ -19,6 +19,10 @@ import {
 	COLLECT_POLL_FAILURE_LIMIT,
 	COLLECT_UI_TIMEOUT_MS,
 	collectActionLabel,
+	collectHistoryQuery,
+	HISTORY_MAX_BINS,
+	HISTORY_MAX_POINTS,
+	HISTORY_MAX_TAGS,
 	collectConnectionsNote,
 	collectExclusions,
 	collectExclusionsHeadline,
@@ -490,5 +494,41 @@ describe('qualityLabel（#414 段階2）', () => {
 		expect(new Set(labels).size).toBe(qualities.length);
 		expect(qualityLabel('invalid')).toContain('設定');
 		expect(qualityLabel('bad')).not.toContain('設定');
+	});
+});
+
+describe('collectHistoryQuery（R1-D の D-3a）', () => {
+	it('tagIds をカンマ区切りにし、期間と bins を数値のまま載せる', () => {
+		const query = collectHistoryQuery({
+			tagIds: [3, 1, 2],
+			fromMs: 1_700_000_000_000,
+			toMs: 1_700_000_600_000,
+			bins: 600
+		});
+		const parsed = new URLSearchParams(query);
+		expect(parsed.get('tagIds')).toBe('3,1,2');
+		expect(parsed.get('fromMs')).toBe('1700000000000');
+		expect(parsed.get('toMs')).toBe('1700000600000');
+		expect(parsed.get('bins')).toBe('600');
+		// カンマはエンコードされても、サーバー（axum のクエリ解釈）は元に戻して読む。
+		expect(query).toContain('tagIds=3%2C1%2C2');
+	});
+
+	it('上限を外れた値も丸めずにそのまま送る（検証はサーバー）', () => {
+		const parsed = new URLSearchParams(
+			collectHistoryQuery({ tagIds: [], fromMs: 10, toMs: 5, bins: 0 })
+		);
+		expect(parsed.get('tagIds')).toBe('');
+		expect(parsed.get('fromMs')).toBe('10');
+		expect(parsed.get('toMs')).toBe('5');
+		expect(parsed.get('bins')).toBe('0');
+	});
+});
+
+describe('履歴の上限（Rust の定数の写し）', () => {
+	it('HISTORY_MAX_BINS・HISTORY_MAX_POINTS が Rust と同じ値（8 ペンなら 1 本 1000 区間）', () => {
+		expect(HISTORY_MAX_BINS).toBe(2000);
+		expect(HISTORY_MAX_POINTS).toBe(8000);
+		expect(Math.floor(HISTORY_MAX_POINTS / HISTORY_MAX_TAGS)).toBe(1000);
 	});
 });
