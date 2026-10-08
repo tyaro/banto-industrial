@@ -11,13 +11,19 @@
 //! ## スキーマの出所（DB スキーマの整理、2026-10-02 オーナー決定）
 //!
 //! この app 自身のテーブルは banto の admin-template と**同じ形**にする。
-//! `migrations-sqlite/` の 5 本は、当面
+//! `migrations-sqlite/` の `0002`〜`0007` の 5 本は、当面
 //! `banto v2.1.1 apps/admin-template/core/migrations-sqlite/<同じファイル名>`
 //! を **byte 等価**でコピーしたもの（banto 側には手を入れない。番号の飛び -
 //! `0001_items`・`0006_attachments` が無い - は上流の番号をそのまま残している
 //! ため）。ファイルの中身を書き換えないこと: 上流と食い違うと「banto に寄せる」
 //! 土台にならず、`sqlx` の checksum も変わる。上流を上げるときは同じ名前で
 //! コピーし直す。
+//!
+//! **この app 固有の migration は `0101_*` から振る**（#393 の
+//! `0101_display_groups.sql` = 表示グループが最初。banto-hub 固有のテーブルと
+//! 同じ決まり - plan.md §5 の 2026-10-02 の決定）。上流が 0008 以降を足した
+//! ときに同じ番号を取り合わないため。こちらは上流のコピーではないので、
+//! 必要なら新しい番号で足す（既存のファイルは書き換えない）。
 //!
 //! ## なぜ `sqlx::migrate!` に戻せたか
 //!
@@ -242,6 +248,9 @@ mod tests {
             "tags",
             // #383 段階2b / R1-C: `banto_collect::migrate` の分。
             "collect_events",
+            // #393: この app 固有の migration（0101_display_groups.sql）。
+            "display_groups",
+            "display_group_pens",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -296,7 +305,8 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(versions, vec![2, 3, 4, 5, 7]);
+        // 2〜7 は admin-template のコピー、101 からはこの app 固有（#393 の表示グループ）。
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 101]);
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
         )

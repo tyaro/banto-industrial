@@ -10,6 +10,9 @@ pub mod assets;
 // `banto-serve` の両方から同じ形で使える。
 pub mod collect;
 pub mod db;
+// #393（#524 の段階 1）: 表示グループのデータモデル・検証・サービス。REST と
+// Tauri の両方が同じ検証関数・同じサービスを使う（モジュール doc 参照）。
+pub mod display_groups;
 pub mod events;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。

@@ -37,6 +37,11 @@ use chronogazer_core::collect::{
     COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::{init_db, Db, InitDbError};
+// #393: 表示グループ。検証・保存は REST と同じ `DisplayGroupService`。
+use chronogazer_core::display_groups::{
+    audit_detail as display_group_audit_detail, DisplayGroup, DisplayGroupPayload,
+    DisplayGroupService, AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
+};
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
@@ -1697,6 +1702,8 @@ async fn start_embedded_server(
     // コマンドと LAN ブラウザの `/api/collect*` が**同じ実体**を操作する
     // ように、`hub` と同じく `AppState` のハンドルをそのまま渡す。
     collect: CollectorService,
+    // #393: 表示グループ（同じ pool）。
+    display_groups: DisplayGroupService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     bound: BoundServer,
@@ -1719,6 +1726,7 @@ async fn start_embedded_server(
             collection_groups,
             tags,
             collect,
+            display_groups,
             auth,
             events,
             false,
@@ -1741,6 +1749,7 @@ async fn serve_embedded(state: &AppState, bound: BoundServer) -> RunningServer {
         state.collection_groups.clone(),
         state.tags.clone(),
         state.collect.clone(),
+        display_groups_service(state),
         state.rest_auth.clone(),
         state.events.clone(),
         bound,
@@ -2818,8 +2827,17 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
 /// `editor`+ (R0 §3.6): delete a tag.
 #[tauri::command]
 async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
-    let actor = require_role(&state, Role::Editor, "tags").await?;
-    state.tags.delete(id).await?;
+    tags_delete_body(&state, id).await
+}
+
+/// Body of [`tags_delete`]（#393 のテストがコマンドの本体を直接呼ぶため）。
+async fn tags_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    // #393（§3.7.9 の 8）: REST の `tags_delete` と同じく、表示グループの
+    // ペンに割り当てられたタグは参照元を並べて削除を拒否する。
+    display_groups_service(state)
+        .delete_tag_unless_referenced(&state.tags, id)
+        .await?;
     state
         .audit
         .record(AuditEntry {
@@ -2834,6 +2852,158 @@ async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoErr
         })
         .await;
     Ok(())
+}
+
+// --- #393: 表示グループ ------------------------------------------------------
+
+/// 表示グループのサービス。`AppState` の pool から都度組む（`Clone` の pool
+/// ハンドルを包むだけなので軽い。`AppState` にフィールドを足さないのは、
+/// テストの `AppState` の組み立てを増やさないため）。
+fn display_groups_service(state: &AppState) -> DisplayGroupService {
+    DisplayGroupService::new(state.pool.clone())
+}
+
+/// 書き込みの監査（REST の `record_write` と同じ中身、`origin: "tauri"`）。
+async fn record_display_group_write(
+    state: &AppState,
+    actor: &UserIdentity,
+    action: &str,
+    entity_id: Option<&str>,
+    detail: Option<serde_json::Value>,
+) {
+    record_ok(
+        &state.audit,
+        actor,
+        action,
+        DISPLAY_GROUPS_RESOURCE,
+        entity_id,
+        detail,
+    )
+    .await;
+}
+
+/// `viewer`+ (R0 §3.6): 表示グループの一覧（並び順）。
+#[tauri::command]
+async fn display_groups_list(state: State<'_, AppState>) -> Result<Vec<DisplayGroup>, BantoError> {
+    display_groups_list_body(&state).await
+}
+
+async fn display_groups_list_body(state: &AppState) -> Result<Vec<DisplayGroup>, BantoError> {
+    require_role(state, Role::Viewer, DISPLAY_GROUPS_RESOURCE).await?;
+    display_groups_service(state).list().await
+}
+
+/// `viewer`+ (R0 §3.6): 表示グループを 1 つ。
+#[tauri::command]
+async fn display_groups_get(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<DisplayGroup, BantoError> {
+    require_role(&state, Role::Viewer, DISPLAY_GROUPS_RESOURCE).await?;
+    display_groups_service(&state).get(id).await
+}
+
+/// `editor`+ (R0 §3.6): 表示グループの作成。検証は REST と同じ
+/// `validate_display_group`（サービスの中）。
+#[tauri::command]
+async fn display_groups_create(
+    state: State<'_, AppState>,
+    input: DisplayGroupPayload,
+) -> Result<DisplayGroup, BantoError> {
+    display_groups_create_body(&state, input).await
+}
+
+async fn display_groups_create_body(
+    state: &AppState,
+    input: DisplayGroupPayload,
+) -> Result<DisplayGroup, BantoError> {
+    let actor = require_role(state, Role::Editor, DISPLAY_GROUPS_RESOURCE).await?;
+    let created = display_groups_service(state).create(&input).await?;
+    record_display_group_write(
+        state,
+        &actor,
+        "create",
+        Some(&created.id.to_string()),
+        Some(display_group_audit_detail(&created)),
+    )
+    .await;
+    Ok(created)
+}
+
+/// `editor`+ (R0 §3.6): 表示グループの更新。版の食い違いは REST の `409` と
+/// 同じ本文の検証エラー（`field_errors` の `expectedRevision`）。
+#[tauri::command]
+async fn display_groups_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: DisplayGroupPayload,
+) -> Result<DisplayGroup, BantoError> {
+    display_groups_update_body(&state, id, input).await
+}
+
+async fn display_groups_update_body(
+    state: &AppState,
+    id: i64,
+    input: DisplayGroupPayload,
+) -> Result<DisplayGroup, BantoError> {
+    let actor = require_role(state, Role::Editor, DISPLAY_GROUPS_RESOURCE).await?;
+    let updated = display_groups_service(state).update(id, &input).await?;
+    record_display_group_write(
+        state,
+        &actor,
+        "update",
+        Some(&id.to_string()),
+        Some(display_group_audit_detail(&updated)),
+    )
+    .await;
+    Ok(updated)
+}
+
+/// `editor`+ (R0 §3.6): 表示グループの削除。
+#[tauri::command]
+async fn display_groups_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    display_groups_delete_body(&state, id).await
+}
+
+async fn display_groups_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, DISPLAY_GROUPS_RESOURCE).await?;
+    let deleted = display_groups_service(state).delete(id).await?;
+    record_display_group_write(
+        state,
+        &actor,
+        "delete",
+        Some(&id.to_string()),
+        Some(serde_json::json!({ "name": deleted.name })),
+    )
+    .await;
+    Ok(())
+}
+
+/// `editor`+ (R0 §3.6): 表示グループの並べ替え（`ids` は全グループを新しい
+/// 順で 1 回ずつ）。
+#[tauri::command]
+async fn display_groups_reorder(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<Vec<DisplayGroup>, BantoError> {
+    display_groups_reorder_body(&state, ids).await
+}
+
+async fn display_groups_reorder_body(
+    state: &AppState,
+    ids: Vec<i64>,
+) -> Result<Vec<DisplayGroup>, BantoError> {
+    let actor = require_role(state, Role::Editor, DISPLAY_GROUPS_RESOURCE).await?;
+    let groups = display_groups_service(state).reorder(&ids).await?;
+    record_display_group_write(
+        state,
+        &actor,
+        "reorder",
+        None,
+        Some(serde_json::json!({ "ids": ids })),
+    )
+    .await;
+    Ok(groups)
 }
 
 /// Body of [`audit_log_list`], split out so the `asOfId`-gated prune
@@ -4042,6 +4212,7 @@ pub fn run() {
                         collection_groups.clone(),
                         tags.clone(),
                         collect.clone(),
+                        DisplayGroupService::new(pool.clone()),
                         rest_auth.clone(),
                         events.clone(),
                         bound,
@@ -4173,6 +4344,12 @@ pub fn run() {
             tags_create,
             tags_update,
             tags_delete,
+            display_groups_list,
+            display_groups_get,
+            display_groups_create,
+            display_groups_update,
+            display_groups_delete,
+            display_groups_reorder,
             simulation_coverage_list,
             config_exclusions_list,
             collect_status,
@@ -5727,6 +5904,7 @@ mod tests {
             state.collection_groups.clone(),
             state.tags.clone(),
             state.collect.clone(),
+            display_groups_service(state),
             state.rest_auth.clone(),
             state.events.clone(),
             false,
@@ -8510,5 +8688,157 @@ mod tests {
                 "disabled={disabled} enabled={enabled} viewer_public={viewer_public}"
             );
         }
+    }
+
+    // --- #393: 表示グループ（Tauri 経路） ---------------------------------------
+
+    fn display_group_input(name: &str, kind: &str, tag_ids: &[i64]) -> DisplayGroupPayload {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "pens": tag_ids.iter().map(|id| serde_json::json!({ "tagId": id })).collect::<Vec<_>>(),
+        }))
+        .expect("DisplayGroupPayload")
+    }
+
+    /// `display_groups` の監査の (action, result, origin)。
+    async fn display_group_audit(state: &AppState) -> Vec<(String, String, String)> {
+        let page = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let mut rows: Vec<_> = page
+            .rows
+            .into_iter()
+            .filter(|row| row.resource == "display_groups")
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        rows.into_iter()
+            .map(|row| (row.action, row.result, row.origin))
+            .collect()
+    }
+
+    /// **#393（Tauri 経路）**: REST と同じサービス・同じ検証・同じ監査の形。
+    /// viewer は読むだけ（書き込みは `Forbidden` で `denied` を監査）、editor は
+    /// 作成・更新・並べ替え・削除ができ、古い版の更新は `expectedRevision` の
+    /// 検証エラー。ペンに割り当てたタグの `tags_delete` は参照元つきで拒否する。
+    ///
+    /// 反証（2026-10-08 実施）: `tags_delete_body` を `state.tags.delete(id)` に
+    /// 戻すと、`expect_err("参照されているタグ…")` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn display_group_commands_crud_rbac_audit_and_tag_delete_refusal() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+
+        let conn = state
+            .plc_connections
+            .create(connection_payload("plc", "modbus-tcp").into_create_input())
+            .await
+            .expect("create connection");
+        let group = state
+            .collection_groups
+            .create(
+                CollectionGroupPayload {
+                    name: "cg".to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 1000,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create collection group");
+        let mut tag_ids = Vec::new();
+        for (name, address) in [("t1", "40001"), ("t2", "40002")] {
+            let tag = state
+                .tags
+                .create(tag_payload(name, group.id, address).into())
+                .await
+                .expect("create tag");
+            tag_ids.push(tag.id);
+        }
+
+        // viewer: 読めるが書けない。
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
+        assert!(display_groups_list_body(&state).await.unwrap().is_empty());
+        let err = display_groups_create_body(&state, display_group_input("L1", "trend", &tag_ids))
+            .await
+            .expect_err("viewer が作成できてしまった");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+
+        // editor: 作成 → 更新 → 古い版 → 並べ替え → タグの削除の拒否 → 削除。
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+        let created =
+            display_groups_create_body(&state, display_group_input("L1", "trend", &tag_ids))
+                .await
+                .expect("create");
+        let other = display_groups_create_body(&state, display_group_input("L2", "bar", &[]))
+            .await
+            .expect("create other");
+        let err = display_groups_create_body(&state, display_group_input("L1", "gauge", &[]))
+            .await
+            .expect_err("同名");
+        assert_eq!(only_field_error(err).field, "name");
+
+        let mut edit = display_group_input("L1改", "digital", &tag_ids[..1]);
+        edit.expected_revision = Some(created.revision);
+        let updated = display_groups_update_body(&state, created.id, edit.clone())
+            .await
+            .expect("update");
+        assert_eq!(updated.revision, created.revision + 1);
+        let err = display_groups_update_body(&state, created.id, edit)
+            .await
+            .expect_err("古い版");
+        assert_eq!(only_field_error(err).field, "expectedRevision");
+
+        let reordered = display_groups_reorder_body(&state, vec![other.id, created.id])
+            .await
+            .expect("reorder");
+        assert_eq!(reordered[0].id, other.id);
+
+        let err = tags_delete_body(&state, tag_ids[0])
+            .await
+            .expect_err("参照されているタグが消せてしまった");
+        let field = only_field_error(err);
+        assert_eq!(field.field, "displayGroups");
+        assert!(field.message.contains("「L1改」"), "{}", field.message);
+        assert!(state.tags.get(tag_ids[0]).await.is_ok());
+        tags_delete_body(&state, tag_ids[1])
+            .await
+            .expect("参照されていないタグは消せる");
+
+        display_groups_delete_body(&state, created.id)
+            .await
+            .expect("delete");
+        tags_delete_body(&state, tag_ids[0])
+            .await
+            .expect("グループを消せばタグも消せる");
+
+        assert_eq!(
+            display_group_audit(&state).await,
+            [
+                ("denied", "denied"),
+                ("create", "ok"),
+                ("create", "ok"),
+                ("update", "ok"),
+                ("reorder", "ok"),
+                ("delete", "ok"),
+            ]
+            .map(|(action, result)| (
+                action.to_string(),
+                result.to_string(),
+                "tauri".to_string()
+            ))
+        );
     }
 }

@@ -50,6 +50,7 @@
 //! | DELETE | `/api/tags/{id}` | -                        | 204 (editor+)           |
 //! | GET    | `/api/simulation-coverage` | -              | `SimulationCoverageEntry[]` (viewer+, #413) |
 //! | GET    | `/api/config-exclusions` | -                | `ExclusionView[]` (viewer+, #414 段階2) |
+//! | *      | `/api/display-groups[/order\|/{id}]` | `DisplayGroupPayload` | 表示グループ（viewer+ 読み取り / editor+ 書き込み、#393。表は `rest::display_groups` の doc） |
 //! | GET    | `/api/collect`   | -                        | `CollectorStateView` (viewer+, #383 段階2b/R1-C) |
 //! | POST   | `/api/collect/start\|stop\|restart` | -     | `CollectOutcome` (editor+) |
 //! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
@@ -93,8 +94,9 @@
 //! their GET routes need only `require_auth` (any role), so read and write
 //! share a path but need different floors - [`tag_registry_router`] uses
 //! [`require_editor`] inline on each write handler rather than a
-//! single-floor `RoleGuard` layer. A future 表示グループ resource would
-//! follow the same pattern.
+//! single-floor `RoleGuard` layer. The 表示グループ resource
+//! (`/api/display-groups/*`, #393) follows the same pattern
+//! (`rest/display_groups.rs`).
 //!
 //! ## Audit log (spec M14, `docs/roadmap.md`)
 //!
@@ -222,6 +224,9 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::BackupService;
+// #393: 表示グループ。ルーターは子モジュール（`rest/display_groups.rs`）に置く。
+use crate::display_groups::DisplayGroupService;
+mod display_groups;
 use crate::collect::ExclusionView;
 use crate::collect::{
     CollectEventList, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
@@ -1065,6 +1070,8 @@ struct TagRegistryState {
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    // #393: タグの削除の前に、表示グループのペンからの参照を確かめる。
+    display_groups: DisplayGroupService,
     auth: AuthState,
     audit: AuditLogService,
 }
@@ -1444,7 +1451,12 @@ async fn tags_delete(
         "/api/tags/{id}",
     )
     .await?;
-    state.tags.delete(id).await?;
+    // #393（§3.7.9 の 8）: 表示グループのペンに割り当てられたタグは、参照元を
+    // 並べて削除を拒否する。Tauri の `tags_delete` も同じ関数を呼ぶ。
+    state
+        .display_groups
+        .delete_tag_unless_referenced(&state.tags, id)
+        .await?;
     record_write(
         &state.audit,
         &state.auth,
@@ -1470,6 +1482,7 @@ fn tag_registry_router(
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    display_groups: DisplayGroupService,
     audit: AuditLogService,
     auth: AuthState,
 ) -> Router {
@@ -1477,6 +1490,7 @@ fn tag_registry_router(
         plc_connections,
         collection_groups,
         tags,
+        display_groups,
         auth: auth.clone(),
         audit,
     };
@@ -1522,11 +1536,10 @@ fn tag_registry_router(
 /// the result *before* `banto_server::static_files::static_router` so
 /// `/api/*` takes priority over the SPA fallback. [`tag_registry_router`]
 /// (#383 段階2a / R1-B: PLC connections/collection groups/tags) is the first
-/// resource wired up this way; a future 表示グループ (display group)
-/// resource would get its own RBAC-split read/write router merged in here
-/// the same way. [`collect_router`] (#383 段階2b / R1-C: 収集の開始・停止・
-/// 再起動) is `editor`-floored router-wide, like `hub_router` is
-/// `admin`-floored.
+/// resource wired up this way; the 表示グループ (display group) resource
+/// (#393, `display_groups::display_groups_router`) is merged in the same
+/// way. [`collect_router`] (#383 段階2b / R1-C: 収集の開始・停止・再起動) is
+/// `editor`-floored router-wide, like `hub_router` is `admin`-floored.
 // Each parameter is a distinct, already-cloneable service handle threaded
 // through from `main()`/tests (no natural subset to bundle into a struct
 // without adding an indirection layer with a single call site); simpler to
@@ -1554,6 +1567,9 @@ pub fn api_router(
     // `crate::collect::resolve_data_dir` 参照）。デスクトップとこの LAN
     // サーバーが**同じ実体**を共有するのは `hub` と同じ理由。
     collect: CollectorService,
+    // #393: 表示グループ。呼び出し元が `DisplayGroupService::new(pool.clone())`
+    // で構築して渡す（レジストリ 3 サービスと同じ pool）。
+    display_groups: DisplayGroupService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -1602,10 +1618,16 @@ pub fn api_router(
         .merge(backups_router(backup, audit.clone(), auth.clone()))
         .merge(hub_router(hub, audit.clone(), auth.clone()))
         .merge(collect_router(collect, audit.clone(), auth.clone()))
+        .merge(display_groups::display_groups_router(
+            display_groups.clone(),
+            audit.clone(),
+            auth.clone(),
+        ))
         .merge(tag_registry_router(
             plc_connections,
             collection_groups,
             tags,
+            display_groups,
             audit,
             auth.clone(),
         ))
@@ -1682,14 +1704,15 @@ mod tests {
     /// [`router_with_role_tokens`] plus the router's own pool - for tests
     /// that must put a row in the registry the REST handlers would refuse
     /// (#414 段階2: a tag saved before the save-time address check).
-    async fn router_with_role_tokens_and_pool() -> (Router, String, String, String, sqlx::SqlitePool)
-    {
+    pub(super) async fn router_with_role_tokens_and_pool(
+    ) -> (Router, String, String, String, sqlx::SqlitePool) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(Db::Sqlite(pool.clone()));
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
 
@@ -1750,6 +1773,7 @@ mod tests {
                 collection_groups,
                 tags,
                 collect,
+                display_groups,
                 auth,
                 tx,
                 false,
@@ -1768,6 +1792,7 @@ mod tests {
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(Db::Sqlite(pool));
         let auth = demo_auth();
@@ -1787,6 +1812,7 @@ mod tests {
                 collection_groups,
                 tags,
                 collect,
+                display_groups,
                 auth,
                 tx,
                 false,
@@ -1881,6 +1907,7 @@ mod tests {
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(Db::Sqlite(pool));
         let auth = demo_auth();
@@ -1895,6 +1922,7 @@ mod tests {
             collection_groups,
             tags,
             collect,
+            display_groups,
             auth,
             tx,
             allow_setup,
@@ -2088,6 +2116,7 @@ mod tests {
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(Db::Sqlite(pool));
         let auth = user_auth_state(users.clone(), audit.clone());
@@ -2103,6 +2132,7 @@ mod tests {
                 collection_groups,
                 tags,
                 collect,
+                display_groups,
                 auth,
                 tx,
                 allow_setup,
@@ -2581,6 +2611,7 @@ mod tests {
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = CollectorService::new(pool.clone(), data_dir);
         let audit = AuditLogService::new(Db::Sqlite(pool));
 
@@ -2622,6 +2653,7 @@ mod tests {
             collection_groups,
             tags,
             collect,
+            display_groups,
             auth,
             tx,
             false,
@@ -2675,6 +2707,7 @@ mod tests {
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let backup = BackupService::new(db_path, Db::Sqlite(pool.clone()));
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(Db::Sqlite(pool));
 
@@ -2716,6 +2749,7 @@ mod tests {
             collection_groups,
             tags,
             collect,
+            display_groups,
             auth,
             tx,
             false,
@@ -5201,6 +5235,7 @@ mod tests {
         let settings = SettingsService::new(db.clone());
         let backup = BackupService::new(db_path, db.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = test_collector_service(pool);
         let audit = AuditLogService::new(db);
         let auth = user_auth_state(users.clone(), audit.clone());
@@ -5215,6 +5250,7 @@ mod tests {
             collection_groups,
             tags,
             collect,
+            display_groups,
             auth,
             tx,
             allow_setup,
@@ -5425,6 +5461,7 @@ mod tests {
         let users = UsersService::new(db.clone());
         let settings = SettingsService::new(db.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let display_groups = DisplayGroupService::new(pool.clone());
         let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(db);
         let auth = user_auth_state(users.clone(), audit.clone());
@@ -5439,6 +5476,7 @@ mod tests {
             collection_groups,
             tags,
             collect,
+            display_groups,
             auth,
             tx,
             false,
