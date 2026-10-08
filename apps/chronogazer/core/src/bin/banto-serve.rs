@@ -244,12 +244,12 @@ async fn main() {
         Default::default()
     });
     let collect_data_dir = resolve_data_dir(&data_base, &store_settings.data_dir);
-    let collect = CollectorService::new(pool_for_collect, collect_data_dir.clone());
+    let collect = CollectorService::new(pool_for_collect, collect_data_dir);
 
     // 保持期間を過ぎた時系列データファイルの削除（#538）。起動時に 1 回、その後は
     // 日付が変わるたびに 1 回。失敗してもログに出すだけで、収集は止めない。
-    // `data.dir` は収集と**同じディレクトリ**を渡す。
-    chronogazer_core::retention::spawn(settings.clone(), collect_data_dir);
+    // 削除は収集サービス経由（書き手が今開いている日付のファイルは消さない）。
+    chronogazer_core::retention::spawn(settings.clone(), collect.clone());
 
     // 起動時の自動開始（docs/r1-plan.md の R1-C）。`hub.resume()` と同じく
     // **spawn して投げっぱなし** - 失敗しても起動は止めず、理由は状態に残る

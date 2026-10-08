@@ -4079,7 +4079,7 @@ pub fn run() {
             let store_settings = tauri::async_runtime::block_on(store_config(&settings))
                 .expect("store_config should succeed");
             let collect_data_dir = resolve_data_dir(&data_dir, &store_settings.data_dir);
-            let collect = CollectorService::new(pool.clone(), collect_data_dir.clone());
+            let collect = CollectorService::new(pool.clone(), collect_data_dir);
             let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
@@ -4278,10 +4278,11 @@ pub fn run() {
 
             // 保持期間を過ぎた時系列データファイルの削除（#538）。起動時に 1 回、
             // その後は日付が変わるたびに 1 回。失敗してもログに出すだけで収集は
-            // 止めない。`data.dir` は収集と同じディレクトリを渡す。
+            // 止めない。削除は収集サービス経由（書き手が今開いている日付のファイルは
+            // 消さない）。
             tauri::async_runtime::spawn(chronogazer_core::retention::run(
                 settings.clone(),
-                collect_data_dir,
+                collect.clone(),
             ));
 
             // If LAN access was left enabled on a previous run, start the

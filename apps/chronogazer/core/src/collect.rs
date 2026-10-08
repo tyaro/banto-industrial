@@ -1593,6 +1593,12 @@ struct Published {
     /// 共有ハンドル（`Arc<RwLock<..>>` 包み）で、**タスクの外で保持してよい**
     /// （このモジュールの doc「現在値はキューから外して葉に公開する」）。
     current: Option<CurrentValuesHandle>,
+    /// 走っているときだけ `Some`。いま使っている `TsWriter` を受け取る口
+    /// （設定の再適用で書き手が入れ替わっても、常に今のものを返す）。
+    /// 保持期間の削除が、**書き手が今開いている日付のファイルを消さない**ために
+    /// 書き手のロックの下で削除する（#538、[`CollectorService::prune_data_files`]）。
+    /// `current` と同じく状態と一緒に書く（[`CollectorContext::publish`]）。
+    writer: Option<tokio::sync::watch::Receiver<Arc<banto_tstore::TsWriter>>>,
 }
 
 impl CollectorContext {
@@ -1635,6 +1641,32 @@ impl CollectorContext {
             .expect("collector published lock poisoned");
         published.state = state;
         published.current = current;
+        published.writer = None;
+    }
+
+    /// [`Self::publish`] の、走っているとき用（書き手の受け口も一緒に公開する）。
+    fn publish_running(
+        &self,
+        state: CollectorState,
+        current: CurrentValuesHandle,
+        writer: tokio::sync::watch::Receiver<Arc<banto_tstore::TsWriter>>,
+    ) {
+        let mut published = self
+            .published
+            .lock()
+            .expect("collector published lock poisoned");
+        published.state = state;
+        published.current = Some(current);
+        published.writer = Some(writer);
+    }
+
+    /// 走っている書き手の受け口。走っていなければ `None`。
+    fn writer(&self) -> Option<tokio::sync::watch::Receiver<Arc<banto_tstore::TsWriter>>> {
+        self.published
+            .lock()
+            .expect("collector published lock poisoned")
+            .writer
+            .clone()
     }
 }
 
@@ -1705,6 +1737,7 @@ impl CollectorService {
             published: Mutex::new(Published {
                 state: CollectorState::Stopped,
                 current: None,
+                writer: None,
             }),
             #[cfg(test)]
             start_gate: None,
@@ -1889,6 +1922,34 @@ impl CollectorService {
     /// 公開する」）。ポーリングで引いてよい。
     pub fn current_values(&self) -> Option<CurrentValuesHandle> {
         self.inner.ctx.current()
+    }
+
+    /// 保持期間を過ぎたデータファイルを消す（[`crate::retention`] 用、#538）。
+    /// 収集が走っていれば、**書き手のロックの下で**消す
+    /// （[`banto_tstore::TsWriter::prune_files`]。書き手が今開いている日付の
+    /// ファイルは、flush の失敗で日付の切り替えができていない間も消さない）。
+    /// 走っていなければ書き手が無いので、そのまま `prune_files`（`std::fs` なので
+    /// `spawn_blocking`）。
+    pub async fn prune_data_files(
+        &self,
+        retention_days: u32,
+        today: banto_tstore::LocalDate,
+    ) -> Result<banto_tstore::PruneReport, banto_tstore::TstoreError> {
+        if let Some(rx) = self.inner.ctx.writer() {
+            let writer = rx.borrow().clone();
+            return writer.prune_files(retention_days, today).await;
+        }
+        let dir = self.inner.ctx.data_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            banto_tstore::prune_files(&dir, retention_days, today)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(banto_tstore::TstoreError::Storage(format!(
+                "削除の処理が異常終了しました: {err}"
+            ))),
+        }
     }
 
     // --- C-3a: 外向きの 3 つの読み出し口 ---------------------------------
@@ -2208,6 +2269,7 @@ impl CollectorService {
             published: Mutex::new(Published {
                 state: CollectorState::Stopped,
                 current: None,
+                writer: None,
             }),
             start_gate: Some(gate),
         })
@@ -2396,6 +2458,7 @@ impl Lifecycle {
         // `publish` 呼び出しで書くので、「走っているのに現在値が読めない」
         // という食い違いが起こらない（[`Published`] の doc）。
         let current = collector.current_values();
+        let writer = collector.writer_handle();
         self.collector = Some(collector);
         self.simulated = simulated_connection_keys(&snapshot);
         let state = CollectorState::Running {
@@ -2403,7 +2466,7 @@ impl Lifecycle {
             tags,
             exclusions,
         };
-        self.ctx.publish(state.clone(), Some(current));
+        self.ctx.publish_running(state.clone(), current, writer);
         Ok(state)
     }
 

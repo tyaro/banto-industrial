@@ -134,7 +134,7 @@ use crate::clock::Clock;
 use crate::config::{compute_config_hash, StoreConfig};
 use crate::date::LocalDate;
 use crate::error::TstoreError;
-use crate::files::latest_file_for_date;
+use crate::files::{latest_file_for_date, prune_files_excluding, PruneReport};
 use crate::findable::ptime_is_findable_in;
 use crate::schema::{self, column_name_for_index, table_name_for_index};
 
@@ -376,6 +376,31 @@ impl TsWriter {
         self.dropped_rows.load(Ordering::Relaxed)
     }
 
+    /// 保持期間を過ぎたデータファイルを消す（#538）。[`crate::files::prune_files`]
+    /// と同じ判定だが、**このライターが今開いている日付のファイルは、古くても
+    /// 消さない**。flush が失敗して日付の切り替え（rotation）ができないと、
+    /// ライターは古い日付のファイルを開いたまま、その日付宛ての未書き込みの
+    /// 行を持ち続ける。外から `prune_files` を呼ぶと、そのファイルを
+    /// （保持日数が小さいと）消してしまい、書き込みの回復後に行の行き先が
+    /// 無くなる。ここでは**ライターのロックを持ったまま**判定と削除をするので、
+    /// 判定のあとにライターが別の日付へ切り替わる競合も起きない。
+    /// 切り替えが成功して古い日付のファイルを閉じたあとの掃除では、通常どおり
+    /// 消せる。削除は同期の `std::fs` で、ロックを持つ時間はファイル数に
+    /// 比例する短さ。
+    pub async fn prune_files(
+        &self,
+        retention_days: u32,
+        today: LocalDate,
+    ) -> Result<PruneReport, TstoreError> {
+        let inner = self.inner.lock().await;
+        prune_files_excluding(
+            &inner.data_dir,
+            retention_days,
+            today,
+            &[inner.current_date],
+        )
+    }
+
     /// 失敗中に溜めてよい量の上限（値のセル数）を変える。主にテスト用。
     /// 既定は 8,000,000 セル。0 は 1 に切り上げる。
     pub async fn set_max_retained_cells(&self, cells: usize) {
@@ -529,44 +554,57 @@ impl Inner {
     /// 時刻（`ptime`）の古い行から捨てる。ここに来るほど溜まるのは flush の
     /// 失敗が続いているときだけ。捨てた行数は [`TsWriter::dropped_rows`] に
     /// 数え、失敗の連続ごとに最初の 1 回だけログへ出す。
+    ///
+    /// 捨てる行は**一度に選ぶ**: 全行の `(ptime, グループ, 位置)` を集めて
+    /// 並べ替え、古い方から必要な数だけ印を付け、グループごとに 1 回の
+    /// `retain` で除く（O(n log n)。1 行捨てるたびに全グループを走査すると
+    /// ライターのロックを持ったまま O(行数 x グループ数) になる）。時計の
+    /// 巻き戻しは許されている（`ptime` が単調でない）ので、グループ内の
+    /// 挿入順ではなく `ptime` で「古い」を決める。残る行の順序は変えない。
+    /// 上限の 7/8 までまとめて捨てるのは、超えるたびに作業が走らないように
+    /// するため。
     fn enforce_retention_cap(&mut self) {
         if self.buffered_cells <= self.max_retained_cells {
             return;
         }
-        // 1 行捨てるたびに `Vec` の先頭を詰めると、失敗が続く間は append の
-        // たびに全体を動かすことになる。そこで上限の 7/8 まで**まとめて**
-        // 捨てる（超えた直後の append で一度に空ける）。どの行を捨てるかは
-        // 各グループの先頭（= そのグループで最も古い行）を見て、全体で最も
-        // 古い `ptime` から選ぶ。
         let target = self.max_retained_cells - self.max_retained_cells / 8;
+        let keys: Vec<&String> = self.buffer.keys().collect();
+        let mut candidates: Vec<(i64, usize, usize)> = Vec::with_capacity(self.buffered_row_count);
+        for (g, key) in keys.iter().enumerate() {
+            for (i, row) in self.buffer[*key].iter().enumerate() {
+                candidates.push((row.ptime_ms, g, i));
+            }
+        }
+        candidates.sort_unstable();
+
         let mut cells = self.buffered_cells;
         let mut rows_left = self.buffered_row_count;
-        let mut cursors: HashMap<&str, usize> = HashMap::new();
+        let mut doomed: Vec<std::collections::HashSet<usize>> =
+            vec![std::collections::HashSet::new(); keys.len()];
         let mut dropped = 0u64;
-        while cells > target && rows_left > 1 {
-            let oldest = self
-                .buffer
-                .iter()
-                .filter_map(|(key, rows)| {
-                    let at = cursors.get(key.as_str()).copied().unwrap_or(0);
-                    rows.get(at).map(|row| (row.ptime_ms, key.as_str(), at))
-                })
-                .min();
-            let Some((_, key, at)) = oldest else {
+        for (_, g, i) in candidates {
+            if cells <= target || rows_left <= 1 {
                 break;
-            };
-            cells -= self.buffer[key][at].values.len() + 1;
+            }
+            cells -= self.buffer[keys[g]][i].values.len() + 1;
             rows_left -= 1;
             dropped += 1;
-            cursors.insert(key, at + 1);
+            doomed[g].insert(i);
         }
-        let drops: Vec<(String, usize)> = cursors
+        let doomed: Vec<(String, std::collections::HashSet<usize>)> = keys
             .into_iter()
-            .map(|(key, n)| (key.to_string(), n))
+            .zip(doomed)
+            .filter(|(_, set)| !set.is_empty())
+            .map(|(key, set)| (key.clone(), set))
             .collect();
-        for (key, n) in drops {
+        for (key, set) in doomed {
             if let Some(rows) = self.buffer.get_mut(&key) {
-                rows.drain(..n);
+                let mut index = 0usize;
+                rows.retain(|_| {
+                    let keep = !set.contains(&index);
+                    index += 1;
+                    keep
+                });
                 if rows.is_empty() {
                     self.buffer.remove(&key);
                 }
@@ -2057,5 +2095,139 @@ mod tests {
             assert_eq!(stored[rows - 1].1, vec![Some((rows - 1) as f64)]);
             writer.close().await.unwrap();
         }
+    }
+
+    // --- #538 レビュー: 保持削除との協調 / 捨てる行の選び方 -----------------
+
+    /// ライターが古い日付のファイルを開いたまま（切り替えの flush が失敗）の間は、
+    /// 保持日数が小さくてもそのファイルを消さない。回復して切り替わったあとは
+    /// 消せる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prune_keeps_the_file_the_writer_still_holds_until_rotation_succeeds() {
+        let dir = TempDir::new("prune-pinned");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+
+        // 3 日進める。切り替え前の flush が失敗するので、ライターは 1 日目の
+        // ファイルを開いたまま、未書き込みの行を持ち続ける。
+        clock.advance_ms(3 * 86_400_000);
+        let later = DAY1_START_MS + 3 * 86_400_000;
+        writer
+            .append("g1", later, &[Some(2.0), None])
+            .await
+            .expect_err("rotation flush must fail");
+        let today = LocalDate::from_epoch_ms(clock.now_ms(), OFFSET_MS);
+        let day1_file = list_data_files(dir.path()).unwrap()[0].path.clone();
+
+        let report = writer.prune_files(1, today).await.unwrap();
+        assert!(report.deleted.is_empty(), "開いている日付は消さない");
+        assert!(day1_file.exists());
+
+        // 回復 -> 切り替えが成功して未書き込みの行が 1 日目のファイルへ書かれる。
+        repair_inserts(&writer).await;
+        writer
+            .append("g1", later, &[Some(2.0), None])
+            .await
+            .expect("rotation succeeds after repair");
+        let report = writer.prune_files(1, today).await.unwrap();
+        assert_eq!(report.deleted, vec![day1_file.clone()]);
+        assert!(!day1_file.exists(), "切り替え後は消せる");
+        writer.close().await.unwrap();
+    }
+
+    /// 時計の巻き戻し（ptime が単調でない）でも、捨てるのは挿入順ではなく
+    /// ptime が本当に古い行。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overflow_drops_the_truly_oldest_ptime_even_when_ptime_goes_backwards() {
+        let dir = TempDir::new("cap-nonmonotonic");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), one_column_config(), clock)
+            .await
+            .unwrap();
+        writer.set_max_retained_cells(8).await; // 1 行 2 セル -> 4 行まで、超えたら 3 行へ
+        break_inserts(&writer).await;
+        for i in (1..=5).rev() {
+            let _ = writer
+                .append("g1", DAY1_START_MS + i, &[Some(i as f64)])
+                .await;
+        }
+        assert_eq!(writer.dropped_rows(), 2);
+        repair_inserts(&writer).await;
+        writer.flush().await.unwrap();
+        let rows = read_g1(&dir).await;
+        assert_eq!(
+            rows.iter()
+                .map(|(p, _)| *p - DAY1_START_MS)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5],
+            "ptime 1 と 2 が捨てられ、3 4 5 が残る"
+        );
+        writer.close().await.unwrap();
+    }
+
+    /// グループが多く、大きく溢れても、全体で上限内に収まり、残った行は全部
+    /// 書ける（グループごとの走査を繰り返す実装では桁違いに遅くなる形）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_overflow_across_many_groups_keeps_within_the_cap() {
+        const GROUPS: usize = 200;
+        const ROWS_PER_GROUP: i64 = 50;
+        let dir = TempDir::new("cap-many-groups");
+        let clock = clock_at(DAY1_START_MS);
+        let config = StoreConfig {
+            groups: (0..GROUPS)
+                .map(|g| GroupConfig {
+                    key: format!("m{g}"),
+                    name: format!("M {g}"),
+                    period_ms: 1_000,
+                    tags: vec![tag(&format!("t{g}"), None, 0)],
+                })
+                .collect(),
+        };
+        let writer = TsWriter::open_with_options(
+            dir.path(),
+            config,
+            clock,
+            WriterOptions {
+                max_buffered_rows: usize::MAX,
+                flush_interval_ms: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+        let cap_cells = 4_000;
+        writer.set_max_retained_cells(cap_cells).await;
+        for i in 0..ROWS_PER_GROUP {
+            for g in 0..GROUPS {
+                writer
+                    .append(&format!("m{g}"), DAY1_START_MS + i * 1_000, &[Some(1.0)])
+                    .await
+                    .unwrap();
+            }
+        }
+        let total = GROUPS as u64 * ROWS_PER_GROUP as u64;
+        let dropped = writer.dropped_rows();
+        assert!(dropped > 0);
+        let kept = total - dropped;
+        assert!(kept * 2 <= cap_cells as u64, "残りは上限内: {kept} 行");
+        writer.flush().await.expect("flush writes what is left");
+        let files = list_data_files(dir.path()).unwrap();
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let mut stored = 0u64;
+        for g in 0..GROUPS {
+            stored += reader
+                .read_range(&format!("m{g}"), i64::MIN, i64::MAX)
+                .await
+                .unwrap()
+                .len() as u64;
+        }
+        assert_eq!(stored, kept);
+        writer.close().await.unwrap();
     }
 }

@@ -621,6 +621,16 @@ impl Collector {
         self.current.clone()
     }
 
+    /// A receiver for the live writer (the same `watch` channel the
+    /// connection tasks use, so it always yields the writer currently in
+    /// use even after [`Collector::apply_config`] rotates it). Lets the
+    /// host app coordinate with the writer - e.g. retention pruning that
+    /// must not delete the file the writer still holds
+    /// ([`banto_tstore::TsWriter::prune_files`], #538).
+    pub fn writer_handle(&self) -> watch::Receiver<Arc<TsWriter>> {
+        self.writer_tx.subscribe()
+    }
+
     /// A point-in-time snapshot of every connection's status
     /// (recorder-requirements.md §5 health display).
     pub fn status(&self) -> HashMap<String, ConnectionStatus> {

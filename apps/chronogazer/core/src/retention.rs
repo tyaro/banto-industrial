@@ -14,9 +14,13 @@
 //! * 保持日数は**掃除のたびに設定から読み直す**ので、設定を変えたら次の掃除
 //!   （次の日付の変わり目、または再起動）から効く。変更の保存では消さない
 //!   （保存で不可逆な削除を起こさない。banto-hub と同じ約束）。
-//! * `data.dir` は**収集が使っているディレクトリ**（起動時に解決した値）を
-//!   渡される。実行中に設定の `data.dir` を変えても、収集と同じく再起動まで
-//!   反映されない。
+//! * 削除は [`Pruner`]（本番は [`pruner_for`] = [`CollectorService::prune_data_files`]）
+//!   を通す。収集が走っていれば**書き手（`TsWriter`）のロックの下で**消し、
+//!   書き手が今開いている日付のファイルは古くても消さない（flush の失敗で
+//!   日付の切り替えができず、古い日付のファイルと未書き込みの行を抱えたままの
+//!   間に、保持日数が小さい設定で消すと行き先が無くなる。#538 レビュー）。
+//!   `data.dir` は収集と同じディレクトリ（起動時に解決した値）で、実行中に
+//!   設定を変えても再起動まで反映されない。
 //!
 //! # 何を消さないか
 //!
@@ -26,6 +30,11 @@
 //!   切り替えていない前日のファイルも、保持日数は 1 以上なので残る）。
 //! * 保持日数が無制限（`None`）・0 以下・`u32` に収まらないときは**削除側では
 //!   なく保持側に倒す**（掃除そのものを飛ばす。[`plan_sweep`]）。
+//! * **設定を読めなかったとき**（DB のロック・I/O エラー）も同じく消さない。
+//!   「未設定 = 既定の 90 日」と「読めなかった」は別で、後者で既定値に
+//!   倒すと、利用者が長い保持期間（例 365 日）を設定していても 90 日で消して
+//!   しまう。その掃除は飛ばし、**日付を記録せずに**次の確認（
+//!   [`CHECK_INTERVAL`] 後）でやり直す。
 //! * データファイルの名前の形（`YYYYMMDD-NNN.sqlite3`）でないものには触らない。
 //!
 //! # 失敗しても収集を止めない
@@ -37,14 +46,38 @@
 //! 結果は標準エラー出力のログに残す（banto-hub も監査やイベントには残さず
 //! ログだけ。ChronoGazer の `collect_events` は収集の出来事用なので使わない）。
 
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use banto_tstore::{Clock, LocalDate, SystemClock};
 use tokio::task::JoinHandle;
 
+use crate::collect::CollectorService;
 use crate::settings::{store_config, SettingsService};
+
+/// 削除の実行役: `(保持日数, 今日)` を受けて、消したファイルの数（失敗は文言）
+/// を返す。本番は [`pruner_for`]。テストは差し替えられる。
+pub type Pruner = Arc<
+    dyn Fn(u32, LocalDate) -> Pin<Box<dyn Future<Output = Result<usize, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// 収集サービス経由で消す [`Pruner`]（書き手が走っていればそのロックの下で）。
+pub fn pruner_for(collect: CollectorService) -> Pruner {
+    Arc::new(move |days, today| {
+        let collect = collect.clone();
+        Box::pin(async move {
+            collect
+                .prune_data_files(days, today)
+                .await
+                .map(|report| report.deleted.len())
+                .map_err(|err| err.to_string())
+        })
+    })
+}
 
 /// 日付が変わったかを見る間隔。掃除そのものは日に 1 回だが、見るのは
 /// これより細かく（変わり目から最長でこの間隔だけ遅れる）。
@@ -93,40 +126,35 @@ pub enum SweepOutcome {
     Pruned { days: u32, deleted: usize },
     /// 削除に失敗した（一部は消えているかもしれない）。
     Failed(String),
+    /// 保持設定を**読めなかった**ので何もしなかった。次の確認でやり直す
+    /// （既定値に倒して消すことはしない）。
+    SettingsUnreadable(String),
 }
 
-/// 掃除を 1 回行う。保持日数は `settings` から**今**読む（読めなければ
-/// banto-hub と同じく既定値で続ける）。`today` は `clock` のローカル日付。
+/// 掃除を 1 回行う。保持日数は `settings` から**今**読む。読めなければ
+/// **何も消さず** [`SweepOutcome::SettingsUnreadable`] を返す（未設定は既定値
+/// だが、読み取りの失敗は既定値ではない）。`today` は `clock` のローカル日付。
 pub async fn sweep_once(
     settings: &SettingsService,
-    data_dir: &Path,
+    prune: &Pruner,
     clock: &dyn Clock,
 ) -> SweepOutcome {
     let retention_days = match store_config(settings).await {
         Ok(config) => config.retention_days,
         Err(err) => {
-            eprintln!("banto: 保持設定の読み取りに失敗しました（既定値で続行します）: {err}");
-            crate::settings::StoreSettings::default().retention_days
+            let outcome = SweepOutcome::SettingsUnreadable(err.to_string());
+            log_outcome(&outcome);
+            return outcome;
         }
     };
     let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
     let outcome = match plan_sweep(retention_days) {
         SweepPlan::Unlimited => SweepOutcome::SkippedUnlimited,
         SweepPlan::Invalid(days) => SweepOutcome::SkippedInvalid(days),
-        SweepPlan::Prune(days) => {
-            let dir = data_dir.to_path_buf();
-            let joined =
-                tokio::task::spawn_blocking(move || banto_tstore::prune_files(&dir, days, today))
-                    .await;
-            match joined {
-                Ok(Ok(report)) => SweepOutcome::Pruned {
-                    days,
-                    deleted: report.deleted.len(),
-                },
-                Ok(Err(err)) => SweepOutcome::Failed(err.to_string()),
-                Err(err) => SweepOutcome::Failed(format!("削除の処理が異常終了しました: {err}")),
-            }
-        }
+        SweepPlan::Prune(days) => match prune(days, today).await {
+            Ok(deleted) => SweepOutcome::Pruned { days, deleted },
+            Err(err) => SweepOutcome::Failed(err),
+        },
     };
     log_outcome(&outcome);
     outcome
@@ -147,20 +175,35 @@ fn log_outcome(outcome: &SweepOutcome) {
         SweepOutcome::Failed(err) => {
             eprintln!("banto: 時系列データの古いファイルの削除に失敗しました: {err}")
         }
+        SweepOutcome::SettingsUnreadable(err) => eprintln!(
+            "banto: 保持設定を読めなかったため、古いファイルの削除を飛ばしました（次の確認でやり直します）: {err}"
+        ),
     }
+}
+
+/// この結果で「今日の掃除は済んだ」と記録してよいか。設定を読めなかった
+/// 掃除だけは済んでいない（何も判断できていない）ので、やり直す。
+fn sweep_is_done(outcome: &SweepOutcome) -> bool {
+    !matches!(outcome, SweepOutcome::SettingsUnreadable(_))
 }
 
 /// 起動時 + 日付が変わるたびに掃除し続ける（終わらない）。呼び出し側が
 /// spawn する（`src-tauri` は新規依存を持たない規約なので、`tokio::spawn`
 /// ではなく future を返す形にして、ランタイムは呼ぶ側が選ぶ）。
-pub async fn run(settings: SettingsService, data_dir: PathBuf) {
-    run_with(settings, data_dir, Arc::new(SystemClock), CHECK_INTERVAL).await
+pub async fn run(settings: SettingsService, collect: CollectorService) {
+    run_with(
+        settings,
+        pruner_for(collect),
+        Arc::new(SystemClock),
+        CHECK_INTERVAL,
+    )
+    .await
 }
 
-/// [`run`] の時計・間隔を差し替えられる版（テスト用に公開）。
+/// [`run`] の削除役・時計・間隔を差し替えられる版（テスト用に公開）。
 pub async fn run_with(
     settings: SettingsService,
-    data_dir: PathBuf,
+    prune: Pruner,
     clock: Arc<dyn Clock>,
     interval: Duration,
 ) {
@@ -168,18 +211,21 @@ pub async fn run_with(
     loop {
         let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
         if needs_sweep(last_swept, today) {
-            // 失敗しても同じ日に掃除し直さない（毎分のログ溢れを避ける）。
+            let outcome = sweep_once(&settings, &prune, clock.as_ref()).await;
+            // 設定を読めなかったときは日付を記録せず、次の確認でやり直す。
+            // それ以外は失敗しても同じ日に掃除し直さない（毎分のログ溢れを避ける）。
             // 次の日付の変わり目か再起動で、もう一度試す。
-            sweep_once(&settings, &data_dir, clock.as_ref()).await;
-            last_swept = Some(today);
+            if sweep_is_done(&outcome) {
+                last_swept = Some(today);
+            }
         }
         tokio::time::sleep(interval).await;
     }
 }
 
 /// [`run`] を現在のランタイムに spawn する（`banto-serve` 用）。
-pub fn spawn(settings: SettingsService, data_dir: PathBuf) -> JoinHandle<()> {
-    tokio::spawn(run(settings, data_dir))
+pub fn spawn(settings: SettingsService, collect: CollectorService) -> JoinHandle<()> {
+    tokio::spawn(run(settings, collect))
 }
 
 #[cfg(test)]
@@ -189,6 +235,7 @@ mod tests {
     use crate::settings::{set_store_config, StoreSettings};
     use crate::test_support::TempDir;
     use banto_tstore::ManualClock;
+    use std::path::{Path, PathBuf};
 
     const OFFSET_MS: i64 = 9 * 3_600_000;
     /// 2026-07-12T00:00:00Z（= 日本時間 09:00）。
@@ -205,6 +252,19 @@ mod tests {
         path
     }
 
+    /// ディレクトリを直接 `prune_files` する削除役（書き手なしのテスト用）。
+    fn dir_pruner(path: &Path) -> Pruner {
+        let path = path.to_path_buf();
+        Arc::new(move |days, today| {
+            let path = path.clone();
+            Box::pin(async move {
+                banto_tstore::prune_files(&path, days, today)
+                    .map(|report| report.deleted.len())
+                    .map_err(|err| err.to_string())
+            })
+        })
+    }
+
     async fn settings_with(retention_days: Option<i64>) -> SettingsService {
         let pool = migrate_memory().await.expect("migrate_memory");
         let svc = SettingsService::new(Db::Sqlite(pool));
@@ -218,6 +278,54 @@ mod tests {
         .await
         .unwrap();
         svc
+    }
+
+    /// 設定を読めない（DB が使えない）ときは、既定の 90 日に倒さず何も消さない。
+    /// 設定が 365 日でも 90 日で消してしまうことを防ぐ。
+    #[tokio::test]
+    async fn an_unreadable_setting_deletes_nothing_instead_of_falling_back_to_default() {
+        let dir = TempDir::new();
+        let ancient = touch(&dir, date(-1000));
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let svc = SettingsService::new(Db::Sqlite(pool.clone()));
+        pool.close().await; // 以後の読み取りはすべて失敗する
+        let clock = ManualClock::new(DAY1_MS, OFFSET_MS);
+        let outcome = sweep_once(&svc, &dir_pruner(dir.path()), &clock).await;
+        assert!(
+            matches!(outcome, SweepOutcome::SettingsUnreadable(_)),
+            "{outcome:?}"
+        );
+        assert!(ancient.exists(), "読めなかったら消さない");
+    }
+
+    /// 設定を読めなかった掃除は「その日は済んだ」と記録しない（次の確認で
+    /// やり直す）。それ以外の結果は記録する。
+    #[test]
+    fn only_an_unreadable_setting_is_retried_within_the_same_day() {
+        assert!(!sweep_is_done(&SweepOutcome::SettingsUnreadable(
+            "x".into()
+        )));
+        assert!(sweep_is_done(&SweepOutcome::SkippedUnlimited));
+        assert!(sweep_is_done(&SweepOutcome::SkippedInvalid(0)));
+        assert!(sweep_is_done(&SweepOutcome::Pruned {
+            days: 1,
+            deleted: 0
+        }));
+        assert!(sweep_is_done(&SweepOutcome::Failed("x".into())));
+    }
+
+    /// 収集が走っていないときは、サービス経由でもそのまま消せる。
+    #[tokio::test]
+    async fn the_service_prunes_when_collection_is_not_running() {
+        let dir = TempDir::new();
+        let old = touch(&dir, date(0));
+        let today_file = touch(&dir, date(100));
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let collect = CollectorService::new(pool, dir.path().to_path_buf());
+        let report = collect.prune_data_files(7, date(100)).await.unwrap();
+        assert_eq!(report.deleted, vec![old.clone()]);
+        assert!(!old.exists());
+        assert!(today_file.exists());
     }
 
     #[test]
@@ -261,7 +369,7 @@ mod tests {
 
         let svc = settings_with(Some(90)).await;
         let clock = ManualClock::new(DAY1_MS + 100 * DAY_MS, OFFSET_MS);
-        let outcome = sweep_once(&svc, dir.path(), &clock).await;
+        let outcome = sweep_once(&svc, &dir_pruner(dir.path()), &clock).await;
 
         assert_eq!(
             outcome,
@@ -287,7 +395,7 @@ mod tests {
         let today_file = touch(&dir, date(100));
         let svc = settings_with(Some(1)).await;
         let clock = ManualClock::new(DAY1_MS + 100 * DAY_MS, OFFSET_MS);
-        sweep_once(&svc, dir.path(), &clock).await;
+        sweep_once(&svc, &dir_pruner(dir.path()), &clock).await;
         assert!(!two_ago.exists());
         assert!(yesterday.exists());
         assert!(today_file.exists());
@@ -301,7 +409,7 @@ mod tests {
         let svc = settings_with(None).await;
         let clock = ManualClock::new(DAY1_MS, OFFSET_MS);
         assert_eq!(
-            sweep_once(&svc, dir.path(), &clock).await,
+            sweep_once(&svc, &dir_pruner(dir.path()), &clock).await,
             SweepOutcome::SkippedUnlimited
         );
         assert!(ancient.exists());
@@ -313,7 +421,7 @@ mod tests {
         let dir = TempDir::new();
         let svc = settings_with(Some(90)).await;
         let clock = ManualClock::new(DAY1_MS, OFFSET_MS);
-        let outcome = sweep_once(&svc, &dir.path().join("nope"), &clock).await;
+        let outcome = sweep_once(&svc, &dir_pruner(&dir.path().join("nope")), &clock).await;
         assert_eq!(
             outcome,
             SweepOutcome::Pruned {
@@ -332,7 +440,7 @@ mod tests {
         let svc = settings_with(Some(90)).await;
         let clock = ManualClock::new(DAY1_MS + 100 * DAY_MS, OFFSET_MS);
 
-        sweep_once(&svc, dir.path(), &clock).await;
+        sweep_once(&svc, &dir_pruner(dir.path()), &clock).await;
         assert!(thirty_ago.exists(), "90 日設定では残る");
 
         set_store_config(
@@ -346,7 +454,7 @@ mod tests {
         .unwrap();
         assert!(thirty_ago.exists(), "設定の保存だけでは消さない");
 
-        sweep_once(&svc, dir.path(), &clock).await;
+        sweep_once(&svc, &dir_pruner(dir.path()), &clock).await;
         assert!(!thirty_ago.exists(), "次の掃除で 7 日設定が効く");
     }
 
@@ -361,7 +469,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new(DAY1_MS + 100 * DAY_MS, OFFSET_MS));
         let handle = tokio::spawn(run_with(
             svc.clone(),
-            dir.path().to_path_buf(),
+            dir_pruner(dir.path()),
             clock.clone(),
             Duration::from_millis(20),
         ));
