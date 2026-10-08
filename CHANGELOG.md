@@ -36,6 +36,7 @@ banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし
 - 管理 UI を SvelteKit 3（`@sveltejs/kit` 3・`@sveltejs/adapter-static` 4）と TypeScript 6 に移行し、npm の `@banto/*` を banto v4.0.0 に上げた（ChronoGazer と同じ banto #325 の経路 B: `svelte.config.js` を廃止して `vite.config.ts` に、`$lib` → `#lib`、ナビ・設定カテゴリの表の `AppPath` とアプリ内の遷移先 `goto()`・`redirect()`・`href` の `resolveAppPath()` 経由、`invalidateAll()` → `refreshAll()`、`error(status, message)`。あわせて #326 の `navigationSettled.svelte.ts` を写し、ナビゲーションの途中で配線①の再 load を始めない）。画面の URL・挙動は変わらない。これで両アプリの Rust・npm が banto v4.0.0 に揃った。
 - banto の依存（`banto-core` / `banto-storage` / `banto-server` / `banto-admin-services`、`@banto/*`）を `v3.0.0` から `v3.0.1` に上げた。`Cargo.lock` は banto の 4 crate と workspace の版だけ、`pnpm-lock.yaml` は `@banto/*` のみ。
 - デスクトップ版（`banto-hub-shell`）で Hub の起動に失敗したとき、フォールバックの画面が「起動中…」のまま変わらないことがあったのを直した（#514）。起動判定の文言の書き込み（`eval`）がプレースホルダの読み込みより先に走ると捨てられていた（実機の計測で `readyState` が `loading`・要素なしを確認）。文言をシェルが持ち、ページの読み込みが終わるたびに書き直し、読み込み中なら `DOMContentLoaded` を待つ。ポートを塞いだ実機確認で、修正前は 20 回中 10 回「起動中…」のまま、修正後は 20 回中 20 回とも文言が出た（再読み込みしても残る）。
+- 設定の書き込み（PLC接続・収集グループ・タグの作成・更新・削除、一括、保留した変更の適用。REST と MCP）が、別の書き込みと重なったとき `database is locked`（REST 500）で失敗しうるのを直した（#528）。これらは検証の `SELECT` の後に書き込むが、トランザクションを素の `BEGIN`（DEFERRED）で始めていたため、その間に別の接続が書き込みを確定すると、WAL では待たずに `SQLITE_BUSY_SNAPSHOT` になっていた。`BEGIN IMMEDIATE` で始めるようにし、書き込みロックが空くまで待つ。本物の版の食い違いは従来どおり `409`。ChronoGazer の同じ修正は #527。
 
 ## v0.2.0-alpha.28 — 2026-10-04（アルファ）
 

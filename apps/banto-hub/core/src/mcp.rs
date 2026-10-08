@@ -1938,7 +1938,8 @@ async fn tool_create_connection(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -2060,7 +2061,8 @@ async fn tool_delete_connection(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -2293,7 +2295,8 @@ async fn tool_update_connection(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -2487,7 +2490,8 @@ async fn tool_create_group(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -2606,7 +2610,8 @@ async fn tool_update_group(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -2728,7 +2733,8 @@ async fn tool_delete_group(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -2883,7 +2889,8 @@ async fn tool_create_tag(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -3000,7 +3007,8 @@ async fn tool_update_tag(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(
@@ -3164,7 +3172,8 @@ async fn tool_delete_tag(
         })));
     }
 
-    let mut tx = match state.manager.pool().begin().await {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
             return Ok(tool_error(format!(

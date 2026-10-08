@@ -2790,10 +2790,11 @@ async fn plc_connections_create(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
@@ -2856,10 +2857,11 @@ async fn plc_connections_update(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let updated = match state
@@ -2925,10 +2927,11 @@ async fn plc_connections_delete(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2、
@@ -3674,10 +3677,11 @@ async fn collection_groups_create(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let created = match state
@@ -3744,10 +3748,11 @@ async fn collection_groups_update(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let updated = match state
@@ -3813,10 +3818,11 @@ async fn collection_groups_delete(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     // T19 S2-b（UX-38）: `plc_connections_delete` と同じ理由・同じ形で
@@ -4435,10 +4441,11 @@ async fn tags_create(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let created = match state.tags.create_tx(&mut tx, input.into()).await {
@@ -4501,10 +4508,11 @@ async fn tags_update(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
@@ -4571,10 +4579,11 @@ async fn tags_delete(
         )
         .await;
     }
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     if let Err(err) = state.tags.delete_tx(&mut tx, id).await {
@@ -4845,10 +4854,11 @@ async fn execute_pending_apply(
     state: &PendingChangesAdminState,
     pending: &PendingChange,
 ) -> Result<(), PendingApplyError> {
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)
         .map_err(PendingApplyError::Api)?;
@@ -5511,10 +5521,12 @@ async fn tags_batch(
         .into_response());
     }
 
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let outcome = match state.tags.create_batch_tx(&mut tx, &inputs).await {
@@ -5699,10 +5711,12 @@ async fn tags_batch_update(
         .into_response());
     }
 
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let outcome = match state.tags.update_batch_tx(&mut tx, &updates).await {
@@ -5859,10 +5873,12 @@ async fn tags_batch_delete(
         .into_response());
     }
 
+    // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+
     let mut tx = state
         .manager
         .pool()
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
     let outcome = match state.tags.delete_batch_tx(&mut tx, &ids).await {
@@ -9640,6 +9656,22 @@ mod tests {
     /// 状態では一切変えないこと」）。
     async fn test_env_with_clock_and_lock(clock: Arc<dyn Clock>, locked_down: bool) -> TestEnv {
         let pool = migrate_memory().await.expect("migrate_memory");
+        test_env_on_pool(pool, clock, locked_down).await
+    }
+
+    /// 別接続からの書き込みと競合させるテスト用（#528）: メモリ DB ではなく
+    /// **ファイルの DB**（接続が複数開く）の上に [`test_env`] と同じ環境を組む。
+    async fn test_env_on_file_db(path: &std::path::Path) -> TestEnv {
+        let pool = crate::db::init_db(path).await.expect("init_db");
+        test_env_on_pool(pool, Arc::new(SystemClock), true).await
+    }
+
+    /// [`test_env_with_clock_and_lock`] の本体（渡された `pool` の上に環境を組む）。
+    async fn test_env_on_pool(
+        pool: sqlx::SqlitePool,
+        clock: Arc<dyn Clock>,
+        locked_down: bool,
+    ) -> TestEnv {
         let (tx, _rx) = tokio_broadcast::channel(16);
         let users = UsersService::new(Db::Sqlite(pool.clone()));
         let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
@@ -15335,6 +15367,154 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{tag:?}");
         (tag["id"].as_i64().unwrap(), group_id)
+    }
+
+    /// ファイル DB の一時パス（テストごとに一意）。
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "banto-hub-{label}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn remove_db_files(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// #528: 別接続が書き込みロックを握っている間に `PUT /api/tags/{id}` が
+    /// 始まり、書き込み側がコミットした後も、素の `BEGIN`（DEFERRED）だと
+    /// `update_tx` の検証 `SELECT` で張ったスナップショットが古くなり、
+    /// `UPDATE` が待たずに `SQLITE_BUSY_SNAPSHOT` で失敗する（REST 500）。
+    /// `BEGIN IMMEDIATE` ならロックが空くまで待って成功する。
+    /// `banto-tags` の `update_checked_waits_for_a_concurrent_writer_...`（#527）と同じ形。
+    #[tokio::test]
+    async fn tags_update_waits_for_a_concurrent_writer_instead_of_500() {
+        let path = temp_db_path("tags-update-busy");
+        let env = test_env_on_file_db(&path).await;
+        let (tag1, group_id) =
+            create_tag_via_admin(&env.router, &env.admin_token, "imm1", None).await;
+        let (tag2, _) =
+            create_tag_via_admin(&env.router, &env.admin_token, "imm2", Some(group_id)).await;
+
+        // 別コネクション（別プール）が書き込みロックを握る。
+        let pool_b = banto_storage::connect_sqlite(&path)
+            .await
+            .expect("connect b");
+        let mut writer = pool_b.acquire().await.expect("acquire b");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .expect("begin immediate on b");
+        sqlx::query("UPDATE tags SET name = 'imm2-external' WHERE id = ?")
+            .bind(tag2)
+            .execute(&mut *writer)
+            .await
+            .expect("external write");
+
+        let router = env.router.clone();
+        let token = env.admin_token.clone();
+        let request = tokio::spawn(async move {
+            admin_put(
+                &router,
+                &format!("/api/tags/{tag1}"),
+                &token,
+                json!({
+                    "name": "tag-imm1-renamed",
+                    "collectionGroupId": group_id,
+                    "address": "D100",
+                    "dataType": "i16"
+                }),
+            )
+            .await
+        });
+
+        // リクエストがトランザクションを始めるまでの時間を与えてからコミットする。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("COMMIT")
+            .execute(&mut *writer)
+            .await
+            .expect("commit b");
+        drop(writer);
+
+        let (status, body) = request.await.expect("join");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "別接続のコミットを待って成功するはず（500 ならスナップショット競合）: {body:?}"
+        );
+        assert_eq!(body["name"], "tag-imm1-renamed");
+        let (status, other) =
+            admin_get(&env.router, &format!("/api/tags/{tag2}"), &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{other:?}");
+        assert_eq!(other["name"], "imm2-external");
+
+        pool_b.close().await;
+        env.pool.close().await;
+        remove_db_files(&path);
+    }
+
+    /// #528: 同じ競合の最中でも、本物の版の食い違いは 500 ではなく 409
+    /// （`tag_revision_conflict`）で返る。
+    #[tokio::test]
+    async fn tags_update_true_revision_conflict_is_409_even_under_a_concurrent_writer() {
+        let path = temp_db_path("tags-update-conflict");
+        let env = test_env_on_file_db(&path).await;
+        let (tag1, group_id) =
+            create_tag_via_admin(&env.router, &env.admin_token, "cf1", None).await;
+        let (tag2, _) =
+            create_tag_via_admin(&env.router, &env.admin_token, "cf2", Some(group_id)).await;
+        let (_, current) =
+            admin_get(&env.router, &format!("/api/tags/{tag1}"), &env.admin_token).await;
+        let stale = current["revision"].as_i64().unwrap() + 100;
+
+        let pool_b = banto_storage::connect_sqlite(&path)
+            .await
+            .expect("connect b");
+        let mut writer = pool_b.acquire().await.expect("acquire b");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tags SET name = 'cf2-external' WHERE id = ?")
+            .bind(tag2)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let router = env.router.clone();
+        let token = env.admin_token.clone();
+        let request = tokio::spawn(async move {
+            admin_put(
+                &router,
+                &format!("/api/tags/{tag1}"),
+                &token,
+                json!({
+                    "name": "tag-cf1-renamed",
+                    "collectionGroupId": group_id,
+                    "address": "D100",
+                    "dataType": "i16",
+                    "expectedRevision": stale
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+        drop(writer);
+
+        let (status, body) = request.await.expect("join");
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert_eq!(body["error"], "tag_revision_conflict", "{body:?}");
+
+        pool_b.close().await;
+        env.pool.close().await;
+        remove_db_files(&path);
     }
 
     /// (a) 認証なし → 401（CSRF ヘッダは付けている - `admin_routes_require_the_csrf_header`
