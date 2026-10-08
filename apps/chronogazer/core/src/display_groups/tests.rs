@@ -48,20 +48,16 @@ pub(crate) async fn seed_tags(pool: &SqlitePool, n: usize) -> (TagService, Vec<i
     (tags, ids)
 }
 
+/// タグの本文。JSON から組むのは、`TagPayload` に省略できる項目が増えても
+/// （#525 のしきい値・`expectedRevision` など）このテストを直さずに済むように。
 fn tag_payload(name: &str, collection_group_id: i64) -> TagPayload {
-    TagPayload {
-        name: name.to_string(),
-        collection_group_id,
-        address: "40001".to_string(),
-        data_type: "u16".to_string(),
-        raw_lo: None,
-        raw_hi: None,
-        eng_lo: None,
-        eng_hi: None,
-        unit: None,
-        decimals: 0,
-        enabled: true,
-    }
+    serde_json::from_value(json!({
+        "name": name,
+        "collectionGroupId": collection_group_id,
+        "address": "40001",
+        "dataType": "u16",
+    }))
+    .expect("TagPayload")
 }
 
 /// メモリ DB と、その上のタグ `n` 本。
