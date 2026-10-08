@@ -2,7 +2,7 @@
 
 作成日: 2026-09-30  
 最終更新: 2026-10-01（同日 2 回目: §22 の #22〜#27 を決定。projectRevision と contentHash の役割分離と `external-modified` 状態（§4.3）、式の Quality 導出と string 参照の拒否箇所（§9.5）、回転 pivot と `preserveAspectRatio`（§6.4）、mode は起動時に確定（§18）、session descriptor の脅威モデルと session probe（§19.13）、Symbol 取り込み時の SymbolId 保持と複製時の deep clone（§4.2 / §5.3）。同日 1 回目: §22 の未決 6 件を決定: Project package は `.bantoscada` で directory / ZIP の 2 表現（§5.1）、Stable ID は UUID v7（§4.2）、Screen 座標は f64 design unit + SVG viewBox（§6.4）、式は banto-expr を Rust 側で評価し presentation semantics は宣言的 mapping（§9.5）、Editor / Runtime は v1 は同一 executable の mode で capability を分離（§18）、Design API は loopback REST + ephemeral bearer token のみ（§19.13）。AI 変更の承認要否は semantic risk を Design Domain が算出（§19.7）。決定の帰結として生じた残件 #22〜#27 を §22 に追加、manifest の `exportedAt` / `contentHash` を archive-only に（§4.3）。2026-09-30: DB Table/View を Dataset で表現する案 B に決定（§14.2）。repo の置き場所を banto-industrial 内に決定（§20）。Replay を将来機能（有料版候補）として §13.3 に追加し、v1 に残す前提条件を列挙。冗長化の方針を §13.2 に追記: PLC / Hub / SCADA server の 3 層で独立、読み取り・評価は全台、副作用は 1 台、調停は PLC 調停を第一候補。詳細は別草案。v1 の範囲を決定（§3）: 画面とライブ値・操作まで、scada-server 系は v1.1。SCADA server の構成を決定（§13.2）: 24/365 の処理は UI と別のライブラリ core に置き、v1 はアプリ埋め込み、後から Windows サービス host を足す。§10.3 / §11.6 / §22 の #7 #15 #17 #18 を決定済みに。同日: Historian は ChronoGazer と共有（§13）、Binding identity は名前のみ（§9.6）、Hub データ型対応（§8.3）ほか）  
-状態: **設計中（初版ドラフト）**
+状態: **設計中（初版ドラフト）**。2026-10-08 更新: §11.2 に、しきい値警報は使う側（SCADA・記録計）が持って判定し Hub の computed tag は使わない、とするオーナー決定（#532・#533）を追記した。
 
 本書は banto-industrial のタグサーバー banto-hub をデータ境界として利用する
 汎用 SCADA / HMI アプリケーション **banto-scada** の設計方針をまとめる。
@@ -1373,8 +1373,14 @@ AlarmSource
 - `Motor.Command && !Motor.Feedback`
 - bool tag の rising / falling state
 
-条件式の評価は Hub の computed tag（banto-expr、tag-server-design.md §4.2）に登録し、Alarm Engine は
-その `bit` を購読するだけにすると、式評価器を二重に持たずに済む。初期実装の最小形として検討する。
+**2026-10-08 オーナー決定（#532・#533、[plan.md](plan.md) §5）: しきい値警報（HH/H/L/LL）は、
+使う側のアプリ（SCADA・記録計）がしきい値を持って自分で判定する。Hub は持たず、警報も判定しない。**
+上の `Tank.Level >= 90` のような**しきい値の条件は、Hub の computed tag に登録して Alarm Engine が
+その `bit` を購読する方式にはしない**。SCADA は自分のしきい値の設定を持ち、判定に使った
+しきい値をイベントに残す（記録計と同じ。SCADA は記録計の機能を含むので、同じ計器を両方で判定しない）。
+Hub の computed tag（banto-expr、tag-server-design.md §4.2）は汎用の機能として残る（外さない）が、
+しきい値警報の仕組みではない。しきい値でない条件（`Motor.Command && !Motor.Feedback` のような
+複数タグの式）を computed tag の `bit` で受けるかどうかは、この決定の対象外で、別に検討する。
 
 将来 PLC 側で生成済みの Alarm state/event を取り込む場合も、
 Alarm Engine 本体へ MELSEC 固有情報を持ち込まず source adapter で接続する。
