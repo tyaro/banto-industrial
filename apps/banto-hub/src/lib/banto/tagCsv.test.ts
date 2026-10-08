@@ -135,10 +135,6 @@ function makeTag(overrides: Partial<Tag> = {}): Tag {
 		engHi: null,
 		unit: null,
 		decimals: 0,
-		thresholdH: null,
-		thresholdHh: null,
-		thresholdL: null,
-		thresholdLl: null,
 		enabled: true,
 		writable: false,
 		tagKind: 'plc',
@@ -169,10 +165,6 @@ const DEFAULT_ROW: CsvRowFields = {
 	rawHi: '',
 	engLo: '',
 	engHi: '',
-	thresholdH: '',
-	thresholdHh: '',
-	thresholdL: '',
-	thresholdLl: '',
 	enabled: '',
 	writable: '',
 	tagKind: '',
@@ -457,8 +449,8 @@ describe('serializeCsv', () => {
 // ==============================================================================
 
 describe('TAG_CSV_COLUMNS', () => {
-	it('22 列である', () => {
-		expect(TAG_CSV_COLUMNS.length).toBe(22);
+	it('18 列である（#533 でしきい値の 4 列を外した）', () => {
+		expect(TAG_CSV_COLUMNS.length).toBe(18);
 	});
 
 	it('列順のスナップショット', () => {
@@ -476,10 +468,6 @@ describe('TAG_CSV_COLUMNS', () => {
 			'rawHi',
 			'engLo',
 			'engHi',
-			'thresholdH',
-			'thresholdHh',
-			'thresholdL',
-			'thresholdLl',
 			'enabled',
 			'writable',
 			'tagKind',
@@ -516,26 +504,12 @@ describe('exportTagsCsv', () => {
 			rawLo: null,
 			rawHi: null,
 			engLo: null,
-			engHi: null,
-			thresholdH: null,
-			thresholdHh: null,
-			thresholdL: null,
-			thresholdLl: null
+			engHi: null
 		});
 		const csv = exportTagsCsv([tag], CONNECTIONS, GROUPS);
 		const [, dataRow] = parseCsv(stripBom(csv));
 		const idx = (c: CsvColumn) => TAG_CSV_COLUMNS.indexOf(c);
-		for (const c of [
-			'stringLength',
-			'rawLo',
-			'rawHi',
-			'engLo',
-			'engHi',
-			'thresholdH',
-			'thresholdHh',
-			'thresholdL',
-			'thresholdLl'
-		] as const) {
+		for (const c of ['stringLength', 'rawLo', 'rawHi', 'engLo', 'engHi'] as const) {
 			expect(dataRow[idx(c)]).toBe('');
 		}
 	});
@@ -613,10 +587,6 @@ describe('exportTagsCsv', () => {
 				engHi: 99.9,
 				unit: '℃',
 				decimals: 2,
-				thresholdH: 80,
-				thresholdHh: 90,
-				thresholdL: 10,
-				thresholdLl: 5,
 				enabled: true,
 				writable: true,
 				tagKind: 'plc'
@@ -638,10 +608,6 @@ describe('exportTagsCsv', () => {
 				engHi: 99.9,
 				unit: '℃',
 				decimals: 2,
-				thresholdH: 80,
-				thresholdHh: 90,
-				thresholdL: 10,
-				thresholdLl: 5,
 				enabled: true,
 				writable: true,
 				tagKind: 'plc',
@@ -791,6 +757,24 @@ describe('parseTagsCsv', () => {
 			const errors = expectErr(parseTagsCsv(text, CONNECTIONS, GROUPS));
 			expect(errors[0].lineNumber).toBe(1);
 		});
+
+		it('#533: しきい値の 4 列を持つ旧形式の CSV はヘッダ不一致エラー（黙って捨てない）', () => {
+			expect(TAG_CSV_COLUMNS.some((c) => c.startsWith('threshold'))).toBe(false);
+			const header: string[] = [...TAG_CSV_COLUMNS];
+			header.splice(
+				header.indexOf('engHi') + 1,
+				0,
+				'thresholdH',
+				'thresholdHh',
+				'thresholdL',
+				'thresholdLl'
+			);
+			const text = buildCsv([], { header });
+			const errors = expectErr(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(errors).toHaveLength(1);
+			expect(errors[0].lineNumber).toBe(1);
+			expect(errors[0].message).not.toContain('threshold');
+		});
 	});
 
 	describe('正常系', () => {
@@ -815,10 +799,6 @@ describe('parseTagsCsv', () => {
 					engHi: undefined,
 					unit: undefined,
 					decimals: 0,
-					thresholdH: undefined,
-					thresholdHh: undefined,
-					thresholdL: undefined,
-					thresholdLl: undefined,
 					enabled: true,
 					writable: false,
 					tagKind: 'plc',
@@ -1114,17 +1094,8 @@ describe('parseTagsCsv', () => {
 		});
 	});
 
-	describe('数値欄(rawLo/rawHi/engLo/engHi/thresholdH/Hh/L/Ll)', () => {
-		const NUMERIC_FIELDS = [
-			'rawLo',
-			'rawHi',
-			'engLo',
-			'engHi',
-			'thresholdH',
-			'thresholdHh',
-			'thresholdL',
-			'thresholdLl'
-		] as const;
+	describe('数値欄(rawLo/rawHi/engLo/engHi)', () => {
+		const NUMERIC_FIELDS = ['rawLo', 'rawHi', 'engLo', 'engHi'] as const;
 
 		it('すべて空欄なら undefined になる', () => {
 			const text = buildCsv([row()]);
@@ -1139,11 +1110,7 @@ describe('parseTagsCsv', () => {
 				rawLo: '0',
 				rawHi: '4095',
 				engLo: '-5.5',
-				engHi: '200',
-				thresholdH: '80',
-				thresholdHh: '90',
-				thresholdL: '10',
-				thresholdLl: '5'
+				engHi: '200'
 			};
 			const text = buildCsv([row(overrides)]);
 			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
@@ -1151,10 +1118,6 @@ describe('parseTagsCsv', () => {
 			expect(rows[0].tag.rawHi).toBe(4095);
 			expect(rows[0].tag.engLo).toBe(-5.5);
 			expect(rows[0].tag.engHi).toBe(200);
-			expect(rows[0].tag.thresholdH).toBe(80);
-			expect(rows[0].tag.thresholdHh).toBe(90);
-			expect(rows[0].tag.thresholdL).toBe(10);
-			expect(rows[0].tag.thresholdLl).toBe(5);
 		});
 
 		test.each(NUMERIC_FIELDS)('%s に非数値を入れるとラベル付きエラーになる', (field) => {

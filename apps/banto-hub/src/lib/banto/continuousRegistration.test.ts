@@ -43,10 +43,6 @@ function baseForm(overrides: Partial<ContinuousFormState> = {}): ContinuousFormS
 		rawHi: '',
 		engLo: '',
 		engHi: '',
-		thresholdH: '',
-		thresholdHh: '',
-		thresholdL: '',
-		thresholdLl: '',
 		enabled: true,
 		writable: false,
 		...overrides
@@ -93,14 +89,16 @@ describe('buildContinuousParams', () => {
 		expect(params?.decimals).toBe(0);
 	});
 
-	it('スケーリング/しきい値が null でも組み立てられ、送信時は未設定（null）になる', () => {
-		const params = buildContinuousParams(
-			baseForm({ rawLo: null, rawHi: 100, thresholdH: null, thresholdHh: 90 })
-		);
+	it('スケーリングが null でも組み立てられ、送信時は未設定（null）になる', () => {
+		const params = buildContinuousParams(baseForm({ rawLo: null, rawHi: 100 }));
 		expect(params?.rawLo).toBeNull();
 		expect(params?.rawHi).toBe(100);
-		expect(params?.thresholdH).toBeNull();
-		expect(params?.thresholdHh).toBe(90);
+	});
+
+	it('#533: 組み立てた入力にしきい値の項目は無い（Hub はしきい値を持たない）', () => {
+		const params = buildContinuousParams(baseForm({}));
+		expect(params).not.toBeNull();
+		expect(Object.keys(params ?? {}).filter((key) => key.startsWith('threshold'))).toEqual([]);
 	});
 });
 

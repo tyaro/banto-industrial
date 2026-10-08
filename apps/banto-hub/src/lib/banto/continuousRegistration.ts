@@ -145,10 +145,6 @@ export interface ContinuousRegistrationCommon {
 	rawHi?: number | null;
 	engLo?: number | null;
 	engHi?: number | null;
-	thresholdH?: number | null;
-	thresholdHh?: number | null;
-	thresholdL?: number | null;
-	thresholdLl?: number | null;
 	enabled: boolean;
 	writable: boolean;
 }
@@ -178,7 +174,7 @@ export interface ContinuousRegistrationParams extends ContinuousRegistrationComm
  *
  * 本 interface はこの「型は string だが実体は string|number|null」という
  * 実態を明示するため、number input 由来のフィールド（`startNumber`/
- * `count`/`decimals`/`stringLength`/`rawLo`〜`thresholdLl`）は
+ * `count`/`decimals`/`stringLength`/`rawLo`〜`engHi`）は
  * `string | number | null` とし、text input・select 由来のフィールド
  * （`collectionGroupId`/`namePattern`/`startAddress`）のみ `string` に
  * 保つ。パースは {@link buildContinuousParams} が
@@ -201,10 +197,6 @@ export interface ContinuousFormState {
 	rawHi: string | number | null;
 	engLo: string | number | null;
 	engHi: string | number | null;
-	thresholdH: string | number | null;
-	thresholdHh: string | number | null;
-	thresholdL: string | number | null;
-	thresholdLl: string | number | null;
 	enabled: boolean;
 	writable: boolean;
 }
@@ -398,10 +390,6 @@ export function generateContinuousTags(
 		engHi: params.engHi,
 		unit: params.unit,
 		decimals: params.decimals,
-		thresholdH: params.thresholdH,
-		thresholdHh: params.thresholdHh,
-		thresholdL: params.thresholdL,
-		thresholdLl: params.thresholdLl,
 		enabled: params.enabled,
 		writable: params.writable
 	}));
@@ -454,10 +442,6 @@ export function buildContinuousParams(
 		rawHi: toOptionalNumberOrNull(form.rawHi),
 		engLo: toOptionalNumberOrNull(form.engLo),
 		engHi: toOptionalNumberOrNull(form.engHi),
-		thresholdH: toOptionalNumberOrNull(form.thresholdH),
-		thresholdHh: toOptionalNumberOrNull(form.thresholdHh),
-		thresholdL: toOptionalNumberOrNull(form.thresholdL),
-		thresholdLl: toOptionalNumberOrNull(form.thresholdLl),
 		enabled: form.enabled,
 		writable: form.writable
 	};

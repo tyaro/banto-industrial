@@ -159,10 +159,6 @@ export const TAG_CSV_COLUMNS = [
 	'rawHi',
 	'engLo',
 	'engHi',
-	'thresholdH',
-	'thresholdHh',
-	'thresholdL',
-	'thresholdLl',
 	'enabled',
 	'writable',
 	'tagKind',
@@ -210,10 +206,6 @@ export function exportTagsCsv(
 			numCell(t.rawHi),
 			numCell(t.engLo),
 			numCell(t.engHi),
-			numCell(t.thresholdH),
-			numCell(t.thresholdHh),
-			numCell(t.thresholdL),
-			numCell(t.thresholdLl),
 			t.enabled ? 'true' : 'false',
 			t.writable ? 'true' : 'false',
 			t.tagKind,
@@ -458,10 +450,6 @@ export function parseTagsCsv(
 		const rawHi = numField('rawHi', 'rawHi');
 		const engLo = numField('engLo', 'engLo');
 		const engHi = numField('engHi', 'engHi');
-		const thresholdH = numField('thresholdH', 'thresholdH');
-		const thresholdHh = numField('thresholdHh', 'thresholdHh');
-		const thresholdL = numField('thresholdL', 'thresholdL');
-		const thresholdLl = numField('thresholdLl', 'thresholdLl');
 
 		const unitRaw = col('unit');
 		const unit = unitRaw === '' ? undefined : unitRaw;
@@ -508,10 +496,6 @@ export function parseTagsCsv(
 			engHi,
 			unit,
 			decimals,
-			thresholdH,
-			thresholdHh,
-			thresholdL,
-			thresholdLl,
 			enabled,
 			// computed/db は toInput() と同じく常に writable=false（computed:
 			// 値は式が決める。db: v1 は読み取り専用 §6-10）。

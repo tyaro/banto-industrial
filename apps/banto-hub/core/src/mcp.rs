@@ -841,7 +841,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_tag",
-            "description": "タグを新規作成する(admin スコープ必須)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+            "description": "タグを新規作成する(admin スコープ必須)。しきい値(H/HH/L/LL)は Hub では持たない(記録計・SCADA の側の設定) - thresholdH などを値付きで送ると入力エラーになる。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -863,10 +863,6 @@ fn tool_definitions() -> Vec<Value> {
                     "engHi": { "type": ["number", "null"], "description": "スケーリング後工学値上限。未使用時は null。" },
                     "unit": { "type": ["string", "null"], "description": "工学単位。未使用時は null。" },
                     "decimals": { "type": "integer", "description": "表示小数桁数。既定値 0。" },
-                    "thresholdH": { "type": ["number", "null"], "description": "しきい値 H。未使用時は null。" },
-                    "thresholdHh": { "type": ["number", "null"], "description": "しきい値 HH。未使用時は null。" },
-                    "thresholdL": { "type": ["number", "null"], "description": "しきい値 L。未使用時は null。" },
-                    "thresholdLl": { "type": ["number", "null"], "description": "しきい値 LL。未使用時は null。" },
                     "enabled": { "type": "boolean", "description": "既定値 false。" },
                     "writable": { "type": "boolean", "description": "書き込み許可。既定値 false。" },
                     "tagKind": {
@@ -882,7 +878,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_tag",
-            "description": "既存のタグを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない) - get_tag で現在値を取得してから全項目を送り返すこと。expectedRevision を付けると楽観ロックになり、他者が先に更新していた場合は revision_conflict エラーで拒否される(get_tag で最新の revision を取り直して再試行)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+            "description": "既存のタグを更新する(admin スコープ必須)。しきい値(H/HH/L/LL)は Hub では持たない(記録計・SCADA の側の設定)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない) - get_tag で現在値を取得してから全項目を送り返すこと。expectedRevision を付けると楽観ロックになり、他者が先に更新していた場合は revision_conflict エラーで拒否される(get_tag で最新の revision を取り直して再試行)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -902,10 +898,6 @@ fn tool_definitions() -> Vec<Value> {
                     "engHi": { "type": ["number", "null"], "description": "スケーリング後工学値上限。未使用時は null。" },
                     "unit": { "type": ["string", "null"], "description": "工学単位。未使用時は null。" },
                     "decimals": { "type": "integer", "description": "表示小数桁数。" },
-                    "thresholdH": { "type": ["number", "null"], "description": "しきい値 H。未使用時は null。" },
-                    "thresholdHh": { "type": ["number", "null"], "description": "しきい値 HH。未使用時は null。" },
-                    "thresholdL": { "type": ["number", "null"], "description": "しきい値 L。未使用時は null。" },
-                    "thresholdLl": { "type": ["number", "null"], "description": "しきい値 LL。未使用時は null。" },
                     "enabled": { "type": "boolean", "description": "タグを有効にするか。" },
                     "writable": { "type": "boolean", "description": "書き込み許可。" },
                     "tagKind": { "type": "string", "description": "plc/computed/internal/db のいずれか。" },
@@ -930,10 +922,6 @@ fn tool_definitions() -> Vec<Value> {
                     "engHi",
                     "unit",
                     "decimals",
-                    "thresholdH",
-                    "thresholdHh",
-                    "thresholdL",
-                    "thresholdLl",
                     "enabled",
                     "writable",
                     "tagKind",
@@ -2197,7 +2185,7 @@ const UPDATE_GROUP_REQUIRED_FIELDS: [&str; 7] = [
 /// （camelCase）全部 + `id`。`expectedRevision`は楽観ロック用の任意項目
 /// なので含めない（設計 §4 実装指示 T21-S1d 参照）。inputSchema の
 /// `update_tag.required`と同期させること。
-const UPDATE_TAG_REQUIRED_FIELDS: [&str; 22] = [
+const UPDATE_TAG_REQUIRED_FIELDS: [&str; 18] = [
     "id",
     "name",
     "collectionGroupId",
@@ -2211,10 +2199,6 @@ const UPDATE_TAG_REQUIRED_FIELDS: [&str; 22] = [
     "engHi",
     "unit",
     "decimals",
-    "thresholdH",
-    "thresholdHh",
-    "thresholdL",
-    "thresholdLl",
     "enabled",
     "writable",
     "tagKind",
@@ -2842,6 +2826,10 @@ async fn tool_create_tag(
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
     let input: TagPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("タグの入力が不正です: {err}")))?;
+    // #533: しきい値を値付きで送ってきたら、キューに積む前に断る（REST と同じ）。
+    if let Err(err) = input.reject_thresholds() {
+        return Ok(banto_error_tool_error(&err));
+    }
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
@@ -2960,6 +2948,10 @@ async fn tool_update_tag(
         .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
     let input: TagPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("タグの入力が不正です: {err}")))?;
+    // #533: しきい値を値付きで送ってきたら、キューに積む前に断る（REST と同じ）。
+    if let Err(err) = input.reject_thresholds() {
+        return Ok(banto_error_tool_error(&err));
+    }
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()

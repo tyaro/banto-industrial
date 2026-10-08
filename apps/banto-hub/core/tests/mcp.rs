@@ -121,10 +121,6 @@ fn tag_input(
         eng_hi: None,
         unit: None,
         decimals: 0,
-        threshold_h: None,
-        threshold_hh: None,
-        threshold_l: None,
-        threshold_ll: None,
         enabled,
         writable,
         tag_kind: "plc".to_string(),
@@ -488,6 +484,132 @@ async fn tools_list_returns_the_thirty_eight_tools() {
             "write_tag_value",
         ]
     );
+}
+
+/// #533（2026-10-08 オーナー決定「Hub はしきい値を持たない」）: タグのツール
+/// （`create_tag`/`update_tag`）の入力スキーマはしきい値を載せず、
+/// `update_tag` の必須項目にも無い。説明文は「Hub では持たない」と案内する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_tool_schemas_do_not_advertise_thresholds() {
+    let app = test_app("tools-list-no-thresholds").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = mcp_post(&app.router, Some(&key), rpc("tools/list", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    for name in ["create_tag", "update_tag"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed"));
+        let schema = &tool["inputSchema"];
+        let properties = schema["properties"].as_object().expect("properties");
+        assert!(
+            properties.keys().all(|key| !key.starts_with("threshold")),
+            "{name}: {:?}",
+            properties.keys().collect::<Vec<_>>()
+        );
+        let required = schema["required"].as_array().expect("required");
+        assert!(
+            required
+                .iter()
+                .all(|key| !key.as_str().unwrap().starts_with("threshold")),
+            "{name}: {required:?}"
+        );
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("しきい値(H/HH/L/LL)は Hub では持たない"),
+            "{name}: {}",
+            tool["description"]
+        );
+    }
+}
+
+/// #533: `create_tag`/`update_tag` にしきい値を**値付きで**送ると、黙って捨てずに
+/// 入力エラー（どの項目かが分かる）で断り、何も作らない・変えない。`null` は
+/// 通る（#533 より前のクライアントは空欄を `null` で送っていた）。
+///
+/// 反証（2026-10-09 実施）: `TagPayload::threshold_field_errors`（`reject_thresholds`
+/// の中身）が常に空を返すようにすると、作成が通って `isError` が `false` になり
+/// 落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_tools_reject_thresholds_with_values() {
+    let app = test_app("s1d-tag-thresholds").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15023).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let before_rows = tags_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp01",
+                "collectionGroupId": group.id,
+                "address": "D100",
+                "dataType": "u16",
+                "thresholdH": 80,
+                "thresholdLl": null,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("thresholdH"), "{text}");
+    assert!(!text.contains("thresholdLl"), "{text}");
+    assert!(text.contains("banto-hub はしきい値を持ちません"), "{text}");
+    assert_eq!(tags_row_count(&app).await, before_rows);
+
+    // `null` は通る。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp01",
+                "collectionGroupId": group.id,
+                "address": "D100",
+                "dataType": "u16",
+                "thresholdH": null,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let id = serde_json::from_str::<Value>(text).unwrap()["created"]["id"]
+        .as_i64()
+        .unwrap();
+
+    let mut args = full_tag_update_args(id, group.id, "temp01", "D100", None);
+    args["thresholdHh"] = json!(90);
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_tag", args),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("thresholdHh"), "{text}");
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM tags WHERE id = ?")
+        .bind(id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(revision, 1, "the rejected update must not change the tag");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2751,10 +2873,6 @@ fn full_tag_update_args(
         "engHi": null,
         "unit": null,
         "decimals": 0,
-        "thresholdH": null,
-        "thresholdHh": null,
-        "thresholdL": null,
-        "thresholdLl": null,
         "enabled": true,
         "writable": true,
         "tagKind": "plc",
@@ -2919,9 +3037,9 @@ async fn create_tag_with_admin_scope_while_stopped_creates_and_audits() {
 }
 
 /// T21 小改善（実機検証 2026-09-06）: `TagService::create_tx`が
-/// `TagUpdateError`とは別に`BantoError::Validation`（しきい値の大小関係
-/// 違反、`crates/banto-tags/src/tag.rs`の`validate_thresholds`）を返した
-/// とき、field 詳細（どのしきい値がなぜ不正か）が`tool_error`に出ることを
+/// `TagUpdateError`とは別に`BantoError::Validation`（表示小数桁の範囲外。
+/// #533 まではしきい値の大小関係違反で確かめていた）を返した
+/// とき、field 詳細（どの項目がなぜ不正か）が`tool_error`に出ることを
 /// 確認する - `create_connection_validation_error_includes_field_detail`
 /// と同じ`crate::mcp::banto_error_tool_error`の固定テストだが、こちらは
 /// `banto_tags::tag`側の Validation を通す。
@@ -2946,8 +3064,7 @@ async fn create_tag_validation_error_includes_field_detail() {
                 "collectionGroupId": group.id,
                 "address": "D100",
                 "dataType": "u16",
-                "thresholdLl": 100,
-                "thresholdL": 10,
+                "decimals": 7,
             }),
         ),
     )
@@ -2955,7 +3072,7 @@ async fn create_tag_validation_error_includes_field_detail() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["result"]["isError"], true, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("thresholdL"), "{text}");
+    assert!(text.contains("decimals"), "{text}");
     assert!(!text.contains("validation failed"), "{text}");
 
     assert_eq!(

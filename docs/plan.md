@@ -29,6 +29,7 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 同日: §5 の同項に、要件の草案（recorder-requirements.md §3.7、未実装・未決あり）への参照を追記。同日: §5 の同項に、PLC 接続・収集グループ・タグ定義（I1）も対象に含めること、目的（ユーザーの負荷を極力減らす）、適用の動作（手動と同じ）のオーナー決定を追記。同日: §3.7 の未決（9 項目）がオーナー決定で確定したことを §5 の同項に反映。
 同日: §5 に、しきい値は使う側（記録計・SCADA）の設定であり Hub は持たない・判定しないオーナー決定（#532・#533）を追記し、AI 対話の項の「しきい値を含む」を記録計の側の設定に直した。
 同日: §5 の同項に、#532（ChronoGazer の記録計の側のタグごとの設定への移行）を実装したことを追記（#533 は未着手）。
+2026-10-09: §5 の同項に、#533（Hub と `banto-tags` からしきい値を外す）を実装したことを追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -441,7 +442,9 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
   - しきい値のイベントには、**判定に使ったしきい値**を残す。
   - 作業: #532（ChronoGazer: 記録計の側のタグごとの設定へ移す。先。**2026-10-08 実装** -
     `recorder_tag_settings`・`/api/tag-thresholds`、しきい値イベントに判定値 `limit_value`。
-    既存のタグの列の値は移さない）→ #533（Hub と `banto-tags` から外す。未着手）。要件は [recorder-requirements.md](recorder-requirements.md)
+    既存のタグの列の値は移さない）→ #533（Hub と `banto-tags` から外す。**2026-10-09 実装** -
+    banto-tags の migration 0018 で `tags` のしきい値の列を落とし、Hub の画面・REST・MCP・CSV・
+    設定パッケージから外した。値付きのしきい値は検証エラーで断る。Hub の収集は判定しない）。要件は [recorder-requirements.md](recorder-requirements.md)
     §3.1・§3.2・§3.5・§3.7 に反映済み。
 
 ## 6. 全体の依存関係

@@ -7,7 +7,6 @@ import { describe, expect, it } from 'vitest';
 import {
 	DISPLAY_SCALING_FIELDS,
 	DISPLAY_SCALING_VALUE_FIELDS,
-	THRESHOLD_FIELDS,
 	WRITE_SAFETY_FIELDS,
 	hasFieldError,
 	hasAnyFieldValue,
@@ -27,14 +26,6 @@ describe('hasFieldError', () => {
 		expect(hasFieldError({ name: 'required' }, DISPLAY_SCALING_FIELDS)).toBe(false);
 	});
 
-	it('THRESHOLD_FIELDS のいずれかにエラーがあれば true', () => {
-		expect(hasFieldError({ thresholdHh: 'invalid' }, THRESHOLD_FIELDS)).toBe(true);
-	});
-
-	it('THRESHOLD_FIELDS に無関係なエラーだけなら false', () => {
-		expect(hasFieldError({ unit: 'invalid' }, THRESHOLD_FIELDS)).toBe(false);
-	});
-
 	it('WRITE_SAFETY_FIELDS（writable）にエラーがあれば true', () => {
 		expect(hasFieldError({ writable: 'invalid' }, WRITE_SAFETY_FIELDS)).toBe(true);
 	});
@@ -45,7 +36,6 @@ describe('hasFieldError', () => {
 
 	it('errors が空なら常に false', () => {
 		expect(hasFieldError({}, DISPLAY_SCALING_FIELDS)).toBe(false);
-		expect(hasFieldError({}, THRESHOLD_FIELDS)).toBe(false);
 		expect(hasFieldError({}, WRITE_SAFETY_FIELDS)).toBe(false);
 	});
 
@@ -64,10 +54,6 @@ describe('hasAnyFieldValue', () => {
 		expect(hasAnyFieldValue({ decimals: '2' }, DISPLAY_SCALING_VALUE_FIELDS)).toBe(false);
 	});
 
-	it('THRESHOLD_FIELDS のいずれかに非空文字列があれば true', () => {
-		expect(hasAnyFieldValue({ thresholdHh: '80' }, THRESHOLD_FIELDS)).toBe(true);
-	});
-
 	it('すべて空文字列なら false', () => {
 		expect(
 			hasAnyFieldValue({ rawLo: '', rawHi: '', engLo: '', engHi: '' }, DISPLAY_SCALING_VALUE_FIELDS)
@@ -83,7 +69,7 @@ describe('hasAnyFieldValue', () => {
 	});
 
 	it('数値の "0" は非空文字列として設定済み扱いにする', () => {
-		expect(hasAnyFieldValue({ thresholdL: '0' }, THRESHOLD_FIELDS)).toBe(true);
+		expect(hasAnyFieldValue({ engLo: '0' }, DISPLAY_SCALING_VALUE_FIELDS)).toBe(true);
 	});
 });
 

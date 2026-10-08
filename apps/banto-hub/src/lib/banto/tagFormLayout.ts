@@ -40,9 +40,6 @@ import type { TagKind } from './tagRegistryAdmin';
 /** 「表示・スケーリング」詳細セクションに属するフィールド名。 */
 export const DISPLAY_SCALING_FIELDS = ['decimals', 'rawLo', 'rawHi', 'engLo', 'engHi'] as const;
 
-/** 「しきい値」詳細セクションに属するフィールド名。 */
-export const THRESHOLD_FIELDS = ['thresholdH', 'thresholdHh', 'thresholdL', 'thresholdLl'] as const;
-
 /** 「書き込み安全設定」詳細セクションに属するフィールド名。 */
 export const WRITE_SAFETY_FIELDS = ['writable'] as const;
 
@@ -91,7 +88,7 @@ export function hasAnyFieldValue(values: object, fields: readonly string[]): boo
 	// the call site - `Record<string, unknown>` requires the argument type
 	// to structurally have one. The cast here is safe: every field this
 	// function is ever called with is a known key of the caller's own form
-	// type (`DISPLAY_SCALING_VALUE_FIELDS`/`THRESHOLD_FIELDS`), so indexing
+	// type (`DISPLAY_SCALING_VALUE_FIELDS`), so indexing
 	// with a lookup that might miss is exactly the same risk a direct
 	// `values[field]` would already have.
 	const record = values as Record<string, unknown>;

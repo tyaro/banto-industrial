@@ -1386,3 +1386,126 @@ async fn batch_delete_pending_apply_after_stop_actually_deletes_the_rows() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(fetched3["name"], json!("dp3"));
 }
+
+// ---------------------------------------------------------------------------
+// #533: しきい値は Hub では受け取らない
+// ---------------------------------------------------------------------------
+
+/// #533（2026-10-08 オーナー決定「しきい値は使う側（記録計・SCADA）が持つ設定で、
+/// Hub は持たない」）: タグの作成・更新の 4 つの入口（`POST /api/tags`・
+/// `PUT /api/tags/{id}`・`POST /api/tags/batch`・`POST /api/tags/batch-update`）は、
+/// しきい値を**値付きで**送られたら黙って捨てずに `thresholdH` などの検証エラーで
+/// 断り、何も書き込まない（一括は「常に 200、`ok: false` で行ごとエラー」の契約の
+/// まま、dry run でも同じ）。`null` は通る（#533 より前の画面は空欄を `null` で
+/// 送っていた）。タグの応答にしきい値の項目は無い。
+///
+/// 反証（2026-10-09 実施）: `TagPayload::threshold_field_errors` が常に空を返す
+/// ようにすると、最初の単票作成が 200 になって落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_routes_reject_thresholds_with_values() {
+    let app = test_app("reject-thresholds").await;
+    let group_id = seed_group(&app, "thresholds").await;
+
+    // 単票の作成: 値付きは 422、`null` の欄はエラーに出ない。
+    let mut with_values = tag_payload("th1", group_id, "40001");
+    with_values["thresholdH"] = json!(80.0);
+    with_values["thresholdLl"] = json!(0.0);
+    with_values["thresholdL"] = Value::Null;
+    let (status, body) =
+        write_json(&app.router, "POST", "/api/tags", &app.token, with_values).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["kind"], json!("validation"));
+    let fields: Vec<&str> = body["field_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["field"].as_str().unwrap())
+        .collect();
+    assert_eq!(fields, ["thresholdLl", "thresholdH"], "{body:?}");
+    assert_eq!(tag_count(&app).await, 0);
+
+    // `null` だけなら通る。応答にしきい値の項目は無い。
+    let mut nulls = tag_payload("th1", group_id, "40001");
+    for key in ["thresholdH", "thresholdHh", "thresholdL", "thresholdLl"] {
+        nulls[key] = Value::Null;
+    }
+    let (status, created) = write_json(&app.router, "POST", "/api/tags", &app.token, nulls).await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    assert!(
+        created
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with("threshold")),
+        "{created:?}"
+    );
+    let id = created["id"].as_i64().unwrap();
+    let revision = created["revision"].as_i64().unwrap();
+
+    // 単票の更新: 断られ、版も進まない。
+    let mut update = tag_payload("th1", group_id, "40001");
+    update["thresholdHh"] = json!(90.0);
+    update["expectedRevision"] = json!(revision);
+    let (status, body) = write_json(
+        &app.router,
+        "PUT",
+        &format!("/api/tags/{id}"),
+        &app.token,
+        update,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["field_errors"][0]["field"], json!("thresholdHh"));
+    let (_, reread) = get_json(&app.router, &format!("/api/tags/{id}"), &app.token).await;
+    assert_eq!(reread["revision"], json!(revision));
+
+    // 一括作成（dry run でも本番でも）: 行ごとのエラー、何も作らない。
+    for dry_run in [true, false] {
+        let mut row = tag_payload("th2", group_id, "40002");
+        row["thresholdL"] = json!(10.0);
+        let (status, body) = write_json(
+            &app.router,
+            "POST",
+            "/api/tags/batch",
+            &app.token,
+            json!({
+                "dryRun": dry_run,
+                "tags": [tag_payload("ok", group_id, "40003"), row],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["ok"], json!(false), "{body:?}");
+        assert_eq!(body["dryRun"], json!(dry_run));
+        assert_eq!(body["errors"].as_array().unwrap().len(), 1, "{body:?}");
+        assert_eq!(body["errors"][0]["index"], json!(1));
+        assert_eq!(
+            body["errors"][0]["fieldErrors"][0]["field"],
+            json!("thresholdL")
+        );
+    }
+    assert_eq!(tag_count(&app).await, 1);
+
+    // 一括更新: 行ごとのエラー（id 付き）、何も変えない。
+    let mut row =
+        tag_batch_update_payload(id, "th1-renamed", group_id, "40001", true, Some(revision));
+    row["thresholdH"] = json!(1.0);
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({ "dryRun": false, "tags": [row] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(false), "{body:?}");
+    assert_eq!(body["errors"][0]["id"], json!(id));
+    assert_eq!(
+        body["errors"][0]["fieldErrors"][0]["field"],
+        json!("thresholdH")
+    );
+    let (_, reread) = get_json(&app.router, &format!("/api/tags/{id}"), &app.token).await;
+    assert_eq!(reread["name"], json!("th1"));
+    assert_eq!(reread["revision"], json!(revision));
+}

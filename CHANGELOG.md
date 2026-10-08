@@ -4,7 +4,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ## v0.2.0-alpha.29 — 2026-10-05（アルファ）
 
-banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A）。その後 v4.0.0 を経て、banto v5.0.0（2026-10-06、`SnapshotListResource` の失敗の形の破壊的変更と、`banto-server` の CSP の `connect-src` を要求ごとに広げる API の追加）に追従した。banto-hub への影響は依存の版・監査ログ画面の失敗の扱い・デスクトップ版の `/status` の CSP で、REST の wire・設定・DB は変わらない。配布物の構成・前提ランタイムは alpha.3 以降と同じ。alpha.28 の「旧形式の DB は起動を拒否する」はそのまま（上げる手順は alpha.28 の節）。
+banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A）。その後 v4.0.0 を経て、banto v5.0.0（2026-10-06、`SnapshotListResource` の失敗の形の破壊的変更と、`banto-server` の CSP の `connect-src` を要求ごとに広げる API の追加）に追従した。banto-hub への影響は依存の版・監査ログ画面の失敗の扱い・デスクトップ版の `/status` の CSP で、REST の wire・設定・DB は変わらない。ただし、その後に入ったしきい値の除去（#533）は、タグの REST/MCP の wire・CSV・設定パッケージ・DB（`tags` の列）と収集の動作（しきい値のイベントを出さない）を変える（下の banto-hub の節）。配布物の構成・前提ランタイムは alpha.3 以降と同じ。alpha.28 の「旧形式の DB は起動を拒否する」はそのまま（上げる手順は alpha.28 の節）。
 
 ### 変更（ChronoGazer。banto-hub の配布物には入らない）
 
@@ -28,7 +28,13 @@ banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし
 
 ### 変更（banto-hub）
 
-- 共有の `banto-collect` の変更（ChronoGazer の #532）に伴い、banto-hub の `collect_events` にも列 `limit_value`（しきい値のイベントの判定に使ったしきい値）が起動時に足され、しきい値のイベントにその値が入るようになった（banto-hub は従来どおりタグの列のしきい値で判定する。REST の `/api/v1/events` の応答・gRPC・ストリームの形は変えていない）。banto-hub のしきい値の除去は #533。
+- **しきい値を banto-hub から外した（#533、2026-10-08 オーナー決定「しきい値は使う側（記録計・SCADA）が持つ設定で、Hub は持たず警報を判定しない」）。動作の変更**:
+  - banto-hub は**しきい値を判定せず、しきい値のイベント（`threshold_entered` / `threshold_cleared`）を出さない**。収集の組み立て（`banto_collect::build_config_from`）がどのタグにもしきい値を持たせない。`/api/v1/events` などに出るのは収集開始/停止・PLC 断/復旧などだけになる（過去に記録したしきい値のイベントの行はそのまま残る）。
+  - 共有のタグ定義 `banto-tags` の `tags` からしきい値の列（`threshold_h` / `threshold_hh` / `threshold_l` / `threshold_ll`）を外した（migration 0018。表の作り直しで、残りの列の値・制約・索引・採番位置は保つ）。**起動時に自動で当たり、列の値は捨てる**（移す先は無い。必要なら記録計・SCADA の側で設定し直す）。ChronoGazer の DB にも当たる（ChronoGazer は #532 から列を使っていない）。
+  - タグの画面（単票・連続登録）からしきい値の欄を外した。REST（`POST`/`PUT /api/tags`・`/api/tags/batch`・`/api/tags/batch-update`）と MCP（`create_tag` / `update_tag`）は、しきい値を**値付きで**送ると黙って捨てずに `thresholdH` などの検証エラーで断る（`null` は通る。一括は従来どおり `200` + `ok: false` の行ごとのエラー）。MCP の入力スキーマ・`update_tag` の必須項目からも外した。タグの応答（`GET /api/tags` など）にしきい値の項目は無くなった。
+  - CSV の列から `thresholdH`〜`thresholdLl` を外した（18 列）。#533 より前の CSV はヘッダが合わず取り込めないので、4 列を消してから取り込む。
+  - **設定パッケージ（JSON）の形を変えた**: export はしきい値を書かない。取り込みは、しきい値が `null` か項目の無いタグは通し、値の入ったしきい値を持つタグがあれば取り込みを断る。版（`schemaVersion`）は 1 のまま（しきい値を使っていない旧パッケージはそのまま取り込める）。
+- 共有の `banto-collect` の変更（ChronoGazer の #532）に伴い、banto-hub の `collect_events` にも列 `limit_value`（しきい値のイベントの判定に使ったしきい値）が起動時に足された。banto-hub は #533 でしきい値を判定しなくなったので、この列に値が入るのは ChronoGazer だけ（REST の `/api/v1/events` の応答・gRPC・ストリームの形は変えていない）。
 - ChronoGazer の組み込みサーバー（デスクトップ版の LAN アクセスと `banto-serve`）と banto-hub のサーバー（コンソール/サービス/デスクトップ版の共通経路）の応答に、banto のセキュリティヘッダー（`with_security_headers`: CSP・`nosniff`・`X-Frame-Options: DENY`・`Referrer-Policy: same-origin`）を付けた（#500）。admin-template と同じく Router の最外に掛ける。
 - デスクトップ版（`banto-hub-shell`）の窓に CSP を設定した（#505。ChronoGazer と同じ値）。この CSP が掛かるのは起動中・起動失敗のプレースホルダ（`ui/index.html`）だけで、navigate した後の管理画面には Hub の応答の CSP（#500）が掛かる。その応答の CSP は `connect-src 'self'` なので、デスクトップ版で `/status` を読み込む（起動直後・再読み込み）たびに、サービス状態を取る IPC（`host_switch_status`・`sink_service_status`）の最初の fetch がコンソールに CSP 違反を出し、Tauri が postMessage に切り替えて表示は出ていた。→ 下の banto v5.0.0 追従で解消した。
 - **#505 の残り（`/status` の CSP 違反）を解消した。** Hub の応答の CSP を banto の `with_security_headers_using` に替え、**TCP の接続元と要求の宛先（`Host`）の両方が loopback の要求にだけ** `connect-src` に Tauri IPC（`ipc: http://ipc.localhost`）を足す（banto v5.1.0 の `request_is_loopback_local`）。LAN から直接つなぐブラウザ・接続元の分からない要求・`Host` が loopback でない要求は厳格なまま。広げた CSP を普通のブラウザが受け取っても、`ipc:` は扱えない scheme で、`http://ipc.localhost` は閲覧者自身の loopback の 80/443 番を指すだけ。v5.0.0 の接続元だけの判定（`request_from_loopback_peer`）では、同一ホストのリバースプロキシ（Caddy など）の後ろで LAN の閲覧者にも広げた CSP が届いていたので、v5.1.0 で宛先との AND に絞った（2026-10-06 オーナー決定）。**運用条件: プロキシは受け取った `Host` を保つ（Caddy の既定のまま。nginx は `proxy_set_header Host $host`）。共有キャッシュを前段に置かないか、`Host` ごとに分ける**（banto-hub-operations.md §6）。デスクトップ版の `/status` で違反 0 件・サービス状態の表示を実機で確認した。

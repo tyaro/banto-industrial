@@ -12,7 +12,9 @@
 //! - [`CollectionGroup`]: the unit of periodic PLC bulk read
 //!   (recorder-requirements.md §3.1: "収集周期はタグ毎ではなく収集グループ毎")
 //! - [`Tag`]: one collection point - address + data type + scaling + unit +
-//!   decimals + H/HH/L/LL thresholds (§2, §3.2)
+//!   decimals (§2, §3.2). H/HH/L/LL thresholds are **not** part of a tag
+//!   (#533, 2026-10-08 owner decision: しきい値は使う側（記録計・SCADA）の
+//!   設定) - migration 0018 dropped the `threshold_*` columns
 //!
 //! This crate is also the first real-world proof of consuming `banto-core`/
 //! `banto-storage` via a git tag reference rather than a workspace path
@@ -46,9 +48,9 @@ pub use plc_connection::{
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{
-    validate_thresholds, BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError,
-    BatchTagOutcome, BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput,
-    TagService, TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
+    BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome,
+    BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput, TagService,
+    TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
     COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN,
     MODBUS_ONLY_DATA_TYPES, NUMERIC_DATA_TYPES, PLC_TAG_KIND, STRING_DATA_TYPE,
 };

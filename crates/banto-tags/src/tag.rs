@@ -76,7 +76,7 @@ pub const NUMERIC_DATA_TYPES: &[&str] = &[
 pub const MODBUS_ONLY_DATA_TYPES: &[&str] = &["i64", "u64", "f64"];
 
 /// The one data type with a mandatory companion column (`string_length`) and
-/// no scaling/threshold story. Kept as a named constant so the validation
+/// no scaling story. Kept as a named constant so the validation
 /// below and any consumer reads as prose.
 pub const STRING_DATA_TYPE: &str = "string";
 
@@ -218,10 +218,6 @@ pub struct Tag {
     pub eng_hi: Option<f64>,
     pub unit: Option<String>,
     pub decimals: i64,
-    pub threshold_h: Option<f64>,
-    pub threshold_hh: Option<f64>,
-    pub threshold_l: Option<f64>,
-    pub threshold_ll: Option<f64>,
     pub enabled: bool,
     /// Per-tag write opt-in (design §6 item 1: "per-tag opt-in"). Whether a
     /// `writable` tag can actually be *targeted* by a write (e.g. "is this
@@ -319,14 +315,6 @@ pub struct TagInput {
     pub unit: Option<String>,
     #[serde(default = "default_decimals")]
     pub decimals: i64,
-    #[serde(default)]
-    pub threshold_h: Option<f64>,
-    #[serde(default)]
-    pub threshold_hh: Option<f64>,
-    #[serde(default)]
-    pub threshold_l: Option<f64>,
-    #[serde(default)]
-    pub threshold_ll: Option<f64>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// `#[serde(default)]` (= `false`): an existing API client's payload
@@ -366,53 +354,6 @@ struct ValidatedTag {
     /// this field rather than the raw input so the normalization cannot be
     /// forgotten on one of the (single/tx/batch) write paths.
     writable: bool,
-}
-
-/// Check `ll <= l <= h <= hh`, comparing only the thresholds that are
-/// actually set (spec: "しきい値の順序... 設定されているものだけ比較").
-/// Filtering to the set values while preserving position order and then
-/// checking only *consecutive* pairs in that filtered list is equivalent to
-/// checking every pair: the four positions form a fixed chain, so if the
-/// filtered sequence is non-decreasing, every omitted comparison involving a
-/// `None` is vacuously satisfied, and if some pair in the full chain would
-/// have been violated, at least one consecutive pair in the filtered
-/// sequence must be too (order violations cannot "hide" between two set
-/// values with only unset values between them).
-///
-/// `pub` since #532: ChronoGazer keeps its thresholds in its own recorder-side
-/// settings (not these columns) and validates them with this same ordering
-/// rule and the same `thresholdLl`/`thresholdL`/`thresholdH`/`thresholdHh`
-/// field names, so the two cannot drift apart while both exist.
-pub fn validate_thresholds(
-    ll: Option<f64>,
-    l: Option<f64>,
-    h: Option<f64>,
-    hh: Option<f64>,
-) -> Result<(), BantoError> {
-    let entries: [(&str, Option<f64>); 4] = [
-        ("thresholdLl", ll),
-        ("thresholdL", l),
-        ("thresholdH", h),
-        ("thresholdHh", hh),
-    ];
-    let set: Vec<(&str, f64)> = entries
-        .into_iter()
-        .filter_map(|(name, v)| v.map(|v| (name, v)))
-        .collect();
-
-    for pair in set.windows(2) {
-        let (prev_field, prev_value) = pair[0];
-        let (field, value) = pair[1];
-        if prev_value > value {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: field.to_string(),
-                    message: format!("{prev_field} 以上の値にしてください"),
-                }],
-            });
-        }
-    }
-    Ok(())
 }
 
 /// If `address` is unmistakably a Modbus reference number
@@ -748,11 +689,12 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
 
     // S1 string tags: `string_length` is mandatory (1..=128 words) for
     // data_type "string" and forbidden otherwise, and a string tag has no
-    // scaling/threshold story at all - a raw/eng mapping or an H/HH/L/LL
-    // comparison over SJIS text is meaningless, so setting either is a field
-    // error rather than silently ignored. The ordinary scaling/threshold
-    // validation below is skipped for string tags so a violation surfaces as
-    // the one intended message, not twice.
+    // scaling story at all - a raw/eng mapping over SJIS text is
+    // meaningless, so setting one is a field error rather than silently
+    // ignored. The ordinary scaling validation below is skipped for string
+    // tags so a violation surfaces as the one intended message, not twice.
+    // (#533: H/HH/L/LL thresholds are no longer part of a tag at all - they
+    // are the consumer's setting, e.g. ChronoGazer's `recorder_tag_settings`.)
     // T20 ①a: `string_encoding` vocabulary check applies to every tag (the
     // column carries a default regardless of `data_type`, same as
     // `decimals`) - unlike `string_length`, an out-of-vocabulary value is
@@ -795,20 +737,6 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
                 message: "string 型ではスケーリングを設定できません".to_string(),
             });
         }
-
-        for (field, value) in [
-            ("thresholdH", input.threshold_h),
-            ("thresholdHh", input.threshold_hh),
-            ("thresholdL", input.threshold_l),
-            ("thresholdLl", input.threshold_ll),
-        ] {
-            if value.is_some() {
-                errors.push(FieldError {
-                    field: field.to_string(),
-                    message: "string 型ではしきい値を設定できません".to_string(),
-                });
-            }
-        }
     } else if input.string_length.is_some() {
         errors.push(FieldError {
             field: "stringLength".to_string(),
@@ -823,15 +751,6 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
             input.eng_lo,
             input.eng_hi,
             "scaling",
-        ) {
-            errors.extend(field_errors);
-        }
-
-        if let Err(BantoError::Validation { field_errors }) = validate_thresholds(
-            input.threshold_ll,
-            input.threshold_l,
-            input.threshold_h,
-            input.threshold_hh,
         ) {
             errors.extend(field_errors);
         }
@@ -1068,10 +987,6 @@ fn column_map() -> ColumnMap {
         .column("engHi", "eng_hi")
         .column("unit", "unit")
         .column("decimals", "decimals")
-        .column("thresholdH", "threshold_h")
-        .column("thresholdHh", "threshold_hh")
-        .column("thresholdL", "threshold_l")
-        .column("thresholdLl", "threshold_ll")
         .column("enabled", "enabled")
         .column("writable", "writable")
         .column("tagKind", "tag_kind")
@@ -1082,8 +997,7 @@ fn column_map() -> ColumnMap {
 
 const RESOURCE: &str = "tags";
 const COLUMNS: &str = "id, name, collection_group_id, address, data_type, string_length, \
-     string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
-     threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
+     string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled, \
      writable, tag_kind, expression, retain, revision";
 const FK_MESSAGE: &str = "指定された収集グループが見つかりません";
 /// UNIQUE-violation message for `tags.name` (migration
@@ -1098,22 +1012,21 @@ const NAME_ALREADY_USED_IN_GROUP: &str = "この収集グループ内では既�
 
 /// Shared by [`TagService::create`] and [`TagService::create_batch`] (T11-1)
 /// so the two INSERT statements cannot drift apart - both bind the exact
-/// same 20 columns in the exact same order (see either call site).
+/// same 17 columns in the exact same order (see either call site).
 fn insert_tag_sql() -> String {
     format!(
         "INSERT INTO tags (\
             name, collection_group_id, address, data_type, string_length, \
-            string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
-            threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
+            string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled, \
             writable, tag_kind, expression, retain\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING {COLUMNS}"
     )
 }
 
 /// Shared by [`TagService::update`] and [`TagService::update_tx`] (T18-1) so
 /// the two UPDATE statements cannot drift apart - both bind the exact same
-/// 20 columns in the exact same order (mirrors [`insert_tag_sql`]'s doc
+/// 17 columns in the exact same order (mirrors [`insert_tag_sql`]'s doc
 /// comment), and both always advance `revision` regardless of whether the
 /// caller opted into the optimistic-lock check.
 ///
@@ -1133,7 +1046,7 @@ fn update_tag_sql(with_expected_revision: bool) -> String {
         "UPDATE tags SET \
             name = ?, collection_group_id = ?, address = ?, data_type = ?, \
             string_length = ?, string_encoding = ?, raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
-            threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ?, \
+            enabled = ?, \
             writable = ?, tag_kind = ?, expression = ?, retain = ?, revision = revision + 1 \
          {where_clause} RETURNING {COLUMNS}"
     )
@@ -1388,10 +1301,6 @@ impl TagService {
             .bind(input.eng_hi)
             .bind(&validated.unit)
             .bind(input.decimals)
-            .bind(input.threshold_h)
-            .bind(input.threshold_hh)
-            .bind(input.threshold_l)
-            .bind(input.threshold_ll)
             .bind(input.enabled)
             .bind(validated.writable)
             .bind(&input.tag_kind)
@@ -1439,10 +1348,6 @@ impl TagService {
             .bind(input.eng_hi)
             .bind(&validated.unit)
             .bind(input.decimals)
-            .bind(input.threshold_h)
-            .bind(input.threshold_hh)
-            .bind(input.threshold_l)
-            .bind(input.threshold_ll)
             .bind(input.enabled)
             .bind(validated.writable)
             .bind(&input.tag_kind)
@@ -1505,10 +1410,6 @@ impl TagService {
             .bind(input.eng_hi)
             .bind(&validated.unit)
             .bind(input.decimals)
-            .bind(input.threshold_h)
-            .bind(input.threshold_hh)
-            .bind(input.threshold_l)
-            .bind(input.threshold_ll)
             .bind(input.enabled)
             .bind(validated.writable)
             .bind(&input.tag_kind)
@@ -1603,10 +1504,6 @@ impl TagService {
             .bind(input.eng_hi)
             .bind(&validated.unit)
             .bind(input.decimals)
-            .bind(input.threshold_h)
-            .bind(input.threshold_hh)
-            .bind(input.threshold_l)
-            .bind(input.threshold_ll)
             .bind(input.enabled)
             .bind(validated.writable)
             .bind(&input.tag_kind)
@@ -1944,10 +1841,6 @@ impl TagService {
                 .bind(input.eng_hi)
                 .bind(&value.unit)
                 .bind(input.decimals)
-                .bind(input.threshold_h)
-                .bind(input.threshold_hh)
-                .bind(input.threshold_l)
-                .bind(input.threshold_ll)
                 .bind(input.enabled)
                 .bind(value.writable)
                 .bind(&input.tag_kind)
@@ -2287,10 +2180,6 @@ impl TagService {
                 .bind(input.eng_hi)
                 .bind(&value.unit)
                 .bind(input.decimals)
-                .bind(input.threshold_h)
-                .bind(input.threshold_hh)
-                .bind(input.threshold_l)
-                .bind(input.threshold_ll)
                 .bind(input.enabled)
                 .bind(value.writable)
                 .bind(&input.tag_kind)
@@ -2508,10 +2397,6 @@ impl TagService {
                 .bind(input.eng_hi)
                 .bind(&validated.unit)
                 .bind(input.decimals)
-                .bind(input.threshold_h)
-                .bind(input.threshold_hh)
-                .bind(input.threshold_l)
-                .bind(input.threshold_ll)
                 .bind(input.enabled)
                 .bind(validated.writable)
                 .bind(&input.tag_kind)
@@ -2607,10 +2492,6 @@ mod tests {
             eng_hi: None,
             unit: None,
             decimals: 0,
-            threshold_h: None,
-            threshold_hh: None,
-            threshold_l: None,
-            threshold_ll: None,
             enabled: true,
             writable: false,
             tag_kind: PLC_TAG_KIND.to_string(),
@@ -3644,25 +3525,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_rejects_thresholds_on_a_string_tag_per_field() {
-        let (svc, group_id) = setup().await;
-        let mut input = string_input("S", group_id, Some(8));
-        input.threshold_h = Some(10.0);
-        input.threshold_ll = Some(0.0);
-        let err = svc.create(input).await.unwrap_err();
-        match err {
-            BantoError::Validation { field_errors } => {
-                let fields: Vec<&str> = field_errors.iter().map(|e| e.field.as_str()).collect();
-                assert_eq!(fields, vec!["thresholdH", "thresholdLl"]);
-                for e in &field_errors {
-                    assert_eq!(e.message, "string 型ではしきい値を設定できません");
-                }
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn update_can_change_a_numeric_tag_into_a_string_tag_and_back() {
         let (svc, group_id) = setup().await;
         let created = svc.create(sample_input("T", group_id)).await.unwrap();
@@ -3798,81 +3660,6 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-    }
-
-    // --- validation: thresholds ------------------------------------------
-
-    #[tokio::test]
-    async fn create_accepts_fully_ordered_thresholds() {
-        let (svc, group_id) = setup().await;
-        let mut input = sample_input("X", group_id);
-        input.threshold_ll = Some(0.0);
-        input.threshold_l = Some(10.0);
-        input.threshold_h = Some(90.0);
-        input.threshold_hh = Some(100.0);
-        svc.create(input).await.expect("ordered thresholds ok");
-    }
-
-    #[tokio::test]
-    async fn create_accepts_partial_thresholds_in_order() {
-        let (svc, group_id) = setup().await;
-        // Only LL and H set; must still be compared (LL <= H).
-        let mut input = sample_input("X", group_id);
-        input.threshold_ll = Some(0.0);
-        input.threshold_h = Some(90.0);
-        svc.create(input)
-            .await
-            .expect("partial ordered thresholds ok");
-    }
-
-    #[tokio::test]
-    async fn create_rejects_adjacent_threshold_violation() {
-        let (svc, group_id) = setup().await;
-        let mut input = sample_input("X", group_id);
-        input.threshold_l = Some(50.0);
-        input.threshold_h = Some(40.0); // H < L
-        let err = svc.create(input).await.unwrap_err();
-        match err {
-            BantoError::Validation { field_errors } => {
-                assert_eq!(field_errors[0].field, "thresholdH")
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-    }
-
-    /// LL and H are both set (and violate LL <= H) while L is left unset -
-    /// proves the check does not just compare adjacent SQL columns but
-    /// every consecutive pair *among the values that are actually set*.
-    #[tokio::test]
-    async fn create_rejects_non_adjacent_threshold_violation_across_a_gap() {
-        let (svc, group_id) = setup().await;
-        let mut input = sample_input("X", group_id);
-        input.threshold_ll = Some(50.0);
-        input.threshold_h = Some(10.0); // LL > H, with L unset in between
-        let err = svc.create(input).await.unwrap_err();
-        match err {
-            BantoError::Validation { field_errors } => {
-                assert_eq!(field_errors[0].field, "thresholdH")
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn create_accepts_equal_adjacent_thresholds() {
-        let (svc, group_id) = setup().await;
-        let mut input = sample_input("X", group_id);
-        input.threshold_l = Some(50.0);
-        input.threshold_h = Some(50.0); // equal is allowed (<=)
-        svc.create(input).await.expect("equal thresholds ok");
-    }
-
-    #[tokio::test]
-    async fn create_accepts_a_single_threshold() {
-        let (svc, group_id) = setup().await;
-        let mut input = sample_input("X", group_id);
-        input.threshold_h = Some(80.0);
-        svc.create(input).await.expect("single threshold ok");
     }
 
     // --- writable / tag_kind / expression / retain (T2-3, migration 0006) --
@@ -5577,6 +5364,258 @@ mod tests {
                 "the {label} CHECK should have survived the rebuild"
             );
         }
+    }
+
+    // --- migration 0018 (table rebuild: しきい値の列を外す、#533) -----------
+
+    /// #533: 0018 drops `threshold_h/hh/l/ll` from a populated pre-0018
+    /// database (the real migrator run up to 0017, then [`crate::migrate`] -
+    /// exactly what an app does on its next startup). Every remaining column
+    /// of every row survives, the four columns are gone, the CHECK / FK /
+    /// UNIQUE / index survive, and the AUTOINCREMENT position carries over
+    /// (a tag deleted from the end before the migration does not get its id
+    /// reused - ChronoGazer's `recorder_tag_settings` / `display_group_pens`
+    /// point at `tags.id` without an FK and rely on that).
+    ///
+    /// 反証（2026-10-09 実施）: 0018 から `sqlite_sequence` の引き継ぎ（INSERT と
+    /// UPDATE の 2 文）を外すと、最後の `assert_eq!(next.id, 4)` が 3 になって
+    /// 落ちる。
+    #[tokio::test]
+    async fn migration_0018_drops_threshold_columns_and_preserves_rows_on_a_populated_database() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.dangerous_set_table_name(crate::MIGRATIONS_TABLE);
+        migrator
+            .run_to(17, &pool)
+            .await
+            .expect("migrate up to 0017");
+
+        sqlx::query(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+             simulation, word_order) \
+             VALUES (7, 'Line1 PLC', 'modbus-tcp', '192.168.1.10', 502, 3, 0, 1, 'high_low')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed connection");
+        sqlx::query(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled, \
+             default_writable) VALUES (4, 'G1', 7, 2000, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed collection group");
+        for (id, name) in [(1, 'A'), (2, 'B'), (3, 'C')] {
+            sqlx::query(
+                "INSERT INTO tags (id, name, collection_group_id, address, data_type, \
+                 string_length, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, threshold_h, \
+                 threshold_hh, threshold_l, threshold_ll, enabled, writable, tag_kind, \
+                 expression, retain, revision, string_encoding) \
+                 VALUES (?, ?, 4, '40001', 'i64', NULL, 0, 100, 0, 50, 'degC', 2, 45, 50, 10, \
+                 5, 0, 1, 'plc', NULL, 1, 3, 'shift_jis')",
+            )
+            .bind(id)
+            .bind(name.to_string())
+            .execute(&pool)
+            .await
+            .expect("seed tag with thresholds");
+        }
+        // The highest id is deleted before the migration: AUTOINCREMENT has
+        // already handed it out, so it must never come back.
+        sqlx::query("DELETE FROM tags WHERE id = 3")
+            .execute(&pool)
+            .await
+            .expect("delete the last tag");
+
+        crate::migrate(&pool).await.expect("0018 should apply");
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('tags') ORDER BY cid")
+                .fetch_all(&pool)
+                .await
+                .expect("table_info");
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "name",
+                "collection_group_id",
+                "address",
+                "data_type",
+                "string_length",
+                "raw_lo",
+                "raw_hi",
+                "eng_lo",
+                "eng_hi",
+                "unit",
+                "decimals",
+                "enabled",
+                "writable",
+                "tag_kind",
+                "expression",
+                "retain",
+                "revision",
+                "string_encoding",
+            ]
+        );
+
+        // The rows themselves, through the service (= the new `COLUMNS`).
+        let svc = TagService::new(pool.clone());
+        let a = svc.get(1).await.expect("tag 1 should survive");
+        assert_eq!(
+            a,
+            Tag {
+                id: 1,
+                name: "A".to_string(),
+                collection_group_id: 4,
+                address: "40001".to_string(),
+                data_type: "i64".to_string(),
+                string_length: None,
+                string_encoding: "shift_jis".to_string(),
+                raw_lo: Some(0.0),
+                raw_hi: Some(100.0),
+                eng_lo: Some(0.0),
+                eng_hi: Some(50.0),
+                unit: Some("degC".to_string()),
+                decimals: 2,
+                enabled: false,
+                writable: true,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: true,
+                revision: 3,
+            }
+        );
+        assert_eq!(svc.get(2).await.expect("tag 2 should survive").name, "B");
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .expect("foreign_key_check");
+        assert!(violations.is_empty(), "{violations:?}");
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('orphan', 999, 'D0', 'i16')",
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('A', 4, 'D200', 'i16')",
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "UNIQUE(collection_group_id, name) should have survived"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('Nope', 4, 'D300', 'f128')",
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "the data_type CHECK should have survived"
+        );
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_tags_collection_group_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("index lookup");
+        assert_eq!(index_count, 1);
+
+        // AUTOINCREMENT carried over: id 3 is not reused.
+        let next = svc
+            .create(sample_input("D", 4))
+            .await
+            .expect("create after 0018");
+        assert_eq!(next.id, 4);
+    }
+
+    /// 0018 on a database with no tag at all (a fresh install, or every tag
+    /// deleted): the `sqlite_sequence` carry-over has nothing / only the old
+    /// position to copy and must not fail; numbering continues past the old
+    /// position.
+    #[tokio::test]
+    async fn migration_0018_applies_to_an_empty_tags_table() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.dangerous_set_table_name(crate::MIGRATIONS_TABLE);
+        migrator
+            .run_to(17, &pool)
+            .await
+            .expect("migrate up to 0017");
+        sqlx::query(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled) \
+             VALUES (1, 'P', 'modbus-tcp', '127.0.0.1', 502, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed connection");
+        sqlx::query(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled) \
+             VALUES (1, 'G', 1, 1000, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed group");
+        sqlx::query(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type) \
+             VALUES (5, 'gone', 1, '40001', 'i16')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed tag");
+        sqlx::query("DELETE FROM tags")
+            .execute(&pool)
+            .await
+            .expect("delete every tag");
+
+        crate::migrate(&pool).await.expect("0018 should apply");
+
+        let created = TagService::new(pool.clone())
+            .create(sample_input("new", 1))
+            .await
+            .expect("create after 0018");
+        assert_eq!(created.id, 6);
+    }
+
+    /// #533: a tag carries no thresholds on the wire either - the serialized
+    /// `Tag` has no `threshold*` key, and a `TagInput` without them
+    /// round-trips through create/get unchanged.
+    #[tokio::test]
+    async fn tag_round_trips_without_thresholds() {
+        let (svc, group_id) = setup().await;
+        let input: TagInput = serde_json::from_value(serde_json::json!({
+            "name": "T",
+            "collection_group_id": group_id,
+            "address": "40001",
+            "data_type": "i16",
+            "unit": "kPa",
+            "decimals": 1,
+        }))
+        .expect("TagInput without thresholds");
+        let created = svc.create(input).await.expect("create");
+        assert_eq!(svc.get(created.id).await.unwrap(), created);
+        let wire = serde_json::to_value(&created).unwrap();
+        let keys: Vec<&String> = wire.as_object().unwrap().keys().collect();
+        assert!(
+            keys.iter().all(|key| !key.starts_with("threshold")),
+            "{keys:?}"
+        );
+        assert_eq!(wire["unit"], "kPa");
     }
 
     // --- list -------------------------------------------------------------
