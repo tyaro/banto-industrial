@@ -400,10 +400,6 @@ export interface Tag {
 	engHi: number | null;
 	unit: string | null;
 	decimals: number;
-	thresholdH: number | null;
-	thresholdHh: number | null;
-	thresholdL: number | null;
-	thresholdLl: number | null;
 	enabled: boolean;
 	/** Per-tag write opt-in (T2-3, docs/tag-server-design.md §6 item 1). */
 	writable: boolean;
@@ -443,10 +439,6 @@ export interface TagInput {
 	engHi?: number | null;
 	unit?: string | null;
 	decimals: number;
-	thresholdH?: number | null;
-	thresholdHh?: number | null;
-	thresholdL?: number | null;
-	thresholdLl?: number | null;
 	enabled: boolean;
 	/** T2-3: `#[serde(default)]` on the backend - omitting this still creates
 	 * a non-writable tag, so existing callers of `createTag`/`updateTag` are

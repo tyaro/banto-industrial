@@ -64,10 +64,6 @@ function makeTag(overrides: Partial<Tag> = {}): Tag {
 		engHi: null,
 		unit: null,
 		decimals: 0,
-		thresholdH: null,
-		thresholdHh: null,
-		thresholdL: null,
-		thresholdLl: null,
 		enabled: true,
 		writable: false,
 		tagKind: 'plc',
@@ -96,10 +92,6 @@ const DEFAULT_ROW: CsvRowFields = {
 	rawHi: '',
 	engLo: '',
 	engHi: '',
-	thresholdH: '',
-	thresholdHh: '',
-	thresholdL: '',
-	thresholdLl: '',
 	enabled: '',
 	writable: '',
 	tagKind: '',
@@ -265,7 +257,7 @@ describe('classifyCsvUpdate: unchanged', () => {
 	});
 
 	it('既存の null(未設定)と CSV の空欄(undefined)は同じ「未設定」として unchanged 扱いになる', () => {
-		// unit/rawLo/rawHi/engLo/engHi/threshold*/stringLength は既存タグでは
+		// unit/rawLo/rawHi/engLo/engHi/stringLength は既存タグでは
 		// null、CSV で空欄なら parseTagsCsv 側は undefined を返す
 		// (tagCsv.ts の numField/col 実装)。この差だけで changed にならない
 		// ことを固定する(toComparableRecord の正規化)。
@@ -275,10 +267,6 @@ describe('classifyCsvUpdate: unchanged', () => {
 			rawHi: null,
 			engLo: null,
 			engHi: null,
-			thresholdH: null,
-			thresholdHh: null,
-			thresholdL: null,
-			thresholdLl: null,
 			stringLength: null,
 			expression: null
 		});

@@ -4,17 +4,15 @@
 //! 2026-10-08 オーナー決定: しきい値 H / HH / L / LL は**データ点（タグ定義）の
 //! 性質ではなく、使う側（記録計・SCADA）が持つ設定**。ChronoGazer は自分の DB の
 //! `recorder_tag_settings`（`migrations-sqlite/0102_recorder_tag_settings.sql`）に
-//! 持ち、banto-tags の `tags.threshold_*` の列は**読みも書きもしない**（列そのものは
-//! banto-hub が使っているので #533 まで残る。ChronoGazer のタグの保存は常に
-//! `None` を渡す - `crate::rest::TagPayload`）。
+//! 持つ。banto-tags の `tags` にしきい値の列はもう無い（#533 で banto-hub からも
+//! 外し、banto-tags の migration 0018 で列を落とした）。
 //!
 //! - **既定は設定なし**。行が無いタグはしきい値なし（色・帯・しきい値イベントの
 //!   どれも出さない）。行があって 4 つとも `null` のときも同じ。
 //! - **検証はこのモジュールの [`validate_thresholds_for`] 1 か所**（REST・Tauri
 //!   共通。のちの関所・MCP もここを通す）: 対象タグの存在、文字列タグには付けない、
-//!   有限の数、大小関係（`banto_tags::validate_thresholds` をそのまま使う - 規則と
-//!   フィールド名 `thresholdLl`/`thresholdL`/`thresholdH`/`thresholdHh` が
-//!   banto-tags と同じになる）。
+//!   有限の数、大小関係（フィールド名は `thresholdLl`/`thresholdL`/`thresholdH`/
+//!   `thresholdHh`。#533 で banto-tags から移した `validate_threshold_order`）。
 //! - **更新は全項目置換**（省略した欄は「設定なし」になる）。`expectedRevision` が
 //!   今の版と違えば `{kind:"validation", field_errors:[{field:"expectedRevision"}]}`
 //!   で拒否する（`crate::revision`。REST は `409`、Tauri は同じ形の検証エラー）。
@@ -146,11 +144,11 @@ const FIELDS: [&str; 4] = ["thresholdLl", "thresholdL", "thresholdH", "threshold
 /// しきい値の検証（純関数。DB を見る部分 - タグの存在と型 - は呼び出し側が
 /// `data_type` を渡す）。誤りはすべて `field_errors` に並べる。
 ///
-/// - 文字列タグ（`data_type == "string"`）には付けられない（banto-tags の
+/// - 文字列タグ（`data_type == "string"`）には付けられない（#533 より前の banto-tags の
 ///   タグの検証と同じ文言）。
 /// - 有限の数であること（JSON は NaN・無限大を運べないが、のちの経路に備える）。
 /// - 大小関係 `LL <= L <= H <= HH`（設定されたものだけ比べる。
-///   `banto_tags::validate_thresholds` そのもの）。
+///   [`validate_threshold_order`]）。
 pub fn validate_thresholds_for(
     data_type: &str,
     payload: &TagThresholdsPayload,
@@ -176,7 +174,7 @@ pub fn validate_thresholds_for(
         }
     }
     if errors.is_empty() {
-        if let Err(BantoError::Validation { field_errors }) = banto_tags::validate_thresholds(
+        if let Err(BantoError::Validation { field_errors }) = validate_threshold_order(
             payload.threshold_ll,
             payload.threshold_l,
             payload.threshold_h,
@@ -192,6 +190,51 @@ pub fn validate_thresholds_for(
             field_errors: errors,
         })
     }
+}
+
+/// Check `ll <= l <= h <= hh`, comparing only the thresholds that are
+/// actually set (spec: "しきい値の順序... 設定されているものだけ比較").
+/// Filtering to the set values while preserving position order and then
+/// checking only *consecutive* pairs in that filtered list is equivalent to
+/// checking every pair: the four positions form a fixed chain, so if the
+/// filtered sequence is non-decreasing, every omitted comparison involving a
+/// `None` is vacuously satisfied, and if some pair in the full chain would
+/// have been violated, at least one consecutive pair in the filtered
+/// sequence must be too (order violations cannot "hide" between two set
+/// values with only unset values between them).
+///
+/// #533 で banto-tags（`tags` のしきい値の列の検証）からここへ移した。タグの
+/// 定義はもうしきい値を持たないので、規則の持ち主はこの記録計の側の設定だけ。
+fn validate_threshold_order(
+    ll: Option<f64>,
+    l: Option<f64>,
+    h: Option<f64>,
+    hh: Option<f64>,
+) -> Result<(), BantoError> {
+    let entries: [(&str, Option<f64>); 4] = [
+        ("thresholdLl", ll),
+        ("thresholdL", l),
+        ("thresholdH", h),
+        ("thresholdHh", hh),
+    ];
+    let set: Vec<(&str, f64)> = entries
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|v| (name, v)))
+        .collect();
+
+    for pair in set.windows(2) {
+        let (prev_field, prev_value) = pair[0];
+        let (field, value) = pair[1];
+        if prev_value > value {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: field.to_string(),
+                    message: format!("{prev_field} 以上の値にしてください"),
+                }],
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `recorder_tag_settings` を [`TagThresholds`] の形で読む SELECT（`sqlx` 0.9 は

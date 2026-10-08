@@ -2297,6 +2297,15 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
     }
 }
 
+/// タグの作成・更新の wire 形（REST の `POST`/`PUT /api/tags`・一括 API・
+/// MCP の `create_tag`/`update_tag`・未適用キューの保存形が共有する）。
+///
+/// **しきい値は持たない**（#533、2026-10-08 オーナー決定: しきい値 H/HH/L/LL は
+/// 使う側（記録計・SCADA）が持つ設定で、Hub は持たず警報を判定しない）。
+/// `thresholdH` などを**値付きで**送ってきたクライアント（#533 より前の画面・
+/// 設定パッケージ・MCP クライアントなど）は、黙って捨てずに検証エラーで断る
+/// （[`TagPayload::reject_thresholds`]。ChronoGazer の `TagPayload`（#532）と
+/// 同じ作法）。`null` は通す（#533 より前の画面は空欄を `null` で送っていた）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagPayload {
@@ -2327,13 +2336,16 @@ pub struct TagPayload {
     pub unit: Option<String>,
     #[serde(default = "default_tag_decimals")]
     pub decimals: i64,
-    #[serde(default)]
+    /// #533: 受け取るのは「値付きで送られたら断る」ためだけ
+    /// （[`TagPayload::reject_thresholds`]）。タグには渡さず、未適用キューの
+    /// 保存形にも書かない（`skip_serializing`）。
+    #[serde(default, skip_serializing)]
     pub threshold_h: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub threshold_hh: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub threshold_l: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub threshold_ll: Option<f64>,
     #[serde(default)]
     pub enabled: bool,
@@ -2361,6 +2373,41 @@ pub struct TagPayload {
     pub expected_revision: Option<i64>,
 }
 
+/// [`TagPayload::reject_thresholds`] の案内（画面・MCP の応答にそのまま出る）。
+pub const TAG_THRESHOLDS_NOT_HELD_MESSAGE: &str =
+    "banto-hub はしきい値を持ちません（警報の判定は PLC・記録計・SCADA の側で行います）";
+
+impl TagPayload {
+    /// #533: しきい値を値付きで送ってきたら断る（黙って捨てると、送った側は
+    /// 設定できたと思い込む）。タグの作成・更新の入口（REST の単票・一括、
+    /// MCP）で、未適用キューに積む**前**に呼ぶ。
+    pub fn reject_thresholds(&self) -> Result<(), BantoError> {
+        let field_errors = self.threshold_field_errors();
+        if field_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(BantoError::Validation { field_errors })
+        }
+    }
+
+    /// [`Self::reject_thresholds`] の中身（一括 API は行ごとのエラーに並べる）。
+    fn threshold_field_errors(&self) -> Vec<FieldError> {
+        [
+            ("thresholdLl", self.threshold_ll),
+            ("thresholdL", self.threshold_l),
+            ("thresholdH", self.threshold_h),
+            ("thresholdHh", self.threshold_hh),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.is_some())
+        .map(|(field, _)| FieldError {
+            field: field.to_string(),
+            message: TAG_THRESHOLDS_NOT_HELD_MESSAGE.to_string(),
+        })
+        .collect()
+    }
+}
+
 impl From<TagPayload> for TagInput {
     fn from(payload: TagPayload) -> Self {
         Self {
@@ -2376,10 +2423,6 @@ impl From<TagPayload> for TagInput {
             eng_hi: payload.eng_hi,
             unit: payload.unit,
             decimals: payload.decimals,
-            threshold_h: payload.threshold_h,
-            threshold_hh: payload.threshold_hh,
-            threshold_l: payload.threshold_l,
-            threshold_ll: payload.threshold_ll,
             enabled: payload.enabled,
             writable: payload.writable,
             tag_kind: payload.tag_kind,
@@ -4431,6 +4474,7 @@ async fn tags_create(
         "/api/tags",
     )
     .await?;
+    input.reject_thresholds().map_err(ApiError)?;
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
@@ -4526,6 +4570,7 @@ async fn tags_update(
         "/api/tags/{id}",
     )
     .await?;
+    input.reject_thresholds().map_err(ApiError)?;
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
@@ -5523,6 +5568,31 @@ async fn tags_batch(
     )
     .await?;
 
+    // #533: しきい値を値付きで送った行は、未適用キューに積む前・dry run でも
+    // 行ごとのエラーとして返す（「常に 200、`ok: false` で行ごとエラー」の契約）。
+    let threshold_errors: Vec<BatchTagRowErrorResponse> = body
+        .tags
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tag)| {
+            let field_errors = tag.threshold_field_errors();
+            (!field_errors.is_empty()).then(|| BatchTagRowErrorResponse {
+                index,
+                field_errors: field_errors.into_iter().map(Into::into).collect(),
+            })
+        })
+        .collect();
+    if !threshold_errors.is_empty() {
+        return Ok(Json(BatchTagsResponse {
+            ok: false,
+            dry_run: body.dry_run,
+            count: 0,
+            errors: threshold_errors,
+            tags: None,
+        })
+        .into_response());
+    }
+
     if !body.dry_run {
         if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning)
         {
@@ -5712,6 +5782,31 @@ async fn tags_batch_update(
         "/api/tags/batch-update",
     )
     .await?;
+
+    // #533: `tags_batch` と同じ（しきい値を値付きで送った行は行ごとのエラー）。
+    let threshold_errors: Vec<BatchTagUpdateRowErrorResponse> = body
+        .tags
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tag)| {
+            let field_errors = tag.input.threshold_field_errors();
+            (!field_errors.is_empty()).then(|| BatchTagUpdateRowErrorResponse {
+                index,
+                id: tag.id,
+                field_errors: field_errors.into_iter().map(Into::into).collect(),
+            })
+        })
+        .collect();
+    if !threshold_errors.is_empty() {
+        return Ok(Json(BatchTagsUpdateResponse {
+            ok: false,
+            dry_run: body.dry_run,
+            count: 0,
+            errors: threshold_errors,
+            tags: None,
+        })
+        .into_response());
+    }
 
     if !body.dry_run {
         if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning)

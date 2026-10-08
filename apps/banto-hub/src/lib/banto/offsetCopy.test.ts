@@ -26,10 +26,6 @@ function makeTag(overrides: Partial<Tag> & Pick<Tag, 'id' | 'name' | 'address'>)
 		engHi: null,
 		unit: null,
 		decimals: 0,
-		thresholdH: null,
-		thresholdHh: null,
-		thresholdL: null,
-		thresholdLl: null,
 		enabled: true,
 		writable: false,
 		tagKind: 'plc',
@@ -330,10 +326,6 @@ describe('offsetCopyRowsToTagInputs', () => {
 				rawHi: 4095,
 				engLo: 0,
 				engHi: 400,
-				thresholdH: 350,
-				thresholdHh: 380,
-				thresholdL: null,
-				thresholdLl: null,
 				enabled: true,
 				writable: true
 			}
@@ -352,10 +344,6 @@ describe('offsetCopyRowsToTagInputs', () => {
 				rawHi: 4095,
 				engLo: 0,
 				engHi: 400,
-				thresholdH: 350,
-				thresholdHh: 380,
-				thresholdL: null,
-				thresholdLl: null,
 				enabled: true,
 				writable: true
 			}

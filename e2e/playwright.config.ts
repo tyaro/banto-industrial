@@ -86,7 +86,7 @@ const dbPath = path.join(dbDir, DB_FILE_NAME);
 // Modbus TCP simulator with a ramp on 40001-40016) that
 // `user-simulator-roundtrip.spec.ts` registers as an ordinary connection.
 // **Port 8803**: the next free number in this repo's E2E block (8798
-// chronogazer / 8799 banto-hub / 8800 relay-wright / 8801 banto-hub perf /
+// chronogazer / 8805 banto-hub (moved from 8799 on 2026-10-09) / 8800 relay-wright / 8801 banto-hub perf /
 // 8802 banto-hub locked-down - see e2e/README.md), so every E2E port stays
 // in one greppable range; it is outside this repo's other fixed ports
 // (banto-serve's default 8721, the MCP ports 3101-/3200/3201 in the

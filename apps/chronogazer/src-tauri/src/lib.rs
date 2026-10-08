@@ -5798,7 +5798,6 @@ mod tests {
         let tag = tags_create_body(&state, payload.clone())
             .await
             .expect("create");
-        assert_eq!(tag.threshold_h, None);
 
         let mut ok = payload.clone();
         ok.unit = Some("kPa".to_string());

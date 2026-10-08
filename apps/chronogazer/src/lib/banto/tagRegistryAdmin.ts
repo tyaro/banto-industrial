@@ -136,8 +136,7 @@ export interface Tag {
 	unit: string | null;
 	decimals: number;
 	// しきい値は持たない（#532: タグ定義の属性ではなく、記録計の側の設定。
-	// `tagThresholdsAdmin.ts`）。サーバーの応答には banto-tags の列
-	// （`thresholdH` など）がまだ載るが、ChronoGazer は常に空で保存し、読まない。
+	// `tagThresholdsAdmin.ts`）。banto-tags の `tags` にもしきい値の列は無い（#533）。
 	enabled: boolean;
 	/** #525: 楽観ロック用の版。更新のたびに +1 される（更新時は `TagInput.expectedRevision` に載せる）。 */
 	revision: number;
