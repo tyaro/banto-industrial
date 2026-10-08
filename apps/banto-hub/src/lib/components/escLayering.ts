@@ -72,7 +72,7 @@
  *
  * | 層                                          | z-index | role                      |
  * | ------------------------------------------- | ------- | ------------------------- |
- * | `CommandPalette.svelte` / `ToastHost.svelte` / `TreeContextMenu.svelte` | 1000 | `dialog` / -（トースト）/ `menu` |
+ * | `CommandPalette`・`ToastHost`（`@banto/ui`、`--banto-z-overlay`・`--banto-z-toast`）/ `TreeContextMenu.svelte` | 1000 | `dialog` / -（トースト）/ `menu` |
  * | `Drawer.svelte` / `Modal.svelte`            | 900     | `dialog`                  |
  * | オフキャンバスサイドバー（`Sidebar.svelte`、バックドロップ 700） | 710 | -（常設ナビ）    |
  * | 狭幅の退避ツリー（`SplitPane.svelte`、バックドロップ 600） | 610 | `region`         |
@@ -94,6 +94,16 @@
  * メニューが出ているあいだ `Ctrl+K` はパレットを開かない
  * （`(app)/+layout.svelte`。メニューは一過性で、レイアウトからページのメニューを
  * 閉じる口が無いため「開かない」側に倒した - Esc で閉じてから開く）。
+ *
+ * **コマンドパレットと `ToastHost` は `@banto/ui` の部品**（banto #220 段階 3、
+ * 2026-10-08）。パレットはこの約束 1〜5 を banto 側へ移したもの（`@banto/ui` の
+ * `overlayFocus.ts`）で、層の印（`role="dialog"`/`role="menu"`/`data-esc-layer`/
+ * {@link LAYER_INACTIVE_ATTR}）も z-index の読み方も同じ。違いは、パレットが
+ * 自分の Esc を**z 順で手前の層にだけ**譲ること（同じ z なら DOM で後ろの層が
+ * 手前）と、可視の判定に矩形の有無を使わないこと。パレットが最上位（1000）で、
+ * 同じ 1000 のメニューとは同時に出さない今の構成では、どちらも結果は同じ。
+ * **この表の層を足す・z を変えるときは、`@banto/ui` 側の判定とも食い違わないか
+ * 確かめること**（このファイルを直しても banto 側は変わらない）。
  *
  * {@link LAYER_ABOVE_SELECTOR} が拾うのは **Esc で閉じる一時的な UI**
  * （`dialog` = Drawer/Modal/CommandPalette、`menu` = TreeContextMenu）だけ。

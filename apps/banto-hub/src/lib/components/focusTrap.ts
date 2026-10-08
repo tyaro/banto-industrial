@@ -66,7 +66,9 @@ function handleTrapKeydown(panel: HTMLElement, event: KeyboardEvent): void {
 /**
  * `panel` にフォーカストラップを張り、外す関数を返す（#381 レビュー対応13回目で
  * **入口をこれ1つに統一**した - Drawer / Modal / CommandPalette で同じ2つの
- * リスナーを書き写さない）。
+ * リスナーを書き写さない）。2026-10-08（banto #220 段階 3）からコマンドパレットは
+ * `@banto/ui` の部品で、同じ形のトラップ（banto 側の `overlayFocus.ts`）を持つ。
+ * ここを使うのは Drawer / Modal。
  *
  * 2段構え:
  * 1. **パネルの `keydown`**: Tab / Shift+Tab をパネル内で循環させる
