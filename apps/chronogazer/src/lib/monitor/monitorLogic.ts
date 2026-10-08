@@ -13,8 +13,11 @@
  *   （`collectAdmin.ts` の `qualityLabel`）。
  * - 現在値の表にキーが無いタグは「未収集（無効、または収集の再起動で反映）」。
  *   無効にしたタグ・収集を始めた後に足したタグがここに来る。
- * - **`bad` / `stale` では最後の値を出さない**。「—」と、最後に受け取った時刻を
- *   小さく添える（古い値が今の値に見えないように）。
+ * - **`bad` / `stale` では最後の値を出さない**。「—」と、最後に**使える値を
+ *   受け取った**時刻（`lastGoodMs`）を小さく添える。一度も受け取っていなければ
+ *   「受信した値はありません」。`ptimeMs`（読みに行った時刻。`bad` でも毎周期
+ *   進む）は使わない（#531 レビュー: 切断中も時刻が進み、一度も読めていない
+ *   タグも何か受け取ったように見えた）。
  *
  * ## しきい値（Q5）
  *
@@ -151,14 +154,33 @@ export interface PenView {
 	/** しきい値の文言（`none` のときは `null`）。色だけで伝えないための文字。 */
 	levelLabel: string | null;
 	/**
-	 * 最後に受け取った時刻（`bad` / `stale` で添える、epoch ミリ秒）。それ以外・
-	 * 時刻が無いときは `null`。
+	 * 最後に使える値を受け取った時刻（`lastGoodMs`、epoch ミリ秒）。`null` = 一度も
+	 * 受け取っていない（`showLastReceived` のときだけ意味がある）。
 	 */
 	lastReceivedMs: number | null;
+	/** 「最後に受け取った値」の行を出すか（`bad` / `stale` / 品質 good で値なし）。 */
+	showLastReceived: boolean;
 	/** 直す場所へのリンクを出すか（`invalid` = 設定不正）。 */
 	linkToTags: boolean;
 	/** banto チャートの系列色の枠（1..8）。 */
 	colorSlot: number;
+}
+
+/** 一度も使える値を受け取っていないときの文言（#531 レビュー）。 */
+export const NEVER_RECEIVED_LABEL = '受信した値はありません';
+
+/**
+ * 「最後に受け取った値」の行の文言（純関数）。出さないときは `null`。時刻は
+ * `lastGoodMs` だけから作る（`ptimeMs` は使わない）。
+ */
+export function lastReceivedText(
+	view: Pick<PenView, 'lastReceivedMs' | 'showLastReceived'>,
+	timeLabel: (epochMs: number) => string
+): string | null {
+	if (!view.showLastReceived) return null;
+	return view.lastReceivedMs === null
+		? NEVER_RECEIVED_LABEL
+		: `最後に受け取った値: ${timeLabel(view.lastReceivedMs)}`;
 }
 
 /** 値が無いときの表示（0 と区別する）。 */
@@ -244,6 +266,7 @@ export function penView(
 			level: 'none',
 			levelLabel: null,
 			lastReceivedMs: null,
+			showLastReceived: false,
 			linkToTags: false
 		};
 	}
@@ -257,6 +280,7 @@ export function penView(
 				level: 'none',
 				levelLabel: null,
 				lastReceivedMs: null,
+				showLastReceived: false,
 				linkToTags: true
 			};
 		case 'bad':
@@ -269,7 +293,8 @@ export function penView(
 				stateLabel: qualityLabel(sample.quality),
 				level: 'none',
 				levelLabel: null,
-				lastReceivedMs: sample.ptimeMs,
+				lastReceivedMs: sample.lastGoodMs,
+				showLastReceived: true,
 				linkToTags: false
 			};
 		case 'good': {
@@ -281,7 +306,8 @@ export function penView(
 					stateLabel: GOOD_WITHOUT_VALUE_LABEL,
 					level: 'none',
 					levelLabel: null,
-					lastReceivedMs: sample.ptimeMs,
+					lastReceivedMs: sample.lastGoodMs,
+					showLastReceived: true,
 					linkToTags: false
 				};
 			}
@@ -294,6 +320,7 @@ export function penView(
 				level,
 				levelLabel: thresholdLevelLabel(level),
 				lastReceivedMs: null,
+				showLastReceived: false,
 				linkToTags: false
 			};
 		}

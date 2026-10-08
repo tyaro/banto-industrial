@@ -10,13 +10,14 @@
 	 * `monitorLogic.ts` の `penView` が済ませてあり、ここは描くだけ。
 	 *
 	 * - 値が無いときは「—」（0 と区別する）。`bad` / `stale` では最後の値を出さず、
-	 *   最後に受け取った時刻を小さく添える（2026-10-08 オーナー決定 Q2）。
+	 *   最後に使える値を受け取った時刻（`lastGoodMs`。無ければ「受信した値は
+	 *   ありません」）を小さく添える（2026-10-08 オーナー決定 Q2、#531 レビュー）。
 	 * - しきい値は**色と文字の両方**で出す（色だけで伝えない）。
 	 * - `invalid`（設定不正）は直す場所へのリンクを添える（`tagsHref` が `null` なら
 	 *   出さない - 閲覧公開のセッションはタグ設定を開けない）。
 	 */
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
-	import type { PenView } from './monitorLogic';
+	import { lastReceivedText, type PenView } from './monitorLogic';
 
 	interface Props {
 		group: Pick<DisplayGroup, 'name'>;
@@ -32,6 +33,7 @@
 
 <ul class="digital-grid" aria-label={`${group.name} のデジタル表示`}>
 	{#each pens as pen (pen.tagId)}
+		{@const lastReceived = lastReceivedText(pen, timeLabel)}
 		<li
 			class="digital-cell"
 			data-state={pen.state}
@@ -47,8 +49,8 @@
 				<span class="state">{pen.stateLabel}</span>
 				{#if pen.levelLabel}<span class="level">{pen.levelLabel}</span>{/if}
 			</div>
-			{#if pen.lastReceivedMs !== null}
-				<div class="last-received">最後に受け取った値: {timeLabel(pen.lastReceivedMs)}</div>
+			{#if lastReceived !== null}
+				<div class="last-received">{lastReceived}</div>
 			{/if}
 			{#if pen.linkToTags && tagsHref}
 				<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- tagsHref は呼び出し側が resolveAppPath() で作る -->

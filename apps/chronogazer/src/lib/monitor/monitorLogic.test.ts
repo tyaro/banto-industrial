@@ -15,11 +15,13 @@ import type { Tag } from '../banto/tagRegistryAdmin';
 import {
 	LAST_GROUP_STORAGE_KEY,
 	MONITOR_POLL_DEFAULT_MS,
+	NEVER_RECEIVED_LABEL,
 	NO_VALUE,
 	UNCOLLECTED_LABEL,
 	formatValue,
 	groupPenViews,
 	isKindRendered,
+	lastReceivedText,
 	loadLastGroup,
 	parseGroupParam,
 	penView,
@@ -241,8 +243,11 @@ describe('penView（値・品質・しきい値の総当たり）', () => {
 		value: 1,
 		ptimeMs: 1000,
 		quality: 'good',
+		lastGoodMs: 1000,
 		...s
 	});
+	/** 時刻の表示（テストでは区別できれば足りる）。 */
+	const at = (ms: number) => `T${ms}`;
 
 	it.each<
 		[
@@ -254,7 +259,7 @@ describe('penView（値・品質・しきい値の総当たり）', () => {
 				state: PenState;
 				stateLabel: string;
 				level: ThresholdLevel;
-				last: number | null;
+				last: string | null;
 				link: boolean;
 			}
 		]
@@ -292,46 +297,59 @@ describe('penView（値・品質・しきい値の総当たり）', () => {
 		],
 		[
 			'good・値 null（来ない約束だが 0 にしない）',
-			sample({ value: null }),
+			sample({ value: null, ptimeMs: 7000, lastGoodMs: 1000 }),
 			tag(),
 			{
 				display: NO_VALUE,
 				state: 'bad',
 				stateLabel: '値なし',
 				level: 'none',
-				last: 1000,
+				last: '最後に受け取った値: T1000',
 				link: false
 			}
 		],
 		[
-			'bad: 値があっても出さず、時刻を添える',
-			sample({ value: 42, quality: 'bad', ptimeMs: 5000 }),
+			'bad: 値があっても出さず、最後に good だった時刻を添える（読みに行った時刻ではない）',
+			sample({ value: 42, quality: 'bad', ptimeMs: 5000, lastGoodMs: 1000 }),
 			withThresholds,
 			{
 				display: NO_VALUE,
 				state: 'bad',
 				stateLabel: '通信エラー',
 				level: 'none',
-				last: 5000,
+				last: '最後に受け取った値: T1000',
+				link: false
+			}
+		],
+		[
+			'bad: 一度も受け取っていなければ時刻を出さない（#531）',
+			sample({ value: null, quality: 'bad', ptimeMs: 5000, lastGoodMs: null }),
+			withThresholds,
+			{
+				display: NO_VALUE,
+				state: 'bad',
+				stateLabel: '通信エラー',
+				level: 'none',
+				last: NEVER_RECEIVED_LABEL,
 				link: false
 			}
 		],
 		[
 			'stale: 最後の値を出さず、時刻を添える',
-			sample({ value: 95, quality: 'stale', ptimeMs: 6000 }),
+			sample({ value: 95, quality: 'stale', ptimeMs: 6000, lastGoodMs: 4000 }),
 			withThresholds,
 			{
 				display: NO_VALUE,
 				state: 'stale',
 				stateLabel: '更新停止',
 				level: 'none',
-				last: 6000,
+				last: '最後に受け取った値: T4000',
 				link: false
 			}
 		],
 		[
 			'invalid: 設定不正、タグ設定へ案内',
-			{ value: null, ptimeMs: null, quality: 'invalid' },
+			{ value: null, ptimeMs: null, quality: 'invalid', lastGoodMs: null },
 			tag(),
 			{
 				display: NO_VALUE,
@@ -368,7 +386,7 @@ describe('penView（値・品質・しきい値の総当たり）', () => {
 			state: view.state,
 			stateLabel: view.stateLabel,
 			level: view.level,
-			last: view.lastReceivedMs,
+			last: lastReceivedText(view, at),
 			link: view.linkToTags
 		}).toEqual(expected);
 		expect(view.levelLabel).toBe(thresholdLevelLabel(expected.level));
@@ -396,10 +414,11 @@ describe('groupPenViews', () => {
 		expect(groupPenViews(g, null, [tag()])).toEqual([]);
 	});
 	it('ペンの順に、キー tag:<id> で引く', () => {
-		const views = groupPenViews(g, { 'tag:2': { value: 3, ptimeMs: 1, quality: 'good' } }, [
-			tag(),
-			tag({ id: 2, name: '圧力', decimals: 0 })
-		]);
+		const views = groupPenViews(
+			g,
+			{ 'tag:2': { value: 3, ptimeMs: 1, quality: 'good', lastGoodMs: 1 } },
+			[tag(), tag({ id: 2, name: '圧力', decimals: 0 })]
+		);
 		expect(views.map((v) => [v.name, v.display, v.state])).toEqual([
 			['温度', NO_VALUE, 'uncollected'],
 			['圧力', '3', 'good']

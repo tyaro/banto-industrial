@@ -22,11 +22,11 @@ import {
 
 const READY_A: ValuesReadout = {
 	state: 'ready',
-	data: { 'tag:1': { value: 1, ptimeMs: 1, quality: 'good' } }
+	data: { 'tag:1': { value: 1, ptimeMs: 1, quality: 'good', lastGoodMs: 1 } }
 };
 const READY_B: ValuesReadout = {
 	state: 'ready',
-	data: { 'tag:2': { value: 2, ptimeMs: 2, quality: 'good' } }
+	data: { 'tag:2': { value: 2, ptimeMs: 2, quality: 'good', lastGoodMs: 2 } }
 };
 
 describe('applyValuesOutcome', () => {

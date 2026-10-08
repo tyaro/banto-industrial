@@ -174,12 +174,20 @@ export type QualityView = 'good' | 'bad' | 'stale' | 'invalid';
  * `chronogazer_core::collect::CurrentSampleView`（現在値 1 件）。
  *
  * `value` は読めなかった・外したときは `null`（**0 ではない**）。
- * `ptimeMs` は `invalid` のときだけ `null`（一度も読んでいない）。
+ * `ptimeMs` は**読みに行った時刻**で、`bad` でも失敗した読み取りの時刻が入る
+ * （切断中は毎周期進む）。`invalid` のときだけ `null`（一度も読んでいない）。
+ *
+ * `lastGoodMs`（#531 レビュー）は**最後に使える値を受け取った時刻**: 品質 good・
+ * 有限値のサンプルでだけ進み、`bad` の間は止まる。`null` = 収集を開始してから
+ * 一度も受け取っていない（`invalid` も `null`）。「最後に受け取った値」の表示は
+ * これだけを使う（`ptimeMs` を使うと、切断中も時刻が進み、一度も読めていない
+ * タグも何か受け取ったように見える）。
  */
 export interface CurrentSampleView {
 	value: number | null;
 	ptimeMs: number | null;
 	quality: QualityView;
+	lastGoodMs: number | null;
 }
 
 /** `chronogazer_core::collect::ConnectionStatusView`。 */
