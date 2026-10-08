@@ -1,5 +1,5 @@
 /**
- * 監視画面（`/monitor`、R1-D の D-1）の実 DOM 固定。
+ * 監視画面（`/monitor`、R1-D の D-1・D-2）の実 DOM 固定。
  *
  * 固定したい受入条件:
  * 1. 収集が動いていないときは「収集が動いていません」（値の欄を 0 や空で出さない）。
@@ -12,6 +12,11 @@
  *    種別（D-1 ではトレンド）は「この表示種別は準備中です」。
  * 5. コマンドパレットの「グループ: ◯◯ を表示」でも切り替えられる。`/monitor` を
  *    開き直すと、この端末で最後に見たグループが選ばれている。
+ * 6. バー（D-2）: 工学値レンジのタグは棒が出て値が変わる。LL..HH をレンジにした
+ *    タグは HH を超えて「レンジ上限超え」・`data-level="HH"`。不正なタグは棒を
+ *    描かず「—」。レンジが無いタグは「レンジ未設定」と値の文字。
+ * 7. 計器（D-2）: banto の `Gauge` が出て値が変わる。不正なタグは弧を描かず
+ *    「—」（banto v6.3.0 の値なし）。しきい値の判定は `data-level` と文字で出る。
  *
  * ## ファイル名（実行順）
  *
@@ -55,8 +60,12 @@ const TAG_HIGH = 'E2E-MON-上限';
 const GROUP_1 = 'E2E-MON-デジタル1';
 const GROUP_2 = 'E2E-MON-デジタル2';
 const GROUP_TREND = 'E2E-MON-トレンド';
-const TAG_NAMES = [TAG_RAMP, TAG_INVALID, TAG_HIGH];
-const GROUP_NAMES = [GROUP_1, GROUP_2, GROUP_TREND];
+const TAG_SCALED = 'E2E-MON-工学値';
+const TAG_OVER = 'E2E-MON-レンジ超え';
+const GROUP_BAR = 'E2E-MON-バー';
+const GROUP_GAUGE = 'E2E-MON-計器';
+const TAG_NAMES = [TAG_RAMP, TAG_INVALID, TAG_HIGH, TAG_SCALED, TAG_OVER];
+const GROUP_NAMES = [GROUP_1, GROUP_2, GROUP_TREND, GROUP_BAR, GROUP_GAUGE];
 
 interface NamedRow {
 	id: number;
@@ -176,7 +185,7 @@ function rewriteTagAddress(dbPath: string, tagId: number, address: string): void
 	}
 }
 
-test.describe.serial('chronogazer 監視画面（R1-D の D-1）', () => {
+test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 	let page: Page;
 	let headers: ApiHeaders;
 	let disabledByUs: ConnectionRow[] = [];
@@ -219,10 +228,14 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1）', () => {
 			address: '40001',
 			unit: 'cnt'
 		});
+		// LL..HH があるので、バー・計器ではレンジが決まる（値なしの「—」を計器でも
+		// 確かめるため。D-2）。品質 invalid なのでデジタルのしきい値表示には出ない。
 		const invalid = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
 			name: TAG_INVALID,
-			address: '40002'
+			address: '40002',
+			thresholdLl: 0,
+			thresholdHh: 100
 		});
 		// u16 は 0 以上なので、H = 0 なら必ず「H 上限以上」になる（しきい値の表示の確認）。
 		const high = await postJson<NamedRow>(page.request, headers, '/api/tags', {
@@ -231,13 +244,37 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1）', () => {
 			address: '40003',
 			thresholdH: 0
 		});
+		// D-2: 工学値レンジ（生値をそのまま 0..65535 に写す = 値は変わらない）。
+		const scaledTag = await postJson<NamedRow>(page.request, headers, '/api/tags', {
+			...tagBase,
+			name: TAG_SCALED,
+			address: '40004',
+			unit: 'cnt',
+			rawLo: 0,
+			rawHi: 65535,
+			engLo: 0,
+			engHi: 65535
+		});
+		// D-2: 工学値レンジが無く LL..HH = 0..1 がレンジになる。ランプ波は開発用 PLC の
+		// 起動から 100ms ごとに増える（`banto_collect::simulation`）ので、ここに来る
+		// ころには 1 を超えている（HH 以上・レンジ上限超え。u16 で一周するのは
+		// 約 109 分後）。
+		const over = await postJson<NamedRow>(page.request, headers, '/api/tags', {
+			...tagBase,
+			name: TAG_OVER,
+			address: '40005',
+			thresholdLl: 0,
+			thresholdHh: 1
+		});
 		rewriteTagAddress(path.join(dbDir, DB_FILE_NAME), invalid.id, 'D3000');
 
 		const pen = (id: number) => ({ tagId: id, colorSlot: null });
 		for (const [name, kind, pens] of [
 			[GROUP_1, 'digital', [ramp.id, invalid.id, high.id]],
 			[GROUP_2, 'digital', [high.id]],
-			[GROUP_TREND, 'trend', [ramp.id]]
+			[GROUP_TREND, 'trend', [ramp.id]],
+			[GROUP_BAR, 'bar', [scaledTag.id, over.id, invalid.id, high.id]],
+			[GROUP_GAUGE, 'gauge', [scaledTag.id, over.id, invalid.id, high.id]]
 		] as const) {
 			const created = await postJson<NamedRow>(page.request, headers, '/api/display-groups', {
 				name,
@@ -344,5 +381,96 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1）', () => {
 		await page.goto('/monitor');
 		await expect(tab(GROUP_2)).toHaveAttribute('aria-selected', 'true');
 		await expect(page).toHaveURL(/\/monitor$/);
+	});
+	test('5. バー: 棒が出て値が変わる。レンジ外・しきい値・値なし・レンジ未設定を区別する', async () => {
+		await tab(GROUP_BAR).click();
+		await expect(page).toHaveURL(new RegExp(`/monitor\\?group=${groupIds[GROUP_BAR]}$`));
+		await expect(panel().getByRole('list', { name: `${GROUP_BAR} のバー表示` })).toBeVisible();
+
+		// 工学値レンジ: 棒（.fill）があり、値が変わる。
+		const scaledCell = cell(TAG_SCALED);
+		await expect(scaledCell).toHaveAttribute('data-range', 'ok', { timeout: 20_000 });
+		const scaledValue = scaledCell.locator('.value');
+		await expect(scaledValue).toHaveText(/^\d+$/, { timeout: 20_000 });
+		await expect(scaledCell.locator('.fill')).toHaveCount(1);
+		const first = await scaledValue.textContent();
+		await expect(scaledValue).not.toHaveText(first ?? '', { timeout: 15_000 });
+
+		// LL..HH = 0..1 のレンジを超える: HH（色と文字）・上限超え。棒は上端に丸める。
+		const overCell = cell(TAG_OVER);
+		await expect(overCell).toHaveAttribute('data-level', 'HH');
+		await expect(overCell).toHaveAttribute('data-tone', 'danger');
+		await expect(overCell).toHaveAttribute('data-out', 'over');
+		await expect(overCell).toContainText('HH 上上限以上');
+		await expect(overCell).toContainText('レンジ上限超え');
+		await expect(overCell.locator('.fill')).toHaveAttribute('style', /height:\s*100(\.0+)?%/);
+
+		// 不正なタグ: レンジはあるが棒を描かない（0 の高さにもしない）。「—」と設定不正。
+		const invalidCell = cell(TAG_INVALID);
+		await expect(invalidCell).toHaveAttribute('data-range', 'ok');
+		await expect(invalidCell).toHaveAttribute('data-state', 'invalid');
+		await expect(invalidCell.locator('.value')).toHaveText('—');
+		await expect(invalidCell.locator('.track')).toHaveCount(1);
+		await expect(invalidCell.locator('.fill')).toHaveCount(0);
+		await expect(invalidCell).toContainText('設定不正（収集対象外）');
+		await expect(invalidCell.getByRole('link', { name: 'タグ設定で直す' })).toBeVisible();
+
+		// レンジが無いタグ: 棒の代わりに理由とタグ設定へのリンク。値と判定の文字は出す。
+		const highCell = cell(TAG_HIGH);
+		await expect(highCell).toHaveAttribute('data-range', 'unset');
+		await expect(highCell).toContainText('レンジ未設定（タグ設定で工学値レンジを入れてください）');
+		await expect(highCell.getByRole('link', { name: 'タグ設定を開く' })).toHaveAttribute(
+			'href',
+			'/tags'
+		);
+		await expect(highCell).toHaveAttribute('data-level', 'H');
+		await expect(highCell).toContainText('H 上限以上');
+		await expect(highCell.locator('.value')).toHaveText(/^\d+$/);
+		await expect(highCell.locator('.track')).toHaveCount(0);
+	});
+
+	test('6. 計器: banto の Gauge が出て値が変わる。値なしは「—」、しきい値は data-level と文字', async () => {
+		await tab(GROUP_GAUGE).click();
+		await expect(page).toHaveURL(new RegExp(`/monitor\\?group=${groupIds[GROUP_GAUGE]}$`));
+		await expect(panel().getByRole('list', { name: `${GROUP_GAUGE} の計器表示` })).toBeVisible();
+
+		// Gauge の枠は role="img"（中の svg も暗黙の img なので、属性で枠だけを取る）。
+		// 名前・値・単位は aria-label に載せている。
+		const scaledGauge = cell(TAG_SCALED).locator('[role="img"]');
+		await expect(scaledGauge).toHaveAttribute(
+			'aria-label',
+			new RegExp(`^${TAG_SCALED} \\d+ cnt$`),
+			{
+				timeout: 20_000
+			}
+		);
+		const first = await scaledGauge.getAttribute('aria-label');
+		await expect(scaledGauge).not.toHaveAttribute('aria-label', first ?? '', { timeout: 15_000 });
+		await expect(cell(TAG_SCALED)).toHaveAttribute('data-level', 'none');
+
+		const overCell = cell(TAG_OVER);
+		await expect(overCell).toHaveAttribute('data-level', 'HH');
+		await expect(overCell).toHaveAttribute('data-tone', 'danger');
+		await expect(overCell).toContainText('HH 上上限以上');
+		await expect(overCell).toContainText('レンジ上限超え');
+		await expect(overCell.locator('[role="img"]')).toBeVisible();
+
+		// 不正なタグ: Gauge は出る（レンジは LL..HH）が、弧を描かず「—」（0 にしない）。
+		const invalidCell = cell(TAG_INVALID);
+		await expect(invalidCell).toHaveAttribute('data-state', 'invalid');
+		await expect(invalidCell.locator('[role="img"]')).toHaveAttribute(
+			'aria-label',
+			`${TAG_INVALID} —`
+		);
+		await expect(invalidCell.locator('svg text', { hasText: '—' })).toHaveCount(1);
+		await expect(invalidCell).toContainText('設定不正（収集対象外）');
+
+		// レンジが無いタグ: 計器を描かず、理由と値の文字。
+		const highCell = cell(TAG_HIGH);
+		await expect(highCell).toHaveAttribute('data-range', 'unset');
+		await expect(highCell.locator('[role="img"]')).toHaveCount(0);
+		await expect(highCell).toContainText('レンジ未設定');
+		await expect(highCell).toHaveAttribute('data-level', 'H');
+		await expect(highCell.locator('.value')).toHaveText(/^\d+$/);
 	});
 });

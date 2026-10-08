@@ -146,6 +146,12 @@ export interface PenView {
 	name: string;
 	/** 大きく出す文字列。値が無ければ「—」（0 にしない）。 */
 	display: string;
+	/**
+	 * 描画に使う数値（バーの長さ・計器の弧、D-2）。品質 good で値があるときだけ
+	 * 数値で、それ以外（`bad` / `stale` / `invalid` / 未収集 / good で値なし）は
+	 * `null`。`display` が「—」になるのと同じ条件で `null` になる（0 にしない）。
+	 */
+	value: number | null;
 	unit: string | null;
 	state: PenState;
 	/** 状態の文言（品質のラベル、または未収集の説明）。 */
@@ -261,6 +267,7 @@ export function penView(
 		return {
 			...base,
 			display: NO_VALUE,
+			value: null,
 			state: 'uncollected',
 			stateLabel: UNCOLLECTED_LABEL,
 			level: 'none',
@@ -275,6 +282,7 @@ export function penView(
 			return {
 				...base,
 				display: NO_VALUE,
+				value: null,
 				state: 'invalid',
 				stateLabel: qualityLabel('invalid'),
 				level: 'none',
@@ -289,6 +297,7 @@ export function penView(
 			return {
 				...base,
 				display: NO_VALUE,
+				value: null,
 				state: sample.quality,
 				stateLabel: qualityLabel(sample.quality),
 				level: 'none',
@@ -302,6 +311,7 @@ export function penView(
 				return {
 					...base,
 					display: NO_VALUE,
+					value: null,
 					state: 'bad',
 					stateLabel: GOOD_WITHOUT_VALUE_LABEL,
 					level: 'none',
@@ -315,6 +325,7 @@ export function penView(
 			return {
 				...base,
 				display: tag ? formatValue(sample.value, tag.decimals) : String(sample.value),
+				value: sample.value,
 				state: 'good',
 				stateLabel: qualityLabel('good'),
 				level,
@@ -349,9 +360,9 @@ export function groupPenViews(
 
 // --- 表示種別 ----------------------------------------------------------------
 
-/** D-1 で描ける種別（D-2 でバー・計器、D-3 でトレンドを足す）。 */
+/** 描ける種別（D-1 でデジタル、D-2 でバー・計器。トレンドは D-3 で足す）。 */
 export function isKindRendered(kind: DisplayKind): boolean {
-	return kind === 'digital';
+	return kind === 'digital' || kind === 'bar' || kind === 'gauge';
 }
 
 export const KIND_NOT_READY_MESSAGE = 'この表示種別は準備中です';
