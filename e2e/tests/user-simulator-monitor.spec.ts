@@ -14,7 +14,8 @@
  *    開き直すと、この端末で最後に見たグループが選ばれている。
  * 6. バー（D-2）: 工学値レンジのタグは棒が出て値が変わる。LL..HH をレンジにした
  *    タグは HH を超えて「レンジ上限超え」・`data-level="HH"`。不正なタグは棒を
- *    描かず「—」。レンジが無いタグは「レンジ未設定」と値の文字。
+ *    描かず「—」。レンジが無いタグは「レンジ未設定」と値の文字。同じ値のしきい値の
+ *    名前は 1 つ（`LL/L/H`）にまとまり、レンジとしきい値は画面外の文で読める（#535）。
  * 7. 計器（D-2）: banto の `Gauge` が出て値が変わる。不正なタグは弧を描かず
  *    「—」（banto v6.3.0 の値なし）。しきい値の判定は `data-level` と文字で出る。
  *
@@ -62,9 +63,10 @@ const GROUP_2 = 'E2E-MON-デジタル2';
 const GROUP_TREND = 'E2E-MON-トレンド';
 const TAG_SCALED = 'E2E-MON-工学値';
 const TAG_OVER = 'E2E-MON-レンジ超え';
+const TAG_EQUAL = 'E2E-MON-同値しきい値';
 const GROUP_BAR = 'E2E-MON-バー';
 const GROUP_GAUGE = 'E2E-MON-計器';
-const TAG_NAMES = [TAG_RAMP, TAG_INVALID, TAG_HIGH, TAG_SCALED, TAG_OVER];
+const TAG_NAMES = [TAG_RAMP, TAG_INVALID, TAG_HIGH, TAG_SCALED, TAG_OVER, TAG_EQUAL];
 const GROUP_NAMES = [GROUP_1, GROUP_2, GROUP_TREND, GROUP_BAR, GROUP_GAUGE];
 
 interface NamedRow {
@@ -266,6 +268,20 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			thresholdLl: 0,
 			thresholdHh: 1
 		});
+		// #535: 等号は正しい設定（LL <= L <= H <= HH）。同じ値の名前は 1 つにまとまる。
+		const equal = await postJson<NamedRow>(page.request, headers, '/api/tags', {
+			...tagBase,
+			name: TAG_EQUAL,
+			address: '40006',
+			rawLo: 0,
+			rawHi: 65535,
+			engLo: 0,
+			engHi: 65535,
+			thresholdLl: 30000,
+			thresholdL: 30000,
+			thresholdH: 30000,
+			thresholdHh: 60000
+		});
 		rewriteTagAddress(path.join(dbDir, DB_FILE_NAME), invalid.id, 'D3000');
 
 		const pen = (id: number) => ({ tagId: id, colorSlot: null });
@@ -273,7 +289,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			[GROUP_1, 'digital', [ramp.id, invalid.id, high.id]],
 			[GROUP_2, 'digital', [high.id]],
 			[GROUP_TREND, 'trend', [ramp.id]],
-			[GROUP_BAR, 'bar', [scaledTag.id, over.id, invalid.id, high.id]],
+			[GROUP_BAR, 'bar', [scaledTag.id, over.id, invalid.id, high.id, equal.id]],
 			[GROUP_GAUGE, 'gauge', [scaledTag.id, over.id, invalid.id, high.id]]
 		] as const) {
 			const created = await postJson<NamedRow>(page.request, headers, '/api/display-groups', {
@@ -405,6 +421,19 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(overCell).toContainText('レンジ上限超え');
 		await expect(overCell.locator('.fill')).toHaveAttribute('style', /height:\s*100(\.0+)?%/);
 
+		// 図は aria-hidden。レンジとしきい値は画面外の文で読める（#535）。
+		await expect(scaledCell.locator('.sr-only')).toHaveText(
+			'レンジ 0 cnt〜65535 cnt（工学値レンジ）。しきい値: なし'
+		);
+		await expect(overCell.locator('.sr-only')).toHaveText(
+			'レンジ 0〜1（しきい値の LL〜HH）。しきい値: HH 1、LL 0'
+		);
+
+		// 同じ値のしきい値（LL = L = H）は名前が重ならず 1 つにまとまる（#535）。
+		const equalCell = cell(TAG_EQUAL);
+		await expect(equalCell.locator('.mark-label')).toHaveText(['HH', 'LL/L/H']);
+		await expect(equalCell.locator('.mark')).toHaveCount(2);
+
 		// 不正なタグ: レンジはあるが棒を描かない（0 の高さにもしない）。「—」と設定不正。
 		const invalidCell = cell(TAG_INVALID);
 		await expect(invalidCell).toHaveAttribute('data-range', 'ok');
@@ -447,6 +476,9 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		const first = await scaledGauge.getAttribute('aria-label');
 		await expect(scaledGauge).not.toHaveAttribute('aria-label', first ?? '', { timeout: 15_000 });
 		await expect(cell(TAG_SCALED)).toHaveAttribute('data-level', 'none');
+		await expect(cell(TAG_SCALED).locator('.sr-only')).toHaveText(
+			'レンジ 0 cnt〜65535 cnt（工学値レンジ）。しきい値: なし'
+		);
 
 		const overCell = cell(TAG_OVER);
 		await expect(overCell).toHaveAttribute('data-level', 'HH');

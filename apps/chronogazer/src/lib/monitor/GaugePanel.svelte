@@ -16,12 +16,13 @@
 	 *   写す（`gaugeThresholds`）。弧の色に加えて文字（`levelLabel`）でも出す。
 	 * - レンジが決まらない（Q3）ときは計器を描かず、値の文字と理由を出す。
 	 * - `Gauge` は `role="img"` で中の文字が支援技術に読まれないので、`label` に
-	 *   名前・値・単位を入れる。
+	 *   名前・値・単位を入れる。レンジとしきい値は画面外の文字
+	 *   （`meterDescription`、バーと同じ文）で伝える（#535）。
 	 */
 	import { Gauge } from '@banto/charts';
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 	import { formatValue, lastReceivedText } from './monitorLogic';
-	import type { MeterView } from './meterLogic';
+	import { meterDescription, type MeterView } from './meterLogic';
 
 	interface Props {
 		group: Pick<DisplayGroup, 'name'>;
@@ -59,6 +60,7 @@
 			<div class="pen-name">
 				{pen.name}{#if pen.unit}<span class="unit">（{pen.unit}）</span>{/if}
 			</div>
+			<p class="sr-only">{meterDescription(pen)}</p>
 
 			{#if pen.range.kind === 'ok'}
 				<Gauge
@@ -217,5 +219,17 @@
 	.fix-link {
 		font-size: 0.8rem;
 		color: var(--banto-primary);
+	}
+	/* 画面には出さず、支援技術にだけ読ませる（目盛・しきい値の説明、#535）。 */
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
 	}
 </style>

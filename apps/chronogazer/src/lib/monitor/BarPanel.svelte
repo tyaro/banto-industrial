@@ -16,10 +16,13 @@
 	 * - しきい値は**色と文字の両方**で出す。棒の色は HH/LL が danger、H/L が warning。
 	 * - レンジの外は棒を端に丸め、「レンジ上限超え / 下限未満」を文字で添える。
 	 * - レンジが決まらない（Q3）ときは棒の代わりに理由を出し、値の文字は出す。
+	 * - 棒・目盛・印の図は `aria-hidden` にし、レンジとしきい値は画面外の文字
+	 *   （`meterDescription`）で支援技術に伝える。同じ値のしきい値の名前は 1 つに
+	 *   まとめる（`LL/L/H`。等号は正しい設定なので、重ねると読めない。#535）。
 	 */
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
 	import { formatValue, lastReceivedText } from './monitorLogic';
-	import { toneColorVar, type MeterView } from './meterLogic';
+	import { meterDescription, toneColorVar, type MeterView } from './meterLogic';
 
 	interface Props {
 		group: Pick<DisplayGroup, 'name'>;
@@ -57,6 +60,7 @@
 				<span class="value">{pen.display}</span>
 				{#if pen.unit}<span class="unit">{pen.unit}</span>{/if}
 			</div>
+			<p class="sr-only">{meterDescription(pen)}</p>
 
 			{#if pen.range.kind === 'ok'}
 				<div class="meter" aria-hidden="true">
@@ -70,19 +74,19 @@
 						{#if pen.bar}
 							<div class="fill" style:height={pct(pen.bar.fill)}></div>
 						{/if}
-						{#each pen.marks as mark (mark.level)}
+						{#each pen.markGroups as mark (mark.label)}
 							<span
 								class="mark"
 								data-tone={mark.tone}
 								style:bottom={pct(mark.position)}
-								title={`${mark.level} ${tickText(pen, mark.value)}`}
+								title={`${mark.label} ${tickText(pen, mark.value)}`}
 							></span>
 						{/each}
 					</div>
 					<div class="mark-labels">
-						{#each pen.marks as mark (mark.level)}
+						{#each pen.markGroups as mark (mark.label)}
 							<span class="mark-label" data-tone={mark.tone} style:bottom={pct(mark.position)}
-								>{mark.level}</span
+								>{mark.label}</span
 							>
 						{/each}
 					</div>
@@ -313,5 +317,17 @@
 	.fix-link {
 		font-size: 0.8rem;
 		color: var(--banto-primary);
+	}
+	/* 画面には出さず、支援技術にだけ読ませる（目盛・しきい値の説明、#535）。 */
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
 	}
 </style>

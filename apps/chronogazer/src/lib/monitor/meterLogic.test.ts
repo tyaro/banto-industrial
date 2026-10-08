@@ -21,7 +21,9 @@ import {
 	UNDER_RANGE_LABEL,
 	barGeometry,
 	gaugeThresholds,
+	groupThresholdMarks,
 	levelTone,
+	meterDescription,
 	meterView,
 	meterViews,
 	resolveMeterRange,
@@ -307,5 +309,116 @@ describe('meterView（ペン 1 本のバー・計器の表示）', () => {
 			[1, 'ok'],
 			[3, 'noTag']
 		]);
+	});
+});
+
+describe('groupThresholdMarks（同じ値のしきい値の名前を 1 つにまとめる、#535）', () => {
+	const range = { min: 0, max: 100 };
+	const groups = (t: Tag) =>
+		groupThresholdMarks(thresholdMarks(t, range)).map((g) => [g.label, g.value, g.tone]);
+
+	it.each<[string, Tag, [string, number, LevelTone][]]>([
+		[
+			'4 つとも別の値: まとめない（上から）',
+			tag({ thresholdLl: 5, thresholdL: 10, thresholdH: 80, thresholdHh: 90 }),
+			[
+				['HH', 90, 'danger'],
+				['H', 80, 'warning'],
+				['L', 10, 'warning'],
+				['LL', 5, 'danger']
+			]
+		],
+		[
+			'LL === L === H: 1 つ（下から LL/L/H、重い方の danger）',
+			tag({ thresholdLl: 50, thresholdL: 50, thresholdH: 50, thresholdHh: 60 }),
+			[
+				['HH', 60, 'danger'],
+				['LL/L/H', 50, 'danger']
+			]
+		],
+		[
+			'L === H: warning どうし',
+			tag({ thresholdLl: 10, thresholdL: 50, thresholdH: 50, thresholdHh: 90 }),
+			[
+				['HH', 90, 'danger'],
+				['L/H', 50, 'warning'],
+				['LL', 10, 'danger']
+			]
+		],
+		['H === HH', tag({ thresholdH: 90, thresholdHh: 90 }), [['H/HH', 90, 'danger']]],
+		['LL === L', tag({ thresholdLl: 10, thresholdL: 10 }), [['LL/L', 10, 'danger']]],
+		[
+			'全部同じ',
+			tag({ thresholdLl: 50, thresholdL: 50, thresholdH: 50, thresholdHh: 50 }),
+			[['LL/L/H/HH', 50, 'danger']]
+		],
+		['しきい値なし', tag(), []]
+	])('%s', (_label, t, expected) => {
+		expect(groups(t)).toEqual(expected);
+	});
+
+	it('meterView の markGroups に入る（位置はまとめた値の位置）', () => {
+		const t = tag({
+			rawLo: 0,
+			rawHi: 1,
+			engLo: 0,
+			engHi: 100,
+			thresholdLl: 50,
+			thresholdL: 50,
+			thresholdH: 50
+		});
+		const v = meterView(penView({ tagId: 1, colorSlot: null }, 0, undefined, t), t);
+		expect(v.marks).toHaveLength(3);
+		expect(v.markGroups).toEqual([
+			{ levels: ['LL', 'L', 'H'], label: 'LL/L/H', value: 50, position: 0.5, tone: 'danger' }
+		]);
+	});
+});
+
+describe('meterDescription（レンジとしきい値を文で伝える、#535）', () => {
+	const view = (t: Tag | undefined) =>
+		meterView(penView({ tagId: 1, colorSlot: null }, 0, undefined, t), t);
+
+	it.each<[string, Tag | undefined, string]>([
+		[
+			'工学値レンジ + 4 つのしきい値（単位・小数桁つき）',
+			tag({
+				rawLo: 0,
+				rawHi: 1,
+				engLo: 0,
+				engHi: 100,
+				thresholdLl: 5,
+				thresholdL: 10,
+				thresholdH: 80,
+				thresholdHh: 90
+			}),
+			'レンジ 0.0 ℃〜100.0 ℃（工学値レンジ）。しきい値: HH 90.0 ℃、H 80.0 ℃、L 10.0 ℃、LL 5.0 ℃'
+		],
+		[
+			'LL..HH のレンジ',
+			tag({ unit: null, decimals: 0, thresholdLl: 0, thresholdHh: 1 }),
+			'レンジ 0〜1（しきい値の LL〜HH）。しきい値: HH 1、LL 0'
+		],
+		[
+			'レンジの外のしきい値も言う（印は出ないので文で補う）',
+			tag({ unit: null, decimals: 0, rawLo: 0, rawHi: 1, engLo: 0, engHi: 10, thresholdH: 50 }),
+			'レンジ 0〜10（工学値レンジ）。しきい値: H 50'
+		],
+		[
+			'同じ値のしきい値も 1 つずつ言う',
+			tag({
+				unit: null,
+				decimals: 0,
+				thresholdLl: 50,
+				thresholdL: 50,
+				thresholdH: 50,
+				thresholdHh: 60
+			}),
+			'レンジ 50〜60（しきい値の LL〜HH）。しきい値: HH 60、H 50、L 50、LL 50'
+		],
+		['レンジ未設定・しきい値なし', tag({ unit: null }), `${RANGE_UNSET_MESSAGE}。しきい値: なし`],
+		['タグを読めていない', undefined, `${RANGE_NO_TAG_MESSAGE}。しきい値: なし`]
+	])('%s', (_label, t, expected) => {
+		expect(meterDescription(view(t))).toBe(expected);
 	});
 });

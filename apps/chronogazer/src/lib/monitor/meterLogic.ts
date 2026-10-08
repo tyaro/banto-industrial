@@ -40,7 +40,7 @@
  */
 import { niceTicks, type GaugeThresholds } from '@banto/charts';
 import type { Tag } from '../banto/tagRegistryAdmin';
-import type { PenView, ThresholdLevel } from './monitorLogic';
+import { formatValue, type PenView, type ThresholdLevel } from './monitorLogic';
 
 // --- レンジ ----------------------------------------------------------------
 
@@ -254,6 +254,53 @@ export function thresholdMarks(
 	return marks;
 }
 
+/**
+ * 同じ位置に重なるしきい値の印をまとめたもの（バーの名前の欄に 1 つだけ出す）。
+ * タグの検証は `LL <= L <= H <= HH` の**等号を許す**ので、`LL === L === H` の
+ * ような設定は正しく、印を 1 本ずつ置くと名前が同じ場所に重なって読めない
+ * （#535 のレビュー）。
+ */
+export interface ThresholdMarkGroup {
+	/** まとめた段（下から: LL → L → H → HH）。 */
+	levels: ThresholdMark['level'][];
+	/** 名前の欄に出す文字（例: `LL/L/H`）。 */
+	label: string;
+	value: number;
+	position: number;
+	/** まとめた段のうち重い方（danger があれば danger）。 */
+	tone: LevelTone;
+}
+
+const LEVEL_ORDER_BOTTOM_UP: readonly ThresholdMark['level'][] = ['LL', 'L', 'H', 'HH'];
+
+/**
+ * しきい値の印を値ごとにまとめる（純関数）。同じ値の印は 1 つにし、名前は
+ * 下から（LL → L → H → HH）`/` でつなぐ。並びは上から（値の大きい順）。
+ */
+export function groupThresholdMarks(marks: readonly ThresholdMark[]): ThresholdMarkGroup[] {
+	const groups: ThresholdMarkGroup[] = [];
+	for (const mark of marks) {
+		const found = groups.find((g) => g.value === mark.value);
+		if (found) {
+			found.levels.push(mark.level);
+			if (mark.tone === 'danger') found.tone = 'danger';
+		} else {
+			groups.push({
+				levels: [mark.level],
+				label: '',
+				value: mark.value,
+				position: mark.position,
+				tone: mark.tone
+			});
+		}
+	}
+	for (const g of groups) {
+		g.levels.sort((a, b) => LEVEL_ORDER_BOTTOM_UP.indexOf(a) - LEVEL_ORDER_BOTTOM_UP.indexOf(b));
+		g.label = g.levels.join('/');
+	}
+	return groups.sort((a, b) => b.value - a.value);
+}
+
 // --- ペン 1 本の表示（バー・計器） -------------------------------------------
 
 /** バー・計器のペン 1 本の表示（パネルはこれを描くだけ）。 */
@@ -268,6 +315,13 @@ export interface MeterView extends PenView {
 	outLabel: string | null;
 	ticks: ScaleTick[];
 	marks: ThresholdMark[];
+	/** 名前の欄に出す印（同じ値の印をまとめたもの）。 */
+	markGroups: ThresholdMarkGroup[];
+	/**
+	 * タグに設定されているしきい値（レンジの外も含む。上から HH → H → L → LL）。
+	 * 支援技術向けの説明（`meterDescription`）に使う。
+	 */
+	thresholds: { level: ThresholdMark['level']; value: number }[];
 	gaugeThresholds: GaugeThresholds;
 	/** 目盛・計器の数値の小数桁（タグを読めていなければ `null` = そのまま出す）。 */
 	decimals: number | null;
@@ -283,6 +337,18 @@ export function meterView(
 ): MeterView {
 	const range = resolveMeterRange(tag);
 	const bar = range.kind === 'ok' ? barGeometry(pen.value, range) : null;
+	const marks = range.kind === 'ok' ? thresholdMarks(tag, range) : [];
+	const thresholds: MeterView['thresholds'] = [];
+	if (tag) {
+		for (const [level, value] of [
+			['HH', tag.thresholdHh],
+			['H', tag.thresholdH],
+			['L', tag.thresholdL],
+			['LL', tag.thresholdLl]
+		] as const) {
+			if (finite(value)) thresholds.push({ level, value });
+		}
+	}
 	return {
 		...pen,
 		range,
@@ -291,7 +357,9 @@ export function meterView(
 		bar,
 		outLabel: outOfRangeLabel(bar?.out ?? null),
 		ticks: range.kind === 'ok' ? scaleTicks(range) : [],
-		marks: range.kind === 'ok' ? thresholdMarks(tag, range) : [],
+		marks,
+		markGroups: groupThresholdMarks(marks),
+		thresholds,
 		gaugeThresholds: gaugeThresholds(tag),
 		decimals: tag ? tag.decimals : null
 	};
@@ -305,4 +373,31 @@ export function meterViews(pens: readonly PenView[], tags: readonly Tag[]): Mete
 			tags.find((tag) => tag.id === pen.tagId)
 		)
 	);
+}
+
+// --- 支援技術向けの説明 ------------------------------------------------------
+
+/**
+ * バー・計器の目盛としきい値の説明（純関数、#535 のレビュー）。棒・目盛・印の
+ * 図は `aria-hidden` にしてあり、そのままでは支援技術にレンジとしきい値が
+ * 伝わらないので、同じ内容を文で添える（パネルが画面外の文字として置く）。
+ * 例: 「レンジ 0〜100（工学値レンジ）。しきい値: HH 90、H 80、L 10、LL 5」。
+ */
+export function meterDescription(
+	view: Pick<MeterView, 'range' | 'rangeMessage' | 'thresholds' | 'decimals' | 'unit'>
+): string {
+	const fmt = (n: number) =>
+		(view.decimals === null ? String(n) : formatValue(n, view.decimals)) +
+		(view.unit ? ` ${view.unit}` : '');
+	const range =
+		view.range.kind === 'ok'
+			? `レンジ ${fmt(view.range.min)}〜${fmt(view.range.max)}（${
+					view.range.source === 'eng' ? '工学値レンジ' : 'しきい値の LL〜HH'
+				}）`
+			: (view.rangeMessage ?? '');
+	const thresholds =
+		view.thresholds.length === 0
+			? 'しきい値: なし'
+			: `しきい値: ${view.thresholds.map((t) => `${t.level} ${fmt(t.value)}`).join('、')}`;
+	return `${range}。${thresholds}`;
 }
