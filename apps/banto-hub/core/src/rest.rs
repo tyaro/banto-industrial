@@ -4485,10 +4485,10 @@ async fn tags_create(
 
 /// #528 の回帰テスト専用の割り込み点（本番では存在しない）。`tags_update` が
 /// トランザクションを始めた直後に、(1) 読み取りを 1 回してスナップショットを
-/// 張り、(2) テストへ知らせ、(3) テストが許すまで止まる。素の `BEGIN`
-/// （DEFERRED）ならここへすぐ着くので、テストは別接続のコミットをその後に
-/// 確実に挟める。`BEGIN IMMEDIATE` なら書き込みロックが空くまでここへ着かない。
-/// 固定の `sleep` に頼らないための仕掛け（`display_groups` の `ReadPause` と同じ考え方）。
+/// 張り、(2) テストへ知らせ、(3) テストが許すまで止まる。止まっている間、
+/// `BEGIN IMMEDIATE` ならハンドラが書き込みロックを握っており、素の `BEGIN` なら
+/// 握っていない（スナップショットだけ）ので、テストは別接続からそれを直接確かめる。
+/// 待ち時間に頼らないための仕掛け（`display_groups` の `ReadPause` と同じ考え方）。
 #[cfg(test)]
 pub(crate) struct TxTestHook {
     pub(crate) reached: tokio::sync::Notify,
@@ -15417,163 +15417,124 @@ mod tests {
         }
     }
 
-    /// [`TxTestHook`] の待ち合わせ: ハンドラがトランザクションを始めてスナップ
-    /// ショットを張る（＝素の `BEGIN` の挙動）まで最大 2 秒待つ。着いたら
-    /// `false`、着かずに時間切れ（＝書き込みロック待ちで止まっている、
-    /// `BEGIN IMMEDIATE` の挙動）なら `true` を返す。どちらでも呼び出し側は
-    /// この後で別接続をコミットする。固定時間だけ待ってコミットする方式と違い、
-    /// 素の `BEGIN` ではスナップショットを張った後に必ずコミットが入る。
-    async fn wait_until_blocked_or_reached(hook: &TxTestHook) -> bool {
-        tokio::time::timeout(std::time::Duration::from_secs(2), hook.reached.notified())
+    /// #528 の回帰テスト共通: `PUT /api/tags/{tag}` を [`TxTestHook`] の下で
+    /// 始め、ハンドラがトランザクションを始めて**止まっている間**に、別接続
+    /// （`busy_timeout = 0`）から書き込みを試みる。
+    ///
+    /// - `BEGIN IMMEDIATE` で始めていれば、ハンドラが書き込みロックを握っているので
+    ///   別接続の `BEGIN IMMEDIATE` は**必ず** `SQLITE_BUSY` で失敗する。
+    /// - 素の `BEGIN`（DEFERRED）だと、フックの読み取りはスナップショットを張るだけで
+    ///   ロックを握らないので、別接続の書き込みは成功してしまう（テストはここで落ちる。
+    ///   通った場合の後続は、スナップショットが古くなって `UPDATE` が
+    ///   `SQLITE_BUSY_SNAPSHOT`（500）になる実際の失敗の再現でもある）。
+    ///
+    /// 「待った時間」ではなく「ロックを握っている」という積極的な証拠で判定するので、
+    /// ハンドラの開始が遅れても結果は変わらない。止めたハンドラを解放して応答を返す。
+    async fn put_tag_while_probing_the_write_lock(
+        env: &TestEnv,
+        path: &std::path::Path,
+        tag: i64,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let hook = Arc::new(TxTestHook {
+            reached: tokio::sync::Notify::new(),
+            proceed: tokio::sync::Notify::new(),
+        });
+        let router = env.router.clone();
+        let token = env.admin_token.clone();
+        let request = tokio::spawn(TX_TEST_HOOK.scope(hook.clone(), async move {
+            admin_put(&router, &format!("/api/tags/{tag}"), &token, body).await
+        }));
+
+        // 到達しなければテストの失敗（時間切れは成功の根拠にしない）。
+        tokio::time::timeout(std::time::Duration::from_secs(60), hook.reached.notified())
             .await
-            .is_err()
+            .expect("ハンドラがトランザクションを始めてフックへ着くはず");
+
+        // ハンドラは止まっている。別接続（待たない設定）から書き込みを試みる。
+        use sqlx::ConnectOptions;
+        let mut probe = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .busy_timeout(std::time::Duration::ZERO)
+            .connect()
+            .await
+            .expect("connect probe");
+        let attempt = sqlx::query("BEGIN IMMEDIATE").execute(&mut probe).await;
+        match attempt {
+            Err(sqlx::Error::Database(err)) => {
+                assert!(
+                    matches!(err.code().as_deref(), Some("5") | Some("261")),
+                    "SQLITE_BUSY のはず: {err}"
+                );
+            }
+            other => panic!(
+                "ハンドラが書き込みロックを握っているはず（BEGIN IMMEDIATE で始めていれば \
+                 別接続の BEGIN IMMEDIATE は BUSY になる）: {other:?}"
+            ),
+        }
+        drop(probe);
+
+        hook.proceed.notify_one();
+        request.await.expect("join")
     }
 
-    /// #528: 別接続が書き込みロックを握っている間に `PUT /api/tags/{id}` が
-    /// 始まり、書き込み側がコミットした後も、素の `BEGIN`（DEFERRED）だと
-    /// `update_tx` の検証 `SELECT` で張ったスナップショットが古くなり、
-    /// `UPDATE` が待たずに `SQLITE_BUSY_SNAPSHOT` で失敗する（REST 500）。
-    /// `BEGIN IMMEDIATE` ならロックが空くまで待って成功する。
-    /// `banto-tags` の `update_checked_waits_for_a_concurrent_writer_...`（#527）と同じ形。
+    /// #528: 書き込みロックを握ったまま検証する（`BEGIN IMMEDIATE`）ので
+    /// `PUT /api/tags/{id}` は 200 になる。素の `BEGIN` だと別接続が割り込めて
+    /// `database is locked`（REST 500）になりうる。
     #[tokio::test]
-    async fn tags_update_waits_for_a_concurrent_writer_instead_of_500() {
+    async fn tags_update_holds_the_write_lock_from_the_start() {
         let path = temp_db_path("tags-update-busy");
         let env = test_env_on_file_db(&path).await;
         let (tag1, group_id) =
             create_tag_via_admin(&env.router, &env.admin_token, "imm1", None).await;
-        let (tag2, _) =
-            create_tag_via_admin(&env.router, &env.admin_token, "imm2", Some(group_id)).await;
 
-        // 別コネクション（別プール）が書き込みロックを握る。
-        let pool_b = banto_storage::connect_sqlite(&path)
-            .await
-            .expect("connect b");
-        let mut writer = pool_b.acquire().await.expect("acquire b");
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *writer)
-            .await
-            .expect("begin immediate on b");
-        sqlx::query("UPDATE tags SET name = 'imm2-external' WHERE id = ?")
-            .bind(tag2)
-            .execute(&mut *writer)
-            .await
-            .expect("external write");
-
-        let router = env.router.clone();
-        let token = env.admin_token.clone();
-        let hook = Arc::new(TxTestHook {
-            reached: tokio::sync::Notify::new(),
-            proceed: tokio::sync::Notify::new(),
-        });
-        let request = tokio::spawn(TX_TEST_HOOK.scope(hook.clone(), async move {
-            admin_put(
-                &router,
-                &format!("/api/tags/{tag1}"),
-                &token,
-                json!({
-                    "name": "tag-imm1-renamed",
-                    "collectionGroupId": group_id,
-                    "address": "D100",
-                    "dataType": "i16"
-                }),
-            )
-            .await
-        }));
-
-        let blocked = wait_until_blocked_or_reached(&hook).await;
-        sqlx::query("COMMIT")
-            .execute(&mut *writer)
-            .await
-            .expect("commit b");
-        drop(writer);
-        hook.proceed.notify_one();
-
-        assert!(
-            blocked,
-            "ハンドラは書き込みロックを待って止まっているはず（BEGIN IMMEDIATE）。
-             スナップショットを張れたなら素の BEGIN のまま"
-        );
-        let (status, body) = request.await.expect("join");
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "別接続のコミットを待って成功するはず（500 ならスナップショット競合）: {body:?}"
-        );
+        let (status, body) = put_tag_while_probing_the_write_lock(
+            &env,
+            &path,
+            tag1,
+            json!({
+                "name": "tag-imm1-renamed",
+                "collectionGroupId": group_id,
+                "address": "D100",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
         assert_eq!(body["name"], "tag-imm1-renamed");
-        let (status, other) =
-            admin_get(&env.router, &format!("/api/tags/{tag2}"), &env.admin_token).await;
-        assert_eq!(status, StatusCode::OK, "{other:?}");
-        assert_eq!(other["name"], "imm2-external");
 
-        pool_b.close().await;
         env.pool.close().await;
         remove_db_files(&path);
     }
 
-    /// #528: 同じ競合の最中でも、本物の版の食い違いは 500 ではなく 409
+    /// #528: 同じ状況でも、本物の版の食い違いは 500 ではなく 409
     /// （`tag_revision_conflict`）で返る。
     #[tokio::test]
-    async fn tags_update_true_revision_conflict_is_409_even_under_a_concurrent_writer() {
+    async fn tags_update_true_revision_conflict_is_409_while_holding_the_write_lock() {
         let path = temp_db_path("tags-update-conflict");
         let env = test_env_on_file_db(&path).await;
         let (tag1, group_id) =
             create_tag_via_admin(&env.router, &env.admin_token, "cf1", None).await;
-        let (tag2, _) =
-            create_tag_via_admin(&env.router, &env.admin_token, "cf2", Some(group_id)).await;
         let (_, current) =
             admin_get(&env.router, &format!("/api/tags/{tag1}"), &env.admin_token).await;
         let stale = current["revision"].as_i64().unwrap() + 100;
 
-        let pool_b = banto_storage::connect_sqlite(&path)
-            .await
-            .expect("connect b");
-        let mut writer = pool_b.acquire().await.expect("acquire b");
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *writer)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE tags SET name = 'cf2-external' WHERE id = ?")
-            .bind(tag2)
-            .execute(&mut *writer)
-            .await
-            .unwrap();
-
-        let router = env.router.clone();
-        let token = env.admin_token.clone();
-        let hook = Arc::new(TxTestHook {
-            reached: tokio::sync::Notify::new(),
-            proceed: tokio::sync::Notify::new(),
-        });
-        let request = tokio::spawn(TX_TEST_HOOK.scope(hook.clone(), async move {
-            admin_put(
-                &router,
-                &format!("/api/tags/{tag1}"),
-                &token,
-                json!({
-                    "name": "tag-cf1-renamed",
-                    "collectionGroupId": group_id,
-                    "address": "D100",
-                    "dataType": "i16",
-                    "expectedRevision": stale
-                }),
-            )
-            .await
-        }));
-        let blocked = wait_until_blocked_or_reached(&hook).await;
-        sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
-        drop(writer);
-        hook.proceed.notify_one();
-
-        assert!(
-            blocked,
-            "ハンドラは書き込みロックを待って止まっているはず（BEGIN IMMEDIATE）。
-             スナップショットを張れたなら素の BEGIN のまま"
-        );
-        let (status, body) = request.await.expect("join");
+        let (status, body) = put_tag_while_probing_the_write_lock(
+            &env,
+            &path,
+            tag1,
+            json!({
+                "name": "tag-cf1-renamed",
+                "collectionGroupId": group_id,
+                "address": "D100",
+                "dataType": "i16",
+                "expectedRevision": stale
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
         assert_eq!(body["error"], "tag_revision_conflict", "{body:?}");
 
-        pool_b.close().await;
         env.pool.close().await;
         remove_db_files(&path);
     }
