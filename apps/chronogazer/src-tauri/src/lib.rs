@@ -5487,6 +5487,15 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(state.tags.get(tag.id).await.unwrap().threshold_h, Some(7.0));
+
+        // 削除済みのタグへの古い版の更新は NotFound（競合でも汎用エラーでもない）。
+        state.tags.delete(tag.id).await.expect("delete");
+        let mut gone = tag_payload("t", group.id, "40001");
+        gone.expected_revision = Some(tag.revision);
+        let err = tags_update_body(&state, tag.id, gone)
+            .await
+            .expect_err("削除済みのタグが更新できてしまった");
+        assert!(matches!(err, BantoError::NotFound { .. }), "{err:?}");
     }
 
     /// **#414 段階1（Tauri 経路）**: REST と同じ検査が、コマンドの本体にも

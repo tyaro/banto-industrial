@@ -1642,6 +1642,40 @@ impl TagService {
         }
     }
 
+    /// Pool-taking twin of [`Self::update_tx`] (#525 / PR #527 review): opens
+    /// its own transaction, runs `update_tx`, commits on success and rolls
+    /// back on any error, and returns the structured [`TagUpdateError`]
+    /// ([`TagUpdateError::RevisionConflict`] with the current row,
+    /// `Banto(NotFound)`, validation, ...). For callers without a
+    /// transaction of their own (ChronoGazer's REST/Tauri `tags_update`)
+    /// that still need to tell a stale `expected_revision` apart from the
+    /// other failures. [`Self::update`] folds a conflict into
+    /// `BantoError::Other`, and re-reading the row afterwards to classify it
+    /// races with a concurrent delete; here the conflict/not-found decision
+    /// is made inside the same transaction as the `UPDATE`.
+    ///
+    /// Validation and side effects are identical to [`Self::update`] (the
+    /// two differ only in pool vs. connection for the placement check; there
+    /// is no audit/notify step in either).
+    pub async fn update_checked(&self, id: i64, input: TagInput) -> Result<Tag, TagUpdateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        match self.update_tx(&mut tx, id, input).await {
+            Ok(tag) => {
+                tx.commit().await.map_err(banto_storage::storage_error)?;
+                Ok(tag)
+            }
+            Err(err) => {
+                // 失敗の原因をロールバックの失敗で隠さない。
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
     /// Validate and update a batch of existing tags using a caller-owned
     /// SQLite transaction (T18-3b, bulk tag operations) - the update-side
     /// counterpart of [`Self::create_batch_tx`], following the exact same
@@ -2784,6 +2818,42 @@ mod tests {
                 if resource == "tags" && id == created.id.to_string()
         ));
         tx.rollback().await.expect("rollback");
+    }
+
+    /// `update_checked`（プールを取る版）も、古い版は現在の行つきの
+    /// `RevisionConflict`、削除済みの id は `NotFound` を返し、成功は確定する。
+    #[tokio::test]
+    async fn update_checked_reports_conflict_and_not_found_and_commits_success() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev8", group_id)).await.unwrap();
+
+        let mut first = sample_input("Rev8-updated", group_id);
+        first.expected_revision = Some(created.revision);
+        let updated = svc
+            .update_checked(created.id, first)
+            .await
+            .expect("current revision should succeed");
+        assert_eq!(updated.revision, 2);
+        assert_eq!(svc.get(created.id).await.unwrap().name, "Rev8-updated");
+
+        let mut stale = sample_input("Rev8-stale", group_id);
+        stale.expected_revision = Some(created.revision);
+        match svc.update_checked(created.id, stale).await.unwrap_err() {
+            TagUpdateError::RevisionConflict(current) => {
+                assert_eq!(current.name, "Rev8-updated");
+                assert_eq!(current.revision, 2);
+            }
+            other => panic!("expected RevisionConflict, got {other:?}"),
+        }
+        assert_eq!(svc.get(created.id).await.unwrap().name, "Rev8-updated");
+
+        svc.delete(created.id).await.unwrap();
+        let mut gone = sample_input("Rev8-gone", group_id);
+        gone.expected_revision = Some(created.revision);
+        assert!(matches!(
+            svc.update_checked(created.id, gone).await.unwrap_err(),
+            TagUpdateError::Banto(BantoError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

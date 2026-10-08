@@ -55,7 +55,7 @@
 
 use banto_collect::{check_tag_address, TagAddressField, TagAddressIssue};
 use banto_core::{BantoError, FieldError, ListParams};
-use banto_tags::{CollectionGroupService, PlcConnectionService, Tag, TagService};
+use banto_tags::{CollectionGroupService, PlcConnectionService, Tag, TagService, TagUpdateError};
 
 /// プロトコル変更の拒否メッセージに名前を並べるタグの上限。これを超えた分は
 /// 「ほか N 件」にまとめる（1 件ずつ全部並べるとトーストが読めなくなる）。
@@ -288,30 +288,21 @@ pub fn is_revision_conflict(err: &BantoError) -> bool {
 }
 
 /// タグを更新する（REST・Tauri 共通）。`input.expected_revision` が `Some` で
-/// 他者が先に更新していたら、`TagService::update` の汎用エラー（`Other` =
-/// 500 になる）ではなく [`revision_conflict_error`] を返す。
+/// 他者が先に更新していたら、[`revision_conflict_error`] を返す（REST は 409）。
 ///
-/// `TagService::update` は「版の食い違い」と「その他の失敗」をどちらも
-/// `BantoError::Other` にするので、`Other` が返ったときだけ現在の行を読み直し、
-/// 版が進んでいれば食い違いと判定する（メッセージの文字列には依存しない）。
+/// 判定は `TagService::update_checked`（`update_tx` を自前のトランザクションで
+/// 実行する）が返す構造化エラーに従う。更新の結果そのもので分類するので、
+/// 失敗後に読み直す間に別の要求が割り込む余地が無い（削除されていれば
+/// `NotFound`、404 のまま）。
 pub async fn update_tag_checked(
     tags: &TagService,
     id: i64,
     input: banto_tags::TagInput,
 ) -> Result<Tag, BantoError> {
-    let expected = input.expected_revision;
-    match tags.update(id, input).await {
-        Err(BantoError::Other(message)) => {
-            if let Some(expected) = expected {
-                if let Ok(current) = tags.get(id).await {
-                    if current.revision != expected {
-                        return Err(revision_conflict_error());
-                    }
-                }
-            }
-            Err(BantoError::Other(message))
-        }
-        other => other,
+    match tags.update_checked(id, input).await {
+        Ok(tag) => Ok(tag),
+        Err(TagUpdateError::RevisionConflict(_)) => Err(revision_conflict_error()),
+        Err(TagUpdateError::Banto(err)) => Err(err),
     }
 }
 

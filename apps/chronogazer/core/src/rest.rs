@@ -4470,6 +4470,24 @@ mod tests {
             send(&router, put_json_auth(&path, &editor, tag_body(json!({})))).await;
         assert_eq!(status, StatusCode::OK, "{cleared}");
         assert!(cleared["thresholdH"].is_null(), "{cleared}");
+
+        // 削除済みのタグへの古い版の更新は 404（409 や 500 ではない）。
+        let deleted = router
+            .clone()
+            .oneshot(delete_auth(&path, &editor))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let (status, body) = send(
+            &router,
+            put_json_auth(
+                &path,
+                &editor,
+                tag_body(json!({"expectedRevision": revision})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
 
     /// **作成で送らない = `false`**（既存クライアントの挙動は #413 の前と同じ）。
