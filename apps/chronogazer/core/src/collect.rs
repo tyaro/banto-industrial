@@ -1527,6 +1527,9 @@ struct CollectorContext {
     /// `collect_events` を同居させている、このアプリ唯一の SQLite プール。
     /// [`banto_collect::build_config`] の読み取り元であり、[`EventSink`] の書き込み先でもある。
     pool: SqlitePool,
+    /// 保持期間の削除と停止を直列にするゲート（[`Published::writer`] の doc、
+    /// [`CollectorService::prune_data_files`]）。
+    writer_gate: tokio::sync::Mutex<()>,
     /// 時系列ファイル（`banto-tstore`）の置き場。設定 `data.dir` を
     /// [`resolve_data_dir`] で解決したもの。
     data_dir: PathBuf,
@@ -1593,12 +1596,21 @@ struct Published {
     /// 共有ハンドル（`Arc<RwLock<..>>` 包み）で、**タスクの外で保持してよい**
     /// （このモジュールの doc「現在値はキューから外して葉に公開する」）。
     current: Option<CurrentValuesHandle>,
-    /// 走っているときだけ `Some`。いま使っている `TsWriter` を受け取る口
-    /// （設定の再適用で書き手が入れ替わっても、常に今のものを返す）。
+    /// 走っているときだけ `Some`。いま使っている `TsWriter` への**弱い**参照。
     /// 保持期間の削除が、**書き手が今開いている日付のファイルを消さない**ために
     /// 書き手のロックの下で削除する（#538、[`CollectorService::prune_data_files`]）。
     /// `current` と同じく状態と一緒に書く（[`CollectorContext::publish`]）。
-    writer: Option<tokio::sync::watch::Receiver<Arc<banto_tstore::TsWriter>>>,
+    ///
+    /// **強い参照（`Arc` や `watch::Receiver`）を持ってはいけない**:
+    /// `Collector::stop` は「自分だけが持っている `Arc`」のときだけ
+    /// `TsWriter::close`（最終 flush + 接続プールの close）を呼び、共有されて
+    /// いると flush だけで済ませる。ここに強い参照が残ると、停止のたびに
+    /// プールが閉じられず、Windows ではファイルが掴まれたままになる
+    /// （`a_failed_restart_leaves_no_stale_exclusions` が OS error 32 で落ちた）。
+    /// `watch::Receiver` もチャネル内に `Arc` の写しを保つので同じ。
+    /// 書き手の入れ替え（`apply_config`）は ChronoGazer は使わない（反映は
+    /// 停止 + 開始だけ）ので、起動時に取った参照が実行の間ずっと有効。
+    writer: Option<std::sync::Weak<banto_tstore::TsWriter>>,
 }
 
 impl CollectorContext {
@@ -1649,7 +1661,7 @@ impl CollectorContext {
         &self,
         state: CollectorState,
         current: CurrentValuesHandle,
-        writer: tokio::sync::watch::Receiver<Arc<banto_tstore::TsWriter>>,
+        writer: std::sync::Weak<banto_tstore::TsWriter>,
     ) {
         let mut published = self
             .published
@@ -1661,7 +1673,7 @@ impl CollectorContext {
     }
 
     /// 走っている書き手の受け口。走っていなければ `None`。
-    fn writer(&self) -> Option<tokio::sync::watch::Receiver<Arc<banto_tstore::TsWriter>>> {
+    fn writer(&self) -> Option<std::sync::Weak<banto_tstore::TsWriter>> {
         self.published
             .lock()
             .expect("collector published lock poisoned")
@@ -1739,6 +1751,7 @@ impl CollectorService {
                 current: None,
                 writer: None,
             }),
+            writer_gate: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             start_gate: None,
         })
@@ -1935,8 +1948,11 @@ impl CollectorService {
         retention_days: u32,
         today: banto_tstore::LocalDate,
     ) -> Result<banto_tstore::PruneReport, banto_tstore::TstoreError> {
-        if let Some(rx) = self.inner.ctx.writer() {
-            let writer = rx.borrow().clone();
+        // 停止と直列（`stop` が同じゲートを先に取る）。ゲートの下で書き手を
+        // 掴む間は停止の close が待つ。書き手が既に無ければ（停止済み・
+        // 起動前）、ファイルを開いている者は居ないので素の削除でよい。
+        let _gate = self.inner.ctx.writer_gate.lock().await;
+        if let Some(writer) = self.inner.ctx.writer().and_then(|weak| weak.upgrade()) {
             return writer.prune_files(retention_days, today).await;
         }
         let dir = self.inner.ctx.data_dir.clone();
@@ -2271,6 +2287,7 @@ impl CollectorService {
                 current: None,
                 writer: None,
             }),
+            writer_gate: tokio::sync::Mutex::new(()),
             start_gate: Some(gate),
         })
     }
@@ -2458,7 +2475,9 @@ impl Lifecycle {
         // `publish` 呼び出しで書くので、「走っているのに現在値が読めない」
         // という食い違いが起こらない（[`Published`] の doc）。
         let current = collector.current_values();
-        let writer = collector.writer_handle();
+        // 弱い参照にして、すぐ `Receiver` と一時的な `Arc` を手放す
+        // （[`Published::writer`] の doc）。
+        let writer = Arc::downgrade(&collector.writer_handle().borrow());
         self.collector = Some(collector);
         self.simulated = simulated_connection_keys(&snapshot);
         let state = CollectorState::Running {
@@ -2480,6 +2499,11 @@ impl Lifecycle {
         // ここから先は誰にも中断されない（呼び出し側が消えてもこのタスクは
         // 生きている）ので、`take()` 済み・状態は `Running` のまま、という
         // 食い違いが残ることはない。
+        // 保持期間の削除と**直列にする**: 削除が書き手を掴んだまま停止が
+        // `TsWriter::close` に進むと、共有扱いになって close されない
+        // （[`Published::writer`] の doc）。逆に、停止の途中（close の最中）に
+        // 書き手なしの削除が走ることも無くなる。
+        let _prune_gate = self.ctx.writer_gate.lock().await;
         let result = collector.stop().await;
         self.simulated.clear();
         // 止まったことは確定なので、flush の成否に関わらず `Stopped` にする。
@@ -3371,6 +3395,65 @@ mod tests {
         assert!(matches!(svc.state(), CollectorState::StartFailed { .. }));
         assert_eq!(svc.state_view(), CollectorStateView::StartFailed);
         assert_eq!(svc.values(), Readout::NotRunning);
+    }
+
+    /// 停止すると書き手が**閉じられる**（`TsWriter::close` = 接続プールの close）。
+    /// 保持期間の削除のために公開している書き手への参照が強いと、`Collector::stop`
+    /// は「共有されている」と見て flush だけで済ませ、プールが閉じられない
+    /// （Windows ではデータディレクトリが消せなくなる。#538 の CI で
+    /// `a_failed_restart_leaves_no_stale_exclusions` が OS error 32 で落ちた）。
+    /// 停止後に書き手が誰からも掴まれていないこと、ディレクトリがすぐ消せる
+    /// ことで確かめる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_closes_the_writer_even_though_prune_can_reach_it() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+        svc.start().await.expect("start");
+        let weak = svc
+            .inner
+            .ctx
+            .writer()
+            .expect("running publishes the writer");
+        assert!(weak.upgrade().is_some());
+
+        svc.stop().await.expect("stop");
+        assert!(weak.upgrade().is_none(), "停止後に書き手が残っていない");
+        assert!(svc.inner.ctx.writer().is_none());
+        std::fs::remove_dir_all(dir.path().join("data"))
+            .expect("プールが閉じられていれば、すぐ消せる");
+    }
+
+    /// 走っている間の削除は書き手を通して古いファイルを消し、そのあとの停止も
+    /// 書き手を閉じられる（削除が書き手を掴んだまま残らない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prune_while_running_deletes_old_files_and_does_not_defeat_close() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+        svc.start().await.expect("start");
+        let old = dir.path().join("data").join("20200101-001.sqlite3");
+        std::fs::write(&old, b"").unwrap();
+        let clock = SystemClock;
+        let today = banto_tstore::LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
+
+        let report = svc.prune_data_files(7, today).await.expect("prune");
+        assert_eq!(report.deleted, vec![old.clone()]);
+        assert!(!old.exists());
+        assert_eq!(
+            banto_tstore::list_data_files(&dir.path().join("data"))
+                .unwrap()
+                .len(),
+            1,
+            "開いている今日のファイルは残る"
+        );
+
+        let weak = svc.inner.ctx.writer().unwrap();
+        svc.stop().await.expect("stop");
+        assert!(weak.upgrade().is_none());
+        std::fs::remove_dir_all(dir.path().join("data")).expect("close 済みなので消せる");
     }
 
     /// **公開する形に内部情報を載せない**（#414 段階2）: 除外ありの状態の
