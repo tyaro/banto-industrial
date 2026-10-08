@@ -177,7 +177,8 @@ export interface TagInput {
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';
 
-function demoModeError(): ProviderError {
+/** デモモードの拒否（`displayGroupsAdmin.ts` も使う）。 */
+export function demoModeError(): ProviderError {
 	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
 }
 
@@ -208,7 +209,8 @@ function toProviderError(err: unknown): ProviderError {
 	return new ProviderError({ kind: 'other', message });
 }
 
-async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+/** Tauri コマンドの呼び出し（エラーを `ProviderError` にそろえる。`displayGroupsAdmin.ts` も使う）。 */
+export async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	try {
 		return (await invoke(cmd, args)) as T;
 	} catch (err) {
@@ -221,13 +223,14 @@ function currentToken(): string | null {
 	return auth.getToken ? auth.getToken() : null;
 }
 
-interface HttpInit {
+export interface HttpInit {
 	method: string;
 	body?: unknown;
 	expectNoContent?: boolean;
 }
 
-async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
+/** REST の呼び出し（CSRF ヘッダー・Bearer・`ErrorBody` の復元。`displayGroupsAdmin.ts` も使う）。 */
+export async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 	const hasBody = init.body !== undefined;
 	const headers: Record<string, string> = { ...CSRF_HEADER };
 	if (hasBody) headers['Content-Type'] = 'application/json';

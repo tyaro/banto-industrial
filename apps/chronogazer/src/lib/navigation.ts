@@ -21,6 +21,11 @@
  * viewer も閲覧できる（R0 §3.6: 読み取りは viewer 以上、書き込みは editor
  * 以上）。
  *
+ * #393（#524 の段階 1）: `/groups`（グループ設定 = 表示グループの定義）を
+ * タグ設定の直後に追加（§6 の画面順: 監視・ヒストリカル・タグ設定・グループ
+ * 設定・イベント）。タグ設定と同じく viewer も閲覧でき、閲覧公開のセッションには
+ * 出さない（設定画面のため）。コマンドパレットにはこの表から自動で載る。
+ *
  * I2b（2026-10-04 オーナー決定: ChronoGazer でも閲覧公開を使う）: banto v3.0.0
  * の admin-template `navigation.ts` の `NavItem.publicViewer` と
  * `publicNavItems()` を写した。閲覧公開のセッションに見せるのは、計測値を
@@ -91,6 +96,7 @@ export const navItems: NavItem[] = [
 	{ path: '/monitor', label: '監視', icon: '📈', publicViewer: true },
 	{ path: '/historical', label: 'ヒストリカル', icon: '🕰️', publicViewer: true },
 	{ path: '/tags', label: 'タグ設定', icon: '🏷️' },
+	{ path: '/groups', label: 'グループ設定', icon: '🗂️' },
 	{ path: '/events', label: 'イベント', icon: '🔔', publicViewer: true },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },

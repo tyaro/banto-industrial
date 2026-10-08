@@ -623,15 +623,6 @@ export function tagFormValues(prefix: string, tag: Tag): Record<string, unknown>
 	};
 }
 
-/**
- * 保存の失敗が「版の食い違い（他者が先に更新した）」か。サーバーは REST（409）も
- * Tauri も `field: "expectedRevision"` の検証エラーで返す。
- */
-export function isRevisionConflict(err: unknown): boolean {
-	if (typeof err !== 'object' || err === null) return false;
-	const body = (err as { body?: { kind?: unknown; field_errors?: unknown } }).body;
-	if (!body || body.kind !== 'validation' || !Array.isArray(body.field_errors)) return false;
-	return body.field_errors.some(
-		(fe) => typeof fe === 'object' && fe !== null && (fe as FieldError).field === 'expectedRevision'
-	);
-}
+// 保存の失敗が「版の食い違い（他者が先に更新した）」か。判定は表示グループと共通
+// （`#lib/banto/revisionConflict.ts`）。既存の呼び出し元のためにここからも引ける。
+export { isRevisionConflict } from '#lib/banto/revisionConflict.js';

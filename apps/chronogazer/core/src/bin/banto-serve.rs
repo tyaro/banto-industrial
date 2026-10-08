@@ -50,6 +50,7 @@ use chronogazer_core::backup::BackupService;
 // いない」口になる）。
 use chronogazer_core::collect::{resolve_data_dir, CollectorService};
 use chronogazer_core::db::{init_db, Db, InitDbError};
+use chronogazer_core::display_groups::DisplayGroupService;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, UnavailableKeyStore};
 use chronogazer_core::rest::{api_router, user_auth_state};
@@ -135,6 +136,8 @@ async fn main() {
     let plc_connections = PlcConnectionService::new(pool.clone());
     let collection_groups = CollectionGroupService::new(pool.clone());
     let tags = TagService::new(pool.clone());
+    // #393: 表示グループ（同じ pool）。
+    let display_groups = DisplayGroupService::new(pool.clone());
     let audit = AuditLogService::new(db);
     // Credential verifier from `chronogazer_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
@@ -273,6 +276,7 @@ async fn main() {
             collection_groups,
             tags,
             collect.clone(),
+            display_groups,
             auth,
             events,
             allow_setup,
