@@ -263,28 +263,17 @@ pub async fn ensure_tag_update_fits_its_connection(
     .await
 }
 
-/// 楽観ロック（`expectedRevision`）が食い違ったときにフォームへ出すフィールド名。
-pub const REVISION_CONFLICT_FIELD: &str = "expectedRevision";
+// 楽観ロックの食い違いの表し方は `crate::revision` に 1 つ（表示グループと共通）。
+// 既存の呼び出し元のために、判定とフィールド名はここからも引ける。
+pub use crate::revision::{is_revision_conflict, REVISION_CONFLICT_FIELD};
 
-/// 版の食い違いの案内（画面にそのまま出る）。
+/// タグの版の食い違いの案内（画面にそのまま出る）。
 pub const REVISION_CONFLICT_MESSAGE: &str =
     "他の人（または別の画面）がこのタグを先に更新しました。一覧を再読み込みしてから、もう一度編集して保存してください。";
 
-/// 版の食い違いを表すエラー。REST は `409 Conflict`、Tauri は通常の検証エラーと
-/// 同じ形（`kind: "validation"`）で返し、画面は両経路を同じに扱える。
+/// タグの版の食い違いを表すエラー（形は `crate::revision::revision_conflict_error`）。
 pub fn revision_conflict_error() -> BantoError {
-    BantoError::Validation {
-        field_errors: vec![FieldError {
-            field: REVISION_CONFLICT_FIELD.to_string(),
-            message: REVISION_CONFLICT_MESSAGE.to_string(),
-        }],
-    }
-}
-
-/// [`revision_conflict_error`] が作ったエラーか（REST が `409` にするための判定）。
-pub fn is_revision_conflict(err: &BantoError) -> bool {
-    matches!(err, BantoError::Validation { field_errors }
-        if field_errors.iter().any(|fe| fe.field == REVISION_CONFLICT_FIELD))
+    crate::revision::revision_conflict_error(REVISION_CONFLICT_MESSAGE)
 }
 
 /// タグを更新する（REST・Tauri 共通）。`input.expected_revision` が `Some` で

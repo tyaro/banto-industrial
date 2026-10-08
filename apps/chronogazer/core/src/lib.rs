@@ -18,6 +18,8 @@ pub mod events;
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
 pub mod hub;
 pub mod rest;
+// #393 / #525: 楽観ロックの食い違いの表し方（タグ・表示グループ共通）。
+pub mod revision;
 pub mod settings;
 // #413: 接続単位シミュレーションで値が動かないタグの判定（判定そのものは
 // `banto_collect::simulation::classify_plc_tag`）。REST と Tauri の両方が使う。

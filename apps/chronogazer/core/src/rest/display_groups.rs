@@ -6,7 +6,7 @@
 //! | POST   | `/api/display-groups`       | `DisplayGroupPayload`   | `DisplayGroup`（editor 以上） |
 //! | PUT    | `/api/display-groups/order` | `{ ids: number[] }`     | `DisplayGroup[]`（editor 以上、並べ替え） |
 //! | GET    | `/api/display-groups/{id}`  | -                       | `DisplayGroup`（viewer 以上） |
-//! | PUT    | `/api/display-groups/{id}`  | `DisplayGroupPayload`   | `DisplayGroup`（editor 以上。版の食い違いは `409`） |
+//! | PUT    | `/api/display-groups/{id}`  | `DisplayGroupPayload`   | `DisplayGroup`（editor 以上。版の食い違いは `409`。本文の `sortOrder` は無視 - 並びは `/order` だけで変える） |
 //! | DELETE | `/api/display-groups/{id}`  | -                       | 204（editor 以上） |
 //!
 //! 作法は親モジュールの `tag_registry_router` と同じ: 読み取りはルーター全体の
@@ -23,19 +23,17 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
-use banto_core::BantoError;
 use banto_server::routes::record_write;
 use banto_server::{require_auth, ApiError, AuthState};
 use serde_json::json;
 
-use super::require_editor;
+use super::{require_editor, RevisionConflictRejection};
 use crate::audit::AuditLogService;
 use crate::display_groups::{
-    audit_detail, is_revision_conflict, DisplayGroup, DisplayGroupPayload, DisplayGroupService,
-    ReorderPayload, AUDIT_RESOURCE,
+    audit_detail, DisplayGroup, DisplayGroupPayload, DisplayGroupService, ReorderPayload,
+    AUDIT_RESOURCE,
 };
 
 #[derive(Clone)]
@@ -43,35 +41,6 @@ struct DisplayGroupsState {
     display_groups: DisplayGroupService,
     auth: AuthState,
     audit: AuditLogService,
-}
-
-/// 書き込みの失敗。版の食い違いだけ `409`。
-enum WriteRejection {
-    Api(ApiError),
-    RevisionConflict(BantoError),
-}
-
-impl From<BantoError> for WriteRejection {
-    fn from(err: BantoError) -> Self {
-        if is_revision_conflict(&err) {
-            Self::RevisionConflict(err)
-        } else {
-            Self::Api(ApiError(err))
-        }
-    }
-}
-
-impl IntoResponse for WriteRejection {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Api(err) => err.into_response(),
-            Self::RevisionConflict(err) => (
-                StatusCode::CONFLICT,
-                Json(banto_core::ErrorBody::from(&err)),
-            )
-                .into_response(),
-        }
-    }
 }
 
 async fn list(
@@ -120,7 +89,7 @@ async fn update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(payload): Json<DisplayGroupPayload>,
-) -> Result<Json<DisplayGroup>, WriteRejection> {
+) -> Result<Json<DisplayGroup>, RevisionConflictRejection> {
     require_editor(
         &state.auth,
         &state.audit,

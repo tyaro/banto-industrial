@@ -1417,14 +1417,16 @@ async fn tags_create(
     Ok(Json(created))
 }
 
-/// `PUT /api/tags/{id}` の失敗。版の食い違い（楽観ロック）だけ `409 Conflict`
+/// 楽観ロックを持つ更新（`PUT /api/tags/{id}`・`PUT /api/display-groups/{id}`）の
+/// 失敗。版の食い違い（`crate::revision::is_revision_conflict`）だけ `409 Conflict`
 /// にし、本文は他の検証エラーと同じ `ErrorBody` 形（画面が同じ処理で読める）。
-enum TagUpdateRejection {
+/// タグと表示グループで 1 つ（子モジュール `display_groups` も使う）。
+enum RevisionConflictRejection {
     Api(ApiError),
     RevisionConflict(BantoError),
 }
 
-impl From<BantoError> for TagUpdateRejection {
+impl From<BantoError> for RevisionConflictRejection {
     fn from(err: BantoError) -> Self {
         if is_revision_conflict(&err) {
             Self::RevisionConflict(err)
@@ -1434,13 +1436,13 @@ impl From<BantoError> for TagUpdateRejection {
     }
 }
 
-impl From<ApiError> for TagUpdateRejection {
+impl From<ApiError> for RevisionConflictRejection {
     fn from(err: ApiError) -> Self {
         Self::Api(err)
     }
 }
 
-impl IntoResponse for TagUpdateRejection {
+impl IntoResponse for RevisionConflictRejection {
     fn into_response(self) -> Response {
         match self {
             Self::Api(err) => err.into_response(),
@@ -1458,7 +1460,7 @@ async fn tags_update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<TagPayload>,
-) -> Result<Json<Tag>, TagUpdateRejection> {
+) -> Result<Json<Tag>, RevisionConflictRejection> {
     require_editor(
         &state.auth,
         &state.audit,
