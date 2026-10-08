@@ -197,6 +197,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use banto_core::{BantoError, FieldError, ListParams};
@@ -233,7 +234,8 @@ use crate::settings::SettingsService;
 use crate::simulation::SimulationCoverageEntry;
 use crate::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
-    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, TagPlacement,
+    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, is_revision_conflict,
+    update_tag_checked, TagPlacement,
 };
 use crate::users::{Role, UsersService};
 
@@ -988,15 +990,23 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
 /// Wire-shaped (camelCase) create/update payload for `tags`。
 ///
 /// R1-B 指示書の「残すもの」（名前/接続/デバイスアドレス/データ型/
-/// スケーリング/単位/小数桁）に厳密に合わせた最小形。しきい値
-/// （`thresholdH`/`Hh`/`L`/`Ll`）と文字列タグ（`stringLength`/
-/// `stringEncoding`）は指示書の残す一覧に無い - recorder-requirements.md
-/// §6 は「タグ設定」画面（本 PR）と「グループ設定（ペン割当・表示種別・
-/// しきい値）」画面を別画面として挙げており、しきい値の編集は後者
-/// （表示グループ、R1-B の範囲外・#383 の後続段階）の役目と読める。
+/// スケーリング/単位/小数桁）に、**しきい値（`thresholdH`/`Hh`/`L`/`Ll`）と
+/// 楽観ロック用の `expectedRevision`**（#525）を加えた形。しきい値は
+/// タグ定義の属性で、収集のしきい値イベントが `tags` テーブルの値を使う
+/// （recorder-requirements.md §3.7。表示グループ #393 は参照するだけ）。
+/// 文字列タグ（`stringLength`/`stringEncoding`）は扱わない。
 /// `writable`/`tagKind`/`expression`/`retain` は指示書が明示的に落とす
 /// もの（演算タグ・書き込みは banto-hub 固有 / R0 §7 非スコープ）。
 /// [`From`] impl 側でこれらを `banto_tags::TagInput` の既定値に固定する。
+///
+/// ## 省略したときの意味（banto-hub の `PUT` と同じ「全項目置換」）
+///
+/// `PUT /api/tags/{id}` は**置換**で、省略した項目は既定値（しきい値なら
+/// 「設定なし」）になる。つまり**しきい値を省略した更新は、既存のしきい値を
+/// 消す**。画面（`/tags`）は常に今の値を送る。これを直接呼ぶクライアントは、
+/// `GET /api/tags/{id}` で取った値を全項目送り返すこと。`expectedRevision` を
+/// 付けると、他者が先に更新していた場合は `409` で拒否する（省略すると
+/// 版を確かめない後勝ち）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagPayload {
@@ -1016,8 +1026,22 @@ pub struct TagPayload {
     pub unit: Option<String>,
     #[serde(default = "default_tag_decimals")]
     pub decimals: i64,
+    /// しきい値（省略可。範囲外の大小関係は `banto-tags` が `ll <= l <= h <= hh`
+    /// で検証する）。
+    #[serde(default)]
+    pub threshold_h: Option<f64>,
+    #[serde(default)]
+    pub threshold_hh: Option<f64>,
+    #[serde(default)]
+    pub threshold_l: Option<f64>,
+    #[serde(default)]
+    pub threshold_ll: Option<f64>,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
+    /// 楽観ロック（更新のみ）: 編集画面が最後に読んだ `Tag::revision`。
+    /// 省略すると版を確かめない。
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
 }
 
 impl From<TagPayload> for TagInput {
@@ -1040,18 +1064,16 @@ impl From<TagPayload> for TagInput {
             eng_hi: payload.eng_hi,
             unit: payload.unit,
             decimals: payload.decimals,
-            // しきい値は本 PR のスコープ外（この payload の doc comment
-            // 参照）。
-            threshold_h: None,
-            threshold_hh: None,
-            threshold_l: None,
-            threshold_ll: None,
+            threshold_h: payload.threshold_h,
+            threshold_hh: payload.threshold_hh,
+            threshold_l: payload.threshold_l,
+            threshold_ll: payload.threshold_ll,
             enabled: payload.enabled,
             writable: false,
             tag_kind: "plc".to_string(),
             expression: None,
             retain: false,
-            expected_revision: None,
+            expected_revision: payload.expected_revision,
         }
     }
 }
@@ -1388,12 +1410,48 @@ async fn tags_create(
     Ok(Json(created))
 }
 
+/// `PUT /api/tags/{id}` の失敗。版の食い違い（楽観ロック）だけ `409 Conflict`
+/// にし、本文は他の検証エラーと同じ `ErrorBody` 形（画面が同じ処理で読める）。
+enum TagUpdateRejection {
+    Api(ApiError),
+    RevisionConflict(BantoError),
+}
+
+impl From<BantoError> for TagUpdateRejection {
+    fn from(err: BantoError) -> Self {
+        if is_revision_conflict(&err) {
+            Self::RevisionConflict(err)
+        } else {
+            Self::Api(ApiError(err))
+        }
+    }
+}
+
+impl From<ApiError> for TagUpdateRejection {
+    fn from(err: ApiError) -> Self {
+        Self::Api(err)
+    }
+}
+
+impl IntoResponse for TagUpdateRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(err) => err.into_response(),
+            Self::RevisionConflict(err) => (
+                StatusCode::CONFLICT,
+                Json(banto_core::ErrorBody::from(&err)),
+            )
+                .into_response(),
+        }
+    }
+}
+
 async fn tags_update(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<TagPayload>,
-) -> Result<Json<Tag>, ApiError> {
+) -> Result<Json<Tag>, TagUpdateRejection> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -1416,7 +1474,7 @@ async fn tags_update(
         },
     )
     .await?;
-    let updated = state.tags.update(id, input.into()).await?;
+    let updated = update_tag_checked(&state.tags, id, input.into()).await?;
     record_write(
         &state.audit,
         &state.auth,
@@ -4267,6 +4325,170 @@ mod tests {
     }
 
     // --- #413: 接続単位シミュレーション -------------------------------------
+
+    /// **#525**: タグのしきい値と楽観ロックが REST を通る。
+    /// (1) しきい値を付けて作成・更新でき、読み直しても残る
+    /// (2) 大小関係が崩れた組は `field_errors`（`thresholdH` など）で拒否される
+    /// (3) 古い `expectedRevision` の更新は `409` で拒否され、保存は変わらない
+    /// (4) しきい値を省略した更新は置換（消える）= banto-hub の `PUT` と同じ。
+    ///
+    /// 反証: `From<TagPayload>` のしきい値・`expected_revision` を `None` に戻すと
+    /// (1)(3) が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_routes_carry_thresholds_and_enforce_the_expected_revision() {
+        let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
+        async fn send(
+            router: &Router,
+            request: HttpRequest<Body>,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = router.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+        let (_, conn) = send(
+            &router,
+            post_json_auth("/api/plc-connections", &editor, plc_connection_payload("p")),
+        )
+        .await;
+        let (_, group) = send(
+            &router,
+            post_json_auth(
+                "/api/collection-groups",
+                &editor,
+                json!({"name": "g", "plcConnectionId": conn["id"], "periodMs": 1000, "enabled": true}),
+            ),
+        )
+        .await;
+        let tag_body = |extra: serde_json::Value| {
+            let mut body = json!({
+                "name": "t",
+                "collectionGroupId": group["id"],
+                "address": "40001",
+                "dataType": "i16",
+                "decimals": 0,
+                "enabled": true
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            body
+        };
+
+        // (1) しきい値つきで作成できる。
+        let (status, created) = send(
+            &router,
+            post_json_auth(
+                "/api/tags",
+                &editor,
+                tag_body(json!({"thresholdLl": 1.0, "thresholdL": 2.0, "thresholdH": 8.0, "thresholdHh": 9.0})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["thresholdH"], 8.0);
+        assert_eq!(created["thresholdLl"], 1.0);
+        let id = created["id"].as_i64().unwrap();
+        let path = format!("/api/tags/{id}");
+        let revision = created["revision"].as_i64().unwrap();
+
+        // (2) 大小関係が崩れた更新は拒否され、保存は変わらない。
+        let (status, body) = send(
+            &router,
+            put_json_auth(
+                &path,
+                &editor,
+                tag_body(
+                    json!({"thresholdL": 5.0, "thresholdH": 3.0, "expectedRevision": revision}),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["kind"], "validation", "{body}");
+        let fields: Vec<&str> = body["field_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fe| fe["field"].as_str().unwrap())
+            .collect();
+        assert!(
+            fields.iter().any(|f| f.starts_with("threshold")),
+            "しきい値のフィールドエラーが無い: {body}"
+        );
+
+        // しきい値を変えて更新（版は進む）。
+        let (status, updated) = send(
+            &router,
+            put_json_auth(
+                &path,
+                &editor,
+                tag_body(json!({"thresholdLl": 1.0, "thresholdL": 2.0, "thresholdH": 7.0, "thresholdHh": 9.0, "expectedRevision": revision})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["thresholdH"], 7.0);
+        let new_revision = updated["revision"].as_i64().unwrap();
+        assert!(new_revision > revision);
+        let (_, reread) = send(&router, get_auth(&path, &editor)).await;
+        assert_eq!(reread["thresholdH"], 7.0, "読み直してもしきい値が残る");
+
+        // (3) 古い版での更新は 409。保存は変わらない。
+        let (status, body) = send(
+            &router,
+            put_json_auth(
+                &path,
+                &editor,
+                tag_body(json!({"thresholdH": 8.5, "expectedRevision": revision})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["kind"], "validation", "{body}");
+        assert_eq!(
+            body["field_errors"][0]["field"], "expectedRevision",
+            "{body}"
+        );
+        let (_, reread) = send(&router, get_auth(&path, &editor)).await;
+        assert_eq!(reread["thresholdH"], 7.0, "拒否された更新が保存された");
+        assert_eq!(reread["revision"], new_revision);
+
+        // 存在しない id は（版を付けても）409 ではなく 404。
+        let (status, body) = send(
+            &router,
+            put_json_auth(
+                "/api/tags/999999",
+                &editor,
+                tag_body(json!({"expectedRevision": 1})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // (4) 省略した更新は置換: しきい値が消える（版を付けない呼び出し）。
+        let (status, cleared) =
+            send(&router, put_json_auth(&path, &editor, tag_body(json!({})))).await;
+        assert_eq!(status, StatusCode::OK, "{cleared}");
+        assert!(cleared["thresholdH"].is_null(), "{cleared}");
+
+        // 削除済みのタグへの古い版の更新は 404（409 や 500 ではない）。
+        let deleted = router
+            .clone()
+            .oneshot(delete_auth(&path, &editor))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let (status, body) = send(
+            &router,
+            put_json_auth(
+                &path,
+                &editor,
+                tag_body(json!({"expectedRevision": revision})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
 
     /// **作成で送らない = `false`**（既存クライアントの挙動は #413 の前と同じ）。
     /// 送れば素通しで `PlcConnectionInput` に届く。
