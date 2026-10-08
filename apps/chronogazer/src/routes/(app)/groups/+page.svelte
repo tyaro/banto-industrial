@@ -125,7 +125,8 @@
 
 	// #532: しきい値は記録計の側の設定（`/api/tag-thresholds`）から読む（読み取り
 	// 専用の表示）。タグの一覧とは別に読み、読めなかったことは「しきい値なし」と
-	// 区別して出す（`penThresholdText`）。前に読めた値は消さない。
+	// 区別して出す（`penThresholdText`）。読み直しに失敗したら前の値は捨てる（古い
+	// しきい値を今の設定のように見せない。監視画面の `applyTagMetaLoad` と同じ）。
 	let thresholdsByTag = $state<Map<number, TagThresholds> | null>(null);
 	let thresholdsError = $state<string | null>(null);
 
@@ -135,6 +136,7 @@
 			thresholdsByTag = new Map(rows.map((row) => [row.tagId, row]));
 			thresholdsError = null;
 		} catch (err) {
+			thresholdsByTag = null;
 			thresholdsError = errorMessage(err);
 		}
 	}

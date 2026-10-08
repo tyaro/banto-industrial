@@ -36,7 +36,12 @@
 import { qualityLabel, type CurrentSampleView } from '../banto/collectAdmin';
 import type { DisplayGroup, DisplayKind } from '../banto/displayGroupsAdmin';
 import type { CollectionGroup, Tag } from '../banto/tagRegistryAdmin';
-import type { TagWithThresholds, ThresholdFields } from '../banto/tagThresholdsAdmin';
+import {
+	withThresholds,
+	type TagThresholds as TagThresholdRow,
+	type TagWithThresholds,
+	type ThresholdFields
+} from '../banto/tagThresholdsAdmin';
 
 // --- グループの並びと選択 ----------------------------------------------------
 
@@ -388,4 +393,80 @@ export function valuesStaleNote(
 ): string {
 	if (lastOkAt === null) return '現在値を取得できていません（まだ一度も取得できていません）。';
 	return `現在値を取得できていません。下の表示は${timeLabel(lastOkAt)}に取得したもので、最新ではありません。`;
+}
+
+// --- タグ情報としきい値の読み込み（#532 のレビュー P2） ---------------------------
+
+/** 1 つの読み込みの結果（成功なら値、失敗なら理由の文字列）。 */
+export type LoadResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
+/**
+ * 監視画面が持つタグ情報としきい値。**2 つは別の失敗の軸**で、片方が読めなくても
+ * もう片方は使う（`Promise.all` で 1 つにまとめると、しきい値だけの失敗でタグの
+ * 名前・単位・小数桁まで捨ててしまう）。
+ */
+export interface TagMetaState {
+	tags: Tag[];
+	collectionGroups: CollectionGroup[];
+	/** 判定に使うしきい値。読めなかったときは空（= 判定しない）で、前の値を残さない。 */
+	thresholds: TagThresholdRow[];
+	tagsError: string | null;
+	thresholdsError: string | null;
+}
+
+export const INITIAL_TAG_META: TagMetaState = {
+	tags: [],
+	collectionGroups: [],
+	thresholds: [],
+	tagsError: null,
+	thresholdsError: null
+};
+
+/**
+ * 読み込みの結果を状態に当てる（純関数）。
+ *
+ * - タグ情報（タグ + 収集グループ）: 読めたら置き換える。読めなかったら前に読めた
+ *   ものを残す（名前・単位・小数桁は古くても無いより正しい）。
+ * - しきい値: 読めたら置き換える。**読めなかったら空にする**（古いしきい値で色分け・
+ *   判定を続けると、設定を変えた後も古い判定を正しいように見せてしまう）。
+ */
+export function applyTagMetaLoad(
+	prev: TagMetaState,
+	meta: LoadResult<{ tags: Tag[]; collectionGroups: CollectionGroup[] }>,
+	thresholds: LoadResult<TagThresholdRow[]>
+): TagMetaState {
+	return {
+		tags: meta.ok ? meta.value.tags : prev.tags,
+		collectionGroups: meta.ok ? meta.value.collectionGroups : prev.collectionGroups,
+		tagsError: meta.ok ? null : meta.error,
+		thresholds: thresholds.ok ? thresholds.value : [],
+		thresholdsError: thresholds.ok ? null : thresholds.error
+	};
+}
+
+/** 判定・描画に使うタグ（しきい値を添えた形）。 */
+export function tagsForDisplay(state: TagMetaState): TagWithThresholds[] {
+	return withThresholds(state.tags, state.thresholds);
+}
+
+/**
+ * 読めなかったときの注記（純関数）。出す順に並べる。タグ情報は、まだ一度も読めて
+ * いなければ従来の文言、前に読めたものを使っているならそう書く。しきい値は別の
+ * 一文（色分け・判定をしていないことを言う）。
+ */
+export function tagMetaNotices(state: TagMetaState): string[] {
+	const notices: string[] = [];
+	if (state.tagsError !== null) {
+		notices.push(
+			state.tags.length === 0
+				? `タグの情報を読み込めませんでした（${state.tagsError}）。単位・小数桁・しきい値なしで表示しています。`
+				: `タグの情報を読み直せませんでした（${state.tagsError}）。前に読めたタグの情報で表示しています。`
+		);
+	}
+	if (state.thresholdsError !== null) {
+		notices.push(
+			`しきい値を読み込めませんでした（${state.thresholdsError}）。色分け・しきい値の判定なしで表示しています。`
+		);
+	}
+	return notices;
 }

@@ -22,9 +22,10 @@
 	 * なかった」「収集が動いていない」「現在値を取得できていない（いつの表示か）」を
 	 * 別々の表示にする。
 	 *
-	 * タグの単位・小数桁・しきい値は既存の `/api/tags` と `/api/collection-groups`
-	 * から読む（Q6。新しい API は足さない）。読めなくても値は出す（単位・しきい値
-	 * なしで出し、その旨を添える）。
+	 * タグの単位・小数桁は既存の `/api/tags` と `/api/collection-groups` から読む（Q6）。
+	 * しきい値は記録計の側の設定 `/api/tag-thresholds`（#532）から**別の失敗の軸**で読む
+	 * （`applyTagMetaLoad`）。どちらが読めなくても値は出し、読めなかったことを別々の
+	 * 注記で添える（しきい値が読めなければ前の値を使わず、色分け・判定をしない）。
 	 */
 	import { onDestroy, onMount, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
@@ -38,16 +39,18 @@
 		isTagRegistryAvailable,
 		listCollectionGroups,
 		listTags,
-		type CollectionGroup
+		type CollectionGroup,
+		type Tag
 	} from '#lib/banto/tagRegistryAdmin.js';
-	import {
-		listTagThresholds,
-		withThresholds,
-		type TagWithThresholds
-	} from '#lib/banto/tagThresholdsAdmin.js';
+	import { listTagThresholds } from '#lib/banto/tagThresholdsAdmin.js';
 	import { displayGroupCatalog } from '#lib/monitor/displayGroupCatalog.svelte.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
 	import {
+		INITIAL_TAG_META,
+		applyTagMetaLoad,
+		tagMetaNotices,
+		tagsForDisplay,
+		type LoadResult,
 		KIND_NOT_READY_MESSAGE,
 		groupPenViews,
 		isKindRendered,
@@ -111,25 +114,33 @@
 
 	// --- タグ情報（単位・小数桁・しきい値・収集周期） ---------------------------
 
-	// #532: しきい値はタグではなく記録計の側の設定から読み、タグに添える。読めな
-	// ければタグ情報と同じ扱い（`tagsError`）で、前に読めた値を消さない。
-	let tags = $state<TagWithThresholds[]>([]);
-	let collectionGroups = $state<CollectionGroup[]>([]);
-	let tagsError = $state<string | null>(null);
+	// #532: しきい値はタグではなく記録計の側の設定から読み、タグに添える。タグ情報と
+	// しきい値は**別の失敗の軸**（`applyTagMetaLoad`）: しきい値だけ読めなくてもタグの
+	// 名前・単位・小数桁は使い、しきい値は前の値を残さず「判定なし」にする。
+	let tagMeta = $state(INITIAL_TAG_META);
+	const tags = $derived(tagsForDisplay(tagMeta));
+	const collectionGroups = $derived(tagMeta.collectionGroups);
+	const tagMetaNoticeLines = $derived(tagMetaNotices(tagMeta));
+
+	function errorText(err: unknown): string {
+		return err instanceof Error ? err.message : String(err);
+	}
 
 	async function loadTagMeta(): Promise<void> {
-		try {
-			const [tagRows, groupRows, thresholdRows] = await Promise.all([
-				listTags(),
-				listCollectionGroups(),
-				listTagThresholds()
-			]);
-			tags = withThresholds(tagRows, thresholdRows);
-			collectionGroups = groupRows;
-			tagsError = null;
-		} catch (err) {
-			tagsError = err instanceof Error ? err.message : String(err);
-		}
+		const metaLoad: Promise<LoadResult<{ tags: Tag[]; collectionGroups: CollectionGroup[] }>> =
+			Promise.all([listTags(), listCollectionGroups()]).then(
+				([tagRows, groupRows]) => ({
+					ok: true as const,
+					value: { tags: tagRows, collectionGroups: groupRows }
+				}),
+				(err: unknown) => ({ ok: false as const, error: errorText(err) })
+			);
+		const thresholdsLoad = listTagThresholds().then(
+			(rows) => ({ ok: true as const, value: rows }),
+			(err: unknown) => ({ ok: false as const, error: errorText(err) })
+		);
+		const [meta, thresholds] = await Promise.all([metaLoad, thresholdsLoad]);
+		tagMeta = applyTagMetaLoad(tagMeta, meta, thresholds);
 	}
 
 	async function reload(): Promise<void> {
@@ -286,11 +297,9 @@
 						{/if}
 					</div>
 				{:else}
-					{#if tagsError !== null}
-						<p class="note warn" role="status">
-							タグの情報を読み込めませんでした（{tagsError}）。単位・小数桁・しきい値なしで表示しています。
-						</p>
-					{/if}
+					{#each tagMetaNoticeLines as notice (notice)}
+						<p class="note warn" role="status">{notice}</p>
+					{/each}
 					{#if poller.stale}
 						<p class="note warn" role="status">
 							{valuesStaleNote(values?.lastOkAt ?? null, collectTimeLabel)}
