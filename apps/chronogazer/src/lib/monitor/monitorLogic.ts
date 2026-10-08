@@ -368,9 +368,12 @@ export function groupPenViews(
 
 // --- 表示種別 ----------------------------------------------------------------
 
-/** 描ける種別（D-1 でデジタル、D-2 でバー・計器。トレンドは D-3 で足す）。 */
+/**
+ * 描ける種別（D-1 でデジタル、D-2 でバー・計器、D-3b でトレンド。§3.2 の 4 種が
+ * そろった）。サーバーが知らない種別を返したとき（版の食い違い）だけ `false`。
+ */
 export function isKindRendered(kind: DisplayKind): boolean {
-	return kind === 'digital' || kind === 'bar' || kind === 'gauge';
+	return kind === 'digital' || kind === 'bar' || kind === 'gauge' || kind === 'trend';
 }
 
 export const KIND_NOT_READY_MESSAGE = 'この表示種別は準備中です';

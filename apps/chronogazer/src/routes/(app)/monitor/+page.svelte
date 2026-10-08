@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * 監視画面（R1-D の D-1・D-2、docs/r1-plan.md）。ログイン後の既定ページ
+	 * 監視画面（R1-D の D-1・D-2・D-3b、docs/r1-plan.md）。ログイン後の既定ページ
 	 * （`routes/+page.ts`、`routes/login/+page.svelte`）。閲覧公開のセッションにも
 	 * 開いている（`navigation.ts` の `publicViewer: true`）。
 	 *
@@ -12,8 +12,13 @@
 	 *   先頭を出す）。コマンドパレットの「グループ: ◯◯ を表示」も同じ URL へ移る
 	 *   （`commands.ts` の `displayGroupCommands`。一覧は `displayGroupCatalog` で共有）。
 	 * - **デジタル表示**を描く。**バー・計器**は D-2 で足した（`BarPanel.svelte`・
-	 *   `GaugePanel.svelte`。レンジ・色の判断は `meterLogic.ts`）。トレンドは
-	 *   「この表示種別は準備中です」（D-3）。
+	 *   `GaugePanel.svelte`。レンジ・色の判断は `meterLogic.ts`）。**トレンド**は
+	 *   D-3b で足した（`TrendPanel.svelte`。格子・帯の判断は `trendLogic.ts`、
+	 *   バッファの持ち主は `trendFeed.svelte.ts`）。現在値は同じポーラーの結果を
+	 *   書き足し、初期窓だけ履歴（D-3a）を読む。履歴はグループ・時間窓・刻みが
+	 *   変わったときに読み直し、前の構成の応答は捨てる（グループをまたいで線を
+	 *   持ち越さない）。時間窓は端末ごと（Q4、localStorage）で、グループの定義には
+	 *   書かない。
 	 * - **現在値のポーリング**（`valuesPoller.svelte.ts`）。周期はグループのペンの
 	 *   収集周期の最短を 500ms〜5s に丸めたもの（2026-10-08 オーナー決定 Q1）。
 	 *   描かない種別・ペンが無いグループ・タブが隠れている間は止める。
@@ -66,6 +71,20 @@
 	import DigitalPanel from '#lib/monitor/DigitalPanel.svelte';
 	import BarPanel from '#lib/monitor/BarPanel.svelte';
 	import GaugePanel from '#lib/monitor/GaugePanel.svelte';
+	import TrendPanel from '#lib/monitor/TrendPanel.svelte';
+	import { TrendFeed } from '#lib/monitor/trendFeed.svelte.js';
+	import {
+		TREND_WINDOWS_SEC,
+		chooseStepMs,
+		groupDefaultWindowSec,
+		loadTrendWindowOverride,
+		resolveBandPen,
+		resolveTrendWindowSec,
+		saveTrendWindowOverride,
+		serverNowMs,
+		trendNotices,
+		trendPenInfos
+	} from '#lib/monitor/trendLogic.js';
 
 	const available = isTagRegistryAvailable();
 	const canEdit = $derived(canWriteResources(sessionStore.role) && !sessionStore.publicViewer);
@@ -187,6 +206,119 @@
 			: []
 	);
 
+	// --- トレンド（D-3b） ---------------------------------------------------------
+
+	const trendFeed = new TrendFeed();
+	/** トレンドの描画域の幅（px、`TrendPanel` が測る）。刻みを決めるのに使う。 */
+	let trendWidth = $state(0);
+	/**
+	 * この画面で選んだ時間窓（グループ ID → 秒。`null` = グループの既定）。無いグループは
+	 * localStorage の覚えを読む（Q4）。
+	 */
+	let windowChoice = $state<Record<number, number | null>>({});
+	/** しきい値の帯を出すペン（グループごと。グループを替えたら既定に戻る）。 */
+	let bandChoice = $state<{ groupId: number; tagId: number } | null>(null);
+
+	const trendTarget = $derived(pollTarget && pollTarget.kind === 'trend' ? pollTarget : null);
+	const trendWindowSec = $derived.by(() => {
+		if (!trendTarget) return groupDefaultWindowSec({});
+		const chosen = windowChoice[trendTarget.id];
+		const override =
+			chosen !== undefined ? chosen : loadTrendWindowOverride(deviceStorage(), trendTarget.id);
+		return resolveTrendWindowSec(trendTarget.attributes, override);
+	});
+	const trendPens = $derived(trendTarget ? trendPenInfos(trendTarget, tags) : []);
+	const bandTagId = $derived(
+		trendTarget
+			? resolveBandPen(
+					trendPens,
+					bandChoice && bandChoice.groupId === trendTarget.id ? bandChoice.tagId : null
+				)
+			: null
+	);
+	/** フィードが今のグループのものか（違えば前のグループの線を出さない）。 */
+	const trendFeedCurrent = $derived(
+		trendTarget !== null && trendFeed.groupId === trendTarget.id && trendFeed.buffer !== null
+	);
+	const trendRows = $derived(trendFeedCurrent ? (trendFeed.buffer?.rows ?? []) : []);
+	const trendNoticeLines = $derived.by(() => {
+		if (!trendFeedCurrent) return [];
+		const nameOf = (id: number) =>
+			trendPens.find((pen) => pen.tagId === id)?.name ?? `タグ ID ${id}`;
+		return trendNotices({
+			historyState: trendFeed.historyState,
+			unknownNames: trendFeed.unknownTagIds.map(nameOf),
+			simulationNames: trendFeed.simulationTagIds.map(nameOf)
+		});
+	});
+
+	function collectPeriodOf(tagId: number): number | null {
+		const tag = tags.find((t) => t.id === tagId);
+		const cg = tag ? collectionGroups.find((g) => g.id === tag.collectionGroupId) : undefined;
+		return cg && Number.isFinite(cg.periodMs) && cg.periodMs > 0 ? cg.periodMs : null;
+	}
+
+	/** 書き足し済みの現在値（同じ応答を 2 回書かない。成功のたびに新しいオブジェクト）。 */
+	let appliedValues: object | null = null;
+
+	$effect(() => {
+		const target = trendTarget;
+		const current = values;
+		const width = trendWidth;
+		const windowSec = trendWindowSec;
+		const period = periodMs;
+		const views = penViews;
+		untrack(() => {
+			if (target === null) {
+				trendFeed.reset();
+				appliedValues = null;
+				return;
+			}
+			// グループが替わったら、新しいグループの値が来る前でも前の線を捨てる。
+			if (trendFeed.groupId !== null && trendFeed.groupId !== target.id) {
+				trendFeed.reset();
+				appliedValues = null;
+			}
+			if (current === null || current.phase !== 'ready' || current.values === null || width <= 0)
+				return;
+			const now = serverNowMs(current.values, Date.now());
+			const penTagIds = target.pens.map((pen) => pen.tagId);
+			trendFeed.configure(
+				{
+					groupId: target.id,
+					windowMs: windowSec * 1000,
+					stepMs: chooseStepMs({
+						windowMs: windowSec * 1000,
+						widthPx: width,
+						pollPeriodMs: period ?? 1000,
+						tagCount: new Set(penTagIds).size
+					}),
+					penTagIds,
+					periodMsOf: collectPeriodOf
+				},
+				now
+			);
+			if (current.values !== appliedValues) {
+				appliedValues = current.values;
+				trendFeed.append(
+					now,
+					views.map((view) => view.value)
+				);
+			}
+		});
+	});
+
+	function onTrendWindowChange(sec: number): void {
+		if (!trendTarget) return;
+		const groupDefault = groupDefaultWindowSec(trendTarget.attributes);
+		saveTrendWindowOverride(deviceStorage(), trendTarget.id, sec, groupDefault);
+		windowChoice = { ...windowChoice, [trendTarget.id]: sec === groupDefault ? null : sec };
+	}
+
+	function onSelectBandPen(tagId: number): void {
+		if (trendTarget) bandChoice = { groupId: trendTarget.id, tagId };
+	}
+
 	function onVisibilityChange(): void {
 		pageVisible = document.visibilityState === 'visible';
 	}
@@ -200,6 +332,7 @@
 
 	onDestroy(() => {
 		poller.stop();
+		trendFeed.reset();
 		if (typeof document !== 'undefined') {
 			document.removeEventListener('visibilitychange', onVisibilityChange);
 		}
@@ -284,7 +417,7 @@
 						<p class="empty-hint">
 							「{kindLabel(
 								selectedGroup.kind
-							)}」の表示は準備中です。デジタル・バー・計器のグループは表示できます。
+							)}」の表示は準備中です。トレンド・デジタル・バー・計器のグループは表示できます。
 						</p>
 					</div>
 				{:else if selectedGroup.pens.length === 0}
@@ -318,6 +451,20 @@
 								{/if}
 							</p>
 						</div>
+					{:else if selectedGroup.kind === 'trend'}
+						<TrendPanel
+							group={selectedGroup}
+							pens={trendPens}
+							rows={trendRows}
+							windowSec={trendWindowSec}
+							windowOptions={TREND_WINDOWS_SEC}
+							onWindowChange={onTrendWindowChange}
+							{bandTagId}
+							{onSelectBandPen}
+							notices={trendNoticeLines}
+							historyLoading={trendFeedCurrent && trendFeed.historyState === 'loading'}
+							bind:width={trendWidth}
+						/>
 					{:else if selectedGroup.kind === 'bar'}
 						<BarPanel group={selectedGroup} pens={meters} timeLabel={collectTimeLabel} {tagsHref} />
 					{:else if selectedGroup.kind === 'gauge'}
