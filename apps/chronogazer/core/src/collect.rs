@@ -561,7 +561,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 mod history;
 pub use history::{
     parse_tag_ids, validate_history_request, CollectHistory, HistoryPoint, HistoryRequest,
-    HistorySeries, HISTORY_MAX_BINS, HISTORY_MAX_TAGS, HISTORY_MAX_WINDOW_MS, HISTORY_READ_TIMEOUT,
+    HistorySeries, HISTORY_MAX_BINS, HISTORY_MAX_POINTS, HISTORY_MAX_TAGS, HISTORY_MAX_WINDOW_MS,
+    HISTORY_READ_TIMEOUT,
 };
 
 /// 収集サービスの状態。**必要最小限の 5 つ**だけ（語彙を増やさない）。

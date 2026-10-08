@@ -283,6 +283,18 @@ export interface CollectHistory {
 export const HISTORY_MAX_TAGS = 8;
 /** 履歴 1 回で読める期間の幅の上限（ミリ秒、`HISTORY_MAX_WINDOW_MS`）。 */
 export const HISTORY_MAX_WINDOW_MS = 3_600_000;
+/**
+ * 系列 1 本あたりの `bins` の上限（`HISTORY_MAX_BINS`。返る点の数も系列ごとに
+ * これ以下）。描画の 1 ピクセルに 1 区間あれば山を落とさないので、描画幅に
+ * 合わせた値（`banto-tsquery` の内部の上限 20 万とは別）。
+ */
+export const HISTORY_MAX_BINS = 2000;
+/**
+ * 1 回の応答全体の予算: **タグの本数（重複を除く）× `bins`** の上限
+ * （`HISTORY_MAX_POINTS`）。8 ペンなら 1 本 1000 区間まで。超えると
+ * `validation`（`bins` の誤り）。
+ */
+export const HISTORY_MAX_POINTS = 8000;
 
 /** [`getCollectHistory`] の引数。期間は両端を含み、`fromMs < toMs`。 */
 export interface CollectHistoryParams {
@@ -478,7 +490,9 @@ export async function listCollectEvents(
  * - **`notRunning` は返らない**（収集が止まっていても過去の記録は読める）。
  *   `unavailable` はデータファイルか設定 DB を読めなかったとき（理由は
  *   返らない）。
- * - 上限（タグ 8 本・期間 1 時間・`bins`）を外れると `validation` のエラー。
+ * - 上限（タグ 8 本・期間 1 時間・`bins` ≤ [`HISTORY_MAX_BINS`]・
+ *   本数 × `bins` ≤ [`HISTORY_MAX_POINTS`]）を外れると `validation` のエラー。
+ *   系列の点の数は `bins` 以下（素通しの経路でもサーバーが畳む）。
  * - 収集の操作キューを通らない。直近 1 秒ほどはまだデータファイルに無い
  *   ことがある（書き手の flush 間隔）ので、以後は現在値のポーリングで足す。
  */

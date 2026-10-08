@@ -31,7 +31,19 @@
 //! * タグは **1〜[`HISTORY_MAX_TAGS`] 本**（重複は 1 本に数える）、
 //! * 期間は `fromMs < toMs` かつ **幅 [`HISTORY_MAX_WINDOW_MS`]（1 時間）以内**
 //!   （両端を含む。`banto-tsquery` の約束どおり）、
-//! * `bins` は **1〜[`HISTORY_MAX_BINS`]**（= `banto_tsquery::MAX_TARGET_BINS`）。
+//! * `bins` は **1〜[`HISTORY_MAX_BINS`]**（2000。グラフの幅に合わせた API の
+//!   上限で、`banto_tsquery::MAX_TARGET_BINS`（20 万、内部のメモリの安全弁）
+//!   とは別に決める）、
+//! * 応答全体の点の数の予算として **タグの本数 × `bins` ≤ [`HISTORY_MAX_POINTS`]**
+//!   （8000）。
+//!
+//! **返す点の数は、どの経路でも系列ごとに `bins` 以下**（[`fit_to_bins`]）。
+//! `banto-tsquery` は拡大しきったときの素通し（1 区間 1 サンプル程度）で最大
+//! `bins × 2` 行を返しうるので、その場合はここで `bins` 個の区間に寄せ直す。
+//! したがって 1 回の応答は最大 [`HISTORY_MAX_POINTS`] 点で、JSON に直す処理
+//! （[`HISTORY_READ_TIMEOUT`] の外で行われる）の大きさにも上限が付く。この口は
+//! 閲覧公開（ログインなしの閲覧者）にも開いているので、上限は「有効な要求で
+//! 作れる最大の応答」を基準に決めている（PR #536 のオーナーレビュー P1）。
 //!
 //! 外れたら `BantoError::Validation`（REST は 422）で、**ファイルには触らない**。
 //! 1 時間を超える期間は R2（ヒストリカル）で別に決める。
@@ -108,9 +120,26 @@ pub const HISTORY_MAX_TAGS: usize = 8;
 /// 初期窓（既定 10 分・選択可）を賄う幅。
 pub const HISTORY_MAX_WINDOW_MS: i64 = 3_600_000;
 
-/// `bins` の上限。`banto-tsquery` の上限をそのまま使う（ここで別の値を
-/// 決めると、どちらが効いているのか分からなくなる）。
-pub const HISTORY_MAX_BINS: usize = banto_tsquery::MAX_TARGET_BINS;
+/// 系列 1 本あたりの `bins` の上限（= 返す点の数の上限）。
+///
+/// **`banto_tsquery::MAX_TARGET_BINS`（20 万）を使わない**: あれはクエリ層の
+/// メモリの安全弁で、HTTP の口の上限としては大きすぎる（8 本 × 20 万で
+/// 160 万点の応答を、有効な要求で作れてしまった。PR #536 のオーナーレビュー P1）。
+///
+/// 2000 の根拠: 点は「1 区間の最小・最大」なので、**描画の 1 ピクセルに 1 区間**
+/// あれば山を落とさない。D-3b のトレンドの描画幅は画面幅以下（フル HD の全幅でも
+/// 2000px 未満）で、それ以上の点は LineChart の側で間引かれて見えない。
+/// 時間で言えば、窓 1 時間を 2000 区間に割ると 1.8 秒、既定の 10 分なら
+/// 0.3 秒で、1 秒周期の収集なら 10 分窓は全サンプルがそのまま入る。
+pub const HISTORY_MAX_BINS: usize = 2000;
+
+/// 1 回の応答全体の点の数の予算: **タグの本数（重複を除く）× `bins`** の上限。
+///
+/// 8000 = 8 ペン × 1000 区間 = 4 ペン × 2000 区間。1 点はおよそ 40 バイトの
+/// JSON なので応答は 320KB 程度で収まる。ペンが多いときは 1 本あたりの区間を
+/// 減らしてもらう（8 本のトレンドを 1000px で描けば 1 ピクセル 1 区間で足りる。
+/// 既定の 10 分窓なら 1000 区間 = 0.6 秒で、1 秒周期の全サンプルが入る）。
+pub const HISTORY_MAX_POINTS: usize = 8000;
 
 /// 1 回の読み出しの待ち時間の上限。過ぎたら [`Readout::Unavailable`]。
 ///
@@ -235,6 +264,20 @@ pub fn validate_history_request(
             "bins",
             format!("bins は 1〜{HISTORY_MAX_BINS} にしてください"),
         ));
+    } else if !unique.is_empty()
+        && unique.len() <= HISTORY_MAX_TAGS
+        && unique.len().saturating_mul(bins) > HISTORY_MAX_POINTS
+    {
+        // 本数と bins がそれぞれ上限内のときだけ見る（どちらかが外れていれば
+        // そちらの誤りで足りる）。直すのはどちらでもよいが、画面の側で
+        // 調整するのは bins なので、誤りは bins に付ける。
+        errors.push(field_error(
+            "bins",
+            format!(
+                "タグの本数 × bins は {HISTORY_MAX_POINTS} 以下にしてください（{} × {bins}）",
+                unique.len()
+            ),
+        ));
     }
 
     if errors.is_empty() {
@@ -340,6 +383,48 @@ fn points_for_column(range: &DecimatedRange, column: usize) -> Vec<HistoryPoint>
         .collect()
 }
 
+/// 系列の点を**必ず `bins` 個以下**にする（このモジュールの doc「上限」）。
+///
+/// `banto-tsquery` の区切った経路（`bins` 個以下）と、ファイルが無い・
+/// グループが無いときの欠測だけの経路（同じく `bins` 個以下）はそのまま通る。
+/// 超えるのは拡大しきったときの素通し（最大 `bins × 2` 行）だけで、そのときは
+/// `[from_ms, to_ms]` を幅 `ceil((to - from + 1) / bins)` の `bins` 個以下の
+/// 区間に割り直し、区間ごとに**最小の最小・最大の最大**へ畳む（値のある点が
+/// 無い区間は `null`。山を落とさない、の原則は保つ）。点の時刻は区間に
+/// 入った最初の点の時刻（サンプルの実際の時刻を残す）。戻り値の 2 つ目は
+/// 割り直したときの区間の幅（割り直さなければ `None`）。
+fn fit_to_bins(
+    points: Vec<HistoryPoint>,
+    from_ms: i64,
+    to_ms: i64,
+    bins: usize,
+) -> (Vec<HistoryPoint>, Option<i64>) {
+    if points.len() <= bins || bins == 0 {
+        return (points, None);
+    }
+    let width = i128::from(to_ms) - i128::from(from_ms) + 1;
+    let bins_i = bins as i128;
+    let bucket = (width + bins_i - 1) / bins_i;
+    let mut out: Vec<(i128, HistoryPoint)> = Vec::with_capacity(bins);
+    for point in points {
+        // 範囲外の点は来ない（`banto-tsquery` は両端を含む範囲だけ返す）が、
+        // 来ても端の区間に寄せて個数の約束を守る。
+        let offset = (i128::from(point.t_ms) - i128::from(from_ms)).clamp(0, width - 1);
+        let index = offset / bucket;
+        match out.last_mut() {
+            Some((last, merged)) if *last == index => {
+                if let (Some(min), Some(max)) = (point.min, point.max) {
+                    merged.min = Some(merged.min.map_or(min, |m| m.min(min)));
+                    merged.max = Some(merged.max.map_or(max, |m| m.max(max)));
+                }
+            }
+            _ => out.push((index, point)),
+        }
+    }
+    let bucket_ms = i64::try_from(bucket).unwrap_or(i64::MAX);
+    (out.into_iter().map(|(_, p)| p).collect(), Some(bucket_ms))
+}
+
 /// 読み出しが失敗した理由（ログ用。公開する形には載せない）。
 #[derive(Debug)]
 enum HistoryReadError {
@@ -392,7 +477,14 @@ async fn read_history(
             .await
             .map_err(HistoryReadError::Store)?;
         for (column, id) in ids.iter().enumerate() {
-            by_tag.insert(*id, (range.bin_ms, points_for_column(&range, column)));
+            let (points, refit_ms) = fit_to_bins(
+                points_for_column(&range, column),
+                request.from_ms,
+                request.to_ms,
+                request.bins,
+            );
+            let bin_ms = refit_ms.map_or(range.bin_ms, |ms| ms.max(range.bin_ms));
+            by_tag.insert(*id, (bin_ms, points));
         }
     }
 

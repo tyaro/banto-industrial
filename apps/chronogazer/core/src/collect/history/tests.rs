@@ -98,6 +98,84 @@ fn request_limits_accept_the_boundary_and_reject_one_beyond() {
     );
 }
 
+/// 応答全体の点の数の予算（タグの本数 × `bins` ≤ `HISTORY_MAX_POINTS`）と、
+/// 系列あたりの `bins` の上限（`HISTORY_MAX_BINS`）の境界。PR #536 の
+/// オーナーレビュー P1（`MAX_TARGET_BINS` を HTTP の上限にしていた）。
+///
+/// 反証: 予算の判定を外すと「8 本 × 1001」が通って落ちる。
+#[test]
+fn the_response_budget_accepts_the_boundary_and_rejects_one_beyond() {
+    let eight: Vec<i64> = (1..=8).collect();
+    let five: Vec<i64> = (1..=5).collect();
+    assert_eq!(HISTORY_MAX_BINS, 2000);
+    assert_eq!(HISTORY_MAX_POINTS, 8000);
+
+    // ちょうど予算（8 × 1000 = 5 × 1600 = 4 × 2000 = 8000）は通る。
+    validate_history_request(&eight, 0, 1, 1000).expect("8 × 1000 は通る");
+    validate_history_request(&five, 0, 1, 1600).expect("5 × 1600 は通る");
+    validate_history_request(&[1, 2, 3, 4], 0, 1, 2000).expect("4 × 2000 は通る");
+    // 重複は 1 本に数える（16 個並べても 8 本）。
+    let doubled: Vec<i64> = eight.iter().chain(eight.iter()).copied().collect();
+    validate_history_request(&doubled, 0, 1, 1000).expect("重複は数えない");
+
+    // 1 つでも超えたら bins の誤り。
+    assert_eq!(
+        field_names(validate_history_request(&eight, 0, 1, 1001).unwrap_err()),
+        vec!["bins"]
+    );
+    assert_eq!(
+        field_names(validate_history_request(&five, 0, 1, 1601).unwrap_err()),
+        vec!["bins"]
+    );
+    // 系列あたりの上限は本数に依らない。
+    assert_eq!(
+        field_names(validate_history_request(&[1], 0, 1, 2001).unwrap_err()),
+        vec!["bins"]
+    );
+    // 本数の誤りがあるときは予算の誤りを重ねない。
+    let nine: Vec<i64> = (1..=9).collect();
+    assert_eq!(
+        field_names(validate_history_request(&nine, 0, 1, 1000).unwrap_err()),
+        vec!["tagIds"]
+    );
+}
+
+/// 割り直し（`fit_to_bins`）: `bins` 以下ならそのまま、超えたら幅
+/// `ceil(width / bins)` の区間で最小の最小・最大の最大に畳む（null は値の
+/// ある点に負ける。区間が全部 null なら null）。
+#[test]
+fn points_beyond_bins_are_folded_into_envelopes() {
+    let p = |t_ms, v: Option<f64>| HistoryPoint {
+        t_ms,
+        min: v,
+        max: v,
+    };
+    let few = vec![p(0, Some(1.0)), p(5, None)];
+    assert_eq!(fit_to_bins(few.clone(), 0, 9, 2), (few, None));
+
+    // 幅 10ms を 2 区間（5ms ずつ）に。
+    let many = vec![
+        p(0, None),
+        p(1, Some(3.0)),
+        p(4, Some(-1.0)),
+        p(5, None),
+        p(9, None),
+    ];
+    let (folded, bin_ms) = fit_to_bins(many, 0, 9, 2);
+    assert_eq!(bin_ms, Some(5));
+    assert_eq!(
+        folded,
+        vec![
+            HistoryPoint {
+                t_ms: 0,
+                min: Some(-1.0),
+                max: Some(3.0)
+            },
+            p(5, None),
+        ]
+    );
+}
+
 #[test]
 fn tag_ids_are_parsed_from_a_comma_separated_list() {
     assert_eq!(parse_tag_ids("1,2, 3").unwrap(), vec![1, 2, 3]);
@@ -545,5 +623,112 @@ async fn history_does_not_wait_for_a_stuck_lifecycle_task() {
     gate.release.notify_one();
     let _ = starter.await.expect("start task");
     let _ = svc.stop().await;
+    pool.close().await;
+}
+
+/// **素通しの経路でも点は `bins` 以下**（PR #536 のオーナーレビュー P1）。
+/// `banto-tsquery` は区間の幅がグループの周期まで広がり、かつ行数が
+/// `bins × 2` 以下なら行をそのまま返す。記録された周期（1s）より密に行が
+/// ある（周期を縮めて収集し直した、など）と、`bins` を超える。
+///
+/// 0.5 秒おきに 120 行、`bins = 60` で読むと、`banto-tsquery` は 120 行を
+/// 素通しで返し、ここで 1 秒ずつ 60 区間に畳む（区間 j は 2j と 2j+1）。
+///
+/// 反証: `read_history` の `fit_to_bins` を外すと 120 点が返って落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_passthrough_is_folded_down_to_bins() {
+    let dir = TempDir::new();
+    let data_dir = dir.path().join("data");
+    let pool = init_db_memory().await.expect("init_db_memory");
+    let conn = connection(&pool, "real", false).await;
+    let grp = group(&pool, "A", conn, 1000).await;
+    let t = tag(&pool, "t", grp).await;
+
+    let clock = Arc::new(ManualClock::new(BASE_MS, OFFSET_MS));
+    let writer = TsWriter::open(
+        &data_dir,
+        StoreConfig {
+            groups: vec![group_config(grp, 1000, &[t])],
+        },
+        clock,
+    )
+    .await
+    .expect("writer を開ける");
+    for k in 0..120_i64 {
+        writer
+            .append(&format!("grp:{grp}"), BASE_MS + k * 500, &[Some(k as f64)])
+            .await
+            .expect("書ける");
+    }
+    writer.close().await.expect("writer を閉じる");
+
+    // 前提の確認: `banto-tsquery` 自体は 120 行を素通しで返す。
+    let raw = TsQuery::new(&data_dir)
+        .read_decimated(
+            &format!("grp:{grp}"),
+            &[format!("tag:{t}")],
+            BASE_MS,
+            BASE_MS + 59_999,
+            60,
+        )
+        .await
+        .expect("読める");
+    assert_eq!(raw.bins.len(), 120, "素通しの前提が崩れている");
+
+    let svc = CollectorService::new(pool.clone(), data_dir);
+    let request = validate_history_request(&[t], BASE_MS, BASE_MS + 59_999, 60).unwrap();
+    let Readout::Ready { data } = svc.history(&request).await else {
+        panic!("読めるはず");
+    };
+    let series = &data.series[0];
+    assert_eq!(series.points.len(), 60, "bins を超えて返している");
+    assert_eq!(series.bin_ms, 1000);
+    for (j, point) in series.points.iter().enumerate() {
+        let j = j as i64;
+        assert_eq!(point.t_ms, BASE_MS + j * 1000);
+        assert_eq!(point.min, Some((2 * j) as f64));
+        assert_eq!(point.max, Some((2 * j + 1) as f64));
+    }
+    pool.close().await;
+}
+
+/// **ファイルが無い（欠測だけの）経路でも点は `bins` 以下**。予算いっぱいの
+/// 要求（4 本 × 2000 区間 × 1 時間）で、どの系列も 2000 点以下。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gap_only_path_never_exceeds_bins_at_the_budget() {
+    let dir = TempDir::new();
+    let pool = init_db_memory().await.expect("init_db_memory");
+    let conn = connection(&pool, "real", false).await;
+    let grp = group(&pool, "A", conn, 100).await;
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        ids.push(tag(&pool, &format!("t{i}"), grp).await);
+    }
+    let svc = CollectorService::new(pool.clone(), dir.path().join("never-created"));
+    let request = validate_history_request(
+        &ids,
+        BASE_MS,
+        BASE_MS + HISTORY_MAX_WINDOW_MS,
+        HISTORY_MAX_BINS as u64,
+    )
+    .expect("予算ちょうどは通る");
+    let Readout::Ready { data } = svc.history(&request).await else {
+        panic!("読めるはず");
+    };
+    assert_eq!(data.series.len(), 4);
+    let total: usize = data.series.iter().map(|s| s.points.len()).sum();
+    assert!(total <= HISTORY_MAX_POINTS, "{total}");
+    for series in &data.series {
+        assert!(!series.points.is_empty());
+        assert!(
+            series.points.len() <= HISTORY_MAX_BINS,
+            "{} 点",
+            series.points.len()
+        );
+        assert!(series
+            .points
+            .iter()
+            .all(|p| p.min.is_none() && p.max.is_none()));
+    }
     pool.close().await;
 }

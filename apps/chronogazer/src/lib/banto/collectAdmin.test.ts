@@ -20,6 +20,9 @@ import {
 	COLLECT_UI_TIMEOUT_MS,
 	collectActionLabel,
 	collectHistoryQuery,
+	HISTORY_MAX_BINS,
+	HISTORY_MAX_POINTS,
+	HISTORY_MAX_TAGS,
 	collectConnectionsNote,
 	collectExclusions,
 	collectExclusionsHeadline,
@@ -491,5 +494,13 @@ describe('collectHistoryQuery（R1-D の D-3a）', () => {
 		expect(parsed.get('fromMs')).toBe('10');
 		expect(parsed.get('toMs')).toBe('5');
 		expect(parsed.get('bins')).toBe('0');
+	});
+});
+
+describe('履歴の上限（Rust の定数の写し）', () => {
+	it('HISTORY_MAX_BINS・HISTORY_MAX_POINTS が Rust と同じ値（8 ペンなら 1 本 1000 区間）', () => {
+		expect(HISTORY_MAX_BINS).toBe(2000);
+		expect(HISTORY_MAX_POINTS).toBe(8000);
+		expect(Math.floor(HISTORY_MAX_POINTS / HISTORY_MAX_TAGS)).toBe(1000);
 	});
 });
