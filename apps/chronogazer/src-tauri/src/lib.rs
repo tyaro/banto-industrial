@@ -32,9 +32,10 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
-    registry_exclusions, resolve_data_dir, CollectEventList, CollectOutcome, CollectorService,
-    CollectorStateView, ConnectionView, CurrentSampleView, EventPage, ExclusionView, Readout,
-    COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    registry_exclusions, resolve_data_dir, validate_history_request, CollectEventList,
+    CollectHistory, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
+    CurrentSampleView, EventPage, ExclusionView, Readout, COLLECT_AUDIT_RESOURCE,
+    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::{init_db, Db, InitDbError};
 // #393: 表示グループ。検証・保存は REST と同じ `DisplayGroupService`。
@@ -3701,6 +3702,41 @@ async fn collect_events_list(
     collect_events_list_body(&state, offset, limit, as_of_id).await
 }
 
+/// Body of [`collect_history`]（spec M14 split-function pattern）。
+/// 床を先に見る（未認証・権限不足なら検証の誤りより先に拒否する - REST の
+/// `RoleGuard` が先に効くのと同じ順）。
+async fn collect_history_body(
+    state: &AppState,
+    tag_ids: Vec<i64>,
+    from_ms: i64,
+    to_ms: i64,
+    bins: u64,
+) -> Result<Readout<CollectHistory>, BantoError> {
+    require_collect_reader(state).await?;
+    let request = validate_history_request(&tag_ids, from_ms, to_ms, bins)?;
+    Ok(state.collect.history(&request).await)
+}
+
+/// `GET`-ish command: タグごとの直近の履歴（R1-D の D-3a。間引いた最小・
+/// 最大）。**`viewer` 以上**、監査しない。`chronogazer_core::rest` の
+/// `GET /api/collect/history` と**同じ検証・同じメソッド**を通る双子。
+///
+/// **収集が止まっていても読める**（`notRunning` を返さない）。読めなかった
+/// ときは `unavailable` で、理由（ファイルのパスを含みうる）は返さない。
+/// 収集の操作キューは通らない。上限（タグ 8 本・期間 1 時間・`bins`）と
+/// 割り切り（タグを別グループへ移す前の区間は欠測、など）は
+/// `chronogazer_core::collect` の `history` モジュールの doc。
+#[tauri::command]
+async fn collect_history(
+    state: State<'_, AppState>,
+    tag_ids: Vec<i64>,
+    from_ms: i64,
+    to_ms: i64,
+    bins: u64,
+) -> Result<Readout<CollectHistory>, BantoError> {
+    collect_history_body(&state, tag_ids, from_ms, to_ms, bins).await
+}
+
 /// How long [`shutdown_app_state`] is allowed to take in total before the
 /// app gives up and exits anyway (#383 R1-C's prerequisite).
 ///
@@ -4360,6 +4396,7 @@ pub fn run() {
             collect_values,
             collect_connections,
             collect_events_list,
+            collect_history,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -5381,6 +5418,46 @@ mod tests {
         let page = events.data().expect("ready");
         assert!(page.rows.is_empty());
         assert_eq!(page.total_count, 0);
+    }
+
+    /// R1-D の D-3a: 履歴も**読み取りと同じ床**（`viewer` 以上・セッションが
+    /// 無ければ拒否）で、収集が走っていなくても `ready`。上限外は
+    /// `Validation`。`chronogazer_core::rest` の
+    /// `collect_history_is_viewer_readable_validated_and_ready_without_collection`
+    /// と対になる双子のテスト（系列の中身は `chronogazer_core` 側が固定）。
+    ///
+    /// 反証: `collect_history_body` の `require_collect_reader` を外すと
+    /// 未認証の `expect_err` が落ちる。`require_collect_editor` にすると viewer
+    /// の呼び出しが `Forbidden` で落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_history_is_viewer_readable_and_validated() {
+        let state = app_state().await;
+
+        collect_history_body(&state, vec![1], 0, 1000, 10)
+            .await
+            .expect_err("未認証で履歴が読めている");
+
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
+
+        let history = collect_history_body(&state, vec![42], 0, 60_000, 60)
+            .await
+            .expect("viewer は履歴を読めること");
+        let data = history.data().expect("走っていなくても ready");
+        assert!(data.series.is_empty());
+        assert_eq!(data.unknown_tag_ids, vec![42]);
+
+        let err = collect_history_body(&state, vec![1], 0, 3_600_001, 10)
+            .await
+            .expect_err("1 時間を超える期間は拒否する");
+        assert!(
+            matches!(err, BantoError::Validation { .. }),
+            "検証の誤りになっていない: {err:?}"
+        );
     }
 
     // --- #413: 接続単位シミュレーション -------------------------------------

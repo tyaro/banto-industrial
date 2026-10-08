@@ -556,6 +556,14 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+// R1-D の D-3a: 直近の履歴の読み出し（`GET /api/collect/history` /
+// `collect_history`）。操作キューを通らない読み出しで、本体は子モジュール。
+mod history;
+pub use history::{
+    parse_tag_ids, validate_history_request, CollectHistory, HistoryPoint, HistoryRequest,
+    HistorySeries, HISTORY_MAX_BINS, HISTORY_MAX_TAGS, HISTORY_MAX_WINDOW_MS, HISTORY_READ_TIMEOUT,
+};
+
 /// 収集サービスの状態。**必要最小限の 5 つ**だけ（語彙を増やさない）。
 ///
 /// * [`Self::Stopped`] - 止まっている（まだ一度も起動していない、または
