@@ -378,7 +378,12 @@ struct ValidatedTag {
 /// have been violated, at least one consecutive pair in the filtered
 /// sequence must be too (order violations cannot "hide" between two set
 /// values with only unset values between them).
-fn validate_thresholds(
+///
+/// `pub` since #532: ChronoGazer keeps its thresholds in its own recorder-side
+/// settings (not these columns) and validates them with this same ordering
+/// rule and the same `thresholdLl`/`thresholdL`/`thresholdH`/`thresholdHh`
+/// field names, so the two cannot drift apart while both exist.
+pub fn validate_thresholds(
     ll: Option<f64>,
     l: Option<f64>,
     h: Option<f64>,

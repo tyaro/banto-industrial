@@ -857,6 +857,7 @@ async fn record_group(
                                 &tag.key,
                                 old,
                                 v,
+                                tag.thresholds.limit_for(old),
                             ))
                             .await;
                     }
@@ -869,6 +870,7 @@ async fn record_group(
                                 &tag.key,
                                 level,
                                 v,
+                                tag.thresholds.limit_for(level),
                             ))
                             .await;
                     }
@@ -1218,6 +1220,127 @@ mod tests {
             health.record(false),
             Some(AppendTransition::Entered { streak: 1 }),
             "a fresh streak must be detected again, not suppressed by the earlier one"
+        );
+    }
+
+    /// #532: every `threshold_*` event carries the limit it was judged
+    /// against - on the live channel and in the `collect_events` row. A move
+    /// from H to HH clears H (limit = H's value) and enters HH (limit = HH's
+    /// value); leaving HH back to normal clears HH with HH's value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn threshold_events_record_the_limit_they_were_judged_against() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(T0_MS, 9 * 3_600_000));
+        let config = StoreConfig {
+            groups: vec![GroupConfig {
+                key: "g".to_string(),
+                name: "G".to_string(),
+                period_ms: 100,
+                tags: vec![TagColumn {
+                    key: "tag:1".to_string(),
+                    name: "T1".to_string(),
+                    data_type: "f32".to_string(),
+                    unit: None,
+                    decimals: 0,
+                }],
+            }],
+        };
+        let writer = Arc::new(
+            TsWriter::open(dir.path(), config, clock.clone())
+                .await
+                .expect("writer should open"),
+        );
+        let (_writer_tx, writer_rx) = watch::channel(writer);
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("sqlite memory pool");
+        crate::migrate(&pool).await.expect("collect_events");
+        let events = EventSink::new(pool.clone());
+        let mut live = events.subscribe();
+        let ctx = TaskContext {
+            writer_rx,
+            clock: clock.clone(),
+            current: CurrentValuesHandle::new(clock.clone()),
+            events,
+            status: Arc::new(RwLock::new(HashMap::new())),
+            backoff: BackoffConfig::default(),
+            simulation: false,
+            factory: default_client_factory(),
+        };
+        let group = GroupPlan {
+            key: "g".to_string(),
+            period: Duration::from_millis(100),
+            period_ms: 100,
+            requests: vec![],
+            tags: vec![tag_with(Thresholds {
+                hh: Some(100.0),
+                h: Some(80.0),
+                l: None,
+                ll: None,
+            })],
+        };
+        let mut threshold_state = vec![None];
+        let mut append_health = AppendHealth::default();
+
+        for (offset, value) in [(100, 50.0), (200, 85.0), (300, 105.0), (400, 50.0)] {
+            let reading = [ReadResult::Value(TagValue::F64(value))];
+            record_group(
+                &group,
+                Some(&reading),
+                T0_MS + offset,
+                &ctx,
+                "conn:1",
+                &mut threshold_state,
+                &mut append_health,
+            )
+            .await;
+        }
+
+        let mut seen = Vec::new();
+        while let Ok(evt) = live.try_recv() {
+            seen.push((evt.kind, evt.level, evt.value, evt.limit_value));
+        }
+        let expected = vec![
+            (
+                EventKind::ThresholdEntered,
+                Some(ThresholdLevel::H),
+                Some(85.0),
+                Some(80.0),
+            ),
+            (
+                EventKind::ThresholdCleared,
+                Some(ThresholdLevel::H),
+                Some(105.0),
+                Some(80.0),
+            ),
+            (
+                EventKind::ThresholdEntered,
+                Some(ThresholdLevel::Hh),
+                Some(105.0),
+                Some(100.0),
+            ),
+            (
+                EventKind::ThresholdCleared,
+                Some(ThresholdLevel::Hh),
+                Some(50.0),
+                Some(100.0),
+            ),
+        ];
+        assert_eq!(seen, expected);
+
+        let rows: Vec<(String, Option<String>, Option<f64>)> =
+            sqlx::query_as("SELECT kind, level, limit_value FROM collect_events ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("threshold_entered".into(), Some("H".into()), Some(80.0)),
+                ("threshold_cleared".into(), Some("H".into()), Some(80.0)),
+                ("threshold_entered".into(), Some("HH".into()), Some(100.0)),
+                ("threshold_cleared".into(), Some("HH".into()), Some(100.0)),
+            ]
         );
     }
 
