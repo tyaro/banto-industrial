@@ -3,7 +3,10 @@
 	import '../app.css';
 	import { bantoReady } from '#lib/banto/setup.js'; // initBanto() (+ EventProvider) をどのルートガードより先に完了させる
 	import { settings } from '#lib/settings.svelte.js';
-	import ToastHost from '#lib/components/ToastHost.svelte';
+	// トーストの表示は `@banto/ui` の ToastHost（banto #220 段階 3）。ストアは
+	// アプリ全体で 1 つ（`#lib/toast.svelte.ts`）。
+	import { ToastHost } from '@banto/ui';
+	import { toastStore } from '#lib/toast.svelte.js';
 	import { trackFirstNavigation } from '#lib/banto/navigationSettled.svelte.js';
 
 	let { children } = $props();
@@ -25,7 +28,7 @@
 	<p class="banto-splash">起動中…</p>
 {:then}
 	{@render children()}
-	<ToastHost />
+	<ToastHost store={toastStore} />
 {/await}
 
 <style>

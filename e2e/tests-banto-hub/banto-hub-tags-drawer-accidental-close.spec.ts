@@ -78,7 +78,7 @@ function watchNoDialog(page: Page): { shown: () => boolean; stop: () => void } {
  * ブロックされたことを知らせる `onBlockedClose` トースト（`notifyBlockedClose`、
  * `tags/+page.svelte`/`ConnectionDrawer.svelte`/`CollectionGroupDrawer.svelte`
  * 共通の文言）が出たことを確認し、その場で消しておく。トーストの `×`
- * （`ToastHost.svelte`）は Drawer の `×`（`aria-label="閉じる"`）と同じ
+ * （`@banto/ui` の `ToastHost`）は Drawer の `×`（`aria-label="閉じる"`）と同じ
  * アクセシブル名を持つため、`page.getByRole('status')` に限定して押す
  * - スコープしないと後続の操作で `名前 '閉じる'` ボタンが2つヒットし
  * strict mode 違反になる。

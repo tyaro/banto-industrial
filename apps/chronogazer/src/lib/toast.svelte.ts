@@ -1,31 +1,11 @@
 /**
- * Toast notification store (Svelte 5 runes). Wired as the admin-core
- * `Notifier` in src/lib/banto/setup.ts, so success/error/info messages from
- * the list/form composables (spec §3.4) surface here via `ToastHost`.
+ * The app's toast store (banto #220 phase 3, 2026-10-08): one `@banto/ui`
+ * store (`createToastStore()`, banto ADR-0018 §8 phase 2c) shared by
+ * `@banto/ui`'s `ToastHost` (mounted in routes/+layout.svelte) and every
+ * caller. Wired as the admin-core `Notifier` in src/lib/banto/setup.ts, so
+ * success/error/info messages from the list/form composables (spec §3.4)
+ * surface here. Auto-dismiss stays at the package default (4000ms).
  */
-import type { NotificationKind } from '@banto/admin-core';
+import { createToastStore } from '@banto/ui';
 
-export interface Toast {
-	id: number;
-	kind: NotificationKind;
-	message: string;
-}
-
-const AUTO_DISMISS_MS = 4000;
-
-class ToastStore {
-	toasts: Toast[] = $state([]);
-	#nextId = 1;
-
-	push(kind: NotificationKind, message: string): void {
-		const id = this.#nextId++;
-		this.toasts = [...this.toasts, { id, kind, message }];
-		setTimeout(() => this.dismiss(id), AUTO_DISMISS_MS);
-	}
-
-	dismiss(id: number): void {
-		this.toasts = this.toasts.filter((toast) => toast.id !== id);
-	}
-}
-
-export const toastStore = new ToastStore();
+export const toastStore = createToastStore();
