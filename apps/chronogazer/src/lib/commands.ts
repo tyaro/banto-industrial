@@ -17,7 +17,8 @@ import { goto } from '$app/navigation';
 import type { PaletteCommand } from '@banto/admin-core';
 import { logoutAndLeave } from './banto/logout.svelte';
 import { notifyLogoutOutcome } from './banto/logoutNotice';
-import { navItems, publicNavItems, resolveAppPath } from './navigation';
+import { monitorGroupHref, navItems, publicNavItems, resolveAppPath } from './navigation';
+import type { DisplayGroup } from './banto/displayGroupsAdmin';
 import { settings } from './settings.svelte';
 import { sessionStore } from './session.svelte';
 import { isAdmin } from './permissions';
@@ -113,9 +114,40 @@ function sessionCommands(): PaletteCommand[] {
 	];
 }
 
-/** All palette commands, in a fixed order (navigation, then theme, then session) - `searchCommands` re-sorts/filters this for display. */
-export function buildCommands(): PaletteCommand[] {
-	return [...navigationCommands(), ...themeCommands(), ...sessionCommands()];
+/**
+ * 表示グループの切り替え（R1-D、recorder-requirements.md §3.2「グループ切替は
+ * タブ or コマンドパレット」）。グループ 1 つにつき 1 件で、監視画面の
+ * `?group=<id>` へ移る。監視画面は閲覧公開のセッションにも開いているので、
+ * 表示の条件は付けない（一覧を読めるのは viewer 以上で、閲覧公開も viewer）。
+ */
+export function displayGroupCommands(
+	groups: readonly Pick<DisplayGroup, 'id' | 'name'>[]
+): PaletteCommand[] {
+	return groups.map((group) => ({
+		id: `monitor.group.${group.id}`,
+		title: `グループ: ${group.name} を表示`,
+		group: 'グループ',
+		keywords: ['group', 'monitor', '監視', '表示グループ', group.name],
+		run: () => {
+			void goto(monitorGroupHref(group.id));
+		}
+	}));
+}
+
+/**
+ * All palette commands, in a fixed order (navigation, display groups, then
+ * theme, then session) - `searchCommands` re-sorts/filters this for display.
+ * `groups` は表示の並びの表示グループ（R1-D。省略 = グループのコマンドなし）。
+ */
+export function buildCommands(
+	groups: readonly Pick<DisplayGroup, 'id' | 'name'>[] = []
+): PaletteCommand[] {
+	return [
+		...navigationCommands(),
+		...displayGroupCommands(groups),
+		...themeCommands(),
+		...sessionCommands()
+	];
 }
 
 // --- Recency (localStorage) -------------------------------------------------

@@ -99,6 +99,11 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 			await expect(navLink(page, label)).toHaveCount(0);
 		}
 		await expect(page.getByRole('navigation').getByRole('link')).toHaveCount(ALLOWED.length);
+		// R1-D: 監視画面の本体（表示グループの一覧の読み取り）まで閲覧者として届く。
+		// 一覧の取得に失敗すると「読み込めませんでした」になり、この空状態は出ない。
+		// 編集者向けのグループ設定へのリンクは、本文にも（サイドバーと同じく）出さない。
+		await expect(page.getByText('表示グループが未設定です')).toBeVisible();
+		await expect(page.getByRole('link', { name: 'グループ設定' })).toHaveCount(0);
 	});
 
 	test('4. "ログイン" leads to the setup screen; signing in switches to a normal session', async () => {

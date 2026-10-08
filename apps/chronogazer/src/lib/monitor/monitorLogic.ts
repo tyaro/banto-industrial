@@ -1,0 +1,350 @@
+/**
+ * 監視画面（`/monitor`、R1-D）の判断をまとめた純関数（`monitorLogic.test.ts` が
+ * 表で固定する）。画面・パネル・ポーラーはここを呼ぶだけで、判断を書き写さない
+ * （docs/implementation-checklist.md §5「判断は純関数に出して、状態の総当たりを
+ * 表でテストする」）。
+ *
+ * ## 値の表示（2026-10-08 オーナー決定 Q2、docs/r1-plan.md の R1-D）
+ *
+ * - **null を 0 と区別する**（#414 段階2 の決定）。値が無いときは数値を出さず
+ *   「—」にする。`0` は `0` として出す（`value ?? 0` のような潰し方をしない）。
+ * - 品質 `invalid`（開始時に設定が不正で外したタグ）は「設定不正（収集対象外）」
+ *   で、直す場所（`/tags`）へ案内する。通信エラーの `bad` と混ぜない
+ *   （`collectAdmin.ts` の `qualityLabel`）。
+ * - 現在値の表にキーが無いタグは「未収集（無効、または収集の再起動で反映）」。
+ *   無効にしたタグ・収集を始めた後に足したタグがここに来る。
+ * - **`bad` / `stale` では最後の値を出さない**。「—」と、最後に受け取った時刻を
+ *   小さく添える（古い値が今の値に見えないように）。
+ *
+ * ## しきい値（Q5）
+ *
+ * タグに**今登録されている**しきい値で、画面側で判定する。判定の向きと優先順位は
+ * 収集のしきい値イベント（`crates/banto-collect/src/task.rs` の
+ * `classify_threshold`）と同じ: 上側が下側より優先、HH/LL が H/L より優先、
+ * 上側は `>=`、下側は `<=`。色だけで伝えない（パネルは文言も出す）。
+ *
+ * ## ポーリング周期（Q1）
+ *
+ * REST / Tauri のポーリングのまま（SSE にしない）。周期は、表示しているグループの
+ * ペンのタグが属する収集グループの**最短の収集周期**を 500ms〜5s に丸めたもの。
+ */
+import { qualityLabel, type CurrentSampleView } from '../banto/collectAdmin';
+import type { DisplayGroup, DisplayKind } from '../banto/displayGroupsAdmin';
+import type { CollectionGroup, Tag } from '../banto/tagRegistryAdmin';
+
+// --- グループの並びと選択 ----------------------------------------------------
+
+/** 表示の並び（`sortOrder` 昇順、同じなら ID 昇順）。元の配列は変えない。 */
+export function sortDisplayGroups(groups: readonly DisplayGroup[]): DisplayGroup[] {
+	return [...groups].sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+}
+
+/** URL の `?group=` の値を ID に読む。数字でなければ `null`。 */
+export function parseGroupParam(raw: string | null): number | null {
+	if (raw === null || !/^\d+$/.test(raw)) return null;
+	const id = Number(raw);
+	return Number.isSafeInteger(id) ? id : null;
+}
+
+/** 表示するグループの選び方の結果。 */
+export interface GroupSelection {
+	/** 表示するグループの ID（グループが 1 つも無ければ `null`）。 */
+	id: number | null;
+	/**
+	 * URL で指定されたグループが見つからなかった（消された・ID の書き間違い）。
+	 * 黙って別のグループを出すと、指定どおりに見えてしまうので画面が断る。
+	 */
+	missingRequested: number | null;
+}
+
+/**
+ * 表示するグループを決める（純関数）。優先順位は URL（`?group=`）→ この端末で
+ * 最後に見たグループ → 並びの先頭。どれも一覧に無いものは採らない。
+ */
+export function selectGroup(
+	sorted: readonly DisplayGroup[],
+	requested: number | null,
+	remembered: number | null
+): GroupSelection {
+	const exists = (id: number | null): id is number =>
+		id !== null && sorted.some((group) => group.id === id);
+	if (exists(requested)) return { id: requested, missingRequested: null };
+	const missingRequested = requested;
+	if (exists(remembered)) return { id: remembered, missingRequested };
+	return { id: sorted[0]?.id ?? null, missingRequested };
+}
+
+// --- 端末ごとの「最後に見たグループ」（localStorage） -------------------------
+
+export const LAST_GROUP_STORAGE_KEY = 'chronogazer.monitor.lastGroup';
+
+/** 端末に覚えた最後のグループ。ストレージが使えない・壊れていれば `null`。 */
+export function loadLastGroup(storage: Pick<Storage, 'getItem'> | undefined): number | null {
+	if (!storage) return null;
+	try {
+		return parseGroupParam(storage.getItem(LAST_GROUP_STORAGE_KEY));
+	} catch {
+		return null;
+	}
+}
+
+/** 覚える（ベストエフォート。満杯・無効なストレージでも画面を止めない）。 */
+export function saveLastGroup(storage: Pick<Storage, 'setItem'> | undefined, id: number): void {
+	if (!storage) return;
+	try {
+		storage.setItem(LAST_GROUP_STORAGE_KEY, String(id));
+	} catch {
+		// 端末の便利機能なので、失敗しても表示は続ける。
+	}
+}
+
+// --- ポーリング周期 ----------------------------------------------------------
+
+export const MONITOR_POLL_MIN_MS = 500;
+export const MONITOR_POLL_MAX_MS = 5000;
+/** 周期を決められない（タグ・収集グループを読めていない、ペンが無い）ときの周期。 */
+export const MONITOR_POLL_DEFAULT_MS = 1000;
+
+/**
+ * グループのペンの収集周期の最短を 500ms〜5s に丸める（純関数）。周期が 1 つも
+ * 分からなければ [`MONITOR_POLL_DEFAULT_MS`]。
+ */
+export function pollPeriodMs(
+	group: Pick<DisplayGroup, 'pens'>,
+	tags: readonly Pick<Tag, 'id' | 'collectionGroupId'>[],
+	collectionGroups: readonly Pick<CollectionGroup, 'id' | 'periodMs'>[]
+): number {
+	const periods: number[] = [];
+	for (const pen of group.pens) {
+		const tag = tags.find((t) => t.id === pen.tagId);
+		if (!tag) continue;
+		const cg = collectionGroups.find((g) => g.id === tag.collectionGroupId);
+		if (cg && Number.isFinite(cg.periodMs) && cg.periodMs > 0) periods.push(cg.periodMs);
+	}
+	if (periods.length === 0) return MONITOR_POLL_DEFAULT_MS;
+	return Math.min(MONITOR_POLL_MAX_MS, Math.max(MONITOR_POLL_MIN_MS, Math.min(...periods)));
+}
+
+// --- ペン 1 本の表示 ---------------------------------------------------------
+
+/**
+ * ペンの値の状態。`uncollected` = 現在値の表にキーが無い（無効なタグ・収集を
+ * 始めた後に足したタグ）。品質の 4 つとは別の 5 つ目。
+ */
+export type PenState = 'good' | 'bad' | 'stale' | 'invalid' | 'uncollected';
+
+/** しきい値の判定。`none` = 判定しない（しきい値が無い・値が無い）。 */
+export type ThresholdLevel = 'HH' | 'H' | 'normal' | 'L' | 'LL' | 'none';
+
+/** パネルに渡すペン 1 本の表示（パネルは判断せず、これを描くだけ）。 */
+export interface PenView {
+	tagId: number;
+	/** タグ名（タグ情報が読めていなければ「タグ ID n」）。 */
+	name: string;
+	/** 大きく出す文字列。値が無ければ「—」（0 にしない）。 */
+	display: string;
+	unit: string | null;
+	state: PenState;
+	/** 状態の文言（品質のラベル、または未収集の説明）。 */
+	stateLabel: string;
+	level: ThresholdLevel;
+	/** しきい値の文言（`none` のときは `null`）。色だけで伝えないための文字。 */
+	levelLabel: string | null;
+	/**
+	 * 最後に受け取った時刻（`bad` / `stale` で添える、epoch ミリ秒）。それ以外・
+	 * 時刻が無いときは `null`。
+	 */
+	lastReceivedMs: number | null;
+	/** 直す場所へのリンクを出すか（`invalid` = 設定不正）。 */
+	linkToTags: boolean;
+	/** banto チャートの系列色の枠（1..8）。 */
+	colorSlot: number;
+}
+
+/** 値が無いときの表示（0 と区別する）。 */
+export const NO_VALUE = '—';
+
+export const UNCOLLECTED_LABEL = '未収集（無効、または収集の再起動で反映）';
+/** 品質は `good` なのに値が無い（サーバーは返さない約束だが、来たら 0 にしない）。 */
+export const GOOD_WITHOUT_VALUE_LABEL = '値なし';
+
+/**
+ * 数値の表示（純関数）。小数桁はタグの `decimals`（0..15 に丸める）。`-0` は
+ * `0` と出す。
+ */
+export function formatValue(value: number, decimals: number): string {
+	const digits = Number.isInteger(decimals) ? Math.min(15, Math.max(0, decimals)) : 0;
+	const text = value.toFixed(digits);
+	return Number(text) === 0 ? (0).toFixed(digits) : text;
+}
+
+type TagThresholds = Pick<Tag, 'thresholdH' | 'thresholdHh' | 'thresholdL' | 'thresholdLl'>;
+
+/**
+ * しきい値の判定（純関数）。`classify_threshold`（収集のしきい値イベント）と同じ
+ * 向き・優先順位。しきい値が 1 つも無ければ `none`、あって当たらなければ `normal`。
+ */
+export function thresholdLevel(
+	value: number | null,
+	tag: TagThresholds | undefined
+): ThresholdLevel {
+	if (value === null || !tag) return 'none';
+	const { thresholdHh: hh, thresholdH: h, thresholdLl: ll, thresholdL: l } = tag;
+	if (hh == null && h == null && ll == null && l == null) return 'none';
+	if (hh != null && value >= hh) return 'HH';
+	if (h != null && value >= h) return 'H';
+	if (ll != null && value <= ll) return 'LL';
+	if (l != null && value <= l) return 'L';
+	return 'normal';
+}
+
+/** しきい値の文言（色だけで伝えないための文字）。 */
+export function thresholdLevelLabel(level: ThresholdLevel): string | null {
+	switch (level) {
+		case 'HH':
+			return 'HH 上上限以上';
+		case 'H':
+			return 'H 上限以上';
+		case 'L':
+			return 'L 下限以下';
+		case 'LL':
+			return 'LL 下下限以下';
+		case 'normal':
+			return '範囲内';
+		case 'none':
+			return null;
+	}
+}
+
+/**
+ * ペン 1 本の表示を作る（純関数）。
+ *
+ * @param sample 現在値の表の該当エントリ（キーが無ければ `undefined` = 未収集）。
+ * @param tag タグ定義（読めていなければ `undefined`。値は出すが単位・小数桁・
+ *   しきい値は使えない）。
+ */
+export function penView(
+	pen: { tagId: number; colorSlot: number | null },
+	index: number,
+	sample: CurrentSampleView | undefined,
+	tag: (Pick<Tag, 'name' | 'unit' | 'decimals'> & TagThresholds) | undefined
+): PenView {
+	const base = {
+		tagId: pen.tagId,
+		name: tag?.name ?? `タグ ID ${pen.tagId}`,
+		unit: tag?.unit ? tag.unit : null,
+		colorSlot: pen.colorSlot ?? index + 1
+	};
+	if (sample === undefined) {
+		return {
+			...base,
+			display: NO_VALUE,
+			state: 'uncollected',
+			stateLabel: UNCOLLECTED_LABEL,
+			level: 'none',
+			levelLabel: null,
+			lastReceivedMs: null,
+			linkToTags: false
+		};
+	}
+	switch (sample.quality) {
+		case 'invalid':
+			return {
+				...base,
+				display: NO_VALUE,
+				state: 'invalid',
+				stateLabel: qualityLabel('invalid'),
+				level: 'none',
+				levelLabel: null,
+				lastReceivedMs: null,
+				linkToTags: true
+			};
+		case 'bad':
+		case 'stale':
+			// 最後の値は出さない（Q2）。時刻だけ添える。
+			return {
+				...base,
+				display: NO_VALUE,
+				state: sample.quality,
+				stateLabel: qualityLabel(sample.quality),
+				level: 'none',
+				levelLabel: null,
+				lastReceivedMs: sample.ptimeMs,
+				linkToTags: false
+			};
+		case 'good': {
+			if (sample.value === null) {
+				return {
+					...base,
+					display: NO_VALUE,
+					state: 'bad',
+					stateLabel: GOOD_WITHOUT_VALUE_LABEL,
+					level: 'none',
+					levelLabel: null,
+					lastReceivedMs: sample.ptimeMs,
+					linkToTags: false
+				};
+			}
+			const level = thresholdLevel(sample.value, tag);
+			return {
+				...base,
+				display: tag ? formatValue(sample.value, tag.decimals) : String(sample.value),
+				state: 'good',
+				stateLabel: qualityLabel('good'),
+				level,
+				levelLabel: thresholdLevelLabel(level),
+				lastReceivedMs: null,
+				linkToTags: false
+			};
+		}
+	}
+}
+
+/**
+ * グループの全ペンの表示（純関数）。`values` が `null`（まだ読めていない・
+ * 収集が動いていない）なら空配列 - 画面はその場合パネルではなく状態の説明を出す。
+ */
+export function groupPenViews(
+	group: Pick<DisplayGroup, 'pens'>,
+	values: Readonly<Record<string, CurrentSampleView>> | null,
+	tags: readonly Tag[]
+): PenView[] {
+	if (values === null) return [];
+	return group.pens.map((pen, index) =>
+		penView(
+			pen,
+			index,
+			values[`tag:${pen.tagId}`],
+			tags.find((tag) => tag.id === pen.tagId)
+		)
+	);
+}
+
+// --- 表示種別 ----------------------------------------------------------------
+
+/** D-1 で描ける種別（D-2 でバー・計器、D-3 でトレンドを足す）。 */
+export function isKindRendered(kind: DisplayKind): boolean {
+	return kind === 'digital';
+}
+
+export const KIND_NOT_READY_MESSAGE = 'この表示種別は準備中です';
+
+// --- 画面全体の状態 ----------------------------------------------------------
+
+/** 現在値の取得の状態（ポーラーの状態から導く）。 */
+export type ValuesPhase =
+	/** まだ一度も結果が無い。 */
+	| 'loading'
+	/** 収集が動いていない（`notRunning`）。 */
+	| 'notRunning'
+	/** 値がある（読めている）。 */
+	| 'ready';
+
+/** 現在値を取得できていない間に添える一文（「いつの表示か」を必ず出す）。 */
+export function valuesStaleNote(
+	lastOkAt: number | null,
+	timeLabel: (ms: number) => string
+): string {
+	if (lastOkAt === null) return '現在値を取得できていません（まだ一度も取得できていません）。';
+	return `現在値を取得できていません。下の表示は${timeLabel(lastOkAt)}に取得したもので、最新ではありません。`;
+}

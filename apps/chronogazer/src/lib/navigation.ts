@@ -115,3 +115,12 @@ export function pageTitle(pathname: string): string {
 	});
 	return item?.label ?? 'ChronoGazer';
 }
+
+/**
+ * 監視画面で表示グループを選んだ URL（R1-D）。選択は `?group=<id>` で URL に
+ * 載せる（ブックマーク・共有・戻る操作で同じグループに戻れる）。タブと
+ * コマンドパレットの「グループ: ◯◯ を表示」の両方がこれを使う。
+ */
+export function monitorGroupHref(groupId: number): string {
+	return `${resolveAppPath('/monitor')}?group=${groupId}`;
+}
