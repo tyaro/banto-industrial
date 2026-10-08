@@ -598,18 +598,23 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await highPen.click();
 		await expect(trend.locator('.chart-host svg text.band-label')).toHaveText(['H']);
 
-		// 時間窓: 既定（グループの属性なし = 10 分）→ 1 分。端末に覚え、グループには書かない。
+		// 時間窓: 既定（グループの属性。作成時に何も渡さないとサーバーが 10 分を入れる）→
+		// 1 分。端末に覚え、グループの定義には書かない。
+		const groupAttributes = async (): Promise<unknown> => {
+			const res = await page.request.get(`/api/display-groups/${groupIds[GROUP_TREND]}`, {
+				headers
+			});
+			expect(res.ok(), `GET /api/display-groups/${groupIds[GROUP_TREND]}`).toBe(true);
+			return ((await res.json()) as { attributes: unknown }).attributes;
+		};
+		const attributesBefore = await groupAttributes();
 		const windowSelect = trend.getByLabel('時間窓');
 		await expect(windowSelect).toHaveValue('600');
 		await windowSelect.selectOption('60');
 		await expect(windowSelect).toHaveValue('60');
 		await page.reload();
 		await expect(trend.getByLabel('時間窓')).toHaveValue('60', { timeout: 20_000 });
-		const groupRes = await page.request.get(`/api/display-groups/${groupIds[GROUP_TREND]}`, {
-			headers
-		});
-		expect(groupRes.ok(), `GET /api/display-groups/${groupIds[GROUP_TREND]}`).toBe(true);
-		expect(((await groupRes.json()) as { attributes: unknown }).attributes).toEqual({});
+		expect(await groupAttributes()).toEqual(attributesBefore);
 
 		// 収集を止めている間の刻みは null（0 ではない）で、線が切れる。履歴の待ち（2 秒）
 		// の後で線が出ていることを確かめてから止める。
