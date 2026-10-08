@@ -86,7 +86,7 @@ PLC）相手に「設定 → 収集開始 → データファイル生成 → �
 >   （GET/PUT/DELETE）・`/api/display-groups/order`（PUT、並べ替え）、Tauri
 >   `display_groups_list|get|create|update|delete|reorder`。読み取りは viewer 以上・
 >   変更は editor 以上、変更は監査（`resource: display_groups`）。更新は楽観ロック
->   （`expectedRevision`。REST は `409`、Tauri は同じ形の検証エラー）。
+>   （`expectedRevision`。REST は `409`、Tauri は同じ形の検証エラー）。更新（PUT）の本文の `sortOrder` は無視し、並びは `/order` だけで変える（並べ替えは版を進めないため、古い `sortOrder` の書き戻しで並べ替えを取り消さないように。2026-10-08 レビュー対応）。読み取りはグループの行とペンを 1 つの読み取りトランザクションで読む。
 > - **参照されているタグの削除は拒否**（§3.7.9 の 8）: ペンに割り当てたタグの
 >   `DELETE /api/tags/{id}` / `tags_delete` は、参照元のグループ名つきの検証エラーに
 >   なる。`tags` への FK は張らず（banto-tags は `tags` を作り直すことがある）、

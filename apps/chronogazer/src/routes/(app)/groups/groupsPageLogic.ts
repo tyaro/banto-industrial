@@ -17,6 +17,7 @@ import type {
 	DisplayGroupInput,
 	DisplayKind
 } from '#lib/banto/displayGroupsAdmin.js';
+import { REVISION_CONFLICT_FIELD } from '#lib/banto/revisionConflict.js';
 
 /** グループ数の上限（§3.2）。画面は作成ボタンを止めるだけで、拒否はサーバー。 */
 export const MAX_DISPLAY_GROUPS = 16;
@@ -242,7 +243,7 @@ export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedF
 		else if (fe.field === 'kind') sorted.kind.push(fe.message);
 		else if (fe.field === 'attributes.timeWindowSec') sorted.timeWindowSec.push(fe.message);
 		else if (fe.field === 'pens') sorted.pens.push(fe.message);
-		else if (fe.field === 'expectedRevision') sorted.revision.push(fe.message);
+		else if (fe.field === REVISION_CONFLICT_FIELD) sorted.revision.push(fe.message);
 		else sorted.other.push(fe.message);
 	}
 	return sorted;
@@ -250,4 +251,45 @@ export function sortFieldErrors(fieldErrors: readonly FieldErrorLike[]): SortedF
 
 export function emptyFieldErrors(): SortedFieldErrors {
 	return sortFieldErrors([]);
+}
+
+// --- 版の食い違いのあとの「最新の内容を読み込む」（#393 オーナーレビュー P2-2・P2-5） ---
+
+/**
+ * 「最新の内容を読み込む」の結果:
+ * - `open`: 読めた。`group` を開き直す（入力は破棄）。`groups` は一覧の最新。
+ * - `deleted`: 読めたが、そのグループはもう無い。
+ * - `failed`: 読めなかった。**古い行で開き直さず**、入力を残したまま理由を出す
+ *   （P2-5: 以前は一覧の再読み込みの失敗を握り、最後に読めていた古い行で
+ *   開き直して入力を捨てていた）。
+ * - `stale`: 待っている間に選択・編集の世代が変わった。**何もしない**（P2-2:
+ *   遅れて届いた応答が、別のグループで編集中の下書きを捨てないように）。
+ */
+export type LatestReload =
+	| { kind: 'open'; group: DisplayGroup; groups: DisplayGroup[] }
+	| { kind: 'deleted'; groups: DisplayGroup[] }
+	| { kind: 'failed'; message: string }
+	| { kind: 'stale' };
+
+export interface LatestReloadOptions {
+	/** 開き直すグループの ID。 */
+	id: number;
+	/** 一覧の取得（`listDisplayGroups`）。 */
+	load: () => Promise<DisplayGroup[]>;
+	/** 応答が届いた時点で、読み込みを始めたときの選択・編集がまだ続いているか。 */
+	isCurrent: () => boolean;
+	describeError: (err: unknown) => string;
+}
+
+export async function reloadLatestGroup(options: LatestReloadOptions): Promise<LatestReload> {
+	let groups: DisplayGroup[];
+	try {
+		groups = await options.load();
+	} catch (err) {
+		if (!options.isCurrent()) return { kind: 'stale' };
+		return { kind: 'failed', message: options.describeError(err) };
+	}
+	if (!options.isCurrent()) return { kind: 'stale' };
+	const group = groups.find((entry) => entry.id === options.id);
+	return group ? { kind: 'open', group, groups } : { kind: 'deleted', groups };
 }

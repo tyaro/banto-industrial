@@ -69,6 +69,7 @@
 		movePen,
 		movedGroupIds,
 		removePen,
+		reloadLatestGroup,
 		sortFieldErrors,
 		tagsUsedByOtherPens,
 		thresholdSummary,
@@ -153,9 +154,18 @@
 	let saving = $state(false);
 	let deleting = $state(false);
 	let reordering = $state(false);
+	/** 「最新の内容を読み込む」の待ち（P2-2: 待っている間は編集・選択の操作を止める）。 */
+	let reloadingLatest = $state(false);
+	/** 「最新の内容を読み込む」が失敗した理由（P2-5: 入力は残したまま出す）。 */
+	let latestReloadError = $state<string | null>(null);
+	/**
+	 * 選択・編集の世代。開き直す・新規・閉じる・取り消すのたびに進める。遅れて届いた
+	 * 「最新の内容」の応答は、世代が変わっていたら捨てる（P2-2 の二重の守り）。
+	 */
+	let editGeneration = 0;
 
 	const dirty = $derived(selected !== null && isDraftDirty(draft, baseline));
-	const busy = $derived(saving || deleting || reordering);
+	const busy = $derived(saving || deleting || reordering || reloadingLatest);
 	const selectedGroup = $derived(
 		typeof selected === 'number' ? (groups ?? []).find((group) => group.id === selected) : undefined
 	);
@@ -176,6 +186,8 @@
 	}
 
 	function openGroup(group: DisplayGroup): void {
+		editGeneration += 1;
+		latestReloadError = null;
 		selected = group.id;
 		editingRevision = group.revision;
 		baseline = draftFromGroup(group);
@@ -191,6 +203,8 @@
 
 	function startNew(): void {
 		if (busy || !confirmDiscard()) return;
+		editGeneration += 1;
+		latestReloadError = null;
 		selected = 'new';
 		editingRevision = undefined;
 		baseline = emptyDraft();
@@ -200,25 +214,58 @@
 
 	function closeEditor(): void {
 		if (busy || !confirmDiscard()) return;
+		editGeneration += 1;
+		latestReloadError = null;
 		selected = null;
 		fieldErrors = emptyFieldErrors();
 	}
 
 	function discardChanges(): void {
+		editGeneration += 1;
 		draft = cloneDraft(baseline);
 		fieldErrors = emptyFieldErrors();
 	}
 
-	/** 版の食い違いのあと: 入力を捨てて、最新の内容を開き直す。 */
+	/**
+	 * 版の食い違いのあと: 入力を捨てて、最新の内容を開き直す。判断は
+	 * `reloadLatestGroup`（`groupsPageLogic.ts`）: 待っている間に選択・編集が
+	 * 変わったら何もしない（P2-2）、読めなかったら古い行で開き直さず入力を残して
+	 * 理由を出す（P2-5）。待っている間は `busy` で編集・選択の操作を止める。
+	 */
 	async function reloadLatest(): Promise<void> {
-		if (typeof selected !== 'number') return;
+		if (busy || typeof selected !== 'number') return;
 		const id = selected;
-		await reloadGroups();
-		const latest = (groups ?? []).find((group) => group.id === id);
-		if (latest) openGroup(latest);
-		else {
-			selected = null;
-			toastStore.push('error', 'このグループは削除されています');
+		const generation = editGeneration;
+		reloadingLatest = true;
+		latestReloadError = null;
+		try {
+			const outcome = await reloadLatestGroup({
+				id,
+				load: listDisplayGroups,
+				isCurrent: () => editGeneration === generation && selected === id,
+				describeError: errorMessage
+			});
+			switch (outcome.kind) {
+				case 'open':
+					groups = outcome.groups;
+					groupsError = null;
+					openGroup(outcome.group);
+					break;
+				case 'deleted':
+					groups = outcome.groups;
+					groupsError = null;
+					editGeneration += 1;
+					selected = null;
+					toastStore.push('error', 'このグループは削除されています');
+					break;
+				case 'failed':
+					latestReloadError = outcome.message;
+					break;
+				case 'stale':
+					break;
+			}
+		} finally {
+			reloadingLatest = false;
 		}
 	}
 
@@ -243,6 +290,7 @@
 		}
 		saving = true;
 		fieldErrors = emptyFieldErrors();
+		latestReloadError = null;
 		const target = selected;
 		try {
 			const saved =
@@ -419,9 +467,14 @@
 					<p class="load-error" role="alert">
 						{fieldErrors.revision.join(' / ')}
 						<button type="button" onclick={() => void reloadLatest()} disabled={busy}>
-							最新の内容を読み込む（入力を破棄）
+							{reloadingLatest ? '読み込み中…' : '最新の内容を読み込む（入力を破棄）'}
 						</button>
 					</p>
+					{#if latestReloadError !== null}
+						<p class="load-error" role="alert">
+							最新の内容を読み込めませんでした（{latestReloadError}）。入力はそのまま残っています。
+						</p>
+					{/if}
 				{/if}
 
 				<fieldset class="editor" disabled={!canWrite || busy}>

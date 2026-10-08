@@ -13,7 +13,7 @@
 CREATE TABLE display_groups (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
-  sort_order INTEGER NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0 CHECK (sort_order BETWEEN 0 AND 9999),
   -- 4 種固定（§3.2）。種別はデータで増やせない（§3.7.7）。
   kind TEXT NOT NULL CHECK (kind IN ('trend', 'digital', 'bar', 'gauge')),
   -- 種別ごとの表示属性（JSON。閉じた項目の集合で、検証済みの形だけを書く）。
@@ -24,6 +24,8 @@ CREATE TABLE display_groups (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- sort_order の上限 9999 は `display_groups::MAX_SORT_ORDER`。作成で省略したときの
+-- 末尾が溢れるなら、サービスが並びを保ったまま 0 から振り直す。
 CREATE INDEX idx_display_groups_sort ON display_groups(sort_order, id);
 
 -- ペン: グループ内のタグ参照 + 表示属性（§2）。1 グループ最大 8（position 0..7）。

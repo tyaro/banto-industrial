@@ -14,6 +14,7 @@ import {
 	isDraftDirty,
 	movePen,
 	movedGroupIds,
+	reloadLatestGroup,
 	removePen,
 	sortFieldErrors,
 	tagsUsedByOtherPens,
@@ -177,5 +178,86 @@ describe('サーバーの検証エラーの振り分け', () => {
 			revision: ['先に更新されました'],
 			other: ['使えない項目', '16 個まで']
 		});
+	});
+});
+
+describe('「最新の内容を読み込む」（オーナーレビュー P2-2・P2-5）', () => {
+	/** 後から解決・失敗させられる取得（遅れて届く応答の再現）。 */
+	function deferred<T>() {
+		let resolve!: (value: T) => void;
+		let reject!: (err: unknown) => void;
+		const promise = new Promise<T>((res, rej) => {
+			resolve = res;
+			reject = rej;
+		});
+		return { promise, resolve, reject };
+	}
+	const latest: DisplayGroup = { ...group, name: 'ライン1（他の人が更新）', revision: 4 };
+	const describeError = (err: unknown) => String(err);
+
+	it('読めたら最新の行で開き直す', async () => {
+		const load = deferred<DisplayGroup[]>();
+		const pending = reloadLatestGroup({
+			id: group.id,
+			load: () => load.promise,
+			isCurrent: () => true,
+			describeError
+		});
+		load.resolve([latest]);
+		expect(await pending).toEqual({ kind: 'open', group: latest, groups: [latest] });
+	});
+
+	it('待っている間に選択・編集が変わったら、遅れて届いた応答で開き直さない（P2-2）', async () => {
+		// 反証: `reloadLatestGroup` の `isCurrent()` の確認を消すと、この結果が `open` になって落ちる。
+		let generation = 1;
+		const load = deferred<DisplayGroup[]>();
+		const pending = reloadLatestGroup({
+			id: group.id,
+			load: () => load.promise,
+			isCurrent: () => generation === 1,
+			describeError
+		});
+		generation = 2; // 別のグループを開いた・新規作成を始めた
+		load.resolve([latest]);
+		expect(await pending).toEqual({ kind: 'stale' });
+	});
+
+	it('読めなかったら古い行で開き直さず、理由を返す（P2-5）', async () => {
+		// 反証: 失敗を握って一覧の古い内容で続ける形（修正前の `reloadGroups()` の振る舞い）にすると落ちる。
+		const load = deferred<DisplayGroup[]>();
+		const pending = reloadLatestGroup({
+			id: group.id,
+			load: () => load.promise,
+			isCurrent: () => true,
+			describeError
+		});
+		load.reject(new Error('サーバーに接続できません'));
+		expect(await pending).toEqual({ kind: 'failed', message: 'Error: サーバーに接続できません' });
+	});
+
+	it('読めなかったが、その間に選択が変わっていたら何もしない', async () => {
+		let current = true;
+		const load = deferred<DisplayGroup[]>();
+		const pending = reloadLatestGroup({
+			id: group.id,
+			load: () => load.promise,
+			isCurrent: () => current,
+			describeError
+		});
+		current = false;
+		load.reject(new Error('x'));
+		expect(await pending).toEqual({ kind: 'stale' });
+	});
+
+	it('読めたがグループが無ければ deleted', async () => {
+		const other = { ...group, id: 99 };
+		expect(
+			await reloadLatestGroup({
+				id: group.id,
+				load: async () => [other],
+				isCurrent: () => true,
+				describeError
+			})
+		).toEqual({ kind: 'deleted', groups: [other] });
 	});
 });

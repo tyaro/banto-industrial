@@ -36,10 +36,13 @@
 //! - **しきい値は持たない**。しきい値はタグ定義の属性（§3.7.1、2026-10-08
 //!   オーナー決定）で、表示グループからは参照するだけ（画面はタグの値を
 //!   読み取り専用で見せる）。
-//! - `sortOrder`: 一覧の並び順（昇順、同じ値は `id` 順）。作成で省略すると末尾、
-//!   更新で省略すると今の値を保つ。並べ替えは [`DisplayGroupService::reorder`]。
-//!   並べ替えは版（`revision`）を進めない - 別の人の内容の編集を、並べ替えだけで
-//!   衝突させないため。
+//! - `sortOrder`: 一覧の並び順（昇順、同じ値は `id` 順。0〜[`MAX_SORT_ORDER`]、
+//!   DB の CHECK でも縛る）。作成で省略すると末尾（溢れるなら振り直す）。
+//!   **更新（PUT）の本文の `sortOrder` は無視する** - 並びを変える口は
+//!   [`DisplayGroupService::reorder`]（`PUT /api/display-groups/order`）だけ。
+//!   並べ替えは版（`revision`）を進めない（別の人の内容の編集を、並べ替えだけで
+//!   衝突させないため）ので、更新が前に読んだ `sortOrder` を書き戻すと並べ替えを
+//!   黙って取り消してしまう（2026-10-08 Codex レビュー P2-3）。
 //!
 //! ## 検証は 1 関数（§3.7.4）
 //!
@@ -100,9 +103,8 @@ pub const TREND_TIME_WINDOWS_SEC: [i64; 5] = [60, 300, 600, 1800, 3600];
 /// トレンドの既定時間窓の既定値（R1-D「既定窓 10 分」）。
 pub const DEFAULT_TREND_TIME_WINDOW_SEC: i64 = 600;
 
-/// 楽観ロック（`expectedRevision`）が食い違ったときのフィールド名。タグの
-/// 楽観ロック（#525）と同じ。
-pub const REVISION_CONFLICT_FIELD: &str = "expectedRevision";
+/// 楽観ロックの食い違いの表し方はタグ（#525）と共通（`crate::revision`）。
+pub use crate::revision::{is_revision_conflict, REVISION_CONFLICT_FIELD};
 
 /// 版の食い違いの案内（画面にそのまま出る）。
 pub const REVISION_CONFLICT_MESSAGE: &str = "他の人（または別の画面）がこの表示グループを先に更新しました。一覧を再読み込みしてから、もう一度編集して保存してください。";
@@ -202,7 +204,7 @@ pub struct DisplayGroup {
 #[serde(rename_all = "camelCase")]
 pub struct DisplayGroupPayload {
     pub name: String,
-    /// 省略: 作成なら末尾、更新なら今の値を保つ。
+    /// 作成のときだけ使う（省略で末尾）。**更新では無視する**（モジュール doc）。
     #[serde(default)]
     pub sort_order: Option<i64>,
     pub kind: String,
@@ -257,21 +259,9 @@ fn field_error(field: impl Into<String>, message: impl Into<String>) -> FieldErr
     }
 }
 
-/// 版の食い違いを表すエラー。REST は `409 Conflict`、Tauri は通常の検証エラーと
-/// 同じ形で返し、画面は両経路を同じに扱える。
+/// 表示グループの版の食い違いを表すエラー（形は `crate::revision` と共通）。
 pub fn revision_conflict_error() -> BantoError {
-    BantoError::Validation {
-        field_errors: vec![field_error(
-            REVISION_CONFLICT_FIELD,
-            REVISION_CONFLICT_MESSAGE,
-        )],
-    }
-}
-
-/// [`revision_conflict_error`] が作ったエラーか（REST が `409` にするための判定）。
-pub fn is_revision_conflict(err: &BantoError) -> bool {
-    matches!(err, BantoError::Validation { field_errors }
-        if field_errors.iter().any(|fe| fe.field == REVISION_CONFLICT_FIELD))
+    crate::revision::revision_conflict_error(REVISION_CONFLICT_MESSAGE)
 }
 
 fn kind_choices() -> String {
@@ -573,14 +563,44 @@ impl DisplayGroupService {
     }
 
     /// 全グループ（並び順 → ID 順）。
+    ///
+    /// グループの行とペンは 2 つの SELECT で読むので、**1 つの読み取り
+    /// トランザクションの中で**読む（オーナーレビュー P2-1）。素の接続で読むと、
+    /// 2 つの間に別の更新が commit されたとき、古い名前・種別・版に新しいペンが
+    /// 混ざった応答になりうる（その応答の `revision` で保存すると、見ていない
+    /// ペンを上書きする）。WAL の読み取りトランザクションは最初の SELECT の時点の
+    /// スナップショットを最後まで見る。
     pub async fn list(&self) -> Result<Vec<DisplayGroup>, BantoError> {
-        let mut conn = self.pool.acquire().await.map_err(storage)?;
-        list_on(&mut conn).await
+        self.list_paused(None).await
     }
 
+    /// [`Self::list`] の本体。`pause` はテスト専用の割り込み点（2 つの SELECT の
+    /// 間で止まる、[`ReadPause`]）で、本番は常に `None`。
+    pub(crate) async fn list_paused(
+        &self,
+        pause: Option<&ReadPause>,
+    ) -> Result<Vec<DisplayGroup>, BantoError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let groups = list_on(&mut tx, pause).await?;
+        tx.commit().await.map_err(storage)?;
+        Ok(groups)
+    }
+
+    /// 1 つ。[`Self::list`] と同じく 1 つの読み取りトランザクションで読む。
     pub async fn get(&self, id: i64) -> Result<DisplayGroup, BantoError> {
-        let mut conn = self.pool.acquire().await.map_err(storage)?;
-        get_on(&mut conn, id).await
+        self.get_paused(id, None).await
+    }
+
+    /// [`Self::get`] の本体（`pause` は [`Self::list_paused`] と同じ）。
+    pub(crate) async fn get_paused(
+        &self,
+        id: i64,
+        pause: Option<&ReadPause>,
+    ) -> Result<DisplayGroup, BantoError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let group = get_on(&mut tx, id, pause).await?;
+        tx.commit().await.map_err(storage)?;
+        Ok(group)
     }
 
     /// 保存せずに検証だけする（段階 3 の「検証だけする口」の土台。今は画面から
@@ -603,12 +623,7 @@ impl DisplayGroupService {
         let valid = validate_display_group(&mut tx, payload, None).await?;
         let sort_order = match valid.sort_order {
             Some(order) => order,
-            None => sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM display_groups",
-            )
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(storage)?,
+            None => end_sort_order(&mut tx).await?,
         };
         let attributes = serde_json::to_string(&valid.attributes)
             .map_err(|err| BantoError::Other(err.to_string()))?;
@@ -624,12 +639,17 @@ impl DisplayGroupService {
         .await
         .map_err(map_write_error)?;
         insert_pens(&mut tx, id, &valid.pens).await?;
-        let created = get_on(&mut tx, id).await?;
+        let created = get_on(&mut tx, id, None).await?;
         tx.commit().await.map_err(storage)?;
         Ok(created)
     }
 
-    /// 全項目の置き換え（`sortOrder` の省略だけは今の値を保つ）。
+    /// 内容（名前・種別・属性・ペン）の全項目の置き換え。**`sortOrder` は本文に
+    /// あっても無視し、今の並び順を保つ**（Codex レビュー P2-3: 並べ替えは版を
+    /// 進めないので、前に読んだ `sortOrder` を載せた本文で並びを書き戻すと、その
+    /// 間の並べ替えを黙って取り消してしまう。並びを変える口は [`Self::reorder`]
+    /// だけ。拒否ではなく無視にしたのは、GET の応答をそのまま送り返せる往復の形を
+    /// 保つため）。
     /// `expectedRevision` が保存されている版と違えば [`revision_conflict_error`]。
     pub async fn update(
         &self,
@@ -641,13 +661,13 @@ impl DisplayGroupService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(storage)?;
-        let current: Option<(i64, i64)> =
-            sqlx::query_as("SELECT revision, sort_order FROM display_groups WHERE id = ?")
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM display_groups WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(storage)?;
-        let Some((revision, current_order)) = current else {
+        let Some(revision) = current else {
             return Err(not_found(id));
         };
         if let Some(expected) = payload.expected_revision {
@@ -659,11 +679,10 @@ impl DisplayGroupService {
         let attributes = serde_json::to_string(&valid.attributes)
             .map_err(|err| BantoError::Other(err.to_string()))?;
         sqlx::query(
-            "UPDATE display_groups SET name = ?, sort_order = ?, kind = ?, attributes = ?, \
+            "UPDATE display_groups SET name = ?, kind = ?, attributes = ?, \
              revision = revision + 1, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(&valid.name)
-        .bind(valid.sort_order.unwrap_or(current_order))
         .bind(valid.kind.as_str())
         .bind(&attributes)
         .bind(id)
@@ -676,7 +695,7 @@ impl DisplayGroupService {
             .await
             .map_err(storage)?;
         insert_pens(&mut tx, id, &valid.pens).await?;
-        let updated = get_on(&mut tx, id).await?;
+        let updated = get_on(&mut tx, id, None).await?;
         tx.commit().await.map_err(storage)?;
         Ok(updated)
     }
@@ -689,7 +708,7 @@ impl DisplayGroupService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(storage)?;
-        let existing = get_on(&mut tx, id).await?;
+        let existing = get_on(&mut tx, id, None).await?;
         sqlx::query("DELETE FROM display_groups WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -730,7 +749,7 @@ impl DisplayGroupService {
                 .await
                 .map_err(storage)?;
         }
-        let groups = list_on(&mut tx).await?;
+        let groups = list_on(&mut tx, None).await?;
         tx.commit().await.map_err(storage)?;
         Ok(groups)
     }
@@ -786,7 +805,54 @@ async fn insert_pens(
     Ok(())
 }
 
-async fn list_on(conn: &mut SqliteConnection) -> Result<Vec<DisplayGroup>, BantoError> {
+/// 作成で `sortOrder` を省略したときの末尾の位置（Codex レビュー P2-4）。
+/// 「最大 + 1」が [`MAX_SORT_ORDER`] を超えるときは、今の並びのまま 0 から振り
+/// 直してから末尾を返す（グループは最大 [`MAX_DISPLAY_GROUPS`] なので、振り直せば
+/// 必ず収まる）。呼び出し側の書き込みトランザクションの中で呼ぶ。
+async fn end_sort_order(conn: &mut SqliteConnection) -> Result<i64, BantoError> {
+    let next: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(sort_order) + 1, 0) FROM display_groups")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(storage)?;
+    if next <= MAX_SORT_ORDER {
+        return Ok(next);
+    }
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM display_groups ORDER BY sort_order, id")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(storage)?;
+    for (order, id) in ids.iter().enumerate() {
+        sqlx::query("UPDATE display_groups SET sort_order = ? WHERE id = ?")
+            .bind(order as i64)
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map_err(storage)?;
+    }
+    Ok(ids.len() as i64)
+}
+
+/// テスト専用の割り込み点: 読み取りの 2 つの SELECT（グループの行 → ペン）の
+/// 間で止まり、`reached` を知らせて `resume` を待つ。その間に別の接続から更新を
+/// commit すると、読み取りが 1 つのスナップショットで行われているかを決定的に
+/// 確かめられる。本番の呼び出しは常に `None`。
+pub(crate) struct ReadPause {
+    pub(crate) reached: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ReadPause {
+    async fn hold(&self) {
+        self.reached.notify_one();
+        self.resume.notified().await;
+    }
+}
+
+async fn list_on(
+    conn: &mut SqliteConnection,
+    pause: Option<&ReadPause>,
+) -> Result<Vec<DisplayGroup>, BantoError> {
     let rows: Vec<GroupRow> = sqlx::query_as(
         "SELECT id, name, sort_order, kind, attributes, revision FROM display_groups \
          ORDER BY sort_order, id",
@@ -794,6 +860,9 @@ async fn list_on(conn: &mut SqliteConnection) -> Result<Vec<DisplayGroup>, Banto
     .fetch_all(&mut *conn)
     .await
     .map_err(storage)?;
+    if let Some(pause) = pause {
+        pause.hold().await;
+    }
     let pen_rows: Vec<PenRow> = sqlx::query_as(
         "SELECT group_id, tag_id, color_slot FROM display_group_pens ORDER BY group_id, position",
     )
@@ -815,7 +884,11 @@ async fn list_on(conn: &mut SqliteConnection) -> Result<Vec<DisplayGroup>, Banto
         .collect()
 }
 
-async fn get_on(conn: &mut SqliteConnection, id: i64) -> Result<DisplayGroup, BantoError> {
+async fn get_on(
+    conn: &mut SqliteConnection,
+    id: i64,
+    pause: Option<&ReadPause>,
+) -> Result<DisplayGroup, BantoError> {
     let row: Option<GroupRow> = sqlx::query_as(
         "SELECT id, name, sort_order, kind, attributes, revision FROM display_groups WHERE id = ?",
     )
@@ -826,6 +899,9 @@ async fn get_on(conn: &mut SqliteConnection, id: i64) -> Result<DisplayGroup, Ba
     let Some(row) = row else {
         return Err(not_found(id));
     };
+    if let Some(pause) = pause {
+        pause.hold().await;
+    }
     let pens: Vec<PenRow> = sqlx::query_as(
         "SELECT group_id, tag_id, color_slot FROM display_group_pens WHERE group_id = ? \
          ORDER BY position",

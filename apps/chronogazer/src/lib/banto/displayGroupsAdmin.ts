@@ -51,7 +51,7 @@ export interface DisplayGroup {
 /** Mirrors `chronogazer_core::display_groups::DisplayGroupPayload`. */
 export interface DisplayGroupInput {
 	name: string;
-	/** 省略: 作成なら末尾、更新なら今の値を保つ。この画面は並べ替えを専用の口で行うので送らない。 */
+	/** 作成のときだけ使う（省略で末尾）。**更新では無視される**（並びは `reorderDisplayGroups` だけで変える）。この画面は送らない。 */
 	sortOrder?: number;
 	kind: DisplayKind;
 	attributes: DisplayAttributes;

@@ -481,3 +481,156 @@ async fn tag_delete_and_pen_assignment_do_not_interleave() {
     }
     pool.close().await;
 }
+
+/// on-disk（WAL）の DB と、その上のタグ `n` 本。複数の接続で同時に読み書き
+/// するテスト用（メモリ DB は接続を跨いだ割り込みを再現できない）。
+async fn on_disk_service(
+    dir: &crate::test_support::TempDir,
+    n: usize,
+) -> (SqlitePool, DisplayGroupService, TagService, Vec<i64>) {
+    let pool = crate::db::init_db(dir.path().join("dg.sqlite3"))
+        .await
+        .expect("init_db");
+    let (tags, ids) = seed_tags(&pool, n).await;
+    (pool.clone(), DisplayGroupService::new(pool), tags, ids)
+}
+
+fn read_pause() -> (
+    ReadPause,
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+) {
+    let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+    (
+        ReadPause {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        },
+        reached,
+        resume,
+    )
+}
+
+/// オーナーレビュー P2-1: `list`/`get` はグループの行とペンを 1 つのスナップ
+/// ショットで読む。2 つの SELECT の間で止め（[`ReadPause`]）、その間に別の接続
+/// から名前・種別・ペンを変える更新を commit しても、応答は「更新前の全体」で、
+/// 古い名前・版に新しいペンが混ざらない。
+///
+/// 反証（2026-10-08 実施）: `list_paused`/`get_paused` の `self.pool.begin()` を
+/// `self.pool.acquire()`（素の接続）に戻すと、両方の `assert_eq!` が落ちる
+/// （名前は「前」、ペンは「後」）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_and_get_read_rows_and_pens_from_one_snapshot() {
+    let dir = crate::test_support::TempDir::new();
+    let (pool, svc, _tags, ids) = on_disk_service(&dir, 2).await;
+    let before = svc
+        .create(&payload("前", "trend", &ids[..1]))
+        .await
+        .unwrap();
+
+    for use_get in [false, true] {
+        let current = svc.get(before.id).await.unwrap();
+        let (pause, reached, resume) = read_pause();
+        let reader = svc.clone();
+        let id = before.id;
+        let read = tokio::spawn(async move {
+            if use_get {
+                reader.get_paused(id, Some(&pause)).await.map(|g| vec![g])
+            } else {
+                reader.list_paused(Some(&pause)).await
+            }
+        });
+        reached.notified().await;
+
+        // 読み取りが 2 つの SELECT の間にいる間に、別の接続で更新を commit する。
+        let mut edit = payload("後", "gauge", &ids[1..]);
+        edit.expected_revision = Some(current.revision);
+        let after = svc
+            .update(id, &edit)
+            .await
+            .expect("読み取りの最中でも更新できる");
+        resume.notify_one();
+
+        let seen = read.await.unwrap().expect("read");
+        assert_eq!(seen, vec![current.clone()], "use_get={use_get}");
+        assert_eq!(svc.get(id).await.unwrap(), after);
+
+        // 次の周のために元へ戻す。
+        let mut back = payload("前", "trend", &ids[..1]);
+        back.expected_revision = Some(after.revision);
+        svc.update(id, &back).await.unwrap();
+    }
+    pool.close().await;
+}
+
+/// Codex レビュー P2-3: 更新（PUT）の本文の `sortOrder` は無視する。前に読んだ
+/// 応答（`sortOrder` 入り）をそのまま送り返しても、その間の並べ替えは取り消され
+/// ない。
+///
+/// 反証（2026-10-08 実施）: `update` の UPDATE 文を本文の `sortOrder` で書く形
+/// （`sort_order = COALESCE(?, sort_order)`、修正前と同じ）に戻すと、最後の並びが `["A", "B"]` になって落ちる。
+#[tokio::test]
+async fn update_ignores_sort_order_so_a_reorder_is_not_undone() {
+    let (svc, _tags, _ids) = service_with_tags(0).await;
+    let a = svc.create(&payload("A", "digital", &[])).await.unwrap();
+    let b = svc.create(&payload("B", "digital", &[])).await.unwrap();
+    let fetched = serde_json::to_value(svc.get(a.id).await.unwrap()).unwrap();
+    assert_eq!(fetched["sortOrder"], 0);
+
+    svc.reorder(&[b.id, a.id]).await.unwrap();
+
+    // 前に読んだ A（sortOrder 0）を、名前だけ変えて送り返す。
+    let mut body: DisplayGroupPayload = serde_json::from_value(fetched).unwrap();
+    body.name = "A2".into();
+    body.expected_revision = Some(a.revision);
+    let updated = svc.update(a.id, &body).await.unwrap();
+    assert_eq!(updated.sort_order, 1, "並べ替え後の位置のまま");
+    let names: Vec<_> = svc
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|g| g.name)
+        .collect();
+    assert_eq!(names, ["B", "A2"]);
+}
+
+/// Codex レビュー P2-4: 作成で `sortOrder` を省略したときの末尾が
+/// [`MAX_SORT_ORDER`] を超えるなら、並びを保ったまま 0 から振り直す。DB の
+/// CHECK も範囲外を拒否する。
+///
+/// 反証（2026-10-08 実施）: `end_sort_order` の振り直しを消して「最大 + 1」を
+/// そのまま返すと、2 つ目の作成が CHECK 違反（storage エラー）で落ちる。
+#[tokio::test]
+async fn an_implicit_end_position_never_exceeds_the_limit() {
+    let (svc, _tags, _ids) = service_with_tags(0).await;
+    let mut first = payload("先頭", "digital", &[]);
+    first.sort_order = Some(0);
+    svc.create(&first).await.unwrap();
+    let mut last = payload("端", "digital", &[]);
+    last.sort_order = Some(MAX_SORT_ORDER);
+    svc.create(&last).await.unwrap();
+
+    let appended = svc
+        .create(&payload("追加", "digital", &[]))
+        .await
+        .expect("末尾が溢れても作れる");
+    let groups = svc.list().await.unwrap();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| (g.name.as_str(), g.sort_order))
+            .collect::<Vec<_>>(),
+        [("先頭", 0), ("端", 1), ("追加", 2)]
+    );
+    assert_eq!(appended.sort_order, 2);
+
+    let err = sqlx::query(
+        "INSERT INTO display_groups (name, sort_order, kind) VALUES ('範囲外', 10000, 'trend')",
+    )
+    .execute(&svc.pool)
+    .await
+    .expect_err("CHECK が範囲外を拒否する");
+    assert!(err.to_string().contains("CHECK"), "{err}");
+}
