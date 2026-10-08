@@ -1069,9 +1069,8 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
 ///
 /// **しきい値は持たない**（#532、2026-10-08 オーナー決定: しきい値はタグ定義の
 /// 属性ではなく、記録計の側のタグごとの設定）。保存は `crate::tag_thresholds`
-/// （`PUT /api/tag-thresholds/{tagId}`・Tauri の `tag_thresholds_update`）で行い、
-/// banto-tags の `tags.threshold_*` の列には常に `None` を渡す（列は banto-hub の
-/// ために #533 まで残るが、ChronoGazer は読みも書きもしない）。`thresholdH` など
+/// （`PUT /api/tag-thresholds/{tagId}`・Tauri の `tag_thresholds_update`）で行う。
+/// banto-tags の `tags` にしきい値の列は無い（#533 で落とした）。`thresholdH` など
 /// を**値付きで**送ってきたクライアント（#532 より前の画面など）は、黙って捨てずに
 /// 検証エラーで断る（[`TagPayload::reject_thresholds`]）。`null` は通す（前の画面は
 /// 空欄を `null` で送っていた）。
@@ -1173,12 +1172,6 @@ impl From<TagPayload> for TagInput {
             eng_hi: payload.eng_hi,
             unit: payload.unit,
             decimals: payload.decimals,
-            // #532: しきい値はタグ定義に含めない（記録計の側の設定、
-            // `crate::tag_thresholds`）。列は常に空にする。
-            threshold_h: None,
-            threshold_hh: None,
-            threshold_l: None,
-            threshold_ll: None,
             enabled: payload.enabled,
             writable: false,
             tag_kind: "plc".to_string(),
@@ -4481,7 +4474,7 @@ mod tests {
     /// 受け取らない**（#532: 記録計の側の設定 `/api/tag-thresholds` へ移った）。
     /// (1) しきい値を値付きで送った作成・更新は、黙って捨てずに `thresholdH` などの
     ///     `field_errors` で拒否される（`null` は通る - #532 より前の画面は空欄を
-    ///     `null` で送っていた）。タグの `threshold_*` の列は常に空
+    ///     `null` で送っていた）。タグの応答にしきい値の項目は無い（#533）
     /// (2) 古い `expectedRevision` の更新は `409` で拒否され、保存は変わらない
     /// (3) 存在しない・削除済みの id は 404。
     ///
@@ -4562,7 +4555,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{created}");
-        assert!(created["thresholdH"].is_null(), "{created}");
+        assert!(created.get("thresholdH").is_none(), "{created}");
         let id = created["id"].as_i64().unwrap();
         let path = format!("/api/tags/{id}");
         let revision = created["revision"].as_i64().unwrap();
@@ -4581,7 +4574,7 @@ mod tests {
         assert_eq!(field_names(&body), ["thresholdH"]);
         let (_, reread) = send(&router, get_auth(&path, &editor)).await;
         assert_eq!(reread["revision"], revision);
-        assert!(reread["thresholdH"].is_null());
+        assert!(reread.get("thresholdH").is_none(), "{reread}");
 
         // 版を合わせた更新は通る（版は進む）。
         let (status, updated) = send(

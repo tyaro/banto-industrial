@@ -5,8 +5,8 @@
  * Svelte 5 の `<input type="number">` は `bind:value` の対象を空にすると、
  * 他の `<input>` と違って空文字列 `''` ではなく **`null`** を代入する。
  * `+page.svelte` の `FormState`/`ContinuousFormState` は数値系フィールド
- * （`stringLength`/`rawLo`/`rawHi`/`engLo`/`engHi`/`thresholdH`/`thresholdHh`/
- * `thresholdL`/`thresholdLl` 等）を TypeScript 上は `string` と宣言している
+ * （`stringLength`/`rawLo`/`rawHi`/`engLo`/`engHi` 等）を TypeScript 上は
+ * `string` と宣言している
  * ため、この `null` 混入は型チェックでは検出できない
  * （docs/banto-hub-desktop-plan.md §16.4「`optNum` の null 取りこぼし」）。
  * 旧 `optNum` は `s === '' ? undefined : Number(s)` しか見ておらず、

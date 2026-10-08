@@ -146,7 +146,6 @@
 	import {
 		DISPLAY_SCALING_FIELDS,
 		DISPLAY_SCALING_VALUE_FIELDS,
-		THRESHOLD_FIELDS,
 		WRITE_SAFETY_FIELDS,
 		hasFieldError,
 		hasAnyFieldValue,
@@ -268,10 +267,6 @@
 		engHi: string;
 		unit: string;
 		decimals: string;
-		thresholdH: string;
-		thresholdHh: string;
-		thresholdL: string;
-		thresholdLl: string;
 		enabled: boolean;
 		/**
 		 * 書き込み可（T2-3、docs/tag-server-design.md §6 item 1）。既定 off -
@@ -358,10 +353,6 @@
 			engHi: '',
 			unit: '',
 			decimals: '0',
-			thresholdH: '',
-			thresholdHh: '',
-			thresholdL: '',
-			thresholdLl: '',
 			enabled: true,
 			writable: false,
 			tagKind: 'plc',
@@ -388,10 +379,6 @@
 			engHi: numOrEmpty(t.engHi),
 			unit: t.unit ?? '',
 			decimals: String(t.decimals),
-			thresholdH: numOrEmpty(t.thresholdH),
-			thresholdHh: numOrEmpty(t.thresholdHh),
-			thresholdL: numOrEmpty(t.thresholdL),
-			thresholdLl: numOrEmpty(t.thresholdLl),
 			enabled: t.enabled,
 			writable: t.writable,
 			tagKind: t.tagKind,
@@ -419,10 +406,6 @@
 		engHi: 'EngHi',
 		unit: '単位',
 		decimals: '小数桁数',
-		thresholdH: 'しきい値 H',
-		thresholdHh: 'しきい値 HH',
-		thresholdL: 'しきい値 L',
-		thresholdLl: 'しきい値 LL',
 		enabled: '有効',
 		writable: '書き込み可',
 		tagKind: 'タグ種別',
@@ -473,10 +456,6 @@
 			engHi: parseOptionalNumber(form.engHi),
 			unit: form.unit === '' ? undefined : form.unit,
 			decimals: Number(form.decimals),
-			thresholdH: parseOptionalNumber(form.thresholdH),
-			thresholdHh: parseOptionalNumber(form.thresholdHh),
-			thresholdL: parseOptionalNumber(form.thresholdL),
-			thresholdLl: parseOptionalNumber(form.thresholdLl),
 			enabled: form.enabled,
 			// computed/db タグは常に writable=false（computed: 値は式が決める、
 			// db: v1 は読み取り専用 §6-10）- フォーム自体もこの2種でチェック
@@ -885,7 +864,7 @@
 	 *   ユーザーが前の1件で手動 OFF にした意図が次の1件で黙って ON に
 	 *   戻ってしまう。
 	 * - `openDuplicateDrawer`: **`true` で開始する**（`createNameTouched`
-	 *   と同じ判断 - 複製元の `writable` は「型/単位/スケーリング/しきい値」
+	 *   と同じ判断 - 複製元の `writable` は「型/単位/スケーリング」
 	 *   と同格の引き継ぎ対象であり、この既定計算で上書きすべきではない）。
 	 */
 	let createWritableTouched = $state(false);
@@ -1172,20 +1151,19 @@
 
 	/**
 	 * T18-2a（TAG-UX-B「詳細を閉じても値保持・詳細エラー時は自動展開」）:
-	 * `tagFields` の3つの `<details class="detail-group">` の開閉状態。
+	 * `tagFields` の2つの `<details class="detail-group">` の開閉状態。
 	 * create/edit の Drawer は `{#if drawerMode === 'create'} ...
 	 * {:else if drawerMode === 'edit'}` で同時に1つしかマウントされないが、
 	 * それぞれ独立した `$state` を持たせる — 共有すると、例えば edit で
-	 * 「しきい値」セクションを開いた状態のまま create Drawer を開いたときに
+	 * 「表示・スケーリング」セクションを開いた状態のまま create Drawer を開いたときに
 	 * その開閉状態が漏れてしまう。
 	 */
 	interface DetailOpenState {
 		display: boolean;
-		threshold: boolean;
 		write: boolean;
 	}
 	function blankDetailOpen(): DetailOpenState {
-		return { display: false, threshold: false, write: false };
+		return { display: false, write: false };
 	}
 	let createDetailOpen: DetailOpenState = $state(blankDetailOpen());
 	let editDetailOpen: DetailOpenState = $state(blankDetailOpen());
@@ -1315,12 +1293,10 @@
 	 */
 	$effect(() => {
 		if (hasFieldError(createErrors, DISPLAY_SCALING_FIELDS)) createDetailOpen.display = true;
-		if (hasFieldError(createErrors, THRESHOLD_FIELDS)) createDetailOpen.threshold = true;
 		if (hasFieldError(createErrors, WRITE_SAFETY_FIELDS)) createDetailOpen.write = true;
 	});
 	$effect(() => {
 		if (hasFieldError(editErrors, DISPLAY_SCALING_FIELDS)) editDetailOpen.display = true;
-		if (hasFieldError(editErrors, THRESHOLD_FIELDS)) editDetailOpen.threshold = true;
 		if (hasFieldError(editErrors, WRITE_SAFETY_FIELDS)) editDetailOpen.write = true;
 	});
 
@@ -2876,8 +2852,8 @@
 		// いるため、プリフィル対象外として開始する（上の `createNameTouched`
 		// 宣言のコメント参照 - アドレスを後から入力しても複製名を上書きしない）。
 		createNameTouched = true;
-		// T19 S1-b（UX-34）: 複製元の `writable` は「型/単位/スケーリング/
-		// しきい値」と同格の引き継ぎ対象 - 自動計算で上書きしない（上の
+		// T19 S1-b（UX-34）: 複製元の `writable` は「型/単位/スケーリング」
+		// と同格の引き継ぎ対象 - 自動計算で上書きしない（上の
 		// `createWritableTouched` 宣言のコメント参照）。
 		createWritableTouched = true;
 		// T19 S1-c（UX-33）: 複製は複製元のグループを引き継ぐだけで、現在の
@@ -3596,10 +3572,6 @@
 			rawHi: '',
 			engLo: '',
 			engHi: '',
-			thresholdH: '',
-			thresholdHh: '',
-			thresholdL: '',
-			thresholdLl: '',
 			enabled: true,
 			writable: false
 		};
@@ -3629,15 +3601,14 @@
 
 	/**
 	 * T19 S1-b（UX-36、単票フォームの `createDetailOpen`/`editDetailOpen` と
-	 * 同じ考え方）: 連続登録フォームの「表示・スケーリング」「しきい値」の
-	 * 開閉状態。既定は閉じた状態（design「既定は閉じた状態」）。連続登録は
+	 * 同じ考え方）: 連続登録フォームの「表示・スケーリング」の
+	 * 開閉状態（「しきい値」は #533 で外した - Hub はしきい値を持たない）。既定は閉じた状態（design「既定は閉じた状態」）。連続登録は
 	 * フィールド単位のサーバーエラーを持たない（検証結果はプレビュー
 	 * テーブルの行単位エラー）ため、単票フォームのような「エラー時に自動
 	 * 展開」は無い。
 	 */
-	let continuousDetailOpen: { display: boolean; threshold: boolean } = $state({
-		display: false,
-		threshold: false
+	let continuousDetailOpen: { display: boolean } = $state({
+		display: false
 	});
 
 	/** 入力が変わるたびに再計算される、適用前プレビュー(設計「適用前にプレビュー表示」)。
@@ -3712,7 +3683,7 @@
 				// アドレス入力がプリフィルされなくなる。
 				continuousNamePatternTouched = false;
 				continuousStartNumberTouched = false;
-				continuousDetailOpen = { display: false, threshold: false };
+				continuousDetailOpen = { display: false };
 				invalidateContinuousValidation();
 				await reload();
 			} else {
@@ -5420,66 +5391,6 @@
 			</label>
 		</div>
 	</details>
-	<details class="detail-group" bind:open={detailOpen.threshold}>
-		<summary>
-			しきい値
-			{#if hasAnyFieldValue(form, THRESHOLD_FIELDS)}
-				<span class="detail-value-badge" title="値が設定されています">設定あり</span>
-			{/if}
-		</summary>
-		<div class="form-grid">
-			<label class="field">
-				しきい値 H
-				<input
-					id="tag-threshold-h"
-					type="number"
-					bind:value={form.thresholdH}
-					aria-invalid={errors.thresholdH ? 'true' : undefined}
-					aria-describedby={describedBy(errors.thresholdH && 'tag-threshold-h-err')}
-				/>
-				{#if errors.thresholdH}<span class="err" id="tag-threshold-h-err">{errors.thresholdH}</span
-					>{/if}
-			</label>
-			<label class="field">
-				しきい値 HH
-				<input
-					id="tag-threshold-hh"
-					type="number"
-					bind:value={form.thresholdHh}
-					aria-invalid={errors.thresholdHh ? 'true' : undefined}
-					aria-describedby={describedBy(errors.thresholdHh && 'tag-threshold-hh-err')}
-				/>
-				{#if errors.thresholdHh}<span class="err" id="tag-threshold-hh-err"
-						>{errors.thresholdHh}</span
-					>{/if}
-			</label>
-			<label class="field">
-				しきい値 L
-				<input
-					id="tag-threshold-l"
-					type="number"
-					bind:value={form.thresholdL}
-					aria-invalid={errors.thresholdL ? 'true' : undefined}
-					aria-describedby={describedBy(errors.thresholdL && 'tag-threshold-l-err')}
-				/>
-				{#if errors.thresholdL}<span class="err" id="tag-threshold-l-err">{errors.thresholdL}</span
-					>{/if}
-			</label>
-			<label class="field">
-				しきい値 LL
-				<input
-					id="tag-threshold-ll"
-					type="number"
-					bind:value={form.thresholdLl}
-					aria-invalid={errors.thresholdLl ? 'true' : undefined}
-					aria-describedby={describedBy(errors.thresholdLl && 'tag-threshold-ll-err')}
-				/>
-				{#if errors.thresholdLl}<span class="err" id="tag-threshold-ll-err"
-						>{errors.thresholdLl}</span
-					>{/if}
-			</label>
-		</div>
-	</details>
 	{#if form.tagKind !== 'computed' && form.tagKind !== DB_TAG_KIND}
 		<!--
 			S3（docs/banto-hub-external-db-design.md §6-10「v1 は読み取り
@@ -5635,7 +5546,7 @@
 	</label>
 	<!--
 		T19 S1-b（UX-36、単票フォームの `<details class="detail-group">` と
-		同じ扱い）: RawLo/RawHi/EngLo/EngHi・しきい値 HH/H/L/LL は既定で
+		同じ扱い）: RawLo/RawHi/EngLo/EngHi は既定で
 		閉じ、値が入っていれば summary にバッジを出す。
 	-->
 	<div class="continuous-detail-wrap">
@@ -5662,32 +5573,6 @@
 				<label class="field">
 					EngHi
 					<input type="number" bind:value={continuousForm.engHi} />
-				</label>
-			</div>
-		</details>
-		<details class="detail-group" bind:open={continuousDetailOpen.threshold}>
-			<summary>
-				しきい値
-				{#if hasAnyFieldValue(continuousForm, THRESHOLD_FIELDS)}
-					<span class="detail-value-badge" title="値が設定されています">設定あり</span>
-				{/if}
-			</summary>
-			<div class="form-grid">
-				<label class="field">
-					しきい値 H
-					<input type="number" bind:value={continuousForm.thresholdH} />
-				</label>
-				<label class="field">
-					しきい値 HH
-					<input type="number" bind:value={continuousForm.thresholdHh} />
-				</label>
-				<label class="field">
-					しきい値 L
-					<input type="number" bind:value={continuousForm.thresholdL} />
-				</label>
-				<label class="field">
-					しきい値 LL
-					<input type="number" bind:value={continuousForm.thresholdLl} />
 				</label>
 			</div>
 		</details>
@@ -8095,8 +7980,8 @@
 
 	/*
 	 * T18-2a（TAG-UX-B「常用する基本設定と、詳細設定を fieldset /
-	 * 折りたたみで分ける」）: 表示・スケーリング／しきい値／書き込み安全
-	 * 設定の3つの `<details>`。基本 form-grid と視覚的に区切るため上に
+	 * 折りたたみで分ける」）: 表示・スケーリング／書き込み安全
+	 * 設定の2つの `<details>`（「しきい値」は #533 で外した）。基本 form-grid と視覚的に区切るため上に
 	 * 罫線を引く。
 	 */
 	.detail-group {

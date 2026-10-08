@@ -20,8 +20,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use banto_collect::{
-    build_config, default_client_factory, BackoffConfig, CollectError, Collector, CollectorOptions,
-    ConnectionStatus, EventSink, Quality,
+    build_config, build_config_lenient_with_thresholds, default_client_factory, BackoffConfig,
+    CollectError, Collector, CollectorConfig, CollectorOptions, ConnectionStatus, EventSink,
+    Quality, RegistrySnapshot, Thresholds,
 };
 use banto_plc::modbus::simulator::Simulator;
 use banto_plc::slmp::address::SlmpDevice;
@@ -229,10 +230,6 @@ fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagIn
         eng_hi: None,
         unit: None,
         decimals: 0,
-        threshold_h: None,
-        threshold_hh: None,
-        threshold_l: None,
-        threshold_ll: None,
         enabled: true,
         writable: false,
         tag_kind: "plc".to_string(),
@@ -1021,6 +1018,23 @@ async fn slmp_auto_reconnects_and_values_resume_after_recovery() {
 // Thresholds
 // ---------------------------------------------------------------------------
 
+/// #532 / #533: the tag registry has no thresholds; a caller that judges
+/// them (ChronoGazer) supplies them per tag id. Builds the config the way
+/// such a caller does.
+async fn config_with_thresholds(
+    pool: &SqlitePool,
+    tag_id: i64,
+    limits: Thresholds,
+) -> CollectorConfig {
+    let snapshot = RegistrySnapshot::load(pool).await.unwrap();
+    let (config, exclusions) = build_config_lenient_with_thresholds(
+        &snapshot,
+        &std::collections::HashMap::from([(tag_id, limits)]),
+    );
+    assert!(exclusions.is_empty(), "{exclusions:?}");
+    config
+}
+
 async fn entered_levels(pool: &SqlitePool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT level FROM collect_events WHERE kind = 'threshold_entered' AND level IS NOT NULL",
@@ -1045,14 +1059,22 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
         .create(group_input("G1", conn.id, 100))
         .await
         .unwrap();
-    let mut t = tag_input("t1", group.id, "40001", "i16");
-    t.threshold_ll = Some(5.0);
-    t.threshold_l = Some(20.0);
-    t.threshold_h = Some(50.0);
-    t.threshold_hh = Some(90.0);
-    TagService::new(pool.clone()).create(t).await.unwrap();
+    let t = TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "40001", "i16"))
+        .await
+        .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = config_with_thresholds(
+        &pool,
+        t.id,
+        Thresholds {
+            ll: Some(5.0),
+            l: Some(20.0),
+            h: Some(50.0),
+            hh: Some(90.0),
+        },
+    )
+    .await;
     let collector = Collector::start(
         config,
         &env.data_dir(),
@@ -1121,6 +1143,102 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
 
     collector.stop().await.unwrap();
     sim.stop();
+}
+
+/// #533（2026-10-08 オーナー決定「Hub はしきい値を持たず、警報を判定しない」）:
+/// banto-hub の組み立て（`build_config` = `RegistrySnapshot::load` +
+/// `build_config_from`、Hub の `hub.rs` と同じ関数）で収集すると、
+/// **しきい値イベントは 1 件も出ない** - migration 0018 より前の DB で
+/// `tags.threshold_*` に値が入っていたタグでも。
+///
+/// banto-tags の migration を 0017 まで流した DB（列がまだある）に H = 50 /
+/// HH = 90 のタグを入れ、`banto_tags::migrate` で 0018 を当ててから、その H/HH を
+/// 越える値（100）を何周期も読ませる。値は収集される（収集そのものは止まって
+/// いない）が、`threshold_entered` / `threshold_cleared` は 0 件のまま。
+///
+/// 反証（2026-10-09 実施）: banto-collect の `ThresholdSource::None` が
+/// 固定の limits（`h: Some(50.0)`）を返すようにすると、`threshold_entered` が
+/// 記録されてこのテストが落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hub_build_raises_no_threshold_event_even_for_pre_0018_threshold_columns() {
+    let _serial = TEST_SERIAL.lock().await;
+    let env = TempEnv::new("hub-no-threshold");
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 100); // 旧 H(50)・HH(90) を越える値
+
+    let pool = banto_storage::connect_sqlite(env.registry_path())
+        .await
+        .expect("connect registry");
+    // 0017 まで（しきい値の列がまだある形）。
+    let mut migrator = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../banto-tags/migrations"
+    )))
+    .await
+    .expect("load banto-tags migrations");
+    migrator.dangerous_set_table_name(banto_tags::MIGRATIONS_TABLE);
+    migrator.run_to(17, &pool).await.expect("migrate to 0017");
+    sqlx::query(
+        "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+         simulation, word_order) VALUES (1, 'PLC1', 'modbus-tcp', '127.0.0.1', ?, 1, 1, 0, \
+         'high_low')",
+    )
+    .bind(i64::from(sim.addr.port()))
+    .execute(&pool)
+    .await
+    .expect("seed connection");
+    sqlx::query(
+        "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled) \
+         VALUES (1, 'G1', 1, 100, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed group");
+    sqlx::query(
+        "INSERT INTO tags (id, name, collection_group_id, address, data_type, \
+         threshold_h, threshold_hh, threshold_l, threshold_ll, enabled) \
+         VALUES (1, 't1', 1, '40001', 'i16', 50, 90, 20, 5, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed tag with thresholds in the old columns");
+
+    // 0018 以降（列を落とす）と collect_events。
+    banto_tags::migrate(&pool).await.expect("tags migrate");
+    banto_collect::migrate(&pool)
+        .await
+        .expect("collect migrate");
+
+    let config = build_config(&pool).await.unwrap();
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+    let current = collector.current_values();
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current.get("tag:1").map(|s| s.value) == Some(Some(100.0))
+        })
+        .await,
+        "the tag must still be collected"
+    );
+    // 何周期か読ませてから止める（イベントの書き込みは stop で流し切る）。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    collector.stop().await.unwrap();
+    sim.stop();
+
+    assert_eq!(count_events(&pool, "collection_started").await, 1);
+    assert_eq!(
+        count_events(&pool, "threshold_entered").await,
+        0,
+        "banto-hub must not judge thresholds"
+    );
+    assert_eq!(count_events(&pool, "threshold_cleared").await, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,11 +1591,20 @@ async fn collect_events_rows_carry_the_full_shape() {
         .create(group_input("G1", conn.id, 100))
         .await
         .unwrap();
-    let mut t = tag_input("t1", group.id, "40001", "i16");
-    t.threshold_h = Some(50.0);
-    TagService::new(pool.clone()).create(t).await.unwrap();
+    let t = TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "40001", "i16"))
+        .await
+        .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = config_with_thresholds(
+        &pool,
+        t.id,
+        Thresholds {
+            h: Some(50.0),
+            ..Thresholds::default()
+        },
+    )
+    .await;
     let collector = Collector::start(
         config,
         &env.data_dir(),

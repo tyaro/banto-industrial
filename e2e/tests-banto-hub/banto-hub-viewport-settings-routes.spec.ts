@@ -6,7 +6,7 @@
  * 残している（レール/タブの viewport 切替を検証する spec としての名前）。
  *
  * **ログインしない（banto v3.0.0、ADR-0017）**: このメイン E2E サーバー（port
- * 8799、`lock_down()` を一度も呼ばない）は未ロックダウン＝試運転モードで、
+ * 8805、`lock_down()` を一度も呼ばない）は未ロックダウン＝試運転モードで、
  * loopback から繋ぐので `GET /api/auth/status` の `grants.commissioning` が
  * true になる。この spec はトークンを注入せず（`ensureLoggedIn`/
  * `injectAuthToken` を呼ばず）に保護画面へ `page.goto` し、`(app)/+layout.ts`

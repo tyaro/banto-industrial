@@ -1,14 +1,13 @@
 //! #532（2026-10-08 オーナー決定）: 収集のしきい値の判定は**記録計の側の
 //! タグごとの設定**（`chronogazer_core::tag_thresholds`）から作り、banto-tags の
-//! `tags.threshold_*` の列は使わない。判定に使ったしきい値はイベントに残る。
+//! `tags` にしきい値の列は無い（#533 で外した）。判定に使ったしきい値はイベントに残る。
 //!
 //! 実際のワイヤ経路（`banto_collect::simulation` のシミュレータを普通の
 //! Modbus TCP 接続として登録 - `collect_roundtrip.rs` と同じ）で、次を固定する:
 //!
-//! * タグの列には `HH = 0`（#532 より前の DB に残っていた値の想定。u16 は必ず
-//!   0 以上なので、列を使えば最初の読みで `HH` に入る）、記録計の側の設定には
-//!   `H = 0` を入れる。収集を始めると、**`H` に入った**イベントが、判定に使った
-//!   しきい値 `0` 付きで記録される（`HH` は出ない = 列は使われていない）。
+//! * 記録計の側の設定に `H = 0` を入れる（u16 は必ず 0 以上なので、最初の読みで
+//!   `H` に入る）。収集を始めると、**`H` に入った**イベントが、判定に使った
+//!   しきい値 `0` 付きで記録される。
 //! * 保存は走っている収集には反映されない。再起動で反映される（タグの保存と
 //!   同じ約束）: 走行中に設定を消しても新しいイベントは出ず、再起動後は判定
 //!   しない（`H` に入ったイベントは 1 件のまま）。
@@ -82,7 +81,7 @@ impl Drop for TempDir {
     }
 }
 
-/// 接続 1 / 収集グループ 1（100ms）/ タグ 1（列に `HH = 0`）。タグ id を返す。
+/// 接続 1 / 収集グループ 1（100ms）/ タグ 1。タグ id を返す。
 async fn register(pool: &SqlitePool, port: u16) -> i64 {
     let conn = PlcConnectionService::new(pool.clone())
         .create(PlcConnectionInput {
@@ -111,8 +110,6 @@ async fn register(pool: &SqlitePool, port: u16) -> i64 {
         })
         .await
         .expect("収集グループを登録できる");
-    // banto-tags のサービスを直接使い、列にしきい値を入れる（ChronoGazer の
-    // 画面・REST はもう列に書かない。#532 より前の DB の想定）。
     TagService::new(pool.clone())
         .create(TagInput {
             name: "ランプ".to_string(),
@@ -127,10 +124,6 @@ async fn register(pool: &SqlitePool, port: u16) -> i64 {
             eng_hi: None,
             unit: None,
             decimals: 0,
-            threshold_h: None,
-            threshold_hh: Some(0.0),
-            threshold_l: None,
-            threshold_ll: None,
             enabled: true,
             writable: false,
             tag_kind: "plc".to_string(),
@@ -218,7 +211,7 @@ async fn collection_judges_by_the_recorder_side_thresholds_and_records_the_limit
             Some("H".to_string()),
             Some(0.0)
         )],
-        "記録計の側の H = 0 で判定し、タグの列の HH は使わない"
+        "記録計の側の H = 0 で判定する"
     );
     assert_eq!(rows[0].tag_key.as_deref(), Some(tag_key.as_str()));
 

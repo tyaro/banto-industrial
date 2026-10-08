@@ -56,3 +56,7 @@ banto-storage = { workspace = true, features = ["sqlite"] }
 # real PLC socket involved - the injected fake client never touches disk
 # beyond the store itself).
 tempfile = { workspace = true }
+# #533: `tests/integration.rs` replays banto-tags' migrations only up to 0017
+# (`Migrator::run_to`) to seed a pre-0018 database whose `threshold_*`
+# columns still hold values, then lets `banto_tags::migrate` apply the rest.
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate"] }

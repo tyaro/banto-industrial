@@ -108,13 +108,16 @@ pub(crate) enum ProtocolConfig {
 
 /// A tag's fixed H/HH/L/LL limits (any subset may be set), compared against
 /// the *scaled* value. Ordering (`ll <= l <= h <= hh` among the set ones) is
-/// the source's job to guarantee at write time: `banto-tags` validation for
-/// the tag columns ([`build_config_lenient_from`]), the caller's own
-/// validation for limits it supplies ([`build_config_lenient_with_thresholds`]).
+/// the caller's job to guarantee at write time - its own validation of the
+/// limits it supplies ([`build_config_lenient_with_thresholds`]).
 ///
-/// `pub` since #532 (2026-10-08 owner decision: しきい値は使う側の設定): a
-/// caller that keeps thresholds outside the tag registry (ChronoGazer's
-/// recorder-side per-tag settings) builds these itself and hands them in.
+/// `pub` since #532 (2026-10-08 owner decision: しきい値は使う側の設定): the
+/// tag registry carries no limits at all (#533 dropped the `threshold_*`
+/// columns), so a caller that judges thresholds (ChronoGazer's recorder-side
+/// per-tag settings) builds these itself and hands them in. The builders that
+/// take no limits ([`build_config`] / [`build_config_from`] /
+/// [`build_config_lenient_from`] - banto-hub's) give every tag empty limits,
+/// so they never raise a `threshold_*` event.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Thresholds {
     pub hh: Option<f64>,
@@ -148,22 +151,18 @@ impl Thresholds {
 /// Where [`build_config_lenient_inner`] takes each tag's [`Thresholds`] from.
 #[derive(Clone, Copy)]
 enum ThresholdSource<'a> {
-    /// The tag registry's own `threshold_*` columns (banto-hub until #533).
-    TagColumns,
+    /// No limits for any tag (#533: banto-hub holds no thresholds and judges
+    /// no alarms - Hub はデータを集めて配る役に徹する).
+    None,
     /// Limits supplied by the caller, keyed by tag id. A tag with no entry
-    /// has no limits (#532: 既定は設定なし). The tag columns are ignored.
+    /// has no limits (#532: 既定は設定なし).
     Supplied(&'a HashMap<i64, Thresholds>),
 }
 
 impl ThresholdSource<'_> {
     fn for_tag(&self, tag: &Tag) -> Thresholds {
         match self {
-            Self::TagColumns => Thresholds {
-                hh: tag.threshold_hh,
-                h: tag.threshold_h,
-                l: tag.threshold_l,
-                ll: tag.threshold_ll,
-            },
+            Self::None => Thresholds::default(),
             Self::Supplied(map) => map.get(&tag.id).copied().unwrap_or_default(),
         }
     }
@@ -438,8 +437,7 @@ impl RegistrySnapshot {
         let tags = sqlx::query_as::<_, Tag>(
             "SELECT id, name, collection_group_id, address, data_type, \
              string_length, string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
-             threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
-             writable, tag_kind, expression, retain, revision FROM tags ORDER BY id",
+             enabled, writable, tag_kind, expression, retain, revision FROM tags ORDER BY id",
         )
         .fetch_all(&mut *connection)
         .await
@@ -743,24 +741,28 @@ impl ConfigExclusion {
 ///
 /// Same filtering, same order, same interpreter as [`build_config_from`]
 /// (which is this function plus "fail on the first exclusion"). banto-hub
-/// keeps using the strict one; chronogazer starts collection with this one.
+/// keeps using the strict one; chronogazer starts collection with
+/// [`build_config_lenient_with_thresholds`].
+///
+/// #533: every tag gets **no** limits (the registry has no threshold
+/// columns any more), so a collector built from this raises no
+/// `threshold_*` event.
 pub fn build_config_lenient_from(
     snapshot: &RegistrySnapshot,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
-    build_config_lenient_inner(snapshot, ThresholdSource::TagColumns)
+    build_config_lenient_inner(snapshot, ThresholdSource::None)
 }
 
 /// [`build_config_lenient_from`] with the tags' H/HH/L/LL limits **supplied
-/// by the caller** instead of read from the tag registry's `threshold_*`
-/// columns (#532, 2026-10-08 owner decision: しきい値はタグ定義の属性ではなく、
-/// 使う側（記録計・SCADA）が持つ設定). `thresholds` is keyed by tag id; a tag
-/// with no entry gets no limits (既定は設定なし) - whatever its columns say.
+/// by the caller** (#532, 2026-10-08 owner decision: しきい値はタグ定義の属性
+/// ではなく、使う側（記録計・SCADA）が持つ設定). `thresholds` is keyed by tag
+/// id; a tag with no entry gets no limits (既定は設定なし).
 ///
 /// Everything else - filtering, order, exclusions - is identical (same
 /// interpreter): thresholds never cause an exclusion. ChronoGazer uses this;
-/// banto-hub keeps reading the columns ([`build_config_from`]) until #533
-/// removes them. The caller is responsible for the `ll <= l <= h <= hh`
-/// ordering of what it supplies (see [`Thresholds`]).
+/// banto-hub uses [`build_config_from`], which gives no tag any limits (#533:
+/// Hub は警報を判定しない). The caller is responsible for the
+/// `ll <= l <= h <= hh` ordering of what it supplies (see [`Thresholds`]).
 pub fn build_config_lenient_with_thresholds(
     snapshot: &RegistrySnapshot,
     thresholds: &HashMap<i64, Thresholds>,
@@ -1350,10 +1352,6 @@ mod tests {
             eng_hi: None,
             unit: None,
             decimals: 0,
-            threshold_h: None,
-            threshold_hh: None,
-            threshold_l: None,
-            threshold_ll: None,
             enabled: true,
             writable: false,
             tag_kind: "plc".to_string(),
@@ -1592,13 +1590,18 @@ mod tests {
         assert_eq!(group.requests[1].data_type, DataType::Bit);
     }
 
-    /// #532: the tag columns feed the classic builds (banto-hub, unchanged
-    /// until #533); [`build_config_lenient_with_thresholds`] takes only what
-    /// the caller supplies - a tag missing from the map has no limits even if
-    /// its columns are set, and the columns never leak into a supplied entry.
-    /// Everything other than the limits is the same plan.
+    /// #532 / #533: the builders without limits (banto-hub's
+    /// [`build_config_from`] and [`build_config_lenient_from`]) give **every**
+    /// tag empty limits, so banto-hub never judges a threshold;
+    /// [`build_config_lenient_with_thresholds`] takes only what the caller
+    /// supplies - a tag missing from the map has no limits. Everything other
+    /// than the limits is the same plan.
+    ///
+    /// 反証（2026-10-09 実施）: `ThresholdSource::None` の `for_tag` が
+    /// 固定の limits（`h: Some(50.0)`）を返すようにすると、Hub 側の
+    /// `is_empty` の assert（1 つ目）で落ちる。
     #[tokio::test]
-    async fn supplied_thresholds_replace_the_tag_columns() {
+    async fn only_supplied_thresholds_reach_the_plan() {
         let pool = registry().await;
         let conn = PlcConnectionService::new(pool.clone())
             .create(conn_input("PLC1", 502))
@@ -1609,10 +1612,10 @@ mod tests {
             .await
             .unwrap();
         let tag_svc = TagService::new(pool.clone());
-        let mut with_columns = tag_input("Columns", group.id, "40001");
-        with_columns.threshold_h = Some(80.0);
-        with_columns.threshold_hh = Some(90.0);
-        let with_columns = tag_svc.create(with_columns).await.unwrap();
+        let unlisted = tag_svc
+            .create(tag_input("Unlisted", group.id, "40001"))
+            .await
+            .unwrap();
         let plain = tag_svc
             .create(tag_input("Plain", group.id, "40002"))
             .await
@@ -1620,14 +1623,19 @@ mod tests {
 
         let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
 
-        // Classic: the columns.
+        // Without limits (banto-hub): no tag has any.
         let (classic, _) = build_config_lenient_from(&snapshot);
-        let classic_tags = &classic.connections[0].groups[0].tags;
-        assert_eq!(classic_tags[0].thresholds.h, Some(80.0));
-        assert_eq!(classic_tags[0].thresholds.hh, Some(90.0));
-        assert!(classic_tags[1].thresholds.is_empty());
+        assert!(classic.connections[0].groups[0]
+            .tags
+            .iter()
+            .all(|tag| tag.thresholds.is_empty()));
+        let strict = build_config_from(&snapshot).unwrap();
+        assert!(strict.connections[0].groups[0]
+            .tags
+            .iter()
+            .all(|tag| tag.thresholds.is_empty()));
 
-        // Supplied: only the map. `with_columns` is absent -> no limits.
+        // Supplied: only the map. `unlisted` is absent -> no limits.
         let supplied = HashMap::from([(
             plain.id,
             Thresholds {
@@ -1640,11 +1648,8 @@ mod tests {
         let (config, exclusions) = build_config_lenient_with_thresholds(&snapshot, &supplied);
         assert!(exclusions.is_empty());
         let tags = &config.connections[0].groups[0].tags;
-        assert_eq!(tags[0].key, format!("tag:{}", with_columns.id));
-        assert!(
-            tags[0].thresholds.is_empty(),
-            "the tag columns must not be used when thresholds are supplied"
-        );
+        assert_eq!(tags[0].key, format!("tag:{}", unlisted.id));
+        assert!(tags[0].thresholds.is_empty());
         assert_eq!(tags[1].thresholds, supplied[&plain.id]);
 
         // Same plan apart from the limits.

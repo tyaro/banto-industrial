@@ -109,10 +109,6 @@ const BASE_TAG: Tag = {
 	engHi: null,
 	unit: null,
 	decimals: 0,
-	thresholdH: null,
-	thresholdHh: null,
-	thresholdL: null,
-	thresholdLl: null,
 	enabled: true,
 	writable: false,
 	tagKind: 'plc',
@@ -235,10 +231,6 @@ describe('configPackage', () => {
 				engHi: null,
 				unit: null,
 				decimals: 0,
-				thresholdH: null,
-				thresholdHh: null,
-				thresholdL: null,
-				thresholdLl: null,
 				enabled: true,
 				writable: false,
 				tagKind: 'plc',
@@ -258,10 +250,6 @@ describe('configPackage', () => {
 				engHi: null,
 				unit: null,
 				decimals: 0,
-				thresholdH: null,
-				thresholdHh: null,
-				thresholdL: null,
-				thresholdLl: null,
 				enabled: true,
 				writable: false,
 				tagKind: 'computed',
@@ -446,6 +434,46 @@ describe('configPackage', () => {
 		};
 		expect(() => parseConfigPackage(JSON.stringify(withBadStringEncoding))).toThrow(
 			/stringEncoding/
+		);
+	});
+
+	// --- #533（2026-10-08 オーナー決定「しきい値は使う側（記録計・SCADA）が
+	// 持つ設定で、Hub は持たない」）: export はしきい値を書かず、値付きの
+	// しきい値を持つ旧パッケージは取り込みを断る（`null`・項目なしは通す）。
+	// `CONFIG_PACKAGE_SCHEMA_VERSION` は 1 のまま。
+
+	it('#533: buildConfigPackage はタグのしきい値を書かない', () => {
+		const pkg = makePackage();
+		const text = serializeConfigPackage(pkg);
+		expect(text).not.toContain('threshold');
+		expect(CONFIG_PACKAGE_SCHEMA_VERSION).toBe(1);
+	});
+
+	it('#533: parseConfigPackage は しきい値が null の旧パッケージを受け入れ、しきい値を持ち込まない', () => {
+		const pkg = makePackage();
+		const old = {
+			...pkg,
+			tags: pkg.tags.map((t) => ({
+				...t,
+				thresholdH: null,
+				thresholdHh: null,
+				thresholdL: null,
+				thresholdLl: null
+			}))
+		};
+		const parsed = parseConfigPackage(JSON.stringify(old));
+		expect(parsed.tags[0].name).toBe(pkg.tags[0].name);
+		expect(Object.keys(parsed.tags[0]).filter((key) => key.startsWith('threshold'))).toEqual([]);
+	});
+
+	it('#533: parseConfigPackage は値付きのしきい値を持つ旧パッケージを拒否する（黙って捨てない）', () => {
+		const pkg = makePackage();
+		const old = {
+			...pkg,
+			tags: pkg.tags.map((t) => ({ ...t, thresholdH: null, thresholdHh: 90 }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(old))).toThrow(
+			/tags\[0\]\.thresholdHh にしきい値が入っています/
 		);
 	});
 

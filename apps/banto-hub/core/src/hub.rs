@@ -624,8 +624,10 @@ pub struct CollectorManager {
     /// `broadcast::Receiver` survives a rebuild instead of being silently
     /// orphaned. (T0 REST does not expose live event subscription - `/api/v1
     /// /events` reads the durable `collect_events` table directly - but the
-    /// collector-internal event flow (`plc_connected`/threshold edges/etc.)
-    /// still needs a stable sink to persist to.)
+    /// collector-internal event flow (`plc_connected`/`plc_disconnected`/etc.)
+    /// still needs a stable sink to persist to. #533: no threshold edges -
+    /// [`build_config_from`] gives no tag any limits, so the hub never
+    /// judges a threshold.)
     events: EventSink,
     /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory,
     /// owned OUTSIDE this manager (`bin/banto-hub.rs` constructs it and holds
@@ -2440,10 +2442,6 @@ mod tests {
             eng_hi: None,
             unit: None,
             decimals: 0,
-            threshold_h: None,
-            threshold_hh: None,
-            threshold_l: None,
-            threshold_ll: None,
             enabled: true,
             writable: false,
             tag_kind: "plc".to_string(),
@@ -2527,10 +2525,6 @@ mod tests {
                 eng_hi: None,
                 unit: None,
                 decimals: 0,
-                threshold_h: None,
-                threshold_hh: None,
-                threshold_l: None,
-                threshold_ll: None,
                 enabled: false,
                 writable: false,
                 tag_kind: "plc".to_string(),
@@ -2665,10 +2659,6 @@ mod tests {
                 eng_hi: None,
                 unit: None,
                 decimals: 0,
-                threshold_h: None,
-                threshold_hh: None,
-                threshold_l: None,
-                threshold_ll: None,
                 enabled: true,
                 writable: true,
                 tag_kind: "plc".to_string(),
@@ -2756,10 +2746,6 @@ mod tests {
                 eng_hi: None,
                 unit: None,
                 decimals: 0,
-                threshold_h: None,
-                threshold_hh: None,
-                threshold_l: None,
-                threshold_ll: None,
                 enabled: true,
                 writable: false,
                 tag_kind: "plc".to_string(),

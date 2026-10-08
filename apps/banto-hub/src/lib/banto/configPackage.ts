@@ -19,6 +19,11 @@ import type { GrpcSettings } from './grpcSettingsAdmin';
 import type { MqttSettings } from './mqttSettingsAdmin';
 import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
 
+/**
+ * #533（2026-10-08）でタグのしきい値（`thresholdH`/`thresholdHh`/`thresholdL`/
+ * `thresholdLl`）を外したが、版は 1 のまま: export は書かなくなり、取り込みは
+ * 項目なし・`null` を通し、値付きは拒否する（`rejectTagThresholds`）。
+ */
 export const CONFIG_PACKAGE_SCHEMA_VERSION = 1 as const;
 export const CONFIG_PACKAGE_PRODUCT = 'banto-hub' as const;
 
@@ -376,10 +381,6 @@ function sanitizeTag(input: Tag, groupName: string): ConfigPackageTag {
 		engHi: input.engHi,
 		unit: input.unit,
 		decimals: input.decimals,
-		thresholdH: input.thresholdH,
-		thresholdHh: input.thresholdHh,
-		thresholdL: input.thresholdL,
-		thresholdLl: input.thresholdLl,
 		enabled: input.enabled,
 		writable: input.writable,
 		tagKind: input.tagKind,
@@ -584,12 +585,43 @@ function parseCollectionGroups(raw: unknown): ConfigPackageCollectionGroup[] {
 	});
 }
 
+/**
+ * #533（2026-10-08 オーナー決定「しきい値は使う側（記録計・SCADA）が持つ設定で、
+ * Hub は持たない」）: タグのしきい値の 4 項目。export はもう書かない。
+ */
+const REMOVED_TAG_THRESHOLD_KEYS = [
+	'thresholdH',
+	'thresholdHh',
+	'thresholdL',
+	'thresholdLl'
+] as const;
+
+/**
+ * #533: しきい値を**値付きで**持つ旧パッケージ（#533 より前の export）は、
+ * 黙って捨てずに取り込みを断る（REST の `TagPayload::reject_thresholds` と
+ * 同じ考え方 - 捨てると、取り込んだ側は警報が設定できたと思い込む）。
+ * 項目が無い・`null`（#533 より前の export で、しきい値を設定していなかった
+ * タグ）は通す - `CONFIG_PACKAGE_SCHEMA_VERSION` は 1 のまま（項目を外した
+ * だけで、しきい値を使っていない旧パッケージはそのまま取り込める）。
+ */
+function rejectTagThresholds(item: Record<string, unknown>, index: number): void {
+	for (const key of REMOVED_TAG_THRESHOLD_KEYS) {
+		const value = item[key];
+		if (value !== undefined && value !== null) {
+			throw new ConfigPackageParseError(
+				`tags[${index}].${key} にしきい値が入っています。banto-hub はしきい値を持ちません（記録計・SCADA の側で設定します）。パッケージからしきい値を消してから取り込んでください`
+			);
+		}
+	}
+}
+
 function parseTags(raw: unknown): ConfigPackageTag[] {
 	if (!Array.isArray(raw)) {
 		throw new ConfigPackageParseError('tags は配列である必要があります');
 	}
 	return raw.map((entry, index) => {
 		const item = expectRecord(entry, `tags[${index}]`);
+		rejectTagThresholds(item, index);
 		return {
 			name: expectString(item.name, `tags[${index}].name`),
 			collectionGroupName: expectString(
@@ -607,10 +639,6 @@ function parseTags(raw: unknown): ConfigPackageTag[] {
 			engHi: expectNullableNumber(item.engHi, `tags[${index}].engHi`),
 			unit: expectNullableString(item.unit, `tags[${index}].unit`),
 			decimals: expectInteger(item.decimals, `tags[${index}].decimals`),
-			thresholdH: expectNullableNumber(item.thresholdH, `tags[${index}].thresholdH`),
-			thresholdHh: expectNullableNumber(item.thresholdHh, `tags[${index}].thresholdHh`),
-			thresholdL: expectNullableNumber(item.thresholdL, `tags[${index}].thresholdL`),
-			thresholdLl: expectNullableNumber(item.thresholdLl, `tags[${index}].thresholdLl`),
 			enabled: expectBoolean(item.enabled, `tags[${index}].enabled`),
 			writable: expectBoolean(item.writable, `tags[${index}].writable`),
 			tagKind: expectString(item.tagKind, `tags[${index}].tagKind`) as TagInput['tagKind'],

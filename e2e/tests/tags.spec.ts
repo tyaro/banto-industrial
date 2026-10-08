@@ -179,7 +179,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await thresholds.getByLabel('しきい値 L（下限）', { exact: true }).fill('50');
 		await thresholds.getByLabel('しきい値 H（上限）', { exact: true }).fill('10');
 		await thresholds.getByRole('button', { name: 'しきい値を保存', exact: true }).click();
-		// `validate_thresholds`（crates/banto-tags/src/tag.rs、ChronoGazer も同じ規則）の文言が H 欄に出る。
+		// `validate_threshold_order`（apps/chronogazer/core/src/tag_thresholds.rs）の文言が H 欄に出る。
 		await expect(thresholds.getByText('thresholdL 以上の値にしてください')).toBeVisible();
 
 		// 正しい組で保存する。案内は「収集を再起動」で反映すること。

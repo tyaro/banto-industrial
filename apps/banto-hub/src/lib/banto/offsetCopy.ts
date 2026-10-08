@@ -166,10 +166,6 @@ export interface OffsetCopyRow {
 	rawHi?: number | null;
 	engLo?: number | null;
 	engHi?: number | null;
-	thresholdH?: number | null;
-	thresholdHh?: number | null;
-	thresholdL?: number | null;
-	thresholdLl?: number | null;
 	enabled: boolean;
 	writable: boolean;
 }
@@ -276,10 +272,6 @@ export function buildOffsetCopyRows(
 			rawHi: source.rawHi,
 			engLo: source.engLo,
 			engHi: source.engHi,
-			thresholdH: source.thresholdH,
-			thresholdHh: source.thresholdHh,
-			thresholdL: source.thresholdL,
-			thresholdLl: source.thresholdLl,
 			enabled: source.enabled,
 			writable: source.writable
 		});
@@ -342,10 +334,6 @@ export function offsetCopyRowsToTagInputs(rows: OffsetCopyRow[]): TagInput[] {
 		rawHi: row.rawHi,
 		engLo: row.engLo,
 		engHi: row.engHi,
-		thresholdH: row.thresholdH,
-		thresholdHh: row.thresholdHh,
-		thresholdL: row.thresholdL,
-		thresholdLl: row.thresholdLl,
 		enabled: row.enabled,
 		writable: row.writable
 	}));
