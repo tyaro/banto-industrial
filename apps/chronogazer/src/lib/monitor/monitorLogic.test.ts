@@ -11,7 +11,9 @@
 import { describe, expect, it } from 'vitest';
 import type { CurrentSampleView } from '../banto/collectAdmin';
 import type { DisplayGroup } from '../banto/displayGroupsAdmin';
-import type { Tag } from '../banto/tagRegistryAdmin';
+// #532: しきい値はタグではなく記録計の側の設定。画面はタグにしきい値を添えた形
+// （`withThresholds`）で判定するので、テストもその形で組む。
+import type { TagWithThresholds as Tag } from '../banto/tagThresholdsAdmin';
 import {
 	LAST_GROUP_STORAGE_KEY,
 	MONITOR_POLL_DEFAULT_MS,

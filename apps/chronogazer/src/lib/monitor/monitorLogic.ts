@@ -21,7 +21,9 @@
  *
  * ## しきい値（Q5）
  *
- * タグに**今登録されている**しきい値で、画面側で判定する。判定の向きと優先順位は
+ * **記録計の側のタグごとの設定**（#532。`tagThresholdsAdmin.ts`、タグ定義の属性では
+ * ない）に今登録されているしきい値で、画面側で判定する。設定の無いタグは判定しない
+ * （色も文字も出さない）。判定の向きと優先順位は
  * 収集のしきい値イベント（`crates/banto-collect/src/task.rs` の
  * `classify_threshold`）と同じ: 上側が下側より優先、HH/LL が H/L より優先、
  * 上側は `>=`、下側は `<=`。色だけで伝えない（パネルは文言も出す）。
@@ -34,6 +36,7 @@
 import { qualityLabel, type CurrentSampleView } from '../banto/collectAdmin';
 import type { DisplayGroup, DisplayKind } from '../banto/displayGroupsAdmin';
 import type { CollectionGroup, Tag } from '../banto/tagRegistryAdmin';
+import type { TagWithThresholds, ThresholdFields } from '../banto/tagThresholdsAdmin';
 
 // --- グループの並びと選択 ----------------------------------------------------
 
@@ -206,7 +209,7 @@ export function formatValue(value: number, decimals: number): string {
 	return Number(text) === 0 ? (0).toFixed(digits) : text;
 }
 
-type TagThresholds = Pick<Tag, 'thresholdH' | 'thresholdHh' | 'thresholdL' | 'thresholdLl'>;
+type TagThresholds = ThresholdFields;
 
 /**
  * しきい値の判定（純関数）。`classify_threshold`（収集のしきい値イベント）と同じ
@@ -345,7 +348,7 @@ export function penView(
 export function groupPenViews(
 	group: Pick<DisplayGroup, 'pens'>,
 	values: Readonly<Record<string, CurrentSampleView>> | null,
-	tags: readonly Tag[]
+	tags: readonly TagWithThresholds[]
 ): PenView[] {
 	if (values === null) return [];
 	return group.pens.map((pen, index) =>

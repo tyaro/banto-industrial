@@ -38,9 +38,13 @@
 		isTagRegistryAvailable,
 		listCollectionGroups,
 		listTags,
-		type CollectionGroup,
-		type Tag
+		type CollectionGroup
 	} from '#lib/banto/tagRegistryAdmin.js';
+	import {
+		listTagThresholds,
+		withThresholds,
+		type TagWithThresholds
+	} from '#lib/banto/tagThresholdsAdmin.js';
 	import { displayGroupCatalog } from '#lib/monitor/displayGroupCatalog.svelte.js';
 	import { ValuesPoller } from '#lib/monitor/valuesPoller.svelte.js';
 	import {
@@ -107,14 +111,20 @@
 
 	// --- タグ情報（単位・小数桁・しきい値・収集周期） ---------------------------
 
-	let tags = $state<Tag[]>([]);
+	// #532: しきい値はタグではなく記録計の側の設定から読み、タグに添える。読めな
+	// ければタグ情報と同じ扱い（`tagsError`）で、前に読めた値を消さない。
+	let tags = $state<TagWithThresholds[]>([]);
 	let collectionGroups = $state<CollectionGroup[]>([]);
 	let tagsError = $state<string | null>(null);
 
 	async function loadTagMeta(): Promise<void> {
 		try {
-			const [tagRows, groupRows] = await Promise.all([listTags(), listCollectionGroups()]);
-			tags = tagRows;
+			const [tagRows, groupRows, thresholdRows] = await Promise.all([
+				listTags(),
+				listCollectionGroups(),
+				listTagThresholds()
+			]);
+			tags = withThresholds(tagRows, thresholdRows);
 			collectionGroups = groupRows;
 			tagsError = null;
 		} catch (err) {

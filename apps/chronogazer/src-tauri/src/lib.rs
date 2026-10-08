@@ -43,6 +43,7 @@ use chronogazer_core::display_groups::{
     DisplayGroupService, AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
 };
 use chronogazer_core::events::event_channel;
+// #532: 記録計の側のタグごとのしきい値。検証・保存は REST と同じ `TagThresholdService`。
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
     api_router, plc_connection_audit_detail, update_plc_connection, user_auth_state,
@@ -57,6 +58,10 @@ use chronogazer_core::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
     ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, update_tag_checked,
     TagPlacement,
+};
+use chronogazer_core::tag_thresholds::{
+    audit_detail as tag_thresholds_audit_detail, TagThresholdService, TagThresholds,
+    TagThresholdsPayload, AUDIT_RESOURCE as TAG_THRESHOLDS_RESOURCE,
 };
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
@@ -2752,6 +2757,8 @@ async fn tags_create(state: State<'_, AppState>, input: TagPayload) -> Result<Ta
 /// テストがコマンドの本体を直接呼ぶため）。
 async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, BantoError> {
     let actor = require_role(state, Role::Editor, "tags").await?;
+    // #532: しきい値は記録計の側の設定。値付きで送られたら断る（REST と同じ）。
+    input.reject_thresholds()?;
     // #414 段階1: REST の `tags_create` と同じ検査（両経路対称）。
     ensure_tag_fits_its_connection(
         &state.plc_connections,
@@ -2792,6 +2799,8 @@ async fn tags_update(
 /// テストがコマンドの本体を直接呼ぶため）。
 async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Result<Tag, BantoError> {
     let actor = require_role(state, Role::Editor, "tags").await?;
+    // #532: しきい値は記録計の側の設定。値付きで送られたら断る（REST と同じ）。
+    input.reject_thresholds()?;
     // #414 段階1: REST の `tags_update` と同じ検査（両経路対称）。所属
     // グループを変える更新も、入力のグループから接続を辿るので同じ検査で拾う。
     // 読む場所を変えずに無効化するだけの更新は検査しない（#418 P2）。
@@ -3005,6 +3014,65 @@ async fn display_groups_reorder_body(
     )
     .await;
     Ok(groups)
+}
+
+// --- #532: 記録計の側のタグごとのしきい値 ---------------------------------------
+
+/// しきい値のサービス。`display_groups_service` と同じく `AppState` の pool から
+/// 都度組む（テストの `AppState` の組み立てを増やさないため）。
+fn tag_thresholds_service(state: &AppState) -> TagThresholdService {
+    TagThresholdService::new(state.pool.clone())
+}
+
+/// `viewer`+ (R0 §3.6): 設定のあるタグのしきい値の一覧（タグ ID 順）。
+#[tauri::command]
+async fn tag_thresholds_list(state: State<'_, AppState>) -> Result<Vec<TagThresholds>, BantoError> {
+    tag_thresholds_list_body(&state).await
+}
+
+async fn tag_thresholds_list_body(state: &AppState) -> Result<Vec<TagThresholds>, BantoError> {
+    require_role(state, Role::Viewer, TAG_THRESHOLDS_RESOURCE).await?;
+    tag_thresholds_service(state).list().await
+}
+
+/// `viewer`+ (R0 §3.6): 1 つのタグのしきい値（設定が無ければ版 0 の「設定なし」）。
+#[tauri::command]
+async fn tag_thresholds_get(
+    state: State<'_, AppState>,
+    tag_id: i64,
+) -> Result<TagThresholds, BantoError> {
+    require_role(&state, Role::Viewer, TAG_THRESHOLDS_RESOURCE).await?;
+    tag_thresholds_service(&state).get(tag_id).await
+}
+
+/// `editor`+ (R0 §3.6): しきい値の保存（全項目置換）。版の食い違いは REST の
+/// `409` と同じ本文の検証エラー（`field_errors` の `expectedRevision`）。
+#[tauri::command]
+async fn tag_thresholds_update(
+    state: State<'_, AppState>,
+    tag_id: i64,
+    input: TagThresholdsPayload,
+) -> Result<TagThresholds, BantoError> {
+    tag_thresholds_update_body(&state, tag_id, input).await
+}
+
+async fn tag_thresholds_update_body(
+    state: &AppState,
+    tag_id: i64,
+    input: TagThresholdsPayload,
+) -> Result<TagThresholds, BantoError> {
+    let actor = require_role(state, Role::Editor, TAG_THRESHOLDS_RESOURCE).await?;
+    let updated = tag_thresholds_service(state).update(tag_id, &input).await?;
+    record_ok(
+        &state.audit,
+        &actor,
+        "update",
+        TAG_THRESHOLDS_RESOURCE,
+        Some(&tag_id.to_string()),
+        Some(tag_thresholds_audit_detail(&updated)),
+    )
+    .await;
+    Ok(updated.thresholds)
 }
 
 /// Body of [`audit_log_list`], split out so the `asOfId`-gated prune
@@ -4351,6 +4419,9 @@ pub fn run() {
             display_groups_update,
             display_groups_delete,
             display_groups_reorder,
+            tag_thresholds_list,
+            tag_thresholds_get,
+            tag_thresholds_update,
             simulation_coverage_list,
             config_exclusions_list,
             collect_status,
@@ -5597,13 +5668,15 @@ mod tests {
         }
     }
 
-    /// **#525（Tauri 経路）**: しきい値は保存され、古い `expectedRevision` の
-    /// 更新は `expectedRevision` の検証エラー（REST の 409 と同じ中身）で拒否される。
+    /// **#525 / #532（Tauri 経路）**: 古い `expectedRevision` の更新は
+    /// `expectedRevision` の検証エラー（REST の 409 と同じ中身）で拒否される。
+    /// しきい値はタグで受け取らない（#532: 記録計の側の設定）- 値付きの作成は
+    /// 断られ、タグの列は空のまま。
     ///
-    /// 反証: `tags_update_body` を `state.tags.update` に戻すと、最後の
+    /// 反証: `tags_update_body` を `state.tags.update` に戻すと、
     /// `is_revision_conflict` が落ちる（`Other` のまま返る）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tag_commands_carry_thresholds_and_enforce_the_expected_revision() {
+    async fn tag_commands_refuse_thresholds_and_enforce_the_expected_revision() {
         let state = app_state().await;
         let editor = state
             .users
@@ -5630,31 +5703,28 @@ mod tests {
             .await
             .expect("create collection group");
 
-        let mut payload = tag_payload("t", group.id, "40001");
-        payload.threshold_h = Some(8.0);
+        let payload = tag_payload("t", group.id, "40001");
+        let mut with_threshold = payload.clone();
+        with_threshold.threshold_h = Some(8.0);
+        let err = tags_create_body(&state, with_threshold)
+            .await
+            .expect_err("しきい値付きのタグが作れてしまった");
+        assert_eq!(only_field_error(err).field, "thresholdH");
+
         let tag = tags_create_body(&state, payload.clone())
             .await
             .expect("create");
-        assert_eq!(tag.threshold_h, Some(8.0));
-
-        // 大小関係が崩れる更新は拒否。
-        let mut bad = payload.clone();
-        bad.threshold_l = Some(9.0);
-        bad.expected_revision = Some(tag.revision);
-        assert!(matches!(
-            tags_update_body(&state, tag.id, bad).await,
-            Err(BantoError::Validation { .. })
-        ));
+        assert_eq!(tag.threshold_h, None);
 
         let mut ok = payload.clone();
-        ok.threshold_h = Some(7.0);
+        ok.unit = Some("kPa".to_string());
         ok.expected_revision = Some(tag.revision);
         let updated = tags_update_body(&state, tag.id, ok).await.expect("update");
-        assert_eq!(updated.threshold_h, Some(7.0));
+        assert_eq!(updated.unit.as_deref(), Some("kPa"));
 
         // 古い版での更新は食い違いとして拒否され、保存は変わらない。
         let mut stale = payload;
-        stale.threshold_h = Some(8.5);
+        stale.unit = Some("MPa".to_string());
         stale.expected_revision = Some(tag.revision);
         let err = tags_update_body(&state, tag.id, stale)
             .await
@@ -5663,7 +5733,10 @@ mod tests {
             chronogazer_core::tag_address::is_revision_conflict(&err),
             "{err:?}"
         );
-        assert_eq!(state.tags.get(tag.id).await.unwrap().threshold_h, Some(7.0));
+        assert_eq!(
+            state.tags.get(tag.id).await.unwrap().unit.as_deref(),
+            Some("kPa")
+        );
 
         // 削除済みのタグへの古い版の更新は NotFound（競合でも汎用エラーでもない）。
         state.tags.delete(tag.id).await.expect("delete");
@@ -8777,6 +8850,118 @@ mod tests {
                 "disabled={disabled} enabled={enabled} viewer_public={viewer_public}"
             );
         }
+    }
+
+    // --- #532: 記録計の側のしきい値（Tauri 経路） -----------------------------
+
+    /// **#532（Tauri 経路）**: REST と同じサービス・同じ検証・同じ監査の形。
+    /// viewer は読むだけ（保存は `Forbidden` で `denied` を監査）、editor は保存
+    /// でき、古い版は `expectedRevision` の検証エラー。`tags_delete` でタグを消すと
+    /// しきい値の行も消える。タグの作成・更新は値付きのしきい値を断る。
+    ///
+    /// 反証（2026-10-08 実施）: `tags_update_body` の `input.reject_thresholds()?` を
+    /// 消すと、`expect_err("タグにしきい値…")` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_threshold_commands_rbac_audit_conflict_and_cascade() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        let conn = state
+            .plc_connections
+            .create(connection_payload("plc", "modbus-tcp").into_create_input())
+            .await
+            .expect("create connection");
+        let group = state
+            .collection_groups
+            .create(
+                CollectionGroupPayload {
+                    name: "cg".to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 1000,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create collection group");
+        let tag = state
+            .tags
+            .create(tag_payload("t1", group.id, "40001").into())
+            .await
+            .expect("create tag");
+        let body = |h: Option<f64>, expected: Option<i64>| TagThresholdsPayload {
+            threshold_h: h,
+            expected_revision: expected,
+            ..TagThresholdsPayload::default()
+        };
+
+        // viewer: 読めるが保存できない。
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
+        assert!(tag_thresholds_list_body(&state).await.unwrap().is_empty());
+        let err = tag_thresholds_update_body(&state, tag.id, body(Some(80.0), Some(0)))
+            .await
+            .expect_err("viewer が保存できてしまった");
+        assert!(matches!(err, BantoError::Forbidden), "{err:?}");
+
+        // editor: 保存 → 古い版は拒否。
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+        let saved = tag_thresholds_update_body(&state, tag.id, body(Some(80.0), Some(0)))
+            .await
+            .expect("save");
+        assert_eq!(saved.threshold_h, Some(80.0));
+        assert_eq!(saved.revision, 1);
+        let err = tag_thresholds_update_body(&state, tag.id, body(Some(70.0), Some(0)))
+            .await
+            .expect_err("古い版");
+        assert_eq!(only_field_error(err).field, "expectedRevision");
+        assert_eq!(tag_thresholds_list_body(&state).await.unwrap(), vec![saved]);
+
+        // タグの更新は値付きのしきい値を断る（`null` は通る）。
+        let mut with_threshold = tag_payload("t1", group.id, "40001");
+        with_threshold.threshold_h = Some(1.0);
+        let err = tags_update_body(&state, tag.id, with_threshold)
+            .await
+            .expect_err("タグにしきい値を保存できてしまった");
+        assert_eq!(only_field_error(err).field, "thresholdH");
+        tags_update_body(&state, tag.id, tag_payload("t1改", group.id, "40001"))
+            .await
+            .expect("しきい値なしのタグの更新は通る");
+
+        // タグを消すと、しきい値も消える。
+        tags_delete_body(&state, tag.id).await.expect("delete tag");
+        assert!(tag_thresholds_list_body(&state).await.unwrap().is_empty());
+
+        let page = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let mut rows: Vec<_> = page
+            .rows
+            .into_iter()
+            .filter(|row| row.resource == "tag_thresholds")
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        let actions: Vec<(String, String, String)> = rows
+            .into_iter()
+            .map(|row| (row.action, row.result, row.origin))
+            .collect();
+        assert_eq!(
+            actions,
+            [("denied", "denied", "tauri"), ("update", "ok", "tauri")].map(|(a, r, o)| (
+                a.to_string(),
+                r.to_string(),
+                o.to_string()
+            ))
+        );
     }
 
     // --- #393: 表示グループ（Tauri 経路） ---------------------------------------

@@ -49,6 +49,7 @@
 		collectTimeLabel,
 		createCollectEventsResource,
 		eventKindLabel,
+		eventLevelLabel,
 		eventsView,
 		isCollectAvailable,
 		type CollectEventRow
@@ -93,10 +94,11 @@
 			sortable: false
 		},
 		{
+			// #532: しきい値のイベントは判定に使ったしきい値も出す（`eventLevelLabel`）。
 			id: 'level',
 			header: '水準',
-			accessor: (row) => row.level ?? '-',
-			width: 80,
+			accessor: (row) => eventLevelLabel(row),
+			width: 140,
 			sortable: false
 		},
 		{

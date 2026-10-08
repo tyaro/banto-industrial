@@ -65,6 +65,7 @@
  */
 
 import type { Tag, TagDataType, TagInput } from '#lib/banto/tagRegistryAdmin.js';
+import type { TagThresholdsInput, ThresholdFields } from '#lib/banto/tagThresholdsAdmin.js';
 
 export interface FieldError {
 	field: string;
@@ -556,21 +557,19 @@ export function simulationCoverageView<T extends { supported: boolean }>(
 
 // --- F: タグのフォーム値 <-> 送受信の形（#525） ---------------------------------
 //
-// しきい値（H/HH/L/LL）と楽観ロック用の版（`revision`）を扱う。`PUT` は置換
-// （省略したしきい値は消える）なので、**更新では 4 項目を必ず載せ**、編集を
-// 始めた時点の版を `expectedRevision` として送る。判断は `+page.svelte` の
+// 楽観ロック用の版（`revision`）を扱う。編集を始めた時点の版を
+// `expectedRevision` として送る。**しきい値はタグのフォームに無い**（#532: 記録計
+// の側の設定。下の「G」の別フォームで別に保存する）。判断は `+page.svelte` の
 // 外（ここ）に置いて、vitest で総当たりする。
-
-const THRESHOLD_SUFFIXES = ['ThresholdH', 'ThresholdHh', 'ThresholdL', 'ThresholdLl'] as const;
 
 function numOrNull(v: unknown): number | null {
 	return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
 /**
- * フォームの値から送信用の `TagInput` を作る。しきい値は空欄 = `null`（設定なし）で
- * **常に 4 項目とも載せる**。`expectedRevision` を渡すと更新用（楽観ロック）、
- * 渡さないと作成用（版を持たない）。
+ * フォームの値から送信用の `TagInput` を作る。`expectedRevision` を渡すと
+ * 更新用（楽観ロック）、渡さないと作成用（版を持たない）。しきい値は載せない
+ * （#532。載せるとサーバーが断る）。
  */
 export function buildTagInput(
 	prefix: string,
@@ -592,17 +591,13 @@ export function buildTagInput(
 		engHi: numOrNull(values[`${prefix}EngHi`]),
 		unit: unit === '' ? null : unit,
 		decimals: typeof decimals === 'number' ? decimals : 0,
-		thresholdH: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[0]}`]),
-		thresholdHh: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[1]}`]),
-		thresholdL: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[2]}`]),
-		thresholdLl: numOrNull(values[`${prefix}${THRESHOLD_SUFFIXES[3]}`]),
 		enabled: Boolean(values[`${prefix}Enabled`])
 	};
 	if (expectedRevision !== undefined) input.expectedRevision = expectedRevision;
 	return input;
 }
 
-/** 既存のタグから編集フォームの初期値を作る（しきい値も含む）。 */
+/** 既存のタグから編集フォームの初期値を作る。 */
 export function tagFormValues(prefix: string, tag: Tag): Record<string, unknown> {
 	return {
 		[`${prefix}Name`]: tag.name,
@@ -615,13 +610,61 @@ export function tagFormValues(prefix: string, tag: Tag): Record<string, unknown>
 		[`${prefix}EngHi`]: tag.engHi,
 		[`${prefix}Unit`]: tag.unit,
 		[`${prefix}Decimals`]: tag.decimals,
-		[`${prefix}ThresholdH`]: tag.thresholdH,
-		[`${prefix}ThresholdHh`]: tag.thresholdHh,
-		[`${prefix}ThresholdL`]: tag.thresholdL,
-		[`${prefix}ThresholdLl`]: tag.thresholdLl,
 		[`${prefix}Enabled`]: tag.enabled
 	};
 }
+
+// --- G: しきい値のフォーム値 <-> 送受信の形（#532） --------------------------------
+//
+// しきい値（H/HH/L/LL）は記録計の側のタグごとの設定で、タグとは**別の保存**
+// （`updateTagThresholds`）・別の版（`TagThresholds.revision`、設定の無いタグは 0）を
+// 持つ。保存は全項目置換なので **4 項目とも必ず載せ**（空欄 = `null` = 設定なし）、
+// 編集を始めた時点の版を `expectedRevision` として送る。フォームの欄の名前は
+// `${prefix}ThresholdLl` など（サーバーの検証エラーの `thresholdLl` などがそのまま
+// 対応する - `THRESHOLD_WIRE_FIELDS`）。
+
+/** しきい値のフォームの欄（wire の名前。並びは LL → L → H → HH）。 */
+export const THRESHOLD_WIRE_FIELDS = [
+	'thresholdLl',
+	'thresholdL',
+	'thresholdH',
+	'thresholdHh'
+] as const;
+
+function capitalized(field: string): string {
+	return field.charAt(0).toUpperCase() + field.slice(1);
+}
+
+/** しきい値のフォームの値から保存の本文を作る（4 項目とも必ず載る）。 */
+export function buildThresholdsInput(
+	prefix: string,
+	values: Record<string, unknown>,
+	expectedRevision: number
+): TagThresholdsInput {
+	const pick = (field: (typeof THRESHOLD_WIRE_FIELDS)[number]) =>
+		numOrNull(values[`${prefix}${capitalized(field)}`]);
+	return {
+		thresholdLl: pick('thresholdLl'),
+		thresholdL: pick('thresholdL'),
+		thresholdH: pick('thresholdH'),
+		thresholdHh: pick('thresholdHh'),
+		expectedRevision
+	};
+}
+
+/** 読んだしきい値からフォームの初期値を作る。 */
+export function thresholdFormValues(
+	prefix: string,
+	thresholds: ThresholdFields
+): Record<string, unknown> {
+	return Object.fromEntries(
+		THRESHOLD_WIRE_FIELDS.map((field) => [`${prefix}${capitalized(field)}`, thresholds[field]])
+	);
+}
+
+/** しきい値を保存したときの案内（収集への反映は再起動、タグの保存と同じ約束）。 */
+export const THRESHOLDS_SAVED_MESSAGE =
+	'しきい値を保存しました。収集中なら「収集を再起動」で反映されます';
 
 // 保存の失敗が「版の食い違い（他者が先に更新した）」か。判定は表示グループと共通
 // （`#lib/banto/revisionConflict.ts`）。既存の呼び出し元のためにここからも引ける。

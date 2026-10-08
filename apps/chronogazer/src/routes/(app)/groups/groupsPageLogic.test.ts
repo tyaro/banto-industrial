@@ -19,6 +19,8 @@ import {
 	sortFieldErrors,
 	tagsUsedByOtherPens,
 	thresholdSummary,
+	penThresholdText,
+	THRESHOLDS_UNREADABLE,
 	type GroupDraft
 } from './groupsPageLogic';
 
@@ -129,7 +131,7 @@ describe('ペンの操作', () => {
 	});
 });
 
-describe('しきい値の表示（タグ定義の値を読むだけ）', () => {
+describe('しきい値の表示（記録計の側の設定を読むだけ、#532）', () => {
 	it('LL / L / H / HH の順に、無いものは —', () => {
 		expect(thresholdSummary({ thresholdL: 10, thresholdH: 90 })).toBe('LL — / L 10 / H 90 / HH —');
 		expect(
@@ -141,6 +143,23 @@ describe('しきい値の表示（タグ定義の値を読むだけ）', () => {
 		expect(thresholdSummary({})).toBe('しきい値なし');
 		expect(thresholdSummary({ thresholdH: null })).toBe('しきい値なし');
 		expect(thresholdSummary(undefined)).toBe('—');
+	});
+});
+
+describe('penThresholdText（#532: 読めなかったことを「しきい値なし」に潰さない）', () => {
+	const loaded = new Map([
+		[2, { thresholdLl: null, thresholdL: null, thresholdH: 80, thresholdHh: null }]
+	]);
+
+	it.each<[string, number | null, boolean, typeof loaded | null, boolean, string]>([
+		['タグ未選択', null, false, loaded, false, '—'],
+		['タグが見つからない', 9, false, loaded, false, '—'],
+		['しきい値を読み込み中', 2, true, null, false, '—'],
+		['しきい値を読めなかった', 2, true, null, true, THRESHOLDS_UNREADABLE],
+		['設定のあるタグ', 2, true, loaded, false, 'LL — / L — / H 80 / HH —'],
+		['設定の無いタグ（既定）', 3, true, loaded, false, 'しきい値なし']
+	])('%s', (_label, tagId, tagKnown, thresholds, failed, expected) => {
+		expect(penThresholdText(tagId, tagKnown, thresholds, failed)).toBe(expected);
 	});
 });
 

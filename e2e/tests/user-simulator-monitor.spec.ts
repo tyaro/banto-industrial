@@ -18,6 +18,9 @@
  *    名前は 1 つ（`LL/L/H`）にまとまり、レンジとしきい値は画面外の文で読める（#535）。
  * 7. 計器（D-2）: banto の `Gauge` が出て値が変わる。不正なタグは弧を描かず
  *    「—」（banto v6.3.0 の値なし）。しきい値の判定は `data-level` と文字で出る。
+ * 8.（#532）しきい値はタグではなく**記録計の側の設定**（`PUT /api/tag-thresholds/{id}`）
+ *    に入れ、監視画面はそこから判定する。収集のしきい値のイベントは、判定に使った
+ *    しきい値を `/events` の「水準」に出す（`H 0 以上`）。
  *
  * ## ファイル名（実行順）
  *
@@ -115,6 +118,30 @@ async function postJson<T>(
 	return (await res.json()) as T;
 }
 
+/**
+ * #532: 記録計の側のしきい値を保存する（タグの本文にはもう載せられない）。
+ * 新しいタグは設定が無いので版は 0。
+ */
+async function putThresholds(
+	request: APIRequestContext,
+	headers: ApiHeaders,
+	tagId: number,
+	thresholds: {
+		thresholdLl?: number;
+		thresholdL?: number;
+		thresholdH?: number;
+		thresholdHh?: number;
+	}
+): Promise<void> {
+	const res = await request.put(`/api/tag-thresholds/${tagId}`, {
+		headers,
+		data: { ...thresholds, expectedRevision: 0 }
+	});
+	if (!res.ok()) {
+		throw new Error(`PUT /api/tag-thresholds/${tagId} が ${res.status()}: ${await res.text()}`);
+	}
+}
+
 async function setConnectionEnabled(
 	request: APIRequestContext,
 	headers: ApiHeaders,
@@ -192,6 +219,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 	let headers: ApiHeaders;
 	let disabledByUs: ConnectionRow[] = [];
 	const groupIds: Record<string, number> = {};
+	let highTagId = 0;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -235,17 +263,17 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		const invalid = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
 			name: TAG_INVALID,
-			address: '40002',
-			thresholdLl: 0,
-			thresholdHh: 100
+			address: '40002'
 		});
+		await putThresholds(page.request, headers, invalid.id, { thresholdLl: 0, thresholdHh: 100 });
 		// u16 は 0 以上なので、H = 0 なら必ず「H 上限以上」になる（しきい値の表示の確認）。
 		const high = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
 			name: TAG_HIGH,
-			address: '40003',
-			thresholdH: 0
+			address: '40003'
 		});
+		await putThresholds(page.request, headers, high.id, { thresholdH: 0 });
+		highTagId = high.id;
 		// D-2: 工学値レンジ（生値をそのまま 0..65535 に写す = 値は変わらない）。
 		const scaledTag = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
@@ -264,10 +292,9 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		const over = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
 			name: TAG_OVER,
-			address: '40005',
-			thresholdLl: 0,
-			thresholdHh: 1
+			address: '40005'
 		});
+		await putThresholds(page.request, headers, over.id, { thresholdLl: 0, thresholdHh: 1 });
 		// #535: 等号は正しい設定（LL <= L <= H <= HH）。同じ値の名前は 1 つにまとまる。
 		const equal = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
@@ -276,7 +303,9 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			rawLo: 0,
 			rawHi: 65535,
 			engLo: 0,
-			engHi: 65535,
+			engHi: 65535
+		});
+		await putThresholds(page.request, headers, equal.id, {
 			thresholdLl: 30000,
 			thresholdL: 30000,
 			thresholdH: 30000,
@@ -352,6 +381,24 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 
 		await expect(cell(TAG_HIGH)).toContainText('H 上限以上');
 		await expect(cell(TAG_HIGH).locator('.value')).toHaveText(/^\d+$/);
+	});
+
+	test('2b. しきい値のイベントは、判定に使ったしきい値を「水準」に出す（#532）', async () => {
+		await page.goto('/events');
+		await expect(page.getByRole('heading', { level: 2, name: 'イベント' })).toBeVisible();
+		// 記録計の側の H = 0 で判定した「超過」の行。`tag:<id>` は完全一致で絞る
+		// （`tag:1` が `tag:12` に部分一致しないように）。
+		const highRow = page
+			.getByRole('row')
+			.filter({ has: page.getByRole('gridcell', { name: `tag:${highTagId}`, exact: true }) });
+		await expect(highRow.getByRole('gridcell', { name: 'しきい値超過', exact: true })).toBeVisible({
+			timeout: 15_000
+		});
+		await expect(highRow.getByRole('gridcell', { name: 'H 0 以上', exact: true })).toBeVisible();
+
+		await page.goto(`/monitor?group=${groupIds[GROUP_1]}`);
+		await expect(tab(GROUP_1)).toHaveAttribute('aria-selected', 'true');
+		await expect(cell(TAG_RAMP).locator('.value')).toHaveText(/^\d+$/, { timeout: 20_000 });
 	});
 
 	test('3. タブで切り替えると URL の ?group= が変わり、値は前のグループから持ち越さない', async () => {

@@ -35,6 +35,7 @@ import {
 	connectionSimulationNote,
 	connectionStatusLabel,
 	eventKindLabel,
+	eventLevelLabel,
 	isCollectStale,
 	nextPollFailureCount,
 	startFailedReason,
@@ -368,6 +369,33 @@ describe('eventKindLabel', () => {
 
 	it('未知の種類は綴りをそのまま出す（落とさない・失敗しない）', () => {
 		expect(eventKindLabel('some_future_kind')).toBe('some_future_kind');
+	});
+});
+
+describe('eventLevelLabel（#532: 判定に使ったしきい値を添える）', () => {
+	const row = (kind: string, level: string | null, limitValue: number | null) => ({
+		kind,
+		level,
+		limitValue
+	});
+
+	it.each([
+		['threshold_entered', 'H', 80, 'H 80 以上'],
+		['threshold_entered', 'HH', 95.5, 'HH 95.5 以上'],
+		['threshold_entered', 'L', 10, 'L 10 以下'],
+		['threshold_entered', 'LL', 0, 'LL 0 以下'],
+		['threshold_cleared', 'H', 80, 'H 80 から復帰'],
+		['threshold_cleared', 'LL', -5, 'LL -5 から復帰']
+	])('%s %s %s → %s', (kind, level, limit, expected) => {
+		expect(eventLevelLabel(row(kind, level, limit))).toBe(expected);
+	});
+
+	it('しきい値が記録されていない行（#532 より前）は段の名前だけ', () => {
+		expect(eventLevelLabel(row('threshold_entered', 'H', null))).toBe('H');
+	});
+
+	it('段の無いイベントは -', () => {
+		expect(eventLevelLabel(row('collection_started', null, null))).toBe('-');
 	});
 });
 
