@@ -1657,10 +1657,24 @@ impl TagService {
     /// Validation and side effects are identical to [`Self::update`] (the
     /// two differ only in pool vs. connection for the placement check; there
     /// is no audit/notify step in either).
+    ///
+    /// **`BEGIN IMMEDIATE`**: the transaction is started with
+    /// `begin_with("BEGIN IMMEDIATE")` rather than a plain `begin()` (SQLite's
+    /// default `BEGIN DEFERRED`). `update_tx` runs read-only `SELECT`s (the
+    /// placement check) before its `UPDATE`; under WAL, if another connection
+    /// commits in between, the snapshot this transaction already established
+    /// is stale and the `UPDATE` fails at once with `SQLITE_BUSY_SNAPSHOT`
+    /// (517) - the busy handler / `busy_timeout` is NOT consulted for that
+    /// case - surfacing as a storage error (HTTP 500) instead of a success or
+    /// a `RevisionConflict`. `BEGIN IMMEDIATE` takes the write lock up front,
+    /// so a concurrent writer just makes this call wait (within
+    /// `busy_timeout`, 5 s by default in `banto_storage::connect_sqlite*`)
+    /// and the later `UPDATE` sees the committed state. Same precedent and
+    /// reasoning as `apps/banto-hub/core/src/sink/service.rs`.
     pub async fn update_checked(&self, id: i64, input: TagInput) -> Result<Tag, TagUpdateError> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
         match self.update_tx(&mut tx, id, input).await {
@@ -2533,6 +2547,10 @@ mod tests {
         let pool = banto_storage::connect_sqlite_memory()
             .await
             .expect("connect_sqlite_memory");
+        setup_on(pool).await
+    }
+
+    async fn setup_on(pool: SqlitePool) -> (TagService, i64) {
         migrate(&pool).await.expect("migrate");
 
         let plc_svc = PlcConnectionService::new(pool.clone());
@@ -2854,6 +2872,71 @@ mod tests {
             svc.update_checked(created.id, gone).await.unwrap_err(),
             TagUpdateError::Banto(BantoError::NotFound { .. })
         ));
+    }
+
+    /// **BEGIN IMMEDIATE の回帰**（#527 レビュー）: ファイル DB（WAL）で、
+    /// 別コネクションが書き込みを保持している間に `update_checked` を始め、
+    /// そのコネクションがコミットしても成功すること。素の `begin()`（DEFERRED）
+    /// だと、先に検証用 `SELECT` で読み取りスナップショットを張ったあとに別の
+    /// 書き込みがコミットされ、`UPDATE` が待たずに `SQLITE_BUSY_SNAPSHOT` で
+    /// 失敗する（ストレージエラー）。
+    #[tokio::test]
+    async fn update_checked_waits_for_a_concurrent_writer_instead_of_failing_busy_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "banto-tags-update-checked-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool_a = banto_storage::connect_sqlite(&path)
+            .await
+            .expect("connect a");
+        let (svc, group_id) = setup_on(pool_a.clone()).await;
+        let t1 = svc.create(sample_input("Imm1", group_id)).await.unwrap();
+        let t2 = svc.create(sample_input("Imm2", group_id)).await.unwrap();
+
+        // 別コネクション（別プール）が書き込みロックを握る。
+        let pool_b = banto_storage::connect_sqlite(&path)
+            .await
+            .expect("connect b");
+        let mut writer = pool_b.acquire().await.expect("acquire b");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .expect("begin immediate on b");
+        sqlx::query("UPDATE tags SET name = 'Imm2-external' WHERE id = ?")
+            .bind(t2.id)
+            .execute(&mut *writer)
+            .await
+            .expect("external write");
+
+        let svc_a = svc.clone();
+        let mut input = sample_input("Imm1-updated", group_id);
+        input.expected_revision = Some(t1.revision);
+        let update = tokio::spawn(async move { svc_a.update_checked(t1.id, input).await });
+
+        // update_checked が検証 SELECT まで進む時間を与えてからコミットする。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("COMMIT")
+            .execute(&mut *writer)
+            .await
+            .expect("commit b");
+        drop(writer);
+
+        let updated = update
+            .await
+            .expect("join")
+            .expect("update_checked は別コネクションのコミットを待って成功するはず");
+        assert_eq!(updated.name, "Imm1-updated");
+        assert_eq!(svc.get(t2.id).await.unwrap().name, "Imm2-external");
+
+        pool_a.close().await;
+        pool_b.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[tokio::test]
