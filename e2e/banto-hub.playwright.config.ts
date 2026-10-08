@@ -42,9 +42,11 @@ import { fileURLToPath } from 'node:url';
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(dirname, '..');
 
-// chronogazer は 8798（e2e/playwright.config.ts）: banto-hub はその隣の
-// 8799 を使い、同一マシンで両方の `webServer` を同時に起動しても衝突しない。
-const PORT = 8799;
+// chronogazer は 8798（e2e/playwright.config.ts）: banto-hub は 8805 を使い、
+// 同一マシンで両方の `webServer` を同時に起動しても衝突しない。2026-10-09
+// オーナー決定で 8799 から移した（オーナーが 8799 を別の作業で使うため。
+// banto 本体の E2E は今も 8799 を使う）。
+const PORT = 8805;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 
 // #341（2026-09-14）: **ロックダウン済み専用の2台目**。試運転中（未ロック
@@ -58,7 +60,7 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 // 同じ理由）。そこで upstream banto の e2e `public-viewer`（別ポートの2本目
 // banto-serve）と同じ型で、サーバーごと分ける。
 //
-// ポートは 8802 - 8798 chronogazer / 8799 banto-hub 本体 /
+// ポートは 8802 - 8798 chronogazer / 8805 banto-hub 本体（2026-10-09 に 8799 から移した） /
 // 8800 relay-wright / 8801 banto-hub perf（`banto-hub-perf.playwright.config.ts`）
 // のいずれとも衝突しない（指示の 8801 は perf が既に使用済みのため1つずらした）。
 const LOCKED_DOWN_PORT = 8802;

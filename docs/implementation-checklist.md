@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-08（§5 に「SQLite で読み取りを挟む書き込みトランザクションは `BEGIN IMMEDIATE`」を追加。#527 のオーナーレビュー P2）
+最終更新: 2026-10-09（§2-8 の banto-hub の E2E のポートを 8799 から 8805 に直した。オーナーが 8799 を別の作業で使うため、オーナー決定）
+2026-10-08（§5 に「SQLite で読み取りを挟む書き込みトランザクションは `BEGIN IMMEDIATE`」を追加。#527 のオーナーレビュー P2）
 2026-10-07（§2-7/§2-8 に閲覧公開 E2E のポート 8804 を追記、#507）
 2026-10-07（§2 に「`@banto/*` の git 依存を上げるとき `pnpm-lock.yaml` を手で書き換えない」を追加。#515 で lock の version が旧版のまま残った）
 2026-10-05（§2-6 に「`sv migrate` は最後にルートの `pnpm run format`（= `prettier --write .`）を自動で走らせる」を追加。banto-hub の SvelteKit 3 移行で対象外の 4 ファイルが改行だけ書き換わった）
@@ -51,7 +52,7 @@
 7. [ ] E2E の前に必ず: `pnpm --filter <app> build` → **`cargo build -p <core> --bin <bin> --features embed-ui`**（**`--features embed-ui` を落とすと smoke が全滅する**）
    - [ ] **chronogazer の E2E（`pnpm e2e`）は、加えて `cargo build -p chronogazer-core --example dev_plc`**（2 つ目の `webServer` = 開発用 PLC。R1-C の C-4 で追加。ビルドし忘れると `webServer` の起動で全体が落ちる）
    - [ ] **chronogazer の閲覧公開 E2E（`pnpm e2e:public-viewer`、#507）は `banto-serve` だけ**（上の chronogazer ビルドで足りる。`dev_plc` は不要。`BANTO_VIEWER_PUBLIC=1` の 2 台目をポート 8804 で起動）
-8. [ ] **緑の確認は 1 回だけ**（通るまで回し直さない）。**反証（修正を戻して落ちるかの確認、§5）は、理由を書けば別に回してよい**。`describe.serial` は最初の失敗で以降を skip するので、反証が複数本あると 1 回では取れない（#409 で 3 回実行した。2026-09-23 オーナー決定）。反証の実行は PR 本文に「何を戻して、どのテストが落ちたか」を書く。実行前に残プロセスが 0 で、ポートが空いていることを確認（Windows: `Get-Process <bin>` / POSIX: `pgrep -f <bin>`）。**同時に 2 つ走らせない**。**E2E は worktree やエージェントが違っても同時に 1 本だけ**（同じ固定ポートを取り合う。2026-09-23 オーナー指示）。**リポジトリをまたいでも**（banto と banto-industrial の E2E は同じポート 8798 / 8799 / 4173 を使う。banto-industrial には閲覧公開の `pnpm e2e:public-viewer`（8804、2026-10-07 #507）もあり、`pnpm e2e` や他の E2E と同時に走らせない。2026-09-24 に #234 と #429 の作業でぶつかった）。失敗の詳細は `e2e/test-results-*/<test>/error-context.md`
+8. [ ] **緑の確認は 1 回だけ**（通るまで回し直さない）。**反証（修正を戻して落ちるかの確認、§5）は、理由を書けば別に回してよい**。`describe.serial` は最初の失敗で以降を skip するので、反証が複数本あると 1 回では取れない（#409 で 3 回実行した。2026-09-23 オーナー決定）。反証の実行は PR 本文に「何を戻して、どのテストが落ちたか」を書く。実行前に残プロセスが 0 で、ポートが空いていることを確認（Windows: `Get-Process <bin>` / POSIX: `pgrep -f <bin>`）。**同時に 2 つ走らせない**。**E2E は worktree やエージェントが違っても同時に 1 本だけ**（同じ固定ポートを取り合う。2026-09-23 オーナー指示）。**リポジトリをまたいでも**（banto の E2E は 8798 / 8799 / 4173、banto-industrial の E2E は 8798（chronogazer）/ 8805（banto-hub、2026-10-09 に 8799 から移した - オーナーが 8799 を別の作業で使うため）/ 8802 / 8803 を使い、8798 が重なる。banto-industrial には閲覧公開の `pnpm e2e:public-viewer`（8804、2026-10-07 #507）もあり、`pnpm e2e` や他の E2E と同時に走らせない。2026-09-24 に #234 と #429 の作業でぶつかった）。失敗の詳細は `e2e/test-results-*/<test>/error-context.md`
 9. [ ] `cargo deny check`（CI にある）
    - [ ] **banto の版を上げるときに `cargo update -p banto-core -p banto-storage -p banto-server -p banto-admin-services` を使わない**。タグを付け替えるだけのつもりでも、cargo は同時に無関係な crate を**再解決して降格する**（2026-10-04 の v3.0.0 追従で `windows-sys 0.61.2 → 0.60.2`・`socket2 0.6.4 → 0.5.10` が 10 か所以上付け替わった。#450/#465/#484 と同じ型）。`Cargo.lock` の banto 4 crate の `version`/`source`（コミット SHA はタグの `git rev-parse <tag>^{commit}`）を**手で書き換え**、`cargo metadata --locked` が通ることで確かめる。
    - [ ] **`@banto/*` の git 依存を上げるとき `pnpm-lock.yaml` を手で書き換えない**（Cargo.lock と逆）。SHA・specifier だけ直すと `packages:` の `version:` が旧版のまま残り、pnpm は「lock は最新」と判断して再解決しない。ストアを再利用する `pnpm install --frozen-lockfile`（CI のキャッシュ復元・別 checkout）が `ERR_PNPM_UNEXPECTED_PKG_CONTENT_IN_STORE`（lock の 5.0.0 と実 manifest の 5.1.0 の食い違い）で落ちる。#515 のオーナーレビュー P2、2026-10-07。対処: `packages:`/`snapshots:` の `@banto/*` 項目を消してから `pnpm install --no-frozen-lockfile` で再生成し、各 `version:` が取得元の実 `package.json` と一致することを確認する。
