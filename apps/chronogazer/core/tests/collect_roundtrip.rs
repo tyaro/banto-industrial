@@ -24,7 +24,11 @@
 //!   いる**（ファイルがあるだけでは足りない - `TsReader` で読み戻す）、
 //! * (d) `collect_events` に `collection_started` と、この接続の
 //!   `plc_connected` が記録される、
-//! * (e) 停止後に `collection_stopped` が記録され、状態が `Stopped`。
+//! * (e) 停止後に `collection_stopped` が記録され、状態が `Stopped`、
+//! * (f) 停止後でも、履歴の読み出し（`CollectorService::history`、R1-D の
+//!   D-3a = `GET /api/collect/history` / `collect_history`）で直近 10 分を読むと
+//!   `ready` で、このタグの系列に**値の入った点**がある（収集が書いたデータ
+//!   ファイルを、収集を通さずに読める）。
 //!
 //! **待ちはすべて「条件をポーリング + 上限時間」**（[`wait_until`]）。固定
 //! sleep で緑にしない。上限に達したら、最後に観測した値を添えて落とす。
@@ -44,8 +48,8 @@ use banto_tags::{
 };
 use banto_tstore::{list_data_files, TsReader};
 use chronogazer_core::collect::{
-    resolve_data_dir, CollectEventRow, CollectorService, CollectorState, ConnectionStatusView,
-    ConnectionView, EventPage, QualityView, Readout,
+    resolve_data_dir, validate_history_request, CollectEventRow, CollectorService, CollectorState,
+    ConnectionStatusView, ConnectionView, EventPage, QualityView, Readout,
 };
 use chronogazer_core::db::init_db;
 use sqlx::SqlitePool;
@@ -363,6 +367,39 @@ async fn roundtrip(protocol: Protocol, protocol_name: &str, address: &str) {
     count_samples_with_value(&data_dir, &group_key)
         .await
         .expect("停止後もサンプル行が残っている");
+
+    // (f) 履歴の読み出し: 停止後（収集は走っていない）でも直近 10 分が読める。
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis(),
+    )
+    .expect("fits i64");
+    let request = validate_history_request(&[tag_id], now_ms - 600_000, now_ms, 600)
+        .expect("履歴の要求が検証を通る");
+    let Readout::Ready { data } = svc.history(&request).await else {
+        panic!("停止後の履歴が ready でない");
+    };
+    assert!(
+        data.unknown_tag_ids.is_empty(),
+        "{:?}",
+        data.unknown_tag_ids
+    );
+    let series = data
+        .series
+        .iter()
+        .find(|s| s.tag_id == tag_id)
+        .expect("このタグの系列がある");
+    assert!(!series.simulation);
+    assert!(
+        series
+            .points
+            .iter()
+            .any(|p| p.min.is_some() && p.max.is_some()),
+        "履歴に値の入った点が無い: {:?}",
+        series.points
+    );
 
     sim.stop().await;
     pool.close().await;
