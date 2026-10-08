@@ -18,6 +18,9 @@ pub mod events;
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
 pub mod hub;
 pub mod rest;
+// #538: 保持期間（`retention.days`）を過ぎた時系列データファイルの削除
+// （起動時 + 日付が変わるたび）。`tauri`/`axum` に依存しない future を返す。
+pub mod retention;
 // #393 / #525: 楽観ロックの食い違いの表し方（タグ・表示グループ共通）。
 pub mod revision;
 pub mod settings;

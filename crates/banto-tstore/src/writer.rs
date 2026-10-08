@@ -124,6 +124,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -153,6 +154,27 @@ impl Default for WriterOptions {
             flush_interval_ms: 1_000,
         }
     }
+}
+
+/// SQLite が 1 文に許すバインド変数の上限（`SQLITE_MAX_VARIABLE_NUMBER` の
+/// 既定、3.32 以降は 32766）。複数行 INSERT は 1 行あたり `列数 + 1`
+/// （`ptime` の分）個のバインドを使うので、列が多いグループは少ない行数で
+/// この上限を超える（#538）。超えると `too many SQL variables` で 1 文ごと
+/// 失敗する。
+const MAX_SQL_BINDS_PER_STATEMENT: usize = 32_766;
+
+/// 書き込みに失敗している間、バッファに溜め続けてよい量の既定の上限
+/// （値のセル数 = 行ごとの `列数 + 1` の合計）。flush の失敗で行を戻し続ける
+/// とメモリが際限なく増えるので、超えたら古い行から捨てる
+/// （[`TsWriter::dropped_rows`] で件数を読める）。1 セルは `Option<f64>` で
+/// 16 バイトなので、既定の 8,000,000 セルはおよそ 128MB。
+/// 通常運転（500 行 / 1 秒で flush）ではまず届かない大きさ。
+const DEFAULT_MAX_RETAINED_CELLS: usize = 8_000_000;
+
+/// 1 回の複数行 INSERT に入れてよい行数。`列数 + 1` 個のバインドを使う行を
+/// [`MAX_SQL_BINDS_PER_STATEMENT`] 以内に収める（最低 1 行）。
+fn rows_per_statement(column_count: usize) -> usize {
+    (MAX_SQL_BINDS_PER_STATEMENT / (column_count + 1)).max(1)
 }
 
 /// Compact per-group info `Inner` needs on every `append`/`flush` - derived
@@ -185,6 +207,15 @@ struct Inner {
     groups: HashMap<String, GroupRuntime>,
     buffer: HashMap<String, Vec<BufferedRow>>,
     buffered_row_count: usize,
+    /// バッファにある値のセル数（行ごとに `values.len() + 1`）。
+    /// `max_retained_cells` と比べる。
+    buffered_cells: usize,
+    max_retained_cells: usize,
+    /// 上限超過で捨てた行の累計。`TsWriter::dropped_rows` が読む。
+    dropped_rows: Arc<AtomicU64>,
+    /// 今の失敗の連続（flush が成功するまで）の間に、捨てたことをすでに
+    /// ログへ出したか。1 行ごとに出すと失敗が続く間ログが溢れる。
+    drop_logged: bool,
     last_flush_ms: i64,
 }
 
@@ -197,6 +228,9 @@ struct Inner {
 /// also what makes "batch everything pending into one transaction" work.
 pub struct TsWriter {
     inner: Mutex<Inner>,
+    /// `Inner::dropped_rows` と同じカウンタ。ロックを取らずに読めるように
+    /// 外に持つ。
+    dropped_rows: Arc<AtomicU64>,
 }
 
 // Manual `Debug` (not `#[derive]`): `Inner` holds `Arc<dyn Clock>`, and
@@ -242,8 +276,10 @@ impl TsWriter {
         let today = LocalDate::from_epoch_ms(now_ms, clock.utc_offset_ms());
         let (pool, seq) = resolve_file(data_dir, &config, &config_hash, today, now_ms).await?;
         let groups = build_group_runtime(&config);
+        let dropped_rows = Arc::new(AtomicU64::new(0));
 
         Ok(Self {
+            dropped_rows: dropped_rows.clone(),
             inner: Mutex::new(Inner {
                 data_dir: data_dir.to_path_buf(),
                 config,
@@ -256,6 +292,10 @@ impl TsWriter {
                 groups,
                 buffer: HashMap::new(),
                 buffered_row_count: 0,
+                buffered_cells: 0,
+                max_retained_cells: DEFAULT_MAX_RETAINED_CELLS,
+                dropped_rows,
+                drop_logged: false,
                 last_flush_ms: now_ms,
             }),
         })
@@ -316,6 +356,8 @@ impl TsWriter {
                 values: values.to_vec(),
             });
         inner.buffered_row_count += 1;
+        inner.buffered_cells += values.len() + 1;
+        inner.enforce_retention_cap();
 
         inner.maybe_flush().await
     }
@@ -325,6 +367,21 @@ impl TsWriter {
     pub async fn flush(&self) -> Result<(), TstoreError> {
         let mut inner = self.inner.lock().await;
         inner.flush_locked().await
+    }
+
+    /// 書き込みの失敗が続いてバッファの上限を超え、古い順に捨てた行の累計。
+    /// 0 でなければデータに欠けがある（flush の失敗で残した行が溜まり
+    /// すぎた。#538）。アプリはこれを見て利用者に知らせられる。
+    pub fn dropped_rows(&self) -> u64 {
+        self.dropped_rows.load(Ordering::Relaxed)
+    }
+
+    /// 失敗中に溜めてよい量の上限（値のセル数）を変える。主にテスト用。
+    /// 既定は 8,000,000 セル。0 は 1 に切り上げる。
+    pub async fn set_max_retained_cells(&self, cells: usize) {
+        let mut inner = self.inner.lock().await;
+        inner.max_retained_cells = cells.max(1);
+        inner.enforce_retention_cap();
     }
 
     /// Flush any remaining buffered rows and close the underlying
@@ -377,19 +434,25 @@ impl Inner {
         Ok(())
     }
 
+    /// 溜めた行を書く。**失敗してもバッファは減らさない**（#538）: 以前は
+    /// `buffer.drain()` で先に取り出していたので、書き込みが失敗するとその
+    /// 回の全グループの行が戻らなかった。今は書く間バッファを借りるだけで、
+    /// トランザクションがコミットできた後にだけ空にする。失敗したときは行が
+    /// そのまま残り（順序も保たれる）、次の flush でもう一度書く。
+    /// 1 文あたりの行数は [`rows_per_statement`] で区切る。
     async fn flush_locked(&mut self) -> Result<(), TstoreError> {
         if self.buffer.is_empty() {
             return Ok(());
         }
 
         let mut tx = self.pool.begin().await?;
-        for (group_key, rows) in self.buffer.drain() {
+        for (group_key, rows) in &self.buffer {
             if rows.is_empty() {
                 continue;
             }
             let table_name = &self
                 .groups
-                .get(&group_key)
+                .get(group_key)
                 .expect("buffered rows only ever exist for a group validated at append() time")
                 .table_name;
 
@@ -400,52 +463,127 @@ impl Inner {
                 column_list.push_str(&column_name_for_index(i));
             }
 
-            let mut query_builder: QueryBuilder<Sqlite> =
-                QueryBuilder::new(format!("INSERT INTO {table_name} ({column_list}) "));
-            query_builder.push_values(rows.iter(), |mut binder, row| {
-                binder.push_bind(row.ptime_ms);
-                for value in &row.values {
-                    binder.push_bind(*value);
-                }
-            });
-            // Upsert, not a plain INSERT (owner decision 2026-08-08, see this
-            // module's doc comment "Wall-clock-wins upsert on a `ptime`
-            // collision"): a backward clock jump can make this batch's
-            // `ptime` collide with an already-written row (or, within one
-            // batch, with an earlier row of this same statement) - every
-            // value column is replaced from `excluded` rather than letting
-            // `ptime INTEGER PRIMARY KEY` reject the repeat, so the newest
-            // write always wins. `ON CONFLICT ... DO UPDATE`, not `INSERT OR
-            // REPLACE`: `OR REPLACE` is a delete+insert that would disturb
-            // the rowid-is-`ptime` clustering `schema.rs`'s doc comment
-            // relies on; `DO UPDATE` only touches an actually-colliding row.
-            //
-            // A zero-tag group (`StoreConfig::validate` allows one - see
-            // `config.rs::validate_allows_a_group_with_zero_tags`) has no
-            // value column to reassign, so `DO UPDATE SET` would have an
-            // empty (invalid) SET list; `DO NOTHING` is the exact right
-            // behaviour there anyway - with no columns beyond `ptime` itself,
-            // a colliding row is byte-for-byte indistinguishable from the one
-            // already stored.
-            if column_count == 0 {
-                query_builder.push(" ON CONFLICT(ptime) DO NOTHING");
-            } else {
-                query_builder.push(" ON CONFLICT(ptime) DO UPDATE SET ");
-                for i in 0..column_count {
-                    if i > 0 {
-                        query_builder.push(", ");
+            for chunk in rows.chunks(rows_per_statement(column_count)) {
+                let mut query_builder: QueryBuilder<Sqlite> =
+                    QueryBuilder::new(format!("INSERT INTO {table_name} ({column_list}) "));
+                query_builder.push_values(chunk.iter(), |mut binder, row| {
+                    binder.push_bind(row.ptime_ms);
+                    for value in &row.values {
+                        binder.push_bind(*value);
                     }
-                    let column = column_name_for_index(i);
-                    query_builder.push(format!("{column} = excluded.{column}"));
+                });
+                // Upsert, not a plain INSERT (owner decision 2026-08-08, see this
+                // module's doc comment "Wall-clock-wins upsert on a `ptime`
+                // collision"): a backward clock jump can make this batch's
+                // `ptime` collide with an already-written row (or, within one
+                // batch, with an earlier row of this same statement) - every
+                // value column is replaced from `excluded` rather than letting
+                // `ptime INTEGER PRIMARY KEY` reject the repeat, so the newest
+                // write always wins. `ON CONFLICT ... DO UPDATE`, not `INSERT OR
+                // REPLACE`: `OR REPLACE` is a delete+insert that would disturb
+                // the rowid-is-`ptime` clustering `schema.rs`'s doc comment
+                // relies on; `DO UPDATE` only touches an actually-colliding row.
+                //
+                // A zero-tag group (`StoreConfig::validate` allows one - see
+                // `config.rs::validate_allows_a_group_with_zero_tags`) has no
+                // value column to reassign, so `DO UPDATE SET` would have an
+                // empty (invalid) SET list; `DO NOTHING` is the exact right
+                // behaviour there anyway - with no columns beyond `ptime` itself,
+                // a colliding row is byte-for-byte indistinguishable from the one
+                // already stored.
+                if column_count == 0 {
+                    query_builder.push(" ON CONFLICT(ptime) DO NOTHING");
+                } else {
+                    query_builder.push(" ON CONFLICT(ptime) DO UPDATE SET ");
+                    for i in 0..column_count {
+                        if i > 0 {
+                            query_builder.push(", ");
+                        }
+                        let column = column_name_for_index(i);
+                        query_builder.push(format!("{column} = excluded.{column}"));
+                    }
                 }
+                // 文を区切っても、行は元の順に同じトランザクションで流すので
+                // 「同じ ptime は後の値が勝つ」は変わらない。`?` で抜けるとき
+                // `tx` は drop されて巻き戻り、バッファはそのまま残る。
+                query_builder.build().execute(&mut *tx).await?;
             }
-            query_builder.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
 
+        self.buffer.clear();
         self.buffered_row_count = 0;
+        self.buffered_cells = 0;
+        if self.drop_logged {
+            self.drop_logged = false;
+            eprintln!(
+                "banto-tstore: 書き込みが回復しました（失敗の間に捨てた行は累計 {} 行）",
+                self.dropped_rows.load(Ordering::Relaxed)
+            );
+        }
         self.last_flush_ms = self.clock.now_ms();
         Ok(())
+    }
+
+    /// バッファが `max_retained_cells` を超えたら、全グループを通して
+    /// 時刻（`ptime`）の古い行から捨てる。ここに来るほど溜まるのは flush の
+    /// 失敗が続いているときだけ。捨てた行数は [`TsWriter::dropped_rows`] に
+    /// 数え、失敗の連続ごとに最初の 1 回だけログへ出す。
+    fn enforce_retention_cap(&mut self) {
+        if self.buffered_cells <= self.max_retained_cells {
+            return;
+        }
+        // 1 行捨てるたびに `Vec` の先頭を詰めると、失敗が続く間は append の
+        // たびに全体を動かすことになる。そこで上限の 7/8 まで**まとめて**
+        // 捨てる（超えた直後の append で一度に空ける）。どの行を捨てるかは
+        // 各グループの先頭（= そのグループで最も古い行）を見て、全体で最も
+        // 古い `ptime` から選ぶ。
+        let target = self.max_retained_cells - self.max_retained_cells / 8;
+        let mut cells = self.buffered_cells;
+        let mut rows_left = self.buffered_row_count;
+        let mut cursors: HashMap<&str, usize> = HashMap::new();
+        let mut dropped = 0u64;
+        while cells > target && rows_left > 1 {
+            let oldest = self
+                .buffer
+                .iter()
+                .filter_map(|(key, rows)| {
+                    let at = cursors.get(key.as_str()).copied().unwrap_or(0);
+                    rows.get(at).map(|row| (row.ptime_ms, key.as_str(), at))
+                })
+                .min();
+            let Some((_, key, at)) = oldest else {
+                break;
+            };
+            cells -= self.buffer[key][at].values.len() + 1;
+            rows_left -= 1;
+            dropped += 1;
+            cursors.insert(key, at + 1);
+        }
+        let drops: Vec<(String, usize)> = cursors
+            .into_iter()
+            .map(|(key, n)| (key.to_string(), n))
+            .collect();
+        for (key, n) in drops {
+            if let Some(rows) = self.buffer.get_mut(&key) {
+                rows.drain(..n);
+                if rows.is_empty() {
+                    self.buffer.remove(&key);
+                }
+            }
+        }
+        self.buffered_cells = cells;
+        self.buffered_row_count = rows_left;
+        if dropped > 0 {
+            self.dropped_rows.fetch_add(dropped, Ordering::Relaxed);
+            if !self.drop_logged {
+                self.drop_logged = true;
+                eprintln!(
+                    "banto-tstore: 書き込みの失敗が続いてバッファが上限（{} セル）を超えたため、古い行から捨てています",
+                    self.max_retained_cells
+                );
+            }
+        }
     }
 }
 
@@ -1753,5 +1891,171 @@ mod tests {
         );
 
         writer.close().await.expect("close should succeed");
+    }
+
+    // --- #538: flush の失敗で行を失わない / 1 文のバインド数 -----------------
+
+    /// 書き込み側の接続に「samples_1 への INSERT を必ず失敗させる」トリガーを
+    /// 付ける（ディスクフル・ロックなど flush が失敗する状況の代わり）。
+    async fn break_inserts(writer: &TsWriter) {
+        let inner = writer.inner.lock().await;
+        sqlx::query(
+            "CREATE TRIGGER fail_insert BEFORE INSERT ON samples_1 \
+             BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
+        )
+        .execute(&inner.pool)
+        .await
+        .expect("create trigger");
+    }
+
+    async fn repair_inserts(writer: &TsWriter) {
+        let inner = writer.inner.lock().await;
+        sqlx::query("DROP TRIGGER fail_insert")
+            .execute(&inner.pool)
+            .await
+            .expect("drop trigger");
+    }
+
+    async fn read_g1(dir: &TempDir) -> Vec<(i64, Vec<Option<f64>>)> {
+        let files = list_data_files(dir.path()).expect("list");
+        let reader = TsReader::open(&files[0].path).await.expect("reader open");
+        reader
+            .read_range("g1", i64::MIN, i64::MAX)
+            .await
+            .expect("read_range")
+            .into_iter()
+            .map(|s| (s.ptime_ms, s.values))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_flush_keeps_rows_and_the_next_flush_writes_them_in_order() {
+        let dir = TempDir::new("flush-failure-restore");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(2.0), None])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+        writer
+            .flush()
+            .await
+            .expect_err("flush must fail while inserts are broken");
+        // 失敗のあとに来た行も、前の行の後ろに並ぶ。
+        writer
+            .append("g1", DAY1_START_MS + 2_000, &[Some(3.0), None])
+            .await
+            .unwrap();
+        writer.flush().await.expect_err("still broken");
+        repair_inserts(&writer).await;
+        writer.flush().await.expect("flush succeeds after repair");
+
+        let rows = read_g1(&dir).await;
+        assert_eq!(
+            rows.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![DAY1_START_MS, DAY1_START_MS + 1_000, DAY1_START_MS + 2_000]
+        );
+        assert_eq!(rows[0].1, vec![Some(1.0), None]);
+        assert_eq!(rows[2].1, vec![Some(3.0), None]);
+        assert_eq!(writer.dropped_rows(), 0);
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overflowing_the_retention_cap_drops_the_oldest_rows_and_counts_them() {
+        let dir = TempDir::new("flush-failure-cap");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+        // g1 は 1 行 3 セル。上限 30 セル、超えたら 27 セル（= 9 行）まで捨てる。
+        writer.set_max_retained_cells(30).await;
+        break_inserts(&writer).await;
+
+        // 10 行目で 30 セルちょうど（上限内）。11 行目で超えて古い方から
+        // 9 行まで減る。失敗の最中でも append 自体は行をバッファに入れる
+        // （flush のしきい値に達したときだけ Err が返る）ので、結果は捨てる。
+        for i in 0..11 {
+            let _ = writer
+                .append("g1", DAY1_START_MS + i * 1_000, &[Some(i as f64), None])
+                .await;
+        }
+        assert_eq!(writer.dropped_rows(), 2, "11 rows - 9 kept = 2 dropped");
+
+        repair_inserts(&writer).await;
+        writer.flush().await.expect("flush after repair");
+        let rows = read_g1(&dir).await;
+        // 古い 2 行（i = 0, 1）が捨てられ、新しい 9 行が残る。
+        assert_eq!(rows.len(), 9);
+        assert_eq!(rows[0].0, DAY1_START_MS + 2_000);
+        assert_eq!(rows[8].0, DAY1_START_MS + 10_000);
+        writer.close().await.unwrap();
+    }
+
+    #[test]
+    fn rows_per_statement_keeps_binds_within_the_limit_at_the_boundary() {
+        for columns in [0usize, 1, 2, 9, 99, 255, 1_000, 2_000, 32_765] {
+            let rows = rows_per_statement(columns);
+            let binds_per_row = columns + 1;
+            assert!(rows >= 1);
+            if rows > 1 {
+                assert!(rows * binds_per_row <= MAX_SQL_BINDS_PER_STATEMENT);
+                // もう 1 行足すと上限を超える（= 区切りが必要以上に細かくない）。
+                assert!((rows + 1) * binds_per_row > MAX_SQL_BINDS_PER_STATEMENT);
+            }
+        }
+        // 列 1 本 = 2 バインド/行 -> 16383 行で 32766 ちょうど。
+        assert_eq!(rows_per_statement(1), 16_383);
+        // 1 行だけで上限を超える列数でも 0 行にはならない（最低 1 行）。
+        assert_eq!(rows_per_statement(40_000), 1);
+    }
+
+    fn one_column_config() -> StoreConfig {
+        StoreConfig {
+            groups: vec![GroupConfig {
+                key: "g1".to_string(),
+                name: "Group 1".to_string(),
+                period_ms: 1,
+                tags: vec![tag("t1", None, 0)],
+            }],
+        }
+    }
+
+    /// 1 回の flush が 1 文の上限（16383 行 x 2 バインド = 32766）ちょうどと、
+    /// それを 1 行超える数のどちらでも、全行が書かれる。区切りが無いと後者
+    /// が `too many SQL variables` で失敗する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_at_and_just_over_the_bind_limit_writes_every_row() {
+        for rows in [16_383usize, 16_384] {
+            let dir = TempDir::new(&format!("bind-limit-{rows}"));
+            let clock = clock_at(DAY1_START_MS);
+            let options = WriterOptions {
+                max_buffered_rows: usize::MAX,
+                flush_interval_ms: i64::MAX,
+            };
+            let writer =
+                TsWriter::open_with_options(dir.path(), one_column_config(), clock, options)
+                    .await
+                    .unwrap();
+            for i in 0..rows {
+                writer
+                    .append("g1", DAY1_START_MS + i as i64, &[Some(i as f64)])
+                    .await
+                    .unwrap();
+            }
+            writer.flush().await.expect("flush should chunk the INSERT");
+            let stored = read_g1(&dir).await;
+            assert_eq!(stored.len(), rows);
+            assert_eq!(stored[rows - 1].1, vec![Some((rows - 1) as f64)]);
+            writer.close().await.unwrap();
+        }
     }
 }

@@ -531,10 +531,12 @@
 //!
 //! # 保持期間（`retention.days`）について
 //!
-//! `crate::settings::StoreSettings` が `data.dir` / `retention.days` を持つが、
-//! **このモジュールのコードはファイルを一切削除しない**。期限超過ファイルの
-//! 自動削除は docs/recorder-requirements.md §3.4 にある機能だが、**別途
-//! 実装する**（誤って削除を先取りしない）。ここは設定値を持つだけ。
+//! `crate::settings::StoreSettings` が `data.dir` / `retention.days` を持つ。
+//! **このモジュールのコードはファイルを一切削除しない**（収集と削除は別の
+//! 責務）。期限超過ファイルの自動削除（docs/recorder-requirements.md §3.4）は
+//! [`crate::retention`] が行う（#538。起動時と日付が変わるたびに
+//! `banto_tstore::prune_files`）。`src-tauri` と `banto-serve` が、この
+//! サービスと同じ `data.dir` を渡して起動する。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

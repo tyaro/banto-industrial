@@ -88,12 +88,12 @@ fn parse_retention(raw: Option<String>, default: Option<i64>) -> Option<i64> {
 ///   （docs/recorder-requirements.md §3.4）。`None` は「無制限」
 ///   （[`AuditSettings`] と同じ約束 - [`parse_retention`]）。
 ///
-/// # このコードはファイルを一切削除しない
+/// # 削除は `crate::retention` が行う
 ///
-/// 期限超過ファイルの自動削除（要件 §3.4）は**この PR（C-1）では実装して
-/// いない**。`retention_days` は**設定値を持つだけ**で、chronogazer のどの
-/// コードもこれを読んで削除を行わない - 誤って削除を先取りしないための
-/// 明示的な線引きで、削除は別途実装する。
+/// 期限超過ファイルの自動削除（要件 §3.4）は #538 で実装した
+/// （[`crate::retention`]。起動時と日付が変わるたびに、**その時点の**
+/// `retention_days` で消す。設定を保存しただけでは消さず、次の掃除から効く）。
+/// 設定の読み書き（このモジュール）は削除を行わない。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreSettings {
