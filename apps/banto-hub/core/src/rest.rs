@@ -4483,6 +4483,34 @@ async fn tags_create(
     Ok(Json(created).into_response())
 }
 
+/// #528 の回帰テスト専用の割り込み点（本番では存在しない）。`tags_update` が
+/// トランザクションを始めた直後に、(1) 読み取りを 1 回してスナップショットを
+/// 張り、(2) テストへ知らせ、(3) テストが許すまで止まる。素の `BEGIN`
+/// （DEFERRED）ならここへすぐ着くので、テストは別接続のコミットをその後に
+/// 確実に挟める。`BEGIN IMMEDIATE` なら書き込みロックが空くまでここへ着かない。
+/// 固定の `sleep` に頼らないための仕掛け（`display_groups` の `ReadPause` と同じ考え方）。
+#[cfg(test)]
+pub(crate) struct TxTestHook {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) proceed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TX_TEST_HOOK: std::sync::Arc<TxTestHook>;
+}
+
+#[cfg(test)]
+async fn tx_test_hook(tx: &mut sqlx::SqliteConnection) {
+    if let Ok(hook) = TX_TEST_HOOK.try_with(|hook| hook.clone()) {
+        let _ = sqlx::query("SELECT COUNT(*) FROM tags")
+            .fetch_one(&mut *tx)
+            .await;
+        hook.reached.notify_one();
+        hook.proceed.notified().await;
+    }
+}
+
 async fn tags_update(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
@@ -4515,6 +4543,8 @@ async fn tags_update(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    #[cfg(test)]
+    tx_test_hook(&mut tx).await;
     let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
         Ok(updated) => updated,
         // T18-1: `TagUpdateError::RevisionConflict` の場合もロールバックは
@@ -15387,6 +15417,18 @@ mod tests {
         }
     }
 
+    /// [`TxTestHook`] の待ち合わせ: ハンドラがトランザクションを始めてスナップ
+    /// ショットを張る（＝素の `BEGIN` の挙動）まで最大 2 秒待つ。着いたら
+    /// `false`、着かずに時間切れ（＝書き込みロック待ちで止まっている、
+    /// `BEGIN IMMEDIATE` の挙動）なら `true` を返す。どちらでも呼び出し側は
+    /// この後で別接続をコミットする。固定時間だけ待ってコミットする方式と違い、
+    /// 素の `BEGIN` ではスナップショットを張った後に必ずコミットが入る。
+    async fn wait_until_blocked_or_reached(hook: &TxTestHook) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(2), hook.reached.notified())
+            .await
+            .is_err()
+    }
+
     /// #528: 別接続が書き込みロックを握っている間に `PUT /api/tags/{id}` が
     /// 始まり、書き込み側がコミットした後も、素の `BEGIN`（DEFERRED）だと
     /// `update_tx` の検証 `SELECT` で張ったスナップショットが古くなり、
@@ -15419,7 +15461,11 @@ mod tests {
 
         let router = env.router.clone();
         let token = env.admin_token.clone();
-        let request = tokio::spawn(async move {
+        let hook = Arc::new(TxTestHook {
+            reached: tokio::sync::Notify::new(),
+            proceed: tokio::sync::Notify::new(),
+        });
+        let request = tokio::spawn(TX_TEST_HOOK.scope(hook.clone(), async move {
             admin_put(
                 &router,
                 &format!("/api/tags/{tag1}"),
@@ -15432,16 +15478,21 @@ mod tests {
                 }),
             )
             .await
-        });
+        }));
 
-        // リクエストがトランザクションを始めるまでの時間を与えてからコミットする。
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let blocked = wait_until_blocked_or_reached(&hook).await;
         sqlx::query("COMMIT")
             .execute(&mut *writer)
             .await
             .expect("commit b");
         drop(writer);
+        hook.proceed.notify_one();
 
+        assert!(
+            blocked,
+            "ハンドラは書き込みロックを待って止まっているはず（BEGIN IMMEDIATE）。
+             スナップショットを張れたなら素の BEGIN のまま"
+        );
         let (status, body) = request.await.expect("join");
         assert_eq!(
             status,
@@ -15489,7 +15540,11 @@ mod tests {
 
         let router = env.router.clone();
         let token = env.admin_token.clone();
-        let request = tokio::spawn(async move {
+        let hook = Arc::new(TxTestHook {
+            reached: tokio::sync::Notify::new(),
+            proceed: tokio::sync::Notify::new(),
+        });
+        let request = tokio::spawn(TX_TEST_HOOK.scope(hook.clone(), async move {
             admin_put(
                 &router,
                 &format!("/api/tags/{tag1}"),
@@ -15503,11 +15558,17 @@ mod tests {
                 }),
             )
             .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }));
+        let blocked = wait_until_blocked_or_reached(&hook).await;
         sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
         drop(writer);
+        hook.proceed.notify_one();
 
+        assert!(
+            blocked,
+            "ハンドラは書き込みロックを待って止まっているはず（BEGIN IMMEDIATE）。
+             スナップショットを張れたなら素の BEGIN のまま"
+        );
         let (status, body) = request.await.expect("join");
         assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
         assert_eq!(body["error"], "tag_revision_conflict", "{body:?}");
