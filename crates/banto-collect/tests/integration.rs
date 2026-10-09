@@ -266,17 +266,26 @@ async fn count_events(pool: &SqlitePool, kind: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// All rows for the single group in a single-file data dir (open after
-/// stop(), when the writer has flushed and closed).
-async fn read_single_group_rows(data_dir: &Path) -> Vec<banto_tstore::Sample> {
+/// All rows for the single group in the data dir (open after stop(), when
+/// the writer has flushed and closed). tstore switches files per local date,
+/// so a run that crosses local midnight leaves several files: read them all
+/// and concatenate in ptime order (#343).
+async fn read_all_group_rows(data_dir: &Path) -> Vec<banto_tstore::Sample> {
     let files = banto_tstore::list_data_files(data_dir).expect("list files");
-    assert_eq!(files.len(), 1, "expected exactly one data file");
-    let reader = TsReader::open(&files[0].path).await.expect("open reader");
-    let group_key = reader.groups()[0].key.clone();
-    reader
-        .read_range(&group_key, 0, i64::MAX)
-        .await
-        .expect("read range")
+    assert!(!files.is_empty(), "expected at least one data file");
+    let mut rows = Vec::new();
+    for file in &files {
+        let reader = TsReader::open(&file.path).await.expect("open reader");
+        let group_key = reader.groups()[0].key.clone();
+        rows.extend(
+            reader
+                .read_range(&group_key, 0, i64::MAX)
+                .await
+                .expect("read range"),
+        );
+    }
+    rows.sort_by_key(|row| row.ptime_ms);
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +346,7 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
     collector.stop().await.unwrap();
     sim.stop();
 
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     let good = rows
         .iter()
         .find(|r| r.values[0].is_some() && r.values[1].is_some())
@@ -561,7 +570,7 @@ async fn bit_tags_record_zero_or_one() {
     collector.stop().await.unwrap();
     sim.stop();
 
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     assert!(
         rows.iter().any(|r| r.values[0] == Some(1.0)),
         "coil true should record 1.0"
@@ -709,7 +718,7 @@ async fn hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     collector.stop().await.unwrap();
 
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     assert!(
         rows.iter().any(|r| r.values[0] == Some(7.0)),
         "should have real values from before the drop"
@@ -841,7 +850,7 @@ async fn slmp_collects_values_and_writes_to_tstore() {
     collector.stop().await.unwrap();
     sim.stop();
 
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     assert!(
         rows.iter().any(|r| r.values[0] == Some(4321.0)),
         "tstore should have recorded the SLMP-read value"
@@ -926,7 +935,7 @@ async fn slmp_hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     collector.stop().await.unwrap();
 
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     assert!(
         rows.iter().any(|r| r.values[0] == Some(7.0)),
         "should have real values from before the drop"
@@ -1441,7 +1450,7 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
     // The row at base_ms must reflect the OVERWRITE (99), not the original
     // pre-regression value (1) - proof the regressed interval's data
     // survives via last-write-wins, never a rejected or duplicated append.
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     assert_eq!(
         rows.iter().filter(|r| r.ptime_ms == base_ms).count(),
         1,
@@ -1513,7 +1522,7 @@ async fn stop_flushes_buffered_rows_so_none_are_lost() {
     collector.stop().await.unwrap();
     sim.stop();
 
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     assert!(
         rows.len() >= 3,
         "buffered rows must survive stop(); got {}",
@@ -1806,7 +1815,7 @@ async fn long_soak_sixty_seconds() {
     collector.stop().await.unwrap();
     sim.stop();
 
-    let rows = read_single_group_rows(&env.data_dir()).await;
+    let rows = read_all_group_rows(&env.data_dir()).await;
     // ~600 ticks in 60s @100ms; require the vast majority to have landed.
     println!("long-soak: {} rows in 60s (theoretical ~600)", rows.len());
     assert!(
