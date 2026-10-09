@@ -1723,7 +1723,12 @@ async fn store_settings_prune_preview(
     };
     let clock = state.manager.clock();
     let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
-    let plan = banto_tstore::plan_prune(state.manager.data_dir(), retention_days, today)
+    // 収集中は書き込み側の判定（開いている日付は消さない）も含めて数える。
+    // prune-now と同じ口を通すので、プレビューの件数と実際の件数がずれない（#541）。
+    let plan = state
+        .manager
+        .plan_prune_data_files(retention_days, today)
+        .await
         .map_err(|err| ApiError(BantoError::Storage(err.to_string())))?;
     Ok(Json(PrunePreviewResponse {
         would_delete_count: plan.deleted.len(),
@@ -1753,7 +1758,12 @@ async fn store_settings_prune_now(
         Some(retention_days) => {
             let clock = state.manager.clock();
             let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
-            let report = banto_tstore::prune_files(state.manager.data_dir(), retention_days, today)
+            // 収集中は書き込み側（`TsWriter`）を通して消す。書き手が今開いている
+            // 日付のファイルは、保持日数を過ぎていても消さない（#541）。
+            let report = state
+                .manager
+                .prune_data_files(retention_days, today)
+                .await
                 .map_err(|err| ApiError(BantoError::Storage(err.to_string())))?;
             report.deleted.len()
         }
