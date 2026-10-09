@@ -14,7 +14,7 @@ import {
 	HISTORY_UNAVAILABLE_NOTE,
 	SIMULATION_NOTE,
 	TREND_DANGER_COLOR,
-	TREND_PLOT_MARGIN_PX,
+	TREND_RIGHT_MARGIN_PX,
 	TREND_WARNING_COLOR,
 	TREND_WINDOWS_SEC,
 	TREND_WINDOW_STORAGE_KEY,
@@ -33,6 +33,8 @@ import {
 	resolveBandPen,
 	resolveTrendWindowSec,
 	saveTrendWindowOverride,
+	trendLeftMarginMaxPx,
+	trendPlotWidthPx,
 	observeServerClock,
 	serverClockNow,
 	type ServerClock,
@@ -82,7 +84,14 @@ describe('chooseStepMs / maxTrendRows', () => {
 		['10 分・1280px・500ms・1 本 → 1 秒（600 行）', 600, 1280, 500, 1, 1000],
 		['1 分・1280px・500ms → 1 秒（周期の 2 倍が下限）', 60, 1280, 500, 1, 1000],
 		['1 分・1280px・1 秒 → 2 秒', 60, 1280, 1000, 1, 2000],
-		['10 分・400px・500ms → 2 秒（336 行に収める）', 600, 400, 500, 1, 2000],
+		[
+			'10 分・400px・500ms → 5 秒（描画域は 400-140-16 = 244 行。120 行に収める）',
+			600,
+			400,
+			500,
+			1,
+			5000
+		],
 		['1 時間・1280px・1 秒 → 5 秒（720 行）', 3600, 1280, 1000, 1, 5000],
 		['1 時間・2600px・500ms・8 本 → 5 秒（8000/8 = 1000 行以下）', 3600, 2600, 500, 8, 5000],
 		['1 時間・100px → 最大の 60 秒', 3600, 100, 500, 1, 60_000],
@@ -97,10 +106,39 @@ describe('chooseStepMs / maxTrendRows', () => {
 	});
 
 	it('行数の上限は描画域の幅・HISTORY_MAX_BINS・本数あたりの予算の最小', () => {
-		expect(maxTrendRows(1000, 1)).toBe(1000 - TREND_PLOT_MARGIN_PX);
+		expect(maxTrendRows(1000, 1)).toBe(1000 - 140 - TREND_RIGHT_MARGIN_PX);
 		expect(maxTrendRows(5000, 1)).toBe(HISTORY_MAX_BINS);
 		expect(maxTrendRows(5000, 8)).toBe(1000);
 		expect(maxTrendRows(0, 1)).toBe(1);
+	});
+
+	it.each([
+		// [幅, 左の余白の最大, 描画域]
+		['狭い 380px（40% = 152 > 140）', 380, 140, 224],
+		['中くらい 300px（40% = 120）', 300, 120, 164],
+		['広い 1200px', 1200, 140, 1200 - 140 - 16],
+		['とても狭い 100px（下限 48 を割らない）', 100, 48, 36]
+	])('描画域の幅は左の余白が最大のとき: %s', (_n, widthPx, left, plot) => {
+		expect(trendLeftMarginMaxPx(widthPx)).toBe(left);
+		expect(trendPlotWidthPx(widthPx)).toBe(plot);
+	});
+
+	it('オーナーの例: 10 分窓・1 秒周期・380px は間引きの起きない刻みを選ぶ（#550）', () => {
+		const windowMs = 600_000;
+		const step = chooseStepMs({ windowMs, widthPx: 380, pollPeriodMs: 1000, tagCount: 1 });
+		expect(windowMs / step).toBeLessThanOrEqual(trendPlotWidthPx(380));
+		expect(step).toBe(5000);
+	});
+
+	it('幅を振っても、行数は最悪の描画域の幅を超えない（60 秒で諦める 1 時間窓を除く）', () => {
+		for (let widthPx = 100; widthPx <= 3000; widthPx += 7) {
+			for (const sec of TREND_WINDOWS_SEC) {
+				const windowMs = sec * 1000;
+				const step = chooseStepMs({ windowMs, widthPx, pollPeriodMs: 500, tagCount: 1 });
+				if (step === 60_000) continue;
+				expect(windowMs / step).toBeLessThanOrEqual(trendPlotWidthPx(widthPx));
+			}
+		}
 	});
 
 	it('どの窓でも、行数が整数になる', () => {
