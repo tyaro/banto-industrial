@@ -9930,6 +9930,81 @@ mod tests {
         (env.router, env.admin_token, env._dir)
     }
 
+    /// `index.html` だけを持つ UI アセット（SPA のフォールバックの確認用）。
+    struct SpaAssets;
+
+    impl banto_server::UiAssets for SpaAssets {
+        fn get(path: &str) -> Option<(String, std::borrow::Cow<'static, [u8]>)> {
+            (path == "index.html").then(|| {
+                (
+                    "text/html; charset=utf-8".to_string(),
+                    std::borrow::Cow::Borrowed(b"<html>spa-index</html>".as_slice()),
+                )
+            })
+        }
+    }
+
+    /// 本番と同じ合成（`api_router(..).merge(static_router(..))`）で、存在しない
+    /// `/api/*` が SPA の `index.html`（200）ではなく JSON の 404
+    /// （`kind: not_found`）になること（banto v6.3.1 の `static_router`、
+    /// banto-industrial #547）。既知の API ルートと SPA のルートは従来どおり。
+    /// 反証: 修正は上流（banto）にあり、banto v6.3.0 以前に戻さないと落とせない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_api_path_is_json_404_through_the_composed_router() {
+        let (api, token, _dir) = router_with_token().await;
+        let app = api.merge(banto_server::static_router::<SpaAssets>());
+
+        async fn send(app: &Router, req: HttpRequest<Body>) -> (StatusCode, String, Vec<u8>) {
+            let response = app.clone().oneshot(req).await.unwrap();
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, content_type, bytes.to_vec())
+        }
+
+        for (method, uri) in [
+            ("GET", "/api/does-not-exist"),
+            ("POST", "/api/does-not-exist"),
+            ("GET", "/api"),
+        ] {
+            let req = HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap();
+            let (status, content_type, bytes) = send(&app, req).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            assert!(content_type.starts_with("application/json"), "{uri}");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["kind"], json!("not_found"), "{uri}");
+        }
+
+        // 既知のルートは従来どおり。
+        let req = HttpRequest::get("/api/auth/check")
+            .header("Authorization", format!("Bearer {token}"))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, bytes) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, b"true");
+
+        // SPA のルートは index.html。
+        let req = HttpRequest::get("/monitor").body(Body::empty()).unwrap();
+        let (status, content_type, bytes) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/html"));
+        assert_eq!(bytes, b"<html>spa-index</html>");
+    }
+
     /// `POST /api/api-keys` through the admin surface (bearer + CSRF +
     /// admin RBAC). Returns the parsed JSON body (`{ id, name, prefix,
     /// scopes, key }` on success).
