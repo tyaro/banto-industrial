@@ -16,16 +16,24 @@
 //!   直近 10 分の履歴（`CollectorService::history` = `/api/collect/history`、
 //!   トレンドを開いたときの初期窓）を 8 タグ × 1000 区間で 10 秒ごと。どちらも
 //!   応答を JSON にする（REST が返す形を作るところまで含めてメモリを見る）。
+//!   **現在値と履歴は別々のタスクで並行に回す**（画面でも別々の要求。PR #546 の
+//!   レビュー: 1 本のループで順に呼ぶと、遅い履歴の読み取り（30 分で最長 8.9 秒）の
+//!   間は現在値のポーリングも止まり、並行の負荷を試していなかった）。現在値の
+//!   ポーリングの最長間隔と、履歴の所要時間の分布（p50 / p95 / 最長）も出す。
 //!   HTTP の層（axum）は通さない - 測りたいのは収集・現在値・履歴の読み出しが
 //!   長く回ったときの行欠落とメモリで、HTTP の層は banto 本体のもの。
 //!
 //! ## 何を測るか（合否）
 //!
 //! * **行欠落**: 停止後にデータファイルを `TsReader` で読み戻し、グループごとに
-//!   (1) 行数を経過時間 / 周期と比べ、(2) 隣り合う行の時刻の差が**周期の 2 倍を
-//!   超えた**箇所（= 1 行以上抜けた）を数え、(3) 値が `null` のセルを数える。
-//!   (2) と (3) が 0 であることを合否にする（recorder-requirements.md §4 の
-//!   「欠測ゼロ」）。(1) は報告だけ（開始・停止の端で 1〜2 行ずれる）。
+//!   計測区間（全タグが good になってから停止まで）の行について
+//!   (1) 行数が「計測区間 / 周期」の ±[`EDGE_ROWS`] 行（開始・停止の端のずれ）に
+//!   収まる、(2) 隣り合う行の間隔が**周期の 2 倍以上**の箇所が無い（抜けた行数は
+//!   `round(間隔 / 周期) - 1`。2 倍未満は刻みの揺れ）、(3) 値が `null` のセルが無い、
+//!   の 3 つすべてを合否にする（recorder-requirements.md §4 の「欠測ゼロ」）。
+//!   判定は純関数 [`judge_rows`] で、通常の `cargo test` で走る単体テスト
+//!   （`judge_tests`: 最初の 3 行だけ・1 行おきの抜け・ちょうど 2 周期の抜けが落ち、
+//!   端の ±2 行・遅れた行の揺れは通る）で固定する。
 //! * **エラー**: 現在値の読み取りが `ready` でなかった回数・`good` でなかった
 //!   サンプル数、履歴の読み取りが `ready` でなかった回数。どれも 0 であること。
 //! * **メモリ**: このプロセスの working set（RSS 相当、Windows の
@@ -229,34 +237,87 @@ fn now_ms() -> i64 {
     .expect("fits i64")
 }
 
-/// グループ 1 つ分のデータファイルの読み戻し結果。抜け・`null` は**計測区間**
-/// （全タグが good になった後）の行だけで数える。収集の開始直後、接続が
-/// できる前の周期は値の無い行として記録される（読めなかった周期を 0 にしない
-/// 設計どおり）ので、それは暖機の行として別に数える。
+// ---------------------------------------------------------------------------
+// 判定（純関数。下の `judge_tests` で総当たり）
+// ---------------------------------------------------------------------------
+
+/// 行数の許容（開始・停止の端）。計測の開始時刻・停止時刻と収集の刻みの位相の
+/// ずれで、端の行が 1 つずつ入ったり外れたりする（30 分の実測は目安 ±1 行）。
+/// それ以上の差は欠落（または重複）として落とす。
+const EDGE_ROWS: i64 = 2;
+
+/// 計測区間 `span_ms` の間に周期 `period_ms` で書かれるはずの行数。
+fn expected_rows(span_ms: i64, period_ms: i64) -> i64 {
+    span_ms / period_ms
+}
+
+/// 隣り合う 2 行の間に抜けた行の数。間隔が**周期の 2 倍以上**なら抜けとみなし、
+/// `round(間隔 / 周期) - 1` 行を数える（ちょうど 2 周期 = 1 行の抜け）。2 倍未満は
+/// 刻みの揺れ（遅れた行の次の行は詰まる）として 0。
+fn missing_between(interval_ms: i64, period_ms: i64) -> i64 {
+    if interval_ms < period_ms * 2 {
+        return 0;
+    }
+    ((interval_ms as f64 / period_ms as f64).round() as i64 - 1).max(1)
+}
+
+/// グループ 1 つ分の行の時刻（計測区間のもの、昇順）の判定結果。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RowJudgement {
+    rows: i64,
+    expected: i64,
+    /// 抜けのあった箇所（間隔が周期の 2 倍以上）の数と、抜けた行の数。
+    gaps: usize,
+    missing: i64,
+    max_interval_ms: i64,
+}
+
+impl RowJudgement {
+    /// 合格か。抜けが 0 で、行数が目安の ±[`EDGE_ROWS`] に収まる。
+    fn passes(&self) -> bool {
+        self.gaps == 0 && self.missing == 0 && (self.rows - self.expected).abs() <= EDGE_ROWS
+    }
+}
+
+fn judge_rows(times_ms: &[i64], period_ms: i64, span_ms: i64) -> RowJudgement {
+    let mut judgement = RowJudgement {
+        rows: times_ms.len() as i64,
+        expected: expected_rows(span_ms, period_ms),
+        ..RowJudgement::default()
+    };
+    for pair in times_ms.windows(2) {
+        let interval = pair[1] - pair[0];
+        judgement.max_interval_ms = judgement.max_interval_ms.max(interval);
+        let missing = missing_between(interval, period_ms);
+        if missing > 0 {
+            judgement.gaps += 1;
+            judgement.missing += missing;
+        }
+    }
+    judgement
+}
+
+// ---------------------------------------------------------------------------
+// データファイルの読み戻し
+// ---------------------------------------------------------------------------
+
+/// グループ 1 つ分のデータファイルの中身。抜け・`null` は**計測区間**（全タグが
+/// good になった後）の行だけで数える。収集の開始直後、接続ができる前の周期は
+/// 値の無い行として記録される（読めなかった周期を 0 にしない設計どおり）ので、
+/// それは暖機の行として別に数える。
 #[derive(Debug, Default)]
-struct RowStats {
-    /// 計測区間の行数。
-    rows: usize,
+struct GroupRows {
+    /// 計測区間の行の時刻（昇順）。
+    times_ms: Vec<i64>,
+    /// 計測区間で値が `null` のセルの数。
+    null_cells: usize,
     /// 計測区間より前（暖機中）の行数と、そのうち値が `null` のセルの数。
     warmup_rows: usize,
     warmup_null_cells: usize,
-    /// 隣り合う行の時刻の差が周期の 2 倍を超えた箇所の数。
-    gaps: usize,
-    /// 抜けた行数の見積もり（差 / 周期 - 1 の合計）。
-    missing_estimate: i64,
-    /// 一番大きかった行の間隔（ms）。
-    max_interval_ms: i64,
-    /// 計測区間で値が `null` のセルの数。
-    null_cells: usize,
-    first_ms: Option<i64>,
-    last_ms: Option<i64>,
 }
 
-async fn read_rows(data_dir: &Path, group: &RegisteredGroup, measured_from_ms: i64) -> RowStats {
-    let mut times = Vec::new();
-    let mut null_cells = 0;
-    let mut warmup_rows = 0;
-    let mut warmup_null_cells = 0;
+async fn read_rows(data_dir: &Path, group: &RegisteredGroup, measured_from_ms: i64) -> GroupRows {
+    let mut out = GroupRows::default();
     for file in list_data_files(data_dir).expect("データファイルを列挙できる") {
         let reader = TsReader::open(&file.path)
             .await
@@ -271,33 +332,16 @@ async fn read_rows(data_dir: &Path, group: &RegisteredGroup, measured_from_ms: i
         for sample in samples {
             let nulls = sample.values.iter().filter(|v| v.is_none()).count();
             if sample.ptime_ms < measured_from_ms {
-                warmup_rows += 1;
-                warmup_null_cells += nulls;
+                out.warmup_rows += 1;
+                out.warmup_null_cells += nulls;
             } else {
-                null_cells += nulls;
-                times.push(sample.ptime_ms);
+                out.null_cells += nulls;
+                out.times_ms.push(sample.ptime_ms);
             }
         }
     }
-    times.sort_unstable();
-    let mut stats = RowStats {
-        rows: times.len(),
-        warmup_rows,
-        warmup_null_cells,
-        null_cells,
-        first_ms: times.first().copied(),
-        last_ms: times.last().copied(),
-        ..RowStats::default()
-    };
-    for pair in times.windows(2) {
-        let interval = pair[1] - pair[0];
-        stats.max_interval_ms = stats.max_interval_ms.max(interval);
-        if interval > group.period_ms * 2 {
-            stats.gaps += 1;
-            stats.missing_estimate += interval / group.period_ms - 1;
-        }
-    }
-    stats
+    out.times_ms.sort_unstable();
+    out
 }
 
 fn mib(bytes: Option<u64>) -> String {
@@ -305,6 +349,99 @@ fn mib(bytes: Option<u64>) -> String {
         || "-".to_string(),
         |b| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)),
     )
+}
+
+// ---------------------------------------------------------------------------
+// 閲覧の 2 本のタスク（現在値・履歴）は**別々に**回す
+// ---------------------------------------------------------------------------
+
+/// 現在値のポーリングの集計。
+#[derive(Debug, Default)]
+struct ValuesStats {
+    polls: u64,
+    not_ready: u64,
+    samples_not_good: u64,
+    json_bytes: usize,
+    /// 前のポーリングの開始から次の開始までの最長（ms）。履歴の読み取りに
+    /// 引きずられて止まっていないかを見る（周期は [`VALUES_POLL`]）。
+    max_poll_interval_ms: u128,
+}
+
+/// 現在値を [`VALUES_POLL`] ごとに読む（監視画面のポーリング）。`deadline` まで。
+async fn poll_values(svc: CollectorService, tag_ids: Vec<i64>, deadline: Instant) -> ValuesStats {
+    let mut stats = ValuesStats::default();
+    let mut last_start: Option<Instant> = None;
+    while Instant::now() < deadline {
+        let start = Instant::now();
+        if let Some(prev) = last_start {
+            stats.max_poll_interval_ms = stats
+                .max_poll_interval_ms
+                .max(start.duration_since(prev).as_millis());
+        }
+        last_start = Some(start);
+        let response = svc.values_response();
+        stats.polls += 1;
+        match &response.readout {
+            Readout::Ready { data } => {
+                for id in &tag_ids {
+                    match data.get(&format!("tag:{id}")) {
+                        Some(s) if s.quality == QualityView::Good && s.value.is_some() => {}
+                        _ => stats.samples_not_good += 1,
+                    }
+                }
+            }
+            _ => stats.not_ready += 1,
+        }
+        stats.json_bytes = serde_json::to_vec(&response).expect("JSON にできる").len();
+        tokio::time::sleep(VALUES_POLL).await;
+    }
+    stats
+}
+
+/// 履歴の読み取りの集計。
+#[derive(Debug, Default)]
+struct HistoryStats {
+    reads: u64,
+    not_ready: u64,
+    max_ms: u128,
+    /// 読み取りにかかった時間（ms）。分布を出すため全部持つ（30 分で 180 個）。
+    durations_ms: Vec<u128>,
+}
+
+/// 直近の履歴を [`HISTORY_EVERY`] ごとに読む（トレンドを開いたときの初期窓）。
+async fn read_history(svc: CollectorService, tag_ids: Vec<i64>, deadline: Instant) -> HistoryStats {
+    let mut stats = HistoryStats::default();
+    let mut next = Instant::now();
+    while Instant::now() < deadline {
+        let to = now_ms();
+        let request = validate_history_request(&tag_ids, to - HISTORY_WINDOW_MS, to, HISTORY_BINS)
+            .expect("履歴の要求が検証を通る");
+        let t = Instant::now();
+        let readout = svc.history(&request).await;
+        if matches!(readout, Readout::Ready { .. }) {
+            serde_json::to_vec(&readout).expect("JSON にできる");
+        } else {
+            stats.not_ready += 1;
+        }
+        let took = t.elapsed().as_millis();
+        stats.max_ms = stats.max_ms.max(took);
+        stats.durations_ms.push(took);
+        stats.reads += 1;
+        next += HISTORY_EVERY;
+        tokio::time::sleep_until(next.min(deadline).max(Instant::now()).into()).await;
+    }
+    stats
+}
+
+/// `values` の p 分位（0〜100、最近傍）。空なら 0。
+fn percentile(values: &[u128], p: usize) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = (sorted.len() * p).div_ceil(100).saturating_sub(1);
+    sorted[index.min(sorted.len() - 1)]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -359,63 +496,21 @@ async fn mini_soak_collect_with_monitor_polling() {
 
     let started = Instant::now();
     let started_ms = now_ms();
-    let mut values_polls = 0u64;
-    let mut values_not_ready = 0u64;
-    let mut samples_not_good = 0u64;
-    let mut history_reads = 0u64;
-    let mut history_not_ready = 0u64;
-    let mut history_max_ms = 0u128;
-    let mut json_bytes = 0usize;
+    let deadline = started + duration;
+    // 現在値と履歴は別々のタスク（画面でも別々の要求）。履歴の読み取りが遅くても
+    // 現在値のポーリングは止まらないはず - それも測る（`max_poll_interval_ms`）。
+    let values_task = tokio::spawn(poll_values(svc.clone(), all_tag_ids.clone(), deadline));
+    let history_task = tokio::spawn(read_history(svc.clone(), history_tag_ids.clone(), deadline));
     let mut memory: Vec<(Duration, Option<u64>)> =
         vec![(Duration::ZERO, mem_probe::working_set_bytes())];
-    let mut next_history = started;
-    let mut next_memory = started + MEMORY_EVERY;
-
     while started.elapsed() < duration {
-        let response = svc.values_response();
-        values_polls += 1;
-        match &response.readout {
-            Readout::Ready { data } => {
-                for id in &all_tag_ids {
-                    match data.get(&format!("tag:{id}")) {
-                        Some(s) if s.quality == QualityView::Good && s.value.is_some() => {}
-                        _ => samples_not_good += 1,
-                    }
-                }
-            }
-            _ => values_not_ready += 1,
-        }
-        json_bytes = serde_json::to_vec(&response).expect("JSON にできる").len();
-
-        if Instant::now() >= next_history {
-            next_history += HISTORY_EVERY;
-            let to = now_ms();
-            let request = validate_history_request(
-                &history_tag_ids,
-                to - HISTORY_WINDOW_MS,
-                to,
-                HISTORY_BINS,
-            )
-            .expect("履歴の要求が検証を通る");
-            let t = Instant::now();
-            let readout = svc.history(&request).await;
-            history_max_ms = history_max_ms.max(t.elapsed().as_millis());
-            history_reads += 1;
-            match &readout {
-                Readout::Ready { .. } => {
-                    serde_json::to_vec(&readout).expect("JSON にできる");
-                }
-                _ => history_not_ready += 1,
-            }
-        }
-        if Instant::now() >= next_memory {
-            next_memory += MEMORY_EVERY;
-            memory.push((started.elapsed(), mem_probe::working_set_bytes()));
-        }
-        tokio::time::sleep(VALUES_POLL).await;
+        let remaining = duration.saturating_sub(started.elapsed());
+        tokio::time::sleep(MEMORY_EVERY.min(remaining)).await;
+        memory.push((started.elapsed(), mem_probe::working_set_bytes()));
     }
+    let values = values_task.await.expect("現在値のタスク");
+    let history = history_task.await.expect("履歴のタスク");
     let elapsed = started.elapsed();
-    memory.push((elapsed, mem_probe::working_set_bytes()));
 
     let outcome = svc.stop().await.expect("収集を停止できる");
     assert!(!outcome.pending, "停止が打ち切られた");
@@ -432,32 +527,43 @@ async fn mini_soak_collect_with_monitor_polling() {
     );
     let mut row_failures = Vec::new();
     for group in &groups {
-        let stats = read_rows(&data_dir, group, started_ms).await;
-        let span_ms = stopped_ms - started_ms;
+        let rows = read_rows(&data_dir, group, started_ms).await;
+        let judgement = judge_rows(&rows.times_ms, group.period_ms, stopped_ms - started_ms);
         println!(
-            "[{}] 周期 {}ms: 計測区間の行 {}（目安 {}）、行の抜け {} 箇所（推定 {} 行）、最大間隔 {}ms、null のセル {}（暖機中の行 {}・うち null のセル {}）、最初 {:?} 最後 {:?}",
+            "[{}] 周期 {}ms: 計測区間の行 {}（目安 {}、許容 ±{EDGE_ROWS}）、抜け {} 箇所（{} 行）、最大間隔 {}ms、null のセル {}（暖機中の行 {}・うち null のセル {}）",
             group.name,
             group.period_ms,
-            stats.rows,
-            span_ms / group.period_ms,
-            stats.gaps,
-            stats.missing_estimate,
-            stats.max_interval_ms,
-            stats.null_cells,
-            stats.warmup_rows,
-            stats.warmup_null_cells,
-            stats.first_ms,
-            stats.last_ms,
+            judgement.rows,
+            judgement.expected,
+            judgement.gaps,
+            judgement.missing,
+            judgement.max_interval_ms,
+            rows.null_cells,
+            rows.warmup_rows,
+            rows.warmup_null_cells,
         );
-        if stats.gaps > 0 || stats.null_cells > 0 || stats.rows == 0 {
-            row_failures.push(format!("{}: {stats:?}", group.name));
+        if !judgement.passes() || rows.null_cells > 0 {
+            row_failures.push(format!(
+                "{}: {judgement:?}, null のセル {}",
+                group.name, rows.null_cells
+            ));
         }
     }
     println!(
-        "現在値の読み取り {values_polls} 回（ready でない {values_not_ready} 回、good でないサンプル {samples_not_good}、応答 {json_bytes} バイト）"
+        "現在値の読み取り {} 回（ready でない {} 回、good でないサンプル {}、応答 {} バイト、ポーリングの最長間隔 {}ms）",
+        values.polls,
+        values.not_ready,
+        values.samples_not_good,
+        values.json_bytes,
+        values.max_poll_interval_ms
     );
     println!(
-        "履歴の読み取り {history_reads} 回（ready でない {history_not_ready} 回、最長 {history_max_ms}ms）"
+        "履歴の読み取り {} 回（ready でない {} 回、所要 p50 {}ms / p95 {}ms / 最長 {}ms）",
+        history.reads,
+        history.not_ready,
+        percentile(&history.durations_ms, 50),
+        percentile(&history.durations_ms, 95),
+        history.max_ms
     );
     let warm_index = memory.len() / 4;
     let first = memory.first().and_then(|m| m.1);
@@ -488,7 +594,99 @@ async fn mini_soak_collect_with_monitor_polling() {
     pool.close().await;
 
     assert!(row_failures.is_empty(), "行の欠落: {row_failures:?}");
-    assert_eq!(values_not_ready, 0, "現在値が ready でない回があった");
-    assert_eq!(samples_not_good, 0, "good でないサンプルがあった");
-    assert_eq!(history_not_ready, 0, "履歴が ready でない回があった");
+    assert_eq!(values.not_ready, 0, "現在値が ready でない回があった");
+    assert_eq!(values.samples_not_good, 0, "good でないサンプルがあった");
+    assert!(values.polls > 0, "現在値を一度も読まなかった");
+    assert_eq!(history.not_ready, 0, "履歴が ready でない回があった");
+    assert!(history.reads > 0, "履歴を一度も読まなかった");
+}
+
+/// 判定の純関数の総当たり（通常の `cargo test` で走る）。
+mod judge_tests {
+    use super::*;
+
+    /// `from` から周期 `period` で `count` 行。
+    fn series(from: i64, period: i64, count: i64) -> Vec<i64> {
+        (0..count).map(|i| from + i * period).collect()
+    }
+
+    #[test]
+    fn a_full_series_passes() {
+        let times = series(0, 1000, 1800);
+        let j = judge_rows(&times, 1000, 1_800_000);
+        assert!(j.passes(), "{j:?}");
+        assert_eq!((j.gaps, j.missing, j.expected), (0, 0, 1800));
+    }
+
+    #[test]
+    fn rows_at_the_edges_within_the_allowance_pass() {
+        for count in [1798, 1799, 1801, 1802] {
+            let j = judge_rows(&series(0, 1000, count), 1000, 1_800_000);
+            assert!(j.passes(), "{count} 行: {j:?}");
+        }
+    }
+
+    #[test]
+    fn too_few_or_too_many_rows_fail_even_without_gaps() {
+        // 最初の 3 行だけ（あとは書かれていない）。間隔は正常でも行数で落ちる。
+        let j = judge_rows(&series(0, 1000, 3), 1000, 1_800_000);
+        assert!(!j.passes(), "{j:?}");
+        assert_eq!(j.gaps, 0);
+        for count in [1797, 1803] {
+            let j = judge_rows(&series(0, 1000, count), 1000, 1_800_000);
+            assert!(!j.passes(), "{count} 行: {j:?}");
+        }
+        // 空も落ちる。
+        assert!(!judge_rows(&[], 1000, 1_800_000).passes());
+    }
+
+    #[test]
+    fn alternating_loss_fails() {
+        // 1 行おきに抜ける = 間隔がちょうど 2 周期。
+        let times = series(0, 2000, 900);
+        let j = judge_rows(&times, 1000, 1_800_000);
+        assert!(!j.passes(), "{j:?}");
+        assert_eq!(j.gaps, 899);
+        assert_eq!(j.missing, 899);
+    }
+
+    #[test]
+    fn a_single_gap_of_exactly_two_periods_is_one_missing_row() {
+        let mut times = series(0, 200, 9001);
+        times.remove(4500);
+        let j = judge_rows(&times, 200, 1_800_000);
+        assert_eq!((j.gaps, j.missing, j.max_interval_ms), (1, 1, 400));
+        // 行数は許容に収まっても、抜けがあれば落ちる。
+        assert!((j.rows - j.expected).abs() <= EDGE_ROWS);
+        assert!(!j.passes(), "{j:?}");
+    }
+
+    #[test]
+    fn missing_rows_are_counted_from_the_rounded_interval() {
+        assert_eq!(missing_between(1999, 1000), 0, "2 周期未満は揺れ");
+        assert_eq!(missing_between(2000, 1000), 1);
+        assert_eq!(missing_between(2400, 1000), 1);
+        assert_eq!(missing_between(2600, 1000), 2);
+        assert_eq!(missing_between(10_000, 1000), 9);
+    }
+
+    #[test]
+    fn a_late_row_followed_by_a_short_interval_is_jitter_not_loss() {
+        // 30 分の実測の最大間隔（200ms の周期で 367ms）の形: 遅れた行の次は詰まる。
+        let mut times = series(0, 200, 9001);
+        times[10] += 167;
+        let j = judge_rows(&times, 200, 1_800_000);
+        assert!(j.passes(), "{j:?}");
+        assert_eq!(j.max_interval_ms, 367);
+    }
+
+    #[test]
+    fn percentile_is_nearest_rank() {
+        let values: Vec<u128> = (1..=100).collect();
+        assert_eq!(percentile(&values, 50), 50);
+        assert_eq!(percentile(&values, 95), 95);
+        assert_eq!(percentile(&values, 100), 100);
+        assert_eq!(percentile(&[], 95), 0);
+        assert_eq!(percentile(&[7], 50), 7);
+    }
 }
