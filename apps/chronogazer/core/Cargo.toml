@@ -88,6 +88,17 @@ reqwest = { workspace = true }
 # 依存ツリーには既に入っているので Cargo.lock にノードは増えない。
 tokio-tungstenite = { workspace = true }
 
+# R1-D の D-4（2026-10-09）: tests/mini_soak.rs の working set の記録
+# （`GetProcessMemoryInfo`）専用。`apps/banto-hub/core` の tests/soak.rs と
+# 同じもの（同じ 0.61 系・同じ feature）で、tokio/mio 等が既に依存木に持って
+# いるので Cargo.lock にノードは増えない。
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 [[bin]]
 name = "banto-serve"
 path = "src/bin/banto-serve.rs"
