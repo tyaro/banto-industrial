@@ -436,7 +436,7 @@ async fn deleting_a_connection_with_tags_cascades_and_preserves_tstore_history()
     sim.stop();
 
     let data_dir = app._env.data_dir();
-    let rows_before = read_single_group_rows(&data_dir).await;
+    let rows_before = read_all_group_rows(&data_dir).await;
     assert!(
         rows_before.iter().any(|r| r.values[0] == Some(777.0)),
         "a sample should already be on disk before the delete: {rows_before:?}"
@@ -474,7 +474,7 @@ async fn deleting_a_connection_with_tags_cascades_and_preserves_tstore_history()
     // The point of the test: the tstore file - a completely separate
     // storage engine that never heard about the DELETE - still has the
     // sample recorded before the registry rows were removed.
-    let rows_after = read_single_group_rows(&data_dir).await;
+    let rows_after = read_all_group_rows(&data_dir).await;
     assert_eq!(
         rows_after.len(),
         rows_before.len(),
@@ -486,20 +486,28 @@ async fn deleting_a_connection_with_tags_cascades_and_preserves_tstore_history()
     );
 }
 
-/// Read every row of the (single) collection group's data file in
+/// Read every row of the (single) collection group's data files in
 /// `data_dir`, the same way `crates/banto-collect/tests/integration.rs`'s
-/// helper of the same name does.
-async fn read_single_group_rows(data_dir: &std::path::Path) -> Vec<banto_tstore::Sample> {
+/// helper of the same name does (all files, since tstore switches files per
+/// local date and a run can cross midnight, #343).
+async fn read_all_group_rows(data_dir: &std::path::Path) -> Vec<banto_tstore::Sample> {
     let files = banto_tstore::list_data_files(data_dir).expect("list files");
-    assert_eq!(files.len(), 1, "expected exactly one data file");
-    let reader = banto_tstore::TsReader::open(&files[0].path)
-        .await
-        .expect("open reader");
-    let group_key = reader.groups()[0].key.clone();
-    reader
-        .read_range(&group_key, 0, i64::MAX)
-        .await
-        .expect("read range")
+    assert!(!files.is_empty(), "expected at least one data file");
+    let mut rows = Vec::new();
+    for file in &files {
+        let reader = banto_tstore::TsReader::open(&file.path)
+            .await
+            .expect("open reader");
+        let group_key = reader.groups()[0].key.clone();
+        rows.extend(
+            reader
+                .read_range(&group_key, 0, i64::MAX)
+                .await
+                .expect("read range"),
+        );
+    }
+    rows.sort_by_key(|row| row.ptime_ms);
+    rows
 }
 
 // ---------------------------------------------------------------------------
