@@ -27,6 +27,8 @@ import {
 	levelTone,
 	meterDescription,
 	meterView,
+	scaleText,
+	thresholdText,
 	meterViews,
 	resolveMeterRange,
 	scaleTicks,
@@ -98,6 +100,23 @@ describe('resolveMeterRange（Q3: 工学値レンジ → LL..HH → 未設定）
 			{ kind: 'unset' }
 		],
 		['何も無ければ未設定', tag(), { kind: 'unset' }],
+		// #551: bit は工学値レンジが無くても 0〜1（False〜True）。
+		['bit は既定で 0〜1', tag({ dataType: 'bit' }), { kind: 'ok', min: 0, max: 1, source: 'bit' }],
+		[
+			'bit に LL..HH を置いても 0〜1',
+			tag({ dataType: 'bit', thresholdLl: 5, thresholdHh: 9 }),
+			{ kind: 'ok', min: 0, max: 1, source: 'bit' }
+		],
+		[
+			'bit でも工学値レンジがあればそれが先',
+			tag({ dataType: 'bit', rawLo: 0, rawHi: 1, engLo: 0, engHi: 10 }),
+			{ kind: 'ok', min: 0, max: 10, source: 'eng' }
+		],
+		[
+			'bit 以外は従来どおり未設定（i16 は 0〜1 にしない）',
+			tag({ dataType: 'i16' }),
+			{ kind: 'unset' }
+		],
 		['タグを読めていなければ noTag（未設定と言わない）', undefined, { kind: 'noTag' }]
 	])('%s', (_label, t, expected) => {
 		expect(resolveMeterRange(t)).toEqual(expected);
@@ -374,6 +393,57 @@ describe('groupThresholdMarks（同じ値のしきい値の名前を 1 つにま
 		expect(v.markGroups).toEqual([
 			{ levels: ['LL', 'L', 'H'], label: 'LL/L/H', value: 50, position: 0.5, tone: 'danger' }
 		]);
+	});
+});
+
+describe('bit のバー・計器（#551）', () => {
+	const bit = tag({ dataType: 'bit', unit: null, decimals: 0 });
+	const sample = (value: number | null): CurrentSampleView => ({
+		value,
+		ptimeMs: 1000,
+		quality: 'good',
+		lastGoodMs: 1000
+	});
+	const view = (value: number | null, t: Tag = bit) =>
+		meterView(penView({ tagId: 1, colorSlot: null }, 0, sample(value), t), t);
+
+	it('「レンジ未設定」にならず、棒は 0 で空・1 で満タン、目盛は両端の 2 本だけ', () => {
+		const off = view(0);
+		const on = view(1);
+		expect(off.rangeMessage).toBeNull();
+		expect(off.range.kind).toBe('ok');
+		expect(off.bar).toEqual({ fill: 0, out: null });
+		expect(on.bar).toEqual({ fill: 1, out: null });
+		expect(on.ticks).toEqual([
+			{ value: 0, position: 0 },
+			{ value: 1, position: 1 }
+		]);
+		expect(off.display).toBe('False');
+		expect(on.display).toBe('True');
+	});
+
+	it('非 bit の 0〜1 のレンジの目盛は従来どおり（間の目盛が出る）', () => {
+		const t = tag({ rawLo: 0, rawHi: 1, engLo: 0, engHi: 1 });
+		expect(view(0, t).ticks.length).toBeGreaterThan(2);
+	});
+
+	it('scaleText: bit の既定レンジは False / True、それ以外は数値', () => {
+		expect(scaleText(view(1), 0)).toBe('False');
+		expect(scaleText(view(1), 1)).toBe('True');
+		const num = view(1, tag({ rawLo: 0, rawHi: 1, engLo: 0, engHi: 1 }));
+		expect(scaleText(num, 1)).toBe('1.0');
+		// しきい値の数値は bit でも数値のまま。
+		expect(thresholdText(view(1), 1)).toBe('1');
+	});
+
+	it('値なしは棒なし（0 の位置に描かない）でレンジは 0〜1', () => {
+		const v = view(null);
+		expect(v.bar).toBeNull();
+		expect(v.range).toEqual({ kind: 'ok', min: 0, max: 1, source: 'bit' });
+	});
+
+	it('支援技術向けの説明は False〜True', () => {
+		expect(meterDescription(view(1))).toBe('レンジ False〜True（bit の既定）。しきい値: なし');
 	});
 });
 

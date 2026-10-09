@@ -12,8 +12,12 @@
  *    いるか全部無いかのどちらか - `banto-tags` の `Scaling::from_parts`）。
  *    `engLo > engHi`（逆向きのスケーリング）も正しい設定なので、小さい方を下端に
  *    する。`engLo === engHi` はレンジにならないので次へ。
- * 2. 無ければしきい値の LL..HH（両方あって LL < HH のとき）。
- * 3. どちらも無ければ「レンジ未設定」。棒・計器は描かず、値の文字は出す
+ * 2. **bit のタグは 0〜1（False〜True）**（2026-10-09 オーナー決定、#551）。bit には
+ *    工学値レンジが無いので、「レンジ未設定」にせず既定のレンジにする。目盛は
+ *    `False` / `True` の 2 本だけ（0.2 刻みの数値は出さない）。しきい値の LL..HH より
+ *    先に使う（bit に LL..HH を置いても 0〜1 以外のレンジにはならない）。
+ * 3. 無ければしきい値の LL..HH（両方あって LL < HH のとき）。
+ * 4. どれも無ければ「レンジ未設定」。棒・計器は描かず、値の文字は出す
  *    （値そのものは読めているので隠さない）。タグ設定へのリンクを添える
  *    （閲覧公開ではリンクを出さない - パネル側で `tagsHref` が `null`）。
  *
@@ -44,17 +48,18 @@ import type {
 	TagWithThresholds,
 	ThresholdFields as TagThresholdFields
 } from '../banto/tagThresholdsAdmin';
-import { formatValue, type PenView, type ThresholdLevel } from './monitorLogic';
+import { formatBitValue, formatValue, type PenView, type ThresholdLevel } from './monitorLogic';
 
 // --- レンジ ----------------------------------------------------------------
 
 type RangeFields = Pick<Tag, 'engLo' | 'engHi'> &
+	Partial<Pick<Tag, 'dataType'>> &
 	Pick<TagThresholdFields, 'thresholdLl' | 'thresholdHh'>;
 
 /** バー・計器のレンジ。 */
 export type MeterRange =
 	/** 決まった（`min < max`）。`source` はどこから取ったか。 */
-	| { kind: 'ok'; min: number; max: number; source: 'eng' | 'thresholds' }
+	| { kind: 'ok'; min: number; max: number; source: 'eng' | 'thresholds' | 'bit' }
 	/** タグに工学値レンジも LL..HH も無い。 */
 	| { kind: 'unset' }
 	/** タグの情報を読めていない（設定が無いのか分からない）。 */
@@ -67,13 +72,14 @@ function finite(n: number | null | undefined): n is number {
 	return typeof n === 'number' && Number.isFinite(n);
 }
 
-/** レンジを決める（純関数、Q3）。工学値レンジ → LL..HH → 未設定。 */
+/** レンジを決める（純関数、Q3）。工学値レンジ → bit の 0〜1 → LL..HH → 未設定。 */
 export function resolveMeterRange(tag: RangeFields | undefined): MeterRange {
 	if (!tag) return { kind: 'noTag' };
 	const { engLo, engHi, thresholdLl: ll, thresholdHh: hh } = tag;
 	if (finite(engLo) && finite(engHi) && engLo !== engHi) {
 		return { kind: 'ok', min: Math.min(engLo, engHi), max: Math.max(engLo, engHi), source: 'eng' };
 	}
+	if (tag.dataType === 'bit') return { kind: 'ok', min: 0, max: 1, source: 'bit' };
 	if (finite(ll) && finite(hh) && ll < hh) {
 		return { kind: 'ok', min: ll, max: hh, source: 'thresholds' };
 	}
@@ -361,13 +367,42 @@ export function meterView(
 		tone: levelTone(pen.level),
 		bar,
 		outLabel: outOfRangeLabel(bar?.out ?? null),
-		ticks: range.kind === 'ok' ? scaleTicks(range) : [],
+		ticks: range.kind === 'ok' ? meterTicks(range) : [],
 		marks,
 		markGroups: groupThresholdMarks(marks),
 		thresholds,
 		gaugeThresholds: gaugeThresholds(tag),
 		decimals: tag ? tag.decimals : null
 	};
+}
+
+/**
+ * 目盛（純関数）。bit の既定レンジ（0〜1）は両端の 2 本だけ（`False` / `True`。
+ * 間に 0.2 刻みの数値を出さない）。それ以外は [`scaleTicks`]。
+ */
+export function meterTicks(range: Extract<MeterRange, { kind: 'ok' }>): ScaleTick[] {
+	if (range.source === 'bit') {
+		return [
+			{ value: range.min, position: 0 },
+			{ value: range.max, position: 1 }
+		];
+	}
+	return scaleTicks(range);
+}
+
+/**
+ * レンジの端・目盛・計器の数値の文字（純関数）。bit の既定レンジのときは
+ * `False` / `True`、それ以外は小数桁に揃えた数値。しきい値の数値には使わない
+ * （しきい値は bit でも数値のまま出す - [`thresholdText`]）。
+ */
+export function scaleText(view: Pick<MeterView, 'range' | 'decimals'>, value: number): string {
+	if (view.range.kind === 'ok' && view.range.source === 'bit') return formatBitValue(value);
+	return thresholdText(view, value);
+}
+
+/** 数値の文字（小数桁に揃える。タグを読めていなければそのまま）。 */
+export function thresholdText(view: Pick<MeterView, 'decimals'>, value: number): string {
+	return view.decimals === null ? String(value) : formatValue(value, view.decimals);
 }
 
 /** グループの全ペンのバー・計器の表示（純関数）。 */
@@ -394,14 +429,15 @@ export function meterViews(
 export function meterDescription(
 	view: Pick<MeterView, 'range' | 'rangeMessage' | 'thresholds' | 'decimals' | 'unit'>
 ): string {
-	const fmt = (n: number) =>
-		(view.decimals === null ? String(n) : formatValue(n, view.decimals)) +
-		(view.unit ? ` ${view.unit}` : '');
+	const unit = view.unit ? ` ${view.unit}` : '';
+	const fmt = (n: number) => thresholdText(view, n) + unit;
+	// bit の既定レンジの端は True / False（単位は付けない）。
+	const edge = (n: number) =>
+		view.range.kind === 'ok' && view.range.source === 'bit' ? scaleText(view, n) : fmt(n);
+	const sourceLabel = { eng: '工学値レンジ', thresholds: 'しきい値の LL〜HH', bit: 'bit の既定' };
 	const range =
 		view.range.kind === 'ok'
-			? `レンジ ${fmt(view.range.min)}〜${fmt(view.range.max)}（${
-					view.range.source === 'eng' ? '工学値レンジ' : 'しきい値の LL〜HH'
-				}）`
+			? `レンジ ${edge(view.range.min)}〜${edge(view.range.max)}（${sourceLabel[view.range.source]}）`
 			: (view.rangeMessage ?? '');
 	const thresholds =
 		view.thresholds.length === 0

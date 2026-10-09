@@ -21,8 +21,14 @@
 	 *   まとめる（`LL/L/H`。等号は正しい設定なので、重ねると読めない。#535）。
 	 */
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
-	import { formatValue, lastReceivedText } from './monitorLogic';
-	import { meterDescription, toneColorVar, type MeterView } from './meterLogic';
+	import { lastReceivedText } from './monitorLogic';
+	import {
+		meterDescription,
+		scaleText,
+		thresholdText,
+		toneColorVar,
+		type MeterView
+	} from './meterLogic';
 
 	interface Props {
 		group: Pick<DisplayGroup, 'name'>;
@@ -34,10 +40,6 @@
 	}
 
 	let { group, pens, timeLabel, tagsHref }: Props = $props();
-
-	function tickText(pen: MeterView, value: number): string {
-		return pen.decimals === null ? String(value) : formatValue(value, pen.decimals);
-	}
 
 	const pct = (fraction: number) => `${(fraction * 100).toFixed(3)}%`;
 </script>
@@ -66,7 +68,8 @@
 				<div class="meter" aria-hidden="true">
 					<div class="scale">
 						{#each pen.ticks as tick (tick.value)}
-							<span class="tick" style:bottom={pct(tick.position)}>{tickText(pen, tick.value)}</span
+							<span class="tick" style:bottom={pct(tick.position)}
+								>{scaleText(pen, tick.value)}</span
 							>
 						{/each}
 					</div>
@@ -79,7 +82,7 @@
 								class="mark"
 								data-tone={mark.tone}
 								style:bottom={pct(mark.position)}
-								title={`${mark.label} ${tickText(pen, mark.value)}`}
+								title={`${mark.label} ${thresholdText(pen, mark.value)}`}
 							></span>
 						{/each}
 					</div>

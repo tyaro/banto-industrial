@@ -83,7 +83,7 @@ import {
 } from '../banto/collectAdmin';
 import type { DisplayGroup } from '../banto/displayGroupsAdmin';
 import type { TagWithThresholds, ThresholdFields } from '../banto/tagThresholdsAdmin';
-import { formatValue } from './monitorLogic';
+import { formatBitValue, formatValue, isBitTag } from './monitorLogic';
 
 // --- 時間窓 ------------------------------------------------------------------
 
@@ -471,6 +471,8 @@ export interface TrendPenInfo {
 	unit: string | null;
 	/** 小数桁（タグを読めていなければ `null`）。 */
 	decimals: number | null;
+	/** bit のタグ（線は 0 / 1 のまま、縦軸・ツールチップ・説明文で True / False）。 */
+	isBit: boolean;
 	colorSlot: number;
 	thresholds: ThresholdFields | null;
 }
@@ -491,6 +493,7 @@ export function trendPenInfos(
 			name: tag?.name ?? `タグ ID ${pen.tagId}`,
 			unit: tag?.unit ? tag.unit : null,
 			decimals: tag ? tag.decimals : null,
+			isBit: isBitTag(tag),
 			colorSlot: pen.colorSlot ?? index + 1,
 			thresholds:
 				tag && hasThresholds(tag)
@@ -503,6 +506,47 @@ export function trendPenInfos(
 					: null
 		};
 	});
+}
+
+/**
+ * 縦軸の目盛・ツールチップの文字の作り方（純関数、2026-10-09 オーナー決定 #551）。
+ *
+ * - **グループの全ペンが bit のとき**: 縦軸は `False`（0）/ `True`（1）。線は 0 / 1 の
+ *   段差のまま。間の目盛（0.2 刻み）は文字を出さない（`''`）。履歴の点は最小と最大の
+ *   中点（`historyPointValue`）なので、1 つの区間に変化があると 0〜1 の中間も来うる。
+ *   その値はツールチップの文字も `''` になる（`LineChart` は縦軸とツールチップに同じ
+ *   書式を使う）。
+ * - **bit とほかのタグが混ざるとき**、またはペンが無いとき: 全部数値のまま（縦軸は全ペン
+ *   共通の 1 本なので、0 / 1 だけ False / True にすると他のタグの 0 と 1 まで
+ *   True / False と読めてしまう）。この場合のツールチップの bit の値は 0 / 1。
+ *   True / False は凡例の説明文（`trendDescription`）と、デジタル・バー・計器で確かめられる。
+ */
+export function isAllBitTrend(pens: readonly Pick<TrendPenInfo, 'isBit'>[]): boolean {
+	return pens.length > 0 && pens.every((pen) => pen.isBit);
+}
+
+export function trendYFormatter(
+	pens: readonly Pick<TrendPenInfo, 'isBit' | 'decimals'>[]
+): (n: number) => string {
+	if (isAllBitTrend(pens)) {
+		return (n) => (n === 0 || n === 1 ? formatBitValue(n) : '');
+	}
+	const maxDecimals = Math.max(0, ...pens.map((pen) => pen.decimals ?? 0));
+	return (n) => n.toLocaleString(undefined, { maximumFractionDigits: maxDecimals });
+}
+
+/**
+ * 左の縦軸の範囲に**必ず含める値**（`LineChart` の `includeY`、#554 のレビュー指摘）。
+ *
+ * 全ペンが bit のときは `[0, 1]`、それ以外は `undefined`（範囲はデータだけで決まる）。
+ * 履歴の点は最小と最大の中点なので、見えている有限値が 0.5 だけ（その区間に 0 も 1 も
+ * あり、現在値は bad / stale で線が切れている）のとき、banto は目盛を 0.2〜0.8 で作り、
+ * `trendYFormatter` は 0 / 1 以外の目盛の文字を出さないので、縦軸の文字が 1 つも出ない。
+ * 偽のデータ点を足さず、軸の範囲だけを 0〜1 に広げて False / True の目盛を必ず出す。
+ * 値の目盛・データ点・凡例・ツールチップは増えない。
+ */
+export function trendIncludeY(pens: readonly Pick<TrendPenInfo, 'isBit'>[]): number[] | undefined {
+	return isAllBitTrend(pens) ? [0, 1] : undefined;
 }
 
 /** 凡例の文字（名前 + 単位。Q7: 単位は凡例に）。 */
@@ -523,6 +567,11 @@ export function trendTimeLabel(epochMs: number): string {
 
 function formatNumber(n: number, decimals: number | null): string {
 	return decimals === null ? String(n) : formatValue(n, decimals);
+}
+
+/** 履歴の中点（0〜1 の間）も来うるので、0 / 1 以外は数値のまま。 */
+function bitExtentText(n: number): string {
+	return n === 0 || n === 1 ? formatBitValue(n) : String(n);
 }
 
 /** 帯 1 つの説明（「H 80〜90 注意」など）。 */
@@ -550,11 +599,24 @@ export function trendDescription(input: {
 	);
 	const extent = valueExtent(input.rows);
 	const decimals = Math.max(0, ...input.pens.map((p) => p.decimals ?? 0));
-	parts.push(
-		extent === null
-			? '表示できる値はまだありません。'
-			: `縦軸は全ペン共通の自動スケールで、表示中の値の範囲は ${formatNumber(extent.min, decimals)}〜${formatNumber(extent.max, decimals)}。`
-	);
+	if (extent === null) {
+		parts.push('表示できる値はまだありません。');
+	} else if (isAllBitTrend(input.pens)) {
+		// 全ペンが bit: 縦軸の目盛は False / True。
+		const lo = bitExtentText(extent.min);
+		const hi = bitExtentText(extent.max);
+		parts.push(
+			`縦軸は False（0）と True（1）で、表示中の値は ${lo === hi ? lo : `${lo}〜${hi}`}。`
+		);
+	} else {
+		parts.push(
+			`縦軸は全ペン共通の自動スケールで、表示中の値の範囲は ${formatNumber(extent.min, decimals)}〜${formatNumber(extent.max, decimals)}。`
+		);
+		const bits = input.pens.filter((p) => p.isBit);
+		if (bits.length > 0) {
+			parts.push(`bit のペン（${bits.map((p) => p.name).join('、')}）は 0 が False、1 が True。`);
+		}
+	}
 	const bandPen = input.pens.find((p) => p.tagId === input.bandTagId) ?? null;
 	if (bandPen === null) {
 		parts.push('しきい値の帯: なし。');

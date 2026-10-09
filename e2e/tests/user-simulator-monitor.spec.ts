@@ -25,6 +25,10 @@
  *    帯は選んだ 1 ペンだけ（既定はしきい値のある最初のペン、凡例のペンで切り替え、
  *    画面外の文にも出る）。時間窓は端末ごとに覚え、グループの定義には書かない。
  *    収集を止めている間の刻みは `null` で、線が切れる（`d` の `M` が増える）。
+ * 10.（#551、2026-10-09 オーナー決定）bit のタグ（Modbus のコイル 00001、開発用 PLC が
+ *    トグルする）は、デジタルで `True` / `False`（0 / 1 ではない）。バー・計器は
+ *    「レンジ未設定」にならず 0〜1（目盛 `False` / `True`）。トレンドは全ペンが bit なら
+ *    縦軸の目盛が `False` / `True`。
  *
  * ## ファイル名（実行順）
  *
@@ -73,8 +77,19 @@ const TAG_OVER = 'E2E-MON-レンジ超え';
 const TAG_EQUAL = 'E2E-MON-同値しきい値';
 const GROUP_BAR = 'E2E-MON-バー';
 const GROUP_GAUGE = 'E2E-MON-計器';
-const TAG_NAMES = [TAG_RAMP, TAG_INVALID, TAG_HIGH, TAG_SCALED, TAG_OVER, TAG_EQUAL];
-const GROUP_NAMES = [GROUP_1, GROUP_2, GROUP_TREND, GROUP_BAR, GROUP_GAUGE];
+const TAG_BIT = 'E2E-MON-ビット';
+const GROUP_BIT = 'E2E-MON-ビット表示';
+const GROUP_BIT_TREND = 'E2E-MON-ビットトレンド';
+const TAG_NAMES = [TAG_RAMP, TAG_INVALID, TAG_HIGH, TAG_SCALED, TAG_OVER, TAG_EQUAL, TAG_BIT];
+const GROUP_NAMES = [
+	GROUP_1,
+	GROUP_2,
+	GROUP_TREND,
+	GROUP_BAR,
+	GROUP_GAUGE,
+	GROUP_BIT,
+	GROUP_BIT_TREND
+];
 
 interface NamedRow {
 	id: number;
@@ -224,6 +239,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 	let disabledByUs: ConnectionRow[] = [];
 	const groupIds: Record<string, number> = {};
 	let highTagId = 0;
+	let bitTagId = 0;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -315,6 +331,15 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			thresholdH: 30000,
 			thresholdHh: 60000
 		});
+		// #551: bit のタグ。コイル 00001 は開発用 PLC が 100ms ごとにトグルする。工学値レンジも
+		// しきい値も付けない（「レンジ未設定」にならないことを確かめる）。
+		const bit = await postJson<NamedRow>(page.request, headers, '/api/tags', {
+			...tagBase,
+			name: TAG_BIT,
+			dataType: 'bit',
+			address: '00001'
+		});
+		bitTagId = bit.id;
 		rewriteTagAddress(path.join(dbDir, DB_FILE_NAME), invalid.id, 'D3000');
 
 		const pen = (id: number) => ({ tagId: id, colorSlot: null });
@@ -322,8 +347,10 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			[GROUP_1, 'digital', [ramp.id, invalid.id, high.id]],
 			[GROUP_2, 'digital', [high.id]],
 			[GROUP_TREND, 'trend', [ramp.id, high.id]],
-			[GROUP_BAR, 'bar', [scaledTag.id, over.id, invalid.id, high.id, equal.id]],
-			[GROUP_GAUGE, 'gauge', [scaledTag.id, over.id, invalid.id, high.id]]
+			[GROUP_BAR, 'bar', [scaledTag.id, over.id, invalid.id, high.id, equal.id, bit.id]],
+			[GROUP_GAUGE, 'gauge', [scaledTag.id, over.id, invalid.id, high.id, bit.id]],
+			[GROUP_BIT, 'digital', [bit.id]],
+			[GROUP_BIT_TREND, 'trend', [bit.id]]
 		] as const) {
 			const created = await postJson<NamedRow>(page.request, headers, '/api/display-groups', {
 				name,
@@ -510,6 +537,17 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(highCell).toContainText('H 上限以上');
 		await expect(highCell.locator('.value')).toHaveText(/^\d+$/);
 		await expect(highCell.locator('.track')).toHaveCount(0);
+
+		// #551: bit のタグはレンジが無くても 0〜1。「レンジ未設定」にならず、目盛は False / True。
+		const bitCell = cell(TAG_BIT);
+		await expect(bitCell).toHaveAttribute('data-range', 'ok');
+		await expect(bitCell).not.toContainText('レンジ未設定');
+		await expect(bitCell.locator('.value')).toHaveText(/^(True|False)$/, { timeout: 20_000 });
+		await expect(bitCell.locator('.tick')).toHaveText(['False', 'True']);
+		await expect(bitCell.locator('.track')).toHaveCount(1);
+		await expect(bitCell.locator('.sr-only')).toHaveText(
+			'レンジ False〜True（bit の既定）。しきい値: なし'
+		);
 	});
 
 	test('6. 計器: banto の Gauge が出て値が変わる。値なしは「—」、しきい値は data-level と文字', async () => {
@@ -558,6 +596,20 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(highCell).toContainText('レンジ未設定');
 		await expect(highCell).toHaveAttribute('data-level', 'H');
 		await expect(highCell.locator('.value')).toHaveText(/^\d+$/);
+
+		// #551: bit のタグも「レンジ未設定」にならず Gauge が出る。両端と値は False / True。
+		const bitCell = cell(TAG_BIT);
+		await expect(bitCell).toHaveAttribute('data-range', 'ok');
+		await expect(bitCell).not.toContainText('レンジ未設定');
+		await expect(bitCell.locator('[role="img"]')).toHaveAttribute(
+			'aria-label',
+			new RegExp(`^${TAG_BIT} (True|False)$`),
+			{ timeout: 20_000 }
+		);
+		await expect(bitCell.locator('svg text.range-label')).toHaveText(['False', 'True']);
+		await expect(bitCell.locator('.sr-only')).toHaveText(
+			'レンジ False〜True（bit の既定）。しきい値: なし'
+		);
 	});
 
 	test('7. トレンド: 線が伸び、時刻の目盛・選んだペンの帯・端末ごとの時間窓・止めた間の切れ目', async () => {
@@ -632,5 +684,110 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		expect(start.ok(), `POST /api/collect/start が ${start.status()}`).toBe(true);
 		await expect(trend).toBeVisible({ timeout: 20_000 });
 		await expect.poll(segments, { timeout: 20_000 }).toBeGreaterThan(before);
+	});
+
+	test('8. bit のタグ: デジタルは True / False、トレンドは全ペン bit なら縦軸が False / True（#551）', async () => {
+		await page.goto(`/monitor?group=${groupIds[GROUP_BIT]}`);
+		const bitCell = cell(TAG_BIT);
+		const value = bitCell.locator('.value');
+		await expect(value).toHaveText(/^(True|False)$/, { timeout: 20_000 });
+		// 値が変わる（コイルがトグルする）。0 / 1 の数値は出さない。
+		const seen = new Set<string>();
+		await expect
+			.poll(
+				async () => {
+					const text = (await value.textContent()) ?? '';
+					expect(text).toMatch(/^(True|False)$/);
+					seen.add(text);
+					return seen.size;
+				},
+				{ timeout: 30_000 }
+			)
+			.toBe(2);
+		await expect(bitCell).toContainText('正常');
+
+		await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
+		const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
+		await expect(trend).toBeVisible({ timeout: 20_000 });
+		const yTicks = trend.locator('.chart-host svg text.y-tick');
+		await expect
+			.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
+				timeout: 30_000
+			})
+			.toEqual(expect.arrayContaining(['False', 'True']));
+		// 間の目盛（0.2 刻み）の数字は出さない。
+		for (const text of await yTicks.allTextContents()) {
+			expect(text.trim()).toMatch(/^(False|True)?$/);
+		}
+		await expect(trend.locator('.sr-only')).toContainText('縦軸は False（0）と True（1）で');
+	});
+
+	test('9. 全ペン bit のトレンド: 見える値が履歴の中点 0.5 だけで現在値が bad でも縦軸は False / True（#554 レビュー）', async () => {
+		// 履歴は全区間が「0 も 1 もあった」（中点 0.5）、現在値は bad（値なし）に差し替える。
+		// 縦軸の目盛は `includeY` [0, 1] で必ず 0 と 1 を含み、False / True が出る。
+		await page.route('**/api/collect/history*', async (route) => {
+			const url = new URL(route.request().url());
+			const fromMs = Number(url.searchParams.get('fromMs'));
+			const toMs = Number(url.searchParams.get('toMs'));
+			const count = 20;
+			const binMs = Math.max(1, Math.floor((toMs - fromMs) / count));
+			const points = Array.from({ length: count }, (_, i) => ({
+				tMs: fromMs + i * binMs,
+				min: 0,
+				max: 1
+			}));
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					state: 'ready',
+					data: {
+						fromMs,
+						toMs,
+						series: [{ tagId: bitTagId, simulation: false, binMs, points }],
+						unknownTagIds: []
+					}
+				})
+			});
+		});
+		await page.route('**/api/collect/values*', async (route) => {
+			const now = Date.now();
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					state: 'ready',
+					data: {
+						[`tag:${bitTagId}`]: {
+							value: null,
+							ptimeMs: now,
+							quality: 'bad',
+							lastGoodMs: null
+						}
+					},
+					serverNowMs: now
+				})
+			});
+		});
+		try {
+			await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
+			const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
+			await expect(trend).toBeVisible({ timeout: 20_000 });
+			const yTicks = trend.locator('.chart-host svg text.y-tick');
+			await expect
+				.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
+					timeout: 30_000
+				})
+				.toEqual(expect.arrayContaining(['False', 'True']));
+			// 線は中点 0.5 の水平線として描かれている（偽の 0 / 1 の点を足していない）。
+			// 水平線は外接矩形の高さが 0 で toBeVisible が hidden と判定するので、d 属性で見る。
+			await expect(trend.locator('.chart-host svg path[fill="none"]').first()).toHaveAttribute(
+				'd',
+				/^M [\d.]+ [\d.]+ L/
+			);
+		} finally {
+			await page.unroute('**/api/collect/history*');
+			await page.unroute('**/api/collect/values*');
+		}
 	});
 });
