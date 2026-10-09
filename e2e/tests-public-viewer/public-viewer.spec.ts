@@ -19,11 +19,18 @@
  *   3. the sidebar lists only the allowed items;
  *   4. "ログイン" leads to the setup/login screen and signing in switches to a
  *      normal session (full nav, ログアウト instead of ログイン, and the
- *      restricted screens open).
+ *      restricted screens open);
+ *   5. (R1-D の D-4) 監視画面の 4 種（デジタル・バー・計器・トレンド）が閲覧者にも
+ *      値付きで描かれ、読み取り専用である（本文に設定画面へのリンクを 1 つも
+ *      出さない）。表示グループ・タグは scenario 4 で作った管理者が REST で作り、
+ *      閲覧者はログインしていない別のブラウザコンテキストで開く。値の出どころは
+ *      製品の接続単位シミュレーション（`simulation: true`、#413）- この config は
+ *      開発用 PLC を起動しない（シミュレーションの値は記録されないが、現在値と
+ *      トレンドの追従には足りる）。
  *
  * No `waitForTimeout`/`sleep`: every wait is a locator auto-retry.
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 
 const ADMIN_USERNAME = 'pv-admin';
 const ADMIN_PASSWORD = 'E2ePvAdminPass1';
@@ -42,6 +49,73 @@ const RESTRICTED = [
 	{ path: '/settings', label: '設定' }
 ] as const;
 
+const CSRF_HEADERS = { 'X-Banto-Client': 'banto' };
+type ApiHeaders = Record<string, string>;
+
+// scenario 5 のフィクスチャ。名前で掃除する（CI の再試行は同じ DB で走る）。
+const PV_CONNECTION = 'PV-シミュレーション';
+const PV_COLLECTION_GROUP = 'PV-収集';
+const PV_TAG_SCALED = 'PV-工学値';
+const PV_TAG_UNSET = 'PV-レンジなし';
+const PV_GROUPS = [
+	{ name: 'PV-デジタル', kind: 'digital' },
+	{ name: 'PV-バー', kind: 'bar' },
+	{ name: 'PV-計器', kind: 'gauge' },
+	{ name: 'PV-トレンド', kind: 'trend' }
+] as const;
+
+interface NamedRow {
+	id: number;
+	name: string;
+}
+
+async function adminHeaders(request: APIRequestContext): Promise<ApiHeaders> {
+	const res = await request.post('/api/auth/login', {
+		headers: CSRF_HEADERS,
+		data: { username: ADMIN_USERNAME, password: ADMIN_PASSWORD }
+	});
+	const body = (await res.json()) as { success: boolean; token?: string; error?: string };
+	if (!body.success || !body.token) {
+		throw new Error(`REST のログインに失敗しました: ${body.error ?? res.status()}`);
+	}
+	return { ...CSRF_HEADERS, Authorization: `Bearer ${body.token}` };
+}
+
+async function postJson<T>(
+	request: APIRequestContext,
+	headers: ApiHeaders,
+	url: string,
+	data: unknown
+): Promise<T> {
+	const res = await request.post(url, { headers, data });
+	if (!res.ok()) throw new Error(`POST ${url} が ${res.status()}: ${await res.text()}`);
+	return (await res.json()) as T;
+}
+
+/** 収集を止め、scenario 5 のものを依存の逆順に消す（無ければ何もしない）。 */
+async function cleanupMonitorFixtures(
+	request: APIRequestContext,
+	headers: ApiHeaders
+): Promise<void> {
+	const stop = await request.post('/api/collect/stop', { headers });
+	expect(stop.ok(), `POST /api/collect/stop が ${stop.status()}`).toBe(true);
+	const deleteByName = async (listUrl: string, names: readonly string[]): Promise<void> => {
+		const list = await request.get(listUrl, { headers });
+		expect(list.ok(), `GET ${listUrl} が ${list.status()}`).toBe(true);
+		for (const row of ((await list.json()) as NamedRow[]).filter((r) => names.includes(r.name))) {
+			const res = await request.delete(`${listUrl}/${row.id}`, { headers });
+			expect([204, 404], `DELETE ${listUrl}/${row.id}`).toContain(res.status());
+		}
+	};
+	await deleteByName(
+		'/api/display-groups',
+		PV_GROUPS.map((g) => g.name)
+	);
+	await deleteByName('/api/tags', [PV_TAG_SCALED, PV_TAG_UNSET]);
+	await deleteByName('/api/collection-groups', [PV_COLLECTION_GROUP]);
+	await deleteByName('/api/plc-connections', [PV_CONNECTION]);
+}
+
 /** The header's "ログイン" button that replaces "ログアウト" for the synthetic viewer. */
 function loginButton(page: Page) {
 	return page.getByRole('banner').getByRole('button', { name: 'ログイン' });
@@ -56,12 +130,18 @@ function navLink(page: Page, label: string) {
 
 test.describe.serial('ChronoGazer viewer-public mode', () => {
 	let page: Page;
+	let monitorFixturesCreated = false;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
 	});
 
 	test.afterAll(async () => {
+		// scenario 5 が収集を始めていたら止めて消す（scenario 5 まで来ていなければ
+		// 何もしない）。
+		if (page && monitorFixturesCreated) {
+			await cleanupMonitorFixtures(page.request, await adminHeaders(page.request));
+		}
 		await page?.close();
 	});
 
@@ -146,5 +226,107 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 		await page.reload();
 		await expect(page).toHaveURL(/\/users$/);
 		await expect(page.getByRole('button', { name: 'ログアウト' })).toBeVisible();
+	});
+
+	test('5. 監視画面の 4 種が閲覧者にも値付きで描かれ、設定へのリンクを出さない', async ({
+		browser
+	}) => {
+		const headers = await adminHeaders(page.request);
+		await cleanupMonitorFixtures(page.request, headers);
+		monitorFixturesCreated = true;
+		const conn = await postJson<NamedRow>(page.request, headers, '/api/plc-connections', {
+			name: PV_CONNECTION,
+			protocol: 'modbus-tcp',
+			// 到達しない TEST-NET（RFC 5737）。シミュレーションなので接続しに行かない。
+			host: '192.0.2.1',
+			port: 502,
+			unitId: 1,
+			enabled: true,
+			wordOrder: '',
+			simulation: true
+		});
+		const cg = await postJson<NamedRow>(page.request, headers, '/api/collection-groups', {
+			name: PV_COLLECTION_GROUP,
+			plcConnectionId: conn.id,
+			periodMs: 500,
+			enabled: true
+		});
+		const tagBase = { collectionGroupId: cg.id, dataType: 'u16', decimals: 0, enabled: true };
+		// 工学値レンジのあるタグ（バー・計器が描ける）と、レンジの無いタグ（「レンジ未設定」。
+		// 編集者にはタグ設定へのリンクが出るが、閲覧者には出さない）。
+		const scaled = await postJson<NamedRow>(page.request, headers, '/api/tags', {
+			...tagBase,
+			name: PV_TAG_SCALED,
+			address: '40001',
+			unit: 'cnt',
+			rawLo: 0,
+			rawHi: 65535,
+			engLo: 0,
+			engHi: 65535
+		});
+		const unset = await postJson<NamedRow>(page.request, headers, '/api/tags', {
+			...tagBase,
+			name: PV_TAG_UNSET,
+			address: '40002'
+		});
+		for (const { name, kind } of PV_GROUPS) {
+			await postJson<NamedRow>(page.request, headers, '/api/display-groups', {
+				name,
+				kind,
+				attributes: {},
+				pens: [scaled.id, unset.id].map((tagId) => ({ tagId, colorSlot: null }))
+			});
+		}
+		const start = await page.request.post('/api/collect/start', { headers });
+		expect(start.ok(), `POST /api/collect/start が ${start.status()}`).toBe(true);
+
+		// ログインしていない別のコンテキスト = 閲覧公開の合成セッション。
+		const context = await browser.newContext();
+		try {
+			const viewer = await context.newPage();
+			await viewer.goto('/monitor');
+			await expect(viewer).toHaveURL(/\/monitor$/);
+			await expect(loginButton(viewer)).toBeVisible();
+			const panel = viewer.getByRole('tabpanel');
+			const cell = (name: string) => panel.getByRole('listitem').filter({ hasText: name });
+
+			for (const { name, kind } of PV_GROUPS) {
+				const tab = viewer.getByRole('tab', { name, exact: true });
+				await tab.click();
+				await expect(tab).toHaveAttribute('aria-selected', 'true');
+				if (kind === 'trend') {
+					const trend = panel.getByRole('region', { name: `${name} のトレンド表示` });
+					await expect(trend).toBeVisible({ timeout: 20_000 });
+					await expect(trend.locator('.chart-host svg path[fill="none"]').first()).toHaveAttribute(
+						'd',
+						/L/,
+						{ timeout: 20_000 }
+					);
+				} else if (kind === 'gauge') {
+					await expect(cell(PV_TAG_SCALED).locator('[role="img"]')).toHaveAttribute(
+						'aria-label',
+						new RegExp(`^${PV_TAG_SCALED} \\d+ cnt$`),
+						{ timeout: 20_000 }
+					);
+					await expect(cell(PV_TAG_UNSET)).toContainText('レンジ未設定');
+				} else if (kind === 'bar') {
+					await expect(cell(PV_TAG_SCALED).locator('.fill')).toHaveCount(1, { timeout: 20_000 });
+					await expect(cell(PV_TAG_SCALED).locator('.value')).toHaveText(/^\d+$/);
+					await expect(cell(PV_TAG_UNSET)).toContainText('レンジ未設定');
+				} else {
+					await expect(cell(PV_TAG_SCALED).locator('.value')).toHaveText(/^\d+$/, {
+						timeout: 20_000
+					});
+					await expect(cell(PV_TAG_SCALED)).toContainText('正常');
+				}
+				// 読み取り専用: 本文（タブの中）に設定画面（タグ設定・グループ設定・収集の
+				// 設定）へのリンクを 1 つも出さない。編集者ならレンジ未設定のタグに
+				// 「タグ設定を開く」が出る（user-simulator-monitor.spec.ts のテスト 5・6）。
+				await expect(panel.getByRole('link')).toHaveCount(0);
+			}
+			await expect(viewer.getByRole('button', { name: 'ログアウト' })).toHaveCount(0);
+		} finally {
+			await context.close();
+		}
 	});
 });
