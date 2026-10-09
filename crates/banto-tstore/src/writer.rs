@@ -134,7 +134,9 @@ use crate::clock::Clock;
 use crate::config::{compute_config_hash, StoreConfig};
 use crate::date::LocalDate;
 use crate::error::TstoreError;
-use crate::files::{latest_file_for_date, prune_files_excluding, PruneReport};
+use crate::files::{
+    latest_file_for_date, plan_prune_excluding, prune_files_excluding, PruneReport,
+};
 use crate::findable::ptime_is_findable_in;
 use crate::schema::{self, column_name_for_index, table_name_for_index};
 
@@ -394,6 +396,23 @@ impl TsWriter {
     ) -> Result<PruneReport, TstoreError> {
         let inner = self.inner.lock().await;
         prune_files_excluding(
+            &inner.data_dir,
+            retention_days,
+            today,
+            &[inner.current_date],
+        )
+    }
+
+    /// [`Self::prune_files`] の予行（何も消さない）。同じロックの下で、同じ
+    /// 「今開いている日付は消さない」判定をするので、設定画面の削除予定数と
+    /// 実際に消える数がずれない（#541）。
+    pub async fn plan_prune(
+        &self,
+        retention_days: u32,
+        today: LocalDate,
+    ) -> Result<PruneReport, TstoreError> {
+        let inner = self.inner.lock().await;
+        plan_prune_excluding(
             &inner.data_dir,
             retention_days,
             today,
@@ -2098,6 +2117,46 @@ mod tests {
     }
 
     // --- #538 レビュー: 保持削除との協調 / 捨てる行の選び方 -----------------
+
+    /// `plan_prune` は `prune_files` と同じ判定で、何も消さない。失敗した
+    /// 切り替えで開いたままの日付は予行でも「残す」に入る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_prune_matches_prune_files_and_deletes_nothing() {
+        let dir = TempDir::new("plan-pinned");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+        clock.advance_ms(3 * 86_400_000);
+        writer
+            .append("g1", DAY1_START_MS + 3 * 86_400_000, &[Some(2.0), None])
+            .await
+            .expect_err("rotation flush must fail");
+        let today = LocalDate::from_epoch_ms(clock.now_ms(), OFFSET_MS);
+        let day1_file = list_data_files(dir.path()).unwrap()[0].path.clone();
+
+        let plan = writer.plan_prune(1, today).await.unwrap();
+        assert!(
+            plan.deleted.is_empty(),
+            "予行も開いている日付は消す側に入れない"
+        );
+        assert!(day1_file.exists());
+        // 素の plan_prune は消す側に入れる（ここが食い違うのが #541 の P2）。
+        assert_eq!(
+            crate::files::plan_prune(dir.path(), 1, today)
+                .unwrap()
+                .deleted
+                .len(),
+            1
+        );
+        let report = writer.prune_files(1, today).await.unwrap();
+        assert_eq!(report.deleted.len(), plan.deleted.len());
+    }
 
     /// ライターが古い日付のファイルを開いたまま（切り替えの flush が失敗）の間は、
     /// 保持日数が小さくてもそのファイルを消さない。回復して切り替わったあとは

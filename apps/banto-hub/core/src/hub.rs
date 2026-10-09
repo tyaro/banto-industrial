@@ -1017,6 +1017,38 @@ impl CollectorManager {
         }
     }
 
+    /// [`Self::prune_data_files`] の予行（何も消さない）。収集中は書き込み側の
+    /// 「開いている日付は消さない」判定を含めて数えるので、設定画面の
+    /// プレビューが約束した件数と、実際に消える件数がずれない（#541）。
+    /// 走っていなければ素の [`banto_tstore::plan_prune`]。ロックの取り方は
+    /// `prune_data_files` と同じ。
+    pub async fn plan_prune_data_files(
+        &self,
+        retention_days: u32,
+        today: banto_tstore::LocalDate,
+    ) -> Result<banto_tstore::PruneReport, banto_tstore::TstoreError> {
+        let _gate = self.writer_gate.lock().await;
+        let guard = self.collector.lock().await;
+        if let Some(collector) = guard.as_ref() {
+            let writer = collector.writer_handle().borrow().clone();
+            let result = writer.plan_prune(retention_days, today).await;
+            drop(writer);
+            return result;
+        }
+        drop(guard);
+        let dir = self.data_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            banto_tstore::plan_prune(&dir, retention_days, today)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(banto_tstore::TstoreError::Storage(format!(
+                "削除予定の確認が異常終了しました: {err}"
+            ))),
+        }
+    }
+
     /// Rebuild the catalog and reconfigure the `Collector` from the current
     /// registry state (design §4.3, T7: "部分適用"). Called once at boot and
     /// after every I1 CRUD write that succeeds.
@@ -2507,6 +2539,22 @@ mod tests {
         let report = manager.prune_data_files(1, today).await.expect("prune");
         assert!(report.deleted.is_empty(), "開いている日付は消さない");
         assert!(day1_file.exists());
+
+        // 設定画面のプレビュー（plan_prune_data_files）は、実際の削除と同じ件数。
+        // 素の plan_prune は 1 件と数えてしまう（#541 の P2）。
+        let plan = manager.plan_prune_data_files(1, today).await.expect("plan");
+        assert!(
+            plan.deleted.is_empty(),
+            "プレビューも開いている日付は数えない"
+        );
+        assert_eq!(
+            banto_tstore::plan_prune(&data_dir, 1, today)
+                .expect("plain plan")
+                .deleted
+                .len(),
+            1
+        );
+        assert!(day1_file.exists(), "プレビューは消さない");
 
         // 回復 -> 切り替えが成功して 1 日目のファイルは閉じられ、消せる。
         sqlx::query("DROP TRIGGER fail_insert")
