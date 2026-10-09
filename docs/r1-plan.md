@@ -567,8 +567,9 @@ BANTO_ALLOW_SETUP=1 target/debug/banto-serve`）。`http://127.0.0.1:8810/` で�
      「1 ポート 1 接続」とは一般化しない: 三菱電機の FW 更新履歴（R08ENCPU のネットワーク部 77→78、2024 年 8 月、No.2）で、
      同じ TCP ポート番号に複数の SLMP 機器をつなげるようになった
      （<https://dl.mitsubishielectric.co.jp/dl/fa/software/update/plcr/0000000123/o_file/record_nw.html>）。挙動は FW と設定による
-     ので、FW の版は試運転で確かめる。観察した事実（この検証機は 3101 が拒否・3102 が受付）と、運用上の推奨（接続ごとに
-     ポートを分ける。タッチパネル等とも分ける）は別に扱う。
+     ので、FW の版は試運転で確かめる。観察した事実（この検証機は 3101 が拒否・3102 が受付）と、運用の方針は別に扱う。
+     **方針（2026-10-09 オーナー決定）: FW が同じポートでの複数接続を許していても、記録計や SCADA の接続ポートは分け合わない**
+     （接続ごとにポートを分け、タッチパネル等とも分ける）。
      取扱説明: [apps/chronogazer/README.md](../apps/chronogazer/README.md) の「PLC 側の設定（SLMP、三菱 iQ-R）」、
      [banto-hub-operations.md](banto-hub-operations.md) §2。
      見つかったもの: #550（トレンドの Y 軸ラベルが左で欠ける: banto の `LineChart` の左余白が 48px 固定）、
