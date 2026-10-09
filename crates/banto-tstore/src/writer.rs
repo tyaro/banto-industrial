@@ -39,6 +39,24 @@
 //!   時は再 open で連番ローテーション" - the caller is expected to open a
 //!   fresh writer after a config change, not mutate one in place).
 //!
+//! ### 切り替えの flush が失敗している間（#542）
+//!
+//! 日付が変わって切り替えるとき、前の日付の行の flush が失敗すると（ディスク
+//! いっぱい・ロックなど）、ライターは前の日付のファイルを開いたまま、その
+//! 日付の行を残す（#538）。その間に来た新しい日付の行も捨てずに、**行き先の
+//! 日付ごとに分けて**バッファに溜める（`Inner::buffers`）。このとき `append`
+//! は行を溜めたうえで、切り替えの失敗を `Err` で返す。行が失われたという
+//! 意味ではなく、収集側（`banto-collect` の書き込み失敗の記録・イベント）に
+//! 「書けていない」状態を伝え続けるため。次の `append`（や `flush`/`close`）
+//! が切り替えからやり直し、前の日付が書けた時点で、溜めた日付を古い順に、
+//! 日付ごとにそのファイルへ切り替えながら書き、最後に時計の日付のファイルを
+//! 開いたままにする。日付の中の行の順序は変わらない。溜める量は全日付を
+//! 通して #538 のセル数の上限に含め、超えたら全日付を通して `ptime` の古い
+//! 行から捨てて [`TsWriter::dropped_rows`] に数える。保持期間の削除
+//! （[`TsWriter::prune_files`]）は、未書き込みの行がある日付をすべて消さない。
+//! `close` の最後の flush も失敗したら、書けなかった行を同じカウンタに足して
+//! ログへ出す。
+//!
 //! ## Wall-clock-wins upsert on a `ptime` collision (owner decision 2026-08-08)
 //!
 //! `Inner::flush_locked`'s `INSERT INTO samples_<n> ... VALUES ...` carries an
@@ -122,7 +140,7 @@
 //! per-file min/max `ptime` index (案 B, deferred until PLC-side timestamps
 //! or back-filling historical data are needed).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -196,6 +214,9 @@ struct BufferedRow {
     values: Vec<Option<f64>>,
 }
 
+/// 1 つの日付ぶんの未書き込みの行（グループごと、追加した順）。
+type DateBuffer = HashMap<String, Vec<BufferedRow>>;
+
 struct Inner {
     data_dir: PathBuf,
     config: StoreConfig,
@@ -203,17 +224,23 @@ struct Inner {
     clock: Arc<dyn Clock>,
     options: WriterOptions,
     pool: SqlitePool,
+    /// 今開いている（`pool` が指す）ファイルの日付。
     current_date: LocalDate,
     #[allow(dead_code)] // kept for diagnostics/future use; not read today
     current_seq: u32,
     groups: HashMap<String, GroupRuntime>,
-    buffer: HashMap<String, Vec<BufferedRow>>,
+    /// 未書き込みの行を、行き先のファイルの日付ごとに持つ（#542）。ふだんは
+    /// `current_date` の 1 つだけ。日付の切り替えの flush が失敗している間は、
+    /// 新しい日付の行をここに別に溜める（「Rotation」の失敗時の説明を参照）。
+    buffers: BTreeMap<LocalDate, DateBuffer>,
+    /// 全日付を通した行数。
     buffered_row_count: usize,
-    /// バッファにある値のセル数（行ごとに `values.len() + 1`）。
+    /// 全日付を通した値のセル数（行ごとに `values.len() + 1`）。
     /// `max_retained_cells` と比べる。
     buffered_cells: usize,
     max_retained_cells: usize,
-    /// 上限超過で捨てた行の累計。`TsWriter::dropped_rows` が読む。
+    /// 上限超過で捨てた行と、close の最後の flush が失敗して書けなかった行の
+    /// 累計。`TsWriter::dropped_rows` が読む。
     dropped_rows: Arc<AtomicU64>,
     /// 今の失敗の連続（flush が成功するまで）の間に、捨てたことをすでに
     /// ログへ出したか。1 行ごとに出すと失敗が続く間ログが溢れる。
@@ -292,7 +319,7 @@ impl TsWriter {
                 current_date: today,
                 current_seq: seq,
                 groups,
-                buffer: HashMap::new(),
+                buffers: BTreeMap::new(),
                 buffered_row_count: 0,
                 buffered_cells: 0,
                 max_retained_cells: DEFAULT_MAX_RETAINED_CELLS,
@@ -316,6 +343,13 @@ impl TsWriter {
     /// row is never added to the buffer. The normal date rotation that runs
     /// before the check (flushing the rows already buffered and switching
     /// files) can still have happened by the time the error is returned.
+    ///
+    /// `Err` は「この行を受け付けなかった」とは限らない（#538 / #542）。
+    /// 検証のエラー（未知のグループ・値の数・上の #424 の拒否）では行は
+    /// 溜めないが、**書き込みの失敗**（しきい値で走った flush や、日付の
+    /// 切り替えの flush の失敗）では、行はバッファに溜めたうえで、その失敗を
+    /// 返す。溜めた行は次に書けたときに書かれ、失ったぶんは
+    /// [`Self::dropped_rows`] にだけ数える。
     pub async fn append(
         &self,
         group_key: &str,
@@ -323,7 +357,12 @@ impl TsWriter {
         values: &[Option<f64>],
     ) -> Result<(), TstoreError> {
         let mut inner = self.inner.lock().await;
-        inner.rotate_if_needed().await?;
+        // この行の行き先の日付。時計を読むのは 1 回だけにして、切り替えの
+        // 判定・#424 の判定・溜める先を同じ日付にそろえる。
+        let today = LocalDate::from_epoch_ms(inner.clock.now_ms(), inner.clock.utc_offset_ms());
+        // 切り替えが失敗しても、ここではまだ返さない（#542）。行は `today`
+        // 宛てに溜めてから、最後にこの失敗を返す。
+        let rotation = inner.rotate_if_needed(Some(today)).await;
 
         let expected = inner
             .groups
@@ -342,15 +381,19 @@ impl TsWriter {
         // *after* `rotate_if_needed` - and before anything is buffered, so a
         // rejected row is never written. Any rotation `rotate_if_needed` just
         // did (flush of the old day's buffer, file switch) stands.
-        if !ptime_is_findable_in(inner.current_date, ptime_ms) {
+        // 切り替えが失敗していても、行き先は `today` のファイル（回復後に
+        // 切り替えてから書く）なので、判定も `today` に対して行う。
+        if !ptime_is_findable_in(today, ptime_ms) {
             return Err(TstoreError::PtimeOutsideFileDate {
                 ptime_ms,
-                file_date: inner.current_date,
+                file_date: today,
             });
         }
 
         inner
-            .buffer
+            .buffers
+            .entry(today)
+            .or_default()
             .entry(group_key.to_string())
             .or_default()
             .push(BufferedRow {
@@ -361,34 +404,44 @@ impl TsWriter {
         inner.buffered_cells += values.len() + 1;
         inner.enforce_retention_cap();
 
+        // 切り替えが済んでいないなら、しきい値の flush はしない（開いている
+        // ファイルの日付の行はもう書けないと分かっている）。次の append が
+        // 切り替えからやり直す。
+        rotation?;
         inner.maybe_flush().await
     }
 
     /// Force a flush of whatever is currently buffered, regardless of
     /// thresholds. A no-op (not an error) if nothing is buffered.
+    ///
+    /// 日付の切り替えの失敗で別の日付宛ての行が残っていれば、その日付の
+    /// ファイルへの切り替えも行う（#542）。残っていなければ、日付が変わって
+    /// いても切り替えはしない（従来どおり、切り替えは次の `append` で行う）。
     pub async fn flush(&self) -> Result<(), TstoreError> {
         let mut inner = self.inner.lock().await;
-        inner.flush_locked().await
+        inner.flush_all().await
     }
 
     /// 書き込みの失敗が続いてバッファの上限を超え、古い順に捨てた行の累計。
     /// 0 でなければデータに欠けがある（flush の失敗で残した行が溜まり
     /// すぎた。#538）。アプリはこれを見て利用者に知らせられる。
+    /// 日付の切り替えの失敗中に溜めた新しい日付の行も同じ上限に含む（#542）。
     pub fn dropped_rows(&self) -> u64 {
         self.dropped_rows.load(Ordering::Relaxed)
     }
 
     /// 保持期間を過ぎたデータファイルを消す（#538）。[`crate::files::prune_files`]
-    /// と同じ判定だが、**このライターが今開いている日付のファイルは、古くても
-    /// 消さない**。flush が失敗して日付の切り替え（rotation）ができないと、
-    /// ライターは古い日付のファイルを開いたまま、その日付宛ての未書き込みの
-    /// 行を持ち続ける。外から `prune_files` を呼ぶと、そのファイルを
-    /// （保持日数が小さいと）消してしまい、書き込みの回復後に行の行き先が
-    /// 無くなる。ここでは**ライターのロックを持ったまま**判定と削除をするので、
-    /// 判定のあとにライターが別の日付へ切り替わる競合も起きない。
-    /// 切り替えが成功して古い日付のファイルを閉じたあとの掃除では、通常どおり
-    /// 消せる。削除は同期の `std::fs` で、ロックを持つ時間はファイル数に
-    /// 比例する短さ。
+    /// と同じ判定だが、**このライターが今開いている日付と、未書き込みの行を
+    /// 持っている日付のファイルは、古くても消さない**。flush が失敗して日付の
+    /// 切り替え（rotation）ができないと、ライターは古い日付のファイルを
+    /// 開いたまま、その日付宛ての未書き込みの行を持ち続ける（#542 以降は、
+    /// 新しい日付宛ての行も別に持つ）。外から `prune_files` を呼ぶと、その
+    /// ファイルを（保持日数が小さいと）消してしまい、書き込みの回復後に行の
+    /// 行き先が無くなる。ここでは**ライターのロックを持ったまま**判定と削除を
+    /// するので、判定のあとにライターが別の日付へ切り替わる競合も起きない。
+    /// 切り替えが成功して古い日付のファイルを閉じ、その日付の行を書き終えた
+    /// あとの掃除では、通常どおり消せる。削除は同期の `std::fs` で、ロックを
+    /// 持つ時間はファイル数に比例する短さ。
     pub async fn prune_files(
         &self,
         retention_days: u32,
@@ -399,13 +452,13 @@ impl TsWriter {
             &inner.data_dir,
             retention_days,
             today,
-            &[inner.current_date],
+            &inner.pinned_dates(),
         )
     }
 
     /// [`Self::prune_files`] の予行（何も消さない）。同じロックの下で、同じ
-    /// 「今開いている日付は消さない」判定をするので、設定画面の削除予定数と
-    /// 実際に消える数がずれない（#541）。
+    /// 「開いている日付と未書き込みの行がある日付は消さない」判定をするので、
+    /// 設定画面の削除予定数と実際に消える数がずれない（#541）。
     pub async fn plan_prune(
         &self,
         retention_days: u32,
@@ -416,7 +469,7 @@ impl TsWriter {
             &inner.data_dir,
             retention_days,
             today,
-            &[inner.current_date],
+            &inner.pinned_dates(),
         )
     }
 
@@ -432,11 +485,26 @@ impl TsWriter {
     /// connection pool. Consumes `self` - there is no further use for a
     /// `TsWriter` after `close()` (mirrors `sqlx::SqlitePool::close`'s
     /// "graceful shutdown" contract).
+    ///
+    /// 最後の flush（日付の切り替えの失敗で残った別の日付の行を含む、#542）が
+    /// 失敗したときは、書けなかった行の数を [`Self::dropped_rows`] のカウンタに
+    /// 足してログへ出し、接続を閉じてからそのエラーを返す。`self` を消費する
+    /// ので、呼び出し側が件数を知る手段はログになる。
     pub async fn close(self) -> Result<(), TstoreError> {
         let mut inner = self.inner.into_inner();
-        inner.flush_locked().await?;
+        let result = inner.flush_all().await;
+        if let Err(err) = &result {
+            let lost = inner.buffered_row_count as u64;
+            if lost > 0 {
+                inner.dropped_rows.fetch_add(lost, Ordering::Relaxed);
+                eprintln!(
+                    "banto-tstore: 終了時の書き込みに失敗したため、未書き込みの {lost} 行を捨てました（失敗の間に捨てた行は累計 {} 行）: {err}",
+                    inner.dropped_rows.load(Ordering::Relaxed)
+                );
+            }
+        }
         inner.pool.close().await;
-        Ok(())
+        result
     }
 }
 
@@ -446,51 +514,89 @@ impl Inner {
         let should_flush = self.buffered_row_count >= self.options.max_buffered_rows
             || now_ms - self.last_flush_ms >= self.options.flush_interval_ms;
         if should_flush {
-            self.flush_locked().await
+            self.flush_all().await
         } else {
             Ok(())
         }
     }
 
+    /// 消してはいけない日付: 開いているファイルの日付と、未書き込みの行が
+    /// ある日付（#538 / #542）。
+    fn pinned_dates(&self) -> Vec<LocalDate> {
+        let mut dates: Vec<LocalDate> = self.buffers.keys().copied().collect();
+        if !dates.contains(&self.current_date) {
+            dates.push(self.current_date);
+        }
+        dates
+    }
+
+    /// 溜めた行を全部書く。別の日付宛ての行が残っていれば、その日付の
+    /// ファイルへ切り替えながら書き、最後に開いているファイルの行を書く。
+    async fn flush_all(&mut self) -> Result<(), TstoreError> {
+        self.rotate_if_needed(None).await?;
+        self.flush_locked().await
+    }
+
     /// Check for a local-midnight crossing and, if one occurred since the
     /// currently-open file was resolved, flush the outgoing day's buffer
     /// into its (still-open) file, then resolve/open today's file.
-    async fn rotate_if_needed(&mut self) -> Result<(), TstoreError> {
-        let today = LocalDate::from_epoch_ms(self.clock.now_ms(), self.clock.utc_offset_ms());
-        if today == self.current_date {
-            return Ok(());
-        }
+    ///
+    /// #542: 開いているファイル以外の日付宛ての行（切り替えの flush が失敗
+    /// していた間に溜めたもの）が残っていれば、`target` より先にそれらを
+    /// 日付の順に片付ける: 開いているファイルの行を書く → 次の日付の
+    /// ファイルを開く、を繰り返す。1 歩ごとに日付が 1 つ片付くので必ず
+    /// 終わる。途中で失敗したら、その時点の状態（書けた日付は書けたまま、
+    /// 残りはバッファに）で `Err` を返し、次の呼び出しが続きからやり直す。
+    /// `target` が `None` なら、残った日付を片付けるだけで、時計の日付へは
+    /// 切り替えない（`flush`/`close` 用）。
+    async fn rotate_if_needed(&mut self, target: Option<LocalDate>) -> Result<(), TstoreError> {
+        loop {
+            let next = self
+                .buffers
+                .keys()
+                .copied()
+                .find(|date| *date != self.current_date)
+                .or(target.filter(|date| *date != self.current_date));
+            let Some(next) = next else {
+                return Ok(());
+            };
 
-        self.flush_locked().await?;
-        let now_ms = self.clock.now_ms();
-        let (pool, seq) = resolve_file(
-            &self.data_dir,
-            &self.config,
-            &self.config_hash,
-            today,
-            now_ms,
-        )
-        .await?;
-        let old_pool = std::mem::replace(&mut self.pool, pool);
-        old_pool.close().await;
-        self.current_date = today;
-        self.current_seq = seq;
-        Ok(())
+            self.flush_locked().await?;
+            let now_ms = self.clock.now_ms();
+            let (pool, seq) = resolve_file(
+                &self.data_dir,
+                &self.config,
+                &self.config_hash,
+                next,
+                now_ms,
+            )
+            .await?;
+            let old_pool = std::mem::replace(&mut self.pool, pool);
+            old_pool.close().await;
+            self.current_date = next;
+            self.current_seq = seq;
+        }
     }
 
-    /// 溜めた行を書く。**失敗してもバッファは減らさない**（#538）: 以前は
-    /// `buffer.drain()` で先に取り出していたので、書き込みが失敗するとその
-    /// 回の全グループの行が戻らなかった。今は書く間バッファを借りるだけで、
-    /// トランザクションがコミットできた後にだけ空にする。失敗したときは行が
-    /// そのまま残り（順序も保たれる）、次の flush でもう一度書く。
+    /// 開いているファイルの日付宛てに溜めた行を書く。**失敗してもバッファは
+    /// 減らさない**（#538）: 以前は `buffer.drain()` で先に取り出していたので、
+    /// 書き込みが失敗するとその回の全グループの行が戻らなかった。今は書く間
+    /// バッファを借りるだけで、トランザクションがコミットできた後にだけ
+    /// その日付のぶんを取り除く。失敗したときは行がそのまま残り（順序も
+    /// 保たれる）、次の flush でもう一度書く。
     /// 1 文あたりの行数は [`rows_per_statement`] で区切る。
     async fn flush_locked(&mut self) -> Result<(), TstoreError> {
-        if self.buffer.is_empty() {
+        let date = self.current_date;
+        let Some(buffer) = self.buffers.get(&date) else {
+            return Ok(());
+        };
+        if buffer.values().all(Vec::is_empty) {
+            self.buffers.remove(&date);
             return Ok(());
         }
 
         let mut tx = self.pool.begin().await?;
-        for (group_key, rows) in &self.buffer {
+        for (group_key, rows) in buffer {
             if rows.is_empty() {
                 continue;
             }
@@ -555,10 +661,15 @@ impl Inner {
         }
         tx.commit().await?;
 
-        self.buffer.clear();
-        self.buffered_row_count = 0;
-        self.buffered_cells = 0;
-        if self.drop_logged {
+        if let Some(flushed) = self.buffers.remove(&date) {
+            for rows in flushed.values() {
+                self.buffered_row_count -= rows.len();
+                self.buffered_cells -= rows.iter().map(|r| r.values.len() + 1).sum::<usize>();
+            }
+        }
+        // 全部の日付を書き終えたときだけ「回復した」とみなす。切り替えの途中
+        // （古い日付は書けたが新しい日付が残っている）ではまだ言わない。
+        if self.buffers.is_empty() && self.drop_logged {
             self.drop_logged = false;
             eprintln!(
                 "banto-tstore: 書き込みが回復しました（失敗の間に捨てた行は累計 {} 行）",
@@ -569,16 +680,17 @@ impl Inner {
         Ok(())
     }
 
-    /// バッファが `max_retained_cells` を超えたら、全グループを通して
+    /// バッファが `max_retained_cells` を超えたら、全日付・全グループを通して
     /// 時刻（`ptime`）の古い行から捨てる。ここに来るほど溜まるのは flush の
     /// 失敗が続いているときだけ。捨てた行数は [`TsWriter::dropped_rows`] に
-    /// 数え、失敗の連続ごとに最初の 1 回だけログへ出す。
+    /// 数え、失敗の連続ごとに最初の 1 回だけログへ出す。日付の切り替えの
+    /// 失敗中に溜めた新しい日付の行も同じ上限に含む（#542）。
     ///
-    /// 捨てる行は**一度に選ぶ**: 全行の `(ptime, グループ, 位置)` を集めて
-    /// 並べ替え、古い方から必要な数だけ印を付け、グループごとに 1 回の
-    /// `retain` で除く（O(n log n)。1 行捨てるたびに全グループを走査すると
-    /// ライターのロックを持ったまま O(行数 x グループ数) になる）。時計の
-    /// 巻き戻しは許されている（`ptime` が単調でない）ので、グループ内の
+    /// 捨てる行は**一度に選ぶ**: 全行の `(ptime, 日付とグループ, 位置)` を
+    /// 集めて並べ替え、古い方から必要な数だけ印を付け、日付とグループの組
+    /// ごとに 1 回の `retain` で除く（O(n log n)。1 行捨てるたびに全グループを
+    /// 走査するとライターのロックを持ったまま O(行数 x グループ数) になる）。
+    /// 時計の巻き戻しは許されている（`ptime` が単調でない）ので、グループ内の
     /// 挿入順ではなく `ptime` で「古い」を決める。残る行の順序は変えない。
     /// 上限の 7/8 までまとめて捨てるのは、超えるたびに作業が走らないように
     /// するため。
@@ -587,37 +699,44 @@ impl Inner {
             return;
         }
         let target = self.max_retained_cells - self.max_retained_cells / 8;
-        let keys: Vec<&String> = self.buffer.keys().collect();
+        let slots: Vec<(LocalDate, &String)> = self
+            .buffers
+            .iter()
+            .flat_map(|(date, groups)| groups.keys().map(move |key| (*date, key)))
+            .collect();
         let mut candidates: Vec<(i64, usize, usize)> = Vec::with_capacity(self.buffered_row_count);
-        for (g, key) in keys.iter().enumerate() {
-            for (i, row) in self.buffer[*key].iter().enumerate() {
-                candidates.push((row.ptime_ms, g, i));
+        for (s, (date, key)) in slots.iter().enumerate() {
+            for (i, row) in self.buffers[date][*key].iter().enumerate() {
+                candidates.push((row.ptime_ms, s, i));
             }
         }
         candidates.sort_unstable();
 
         let mut cells = self.buffered_cells;
         let mut rows_left = self.buffered_row_count;
-        let mut doomed: Vec<std::collections::HashSet<usize>> =
-            vec![std::collections::HashSet::new(); keys.len()];
+        let mut doomed: Vec<HashSet<usize>> = vec![HashSet::new(); slots.len()];
         let mut dropped = 0u64;
-        for (_, g, i) in candidates {
+        for (_, s, i) in candidates {
             if cells <= target || rows_left <= 1 {
                 break;
             }
-            cells -= self.buffer[keys[g]][i].values.len() + 1;
+            let (date, key) = slots[s];
+            cells -= self.buffers[&date][key][i].values.len() + 1;
             rows_left -= 1;
             dropped += 1;
-            doomed[g].insert(i);
+            doomed[s].insert(i);
         }
-        let doomed: Vec<(String, std::collections::HashSet<usize>)> = keys
+        let doomed: Vec<(LocalDate, String, HashSet<usize>)> = slots
             .into_iter()
             .zip(doomed)
             .filter(|(_, set)| !set.is_empty())
-            .map(|(key, set)| (key.clone(), set))
+            .map(|((date, key), set)| (date, key.clone(), set))
             .collect();
-        for (key, set) in doomed {
-            if let Some(rows) = self.buffer.get_mut(&key) {
+        for (date, key, set) in doomed {
+            let Some(groups) = self.buffers.get_mut(&date) else {
+                continue;
+            };
+            if let Some(rows) = groups.get_mut(&key) {
                 let mut index = 0usize;
                 rows.retain(|_| {
                     let keep = !set.contains(&index);
@@ -625,8 +744,11 @@ impl Inner {
                     keep
                 });
                 if rows.is_empty() {
-                    self.buffer.remove(&key);
+                    groups.remove(&key);
                 }
+            }
+            if groups.is_empty() {
+                self.buffers.remove(&date);
             }
         }
         self.buffered_cells = cells;
@@ -1258,9 +1380,9 @@ mod tests {
 
     // --- runtime UTC-offset (DST-style) transition (H7 ③) -----------------
     //
-    // `Inner::rotate_if_needed` recomputes `today = LocalDate::from_epoch_ms
+    // `TsWriter::append` recomputes `today = LocalDate::from_epoch_ms
     // (clock.now_ms(), clock.utc_offset_ms())` from scratch on *every*
-    // `append` call and compares it against whatever file is currently open
+    // call and `Inner::rotate_if_needed` compares it against whatever file is currently open
     // (`self.current_date`) - it never caches the offset or assumes it is
     // constant for the writer's lifetime (see `clock.rs`'s doc comment on
     // why `utc_offset_ms()` is re-queried every time rather than cached).
@@ -1271,7 +1393,7 @@ mod tests {
     // between the two appends below - `now_ms` does not.
     //
     // Time math (also asserted below against the same `LocalDate::
-    // from_epoch_ms` conversion `rotate_if_needed` itself uses, so these
+    // from_epoch_ms` conversion `append` itself uses, so these
     // constants can never silently drift from what the writer actually
     // computes):
     //   NOW_MS          = 2026-07-12T14:30:00Z
@@ -2288,5 +2410,304 @@ mod tests {
         }
         assert_eq!(stored, kept);
         writer.close().await.unwrap();
+    }
+
+    // --- #542: 日付の切り替えの flush が失敗している間の新しい日付の行 ---------
+
+    const DAY_MS: i64 = 86_400_000;
+
+    fn day(n: i64) -> LocalDate {
+        LocalDate::from_epoch_ms(DAY1_START_MS + n * DAY_MS, OFFSET_MS)
+    }
+
+    fn file_dates(dir: &Path) -> Vec<LocalDate> {
+        list_data_files(dir)
+            .unwrap()
+            .iter()
+            .map(|f| f.date)
+            .collect()
+    }
+
+    /// 切り替えの flush の失敗は書き込みの失敗（`Storage`、行は溜めた）で、
+    /// 検証のエラー（行を溜めない）ではない。
+    fn assert_storage_failure(result: Result<(), TstoreError>) {
+        match result {
+            Err(TstoreError::Storage(_)) => {}
+            other => panic!("expected a Storage error (row buffered), got {other:?}"),
+        }
+    }
+
+    /// 日付の変わり目で前の日付の flush が失敗し続けても、新しい日付の行は
+    /// 日付ごとに溜まる。回復したら、前の日付の行は前の日付のファイルへ、
+    /// 新しい日付の行は新しい日付のファイルへ、それぞれ元の順に書かれ、
+    /// 何も失わない。2 回日付をまたいだ（3 日分）場合も同じ。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotation_flush_failure_buffers_new_date_rows_and_writes_every_date_after_recovery() {
+        let dir = TempDir::new("rotation-failure-buffer");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(2.0), None])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+
+        // 2 日目: 切り替えの flush が失敗する。行は溜まり、失敗は返る。
+        clock.advance_ms(DAY_MS);
+        let d2 = DAY1_START_MS + DAY_MS;
+        for i in 0..3 {
+            assert_storage_failure(
+                writer
+                    .append("g1", d2 + i * 1_000, &[Some(20.0 + i as f64), None])
+                    .await,
+            );
+        }
+        assert_storage_failure(writer.append("g2", d2, &[Some(200.0)]).await);
+        // 3 日目: まだ失敗している。
+        clock.advance_ms(DAY_MS);
+        let d3 = DAY1_START_MS + 2 * DAY_MS;
+        assert_storage_failure(writer.append("g1", d3, &[Some(30.0), None]).await);
+        writer.flush().await.expect_err("flush still fails");
+        assert_eq!(
+            file_dates(dir.path()),
+            vec![day(0)],
+            "切り替えはまだ起きていない"
+        );
+
+        repair_inserts(&writer).await;
+        writer
+            .append("g1", d3 + 1_000, &[Some(31.0), None])
+            .await
+            .expect("rotation succeeds after repair");
+        let counter = writer.dropped_rows.clone();
+        writer.close().await.unwrap();
+
+        let g1 = all_rows(dir.path(), "g1").await;
+        assert_eq!(
+            g1.iter()
+                .map(|(d, p, v)| (*d, *p, v[0]))
+                .collect::<Vec<_>>(),
+            vec![
+                (day(0), DAY1_START_MS, Some(1.0)),
+                (day(0), DAY1_START_MS + 1_000, Some(2.0)),
+                (day(1), d2, Some(20.0)),
+                (day(1), d2 + 1_000, Some(21.0)),
+                (day(1), d2 + 2_000, Some(22.0)),
+                (day(2), d3, Some(30.0)),
+                (day(2), d3 + 1_000, Some(31.0)),
+            ]
+        );
+        let g2 = all_rows(dir.path(), "g2").await;
+        assert_eq!(g2, vec![(day(1), d2, vec![Some(200.0)])]);
+        assert_eq!(file_dates(dir.path()), vec![day(0), day(1), day(2)]);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    /// 失敗が続いて上限を超えたら、日付をまたいで ptime の古い行から捨てて
+    /// 数える。前の日付の行が全部捨てられても、回復後の切り替えは進む。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotation_failure_past_the_cap_drops_the_oldest_rows_across_dates() {
+        let dir = TempDir::new("rotation-failure-cap");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+            .await
+            .unwrap();
+        // g1 は 1 行 3 セル。上限 30 セル、超えたら 27 セル（= 9 行）まで捨てる。
+        writer.set_max_retained_cells(30).await;
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+
+        clock.advance_ms(DAY_MS);
+        let d2 = DAY1_START_MS + DAY_MS;
+        // 1 + 10 = 11 行で上限を超え、古い 2 行（1 日目の 1 行と 2 日目の
+        // 最初の 1 行）を捨てる。
+        for i in 0..10 {
+            assert_storage_failure(
+                writer
+                    .append("g1", d2 + i * 1_000, &[Some(i as f64), None])
+                    .await,
+            );
+        }
+        assert_eq!(writer.dropped_rows(), 2);
+
+        repair_inserts(&writer).await;
+        writer.flush().await.expect("flush after repair");
+        let g1 = all_rows(dir.path(), "g1").await;
+        assert_eq!(
+            g1.iter().map(|(d, p, _)| (*d, *p)).collect::<Vec<_>>(),
+            (1..10)
+                .map(|i| (day(1), d2 + i * 1_000))
+                .collect::<Vec<_>>(),
+            "1 日目の行と 2 日目の最初の行が捨てられ、残り 9 行が 2 日目のファイルにある"
+        );
+        assert_eq!(writer.dropped_rows(), 2);
+        writer.close().await.unwrap();
+    }
+
+    /// 失敗している間の保持削除は、開いている日付だけでなく、未書き込みの行が
+    /// ある日付（ここでは前の実行で作られた 2 日目のファイル）も消さない。
+    /// 回復して書き終えたあとは、通常どおり消せる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prune_during_rotation_failure_keeps_every_date_with_buffered_rows() {
+        let dir = TempDir::new("rotation-failure-prune");
+        // 2 日目のファイルが先にある（前の実行の名残など、同じ構成）。
+        let earlier = TsWriter::open(
+            dir.path(),
+            two_group_config(),
+            clock_at(DAY1_START_MS + DAY_MS),
+        )
+        .await
+        .unwrap();
+        earlier
+            .append("g1", DAY1_START_MS + DAY_MS, &[Some(9.0), None])
+            .await
+            .unwrap();
+        earlier.close().await.unwrap();
+
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+        clock.advance_ms(DAY_MS);
+        let d2 = DAY1_START_MS + DAY_MS + 1_000;
+        assert_storage_failure(writer.append("g1", d2, &[Some(2.0), None]).await);
+        clock.advance_ms(3 * DAY_MS);
+        let d5 = DAY1_START_MS + 4 * DAY_MS;
+        assert_storage_failure(writer.append("g1", d5, &[Some(5.0), None]).await);
+
+        let today = day(4);
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 2);
+        // 素の判定なら 1 日目と 2 日目の両方が消える。
+        assert_eq!(
+            crate::files::plan_prune(dir.path(), 1, today)
+                .unwrap()
+                .deleted
+                .len(),
+            2
+        );
+        let plan = writer.plan_prune(1, today).await.unwrap();
+        assert!(plan.deleted.is_empty(), "予行も未書き込みの日付を残す");
+        let report = writer.prune_files(1, today).await.unwrap();
+        assert!(report.deleted.is_empty(), "未書き込みの日付は消さない");
+        assert!(files.iter().all(|f| f.path.exists()));
+
+        repair_inserts(&writer).await;
+        writer.flush().await.expect("flush after repair");
+        let g1 = all_rows(dir.path(), "g1").await;
+        assert_eq!(
+            g1.iter().map(|(d, p, _)| (*d, *p)).collect::<Vec<_>>(),
+            vec![
+                (day(0), DAY1_START_MS),
+                (day(1), DAY1_START_MS + DAY_MS),
+                (day(1), d2),
+                (day(4), d5),
+            ]
+        );
+        let report = writer.prune_files(1, today).await.unwrap();
+        assert_eq!(
+            report.deleted,
+            vec![files[0].path.clone(), files[1].path.clone()],
+            "書き終えたあとは消せる"
+        );
+        writer.close().await.unwrap();
+    }
+
+    /// 失敗している間の `flush` は失敗を返し、行は残す（共有中の停止の経路）。
+    /// `close` は最後にもう一度書こうとし、書けなければ書けなかった行を
+    /// `dropped_rows` のカウンタに足してからエラーを返す。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_during_rotation_failure_counts_the_rows_it_could_not_write() {
+        let dir = TempDir::new("rotation-failure-close");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(2.0), None])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+        clock.advance_ms(DAY_MS);
+        let d2 = DAY1_START_MS + DAY_MS;
+        for i in 0..3 {
+            assert_storage_failure(
+                writer
+                    .append("g1", d2 + i * 1_000, &[Some(i as f64), None])
+                    .await,
+            );
+        }
+        writer.flush().await.expect_err("flush fails while broken");
+        assert_eq!(writer.dropped_rows(), 0, "flush の失敗では行を捨てない");
+
+        let counter = writer.dropped_rows.clone();
+        writer
+            .close()
+            .await
+            .expect_err("close reports the final flush failure");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            5,
+            "1 日目の 2 行と 2 日目の 3 行が書けなかった"
+        );
+    }
+
+    /// 回復したら、失敗の間に溜めた新しい日付の行を書いてから、そのまま
+    /// 新しい日付のファイルに続けて書ける（切り替え後の通常の flush）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_recovery_the_writer_keeps_appending_to_the_new_date_in_order() {
+        let dir = TempDir::new("rotation-failure-continue");
+        let clock = clock_at(DAY1_START_MS);
+        let options = WriterOptions {
+            max_buffered_rows: 2,
+            flush_interval_ms: i64::MAX,
+        };
+        let writer =
+            TsWriter::open_with_options(dir.path(), one_column_config(), clock.clone(), options)
+                .await
+                .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(0.0)])
+            .await
+            .unwrap();
+        break_inserts(&writer).await;
+        clock.advance_ms(DAY_MS);
+        let d2 = DAY1_START_MS + DAY_MS;
+        for i in 0..4 {
+            assert_storage_failure(writer.append("g1", d2 + i, &[Some(i as f64)]).await);
+        }
+        repair_inserts(&writer).await;
+        for i in 4..8 {
+            writer
+                .append("g1", d2 + i, &[Some(i as f64)])
+                .await
+                .expect("appends succeed after recovery");
+        }
+        writer.close().await.unwrap();
+        let g1 = all_rows(dir.path(), "g1").await;
+        assert_eq!(
+            g1.iter().map(|(d, p, _)| (*d, *p)).collect::<Vec<_>>(),
+            std::iter::once((day(0), DAY1_START_MS))
+                .chain((0..8).map(|i| (day(1), d2 + i)))
+                .collect::<Vec<_>>()
+        );
     }
 }
