@@ -239,6 +239,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 	let disabledByUs: ConnectionRow[] = [];
 	const groupIds: Record<string, number> = {};
 	let highTagId = 0;
+	let bitTagId = 0;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -338,6 +339,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			dataType: 'bit',
 			address: '00001'
 		});
+		bitTagId = bit.id;
 		rewriteTagAddress(path.join(dbDir, DB_FILE_NAME), invalid.id, 'D3000');
 
 		const pen = (id: number) => ({ tagId: id, colorSlot: null });
@@ -718,5 +720,70 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			expect(text.trim()).toMatch(/^(False|True)?$/);
 		}
 		await expect(trend.locator('.sr-only')).toContainText('縦軸は False（0）と True（1）で');
+	});
+
+	test('9. 全ペン bit のトレンド: 見える値が履歴の中点 0.5 だけで現在値が bad でも縦軸は False / True（#554 レビュー）', async () => {
+		// 履歴は全区間が「0 も 1 もあった」（中点 0.5）、現在値は bad（値なし）に差し替える。
+		// 縦軸の目盛は `includeY` [0, 1] で必ず 0 と 1 を含み、False / True が出る。
+		await page.route('**/api/collect/history*', async (route) => {
+			const url = new URL(route.request().url());
+			const fromMs = Number(url.searchParams.get('fromMs'));
+			const toMs = Number(url.searchParams.get('toMs'));
+			const count = 20;
+			const binMs = Math.max(1, Math.floor((toMs - fromMs) / count));
+			const points = Array.from({ length: count }, (_, i) => ({
+				tMs: fromMs + i * binMs,
+				min: 0,
+				max: 1
+			}));
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					state: 'ready',
+					data: {
+						fromMs,
+						toMs,
+						series: [{ tagId: bitTagId, simulation: false, binMs, points }],
+						unknownTagIds: []
+					}
+				})
+			});
+		});
+		await page.route('**/api/collect/values*', async (route) => {
+			const now = Date.now();
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					state: 'ready',
+					data: {
+						[`tag:${bitTagId}`]: {
+							value: null,
+							ptimeMs: now,
+							quality: 'bad',
+							lastGoodMs: null
+						}
+					},
+					serverNowMs: now
+				})
+			});
+		});
+		try {
+			await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
+			const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
+			await expect(trend).toBeVisible({ timeout: 20_000 });
+			const yTicks = trend.locator('.chart-host svg text.y-tick');
+			await expect
+				.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
+					timeout: 30_000
+				})
+				.toEqual(expect.arrayContaining(['False', 'True']));
+			// 線は中点 0.5 の水平線として描かれている（偽の 0 / 1 の点を足していない）。
+			await expect(trend.locator('.chart-host svg path[fill="none"]').first()).toBeVisible();
+		} finally {
+			await page.unroute('**/api/collect/history*');
+			await page.unroute('**/api/collect/values*');
+		}
 	});
 });

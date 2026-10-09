@@ -6,6 +6,7 @@
  * 時間窓（壊れた localStorage を含む）・説明文と注記。
  */
 import { describe, expect, it } from 'vitest';
+import { niceTicks } from '@banto/charts';
 import { HISTORY_MAX_BINS } from '../banto/collectAdmin';
 import { TIME_WINDOW_OPTIONS } from '../../routes/(app)/groups/groupsPageLogic';
 import {
@@ -40,6 +41,7 @@ import {
 	trendNotices,
 	trendPenInfos,
 	trendYFormatter,
+	trendIncludeY,
 	isAllBitTrend,
 	trendWindowLabel,
 	valueExtent,
@@ -550,6 +552,30 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		// ペンが無いときは全 bit ではない。
 		expect(isAllBitTrend([])).toBe(false);
 		expect(trendYFormatter([])(1)).toBe('1');
+	});
+
+	it('縦軸に含める値: 全 bit は [0, 1]、混在・ペン無しは無し。中点 0.5 だけでも False / True の目盛が出る（#554）', () => {
+		const bit = { isBit: true, decimals: 0 };
+		const num = { isBit: false, decimals: 1 };
+		expect(trendIncludeY([bit, bit])).toEqual([0, 1]);
+		expect(trendIncludeY([bit, num])).toBeUndefined();
+		expect(trendIncludeY([num])).toBeUndefined();
+		expect(trendIncludeY([])).toBeUndefined();
+
+		// 境界: 見えている有限値が履歴の中点 0.5 だけ（現在値は bad / stale で null）。
+		const pens = [bit];
+		const formatY = trendYFormatter(pens);
+		const half = historyPointValue({ min: 0, max: 1 });
+		expect(half).toBe(0.5);
+		// 含めないと、banto の目盛は 0.5 の周りで作られ、0 / 1 が無く文字が全部空になる。
+		const without = niceTicks(0.5, 0.5);
+		expect(without.map(formatY).filter((t) => t !== '')).toEqual([]);
+		// 含めると、範囲は 0.5 と [0, 1] の合併 = 0〜1 で、目盛に 0 と 1 が入る。
+		const include = trendIncludeY(pens) ?? [];
+		const ticks = niceTicks(Math.min(0.5, ...include), Math.max(0.5, ...include));
+		expect(ticks).toContain(0);
+		expect(ticks).toContain(1);
+		expect(ticks.map(formatY).filter((t) => t !== '')).toEqual(['False', 'True']);
 	});
 
 	it('注記: 履歴を読めない・不明なタグ・シミュレーションを別々に', () => {

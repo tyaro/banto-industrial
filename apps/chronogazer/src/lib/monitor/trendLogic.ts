@@ -535,6 +535,20 @@ export function trendYFormatter(
 	return (n) => n.toLocaleString(undefined, { maximumFractionDigits: maxDecimals });
 }
 
+/**
+ * 左の縦軸の範囲に**必ず含める値**（`LineChart` の `includeY`、#554 のレビュー指摘）。
+ *
+ * 全ペンが bit のときは `[0, 1]`、それ以外は `undefined`（範囲はデータだけで決まる）。
+ * 履歴の点は最小と最大の中点なので、見えている有限値が 0.5 だけ（その区間に 0 も 1 も
+ * あり、現在値は bad / stale で線が切れている）のとき、banto は目盛を 0.2〜0.8 で作り、
+ * `trendYFormatter` は 0 / 1 以外の目盛の文字を出さないので、縦軸の文字が 1 つも出ない。
+ * 偽のデータ点を足さず、軸の範囲だけを 0〜1 に広げて False / True の目盛を必ず出す。
+ * 値の目盛・データ点・凡例・ツールチップは増えない。
+ */
+export function trendIncludeY(pens: readonly Pick<TrendPenInfo, 'isBit'>[]): number[] | undefined {
+	return isAllBitTrend(pens) ? [0, 1] : undefined;
+}
+
 /** 凡例の文字（名前 + 単位。Q7: 単位は凡例に）。 */
 export function penLegendLabel(pen: Pick<TrendPenInfo, 'name' | 'unit'>): string {
 	return pen.unit ? `${pen.name}（${pen.unit}）` : pen.name;

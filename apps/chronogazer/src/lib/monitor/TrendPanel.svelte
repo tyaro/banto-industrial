@@ -30,6 +30,7 @@
 		trendDescription,
 		trendTimeLabel,
 		trendWindowLabel,
+		trendIncludeY,
 		trendYFormatter,
 		hasThresholds,
 		type TrendPenInfo,
@@ -86,6 +87,8 @@
 
 	// 縦軸・ツールチップの書式（全ペンが bit なら False / True。判断は trendYFormatter）。
 	const formatY = $derived(trendYFormatter(pens));
+	// 全ペンが bit なら縦軸に 0 と 1 を必ず含める（中点 0.5 だけでも False / True が出る）。
+	const includeY = $derived(trendIncludeY(pens));
 	function formatX(v: unknown): string {
 		return typeof v === 'number' ? trendTimeLabel(v) : String(v ?? '');
 	}
@@ -150,6 +153,7 @@
 			gaps="break"
 			{bands}
 			{formatY}
+			{includeY}
 			{formatX}
 			messages={{ emptyState: () => '表示できる値はまだありません' }}
 		/>
