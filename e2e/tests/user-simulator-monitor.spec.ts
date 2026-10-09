@@ -780,7 +780,11 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 				})
 				.toEqual(expect.arrayContaining(['False', 'True']));
 			// 線は中点 0.5 の水平線として描かれている（偽の 0 / 1 の点を足していない）。
-			await expect(trend.locator('.chart-host svg path[fill="none"]').first()).toBeVisible();
+			// 水平線は外接矩形の高さが 0 で toBeVisible が hidden と判定するので、d 属性で見る。
+			await expect(trend.locator('.chart-host svg path[fill="none"]').first()).toHaveAttribute(
+				'd',
+				/^M [\d.]+ [\d.]+ L/
+			);
 		} finally {
 			await page.unroute('**/api/collect/history*');
 			await page.unroute('**/api/collect/values*');
