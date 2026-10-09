@@ -568,7 +568,8 @@ BANTO_ALLOW_SETUP=1 target/debug/banto-serve`）。`http://127.0.0.1:8810/` で�
      同じ TCP ポート番号に複数の SLMP 機器をつなげるようになった
      （<https://dl.mitsubishielectric.co.jp/dl/fa/software/update/plcr/0000000123/o_file/record_nw.html>）。挙動は FW と設定による
      ので、FW の版は試運転で確かめる。観察した事実（この検証機は 3101 が拒否・3102 が受付）と、運用の方針は別に扱う。
-     **方針（2026-10-09 オーナー決定）: FW が同じポートでの複数接続を許していても、記録計や SCADA の接続ポートは分け合わない**
+     **方針（2026-10-09 オーナー決定）: FW が同じポートでの複数接続を許していても、記録計や SCADA は、ほかのシステム（タッチパネル・
+     ほかのアプリなど）と同じポートで接続しない（専用のポートを割り当てる）**
      （接続ごとにポートを分け、タッチパネル等とも分ける）。
      取扱説明: [apps/chronogazer/README.md](../apps/chronogazer/README.md) の「PLC 側の設定（SLMP、三菱 iQ-R）」、
      [banto-hub-operations.md](banto-hub-operations.md) §2。
