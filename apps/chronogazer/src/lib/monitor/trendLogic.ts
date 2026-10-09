@@ -19,7 +19,8 @@
  *   待ってから次を予約するので、実際の間隔は周期より少し長い）で刻みを飛ばし、
  *   読めているのに線が切れる。2 倍なら 1 刻みに 1 回以上は必ず読む。
  * - **行数が描画幅（ピクセル）以下**。`LineChart` は幅を超える行を間引くので、
- *   行数を幅以下にしておけば 1 行 = 1 刻みが崩れない。
+ *   行数を幅以下にしておけば 1 行 = 1 刻みが崩れない。幅は左の余白が最大まで広がった
+ *   ときの値（[`trendPlotWidthPx`]、#550）。
  * - **履歴の上限**（`HISTORY_MAX_BINS`、本数 × 行数 ≤ `HISTORY_MAX_POINTS`）。初期窓を
  *   1 回の要求で格子と同じ数の区間で読むため。
  *
@@ -181,12 +182,41 @@ export const TREND_STEP_CANDIDATES_MS: readonly number[] = [
 	250, 500, 1000, 2000, 5000, 10_000, 15_000, 30_000, 60_000
 ];
 
-/** `LineChart` の既定の左右の余白（48 + 16 px）。行数の上限を描画域の幅で数える。 */
-export const TREND_PLOT_MARGIN_PX = 64;
+/**
+ * `LineChart` の左の余白の下限（既定値）と、自動で広がるときの絶対上限、全幅に対する
+ * 割合の上限。banto の `leftMarginForTicks`（`packages/charts/src/core/labels.ts` の
+ * `growMargin`）の `max = 140`・`MAX_TICK_MARGIN_RATIO = 0.4`・`DEFAULT_MARGIN.left = 48` と同じ値。
+ */
+export const TREND_LEFT_MARGIN_MIN_PX = 48;
+export const TREND_LEFT_MARGIN_MAX_PX = 140;
+export const TREND_LEFT_MARGIN_MAX_RATIO = 0.4;
+/** `LineChart` の右の余白（右軸なしなら既定のまま 16 px。トレンドは右軸を使わない）。 */
+export const TREND_RIGHT_MARGIN_PX = 16;
+
+/**
+ * 左の余白が**最大まで広がったとき**の幅（px）。banto v6.3.2 以降の `LineChart` は左の余白を
+ * 縦軸の目盛りの文字に合わせて広げる（下限 48、上限 `min(140, floor(全幅 × 0.4))`、下限を
+ * 割らない）。目盛りの文字はデータで決まり、刻みを選ぶ時点では実際の余白が分からない。
+ * 一方 `LineChart` は行数が描画域の幅を超えると等間隔の素朴な間引きをし、短い山を落とす
+ * （可逆でない）ので、行数は実際の描画域の幅を**絶対に**超えてはならない。そこで最悪
+ * （余白が上限まで広がる場合）の描画域の幅で数える（#550）。
+ */
+export function trendLeftMarginMaxPx(widthPx: number): number {
+	if (!(widthPx > 0)) return TREND_LEFT_MARGIN_MAX_PX;
+	return Math.max(
+		TREND_LEFT_MARGIN_MIN_PX,
+		Math.min(TREND_LEFT_MARGIN_MAX_PX, Math.floor(widthPx * TREND_LEFT_MARGIN_MAX_RATIO))
+	);
+}
+
+/** 最悪（左の余白が最大）のときの描画域の幅（px）。0 未満にはしない。 */
+export function trendPlotWidthPx(widthPx: number): number {
+	return Math.max(0, Math.floor(widthPx - trendLeftMarginMaxPx(widthPx) - TREND_RIGHT_MARGIN_PX));
+}
 
 export interface StepInput {
 	windowMs: number;
-	/** パネルの幅（px）。余白は [`TREND_PLOT_MARGIN_PX`] を引いて数える。 */
+	/** パネルの幅（px）。描画域の幅は [`trendPlotWidthPx`]（左の余白が最大のとき）で数える。 */
 	widthPx: number;
 	/** 現在値のポーリング周期（ms）。 */
 	pollPeriodMs: number;
@@ -196,7 +226,7 @@ export interface StepInput {
 
 /** 格子の行数の上限（描画域の幅・履歴の上限）。 */
 export function maxTrendRows(widthPx: number, tagCount: number): number {
-	const plot = Math.floor(widthPx - TREND_PLOT_MARGIN_PX);
+	const plot = trendPlotWidthPx(widthPx);
 	const budget = Math.floor(HISTORY_MAX_POINTS / Math.max(1, tagCount));
 	return Math.max(1, Math.min(plot, HISTORY_MAX_BINS, budget));
 }
