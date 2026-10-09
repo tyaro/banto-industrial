@@ -259,6 +259,7 @@ test.describe.serial('chronogazer 監視画面の断線 → Bad → 復旧（R1-
 	let disabledByUs: ConnectionRow[] = [];
 	let devPlc: DevPlc | null = null;
 	const groupIds: Record<string, number> = {};
+	let rampTagId = 0;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -298,6 +299,7 @@ test.describe.serial('chronogazer 監視画面の断線 → Bad → 復旧（R1-
 			enabled: true,
 			unit: 'cnt'
 		});
+		rampTagId = ramp.id;
 		for (const [name, kind] of [
 			[GROUP_DIGITAL, 'digital'],
 			[GROUP_TREND, 'trend']
@@ -340,6 +342,36 @@ test.describe.serial('chronogazer 監視画面の断線 → Bad → 復旧（R1-
 	const tab = (name: string) => page.getByRole('tab', { name, exact: true });
 	const panel = () => page.getByRole('tabpanel');
 	const rampCell = () => panel().getByRole('listitem').filter({ hasText: TAG_RAMP });
+	const trendRegion = () => panel().getByRole('region', { name: `${GROUP_TREND} のトレンド表示` });
+	const trendLine = () => trendRegion().locator('.chart-host svg path[fill="none"]').first();
+	const trendD = async (): Promise<string> => (await trendLine().getAttribute('d')) ?? '';
+	/** 線の切れ端の数（`d` の `M` の数）。 */
+	const segments = async (): Promise<number> => (await trendD()).split('M').length - 1;
+	/** 最後の切れ端の線分の数（最後の `M` より後の `L` の数）。 */
+	const lastSegmentLines = async (): Promise<number> => {
+		const d = await trendD();
+		return (d.slice(d.lastIndexOf('M')).match(/L/g) ?? []).length;
+	};
+
+	/**
+	 * 直近 2 分の履歴（D-3a。断線中にトレンドを開き直したとき、断線の前の線はここから
+	 * 描かれる）で、値の入った点の数。
+	 */
+	async function historyPointsWithValue(): Promise<number> {
+		const now = Date.now();
+		const res = await page.request.get(
+			`/api/collect/history?tagIds=${rampTagId}&fromMs=${now - 120_000}&toMs=${now}&bins=120`,
+			{ headers }
+		);
+		expect(res.ok(), `GET /api/collect/history が ${res.status()}`).toBe(true);
+		const body = (await res.json()) as {
+			state: string;
+			data?: { series: { tagId: number; points: { min: number | null }[] }[] };
+		};
+		if (body.state !== 'ready') return 0;
+		const series = body.data?.series.find((s) => s.tagId === rampTagId);
+		return series?.points.filter((p) => p.min !== null).length ?? 0;
+	}
 
 	test('1. 収集を始めると、デジタル表示に値と「正常」が出る', async () => {
 		const res = await page.request.post('/api/collect/start', { headers });
@@ -348,6 +380,20 @@ test.describe.serial('chronogazer 監視画面の断線 → Bad → 復旧（R1-
 		await expect(tab(GROUP_DIGITAL)).toHaveAttribute('aria-selected', 'true');
 		await expect(rampCell().locator('.value')).toHaveText(/^\d+$/, { timeout: 20_000 });
 		await expect(rampCell().locator('.state')).toHaveText('正常');
+		await expect(rampCell()).toHaveAttribute('data-state', 'good');
+
+		// 断線させる前に、断線の前の線が確かにできていることを待つ（固定の sleep ではなく
+		// 条件で）。最初の good の表示で止めると、データファイルに値の入った点が 1 つしか
+		// 無く（収集 500ms・トレンドの刻み 1 秒）、断線中に開き直したトレンドが点 1 つ
+		// = 線分なしになる（PR #546 の CI で 2 回とも落ちた）。
+		// (a) トレンドの線が 3 本以上の線分（4 刻み以上）でつながっている。
+		await tab(GROUP_TREND).click();
+		await expect(trendRegion()).toBeVisible({ timeout: 20_000 });
+		await expect.poll(lastSegmentLines, { timeout: 30_000 }).toBeGreaterThanOrEqual(3);
+		// (b) 同じ区間がデータファイルにも書かれている（書き手の flush は約 1 秒）。
+		await expect.poll(historyPointsWithValue, { timeout: 20_000 }).toBeGreaterThanOrEqual(4);
+		await tab(GROUP_DIGITAL).click();
+		await expect(tab(GROUP_DIGITAL)).toHaveAttribute('aria-selected', 'true');
 		await expect(rampCell()).toHaveAttribute('data-state', 'good');
 	});
 
@@ -365,21 +411,22 @@ test.describe.serial('chronogazer 監視画面の断線 → Bad → 復旧（R1-
 	test('3. 断線中のトレンドは前の線を残し、復旧すると新しい線の切れ端が始まる', async () => {
 		await tab(GROUP_TREND).click();
 		await expect(page).toHaveURL(new RegExp(`/monitor\\?group=${groupIds[GROUP_TREND]}$`));
-		const trend = panel().getByRole('region', { name: `${GROUP_TREND} のトレンド表示` });
-		await expect(trend).toBeVisible({ timeout: 20_000 });
-		const line = trend.locator('.chart-host svg path[fill="none"]').first();
-		const segments = async (): Promise<number> =>
-			((await line.getAttribute('d')) ?? '').split('M').length - 1;
+		await expect(trendRegion()).toBeVisible({ timeout: 20_000 });
 
-		// 断線の前の区間は履歴（D-3a）から描かれる。履歴の待ち（2 秒）を見込む。
-		await expect(line).toHaveAttribute('d', /L/, { timeout: 20_000 });
-		await page.waitForTimeout(3_000);
+		// 断線の前の区間は履歴（D-3a）から描かれる（テスト 1 で 4 点以上あることを確かめて
+		// ある）。断線中の現在値は null なので、線分（`L`）が出るのは履歴が届いた後だけ。
+		await expect(trendLine()).toHaveAttribute('d', /L/, { timeout: 20_000 });
 		const before = await segments();
 		expect(before).toBeGreaterThanOrEqual(1);
 
 		devPlc = await startDevPlc(OWN_DEV_PLC_PORT);
-		// 断線の区間は null（0 ではない）なので、復旧後の値は新しい切れ端になる。
-		await expect.poll(segments, { timeout: RECOVERY_TIMEOUT_MS }).toBeGreaterThan(before);
+		// 断線の区間は null（0 ではない）なので、復旧後の値は新しい切れ端になる。点 1 つで
+		// 止まらず、線としてつながる（新しい切れ端に線分がある）ところまで待つ。
+		await expect
+			.poll(async () => (await segments()) > before && (await lastSegmentLines()) >= 1, {
+				timeout: RECOVERY_TIMEOUT_MS
+			})
+			.toBe(true);
 	});
 
 	test('4. 復旧後のデジタル表示は数値と「正常」に戻り、値が変わり続ける', async () => {
