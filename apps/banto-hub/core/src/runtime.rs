@@ -520,7 +520,7 @@ impl HubRuntime {
         // running. T14-1: the `JoinHandle` is now captured (`prune_handle`)
         // instead of discarded - see this module's doc comment ("T14-1 での
         // 唯一の挙動変化").
-        prune_once(&settings, &data_dir, clock.as_ref()).await;
+        prune_once(&settings, &manager, clock.as_ref()).await;
 
         // Audit-log retention sweep (docs/banto-hub-remaining-plan.md
         // P3-a): startup-once, same as the tstore sweep above - see
@@ -533,7 +533,7 @@ impl HubRuntime {
 
         let prune_handle: JoinHandle<()> = {
             let prune_settings = settings.clone();
-            let prune_data_dir = data_dir.clone();
+            let prune_manager = manager.clone();
             let prune_clock = clock.clone();
             let prune_audit = audit.clone();
             tokio::spawn(async move {
@@ -541,7 +541,7 @@ impl HubRuntime {
                 interval.tick().await; // first tick fires immediately; startup sweeps above already ran
                 loop {
                     interval.tick().await;
-                    prune_once(&prune_settings, &prune_data_dir, prune_clock.as_ref()).await;
+                    prune_once(&prune_settings, &prune_manager, prune_clock.as_ref()).await;
                     audit_prune_once(&prune_settings, &prune_audit).await;
                 }
             })
@@ -853,7 +853,7 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
 /// comment at the `u32::try_from` call below.
 async fn prune_once(
     settings: &SettingsService,
-    data_dir: &std::path::Path,
+    manager: &CollectorManager,
     clock: &dyn banto_tstore::Clock,
 ) {
     let retention_days = match settings.store_config().await {
@@ -880,7 +880,8 @@ async fn prune_once(
         return;
     };
     let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
-    match banto_tstore::prune_files(data_dir, retention_days, today) {
+    // 収集中は書き込み側を通して消す（開いている日付のファイルを消さない、#541）。
+    match manager.prune_data_files(retention_days, today).await {
         Ok(report) => {
             if !report.deleted.is_empty() {
                 log_line(&format!(
@@ -1458,6 +1459,24 @@ Host: {addr}
         Arc::new(banto_tstore::ManualClock::new(now_ms, 0))
     }
 
+    /// 剪定の呼び出し口（`CollectorManager::prune_data_files`）を通すための、
+    /// 収集を始めていない管理役。
+    fn test_manager(
+        pool: &sqlx::SqlitePool,
+        data_dir: &std::path::Path,
+        clock: Arc<dyn banto_tstore::Clock>,
+    ) -> CollectorManager {
+        CollectorManager::new(
+            pool.clone(),
+            data_dir.to_path_buf(),
+            clock,
+            CollectorOptions::default(),
+            Arc::new(HubSessions::new(banto_broker::BackoffConfig::default())),
+            Arc::new(BrokerSimRegistry::new()),
+            Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
+        )
+    }
+
     fn touch_test_data_file(data_dir: &std::path::Path, date: LocalDate, seq: u32) {
         std::fs::create_dir_all(data_dir).expect("create data dir");
         std::fs::write(
@@ -1486,7 +1505,8 @@ Host: {addr}
         touch_test_data_file(&data_dir, today, 1); // kept
 
         let clock = manual_clock_at(today);
-        prune_once(&settings, &data_dir, clock.as_ref()).await;
+        let manager = test_manager(&pool, &data_dir, clock.clone());
+        prune_once(&settings, &manager, clock.as_ref()).await;
 
         let remaining = banto_tstore::list_data_files(&data_dir).expect("list_data_files");
         assert_eq!(remaining.len(), 1);
@@ -1514,7 +1534,8 @@ Host: {addr}
         touch_test_data_file(&data_dir, LocalDate::new(2000, 1, 1), 1);
 
         let clock = manual_clock_at(today);
-        prune_once(&settings, &data_dir, clock.as_ref()).await;
+        let manager = test_manager(&pool, &data_dir, clock.clone());
+        prune_once(&settings, &manager, clock.as_ref()).await;
 
         let remaining = banto_tstore::list_data_files(&data_dir).expect("list_data_files");
         assert_eq!(
@@ -1548,7 +1569,8 @@ Host: {addr}
         touch_test_data_file(&data_dir, LocalDate::new(2000, 1, 1), 1);
 
         let clock = manual_clock_at(today);
-        prune_once(&settings, &data_dir, clock.as_ref()).await;
+        let manager = test_manager(&pool, &data_dir, clock.clone());
+        prune_once(&settings, &manager, clock.as_ref()).await;
 
         let remaining = banto_tstore::list_data_files(&data_dir).expect("list_data_files");
         assert_eq!(

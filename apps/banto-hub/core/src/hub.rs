@@ -708,6 +708,14 @@ pub struct CollectorManager {
     /// `inner` lock alone is not enough (it is only held across the short
     /// commit step, not across the registry read that precedes it).
     rebuild_lock: AsyncMutex<()>,
+    /// 保持期間の削除（[`CollectorManager::prune_data_files`]）と、収集の
+    /// 停止（`take()` して `Collector::stop`）を直列にするゲート（#541）。
+    /// 削除が書き込み側（`TsWriter`）の強い参照を持っている間に停止が
+    /// `TsWriter::close` へ進むと、共有扱いでプールが閉じられない。逆に停止の
+    /// 最中（`collector` は既に `None`）に書き手なしの削除が走ると、最終 flush
+    /// が書くファイルを消しうる。ロック順序は `rebuild_lock` → `writer_gate` →
+    /// `collector`（`apply_config` 側は `writer_gate` を取らない）。
+    writer_gate: AsyncMutex<()>,
     /// T1 (docs/tag-server-design.md §4.1「構成変更通知」・§5.2の
     /// `config_changed`): the current `revision`, mirrored onto a
     /// `watch` channel so `crate::stream`'s per-connection tasks can await
@@ -879,6 +887,7 @@ impl CollectorManager {
                 applied_registry: RegistrySnapshot::default(),
             }),
             rebuild_lock: AsyncMutex::new(()),
+            writer_gate: AsyncMutex::new(()),
             revision_tx,
             diag_log: DiagLog::default(),
         }
@@ -966,6 +975,46 @@ impl CollectorManager {
     /// 参照）。
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    /// 保持期間を過ぎたデータファイルを消す（定期の剪定と
+    /// `POST /api/store-settings/prune-now` の共通の口、#541）。
+    /// 収集が走っていれば、**書き込み側（`TsWriter`）のロックの下で**消す
+    /// （[`banto_tstore::TsWriter::prune_files`]。ファイルの切り替えに失敗して
+    /// 古い日付のまま開いているファイルは、保持日数を過ぎていても消さない）。
+    /// 走っていなければ書き手が無いので、そのまま [`banto_tstore::prune_files`]。
+    ///
+    /// `apply_config` が書き手を入れ替えうるので、書き手は**毎回**
+    /// `Collector::writer_handle` から読み直す。`collector` のロックは削除の
+    /// 間ずっと持ち（入れ替えと直列）、`writer_gate` で停止とも直列にする。
+    /// 取った強い参照は削除が終わったら（ゲートを放す前に）手放す - 停止の
+    /// `Collector::stop` は「自分だけが持つ `Arc`」のときだけ接続プールを
+    /// 閉じるため、参照を残すとファイルが掴まれたままになる。
+    pub async fn prune_data_files(
+        &self,
+        retention_days: u32,
+        today: banto_tstore::LocalDate,
+    ) -> Result<banto_tstore::PruneReport, banto_tstore::TstoreError> {
+        let _gate = self.writer_gate.lock().await;
+        let guard = self.collector.lock().await;
+        if let Some(collector) = guard.as_ref() {
+            let writer = collector.writer_handle().borrow().clone();
+            let result = writer.prune_files(retention_days, today).await;
+            drop(writer);
+            return result;
+        }
+        drop(guard);
+        let dir = self.data_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            banto_tstore::prune_files(&dir, retention_days, today)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(banto_tstore::TstoreError::Storage(format!(
+                "削除の処理が異常終了しました: {err}"
+            ))),
+        }
     }
 
     /// Rebuild the catalog and reconfigure the `Collector` from the current
@@ -1137,6 +1186,8 @@ impl CollectorManager {
             // `computed_plan`'s own comment above.
             self.computed.commit(computed_plan);
             self.db_source.commit(db_source_plan);
+            // 停止は削除と直列（`Self::writer_gate`）。`stop` が終わるまで持つ。
+            let _writer_gate = self.writer_gate.lock().await;
             let old_collector = self.collector.lock().await.take();
             let new_revision = {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
@@ -2007,6 +2058,8 @@ impl CollectorManager {
         }
 
         if config.group_count() == 0 {
+            // 停止は削除と直列（`Self::writer_gate`）。`stop` が終わるまで持つ。
+            let _writer_gate = self.writer_gate.lock().await;
             let old_collector = self.collector.lock().await.take();
             if let Some(collector) = old_collector {
                 let _ = collector.stop().await;
@@ -2181,6 +2234,8 @@ impl CollectorManager {
     /// Stop the running `Collector` cleanly (flushes tstore), if any. Called
     /// once at process shutdown (`bin/banto-hub.rs`).
     pub async fn shutdown(&self) {
+        // 停止は削除と直列（`Self::writer_gate`）。`stop` が終わるまで持つ。
+        let _writer_gate = self.writer_gate.lock().await;
         let old = self.collector.lock().await.take();
         if let Some(collector) = old {
             let _ = collector.stop().await;
@@ -2271,6 +2326,210 @@ mod tests {
             computed,
         );
         (dir, manager, pool)
+    }
+
+    /// 保持期間の削除（#541）のテスト用: 時計を差し替えられる管理役を
+    /// [`manager_env`] と同じ形で作る。
+    async fn manager_env_with_clock(
+        clock: Arc<dyn Clock>,
+    ) -> (
+        crate::test_support::TempDir,
+        CollectorManager,
+        sqlx::SqlitePool,
+    ) {
+        let dir = crate::test_support::TempDir::new("manager-env-clock");
+        let db_path = dir.path().join("registry.sqlite3");
+        let pool = init_db(&db_path).await.expect("init_db");
+        let data_dir = dir.path().join("data");
+        let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+        let sim_registry = Arc::new(BrokerSimRegistry::new());
+        let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
+        let manager = CollectorManager::new(
+            pool.clone(),
+            data_dir,
+            clock,
+            CollectorOptions {
+                connect_timeout: Duration::from_millis(200),
+                response_timeout: Duration::from_millis(200),
+                ..CollectorOptions::default()
+            },
+            sessions,
+            sim_registry,
+            computed,
+        );
+        (dir, manager, pool)
+    }
+
+    /// シミュレーション接続 1 本・有効タグ 1 つを登録する（`rebuild` で収集が
+    /// 実際に走る最小構成）。
+    async fn seed_running_simulation(pool: &sqlx::SqlitePool) {
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "prune".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 15031,
+                unit_id: 1,
+                enabled: true,
+                simulation: true,
+                word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "g".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 100,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(TagInput {
+                name: "t".to_string(),
+                collection_group_id: group.id,
+                address: "40001".to_string(),
+                data_type: "i16".to_string(),
+                string_length: None,
+                string_encoding: "utf8".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn local_today(clock: &dyn Clock) -> banto_tstore::LocalDate {
+        banto_tstore::LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms())
+    }
+
+    /// 収集していないとき（書き手が無い）は、素の `prune_files` で消す
+    /// （prune-now の REST も同じ口を通る）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prune_data_files_without_a_collector_deletes_aged_out_files() {
+        let (dir, manager, _pool) = manager_env().await;
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let old = data_dir.join("20200101-001.sqlite3");
+        std::fs::write(&old, b"").unwrap();
+        let today = local_today(manager.clock().as_ref());
+
+        let report = manager.prune_data_files(7, today).await.expect("prune");
+        assert_eq!(report.deleted, vec![old.clone()]);
+        assert!(!old.exists());
+    }
+
+    /// 収集中の削除は書き手を通して古いファイルを消し、開いている今日の
+    /// ファイルは残す。削除が書き手を掴んだまま残らないので、そのあとの
+    /// 停止は書き手を閉じ、データディレクトリがすぐ消せる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prune_while_running_does_not_defeat_the_writer_close_on_stop() {
+        let (dir, manager, pool) = manager_env().await;
+        seed_running_simulation(&pool).await;
+        manager.rebuild().await.expect("rebuild");
+        let data_dir = dir.path().join("data");
+        let old = data_dir.join("20200101-001.sqlite3");
+        std::fs::write(&old, b"").unwrap();
+        let today = local_today(manager.clock().as_ref());
+
+        let report = manager.prune_data_files(7, today).await.expect("prune");
+        assert_eq!(report.deleted, vec![old.clone()]);
+        assert!(!old.exists());
+        assert_eq!(
+            banto_tstore::list_data_files(&data_dir).unwrap().len(),
+            1,
+            "開いている今日のファイルは残る"
+        );
+
+        manager.shutdown().await;
+        std::fs::remove_dir_all(&data_dir).expect("停止で書き手が閉じられていれば、すぐ消せる");
+    }
+
+    /// 書き込みの失敗でファイルの切り替えができず古い日付のまま開いている間は、
+    /// 保持日数が小さくてもそのファイルを消さない。回復して切り替わったあとは
+    /// 消える。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prune_while_running_keeps_the_file_held_by_a_failed_rotation() {
+        use sqlx::Connection;
+
+        let clock = Arc::new(banto_tstore::ManualClock::new(
+            banto_tstore::LocalDate::new(2026, 7, 12).to_days_since_epoch() * 86_400_000
+                + 12 * 3_600_000,
+            0,
+        ));
+        let (dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
+        seed_running_simulation(&pool).await;
+        manager.rebuild().await.expect("rebuild");
+        let data_dir = dir.path().join("data");
+
+        let day1 = banto_tstore::list_data_files(&data_dir).unwrap();
+        assert_eq!(day1.len(), 1, "収集が今日のファイルを開いている");
+        let day1_file = day1[0].path.clone();
+
+        // 書き込み側の INSERT を必ず失敗させる（ディスクフル等の代わり）。
+        // トリガーはファイルに付くので、別の接続から付けても書き手に効く。
+        let url = format!("sqlite://{}", day1_file.display());
+        let mut side = sqlx::SqliteConnection::connect(&url).await.expect("side");
+        sqlx::query("PRAGMA busy_timeout = 5000")
+            .execute(&mut side)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_insert BEFORE INSERT ON samples_1 \
+             BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
+        )
+        .execute(&mut side)
+        .await
+        .expect("create trigger");
+
+        // 3 日進める。日付の切り替え前の flush が失敗し続けるので、書き手は
+        // 1 日目のファイルを開いたまま、行を持ち続ける。
+        clock.advance_ms(3 * 86_400_000);
+        let today = local_today(clock.as_ref());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let report = manager.prune_data_files(1, today).await.expect("prune");
+        assert!(report.deleted.is_empty(), "開いている日付は消さない");
+        assert!(day1_file.exists());
+
+        // 回復 -> 切り替えが成功して 1 日目のファイルは閉じられ、消せる。
+        sqlx::query("DROP TRIGGER fail_insert")
+            .execute(&mut side)
+            .await
+            .expect("drop trigger");
+        side.close().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let report = manager.prune_data_files(1, today).await.expect("prune");
+            if report.deleted.contains(&day1_file) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "回復して切り替わったあとは消せるはず"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!day1_file.exists());
+
+        manager.shutdown().await;
+        std::fs::remove_dir_all(&data_dir).expect("停止で書き手が閉じられていれば、すぐ消せる");
     }
 
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a

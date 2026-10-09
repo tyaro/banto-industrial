@@ -1753,7 +1753,12 @@ async fn store_settings_prune_now(
         Some(retention_days) => {
             let clock = state.manager.clock();
             let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
-            let report = banto_tstore::prune_files(state.manager.data_dir(), retention_days, today)
+            // 収集中は書き込み側（`TsWriter`）を通して消す。書き手が今開いている
+            // 日付のファイルは、保持日数を過ぎていても消さない（#541）。
+            let report = state
+                .manager
+                .prune_data_files(retention_days, today)
+                .await
                 .map_err(|err| ApiError(BantoError::Storage(err.to_string())))?;
             report.deleted.len()
         }
