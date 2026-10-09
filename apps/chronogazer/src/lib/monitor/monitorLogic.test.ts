@@ -463,9 +463,10 @@ describe('groupPenViews', () => {
 });
 
 describe('isKindRendered / valuesStaleNote', () => {
-	it('デジタル（D-1）とバー・計器（D-2）を描く。トレンドは D-3 まで描かない', () => {
+	it('4 種すべてを描く（トレンドは D-3b）。知らない種別は描かない', () => {
 		expect(isKindRendered('digital')).toBe(true);
-		expect(isKindRendered('trend')).toBe(false);
+		expect(isKindRendered('trend')).toBe(true);
+		expect(isKindRendered('unknown' as never)).toBe(false);
 		expect(isKindRendered('bar')).toBe(true);
 		expect(isKindRendered('gauge')).toBe(true);
 	});

@@ -42,7 +42,8 @@ import {
 import type { ValuesPhase } from './monitorLogic';
 
 export type ValuesMap = Record<string, CurrentSampleView>;
-export type ValuesReadout = Readout<ValuesMap>;
+/** 現在値の応答（`serverNowMs` は D-3b で足した。古い相手・テストの足場では無いことがある）。 */
+export type ValuesReadout = Readout<ValuesMap> & { serverNowMs?: number };
 export type ValuesFetch = (signal: AbortSignal) => Promise<ValuesReadout>;
 
 /** ポーラーが持つ状態（[`applyValuesOutcome`] の入出力）。 */
@@ -52,15 +53,21 @@ export interface ValuesState {
 	values: ValuesMap | null;
 	/** 連続失敗回数（成功で 0）。 */
 	failures: number;
-	/** 最後に取得できた時刻（epoch ミリ秒）。 */
+	/** 最後に取得できた時刻（epoch ミリ秒、端末の時計）。 */
 	lastOkAt: number | null;
+	/**
+	 * `phase === 'ready'` の応答のサーバーの時刻（`serverNowMs`、D-3b）。トレンドの表示の
+	 * 時計に使う。応答に無ければ `null`。
+	 */
+	serverNowMs: number | null;
 }
 
 export const INITIAL_VALUES_STATE: ValuesState = {
 	phase: 'loading',
 	values: null,
 	failures: 0,
-	lastOkAt: null
+	lastOkAt: null,
+	serverNowMs: null
 };
 
 /**
@@ -81,10 +88,14 @@ export function applyValuesOutcome(
 	if (outcome.kind === 'ok') {
 		const readout = outcome.value;
 		if (readout.state === 'ready') {
-			return { phase: 'ready', values: readout.data, failures: 0, lastOkAt: now };
+			const serverNowMs =
+				typeof readout.serverNowMs === 'number' && Number.isFinite(readout.serverNowMs)
+					? readout.serverNowMs
+					: null;
+			return { phase: 'ready', values: readout.data, failures: 0, lastOkAt: now, serverNowMs };
 		}
 		if (readout.state === 'notRunning') {
-			return { phase: 'notRunning', values: null, failures: 0, lastOkAt: now };
+			return { phase: 'notRunning', values: null, failures: 0, lastOkAt: now, serverNowMs: null };
 		}
 	}
 	return { ...state, failures: nextPollFailureCount(state.failures, 'failed') };

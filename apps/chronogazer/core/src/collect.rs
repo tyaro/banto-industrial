@@ -1991,6 +1991,21 @@ impl CollectorService {
         }
     }
 
+    /// **現在値の応答**（`GET /api/collect/values` / `collect_values` が返すもの、
+    /// R1-D の D-3b）: [`Self::values`] に**応答を作った時点のサーバーの時刻**
+    /// （[`ValuesResponse::server_now_ms`]）を添える。
+    ///
+    /// 監視画面のトレンドは、表示の時計をこの時刻に合わせる。サンプルの
+    /// `ptimeMs`（読みに行った時刻）を時計にすると、収集周期の長いタグでは
+    /// サンプルの古さ（開いた時点で最大 1 周期）だけ時計が遅れ、次のサンプルで
+    /// 時計が跳んで間の刻みが欠測に見える（PR #543 のレビュー P2）。
+    pub fn values_response(&self) -> ValuesResponse {
+        ValuesResponse {
+            readout: self.values(),
+            server_now_ms: server_now_ms(),
+        }
+    }
+
     /// **接続状態**（`GET /api/collect/connections` / `collect_connections`）。
     ///
     /// 3 つの結末すべてを返しうる唯一の口:
@@ -2551,6 +2566,27 @@ impl Lifecycle {
 /// `invalid` として足す。外したタグは収集計画に入っていないので `samples` に
 /// 同じキーは来ないが、来ても `invalid` を優先する（設定が不正で読んでいない、
 /// が事実なので）。
+/// 現在値の応答（[`CollectorService::values_response`]）。JSON は [`Readout`] の
+/// 形（`{"state": ..., "data": ...}`）に `serverNowMs` を**足しただけ**で、既存の
+/// 項目は変えない（`flatten`）。`serverNowMs` は `state` によらず必ず載る。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValuesResponse {
+    #[serde(flatten)]
+    pub readout: Readout<HashMap<String, CurrentSampleView>>,
+    /// 応答を作った時点のサーバーの時刻（UTC epoch ミリ秒。サンプルの
+    /// `ptimeMs` と同じ時計）。
+    pub server_now_ms: i64,
+}
+
+/// サーバーの今（UTC epoch ミリ秒）。時計が 1970 年より前を指すという
+/// あり得ない場合だけ 0。
+fn server_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 fn values_readout(
     snapshot: Option<HashMap<String, CurrentReading>>,
     excluded: &[String],
@@ -3515,6 +3551,46 @@ mod tests {
             serde_json::json!({"value": null, "ptimeMs": null, "quality": "invalid", "lastGoodMs": null})
         );
         svc.stop().await.expect("stop");
+    }
+
+    /// D-3b（PR #543 のレビュー P2）: 現在値の応答は `Readout` の形に
+    /// `serverNowMs`（応答を作った時点のサーバーの時刻）を足しただけで、
+    /// 走っていないときも載る。値は呼ぶ前後のシステム時刻の間に入る。
+    /// `flatten` を外すと `readout` の入れ子になり 1 つ目の `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn values_response_adds_server_now_ms_to_the_readout_shape() {
+        let dir = TempDir::new();
+        let (_pool, svc) = service(&dir).await;
+        let before = server_now_ms();
+        let json = serde_json::to_value(svc.values_response()).expect("serialize");
+        let after = server_now_ms();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["serverNowMs", "state"], "{json}");
+        assert_eq!(json["state"], "notRunning");
+        let now = json["serverNowMs"].as_i64().expect("serverNowMs is i64");
+        assert!(
+            before <= now && now <= after,
+            "{before} <= {now} <= {after}"
+        );
+        // 2020 年より後（epoch 秒やマイクロ秒と取り違えていない）。
+        assert!(now > 1_577_836_800_000 && now < 4_102_444_800_000, "{now}");
+
+        let ready = ValuesResponse {
+            readout: Readout::Ready {
+                data: HashMap::new(),
+            },
+            server_now_ms: 5,
+        };
+        assert_eq!(
+            serde_json::to_value(ready).expect("serialize"),
+            serde_json::json!({"state": "ready", "data": {}, "serverNowMs": 5})
+        );
     }
 
     /// `/tags` の印（[`registry_exclusions`]）は、**収集の開始が外すものと

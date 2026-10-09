@@ -425,17 +425,23 @@ export async function getCollectStatus(signal?: AbortSignal): Promise<CollectorS
 }
 
 /**
+ * `chronogazer_core::collect::ValuesResponse`: 現在値の [`Readout`] に、応答を作った
+ * 時点の**サーバーの時刻** `serverNowMs`（UTC epoch ミリ秒、サンプルの `ptimeMs` と
+ * 同じ時計。R1-D の D-3b）を足した形。トレンドの表示の時計に使う。
+ */
+export type ValuesResponse = Readout<Record<string, CurrentSampleView>> & {
+	serverNowMs: number;
+};
+
+/**
  * 現在値（`viewer` 以上）。キーは `tag:<id>`。`notRunning` と `ready` のみ
  * （葉から読むので `unavailable` は返らない）。#414 段階2 で外したタグは
- * `quality: 'invalid'`・`value: null` で載る。
+ * `quality: 'invalid'`・`value: null` で載る。応答には `serverNowMs` が添わる。
  */
-export async function getCollectValues(
-	signal?: AbortSignal
-): Promise<Readout<Record<string, CurrentSampleView>>> {
+export async function getCollectValues(signal?: AbortSignal): Promise<ValuesResponse> {
 	if (!isCollectAvailable()) throw demoModeError();
-	if (getBantoMode() === 'tauri')
-		return invokeCommand<Readout<Record<string, CurrentSampleView>>>('collect_values');
-	return httpJson<Readout<Record<string, CurrentSampleView>>>('/api/collect/values', 'GET', signal);
+	if (getBantoMode() === 'tauri') return invokeCommand<ValuesResponse>('collect_values');
+	return httpJson<ValuesResponse>('/api/collect/values', 'GET', signal);
 }
 
 /**

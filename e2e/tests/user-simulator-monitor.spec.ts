@@ -1,5 +1,5 @@
 /**
- * 監視画面（`/monitor`、R1-D の D-1・D-2）の実 DOM 固定。
+ * 監視画面（`/monitor`、R1-D の D-1・D-2・D-3b）の実 DOM 固定。
  *
  * 固定したい受入条件:
  * 1. 収集が動いていないときは「収集が動いていません」（値の欄を 0 や空で出さない）。
@@ -8,8 +8,8 @@
  *    値が実際に変わる。単位・しきい値（色だけでなく文字）が出る。
  * 3. 設定が不正で外したタグ（品質 `invalid`）は「—」と「設定不正（収集対象外）」、
  *    タグ設定へのリンクで出る（0 にしない）。
- * 4. タブで表示グループを切り替えられ、選択は URL の `?group=` に載る。描けない
- *    種別（D-1 ではトレンド）は「この表示種別は準備中です」。
+ * 4. タブで表示グループを切り替えられ、選択は URL の `?group=` に載る。前の
+ *    グループの値を持ち越さない。
  * 5. コマンドパレットの「グループ: ◯◯ を表示」でも切り替えられる。`/monitor` を
  *    開き直すと、この端末で最後に見たグループが選ばれている。
  * 6. バー（D-2）: 工学値レンジのタグは棒が出て値が変わる。LL..HH をレンジにした
@@ -21,6 +21,10 @@
  * 8.（#532）しきい値はタグではなく**記録計の側の設定**（`PUT /api/tag-thresholds/{id}`）
  *    に入れ、監視画面はそこから判定する。収集のしきい値のイベントは、判定に使った
  *    しきい値を `/events` の「水準」に出す（`H 0 以上`）。
+ * 9. トレンド（D-3b）: 線（`path` の `d`）が描かれて伸びる。時刻の目盛。しきい値の
+ *    帯は選んだ 1 ペンだけ（既定はしきい値のある最初のペン、凡例のペンで切り替え、
+ *    画面外の文にも出る）。時間窓は端末ごとに覚え、グループの定義には書かない。
+ *    収集を止めている間の刻みは `null` で、線が切れる（`d` の `M` が増える）。
  *
  * ## ファイル名（実行順）
  *
@@ -317,7 +321,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		for (const [name, kind, pens] of [
 			[GROUP_1, 'digital', [ramp.id, invalid.id, high.id]],
 			[GROUP_2, 'digital', [high.id]],
-			[GROUP_TREND, 'trend', [ramp.id]],
+			[GROUP_TREND, 'trend', [ramp.id, high.id]],
 			[GROUP_BAR, 'bar', [scaledTag.id, over.id, invalid.id, high.id, equal.id]],
 			[GROUP_GAUGE, 'gauge', [scaledTag.id, over.id, invalid.id, high.id]]
 		] as const) {
@@ -411,8 +415,11 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 
 		await tab(GROUP_TREND).click();
 		await expect(page).toHaveURL(new RegExp(`/monitor\\?group=${groupIds[GROUP_TREND]}$`));
-		await expect(panel().getByText('この表示種別は準備中です')).toBeVisible();
-		await expect(panel().getByRole('listitem')).toHaveCount(0);
+		await expect(
+			panel().getByRole('region', { name: `${GROUP_TREND} のトレンド表示` })
+		).toBeVisible({ timeout: 20_000 });
+		await expect(panel().getByText('この表示種別は準備中です')).toHaveCount(0);
+		await expect(cell(TAG_INVALID)).toHaveCount(0);
 	});
 
 	test('4. コマンドパレットで切り替えられ、開き直すと最後に見たグループが選ばれている', async () => {
@@ -551,5 +558,79 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await expect(highCell).toContainText('レンジ未設定');
 		await expect(highCell).toHaveAttribute('data-level', 'H');
 		await expect(highCell.locator('.value')).toHaveText(/^\d+$/);
+	});
+
+	test('7. トレンド: 線が伸び、時刻の目盛・選んだペンの帯・端末ごとの時間窓・止めた間の切れ目', async () => {
+		await page.goto(`/monitor?group=${groupIds[GROUP_TREND]}`);
+		await expect(tab(GROUP_TREND)).toHaveAttribute('aria-selected', 'true');
+		const trend = panel().getByRole('region', { name: `${GROUP_TREND} のトレンド表示` });
+		await expect(trend).toBeVisible({ timeout: 20_000 });
+		// 線は系列の並び（ペンの並び）どおり。1 本目がランプ。
+		const rampPath = trend.locator('.chart-host svg path[fill="none"]').first();
+		const segments = async (): Promise<number> =>
+			((await rampPath.getAttribute('d')) ?? '').split('M').length - 1;
+
+		// 線が描かれて伸びる（`d` が変わる）。
+		await expect(rampPath).toHaveAttribute('d', /L/, { timeout: 20_000 });
+		const firstD = await rampPath.getAttribute('d');
+		await expect(rampPath).not.toHaveAttribute('d', firstD ?? '', { timeout: 15_000 });
+		// 時刻の目盛（時:分:秒。書式は端末のロケールに任せる。Playwright の既定の en-US では
+		// 「03:41:50 AM」）。
+		await expect(trend.locator('.chart-host svg text.x-tick').first()).toHaveText(
+			/^\d{1,2}:\d{2}:\d{2}( [AP]M)?$/
+		);
+
+		// 帯の既定は、しきい値のある最初のペン（上限 = H 0、上が開いた注意の帯）。
+		const rampPen = trend.getByRole('button', { name: new RegExp(`^${TAG_RAMP}（cnt）`) });
+		const highPen = trend.getByRole('button', { name: new RegExp(`^${TAG_HIGH}`) });
+		await expect(highPen).toHaveAttribute('aria-pressed', 'true');
+		await expect(rampPen).toHaveAttribute('aria-pressed', 'false');
+		await expect(trend.locator('.chart-host svg text.band-label')).toHaveText(['H']);
+		await expect(trend.locator('.sr-only')).toContainText(
+			`しきい値の帯: ${TAG_HIGH}（H 0 以上 注意）。`
+		);
+		// しきい値の無いペンを選ぶと帯は消え、文でもそう言う。
+		await rampPen.click();
+		await expect(rampPen).toHaveAttribute('aria-pressed', 'true');
+		await expect(trend.locator('.chart-host svg text.band-label')).toHaveCount(0);
+		await expect(trend.locator('.sr-only')).toContainText(
+			`しきい値の帯: ${TAG_RAMP}（しきい値の設定なし）。`
+		);
+		await highPen.click();
+		await expect(trend.locator('.chart-host svg text.band-label')).toHaveText(['H']);
+
+		// 時間窓: 既定（グループの属性。作成時に何も渡さないとサーバーが 10 分を入れる）→
+		// 1 分。端末に覚え、グループの定義には書かない。
+		const groupAttributes = async (): Promise<unknown> => {
+			const res = await page.request.get(`/api/display-groups/${groupIds[GROUP_TREND]}`, {
+				headers
+			});
+			expect(res.ok(), `GET /api/display-groups/${groupIds[GROUP_TREND]}`).toBe(true);
+			return ((await res.json()) as { attributes: unknown }).attributes;
+		};
+		const attributesBefore = await groupAttributes();
+		const windowSelect = trend.getByLabel('時間窓');
+		await expect(windowSelect).toHaveValue('600');
+		await windowSelect.selectOption('60');
+		await expect(windowSelect).toHaveValue('60');
+		await page.reload();
+		await expect(trend.getByLabel('時間窓')).toHaveValue('60', { timeout: 20_000 });
+		expect(await groupAttributes()).toEqual(attributesBefore);
+
+		// 収集を止めている間の刻みは null（0 ではない）で、線が切れる。履歴の待ち（2 秒）
+		// の後で線が出ていることを確かめてから止める。
+		await expect(rampPath).toHaveAttribute('d', /L/, { timeout: 20_000 });
+		await page.waitForTimeout(3_000);
+		const before = await segments();
+		expect(before).toBeGreaterThanOrEqual(1);
+		const stop = await page.request.post('/api/collect/stop', { headers });
+		expect(stop.ok(), `POST /api/collect/stop が ${stop.status()}`).toBe(true);
+		await expect(panel().getByText('収集が動いていません')).toBeVisible({ timeout: 15_000 });
+		// 刻み（1 分窓・周期 500ms なら 1 秒）を何個か空ける。
+		await page.waitForTimeout(4_000);
+		const start = await page.request.post('/api/collect/start', { headers });
+		expect(start.ok(), `POST /api/collect/start が ${start.status()}`).toBe(true);
+		await expect(trend).toBeVisible({ timeout: 20_000 });
+		await expect.poll(segments, { timeout: 20_000 }).toBeGreaterThan(before);
 	});
 });
