@@ -40,7 +40,11 @@
 //!
 //! - **収集**: `manager.shutdown()`（flush 相当）後に tstore ファイルを直接
 //!   読んで行数を数える（`crates/banto-collect/tests/integration.rs` の
-//!   `read_single_group_rows`と同じ手法）。
+//!   `read_single_group_rows`と同じ手法）。ただし tstore は**ローカル日付で
+//!   ファイルを切り替える**ので、走行が日付をまたぐと（72h なら 4 ファイル）
+//!   データファイルは複数になる。[`read_all_group_rows`]が全ファイルを読んで
+//!   時刻順に連結する（#343。以前は「ファイルは 1 個」と assert しており、
+//!   72h 走行が日付をまたいだ時点で判定に到達する前に panic していた）。
 //! - **WebSocket**: `mode: "interval"`・`interval_ms: 250`
 //!   （`crate::subscribe_core::EVAL_TICK_MS`の下限クランプそのもの、
 //!   `tests/stream.rs::interval_mode_sends_data_on_a_schedule_even_without_changes`
@@ -65,6 +69,17 @@
 //! 追加は新しい依存ノードを増やさない - `Cargo.toml`のコメント参照）。
 //! 非 Windows ビルド（`cargo check --workspace`等のクロスプラットフォーム
 //! カバレッジ用）は`None`を返すフォールバックにしてある。
+//!
+//! ハーネス自身がメモリを溜めないこと（#343）: RSS サンプルは全件保持せず
+//! 件数/最小/最大/最初/最後だけの [`RssStats`] に畳み、MQTT の受信も payload
+//! を保持せず `AtomicU64` で数えるだけにしてある（以前は両方を全件 `Vec` に
+//! 溜めており、72h で約 7MB/h 増えて RSS の目視判定を自分で汚していた）。
+//!
+//! 途中経過（#343）: `SOAK_PROGRESS_SECS`（既定 3600、0 で無効）秒ごとに
+//! WS `data` 受信数・MQTT publish 数・RSS（現在/最小/最大）の累計を stdout へ
+//! 出す（`--nocapture` で可視）ので、途中で落ちても情報が残る。収集行数は
+//! 走行中に数えると tstore の全ファイルを読むことになり走行を乱すので、
+//! 途中経過には含めず終了時にだけ出す。
 //!
 //! ただし**このログはあくまで診断用の観測であって、合否判定には使わない**
 //! （60秒程度の走行時間ではアロケータのウォームアップ/断片化の揺らぎを
@@ -287,17 +302,27 @@ where
 }
 
 /// `crates/banto-collect/tests/integration.rs::read_single_group_rows`と同じ
-/// 手法: `stop()`/`manager.shutdown()`後(flush 済み)に tstore ファイルを直接
-/// 開いて全行を読む。
-async fn read_single_group_rows(data_dir: &Path) -> Vec<banto_tstore::Sample> {
+/// 手法(`stop()`/`manager.shutdown()`後(flush 済み)に tstore ファイルを直接
+/// 開いて全行を読む)だが、**ファイルが複数でもよい**: tstore はローカル日付で
+/// ファイルを切り替えるので、日付をまたぐ走行(72h なら 4 ファイル)でも
+/// 全ファイルの先頭グループを読んで ptime 昇順に連結する(#343)。
+/// 各ファイルは 1 グループだけを持つ前提(このソークの構成)。
+async fn read_all_group_rows(data_dir: &Path) -> Vec<banto_tstore::Sample> {
     let files = banto_tstore::list_data_files(data_dir).expect("list files");
-    assert_eq!(files.len(), 1, "expected exactly one data file");
-    let reader = TsReader::open(&files[0].path).await.expect("open reader");
-    let group_key = reader.groups()[0].key.clone();
-    reader
-        .read_range(&group_key, 0, i64::MAX)
-        .await
-        .expect("read range")
+    assert!(!files.is_empty(), "expected at least one data file");
+    let mut rows = Vec::new();
+    for file in &files {
+        let reader = TsReader::open(&file.path).await.expect("open reader");
+        let group_key = reader.groups()[0].key.clone();
+        rows.extend(
+            reader
+                .read_range(&group_key, 0, i64::MAX)
+                .await
+                .expect("read range"),
+        );
+    }
+    rows.sort_by_key(|row| row.ptime_ms);
+    rows
 }
 
 // --- in-process MQTT ブローカー(rumqttd) - `tests/mqtt.rs`から複製 ---------
@@ -373,11 +398,13 @@ async fn start_test_broker() -> u16 {
     panic!("rumqttd が3回の試行後も起動しませんでした");
 }
 
-/// `tests/mqtt.rs::LiveSubscriber`と同じ: 1本の接続を張りっぱなしにして
-/// 届いた順に蓄積する - ソーク走行中「今何件届いているか」をポーリング
-/// できるようにする。
+/// `tests/mqtt.rs::LiveSubscriber`と同じく、1本の接続を張りっぱなしにして
+/// 「今何件届いているか」をポーリングできるようにする。ただし**ソーク版は
+/// payload を保持せず件数だけを`AtomicU64`で数える**(`mqtt.rs`版は届いた
+/// メッセージを全件`Vec`に溜める。短い試験なら問題ないが、72h では約 100 万件・
+/// 約 7MB/h になりハーネス自身が RSS 判定を汚すため、#343)。
 struct LiveSubscriber {
-    messages: Arc<AsyncMutex<Vec<(String, String)>>>,
+    received: Arc<AtomicU64>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -391,16 +418,13 @@ impl LiveSubscriber {
             .await
             .expect("subscribe");
 
-        let messages = Arc::new(AsyncMutex::new(Vec::new()));
-        let messages_for_task = messages.clone();
+        let received = Arc::new(AtomicU64::new(0));
+        let received_for_task = received.clone();
         let task = tokio::spawn(async move {
             loop {
                 match eventloop.poll().await {
-                    Ok(Event::Incoming(Packet::Publish(publish))) => {
-                        messages_for_task.lock().await.push((
-                            publish.topic,
-                            String::from_utf8_lossy(&publish.payload).to_string(),
-                        ));
+                    Ok(Event::Incoming(Packet::Publish(_))) => {
+                        received_for_task.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -408,13 +432,13 @@ impl LiveSubscriber {
             }
         });
         Self {
-            messages,
+            received,
             _task: task,
         }
     }
 
-    async fn count(&self) -> usize {
-        self.messages.lock().await.len()
+    fn count(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 }
 
@@ -627,15 +651,53 @@ async fn recv_matching(ws: &mut WsStream, predicate: impl Fn(&Value) -> bool) ->
 // ソーク本体
 // ---------------------------------------------------------------------------
 
+/// RSS サンプルの要約(診断用、[`mem_probe`]参照)。サンプルを全件保持せず
+/// 件数/最小/最大/最初/最後だけを持つ - 72h でサンプルは約 240 万件になり、
+/// 全件 `Vec` に溜めるとハーネス自身のメモリ増加が RSS 判定を汚す(#343)。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RssStats {
+    count: u64,
+    min: u64,
+    max: u64,
+    first: u64,
+    last: u64,
+}
+
+impl RssStats {
+    fn record(&mut self, rss: u64) {
+        if self.count == 0 {
+            self.min = rss;
+            self.max = rss;
+            self.first = rss;
+        } else {
+            self.min = self.min.min(rss);
+            self.max = self.max.max(rss);
+        }
+        self.last = rss;
+        self.count += 1;
+    }
+}
+
+/// 途中経過の出力間隔。`SOAK_PROGRESS_SECS`(秒)で指定、既定 3600、0 で無効
+/// (#343)。数値でない値は既定にフォールバックする。
+fn progress_interval() -> Option<Duration> {
+    let secs: u64 = std::env::var("SOAK_PROGRESS_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// 1回のソーク走行の結果 - 収集(tstore 行数)・WS(`data`受信数)・MQTT
-/// (publish 受信数)・RSS サンプル(診断用、[`mem_probe`]参照)。
+/// (publish 受信数)・RSS サンプルの要約(診断用、[`mem_probe`]参照)。
 struct SoakReport {
     elapsed: Duration,
     collected_rows: usize,
     ws_data_messages: u64,
-    mqtt_publishes: usize,
+    mqtt_publishes: u64,
     rss_start_bytes: Option<u64>,
     rss_end_bytes: Option<u64>,
+    rss: RssStats,
 }
 
 /// PLC 収集(banto-plc の Modbus TCP シミュレータ相手)+ WS 購読(`mode:
@@ -737,13 +799,10 @@ async fn run_soak(label: &str, duration: Duration) -> SoakReport {
     let mqtt_sub =
         LiveSubscriber::subscribe(broker_port, &format!("sub-soak-{label}"), mqtt_topic).await;
     assert!(
-        wait_until(Duration::from_secs(6), || async {
-            mqtt_sub.count().await > 0
-        })
-        .await,
+        wait_until(Duration::from_secs(6), || async { mqtt_sub.count() > 0 }).await,
         "mqtt should publish the initial forced value before the timed window starts"
     );
-    let mqtt_baseline = mqtt_sub.count().await;
+    let mqtt_baseline = mqtt_sub.count();
 
     // ここから計測区間: レジスタを収集周期と同じ間隔で単調増加させ続け、
     // 収集(tstore)・WS(interval)・MQTT(on_change)の3経路すべてに継続的な
@@ -753,13 +812,33 @@ async fn run_soak(label: &str, duration: Duration) -> SoakReport {
 
     let started = tokio::time::Instant::now();
     let mut counter: u16 = 0;
-    let mut rss_samples: Vec<u64> = Vec::new();
+    let mut rss = RssStats::default();
+    let progress_every = progress_interval();
+    let mut next_progress = progress_every.map(|every| started + every);
     while started.elapsed() < duration {
         counter = counter.wrapping_add(1);
         sim.set_holding_register(0, counter);
         tokio::time::sleep(Duration::from_millis(PERIOD_MS as u64)).await;
-        if let Some(rss) = mem_probe::working_set_bytes() {
-            rss_samples.push(rss);
+        if let Some(sample) = mem_probe::working_set_bytes() {
+            rss.record(sample);
+        }
+        // 途中経過(#343): ws/mqtt/rss だけ。収集行数は数えるのに tstore の
+        // 全ファイルを読む必要があり走行を乱すので終了時にだけ出す。
+        if let (Some(every), Some(due)) = (progress_every, next_progress) {
+            if tokio::time::Instant::now() >= due {
+                println!(
+                    "soak[{label}]: progress t={:?} ws_data={} mqtt_publishes={} \
+                     RSS now={} min={} max={} bytes ({} samples)",
+                    started.elapsed(),
+                    ws_count.load(Ordering::SeqCst),
+                    mqtt_sub.count().saturating_sub(mqtt_baseline),
+                    rss.last,
+                    rss.min,
+                    rss.max,
+                    rss.count
+                );
+                next_progress = Some(due + every);
+            }
         }
     }
     // 直近の変更が3経路すべてに届き切るのを待ってから確定させる。
@@ -768,24 +847,24 @@ async fn run_soak(label: &str, duration: Duration) -> SoakReport {
 
     let rss_end = mem_probe::working_set_bytes();
     println!(
-        "soak[{label}]: end RSS = {rss_end:?} bytes ({} samples collected)",
-        rss_samples.len()
+        "soak[{label}]: end RSS = {rss_end:?} bytes ({} samples collected, min={} max={})",
+        rss.count, rss.min, rss.max
     );
 
     ws_task.abort();
     let ws_data_messages = ws_count.load(Ordering::SeqCst);
-    let mqtt_publishes = mqtt_sub.count().await.saturating_sub(mqtt_baseline);
+    let mqtt_publishes = mqtt_sub.count().saturating_sub(mqtt_baseline);
 
     // manager.shutdown() が Collector::stop() を呼び、tstore を flush する
     // (banto-collect の雛形と同じ「stop 後に読む」規律 - このファイルの
-    // `read_single_group_rows` doc comment参照)。
+    // `read_all_group_rows` doc comment参照)。
     app.manager.shutdown().await;
     sim.stop();
     if let Some(server) = app.server.take() {
         server.stop().await;
     }
 
-    let rows = read_single_group_rows(&app.env.data_dir()).await;
+    let rows = read_all_group_rows(&app.env.data_dir()).await;
 
     SoakReport {
         elapsed,
@@ -794,6 +873,7 @@ async fn run_soak(label: &str, duration: Duration) -> SoakReport {
         mqtt_publishes,
         rss_start_bytes: rss_start,
         rss_end_bytes: rss_end,
+        rss,
     }
 }
 
@@ -802,6 +882,90 @@ async fn run_soak(label: &str, duration: Duration) -> SoakReport {
 /// 設計なので下限だけを見る)。`fraction`が小さいほど緩い。
 fn loose_lower_bound(theoretical: f64, fraction: f64) -> usize {
     (theoretical * fraction).floor().max(1.0) as usize
+}
+
+// ---------------------------------------------------------------------------
+// ハーネス部品の単体テスト(#343)
+// ---------------------------------------------------------------------------
+
+/// 日付をまたいで 2 ファイルになったデータディレクトリでも、
+/// `read_all_group_rows`が全行を時刻順に読む(以前は「ファイルは 1 個」の
+/// assert で panic していた)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_all_group_rows_spans_files_across_a_date_boundary() {
+    use banto_tstore::{GroupConfig, ManualClock, StoreConfig, TagColumn, TsWriter};
+
+    let env = TempEnv::new(TEMP_ENV_PREFIX, "multi-file");
+    let data_dir = env.data_dir();
+    let config = StoreConfig {
+        groups: vec![GroupConfig {
+            key: "g1".to_string(),
+            name: "g1".to_string(),
+            period_ms: 100,
+            tags: vec![TagColumn {
+                key: "t1".to_string(),
+                name: "t1".to_string(),
+                data_type: "i16".to_string(),
+                unit: None,
+                decimals: 0,
+            }],
+        }],
+    };
+    // UTC オフセット 0、2026-07-12 12:00 から開始。
+    let day1_ms = banto_tstore::LocalDate::new(2026, 7, 12).to_days_since_epoch() * 86_400_000
+        + 12 * 3_600_000;
+    let clock = Arc::new(ManualClock::new(day1_ms, 0));
+    let writer = TsWriter::open(&data_dir, config, clock.clone())
+        .await
+        .expect("open writer");
+    for i in 0..3 {
+        writer
+            .append("g1", day1_ms + i * 100, &[Some(i as f64)])
+            .await
+            .expect("append day 1");
+    }
+    // 翌日へ進める -> 次の append でファイルが切り替わる。
+    let day2_ms = day1_ms + 86_400_000;
+    clock.set_now_ms(day2_ms);
+    for i in 0..4 {
+        writer
+            .append("g1", day2_ms + i * 100, &[Some(10.0 + i as f64)])
+            .await
+            .expect("append day 2");
+    }
+    writer.close().await.expect("close writer");
+
+    assert_eq!(
+        banto_tstore::list_data_files(&data_dir).unwrap().len(),
+        2,
+        "日付をまたいだので 2 ファイルになっているはず"
+    );
+    let rows = read_all_group_rows(&data_dir).await;
+    assert_eq!(rows.len(), 7, "両日の全行が読めること");
+    assert!(
+        rows.windows(2).all(|w| w[0].ptime_ms <= w[1].ptime_ms),
+        "ptime 昇順であること"
+    );
+    assert_eq!(rows[0].ptime_ms, day1_ms);
+    assert_eq!(rows[6].ptime_ms, day2_ms + 300);
+}
+
+#[test]
+fn rss_stats_tracks_min_max_first_last_without_keeping_samples() {
+    let mut stats = RssStats::default();
+    for sample in [50, 30, 90, 70] {
+        stats.record(sample);
+    }
+    assert_eq!(
+        stats,
+        RssStats {
+            count: 4,
+            min: 30,
+            max: 90,
+            first: 50,
+            last: 70
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -850,7 +1014,7 @@ async fn mini_soak_collect_ws_mqtt_stay_alive_for_several_seconds() {
         report.ws_data_messages
     );
     assert!(
-        report.mqtt_publishes >= loose_lower_bound(theoretical_eval_ticks, 1.0 / 15.0),
+        report.mqtt_publishes as usize >= loose_lower_bound(theoretical_eval_ticks, 1.0 / 15.0),
         "expected ~{theoretical_eval_ticks:.0} mqtt publishes (liveness floor >=1/15 tolerated), got {}",
         report.mqtt_publishes
     );
@@ -871,10 +1035,12 @@ async fn mini_soak_collect_ws_mqtt_stay_alive_for_several_seconds() {
 /// 一次ソースは docs/recorder-requirements.md §4・docs/tag-server-design.md
 /// §8)。メモリ増加の合否判定はこのテストの自動アサーションでは行わない -
 /// このファイルのモジュール doc comment「メモリ増加の検証」参照。
+/// `SOAK_PROGRESS_SECS`(既定 3600、0 で無効)ごとに途中経過を stdout へ出す。
 #[ignore = "long-running (60s by default) soak; run explicitly with --ignored. \
             Override the duration via SOAK_DURATION_SECS (seconds) - e.g. \
             SOAK_DURATION_SECS=259200 for the real 72h release-gate run \
-            (docs/banto-hub-operations.md)."]
+            (docs/banto-hub-operations.md). SOAK_PROGRESS_SECS (default 3600, \
+            0 = off) controls the progress lines."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn long_soak_collect_ws_mqtt_stay_alive() {
     let run_secs: u64 = std::env::var("SOAK_DURATION_SECS")
@@ -893,9 +1059,14 @@ async fn long_soak_collect_ws_mqtt_stay_alive() {
         report.collected_rows, report.elapsed, report.ws_data_messages, report.mqtt_publishes
     );
     println!(
-        "long-soak: RSS start={:?} bytes, end={:?} bytes (診断用ログ - 合否判定には使わない。\
+        "long-soak: RSS start={:?} bytes, end={:?} bytes, min={} max={} ({} samples) \
+         (診断用ログ - 合否判定には使わない。\
          72h 本番ソークでのメモリ増加なしの判定手順は docs/banto-hub-operations.md 参照)",
-        report.rss_start_bytes, report.rss_end_bytes
+        report.rss_start_bytes,
+        report.rss_end_bytes,
+        report.rss.min,
+        report.rss.max,
+        report.rss.count
     );
 
     // 走行時間が長いほど揺らぎは平均化されるので、短時間版より厳しい下限
@@ -914,7 +1085,7 @@ async fn long_soak_collect_ws_mqtt_stay_alive() {
         report.ws_data_messages
     );
     assert!(
-        report.mqtt_publishes >= loose_lower_bound(theoretical_eval_ticks, 0.6),
+        report.mqtt_publishes as usize >= loose_lower_bound(theoretical_eval_ticks, 0.6),
         "expected ~{theoretical_eval_ticks:.0} mqtt publishes (>=60% tolerated), got {}",
         report.mqtt_publishes
     );
