@@ -34,7 +34,8 @@ describe('applyValuesOutcome', () => {
 		phase: 'ready',
 		values: READY_A.state === 'ready' ? READY_A.data : null,
 		failures: 1,
-		lastOkAt: 100
+		lastOkAt: 100,
+		serverNowMs: 50
 	};
 
 	it.each<[string, Parameters<typeof applyValuesOutcome>[1], ValuesState]>([
@@ -45,13 +46,25 @@ describe('applyValuesOutcome', () => {
 				phase: 'ready',
 				values: READY_B.state === 'ready' ? READY_B.data : null,
 				failures: 0,
-				lastOkAt: 999
+				lastOkAt: 999,
+				serverNowMs: null
+			}
+		],
+		[
+			'ok + ready + serverNowMs: サーバーの時刻を持つ（D-3b）',
+			{ kind: 'ok', value: { ...READY_B, serverNowMs: 123_456 } },
+			{
+				phase: 'ready',
+				values: READY_B.state === 'ready' ? READY_B.data : null,
+				failures: 0,
+				lastOkAt: 999,
+				serverNowMs: 123_456
 			}
 		],
 		[
 			'ok + notRunning: 値を捨てる・失敗 0',
 			{ kind: 'ok', value: { state: 'notRunning' } },
-			{ phase: 'notRunning', values: null, failures: 0, lastOkAt: 999 }
+			{ phase: 'notRunning', values: null, failures: 0, lastOkAt: 999, serverNowMs: null }
 		],
 		[
 			'ok + unavailable: 失敗 +1・表示は残す',

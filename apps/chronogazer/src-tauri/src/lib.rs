@@ -34,7 +34,7 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use chronogazer_core::collect::{
     registry_exclusions, resolve_data_dir, validate_history_request, CollectEventList,
     CollectHistory, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
-    CurrentSampleView, EventPage, ExclusionView, Readout, COLLECT_AUDIT_RESOURCE,
+    EventPage, ExclusionView, Readout, ValuesResponse, COLLECT_AUDIT_RESOURCE,
     COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::{init_db, Db, InitDbError};
@@ -3677,11 +3677,12 @@ async fn collect_restart(state: State<'_, AppState>) -> Result<CollectOutcome, B
 // 通る双子**なので、経路によって形も床も割れない。
 
 /// Body of [`collect_values`]（spec M14 split-function pattern）。
-async fn collect_values_body(
-    state: &AppState,
-) -> Result<Readout<HashMap<String, CurrentSampleView>>, BantoError> {
+///
+/// 応答には `serverNowMs`（応答を作った時点のサーバーの時刻、D-3b）が添わる
+/// （REST と同じ [`ValuesResponse`]）。
+async fn collect_values_body(state: &AppState) -> Result<ValuesResponse, BantoError> {
     require_collect_reader(state).await?;
-    Ok(state.collect.values())
+    Ok(state.collect.values_response())
 }
 
 /// `GET`-ish command: タグごとの現在値。**`viewer` 以上**。
@@ -3695,9 +3696,7 @@ async fn collect_values_body(
 /// **品質（`good`/`bad`/`stale`）と時刻を必ず載せる** - 値だけでは「通信
 /// エラーで古い値を出し続けている」のか「今読めた値」なのかを画面が言えない。
 #[tauri::command]
-async fn collect_values(
-    state: State<'_, AppState>,
-) -> Result<Readout<HashMap<String, CurrentSampleView>>, BantoError> {
+async fn collect_values(state: State<'_, AppState>) -> Result<ValuesResponse, BantoError> {
     collect_values_body(&state).await
 }
 
@@ -5475,10 +5474,12 @@ mod tests {
             .await
             .expect("viewer は現在値を読めること");
         assert_eq!(
-            values,
+            values.readout,
             Readout::NotRunning,
             "「走っていない」を「0 件」に潰している: {values:?}"
         );
+        // D-3b: REST と同じく、応答を作った時点のサーバーの時刻が添わる。
+        assert!(values.server_now_ms > 0, "{values:?}");
         let connections = collect_connections_body(&state)
             .await
             .expect("viewer は接続状態を読めること");

@@ -23,20 +23,24 @@
  * - **履歴の上限**（`HISTORY_MAX_BINS`、本数 × 行数 ≤ `HISTORY_MAX_POINTS`）。初期窓を
  *   1 回の要求で格子と同じ数の区間で読むため。
  *
- * 時刻は**サーバーの時計**（現在値の `ptimeMs`、履歴の `tMs`）で揃える。端末の時計を
- * 使うと、LAN の別の端末で時計がずれているとき履歴と現在値が食い違う。表示の時計は
- * [`observeServerClock`] / [`serverClockNow`]: 受け取った `ptimeMs` の最大を基準にし、
- * その後は**端末の単調な経過時間**（`performance.now()`）で進める。
+ * 時刻は**サーバーの時計**（現在値の応答の `serverNowMs`、サンプルの `ptimeMs`、履歴の
+ * `tMs`）で揃える。端末の時計を使うと、LAN の別の端末で時計がずれているとき履歴と現在値が
+ * 食い違う。表示の時計は [`observeServerClock`] / [`serverClockNow`]: **現在値の応答を作った
+ * 時点のサーバーの時刻**（`serverNowMs`）を基準にし、次の応答までは**端末の単調な経過時間**
+ * （`performance.now()`）で進める。成功した応答のたびに基準を付け替え、表示の時刻は戻さない
+ * （付け替えで見積もりより前になったら、追いつくまで止める）。
  *
- * - `ptimeMs` だけを時計にすると、表示中のタグがすべて収集周期 60 秒のとき、ポーリングが
- *   成功し続けても `ptimeMs` は 60 秒間止まったままで、同じ刻みを書き直し続け、次の
- *   サンプルで間の刻みが `null` になって**毎分線が切れる**（PR #543 のオーナーレビュー P2）。
- *   経過時間で進めれば、同じ good のサンプルが続く間も今の刻みに書く（下の「収集周期の
- *   長いタグも、ポーリングのたびに今の値を書く」、履歴の `max(binMs, 周期)` と同じ扱い）。
- * - 基準はより新しい `ptimeMs` が来たときだけ前へ付け替える（戻さない）。
- * - **サーバーの時刻を 1 つも受け取っていない間は時計が無い**（`null`）。そのあいだ格子を
- *   作らず、履歴も要求しない。端末の時計で格子を作ると、端末の時計が進んでいるとき後から
- *   来たサーバーの時刻が「過去」に見え、`appendLive` が捨ててしまう（PR #543 のレビュー P2）。
+ * - サンプルの `ptimeMs`（読みに行った時刻）を時計にすると、表示中のタグがすべて収集周期
+ *   60 秒のとき `ptimeMs` が 60 秒間止まり、同じ刻みを書き直し続けて毎分線が切れた
+ *   （PR #543 のオーナーレビュー P2）。`ptimeMs` を基準に経過時間で進めても、開いた時点の
+ *   サンプルの古さ（最大 1 周期）だけ時計が遅れ、次のサンプルで時計が跳んで間の刻みが `null`
+ *   になった（同 再レビュー P2）。応答の時刻はサンプルの古さに関係しないので、good の
+ *   サンプルは常に「サーバーの今」の刻みに書かれる（下の「収集周期の長いタグも、ポーリングの
+ *   たびに今の値を書く」、履歴の `max(binMs, 周期)` と同じ扱い）。
+ * - **サーバーの時刻を受け取るまでは時計が無い**（`null`）。そのあいだ格子を作らず、履歴も
+ *   要求しない。端末の時計で格子を作ると、端末の時計が進んでいるとき後から来たサーバーの
+ *   時刻が「過去」に見え、`appendLive` が捨ててしまう（PR #543 のレビュー P2）。格子は時計が
+ *   できた時点の刻みで終わり、履歴はそこまでを要求し、現在値はその刻みから書く。
  * - 読み取りの失敗（ポーリングが成功しない）・`bad`・`stale` は今までどおり線を切る:
  *   失敗の間は書き足さないので刻みは `null`、`bad` / `stale` の値は `null`。
  *
@@ -75,7 +79,6 @@ import {
 	HISTORY_MAX_POINTS,
 	type CollectHistory,
 	type CollectHistoryParams,
-	type CurrentSampleView,
 	type HistoryPoint
 } from '../banto/collectAdmin';
 import type { DisplayGroup } from '../banto/displayGroupsAdmin';
@@ -373,44 +376,31 @@ export function historyRequest(
 	return { tagIds, fromMs, toMs, bins: buffer.rows.length };
 }
 
-/** 現在値の `ptimeMs`（収集が読みに行った時刻、サーバーの時計）の最大。無ければ `null`。 */
-export function maxPtimeMs(
-	values: Readonly<Record<string, Pick<CurrentSampleView, 'ptimeMs'>>>
-): number | null {
-	let max: number | null = null;
-	for (const sample of Object.values(values)) {
-		const t = sample.ptimeMs;
-		if (t !== null && Number.isFinite(t) && (max === null || t > max)) max = t;
-	}
-	return max;
-}
-
 /**
- * 表示の時計（サーバーの時刻の基準と、それを受け取ったときの端末の単調な時刻）。
- * `null` = まだサーバーの時刻を受け取っていない。
+ * 表示の時計。`serverMs` は基準にしたサーバーの時刻（応答の `serverNowMs`）、`localMs` は
+ * それを受け取ったときの端末の単調な時刻、`floorMs` は付け替えた時点で表示していた時刻
+ * （表示の時刻をこれより前にしない）。`null` = まだサーバーの時刻を受け取っていない。
  */
-export type ServerClock = { serverMs: number; localMs: number } | null;
+export type ServerClock = { serverMs: number; localMs: number; floorMs: number } | null;
 
-/** 時計の今（純関数）: 基準 + 端末の経過時間。時計が無ければ `null`。 */
+/** 時計の今（純関数）: 基準 + 端末の経過時間（戻さない）。時計が無ければ `null`。 */
 export function serverClockNow(clock: ServerClock, localNowMs: number): number | null {
-	return clock === null ? null : clock.serverMs + Math.max(0, localNowMs - clock.localMs);
+	if (clock === null) return null;
+	return Math.max(clock.floorMs, clock.serverMs + Math.max(0, localNowMs - clock.localMs));
 }
 
 /**
- * 現在値を受け取ったときに時計を更新する（純関数）。`ptimeMs` の最大が今の見積もりより
- * 新しければ基準をそこへ付け替え、そうでなければそのまま（後ろへは戻さない）。
- * `ptimeMs` が 1 つも無ければ時計はそのまま（無ければ `null` のまま）。
+ * 成功した現在値の応答を受け取ったときに時計を付け替える（純関数）。`serverNowMs` が
+ * 無ければ（古い相手）時計はそのまま。表示の時刻は戻さない（`floorMs`）。
  */
 export function observeServerClock(
 	clock: ServerClock,
-	values: Readonly<Record<string, Pick<CurrentSampleView, 'ptimeMs'>>>,
+	serverNowMs: number | null,
 	localNowMs: number
 ): ServerClock {
-	const latest = maxPtimeMs(values);
-	if (latest === null) return clock;
-	const now = serverClockNow(clock, localNowMs);
-	if (now !== null && latest <= now) return clock;
-	return { serverMs: latest, localMs: localNowMs };
+	if (serverNowMs === null || !Number.isFinite(serverNowMs)) return clock;
+	const shown = serverClockNow(clock, localNowMs);
+	return { serverMs: serverNowMs, localMs: localNowMs, floorMs: shown ?? serverNowMs };
 }
 
 /** 値の範囲（全ペン・全行の最小と最大）。値が 1 つも無ければ `null`。 */

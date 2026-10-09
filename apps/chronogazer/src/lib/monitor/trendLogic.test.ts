@@ -32,7 +32,6 @@ import {
 	resolveBandPen,
 	resolveTrendWindowSec,
 	saveTrendWindowOverride,
-	maxPtimeMs,
 	observeServerClock,
 	serverClockNow,
 	type ServerClock,
@@ -46,6 +45,7 @@ import {
 	type TrendPenInfo
 } from './trendLogic';
 import type { ThresholdFields } from '../banto/tagThresholdsAdmin';
+import { INITIAL_VALUES_STATE, applyValuesOutcome, type ValuesState } from './valuesPoller.svelte';
 
 const NONE: ThresholdFields = {
 	thresholdHh: null,
@@ -267,7 +267,7 @@ describe('mergeHistory（初期窓 + 現在値）', () => {
 	});
 });
 
-describe('historyRequest / maxPtimeMs / valueExtent', () => {
+describe('historyRequest / valueExtent', () => {
 	it('期間は格子の全体（両端を含む）、区間の数は行数、タグは重複を除く', () => {
 		const b = emptyTrendBuffer(1000, 600_000, 2, 1_000_000);
 		expect(historyRequest(b, [3, 3, 4])).toEqual({
@@ -277,13 +277,6 @@ describe('historyRequest / maxPtimeMs / valueExtent', () => {
 			bins: 600
 		});
 		expect(historyRequest(b, [])).toBeNull();
-	});
-
-	it('ptimeMs の最大。無ければ null', () => {
-		expect(
-			maxPtimeMs({ 'tag:1': { ptimeMs: 5 }, 'tag:2': { ptimeMs: 9 }, 'tag:3': { ptimeMs: null } })
-		).toBe(9);
-		expect(maxPtimeMs({ 'tag:3': { ptimeMs: null } })).toBeNull();
 	});
 
 	it('値の範囲は null を飛ばす。値が無ければ null', () => {
@@ -513,55 +506,86 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 });
 
 describe('表示の時計（observeServerClock / serverClockNow、PR #543 のレビュー P2）', () => {
-	const sample = (ptimeMs: number | null) => ({ 'tag:1': { ptimeMs } });
-
 	it('サーバーの時刻を受け取るまでは時計が無い（端末の時計を使わない）', () => {
-		expect(observeServerClock(null, sample(null), 123_456)).toBeNull();
+		expect(observeServerClock(null, null, 123_456)).toBeNull();
 		expect(serverClockNow(null, 123_456)).toBeNull();
 	});
 
-	it('基準 + 端末の経過時間で進む。新しい ptimeMs で前へ付け替え、古い ptimeMs では戻さない', () => {
-		let clock: ServerClock = observeServerClock(null, sample(1_000_000), 50);
+	it('基準 + 端末の経過時間で進み、応答のたびに付け替える。表示の時刻は戻さない', () => {
+		let clock: ServerClock = observeServerClock(null, 1_000_000, 50);
 		expect(serverClockNow(clock, 50)).toBe(1_000_000);
 		expect(serverClockNow(clock, 5050)).toBe(1_005_000);
-		// 同じ ptimeMs（周期の長いタグ）: 基準はそのまま、時計は進み続ける。
-		clock = observeServerClock(clock, sample(1_000_000), 5050);
-		expect(serverClockNow(clock, 10_050)).toBe(1_010_000);
-		// 見積もりより新しい ptimeMs: 付け替える。
-		clock = observeServerClock(clock, sample(1_020_000), 12_050);
-		expect(serverClockNow(clock, 12_050)).toBe(1_020_000);
-		// 見積もりより古い ptimeMs: 戻さない。
-		clock = observeServerClock(clock, sample(1_000_000), 13_050);
-		expect(serverClockNow(clock, 13_050)).toBe(1_021_000);
-		// 端末の時刻が戻っても（単調でない入力でも）基準より前にしない。
-		expect(serverClockNow(clock, 0)).toBe(1_020_000);
+		// 次の応答: サーバーの時刻に付け替える。
+		clock = observeServerClock(clock, 1_005_200, 5050);
+		expect(serverClockNow(clock, 5050)).toBe(1_005_200);
+		// 見積もりより前のサーバーの時刻（端末の時計が速い）: 表示は戻さず、追いつくまで止める。
+		clock = observeServerClock(clock, 1_009_000, 10_050); // 見積もりは 1_010_200
+		expect(serverClockNow(clock, 10_050)).toBe(1_010_200);
+		expect(serverClockNow(clock, 11_050)).toBe(1_010_200);
+		expect(serverClockNow(clock, 12_050)).toBe(1_011_000);
+		// serverNowMs の無い応答では変えない。端末の時刻が戻っても基準より前にしない。
+		expect(observeServerClock(clock, null, 13_000)).toBe(clock);
+		expect(serverClockNow(clock, 0)).toBe(1_010_200);
 	});
 
-	it('収集周期 60 秒のタグだけでも、5 秒ごとのポーリングで線が切れない', () => {
-		// 窓 1 分・刻み 10 秒（周期 5 秒の 2 倍）。ptimeMs は 60 秒ごとにしか進まない。
+	/**
+	 * 収集周期 60 秒・ポーリング 5 秒・刻み 10 秒で、開いた時点のサンプルの古さ（0 / 30 / 55 秒）
+	 * によらず、good のサンプルが続く間は線が切れない（応答 → `applyValuesOutcome` → 時計 →
+	 * `appendLive` を通す）。古さ 55 秒は「開いて 5 秒後に次のサンプル」で、`ptimeMs` を時計に
+	 * すると時計が跳んで間の刻みが `null` になった（再レビュー P2）。
+	 */
+	it.each([
+		[0, 60_000],
+		[30_000, 60_000],
+		[55_000, 60_000],
+		[0, 600_000],
+		[30_000, 600_000],
+		[55_000, 600_000]
+	])('サンプルの古さ %i ms・窓 %i ms', (ageMs, windowMs) => {
+		const T0 = 3_600_000_000;
+		const localOffset = 987_654; // 端末の単調な時刻はサーバーの時刻と無関係
 		const step = 10_000;
+		let state: ValuesState = INITIAL_VALUES_STATE;
 		let clock: ServerClock = null;
 		let buffer: TrendBuffer | null = null;
-		for (let local = 0; local <= 180_000; local += 5000) {
-			const ptime = 3_600_000 + Math.floor(local / 60_000) * 60_000;
-			clock = observeServerClock(clock, sample(ptime), local);
-			const now = serverClockNow(clock, local);
+		let lastNow = -Infinity;
+		for (let k = 0; k <= 36; k++) {
+			// 5 秒ごと + 少し揺らぐ（応答を待ってから次を予約する）。
+			const t = k * 5000 + (k % 3) * 37;
+			// 最後に読んだ時刻: 開いた時点（t = 0）で ageMs だけ古く、60 秒ごとに進む。
+			const ptime = T0 - ageMs + Math.floor((t + ageMs) / 60_000) * 60_000;
+			state = applyValuesOutcome(
+				state,
+				{
+					kind: 'ok',
+					value: {
+						state: 'ready',
+						data: { 'tag:1': { value: 42, ptimeMs: ptime, quality: 'good', lastGoodMs: ptime } },
+						serverNowMs: T0 + t
+					}
+				},
+				t
+			);
+			clock = observeServerClock(clock, state.serverNowMs, localOffset + t);
+			const now = serverClockNow(clock, localOffset + t);
 			if (now === null) throw new Error('時計が無い');
-			buffer ??= emptyTrendBuffer(step, 60_000, 1, now);
+			expect(now).toBeGreaterThanOrEqual(lastNow);
+			lastNow = now;
+			buffer ??= emptyTrendBuffer(step, windowMs, 1, now);
 			buffer = appendLive(buffer, now, [42]);
 		}
-		expect(values(buffer!).flat()).toEqual([42, 42, 42, 42, 42, 42]);
+		const live = buffer!.rows.filter((row) => row.t >= (buffer!.liveFromT ?? Infinity));
+		expect(live.length).toBeGreaterThan(5);
+		expect(live.every((row) => row.values[0] === 42)).toBe(true);
 	});
 
-	it('最初の ptimeMs が null で端末の時計が進んでいても、後のサーバーの時刻を捨てない', () => {
-		// 端末の時計（Date.now 相当）はサーバーより 1 時間進んでいるが、時計は使わない。
-		let clock: ServerClock = observeServerClock(null, sample(null), 0);
-		expect(serverClockNow(clock, 0)).toBeNull();
-		clock = observeServerClock(clock, sample(1_000_000), 1000);
-		const now = serverClockNow(clock, 1000)!;
-		let buffer = emptyTrendBuffer(1000, 5000, 1, now);
-		buffer = appendLive(buffer, now, [7]);
-		buffer = appendLive(buffer, serverClockNow(clock, 2000)!, [8]);
-		expect(values(buffer).flat()).toEqual([null, null, null, 7, 8]);
+	it('ポーリングの失敗の間は書き足さないので、刻みは null（線が切れる）のまま', () => {
+		let clock: ServerClock = observeServerClock(null, 1_000_000, 0);
+		let buffer = emptyTrendBuffer(10_000, 60_000, 1, serverClockNow(clock, 0)!);
+		buffer = appendLive(buffer, serverClockNow(clock, 0)!, [1]);
+		// 30 秒失敗して、次の成功。
+		clock = observeServerClock(clock, 1_030_000, 30_000);
+		buffer = appendLive(buffer, serverClockNow(clock, 30_000)!, [2]);
+		expect(values(buffer).flat()).toEqual([null, null, 1, null, null, 2]);
 	});
 });

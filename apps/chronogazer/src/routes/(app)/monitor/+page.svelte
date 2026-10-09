@@ -261,9 +261,10 @@
 	}
 
 	/**
-	 * 表示の時計（`trendLogic.ts` の `observeServerClock`）。サーバーの時刻（`ptimeMs` の最大）を
-	 * 基準に、端末の単調な経過時間で進める。サーバーの時刻を受け取るまでは `null` で、格子を
-	 * 作らない（端末の時計で作らない）。時計はサーバー全体のものなので、グループを替えても残す。
+	 * 表示の時計（`trendLogic.ts` の `observeServerClock`）。現在値の応答の `serverNowMs`
+	 * （応答を作った時点のサーバーの時刻）を基準に、端末の単調な経過時間で進める。サーバーの
+	 * 時刻を受け取るまでは `null` で、格子を作らない（端末の時計で作らない）。時計はサーバー
+	 * 全体のものなので、グループを替えても残す。
 	 */
 	let serverClock: ServerClock = null;
 	/** 時計に反映済みの現在値のスナップショット（成功のたびに新しいオブジェクト）。 */
@@ -286,7 +287,7 @@
 			if (current === null || current.phase !== 'ready' || current.values === null) return;
 			if (current.values !== observedValues) {
 				observedValues = current.values;
-				serverClock = observeServerClock(serverClock, current.values, performance.now());
+				serverClock = observeServerClock(serverClock, current.serverNowMs, performance.now());
 			}
 			const now = serverClockNow(serverClock, performance.now());
 			if (now === null || width <= 0) return;

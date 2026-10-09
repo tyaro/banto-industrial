@@ -54,7 +54,7 @@
 //! | *      | `/api/tag-thresholds[/{tagId}]` | `TagThresholdsPayload` | 記録計の側のしきい値（viewer+ 読み取り / editor+ 書き込み、#532。表は `rest::tag_thresholds` の doc） |
 //! | GET    | `/api/collect`   | -                        | `CollectorStateView` (viewer+, #383 段階2b/R1-C) |
 //! | POST   | `/api/collect/start\|stop\|restart` | -     | `CollectOutcome` (editor+) |
-//! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
+//! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` + `serverNowMs` (viewer+, C-3a / D-3b) |
 //! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionView}>` (viewer+, C-3a / `simulation` = #413) |
 //! | GET    | `/api/collect/events?offset=&limit=&asOfId=` | -    | `Readout<CollectEventList>` (viewer+, C-3a / `asOfId` = #409) |
 //! | GET    | `/api/collect/history?tagIds=&fromMs=&toMs=&bins=` | - | `Readout<CollectHistory>` (viewer+, R1-D の D-3a) |
@@ -237,8 +237,8 @@ mod tag_thresholds;
 use crate::collect::ExclusionView;
 use crate::collect::{
     parse_tag_ids, validate_history_request, CollectEventList, CollectHistory, CollectOutcome,
-    CollectorService, CollectorStateView, ConnectionView, CurrentSampleView, EventPage,
-    HistoryRequest, Readout, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    CollectorService, CollectorStateView, ConnectionView, EventPage, HistoryRequest, Readout,
+    ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::SettingsService;
@@ -548,12 +548,13 @@ async fn collect_status_handler(State(state): State<CollectState>) -> Json<Colle
 ///
 /// 返すのは [`Readout`]: **「走っていない」と「読めて 0 件」を別の値**にする
 /// （空の `{}` を返して 2 つを潰さない）。値の型は公開用の
-/// [`CurrentSampleView`] で、**品質と時刻を必ず載せる**（画面が Stale / Bad を
+/// [`crate::collect::CurrentSampleView`] で、**品質と時刻を必ず載せる**（画面が Stale / Bad を
 /// 出し分けられること自体が R0 §3.2 の要求）。
-async fn collect_values_handler(
-    State(state): State<CollectState>,
-) -> Json<Readout<HashMap<String, CurrentSampleView>>> {
-    Json(state.collect.values())
+///
+/// 応答には `serverNowMs`（応答を作った時点のサーバーの時刻、D-3b）が添わる
+/// （[`ValuesResponse`]。トレンドの表示の時計に使う）。
+async fn collect_values_handler(State(state): State<CollectState>) -> Json<ValuesResponse> {
+    Json(state.collect.values_response())
 }
 
 /// `GET /api/collect/connections`（**`viewer` 以上**、C-3a）: 接続ごとの状態。
@@ -5378,6 +5379,10 @@ mod tests {
         assert_eq!(
             values["state"], "notRunning",
             "「走っていない」を「0 件」に潰している: {values}"
+        );
+        assert!(
+            values["serverNowMs"].as_i64().is_some_and(|ms| ms > 0),
+            "現在値の応答にサーバーの時刻が無い（D-3b）: {values}"
         );
         let connections = body_json(
             router
