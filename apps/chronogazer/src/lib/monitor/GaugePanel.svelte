@@ -21,8 +21,8 @@
 	 */
 	import { Gauge } from '@banto/charts';
 	import type { DisplayGroup } from '#lib/banto/displayGroupsAdmin.js';
-	import { formatValue, lastReceivedText } from './monitorLogic';
-	import { meterDescription, type MeterView } from './meterLogic';
+	import { lastReceivedText } from './monitorLogic';
+	import { meterDescription, scaleText, type MeterView } from './meterLogic';
 
 	interface Props {
 		group: Pick<DisplayGroup, 'name'>;
@@ -35,9 +35,9 @@
 
 	let { group, pens, timeLabel, tagsHref }: Props = $props();
 
+	// 値・両端の文字。bit の既定レンジは False / True（scaleText）。
 	function formatter(pen: MeterView): (n: number) => string {
-		const decimals = pen.decimals;
-		return decimals === null ? (n) => String(n) : (n) => formatValue(n, decimals);
+		return (n) => scaleText(pen, n);
 	}
 
 	function gaugeLabel(pen: MeterView): string {

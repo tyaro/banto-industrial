@@ -31,6 +31,7 @@ import {
 	saveLastGroup,
 	selectGroup,
 	sortDisplayGroups,
+	formatBitValue,
 	thresholdLevel,
 	thresholdLevelLabel,
 	valuesStaleNote,
@@ -410,6 +411,51 @@ describe('penView（値・品質・しきい値の総当たり）', () => {
 		expect(penView(PEN, 0, undefined, tag({ unit: null })).unit).toBeNull();
 		expect(penView(PEN, 2, undefined, tag()).colorSlot).toBe(3);
 		expect(penView({ tagId: 1, colorSlot: 5 }, 0, undefined, tag()).colorSlot).toBe(5);
+	});
+});
+
+describe('bit のタグは True / False（2026-10-09 オーナー決定、#551）', () => {
+	const bit = tag({ dataType: 'bit', unit: null, decimals: 0 });
+	const sample = (s: Partial<CurrentSampleView>): CurrentSampleView => ({
+		value: 1,
+		ptimeMs: 1000,
+		quality: 'good',
+		lastGoodMs: 1000,
+		...s
+	});
+	const pen = { tagId: 1, colorSlot: null };
+
+	it.each<[string, CurrentSampleView | undefined, Tag | undefined, string, boolean]>([
+		['bit・1 は True', sample({ value: 1 }), bit, 'True', true],
+		['bit・0 は False（null と区別する）', sample({ value: 0 }), bit, 'False', true],
+		['bit・0 以外は True', sample({ value: 2 }), bit, 'True', true],
+		['bit・bad は最後の値を出さず「—」', sample({ quality: 'bad' }), bit, '—', true],
+		['bit・値なし（good で null）は「—」', sample({ value: null }), bit, '—', true],
+		['bit・未収集は「—」', undefined, bit, '—', true],
+		['u16 の 1 は数値のまま', sample({ value: 1 }), tag(), '1.0', false],
+		['タグを読めていなければ数値のまま', sample({ value: 1 }), undefined, '1', false]
+	])('%s', (_label, s, t, display, isBit) => {
+		const v = penView(pen, 0, s, t);
+		expect(v.display).toBe(display);
+		expect(v.isBit).toBe(isBit);
+	});
+
+	it('品質・しきい値の段は他のタグと同じ（bit に H=1 を置くと True で H）', () => {
+		const t = tag({ dataType: 'bit', unit: null, decimals: 0, thresholdH: 1 });
+		const v = penView(pen, 0, sample({ value: 1 }), t);
+		expect(v.display).toBe('True');
+		expect(v.level).toBe('H');
+		expect(v.stateLabel).toBe('正常');
+		expect(v.value).toBe(1);
+	});
+
+	it.each([
+		[0, 'False'],
+		[1, 'True'],
+		[-0, 'False'],
+		[0.5, 'True']
+	])('formatBitValue(%j) = %s', (n, text) => {
+		expect(formatBitValue(n)).toBe(text);
 	});
 });
 

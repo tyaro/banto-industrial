@@ -19,6 +19,10 @@
  *   進む）は使わない（#531 レビュー: 切断中も時刻が進み、一度も読めていない
  *   タグも何か受け取ったように見えた）。
  *
+ * - **bit のタグは `True` / `False`**（2026-10-09 オーナー決定、#551）。数値の 0 / 1
+ *   では出さない。品質・しきい値の段の出し方は他のタグと同じ。タグ定義を読めて
+ *   いない間は `dataType` が分からないので数値のまま出す。
+ *
  * ## しきい値（Q5）
  *
  * **記録計の側のタグごとの設定**（#532。`tagThresholdsAdmin.ts`、タグ定義の属性では
@@ -161,6 +165,8 @@ export interface PenView {
 	 */
 	value: number | null;
 	unit: string | null;
+	/** bit のタグ（`display` は True / False、バー・計器は 0〜1 が既定のレンジ）。 */
+	isBit: boolean;
 	state: PenState;
 	/** 状態の文言（品質のラベル、または未収集の説明）。 */
 	stateLabel: string;
@@ -199,6 +205,24 @@ export function lastReceivedText(
 
 /** 値が無いときの表示（0 と区別する）。 */
 export const NO_VALUE = '—';
+
+/**
+ * bit のタグの表示（2026-10-09 オーナー決定、#551）。既定で 0 / 1 ではなく
+ * `True` / `False` と出す。文言は既定の表記として持つ（日本語の「オン / オフ」
+ * などへ切り替えたくなったら、その時に設定を足す）。
+ */
+export const BIT_TRUE_LABEL = 'True';
+export const BIT_FALSE_LABEL = 'False';
+
+/** タグが bit か（タグを読めていなければ `false` = 数値のまま出す）。 */
+export function isBitTag(tag: { dataType?: string } | undefined): boolean {
+	return tag?.dataType === 'bit';
+}
+
+/** bit の値の表示（純関数）。`0` = `False`、それ以外 = `True`。 */
+export function formatBitValue(value: number): string {
+	return value === 0 ? BIT_FALSE_LABEL : BIT_TRUE_LABEL;
+}
 
 export const UNCOLLECTED_LABEL = '未収集（無効、または収集の再起動で反映）';
 /** 品質は `good` なのに値が無い（サーバーは返さない約束だが、来たら 0 にしない）。 */
@@ -263,12 +287,15 @@ export function penView(
 	pen: { tagId: number; colorSlot: number | null },
 	index: number,
 	sample: CurrentSampleView | undefined,
-	tag: (Pick<Tag, 'name' | 'unit' | 'decimals'> & TagThresholds) | undefined
+	tag:
+		| (Pick<Tag, 'name' | 'unit' | 'decimals'> & Partial<Pick<Tag, 'dataType'>> & TagThresholds)
+		| undefined
 ): PenView {
 	const base = {
 		tagId: pen.tagId,
 		name: tag?.name ?? `タグ ID ${pen.tagId}`,
 		unit: tag?.unit ? tag.unit : null,
+		isBit: isBitTag(tag),
 		colorSlot: pen.colorSlot ?? index + 1
 	};
 	if (sample === undefined) {
@@ -332,7 +359,11 @@ export function penView(
 			const level = thresholdLevel(sample.value, tag);
 			return {
 				...base,
-				display: tag ? formatValue(sample.value, tag.decimals) : String(sample.value),
+				display: base.isBit
+					? formatBitValue(sample.value)
+					: tag
+						? formatValue(sample.value, tag.decimals)
+						: String(sample.value),
 				value: sample.value,
 				state: 'good',
 				stateLabel: qualityLabel('good'),

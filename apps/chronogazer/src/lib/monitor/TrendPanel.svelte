@@ -30,6 +30,7 @@
 		trendDescription,
 		trendTimeLabel,
 		trendWindowLabel,
+		trendYFormatter,
 		hasThresholds,
 		type TrendPenInfo,
 		type TrendRow
@@ -83,10 +84,8 @@
 	const bandPen = $derived(pens.find((pen) => pen.tagId === bandTagId) ?? null);
 	const bands = $derived(bandPen ? thresholdBands(bandPen.thresholds) : []);
 
-	const maxDecimals = $derived(Math.max(0, ...pens.map((pen) => pen.decimals ?? 0)));
-	function formatY(n: number): string {
-		return n.toLocaleString(undefined, { maximumFractionDigits: maxDecimals });
-	}
+	// 縦軸・ツールチップの書式（全ペンが bit なら False / True。判断は trendYFormatter）。
+	const formatY = $derived(trendYFormatter(pens));
 	function formatX(v: unknown): string {
 		return typeof v === 'number' ? trendTimeLabel(v) : String(v ?? '');
 	}

@@ -39,6 +39,8 @@ import {
 	trendDescription,
 	trendNotices,
 	trendPenInfos,
+	trendYFormatter,
+	isAllBitTrend,
 	trendWindowLabel,
 	valueExtent,
 	type TrendBuffer,
@@ -449,11 +451,28 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 				name: '温度',
 				unit: '℃',
 				decimals: 1,
+				isBit: false,
 				colorSlot: 5,
 				thresholds: { thresholdHh: 90, thresholdH: 80, thresholdL: null, thresholdLl: null }
 			},
-			{ tagId: 2, name: '圧力', unit: null, decimals: 0, colorSlot: 2, thresholds: null },
-			{ tagId: 9, name: 'タグ ID 9', unit: null, decimals: null, colorSlot: 3, thresholds: null }
+			{
+				tagId: 2,
+				name: '圧力',
+				unit: null,
+				decimals: 0,
+				isBit: false,
+				colorSlot: 2,
+				thresholds: null
+			},
+			{
+				tagId: 9,
+				name: 'タグ ID 9',
+				unit: null,
+				decimals: null,
+				isBit: false,
+				colorSlot: 3,
+				thresholds: null
+			}
 		]);
 		expect(penLegendLabel(pens[0])).toBe('温度（℃）');
 		expect(penLegendLabel(pens[1])).toBe('圧力');
@@ -482,6 +501,55 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 		expect(trendDescription({ windowSec: 60, pens, rows: [], bandTagId: null })).toContain(
 			'しきい値の帯: なし。'
 		);
+	});
+
+	it('bit のタグ: isBit、全ペン bit なら縦軸・説明文は False / True、混在は数値のまま（#551）', () => {
+		const withBit = [
+			...tags,
+			{ id: 3, name: '運転中', unit: '', decimals: 0, dataType: 'bit', ...NONE },
+			{ id: 4, name: '異常', unit: '', decimals: 0, dataType: 'bit', ...NONE }
+		] as unknown as Parameters<typeof trendPenInfos>[1];
+		const g = (...ids: number[]) => ({ pens: ids.map((tagId) => ({ tagId, colorSlot: null })) });
+		const bits = trendPenInfos(g(3, 4), withBit);
+		expect(bits.map((p) => p.isBit)).toEqual([true, true]);
+		expect(isAllBitTrend(bits)).toBe(true);
+
+		const fy = trendYFormatter(bits);
+		expect([0, 1, 0.2, 0.5].map(fy)).toEqual(['False', 'True', '', '']);
+
+		const rows = [
+			{ t: 0, values: [0, 1] },
+			{ t: 1, values: [1, 1] }
+		];
+		expect(trendDescription({ windowSec: 60, pens: bits, rows, bandTagId: null })).toBe(
+			'直近 1 分のトレンド。ペン: 運転中、異常。縦軸は False（0）と True（1）で、表示中の値は False〜True。しきい値の帯: なし。'
+		);
+		// 値が 1 種類だけのとき。
+		expect(
+			trendDescription({
+				windowSec: 60,
+				pens: bits,
+				rows: [{ t: 0, values: [1, 1] }],
+				bandTagId: null
+			})
+		).toContain('表示中の値は True。');
+
+		// 混在: 数値のまま（他のタグの 0 / 1 まで True / False に見せない）。
+		const mixed = trendPenInfos(g(2, 3), withBit);
+		expect(isAllBitTrend(mixed)).toBe(false);
+		expect([0, 1].map(trendYFormatter(mixed))).toEqual(['0', '1']);
+		const text = trendDescription({
+			windowSec: 60,
+			pens: mixed,
+			rows: [{ t: 0, values: [5, 1] }],
+			bandTagId: null
+		});
+		expect(text).toContain('表示中の値の範囲は 1〜5。');
+		expect(text).toContain('bit のペン（運転中）は 0 が False、1 が True。');
+
+		// ペンが無いときは全 bit ではない。
+		expect(isAllBitTrend([])).toBe(false);
+		expect(trendYFormatter([])(1)).toBe('1');
 	});
 
 	it('注記: 履歴を読めない・不明なタグ・シミュレーションを別々に', () => {
