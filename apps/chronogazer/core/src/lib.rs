@@ -17,6 +17,9 @@ pub mod events;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
 pub mod hub;
+// #392 A1: 同じ DB を 2 プロセスで開かないための単一インスタンス排他。
+// デスクトップと `banto-serve` が DB を開く前に呼ぶ。
+pub mod instance_lock;
 pub mod rest;
 // #538: 保持期間（`retention.days`）を過ぎた時系列データファイルの削除
 // （起動時 + 日付が変わるたび）。`tauri`/`axum` に依存しない future を返す。

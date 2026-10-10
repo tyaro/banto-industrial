@@ -53,6 +53,7 @@ use chronogazer_core::db::{init_db, Db, InitDbError};
 use chronogazer_core::display_groups::DisplayGroupService;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, UnavailableKeyStore};
+use chronogazer_core::instance_lock::{acquire_for_db, ChronoGazerHost};
 use chronogazer_core::rest::{api_router, user_auth_state};
 use chronogazer_core::settings::{store_config, ServerSettings, SettingsService};
 use chronogazer_core::users::UsersService;
@@ -82,6 +83,17 @@ async fn main() {
         .unwrap_or(false);
 
     let db_path_buf = PathBuf::from(&db_path);
+
+    // #392 A1: 同じ DB を別のプロセス（デスクトップアプリや別の banto-serve）が
+    // 使っていれば、**DB に触れる前**（リストア予約の適用より前）に終了する。
+    // ガードは `main` の終わりまで持つ（Ctrl-C の後始末を抜けるまで）。
+    let _instance_lock = match acquire_for_db(&db_path_buf, ChronoGazerHost::Serve) {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("banto-serve: {err}");
+            std::process::exit(1);
+        }
+    };
 
     // Apply any staged restore (spec M17) BEFORE `init_db`/the pool is
     // created - see `BackupService::apply_pending_restore_at_startup`'s doc
@@ -256,10 +268,8 @@ async fn main() {
     // （`CollectorService::autostart` の doc）。**レジストリを後から編集
     // しても自動では再起動しない**（反映は `POST /api/collect/restart`）。
     //
-    // **注意**: デスクトップアプリとこのサーバーを**同時に起動して同じ
-    // `data.dir` を指すと二重書き込みになる**（防止機構は未実装 -
-    // `chronogazer_core::collect` のモジュール doc「同じ `data.dir` を
-    // 2 つのプロセスで開かないこと」）。
+    // デスクトップアプリとこのサーバーが同じ DB を同時に開くことは、冒頭の
+    // 単一インスタンス排他（`_instance_lock`）が防ぐ。
     {
         let collect = collect.clone();
         tokio::spawn(async move { collect.autostart().await });

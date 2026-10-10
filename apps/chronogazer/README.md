@@ -69,6 +69,18 @@ DB スキーマを banto の admin-template と同じ形に整理した（2026-1
 `%APPDATA%\dev.tyaro.chronogazer\chronogazer.sqlite3`）、`banto-serve` が
 `BANTO_DB`（既定 `./banto-dev.sqlite3`）。
 
+### 1 つの DB につき 1 プロセス（2026-10-10〜）
+
+デスクトップ版と `banto-serve` は、起動時に収集を自動開始するため、**同じ DB を同時に 2 つのプロセスで
+開けない**（開くと 2 つの収集エンジンが同じ時系列ファイルに書き込んで壊れる）。DB を開く前に OS の排他
+（Windows は名前付き mutex `Global\ChronoGazer.<DB パスのハッシュ>`、それ以外は DB の隣の
+`<DB のファイル名>.instance.lock` への `flock`）を取り、取れなければ DB に触れずに終了する。
+デスクトップ版は「ChronoGazer は既に起動しています」の小さな窓（閉じると終了）、`banto-serve` は標準エラーに
+理由を出して非 0 で終了する。**DB が違えば同時に動かせる**（E2E が一時ディレクトリごとに `banto-serve` を
+立てるのはこのため）。プロセスが落ちても OS が排他を返すので、ロックが残って起動できなくなることはない
+（`.instance.lock` ファイルが残っていても無害）。排他の単位は DB なので、別々の DB が設定で同じ絶対パスの
+`data.dir` を指す構成までは防げない。
+
 ## 起動時の判定と「サーバーに接続できません」（2026-10-04〜）
 
 画面を開いたとき、どの環境で動いているかを次の順で決める（banto v3.0.0 の

@@ -30,6 +30,11 @@ banto-admin-services = { workspace = true }
 # I1: tag registry (PlcConnection/CollectionGroup/Tag) - hub's own SQLite
 # DB doubles as the registry DB (docs/tag-server-design.md §3.2 table).
 banto-tags = { path = "../../../crates/banto-tags" }
+# #392 A1（2026-10-10）: `profile_lock.rs` の排他の仕組み（Windows named mutex /
+# 非 Windows の flock / `profile.lock` 診断ファイル）は共有 crate に移した。
+# 以前ここにあった `[target.'cfg(not(windows))'.dependencies] libc` は
+# 同 crate 側へ移動（このパッケージの他のコードは使っていない）。
+banto-instance-lock = { path = "../../../crates/banto-instance-lock" }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its
 # PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
@@ -256,12 +261,3 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
-
-[target.'cfg(not(windows))'.dependencies]
-# T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2 (c)）: 非 Windows には
-# `Global\`名前空間の mutex が無いため、`profile_lock.rs`は
-# `flock(2)`（`LOCK_EX|LOCK_NB`）自体を排他の実体として使う - Linux CI で
-# 二重取得失敗を検証できるようにするため。`libc`はこのワークスペースの
-# 依存木に既に transitively 存在する（`Cargo.lock`参照、tokio 等経由）ため
-# 新規ノードは増えない。MIT/Apache-2.0 デュアルライセンス。
-libc = "0.2"
