@@ -105,7 +105,7 @@ use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 use crate::settings::{HubSettingsExt, MqttSettings, SettingsService, StoreSettings};
 use crate::system_info::SystemInfoSampler;
 use crate::write_audit::WriteAuditService;
-use crate::write_control::WriteControl;
+use crate::write_control::{WriteControl, WriteControlChange};
 use crate::write_path::{execute_write, execute_write_batch, WriteDeps};
 use crate::write_rate::WriteRateLimiter;
 use banto_server::ServerEvent;
@@ -3210,7 +3210,7 @@ async fn tool_delete_tag(
 // レジストリの内容が変わる mutation 専用の経路）。REST の
 // `crate::rest::collection_start`/`collection_stop`/`write_control_set`と
 // 全く同じ呼び出し（`state.status.controller.start/stop`・
-// `state.write_control.set_enabled`）を行い、
+// `state.write_control.set_enabled_detached`）を行い、
 // 監査の宛先だけが違う（[`audit_config_action`]のdoc comment参照）。
 // 可逆操作なので他の構成ツールと違い confirm は要求しない（設計の
 // confirm 必須は delete 系の不可逆操作限定）。
@@ -3286,49 +3286,63 @@ async fn tool_set_write_control(
         .ok_or_else(|| RpcError::invalid_params("arguments.enabled (boolean) is required"))?;
 
     // `crate::rest::write_control_set`と同じ扱い（#340・#433）: 停止・再開の
-    // 本体は `WriteControl::set_enabled`（DB と状態ファイルの 2 か所に保存。
+    // 本体は `WriteControl::set_enabled_detached`（DB と状態ファイルの 2 か所に保存。
     // `crate::write_control` のモジュール doc 参照）。停止はライブフラグを
     // 必ず即座に落とし、どちらか一方に保存できれば成功（片方の失敗は
     // `persistenceWarning` に出す）。再開は両方に保存できたときだけ有効にする。
+    // REST と同じく別タスクで最後まで走らせ、監査もその中で行う（接続が
+    // 切れてこの future が捨てられても、停止・再開と監査を途中で止めない。
+    // `crate::write_control` のモジュール doc「呼び出し側が future を捨てても」）。
+    let action = if enabled { "enable" } else { "disable" };
+    let follow_up = {
+        let audit = state.audit.clone();
+        let key_name = ctx.name.clone();
+        move |change: WriteControlChange| async move {
+            audit_write_control_outcome(&audit, &key_name, action, &change).await;
+        }
+    };
     let change = state
         .write_control
-        .set_enabled(&state.manager.pool(), enabled, Some(ctx.name.as_str()))
+        .set_enabled_detached(
+            &state.manager.pool(),
+            enabled,
+            Some(ctx.name.as_str()),
+            follow_up,
+        )
         .await;
-    let action = if enabled { "enable" } else { "disable" };
-    let detail = crate::rest::write_control_audit_detail(&change);
 
     if !change.succeeded() {
-        audit_write_control_failure(state, ctx, action, detail).await;
         return Ok(tool_error(change.warning().unwrap_or_default()));
     }
 
-    audit_config_action(state, ctx, action, "write_control", Some("1"), Some(detail)).await;
     Ok(tool_ok(json!({
         "writeEnabled": state.write_control.is_enabled(),
         "persistenceWarning": change.warning(),
     })))
 }
 
-/// [`tool_set_write_control`] の失敗時の監査行 - [`audit_config_action`]
-/// （成功専用、`result: "ok"` 固定）とは別に、`result: "failed"` を記録する
-/// （`crate::rest::record_write_control_failure` と同じ形）。
-async fn audit_write_control_failure(
-    state: &McpState,
-    ctx: &ApiKeyContext,
+/// [`tool_set_write_control`] の監査行。[`WriteControl::set_enabled_detached`]
+/// の `follow_up` として、停止・再開と同じ別タスクの中で呼ぶ。成功は
+/// [`audit_config_action`] と同じ形（`result: "ok"`）、失敗は `result:
+/// "failed"`（`crate::rest::record_write_control_failure` と同じ形）。actor は
+/// API キー名、`actor_role` は `"api_key"`、`origin` は `"mcp"`。
+async fn audit_write_control_outcome(
+    audit: &AuditLogService,
+    key_name: &str,
     action: &str,
-    detail: Value,
+    change: &WriteControlChange,
 ) {
-    state
-        .audit
+    let detail = crate::rest::write_control_audit_detail(change);
+    audit
         .record(AuditEntry {
-            actor_username: Some(ctx.name.as_str()),
+            actor_username: Some(key_name),
             actor_role: Some("api_key"),
             action,
             resource: "write_control",
             entity_id: Some("1"),
             detail: Some(detail),
             origin: "mcp",
-            result: "failed",
+            result: if change.succeeded() { "ok" } else { "failed" },
         })
         .await;
 }
