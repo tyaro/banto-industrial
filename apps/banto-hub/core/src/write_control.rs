@@ -67,23 +67,25 @@
 //!
 //! ### ロック順序 (一方向に固定)
 //!
-//! `op_lock` (tokio の非同期ロック。保存の一連を直列化) → `stop_generation`・
-//! `lagging_stop_db`・`lagging_resume_db` (std の同期ロック。世代を読む・
-//! ライブフラグを切り替える・書き込みの控えを出し入れする短い区間だけ)。
+//! `op_lock` (tokio の非同期ロック。保存の一連を直列化) → `stop_state`・
+//! `lagging_stop_db`・`lagging_resume_db` (std の同期ロック。世代と並んでいる
+//! 停止の数を読み書きする・ライブフラグを切り替える・書き込みの控えを出し
+//! 入れする短い区間だけ) → 状態ファイルの書き込みの直列化
+//! (`STATE_FILE_WRITE_LOCK`、std の同期ロック。`spawn_blocking` の中だけ)。
 //! 同期ロックを持ったまま `op_lock` を待つ経路は無い (同期ロックは await を
 //! またいで持たず、2 つを同時に持たない)。停止の知らせ (`stop_signal`、tokio の
-//! `Notify`) は `stop_generation` の中で鳴らす:
+//! `Notify`) は `stop_state` の中で鳴らす:
 //!
-//! - **停止**は `stop_generation` を取って世代を進めライブフラグを落とし、
-//!   待っている再開に知らせ、**それを離してから** `op_lock` を待つ。
-//!   `op_lock` を取れたら、もう一度世代を進めてライブフラグを落としてから
-//!   保存する (落としてから並ぶまでの間に来た再開が先に並んでライブフラグを
-//!   立てても、後で保存するこの停止がライブフラグも停止に戻す)。
+//! - **停止**は `stop_state` を取って世代を進めライブフラグを落とし、
+//!   「並んでいる停止」を 1 つ数え (`WriteControl::begin_stop`)、待っている
+//!   再開に知らせ、**それを離してから** `op_lock` を待つ。`op_lock` を取れたら、
+//!   もう一度世代を進めてライブフラグを落とし、「並んでいる停止」から外して
+//!   から保存する。
 //! - **再開**は、**最初に待つ前に** (`op_lock`、遅れている停止の DB 書き込み)
-//!   世代を読んで覚え、すぐに離す (#439 レビュー P1-2)。待ち終えたら世代を
-//!   比べ、変わっていれば何も保存せずにやめる。保存が済んだら
-//!   `stop_generation` を取って、世代が変わっていないときだけライブフラグを
-//!   立てる。
+//!   世代を読んで覚え、すぐに離す (#439 レビュー P1-2)。待ち終えたら、世代が
+//!   変わった**か、並んでいる停止がある**かを確かめ、どちらかなら何も保存せずに
+//!   やめる (下の「並んでいる停止があれば、再開は始めない」)。保存が済んだら
+//!   `stop_state` を取って、同じ条件に当たらないときだけライブフラグを立てる。
 //!
 //! これで:
 //!
@@ -122,35 +124,72 @@
 //!   (状態ファイルに「停止」を書けていれば成功)。打ち切った停止の書き込みは
 //!   `lagging_stop_db` に入るので、次の再開は (間接的に) 見捨てた再開の
 //!   書き込みの完了も待つ (これも停止が来ればやめられる)。
+//! - **「再開の途中」を書いている間**に停止が来たら、書き終えた後で DB には
+//!   触れずにやめる (要らない「有効」を DB に書かず、停止をその完了待ちに
+//!   しない)。状態ファイルは「再開の途中」のまま。
 //! - 守る性質: **割り込まれた再開には、必ず割り込んだ停止が後に続く**
-//!   (再開が割り込みを検出するのは世代が進んだとき = [`WriteControl::disable`]
-//!   が呼ばれたときで、運用の停止は必ずその後 `op_lock` を取って保存する)。
+//!   (再開が割り込みを検出するのは世代が進んだか並んでいる停止があるとき =
+//!   停止が `begin_stop` (または [`WriteControl::disable`]) を通ったときで、
+//!   運用の停止は必ずその後 `op_lock` を取って保存する。本番の呼び出しは
+//!   停止を別タスクで最後まで走らせる - 下の「呼び出し側が future を捨てても」)。
 //!   再開は `lagging_resume_db` へ渡してから `op_lock` を離すので、続く停止は
-//!   必ずそれを引き取る。停止がライブフラグを落としてから `op_lock` に並ぶ
-//!   までの間に来て先に並んだ再開 (上の「ロック順序」の例) は、その停止の
-//!   後の世代で始まるので割り込まれない (停止の 2 度目の `disable` は、再開が
-//!   `op_lock` を離した後)。
+//!   必ずそれを引き取る。
 //!
-//! これで停止が `op_lock` を待つ時間は、再開の反応 (知らせを受けて即座に
-//! やめる) か、再開の状態ファイルの書き込み (ローカルのファイル。停止自身の
-//! 状態ファイルの書き込みと同じ種類) か、先に並んだ停止 (それぞれ状態ファイルの
-//! 書き込み + 5 秒) で抑えられる。状態ファイルを持たない構成
-//! ([`WriteControl::new`]、テスト用) も同じで、ファイルを書かないだけ。
+//! #### 並んでいる停止があれば、再開は始めない (2026-10-10 監査 P2-1)
 //!
-//! ### 呼び出し側が future を捨てても、書き込みを見失わない (2026-10-10)
+//! 停止はライブフラグを落とした (世代を進めた) 後に `op_lock` を待つ。その
+//! 間に始まった再開は**進んだ後の**世代を覚えるので、世代の比較では割り込みが
+//! 見えず、知らせも来ない。この再開が停止より先に `op_lock` を取り、DB 保存で
+//! 固まると、停止は `op_lock` を制限なしで待つことになる (受付は止まっているが、
+//! REST・MCP の応答が返らない)。そこで停止は世代を進めるのと同じロックの中で
+//! 「並んでいる停止」の数を増やし、`op_lock` を取れたら減らす (`QueuedStop`。
+//! 停止の future が捨てられた・panic したときも `Drop` で減らす)。再開は
+//! 「世代が変わった**または**並んでいる停止がある」を「停止が来た」とみなす
+//! (`StopState::stopped_since`) ので、停止が並んでいる間に始まった再開は、
+//! 何も保存せずに割り込まれて返る (409。停止が勝つ)。停止が `op_lock` を
+//! 取った後に来た再開は、通常どおりその停止の後に並ぶ。
 //!
-//! REST では、クライアントが切断すると hyper がハンドラの future を捨てる。
-//! 停止・再開 ([`WriteControl::set_enabled`]) はどこで捨てられても安全で、
-//! 走っている DB 書き込みを追えなくすることは無い。再開の DB 書き込みは
-//! `lagging_resume_db` (次の停止がその後に書く) へ、待っていた遅れている停止の
-//! DB 書き込みは `lagging_stop_db` の先頭へ順番どおり、制限時間を待つ間の停止の
-//! DB 書き込みは `lagging_stop_db` (次の再開が待つ) へ、それぞれの `Drop` が
-//! `op_lock` を離す前に戻す。停止が引き取った再開の書き込みは、取り出してから
-//! 停止の DB タスクに渡すまで await を挟まない。状態ファイルは書き込みを
-//! 原子的に置き換えるので、どこで捨てられても前の内容か新しい内容のどちらか
-//! (再開が捨てられたら「再開の途中」= 停止扱いが残り得る)。捨てられた停止の
-//! 結果は記録されないので、注意書きは更新しない (ライブフラグは停止が最初に
-//! 動いた時点で、ロックを待つ前に落ちている)。
+//! これで停止が `op_lock` を待つ時間は、次のどれかで抑えられる:
+//!
+//! - 先に `op_lock` を持つ再開の反応 (知らせを受けて、または並んでいる停止を
+//!   見て即座にやめる)。ただし、その再開が状態ファイルを書いている最中なら、
+//!   その書き込みが終わるまで (ローカルのファイル。停止自身の状態ファイルの
+//!   書き込みと同じ種類)。
+//! - 先に並んだ停止 (それぞれ状態ファイルの書き込み + 5 秒)。
+//!
+//! 状態ファイルを持たない構成 ([`WriteControl::new`]、テスト用) も同じで、
+//! ファイルを書かないだけ。
+//!
+//! ### 呼び出し側が future を捨てても (2026-10-10、監査 P2-2)
+//!
+//! REST では、クライアントが切断すると hyper がハンドラの future を捨てる
+//! (MCP も同じ)。**本番の呼び出し (REST・MCP) は
+//! [`WriteControl::set_enabled_detached`] で停止・再開を別タスクにし、最後まで
+//! 走らせる**。ハンドラの future が捨てられても、停止・再開そのものは途中で
+//! 止まらない (停止は必ず `op_lock` を取って両方に保存し、再開は割り込まれる
+//! か確定するまで進む)。結果を受け取る相手がいないだけで、注意書き・ログは
+//! 通常どおり更新される (監査はハンドラが書くので、切断されたら残らない)。
+//!
+//! [`WriteControl::set_enabled`] の future を直接捨てたとき (テスト・
+//! ランタイムの終了) に守るのは、次の 2 つだけ:
+//!
+//! - **走っている DB 書き込みを見失わない**。再開の DB 書き込みは
+//!   `lagging_resume_db` (次の停止がその後に書く) へ、待っていた遅れている
+//!   停止の DB 書き込みは `lagging_stop_db` の先頭へ順番どおり、制限時間を待つ
+//!   間の停止の DB 書き込みは `lagging_stop_db` (次の再開が待つ) へ、それぞれの
+//!   `Drop` が `op_lock` を離す前に戻す。停止が引き取った再開の書き込みは、
+//!   取り出してから停止の DB タスクに渡すまで await を挟まない。並んでいる
+//!   停止の数も `Drop` で戻す。
+//! - **状態ファイルが半端な内容にならない** (原子的な置き換え。同じプロセスの
+//!   書き込みどうしは `STATE_FILE_WRITE_LOCK` で直列)。
+//!
+//! **順序は守らない**: 状態ファイルの書き込みは `spawn_blocking` で、future を
+//! 捨てても止まらず、`op_lock` を離した後で置き換わり得る。たとえば再開の
+//! 確定 (状態ファイルを「有効」) の途中で捨てられ、直後の停止が「停止」を
+//! 書いた後に遅れた「有効」が置き換わると、停止を受け付けたのに再起動で有効に
+//! なり得る。また、`op_lock` を待つ間に捨てられた停止は、ライブフラグを落とす
+//! だけで何も保存しない。これらを本番で起こさないために、上のとおり別タスクで
+//! 最後まで走らせる。
 //!
 //! ### 停止の DB 保存は 5 秒で打ち切る (#433 監査、2026-09-24)
 //!
@@ -183,17 +222,21 @@
 //! 固まっているときの REST の停止の応答は、停止の監査 (#437、監査の保留が
 //! INSERT を待つ上限 3 秒 - `crate::audit_spool`) を足して最長でおよそ
 //! 5 + 5 + 3 秒になる。同時に走っている再開が DB を待っていても、停止が来た
-//! 時点でその再開は待つのをやめるので、`op_lock` を待つ間は状態ファイルの
-//! 書き込み程度で、この上限から外れない (先に並んだ停止があれば、その分、
-//! つまりそれぞれ状態ファイルの書き込み + 5 秒だけ延びる)。ライブフラグは
-//! 並ぶ前に落ちる。
+//! 時点でその再開は待つのをやめ、停止が並んでいる間に始まった再開は保存を
+//! 始めないので、`op_lock` を待つ間は状態ファイルの書き込み程度で、この上限
+//! から外れない (先に並んだ停止があれば、その分、つまりそれぞれ状態ファイルの
+//! 書き込み + 5 秒だけ延びる。上の「並んでいる停止があれば、再開は始めない」)。
+//! ライブフラグは並ぶ前に落ちる。
 //!
 //! ### ファイルの書き込み中に落ちた場合
 //!
 //! 一時ファイル (`<名前>.tmp`) に書いて `sync_all` し、`rename` で置き換える
 //! (Unix では親ディレクトリも `sync_all`)。途中で落ちても、状態ファイルは
 //! 前の内容か新しい内容のどちらかで、半端な内容は残らない。残った一時
-//! ファイルは読まず、次の書き込みで上書きする。
+//! ファイルは読まず、次の書き込みで上書きする。一時ファイルの名前は 1 つ
+//! なので、同じプロセスの書き込みどうしは作成 → rename を
+//! `STATE_FILE_WRITE_LOCK` で直列にする (他方の書きかけの一時ファイルを
+//! rename しない)。
 //!
 //! [`WriteControl::was_enabled_before_restart`] は「起動時に復元した値」を
 //! 指す名称として残す (外部クライアント Thermal Monitor が
@@ -241,6 +284,10 @@ const NOT_SAVED_INTERRUPTED: &str = "停止が要求されたため保存して�
 /// 停止の DB 保存はその完了を待ってから行う (このモジュール doc「停止は、
 /// 固まった再開の後ろで待たない」)。
 const DB_ABANDONED_ON_STOP: &str = "DB への保存中に停止が要求されたため、完了を待たずにやめました（書き込みは取り消していないので遅れて「有効」が保存される場合がありますが、停止の DB 保存は必ずその後に行います）";
+
+/// 再開が状態ファイルを「有効」にしなかった理由 (「再開の途中」を書いている間に
+/// 停止が来たので、DB に触れずにやめた)。
+const KEPT_RESUME_PENDING_BEFORE_DB: &str = "「再開の途中」を書いている間に停止が要求されたため、DB には保存せず「再開の途中」のままにしました（「有効」は書いていません。再起動すると停止で起動します）";
 
 /// 再開が状態ファイルを「有効」にしなかった理由 (DB の保存中に停止が来た)。
 const KEPT_RESUME_PENDING_ON_STOP: &str = "DB への保存中に停止が要求されたため「再開の途中」のままにしました（「有効」は書いていません。再起動すると停止で起動します）";
@@ -429,6 +476,10 @@ async fn write_state_record(
     .map_err(|err| format!("{}: {err}", path.display()))?
 }
 
+/// 状態ファイルの書き込み (一時ファイルの作成 → rename) を直列にする
+/// ([`write_state_file_blocking`])。
+static STATE_FILE_WRITE_LOCK: SyncMutex<()> = SyncMutex::new(());
+
 fn write_state_file_blocking(
     path: &Path,
     record: FileRecord,
@@ -459,6 +510,11 @@ fn write_state_file_blocking(
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = PathBuf::from(tmp_name);
+    // 一時ファイルの名前は 1 つなので、同じプロセスの書き込みどうしは
+    // 作成 → rename を直列にする (捨てられた future の書き込みが後の書き込みと
+    // 重なっても、他方の書きかけの一時ファイルを rename しない。順序までは
+    // 守らない - このモジュール doc「呼び出し側が future を捨てても」)。
+    let _serialized = lock_ignoring_poison(&STATE_FILE_WRITE_LOCK);
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(&body)?;
@@ -493,9 +549,10 @@ pub struct WriteControl {
     /// 状態ファイル。`None` は状態ファイルを持たない構成 ([`Self::new`]、
     /// 他機能のテスト用) - そのときは DB だけに保存する (#433 より前の挙動)。
     state_file: Option<PathBuf>,
-    /// 停止の世代。停止のたびに進む。ライブフラグの切り替えはこのロックの
-    /// 中で行う (このモジュール doc「ロック順序」)。
-    stop_generation: SyncMutex<u64>,
+    /// 停止の世代と、`op_lock` に並んでいる停止の数。ライブフラグの切り替えは
+    /// このロックの中で行う (このモジュール doc「ロック順序」「並んでいる停止が
+    /// あれば、再開は始めない」)。
+    stop_state: SyncMutex<StopState>,
     /// 停止の知らせ。[`Self::disable`] が世代を進めたのと同じロックの中で
     /// `notify_waiters` する。再開は `op_lock` を持ったまま長く待つところ
     /// (遅れている停止の DB 書き込み・自分の DB 保存) でこれを待ち、停止が
@@ -511,13 +568,46 @@ pub struct WriteControl {
     /// 制限時間を超えてまだ終わっていない、停止の DB 書き込み (打ち切った停止の
     /// 見届け役、または完了を見ずに捨てられた停止の DB 書き込みそのもの)。
     /// 次の再開はこれの完了を待つ (このモジュール doc「停止の DB 保存は 5 秒で
-    /// 打ち切る」「呼び出し側が future を捨てても、書き込みを見失わない」)。
+    /// 打ち切る」「呼び出し側が future を捨てても」)。
     lagging_stop_db: SyncMutex<Vec<DbWrite>>,
     /// 停止に割り込まれた・捨てられた再開が、完了を待たずに残した DB 書き込み
     /// (中身は「有効」)。次の停止が `op_lock` の中で取り出し、自分の DB 書き込み
     /// をこれらの完了の後に行う (このモジュール doc「停止は、固まった再開の
     /// 後ろで待たない」)。
     lagging_resume_db: SyncMutex<Vec<DbWrite>>,
+}
+
+/// 停止の世代と、並んでいる停止の数 ([`WriteControl::stop_state`])。
+#[derive(Debug, Default)]
+struct StopState {
+    /// 停止のたびに進む ([`WriteControl::disable`])。
+    generation: u64,
+    /// ライブフラグを落としたが、まだ `op_lock` を取れていない停止の数
+    /// ([`QueuedStop`])。0 より大きい間は、再開は「停止が来た」とみなす。
+    queued: u64,
+}
+
+impl StopState {
+    /// 再開が「停止が来た」とみなすか: `started_generation` を覚えた後に世代が
+    /// 進んだ、**または**並んでいる停止がある (覚える前から並んでいた停止も
+    /// 含む。このモジュール doc「並んでいる停止があれば、再開は始めない」)。
+    fn stopped_since(&self, started_generation: u64) -> bool {
+        self.generation != started_generation || self.queued > 0
+    }
+}
+
+/// ライブフラグを落としてから `op_lock` を取るまでの停止 1 件
+/// ([`WriteControl::begin_stop`])。`op_lock` を取れた・停止の future が捨て
+/// られた・panic したときに `Drop` で数を戻す。
+struct QueuedStop<'a> {
+    state: &'a SyncMutex<StopState>,
+}
+
+impl Drop for QueuedStop<'_> {
+    fn drop(&mut self) {
+        let mut state = lock_ignoring_poison(self.state);
+        state.queued = state.queued.saturating_sub(1);
+    }
 }
 
 /// 完了を追いかける DB 書き込み (別タスク)。結果は待つ側では使わない
@@ -651,7 +741,7 @@ impl WriteControlChange {
     pub fn warning(&self) -> Option<String> {
         if self.interrupted_by_stop {
             return Some(
-                "再開の保存中、または保存を待っている間に停止が要求されたため、再開しませんでした。"
+                "停止が要求されたため、再開しませんでした（再開の保存中・保存を待っている間に停止が来た、または先に来た停止がまだ保存を始めていなかった）。"
                     .to_string(),
             );
         }
@@ -685,7 +775,8 @@ impl WriteControlChange {
         } else {
             format!(
                 "書き込み受付は停止しましたが、どこにも保存できませんでした（{detail}）。\
-                 再起動すると最後に保存した状態に戻ります。"
+                 再起動すると、それまでに保存されていた内容で起動します（DB と\
+                 状態ファイルのどちらかが「停止」または「再開の途中」なら停止）。"
             )
         })
     }
@@ -710,7 +801,7 @@ impl WriteControl {
             enabled: AtomicBool::new(enabled),
             was_enabled_before_restart: enabled,
             state_file,
-            stop_generation: SyncMutex::new(0),
+            stop_state: SyncMutex::new(StopState::default()),
             stop_signal: Notify::new(),
             op_lock: AsyncMutex::new(()),
             persistence_warning: Arc::new(SyncMutex::new(WarningSlot { seq: 0, warning })),
@@ -722,7 +813,7 @@ impl WriteControl {
     /// ライブフラグだけを立てる (保存しない。テスト用)。運用の再開は
     /// [`Self::set_enabled`] を使う。
     pub fn enable(&self) {
-        let _generation = lock_ignoring_poison(&self.stop_generation);
+        let _state = lock_ignoring_poison(&self.stop_state);
         self.enabled.store(true, Ordering::SeqCst);
     }
 
@@ -730,8 +821,26 @@ impl WriteControl {
     /// (保存しない)。運用の停止は [`Self::set_enabled`] を使う (これだけを
     /// 呼んで割り込んだ再開が残した DB 書き込みは、次の停止が引き取る)。
     pub fn disable(&self) {
-        let mut generation = lock_ignoring_poison(&self.stop_generation);
-        *generation = generation.wrapping_add(1);
+        let mut state = lock_ignoring_poison(&self.stop_state);
+        self.disable_locked(&mut state);
+    }
+
+    /// 停止の前半: [`Self::disable`] と同じことを行い、同じロックの中で
+    /// 「並んでいる停止」を 1 つ数える。返したガードを `op_lock` を取れた
+    /// ところで捨てる ([`Self::save_stop`])。それまでの間に始まった再開は、
+    /// 世代が変わっていなくても「停止が来た」とみなす (このモジュール doc
+    /// 「並んでいる停止があれば、再開は始めない」)。
+    fn begin_stop(&self) -> QueuedStop<'_> {
+        let mut state = lock_ignoring_poison(&self.stop_state);
+        self.disable_locked(&mut state);
+        state.queued = state.queued.saturating_add(1);
+        QueuedStop {
+            state: &self.stop_state,
+        }
+    }
+
+    fn disable_locked(&self, state: &mut StopState) {
+        state.generation = state.generation.wrapping_add(1);
         self.enabled.store(false, Ordering::SeqCst);
         // 世代を進めたのと同じロックの中で知らせる (世代を読んだ後に作った
         // 受け口には、その後の停止の知らせだけが届く)。
@@ -760,8 +869,68 @@ impl WriteControl {
             .clone()
     }
 
+    /// 停止・再開を**別タスクで最後まで**走らせ、その結果を待つ。本番の
+    /// 呼び出し (REST・MCP) はこれを使う: 呼び出し側の future (クライアントが
+    /// 切断した要求のハンドラ) が捨てられても、停止・再開は途中で止まらない
+    /// (このモジュール doc「呼び出し側が future を捨てても」)。中身は
+    /// [`Self::set_enabled`]。
+    pub async fn set_enabled_detached(
+        self: &Arc<Self>,
+        pool: &SqlitePool,
+        enabled: bool,
+        actor: Option<&str>,
+    ) -> WriteControlChange {
+        let pool = pool.clone();
+        let db_actor = actor.map(str::to_string);
+        self.set_enabled_detached_with(enabled, actor, async move {
+            persist_enabled(&pool, enabled, db_actor.as_deref())
+                .await
+                .map_err(|err| err.to_string())
+        })
+        .await
+    }
+
+    /// [`Self::set_enabled_detached`] の本体 (テストで DB の詰まりを差し込む
+    /// ため)。
+    async fn set_enabled_detached_with<F>(
+        self: &Arc<Self>,
+        enabled: bool,
+        actor: Option<&str>,
+        persist_db: F,
+    ) -> WriteControlChange
+    where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let control = Arc::clone(self);
+        let actor = actor.map(str::to_string);
+        let task = tokio::spawn(async move {
+            control
+                .set_enabled_with(enabled, actor.as_deref(), persist_db)
+                .await
+        });
+        match task.await {
+            Ok(change) => change,
+            // panic した (またはランタイムの終了で取り消された)。どこまで保存
+            // できたか分からないので、保存できなかったものとして返す (停止なら
+            // 500。ライブフラグは停止なら最初に落ちている)。
+            Err(err) => {
+                let failed = || Err(format!("停止・再開の処理が途中で終了しました（{err}）"));
+                WriteControlChange {
+                    requested_enabled: enabled,
+                    db: failed(),
+                    file: self.state_file.as_ref().map(|_| failed()),
+                    interrupted_by_stop: false,
+                    db_timed_out: false,
+                }
+            }
+        }
+    }
+
     /// 停止 (`false`) / 再開 (`true`) し、DB と状態ファイルに保存する
-    /// (このモジュール doc「停止の状態は 2 か所に記録する」)。
+    /// (このモジュール doc「停止の状態は 2 か所に記録する」)。この future を
+    /// 途中で捨てると、状態ファイルの書き込みが `op_lock` を離した後に置き
+    /// 換わり得る (このモジュール doc「呼び出し側が future を捨てても」)。
+    /// 本番の呼び出しは [`Self::set_enabled_detached`] を使う。
     pub async fn set_enabled(
         &self,
         pool: &SqlitePool,
@@ -794,8 +963,9 @@ impl WriteControl {
             self.resume(actor, persist_db).await
         } else {
             // ロックを取る前にライブフラグを落とす (書き込みは即座に止まる)。
-            self.disable();
-            self.save_stop(actor, persist_db).await
+            // `op_lock` を取るまでは「並んでいる停止」として数える。
+            let queued = self.begin_stop();
+            self.save_stop(queued, actor, persist_db).await
         }
     }
 
@@ -808,7 +978,11 @@ impl WriteControl {
         // **前に**覚える (#439 レビュー P1-2)。待っている間に来た停止を
         // 「開始時からあった」ものとして取り込まないため。同期ロックは値を
         // 読んだらすぐ離す (await をまたいで持たない)。
-        let started_generation = *lock_ignoring_poison(&self.stop_generation);
+        // ここで並んでいる停止 (ライブフラグを落としたが `op_lock` をまだ
+        // 取れていない停止) があれば、下の `stopped_since` が「停止が来た」と
+        // 判定する (このモジュール doc「並んでいる停止があれば、再開は始め
+        // ない」)。
+        let started_generation = lock_ignoring_poison(&self.stop_state).generation;
         let _op = self.op_lock.lock().await;
         // 遅れている停止の DB 書き込みが終わるまで待つ (再開の「有効」を
         // 後から「停止」で上書きされないように)。再開に制限時間は無いが、
@@ -842,6 +1016,23 @@ impl WriteControl {
                 self.record_outcome(&change);
                 return change;
             }
+        }
+        // 1 の書き込み中に停止が来ていたら、DB には触れずにやめる (要らない
+        // 「有効」を DB に書かず、停止をその書き込みの完了待ちにしない)。
+        // 状態ファイルは「再開の途中」(停止扱い) のまま。
+        if self.stopped_since(started_generation) {
+            let change = WriteControlChange {
+                requested_enabled: true,
+                db: Err(NOT_SAVED_INTERRUPTED.to_string()),
+                file: self
+                    .state_file
+                    .as_ref()
+                    .map(|_| Err(KEPT_RESUME_PENDING_BEFORE_DB.to_string())),
+                interrupted_by_stop: true,
+                db_timed_out: false,
+            };
+            self.record_outcome(&change);
+            return change;
         }
         // 2. DB を「有効」にする。別タスクで走らせ、停止が来たら完了を待たずに
         //    やめる (停止を固まった再開の後ろに並ばせない)。書き込みは取り
@@ -893,8 +1084,8 @@ impl WriteControl {
             db_timed_out: false,
         };
         if change.fully_persisted() {
-            let generation = lock_ignoring_poison(&self.stop_generation);
-            if *generation == started_generation {
+            let state = lock_ignoring_poison(&self.stop_state);
+            if !state.stopped_since(started_generation) {
                 self.enabled.store(true, Ordering::SeqCst);
             } else {
                 change.interrupted_by_stop = true;
@@ -904,9 +1095,10 @@ impl WriteControl {
         change
     }
 
-    /// `started_generation` を覚えた後に停止が来たか。
+    /// `started_generation` を覚えた後に停止が来たか、または並んでいる停止が
+    /// あるか ([`StopState::stopped_since`])。
     fn stopped_since(&self, started_generation: u64) -> bool {
-        *lock_ignoring_poison(&self.stop_generation) != started_generation
+        lock_ignoring_poison(&self.stop_state).stopped_since(started_generation)
     }
 
     /// `started_generation` を覚えた後に停止が来るまで待つ (もう来ていれば
@@ -954,18 +1146,25 @@ impl WriteControl {
         // 残りがあれば `waiting` を捨てるときに戻る。
     }
 
-    /// 停止の保存 (ライブフラグを落とした後に呼ぶ)。
-    async fn save_stop<F>(&self, actor: Option<&str>, persist_db: F) -> WriteControlChange
+    /// 停止の保存 ([`Self::begin_stop`] でライブフラグを落とした後に呼ぶ)。
+    async fn save_stop<F>(
+        &self,
+        queued: QueuedStop<'_>,
+        actor: Option<&str>,
+        persist_db: F,
+    ) -> WriteControlChange
     where
         F: Future<Output = Result<(), String>> + Send + 'static,
     {
         let _op = self.op_lock.lock().await;
-        // `op_lock` を取れたら、もう一度落とす。ライブフラグを落としてから
-        // `op_lock` に並ぶまでの間に来た再開は、この停止の世代を開始時の世代と
-        // して覚えて先に並び得る。その再開がライブフラグを立てても、この停止が
-        // 後で保存する (永続値は停止になる) ので、ライブフラグもそれに合わせる
-        // (#439 レビュー P1-2: 停止が成功したのにライブフラグだけ有効、を残さない)。
+        // `op_lock` を取れたら、もう一度落としてから「並んでいる停止」を外す。
+        // 並んでいる間に始まった再開は `stopped_since` で止まるので、ライブ
+        // フラグを立てて先に済ませることは無いが、`disable` だけを呼んだ
+        // 経路 (テスト用) もあるので、ここでも落とす (#439 レビュー P1-2:
+        // 停止が成功したのにライブフラグだけ有効、を残さない)。世代を進めて
+        // から外すので、その間に世代を覚えた再開も割り込みとして見える。
         self.disable();
+        drop(queued);
         let file = self.persist_file(false, actor).await;
         // 割り込まれた・捨てられた再開が残した DB 書き込み (「有効」) を引き
         // 取り、この停止の DB 書き込みはそれらの完了の後に行う (DB に最後に
@@ -1959,10 +2158,14 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_until("resume B takes over the lagging stop write", || {
+            control.lagging_stop_db.lock().unwrap().is_empty()
+        })
+        .await;
         assert!(!resume.is_finished());
 
         // 停止 C: B が待っている間に来る。
+        let before_c = control.stop_state.lock().unwrap().generation;
         let stop = {
             let control = control.clone();
             let order = order.clone();
@@ -1975,7 +2178,10 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_until("stop C has started", || {
+            control.stop_state.lock().unwrap().generation != before_c
+        })
+        .await;
 
         release.notify_one();
         let resumed = resume.await.unwrap();
@@ -2053,6 +2259,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // 停止 C: B が `op_lock` を待っている間に来る (B の後ろに並ぶ)。
+        let before_c = control.stop_state.lock().unwrap().generation;
         let stop_c = {
             let control = control.clone();
             let order = order.clone();
@@ -2065,7 +2272,10 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_until("stop C has started", || {
+            control.stop_state.lock().unwrap().generation != before_c
+        })
+        .await;
 
         release.notify_one();
         assert!(stop_a.await.unwrap().succeeded());
@@ -2084,13 +2294,14 @@ mod tests {
         );
     }
 
-    /// 停止がライブフラグを落としてから `op_lock` に並ぶまでの間に再開が来て、
-    /// 停止より先に並んだ (#439 レビュー P1-2 の残り)。この再開は停止の後に
-    /// 来たので成功してよいが、後で保存する停止がライブフラグも停止に戻し、
-    /// 「停止が成功したのにライブフラグだけ有効」を残さない。停止の前半
-    /// (`disable`) と後半 (`save_stop`) を分けて、この順序を作る。
+    /// 停止がライブフラグを落としてから `op_lock` を取るまでの間に再開が来て、
+    /// 停止より先に `op_lock` を取った (#439 レビュー P1-2 の残り、2026-10-10
+    /// 監査 P2-1)。この再開は停止の後の世代を覚えて始まるので世代では割り込みが
+    /// 見えないが、並んでいる停止があるので保存せずに割り込まれて返る (409)。
+    /// 後で保存する停止が永続値もライブフラグも停止にする。停止の前半
+    /// (`begin_stop`) と後半 (`save_stop`) を分けて、この順序を作る。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_resume_that_overtakes_a_stop_in_the_queue_is_undone_by_the_stop() {
+    async fn a_resume_that_overtakes_a_queued_stop_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let state_file = state_file_path(dir.path());
         let control = Arc::new(WriteControl::restore(
@@ -2102,37 +2313,148 @@ mod tests {
         ));
         let held = control.op_lock.lock().await;
 
-        // 停止 C の前半: ライブフラグを落とす (まだ `op_lock` に並んでいない)。
-        control.disable();
+        // 停止 C の前半: ライブフラグを落とす (まだ `op_lock` を取っていない)。
+        let queued = control.begin_stop();
         // 再開 B: C の後の世代を覚えて、先に `op_lock` に並ぶ。
         let resume = {
             let control = control.clone();
             tokio::spawn(async move { control.set_enabled_with(true, None, db_ok()).await })
         };
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // 停止 C の後半: B の後ろに並んで保存する。
-        let stop = {
-            let control = control.clone();
-            tokio::spawn(async move { control.save_stop(None, db_ok()).await })
-        };
+        // B が `op_lock` に並ぶのを待つ (並んでいなくても、B は C の保存の前に
+        // 取るか後に取るかで、どちらでも割り込まれる)。
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(held);
+        let resumed = tokio::time::timeout(Duration::from_secs(5), resume)
+            .await
+            .expect("the resume returns without waiting for the queued stop")
+            .unwrap();
+        assert!(resumed.interrupted_by_stop, "{resumed:?}");
+        assert!(!resumed.succeeded());
+        assert!(!control.is_enabled());
+        assert_ne!(
+            read_state_file(&state_file).await,
+            FileStartupState::ResumePending,
+            "the refused resume writes nothing"
+        );
 
-        let resumed = resume.await.unwrap();
-        let stopped = stop.await.unwrap();
-        assert!(resumed.succeeded(), "{resumed:?}");
+        // 停止 C の後半。
+        let stopped = control.save_stop(queued, None, db_ok()).await;
         assert!(
             stopped.succeeded() && stopped.fully_persisted(),
             "{stopped:?}"
         );
-        assert!(
-            !control.is_enabled(),
-            "the stop saved last, so the live flag must match it"
-        );
+        assert!(!control.is_enabled());
         assert_eq!(
             read_state_file(&state_file).await,
             FileStartupState::Disabled
         );
+
+        // 停止が `op_lock` を取った後の再開は、通常どおり成功する。
+        let resumed = control.set_enabled_with(true, None, db_ok()).await;
+        assert!(resumed.succeeded(), "{resumed:?}");
+        assert!(control.is_enabled());
+    }
+
+    /// 2026-10-10 監査 P2-1: 停止が世代を進めた後、`op_lock` を取る前に再開が
+    /// 始まって先に `op_lock` を取り、その再開の DB 保存が返らない。再開は
+    /// 世代が変わらないので知らせも届かないが、並んでいる停止があるので DB に
+    /// 触れる前に割り込まれて返り、停止は制限時間の内に (再開を待たずに) 返る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_started_while_a_stop_is_queued_does_not_hold_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        write_state_file(&state_file, true, None).await.unwrap();
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+
+        // 停止の前半だけ (世代は進んだが、まだ `op_lock` を取っていない)。
+        let queued = control.begin_stop();
+        assert!(!control.is_enabled());
+
+        // 再開: `op_lock` は空いているので、停止より先に取る。DB 保存は返らない。
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut resume = {
+            let control = control.clone();
+            let entered = entered.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        entered.notify_one();
+                        std::future::pending::<Result<(), String>>().await
+                    })
+                    .await
+            })
+        };
+        let resumed = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                resumed = &mut resume => resumed.unwrap(),
+                () = entered.notified() => {
+                    panic!("the resume reached its DB save while a stop was queued")
+                }
+            }
+        })
+        .await
+        .expect("the resume must return while a stop is queued");
+        assert!(resumed.interrupted_by_stop, "{resumed:?}");
+        assert_eq!(resumed.db_error(), Some(NOT_SAVED_INTERRUPTED));
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Enabled,
+            "the refused resume writes nothing (not even 'resume pending')"
+        );
+
+        // 停止の後半: 再開に塞がれずに、すぐ保存して返る。
+        let stopped = tokio::time::timeout(
+            STOP_DB_SAVE_TIMEOUT,
+            control.save_stop(queued, Some("admin"), db_ok()),
+        )
+        .await
+        .expect("the stop must not wait behind the resume");
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        assert!(!control.is_enabled());
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+    }
+
+    /// 並んでいる停止の future が `op_lock` を待つ間に捨てられても、並んでいる
+    /// 数は戻る (以後の再開を拒み続けない)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_queued_stop_does_not_block_later_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file_path(dir.path()),
+        ));
+        let held = control.op_lock.lock().await;
+        let stop = {
+            let control = control.clone();
+            tokio::spawn(async move { control.set_enabled_with(false, None, db_ok()).await })
+        };
+        wait_until("the stop is queued", || {
+            control.stop_state.lock().unwrap().queued == 1
+        })
+        .await;
+        stop.abort();
+        assert!(stop.await.unwrap_err().is_cancelled());
+        assert_eq!(control.stop_state.lock().unwrap().queued, 0);
+        drop(held);
+
+        let resumed = control.set_enabled_with(true, None, db_ok()).await;
+        assert!(resumed.succeeded(), "{resumed:?}");
+        assert!(control.is_enabled());
     }
 
     /// 遅れて完了した停止の DB 書き込みは、注意書きを自分の結果で更新する
@@ -2399,7 +2721,10 @@ mod tests {
 
         // 再開 B: A の DB 書き込みの完了を待つ。
         let resume_b = resume_pushing("resume B");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until("resume B takes over the lagging stop write", || {
+            control.lagging_stop_db.lock().unwrap().is_empty()
+        })
+        .await;
         assert!(!resume_b.is_finished());
 
         // 停止 C: B は A を待たずにすぐやめ、C はその場で保存する。
@@ -2559,7 +2884,10 @@ mod tests {
 
         // 再開 B: A を待っている間に捨てられる。
         let resume_b = resume_pushing("resume B");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until("resume B takes over the lagging stop write", || {
+            control.lagging_stop_db.lock().unwrap().is_empty()
+        })
+        .await;
         assert!(!resume_b.is_finished());
         resume_b.abort();
         assert!(resume_b.await.unwrap_err().is_cancelled());
@@ -2650,5 +2978,170 @@ mod tests {
         assert!(resumed.succeeded(), "{resumed:?}");
         assert_eq!(*order.lock().unwrap(), vec!["stop", "resume"]);
         assert!(control.is_enabled());
+    }
+
+    // --- 本番の呼び出しは別タスクで最後まで走らせる (2026-10-10 監査 P2-2) ---
+
+    /// 呼び出し側 (REST・MCP のハンドラ) の future が再開の DB 保存中に捨て
+    /// られても、再開は途中で止まらずに最後まで走る (状態ファイルの「有効」が
+    /// `op_lock` の外で遅れて置き換わることは無い)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_detached_resume_runs_to_completion_when_the_caller_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: false,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let caller = {
+            let control = control.clone();
+            let entered = entered.clone();
+            let held = db_held_until(release.clone(), order.clone(), "resume", Ok(()));
+            tokio::spawn(async move {
+                control
+                    .set_enabled_detached_with(true, None, async move {
+                        entered.notify_one();
+                        held.await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(
+            control.lagging_resume_db.lock().unwrap().is_empty(),
+            "the resume itself was not abandoned"
+        );
+
+        release.notify_one();
+        wait_until("the resume completes", || control.is_enabled()).await;
+        // ライブフラグは状態ファイルを「有効」にした後に立つ。
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Enabled
+        );
+        assert_eq!(control.persistence_warning(), None);
+    }
+
+    /// 監査 P2-2 の例: 再開の途中で呼び出し側が切断し、すぐに停止が来る。
+    /// 最後に残る永続値 (状態ファイル・DB の書き込み順) は停止になる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_after_a_dropped_detached_resume_is_what_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: false,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let caller = {
+            let control = control.clone();
+            let entered = entered.clone();
+            let held = db_held_until(release.clone(), order.clone(), "resume", Ok(()));
+            tokio::spawn(async move {
+                control
+                    .set_enabled_detached_with(true, None, async move {
+                        entered.notify_one();
+                        held.await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        let before_stop = control.stop_state.lock().unwrap().generation;
+        let stop = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_detached_with(false, None, async move {
+                        order.lock().unwrap().push("stop");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        wait_until("the stop has started", || {
+            control.stop_state.lock().unwrap().generation != before_stop
+        })
+        .await;
+        release.notify_one();
+        let stopped = stop.await.unwrap();
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        assert_eq!(*order.lock().unwrap(), vec!["resume", "stop"]);
+        assert!(!control.is_enabled());
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+    }
+
+    /// 停止の呼び出し側が `op_lock` を待つ間に捨てられても、停止は最後まで
+    /// 走って保存する (以前は、ライブフラグが落ちるだけで何も保存しなかった)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_detached_stop_saves_even_if_the_caller_is_dropped_while_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        write_state_file(&state_file, true, None).await.unwrap();
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let held = control.op_lock.lock().await;
+
+        let caller = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_detached_with(false, None, async move {
+                        order.lock().unwrap().push("stop");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        wait_until("the stop is queued", || {
+            control.stop_state.lock().unwrap().queued == 1
+        })
+        .await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(!control.is_enabled());
+        drop(held);
+
+        wait_until("the stop saves to the DB", || {
+            order.lock().unwrap().as_slice() == ["stop"]
+        })
+        .await;
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+        assert_eq!(control.stop_state.lock().unwrap().queued, 0);
     }
 }

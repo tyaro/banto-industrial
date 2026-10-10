@@ -858,7 +858,7 @@ struct WriteControlStatusResponse {
     persistence_warning: Option<String>,
 }
 
-/// 停止・再開の本体は [`WriteControl::set_enabled`]（#433。DB と状態
+/// 停止・再開の本体は [`WriteControl::set_enabled_detached`]（#433。DB と状態
 /// ファイルの 2 か所に保存する - `crate::write_control` のモジュール doc 参照）。
 /// このハンドラは結果を応答と監査に変換するだけ:
 /// - **disable（非常停止）**: ライブフラグは必ず即座に落ちる。どちらか一方に
@@ -883,9 +883,12 @@ async fn write_control_set(
     let identity = actor_identity(headers, &state.auth);
     let actor_id = identity.as_ref().map(|i| i.id.as_str());
 
+    // 別タスクで最後まで走らせる（クライアントが切断してこのハンドラの
+    // future が捨てられても、停止・再開を途中で止めない。`crate::write_control`
+    // のモジュール doc「呼び出し側が future を捨てても」）。
     let change = state
         .write_control
-        .set_enabled(&state.manager.pool(), enabled, actor_id)
+        .set_enabled_detached(&state.manager.pool(), enabled, actor_id)
         .await;
     let detail = with_session_exception_mark(write_control_audit_detail(&change), unverified_stop);
 

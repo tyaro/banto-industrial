@@ -3210,7 +3210,7 @@ async fn tool_delete_tag(
 // レジストリの内容が変わる mutation 専用の経路）。REST の
 // `crate::rest::collection_start`/`collection_stop`/`write_control_set`と
 // 全く同じ呼び出し（`state.status.controller.start/stop`・
-// `state.write_control.set_enabled`）を行い、
+// `state.write_control.set_enabled_detached`）を行い、
 // 監査の宛先だけが違う（[`audit_config_action`]のdoc comment参照）。
 // 可逆操作なので他の構成ツールと違い confirm は要求しない（設計の
 // confirm 必須は delete 系の不可逆操作限定）。
@@ -3286,13 +3286,15 @@ async fn tool_set_write_control(
         .ok_or_else(|| RpcError::invalid_params("arguments.enabled (boolean) is required"))?;
 
     // `crate::rest::write_control_set`と同じ扱い（#340・#433）: 停止・再開の
-    // 本体は `WriteControl::set_enabled`（DB と状態ファイルの 2 か所に保存。
+    // 本体は `WriteControl::set_enabled_detached`（DB と状態ファイルの 2 か所に保存。
     // `crate::write_control` のモジュール doc 参照）。停止はライブフラグを
     // 必ず即座に落とし、どちらか一方に保存できれば成功（片方の失敗は
     // `persistenceWarning` に出す）。再開は両方に保存できたときだけ有効にする。
+    // REST と同じく別タスクで最後まで走らせる（接続が切れてこの future が
+    // 捨てられても、停止・再開を途中で止めない）。
     let change = state
         .write_control
-        .set_enabled(&state.manager.pool(), enabled, Some(ctx.name.as_str()))
+        .set_enabled_detached(&state.manager.pool(), enabled, Some(ctx.name.as_str()))
         .await;
     let action = if enabled { "enable" } else { "disable" };
     let detail = crate::rest::write_control_audit_detail(&change);
