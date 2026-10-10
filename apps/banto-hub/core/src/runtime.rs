@@ -348,8 +348,6 @@ impl HubRuntime {
         let events = event_channel();
         let users = UsersService::new(Db::Sqlite(pool.clone()));
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
-        let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
-        let auth = user_auth_state(users.clone(), audit.clone());
 
         // PORT/BANTO_BIND/BANTO_HUB_DATA (via `*_override`) override the
         // persisted settings, which in turn fall back to their own defaults
@@ -368,6 +366,44 @@ impl HubRuntime {
         let port: u16 = port_override.unwrap_or(server_config.port);
         let bind = bind_override.unwrap_or(server_config.bind);
         let data_dir = data_dir_override.unwrap_or_else(|| PathBuf::from(store_config.data_dir));
+
+        // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・
+        // 応答しない監査はデータディレクトリの保留ファイルに退避し、`record` は
+        // 3 秒で戻る（`crate::audit_spool` のモジュール doc）。保留の置き場所が
+        // データディレクトリなので、その実効値が決まったここで組む（以前は
+        // `users`/`settings` と並べて組んでいたが、`auth` を含めて上の設定の
+        // 読み取りでは使っていない）。マイグレーション（`init_db`、`0008` の
+        // `pending_id` を含む）は済んでいるので、前回の実行で残った保留を
+        // ここで 1 回流し込み、以後は定期実行に任せる（ハンドルは
+        // `RunningHub::shutdown` で abort する）。
+        let audit = crate::audit_spool::build_audit_service(Db::Sqlite(pool.clone()), &data_dir);
+        match audit.flush_spool().await {
+            Ok(report) => {
+                if report.flushed > 0
+                    || report.remaining > 0
+                    || report.quarantined > 0
+                    || report.error.is_some()
+                {
+                    log_line(&format!(
+                        "banto-hub: 監査の保留: 起動時に {} 件を DB へ流し込みました\
+                         （残り {} 件、読めずに隔離 {} 件{}）",
+                        report.flushed,
+                        report.remaining,
+                        report.quarantined,
+                        report
+                            .error
+                            .as_ref()
+                            .map(|err| format!("、中断: {err}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+            Err(err) => log_err_line(&format!(
+                "banto-hub: [WARN] 監査の保留ディレクトリを読めませんでした: {err}"
+            )),
+        }
+        let audit_spool_handle: Option<JoinHandle<()>> = audit.spawn_spool_flusher();
+        let auth = user_auth_state(users.clone(), audit.clone());
 
         // 試運転モードとロックダウン（docs/tag-server-design.md §5.6・
         // 2026-08-30 オーナー決定）: DB の永続状態からロックダウン済みかを
@@ -700,6 +736,7 @@ impl HubRuntime {
             server,
             eval_handle,
             prune_handle,
+            audit_spool_handle,
             _profile_lock: profile_lock,
         })
     }
@@ -723,6 +760,11 @@ pub struct RunningHub {
     eval_handle: JoinHandle<()>,
     /// tstore 剪定24hループの `JoinHandle`（同上）。
     prune_handle: JoinHandle<()>,
+    /// #437: 監査の保留の定期の流し込み（`AuditLogService::spawn_spool_flusher`、
+    /// `crate::audit_spool`）の `JoinHandle`。保留を開けなかったときは `None`。
+    /// タスクは監査サービス（延いては DB の pool）の複製を持つので、
+    /// [`RunningHub::shutdown`] で abort する。
+    audit_spool_handle: Option<JoinHandle<()>>,
     /// 外部 DB 連携 S2: DB Source のポーリングエンジン
     /// （`crate::hub::CollectorManager` が所有する `Arc` の複製 -
     /// [`RunningHub::shutdown`] が接続タスクを止めるために持つ）。
@@ -765,6 +807,12 @@ impl RunningHub {
         // の読み取り専用消費者だから。
         self.eval_handle.abort();
         self.prune_handle.abort();
+        // #437: 監査の保留の定期の流し込みも、上の 2 本と同じく止める。流し込みの
+        // 途中で止めても、ファイルは行が入ってから消すので失われない（次の起動で
+        // 同じ `pending_id` で流し直し、`ON CONFLICT` で 1 行になる）。
+        if let Some(handle) = &self.audit_spool_handle {
+            handle.abort();
+        }
         // 外部 DB 連携 S2: DB Source の接続タスクは `ServerTagStore` への
         // 書き手なので、`manager.shutdown()` より前で止める（このモジュール
         // doc の「シャットダウン順序」節「DB Source の位置」参照）。

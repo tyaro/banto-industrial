@@ -29,6 +29,7 @@ use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
+use banto_hub_core::audit_spool;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
@@ -175,6 +176,10 @@ struct TestApp {
     sessions: Arc<HubSessions>,
     /// #433: `write_control` の状態ファイル（`env.data_dir()` の中）。
     state_file: std::path::PathBuf,
+    /// #437: the audit service the router uses (with the spool).
+    audit: AuditLogService,
+    /// #437: the data dir (the spool lives in it).
+    data_dir: std::path::PathBuf,
     _env: TempEnv,
 }
 
@@ -191,7 +196,10 @@ async fn test_app(label: &str) -> TestApp {
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
     let users = UsersService::new(Db::Sqlite(pool.clone()));
-    let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
+    // #437: built exactly the way `crate::runtime` builds it (the spool in
+    // the data dir, `banto_hub_core::audit_spool`), so the tests below
+    // exercise the production wiring.
+    let audit = audit_spool::build_audit_service(Db::Sqlite(pool.clone()), &env.data_dir());
     users
         .setup_first_user("admin", "password123", "管理者")
         .await
@@ -281,7 +289,7 @@ async fn test_app(label: &str) -> TestApp {
 
     let router = api_router(
         users,
-        audit,
+        audit.clone(),
         PlcConnectionService::new(pool.clone()),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
@@ -307,6 +315,8 @@ async fn test_app(label: &str) -> TestApp {
         write_control,
         sessions,
         state_file,
+        audit,
+        data_dir: env.data_dir(),
         _env: env,
     }
 }
@@ -2152,4 +2162,188 @@ async fn a_revoked_session_cannot_stop_writes() {
         app.write_control.is_enabled(),
         "a revoked session stops nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #437: DB 全体が応答しない・使えないあいだの緊急停止の監査（banto v6.5.0 の
+// 監査の保留、`banto_hub_core::audit_spool`）
+
+/// The spool files waiting in `data_dir` (`<pending_id>.json`; the
+/// `quarantine/` directory and `.json.tmp` files are not entries).
+fn spooled_files(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let dir = audit_spool::spool_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "json"))
+        .collect()
+}
+
+async fn count_stop_rows(pool: &SqlitePool, table: &str) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {table} WHERE action = 'disable' AND resource = 'write_control'"
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn rename_table(pool: &SqlitePool, from: &str, to: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {from} RENAME TO {to}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|err| panic!("rename {from} -> {to}: {err}"));
+}
+
+/// #437 完了条件 1（失敗型）: `audit_log`・`users`・`write_control_state` が
+/// 使えないあいだ（DB 全体の障害）も、それまで有効だったセッションの緊急停止は
+/// 200 で、監査は保留ファイルに 1 件退避される（`audit_log` にはまだ無い）。
+/// 状態 API は保留の件数を出す。表が戻って流し込むと、#431 の印
+/// （`sessionCheck = unverified_stop_exception`）と `spooled = true` の付いた
+/// 停止の行が**ちょうど 1 件**入り、流し込み直し・再起動（同じデータ
+/// ディレクトリでサービスを組み直す）でも増えない。
+///
+/// 反証（PR 本文）: `audit_spool::build_audit_service` の `with_spool` を外すと、
+/// 復旧後の「ちょうど 1 件」で落ちる（監査は標準エラー出力に出るだけで失われる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stop_audit_written_while_the_db_is_down_lands_exactly_once_after_recovery() {
+    let app = test_app("audit-spool-db-down").await;
+    app.write_control.enable();
+    // The status API is read with an API key: the session check needs
+    // `users`, which is about to go away (`api_keys` stays).
+    let (reader, _) = issue_key(&app.router, &app.admin_token, "status-reader", &["read"]).await;
+    assert!(spooled_files(&app.data_dir).is_empty());
+
+    rename_table(&app.pool, "audit_log", "audit_log_away").await;
+    rename_table(&app.pool, "users", "users_away").await;
+    rename_table(&app.pool, "write_control_state", "write_control_state_away").await;
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(!app.write_control.is_enabled(), "writes are stopped");
+
+    assert_eq!(
+        count_stop_rows(&app.pool, "audit_log_away").await,
+        0,
+        "the audit could not reach the table"
+    );
+    assert_eq!(spooled_files(&app.data_dir).len(), 1, "spooled once");
+
+    let (status, json) = get_json(&app.router, "/api/v1/status", &reader).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["audit_pending_count"], 1, "{json}");
+    assert!(json["audit_pending_oldest_ts"].is_string(), "{json}");
+    assert_eq!(json["audit_dropped_count"], 0, "{json}");
+    assert_eq!(json["audit_failed_count"], 0, "{json}");
+
+    rename_table(&app.pool, "audit_log_away", "audit_log").await;
+    rename_table(&app.pool, "users_away", "users").await;
+    rename_table(&app.pool, "write_control_state_away", "write_control_state").await;
+
+    let report = app.audit.flush_spool().await.expect("flush");
+    assert_eq!(report.flushed, 1, "{report:?}");
+    assert_eq!(report.remaining, 0, "{report:?}");
+    assert!(spooled_files(&app.data_dir).is_empty());
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT result, detail FROM audit_log \
+         WHERE action = 'disable' AND resource = 'write_control'",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one stop row after recovery: {rows:?}"
+    );
+    let detail: Value = serde_json::from_str(&rows[0].1).unwrap();
+    assert_eq!(rows[0].0, "ok");
+    assert_eq!(
+        detail["sessionCheck"], "unverified_stop_exception",
+        "{detail}"
+    );
+    assert_eq!(detail["spooled"], true, "{detail}");
+    assert_eq!(detail["enabled"], false, "{detail}");
+
+    let (status, json) = get_json(&app.router, "/api/v1/status", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["audit_pending_count"], 0, "{json}");
+    assert_eq!(json["audit_pending_oldest_ts"], Value::Null, "{json}");
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/status")
+                .header("Authorization", format!("Bearer {}", app.admin_token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["auditPendingCount"], 0, "{json}");
+    assert_eq!(json["auditDroppedCount"], 0, "{json}");
+
+    // Flushing again, and a "restart" (a new service on the same data dir,
+    // the way `HubRuntime::start` flushes at startup), add nothing.
+    let report = app.audit.flush_spool().await.expect("flush again");
+    assert_eq!(report.flushed, 0, "{report:?}");
+    let restarted = audit_spool::build_audit_service(Db::Sqlite(app.pool.clone()), &app.data_dir);
+    let report = restarted
+        .flush_spool()
+        .await
+        .expect("flush after a restart");
+    assert_eq!(report.flushed, 0, "{report:?}");
+    assert_eq!(count_stop_rows(&app.pool, "audit_log").await, 1);
+}
+
+/// #437 完了条件 2（応答なし型）: pool の接続をすべて握って DB を固める
+/// （読み取りも書き込みも接続を待つ）。緊急停止は、セッションの照合（5 秒）+
+/// 停止の DB 保存（5 秒）+ 監査（3 秒、保留）の上限内で 200 を返す。
+/// 接続を離すと、打ち切った監査の INSERT が遅れて完了し得るが、流し込みと
+/// 合わせて停止の行は**ちょうど 1 件**。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stop_answers_within_the_bound_while_the_db_hangs_and_audits_once() {
+    let app = test_app("audit-spool-db-hang").await;
+    app.write_control.enable();
+
+    let max = app.pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..max {
+        held.push(app.pool.acquire().await.expect("hold a connection"));
+    }
+
+    let started = std::time::Instant::now();
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(!app.write_control.is_enabled(), "writes are stopped");
+    assert!(
+        elapsed < Duration::from_secs(16),
+        "the stop must answer within ~5 + 5 + 3 s, took {elapsed:?}"
+    );
+    assert_eq!(app.audit.spool_backlog().count, 1);
+    assert_eq!(spooled_files(&app.data_dir).len(), 1);
+
+    drop(held);
+
+    let report = app.audit.flush_spool().await.expect("flush");
+    assert_eq!(report.remaining, 0, "{report:?}");
+    assert!(spooled_files(&app.data_dir).is_empty());
+    // The timed-out INSERT may complete just after the flush; give it the
+    // chance to (it then hits `ON CONFLICT (pending_id) DO NOTHING`).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count_stop_rows(&app.pool, "audit_log").await, 1);
 }

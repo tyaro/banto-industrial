@@ -6713,6 +6713,11 @@ pub(crate) struct TagSpaceState {
     /// `manager.computed_engine()` と**同じ** `Arc`（他の共有フィールドと
     /// 同じ規律）。
     pub(crate) computed: Arc<ComputedEngine>,
+    /// #437: `GET /api/v1/status`・`GET /api/status` の `audit_pending_*` 等
+    /// （監査の保留の状態、[`AuditLogService::spool_backlog`]）のため。他の
+    /// ルーターへ渡すものと**同じ**サービスの複製（保留の件数はサービスが
+    /// 持つ `Arc` の中にあるので、複製どうしで共有される）。
+    pub(crate) audit: AuditLogService,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7475,6 +7480,17 @@ pub(crate) struct StatusResponse {
     /// 食い違っていた、直近の停止・再開を片方に保存できなかった等。
     /// `crate::write_control::WriteControl::persistence_warning`）。無ければ `null`。
     write_persistence_warning: Option<String>,
+    /// #437: DB に書けず保留ファイルに退避している監査の件数（このプロセスが
+    /// 見ている分、`banto_admin_services::audit::SpoolBacklog::count`）。DB が
+    /// 戻れば流し込まれて 0 に戻る。保留を使っていない構成では常に 0。
+    audit_pending_count: u64,
+    /// #437: 保留中で最も古い監査の時刻（`audit_log.ts` と同じ書式、UTC）。
+    /// 保留が無ければ `null`。
+    audit_pending_oldest_ts: Option<String>,
+    /// #437: 保留が上限（10,000 件）に達して捨てた監査の件数（起動から）。
+    audit_dropped_count: u64,
+    /// #437: 保留ファイルの書き込みにも失敗して失った監査の件数（起動から）。
+    audit_failed_count: u64,
     /// T3（設計 §5.3）: MQTT publish の設定/接続状態。
     mqtt: MqttStatusEntry,
     /// T4（設計 §5.4）: gRPC サーバーの設定。
@@ -7616,6 +7632,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
             }
         })
         .collect();
+    let audit_backlog = state.audit.spool_backlog();
 
     Ok(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -7631,6 +7648,10 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
         write_persistence_warning: state.write_control.persistence_warning(),
+        audit_pending_count: audit_backlog.count,
+        audit_pending_oldest_ts: audit_backlog.oldest_ts,
+        audit_dropped_count: audit_backlog.dropped,
+        audit_failed_count: audit_backlog.failed,
         mqtt: MqttStatusEntry {
             enabled: mqtt_settings.enabled,
             connected: state.mqtt.connected(),
@@ -7874,6 +7895,10 @@ struct AdminStatusResponse {
     write_enabled: bool,
     write_was_enabled_before_restart: bool,
     write_persistence_warning: Option<String>,
+    audit_pending_count: u64,
+    audit_pending_oldest_ts: Option<String>,
+    audit_dropped_count: u64,
+    audit_failed_count: u64,
     mqtt: MqttStatusEntry,
     grpc: GrpcStatusEntry,
     last_apply: Option<AdminLastApplyEntry>,
@@ -7952,6 +7977,10 @@ impl From<StatusResponse> for AdminStatusResponse {
             write_enabled: status.write_enabled,
             write_was_enabled_before_restart: status.write_was_enabled_before_restart,
             write_persistence_warning: status.write_persistence_warning,
+            audit_pending_count: status.audit_pending_count,
+            audit_pending_oldest_ts: status.audit_pending_oldest_ts,
+            audit_dropped_count: status.audit_dropped_count,
+            audit_failed_count: status.audit_failed_count,
             mqtt: status.mqtt,
             grpc: status.grpc,
             last_apply: status.last_apply.map(Into::into),
@@ -8147,6 +8176,7 @@ fn admin_status_router(
     system_info: Arc<SystemInfoSampler>,
     sink_status: Arc<SinkStatusStore>,
     auth: AuthState,
+    audit: AuditLogService,
 ) -> Router {
     let computed = manager.computed_engine();
     let state = TagSpaceState {
@@ -8157,6 +8187,7 @@ fn admin_status_router(
         system_info,
         sink_status,
         computed,
+        audit,
     };
     Router::new()
         .route("/api/status", get(admin_status))
@@ -8239,6 +8270,7 @@ fn admin_tag_stream_router(
     system_info: Arc<SystemInfoSampler>,
     sink_status: Arc<SinkStatusStore>,
     auth: AuthState,
+    audit: AuditLogService,
 ) -> Router {
     let computed = manager.computed_engine();
     let state = TagSpaceState {
@@ -8249,6 +8281,7 @@ fn admin_tag_stream_router(
         system_info,
         sink_status,
         computed,
+        audit,
     };
     Router::new()
         .route(ADMIN_TAG_STREAM_PATH, get(crate::stream::ws_upgrade))
@@ -9011,6 +9044,7 @@ fn tag_space_router(
         system_info,
         sink_status,
         computed: manager.computed_engine(),
+        audit: audit.clone(),
     };
     let auth_state = TagSpaceAuthState {
         auth: auth.clone(),
@@ -9443,6 +9477,7 @@ fn api_router_with_controller_mode(
             system_info.clone(),
             sink_status.clone(),
             auth.clone(),
+            audit.clone(),
         ))
         .layer(middleware::from_fn(require_banto_client_header));
 
@@ -9460,6 +9495,7 @@ fn api_router_with_controller_mode(
             system_info.clone(),
             sink_status.clone(),
             auth.clone(),
+            audit.clone(),
         ))
         // T19 S5（docs/banto-hub-t19-design.md §3.7、UX-41）: `POST /mcp` -
         // `tag_space_router`と同じ形で、CSRF レイヤー（`admin`）の外側に

@@ -168,6 +168,15 @@ export interface StatusResponse {
 	/** #433: 書き込み受付の保存状態の注意書き（起動時に DB と状態ファイルが
 	 * 食い違っていた、直近の停止・再開を片方に保存できなかった等）。無ければ `null`。 */
 	write_persistence_warning: string | null;
+	/** #437: DB に書けずデータディレクトリに保留している監査の件数（DB が戻ると
+	 * 自動で流し込まれて 0 に戻る）。 */
+	audit_pending_count: number;
+	/** #437: 保留中で最も古い監査の時刻（`audit_log.ts` と同じ UTC の文字列）。無ければ `null`。 */
+	audit_pending_oldest_ts: string | null;
+	/** #437: 保留の上限（10,000 件）を超えて捨てた監査の件数（サーバーの起動から）。 */
+	audit_dropped_count: number;
+	/** #437: 保留ファイルにも書けずに失った監査の件数（サーバーの起動から）。 */
+	audit_failed_count: number;
 	/** T3（設計 §5.3）: MQTT publish の設定/接続状態。 */
 	mqtt: MqttStatusEntry;
 	/** T4（設計 §5.4）: gRPC サーバーの設定。 */
@@ -252,6 +261,10 @@ interface RawStatusResponse {
 	writeEnabled: boolean;
 	writeWasEnabledBeforeRestart: boolean;
 	writePersistenceWarning?: string | null;
+	auditPendingCount?: number;
+	auditPendingOldestTs?: string | null;
+	auditDroppedCount?: number;
+	auditFailedCount?: number;
 	mqtt: MqttStatusEntry;
 	grpc: GrpcStatusEntry;
 	collectionState: string;
@@ -281,6 +294,10 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 		write_enabled: raw.writeEnabled,
 		write_was_enabled_before_restart: raw.writeWasEnabledBeforeRestart,
 		write_persistence_warning: raw.writePersistenceWarning ?? null,
+		audit_pending_count: raw.auditPendingCount ?? 0,
+		audit_pending_oldest_ts: raw.auditPendingOldestTs ?? null,
+		audit_dropped_count: raw.auditDroppedCount ?? 0,
+		audit_failed_count: raw.auditFailedCount ?? 0,
 		mqtt: raw.mqtt,
 		grpc: raw.grpc,
 		collection_state: raw.collectionState,
