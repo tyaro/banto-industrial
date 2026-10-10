@@ -30,12 +30,14 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 同日: §5 に、しきい値は使う側（記録計・SCADA）の設定であり Hub は持たない・判定しないオーナー決定（#532・#533）を追記し、AI 対話の項の「しきい値を含む」を記録計の側の設定に直した。
 同日: §5 の同項に、#532（ChronoGazer の記録計の側のタグごとの設定への移行）を実装したことを追記（#533 は未着手）。
 2026-10-09: §5 の同項に、#533（Hub と `banto-tags` からしきい値を外す）を実装したことを追記。
+2026-10-10: §5 に #383 段階3（Hub を接続種別として扱い、外部ソース接続タスクを `banto-collect` に足す）と
+#392（収集エンジンを UI から独立させる段階移行）のオーナー決定（H1〜H11）を追記し、§4 のドライバ段落を更新（決定のみ、未実装）。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
-地図は [README.md](README.md)**（2026-10-05 更新。本文の T 系表は 2026-08-08 時点の
+地図は [README.md](README.md)**（2026-10-10 更新。本文の T 系表は 2026-08-08 時点の
 まま — 実装状況の正は banto-hub-remaining-plan.md/banto-hub-desktop-plan.md）
 最終検証日(コード照合): 2026-09-01
 
@@ -118,6 +120,8 @@ PLC通信 + タグデータ保存 + リアルタイム/ヒストリカル/ハイ
 `status()` では張り直さない。トレンド表示・保存は段階3）。banto-hub 側も今後接続ドライバが増えていく
 想定なので前2者は Hub と機能が被るが、**現場 PC 1 台だけでも ChronoGazer が成立すること**を
 優先し、この重複は許容する。段階（Hub 経由 → 直結 → 合流）と設計の論点は #383。
+**段階1（Hub 購読）・段階2（SLMP / Modbus TCP 直結 = R1-B/R1-C）は実装済み。段階3（Hub 経由タグの合流・
+保存・表示）の方針は 2026-10-10 に決定済み（§5、未実装）**。
 
 **スコープの護り（SCADA化の誘惑対策、v1 で入れない線）**:
 PLC への書き込み / 汎用画面エディタ（表示は固定グループパターンのみ）/
@@ -446,6 +450,41 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     banto-tags の migration 0018 で `tags` のしきい値の列を落とし、Hub の画面・REST・MCP・CSV・
     設定パッケージから外した。値付きのしきい値は検証エラーで断る。Hub の収集は判定しない）。要件は [recorder-requirements.md](recorder-requirements.md)
     §3.1・§3.2・§3.5・§3.7 に反映済み。
+- **#383 段階3（Hub 経由タグの合流・保存・表示）と #392（収集エンジンの UI 独立）（2026-10-10 オーナー決定「おすすめで」、決定のみ・未実装）**:
+  - **#383 段階3**:
+    - **H1 Hub は接続種別として表す**: `plc_connections.protocol` に `hub` を足し、Hub 由来のタグは
+      `tags` の行にする（ペン・しきい値 `recorder_tag_settings`・履歴・除外が同じタグ ID で動く）。
+      Hub は 1 つ。接続先とキーは `hub.record` のまま。
+    - **H2 収集経路は `banto-collect` に「外部ソース」接続タスクを足す**: 日次の tstore ファイル・
+      単一ライター・イベント・品質・stale を共有する。ChronoGazer 内に別の recorder を持って読み出し時に
+      合流する案は、履歴・保持・イベントが二重になるため**却下**（#383 本文の初期の推奨は後者寄りだったが、
+      本決定で置き換える）。
+    - **H3 タグ定義は登録時に Hub のカタログから複製**（名前・データ型・単位）。同一性は外部名
+      （scada-design.md §9.6、2026-09-30）。収集開始時にカタログと突き合わせ、消えた・型が変わったタグは
+      外す（#414 と同じ）。
+    - **H4 品質と記録**: Hub が Live でない間は全タグ `bad` で `null` を記録する。イベントは
+      `plc_connected` / `plc_disconnected` を Hub の接続キーで再利用（新しい `EventKind` は足さない）。
+      Hub の `stale` は Stale、`bad`・不明は Bad（good に丸めない）。Hub の `value_source = simulation`
+      の値は記録しない（#413）。記録時刻はこの PC の時計（R0 §4）で、Hub の `t` は鮮度の判定にだけ使う。
+    - **H5 Hub 経由の書き込みはしない**（R0 §7）。
+    - 手順: P2（`banto-tags` に `hub` protocol）→ P3（`banto-collect` の Hub サンプラー）→ P4（タグを
+      「Hub から」登録）→ P5（監視・履歴・しきい値の結合）→ P6 実機確認（Hub 経由の SLMP と直結 SLMP を別ポートで
+      比較）。
+  - **#392 収集エンジンの UI 独立**:
+    - **H6 scada-design.md §13.2 の 3 host モデルへ段階的に移る**: まず A（単一インスタンス・プロファイル排他 +
+      トレイ常駐。ウィンドウを閉じても収集を止めない）、次に B（`banto-serve` から本番用の headless host、
+      シェル起動の決定は banto-hub の T16-2 と同様、Windows サービス + インストーラ）で R0 §4 を満たす。
+    - **H7 UI とエンジンは localhost REST で話す**（banto-hub と同じ。新しい IPC は作らない）。
+    - **H8 サービス運用ではデスクトップの自動ログインを loopback grant に置き換える**（banto-hub の
+      試運転 grant と同じ型）。
+    - **H9 データの置き場所は `%APPDATA%` から ProgramData へ移す**。既存データを移行するか捨ててよいかは
+      **未決**（サービス化の手順に入る前にオーナーが決める）。
+    - **H10 サービスは Hub の API キーを machine スコープの DPAPI でファイルに保存する**。
+    - **H11 更新は「インストーラがサービスを停止 → 置換 → 開始」**（banto-hub の手順を流用）。
+    - 手順: A1（プロファイルロックの共有 crate。デスクトップと `banto-serve` の両方）→ A2（トレイ）→
+      B1（headless host + KeyStore）→ B2（シェル決定）→ B3（サービス + インストーラ + 実機 24h/72h）。
+  - **順序**: #383 段階3 を先に進め、#392 の A1 は並行。B1 は P3 の後。
+  - 要件側は [recorder-requirements.md](recorder-requirements.md) §3.1・§4 に反映済み。
 
 ## 6. 全体の依存関係
 
