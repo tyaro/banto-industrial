@@ -822,6 +822,9 @@ pub fn bind_error_allows_port_fallback(kind: std::io::ErrorKind) -> bool {
 /// 取り直す（#479）。**空きを事前に探す処理ではない**: 本番の bind が既に失敗した
 /// 後の分類だけに使い、成功した場合はすぐ閉じて `None`（= 退避しない。すでに
 /// 空いたなら元のエラーをそのまま報告して、起動し直しは呼び出し側に任せる）。
+///
+/// banto 側が `io::ErrorKind` を返す API、または bind 済みの listener を受け取る API を
+/// 持てば、この再 bind は不要になる（上流への課題）。
 async fn classify_bind_failure(bind: &str, port: u16) -> Option<std::io::ErrorKind> {
     match tokio::net::TcpListener::bind(format!("{bind}:{port}")).await {
         Ok(_listener) => None,
