@@ -28,6 +28,8 @@
 		penLegendLabel,
 		thresholdBands,
 		trendDescription,
+		trendSeriesId,
+		trendTooltipFormatter,
 		trendTimeLabel,
 		trendWindowLabel,
 		trendIncludeY,
@@ -71,7 +73,7 @@
 
 	const series = $derived(
 		pens.map((pen, i) => ({
-			id: `pen-${i}`,
+			id: trendSeriesId(i),
 			label: penLegendLabel(pen),
 			y: (row: TrendRow) => row.values[i]
 		}))
@@ -87,6 +89,8 @@
 
 	// 縦軸・ツールチップの書式（全ペンが bit なら False / True。判断は trendYFormatter）。
 	const formatY = $derived(trendYFormatter(pens));
+	// ツールチップは縦軸と別の書式（ペンごと。bit は True / False、区間の中点は False / True）。
+	const formatTooltip = $derived(trendTooltipFormatter(pens));
 	// 全ペンが bit なら縦軸に 0 と 1 を必ず含める（中点 0.5 だけでも False / True が出る）。
 	const includeY = $derived(trendIncludeY(pens));
 	function formatX(v: unknown): string {
@@ -153,6 +157,7 @@
 			gaps="break"
 			{bands}
 			{formatY}
+			{formatTooltip}
 			{includeY}
 			{formatX}
 			messages={{ emptyState: () => '表示できる値はまだありません' }}

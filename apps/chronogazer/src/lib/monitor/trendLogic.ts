@@ -74,7 +74,7 @@
  * 危険、下側は LL..L が注意、-∞..LL が危険（[`thresholdBands`]）。設定の無いペンは
  * 帯を出さない。既定で選ぶのは、しきい値のある最初のペン。
  */
-import type { OpenThresholdBand } from '@banto/charts';
+import type { FormatTooltip, OpenThresholdBand } from '@banto/charts';
 import {
 	HISTORY_MAX_BINS,
 	HISTORY_MAX_POINTS,
@@ -548,8 +548,11 @@ export function trendPenInfos(
  *   書式を使う）。
  * - **bit とほかのタグが混ざるとき**、またはペンが無いとき: 全部数値のまま（縦軸は全ペン
  *   共通の 1 本なので、0 / 1 だけ False / True にすると他のタグの 0 と 1 まで
- *   True / False と読めてしまう）。この場合のツールチップの bit の値は 0 / 1。
- *   True / False は凡例の説明文（`trendDescription`）と、デジタル・バー・計器で確かめられる。
+ *   True / False と読めてしまう）。
+ *
+ * ツールチップは縦軸と別の書式（`trendTooltipFormatter`、2026-10-10、tyaro/banto#376）なので、
+ * 上の「中点の文字が `''`」「混在時の bit が 0 / 1」はツールチップには当たらない
+ * （縦軸だけの制約）。
  */
 export function isAllBitTrend(pens: readonly Pick<TrendPenInfo, 'isBit'>[]): boolean {
 	return pens.length > 0 && pens.every((pen) => pen.isBit);
@@ -563,6 +566,42 @@ export function trendYFormatter(
 	}
 	const maxDecimals = Math.max(0, ...pens.map((pen) => pen.decimals ?? 0));
 	return (n) => n.toLocaleString(undefined, { maximumFractionDigits: maxDecimals });
+}
+
+/** `LineChart` の系列 ID（`TrendPanel` の系列とツールチップの書式が同じ鍵を使う）。 */
+export function trendSeriesId(index: number): string {
+	return `pen-${index}`;
+}
+
+/**
+ * bit のペンのツールチップで、履歴の区間の中点（0 でも 1 でもない値）に出す文字。
+ * 履歴の点は区間の最小と最大の中点（`historyPointValue`）なので、0.5 は「その区間に
+ * False も True も現れた」ことを表す。`BIT_FALSE_LABEL` / `BIT_TRUE_LABEL` を並べるので
+ * 文言は `formatBitValue` と揃う。
+ */
+export const BIT_BOTH_LABEL = `${formatBitValue(0)} / ${formatBitValue(1)}`;
+
+/**
+ * ツールチップの値の書式（純関数、tyaro/banto#376、banto v6.5.0 の `formatTooltip`）。
+ * 縦軸の書式（`trendYFormatter`）とは別に、系列（ペン）ごとに決める。
+ *
+ * - bit のペン: 0 → False、1 → True、それ以外の有限値（履歴の区間の中点）→
+ *   `BIT_BOTH_LABEL`（`False / True`）。混在グループでも、全ペン bit で縦軸が 0 / 1 以外の
+ *   文字を出さなくても、ツールチップは必ず文字が出る。
+ * - 数値のペン、系列 ID が分からないとき: 縦軸の書式と同じ（出力は変えない。単位は凡例に
+ *   あるのでツールチップには足さない、Q7）。
+ *
+ * `index`（データの位置）は使わない。
+ */
+export function trendTooltipFormatter(
+	pens: readonly Pick<TrendPenInfo, 'isBit' | 'decimals'>[]
+): FormatTooltip {
+	const axis = trendYFormatter(pens);
+	return (value, series) => {
+		const pen = pens.find((_, i) => trendSeriesId(i) === series.id);
+		if (pen === undefined || !pen.isBit) return axis(value);
+		return value === 0 || value === 1 ? formatBitValue(value) : BIT_BOTH_LABEL;
+	};
 }
 
 /**

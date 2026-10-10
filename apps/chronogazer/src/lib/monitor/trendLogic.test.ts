@@ -43,6 +43,9 @@ import {
 	trendNotices,
 	trendPenInfos,
 	trendYFormatter,
+	trendTooltipFormatter,
+	trendSeriesId,
+	BIT_BOTH_LABEL,
 	trendIncludeY,
 	isAllBitTrend,
 	trendWindowLabel,
@@ -634,6 +637,48 @@ describe('パネルの表示（trendPenInfos / 説明文 / 注記）', () => {
 			'次のタグは登録が見つからないため履歴がありません: タグ ID 9',
 			`${SIMULATION_NOTE}（温度、圧力）。`
 		]);
+	});
+});
+
+describe('ツールチップの書式（ペンごと、tyaro/banto#376）', () => {
+	const bit = { isBit: true, decimals: 0 };
+	const num = { isBit: false, decimals: 1 };
+	const info = (id: string) => ({ id, label: id, axis: 'left' as const });
+
+	it('混在: bit のペンは 0 / 1 を False / True、数値のペンは縦軸と同じ', () => {
+		const pens = [bit, num];
+		const tip = trendTooltipFormatter(pens);
+		const fy = trendYFormatter(pens);
+		expect(tip(0, info(trendSeriesId(0)), 0)).toBe('False');
+		expect(tip(1, info(trendSeriesId(0)), 0)).toBe('True');
+		// 数値のペンの 0 / 1 は数値のまま（縦軸と同じ）。
+		expect(tip(1, info(trendSeriesId(1)), 0)).toBe('1');
+		expect(tip(12.34, info(trendSeriesId(1)), 0)).toBe(fy(12.34));
+		expect(tip(12.34, info(trendSeriesId(1)), 0)).toBe('12.3');
+	});
+
+	it('全 bit: 履歴の区間の中点（0 でも 1 でもない値）は False / True', () => {
+		const tip = trendTooltipFormatter([bit, bit]);
+		expect(BIT_BOTH_LABEL).toBe('False / True');
+		expect(tip(historyPointValue({ min: 0, max: 1 })!, info(trendSeriesId(1)), 3)).toBe(
+			'False / True'
+		);
+		// 縦軸は 0.5 の文字を出さない（変えていない）が、ツールチップは出る。
+		expect(trendYFormatter([bit, bit])(0.5)).toBe('');
+		expect(tip(0, info(trendSeriesId(0)), 0)).toBe('False');
+		expect(tip(1, info(trendSeriesId(0)), 0)).toBe('True');
+	});
+
+	it('系列 ID が分からないときは縦軸の書式、index は結果に影響しない', () => {
+		const pens = [bit, num];
+		const tip = trendTooltipFormatter(pens);
+		const fy = trendYFormatter(pens);
+		expect(tip(1, info('pen-9'), 0)).toBe(fy(1));
+		expect(tip(0.5, info('other'), 0)).toBe(fy(0.5));
+		expect(tip(0.5, info(trendSeriesId(0)), 0)).toBe(tip(0.5, info(trendSeriesId(0)), 99));
+		expect(tip(5, info(trendSeriesId(1)), 0)).toBe(tip(5, info(trendSeriesId(1)), 99));
+		// ペンが無いときも落ちない。
+		expect(trendTooltipFormatter([])(2, info('pen-0'), 0)).toBe('2');
 	});
 });
 
