@@ -295,6 +295,7 @@ pub(crate) fn mcp_router(
         mqtt,
         system_info,
         sink_status,
+        audit: audit.clone(),
     };
     // T21 S1-b: REST の `tag_registry_router`と同じ生成方法
     // （`PlcConnectionService::new(manager.pool())`等）- `SqlitePool`は

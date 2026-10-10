@@ -28,7 +28,9 @@
 //!   ChronoGazer の `server.enabled` トグルは持たない
 //! - [`users`] / [`audit`]: ローカルアカウント（RBAC: admin/editor/viewer）と
 //!   監査ログ。I3'（2026-10-04）から banto の `banto-admin-services` のものを
-//!   そのまま使う（下の re-export）
+//!   そのまま使う（下の re-export）。[`audit_spool`]: DB に書けない監査を
+//!   データディレクトリの保留ファイルに退避し、復旧後に流し込む配線（#437、
+//!   banto ADR-0019）
 //! - [`assets`]: 管理 UI 静的ファイルの埋め込み枠（`embed-ui` feature）。
 //!   T0 では中身（フロントエンド）は作らない — 枠だけ用意する
 //! - [`computed`]: T6-2（設計 §4.2/§4.3(a)）。演算タグ・内部タグの評価
@@ -169,6 +171,7 @@
 
 pub mod api_keys;
 pub mod assets;
+pub mod audit_spool;
 pub mod broker_glue;
 pub mod commissioning;
 pub mod computed;

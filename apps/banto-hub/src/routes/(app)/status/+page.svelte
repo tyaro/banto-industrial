@@ -75,6 +75,7 @@
 	import { formatBytes, formatPercent } from '#lib/banto/systemInfoFormat.js';
 	import { listPlcConnections, isVirtualConnection } from '#lib/banto/tagRegistryAdmin.js';
 	import { enableWriteControl, disableWriteControl } from '#lib/banto/writeControlAdmin.js';
+	import { auditSpoolWarning } from '#lib/banto/auditSpoolWarning.js';
 	import {
 		startCollection,
 		startAllSimulationCollection,
@@ -1015,6 +1016,12 @@
 				{#if status.write_persistence_warning}
 					<dt>保存状態の注意</dt>
 					<dd class="warn" role="alert">{status.write_persistence_warning}</dd>
+				{/if}
+				{#if auditSpoolWarning(status)}
+					<dt>監査の保留</dt>
+					<dd class="warn" role="alert" data-testid="audit-spool-warning">
+						{auditSpoolWarning(status)}
+					</dd>
 				{/if}
 			</dl>
 			<div class="write-control-actions">
