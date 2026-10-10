@@ -402,7 +402,11 @@ impl HubRuntime {
                 "banto-hub: [WARN] 監査の保留ディレクトリを読めませんでした: {err}"
             )),
         }
-        let audit_spool_handle: Option<JoinHandle<()>> = audit.spawn_spool_flusher();
+        // 定期の流し込み（`spawn_spool_flusher`）は、ここでは起こさない。以降にも
+        // 失敗しうる起動手順（試運転モードの読み込み・bind 検査・サーバー起動）が
+        // あり、そこで失敗して戻ると `JoinHandle` が捨てられて「止まらないまま
+        // 残る」ため（デスクトップのトレイ再試行で起動のたびに積み上がる。#557 の
+        // レビュー指摘）。最後に失敗しうる手順（サーバー起動）の後で起こす。
         let auth = user_auth_state(users.clone(), audit.clone());
 
         // 試運転モードとロックダウン（docs/tag-server-design.md §5.6・
@@ -666,6 +670,7 @@ impl HubRuntime {
         // 足すだけで、ルーティング・認証・本文には触らない）。loopback の
         // 接続元にだけ CSP の `connect-src` に Tauri IPC を足す
         // （[`hub_security_headers`]、#505）。
+        let audit_for_spool = audit.clone();
         let app = with_hub_security_headers(
             api_router_with_controller(
                 users,
@@ -690,9 +695,23 @@ impl HubRuntime {
             .merge(static_router::<FrontendAssets>()),
         );
 
-        let server = start(ServerConfig { bind, port }, app)
-            .await
-            .map_err(HubStartError::ServerStart)?;
+        let server = match start(ServerConfig { bind, port }, app).await {
+            Ok(server) => server,
+            Err(err) => {
+                // ここまでに起こした背景タスクを残さない（`JoinHandle` を捨てても
+                // タスクは止まらない。#557 のレビュー指摘）。
+                eval_handle.abort();
+                prune_handle.abort();
+                mqtt.shutdown().await;
+                grpc_server.shutdown().await;
+                return Err(HubStartError::ServerStart(err));
+            }
+        };
+
+        // 背景タスクの順序の約束（#557 のレビュー指摘）: 起動手順のうち失敗しうる
+        // ものがすべて済んでから起こす。先に起こしたものは、失敗する経路で
+        // abort する（上のサーバー起動の失敗側）。
+        let audit_spool_handle: Option<JoinHandle<()>> = audit_for_spool.spawn_spool_flusher();
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
