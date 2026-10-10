@@ -5,6 +5,8 @@
 //! services back the embedded REST server in M6.
 
 pub mod assets;
+// #437: 監査の保留（banto ADR-0019）の配線。`banto-serve` と Tauri の両方が通る。
+pub mod audit_spool;
 // #383 段階2b / R1-C（C-1）: 収集ランタイムのサービス層。`tauri` にも `axum`
 // にも依存しない（この crate の規律 - 上の doc 参照）ので、`src-tauri` と
 // `banto-serve` の両方から同じ形で使える。
