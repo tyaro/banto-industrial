@@ -3741,6 +3741,91 @@ async fn set_write_control_enable_and_disable_persist_and_audit() {
     );
 }
 
+/// 2026-10-10 監査: `set_write_control` の停止の途中（ライブフラグを落とし、
+/// DB の保存を待っている間）で接続が切れても、停止は最後まで行われ、監査の
+/// 行（`origin: "mcp"`、actor は API キー名）は**ちょうど 1 件**残る（監査は
+/// 停止と同じ別タスクの中で書く）。DB の書き込みロックを別の接続で握って
+/// 停止の DB 保存を待たせる（API キーの `last_used_at` の更新は 60 秒に
+/// 1 回なので、先に 1 回呼んでおけば認証は書き込まない）。
+///
+/// 反証（コミットメッセージ）: 監査を `follow_up` からツール（`await` の後）
+/// に戻すと、監査の行が 0 件のままで落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_write_control_stop_is_audited_once_even_if_the_client_disconnects() {
+    let app = test_app("runtime-write-control-disconnect").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(app.write_control.is_enabled());
+
+    let stop_rows = |pool: SqlitePool| async move {
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT result, origin, actor_username, detail FROM audit_log              WHERE action = 'disable' AND resource = 'write_control'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(stop_rows(app.pool.clone()).await.is_empty());
+
+    let mut blocker = app.pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let caller = {
+        let router = app.router.clone();
+        let key = admin_key.clone();
+        tokio::spawn(async move {
+            mcp_post(
+                &router,
+                Some(&key),
+                tools_call("set_write_control", json!({ "enabled": false })),
+            )
+            .await
+        })
+    };
+    let control = app.write_control.clone();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let control = control.clone();
+            async move { !control.is_enabled() }
+        })
+        .await,
+        "the stop dropped the live flag and is waiting for the DB"
+    );
+    assert!(!caller.is_finished());
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+    drop(blocker);
+
+    let pool = app.pool.clone();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let pool = pool.clone();
+            async move { !stop_rows(pool).await.is_empty() }
+        })
+        .await,
+        "the disconnected stop must still be audited"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rows = stop_rows(app.pool.clone()).await;
+    assert_eq!(rows.len(), 1, "exactly one stop row: {rows:?}");
+    let (result, origin, actor, detail) = &rows[0];
+    assert_eq!(result, "ok");
+    assert_eq!(origin, "mcp");
+    assert_eq!(actor, "admin-key");
+    let detail: Value = serde_json::from_str(detail).unwrap();
+    assert_eq!(detail["persistedDb"], true, "{detail}");
+    assert!(!app.write_control.is_enabled());
+}
+
 /// #340 レビュー対応（2026-09-14）: `enabled_persisted` が次回起動時の
 /// ライブ値そのものになったため、enable は永続化に成功したときだけ
 /// ライブフラグを立てる。`persist_enabled` を強制失敗させ、`isError: true`

@@ -168,7 +168,12 @@
 //! 走らせる**。ハンドラの future が捨てられても、停止・再開そのものは途中で
 //! 止まらない (停止は必ず `op_lock` を取って両方に保存し、再開は割り込まれる
 //! か確定するまで進む)。結果を受け取る相手がいないだけで、注意書き・ログは
-//! 通常どおり更新される (監査はハンドラが書くので、切断されたら残らない)。
+//! 通常どおり更新される。呼び出し側の監査 (REST の `record_write`・
+//! 失敗の監査、MCP の監査) と通知は、`follow_up` として**同じ別タスクの中で**
+//! 停止・再開の後に行うので、切断されても 1 件だけ残る (#437 の「非常停止の
+//! 監査を失わない」を切断にも広げる。監査は従来どおり
+//! `AuditLogService::record` = 3 秒で打ち切って保留、を通る)。停止・再開が
+//! panic しても、保存できなかったものとして `follow_up` (失敗の監査) を呼ぶ。
 //!
 //! [`WriteControl::set_enabled`] の future を直接捨てたとき (テスト・
 //! ランタイムの終了) に守るのは、次の 2 つだけ:
@@ -874,55 +879,71 @@ impl WriteControl {
     /// 切断した要求のハンドラ) が捨てられても、停止・再開は途中で止まらない
     /// (このモジュール doc「呼び出し側が future を捨てても」)。中身は
     /// [`Self::set_enabled`]。
-    pub async fn set_enabled_detached(
+    ///
+    /// `follow_up` は、停止・再開が終わった後に**同じ別タスクの中で**結果を
+    /// 渡して呼ぶ (呼び出し側の監査・通知。切断されても最後まで走り、結果を
+    /// 返すのはその完了の後)。停止・再開が panic したときは呼ばない。
+    pub async fn set_enabled_detached<A, Fut>(
         self: &Arc<Self>,
         pool: &SqlitePool,
         enabled: bool,
         actor: Option<&str>,
-    ) -> WriteControlChange {
+        follow_up: A,
+    ) -> WriteControlChange
+    where
+        A: FnOnce(WriteControlChange) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let pool = pool.clone();
         let db_actor = actor.map(str::to_string);
-        self.set_enabled_detached_with(enabled, actor, async move {
-            persist_enabled(&pool, enabled, db_actor.as_deref())
-                .await
-                .map_err(|err| err.to_string())
-        })
+        self.set_enabled_detached_with(
+            enabled,
+            actor,
+            async move {
+                persist_enabled(&pool, enabled, db_actor.as_deref())
+                    .await
+                    .map_err(|err| err.to_string())
+            },
+            follow_up,
+        )
         .await
     }
 
     /// [`Self::set_enabled_detached`] の本体 (テストで DB の詰まりを差し込む
     /// ため)。
-    async fn set_enabled_detached_with<F>(
+    async fn set_enabled_detached_with<F, A, Fut>(
         self: &Arc<Self>,
         enabled: bool,
         actor: Option<&str>,
         persist_db: F,
+        follow_up: A,
     ) -> WriteControlChange
     where
         F: Future<Output = Result<(), String>> + Send + 'static,
+        A: FnOnce(WriteControlChange) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let control = Arc::clone(self);
         let actor = actor.map(str::to_string);
+        let has_state_file = self.state_file.is_some();
         let task = tokio::spawn(async move {
-            control
-                .set_enabled_with(enabled, actor.as_deref(), persist_db)
-                .await
+            // 停止・再開はさらに別タスクにして、panic しても `follow_up` (失敗の
+            // 監査) は呼ぶ。
+            let operation = tokio::spawn(async move {
+                control
+                    .set_enabled_with(enabled, actor.as_deref(), persist_db)
+                    .await
+            });
+            let change = match operation.await {
+                Ok(change) => change,
+                Err(err) => ended_abnormally(enabled, has_state_file, &err),
+            };
+            follow_up(change.clone()).await;
+            change
         });
         match task.await {
             Ok(change) => change,
-            // panic した (またはランタイムの終了で取り消された)。どこまで保存
-            // できたか分からないので、保存できなかったものとして返す (停止なら
-            // 500。ライブフラグは停止なら最初に落ちている)。
-            Err(err) => {
-                let failed = || Err(format!("停止・再開の処理が途中で終了しました（{err}）"));
-                WriteControlChange {
-                    requested_enabled: enabled,
-                    db: failed(),
-                    file: self.state_file.as_ref().map(|_| failed()),
-                    interrupted_by_stop: false,
-                    db_timed_out: false,
-                }
-            }
+            Err(err) => ended_abnormally(enabled, has_state_file, &err),
         }
     }
 
@@ -1262,6 +1283,24 @@ impl WriteControl {
         slot.seq = slot.seq.wrapping_add(1);
         slot.warning = warning;
         slot.seq
+    }
+}
+
+/// 停止・再開の別タスクが panic した (またはランタイムの終了で取り消された)
+/// ときの結果。どこまで保存できたか分からないので、保存できなかったものとして
+/// 返す (停止なら 500。ライブフラグは停止なら最初に落ちている)。
+fn ended_abnormally(
+    enabled: bool,
+    has_state_file: bool,
+    err: &tokio::task::JoinError,
+) -> WriteControlChange {
+    let failed = || Err(format!("停止・再開の処理が途中で終了しました（{err}）"));
+    WriteControlChange {
+        requested_enabled: enabled,
+        db: failed(),
+        file: has_state_file.then(failed),
+        interrupted_by_stop: false,
+        db_timed_out: false,
     }
 }
 
@@ -2008,6 +2047,23 @@ mod tests {
         release.notified().await;
         order.lock().unwrap().push(label);
         result
+    }
+
+    fn no_follow_up(_: WriteControlChange) -> std::future::Ready<()> {
+        std::future::ready(())
+    }
+
+    /// 呼ばれた回数と結果を覚える `follow_up`。
+    type FollowUps = Arc<SyncMutex<Vec<WriteControlChange>>>;
+
+    fn counting_follow_up(
+        seen: &FollowUps,
+    ) -> impl FnOnce(WriteControlChange) -> std::future::Ready<()> + Send + 'static {
+        let seen = seen.clone();
+        move |change| {
+            seen.lock().unwrap().push(change);
+            std::future::ready(())
+        }
     }
 
     async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
@@ -2998,18 +3054,25 @@ mod tests {
         ));
         let order: Order = Arc::default();
         let release = Arc::new(tokio::sync::Notify::new());
+        let follow_ups: FollowUps = Arc::default();
         let entered = Arc::new(tokio::sync::Notify::new());
 
         let caller = {
             let control = control.clone();
             let entered = entered.clone();
             let held = db_held_until(release.clone(), order.clone(), "resume", Ok(()));
+            let follow_up = counting_follow_up(&follow_ups);
             tokio::spawn(async move {
                 control
-                    .set_enabled_detached_with(true, None, async move {
-                        entered.notify_one();
-                        held.await
-                    })
+                    .set_enabled_detached_with(
+                        true,
+                        None,
+                        async move {
+                            entered.notify_one();
+                            held.await
+                        },
+                        follow_up,
+                    )
                     .await
             })
         };
@@ -3029,6 +3092,14 @@ mod tests {
             FileStartupState::Enabled
         );
         assert_eq!(control.persistence_warning(), None);
+        // 呼び出し側の後始末 (監査) も、捨てられた後で 1 回だけ走る。
+        wait_until("the follow-up runs", || {
+            !follow_ups.lock().unwrap().is_empty()
+        })
+        .await;
+        let seen = follow_ups.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].requested_enabled && seen[0].succeeded(), "{seen:?}");
     }
 
     /// 監査 P2-2 の例: 再開の途中で呼び出し側が切断し、すぐに停止が来る。
@@ -3054,10 +3125,15 @@ mod tests {
             let held = db_held_until(release.clone(), order.clone(), "resume", Ok(()));
             tokio::spawn(async move {
                 control
-                    .set_enabled_detached_with(true, None, async move {
-                        entered.notify_one();
-                        held.await
-                    })
+                    .set_enabled_detached_with(
+                        true,
+                        None,
+                        async move {
+                            entered.notify_one();
+                            held.await
+                        },
+                        no_follow_up,
+                    )
                     .await
             })
         };
@@ -3071,10 +3147,15 @@ mod tests {
             let order = order.clone();
             tokio::spawn(async move {
                 control
-                    .set_enabled_detached_with(false, None, async move {
-                        order.lock().unwrap().push("stop");
-                        Ok(())
-                    })
+                    .set_enabled_detached_with(
+                        false,
+                        None,
+                        async move {
+                            order.lock().unwrap().push("stop");
+                            Ok(())
+                        },
+                        no_follow_up,
+                    )
                     .await
             })
         };
@@ -3111,17 +3192,24 @@ mod tests {
             state_file.clone(),
         ));
         let order: Order = Arc::default();
+        let follow_ups: FollowUps = Arc::default();
         let held = control.op_lock.lock().await;
 
         let caller = {
             let control = control.clone();
             let order = order.clone();
+            let follow_up = counting_follow_up(&follow_ups);
             tokio::spawn(async move {
                 control
-                    .set_enabled_detached_with(false, None, async move {
-                        order.lock().unwrap().push("stop");
-                        Ok(())
-                    })
+                    .set_enabled_detached_with(
+                        false,
+                        None,
+                        async move {
+                            order.lock().unwrap().push("stop");
+                            Ok(())
+                        },
+                        follow_up,
+                    )
                     .await
             })
         };
@@ -3143,5 +3231,15 @@ mod tests {
             FileStartupState::Disabled
         );
         assert_eq!(control.stop_state.lock().unwrap().queued, 0);
+        wait_until("the follow-up runs", || {
+            !follow_ups.lock().unwrap().is_empty()
+        })
+        .await;
+        let seen = follow_ups.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            !seen[0].requested_enabled && seen[0].succeeded(),
+            "{seen:?}"
+        );
     }
 }

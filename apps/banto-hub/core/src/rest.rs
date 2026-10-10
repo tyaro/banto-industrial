@@ -150,7 +150,7 @@ use crate::system_info::{SystemInfoSampler, SystemInfoSnapshot};
 use crate::users::{Role, UsersService};
 use crate::value_source::{effective_simulation_for_tag, value_source_for_tag};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
-use crate::write_control::WriteControl;
+use crate::write_control::{WriteControl, WriteControlChange};
 use crate::write_rate::WriteRateLimiter;
 
 // --- shared helpers -------------------------------------------------------
@@ -872,7 +872,11 @@ struct WriteControlStatusResponse {
 ///
 /// 監査ログは成功/失敗の両方を記録する（[`write_control_audit_detail`]）。
 /// `ServerEvent::ResourceChanged` は停止では常に（ライブフラグは必ず落ちる）、
-/// 再開では成功したときだけ送る。
+/// 再開では成功したときだけ送る。監査と通知は停止・再開と**同じ別タスクの
+/// 中で**行う（[`record_write_control_outcome`]）ので、クライアントが切断して
+/// このハンドラの future が捨てられても残る（#437 の「非常停止の監査を
+/// 失わない」を切断にも広げる。`crate::write_control` のモジュール doc
+/// 「呼び出し側が future を捨てても」）。応答はその完了の後に返す（従来どおり）。
 async fn write_control_set(
     state: &WriteControlAdminState,
     headers: &HeaderMap,
@@ -883,23 +887,34 @@ async fn write_control_set(
     let identity = actor_identity(headers, &state.auth);
     let actor_id = identity.as_ref().map(|i| i.id.as_str());
 
+    let follow_up = {
+        let audit = state.audit.clone();
+        let auth = state.auth.clone();
+        let headers = headers.clone();
+        let events = state.events.clone();
+        let action = action.to_string();
+        move |change: WriteControlChange| async move {
+            record_write_control_outcome(
+                &audit,
+                &auth,
+                &headers,
+                &events,
+                &action,
+                unverified_stop,
+                &change,
+            )
+            .await;
+        }
+    };
     // 別タスクで最後まで走らせる（クライアントが切断してこのハンドラの
-    // future が捨てられても、停止・再開を途中で止めない。`crate::write_control`
-    // のモジュール doc「呼び出し側が future を捨てても」）。
+    // future が捨てられても、停止・再開と監査を途中で止めない。
+    // `crate::write_control` のモジュール doc「呼び出し側が future を捨てても」）。
     let change = state
         .write_control
-        .set_enabled_detached(&state.manager.pool(), enabled, actor_id)
+        .set_enabled_detached(&state.manager.pool(), enabled, actor_id, follow_up)
         .await;
-    let detail = with_session_exception_mark(write_control_audit_detail(&change), unverified_stop);
-
-    if !enabled || change.succeeded() {
-        let _ = state.events.send(ServerEvent::ResourceChanged {
-            resource: "write_control".to_string(),
-        });
-    }
 
     if !change.succeeded() {
-        record_write_control_failure(&state.audit, &state.auth, headers, action, detail).await;
         if change.interrupted_by_stop {
             return (
                 StatusCode::CONFLICT,
@@ -913,9 +928,43 @@ async fn write_control_set(
         return write_control_persist_failed_response(&change.warning().unwrap_or_default());
     }
 
+    Json(WriteControlStatusResponse {
+        write_enabled: state.write_control.is_enabled(),
+        write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+        persistence_warning: change.warning(),
+    })
+    .into_response()
+}
+
+/// [`write_control_set`] の停止・再開の後始末（通知と監査）。
+/// [`WriteControl::set_enabled_detached`] の `follow_up` として、停止・再開と
+/// 同じ別タスクの中で呼ぶ（クライアントの切断で捨てられない）。監査は
+/// `AuditLogService::record`（3 秒で打ち切って保留、#437）を通る。
+async fn record_write_control_outcome(
+    audit: &AuditLogService,
+    auth: &AuthState,
+    headers: &HeaderMap,
+    events: &broadcast::Sender<ServerEvent>,
+    action: &str,
+    unverified_stop: bool,
+    change: &WriteControlChange,
+) {
+    let detail = with_session_exception_mark(write_control_audit_detail(change), unverified_stop);
+
+    if !change.requested_enabled || change.succeeded() {
+        let _ = events.send(ServerEvent::ResourceChanged {
+            resource: "write_control".to_string(),
+        });
+    }
+
+    if !change.succeeded() {
+        record_write_control_failure(audit, auth, headers, action, detail).await;
+        return;
+    }
+
     record_write(
-        &state.audit,
-        &state.auth,
+        audit,
+        auth,
         headers,
         action,
         "write_control",
@@ -923,13 +972,6 @@ async fn write_control_set(
         Some(detail),
     )
     .await;
-
-    Json(WriteControlStatusResponse {
-        write_enabled: state.write_control.is_enabled(),
-        write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
-        persistence_warning: change.warning(),
-    })
-    .into_response()
 }
 
 /// 停止・再開の監査の `detail`（#433）。`persisted` は「再起動後も要求どおり
