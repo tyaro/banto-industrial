@@ -337,6 +337,11 @@ C-3b 時点の既知の制約（いずれも設計判断として記録済み。
   （`monitorLogic.ts` の `formatBitValue`、`meterLogic.ts` の `resolveMeterRange`・`scaleText`、
   `trendLogic.ts` の `trendYFormatter`）に置き、表のテストと E2E（`user-simulator-monitor.spec.ts`
   のテスト 5・6・8）で固定。文言の切り替え設定（オン / オフ）は必要になった時に足す。
+  **ツールチップ**（2026-10-10 解消、tyaro/banto#376・banto v6.5.0 の `formatTooltip`）: 縦軸とは別の
+  書式を系列（ペン）ごとに持つ（`trendTooltipFormatter`）。bit のペンは混在グループでも
+  `False` / `True`、履歴の区間の中点（0.5）は `False / True`（その区間に両方あった）。数値のペンは
+  縦軸と同じ書式。これで #554 で受容していた「混在時のツールチップの bit が 0 / 1」「全 bit で中点の
+  ツールチップが空」の 2 つの制約は無くなった（縦軸は従来どおり、全 bit のときだけ False / True）。
 
 #### R1-D の進捗
 

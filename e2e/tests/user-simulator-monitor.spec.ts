@@ -785,6 +785,24 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 				'd',
 				/^M [\d.]+ [\d.]+ L/
 			);
+			// ツールチップ（tyaro/banto#376）: 中点 0.5 の点にカーソルを置くと「False / True」
+			// （縦軸は 0.5 の文字を出さないが、ツールチップは出る）。履歴の点がどの横位置に
+			// 載るかは窓と格子次第なので、プロット面の上を左から右へ動かして値の行を探す。
+			const surface = trend.locator('.chart-host svg rect[fill="transparent"]');
+			const tipValue = trend.locator('.chart-tooltip .tt-value');
+			let step = 0;
+			await expect
+				.poll(
+					async () => {
+						const box = await surface.boundingBox();
+						if (box === null) return [];
+						const fraction = ((step++ % 19) + 1) / 20;
+						await page.mouse.move(box.x + box.width * fraction, box.y + box.height / 2);
+						return (await tipValue.allTextContents()).map((t) => t.trim());
+					},
+					{ timeout: 30_000 }
+				)
+				.toContain('False / True');
 		} finally {
 			await page.unroute('**/api/collect/history*');
 			await page.unroute('**/api/collect/values*');
