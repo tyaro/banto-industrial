@@ -5,10 +5,14 @@
 //! grid UI built on top of it (`banto_storage::list_query` today; a real
 //! grid lands with the ChronoGazer app, R系):
 //!
-//! - [`PlcConnection`]: one PLC endpoint. v1 only writes `protocol =
-//!   "modbus-tcp"` (Modbus TCP first for debuggability, plan.md §3's I2
-//!   decision); the column stays open for `"slmp"` (MELSEC MC protocol)
-//!   later
+//! - [`PlcConnection`]: one data source. Started as one PLC endpoint
+//!   (`"modbus-tcp"` first for debuggability, plan.md §3's I2 decision, then
+//!   `"slmp"`); the vocabulary is now `"modbus-tcp"`/`"slmp"`/`"virtual"`/
+//!   `"postgres"`/`"hub"` ([`ALLOWED_PROTOCOLS`]). `"hub"` (#383 段階3 P2,
+//!   2026-10-10 オーナー決定 H1) is banto-hub as a source: at most one per
+//!   registry, no endpoint of its own (ChronoGazer's `hub.record` owns it),
+//!   and its tags' `address` is the Hub tag's external name - see
+//!   [`plc_connection`]'s "`\"hub\"`" section
 //! - [`CollectionGroup`]: the unit of periodic PLC bulk read
 //!   (recorder-requirements.md §3.1: "収集周期はタグ毎ではなく収集グループ毎")
 //! - [`Tag`]: one collection point - address + data type + scaling + unit +
@@ -43,16 +47,18 @@ pub use collection_group::{
 };
 pub use plc_connection::{
     PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
-    ALLOWED_PROTOCOLS, ALLOWED_WORD_ORDERS, CALC_CONNECTION_NAME, MEM_CONNECTION_NAME,
-    MODBUS_PROTOCOL, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL, WORD_ORDER_HIGH_LOW, WORD_ORDER_LOW_HIGH,
+    ALLOWED_PROTOCOLS, ALLOWED_WORD_ORDERS, CALC_CONNECTION_NAME, HUB_PROTOCOL,
+    MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL, WORD_ORDER_HIGH_LOW,
+    WORD_ORDER_LOW_HIGH,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{
-    BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome,
-    BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput, TagService,
-    TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
+    validate_hub_tag_address, BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError,
+    BatchTagOutcome, BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput,
+    TagService, TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
     COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN,
-    MODBUS_ONLY_DATA_TYPES, NUMERIC_DATA_TYPES, PLC_TAG_KIND, STRING_DATA_TYPE,
+    MAX_HUB_EXTERNAL_NAME_LEN, MODBUS_ONLY_DATA_TYPES, NUMERIC_DATA_TYPES, PLC_TAG_KIND,
+    STRING_DATA_TYPE,
 };
 
 use banto_core::BantoError;

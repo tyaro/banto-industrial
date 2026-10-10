@@ -1880,6 +1880,11 @@ async fn tool_create_connection(
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
     let input: PlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
+    // #383 段階3 P2: banto-hub は `hub` 接続を作らない - キューへ積む前に拒否
+    // （`crate::rest::reject_hub_connection_protocol`）。
+    if let Err(err) = crate::rest::reject_hub_connection_protocol(&input) {
+        return Ok(banto_error_tool_error(&err));
+    }
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
@@ -2233,6 +2238,11 @@ async fn tool_update_connection(
         .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
     let input: PlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
+    // #383 段階3 P2: banto-hub は `hub` 接続を作らない - キューへ積む前に拒否
+    // （`crate::rest::reject_hub_connection_protocol`）。
+    if let Err(err) = crate::rest::reject_hub_connection_protocol(&input) {
+        return Ok(banto_error_tool_error(&err));
+    }
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()

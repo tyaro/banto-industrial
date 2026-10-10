@@ -70,6 +70,8 @@ flush が失敗している間の新しい日付の行も失わない**ことを
 描画、30 分のミニソーク）を入れたので、§3.7 の状態行と §3.7.8 の段階 2 の行を実装に合わせ、
 §4 のソークにミニソークのハーネスと結果の置き場を足した（実機 PLC での目視は同日に OK。R0 の決定・
 スコープ自体は不変）。
+2026-10-10 追記: #383 段階3 の P2（Hub 経由の接続の種別 `hub` をレジストリに足した。スキーマと
+検証だけで、作成の導線は P4・収集は P3）を §3.7.2 の現状に足した（R0 の決定・スコープ自体は不変）。
 位置づけ: [plan.md](plan.md) R0 の成果物。R1〜R4 の実装スコープはこの文書を正とする。
 
 ## 1. 製品コンセプト
@@ -328,6 +330,14 @@ D-3b（トレンド、2026-10-09）で 4 種を描き、D-4（2026-10-09）で�
   画面は `/tags`（接続・収集グループ・タグの 3 節）。
   - ChronoGazer が受け付ける接続のプロトコルは `modbus-tcp` と `slmp` だけ
     （`virtual` と `postgres` は banto-hub 固有で、`rest.rs` が拒否する）。
+  - レジストリ（`banto-tags`）は Hub 経由の接続の種別 `hub` も持つ（#383 段階3 の P2、
+    2026-10-10。migration `0019_plc_connections_allow_hub.sql`）。`hub` 接続はレジストリに 1 つまで、
+    接続先とキーは設定 `hub.record` が持つので接続の行には持たない（`host`・`port` などは空・既定値に
+    揃える）。その下のタグの `address` は Hub のタグの外部名（`接続名.グループ名.タグ名`）、データ型は
+    数値と bit、書き込み可にはできない（`crates/banto-tags/src/plc_connection.rs` の "hub" 節・
+    `tag.rs` の `validate_hub_tag_address`）。ChronoGazer の REST・Tauri は `hub` 接続の作成を
+    **まだ拒否する**（作成の導線は P4）。収集の開始は `hub` 接続を `hubSourceNotYetCollected` で外し、
+    その下のグループ・タグも連鎖で外して残りを動かす（#414 と同じ。Hub のサンプラーは P3）。
   - 削除は、配下（収集グループ・タグ）が残っていれば拒否される
     （`ON DELETE RESTRICT`、`crates/banto-tags/migrations/0002_collection_groups.sql`・
     `0003_tags.sql`）。

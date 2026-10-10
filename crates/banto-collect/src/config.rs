@@ -547,7 +547,7 @@ impl ExclusionUnit {
 
 /// Why [`build_config_lenient_from`] left an item out (#414 段階2).
 ///
-/// The first five variants are the item's *own* fault - each one is exactly
+/// The first six variants are the item's *own* fault - each one is exactly
 /// one of the `CollectError::Config` cases [`build_config_from`] raises. The
 /// last two are cascades: the item itself may be fine, but its connection or
 /// group was excluded, so there is nothing to collect it through. A cascade
@@ -562,6 +562,14 @@ impl ExclusionUnit {
 pub enum ExclusionReason {
     /// `plc_connections.protocol` is not `modbus-tcp` / `slmp`.
     UnsupportedProtocol { protocol: String },
+    /// #383 段階3 P2: a `"hub"` connection (banto-hub as a source,
+    /// `banto_tags::HUB_PROTOCOL`). The registry accepts it, but this crate
+    /// has no Hub sampler yet (P3 adds it), so the connection - and its
+    /// groups and tags as cascades - is left out, and the rest keeps
+    /// running (#414). A distinct reason rather than [`Self::UnsupportedProtocol`]
+    /// because the fix is not "pick a supported protocol": the connection is
+    /// configured correctly and simply waits for the sampler.
+    HubSourceNotYetCollected,
     /// `plc_connections.port` does not fit a TCP port (`u16`).
     InvalidPort { port: i64 },
     /// `plc_connections.unit_id` does not fit a Modbus unit id (`u8`).
@@ -586,6 +594,7 @@ impl ExclusionReason {
     pub fn code(&self) -> &'static str {
         match self {
             ExclusionReason::UnsupportedProtocol { .. } => "unsupportedProtocol",
+            ExclusionReason::HubSourceNotYetCollected => "hubSourceNotYetCollected",
             ExclusionReason::InvalidPort { .. } => "invalidPort",
             ExclusionReason::InvalidUnitId { .. } => "invalidUnitId",
             ExclusionReason::InvalidPeriod { .. } => "invalidPeriod",
@@ -607,6 +616,9 @@ impl ExclusionReason {
         match self {
             ExclusionReason::UnsupportedProtocol { protocol } => {
                 format!("プロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）")
+            }
+            ExclusionReason::HubSourceNotYetCollected => {
+                "Hub 経由の接続からの収集にはまだ対応していません".to_string()
             }
             ExclusionReason::InvalidPort { port } => format!("ポート番号が不正です: {port}"),
             ExclusionReason::InvalidUnitId { unit_id } => {
@@ -688,6 +700,9 @@ impl ConfigExclusion {
             ExclusionReason::UnsupportedProtocol { protocol } => format!(
                 "接続 {name} のプロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）"
             ),
+            ExclusionReason::HubSourceNotYetCollected => {
+                format!("接続 {name} は Hub 経由の接続です。Hub 経由の収集にはまだ対応していません")
+            }
             ExclusionReason::InvalidPort { port } => {
                 format!("接続 {name} のポート番号が不正です: {port}")
             }
@@ -829,6 +844,14 @@ fn build_config_lenient_inner(
     //
     // (Neither of these is a `ConfigExclusion`: they are not collected by
     // design, not "left out because broken".)
+    //
+    // #383 段階3 P2: a `"hub"` connection ([`PlcConnection::is_hub_source`])
+    // is deliberately NOT filtered here. It *will* be collected (P3's Hub
+    // sampler), so silently contributing nothing would hide its tags'
+    // missing history; instead `parse_protocol` below turns it into an
+    // explicit [`ExclusionReason::HubSourceNotYetCollected`], which takes
+    // its groups and tags with it as cascades and leaves every other
+    // connection running (#414's "外して残りを動かす").
     let mut enabled_connections: Vec<&PlcConnection> = connections
         .iter()
         .filter(|c| c.enabled && c.protocol != "virtual" && !c.is_db_source())
@@ -1019,6 +1042,8 @@ fn parse_protocol(protocol: &str) -> Result<Protocol, ExclusionReason> {
     match protocol {
         "modbus-tcp" => Ok(Protocol::ModbusTcp),
         "slmp" => Ok(Protocol::Slmp),
+        // #383 段階3 P2: see `build_config_lenient_inner`'s filter comment.
+        banto_tags::HUB_PROTOCOL => Err(ExclusionReason::HubSourceNotYetCollected),
         other => Err(ExclusionReason::UnsupportedProtocol {
             protocol: other.to_string(),
         }),
@@ -1277,7 +1302,12 @@ impl TagAddressIssue {
 /// - A `protocol` other than `"modbus-tcp"`/`"slmp"` is `Ok` here:
 ///   `"virtual"`/`"postgres"` connections are excluded from collection, and
 ///   an unsupported protocol string is a *connection*-level error
-///   (`parse_protocol`) that no tag address could fix.
+///   (`parse_protocol`) that no tag address could fix. That includes
+///   `"hub"` (#383 段階3 P2): a hub tag's address is an external name, not a
+///   device address, and its shape/data type/`writable` rules are enforced
+///   by `banto_tags::TagService` itself on every save
+///   (`banto_tags::validate_hub_tag_address`), so there is nothing left for
+///   this collector-side interpreter to check.
 ///
 /// Whether the tag/group/connection is `enabled` is deliberately not an
 /// input - a disabled tag with an unreadable address still breaks
@@ -2197,6 +2227,90 @@ mod tests {
             "only the PLC connection should be collected - the postgres one is not a PLC pipeline participant"
         );
         assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
+    }
+
+    /// #383 段階3 P2: a `"hub"` connection with a group and a tag is left out
+    /// of the PLC tasks with an explicit reason - the connection as
+    /// [`ExclusionReason::HubSourceNotYetCollected`], its group and tag as
+    /// cascades - while the PLC connection next to it is still collected
+    /// (#414: 外して残りを動かす). The strict build (banto-hub) fails on it
+    /// with the hub-specific wording, and the hub tag's external-name address
+    /// is never handed to the PLC address interpreter.
+    #[tokio::test]
+    async fn a_hub_connection_is_excluded_with_a_reason_and_the_rest_keeps_running() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+        let real_conn = plc_svc.create(conn_input("PLC1", 502)).await.unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", real_conn.id, 1_000))
+            .await
+            .unwrap();
+        let tag_svc = TagService::new(pool.clone());
+        tag_svc
+            .create(tag_input("T1", group.id, "40001"))
+            .await
+            .unwrap();
+
+        let mut hub_input = conn_input("Hub", 0);
+        hub_input.protocol = banto_tags::HUB_PROTOCOL.to_string();
+        let hub = plc_svc.create(hub_input).await.unwrap();
+        let hub_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("HG", hub.id, 1_000))
+            .await
+            .unwrap();
+        let hub_tag = tag_svc
+            .create(tag_input("HT", hub_group.id, "PLC9.G.Temp"))
+            .await
+            .unwrap();
+
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        assert_eq!(config.connections.len(), 1);
+        assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
+        assert_eq!(config.store_config.groups.len(), 1);
+        assert_eq!(
+            config.store_config.groups[0].key,
+            format!("grp:{}", group.id)
+        );
+
+        let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
+            .iter()
+            .map(|e| (e.unit, e.id, e.reason.code()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    ExclusionUnit::Connection,
+                    hub.id,
+                    "hubSourceNotYetCollected"
+                ),
+                (ExclusionUnit::Group, hub_group.id, "connectionExcluded"),
+                (ExclusionUnit::Tag, hub_tag.id, "connectionExcluded"),
+            ]
+        );
+        assert_eq!(
+            exclusions[0].reason.message(),
+            "Hub 経由の接続からの収集にはまだ対応していません"
+        );
+        assert_eq!(config_exclusions(&snapshot), exclusions);
+
+        match build_config_from(&snapshot) {
+            Err(CollectError::Config(message)) => {
+                assert!(
+                    message.contains("接続 Hub は Hub 経由の接続です"),
+                    "{message}"
+                );
+            }
+            other => panic!("the strict build must refuse a hub connection, got {other:?}"),
+        }
+
+        // The save-time check has nothing to add for a hub tag: its address
+        // is an external name, validated by banto-tags itself.
+        assert_eq!(
+            check_tag_address(banto_tags::HUB_PROTOCOL, "PLC9.G.Temp", "f64"),
+            Ok(())
+        );
     }
 
     #[tokio::test]
