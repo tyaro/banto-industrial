@@ -154,8 +154,10 @@ flush が失敗している間の新しい日付の行も失わない**ことを
   登録時に Hub のカタログから複製し、同一性は外部名（scada-design.md §9.6）。収集開始時にカタログと
   突き合わせ、消えた・型が変わったタグは外す（#414 と同じ）。Hub が Live でない間は全タグ `bad` で
   `null` を記録し、イベントは `plc_connected` / `plc_disconnected` を Hub の接続キーで再利用する。
-  Hub の `stale` は Stale、`bad`・不明は Bad、`value_source = simulation` の値は記録しない（#413）。
-  記録時刻はこの PC の時計で、Hub の `t` は鮮度の判定にだけ使う。Hub 経由の書き込みはしない（§7）。
+  Hub の `stale` は Stale、`bad`・不明は Bad、`value_source` が `simulation`・`derived_simulation` の値は記録しない（#413）。
+  記録時刻はこの PC の時計。購読は on-change（値・品質が変わったときだけ届く）なので、Hub の `t` の経過時間では
+  鮮度を判定せず、Live かつ good の定常値は最後の値を周期ごとに記録して Stale にしない（Stale・Bad の根拠は Hub の
+  品質ラベルと Hub 接続の状態だけ）。Hub 経由の書き込みはしない（§7）。
   ChronoGazer 内に別の recorder を持って読み出し時に合流する案は、履歴・保持・イベントが二重に
   なるため却下した。決定の詳細と手順（P2〜P6）は [plan.md](plan.md) §5。
 - 品質フラグ付きで保存。PLC 断で Bad を記録し続け、**復旧後に自動再接続**

@@ -464,8 +464,13 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
       外す（#414 と同じ）。
     - **H4 品質と記録**: Hub が Live でない間は全タグ `bad` で `null` を記録する。イベントは
       `plc_connected` / `plc_disconnected` を Hub の接続キーで再利用（新しい `EventKind` は足さない）。
-      Hub の `stale` は Stale、`bad`・不明は Bad（good に丸めない）。Hub の `value_source = simulation`
-      の値は記録しない（#413）。記録時刻はこの PC の時計（R0 §4）で、Hub の `t` は鮮度の判定にだけ使う。
+      Hub の `stale` は Stale、`bad`・不明は Bad（good に丸めない）。Hub の `value_source` が `simulation`・
+      `derived_simulation`（シミュレーション入力を参照する演算タグ）の値は記録しない（#413）。記録時刻は
+      この PC の時計（R0 §4）。**購読は on-change**（Hub は値・品質が変わったときだけ送る）なので、Hub の `t` の
+      経過時間で鮮度を判定しない: Live かつ good の定常値は、受信が長く途切れても最後の値を周期ごとに記録し続け
+      Stale にしない。Stale・Bad の根拠は Hub の品質ラベルと Hub 接続の状態（Live でない）だけ（P3 の検証条件に
+      「Live + good の定常値が複数周期続いても Stale にしない」「`simulation`・`derived_simulation` をそれぞれ
+      記録しない」を含める。2026-10-10 #564 のレビュー）。
     - **H5 Hub 経由の書き込みはしない**（R0 §7）。
     - 手順: P2（`banto-tags` に `hub` protocol）→ P3（`banto-collect` の Hub サンプラー）→ P4（タグを
       「Hub から」登録）→ P5（監視・履歴・しきい値の結合）→ P6 実機確認（Hub 経由の SLMP と直結 SLMP を別ポートで
