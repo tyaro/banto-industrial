@@ -2347,3 +2347,165 @@ async fn the_stop_answers_within_the_bound_while_the_db_hangs_and_audits_once() 
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(count_stop_rows(&app.pool, "audit_log").await, 1);
 }
+
+/// `write_control` の監査行（`action` ごと）。
+async fn write_control_audit_rows(pool: &SqlitePool, action: &str) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT result, detail FROM audit_log          WHERE action = ? AND resource = 'write_control' ORDER BY id",
+    )
+    .bind(action)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// 別の接続で DB の書き込みロックを握る（`BEGIN IMMEDIATE`）。停止・再開の
+/// DB 保存は（状態ファイルの保存の後で）これの解放を待つ（busy_timeout 5 秒の
+/// 内に離す）。読み取り（セッションの照合）は WAL なので止まらない。
+async fn hold_db_write_lock(pool: &SqlitePool) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .expect("BEGIN IMMEDIATE");
+    conn
+}
+
+async fn release_db_write_lock(mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+    sqlx::query("COMMIT")
+        .execute(&mut *conn)
+        .await
+        .expect("COMMIT");
+}
+
+/// 2026-10-10 監査: 停止の要求の途中（状態ファイルに保存し、DB の保存を
+/// 待っている間）でクライアントが切断しても、停止は最後まで行われ、監査の
+/// 行は**ちょうど 1 件**残る（監査は停止と同じ別タスクの中で書く）。
+///
+/// 反証（コミットメッセージ）: 監査を `follow_up` からハンドラ（`await` の後）
+/// に戻すと、監査の行が 0 件のままで落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_whose_client_disconnects_mid_operation_is_still_audited_once() {
+    let app = test_app("write-control-disconnect-stop").await;
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/enable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(app.write_control.is_enabled());
+    assert!(write_control_audit_rows(&app.pool, "disable")
+        .await
+        .is_empty());
+
+    let blocker = hold_db_write_lock(&app.pool).await;
+    let caller = {
+        let router = app.router.clone();
+        let token = app.admin_token.clone();
+        tokio::spawn(async move {
+            admin_post_empty(&router, "/api/write-control/disable", &token).await
+        })
+    };
+    let state_file = app.state_file.clone();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let state_file = state_file.clone();
+            async move {
+                write_control::read_state_file(&state_file).await
+                    == write_control::FileStartupState::Disabled
+            }
+        })
+        .await,
+        "the stop saved to the state file and is waiting for the DB"
+    );
+    assert!(!caller.is_finished());
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(!app.write_control.is_enabled());
+    release_db_write_lock(blocker).await;
+
+    let pool = app.pool.clone();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let pool = pool.clone();
+            async move { !write_control_audit_rows(&pool, "disable").await.is_empty() }
+        })
+        .await,
+        "the disconnected stop must still be audited"
+    );
+    // 遅れて増えないこと。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rows = write_control_audit_rows(&app.pool, "disable").await;
+    assert_eq!(rows.len(), 1, "exactly one stop row: {rows:?}");
+    assert_eq!(rows[0].0, "ok", "{rows:?}");
+    let detail: Value = serde_json::from_str(&rows[0].1).unwrap();
+    assert_eq!(detail["enabled"], false, "{detail}");
+    assert_eq!(detail["persistedDb"], true, "{detail}");
+    assert_eq!(detail["persistedFile"], true, "{detail}");
+    assert!(spooled_files(&app.data_dir).is_empty());
+    assert!(!app.write_control.is_enabled());
+    assert!(
+        !write_control::load_persisted_enabled(&app.pool)
+            .await
+            .unwrap(),
+        "the stop reached the DB"
+    );
+}
+
+/// 再開の要求の途中（状態ファイルに「再開の途中」を書き、DB の保存を待って
+/// いる間）でクライアントが切断しても、再開は最後まで行われ、監査の行は
+/// ちょうど 1 件残る。反証は上と同じ。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_whose_client_disconnects_mid_operation_is_still_audited_once() {
+    let app = test_app("write-control-disconnect-resume").await;
+    assert!(!app.write_control.is_enabled());
+    assert!(write_control_audit_rows(&app.pool, "enable")
+        .await
+        .is_empty());
+
+    let blocker = hold_db_write_lock(&app.pool).await;
+    let caller = {
+        let router = app.router.clone();
+        let token = app.admin_token.clone();
+        tokio::spawn(
+            async move { admin_post_empty(&router, "/api/write-control/enable", &token).await },
+        )
+    };
+    let state_file = app.state_file.clone();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let state_file = state_file.clone();
+            async move {
+                write_control::read_state_file(&state_file).await
+                    == write_control::FileStartupState::ResumePending
+            }
+        })
+        .await,
+        "the resume wrote 'resume pending' and is waiting for the DB"
+    );
+    assert!(!caller.is_finished());
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    release_db_write_lock(blocker).await;
+
+    let pool = app.pool.clone();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let pool = pool.clone();
+            async move { !write_control_audit_rows(&pool, "enable").await.is_empty() }
+        })
+        .await,
+        "the disconnected resume must still be audited"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rows = write_control_audit_rows(&app.pool, "enable").await;
+    assert_eq!(rows.len(), 1, "exactly one resume row: {rows:?}");
+    assert_eq!(rows[0].0, "ok", "{rows:?}");
+    let detail: Value = serde_json::from_str(&rows[0].1).unwrap();
+    assert_eq!(detail["enabled"], true, "{detail}");
+    assert!(
+        app.write_control.is_enabled(),
+        "the resume ran to completion"
+    );
+    assert_eq!(
+        write_control::read_state_file(&app.state_file).await,
+        write_control::FileStartupState::Enabled
+    );
+}
