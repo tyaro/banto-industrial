@@ -178,7 +178,7 @@ use crate::profile_lock::{
 };
 use crate::profile_paths::{resolve_hub_root, resolve_profile_paths};
 use crate::rest::{api_router_with_controller, user_auth_state};
-use crate::settings::{HubSettingsExt, SettingsService};
+use crate::settings::{HubSettingsExt, SettingsService, DEFAULT_PORT};
 use crate::subscribe_core::EVAL_TICK_MS;
 use crate::users::UsersService;
 use crate::write_audit::WriteAuditService;
@@ -695,18 +695,23 @@ impl HubRuntime {
             .merge(static_router::<FrontendAssets>()),
         );
 
-        let server = match start(ServerConfig { bind, port }, app).await {
-            Ok(server) => server,
-            Err(err) => {
-                // ここまでに起こした背景タスクを残さない（`JoinHandle` を捨てても
-                // タスクは止まらない。#557 のレビュー指摘）。
-                eval_handle.abort();
-                prune_handle.abort();
-                mqtt.shutdown().await;
-                grpc_server.shutdown().await;
-                return Err(HubStartError::ServerStart(err));
-            }
-        };
+        // #479: デスクトップシェルだけ、既定ポートが埋まっていたら OS 割り当てへ
+        // 退避する（規則は [`port_fallback_applies`]）。退避したときは元のポートを
+        // `port_fallback_from` に持ち、`RunningHub::port_fallback_from` で見せる。
+        let fallback_allowed = port_fallback_applies(host_kind, port_override, port);
+        let (server, port_fallback_from) =
+            match start_with_port_fallback(&bind, port, app, fallback_allowed).await {
+                Ok(started) => started,
+                Err(err) => {
+                    // ここまでに起こした背景タスクを残さない（`JoinHandle` を捨てても
+                    // タスクは止まらない。#557 のレビュー指摘）。
+                    eval_handle.abort();
+                    prune_handle.abort();
+                    mqtt.shutdown().await;
+                    grpc_server.shutdown().await;
+                    return Err(HubStartError::ServerStart(err));
+                }
+            };
 
         // 背景タスクの順序の約束（#557 のレビュー指摘）: 起動手順のうち失敗しうる
         // ものがすべて済んでから起こす。先に起こしたものは、失敗する経路で
@@ -715,6 +720,12 @@ impl HubRuntime {
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
+        if let Some(wanted) = port_fallback_from {
+            log_err_line(&format!(
+                "[WARN] banto-hub: port {wanted} is in use; started on {} instead (OS-assigned, desktop shell only). External clients that expect {wanted} (Sink, ChronoGazer, etc.) cannot reach this Hub - use the service Hub or set PORT / server.port to a fixed port",
+                server.local_addr()
+            ));
+        }
         log_line("banto-hub: listening at:");
         for url in listening_urls(server.local_addr()) {
             log_line(&format!("  {url}"));
@@ -753,11 +764,114 @@ impl HubRuntime {
             sessions,
             sim_registry,
             server,
+            port_fallback_from,
             eval_handle,
             prune_handle,
             audit_spool_handle,
             _profile_lock: profile_lock,
         })
+    }
+}
+
+/// #479（2026-10-10 オーナー決定「おすすめで」= 案 A'）: デスクトップシェル内の
+/// Hub だけ、既定ポート（[`DEFAULT_PORT`] = 8722）が**使用中**のときに限り、同じ
+/// bind アドレスの OS 割り当てポート（`port: 0`）で 1 回だけ起動し直す。
+///
+/// 退避してよいのは次の 3 つが**すべて**成り立つときだけ（外から設定された
+/// 構成は固定のまま、という約束）:
+/// - ホストがデスクトップシェル（[`HubHostKind::Shell`]）。サービス版・コンソール版
+///   は外のクライアントが 8722 でつなぎに来るので、埋まっていたら今までどおり
+///   起動失敗にする。
+/// - `PORT` 環境変数による上書きが無い（`port_override` が `None`）。
+/// - 設定 `server.port` が既定値のまま。**既定と違う値は利用者が明示的に選んだ
+///   ものとして固定扱い**にする（8722 を明示的に保存していても既定と区別が
+///   付かないので退避してよい側に倒れる。設定画面は既定値を保存するだけで
+///   「選んだ」とは言えない）。
+///
+/// `BANTO_BIND` は退避の可否に影響しない（bind アドレスは変えない）。
+pub fn port_fallback_applies(
+    host_kind: HubHostKind,
+    port_override: Option<u16>,
+    configured_port: u16,
+) -> bool {
+    host_kind == HubHostKind::Shell && port_override.is_none() && configured_port == DEFAULT_PORT
+}
+
+/// #479: bind の失敗の種類が「そのポートは今使えない」にあたるか。
+///
+/// - [`std::io::ErrorKind::AddrInUse`]: 他のプロセスが待ち受け中（Windows の
+///   `WSAEADDRINUSE` 10048、Linux/macOS の `EADDRINUSE`）。
+/// - [`std::io::ErrorKind::PermissionDenied`]: Windows では `WSAEACCES` 10013 で、
+///   (a) 他のプロセスが `SO_EXCLUSIVEADDRUSE` で握っている、(b) Hyper-V / WinNAT の
+///   除外ポート範囲に入っている、のどちらも「そのポートは使えない」であり、
+///   別ポートでなら起動できるので退避の対象にする。Linux/macOS の
+///   `EACCES` は 1024 未満の特権ポートでしか起きず、退避対象は 8722 に限られる
+///   ので実害がない（誤って他の失敗を握り潰さないよう、判定はこの 2 種類だけ）。
+///
+/// それ以外（アドレスが不正・ネットワークが無い等）は、別ポートでも直らないので
+/// 退避せずそのままエラーにする。
+pub fn bind_error_allows_port_fallback(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// `banto_server::start` は bind の失敗を文字列の [`BantoError::Other`] に潰して
+/// `io::ErrorKind` を返さないので、失敗した後にもう一度 bind を試して種類を
+/// 取り直す（#479）。**空きを事前に探す処理ではない**: 本番の bind が既に失敗した
+/// 後の分類だけに使い、成功した場合はすぐ閉じて `None`（= 退避しない。すでに
+/// 空いたなら元のエラーをそのまま報告して、起動し直しは呼び出し側に任せる）。
+async fn classify_bind_failure(bind: &str, port: u16) -> Option<std::io::ErrorKind> {
+    match tokio::net::TcpListener::bind(format!("{bind}:{port}")).await {
+        Ok(_listener) => None,
+        Err(err) => Some(err.kind()),
+    }
+}
+
+/// axum サーバーを `bind:port` で起動する。`fallback_allowed`（[`port_fallback_applies`]）
+/// で、その bind が [`bind_error_allows_port_fallback`] の失敗だったときだけ、同じ
+/// `bind` の `port: 0` で 1 回起動し直す。戻り値の 2 つ目は退避したときの元のポート。
+///
+/// 退避は **サーバーの bind だけのやり直し**で、`HubRuntime::start` 全体は
+/// やり直さない（profile 排他・DB・収集・MQTT・gRPC は 1 回しか作らない）。
+/// 失敗時の後始末（背景タスクの abort など）は呼び出し側の既存の経路のまま。
+async fn start_with_port_fallback(
+    bind: &str,
+    port: u16,
+    app: axum::Router,
+    fallback_allowed: bool,
+) -> Result<(RunningServer, Option<u16>), BantoError> {
+    let first = start(
+        ServerConfig {
+            bind: bind.to_string(),
+            port,
+        },
+        app.clone(),
+    )
+    .await;
+    match first {
+        Ok(server) => Ok((server, None)),
+        Err(err) => {
+            if !fallback_allowed {
+                return Err(err);
+            }
+            let allows = classify_bind_failure(bind, port)
+                .await
+                .is_some_and(bind_error_allows_port_fallback);
+            if !allows {
+                return Err(err);
+            }
+            let server = start(
+                ServerConfig {
+                    bind: bind.to_string(),
+                    port: 0,
+                },
+                app,
+            )
+            .await?;
+            Ok((server, Some(port)))
+        }
     }
 }
 
@@ -774,6 +888,9 @@ pub struct RunningHub {
     sessions: Arc<HubSessions>,
     sim_registry: Arc<BrokerSimRegistry>,
     server: RunningServer,
+    /// #479: デスクトップシェルが既定ポートの競合で OS 割り当てへ退避したとき、
+    /// 本来 bind したかったポート。退避しなかったら `None`。
+    port_fallback_from: Option<u16>,
     /// computed 250ms 評価ループの `JoinHandle`（T14-1 で捕捉。このモジュール
     /// doc の「T14-1 での唯一の挙動変化」節参照）。
     eval_handle: JoinHandle<()>,
@@ -803,6 +920,14 @@ impl RunningHub {
     /// を直接使っていたのと同じ（設計 §3「D1」の `local_addr()`）。
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.server.local_addr()
+    }
+
+    /// #479: 既定ポートが埋まっていて OS 割り当てのポートへ退避して起動したとき、
+    /// 本来 bind したかったポート（[`port_fallback_applies`]）。退避していなければ
+    /// `None`。外のクライアント（Sink など）はこの Hub に届かないので、ホストが
+    /// 状態として見せたいときに使う。
+    pub fn port_fallback_from(&self) -> Option<u16> {
+        self.port_fallback_from
     }
 
     /// Obtain the process-wide serialized collection controller.
@@ -1132,6 +1257,123 @@ mod tests {
         assert_ne!(addr.port(), 0, "the OS should have assigned a real port");
 
         hub.shutdown().await;
+    }
+
+    /// #479: 退避の規則（純関数）。シェル・`PORT` 無し・永続ポートが既定のときだけ。
+    #[test]
+    fn port_fallback_applies_only_to_shell_with_default_unforced_port() {
+        use HubHostKind::{Console, Service, Shell};
+        // 退避する: シェル + PORT 無し + 設定が既定。
+        assert!(port_fallback_applies(Shell, None, DEFAULT_PORT));
+        // PORT 環境変数による明示（既定と同じ値でも、明示は固定）。
+        assert!(!port_fallback_applies(
+            Shell,
+            Some(DEFAULT_PORT),
+            DEFAULT_PORT
+        ));
+        assert!(!port_fallback_applies(Shell, Some(9000), DEFAULT_PORT));
+        assert!(!port_fallback_applies(Shell, Some(0), DEFAULT_PORT));
+        // 永続設定が既定と違う = 利用者が選んだ値は固定。
+        assert!(!port_fallback_applies(Shell, None, DEFAULT_PORT + 1));
+        assert!(!port_fallback_applies(Shell, None, 9000));
+        // サービス版・コンソール版は退避しない（外のクライアントが既定ポートで来る）。
+        assert!(!port_fallback_applies(Service, None, DEFAULT_PORT));
+        assert!(!port_fallback_applies(Console, None, DEFAULT_PORT));
+    }
+
+    /// #479: 退避の対象にする bind 失敗の種類（純関数）。
+    #[test]
+    fn bind_error_allows_port_fallback_only_for_in_use_and_denied() {
+        use std::io::ErrorKind;
+        assert!(bind_error_allows_port_fallback(ErrorKind::AddrInUse));
+        assert!(bind_error_allows_port_fallback(ErrorKind::PermissionDenied));
+        for kind in [
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::InvalidInput,
+            ErrorKind::NotFound,
+            ErrorKind::TimedOut,
+            ErrorKind::Other,
+        ] {
+            assert!(!bind_error_allows_port_fallback(kind), "{kind:?}");
+        }
+    }
+
+    /// #479: ポートが埋まっていて退避が許されていれば、同じ bind アドレスの別
+    /// ポートで起動し、元のポートを返す。許されていなければ今までどおり失敗する。
+    /// 8722 には依存しない（テストが自分で `TcpListener` を握った任意のポートを使う）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_port_fallback_moves_off_a_busy_port_only_when_allowed() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let busy = holder.local_addr().unwrap().port();
+        let router = || axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+
+        // 許可なし: 失敗（従来どおり）。
+        let denied = start_with_port_fallback("127.0.0.1", busy, router(), false).await;
+        assert!(denied.is_err(), "must fail when fallback is not allowed");
+
+        // 許可あり: 別ポートで起動し、元のポートを報告する。
+        let (server, from) = start_with_port_fallback("127.0.0.1", busy, router(), true)
+            .await
+            .expect("should fall back to an OS-assigned port");
+        assert_eq!(from, Some(busy));
+        let addr = server.local_addr();
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert_ne!(addr.port(), 0);
+        assert_ne!(addr.port(), busy);
+        server.stop().await;
+
+        // 空いていれば退避しない（許可ありでも元のポートのまま）。
+        drop(holder);
+        let (server, from) = start_with_port_fallback("127.0.0.1", busy, router(), true)
+            .await
+            .expect("free port should bind as asked");
+        assert_eq!(from, None);
+        assert_eq!(server.local_addr().port(), busy);
+        server.stop().await;
+
+        // 退避しても直らない失敗（不正な bind アドレス）はそのままエラー。
+        let bad = start_with_port_fallback("203.0.113.1", 0, router(), true).await;
+        assert!(bad.is_err());
+    }
+
+    /// #479: シェルが組むのと同じ `HubConfig`（`HubHostKind::Shell`）でも、`PORT`
+    /// 相当の明示（`port_override`）があれば埋まったポートで起動に失敗する
+    /// （退避しない）。退避する側は上のテストと [`port_fallback_applies`] の表で
+    /// 押さえる（既定の 8722 を埋めることはテストにできない）。失敗後に背景タスク・
+    /// ロックが残らず、同じ構成の再起動が通ること（空きが出れば）も確かめる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_start_with_explicit_busy_port_fails_and_leaves_nothing_behind() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-shell-explicit-port");
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let busy = holder.local_addr().unwrap().port();
+        let make = |port: u16| HubConfig {
+            db_path: dir
+                .path()
+                .join("registry.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(port),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test".to_string(),
+            host_kind: HubHostKind::Shell,
+            skip_profile_lock: true,
+        };
+
+        let err = match HubRuntime::start(make(busy)).await {
+            Ok(_) => panic!("an explicit busy port must not fall back"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, HubStartError::ServerStart(_)), "{err:?}");
+
+        // 失敗した起動が何も残していない: 同じ DB・data_dir でもう一度起動できる。
+        let hub = HubRuntime::start(make(0))
+            .await
+            .expect("restart after a failed bind should succeed");
+        assert_eq!(hub.port_fallback_from(), None);
+        hub.shutdown().await;
+        drop(holder);
     }
 
     /// #500: `HubRuntime::start` が組み立てる Router（コンソール/サービス/

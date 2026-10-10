@@ -595,6 +595,18 @@ fn stop_collection(app: &AppHandle) {
 /// [`decide_startup`]が必要とする「期待する root・profile-id・port・host」を
 /// 解決する。`build_hub_config_from_env`と同じ env を読むが、`HubConfig`
 /// 全体ではなく[`ProbeTarget`]が必要とする値だけを返す薄いラッパ。
+///
+/// #479: ここで返す `port` は「**サービス版の Hub が待ち受ける期待ポート**」
+/// （`PORT` 環境変数、無ければ既定 8722）で、サービスへの接続・health probe・
+/// host_switch の判定に使う。デスクトップシェルの Hub は、`PORT` 指定が無く既定の
+/// ポートが埋まっているときだけ OS 割り当てのポートへ退避する
+/// （`banto_hub_core::runtime::port_fallback_applies`）ので、デスクトップが実際に
+/// 待ち受けているポートとは限らない。デスクトップ側の実ポートは常に
+/// `RunningHub::local_addr()` を使うこと（navigate は
+/// [`apply_startup_outcome`] がそうしている）。host_switch の待ちは
+/// 「サービスの」health（Service→Desktop は旧サービスの消失、Desktop→Service は
+/// サービスの起動）を期待ポートで見るだけで、デスクトップの実ポートを待つ
+/// ことはない（切替前にデスクトップの Hub は `shutdown` 済みでポートも解放済み）。
 fn expected_probe_target() -> ProbeTarget {
     let paths = resolve_profile_paths_from_env();
     let port = std::env::var("PORT")
@@ -729,6 +741,12 @@ fn decide_startup(target: &ProbeTarget) -> StartupOutcome {
 /// [`HttpHubHealthProbe`]を1回投げてから[`StartupOutcome::Fallback`]を返す -
 /// 「ポート競合の相手が別の banto-hub インスタンスかどうか」の手がかりに
 /// なる（`scm_state`の`allow(dead_code)`同様、Err時のみ使う値）。
+///
+/// #479: 既定ポートが埋まっているだけなら、`PORT` 指定が無い限り
+/// [`HubRuntime::start`] が OS 割り当てのポートへ退避して起動するので、
+/// ここには来ない（退避のログは `RunningHub::port_fallback_from` と
+/// `hub_log` に出る）。`PORT` を明示した構成でそのポートが埋まっていれば、
+/// 従来どおりここへ来て、同じポートへの probe で相手を診断する。
 #[allow(unused_variables)]
 fn attempt_desktop_start(target: &ProbeTarget, scm_state: Option<ScmState>) -> StartupOutcome {
     // HubRuntime::start はここで同期的に待つ - `tauri::async_runtime`
