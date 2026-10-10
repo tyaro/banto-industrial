@@ -13,14 +13,19 @@
 //!
 //! `migrations-sqlite/` は 2 種類:
 //!
-//! - `0002`〜`0007`（settings/users/user_roles/audit_log/user_auth_epoch の
-//!   5 本）は、当面
-//!   `banto v2.1.1 apps/admin-template/core/migrations-sqlite/<同じファイル名>`
-//!   を **byte 等価**でコピーしたもの（banto 側には手を入れない。番号の飛び -
-//!   `0001_items`・`0006_attachments` が無い - は上流の番号をそのまま残して
-//!   いるため）。中身を書き換えないこと: 上流と食い違うと「banto に寄せる」
-//!   土台にならず、`sqlx` の checksum も変わる。上流を上げるときは同じ名前で
-//!   コピーし直す。ChronoGazer と同じ 5 本。
+//! - `0002`〜`0008`（settings/users/user_roles/audit_log/user_auth_epoch/
+//!   audit_log_pending_id の 6 本）は、当面
+//!   `banto apps/admin-template/core/migrations-sqlite/<同じファイル名>`
+//!   を **byte 等価**でコピーしたもの（`0002`〜`0007` は v2.1.1、`0008` は
+//!   v6.5.0 = 監査の保留の `audit_log.pending_id`、banto ADR-0019・#437。
+//!   banto 側には手を入れない。番号の飛び - `0001_items`・`0006_attachments`
+//!   が無い - は上流の番号をそのまま残しているため）。中身を書き換えないこと:
+//!   上流と食い違うと「banto に寄せる」土台にならず、`sqlx` の checksum も
+//!   変わる。上流を上げるときは同じ名前でコピーし直す。ChronoGazer と同じ 6 本。
+//!   `0008` は `0101`〜`0106` を適用済みの既存 DB には「若い番号が後から来る」
+//!   形になるが、`sqlx` 0.9 の `Migrator::run` は適用済みに無い版を流すだけで
+//!   順序の逆転を拒まない（テスト
+//!   `an_existing_db_without_0008_gets_it_on_the_next_startup`）。
 //! - `0101_*` 以降は banto-hub 固有のテーブル（api_keys・write_control_state
 //!   と seed・hub_write_audit・hub_retained_values・pending_changes・
 //!   hub_sink_groups/hub_sink_group_tags）。スキーマの整理（2026-10-02）で、それまでの冪等 DDL と後追いの
@@ -255,7 +260,7 @@ mod tests {
     }
 
     /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
-    /// は作られない。この app の分は上流 admin-template の 5 本 + Hub 固有。
+    /// は作られない。この app の分は上流 admin-template の 6 本 + Hub 固有。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {
         let pool = init_db_memory().await.unwrap();
@@ -279,7 +284,10 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 101, 102, 103, 104, 105, 106]);
+        assert_eq!(
+            versions,
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106]
+        );
     }
 
     /// スキーマ整理（2026-10-02）: 以前は後追いの `ADD COLUMN` で足していた列が、新しい DB では
@@ -348,6 +356,80 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(enabled, 0, "the operator's choice must survive a restart");
+        pool.close().await;
+    }
+
+    /// #437: banto v6.5.0 の `0008_audit_log_pending_id.sql`（監査の保留、
+    /// banto ADR-0019）は、`0101`〜`0106` を適用済みの既存 DB にとって
+    /// 「番号が若い後から来た migration」になる。`sqlx` 0.9 の `Migrator::run`
+    /// は適用済みの集合に無い版を順に流すだけで、順序の逆転を拒まない
+    /// （`ignore_missing` が効くのは「DB にあってソースに無い」側だけ）。
+    /// 0008 を除いた集合で作った DB を、今の集合で起動し直して確かめる。
+    #[tokio::test]
+    async fn an_existing_db_without_0008_gets_it_on_the_next_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_set = dir.path().join("migrations-before-0008");
+        std::fs::create_dir(&old_set).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-sqlite");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("0008_") {
+                continue;
+            }
+            std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
+        }
+
+        let db_path = dir.path().join("registry.sqlite3");
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(old_set.as_path())
+            .await
+            .unwrap();
+        old.dangerous_set_table_name(MIGRATIONS_TABLE);
+        old.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO audit_log (action, resource, origin, result) \
+             VALUES ('probe', 'test', 'rest', 'ok')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 0, "the old set must not have 0008");
+        pool.close().await;
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("an existing DB must take 0008 after 0101-0106");
+        let versions: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT version FROM {MIGRATIONS_TABLE} ORDER BY version"
+        )))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            versions,
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106]
+        );
+        let pending_id: Option<String> =
+            sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_id, None, "the earlier row is kept, with NULL");
+        let index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_audit_log_pending_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index, 1);
         pool.close().await;
     }
 

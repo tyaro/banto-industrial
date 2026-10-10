@@ -11,11 +11,16 @@
 //! ## スキーマの出所（DB スキーマの整理、2026-10-02 オーナー決定）
 //!
 //! この app 自身のテーブルは banto の admin-template と**同じ形**にする。
-//! `migrations-sqlite/` の `0002`〜`0007` の 5 本は、当面
-//! `banto v2.1.1 apps/admin-template/core/migrations-sqlite/<同じファイル名>`
-//! を **byte 等価**でコピーしたもの（banto 側には手を入れない。番号の飛び -
-//! `0001_items`・`0006_attachments` が無い - は上流の番号をそのまま残している
-//! ため）。ファイルの中身を書き換えないこと: 上流と食い違うと「banto に寄せる」
+//! `migrations-sqlite/` の `0002`〜`0008` の 6 本は、当面
+//! `banto apps/admin-template/core/migrations-sqlite/<同じファイル名>`
+//! を **byte 等価**でコピーしたもの（`0002`〜`0007` は v2.1.1、`0008` は
+//! v6.5.0 = 監査の保留の `audit_log.pending_id`、banto ADR-0019。ChronoGazer は
+//! まだ保留を有効にしていないが、banto-hub と同じ集合に揃えておく - #437。
+//! banto 側には手を入れない。番号の飛び - `0001_items`・`0006_attachments` が
+//! 無い - は上流の番号をそのまま残しているため）。`0008` は `0101`・`0102` を
+//! 適用済みの既存 DB には「若い番号が後から来る」形になるが、`sqlx` 0.9 の
+//! `Migrator::run` は適用済みに無い版を流すだけで順序の逆転を拒まない（テスト
+//! `an_existing_db_without_0008_gets_it_on_the_next_startup`）。ファイルの中身を書き換えないこと: 上流と食い違うと「banto に寄せる」
 //! 土台にならず、`sqlx` の checksum も変わる。上流を上げるときは同じ名前で
 //! コピーし直す。
 //!
@@ -283,7 +288,7 @@ mod tests {
     }
 
     /// スキーマ整理（2026-10-02）: 記録テーブルは migrator ごとに分かれ、共有の `_sqlx_migrations`
-    /// は作られない。この app の分は上流 admin-template の 5 本。
+    /// は作られない。この app の分は上流 admin-template の 6 本 + この app 固有。
     #[tokio::test]
     async fn migrations_are_recorded_in_per_migrator_tables() {
         let pool = init_db_memory().await.unwrap();
@@ -307,9 +312,9 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        // 2〜7 は admin-template のコピー、101 からはこの app 固有（#393 の表示グループ、
+        // 2〜8 は admin-template のコピー、101 からはこの app 固有（#393 の表示グループ、
         // #532 の記録計の側のタグごとの設定）。
-        assert_eq!(versions, vec![2, 3, 4, 5, 7, 101, 102]);
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102]);
         let has_auth_epoch: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'auth_epoch'",
         )
@@ -341,6 +346,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, "kept");
+        pool.close().await;
+    }
+
+    /// #437: banto v6.5.0 の `0008_audit_log_pending_id.sql` は、`0101`・`0102`
+    /// を適用済みの既存 DB にとって「番号が若い後から来た migration」になる。
+    /// `sqlx` 0.9 はそれを拒まずに流すことを、0008 を除いた集合で作った DB を
+    /// 今の集合で起動し直して確かめる（banto-hub の同名のテストと同じ）。
+    #[tokio::test]
+    async fn an_existing_db_without_0008_gets_it_on_the_next_startup() {
+        let dir = crate::test_support::TempDir::new();
+        let old_set = dir.path().join("migrations-before-0008");
+        std::fs::create_dir(&old_set).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-sqlite");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("0008_") {
+                continue;
+            }
+            std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
+        }
+
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(old_set.as_path())
+            .await
+            .unwrap();
+        old.dangerous_set_table_name(MIGRATIONS_TABLE);
+        old.run(&pool).await.unwrap();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, 0, "the old set must not have 0008");
+        pool.close().await;
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("an existing DB must take 0008 after 0101-0102");
+        let versions: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT version FROM {MIGRATIONS_TABLE} ORDER BY version"
+        )))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(versions, vec![2, 3, 4, 5, 7, 8, 101, 102]);
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('audit_log') WHERE name = 'pending_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, 1);
         pool.close().await;
     }
 
