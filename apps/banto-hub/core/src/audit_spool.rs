@@ -44,7 +44,19 @@
 //!
 //! 昇格プロセス（`crate::service_elevated` の `banto-hub-elev.exe`）は自前の
 //! `AuditLogService` を作るが、`try_record`（監査に失敗したら操作も失敗させる）
-//! しか使わず、`try_record` は保留を通らないので、保留を付けない。
+//! しか使わず、`try_record` は保留を通らないので、保留を付けない。同じ理由で
+//! ログの出口（`with_log_sink`）も付けない: `try_record` は失敗を呼び出し元に
+//! `Err` で返し、行を出すのは `record` と保留だけ。
+//!
+//! ## 警告行の行き先
+//!
+//! banto の `AuditLogService` は、監査の記録失敗と保留の警告行（保留した・流し
+//! 込んだ・捨てた・書けない・隔離した・読めない・流し込みに失敗した）を既定では
+//! `eprintln!` に出す。標準エラーの無い Windows サービスではどこにも届かない
+//! ので、[`build_audit_service`] は `with_log_sink` で
+//! [`crate::hub_log::log_err_line`]（標準エラー + サービスログファイルへの
+//! ミラー）に向ける。ミラーはサービスモードのときだけ（コンソールでは従来どおり
+//! 標準エラーのみ）。
 
 use std::path::{Path, PathBuf};
 
@@ -68,7 +80,13 @@ pub fn spool_dir(data_dir: &Path) -> PathBuf {
 /// 呼び出し側（`crate::runtime::HubRuntime::start`）が行う。
 pub fn build_audit_service(db: Db, data_dir: &Path) -> AuditLogService {
     let dir = spool_dir(data_dir);
-    match AuditLogService::new(db.clone()).with_spool(&dir, SpoolConfig::default()) {
+    // 監査の記録失敗と保留の警告行（banto が `eprintln!` していたもの）を、サービス
+    // ログ（`banto-hub-service.log`）にも写す。標準エラーの無い Windows サービス
+    // では、これが無いと行がどこにも届かない。保留が付いたかどうかによらず付ける。
+    match AuditLogService::new(db.clone())
+        .with_log_sink(log_err_line)
+        .with_spool(&dir, SpoolConfig::default())
+    {
         Ok(audit) => audit,
         Err(err) => {
             log_err_line(&format!(
@@ -76,7 +94,7 @@ pub fn build_audit_service(db: Db, data_dir: &Path) -> AuditLogService {
                  監査は保留されず失われます: {err}",
                 dir.display()
             ));
-            AuditLogService::new(db)
+            AuditLogService::new(db).with_log_sink(log_err_line)
         }
     }
 }
@@ -99,7 +117,10 @@ mod tests {
     }
 
     /// 保留ディレクトリを作れない（同名のファイルがある）ときは、起動を
-    /// 止めずに保留なしで返す。
+    /// 止めずに保留なしで返す。（ログの出口 `with_log_sink` は、保留が付いたか
+    /// どうかによらず付く。出口が行を受け取る挙動そのものは `hub_log` が
+    /// プロセス全体の `OnceLock` に書き込み、テストから差し替えられないため、
+    /// banto 側のテストに任せる。）
     #[tokio::test]
     async fn an_unusable_spool_dir_falls_back_to_no_spool() {
         let dir = tempfile::tempdir().unwrap();
