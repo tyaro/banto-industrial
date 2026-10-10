@@ -282,6 +282,11 @@ fn now_unix_ms() -> i64 {
 ///   足す（対象ファイル自体はまだ無くてよい — 初回起動の DB）。
 /// - Windows ではファイルシステムが大文字小文字を区別しないので、ハッシュの
 ///   前に小文字へそろえる。
+/// - 既にあるファイルは全体を `canonicalize` する（シンボリックリンクの別名は
+///   本体と同じ ID）。**ハードリンクの別名は検出しない**（同じ実体への別パス
+///   なので、パスから作る ID は別になる。ハードリンク越しに DB を開く構成は
+///   非対応）。ファイルの実体 ID（dev+ino 等）を使わないのは、初回起動
+///   （ファイル作成前）に取った ID と作成後に取った ID が食い違うため。
 /// - 戻り値の 2 つ目は正規化したパス（診断メッセージ用）。
 pub fn path_scope_id(target: &Path) -> std::io::Result<(String, PathBuf)> {
     use sha2::{Digest, Sha256};
@@ -297,7 +302,16 @@ pub fn path_scope_id(target: &Path) -> std::io::Result<(String, PathBuf)> {
         _ => Path::new("."),
     };
     std::fs::create_dir_all(parent)?;
-    let canonical = parent.canonicalize()?.join(file_name);
+    // 既にあるファイルは**全体**を `canonicalize` してシンボリックリンクを解く
+    // （リンク経由の別名で開いても本体と同じ ID になる）。まだ無いファイル
+    // （初回起動）は親 + ファイル名。通常のファイル（リンクでない）は前者も
+    // 「正規化した親 + 実際のファイル名」になるので、作成の前に ID を作った
+    // プロセスと後に作ったプロセスで ID が食い違わない。
+    let canonical = if target.exists() {
+        target.canonicalize()?
+    } else {
+        parent.canonicalize()?.join(file_name)
+    };
 
     let mut key = canonical.to_string_lossy().into_owned();
     if cfg!(windows) {
@@ -426,5 +440,60 @@ mod tests {
         let target = dir.path().join("fresh").join("db.sqlite3");
         path_scope_id(&target).unwrap();
         assert!(dir.path().join("fresh").is_dir());
+    }
+
+    #[test]
+    fn path_scope_id_is_the_same_before_and_after_the_file_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fresh.sqlite3");
+        let (before, _) = path_scope_id(&db).unwrap();
+        std::fs::write(&db, b"x").unwrap();
+        let (after, _) = path_scope_id(&db).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_symlink_alias_of_an_existing_file_has_the_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("real.sqlite3");
+        std::fs::write(&db, b"x").unwrap();
+        let alias = dir.path().join("alias.sqlite3");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&db, &alias);
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&db, &alias);
+        if let Err(err) = made {
+            eprintln!("skip: シンボリックリンクを作れません（権限?）: {err}");
+            return;
+        }
+        let (real_id, real_path) = path_scope_id(&db).unwrap();
+        let (alias_id, alias_path) = path_scope_id(&alias).unwrap();
+        assert_eq!(real_id, alias_id);
+        assert_eq!(real_path, alias_path);
+
+        // 実際にロックしても衝突する（診断ファイルも本体の隣の 1 つ）。
+        let name = format!(
+            r"Global\BantoInstanceLockTest.sym.{}.{real_id}",
+            std::process::id()
+        );
+        let _first = try_acquire(&name, &real_path.with_extension("lock"), "a").unwrap();
+        assert!(matches!(
+            try_acquire(&name, &alias_path.with_extension("lock"), "b"),
+            Err(InstanceLockError::AlreadyHeld { .. })
+        ));
+    }
+
+    /// ハードリンクは検出しない（非対応）。この挙動を固定して、変わったら気付く。
+    #[test]
+    fn a_hard_link_alias_is_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("real.sqlite3");
+        std::fs::write(&db, b"x").unwrap();
+        let alias = dir.path().join("hard.sqlite3");
+        std::fs::hard_link(&db, &alias).unwrap();
+        assert_ne!(
+            path_scope_id(&db).unwrap().0,
+            path_scope_id(&alias).unwrap().0
+        );
     }
 }

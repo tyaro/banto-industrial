@@ -23,9 +23,14 @@
 //!   DB の隣の `<DB のファイル名>.instance.lock`（SQLite の `-wal`/`-shm` や
 //!   バックアップの置き場とは名前が重ならない）。
 //!
-//! 守る範囲は**DB 単位**であり、`data.dir` 単位ではない。別々の DB が設定で
-//! 同じ絶対パスの `data.dir` を指すと、この排他では止められない（通常の
-//! 構成では `data.dir` は DB の隣の相対パスなので、DB が違えば別になる）。
+//! 守る範囲は**DB 単位**であり、`data.dir` 単位ではない。別の DB は同時に動かせるが、
+//! **解決した `data.dir` が同じ**（相対でも絶対でも。例: 同じフォルダに置いた 2 つの
+//! DB で `data.dir` が既定のまま、どちらも `<フォルダ>/data` になる）と、この排他では
+//! 二重書き込みを防げない。DB ごとに専用のフォルダか `data.dir` を割り当てること
+//! （収集開始時に `data.dir` へもロックを取るのは今後の課題）。
+//!
+//! 既にあるファイルは全体を正規化するので、シンボリックリンク経由の別名は同じ
+//! DB として扱う。ハードリンクの別名は検出しない（非対応）。
 //!
 //! # 呼ぶ位置とガードの寿命
 //!
@@ -201,6 +206,34 @@ mod tests {
             acquire_for_db(&respelled, ChronoGazerHost::Serve),
             Err(InstanceLockFailure::AlreadyRunning { .. })
         ));
+    }
+
+    #[test]
+    fn a_symlink_alias_of_the_db_is_refused_and_creation_does_not_change_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("chronogazer.sqlite3");
+        // 初回起動: ファイルがまだ無い状態で取る。
+        let first = acquire_for_db(&db, ChronoGazerHost::Desktop).expect("first ok");
+        // 後から DB が作られても、同じ DB の 2 つ目は止まる（ID が食い違わない）。
+        std::fs::write(&db, b"x").unwrap();
+        assert!(matches!(
+            acquire_for_db(&db, ChronoGazerHost::Serve),
+            Err(InstanceLockFailure::AlreadyRunning { .. })
+        ));
+        // シンボリックリンク経由の別名も止まる。
+        let alias = dir.path().join("alias.sqlite3");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&db, &alias);
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&db, &alias);
+        match made {
+            Ok(()) => assert!(matches!(
+                acquire_for_db(&alias, ChronoGazerHost::Serve),
+                Err(InstanceLockFailure::AlreadyRunning { .. })
+            )),
+            Err(err) => eprintln!("skip: シンボリックリンクを作れません（権限?）: {err}"),
+        }
+        drop(first);
     }
 
     #[test]
