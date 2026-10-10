@@ -42,3 +42,19 @@ export function auditSpoolWarning(status: AuditSpoolCounts): string | null {
 	}
 	return parts.length > 0 ? parts.join('') : null;
 }
+
+/** 状態の取得結果: 読めた（`ok`）か、読めなかった（`failed`）か。 */
+export type AuditSpoolOutcome = { kind: 'ok'; status: AuditSpoolCounts } | { kind: 'failed' };
+
+/** 状態を読めなかったときの文。保留が 0 件とは言い切れない、と伝える。 */
+export const AUDIT_SPOOL_UNREADABLE_MESSAGE =
+	'監査の保留の状態を読めませんでした。DB が応答していない可能性があります（保留が 0 件とは限りません）。「再読み込み」でもう一度試せます。';
+
+/**
+ * 画面に出す注意書き。読めたなら [`auditSpoolWarning`]（保留も喪失も無ければ
+ * `null`）、読めなかったなら [`AUDIT_SPOOL_UNREADABLE_MESSAGE`]。「読めなかった」
+ * と「0 件」を同じ `null` にしない（DB が応答しない障害こそ、この警告が要る場面）。
+ */
+export function auditSpoolNotice(outcome: AuditSpoolOutcome): string | null {
+	return outcome.kind === 'ok' ? auditSpoolWarning(outcome.status) : AUDIT_SPOOL_UNREADABLE_MESSAGE;
+}

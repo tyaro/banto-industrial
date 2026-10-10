@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { auditSpoolWarning } from './auditSpoolWarning';
+import {
+	AUDIT_SPOOL_UNREADABLE_MESSAGE,
+	auditSpoolNotice,
+	auditSpoolWarning
+} from './auditSpoolWarning';
 
 const none = { pendingCount: 0, pendingOldestTs: null, droppedCount: 0, failedCount: 0 };
 
@@ -31,5 +35,23 @@ describe('auditSpoolWarning', () => {
 		expect(text).toContain('2 件');
 		expect(text).toContain('保留ファイルにも書けなかった');
 		expect(text).toContain('5 件');
+	});
+});
+
+describe('auditSpoolNotice', () => {
+	it('is null when the status was read and nothing is pending', () => {
+		expect(auditSpoolNotice({ kind: 'ok', status: none })).toBeNull();
+	});
+
+	it('shows the backlog warning when the status was read', () => {
+		const text = auditSpoolNotice({ kind: 'ok', status: { ...none, pendingCount: 2 } });
+		expect(text).toContain('2 件');
+	});
+
+	it('says the status could not be read, which is not the same as zero', () => {
+		const text = auditSpoolNotice({ kind: 'failed' });
+		expect(text).toBe(AUDIT_SPOOL_UNREADABLE_MESSAGE);
+		expect(text).toContain('読めませんでした');
+		expect(text).not.toBeNull();
 	});
 });

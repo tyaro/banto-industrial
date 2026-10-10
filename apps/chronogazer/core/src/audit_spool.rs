@@ -27,8 +27,9 @@
 //! ## 置き場所
 //!
 //! **DB ファイルの置き場所**（Tauri ではアプリのデータディレクトリ、`banto-serve`
-//! では `BANTO_DB` の親）の中の [`SPOOL_DIR_NAME`]。`backups/` とリストア予約と
-//! 同じ「DB ごとのファイルは DB の隣」の決まり。時系列データのディレクトリ
+//! では `BANTO_DB` の親）の中の `audit-spool/<DB ファイル名>/`（[`spool_dir`]）。
+//! `backups/<DB ファイル名>/` と同じ「DB ごとのファイルは DB の隣、DB ファイルごとに
+//! 分ける」決まり。時系列データのディレクトリ
 //! （`data.dir` 設定）の中には**置かない**: あれは設定で動かせるので、動かすと
 //! 保留が取り残され、しかも DB が壊れている最中は設定を読めない。tstore の
 //! 剪定・一覧は `YYYYMMDD-NNN.sqlite3` のファイルしか見ないので、どのみち
@@ -58,9 +59,24 @@ use crate::db::Db;
 /// DB ファイルの置き場所の中の、監査の保留ディレクトリの名前。
 pub const SPOOL_DIR_NAME: &str = "audit-spool";
 
-/// `db_dir`（DB ファイルのあるディレクトリ）の中の監査の保留ディレクトリ。
-pub fn spool_dir(db_dir: &Path) -> PathBuf {
-    db_dir.join(SPOOL_DIR_NAME)
+/// DB ファイル `db_path` ごとの監査の保留ディレクトリ:
+/// `<DB のフォルダ>/audit-spool/<DB ファイル名>/`（バックアップの
+/// `<DB のフォルダ>/backups/<DB ファイル名>/` と同じ分け方）。
+///
+/// **DB ファイルごとに分ける**のは、banto の `with_spool` が「ディレクトリは DB
+/// ごとに独立」を前提にしているため（流し込みは保留の全件を自分の DB に入れて
+/// ファイルを消す）。同じフォルダに `a.sqlite3` と `b.sqlite3` があるとき
+/// （`BANTO_DB` で選べる）、フォルダ共通だと B の起動時の流し込みが A の監査を
+/// B に入れて消してしまう。
+pub fn spool_dir(db_path: &Path) -> PathBuf {
+    let parent = match db_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = db_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("db"));
+    parent.join(SPOOL_DIR_NAME).join(name)
 }
 
 /// ChronoGazer の監査サービスを組む: [`spool_dir`] に保留を付ける
@@ -69,8 +85,8 @@ pub fn spool_dir(db_dir: &Path) -> PathBuf {
 ///
 /// 起動時の流し込み（`flush_spool`）と定期実行（`spawn_spool_flusher`）は
 /// 呼び出し側が行う。
-pub fn build_audit_service(db: Db, db_dir: &Path) -> AuditLogService {
-    let dir = spool_dir(db_dir);
+pub fn build_audit_service(db: Db, db_path: &Path) -> AuditLogService {
+    let dir = spool_dir(db_path);
     match AuditLogService::new(db.clone()).with_spool(&dir, SpoolConfig::default()) {
         Ok(audit) => audit,
         Err(err) => {
@@ -146,9 +162,14 @@ mod tests {
     #[tokio::test]
     async fn the_spool_lives_next_to_the_db_and_is_created() {
         let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chronogazer.sqlite3");
         let pool = crate::db::init_db_memory().await.unwrap();
-        let audit = build_audit_service(Db::Sqlite(pool), dir.path());
-        assert!(dir.path().join(SPOOL_DIR_NAME).is_dir());
+        let audit = build_audit_service(Db::Sqlite(pool), &db_path);
+        assert_eq!(
+            spool_dir(&db_path),
+            dir.path().join(SPOOL_DIR_NAME).join("chronogazer.sqlite3")
+        );
+        assert!(spool_dir(&db_path).is_dir());
         assert_eq!(spool_status(&audit), AuditSpoolStatus::default());
         assert!(audit.spawn_spool_flusher().is_some_and(|h| {
             h.abort();
@@ -163,7 +184,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(SPOOL_DIR_NAME), b"not a directory").unwrap();
         let pool = crate::db::init_db_memory().await.unwrap();
-        let audit = build_audit_service(Db::Sqlite(pool), dir.path());
+        let audit = build_audit_service(Db::Sqlite(pool), &dir.path().join("chronogazer.sqlite3"));
         assert!(audit.spawn_spool_flusher().is_none(), "no spool");
+    }
+
+    /// 同じフォルダの 2 つの DB（`BANTO_DB` で選べる）は保留を共有しない: A の
+    /// 保留が残っているところで B を起動して流し込んでも、B には 0 行・A の
+    /// 保留ファイルは残り、A を戻して流し込むと A にちょうど 1 行入る。
+    ///
+    /// 反証（コミット本文）: `spool_dir` をフォルダ共通（`join(SPOOL_DIR_NAME)`）に
+    /// 戻すと、B の流し込みが A の監査を B に入れて消し、このテストが落ちる。
+    #[tokio::test]
+    async fn two_dbs_in_one_folder_do_not_share_a_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.sqlite3");
+        let b_path = dir.path().join("b.sqlite3");
+        assert_ne!(spool_dir(&a_path), spool_dir(&b_path));
+        let a_pool = crate::db::init_db_memory().await.unwrap();
+        let b_pool = crate::db::init_db_memory().await.unwrap();
+
+        // A: 表を取り除いたまま監査を 1 件書く -> A の保留に 1 件。
+        let audit_a = build_audit_service(Db::Sqlite(a_pool.clone()), &a_path);
+        sqlx::query("ALTER TABLE audit_log RENAME TO audit_log_away")
+            .execute(&a_pool)
+            .await
+            .unwrap();
+        audit_a
+            .record(crate::audit::AuditEntry {
+                actor_username: None,
+                actor_role: None,
+                action: "settings_change",
+                resource: "settings",
+                entity_id: None,
+                detail: None,
+                origin: "rest",
+                result: "ok",
+            })
+            .await;
+        assert_eq!(audit_a.spool_backlog().count, 1);
+
+        // B を同じフォルダで起動して流し込む: B には入らず、A の保留は残る。
+        let audit_b = build_audit_service(Db::Sqlite(b_pool.clone()), &b_path);
+        let report = audit_b.flush_spool().await.unwrap();
+        assert_eq!(report.flushed, 0, "{report:?}");
+        let b_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&b_pool)
+            .await
+            .unwrap();
+        assert_eq!(b_rows, 0, "B must not receive A's audit");
+        assert_eq!(
+            std::fs::read_dir(spool_dir(&a_path)).unwrap().count(),
+            1,
+            "A's spool file remains"
+        );
+
+        // A を戻して流し込む -> A にちょうど 1 行。
+        sqlx::query("ALTER TABLE audit_log_away RENAME TO audit_log")
+            .execute(&a_pool)
+            .await
+            .unwrap();
+        let report = audit_a.flush_spool().await.unwrap();
+        assert_eq!(report.flushed, 1, "{report:?}");
+        let a_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&a_pool)
+            .await
+            .unwrap();
+        assert_eq!(a_rows, 1);
     }
 }

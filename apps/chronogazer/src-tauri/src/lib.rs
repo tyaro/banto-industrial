@@ -4096,14 +4096,14 @@ pub fn run() {
             let collect = CollectorService::new(pool.clone(), collect_data_dir);
             // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・応答
             // しない監査は DB の隣（= アプリのデータディレクトリ）の
-            // `audit-spool/` に退避し、`record` は 3 秒で戻る
+            // `audit-spool/<DB ファイル名>/` に退避し、`record` は 3 秒で戻る
             // （`chronogazer_core::audit_spool` のモジュール doc）。
             // マイグレーション（`init_db`）は済んでいるので、前回の実行で残った
             // 保留をここで 1 回流し込む。定期の流し込みは、この後の起動手順が
             // すべて済んでから起こす（`setup()` の末尾）。
             let audit = chronogazer_core::audit_spool::build_audit_service(
                 Db::Sqlite(pool.clone()),
-                &data_dir,
+                &db_path,
             );
             tauri::async_runtime::block_on(chronogazer_core::audit_spool::flush_at_startup(
                 &audit, "banto",

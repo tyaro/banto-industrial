@@ -62,8 +62,8 @@ async fn rename_table(pool: &SqlitePool, from: &str, to: &str) {
     .unwrap_or_else(|err| panic!("rename {from} -> {to}: {err}"));
 }
 
-fn spooled_files(db_dir: &Path) -> Vec<PathBuf> {
-    let dir = crate::audit_spool::spool_dir(db_dir);
+fn spooled_files(db_path: &Path) -> Vec<PathBuf> {
+    let dir = crate::audit_spool::spool_dir(db_path);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -84,14 +84,15 @@ async fn settings_change_rows(pool: &SqlitePool, table: &str) -> Vec<Option<Stri
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_audit_written_while_the_table_is_missing_lands_exactly_once_after_recovery() {
-    let db_dir = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("chronogazer.sqlite3");
     let (router, audit, pool, admin, _editor, _viewer) =
         router_with_role_tokens_audit_pool_data_dir_and_spool(
             PathBuf::from("unused-in-tests"),
-            Some(db_dir.path()),
+            Some(db_path.as_path()),
         )
         .await;
-    assert!(spooled_files(db_dir.path()).is_empty());
+    assert!(spooled_files(&db_path).is_empty());
 
     // 何も溜まっていなければ 0。
     let (status, json) = send(&router, "GET", "/api/audit-log/spool", &admin, None).await;
@@ -119,7 +120,7 @@ async fn an_audit_written_while_the_table_is_missing_lands_exactly_once_after_re
             .is_empty(),
         "the audit could not reach the table"
     );
-    assert_eq!(spooled_files(db_dir.path()).len(), 1, "spooled once");
+    assert_eq!(spooled_files(&db_path).len(), 1, "spooled once");
 
     let (status, json) = send(&router, "GET", "/api/audit-log/spool", &admin, None).await;
     assert_eq!(status, StatusCode::OK, "{json}");
@@ -132,7 +133,7 @@ async fn an_audit_written_while_the_table_is_missing_lands_exactly_once_after_re
     let report = audit.flush_spool().await.expect("flush");
     assert_eq!(report.flushed, 1, "{report:?}");
     assert_eq!(report.remaining, 0, "{report:?}");
-    assert!(spooled_files(db_dir.path()).is_empty());
+    assert!(spooled_files(&db_path).is_empty());
 
     let rows = settings_change_rows(&pool, "audit_log").await;
     assert_eq!(rows.len(), 1, "exactly one row after recovery: {rows:?}");
@@ -149,7 +150,7 @@ async fn an_audit_written_while_the_table_is_missing_lands_exactly_once_after_re
     let report = audit.flush_spool().await.expect("flush again");
     assert_eq!(report.flushed, 0, "{report:?}");
     let restarted =
-        crate::audit_spool::build_audit_service(crate::db::Db::Sqlite(pool.clone()), db_dir.path());
+        crate::audit_spool::build_audit_service(crate::db::Db::Sqlite(pool.clone()), &db_path);
     let report = restarted.flush_spool().await.expect("flush after restart");
     assert_eq!(report.flushed, 0, "{report:?}");
     assert_eq!(settings_change_rows(&pool, "audit_log").await.len(), 1);
@@ -158,11 +159,12 @@ async fn an_audit_written_while_the_table_is_missing_lands_exactly_once_after_re
 /// 状態の口は `admin` 限定（editor・viewer は 403）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_spool_status_is_admin_only() {
-    let db_dir = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("chronogazer.sqlite3");
     let (router, _audit, _pool, admin, editor, viewer) =
         router_with_role_tokens_audit_pool_data_dir_and_spool(
             PathBuf::from("unused-in-tests"),
-            Some(db_dir.path()),
+            Some(db_path.as_path()),
         )
         .await;
     for token in [&editor, &viewer] {

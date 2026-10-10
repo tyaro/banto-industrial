@@ -149,7 +149,7 @@ async fn main() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let audit = build_audit_service(db, &db_dir);
+    let audit = build_audit_service(db, &db_path_buf);
     flush_at_startup(&audit, "banto-serve").await;
     // Credential verifier from `chronogazer_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old

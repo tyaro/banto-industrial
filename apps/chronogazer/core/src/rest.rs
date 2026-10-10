@@ -2890,11 +2890,11 @@ mod tests {
         router_with_role_tokens_audit_pool_data_dir_and_spool(data_dir, None).await
     }
 
-    /// 上と同じだが、監査サービスを**保留つき**（`spool_db_dir` の中の
-    /// `audit-spool/`、#437）で組めるようにしたもの。`None` なら保留なし。
+    /// 上と同じだが、監査サービスを**保留つき**（`spool_db_path` ごとの
+    /// `audit-spool/<DB ファイル名>/`、#437）で組めるようにしたもの。`None` なら保留なし。
     pub(super) async fn router_with_role_tokens_audit_pool_data_dir_and_spool(
         data_dir: PathBuf,
-        spool_db_dir: Option<&std::path::Path>,
+        spool_db_path: Option<&std::path::Path>,
     ) -> (
         Router,
         AuditLogService,
@@ -2912,7 +2912,7 @@ mod tests {
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let display_groups = DisplayGroupService::new(pool.clone());
         let collect = CollectorService::new(pool.clone(), data_dir);
-        let audit = match spool_db_dir {
+        let audit = match spool_db_path {
             Some(dir) => crate::audit_spool::build_audit_service(Db::Sqlite(pool), dir),
             None => AuditLogService::new(Db::Sqlite(pool)),
         };

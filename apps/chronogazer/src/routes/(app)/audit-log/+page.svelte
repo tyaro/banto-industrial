@@ -35,7 +35,7 @@
 		type GridColumn,
 		type SortState
 	} from '@banto/grid-svelte';
-	import { auditSpoolWarning } from '#lib/banto/auditSpoolWarning.js';
+	import { auditSpoolNotice } from '#lib/banto/auditSpoolWarning.js';
 	import {
 		AUDIT_SNAPSHOT_EXPIRED_MESSAGE,
 		DEMO_MODE_MESSAGE,
@@ -221,15 +221,16 @@
 	// --- 監査の保留の警告（#437） ---------------------------------------
 	// DB に書けなかった監査は、データディレクトリの保留ファイルに退避され、
 	// DB が戻ると自動で監査ログに入る。溜まっている間・失った分があるときだけ
-	// 警告を出す。表示専用の補足なので、取得に失敗しても画面は壊さない。
+	// 警告を出す。表示専用の補足なので、取得に失敗しても一覧は壊さない（失敗は「読めませんでした」と出す）。
 	let spoolWarning: string | null = $state(null);
 
 	async function loadSpoolWarning(): Promise<void> {
 		if (!available) return;
 		try {
-			spoolWarning = auditSpoolWarning(await getAuditSpoolStatus());
+			spoolWarning = auditSpoolNotice({ kind: 'ok', status: await getAuditSpoolStatus() });
 		} catch {
-			spoolWarning = null;
+			// 読めなかったことを「保留 0 件」と区別して出す（一覧は壊さない）。
+			spoolWarning = auditSpoolNotice({ kind: 'failed' });
 		}
 	}
 

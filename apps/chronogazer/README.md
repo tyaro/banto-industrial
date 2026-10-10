@@ -149,15 +149,19 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
 
 監査（`audit_log`）の書き込みは最大 3 秒で打ち切り、DB に書けない（表が壊れている・
 ディスクが満杯・接続を握られて応答しない）ときは、監査を **DB ファイルの隣の
-`audit-spool/`** に 1 件 1 ファイルで退避して、操作はそのまま成功させる
+`audit-spool/<DB ファイル名>/`** に 1 件 1 ファイルで退避して、操作はそのまま成功させる
 （banto v6.5.0 の監査の保留、banto ADR-0019。banto-hub と同じ仕組み）。デスクトップ版では
-`%APPDATA%\dev.tyaro.chronogazer\audit-spool\`、`banto-serve` では `BANTO_DB` のフォルダ
-（既定 `./audit-spool/`）。置き場所は時系列データの `data.dir` ではなく DB の隣
+`%APPDATA%\dev.tyaro.chronogazer\audit-spool\chronogazer.sqlite3\`、`banto-serve` では
+`BANTO_DB` のフォルダ（既定 `./audit-spool/banto-dev.sqlite3/`）。**DB ファイルごとに
+分ける**のは、同じフォルダの `a.sqlite3` と `b.sqlite3` が保留を共有すると、B の起動時の
+流し込みが A の監査を B に入れて消すため（バックアップの `backups/<DB ファイル名>/` と
+同じ分け方）。置き場所は時系列データの `data.dir` ではなく DB の隣
 （`data.dir` は設定で動かせて、動かすと保留が取り残されるため）。DB が戻ると、
 起動時・監査の書き込みの成功時・30 秒ごとに `audit_log` へ流し込む（`detail.spooled =
 true`。時間切れの書き込みが遅れて完了しても、同じ `pending_id` で 1 行にまとまる）。
 
-- 溜まっている間（と、上限 10,000 件を超えて捨てた分・保留にも書けずに失った分が
+- 状態を読めなかったとき（DB が応答しないときなど）は「保留の状態を読めませんでした」と
+  出す（0 件とは区別する）。溜まっている間（と、上限 10,000 件を超えて捨てた分・保留にも書けずに失った分が
   あるとき）、**監査ログ画面（admin）の上部に警告帯**が出る。同じ値は
   `GET /api/audit-log/spool`（admin、`pendingCount` / `pendingOldestTs` /
   `droppedCount` / `failedCount`）と Tauri の `audit_spool_status` で読める。
