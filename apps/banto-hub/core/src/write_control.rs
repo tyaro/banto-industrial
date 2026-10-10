@@ -67,16 +67,18 @@
 //!
 //! ### ロック順序 (一方向に固定)
 //!
-//! `op_lock` (tokio の非同期ロック。保存の一連を直列化) → `stop_generation`
-//! (std の同期ロック。世代を読む・ライブフラグを切り替える短い区間だけ)。
-//! `stop_generation` を持ったまま `op_lock` を待つ経路は無い (同期ロックは
-//! await をまたいで持たない):
+//! `op_lock` (tokio の非同期ロック。保存の一連を直列化) → `stop_generation`・
+//! `lagging_stop_db`・`lagging_resume_db` (std の同期ロック。世代を読む・
+//! ライブフラグを切り替える・書き込みの控えを出し入れする短い区間だけ)。
+//! 同期ロックを持ったまま `op_lock` を待つ経路は無い (同期ロックは await を
+//! またいで持たず、2 つを同時に持たない)。停止の知らせ (`stop_signal`、tokio の
+//! `Notify`) は `stop_generation` の中で鳴らす:
 //!
 //! - **停止**は `stop_generation` を取って世代を進めライブフラグを落とし、
-//!   **それを離してから** `op_lock` を待つ。`op_lock` を取れたら、もう一度
-//!   世代を進めてライブフラグを落としてから保存する (落としてから並ぶまでの
-//!   間に来た再開が先に並んでライブフラグを立てても、後で保存するこの停止が
-//!   ライブフラグも停止に戻す)。
+//!   待っている再開に知らせ、**それを離してから** `op_lock` を待つ。
+//!   `op_lock` を取れたら、もう一度世代を進めてライブフラグを落としてから
+//!   保存する (落としてから並ぶまでの間に来た再開が先に並んでライブフラグを
+//!   立てても、後で保存するこの停止がライブフラグも停止に戻す)。
 //! - **再開**は、**最初に待つ前に** (`op_lock`、遅れている停止の DB 書き込み)
 //!   世代を読んで覚え、すぐに離す (#439 レビュー P1-2)。待ち終えたら世代を
 //!   比べ、変わっていれば何も保存せずにやめる。保存が済んだら
@@ -86,12 +88,69 @@
 //! これで:
 //!
 //! - 再開の保存が DB 待ちで詰まっていても、停止はライブフラグを即座に
-//!   落とせる (停止が再開の後ろに並ばない)。
+//!   落とせる (ライブフラグは `op_lock` に並ぶ前に落ちる)。
 //! - 再開の保存中・待機中 (`op_lock` や遅れている停止の DB 書き込みを
 //!   待っている間) に停止が割り込んだら、その再開はライブフラグを立てない
 //!   ([`WriteControlChange::interrupted_by_stop`])。割り込んだ停止は再開の
 //!   後で保存するので、最後に残る永続値も停止になる。
 //! - 停止が成功を返した後に、ライブフラグだけが有効で残ることは無い。
+//!
+//! ### 停止は、固まった再開の後ろで待たない (2026-10-10)
+//!
+//! 再開は `op_lock` を持ったまま、遅れている停止の DB 書き込みと自分の DB
+//! 保存を**制限なしで**待つ (理由は下の「再開には制限を付けない」)。DB が
+//! 固まると、その後ろで `op_lock` を待つ停止の応答も返らなくなっていた
+//! (ライブフラグは先に落ちるので書き込みは止まるが、REST・MCP の応答が
+//! 返らない)。そこで再開の長い待ちを、**停止が来たらやめる**形にした
+//! (再開に制限時間を付けるのではない):
+//!
+//! - 停止は世代を進めたのと同じロックの中で `stop_signal` を鳴らす。再開は
+//!   受け口を登録してから世代を確かめて待つので、知らせを取りこぼさない
+//!   (`WriteControl::stopped_after`)。
+//! - **遅れている停止の DB 書き込みを待っている間**に停止が来たら、待つのを
+//!   やめ、終わっていない書き込みを `lagging_stop_db` に順番どおり戻して
+//!   (次の再開がまた待つ) 何も保存せずにやめる。
+//! - **自分の DB 保存の最中**に停止が来たら (DB 保存は別タスクで走らせて
+//!   いる)、完了を待たずにやめる。書き込みは取り消さず、`op_lock` を離す
+//!   **前に** `lagging_resume_db` へ渡す。状態ファイルは「再開の途中」
+//!   (起動時は停止扱い) のままで「有効」は書かない。
+//! - 停止は `op_lock` を取ってから `lagging_resume_db` を**全部取り出し**、
+//!   自分の DB 書き込みを**それらの完了の後に**行う別タスクにする。だから
+//!   見捨てた再開の「有効」が、停止の「停止」より後に DB に届くことは無い。
+//!   取り出した書き込みを待つ時間も停止の制限時間 (5 秒) に含めるので、
+//!   再開の DB 保存が固まっていれば停止は 5 秒で `db_timed_out` として返る
+//!   (状態ファイルに「停止」を書けていれば成功)。打ち切った停止の書き込みは
+//!   `lagging_stop_db` に入るので、次の再開は (間接的に) 見捨てた再開の
+//!   書き込みの完了も待つ (これも停止が来ればやめられる)。
+//! - 守る性質: **割り込まれた再開には、必ず割り込んだ停止が後に続く**
+//!   (再開が割り込みを検出するのは世代が進んだとき = [`WriteControl::disable`]
+//!   が呼ばれたときで、運用の停止は必ずその後 `op_lock` を取って保存する)。
+//!   再開は `lagging_resume_db` へ渡してから `op_lock` を離すので、続く停止は
+//!   必ずそれを引き取る。停止がライブフラグを落としてから `op_lock` に並ぶ
+//!   までの間に来て先に並んだ再開 (上の「ロック順序」の例) は、その停止の
+//!   後の世代で始まるので割り込まれない (停止の 2 度目の `disable` は、再開が
+//!   `op_lock` を離した後)。
+//!
+//! これで停止が `op_lock` を待つ時間は、再開の反応 (知らせを受けて即座に
+//! やめる) か、再開の状態ファイルの書き込み (ローカルのファイル。停止自身の
+//! 状態ファイルの書き込みと同じ種類) か、先に並んだ停止 (それぞれ状態ファイルの
+//! 書き込み + 5 秒) で抑えられる。状態ファイルを持たない構成
+//! ([`WriteControl::new`]、テスト用) も同じで、ファイルを書かないだけ。
+//!
+//! ### 呼び出し側が future を捨てても、書き込みを見失わない (2026-10-10)
+//!
+//! REST では、クライアントが切断すると hyper がハンドラの future を捨てる。
+//! 停止・再開 ([`WriteControl::set_enabled`]) はどこで捨てられても安全で、
+//! 走っている DB 書き込みを追えなくすることは無い。再開の DB 書き込みは
+//! `lagging_resume_db` (次の停止がその後に書く) へ、待っていた遅れている停止の
+//! DB 書き込みは `lagging_stop_db` の先頭へ順番どおり、制限時間を待つ間の停止の
+//! DB 書き込みは `lagging_stop_db` (次の再開が待つ) へ、それぞれの `Drop` が
+//! `op_lock` を離す前に戻す。停止が引き取った再開の書き込みは、取り出してから
+//! 停止の DB タスクに渡すまで await を挟まない。状態ファイルは書き込みを
+//! 原子的に置き換えるので、どこで捨てられても前の内容か新しい内容のどちらか
+//! (再開が捨てられたら「再開の途中」= 停止扱いが残り得る)。捨てられた停止の
+//! 結果は記録されないので、注意書きは更新しない (ライブフラグは停止が最初に
+//! 動いた時点で、ロックを待つ前に落ちている)。
 //!
 //! ### 停止の DB 保存は 5 秒で打ち切る (#433 監査、2026-09-24)
 //!
@@ -107,20 +166,27 @@
 //!   続け、その完了を `lagging_stop_db` に覚える。中身は「停止」なので、遅れて
 //!   完了しても安全側。
 //! - **次の再開は、遅れている停止の DB 書き込みの完了を待ってから**自分の
-//!   保存を始める (`op_lock` の中で待つ)。これで「再開の『有効』を、遅れて
+//!   保存を始める (`op_lock` の中で待つ。待っている間に停止が来たらやめて、
+//!   終わっていない書き込みは次の再開に回す)。これで「再開の『有効』を、遅れて
 //!   届いた停止の『停止』が上書きする」順序の逆転が起きない。
 //! - 遅れて完了したら、その停止より新しい停止・再開が記録されていない
 //!   ときに限り、注意書きをその結果で更新する (両方に保存できたなら消える)。
 //!   古い結果が新しい表示を巻き戻さないよう、記録の通し番号で比べる。
 //! - **再開には制限を付けない**: 打ち切った書き込みが後から「有効」を DB に
-//!   残すと、失敗を返したのに再起動で有効になり得るため。
+//!   残すと、失敗を返したのに再起動で有効になり得るため。その代わり、再開の
+//!   長い待ちは停止が来たらやめる (上の「停止は、固まった再開の後ろで待た
+//!   ない」)。見捨てた書き込みは停止の DB 書き込みより前に並べるので、
+//!   「有効」が最後に残ることは無い。
 //!
 //! REST の停止は、#431 のセッション照合 (`crate::rest` の
 //! `STOP_SESSION_CHECK_TIMEOUT`、同じ 5 秒) を通ってから来るので、DB が
 //! 固まっているときの REST の停止の応答は、停止の監査 (#437、監査の保留が
 //! INSERT を待つ上限 3 秒 - `crate::audit_spool`) を足して最長でおよそ
-//! 5 + 5 + 3 秒になる (`op_lock` を待つ間は含まない - 同時に走っている再開が
-//! DB を待っていると、停止はその後ろに並ぶ。ライブフラグは並ぶ前に落ちる)。
+//! 5 + 5 + 3 秒になる。同時に走っている再開が DB を待っていても、停止が来た
+//! 時点でその再開は待つのをやめるので、`op_lock` を待つ間は状態ファイルの
+//! 書き込み程度で、この上限から外れない (先に並んだ停止があれば、その分、
+//! つまりそれぞれ状態ファイルの書き込み + 5 秒だけ延びる)。ライブフラグは
+//! 並ぶ前に落ちる。
 //!
 //! ### ファイルの書き込み中に落ちた場合
 //!
@@ -144,7 +210,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use banto_core::BantoError;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
-use tokio::sync::Mutex as AsyncMutex;
+use std::collections::VecDeque;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::hub_log::{log_err_line, log_line};
@@ -168,6 +235,15 @@ const KEPT_RESUME_PENDING: &str =
 
 /// 再開がどこにも保存しなかった理由 (待っている間に停止が来た)。
 const NOT_SAVED_INTERRUPTED: &str = "停止が要求されたため保存していません";
+
+/// 再開が DB への保存の完了を待つのをやめた理由 (DB の保存中に停止が来た)。
+/// 書き込みは取り消していないので、遅れて「有効」が DB に残り得るが、割り込んだ
+/// 停止の DB 保存はその完了を待ってから行う (このモジュール doc「停止は、
+/// 固まった再開の後ろで待たない」)。
+const DB_ABANDONED_ON_STOP: &str = "DB への保存中に停止が要求されたため、完了を待たずにやめました（書き込みは取り消していないので遅れて「有効」が保存される場合がありますが、停止の DB 保存は必ずその後に行います）";
+
+/// 再開が状態ファイルを「有効」にしなかった理由 (DB の保存中に停止が来た)。
+const KEPT_RESUME_PENDING_ON_STOP: &str = "DB への保存中に停止が要求されたため「再開の途中」のままにしました（「有効」は書いていません。再起動すると停止で起動します）";
 
 /// 状態ファイルの形式番号。これ以外の値は「壊れている」として停止側に倒す。
 const STATE_FILE_FORMAT: u64 = 1;
@@ -420,15 +496,92 @@ pub struct WriteControl {
     /// 停止の世代。停止のたびに進む。ライブフラグの切り替えはこのロックの
     /// 中で行う (このモジュール doc「ロック順序」)。
     stop_generation: SyncMutex<u64>,
+    /// 停止の知らせ。[`Self::disable`] が世代を進めたのと同じロックの中で
+    /// `notify_waiters` する。再開は `op_lock` を持ったまま長く待つところ
+    /// (遅れている停止の DB 書き込み・自分の DB 保存) でこれを待ち、停止が
+    /// 来たら待つのをやめる (このモジュール doc「停止は、固まった再開の後ろで
+    /// 待たない」)。取りこぼさない手順は [`Self::stopped_after`]。
+    stop_signal: Notify,
     /// 停止・再開の保存の一連を直列化する (このモジュール doc「ロック順序」)。
     op_lock: AsyncMutex<()>,
     /// いまの保存状態の注意書き (起動時の食い違い、または直近の停止・再開の
     /// 保存の失敗)。両方に保存できた停止・再開で消える。遅れて完了した停止の
     /// DB 書き込みも更新するので `Arc` で共有する。
     persistence_warning: Arc<SyncMutex<WarningSlot>>,
-    /// 制限時間を超えてまだ終わっていない、停止の DB 書き込み。次の再開は
-    /// これの完了を待つ (このモジュール doc「停止の DB 保存は 5 秒で打ち切る」)。
-    lagging_stop_db: SyncMutex<Vec<JoinHandle<()>>>,
+    /// 制限時間を超えてまだ終わっていない、停止の DB 書き込み (打ち切った停止の
+    /// 見届け役、または完了を見ずに捨てられた停止の DB 書き込みそのもの)。
+    /// 次の再開はこれの完了を待つ (このモジュール doc「停止の DB 保存は 5 秒で
+    /// 打ち切る」「呼び出し側が future を捨てても、書き込みを見失わない」)。
+    lagging_stop_db: SyncMutex<Vec<DbWrite>>,
+    /// 停止に割り込まれた・捨てられた再開が、完了を待たずに残した DB 書き込み
+    /// (中身は「有効」)。次の停止が `op_lock` の中で取り出し、自分の DB 書き込み
+    /// をこれらの完了の後に行う (このモジュール doc「停止は、固まった再開の
+    /// 後ろで待たない」)。
+    lagging_resume_db: SyncMutex<Vec<DbWrite>>,
+}
+
+/// 完了を追いかける DB 書き込み (別タスク)。結果は待つ側では使わない
+/// (停止・再開の順序を守るために完了だけを待つ)。
+type DbWrite = JoinHandle<Result<(), String>>;
+
+/// 走っている DB 書き込み 1 本を持ち、結果を受け取らないまま捨てられたら
+/// (`op_lock` を持つ側の future が捨てられた・割り込まれた) `slot` に渡す。
+/// `op_lock` のガードより**後に**宣言して、`op_lock` を離す前に渡す。
+struct TrackedDbWrite<'a> {
+    slot: &'a SyncMutex<Vec<DbWrite>>,
+    task: Option<DbWrite>,
+}
+
+impl<'a> TrackedDbWrite<'a> {
+    fn spawn<F>(slot: &'a SyncMutex<Vec<DbWrite>>, write: F) -> Self
+    where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        Self {
+            slot,
+            task: Some(tokio::spawn(write)),
+        }
+    }
+
+    /// 走っている書き込み (取り出す前は必ずある)。
+    fn task(&mut self) -> &mut DbWrite {
+        self.task
+            .as_mut()
+            .expect("the DB write has not been taken yet")
+    }
+
+    /// 結果を受け取った (または自分で後を引き受ける) ので、渡さない。
+    fn take(&mut self) -> Option<DbWrite> {
+        self.task.take()
+    }
+}
+
+impl Drop for TrackedDbWrite<'_> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            lock_ignoring_poison(self.slot).push(task);
+        }
+    }
+}
+
+/// 再開が待っている、遅れている停止の DB 書き込みの残り (古い順)。待ち終わる
+/// 前にやめた (停止が来た・future が捨てられた) ら、残りを `slot` の先頭に順番
+/// どおり戻す (その間に足された分はその後ろ)。
+struct PendingStopWrites<'a> {
+    slot: &'a SyncMutex<Vec<DbWrite>>,
+    pending: VecDeque<DbWrite>,
+}
+
+impl Drop for PendingStopWrites<'_> {
+    fn drop(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut slot = lock_ignoring_poison(self.slot);
+        let newer = std::mem::take(&mut *slot);
+        slot.extend(self.pending.drain(..));
+        slot.extend(newer);
+    }
 }
 
 /// 注意書きと、それを記録した通し番号 (遅れて届く結果が新しい表示を巻き戻さ
@@ -451,7 +604,8 @@ pub struct WriteControlChange {
     /// 再開の保存中に停止が割り込んだため、再開しなかった。
     pub interrupted_by_stop: bool,
     /// 停止の DB 保存が [`STOP_DB_SAVE_TIMEOUT`] を超えたため打ち切った
-    /// (`db` は `Err`)。書き込み自体は続いていて、遅れて完了し得る。
+    /// (`db` は `Err`)。書き込み自体は続いていて、遅れて完了し得る。制限時間
+    /// には、割り込まれた再開が残した DB 書き込みの完了を待つ時間も含む。
     pub db_timed_out: bool,
 }
 
@@ -557,9 +711,11 @@ impl WriteControl {
             was_enabled_before_restart: enabled,
             state_file,
             stop_generation: SyncMutex::new(0),
+            stop_signal: Notify::new(),
             op_lock: AsyncMutex::new(()),
             persistence_warning: Arc::new(SyncMutex::new(WarningSlot { seq: 0, warning })),
             lagging_stop_db: SyncMutex::new(Vec::new()),
+            lagging_resume_db: SyncMutex::new(Vec::new()),
         }
     }
 
@@ -570,11 +726,16 @@ impl WriteControl {
         self.enabled.store(true, Ordering::SeqCst);
     }
 
-    /// ライブフラグだけを落とし、停止の世代を進める (保存しない)。
+    /// ライブフラグだけを落とし、停止の世代を進めて、待っている再開に知らせる
+    /// (保存しない)。運用の停止は [`Self::set_enabled`] を使う (これだけを
+    /// 呼んで割り込んだ再開が残した DB 書き込みは、次の停止が引き取る)。
     pub fn disable(&self) {
         let mut generation = lock_ignoring_poison(&self.stop_generation);
         *generation = generation.wrapping_add(1);
         self.enabled.store(false, Ordering::SeqCst);
+        // 世代を進めたのと同じロックの中で知らせる (世代を読んだ後に作った
+        // 受け口には、その後の停止の知らせだけが届く)。
+        self.stop_signal.notify_waiters();
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -650,12 +811,9 @@ impl WriteControl {
         let started_generation = *lock_ignoring_poison(&self.stop_generation);
         let _op = self.op_lock.lock().await;
         // 遅れている停止の DB 書き込みが終わるまで待つ (再開の「有効」を
-        // 後から「停止」で上書きされないように)。再開に制限時間は無い。
-        let lagging: Vec<JoinHandle<()>> =
-            std::mem::take(&mut *lock_ignoring_poison(&self.lagging_stop_db));
-        for handle in lagging {
-            let _ = handle.await;
-        }
+        // 後から「停止」で上書きされないように)。再開に制限時間は無いが、
+        // 停止が来たら待つのをやめる (終わっていない分は戻す)。
+        self.wait_lagging_stop_db(started_generation).await;
         // 待っている間に停止が来ていたら、何も保存せずにやめる。
         if self.stopped_since(started_generation) {
             let not_saved = || Err(NOT_SAVED_INTERRUPTED.to_string());
@@ -685,8 +843,41 @@ impl WriteControl {
                 return change;
             }
         }
-        // 2. DB を「有効」にする。
-        let db = persist_db.await;
+        // 2. DB を「有効」にする。別タスクで走らせ、停止が来たら完了を待たずに
+        //    やめる (停止を固まった再開の後ろに並ばせない)。書き込みは取り
+        //    消さず、`op_lock` を離す**前に** `lagging_resume_db` へ渡す。割り
+        //    込んだ停止は `op_lock` を取ってからそれを取り出し、自分の DB 書き
+        //    込みをその完了の後に行うので、DB に最後に残るのは停止になる。
+        //    状態ファイルは「再開の途中」(停止扱い) のままにする。この future
+        //    自体が捨てられた (呼び出し側が切断した等) ときも、`db_write` の
+        //    `Drop` が同じく `lagging_resume_db` へ渡す (`_op` より後に宣言して
+        //    いるので、`op_lock` を離す前に渡る)。
+        let mut db_write = TrackedDbWrite::spawn(&self.lagging_resume_db, persist_db);
+        let joined = tokio::select! {
+            biased;
+            () = self.stopped_after(started_generation) => None,
+            joined = db_write.task() => Some(joined),
+        };
+        let Some(joined) = joined else {
+            // 割り込まれた: 書き込みは `db_write` を捨てるときに
+            // `lagging_resume_db` へ渡る (捨てられたときと同じ経路)。
+            drop(db_write);
+            let change = WriteControlChange {
+                requested_enabled: true,
+                db: Err(DB_ABANDONED_ON_STOP.to_string()),
+                file: self
+                    .state_file
+                    .as_ref()
+                    .map(|_| Err(KEPT_RESUME_PENDING_ON_STOP.to_string())),
+                interrupted_by_stop: true,
+                db_timed_out: false,
+            };
+            self.record_outcome(&change);
+            return change;
+        };
+        // 結果を受け取ったので、もう誰にも渡さない。
+        db_write.take();
+        let db = flatten_join(joined);
         // 3. DB に保存できたときだけ、状態ファイルを「有効」にする (ここが
         //    再開の確定点)。DB が失敗したら「再開の途中」のまま残す。
         let file = match &self.state_file {
@@ -718,6 +909,51 @@ impl WriteControl {
         *lock_ignoring_poison(&self.stop_generation) != started_generation
     }
 
+    /// `started_generation` を覚えた後に停止が来るまで待つ (もう来ていれば
+    /// すぐ返る)。知らせを取りこぼさないよう、**受け口を登録してから**世代を
+    /// 確かめる: 確かめた後の停止は登録済みの受け口に届き、確かめる前の停止は
+    /// 世代の比較で分かる。起きたら世代を確かめ直す (起き違いは待ち直す)。
+    /// 途中で捨ててよい (何も持たない)。
+    async fn stopped_after(&self, started_generation: u64) {
+        loop {
+            let notified = self.stop_signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.stopped_since(started_generation) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 再開が `op_lock` の中で、遅れている停止の DB 書き込みの完了を古い順に
+    /// 待つ。`started_generation` の後に停止が来たら待つのをやめ、終わって
+    /// いない書き込みを `lagging_stop_db` の先頭に順番どおり戻す (次の再開が
+    /// また待つ。失わない)。この future が途中で捨てられたときも同じく戻す
+    /// (どちらも [`PendingStopWrites`] の `Drop` の 1 経路)。停止が来たかは
+    /// 呼び出し側が世代で確かめる。
+    async fn wait_lagging_stop_db(&self, started_generation: u64) {
+        let mut waiting = PendingStopWrites {
+            slot: &self.lagging_stop_db,
+            pending: std::mem::take(&mut *lock_ignoring_poison(&self.lagging_stop_db)).into(),
+        };
+        let stop = self.stopped_after(started_generation);
+        tokio::pin!(stop);
+        while let Some(handle) = waiting.pending.front_mut() {
+            let finished = tokio::select! {
+                biased;
+                () = &mut stop => false,
+                _ = handle => true,
+            };
+            if !finished {
+                break;
+            }
+            // 完了を見届けたものだけを外す (この間に await は無い)。
+            waiting.pending.pop_front();
+        }
+        // 残りがあれば `waiting` を捨てるときに戻る。
+    }
+
     /// 停止の保存 (ライブフラグを落とした後に呼ぶ)。
     async fn save_stop<F>(&self, actor: Option<&str>, persist_db: F) -> WriteControlChange
     where
@@ -731,8 +967,27 @@ impl WriteControl {
         // (#439 レビュー P1-2: 停止が成功したのにライブフラグだけ有効、を残さない)。
         self.disable();
         let file = self.persist_file(false, actor).await;
-        let mut task = tokio::spawn(persist_db);
-        let (db, db_timed_out) = match tokio::time::timeout(STOP_DB_SAVE_TIMEOUT, &mut task).await {
+        // 割り込まれた・捨てられた再開が残した DB 書き込み (「有効」) を引き
+        // 取り、この停止の DB 書き込みはそれらの完了の後に行う (DB に最後に
+        // 残るのは停止)。待つ時間も下の制限時間に含める。取り出してから
+        // タスクに渡すまでの間に await を挟まない (この future が捨てられても
+        // 取り出した書き込みを失わない)。
+        let resume_writes: Vec<DbWrite> =
+            std::mem::take(&mut *lock_ignoring_poison(&self.lagging_resume_db));
+        // この future が制限時間を待つ間に捨てられたら、停止の DB 書き込みは
+        // そのまま `lagging_stop_db` に入る (次の再開が待つ)。結果は誰も記録
+        // していないので、注意書きは更新しない。
+        let mut db_write = TrackedDbWrite::spawn(&self.lagging_stop_db, async move {
+            for handle in resume_writes {
+                let _ = handle.await;
+            }
+            persist_db.await
+        });
+        let timed = tokio::time::timeout(STOP_DB_SAVE_TIMEOUT, db_write.task()).await;
+        // ここから先に await は無い。完了したら誰にも渡さず、打ち切ったときは
+        // 見届け役に渡す。
+        let task = db_write.take();
+        let (db, db_timed_out) = match timed {
             Ok(joined) => (flatten_join(joined), false),
             Err(_) => (
                 Err(format!(
@@ -750,7 +1005,7 @@ impl WriteControl {
             db_timed_out,
         };
         let seq = self.record_outcome(&change);
-        if db_timed_out {
+        if let (true, Some(task)) = (db_timed_out, task) {
             self.follow_lagging_stop_db(task, change.file.clone(), seq);
         }
         change
@@ -758,12 +1013,7 @@ impl WriteControl {
 
     /// 打ち切った停止の DB 書き込みを見届ける (`op_lock` の中で呼ぶ)。完了
     /// したら、この停止より新しい記録が無いときだけ注意書きを更新する。
-    fn follow_lagging_stop_db(
-        &self,
-        task: JoinHandle<Result<(), String>>,
-        file: Option<Result<(), String>>,
-        seq: u64,
-    ) {
+    fn follow_lagging_stop_db(&self, task: DbWrite, file: Option<Result<(), String>>, seq: u64) {
         let slot = self.persistence_warning.clone();
         let follower = tokio::spawn(async move {
             let late = WriteControlChange {
@@ -783,6 +1033,7 @@ impl WriteControl {
             if slot.seq == seq {
                 slot.warning = late.warning();
             }
+            late.db
         });
         lock_ignoring_poison(&self.lagging_stop_db).push(follower);
     }
@@ -1465,7 +1716,9 @@ mod tests {
     }
 
     /// 再開の保存 (DB) が詰まっているあいだに停止が来たら: 停止はすぐに
-    /// 効き、再開はライブフラグを立てず、最後に残る永続値も停止になる。
+    /// 効き、再開は DB の完了を待たずに割り込まれて返り (ライブフラグを
+    /// 立てない)、停止の DB 書き込みは再開の書き込みの後に行われ、最後に
+    /// 残る永続値も停止になる。
     /// (有効な状態から、再開が重ねて要求されて詰まっている場面で確かめる -
     /// ライブフラグが「すぐに落ちる」ことを観測できるように。)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1510,14 +1763,30 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!stop.is_finished(), "the stop's save waits for the resume");
 
-        release.notify_one();
-        let resumed = resume.await.unwrap();
+        // 再開は自分の DB 保存の完了を待たずに、割り込まれて返る。
+        let resumed = tokio::time::timeout(Duration::from_secs(2), resume)
+            .await
+            .expect("the resume must stop waiting for its DB once a stop arrives")
+            .unwrap();
         assert!(resumed.interrupted_by_stop, "{resumed:?}");
         assert!(!resumed.succeeded());
+        assert_eq!(resumed.db_error(), Some(DB_ABANDONED_ON_STOP));
+        assert_eq!(resumed.file_error(), Some(KEPT_RESUME_PENDING_ON_STOP));
+        // 停止の DB 書き込みは、見捨てた再開の書き込みの完了を待つ。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !stop.is_finished(),
+            "the stop's DB write is ordered after the abandoned resume write"
+        );
+
+        release.notify_one();
         let stopped = stop.await.unwrap();
-        assert!(stopped.succeeded());
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        assert!(!stopped.db_timed_out);
         assert!(!control.is_enabled(), "the stop wins");
         assert_eq!(
             read_state_file(&state_file).await,
@@ -1718,9 +1987,18 @@ mod tests {
             "{stopped:?}"
         );
         assert!(!control.is_enabled(), "the later stop wins");
+        // B は C が来た時点で待つのをやめ (A の完了を待たない)、C はその場で
+        // 保存する。停止どうしの DB 書き込みの順番は問わない (どちらも「停止」。
+        // 遅れた停止が後の停止の後に届くのは従来からある。
+        // `a_late_stop_db_result_updates_only_its_own_warning` 参照)。B が A を
+        // 待たなくなったので、A の書き込みが届くのを待ってから比べる。
+        wait_until("the lagging stop A lands", || {
+            order.lock().unwrap().len() == 2
+        })
+        .await;
         assert_eq!(
             *order.lock().unwrap(),
-            vec!["stop A", "stop C"],
+            vec!["stop C", "stop A"],
             "the interrupted resume saves nothing"
         );
         assert_eq!(
@@ -1920,15 +2198,457 @@ mod tests {
             order.lock().unwrap().contains(&"late failure")
         })
         .await;
-        let lagging: Vec<JoinHandle<()>> =
-            std::mem::take(&mut *control.lagging_stop_db.lock().unwrap());
+        let lagging: Vec<DbWrite> = std::mem::take(&mut *control.lagging_stop_db.lock().unwrap());
         for handle in lagging {
-            handle.await.unwrap();
+            // 見届け役は遅れた結果を返す (ここでは「失敗」)。完了だけを待つ。
+            let _ = handle.await.unwrap();
         }
         assert_eq!(
             control.persistence_warning(),
             None,
             "an older late result must not overwrite a newer outcome"
         );
+    }
+
+    // --- 停止は、固まった再開の後ろで待たない (2026-10-10) -------------------
+
+    /// 再開の DB 保存が返らない (DB が固まった) ときに停止が来た: 停止は
+    /// 再開を待たずに、自分の DB 保存の制限時間 (再開の書き込みの完了待ちを
+    /// 含む) で返る。書き込みは止まり、再開は割り込まれて返り、状態ファイルは
+    /// 「停止」、再起動は停止で起動する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_does_not_wait_behind_a_resume_whose_db_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = init_db(dir.path().join("registry.sqlite3")).await.unwrap();
+        let state_file = state_file_path(&dir.path().join("data"));
+        persist_enabled(&pool, false, None).await.unwrap();
+        write_state_file(&state_file, false, None).await.unwrap();
+        let control = Arc::new(WriteControl::restore(
+            load_startup_decision(&pool, &state_file).await,
+            state_file.clone(),
+        ));
+        assert!(!control.is_enabled());
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = {
+            let control = control.clone();
+            let entered = entered.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, Some("admin"), async move {
+                        entered.notify_one();
+                        std::future::pending::<Result<(), String>>().await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::ResumePending,
+            "precondition: the resume is inside its DB save"
+        );
+
+        let started = std::time::Instant::now();
+        let stopped = tokio::time::timeout(
+            STOP_DB_SAVE_TIMEOUT * 2,
+            control.set_enabled_with(false, Some("admin"), db_ok()),
+        )
+        .await
+        .expect("the stop must not wait behind the hung resume");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= STOP_DB_SAVE_TIMEOUT && elapsed < STOP_DB_SAVE_TIMEOUT * 2,
+            "the stop's DB write waits for the hung resume write until its own limit: {elapsed:?}"
+        );
+        assert!(stopped.db_timed_out, "{stopped:?}");
+        assert!(stopped.succeeded(), "saved to the file, so the stop holds");
+        assert!(!control.is_enabled());
+
+        let resumed = tokio::time::timeout(Duration::from_secs(1), resume)
+            .await
+            .expect("the interrupted resume has returned")
+            .unwrap();
+        assert!(resumed.interrupted_by_stop, "{resumed:?}");
+        assert!(!resumed.succeeded());
+        assert!(!control.is_enabled());
+
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+        let restart = load_startup_decision(&pool, &state_file).await;
+        assert!(!restart.enabled, "the stop survives a restart");
+    }
+
+    /// 見捨てた再開の DB 書き込み (「有効」) は、割り込んだ停止の DB 書き込み
+    /// (「停止」) より必ず先に届く。停止が制限時間で返った後に再開の書き込みが
+    /// 完了しても、その後に停止の書き込みが届き、注意書きもそれで更新される。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_db_write_lands_after_an_abandoned_resume_db_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: false,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let resume = {
+            let control = control.clone();
+            let entered = entered.clone();
+            let held = db_held_until(release.clone(), order.clone(), "resume", Ok(()));
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        entered.notify_one();
+                        held.await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+
+        let stop = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(false, None, async move {
+                        order.lock().unwrap().push("stop");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        let resumed = tokio::time::timeout(Duration::from_secs(2), resume)
+            .await
+            .expect("the resume stops waiting once the stop arrives")
+            .unwrap();
+        assert!(resumed.interrupted_by_stop, "{resumed:?}");
+
+        let stopped = stop.await.unwrap();
+        assert!(stopped.db_timed_out && stopped.succeeded(), "{stopped:?}");
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "the stop's DB write must not land before the abandoned resume write"
+        );
+        assert!(control
+            .persistence_warning()
+            .unwrap()
+            .contains("タイムアウト"));
+        assert!(!control.is_enabled());
+
+        release.notify_one();
+        wait_until("both DB writes land", || order.lock().unwrap().len() == 2).await;
+        assert_eq!(*order.lock().unwrap(), vec!["resume", "stop"]);
+        wait_until("the late stop result clears the warning", || {
+            control.persistence_warning().is_none()
+        })
+        .await;
+        assert!(!control.is_enabled());
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+    }
+
+    /// 再開が遅れている停止の DB 書き込みを待っている間に停止が来た: 再開は
+    /// その完了を待たずにすぐ返り、待っていた書き込みは失われない (次の再開が
+    /// また待つ)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_interrupted_while_waiting_for_a_lagging_stop_keeps_it_for_the_next_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file_path(dir.path()),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        // 停止 A: DB 保存が制限時間を超えて遅れる。
+        let stopped = control
+            .set_enabled_with(
+                false,
+                None,
+                db_held_until(release.clone(), order.clone(), "stop A", Ok(())),
+            )
+            .await;
+        assert!(stopped.db_timed_out && stopped.succeeded(), "{stopped:?}");
+
+        let resume_pushing = |label: &'static str| {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        order.lock().unwrap().push(label);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+
+        // 再開 B: A の DB 書き込みの完了を待つ。
+        let resume_b = resume_pushing("resume B");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!resume_b.is_finished());
+
+        // 停止 C: B は A を待たずにすぐやめ、C はその場で保存する。
+        let order_c = order.clone();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(2),
+            control.set_enabled_with(false, None, async move {
+                order_c.lock().unwrap().push("stop C");
+                Ok(())
+            }),
+        )
+        .await
+        .expect("the stop must not wait for the lagging stop write behind the resume");
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        let resumed = tokio::time::timeout(Duration::from_secs(2), resume_b)
+            .await
+            .expect("the interrupted resume has returned")
+            .unwrap();
+        assert!(resumed.interrupted_by_stop, "{resumed:?}");
+        assert_eq!(*order.lock().unwrap(), vec!["stop C"]);
+
+        // 再開 D: A の書き込みはまだ控えに残っているので、D はそれを待つ。
+        let resume_d = resume_pushing("resume D");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !resume_d.is_finished(),
+            "the lagging stop write must not be lost by the interrupted resume"
+        );
+        assert_eq!(*order.lock().unwrap(), vec!["stop C"]);
+
+        release.notify_one();
+        let resumed = resume_d.await.unwrap();
+        assert!(resumed.succeeded(), "{resumed:?}");
+        assert_eq!(*order.lock().unwrap(), vec!["stop C", "stop A", "resume D"]);
+        assert!(control.is_enabled());
+    }
+
+    // --- 呼び出し側が future を捨てても、書き込みを見失わない (2026-10-10) -----
+
+    /// DB 保存の途中で再開の future が捨てられた (クライアントの切断): その
+    /// DB 書き込みは追跡に残り、次の停止の DB 書き込みはその完了の後に届く。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_resume_leaves_its_db_write_for_the_next_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: false,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let resume = {
+            let control = control.clone();
+            let entered = entered.clone();
+            let held = db_held_until(release.clone(), order.clone(), "resume", Ok(()));
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        entered.notify_one();
+                        held.await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::ResumePending
+        );
+        resume.abort();
+        assert!(resume.await.unwrap_err().is_cancelled());
+        assert!(!control.is_enabled());
+        assert_eq!(
+            control.lagging_resume_db.lock().unwrap().len(),
+            1,
+            "the abandoned resume write is tracked"
+        );
+
+        let stop = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(false, None, async move {
+                        order.lock().unwrap().push("stop");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "the stop's DB write must wait for the abandoned resume write"
+        );
+        assert!(!stop.is_finished());
+
+        release.notify_one();
+        let stopped = stop.await.unwrap();
+        assert!(
+            stopped.succeeded() && stopped.fully_persisted(),
+            "{stopped:?}"
+        );
+        assert_eq!(*order.lock().unwrap(), vec!["resume", "stop"]);
+        assert!(!control.is_enabled());
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+    }
+
+    /// 遅れている停止の DB 書き込みを待っている間に再開の future が捨てられた:
+    /// 待っていた書き込みは控えに戻り、後の再開がまた待つ。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_dropped_while_waiting_for_a_lagging_stop_keeps_it_for_the_next_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file_path(dir.path()),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        // 停止 A: DB 保存が制限時間を超えて遅れる。
+        let stopped = control
+            .set_enabled_with(
+                false,
+                None,
+                db_held_until(release.clone(), order.clone(), "stop A", Ok(())),
+            )
+            .await;
+        assert!(stopped.db_timed_out && stopped.succeeded(), "{stopped:?}");
+
+        let resume_pushing = |label: &'static str| {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        order.lock().unwrap().push(label);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+
+        // 再開 B: A を待っている間に捨てられる。
+        let resume_b = resume_pushing("resume B");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!resume_b.is_finished());
+        resume_b.abort();
+        assert!(resume_b.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            control.lagging_stop_db.lock().unwrap().len(),
+            1,
+            "the lagging stop write is put back"
+        );
+
+        // 再開 D: A をまた待つ。
+        let resume_d = resume_pushing("resume D");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !resume_d.is_finished(),
+            "the lagging stop write must not be lost by the dropped resume"
+        );
+        assert!(order.lock().unwrap().is_empty());
+
+        release.notify_one();
+        let resumed = resume_d.await.unwrap();
+        assert!(resumed.succeeded(), "{resumed:?}");
+        assert_eq!(*order.lock().unwrap(), vec!["stop A", "resume D"]);
+        assert!(control.is_enabled());
+    }
+
+    /// 停止の future が DB 保存の制限時間を待つ間に捨てられた: 停止の DB
+    /// 書き込みは `lagging_stop_db` に残り、次の再開はその完了を待つ。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_dropped_while_its_db_write_runs_keeps_it_for_the_next_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_path(dir.path());
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: true,
+                warning: None,
+            },
+            state_file.clone(),
+        ));
+        let order: Order = Arc::default();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let stop = {
+            let control = control.clone();
+            let entered = entered.clone();
+            let held = db_held_until(release.clone(), order.clone(), "stop", Ok(()));
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(false, None, async move {
+                        entered.notify_one();
+                        held.await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        stop.abort();
+        assert!(stop.await.unwrap_err().is_cancelled());
+        assert!(!control.is_enabled());
+        assert_eq!(
+            read_state_file(&state_file).await,
+            FileStartupState::Disabled
+        );
+        assert_eq!(
+            control.lagging_stop_db.lock().unwrap().len(),
+            1,
+            "the stop's DB write is tracked"
+        );
+
+        let resume = {
+            let control = control.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                control
+                    .set_enabled_with(true, None, async move {
+                        order.lock().unwrap().push("resume");
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!resume.is_finished());
+        assert!(order.lock().unwrap().is_empty());
+
+        release.notify_one();
+        let resumed = resume.await.unwrap();
+        assert!(resumed.succeeded(), "{resumed:?}");
+        assert_eq!(*order.lock().unwrap(), vec!["stop", "resume"]);
+        assert!(control.is_enabled());
     }
 }
