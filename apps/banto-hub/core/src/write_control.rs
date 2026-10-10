@@ -2221,7 +2221,6 @@ mod tests {
         assert!(!resume.is_finished());
 
         // 停止 C: B が待っている間に来る。
-        let before_c = control.stop_state.lock().unwrap().generation;
         let stop = {
             let control = control.clone();
             let order = order.clone();
@@ -2234,14 +2233,16 @@ mod tests {
                     .await
             })
         };
-        wait_until("stop C has started", || {
-            control.stop_state.lock().unwrap().generation != before_c
-        })
-        .await;
-
-        release.notify_one();
-        let resumed = resume.await.unwrap();
-        let stopped = stop.await.unwrap();
+        // A の DB 書き込みは握ったまま: B は C が来た時点で待つのをやめ
+        // (A の完了を待たない)、C はその場で保存して返る。
+        let resumed = tokio::time::timeout(Duration::from_secs(5), resume)
+            .await
+            .expect("the interrupted resume returns without waiting for stop A")
+            .unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .expect("stop C returns without waiting for stop A")
+            .unwrap();
         assert!(resumed.interrupted_by_stop, "{resumed:?}");
         assert!(!resumed.succeeded());
         assert!(
@@ -2249,20 +2250,21 @@ mod tests {
             "{stopped:?}"
         );
         assert!(!control.is_enabled(), "the later stop wins");
-        // B は C が来た時点で待つのをやめ (A の完了を待たない)、C はその場で
-        // 保存する。停止どうしの DB 書き込みの順番は問わない (どちらも「停止」。
-        // 遅れた停止が後の停止の後に届くのは従来からある。
-        // `a_late_stop_db_result_updates_only_its_own_warning` 参照)。B が A を
-        // 待たなくなったので、A の書き込みが届くのを待ってから比べる。
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["stop C"],
+            "the interrupted resume saves nothing; stop A is still held"
+        );
+
+        // 停止どうしの DB 書き込みの順番は問わない (どちらも「停止」。遅れた
+        // 停止が後の停止の後に届くのは従来からある。
+        // `a_late_stop_db_result_updates_only_its_own_warning` 参照)。
+        release.notify_one();
         wait_until("the lagging stop A lands", || {
             order.lock().unwrap().len() == 2
         })
         .await;
-        assert_eq!(
-            *order.lock().unwrap(),
-            vec!["stop C", "stop A"],
-            "the interrupted resume saves nothing"
-        );
+        assert_eq!(*order.lock().unwrap(), vec!["stop C", "stop A"]);
         assert_eq!(
             read_state_file(&state_file).await,
             FileStartupState::Disabled
