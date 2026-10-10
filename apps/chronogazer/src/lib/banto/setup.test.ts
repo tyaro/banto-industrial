@@ -19,7 +19,7 @@
  * `initBanto` / `connectEvents` だけ差し替える（プロバイダーの配線そのもの
  * ではなく、どの経路を選んだかを見るため）。
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { STARTUP_AUTO_RETRIES, STARTUP_RETRY_DELAY_MS } from './startup';
 
 const core = vi.hoisted(() => ({ initBanto: vi.fn(), connectEvents: vi.fn() }));
@@ -39,15 +39,45 @@ async function runAutoRetries(): Promise<void> {
 	}
 }
 
+// 直近の `loadSetup()` の import。テストがタイムアウトして import が孤立しても、
+// そのテストの afterEach で決着させる（fetch もタイマーもまだそのテストのもの。
+// 次のテスト中に setup.ts が評価されて、次の fetch モックを叩くのを防ぐ）。
+let pendingImport: Promise<unknown> | undefined;
+
 async function loadSetup() {
-	const setup = await import('./setup');
-	const state = await import('./startupState.svelte');
+	const imports = Promise.all([import('./setup'), import('./startupState.svelte')]);
+	pendingImport = imports;
+	const [setup, state] = await imports;
 	let settled = false;
 	void setup.bantoReady.then(() => {
 		settled = true;
 	});
 	return { setup, state, settled: () => settled };
 }
+
+// 先にモジュールグラフ（setup.ts → @banto/admin-core / @tauri-apps/api など）を
+// 一度読み込んで変換結果をキャッシュしておく。各テストの `vi.resetModules()` +
+// 再 import はこのキャッシュで速くなる。初回 import は負荷の高い Windows で 5 秒を
+// 超えることがあり（#554 の検証 2026-10-10）、タイムアウトしたテストの import が
+// 孤立したまま次のテスト中に `bantoReady` を走らせて、次の fetch モックを
+// 叩く不具合を起こした。404 は「/api は無い」の確定応答で demo になり、
+// タイマーも再試行も使わない。
+beforeAll(async () => {
+	vi.stubGlobal('location', { origin: 'http://lan.test' });
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async () => new Response('<html>', { status: 404 }))
+	);
+	try {
+		const setup = await import('./setup');
+		await import('./startupState.svelte');
+		await setup.bantoReady;
+	} finally {
+		vi.unstubAllGlobals();
+		core.initBanto.mockReset();
+		core.connectEvents.mockReset();
+	}
+}, 60_000);
 
 beforeEach(() => {
 	vi.resetModules();
@@ -57,13 +87,16 @@ beforeEach(() => {
 	vi.stubGlobal('location', { origin: 'http://lan.test' });
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await pendingImport?.catch(() => {});
+	pendingImport = undefined;
+	vi.clearAllTimers();
 	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	vi.unstubAllEnvs();
 });
 
-describe('bantoReady: 一時的に届かないときは demo に落ちない（#286）', () => {
+describe('bantoReady: 一時的に届かないときは demo に落ちない（#286）', { timeout: 30_000 }, () => {
 	const transient: [string, () => Promise<Response>][] = [
 		[
 			'fetch の例外（サーバーが止まっている）',
@@ -123,7 +156,7 @@ describe('bantoReady: 一時的に届かないときは demo に落ちない（#
 	});
 });
 
-describe('bantoReady: demo になる経路', () => {
+describe('bantoReady: demo になる経路', { timeout: 30_000 }, () => {
 	it('VITE_BANTO_DEMO=1 のビルドは probe せずに demo', async () => {
 		vi.stubEnv('VITE_BANTO_DEMO', '1');
 		const fetchMock = vi.fn(async () => json(200, false));
