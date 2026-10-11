@@ -982,6 +982,14 @@ fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Resul
 /// tags in [`validate_tag_input`]): the only registry editor that will create
 /// hub tags is ChronoGazer, which always sends `writable: false`, so a `true`
 /// here can only be a caller that believes it can write - and it cannot.
+///
+/// #383 段階3 P4 (2026-10-11 オーナー決定): **scaling is refused too**. The
+/// Hub already publishes engineering values (its own tags carry their own
+/// scaling), so a second linear conversion here would silently double-scale
+/// every recorded sample. An identity mapping (`raw_lo == eng_lo` and
+/// `raw_hi == eng_hi`) changes nothing and is let through; a partial set of
+/// the four bounds is already reported by [`Scaling::from_parts`] in
+/// [`validate_tag_input`], so this only looks at a complete set.
 fn hub_tag_errors(input: &TagInput) -> Vec<FieldError> {
     let mut errors = Vec::new();
     if let Err(message) = validate_hub_tag_address(input.address.trim()) {
@@ -1003,7 +1011,26 @@ fn hub_tag_errors(input: &TagInput) -> Vec<FieldError> {
                 .to_string(),
         });
     }
+    if hub_scaling_is_not_identity(input) {
+        errors.push(FieldError {
+            field: "scaling".to_string(),
+            message: "Hub 経由のタグにはスケーリングを設定できません（Hub は工学値を送るため、                      ここで変換すると二重に換算されます）"
+                .to_string(),
+        });
+    }
     errors
+}
+
+/// Whether a hub tag carries a real (non-identity) linear scaling - the
+/// #383 段階3 P4 rule in [`hub_tag_errors`]. Only a complete set of the four
+/// bounds is judged (a partial set is [`Scaling::from_parts`]' error).
+fn hub_scaling_is_not_identity(input: &TagInput) -> bool {
+    match (input.raw_lo, input.raw_hi, input.eng_lo, input.eng_hi) {
+        (Some(raw_lo), Some(raw_hi), Some(eng_lo), Some(eng_hi)) => {
+            raw_lo != eng_lo || raw_hi != eng_hi
+        }
+        _ => false,
+    }
 }
 
 /// Cross-table placement check (T6-2, design §4.2's reserved `calc`/`mem`
@@ -6722,6 +6749,83 @@ mod tests {
         db.tag_kind = DB_TAG_KIND.to_string();
         let errors = field_errors_of(svc.create(db).await.unwrap_err());
         assert_eq!(errors[0].field, "tagKind");
+    }
+
+    /// #383 段階3 P4: a hub tag refuses a real scaling (the Hub sends
+    /// engineering values - converting again would double-scale), on create,
+    /// on update and in a batch, while an identity mapping and no scaling at
+    /// all are accepted.
+    #[tokio::test]
+    async fn a_hub_tag_refuses_a_non_identity_scaling() {
+        let (svc, _) = setup().await;
+        let group = hub_group(&svc.pool).await;
+
+        let scaled = |name: &str, raw: (f64, f64), eng: (f64, f64)| {
+            let mut input = hub_tag(name, group, &format!("PLC1.G.{name}"));
+            input.raw_lo = Some(raw.0);
+            input.raw_hi = Some(raw.1);
+            input.eng_lo = Some(eng.0);
+            input.eng_hi = Some(eng.1);
+            input
+        };
+
+        let errors = field_errors_of(
+            svc.create(scaled("S", (0.0, 4000.0), (0.0, 100.0)))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "scaling");
+        assert!(errors[0].message.contains("Hub"), "{}", errors[0].message);
+
+        // An offset alone (same span) is still a conversion.
+        let errors = field_errors_of(
+            svc.create(scaled("O", (0.0, 100.0), (10.0, 110.0)))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors[0].field, "scaling");
+
+        // Identity and no scaling at all are accepted.
+        svc.create(scaled("I", (0.0, 100.0), (0.0, 100.0)))
+            .await
+            .expect("an identity scaling changes nothing");
+        let plain = svc
+            .create(hub_tag("P", group, "PLC1.G.P"))
+            .await
+            .expect("a hub tag without scaling is accepted");
+
+        // Update and batch hold the same rule.
+        let errors = field_errors_of(
+            svc.update(plain.id, scaled("P", (0.0, 1.0), (0.0, 2.0)))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors[0].field, "scaling");
+        match svc
+            .create_batch(vec![scaled("B", (0.0, 1.0), (0.0, 2.0))], true)
+            .await
+            .unwrap()
+        {
+            BatchTagOutcome::Invalid(errors) => {
+                assert_eq!(errors[0].field_errors[0].field, "scaling");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// The scaling rule is hub-only: a PLC tag keeps its scaling.
+    #[tokio::test]
+    async fn a_plc_tag_still_accepts_scaling() {
+        let (svc, plc_group) = setup().await;
+        let mut input = sample_input("Scaled", plc_group);
+        input.raw_lo = Some(0.0);
+        input.raw_hi = Some(4000.0);
+        input.eng_lo = Some(0.0);
+        input.eng_hi = Some(100.0);
+        svc.create(input)
+            .await
+            .expect("scaling outside the hub is unchanged");
     }
 
     /// Outside a hub connection nothing changes: the 64-bit types are still
