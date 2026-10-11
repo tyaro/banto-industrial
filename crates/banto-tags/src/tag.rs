@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::plc_connection::{
-    CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL,
+    CALC_CONNECTION_NAME, HUB_PROTOCOL, MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL,
+    VIRTUAL_PROTOCOL,
 };
 use crate::scaling::Scaling;
 use crate::support::{map_write_error, max_length_message, range_message, required_message};
@@ -186,6 +187,56 @@ pub const DB_TAG_KIND: &str = "db";
 /// own identifiers at this length - so accepting one would only ever produce
 /// a tag that can never match a column.
 pub const MAX_DB_COLUMN_NAME_LEN: usize = 63;
+
+/// Upper bound on a hub tag's `address` (#383 段階3 P2): a banto-hub external
+/// name is `接続名.グループ名.タグ名`, and each of the three names is capped at
+/// 100 characters by this crate's own validation (`plc_connections.name`,
+/// `collection_groups.name`, `tags.name` - the Hub stores its registry in the
+/// same tables), so no real external name is longer than `3 * 100 + 2`.
+pub const MAX_HUB_EXTERNAL_NAME_LEN: usize = 3 * MAX_NAME_LEN + 2;
+
+/// #383 段階3 P2 (2026-10-10 オーナー決定 H1、`crate::plc_connection` の
+/// "`\"hub\"`" 節): the shape a tag's `address` must have when its group sits
+/// under a [`crate::plc_connection::HUB_PROTOCOL`] connection - there it is
+/// not a PLC device address but **the Hub tag's external name** (identity by
+/// name, scada-design.md §9.6). `address` is expected already trimmed (as
+/// [`validate_tag_input`] stores it). `Err` carries the field message.
+///
+/// The rule is "could this be a banto-hub external name that a client can
+/// actually subscribe to", and no more - banto-hub's own names are free text
+/// (trimmed, non-empty, at most 100 characters each), so this does not invent
+/// a stricter grammar than the Hub's:
+///
+/// - non-empty, at most [`MAX_HUB_EXTERNAL_NAME_LEN`] characters;
+/// - at least two `.` - every external name the Hub publishes is
+///   `{connection}.{group}.{tag}` (`apps/banto-hub/core/src/hub.rs`'s catalog
+///   builder, the DB Source's likewise; `calc`/`mem` are connections too), so
+///   an address with fewer dots cannot name any Hub tag (and catches a PLC
+///   device address such as `D100` pasted by mistake);
+/// - no `,` - `banto-tagclient` refuses a comma in a name it is asked to read
+///   or subscribe (`RestClient::fetch_values`' single `tags=` query makes it
+///   ambiguous), so such a tag could never be collected;
+/// - no control characters - none can come from a trimmed Hub name typed
+///   into a form, and one here would only ever be a copy/paste accident.
+pub fn validate_hub_tag_address(address: &str) -> Result<(), String> {
+    if address.is_empty() {
+        return Err(required_message());
+    }
+    if address.chars().count() > MAX_HUB_EXTERNAL_NAME_LEN {
+        return Err(max_length_message(MAX_HUB_EXTERNAL_NAME_LEN));
+    }
+    if address.contains(',') || address.chars().any(char::is_control) {
+        return Err("Hub のタグ名（外部名）にカンマや制御文字は使えません".to_string());
+    }
+    if address.matches('.').count() < 2 {
+        return Err(
+            "Hub 経由のタグのアドレスは Hub のタグ名（外部名「接続名.グループ名.タグ名」）で\
+             指定してください"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
 
 /// A row of the `tags` table, wire-shaped (camelCase) for a future settings
 /// grid (recorder-requirements.md §6 "タグ設定" screen).
@@ -827,14 +878,22 @@ const PLACEMENT_CONNECTION_SQL: &str = "SELECT pc.name, pc.protocol FROM collect
 /// fail: a `computed` tag misplaced *and* typed `i64` is misplaced first and
 /// foremost, and the caller's field-error list stays as short as the existing
 /// twins' did.
-fn placement_verdict(
-    conn_name: &str,
-    protocol: &str,
-    tag_kind: &str,
-    data_type: &str,
-) -> Result<(), BantoError> {
+///
+/// A third family (#383 段階3 P2, 2026-10-10 オーナー決定 H1/H3/H5) applies
+/// to a `plc` tag under a [`HUB_PROTOCOL`] connection - see [`hub_tag_errors`]:
+/// `address` is the Hub tag's external name ([`validate_hub_tag_address`]),
+/// `data_type` is numeric or `bit` (no `string`; the 64-bit types *are*
+/// allowed - the Hub serves whatever its own connections carry, and the
+/// value travels as `f64` exactly as it does from a direct Modbus read, the
+/// precision trade-off [`MODBUS_ONLY_DATA_TYPES`] already accepts), and
+/// `writable` must be `false` (no writes through the Hub). Every violation
+/// of this family is reported together.
+fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Result<(), BantoError> {
+    let tag_kind = input.tag_kind.as_str();
+    let data_type = input.data_type.as_str();
     let is_virtual = protocol == VIRTUAL_PROTOCOL;
     let is_postgres = protocol == POSTGRES_PROTOCOL;
+    let is_hub = protocol == HUB_PROTOCOL;
 
     let placement_error = |field: &str, message: String| -> Result<(), BantoError> {
         Err(BantoError::Validation {
@@ -886,10 +945,24 @@ fn placement_verdict(
         _ => {}
     }
 
+    // #383 段階3 P2: Hub 経由のタグ（`hub` 接続配下の `plc` タグ）の規則。
+    // 上の match を抜けた時点で `tag_kind` は `plc`（computed/internal/db は
+    // `hub` 配下だと上で拒否済み）か未知の値（validate_tag_input が拒否済み）。
+    if is_hub && tag_kind == PLC_TAG_KIND {
+        let errors = hub_tag_errors(input);
+        if !errors.is_empty() {
+            return Err(BantoError::Validation {
+                field_errors: errors,
+            });
+        }
+        return Ok(());
+    }
+
     // #325 (2026-09-08 オーナー決定): 64bit 型は Modbus 接続配下限定 -
     // `MODBUS_ONLY_DATA_TYPES` の doc comment 参照。`tag_kind` と独立した
     // 規則なので、上の match を抜けた（＝種別としては正しい配置の）タグにも
-    // 必ず適用される。
+    // 必ず適用される。例外は Hub 経由のタグ（直上で返している - この関数の
+    // doc comment 参照）。
     if MODBUS_ONLY_DATA_TYPES.contains(&data_type) && protocol != MODBUS_PROTOCOL {
         return placement_error(
             "dataType",
@@ -898,6 +971,39 @@ fn placement_verdict(
     }
 
     Ok(())
+}
+
+/// The hub-tag family of [`placement_verdict`] (#383 段階3 P2), every
+/// violation at once: `address` must be an external name
+/// ([`validate_hub_tag_address`]), `data_type` must not be `string` (H3: the
+/// recorder pipeline is numeric-only - the Hub's own string tags are not
+/// recordable), and `writable` must be `false` (H5: no writes through the
+/// Hub). `writable` is **rejected** rather than normalized (contrast `db`
+/// tags in [`validate_tag_input`]): the only registry editor that will create
+/// hub tags is ChronoGazer, which always sends `writable: false`, so a `true`
+/// here can only be a caller that believes it can write - and it cannot.
+fn hub_tag_errors(input: &TagInput) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    if let Err(message) = validate_hub_tag_address(input.address.trim()) {
+        errors.push(FieldError {
+            field: "address".to_string(),
+            message,
+        });
+    }
+    if input.data_type == STRING_DATA_TYPE {
+        errors.push(FieldError {
+            field: "dataType".to_string(),
+            message: "string 型は Hub 経由のタグに設定できません（数値・bit のみ）".to_string(),
+        });
+    }
+    if input.writable {
+        errors.push(FieldError {
+            field: "writable".to_string(),
+            message: "Hub 経由のタグは書き込み可にできません（Hub 経由の書き込みは行いません）"
+                .to_string(),
+        });
+    }
+    errors
 }
 
 /// Cross-table placement check (T6-2, design §4.2's reserved `calc`/`mem`
@@ -935,12 +1041,10 @@ fn placement_verdict(
 /// at that name.
 async fn validate_tag_kind_placement(
     pool: &SqlitePool,
-    collection_group_id: i64,
-    tag_kind: &str,
-    data_type: &str,
+    input: &TagInput,
 ) -> Result<(), BantoError> {
     let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
-        .bind(collection_group_id)
+        .bind(input.collection_group_id)
         .fetch_optional(pool)
         .await
         .map_err(banto_storage::storage_error)?;
@@ -948,7 +1052,7 @@ async fn validate_tag_kind_placement(
     let Some((conn_name, protocol)) = row else {
         return Ok(());
     };
-    placement_verdict(&conn_name, &protocol, tag_kind, data_type)
+    placement_verdict(&conn_name, &protocol, input)
 }
 
 /// Transaction-taking twin of [`validate_tag_kind_placement`] - identical
@@ -957,19 +1061,17 @@ async fn validate_tag_kind_placement(
 /// transaction's uncommitted writes.
 async fn validate_tag_kind_placement_tx(
     connection: &mut SqliteConnection,
-    collection_group_id: i64,
-    tag_kind: &str,
-    data_type: &str,
+    input: &TagInput,
 ) -> Result<(), BantoError> {
     let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
-        .bind(collection_group_id)
+        .bind(input.collection_group_id)
         .fetch_optional(&mut *connection)
         .await
         .map_err(banto_storage::storage_error)?;
     let Some((conn_name, protocol)) = row else {
         return Ok(());
     };
-    placement_verdict(&conn_name, &protocol, tag_kind, data_type)
+    placement_verdict(&conn_name, &protocol, input)
 }
 
 fn column_map() -> ColumnMap {
@@ -1279,13 +1381,7 @@ impl TagService {
 
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(
-            &self.pool,
-            input.collection_group_id,
-            &input.tag_kind,
-            &input.data_type,
-        )
-        .await?;
+        validate_tag_kind_placement(&self.pool, &input).await?;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1326,13 +1422,7 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(
-            connection,
-            input.collection_group_id,
-            &input.tag_kind,
-            &input.data_type,
-        )
-        .await?;
+        validate_tag_kind_placement_tx(connection, &input).await?;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1385,13 +1475,7 @@ impl TagService {
     /// hub REST layer, via [`Self::update_tx`]).
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(
-            &self.pool,
-            input.collection_group_id,
-            &input.tag_kind,
-            &input.data_type,
-        )
-        .await?;
+        validate_tag_kind_placement(&self.pool, &input).await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update_tag_sql() は expected_revision の有無で固定の
@@ -1479,13 +1563,7 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, TagUpdateError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(
-            connection,
-            input.collection_group_id,
-            &input.tag_kind,
-            &input.data_type,
-        )
-        .await?;
+        validate_tag_kind_placement_tx(connection, &input).await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update() と同じ理由 - update_tag_sql() は固定の
@@ -1659,14 +1737,7 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement_tx(
-                connection,
-                input.collection_group_id,
-                &input.tag_kind,
-                &input.data_type,
-            )
-            .await
-            {
+            match validate_tag_kind_placement_tx(connection, input).await {
                 Ok(()) => {}
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
@@ -2066,14 +2137,7 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement_tx(
-                connection,
-                input.collection_group_id,
-                &input.tag_kind,
-                &input.data_type,
-            )
-            .await
-            {
+            match validate_tag_kind_placement_tx(connection, input).await {
                 Ok(()) => {}
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
@@ -2270,14 +2334,7 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement(
-                &self.pool,
-                input.collection_group_id,
-                &input.tag_kind,
-                &input.data_type,
-            )
-            .await
-            {
+            match validate_tag_kind_placement(&self.pool, input).await {
                 Ok(()) => {}
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
@@ -6473,5 +6530,211 @@ mod tests {
         assert!(matches!(retry, BatchTagDeleteOutcome::Valid { count: 1 }));
         tx.commit().await.expect("commit");
         assert!(svc.get(a.id).await.is_err());
+    }
+
+    // --- #383 段階3 P2: tags under a "hub" connection --------------------
+
+    /// A group under the registry's (only) hub connection.
+    async fn hub_group(pool: &SqlitePool) -> i64 {
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "Hub".to_string(),
+                protocol: HUB_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: String::new(),
+                database: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .expect("hub connection should be creatable");
+        CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "HubGroup".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            })
+            .await
+            .expect("group under the hub connection should be creatable")
+            .id
+    }
+
+    fn hub_tag(name: &str, group_id: i64, address: &str) -> TagInput {
+        let mut input = sample_input(name, group_id);
+        input.address = address.to_string();
+        input
+    }
+
+    fn field_errors_of(err: BantoError) -> Vec<FieldError> {
+        match err {
+            BantoError::Validation { field_errors } => field_errors,
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_hub_tag_address_table() {
+        let longest = format!(
+            "{}.{}.{}",
+            "a".repeat(100),
+            "b".repeat(100),
+            "c".repeat(100)
+        );
+        assert_eq!(longest.chars().count(), MAX_HUB_EXTERNAL_NAME_LEN);
+        let too_long = format!("{longest}d");
+        let cases: &[(&str, bool)] = &[
+            ("PLC1.Group1.Temp", true),
+            ("calc.g.t", true),
+            ("ライン1.グループ.温度", true),
+            ("a.b.c.d", true), // a Hub name may itself contain a dot
+            ("a b.c d.e f", true),
+            (&longest, true),
+            ("", false),
+            ("D100", false),
+            ("40001", false),
+            ("conn.tag", false),
+            ("a,b.c.d", false),
+            ("a.b.c\u{7}", false),
+            ("a.b\tc.d", false),
+            (&too_long, false),
+        ];
+        for &(address, ok) in cases {
+            assert_eq!(validate_hub_tag_address(address).is_ok(), ok, "{address:?}");
+        }
+    }
+
+    /// A hub tag is an ordinary `plc` tag whose address is an external name.
+    /// Every numeric type and `bit` are accepted - including the 64-bit types,
+    /// which are otherwise Modbus-only (the Hub serves whatever its own
+    /// connections carry).
+    #[tokio::test]
+    async fn a_hub_tag_with_an_external_name_and_a_numeric_type_is_accepted() {
+        let (svc, _) = setup().await;
+        let group = hub_group(&svc.pool).await;
+        for (i, data_type) in NUMERIC_DATA_TYPES.iter().enumerate() {
+            let mut input = hub_tag(&format!("T{i}"), group, &format!("PLC1.G.T{i}"));
+            input.data_type = (*data_type).to_string();
+            let tag = svc
+                .create(input)
+                .await
+                .unwrap_or_else(|e| panic!("{data_type} hub tag should be accepted: {e:?}"));
+            assert_eq!(tag.address, format!("PLC1.G.T{i}"));
+            assert!(!tag.writable);
+        }
+    }
+
+    /// A PLC device address, a string type and `writable` are all refused for
+    /// a hub tag, and reported together.
+    #[tokio::test]
+    async fn a_hub_tag_rejects_device_addresses_strings_and_writable() {
+        let (svc, _) = setup().await;
+        let group = hub_group(&svc.pool).await;
+
+        let mut input = hub_tag("Bad", group, "D100");
+        input.data_type = STRING_DATA_TYPE.to_string();
+        input.string_length = Some(4);
+        input.writable = true;
+        let errors = field_errors_of(svc.create(input).await.unwrap_err());
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec!["address", "dataType", "writable"],
+            "{errors:?}"
+        );
+
+        let mut writable_only = hub_tag("W", group, "PLC1.G.W");
+        writable_only.writable = true;
+        let errors = field_errors_of(svc.create(writable_only).await.unwrap_err());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "writable");
+        assert!(errors[0].message.contains("Hub"), "{}", errors[0].message);
+    }
+
+    /// The same rules hold on the transaction path, on update, and in a batch.
+    #[tokio::test]
+    async fn hub_tag_rules_apply_to_update_tx_and_batch() {
+        let (svc, plc_group) = setup().await;
+        let group = hub_group(&svc.pool).await;
+        let tag = svc.create(hub_tag("T", group, "PLC1.G.T")).await.unwrap();
+
+        let mut tx = svc.pool.begin().await.unwrap();
+        let err = svc
+            .update_tx(&mut tx, tag.id, hub_tag("T", group, "D200"))
+            .await
+            .unwrap_err();
+        match err {
+            TagUpdateError::Banto(BantoError::Validation { field_errors }) => {
+                assert_eq!(field_errors[0].field, "address");
+            }
+            other => panic!("expected a Validation error, got {other:?}"),
+        }
+        drop(tx);
+
+        // Moving an existing PLC tag into the hub group re-checks its address.
+        let plc_tag = svc.create(sample_input("P", plc_group)).await.unwrap();
+        let errors = field_errors_of(
+            svc.update(plc_tag.id, sample_input("P", group))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors[0].field, "address");
+
+        match svc
+            .create_batch(
+                vec![
+                    hub_tag("B1", group, "PLC1.G.B1"),
+                    hub_tag("B2", group, "PLC1"),
+                ],
+                true,
+            )
+            .await
+            .unwrap()
+        {
+            BatchTagOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].index, 1);
+                assert_eq!(errors[0].field_errors[0].field, "address");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// The existing species rules still apply under a hub connection:
+    /// computed/internal/db tags cannot live there.
+    #[tokio::test]
+    async fn only_plc_tags_can_live_under_a_hub_connection() {
+        let (svc, _) = setup().await;
+        let group = hub_group(&svc.pool).await;
+        let mut computed = hub_tag("C", group, "");
+        computed.tag_kind = COMPUTED_TAG_KIND.to_string();
+        computed.expression = Some("1".to_string());
+        let errors = field_errors_of(svc.create(computed).await.unwrap_err());
+        assert_eq!(errors[0].field, "tagKind");
+
+        let mut db = hub_tag("D", group, "col");
+        db.tag_kind = DB_TAG_KIND.to_string();
+        let errors = field_errors_of(svc.create(db).await.unwrap_err());
+        assert_eq!(errors[0].field, "tagKind");
+    }
+
+    /// Outside a hub connection nothing changes: the 64-bit types are still
+    /// Modbus-only (SLMP rejects them) - the hub exemption is not a general
+    /// relaxation.
+    #[tokio::test]
+    async fn the_64bit_rule_is_unchanged_outside_the_hub() {
+        let (svc, _) = setup().await;
+        let slmp = slmp_group(&svc.pool).await;
+        let mut input = sample_input("Wide", slmp);
+        input.address = "D100".to_string();
+        input.data_type = "f64".to_string();
+        let errors = field_errors_of(svc.create(input).await.unwrap_err());
+        assert_eq!(errors[0].field, "dataType");
     }
 }

@@ -157,6 +157,53 @@
 //! (S2, the DB Source polling engine itself, lifts this once `query_sql`
 //! and `tag_kind = "db"` exist to give such a group somewhere to put its
 //! results).
+//!
+//! ## `"hub"` (#383 段階3 P2, 2026-10-10 オーナー決定 H1/H5)
+//!
+//! A fifth protocol joins in migration `0019_plc_connections_allow_hub.sql`:
+//! `"hub"` ([`HUB_PROTOCOL`]) names the banto-hub tag server as a *source* -
+//! ChronoGazer records tags it receives from the Hub alongside the ones it
+//! reads from PLCs directly. Hub-sourced tags are ordinary `tags` rows under
+//! groups under this connection, so pens, history and exclusions all key off
+//! the same tag ID; a hub tag's `address` is the Hub tag's **external name**
+//! (`接続名.グループ名.タグ名` - identity by name, scada-design.md §9.6), see
+//! [`crate::tag::validate_hub_tag_address`] for the exact rule.
+//!
+//! What this connection row does **not** carry is the Hub's endpoint or key:
+//! there is exactly one Hub, and ChronoGazer's `hub.record` setting already
+//! owns both (H1). So, like `"postgres"`, a `"hub"` [`PlcConnectionInput`] has
+//! every wire/PLC field **silently normalized** ([`normalize_hub_input`]):
+//! `host` → `""`, `port` → `0`, `unit_id`/`word_order` → column defaults,
+//! `simulation` → `false`. Normalizing rather than rejecting is the
+//! `"postgres"` reasoning above - a generic caller that always sends its own
+//! defaults should not need hub-specific branching - and storing `""`/`0`
+//! (rather than whatever was sent) keeps a stale-looking host from sitting in
+//! the row while the real endpoint lives elsewhere. `database`/`username`/
+//! `password` stay forbidden, same as every non-`"postgres"` protocol.
+//!
+//! **At most one `"hub"` row per registry.** There is one Hub, so a second
+//! `"hub"` connection could only ever be a duplicate source for the same
+//! external names. Migration `0019` enforces this with a partial unique index
+//! (`idx_plc_connections_single_hub`), which is race-free without a
+//! read-then-write transaction; [`map_connection_write_error`] turns the
+//! violation into a `FieldError` on `protocol`.
+//!
+//! **Switching a connection's protocol to or from `"hub"` is refused while it
+//! still has collection groups** (`update`/`update_tx`). A hub tag's address
+//! is an external name and a PLC tag's is a device address; flipping the
+//! protocol underneath existing tags would leave every one of them with an
+//! address its new connection cannot interpret. The same boundary applies to
+//! moving a group that has tags between a `"hub"` and a non-`"hub"`
+//! connection (`crate::collection_group::CollectionGroupService`).
+//!
+//! **Writes through the Hub are out of scope (H5)** - a hub tag can never be
+//! `writable` ([`crate::tag::TagService`]'s placement check rejects it).
+//!
+//! The collection side does not sample `"hub"` connections yet (P3 adds the
+//! Hub sampler to `banto-collect`); until then `banto_collect`'s lenient
+//! build leaves them out with an explicit reason. banto-hub itself never
+//! accepts a `"hub"` connection (a Hub does not subscribe to itself) -
+//! `apps/banto-hub/core/src/rest.rs::reject_hub_connection_protocol`.
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -175,13 +222,18 @@ use crate::support::{
 /// changed together; `every_allowed_protocol_is_accepted_by_the_sql_check` is
 /// the tripwire if they drift.
 ///
-/// The four entries are, in order, [`MODBUS_PROTOCOL`], `"slmp"`,
-/// [`VIRTUAL_PROTOCOL`] and [`POSTGRES_PROTOCOL`] - spelled out as literals
-/// here (rather than built from those constants) so this list still reads as
-/// the vocabulary itself, exactly like the SQL `CHECK` it mirrors;
-/// `the_named_protocol_constants_are_all_in_allowed_protocols` is the
+/// The five entries are, in order, [`MODBUS_PROTOCOL`], `"slmp"`,
+/// [`VIRTUAL_PROTOCOL`], [`POSTGRES_PROTOCOL`] and [`HUB_PROTOCOL`] (the last
+/// widened by `migrations/0019_plc_connections_allow_hub.sql`) - spelled out
+/// as literals here (rather than built from those constants) so this list
+/// still reads as the vocabulary itself, exactly like the SQL `CHECK` it
+/// mirrors; `the_named_protocol_constants_are_all_in_allowed_protocols` is the
 /// tripwire that keeps the two spellings from drifting.
-pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual", "postgres"];
+///
+/// This is the *registry's* vocabulary, not "what every app accepts": an app
+/// narrows it at its own boundary (ChronoGazer accepts `"modbus-tcp"`/`"slmp"`
+/// only, banto-hub refuses `"hub"`).
+pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual", "postgres", "hub"];
 
 /// Values accepted in `plc_connections.word_order` (P3-b, 監査指摘
 /// 2026-08-12). Mirrors the SQL `CHECK` added by
@@ -241,6 +293,17 @@ pub const VIRTUAL_PROTOCOL: &str = "virtual";
 /// [`PlcConnection::is_db_source`], and by
 /// `crate::collection_group::CollectionGroupService`'s group-placement guard.
 pub const POSTGRES_PROTOCOL: &str = "postgres";
+
+/// The banto-hub-as-a-source protocol (#383 段階3 P2, this module's doc
+/// comment "`\"hub\"`" section). Used by [`validate_plc_connection_input`]/
+/// [`normalize_hub_input`] (no host/port of its own), [`PlcConnection::is_hub_source`],
+/// the at-most-one / protocol-switch guards in [`PlcConnectionService`], and
+/// [`crate::tag::TagService`]'s hub-tag placement rules.
+pub const HUB_PROTOCOL: &str = "hub";
+
+/// Field-error message for a second `"hub"` connection (this module's doc
+/// comment, "`\"hub\"`" section - at most one per registry).
+const SECOND_HUB_MESSAGE: &str = "Hub 接続は 1 つまでです（既に登録されています）";
 
 /// The reserved connection name for computed tags (design §4.2's `calc`
 /// external-name segment). `banto-hub` auto-provisions a `"virtual"`-protocol
@@ -363,16 +426,99 @@ fn normalize_postgres_input(mut input: PlcConnectionInput) -> PlcConnectionInput
     input
 }
 
+/// #383 段階3 P2 (this module's doc comment, "`\"hub\"`" section): a `"hub"`
+/// connection has no endpoint of its own (ChronoGazer's `hub.record` owns
+/// it) and no wire/PLC settings, so `host`/`port`/`unit_id`/`word_order`/
+/// `simulation` are silently replaced - `host` with `""`, `port` with `0`,
+/// the rest with their column defaults - the same "ignore, don't reject"
+/// treatment [`normalize_postgres_input`] gives a `"postgres"` row.
+///
+/// A no-op for every other protocol (returns `input` unchanged).
+fn normalize_hub_input(mut input: PlcConnectionInput) -> PlcConnectionInput {
+    if input.protocol == HUB_PROTOCOL {
+        input.host = String::new();
+        input.port = 0;
+        input.unit_id = default_unit_id();
+        input.word_order = default_word_order();
+        input.simulation = false;
+    }
+    input
+}
+
 /// The single normalization entry point every [`PlcConnectionService`] write
 /// method runs a payload through before [`validate_plc_connection_input`].
 ///
 /// Order matters: [`normalize_word_order_input`] first (it only fills in an
-/// *unspecified* `word_order`), then [`normalize_postgres_input`] (which
-/// overrides `word_order` unconditionally for `"postgres"`), so a
-/// `"postgres"` row still ends up carrying the plain column default no matter
-/// what - or whether - the caller sent.
+/// *unspecified* `word_order`), then [`normalize_postgres_input`] /
+/// [`normalize_hub_input`] (which override `word_order` unconditionally for
+/// their protocol), so a `"postgres"`/`"hub"` row still ends up carrying the
+/// plain column default no matter what - or whether - the caller sent.
 fn normalize_plc_connection_input(input: PlcConnectionInput) -> PlcConnectionInput {
-    normalize_postgres_input(normalize_word_order_input(input))
+    normalize_hub_input(normalize_postgres_input(normalize_word_order_input(input)))
+}
+
+/// Whether `protocol` has no simulation of its own, i.e. its `simulation`
+/// column is always normalized to `false` (`"virtual"` is rejected instead,
+/// `"postgres"`/`"hub"` are normalized - this module's doc comment). Used by
+/// [`PlcConnectionService::update_preserving_simulation`] so a "keep the
+/// stored value" update still stores `false` for these.
+fn has_no_simulation(protocol: &str) -> bool {
+    protocol == POSTGRES_PROTOCOL || protocol == VIRTUAL_PROTOCOL || protocol == HUB_PROTOCOL
+}
+
+/// [`map_write_error`] for `plc_connections`, plus the one constraint only
+/// this table has: the partial unique index `idx_plc_connections_single_hub`
+/// (migration `0019`, at most one `"hub"` row). SQLite reports a partial
+/// unique index on `protocol` as `UNIQUE constraint failed:
+/// plc_connections.protocol`, which is told apart from the `name` UNIQUE by
+/// that column name; anything else falls through to the shared mapping.
+fn map_connection_write_error(err: sqlx::Error) -> BantoError {
+    if let Some(db_err) = err.as_database_error() {
+        if db_err.is_unique_violation() && db_err.message().contains("plc_connections.protocol") {
+            return BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "protocol".to_string(),
+                    message: SECOND_HUB_MESSAGE.to_string(),
+                }],
+            };
+        }
+    }
+    map_write_error(err, "name", NAME_ALREADY_USED, "", "")
+}
+
+/// #383 段階3 P2 (this module's doc comment, "`\"hub\"`" section): refuse
+/// switching a connection's protocol across the `"hub"` boundary while it
+/// still has collection groups. `existing_protocol` is the row's current
+/// protocol (`None` = no such row - the `UPDATE` reports that as not-found).
+/// `group_count` is only consulted when the boundary is actually crossed.
+fn hub_protocol_switch_error(
+    existing_protocol: Option<&str>,
+    new_protocol: &str,
+    group_count: i64,
+) -> Option<BantoError> {
+    if !crosses_hub_boundary(existing_protocol, new_protocol) || group_count == 0 {
+        return None;
+    }
+    Some(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "protocol".to_string(),
+            message: format!(
+                "この接続には収集グループが{group_count}件あるため、Hub 接続と他のプロトコルの間で\
+                 変更できません（Hub 経由のタグのアドレスは外部名で、PLC のアドレスとは\
+                 互換がありません）"
+            ),
+        }],
+    })
+}
+
+/// `SELECT COUNT(*)` of the groups under connection `id` - the input
+/// [`hub_protocol_switch_error`] needs, only queried when the protocol
+/// boundary is crossed.
+const GROUP_COUNT_SQL: &str = "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?";
+
+fn crosses_hub_boundary(existing_protocol: Option<&str>, new_protocol: &str) -> bool {
+    existing_protocol
+        .is_some_and(|existing| (existing == HUB_PROTOCOL) != (new_protocol == HUB_PROTOCOL))
 }
 
 /// [`PlcConnectionService::create`]'s password rule (this crate's
@@ -457,6 +603,15 @@ impl PlcConnection {
     /// of re-deriving the equality check inline.
     pub fn is_db_source(&self) -> bool {
         self.protocol == POSTGRES_PROTOCOL
+    }
+
+    /// #383 段階3 P2 (this module's doc comment, "`\"hub\"`" section):
+    /// whether this row is the banto-hub source connection
+    /// (`protocol == `[`HUB_PROTOCOL`]) rather than a wire-protocol PLC
+    /// connection - the `"hub"` sibling of [`Self::is_db_source`], used by
+    /// `banto_collect::config` to keep it out of the PLC tasks.
+    pub fn is_hub_source(&self) -> bool {
+        self.protocol == HUB_PROTOCOL
     }
 }
 
@@ -605,16 +760,22 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
     // nothing, so `host`/`port` are meaningless - both checks are skipped for
     // it (host may be empty, port may be 0/anything), while every other
     // protocol keeps the original required-host / 1..=65535-port rules.
+    //
+    // #383 段階3 P2: a "hub" connection has no endpoint of its own either
+    // (this module's doc comment, "`\"hub\"`" section) - its host/port are
+    // normalized to ""/0 before validation, so the same two checks are
+    // skipped for it.
     let is_virtual = input.protocol == VIRTUAL_PROTOCOL;
+    let has_no_endpoint = is_virtual || input.protocol == HUB_PROTOCOL;
 
-    if !is_virtual && input.host.trim().is_empty() {
+    if !has_no_endpoint && input.host.trim().is_empty() {
         errors.push(FieldError {
             field: "host".to_string(),
             message: required_message(),
         });
     }
 
-    if !is_virtual && !(MIN_PORT..=MAX_PORT).contains(&input.port) {
+    if !has_no_endpoint && !(MIN_PORT..=MAX_PORT).contains(&input.port) {
         errors.push(FieldError {
             field: "port".to_string(),
             message: range_message(MIN_PORT, MAX_PORT),
@@ -836,7 +997,7 @@ impl PlcConnectionService {
         .bind(stored_password)
         .fetch_one(&self.pool)
         .await
-        .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
+        .map_err(map_connection_write_error)
     }
 
     /// Transaction-compatible counterpart of [`Self::create`]. The caller
@@ -876,7 +1037,7 @@ impl PlcConnectionService {
         .bind(stored_password)
         .fetch_one(&mut *connection)
         .await
-        .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
+        .map_err(map_connection_write_error)
     }
 
     /// **T6-2 addition**: a `"virtual"`-protocol connection cannot be edited
@@ -903,7 +1064,7 @@ impl PlcConnectionService {
     /// the `UPDATE` statement itself (`simulation = COALESCE(NULL,
     /// simulation)`) - there is no separate read of `simulation` at all.
     ///
-    /// The protocol normalizations still win: a `"postgres"` (or
+    /// The protocol normalizations still win: a `"postgres"`/`"hub"` (or
     /// `"virtual"`) payload stores `simulation = false` exactly as
     /// [`Self::update`] would, because those protocols have no meaningful
     /// simulation (this module's doc comment). Added as a separate method so
@@ -935,9 +1096,7 @@ impl PlcConnectionService {
         // column. Protocols without a meaningful simulation always store the
         // normalized value, same as a plain `update`.
         let simulation_to_store = match simulation {
-            None if input.protocol != POSTGRES_PROTOCOL && input.protocol != VIRTUAL_PROTOCOL => {
-                None
-            }
+            None if !has_no_simulation(&input.protocol) => None,
             _ => Some(input.simulation),
         };
 
@@ -947,13 +1106,26 @@ impl PlcConnectionService {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        if existing.as_ref().map(|(protocol, _)| protocol.as_str()) == Some(VIRTUAL_PROTOCOL) {
+        let existing_protocol = existing.as_ref().map(|(protocol, _)| protocol.as_str());
+        if existing_protocol == Some(VIRTUAL_PROTOCOL) {
             return Err(BantoError::Validation {
                 field_errors: vec![FieldError {
                     field: "id".to_string(),
                     message: "予約接続（calc/mem）は編集できません".to_string(),
                 }],
             });
+        }
+        if crosses_hub_boundary(existing_protocol, &input.protocol) {
+            let group_count: i64 = sqlx::query_scalar(GROUP_COUNT_SQL)
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            if let Some(err) =
+                hub_protocol_switch_error(existing_protocol, &input.protocol, group_count)
+            {
+                return Err(err);
+            }
         }
         let existing_password = existing.and_then(|(_, password)| password);
 
@@ -993,7 +1165,7 @@ impl PlcConnectionService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", NAME_ALREADY_USED, "", ""),
+            other => map_connection_write_error(other),
         })
     }
 
@@ -1012,13 +1184,26 @@ impl PlcConnectionService {
                 .fetch_optional(&mut *connection)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        if existing.as_ref().map(|(protocol, _)| protocol.as_str()) == Some(VIRTUAL_PROTOCOL) {
+        let existing_protocol = existing.as_ref().map(|(protocol, _)| protocol.as_str());
+        if existing_protocol == Some(VIRTUAL_PROTOCOL) {
             return Err(BantoError::Validation {
                 field_errors: vec![FieldError {
                     field: "id".to_string(),
                     message: "予約接続（calc/mem）は編集できません".to_string(),
                 }],
             });
+        }
+        if crosses_hub_boundary(existing_protocol, &input.protocol) {
+            let group_count: i64 = sqlx::query_scalar(GROUP_COUNT_SQL)
+                .bind(id)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            if let Some(err) =
+                hub_protocol_switch_error(existing_protocol, &input.protocol, group_count)
+            {
+                return Err(err);
+            }
         }
         let existing_password = existing.and_then(|(_, password)| password);
 
@@ -1058,7 +1243,7 @@ impl PlcConnectionService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", NAME_ALREADY_USED, "", ""),
+            other => map_connection_write_error(other),
         })
     }
 
@@ -1536,7 +1721,12 @@ mod tests {
     /// pass silently.
     #[test]
     fn the_named_protocol_constants_are_all_in_allowed_protocols() {
-        for protocol in [MODBUS_PROTOCOL, VIRTUAL_PROTOCOL, POSTGRES_PROTOCOL] {
+        for protocol in [
+            MODBUS_PROTOCOL,
+            VIRTUAL_PROTOCOL,
+            POSTGRES_PROTOCOL,
+            HUB_PROTOCOL,
+        ] {
             assert!(
                 ALLOWED_PROTOCOLS.contains(&protocol),
                 "{protocol:?} is a named constant but missing from ALLOWED_PROTOCOLS"
@@ -3356,5 +3546,593 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+    }
+
+    // --- #383 段階3 P2: "hub" (this module's doc comment, "`\"hub\"`" section).
+
+    fn hub_input(name: &str) -> PlcConnectionInput {
+        let mut input = sample_input(name);
+        input.protocol = HUB_PROTOCOL.to_string();
+        input
+    }
+
+    fn only_field_error(err: BantoError) -> FieldError {
+        match err {
+            BantoError::Validation { mut field_errors } => {
+                assert_eq!(field_errors.len(), 1, "{field_errors:?}");
+                field_errors.remove(0)
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    async fn add_group(svc: &PlcConnectionService, connection_id: i64, name: &str) {
+        sqlx::query(
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
+             VALUES (?, ?, 1000, 1)",
+        )
+        .bind(name)
+        .bind(connection_id)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A hub connection has no endpoint or wire settings of its own: whatever
+    /// the caller sent for host/port/unitId/wordOrder/simulation is replaced
+    /// by ""/0/the column defaults/false, on create and on update.
+    #[tokio::test]
+    async fn a_hub_connection_normalizes_every_wire_field() {
+        let svc = service().await;
+        let mut input = hub_input("Hub");
+        input.host = "10.0.0.5".to_string();
+        input.port = 8722;
+        input.unit_id = 9;
+        input.word_order = WORD_ORDER_HIGH_LOW.to_string();
+        input.simulation = true;
+        let created = svc.create(input.clone()).await.expect("hub create");
+        assert_eq!(created.protocol, HUB_PROTOCOL);
+        assert_eq!(created.host, "");
+        assert_eq!(created.port, 0);
+        assert_eq!(created.unit_id, 1);
+        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        assert!(!created.simulation);
+        assert!(created.is_hub_source());
+        assert!(!created.is_db_source());
+
+        let updated = svc.update(created.id, input.clone()).await.expect("update");
+        assert_eq!((updated.host.as_str(), updated.port), ("", 0));
+        assert!(!updated.simulation);
+
+        let preserved = svc
+            .update_preserving_simulation(created.id, input)
+            .await
+            .expect("update_preserving_simulation");
+        assert!(!preserved.simulation);
+    }
+
+    /// Unlike every PLC protocol, a hub connection is valid with an empty host
+    /// and port 0 (it dials nothing itself).
+    #[tokio::test]
+    async fn a_hub_connection_accepts_empty_host_and_zero_port() {
+        let svc = service().await;
+        let mut input = hub_input("Hub");
+        input.host = String::new();
+        input.port = 0;
+        svc.create(input).await.expect("hub needs no host/port");
+    }
+
+    #[tokio::test]
+    async fn a_hub_connection_rejects_database_credentials() {
+        let svc = service().await;
+        let mut input = hub_input("Hub");
+        input.database = Some("db".to_string());
+        input.username = Some("user".to_string());
+        input.password = Some("pw".to_string());
+        match svc.create(input).await.unwrap_err() {
+            BantoError::Validation { field_errors } => {
+                let fields: Vec<&str> = field_errors.iter().map(|e| e.field.as_str()).collect();
+                assert_eq!(fields, vec!["database", "username", "password"]);
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// At most one hub connection per registry (one Hub, H1): a second one is
+    /// a `protocol` field error, whether it arrives as a create or as an
+    /// update that switches another connection to "hub" - on both the pool
+    /// and the transaction paths.
+    #[tokio::test]
+    async fn only_one_hub_connection_is_allowed() {
+        let svc = service().await;
+        svc.create(hub_input("Hub")).await.expect("first hub");
+
+        let err = only_field_error(svc.create(hub_input("Hub2")).await.unwrap_err());
+        assert_eq!(err.field, "protocol");
+        assert_eq!(err.message, SECOND_HUB_MESSAGE);
+
+        let mut tx = svc.pool.begin().await.unwrap();
+        let err = only_field_error(svc.create_tx(&mut tx, hub_input("Hub3")).await.unwrap_err());
+        assert_eq!(err.field, "protocol");
+        drop(tx);
+
+        let plc = svc.create(sample_input("PLC")).await.unwrap();
+        let err = only_field_error(svc.update(plc.id, hub_input("PLC")).await.unwrap_err());
+        assert_eq!(err.field, "protocol");
+        assert_eq!(err.message, SECOND_HUB_MESSAGE);
+        let mut tx = svc.pool.begin().await.unwrap();
+        let err = only_field_error(
+            svc.update_tx(&mut tx, plc.id, hub_input("PLC"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(err.field, "protocol");
+        drop(tx);
+
+        // Other protocols are unaffected by the partial index, and a name
+        // clash is still reported on `name`, not mistaken for the hub limit.
+        svc.create(sample_input("PLC2"))
+            .await
+            .expect("second modbus");
+        let err = only_field_error(svc.create(sample_input("PLC2")).await.unwrap_err());
+        assert_eq!(err.field, "name");
+    }
+
+    /// Once the only hub connection is gone, a new one can be created.
+    #[tokio::test]
+    async fn a_hub_connection_can_be_recreated_after_delete() {
+        let svc = service().await;
+        let hub = svc.create(hub_input("Hub")).await.unwrap();
+        svc.delete(hub.id).await.unwrap();
+        svc.create(hub_input("Hub")).await.expect("recreate");
+    }
+
+    /// Switching a connection across the "hub" boundary is refused while it
+    /// has collection groups (their tags' addresses would stop making sense),
+    /// and allowed while it has none - in both directions, on both paths.
+    #[tokio::test]
+    async fn switching_to_or_from_hub_is_refused_while_groups_exist() {
+        let svc = service().await;
+        let plc = svc.create(sample_input("PLC")).await.unwrap();
+        add_group(&svc, plc.id, "G-plc").await;
+
+        let err = only_field_error(svc.update(plc.id, hub_input("PLC")).await.unwrap_err());
+        assert_eq!(err.field, "protocol");
+        assert!(err.message.contains("1件"), "{}", err.message);
+        let mut tx = svc.pool.begin().await.unwrap();
+        let err = only_field_error(
+            svc.update_tx(&mut tx, plc.id, hub_input("PLC"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(err.field, "protocol");
+        drop(tx);
+
+        let hub = svc.create(hub_input("Hub")).await.unwrap();
+        add_group(&svc, hub.id, "G-hub").await;
+        let mut to_slmp = sample_input("Hub");
+        to_slmp.protocol = "slmp".to_string();
+        let err = only_field_error(svc.update(hub.id, to_slmp.clone()).await.unwrap_err());
+        assert_eq!(err.field, "protocol");
+        let mut tx = svc.pool.begin().await.unwrap();
+        let err = only_field_error(
+            svc.update_tx(&mut tx, hub.id, to_slmp.clone())
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(err.field, "protocol");
+        drop(tx);
+
+        // Edits that stay on the same side of the boundary are unaffected.
+        let mut renamed = hub_input("Hub renamed");
+        renamed.enabled = false;
+        svc.update(hub.id, renamed).await.expect("rename hub");
+        let mut to_slmp_plc = sample_input("PLC");
+        to_slmp_plc.protocol = "slmp".to_string();
+        svc.update(plc.id, to_slmp_plc)
+            .await
+            .expect("modbus -> slmp");
+
+        // With no groups, the switch is allowed.
+        sqlx::query("DELETE FROM collection_groups WHERE plc_connection_id = ?")
+            .bind(hub.id)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        svc.delete(hub.id).await.unwrap();
+        let empty = svc.create(sample_input("Empty")).await.unwrap();
+        let switched = svc
+            .update(empty.id, hub_input("Empty"))
+            .await
+            .expect("an empty connection may become the hub");
+        assert_eq!(switched.protocol, HUB_PROTOCOL);
+        assert_eq!((switched.host.as_str(), switched.port), ("", 0));
+    }
+
+    #[test]
+    fn hub_protocol_switch_error_table() {
+        let cases: &[(Option<&str>, &str, i64, bool)] = &[
+            (Some("modbus-tcp"), "hub", 1, true),
+            (Some("hub"), "slmp", 2, true),
+            (Some("modbus-tcp"), "hub", 0, false),
+            (Some("hub"), "hub", 5, false),
+            (Some("modbus-tcp"), "slmp", 5, false),
+            (None, "hub", 5, false),
+        ];
+        for &(existing, new, groups, refused) in cases {
+            assert_eq!(
+                hub_protocol_switch_error(existing, new, groups).is_some(),
+                refused,
+                "{existing:?} -> {new} with {groups} groups"
+            );
+        }
+    }
+
+    /// Migration 0019 rebuilds `plc_connections` against the full post-0018
+    /// schema (0014's credential columns, 0015's `query_sql`, 0018's 19 tag
+    /// columns). Applied the way sqlx applies it (whole file, one pinned
+    /// connection, one transaction) to a populated database: every row comes
+    /// back intact, foreign keys and the children's indexes still hold, every
+    /// AUTOINCREMENT high-water mark survives (a freed connection id is not
+    /// reused), "hub" is accepted once, a second "hub" and unknown protocols
+    /// are not.
+    #[tokio::test]
+    async fn migration_0019_preserves_rows_sequence_and_foreign_keys_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+            (
+                "0006",
+                include_str!("../migrations/0006_tags_writable_kind.sql"),
+            ),
+            (
+                "0007",
+                include_str!("../migrations/0007_plc_connections_allow_virtual.sql"),
+            ),
+            (
+                "0008",
+                include_str!("../migrations/0008_plc_connections_add_simulation.sql"),
+            ),
+            ("0009", include_str!("../migrations/0009_tags_revision.sql")),
+            (
+                "0010",
+                include_str!("../migrations/0010_plc_connections_add_word_order.sql"),
+            ),
+            (
+                "0011",
+                include_str!("../migrations/0011_tags_unique_name_per_group.sql"),
+            ),
+            (
+                "0012",
+                include_str!("../migrations/0012_collection_groups_add_default_writable.sql"),
+            ),
+            (
+                "0013",
+                include_str!("../migrations/0013_tags_add_string_encoding.sql"),
+            ),
+            (
+                "0014",
+                include_str!("../migrations/0014_plc_connections_allow_postgres.sql"),
+            ),
+            (
+                "0015",
+                include_str!("../migrations/0015_db_source_query_sql_and_tag_kind.sql"),
+            ),
+            (
+                "0016",
+                include_str!("../migrations/0016_tags_allow_64bit.sql"),
+            ),
+            (
+                "0017",
+                include_str!("../migrations/0017_modbus_word_order_high_low.sql"),
+            ),
+            (
+                "0018",
+                include_str!("../migrations/0018_tags_drop_thresholds.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0019 migration {label} failed: {e}"));
+        }
+
+        // Connection 9 is created and deleted so the high-water mark (9) is
+        // above every surviving id (7, 8) - the case a plain copy would lose.
+        conn.execute(
+            "INSERT INTO plc_connections \
+             (id, name, protocol, host, port, unit_id, enabled, simulation, word_order) \
+             VALUES (7, 'Line1 PLC', 'slmp', '192.168.1.10', 5007, 3, 0, 1, 'high_low')",
+        )
+        .await
+        .expect("seed slmp connection");
+        conn.execute(
+            "INSERT INTO plc_connections \
+             (id, name, protocol, host, port, database, username, password) \
+             VALUES (8, 'ERP DB', 'postgres', '10.0.0.50', 5432, 'erp', 'reader', 'secret')",
+        )
+        .await
+        .expect("seed postgres connection");
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port) \
+             VALUES (9, 'Gone', 'modbus-tcp', '1.2.3.4', 502)",
+        )
+        .await
+        .expect("seed doomed connection");
+        conn.execute("DELETE FROM plc_connections WHERE id = 9")
+            .await
+            .expect("delete doomed connection");
+        conn.execute(
+            "INSERT INTO collection_groups \
+             (id, name, plc_connection_id, period_ms, enabled, default_writable) \
+             VALUES (4, 'G1', 7, 1000, 1, 0)",
+        )
+        .await
+        .expect("seed plc group");
+        conn.execute(
+            "INSERT INTO collection_groups \
+             (id, name, plc_connection_id, period_ms, enabled, default_writable, query_sql) \
+             VALUES (5, 'Q1', 8, 5000, 1, 1, 'SELECT 1 AS v')",
+        )
+        .await
+        .expect("seed db group");
+        conn.execute(
+            "INSERT INTO tags (\
+                id, name, collection_group_id, address, data_type, string_length, \
+                raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled, \
+                writable, tag_kind, expression, retain, revision, string_encoding\
+             ) VALUES (\
+                11, 'T1', 4, 'D100', 'i16', NULL, \
+                0, 100, 0, 50, 'degC', 2, 1, \
+                1, 'plc', NULL, 0, 3, 'shift_jis'\
+             )",
+        )
+        .await
+        .expect("seed plc tag");
+        conn.execute(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, tag_kind, writable) \
+             VALUES (12, 'V', 5, 'v', 'f64', 'db', 0)",
+        )
+        .await
+        .expect("seed db tag");
+        let sequences_before: Vec<(String, i64)> =
+            sqlx::query_as("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+        assert!(sequences_before.contains(&("plc_connections".to_string(), 9)));
+
+        let migration = include_str!("../migrations/0019_plc_connections_allow_hub.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0019 should apply");
+        tx.commit().await.expect("0019 should commit");
+
+        #[allow(clippy::type_complexity)]
+        let connections: Vec<(
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            bool,
+            bool,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order, \
+                 database, username, password FROM plc_connections ORDER BY id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            connections,
+            vec![
+                (
+                    7,
+                    "Line1 PLC".to_string(),
+                    "slmp".to_string(),
+                    "192.168.1.10".to_string(),
+                    5007,
+                    3,
+                    false,
+                    true,
+                    "high_low".to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    8,
+                    "ERP DB".to_string(),
+                    "postgres".to_string(),
+                    "10.0.0.50".to_string(),
+                    5432,
+                    1,
+                    true,
+                    false,
+                    "low_high".to_string(),
+                    Some("erp".to_string()),
+                    Some("reader".to_string()),
+                    Some("secret".to_string()),
+                ),
+            ]
+        );
+
+        #[allow(clippy::type_complexity)]
+        let groups: Vec<(i64, String, i64, i64, bool, bool, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, plc_connection_id, period_ms, enabled, default_writable, query_sql \
+             FROM collection_groups ORDER BY id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            groups,
+            vec![
+                (4, "G1".to_string(), 7, 1000, true, false, None),
+                (
+                    5,
+                    "Q1".to_string(),
+                    8,
+                    5000,
+                    true,
+                    true,
+                    Some("SELECT 1 AS v".to_string())
+                ),
+            ]
+        );
+
+        #[allow(clippy::type_complexity)]
+        let tags: Vec<(
+            i64,
+            String,
+            i64,
+            String,
+            String,
+            Option<f64>,
+            Option<String>,
+            i64,
+            bool,
+            String,
+            i64,
+            String,
+        )> = sqlx::query_as(
+            "SELECT id, name, collection_group_id, address, data_type, eng_hi, unit, decimals, \
+                 writable, tag_kind, revision, string_encoding FROM tags ORDER BY id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            tags,
+            vec![
+                (
+                    11,
+                    "T1".to_string(),
+                    4,
+                    "D100".to_string(),
+                    "i16".to_string(),
+                    Some(50.0),
+                    Some("degC".to_string()),
+                    2,
+                    true,
+                    "plc".to_string(),
+                    3,
+                    "shift_jis".to_string(),
+                ),
+                (
+                    12,
+                    "V".to_string(),
+                    5,
+                    "v".to_string(),
+                    "f64".to_string(),
+                    None,
+                    None,
+                    0,
+                    false,
+                    "db".to_string(),
+                    1,
+                    "utf8".to_string(),
+                ),
+            ]
+        );
+
+        // Every AUTOINCREMENT high-water mark is exactly what it was.
+        let sequences_after: Vec<(String, i64)> =
+            sqlx::query_as("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(sequences_after, sequences_before);
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            violations.is_empty(),
+            "dangling foreign keys: {violations:?}"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+                 VALUES ('orphan', 999, 1000)",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+        // The children's indexes survive (their tables were never dropped),
+        // and the new partial unique index exists.
+        let indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            vec![
+                ("idx_collection_groups_plc_connection_id".to_string(),),
+                ("idx_plc_connections_single_hub".to_string(),),
+                ("idx_tags_collection_group_id".to_string(),),
+            ]
+        );
+
+        // A freed id is not reused: the next connection gets 10, not 9.
+        let next_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plc_connections (name, protocol, host, port) \
+             VALUES ('Hub', 'hub', '', 0) RETURNING id",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("hub should be accepted after the rebuild");
+        assert_eq!(next_id, 10);
+        assert!(
+            sqlx::query(
+                "INSERT INTO plc_connections (name, protocol, host, port) \
+                 VALUES ('Hub2', 'hub', '', 0)",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "a second hub row must be refused by the partial unique index"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO plc_connections (name, protocol, host, port) \
+                 VALUES ('Nope', 'opc-ua', '1.2.3.4', 4840)",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "an unknown protocol must still be refused"
+        );
     }
 }

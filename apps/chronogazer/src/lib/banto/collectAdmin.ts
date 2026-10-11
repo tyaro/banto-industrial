@@ -100,7 +100,8 @@ export type ExclusionUnit = 'connection' | 'group' | 'tag';
  *
  * - `reason`: 機械可読な分類（`invalidAddress` / `unknownDataType` /
  *   `bitAddressOnNonBitType` / `invalidPort` / `invalidUnitId` /
- *   `unsupportedProtocol` / `invalidPeriod` / `connectionExcluded` /
+ *   `unsupportedProtocol` / `hubSourceNotYetCollected`（#383 段階3 P2: Hub
+ *   経由の接続。収集は P3 で対応）/ `invalidPeriod` / `connectionExcluded` /
  *   `groupExcluded`）。
  * - `message`: 人間向けの文言。タグは保存時の拒否理由（#418）と同じ文言。
  *
