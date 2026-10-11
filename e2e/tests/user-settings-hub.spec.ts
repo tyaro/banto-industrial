@@ -117,8 +117,12 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 		await expect(page.getByText('状態: 未設定')).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: '購読' })).toBeVisible();
 		await expect(page.getByText('購読: 停止')).toBeVisible();
-		await expect(page.getByText('値を受信していません。')).toBeVisible();
-		// 値の表は Live のときだけ。停止中に古い値や空の表を出さない。
+		// 停止の理由（Hub への接続が未設定）を出す。
+		await expect(page.getByText('Hubへの接続が設定されていません')).toBeVisible();
+		// #383 段階3 P4: 値の表の代わりに、登録済みの Hub タグが無いことを言う
+		// （P3 までの「値を受信していません。」から変わった。オーナー確認済み）。
+		await expect(page.getByText('Hub経由のタグはまだ登録されていません。')).toBeVisible();
+		// 値の表は出さない（停止中に古い値や空の表を出さない）。
 		await expect(page.getByRole('columnheader', { name: '品質' })).toHaveCount(0);
 	});
 
@@ -130,7 +134,8 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 		// 接続が失敗しても購読ブロックは「停止」のまま残る（消えない・
 		// 例外で画面が落ちない）。
 		await expect(page.getByText('購読: 停止')).toBeVisible();
-		await expect(page.getByText('値を受信していません。')).toBeVisible();
+		await expect(page.getByText('Hub経由のタグはまだ登録されていません。')).toBeVisible();
+		await expect(page.getByRole('columnheader', { name: '品質' })).toHaveCount(0);
 	});
 
 	test('6. 閲覧者アカウントを作成する（次のテストの前提）', async () => {
@@ -247,7 +252,7 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 			const table = page.getByRole('table', { name: '登録済みのHubタグ' });
 			await expect(table.getByRole('row').filter({ hasText: REGISTERED })).toContainText('21.5');
 			await expect(table.getByText(OTHER)).toHaveCount(0);
-			await expect(page.getByRole('link', { name: 'タグ設定' })).toBeVisible();
+			await expect(page.getByRole('link', { name: 'タグ設定', exact: true })).toBeVisible();
 
 			// 以前の選択は件数の注記だけ（購読していない）。
 			await expect(page.getByText('以前この画面で選んでいたタグが1件あります')).toBeVisible();
