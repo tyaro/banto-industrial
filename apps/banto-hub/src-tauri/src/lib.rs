@@ -47,8 +47,12 @@
 //!   CollectionController::subscribe_status() の変化を tray tooltip/menu へ
 //!   反映（デスクトップホスト時のみ）
 //!   CloseRequested (×) -> prevent_close + hide（トレイへ格納）+ 初回だけ通知
-//! トレイ「管理画面を終了」/「終了」 -> 確認ダイアログ -> (デスクトップ
-//!          ホストなら) RunningHub::shutdown() -> app.exit(0)
+//! トレイ「管理画面を終了」/「終了」 -> 確認ダイアログ -> exit_cleanup
+//!          （デスクトップホストなら RunningHub::shutdown()、予算 15 秒）
+//!          -> app.exit(0)
+//! RunEvent::Exit（app.exit の後・OS のサインアウト/シャットダウン）
+//!          -> exit_cleanup（予算 5 秒。トレイの終了と合わせてプロセスで
+//!          1 回だけ走り、2 つ目は先行の完了を待つ - #586）
 //! トレイ「収集を停止」（デスクトップホスト時） -> controller.stop().await
 //! トレイ「サービスを停止」（サービス接続時、Operators/管理者のみ）
 //!          -> [`run_host_switch`]（`HostKind::Service` を起点に
@@ -152,7 +156,8 @@
 //! - [`ShellDesktopControl`][]: `HostSwitchEngine`が要求する
 //!   [`banto_hub_core::host_switch::DesktopHostControl`]の実装。
 //!   Desktop→Service では`request_stop`がこのプロセスの`RunningHub`を
-//!   `shutdown`し、`is_stopped`は hub 未保有で`true`を返す
+//!   `shutdown`し、`is_stopped`は hub 未保有かつ進行中の起動・停止が無い
+//!   ときに`true`を返す（#586 で「未保有」だけから変えた - [`hub_slot`]）
 //!   （切替ウィザード UI / `switch_to_service` invoke がこの経路を使う）。
 //! - [`host_switch_ipc`]: Hub 管理 UI 向けの最小 invoke
 //!   （`host_switch_status` / `switch_to_service` / `switch_to_desktop` /
@@ -197,14 +202,27 @@
 //! `capabilities/default.json`の`description`に記載）。ポートは`PORT`
 //! env で可変なためワイルドカードにしたが、ホストは`127.0.0.1`固定のまま
 //! 広げていない。
+//!
+//! ## OS の終了で収集を止める（#586、2026-10-12）
+//!
+//! 以前は `.run(tauri::generate_context!())` で起動して `RunEvent::Exit` を
+//! 扱っておらず、OS のサインアウト・シャットダウンでは `RunningHub::shutdown`
+//! （収集の停止・最終 flush）を通らずに落ちていた。`.build(..).run(..)` に
+//! して、`Exit` から [`exit_cleanup`] を通す。トレイの「アプリを終了」
+//! （[`quit`]）も同じ [`exit_cleanup`] を通り、後始末はプロセスで 1 回だけ
+//! 走って 2 つ目は先行の完了を期限まで待つ（共有 crate の
+//! `banto_desktop_tray::ExitCleanupOnce`、ChronoGazer の #585 と同じ型）。
+//! ホスト切替との競合（切替が Hub を取り出して止めている最中・新しい Hub を
+//! 起動している最中の終了）は、Hub の置き場所 [`hub_slot::HubSlot`] が
+//! 「進行中の起動・停止」と「閉じた（終了が始まった）」印を持つことで扱う。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-#[cfg(windows)]
 use std::time::Duration;
 
 use banto_desktop_tray::{
-    ConfirmPrompt, QuitAdmission, QuitAnswerDecision, QuitGate, QuitRequestDecision, TrayHint,
+    ConfirmPrompt, ExitCleanupOnce, ExitCleanupOutcome, QuitAdmission, QuitAnswerDecision,
+    QuitGate, QuitRequestDecision, TrayHint,
 };
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
 #[cfg(windows)]
@@ -214,6 +232,7 @@ use banto_hub_core::host_switch::{
 };
 use banto_hub_core::http_hub_health::HttpHubHealthProbe;
 use banto_hub_core::hub_health::{HealthOutcome, HubHealthProbe};
+use banto_hub_core::hub_log::{log_err_line, log_line};
 use banto_hub_core::profile_lock::HubHostKind;
 use banto_hub_core::profile_paths::{build_hub_config_from_env, resolve_profile_paths_from_env};
 use banto_hub_core::runtime::{HubRuntime, RunningHub};
@@ -225,9 +244,11 @@ use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, Runtime, Webview, WebviewWindow, Wry};
-use tokio::sync::Mutex as AsyncMutex;
+
+use hub_slot::{run_hub_exit, HubExitReport, HubSlot, InFlight};
 
 mod host_switch_ipc;
+mod hub_slot;
 mod sink_service_ipc;
 mod tray_status;
 
@@ -275,9 +296,17 @@ enum StartupOutcome {
         scm_state: ScmState,
     },
     /// デスクトップホストとして起動できた。
-    Desktop(RunningHub),
+    Desktop(StartedHub),
     /// fallback 画面を表示する。
     Fallback(FallbackInfo),
+}
+
+/// デスクトップホストとして起動し終えた Hub と、置き場所
+/// （[`AppState::hub`]）に置くまでの「進行中の起動」の札（#586、
+/// [`hub_slot`] の doc）。札を持っている間は、終了がこの Hub を待つ。
+struct StartedHub {
+    hub: RunningHub,
+    ticket: InFlight<RunningHub>,
 }
 
 /// T16-2 第二スライス: [`decide_startup`]・[`attempt_desktop_start`]・
@@ -295,22 +324,23 @@ struct ProbeTarget {
 
 /// `app.manage()` で保持するアプリ全体の唯一の可変状態。
 pub(crate) struct AppState {
-    /// 稼働中の Hub。デスクトップホストとして起動できた場合のみ`Some`
-    /// （サービス接続時・fallback 時は`None` - [`show_fallback_ui`]・
+    /// 稼働中の Hub の置き場所。デスクトップホストとして起動できた場合のみ
+    /// Hub が置かれる（サービス接続時・fallback 時は空 - [`render_fallback`]・
     /// [`show_startup_error`]参照）。
     ///
-    /// `tokio::sync::Mutex`（`std::sync::Mutex` ではない）を使うのは、
-    /// [`RunningHub::shutdown`] 自体が `.await` を挟む非同期メソッドで、
-    /// ロックを保持したまま `.await` する必要があるため
-    /// （`apps/chronogazer/src-tauri`の`AppState::server`フィールドと同じ
-    /// 理由 - あちらも同じ形の`AsyncMutex<Option<RunningServer>>>`）。
-    hub: AsyncMutex<Option<RunningHub>>,
+    /// #586: 以前は `tokio::sync::Mutex<Option<RunningHub>>` で、空かどうか
+    /// しか分からなかった。ホスト切替が Hub を取り出して止めている最中・
+    /// 新しい Hub を起動している最中も終了から見えるように、置き場所と
+    /// 「進行中の起動・停止」の数と「閉じた（終了が始まった）」印を同じロックで
+    /// 持つ [`HubSlot`] にした（[`hub_slot`] の doc）。`shutdown` は Hub を
+    /// 取り出してから、ロックの外で待つ。
+    hub: Arc<HubSlot<RunningHub>>,
     /// T16-1: トレイの状態表示・「収集を停止」・終了確認の文言決定に使う
     /// controller ハンドル。`hub`とは別フィールドにしているのは、
-    /// [`quit`]が`hub`の中身を`take()`して`shutdown()`へ渡した後は参照できなく
-    /// なってよいのに対し、こちらは読み書きだけで `.await` を挟まないため
-    /// `std::sync::Mutex`（`CollectionController`のメソッド自体が内部で
-    /// 非同期処理するので、ここは同期ロックで足りる）で揃えたいため。
+    /// 終了・切替が`hub`の中身を取り出して`shutdown()`へ渡した後は参照できなく
+    /// なってよいのに対し、こちらはトレイの文言・確認の受付から同期的に
+    /// 読むため（`CollectionController`のメソッド自体が内部で非同期処理する
+    /// ので、ここは同期ロックで足りる）。
     /// デスクトップホストとして起動できなかった場合は`None`のまま。
     controller: StdMutex<Option<Arc<CollectionController>>>,
     /// T16-2: 現在シェルが表示している見え方（[`ShellView`]）。
@@ -508,22 +538,146 @@ fn show_main_window(app: &AppHandle) {
 /// トレイ「アプリを終了」の実処理（確認ダイアログ通過後に [`confirm_quit`]
 /// から呼ばれる - T16-0 時点はここが確認なしで直接メニューへ繋がっていた）。
 ///
-/// 稼働中の Hub があれば [`RunningHub::shutdown`] を必ず待ってから
-/// プロセスを終了する（実装指示「Exit / トレイ終了 -> RunningHub::shutdown()
-/// -> app.exit」- 収集停止・tstore flush・broker セッション切断は
-/// `RunningHub::shutdown`/`CollectionController` 側の既存責務で、ここで
-/// 個別に呼び直すことはしない）。デスクトップホストとして起動できていない
-/// 場合（サービス接続中・fallback 中）は`state.hub`が`None`のままなので、
-/// そのままプロセスを終了する - **サービス自体は停止しない**（実装指示の
-/// 対象外、サービスは Windows が管理する独立プロセス）。
+/// 終了の後始末（[`exit_cleanup`]）を [`TRAY_QUIT_BUDGET`] の範囲で待って
+/// から `app.exit(0)` する（実装指示「Exit / トレイ終了 ->
+/// RunningHub::shutdown() -> app.exit」- 収集停止・tstore flush・broker
+/// セッション切断は `RunningHub::shutdown`/`CollectionController` 側の既存
+/// 責務で、ここで個別に呼び直すことはしない）。後始末は `RunEvent::Exit`
+/// （OS のサインアウト・シャットダウンでも来る）と共有で、プロセスで 1 回しか
+/// 走らない（#586）。デスクトップホストとして起動できていない場合（サービス
+/// 接続中・fallback 中）は止める Hub が無いので、そのままプロセスを終了する -
+/// **サービス自体は停止しない**（実装指示の対象外、サービスは Windows が
+/// 管理する独立プロセス。[`exit_cleanup`] は SCM を呼ばない）。
 fn quit(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    tauri::async_runtime::block_on(async {
-        if let Some(hub) = state.hub.lock().await.take() {
-            hub.shutdown().await;
-        }
-    });
+    exit_cleanup(app, ExitTrigger::TrayQuit);
     app.exit(0);
+}
+
+/// 終了の後始末に入った経路（記録の文言と予算を選ぶため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitTrigger {
+    /// トレイの「アプリを終了」（確認の後）。
+    TrayQuit,
+    /// `tauri::RunEvent::Exit`。トレイの終了の `app.exit(0)` の後にも来るほか、
+    /// OS のサインアウト・シャットダウンで来る（tao が `WM_ENDSESSION` で
+    /// イベントループを畳み、戻った直後に `std::process::exit` する）。
+    RunEventExit,
+}
+
+impl ExitTrigger {
+    fn label(self) -> &'static str {
+        match self {
+            ExitTrigger::TrayQuit => "トレイの終了",
+            ExitTrigger::RunEventExit => {
+                "アプリの終了イベント（OS のサインアウト・シャットダウンを含む）"
+            }
+        }
+    }
+
+    /// この経路が後始末を待つ上限（[`TRAY_QUIT_BUDGET`]・[`OS_EXIT_BUDGET`]）。
+    fn budget(self) -> Duration {
+        match self {
+            ExitTrigger::TrayQuit => TRAY_QUIT_BUDGET,
+            ExitTrigger::RunEventExit => OS_EXIT_BUDGET,
+        }
+    }
+}
+
+/// トレイの「アプリを終了」が後始末を待つ上限（#586）。
+///
+/// 以前（#585 まで）は上限なしで `RunningHub::shutdown` を待っていた。
+/// 確認ダイアログで「停止して flush してから終了」に同意した利用者が待つ
+/// 経路なので、OS の終了より長めに取る: `RunningHub::shutdown` は DB Source・
+/// MQTT・gRPC・収集（最終 flush）・broker セッション・シミュレータ・HTTP を
+/// 順に止め、外の相手（MQTT ブローカー・PLC）を待つことがある。それでも、
+/// 応答の無い相手のせいで窓の無いプロセスが残り続けるよりは、上限で切って
+/// 終了する。切ったことは [`exit_cleanup`] が記録する。**実機で足りないと
+/// 分かったら、勝手に延ばさずオーナーに報告すること**（ChronoGazer の
+/// `EXIT_CLEANUP_BUDGET` と同じ扱い）。
+const TRAY_QUIT_BUDGET: Duration = Duration::from_secs(15);
+
+/// `RunEvent::Exit`（OS のサインアウト・シャットダウン）が後始末を待つ上限（#586）。
+///
+/// Windows は終了の通知（`WM_ENDSESSION`）の処理におよそ 5 秒を見込み、
+/// それを超えると「このアプリがシャットダウンを妨げています」を出して利用者を
+/// 待たせ、最後は強制終了する。そこで ChronoGazer の `EXIT_CLEANUP_BUDGET` と
+/// 同じ 5 秒にした。トレイの終了が先に始めた後始末に合流したときも、この経路は
+/// 自分の 5 秒を超えて待たない（`banto_desktop_tray::ExitCleanupOnce::run_or_wait`）。
+const OS_EXIT_BUDGET: Duration = Duration::from_secs(5);
+
+/// 終了の後始末を 1 回に限るための入れ物（#586）。`run()` が manage する。
+struct ExitOnce(ExitCleanupOnce<HubExitReport>);
+
+/// 終了の後始末（#586）。トレイの「アプリを終了」（[`quit`]）と
+/// `RunEvent::Exit`（[`run`]）の両方から呼ばれる。
+///
+/// 1. **待たずに、すぐ**: Hub の置き場所を閉じ（[`HubSlot::close`]。以後は
+///    新しい Hub を起動させず、起動し終えた Hub も置かせない - ホスト切替の
+///    結果の適用・「再試行」を含む）、今の controller に終了の取り消せない印
+///    （`CollectionController::begin_shutdown`）を立てる（以後の収集の開始を
+///    断る。`RunningHub::shutdown` も先頭で同じ印を立てるが、そこへ来るまでの
+///    間も断る）。閉じた後は新しい Hub＝新しい controller が作られないので、
+///    「切替で作られた新しい controller に終了の印が引き継がれない」
+///    （#585 の残件）は起こらない。
+/// 2. **1 回だけ、期限まで待つ**: 置かれている Hub を取り出して
+///    `RunningHub::shutdown` で止め、切替が進めている停止・起動が終わるのを
+///    待つ（[`run_hub_exit`]）。2 つ目の呼び出し（トレイの終了の最中に来た
+///    OS の終了、トレイの終了の `app.exit(0)` の後の `Exit`）は 1 つ目の完了を
+///    待つ（`ExitCleanupOnce`）。待つ上限は経路ごとの予算
+///    （[`ExitTrigger::budget`]）で、ロックの取得・進行中の停止の完了待ちも
+///    その中に入る（本体は専用のスレッドで走り、呼び出し元は期限で戻る）。
+/// 3. 結果を記録する。予算切れ（待つのをやめた・進行中のものが終わらな
+///    かった）は正常終了と別の文言で `log_err_line` に出す。
+///
+/// **ダイアログは出さない**（OS の終了経路で利用者の応答を待たないため。
+/// トレイの確認ダイアログが開いたままでも、それを待たずに進む）。
+///
+/// **サービスは止めない**: ホストの種類（デスクトップ／サービス接続／
+/// fallback）によらず、ここは SCM を一切呼ばない。サービス接続中・fallback
+/// では置き場所が空なので、止めるものは無く（切替が進行中ならそれを待つ
+/// だけ）、サービスはそのまま動き続ける（既存の境界）。進行中の切替自体は
+/// [`drive_host_switch`] が閉じた印を見て、次の SCM 操作の前に打ち切る。
+///
+/// `AppState`/[`ExitOnce`] が無い（`setup` の前に落ちた）なら何もしない。
+fn exit_cleanup(app: &AppHandle, trigger: ExitTrigger) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Some(once) = app.try_state::<ExitOnce>() else {
+        return;
+    };
+    state.hub.close();
+    if let Some(controller) = current_controller(app) {
+        let _ = controller.begin_shutdown();
+    }
+    let slot = Arc::clone(&state.hub);
+    let budget = trigger.budget();
+    let outcome = once.0.run_or_wait(budget, move |deadline| {
+        run_hub_exit(&slot, deadline, |hub| {
+            tauri::async_runtime::block_on(hub.shutdown());
+        })
+    });
+    match outcome {
+        ExitCleanupOutcome::Finished(HubExitReport { settled: true, .. }) => {
+            log_line(&format!(
+                "banto-hub-shell: 終了の後始末が完了しました（{}）",
+                trigger.label()
+            ));
+        }
+        ExitCleanupOutcome::Finished(HubExitReport { settled: false, .. }) => {
+            log_err_line(&format!(
+                "banto-hub-shell: 終了の後始末の期限までに、ホスト切替の停止・起動が終わりませんでした。待たずに終了します（{}）",
+                trigger.label()
+            ));
+        }
+        ExitCleanupOutcome::TimedOut => {
+            log_err_line(&format!(
+                "banto-hub-shell: 終了の後始末が期限までに終わらなかったため、待たずに終了します（この経路の上限{}秒、{}）",
+                budget.as_secs(),
+                trigger.label()
+            ));
+        }
+    }
 }
 
 /// 今の controller（サービス接続中・fallback なら `None`）。
@@ -759,7 +913,7 @@ fn build_service_manager() -> WindowsServiceManager {
 ///
 /// 非 Windows: SCM という概念が無いため、常に[`attempt_desktop_start`]を
 /// 呼ぶ（実装指示「Non-Windows: keep current Desktop-only path」）。
-fn decide_startup(target: &ProbeTarget) -> StartupOutcome {
+fn decide_startup(target: &ProbeTarget, slot: &Arc<HubSlot<RunningHub>>) -> StartupOutcome {
     #[cfg(windows)]
     {
         let manager = build_service_manager();
@@ -785,7 +939,7 @@ fn decide_startup(target: &ProbeTarget) -> StartupOutcome {
                 }
             }
             Ok(status) if matches!(status.state, ScmState::Stopped | ScmState::NotInstalled) => {
-                attempt_desktop_start(target, Some(status.state))
+                attempt_desktop_start(target, slot, Some(status.state))
             }
             Ok(status) => {
                 // StartPending/StopPending/Other: 遷移中 - デスクトップを
@@ -800,13 +954,13 @@ fn decide_startup(target: &ProbeTarget) -> StartupOutcome {
             Err(_err) => {
                 // SCM 自体に問い合わせられない（未インストール環境・権限不足等）
                 // - 判定材料が無いだけなので、従来どおりデスクトップ起動を試みる。
-                attempt_desktop_start(target, None)
+                attempt_desktop_start(target, slot, None)
             }
         }
     }
     #[cfg(not(windows))]
     {
-        attempt_desktop_start(target, None)
+        attempt_desktop_start(target, slot, None)
     }
 }
 
@@ -821,8 +975,26 @@ fn decide_startup(target: &ProbeTarget) -> StartupOutcome {
 /// ここには来ない（退避のログは `RunningHub::port_fallback_from` と
 /// `hub_log` に出る）。`PORT` を明示した構成でそのポートが埋まっていれば、
 /// 従来どおりここへ来て、同じポートへの probe で相手を診断する。
+///
+/// #586: 起動の前に置き場所（`slot`）から「進行中の起動」の札を取る。終了が
+/// 始まっていれば（置き場所が閉じていれば）札は取れず、**起動しない**
+/// （[`EXITING_MESSAGE`] の fallback を返すが、閉じた後の適用は
+/// [`apply_startup_outcome`] が捨てるので画面には出ない）。札は起動し終えた
+/// Hub と一緒に [`StartupOutcome::Desktop`] で返し、置き場所に置くまで持つ -
+/// その間に終了が始まっても、終了はこの Hub を待つ。
 #[allow(unused_variables)]
-fn attempt_desktop_start(target: &ProbeTarget, scm_state: Option<ScmState>) -> StartupOutcome {
+fn attempt_desktop_start(
+    target: &ProbeTarget,
+    slot: &Arc<HubSlot<RunningHub>>,
+    scm_state: Option<ScmState>,
+) -> StartupOutcome {
+    let Some(ticket) = slot.begin_start() else {
+        return StartupOutcome::Fallback(FallbackInfo {
+            scm_state,
+            health: None,
+            desktop_error: Some(EXITING_MESSAGE.to_string()),
+        });
+    };
     // HubRuntime::start はここで同期的に待つ - `tauri::async_runtime`
     // が既定で保持する多重スレッド tokio ランタイム上で block_on
     // する（`apps/chronogazer/src-tauri`の`run()`が`init_db`等を
@@ -830,8 +1002,10 @@ fn attempt_desktop_start(target: &ProbeTarget, scm_state: Option<ScmState>) -> S
     match tauri::async_runtime::block_on(HubRuntime::start(build_hub_config_from_env(
         HubHostKind::Shell,
     ))) {
-        Ok(hub) => StartupOutcome::Desktop(hub),
+        Ok(hub) => StartupOutcome::Desktop(StartedHub { hub, ticket }),
         Err(err) => {
+            // 起動できなかった - 札を返す（終了が待っていればここで起きる）。
+            drop(ticket);
             let health = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone())
                 .probe(&target.profile_id, target.port)
                 .ok();
@@ -857,6 +1031,11 @@ fn attempt_desktop_start(target: &ProbeTarget, scm_state: Option<ScmState>) -> S
 /// 戻り値の`(RuntimeStatus, Arc<CollectionController>)`はデスクトップへ
 /// 新規遷移した場合のみ`Some` - 呼び出し元がトレイ構築・
 /// [`watch_collection_status`]の起動要否を判断するために使う。
+///
+/// #586: 終了が始まった後（置き場所が閉じた後）は何も適用しない - 画面・
+/// トレイも変えず、起動し終えた Hub があれば置かずに止める
+/// （[`discard_started_hub`]）。閉じたかどうかの確認と Hub を置くことの間に
+/// 終了が始まった場合も、[`HubSlot::install`] が突き返すので同じく止める。
 fn apply_startup_outcome(
     app: &AppHandle,
     window: &WebviewWindow,
@@ -864,16 +1043,23 @@ fn apply_startup_outcome(
 ) -> Option<(RuntimeStatus, Arc<CollectionController>)> {
     let state = app.state::<AppState>();
 
+    if state.hub.is_closed() {
+        if let StartupOutcome::Desktop(started) = outcome {
+            discard_started_hub(started.hub, started.ticket);
+        }
+        return None;
+    }
+
     // 直前が Desktop で、今回 Desktop 以外へ切り替わる場合に備えて
-    // 稼働中の hub を先に取り出しておく（下の match 内でシャットダウンする）。
-    let previous_hub = if matches!(outcome, StartupOutcome::Desktop(_)) {
-        None
-    } else {
-        tauri::async_runtime::block_on(state.hub.lock()).take()
-    };
-    if let Some(hub) = previous_hub {
-        tauri::async_runtime::block_on(hub.shutdown());
-        *state.controller.lock().expect("controller mutex poisoned") = None;
+    // 稼働中の hub を先に取り出して止める。取り出すのと同じロックで
+    // 「進行中の停止」の札を取るので、止めている最中に終了が始まっても、
+    // 終了はこの停止を待つ（#586）。
+    if !matches!(outcome, StartupOutcome::Desktop(_)) {
+        if let Some((hub, ticket)) = state.hub.take_for_stop() {
+            tauri::async_runtime::block_on(hub.shutdown());
+            *state.controller.lock().expect("controller mutex poisoned") = None;
+            drop(ticket);
+        }
     }
 
     match outcome {
@@ -886,14 +1072,20 @@ fn apply_startup_outcome(
             *state.view.lock().expect("view mutex poisoned") = ShellView::Service { scm_state };
             None
         }
-        StartupOutcome::Desktop(hub) => {
+        StartupOutcome::Desktop(StartedHub { hub, ticket }) => {
             let addr = hub.local_addr();
-            navigate_to_hub(window, &addr.to_string());
             let controller = hub.controller();
+            // 先に置く（置けなければ画面を Hub へ移さない）。置けなかったのは
+            // 終了が始まった（または別の Hub が置かれていた）ときで、起動した
+            // この Hub は誰も止めないので、ここで止める（#586）。
+            if let Err(rejected) = state.hub.install(hub, ticket) {
+                discard_started_hub(rejected.hub, rejected.ticket);
+                return None;
+            }
             let status = controller.status();
-            *tauri::async_runtime::block_on(state.hub.lock()) = Some(hub);
             *state.controller.lock().expect("controller mutex poisoned") = Some(controller.clone());
             *state.view.lock().expect("view mutex poisoned") = ShellView::Desktop;
+            navigate_to_hub(window, &addr.to_string());
             Some((status, controller))
         }
         StartupOutcome::Fallback(info) => {
@@ -903,6 +1095,17 @@ fn apply_startup_outcome(
         }
     }
 }
+
+/// 終了が始まった後に起動し終えた Hub を、置かずに止める（#586）。札は止め
+/// 終えてから返す - 終了はそれを待つ。
+fn discard_started_hub(hub: RunningHub, ticket: InFlight<RunningHub>) {
+    log_line("banto-hub-shell: 終了処理中のため、起動し終えた Hub を使わずに停止します");
+    tauri::async_runtime::block_on(hub.shutdown());
+    drop(ticket);
+}
+
+/// 終了が始まった後に起動・切替を断るときの文言（#586）。
+const EXITING_MESSAGE: &str = "終了処理中のため、Hub を起動しません";
 
 /// トレイメニューを組み立てる（デスクトップホスト用、desktop-plan §9.9 の
 /// 表どおりの3構成）。
@@ -1076,6 +1279,11 @@ fn apply_outcome_and_sync(app: &AppHandle, window: &WebviewWindow, outcome: Star
             tauri::async_runtime::spawn(watch_collection_status(app_handle, controller));
         }
     }
+    // #586: 終了が始まった後は適用していない（`apply_startup_outcome`）ので、
+    // トレイも作り直さない。
+    if state.hub.is_closed() {
+        return;
+    }
     sync_tray(app);
 }
 
@@ -1088,8 +1296,15 @@ fn retry_startup(app: &AppHandle) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
         return;
     };
+    let slot = Arc::clone(&app.state::<AppState>().hub);
+    // #586: 終了が始まった後は判定し直さない（起動もしない）。この確認の後に
+    // 終了が始まっても、起動は `attempt_desktop_start` の札で、適用は
+    // `apply_startup_outcome` で断られる。
+    if slot.is_closed() {
+        return;
+    }
     let target = expected_probe_target();
-    let outcome = decide_startup(&target);
+    let outcome = decide_startup(&target, &slot);
     apply_outcome_and_sync(app, &window, outcome);
 }
 
@@ -1097,10 +1312,15 @@ fn retry_startup(app: &AppHandle) {
 /// [`banto_hub_core::host_switch::DesktopHostControl`]の実装
 /// （Desktop→Service 切替ウィザード、desktop-plan §9.7）。
 ///
-/// `request_stop`はこのプロセスが保有する[`RunningHub`]を`take`して
-/// `shutdown`し、controller ハンドルも消す。完了後の`is_stopped`は
-/// hub 未保有（`None`）で`true` - profile mutex は`RunningHub::shutdown`
-/// 側で解放される。
+/// `request_stop`はこのプロセスが保有する[`RunningHub`]を取り出して
+/// `shutdown`し、controller ハンドルも消す。profile mutex は
+/// `RunningHub::shutdown`側で解放される。
+///
+/// #586: 取り出すときに「進行中の停止」の札を取り（[`HubSlot::take_for_stop`]）、
+/// `shutdown` を終えてから返す。その間に終了が始まっても、終了はこの停止を
+/// 待つ。`is_stopped` は「置き場所が空」ではなく「置き場所が空で、進行中の
+/// 起動・停止も無い」（[`HubSlot::is_idle`]）で答える - 置き場所が空でも、
+/// 終了の後始末が取り出した Hub をまだ止めている最中のことがある。
 #[cfg(windows)]
 struct ShellDesktopControl {
     app: AppHandle,
@@ -1110,18 +1330,16 @@ struct ShellDesktopControl {
 impl DesktopHostControl for ShellDesktopControl {
     fn request_stop(&mut self) -> Result<(), DesktopHostError> {
         let state = self.app.state::<AppState>();
-        let hub = tauri::async_runtime::block_on(state.hub.lock()).take();
-        if let Some(hub) = hub {
+        if let Some((hub, ticket)) = state.hub.take_for_stop() {
             tauri::async_runtime::block_on(hub.shutdown());
             *state.controller.lock().expect("controller mutex poisoned") = None;
+            drop(ticket);
         }
         Ok(())
     }
 
     fn is_stopped(&self) -> bool {
-        let state = self.app.state::<AppState>();
-        let stopped = tauri::async_runtime::block_on(state.hub.lock()).is_none();
-        stopped
+        self.app.state::<AppState>().hub.is_idle()
     }
 }
 
@@ -1164,10 +1382,17 @@ enum HostSwitchResult {
 /// まとめて1回のブロッキング呼び出しにする）。呼び出し元
 /// （[`run_host_switch`]）が背景スレッドで呼ぶ前提 - ここ自体はスレッドを
 /// 起動しない。
+///
+/// #586: `exiting` が真になったら（シェルの終了が始まったら）、次の
+/// `Poll`（= 次の SCM・health の操作）へ進まずに打ち切って `Faulted` を返す。
+/// 終了の開始後に、切替が SCM の開始・停止を新しく発行したり、Desktop への
+/// 引き継ぎで Hub を起動したりしないため。既に発行した SCM の操作は取り消さない
+/// （SCM 側で進む）。
 #[cfg(windows)]
 fn drive_host_switch<M, P, D>(
     engine: &mut HostSwitchEngine<M, P, D>,
     command: SwitchCommand,
+    exiting: &dyn Fn() -> bool,
 ) -> HostSwitchResult
 where
     M: ServiceManager,
@@ -1241,6 +1466,13 @@ where
                 // ServiceStopping」節と同じ理由）。
             }
         }
+        if exiting() {
+            return HostSwitchResult::Faulted {
+                scm_state: None,
+                health: engine.state().last_health.clone(),
+                reason: "終了処理中のため、切替を中断しました".to_string(),
+            };
+        }
         outcome = match engine.step(SwitchCommand::Poll) {
             Ok(outcome) => outcome,
             Err(SwitchError::PermissionDenied) => {
@@ -1272,7 +1504,11 @@ fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: Host
             port: target.port,
             scm_state,
         },
-        HostSwitchResult::Desktop => attempt_desktop_start(target, Some(ScmState::Stopped)),
+        HostSwitchResult::Desktop => {
+            // #586: 終了が始まっていれば起動しない（札が取れない）。
+            let slot = Arc::clone(&app.state::<AppState>().hub);
+            attempt_desktop_start(target, &slot, Some(ScmState::Stopped))
+        }
         HostSwitchResult::Faulted {
             scm_state,
             health,
@@ -1294,9 +1530,27 @@ fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: Host
 /// [`HostSwitchEngine`]を1回だけ構築してバックグラウンドスレッドで
 /// [`drive_host_switch`]を完了まで進める - 呼び出し元（トレイのメニュー
 /// イベントハンドラ / invoke）はブロックしない。
+///
+/// #586: 終了が始まっていれば（Hub の置き場所が閉じていれば）切替を始めず、
+/// 進行中フラグを下ろして失敗の進捗を出すだけにする（SCM を呼ばない）。
+/// 始めた後に終了が始まったら、[`drive_host_switch`] が次の操作の前に打ち切る。
 #[cfg(windows)]
 pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let state = app.state::<AppState>();
+    if state.hub.is_closed() {
+        host_switch_ipc::end_switch();
+        host_switch_ipc::emit_progress(
+            app,
+            host_switch_ipc::HostSwitchProgressEvent {
+                phase: "faulted".into(),
+                message: "終了処理中のため、切替を開始しません".into(),
+                done: true,
+                error: Some("終了処理中のため、切替を開始しません".into()),
+            },
+        );
+        return;
+    }
+    let slot = Arc::clone(&state.hub);
     let initial_host = match &*state.view.lock().expect("view mutex poisoned") {
         ShellView::Desktop => HostKind::Desktop,
         ShellView::Service { .. } => HostKind::Service,
@@ -1330,7 +1584,7 @@ pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
                 error: None,
             },
         );
-        let result = drive_host_switch(&mut engine, command);
+        let result = drive_host_switch(&mut engine, command, &|| slot.is_closed());
         let (phase, message, error) = match &result {
             HostSwitchResult::Service { .. } => (
                 "completed".to_string(),
@@ -1497,8 +1751,11 @@ pub fn run() {
         ])
         // #392 A2: 「アプリを終了」の確認中・終了処理中の 2 回目を無視する。
         .manage(QuitGate::new())
+        // #586: 終了の後始末（トレイの「アプリを終了」と `RunEvent::Exit`）を
+        // プロセスで 1 回に限り、2 つ目には完了を待たせる（[`exit_cleanup`]）。
+        .manage(ExitOnce(ExitCleanupOnce::new()))
         .manage(AppState {
-            hub: AsyncMutex::new(None),
+            hub: HubSlot::new(),
             controller: StdMutex::new(None),
             view: StdMutex::new(ShellView::Fallback(FallbackInfo {
                 scm_state: None,
@@ -1530,7 +1787,8 @@ pub fn run() {
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
             let target = expected_probe_target();
-            let outcome = decide_startup(&target);
+            let slot = Arc::clone(&app.state::<AppState>().hub);
+            let outcome = decide_startup(&target, &slot);
             let desktop_started = apply_startup_outcome(app.handle(), &window, outcome);
 
             // トレイ（T16-1/T16-2、desktop-plan §9.9）: 起動直後の見え方
@@ -1590,8 +1848,29 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // #586: `RunEvent::Exit` で終了の後始末（[`exit_cleanup`]）を通す。
+            // トレイの「アプリを終了」は `app.exit(0)` の前に後始末を済ませて
+            // あるので、ここは済んだ結果を受け取るだけ（2 回は走らない）。
+            // **OS のサインアウト・シャットダウン**では tao が `WM_ENDSESSION`
+            // でここを呼び、戻った直後に `std::process::exit` するので、窓を
+            // 隠したまま（トレイ常駐中）でも、デスクトップホストの Hub は
+            // ここで `RunningHub::shutdown`（収集の停止・最終 flush）を通る。
+            // 以前は `.run(context)` で `Exit` を扱っておらず、OS の終了では
+            // shutdown を通らずに落ちていた。待つ上限は [`OS_EXIT_BUDGET`]。
+            //
+            // **テストの範囲**: 後始末の中身（置き場所を閉じる → Hub を止める →
+            // 進行中の起動・停止を待つ、1 回に限る、予算）は `hub_slot` の
+            // テストと `banto_desktop_tray` の `exit_once` のテストで押さえて
+            // ある。「OS の終了 → Tauri のイベントループ → このコールバック」の
+            // 経路そのものは単体テストでは再現できない（ChronoGazer の
+            // `RunEvent::Exit` 腕のコメントと同じ事情）ので、実機確認の領域。
+            if let tauri::RunEvent::Exit = event {
+                exit_cleanup(app_handle, ExitTrigger::RunEventExit);
+            }
+        });
 }
 
 #[cfg(test)]

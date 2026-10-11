@@ -44,6 +44,8 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 二重防止 `QuitGate`、OS 終了で banto-hub が `RunningHub::shutdown` を通らない件は #586、ログオン時の自動起動は B）と、
 #383 段階3 の P6 で分かったこと（Hub 側の収集だけが止まった場合のイベントは Hub 側に出る。このままでよい）を追記。
 同日: §5 の #392 A2 の実装の細部に、トレイの「終了」の確定を収集の開始と直列化したこと（終了の受付の印、#392 A2 レビュー）と、再レビューでの追加（印を一時的・取り消せないの 2 種類に分けた、ChronoGazer で終了の `stop` を終端の操作にした）を追記。
+同日: §5 の #392 A2 のオーナー決定 3 に、#586（banto-hub のデスクトップシェルが OS のサインアウト・シャットダウンでも
+`RunningHub::shutdown` を通る。実装済み、Windows 実機の OS 終了は未確認）を直したことと、残件（ChronoGazer の後始末の 1 回を共有 crate に寄せるか）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -595,6 +597,19 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
       3. **OS のサインアウト・シャットダウンで banto-hub のデスクトップシェルが `RunningHub::shutdown` を
          通らない件は別 issue（tyaro/banto-industrial#586）**。この PR では直さない（ChronoGazer は
          OS の終了でも同じ終了処理を通す）。
+         → **#586 で直した（2026-10-12、実装済み。Windows 実機での OS のサインアウト・シャットダウンは
+         未確認）**。受入条件はオーナーのレビュー由来: (1) 後始末の「1 回」は完了待ちまで含める
+         （共有 crate の `ExitCleanupOnce`。トレイの終了と `RunEvent::Exit` で共有し、後から来た方は先行の
+         完了を待つ）、(2) 予算はロックの取得・進行中の後始末の待ちも含めて上限を持つ（トレイ 15 秒・
+         OS の終了 5 秒、予算切れは正常終了と別の文言でログ。OS の経路ではダイアログを出さない）、
+         (3) 終了の開始後はホスト切替・「再試行」で新しい Hub を起動・適用しない。切替が止めている・
+         起動している最中の Hub も同じ予算で待つ（Hub の置き場所 `HubSlot` が進行中の数と閉じた印を持つ）。
+         1 回に限るのは終了の後始末だけで、切替の停止・起動は何度でもできる、(4) サービス接続中・fallback の
+         終了は SCM を呼ばない。閉じた後は新しい controller が作られないので、#585 の残件「切替で作られた
+         新しい controller に終了の印が引き継がれない」も起こらなくなった。詳細は
+         [banto-hub-t16-design.md](banto-hub-t16-design.md) §4.1 の #586 追記。
+         ChronoGazer の `exit_cleanup_once`（`tokio::sync::OnceCell`）を共有 crate の `ExitCleanupOnce` に
+         寄せるかは未（#392 の残件）。
       4. **ログオン時の自動起動は A の範囲外のまま**（B で扱う）。
 
       実装の細部（オーナー決定ではない。banto-hub の既存の型に合わせた）:
@@ -630,7 +645,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
           誰も下ろさない）。OS のシャットダウンの経路は `QuitGate` を `Quitting` にしないので、トレイの答えが
           後始末の開始より遅れて届きうる。`cancel_quit_confirm` は一時的な印だけを下ろすので、遅れた
           `AskAgain` が終了処理の印を解除して開始を通すことは無い。開始はどちらかが立っていれば断る
-          （banto-hub も同じ構造にした。banto-hub のデスクトップの OS 終了経路は #586 で未接続だが、
+          （banto-hub も同じ構造にした。banto-hub のデスクトップの OS 終了経路は #586 で接続した。
           `RunningHub::shutdown` が立てる印は `AskAgain` で下ろせない）。
         - **ChronoGazer の受付から投入までの隙間**（P2-1）: 札を取る受付とキューへの投入は別の区間なので、
           その間に終了処理が印を立てて終了の `stop` を先に完了させると、元の開始が後から投入されて最後の
