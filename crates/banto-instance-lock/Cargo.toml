@@ -1,0 +1,31 @@
+[package]
+name = "banto-instance-lock"
+description = "Cross-process single-instance lock (Windows named mutex + diagnostic lock file / flock elsewhere), shared by banto-hub and ChronoGazer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `path_scope_id`: 同じ対象パスから、プロセス・ビルドをまたいで同じ短い ID を
+# 作るためのハッシュ（`DefaultHasher` はバージョン間の安定が保証されない）。
+sha2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# banto-hub-core が `profile_lock.rs` で使っていたのと同じ 0.61 系・同じ
+# feature（`CreateMutexW`/`OpenMutexW` は `Win32_Security` を要求する）。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+# 非 Windows は `flock(2)` 自体を排他の実体にする（banto-hub-core から移動）。
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
