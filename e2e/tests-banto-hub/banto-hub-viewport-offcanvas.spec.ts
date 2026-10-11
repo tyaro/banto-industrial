@@ -14,7 +14,7 @@
  * できず、bounding box の x 座標で判定していた。
  *
  * **2026-09-16（#381 レビュー対応12回目）**: 閉じたオフキャンバスに
- * `visibility: hidden` + `inert` を足した（`escLayering.ts` の層の約束・項目6 -
+ * `visibility: hidden` + `inert` を足した（`@banto/ui` の `layering.ts` の層の約束・項目6 -
  * `transform` だけだと画面外のナビ項目がフォーカスを受けられてしまい、
  * 閉じたあとの「フォーカスの戻し先」判定にも生きた要素として残るため）。
  * これで「退避している」は Playwright から見て素直に **hidden** になったので、

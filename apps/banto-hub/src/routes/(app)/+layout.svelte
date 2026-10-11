@@ -18,11 +18,7 @@
 	import Header from '#lib/components/Header.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
-	import {
-		hasVisibleLayerAbove,
-		hasVisibleMenuLayer,
-		LAYER_MARKER_ATTR
-	} from '#lib/components/escLayering.js';
+	import { hasVisibleLayerAbove, hasVisibleMenuLayer, LAYER_MARKER_ATTR } from '@banto/ui';
 	import { listPendingChanges } from '#lib/banto/pendingChangesAdmin.js';
 	import { countUnappliedPendingChanges } from '#lib/banto/pendingUnappliedCount.js';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
@@ -39,10 +35,12 @@
 	function handleKeydown(event: KeyboardEvent): void {
 		if (event.key.toLowerCase() === 'k' && (event.ctrlKey || event.metaKey)) {
 			event.preventDefault();
-			// #381 レビュー対応14回目（層の約束・項目5の補足、`escLayering.ts`）:
-			// **コマンドパレットとコンテキストメニューは同じ z（1000）**なので同時に
-			// 出さない。同 z は z 順の判定で区別できず、出してしまうと Esc も
-			// フォーカスの引き戻しも互いに譲り合って効かなくなる。メニューは
+			// #381 レビュー対応14回目（層の約束・項目5の補足、`@banto/ui` の `layering.ts`）:
+			// **コマンドパレットとコンテキストメニューは同時に出さない**（どちらも
+			// z=1000）。`@banto/ui` v6.7.0 以降は同じ z の層を DOM の描画順で区別する
+			// ので Esc・フォーカスが噛み合わなくなることはないが、一過性のメニューと
+			// 未保存確認・フォーカストラップを持つパレットが重なって出るのは
+			// UX として避ける（出す層は 1 つ、という運用方針）。メニューは
 			// 一過性（Esc・外クリック・フォーカスが外れるで閉じる）なので、
 			// 開いているあいだは**パレットを開かない**側に倒した - レイアウトから
 			// ページのメニューを閉じる口が無いため（閉じてから `Ctrl+K`）。
@@ -53,7 +51,7 @@
 
 		// T19 S3-a（UX-43）: オフキャンバスが開いていれば Escape で閉じる。
 		//
-		// #381 レビュー対応（層の約束 - **正は `escLayering.ts` の doc**）:
+		// #381 レビュー対応（層の約束 - **正は `@banto/ui` の `layering.ts` の doc**）:
 		// サイドバー（z-index 710）は、より手前の層（Drawer/Modal 900、
 		// コマンドパレット・コンテキストメニュー 1000）には譲り、自分より下の層
 		// （タグ画面の退避ツリー 610、`SplitPane.svelte`）には**閉じたことを
