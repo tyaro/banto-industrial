@@ -16,7 +16,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	adoptionResult,
-	applyServerSelection,
 	HUB_STATUS_RECHECK_FAILED_LABEL,
 	INITIAL_STATUS_SNAPSHOT,
 	runStaleRecheck,
@@ -50,16 +49,11 @@ import {
 	isPollResultFresh,
 	isSubscriptionStale,
 	nextPollFailureCount,
-	nextSelectionUnsaved,
 	nextStatusUnconfirmed,
 	pollFailureOutcome,
 	readSubscriptionWithLimit,
 	reconfirmStatusFailureNotice,
 	runWithLimit,
-	sameSelection,
-	saveSelectionWithLimits,
-	SELECTION_DISCARDED_NOTICE,
-	showsServerSelectionDiff,
 	needsManualKey,
 	showManualKeyEntry,
 	SUBSCRIPTION_POLL_FAILURE_LIMIT,
@@ -68,7 +62,6 @@ import {
 	type HubSubscription,
 	type HubSubscriptionState,
 	type HubView,
-	type SelectionEvent,
 	type StatusRereadDetailedOutcome,
 	type StatusRereadOutcome
 } from './hubAdmin';
@@ -172,6 +165,7 @@ function subscription(overrides: Partial<HubSubscription> = {}): HubSubscription
 		state: 'live',
 		reason: null,
 		subscribedCount: 2,
+		registered: [],
 		unresolved: [],
 		unsupported: [],
 		lastError: null,
@@ -1135,128 +1129,6 @@ describe('hubPollStaleNote', () => {
 	});
 });
 
-// --- レビュー P2-B: 未保存のタグ選択を黙って捨てない -----------------------
-
-describe('sameSelection', () => {
-	it('並び順は問わない（画面のチェックは順序を持たない）', () => {
-		expect(sameSelection(['a', 'b'], ['b', 'a'])).toBe(true);
-		expect(sameSelection([], [])).toBe(true);
-	});
-
-	it('件数や中身が違えば false', () => {
-		expect(sameSelection(['a'], ['a', 'b'])).toBe(false);
-		expect(sameSelection(['a', 'b'], ['a'])).toBe(false);
-		expect(sameSelection(['a'], ['b'])).toBe(false);
-	});
-});
-
-describe('applyServerSelection', () => {
-	const HUB_A = 'http://127.0.0.1:3100';
-	const HUB_B = 'http://127.0.0.1:3200';
-
-	it('未保存の変更が無ければサーバーの選択で上書きする（従来どおり）', () => {
-		const outcome = applyServerSelection(['a'], ['b', 'c'], false, HUB_A, HUB_A);
-		expect(outcome.selected).toEqual(['b', 'c']);
-		expect(outcome.unsaved).toBe(false);
-		expect(outcome.discardedForEndpointChange).toBe(false);
-	});
-
-	it('同じHubなら未保存の変更を上書きしない（「一覧を更新」で黙って消えない）', () => {
-		const outcome = applyServerSelection(['a', 'x'], ['a'], true, HUB_A, HUB_A);
-		expect(outcome.selected).toEqual(['a', 'x']);
-		expect(outcome.unsaved).toBe(true);
-		expect(outcome.discardedForEndpointChange).toBe(false);
-	});
-
-	// レビュー P2-2: 下書きは接続先ごとのもの。別の Hub に繋ぎ直したら、旧 Hub
-	// のタグ名を保存の payload に持ち越さない（画面に出ていない名前が混ざる）。
-	it('未保存 × 接続先の同一性の総当たり', () => {
-		type Row = [boolean, string | null, string | null, string[], boolean, boolean];
-		const table: Row[] = [
-			// [未保存, 下書きのendpoint, viewのendpoint, 採用する選択, 未保存フラグ, 破棄したか]
-			[true, HUB_A, HUB_A, ['a', 'x'], true, false], // 同じHub: 保つ
-			[true, HUB_A, HUB_B, ['a'], false, true], // 別のHub: サーバーを採用して破棄
-			[true, HUB_A, null, ['a'], false, true], // 未設定・切断後も「同じHub」ではない
-			[true, null, HUB_A, ['a'], false, true], // 下書き側が null（接続先不明）
-			[true, null, null, ['a'], false, true],
-			[false, HUB_A, HUB_A, ['a'], false, false], // 未保存でなければ常にサーバー
-			[false, HUB_A, HUB_B, ['a'], false, false],
-			[false, null, HUB_B, ['a'], false, false]
-		];
-		for (const [unsaved, draftEndpoint, viewEndpoint, selected, nextUnsaved, discarded] of table) {
-			const outcome = applyServerSelection(['a', 'x'], ['a'], unsaved, draftEndpoint, viewEndpoint);
-			const label = `unsaved=${unsaved} ${draftEndpoint} -> ${viewEndpoint}`;
-			expect(outcome.selected, label).toEqual(selected);
-			expect(outcome.unsaved, label).toBe(nextUnsaved);
-			expect(outcome.discardedForEndpointChange, label).toBe(discarded);
-		}
-	});
-
-	it('同じHubなら、今その一覧に無いタグの選択も落とさない（catalog と積集合を取らない）', () => {
-		// 一時的に見えなくなっただけのタグ（refresh が空振り・権限が一瞬揺れた）
-		// の選択まで失わないこと。判定は接続先の同一性だけ。
-		const outcome = applyServerSelection(['gone', 'here'], [], true, HUB_A, HUB_A);
-		expect(outcome.selected).toEqual(['gone', 'here']);
-	});
-
-	it('返すのは常に新しい配列（呼び出し側の配列を共有しない）', () => {
-		const current = ['a'];
-		const server = ['b'];
-		expect(applyServerSelection(current, server, true, HUB_A, HUB_A).selected).not.toBe(current);
-		expect(applyServerSelection(current, server, false, HUB_A, HUB_A).selected).not.toBe(server);
-	});
-
-	it('破棄の通知は保存成功の文言と混ざらない', () => {
-		expect(SELECTION_DISCARDED_NOTICE).toContain('破棄');
-		expect(SELECTION_DISCARDED_NOTICE).not.toContain('保存しました');
-	});
-});
-
-describe('showsServerSelectionDiff', () => {
-	it('未保存で中身も違うときだけ、注記と「戻す」導線を出す', () => {
-		const table: [string[], string[], boolean, boolean][] = [
-			// [編集中, サーバー, 未保存か, 注記を出すか]
-			[['a'], ['a'], false, false],
-			[['a'], ['b'], false, false], // 未保存でないなら上書き済みのはず
-			[['a'], ['a'], true, false], // 触ったが同じ内容に戻した
-			[['a', 'b'], ['b', 'a'], true, false], // 並びが違うだけ
-			[['a'], ['b'], true, true],
-			[['a'], [], true, true],
-			[[], ['a'], true, true]
-		];
-		for (const [current, server, unsaved, expected] of table) {
-			expect(
-				showsServerSelectionDiff(current, server, unsaved),
-				`${JSON.stringify(current)} vs ${JSON.stringify(server)} (unsaved=${unsaved})`
-			).toBe(expected);
-		}
-	});
-});
-
-describe('nextSelectionUnsaved', () => {
-	it('チェックを触ったら未保存、保存・明示的な破棄・切断で降りる（総当たり）', () => {
-		const expected: Record<SelectionEvent, boolean> = {
-			edited: true,
-			saved: false,
-			discarded: false,
-			disconnected: false
-		};
-		for (const current of [false, true]) {
-			for (const event of Object.keys(expected) as SelectionEvent[]) {
-				expect(nextSelectionUnsaved(current, event), `${current} + ${event}`).toBe(expected[event]);
-			}
-		}
-	});
-});
-
-// --- レビュー P2-3: 応答が返らない相手でポーリングが止まらないこと ----------
-//
-// 「2 回連続で失敗したら取得できていないと言う」は**即座に失敗する障害にしか
-// 成立していなかった**。TCP は繋がるが応答が返らない相手だと `catch` に入らず、
-// 失敗も数えられず、`pollThenSchedule()` の次の予約も行われない。ここでの
-// テストは **`vi.useFakeTimers()` と「解決しない Promise」**で、その障害を
-// 再現する（即座に reject するモックでは一生検出できない）。
-
 describe('readSubscriptionWithLimit / pollFailureOutcome', () => {
 	afterEach(() => {
 		vi.useRealTimers();
@@ -1550,7 +1422,7 @@ describe('hubAbandonedDisplay', () => {
 		// 止める役割を果たさない。止めた以上、抜け道も同じ行に書く。
 		const blocked = hubAbandonedDisplay(true, false);
 		expect(blocked.blocksChanges).toBe(true);
-		for (const stopped of ['接続', '切断', '採用', '一覧の更新', '選択の保存', 'タグの選択']) {
+		for (const stopped of ['接続', '切断', '採用', '一覧の更新']) {
 			expect(blocked.notice, stopped).toContain(stopped);
 		}
 		expect(blocked.notice).toContain('状態を再取得');
@@ -1620,7 +1492,7 @@ describe('reconfirmStatusFailureNotice', () => {
 			expect(notice, row.outcome).toContain('もう一度');
 			expect(notice, row.outcome).toContain('状態を再取得');
 			// 止めている操作は引き続き列挙する（`hubAbandonedDisplay` と同じ規律）。
-			for (const stopped of ['接続', '切断', '採用', '一覧の更新', '選択の保存', 'タグの選択']) {
+			for (const stopped of ['接続', '切断', '採用', '一覧の更新']) {
 				expect(notice, `${row.outcome} / ${stopped}`).toContain(stopped);
 			}
 		}
@@ -1645,144 +1517,5 @@ describe('reconfirmStatusFailureNotice', () => {
 		const failed = reconfirmStatusFailureNotice('failed', '理由');
 		const timedOut = reconfirmStatusFailureNotice('timedOut', null);
 		expect(failed).not.toBe(timedOut);
-	});
-});
-
-// --- オーナーレビュー P2-2: 保存本体と、保存後の購読読み取りの予算を分ける ---
-//
-// 以前は保存も読み直しも 1 つの `runWithLimit(action, HUB_UI_TIMEOUT_MS)` の
-// 内側にあり、**保存が成功していても読み直しが返らないだけで操作全体が
-// `timedOut`** になっていた（「保存しました」と「操作は続いている可能性が
-// あります」が併存）。ここでも `vi.useFakeTimers()` と「解決しない Promise」で
-// 固定する - 即座に reject するモックでは再現できない。
-
-describe('saveSelectionWithLimits', () => {
-	afterEach(() => {
-		vi.useRealTimers();
-	});
-
-	/** 解決も reject もしない購読読み取り（応答が返らないアプリ）。 */
-	function neverSettlingSubscription(): (signal: AbortSignal) => Promise<HubSubscription> {
-		return () => new Promise<HubSubscription>(() => {});
-	}
-
-	function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
-		let resolve!: (value: T) => void;
-		const promise = new Promise<T>((res) => {
-			resolve = res;
-		});
-		return { promise, resolve };
-	}
-
-	it('保存が成功すれば、購読の読み直しが返らなくても保存は ok のまま', async () => {
-		vi.useFakeTimers();
-		const save = deferred<void>();
-		const onSaved = vi.fn();
-		const pending = saveSelectionWithLimits(
-			() => save.promise,
-			neverSettlingSubscription(),
-			onSaved
-		);
-
-		save.resolve();
-		await vi.advanceTimersByTimeAsync(0);
-		// 保存本体が成功した時点で「保存しました」を出す（読み直しを待たない）。
-		expect(onSaved).toHaveBeenCalledTimes(1);
-
-		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
-		const outcome = await pending;
-		expect(outcome.save.kind).toBe('ok');
-		expect(outcome.subscriptionReread).toEqual({ kind: 'timedOut' });
-		// 打ち切り通知には進めない（`run()` 側の分岐は save の結末だけを見る）。
-		expect(hubAbandonedDisplay(outcome.save.kind === 'timedOut', false).notice).toBeNull();
-	});
-
-	it('保存本体が上限直前に成功しても同じ（読み直しの 4 秒は全体の枠外）', async () => {
-		// 「読み直しに 4 秒上限を足して全体 90 秒の枠内に残す」では塞げない境界。
-		vi.useFakeTimers();
-		const save = deferred<void>();
-		const onSaved = vi.fn();
-		const pending = saveSelectionWithLimits(
-			() => save.promise,
-			neverSettlingSubscription(),
-			onSaved
-		);
-
-		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS - 1);
-		save.resolve();
-		await vi.advanceTimersByTimeAsync(0);
-		expect(onSaved).toHaveBeenCalledTimes(1);
-
-		// ここから購読の 4 秒。合計は 90 秒を超えるが、保存の成否はもう確定済み。
-		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
-		const outcome = await pending;
-		expect(outcome.save.kind).toBe('ok');
-		expect(outcome.subscriptionReread?.kind).toBe('timedOut');
-	});
-
-	it('読み直しの失敗・打ち切りは購読状態の取得失敗として数える', async () => {
-		vi.useFakeTimers();
-		const pendingTimedOut = saveSelectionWithLimits(
-			async () => {},
-			neverSettlingSubscription(),
-			() => {}
-		);
-		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
-		const timedOut = await pendingTimedOut;
-		expect(timedOut.save.kind).toBe('ok');
-		expect(timedOut.subscriptionReread).toEqual({ kind: 'timedOut' });
-
-		const failed = await saveSelectionWithLimits(
-			async () => {},
-			async () => {
-				throw new Error('boom');
-			},
-			() => {}
-		);
-		expect(failed.save.kind).toBe('ok');
-		expect(failed.subscriptionReread).toEqual({ kind: 'failed' });
-
-		// 既存のポーリングと同じカウンタに合流する（別の数え方を作らない）。
-		let failures = 0;
-		for (const reread of [timedOut.subscriptionReread, failed.subscriptionReread]) {
-			if (reread === null) continue;
-			failures = nextPollFailureCount(failures, pollFailureOutcome(reread));
-		}
-		expect(failures).toBe(SUBSCRIPTION_POLL_FAILURE_LIMIT);
-		expect(isSubscriptionStale(failures)).toBe(true);
-	});
-
-	it('保存が打ち切られたら「保存しました」も出さず、読み直しにも進まない', async () => {
-		vi.useFakeTimers();
-		const onSaved = vi.fn();
-		const readSubscription = vi.fn(neverSettlingSubscription());
-		const pending = saveSelectionWithLimits(
-			() => new Promise<void>(() => {}),
-			readSubscription,
-			onSaved
-		);
-		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS);
-		const outcome = await pending;
-		expect(outcome.save.kind).toBe('timedOut');
-		expect(outcome.subscriptionReread).toBeNull();
-		expect(onSaved).not.toHaveBeenCalled();
-		expect(readSubscription).not.toHaveBeenCalled();
-	});
-
-	it('保存が失敗したら失敗の中身を運び、読み直しには進まない', async () => {
-		const boom = new Error('boom');
-		const onSaved = vi.fn();
-		const readSubscription = vi.fn(neverSettlingSubscription());
-		const outcome = await saveSelectionWithLimits(
-			async () => {
-				throw boom;
-			},
-			readSubscription,
-			onSaved
-		);
-		expect(outcome.save).toEqual({ kind: 'failed', error: boom });
-		expect(outcome.subscriptionReread).toBeNull();
-		expect(onSaved).not.toHaveBeenCalled();
-		expect(readSubscription).not.toHaveBeenCalled();
 	});
 });

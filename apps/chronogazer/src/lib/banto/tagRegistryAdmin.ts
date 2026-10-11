@@ -44,9 +44,9 @@ export type PlcProtocol = 'modbus-tcp' | 'slmp';
  * #383 段階3 P2（2026-10-10 オーナー決定 H1）: レジストリには Hub 経由の接続
  * （`protocol: 'hub'`、`banto_tags::HUB_PROTOCOL`）も入りうるので、**読み取った**
  * 接続の型はこちら。作成・更新の入力（{@link PlcConnectionInput}）は
- * {@link PlcProtocol} のまま - Hub 接続を作る画面は P4 で足す（それまでは REST が
- * 拒否する）。画面はプロトコルを文字列のまま表示するだけなので、`'hub'` の行が
- * あっても一覧・フォームは壊れない。
+ * {@link PlcProtocol} のまま - Hub 接続は画面の作成フォームでは作らず、P4 の
+ * 「Hub から追加」（{@link registerTagsFromHub}）がサーバー側で暗黙に作る
+ * （REST・Tauri は P4 から `hub` の作成も受け付ける）。一覧では読み取り専用で出す。
  */
 export type RegistryProtocol = PlcProtocol | 'hub';
 
@@ -417,4 +417,67 @@ export async function deleteTag(id: number): Promise<void> {
 		return;
 	}
 	await httpRequest<void>(`/api/tags/${id}`, { method: 'DELETE', expectNoContent: true });
+}
+
+// --- #383 段階3 P4: Hub から追加 ---------------------------------------------
+
+/** Mirrors `chronogazer_core::hub_tags::HubTagRow`（ダイアログが読んだ catalog の 1 行）。 */
+export interface HubTagRow {
+	externalName: string;
+	name: string;
+	dataType: string;
+	unit: string | null;
+	decimals: number | null;
+}
+
+/**
+ * Mirrors `chronogazer_core::hub_tags::HubTagRegistration`。登録先は
+ * `collectionGroupId`（Hub 接続の下の既存グループ）か `newGroup` の**どちらか 1 つ**。
+ */
+export interface HubTagRegistration {
+	collectionGroupId: number | null;
+	newGroup: { name: string; periodMs: number } | null;
+	tags: HubTagRow[];
+}
+
+/** 1 行分のエラー（`index` = リクエストの `tags` の位置）。 */
+export interface HubRowError {
+	index: number;
+	externalName: string;
+	fieldErrors: { field: string; message: string }[];
+}
+
+/**
+ * Mirrors `chronogazer_core::hub_tags::HubRegistrationResult`。**検証の不合格は
+ * 例外ではなく `ok: false`**（banto-hub の `POST /api/tags/batch` と同じ）で、
+ * そのときは何も書かれていない。`fieldErrors` は行に属さないエラー（登録先・
+ * 新しいグループの `newGroupName` / `newGroupPeriodMs`）。
+ */
+export interface HubRegistrationResult {
+	ok: boolean;
+	fieldErrors: { field: string; message: string }[];
+	rowErrors: HubRowError[];
+	connectionId: number | null;
+	connectionCreated: boolean;
+	collectionGroup: CollectionGroup | null;
+	groupCreated: boolean;
+	tags: Tag[];
+	legacySelectionCleared: boolean;
+}
+
+/**
+ * `editor`-floor: Hub のカタログから選んだタグを登録する（#383 段階3 P4）。
+ * Hub 接続がまだ無ければサーバーが暗黙に作る（新しいグループを作る登録のとき）。
+ */
+export async function registerTagsFromHub(
+	input: HubTagRegistration
+): Promise<HubRegistrationResult> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<HubRegistrationResult>('tags_register_from_hub', { input });
+	}
+	return httpRequest<HubRegistrationResult>('/api/tags/from-hub', {
+		method: 'POST',
+		body: input
+	});
 }
