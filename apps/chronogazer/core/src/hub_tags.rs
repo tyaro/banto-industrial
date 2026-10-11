@@ -173,10 +173,13 @@ pub struct HubRegistrationResult {
     pub collection_group: Option<CollectionGroup>,
     pub group_created: bool,
     pub tags: Vec<Tag>,
-    /// 移行前の選択（`hub.record.selected_tags`）を消したか。消すのは
-    /// 呼び出し側（REST / Tauri）で、登録が成功した後（[`register_from_hub`]
-    /// 自体は `false` のまま返す）。
-    pub legacy_selection_cleared: bool,
+    /// 移行前の選択（`hub.record.selected_tags`）の消去を**予約した**か（消すべき
+    /// 選択があった）。予約するのは呼び出し側（REST / Tauri）で、登録が成功した後
+    /// （[`register_from_hub`] 自体は `false` のまま返す）。消去そのものは応答を
+    /// 待たせずに裏で行う（`HubService::schedule_legacy_selection_clear`。操作ロックを
+    /// `connect` が握っていると最大 60 秒待つため）。予約した時点からダイアログ用の
+    /// catalog は移行前の選択を空として返す。
+    pub legacy_selection_clear_scheduled: bool,
 }
 
 impl HubRegistrationResult {
@@ -190,7 +193,7 @@ impl HubRegistrationResult {
             collection_group: None,
             group_created: false,
             tags: Vec::new(),
-            legacy_selection_cleared: false,
+            legacy_selection_clear_scheduled: false,
         }
     }
 }
@@ -526,7 +529,7 @@ async fn register_in_tx(
                 collection_group: Some(group),
                 group_created,
                 tags: created.unwrap_or_default(),
-                legacy_selection_cleared: false,
+                legacy_selection_clear_scheduled: false,
             })
         }
     }

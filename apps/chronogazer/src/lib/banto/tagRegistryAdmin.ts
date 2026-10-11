@@ -462,7 +462,12 @@ export interface HubRegistrationResult {
 	collectionGroup: CollectionGroup | null;
 	groupCreated: boolean;
 	tags: Tag[];
-	legacySelectionCleared: boolean;
+	/**
+	 * 移行前の選択の消去を**予約した**か（消すべき選択があった）。消去はサーバーが
+	 * 応答を待たせずに裏で行い、予約した時点から {@link getHubCatalog} の
+	 * `legacySelection` は空になる。
+	 */
+	legacySelectionClearScheduled: boolean;
 }
 
 /**

@@ -509,7 +509,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
          **移行**: 既存の `hub.record.selected_tags` は自動ではタグにしない（グループと周期を持たないため）。
          「Hub から追加」が 1 度だけ事前にチェックして注記（「以前の Hub 接続の画面で選んでいたタグ」）を出し、最初の
          登録が成功したとき、または明示の「以前の選択を使わない」（`POST /api/hub/legacy-selection/dismiss`）で消す。
-         古い記録は読める（後方互換）。選択の保存の口（`PUT /api/hub/selected-tags`・`hub_set_selected_tags`）は外した。
+         登録の後の消去は**応答を待たせずに予約する**（消去は Hub の操作ロックを取るので、`connect` が握っていると最大 60 秒待つ。予約の間はダイアログ用の catalog が移行前の選択を空で返し、事前チェックは出直さない。応答の `legacySelectionClearScheduled`、`HubService::schedule_legacy_selection_clear`。2026-10-11 の P4 の監査）。古い記録は読める（後方互換）。選択の保存の口（`PUT /api/hub/selected-tags`・`hub_set_selected_tags`）は外した。
       5. **P3 の持ち越し**: 開始時の突き合わせで外したタグ（`hubTagNotFound` / `hubTagTypeChanged`）は収集の需要に
          残さない（`CollectorConfig::external_names` = 組み立ての後の計画で需要を絞る。Hub への往復は増えない）。
   - **#392 収集エンジンの UI 独立**:

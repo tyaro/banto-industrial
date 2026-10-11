@@ -1753,7 +1753,8 @@ async fn hub_dismiss_legacy_selection_handler(
 /// 選んだタグを登録する（規則は `crate::hub_tags` のモジュール doc）。**常に
 /// 200**（banto-hub の `POST /api/tags/batch` と同じ）: 検証の不合格は
 /// `ok: false` と行ごとのエラー。成功したら監査し、購読に反映し
-/// （`HubService::registry_changed`）、移行前の選択を消す。
+/// （`HubService::registry_changed`）、移行前の選択の消去を予約する（待たない -
+/// `HubService::schedule_legacy_selection_clear`）。
 async fn tags_from_hub_handler(
     State(state): State<HubRegistrationState>,
     headers: HeaderMap,
@@ -1788,25 +1789,10 @@ async fn tags_from_hub_handler(
         )
         .await;
         state.hub.registry_changed().await;
-        result.legacy_selection_cleared =
-            clear_legacy_selection_after_registration(&state.hub).await;
+        // 待たない（操作ロックを `connect` が握っていても応答を遅らせない）。
+        result.legacy_selection_clear_scheduled = state.hub.schedule_legacy_selection_clear();
     }
     Ok(Json(result))
-}
-
-/// 登録が成功した後に移行前の選択を消す（#383 段階3 P4）。消せなくても登録は
-/// 成功のまま返す（ログだけ残す。次の登録・「使わない」でまた消しに行く）。
-/// REST と Tauri の両方が使う。
-pub async fn clear_legacy_selection_after_registration(hub: &HubService) -> bool {
-    match hub.clear_legacy_selection().await {
-        Ok(cleared) => cleared,
-        Err(err) => {
-            eprintln!(
-                "banto: Hub から追加した後、以前の画面で選んでいたタグを消せませんでした（登録は完了しています）: {err}"
-            );
-            false
-        }
-    }
 }
 
 fn hub_registration_router(state: HubRegistrationState) -> Router {
@@ -2090,6 +2076,21 @@ mod tests {
     /// (#414 段階2: a tag saved before the save-time address check).
     pub(super) async fn router_with_role_tokens_and_pool(
     ) -> (Router, String, String, String, sqlx::SqlitePool) {
+        let (router, admin, editor, viewer, pool, _hub) =
+            router_with_role_tokens_pool_and_hub().await;
+        (router, admin, editor, viewer, pool)
+    }
+
+    /// [`router_with_role_tokens_and_pool`] plus the router's `HubService`（#383 段階3
+    /// P4: 操作ロックを外から握るテストのため。`Clone` は同じ実体を指す）。
+    async fn router_with_role_tokens_pool_and_hub() -> (
+        Router,
+        String,
+        String,
+        String,
+        sqlx::SqlitePool,
+        crate::hub::HubService,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(Db::Sqlite(pool.clone()));
@@ -2152,7 +2153,7 @@ mod tests {
                 settings,
                 audit,
                 backup,
-                hub,
+                hub.clone(),
                 plc_connections,
                 collection_groups,
                 tags,
@@ -2166,6 +2167,7 @@ mod tests {
             editor_token,
             viewer_token,
             pool,
+            hub,
         )
     }
 
@@ -4322,7 +4324,7 @@ mod tests {
         assert_eq!(body["tags"][0]["writable"], json!(false));
         assert_eq!(body["tags"][0]["rawLo"], json!(null));
         assert_eq!(body["tags"][0]["decimals"], json!(1));
-        assert_eq!(body["legacySelectionCleared"], json!(false));
+        assert_eq!(body["legacySelectionClearScheduled"], json!(false));
         let group_id = body["collectionGroup"]["id"].as_i64().unwrap();
 
         let connections = body_json(
@@ -4406,6 +4408,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dismissed.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// #383 段階3 P4（監査の追補）: 登録の応答は、移行前の選択の消去を**待たない**。
+    /// Hub の操作ロックを `connect` が握っている（最大 60 秒）状態でも登録はすぐ
+    /// 返り、`legacySelectionClearScheduled: true`。予約の間も catalog は移行前の
+    /// 選択を出さず、ロックが空くと設定から消える。
+    ///
+    /// 反証: ハンドラの予約を `clear_legacy_selection().await` に戻すと、応答が
+    /// 時間切れで落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tags_from_hub_does_not_wait_for_the_legacy_clear() {
+        let (router, _admin, editor, _viewer, pool, hub) =
+            router_with_role_tokens_pool_and_hub().await;
+        let settings = SettingsService::new(Db::Sqlite(pool));
+        let record = json!({
+            "endpoint": "http://127.0.0.1:3100",
+            "installationId": "inst",
+            "keyId": null,
+            "keyName": null,
+            "keyringAccount": "hub:127.0.0.1:3100/:inst",
+            "selectedTags": ["L.G.a"]
+        });
+        settings
+            .set("hub.record", &record.to_string())
+            .await
+            .unwrap();
+        let catalog = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/hub/catalog", &editor))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(catalog["legacySelection"], json!(["L.G.a"]), "{catalog}");
+
+        let held = hub.hold_operation_lock_for_test().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.clone().oneshot(post_json_auth(
+                "/api/tags/from-hub",
+                &editor,
+                json!({
+                    "newGroup": { "name": "hub-g", "periodMs": 1000 },
+                    "tags": [hub_row("L.G.a", "a", "f32")]
+                }),
+            )),
+        )
+        .await
+        .expect("操作ロックを握られていても登録の応答は待たない")
+        .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["legacySelectionClearScheduled"], json!(true));
+        assert!(hub.legacy_clear_pending_for_test());
+        drop(held);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let stored: serde_json::Value =
+                serde_json::from_str(&settings.get("hub.record").await.unwrap().unwrap()).unwrap();
+            if stored["selectedTags"] == json!([]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ロックが空いたら裏で消える: {stored}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let catalog = body_json(
+            router
+                .oneshot(get_auth("/api/hub/catalog", &editor))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(catalog["legacySelection"], json!([]));
     }
 
     /// banto-tags 自身の検証（`period_ms` は `ALLOWED_PERIOD_MS` のいずれか）

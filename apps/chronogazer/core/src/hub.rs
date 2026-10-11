@@ -1772,6 +1772,15 @@ struct HubInner {
     /// それより後の変更は、そのタスクの突き合わせが読み直すレジストリに
     /// 含まれる）。
     registry_resync_queued: std::sync::atomic::AtomicBool,
+    /// 移行前の選択の消去を予約した（[`HubService::schedule_legacy_selection_clear`]）
+    /// が、まだ消せていない。立っている間は、ダイアログ用の catalog
+    /// （[`HubService::catalog_for_registration`]）が移行前の選択を**空として**返す
+    /// （消去が操作ロックを待っている間に事前チェックが出直さないように）。
+    /// 消せたら降ろす。失敗したら立てたまま（このプロセスの間は出さない。設定には
+    /// 残っているので、次の予約で消しに行く）。
+    legacy_clear_pending: std::sync::atomic::AtomicBool,
+    /// 消去のタスクが走っている（単発の保証。走っている間の予約は旗を立てるだけ）。
+    legacy_clear_running: std::sync::atomic::AtomicBool,
 }
 
 /// Hub 接続のサービス層。`src-tauri` の `hub_*` コマンドと
@@ -1825,6 +1834,8 @@ impl HubService {
                 prepare_answer_for_test: Mutex::new(None),
                 registry: std::sync::OnceLock::new(),
                 registry_resync_queued: std::sync::atomic::AtomicBool::new(false),
+                legacy_clear_pending: std::sync::atomic::AtomicBool::new(false),
+                legacy_clear_running: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -2014,18 +2025,85 @@ impl HubService {
     /// ポーリングには使わない）。**発行は行わない**。
     pub async fn catalog_for_registration(&self) -> Result<HubCatalogView, BantoError> {
         let view = self.status().await?;
-        let legacy_selection = self
-            .inner
-            .mirror
-            .current()
-            .map(|record| record.selected_tags)
-            .unwrap_or_default();
+        // 消去を予約済み（まだ操作ロックを待っている）なら、消えたものとして返す。
+        let legacy_selection = if self.inner.legacy_clear_pending.load(Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            self.inner
+                .mirror
+                .current()
+                .map(|record| record.selected_tags)
+                .unwrap_or_default()
+        };
         Ok(HubCatalogView {
             status: view.status,
             tags: view.tags,
             registered: view.subscription.registered,
             legacy_selection,
         })
+    }
+
+    /// 「Hub から追加」の登録が成功した後に、移行前の選択の消去を**予約する**
+    /// （#383 段階3 P4）。**待たない**: 消去は操作ロックを取るので、`connect`
+    /// （最大 60 秒）が走っていると待たされる - それで登録の応答を遅らせない。
+    ///
+    /// * 予約した時点で [`HubInner::legacy_clear_pending`] を立てるので、消える
+    ///   前に開き直したダイアログにも事前チェックは出ない。
+    /// * 消去のタスクは**単発**（[`HubInner::legacy_clear_running`]）。走っている
+    ///   間の予約は旗だけ立てる（そのタスクが操作ロックの後で最新の記録を消すので
+    ///   足りる）。消去は冪等（消すものが無ければ何もしない）。
+    /// * 失敗はログに残し、旗は立てたまま（このプロセスの間は出さない。次の予約で
+    ///   また消しに行く）。
+    ///
+    /// 戻り値は「消すべき移行前の選択があったので予約した」か（写しを読むだけ。
+    /// 写しが未読込なら `false` でも予約はする）。
+    pub fn schedule_legacy_selection_clear(&self) -> bool {
+        let had_selection = self
+            .inner
+            .mirror
+            .current()
+            .is_some_and(|record| !record.selected_tags.is_empty());
+        if self.is_shutting_down() {
+            return had_selection;
+        }
+        self.inner
+            .legacy_clear_pending
+            .store(true, Ordering::SeqCst);
+        if self.inner.legacy_clear_running.swap(true, Ordering::SeqCst) {
+            return had_selection;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            // 消去は冪等で、操作ロックを取ってから最新の記録を読み直して消すので、
+            // 走っている間に重なった予約も同じ 1 回で満たされる（P4 から選択を
+            // 書き込む口は無く、新しい選択が後から現れることも無い）。
+            match service.clear_legacy_selection().await {
+                Ok(_) => service
+                    .inner
+                    .legacy_clear_pending
+                    .store(false, Ordering::SeqCst),
+                Err(err) => eprintln!(
+                    "banto: Hub から追加した後、以前の画面で選んでいたタグを消せませんでした（登録は完了しています。次の登録・「以前の選択を使わない」で再試行します）: {err}"
+                ),
+            }
+            service
+                .inner
+                .legacy_clear_running
+                .store(false, Ordering::SeqCst);
+        });
+        had_selection
+    }
+
+    /// テスト用: 移行前の選択の消去を予約済みで、まだ消せていないか。
+    #[cfg(test)]
+    pub(crate) fn legacy_clear_pending_for_test(&self) -> bool {
+        self.inner.legacy_clear_pending.load(Ordering::SeqCst)
+    }
+
+    /// テスト用: 操作ロックを外から握る（`connect` が走っている状態の再現）。
+    #[cfg(test)]
+    pub(crate) async fn hold_operation_lock_for_test(&self) -> AsyncMutexGuard<'_, ()> {
+        self.inner.operation.lock().await
     }
 
     /// P4 より前の設定画面で選んでいたタグ（`hub.record.selected_tags`）を
@@ -3494,6 +3572,94 @@ mod tests {
         assert!(read_back.selected_tags.is_empty());
         assert_eq!(read_back.key_id, Some(3));
         assert_eq!(read_back.endpoint, "http://127.0.0.1:3100");
+        assert!(hub
+            .catalog_for_registration()
+            .await
+            .unwrap()
+            .legacy_selection
+            .is_empty());
+    }
+
+    /// #383 段階3 P4（監査の追補）: 登録の後の移行前の選択の消去は**予約するだけで
+    /// 待たない**。操作ロックを握られていても（`connect` が最大 60 秒握る）すぐ戻り、
+    /// 予約の間は catalog が移行前の選択を空で返す（事前チェックが出直さない）。
+    /// ロックが空くと裏で消える。
+    ///
+    /// 反証: 予約を `clear_legacy_selection().await` に戻すと、ロックを握ったままの
+    /// 呼び出しが戻らず（この関数は同期なので書けない - 戻したら REST の
+    /// `tags_from_hub_does_not_wait_for_the_legacy_clear` が時間切れで落ちる）。
+    /// 予約の旗を catalog で見なくすると、下の「消える前の catalog」で落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scheduled_legacy_clear_returns_at_once_and_clears_after_the_lock() {
+        let (settings, hub) = service().await;
+        settings
+            .set(
+                KEY_HUB_RECORD,
+                &serde_json::to_string(&seed_record(&["a"])).unwrap(),
+            )
+            .await
+            .unwrap();
+        hub.hydrate().await.unwrap();
+
+        let held = hub.hold_operation_lock_for_test().await;
+        assert!(hub.schedule_legacy_selection_clear(), "消すべき選択がある");
+        // 2 回目の予約も待たずに戻る（タスクは単発で、旗を立てるだけ）。
+        hub.schedule_legacy_selection_clear();
+        assert!(hub.legacy_clear_pending_for_test());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let still: HubRecord =
+            serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            still.selected_tags,
+            owned(&["a"]),
+            "ロックを握られている間は消えない"
+        );
+        drop(held);
+
+        // 消える前でも catalog は空で返す（予約の旗）- ここで操作ロックを取りに行く
+        // ので、消去のタスクと順番に進む。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stored: HubRecord =
+                serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap())
+                    .unwrap();
+            if stored.selected_tags.is_empty() && !hub.legacy_clear_pending_for_test() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ロックが空いたら裏で消える"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(hub
+            .catalog_for_registration()
+            .await
+            .unwrap()
+            .legacy_selection
+            .is_empty());
+    }
+
+    /// 予約の旗が立っている間（消去がまだ操作ロックを待っている）は、設定に選択が
+    /// 残っていても catalog は移行前の選択を空で返す。
+    #[tokio::test]
+    async fn a_pending_legacy_clear_hides_the_selection_from_the_catalog() {
+        let (settings, hub) = service().await;
+        settings
+            .set(
+                KEY_HUB_RECORD,
+                &serde_json::to_string(&seed_record(&["a"])).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.catalog_for_registration()
+                .await
+                .unwrap()
+                .legacy_selection,
+            owned(&["a"])
+        );
+        hub.inner.legacy_clear_pending.store(true, Ordering::SeqCst);
         assert!(hub
             .catalog_for_registration()
             .await

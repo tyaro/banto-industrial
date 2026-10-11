@@ -3526,8 +3526,8 @@ async fn tags_register_from_hub_body(
             })
             .await;
         state.hub.registry_changed().await;
-        result.legacy_selection_cleared =
-            chronogazer_core::rest::clear_legacy_selection_after_registration(&state.hub).await;
+        // 待たない（REST と同じ。`HubService::schedule_legacy_selection_clear`）。
+        result.legacy_selection_clear_scheduled = state.hub.schedule_legacy_selection_clear();
     }
     Ok(result)
 }
