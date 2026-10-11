@@ -200,6 +200,14 @@ describe('connectionStatusLabel', () => {
 		expect(new Set(labels).size).toBe(statuses.length);
 		expect(connectionStatusLabel({ status: 'reconnecting', attempt: 4 })).toContain('4回目');
 	});
+
+	it('#383 P5: 回数を数えない再接続（attempt 0 = Hub 経由）は回数を出さない', () => {
+		const label = connectionStatusLabel({ status: 'reconnecting', attempt: 0 });
+		expect(label).toBe('再接続中');
+		expect(label).not.toContain('回目');
+		// 1 以上は従来どおり。
+		expect(connectionStatusLabel({ status: 'reconnecting', attempt: 1 })).toBe('再接続中（1回目）');
+	});
 });
 
 describe('connectionSimulationNote（#413）', () => {
@@ -371,6 +379,12 @@ describe('eventKindLabel', () => {
 		expect(eventKindLabel('append_failure_cleared')).toBe('書き込み復帰');
 	});
 
+	it('#383 P5: 接続の 3 種は PLC 直結にも Hub 経由にも通る語（「PLC」を付けない）', () => {
+		expect(eventKindLabel('plc_connected')).toBe('接続');
+		expect(eventKindLabel('plc_disconnected')).toBe('切断');
+		expect(eventKindLabel('plc_reconnected')).toBe('再接続');
+	});
+
 	it('未知の種類は綴りをそのまま出す（落とさない・失敗しない）', () => {
 		expect(eventKindLabel('some_future_kind')).toBe('some_future_kind');
 	});
@@ -433,7 +447,7 @@ describe('除外の一覧（#414 段階2）', () => {
 	});
 
 	it('単位の表示は 3 つとも別で、/tags の節の見出しと同じ語', () => {
-		expect(exclusionUnitLabel('connection')).toBe('PLC接続');
+		expect(exclusionUnitLabel('connection')).toBe('接続');
 		expect(exclusionUnitLabel('group')).toBe('収集グループ');
 		expect(exclusionUnitLabel('tag')).toBe('タグ');
 	});
@@ -461,6 +475,85 @@ describe('除外の一覧（#414 段階2）', () => {
 		});
 		expect(note?.summary).toContain('残りは収集しています');
 		expect(note?.fix).toContain('「収集を再起動」');
+	});
+
+	describe('#383 P5: Hub 経由の除外理由の案内', () => {
+		const hub = (reason: string, key = 'conn:2'): ExclusionView => ({
+			unit: key.startsWith('conn') ? 'connection' : key.startsWith('grp') ? 'group' : 'tag',
+			id: 2,
+			key,
+			name: 'Hub',
+			reason,
+			message: 'm'
+		});
+		const running = (exclusions: ExclusionView[]): CollectorStateView => ({
+			state: 'running',
+			groups: 1,
+			tags: 1,
+			exclusions
+		});
+
+		it('hubNotConfigured: 設定 > Hub接続 へ案内し、タグ設定で直せとは言わない（連鎖の除外があっても）', () => {
+			const note = collectExclusionsNote(
+				running([
+					hub('hubNotConfigured'),
+					hub('connectionExcluded', 'grp:3'),
+					hub('connectionExcluded', 'tag:4')
+				])
+			);
+			expect(note?.fix).toBeNull();
+			expect(note?.summary).not.toContain('不正');
+			expect(note?.guides.map((g) => [g.reason, g.link?.path])).toEqual([
+				['hubNotConfigured', '/settings/hub']
+			]);
+		});
+
+		it('hubSourceUnavailable: この実行形態では収集できない旨で、リンクは付けない', () => {
+			const note = collectExclusionsNote(running([hub('hubSourceUnavailable')]));
+			expect(note?.fix).toBeNull();
+			expect(note?.guides).toHaveLength(1);
+			expect(note?.guides[0].text).toContain('この実行形態では');
+			expect(note?.guides[0].link).toBeNull();
+		});
+
+		it('hubTagNotFound / hubTagTypeChanged: タグ設定でそのタグを編集して直す案内（削除・再登録は勧めない。理由の並びは固定）', () => {
+			const note = collectExclusionsNote(
+				running([hub('hubTagTypeChanged', 'tag:5'), hub('hubTagNotFound', 'tag:4')])
+			);
+			expect(note?.guides.map((g) => g.reason)).toEqual(['hubTagNotFound', 'hubTagTypeChanged']);
+			for (const guide of note?.guides ?? []) {
+				expect(guide.text).toContain('編集');
+				expect(guide.text).toContain('収集を再起動');
+				expect(guide.text).not.toContain('削除して');
+				expect(guide.text).not.toContain('登録し直');
+				expect(guide.link?.path).toBe('/tags');
+			}
+			// タグ設定での作業が要る理由なので、従来のリンク文も出す。
+			expect(note?.fix).not.toBeNull();
+		});
+
+		it('設定の不正と Hub の環境理由が混ざれば、タグ設定の案内も Hub の案内も出る', () => {
+			const note = collectExclusionsNote(running([legacy, hub('hubNotConfigured')]));
+			expect(note?.fix).toContain('「収集を再起動」');
+			expect(note?.summary).toContain('不正');
+			expect(note?.guides.map((g) => g.reason)).toEqual(['hubNotConfigured']);
+		});
+
+		it('Hub の理由が無ければ guides は空で従来どおり', () => {
+			const note = collectExclusionsNote(running([legacy]));
+			expect(note?.guides).toEqual([]);
+			expect(note?.fix).toContain('「収集を再起動」');
+		});
+
+		it('全部外れた noTargets でも、環境の理由だけなら「直して」ではなく案内に従う旨', () => {
+			const detail = collectStateDetail({
+				state: 'noTargets',
+				exclusions: [hub('hubNotConfigured')]
+			});
+			expect(detail).toContain('失敗ではありません');
+			expect(detail).toContain('案内に従って');
+			expect(detail).not.toContain('不正');
+		});
 	});
 
 	it('除外が無い・走っている構成が無いときは説明文を出さない', () => {

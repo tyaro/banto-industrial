@@ -157,7 +157,12 @@ export default defineConfig({
 				BANTO_DB: dbPath,
 				// chronogazer-core/src/bin/banto-serve.rs: POST /api/auth/setup is
 				// 403'd unless explicitly opted into - required for scenario 1.
-				BANTO_ALLOW_SETUP: '1'
+				BANTO_ALLOW_SETUP: '1',
+				// #383 段階3 P5: Hub の API キーをプロセス内メモリに置き、収集にも
+				// Hub を繋ぐ（`user-simulator-monitor-hub.spec.ts` がモック Hub 相手に
+				// Hub 経由のタグの収集を通す）。既定の banto-serve は OS キーリングが無く、
+				// Hub 経由の接続を収集しない。
+				BANTO_HUB_MEMORY_KEYS: '1'
 			}
 		},
 		{

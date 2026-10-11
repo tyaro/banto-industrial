@@ -13,12 +13,18 @@
 //!
 //! * (a) Hub のタグ一覧から消えたタグは `hubTagNotFound` で**そのタグだけ**
 //!   外れ、残りで `Running`（H3・#414）、
-//! * (b) 現在値: Hub の good の値は `good`、`simulation` / `derived_simulation`
-//!   の値も表示はされ（#413）、Hub の `stale` は `stale`、外したタグは
-//!   `invalid`、
-//! * (c) データファイル: 実値（`real`）だけが**毎周期**記録され、
-//!   シミュレーションの 2 種と stale は null（H4・#413）、
+//! * (b) 現在値: Hub の good の値は `value_source` に依らず（`simulation`・
+//!   `derived_simulation`・未知を含む）`good`、Hub の `stale` は `stale`、
+//!   外したタグは `invalid`、
+//! * (c) データファイル: good の値は `value_source` に依らず**毎周期**記録され、
+//!   stale だけが null（H4。`value_source` を解釈しない = 2026-10-11 オーナー
+//!   決定。P3 では simulation 系と未知を記録しなかった）、
 //! * (d) `collect_events` に Hub の接続キーの `plc_connected`。
+//!
+//! P5（#383 段階3）で足したもの: Hub の切断→再接続が Hub の接続キーの
+//! `plc_connected` → `plc_disconnected` → `plc_reconnected` で出る、bit
+//! タグの記録（0/1）、Hub 経由のタグへのしきい値（記録計の側の
+//! `recorder_tag_settings`）がシミュレーション由来の値でも判定され記録される。
 //!
 //! 待ちはすべて「条件をポーリング + 上限時間」。固定 sleep で緑にしない。
 
@@ -44,6 +50,7 @@ use chronogazer_core::collect::{
 use chronogazer_core::db::{init_db, Db};
 use chronogazer_core::hub::HubService;
 use chronogazer_core::settings::SettingsService;
+use chronogazer_core::tag_thresholds::{TagThresholdService, TagThresholdsPayload};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -61,6 +68,8 @@ const REAL: &str = "PLC9.G.real";
 const SIM: &str = "PLC9.G.sim";
 const DSIM: &str = "PLC9.G.dsim";
 const STALE: &str = "PLC9.G.stale";
+/// Hub が未知の `value_source` を付けた値（将来のラベル）。
+const FUTURE: &str = "PLC9.G.future";
 /// 登録はしてあるが Hub のタグ一覧に無い（Hub で消された）。
 const GONE: &str = "PLC9.G.gone";
 
@@ -159,7 +168,7 @@ fn mock_hub() -> MockHub {
         revision: 1,
         run_id: Some(1),
         collection_mode: CollectionMode::Configured,
-        tags: [REAL, SIM, DSIM, STALE]
+        tags: [REAL, SIM, DSIM, STALE, FUTURE]
             .iter()
             .enumerate()
             .map(|(index, name)| catalog_tag(name, index as i64 + 1))
@@ -180,6 +189,12 @@ fn mock_hub() -> MockHub {
                 ValueSource::DerivedSimulation,
             ),
             entry(STALE, 4.0, ValueQuality::Stale, ValueSource::Real),
+            entry(
+                FUTURE,
+                5.0,
+                ValueQuality::Good,
+                ValueSource::Unknown("future_source".to_owned()),
+            ),
         ],
     };
     // WS は tag/v/q/t だけを運ぶ。`t` を REST より新しくして、こちらが勝つ。
@@ -227,7 +242,11 @@ async fn peek_head(stream: &TcpStream) -> String {
 
 /// catalog（`/api/v1/tags`）・values（`/api/v1/values`）・WS（subscribe を
 /// 待って data フレームを 1 つ送り、閉じられるまで開けておく）に答え続ける。
+///
+/// WS の接続は `JoinSet` に持つので、この関数の future を止める（`abort` して
+/// 待つ）と開いている WS もまとめて閉じる（Hub が落ちた状態を作れる）。
 async fn serve_hub(listener: TcpListener, hub: Arc<MockHub>) {
+    let mut sockets = tokio::task::JoinSet::new();
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             return;
@@ -235,7 +254,7 @@ async fn serve_hub(listener: TcpListener, hub: Arc<MockHub>) {
         let head = peek_head(&stream).await;
         if head.contains("upgrade: websocket") {
             let frame = hub.frame.clone();
-            tokio::spawn(async move {
+            sockets.spawn(async move {
                 let Ok(mut socket) = accept_async(stream).await else {
                     return;
                 };
@@ -277,8 +296,21 @@ async fn serve_hub(listener: TcpListener, hub: Arc<MockHub>) {
 // --- レジストリ ----------------------------------------------------------------
 
 /// `protocol = hub` の接続 1・グループ 1（100ms）・タグ 5 を登録し、
-/// `(接続 id, グループ id, [REAL, SIM, DSIM, STALE, GONE] のタグ id)` を返す。
+/// `(接続 id, グループ id, [REAL, SIM, DSIM, STALE, FUTURE, GONE] のタグ id)` を返す。
 async fn register_hub_tags(pool: &sqlx::SqlitePool) -> (i64, i64, Vec<i64>) {
+    let specs: Vec<(&str, &str)> = [REAL, SIM, DSIM, STALE, FUTURE, GONE]
+        .iter()
+        .map(|name| (*name, "f64"))
+        .collect();
+    register_hub_specs(pool, &specs).await
+}
+
+/// `protocol = hub` の接続 1・グループ 1（100ms）と、`(外部名, データ型)` の
+/// タグを登録する。`(接続 id, グループ id, タグ id（指定順）)` を返す。
+async fn register_hub_specs(
+    pool: &sqlx::SqlitePool,
+    specs: &[(&str, &str)],
+) -> (i64, i64, Vec<i64>) {
     let conn = PlcConnectionService::new(pool.clone())
         .create(PlcConnectionInput {
             name: "Hub".to_string(),
@@ -308,13 +340,13 @@ async fn register_hub_tags(pool: &sqlx::SqlitePool) -> (i64, i64, Vec<i64>) {
         .expect("収集グループを登録できる");
     let tags = TagService::new(pool.clone());
     let mut ids = Vec::new();
-    for name in [REAL, SIM, DSIM, STALE, GONE] {
+    for (name, data_type) in specs {
         let tag = tags
             .create(TagInput {
                 name: name.rsplit('.').next().unwrap().to_string(),
                 collection_group_id: group.id,
                 address: name.to_string(),
-                data_type: "f64".to_string(),
+                data_type: data_type.to_string(),
                 string_length: None,
                 string_encoding: "utf8".to_string(),
                 raw_lo: None,
@@ -407,12 +439,12 @@ async fn hub_sourced_tags_are_recorded_by_the_same_collector() {
             tags,
             exclusions,
         } => {
-            assert_eq!((groups, tags), (1, 4));
+            assert_eq!((groups, tags), (1, 5));
             let excluded: Vec<(&str, &str)> = exclusions
                 .iter()
                 .map(|e| (e.key.as_str(), e.reason))
                 .collect();
-            assert_eq!(excluded, vec![(key(4).as_str(), "hubTagNotFound")]);
+            assert_eq!(excluded, vec![(key(5).as_str(), "hubTagNotFound")]);
         }
         other => panic!("Running を期待したが {other:?}"),
     }
@@ -437,18 +469,23 @@ async fn hub_sourced_tags_are_recorded_by_the_same_collector() {
     assert_eq!(
         (values[&key(1)].value, values[&key(1)].quality),
         (Some(2.0), QualityView::Good),
-        "simulation は表示はされる"
+        "simulation も good の値として扱う"
     );
     assert_eq!(
         (values[&key(2)].value, values[&key(2)].quality),
         (Some(3.0), QualityView::Good),
-        "derived_simulation も表示はされる"
+        "derived_simulation も同じ"
     );
     assert_eq!(
         (values[&key(3)].value, values[&key(3)].quality),
         (Some(4.0), QualityView::Stale)
     );
-    assert_eq!(values[&key(4)].quality, QualityView::Invalid);
+    assert_eq!(
+        (values[&key(4)].value, values[&key(4)].quality),
+        (Some(5.0), QualityView::Good),
+        "未知の value_source も good の値として扱う"
+    );
+    assert_eq!(values[&key(5)].quality, QualityView::Invalid);
 
     // Hub は値を変えない（on-change なので何も送ってこない）まま、定常値が
     // 毎周期記録されるのを待つ（100ms 周期で 10 行以上）。
@@ -477,14 +514,21 @@ async fn hub_sourced_tags_are_recorded_by_the_same_collector() {
 
     svc.stop().await.expect("停止できる");
 
-    // (c) データファイル: 実値だけが記録され、シミュレーションの 2 種と
-    // stale は null。外したタグには列が無い（4 列）。
+    // (c) データファイル: good の値は出所（simulation・derived_simulation・
+    // 未知）に依らず記録され、stale だけが null。外したタグには列が無い
+    // （5 列）。
     let rows = stored_rows(&data_dir, &group_key).await;
     let live_rows: Vec<&Vec<Option<f64>>> = rows.iter().filter(|row| row[0].is_some()).collect();
     assert!(live_rows.len() >= 10, "{rows:?}");
     for row in &rows {
-        assert_eq!(row.len(), 4, "{row:?}");
-        assert_eq!(&row[1..], &[None, None, None], "{row:?}");
+        assert_eq!(row.len(), 5, "{row:?}");
+        if row[0].is_some() {
+            assert_eq!(
+                &row[1..],
+                &[Some(2.0), Some(3.0), None, Some(5.0)],
+                "simulation・derived_simulation・未知の出所も記録される: {row:?}"
+            );
+        }
     }
     assert!(
         live_rows
@@ -514,4 +558,412 @@ async fn hub_sourced_tags_are_recorded_by_the_same_collector() {
 
     hub.shutdown().await;
     server.abort();
+}
+
+// --- P5: 切断→再接続・bit タグ・しきい値 ------------------------------------
+
+/// モック Hub に出させる 1 本のタグ（外部名・データ型・値・出所）。品質は good。
+struct HubSpec {
+    name: &'static str,
+    data_type: &'static str,
+    value: f64,
+    source: ValueSource,
+}
+
+fn spec(name: &'static str, data_type: &'static str, value: f64, source: ValueSource) -> HubSpec {
+    HubSpec {
+        name,
+        data_type,
+        value,
+        source,
+    }
+}
+
+/// `specs` を catalog と values に載せ、WS は先頭のタグの同じ値を 1 つ送る
+/// モック Hub。
+fn mock_hub_from(specs: &[HubSpec]) -> MockHub {
+    let catalog = CatalogSnapshot {
+        revision: 1,
+        run_id: Some(1),
+        collection_mode: CollectionMode::Configured,
+        tags: specs
+            .iter()
+            .enumerate()
+            .map(|(index, s)| {
+                let mut tag = catalog_tag(s.name, index as i64 + 1);
+                tag.data_type = s.data_type.into();
+                tag
+            })
+            .collect(),
+    };
+    let values = ValuesSnapshot {
+        revision: catalog.revision,
+        t: 1_000,
+        run_id: catalog.run_id,
+        collection_mode: catalog.collection_mode.clone(),
+        values: specs
+            .iter()
+            .map(|s| entry(s.name, s.value, ValueQuality::Good, s.source.clone()))
+            .collect(),
+    };
+    let frame = format!(
+        concat!(
+            r#"{{"op":"data","id":{},"t":2000,"#,
+            r#""values":[{{"tag":"{}","v":{},"q":"good","t":2000}}]}}"#
+        ),
+        SUBSCRIPTION_ID, specs[0].name, specs[0].value
+    );
+    MockHub {
+        catalog: serde_json::to_string(&catalog).unwrap(),
+        values: serde_json::to_string(&values).unwrap(),
+        frame,
+    }
+}
+
+/// Hub に手動キーで接続し、`specs` を登録して、`attach_hub` 済みの
+/// `CollectorService` を持つ（まだ開始しない）。
+struct Fixture {
+    _dir: TempDir,
+    pool: sqlx::SqlitePool,
+    data_dir: PathBuf,
+    hub: HubService,
+    svc: CollectorService,
+    conn_key: String,
+    group_key: String,
+    /// `specs` と同じ順のタグ id。
+    ids: Vec<i64>,
+}
+
+impl Fixture {
+    async fn new(endpoint: &str, specs: &[HubSpec]) -> Self {
+        let dir = TempDir::new();
+        let pool = init_db(dir.path().join("chronogazer.sqlite3"))
+            .await
+            .expect("設定 DB を初期化できる");
+        let data_dir = resolve_data_dir(dir.path(), "./data");
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        let keys: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
+        let hub = HubService::new(settings, keys)
+            .await
+            .expect("HubService を組める");
+        let view = hub
+            .adopt_manual_key(endpoint, "bh_abcd1234_opaque-secret".to_string())
+            .await
+            .expect("モック Hub に接続できる");
+        assert!(
+            matches!(view.status, HubStatus::Connected { .. }),
+            "{:?}",
+            view.status
+        );
+        let pairs: Vec<(&str, &str)> = specs.iter().map(|s| (s.name, s.data_type)).collect();
+        let (conn_id, group_id, ids) = register_hub_specs(&pool, &pairs).await;
+        let svc = CollectorService::new(pool.clone(), data_dir.clone());
+        assert!(svc.attach_hub(hub.clone()));
+        Self {
+            _dir: dir,
+            pool,
+            data_dir,
+            hub,
+            svc,
+            conn_key: format!("conn:{conn_id}"),
+            group_key: format!("grp:{group_id}"),
+            ids,
+        }
+    }
+
+    fn tag_key(&self, index: usize) -> String {
+        format!("tag:{}", self.ids[index])
+    }
+
+    /// この接続の `plc_*` イベントの種別（古い順）。
+    async fn link_events(&self) -> Vec<String> {
+        match self.svc.events(EventPage::default()).await {
+            Readout::Ready { data } => {
+                let mut rows: Vec<_> = data
+                    .rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.kind.starts_with("plc_")
+                            && row.connection_key.as_deref() == Some(self.conn_key.as_str())
+                    })
+                    .collect();
+                rows.sort_by_key(|row| row.id);
+                rows.into_iter().map(|row| row.kind).collect()
+            }
+            other => panic!("イベント一覧が読めない: {}", other.as_str()),
+        }
+    }
+
+    async fn wait_good(&self, index: usize, expected: f64) {
+        let key = self.tag_key(index);
+        wait_until("現在値が good で Hub の値になる", || {
+            let response = self.svc.values_response();
+            let key = key.clone();
+            async move {
+                let Readout::Ready { data } = &response.readout else {
+                    return Err(response.readout.as_str().to_string());
+                };
+                match data.get(&key) {
+                    Some(s) if s.quality == QualityView::Good && s.value == Some(expected) => {
+                        Ok(())
+                    }
+                    other => Err(format!("{other:?}")),
+                }
+            }
+        })
+        .await;
+    }
+
+    async fn finish(self) {
+        self.hub.shutdown().await;
+        self.pool.close().await;
+    }
+}
+
+async fn bind_with_retry(port: u16) -> TcpListener {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return listener,
+            Err(err) if Instant::now() >= deadline => {
+                panic!("ポート {port} を取り直せなかった: {err}")
+            }
+            Err(_) => tokio::time::sleep(POLL_INTERVAL).await,
+        }
+    }
+}
+
+/// Hub が落ちて戻る: 収集の接続イベントが **Hub の接続キー**で
+/// `plc_connected` → `plc_disconnected` → `plc_reconnected` と 1 回ずつ出て、
+/// 落ちている間は現在値が good でなくなり、戻ると good に戻る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_drop_and_return_emit_link_events_under_the_hub_connection_key() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let hub_data = Arc::new(mock_hub_from(&[spec(
+        REAL,
+        "f64",
+        1.0,
+        ValueSource::Simulation,
+    )]));
+    let mut server = tokio::spawn(serve_hub(listener, hub_data.clone()));
+
+    let fx = Fixture::new(
+        &endpoint,
+        &[spec(REAL, "f64", 1.0, ValueSource::Simulation)],
+    )
+    .await;
+    fx.svc.start().await.expect("収集を開始できる");
+    fx.wait_good(0, 1.0).await;
+    wait_until("plc_connected が出る", || async {
+        let events = fx.link_events().await;
+        if events == ["plc_connected"] {
+            Ok(())
+        } else {
+            Err(format!("{events:?}"))
+        }
+    })
+    .await;
+
+    // Hub を落とす（開いている WS も閉じる）。
+    server.abort();
+    let _ = (&mut server).await;
+    wait_until("plc_disconnected が出る", || async {
+        let events = fx.link_events().await;
+        if events.last().map(String::as_str) == Some("plc_disconnected") {
+            Ok(())
+        } else {
+            Err(format!("{events:?}"))
+        }
+    })
+    .await;
+    match fx.svc.values_response().readout {
+        Readout::Ready { data } => assert_ne!(
+            data[&fx.tag_key(0)].quality,
+            QualityView::Good,
+            "Hub が落ちている間は good ではない"
+        ),
+        other => panic!("{}", other.as_str()),
+    }
+
+    // 同じポートで Hub を戻す。
+    let listener = bind_with_retry(port).await;
+    let server = tokio::spawn(serve_hub(listener, hub_data));
+    wait_until("plc_reconnected が出る", || async {
+        let events = fx.link_events().await;
+        if events.last().map(String::as_str) == Some("plc_reconnected") {
+            Ok(())
+        } else {
+            Err(format!("{events:?}"))
+        }
+    })
+    .await;
+    fx.wait_good(0, 1.0).await;
+
+    fx.svc.stop().await.expect("停止できる");
+    assert_eq!(
+        fx.link_events().await,
+        ["plc_connected", "plc_disconnected", "plc_reconnected"],
+        "接続・切断・再接続が 1 回ずつ、この順で"
+    );
+    server.abort();
+    fx.finish().await;
+}
+
+/// bit タグ: Hub の `bit` の値 1 / 0 がそのまま記録される。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hub_bit_tags_are_recorded_as_zero_and_one() {
+    let specs = [
+        spec("PLC9.G.on", "bit", 1.0, ValueSource::Real),
+        spec("PLC9.G.off", "bit", 0.0, ValueSource::Simulation),
+    ];
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(serve_hub(listener, Arc::new(mock_hub_from(&specs))));
+
+    let fx = Fixture::new(&endpoint, &specs).await;
+    let outcome = fx.svc.start().await.expect("収集を開始できる");
+    assert!(!outcome.pending, "{:?}", outcome.status);
+    match fx.svc.state() {
+        CollectorState::Running {
+            tags, exclusions, ..
+        } => assert_eq!((tags, exclusions.len()), (2, 0), "{exclusions:?}"),
+        other => panic!("Running を期待したが {other:?}"),
+    }
+    fx.wait_good(0, 1.0).await;
+    fx.wait_good(1, 0.0).await;
+    wait_until("bit の 1 / 0 が毎周期記録される", || {
+        let data_dir = fx.data_dir.clone();
+        let group_key = fx.group_key.clone();
+        async move {
+            let rows = stored_rows(&data_dir, &group_key).await;
+            let recorded = rows
+                .iter()
+                .filter(|row| row == &&vec![Some(1.0), Some(0.0)])
+                .count();
+            if recorded >= 5 {
+                Ok(())
+            } else {
+                Err(format!("{recorded} 行 / {rows:?}"))
+            }
+        }
+    })
+    .await;
+    fx.svc.stop().await.expect("停止できる");
+    server.abort();
+    fx.finish().await;
+}
+
+/// Hub 経由のタグに記録計の側のしきい値（`recorder_tag_settings`）を設定
+/// すると、`value_source` が simulation / derived_simulation の値でも判定
+/// されてイベントが出て、値も記録される。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thresholds_judge_hub_values_whatever_their_value_source() {
+    let specs = [
+        spec("PLC9.G.hot", "f64", 5.0, ValueSource::Simulation),
+        spec("PLC9.G.cold", "f64", 5.0, ValueSource::DerivedSimulation),
+    ];
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(serve_hub(listener, Arc::new(mock_hub_from(&specs))));
+
+    let fx = Fixture::new(&endpoint, &specs).await;
+    let thresholds = TagThresholdService::new(fx.pool.clone());
+    // hot: 5 は H = 3 を超える。cold: 5 は L = 10 を下回る。
+    thresholds
+        .update(
+            fx.ids[0],
+            &TagThresholdsPayload {
+                threshold_h: Some(3.0),
+                expected_revision: Some(0),
+                ..TagThresholdsPayload::default()
+            },
+        )
+        .await
+        .expect("しきい値を保存できる");
+    thresholds
+        .update(
+            fx.ids[1],
+            &TagThresholdsPayload {
+                threshold_l: Some(10.0),
+                expected_revision: Some(0),
+                ..TagThresholdsPayload::default()
+            },
+        )
+        .await
+        .expect("しきい値を保存できる");
+
+    fx.svc.start().await.expect("収集を開始できる");
+    fx.wait_good(0, 5.0).await;
+
+    type EventSummary = (String, String, Option<String>, Option<f64>, Option<f64>);
+    let summary: Vec<EventSummary> =
+        wait_until("しきい値のイベントが 2 件出る", || async {
+            match fx.svc.events(EventPage::default()).await {
+                Readout::Ready { data } => {
+                    let mut rows: Vec<EventSummary> = data
+                        .rows
+                        .into_iter()
+                        .filter(|row| row.kind.starts_with("threshold_"))
+                        .map(|row| {
+                            (
+                                row.kind,
+                                row.tag_key.unwrap_or_default(),
+                                row.level,
+                                row.value,
+                                row.limit_value,
+                            )
+                        })
+                        .collect();
+                    rows.sort_by(|a, b| a.1.cmp(&b.1));
+                    if rows.len() >= 2 {
+                        Ok(rows)
+                    } else {
+                        Err(format!("{rows:?}"))
+                    }
+                }
+                other => Err(other.as_str().to_string()),
+            }
+        })
+        .await;
+    let mut expected: Vec<EventSummary> = vec![
+        (
+            "threshold_entered".to_string(),
+            fx.tag_key(0),
+            Some("H".to_string()),
+            Some(5.0),
+            Some(3.0),
+        ),
+        (
+            "threshold_entered".to_string(),
+            fx.tag_key(1),
+            Some("L".to_string()),
+            Some(5.0),
+            Some(10.0),
+        ),
+    ];
+    expected.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(summary, expected, "simulation 由来でも判定される");
+
+    wait_until("simulation 由来の値も記録される", || {
+        let data_dir = fx.data_dir.clone();
+        let group_key = fx.group_key.clone();
+        async move {
+            let recorded = stored_rows(&data_dir, &group_key)
+                .await
+                .iter()
+                .filter(|row| row == &&vec![Some(5.0), Some(5.0)])
+                .count();
+            if recorded >= 5 {
+                Ok(())
+            } else {
+                Err(format!("{recorded} 行"))
+            }
+        }
+    })
+    .await;
+    fx.svc.stop().await.expect("停止できる");
+    server.abort();
+    fx.finish().await;
 }

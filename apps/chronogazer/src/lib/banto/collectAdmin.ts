@@ -50,6 +50,7 @@ import {
 	type SnapshotListMessages,
 	type SnapshotListResource
 } from '@banto/admin-core';
+import type { AppPath } from '../navigation';
 import { CSRF_HEADER, getBantoMode } from './setup';
 import {
 	isPollGenerationCurrent,
@@ -603,6 +604,10 @@ export function collectStateDetail(state: CollectorStateView): string {
 		case 'noTargets':
 			// #414 段階2: 全部が設定の不正で外れた場合は、登録・有効化ではなく
 			// 「直す」が次の一手（一覧は `collectExclusionsHeadline` の下に出る）。
+			if (state.exclusions.length > 0 && !exclusionsNeedSettingFix(state.exclusions)) {
+				// Hub に未接続・Hub を持たない実行形態など、タグ設定では直らない理由だけ。
+				return '有効なタグがすべて収集できない設定で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の案内に従ってから「収集を開始」を押してください。';
+			}
 			return state.exclusions.length > 0
 				? '有効なタグがすべて設定の不正で外れたため、収集するものがありません（失敗ではありません）。下の「除外あり」の一覧の設定を「タグ設定」で直してから「収集を開始」を押してください。'
 				: '有効なタグが1件もないため、収集するものがありません（失敗ではありません）。「タグ設定」でタグを登録・有効化してから「収集を再起動」を押してください。';
@@ -651,23 +656,86 @@ export function collectExclusionsHeadline(count: number): string | null {
  */
 export interface CollectExclusionsNote {
 	summary: string;
-	fix: string;
+	/**
+	 * 「タグ設定」リンクの直後に続ける文。**設定の不正を直す必要がある**ときだけ
+	 * （Hub に未接続・Hub を持たない実行形態のように、タグ設定では直らない理由
+	 * だけが原因のときは `null` で、画面はリンクも出さない）。
+	 */
+	fix: string | null;
+	/** Hub 経由の除外の理由ごとの追加の案内（出現した理由だけ。理由の並びは固定）。 */
+	guides: ExclusionGuide[];
+}
+
+/** Hub 経由の除外理由の案内 1 件。`link` があれば画面は文の後ろにリンクを付ける。 */
+export interface ExclusionGuide {
+	reason: HubExclusionReason;
+	text: string;
+	link: { label: string; path: AppPath } | null;
+}
+
+export type HubExclusionReason =
+	'hubNotConfigured' | 'hubSourceUnavailable' | 'hubTagNotFound' | 'hubTagTypeChanged';
+
+/** 案内の並び（原因に近い順）と文言。reason の綴りは Rust の `ExclusionReason::code`。 */
+const HUB_EXCLUSION_GUIDES: readonly ExclusionGuide[] = [
+	{
+		reason: 'hubNotConfigured',
+		text: 'Hub 経由の接続は、Hub に接続されていないため外れています。Hub に接続してから「収集を再起動」してください:',
+		link: { label: '設定 > Hub接続', path: '/settings/hub' }
+	},
+	{
+		reason: 'hubSourceUnavailable',
+		text: 'この実行形態では Hub 経由の接続から収集できません。Hub 経由のタグはデスクトップアプリで収集してください。',
+		link: null
+	},
+	{
+		reason: 'hubTagNotFound',
+		text: 'Hub にタグが見つからないため外れたタグがあります（Hub で削除・改名されたか、使っているキーでは見えません）。まず Hub 側でタグの名前と、使っているキーで見えるかを確認してください。Hub で改名されたなら、タグ設定で該当のタグを編集してアドレス（外部名）を新しい名前に直し、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）。キーで見えないだけなら Hub 側のキー設定を確認してください:',
+		link: { label: 'タグ設定', path: '/tags' }
+	},
+	{
+		reason: 'hubTagTypeChanged',
+		text: 'Hub 側でデータ型が変わったため外れたタグがあります。タグ設定で該当のタグを編集してデータ型を Hub に合わせ、「収集を再起動」してください（削除せず編集すれば、ID・しきい値・表示・履歴が保たれます）:',
+		link: { label: 'タグ設定', path: '/tags' }
+	}
+];
+
+/** タグ設定では直らない（環境の）理由。これと連鎖（配下の除外）だけなら「タグ設定で直して」は案内しない。 */
+const NON_TAG_FIX_REASONS: ReadonlySet<string> = new Set([
+	'hubNotConfigured',
+	'hubSourceUnavailable',
+	// 親（接続・グループ）が外れたことによる連鎖。原因は親の理由の側にある。
+	'connectionExcluded',
+	'groupExcluded'
+]);
+
+/** 除外のうち、タグ設定で直すべきもの（設定の不正・Hub のタグの食い違い）が 1 件でもあるか。 */
+export function exclusionsNeedSettingFix(exclusions: readonly ExclusionView[]): boolean {
+	return exclusions.some((exclusion) => !NON_TAG_FIX_REASONS.has(exclusion.reason));
 }
 
 export function collectExclusionsNote(state: CollectorStateView): CollectExclusionsNote | null {
-	if (collectExclusions(state).length === 0) return null;
+	const exclusions = collectExclusions(state);
+	if (exclusions.length === 0) return null;
+	const reasons = new Set(exclusions.map((exclusion) => exclusion.reason));
+	const needsSettingFix = exclusionsNeedSettingFix(exclusions);
+	const guides = HUB_EXCLUSION_GUIDES.filter((guide) => reasons.has(guide.reason));
+	// 設定の不正がなく、環境の理由だけなら「不正」とは言わない。
+	const lead = needsSettingFix
+		? '次の設定は不正なため、収集の開始時に外しました。'
+		: '次の設定は収集できないため、収集の開始時に外しました。';
 	switch (state.state) {
 		case 'running':
 			return {
-				summary:
-					'次の設定は不正なため、収集の開始時に外しました。残りは収集しています（外したタグの値は記録されず、履歴は空欄になります）。',
-				fix: 'で直してから「収集を再起動」を押してください。'
+				summary: `${lead}残りは収集しています（外したタグの値は記録されず、履歴は空欄になります）。`,
+				fix: needsSettingFix ? 'で直してから「収集を再起動」を押してください。' : null,
+				guides
 			};
 		case 'noTargets':
 			return {
-				summary:
-					'次の設定は不正なため、収集の開始時に外しました。収集対象が残らなかったため、現在は収集していません（値は記録されていません）。',
-				fix: 'で直してから「収集を開始」を押してください。'
+				summary: `${lead}収集対象が残らなかったため、現在は収集していません（値は記録されていません）。`,
+				fix: needsSettingFix ? 'で直してから「収集を開始」を押してください。' : null,
+				guides
 			};
 		default:
 			return null;
@@ -678,7 +746,8 @@ export function collectExclusionsNote(state: CollectorStateView): CollectExclusi
 export function exclusionUnitLabel(unit: ExclusionUnit): string {
 	switch (unit) {
 		case 'connection':
-			return 'PLC接続';
+			// PLC 直結も Hub 経由も同じ単位（`/tags` の「接続」節）。
+			return '接続';
 		case 'group':
 			return '収集グループ';
 		case 'tag':
@@ -839,7 +908,9 @@ export function connectionStatusLabel(status: ConnectionStatusView): string {
 		case 'connected':
 			return '接続中';
 		case 'reconnecting':
-			return `再接続中（${status.attempt}回目）`;
+			// 0 = 回数を数えない接続（Hub 経由: 購読が自分で張り直す。
+			// `banto_collect::EXTERNAL_RECONNECT_ATTEMPT`）。
+			return status.attempt > 0 ? `再接続中（${status.attempt}回目）` : '再接続中';
 		case 'stopped':
 			return '停止';
 	}
@@ -1137,9 +1208,11 @@ export function collectOperationDisplay(
 const eventKindLabels: Record<string, string> = {
 	collection_started: '収集開始',
 	collection_stopped: '収集停止',
-	plc_connected: 'PLC接続',
-	plc_disconnected: 'PLC切断',
-	plc_reconnected: 'PLC再接続',
+	// 種別の綴り（`plc_*`）は変えない。Hub 経由の接続にも同じ種別が出る
+	// （`banto-collect` の `external` のモジュール doc）ので、表示は「PLC」を付けない。
+	plc_connected: '接続',
+	plc_disconnected: '切断',
+	plc_reconnected: '再接続',
 	threshold_entered: 'しきい値超過',
 	threshold_cleared: 'しきい値復帰',
 	clock_regression_entered: '時刻逆行',

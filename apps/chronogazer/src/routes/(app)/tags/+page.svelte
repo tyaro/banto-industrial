@@ -106,7 +106,6 @@
 		type CollectionGroup,
 		type CollectionGroupInput,
 		type Tag,
-		type TagDataType,
 		type SimulationCoverageEntry,
 		type ExclusionView
 	} from '#lib/banto/tagRegistryAdmin.js';
@@ -136,6 +135,8 @@
 		THRESHOLDS_SAVED_MESSAGE,
 		isRevisionConflict,
 		connectionModeLabel,
+		connectionOptionLabel,
+		tagDataTypeOptions,
 		connectionSavedMessage,
 		hubConnectionInput,
 		hubConnectionSavedMessage,
@@ -669,7 +670,7 @@
 		ALLOWED_PERIOD_MS.map((ms) => ({ value: ms, label: ms >= 1000 ? `${ms / 1000}s` : `${ms}ms` }))
 	);
 	const connectionOptions = $derived(
-		connectionRows.map((c) => ({ value: c.id, label: `${c.name}（${c.protocol}）` }))
+		connectionRows.map((c) => ({ value: c.id, label: connectionOptionLabel(c) }))
 	);
 
 	function groupSchema(prefix: string): FormSchema {
@@ -678,7 +679,7 @@
 				{ name: `${prefix}Name`, label: '名前', type: 'text', required: true, min: 1, max: 100 },
 				{
 					name: `${prefix}PlcConnectionId`,
-					label: 'PLC接続',
+					label: '接続',
 					type: 'select',
 					required: true,
 					options: connectionOptions
@@ -808,7 +809,7 @@
 		},
 		{
 			id: 'plcConnectionId',
-			header: 'PLC接続',
+			header: '接続',
 			accessor: (row) => connectionName(row.plcConnectionId),
 			width: 160
 		},
@@ -917,25 +918,13 @@
 	const TAG_CREATE = 'tagCreate';
 	const TAG_EDIT = 'tagEdit';
 
-	const dataTypeOptions: { value: TagDataType; label: string }[] = [
-		{ value: 'bit', label: 'ビット' },
-		{ value: 'i16', label: '16bit（符号あり）' },
-		{ value: 'u16', label: '16bit（符号なし）' },
-		{ value: 'i32', label: '32bit（符号あり）' },
-		{ value: 'u32', label: '32bit（符号なし）' },
-		{ value: 'f32', label: '32bit実数' },
-		{ value: 'i64', label: '64bit（符号あり、Modbusのみ）' },
-		{ value: 'u64', label: '64bit（符号なし、Modbusのみ）' },
-		{ value: 'f64', label: '64bit実数（倍精度、Modbusのみ）' }
-	];
-
 	const groupOptions = $derived(groupRows.map((g) => ({ value: g.id, label: g.name })));
 
 	/**
 	 * `hub` = Hub 経由のタグ（#383 段階3 P4）。アドレスは Hub のタグ名（外部名）で、
 	 * **スケーリングの欄を出さない**（Hub は工学値を送るので、ここで換算すると二重に
-	 * なる。サーバーの `banto-tags` も断る）。欄が無ければ `buildTagInput` は
-	 * スケーリングを `null` で送る。
+	 * なる。サーバーの `banto-tags` も断る）。作成では `buildTagInput` が
+	 * スケーリングを `null` で送り、編集では編集前のタグの値をそのまま送る。
 	 */
 	function tagSchema(prefix: string, hub = false): FormSchema {
 		const scalingFields: FormSchema['fields'] = hub
@@ -969,7 +958,7 @@
 					type: 'select',
 					required: true,
 					default: 'i16',
-					options: dataTypeOptions
+					options: tagDataTypeOptions(hub)
 				},
 				...scalingFields,
 				{ name: `${prefix}Unit`, label: '単位', type: 'text' },
@@ -1029,10 +1018,20 @@
 	let createTagStore = $state(untrack(() => createFormStore(tagSchema(TAG_CREATE))));
 	let creatingTag = $state(false);
 
+	/**
+	 * 作成フォームで選んでいる収集グループが Hub 接続の下か。そうなら編集と同じ
+	 * Hub 用の欄（外部名・スケーリング無し）に切り替える。
+	 */
+	const createTagIsHub = $derived(
+		isHubGroup(Number(createTagStore.values[`${TAG_CREATE}CollectionGroupId`]))
+	);
+
 	async function handleCreateTag(values: Record<string, unknown>): Promise<void> {
 		creatingTag = true;
 		try {
-			await createTag(buildTagInput(TAG_CREATE, values));
+			await createTag(
+				buildTagInput(TAG_CREATE, values, undefined, createTagIsHub ? 'none' : 'form')
+			);
 			toastStore.push('success', '作成しました');
 			createTagStore = createFormStore(tagSchema(TAG_CREATE));
 			await reloadTags();
@@ -1217,7 +1216,20 @@
 				pending,
 				updateTag(
 					selectedTag.id,
-					buildTagInput(TAG_EDIT, editTagStore.values, selectedTag.revision)
+					buildTagInput(
+						TAG_EDIT,
+						editTagStore.values,
+						selectedTag.revision,
+						// Hub タグは画面に欄が無いので、編集前のタグが持つスケーリングをそのまま送る。
+						selectedTagIsHub
+							? {
+									rawLo: selectedTag.rawLo,
+									rawHi: selectedTag.rawHi,
+									engLo: selectedTag.engLo,
+									engHi: selectedTag.engHi
+								}
+							: 'form'
+					)
 				),
 				() => ({ id: selectedTag?.id, store: editTagStore })
 			);
@@ -1465,7 +1477,7 @@
 		{/if}
 
 		<section class="registry-section">
-			<h3>PLC接続</h3>
+			<h3>接続</h3>
 			{#if canWrite}
 				<div class="create">
 					<h4>新規作成</h4>
@@ -1499,7 +1511,7 @@
 					<p class="loading">読み込み中…</p>
 				{:else if connectionsView === 'failed'}
 					<p class="load-error" role="alert">
-						PLC接続の一覧を読み込めませんでした（{connectionsError}）。登録が0件という意味ではありません。
+						接続の一覧を読み込めませんでした（{connectionsError}）。登録が0件という意味ではありません。
 						<button
 							type="button"
 							onclick={() => void reloadConnections()}
@@ -1599,12 +1611,15 @@
 					**読めて0件**のときだけ。読めていないときにこれを出すと、
 					既にある接続を重複登録させてしまう。 -->
 					{#if groupCreateGate === 'needs-prerequisite'}
-						<p class="note">先にPLC接続を1件以上作成してください。</p>
+						<p class="note">
+							先に接続を1件以上作成してください（Hub 経由の接続は「タグ」の「Hub
+							から追加」で作られます）。
+						</p>
 					{:else if groupCreateGate === 'dependency-loading'}
-						<p class="note">PLC接続の一覧を読み込んでいます…</p>
+						<p class="note">接続の一覧を読み込んでいます…</p>
 					{:else if groupCreateGate === 'dependency-failed'}
 						<p class="load-error" role="alert">
-							PLC接続の一覧を読み込めなかったため、作成フォームを表示できません（{connectionsError}）。
+							接続の一覧を読み込めなかったため、作成フォームを表示できません（{connectionsError}）。
 							<button
 								type="button"
 								onclick={() => void reloadConnections()}
@@ -1715,8 +1730,14 @@
 						</p>
 					{:else}
 						<UnsavedChangesNotice pending={createTagStore.isDirty} label={UNSAVED_NOTICE} />
+						{#if createTagIsHub}
+							<p class="note">
+								Hub 経由のグループです。アドレスは Hub
+								のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
+							</p>
+						{/if}
 						<BantoForm
-							schema={tagSchema(TAG_CREATE)}
+							schema={tagSchema(TAG_CREATE, createTagIsHub)}
 							store={createTagStore}
 							onSubmit={handleCreateTag}
 							submitting={creatingTag}

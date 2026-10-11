@@ -20,7 +20,7 @@
  *   なので、UI がある操作はすべて画面から行う。
  * - **REST**: 後始末（収集の停止・作ったタグ/グループ/接続の削除）と、下の
  *   「先行スペックの接続を一時的に無効にする」操作、作った接続の `id` の取得
- *   （画面の接続状態の行は `conn:<id>` で出るため）。後始末は**途中で失敗した
+ *   （REST のイベントの `connectionKey` は `conn:<id>` で返る。画面は #383 P5 から接続の名前で出す）。後始末は**途中で失敗した
  *   テストの後でも確実に走らせる**必要があり、画面の状態（開いているダイアログ・
  *   選択中の行）に左右されない REST のほうが確実。
  *
@@ -407,11 +407,13 @@ async function timeLabelInPage(page: Page, tsMs: number): Promise<string> {
 async function expectEventRowVisible(
 	page: Page,
 	event: CollectEventRow,
-	kindLabel: string
+	kindLabel: string,
+	connectionLabel?: string
 ): Promise<void> {
 	const timeLabel = await timeLabelInPage(page, event.tsMs);
 	let row = page.getByRole('row').filter({ hasText: kindLabel }).filter({ hasText: timeLabel });
-	if (event.connectionKey) row = row.filter({ hasText: event.connectionKey });
+	// 画面は `conn:<id>` ではなく接続の名前を出す（#383 P5）。
+	if (event.connectionKey) row = row.filter({ hasText: connectionLabel ?? event.connectionKey });
 	await expect(async () => {
 		await page.getByRole('button', { name: '再読み込み' }).click();
 		await expect(row.first()).toBeVisible({ timeout: 1_000 });
@@ -501,9 +503,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		const groupSection = page.locator('section.registry-section').nth(1);
 		const groupForm = groupSection.locator('div.create');
 		await groupForm.getByLabel('名前').fill(GROUP_NAME);
-		await groupForm
-			.getByLabel('PLC接続')
-			.selectOption({ label: `${CONNECTION_NAME}（modbus-tcp）` });
+		await groupForm.getByLabel('接続').selectOption({ label: `${CONNECTION_NAME}（modbus-tcp）` });
 		await groupForm.getByLabel('収集周期').selectOption({ label: '100ms' });
 		await groupForm.getByRole('button', { name: '作成' }).click();
 		await expect(groupSection.locator('div.list').getByText(GROUP_NAME)).toBeVisible();
@@ -541,7 +541,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		await expect(statusLine(page)).toHaveText('状態: 収集中（グループ1件 / タグ1件）');
 		const row = page
 			.locator('table.collect-connections tbody tr')
-			.filter({ hasText: `conn:${connectionId}` });
+			.filter({ hasText: CONNECTION_NAME });
 		// 接続状態は画面のポーリングで更新される。既定の接続タイムアウト（3 秒）
 		// より長く待つ。
 		await expect(row).toContainText('接続中', { timeout: 20_000 });
@@ -564,7 +564,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		expect(dataFiles(dataDir)).toEqual(expect.arrayContaining(writtenFiles));
 	});
 
-	test('4. イベント画面に、この試行の「収集開始」と、この接続の「PLC接続」が出る', async () => {
+	test('4. イベント画面に、この試行の「収集開始」と、この接続の「接続」が出る', async () => {
 		const started = await waitForEventSince(
 			page.request,
 			apiHeaders,
@@ -581,7 +581,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		await page.goto('/events');
 		await expect(page.getByRole('heading', { level: 2, name: 'イベント' })).toBeVisible();
 		await expectEventRowVisible(page, started, '収集開始');
-		await expectEventRowVisible(page, connected, 'PLC接続');
+		await expectEventRowVisible(page, connected, '接続', CONNECTION_NAME);
 	});
 
 	test('5. 停止すると「停止」になり、イベント画面にこの試行の「収集停止」が出る', async () => {

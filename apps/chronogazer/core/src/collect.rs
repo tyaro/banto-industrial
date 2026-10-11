@@ -63,8 +63,10 @@
 //! * 品質と記録（H4）は `banto_collect::external` のモジュール doc の表。
 //!   要点: Hub が Live でない間は全タグ Bad で null、Live かつ good の定常値は
 //!   周期ごとに記録して Good のまま（Hub の `t` で鮮度を判定しない）、Hub の
-//!   `stale` は Stale（記録は null）、`simulation`・`derived_simulation` は
-//!   表示するが記録しない。イベントは Hub の接続キーの `plc_connected` /
+//!   `stale` は Stale（記録は null）。Hub の `value_source`（`simulation`・
+//!   `derived_simulation`・未知を含む）は解釈せず、Good なら記録する
+//!   （2026-10-11 オーナー決定。シミュレーション値でも動作を確認できる方を
+//!   優先）。イベントは Hub の接続キーの `plc_connected` /
 //!   `plc_disconnected` / `plc_reconnected`。
 //! * `/tags` の印（[`registry_exclusions`]）はレジストリの中身だけで判定する
 //!   ので、hub 接続そのものは印に出ない（実行形態と Hub の今の状態は、走って
@@ -1142,6 +1144,9 @@ impl From<&CurrentReading> for CurrentSampleView {
 /// 落としたものは**無い**: この型は接続先のホストもポートも資格情報も
 /// 持っていない（持っているのは状態と再接続の試行回数だけ）。`attempt` は
 /// 残す - 「切れてから何回目か」はヘルス表示の実用情報で、機微ではない。
+/// ただし **Hub 経由の接続は 0**（回数を数える再接続の単位が無い - 購読が自分で
+/// 張り直す。`banto_collect::EXTERNAL_RECONNECT_ATTEMPT`）。表示側は 0 のとき
+/// 回数を出さない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum ConnectionStatusView {
@@ -1797,8 +1802,9 @@ impl CollectorService {
 
     /// Hub 経由の接続を収集できるようにする（#383 段階3 P3）。OS キーリングを
     /// 持つ実行形態（`src-tauri`）が、**自動開始を spawn する前に**呼ぶ。
-    /// `banto-serve` は呼ばない（キーリングが無く購読できないので、hub 接続は
-    /// `hubSourceUnavailable` で外れる）。2 回目以降は無視する（`false`）。
+    /// `banto-serve` は既定では呼ばない（キーリングが無く購読できないので、hub
+    /// 接続は `hubSourceUnavailable` で外れる）。開発・E2E 用の
+    /// `BANTO_HUB_MEMORY_KEYS=1` のときだけ呼ぶ。2 回目以降は無視する（`false`）。
     ///
     /// 反映は次の開始から（走っている収集は作り直さない）。
     pub fn attach_hub(&self, hub: HubService) -> bool {
@@ -3835,7 +3841,7 @@ mod tests {
                 key: format!("grp:{}", hub_group.id),
                 name: "HubG".to_string(),
                 reason: "connectionExcluded",
-                message: "所属する PLC接続「Hub」が除外されたため、収集しません".to_string(),
+                message: "所属する接続「Hub」が除外されたため、収集しません".to_string(),
             },
             ExclusionView {
                 unit: ExclusionUnitView::Tag,
@@ -3843,7 +3849,7 @@ mod tests {
                 key: format!("tag:{hub_tag}"),
                 name: "remote".to_string(),
                 reason: "connectionExcluded",
-                message: "所属する PLC接続「Hub」が除外されたため、収集しません".to_string(),
+                message: "所属する接続「Hub」が除外されたため、収集しません".to_string(),
             },
         ];
         let marks = registry_exclusions(

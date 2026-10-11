@@ -179,12 +179,24 @@ pub(crate) fn backoff_delay(attempt: u32, cfg: BackoffConfig) -> Duration {
 /// design: "Connected / Reconnecting{attempt} / Stopped"). `attempt` is the
 /// number of the connect attempt currently in flight or scheduled (starts at
 /// 1 for the initial connect).
+///
+/// An **external** (`"hub"`) connection has no connect attempts of its own to
+/// count - the subscription behind it reconnects itself and the loop only
+/// samples its state each tick - so it reports
+/// `Reconnecting { attempt: `[`EXTERNAL_RECONNECT_ATTEMPT`]` }` (= 0, "no
+/// count") while the link is not Live; a display must not print a number
+/// for 0 (#383 P5: it used to read "reconnecting, attempt 1" forever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connected,
     Reconnecting { attempt: u32 },
     Stopped,
 }
+
+/// The `attempt` an external connection reports while its link is not Live:
+/// 0 = there is no attempt counter (PLC connections count from 1). See
+/// [`ConnectionStatus`].
+pub const EXTERNAL_RECONNECT_ATTEMPT: u32 = 0;
 
 /// Shared status map: each connection task writes its own key; `Collector`
 /// reads the whole map. `std::sync::RwLock` for the same reason as the
@@ -976,8 +988,9 @@ async fn record_ticks(
     // drive threshold/event processing above, but they are not a record of
     // the physical PLC and must never be appended to the real tstore. Keep
     // append-health untouched so suppression cannot create a false failure or
-    // recovery edge. (An external connection is never `simulation`; its
-    // simulated values are suppressed per tag through `recorded` instead.)
+    // recovery edge. (An external connection is never `simulation`; the
+    // Hub's own `value_source` is not interpreted, so its simulated values
+    // are recorded like any Good value - 2026-10-11.)
     if ctx.simulation {
         return;
     }
@@ -1077,7 +1090,9 @@ pub(crate) async fn run_external_connection(
     set_status(
         &ctx,
         &conn_key,
-        ConnectionStatus::Reconnecting { attempt: 1 },
+        ConnectionStatus::Reconnecting {
+            attempt: EXTERNAL_RECONNECT_ATTEMPT,
+        },
     );
 
     loop {
@@ -1114,9 +1129,12 @@ pub(crate) async fn run_external_connection(
                     if live {
                         ConnectionStatus::Connected
                     } else {
-                        // The subscription reconnects itself; there is no
-                        // attempt counter to report, so this stays at 1.
-                        ConnectionStatus::Reconnecting { attempt: 1 }
+                        // The subscription reconnects itself; the ticks of
+                        // this loop are not retries, so there is no attempt
+                        // counter to report (EXTERNAL_RECONNECT_ATTEMPT).
+                        ConnectionStatus::Reconnecting {
+                            attempt: EXTERNAL_RECONNECT_ATTEMPT,
+                        }
                     },
                 );
                 if let Some(edge) = link.observe(live) {

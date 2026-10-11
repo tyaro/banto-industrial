@@ -421,6 +421,33 @@ export function connectionModeLabel(simulation: boolean): string {
 	return simulation ? SIMULATION_CONNECTION_LABEL : REAL_CONNECTION_LABEL;
 }
 
+/** 接続の選択肢（収集グループの「接続」）の表示（純関数）。Hub 経由は生の protocol 名（`hub`）を出さない。 */
+export function connectionOptionLabel(connection: { name: string; protocol: string }): string {
+	return connection.protocol === 'hub'
+		? `${connection.name}（Hub 経由）`
+		: `${connection.name}（${connection.protocol}）`;
+}
+
+/**
+ * タグのデータ型の選択肢（純関数）。64bit は PLC 直結では Modbus のみ（SLMP は
+ * 扱えない）だが、Hub 経由のタグは Hub が工学値の数値として送るので型の制約は
+ * 無い（`REGISTRABLE_DATA_TYPES`）。Hub 用に「Modbusのみ」を出すと不正確。
+ */
+export function tagDataTypeOptions(hub: boolean): { value: TagDataType; label: string }[] {
+	const modbusOnly = hub ? '' : '、Modbusのみ';
+	return [
+		{ value: 'bit', label: 'ビット' },
+		{ value: 'i16', label: '16bit（符号あり）' },
+		{ value: 'u16', label: '16bit（符号なし）' },
+		{ value: 'i32', label: '32bit（符号あり）' },
+		{ value: 'u32', label: '32bit（符号なし）' },
+		{ value: 'f32', label: '32bit実数' },
+		{ value: 'i64', label: `64bit（符号あり${modbusOnly}）` },
+		{ value: 'u64', label: `64bit（符号なし${modbusOnly}）` },
+		{ value: 'f64', label: `64bit実数（倍精度${modbusOnly}）` }
+	];
+}
+
 /**
  * PLC接続の作成・更新に成功したときのトースト文言（純関数）。
  *
@@ -608,14 +635,49 @@ function numOrNull(v: unknown): number | null {
 }
 
 /**
+ * スケーリング 4 項目の出どころ:
+ * - `'form'`（既定）: フォームの欄の値（PLC 直結のタグ）。
+ * - `'none'`: 常に `null`（Hub 経由のタグの**作成**。PLC 用のグループを選んで入力した
+ *   後に Hub 用へ選び直しても、見えない欄の値を送らない）。
+ * - `{ rawLo, rawHi, engLo, engHi }`: その値をそのまま送る（Hub 経由のタグの**編集**。
+ *   画面に欄が無いので、編集前のタグが持っていた値を保つ。API で入れた恒等レンジ
+ *   rawLo=engLo=0・rawHi=engHi=100 は合法で、消すと計器・バーのレンジが未設定になる）。
+ */
+export type TagScalingSource =
+	| 'form'
+	| 'none'
+	| {
+			rawLo: number | null;
+			rawHi: number | null;
+			engLo: number | null;
+			engHi: number | null;
+	  };
+
+function scalingValue(
+	scaling: TagScalingSource,
+	values: Record<string, unknown>,
+	prefix: string,
+	field: 'rawLo' | 'rawHi' | 'engLo' | 'engHi'
+): number | null {
+	if (scaling === 'none') return null;
+	if (scaling === 'form') {
+		return numOrNull(values[`${prefix}${field.charAt(0).toUpperCase()}${field.slice(1)}`]);
+	}
+	return numOrNull(scaling[field]);
+}
+
+/**
  * フォームの値から送信用の `TagInput` を作る。`expectedRevision` を渡すと
  * 更新用（楽観ロック）、渡さないと作成用（版を持たない）。しきい値は載せない
  * （#532。載せるとサーバーが断る）。
+ *
+ * `scaling` はスケーリング 4 項目の出どころ（`TagScalingSource`）。
  */
 export function buildTagInput(
 	prefix: string,
 	values: Record<string, unknown>,
-	expectedRevision?: number
+	expectedRevision?: number,
+	scaling: TagScalingSource = 'form'
 ): TagInput {
 	const rawUnit = values[`${prefix}Unit`];
 	const unit = typeof rawUnit === 'string' ? rawUnit.trim() : '';
@@ -626,10 +688,10 @@ export function buildTagInput(
 		collectionGroupId: typeof collectionGroupId === 'number' ? collectionGroupId : 0,
 		address: String(values[`${prefix}Address`] ?? ''),
 		dataType: (values[`${prefix}DataType`] as TagDataType) ?? 'i16',
-		rawLo: numOrNull(values[`${prefix}RawLo`]),
-		rawHi: numOrNull(values[`${prefix}RawHi`]),
-		engLo: numOrNull(values[`${prefix}EngLo`]),
-		engHi: numOrNull(values[`${prefix}EngHi`]),
+		rawLo: scalingValue(scaling, values, prefix, 'rawLo'),
+		rawHi: scalingValue(scaling, values, prefix, 'rawHi'),
+		engLo: scalingValue(scaling, values, prefix, 'engLo'),
+		engHi: scalingValue(scaling, values, prefix, 'engHi'),
 		unit: unit === '' ? null : unit,
 		decimals: typeof decimals === 'number' ? decimals : 0,
 		enabled: Boolean(values[`${prefix}Enabled`])

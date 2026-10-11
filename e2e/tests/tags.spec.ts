@@ -114,7 +114,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 	test('1. /tags を開くと見出しと3セクションが出る', async () => {
 		await page.goto('/tags');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグ設定' })).toBeVisible();
-		await expect(page.getByRole('heading', { level: 3, name: 'PLC接続' })).toBeVisible();
+		await expect(page.getByRole('heading', { level: 3, name: '接続' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: '収集グループ' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: 'タグ' })).toBeVisible();
 	});
@@ -143,7 +143,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		const section = page.locator('section.registry-section').nth(1);
 		const form = section.locator('div.create');
 		await form.getByLabel('名前').fill(GROUP_NAME);
-		await form.getByLabel('PLC接続').selectOption({ label: `${CONNECTION_NAME}（modbus-tcp）` });
+		await form.getByLabel('接続').selectOption({ label: `${CONNECTION_NAME}（modbus-tcp）` });
 		await form.getByRole('button', { name: '作成' }).click();
 		await expect(section.locator('div.list').getByText(GROUP_NAME)).toBeVisible();
 	});
@@ -456,7 +456,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 			// `ProviderError({ kind: 'other', message: 'サーバーに接続できません' })`
 			// に変換するので、その文言がそのまま添えられる。
 			await expect(
-				plcSection.getByText('PLC接続の一覧を読み込めませんでした', { exact: false })
+				plcSection.getByText('接続の一覧を読み込めませんでした', { exact: false })
 			).toBeVisible();
 			await expect(plcSection.getByRole('button', { name: '再試行' }).first()).toBeVisible();
 
@@ -465,9 +465,9 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 
 			// **誤った指示を出さない**（修正前はここが出て、利用者を重複登録へ
 			// 誘導していた）。
-			await expect(page.getByText('先にPLC接続を1件以上作成してください')).toHaveCount(0);
+			await expect(page.getByText('先に接続を1件以上作成してください')).toHaveCount(0);
 			// 候補が無いように見える `<select>` も出さない。
-			await expect(groupSection.locator('div.create').getByLabel('PLC接続')).toHaveCount(0);
+			await expect(groupSection.locator('div.create').getByLabel('接続')).toHaveCount(0);
 		} finally {
 			await page.unroute('**/api/plc-connections');
 		}
@@ -476,7 +476,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await plcSection.getByRole('button', { name: '再試行' }).first().click();
 		await expect(plcSection.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
 		await expect(
-			plcSection.getByText('PLC接続の一覧を読み込めませんでした', { exact: false })
+			plcSection.getByText('接続の一覧を読み込めませんでした', { exact: false })
 		).toHaveCount(0);
 	});
 });

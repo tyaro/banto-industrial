@@ -708,7 +708,7 @@ impl ExclusionReason {
     pub fn message(&self) -> String {
         match self {
             ExclusionReason::UnsupportedProtocol { protocol } => {
-                format!("プロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）")
+                format!("プロトコル {protocol} は未対応です（modbus-tcp / slmp / hub のみ対応）")
             }
             ExclusionReason::HubSourceUnavailable => {
                 "この実行形態では Hub 経由の接続から収集できません".to_string()
@@ -736,7 +736,7 @@ impl ExclusionReason {
             }
             ExclusionReason::InvalidTag { issue, .. } => issue.message(),
             ExclusionReason::ConnectionExcluded { connection_name } => {
-                format!("所属する PLC接続「{connection_name}」が除外されたため、収集しません")
+                format!("所属する接続「{connection_name}」が除外されたため、収集しません")
             }
             ExclusionReason::GroupExcluded { group_name } => {
                 format!("所属する収集グループ「{group_name}」が除外されたため、収集しません")
@@ -805,7 +805,7 @@ impl ConfigExclusion {
         let name = &self.name;
         let message = match &self.reason {
             ExclusionReason::UnsupportedProtocol { protocol } => format!(
-                "接続 {name} のプロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）"
+                "接続 {name} のプロトコル {protocol} は未対応です（modbus-tcp / slmp / hub のみ対応）"
             ),
             ExclusionReason::HubSourceUnavailable => format!(
                 "接続 {name} は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
@@ -3072,7 +3072,7 @@ mod tests {
         (
             "unsupported protocol",
             |s| s.connections[0].protocol = "ethernet-ip".to_string(),
-            "接続 PLC1 のプロトコル ethernet-ip は未対応です（modbus-tcp / slmp のみ対応）",
+            "接続 PLC1 のプロトコル ethernet-ip は未対応です（modbus-tcp / slmp / hub のみ対応）",
         ),
         (
             "modbus port",
@@ -3412,7 +3412,7 @@ mod tests {
         assert_eq!(exclusions[0].reason.code(), "unsupportedProtocol");
         assert_eq!(
             exclusions[0].reason.message(),
-            "プロトコル ethernet-ip は未対応です（modbus-tcp / slmp のみ対応）"
+            "プロトコル ethernet-ip は未対応です（modbus-tcp / slmp / hub のみ対応）"
         );
     }
 }
