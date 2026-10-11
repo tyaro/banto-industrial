@@ -47,7 +47,7 @@
 		filterHubTags,
 		hubGroupsOf,
 		hubTagAvailability,
-		initialSelection,
+		applyCatalogLoad,
 		legacyNoticeText,
 		registrationBlocker,
 		registrationSuccessMessage,
@@ -116,7 +116,10 @@
 		return String(err);
 	}
 
-	async function load(resetSelection: boolean): Promise<void> {
+	/** この開いている間に、タグ一覧を 1 度でも読めたか（`applyCatalogLoad`）。 */
+	let tagsRead = $state(false);
+
+	async function load(): Promise<void> {
 		loadGeneration += 1;
 		const generation = loadGeneration;
 		loading = true;
@@ -125,19 +128,12 @@
 			const next = await getHubCatalog();
 			if (generation !== loadGeneration || !open) return;
 			catalog = next;
-			if (resetSelection) {
-				initial = initialSelection(next, false);
-				selected = [...initial.selected];
-			} else {
-				// 「一覧を更新」: 選んでいたもののうち、今も選べるものだけ残す
-				// （消えた・登録済みになったものを黙って送らない）。
-				const registered = new Set(next.registered);
-				const byName = new Map((next.tags ?? []).map((t) => [t.externalName, t]));
-				selected = selected.filter((name) => {
-					const tag = byName.get(name);
-					return tag !== undefined && hubTagAvailability(tag, registered).selectable;
-				});
-			}
+			// 読めなかった（`tags: null`）ときは選択を変えない。初めて読めたら事前チェック、
+			// その後は今も選べるものだけ残す（判断は `applyCatalogLoad`）。
+			const applied = applyCatalogLoad({ selected, initial, tagsRead }, next);
+			selected = applied.selected;
+			initial = applied.initial;
+			tagsRead = applied.tagsRead;
 		} catch (err) {
 			if (generation !== loadGeneration || !open) return;
 			// 読めなかったことを「タグ 0 件」に潰さない。
@@ -162,10 +158,11 @@
 		query = '';
 		selected = [];
 		initial = { selected: [], showLegacyNotice: false, legacySkipped: [] };
+		tagsRead = false;
 		target = defaultTarget(hubGroups);
 		rowErrors = new Map();
 		targetErrors = [];
-		void load(true);
+		void load();
 	});
 
 	function toggle(externalName: string, checked: boolean): void {
@@ -290,9 +287,7 @@
 		{#if loadError}
 			<p class="load-error" role="alert">
 				Hub のタグ一覧を読み込めませんでした（{loadError}）。タグが 0 件という意味ではありません。
-				<button type="button" onclick={() => void load(catalog === null)} disabled={loading}>
-					再試行
-				</button>
+				<button type="button" onclick={() => void load()} disabled={loading}> 再試行 </button>
 			</p>
 		{:else if catalog === null}
 			<p class="loading">Hub のタグ一覧を読み込んでいます…</p>
@@ -300,7 +295,7 @@
 			<p class="load-error" role="alert">
 				Hub のタグ一覧を読めませんでした（状態: {hubStatusLabel(catalog.status)}）。Hub
 				への接続は「設定 &gt; Hub接続」で確認できます（管理者）。
-				<button type="button" onclick={() => void load(false)} disabled={loading}>再試行</button>
+				<button type="button" onclick={() => void load()} disabled={loading}>再試行</button>
 			</p>
 		{:else}
 			<div class="toolbar">
@@ -313,7 +308,7 @@
 						disabled={registering}
 					/>
 				</label>
-				<button type="button" onclick={() => void load(false)} disabled={loading || registering}>
+				<button type="button" onclick={() => void load()} disabled={loading || registering}>
 					一覧を更新
 				</button>
 			</div>

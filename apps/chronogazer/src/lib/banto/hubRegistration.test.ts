@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 import type { HubCatalog, HubTag } from './hubAdmin';
 import type { CollectionGroup, PlcConnection } from './tagRegistryAdmin';
 import {
+	applyCatalogLoad,
+	EMPTY_DIALOG_SELECTION,
 	availabilityLabel,
 	buildRegistration,
 	defaultTarget,
@@ -252,5 +254,52 @@ describe('dialogDirty', () => {
 		expect(dialogDirty(new Set(['b']), ['a'], existing)).toBe(true);
 		expect(dialogDirty(new Set(), [], { kind: 'new', name: 'g', periodMs: 1000 })).toBe(true);
 		expect(dialogDirty(new Set(), [], { kind: 'new', name: ' ', periodMs: 1000 })).toBe(false);
+	});
+});
+
+describe('applyCatalogLoad（読み込みのたびの選択。オーナーレビュー P2）', () => {
+	it('初めて読めたら事前チェックを入れ、読めた印を立てる', () => {
+		const state = applyCatalogLoad(
+			EMPTY_DIALOG_SELECTION,
+			catalog({ legacySelection: ['L.G.temp'] })
+		);
+		expect(state.selected).toEqual(['L.G.temp']);
+		expect(state.initial.showLegacyNotice).toBe(true);
+		expect(state.tagsRead).toBe(true);
+	});
+
+	it('一時的に読めない（tags: null）ときは選択も事前チェックの値も変えず、次に読めたら照合する', () => {
+		const first = applyCatalogLoad(
+			EMPTY_DIALOG_SELECTION,
+			catalog({ legacySelection: ['L.G.temp'] })
+		);
+		const picked = { ...first, selected: [...first.selected, 'L.G.run'] };
+		const outage = applyCatalogLoad(picked, catalog({ tags: null }));
+		expect(outage).toBe(picked);
+		const back = applyCatalogLoad(outage, catalog());
+		expect(back.selected).toEqual(['L.G.temp', 'L.G.run']);
+		expect(back.initial).toBe(first.initial);
+	});
+
+	it('2 回目以降に読めたら、消えた・登録済みになったものだけ外す', () => {
+		const first = applyCatalogLoad(EMPTY_DIALOG_SELECTION, catalog());
+		const picked = { ...first, selected: ['L.G.temp', 'L.G.run'] };
+		const next = applyCatalogLoad(picked, catalog({ tags: [tag('L.G.temp')], registered: [] }));
+		expect(next.selected).toEqual(['L.G.temp']);
+		const nowRegistered = applyCatalogLoad(picked, catalog({ registered: ['L.G.temp'] }));
+		expect(nowRegistered.selected).toEqual(['L.G.run']);
+	});
+
+	it('開いた直後に読めなかったら注記だけ出し、読めた時点で事前チェックする', () => {
+		const outage = applyCatalogLoad(
+			EMPTY_DIALOG_SELECTION,
+			catalog({ tags: null, legacySelection: ['L.G.temp'] })
+		);
+		expect(outage.selected).toEqual([]);
+		expect(outage.tagsRead).toBe(false);
+		expect(outage.initial.showLegacyNotice).toBe(true);
+		const back = applyCatalogLoad(outage, catalog({ legacySelection: ['L.G.temp'] }));
+		expect(back.selected).toEqual(['L.G.temp']);
+		expect(back.tagsRead).toBe(true);
 	});
 });

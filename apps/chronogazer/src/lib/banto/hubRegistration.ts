@@ -236,3 +236,50 @@ export function dialogDirty(
 	if (selected.size !== initial.length) return true;
 	return initial.some((name) => !selected.has(name));
 }
+
+/** ダイアログの選択の状態（読み込みのたびに {@link applyCatalogLoad} で進める）。 */
+export interface DialogSelectionState {
+	selected: string[];
+	initial: InitialSelection;
+	/** この開いている間に、タグ一覧を 1 度でも**読めた**か（事前チェックを済ませたか）。 */
+	tagsRead: boolean;
+}
+
+export const EMPTY_DIALOG_SELECTION: DialogSelectionState = {
+	selected: [],
+	initial: { selected: [], showLegacyNotice: false, legacySkipped: [] },
+	tagsRead: false
+};
+
+/**
+ * catalog を読み込んだ後の選択（純関数。2026-10-11 オーナーレビュー P2）。
+ *
+ * - **`tags: null`（読めなかった）では選択を一切変えない**: 一時的に Hub に届か
+ *   ないだけで選択が全部消えると、次に読めても戻らない。「消えた」ではなく
+ *   「読めない」なので、選択も事前チェックの値もそのまま保つ（まだ 1 度も読めて
+ *   いなければ、移行前の選択の注記だけを出す）。
+ * - **初めて読めたとき**は事前チェック（{@link initialSelection}）を入れる。
+ * - **2 回目以降に読めたとき**は、選んでいたもののうち今も選べるものだけを残す
+ *   （消えた・登録済みになったものを黙って送らない）。
+ */
+export function applyCatalogLoad(
+	state: DialogSelectionState,
+	next: HubCatalog
+): DialogSelectionState {
+	if (next.tags === null) {
+		if (state.tagsRead) return state;
+		return { ...state, initial: initialSelection(next, false) };
+	}
+	if (!state.tagsRead) {
+		const initial = initialSelection(next, false);
+		const merged = new Set([...state.selected, ...initial.selected]);
+		return { selected: [...merged], initial, tagsRead: true };
+	}
+	const registered = new Set(next.registered);
+	const byName = new Map(next.tags.map((tag) => [tag.externalName, tag]));
+	const selected = state.selected.filter((name) => {
+		const tag = byName.get(name);
+		return tag !== undefined && hubTagAvailability(tag, registered).selectable;
+	});
+	return { ...state, selected };
+}
