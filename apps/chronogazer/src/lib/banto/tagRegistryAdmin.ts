@@ -40,6 +40,16 @@ export type { ExclusionView };
  */
 export type PlcProtocol = 'modbus-tcp' | 'slmp';
 
+/**
+ * #383 段階3 P2（2026-10-10 オーナー決定 H1）: レジストリには Hub 経由の接続
+ * （`protocol: 'hub'`、`banto_tags::HUB_PROTOCOL`）も入りうるので、**読み取った**
+ * 接続の型はこちら。作成・更新の入力（{@link PlcConnectionInput}）は
+ * {@link PlcProtocol} のまま - Hub 接続を作る画面は P4 で足す（それまでは REST が
+ * 拒否する）。画面はプロトコルを文字列のまま表示するだけなので、`'hub'` の行が
+ * あっても一覧・フォームは壊れない。
+ */
+export type RegistryProtocol = PlcProtocol | 'hub';
+
 /** `""` = 未指定（プロトコルの既定に従う）。 */
 export type WordOrder = '' | 'low_high' | 'high_low';
 
@@ -47,7 +57,7 @@ export type WordOrder = '' | 'low_high' | 'high_low';
 export interface PlcConnection {
 	id: number;
 	name: string;
-	protocol: PlcProtocol;
+	protocol: RegistryProtocol;
 	host: string;
 	port: number;
 	unitId: number;

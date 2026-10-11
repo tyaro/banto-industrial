@@ -26,7 +26,7 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::plc_connection::POSTGRES_PROTOCOL;
+use crate::plc_connection::{HUB_PROTOCOL, POSTGRES_PROTOCOL};
 use crate::support::{map_write_error, max_length_message, required_message, NAME_ALREADY_USED};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
@@ -227,6 +227,42 @@ fn validate_query_sql(
     }
 }
 
+/// #383 段階3 P2（`crate::plc_connection` の "`\"hub\"`" 節）: グループの現在の
+/// 接続のプロトコルと、配下のタグ数。[`hub_group_move_error`] の入力。
+const GROUP_PROTOCOL_AND_TAG_COUNT_SQL: &str = "SELECT pc.protocol, \
+     (SELECT COUNT(*) FROM tags WHERE collection_group_id = cg.id) \
+     FROM collection_groups cg JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
+     WHERE cg.id = ?";
+
+/// #383 段階3 P2: タグを持つグループを `hub` 接続と `hub` 以外の接続の間で
+/// 移すことを拒否する。Hub 経由のタグの `address` は外部名、PLC のタグの
+/// `address` はデバイスアドレスで互換が無いため、移した瞬間に配下の全タグが
+/// 新しい接続で解釈できなくなる（接続のプロトコル変更を拒否するのと同じ理由 -
+/// `PlcConnectionService::update`）。`current` は (今の接続のプロトコル,
+/// 配下のタグ数)、`None` はグループが存在しない（UPDATE が not-found を返す）。
+/// `new_protocol` は移動先の接続のプロトコル、`None` は接続が存在しない
+/// （FK が拒否する）。
+fn hub_group_move_error(
+    current: Option<(&str, i64)>,
+    new_protocol: Option<&str>,
+) -> Option<BantoError> {
+    let (current_protocol, tag_count) = current?;
+    let new_protocol = new_protocol?;
+    let crosses = (current_protocol == HUB_PROTOCOL) != (new_protocol == HUB_PROTOCOL);
+    if !crosses || tag_count == 0 {
+        return None;
+    }
+    Some(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "plcConnectionId".to_string(),
+            message: format!(
+                "このグループにはタグが{tag_count}件あるため、Hub 接続と他の接続の間で移せません\
+                 （Hub 経由のタグのアドレスは外部名で、PLC のアドレスとは互換がありません）"
+            ),
+        }],
+    })
+}
+
 fn column_map() -> ColumnMap {
     ColumnMap::new()
         .column("id", "id")
@@ -389,6 +425,19 @@ impl CollectionGroupService {
                 .map_err(banto_storage::storage_error)?;
         let stored_query_sql =
             validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
+        let current: Option<(String, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if let Some(err) = hub_group_move_error(
+            current
+                .as_ref()
+                .map(|(protocol, count)| (protocol.as_str(), *count)),
+            existing_protocol.as_deref(),
+        ) {
+            return Err(err);
+        }
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
@@ -429,6 +478,19 @@ impl CollectionGroupService {
                 .map_err(banto_storage::storage_error)?;
         let stored_query_sql =
             validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
+        let current: Option<(String, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if let Some(err) = hub_group_move_error(
+            current
+                .as_ref()
+                .map(|(protocol, count)| (protocol.as_str(), *count)),
+            existing_protocol.as_deref(),
+        ) {
+            return Err(err);
+        }
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
@@ -1197,5 +1259,94 @@ mod tests {
                 .and_then(|g| g.query_sql.as_deref()),
             Some("SELECT b FROM v2")
         );
+    }
+
+    // --- #383 段階3 P2: moving a group across the "hub" boundary ---------
+
+    /// A group that has tags cannot move between a hub connection and a
+    /// non-hub one (its tags' addresses would stop making sense); an empty
+    /// group can, and a move that stays on one side is unaffected - on both
+    /// the pool and the transaction paths.
+    #[tokio::test]
+    async fn a_group_with_tags_cannot_move_across_the_hub_boundary() {
+        let (plc_svc, group_svc, plc_id) = setup().await;
+        let mut hub_input = postgres_connection_input("Hub");
+        hub_input.protocol = HUB_PROTOCOL.to_string();
+        hub_input.database = None;
+        hub_input.username = None;
+        let hub = plc_svc.create(hub_input).await.unwrap();
+        let mut other_plc_input = postgres_connection_input("PLC2");
+        other_plc_input.protocol = "slmp".to_string();
+        other_plc_input.database = None;
+        other_plc_input.username = None;
+        let other_plc = plc_svc.create(other_plc_input).await.unwrap();
+
+        let group = group_svc.create(sample_input("G", plc_id)).await.unwrap();
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('T', ?, '40001', 'i16')",
+        )
+        .bind(group.id)
+        .execute(&group_svc.pool)
+        .await
+        .unwrap();
+
+        let err = group_svc
+            .update(group.id, sample_input("G", hub.id))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "plcConnectionId");
+                assert!(field_errors[0].message.contains("1件"), "{field_errors:?}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let mut tx = group_svc.pool.begin().await.unwrap();
+        assert!(matches!(
+            group_svc
+                .update_tx(&mut tx, group.id, sample_input("G", hub.id))
+                .await,
+            Err(BantoError::Validation { .. })
+        ));
+        drop(tx);
+
+        // Same side of the boundary: fine.
+        group_svc
+            .update(group.id, sample_input("G", other_plc.id))
+            .await
+            .expect("modbus -> slmp move is not the hub's concern");
+
+        // An empty group may cross, in either direction.
+        let empty = group_svc.create(sample_input("E", plc_id)).await.unwrap();
+        group_svc
+            .update(empty.id, sample_input("E", hub.id))
+            .await
+            .expect("an empty group may move under the hub");
+        group_svc
+            .update(empty.id, sample_input("E", plc_id))
+            .await
+            .expect("and back");
+    }
+
+    #[test]
+    fn hub_group_move_error_table() {
+        type Case<'a> = (Option<(&'a str, i64)>, Option<&'a str>, bool);
+        let cases: &[Case] = &[
+            (Some(("modbus-tcp", 1)), Some("hub"), true),
+            (Some(("hub", 3)), Some("slmp"), true),
+            (Some(("modbus-tcp", 0)), Some("hub"), false),
+            (Some(("hub", 3)), Some("hub"), false),
+            (Some(("slmp", 3)), Some("modbus-tcp"), false),
+            (None, Some("hub"), false),
+            (Some(("modbus-tcp", 3)), None, false),
+        ];
+        for &(current, new, refused) in cases {
+            assert_eq!(
+                hub_group_move_error(current, new).is_some(),
+                refused,
+                "{current:?} -> {new:?}"
+            );
+        }
     }
 }

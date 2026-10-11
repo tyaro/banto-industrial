@@ -3624,6 +3624,99 @@ mod tests {
         svc.stop().await.expect("stop");
     }
 
+    /// #383 段階3 P2: レジストリに Hub 経由の接続（`protocol: "hub"`）と、その
+    /// 下のグループ・タグがあっても、収集の開始は失敗しない - Hub 接続は
+    /// `hubSourceNotYetCollected`（Hub のサンプラーは P3）で外れ、グループと
+    /// タグは連鎖で外れ、PLC 直結の側はそのまま `Running`（#414 の
+    /// 「外して残りを動かす」）。`/tags` の印も同じものを返す。
+    ///
+    /// 反証: `banto_collect` の `parse_protocol` から `hub` の分岐を消すと
+    /// 理由が `unsupportedProtocol` になり、ここの比較で落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hub_connection_is_left_out_and_the_plc_side_keeps_running() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+
+        let hub = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "Hub".to_string(),
+                protocol: banto_tags::HUB_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: String::new(),
+                database: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .expect("create hub connection");
+        let hub_group = CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "HubG".to_string(),
+                plc_connection_id: hub.id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            })
+            .await
+            .expect("create hub group");
+        let hub_tag = seed_named_tag(&pool, hub_group.id, "remote", "PLC9.G.Temp").await;
+
+        let expected = vec![
+            ExclusionView {
+                unit: ExclusionUnitView::Connection,
+                id: hub.id,
+                key: format!("conn:{}", hub.id),
+                name: "Hub".to_string(),
+                reason: "hubSourceNotYetCollected",
+                message: "Hub 経由の接続からの収集にはまだ対応していません".to_string(),
+            },
+            ExclusionView {
+                unit: ExclusionUnitView::Group,
+                id: hub_group.id,
+                key: format!("grp:{}", hub_group.id),
+                name: "HubG".to_string(),
+                reason: "connectionExcluded",
+                message: "所属する PLC接続「Hub」が除外されたため、収集しません".to_string(),
+            },
+            ExclusionView {
+                unit: ExclusionUnitView::Tag,
+                id: hub_tag,
+                key: format!("tag:{hub_tag}"),
+                name: "remote".to_string(),
+                reason: "connectionExcluded",
+                message: "所属する PLC接続「Hub」が除外されたため、収集しません".to_string(),
+            },
+        ];
+        let marks = registry_exclusions(
+            &PlcConnectionService::new(pool.clone()),
+            &CollectionGroupService::new(pool.clone()),
+            &TagService::new(pool.clone()),
+        )
+        .await
+        .expect("registry_exclusions");
+        assert_eq!(marks, expected);
+
+        match settled(svc.start().await.expect("start")) {
+            CollectorState::Running {
+                groups,
+                tags,
+                exclusions,
+            } => {
+                assert_eq!((groups, tags), (1, 1), "PLC 直結の側は動く");
+                assert_eq!(exclusions, expected);
+            }
+            other => panic!("Running を期待したが {other:?}"),
+        }
+        svc.stop().await.expect("stop");
+    }
+
     /// 収集対象があるときは本当に起動し、読み出しが「走っている」形になる。
     /// 二重 `start()` が 2 つ目のエンジンを立てないことも同時に固定する。
     ///

@@ -870,7 +870,11 @@ fn default_tag_decimals() -> i64 {
 /// `reject_postgres_connection_protocol`（postgres だけを拒否）より一段
 /// 狭い許可リスト方式にしているのは、chronogazer が「PLC 直結」以外の
 /// 用途を一切持たないため（将来 `ALLOWED_PROTOCOLS` が5つ目を増やしても、
-/// ここで拒否されるのが安全側のデフォルト）。REST の create/update ハンドラ
+/// ここで拒否されるのが安全側のデフォルト）。#383 段階3 P2 で 5 つ目の
+/// `"hub"`（Hub 経由の接続、2026-10-10 オーナー決定 H1）が増えたが、
+/// これは chronogazer のための種別で、作成の導線（Hub のカタログから登録）は
+/// P4 で足す。それまではここで拒否したままにする（レジストリの検証と収集の
+/// 除外 - `banto_collect` の `HubSourceNotYetCollected` - だけが先に入る）。REST の create/update ハンドラ
 /// と、双方向対称の Tauri コマンド（`apps/chronogazer/src-tauri/src/lib.rs`
 /// の `plc_connections_create`/`plc_connections_update`）の両方から呼ぶ -
 /// 片方だけに書くともう片方の経路から通ってしまう。
@@ -3985,11 +3989,12 @@ mod tests {
     /// [`reject_disallowed_connection_protocol`]: chronogazer は
     /// `"virtual"`/`"postgres"` 接続の作成を拒否する（banto-hub 固有の
     /// プロトコル）。人間可読な `field_errors` として返ることを固定する。
+    /// `"hub"`（#383 段階3 P2）も、作成の導線を足す P4 までは同じく拒否する。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plc_connection_create_rejects_virtual_and_postgres_protocol_readably() {
         let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
 
-        for protocol in ["virtual", "postgres"] {
+        for protocol in ["virtual", "postgres", "hub"] {
             let mut payload = plc_connection_payload("not-allowed");
             payload["protocol"] = json!(protocol);
             let response = router

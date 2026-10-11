@@ -2265,6 +2265,34 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
     }
 }
 
+/// #383 段階3 P2（2026-10-10 オーナー決定 H1）: banto-tags のレジストリは
+/// `protocol: "hub"`（banto-hub をデータ源とする接続、ChronoGazer が Hub 経由の
+/// タグを記録するための種別）を受け付けるが、**banto-hub 自身はそれを作らない**。
+/// Hub が自分自身を購読することは無く、Hub の収集（`banto_collect::build_config_from`
+/// の厳格版）も `hub` 接続を「未対応」として全体を止める。接続を作る・変える
+/// すべての入口 - REST の作成/更新（[`plc_connections_create`]/
+/// [`plc_connections_update`]）、MCP の `create_connection`/`update_connection`、
+/// 未適用キューの適用（[`execute_pending_apply`] の `plc_connections.*`）- が
+/// キューへ積む**前に**これを呼び、`protocol` の項目エラーとして拒否する
+/// （キューに積んでから適用時に落ちるのでは、どの変更が悪いかが遅れて分かる）。
+/// 設定パッケージの取り込み（`configPackage.ts`）は REST の作成/更新を呼ぶので、
+/// ここで同じく拒否される。
+pub(crate) fn reject_hub_connection_protocol(
+    payload: &PlcConnectionPayload,
+) -> Result<(), BantoError> {
+    if payload.protocol != banto_tags::HUB_PROTOCOL {
+        return Ok(());
+    }
+    Err(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "protocol".to_string(),
+            message: "banto-hub では Hub 経由の接続（hub）は作成できません\
+                      （Hub 経由の接続は記録計などの Hub を使う側の設定です）"
+                .to_string(),
+        }],
+    })
+}
+
 /// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: GET/list が返す
 /// `plc_connections` の読み取り DTO。`banto_tags::PlcConnection`をそのまま
 /// `Serialize`すると`password`列（平文）がそのまま応答に出てしまうため、
@@ -2878,6 +2906,10 @@ async fn plc_connections_create(
         "/api/plc-connections",
     )
     .await?;
+    // #383 段階3 P2: キューへ積む前に拒否する（`reject_hub_connection_protocol`）。
+    if let Err(err) = reject_hub_connection_protocol(&input) {
+        return Err(ApiError(err).into());
+    }
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
@@ -2945,6 +2977,10 @@ async fn plc_connections_update(
         "/api/plc-connections/{id}",
     )
     .await?;
+    // #383 段階3 P2: キューへ積む前に拒否する（`reject_hub_connection_protocol`）。
+    if let Err(err) = reject_hub_connection_protocol(&input) {
+        return Err(ApiError(err).into());
+    }
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
@@ -4997,6 +5033,9 @@ async fn execute_pending_apply(
         "plc_connections.create" => {
             let body: PendingChangeWithInput<PlcConnectionPayload> =
                 decode_pending_payload(pending)?;
+            reject_hub_connection_protocol(&body.input)
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
             state
                 .plc_connections
                 .create_tx(&mut tx, body.input.into())
@@ -5008,6 +5047,9 @@ async fn execute_pending_apply(
         "plc_connections.update" => {
             let body: PendingChangeWithIdAndInput<PlcConnectionPayload> =
                 decode_pending_payload(pending)?;
+            reject_hub_connection_protocol(&body.input)
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
             if let Some(expected) = &pending.base_fingerprint {
                 // Plain pool read (not part of `tx` above) — same source as
                 // `compute_pending_base_fingerprint` used at enqueue time.
@@ -17960,5 +18002,113 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["kind"], "bad_request", "{body}");
+    }
+
+    // --- #383 段階3 P2: banto-hub は `hub` 接続を作らない ------------------
+
+    /// `reject_hub_connection_protocol`: REST の作成も、既存の接続を `hub` へ
+    /// 変える更新も、`protocol` の項目エラーで拒否し、何も書かない。
+    #[tokio::test]
+    async fn plc_connections_create_and_update_reject_the_hub_protocol() {
+        let env = test_env().await;
+
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "hub", "protocol": "hub", "host": "", "port": 0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["field_errors"][0]["field"], "protocol", "{body:?}");
+        assert!(
+            body["field_errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Hub 経由の接続"),
+            "{body:?}"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE protocol = 'hub'")
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-hub-switch", "host": "127.0.0.1", "port": 15071 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let id = conn["id"].as_i64().unwrap();
+        let (status, body) = admin_put(
+            &env.router,
+            &format!("/api/plc-connections/{id}"),
+            &env.admin_token,
+            json!({ "name": "line-hub-switch", "protocol": "hub", "host": "", "port": 0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["field_errors"][0]["field"], "protocol", "{body:?}");
+        let protocol: String =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(id)
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        assert_eq!(protocol, "modbus-tcp");
+    }
+
+    /// 未適用キューに `hub` の作成が残っていても（REST/MCP はキューへ積む前に
+    /// 拒否するので、今の版では積まれない）、適用時にもう一度拒否して
+    /// `failed` にし、理由に `protocol` を残す。
+    #[tokio::test]
+    async fn pending_apply_rejects_a_queued_hub_connection() {
+        let env = test_env().await;
+        let payload = json!({
+            "input": { "name": "hub", "protocol": "hub", "host": "", "port": 0 }
+        });
+        let pending = PendingChangesService::new(env.pool.clone())
+            .create_pending(
+                "plc_connections.create",
+                &payload,
+                env.manager.configured_revision() as i64,
+                None,
+                Some("admin"),
+                Some("ui"),
+            )
+            .await
+            .unwrap();
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{}/apply", pending.id))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending.id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Failed);
+        let reason = pending.failure_reason.expect("failure_reason");
+        assert!(reason.contains("protocol"), "{reason}");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE protocol = 'hub'")
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
     }
 }

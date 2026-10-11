@@ -5104,3 +5104,91 @@ async fn delete_sink_group_requires_confirm() {
     assert!(text.contains("confirm_required"), "{text}");
     assert_eq!(sink_groups_row_count(&app).await, 1);
 }
+
+/// #383 段階3 P2: banto-hub は `hub` 接続（Hub 経由の接続、記録計の側の種別）を
+/// 作らない - MCP の `create_connection`/`update_connection` も REST と同じく
+/// `protocol` の項目エラーで拒否する。ロックダウン済み + 収集中（= 通常なら
+/// 未適用キューへ積まれる状態）でも、**キューへ積む前に**拒否することを
+/// 確かめる（積んでから適用時に落ちるのでは、どの変更が悪いかが遅れて分かる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_and_update_connection_reject_the_hub_protocol_before_queueing() {
+    let app = test_app("config-hub-protocol").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let existing = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", 15023))
+        .await
+        .unwrap();
+
+    // 停止中（即時反映の経路）。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "hub", "protocol": "hub", "host": "", "port": 0 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("protocol"), "{text}");
+    assert!(text.contains("Hub 経由の接続"), "{text}");
+
+    // ロックダウン済み + 収集中（キューへ積まれる経路）。
+    app.commissioning.lock_down().await.expect("lock_down");
+    start_collection(&app.router, &app.admin_token).await;
+    let before_rows = plc_connections_row_count(&app).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "hub", "protocol": "hub", "host": "", "port": 0 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Hub 経由の接続"), "{text}");
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_connection",
+            json!({
+                "id": existing.id,
+                "name": "line1",
+                "protocol": "hub",
+                "host": "",
+                "port": 0,
+                "unitId": 1,
+                "enabled": true,
+                "simulation": false,
+                "wordOrder": "low_high",
+                "database": null,
+                "username": null,
+                "password": null,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Hub 経由の接続"), "{text}");
+
+    assert_eq!(plc_connections_row_count(&app).await, before_rows);
+    let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending_count, 0, "a hub connection must never be queued");
+    let protocol: String = sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+        .bind(existing.id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(protocol, "slmp");
+}
