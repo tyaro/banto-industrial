@@ -1065,6 +1065,26 @@ fn current_pair_line(
     )
 }
 
+/// 一時 Hub の `GET /api/api-keys` の応答から、まだ失効していないキーの
+/// id を取り出す。
+///
+/// **名前や発行時刻では絞らず、有効なキーを全部**対象にする。理由: 一時 Hub
+/// は試験ごとの一意な profile・一時 DB で、キーを発行するのはこのハーネスの
+/// ChronoGazer だけ（`check_own_hub` で今回の子と照合してから使う）。名前の
+/// 規則（`{app_id}-{installation_id}-{秒}`）に頼ると、`connect` が同秒の
+/// 衝突で秒をずらした再発行などで規則から外れたときに取りこぼす。本番の
+/// Hub では絶対にやらないこと（docs/banto-hub-client-bootstrap.md）。
+fn live_key_ids(list: &Value) -> Vec<i64> {
+    list.as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row["revokedAt"].is_null())
+                .filter_map(|row| row["id"].as_i64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn read_hub_record(settings: &SettingsService) -> Option<HubRecord> {
     let raw = settings.get(HUB_RECORD_SETTINGS_KEY).await.ok()??;
     serde_json::from_str(&raw).ok()
@@ -1689,6 +1709,41 @@ async fn main() {
             }
             None => cleanup_notes.push("hub.record が無い（キー未発行）".to_owned()),
         }
+        // `hub.record` に `key_id` が残らない経路（`connect` が発行後に
+        // 保存まで進めず Err・タイムアウトで落ちた等）の取りこぼしを、
+        // 一時 Hub 上の有効なキー全部の失効で塞ぐ（`live_key_ids` の doc）。
+        let swept = async {
+            check_own_hub(&admin, &mut hub_proc).await?;
+            if admin.token.is_none() {
+                admin.grant().await?;
+            }
+            let list = admin
+                .ok(reqwest::Method::GET, "/api/api-keys", None)
+                .await?;
+            let ids = live_key_ids(&list);
+            let mut done = Vec::new();
+            for id in ids {
+                check_own_hub(&admin, &mut hub_proc).await?;
+                admin
+                    .ok(
+                        reqwest::Method::POST,
+                        &format!("/api/api-keys/{id}/revoke"),
+                        None,
+                    )
+                    .await?;
+                done.push(id);
+            }
+            Ok::<_, String>(done)
+        }
+        .await;
+        match swept {
+            Ok(ids) if ids.is_empty() => {}
+            Ok(ids) => cleanup_notes.push(format!("一覧から残りの有効キー {ids:?} を失効")),
+            Err(e) => {
+                cleanup_ok = false;
+                cleanup_notes.push(format!("キー一覧による失効に失敗: {e}"));
+            }
+        }
         pool.close().await;
     }
     // grant のトークンは今回の子にだけ返す（照合できなければ送らずに捨てる）。
@@ -1773,6 +1828,19 @@ mod tests {
             assert_eq!(value_under(label), expected, "列 {label}");
         }
         assert!(lines[1].ends_with("100 / 100"));
+    }
+
+    #[test]
+    fn live_key_ids_skips_revoked_and_malformed_rows() {
+        let list = serde_json::json!([
+            {"id": 1, "name": "a", "revokedAt": null},
+            {"id": 2, "name": "b", "revokedAt": "2026-10-12 01:02:03"},
+            {"name": "no-id", "revokedAt": null},
+            {"id": 7, "name": "c"}
+        ]);
+        assert_eq!(live_key_ids(&list), vec![1, 7]);
+        assert!(live_key_ids(&serde_json::json!({"error": "x"})).is_empty());
+        assert!(live_key_ids(&Value::Null).is_empty());
     }
 
     #[test]
