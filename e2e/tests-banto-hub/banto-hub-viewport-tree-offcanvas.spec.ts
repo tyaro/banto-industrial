@@ -1162,22 +1162,37 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 			void dialog.accept();
 		};
 		page.on('dialog', onDialog);
+		// 閉じ遷移の長さは @banto/ui が `--banto-duration-base` から読む。1 秒に
+		// 延ばして「閉じ遷移中」を決定的にする（テストの終わりに外す）。
+		const slowExit = await page.addStyleTag({
+			content: ':root { --banto-duration-base: 1s !important; }'
+		});
 		try {
 			const closeButton = editDrawer.getByRole('button', { name: '閉じる' });
+			// 閉じ遷移中のパネルは `inert`（アクセシビリティツリーから外れる）なので、
+			// 最初のクリックの前に × の DOM 参照を取っておく。role ロケーターは
+			// 閉じ遷移中は解決しない。
+			const closeHandle = await closeButton.elementHandle();
+			expect(closeHandle).not.toBeNull();
 			await closeButton.click();
-			// outro 中にもう一度押す。@banto/ui の閉じ遷移中のパネルは `inert`
-			// （アクセシビリティツリーから外れる）なので、× の role ロケーターが
-			// 解決せず、2 回目の click は通常は届かない。**座標クリックではなく
-			// 要素へ直接 click イベントを送る**: 消えかけのパネルへ `force` の座標
-			// クリックを撃つと、下にあるヘッダーのボタン（ログアウト等）を叩いて
-			// しまう（実測）。`dispatchEvent` の第 2 引数は eventInit なので、
-			// タイムアウトは第 3 引数。届かなければ例外になるので無視してよい
-			// （確認が 1 回だけ出ることは下の `dialogCount` で確かめる）。
-			await closeButton.dispatchEvent('click', undefined, { timeout: 2000 }).catch(() => {});
+			// 閉じ遷移中にもう一度押す。**座標クリックではなく DOM 参照へ直接 click
+			// イベントを送る**: 消えかけのパネルへ `force` の座標クリックを撃つと、
+			// 下にあるヘッダーのボタン（ログアウト等）を叩いてしまう（実測）。
+			// `inert` でもプログラムからの dispatch はハンドラへ届くので、
+			// 再入ガード（`requestClose` の冪等性）を実際に試せる。握りつぶさず、
+			// パネルがまだ DOM に居るあいだに届いたことを確かめる。
+			const delivered = await closeHandle!.evaluate((el) => {
+				if (!el.isConnected) return false;
+				el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+				return true;
+			});
+			expect(delivered).toBe(true);
 			await expect(editDrawer).toHaveCount(0);
+			await expect.poll(() => closeHandle!.evaluate((el) => el.isConnected)).toBe(false);
 			expect(dialogCount).toBe(1);
 		} finally {
 			page.off('dialog', onDialog);
+			await slowExit.evaluate((el) => el.remove());
 		}
 
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
