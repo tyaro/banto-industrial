@@ -26,6 +26,7 @@
 //! | POST   | `/api/audit-log/list?asOfId=` | `ListParams` | `AuditLogList` (`ListResult` + `asOfId` + `deletionEpoch`, admin; unreadable query = `400 bad_request`) |
 //! | GET    | `/api/audit-log/config` | -            | `AuditSettings` (admin) |
 //! | PUT    | `/api/audit-log/config` | `AuditSettings` | `AuditSettings` (admin) |
+//! | GET    | `/api/audit-log/spool` | -            | `AuditSpoolStatus` (`pendingCount`/`pendingOldestTs`/`droppedCount`/`failedCount`, admin; #437) |
 //! | POST   | `/api/backups`        | -              | `BackupInfo` (admin, spec M17) |
 //! | GET    | `/api/backups`        | -              | `BackupInfo[]` (admin)  |
 //! | GET    | `/api/backups/{fileName}` | -          | raw bytes, `Content-Disposition: attachment` (admin) |
@@ -234,6 +235,9 @@ mod display_groups;
 // （`rest/tag_thresholds.rs`）に置く。
 use crate::tag_thresholds::TagThresholdService;
 mod tag_thresholds;
+// #437: 監査の保留の REST の経路（保留・流し込み・状態の口）のテスト。
+#[cfg(test)]
+mod audit_spool_tests;
 use crate::collect::ExclusionView;
 use crate::collect::{
     parse_tag_ids, validate_history_request, CollectEventList, CollectHistory, CollectOutcome,
@@ -465,6 +469,33 @@ fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Route
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "hub",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
+/// `GET /api/audit-log/spool`（#437、`admin` 限定）: 監査の保留
+/// （`crate::audit_spool`）の状態。DB に書けなかった監査が保留ファイルに
+/// 溜まっていれば件数が 0 でなくなり、監査ログ画面が警告帯を出す。
+async fn audit_spool_status_handler(
+    State(audit): State<AuditLogService>,
+) -> Json<crate::audit_spool::AuditSpoolStatus> {
+    Json(crate::audit_spool::spool_status(&audit))
+}
+
+/// `/api/audit-log/spool`: `admin` 限定、`hub_router` と同じ掛け方
+/// （`require_auth` → `require_role_at_least`、拒否は `audit_log` として監査）。
+fn audit_spool_router(audit: AuditLogService, auth: AuthState) -> Router {
+    Router::new()
+        .route("/api/audit-log/spool", get(audit_spool_status_handler))
+        .with_state(audit.clone())
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "audit_log",
                 audit,
             },
             require_role_at_least,
@@ -1785,6 +1816,7 @@ pub fn api_router(
             settings.clone(),
             auth.clone(),
         ))
+        .merge(audit_spool_router(audit.clone(), auth.clone()))
         .merge(backups_router(backup, audit.clone(), auth.clone()))
         .merge(hub_router(hub, audit.clone(), auth.clone()))
         .merge(collect_router(collect, audit.clone(), auth.clone()))
@@ -2859,6 +2891,22 @@ mod tests {
         String,
         String,
     ) {
+        router_with_role_tokens_audit_pool_data_dir_and_spool(data_dir, None).await
+    }
+
+    /// 上と同じだが、監査サービスを**保留つき**（`spool_db_path` ごとの
+    /// `audit-spool/<DB ファイル名>/`、#437）で組めるようにしたもの。`None` なら保留なし。
+    pub(super) async fn router_with_role_tokens_audit_pool_data_dir_and_spool(
+        data_dir: PathBuf,
+        spool_db_path: Option<&std::path::Path>,
+    ) -> (
+        Router,
+        AuditLogService,
+        sqlx::SqlitePool,
+        String,
+        String,
+        String,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let pool_for_tests = pool.clone();
         let (tx, _rx) = broadcast::channel(16);
@@ -2868,7 +2916,10 @@ mod tests {
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let display_groups = DisplayGroupService::new(pool.clone());
         let collect = CollectorService::new(pool.clone(), data_dir);
-        let audit = AuditLogService::new(Db::Sqlite(pool));
+        let audit = match spool_db_path {
+            Some(dir) => crate::audit_spool::build_audit_service(Db::Sqlite(pool), dir),
+            None => AuditLogService::new(Db::Sqlite(pool)),
+        };
 
         users
             .setup_first_user("admin", "password123", "管理者")

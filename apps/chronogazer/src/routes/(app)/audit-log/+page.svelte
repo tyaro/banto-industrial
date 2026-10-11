@@ -35,11 +35,13 @@
 		type GridColumn,
 		type SortState
 	} from '@banto/grid-svelte';
+	import { auditSpoolNotice } from '#lib/banto/auditSpoolWarning.js';
 	import {
 		AUDIT_SNAPSHOT_EXPIRED_MESSAGE,
 		DEMO_MODE_MESSAGE,
 		createAuditLogResource,
 		getAuditConfig,
+		getAuditSpoolStatus,
 		isAuditLogAvailable,
 		type AuditLogEntry
 	} from '#lib/banto/auditLogAdmin.js';
@@ -185,6 +187,7 @@
 	// 使えなくならない）。
 	function reload(): void {
 		auditLog.refresh();
+		void loadSpoolWarning();
 	}
 
 	// spec M14: result='denied'/'failed' の行を控えめな左ボーダーで視覚的に
@@ -213,6 +216,26 @@
 		} catch {
 			return selected.detail;
 		}
+	});
+
+	// --- 監査の保留の警告（#437） ---------------------------------------
+	// DB に書けなかった監査は、データディレクトリの保留ファイルに退避され、
+	// DB が戻ると自動で監査ログに入る。溜まっている間・失った分があるときだけ
+	// 警告を出す。表示専用の補足なので、取得に失敗しても一覧は壊さない（失敗は「読めませんでした」と出す）。
+	let spoolWarning: string | null = $state(null);
+
+	async function loadSpoolWarning(): Promise<void> {
+		if (!available) return;
+		try {
+			spoolWarning = auditSpoolNotice({ kind: 'ok', status: await getAuditSpoolStatus() });
+		} catch {
+			// 読めなかったことを「保留 0 件」と区別して出す（一覧は壊さない）。
+			spoolWarning = auditSpoolNotice({ kind: 'failed' });
+		}
+	}
+
+	$effect(() => {
+		void loadSpoolWarning();
 	});
 
 	// --- 保持ポリシー（表示のみ・設定変更は「設定」画面で行う） -----------
@@ -245,6 +268,10 @@
 			{DEMO_MODE_MESSAGE}。単体ブラウザのデモモードには監査ログDBがないため、この機能はTauriアプリまたはLANアクセス（組み込みサーバー）でのみ利用できます。
 		</p>
 	{:else}
+		{#if spoolWarning}
+			<p class="error" role="alert" data-testid="audit-spool-warning">{spoolWarning}</p>
+		{/if}
+
 		{#if retentionNote}
 			<p class="note">{retentionNote}</p>
 		{/if}

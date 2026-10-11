@@ -284,6 +284,26 @@ export async function getAuditConfig(): Promise<AuditSettings> {
 	return httpRequest<AuditSettings>('/api/audit-log/config', { method: 'GET' });
 }
 
+/**
+ * #437: 監査の保留の状態（`GET /api/audit-log/spool` / Tauri の
+ * `audit_spool_status`、camelCase）。DB に書けなかった監査がデータ
+ * ディレクトリの保留ファイルに溜まっているときに件数が 0 でなくなる
+ * （`chronogazer_core::audit_spool`）。
+ */
+export interface AuditSpoolStatus {
+	pendingCount: number;
+	pendingOldestTs: string | null;
+	droppedCount: number;
+	failedCount: number;
+}
+
+/** 監査の保留の状態。`admin` 限定（監査ログ画面の警告帯が読む）。 */
+export async function getAuditSpoolStatus(): Promise<AuditSpoolStatus> {
+	if (!isAuditLogAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<AuditSpoolStatus>('audit_spool_status');
+	return httpRequest<AuditSpoolStatus>('/api/audit-log/spool', { method: 'GET' });
+}
+
 /** Persist a new retention policy. `admin`-only (rejected with a `forbidden` `ProviderError` otherwise). */
 export async function setAuditConfig(config: AuditSettings): Promise<AuditSettings> {
 	if (!isAuditLogAvailable()) throw demoModeError();
