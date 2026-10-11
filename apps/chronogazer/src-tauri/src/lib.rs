@@ -3987,26 +3987,40 @@ impl StartupErrorNotice {
     /// #392 A1: 同じ DB を別のプロセスが使用中のとき。DB には触れずに出す。
     fn already_running(failure: &chronogazer_core::instance_lock::InstanceLockFailure) -> Self {
         use chronogazer_core::instance_lock::InstanceLockFailure;
-        let (message, path) = match failure {
+        let (title, message, path, steps) = match failure {
             InstanceLockFailure::AlreadyRunning { db, .. } => (
-                "このデータベースは既に別の ChronoGazer（または banto-serve）が使用中です。                 同じデータベースを 2 つのプロセスで開くと時系列データが二重に書き込まれて                 壊れるため、起動を中止しました。"
+                "ChronoGazer は既に起動しています",
+                concat!(
+                    "このデータベースは既に別の ChronoGazer（または banto-serve）が使用中です。",
+                    "同じデータベースを 2 つのプロセスで開くと時系列データが二重に書き込まれて",
+                    "壊れるため、起動を中止しました。"
+                )
+                .to_string(),
+                chronogazer_core::instance_lock::display_path(db),
+                concat!(
+                    "先に起動している ChronoGazer（タスクトレイ・タスクバーを確認してください）",
+                    "または banto-serve を終了してから、もう一度起動してください。"
+                ),
+            ),
+            InstanceLockFailure::SymlinkDbPath { db } => (
+                "ChronoGazer を起動できません",
+                "DB ファイルのパスにシンボリックリンクは使えません。実体のパスを指定してください。"
                     .to_string(),
                 chronogazer_core::instance_lock::display_path(db),
+                "リンクではなく実体のファイルのパスを指定して、起動し直してください。",
             ),
             InstanceLockFailure::Io { db, source } => (
+                "ChronoGazer を起動できません",
                 format!("起動の排他を取得できませんでした: {source}"),
                 chronogazer_core::instance_lock::display_path(db),
+                "ディレクトリの権限や空き容量を確認して、起動し直してください。",
             ),
         };
         Self {
-            title: "ChronoGazer は既に起動しています".to_string(),
+            title: title.to_string(),
             message,
             path,
-            steps: concat!(
-                "先に起動している ChronoGazer（タスクトレイ・タスクバーを確認してください）",
-                "または banto-serve を終了してから、もう一度起動してください。"
-            )
-            .to_string(),
+            steps: steps.to_string(),
             closing: "このウィンドウを閉じると、この起動は終了します。".to_string(),
         }
     }

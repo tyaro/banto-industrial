@@ -29,8 +29,10 @@
 //! 二重書き込みを防げない。DB ごとに専用のフォルダか `data.dir` を割り当てること
 //! （収集開始時に `data.dir` へもロックを取るのは今後の課題）。
 //!
-//! 既にあるファイルは全体を正規化するので、シンボリックリンク経由の別名は同じ
-//! DB として扱う。ハードリンクの別名は検出しない（非対応）。
+//! **DB ファイルのパス自体がシンボリックリンクなら起動を断る**（壊れたリンク
+//! も含む。親ディレクトリのリンクは正規化して許す）。リンクを許すと、リンク先が
+//! まだ無い間と作成後、保留中のリストアが別名のリンクを置き換えた後で、ロックの
+//! 単位と実際に開く DB がずれるため。ハードリンクの別名は検出しない（非対応）。
 //!
 //! # 呼ぶ位置とガードの寿命
 //!
@@ -78,6 +80,9 @@ pub enum InstanceLockFailure {
         db: PathBuf,
         owner: Option<OwnerInfo>,
     },
+    /// DB ファイルのパス自体がシンボリックリンク（壊れたリンクを含む）。
+    /// 排他の単位（実体のパス）と最終的に開く DB がずれうるので、DB に触れる前に断る。
+    SymlinkDbPath { db: PathBuf },
     /// ロックの取得そのものに失敗した（ディレクトリが作れない等）。
     Io { db: PathBuf, source: std::io::Error },
 }
@@ -88,6 +93,11 @@ impl std::fmt::Display for InstanceLockFailure {
             InstanceLockFailure::AlreadyRunning { db, owner } => {
                 f.write_str(&already_running_message(db, owner))
             }
+            InstanceLockFailure::SymlinkDbPath { db } => write!(
+                f,
+                "DB ファイルのパスにシンボリックリンクは使えません。実体のパスを指定してください: {}",
+                display_path(db)
+            ),
             InstanceLockFailure::Io { db, source } => write!(
                 f,
                 "起動の排他を取得できませんでした（{}）: {source}",
@@ -101,7 +111,8 @@ impl std::error::Error for InstanceLockFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             InstanceLockFailure::Io { source, .. } => Some(source),
-            InstanceLockFailure::AlreadyRunning { .. } => None,
+            InstanceLockFailure::AlreadyRunning { .. }
+            | InstanceLockFailure::SymlinkDbPath { .. } => None,
         }
     }
 }
@@ -142,6 +153,20 @@ pub fn acquire_for_db(
     db_path: &Path,
     host: ChronoGazerHost,
 ) -> Result<InstanceGuard, InstanceLockFailure> {
+    // DB ファイル自体がシンボリックリンクなら断る（`symlink_metadata` なので壊れた
+    // リンクも見える）。許すと、(a) リンク先がまだ無い間は別名のパスで ID を作り、
+    // `init_db` が実体を作った後の起動は実体のパスで ID を作る、(b) 保留中のリストア
+    // が `rename` で別名のリンク自体を通常ファイルに置き換える、のどちらでも
+    // 「保持しているロック」と「最終的に開く DB」がずれて、2 プロセスが通り抜ける。
+    // 親ディレクトリのリンクは `path_scope_id` が正規化するので許す。
+    if std::fs::symlink_metadata(db_path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(InstanceLockFailure::SymlinkDbPath {
+            db: db_path.to_path_buf(),
+        });
+    }
     let (id, canonical) =
         banto_instance_lock::path_scope_id(db_path).map_err(|source| InstanceLockFailure::Io {
             db: db_path.to_path_buf(),
@@ -209,31 +234,89 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_alias_of_the_db_is_refused_and_creation_does_not_change_the_identity() {
+    fn creating_the_db_after_the_lock_does_not_change_the_identity() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("chronogazer.sqlite3");
         // 初回起動: ファイルがまだ無い状態で取る。
-        let first = acquire_for_db(&db, ChronoGazerHost::Desktop).expect("first ok");
+        let _first = acquire_for_db(&db, ChronoGazerHost::Desktop).expect("first ok");
         // 後から DB が作られても、同じ DB の 2 つ目は止まる（ID が食い違わない）。
         std::fs::write(&db, b"x").unwrap();
         assert!(matches!(
             acquire_for_db(&db, ChronoGazerHost::Serve),
             Err(InstanceLockFailure::AlreadyRunning { .. })
         ));
-        // シンボリックリンク経由の別名も止まる。
-        let alias = dir.path().join("alias.sqlite3");
+    }
+
+    fn symlink_file(target: &Path, link: &Path) -> bool {
         #[cfg(windows)]
-        let made = std::os::windows::fs::symlink_file(&db, &alias);
+        let made = std::os::windows::fs::symlink_file(target, link);
         #[cfg(not(windows))]
-        let made = std::os::unix::fs::symlink(&db, &alias);
+        let made = std::os::unix::fs::symlink(target, link);
         match made {
-            Ok(()) => assert!(matches!(
-                acquire_for_db(&alias, ChronoGazerHost::Serve),
-                Err(InstanceLockFailure::AlreadyRunning { .. })
-            )),
-            Err(err) => eprintln!("skip: シンボリックリンクを作れません（権限?）: {err}"),
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("skip: シンボリックリンクを作れません（権限?）: {err}");
+                false
+            }
         }
-        drop(first);
+    }
+
+    #[test]
+    fn a_dangling_symlink_db_path_is_rejected_before_anything_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sqlite3");
+        let alias = dir.path().join("alias.sqlite3");
+        if !symlink_file(&real, &alias) {
+            return;
+        }
+        assert!(matches!(
+            acquire_for_db(&alias, ChronoGazerHost::Desktop),
+            Err(InstanceLockFailure::SymlinkDbPath { .. })
+        ));
+        assert!(!real.exists(), "the DB must not be created");
+        assert!(!dir.path().join("real.sqlite3.instance.lock").exists());
+    }
+
+    #[test]
+    fn an_existing_symlink_db_path_is_rejected_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sqlite3");
+        std::fs::write(&real, b"x").unwrap();
+        let alias = dir.path().join("alias.sqlite3");
+        if !symlink_file(&real, &alias) {
+            return;
+        }
+        let err = acquire_for_db(&alias, ChronoGazerHost::Serve)
+            .err()
+            .expect("must be rejected");
+        assert!(matches!(err, InstanceLockFailure::SymlinkDbPath { .. }));
+        let text = err.to_string();
+        assert!(text.contains("シンボリックリンクは使えません"), "{text}");
+        assert!(text.contains("実体のパスを指定"), "{text}");
+        // 実体のパスなら通る。
+        let _ok = acquire_for_db(&real, ChronoGazerHost::Serve).expect("real path ok");
+    }
+
+    #[test]
+    fn a_symlinked_parent_directory_still_works_and_shares_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link_dir = dir.path().join("link");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&real_dir, &link_dir);
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&real_dir, &link_dir);
+        if let Err(err) = made {
+            eprintln!("skip: シンボリックリンクを作れません（権限?）: {err}");
+            return;
+        }
+        let _first = acquire_for_db(&real_dir.join("db.sqlite3"), ChronoGazerHost::Desktop)
+            .expect("via real dir ok");
+        assert!(matches!(
+            acquire_for_db(&link_dir.join("db.sqlite3"), ChronoGazerHost::Serve),
+            Err(InstanceLockFailure::AlreadyRunning { .. })
+        ));
     }
 
     #[test]
