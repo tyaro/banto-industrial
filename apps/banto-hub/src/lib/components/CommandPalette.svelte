@@ -12,7 +12,7 @@
 	 * マウントする（`{#if}`）ので、開くたびに新しいインスタンスになり、
 	 * コマンドの一覧と最近使った記録は開いた時点のものを読む。
 	 *
-	 * ## 層の約束（`escLayering.ts` の doc が正）との合わせ方
+	 * ## 層の約束（`@banto/ui` の `layering.ts` の doc が正）との合わせ方
 	 *
 	 * `@banto/ui` のパレットは #381 の約束 1〜5 を banto-hub から移したもので、
 	 * 層の印（`role="dialog"` / `role="menu"` / `data-esc-layer` /
@@ -27,7 +27,7 @@
 	 *   同じ z（1000）の `TreeContextMenu` とは同時に出さない
 	 *   （`(app)/+layout.svelte` の `Ctrl+K` の抑止）のは従来どおり。
 	 * - フォーカストラップ（約束 4）: Tab の循環 + document の `focusin` の
-	 *   引き戻しの 2 段構え（`focusTrap.ts` と同じ形）。
+	 *   引き戻しの 2 段構え（`@banto/ui` の `layering.ts`（`attachFocusTrap`） と同じ形）。
 	 * - フォーカスの戻し（約束 5）: 閉じたら開いた元へ、`tick()` の後に判定する
 	 *   （ナビ系コマンドの `goto()` → `afterNavigate` でサイドバーが畳まれ、
 	 *   戻し先が同じ流れの中で `inert` になるため）。戻し先が消えている /

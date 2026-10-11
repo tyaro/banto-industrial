@@ -70,7 +70,7 @@
 	 * と同じ流儀で `baseline`（Drawer/Modal を開いた時点のフォーム
 	 * スナップショット）を持ち、`isFormDirty(baseline, form)` を
 	 * `Drawer.svelte`/`Modal.svelte` の `dirty` prop へ渡す - `dirty` の間は
-	 * Esc・オーバーレイクリックでは閉じない（`drawerCloseGuard.ts`）。
+	 * Esc・オーバーレイクリックでは閉じない（`@banto/ui` の `isCloseAllowed`）。
 	 * `onRequestClose`（`×` 経由）も `!isBusy()` だけでなく `dirty` なら
 	 * `window.confirm` で確認するよう改めた（`confirmDiscardIfNeeded` と
 	 * 同じ文言・同じ順序）。3ステップの作成ウィザードでも `baseline` は
@@ -78,8 +78,7 @@
 	 * `dirty` になる。
 	 */
 	import { isProviderError } from '@banto/admin-core';
-	import Drawer from './Drawer.svelte';
-	import Modal from './Modal.svelte';
+	import { Drawer, Modal } from '@banto/ui';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
 	import { sessionStore } from '#lib/session.svelte.js';

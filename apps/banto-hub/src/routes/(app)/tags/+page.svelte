@@ -30,12 +30,15 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
 	import { pruneTreeFilter } from '#lib/banto/treeFilterPrune.js';
-	import { canRestoreFocusTo, restoreFocus } from '#lib/components/focusRestore.js';
-	import { focusablesIn } from '#lib/components/focusTrap.js';
-	import { hasVisibleLayerAbove } from '#lib/components/escLayering.js';
+	import {
+		canRestoreFocusTo,
+		Drawer,
+		focusablesIn,
+		hasVisibleLayerAbove,
+		Modal,
+		restoreFocus
+	} from '@banto/ui';
 	import { canWriteResources } from '#lib/permissions.js';
-	import Drawer from '#lib/components/Drawer.svelte';
-	import Modal from '#lib/components/Modal.svelte';
 	import SplitPane from '#lib/components/SplitPane.svelte';
 	import ConnectionTree from '#lib/components/ConnectionTree.svelte';
 	import TreeContextMenu from '#lib/components/TreeContextMenu.svelte';
@@ -2023,7 +2026,7 @@
 			// ことがないようにする（`SplitPane` 側も広幅遷移で `false` へ戻すが、
 			// その書き戻しに依存しない二重の担保）。
 			if (treeOpen && mobileNavStore.isNarrow) return;
-			// #381 レビュー対応10回目（層の約束・項目2、`escLayering.ts`）:
+			// #381 レビュー対応10回目（層の約束・項目2、`@banto/ui` の `layering.ts`）:
 			// **ページ側の window Esc ハンドラも上位層があれば譲る。** このトグルは
 			// 広幅の右ペイン（層としては本文と同じ最下層）に属するので、Drawer/
 			// Modal・コマンドパレット・コンテキストメニューが出ているあいだの Esc を
@@ -2978,7 +2981,7 @@
 	});
 
 	/**
-	 * #381 レビュー対応8回目（層の約束・項目6、`escLayering.ts`）: **下位の層を
+	 * #381 レビュー対応8回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: **下位の層を
 	 * 開くなら上位の層を先に畳む。** サイドバー（z-index 710）はモーダルでは
 	 * ないのでフォーカストラップで塞げず、開いたまま Tab でヘッダー経由この
 	 * トグルへ到達できる。そのままツリー（610）を開くと重なりが逆順になり、
@@ -3175,7 +3178,7 @@
 		// **`inert` の中に入っていることがある** - メニューを開いたまま広幅→狭幅へ
 		// 変わると、退避パネルが閉じた状態で現れてノードごと不活性になる。その
 		// ときはフォーカスを `<body>` へ落とさず、ツリーを開き直せるトグル
-		// ボタンへ送る（`focusRestore.ts`）。
+		// ボタンへ送る（`@banto/ui` の `layering.ts`）。
 		restoreFocus(trigger, () => treeToggleEl?.focus());
 	}
 
@@ -3214,14 +3217,14 @@
 	 * #381 レビュー対応7回目（8回目で「閉じる」→「開かせない」へ改めた）:
 	 * **接続 Drawer と収集グループ Drawer を同時に出さない。** どちらも
 	 * `Modal`/`Drawer`（z-index 900）で**同じ層**なので、2つ開くと Esc の層判定
-	 * （`escLayering.ts::hasVisibleLayerAbove`）が互いを「手前の層」と見なして
+	 * （`@banto/ui` の `layering.ts::hasVisibleLayerAbove`）が互いを「手前の層」と見なして
 	 * **どちらも閉じなくなる**（同じ z 順の2層は判定では区別できない - 同時に
 	 * 出さないのは呼び出し側の責務、と同 doc に明記した）。`Modal`/`Drawer` は
 	 * タブ移動を閉じ込めないため、キーボードでツリーツールバーのもう一方の
 	 * ボタンへ到達して両方開ける経路が実在する。
 	 *
 	 * **2026-09-16 追補（#381 レビュー8回目・根本対策）**: `Drawer`/`Modal` に
-	 * Tab の循環（フォーカストラップ、`focusTrap.ts`）を入れたので、**通常は
+	 * Tab の循環（フォーカストラップ、`@banto/ui` の `layering.ts`（`attachFocusTrap`））を入れたので、**通常は
 	 * この状況に到達できない**（オーバーレイの裏の起動ボタンへ Tab で届かない）。
 	 * このガードは**トラップをすり抜けた場合の保険**として残す - 到達経路は
 	 * 起動ボタンだけとは限らず（プログラム的な `click` ディスパッチ等）、

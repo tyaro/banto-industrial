@@ -508,7 +508,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 	});
 
 	test('10. コマンドパレットが開いている間の Esc はトグルを OFF にしない（#381 レビュー対応10回目）', async () => {
-		// Esc の「層の約束」（`$lib/components/escLayering.ts`）: 本文と同じ最下層に
+		// Esc の「層の約束」（`@banto/ui` の `layering.ts`）: 本文と同じ最下層に
 		// 属するこのトグルの window ハンドラは、上に層（コマンドパレット）が出て
 		// いるあいだ Esc を食べてはいけない。`defaultPrevented` だけでは足りない -
 		// window リスナーは登録順に走り、**先に ON にしたトグル側が後から開いた

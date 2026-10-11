@@ -15,7 +15,7 @@
 	 * 少ないうちはこれで十分。将来項目が増えても roving tabindex のまま
 	 * 破綻しない）。サブメニュー・アイコン等は持たない。
 	 */
-	import { hasVisibleLayerAbove } from './escLayering';
+	import { hasVisibleLayerAbove } from '@banto/ui';
 
 	interface ContextMenuItem {
 		id: string;
@@ -141,7 +141,7 @@
 	}
 
 	/**
-	 * #381 レビュー対応13回目（層の約束・項目3、`escLayering.ts`）: **window
+	 * #381 レビュー対応13回目（層の約束・項目3、`@banto/ui` の `layering.ts`）: **window
 	 * レベルでも Esc を処理する。** 下の `handleKeydown`（メニュー要素）だけだと、
 	 * フォーカスがメニューの外にあるときの Esc でメニューが閉じられず、一方で
 	 * 下の層は「可視な上位層がある」と見て全員譲るので **Esc が無反応**になる
@@ -152,7 +152,7 @@
 		if (event.key !== 'Escape' || event.defaultPrevented) return;
 		// #381 レビュー対応14回目: 自分（z-index 1000）より**上**の層があれば譲る
 		// （下の Drawer/Modal(900) は譲る相手ではない）。判定は z 順対応の
-		// `hasVisibleLayerAbove`（`escLayering.ts`）。
+		// `hasVisibleLayerAbove`（`@banto/ui` の `layering.ts`）。
 		if (hasVisibleLayerAbove({ except: menuEl })) return;
 		event.preventDefault();
 		onClose();

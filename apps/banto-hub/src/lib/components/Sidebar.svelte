@@ -31,7 +31,7 @@
 	const collapsed = $derived(!mobileNavStore.isNarrow && settings.sidebarCollapsed);
 
 	/**
-	 * #381 レビュー対応12回目（層の約束・項目6、`escLayering.ts`）: **退避した
+	 * #381 レビュー対応12回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: **退避した
 	 * 瞬間、中にフォーカスが残っていたらヘッダーの ☰ へ逃がす**（`SplitPane` の
 	 * `focusFallback` と同じ役割）。オフキャンバスは閉じると `inert` になるので、
 	 * 中の項目にフォーカスが残っていると `<body>` へ落ちる - 実際に踏むのは
@@ -43,7 +43,7 @@
 	 */
 	/**
 	 * #381 レビュー対応15回目: 開いているオフキャンバスを**層として名乗る**
-	 * （`escLayering.ts::LAYER_MARKER_ATTR` = `data-esc-layer`）。`dialog`/`menu` を
+	 * （`@banto/ui` の `layering.ts::LAYER_MARKER_ATTR` = `data-esc-layer`）。`dialog`/`menu` を
 	 * 名乗らない常設ナビなので、これが無いと下の層（退避ツリー 610）から
 	 * 「上に層がある」と見えず、Esc が下から閉じてしまう。z-index は属性ではなく
 	 * CSS の 710 を `effectiveZIndex` が読む。**属性名は定数と同じ文字列を
@@ -78,10 +78,10 @@
 </script>
 
 <!--
-	#381 レビュー対応12回目（層の約束・項目6、`escLayering.ts`）: 狭幅で閉じている
+	#381 レビュー対応12回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: 狭幅で閉じている
 	オフキャンバスは `inert`。`transform: translateX(-100%)` だけだと矩形も
 	`visibility` も残り、**画面外のナビ項目がフォーカスを受けられてしまう**
-	（`focusRestore.ts::canRestoreFocusTo` も「生きている」と判定する）。CSS 側でも
+	（`@banto/ui` の `layering.ts::canRestoreFocusTo` も「生きている」と判定する）。CSS 側でも
 	`visibility: hidden` を併用する（`SplitPane` の退避ペインと同じ形）。
 -->
 <aside
@@ -176,7 +176,7 @@
 		 * `visible` にする**（遷移させるのは閉じるときだけ）。`visibility` の
 		 * 補間は「p=0 は始点の値」なので、`hidden → visible` を 0.2s で遷移
 		 * させると**開いた直後、最初のアニメーションフレームが進むまで計算値が
-		 * `hidden` のまま**になる。そのあいだ `escLayering.ts::isActiveLayer` は
+		 * `hidden` のまま**になる。そのあいだ `@banto/ui` の `layering.ts::isActiveLayer` は
 		 * 開いたサイドバー（`data-esc-layer` 付き）を「層ではない」と判定し、
 		 * 退避ツリー内にフォーカスがある Esc がツリーを先に閉じていた
 		 * （CI の遅いランナーでだけ踏む。E2E テスト31のフレーク）。

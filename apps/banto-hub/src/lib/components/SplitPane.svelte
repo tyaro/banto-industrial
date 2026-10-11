@@ -22,9 +22,7 @@
 	 */
 	import type { Snippet } from 'svelte';
 	import { tick, untrack } from 'svelte';
-	import { hasVisibleLayerAbove } from './escLayering';
-	import { restoreFocus } from './focusRestore';
-	import { focusablesIn } from './focusTrap';
+	import { focusablesIn, hasVisibleLayerAbove, restoreFocus } from '@banto/ui';
 
 	interface Props {
 		/** 左ペイン幅（CSS の長さ文字列）。既定 280px。 */
@@ -183,7 +181,7 @@
 				triggerEl = null;
 				// 戻り先が消えている / `inert` の中にいることがある（この部品ごと
 				// アンマウントされる呼び出し方もある）ので `restoreFocus` 経由で
-				// 安全に戻す（`focusRestore.ts`）。代わりの行き先は持たない。
+				// 安全に戻す（`@banto/ui` の `layering.ts`）。代わりの行き先は持たない。
 				restoreFocus(previous);
 			}
 		});
@@ -222,7 +220,7 @@
 	 * 任せる。
 	 *
 	 * **層の約束（上位層があるあいだは反応しない・閉じるときは消費する）は
-	 * `escLayering.ts` の doc が正**。ここはそれを守る側で、`defaultPrevented` と
+	 * `@banto/ui` の `layering.ts` の doc が正**。ここはそれを守る側で、`defaultPrevented` と
 	 * {@link hasVisibleLayerAbove} の2つで上位層（Drawer/Modal・コマンド
 	 * パレット・コンテキストメニュー）へ譲る。
 	 *
@@ -235,7 +233,7 @@
 	 * 2. 念のため window にも張る（フォーカスが左ペイン外にある場合の保険）。
 	 *    1 で処理済みのイベントは `defaultPrevented` で弾く。判定は
 	 *    {@link hasVisibleLayerAbove} **だけ**にする（#381 レビュー対応15回目）:
-	 *    以前は `event.target.closest(LAYER_ABOVE_SELECTOR)` を「同じ結論に早く
+	 *    以前は `event.target.closest(LAYER_SELECTOR)` を「同じ結論に早く
 	 *    達する近道」として併用していたが、**閉じ遷移中（非活性）の層の中から来た
 	 *    Esc まで捨ててしまい**、結論が変わっていた（近道の方は
 	 *    `data-layer-inactive` を見ない）。
@@ -372,7 +370,7 @@
 	 * 0.2s で遷移させると、開いた直後・最初のアニメーションフレームが進む
 	 * までのあいだ計算値が `hidden` のままになる。
 	 *
-	 * このペインは `escLayering.ts` の層判定の対象ではないので #399 と同じ
+	 * このペインは `@banto/ui` の `layering.ts` の層判定の対象ではないので #399 と同じ
 	 * Esc の誤動作は起きないが、開いた直後にこのペイン内へフォーカスを移す
 	 * `focusFirstInLeftPane()`（上の `$effect`）が、`visibility: hidden` の
 	 * ままの要素に対して `focus()` を呼ぶ余地がある（`hidden` な要素は

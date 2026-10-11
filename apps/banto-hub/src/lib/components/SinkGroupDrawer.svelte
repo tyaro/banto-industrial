@@ -31,7 +31,7 @@
 	 * 存在しない（このコンポーネントに `readOnly` prop は無い）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
-	import Drawer from './Drawer.svelte';
+	import { Drawer } from '@banto/ui';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { isFormDirty } from '#lib/banto/formDirty.js';
 	import {

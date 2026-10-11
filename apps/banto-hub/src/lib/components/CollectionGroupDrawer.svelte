@@ -65,8 +65,7 @@
 	 * （既定 `undefined`）ならページの旧来どおり未選択のまま出す。
 	 */
 	import { isProviderError } from '@banto/admin-core';
-	import Drawer from './Drawer.svelte';
-	import Modal from './Modal.svelte';
+	import { Drawer, Modal } from '@banto/ui';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
 	import { sessionStore } from '#lib/session.svelte.js';

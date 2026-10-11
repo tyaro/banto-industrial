@@ -335,7 +335,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 	test('9. ツリー・サイドバー・コマンドパレットが重なっても、Esc は手前から1層ずつ畳む（#381 レビュー対応4回目）', async () => {
 		// 3層を下から順に開く（退避ツリー 610 → サイドバー 710 →
-		// コマンドパレット 1000。`escLayering.ts` の層の表）。パレットは
+		// コマンドパレット 1000。`@banto/ui` の `layering.ts` の層の表）。パレットは
 		// `Ctrl+K` で開く - サイドバーのバックドロップがヘッダーの 🔍 を覆うため、
 		// この状態でパレットを開く経路はキーボードになる。
 		await treeToggle.click();
@@ -463,7 +463,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 	test('14. 接続 Drawer が開いている間はグループ Drawer を開かない（未保存入力を捨てない、#381 レビュー対応8回目）', async () => {
 		// 同じ層（z-index 900）を2つ開くと、Esc の層判定が互いを「手前の層」と
-		// 見なしてどちらも閉じなくなる（`escLayering.ts` の doc）。同時に出さない
+		// 見なしてどちらも閉じなくなる（`@banto/ui` の `layering.ts` の doc）。同時に出さない
 		// のは呼び出し側の責務だが、**相手を閉じる**側に倒すと相手の未保存入力を
 		// 黙って捨てる（#376 で塞いだ事故と同じ）ので、**こちらを開かせない**。
 		await treeToggle.click();
@@ -588,7 +588,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 	});
 
 	test('18. Drawer を閉じるとフォーカスは開いた元（グリッドの行）へ戻る（#381 レビュー対応10回目）', async () => {
-		// 層の約束・項目5（`escLayering.ts`）。`<body>` に落とすと、そこからの Tab は
+		// 層の約束・項目5（`@banto/ui` の `layering.ts`）。`<body>` に落とすと、そこからの Tab は
 		// どのパネルの keydown も通らないので残りの層のトラップをすり抜ける。
 		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_A);
 		await page.getByRole('gridcell', { name: TAG_A, exact: true }).click();
@@ -783,7 +783,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 	test('27. 退避したサイドバーの中にフォーカスを残さない（#381 レビュー対応12回目）', async () => {
 		// 狭幅のサイドバーは `translateX(-100%)` で退避するだけだったので、閉じた
 		// あとも中のナビ項目がフォーカスを受けられた（`inert` + `visibility: hidden`
-		// で「無い」ことを明示した - `escLayering.ts` の層の約束・項目6）。あわせて
+		// で「無い」ことを明示した - `@banto/ui` の `layering.ts` の層の約束・項目6）。あわせて
 		// **畳む瞬間に中にフォーカスがあればヘッダーの ☰ へ逃がす**（`SplitPane` の
 		// `focusFallback` と同じ役割。`inert` が付いた後ではブラウザが先に
 		// フォーカスを外してしまうので、判定は DOM 更新の前に行っている）。
@@ -848,7 +848,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 	test('29. メニューが出ているあいだ Ctrl+K はパレットを開かない（#381 レビュー対応14回目）', async () => {
 		// パレットとメニューは同じ z（1000）なので z 順では解けない - 同時に
-		// 出さないのは呼び出し側の責務（`escLayering.ts`）。
+		// 出さないのは呼び出し側の責務（`@banto/ui` の `layering.ts`）。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 		await groupNodeByName(page, GROUP_B).click({ button: 'right' });
@@ -924,7 +924,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 	test('31b. サイドバーを開いた直後（最初のフレームより前）の Esc でも、サイドバーが先に閉じる（#399）', async () => {
 		// テスト31 が CI でだけ落ちていた原因（#399）。サイドバーの `visibility` を
 		// 開くときも 0.2s で遷移させていたため、**開いてから最初のアニメーション
-		// フレームが進むまで計算値が `hidden`** のままで、`escLayering.ts` の
+		// フレームが進むまで計算値が `hidden`** のままで、`@banto/ui` の `layering.ts` の
 		// `isActiveLayer` が開いたサイドバーを「層ではない」と判定していた。
 		// 遅い CI ランナーでは ☰ のクリックから Esc までにフレームが進まないこと
 		// があり、ペイン内の Esc がツリーを先に閉じた（失敗時の画面は「サイドバー
@@ -973,7 +973,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 	test('31c. 開いた直後（同じタスク内）にペインへ移すフォーカスが、visibility: hidden の間に空振りしない（#421）', async () => {
 		// #399/#420 は Sidebar の Esc 誤動作だったが、SplitPane の退避ペインは
-		// escLayering.ts の層判定の対象ではないので同じ誤動作は起きない。
+		// @banto/ui の layering.ts の層判定の対象ではないので同じ誤動作は起きない。
 		// ただし SplitPane.svelte の開閉 `$effect` は、開いた直後に
 		// `focusFirstInLeftPane()` でペイン内の最初の要素へ `.focus()` を呼ぶ。
 		// この `$effect` は Svelte のマイクロタスクで実行され、CSS の
@@ -1165,11 +1165,15 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		try {
 			const closeButton = editDrawer.getByRole('button', { name: '閉じる' });
 			await closeButton.click();
-			// outro 中（まだ DOM に居る）にもう一度押す。**座標クリックではなく
+			// outro 中にもう一度押す。@banto/ui の閉じ遷移中のパネルは `inert`
+			// （アクセシビリティツリーから外れる）なので、× の role ロケーターが
+			// 解決せず、2 回目の click は通常は届かない。**座標クリックではなく
 			// 要素へ直接 click イベントを送る**: 消えかけのパネルへ `force` の座標
 			// クリックを撃つと、下にあるヘッダーのボタン（ログアウト等）を叩いて
-			// しまう（実測）。既に外れていれば例外になるので無視してよい。
-			await closeButton.dispatchEvent('click', { timeout: 2000 }).catch(() => {});
+			// しまう（実測）。`dispatchEvent` の第 2 引数は eventInit なので、
+			// タイムアウトは第 3 引数。届かなければ例外になるので無視してよい
+			// （確認が 1 回だけ出ることは下の `dialogCount` で確かめる）。
+			await closeButton.dispatchEvent('click', undefined, { timeout: 2000 }).catch(() => {});
 			await expect(editDrawer).toHaveCount(0);
 			expect(dialogCount).toBe(1);
 		} finally {

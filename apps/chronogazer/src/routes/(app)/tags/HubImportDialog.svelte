@@ -16,13 +16,13 @@
 	 * - 名前の衝突などは**その行**に出す（黙って改名しない）。1 行でもエラーが
 	 *   あれば何も登録されない（サーバーが全部か無し）。
 	 *
-	 * 層の約束: 中央モーダル（`#lib/components/Modal.svelte`。banto-hub の写し）
+	 * 層の約束: 中央モーダル（`@banto/ui` の `Modal`）
 	 * なので、Esc・オーバーレイ・× の 3 経路が同じ閉じる処理を通り、フォーカスは
 	 * 中に閉じ込め、閉じたら開いた元へ戻る。未保存（チェックを変えた・新しい
 	 * グループの名前を入れた）の間は Esc とオーバーレイでは閉じず、× は確認を
 	 * 出す。画面の移動も `guardUnsavedChanges` で確認する。
 	 */
-	import Modal from '#lib/components/Modal.svelte';
+	import { Modal } from '@banto/ui';
 	import { guardUnsavedChanges, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { UnsavedChangesNotice } from '@banto/forms';
 	import { isProviderError } from '@banto/admin-core';

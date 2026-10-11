@@ -283,7 +283,7 @@ test.describe.serial('banto-hub DB Sink: sink group の作成・編集・状態�
 		// `Drawer.svelte` は閉じたときに「開いた元」へフォーカスを戻すが、削除では
 		// その行（「編集」ボタン）ごと消える。呼び出し側が `focusFallback`
 		// （ここではツールバーの「新規作成」ボタン）を渡していないと `<body>` へ
-		// 落ちる（層の約束・項目5、`$lib/components/escLayering.ts`）。
+		// 落ちる（層の約束・項目5、`@banto/ui` の `layering.ts`）。
 		const pgListRes = await adminPage.request.get('/api/plc-connections', {
 			headers: adminHeaders
 		});
