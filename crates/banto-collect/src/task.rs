@@ -107,6 +107,22 @@
 //!   file a query covering its time could miss, so it is dropped (not retried) and
 //!   reported through this same failure path; the next tick's `ptime_ms`
 //!   comes from the jumped clock and is written normally.
+//!
+//! ## External connections (#383 段階3 P3)
+//!
+//! A `"hub"` connection has no socket: [`run_external_connection`] runs the
+//! **same** scheduler (per-group phase-aligned deadlines, skip on a missed
+//! period), the same clock-regression and append-failure trackers, and the
+//! same row/cache/threshold step (`record_ticks`) as [`run_connection`] -
+//! only the source of a tick's values differs. On every tick-wake it takes
+//! one [`crate::external::ExternalSource::snapshot`] (synchronous and
+//! lock-light, never the network), turns the link state into
+//! `plc_connected` / `plc_disconnected` / `plc_reconnected` edges
+//! ([`crate::external::LinkTracker`], the #344 rule) and the per-tag
+//! readings into cache + row values ([`crate::external::classify_external`]).
+//! A Live + good value is recorded on **every** tick however long the Hub has
+//! been silent about it (on-change subscription, H4). See `crate::external`'s
+//! module doc for the mapping table.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -124,6 +140,9 @@ use tokio::time::Instant;
 use crate::config::{ConnectionPlan, GroupPlan, ProtocolConfig};
 use crate::current::{CurrentValuesHandle, Quality};
 use crate::event::{CollectEvent, EventKind, EventSink, ThresholdLevel};
+use crate::external::{
+    classify_external, ExternalLink, ExternalSnapshot, ExternalSource, LinkEdge, LinkTracker,
+};
 
 /// Reconnect backoff bounds (recorder-requirements.md §3.1: "失敗時バックオフ
 /// 1s→2s→...上限30s、成功でリセット"). Parameterized so tests can shrink the
@@ -328,6 +347,11 @@ fn client_spec(plan: &ConnectionPlan) -> ClientSpec {
             response_timeout: cfg.response_timeout,
             word_order: cfg.word_order,
         },
+        // `crate::collector` spawns `run_external_connection` for these, never
+        // `run_connection` (the only caller of this function).
+        ProtocolConfig::External => {
+            unreachable!("an external connection has no client to build")
+        }
     }
 }
 
@@ -665,28 +689,7 @@ pub(crate) async fn run_connection(
                 // regardless of connection state - a clock regression is a
                 // fact about the collection PC, not about PLC connectivity.
                 if let Some(transition) = clock_tracker.observe(ptime_ms) {
-                    let (kind, detail) = match transition {
-                        ClockTransition::Entered { high_water_ms, .. } => (
-                            EventKind::ClockRegressionEntered,
-                            format!(
-                                "収集PCの時計が逆行しました: {high_water_ms}ms → {ptime_ms}ms \
-                                 (Δ{}ms)",
-                                ptime_ms - high_water_ms
-                            ),
-                        ),
-                        ClockTransition::Recovered { .. } => (
-                            EventKind::ClockRegressionCleared,
-                            format!("収集PCの時計逆行から復旧しました: {ptime_ms}ms"),
-                        ),
-                    };
-                    ctx.events
-                        .emit(CollectEvent::connection(
-                            ptime_ms,
-                            kind,
-                            conn_key.clone(),
-                            Some(detail),
-                        ))
-                        .await;
+                    emit_clock_transition(&ctx, &conn_key, ptime_ms, transition).await;
                 }
 
                 for i in 0..group_count {
@@ -806,6 +809,17 @@ pub(crate) async fn run_connection(
     set_status(&ctx, &conn_key, ConnectionStatus::Stopped);
 }
 
+/// One tag on one tick, ready to be cached and recorded: what the
+/// current-value cache shows (`shown`, with `quality`) and what the data
+/// file's column gets (`recorded`). For a PLC tag the two values are the
+/// same; an external tag can be shown but not recorded (`crate::external`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TagTick {
+    shown: Option<f64>,
+    quality: Quality,
+    recorded: Option<f64>,
+}
+
 /// Turn one group's read outcome into a stored row, cache updates, and
 /// threshold edge events. `results = None` means "no reading this tick"
 /// (disconnected or fatal): every tag becomes `None`/Bad. Threshold state is
@@ -820,31 +834,109 @@ async fn record_group(
     threshold_state: &mut [Option<ThresholdLevel>],
     append_health: &mut AppendHealth,
 ) {
+    let ticks: Vec<TagTick> = group
+        .tags
+        .iter()
+        .enumerate()
+        .map(|(idx, tag)| {
+            let (value, quality) = match results.map(|r| &r[idx]) {
+                Some(ReadResult::Value(TagValue::Bit(b))) => {
+                    (Some(if *b { 1.0 } else { 0.0 }), Quality::Good)
+                }
+                Some(ReadResult::Value(TagValue::F64(raw))) => {
+                    let scaled = match &tag.scaling {
+                        Some(s) => scale_raw(*raw, s),
+                        None => *raw,
+                    };
+                    (Some(scaled), Quality::Good)
+                }
+                // Per-tag Bad within an otherwise-good batch, or the whole
+                // tick absent (results = None).
+                Some(ReadResult::Bad(_)) | None => (None, Quality::Bad),
+            };
+            TagTick {
+                shown: value,
+                quality,
+                recorded: value,
+            }
+        })
+        .collect();
+    record_ticks(
+        group,
+        &ticks,
+        ptime_ms,
+        ctx,
+        conn_key,
+        threshold_state,
+        append_health,
+    )
+    .await;
+}
+
+/// #383 段階3 P3: an external group's tick - each tag's reading from the
+/// wake's one `snapshot`, mapped by [`classify_external`] (the
+/// `crate::external` table), then the same [`record_ticks`] a PLC group uses.
+async fn record_external_group(
+    group: &GroupPlan,
+    snapshot: &ExternalSnapshot,
+    ptime_ms: i64,
+    ctx: &TaskContext,
+    conn_key: &str,
+    threshold_state: &mut [Option<ThresholdLevel>],
+    append_health: &mut AppendHealth,
+) {
+    let ticks: Vec<TagTick> = group
+        .external_names
+        .iter()
+        .map(|name| {
+            let outcome = classify_external(snapshot.reading(name));
+            TagTick {
+                shown: outcome.shown,
+                quality: outcome.quality,
+                recorded: outcome.recorded,
+            }
+        })
+        .collect();
+    record_ticks(
+        group,
+        &ticks,
+        ptime_ms,
+        ctx,
+        conn_key,
+        threshold_state,
+        append_health,
+    )
+    .await;
+}
+
+/// The step every tick of every group ends in (PLC or external): cache each
+/// tag, raise threshold edges on Good values, and append one row of the
+/// `recorded` values. `ticks` is aligned with `group.tags`.
+async fn record_ticks(
+    group: &GroupPlan,
+    ticks: &[TagTick],
+    ptime_ms: i64,
+    ctx: &TaskContext,
+    conn_key: &str,
+    threshold_state: &mut [Option<ThresholdLevel>],
+    append_health: &mut AppendHealth,
+) {
     let mut values: Vec<Option<f64>> = Vec::with_capacity(group.tags.len());
 
-    for (idx, tag) in group.tags.iter().enumerate() {
-        let (value, quality) = match results.map(|r| &r[idx]) {
-            Some(ReadResult::Value(TagValue::Bit(b))) => {
-                (Some(if *b { 1.0 } else { 0.0 }), Quality::Good)
-            }
-            Some(ReadResult::Value(TagValue::F64(raw))) => {
-                let scaled = match &tag.scaling {
-                    Some(s) => scale_raw(*raw, s),
-                    None => *raw,
-                };
-                (Some(scaled), Quality::Good)
-            }
-            // Per-tag Bad within an otherwise-good batch, or the whole tick
-            // absent (results = None).
-            Some(ReadResult::Bad(_)) | None => (None, Quality::Bad),
-        };
+    for (idx, (tag, tick)) in group.tags.iter().zip(ticks).enumerate() {
+        values.push(tick.recorded);
+        ctx.current.set(
+            &tag.key,
+            tick.shown,
+            ptime_ms,
+            tick.quality,
+            group.period_ms,
+        );
 
-        values.push(value);
-        ctx.current
-            .set(&tag.key, value, ptime_ms, quality, group.period_ms);
-
-        if !tag.thresholds.is_empty() {
-            if let Some(v) = value {
+        // Judged on a Good value only - a Stale (external) value is not a new
+        // reading, and a Bad one has none.
+        if !tag.thresholds.is_empty() && tick.quality == Quality::Good {
+            if let Some(v) = tick.shown {
                 let new_level = classify_threshold(v, tag);
                 let prev = threshold_state[idx];
                 if prev != new_level {
@@ -884,7 +976,8 @@ async fn record_group(
     // drive threshold/event processing above, but they are not a record of
     // the physical PLC and must never be appended to the real tstore. Keep
     // append-health untouched so suppression cannot create a false failure or
-    // recovery edge.
+    // recovery edge. (An external connection is never `simulation`; its
+    // simulated values are suppressed per tag through `recorded` instead.)
     if ctx.simulation {
         return;
     }
@@ -956,6 +1049,153 @@ async fn record_group(
         }
         None => {}
     }
+}
+
+/// #383 段階3 P3: run one external (`"hub"`) connection until `stop_rx` flips
+/// to `true` - see this module's doc ("External connections"). Same
+/// scheduler, trackers and row step as [`run_connection`]; the values come
+/// from `source` instead of a socket, so there is no connect / backoff state
+/// at all (reconnecting the subscription is the source's job).
+pub(crate) async fn run_external_connection(
+    plan: ConnectionPlan,
+    ctx: TaskContext,
+    source: Arc<dyn ExternalSource>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let conn_key = plan.key.clone();
+    let group_count = plan.groups.len();
+    let start = Instant::now();
+    let mut next_fire: Vec<Instant> = vec![start; group_count];
+    let mut threshold_state: Vec<Vec<Option<ThresholdLevel>>> = plan
+        .groups
+        .iter()
+        .map(|g| vec![None; g.tags.len()])
+        .collect();
+    let mut clock_tracker = ClockRegressionTracker::default();
+    let mut append_health: Vec<AppendHealth> = vec![AppendHealth::default(); group_count];
+    let mut link = LinkTracker::default();
+    set_status(
+        &ctx,
+        &conn_key,
+        ConnectionStatus::Reconnecting { attempt: 1 },
+    );
+
+    loop {
+        let soonest = next_fire
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or_else(|| start + Duration::from_secs(3600));
+
+        tokio::select! {
+            biased;
+
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    break;
+                }
+            }
+
+            _ = tokio::time::sleep_until(soonest) => {
+                let now = Instant::now();
+                let ptime_ms = ctx.clock.now_ms();
+
+                if let Some(transition) = clock_tracker.observe(ptime_ms) {
+                    emit_clock_transition(&ctx, &conn_key, ptime_ms, transition).await;
+                }
+
+                // One snapshot per wake: every group firing now sees the same
+                // link state and values (`crate::external`'s module doc).
+                let snapshot = source.snapshot();
+                let live = snapshot.is_live();
+                set_status(
+                    &ctx,
+                    &conn_key,
+                    if live {
+                        ConnectionStatus::Connected
+                    } else {
+                        // The subscription reconnects itself; there is no
+                        // attempt counter to report, so this stays at 1.
+                        ConnectionStatus::Reconnecting { attempt: 1 }
+                    },
+                );
+                if let Some(edge) = link.observe(live) {
+                    let (kind, detail) = match edge {
+                        LinkEdge::Connected => (EventKind::PlcConnected, None),
+                        LinkEdge::Reconnected => (EventKind::PlcReconnected, None),
+                        LinkEdge::Disconnected => (
+                            EventKind::PlcDisconnected,
+                            match &snapshot.link {
+                                ExternalLink::Down { detail } => detail.clone(),
+                                ExternalLink::Live => None,
+                            },
+                        ),
+                    };
+                    ctx.events
+                        .emit(CollectEvent::connection(
+                            ptime_ms,
+                            kind,
+                            conn_key.clone(),
+                            detail,
+                        ))
+                        .await;
+                }
+
+                for i in 0..group_count {
+                    if next_fire[i] > now {
+                        continue;
+                    }
+                    while next_fire[i] <= now {
+                        next_fire[i] += plan.groups[i].period;
+                    }
+                    record_external_group(
+                        &plan.groups[i],
+                        &snapshot,
+                        ptime_ms,
+                        &ctx,
+                        &conn_key,
+                        &mut threshold_state[i],
+                        &mut append_health[i],
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    set_status(&ctx, &conn_key, ConnectionStatus::Stopped);
+}
+
+/// Emit the clock-regression edge [`ClockRegressionTracker::observe`]
+/// reported (shared by [`run_connection`] and [`run_external_connection`]).
+async fn emit_clock_transition(
+    ctx: &TaskContext,
+    conn_key: &str,
+    ptime_ms: i64,
+    transition: ClockTransition,
+) {
+    let (kind, detail) = match transition {
+        ClockTransition::Entered { high_water_ms, .. } => (
+            EventKind::ClockRegressionEntered,
+            format!(
+                "収集PCの時計が逆行しました: {high_water_ms}ms → {ptime_ms}ms \
+                 (Δ{}ms)",
+                ptime_ms - high_water_ms
+            ),
+        ),
+        ClockTransition::Recovered { .. } => (
+            EventKind::ClockRegressionCleared,
+            format!("収集PCの時計逆行から復旧しました: {ptime_ms}ms"),
+        ),
+    };
+    ctx.events
+        .emit(CollectEvent::connection(
+            ptime_ms,
+            kind,
+            conn_key.to_string(),
+            Some(detail),
+        ))
+        .await;
 }
 
 /// Classify a scaled value against a tag's H/HH/L/LL limits. High bands take
@@ -1272,6 +1512,7 @@ mod tests {
             period: Duration::from_millis(100),
             period_ms: 100,
             requests: vec![],
+            external_names: vec![],
             tags: vec![tag_with(Thresholds {
                 hh: Some(100.0),
                 h: Some(80.0),
@@ -1411,6 +1652,7 @@ mod tests {
             period: Duration::from_millis(100),
             period_ms: 100,
             requests: vec![],
+            external_names: vec![],
             tags: vec![crate::config::TagPlan {
                 key: "tag:1".to_string(),
                 scaling: None,
@@ -1598,6 +1840,7 @@ mod tests {
             period: Duration::from_millis(100),
             period_ms: 100,
             requests: vec![],
+            external_names: vec![],
             tags: vec![crate::config::TagPlan {
                 key: "t1".to_string(),
                 scaling: None,

@@ -55,6 +55,39 @@
 //!   存在しないは再試行しない - キーの入れ直し（`connect` /
 //!   `adopt_manual_key`）を待つ（[`retry_pace`]）。
 //!
+//! # 収集への供給（#383 段階3 P3、2026-10-10 オーナー決定 H2〜H4）
+//!
+//! Hub 経由のタグ（`plc_connections.protocol = hub` の接続の下のタグ）は
+//! `banto-collect` が PLC のタグと同じ tstore・同じ書き手・同じイベントで
+//! 収集する。ここはそのための**値の出口**だけを持つ:
+//!
+//! * **購読するタグ集合 = 画面の選択（`hub.record.selected_tags`）∪ 収集の
+//!   需要**（[`Subscription::collect_demand`]）。需要は収集の開始のたびに
+//!   レジストリから作り直す（[`HubService::prepare_collect`]、有効な hub
+//!   接続 → 有効なグループ → 有効なタグの `address` = 外部名。H3 の同一性）。
+//!   **設定 KV には書かない**（実行時の事実で、正はレジストリ）。選択タグは
+//!   設定画面での手動の購読のために残す（後方互換。P4 で「Hub から登録」が
+//!   入ったら役割を見直す）。和集合なので、選択と需要の片方だけが変わっても
+//!   もう片方の購読は止まらない。
+//! * **収集が読むのは `watch` の写しだけ**（[`HubFeed`] / [`HubSampler`]）。
+//!   世代を張ったときに `TagClientHandle::state_watch()` を差し込み、止めた
+//!   ときに外す。収集の周期は `std::sync::RwLock` の読み取り 1 回 +
+//!   `watch::borrow` 1 回で、**購読ロック（非同期）も操作ロックも取らない**
+//!   ので、Hub への往復中の操作に収集の周期を待たせない。ロック順序は
+//!   操作 → 購読 → [`HubFeed`]（葉）で、葉から上へは取りに行かない。
+//! * **需要の変化を取りこぼさない**: 需要を変えたら
+//!   [`Subscription::demand_pending`] を立て、突き合わせ
+//!   （[`HubService::reconcile_generation`]）が今の需要で判断した時点で降ろす
+//!   （世代を持てない分岐でも降ろす - その後の再試行は通常の見張りの規則が
+//!   決め、張るときは必ずその時点の需要で計画する）。見張りは立っている間
+//!   だけ追加で張り直しに行く（立っていなければ叩かない）。
+//!   収集の開始は待てるだけ待つが（[`HUB_COLLECT_PREPARE_TIMEOUT`]）、
+//!   打ち切っても需要と旗は残るので、見張りが後から反映する。打ち切った側の
+//!   処理は止めずに走り切らせる（`tokio::time::timeout` で途中を落とさない -
+//!   突き合わせの途中で落とすと世代の後始末が半端になる）。走り切った処理は
+//!   **その時点の**需要で計画するので、後から来た停止（需要の取り下げ）を
+//!   巻き戻さない。
+//!
 //! # 同期 trait と非同期設定ストアの橋渡し
 //!
 //! [`BootstrapState`] は意図的に同期 trait（crate 側の設計、`KeyStore` が
@@ -70,6 +103,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use banto_collect::{
+    ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource, ExternalValueSource,
+    HubCatalog,
+};
 use banto_core::BantoError;
 use banto_hub_bootstrap::{
     error::{Error as BootstrapError, ErrorKind as BootstrapErrorKind},
@@ -78,7 +115,8 @@ use banto_hub_bootstrap::{
 };
 use banto_tagclient::{
     BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind as TagErrorKind,
-    TagClientConnectionState, TagClientHandle, TagClientState, ValuesSnapshot,
+    TagClientConnectionState, TagClientHandle, TagClientState, ValueQuality, ValueSource,
+    ValuesSnapshot,
 };
 use serde::Serialize;
 use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -531,12 +569,27 @@ type Fingerprint = (String, Vec<String>);
 /// catalog を読めない場面で判断したい。
 type SubscriptionIdentity = (String, Vec<String>);
 
-fn subscription_identity(record: Option<&HubRecord>) -> Option<SubscriptionIdentity> {
+fn subscription_identity(
+    record: Option<&HubRecord>,
+    collect_demand: &[String],
+) -> Option<SubscriptionIdentity> {
     let record = record?;
-    let mut tags = record.selected_tags.clone();
+    let mut tags = wanted_tags(record, collect_demand);
     tags.sort();
     tags.dedup();
     Some((fingerprint_endpoint(&record.endpoint), tags))
+}
+
+/// 購読するタグ集合（#383 段階3 P3）: 画面の選択の後ろに収集の需要を並べた
+/// もの。重複は [`plan_bindings`] が畳むのでここでは残してよい（選択の並びは
+/// 変えない - 画面の一覧の順をそのまま保つ）。
+fn wanted_tags(record: &HubRecord, collect_demand: &[String]) -> Vec<String> {
+    record
+        .selected_tags
+        .iter()
+        .chain(collect_demand)
+        .cloned()
+        .collect()
 }
 
 /// 覚えている「最後に値を受けた時刻」を、これからの購読でも出してよいか。
@@ -1021,6 +1074,18 @@ struct Subscription {
     credential_rejection: Option<RememberedRejection>,
     /// [`RetryPace::Slowly`] の待ち周期のカウンタ（[`takes_this_tick`]）。
     slow_retry_ticks: u32,
+    /// 収集が要る外部名（#383 段階3 P3、[`HubService::prepare_collect`]）。
+    /// 選択タグと合わせて購読する（[`wanted_tags`]）。収集が止まると空に戻す
+    /// （[`HubService::release_collect`]）。
+    collect_demand: Vec<String>,
+    /// 需要が変わったのに、まだ突き合わせ（[`HubService::reconcile_generation`]）
+    /// が今の需要で判断していない。見張りはこれが立っている間だけ追加で
+    /// 張り直しに行く（モジュール doc「需要の変化を取りこぼさない」）。
+    demand_pending: bool,
+    /// 収集が読む現世代の `watch`（[`HubFeed`]）。世代と**同じ場所**で
+    /// 差し込み・外す（[`Self::stop`] / [`HubService::reconcile_generation`]）
+    /// ので、世代と食い違わない。
+    feed: HubFeed,
 }
 
 /// 起動直後（まだ一度も突き合わせていない）も「理由付きの停止」で表現する。
@@ -1037,6 +1102,9 @@ impl Default for Subscription {
             last_value_from: None,
             credential_rejection: None,
             slow_retry_ticks: 0,
+            collect_demand: Vec::new(),
+            demand_pending: false,
+            feed: HubFeed::default(),
         }
     }
 }
@@ -1049,6 +1117,9 @@ impl Subscription {
     /// 止まっていたなら、その理由を落とさない（#446）。
     async fn stop(&mut self, reason: Option<String>) {
         self.observe();
+        // 収集から先に外す: 止める世代の `watch` を、止めた後まで Live と
+        // 読ませない。
+        self.feed.publish(None);
         if let Some(generation) = self.generation.take() {
             let (sequence, started_at) = (generation.sequence, generation.started_at);
             if let Err(err) = generation.handle.shutdown().await {
@@ -1145,6 +1216,126 @@ impl Subscription {
         })
     }
 }
+
+/// 収集が読む現世代の `watch`（#383 段階3 P3、モジュール doc「収集への供給」）。
+///
+/// **葉のロック**: 書くのは購読ロックを持った側（世代を張る・止める）だけで、
+/// 読むのは収集の周期（[`HubSampler::snapshot`]）。読み手は非同期のロックを
+/// 一切取らないので、Hub への往復中も収集の周期は待たされない。
+#[derive(Clone, Default)]
+struct HubFeed(Arc<std::sync::RwLock<Option<watch::Receiver<TagClientState>>>>);
+
+impl HubFeed {
+    fn publish(&self, states: Option<watch::Receiver<TagClientState>>) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = states;
+    }
+}
+
+/// [`ExternalSource`] の実装（#383 段階3 P3）。[`HubService::collect_source`]
+/// が返し、`banto-collect` の Hub 接続のタスクが周期ごとに呼ぶ。
+///
+/// 返すのは**今の世代が保持している最新値**（sample and hold）。購読は
+/// on-change なので、変わらない値は再送されないが、`current()` には残り
+/// 続ける - それを周期ごとにそのまま渡す（H4: Hub の `t` で鮮度を判定
+/// しない）。世代が無い・Live でないときは [`ExternalSnapshot::down`]。
+pub struct HubSampler {
+    feed: HubFeed,
+}
+
+impl ExternalSource for HubSampler {
+    fn snapshot(&self) -> ExternalSnapshot {
+        let feed = self
+            .feed
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(states) = feed.as_ref() else {
+            return ExternalSnapshot::down(Some(DETAIL_NO_SUBSCRIPTION.to_owned()));
+        };
+        let state = states.borrow();
+        external_snapshot(state.connection_state(), state.current())
+    }
+}
+
+/// 収集の `plc_disconnected` に載せる理由（世代が無いとき）。資格情報・
+/// 接続先は含めない。
+const DETAIL_NO_SUBSCRIPTION: &str = "Hubの購読がありません（未接続・停止中）";
+
+/// 世代の状態から収集に渡す形を作る**純関数**（#383 段階3 P3）。値を渡すのは
+/// `Live` かつスナップショットがあるときだけ（`banto-tagclient` は Live 以外で
+/// `current()` を返さない - その性質にそのまま乗る）。
+fn external_snapshot(
+    state: TagClientConnectionState,
+    current: Option<&ValuesSnapshot>,
+) -> ExternalSnapshot {
+    match (state, current) {
+        (TagClientConnectionState::Live, Some(snapshot)) => ExternalSnapshot::live(
+            snapshot
+                .values
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.tag.clone(),
+                        ExternalReading {
+                            value: entry.v,
+                            quality: external_quality(&entry.q),
+                            source: external_value_source(&entry.value_source),
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        (state, _) => ExternalSnapshot::down(Some(format!(
+            "Hubの購読が {} の状態です",
+            connection_state_str(state)
+        ))),
+    }
+}
+
+/// Hub の品質ラベル → 収集の品質（H4: 未知のラベルは good に丸めない）。
+fn external_quality(quality: &ValueQuality) -> ExternalQuality {
+    match quality {
+        ValueQuality::Good => ExternalQuality::Good,
+        ValueQuality::Stale => ExternalQuality::Stale,
+        ValueQuality::Bad => ExternalQuality::Bad,
+        ValueQuality::Unknown(_) => ExternalQuality::Unknown,
+    }
+}
+
+/// Hub の `value_source` → 収集の分類（H4・#413）。`simulation` と
+/// `derived_simulation`（シミュレーション入力を参照する演算タグ）は
+/// **記録しない**側。未知のラベルも記録しない（`banto-tagclient` が未知を
+/// 未知のまま保つのは「将来の Hub が黙って実値の出所にならない」ため。
+/// `banto_collect::external` のモジュール doc）。
+fn external_value_source(source: &ValueSource) -> ExternalValueSource {
+    match source {
+        ValueSource::Real | ValueSource::Computed | ValueSource::Internal | ValueSource::Db => {
+            ExternalValueSource::Measured
+        }
+        ValueSource::Simulation | ValueSource::DerivedSimulation => ExternalValueSource::Simulated,
+        ValueSource::Unknown(_) => ExternalValueSource::Unknown,
+    }
+}
+
+/// 収集の開始に答えるもの（[`HubService::prepare_collect`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubCollectReadiness {
+    /// Hub への接続が設定されていない（`hub.record` が無い）。Hub 接続は
+    /// `hubNotConfigured` で外す。
+    NotConfigured,
+    /// 設定されている。`catalog` は開始の時点で読めた Hub のタグ一覧
+    /// （外部名 → データ型）で、読めなかったら `None`（突き合わせない）。
+    Ready { catalog: Option<HubCatalog> },
+}
+
+/// [`HubService::prepare_collect`] が Hub の答えを待つ上限。収集の開始全体の
+/// 上限（`crate::collect::COLLECT_OPERATION_TIMEOUT` = 30 秒）の内側に収め、
+/// Hub の 1 往復の上限（[`HUB_OPERATION_TIMEOUT`]）より少し長く取る
+/// （操作ロックを待つ分）。打ち切っても需要は反映される（見張りが拾う）。
+pub const HUB_COLLECT_PREPARE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 「最後に値を受けた時刻」を観測結果で進める（純関数）。
 ///
@@ -1443,6 +1634,9 @@ struct HubInner {
     /// 購読世代（#383 段階1）。`Clone` したハンドル同士が**同じ世代**を
     /// 共有する（LAN ブラウザとデスクトップで WS が 2 本張られない）。
     subscription: AsyncMutex<Subscription>,
+    /// [`Subscription::feed`] と同じもの（#383 段階3 P3）。収集の側は
+    /// 購読ロックを取らずにこれだけを持つ（[`HubService::collect_source`]）。
+    feed: HubFeed,
     /// spawn した supervisor タスクの本数。0 → 1 の
     /// `compare_exchange` に勝った 1 本だけが走る（`resume()` を何度呼んでも
     /// 増えない）。
@@ -1463,6 +1657,11 @@ struct HubInner {
     shutdown: watch::Sender<bool>,
     /// これまでに張った購読世代の本数（[`Generation::sequence`] の採番元）。
     generations_started: AtomicUsize,
+    /// **テスト専用**: 入っていれば [`HubService::prepare_collect`] は需要を
+    /// 入れた後、Hub に問い合わせずにこの答えを返す（収集側のテストが Hub の
+    /// 答えを決め打ちするため。製品ビルドにはフィールドごと無い）。
+    #[cfg(test)]
+    prepare_answer_for_test: Mutex<Option<HubCollectReadiness>>,
 }
 
 /// Hub 接続のサービス層。`src-tauri` の `hub_*` コマンドと
@@ -1498,6 +1697,8 @@ impl HubService {
             keys,
             Arc::clone(&mirror) as Arc<dyn BootstrapState>,
         ));
+        let subscription = Subscription::default();
+        let feed = subscription.feed.clone();
         Ok(Self {
             inner: Arc::new(HubInner {
                 settings,
@@ -1505,10 +1706,13 @@ impl HubService {
                 bootstrapper,
                 installation_id,
                 operation: AsyncMutex::new(()),
-                subscription: AsyncMutex::new(Subscription::default()),
+                subscription: AsyncMutex::new(subscription),
+                feed,
                 supervisor_spawns: AtomicUsize::new(0),
                 shutdown: watch::channel(false).0,
                 generations_started: AtomicUsize::new(0),
+                #[cfg(test)]
+                prepare_answer_for_test: Mutex::new(None),
             }),
         })
     }
@@ -1533,6 +1737,140 @@ impl HubService {
     /// だけ**で、Hub へのリクエストは 1 本も出さない。
     pub async fn subscription(&self) -> HubSubscriptionView {
         self.inner.subscription.lock().await.view()
+    }
+
+    /// 収集が Hub 経由の接続の値を読む口（#383 段階3 P3）。何度呼んでも同じ
+    /// [`HubFeed`] を指すので、世代が張り直されても収集は作り直さなくてよい。
+    pub fn collect_source(&self) -> Arc<dyn ExternalSource> {
+        Arc::new(HubSampler {
+            feed: self.inner.feed.clone(),
+        })
+    }
+
+    /// 収集の開始（#383 段階3 P3）: 収集が要る外部名 `names` を購読の需要に
+    /// し（[`Subscription::collect_demand`]）、catalog を読み直して購読を
+    /// 突き合わせ、**開始の時点の** catalog を返す（H3: 消えた・型が変わった
+    /// タグを外すため）。
+    ///
+    /// * 需要は**待つ前に**入れる。Hub が答えなくても需要と
+    ///   [`Subscription::demand_pending`] は残り、見張りが後で反映する。
+    /// * Hub への往復は別タスクで走らせ、[`HUB_COLLECT_PREPARE_TIMEOUT`] だけ
+    ///   待つ。打ち切っても処理は止めない（モジュール doc「需要の変化を
+    ///   取りこぼさない」）。打ち切ったら catalog は `None`。
+    /// * 設定されていなければ [`HubCollectReadiness::NotConfigured`]。
+    pub async fn prepare_collect(&self, names: Vec<String>) -> HubCollectReadiness {
+        {
+            let mut slot = self.inner.subscription.lock().await;
+            slot.collect_demand = names;
+            slot.demand_pending = true;
+        }
+        #[cfg(test)]
+        if let Some(answer) = self
+            .inner
+            .prepare_answer_for_test
+            .lock()
+            .expect("prepare_answer_for_test")
+            .clone()
+        {
+            return answer;
+        }
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _ = reply.send(service.refresh_for_collect().await);
+        });
+        match tokio::time::timeout(HUB_COLLECT_PREPARE_TIMEOUT, answer).await {
+            Ok(Ok(readiness)) => readiness,
+            // 打ち切り（またはタスクが答えずに終わった）。設定の有無だけは
+            // ローカルで確かめる - 写しがまだ hydrate されていない起動直後も
+            // あるので、設定 KV も見る。
+            _ => {
+                if self.is_configured_locally().await {
+                    HubCollectReadiness::Ready { catalog: None }
+                } else {
+                    HubCollectReadiness::NotConfigured
+                }
+            }
+        }
+    }
+
+    /// 収集の停止（#383 段階3 P3）: 需要を取り下げる。**Hub は叩かない** -
+    /// 取り下げた分の購読は、見張りが次の周期で計画し直すときに外れる
+    /// （すぐ開始し直す再起動では、同じ需要が戻ってきて張り直しが起きない）。
+    pub async fn release_collect(&self) {
+        let mut slot = self.inner.subscription.lock().await;
+        if !slot.collect_demand.is_empty() {
+            slot.collect_demand.clear();
+            slot.demand_pending = true;
+        }
+    }
+
+    /// テスト用: [`Self::prepare_collect`] の答えを決め打ちする
+    /// （[`HubInner::prepare_answer_for_test`]）。
+    #[cfg(test)]
+    pub(crate) fn answer_prepare_for_test(&self, answer: HubCollectReadiness) {
+        *self
+            .inner
+            .prepare_answer_for_test
+            .lock()
+            .expect("prepare_answer_for_test") = Some(answer);
+    }
+
+    /// テスト用: 今の収集の需要。
+    #[cfg(test)]
+    pub(crate) async fn collect_demand_for_test(&self) -> Vec<String> {
+        self.inner.subscription.lock().await.collect_demand.clone()
+    }
+
+    /// [`Self::prepare_collect`] の Hub 側の本体。操作の 1 つとして直列化する。
+    async fn refresh_for_collect(&self) -> HubCollectReadiness {
+        let operation = self.begin_operation().await;
+        let Ok(_operation) = operation else {
+            // 終了中・設定 DB の読み取り失敗。突き合わせはできないが、設定の
+            // 有無は答えられる範囲で答える。
+            return if self.inner.mirror.current().is_some() {
+                HubCollectReadiness::Ready { catalog: None }
+            } else {
+                HubCollectReadiness::NotConfigured
+            };
+        };
+        if self.inner.mirror.current().is_none() {
+            return HubCollectReadiness::NotConfigured;
+        }
+        let call = match with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await {
+            Ok(call) => call,
+            Err(err) => {
+                eprintln!("banto: 収集の開始時にHubのタグ一覧を読めませんでした: {err}");
+                return HubCollectReadiness::Ready { catalog: None };
+            }
+        };
+        if let Err(err) = self.flush().await {
+            eprintln!("banto: Hub接続設定の書き戻しに失敗しました（収集の開始は続けます）: {err}");
+        }
+        self.reconcile(&call, Trigger::Observe).await;
+        let catalog = match (&call.connection.status, &call.connection.catalog) {
+            (HubStatus::Connected { .. }, Some(catalog)) => Some(
+                catalog
+                    .tags
+                    .iter()
+                    .map(|tag| (tag.external_name.clone(), tag.data_type.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        };
+        HubCollectReadiness::Ready { catalog }
+    }
+
+    /// 写し、無ければ設定 KV を見て「Hub の接続が保存されているか」だけを
+    /// 答える（ネットワークも操作ロックも使わない）。
+    async fn is_configured_locally(&self) -> bool {
+        if self.inner.mirror.current().is_some() {
+            return true;
+        }
+        matches!(
+            self.inner.settings.get(KEY_HUB_RECORD).await,
+            Ok(Some(raw)) if serde_json::from_str::<HubRecord>(&raw).is_ok()
+        )
     }
 
     /// 起動時の再開（#383 段階1）。保存済みレコードがあれば catalog を
@@ -1781,7 +2119,12 @@ impl HubService {
                     settle_credential_rejection(slot.credential_rejection, None, stored);
             }
             // 頻度は close 1008 の理由まで見て決める（#446、[`retry_pace`]）。
-            if !slot.takes_supervisor_tick() {
+            // 収集の需要が変わったまま計画し直していないとき（#383 段階3 P3）
+            // も起こす - 起こした先の `resume_locked` が catalog を読み直して
+            // `reconcile_generation` で計画し直すので、「起こす」と「実際に
+            // やる」は食い違わない（checklist §5）。
+            let tick = slot.takes_supervisor_tick();
+            if !tick && !slot.demand_pending {
                 return;
             }
         }
@@ -1910,7 +2253,10 @@ impl HubService {
                 let mut slot = self.inner.subscription.lock().await;
                 // 選択が変わったなら、前の選択についての最終受信時刻はもう
                 // 別の購読の話（同じ選択で保存し直しただけなら残る）。
-                let identity = subscription_identity(self.inner.mirror.current().as_ref());
+                let identity = subscription_identity(
+                    self.inner.mirror.current().as_ref(),
+                    &slot.collect_demand,
+                );
                 slot.retain_last_value_for(identity.as_ref());
                 // 未解決・購読不可は**直前の選択**を catalog と突き合わせた
                 // 結果なので、選択が変わった今はもう何も語っていない。新しい
@@ -2105,8 +2451,15 @@ impl HubService {
         reason_override: Option<&str>,
     ) {
         let record = self.inner.mirror.current();
-        let identity = subscription_identity(record.as_ref());
         let mut slot = self.inner.subscription.lock().await;
+        let identity = subscription_identity(record.as_ref(), &slot.collect_demand);
+        // #383 段階3 P3: ここから先は**今の**需要で判断するので、需要の変化は
+        // 突き合わせ済みになる。世代を持てない分岐（未接続・キーの拒否など）でも
+        // 降ろす - その後いつ張り直しに行くかは通常の見張りの規則
+        // （[`retry_pace`]）が決め、張るときは必ずその時点の需要で計画する。
+        // 立てたままにすると、失効したキーのように「待っても直らない」状態でも
+        // 30 秒ごとに Hub を叩き続ける（無駄撃ち）。
+        slot.demand_pending = false;
         // 「同じ購読が止まっているだけ」なら最終受信時刻を残し、別物になった
         // ／無くなったなら捨てる。世代を張る前に決める。
         slot.retain_last_value_for(identity.as_ref());
@@ -2145,7 +2498,8 @@ impl HubService {
         };
 
         // 2. 未解決タグ・購読できない名前は世代の有無に関わらず画面に出す。
-        let plan = plan_bindings(&record.selected_tags, catalog);
+        //    購読するのは選択と収集の需要の和集合（#383 段階3 P3）。
+        let plan = plan_bindings(&wanted_tags(&record, &slot.collect_demand), catalog);
         slot.unresolved = plan.unresolved;
         slot.unsupported = plan.unsupported;
         if plan.requests.is_empty() {
@@ -2216,6 +2570,9 @@ impl HubService {
                 // 上の `retain_last_value_for` が既に決めている - 同じ接続先・
                 // 同じ選択のまま張り直したときは残る）。
                 slot.last_value_from = identity;
+                // 収集に新しい世代の `watch` を渡す（#383 段階3 P3）。古い世代は
+                // 上の `stop` が既に外している。
+                slot.feed.publish(Some(handle.state_watch()));
                 slot.generation = Some(Generation {
                     states: handle.state_watch(),
                     handle,
@@ -2396,7 +2753,7 @@ fn generate_installation_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use banto_tagclient::StableTagId;
+    use banto_tagclient::{StableTagId, ValueEntry};
 
     use super::*;
     use crate::db::init_db_memory;
@@ -3683,6 +4040,163 @@ mod tests {
         );
     }
 
+    // --- #383 段階3 P3: 収集への供給 ------------------------------------------
+
+    fn collect_entry(tag: &str, v: Option<f64>, q: ValueQuality, s: ValueSource) -> ValueEntry {
+        ValueEntry {
+            tag: tag.to_owned(),
+            v,
+            q,
+            t: 1,
+            value_source: s,
+        }
+    }
+
+    /// Hub のラベルを収集の分類へ写す表（H4・#413）。`simulation` と
+    /// `derived_simulation` はどちらも「シミュレーション」（記録しない側）、
+    /// 未知の出所・品質は丸めない。
+    ///
+    /// 反証: `external_value_source` で `DerivedSimulation` を `Measured` 側に
+    /// 入れると、ここで落ちる。
+    #[test]
+    fn the_collect_snapshot_maps_hub_labels_without_rounding() {
+        let values = ValuesSnapshot {
+            revision: 1,
+            t: 1,
+            run_id: Some(1),
+            collection_mode: banto_tagclient::CollectionMode::Configured,
+            values: vec![
+                collect_entry("real", Some(1.0), ValueQuality::Good, ValueSource::Real),
+                collect_entry("calc", Some(2.0), ValueQuality::Good, ValueSource::Computed),
+                collect_entry("mem", Some(3.0), ValueQuality::Good, ValueSource::Internal),
+                collect_entry("db", Some(4.0), ValueQuality::Good, ValueSource::Db),
+                collect_entry(
+                    "sim",
+                    Some(5.0),
+                    ValueQuality::Good,
+                    ValueSource::Simulation,
+                ),
+                collect_entry(
+                    "dsim",
+                    Some(6.0),
+                    ValueQuality::Good,
+                    ValueSource::DerivedSimulation,
+                ),
+                collect_entry(
+                    "future",
+                    Some(7.0),
+                    ValueQuality::Good,
+                    ValueSource::Unknown("future_source".to_owned()),
+                ),
+                collect_entry("stale", Some(8.0), ValueQuality::Stale, ValueSource::Real),
+                collect_entry("bad", None, ValueQuality::Bad, ValueSource::Real),
+                collect_entry(
+                    "odd",
+                    Some(9.0),
+                    ValueQuality::Unknown("future_quality".to_owned()),
+                    ValueSource::Real,
+                ),
+            ],
+        };
+        let snapshot = external_snapshot(TagClientConnectionState::Live, Some(&values));
+        assert!(snapshot.is_live());
+        let read = |tag: &str| *snapshot.reading(tag).expect("held");
+        use ExternalQuality as Q;
+        use ExternalValueSource as S;
+        for (tag, value, quality, source) in [
+            ("real", Some(1.0), Q::Good, S::Measured),
+            ("calc", Some(2.0), Q::Good, S::Measured),
+            ("mem", Some(3.0), Q::Good, S::Measured),
+            ("db", Some(4.0), Q::Good, S::Measured),
+            ("sim", Some(5.0), Q::Good, S::Simulated),
+            ("dsim", Some(6.0), Q::Good, S::Simulated),
+            ("future", Some(7.0), Q::Good, S::Unknown),
+            ("stale", Some(8.0), Q::Stale, S::Measured),
+            ("bad", None, Q::Bad, S::Measured),
+            ("odd", Some(9.0), Q::Unknown, S::Measured),
+        ] {
+            assert_eq!(
+                read(tag),
+                ExternalReading {
+                    value,
+                    quality,
+                    source
+                },
+                "{tag}"
+            );
+        }
+    }
+
+    /// Live でなければ値を渡さない（保持している値があっても）。理由は
+    /// 状態名だけで、接続先やキーを含めない。
+    #[test]
+    fn a_collect_snapshot_outside_live_carries_no_values() {
+        let values = ValuesSnapshot {
+            revision: 1,
+            t: 1,
+            run_id: Some(1),
+            collection_mode: banto_tagclient::CollectionMode::Configured,
+            values: vec![collect_entry(
+                "real",
+                Some(1.0),
+                ValueQuality::Good,
+                ValueSource::Real,
+            )],
+        };
+        for state in [
+            TagClientConnectionState::Stopped,
+            TagClientConnectionState::Connecting,
+            TagClientConnectionState::Handshaking,
+            TagClientConnectionState::Rebinding,
+            TagClientConnectionState::Reconnecting,
+            TagClientConnectionState::Unauthorized,
+        ] {
+            let snapshot = external_snapshot(state, Some(&values));
+            assert!(!snapshot.is_live(), "{state}");
+            assert_eq!(snapshot.reading("real"), None, "{state}");
+            assert_eq!(
+                snapshot.link,
+                banto_collect::ExternalLink::Down {
+                    detail: Some(format!("Hubの購読が {state} の状態です")),
+                }
+            );
+        }
+        // Live でもスナップショットがまだ無ければ渡さない。
+        assert!(!external_snapshot(TagClientConnectionState::Live, None).is_live());
+    }
+
+    /// 世代が無い間、収集の口は Down を返す。未設定の Hub に需要を出すと
+    /// `NotConfigured` で、需要は残り（見張りが後で拾う）、停止で取り下がる。
+    #[tokio::test]
+    async fn the_collect_side_without_a_subscription_reads_down_and_tracks_the_demand() {
+        let (_settings, hub) = service().await;
+        let source = hub.collect_source();
+        assert_eq!(
+            source.snapshot(),
+            ExternalSnapshot::down(Some(DETAIL_NO_SUBSCRIPTION.to_owned()))
+        );
+
+        assert_eq!(
+            hub.prepare_collect(owned(&["a.b.c"])).await,
+            HubCollectReadiness::NotConfigured
+        );
+        {
+            let slot = hub.inner.subscription.lock().await;
+            assert_eq!(slot.collect_demand, owned(&["a.b.c"]));
+            assert!(slot.demand_pending, "突き合わせるまで旗は残る");
+        }
+        // 突き合わせは世代を持てない分岐でも旗を降ろす（待っても直らない
+        // 状態で見張りに Hub を叩かせ続けない）。
+        hub.reconcile_with(&HubStatus::NotConfigured, None, Trigger::Observe)
+            .await;
+        assert!(!hub.inner.subscription.lock().await.demand_pending);
+
+        hub.release_collect().await;
+        let slot = hub.inner.subscription.lock().await;
+        assert!(slot.collect_demand.is_empty());
+        assert!(slot.demand_pending);
+    }
+
     /// Hub から受けた 1 スナップショットを画面の形へ写す。**未知のラベルを
     /// 丸めない**のが要点: `banto-tagclient` は知らない品質・値の出所を
     /// `Unknown(raw)` として保つので、こちらもそのまま出す（知らない品質を
@@ -3794,10 +4308,20 @@ mod tests {
         let base = keyring_record("http://127.0.0.1:3100", &["beta", "alpha"]);
         let shuffled = keyring_record("http://127.0.0.1:3100/", &["alpha", "beta", "alpha"]);
         assert_eq!(
-            subscription_identity(Some(&base)),
-            subscription_identity(Some(&shuffled))
+            subscription_identity(Some(&base), &[]),
+            subscription_identity(Some(&shuffled), &[])
         );
-        assert_eq!(subscription_identity(None), None);
+        assert_eq!(subscription_identity(None, &[]), None);
+        // #383 段階3 P3: 収集の需要も同一性に入る（需要が変われば別の購読）。
+        assert_ne!(
+            subscription_identity(Some(&base), &[]),
+            subscription_identity(Some(&base), &owned(&["gamma"]))
+        );
+        assert_eq!(
+            subscription_identity(Some(&base), &owned(&["alpha"])),
+            subscription_identity(Some(&base), &[]),
+            "選択と同じ名前の需要は集合を変えない"
+        );
     }
 
     /// 切断すると、その Hub の受信時刻は残さない。
@@ -4556,6 +5080,71 @@ mod tests {
             assert_eq!(view.last_value_at, Some(2_000));
 
             hub.inner.subscription.lock().await.stop(None).await;
+            server.abort();
+        }
+
+        /// #383 段階3 P3: 収集の需要は**選択タグと一緒に**購読され（和集合）、
+        /// 収集の口（[`HubService::collect_source`]）は購読ロックを取らずに
+        /// その世代の最新値を読める。開始時の catalog（外部名 → データ型）が
+        /// 返り、需要の旗は計画し直した時点で降りる。世代を止めると収集の口は
+        /// Down に戻る。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_collect_demand_is_subscribed_with_the_selection_and_sampled() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let catalog = catalog(&["alpha", "beta"]);
+            let mock = Arc::new(MockHub::default());
+            mock.set(
+                &catalog,
+                &values_of(
+                    &catalog,
+                    vec![
+                        entry("alpha", 1.0, ValueQuality::Good, ValueSource::Real),
+                        entry("beta", 2.0, ValueQuality::Good, ValueSource::Simulation),
+                    ],
+                ),
+                data_frame("alpha", 10.0, "good"),
+            );
+            let server = tokio::spawn(serve_hub(listener, Arc::clone(&mock)));
+
+            // 画面で選んだのは alpha だけ。beta は収集だけが要る。
+            let (_settings, hub) = service_with_keyring(&endpoint, &["alpha"]).await;
+            let readiness = hub.prepare_collect(owned(&["beta"])).await;
+            assert_eq!(
+                readiness,
+                HubCollectReadiness::Ready {
+                    catalog: Some(HubCatalog::from([
+                        ("alpha".to_owned(), "f64".to_owned()),
+                        ("beta".to_owned(), "f64".to_owned()),
+                    ])),
+                }
+            );
+            assert!(!hub.inner.subscription.lock().await.demand_pending);
+            wait_live(&hub).await;
+            assert_eq!(hub.subscription().await.subscribed_count, 2);
+
+            let snapshot = hub.collect_source().snapshot();
+            assert!(snapshot.is_live());
+            assert_eq!(
+                snapshot.reading("alpha").map(|r| (r.value, r.source)),
+                Some((Some(10.0), ExternalValueSource::Measured))
+            );
+            assert_eq!(
+                snapshot.reading("beta").map(|r| (r.value, r.source)),
+                Some((Some(2.0), ExternalValueSource::Simulated))
+            );
+
+            // 停止で需要は取り下がる（Hub は叩かない - 世代はそのまま）。
+            hub.release_collect().await;
+            {
+                let slot = hub.inner.subscription.lock().await;
+                assert!(slot.collect_demand.is_empty());
+                assert!(slot.demand_pending);
+            }
+            assert!(hub.collect_source().snapshot().is_live());
+
+            hub.inner.subscription.lock().await.stop(None).await;
+            assert!(!hub.collect_source().snapshot().is_live());
             server.abort();
         }
 

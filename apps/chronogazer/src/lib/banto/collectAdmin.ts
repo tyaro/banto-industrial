@@ -100,9 +100,11 @@ export type ExclusionUnit = 'connection' | 'group' | 'tag';
  *
  * - `reason`: 機械可読な分類（`invalidAddress` / `unknownDataType` /
  *   `bitAddressOnNonBitType` / `invalidPort` / `invalidUnitId` /
- *   `unsupportedProtocol` / `hubSourceNotYetCollected`（#383 段階3 P2: Hub
- *   経由の接続。収集は P3 で対応）/ `invalidPeriod` / `connectionExcluded` /
- *   `groupExcluded`）。
+ *   `unsupportedProtocol` / `invalidPeriod` / `connectionExcluded` /
+ *   `groupExcluded`、#383 段階3 P3 の Hub 経由の接続の `hubSourceUnavailable`
+ *   （Hub を持たない実行形態）/ `hubNotConfigured`（Hub に未接続）/
+ *   `hubTagNotFound`（Hub のタグ一覧に無い）/ `hubTagTypeChanged`（データ型が
+ *   変わった））。
  * - `message`: 人間向けの文言。タグは保存時の拒否理由（#418）と同じ文言。
  *
  * 接続先ホスト・資格情報・ファイルパスは載っていない（Rust 側の doc と

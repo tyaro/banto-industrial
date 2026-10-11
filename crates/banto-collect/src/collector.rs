@@ -122,6 +122,22 @@
 //! `crate::simulation`'s module doc for why the address substitution itself
 //! happens here (at task-spawn time) rather than in `crate::config::build_config`.
 //!
+//! ### #383 段階3 P3 addendum: external connections
+//!
+//! A `"hub"` connection's plan ([`crate::config::ProtocolConfig::External`])
+//! gets `crate::task::run_external_connection` instead of `run_connection`,
+//! sampling the [`ExternalSource`] handed to
+//! [`Collector::start_with_sources`] - the one place a source enters the
+//! engine, kept for the collector's life so `apply_config` can spawn an
+//! added/replaced external connection with it too. It is otherwise an
+//! ordinary connection task in every step above (its own stop channel, the
+//! shared writer `watch`, the same cache/status/events), and never has a
+//! simulator. A config with external connections and no source is refused
+//! ([`CollectError::Config`]) rather than left reading "not Live" forever -
+//! at start, and also by `apply_config` on a collector started without a
+//! source (checked first, before anything is touched: the collector stays
+//! exactly as it was, PR #578 review).
+//!
 //! ### Why no `collection_started`/`collection_stopped` event
 //!
 //! Those two [`EventKind`] variants mean "the whole engine started/stopped"
@@ -161,10 +177,11 @@ use crate::config::{CollectorConfig, ConnectionPlan, Protocol, ProtocolConfig};
 use crate::current::CurrentValuesHandle;
 use crate::error::CollectError;
 use crate::event::{CollectEvent, EventKind, EventSink};
+use crate::external::ExternalSource;
 use crate::simulation::{self, SimulatorHandle};
 use crate::task::{
-    default_client_factory, retain_status, run_connection, BackoffConfig, ClientFactory,
-    ConnectionStatus, StatusMap, TaskContext,
+    default_client_factory, retain_status, run_connection, run_external_connection, BackoffConfig,
+    ClientFactory, ConnectionStatus, StatusMap, TaskContext,
 };
 
 /// Tunables for [`Collector::start`]. `Default` matches the product defaults
@@ -261,6 +278,9 @@ pub struct Collector {
     /// "unchanged" by `apply_config`'s diff, added/removed/replaced exactly
     /// when the corresponding task is.
     simulators: HashMap<String, SimulatorHandle>,
+    /// #383 段階3 P3: the source external (`"hub"`) connections sample, if
+    /// the caller supplied one (this module's doc, "external connections").
+    external: Option<Arc<dyn ExternalSource>>,
 }
 
 impl Collector {
@@ -316,10 +336,30 @@ impl Collector {
         options: CollectorOptions,
         factory: ClientFactory,
     ) -> Result<Self, CollectError> {
+        Self::start_with_sources(config, data_dir, clock, events, options, factory, None).await
+    }
+
+    /// #383 段階3 P3: [`Self::start_with_client_factory`] plus the
+    /// [`ExternalSource`] that external (`"hub"`) connections sample. A
+    /// config with external connections
+    /// ([`CollectorConfig::has_external_connections`]) and `external = None`
+    /// is refused with [`CollectError::Config`] before anything is opened.
+    pub async fn start_with_sources(
+        config: CollectorConfig,
+        data_dir: &Path,
+        clock: Arc<dyn Clock>,
+        events: EventSink,
+        options: CollectorOptions,
+        factory: ClientFactory,
+        external: Option<Arc<dyn ExternalSource>>,
+    ) -> Result<Self, CollectError> {
         if config.connections.is_empty() {
             return Err(CollectError::Config(
                 "収集対象がありません（有効な接続・グループ・タグを設定してください）".to_string(),
             ));
+        }
+        if external.is_none() && config.has_external_connections() {
+            return Err(CollectError::Config(MISSING_EXTERNAL_SOURCE.to_string()));
         }
 
         let writer = Arc::new(
@@ -346,13 +386,14 @@ impl Collector {
         let mut tasks = HashMap::with_capacity(config.connections.len());
         let mut simulators: HashMap<String, SimulatorHandle> = HashMap::new();
         for plan in &config.connections {
-            let sim_addr = if plan.simulation {
-                let sim = simulation::start(protocol_of(plan)).await;
-                let addr = sim.addr();
-                simulators.insert(plan.key.clone(), sim);
-                Some(addr)
-            } else {
-                None
+            let sim_addr = match protocol_of(plan) {
+                Some(protocol) if plan.simulation => {
+                    let sim = simulation::start(protocol).await;
+                    let addr = sim.addr();
+                    simulators.insert(plan.key.clone(), sim);
+                    Some(addr)
+                }
+                _ => None,
             };
             let ctx = TaskContext {
                 writer_rx: writer_tx.subscribe(),
@@ -364,13 +405,12 @@ impl Collector {
                 simulation: plan.simulation,
                 factory: factory.clone(),
             };
-            let (stop_tx, stop_rx) = watch::channel(false);
-            let handle = tokio::spawn(run_connection(
+            let task = spawn_task(
                 plan_for_task(plan, &options, sim_addr),
                 ctx,
-                stop_rx,
-            ));
-            tasks.insert(plan.key.clone(), ConnectionTask { handle, stop_tx });
+                external.as_ref(),
+            );
+            tasks.insert(plan.key.clone(), task);
         }
 
         Ok(Self {
@@ -384,6 +424,7 @@ impl Collector {
             config,
             tasks,
             simulators,
+            external,
         })
     }
 
@@ -419,11 +460,24 @@ impl Collector {
     /// 既に全部立っており、ここで `Err` を返すと「タスクは新構成・
     /// `self.config` は旧構成・呼び出し元は失敗と判断」という、はるかに
     /// 悪い不整合が残るため（モジュール doc のステップ 5b 参照）。
+    ///
+    /// **もう 1 つの `Err`（#383 段階3 P3、PR #578 レビュー）**: 外部ソース無しで
+    /// 起動した collector（[`Self::start`] / [`Self::start_with_client_factory`]）に、
+    /// 外部（`"hub"`）接続を含む構成を渡すと [`CollectError::Config`] を返す。
+    /// 判定は**何よりも先に**行う（差分も writer も触る前）ので、この `Err` の
+    /// ときも collector は呼び出し前のまま（`self.config`・全タスク・writer とも
+    /// 不変）。受け入れると、その接続は値の出どころが無いまま「Live でない」
+    /// （Bad + null）を永久に記録し続けるため。
     pub async fn apply_config(
         &mut self,
         new_config: CollectorConfig,
         factory: ClientFactory,
     ) -> Result<ApplyReport, CollectError> {
+        // --- 0. External connections need a source (before any side effect) -
+        if self.external.is_none() && new_config.has_external_connections() {
+            return Err(CollectError::Config(MISSING_EXTERNAL_SOURCE.to_string()));
+        }
+
         // --- 1. Diff (pure - no side effects yet) ---------------------------
         let current_map: HashMap<&str, &ConnectionPlan> = self
             .config
@@ -537,13 +591,14 @@ impl Collector {
         // - see this module's doc comment, "T9-1 addendum".
         for key in added.iter().chain(replaced.iter()) {
             let plan = new_map[key.as_str()];
-            let sim_addr = if plan.simulation {
-                let sim = simulation::start(protocol_of(plan)).await;
-                let addr = sim.addr();
-                self.simulators.insert(key.clone(), sim);
-                Some(addr)
-            } else {
-                None
+            let sim_addr = match protocol_of(plan) {
+                Some(protocol) if plan.simulation => {
+                    let sim = simulation::start(protocol).await;
+                    let addr = sim.addr();
+                    self.simulators.insert(key.clone(), sim);
+                    Some(addr)
+                }
+                _ => None,
             };
             let ctx = TaskContext {
                 writer_rx: self.writer_tx.subscribe(),
@@ -555,14 +610,12 @@ impl Collector {
                 simulation: plan.simulation,
                 factory: factory.clone(),
             };
-            let (stop_tx, stop_rx) = watch::channel(false);
-            let handle = tokio::spawn(run_connection(
+            let task = spawn_task(
                 plan_for_task(plan, &self.options, sim_addr),
                 ctx,
-                stop_rx,
-            ));
-            self.tasks
-                .insert(key.clone(), ConnectionTask { handle, stop_tx });
+                self.external.as_ref(),
+            );
+            self.tasks.insert(key.clone(), task);
         }
 
         // --- 5b. Retire the old writer (non-fatal) -------------------------
@@ -728,19 +781,70 @@ fn plan_for_task(
                 cfg.port = addr.port();
             }
         }
+        // Nothing to dial, so nothing to override.
+        ProtocolConfig::External => {}
     }
     plan
+}
+
+/// The [`CollectError::Config`] text for a config with external (`"hub"`)
+/// connections handed to a collector that has no [`ExternalSource`] - shared
+/// by [`Collector::start_with_sources`] and [`Collector::apply_config`].
+const MISSING_EXTERNAL_SOURCE: &str = "Hub 経由の接続を収集するための値の取得元が渡されていません";
+
+/// Spawn one connection's task with its own stop channel: the socket loop
+/// for a PLC plan, the sampling loop for an external one (#383 段階3 P3).
+/// `external` is only read for an external plan; `start_with_sources`
+/// guarantees it is `Some` whenever the config has one (a missing source
+/// would otherwise only ever read "not Live").
+fn spawn_task(
+    plan: ConnectionPlan,
+    ctx: TaskContext,
+    external: Option<&Arc<dyn ExternalSource>>,
+) -> ConnectionTask {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let handle = match (&plan.config, external) {
+        (ProtocolConfig::External, Some(source)) => tokio::spawn(run_external_connection(
+            plan,
+            ctx,
+            Arc::clone(source),
+            stop_rx,
+        )),
+        (ProtocolConfig::External, None) => tokio::spawn(run_external_connection(
+            plan,
+            ctx,
+            Arc::new(MissingSource),
+            stop_rx,
+        )),
+        _ => tokio::spawn(run_connection(plan, ctx, stop_rx)),
+    };
+    ConnectionTask { handle, stop_tx }
+}
+
+/// Stands in for an absent [`ExternalSource`]. Unreachable:
+/// [`Collector::start_with_sources`] and [`Collector::apply_config`] both
+/// refuse a config with external connections when the collector has no
+/// source ([`MISSING_EXTERNAL_SOURCE`]). Kept only so [`spawn_task`] is total -
+/// the connection would read "not Live" (Bad + null) instead of panicking.
+struct MissingSource;
+
+impl ExternalSource for MissingSource {
+    fn snapshot(&self) -> crate::external::ExternalSnapshot {
+        crate::external::ExternalSnapshot::down(None)
+    }
 }
 
 /// Project a [`ConnectionPlan`]'s protocol config down to the
 /// [`crate::config::Protocol`] [`crate::simulation::start`] dispatches on -
 /// the two are always in lockstep (`ProtocolConfig::ModbusTcp` iff
 /// `Protocol::ModbusTcp`, built from the same `build_config` match arm), so
-/// this is a plain projection, never a guess.
-fn protocol_of(plan: &ConnectionPlan) -> Protocol {
+/// this is a plain projection, never a guess. `None` for an external
+/// connection, which has no wire protocol and never a simulator.
+fn protocol_of(plan: &ConnectionPlan) -> Option<Protocol> {
     match &plan.config {
-        ProtocolConfig::ModbusTcp(_) => Protocol::ModbusTcp,
-        ProtocolConfig::Slmp(_) => Protocol::Slmp,
+        ProtocolConfig::ModbusTcp(_) => Some(Protocol::ModbusTcp),
+        ProtocolConfig::Slmp(_) => Some(Protocol::Slmp),
+        ProtocolConfig::External => None,
     }
 }
 
@@ -881,6 +985,7 @@ mod tests {
             period: Duration::from_millis(20),
             period_ms: 20,
             requests,
+            external_names: Vec::new(),
             tags,
         };
         let conn = ConnectionPlan {
@@ -986,7 +1091,7 @@ mod tests {
                 cfg.host = "203.0.113.1".to_string();
                 cfg.port = 502;
             }
-            ProtocolConfig::Slmp(_) => unreachable!("one_tag_config always builds ModbusTcp"),
+            _ => unreachable!("one_tag_config always builds ModbusTcp"),
         }
         config
     }
@@ -1275,6 +1380,552 @@ mod tests {
         }
 
         collector.stop().await.expect("stop should succeed");
+    }
+
+    // --- #383 段階3 P3: external (`"hub"`) connections -----------------------
+    //
+    // These drive `crate::task::run_external_connection` end to end through a
+    // real `Collector` built from a real registry (one PLC connection on the
+    // `FakeClient` + one `"hub"` connection), with a hand-set
+    // `ExternalSource`. Waits are "poll a counter until it reaches N, with a
+    // deadline" - no fixed sleeps decide the outcome.
+    mod external_sources {
+        use super::*;
+        use crate::config::{build_config_lenient_with_thresholds, HubSource, RegistrySnapshot};
+        use crate::current::Quality;
+        use crate::event::EventKind;
+        use crate::external::{
+            ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource, ExternalValueSource,
+        };
+        use banto_tags::{
+            CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
+            TagInput, TagService,
+        };
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// The external names registered on the hub connection, in tag order.
+        const MEASURED: &str = "PLC9.G.measured";
+        const SIMULATED: &str = "PLC9.G.simulated";
+        const STALE: &str = "PLC9.G.stale";
+        const BAD: &str = "PLC9.G.bad";
+        const UNKNOWN_QUALITY: &str = "PLC9.G.unknown";
+        /// Registered but never present in the source's snapshot.
+        const ABSENT: &str = "PLC9.G.absent";
+        const HUB_NAMES: [&str; 6] = [MEASURED, SIMULATED, STALE, BAD, UNKNOWN_QUALITY, ABSENT];
+
+        /// A hand-set source: whatever `set` last stored, counting how many
+        /// times the task sampled it (= tick-wakes of the hub connection).
+        struct MockSource {
+            snapshot: Mutex<ExternalSnapshot>,
+            samples: AtomicUsize,
+        }
+
+        impl MockSource {
+            fn new(snapshot: ExternalSnapshot) -> Arc<Self> {
+                Arc::new(Self {
+                    snapshot: Mutex::new(snapshot),
+                    samples: AtomicUsize::new(0),
+                })
+            }
+
+            fn set(&self, snapshot: ExternalSnapshot) {
+                *self.snapshot.lock().unwrap() = snapshot;
+            }
+
+            /// Wait until the task has sampled `more` further times.
+            async fn wait_samples(&self, more: usize) {
+                let target = self.samples.load(Ordering::SeqCst) + more;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                while self.samples.load(Ordering::SeqCst) < target {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the hub task sampled only {} of {target} times",
+                        self.samples.load(Ordering::SeqCst)
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+
+        impl ExternalSource for MockSource {
+            fn snapshot(&self) -> ExternalSnapshot {
+                self.samples.fetch_add(1, Ordering::SeqCst);
+                self.snapshot.lock().unwrap().clone()
+            }
+        }
+
+        fn reading(
+            value: f64,
+            quality: ExternalQuality,
+            source: ExternalValueSource,
+        ) -> ExternalReading {
+            ExternalReading {
+                value: Some(value),
+                quality,
+                source,
+            }
+        }
+
+        /// Every held value, one per label the mapping cares about. `ABSENT`
+        /// is deliberately missing.
+        fn held_values() -> HashMap<String, ExternalReading> {
+            use ExternalQuality as Q;
+            use ExternalValueSource as S;
+            HashMap::from([
+                (MEASURED.to_string(), reading(7.0, Q::Good, S::Measured)),
+                (SIMULATED.to_string(), reading(8.0, Q::Good, S::Simulated)),
+                (STALE.to_string(), reading(9.0, Q::Stale, S::Measured)),
+                (BAD.to_string(), reading(10.0, Q::Bad, S::Measured)),
+                (
+                    UNKNOWN_QUALITY.to_string(),
+                    reading(11.0, Q::Unknown, S::Measured),
+                ),
+            ])
+        }
+
+        /// Keys of the registry rows [`start`] created.
+        struct Keys {
+            plc_tag: String,
+            plc_group: String,
+            hub_conn: String,
+            hub_group: String,
+            /// In [`HUB_NAMES`] order.
+            hub_tags: Vec<String>,
+        }
+
+        impl Keys {
+            fn hub_tag(&self, name: &str) -> &str {
+                let idx = HUB_NAMES.iter().position(|n| *n == name).unwrap();
+                &self.hub_tags[idx]
+            }
+        }
+
+        /// Register a PLC connection (FakeClient, value 42) and a `"hub"`
+        /// connection with [`HUB_NAMES`], both on 100 ms groups, and start a
+        /// collector on them with `source`.
+        async fn start(
+            dir: &TempDir,
+            source: Arc<MockSource>,
+        ) -> (
+            Collector,
+            tokio::sync::broadcast::Receiver<crate::event::CollectEvent>,
+            Keys,
+        ) {
+            let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+            banto_tags::migrate(&pool).await.unwrap();
+            let conns = PlcConnectionService::new(pool.clone());
+            let groups = CollectionGroupService::new(pool.clone());
+            let tags = TagService::new(pool.clone());
+            let conn_input = |name: &str, protocol: &str| PlcConnectionInput {
+                name: name.to_string(),
+                protocol: protocol.to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 1,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "high_low".to_string(),
+                database: None,
+                username: None,
+                password: None,
+            };
+            let group_input = |conn: i64| CollectionGroupInput {
+                name: format!("G{conn}"),
+                plc_connection_id: conn,
+                period_ms: 100,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            };
+            let tag_input = |name: &str, group: i64, address: &str, data_type: &str| TagInput {
+                name: name.to_string(),
+                collection_group_id: group,
+                address: address.to_string(),
+                data_type: data_type.to_string(),
+                string_length: None,
+                string_encoding: "utf8".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            };
+
+            let plc = conns
+                .create(conn_input("PLC1", "modbus-tcp"))
+                .await
+                .unwrap();
+            let plc_group = groups.create(group_input(plc.id)).await.unwrap();
+            let plc_tag = tags
+                .create(tag_input("plc", plc_group.id, "40001", "i16"))
+                .await
+                .unwrap();
+            let hub = conns
+                .create(conn_input("Hub", banto_tags::HUB_PROTOCOL))
+                .await
+                .unwrap();
+            let hub_group = groups.create(group_input(hub.id)).await.unwrap();
+            let mut hub_tags = Vec::new();
+            for (i, name) in HUB_NAMES.iter().enumerate() {
+                let tag = tags
+                    .create(tag_input(&format!("h{i}"), hub_group.id, name, "f64"))
+                    .await
+                    .unwrap();
+                hub_tags.push(format!("tag:{}", tag.id));
+            }
+
+            let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+            let (config, exclusions) = build_config_lenient_with_thresholds(
+                &snapshot,
+                &HashMap::new(),
+                HubSource::Available { catalog: None },
+            );
+            assert!(exclusions.is_empty(), "{exclusions:?}");
+
+            let events_pool = banto_storage::connect_sqlite_memory().await.unwrap();
+            let events = EventSink::new(events_pool);
+            let rx = events.subscribe();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let factory: ClientFactory = Arc::new(move |_spec| {
+                Box::new(FakeClient {
+                    reads: reads.clone(),
+                }) as Box<dyn PlcClient>
+            });
+            let collector = Collector::start_with_sources(
+                config,
+                dir.path(),
+                Arc::new(SystemClock),
+                events,
+                CollectorOptions::default(),
+                factory,
+                Some(source as Arc<dyn ExternalSource>),
+            )
+            .await
+            .expect("start_with_sources");
+            let keys = Keys {
+                plc_tag: format!("tag:{}", plc_tag.id),
+                plc_group: format!("grp:{}", plc_group.id),
+                hub_conn: format!("conn:{}", hub.id),
+                hub_group: format!("grp:{}", hub_group.id),
+                hub_tags,
+            };
+            (collector, rx, keys)
+        }
+
+        /// Every stored row of `group_key` across the data files in `dir`
+        /// (read after `stop()` flushed and closed the writer).
+        async fn rows(dir: &TempDir, group_key: &str) -> Vec<Vec<Option<f64>>> {
+            let mut rows = Vec::new();
+            for file in banto_tstore::list_data_files(dir.path()).unwrap() {
+                let reader = banto_tstore::TsReader::open(&file.path).await.unwrap();
+                for sample in reader
+                    .read_range(group_key, i64::MIN, i64::MAX)
+                    .await
+                    .unwrap()
+                {
+                    rows.push(sample.values);
+                }
+            }
+            rows
+        }
+
+        /// The PLC connection's rows: after the first tick that read (the
+        /// first tick fires while its fake client is still connecting, an
+        /// all-NULL row like any PLC connection's), every row carries the
+        /// fake client's 42 - the hub connection beside it changes nothing.
+        fn assert_plc_rows_unaffected(plc_rows: &[Vec<Option<f64>>]) {
+            let read: Vec<&Vec<Option<f64>>> = plc_rows
+                .iter()
+                .skip_while(|row| row.as_slice() == [None])
+                .collect();
+            assert!(!read.is_empty(), "{plc_rows:?}");
+            assert!(
+                read.iter().all(|row| row.as_slice() == [Some(42.0)]),
+                "{plc_rows:?}"
+            );
+        }
+
+        fn connection_kinds(
+            events: &[crate::event::CollectEvent],
+            conn_key: &str,
+        ) -> Vec<EventKind> {
+            events
+                .iter()
+                .filter(|e| e.connection_key.as_deref() == Some(conn_key))
+                .map(|e| e.kind)
+                .filter(|k| {
+                    matches!(
+                        k,
+                        EventKind::PlcConnected
+                            | EventKind::PlcDisconnected
+                            | EventKind::PlcReconnected
+                    )
+                })
+                .collect()
+        }
+
+        /// The mapping table end to end, and **a steady value stays Good and
+        /// is recorded on every cycle** (H4: the subscription is on-change, so
+        /// an unchanged value is never re-sent - the snapshot here never
+        /// changes at all for the whole run). Simulated, stale, bad,
+        /// unknown-quality and absent values are never written; the PLC
+        /// connection beside it is untouched.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn live_values_are_recorded_every_cycle_and_mapped_by_quality_and_source() {
+            let dir = TempDir::new();
+            let source = MockSource::new(ExternalSnapshot::live(held_values()));
+            let (collector, mut rx, keys) = start(&dir, source.clone()).await;
+
+            // Well past the 2.5-period Stale horizon of the cache, with no
+            // change at all in what the source holds.
+            source.wait_samples(12).await;
+
+            let current = collector.current_values();
+            let get = |name: &str| current.get(keys.hub_tag(name)).expect("cached");
+            assert_eq!(
+                (get(MEASURED).value, get(MEASURED).quality),
+                (Some(7.0), Quality::Good)
+            );
+            assert_eq!(
+                (get(SIMULATED).value, get(SIMULATED).quality),
+                (Some(8.0), Quality::Good),
+                "a simulated value is still shown (#413)"
+            );
+            assert_eq!(
+                (get(STALE).value, get(STALE).quality),
+                (Some(9.0), Quality::Stale)
+            );
+            for name in [BAD, UNKNOWN_QUALITY, ABSENT] {
+                assert_eq!((get(name).value, get(name).quality), (None, Quality::Bad));
+            }
+            assert_eq!(
+                collector.status().get(&keys.hub_conn),
+                Some(&ConnectionStatus::Connected)
+            );
+            assert_eq!(
+                current.get(&keys.plc_tag).map(|s| (s.value, s.quality)),
+                Some((Some(42.0), Quality::Good))
+            );
+
+            collector.stop().await.expect("stop");
+
+            let hub_rows = rows(&dir, &keys.hub_group).await;
+            assert!(hub_rows.len() >= 10, "{} rows", hub_rows.len());
+            for row in &hub_rows {
+                assert_eq!(
+                    row,
+                    &vec![Some(7.0), None, None, None, None, None],
+                    "only the measured good value is recorded, on every row"
+                );
+            }
+            assert_plc_rows_unaffected(&rows(&dir, &keys.plc_group).await);
+
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            assert_eq!(
+                connection_kinds(&events, &keys.hub_conn),
+                vec![EventKind::PlcConnected]
+            );
+        }
+
+        /// H4: while the Hub link is not Live **every** hub tag is Bad and
+        /// recorded as null - even though the source still holds the last
+        /// values - and the link's drop and return are exactly one
+        /// `plc_disconnected` and one `plc_reconnected` under the hub
+        /// connection's key, however many cycles the outage lasts. The PLC
+        /// connection keeps recording through it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_hub_outage_is_bad_and_null_with_one_disconnect_and_one_reconnect() {
+            let dir = TempDir::new();
+            let source = MockSource::new(ExternalSnapshot::live(held_values()));
+            let (collector, mut rx, keys) = start(&dir, source.clone()).await;
+            let current = collector.current_values();
+            let measured = || current.get(keys.hub_tag(MEASURED)).expect("cached");
+
+            source.wait_samples(3).await;
+            assert_eq!(measured().quality, Quality::Good);
+
+            // Down, but still *holding* the last values: a Down link must
+            // never let them through.
+            source.set(ExternalSnapshot {
+                link: crate::external::ExternalLink::Down {
+                    detail: Some("Hub の購読: reconnecting".to_string()),
+                },
+                values: held_values(),
+            });
+            source.wait_samples(6).await;
+            assert_eq!((measured().value, measured().quality), (None, Quality::Bad));
+            for name in HUB_NAMES {
+                assert_eq!(
+                    current
+                        .get(keys.hub_tag(name))
+                        .map(|s| (s.value, s.quality)),
+                    Some((None, Quality::Bad)),
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                collector.status().get(&keys.hub_conn),
+                Some(&ConnectionStatus::Reconnecting { attempt: 1 })
+            );
+            assert_eq!(
+                current.get(&keys.plc_tag).map(|s| s.quality),
+                Some(Quality::Good),
+                "the PLC connection is unaffected"
+            );
+
+            source.set(ExternalSnapshot::live(held_values()));
+            source.wait_samples(3).await;
+            assert_eq!(
+                (measured().value, measured().quality),
+                (Some(7.0), Quality::Good)
+            );
+
+            collector.stop().await.expect("stop");
+
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            assert_eq!(
+                connection_kinds(&events, &keys.hub_conn),
+                vec![
+                    EventKind::PlcConnected,
+                    EventKind::PlcDisconnected,
+                    EventKind::PlcReconnected,
+                ],
+                "{events:?}"
+            );
+            let disconnect = events
+                .iter()
+                .find(|e| e.kind == EventKind::PlcDisconnected)
+                .unwrap();
+            assert_eq!(
+                disconnect.detail.as_deref(),
+                Some("Hub の購読: reconnecting")
+            );
+
+            let hub_rows = rows(&dir, &keys.hub_group).await;
+            let measured_column: Vec<Option<f64>> = hub_rows.iter().map(|row| row[0]).collect();
+            let nulls = measured_column.iter().filter(|v| v.is_none()).count();
+            assert!(
+                nulls >= 5,
+                "the outage is recorded as null rows: {measured_column:?}"
+            );
+            assert!(measured_column.contains(&Some(7.0)));
+            assert!(
+                measured_column
+                    .iter()
+                    .all(|v| v.is_none() || *v == Some(7.0)),
+                "{measured_column:?}"
+            );
+            assert_plc_rows_unaffected(&rows(&dir, &keys.plc_group).await);
+        }
+
+        /// PR #578 review: a collector started **without** a source refuses
+        /// an `apply_config` that brings in a hub connection - before
+        /// touching anything. Its config is unchanged, the PLC task keeps
+        /// running and recording, and no hub task appears.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn apply_config_refuses_a_hub_connection_without_a_source() {
+            // Build the PLC-only and the PLC + hub configs from one registry.
+            let src_dir = TempDir::new();
+            let source = MockSource::new(ExternalSnapshot::down(None));
+            let (with_hub, _rx, keys) = start(&src_dir, source).await;
+            let hub_config = with_hub.config.clone();
+            with_hub.stop().await.expect("stop");
+            let mut plc_only = hub_config.clone();
+            plc_only
+                .connections
+                .retain(|c| c.config != ProtocolConfig::External);
+            plc_only
+                .store_config
+                .groups
+                .retain(|g| g.key != keys.hub_group);
+            assert!(!plc_only.has_external_connections());
+
+            let dir = TempDir::new();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let factory = {
+                let reads = reads.clone();
+                Arc::new(move |_spec: &crate::task::ClientSpec| {
+                    Box::new(FakeClient {
+                        reads: reads.clone(),
+                    }) as Box<dyn PlcClient>
+                }) as ClientFactory
+            };
+            let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+            let mut collector = Collector::start_with_client_factory(
+                plc_only.clone(),
+                dir.path(),
+                Arc::new(SystemClock),
+                EventSink::new(pool),
+                CollectorOptions::default(),
+                factory.clone(),
+            )
+            .await
+            .expect("start without sources");
+
+            let result = collector.apply_config(hub_config, factory).await;
+            assert!(
+                matches!(&result, Err(CollectError::Config(m)) if m == MISSING_EXTERNAL_SOURCE),
+                "{:?}",
+                result.map(|r| r.added)
+            );
+            assert_eq!(collector.config, plc_only, "config unchanged");
+            assert!(!collector.tasks.contains_key(&keys.hub_conn));
+            assert_eq!(collector.status().get(&keys.hub_conn), None);
+
+            // The PLC task is still running: its reads keep climbing.
+            let before = reads.load(Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while reads.load(Ordering::SeqCst) < before + 3 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the PLC task stopped reading after the refused apply_config"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            collector.stop().await.expect("stop");
+            assert_plc_rows_unaffected(&rows(&dir, &keys.plc_group).await);
+        }
+
+        /// A config with a hub connection is refused without a source (it
+        /// could only ever read "not Live").
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_hub_config_without_a_source_is_refused() {
+            let dir = TempDir::new();
+            let source = MockSource::new(ExternalSnapshot::down(None));
+            let (collector, _rx, _keys) = start(&dir, source).await;
+            let config = collector.config.clone();
+            collector.stop().await.expect("stop");
+
+            let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+            let result = Collector::start_with_client_factory(
+                config,
+                dir.path(),
+                Arc::new(SystemClock),
+                EventSink::new(pool),
+                CollectorOptions::default(),
+                default_client_factory(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(CollectError::Config(_))),
+                "{:?}",
+                result.err()
+            );
+        }
     }
 
     /// T9-1: toggling only `simulation` (everything else on the connection

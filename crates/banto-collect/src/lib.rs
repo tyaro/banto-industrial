@@ -42,6 +42,15 @@
 //!   docs/tag-server-design.md §6-5) the [`ClientFactory`]/[`ClientSpec`]/
 //!   [`ClientProtocol`] client-construction injection seam and its
 //!   [`default_client_factory`].
+//! - [`external`] (#383 段階3 P3, 2026-10-10 オーナー決定 H2/H4): the
+//!   [`ExternalSource`] seam for a `"hub"` connection - values banto-hub
+//!   already collected, sampled-and-held into the **same** daily tstore file,
+//!   single writer, events, quality and group cycle as the PLC connections.
+//!   This crate defines the trait and the quality/record mapping; the app
+//!   (ChronoGazer's `hub.rs`, on `banto-tagclient`) implements it and passes
+//!   it to [`Collector::start_with_sources`]. Whether a hub connection is
+//!   collected at all is decided at build time by [`HubSource`] (banto-hub's
+//!   strict build passes none and still refuses a hub connection).
 //!
 //! ## Why `migrate` is not `sqlx::migrate!`
 //!
@@ -68,6 +77,9 @@ pub mod config;
 pub mod current;
 pub mod error;
 pub mod event;
+// #383 段階3 P3: the external value source (banto-hub as a data source) -
+// the trait the app implements and the pure mapping the task uses.
+pub mod external;
 // T9-1/T9-2 (docs/ux-plan.md §1): in-process simulator lifecycle for
 // `simulation = true` connections. Started life as a pure implementation
 // detail of `crate::collector::Collector`; T9-2 (apps/banto-hub/core's
@@ -84,7 +96,8 @@ pub use config::{
     build_config, build_config_from, build_config_lenient_from,
     build_config_lenient_with_thresholds, check_tag_address, config_exclusions,
     connections_with_collected_groups, CollectorConfig, ConfigExclusion, ExclusionReason,
-    ExclusionUnit, Protocol, RegistrySnapshot, TagAddressField, TagAddressIssue, Thresholds,
+    ExclusionUnit, HubCatalog, HubSource, Protocol, RegistrySnapshot, TagAddressField,
+    TagAddressIssue, Thresholds,
 };
 pub use current::{
     CurrentReading, CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR,
@@ -92,6 +105,10 @@ pub use current::{
 pub use error::CollectError;
 pub use event::{
     CollectEvent, EventKind, EventSink, ThresholdLevel, DEFAULT_EVENT_CHANNEL_CAPACITY,
+};
+pub use external::{
+    ExternalLink, ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource,
+    ExternalValueSource,
 };
 pub use task::{
     default_client_factory, BackoffConfig, ClientFactory, ClientProtocol, ClientSpec,

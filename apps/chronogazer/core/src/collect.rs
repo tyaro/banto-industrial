@@ -32,12 +32,43 @@
 //! * 画面（収集の状態表示・現在値表示・イベント一覧ページ）は **C-3b**、
 //! * シミュレータハーネスと E2E は **C-4**（`tests/collect_roundtrip.rs` と
 //!   `e2e/tests/user-simulator-roundtrip.spec.ts`）、
-//! * Hub 経由で受けている値の保存・合流は **段階3**（`crate::hub` は触らない）。
+//! * Hub 経由で受けている値の保存・合流は **段階3**（P3 で収集までは入った。
+//!   下の「Hub 経由の接続」）。
 //!
-//! # 扱う対象（段階2b）
+//! # 扱う対象
 //!
-//! **SLMP / Modbus TCP の直結のみ**。Hub 接続は設定 KV（`hub.record`）のままの
-//! 別建てで、`plc_connections` には何も足していない（マイグレーション無し）。
+//! 段階2b は **SLMP / Modbus TCP の直結のみ**だった。#383 段階3 の P3
+//! （2026-10-10 オーナー決定 H2）で、`plc_connections.protocol = hub` の接続
+//! （P2 で `banto-tags` に入った種別。Hub は 1 つ）も**同じ収集エンジン**で
+//! 収集する - 下の「Hub 経由の接続」。
+//!
+//! # Hub 経由の接続（#383 段階3 P3）
+//!
+//! * 値は `crate::hub` の購読から取る（[`HubService::collect_source`]、
+//!   `banto_collect::ExternalSource` の実装）。日次の tstore ファイル・
+//!   書き手・イベント・品質・収集グループの周期は PLC 直結のタグと共有で、
+//!   読み出し（現在値・履歴・イベント）も同じ口に出る。
+//! * **開始のたびに**、レジストリの有効な hub 接続 → 有効なグループ →
+//!   有効なタグの `address`（= Hub の外部名、H3）を集めて購読の需要にし
+//!   （[`HubService::prepare_collect`]）、その時点の Hub のタグ一覧と
+//!   突き合わせる - 消えた・データ型が変わったタグは `hubTagNotFound` /
+//!   `hubTagTypeChanged` で**そのタグだけ**外し、残りは動かす（#414 と同じ）。
+//!   Hub が答えなかったら突き合わせずに動かす（そのタグは Hub が Live に
+//!   なっても値が無く Bad のまま。次の開始で外れる）。
+//! * Hub が使えない実行形態（[`CollectorService::attach_hub`] を呼んでいない
+//!   `banto-serve` - OS キーリングが無く購読できない）では `hubSourceUnavailable`、
+//!   Hub への接続が設定されていなければ `hubNotConfigured` で、hub 接続を
+//!   配下ごと外す。PLC 直結の側はそのまま動く。
+//! * 停止で需要を取り下げる（[`HubService::release_collect`]。Hub は叩かない）。
+//! * 品質と記録（H4）は `banto_collect::external` のモジュール doc の表。
+//!   要点: Hub が Live でない間は全タグ Bad で null、Live かつ good の定常値は
+//!   周期ごとに記録して Good のまま（Hub の `t` で鮮度を判定しない）、Hub の
+//!   `stale` は Stale（記録は null）、`simulation`・`derived_simulation` は
+//!   表示するが記録しない。イベントは Hub の接続キーの `plc_connected` /
+//!   `plc_disconnected` / `plc_reconnected`。
+//! * `/tags` の印（[`registry_exclusions`]）はレジストリの中身だけで判定する
+//!   ので、hub 接続そのものは印に出ない（実行形態と Hub の今の状態は、走って
+//!   いる収集の除外一覧に出る）。
 //!
 //! # 状態の表現 — 「収集対象 0 件」は異常ではない
 //!
@@ -548,7 +579,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use banto_collect::{
     build_config_lenient_with_thresholds, config_exclusions, ClientFactory, CollectError,
     CollectEvent, Collector, CollectorOptions, ConfigExclusion, ConnectionStatus, CurrentReading,
-    CurrentValuesHandle, EventSink, ExclusionUnit, Quality, RegistrySnapshot,
+    CurrentValuesHandle, EventSink, ExclusionUnit, HubSource, Quality, RegistrySnapshot,
 };
 use banto_core::{BantoError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
@@ -556,6 +587,7 @@ use banto_tstore::{Clock, SystemClock};
 // ロールの下限（`COLLECT_OPERATION_ROLE` / `COLLECT_READ_ROLE`）だけ、この
 // service 層が名前を出す - 両経路の床を 1 か所で決めるため（transport の
 // 知識ではなく「この資源を触ってよいのは誰か」という資源側の性質）。
+use crate::hub::{HubCollectReadiness, HubService};
 use crate::users::Role;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -1556,6 +1588,10 @@ struct CollectorContext {
     /// 状態と現在値ハンドルを**1 本のロックに同居**させている理由は、この
     /// モジュールの doc「ライフサイクルは専用タスクが所有する」の末尾。
     published: Mutex<Published>,
+    /// Hub 経由の接続の値の出どころ（#383 段階3 P3）。**設定された実行形態
+    /// だけ**（デスクトップ。[`CollectorService::attach_hub`]）。無ければ hub
+    /// 接続は `hubSourceUnavailable` で外す。一度入れたら差し替えない。
+    hub: OnceLock<HubService>,
     /// **テスト専用**（製品ビルドにはフィールドごと存在しない）: 起動処理を
     /// 「[`CollectorState::Starting`] を立てた直後・tstore を開く前」で
     /// 止められるゲート。[`COLLECT_OPERATION_TIMEOUT`] の受入条件
@@ -1753,9 +1789,20 @@ impl CollectorService {
                 writer: None,
             }),
             writer_gate: tokio::sync::Mutex::new(()),
+            hub: OnceLock::new(),
             #[cfg(test)]
             start_gate: None,
         })
+    }
+
+    /// Hub 経由の接続を収集できるようにする（#383 段階3 P3）。OS キーリングを
+    /// 持つ実行形態（`src-tauri`）が、**自動開始を spawn する前に**呼ぶ。
+    /// `banto-serve` は呼ばない（キーリングが無く購読できないので、hub 接続は
+    /// `hubSourceUnavailable` で外れる）。2 回目以降は無視する（`false`）。
+    ///
+    /// 反映は次の開始から（走っている収集は作り直さない）。
+    pub fn attach_hub(&self, hub: HubService) -> bool {
+        self.inner.ctx.hub.set(hub).is_ok()
     }
 
     fn from_context(ctx: CollectorContext) -> Self {
@@ -2159,6 +2206,7 @@ impl CollectorService {
                 ctx: self.inner.ctx.clone(),
                 collector: None,
                 simulated: HashSet::new(),
+                hub_demand: false,
             };
             tokio::spawn(lifecycle.run(rx, read_rx));
             Channels {
@@ -2304,6 +2352,7 @@ impl CollectorService {
                 writer: None,
             }),
             writer_gate: tokio::sync::Mutex::new(()),
+            hub: OnceLock::new(),
             start_gate: Some(gate),
         })
     }
@@ -2324,6 +2373,9 @@ struct Lifecycle {
     /// 停止で空にする。`collector` と同じくこのタスクだけが書くので、
     /// 接続状態の応答（[`ConnectionSnapshot`]）と食い違わない。
     simulated: HashSet<String>,
+    /// 今の開始で Hub に購読の需要を出したか（#383 段階3 P3）。停止・開始の
+    /// 失敗で取り下げる（[`Self::release_hub_demand`]）。このタスクだけが書く。
+    hub_demand: bool,
 }
 
 impl Lifecycle {
@@ -2444,8 +2496,37 @@ impl Lifecycle {
         // `exclusions` に入る）。banto-hub が使う厳格版 `build_config_from`
         // は変えていない。除外の判定はしきい値に依らない
         // （`build_config_lenient_from` と同じ解釈器）。
-        let (config, exclusions) = build_config_lenient_with_thresholds(&snapshot, &thresholds);
+        // #383 段階3 P3: Hub 経由の接続があれば、Hub に購読の需要を出して
+        // 開始の時点のタグ一覧をもらう（モジュール doc「Hub 経由の接続」）。
+        // 無ければ Hub には何も聞かない。
+        let hub = self.ctx.hub.get().cloned();
+        let readiness = match (hub_external_names(&snapshot), &hub) {
+            (Some(names), Some(hub)) => {
+                self.hub_demand = true;
+                Some(hub.prepare_collect(names).await)
+            }
+            _ => None,
+        };
+        let hub_source = match &readiness {
+            Some(HubCollectReadiness::Ready { catalog }) => HubSource::Available {
+                catalog: catalog.as_ref(),
+            },
+            Some(HubCollectReadiness::NotConfigured) => HubSource::NotConfigured,
+            // hub 接続が無い（どれを渡しても同じ）か、Hub を持たない実行形態。
+            None => HubSource::Unavailable,
+        };
+        let (config, exclusions) =
+            build_config_lenient_with_thresholds(&snapshot, &thresholds, hub_source);
         let exclusions = exclusion_views(&exclusions);
+        let external = match (&hub, config.has_external_connections()) {
+            (Some(hub), true) => Some(hub.collect_source()),
+            // 収集する hub 接続が残らなかった（未設定・全部外れた）なら、
+            // 出した需要はもう要らない。
+            _ => {
+                self.release_hub_demand().await;
+                None
+            }
+        };
 
         // 「収集対象なし」は **`Collector::start` に渡す前に**分岐する。
         // 渡すと `CollectError::Config` になり、本物の構成エラーと同じ入れ物に
@@ -2458,6 +2539,12 @@ impl Lifecycle {
         // ではなく、動かすものが残らなかった。外した一覧は状態に持たせるので
         // 画面から見える。
         if config.tag_count() == 0 {
+            // #383 段階3 P3（PR #578 レビュー）: **収集が立たずに開始を終える
+            // ときは、必ず Hub への需要を取り下げる**。上の分岐で取り下げ
+            // 済みのはずだが（hub のタグが 1 本も残らなければ外部接続は計画に
+            // 載らない）、ここで重ねて呼ぶ（冪等）- 残すと、収集していない
+            // タグの購読が停止でも外れずに居座る。
+            self.release_hub_demand().await;
             let state = CollectorState::NoTargets { exclusions };
             self.ctx.publish(state.clone(), None);
             return Ok(state);
@@ -2465,13 +2552,14 @@ impl Lifecycle {
 
         let groups = config.group_count();
         let tags = config.tag_count();
-        let collector = match Collector::start_with_client_factory(
+        let collector = match Collector::start_with_sources(
             config,
             &self.ctx.data_dir,
             self.ctx.clock.clone(),
             self.ctx.events.clone(),
             self.ctx.options,
             self.ctx.factory.clone(),
+            external,
         )
         .await
         {
@@ -2480,7 +2568,10 @@ impl Lifecycle {
             // （走っている構成が無い）- 一覧は捨てられ、次の開始で組み直す
             // ので、古い一覧が残ることもない。不正な設定そのものは `/tags`
             // の印（[`registry_exclusions`]）で引き続き分かる。
-            Err(err) => return Err(self.fail_start(err)),
+            Err(err) => {
+                self.release_hub_demand().await;
+                return Err(self.fail_start(err));
+            }
         };
 
         // **成功を確かめてから**状態を上げる（先に Running にして失敗時に
@@ -2507,8 +2598,11 @@ impl Lifecycle {
 
     async fn stop(&mut self) -> Result<CollectorState, BantoError> {
         let Some(collector) = self.collector.take() else {
-            // 走っていない: **何もしない**。状態も触らない（`NoTargets` /
-            // `StartFailed` の理由を握り潰さないため）。
+            // 走っていない: 状態は触らない（`NoTargets` / `StartFailed` の理由を
+            // 握り潰さないため）。ただし Hub への需要が残っていれば取り下げる
+            // （#383 段階3 P3、PR #578 レビュー: 開始が収集を立てずに終わった
+            // 経路の取りこぼしを、停止が必ず拾う。出していなければ何もしない）。
+            self.release_hub_demand().await;
             return Ok(self.ctx.state());
         };
 
@@ -2519,9 +2613,15 @@ impl Lifecycle {
         // `TsWriter::close` に進むと、共有扱いになって close されない
         // （[`Published::writer`] の doc）。逆に、停止の途中（close の最中）に
         // 書き手なしの削除が走ることも無くなる。
-        let _prune_gate = self.ctx.writer_gate.lock().await;
+        // （ゲートは `ctx` の `Arc` の写し越しに握る - 下で `self` を可変で
+        // 借りる `release_hub_demand` と並べるため。）
+        let ctx = Arc::clone(&self.ctx);
+        let _prune_gate = ctx.writer_gate.lock().await;
         let result = collector.stop().await;
         self.simulated.clear();
+        // #383 段階3 P3: 収集が止まったので Hub への需要も取り下げる（Hub は
+        // 叩かない。`HubService::release_collect`）。
+        self.release_hub_demand().await;
         // 止まったことは確定なので、flush の成否に関わらず `Stopped` にする。
         // **現在値ハンドルの取り下げもここ**（C-3a）- 停止が実体まで終わって
         // から降ろすので、停止処理の最中はまだ最後の値が読める（止まったのに
@@ -2542,6 +2642,16 @@ impl Lifecycle {
         self.start().await
     }
 
+    /// 出していた Hub への購読の需要を取り下げる（#383 段階3 P3）。出して
+    /// いなければ何もしない。
+    async fn release_hub_demand(&mut self) {
+        if std::mem::take(&mut self.hub_demand) {
+            if let Some(hub) = self.ctx.hub.get() {
+                hub.release_collect().await;
+            }
+        }
+    }
+
     /// 起動の失敗を状態に焼き付けて、同じ理由を `Err` として返す。
     /// **[`CollectError`] の文言をそのまま捨てない**。
     fn fail_start(&self, err: CollectError) -> BantoError {
@@ -2554,6 +2664,41 @@ impl Lifecycle {
         );
         collect_error_with_reason(err, reason)
     }
+}
+
+/// 収集が Hub に求める外部名（#383 段階3 P3、H3 の同一性）: **有効な** hub
+/// 接続の**有効な**グループの**有効な**タグの `address`（前後の空白を除く）。
+/// 文字列型は収集しない（`banto_collect` の組み立てと同じ）。有効な hub 接続が
+/// 無ければ `None`（= Hub には何も聞かない）。**純関数**。
+fn hub_external_names(snapshot: &RegistrySnapshot) -> Option<Vec<String>> {
+    let hub_connections: HashSet<i64> = snapshot
+        .connections
+        .iter()
+        .filter(|conn| conn.enabled && conn.is_hub_source())
+        .map(|conn| conn.id)
+        .collect();
+    if hub_connections.is_empty() {
+        return None;
+    }
+    let hub_groups: HashSet<i64> = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.enabled && hub_connections.contains(&group.plc_connection_id))
+        .map(|group| group.id)
+        .collect();
+    let mut names: Vec<String> = snapshot
+        .tags
+        .iter()
+        .filter(|tag| {
+            tag.enabled
+                && hub_groups.contains(&tag.collection_group_id)
+                && tag.data_type != banto_tags::STRING_DATA_TYPE
+        })
+        .map(|tag| tag.address.trim().to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    Some(names)
 }
 
 /// 現在値の「走っていない / 読めて 0 件 / 読めて N 件」の言い分け（**純関数**）。
@@ -3625,16 +3770,16 @@ mod tests {
         svc.stop().await.expect("stop");
     }
 
-    /// #383 段階3 P2: レジストリに Hub 経由の接続（`protocol: "hub"`）と、その
-    /// 下のグループ・タグがあっても、収集の開始は失敗しない - Hub 接続は
-    /// `hubSourceNotYetCollected`（Hub のサンプラーは P3）で外れ、グループと
+    /// #383 段階3 P2/P3: Hub を持たない実行形態（[`CollectorService::attach_hub`]
+    /// を呼んでいない = `banto-serve`）では、レジストリに Hub 経由の接続
+    /// （`protocol: "hub"`）と、その下のグループ・タグがあっても、収集の開始は
+    /// 失敗しない - Hub 接続は `hubSourceUnavailable` で外れ、グループと
     /// タグは連鎖で外れ、PLC 直結の側はそのまま `Running`（#414 の
-    /// 「外して残りを動かす」）。`/tags` の印も同じものを返す。
-    ///
-    /// 反証: `banto_collect` の `parse_protocol` から `hub` の分岐を消すと
-    /// 理由が `unsupportedProtocol` になり、ここの比較で落ちる。
+    /// 「外して残りを動かす」）。`/tags` の印はレジストリの中身だけで判定する
+    /// ので、Hub 接続は印に出ない（実行形態の事情は走っている収集の除外一覧に
+    /// 出る）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hub_connection_is_left_out_and_the_plc_side_keeps_running() {
+    async fn a_hub_connection_is_left_out_where_there_is_no_hub_and_the_plc_side_keeps_running() {
         let dir = TempDir::new();
         let (pool, svc) = service(&dir).await;
         let group_id = seed_enabled_group(&pool).await;
@@ -3675,8 +3820,8 @@ mod tests {
                 id: hub.id,
                 key: format!("conn:{}", hub.id),
                 name: "Hub".to_string(),
-                reason: "hubSourceNotYetCollected",
-                message: "Hub 経由の接続からの収集にはまだ対応していません".to_string(),
+                reason: "hubSourceUnavailable",
+                message: "この実行形態では Hub 経由の接続から収集できません".to_string(),
             },
             ExclusionView {
                 unit: ExclusionUnitView::Group,
@@ -3702,7 +3847,7 @@ mod tests {
         )
         .await
         .expect("registry_exclusions");
-        assert_eq!(marks, expected);
+        assert_eq!(marks, Vec::new(), "印はレジストリの中身だけで判定する");
 
         match settled(svc.start().await.expect("start")) {
             CollectorState::Running {
@@ -3716,6 +3861,263 @@ mod tests {
             other => panic!("Running を期待したが {other:?}"),
         }
         svc.stop().await.expect("stop");
+    }
+
+    /// レジストリに Hub 経由の接続 1・グループ 1・タグ 1 を足し、
+    /// `(接続 id, グループ id, タグ id)` を返す。
+    async fn seed_hub_connection(pool: &SqlitePool) -> (i64, i64, i64) {
+        let hub = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "Hub".to_string(),
+                protocol: banto_tags::HUB_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: String::new(),
+                database: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .expect("create hub connection");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "HubG".to_string(),
+                plc_connection_id: hub.id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            })
+            .await
+            .expect("create hub group");
+        let tag = seed_named_tag(pool, group.id, "remote", "PLC9.G.Temp").await;
+        (hub.id, group.id, tag)
+    }
+
+    /// #383 段階3 P3: Hub をつないだ（デスクトップの形の）収集でも、Hub への
+    /// 接続が設定されていなければ Hub 接続は `hubNotConfigured` で配下ごと
+    /// 外れ、PLC 直結の側は `Running`。開始で出した購読の需要は、収集する
+    /// Hub 接続が残らなかったのでその場で取り下げる（停止を待たない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hub_connection_without_a_configured_hub_is_left_out_with_that_reason() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+        let (hub_id, hub_group, hub_tag) = seed_hub_connection(&pool).await;
+
+        let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
+        let hub = HubService::new(settings, Arc::new(crate::hub::UnavailableKeyStore))
+            .await
+            .expect("HubService::new");
+        assert!(svc.attach_hub(hub.clone()));
+        assert!(!svc.attach_hub(hub.clone()), "2 回目は無視する");
+
+        match settled(svc.start().await.expect("start")) {
+            CollectorState::Running {
+                groups,
+                tags,
+                exclusions,
+            } => {
+                assert_eq!((groups, tags), (1, 1), "PLC 直結の側は動く");
+                let listed: Vec<(i64, &str)> =
+                    exclusions.iter().map(|e| (e.id, e.reason)).collect();
+                assert_eq!(
+                    listed,
+                    vec![
+                        (hub_id, "hubNotConfigured"),
+                        (hub_group, "connectionExcluded"),
+                        (hub_tag, "connectionExcluded"),
+                    ]
+                );
+            }
+            other => panic!("Running を期待したが {other:?}"),
+        }
+        // 需要は取り下げ済み（外部名が Hub の購読に残っていない）。
+        assert_eq!(hub.collect_demand_for_test().await, Vec::<String>::new());
+        svc.stop().await.expect("stop");
+    }
+
+    /// Hub をつないだ収集サービス（Hub の答えは `answer` に決め打ち）。
+    async fn hub_attached(
+        svc: &CollectorService,
+        pool: &SqlitePool,
+        answer: HubCollectReadiness,
+    ) -> HubService {
+        let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
+        let hub = HubService::new(settings, Arc::new(crate::hub::UnavailableKeyStore))
+            .await
+            .expect("HubService::new");
+        hub.answer_prepare_for_test(answer);
+        assert!(svc.attach_hub(hub.clone()));
+        hub
+    }
+
+    /// #383 段階3 P3（PR #578 レビュー）: Hub のタグが**全部**外れて（ここでは
+    /// データ型が変わった）収集対象が無い開始は `NoTargets` で終わり、出した
+    /// Hub への需要は**その場で**取り下がる - 収集していないタグの購読を残さ
+    /// ない。その後の停止（走っている収集は無い）でも取り下がったまま（冪等）。
+    ///
+    /// 反証: 開始の「収集する hub 接続が残らなかった」分岐と `NoTargets` の
+    /// 分岐の取り下げを両方消すと、開始直後の需要の確認で落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_with_every_hub_tag_excluded_withdraws_the_hub_demand() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let (_hub_id, _hub_group, hub_tag) = seed_hub_connection(&pool).await;
+        let hub = hub_attached(
+            &svc,
+            &pool,
+            HubCollectReadiness::Ready {
+                catalog: Some(banto_collect::HubCatalog::from([(
+                    "PLC9.G.Temp".to_string(),
+                    "f32".to_string(),
+                )])),
+            },
+        )
+        .await;
+
+        match settled(svc.start().await.expect("start")) {
+            CollectorState::NoTargets { exclusions } => {
+                let listed: Vec<(i64, &str)> =
+                    exclusions.iter().map(|e| (e.id, e.reason)).collect();
+                assert_eq!(listed, vec![(hub_tag, "hubTagTypeChanged")]);
+            }
+            other => panic!("NoTargets を期待したが {other:?}"),
+        }
+        assert_eq!(
+            hub.collect_demand_for_test().await,
+            Vec::<String>::new(),
+            "収集が立たなかったので需要は残さない"
+        );
+
+        // 走っている収集は無いが、停止しても壊れず、需要も空のまま。
+        settled(svc.stop().await.expect("stop"));
+        assert_eq!(hub.collect_demand_for_test().await, Vec::<String>::new());
+    }
+
+    /// 普通の開始 → 停止: 走っている間は Hub のタグの外部名が需要に入り、
+    /// 停止で取り下がる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_hub_collection_holds_the_demand_until_stop() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_named_tag(&pool, group_id, "good", "40001").await;
+        seed_hub_connection(&pool).await;
+        let hub = hub_attached(
+            &svc,
+            &pool,
+            HubCollectReadiness::Ready {
+                catalog: Some(banto_collect::HubCatalog::from([(
+                    "PLC9.G.Temp".to_string(),
+                    "i16".to_string(),
+                )])),
+            },
+        )
+        .await;
+
+        match settled(svc.start().await.expect("start")) {
+            CollectorState::Running {
+                groups,
+                tags,
+                exclusions,
+            } => {
+                assert_eq!((groups, tags), (2, 2));
+                assert!(exclusions.is_empty(), "{exclusions:?}");
+            }
+            other => panic!("Running を期待したが {other:?}"),
+        }
+        assert_eq!(
+            hub.collect_demand_for_test().await,
+            vec!["PLC9.G.Temp".to_string()]
+        );
+        svc.stop().await.expect("stop");
+        assert_eq!(hub.collect_demand_for_test().await, Vec::<String>::new());
+    }
+
+    /// 収集が Hub に求める外部名は、有効な hub 接続の有効なグループの有効な
+    /// タグの `address` だけ（**純関数**）。hub 接続が無ければ `None`（Hub に
+    /// 何も聞かない）。
+    #[test]
+    fn hub_external_names_come_from_enabled_hub_rows_only() {
+        use banto_tags::{CollectionGroup, PlcConnection, Tag};
+        let conn = |id: i64, protocol: &str, enabled: bool| PlcConnection {
+            id,
+            name: format!("c{id}"),
+            protocol: protocol.to_string(),
+            host: String::new(),
+            port: 0,
+            unit_id: 1,
+            enabled,
+            simulation: false,
+            word_order: String::new(),
+            database: None,
+            username: None,
+            password: None,
+        };
+        let group = |id: i64, conn: i64, enabled: bool| CollectionGroup {
+            id,
+            name: format!("g{id}"),
+            plc_connection_id: conn,
+            period_ms: 1_000,
+            enabled,
+            default_writable: false,
+            query_sql: None,
+        };
+        let tag = |id: i64, group: i64, address: &str, enabled: bool| Tag {
+            id,
+            name: format!("t{id}"),
+            collection_group_id: group,
+            address: address.to_string(),
+            data_type: "f64".to_string(),
+            string_length: None,
+            string_encoding: "utf8".to_string(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            enabled,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
+            revision: 1,
+        };
+        let plc_only = RegistrySnapshot {
+            connections: vec![conn(1, "modbus-tcp", true)],
+            groups: vec![group(10, 1, true)],
+            tags: vec![tag(100, 10, "40001", true)],
+        };
+        assert_eq!(hub_external_names(&plc_only), None);
+
+        let snapshot = RegistrySnapshot {
+            connections: vec![conn(1, "modbus-tcp", true), conn(2, "hub", true)],
+            groups: vec![group(10, 1, true), group(20, 2, true), group(21, 2, false)],
+            tags: vec![
+                tag(100, 10, "40001", true),
+                tag(200, 20, " B.G.b ", true),
+                tag(201, 20, "A.G.a", true),
+                tag(202, 20, "A.G.off", false),
+                tag(203, 21, "A.G.group_off", true),
+                tag(204, 20, "A.G.a", true),
+            ],
+        };
+        assert_eq!(
+            hub_external_names(&snapshot),
+            Some(vec!["A.G.a".to_string(), "B.G.b".to_string()])
+        );
+
+        let disabled_hub = RegistrySnapshot {
+            connections: vec![conn(2, "hub", false)],
+            ..snapshot
+        };
+        assert_eq!(hub_external_names(&disabled_hub), None);
     }
 
     /// 収集対象があるときは本当に起動し、読み出しが「走っている」形になる。

@@ -873,8 +873,8 @@ fn default_tag_decimals() -> i64 {
 /// ここで拒否されるのが安全側のデフォルト）。#383 段階3 P2 で 5 つ目の
 /// `"hub"`（Hub 経由の接続、2026-10-10 オーナー決定 H1）が増えたが、
 /// これは chronogazer のための種別で、作成の導線（Hub のカタログから登録）は
-/// P4 で足す。それまではここで拒否したままにする（レジストリの検証と収集の
-/// 除外 - `banto_collect` の `HubSourceNotYetCollected` - だけが先に入る）。REST の create/update ハンドラ
+/// P4 で足す。それまではここで拒否したままにする（レジストリの検証と、P3 の
+/// 収集 - `crate::collect` のモジュール doc「Hub 経由の接続」 - だけが先に入る）。REST の create/update ハンドラ
 /// と、双方向対称の Tauri コマンド（`apps/chronogazer/src-tauri/src/lib.rs`
 /// の `plc_connections_create`/`plc_connections_update`）の両方から呼ぶ -
 /// 片方だけに書くともう片方の経路から通ってしまう。

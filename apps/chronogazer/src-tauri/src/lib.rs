@@ -3842,21 +3842,23 @@ const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// **Order matters**, and it is "消費者を先に止め、書き手はその後、みんなが
 /// 書き込む先は最後":
 ///
-/// 1. **Hub subscriptions** - closes the WS generation and stops the
-///    supervisor, so nothing keeps waking up to touch the settings DB or the
-///    network while we are tearing the rest down.
-/// 2. **The embedded LAN server** - stops accepting new requests and lets
+/// 1. **The embedded LAN server** - stops accepting new requests and lets
 ///    in-flight ones finish. Its handlers use the same pool, so it has to be
 ///    down before step 4.
-/// 3. **収集（#383 段階2b / R1-C）** - **消費者を全部止めた後、DB プールを
+/// 2. **収集（#383 段階2b / R1-C）** - **消費者を全部止めた後、DB プールを
 ///    閉じる前**。収集は PLC から読んだ値を tstore と `collect_events` に
 ///    書く**書き手**なので、`banto-hub` の `RunningHub::shutdown`
 ///    （`apps/banto-hub/core/src/runtime.rs`）が採っているのと同じ方針、
-///    すなわち「read-only な消費者（LAN サーバー・Hub 購読）を先に止め、
-///    収集は依存が全部止まってから」に揃える。先に収集を止めてしまうと、まだ
-///    生きている消費者が「値が止まった収集エンジン」を観測する時間帯が
-///    できる。逆に DB プールより後ろへ回すと、最終 flush の書き込み先が
-///    もう閉じている。
+///    すなわち「read-only な消費者（LAN サーバー）を先に止め、収集は依存が
+///    全部止まってから」に揃える。先に収集を止めてしまうと、まだ生きている
+///    消費者が「値が止まった収集エンジン」を観測する時間帯ができる。逆に
+///    DB プールより後ろへ回すと、最終 flush の書き込み先がもう閉じている。
+/// 3. **Hub subscriptions** - closes the WS generation and stops the
+///    supervisor, so nothing keeps waking up to touch the settings DB or the
+///    network after this point. **#383 段階3 P3 で収集の後ろへ移した**: Hub
+///    購読は Hub 経由の接続の値の出どころ（収集にとっての生産者）になったので、
+///    収集より先に止めると、終了のたびに Hub 接続の `plc_disconnected` と
+///    Bad の行が記録される。
 /// 4. **The SQLite pool** - closed last, once nothing can still use it.
 ///
 /// Every step is best-effort: `HubService::shutdown` and `RunningServer::stop`
@@ -3894,11 +3896,6 @@ struct AuditSpoolFlusher(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
 
 async fn shutdown_app_state(state: &AppState) {
     let cleanup = async {
-        // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを
-        // 無条件には待たない（`connect` の 60 秒で終了が固まるため）-
-        // 理由は `chronogazer_core::hub::HubService::shutdown` の doc。
-        state.hub.shutdown().await;
-
         // `server_apply` が停止に使っているのと同じ経路（`take()` して
         // `RunningServer::stop()`）。`take()` しておくのは、ここで止めたものを
         // 残しておく意味が無いのと、二重に stop されないようにするため。
@@ -3918,6 +3915,14 @@ async fn shutdown_app_state(state: &AppState) {
         if let Err(err) = state.collect.stop().await {
             eprintln!("banto: 終了時の収集の停止に失敗しました: {err}");
         }
+
+        // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを
+        // 無条件には待たない（`connect` の 60 秒で終了が固まるため）-
+        // 理由は `chronogazer_core::hub::HubService::shutdown` の doc。
+        // #383 段階3 P3 で**収集の後ろ**に移した: Hub 購読は収集の値の
+        // 出どころ（生産者）になったので、先に止めると、終了のたびに Hub 接続の
+        // `plc_disconnected` と Bad の行が 1 周期ぶん記録される。
+        state.hub.shutdown().await;
 
         // 最後に DB。`close()` は全接続が返るのを待ってからプールを閉じる
         // ので、`-wal`/`-shm` が畳まれた状態でプロセスが終わる。
@@ -4372,6 +4377,11 @@ pub fn run() {
             // `data.dir` を指すと二重書き込みになる（防止機構は未実装 -
             // 同モジュール doc「同じ `data.dir` を 2 つのプロセスで
             // 開かないこと」）。
+            //
+            // #383 段階3 P3: Hub 経由の接続（`protocol = hub`）は上の Hub 購読から
+            // 値を取って同じ収集エンジンで記録する。**自動開始の前に**つなぐ
+            // （後からつないでも、走り出した収集には効かない）。
+            collect.attach_hub(hub.clone());
             {
                 let collect = collect.clone();
                 tauri::async_runtime::spawn(async move { collect.autostart().await });

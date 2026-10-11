@@ -1,7 +1,7 @@
 # ChronoGazer（デジタル記録計）要件定義 — R0
 
 作成日: 2026-07-12
-状態: **確定（2026-07-12 決定、未決事項ゼロ）**。§8 参照。2026-10-10 追記: #383 段階3・#392 のオーナー決定（未実装）を §3.1・§4 に反映。2026-09-08
+状態: **確定（2026-07-12 決定、未決事項ゼロ）**。§8 参照。2026-10-11 追記: #383 段階3 の P3（Hub 経由のタグの収集・保存）を実装したので §3.1・§3.7.2 に反映（登録の導線 P4 以降は未。R0 の決定・スコープ自体は不変）。2026-10-10 追記: #383 段階3・#392 のオーナー決定（未実装）を §3.1・§4 に反映。2026-09-08
 追記: §3.1 に I1 共有スキーマの 64bit 型追加（issue #325）を追補（R0 の
 決定・スコープ自体は不変）。2026-09-18 追記: #383 段階2a の実装に伴い、
 §3.6 に収集開始/停止の権限確認、§4 に収集エンジンの配置（当面 Tauri
@@ -150,7 +150,7 @@ flush が失敗している間の新しい日付の行も失わない**ことを
   詳細は [r1-plan.md](r1-plan.md) の R1-C の節。R0 の要件・スコープ自体は
   変えていない（正常なタグの保存は従来どおり）。
 - **2026-10-10 オーナー決定（#383 段階3）: Hub 経由のタグは「Hub」という接続種別のタグとして
-  `banto-collect` が収集・保存する**（決定のみ、未実装）。`plc_connections.protocol` に `hub` を足し、
+  `banto-collect` が収集・保存する**（2026-10-11: P2・P3 = レジストリの種別と収集・保存まで実装。タグを「Hub から」登録する導線 P4・監視/履歴/しきい値の結合 P5・実機確認 P6 は未。実装の要点は §3.7.2）。`plc_connections.protocol` に `hub` を足し、
   Hub から登録したタグは `tags` の行になる（ペン・しきい値・履歴・除外が SLMP / Modbus のタグと同じ
   タグ ID で動く）。Hub は 1 つで、接続先とキーは `hub.record` のまま。タグ定義（名前・データ型・単位）は
   登録時に Hub のカタログから複製し、同一性は外部名（scada-design.md §9.6）。収集開始時にカタログと
@@ -352,8 +352,18 @@ D-3b（トレンド、2026-10-09）で 4 種を描き、D-4（2026-10-09）で�
     揃える）。その下のタグの `address` は Hub のタグの外部名（`接続名.グループ名.タグ名`）、データ型は
     数値と bit、書き込み可にはできない（`crates/banto-tags/src/plc_connection.rs` の "hub" 節・
     `tag.rs` の `validate_hub_tag_address`）。ChronoGazer の REST・Tauri は `hub` 接続の作成を
-    **まだ拒否する**（作成の導線は P4）。収集の開始は `hub` 接続を `hubSourceNotYetCollected` で外し、
-    その下のグループ・タグも連鎖で外して残りを動かす（#414 と同じ。Hub のサンプラーは P3）。
+    **まだ拒否する**（作成の導線は P4）。
+  - **`hub` 接続の収集（#383 段階3 の P3、2026-10-11）**: `banto-collect` の外部ソースの接続タスク
+    （`crates/banto-collect/src/external.rs`・`task.rs` の `run_external_connection`）が、ChronoGazer の
+    Hub 購読（`apps/chronogazer/core/src/hub.rs` の `HubSampler`）が保持する最新値を収集グループの周期ごとに
+    読み、PLC 直結のタグと同じ日次の tstore ファイル・書き手・イベント・品質で記録する。購読するタグは
+    設定画面の選択と収集の需要（開始のたびにレジストリの有効な hub タグの外部名から作る）の和集合。開始時に
+    Hub のタグ一覧と突き合わせ、消えたタグは `hubTagNotFound`、データ型が変わったタグは `hubTagTypeChanged`
+    でそのタグだけ外す。Hub を持たない実行形態（`banto-serve`。OS キーリングが無い）では `hubSourceUnavailable`、
+    Hub に未接続なら `hubNotConfigured` で `hub` 接続を配下ごと外し、PLC 直結の側は動かす（#414 と同じ）。
+    品質と記録は §3.1 の決定どおり（Live でない間は Bad + null、定常値は毎周期 Good で記録、`stale` は Stale で
+    記録は null、`simulation`・`derived_simulation` と未知の出所は表示のみ）。`/tags` の印はレジストリの中身
+    だけで判定するので `hub` 接続は印に出ない（実行形態や Hub の状態による除外は収集の状態の除外一覧に出る）。
   - 削除は、配下（収集グループ・タグ）が残っていれば拒否される
     （`ON DELETE RESTRICT`、`crates/banto-tags/migrations/0002_collection_groups.sql`・
     `0003_tags.sql`）。
