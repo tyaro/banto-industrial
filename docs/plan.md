@@ -35,6 +35,8 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 2026-10-11: §5 の #383 段階3 に、P2（`banto-tags` の `hub`、#566）と P3（`banto-collect` の Hub サンプラー）を
 実装したことを追記。同日: P4（タグを「Hub から追加」で登録する導線）を実装し、P4 の細部（オーナー決定）を追記
 （P5・P6 は未）。
+同日: P5（監視・履歴・しきい値の結合）を実装し、Hub の `value_source` を解釈しない（simulation 系・未知の出所も Good なら
+記録する）オーナー決定を H4・P3 の細部の置き換えとして追記（P6 は未）。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -469,19 +471,20 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
       外す（#414 と同じ）。
     - **H4 品質と記録**: Hub が Live でない間は全タグ `bad` で `null` を記録する。イベントは
       `plc_connected` / `plc_disconnected` を Hub の接続キーで再利用（新しい `EventKind` は足さない）。
-      Hub の `stale` は Stale、`bad`・不明は Bad（good に丸めない）。Hub の `value_source` が `simulation`・
-      `derived_simulation`（シミュレーション入力を参照する演算タグ）の値は記録しない（#413）。記録時刻は
+      Hub の `stale` は Stale、`bad`・不明は Bad（good に丸めない）。**Hub の `value_source` は解釈しない**
+      （`simulation`・`derived_simulation`・未知を含めて品質だけで扱う。2026-10-11 オーナー決定で置き換え: 以前は
+      `simulation`・`derived_simulation` の値を記録しない（#413 と同じ）としていた。下の「P5 の決定」）。記録時刻は
       この PC の時計（R0 §4）。**購読は on-change**（Hub は値・品質が変わったときだけ送る）なので、Hub の `t` の
       経過時間で鮮度を判定しない: Live かつ good の定常値は、受信が長く途切れても最後の値を周期ごとに記録し続け
       Stale にしない。Stale・Bad の根拠は Hub の品質ラベルと Hub 接続の状態（Live でない）だけ（P3 の検証条件に
-      「Live + good の定常値が複数周期続いても Stale にしない」「`simulation`・`derived_simulation` をそれぞれ
-      記録しない」を含める。2026-10-10 #564 のレビュー）。
+      「Live + good の定常値が複数周期続いても Stale にしない」を含める。2026-10-10 #564 のレビュー。当時の
+      「`simulation`・`derived_simulation` をそれぞれ記録しない」は 2026-10-11 の決定で「どれも Good なら記録する」に替えた）。
     - **H5 Hub 経由の書き込みはしない**（R0 §7）。
     - 手順: P2（`banto-tags` に `hub` protocol）→ P3（`banto-collect` の Hub サンプラー）→ P4（タグを
       「Hub から」登録）→ P5（監視・履歴・しきい値の結合）→ P6 実機確認（Hub 経由の SLMP と直結 SLMP を別ポートで
       比較）。
-    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る。**P4 で「登録済みの hub タグ ∪ 需要」に替えた** - 下の「P4 の細部」）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、`simulation`・`derived_simulation` と未知の出所は表示するが記録しない。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。P4（登録の導線）も 2026-10-11 に実装（下の「P4 の細部」、規則は `apps/chronogazer/core/src/hub_tags.rs`・購読は `hub.rs` のモジュール doc）。**未**: P5、P6。
-    - **P3 の細部（2026-10-11 オーナー決定「おすすめで」）**: Hub が戻ったときのイベントは PLC と同じ `plc_reconnected`（最初は `plc_connected`）。未知の `value_source` は実値として扱わず記録しない。Hub の `stale` は null で記録する（古い値を新しい測定に見せない）。収集中に画面の選択タグを変えると購読の張り直しで数周期の切断・再接続と Bad が出る件は P4 で扱いを決める（→ P4 で選択を購読から外して解消。下）。開始時に Hub が答えないときは突き合わせをせずに始め（開始の待ちは最大 20 秒）、消えたタグは次の開始まで Bad のまま。
+    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る。**P4 で「登録済みの hub タグ ∪ 需要」に替えた** - 下の「P4 の細部」）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、（`simulation`・`derived_simulation` と未知の出所は、この時点では表示するが記録しなかったが、**P5 で替えた** - 下の「P5 の決定」）。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。P4（登録の導線）も 2026-10-11 に実装（下の「P4 の細部」、規則は `apps/chronogazer/core/src/hub_tags.rs`・購読は `hub.rs` のモジュール doc）。**P5（監視・履歴・しきい値の結合）も 2026-10-11 に実装**（下の「P5 の決定」）。**未**: P6。
+    - **P3 の細部（2026-10-11 オーナー決定「おすすめで」）**: Hub が戻ったときのイベントは PLC と同じ `plc_reconnected`（最初は `plc_connected`）。~~未知の `value_source` は実値として扱わず記録しない~~（**P5 で置き換え**: 未知の出所も Good なら記録する。下の「P5 の決定」）。Hub の `stale` は null で記録する（古い値を新しい測定に見せない）。収集中に画面の選択タグを変えると購読の張り直しで数周期の切断・再接続と Bad が出る件は P4 で扱いを決める（→ P4 で選択を購読から外して解消。下）。開始時に Hub が答えないときは突き合わせをせずに始め（開始の待ちは最大 20 秒）、消えたタグは次の開始まで Bad のまま。
     - **P4 の細部（2026-10-11 オーナー決定「P4進めてください」= 推奨どおり。実装済み）**:
       1. **`hub` 接続の許可**: ChronoGazer の REST・Tauri は `hub` 接続の作成・更新・削除を受け付ける（banto-hub は
          引き続き断る）。接続先とキーは `hub.record` のままで、行は host/port を持たない。画面は作成フォームでは作らず、
@@ -522,6 +525,30 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
          登録の後の消去は**応答を待たせずに予約する**（消去は Hub の操作ロックを取るので、`connect` が握っていると最大 60 秒待つ。予約の間はダイアログ用の catalog が移行前の選択を空で返し、事前チェックは出直さない。応答の `legacySelectionClearScheduled`、`HubService::schedule_legacy_selection_clear`。2026-10-11 の P4 の監査）。古い記録は読める（後方互換）。選択の保存の口（`PUT /api/hub/selected-tags`・`hub_set_selected_tags`）は外した。
       5. **P3 の持ち越し**: 開始時の突き合わせで外したタグ（`hubTagNotFound` / `hubTagTypeChanged`）は収集の需要に
          残さない（`CollectorConfig::external_names` = 組み立ての後の計画で需要を絞る。Hub への往復は増えない）。
+    - **P5 の決定（2026-10-11 オーナー決定。実装済み）**: 「Hub 側のシミュレーション値は記録して構わない。アプリケーションごとに責務は完全に分ける。むしろシミュレーション値でちゃんと動作できているか確認できる方が望ましい」。
+      1. **ChronoGazer は Hub の `value_source` を解釈しない**。Hub 経由の値は `value_source`（`real`・`computed`・
+         `internal`・`db`・`simulation`・`derived_simulation`・未知）に依らず、**品質だけ**で扱う（Good なら現在値に出して記録、
+         Hub の `stale` は従来どおり Stale + null、bad・不明な品質は Bad、Hub が Live でない間は全タグ Bad + null）。
+         `banto_collect::ExternalValueSource` と `ExternalReading::source` は廃止した（`banto-tagclient` の型は変えていない）。
+         これは H4 の「`simulation`・`derived_simulation` は記録しない（#413）」と P3 の細部の「未知の `value_source` は記録しない」
+         を**置き換える**。ChronoGazer 自身の接続単位のシミュレーション（`plc_connections.simulation`、PLC 直結のシミュレーション）
+         は従来どおり記録しない（#413 のまま）。
+      2. **監視・履歴・しきい値**: Hub 経由のタグは PLC 直結と同じ現在値・日次ファイル・イベントの口に乗っているので、監視画面・履歴・
+         しきい値（`recorder_tag_settings`、シミュレーション由来の値でも判定してイベントを出す）はそのまま使える。モック Hub 相手の
+         統合テスト（切断→再接続のイベント、bit タグの記録、しきい値）と E2E（Hub 経由のタグを含む表示グループが監視画面で値を出し、
+         Hub を止めると通信エラーになる）で固定した。
+      3. **接続の表示を Hub にも通る語にした**: イベントの種別は「接続 / 切断 / 再接続」（種別 `plc_*` と API は不変）。イベント一覧と
+         設定 > 収集の接続の表は `conn:<id>` / `tag:<id>` ではなく接続・タグの名前（見つからなければキーのまま）。`/tags` の
+         接続の節・収集グループの接続の欄は「接続」とし、Hub 経由の選択肢は `Hub（Hub 経由）`。Hub 経由のグループを選んだタグの
+         作成フォームは編集と同じ Hub 用（外部名・スケーリング欄なし）。
+      4. **Hub 経由の再接続は回数を数えない**: 外部接続の `Reconnecting` は `attempt = 0`（`EXTERNAL_RECONNECT_ATTEMPT`）で、
+         画面は「再接続中」とだけ出す。tick ごとの標本は再試行の単位ではなく、購読が自分で張り直すため（以前は「再接続中（1回目）」
+         のまま固まって見えた）。
+      5. **除外の案内**: 除外の「PLC接続」を「接続」にし、Hub 系の理由ごとに案内を出す（`hubNotConfigured` = 設定 > Hub接続、
+         `hubSourceUnavailable` = この実行形態では収集できない、`hubTagNotFound`・`hubTagTypeChanged` = タグ設定で削除して
+         「Hub から追加」で登録し直す）。タグ設定で直すものが無いとき（Hub 未接続など）は「不正」と言わない。
+      6. **E2E 用の入口**: `banto-serve` は `BANTO_HUB_MEMORY_KEYS=1`（開発・E2E 用）のときだけ Hub の API キーをプロセス内に置き、
+         収集にも Hub を繋ぐ（既定は変えない）。
   - **#392 収集エンジンの UI 独立**:
     - **H6 scada-design.md §13.2 の 3 host モデルへ段階的に移る**: まず A（単一インスタンス・プロファイル排他 +
       トレイ常駐。ウィンドウを閉じても収集を止めない）、次に B（`banto-serve` から本番用の headless host、
