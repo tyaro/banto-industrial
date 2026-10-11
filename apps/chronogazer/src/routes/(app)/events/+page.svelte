@@ -54,8 +54,19 @@
 		isCollectAvailable,
 		type CollectEventRow
 	} from '#lib/banto/collectAdmin.js';
+	import { loadKeyNames, resolveKeyLabel, type KeyNames } from '#lib/banto/collectNames.js';
 
 	const available = isCollectAvailable();
+
+	/**
+	 * 内部キー（`conn:<id>` / `tag:<id>`）→ 名前（#383 段階3 P5）。読めていない間・
+	 * 見つからないキー（削除済みなど）はキーのまま出す。「再読み込み」でも取り直す。
+	 */
+	let keyNames = $state<KeyNames>(new Map());
+
+	async function refreshKeyNames(): Promise<void> {
+		keyNames = await loadKeyNames();
+	}
 
 	/**
 	 * 列は `CollectEventRow` のフィールドそのまま（`detail` は**そもそも
@@ -82,15 +93,15 @@
 		{
 			id: 'connectionKey',
 			header: '接続',
-			accessor: (row) => row.connectionKey ?? '-',
-			width: 120,
+			accessor: (row) => resolveKeyLabel(row.connectionKey, keyNames),
+			width: 160,
 			sortable: false
 		},
 		{
 			id: 'tagKey',
 			header: 'タグ',
-			accessor: (row) => row.tagKey ?? '-',
-			width: 120,
+			accessor: (row) => resolveKeyLabel(row.tagKey, keyNames),
+			width: 160,
 			sortable: false
 		},
 		{
@@ -137,7 +148,10 @@
 	// effect と同じ理由・同じ書き方）。後始末で飛行中の要求を中断する。
 	$effect(() => {
 		if (!available) return;
-		untrack(() => events.ensureRange(0, 100));
+		untrack(() => {
+			events.ensureRange(0, 100);
+			void refreshKeyNames();
+		});
 		return () => events.dispose();
 	});
 
@@ -155,6 +169,7 @@
 	 */
 	function reload(): void {
 		events.refresh();
+		void refreshKeyNames();
 	}
 </script>
 

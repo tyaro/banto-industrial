@@ -83,6 +83,7 @@
 		type ConnectionView,
 		type Readout
 	} from '#lib/banto/collectAdmin.js';
+	import { loadKeyNames, resolveKeyLabel, type KeyNames } from '#lib/banto/collectNames.js';
 	import { errorMessage } from './shared';
 
 	const available = isCollectAvailable();
@@ -122,6 +123,16 @@
 	const connectionEntries = $derived(
 		connections?.state === 'ready' ? Object.entries(connections.data) : []
 	);
+
+	/**
+	 * 接続のキー（`conn:<id>`）→ 名前（#383 段階3 P5）。読めていない間・読めな
+	 * かった部分はキーのまま出す（`collectNames.ts`）。開いたとき・操作の後に読む。
+	 */
+	let keyNames = $state<KeyNames>(new Map());
+
+	async function refreshKeyNames(): Promise<void> {
+		keyNames = await loadKeyNames();
+	}
 
 	let busy = $state(false);
 	/** 明示操作の結果（受付・完了・打ち切り）。エラーとは別の行に出す。 */
@@ -182,6 +193,7 @@
 			// 打ち切り（`timedOut`）のときは状態を書き換えない - 何も返って
 			// きていないので、書ける新しい事実が無い。続きはポーリングが拾う。
 			if (outcome.kind === 'ok') applyOperationStatus(toCollectStateView(outcome.value.status));
+			void refreshKeyNames();
 		} finally {
 			busy = false;
 		}
@@ -273,6 +285,7 @@
 	onMount(() => {
 		if (!available) return;
 		document.addEventListener('visibilitychange', onVisibilityChange);
+		void refreshKeyNames();
 		if (document.visibilityState === 'visible') startPolling();
 	});
 
@@ -315,8 +328,18 @@
 				{#if exclusionsNote}
 					<p class="note">
 						{exclusionsNote.summary}
-						<a href={resolveAppPath('/tags')}>タグ設定</a>{exclusionsNote.fix}
+						{#if exclusionsNote.fix !== null}
+							<a href={resolveAppPath('/tags')}>タグ設定</a>{exclusionsNote.fix}
+						{/if}
 					</p>
+					{#each exclusionsNote.guides as guide (guide.reason)}
+						<p class="note exclusion-guide" data-reason={guide.reason}>
+							{guide.text}
+							{#if guide.link}
+								<a href={resolveAppPath(guide.link.path)}>{guide.link.label}</a>
+							{/if}
+						</p>
+					{/each}
 				{/if}
 				<table class="collect-exclusion-list">
 					<thead>
@@ -388,7 +411,7 @@
 						{#each connectionEntries as [key, value] (key)}
 							{@const simulationNote = connectionSimulationNote(value)}
 							<tr>
-								<td class="collect-key">{key}</td>
+								<td class="collect-key" title={key}>{resolveKeyLabel(key, keyNames)}</td>
 								<td>{connectionStatusLabel(value)}</td>
 								<td class:simulation-note={simulationNote !== null}>
 									{simulationNote ?? '記録対象'}

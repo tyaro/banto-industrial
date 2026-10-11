@@ -27,6 +27,8 @@ import {
 	coverageReloadStarted,
 	coverageReloadSettled,
 	buildTagInput,
+	connectionOptionLabel,
+	tagDataTypeOptions,
 	tagFormValues,
 	buildThresholdsInput,
 	thresholdFormValues,
@@ -743,6 +745,23 @@ describe('tagFormValues -> buildTagInput', () => {
 		);
 	});
 
+	it('#383 P5: Hub 経由のタグはフォームにスケーリングの値が残っていても null で送る', () => {
+		const values = {
+			...tagFormValues('tagCreate', SAMPLE_TAG),
+			tagCreateRawLo: 0,
+			tagCreateRawHi: 4095,
+			tagCreateEngLo: 0,
+			tagCreateEngHi: 100
+		};
+		const plc = buildTagInput('tagCreate', values);
+		expect([plc.rawLo, plc.rawHi, plc.engLo, plc.engHi]).toEqual([0, 4095, 0, 100]);
+		const hub = buildTagInput('tagCreate', values, undefined, true);
+		expect([hub.rawLo, hub.rawHi, hub.engLo, hub.engHi]).toEqual([null, null, null, null]);
+		// ほかの項目は変わらない。
+		expect(hub.address).toBe(plc.address);
+		expect(hub.decimals).toBe(plc.decimals);
+	});
+
 	it('既存の項目（単位の trim・空単位は null・小数桁）は変わらない', () => {
 		const values = {
 			...tagFormValues('tagEdit', SAMPLE_TAG),
@@ -865,5 +884,38 @@ describe('hubConnectionInput / hubConnectionSavedMessage', () => {
 		const on = hubConnectionSavedMessage({ enabled: false }, { enabled: true });
 		expect(on).toContain('有効にしました');
 		expect(on).toContain('購読を再開');
+	});
+});
+
+// --- #383 段階3 P5: 接続の選択肢・データ型の選択肢 -----------------------------------
+
+describe('connectionOptionLabel', () => {
+	it('PLC 直結は protocol を括弧で添え、Hub 経由は生の protocol 名（hub）を出さない', () => {
+		expect(connectionOptionLabel({ name: 'ライン1', protocol: 'modbus-tcp' })).toBe(
+			'ライン1（modbus-tcp）'
+		);
+		expect(connectionOptionLabel({ name: 'ライン2', protocol: 'slmp' })).toBe('ライン2（slmp）');
+		const hub = connectionOptionLabel({ name: 'Hub', protocol: 'hub' });
+		expect(hub).toBe('Hub（Hub 経由）');
+		expect(hub).not.toContain('（hub）');
+	});
+});
+
+describe('tagDataTypeOptions', () => {
+	const labelOf = (hub: boolean, value: string) =>
+		tagDataTypeOptions(hub).find((o) => o.value === value)?.label;
+
+	it('値の並びは Hub 用でも PLC 用でも同じ（9 種）', () => {
+		const values = (hub: boolean) => tagDataTypeOptions(hub).map((o) => o.value);
+		expect(values(false)).toEqual(['bit', 'i16', 'u16', 'i32', 'u32', 'f32', 'i64', 'u64', 'f64']);
+		expect(values(true)).toEqual(values(false));
+	});
+
+	it('PLC 直結の 64bit は「Modbusのみ」、Hub 経由では言わない', () => {
+		for (const type of ['i64', 'u64', 'f64']) {
+			expect(labelOf(false, type), type).toContain('Modbusのみ');
+			expect(labelOf(true, type), type).not.toContain('Modbus');
+		}
+		expect(labelOf(true, 'f64')).toBe('64bit実数（倍精度）');
 	});
 });

@@ -238,7 +238,6 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 	let headers: ApiHeaders;
 	let disabledByUs: ConnectionRow[] = [];
 	const groupIds: Record<string, number> = {};
-	let highTagId = 0;
 	let bitTagId = 0;
 
 	test.beforeAll(async ({ browser }) => {
@@ -293,7 +292,6 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			address: '40003'
 		});
 		await putThresholds(page.request, headers, high.id, { thresholdH: 0 });
-		highTagId = high.id;
 		// D-2: 工学値レンジ（生値をそのまま 0..65535 に写す = 値は変わらない）。
 		const scaledTag = await postJson<NamedRow>(page.request, headers, '/api/tags', {
 			...tagBase,
@@ -417,11 +415,11 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 	test('2b. しきい値のイベントは、判定に使ったしきい値を「水準」に出す（#532）', async () => {
 		await page.goto('/events');
 		await expect(page.getByRole('heading', { level: 2, name: 'イベント' })).toBeVisible();
-		// 記録計の側の H = 0 で判定した「超過」の行。`tag:<id>` は完全一致で絞る
-		// （`tag:1` が `tag:12` に部分一致しないように）。
+		// 記録計の側の H = 0 で判定した「超過」の行。タグ列は `tag:<id>` ではなく
+		// タグの名前で出る（#383 P5）ので、名前の完全一致で絞る。
 		const highRow = page
 			.getByRole('row')
-			.filter({ has: page.getByRole('gridcell', { name: `tag:${highTagId}`, exact: true }) });
+			.filter({ has: page.getByRole('gridcell', { name: TAG_HIGH, exact: true }) });
 		await expect(highRow.getByRole('gridcell', { name: 'しきい値超過', exact: true })).toBeVisible({
 			timeout: 15_000
 		});
