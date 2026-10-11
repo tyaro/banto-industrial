@@ -16,6 +16,14 @@
 //! "更新停止"); Stale only appears when updates genuinely stop arriving - e.g.
 //! a collection task that is no longer ticking at all.
 //!
+//! **The one stored Stale: an external source's own label** (#383 段階3 P3,
+//! 2026-10-10 オーナー決定 H4). A Hub-sourced tag whose value the Hub itself
+//! labels `stale` is written here as [`Quality::Stale`] (with the Hub's last
+//! value) on every tick - the Hub, not this cache, is the one that knows its
+//! value stopped updating. It reads back as Stale regardless of age (the
+//! time-based derivation above never turns it back into Good) and does not
+//! move `last_good_ms`. See `crate::external`.
+//!
 //! ## Last successful receive time (`last_good_ms`)
 //!
 //! [`CurrentSample::ptime_ms`] is the time of the **latest attempt**, whatever
@@ -97,7 +105,8 @@ pub struct CurrentReading {
 struct Entry {
     value: Option<f64>,
     ptime_ms: i64,
-    /// Good or Bad only - never Stale (Stale is a read-time derivation).
+    /// Good or Bad for a PLC tag (its Stale is a read-time derivation);
+    /// Stale only for an external-source tag the source labelled stale.
     stored_quality: Quality,
     period_ms: u32,
     /// See [`CurrentReading::last_good_ms`].
@@ -125,8 +134,10 @@ impl CurrentValuesHandle {
     }
 
     /// Record a fresh sample for `tag_key`. Called once per tag per tick by
-    /// the collection tasks. `stored_quality` must be Good or Bad;
-    /// [`Quality::Stale`] is derived on read and must never be passed here.
+    /// the collection tasks. A PLC task passes Good or Bad only (its Stale is
+    /// derived on read); an external-source task (`crate::external`) may
+    /// also pass [`Quality::Stale`] when the source itself labelled the value
+    /// stale (module doc, "The one stored Stale").
     pub(crate) fn set(
         &self,
         tag_key: &str,
@@ -135,10 +146,6 @@ impl CurrentValuesHandle {
         stored_quality: Quality,
         period_ms: u32,
     ) {
-        debug_assert!(
-            stored_quality != Quality::Stale,
-            "Stale is derived at read time, never stored"
-        );
         let mut map = self
             .map
             .write()
@@ -168,7 +175,10 @@ impl CurrentValuesHandle {
         // age into Stale.
         let quality = match entry.stored_quality {
             Quality::Bad => Quality::Bad,
-            _ => {
+            // An external source's own `stale` label (module doc): a recent
+            // ptime never turns it back into Good.
+            Quality::Stale => Quality::Stale,
+            Quality::Good => {
                 let staleness_limit = (entry.period_ms as f64 * STALE_PERIOD_FACTOR) as i64;
                 if now_ms - entry.ptime_ms > staleness_limit {
                     Quality::Stale
@@ -387,6 +397,21 @@ mod tests {
         clock.set_now_ms(100_000);
         let reading = handle.snapshot_readings()["t1"];
         assert_eq!(reading.sample.quality, Quality::Stale);
+        assert_eq!(reading.last_good_ms, Some(1_000));
+    }
+
+    /// #383 段階3 P3: a stored Stale (an external source's own label) reads
+    /// back Stale even when fresh, keeps its value, and does not move
+    /// `last_good_ms`.
+    #[test]
+    fn a_stored_stale_sample_reads_back_stale_and_keeps_last_good() {
+        let (handle, _clock) = handle_at(2_000);
+        handle.set("t1", Some(1.0), 1_000, Quality::Good, 1_000);
+        handle.set("t1", Some(1.0), 2_000, Quality::Stale, 1_000);
+        let reading = handle.snapshot_readings()["t1"];
+        assert_eq!(reading.sample.quality, Quality::Stale);
+        assert_eq!(reading.sample.value, Some(1.0));
+        assert_eq!(reading.sample.ptime_ms, 2_000);
         assert_eq!(reading.last_good_ms, Some(1_000));
     }
 

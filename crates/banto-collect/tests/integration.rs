@@ -22,7 +22,7 @@ use std::time::Duration;
 use banto_collect::{
     build_config, build_config_lenient_with_thresholds, default_client_factory, BackoffConfig,
     CollectError, Collector, CollectorConfig, CollectorOptions, ConnectionStatus, EventSink,
-    Quality, RegistrySnapshot, Thresholds,
+    HubSource, Quality, RegistrySnapshot, Thresholds,
 };
 use banto_plc::modbus::simulator::Simulator;
 use banto_plc::slmp::address::SlmpDevice;
@@ -1039,6 +1039,7 @@ async fn config_with_thresholds(
     let (config, exclusions) = build_config_lenient_with_thresholds(
         &snapshot,
         &std::collections::HashMap::from([(tag_id, limits)]),
+        HubSource::Unavailable,
     );
     assert!(exclusions.is_empty(), "{exclusions:?}");
     config

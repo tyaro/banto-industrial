@@ -100,10 +100,18 @@ pub enum Protocol {
 /// [`crate::collector::Collector::apply_config`] uses to tell "this
 /// connection's settings changed" from "byte-for-byte identical, leave its
 /// task alone".
+///
+/// #383 段階3 P3: [`Self::External`] is a `"hub"` connection - nothing to
+/// dial; its task samples a [`crate::external::ExternalSource`] instead
+/// (`crate::task::run_external_connection`). Deliberately **not** a
+/// [`Protocol`] / [`crate::ClientProtocol`] variant: those are public and
+/// banto-hub matches them exhaustively, while an external connection never
+/// gets a client or a simulator.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProtocolConfig {
     ModbusTcp(ModbusTcpConfig),
     Slmp(SlmpConfig),
+    External,
 }
 
 /// A tag's fixed H/HH/L/LL limits (any subset may be set), compared against
@@ -204,8 +212,13 @@ pub(crate) struct GroupPlan {
     pub period: Duration,
     pub period_ms: u32,
     /// Wire reads in tag order (`requests[i]` <-> `tags[i]` <-> tstore column
-    /// `c{i+1}`). Passed straight to `PlcClient::read_batch`.
+    /// `c{i+1}`). Passed straight to `PlcClient::read_batch`. Empty for an
+    /// external (`"hub"`) group.
     pub requests: Vec<ReadRequest>,
+    /// #383 段階3 P3: for an external (`"hub"`) group, the external name of
+    /// each tag in tag order (`external_names[i]` <-> `tags[i]`) - what the
+    /// task looks up in the source's snapshot. Empty for a PLC group.
+    pub external_names: Vec<String>,
     pub tags: Vec<TagPlan>,
 }
 
@@ -379,9 +392,47 @@ impl CollectorConfig {
                         cfg.port = port;
                     }
                 }
+                // Never broker-routed (banto-hub has no hub connections).
+                ProtocolConfig::External => {}
             }
         }
     }
+
+    /// #383 段階3 P3: does this config collect any external (`"hub"`)
+    /// connection? [`crate::Collector::start_with_sources`] refuses such a
+    /// config without an [`crate::external::ExternalSource`].
+    pub fn has_external_connections(&self) -> bool {
+        self.connections
+            .iter()
+            .any(|conn| conn.config == ProtocolConfig::External)
+    }
+}
+
+/// #383 段階3 P3: the Hub catalog the lenient build reconciles hub tags
+/// against - external name -> the Hub's `data_type` for that tag (H3:
+/// identity is the external name).
+pub type HubCatalog = HashMap<String, String>;
+
+/// #383 段階3 P3: whether the calling runtime can collect `"hub"`
+/// connections, passed to [`build_config_lenient_with_thresholds`].
+///
+/// | value | a `"hub"` connection is |
+/// | --- | --- |
+/// | [`Self::Unavailable`] | excluded ([`ExclusionReason::HubSourceUnavailable`]) with its groups and tags |
+/// | [`Self::NotConfigured`] | excluded ([`ExclusionReason::HubNotConfigured`]) with its groups and tags |
+/// | [`Self::Available`] with a catalog | collected; a tag missing from the catalog or whose data type differs is excluded alone ([`ExclusionReason::HubTagNotFound`] / [`ExclusionReason::HubTagTypeChanged`], #414's "外して残りを動かす") |
+/// | [`Self::Available`] without a catalog | collected, nothing reconciled (the Hub could not be asked at start; a tag it does not have reads Bad until the next start) |
+#[derive(Debug, Clone, Copy)]
+pub enum HubSource<'a> {
+    /// This runtime has no Hub subscription at all (banto-hub, ChronoGazer's
+    /// `banto-serve` which has no OS keyring).
+    Unavailable,
+    /// The runtime could subscribe, but no Hub connection is set up
+    /// (ChronoGazer's `hub.record` is absent).
+    NotConfigured,
+    /// The runtime subscribes; `catalog` is the Hub's tag list read at
+    /// start, if it could be read.
+    Available { catalog: Option<&'a HubCatalog> },
 }
 
 /// One logical, point-in-time registry input used by both catalog and
@@ -562,14 +613,29 @@ impl ExclusionUnit {
 pub enum ExclusionReason {
     /// `plc_connections.protocol` is not `modbus-tcp` / `slmp`.
     UnsupportedProtocol { protocol: String },
-    /// #383 段階3 P2: a `"hub"` connection (banto-hub as a source,
-    /// `banto_tags::HUB_PROTOCOL`). The registry accepts it, but this crate
-    /// has no Hub sampler yet (P3 adds it), so the connection - and its
-    /// groups and tags as cascades - is left out, and the rest keeps
-    /// running (#414). A distinct reason rather than [`Self::UnsupportedProtocol`]
-    /// because the fix is not "pick a supported protocol": the connection is
-    /// configured correctly and simply waits for the sampler.
-    HubSourceNotYetCollected,
+    /// #383 段階3 P3: a `"hub"` connection (banto-hub as a source,
+    /// `banto_tags::HUB_PROTOCOL`) in a runtime that cannot subscribe to the
+    /// Hub ([`HubSource::Unavailable`]: banto-hub itself, ChronoGazer's
+    /// `banto-serve`). The connection - and its groups and tags as cascades -
+    /// is left out, and the rest keeps running (#414). (P2 called this
+    /// `hubSourceNotYetCollected`; P3 added the sampler, so the reason is now
+    /// about the runtime, not the crate.)
+    HubSourceUnavailable,
+    /// #383 段階3 P3: a `"hub"` connection while no Hub connection is set up
+    /// ([`HubSource::NotConfigured`]). Cascades like the one above.
+    HubNotConfigured,
+    /// #383 段階3 P3 (H3): a hub tag whose external name is not in the Hub's
+    /// catalog at collection start (deleted / renamed on the Hub, or not
+    /// visible to this key). The tag alone is left out.
+    HubTagNotFound { external_name: String },
+    /// #383 段階3 P3 (H3): a hub tag whose registered data type no longer
+    /// matches the Hub's. The tag alone is left out (its column type would
+    /// lie).
+    HubTagTypeChanged {
+        external_name: String,
+        registered: String,
+        catalog: String,
+    },
     /// `plc_connections.port` does not fit a TCP port (`u16`).
     InvalidPort { port: i64 },
     /// `plc_connections.unit_id` does not fit a Modbus unit id (`u8`).
@@ -594,7 +660,10 @@ impl ExclusionReason {
     pub fn code(&self) -> &'static str {
         match self {
             ExclusionReason::UnsupportedProtocol { .. } => "unsupportedProtocol",
-            ExclusionReason::HubSourceNotYetCollected => "hubSourceNotYetCollected",
+            ExclusionReason::HubSourceUnavailable => "hubSourceUnavailable",
+            ExclusionReason::HubNotConfigured => "hubNotConfigured",
+            ExclusionReason::HubTagNotFound { .. } => "hubTagNotFound",
+            ExclusionReason::HubTagTypeChanged { .. } => "hubTagTypeChanged",
             ExclusionReason::InvalidPort { .. } => "invalidPort",
             ExclusionReason::InvalidUnitId { .. } => "invalidUnitId",
             ExclusionReason::InvalidPeriod { .. } => "invalidPeriod",
@@ -617,9 +686,23 @@ impl ExclusionReason {
             ExclusionReason::UnsupportedProtocol { protocol } => {
                 format!("プロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）")
             }
-            ExclusionReason::HubSourceNotYetCollected => {
-                "Hub 経由の接続からの収集にはまだ対応していません".to_string()
+            ExclusionReason::HubSourceUnavailable => {
+                "この実行形態では Hub 経由の接続から収集できません".to_string()
             }
+            ExclusionReason::HubNotConfigured => {
+                "Hub への接続が設定されていないため収集しません（Hub に接続してから収集を再起動してください）"
+                    .to_string()
+            }
+            ExclusionReason::HubTagNotFound { external_name } => format!(
+                "Hub のタグ一覧に {external_name} が見つからないため収集しません（Hub で削除・改名されたか、このキーでは見えません）"
+            ),
+            ExclusionReason::HubTagTypeChanged {
+                external_name,
+                registered,
+                catalog,
+            } => format!(
+                "Hub のタグ {external_name} のデータ型が変わったため収集しません（登録: {registered} / Hub: {catalog}）"
+            ),
             ExclusionReason::InvalidPort { port } => format!("ポート番号が不正です: {port}"),
             ExclusionReason::InvalidUnitId { unit_id } => {
                 format!("ユニットIDが不正です: {unit_id}")
@@ -700,9 +783,22 @@ impl ConfigExclusion {
             ExclusionReason::UnsupportedProtocol { protocol } => format!(
                 "接続 {name} のプロトコル {protocol} は未対応です（modbus-tcp / slmp のみ対応）"
             ),
-            ExclusionReason::HubSourceNotYetCollected => {
-                format!("接続 {name} は Hub 経由の接続です。Hub 経由の収集にはまだ対応していません")
+            ExclusionReason::HubSourceUnavailable => format!(
+                "接続 {name} は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
+            ),
+            ExclusionReason::HubNotConfigured => format!(
+                "接続 {name} は Hub 経由の接続ですが、Hub への接続が設定されていません"
+            ),
+            ExclusionReason::HubTagNotFound { external_name } => {
+                format!("タグ {name} の Hub のタグ {external_name} が Hub に見つかりません")
             }
+            ExclusionReason::HubTagTypeChanged {
+                external_name,
+                registered,
+                catalog,
+            } => format!(
+                "タグ {name} の Hub のタグ {external_name} のデータ型が変わりました（登録: {registered} / Hub: {catalog}）"
+            ),
             ExclusionReason::InvalidPort { port } => {
                 format!("接続 {name} のポート番号が不正です: {port}")
             }
@@ -762,10 +858,15 @@ impl ConfigExclusion {
 /// #533: every tag gets **no** limits (the registry has no threshold
 /// columns any more), so a collector built from this raises no
 /// `threshold_*` event.
+///
+/// #383 段階3 P3: a `"hub"` connection is excluded as
+/// [`ExclusionReason::HubSourceUnavailable`] ([`HubSource::Unavailable`]) -
+/// this is the builder banto-hub's strict path shares, and banto-hub never
+/// subscribes to a Hub.
 pub fn build_config_lenient_from(
     snapshot: &RegistrySnapshot,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
-    build_config_lenient_inner(snapshot, ThresholdSource::None)
+    build_config_lenient_inner(snapshot, ThresholdSource::None, HubSource::Unavailable)
 }
 
 /// [`build_config_lenient_from`] with the tags' H/HH/L/LL limits **supplied
@@ -778,16 +879,33 @@ pub fn build_config_lenient_from(
 /// banto-hub uses [`build_config_from`], which gives no tag any limits (#533:
 /// Hub は警報を判定しない). The caller is responsible for the
 /// `ll <= l <= h <= hh` ordering of what it supplies (see [`Thresholds`]).
+///
+/// #383 段階3 P3: `hub` says whether the caller can collect `"hub"`
+/// connections and, if so, which Hub catalog to reconcile their tags
+/// against ([`HubSource`]'s table). Only an [`HubSource::Available`] build
+/// produces external connection plans, which then need an
+/// [`crate::external::ExternalSource`] at
+/// [`crate::Collector::start_with_sources`].
 pub fn build_config_lenient_with_thresholds(
     snapshot: &RegistrySnapshot,
     thresholds: &HashMap<i64, Thresholds>,
+    hub: HubSource<'_>,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
-    build_config_lenient_inner(snapshot, ThresholdSource::Supplied(thresholds))
+    build_config_lenient_inner(snapshot, ThresholdSource::Supplied(thresholds), hub)
+}
+
+/// How one enabled connection is collected, once its row is understood.
+enum ResolvedConnection<'a> {
+    /// Dialed by this crate.
+    Plc(Protocol, ProtocolConfig),
+    /// Sampled from an [`crate::external::ExternalSource`] (#383 段階3 P3).
+    Hub { catalog: Option<&'a HubCatalog> },
 }
 
 fn build_config_lenient_inner(
     snapshot: &RegistrySnapshot,
     threshold_source: ThresholdSource<'_>,
+    hub: HubSource<'_>,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
@@ -845,13 +963,14 @@ fn build_config_lenient_inner(
     // (Neither of these is a `ConfigExclusion`: they are not collected by
     // design, not "left out because broken".)
     //
-    // #383 段階3 P2: a `"hub"` connection ([`PlcConnection::is_hub_source`])
-    // is deliberately NOT filtered here. It *will* be collected (P3's Hub
-    // sampler), so silently contributing nothing would hide its tags'
-    // missing history; instead `parse_protocol` below turns it into an
-    // explicit [`ExclusionReason::HubSourceNotYetCollected`], which takes
-    // its groups and tags with it as cascades and leaves every other
-    // connection running (#414's "外して残りを動かす").
+    // #383 段階3 P2/P3: a `"hub"` connection ([`PlcConnection::is_hub_source`])
+    // is deliberately NOT filtered here. It is collected through an external
+    // source when the caller can ([`HubSource::Available`]); otherwise
+    // `resolve_connection` below turns it into an explicit
+    // [`ExclusionReason::HubSourceUnavailable`] / [`ExclusionReason::HubNotConfigured`],
+    // which takes its groups and tags with it as cascades and leaves every
+    // other connection running (#414's "外して残りを動かす") - silently
+    // contributing nothing would hide its tags' missing history.
     let mut enabled_connections: Vec<&PlcConnection> = connections
         .iter()
         .filter(|c| c.enabled && c.protocol != "virtual" && !c.is_db_source())
@@ -866,14 +985,7 @@ fn build_config_lenient_inner(
         let mut conn_groups = groups_by_connection.remove(&conn.id).unwrap_or_default();
         conn_groups.sort_by_key(|g| g.id);
 
-        let resolved = parse_protocol(&conn.protocol).and_then(|protocol| {
-            let client_config = match protocol {
-                Protocol::ModbusTcp => ProtocolConfig::ModbusTcp(modbus_config_for(conn)?),
-                Protocol::Slmp => ProtocolConfig::Slmp(slmp_config_for(conn)?),
-            };
-            Ok((protocol, client_config))
-        });
-        let (protocol, client_config) = match resolved {
+        let resolved = match resolve_connection(conn, hub) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 // The connection first (it is what needs fixing), then
@@ -913,6 +1025,7 @@ fn build_config_lenient_inner(
             let mut requests = Vec::with_capacity(group_tags.len());
             let mut tag_plans = Vec::with_capacity(group_tags.len());
             let mut store_columns = Vec::with_capacity(group_tags.len());
+            let mut external_names = Vec::new();
             // Tags that were fine on their own - listed as cascades if the
             // group itself turns out to be excluded below.
             let mut readable_tags = Vec::with_capacity(group_tags.len());
@@ -931,28 +1044,48 @@ fn build_config_lenient_inner(
                 if tag.data_type == banto_tags::STRING_DATA_TYPE {
                     continue;
                 }
-                let request = match build_request(tag, protocol) {
-                    Ok(request) => request,
-                    Err(issue) => {
-                        // #414 段階2: this tag alone is left out - no read,
-                        // no store column (its history reads as null), and
-                        // the rest of the group still collects.
-                        exclusions.push(ConfigExclusion::tag(
-                            tag,
-                            ExclusionReason::InvalidTag {
-                                address: tag.address.clone(),
-                                data_type: tag.data_type.clone(),
-                                issue,
-                            },
-                        ));
-                        continue;
-                    }
+                let scaling = match &resolved {
+                    ResolvedConnection::Plc(protocol, _) => match build_request(tag, *protocol) {
+                        Ok(request) => {
+                            requests.push(request);
+                            tag.scaling()
+                        }
+                        Err(issue) => {
+                            // #414 段階2: this tag alone is left out - no
+                            // read, no store column (its history reads as
+                            // null), and the rest of the group still
+                            // collects.
+                            exclusions.push(ConfigExclusion::tag(
+                                tag,
+                                ExclusionReason::InvalidTag {
+                                    address: tag.address.clone(),
+                                    data_type: tag.data_type.clone(),
+                                    issue,
+                                },
+                            ));
+                            continue;
+                        }
+                    },
+                    ResolvedConnection::Hub { catalog } => match hub_external_name(tag, *catalog) {
+                        Ok(name) => {
+                            external_names.push(name);
+                            // The Hub delivers engineering values (its own
+                            // scaling is already applied), so a scaling on
+                            // the registry row is never applied again here.
+                            None
+                        }
+                        Err(reason) => {
+                            // #383 段階3 P3 (H3, #414): this tag alone is
+                            // left out; the rest of the group collects.
+                            exclusions.push(ConfigExclusion::tag(tag, reason));
+                            continue;
+                        }
+                    },
                 };
                 readable_tags.push(tag);
-                requests.push(request);
                 tag_plans.push(TagPlan {
                     key: tag_key(tag.id),
-                    scaling: tag.scaling(),
+                    scaling,
                     thresholds: threshold_source.for_tag(tag),
                 });
                 store_columns.push(TagColumn {
@@ -999,6 +1132,7 @@ fn build_config_lenient_inner(
                 period: Duration::from_millis(period_ms as u64),
                 period_ms,
                 requests,
+                external_names,
                 tags: tag_plans,
             });
         }
@@ -1011,11 +1145,18 @@ fn build_config_lenient_inner(
         }
 
         store_groups.extend(conn_store_groups);
+        let (config, simulation) = match resolved {
+            ResolvedConnection::Plc(_, client_config) => (client_config, conn.simulation),
+            // Connection-level simulation does not apply to a Hub connection
+            // (banto-tags stores it as `false`; the Hub labels its own
+            // simulated values, `crate::external`).
+            ResolvedConnection::Hub { .. } => (ProtocolConfig::External, false),
+        };
         connection_plans.push(ConnectionPlan {
             key: connection_key(conn.id),
-            config: client_config,
+            config,
             groups: group_plans,
-            simulation: conn.simulation,
+            simulation,
         });
     }
 
@@ -1030,20 +1171,87 @@ fn build_config_lenient_inner(
     )
 }
 
-/// #414 段階2: just the exclusions [`build_config_lenient_from`] would make
-/// for `snapshot` - "which registry items would be left out if collection
-/// were started now". For a registry editor's marks (chronogazer's `/tags`),
-/// so the verdict comes from the one builder instead of a re-implementation.
+/// #414 段階2: just the exclusions the lenient build would make for
+/// `snapshot` - "which registry items would be left out if collection were
+/// started now". For a registry editor's marks (chronogazer's `/tags`), so
+/// the verdict comes from the one builder instead of a re-implementation.
+///
+/// #383 段階3 P3: these marks are about **the registry's own content**, so
+/// a `"hub"` connection is judged as collectable without a catalog
+/// ([`HubSource::Available`] with `catalog: None`). Whether this runtime can
+/// reach a Hub, and whether a hub tag still exists on the Hub, are facts of
+/// a running collection, not of the registry - they show up in the running
+/// collector's own exclusion list (the build at collection start), not here.
 pub fn config_exclusions(snapshot: &RegistrySnapshot) -> Vec<ConfigExclusion> {
-    build_config_lenient_from(snapshot).1
+    build_config_lenient_inner(
+        snapshot,
+        ThresholdSource::None,
+        HubSource::Available { catalog: None },
+    )
+    .1
+}
+
+/// Understand one enabled connection row: dialed (`modbus-tcp` / `slmp`),
+/// sampled from the Hub (`hub`, when `hub` allows it), or excluded with the
+/// reason.
+fn resolve_connection<'a>(
+    conn: &PlcConnection,
+    hub: HubSource<'a>,
+) -> Result<ResolvedConnection<'a>, ExclusionReason> {
+    if conn.is_hub_source() {
+        return match hub {
+            HubSource::Unavailable => Err(ExclusionReason::HubSourceUnavailable),
+            HubSource::NotConfigured => Err(ExclusionReason::HubNotConfigured),
+            HubSource::Available { catalog } => Ok(ResolvedConnection::Hub { catalog }),
+        };
+    }
+    let protocol = parse_protocol(&conn.protocol)?;
+    let client_config = match protocol {
+        Protocol::ModbusTcp => ProtocolConfig::ModbusTcp(modbus_config_for(conn)?),
+        Protocol::Slmp => ProtocolConfig::Slmp(slmp_config_for(conn)?),
+    };
+    Ok(ResolvedConnection::Plc(protocol, client_config))
+}
+
+/// #383 段階3 P3: a hub tag's external name, if the tag can be collected -
+/// its data type must be one the store knows, and (when the Hub's catalog
+/// could be read at start, H3) the external name must still be on the Hub
+/// with the same data type. The registry already enforced the external-name
+/// shape and "not string, not writable" on save
+/// (`banto_tags::validate_hub_tag_address`).
+fn hub_external_name(tag: &Tag, catalog: Option<&HubCatalog>) -> Result<String, ExclusionReason> {
+    if DataType::parse(&tag.data_type).is_none() {
+        return Err(ExclusionReason::InvalidTag {
+            address: tag.address.clone(),
+            data_type: tag.data_type.clone(),
+            issue: TagAddressIssue::UnknownDataType,
+        });
+    }
+    let name = tag.address.trim().to_string();
+    if let Some(catalog) = catalog {
+        match catalog.get(&name) {
+            None => {
+                return Err(ExclusionReason::HubTagNotFound {
+                    external_name: name,
+                })
+            }
+            Some(hub_type) if *hub_type != tag.data_type => {
+                return Err(ExclusionReason::HubTagTypeChanged {
+                    external_name: name,
+                    registered: tag.data_type.clone(),
+                    catalog: hub_type.clone(),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(name)
 }
 
 fn parse_protocol(protocol: &str) -> Result<Protocol, ExclusionReason> {
     match protocol {
         "modbus-tcp" => Ok(Protocol::ModbusTcp),
         "slmp" => Ok(Protocol::Slmp),
-        // #383 段階3 P2: see `build_config_lenient_inner`'s filter comment.
-        banto_tags::HUB_PROTOCOL => Err(ExclusionReason::HubSourceNotYetCollected),
         other => Err(ExclusionReason::UnsupportedProtocol {
             protocol: other.to_string(),
         }),
@@ -1457,7 +1665,7 @@ mod tests {
                 assert_eq!(modbus.host, "127.0.0.1");
                 assert_eq!(modbus.port, 502);
             }
-            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+            _ => panic!("expected ModbusTcp config"),
         }
         assert_eq!(c.groups[0].requests.len(), 2);
 
@@ -1675,7 +1883,8 @@ mod tests {
                 ll: Some(5.0),
             },
         )]);
-        let (config, exclusions) = build_config_lenient_with_thresholds(&snapshot, &supplied);
+        let (config, exclusions) =
+            build_config_lenient_with_thresholds(&snapshot, &supplied, HubSource::Unavailable);
         assert!(exclusions.is_empty());
         let tags = &config.connections[0].groups[0].tags;
         assert_eq!(tags[0].key, format!("tag:{}", unlisted.id));
@@ -1881,7 +2090,7 @@ mod tests {
                 assert_eq!(slmp.host, "127.0.0.1");
                 assert_eq!(slmp.port, 5007);
             }
-            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+            _ => panic!("expected Slmp config"),
         }
         assert_eq!(c.groups[0].requests.len(), 1);
     }
@@ -1916,7 +2125,7 @@ mod tests {
                     "a connection asking for high_low must not silently get the default"
                 );
             }
-            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+            _ => panic!("expected Slmp config"),
         }
     }
 
@@ -1943,7 +2152,7 @@ mod tests {
         let config = build_config(&pool).await.expect("slmp config should build");
         match &config.connections[0].config {
             ProtocolConfig::Slmp(slmp) => assert_eq!(slmp.word_order, WordOrder::LowHigh),
-            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+            _ => panic!("expected Slmp config"),
         }
     }
 
@@ -2003,7 +2212,7 @@ mod tests {
                 WordOrder::HighLow,
                 "a connection asking for high_low must not silently get low_high"
             ),
-            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+            _ => panic!("expected ModbusTcp config"),
         }
 
         let low_high_plan = config
@@ -2018,7 +2227,7 @@ mod tests {
                 "a connection asking for low_high must not silently get \
                  ModbusTcpConfig::default()'s high_low"
             ),
-            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+            _ => panic!("expected ModbusTcp config"),
         }
     }
 
@@ -2084,7 +2293,7 @@ mod tests {
         // that is Collector's job (see ConnectionPlan's doc comment).
         match &sim_plan.config {
             ProtocolConfig::ModbusTcp(modbus) => assert_eq!(modbus.port, 502),
-            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+            _ => panic!("expected ModbusTcp config"),
         }
         let real_plan = config
             .connections
@@ -2229,15 +2438,12 @@ mod tests {
         assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
     }
 
-    /// #383 段階3 P2: a `"hub"` connection with a group and a tag is left out
-    /// of the PLC tasks with an explicit reason - the connection as
-    /// [`ExclusionReason::HubSourceNotYetCollected`], its group and tag as
-    /// cascades - while the PLC connection next to it is still collected
-    /// (#414: 外して残りを動かす). The strict build (banto-hub) fails on it
-    /// with the hub-specific wording, and the hub tag's external-name address
-    /// is never handed to the PLC address interpreter.
-    #[tokio::test]
-    async fn a_hub_connection_is_excluded_with_a_reason_and_the_rest_keeps_running() {
+    /// A registry with one PLC connection (`T1` at `40001`) and one `"hub"`
+    /// connection whose group holds `HT` (`PLC9.G.Temp`, `f64`), `Gone`
+    /// (`PLC9.G.Gone`, `f64`) and `Retyped` (`PLC9.G.Retyped`, `i16`).
+    /// Returns `(pool, plc conn id, plc group id, hub conn id, hub group id,
+    /// [HT, Gone, Retyped] tag ids)`.
+    async fn registry_with_a_hub_connection() -> (SqlitePool, i64, i64, i64, i64, [i64; 3]) {
         let pool = registry().await;
         let plc_svc = PlcConnectionService::new(pool.clone());
         let real_conn = plc_svc.create(conn_input("PLC1", 502)).await.unwrap();
@@ -2254,52 +2460,89 @@ mod tests {
         let mut hub_input = conn_input("Hub", 0);
         hub_input.protocol = banto_tags::HUB_PROTOCOL.to_string();
         let hub = plc_svc.create(hub_input).await.unwrap();
+        let mut hub_group_input = group_input("HG", hub.id, 1_000);
+        hub_group_input.default_writable = false;
         let hub_group = CollectionGroupService::new(pool.clone())
-            .create(group_input("HG", hub.id, 1_000))
+            .create(hub_group_input)
             .await
             .unwrap();
-        let hub_tag = tag_svc
-            .create(tag_input("HT", hub_group.id, "PLC9.G.Temp"))
-            .await
-            .unwrap();
+        let mut ids = [0_i64; 3];
+        for (slot, (name, address, data_type)) in [
+            ("HT", "PLC9.G.Temp", "f64"),
+            ("Gone", "PLC9.G.Gone", "f64"),
+            ("Retyped", "PLC9.G.Retyped", "i16"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut input = tag_input(name, hub_group.id, address);
+            input.data_type = data_type.to_string();
+            ids[slot] = tag_svc.create(input).await.unwrap().id;
+        }
+        (pool, real_conn.id, group.id, hub.id, hub_group.id, ids)
+    }
 
+    /// #383 段階3 P3: where the runtime cannot collect a `"hub"` connection
+    /// (banto-hub, `banto-serve`) it is left out with an explicit reason -
+    /// the connection as [`ExclusionReason::HubSourceUnavailable`] (or
+    /// [`ExclusionReason::HubNotConfigured`] when no Hub is set up), its
+    /// group and tags as cascades - while the PLC connection next to it is
+    /// still collected (#414: 外して残りを動かす). The strict build
+    /// (banto-hub) fails on it, and the hub tags' external-name addresses
+    /// are never handed to the PLC address interpreter.
+    #[tokio::test]
+    async fn a_hub_connection_is_excluded_where_the_runtime_cannot_collect_it() {
+        let (pool, plc_id, plc_group, hub_id, hub_group, ids) =
+            registry_with_a_hub_connection().await;
         let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
-        let (config, exclusions) = build_config_lenient_from(&snapshot);
-        assert_eq!(config.connections.len(), 1);
-        assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
-        assert_eq!(config.store_config.groups.len(), 1);
-        assert_eq!(
-            config.store_config.groups[0].key,
-            format!("grp:{}", group.id)
-        );
 
-        let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
-            .iter()
-            .map(|e| (e.unit, e.id, e.reason.code()))
-            .collect();
-        assert_eq!(
-            listed,
-            vec![
-                (
-                    ExclusionUnit::Connection,
-                    hub.id,
-                    "hubSourceNotYetCollected"
-                ),
-                (ExclusionUnit::Group, hub_group.id, "connectionExcluded"),
-                (ExclusionUnit::Tag, hub_tag.id, "connectionExcluded"),
-            ]
-        );
-        assert_eq!(
-            exclusions[0].reason.message(),
-            "Hub 経由の接続からの収集にはまだ対応していません"
-        );
-        assert_eq!(config_exclusions(&snapshot), exclusions);
+        for (source, code, message) in [
+            (
+                HubSource::Unavailable,
+                "hubSourceUnavailable",
+                "この実行形態では Hub 経由の接続から収集できません",
+            ),
+            (
+                HubSource::NotConfigured,
+                "hubNotConfigured",
+                "Hub への接続が設定されていないため収集しません（Hub に接続してから収集を再起動してください）",
+            ),
+        ] {
+            let (config, exclusions) =
+                build_config_lenient_with_thresholds(&snapshot, &HashMap::new(), source);
+            assert_eq!(config.connections.len(), 1);
+            assert_eq!(config.connections[0].key, format!("conn:{plc_id}"));
+            assert!(!config.has_external_connections());
+            assert_eq!(config.store_config.groups.len(), 1);
+            assert_eq!(
+                config.store_config.groups[0].key,
+                format!("grp:{plc_group}")
+            );
+            let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
+                .iter()
+                .map(|e| (e.unit, e.id, e.reason.code()))
+                .collect();
+            assert_eq!(
+                listed,
+                vec![
+                    (ExclusionUnit::Connection, hub_id, code),
+                    (ExclusionUnit::Group, hub_group, "connectionExcluded"),
+                    (ExclusionUnit::Tag, ids[0], "connectionExcluded"),
+                    (ExclusionUnit::Tag, ids[1], "connectionExcluded"),
+                    (ExclusionUnit::Tag, ids[2], "connectionExcluded"),
+                ]
+            );
+            assert_eq!(exclusions[0].reason.message(), message);
+        }
 
+        // banto-hub's lenient twin is the `Unavailable` one.
+        let (_, exclusions) = build_config_lenient_from(&snapshot);
+        assert_eq!(exclusions[0].reason, ExclusionReason::HubSourceUnavailable);
         match build_config_from(&snapshot) {
             Err(CollectError::Config(message)) => {
-                assert!(
-                    message.contains("接続 Hub は Hub 経由の接続です"),
-                    "{message}"
+                assert_eq!(
+                    message,
+                    "接続 Hub は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
                 );
             }
             other => panic!("the strict build must refuse a hub connection, got {other:?}"),
@@ -2311,6 +2554,106 @@ mod tests {
             check_tag_address(banto_tags::HUB_PROTOCOL, "PLC9.G.Temp", "f64"),
             Ok(())
         );
+    }
+
+    /// #383 段階3 P3: where the runtime can collect it, a `"hub"` connection
+    /// becomes an external plan sampling each tag's external name, in tag
+    /// order, with no scaling and no simulation. Against the Hub catalog
+    /// (H3), a tag that vanished and one whose data type changed are left
+    /// out **alone** with their reasons, the rest of the group and the PLC
+    /// connection keep running (#414). Without a catalog nothing is
+    /// reconciled. The registry marks (`config_exclusions`) judge only the
+    /// registry, so they list nothing for a well-formed hub connection.
+    #[tokio::test]
+    async fn an_available_hub_is_collected_and_reconciled_against_its_catalog() {
+        let (pool, plc_id, _plc_group, hub_id, hub_group, ids) =
+            registry_with_a_hub_connection().await;
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+
+        let catalog: HubCatalog = HashMap::from([
+            ("PLC9.G.Temp".to_string(), "f64".to_string()),
+            ("PLC9.G.Retyped".to_string(), "f32".to_string()),
+            ("PLC9.G.Other".to_string(), "bit".to_string()),
+        ]);
+        let (config, exclusions) = build_config_lenient_with_thresholds(
+            &snapshot,
+            &HashMap::new(),
+            HubSource::Available {
+                catalog: Some(&catalog),
+            },
+        );
+        assert!(config.has_external_connections());
+        let keys: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+        let (plc_key, hub_key) = (format!("conn:{plc_id}"), format!("conn:{hub_id}"));
+        assert_eq!(keys, vec![plc_key.as_str(), hub_key.as_str()]);
+        let hub_plan = &config.connections[1];
+        assert_eq!(hub_plan.config, ProtocolConfig::External);
+        assert!(!hub_plan.simulation);
+        assert_eq!(hub_plan.groups.len(), 1);
+        assert_eq!(hub_plan.groups[0].key, format!("grp:{hub_group}"));
+        assert!(hub_plan.groups[0].requests.is_empty());
+        assert_eq!(hub_plan.groups[0].external_names, vec!["PLC9.G.Temp"]);
+        let tag_keys: Vec<&str> = hub_plan.groups[0]
+            .tags
+            .iter()
+            .map(|t| t.key.as_str())
+            .collect();
+        assert_eq!(tag_keys, vec![format!("tag:{}", ids[0]).as_str()]);
+        assert_eq!(hub_plan.groups[0].tags[0].scaling, None);
+        // The hub group gets a store group with only the surviving column.
+        let hub_store = config
+            .store_config
+            .groups
+            .iter()
+            .find(|g| g.key == format!("grp:{hub_group}"))
+            .expect("hub store group");
+        assert_eq!(hub_store.tags.len(), 1);
+        assert_eq!(hub_store.tags[0].data_type, "f64");
+
+        assert_eq!(
+            exclusions,
+            vec![
+                ConfigExclusion {
+                    unit: ExclusionUnit::Tag,
+                    id: ids[1],
+                    key: format!("tag:{}", ids[1]),
+                    name: "Gone".to_string(),
+                    reason: ExclusionReason::HubTagNotFound {
+                        external_name: "PLC9.G.Gone".to_string(),
+                    },
+                },
+                ConfigExclusion {
+                    unit: ExclusionUnit::Tag,
+                    id: ids[2],
+                    key: format!("tag:{}", ids[2]),
+                    name: "Retyped".to_string(),
+                    reason: ExclusionReason::HubTagTypeChanged {
+                        external_name: "PLC9.G.Retyped".to_string(),
+                        registered: "i16".to_string(),
+                        catalog: "f32".to_string(),
+                    },
+                },
+            ]
+        );
+        assert_eq!(exclusions[0].reason.code(), "hubTagNotFound");
+        assert_eq!(exclusions[1].reason.code(), "hubTagTypeChanged");
+        assert_eq!(
+            exclusions[1].reason.message(),
+            "Hub のタグ PLC9.G.Retyped のデータ型が変わったため収集しません（登録: i16 / Hub: f32）"
+        );
+
+        // Without a catalog: every hub tag is collected, nothing reconciled.
+        let (config, exclusions) = build_config_lenient_with_thresholds(
+            &snapshot,
+            &HashMap::new(),
+            HubSource::Available { catalog: None },
+        );
+        assert!(exclusions.is_empty(), "{exclusions:?}");
+        assert_eq!(
+            config.connections[1].groups[0].external_names,
+            vec!["PLC9.G.Temp", "PLC9.G.Gone", "PLC9.G.Retyped"]
+        );
+        assert!(config_exclusions(&snapshot).is_empty());
     }
 
     #[tokio::test]
@@ -2455,7 +2798,7 @@ mod tests {
             .unwrap();
         match &slmp_plan.config {
             ProtocolConfig::Slmp(cfg) => assert_eq!(cfg.port, 19999),
-            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+            _ => panic!("expected Slmp config"),
         }
 
         let modbus_plan = config
@@ -2468,7 +2811,7 @@ mod tests {
                 cfg.port, 19998,
                 "#337: a broker-routed Modbus plan is stamped just like an SLMP one"
             ),
-            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+            _ => panic!("expected ModbusTcp config"),
         }
     }
 
