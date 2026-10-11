@@ -583,23 +583,52 @@
 //!   投入する。札はタスクがその開始を処理し終えて**状態を公開した後**に
 //!   落ち（受付数を 1 減らす）、投入に失敗したとき・タスクが居なくなって
 //!   キューごと捨てられたときも `Drop` で必ず落ちる。
-//! * **[`CollectorService::begin_quit`]** は同じロックの中で印を立て、
+//! * **[`CollectorService::begin_quit_confirm`]** は同じロックの中で印を立て、
 //!   「受付数が 1 以上か、状態が `Starting`/`Running`」を返す。
 //!
-//! 受付（印の確認と受付数の増加）と `begin_quit`（印を立てて受付数と状態を
+//! **印は 2 種類**（#392 A2 再レビュー P2-2、2026-10-12）:
+//!
+//! * **確認のための一時的な印**（`Admission::confirm_hold`）。トレイの確認の
+//!   答えが [`CollectorService::begin_quit_confirm`] で立て、確かめ直すとき
+//!   （`AskAgain`）に [`CollectorService::cancel_quit_confirm`] で下ろす。
+//! * **終了処理の取り消せない印**（`Admission::shutting_down`）。終了処理が
+//!   [`CollectorService::begin_shutdown`] で立て、**誰も下ろさない**。
+//!   `cancel_quit_confirm` はこちらに触れないので、OS のシャットダウンで後始末に
+//!   入った後に遅れて届いたトレイの `AskAgain` が、終了処理の印を解除して
+//!   開始を通してしまうことは無い（OS の経路は `QuitGate` を `Quitting` に
+//!   しないので、トレイの答えが遅れて届きうる）。
+//!
+//! 受付はどちらかが立っていれば断る。
+//!
+//! 受付（印の確認と受付数の増加）と `begin_quit_confirm`（印を立てて受付数と状態を
 //! 読む）が同じロックの下にあり、受付数が 0 に戻るのは状態の公開の後なので、
-//! どちらが先でも「黙って止める」結果にならない: 開始が先なら `begin_quit` は
-//! 「忙しい」（トレイは「収集中」の文言で確かめ直し、印を下ろす =
-//! [`CollectorService::cancel_quit`]）、`begin_quit` が先なら開始が断られる。
+//! どちらが先でも「黙って止める」結果にならない: 開始が先なら `begin_quit_confirm` は
+//! 「忙しい」（トレイは「収集中」の文言で確かめ直し、一時的な印を下ろす =
+//! [`CollectorService::cancel_quit_confirm`]）、`begin_quit_confirm` が先なら開始が断られる。
 //! キューの中で待っている開始（まだ `Starting` を公開していない）も受付数で
 //! 数えるので見落とさない。印を立てるのに**キューを通らない**のは、トレイの
 //! 答えのコールバックを、走っている開始（応答しない接続先へのダイヤルを
 //! 含む）の後ろで待たせないため。停止（`stop`）は断らない。
 //!
-//! 印は終了処理（`src-tauri` の `shutdown_app_state`・`banto-serve` の
-//! 終了）も先頭で立てる（下ろさない）- OS のシャットダウンで
-//! `RunEvent::Exit` から後始末に入った場合も、後始末の途中で開始が受け付け
-//! られて、止めたはずの収集が閉じかけた DB の上で動き出すことは無い。
+//! 取り消せない印は終了処理（`src-tauri` の `shutdown_app_state`・`banto-serve`
+//! の終了）が先頭で立てる - OS のシャットダウンで `RunEvent::Exit` から
+//! 後始末に入った場合も、後始末の途中で開始が受け付けられて、止めたはずの
+//! 収集が閉じかけた DB の上で動き出すことは無い。
+//!
+//! **受付から投入までの隙間**（#392 A2 再レビュー P2-1）: 受付（札を取る）と
+//! キューへの投入は別の区間なので、札を取った直後・投入の前に終了処理が
+//! 取り消せない印を立て、終了の `stop` を先に投入・完了させることがありうる。
+//! そのまま元の開始が投入されると、最後の停止の後に収集が立ち上がる（その
+//! 収集の最終 flush は誰も行わない）。そこで**タスクが `Start`/`Restart` を
+//! 処理する直前に、取り消せない印を確かめて断る**（同じ文言の `Err`）。
+//! 終了処理は印を立ててから `stop` を投入し、タスクはキューを順に処理する
+//! ので、終了の `stop` より後ろに並んだ開始は必ず印を見て断られる（前に
+//! 並んだ開始はその `stop` が止める）。**終了の `stop` が終端の操作になる**。
+//! 終了側が「未投入の札が 0 になるまで待つ」形を採らなかったのは、投入の
+//! 待ち（`COLLECT_ENQUEUE_TIMEOUT`）が終了の予算（5 秒）と競合し、待つ側と
+//! 待たれる側の順序を新たに決める必要が出るため - タスク側で断れば誰も
+//! 待たない。一時的な印はタスク側では見ない（一時的な印より前に受け付けた
+//! 開始は「忙しい」として数えられ、トレイが確かめ直すので、実行してよい）。
 //!
 //! # 保持期間（`retention.days`）について
 //!
@@ -878,7 +907,7 @@ impl CollectorState {
     }
 
     /// 止めるべき収集があるか（走っている・開始中）。終了の確認の文言と
-    /// [`CollectorService::begin_quit`] の「忙しいか」の判定に使う（#392 A2）。
+    /// [`CollectorService::begin_quit_confirm`] の「忙しいか」の判定に使う（#392 A2）。
     /// 開始中も含める（開始処理は止めないと走り切ってしまう）。対象 0 件・
     /// 開始失敗・停止中はエンジンが無いので含めない。
     pub fn is_collecting(&self) -> bool {
@@ -1424,9 +1453,14 @@ enum Command {
 /// doc「終了の受付」）。[`CollectorContext::admission`] の中身。
 #[derive(Debug, Default)]
 struct Admission {
-    /// 終了受付中。立っている間の開始（`start`・`restart`）は
+    /// 終了の確認のための一時的な印。トレイの `AskAgain` で下ろす。
+    confirm_hold: bool,
+    /// 終了処理の取り消せない印。一度立てたら下ろさない。タスクも
+    /// `Start`/`Restart` を処理する直前にこれを見る。
+    ///
+    /// どちらかが立っている間の受付（`start`・`restart`）は
     /// [`QUIT_IN_PROGRESS_MESSAGE`] で断る。
-    quitting: bool,
+    shutting_down: bool,
     /// 受け付けた（[`StartTicket`] を払い出した）が、まだ処理し終えていない
     /// 開始の数。
     pending_starts: usize,
@@ -1681,7 +1715,7 @@ struct CollectorContext {
     /// モジュールの doc「ライフサイクルは専用タスクが所有する」の末尾。
     published: Mutex<Published>,
     /// 終了の受付の印と、受け付け済みの開始の数（このモジュールの doc
-    /// 「終了の受付」）。**開始の受付と [`CollectorService::begin_quit`] を
+    /// 「終了の受付」）。**開始の受付と [`CollectorService::begin_quit_confirm`] を
     /// 直列にするロック**。中で `published` を読むことがある（順序は
     /// `admission` → `published` の一方向。`published` を握ったまま
     /// こちらを取る経路は無い）。
@@ -1758,6 +1792,12 @@ impl CollectorContext {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// 終了処理の取り消せない印が立っているか（タスクが `Start`/`Restart` を
+    /// 処理する直前に見る）。
+    fn shutting_down(&self) -> bool {
+        self.admission().shutting_down
+    }
+
     fn state(&self) -> CollectorState {
         self.published
             .lock()
@@ -1831,6 +1871,11 @@ impl CollectorContext {
 /// コマンドと LAN の REST が別々のエンジンを立てない）。
 struct CollectorInner {
     ctx: Arc<CollectorContext>,
+    /// **テスト専用**: 開始の受付（札を取った直後）とキューへの投入の間で
+    /// 止めるゲート（このモジュールの doc「受付から投入までの隙間」の回帰
+    /// テスト用）。製品ビルドにはフィールドごと存在しない。
+    #[cfg(test)]
+    enqueue_gate: OnceLock<Arc<StartGate>>,
     /// ライフサイクルタスクへの 2 本の口。**初回の非同期操作で spawn する**
     /// （[`CollectorService::new`] は `tauri` の `setup` から**ランタイムの
     /// 外**で呼ばれるので、そこで `tokio::spawn` すると panic する）。
@@ -1918,6 +1963,8 @@ impl CollectorService {
         Self {
             inner: Arc::new(CollectorInner {
                 ctx: Arc::new(ctx),
+                #[cfg(test)]
+                enqueue_gate: OnceLock::new(),
                 channels: OnceLock::new(),
             }),
         }
@@ -1968,11 +2015,13 @@ impl CollectorService {
     /// そのとき状態は [`CollectorState::Starting`] のままで、起動処理は
     /// タスク側で続いている。
     ///
-    /// 終了の受付の印が立っていれば（[`Self::begin_quit`]）、投入せずに
+    /// 終了の受付の印が立っていれば（[`Self::begin_quit_confirm`]）、投入せずに
     /// [`QUIT_IN_PROGRESS_MESSAGE`] の `Err` を返す（このモジュールの doc
     /// 「終了の受付」）。
     pub async fn start(&self) -> Result<CollectOutcome, BantoError> {
         let ticket = self.admit_start()?;
+        #[cfg(test)]
+        self.pause_before_enqueue_for_test().await;
         self.lifecycle(move |reply| Command::Start(reply, ticket))
             .await
     }
@@ -2011,6 +2060,8 @@ impl CollectorService {
     /// 投入せずに断る（止めもしない - 止めるのは終了処理の仕事）。
     pub async fn restart(&self) -> Result<CollectOutcome, BantoError> {
         let ticket = self.admit_start()?;
+        #[cfg(test)]
+        self.pause_before_enqueue_for_test().await;
         self.lifecycle(move |reply| Command::Restart(reply, ticket))
             .await
     }
@@ -2020,24 +2071,36 @@ impl CollectorService {
     /// `Starting`/`Running`）を返す（このモジュールの doc「終了の受付」）。
     /// 以降の `start`/`restart` は [`QUIT_IN_PROGRESS_MESSAGE`] で断られる。
     /// 冪等。キューを通らないので待たされない。
-    pub fn begin_quit(&self) -> bool {
+    pub fn begin_quit_confirm(&self) -> bool {
         let mut admission = self.inner.ctx.admission();
-        admission.quitting = true;
+        admission.confirm_hold = true;
         admission.pending_starts > 0 || self.inner.ctx.state().is_collecting()
     }
 
-    /// 終了の受付の印を下ろし、開始を再び受け付ける。トレイが「収集中」の
-    /// 文言でもう一度確かめるとき（`AskAgain`）だけ使う。終了処理に入った
-    /// 後は呼ばない。
-    pub fn cancel_quit(&self) {
-        self.inner.ctx.admission().quitting = false;
+    /// 確認のための一時的な印**だけ**を下ろす。トレイが「収集中」の文言で
+    /// もう一度確かめるとき（`AskAgain`）だけ使う。終了処理の取り消せない印
+    /// （[`Self::begin_shutdown`]）には触れないので、それが立っていれば開始は
+    /// 断られ続ける。
+    pub fn cancel_quit_confirm(&self) {
+        self.inner.ctx.admission().confirm_hold = false;
     }
 
-    /// 開始の受付（このモジュールの doc「終了の受付」）。印が立っていれば
-    /// `Err`、立っていなければ受付数を 1 増やして札を返す。
+    /// 終了処理の取り消せない印を立て、同じロックの中で今忙しいかを返す
+    /// （このモジュールの doc「終了の受付」）。以降の受付は断られ、タスクも
+    /// この後に処理する `Start`/`Restart` を断る。下ろす口は無い。冪等。
+    /// 終了処理は、これを立ててから終了の [`Self::stop`] を投入すること
+    /// （その `stop` を終端の操作にするため）。
+    pub fn begin_shutdown(&self) -> bool {
+        let mut admission = self.inner.ctx.admission();
+        admission.shutting_down = true;
+        admission.pending_starts > 0 || self.inner.ctx.state().is_collecting()
+    }
+
+    /// 開始の受付（このモジュールの doc「終了の受付」）。印（どちらか）が
+    /// 立っていれば `Err`、立っていなければ受付数を 1 増やして札を返す。
     fn admit_start(&self) -> Result<StartTicket, BantoError> {
         let mut admission = self.inner.ctx.admission();
-        if admission.quitting {
+        if admission.confirm_hold || admission.shutting_down {
             return Err(BantoError::Other(QUIT_IN_PROGRESS_MESSAGE.to_string()));
         }
         admission.pending_starts += 1;
@@ -2509,6 +2572,24 @@ impl CollectorService {
         (svc, command_rx, read_rx)
     }
 
+    /// **テスト専用**: 受付とキューへの投入の間で止めるゲートを付ける
+    /// （[`CollectorInner::enqueue_gate`]）。
+    #[cfg(test)]
+    fn set_enqueue_gate(&self, gate: Arc<StartGate>) {
+        if self.inner.enqueue_gate.set(gate).is_err() {
+            panic!("enqueue_gate は 1 回だけ付ける");
+        }
+    }
+
+    /// **テスト専用**: ゲートが付いていれば、受付の後・投入の前で止まる。
+    #[cfg(test)]
+    async fn pause_before_enqueue_for_test(&self) {
+        if let Some(gate) = self.inner.enqueue_gate.get() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// **テスト専用**: 受け付け済みでまだ処理し終えていない開始の数。
     #[cfg(test)]
     fn pending_starts(&self) -> usize {
@@ -2606,9 +2687,17 @@ impl Lifecycle {
                         //
                         // 開始の札は**処理し終えて状態を公開した後**に落とす
                         // （このモジュールの doc「終了の受付」- 落とした時点で
-                        // `begin_quit` は公開済みの状態を読める）。
+                        // `begin_quit_confirm` は公開済みの状態を読める）。
+                        //
+                        // 処理の直前に終了処理の取り消せない印を確かめ、立って
+                        // いれば断る（このモジュールの doc「受付から投入までの
+                        // 隙間」- 終了の `stop` の後ろに並んだ開始を走らせない）。
                         Command::Start(reply, ticket) => {
-                            let result = self.start().await;
+                            let result = if self.ctx.shutting_down() {
+                                Err(BantoError::Other(QUIT_IN_PROGRESS_MESSAGE.to_string()))
+                            } else {
+                                self.start().await
+                            };
                             drop(ticket);
                             let _ = reply.send(result);
                         }
@@ -2616,7 +2705,11 @@ impl Lifecycle {
                             let _ = reply.send(self.stop().await);
                         }
                         Command::Restart(reply, ticket) => {
-                            let result = self.restart().await;
+                            let result = if self.ctx.shutting_down() {
+                                Err(BantoError::Other(QUIT_IN_PROGRESS_MESSAGE.to_string()))
+                            } else {
+                                self.restart().await
+                            };
                             drop(ticket);
                             let _ = reply.send(result);
                         }
@@ -5848,21 +5941,21 @@ mod tests {
         let (pool, svc) = service(&dir).await;
         seed_one_tag(&pool, "40001").await;
 
-        assert!(!svc.begin_quit(), "停止中で受付も無い = 暇");
+        assert!(!svc.begin_quit_confirm(), "停止中で受付も無い = 暇");
         assert_quit_refusal(svc.start().await);
         assert_quit_refusal(svc.restart().await);
         assert_eq!(svc.state(), CollectorState::Stopped);
         assert_eq!(svc.pending_starts(), 0, "断った開始を数えに残さない");
         svc.stop().await.expect("停止は断らない");
 
-        svc.cancel_quit();
+        svc.cancel_quit_confirm();
         let outcome = svc.start().await.expect("印を下ろせば開始できる");
         assert!(outcome.status.is_running(), "{:?}", outcome.status);
         assert_eq!(svc.pending_starts(), 0, "処理し終えた開始の札は落ちる");
         svc.stop().await.expect("stop");
     }
 
-    /// 開始が先（開始処理の最中）: `begin_quit` は「忙しい」を返し
+    /// 開始が先（開始処理の最中）: `begin_quit_confirm` は「忙しい」を返し
     /// （= トレイは「収集中」の文言で確かめ直す）、その後の開始は断られる。
     /// 受け付け済みの開始は最後まで進む。
     #[tokio::test]
@@ -5885,7 +5978,7 @@ mod tests {
         gate.entered.notified().await;
         assert_eq!(svc.state(), CollectorState::Starting);
 
-        assert!(svc.begin_quit(), "開始中は忙しい側に数える");
+        assert!(svc.begin_quit_confirm(), "開始中は忙しい側に数える");
         assert_quit_refusal(svc.start().await);
 
         gate.release.notify_one();
@@ -5919,7 +6012,7 @@ mod tests {
         assert_eq!(svc.pending_starts(), 1);
 
         assert!(
-            svc.begin_quit(),
+            svc.begin_quit_confirm(),
             "キューで待っている開始を見落として「暇」と答えている"
         );
 
@@ -5930,7 +6023,7 @@ mod tests {
         let result = starter.await.expect("join");
         assert!(result.is_err(), "{result:?}");
         assert_eq!(svc.pending_starts(), 0, "捨てられたコマンドの札も落ちる");
-        assert!(!svc.begin_quit(), "数え残しが無ければ暇");
+        assert!(!svc.begin_quit_confirm(), "数え残しが無ければ暇");
     }
 
     /// 開始と印を同時に走らせ、どの順に並んでも「印を立てた時点で暇
@@ -5956,7 +6049,7 @@ mod tests {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    svc.begin_quit()
+                    svc.begin_quit_confirm()
                 })
             };
             let started = start.await.expect("join start");
@@ -5966,7 +6059,7 @@ mod tests {
                     assert!(outcome.status.is_running(), "{:?}", outcome.status);
                     assert!(
                         busy,
-                        "開始が受け付けられたなら、begin_quit は忙しいと読んでいるはず"
+                        "開始が受け付けられたなら、begin_quit_confirm は忙しいと読んでいるはず"
                     );
                 }
                 Err(err) => {
@@ -5977,5 +6070,74 @@ mod tests {
             }
             svc.stop().await.expect("stop");
         }
+    }
+
+    /// #392 A2 再レビュー P2-1: 開始の受付（札を取った）直後・キューへの投入の
+    /// 前で止めておき、その間に終了処理（取り消せない印 → 終了の `stop`）を
+    /// 完了させる。投入を再開しても、開始は**終了の `stop` の後に走らない**
+    /// （タスクが処理の直前に断る）。`start` と `restart` の両方。
+    #[tokio::test]
+    async fn a_start_admitted_before_shutdown_but_enqueued_after_the_final_stop_is_refused() {
+        for use_restart in [false, true] {
+            let dir = TempDir::new();
+            let (pool, svc) = service(&dir).await;
+            seed_one_tag(&pool, "40001").await;
+            let gate = Arc::new(StartGate::default());
+            svc.set_enqueue_gate(gate.clone());
+
+            let starter = {
+                let svc = svc.clone();
+                tokio::spawn(async move {
+                    if use_restart {
+                        svc.restart().await
+                    } else {
+                        svc.start().await
+                    }
+                })
+            };
+            gate.entered.notified().await;
+            assert_eq!(svc.pending_starts(), 1, "札は取ってある（未投入）");
+
+            // 終了処理: 取り消せない印を立て、終了の stop を投入して完了させる。
+            assert!(svc.begin_shutdown(), "受付済みの開始は忙しい側に数える");
+            svc.stop().await.expect("終了の stop");
+            assert_eq!(svc.state(), CollectorState::Stopped);
+
+            // 止めていた開始を投入させる。
+            gate.release.notify_one();
+            assert_quit_refusal(starter.await.expect("join"));
+            assert_eq!(
+                svc.state(),
+                CollectorState::Stopped,
+                "終了の stop の後に収集が立ち上がっている (restart={use_restart})"
+            );
+            assert_eq!(svc.pending_starts(), 0);
+        }
+    }
+
+    /// #392 A2 再レビュー P2-2: OS の終了経路が取り消せない印を立てた後に、
+    /// 遅れて届いたトレイの答えが「確かめ直す」（一時的な印を立てて下ろす）を
+    /// 行っても、開始は断られ続ける。`QuitGate::answer` が AskAgain で行う
+    /// 呼び出し（`begin_quit_confirm` が忙しいを返す → `cancel_quit_confirm`）を
+    /// そのまま再現する。
+    #[tokio::test]
+    async fn a_late_ask_again_cannot_lift_the_shutdown_mark() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        seed_one_tag(&pool, "40001").await;
+        let outcome = svc.start().await.expect("収集を開始できる");
+        assert!(outcome.status.is_running());
+
+        // OS のシャットダウンで後始末に入った（取り消せない印）。
+        assert!(svc.begin_shutdown());
+        // 遅れて届いた同意: まだ走っているので忙しい → AskAgain → 一時的な印を下ろす。
+        assert!(svc.begin_quit_confirm());
+        svc.cancel_quit_confirm();
+
+        assert_quit_refusal(svc.start().await);
+        assert_quit_refusal(svc.restart().await);
+        svc.stop().await.expect("stop");
+        assert_quit_refusal(svc.start().await);
+        assert_eq!(svc.state(), CollectorState::Stopped);
     }
 }

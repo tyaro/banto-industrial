@@ -550,7 +550,7 @@ fn currently_collecting(app: &AppHandle) -> bool {
 /// 口（#392 A2 レビュー、2026-10-12。`banto_desktop_tray` の doc「終了の確定と
 /// 収集の開始の直列化」・`banto_hub_core::controller` の doc「終了の受付」）。
 ///
-/// [`CollectionController::begin_quit`] は、収集の開始（REST・MCP の
+/// [`CollectionController::begin_quit_confirm`] は、収集の開始（REST・MCP の
 /// `start`/`start-all-simulation`/走行中の `mode`）が `Starting` を書くのと
 /// 同じロックで印を立てて状態を読むので、「停止中の文言で同意 → 状態を
 /// 読む → その直後に開始 → 古い『停止中』で終了へ進み、新しい収集を黙って
@@ -560,20 +560,22 @@ fn currently_collecting(app: &AppHandle) -> bool {
 /// 止める収集が無いので常に「暇」で、印も無い（サービスの収集はサービスが
 /// 持ち、このアプリの終了では止めない - [`quit`] の doc）。controller は
 /// 答えを受けた時点のものを 1 つ掴み、立てた印と下ろす印が別の controller に
-/// なることはない。
+/// なることはない。扱うのは**確認のための一時的な印**だけで、
+/// `RunningHub::shutdown` が立てる取り消せない印（`begin_shutdown`）は
+/// `AskAgain` で下ろせない（#392 A2 再レビュー P2-2）。
 struct ControllerQuitAdmission(Option<Arc<CollectionController>>);
 
 impl QuitAdmission for ControllerQuitAdmission {
-    fn begin_quit(&self) -> bool {
+    fn begin_quit_confirm(&self) -> bool {
         self.0
             .as_ref()
-            .map(|controller| tray_status::show_stop_item(&controller.begin_quit()))
+            .map(|controller| tray_status::show_stop_item(&controller.begin_quit_confirm()))
             .unwrap_or(false)
     }
 
-    fn cancel_quit(&self) {
+    fn cancel_quit_confirm(&self) {
         if let Some(controller) = &self.0 {
-            controller.cancel_quit();
+            controller.cancel_quit_confirm();
         }
     }
 }
@@ -1613,10 +1615,10 @@ mod tests {
     struct BusyAdmission;
 
     impl QuitAdmission for BusyAdmission {
-        fn begin_quit(&self) -> bool {
+        fn begin_quit_confirm(&self) -> bool {
             true
         }
-        fn cancel_quit(&self) {}
+        fn cancel_quit_confirm(&self) {}
     }
 
     /// 暇な文言で同意 → 待つ間に収集が始まった: 出し直し（Confirming のまま
@@ -1645,8 +1647,8 @@ mod tests {
     #[test]
     fn without_a_controller_the_admission_is_never_busy() {
         let admission = ControllerQuitAdmission(None);
-        assert!(!admission.begin_quit());
-        admission.cancel_quit();
+        assert!(!admission.begin_quit_confirm());
+        admission.cancel_quit_confirm();
         let gate = QuitGate::new();
         assert_eq!(gate.request(), QuitRequestDecision::ShowPrompt);
         assert_eq!(

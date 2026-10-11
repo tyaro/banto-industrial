@@ -4003,15 +4003,17 @@ pub(crate) struct ExitCleanupReport {
 }
 
 async fn shutdown_app_state(state: &AppState) -> ExitCleanupReport {
-    // #392 A2 レビュー（2026-10-12）: 後始末に入ったら、以降の収集の開始
-    // （窓の Tauri コマンド・まだ止めていない LAN の REST・自動開始）を
-    // 「終了処理中のため、収集を開始できません」で断る。下ろさない
-    // （`chronogazer_core::collect` の doc「終了の受付」）。トレイの「終了」は
-    // 確認の段階で既に立てているので冪等な 2 回目、OS のシャットダウン
-    // （`RunEvent::Exit`）はここが最初。予算の外で、待たずに立てる。印より前に
-    // 受け付けた開始はキューの順で下の `stop()` より先に処理されるので、
-    // 停止がそれを止める。
-    let _ = state.collect.begin_quit();
+    // #392 A2 レビュー（2026-10-12）: 後始末に入ったら、終了処理の**取り消せない**
+    // 印を立て、以降の収集の開始（窓の Tauri コマンド・まだ止めていない LAN の
+    // REST・自動開始）を「終了処理中のため、収集を開始できません」で断る。
+    // この印は誰も下ろさない（トレイの遅れた `AskAgain` が下ろすのは確認の
+    // ための一時的な印だけ。`chronogazer_core::collect` の doc「終了の受付」）。
+    // OS のシャットダウン（`RunEvent::Exit`）でもトレイの「終了」でも、ここで
+    // 立てる。予算の外で、待たずに立てる。**印を立ててから下の `stop()` を
+    // 投入する**ので、その `stop()` が終端の操作になる: 前に並んだ開始は
+    // それが止め、後ろに並んだ開始（受付は印より前でも）はタスクが処理の直前に
+    // 断る（同 doc「受付から投入までの隙間」）。
+    let _ = state.collect.begin_shutdown();
     let cleanup = async {
         // `server_apply` が停止に使っているのと同じ経路（`take()` して
         // `RunningServer::stop()`）。`take()` しておくのは、ここで止めたものを

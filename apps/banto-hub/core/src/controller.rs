@@ -17,29 +17,40 @@
 //! デスクトップのトレイの「アプリを終了」は、「収集していない」文言で同意を
 //! 取ったら止めずに終了する。その確認と終了の確定の間に、LAN の REST・MCP
 //! から収集が開始されると、**新しく始まった収集を再確認なしで止めて終了**
-//! してしまう。そこで、このコントローラが「終了受付中」の印
-//! （`ControllerState::quitting`）を持ち、
+//! してしまう。そこで、このコントローラが「終了受付中」の印を**2 種類**持つ
+//! （#392 A2 再レビュー P2-2、2026-10-12）:
 //!
-//! - [`CollectionController::begin_quit`] - 印を立て、**同じ `state` ロックの
-//!   中で**今の状態を読んで返す（トレイはこれで「忙しいか」を判断する）、
-//! - [`CollectionController::cancel_quit`] - 印を下ろす（トレイが「収集中」の
-//!   文言でもう一度確かめるとき）、
+//! - **確認のための一時的な印**（`ControllerState::quit_confirm_hold`）。トレイの
+//!   確認の答えで立て、確かめ直すとき（`AskAgain`）に下ろす。
+//! - **終了処理の取り消せない印**（`ControllerState::shutting_down`）。終了処理
+//!   （`crate::runtime::RunningHub::shutdown`）が立て、**誰も下ろさない**。
+//!   一時的な印を下ろす口（`cancel_quit_confirm`）はこちらに触れないので、
+//!   遅れて届いたトレイの `AskAgain` が、別の終了経路が始めた終了処理の印を
+//!   解除することは無い。
+//!
+//! 開始はどちらかが立っていれば断る。
+//!
+//! - [`CollectionController::begin_quit_confirm`] - 一時的な印を立て、**同じ `state`
+//!   ロックの中で**今の状態を読んで返す（トレイはこれで「忙しいか」を判断する）、
+//! - [`CollectionController::cancel_quit_confirm`] - 一時的な印だけを下ろす（トレイが
+//!   「収集中」の文言でもう一度確かめるとき）、
+//! - [`CollectionController::begin_shutdown`] - 取り消せない印を立てる、
 //! - 開始（[`CollectionController::start`]・走行中の
 //!   [`CollectionController::set_mode`]）は、状態を `Starting` にする**同じ
 //!   `state` ロックの区間で**印を見て、立っていれば [`QuitInProgress`] で
 //!   **明示的に断る**（黙って捨てない。REST は 409、MCP はツールエラー）、
 //!
-//! とする。`Starting` への書き込みと `begin_quit` の読み取りが同じロックの
+//! とする。`Starting` への書き込みと `begin_quit_confirm` の読み取りが同じロックの
 //! 下にあるので、どちらが先でも「黙って止める」結果にならない: 開始が先なら
-//! `begin_quit` が `Starting` 以降を読み（トレイは確認し直す）、`begin_quit`
+//! `begin_quit_confirm` が `Starting` 以降を読み（トレイは確認し直す）、`begin_quit_confirm`
 //! が先なら開始が断られる。`transition` ロックではなく `state` ロックで
 //! 直列化するのは、`transition` は live apply が PLC へのダイヤルを含めて
 //! 数秒握ることがあり、トレイの答えのコールバックをそこで待たせないため
 //! （`state` ロックは短い同期の区間でしか握られない）。
 //!
-//! 印は終了処理（`crate::runtime::RunningHub::shutdown`）も先頭で立てる
-//! （下ろさない）- トレイ以外の終了経路（Windows サービスの停止）でも、
-//! 終了処理中に REST から開始されて止めたはずの収集が動き出すことは無い。
+//! 取り消せない印は終了処理（`crate::runtime::RunningHub::shutdown`）が先頭で
+//! 立てる - トレイ以外の終了経路（Windows サービスの停止）でも、終了処理中に
+//! REST から開始されて止めたはずの収集が動き出すことは無い。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -189,10 +200,14 @@ struct ControllerState {
     mode: RunMode,
     context: Option<RunContext>,
     last_error: Option<String>,
-    /// 終了の受付の印（このモジュールの doc「終了の受付」）。立っている間の
-    /// 開始は [`QuitInProgress`] で断る。読み書きは必ずこの `state` ロックの
-    /// 中で、`Starting` への書き込みと同じ区間で見る。
-    quitting: bool,
+    /// 終了の確認のための一時的な印（このモジュールの doc「終了の受付」）。
+    /// トレイの `AskAgain` で下ろす。
+    quit_confirm_hold: bool,
+    /// 終了処理の取り消せない印。一度立てたら下ろさない。
+    ///
+    /// どちらかが立っている間の開始は [`QuitInProgress`] で断る。読み書きは
+    /// 必ずこの `state` ロックの中で、`Starting` への書き込みと同じ区間で見る。
+    shutting_down: bool,
 }
 
 impl CollectionController {
@@ -215,7 +230,8 @@ impl CollectionController {
                 mode: RunMode::Configured,
                 context: None,
                 last_error: None,
-                quitting: false,
+                quit_confirm_hold: false,
+                shutting_down: false,
             }),
             transition: AsyncMutex::new(()),
             live_apply_in_progress: AtomicBool::new(false),
@@ -231,13 +247,13 @@ impl CollectionController {
     /// 返した状態が `Starting`/`Running`/`Stopping` なら、印を立てる前に
     /// 開始が受け付けられていた（または走っている）。`Stopped`/`Faulted`
     /// なら、この後に収集が始まることはない（印を下ろすまで）。
-    pub fn begin_quit(&self) -> CollectionStatus {
+    pub fn begin_quit_confirm(&self) -> CollectionStatus {
         let mut status = {
             let mut state = self
                 .state
                 .lock()
                 .expect("collection controller state lock poisoned");
-            state.quitting = true;
+            state.quit_confirm_hold = true;
             state.status()
         };
         status.configured_revision = self.manager.configured_revision();
@@ -245,23 +261,37 @@ impl CollectionController {
         status
     }
 
-    /// 終了の受付の印を下ろし、開始を再び受け付ける。トレイが「収集中」の
-    /// 文言でもう一度確かめるとき（`AskAgain`）だけ使う。終了処理に入った
-    /// 後は呼ばない。
-    pub fn cancel_quit(&self) {
+    /// 確認のための一時的な印**だけ**を下ろす。トレイが「収集中」の文言で
+    /// もう一度確かめるとき（`AskAgain`）だけ使う。終了処理の取り消せない印
+    /// （[`Self::begin_shutdown`]）には触れないので、それが立っていれば開始は
+    /// 断られ続ける。
+    pub fn cancel_quit_confirm(&self) {
         self.state
             .lock()
             .expect("collection controller state lock poisoned")
-            .quitting = false;
+            .quit_confirm_hold = false;
     }
 
-    /// 終了の受付の印が立っているか。入口での早い拒否と表示・テスト用で、
-    /// 開始の可否の最終判断は `start_locked` が `Starting` を書く区間で行う。
+    /// 終了処理の取り消せない印を立て、同じロックの中で読んだその時点の状態を
+    /// 返す（このモジュールの doc「終了の受付」）。以降の開始は断られ続ける
+    /// （下ろす口は無い）。冪等。
+    pub fn begin_shutdown(&self) -> CollectionStatus {
+        let mut state = self
+            .state
+            .lock()
+            .expect("collection controller state lock poisoned");
+        state.shutting_down = true;
+        state.status()
+    }
+
+    /// 開始を断る印（一時的・取り消せないのどちらか）が立っているか。
+    /// 入口での早い拒否と表示・テスト用で、開始の可否の最終判断は
+    /// `start_locked` が `Starting` を書く区間で行う。
     pub fn is_quitting(&self) -> bool {
         self.state
             .lock()
             .expect("collection controller state lock poisoned")
-            .quitting
+            .refuses_starts()
     }
 
     /// Return the current state without waiting for an in-flight transition.
@@ -463,7 +493,7 @@ impl CollectionController {
     /// runs normally - see [`Self::acquire_transition`]. Starting the same
     /// mode while running is idempotent.
     ///
-    /// 終了の受付の印が立っていれば（[`Self::begin_quit`]）、何もせずに
+    /// 終了の受付の印が立っていれば（[`Self::begin_quit_confirm`]）、何もせずに
     /// [`QuitInProgress`] を返す。印の確認は入口と、状態を `Starting` にする
     /// 区間（`start_locked`）の 2 か所 - 入口は「遷移中の no-op」で現在状態を
     /// 返す前に断るため、`start_locked` は入口を通った後（live apply を
@@ -567,9 +597,9 @@ impl CollectionController {
                 .lock()
                 .expect("collection controller state lock poisoned");
             // 終了の受付（このモジュールの doc）: 印の確認と `Starting` の
-            // 書き込みを**同じロックの区間**で行う。`begin_quit` も同じロックで
+            // 書き込みを**同じロックの区間**で行う。`begin_quit_confirm` も同じロックで
             // 印を立てて状態を読むので、両者の間に隙間は無い。
-            if state.quitting {
+            if state.refuses_starts() {
                 return Err(QuitInProgress);
             }
             let run_id = self.run_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -660,6 +690,11 @@ impl Drop for LiveApplyFlagGuard<'_> {
 }
 
 impl ControllerState {
+    /// 開始を断るか（終了の受付の印のどちらかが立っている）。
+    fn refuses_starts(&self) -> bool {
+        self.quit_confirm_hold || self.shutting_down
+    }
+
     fn status(&self) -> CollectionStatus {
         CollectionStatus {
             state: self.state,
@@ -940,7 +975,7 @@ mod tests {
     async fn starts_are_refused_while_quitting_and_accepted_after_cancel() {
         let (_dir, controller) = controller_env().await;
 
-        let at_quit = controller.begin_quit();
+        let at_quit = controller.begin_quit_confirm();
         assert_eq!(at_quit.state, CollectionState::Stopped);
         assert!(!busy(&at_quit));
         assert!(controller.is_quitting());
@@ -967,7 +1002,7 @@ mod tests {
         assert_eq!(selected.state, CollectionState::Stopped);
         assert_eq!(selected.mode, RunMode::AllSimulation);
 
-        controller.cancel_quit();
+        controller.cancel_quit_confirm();
         assert!(!controller.is_quitting());
         let running = controller
             .start(RunMode::Configured)
@@ -988,7 +1023,7 @@ mod tests {
             .await
             .expect("収集を開始できる");
 
-        let at_quit = controller.begin_quit();
+        let at_quit = controller.begin_quit_confirm();
         assert_eq!(at_quit.state, CollectionState::Running);
         assert!(busy(&at_quit));
 
@@ -1003,7 +1038,7 @@ mod tests {
     }
 
     /// 境界 1（開始が先）: 開始が `Starting` に入った後に印を立てると、
-    /// `begin_quit` は `Starting` を返す = トレイは「収集中」の文言で確かめ
+    /// `begin_quit_confirm` は `Starting` を返す = トレイは「収集中」の文言で確かめ
     /// 直す（黙って止めない）。開始そのものは受け付け済みなので完了する。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn begin_quit_after_a_start_was_admitted_reports_busy() {
@@ -1023,7 +1058,7 @@ mod tests {
             "開始が Starting に入るはず"
         );
 
-        let at_quit = controller.begin_quit();
+        let at_quit = controller.begin_quit_confirm();
         assert_eq!(at_quit.state, CollectionState::Starting);
         assert!(busy(&at_quit), "受け付け済みの開始は忙しい側に数える");
 
@@ -1047,7 +1082,7 @@ mod tests {
         let (_dir, controller) = controller_env().await;
         let _transition = controller.transition.lock().await;
 
-        let at_quit = controller.begin_quit();
+        let at_quit = controller.begin_quit_confirm();
         assert!(!busy(&at_quit), "停止中 = 黙って終了へ進んでよい側");
 
         assert_eq!(
@@ -1077,7 +1112,7 @@ mod tests {
         // 入口で断られても、結果（`Err`）は同じ。
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let at_quit = controller.begin_quit();
+        let at_quit = controller.begin_quit_confirm();
         assert!(!busy(&at_quit));
         controller
             .live_apply_in_progress
@@ -1109,7 +1144,7 @@ mod tests {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    controller.begin_quit()
+                    controller.begin_quit_confirm()
                 })
             };
             let started = start.await.expect("join start");
@@ -1119,7 +1154,7 @@ mod tests {
                     assert_eq!(status.state, CollectionState::Running);
                     assert!(
                         busy(&at_quit),
-                        "開始が受け付けられたなら、begin_quit は忙しいと読んでいるはず: {at_quit:?}"
+                        "開始が受け付けられたなら、begin_quit_confirm は忙しいと読んでいるはず: {at_quit:?}"
                     );
                 }
                 Err(QuitInProgress) => {
@@ -1128,6 +1163,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #392 A2 再レビュー P2-2: 終了処理の取り消せない印（`begin_shutdown`）は、
+    /// 遅れて届いたトレイの確認（一時的な印を立てて、`AskAgain` で下ろす）で
+    /// 解除されない。開始は断られ続ける。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_ask_again_cannot_lift_the_shutdown_mark() {
+        let (_dir, controller) = controller_env().await;
+        let at_shutdown = controller.begin_shutdown();
+        assert_eq!(at_shutdown.state, CollectionState::Stopped);
+
+        // 遅れて届いた答え: 一時的な印を立てて、確かめ直すので下ろす。
+        let _ = controller.begin_quit_confirm();
+        controller.cancel_quit_confirm();
+
+        assert!(controller.is_quitting());
+        assert_eq!(
+            controller.start(RunMode::Configured).await,
+            Err(QuitInProgress)
+        );
+        let _transition = controller.transition.lock().await;
+        assert_eq!(
+            controller.start_locked(RunMode::Configured).await,
+            Err(QuitInProgress)
+        );
+        assert_eq!(controller.status().state, CollectionState::Stopped);
     }
 
     /// Poll `predicate` every 10ms until it returns true or `timeout` elapses.

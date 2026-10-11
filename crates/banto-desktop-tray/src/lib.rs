@@ -53,25 +53,32 @@
 //!
 //! そこで、**収集の開始を受け付ける側**に「終了受付中」の印を持たせ、開始の
 //! 受付と**同じロックの中で**「印を立てる + 今忙しいかを読む」を原子的に行う
-//! （[`QuitAdmission::begin_quit`]）。印が立っている間の開始は、収集側が
+//! （[`QuitAdmission::begin_quit_confirm`]）。印が立っている間の開始は、収集側が
 //! **明示的なエラーで断る**（黙って捨てない）。こうすると、どちらが先でも
 //! 「黙って止める」結果にならない:
 //!
-//! - 開始が先に受け付けられた → `begin_quit` が「忙しい」を返す →
+//! - 開始が先に受け付けられた → `begin_quit_confirm` が「忙しい」を返す →
 //!   [`QuitAnswerDecision::AskAgain`]（印は下ろし、開始を再び受け付ける）。
-//! - `begin_quit` が先 → その後の開始はエラーで断られる → 止めるべき収集が
+//! - `begin_quit_confirm` が先 → その後の開始はエラーで断られる → 止めるべき収集が
 //!   無いまま終了処理へ進む。
 //!
-//! 印の上げ下げはすべて [`QuitGate::answer`] の中にあり、アプリ側のトレイは
-//! 印を直接触らない（終了処理そのもの - banto-hub の `RunningHub::shutdown`、
-//! ChronoGazer の `shutdown_app_state` - は OS の終了経路でも通るので、
-//! そちらは自分で立てる。立てたら下ろさない）:
+//! **印は 2 種類**（#392 A2 再レビュー P2-2、2026-10-12）。この口が扱うのは
+//! **確認のための一時的な印**だけで、[`QuitAdmission::cancel_quit_confirm`] が
+//! 下ろすのもこれだけ。終了処理そのもの（banto-hub の `RunningHub::shutdown`、
+//! ChronoGazer の `shutdown_app_state`・`banto-serve` の終了）は OS の終了経路でも
+//! 通り、そこでは `QuitGate` が `Quitting` にならないためトレイの答えが遅れて
+//! 届きうる。そこで終了処理は収集側の別の口（`begin_shutdown`）で**取り消せない
+//! 印**を立てる。遅れて届いた `AskAgain` が一時的な印を下ろしても、取り消せない
+//! 印は残り、開始は断られ続ける。
 //!
-//! | 答え | `begin_quit` | 結果 | 印 |
+//! 一時的な印の上げ下げはすべて [`QuitGate::answer`] の中にあり、アプリ側の
+//! トレイは印を直接触らない:
+//!
+//! | 答え | `begin_quit_confirm` | 結果 | 一時的な印 |
 //! |---|---|---|---|
 //! | キャンセル | 呼ばない | `Cancelled` | 立てない |
 //! | 確認中でないときの答え（遅れて届いた） | 呼ばない | `Ignored` | 触らない |
-//! | 同意・暇な文言・印を立てた時点で忙しい | 呼ぶ | `AskAgain` | **下ろす**（`cancel_quit`） |
+//! | 同意・暇な文言・印を立てた時点で忙しい | 呼ぶ | `AskAgain` | **下ろす**（`cancel_quit_confirm`） |
 //! | 同意・それ以外 | 呼ぶ | `Proceed` | 立てたまま（終了処理へ。もう下ろさない） |
 //!
 //! # なぜ Tauri の型に依存してよいか
@@ -301,7 +308,7 @@ pub fn decide_request(phase: QuitPhase) -> (QuitPhase, QuitRequestDecision) {
 ///   （「収集を停止してから終了します」の文言を見せたか）。
 /// - `now_busy`: 答えが返った今、忙しいか。[`QuitGate::answer`] は、終了の
 ///   受付の印を立てたのと同じロックの中で読んだ値
-///   （[`QuitAdmission::begin_quit`] の戻り値）を渡す。
+///   （[`QuitAdmission::begin_quit_confirm`] の戻り値）を渡す。
 ///
 /// 忙しくないときの文言で同意を取ったのに、待っている間に忙しくなった
 /// （例: 起動直後の収集の自動開始、LAN から収集を開始）場合は
@@ -323,17 +330,19 @@ pub fn decide_answer(
     }
 }
 
-/// 収集の開始を受け付ける側が持つ「終了の受付」の印（この crate の doc
-/// 「終了の確定と収集の開始の直列化」）。トレイからは [`QuitGate::answer`]
-/// だけが呼ぶ。
+/// 収集の開始を受け付ける側が持つ「終了の受付」の、**確認のための一時的な
+/// 印**の口（この crate の doc「終了の確定と収集の開始の直列化」）。トレイ
+/// からは [`QuitGate::answer`] だけが呼ぶ。終了処理の取り消せない印は、この
+/// 口ではなく収集側の `begin_shutdown` で立てる（ここからは触れない）。
 pub trait QuitAdmission {
-    /// 印を立て、**開始の受付と同じロックの中で**今忙しいか（止めるべき
-    /// 収集がある・開始が受け付け済み）を返す。印が立っている間、収集側は
+    /// 一時的な印を立て、**開始の受付と同じロックの中で**今忙しいか（止める
+    /// べき収集がある・開始が受け付け済み）を返す。印が立っている間、収集側は
     /// 開始を明示的なエラーで断る。何度呼んでもよい（冪等）。
-    fn begin_quit(&self) -> bool;
-    /// 印を下ろし、開始を再び受け付ける（トレイからは
-    /// [`QuitAnswerDecision::AskAgain`] のときだけ呼ばれる）。
-    fn cancel_quit(&self);
+    fn begin_quit_confirm(&self) -> bool;
+    /// 一時的な印**だけ**を下ろす（トレイからは
+    /// [`QuitAnswerDecision::AskAgain`] のときだけ呼ばれる）。終了処理の
+    /// 取り消せない印が立っていれば、開始は断られ続ける。
+    fn cancel_quit_confirm(&self);
 }
 
 /// [`decide_request`]・[`decide_answer`] を、アプリの管理状態として 1 つ
@@ -362,10 +371,10 @@ impl QuitGate {
     /// 確認ダイアログの答えが返った。
     ///
     /// 同意（`confirmed`）で、しかも確認中のときだけ
-    /// [`QuitAdmission::begin_quit`] を **1 回**呼び、その戻り値（印を立てた
+    /// [`QuitAdmission::begin_quit_confirm`] を **1 回**呼び、その戻り値（印を立てた
     /// 時点で忙しいか）で [`decide_answer`] する。判断が
     /// [`QuitAnswerDecision::AskAgain`] なら、同じロックの中で
-    /// [`QuitAdmission::cancel_quit`] を呼んで印を下ろす（収集の開始を再び
+    /// [`QuitAdmission::cancel_quit_confirm`] を呼んで印を下ろす（収集の開始を再び
     /// 受け付ける）。キャンセル・確認中でない答えでは `admission` に触らない。
     /// 印の上げ下げの全経路はこの crate の doc の表。
     ///
@@ -383,10 +392,10 @@ impl QuitGate {
                 // この組み合わせの判断に使われないので何でもよい。
                 return decide_answer(phase, confirmed, prompted_busy, false);
             }
-            let now_busy = admission.begin_quit();
+            let now_busy = admission.begin_quit_confirm();
             let (next, decision) = decide_answer(phase, confirmed, prompted_busy, now_busy);
             if decision == QuitAnswerDecision::AskAgain {
-                admission.cancel_quit();
+                admission.cancel_quit_confirm();
             }
             (next, decision)
         })
@@ -476,7 +485,7 @@ mod tests {
     }
 
     /// 印の上げ下げを記録する偽の [`QuitAdmission`]。`busy` は
-    /// `begin_quit` が返す値。
+    /// `begin_quit_confirm` が返す値。
     #[derive(Default)]
     struct FakeAdmission {
         busy: AtomicBool,
@@ -503,12 +512,12 @@ mod tests {
     }
 
     impl QuitAdmission for FakeAdmission {
-        fn begin_quit(&self) -> bool {
+        fn begin_quit_confirm(&self) -> bool {
             self.begins.fetch_add(1, SeqCst);
             self.raised.store(true, SeqCst);
             self.busy.load(SeqCst)
         }
-        fn cancel_quit(&self) {
+        fn cancel_quit_confirm(&self) {
             self.cancels.fetch_add(1, SeqCst);
             self.raised.store(false, SeqCst);
         }
@@ -551,7 +560,7 @@ mod tests {
     /// 印の上げ下げの全経路（この crate の doc の表）。
     #[test]
     fn admission_is_raised_and_lowered_on_every_path() {
-        // キャンセル: begin_quit を呼ばない（印を立てない）。
+        // キャンセル: begin_quit_confirm を呼ばない（印を立てない）。
         let gate = QuitGate::new();
         let admission = FakeAdmission::new(false);
         gate.request();

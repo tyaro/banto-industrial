@@ -31,13 +31,17 @@
 //! - **同意と収集の開始の競合**（#392 A2 レビュー、2026-10-12）: 同意の後に
 //!   状態を読んでから終了を確定するまでの間に、REST・Tauri の開始・自動開始が
 //!   割り込むと、古い「止まっている」で進んで新しい収集を黙って止めてしまう。
-//!   これは収集側の「終了の受付」（`CollectorService::begin_quit`、
+//!   これは収集側の「終了の受付」（`CollectorService::begin_quit_confirm`、
 //!   `chronogazer_core::collect` の doc「終了の受付」）で直列化する: 答えの
 //!   コールバックは状態を自分で読まず、[`CollectorQuitAdmission`] を通して
 //!   **開始の受付と同じロックの中で印を立てて**忙しいかを読む。印が立った
 //!   後の開始は「終了処理中のため、収集を開始できません」のエラーで断られ、
 //!   確かめ直すとき（`AskAgain`）は印を下ろす（上げ下げは
-//!   [`QuitGate::answer`] が行う）。
+//!   [`QuitGate::answer`] が行う）。ここで扱うのは**確認のための一時的な
+//!   印**だけで、終了処理（[`crate::exit_cleanup_once`] →
+//!   `shutdown_app_state`、OS のシャットダウンを含む）は取り消せない印
+//!   （`CollectorService::begin_shutdown`）を立てる。遅れて届いた `AskAgain`
+//!   は後者を下ろせない（#392 A2 再レビュー P2-2）。
 //! - **終了処理中にもう一度「終了」**: [`banto_desktop_tray::QuitGate`] が
 //!   確認ダイアログを 2 つ出さず、終了処理を 2 回走らせない。終了処理の本体も
 //!   [`crate::exit_cleanup_once`] が 1 回に限る（OS のシャットダウンで
@@ -80,7 +84,7 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 終了の確認に「収集中」の文言を使うか（= 止めるべき収集があるか）。
 /// 判定は収集側（[`CollectorState::is_collecting`]）と同じもの - 終了の
-/// 受付（`CollectorService::begin_quit`）の「忙しい」と食い違わないように。
+/// 受付（`CollectorService::begin_quit_confirm`）の「忙しい」と食い違わないように。
 pub(crate) fn is_collecting(state: &CollectorState) -> bool {
     state.is_collecting()
 }
@@ -91,16 +95,16 @@ pub(crate) fn is_collecting(state: &CollectorState) -> bool {
 struct CollectorQuitAdmission(Option<CollectorService>);
 
 impl QuitAdmission for CollectorQuitAdmission {
-    fn begin_quit(&self) -> bool {
+    fn begin_quit_confirm(&self) -> bool {
         self.0
             .as_ref()
-            .map(CollectorService::begin_quit)
+            .map(CollectorService::begin_quit_confirm)
             .unwrap_or(false)
     }
 
-    fn cancel_quit(&self) {
+    fn cancel_quit_confirm(&self) {
         if let Some(collect) = &self.0 {
-            collect.cancel_quit();
+            collect.cancel_quit_confirm();
         }
     }
 }
