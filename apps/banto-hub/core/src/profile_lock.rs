@@ -1,36 +1,37 @@
 //! T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2、
 //! docs/banto-hub-desktop-plan.md §16.2「mutex 命名決定」）:
 //! `HubRuntime::start`冒頭で取る profile 単位の排他。3層のうち (b)/(c) を
-//! ここに実装する（(a) SCM `query_status`は`crate::service_manager`側、
-//! T17-0 のまま・このスライスでは呼ばない）。
+//! ここに実装する（(a) SCM `query_status`は`crate::service_manager`側）。
 //!
-//! - **(b) Windows**: named mutex `Global\BantoHub.<profile-id>`
-//!   （[`crate::profile_paths::mutex_name`]、desktop-plan §16.2）を
-//!   `CreateMutexW`で取得する。既に別プロセスが所有していれば
-//!   `GetLastError() == ERROR_ALREADY_EXISTS`で判定し、安全側で起動を
-//!   拒否する（[`ProfileLockError::AlreadyHeld`]）。
-//! - **(c) 全 OS**: profile ディレクトリ直下の`profile.lock`へ所有者
-//!   PID・ホスト種別・取得時刻を JSON で書く - fallback UI の「mutex:
-//!   所有者不明」等の診断情報源（ロック自体の正当性は Windows では (b)、
-//!   非 Windows では下記 flock が持つ）。
-//! - **非 Windows**: `Global\`名前空間が無いため、`profile.lock`への
-//!   `flock(2)`（`LOCK_EX|LOCK_NB`）**自体**を排他の実体にする - 同一
-//!   ファイルへの2つ目の`try_acquire_profile_lock`は Linux 上でも確実に
-//!   失敗する（CI で検証可能）。
+//! #392 A1（2026-10-10）: ロックの**仕組み**（Windows named mutex・
+//! `profile.lock` 診断ファイル・非 Windows の `flock`）は共有 crate
+//! [`banto_instance_lock`] へ移した（ChronoGazer も同じ保護を使うため、
+//! 複製せず寄せた）。このモジュールは banto-hub 固有の部分だけを持つ薄い
+//! ラッパー:
 //!
-//! SCM 経由の状態確認（T17-0、`crate::service_manager`）はこのモジュールの
-//! スコープ外 - `HubRuntime::start`はこのモジュールの[`try_acquire_profile_lock`]
-//! だけを呼ぶ。
+//! - 排他の単位は **profile-id**（mutex 名 `Global\BantoHub.<profile-id>`、
+//!   [`crate::profile_paths::mutex_name`]）。命名・診断ファイル名
+//!   （`{profile_dir}/profile.lock`）・JSON の形は移行前と同一で、既存の
+//!   インストール（サービス版が持つ mutex、残っている `profile.lock`）と
+//!   そのまま噛み合う。
+//! - profile ディレクトリ一式（`config`/`data`/`logs`）の作成。
+//! - 失敗に profile-id を載せる（[`ProfileLockError::AlreadyHeld`]）。
+//!
+//! 仕組みの詳細（3 層の役割、LocalSystem 保持時の `ERROR_ACCESS_DENIED`
+//! 対策など）は `banto_instance_lock` の crate doc を参照。
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use banto_instance_lock::{InstanceLockError, InstanceLockGuard};
 use thiserror::Error;
 
 use crate::profile_paths::ProfilePaths;
+
+pub(crate) use banto_instance_lock::read_owner_info;
+
+/// `profile.lock`の中身（診断用 JSON）。共有 crate の [`banto_instance_lock::OwnerInfo`]
+/// と同一の型（フィールド名・JSON の形は移行前のまま）。
+pub type ProfileOwnerInfo = banto_instance_lock::OwnerInfo;
 
 /// profile lock の診断ファイル名（`{profile_dir}/profile.lock`）。
 pub const LOCK_FILE_NAME: &str = "profile.lock";
@@ -58,23 +59,11 @@ impl std::fmt::Display for HubHostKind {
     }
 }
 
-/// `profile.lock`の中身（診断用 JSON）。ロックの正当性そのものはこの内容が
-/// 持つのではなく、OS レベルの機構（Windows: named mutex／非 Windows:
-/// flock）が持つ - このモジュール doc 参照。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProfileOwnerInfo {
-    pub pid: u32,
-    /// [`HubHostKind`]の`Display`表現（`"console"`/`"service"`/`"shell"`）。
-    pub host_kind: String,
-    pub acquired_at_unix_ms: i64,
-}
-
 /// [`try_acquire_profile_lock`]の失敗モード。
 #[derive(Debug, Error)]
 pub enum ProfileLockError {
     /// 既に別プロセスがこの profile を保持している（安全側で起動拒否）。
-    /// `owner`は`profile.lock`から読めた場合のみ`Some`（診断用、
-    /// このモジュール doc の「(c) 全 OS」節参照）。
+    /// `owner`は`profile.lock`から読めた場合のみ`Some`（診断用）。
     #[error("banto-hub: profile '{profile_id}' は既に別プロセスが使用中です（owner: {owner:?}）")]
     AlreadyHeld {
         profile_id: String,
@@ -94,61 +83,27 @@ pub enum ProfileLockError {
 
 /// `try_acquire_profile_lock`が成功した間だけ生存するガード。
 /// `HubRuntime::start`が構築する`RunningHub`がこれを保持し、`Drop`で
-/// OS レベルの排他（Windows: mutex handle の`CloseHandle`／非 Windows:
-/// lock file の fd が閉じることによる自動`flock`解放）を返す。
+/// 共有 crate のガードが OS レベルの排他を返す。
 pub struct ProfileLockGuard {
-    lock_file_path: PathBuf,
-    // 非 Windows: このファイルへの `flock(LOCK_EX)` が排他の実体そのもの
-    // (モジュール doc「非 Windows」節)。`File`の`Drop`が fd を閉じる時点で
-    // カーネルが自動的に unlock する - 明示的な `flock(LOCK_UN)` は不要。
-    #[cfg(not(windows))]
-    _lock_file: File,
-    #[cfg(windows)]
-    _mutex: WindowsMutexHandle,
+    guard: InstanceLockGuard,
 }
 
 impl ProfileLockGuard {
     /// 診断ファイル（`profile.lock`）の絶対パス - fallback UI（T16-2）が
-    /// 「mutex: 所有者不明」等の表示に使う所有者情報の在り処として参照する
-    /// 想定（このモジュール doc「(c) 全 OS」節）。
+    /// 「mutex: 所有者不明」等の表示に使う所有者情報の在り処として参照する想定。
     pub fn lock_file_path(&self) -> &Path {
-        &self.lock_file_path
-    }
-}
-
-#[cfg(windows)]
-struct WindowsMutexHandle(windows_sys::Win32::Foundation::HANDLE);
-
-// `HANDLE`(`*mut c_void`)は本来 `!Send`/`!Sync`だが、Win32 の mutex handle
-// はスレッドに紐付かない（生成スレッドと別スレッドから`CloseHandle`しても
-// 安全 - Win32 ドキュメントの標準的な保証）ため、`RunningHub`を
-// tokio マルチスレッドランタイム上で保持・`.await`越しに運ぶのに必要な
-// `Send`/`Sync`をここだけ明示的に付与する。
-#[cfg(windows)]
-unsafe impl Send for WindowsMutexHandle {}
-#[cfg(windows)]
-unsafe impl Sync for WindowsMutexHandle {}
-
-#[cfg(windows)]
-impl Drop for WindowsMutexHandle {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
+        self.guard.lock_file_path()
     }
 }
 
 /// `paths`が指す profile の排他を取得する。`HubRuntime::start`が DB 初期化
-/// より前に呼ぶ（このモジュール doc 参照）。
+/// より前に呼ぶ。
 ///
 /// - `profile_dir`/`config`/`data`/`logs`を`create_dir_all`する（初回起動時
 ///   はまだ存在しないため）。
-/// - Windows: `Global\BantoHub.<profile-id>`を`CreateMutexW`で取得する。
-///   `ERROR_ALREADY_EXISTS`なら[`ProfileLockError::AlreadyHeld`]。
-/// - 非 Windows: `profile.lock`を`flock(LOCK_EX|LOCK_NB)`する。既に
-///   ロックされていれば同様に[`ProfileLockError::AlreadyHeld`]。
-/// - 取得成功後、`profile.lock`へ`host_kind`を含む[`ProfileOwnerInfo`]を
-///   上書きする（失敗しても致命的にはしない - 診断情報が更新されないだけ）。
+/// - 排他の取得は [`banto_instance_lock::try_acquire`]（mutex 名は
+///   `Global\BantoHub.<profile-id>`、診断ファイルは`{profile_dir}/profile.lock`）。
+///   既に保持されていれば[`ProfileLockError::AlreadyHeld`]。
 pub fn try_acquire_profile_lock(
     paths: &ProfilePaths,
     host_kind: HubHostKind,
@@ -160,187 +115,17 @@ pub fn try_acquire_profile_lock(
     std::fs::create_dir_all(&paths.data_dir)?;
     std::fs::create_dir_all(&paths.logs_dir)?;
 
-    let lock_path = paths.profile_dir.join(LOCK_FILE_NAME);
+    let lock_path: PathBuf = paths.profile_dir.join(LOCK_FILE_NAME);
+    let mutex_name = crate::profile_paths::mutex_name(&paths.profile_id);
 
-    #[cfg(windows)]
-    {
-        acquire_windows(paths, host_kind, &lock_path)
-    }
-    #[cfg(not(windows))]
-    {
-        acquire_unix(paths, host_kind, &lock_path)
-    }
-}
-
-#[cfg(not(windows))]
-fn acquire_unix(
-    paths: &ProfilePaths,
-    host_kind: HubHostKind,
-    lock_path: &Path,
-) -> Result<ProfileLockGuard, ProfileLockError> {
-    use std::os::unix::io::AsRawFd;
-
-    // `truncate(false)`: `flock`取得前に既存内容を消さない - 取得に失敗
-    // した場合、既存の`ProfileOwnerInfo`を診断用に読み直す
-    // （`read_owner_info`）ため。取得成功後の上書きは`write_owner_info`が
-    // 明示的に`set_len(0)`する。
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-
-    // このモジュール doc「非 Windows」節: `flock`自体が排他の実体 -
-    // `LOCK_NB`なので既に他プロセスが保持していれば即座に`EWOULDBLOCK`で
-    // 返る（ブロックしない - 起動処理を止めないため）。
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let owner = read_owner_info(lock_path);
-        return Err(ProfileLockError::AlreadyHeld {
+    match banto_instance_lock::try_acquire(&mutex_name, &lock_path, &host_kind.to_string()) {
+        Ok(guard) => Ok(ProfileLockGuard { guard }),
+        Err(InstanceLockError::AlreadyHeld { owner }) => Err(ProfileLockError::AlreadyHeld {
             profile_id: paths.profile_id.clone(),
             owner,
-        });
+        }),
+        Err(InstanceLockError::Io(err)) => Err(ProfileLockError::Io(err)),
     }
-
-    write_owner_info(&mut file, host_kind)?;
-
-    Ok(ProfileLockGuard {
-        lock_file_path: lock_path.to_path_buf(),
-        _lock_file: file,
-    })
-}
-
-#[cfg(windows)]
-fn acquire_windows(
-    paths: &ProfilePaths,
-    host_kind: HubHostKind,
-    lock_path: &Path,
-) -> Result<ProfileLockGuard, ProfileLockError> {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    };
-    use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW};
-
-    /// `OpenMutexW` の `dwDesiredAccess` — Win32 `SYNCHRONIZE`（0x0010_0000）。
-    /// windows-sys 0.61 の既定 feature セットに定数 export が無いためリテラル化。
-    const MUTEX_SYNCHRONIZE: u32 = 0x0010_0000;
-
-    let name = crate::profile_paths::mutex_name(&paths.profile_id);
-    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-
-    // SAFETY: `wide_name`は呼び出しが終わるまでスコープ内で生存する
-    // NUL 終端 UTF-16 文字列。`lpmutexattributes`に null を渡すのは既定の
-    // セキュリティ記述子（作成プロセスの資格情報が継承される既定動作）で
-    // 十分なため - `Global\`名前空間へ書き込むにはこのプロセス自体に
-    // `SeCreateGlobalPrivilege`相当の権限が必要（通常ユーザーは既定で
-    // 保有、docs/banto-hub-t17-design.md §5「要 Windows 実機スパイク」）。
-    //
-    // `SetLastError(0)`は CreateMutexW の既知の落とし穴対策 - 新規作成に
-    // 成功した場合でも前回のスレッド last-error をクリアしないことがある
-    // ため、呼び出し直前に 0 にしてから `ERROR_ALREADY_EXISTS` を判定する。
-    let handle = unsafe {
-        SetLastError(0);
-        CreateMutexW(std::ptr::null(), 1, wide_name.as_ptr())
-    };
-    if handle.is_null() {
-        // 2026-08-10 Windows 実機観察（docs/banto-hub-t17-design.md §8・
-        // docs/improvement-plan.md §6）: LocalSystem（Session 0 サービス）が
-        // 既に mutex を保持していると、ユーザーセッションからの
-        // `CreateMutexW`は新規作成扱いにならず`ERROR_ACCESS_DENIED`(5)で
-        // null を返す（`ERROR_ALREADY_EXISTS`にならない - セッションを
-        // 跨いだ既定のセキュリティ記述子では対象オブジェクトへの
-        // クエリ権限が無いため）。素直に`Io`化すると fallback UI が
-        // owner 診断を出せない（起動拒否自体は安全側で成功している）ので、
-        // ここで`OpenMutexW(SYNCHRONIZE)`により「開けるだけ開いて」
-        // 存在確認する - 開けたら他プロセスが保持中と確定できる。
-        let last_error = unsafe { GetLastError() };
-        if last_error == ERROR_ACCESS_DENIED {
-            let open_handle = unsafe { OpenMutexW(MUTEX_SYNCHRONIZE, 0, wide_name.as_ptr()) };
-            if !open_handle.is_null() {
-                unsafe {
-                    CloseHandle(open_handle);
-                }
-                return Err(ProfileLockError::AlreadyHeld {
-                    profile_id: paths.profile_id.clone(),
-                    owner: read_owner_info(lock_path),
-                });
-            }
-            // `OpenMutexW`も拒否された場合（更に厳しい ACL 等）でも、
-            // `profile.lock`診断ファイルが読めるなら owner 情報付きの
-            // `AlreadyHeld`に正規化する - mutex 名前空間自体は
-            // `ERROR_ACCESS_DENIED`から「誰かが存在させている」ことが
-            // 濃厚なため、`Io`より有用な診断になる。
-            if let Some(owner) = read_owner_info(lock_path) {
-                return Err(ProfileLockError::AlreadyHeld {
-                    profile_id: paths.profile_id.clone(),
-                    owner: Some(owner),
-                });
-            }
-        }
-        return Err(ProfileLockError::Io(std::io::Error::last_os_error()));
-    }
-    let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    if already_exists {
-        unsafe {
-            CloseHandle(handle);
-        }
-        let owner = read_owner_info(lock_path);
-        return Err(ProfileLockError::AlreadyHeld {
-            profile_id: paths.profile_id.clone(),
-            owner,
-        });
-    }
-
-    // 診断用ファイル（このモジュール doc「(c) 全 OS」節）- Windows では
-    // 排他の実体ではないので、書き込み失敗は致命的にしない。
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(lock_path)
-    {
-        let _ = write_owner_info(&mut file, host_kind);
-    }
-
-    Ok(ProfileLockGuard {
-        lock_file_path: lock_path.to_path_buf(),
-        _mutex: WindowsMutexHandle(handle),
-    })
-}
-
-fn write_owner_info(file: &mut File, host_kind: HubHostKind) -> std::io::Result<()> {
-    let info = ProfileOwnerInfo {
-        pid: std::process::id(),
-        host_kind: host_kind.to_string(),
-        acquired_at_unix_ms: now_unix_ms(),
-    };
-    let json = serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string());
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(json.as_bytes())?;
-    file.flush()?;
-    Ok(())
-}
-
-/// T16-2（docs/banto-hub-t16-design.md §3「T16-2」）:
-/// `crate::http_hub_health::HttpHubHealthProbe`が「health は応答するが
-/// 期待 profile の`profile.lock`が読めない」（[`crate::hub_health::HealthOutcome::MutexOwnerUnknown`]）
-/// を判定するために再利用できるよう`pub(crate)`にした - 同一クレート内の
-/// 診断読み取り専用ヘルパーであり、排他の正当性そのもの（Windows: mutex／
-/// 非 Windows: flock）には関与しない（このモジュール doc参照）。
-pub(crate) fn read_owner_info(lock_path: &Path) -> Option<ProfileOwnerInfo> {
-    let mut file = File::open(lock_path).ok()?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).ok()?;
-    serde_json::from_str(&contents).ok()
-}
-
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

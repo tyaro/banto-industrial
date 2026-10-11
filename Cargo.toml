@@ -39,6 +39,7 @@ members = [
     "crates/banto-rtsp",
     "crates/banto-tagclient",
     "crates/banto-hub-bootstrap",
+    "crates/banto-instance-lock",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
     "apps/banto-hub/core",
