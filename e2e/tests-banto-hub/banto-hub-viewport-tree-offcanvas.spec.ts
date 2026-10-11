@@ -462,9 +462,10 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 	});
 
 	test('14. 接続 Drawer が開いている間はグループ Drawer を開かない（未保存入力を捨てない、#381 レビュー対応8回目）', async () => {
-		// 同じ層（z-index 900）を2つ開くと、Esc の層判定が互いを「手前の層」と
-		// 見なしてどちらも閉じなくなる（`@banto/ui` の `layering.ts` の doc）。同時に出さない
-		// のは呼び出し側の責務だが、**相手を閉じる**側に倒すと相手の未保存入力を
+		// 同じ層（z-index 900）を2つ開くと、未保存入力のガードとフォーカストラップを
+		// 持つ一過性のオーバーレイが重なって競合する（`@banto/ui` v6.7.0 以降は同じ z を
+		// DOM 順で区別するので Esc の取り合いにはならない）。一度に開くダイアログは
+		// 1 つ、というUX方針で同時に出さない。**相手を閉じる**側に倒すと相手の未保存入力を
 		// 黙って捨てる（#376 で塞いだ事故と同じ）ので、**こちらを開かせない**。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
@@ -847,8 +848,9 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 	});
 
 	test('29. メニューが出ているあいだ Ctrl+K はパレットを開かない（#381 レビュー対応14回目）', async () => {
-		// パレットとメニューは同じ z（1000）なので z 順では解けない - 同時に
-		// 出さないのは呼び出し側の責務（`@banto/ui` の `layering.ts`）。
+		// パレットとメニューは同じ z（1000）。`@banto/ui` v6.7.0 以降は DOM 順で
+		// 区別できるが、一過性のメニューとフォーカストラップを持つパレットが重なる
+		// のは避ける（一度に出す層は 1 つ、というUX方針）。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 		await groupNodeByName(page, GROUP_B).click({ button: 'right' });
