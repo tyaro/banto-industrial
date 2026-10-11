@@ -203,7 +203,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(windows)]
 use std::time::Duration;
 
-use banto_desktop_tray::{ConfirmPrompt, TrayHint};
+use banto_desktop_tray::{
+    ConfirmPrompt, QuitAnswerDecision, QuitGate, QuitRequestDecision, TrayHint,
+};
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
 #[cfg(windows)]
 use banto_hub_core::host_switch::{
@@ -524,43 +526,78 @@ fn quit(app: &AppHandle) {
     app.exit(0);
 }
 
-/// トレイ「アプリを終了」クリック時のエントリポイント（T16-1、実装指示
-/// 3.「アプリを終了の確認」- T16-0 では確認なしだったものをここで追加）。
-///
-/// 収集中（[`tray_status::show_stop_item`]が真になる状態）かどうかで文言を
-/// 変える。キャンセルすれば[`quit`]は一切呼ばれない - ダイアログの結果を
-/// 見ずに副作用を起こさない。ダイアログは待たない版
-/// （[`banto_desktop_tray::ask_confirm`]）で、メニューイベントハンドラが
-/// どのスレッドで呼ばれても安全にする。
-fn confirm_quit(app: &AppHandle) {
+/// 今、確認文を「収集を停止して終了」の側にすべき状態か
+/// （[`tray_status::show_stop_item`]が真になる状態）。controller が無い
+/// （サービス接続中・fallback）なら偽。
+fn currently_collecting(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
     let controller = state
         .controller
         .lock()
         .expect("controller mutex poisoned")
         .clone();
-    let collecting = controller
+    controller
         .as_ref()
         .map(|controller| tray_status::show_stop_item(&controller.status()))
-        .unwrap_or(false);
-    let message = if collecting {
+        .unwrap_or(false)
+}
+
+/// 「アプリを終了」の確認文。収集中かどうかで変わる。
+fn quit_prompt_message(collecting: bool) -> &'static str {
+    if collecting {
         "収集を停止し、履歴を flush してから終了します。よろしいですか?"
     } else {
         "Banto Hub を終了します。よろしいですか?"
-    };
+    }
+}
 
+/// トレイ「アプリを終了」クリック時のエントリポイント（T16-1、実装指示
+/// 3.「アプリを終了の確認」- T16-0 では確認なしだったものをここで追加）。
+///
+/// 収集中かどうかで文言を変える。キャンセルすれば[`quit`]は一切呼ばれない -
+/// ダイアログの結果を見ずに副作用を起こさない。ダイアログは待たない版
+/// （[`banto_desktop_tray::ask_confirm`]）で、メニューイベントハンドラが
+/// どのスレッドで呼ばれても安全にする。
+///
+/// #392 A2（オーナー決定 2026-10-12）: 共有の [`QuitGate`] を通す。確認中・
+/// 終了処理中にもう一度「アプリを終了」が押されても、確認ダイアログを
+/// 2 つ出さず、[`quit`] を 2 回走らせない。「収集していない」文言で同意を
+/// 取った後に収集が始まっていたら（起動直後の自動開始・LAN からの開始）、
+/// 黙って止めず「収集中」の文言でもう一度確かめる。
+fn confirm_quit(app: &AppHandle) {
+    let Some(gate) = app.try_state::<QuitGate>() else {
+        return;
+    };
+    match gate.request() {
+        QuitRequestDecision::ShowPrompt => prompt_quit(app, currently_collecting(app)),
+        QuitRequestDecision::AlreadyConfirming | QuitRequestDecision::AlreadyQuitting => {}
+    }
+}
+
+/// 確認ダイアログを出す。`prompted_collecting` は文言を選んだ時点の状態
+/// （答えが返った時点の状態と比べて[`QuitGate::answer`]が判断する）。
+fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
     let app_handle = app.clone();
     banto_desktop_tray::ask_confirm(
         app,
         ConfirmPrompt {
             title: "Banto Hub を終了",
-            message,
+            message: quit_prompt_message(prompted_collecting),
             ok_label: "終了",
             cancel_label: "キャンセル",
         },
         move |confirmed| {
-            if confirmed {
-                quit(&app_handle);
+            let Some(gate) = app_handle.try_state::<QuitGate>() else {
+                return;
+            };
+            match gate.answer(
+                confirmed,
+                prompted_collecting,
+                currently_collecting(&app_handle),
+            ) {
+                QuitAnswerDecision::Proceed => quit(&app_handle),
+                QuitAnswerDecision::AskAgain => prompt_quit(&app_handle, true),
+                QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {}
             }
         },
     );
@@ -1421,6 +1458,8 @@ pub fn run() {
             sink_service_ipc::sink_service_start,
             sink_service_ipc::sink_service_stop,
         ])
+        // #392 A2: 「アプリを終了」の確認中・終了処理中の 2 回目を無視する。
+        .manage(QuitGate::new())
         .manage(AppState {
             hub: AsyncMutex::new(None),
             controller: StdMutex::new(None),
@@ -1470,7 +1509,13 @@ pub fn run() {
                 state.can_operate_service,
                 desktop_started.as_ref().map(|(status, _)| status),
             )?;
-            let tray = TrayIconBuilder::new()
+            // 左クリック = 窓を戻す、右クリック = メニュー（オーナー決定
+            // 2026-10-12、ChronoGazer と共通）。メインの窓は `tauri.conf.json` で
+            // 定義済みで、ホストの種類（デスクトップ／サービス接続／fallback）に
+            // よらず存在し、閉じても破棄されず隠れるだけ - 戻す窓が無い状態は
+            // 無い。万一無ければ [`banto_desktop_tray::show_window`] は何もせず、
+            // メニューは右クリックで出る。
+            let tray_builder = TrayIconBuilder::new()
                 .icon(
                     app.default_window_icon()
                         .cloned()
@@ -1478,7 +1523,6 @@ pub fn run() {
                 )
                 .tooltip(tooltip)
                 .menu(&tray_menu)
-                .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_main_window(app),
                     "stop" => stop_collection(app),
@@ -1487,8 +1531,10 @@ pub fn run() {
                     "retry" => retry_startup(app),
                     "quit" => confirm_quit(app),
                     _ => {}
-                })
-                .build(app.handle())?;
+                });
+            let tray =
+                banto_desktop_tray::restore_window_on_left_click(tray_builder, show_main_window)
+                    .build(app.handle())?;
             // `TrayIcon`は参照カウント式で、最後の1つが drop されると消える
             // （tauri本体のdoc comment参照） - アプリの生存期間中ずっと
             // 保持するためだけに managed state へ入れる
@@ -1514,6 +1560,31 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「アプリを終了」の確認文は収集中かどうかで変わり、収集中の文言は
+    /// 停止と flush を明示する。確認の途中で収集が始まっていた場合は共有の
+    /// `QuitGate` が `AskAgain` を返し、`prompt_quit(app, true)` が収集中の
+    /// 文言で出し直す（#392 A2）。そのつなぎの文言と状態遷移を確かめる。
+    #[test]
+    fn quit_prompt_message_depends_on_collecting() {
+        assert!(quit_prompt_message(true).contains("収集を停止"));
+        assert!(quit_prompt_message(true).contains("flush"));
+        assert!(!quit_prompt_message(false).contains("収集を停止"));
+        assert_ne!(quit_prompt_message(true), quit_prompt_message(false));
+    }
+
+    /// 暇な文言で同意 → 待つ間に収集が始まった: 出し直し（Confirming のまま
+    /// なので 2 回目の「アプリを終了」は重ならない）、収集中の文言で同意すれば
+    /// 終了処理へ進み、その後の「アプリを終了」は無視される。
+    #[test]
+    fn quit_gate_asks_again_when_collection_started_while_confirming() {
+        let gate = QuitGate::new();
+        assert_eq!(gate.request(), QuitRequestDecision::ShowPrompt);
+        assert_eq!(gate.answer(true, false, true), QuitAnswerDecision::AskAgain);
+        assert_eq!(gate.request(), QuitRequestDecision::AlreadyConfirming);
+        assert_eq!(gate.answer(true, true, true), QuitAnswerDecision::Proceed);
+        assert_eq!(gate.request(), QuitRequestDecision::AlreadyQuitting);
+    }
     use banto_hub_core::profile_paths::resolve_profile_paths_from_env;
 
     /// #505: 窓（WebView）の CSP は、Hubの応答の CSP（banto の

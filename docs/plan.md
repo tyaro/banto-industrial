@@ -39,6 +39,9 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 記録する）オーナー決定を H4・P3 の細部の置き換えとして追記（P6 は未）。
 同日: §5 の #392 に A2（ChronoGazer のトレイ常駐。ウィンドウを閉じても収集を止めない）を実装したことと、その実装の細部を追記
 （B1 以降は未）。
+2026-10-12: §5 の #392 に A2 のオーナー決定（トレイの左クリックを両アプリで「窓を戻す」に揃える、banto-hub にも終了の
+二重防止 `QuitGate`、OS 終了で banto-hub が `RunningHub::shutdown` を通らない件は #586、ログオン時の自動起動は B）と、
+#383 段階3 の P6 で分かったこと（Hub 側の収集だけが止まった場合のイベントは Hub 側に出る。このままでよい）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -553,6 +556,9 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
          表示・履歴が保たれる）。タグ設定で直すものが無いとき（Hub 未接続など）は「不正」と言わない。
       6. **E2E 用の入口**: `banto-serve` は `BANTO_HUB_MEMORY_KEYS=1`（開発・E2E 用）のときだけ Hub の API キーをプロセス内に置き、
          収集にも Hub を繋ぐ（既定は変えない）。
+    - **P6 で分かったことの決定（2026-10-12 オーナー決定）**: Hub 自体は動いていて **Hub 側の収集だけが止まった**
+      ときは、ChronoGazer のイベント一覧には出さない（記録は Bad + null のまま）。**このままでよい** -
+      停止は Hub 側のイベントに出るため（ChronoGazer が Hub の収集の状態まで写して二重に出さない）。
   - **#392 収集エンジンの UI 独立**:
     - **H6 scada-design.md §13.2 の 3 host モデルへ段階的に移る**: まず A（単一インスタンス・プロファイル排他 +
       トレイ常駐。ウィンドウを閉じても収集を止めない）、次に B（`banto-serve` から本番用の headless host、
@@ -572,6 +578,23 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
       常駐する。収集が止まるのは、トレイの「終了」（確認の後、既存の終了処理 = LAN サーバー → 収集の停止と
       最終 flush・`collection_stopped` → Hub 購読 → DB を通す）と、OS のシャットダウン・ログオフ
       （同じ終了処理を通す）だけ。
+      **オーナー決定（2026-10-12）**:
+      1. **トレイの左クリックの挙動を両アプリで揃える**: Windows の慣習どおり**左クリック = メインの窓を戻す
+         （前面化）、右クリック = メニュー**。banto-hub（これまで左クリックでメニュー）を ChronoGazer に
+         合わせた。メニューの中身（ホストの種類で変わる）は変えない。左クリックの扱い
+         （`show_menu_on_left_click(false)` と左ボタンを離したときの判定）は `banto-desktop-tray` の
+         `restore_window_on_left_click` に寄せた。banto-hub のメインの窓は `tauri.conf.json` で定義済みで、
+         どのホスト（デスクトップ／サービス接続／fallback）でも存在し、× でも破棄されず隠れるだけなので、
+         戻す窓が無い状態は無い（万一無ければ何もせず、メニューは右クリックで出る）。
+      2. **banto-hub にも `QuitGate` を入れる**: 「アプリを終了」の確認中・終了処理中の 2 回目は無視する
+         （確認ダイアログを 2 つ出さない）。banto-hub の確認文は収集中かどうかで変わるので、ChronoGazer と同じく
+         「収集していない」文言で同意を取った後に収集が始まっていたら、黙って終了せず「収集中」の文言で
+         もう一度確かめる。確認文と終了処理（`RunningHub::shutdown`）の中身は変えていない。
+      3. **OS のサインアウト・シャットダウンで banto-hub のデスクトップシェルが `RunningHub::shutdown` を
+         通らない件は別 issue（tyaro/banto-industrial#586）**。この PR では直さない（ChronoGazer は
+         OS の終了でも同じ終了処理を通す）。
+      4. **ログオン時の自動起動は A の範囲外のまま**（B で扱う）。
+
       実装の細部（オーナー決定ではない。banto-hub の既存の型に合わせた）:
       - 窓の前面化・× で隠す・初回の通知・終了の確認ダイアログは、banto-hub と共有の crate
         `crates/banto-desktop-tray` に寄せた（banto-hub 側も同じ crate を使うように置き換えた。挙動は不変）。

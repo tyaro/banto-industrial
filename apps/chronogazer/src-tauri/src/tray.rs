@@ -47,7 +47,7 @@ use banto_desktop_tray::{
 };
 use chronogazer_core::collect::CollectorState;
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
@@ -139,7 +139,8 @@ pub(crate) fn install(app: &tauri::App) -> tauri::Result<()> {
     let handle = app.handle();
     let label = current_label(handle);
     let menu = build_menu(handle, &label)?;
-    let tray = TrayIconBuilder::new()
+    // 左クリックは窓を戻す（メニューは右クリック）。
+    let builder = TrayIconBuilder::new()
         .icon(
             app.default_window_icon()
                 .cloned()
@@ -147,23 +148,12 @@ pub(crate) fn install(app: &tauri::App) -> tauri::Result<()> {
         )
         .tooltip(tooltip_text(&label))
         .menu(&menu)
-        // 左クリックは窓を戻す（メニューは右クリック）。
-        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => open_main_window(app),
             "quit" => request_quit(app),
             _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                open_main_window(tray.app_handle());
-            }
-        })
+        });
+    let tray = banto_desktop_tray::restore_window_on_left_click(builder, open_main_window)
         .build(handle)?;
     // `TrayIcon` は最後の参照が drop されると消えるので、プロセスの終わりまで
     // 管理状態で持つ（banto-hub と同じ）。

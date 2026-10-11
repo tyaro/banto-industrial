@@ -17,6 +17,9 @@
 //!   だけ「トレイで動作を続けます」と OS 通知で知らせる
 //!   （[`notify_first_hide_once`]。既読の印はアプリのデータディレクトリの
 //!   ファイル）。
+//! - [`restore_window_on_left_click`] — トレイの**左クリック = 窓を戻す、
+//!   右クリック = メニュー**（Windows の慣習。両アプリで揃える、
+//!   オーナー決定 2026-10-12）。
 //! - [`ask_confirm`] — 終了の確認ダイアログ（ネイティブ、警告アイコン、
 //!   ボタン名を指定できる 2 択）。
 //! - [`QuitGate`] — 「終了」の確認中・終了処理中に、もう一度「終了」が押された
@@ -45,6 +48,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Runtime, WebviewWindow, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
@@ -70,6 +74,44 @@ pub fn show_window<R: Runtime>(app: &AppHandle<R>, labels: &[&str]) -> bool {
         }
     }
     false
+}
+
+/// トレイのイベントが「左ボタンを離した」クリックか（純関数）。
+///
+/// 押した（Down）と離した（Up）の両方が来るので、片方だけを拾う。
+/// ダブルクリックや右・中ボタン、マウスの出入り・移動は対象外。
+pub fn is_left_click_release(event: &TrayIconEvent) -> bool {
+    matches!(
+        event,
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }
+    )
+}
+
+/// トレイの左クリックで `restore` を呼ぶようにする（メニューは右クリック）。
+///
+/// `show_menu_on_left_click(false)` と、左クリック（[`is_left_click_release`]）
+/// の拾い方を 1 か所にまとめる。`restore` は通常 [`show_window`] を呼ぶ
+/// 関数（アプリごとに「終了処理中は何もしない」等が付く）。戻す窓が無い
+/// ときは `restore` が何もしないだけで、メニューは右クリックで出る。
+pub fn restore_window_on_left_click<R, F>(
+    builder: TrayIconBuilder<R>,
+    restore: F,
+) -> TrayIconBuilder<R>
+where
+    R: Runtime,
+    F: Fn(&AppHandle<R>) + Send + Sync + 'static,
+{
+    builder
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(move |tray, event| {
+            if is_left_click_release(&event) {
+                restore(tray.app_handle());
+            }
+        })
 }
 
 /// × でトレイへ格納したときに一度だけ出す OS 通知の中身と、既読の印の
@@ -401,6 +443,38 @@ mod tests {
             .filter(|d| *d == QuitRequestDecision::ShowPrompt)
             .count();
         assert_eq!(shown, 1);
+    }
+
+    fn click(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: tauri::tray::TrayIconId::new("t"),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect {
+                position: tauri::PhysicalPosition::new(0, 0).into(),
+                size: tauri::PhysicalSize::new(16, 16).into(),
+            },
+            button,
+            button_state,
+        }
+    }
+
+    /// 窓を戻すのは「左ボタンを離した」ときだけ（押した時・右・中は戻さない）。
+    #[test]
+    fn only_left_button_release_restores() {
+        use MouseButton::*;
+        use MouseButtonState::*;
+        assert!(is_left_click_release(&click(Left, Up)));
+        assert!(!is_left_click_release(&click(Left, Down)));
+        assert!(!is_left_click_release(&click(Right, Up)));
+        assert!(!is_left_click_release(&click(Middle, Up)));
+        assert!(!is_left_click_release(&TrayIconEvent::Enter {
+            id: tauri::tray::TrayIconId::new("t"),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect {
+                position: tauri::PhysicalPosition::new(0, 0).into(),
+                size: tauri::PhysicalSize::new(16, 16).into(),
+            },
+        }));
     }
 
     #[test]
