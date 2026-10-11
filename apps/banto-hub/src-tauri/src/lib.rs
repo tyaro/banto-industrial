@@ -620,8 +620,8 @@ struct ExitOnce(ExitCleanupOnce<HubExitReport>);
 ///    「切替で作られた新しい controller に終了の印が引き継がれない」
 ///    （#585 の残件）は起こらない。
 /// 2. **1 回だけ、期限まで待つ**: 置かれている Hub を取り出して
-///    `RunningHub::shutdown` で止め、切替が進めている停止・起動が終わるのを
-///    待つ（[`run_hub_exit`]）。2 つ目の呼び出し（トレイの終了の最中に来た
+///    `RunningHub::shutdown` で止め、切替が進めている停止・起動と、登録済みの
+///    ホスト切替そのものが終わるのを待つ（[`run_hub_exit`]、#587）。2 つ目の呼び出し（トレイの終了の最中に来た
 ///    OS の終了、トレイの終了の `app.exit(0)` の後の `Exit`）は 1 つ目の完了を
 ///    待つ（`ExitCleanupOnce`）。待つ上限は経路ごとの予算
 ///    （[`ExitTrigger::budget`]）で、ロックの取得・進行中の停止の完了待ちも
@@ -635,8 +635,10 @@ struct ExitOnce(ExitCleanupOnce<HubExitReport>);
 /// **サービスは止めない**: ホストの種類（デスクトップ／サービス接続／
 /// fallback）によらず、ここは SCM を一切呼ばない。サービス接続中・fallback
 /// では置き場所が空なので、止めるものは無く（切替が進行中ならそれを待つ
-/// だけ）、サービスはそのまま動き続ける（既存の境界）。進行中の切替自体は
-/// [`drive_host_switch`] が閉じた印を見て、次の SCM 操作の前に打ち切る。
+/// だけ）、サービスはそのまま動き続ける（既存の境界）。終了の開始後に新しい
+/// 切替は始まらず、最初の SCM 操作の前に閉じられた切替は SCM を呼ばずに
+/// 終わる。SCM を呼んだ後の切替は完走させ、ここがその完了を待つ
+/// （[`run_host_switch`]。SCM を呼ぶのは利用者が求めた切替で、終了ではない）。
 ///
 /// `AppState`/[`ExitOnce`] が無い（`setup` の前に落ちた）なら何もしない。
 fn exit_cleanup(app: &AppHandle, trigger: ExitTrigger) {
@@ -1107,6 +1109,11 @@ fn discard_started_hub(hub: RunningHub, ticket: InFlight<RunningHub>) {
 /// 終了が始まった後に起動・切替を断るときの文言（#586）。
 const EXITING_MESSAGE: &str = "終了処理中のため、Hub を起動しません";
 
+/// 終了が始まった後に切替を始めない（SCM を呼ばない）ときの文言（#586/#587）。
+#[cfg(windows)]
+const EXITING_SWITCH_MESSAGE: &str =
+    "終了処理中のため、切替を開始しません（サービスの操作はしていません）";
+
 /// トレイメニューを組み立てる（デスクトップホスト用、desktop-plan §9.9 の
 /// 表どおりの3構成）。
 ///
@@ -1383,16 +1390,18 @@ enum HostSwitchResult {
 /// （[`run_host_switch`]）が背景スレッドで呼ぶ前提 - ここ自体はスレッドを
 /// 起動しない。
 ///
-/// #586: `exiting` が真になったら（シェルの終了が始まったら）、次の
-/// `Poll`（= 次の SCM・health の操作）へ進まずに打ち切って `Faulted` を返す。
-/// 終了の開始後に、切替が SCM の開始・停止を新しく発行したり、Desktop への
-/// 引き継ぎで Hub を起動したりしないため。既に発行した SCM の操作は取り消さない
-/// （SCM 側で進む）。
+/// #586/#587: シェルの終了が始まっても、ここでは途中で打ち切らない（終端まで
+/// 進める）。終了との関係は [`run_host_switch`] が決める: 最初の `step` の前に
+/// 閉じられていればここを呼ばない（SCM を一切呼ばない）、呼んだ後は完走させて
+/// 終了がその完了を待つ（理由は [`hub_slot`] の doc「ホスト切替そのものも
+/// 数える」- SCM を呼んだ後に途中で止めると、サービスもアプリも止まった状態に
+/// 落ちうる）。#586 の最初の版はここで `Poll` ごとに打ち切っていたが、
+/// Desktop→Service でデスクトップの Hub を止めた後・サービスを開始する前に
+/// 打ち切ると両方止まるので外した。
 #[cfg(windows)]
 fn drive_host_switch<M, P, D>(
     engine: &mut HostSwitchEngine<M, P, D>,
     command: SwitchCommand,
-    exiting: &dyn Fn() -> bool,
 ) -> HostSwitchResult
 where
     M: ServiceManager,
@@ -1466,13 +1475,6 @@ where
                 // ServiceStopping」節と同じ理由）。
             }
         }
-        if exiting() {
-            return HostSwitchResult::Faulted {
-                scm_state: None,
-                health: engine.state().last_health.clone(),
-                reason: "終了処理中のため、切替を中断しました".to_string(),
-            };
-        }
         outcome = match engine.step(SwitchCommand::Poll) {
             Ok(outcome) => outcome,
             Err(SwitchError::PermissionDenied) => {
@@ -1531,26 +1533,38 @@ fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: Host
 /// [`drive_host_switch`]を完了まで進める - 呼び出し元（トレイのメニュー
 /// イベントハンドラ / invoke）はブロックしない。
 ///
-/// #586: 終了が始まっていれば（Hub の置き場所が閉じていれば）切替を始めず、
-/// 進行中フラグを下ろして失敗の進捗を出すだけにする（SCM を呼ばない）。
-/// 始めた後に終了が始まったら、[`drive_host_switch`] が次の操作の前に打ち切る。
+/// #586/#587: 切替全体を終了の追跡に入れる（[`hub_slot`] の doc「ホスト切替
+/// そのものも数える」）。
+///
+/// 1. **spawn する前に**、閉じた印の確認と同じロックの中で切替を登録する
+///    （[`HubSlot::begin_switch`]）。閉じていれば（終了が始まっていれば）
+///    切替を始めず、進行中フラグを下ろして失敗の進捗を出すだけ（SCM を
+///    呼ばない）。登録してあるので、この後に終了が閉じても、終了は切替を
+///    知らずに戻ることが無い（#587 のレビュー: 以前は確認の後・最初の
+///    `step` の前に閉じられると、終了は空と見てすぐ戻り、その後で切替が
+///    `ServiceManager::stop` を呼んでいた）。
+/// 2. スレッドは最初の `engine.step` の**直前に**もう一度閉じた印を見る
+///    （[`hub_slot::run_switch`]）。閉じていれば SCM を一切呼ばずに終える。
+/// 3. 閉じていなければ、終端まで完走させ、結果の適用まで行ってから札を返す。
+///    終了はその完了を自分の予算まで待つ。終了の開始後の適用ではデスクトップの
+///    Hub を起動しない（Service→Desktop の途中で終了すると、サービスは止まり
+///    アプリも終わる。終了がサービスを開始し直すことはしない）。
 #[cfg(windows)]
 pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let state = app.state::<AppState>();
-    if state.hub.is_closed() {
+    let Some(switch_ticket) = state.hub.begin_switch() else {
         host_switch_ipc::end_switch();
         host_switch_ipc::emit_progress(
             app,
             host_switch_ipc::HostSwitchProgressEvent {
                 phase: "faulted".into(),
-                message: "終了処理中のため、切替を開始しません".into(),
+                message: EXITING_SWITCH_MESSAGE.into(),
                 done: true,
-                error: Some("終了処理中のため、切替を開始しません".into()),
+                error: Some(EXITING_SWITCH_MESSAGE.into()),
             },
         );
         return;
-    }
-    let slot = Arc::clone(&state.hub);
+    };
     let initial_host = match &*state.view.lock().expect("view mutex poisoned") {
         ShellView::Desktop => HostKind::Desktop,
         ShellView::Service { .. } => HostKind::Service,
@@ -1584,25 +1598,36 @@ pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
                 error: None,
             },
         );
-        let result = drive_host_switch(&mut engine, command, &|| slot.is_closed());
-        let (phase, message, error) = match &result {
-            HostSwitchResult::Service { .. } => (
-                "completed".to_string(),
-                "サービスへの切替が完了しました".to_string(),
-                None,
-            ),
-            HostSwitchResult::Desktop => (
-                "completed".to_string(),
-                "アプリへの切替が完了しました".to_string(),
-                None,
-            ),
-            HostSwitchResult::Faulted { reason, .. } => (
+        // 札は `run_switch` が、駆動と結果の適用を終えてから返す。
+        let ran = hub_slot::run_switch(switch_ticket, || {
+            let result = drive_host_switch(&mut engine, command);
+            let progress = match &result {
+                HostSwitchResult::Service { .. } => (
+                    "completed".to_string(),
+                    "サービスへの切替が完了しました".to_string(),
+                    None,
+                ),
+                HostSwitchResult::Desktop => (
+                    "completed".to_string(),
+                    "アプリへの切替が完了しました".to_string(),
+                    None,
+                ),
+                HostSwitchResult::Faulted { reason, .. } => (
+                    "faulted".to_string(),
+                    format!("切替に失敗しました: {reason}"),
+                    Some(reason.clone()),
+                ),
+            };
+            apply_host_switch_outcome(&app_handle, &target, result);
+            progress
+        });
+        let (phase, message, error) = ran.unwrap_or_else(|| {
+            (
                 "faulted".to_string(),
-                format!("切替に失敗しました: {reason}"),
-                Some(reason.clone()),
-            ),
-        };
-        apply_host_switch_outcome(&app_handle, &target, result);
+                EXITING_SWITCH_MESSAGE.to_string(),
+                Some(EXITING_SWITCH_MESSAGE.to_string()),
+            )
+        });
         host_switch_ipc::end_switch();
         host_switch_ipc::emit_progress(
             &app_handle,

@@ -30,6 +30,41 @@
 //! 0 になるのを期限まで待つ」（[`run_hub_exit`]）で、切替の途中の停止も起動も
 //! 同じ終了の期限で待つ。
 //!
+//! # ホスト切替そのものも数える（#587 のレビュー、2026-10-12）
+//!
+//! 上の札は「Hub の起動・停止」しか数えないので、切替のスレッドが**まだ Hub に
+//! 触っていない間**（SCM の `stop`/`start` を呼ぶ前後・状態の待ち）は終了から
+//! 見えなかった。`run_host_switch` の「閉じていないか」の確認の後・最初の
+//! `engine.step` の前に終了が閉じると、終了は空で落ち着いたと見てすぐ戻り、
+//! その後で切替が `ServiceManager::stop` を呼んでデスクトップの Hub を起動する
+//! 前にプロセスが終わりうる（サービスもアプリも止まる）。
+//!
+//! そこで切替全体を**別の数**（[`SwitchTicket`]、`switches`）で数える:
+//!
+//! - **登録**（[`HubSlot::begin_switch`]）: 切替のスレッドを spawn する**前に**、
+//!   閉じた印の確認と同じロックの中で数を 1 増やす。閉じていれば `None` で、
+//!   切替を始めない。
+//! - **確定**（[`run_switch`]）: スレッドが最初の SCM 操作（`engine.step`）の
+//!   **直前に**閉じた印をもう一度見る。閉じていれば SCM を一切呼ばずに終える。
+//!   閉じていなければ、そこから先は**打ち切らずに完走させる**（終端の状態まで
+//!   進め、結果の適用まで行う）。終了は札が返るのを同じ期限で待つ。
+//! - **なぜ確定の後は打ち切らないか**: SCM を呼んだ後に途中で止めると、どちらの
+//!   向きでも「サービスもアプリも止まる」状態に落ちうる（Desktop→Service は
+//!   デスクトップの Hub を止めた後・サービスを `start` する前、Service→Desktop
+//!   はサービスを `stop` した後）。Desktop→Service は完走すればサービスが
+//!   収集を引き継ぐ。Service→Desktop は完走しても、終了の開始後はデスクトップの
+//!   Hub を起動しない（[`HubSlot::begin_start`] が断る）ので、**サービスは止まり
+//!   アプリも終わる** - 利用者が求めたサービスの停止の結果で、終了がサービスを
+//!   開始し直すことはしない（シェルの終了は SCM を呼ばない境界）。
+//! - **確定と閉じるの間**: 確定の確認とその後の `step` は 1 つのロックで
+//!   囲めない（`step` は SCM の呼び出しやデスクトップの Hub の `shutdown` で
+//!   長く掛かる）。確定の確認の直後に閉じられた場合は「確定の後」として扱う -
+//!   終了は切替の札を待つので、SCM を呼んだ切替を見捨てることは無い。
+//! - 切替の数は [`HubSlot::is_idle`]（切替の `is_stopped`）には**入れない**。
+//!   入れると、Desktop→Service の切替が自分の札のせいで「デスクトップは
+//!   止まった」に永遠に到達しない。終了の待ち（[`HubSlot::wait_idle_until`]）
+//!   だけが両方を数える。
+//!
 //! # 1 回に限るのは終了だけ
 //!
 //! ホスト切替の停止・起動は何度でも起きる（デスクトップ ↔ サービスを
@@ -48,7 +83,16 @@ use std::time::Instant;
 struct SlotState<H> {
     hub: Option<H>,
     in_flight: usize,
+    /// 登録済みで、まだ終わっていないホスト切替の数（[`SwitchTicket`]）。
+    switches: usize,
     closed: bool,
+}
+
+impl<H> SlotState<H> {
+    /// 終了が待つものが無い（Hub の起動・停止も、ホスト切替も進行中でない）。
+    fn settled(&self) -> bool {
+        self.in_flight == 0 && self.switches == 0
+    }
 }
 
 /// デスクトップホストの Hub の置き場所（この module の doc）。
@@ -68,10 +112,46 @@ impl<H> Drop for InFlight<H> {
     fn drop(&mut self) {
         let mut state = self.slot.lock();
         state.in_flight -= 1;
-        if state.in_flight == 0 {
+        if state.settled() {
             self.slot.idle.notify_all();
         }
     }
+}
+
+/// 登録済みのホスト切替が進行中であることを示す札（この module の doc
+/// 「ホスト切替そのものも数える」）。切替のスレッドが、最初の SCM 操作の前から
+/// 結果の適用の後まで持ち、drop で返す。
+#[must_use = "札を落とすと、進行中の切替を終了が待たなくなる"]
+pub(crate) struct SwitchTicket<H> {
+    slot: Arc<HubSlot<H>>,
+}
+
+impl<H> Drop for SwitchTicket<H> {
+    fn drop(&mut self) {
+        let mut state = self.slot.lock();
+        state.switches -= 1;
+        if state.settled() {
+            self.slot.idle.notify_all();
+        }
+    }
+}
+
+/// 登録済みの切替を、確定してから走らせる（この module の doc「ホスト切替
+/// そのものも数える」）。
+///
+/// - 最初に閉じた印を見る（確定）。閉じていれば `drive` を**呼ばずに** `None`
+///   （SCM を一切呼ばない）。
+/// - 閉じていなければ `drive`（切替の駆動と結果の適用）を最後まで走らせて
+///   `Some`。途中で閉じられても打ち切らない - 終了は札が返るのを待つ。
+///
+/// 札は `drive` が終わってから返す。
+pub(crate) fn run_switch<H, R>(ticket: SwitchTicket<H>, drive: impl FnOnce() -> R) -> Option<R> {
+    if ticket.slot.is_closed() {
+        return None;
+    }
+    let result = drive();
+    drop(ticket);
+    Some(result)
 }
 
 /// [`HubSlot::install`] が突き返した Hub と、その札。呼び出し元は Hub を
@@ -87,6 +167,7 @@ impl<H> HubSlot<H> {
             state: Mutex::new(SlotState {
                 hub: None,
                 in_flight: 0,
+                switches: 0,
                 closed: false,
             }),
             idle: Condvar::new(),
@@ -117,6 +198,21 @@ impl<H> HubSlot<H> {
             return None;
         }
         Some(self.ticket(&mut state))
+    }
+
+    /// ホスト切替を終了の追跡に登録する（spawn する**前に**呼ぶ）。閉じていれば
+    /// （終了が始まっていれば）`None` で、切替を始めない。登録は閉じた印の確認と
+    /// 同じロックの中なので、「確認した後・登録する前に閉じられて、終了が切替を
+    /// 知らずに戻る」隙間は無い。札は [`run_switch`] に渡す。
+    pub(crate) fn begin_switch(self: &Arc<Self>) -> Option<SwitchTicket<H>> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        state.switches += 1;
+        Some(SwitchTicket {
+            slot: Arc::clone(self),
+        })
     }
 
     /// 起動し終えた Hub を置く。閉じている、または既に別の Hub が置かれて
@@ -159,17 +255,18 @@ impl<H> HubSlot<H> {
     /// デスクトップの Hub は止まりきっている）。ホスト切替の
     /// `DesktopHostControl::is_stopped` が使う - `None` を見ただけでは、
     /// 取り出された Hub の `shutdown` がまだ終わっていないことがある。
+    /// 進行中のホスト切替（[`SwitchTicket`]）は数えない（この module の doc）。
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.lock();
         state.hub.is_none() && state.in_flight == 0
     }
 
-    /// 進行中の札が 0 になるのを `deadline` まで待つ。0 になれば `true`、期限が
-    /// 来れば `false`。
+    /// 進行中の札（Hub の起動・停止と、登録済みのホスト切替の両方）が 0 になるのを
+    /// `deadline` まで待つ。0 になれば `true`、期限が来れば `false`。
     pub(crate) fn wait_idle_until(&self, deadline: Instant) -> bool {
         let mut state = self.lock();
         loop {
-            if state.in_flight == 0 {
+            if state.settled() {
                 return true;
             }
             let now = Instant::now();
@@ -191,7 +288,7 @@ pub(crate) struct HubExitReport {
     /// 置き場所にあった Hub をこの後始末が止めた（`false` はサービス接続中・
     /// fallback、または切替が取り出し済みだった）。
     pub(crate) stopped_hub: bool,
-    /// 進行中の起動・停止がすべて期限内に終わった。`false` なら期限で
+    /// 進行中の起動・停止・ホスト切替がすべて期限内に終わった。`false` なら期限で
     /// 待つのをやめた（正常終了と区別して記録する）。
     pub(crate) settled: bool,
 }
@@ -200,8 +297,8 @@ pub(crate) struct HubExitReport {
 /// [`HubSlot::close`] を立ててから、これを `ExitCleanupOnce` の本体として渡す。
 ///
 /// 1. 置かれている Hub を取り出して `shutdown` で止める（札を持ったまま）。
-/// 2. 進行中の起動・停止（切替のスレッドが持つ札）が 0 になるのを `deadline`
-///    まで待つ。閉じているので、進行中の起動は置けずに突き返され、起動した
+/// 2. 進行中の起動・停止と登録済みのホスト切替（切替のスレッドが持つ札）が
+///    0 になるのを `deadline` まで待つ。閉じているので、進行中の起動は置けずに突き返され、起動した
 ///    側が自分で止めてから札を返す。
 ///
 /// 閉じるのはここではなく呼び出し元（待たずに、すぐ立てる）。ここで初めて
@@ -231,7 +328,7 @@ mod tests {
     use super::*;
     use banto_desktop_tray::{ExitCleanupOnce, ExitCleanupOutcome};
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Barrier};
     use std::time::Duration;
 
     const LONG: Duration = Duration::from_secs(10);
@@ -455,9 +552,18 @@ mod tests {
         let stops = Arc::new(AtomicUsize::new(0));
         let once = ExitCleanupOnce::new();
         let started = Instant::now();
-        assert_eq!(
-            exit(&once, &slot, Duration::from_millis(50), &stops),
-            ExitCleanupOutcome::TimedOut
+        // 本体の待ち（`wait_idle_until`）と外側の待ち（`run_or_wait`）は同じ期限
+        // なので、どちらが先に期限を見るかで `TimedOut` と
+        // `Finished(settled: false)` のどちらにもなりうる（#587 のオーナー補足）。
+        // 両方とも「正常完了ではない」ことと、上限内に戻ることだけを確かめる。
+        let outcome = exit(&once, &slot, Duration::from_millis(50), &stops);
+        assert!(
+            matches!(
+                outcome,
+                ExitCleanupOutcome::TimedOut
+                    | ExitCleanupOutcome::Finished(HubExitReport { settled: false, .. })
+            ),
+            "an exit over budget must not look like a clean finish: {outcome:?}"
         );
         assert!(started.elapsed() < LONG);
 
@@ -467,17 +573,155 @@ mod tests {
         assert!(slot.wait_idle_until(Instant::now() + LONG));
     }
 
+    /// #587: 登録の後・最初の SCM 操作（`engine.step`）の前に終了が閉じた場合、
+    /// 切替は SCM を一切呼ばずに終わり、終了はその札が返るのを待つ。
+    ///
+    /// `run_host_switch` の流れをそのまま組む: 呼び出し元のスレッドで登録
+    /// （`begin_switch`）→ 切替のスレッドを起こす → Barrier で止めておき、
+    /// その間に終了を始めて閉じる → 放すと `run_switch` が確定で断る。
+    #[test]
+    fn a_switch_closed_before_its_first_step_issues_no_scm_call() {
+        let slot: Arc<HubSlot<FakeHub>> = HubSlot::new();
+        let ticket = slot.begin_switch().expect("open slot accepts a switch");
+        let scm_calls = Arc::new(AtomicUsize::new(0));
+        let before_step = Arc::new(Barrier::new(2));
+        let worker = {
+            let scm_calls = Arc::clone(&scm_calls);
+            let before_step = Arc::clone(&before_step);
+            std::thread::spawn(move || {
+                // `run_host_switch` の確認の後・最初の `step` の前。
+                before_step.wait();
+                run_switch(ticket, || {
+                    scm_calls.fetch_add(1, SeqCst);
+                })
+            })
+        };
+
+        let stops = Arc::new(AtomicUsize::new(0));
+        let once = Arc::new(ExitCleanupOnce::new());
+        let (done_tx, done_rx) = mpsc::channel();
+        let exiting = {
+            let once = Arc::clone(&once);
+            let slot = Arc::clone(&slot);
+            let stops = Arc::clone(&stops);
+            std::thread::spawn(move || {
+                let outcome = exit(&once, &slot, LONG, &stops);
+                done_tx.send(()).unwrap();
+                outcome
+            })
+        };
+        let give_up = Instant::now() + LONG;
+        while !once.has_started() {
+            assert!(Instant::now() < give_up, "the exit never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slot.is_closed());
+        // 切替の札が残っている間、終了は戻らない（登録の前は空に見えて戻っていた）。
+        assert!(done_rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+        before_step.wait();
+        assert_eq!(worker.join().unwrap(), None);
+        assert_eq!(scm_calls.load(SeqCst), 0);
+        assert_eq!(
+            exiting.join().unwrap(),
+            ExitCleanupOutcome::Finished(HubExitReport {
+                stopped_hub: false,
+                settled: true,
+            })
+        );
+    }
+
+    /// #587: 確定した後（最初の SCM 操作の最中）に終了が閉じた場合、切替は
+    /// 打ち切らずに完走し、終了はその完了を待つ。
+    #[test]
+    fn a_switch_closed_during_its_steps_runs_to_completion_and_the_exit_waits() {
+        let slot: Arc<HubSlot<FakeHub>> = HubSlot::new();
+        let ticket = slot.begin_switch().expect("open slot accepts a switch");
+        let (in_step_tx, in_step_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            run_switch(ticket, move || {
+                in_step_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                "completed"
+            })
+        });
+        in_step_rx.recv().unwrap();
+
+        let stops = Arc::new(AtomicUsize::new(0));
+        let once = Arc::new(ExitCleanupOnce::new());
+        let (done_tx, done_rx) = mpsc::channel();
+        let exiting = {
+            let once = Arc::clone(&once);
+            let slot = Arc::clone(&slot);
+            let stops = Arc::clone(&stops);
+            std::thread::spawn(move || {
+                let outcome = exit(&once, &slot, LONG, &stops);
+                done_tx.send(()).unwrap();
+                outcome
+            })
+        };
+        assert!(done_rx.recv_timeout(Duration::from_millis(200)).is_err());
+        release_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap(), Some("completed"));
+        assert_eq!(
+            exiting.join().unwrap(),
+            ExitCleanupOutcome::Finished(HubExitReport {
+                stopped_hub: false,
+                settled: true,
+            })
+        );
+    }
+
+    /// 終了の開始後は切替を登録させない（spawn もしない）。
+    #[test]
+    fn a_closed_slot_refuses_to_register_a_switch() {
+        let slot: Arc<HubSlot<FakeHub>> = HubSlot::new();
+        slot.close();
+        assert!(slot.begin_switch().is_none());
+        assert!(slot.wait_idle_until(Instant::now()));
+    }
+
+    /// 切替の札は `is_idle`（切替の `is_stopped`）に入れない: Desktop→Service の
+    /// 切替は自分の札を持ったまま「デスクトップは止まった」に到達できる。
+    /// 終了の待ちだけが切替の札を数える。
+    #[test]
+    fn a_registered_switch_does_not_block_its_own_is_stopped() {
+        let slot = slot_with_hub();
+        let switch = slot.begin_switch().expect("open slot accepts a switch");
+        let (hub, stop_ticket) = slot.take_for_stop().expect("hub installed");
+        assert!(!slot.is_idle());
+        assert_eq!(hub.0, 1);
+        drop(stop_ticket);
+        assert!(
+            slot.is_idle(),
+            "the switch's own ticket must not count here"
+        );
+        assert!(
+            !slot.wait_idle_until(Instant::now()),
+            "the exit still waits"
+        );
+        drop(switch);
+        assert!(slot.wait_idle_until(Instant::now()));
+    }
+
     /// 閉じる前のホスト切替は何度でもできる（停止・起動を 1 回に制限しない）。
     #[test]
     fn switches_before_exit_are_not_limited() {
         let slot: Arc<HubSlot<FakeHub>> = HubSlot::new();
         for round in 0..3 {
-            let ticket = slot.begin_start().expect("open slot accepts a start");
-            assert!(slot.install(FakeHub(round), ticket).is_ok());
-            let (hub, ticket) = slot.take_for_stop().expect("installed");
-            assert_eq!(hub.0, round);
-            drop(ticket);
+            let switch = slot.begin_switch().expect("open slot accepts a switch");
+            let ran = run_switch(switch, || {
+                let ticket = slot.begin_start().expect("open slot accepts a start");
+                assert!(slot.install(FakeHub(round), ticket).is_ok());
+                let (hub, ticket) = slot.take_for_stop().expect("installed");
+                assert_eq!(hub.0, round);
+                drop(ticket);
+            });
+            assert_eq!(ran, Some(()));
             assert!(slot.is_idle());
+            assert!(slot.wait_idle_until(Instant::now()));
         }
         assert!(!slot.is_closed());
     }
