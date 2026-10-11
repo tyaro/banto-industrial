@@ -3954,9 +3954,12 @@ fn create_main_window(app: &tauri::App) -> tauri::Result<()> {
 /// 対象外なので、この窓からはコマンドを呼べない。
 const LEGACY_DB_WINDOW_LABEL: &str = "legacy-db";
 
-/// 旧形式の DB を拒否したときに出す文（`static/legacy-db.html` が表示する）。
+/// 起動を止めるときに出す文（`static/legacy-db.html` が表示する）。旧形式の
+/// DB の拒否（[`StartupErrorNotice::new`]）と、同じ DB を別のプロセスが使用中
+/// （[`StartupErrorNotice::already_running`]、#392 A1）の 2 通りで使う。窓の
+/// label・ページ名・JS のグローバル名は旧形式の DB 用に付けたまま共用している。
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct LegacyDbNotice {
+struct StartupErrorNotice {
     title: String,
     message: String,
     path: String,
@@ -3964,7 +3967,7 @@ struct LegacyDbNotice {
     closing: String,
 }
 
-impl LegacyDbNotice {
+impl StartupErrorNotice {
     fn new(legacy: &chronogazer_core::db::LegacyDatabase) -> Self {
         Self {
             title: "ChronoGazer を起動できません".to_string(),
@@ -3981,21 +3984,58 @@ impl LegacyDbNotice {
         }
     }
 
+    /// #392 A1: 同じ DB を別のプロセスが使用中のとき。DB には触れずに出す。
+    fn already_running(failure: &chronogazer_core::instance_lock::InstanceLockFailure) -> Self {
+        use chronogazer_core::instance_lock::InstanceLockFailure;
+        let (title, message, path, steps) = match failure {
+            InstanceLockFailure::AlreadyRunning { db, .. } => (
+                "ChronoGazer は既に起動しています",
+                concat!(
+                    "このデータベースは既に別の ChronoGazer（または banto-serve）が使用中です。",
+                    "同じデータベースを 2 つのプロセスで開くと時系列データが二重に書き込まれて",
+                    "壊れるため、起動を中止しました。"
+                )
+                .to_string(),
+                chronogazer_core::instance_lock::display_path(db),
+                concat!(
+                    "先に起動している ChronoGazer（タスクトレイ・タスクバーを確認してください）",
+                    "または banto-serve を終了してから、もう一度起動してください。"
+                ),
+            ),
+            InstanceLockFailure::SymlinkDbPath { db } => (
+                "ChronoGazer を起動できません",
+                "DB ファイルのパスにシンボリックリンクは使えません。実体のパスを指定してください。"
+                    .to_string(),
+                chronogazer_core::instance_lock::display_path(db),
+                "リンクではなく実体のファイルのパスを指定して、起動し直してください。",
+            ),
+            InstanceLockFailure::Io { db, source } => (
+                "ChronoGazer を起動できません",
+                format!("起動の排他を取得できませんでした: {source}"),
+                chronogazer_core::instance_lock::display_path(db),
+                "ディレクトリの権限や空き容量を確認して、起動し直してください。",
+            ),
+        };
+        Self {
+            title: title.to_string(),
+            message,
+            path,
+            steps: steps.to_string(),
+            closing: "このウィンドウを閉じると、この起動は終了します。".to_string(),
+        }
+    }
+
     /// ページを読む前に走らせる JS（`window.__CHRONOGAZER_LEGACY_DB__` に入れる）。
     /// JSON はそのまま JS の式として有効で、ページ側は `textContent` で入れる
     /// ので、パスにどんな文字が入っても HTML として解釈されない。
     fn initialization_script(&self) -> String {
-        let json = serde_json::to_string(self).expect("LegacyDbNotice serializes");
+        let json = serde_json::to_string(self).expect("StartupErrorNotice serializes");
         format!("window.__CHRONOGAZER_LEGACY_DB__ = {json};")
     }
 }
 
-/// 旧形式の DB を拒否したことを、メインの窓の代わりに小さな窓で見せる。
-fn open_legacy_db_window(
-    app: &tauri::App,
-    legacy: &chronogazer_core::db::LegacyDatabase,
-) -> tauri::Result<()> {
-    let notice = LegacyDbNotice::new(legacy);
+/// 起動を止めたことを、メインの窓の代わりに小さな窓で見せる。
+fn open_startup_error_window(app: &tauri::App, notice: &StartupErrorNotice) -> tauri::Result<()> {
     tauri::WebviewWindowBuilder::new(
         app,
         LEGACY_DB_WINDOW_LABEL,
@@ -4010,12 +4050,43 @@ fn open_legacy_db_window(
     Ok(())
 }
 
+/// 単一インスタンス排他のガード（#392 A1）を、プロセスの終わりまで Tauri の
+/// 管理状態として持つ。`AppState` とは別にしてあるのは、排他に失敗して
+/// `AppState` を作らない経路でも（作る経路でも）寿命の扱いを変えないため。
+#[allow(dead_code)] // 持っていること自体が目的（Drop で OS の排他が返る）
+struct InstanceLockHolder(chronogazer_core::instance_lock::InstanceGuard);
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("resolve app data dir");
             std::fs::create_dir_all(&data_dir).expect("create app data dir");
             let db_path = data_dir.join("chronogazer.sqlite3");
+
+            // #392 A1: 同じ DB を別のプロセス（もう 1 つのデスクトップアプリや
+            // `banto-serve`）が使っていれば、**DB に触れる前**（リストア予約の
+            // 適用より前）に、メインの画面の代わりにエラーの窓を出して終わる。
+            // ガードはプロセスの終わりまで `manage` で持つ。リリースビルドは
+            // `windows_subsystem = "windows"` で stderr が見えないため窓で知らせる。
+            match chronogazer_core::instance_lock::acquire_for_db(
+                &db_path,
+                chronogazer_core::instance_lock::ChronoGazerHost::Desktop,
+            ) {
+                Ok(guard) => {
+                    app.manage(InstanceLockHolder(guard));
+                }
+                Err(failure) => {
+                    eprintln!("banto: {failure}");
+                    let notice = StartupErrorNotice::already_running(&failure);
+                    if let Err(err) = open_startup_error_window(app, &notice) {
+                        eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
+                        std::process::exit(1);
+                    }
+                    // `AppState` は manage しない（旧形式の DB の拒否と同じ形）。
+                    // 窓を閉じると最後の窓なのでプロセスが終わる。
+                    return Ok(());
+                }
+            }
 
             // Spec M17: apply any staged restore BEFORE `init_db`/the pool is
             // created - see `BackupService::apply_pending_restore_at_startup`'s
@@ -4048,13 +4119,15 @@ pub fn run() {
             // （`chronogazer_core::db` のモジュール doc「旧形式の DB の拒否」、
             // 手順は apps/chronogazer/README.md）。リリースビルドは
             // `windows_subsystem = "windows"` で stderr が見えないので、メインの
-            // 画面の代わりにエラー専用の窓を開く（[`open_legacy_db_window`]）。
+            // 画面の代わりにエラー専用の窓を開く（[`open_startup_error_window`]）。
             // stderr にも出す（開発ビルド用）。
             let pool = match tauri::async_runtime::block_on(init_db(&db_path)) {
                 Ok(pool) => pool,
                 Err(InitDbError::Legacy(legacy)) => {
                     eprintln!("banto: {legacy}");
-                    if let Err(err) = open_legacy_db_window(app, &legacy) {
+                    if let Err(err) =
+                        open_startup_error_window(app, &StartupErrorNotice::new(&legacy))
+                    {
                         eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
                         std::process::exit(1);
                     }
@@ -4574,7 +4647,7 @@ mod tests {
         let legacy = chronogazer_core::db::LegacyDatabase {
             path: std::path::PathBuf::from(r#"C:\Users\a "b"\</script>\chronogazer.sqlite3"#),
         };
-        let notice = LegacyDbNotice::new(&legacy);
+        let notice = StartupErrorNotice::new(&legacy);
         assert_eq!(notice.path, legacy.path.display().to_string());
         assert!(notice.message.contains("旧形式"), "{}", notice.message);
         assert!(notice.message.contains(&notice.path), "{}", notice.message);
@@ -4595,6 +4668,34 @@ mod tests {
         assert_eq!(parsed["path"], notice.path);
         assert_eq!(parsed["message"], notice.message);
         assert_eq!(parsed["steps"], notice.steps);
+    }
+
+    /// #392 A1: 同じ DB を別のプロセスが使用中のときの窓の文は、DB のパスと
+    /// 対処（先に起動している側を終了する）を含み、ページへ渡す JS は旧形式の
+    /// DB の拒否と同じ形（同じ静的ページで表示する）。
+    #[test]
+    fn already_running_notice_carries_the_path_and_what_to_do() {
+        use chronogazer_core::instance_lock::{acquire_for_db, ChronoGazerHost};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("chronogazer.sqlite3");
+        let _first = acquire_for_db(&db, ChronoGazerHost::Serve).expect("first ok");
+        let failure = acquire_for_db(&db, ChronoGazerHost::Desktop)
+            .err()
+            .expect("second must fail");
+
+        let notice = StartupErrorNotice::already_running(&failure);
+        assert!(notice.title.contains("既に起動"), "{}", notice.title);
+        assert!(notice.message.contains("使用中"), "{}", notice.message);
+        assert!(
+            notice.path.contains("chronogazer.sqlite3"),
+            "{}",
+            notice.path
+        );
+        assert!(notice.steps.contains("終了"), "{}", notice.steps);
+        let script = notice.initialization_script();
+        assert!(script.starts_with("window.__CHRONOGAZER_LEGACY_DB__ = "));
+        // DB には触れていない（ロックは DB ファイルを作らない）。
+        assert!(!db.exists());
     }
 
     /// エラー専用のページは Tauri のコマンドを呼ばない（そのとき `AppState`

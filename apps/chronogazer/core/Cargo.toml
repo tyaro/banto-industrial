@@ -39,6 +39,9 @@ banto-tsquery = { path = "../../../crates/banto-tsquery" }
 # `crate::hub::UnavailableKeyStore`）ので、この crate は keyring に依存
 # しない - ワークスペース `Cargo.toml` の keyring への注記と同じ理由。
 banto-hub-bootstrap = { path = "../../../crates/banto-hub-bootstrap" }
+# #392 A1: 同じ DB を 2 プロセスで開かないための単一インスタンス排他
+# （`crate::instance_lock`）。banto-hub の profile_lock と共有の仕組み。
+banto-instance-lock = { path = "../../../crates/banto-instance-lock" }
 banto-tagclient = { path = "../../../crates/banto-tagclient" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
