@@ -33,13 +33,14 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 2026-10-10: §5 に #383 段階3（Hub を接続種別として扱い、外部ソース接続タスクを `banto-collect` に足す）と
 #392（収集エンジンを UI から独立させる段階移行）のオーナー決定（H1〜H11）を追記し、§4 のドライバ段落を更新（決定のみ、未実装）。
 2026-10-11: §5 の #383 段階3 に、P2（`banto-tags` の `hub`、#566）と P3（`banto-collect` の Hub サンプラー）を
-実装したことを追記（P4〜P6 は未）。
+実装したことを追記。同日: P4（タグを「Hub から追加」で登録する導線）を実装し、P4 の細部（オーナー決定）を追記
+（P5・P6 は未）。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
-地図は [README.md](README.md)**（2026-10-10 更新。本文の T 系表は 2026-08-08 時点の
+地図は [README.md](README.md)**（2026-10-11 更新。本文の T 系表は 2026-08-08 時点の
 まま — 実装状況の正は banto-hub-remaining-plan.md/banto-hub-desktop-plan.md）
 最終検証日(コード照合): 2026-09-01
 
@@ -123,7 +124,9 @@ PLC通信 + タグデータ保存 + リアルタイム/ヒストリカル/ハイ
 想定なので前2者は Hub と機能が被るが、**現場 PC 1 台だけでも ChronoGazer が成立すること**を
 優先し、この重複は許容する。段階（Hub 経由 → 直結 → 合流）と設計の論点は #383。
 **段階1（Hub 購読）・段階2（SLMP / Modbus TCP 直結 = R1-B/R1-C）は実装済み。段階3（Hub 経由タグの合流・
-保存・表示）の方針は 2026-10-10 に決定済み（§5、未実装）**。
+保存・表示）の方針は 2026-10-10 に決定済みで、2026-10-11 に P2〜P4（種別・収集と保存・「Hub から追加」の
+登録の導線）まで実装した（§5。監視/履歴/しきい値の結合 P5・実機確認 P6 は未）**。P4 から、Hub 経由で購読する
+のは「タグ設定」で登録したタグで、設定画面でのタグ選択は無くなった（§5「P4 の細部」）。
 
 **スコープの護り（SCADA化の誘惑対策、v1 で入れない線）**:
 PLC への書き込み / 汎用画面エディタ（表示は固定グループパターンのみ）/
@@ -452,7 +455,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     banto-tags の migration 0018 で `tags` のしきい値の列を落とし、Hub の画面・REST・MCP・CSV・
     設定パッケージから外した。値付きのしきい値は検証エラーで断る。Hub の収集は判定しない）。要件は [recorder-requirements.md](recorder-requirements.md)
     §3.1・§3.2・§3.5・§3.7 に反映済み。
-- **#383 段階3（Hub 経由タグの合流・保存・表示）と #392（収集エンジンの UI 独立）（2026-10-10 オーナー決定「おすすめで」、決定のみ・未実装）**:
+- **#383 段階3（Hub 経由タグの合流・保存・表示）と #392（収集エンジンの UI 独立）（2026-10-10 オーナー決定「おすすめで」。#383 段階3 は P4 まで実装、#392 は A1 のみ実装）**:
   - **#383 段階3**:
     - **H1 Hub は接続種別として表す**: `plc_connections.protocol` に `hub` を足し、Hub 由来のタグは
       `tags` の行にする（ペン・しきい値 `recorder_tag_settings`・履歴・除外が同じタグ ID で動く）。
@@ -477,8 +480,38 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     - 手順: P2（`banto-tags` に `hub` protocol）→ P3（`banto-collect` の Hub サンプラー）→ P4（タグを
       「Hub から」登録）→ P5（監視・履歴・しきい値の結合）→ P6 実機確認（Hub 経由の SLMP と直結 SLMP を別ポートで
       比較）。
-    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、`simulation`・`derived_simulation` と未知の出所は表示するが記録しない。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。**未**: P4（登録の導線。REST・Tauri は `hub` 接続の作成をまだ拒否）、P5、P6。
-    - **P3 の細部（2026-10-11 オーナー決定「おすすめで」）**: Hub が戻ったときのイベントは PLC と同じ `plc_reconnected`（最初は `plc_connected`）。未知の `value_source` は実値として扱わず記録しない。Hub の `stale` は null で記録する（古い値を新しい測定に見せない）。収集中に画面の選択タグを変えると購読の張り直しで数周期の切断・再接続と Bad が出る件は P4 で扱いを決める。開始時に Hub が答えないときは突き合わせをせずに始め（開始の待ちは最大 20 秒）、消えたタグは次の開始まで Bad のまま。
+    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る。**P4 で「登録済みの hub タグ ∪ 需要」に替えた** - 下の「P4 の細部」）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、`simulation`・`derived_simulation` と未知の出所は表示するが記録しない。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。P4（登録の導線）も 2026-10-11 に実装（下の「P4 の細部」、規則は `apps/chronogazer/core/src/hub_tags.rs`・購読は `hub.rs` のモジュール doc）。**未**: P5、P6。
+    - **P3 の細部（2026-10-11 オーナー決定「おすすめで」）**: Hub が戻ったときのイベントは PLC と同じ `plc_reconnected`（最初は `plc_connected`）。未知の `value_source` は実値として扱わず記録しない。Hub の `stale` は null で記録する（古い値を新しい測定に見せない）。収集中に画面の選択タグを変えると購読の張り直しで数周期の切断・再接続と Bad が出る件は P4 で扱いを決める（→ P4 で選択を購読から外して解消。下）。開始時に Hub が答えないときは突き合わせをせずに始め（開始の待ちは最大 20 秒）、消えたタグは次の開始まで Bad のまま。
+    - **P4 の細部（2026-10-11 オーナー決定「P4進めてください」= 推奨どおり。実装済み）**:
+      1. **`hub` 接続の許可**: ChronoGazer の REST・Tauri は `hub` 接続の作成・更新・削除を受け付ける（banto-hub は
+         引き続き断る）。接続先とキーは `hub.record` のままで、行は host/port を持たない。画面は作成フォームでは作らず、
+         「Hub から追加」が最初の登録で暗黙に作り（名前「Hub」、使われていれば「Hub 2」…）、一覧では読み取り専用
+         （名前と削除だけ。グループを持つ間の削除は `banto-tags` が断る）。
+      2. **「Hub から追加」**: `/tags` のダイアログ（中央モーダル。banto-hub の `Modal` と層の約束を写した）で Hub の
+         カタログ（`GET /api/hub/catalog`・`hub_catalog`、editor 以上、接続先・キー名は返さない）を検索・複数選択し、
+         Hub 接続の下の既存グループか新しいグループ（名前・周期、既定 1000 ms、グループ作成の検証は `banto-tags`）に
+         登録する（`POST /api/tags/from-hub`・`tags_register_from_hub`、editor 以上）。名前・データ型・単位・小数桁を
+         複製、アドレス = 外部名、書き込み不可、スケーリングなし。数値と bit だけ選べ（文字列・構造体は理由付きで
+         無効）、登録済みの外部名は「登録済み」で選べない。名前が登録先のグループで衝突したら**行ごとのエラー**
+         （黙って改名しない）。1 回の登録は `BEGIN IMMEDIATE` の 1 トランザクションで全部か無し（暗黙の接続・グループも
+         巻き戻す）、応答は banto-hub の `POST /api/tags/batch` と同じく常に 200 + `ok: false` で行ごとのエラー。
+      3. **Hub 経由のタグのスケーリング禁止**: `banto-tags` が恒等（`raw_lo == eng_lo` かつ `raw_hi == eng_hi`）以外の
+         スケーリングを断る（作成・更新・バッチ。Hub は工学値を送るので二重換算になる）。タグの編集フォームは Hub 経由の
+         タグでスケーリングの欄を出さない。
+      4. **画面の選択を購読から外す**: 購読するタグ集合は**登録済みの hub タグ（レジストリの hub 接続の下のすべての
+         タグ、有効フラグに依らない）∪ 収集の需要**。**Hub の接続が設定されている限り、収集を止めていても登録済みの
+         タグを購読する**（設定画面が現在値を出せるように。需要は登録済みの部分集合なので、収集の開始・停止では集合が
+         変わらず張り直さない）。設定画面の「選択したタグ」は読み取り専用の「登録済みのHubタグ」（現在値付き）に
+         替えた。集合が変わるのは登録を変えたときだけで、レジストリを変えた REST・Tauri の後
+         （`HubService::registry_changed`、張り直しのタスクは 1 本だけ）・突き合わせの頭・見張りの各周期でレジストリを
+         読み直す。`banto-tagclient` を調べたが、購読の追加・削除を接続を保ったまま行う口は無い（`start(requests)` の要求は世代の間固定、`restart` は資格情報と接続先の差し替えだけ）。したがって**収集中に hub タグを
+         追加・削除すると 1 回張り直し、数周期の Bad と切断・再接続のイベントが出る**（登録を変えたときだけなので許容）。
+         **移行**: 既存の `hub.record.selected_tags` は自動ではタグにしない（グループと周期を持たないため）。
+         「Hub から追加」が 1 度だけ事前にチェックして注記（「以前の Hub 接続の画面で選んでいたタグ」）を出し、最初の
+         登録が成功したとき、または明示の「以前の選択を使わない」（`POST /api/hub/legacy-selection/dismiss`）で消す。
+         古い記録は読める（後方互換）。選択の保存の口（`PUT /api/hub/selected-tags`・`hub_set_selected_tags`）は外した。
+      5. **P3 の持ち越し**: 開始時の突き合わせで外したタグ（`hubTagNotFound` / `hubTagTypeChanged`）は収集の需要に
+         残さない（`CollectorConfig::external_names` = 組み立ての後の計画で需要を絞る。Hub への往復は増えない）。
   - **#392 収集エンジンの UI 独立**:
     - **H6 scada-design.md §13.2 の 3 host モデルへ段階的に移る**: まず A（単一インスタンス・プロファイル排他 +
       トレイ常駐。ウィンドウを閉じても収集を止めない）、次に B（`banto-serve` から本番用の headless host、

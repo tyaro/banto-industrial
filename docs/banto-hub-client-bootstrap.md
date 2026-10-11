@@ -1,13 +1,13 @@
 # Banto クライアントの Hub 自動接続（#332）
 
-状態: **2026-10-11: #383 段階3 の P3 で、購読するタグが「選択 ∪ 収集の需要」になり、購読の最新値を収集が読む口ができた（§10）。2026-10-10: 「SLMP / Modbus TCP 直結は未実装」の記述を実装済みに直し、段階3 の方針決定を反映（§8・§10）。2026-10-04: banto v3.0.0（ADR-0017）追従で、自己発行は「status → 試運転の grant → grant の bearer で発行 → logout」の 4 手順になった（§1・§3・§4・§8）。banto-hub 側は `POST /api/auth/grant/commissioning` が増え、試運転中の `POST /api/api-keys` に bearer が要るようになった（実機未確認、Rust の単体・統合テストで固定）。** chronogazer 分のみ実装済み・実機確認済み（2026-09-17、§11）（共有 crate `crates/banto-hub-bootstrap` + chronogazer の
+状態: **2026-10-11: #383 段階3 の P4 で、購読するタグが「登録済みの hub タグ ∪ 収集の需要」になり、設定画面の選択は購読から外した（§10。選択の保存の口は無くなり、読むだけ残る）。同日: P3 で、購読するタグが「選択 ∪ 収集の需要」になり、購読の最新値を収集が読む口ができた（§10）。2026-10-10: 「SLMP / Modbus TCP 直結は未実装」の記述を実装済みに直し、段階3 の方針決定を反映（§8・§10）。2026-10-04: banto v3.0.0（ADR-0017）追従で、自己発行は「status → 試運転の grant → grant の bearer で発行 → logout」の 4 手順になった（§1・§3・§4・§8）。banto-hub 側は `POST /api/auth/grant/commissioning` が増え、試運転中の `POST /api/api-keys` に bearer が要るようになった（実機未確認、Rust の単体・統合テストで固定）。** chronogazer 分のみ実装済み・実機確認済み（2026-09-17、§11）（共有 crate `crates/banto-hub-bootstrap` + chronogazer の
 設定カテゴリ「Hub 接続」）。**選んだタグの購読（#383 段階1）まで実装済み** — §10 参照（2026-09-30: 購読の鍵は stable ID から external name に変わった、§10.1）。
 **Hub がキーを使えないと言って購読を打ち切ったときの理由ごとの案内（#446）まで実装済み** — §10.6 参照。
 **relay-wright への配線は保留**（relay-wright 自体を 2026-09-17 の
 オーナー決定で凍結、2026-09-24 に main から外してタグ
 `archive/relay-wright-2026-09-24` に退避、plan.md §4b）。
 **banto-hub 側の前提は `apps/banto-hub/core/tests/client_bootstrap.rs` が回帰固定**（2026-10-04 までは「変更ゼロ」だったが、grant 化で Hub 側にも発行口が増えた）。
-最終更新: 2026-10-11（§10 の冒頭に #383 段階3 の P3 を追記）。2026-10-10（§8・§10 の直結「未実装」を訂正、段階3 の決定を反映）。2026-09-26（#449 のオーナーレビュー: 判定の対象のキーを名指しし、別のキー・別の時点の判定を混ぜない。再レビュー: 画面の接続の状態を観測時点と対で持ち、確認し直しの失敗を画面に出す。3 回目: 往復は成功したが中身は失敗、でも再取得の導線を残す。§10.6）
+最終更新: 2026-10-11（§10 の冒頭に #383 段階3 の P4 を追記し、§9 の配線表から選択の保存の口を外した）。同日（§10 の冒頭に #383 段階3 の P3 を追記）。2026-10-10（§8・§10 の直結「未実装」を訂正、段階3 の決定を反映）。2026-09-26（#449 のオーナーレビュー: 判定の対象のキーを名指しし、別のキー・別の時点の判定を混ぜない。再レビュー: 画面の接続の状態を観測時点と対で持ち、確認し直しの失敗を画面に出す。3 回目: 往復は成功したが中身は失敗、でも再取得の導線を残す。§10.6）
 2026-09-25（#446: close 1008 の理由の保持・見張りの再試行の頻度・画面の案内を §10.5 / §10.6 に追加。接続の状態に `keyTripped` を足した（§5、wire 追加））
 2026-09-24（relay-wright の main からの退避を反映。本文の実装状況に変更なし）
 
@@ -166,9 +166,9 @@ HTTP の内訳:
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | keyring     | `apps/chronogazer/src-tauri/src/keyring_store.rs` の `KeyringKeyStore`（サービス名は従来どおり `dev.tyaro.chronogazer`。アカウントは `hub:{host}:{port}{path}:{installation_id}`。自動ログイン用の `set_password`/`get_password`/`delete_password` は薄いラッパとして互換維持） |
 | 設定        | `apps/chronogazer/core/src/hub.rs`。設定 KV の `hub.record`（`HubRecord` の JSON）と `hub.installation_id`（UUID v4）                                                                                                                                                           |
-| サービス    | 同 `HubService`（`status`/`connect`/`adopt_manual_key`/`refresh_catalog`/`set_selected_tags`/`disconnect`）                                                                                                                                                                     |
-| Tauri       | `hub_status` / `hub_connect` / `hub_refresh_catalog` / `hub_set_selected_tags` / `hub_adopt_manual_key` / `hub_disconnect`（すべて admin 限定）                                                                                                                                 |
-| REST（LAN） | `/api/hub`（GET/DELETE）・`/api/hub/connect`・`/api/hub/adopt-key`・`/api/hub/refresh`・`/api/hub/selected-tags`（admin 限定）                                                                                                                                                  |
+| サービス    | 同 `HubService`（`status`/`connect`/`adopt_manual_key`/`refresh_catalog`/`disconnect`。#383 段階3 P4 で `set_selected_tags` を外し、`catalog_for_registration`/`clear_legacy_selection`/`registry_changed` を足した）                                                           |
+| Tauri       | `hub_status` / `hub_connect` / `hub_refresh_catalog` / `hub_adopt_manual_key` / `hub_disconnect`（admin 限定）。P4: `hub_catalog` / `hub_dismiss_legacy_selection`（editor 以上）                                                                                               |
+| REST（LAN） | `/api/hub`（GET/DELETE）・`/api/hub/connect`・`/api/hub/adopt-key`・`/api/hub/refresh`（admin 限定）。P4: `/api/hub/catalog`・`/api/hub/legacy-selection/dismiss`（editor 以上。`/api/hub/selected-tags` は外した）                                                             |
 | 画面        | 設定カテゴリ `hub`（ラベル「Hub接続」、6 番目）。`HubSection.svelte` / `lib/banto/hubAdmin.ts`                                                                                                                                                                                  |
 
 `installation_id` は `uuid` クレートを足さず、既にワークスペース依存にある `getrandom` で
@@ -248,6 +248,20 @@ banto-hub は**未ロックダウンのまま非 loopback バインドで起動�
 写し（`HubFeed`）を読む（`HubSampler`、`banto_collect::ExternalSource`）。需要が変わって突き合わせがまだのときは、
 見張り（§10.5）が追加で 1 回張り直しに行く。保存（tstore）・品質の対応は `crates/banto-collect/src/external.rs`。
 トレンド表示・しきい値の結合は P5（plan.md §5）。
+
+**#383 段階3 の P4（2026-10-11）で替えたこと**: 購読するタグ集合は **登録済みの hub タグ ∪ 収集の需要**になった
+（`wanted_tags`）。登録済みのタグはレジストリの `protocol = hub` の接続の下の**すべての**タグの外部名
+（`HubService::refresh_registered`。有効フラグに依らない）で、**収集を止めていても購読する**（設定画面が現在値を
+出すため）。需要は登録済みの部分集合なので収集の開始・停止では集合が変わらず張り直さない。集合が変わるのは
+登録を変えたときだけで、レジストリを変えた REST・Tauri の後（`registry_changed`、張り直しのタスクを 1 本だけ
+予約）・突き合わせの頭・見張りの各周期にレジストリを読み直す。`banto-tagclient` は購読を接続を保ったまま
+足し引きする口を持たない（`RestClient::start(requests)` は世代の間固定）ので、登録を変えると 1 回張り直し、
+収集中なら数周期のあいだ Hub 経由のタグが Bad になる（オーナー決定で許容）。**設定画面の選択
+（`hub.record.selected_tags`）は購読から外した** - P3 までは選択を収集中に変えるたびに張り直していた。選択は
+読むだけ残し、「タグ設定」の「Hub から追加」が 1 度だけ事前にチェックし、最初の登録か明示の破棄
+（`clear_legacy_selection`）で消す。選択の保存の口（`set_selected_tags`・`PUT /api/hub/selected-tags`・
+`hub_set_selected_tags`）は外した。以下の §10.1〜の「選択タグ」は、P4 からは「登録済みのタグ ∪ 需要」と読む。
+開始時の突き合わせで外したタグは需要に残さない（`narrow_collect`）。
 
 この節を貫く原則は 2 つ: **1 つのタグの事故が購読全体を殺してはいけない** /
 **値が二度と流れない状態を作らない**。`banto-tagclient` と banto-hub は変更せず、アプリ側で吸収する。
