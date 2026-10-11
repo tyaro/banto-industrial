@@ -22,6 +22,8 @@ vi.mock('$app/state', () => ({ navigating: state.navigating }));
 // 直近の `loadModule()` の import。初回の動的 import が負荷の高い全体実行で 5 秒を
 // 超えて時間切れになっても、孤立した import が次のテスト中に評価されないよう、
 // afterEach で決着させる（docs/implementation-checklist.md §5、#559 と同じ型）。
+// hook の既定の時間制限（10 秒）では保留中の import を待ち切れないことがあるので、
+// afterEach にも 60 秒の制限を明示する。
 let pendingImport: Promise<unknown> | undefined;
 
 function loadModule() {
@@ -41,7 +43,7 @@ describe('isNavigationSettled', { timeout: 30_000 }, () => {
 	afterEach(async () => {
 		await pendingImport?.catch(() => {});
 		pendingImport = undefined;
-	});
+	}, 60_000);
 
 	beforeEach(() => {
 		vi.resetModules();

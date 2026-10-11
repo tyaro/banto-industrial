@@ -42,6 +42,8 @@ async function runAutoRetries(): Promise<void> {
 // 直近の `loadSetup()` の import。テストがタイムアウトして import が孤立しても、
 // そのテストの afterEach で決着させる（fetch もタイマーもまだそのテストのもの。
 // 次のテスト中に setup.ts が評価されて、次の fetch モックを叩くのを防ぐ）。
+// hook の既定の時間制限（10 秒）では保留中の import を待ち切れないことがあるので、
+// afterEach にも 60 秒の制限を明示する。
 let pendingImport: Promise<unknown> | undefined;
 
 async function loadSetup() {
@@ -94,7 +96,7 @@ afterEach(async () => {
 	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	vi.unstubAllEnvs();
-});
+}, 60_000);
 
 describe('bantoReady: 一時的に届かないときは demo に落ちない（#286）', { timeout: 30_000 }, () => {
 	const transient: [string, () => Promise<Response>][] = [
