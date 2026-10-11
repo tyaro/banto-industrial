@@ -496,6 +496,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-desktop-tray"
+version = "0.1.0"
+dependencies = [
+ "tauri",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tempfile",
+]
+
+[[package]]
 name = "banto-expr"
 version = "0.2.0-alpha.29"
 dependencies = [
@@ -566,6 +576,7 @@ dependencies = [
 name = "banto-hub-shell"
 version = "0.2.0-alpha.29"
 dependencies = [
+ "banto-desktop-tray",
  "banto-hub-core",
  "banto-server",
  "serde",
@@ -1026,6 +1037,7 @@ dependencies = [
  "axum 0.8.9",
  "banto-collect",
  "banto-core",
+ "banto-desktop-tray",
  "banto-hub-bootstrap",
  "banto-server",
  "chronogazer-core",
@@ -1037,6 +1049,9 @@ dependencies = [
  "sqlx",
  "tauri",
  "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
  "tower",

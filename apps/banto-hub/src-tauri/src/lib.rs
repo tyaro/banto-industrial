@@ -90,9 +90,14 @@
 //!   再構築する。
 //! - トレイ「アプリを終了」の確認ダイアログ（[`confirm_quit`]、
 //!   `tauri-plugin-dialog`）。T16-0 は確認なしだった。
-//! - `×` でトレイ格納した初回だけの OS 通知（[`maybe_notify_first_tray_hide`]、
+//! - `×` でトレイ格納した初回だけの OS 通知（[`TRAY_HINT`]、
 //!   `tauri-plugin-notification`）。既読フラグは `app_data_dir` 配下のファイルへ
 //!   永続化する（実装指示「できれば永続化」）。
+//!
+//! #392 A2 で、窓の前面化・× でトレイへ格納・初回通知・終了の確認ダイアログの
+//! 呼び出しは、ChronoGazer と共有する `banto-desktop-tray`（`crates/`）へ
+//! 移した（振る舞いは変えていない）。トレイのメニュー・状態の文言・終了処理の
+//! 中身はこの crate に残る。
 //!
 //! ## T16-2 で追加したもの（docs/banto-hub-t16-design.md §3「T16-2」）
 //!
@@ -198,6 +203,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(windows)]
 use std::time::Duration;
 
+use banto_desktop_tray::{ConfirmPrompt, TrayHint};
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
 #[cfg(windows)]
 use banto_hub_core::host_switch::{
@@ -216,9 +222,7 @@ use banto_hub_core::service_operators::{is_current_process_admin, is_current_pro
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::webview::PageLoadEvent;
-use tauri::{AppHandle, Manager, Runtime, Webview, WebviewWindow, WindowEvent, Wry};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-use tauri_plugin_notification::NotificationExt;
+use tauri::{AppHandle, Manager, Runtime, Webview, WebviewWindow, Wry};
 use tokio::sync::Mutex as AsyncMutex;
 
 mod host_switch_ipc;
@@ -494,14 +498,9 @@ fn navigate_to_hub(window: &WebviewWindow, host_port: &str) {
 }
 
 /// トレイ「画面を開く」・第二インスタンス起動時の前面化で共有する処理
-/// （設計 §4.2/§4.3）。
+/// （設計 §4.2/§4.3）。中身は ChronoGazer と共有（`banto-desktop-tray`）。
 fn show_main_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        return;
-    };
-    let _ = window.unminimize();
-    let _ = window.show();
-    let _ = window.set_focus();
+    banto_desktop_tray::show_window(app, &[MAIN_WINDOW_LABEL]);
 }
 
 /// トレイ「アプリを終了」の実処理（確認ダイアログ通過後に [`confirm_quit`]
@@ -530,9 +529,9 @@ fn quit(app: &AppHandle) {
 ///
 /// 収集中（[`tray_status::show_stop_item`]が真になる状態）かどうかで文言を
 /// 変える。キャンセルすれば[`quit`]は一切呼ばれない - ダイアログの結果を
-/// 見ずに副作用を起こさない。`show`（非ブロッキング版）を使うのは、
-/// `blocking_show`がメインスレッドでの使用を禁じているため
-/// （メニューイベントハンドラがどのスレッドで呼ばれても安全にする）。
+/// 見ずに副作用を起こさない。ダイアログは待たない版
+/// （[`banto_desktop_tray::ask_confirm`]）で、メニューイベントハンドラが
+/// どのスレッドで呼ばれても安全にする。
 fn confirm_quit(app: &AppHandle) {
     let state = app.state::<AppState>();
     let controller = state
@@ -551,19 +550,20 @@ fn confirm_quit(app: &AppHandle) {
     };
 
     let app_handle = app.clone();
-    app.dialog()
-        .message(message)
-        .title("Banto Hub を終了")
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "終了".to_string(),
-            "キャンセル".to_string(),
-        ))
-        .show(move |confirmed| {
+    banto_desktop_tray::ask_confirm(
+        app,
+        ConfirmPrompt {
+            title: "Banto Hub を終了",
+            message,
+            ok_label: "終了",
+            cancel_label: "キャンセル",
+        },
+        move |confirmed| {
             if confirmed {
                 quit(&app_handle);
             }
-        });
+        },
+    );
 }
 
 /// トレイ「収集を停止」クリック時のエントリポイント（desktop-plan §9.9
@@ -1342,48 +1342,18 @@ fn start_service(app: &AppHandle) {
 #[cfg(not(windows))]
 fn start_service(_app: &AppHandle) {}
 
-/// [`maybe_notify_first_tray_hide`] が既読フラグを永続化するファイルの
-/// パス。Hub 本体の DB/data_dir とは独立したシェル固有の状態なので、
-/// `app.path().app_data_dir()`（`tauri.conf.json`の`identifier`配下）に置く。
-/// `RunningHub`の起動に失敗していても書ける場所であること、複数
-/// profile／複数インストール間で共有すべきではないことの両方を満たす。
-fn tray_hint_flag_path(app: &AppHandle) -> Option<PathBuf> {
-    app.path()
-        .app_data_dir()
-        .ok()
-        .map(|dir| dir.join("tray-hint-shown"))
-}
-
-/// `×` でトレイへ格納した直後に呼ぶ（UX-7 / 実装指示 4.「初回だけ」）。
-///
-/// 既読フラグファイルが無ければ OS 通知を出してからフラグを作成する -
-/// 2回目以降の格納では通知しない。フラグの保存場所を解決できない、または
-/// 書き込みに失敗した場合は通知自体をあきらめる（毎回通知され続けるより、
-/// 通知が出ない方が実装指示の「初回だけ」という意図を壊さない安全側）。
-/// OS 通知 API 自体の失敗（通知権限なし等）も同様に無視する - 継続動作の
-/// 案内が1回出せなくても Hub の収集・UI 提供は妨げない。
-fn maybe_notify_first_tray_hide(app: &AppHandle) {
-    let Some(path) = tray_hint_flag_path(app) else {
-        return;
-    };
-    if path.exists() {
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    if std::fs::write(&path, b"1").is_err() {
-        return;
-    }
-    let _ = app
-        .notification()
-        .builder()
-        .title("Banto Hub")
-        .body("Banto Hub はタスクトレイで動作を続けます。")
-        .show();
-}
+/// `×` でトレイへ格納した初回だけ出す OS 通知（UX-7 / 実装指示 4.「初回
+/// だけ」）。既読フラグは Hub 本体の DB/data_dir とは独立したシェル固有の
+/// 状態なので、`app.path().app_data_dir()`（`tauri.conf.json`の`identifier`
+/// 配下）に置く - `RunningHub`の起動に失敗していても書ける場所であること、
+/// 複数 profile／複数インストール間で共有すべきではないことの両方を満たす。
+/// フラグを書けないときは通知をあきらめる（毎回通知され続けるより安全側）-
+/// 判断は [`banto_desktop_tray::notify_first_hide_once`]。
+const TRAY_HINT: TrayHint = TrayHint {
+    flag_file_name: "tray-hint-shown",
+    title: "Banto Hub",
+    body: "Banto Hub はタスクトレイで動作を続けます。",
+};
 
 /// 状態変化をトレイの tooltip とメニューへ反映する（[`watch_collection_status`]
 /// から毎回呼ばれる、デスクトップホスト専用）。tray が未`manage`のうちに
@@ -1477,16 +1447,9 @@ pub fn run() {
 
             // CloseRequested（×ボタン）はプロセスを終了せずトレイへ格納
             // するだけ（実装指示「CloseRequested -> prevent_close + hide」）。
-            // T16-1 で初回だけの継続通知を追加（UX-7）。
-            let window_to_hide = window.clone();
-            let app_handle_for_hide = app.handle().clone();
-            window.on_window_event(move |event| {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window_to_hide.hide();
-                    maybe_notify_first_tray_hide(&app_handle_for_hide);
-                }
-            });
+            // T16-1 で初回だけの継続通知を追加（UX-7）。#392 A2 で
+            // ChronoGazer と共有の `banto-desktop-tray` へ移した。
+            banto_desktop_tray::hide_to_tray_on_close(&window, TRAY_HINT);
 
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
