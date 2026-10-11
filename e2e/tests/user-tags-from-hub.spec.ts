@@ -20,6 +20,8 @@
  * 4. 層の約束: 未保存の選択がある間は Esc で閉じず、× は確認を出す。
  * 5. Hub 経由のタグの編集フォームにスケーリングの欄が無い。Hub 接続の行は
  *    読み取り専用（ホストの欄が無い）。
+ * 6. Hub 接続の「有効」を切り替えて保存できる（2026-10-11 オーナー決定。無効にした
+ *    Hub 接続のタグは購読も収集もしない - Rust のテストが固定）。
  *
  * フィクスチャは `beforeAll` の先頭と `afterAll` の両方で REST から掃除する
  * （チェックリスト §3。タグ → 収集グループ → Hub 接続の順）。
@@ -246,5 +248,26 @@ test.describe.serial('chronogazer タグ設定の「Hub から追加」（#383 �
 		await expect(connectionDetail.getByText('（Hub 経由の接続）')).toBeVisible();
 		await expect(connectionDetail.getByLabel('ホスト')).toHaveCount(0);
 		await expect(connectionDetail.getByRole('button', { name: '削除' })).toBeVisible();
+	});
+
+	test('6. Hub 接続の「有効」を切り替えて保存でき、一覧と行に反映される（2026-10-11 オーナー決定）', async () => {
+		const connectionsSection = page.locator('section.registry-section').nth(0);
+		const connectionDetail = connectionsSection.locator('div.detail');
+		const enabled = connectionDetail.getByLabel('有効（無効にすると');
+		await expect(enabled).toBeChecked();
+		await enabled.uncheck();
+		await expect(connectionDetail.getByText('未保存の変更があります')).toBeVisible();
+		await connectionDetail.getByRole('button', { name: '保存' }).click();
+		await expect(page.getByText('Hub 接続を無効にしました')).toBeVisible();
+		await expect(connectionDetail.getByText('未保存の変更があります')).toHaveCount(0);
+
+		const conns = (await (
+			await page.request.get('/api/plc-connections', { headers })
+		).json()) as (Row & { enabled: boolean })[];
+		expect(conns.find((c) => c.protocol === 'hub')?.enabled).toBe(false);
+
+		await enabled.check();
+		await connectionDetail.getByRole('button', { name: '保存' }).click();
+		await expect(page.getByText('Hub 接続を有効にしました')).toBeVisible();
 	});
 });

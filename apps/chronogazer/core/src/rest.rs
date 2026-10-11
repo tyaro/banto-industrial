@@ -4213,6 +4213,21 @@ mod tests {
         assert_eq!(created["port"], json!(0));
         let hub_id = created["id"].as_i64().unwrap();
 
+        // 2026-10-11 オーナー決定: Hub 接続の有効・無効は PLC 接続と同じ更新で切り替える。
+        let disabled = router
+            .clone()
+            .oneshot(put_json_auth(
+                &format!("/api/plc-connections/{hub_id}"),
+                &editor,
+                json!({ "name": "Hub", "protocol": "hub", "host": "", "port": 0, "enabled": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let disabled = body_json(disabled).await;
+        assert_eq!(disabled["enabled"], json!(false));
+        assert_eq!(disabled["protocol"], json!("hub"));
+
         let second = router
             .clone()
             .oneshot(post_json_auth(

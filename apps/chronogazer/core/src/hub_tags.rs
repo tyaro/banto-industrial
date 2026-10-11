@@ -63,18 +63,38 @@ const MIN_DECIMALS: i64 = 0;
 const MAX_DECIMALS: i64 = 6;
 
 /// 登録済みの外部名を読む SQL: hub 接続の下の**すべての**タグの `address`
-/// （有効・無効を問わない - 購読の対象と「登録済み」の判定はどちらも
-/// 有効フラグに依らない）。
+/// （接続・グループ・タグの有効フラグを問わない - 「登録済み」＝同じ Hub のタグを
+/// 2 本のタグにしない、の判定）。
 const REGISTERED_SQL: &str = "SELECT t.address FROM tags t \
      JOIN collection_groups g ON g.id = t.collection_group_id \
      JOIN plc_connections c ON c.id = g.plc_connection_id \
      WHERE c.protocol = ? ORDER BY t.address";
 
+/// 購読する外部名を読む SQL: **有効な** hub 接続の下のタグの `address`
+/// （2026-10-11 オーナー決定: 無効にした Hub 接続のタグは購読しない。グループ・
+/// タグの有効フラグは問わない - 収集していなくても設定画面に現在値を出すため）。
+const SUBSCRIBED_SQL: &str = "SELECT t.address FROM tags t \
+     JOIN collection_groups g ON g.id = t.collection_group_id \
+     JOIN plc_connections c ON c.id = g.plc_connection_id \
+     WHERE c.protocol = ? AND c.enabled = 1 ORDER BY t.address";
+
 /// レジストリに登録済みの hub タグの外部名（前後の空白を除き、空を捨て、
-/// ソート・重複なし）。`crate::hub::HubService` の購読の対象と、ダイアログの
-/// 「登録済み」の判定に使う。
+/// ソート・重複なし）。ダイアログの「登録済み」の判定に使う（接続を無効にしても
+/// 登録済みのまま）。
 pub async fn registered_external_names(pool: &SqlitePool) -> Result<Vec<String>, BantoError> {
     let rows: Vec<String> = sqlx::query_scalar(REGISTERED_SQL)
+        .bind(HUB_PROTOCOL)
+        .fetch_all(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    Ok(normalize(rows))
+}
+
+/// `crate::hub::HubService` が購読する外部名: **有効な** hub 接続の下の登録済みの
+/// タグ（[`SUBSCRIBED_SQL`]）。Hub 接続を無効にすると購読から外れ、有効に戻すと
+/// 戻る（どちらも 1 回の張り直し）。形は [`registered_external_names`] と同じ。
+pub async fn subscribed_external_names(pool: &SqlitePool) -> Result<Vec<String>, BantoError> {
+    let rows: Vec<String> = sqlx::query_scalar(SUBSCRIBED_SQL)
         .bind(HUB_PROTOCOL)
         .fetch_all(pool)
         .await
@@ -622,6 +642,64 @@ mod tests {
         )
         .await
         .expect("register_from_hub")
+    }
+
+    /// 2026-10-11 オーナー決定: 無効にした Hub 接続のタグは購読しないが、登録済みの
+    /// まま（同じ外部名を 2 本目として登録させない）。
+    #[tokio::test]
+    async fn a_disabled_hub_connection_is_registered_but_not_subscribed() {
+        let registry = new_registry().await;
+        let result = register(
+            &registry,
+            None,
+            new_group("g"),
+            vec![row("L.G.a", "a", "f32")],
+        )
+        .await;
+        assert!(result.ok);
+        assert_eq!(
+            subscribed_external_names(&registry.pool).await.unwrap(),
+            vec!["L.G.a".to_owned()]
+        );
+        let id = result.connection_id.unwrap();
+        let mut conn = registry.connections.get(id).await.unwrap();
+        conn.enabled = false;
+        registry
+            .connections
+            .update(
+                id,
+                PlcConnectionInput {
+                    name: conn.name,
+                    protocol: conn.protocol,
+                    host: conn.host,
+                    port: conn.port,
+                    unit_id: conn.unit_id,
+                    enabled: conn.enabled,
+                    simulation: conn.simulation,
+                    word_order: conn.word_order,
+                    database: None,
+                    username: None,
+                    password: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(subscribed_external_names(&registry.pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            registered_external_names(&registry.pool).await.unwrap(),
+            vec!["L.G.a".to_owned()]
+        );
+        let again = register(
+            &registry,
+            result.collection_group.map(|g| g.id),
+            None,
+            vec![row("L.G.a", "again", "f32")],
+        )
+        .await;
+        assert!(!again.ok, "無効でも登録済みとして断る");
     }
 
     #[test]

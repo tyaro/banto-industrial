@@ -2521,6 +2521,40 @@ mod tests {
         (pool, real_conn.id, group.id, hub.id, hub_group.id, ids)
     }
 
+    /// #383 段階3 P4 (2026-10-11 owner decision): a **disabled** `"hub"`
+    /// connection is left out of collection exactly like a disabled PLC
+    /// connection - not planned, no exclusion listed (disabling is a choice,
+    /// not an error), its tags' external names not sampled - even where the
+    /// runtime can collect hub connections and the catalog has every tag.
+    #[tokio::test]
+    async fn a_disabled_hub_connection_is_not_collected() {
+        let (pool, plc_id, _plc_group, hub_id, _hub_group, _ids) =
+            registry_with_a_hub_connection().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+        let mut hub_input = conn_input("Hub", 0);
+        hub_input.protocol = banto_tags::HUB_PROTOCOL.to_string();
+        hub_input.enabled = false;
+        plc_svc.update(hub_id, hub_input).await.unwrap();
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        let catalog: HubCatalog = HashMap::from([
+            ("PLC9.G.Temp".to_string(), "f64".to_string()),
+            ("PLC9.G.Gone".to_string(), "f64".to_string()),
+            ("PLC9.G.Retyped".to_string(), "i16".to_string()),
+        ]);
+        let (config, exclusions) = build_config_lenient_with_thresholds(
+            &snapshot,
+            &HashMap::new(),
+            HubSource::Available {
+                catalog: Some(&catalog),
+            },
+        );
+        assert!(!config.has_external_connections());
+        assert!(config.external_names().is_empty());
+        assert!(exclusions.is_empty(), "{exclusions:?}");
+        let keys: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, vec![format!("conn:{plc_id}").as_str()]);
+    }
+
     /// #383 段階3 P3: where the runtime cannot collect a `"hub"` connection
     /// (banto-hub, `banto-serve`) it is left out with an explicit reason -
     /// the connection as [`ExclusionReason::HubSourceUnavailable`] (or

@@ -815,7 +815,8 @@
 				<p class="note">
 					購読するのは<a href={resolveAppPath('/tags')}>タグ設定</a>の「Hub
 					から追加」で登録したタグです（収集していなくても購読し、ここに現在値を出します）。登録を変えると購読を張り直すため、収集中は数周期のあいだ
-					Hub 経由のタグが不良（Bad）になり、切断・再接続のイベントが記録されます。
+					Hub 経由のタグが不良（Bad）になり、切断・再接続のイベントが記録されます。「タグ設定」で
+					Hub 接続を無効にしている間は、その接続のタグを購読しません。
 				</p>
 				{#if legacySelection.length > 0}
 					<p class="note legacy-selection" role="status">

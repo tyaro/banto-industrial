@@ -77,7 +77,11 @@ export interface PlcConnection {
 /** Mirrors `chronogazer_core::rest::PlcConnectionPayload`. */
 export interface PlcConnectionInput {
 	name: string;
-	protocol: PlcProtocol;
+	/**
+	 * 作成フォームが出すのは {@link PlcProtocol} だけ。`'hub'` は Hub 接続の「有効」の
+	 * 切り替え（#383 段階3 P4）の更新でだけ送る。
+	 */
+	protocol: RegistryProtocol;
 	host: string;
 	port: number;
 	unitId: number;

@@ -63,7 +63,8 @@
 //!
 //! * **購読するタグ集合 = 登録済みの hub タグ ∪ 収集の需要**（#383 段階3 P4、
 //!   2026-10-11 オーナー決定。[`wanted_tags`]）。登録済みのタグは
-//!   レジストリの hub 接続の下の**すべての**タグの `address` = 外部名
+//!   レジストリの**有効な** hub 接続の下のすべてのタグの `address` = 外部名
+//!   （Hub 接続を無効にすると購読から外れる。2026-10-11 オーナー決定）
 //!   （[`Subscription::registered`]、H3 の同一性）で、**収集を止めていても
 //!   Hub の接続が設定されている限り購読する**（設定画面が登録済みのタグの
 //!   現在値を出せるように）。需要（[`Subscription::collect_demand`]）は収集の
@@ -274,7 +275,8 @@ pub struct HubSubscriptionView {
     pub reason: Option<String>,
     pub subscribed_count: usize,
     /// 購読の対象として登録されている外部名（#383 段階3 P4: レジストリの
-    /// hub 接続の下のタグ。収集の有無に関わらず購読する）。ソート済み。
+    /// **有効な** hub 接続の下のタグ。収集の有無に関わらず購読する。Hub 接続を
+    /// 無効にすると外れる - 2026-10-11 オーナー決定）。ソート済み。
     /// 設定画面はこれを「登録済みの Hub タグ」として読み取り専用で出す。
     pub registered: Vec<String>,
     /// 登録したのに catalog に無かった external name（Hub から消えた／権限で
@@ -1957,7 +1959,7 @@ impl HubService {
         let Some(pool) = self.inner.registry.get() else {
             return false;
         };
-        match crate::hub_tags::registered_external_names(pool).await {
+        match crate::hub_tags::subscribed_external_names(pool).await {
             Ok(names) => self.inner.subscription.lock().await.set_registered(names),
             Err(err) => {
                 eprintln!(
@@ -2025,6 +2027,12 @@ impl HubService {
     /// ポーリングには使わない）。**発行は行わない**。
     pub async fn catalog_for_registration(&self) -> Result<HubCatalogView, BantoError> {
         let view = self.status().await?;
+        // 「登録済み」は購読の対象（有効な Hub 接続の下だけ）ではなく、レジストリの
+        // すべての hub タグ（無効にした Hub 接続の下のものも 2 本目として登録させない）。
+        let registered = match self.inner.registry.get() {
+            Some(pool) => crate::hub_tags::registered_external_names(pool).await?,
+            None => view.subscription.registered.clone(),
+        };
         // 消去を予約済み（まだ操作ロックを待っている）なら、消えたものとして返す。
         let legacy_selection = if self.inner.legacy_clear_pending.load(Ordering::SeqCst) {
             Vec::new()
@@ -2038,7 +2046,7 @@ impl HubService {
         Ok(HubCatalogView {
             status: view.status,
             tags: view.tags,
-            registered: view.subscription.registered,
+            registered,
             legacy_selection,
         })
     }
@@ -4794,6 +4802,54 @@ mod tests {
         // 削除は `registry_changed` で反映される（Hub 未設定なので張り直しの
         // タスクはすぐ終わる）。
         tags.delete(registered.tags[0].id).await.unwrap();
+        hub.registry_changed().await;
+        assert_eq!(hub.subscription().await.registered, owned(&["L.G.a"]));
+
+        // 2026-10-11 オーナー決定: Hub 接続を無効にすると購読から外れ、有効に戻すと戻る。
+        // 「登録済み」（ダイアログの判定）は無効でも変わらない。
+        //
+        // 反証: `subscribed_external_names` の `c.enabled = 1` を外すと、無効にした後も
+        // 購読に残ってここで落ちる。
+        let set_enabled = |enabled: bool| {
+            let connections = connections.clone();
+            let id = registered.connection_id.expect("hub connection");
+            async move {
+                let conn = connections.get(id).await.unwrap();
+                connections
+                    .update(
+                        id,
+                        banto_tags::PlcConnectionInput {
+                            name: conn.name,
+                            protocol: conn.protocol,
+                            host: conn.host,
+                            port: conn.port,
+                            unit_id: conn.unit_id,
+                            enabled,
+                            simulation: conn.simulation,
+                            word_order: conn.word_order,
+                            database: None,
+                            username: None,
+                            password: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        set_enabled(false).await;
+        hub.registry_changed().await;
+        assert!(
+            hub.subscription().await.registered.is_empty(),
+            "無効なら購読しない"
+        );
+        assert_eq!(
+            crate::hub_tags::registered_external_names(&pool)
+                .await
+                .unwrap(),
+            owned(&["L.G.a"]),
+            "登録済みのまま"
+        );
+        set_enabled(true).await;
         hub.registry_changed().await;
         assert_eq!(hub.subscription().await.registered, owned(&["L.G.a"]));
     }

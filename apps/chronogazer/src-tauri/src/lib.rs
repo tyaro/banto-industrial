@@ -5879,6 +5879,25 @@ mod tests {
 
         let catalog = hub_catalog_body(&state).await.expect("editor は読める");
         assert_eq!(catalog.registered, vec!["L.G.a".to_owned()]);
+
+        // 2026-10-11 オーナー決定: Hub 接続の有効・無効を Tauri でも切り替えられる。
+        // 無効にしても「登録済み」は変わらない（ダイアログで 2 本目を作らせない）。
+        let mut toggle = sim_payload("Hub", None);
+        toggle.protocol = "hub".to_owned();
+        toggle.host = String::new();
+        toggle.port = 0;
+        toggle.enabled = false;
+        let updated = plc_connections_update_body(
+            &state,
+            registered.connection_id.expect("hub connection"),
+            toggle,
+        )
+        .await
+        .expect("editor は Hub 接続を無効にできる");
+        assert!(!updated.enabled);
+        assert_eq!(updated.protocol, "hub");
+        let catalog = hub_catalog_body(&state).await.expect("editor は読める");
+        assert_eq!(catalog.registered, vec!["L.G.a".to_owned()]);
         hub_dismiss_legacy_selection_body(&state)
             .await
             .expect("editor は消せる");

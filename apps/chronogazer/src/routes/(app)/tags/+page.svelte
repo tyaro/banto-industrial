@@ -12,8 +12,10 @@
 	 * **Hub 経由の接続（#383 段階3 P4）**: Hub 接続（`protocol: 'hub'`）は
 	 * 作成フォームでは作らず、「Hub から追加」がサーバー側で暗黙に作る。一覧では
 	 * 読み取り専用（ホスト・ポートを持たない。接続先と API キーは「設定 > Hub接続」）
-	 * で、行を選ぶと名前と削除だけを出す（配下にグループがあれば削除はサーバーが
-	 * 断る）。Hub 経由のタグの編集フォームはスケーリングの欄を出さない（Hub は
+	 * で、行を選ぶと「有効」の切り替えと削除だけを出す（配下にグループがあれば削除は
+	 * サーバーが断る）。「有効」は PLC 接続と同じ更新・同じ未保存の確認で、無効にすると
+	 * その接続の Hub のタグは購読も収集もしない（2026-10-11 オーナー決定）。接続の行に
+	 * 版（楽観ロック）は無い - PLC 接続の編集と同じ。Hub 経由のタグの編集フォームはスケーリングの欄を出さない（Hub は
 	 * 工学値を送る。サーバーも断る）。
 	 *
 	 * 構成は PLC接続 / 収集グループ / タグ の3セクションを**縦並び**（タブでは
@@ -135,6 +137,8 @@
 		isRevisionConflict,
 		connectionModeLabel,
 		connectionSavedMessage,
+		hubConnectionInput,
+		hubConnectionSavedMessage,
 		unmovingSimulationTags,
 		simulationCoverageView,
 		configExclusionsView,
@@ -477,10 +481,86 @@
 			connectionSchema(PLC_EDIT),
 			connectionFormValues(PLC_EDIT, conn)
 		);
+		editHubConnectionStore = createFormStore(hubConnectionSchema(HUB_EDIT), {
+			[`${HUB_EDIT}Enabled`]: conn.enabled
+		});
 	}
 
 	/** #383 段階3 P4: 選んだ接続が Hub 接続か（編集フォームの代わりに読み取り専用の欄を出す）。 */
 	const selectedConnectionIsHub = $derived.by(() => selectedConnection?.protocol === 'hub');
+
+	// --- #383 段階3 P4: Hub 接続の「有効」（2026-10-11 オーナー決定） ---------------
+
+	const HUB_EDIT = 'hubEdit';
+
+	function hubConnectionSchema(prefix: string): FormSchema {
+		return {
+			fields: [
+				{
+					name: `${prefix}Enabled`,
+					label: '有効（無効にすると、この接続の Hub のタグは購読も収集もしません）',
+					type: 'checkbox',
+					default: true
+				}
+			]
+		};
+	}
+
+	const HUB_CONNECTION_WIRE_FIELDS = schemaWireFields(
+		HUB_EDIT,
+		hubConnectionSchema(HUB_EDIT).fields
+	);
+
+	let editHubConnectionStore = $state(
+		untrack(() => createFormStore(hubConnectionSchema(HUB_EDIT)))
+	);
+
+	/** Hub 接続の「有効」の保存（`saveConnection` と同じ取り違え対策）。 */
+	async function saveHubConnection(): Promise<void> {
+		if (!selectedConnection || savingConnection || deletingConnection) return;
+		const pending: SaveGuardToken<typeof editHubConnectionStore> = {
+			id: selectedConnection.id,
+			store: editHubConnectionStore
+		};
+		const before = selectedConnection;
+		savingConnection = true;
+		try {
+			const outcome = await runGuardedSave(
+				pending,
+				updatePlcConnection(
+					selectedConnection.id,
+					hubConnectionInput(
+						selectedConnection,
+						Boolean(editHubConnectionStore.values[`${HUB_EDIT}Enabled`])
+					)
+				),
+				() => ({ id: selectedConnection?.id, store: editHubConnectionStore })
+			);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', hubConnectionSavedMessage(before, outcome.entity));
+					editHubConnectionStore.markClean();
+					selectedConnection = outcome.entity;
+					await reloadConnections();
+					break;
+				case 'stale-success':
+					await reloadConnections();
+					break;
+				case 'error':
+					applyServerErrors(
+						HUB_EDIT,
+						HUB_CONNECTION_WIRE_FIELDS,
+						outcome.err,
+						editHubConnectionStore
+					);
+					break;
+				case 'stale-error':
+					break;
+			}
+		} finally {
+			savingConnection = false;
+		}
+	}
 
 	/**
 	 * #394 レビュー（追補2）: `deletingConnection`が真の間も編集フォーム
@@ -1221,6 +1301,8 @@
 			createGroupStore.isDirty ||
 			createTagStore.isDirty ||
 			(selectedConnection !== null && editConnectionStore.isDirty) ||
+			// #383 段階3 P4: Hub 接続の「有効」（Hub 接続を選んでいる間だけ数える）。
+			(selectedConnection !== null && selectedConnectionIsHub && editHubConnectionStore.isDirty) ||
 			(selectedGroup !== null && editGroupStore.isDirty) ||
 			(selectedTag !== null && editTagStore.isDirty) ||
 			// #532: しきい値のフォームは読めたときだけ出るので、そのときだけ数える。
@@ -1466,14 +1548,23 @@
 						Hub接続」（管理者）で設定します。タグは下の「タグ」の「Hub
 						から追加」で登録します。配下に収集グループがある間は削除できません。
 					</p>
-					<button
-						type="button"
-						class="danger"
-						onclick={handleDeleteConnection}
-						disabled={savingConnection || deletingConnection}
+					<UnsavedChangesNotice pending={editHubConnectionStore.isDirty} label={UNSAVED_NOTICE} />
+					<BantoForm
+						schema={hubConnectionSchema(HUB_EDIT)}
+						store={editHubConnectionStore}
+						onSubmit={saveHubConnection}
+						submitting={savingConnection || deletingConnection}
+						submitLabel="保存"
 					>
-						削除
-					</button>
+						<button
+							type="button"
+							class="danger"
+							onclick={handleDeleteConnection}
+							disabled={savingConnection || deletingConnection}
+						>
+							削除
+						</button>
+					</BantoForm>
 				</div>
 			{:else if selectedConnection && canWrite}
 				<div class="detail">
