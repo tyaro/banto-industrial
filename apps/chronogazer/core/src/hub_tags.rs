@@ -518,11 +518,15 @@ async fn register_in_tx(
             for error in errors {
                 if let Some(slot) = row_errors.get_mut(error.index) {
                     for field_error in error.field_errors {
-                        // 事前検証と同じ指摘を二重に出さない（型の不正は両方が言う）。
-                        if !slot
-                            .iter()
-                            .any(|existing| existing.field == field_error.field)
-                        {
+                        // 事前検証と同じ指摘を二重に出さない（型の不正は両方が言う。
+                        // 登録済み・重複の外部名は事前検証が `externalName` で、banto-tags が
+                        // `address` で言う - 同じ事実なので片方だけ出す）。
+                        let same_fact = slot.iter().any(|existing| {
+                            existing.field == field_error.field
+                                || (existing.field == "externalName"
+                                    && field_error.field == "address")
+                        });
+                        if !same_fact {
                             slot.push(field_error);
                         }
                     }

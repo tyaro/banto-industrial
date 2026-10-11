@@ -5880,6 +5880,27 @@ mod tests {
         let catalog = hub_catalog_body(&state).await.expect("editor は読める");
         assert_eq!(catalog.registered, vec!["L.G.a".to_owned()]);
 
+        // 2026-10-11（Codex）: 普通のタグの作成（`tags_create`）でも外部名は一意。
+        match tags_create_body(
+            &state,
+            serde_json::from_value(serde_json::json!({
+                "name": "a-again",
+                "collectionGroupId": registered.collection_group.as_ref().map(|g| g.id),
+                "address": "L.G.a",
+                "dataType": "f32",
+                "decimals": 0,
+                "enabled": true
+            }))
+            .expect("TagPayload"),
+        )
+        .await
+        {
+            Err(BantoError::Validation { field_errors }) => {
+                assert_eq!(field_errors[0].field, "address");
+            }
+            other => panic!("expected an address validation error, got {other:?}"),
+        }
+
         // 2026-10-11 オーナー決定: Hub 接続の有効・無効を Tauri でも切り替えられる。
         // 無効にしても「登録済み」は変わらない（ダイアログで 2 本目を作らせない）。
         let mut toggle = sim_payload("Hub", None);

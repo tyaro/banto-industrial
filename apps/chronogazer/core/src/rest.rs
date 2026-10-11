@@ -4389,6 +4389,32 @@ mod tests {
             ]
         );
 
+        // 2026-10-11（Codex）: 普通のタグの作成（`POST /api/tags`）でも、Hub 経由のタグの
+        // 外部名は一意（banto-tags の検証）。
+        let duplicate = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "a-again",
+                    "collectionGroupId": group_id,
+                    "address": "L.G.a",
+                    "dataType": "f32",
+                    "decimals": 0,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(duplicate.status().is_client_error());
+        let duplicate = body_json(duplicate).await;
+        assert_eq!(
+            duplicate["field_errors"][0]["field"],
+            json!("address"),
+            "{duplicate}"
+        );
+
         // ダイアログ用の catalog: editor が読め（viewer は不可）、Hub 未接続でも
         // 登録済みの外部名は返る（catalog は `null` = 読めていない）。
         let forbidden = router

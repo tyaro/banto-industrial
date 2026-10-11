@@ -1069,7 +1069,8 @@ fn hub_scaling_is_not_identity(input: &TagInput) -> bool {
 async fn validate_tag_kind_placement(
     pool: &SqlitePool,
     input: &TagInput,
-) -> Result<(), BantoError> {
+    exclude_tag_id: Option<i64>,
+) -> Result<bool, BantoError> {
     let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
         .bind(input.collection_group_id)
         .fetch_optional(pool)
@@ -1077,10 +1078,119 @@ async fn validate_tag_kind_placement(
         .map_err(banto_storage::storage_error)?;
 
     let Some((conn_name, protocol)) = row else {
-        return Ok(());
+        return Ok(false);
     };
-    placement_verdict(&conn_name, &protocol, input)
+    placement_verdict(&conn_name, &protocol, input)?;
+    if !is_hub_plc_tag(&protocol, input) {
+        return Ok(false);
+    }
+    let taken: Option<i64> = sqlx::query_scalar(HUB_EXTERNAL_NAME_TAKEN_SQL)
+        .bind(HUB_PROTOCOL)
+        .bind(input.address.trim())
+        .bind(exclude_tag_id)
+        .bind(exclude_tag_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    hub_external_name_verdict(input, taken)?;
+    Ok(true)
 }
+
+/// #383 段階3 P4（2026-10-11、Codex の指摘）: Hub 経由のタグの外部名は
+/// **レジストリ全体で一意**（同じ Hub のタグを 2 本のタグにしない - 記録・
+/// しきい値・ペンが別々のタグ ID に割れる）。`tags` は接続ではなくグループを
+/// 参照するので、UNIQUE 索引では「hub 接続の下だけで一意」を表せない。そこで
+/// 書き込みの前に**同じ実行者（プール、または呼び出し側のトランザクション）で**
+/// 調べ、加えて migration `0020_tags_hub_external_name_unique.sql` のトリガで
+/// 書き込みの文そのものでも断る（調べてから書くまでに割り込まれても重複を
+/// 作らない - 素のプールの `create`/`update` は検査と書き込みが別の文のため）。
+/// `exclude_tag_id` は更新するタグ自身（自分の今のアドレスとは衝突しない）。
+const HUB_EXTERNAL_NAME_TAKEN_SQL: &str = "SELECT t.id FROM tags t \
+     JOIN collection_groups g ON g.id = t.collection_group_id \
+     JOIN plc_connections c ON c.id = g.plc_connection_id \
+     WHERE c.protocol = ? AND t.address = ? AND (? IS NULL OR t.id <> ?) LIMIT 1";
+
+/// 外部名が重複したときのメッセージ。トリガ（migration 0020）の `RAISE` の
+/// 文言（[`HUB_EXTERNAL_NAME_TRIGGER_MESSAGE`]）を拾ったときも同じ文言にする。
+fn hub_external_name_taken_message(address: &str) -> String {
+    format!(
+        "Hub のタグ {address} は既に登録されています（同じ Hub のタグを 2 本のタグにはできません）"
+    )
+}
+
+/// トリガで断ったとき（検査と書き込みの間に割り込まれた）の文言。どの外部名かは
+/// トリガの文言から取れないので、名指しはしない。
+const HUB_EXTERNAL_NAME_TAKEN_RACE_MESSAGE: &str =
+    "この Hub のタグ（外部名）は既に登録されています（同じ Hub のタグを 2 本のタグにはできません）";
+
+/// migration 0020 のトリガが `RAISE(ABORT, ...)` で返す文言（[`map_tag_write_error`]
+/// が `address` の検証エラーに載せ替える）。
+pub(crate) const HUB_EXTERNAL_NAME_TRIGGER_MESSAGE: &str =
+    "banto_tags: hub external name already registered";
+
+/// `plc` タグが `hub` 接続の下にあるか（外部名の一意性を調べる対象）。
+fn is_hub_plc_tag(protocol: &str, input: &TagInput) -> bool {
+    protocol == HUB_PROTOCOL && input.tag_kind == PLC_TAG_KIND
+}
+
+fn hub_external_name_verdict(input: &TagInput, taken: Option<i64>) -> Result<(), BantoError> {
+    match taken {
+        Some(_) => Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "address".to_string(),
+                message: hub_external_name_taken_message(input.address.trim()),
+            }],
+        }),
+        None => Ok(()),
+    }
+}
+
+/// [`map_write_error`] に、migration 0020 のトリガ（Hub の外部名の一意性）の
+/// 拒否を `address` の検証エラーとして足したもの。タグの書き込みはすべてこれを使う。
+fn map_tag_write_error(err: sqlx::Error) -> BantoError {
+    if let Some(db_err) = err.as_database_error() {
+        if db_err.message().contains(HUB_EXTERNAL_NAME_TRIGGER_MESSAGE) {
+            return BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "address".to_string(),
+                    message: HUB_EXTERNAL_NAME_TAKEN_RACE_MESSAGE.to_string(),
+                }],
+            };
+        }
+    }
+    map_write_error(
+        err,
+        "name",
+        NAME_ALREADY_USED_IN_GROUP,
+        "collectionGroupId",
+        FK_MESSAGE,
+    )
+}
+
+/// バッチの中で、Hub 経由のタグ同士が同じ外部名を指している行（**純関数**）。
+/// `hub_rows[i]` が `Some(address)` の行だけを比べ、重なった行の位置を全部返す。
+fn duplicate_hub_addresses(hub_rows: &[Option<String>]) -> Vec<usize> {
+    let mut first_seen: HashMap<&str, usize> = HashMap::new();
+    let mut dupes: Vec<usize> = Vec::new();
+    for (index, address) in hub_rows.iter().enumerate() {
+        let Some(address) = address else { continue };
+        match first_seen.get(address.as_str()) {
+            Some(&first) => {
+                if !dupes.contains(&first) {
+                    dupes.push(first);
+                }
+                dupes.push(index);
+            }
+            None => {
+                first_seen.insert(address.as_str(), index);
+            }
+        }
+    }
+    dupes
+}
+
+const DUPLICATE_HUB_ADDRESS_IN_BATCH: &str =
+    "リクエスト内の他の行と同じ Hub のタグ（外部名）を指しています";
 
 /// Transaction-taking twin of [`validate_tag_kind_placement`] - identical
 /// rules (both delegate to [`placement_verdict`]), differing only in reading
@@ -1089,16 +1199,30 @@ async fn validate_tag_kind_placement(
 async fn validate_tag_kind_placement_tx(
     connection: &mut SqliteConnection,
     input: &TagInput,
-) -> Result<(), BantoError> {
+    exclude_tag_id: Option<i64>,
+) -> Result<bool, BantoError> {
     let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
         .bind(input.collection_group_id)
         .fetch_optional(&mut *connection)
         .await
         .map_err(banto_storage::storage_error)?;
     let Some((conn_name, protocol)) = row else {
-        return Ok(());
+        return Ok(false);
     };
-    placement_verdict(&conn_name, &protocol, input)
+    placement_verdict(&conn_name, &protocol, input)?;
+    if !is_hub_plc_tag(&protocol, input) {
+        return Ok(false);
+    }
+    let taken: Option<i64> = sqlx::query_scalar(HUB_EXTERNAL_NAME_TAKEN_SQL)
+        .bind(HUB_PROTOCOL)
+        .bind(input.address.trim())
+        .bind(exclude_tag_id)
+        .bind(exclude_tag_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    hub_external_name_verdict(input, taken)?;
+    Ok(true)
 }
 
 fn column_map() -> ColumnMap {
@@ -1408,7 +1532,7 @@ impl TagService {
 
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(&self.pool, &input).await?;
+        validate_tag_kind_placement(&self.pool, &input, None).await?;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1431,15 +1555,7 @@ impl TagService {
             .bind(input.retain)
             .fetch_one(&self.pool)
             .await
-            .map_err(|err| {
-                map_write_error(
-                    err,
-                    "name",
-                    NAME_ALREADY_USED_IN_GROUP,
-                    "collectionGroupId",
-                    FK_MESSAGE,
-                )
-            })
+            .map_err(map_tag_write_error)
     }
 
     /// Transaction-compatible counterpart of [`Self::create`].
@@ -1449,7 +1565,7 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(connection, &input).await?;
+        validate_tag_kind_placement_tx(connection, &input, None).await?;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1472,15 +1588,7 @@ impl TagService {
             .bind(input.retain)
             .fetch_one(&mut *connection)
             .await
-            .map_err(|err| {
-                map_write_error(
-                    err,
-                    "name",
-                    NAME_ALREADY_USED_IN_GROUP,
-                    "collectionGroupId",
-                    FK_MESSAGE,
-                )
-            })
+            .map_err(map_tag_write_error)
     }
 
     /// **T18-1 optimistic lock** (docs/banto-hub-desktop-plan.md §9.4
@@ -1502,7 +1610,7 @@ impl TagService {
     /// hub REST layer, via [`Self::update_tx`]).
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(&self.pool, &input).await?;
+        validate_tag_kind_placement(&self.pool, &input, Some(id)).await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update_tag_sql() は expected_revision の有無で固定の
@@ -1563,13 +1671,7 @@ impl TagService {
                     })
                 }
             }
-            Err(other) => Err(map_write_error(
-                other,
-                "name",
-                NAME_ALREADY_USED_IN_GROUP,
-                "collectionGroupId",
-                FK_MESSAGE,
-            )),
+            Err(other) => Err(map_tag_write_error(other)),
         }
     }
 
@@ -1590,7 +1692,7 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, TagUpdateError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(connection, &input).await?;
+        validate_tag_kind_placement_tx(connection, &input, Some(id)).await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update() と同じ理由 - update_tag_sql() は固定の
@@ -1639,13 +1741,7 @@ impl TagService {
                     }))
                 }
             }
-            Err(other) => Err(TagUpdateError::Banto(map_write_error(
-                other,
-                "name",
-                NAME_ALREADY_USED_IN_GROUP,
-                "collectionGroupId",
-                FK_MESSAGE,
-            ))),
+            Err(other) => Err(TagUpdateError::Banto(map_tag_write_error(other))),
         }
     }
 
@@ -1755,7 +1851,9 @@ impl TagService {
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); updates.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(updates.len());
 
-        for (index, (_id, input)) in updates.iter().enumerate() {
+        // #383 段階3 P4: Hub 経由のタグの外部名（行ごと。バッチ内の重複を下で調べる）。
+        let mut hub_rows: Vec<Option<String>> = vec![None; updates.len()];
+        for (index, (id, input)) in updates.iter().enumerate() {
             match validate_tag_input(input) {
                 Ok(value) => validated.push(Some(value)),
                 Err(BantoError::Validation { field_errors }) => {
@@ -1764,13 +1862,21 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement_tx(connection, input).await {
-                Ok(()) => {}
+            match validate_tag_kind_placement_tx(connection, input, Some(*id)).await {
+                Ok(true) => hub_rows[index] = Some(input.address.trim().to_string()),
+                Ok(false) => {}
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
                 Err(other) => return Err(other),
             }
+        }
+
+        for index in duplicate_hub_addresses(&hub_rows) {
+            row_errors[index].push(FieldError {
+                field: "address".to_string(),
+                message: DUPLICATE_HUB_ADDRESS_IN_BATCH.to_string(),
+            });
         }
 
         // Existing-row snapshot: one query for every target id, used below to
@@ -1948,15 +2054,10 @@ impl TagService {
             if let Some(revision) = input.expected_revision {
                 query = query.bind(revision);
             }
-            let row = query.fetch_one(&mut *connection).await.map_err(|err| {
-                map_write_error(
-                    err,
-                    "name",
-                    NAME_ALREADY_USED_IN_GROUP,
-                    "collectionGroupId",
-                    FK_MESSAGE,
-                )
-            })?;
+            let row = query
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(map_tag_write_error)?;
             updated.push(row);
         }
 
@@ -2154,6 +2255,8 @@ impl TagService {
     ) -> Result<BatchTagOutcome, BantoError> {
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
+        // #383 段階3 P4: Hub 経由のタグの外部名（行ごと。バッチ内の重複を下で調べる）。
+        let mut hub_rows: Vec<Option<String>> = vec![None; inputs.len()];
 
         for (index, input) in inputs.iter().enumerate() {
             match validate_tag_input(input) {
@@ -2164,13 +2267,21 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement_tx(connection, input).await {
-                Ok(()) => {}
+            match validate_tag_kind_placement_tx(connection, input, None).await {
+                Ok(true) => hub_rows[index] = Some(input.address.trim().to_string()),
+                Ok(false) => {}
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
                 Err(other) => return Err(other),
             }
+        }
+
+        for index in duplicate_hub_addresses(&hub_rows) {
+            row_errors[index].push(FieldError {
+                field: "address".to_string(),
+                message: DUPLICATE_HUB_ADDRESS_IN_BATCH.to_string(),
+            });
         }
 
         // Keyed by (collection_group_id, name), not name alone - see
@@ -2278,15 +2389,7 @@ impl TagService {
                 .bind(input.retain)
                 .fetch_one(&mut *connection)
                 .await
-                .map_err(|err| {
-                    map_write_error(
-                        err,
-                        "name",
-                        NAME_ALREADY_USED_IN_GROUP,
-                        "collectionGroupId",
-                        FK_MESSAGE,
-                    )
-                })?;
+                .map_err(map_tag_write_error)?;
             created.push(row);
         }
 
@@ -2351,6 +2454,8 @@ impl TagService {
     ) -> Result<BatchTagOutcome, BantoError> {
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
+        // #383 段階3 P4: Hub 経由のタグの外部名（行ごと。バッチ内の重複を下で調べる）。
+        let mut hub_rows: Vec<Option<String>> = vec![None; inputs.len()];
 
         for (index, input) in inputs.iter().enumerate() {
             match validate_tag_input(input) {
@@ -2361,13 +2466,21 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement(&self.pool, input).await {
-                Ok(()) => {}
+            match validate_tag_kind_placement(&self.pool, input, None).await {
+                Ok(true) => hub_rows[index] = Some(input.address.trim().to_string()),
+                Ok(false) => {}
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
                 Err(other) => return Err(other),
             }
+        }
+
+        for index in duplicate_hub_addresses(&hub_rows) {
+            row_errors[index].push(FieldError {
+                field: "address".to_string(),
+                message: DUPLICATE_HUB_ADDRESS_IN_BATCH.to_string(),
+            });
         }
 
         // Intra-batch duplicates: every index sharing a name with another
@@ -2488,15 +2601,7 @@ impl TagService {
                 .bind(input.retain)
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(|err| {
-                    map_write_error(
-                        err,
-                        "name",
-                        NAME_ALREADY_USED_IN_GROUP,
-                        "collectionGroupId",
-                        FK_MESSAGE,
-                    )
-                })?;
+                .map_err(map_tag_write_error)?;
             created.push(row);
         }
         tx.commit().await.map_err(banto_storage::storage_error)?;
@@ -6749,6 +6854,186 @@ mod tests {
         db.tag_kind = DB_TAG_KIND.to_string();
         let errors = field_errors_of(svc.create(db).await.unwrap_err());
         assert_eq!(errors[0].field, "tagKind");
+    }
+
+    /// A second group under the (single) hub connection.
+    async fn second_hub_group(pool: &SqlitePool) -> i64 {
+        let conn_id: i64 =
+            sqlx::query_scalar("SELECT id FROM plc_connections WHERE protocol = 'hub'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "HubGroup2".to_string(),
+                plc_connection_id: conn_id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    fn expect_address_taken(err: BantoError) {
+        let errors = field_errors_of(err);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "address");
+        assert!(
+            errors[0].message.contains("既に登録"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    /// #383 段階3 P4 (2026-10-11, Codex): a Hub tag's external name is unique
+    /// across the registry on **every** write path - create, create_tx,
+    /// update, update_tx - not only in ChronoGazer's "Hub から追加". The same
+    /// address under a PLC connection is unaffected, and a tag keeps its own
+    /// address on update.
+    #[tokio::test]
+    async fn a_hub_external_name_is_unique_on_single_writes() {
+        let (svc, plc_group) = setup().await;
+        let group = hub_group(&svc.pool).await;
+        let other_group = second_hub_group(&svc.pool).await;
+        let first = svc.create(hub_tag("A", group, "PLC1.G.A")).await.unwrap();
+
+        expect_address_taken(
+            svc.create(hub_tag("A2", other_group, "PLC1.G.A"))
+                .await
+                .unwrap_err(),
+        );
+        let mut tx = svc.pool.begin().await.unwrap();
+        expect_address_taken(
+            svc.create_tx(&mut tx, hub_tag("A3", other_group, " PLC1.G.A "))
+                .await
+                .unwrap_err(),
+        );
+        drop(tx);
+
+        // Updating a tag without changing its address is not a conflict.
+        svc.update(first.id, hub_tag("A-renamed", group, "PLC1.G.A"))
+            .await
+            .expect("own address");
+        let second = svc.create(hub_tag("B", group, "PLC1.G.B")).await.unwrap();
+        expect_address_taken(
+            svc.update(second.id, hub_tag("B", group, "PLC1.G.A"))
+                .await
+                .unwrap_err(),
+        );
+        let mut tx = svc.pool.begin().await.unwrap();
+        match svc
+            .update_tx(&mut tx, second.id, hub_tag("B", group, "PLC1.G.A"))
+            .await
+            .unwrap_err()
+        {
+            TagUpdateError::Banto(err) => expect_address_taken(err),
+            other => panic!("expected Banto(Validation), got {other:?}"),
+        }
+        drop(tx);
+
+        // The same string as a PLC address elsewhere is not a Hub tag.
+        let mut plc = sample_input("P", plc_group);
+        plc.address = "40001".to_string();
+        svc.create(plc).await.unwrap();
+    }
+
+    /// The batch paths report duplicates per row: against existing tags and
+    /// within the request itself, for create_batch, create_batch_tx and
+    /// update_batch_tx.
+    #[tokio::test]
+    async fn a_hub_external_name_is_unique_in_batches() {
+        let (svc, _) = setup().await;
+        let group = hub_group(&svc.pool).await;
+        svc.create(hub_tag("A", group, "PLC1.G.A")).await.unwrap();
+        let fields_by_index = |errors: Vec<BatchTagError>| -> Vec<(usize, Vec<String>)> {
+            errors
+                .into_iter()
+                .map(|e| {
+                    (
+                        e.index,
+                        e.field_errors.into_iter().map(|f| f.field).collect(),
+                    )
+                })
+                .collect()
+        };
+
+        let rows = vec![
+            hub_tag("X", group, "PLC1.G.A"),
+            hub_tag("Y", group, "PLC1.G.Y"),
+            hub_tag("Z", group, "PLC1.G.Y"),
+            hub_tag("OK", group, "PLC1.G.OK"),
+        ];
+        let expected = vec![
+            (0, vec!["address".to_string()]),
+            (1, vec!["address".to_string()]),
+            (2, vec!["address".to_string()]),
+        ];
+        match svc.create_batch(rows.clone(), true).await.unwrap() {
+            BatchTagOutcome::Invalid(errors) => assert_eq!(fields_by_index(errors), expected),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        let mut tx = svc.pool.begin().await.unwrap();
+        match svc.create_batch_tx(&mut tx, &rows).await.unwrap() {
+            BatchTagOutcome::Invalid(errors) => assert_eq!(fields_by_index(errors), expected),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        drop(tx);
+
+        let other = svc.create(hub_tag("B", group, "PLC1.G.B")).await.unwrap();
+        let mut tx = svc.pool.begin().await.unwrap();
+        match svc
+            .update_batch_tx(&mut tx, &[(other.id, hub_tag("B", group, "PLC1.G.A"))])
+            .await
+            .unwrap()
+        {
+            BatchTagUpdateOutcome::Invalid(errors) => {
+                assert_eq!(errors[0].id, other.id);
+                assert_eq!(errors[0].field_errors[0].field, "address");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        drop(tx);
+    }
+
+    /// The migration-0020 triggers refuse a duplicate even when the
+    /// application check is bypassed (a write racing past the check), and
+    /// the error maps to the same `address` field.
+    #[tokio::test]
+    async fn the_trigger_refuses_a_duplicate_that_bypasses_the_check() {
+        let (svc, _) = setup().await;
+        let group = hub_group(&svc.pool).await;
+        let a = svc.create(hub_tag("A", group, "PLC1.G.A")).await.unwrap();
+        let b = svc.create(hub_tag("B", group, "PLC1.G.B")).await.unwrap();
+
+        let insert = sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type, string_encoding,              decimals, enabled, writable, tag_kind, retain)              VALUES ('A2', ?, 'PLC1.G.A', 'f32', 'utf8', 0, 1, 0, 'plc', 0)",
+        )
+        .bind(group)
+        .execute(&svc.pool)
+        .await
+        .unwrap_err();
+        expect_address_taken(map_tag_write_error(insert));
+
+        let update = sqlx::query("UPDATE tags SET address = 'PLC1.G.A' WHERE id = ?")
+            .bind(b.id)
+            .execute(&svc.pool)
+            .await
+            .unwrap_err();
+        assert!(
+            update
+                .as_database_error()
+                .is_some_and(|e| e.message().contains(HUB_EXTERNAL_NAME_TRIGGER_MESSAGE)),
+            "{update:?}"
+        );
+        // A tag may keep (rewrite) its own address.
+        sqlx::query("UPDATE tags SET address = 'PLC1.G.A' WHERE id = ?")
+            .bind(a.id)
+            .execute(&svc.pool)
+            .await
+            .expect("own address is not a duplicate");
     }
 
     /// #383 段階3 P4: a hub tag refuses a real scaling (the Hub sends
