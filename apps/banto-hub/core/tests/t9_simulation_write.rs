@@ -460,7 +460,11 @@ async fn simulated_connection_write_is_applied_and_held(
         .unwrap();
 
     app.manager.rebuild().await.expect("rebuild after seeding");
-    let status = app.controller.start(RunMode::Configured).await;
+    let status = app
+        .controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running, "{status:?}");
     app.write_control.enable();
 
@@ -604,7 +608,11 @@ async fn all_simulation_run_applies_writes_to_the_simulator_too() {
         .unwrap();
 
     app.manager.rebuild().await.expect("rebuild after seeding");
-    let status = app.controller.start(RunMode::AllSimulation).await;
+    let status = app
+        .controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running, "{status:?}");
     assert_eq!(status.mode, RunMode::AllSimulation);
     app.write_control.enable();
@@ -690,7 +698,11 @@ async fn a_real_connection_write_still_fails_and_is_audited_as_plc() {
         .unwrap();
 
     app.manager.rebuild().await.expect("rebuild after seeding");
-    let status = app.controller.start(RunMode::Configured).await;
+    let status = app
+        .controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running, "{status:?}");
     app.write_control.enable();
 

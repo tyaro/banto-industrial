@@ -3259,7 +3259,13 @@ async fn tool_set_collection(
     // （このモジュールの doc comment「§3.7」節と同じ「REST と全く同じ
     // 呼び出し」規律）。
     let status = match action {
-        "start" => state.status.controller.start(RunMode::Configured).await,
+        // #392 A2 レビュー: 終了の受付中の開始は REST（409）と
+        // 同じ文言のツールエラーで断る（`crate::controller` の doc「終了の受付」）。
+        // 実行されていないので監査には載せない。
+        "start" => match state.status.controller.start(RunMode::Configured).await {
+            Ok(status) => status,
+            Err(refused) => return Ok(tool_error(refused.to_string())),
+        },
         "stop" => state.status.controller.stop().await,
         other => {
             return Ok(tool_error(format!(

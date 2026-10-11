@@ -249,7 +249,10 @@ async fn test_app(label: &str) -> TestApp {
     // 収集を Running にしておく - このテストの核心は「外側の
     // CollectionNotRunning ゲートは Running のままレースを検知できない」
     // ことの実演なので、後段のテストは `controller.stop()` を呼ばない。
-    let status = controller.start(RunMode::Configured).await;
+    let status = controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
 
     let grpc_service = GrpcService::new(

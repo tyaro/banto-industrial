@@ -271,7 +271,10 @@ async fn test_app_with(
     let write_control =
         std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
     let controller = std::sync::Arc::new(CollectionController::new(manager.clone()));
-    let status = controller.start(RunMode::Configured).await;
+    let status = controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
 
     let api_keys = ApiKeysService::new(pool.clone());
@@ -644,7 +647,11 @@ async fn api_key_ws_keeps_streaming_normal_output_during_all_simulation() {
     let snapshot = recv_matching(&mut api_key_ws, |m| m["op"] == "data" && m["id"] == 1).await;
     assert_eq!(snapshot["values"][0]["v"], 100.0);
 
-    let status = app.controller.start(RunMode::AllSimulation).await;
+    let status = app
+        .controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
     assert_eq!(status.mode, RunMode::AllSimulation);
 

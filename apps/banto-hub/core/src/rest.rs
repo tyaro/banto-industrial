@@ -136,7 +136,9 @@ use crate::api_keys::{
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::computed::ComputedEngine;
-use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
+use crate::controller::{
+    CollectionController, CollectionState, CollectionStatus, QuitInProgress, RunMode,
+};
 use crate::db::Db;
 use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
@@ -1213,17 +1215,44 @@ async fn collection_control_result(
 async fn collection_start(
     State(state): State<CollectionAdminState>,
     headers: HeaderMap,
-) -> Json<CollectionStatusResponse> {
-    let status = state.controller.start(RunMode::Configured).await;
-    collection_control_result(&state, &headers, "start", status).await
+) -> Response {
+    match state.controller.start(RunMode::Configured).await {
+        Ok(status) => collection_control_result(&state, &headers, "start", status)
+            .await
+            .into_response(),
+        Err(refused) => quit_in_progress_response(refused),
+    }
 }
 
 async fn collection_start_all_simulation(
     State(state): State<CollectionAdminState>,
     headers: HeaderMap,
-) -> Json<CollectionStatusResponse> {
-    let status = state.controller.start(RunMode::AllSimulation).await;
-    collection_control_result(&state, &headers, "start_all_simulation", status).await
+) -> Response {
+    match state.controller.start(RunMode::AllSimulation).await {
+        Ok(status) => collection_control_result(&state, &headers, "start_all_simulation", status)
+            .await
+            .into_response(),
+        Err(refused) => quit_in_progress_response(refused),
+    }
+}
+
+/// #392 A2 レビュー（2026-10-12）: デスクトップのトレイの「アプリを終了」が
+/// 終了の受付を始めた後の開始（`start`・`start-all-simulation`・走行中の
+/// `mode` 切り替え）は、`409 Conflict` で**明示的に断る**
+/// （`crate::controller` のモジュール doc「終了の受付」）。開始は実行されて
+/// いないので、監査（`record_write`、成功専用）にも `ResourceChanged` にも
+/// 載せない。本文は共通の [`ErrorBody`]（`{ kind: "other", message }`）-
+/// 管理 UI の `collectionControlAdmin.ts` がこの形の `message` をそのまま
+/// トーストに出すため（独自の `{ error, message }` にすると
+/// 「409 Conflict」としか出ない）。
+fn quit_in_progress_response(refused: QuitInProgress) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorBody::Other {
+            message: refused.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 async fn collection_stop(
@@ -1302,7 +1331,7 @@ async fn collection_set_mode(
     State(state): State<CollectionAdminState>,
     headers: HeaderMap,
     Json(body): Json<CollectionModeRequest>,
-) -> Result<Json<CollectionStatusResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let mode = match body.mode.as_str() {
         "configured" => RunMode::Configured,
         "all_simulation" => RunMode::AllSimulation,
@@ -1315,8 +1344,14 @@ async fn collection_set_mode(
             }))
         }
     };
-    let status = state.controller.set_mode(mode).await;
-    Ok(collection_control_result(&state, &headers, "set_mode", status).await)
+    match state.controller.set_mode(mode).await {
+        Ok(status) => Ok(
+            collection_control_result(&state, &headers, "set_mode", status)
+                .await
+                .into_response(),
+        ),
+        Err(refused) => Ok(quit_in_progress_response(refused)),
+    }
 }
 
 /// T15-2 (docs/banto-hub-desktop-plan.md §9.7): all-simulation 開始前の
@@ -10487,7 +10522,10 @@ mod tests {
             .await
             .unwrap();
 
-        let started = controller.start(RunMode::Configured).await;
+        let started = controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
         assert_eq!(started.state, CollectionState::Running);
         // Zero collection groups yet (T19 S2-a) - genuinely tagless, so
         // `apply_run` (inside `start`) did not sync a broker session for it.
@@ -10584,7 +10622,10 @@ mod tests {
             .await
             .unwrap();
 
-        let started = controller.start(RunMode::Configured).await;
+        let started = controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
         assert_eq!(started.state, CollectionState::Running);
         assert!(
             manager.sessions().connection_ids().contains(&conn.id),
@@ -11898,6 +11939,21 @@ mod tests {
                 .contains("catalog の検証に失敗しました"),
             "{body:?}"
         );
+    }
+
+    /// #392 A2 レビュー（2026-10-12）: 終了の受付中に断った開始は 409 で、
+    /// 本文は管理 UI（`collectionControlAdmin.ts` の `isErrorBody`）が
+    /// `message` を表示できる共通の [`ErrorBody`] の形。
+    #[tokio::test]
+    async fn quit_in_progress_is_http_409_with_a_displayable_error_body() {
+        let response = quit_in_progress_response(QuitInProgress);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["kind"], "other");
+        assert_eq!(body["message"], crate::controller::QUIT_IN_PROGRESS_MESSAGE);
     }
 
     #[tokio::test]

@@ -943,6 +943,15 @@ impl RunningHub {
     /// トレイ）を待ってからこれを呼ぶこと。
     pub async fn shutdown(self) {
         log_line("banto-hub: shutting down");
+        // #392 A2 レビュー（2026-10-12）: 終了の受付の印を立て、以降の収集の
+        // 開始（REST/MCP はこの関数の最後の `server.stop()` まで受け付けて
+        // いる）を 409 で断る。下ろさない（`crate::controller`
+        // の doc「終了の受付」）。トレイの「アプリを終了」は確認の段階で
+        // 既に立てているので、ここは冪等な 2 回目になる。Windows サービスの
+        // 停止はここが最初。既に受け付けられて走っている開始（印を立てる前の
+        // もの）は、ここでは待たない - 従来どおり下の `manager.shutdown()` が
+        // 止める。
+        let _ = self.controller.begin_quit();
         // T14-1（このモジュール doc の「T14-1 での唯一の挙動変化」節・設計
         // §3「D1」・§9「D7」）: 旧 `hub_run::run`はこの2本のループの
         // `JoinHandle`を捨てて「プロセス終了任せ」で止めていた - ここが

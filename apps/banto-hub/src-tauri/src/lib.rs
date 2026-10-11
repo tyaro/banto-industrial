@@ -204,7 +204,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use banto_desktop_tray::{
-    ConfirmPrompt, QuitAnswerDecision, QuitGate, QuitRequestDecision, TrayHint,
+    ConfirmPrompt, QuitAdmission, QuitAnswerDecision, QuitGate, QuitRequestDecision, TrayHint,
 };
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
 #[cfg(windows)]
@@ -526,20 +526,56 @@ fn quit(app: &AppHandle) {
     app.exit(0);
 }
 
-/// 今、確認文を「収集を停止して終了」の側にすべき状態か
-/// （[`tray_status::show_stop_item`]が真になる状態）。controller が無い
-/// （サービス接続中・fallback）なら偽。
-fn currently_collecting(app: &AppHandle) -> bool {
-    let state = app.state::<AppState>();
-    let controller = state
+/// 今の controller（サービス接続中・fallback なら `None`）。
+fn current_controller(app: &AppHandle) -> Option<Arc<CollectionController>> {
+    app.state::<AppState>()
         .controller
         .lock()
         .expect("controller mutex poisoned")
-        .clone();
-    controller
-        .as_ref()
+        .clone()
+}
+
+/// 今、確認文を「収集を停止して終了」の側にすべき状態か
+/// （[`tray_status::show_stop_item`]が真になる状態）。controller が無い
+/// （サービス接続中・fallback）なら偽。**文言を選ぶためだけ**に使う -
+/// 終了へ進んでよいかの判断は [`ControllerQuitAdmission`] が印を立てて
+/// 読んだ状態で行う。
+fn currently_collecting(app: &AppHandle) -> bool {
+    current_controller(app)
         .map(|controller| tray_status::show_stop_item(&controller.status()))
         .unwrap_or(false)
+}
+
+/// トレイの「アプリを終了」の答えで [`QuitGate::answer`] に渡す、終了の受付の
+/// 口（#392 A2 レビュー、2026-10-12。`banto_desktop_tray` の doc「終了の確定と
+/// 収集の開始の直列化」・`banto_hub_core::controller` の doc「終了の受付」）。
+///
+/// [`CollectionController::begin_quit`] は、収集の開始（REST・MCP の
+/// `start`/`start-all-simulation`/走行中の `mode`）が `Starting` を書くのと
+/// 同じロックで印を立てて状態を読むので、「停止中の文言で同意 → 状態を
+/// 読む → その直後に開始 → 古い『停止中』で終了へ進み、新しい収集を黙って
+/// 止める」が起きない。
+///
+/// controller が無い（サービス接続中・fallback）ときは、このプロセスに
+/// 止める収集が無いので常に「暇」で、印も無い（サービスの収集はサービスが
+/// 持ち、このアプリの終了では止めない - [`quit`] の doc）。controller は
+/// 答えを受けた時点のものを 1 つ掴み、立てた印と下ろす印が別の controller に
+/// なることはない。
+struct ControllerQuitAdmission(Option<Arc<CollectionController>>);
+
+impl QuitAdmission for ControllerQuitAdmission {
+    fn begin_quit(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(|controller| tray_status::show_stop_item(&controller.begin_quit()))
+            .unwrap_or(false)
+    }
+
+    fn cancel_quit(&self) {
+        if let Some(controller) = &self.0 {
+            controller.cancel_quit();
+        }
+    }
 }
 
 /// 「アプリを終了」の確認文。収集中かどうかで変わる。
@@ -562,8 +598,10 @@ fn quit_prompt_message(collecting: bool) -> &'static str {
 /// #392 A2（オーナー決定 2026-10-12）: 共有の [`QuitGate`] を通す。確認中・
 /// 終了処理中にもう一度「アプリを終了」が押されても、確認ダイアログを
 /// 2 つ出さず、[`quit`] を 2 回走らせない。「収集していない」文言で同意を
-/// 取った後に収集が始まっていたら（起動直後の自動開始・LAN からの開始）、
-/// 黙って止めず「収集中」の文言でもう一度確かめる。
+/// 取った後に収集が始まっていたら（LAN の REST・MCP からの開始）、
+/// 黙って止めず「収集中」の文言でもう一度確かめる。その判断と終了の確定は、
+/// 収集の開始と [`ControllerQuitAdmission`] で直列化している（同意の後に
+/// 来た開始は 409 で断られる）。
 fn confirm_quit(app: &AppHandle) {
     let Some(gate) = app.try_state::<QuitGate>() else {
         return;
@@ -575,7 +613,7 @@ fn confirm_quit(app: &AppHandle) {
 }
 
 /// 確認ダイアログを出す。`prompted_collecting` は文言を選んだ時点の状態
-/// （答えが返った時点の状態と比べて[`QuitGate::answer`]が判断する）。
+/// （終了の受付の印を立てた時点の状態と比べて[`QuitGate::answer`]が判断する）。
 fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
     let app_handle = app.clone();
     banto_desktop_tray::ask_confirm(
@@ -590,11 +628,8 @@ fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
             let Some(gate) = app_handle.try_state::<QuitGate>() else {
                 return;
             };
-            match gate.answer(
-                confirmed,
-                prompted_collecting,
-                currently_collecting(&app_handle),
-            ) {
+            let admission = ControllerQuitAdmission(current_controller(&app_handle));
+            match gate.answer(confirmed, prompted_collecting, &admission) {
                 QuitAnswerDecision::Proceed => quit(&app_handle),
                 QuitAnswerDecision::AskAgain => prompt_quit(&app_handle, true),
                 QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {}
@@ -1573,17 +1608,51 @@ mod tests {
         assert_ne!(quit_prompt_message(true), quit_prompt_message(false));
     }
 
+    /// 印を立てた時点で忙しかった（= 確認中に収集が始まっていた）ことにする
+    /// 偽の受付口。
+    struct BusyAdmission;
+
+    impl QuitAdmission for BusyAdmission {
+        fn begin_quit(&self) -> bool {
+            true
+        }
+        fn cancel_quit(&self) {}
+    }
+
     /// 暇な文言で同意 → 待つ間に収集が始まった: 出し直し（Confirming のまま
     /// なので 2 回目の「アプリを終了」は重ならない）、収集中の文言で同意すれば
-    /// 終了処理へ進み、その後の「アプリを終了」は無視される。
+    /// 終了処理へ進み、その後の「アプリを終了」は無視される。印の上げ下げの
+    /// 全経路は `banto_desktop_tray` のテスト、開始との直列化は
+    /// `banto_hub_core::controller` のテストで固定している。
     #[test]
     fn quit_gate_asks_again_when_collection_started_while_confirming() {
         let gate = QuitGate::new();
         assert_eq!(gate.request(), QuitRequestDecision::ShowPrompt);
-        assert_eq!(gate.answer(true, false, true), QuitAnswerDecision::AskAgain);
+        assert_eq!(
+            gate.answer(true, false, &BusyAdmission),
+            QuitAnswerDecision::AskAgain
+        );
         assert_eq!(gate.request(), QuitRequestDecision::AlreadyConfirming);
-        assert_eq!(gate.answer(true, true, true), QuitAnswerDecision::Proceed);
+        assert_eq!(
+            gate.answer(true, true, &BusyAdmission),
+            QuitAnswerDecision::Proceed
+        );
         assert_eq!(gate.request(), QuitRequestDecision::AlreadyQuitting);
+    }
+
+    /// controller が無い（サービス接続中・fallback）ときは、このプロセスに
+    /// 止める収集が無いので、暇な文言の同意でそのまま進む。
+    #[test]
+    fn without_a_controller_the_admission_is_never_busy() {
+        let admission = ControllerQuitAdmission(None);
+        assert!(!admission.begin_quit());
+        admission.cancel_quit();
+        let gate = QuitGate::new();
+        assert_eq!(gate.request(), QuitRequestDecision::ShowPrompt);
+        assert_eq!(
+            gate.answer(true, false, &admission),
+            QuitAnswerDecision::Proceed
+        );
     }
     use banto_hub_core::profile_paths::resolve_profile_paths_from_env;
 

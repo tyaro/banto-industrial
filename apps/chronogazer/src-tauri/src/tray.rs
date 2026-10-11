@@ -28,6 +28,16 @@
 //!   いなければ何もしない）。さらに「止まっている」文言で同意を取った後に
 //!   収集が始まっていたら、黙って止めずに「収集中」の文言でもう一度確かめる
 //!   （[`banto_desktop_tray::decide_answer`] の `AskAgain`）。
+//! - **同意と収集の開始の競合**（#392 A2 レビュー、2026-10-12）: 同意の後に
+//!   状態を読んでから終了を確定するまでの間に、REST・Tauri の開始・自動開始が
+//!   割り込むと、古い「止まっている」で進んで新しい収集を黙って止めてしまう。
+//!   これは収集側の「終了の受付」（`CollectorService::begin_quit`、
+//!   `chronogazer_core::collect` の doc「終了の受付」）で直列化する: 答えの
+//!   コールバックは状態を自分で読まず、[`CollectorQuitAdmission`] を通して
+//!   **開始の受付と同じロックの中で印を立てて**忙しいかを読む。印が立った
+//!   後の開始は「終了処理中のため、収集を開始できません」のエラーで断られ、
+//!   確かめ直すとき（`AskAgain`）は印を下ろす（上げ下げは
+//!   [`QuitGate::answer`] が行う）。
 //! - **終了処理中にもう一度「終了」**: [`banto_desktop_tray::QuitGate`] が
 //!   確認ダイアログを 2 つ出さず、終了処理を 2 回走らせない。終了処理の本体も
 //!   [`crate::exit_cleanup_once`] が 1 回に限る（OS のシャットダウンで
@@ -43,9 +53,10 @@
 use std::time::Duration;
 
 use banto_desktop_tray::{
-    ConfirmPrompt, QuitAnswerDecision, QuitGate, QuitPhase, QuitRequestDecision, TrayHint,
+    ConfirmPrompt, QuitAdmission, QuitAnswerDecision, QuitGate, QuitPhase, QuitRequestDecision,
+    TrayHint,
 };
-use chronogazer_core::collect::CollectorState;
+use chronogazer_core::collect::{CollectorService, CollectorState};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
@@ -68,13 +79,30 @@ pub(crate) const TRAY_HINT: TrayHint = TrayHint {
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 終了の確認に「収集中」の文言を使うか（= 止めるべき収集があるか）。
-/// 開始中も含める（開始処理は止めないと走り切ってしまう）。対象 0 件・
-/// 開始失敗・停止中はエンジンが無いので含めない。
+/// 判定は収集側（[`CollectorState::is_collecting`]）と同じもの - 終了の
+/// 受付（`CollectorService::begin_quit`）の「忙しい」と食い違わないように。
 pub(crate) fn is_collecting(state: &CollectorState) -> bool {
-    matches!(
-        state,
-        CollectorState::Running { .. } | CollectorState::Starting
-    )
+    state.is_collecting()
+}
+
+/// 確認の答えで [`QuitGate::answer`] に渡す、終了の受付の口（このモジュールの
+/// doc「同意と収集の開始の競合」）。`AppState` が無い（起動を止めてエラーの
+/// 窓を出している）ときは止める収集が無いので、常に暇で印も無い。
+struct CollectorQuitAdmission(Option<CollectorService>);
+
+impl QuitAdmission for CollectorQuitAdmission {
+    fn begin_quit(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(CollectorService::begin_quit)
+            .unwrap_or(false)
+    }
+
+    fn cancel_quit(&self) {
+        if let Some(collect) = &self.0 {
+            collect.cancel_quit();
+        }
+    }
 }
 
 /// トレイのメニューの 1 行目と tooltip に出す、収集の状態の文言。
@@ -269,11 +297,14 @@ fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
         },
         move |confirmed| {
             let app = app_for_answer;
-            let now_collecting = currently_collecting(&app);
             let Some(gate) = app.try_state::<QuitGate>() else {
                 return;
             };
-            match gate.answer(confirmed, prompted_collecting, now_collecting) {
+            let admission = CollectorQuitAdmission(
+                app.try_state::<AppState>()
+                    .map(|state| state.collect.clone()),
+            );
+            match gate.answer(confirmed, prompted_collecting, &admission) {
                 QuitAnswerDecision::Proceed => quit(app.clone()),
                 QuitAnswerDecision::AskAgain => prompt_quit(&app, true),
                 QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {}

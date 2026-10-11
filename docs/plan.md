@@ -42,6 +42,7 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 2026-10-12: §5 の #392 に A2 のオーナー決定（トレイの左クリックを両アプリで「窓を戻す」に揃える、banto-hub にも終了の
 二重防止 `QuitGate`、OS 終了で banto-hub が `RunningHub::shutdown` を通らない件は #586、ログオン時の自動起動は B）と、
 #383 段階3 の P6 で分かったこと（Hub 側の収集だけが止まった場合のイベントは Hub 側に出る。このままでよい）を追記。
+同日: §5 の #392 A2 の実装の細部に、トレイの「終了」の確定を収集の開始と直列化したこと（終了の受付の印、#392 A2 レビュー）を追記。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -607,6 +608,21 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
         終了する（プロセスは残さない。banto-hub の「アプリを終了」も停止の結果にかかわらず終了する）。
       - **トレイ常駐でも、ログオン時の自動起動は無い**（A の範囲外。プロセスを起動しない限り収集しないのは
         従来どおり）。UI からの独立（R0 §4 の「UI と独立」）は B で満たす。
+      - **終了の確定と収集の開始の直列化**（#392 A2 レビュー、2026-10-12。両アプリ共通）: 「収集していない」
+        文言で同意した後、答えのコールバックが状態を読んでから終了処理へ進むまでの間に、別のタスクが収集を
+        開始できると、新しく始まった収集を再確認なしで止めて終了してしまう（`QuitGate` の Mutex は確認の段階
+        しか守らない）。そこで**収集の開始を受け付ける側**に「終了の受付」の印を持たせた:
+        banto-hub は `CollectionController`（印は `state` ロックの中。`Starting` を書く区間で印を見る）、
+        ChronoGazer は `CollectorService`（印と「受け付け済みでまだ処理し終えていない開始の数」を 1 本の
+        ロックで持ち、開始はキューへ投入する前に印を見る。数はコマンドに持たせた札で、状態を公開した後に
+        減る）。トレイの答えは `QuitGate::answer` が `QuitAdmission::begin_quit`（印を立てて、同じロックの中で
+        忙しいかを読む）を 1 回だけ呼び、確かめ直す（`AskAgain`）ときは印を下ろす。キャンセルでは立てず、
+        終了処理に入ったら下ろさない。印が立っている間の開始は**明示的に断る**（banto-hub: REST の
+        `start`・`start-all-simulation`・走行中の `mode` 切り替えは 409、MCP はツールエラー。ChronoGazer:
+        REST・Tauri の `start`/`restart` と自動開始は「終了処理中のため、収集を開始できません」のエラー）。
+        停止は断らない。終了処理（banto-hub の `RunningHub::shutdown`、ChronoGazer の `shutdown_app_state`・
+        `banto-serve` の終了）も先頭で印を立てる（Windows サービスの停止・OS のシャットダウンの経路でも、
+        終了処理の途中で開始されない）。
   - **順序**: #383 段階3 を先に進め、#392 の A1 は並行。B1 は P3 の後。
   - 要件側は [recorder-requirements.md](recorder-requirements.md) §3.1・§4 に反映済み。
 

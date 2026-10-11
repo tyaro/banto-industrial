@@ -364,6 +364,10 @@ async fn main() {
         .await
         .expect("failed to listen for ctrl-c");
     println!("banto-serve: shutting down");
+    // #392 A2 レビュー: 終了の受付の印を立て、以降の開始（まだ止めていない
+    // REST・遅れて動いた自動開始）を断る。下ろさない（`collect` の doc
+    // 「終了の受付」。`src-tauri` の `shutdown_app_state` と同じ）。
+    let _ = collect.begin_quit();
     server.stop().await;
     if let Some(handle) = &audit_spool_handle {
         // 流し込みの途中で止めても、ファイルは行が入ってから消すので失われない

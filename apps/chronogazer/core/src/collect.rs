@@ -565,6 +565,42 @@
 //! そのまま続く**。プロセスがその直後に終わるので実害は無い - 途中で
 //! 切り上げても、失われうるのは最後の未 flush 分だけ（固まる方が悪い）。
 //!
+//! # 終了の受付 - 開始の受付と終了の確定を直列にする（#392 A2 レビュー、2026-10-12）
+//!
+//! トレイの「終了」は、「収集していない」文言で同意を取ったら止めずに終了
+//! する。その確認と終了の確定の間に別のタスク（REST・Tauri の
+//! `collect_start`/`collect_restart`・起動時の自動開始）が開始を受け付けると、
+//! **新しく始まった収集を再確認なしで止めて終了**してしまう。そこで、この
+//! サービスが「終了受付中」の印と「受け付け済みでまだ終わっていない開始の
+//! 数」を 1 本のロック（[`CollectorContext::admission`]）で持つ:
+//!
+//! * **開始の受付**（[`CollectorService::start`]・[`CollectorService::restart`]、
+//!   自動開始も `start` を通る）は、キューへ投入する**前に**このロックの中で
+//!   印を確かめ、立っていれば [`QUIT_IN_PROGRESS_MESSAGE`] の **`Err`** で断る
+//!   （黙って捨てない。投入していないので「この操作は実行されていません」と
+//!   言い切れる - [`ENQUEUE_BUSY_MESSAGE`] と同じ扱い）。立っていなければ
+//!   受付数を 1 増やし、その札（`StartTicket`）を**コマンドに持たせて**
+//!   投入する。札はタスクがその開始を処理し終えて**状態を公開した後**に
+//!   落ち（受付数を 1 減らす）、投入に失敗したとき・タスクが居なくなって
+//!   キューごと捨てられたときも `Drop` で必ず落ちる。
+//! * **[`CollectorService::begin_quit`]** は同じロックの中で印を立て、
+//!   「受付数が 1 以上か、状態が `Starting`/`Running`」を返す。
+//!
+//! 受付（印の確認と受付数の増加）と `begin_quit`（印を立てて受付数と状態を
+//! 読む）が同じロックの下にあり、受付数が 0 に戻るのは状態の公開の後なので、
+//! どちらが先でも「黙って止める」結果にならない: 開始が先なら `begin_quit` は
+//! 「忙しい」（トレイは「収集中」の文言で確かめ直し、印を下ろす =
+//! [`CollectorService::cancel_quit`]）、`begin_quit` が先なら開始が断られる。
+//! キューの中で待っている開始（まだ `Starting` を公開していない）も受付数で
+//! 数えるので見落とさない。印を立てるのに**キューを通らない**のは、トレイの
+//! 答えのコールバックを、走っている開始（応答しない接続先へのダイヤルを
+//! 含む）の後ろで待たせないため。停止（`stop`）は断らない。
+//!
+//! 印は終了処理（`src-tauri` の `shutdown_app_state`・`banto-serve` の
+//! 終了）も先頭で立てる（下ろさない）- OS のシャットダウンで
+//! `RunEvent::Exit` から後始末に入った場合も、後始末の途中で開始が受け付け
+//! られて、止めたはずの収集が閉じかけた DB の上で動き出すことは無い。
+//!
 //! # 保持期間（`retention.days`）について
 //!
 //! `crate::settings::StoreSettings` が `data.dir` / `retention.days` を持つ。
@@ -839,6 +875,14 @@ impl CollectorState {
     /// 済むだけの薄い述語。
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
+    }
+
+    /// 止めるべき収集があるか（走っている・開始中）。終了の確認の文言と
+    /// [`CollectorService::begin_quit`] の「忙しいか」の判定に使う（#392 A2）。
+    /// 開始中も含める（開始処理は止めないと走り切ってしまう）。対象 0 件・
+    /// 開始失敗・停止中はエンジンが無いので含めない。
+    pub fn is_collecting(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Starting)
     }
 
     /// 監査ログ用の短い識別子。**`serde` が付けるタグと同じ綴り**（上の
@@ -1361,10 +1405,46 @@ pub struct CollectEventList {
 /// **読み取りはこの enum に入れない**（#408 レビュー P2-1）。理由は
 /// [`ReadCommand`] と、このモジュールの doc「読み取りと操作でキューを
 /// 分ける」。
+///
+/// 開始を含む 2 つ（`Start`・`Restart`）は、受付の札（[`StartTicket`]）を
+/// 一緒に運ぶ（このモジュールの doc「終了の受付」）。
 enum Command {
-    Start(oneshot::Sender<Result<CollectorState, BantoError>>),
+    Start(
+        oneshot::Sender<Result<CollectorState, BantoError>>,
+        StartTicket,
+    ),
     Stop(oneshot::Sender<Result<CollectorState, BantoError>>),
-    Restart(oneshot::Sender<Result<CollectorState, BantoError>>),
+    Restart(
+        oneshot::Sender<Result<CollectorState, BantoError>>,
+        StartTicket,
+    ),
+}
+
+/// 終了の受付の印と、受け付け済みでまだ終わっていない開始の数（このモジュールの
+/// doc「終了の受付」）。[`CollectorContext::admission`] の中身。
+#[derive(Debug, Default)]
+struct Admission {
+    /// 終了受付中。立っている間の開始（`start`・`restart`）は
+    /// [`QUIT_IN_PROGRESS_MESSAGE`] で断る。
+    quitting: bool,
+    /// 受け付けた（[`StartTicket`] を払い出した）が、まだ処理し終えていない
+    /// 開始の数。
+    pending_starts: usize,
+}
+
+/// 開始の受付の札。払い出すと [`Admission::pending_starts`] が 1 増え、
+/// `Drop` で 1 減る。コマンドに入れて運び、タスクがその開始を処理して状態を
+/// 公開した後に落とす。投入に失敗した・キューごと捨てられた場合も、
+/// コマンドと一緒に落ちるので数え残しが無い。
+struct StartTicket {
+    ctx: Arc<CollectorContext>,
+}
+
+impl Drop for StartTicket {
+    fn drop(&mut self) {
+        let mut admission = self.ctx.admission();
+        admission.pending_starts = admission.pending_starts.saturating_sub(1);
+    }
 }
 
 /// ライフサイクルタスクへの**読み取り**の依頼。**[`Command`] とは別のチャネル**
@@ -1512,6 +1592,13 @@ const ENQUEUE_BUSY_MESSAGE: &str =
     "収集の操作を受け付けられませんでした（処理が混み合っています）。\
      前の操作が終わるのを待って、もう一度お試しください（この操作は実行されていません）";
 
+/// 終了の受付の印が立っている間（トレイの「終了」に同意した後・終了処理中）に
+/// 開始（`start`・`restart`）を断ったときの文言。投入していないので
+/// 「実行されていない」と言い切る（[`ENQUEUE_BUSY_MESSAGE`] と同じ扱い）。
+/// テストが等値で固定するため定数にする。
+pub const QUIT_IN_PROGRESS_MESSAGE: &str =
+    "終了処理中のため、収集を開始できません（この操作は実行されていません）";
+
 /// ライフサイクルタスクが居なくなっていた（= panic した。通常は起こらない）
 /// ときの文言。**[`ENQUEUE_BUSY_MESSAGE`] と読み分けられること**が要点で、
 /// どちらも「実行されていない」が、後者は再試行で直らない。
@@ -1593,6 +1680,12 @@ struct CollectorContext {
     /// 状態と現在値ハンドルを**1 本のロックに同居**させている理由は、この
     /// モジュールの doc「ライフサイクルは専用タスクが所有する」の末尾。
     published: Mutex<Published>,
+    /// 終了の受付の印と、受け付け済みの開始の数（このモジュールの doc
+    /// 「終了の受付」）。**開始の受付と [`CollectorService::begin_quit`] を
+    /// 直列にするロック**。中で `published` を読むことがある（順序は
+    /// `admission` → `published` の一方向。`published` を握ったまま
+    /// こちらを取る経路は無い）。
+    admission: Mutex<Admission>,
     /// Hub 経由の接続の値の出どころ（#383 段階3 P3）。**設定された実行形態
     /// だけ**（デスクトップ。[`CollectorService::attach_hub`]）。無ければ hub
     /// 接続は `hubSourceUnavailable` で外す。一度入れたら差し替えない。
@@ -1656,6 +1749,15 @@ struct Published {
 }
 
 impl CollectorContext {
+    /// [`Self::admission`] のロック。中身は数と真偽だけで、ロック中に panic
+    /// しても壊れた値は残らないので、毒化は無視して中身を使う（札の `Drop`
+    /// が panic の巻き戻し中に呼ばれても二重 panic にしないため）。
+    fn admission(&self) -> std::sync::MutexGuard<'_, Admission> {
+        self.admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn state(&self) -> CollectorState {
         self.published
             .lock()
@@ -1794,6 +1896,7 @@ impl CollectorService {
                 writer: None,
             }),
             writer_gate: tokio::sync::Mutex::new(()),
+            admission: Mutex::new(Admission::default()),
             hub: OnceLock::new(),
             #[cfg(test)]
             start_gate: None,
@@ -1864,8 +1967,14 @@ impl CollectorService {
     /// [`CollectOutcome::pending`] が立つ（**打ち切りは失敗ではない**）。
     /// そのとき状態は [`CollectorState::Starting`] のままで、起動処理は
     /// タスク側で続いている。
+    ///
+    /// 終了の受付の印が立っていれば（[`Self::begin_quit`]）、投入せずに
+    /// [`QUIT_IN_PROGRESS_MESSAGE`] の `Err` を返す（このモジュールの doc
+    /// 「終了の受付」）。
     pub async fn start(&self) -> Result<CollectOutcome, BantoError> {
-        self.lifecycle(Command::Start).await
+        let ticket = self.admit_start()?;
+        self.lifecycle(move |reply| Command::Start(reply, ticket))
+            .await
     }
 
     /// 収集を停止する。**走っていなければ何もしない**（冪等）- 状態にも
@@ -1897,8 +2006,44 @@ impl CollectorService {
     /// **レジストリ（接続・グループ・タグ）の変更を収集へ反映する唯一の口**
     /// でもある - CRUD が自動でこれを呼ぶことはしない（理由はこのモジュールの
     /// doc「起動時の自動開始と、「収集を再起動」だけが反映の口であること」）。
+    ///
+    /// 開始を含むので、終了の受付の印が立っていれば [`Self::start`] と同じく
+    /// 投入せずに断る（止めもしない - 止めるのは終了処理の仕事）。
     pub async fn restart(&self) -> Result<CollectOutcome, BantoError> {
-        self.lifecycle(Command::Restart).await
+        let ticket = self.admit_start()?;
+        self.lifecycle(move |reply| Command::Restart(reply, ticket))
+            .await
+    }
+
+    /// 終了の受付の印を立て、**開始の受付と同じロックの中で**、今忙しいか
+    /// （受け付け済みでまだ終わっていない開始がある、または状態が
+    /// `Starting`/`Running`）を返す（このモジュールの doc「終了の受付」）。
+    /// 以降の `start`/`restart` は [`QUIT_IN_PROGRESS_MESSAGE`] で断られる。
+    /// 冪等。キューを通らないので待たされない。
+    pub fn begin_quit(&self) -> bool {
+        let mut admission = self.inner.ctx.admission();
+        admission.quitting = true;
+        admission.pending_starts > 0 || self.inner.ctx.state().is_collecting()
+    }
+
+    /// 終了の受付の印を下ろし、開始を再び受け付ける。トレイが「収集中」の
+    /// 文言でもう一度確かめるとき（`AskAgain`）だけ使う。終了処理に入った
+    /// 後は呼ばない。
+    pub fn cancel_quit(&self) {
+        self.inner.ctx.admission().quitting = false;
+    }
+
+    /// 開始の受付（このモジュールの doc「終了の受付」）。印が立っていれば
+    /// `Err`、立っていなければ受付数を 1 増やして札を返す。
+    fn admit_start(&self) -> Result<StartTicket, BantoError> {
+        let mut admission = self.inner.ctx.admission();
+        if admission.quitting {
+            return Err(BantoError::Other(QUIT_IN_PROGRESS_MESSAGE.to_string()));
+        }
+        admission.pending_starts += 1;
+        Ok(StartTicket {
+            ctx: self.inner.ctx.clone(),
+        })
     }
 
     /// 現在の状態（**内部・診断用**）。**ネットワークもディスクも DB も
@@ -2258,7 +2403,7 @@ impl CollectorService {
     /// [`LIFECYCLE_GONE_MESSAGE`] の `Err`。ここは C-2 から変えていない。
     async fn lifecycle(
         &self,
-        make: fn(oneshot::Sender<Result<CollectorState, BantoError>>) -> Command,
+        make: impl FnOnce(oneshot::Sender<Result<CollectorState, BantoError>>) -> Command,
     ) -> Result<CollectOutcome, BantoError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         // --- 1. 投入（ここで返る = 何も起きていない）---
@@ -2334,6 +2479,42 @@ impl CollectorService {
         svc
     }
 
+    /// **テスト専用**: ライフサイクルタスクを起こさず、2 本のチャネルの
+    /// **受信側を呼び出し元へ渡す**（取り出さない限りコマンドはキューに
+    /// 残る）。「開始を受け付けてキューに入ったが、タスクがまだ取り出して
+    /// いない」（状態は `Stopped` のまま）を作るためのもの
+    /// （このモジュールの doc「終了の受付」）。
+    #[cfg(test)]
+    fn new_for_test_with_parked_lifecycle(
+        pool: SqlitePool,
+        data_dir: PathBuf,
+    ) -> (Self, mpsc::Receiver<Command>, mpsc::Receiver<ReadCommand>) {
+        let svc = Self::build(
+            pool,
+            data_dir,
+            Arc::new(SystemClock),
+            CollectorOptions::default(),
+            banto_collect::default_client_factory(),
+        );
+        let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
+        let (reads, read_rx) = mpsc::channel(READ_QUEUE_DEPTH);
+        if svc
+            .inner
+            .channels
+            .set(Channels { commands, reads })
+            .is_err()
+        {
+            panic!("組み立て直後なのにチャネルが既に入っている");
+        }
+        (svc, command_rx, read_rx)
+    }
+
+    /// **テスト専用**: 受け付け済みでまだ処理し終えていない開始の数。
+    #[cfg(test)]
+    fn pending_starts(&self) -> usize {
+        self.inner.ctx.admission().pending_starts
+    }
+
     /// [`Self::new_for_test`] と同じだが、起動処理を [`StartGate`] で
     /// 止められる（[`CollectorContext::start_gate`] の doc 参照）。
     #[cfg(test)]
@@ -2358,6 +2539,7 @@ impl CollectorService {
                 writer: None,
             }),
             writer_gate: tokio::sync::Mutex::new(()),
+            admission: Mutex::new(Admission::default()),
             hub: OnceLock::new(),
             start_gate: Some(gate),
         })
@@ -2421,14 +2603,22 @@ impl Lifecycle {
                         // `send` の `Err`（呼び出し側が待つのをやめた）は捨てる。
                         // **処理そのものはもう終わっている**ので、誰も受け取らなく
                         // ても状態と実体は一致している。
-                        Command::Start(reply) => {
-                            let _ = reply.send(self.start().await);
+                        //
+                        // 開始の札は**処理し終えて状態を公開した後**に落とす
+                        // （このモジュールの doc「終了の受付」- 落とした時点で
+                        // `begin_quit` は公開済みの状態を読める）。
+                        Command::Start(reply, ticket) => {
+                            let result = self.start().await;
+                            drop(ticket);
+                            let _ = reply.send(result);
                         }
                         Command::Stop(reply) => {
                             let _ = reply.send(self.stop().await);
                         }
-                        Command::Restart(reply) => {
-                            let _ = reply.send(self.restart().await);
+                        Command::Restart(reply, ticket) => {
+                            let result = self.restart().await;
+                            drop(ticket);
+                            let _ = reply.send(result);
                         }
                     }
                 }
@@ -4404,7 +4594,10 @@ mod tests {
         // 停止はまだゲートの中。ここで start をキューへ積む。
         let (reply_tx, reply_rx) = oneshot::channel();
         svc.commands()
-            .send(Command::Start(reply_tx))
+            .send(Command::Start(
+                reply_tx,
+                svc.admit_start().expect("開始を受け付ける"),
+            ))
             .await
             .map_err(|_| ())
             .expect("start をキューに積む");
@@ -4608,7 +4801,10 @@ mod tests {
         let mut fillers = Vec::new();
         loop {
             let (reply_tx, reply_rx) = oneshot::channel();
-            match svc.commands().try_send(Command::Start(reply_tx)) {
+            match svc.commands().try_send(Command::Start(
+                reply_tx,
+                svc.admit_start().expect("開始を受け付ける"),
+            )) {
                 Ok(()) => fillers.push(reply_rx),
                 Err(mpsc::error::TrySendError::Full(_)) => break,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -5633,5 +5829,153 @@ mod tests {
     fn blank_data_dir_falls_back_to_the_default_location() {
         let base = Path::new("C:/appdata");
         assert_eq!(resolve_data_dir(base, "   "), base.join("data"));
+    }
+
+    // --- 終了の受付（#392 A2 レビュー）------------------------------------
+
+    fn assert_quit_refusal(result: Result<CollectOutcome, BantoError>) {
+        match result {
+            Err(BantoError::Other(message)) => assert_eq!(message, QUIT_IN_PROGRESS_MESSAGE),
+            other => panic!("終了の受付中の開始が明示的に断られていない: {other:?}"),
+        }
+    }
+
+    /// 印が先: 立っている間の `start`/`restart` は**明示的なエラー**で断られ
+    /// （何も投入しない）、`stop` は断らない。印を下ろせば再び受け付ける。
+    #[tokio::test]
+    async fn starts_are_refused_while_quitting_and_accepted_after_cancel() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        seed_one_tag(&pool, "40001").await;
+
+        assert!(!svc.begin_quit(), "停止中で受付も無い = 暇");
+        assert_quit_refusal(svc.start().await);
+        assert_quit_refusal(svc.restart().await);
+        assert_eq!(svc.state(), CollectorState::Stopped);
+        assert_eq!(svc.pending_starts(), 0, "断った開始を数えに残さない");
+        svc.stop().await.expect("停止は断らない");
+
+        svc.cancel_quit();
+        let outcome = svc.start().await.expect("印を下ろせば開始できる");
+        assert!(outcome.status.is_running(), "{:?}", outcome.status);
+        assert_eq!(svc.pending_starts(), 0, "処理し終えた開始の札は落ちる");
+        svc.stop().await.expect("stop");
+    }
+
+    /// 開始が先（開始処理の最中）: `begin_quit` は「忙しい」を返し
+    /// （= トレイは「収集中」の文言で確かめ直す）、その後の開始は断られる。
+    /// 受け付け済みの開始は最後まで進む。
+    #[tokio::test]
+    async fn begin_quit_during_a_start_reports_busy() {
+        let dir = TempDir::new();
+        let pool = init_db_memory().await.expect("init_db_memory");
+        seed_one_tag(&pool, "40001").await;
+        let gate = Arc::new(StartGate::default());
+        let svc = CollectorService::new_for_test_gated(
+            pool.clone(),
+            dir.path().join("data"),
+            fast_options(),
+            offline_factory(),
+            gate.clone(),
+        );
+        let starter = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.start().await })
+        };
+        gate.entered.notified().await;
+        assert_eq!(svc.state(), CollectorState::Starting);
+
+        assert!(svc.begin_quit(), "開始中は忙しい側に数える");
+        assert_quit_refusal(svc.start().await);
+
+        gate.release.notify_one();
+        let outcome = starter
+            .await
+            .expect("join")
+            .expect("印より先に受け付けた開始は断らない");
+        assert!(outcome.status.is_running(), "{:?}", outcome.status);
+        assert_eq!(svc.pending_starts(), 0);
+        svc.stop().await.expect("stop");
+    }
+
+    /// 開始が先（キューの中で待っている、状態はまだ `Stopped`）: 状態だけを
+    /// 見ると「暇」に見えるが、受付数で「忙しい」と答える。札はコマンドと
+    /// 一緒に落ちる（タスクが居なくなってキューごと捨てられた場合も）。
+    #[tokio::test]
+    async fn a_start_waiting_in_the_queue_counts_as_busy() {
+        let dir = TempDir::new();
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let (svc, mut commands, _reads) =
+            CollectorService::new_for_test_with_parked_lifecycle(pool, dir.path().join("data"));
+        let starter = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.start().await })
+        };
+        // 投入されたコマンドを取り出して手元に持つ（= タスクがまだ処理して
+        // いない状態のまま、キューの中身を観測できる）。
+        let queued = commands.recv().await.expect("start が投入される");
+        assert!(matches!(queued, Command::Start(..)));
+        assert_eq!(svc.state(), CollectorState::Stopped);
+        assert_eq!(svc.pending_starts(), 1);
+
+        assert!(
+            svc.begin_quit(),
+            "キューで待っている開始を見落として「暇」と答えている"
+        );
+
+        // タスクが処理せずに捨てた（= 居なくなった）: 札が落ち、開始は
+        // `Err` で返る（黙って成功にしない、は従来どおり）。
+        drop(queued);
+        drop(commands);
+        let result = starter.await.expect("join");
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(svc.pending_starts(), 0, "捨てられたコマンドの札も落ちる");
+        assert!(!svc.begin_quit(), "数え残しが無ければ暇");
+    }
+
+    /// 開始と印を同時に走らせ、どの順に並んでも「印を立てた時点で暇
+    /// （= トレイは確認せずに終了へ進む）なのに、開始が受け付けられて収集が
+    /// 立ち上がった」組み合わせにならないこと。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_start_and_begin_quit_never_silently_stop_a_new_run() {
+        for _ in 0..20 {
+            let dir = TempDir::new();
+            let (pool, svc) = service(&dir).await;
+            seed_one_tag(&pool, "40001").await;
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let start = {
+                let svc = svc.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    svc.start().await
+                })
+            };
+            let quit = {
+                let svc = svc.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    svc.begin_quit()
+                })
+            };
+            let started = start.await.expect("join start");
+            let busy = quit.await.expect("join quit");
+            match started {
+                Ok(outcome) => {
+                    assert!(outcome.status.is_running(), "{:?}", outcome.status);
+                    assert!(
+                        busy,
+                        "開始が受け付けられたなら、begin_quit は忙しいと読んでいるはず"
+                    );
+                }
+                Err(err) => {
+                    assert_quit_refusal(Err(err));
+                    assert!(!busy);
+                    assert_eq!(svc.state(), CollectorState::Stopped);
+                }
+            }
+            svc.stop().await.expect("stop");
+        }
     }
 }

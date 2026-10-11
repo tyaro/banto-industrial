@@ -375,7 +375,21 @@ fn run_service_body(_arguments: Vec<OsString>) {
                 return;
             }
         };
-        let start_status = hub.controller().start(RunMode::Configured).await;
+        // 終了の受付（#392 A2 レビュー）の印を立てるのは、サービスのプロセスでは
+        // `RunningHub::shutdown` だけで、それはこの開始より後に呼ばれるため、
+        // ここで `Err` になる経路は今は無い。来ても「開始できなかった」ことに
+        // 変わりはないので、下の失敗と同じ作法で止める。
+        let start_status = match hub.controller().start(RunMode::Configured).await {
+            Ok(status) => status,
+            Err(refused) => {
+                log_err_line(&format!(
+                    "banto-hub: Configured 収集の開始に失敗しました: {refused}"
+                ));
+                hub.shutdown().await;
+                report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
+                return;
+            }
+        };
         if start_status.state != CollectionState::Running {
             log_err_line(&format!(
                 "banto-hub: Configured 収集の開始に失敗しました: {:?}",
