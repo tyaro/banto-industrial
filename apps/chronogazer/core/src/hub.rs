@@ -1202,6 +1202,27 @@ impl Subscription {
         self.mark_pending_if_changed(before)
     }
 
+    /// レジストリから読み直した購読の対象（有効な Hub 接続の下の登録済みのタグ）を
+    /// 入れ、**収集の需要もその中に絞る**（2026-10-11 オーナーレビュー P2）。
+    ///
+    /// 需要は収集の開始の時点の計画なので、収集中に Hub 接続を無効にした・タグを
+    /// 消したときに需要だけが古い名前を持ち続けると、和集合（[`wanted_set`]）が
+    /// 変わらず購読が続いてしまう（「無効なら購読しない」に反する）。需要は常に
+    /// 購読の対象の部分集合に保つ。外した名前は収集の側では「購読していない」＝
+    /// Bad + null として記録され（`banto_collect::external` の表の「name absent」）、
+    /// 「収集を再起動」で計画から外れる。集合が変われば旗を立てる（1 回の張り直し）。
+    ///
+    /// レジストリを差し込んだ実行形態（[`HubService::refresh_registered`]）だけが
+    /// 呼ぶ。レジストリの無いテスト・実機確認の example は [`Self::set_registered`]。
+    fn set_registered_from_registry(&mut self, names: Vec<String>) -> bool {
+        let names = normalized_names(names);
+        let before = wanted_set(&self.registered, &self.collect_demand);
+        self.collect_demand
+            .retain(|name| names.binary_search(name).is_ok());
+        self.registered = names;
+        self.mark_pending_if_changed(before)
+    }
+
     /// 収集の需要を差し替える。立て方は [`Self::set_registered`] と同じ
     /// （集合が変わったときだけ）。
     fn set_demand(&mut self, names: Vec<String>) -> bool {
@@ -1960,7 +1981,12 @@ impl HubService {
             return false;
         };
         match crate::hub_tags::subscribed_external_names(pool).await {
-            Ok(names) => self.inner.subscription.lock().await.set_registered(names),
+            Ok(names) => self
+                .inner
+                .subscription
+                .lock()
+                .await
+                .set_registered_from_registry(names),
             Err(err) => {
                 eprintln!(
                     "banto: 登録済みのHub経由のタグを読めませんでした（前の内容で購読を続けます）: {err}"
@@ -4852,6 +4878,102 @@ mod tests {
         set_enabled(true).await;
         hub.registry_changed().await;
         assert_eq!(hub.subscription().await.registered, owned(&["L.G.a"]));
+    }
+
+    /// 2026-10-11 オーナーレビュー P2: **収集中に** Hub 接続を無効にしたら購読から外れる。
+    /// 収集の需要（開始時の計画）に名前が残っていると和集合が変わらず購読が続いて
+    /// いたので、レジストリを読み直すときに需要も購読の対象の中に絞る。有効に戻すと
+    /// 登録済みとして戻る（需要は次の開始で作り直す）。
+    ///
+    /// 反証: `set_registered_from_registry` の `retain` を外すと、無効にした後も
+    /// 和集合に `L.G.a` が残って落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabling_the_hub_connection_while_collecting_drops_the_subscription() {
+        use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let settings = SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
+        let hub = HubService::new(settings, Arc::new(UnavailableKeyStore))
+            .await
+            .expect("HubService::new");
+        hub.attach_registry(pool.clone());
+        let connections = PlcConnectionService::new(pool.clone());
+        let registered = crate::hub_tags::register_from_hub(
+            &pool,
+            &connections,
+            &CollectionGroupService::new(pool.clone()),
+            &TagService::new(pool.clone()),
+            crate::hub_tags::HubTagRegistration {
+                collection_group_id: None,
+                new_group: Some(crate::hub_tags::NewHubGroup {
+                    name: "g".to_owned(),
+                    period_ms: 1000,
+                }),
+                tags: vec![crate::hub_tags::HubTagRow {
+                    external_name: "L.G.a".to_owned(),
+                    name: "a".to_owned(),
+                    data_type: "f32".to_owned(),
+                    unit: None,
+                    decimals: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(registered.ok);
+        assert!(hub.refresh_registered().await);
+
+        // 収集の開始（需要 = 開始の時点の計画）。
+        hub.answer_prepare_for_test(HubCollectReadiness::Ready { catalog: None });
+        hub.prepare_collect(owned(&["L.G.a"])).await;
+        let wanted = |slot: &Subscription| wanted_set(&slot.registered, &slot.collect_demand);
+        {
+            let mut slot = hub.inner.subscription.lock().await;
+            assert_eq!(wanted(&slot), owned(&["L.G.a"]));
+            slot.demand_pending = false;
+        }
+
+        let id = registered.connection_id.expect("hub connection");
+        let set_enabled = |enabled: bool| {
+            let connections = connections.clone();
+            async move {
+                let conn = connections.get(id).await.unwrap();
+                connections
+                    .update(
+                        id,
+                        banto_tags::PlcConnectionInput {
+                            name: conn.name,
+                            protocol: conn.protocol,
+                            host: conn.host,
+                            port: conn.port,
+                            unit_id: conn.unit_id,
+                            enabled,
+                            simulation: conn.simulation,
+                            word_order: conn.word_order,
+                            database: None,
+                            username: None,
+                            password: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        set_enabled(false).await;
+        assert!(
+            hub.refresh_registered().await,
+            "購読する集合が変わった（張り直しを 1 回予約する）"
+        );
+        {
+            let slot = hub.inner.subscription.lock().await;
+            assert!(wanted(&slot).is_empty(), "収集中でも購読から外れる");
+            assert!(slot.collect_demand.is_empty());
+            assert!(slot.demand_pending);
+        }
+
+        set_enabled(true).await;
+        assert!(hub.refresh_registered().await);
+        let slot = hub.inner.subscription.lock().await;
+        assert_eq!(wanted(&slot), owned(&["L.G.a"]), "有効に戻すと購読に戻る");
     }
 
     /// #383 段階3 P4（P3 の持ち越し）: 需要を開始時の計画に絞っても、需要が
