@@ -923,8 +923,8 @@
 	/**
 	 * `hub` = Hub 経由のタグ（#383 段階3 P4）。アドレスは Hub のタグ名（外部名）で、
 	 * **スケーリングの欄を出さない**（Hub は工学値を送るので、ここで換算すると二重に
-	 * なる。サーバーの `banto-tags` も断る）。欄が無ければ `buildTagInput` は
-	 * スケーリングを `null` で送る。
+	 * なる。サーバーの `banto-tags` も断る）。作成では `buildTagInput` が
+	 * スケーリングを `null` で送り、編集では編集前のタグの値をそのまま送る。
 	 */
 	function tagSchema(prefix: string, hub = false): FormSchema {
 		const scalingFields: FormSchema['fields'] = hub
@@ -1029,7 +1029,9 @@
 	async function handleCreateTag(values: Record<string, unknown>): Promise<void> {
 		creatingTag = true;
 		try {
-			await createTag(buildTagInput(TAG_CREATE, values, undefined, createTagIsHub));
+			await createTag(
+				buildTagInput(TAG_CREATE, values, undefined, createTagIsHub ? 'none' : 'form')
+			);
 			toastStore.push('success', '作成しました');
 			createTagStore = createFormStore(tagSchema(TAG_CREATE));
 			await reloadTags();
@@ -1214,7 +1216,20 @@
 				pending,
 				updateTag(
 					selectedTag.id,
-					buildTagInput(TAG_EDIT, editTagStore.values, selectedTag.revision, selectedTagIsHub)
+					buildTagInput(
+						TAG_EDIT,
+						editTagStore.values,
+						selectedTag.revision,
+						// Hub タグは画面に欄が無いので、編集前のタグが持つスケーリングをそのまま送る。
+						selectedTagIsHub
+							? {
+									rawLo: selectedTag.rawLo,
+									rawHi: selectedTag.rawHi,
+									engLo: selectedTag.engLo,
+									engHi: selectedTag.engHi
+								}
+							: 'form'
+					)
 				),
 				() => ({ id: selectedTag?.id, store: editTagStore })
 			);

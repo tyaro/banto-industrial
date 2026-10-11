@@ -57,6 +57,25 @@ export function resolveKeyLabel(key: string | null | undefined, names: KeyNames)
 }
 
 /**
+ * 名前の読み込みの競合を防ぐ（最後に始めた読み込みの結果だけを反映する）。
+ * 読み込みが重なると（開いたときと操作の後など）、遅く返った古い結果が新しい結果を
+ * 上書きしてしまうため、始めるたびに世代を進め、返ったときに世代が違えば捨てる。
+ * `load` は注入できる（テスト用）。
+ */
+export function createKeyNamesRefresher(
+	apply: (names: Map<string, string>) => void,
+	load: () => Promise<Map<string, string>> = loadKeyNames
+): () => Promise<void> {
+	let generation = 0;
+	return async () => {
+		generation += 1;
+		const mine = generation;
+		const names = await load();
+		if (mine === generation) apply(names);
+	};
+}
+
+/**
  * レジストリから名前を読む。一覧ごとに失敗を吸収する（読めなかった部分は空）。
  * デモモード（backend 無し）では何も読まない。
  */

@@ -83,7 +83,11 @@
 		type ConnectionView,
 		type Readout
 	} from '#lib/banto/collectAdmin.js';
-	import { loadKeyNames, resolveKeyLabel, type KeyNames } from '#lib/banto/collectNames.js';
+	import {
+		createKeyNamesRefresher,
+		resolveKeyLabel,
+		type KeyNames
+	} from '#lib/banto/collectNames.js';
 	import { errorMessage } from './shared';
 
 	const available = isCollectAvailable();
@@ -130,9 +134,10 @@
 	 */
 	let keyNames = $state<KeyNames>(new Map());
 
-	async function refreshKeyNames(): Promise<void> {
-		keyNames = await loadKeyNames();
-	}
+	/** 重なった読み込みは最後に始めたものだけを反映する（遅れて返った古い結果で上書きしない）。 */
+	const refreshKeyNames = createKeyNamesRefresher((names) => {
+		keyNames = names;
+	});
 
 	let busy = $state(false);
 	/** 明示操作の結果（受付・完了・打ち切り）。エラーとは別の行に出す。 */

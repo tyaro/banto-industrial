@@ -635,16 +635,49 @@ function numOrNull(v: unknown): number | null {
 }
 
 /**
+ * スケーリング 4 項目の出どころ:
+ * - `'form'`（既定）: フォームの欄の値（PLC 直結のタグ）。
+ * - `'none'`: 常に `null`（Hub 経由のタグの**作成**。PLC 用のグループを選んで入力した
+ *   後に Hub 用へ選び直しても、見えない欄の値を送らない）。
+ * - `{ rawLo, rawHi, engLo, engHi }`: その値をそのまま送る（Hub 経由のタグの**編集**。
+ *   画面に欄が無いので、編集前のタグが持っていた値を保つ。API で入れた恒等レンジ
+ *   rawLo=engLo=0・rawHi=engHi=100 は合法で、消すと計器・バーのレンジが未設定になる）。
+ */
+export type TagScalingSource =
+	| 'form'
+	| 'none'
+	| {
+			rawLo: number | null;
+			rawHi: number | null;
+			engLo: number | null;
+			engHi: number | null;
+	  };
+
+function scalingValue(
+	scaling: TagScalingSource,
+	values: Record<string, unknown>,
+	prefix: string,
+	field: 'rawLo' | 'rawHi' | 'engLo' | 'engHi'
+): number | null {
+	if (scaling === 'none') return null;
+	if (scaling === 'form') {
+		return numOrNull(values[`${prefix}${field.charAt(0).toUpperCase()}${field.slice(1)}`]);
+	}
+	return numOrNull(scaling[field]);
+}
+
+/**
  * フォームの値から送信用の `TagInput` を作る。`expectedRevision` を渡すと
  * 更新用（楽観ロック）、渡さないと作成用（版を持たない）。しきい値は載せない
- * （#532。載せるとサーバーが断る）。`hub` は Hub 経由のタグ（スケーリングを
- * 常に `null` で送る）。
+ * （#532。載せるとサーバーが断る）。
+ *
+ * `scaling` はスケーリング 4 項目の出どころ（`TagScalingSource`）。
  */
 export function buildTagInput(
 	prefix: string,
 	values: Record<string, unknown>,
 	expectedRevision?: number,
-	hub = false
+	scaling: TagScalingSource = 'form'
 ): TagInput {
 	const rawUnit = values[`${prefix}Unit`];
 	const unit = typeof rawUnit === 'string' ? rawUnit.trim() : '';
@@ -655,13 +688,10 @@ export function buildTagInput(
 		collectionGroupId: typeof collectionGroupId === 'number' ? collectionGroupId : 0,
 		address: String(values[`${prefix}Address`] ?? ''),
 		dataType: (values[`${prefix}DataType`] as TagDataType) ?? 'i16',
-		// Hub 経由のタグはスケーリングを持たない（欄を出さない）。作成フォームで
-		// PLC 用のグループを選んで入力した後に Hub 用のグループへ選び直しても、
-		// 見えない欄の値を送らない。
-		rawLo: hub ? null : numOrNull(values[`${prefix}RawLo`]),
-		rawHi: hub ? null : numOrNull(values[`${prefix}RawHi`]),
-		engLo: hub ? null : numOrNull(values[`${prefix}EngLo`]),
-		engHi: hub ? null : numOrNull(values[`${prefix}EngHi`]),
+		rawLo: scalingValue(scaling, values, prefix, 'rawLo'),
+		rawHi: scalingValue(scaling, values, prefix, 'rawHi'),
+		engLo: scalingValue(scaling, values, prefix, 'engLo'),
+		engHi: scalingValue(scaling, values, prefix, 'engHi'),
 		unit: unit === '' ? null : unit,
 		decimals: typeof decimals === 'number' ? decimals : 0,
 		enabled: Boolean(values[`${prefix}Enabled`])

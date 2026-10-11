@@ -516,13 +516,16 @@ describe('除外の一覧（#414 段階2）', () => {
 			expect(note?.guides[0].link).toBeNull();
 		});
 
-		it('hubTagNotFound / hubTagTypeChanged: タグ設定の「Hub から追加」で登録し直す案内（理由の並びは固定）', () => {
+		it('hubTagNotFound / hubTagTypeChanged: タグ設定でそのタグを編集して直す案内（削除・再登録は勧めない。理由の並びは固定）', () => {
 			const note = collectExclusionsNote(
 				running([hub('hubTagTypeChanged', 'tag:5'), hub('hubTagNotFound', 'tag:4')])
 			);
 			expect(note?.guides.map((g) => g.reason)).toEqual(['hubTagNotFound', 'hubTagTypeChanged']);
 			for (const guide of note?.guides ?? []) {
-				expect(guide.text).toContain('Hub から追加');
+				expect(guide.text).toContain('編集');
+				expect(guide.text).toContain('収集を再起動');
+				expect(guide.text).not.toContain('削除して');
+				expect(guide.text).not.toContain('登録し直');
 				expect(guide.link?.path).toBe('/tags');
 			}
 			// タグ設定での作業が要る理由なので、従来のリンク文も出す。

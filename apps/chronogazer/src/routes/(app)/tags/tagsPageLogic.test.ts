@@ -755,11 +755,39 @@ describe('tagFormValues -> buildTagInput', () => {
 		};
 		const plc = buildTagInput('tagCreate', values);
 		expect([plc.rawLo, plc.rawHi, plc.engLo, plc.engHi]).toEqual([0, 4095, 0, 100]);
-		const hub = buildTagInput('tagCreate', values, undefined, true);
+		const hub = buildTagInput('tagCreate', values, undefined, 'none');
 		expect([hub.rawLo, hub.rawHi, hub.engLo, hub.engHi]).toEqual([null, null, null, null]);
 		// ほかの項目は変わらない。
 		expect(hub.address).toBe(plc.address);
 		expect(hub.decimals).toBe(plc.decimals);
+	});
+
+	it('#383 P5 レビュー: Hub タグの編集は編集前のスケーリング（恒等レンジ）を保つ', () => {
+		const identity = { rawLo: 0, rawHi: 100, engLo: 0, engHi: 100 };
+		const values = {
+			...tagFormValues('tagEdit', SAMPLE_TAG),
+			tagEditName: '改名後',
+			tagEditUnit: '%'
+		};
+		const hub = buildTagInput('tagEdit', values, 5, identity);
+		expect([hub.rawLo, hub.rawHi, hub.engLo, hub.engHi]).toEqual([0, 100, 0, 100]);
+		expect(hub.name).toBe('改名後');
+		expect(hub.unit).toBe('%');
+		expect(hub.expectedRevision).toBe(5);
+		// 編集前に無かった（null）なら null のまま。
+		const none = buildTagInput('tagEdit', values, 5, {
+			rawLo: null,
+			rawHi: null,
+			engLo: null,
+			engHi: null
+		});
+		expect([none.rawLo, none.rawHi, none.engLo, none.engHi]).toEqual([null, null, null, null]);
+	});
+
+	it('#383 P5 レビュー: PLC タグは従来どおりフォームの値を送る', () => {
+		const values = { ...tagFormValues('tagEdit', SAMPLE_TAG), tagEditRawHi: 4095 };
+		expect(buildTagInput('tagEdit', values, 1, 'form').rawHi).toBe(4095);
+		expect(buildTagInput('tagEdit', values, 1).rawHi).toBe(4095);
 	});
 
 	it('既存の項目（単位の trim・空単位は null・小数桁）は変わらない', () => {

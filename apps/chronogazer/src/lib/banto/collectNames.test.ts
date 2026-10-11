@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildKeyNames, resolveKeyLabel } from './collectNames';
+import { buildKeyNames, createKeyNamesRefresher, resolveKeyLabel } from './collectNames';
 
 describe('buildKeyNames / resolveKeyLabel（キー → 名前、#383 P5）', () => {
 	const names = buildKeyNames({
@@ -51,5 +51,42 @@ describe('buildKeyNames / resolveKeyLabel（キー → 名前、#383 P5）', () 
 
 	it('名前が読めていない（空の対応表）ときも全部キーのまま', () => {
 		expect(resolveKeyLabel('conn:1', new Map())).toBe('conn:1');
+	});
+});
+
+describe('createKeyNamesRefresher（重なった読み込みは最後に始めたものだけ反映、#383 P5 レビュー）', () => {
+	function deferred() {
+		let resolve!: (v: Map<string, string>) => void;
+		const promise = new Promise<Map<string, string>>((r) => (resolve = r));
+		return { promise, resolve };
+	}
+
+	it('遅く返った古い結果は新しい結果を上書きしない', async () => {
+		const first = deferred();
+		const second = deferred();
+		const queue = [first, second];
+		let applied: Map<string, string> | null = null;
+		const refresh = createKeyNamesRefresher(
+			(names) => (applied = names),
+			() => queue.shift()!.promise
+		);
+		const a = refresh();
+		const b = refresh();
+		second.resolve(new Map([['conn:1', '新']]));
+		await b;
+		first.resolve(new Map([['conn:1', '旧']]));
+		await a;
+		expect(applied).toEqual(new Map([['conn:1', '新']]));
+	});
+
+	it('重ならなければ毎回反映する', async () => {
+		const seen: string[] = [];
+		const refresh = createKeyNamesRefresher(
+			(names) => seen.push(names.get('k') ?? ''),
+			async () => new Map([['k', 'v']])
+		);
+		await refresh();
+		await refresh();
+		expect(seen).toEqual(['v', 'v']);
 	});
 });

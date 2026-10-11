@@ -54,7 +54,11 @@
 		isCollectAvailable,
 		type CollectEventRow
 	} from '#lib/banto/collectAdmin.js';
-	import { loadKeyNames, resolveKeyLabel, type KeyNames } from '#lib/banto/collectNames.js';
+	import {
+		createKeyNamesRefresher,
+		resolveKeyLabel,
+		type KeyNames
+	} from '#lib/banto/collectNames.js';
 
 	const available = isCollectAvailable();
 
@@ -64,9 +68,10 @@
 	 */
 	let keyNames = $state<KeyNames>(new Map());
 
-	async function refreshKeyNames(): Promise<void> {
-		keyNames = await loadKeyNames();
-	}
+	/** 重なった読み込みは最後に始めたものだけを反映する（遅れて返った古い結果で上書きしない）。 */
+	const refreshKeyNames = createKeyNamesRefresher((names) => {
+		keyNames = names;
+	});
 
 	/**
 	 * 列は `CollectEventRow` のフィールドそのまま（`detail` は**そもそも
