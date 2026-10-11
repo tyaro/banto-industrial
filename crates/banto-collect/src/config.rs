@@ -410,6 +410,26 @@ impl CollectorConfig {
             .iter()
             .any(|conn| conn.config == ProtocolConfig::External)
     }
+
+    /// #383 段階3 P4: every external name this config actually samples from
+    /// an external (`"hub"`) connection, sorted and without duplicates. For a
+    /// config from the lenient build this is the post-reconciliation set - a
+    /// tag left out against the Hub catalog (`hubTagNotFound` /
+    /// `hubTagTypeChanged`) is not in it - so a caller can narrow the demand
+    /// it raised before the build to what is really collected, without
+    /// another round-trip to the Hub. Empty for a PLC-only config.
+    pub fn external_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .connections
+            .iter()
+            .filter(|conn| conn.config == ProtocolConfig::External)
+            .flat_map(|conn| conn.groups.iter())
+            .flat_map(|group| group.external_names.iter().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// #383 段階3 P3: the Hub catalog the lenient build reconciles hub tags
@@ -2602,6 +2622,9 @@ mod tests {
             },
         );
         assert!(config.has_external_connections());
+        // P4: the post-reconciliation set - the vanished and retyped tags are
+        // not sampled, so they are not in it.
+        assert_eq!(config.external_names(), vec!["PLC9.G.Temp".to_string()]);
         let keys: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
         let (plc_key, hub_key) = (format!("conn:{plc_id}"), format!("conn:{hub_id}"));
         assert_eq!(keys, vec![plc_key.as_str(), hub_key.as_str()]);
@@ -2690,6 +2713,7 @@ mod tests {
             },
         );
         assert!(!config.has_external_connections());
+        assert!(config.external_names().is_empty());
         let keys: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
         assert_eq!(keys, vec![plc_key.as_str()]);
         assert!(config

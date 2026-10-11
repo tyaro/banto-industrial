@@ -45,7 +45,10 @@ use chronogazer_core::display_groups::{
 };
 use chronogazer_core::events::event_channel;
 // #532: 記録計の側のタグごとのしきい値。検証・保存は REST と同じ `TagThresholdService`。
-use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
+use chronogazer_core::hub::{HubCatalogView, HubService, HubSubscriptionView, HubView};
+use chronogazer_core::hub_tags::{
+    register_from_hub, registration_audit_detail, HubRegistrationResult, HubTagRegistration,
+};
 use chronogazer_core::rest::{
     api_router, plc_connection_audit_detail, update_plc_connection, user_auth_state,
     CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, TagPayload,
@@ -2412,13 +2415,14 @@ async fn users_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> 
 // （R0 §3.6: viewer-read / editor-write）・同じ監査内容（`origin: "tauri"`
 // のみ異なる）。手本は relay-wright の `src-tauri/src/lib.rs` 同名セクション。
 
-/// #383 段階2a: chronogazer は `"modbus-tcp"`/`"slmp"` だけを受け付ける。
+/// #383 段階2a: chronogazer は `"modbus-tcp"`/`"slmp"` と（#383 段階3 P4 から）
+/// `"hub"` だけを受け付ける。
 /// `chronogazer_core::rest::reject_disallowed_connection_protocol`の doc
 /// comment と同じ理由。REST 側と Tauri 側の両方から呼ぶ - 片方だけに書くと
 /// もう片方の経路から `"virtual"`/`"postgres"` 接続を作れてしまう
 /// （invariant: 両経路対称）。
 fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoError> {
-    const ALLOWED: [&str; 2] = ["modbus-tcp", "slmp"];
+    const ALLOWED: [&str; 3] = ["modbus-tcp", "slmp", "hub"];
     if ALLOWED.contains(&protocol) {
         return Ok(());
     }
@@ -2487,6 +2491,8 @@ async fn plc_connections_create_body(
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(PlcConnectionResponse::from(created))
 }
 
@@ -2535,6 +2541,8 @@ async fn plc_connections_update_body(
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(PlcConnectionResponse::from(updated))
 }
 
@@ -2617,6 +2625,8 @@ async fn plc_connections_delete(state: State<'_, AppState>, id: i64) -> Result<(
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(())
 }
 
@@ -2664,6 +2674,8 @@ async fn collection_groups_create(
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(created)
 }
 
@@ -2708,6 +2720,8 @@ async fn collection_groups_update_body(
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(updated)
 }
 
@@ -2731,6 +2745,8 @@ async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(())
 }
 
@@ -2783,6 +2799,8 @@ async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, Ba
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(created)
 }
 
@@ -2832,6 +2850,8 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(updated)
 }
 
@@ -2862,6 +2882,8 @@ async fn tags_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
             result: "ok",
         })
         .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
+    state.hub.registry_changed().await;
     Ok(())
 }
 
@@ -3419,29 +3441,95 @@ async fn hub_refresh_catalog(state: State<'_, AppState>) -> Result<HubView, Bant
     state.hub.refresh_catalog().await
 }
 
-/// 選択タグの保存。空配列も正当な入力。`admin` 限定。
+/// 「Hub から追加」のダイアログ用（#383 段階3 P4）: catalog・登録済みの
+/// 外部名・移行前の選択。**`editor` 以上**（タグの登録と同じ下限。接続先と
+/// キー名は返さない - `hub_status` は `admin` 限定のまま）。REST の
+/// `GET /api/hub/catalog` と同じ。
 #[tauri::command]
-async fn hub_set_selected_tags(
-    state: State<'_, AppState>,
-    tags: Vec<String>,
-) -> Result<(), BantoError> {
-    let actor = require_hub_admin(&state).await?;
-    let count = tags.len();
-    state.hub.set_selected_tags(tags).await?;
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "settings_change",
-            resource: "settings",
-            entity_id: None,
-            detail: Some(serde_json::json!({ "hubSelectedTagCount": count })),
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
+async fn hub_catalog(state: State<'_, AppState>) -> Result<HubCatalogView, BantoError> {
+    hub_catalog_body(&state).await
+}
+
+async fn hub_catalog_body(state: &AppState) -> Result<HubCatalogView, BantoError> {
+    require_role(state, Role::Editor, "tags").await?;
+    state.hub.catalog_for_registration().await
+}
+
+/// 移行前の選択を使わずに消す（#383 段階3 P4、ダイアログの「以前の選択を
+/// 使わない」）。`editor` 以上。消したときだけ監査する（REST の
+/// `POST /api/hub/legacy-selection/dismiss` と同じ）。
+#[tauri::command]
+async fn hub_dismiss_legacy_selection(state: State<'_, AppState>) -> Result<(), BantoError> {
+    hub_dismiss_legacy_selection_body(&state).await
+}
+
+async fn hub_dismiss_legacy_selection_body(state: &AppState) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "settings").await?;
+    if state.hub.clear_legacy_selection().await? {
+        state
+            .audit
+            .record(AuditEntry {
+                actor_username: Some(&actor.username),
+                actor_role: Some(actor.role.as_str()),
+                action: "settings_change",
+                resource: "settings",
+                entity_id: None,
+                detail: Some(serde_json::json!({
+                    "hubLegacySelectionCleared": true,
+                    "reason": "dismissed"
+                })),
+                origin: "tauri",
+                result: "ok",
+            })
+            .await;
+    }
     Ok(())
+}
+
+/// Hub のカタログから選んだタグを登録する（#383 段階3 P4）。`editor` 以上。
+/// 規則と応答（検証の不合格は `ok: false` の通常の応答）は
+/// `chronogazer_core::hub_tags` のモジュール doc。REST の
+/// `POST /api/tags/from-hub` と同じ関数を呼ぶ。
+#[tauri::command]
+async fn tags_register_from_hub(
+    state: State<'_, AppState>,
+    input: HubTagRegistration,
+) -> Result<HubRegistrationResult, BantoError> {
+    tags_register_from_hub_body(&state, input).await
+}
+
+async fn tags_register_from_hub_body(
+    state: &AppState,
+    input: HubTagRegistration,
+) -> Result<HubRegistrationResult, BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    let mut result = register_from_hub(
+        &state.pool,
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        input,
+    )
+    .await?;
+    if result.ok {
+        state
+            .audit
+            .record(AuditEntry {
+                actor_username: Some(&actor.username),
+                actor_role: Some(actor.role.as_str()),
+                action: "create",
+                resource: "tags",
+                entity_id: None,
+                detail: Some(registration_audit_detail(&result)),
+                origin: "tauri",
+                result: "ok",
+            })
+            .await;
+        state.hub.registry_changed().await;
+        result.legacy_selection_cleared =
+            chronogazer_core::rest::clear_legacy_selection_after_registration(&state.hub).await;
+    }
+    Ok(result)
 }
 
 /// ロックダウン済み Hub 向けの手動連携: 管理者が発行した API キーを採用
@@ -4351,6 +4439,8 @@ pub fn run() {
                 std::sync::Arc::new(keyring_store::KeyringKeyStore),
             ))
             .expect("HubService should initialize");
+            // #383 段階3 P4: 購読の対象（登録済みの hub タグ）をレジストリから読む。
+            hub.attach_registry(pool.clone());
 
             // #383 段階1: 保存済みの接続と選択タグがあれば、設定画面を
             // 開かなくても購読を張り直す。Hub が落ちている・キーが無効に
@@ -4557,7 +4647,9 @@ pub fn run() {
             hub_subscription,
             hub_connect,
             hub_refresh_catalog,
-            hub_set_selected_tags,
+            hub_catalog,
+            hub_dismiss_legacy_selection,
+            tags_register_from_hub,
             hub_adopt_manual_key,
             hub_disconnect,
             plc_connections_list,
@@ -4840,6 +4932,8 @@ mod tests {
         )
         .await
         .expect("HubService::new");
+        // #383 段階3 P4: 本番の起動（`setup`）と同じくレジストリを差し込む。
+        hub.attach_registry(pool.clone());
         AppState {
             auth: Mutex::new(AuthSlot::default()),
             auth_config_lock: AsyncMutex::new(()),
@@ -5707,6 +5801,105 @@ mod tests {
             word_order: String::new(),
             simulation,
         }
+    }
+
+    /// #383 段階3 P4（REST の `a_hub_connection_can_be_created_once_and_deleted_only_when_empty`
+    /// と `tags_from_hub_registers_rows_and_reports_per_row_errors` の双子）:
+    /// Tauri 経路でも `hub` 接続を作れ（2 つ目は断る）、「Hub から追加」で
+    /// 登録でき、ダイアログの catalog は editor が読める（viewer は不可）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hub_connections_and_hub_registration_work_over_tauri() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+        state.set_session_for_test(Some(DesktopSession::Account(editor)));
+
+        let row = |external_name: &str, name: &str, data_type: &str| {
+            chronogazer_core::hub_tags::HubTagRow {
+                external_name: external_name.to_owned(),
+                name: name.to_owned(),
+                data_type: data_type.to_owned(),
+                unit: None,
+                decimals: None,
+            }
+        };
+        let registered = tags_register_from_hub_body(
+            &state,
+            HubTagRegistration {
+                collection_group_id: None,
+                new_group: Some(chronogazer_core::hub_tags::NewHubGroup {
+                    name: "hub-g".to_owned(),
+                    period_ms: 1000,
+                }),
+                tags: vec![row("L.G.a", "a", "f32")],
+            },
+        )
+        .await
+        .expect("editor は登録できる");
+        assert!(registered.ok, "{registered:?}");
+        assert!(registered.connection_created);
+
+        // 2 つ目の hub 接続は banto-tags の規則で断る（許可リストは開いている）。
+        let mut second = sim_payload("Hub 2", None);
+        second.protocol = "hub".to_owned();
+        second.host = String::new();
+        second.port = 0;
+        match plc_connections_create_body(&state, second).await {
+            Err(BantoError::Validation { field_errors }) => {
+                assert_eq!(field_errors[0].field, "protocol");
+                assert!(
+                    field_errors[0].message.contains("1 つまで"),
+                    "許可リストではなく Hub は 1 つの規則で断る: {}",
+                    field_errors[0].message
+                );
+            }
+            other => panic!("expected the at-most-one rule, got {other:?}"),
+        }
+
+        let rejected = tags_register_from_hub_body(
+            &state,
+            HubTagRegistration {
+                collection_group_id: registered.collection_group.as_ref().map(|g| g.id),
+                new_group: None,
+                tags: vec![row("L.G.a", "again", "f32")],
+            },
+        )
+        .await
+        .expect("検証の不合格は Err ではない");
+        assert!(!rejected.ok);
+        assert_eq!(rejected.row_errors[0].field_errors[0].field, "externalName");
+
+        let catalog = hub_catalog_body(&state).await.expect("editor は読める");
+        assert_eq!(catalog.registered, vec!["L.G.a".to_owned()]);
+        hub_dismiss_legacy_selection_body(&state)
+            .await
+            .expect("editor は消せる");
+
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
+        assert!(matches!(
+            hub_catalog_body(&state).await,
+            Err(BantoError::Forbidden)
+        ));
+        assert!(matches!(
+            tags_register_from_hub_body(
+                &state,
+                HubTagRegistration {
+                    collection_group_id: None,
+                    new_group: None,
+                    tags: Vec::new(),
+                },
+            )
+            .await,
+            Err(BantoError::Forbidden)
+        ));
     }
 
     /// **Tauri 経路**で `simulation: true` が保存・返却され、監査の `detail`
