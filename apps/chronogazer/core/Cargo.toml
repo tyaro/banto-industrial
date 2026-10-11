@@ -115,3 +115,10 @@ path = "src/bin/banto-serve.rs"
 [[example]]
 name = "dev_plc"
 test = true
+
+# #383 P6 の実機比較ハーネス（`examples/hub_p6_compare.rs`）。実行には実機が
+# 要るが、`test = true` で表の列順・ポートの空き確認・profile ID の形の単体
+# テストだけを `cargo test -p chronogazer-core` で回す（#584 のレビュー）。
+[[example]]
+name = "hub_p6_compare"
+test = true
