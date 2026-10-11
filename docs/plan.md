@@ -478,6 +478,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
       「Hub から」登録）→ P5（監視・履歴・しきい値の結合）→ P6 実機確認（Hub 経由の SLMP と直結 SLMP を別ポートで
       比較）。
     - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、`simulation`・`derived_simulation` と未知の出所は表示するが記録しない。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。**未**: P4（登録の導線。REST・Tauri は `hub` 接続の作成をまだ拒否）、P5、P6。
+    - **P3 の細部（2026-10-11 オーナー決定「おすすめで」）**: Hub が戻ったときのイベントは PLC と同じ `plc_reconnected`（最初は `plc_connected`）。未知の `value_source` は実値として扱わず記録しない。Hub の `stale` は null で記録する（古い値を新しい測定に見せない）。収集中に画面の選択タグを変えると購読の張り直しで数周期の切断・再接続と Bad が出る件は P4 で扱いを決める。開始時に Hub が答えないときは突き合わせをせずに始め（開始の待ちは最大 20 秒）、消えたタグは次の開始まで Bad のまま。
   - **#392 収集エンジンの UI 独立**:
     - **H6 scada-design.md §13.2 の 3 host モデルへ段階的に移る**: まず A（単一インスタンス・プロファイル排他 +
       トレイ常駐。ウィンドウを閉じても収集を止めない）、次に B（`banto-serve` から本番用の headless host、
