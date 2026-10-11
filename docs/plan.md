@@ -33,10 +33,11 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 2026-10-10: §5 に #383 段階3（Hub を接続種別として扱い、外部ソース接続タスクを `banto-collect` に足す）と
 #392（収集エンジンを UI から独立させる段階移行）のオーナー決定（H1〜H11）を追記し、§4 のドライバ段落を更新（決定のみ、未実装）。
 2026-10-11: §5 の #383 段階3 に、P2（`banto-tags` の `hub`、#566）と P3（`banto-collect` の Hub サンプラー）を
-実装したことを追記。同日: P4（タグを「Hub から追加」で登録する導線）を実装し、P4 の細部（オーナー決定）を追記
-（P6 は未）。
+実装したことを追記。同日: P4（タグを「Hub から追加」で登録する導線）を実装し、P4 の細部（オーナー決定）を追記。
 同日: P5（監視・履歴・しきい値の結合）を実装し、Hub の `value_source` を解釈しない（simulation 系・未知の出所も Good なら
-記録する）オーナー決定を H4・P3 の細部の置き換えとして追記（P6 は未）。
+記録する）オーナー決定を H4・P3 の細部の置き換えとして追記。
+同日: P6（実機確認）を実施（R08ENCPU、Hub 経由 SLMP と直結 SLMP を別ポートで比較。ハーネスの判定は全段 PASS、
+記録は [real-machine-test-2026-10-p6.md](real-machine-test-2026-10-p6.md)）。
 同日: §5 の #392 に A2（ChronoGazer のトレイ常駐。ウィンドウを閉じても収集を止めない）を実装したことと、その実装の細部を追記
 （B1 以降は未）。
 2026-10-12: §5 の #392 に A2 のオーナー決定（トレイの左クリックを両アプリで「窓を戻す」に揃える、banto-hub にも終了の
@@ -133,7 +134,7 @@ PLC通信 + タグデータ保存 + リアルタイム/ヒストリカル/ハイ
 優先し、この重複は許容する。段階（Hub 経由 → 直結 → 合流）と設計の論点は #383。
 **段階1（Hub 購読）・段階2（SLMP / Modbus TCP 直結 = R1-B/R1-C）は実装済み。段階3（Hub 経由タグの合流・
 保存・表示）の方針は 2026-10-10 に決定済みで、2026-10-11 に P2〜P4（種別・収集と保存・「Hub から追加」の
-登録の導線）に加えて P5（監視・履歴・しきい値の結合）まで実装した（§5。実機確認 P6 は未）**。P4 から、Hub 経由で購読する
+登録の導線）に加えて P5（監視・履歴・しきい値の結合）まで実装し、同日 P6（実機確認）も実施した（§5。ハーネスの判定は全段 PASS）**。P4 から、Hub 経由で購読する
 のは「タグ設定」で登録したタグで、設定画面でのタグ選択は無くなった（§5「P4 の細部」）。
 
 **スコープの護り（SCADA化の誘惑対策、v1 で入れない線）**:
@@ -489,7 +490,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     - 手順: P2（`banto-tags` に `hub` protocol）→ P3（`banto-collect` の Hub サンプラー）→ P4（タグを
       「Hub から」登録）→ P5（監視・履歴・しきい値の結合）→ P6 実機確認（Hub 経由の SLMP と直結 SLMP を別ポートで
       比較）。
-    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る。**P4 で「登録済みの hub タグ ∪ 需要」に替えた** - 下の「P4 の細部」）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、（`simulation`・`derived_simulation` と未知の出所は、この時点では表示するが記録しなかったが、**P5 で替えた** - 下の「P5 の決定」）。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。P4（登録の導線）も 2026-10-11 に実装（下の「P4 の細部」、規則は `apps/chronogazer/core/src/hub_tags.rs`・購読は `hub.rs` のモジュール doc）。**P5（監視・履歴・しきい値の結合）も 2026-10-11 に実装**（下の「P5 の決定」）。**未**: P6。
+    - **実装状況（2026-10-11）**: P2 は #566 で実装（スキーマと検証。収集は外していた）。P3（`banto-collect` の Hub サンプラー）は 2026-10-11 に実装: `banto-collect` に外部ソース （`ExternalSource`）の接続タスクを足し、ChronoGazer の Hub 購読（`HubService`）がそれを実装する。購読するタグは画面の選択 ∪ 収集の需要（開始のたびにレジストリの hub タグの外部名から作る。**P4 で「登録済みの hub タグ ∪ 需要」に替えた** - 下の「P4 の細部」）、開始時に Hub のタグ一覧と突き合わせて消えた・型が変わったタグを外す。Hub が Live でない間は全タグ Bad + null（イベントは Hub の接続キーの `plc_connected` / `plc_disconnected` / `plc_reconnected` - PLC 接続と同じ意味）、Live + good の定常値は周期ごとに記録して Good のまま、Hub の `stale` は Stale（記録は null - 新しい測定ではないため）、（`simulation`・`derived_simulation` と未知の出所は、この時点では表示するが記録しなかったが、**P5 で替えた** - 下の「P5 の決定」）。Hub を持たない実行形態（`banto-serve`）では `hubSourceUnavailable`、Hub 未接続では `hubNotConfigured` で hub 接続を外す（PLC 直結は動く）。詳細は `crates/banto-collect/src/external.rs` と `apps/chronogazer/core/src/collect.rs` のモジュール doc。P4（登録の導線）も 2026-10-11 に実装（下の「P4 の細部」、規則は `apps/chronogazer/core/src/hub_tags.rs`・購読は `hub.rs` のモジュール doc）。**P5（監視・履歴・しきい値の結合）も 2026-10-11 に実装**（下の「P5 の決定」）。**P6（実機確認）も 2026-10-11 に実施**: R08ENCPU を Hub（SLMP ポート 3101）と ChronoGazer の直結（同 3102）で同じ 25 タグ（i16・u16・i32・bit）を周期 1000 ms で読み、60 秒の定常区間で行数（62 / 62）・null（両側とも開始直後の 1 行だけ）・値（全組一致）が一致、Hub のプロセスの停止中は Hub 経由のタグだけが Bad + null（直結は影響なし）で `plc_disconnected` → `plc_reconnected`。Hub の収集だけを止めたときはリンクが Live のままなのでイベントは出ず、値が Bad + null になる（設計どおり）。値が変化する場合の追従は、PLC へ書き込まない条件のため未確認。ハーネスは `apps/chronogazer/core/examples/hub_p6_compare.rs`、記録は [real-machine-test-2026-10-p6.md](real-machine-test-2026-10-p6.md)。
     - **P3 の細部（2026-10-11 オーナー決定「おすすめで」）**: Hub が戻ったときのイベントは PLC と同じ `plc_reconnected`（最初は `plc_connected`）。~~未知の `value_source` は実値として扱わず記録しない~~（**P5 で置き換え**: 未知の出所も Good なら記録する。下の「P5 の決定」）。Hub の `stale` は null で記録する（古い値を新しい測定に見せない）。収集中に画面の選択タグを変えると購読の張り直しで数周期の切断・再接続と Bad が出る件は P4 で扱いを決める（→ P4 で選択を購読から外して解消。下）。開始時に Hub が答えないときは突き合わせをせずに始め（開始の待ちは最大 20 秒）、消えたタグは次の開始まで Bad のまま。
     - **P4 の細部（2026-10-11 オーナー決定「P4進めてください」= 推奨どおり。実装済み）**:
       1. **`hub` 接続の許可**: ChronoGazer の REST・Tauri は `hub` 接続の作成・更新・削除を受け付ける（banto-hub は
