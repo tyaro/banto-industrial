@@ -133,8 +133,10 @@
 //! ordinary connection task in every step above (its own stop channel, the
 //! shared writer `watch`, the same cache/status/events), and never has a
 //! simulator. A config with external connections and no source is refused
-//! at start ([`CollectError::Config`]) rather than left reading "not Live"
-//! forever.
+//! ([`CollectError::Config`]) rather than left reading "not Live" forever -
+//! at start, and also by `apply_config` on a collector started without a
+//! source (checked first, before anything is touched: the collector stays
+//! exactly as it was, PR #578 review).
 //!
 //! ### Why no `collection_started`/`collection_stopped` event
 //!
@@ -357,9 +359,7 @@ impl Collector {
             ));
         }
         if external.is_none() && config.has_external_connections() {
-            return Err(CollectError::Config(
-                "Hub 経由の接続を収集するための値の取得元が渡されていません".to_string(),
-            ));
+            return Err(CollectError::Config(MISSING_EXTERNAL_SOURCE.to_string()));
         }
 
         let writer = Arc::new(
@@ -460,11 +460,24 @@ impl Collector {
     /// 既に全部立っており、ここで `Err` を返すと「タスクは新構成・
     /// `self.config` は旧構成・呼び出し元は失敗と判断」という、はるかに
     /// 悪い不整合が残るため（モジュール doc のステップ 5b 参照）。
+    ///
+    /// **もう 1 つの `Err`（#383 段階3 P3、PR #578 レビュー）**: 外部ソース無しで
+    /// 起動した collector（[`Self::start`] / [`Self::start_with_client_factory`]）に、
+    /// 外部（`"hub"`）接続を含む構成を渡すと [`CollectError::Config`] を返す。
+    /// 判定は**何よりも先に**行う（差分も writer も触る前）ので、この `Err` の
+    /// ときも collector は呼び出し前のまま（`self.config`・全タスク・writer とも
+    /// 不変）。受け入れると、その接続は値の出どころが無いまま「Live でない」
+    /// （Bad + null）を永久に記録し続けるため。
     pub async fn apply_config(
         &mut self,
         new_config: CollectorConfig,
         factory: ClientFactory,
     ) -> Result<ApplyReport, CollectError> {
+        // --- 0. External connections need a source (before any side effect) -
+        if self.external.is_none() && new_config.has_external_connections() {
+            return Err(CollectError::Config(MISSING_EXTERNAL_SOURCE.to_string()));
+        }
+
         // --- 1. Diff (pure - no side effects yet) ---------------------------
         let current_map: HashMap<&str, &ConnectionPlan> = self
             .config
@@ -774,6 +787,11 @@ fn plan_for_task(
     plan
 }
 
+/// The [`CollectError::Config`] text for a config with external (`"hub"`)
+/// connections handed to a collector that has no [`ExternalSource`] - shared
+/// by [`Collector::start_with_sources`] and [`Collector::apply_config`].
+const MISSING_EXTERNAL_SOURCE: &str = "Hub 経由の接続を収集するための値の取得元が渡されていません";
+
 /// Spawn one connection's task with its own stop channel: the socket loop
 /// for a PLC plan, the sampling loop for an external one (#383 段階3 P3).
 /// `external` is only read for an external plan; `start_with_sources`
@@ -803,12 +821,11 @@ fn spawn_task(
     ConnectionTask { handle, stop_tx }
 }
 
-/// Stands in for an absent [`ExternalSource`]. [`Collector::start_with_sources`]
-/// refuses a config that would need it; only an `apply_config` that adds an
-/// external connection to a collector started without a source reaches it
-/// (no caller does: banto-hub never has one, ChronoGazer restarts instead of
-/// applying). Kept so [`spawn_task`] is total - the connection reads
-/// "not Live" (Bad + null) instead of panicking.
+/// Stands in for an absent [`ExternalSource`]. Unreachable:
+/// [`Collector::start_with_sources`] and [`Collector::apply_config`] both
+/// refuse a config with external connections when the collector has no
+/// source ([`MISSING_EXTERNAL_SOURCE`]). Kept only so [`spawn_task`] is total -
+/// the connection would read "not Live" (Bad + null) instead of panicking.
 struct MissingSource;
 
 impl ExternalSource for MissingSource {
@@ -1812,6 +1829,74 @@ mod tests {
                     .all(|v| v.is_none() || *v == Some(7.0)),
                 "{measured_column:?}"
             );
+            assert_plc_rows_unaffected(&rows(&dir, &keys.plc_group).await);
+        }
+
+        /// PR #578 review: a collector started **without** a source refuses
+        /// an `apply_config` that brings in a hub connection - before
+        /// touching anything. Its config is unchanged, the PLC task keeps
+        /// running and recording, and no hub task appears.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn apply_config_refuses_a_hub_connection_without_a_source() {
+            // Build the PLC-only and the PLC + hub configs from one registry.
+            let src_dir = TempDir::new();
+            let source = MockSource::new(ExternalSnapshot::down(None));
+            let (with_hub, _rx, keys) = start(&src_dir, source).await;
+            let hub_config = with_hub.config.clone();
+            with_hub.stop().await.expect("stop");
+            let mut plc_only = hub_config.clone();
+            plc_only
+                .connections
+                .retain(|c| c.config != ProtocolConfig::External);
+            plc_only
+                .store_config
+                .groups
+                .retain(|g| g.key != keys.hub_group);
+            assert!(!plc_only.has_external_connections());
+
+            let dir = TempDir::new();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let factory = {
+                let reads = reads.clone();
+                Arc::new(move |_spec: &crate::task::ClientSpec| {
+                    Box::new(FakeClient {
+                        reads: reads.clone(),
+                    }) as Box<dyn PlcClient>
+                }) as ClientFactory
+            };
+            let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+            let mut collector = Collector::start_with_client_factory(
+                plc_only.clone(),
+                dir.path(),
+                Arc::new(SystemClock),
+                EventSink::new(pool),
+                CollectorOptions::default(),
+                factory.clone(),
+            )
+            .await
+            .expect("start without sources");
+
+            let result = collector.apply_config(hub_config, factory).await;
+            assert!(
+                matches!(&result, Err(CollectError::Config(m)) if m == MISSING_EXTERNAL_SOURCE),
+                "{:?}",
+                result.map(|r| r.added)
+            );
+            assert_eq!(collector.config, plc_only, "config unchanged");
+            assert!(!collector.tasks.contains_key(&keys.hub_conn));
+            assert_eq!(collector.status().get(&keys.hub_conn), None);
+
+            // The PLC task is still running: its reads keep climbing.
+            let before = reads.load(Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while reads.load(Ordering::SeqCst) < before + 3 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the PLC task stopped reading after the refused apply_config"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            collector.stop().await.expect("stop");
             assert_plc_rows_unaffected(&rows(&dir, &keys.plc_group).await);
         }
 
