@@ -20,7 +20,7 @@
 //! ```
 //!
 //! * banto-hub は**このハーネスが子プロセスとして起動し、終わりに止める**
-//!   （一時 DB・データは `P6_WORK_DIR` の下）。素の banto-hub は試運転モード
+//!   （一時 DB・データ・profile の root は `P6_WORK_DIR` の下）。素の banto-hub は試運転モード
 //!   （未ロックダウン）で起動するので、**管理者アカウントは作らない**:
 //!   構成（接続・グループ・タグ・収集の開始）は loopback の
 //!   `POST /api/auth/grant/commissioning`（資格情報なしの合成 admin の grant。
@@ -54,6 +54,31 @@
 //! | `P6_OUTAGE_SECS` | `15` | Hub を止めておく秒数 |
 //! | `P6_RECOVER_SECS` | `20` | 再開後に観測を続ける秒数 |
 //!
+//! ## 起動した子以外の Hub に触らない（#584 レビュー）
+//!
+//! 管理 API（grant・構成・収集の stop/start・キーの失効）は、**今回起動した
+//! 子の一時インスタンスだと確かめた相手にだけ**送る。取り違えの疑いがあれば
+//! 何も操作せずに中止する。
+//!
+//! 1. **ポートの空き確認**（[`ensure_port_free`]）: 起動前に
+//!    `127.0.0.1:P6_HUB_PORT` へ接続できたら（既にリスナーがいる）即中止。
+//! 2. **子の終了の検出**（[`HubProcess::ensure_alive`]）: 起動待ちの間も子を
+//!    `try_wait` で見張り、プロファイル競合・bind 失敗などで終了したら即中止
+//!    （既存の Hub の応答で「起動できた」と誤認しない）。
+//! 3. **応答元の照合**（[`confirm_own_hub`]）: 認証不要の
+//!    `GET /api/v1/openapi.json` の `info.x-banto-hub-profile-id` が今回だけの
+//!    一意な profile ID と一致し、専用 root の `profile.lock`（排他の保持者の
+//!    診断ファイル）の pid が子の pid と一致すること。起動時に加え、Hub 接続
+//!    （キーの自己発行）・収集の stop/start・キーの失効・ログアウトの直前にも
+//!    確かめ直す。照合前の相手には grant のトークンを送らない。
+//! 4. **専用 root・一意な profile**（[`HubProcess`] の doc）: インストール済みの
+//!    Hub（`%ProgramData%\BantoHub`・profile `default`・mutex
+//!    `Global\BantoHub.default`）と排他を共有しない。
+//!
+//! 限界: 照合は「操作の段の直前」に行い、要求 1 本ごとではない。照合の後、
+//! 同じ段の途中で子が落ちて別のプロセスが同じポートを取ると、その段の残りの
+//! 要求はそちらへ届きうる（次の段の照合で止まる）。
+//!
 //! 出力の作法は `hub_real_smoke.rs` と同じ: 番号付きの段階見出し、途中で
 //! panic しない、最後に PASS/FAIL 表、前段の失敗で試せなかった段は SKIP。
 //! 終了コードは全段が成功（または任意段の省略）なら 0、それ以外は 1。
@@ -63,7 +88,9 @@
 //! 手順の最後に、**このインストールが自己発行した `key_id`（`hub.record` の
 //! もの、接続先が一時 Hub であることを確かめてから）だけを** grant の下で
 //! 失効させる（docs/implementation-checklist.md §5「同じ接続先のものか」）。
-//! 一時 Hub の DB ごと消すので実害は無いが、作法として行う。
+//! 一時 Hub の DB ごと消すので実害は無いが、作法として行う。キーの発行後に
+//! 手順2（タグ登録・購読）が失敗しても失効させる（設定 DB と `HubService` を
+//! 作った時点で後片付け用に控える）。一時 Hub の停止は失敗経路でも必ず行う。
 //!
 //! ## やらないこと
 //!
@@ -74,6 +101,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::OpenOptions;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -215,14 +243,90 @@ fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// このハーネスが起動した banto-hub。`Drop` で必ず止める（自分が起動した
 /// プロセスだけ）。
+///
+/// **インストール済みの Hub と排他を共有しない**: banto-hub は DB を開く前に
+/// profile 単位の排他（Windows の named mutex `Global\BantoHub.<profile-id>`。
+/// 名前は profile ID だけで決まる - `banto_hub_core::profile_paths::mutex_name`）
+/// を取る。`BANTO_HUB_ROOT` / `BANTO_HUB_PROFILE` を渡さないと既定の
+/// `%ProgramData%\BantoHub` と profile `default` に戻り、インストール済みの
+/// サービスと同じ mutex を取り合う。そこで作業ディレクトリ配下の専用 root と、
+/// **試験ごとに一意な profile ID**（[`unique_profile_id`]）を明示して渡す。
 struct HubProcess {
     bin: PathBuf,
     port: u16,
     work: PathBuf,
+    /// `BANTO_HUB_ROOT`（作業ディレクトリ配下・絶対パス）。
+    root: PathBuf,
+    /// `BANTO_HUB_PROFILE`（試験ごとに一意）。
+    profile_id: String,
     child: Option<Child>,
 }
 
+/// 試験ごとに一意な profile ID（`p6-<ハーネスの pid>-<起動時刻 ms>`）。
+///
+/// banto-hub の `validate_profile_id` は空・パス区切り・`.`/`..` だけを
+/// 拒否し、**拒否したときは黙って `default` に戻す**
+/// （`profile_paths::resolve_profile_paths_from_env`）。英数字と `-` だけで
+/// 組み立てる（万一戻った場合も、応答元の照合 [`confirm_own_hub`] が
+/// profile ID の不一致で止める）。
+fn unique_profile_id() -> String {
+    format!("p6-{}-{}", std::process::id(), now_ms())
+}
+
+/// `127.0.0.1:port` に誰もいないことを確かめる。**既にリスナーがいれば即中止**
+/// （接続できた = 別のプロセスがいる）。接続できず bind もできない場合は、
+/// 直前に止めた子の残り（TIME_WAIT など）に備えて `limit` まで待ってから
+/// 中止する。
+async fn ensure_port_free(port: u16, limit: Duration) -> Result<(), String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + limit;
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+            return Err(format!(
+                "127.0.0.1:{port} に既にリスナーがいる（このハーネスが起動したものではない。何も操作せず中止）"
+            ));
+        }
+        match TcpListener::bind(addr) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(());
+            }
+            Err(e) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "127.0.0.1:{port} を確保できない（使用中の疑い。何も操作せず中止）: {e}"
+                ))
+            }
+            Err(_) => sleep(Duration::from_millis(300)).await,
+        }
+    }
+}
+
 impl HubProcess {
+    /// 子の診断ファイル `{root}/profiles/<profile-id>/profile.lock`
+    /// （`banto_instance_lock` が排他の取得時に保持者の pid を書く）。
+    fn lock_file(&self) -> PathBuf {
+        self.root
+            .join("profiles")
+            .join(&self.profile_id)
+            .join("profile.lock")
+    }
+
+    /// 子が生きていればその pid。終了していれば（起動失敗・プロファイル競合・
+    /// bind 失敗など）終了状態を載せた `Err`。
+    fn ensure_alive(&mut self) -> Result<u32, String> {
+        let Some(child) = self.child.as_mut() else {
+            return Err("一時 Hub が動いていない（起動していない・停止済み）".to_owned());
+        };
+        match child.try_wait() {
+            Ok(None) => Ok(child.id()),
+            Ok(Some(status)) => Err(format!(
+                "一時 Hub（pid {}）が終了した: {status}（hub.log を参照）",
+                child.id()
+            )),
+            Err(e) => Err(format!("一時 Hub の状態を確かめられない: {e}")),
+        }
+    }
+
     fn spawn(&mut self) -> Result<u32, String> {
         let log = OpenOptions::new()
             .create(true)
@@ -237,10 +341,12 @@ impl HubProcess {
             .env("BANTO_BIND", "127.0.0.1")
             .env("BANTO_DB", self.work.join("hub.sqlite3"))
             .env("BANTO_HUB_DATA", self.work.join("hub-data"))
+            // 専用 root と一意な profile（インストール済みの Hub と排他・
+            // ディレクトリを共有しない。この型の doc）。
+            .env("BANTO_HUB_ROOT", &self.root)
+            .env("BANTO_HUB_PROFILE", &self.profile_id)
             // 管理者のセットアップは使わない（試運転モードの grant で構成する）。
             .env_remove("BANTO_ALLOW_SETUP")
-            .env_remove("BANTO_HUB_ROOT")
-            .env_remove("BANTO_HUB_PROFILE")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
@@ -336,23 +442,6 @@ impl HubAdmin {
         }
     }
 
-    async fn wait_ready(&self, limit: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + limit;
-        loop {
-            match self
-                .call(reqwest::Method::GET, "/api/auth/status", None)
-                .await
-            {
-                Ok((200, _)) => return Ok(()),
-                Ok((status, _)) if Instant::now() >= deadline => {
-                    return Err(format!("/api/auth/status が HTTP {status}"))
-                }
-                Err(e) if Instant::now() >= deadline => return Err(e),
-                _ => sleep(Duration::from_millis(300)).await,
-            }
-        }
-    }
-
     async fn grant(&mut self) -> Result<(), String> {
         self.token = None;
         let body = self
@@ -387,6 +476,124 @@ impl HubAdmin {
         let text = body.to_string();
         Ok(text.chars().take(200).collect())
     }
+}
+
+// --- 応答元の照合（起動した子以外の Hub に管理操作を送らない） --------------
+
+/// [`confirm_own_hub`] の失敗の種類。
+enum Identity {
+    /// まだ照合できない（起動中で応答が無い・診断ファイルが未作成）。待てば
+    /// 照合できる可能性がある。
+    NotYet(String),
+    /// 取り違えの疑い（子が終了した・別の profile の Hub が応答した）。
+    /// **待たずに中止する。**
+    Mismatch(String),
+}
+
+/// 応答元が**今回起動した子の一時インスタンス**であることを確かめる。
+///
+/// 1. 子が生きている（`try_wait`）。
+/// 2. `GET /api/v1/openapi.json`（認証不要。Hub の `rest.rs` の
+///    `openapi_json`）の `info.x-banto-hub-profile-id` が、今回だけの一意な
+///    profile ID と一致する（インストール済みの Hub の health probe
+///    `http_hub_health.rs` が使うのと同じ口）。
+/// 3. 専用 root の下の `profile.lock`（排他の保持者の診断ファイル）の pid が
+///    子の pid と一致する。
+///
+/// profile ID は排他（mutex）の単位なので、2 が一致する Hub は同時に 1 つしか
+/// 動けない。3 で、それが自分の子であることまで結び付ける。
+async fn confirm_own_hub(admin: &HubAdmin, proc: &mut HubProcess) -> Result<u32, Identity> {
+    let pid = proc.ensure_alive().map_err(Identity::Mismatch)?;
+    // 照合前の相手に grant のトークンを渡さない（`HubAdmin::call` は付ける）。
+    let response = admin
+        .http
+        .get(format!("{}/api/v1/openapi.json", admin.base))
+        .send()
+        .await
+        .map_err(|e| Identity::NotYet(format!("openapi.json: 送信失敗: {e}")))?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| Identity::NotYet(format!("openapi.json: 応答を読めない: {e}")))?;
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if status != 200 {
+        return Err(Identity::NotYet(format!(
+            "/api/v1/openapi.json が HTTP {status}"
+        )));
+    }
+    let wire = body["info"]["x-banto-hub-profile-id"].as_str();
+    if wire != Some(proc.profile_id.as_str()) {
+        return Err(Identity::Mismatch(format!(
+            "応答した Hub の profile ID が今回のもの（{}）でない: {wire:?}（別の Hub の疑い。何も操作せず中止）",
+            proc.profile_id
+        )));
+    }
+    match banto_instance_lock::read_owner_info(&proc.lock_file()) {
+        Some(owner) if owner.pid == pid => {}
+        Some(owner) => {
+            return Err(Identity::NotYet(format!(
+                "profile.lock の保持者 pid {} が子の pid {pid} でない",
+                owner.pid
+            )))
+        }
+        None => {
+            return Err(Identity::NotYet(format!(
+                "{} を読めない",
+                proc.lock_file().display()
+            )))
+        }
+    }
+    // 照合の間に子が終わっていないこと（終わっていれば、応答したのは別物）。
+    let after = proc.ensure_alive().map_err(Identity::Mismatch)?;
+    if after != pid {
+        return Err(Identity::Mismatch("照合中に子が入れ替わった".to_owned()));
+    }
+    Ok(pid)
+}
+
+/// 管理操作の直前に 1 回だけ照合する（待たない）。
+async fn check_own_hub(admin: &HubAdmin, proc: &mut HubProcess) -> Result<u32, String> {
+    confirm_own_hub(admin, proc).await.map_err(|e| match e {
+        Identity::NotYet(m) | Identity::Mismatch(m) => format!("応答元の照合に失敗: {m}"),
+    })
+}
+
+/// 起動した子が応答し、照合が通るまで待つ。**子が終了したら即中止**、別の
+/// Hub が応答したら即中止（待たない）。
+async fn wait_own_hub(
+    admin: &HubAdmin,
+    proc: &mut HubProcess,
+    limit: Duration,
+) -> Result<u32, String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match confirm_own_hub(admin, proc).await {
+            Ok(pid) => return Ok(pid),
+            Err(Identity::Mismatch(m)) => return Err(m),
+            Err(Identity::NotYet(m)) if Instant::now() >= deadline => {
+                return Err(format!("一時 Hub の照合が {limit:?} 以内に通らない: {m}"))
+            }
+            Err(Identity::NotYet(_)) => sleep(Duration::from_millis(300)).await,
+        }
+    }
+}
+
+/// ポートが空いていることを確かめてから子を起動し、照合が通るまで待つ。
+async fn start_own_hub(admin: &HubAdmin, proc: &mut HubProcess) -> Result<u32, String> {
+    ensure_port_free(proc.port, Duration::from_secs(10)).await?;
+    let pid = proc.spawn()?;
+    println!(
+        "  起動: pid {pid}（profile {}・root {}）",
+        proc.profile_id,
+        proc.root.display()
+    );
+    let confirmed = wait_own_hub(admin, proc, Duration::from_secs(60)).await?;
+    println!(
+        "  照合: 子 pid {confirmed} が 127.0.0.1:{} で応答（profile ID・profile.lock の pid 一致）",
+        proc.port
+    );
+    Ok(confirmed)
 }
 
 /// 一時 Hub に接続・グループ・タグを作る（収集停止中）。
@@ -753,42 +960,59 @@ fn compare_pair(
     }
 }
 
-// 見出しを値と同じ幅指定で揃えるため、文字列リテラルを引数で渡す。
-#[allow(clippy::print_literal)]
-fn print_pair_table(stats: &[PairStats]) {
-    println!(
-        "  {:<6} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>4} {:>4} {:>5} {:>5} {:>5}  {}",
+/// 比較表の数値列（見出し・値）。**見出しと値を 1 か所で対にする**ことで、
+/// 列の順序が見出しとずれない（2026-10-11 版は見出し「Hub行 / Hubnull /
+/// 直先頭」の下に `direct_leading_nulls / hub_rows / hub_nulls` を出していた）。
+/// 見出しは空白を含めない（単体テストが空白区切りで照合する）。
+fn pair_columns(s: &PairStats) -> [(&'static str, usize); 11] {
+    [
+        ("直行", s.direct_rows),
+        ("直null", s.direct_nulls),
+        ("直先頭", s.direct_leading_nulls),
+        ("Hub行", s.hub_rows),
+        ("Hubnull", s.hub_nulls),
+        ("Hub先頭", s.hub_leading_nulls),
+        ("直種", s.direct_distinct),
+        ("Hub種", s.hub_distinct),
+        ("比較", s.compared),
+        ("一致", s.equal),
+        ("説明不能", s.unexplained),
+    ]
+}
+
+/// 比較表の行（見出し 1 行 + 組ごとに 1 行）。
+fn pair_table_lines(stats: &[PairStats]) -> Vec<String> {
+    let header_cols: Vec<&str> = match stats.first() {
+        Some(s) => pair_columns(s).iter().map(|(label, _)| *label).collect(),
+        None => return Vec::new(),
+    };
+    let mut lines = vec![format!(
+        "  {:<6} {}  最後の値(直/Hub)",
         "tag",
-        "直行",
-        "直null",
-        "Hub行",
-        "Hubnull",
-        "直先頭",
-        "Hub先頭",
-        "直種",
-        "Hub種",
-        "比較",
-        "一致",
-        "説明不能",
-        "最後の値(直/Hub)"
-    );
+        header_cols
+            .iter()
+            .map(|label| format!("{label:>7}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )];
     for s in stats {
-        println!(
-            "  {:<6} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>4} {:>4} {:>5} {:>5} {:>5}  {}",
+        lines.push(format!(
+            "  {:<6} {}  {}",
             s.name,
-            s.direct_rows,
-            s.direct_nulls,
-            s.direct_leading_nulls,
-            s.hub_rows,
-            s.hub_nulls,
-            s.hub_leading_nulls,
-            s.direct_distinct,
-            s.hub_distinct,
-            s.compared,
-            s.equal,
-            s.unexplained,
+            pair_columns(s)
+                .iter()
+                .map(|(_, value)| format!("{value:>7}"))
+                .collect::<Vec<_>>()
+                .join(" "),
             s.sample
-        );
+        ));
+    }
+    lines
+}
+
+fn print_pair_table(stats: &[PairStats]) {
+    for line in pair_table_lines(stats) {
+        println!("{line}");
     }
 }
 
@@ -801,6 +1025,20 @@ async fn read_events(svc: &CollectorService) -> Result<Vec<CollectEventRow>, Str
         }
         other => Err(format!("イベント一覧が読めない: {}", other.as_str())),
     }
+}
+
+/// Hub の接続キーに全区間で期待する plc_* の列。Hub の接続キーのイベントは
+/// **Hub とのリンク（購読）**の切断・再接続を表す（`banto_collect::external`
+/// のモジュール doc）ので、`process`（Hub のプロセスが落ちる）だけが
+/// disconnected → reconnected を足す。`collection`（Hub の収集の stop/start）
+/// はリンクが Live のままなので足さない。
+fn expected_hub_link_kinds(outage: &str) -> Vec<String> {
+    let mut kinds = vec!["plc_connected".to_owned()];
+    if outage == "process" {
+        kinds.push("plc_disconnected".to_owned());
+        kinds.push("plc_reconnected".to_owned());
+    }
+    kinds
 }
 
 fn link_kinds(events: &[CollectEventRow], conn_key: &str, after_ms: i64) -> Vec<String> {
@@ -893,8 +1131,10 @@ async fn main() {
         "Hub→PLC ポート {hub_plc_port} / 直結→PLC ポート {direct_plc_port} / 一時 Hub 127.0.0.1:{hub_port} / 周期 {period_ms}ms / 定常 {run_secs}s / 停止・再開 {}",
         if outage.is_empty() { "なし" } else { outage.as_str() }
     );
-    println!("作業ディレクトリ: {}", work.display());
     let _ = std::fs::create_dir_all(&work);
+    // 一時 Hub の root は絶対パスで渡す（子の作業ディレクトリに依存させない）。
+    let work = std::path::absolute(&work).unwrap_or(work);
+    println!("作業ディレクトリ: {}", work.display());
     let hub_url = format!("http://127.0.0.1:{hub_port}");
 
     let mut results: Vec<StepResult> = Vec::new();
@@ -902,9 +1142,11 @@ async fn main() {
         bin: hub_bin.clone(),
         port: hub_port,
         work: work.join("hub"),
+        root: work.join("hub").join("root"),
+        profile_id: unique_profile_id(),
         child: None,
     };
-    let _ = std::fs::create_dir_all(&hub_proc.work);
+    let _ = std::fs::create_dir_all(&hub_proc.root);
     let mut admin = HubAdmin::new(hub_url.clone());
 
     // 1. 一時 Hub の起動・構成 -------------------------------------------
@@ -912,9 +1154,9 @@ async fn main() {
         "\n[1] 一時 banto-hub の起動と構成（試運転モードの grant。管理者アカウントは作らない）"
     );
     let step1 = async {
-        let pid = hub_proc.spawn()?;
-        println!("  起動: pid {pid}");
-        admin.wait_ready(Duration::from_secs(60)).await?;
+        // ポートの空き確認 → 起動 → 応答元の照合（子の終了・別の Hub は即中止）。
+        // 照合が通るまで grant も構成もしない。
+        start_own_hub(&admin, &mut hub_proc).await?;
         admin.grant().await?;
         let tags = configure_hub(&admin, &plc_host, hub_plc_port, period_ms).await?;
         let started = admin.collection("start").await?;
@@ -948,6 +1190,10 @@ async fn main() {
     let _ = std::fs::create_dir_all(&cg_dir);
     let data_dir = resolve_data_dir(&cg_dir, "./data");
     let mut ctx: Option<Context> = None;
+    // 後片付け（キーの失効）に要る一式。`HubService::connect` がキーを発行した
+    // **後**に手順2が失敗しても `ctx` は作られないので、作った時点でここに
+    // 控え、失敗経路でも手順9が `hub.record` の `key_id` を失効させる。
+    let mut cleanup_handles: Option<(sqlx::SqlitePool, SettingsService, HubService)> = None;
     if hub_ok {
         let step2 = async {
             let pool = init_db(cg_dir.join("chronogazer.sqlite3"))
@@ -959,6 +1205,9 @@ async fn main() {
                 .await
                 .map_err(|e| format!("HubService: {e}"))?;
             hub.attach_registry(pool.clone());
+            cleanup_handles = Some((pool.clone(), settings.clone(), hub.clone()));
+            // キーを発行させる前に、相手が今回の子であることを確かめ直す。
+            check_own_hub(&admin, &mut hub_proc).await?;
             let view = hub
                 .connect(&hub_url)
                 .await
@@ -1130,10 +1379,14 @@ async fn main() {
                 let direct_keys: Vec<String> = direct.2.values().cloned().collect();
                 let down_at = now_ms();
                 let stop = if outage == "process" {
+                    // 自分が起動した子だけを止める（`HubProcess::kill`）。
                     hub_proc.kill();
                     Ok("プロセスを停止".to_owned())
                 } else {
-                    admin.collection("stop").await
+                    match check_own_hub(&admin, &mut hub_proc).await {
+                        Ok(_) => admin.collection("stop").await,
+                        Err(e) => Err(e),
+                    }
                 };
                 println!("  停止: {stop:?}");
                 let went_bad = wait_hub_tags(
@@ -1161,12 +1414,13 @@ async fn main() {
                 let up_at = now_ms();
                 let restart = async {
                     if outage == "process" {
-                        let pid = hub_proc.spawn()?;
-                        admin.wait_ready(Duration::from_secs(60)).await?;
+                        // 初回と同じ: ポートの空き確認 → 起動 → 照合。
+                        let pid = start_own_hub(&admin, &mut hub_proc).await?;
                         admin.grant().await?;
                         let s = admin.collection("start").await?;
                         Ok::<String, String>(format!("pid {pid} で再起動・収集開始 {s}"))
                     } else {
+                        check_own_hub(&admin, &mut hub_proc).await?;
                         admin.collection("start").await
                     }
                 }
@@ -1184,11 +1438,21 @@ async fn main() {
                 );
                 sleep(Duration::from_secs(recover_secs)).await;
                 outage_window = Some((down_at, bad_at, up_at));
-                let events = read_events(svc).await.unwrap_or_default();
+                // 読めなかったことを「イベント 0 件」に潰さない（collection では
+                // 0 件が期待値なので、潰すと読めないまま PASS する）。
+                let events = read_events(svc).await;
                 let hub_conn_key = format!("conn:{}", hub_side.0);
                 let direct_conn_key = format!("conn:{}", direct.0);
-                let hub_kinds = link_kinds(&events, &hub_conn_key, down_at);
-                let direct_kinds = link_kinds(&events, &direct_conn_key, down_at);
+                let (hub_kinds, direct_kinds) = match &events {
+                    Ok(events) => (
+                        link_kinds(events, &hub_conn_key, down_at),
+                        link_kinds(events, &direct_conn_key, down_at),
+                    ),
+                    Err(e) => {
+                        println!("  イベントを読めない: {e}");
+                        (Vec::new(), Vec::new())
+                    }
+                };
                 println!("  停止以後のイベント: Hub {hub_kinds:?} / 直結 {direct_kinds:?}");
                 // Hub の接続キーのイベントは **Hub とのリンク（購読）**の切断・
                 // 再接続を表す（`banto_collect::external` のモジュール doc）。
@@ -1196,17 +1460,22 @@ async fn main() {
                 // - collection: Hub は生きていてリンクは Live のまま、値だけが
                 //   Bad になる → イベントは出ない（設計どおり。2026-10-11 の P6
                 //   実機で確認）。
-                let expected_hub: Vec<String> = if outage == "process" {
-                    vec!["plc_disconnected".to_owned(), "plc_reconnected".to_owned()]
-                } else {
-                    Vec::new()
+                let expected_hub: Vec<String> = expected_hub_link_kinds(&outage)
+                    .into_iter()
+                    .skip(1)
+                    .collect();
+                let events_ok =
+                    events.is_ok() && hub_kinds == expected_hub && direct_kinds.is_empty();
+                let events_note = match &events {
+                    Ok(_) => format!("イベント Hub {hub_kinds:?} 直結 {direct_kinds:?}"),
+                    Err(e) => format!("イベントを読めない（判定不能）: {e}"),
                 };
-                let events_ok = hub_kinds == expected_hub && direct_kinds.is_empty();
                 results.push(StepResult::new(
                     "5. Hub 停止・再開",
-                    went_bad && direct_good_during && recovered && events_ok,
+                    stop.is_ok() && went_bad && direct_good_during && recovered && events_ok,
                     format!(
-                        "Bad+null={went_bad} / 直結 good={direct_good_during} / 復帰={recovered} / イベント Hub {hub_kinds:?} 直結 {direct_kinds:?}"
+                        "停止={} / Bad+null={went_bad} / 直結 good={direct_good_during} / 復帰={recovered} / {events_note}",
+                        stop.is_ok()
                     ),
                 ));
             }
@@ -1339,21 +1608,30 @@ async fn main() {
                     })
                     .collect();
                 println!("  全イベント: {all:?}");
-                let steady_hub: Vec<String> = events
+                // **全区間**の plc_* を期待の列と完全一致で比べる（定常区間だけに
+                // 絞ると、停止・再開の区間の予期しないイベント - 直結の切断や
+                // Hub の余分な再接続 - を見逃す）。
+                let expected_hub = expected_hub_link_kinds(&outage);
+                let expected_direct = vec!["plc_connected".to_owned()];
+                // 両接続のどちらでもない plc_* も予期しない。
+                let stray: Vec<String> = events
                     .iter()
                     .filter(|r| {
                         r.kind.starts_with("plc_")
-                            && r.connection_key.as_deref() == Some(hub_conn_key.as_str())
-                            && r.ts_ms <= steady_end
+                            && r.connection_key.as_deref() != Some(hub_conn_key.as_str())
+                            && r.connection_key.as_deref() != Some(direct_conn_key.as_str())
                     })
-                    .map(|r| r.kind.clone())
+                    .map(|r| format!("{}({:?})", r.kind, r.connection_key))
                     .collect();
-                let ok = steady_hub == vec!["plc_connected".to_owned()]
-                    && direct_kinds == vec!["plc_connected".to_owned()];
+                let ok = hub_kinds == expected_hub
+                    && direct_kinds == expected_direct
+                    && stray.is_empty();
                 results.push(StepResult::new(
-                    "8. イベント（定常区間は両接続とも plc_connected 1 件）",
+                    "8. イベント（全区間の plc_* が期待どおり）",
                     ok,
-                    format!("Hub {hub_kinds:?} / 直結 {direct_kinds:?}"),
+                    format!(
+                        "Hub {hub_kinds:?}（期待 {expected_hub:?}）/ 直結 {direct_kinds:?}（期待 {expected_direct:?}）/ その他 {stray:?}"
+                    ),
                 ));
             }
             Err(e) => results.push(StepResult::new("8. イベント", false, e)),
@@ -1370,13 +1648,18 @@ async fn main() {
     println!("\n[9] 後片付け（発行キーの失効・Hub 購読の停止・一時 Hub の停止）");
     let mut cleanup_notes = Vec::new();
     let mut cleanup_ok = true;
-    if let Some((pool, settings, hub, _, _)) = &ctx {
+    // 手順2の途中で失敗しても（`ctx` が無くても）、キーが発行されていれば
+    // 失効させる（`cleanup_handles` の doc）。
+    if let Some((pool, settings, hub)) = &cleanup_handles {
         let record = read_hub_record(settings).await;
         hub.shutdown().await;
         match record {
             Some(record) if record.endpoint.trim_end_matches('/') == hub_url => {
                 if let Some(key_id) = record.key_id {
                     let revoked = async {
+                        // 失効を送る前に、相手が今回の子であることを確かめる
+                        // （止まっていれば、別の Hub に送らずに失敗にする）。
+                        check_own_hub(&admin, &mut hub_proc).await?;
                         if admin.token.is_none() {
                             admin.grant().await?;
                         }
@@ -1408,9 +1691,18 @@ async fn main() {
         }
         pool.close().await;
     }
-    admin.logout().await;
-    hub_proc.kill();
-    cleanup_notes.push("一時 Hub を停止".to_owned());
+    // grant のトークンは今回の子にだけ返す（照合できなければ送らずに捨てる）。
+    if check_own_hub(&admin, &mut hub_proc).await.is_ok() {
+        admin.logout().await;
+    } else {
+        admin.token = None;
+    }
+    if hub_proc.child.is_some() {
+        hub_proc.kill();
+        cleanup_notes.push("一時 Hub を停止".to_owned());
+    } else {
+        cleanup_notes.push("一時 Hub は動いていない（起動していない・停止済み）".to_owned());
+    }
     println!("  {}", cleanup_notes.join(" / "));
     results.push(StepResult::new(
         "9. 後片付け",
@@ -1425,4 +1717,91 @@ async fn main() {
     let all_ok = results.iter().all(|r| r.status.is_pass());
     println!("\n総合: {}", if all_ok { "PASS" } else { "FAIL" });
     std::process::exit(if all_ok { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_with_distinct_values() -> PairStats {
+        PairStats {
+            name: "d3000".to_owned(),
+            direct_rows: 11,
+            direct_nulls: 12,
+            direct_leading_nulls: 13,
+            hub_rows: 14,
+            hub_nulls: 15,
+            hub_leading_nulls: 16,
+            direct_distinct: 17,
+            hub_distinct: 18,
+            compared: 19,
+            equal: 20,
+            unexplained: 21,
+            sample: "100 / 100".to_owned(),
+        }
+    }
+
+    /// 見出しの各列の下に、その見出しが指すフィールドの値が出る
+    /// （#584 のレビュー: 「Hub行 / Hubnull / 直先頭」の下に別の値が出ていた）。
+    #[test]
+    fn pair_table_values_sit_under_their_headers() {
+        let lines = pair_table_lines(&[stats_with_distinct_values()]);
+        assert_eq!(lines.len(), 2);
+        let header: Vec<&str> = lines[0].split_whitespace().collect();
+        let row: Vec<&str> = lines[1].split_whitespace().collect();
+        let value_under = |label: &str| -> &str {
+            let i = header
+                .iter()
+                .position(|h| *h == label)
+                .unwrap_or_else(|| panic!("見出し {label} が無い: {header:?}"));
+            row[i]
+        };
+        assert_eq!(value_under("tag"), "d3000");
+        for (label, expected) in [
+            ("直行", "11"),
+            ("直null", "12"),
+            ("直先頭", "13"),
+            ("Hub行", "14"),
+            ("Hubnull", "15"),
+            ("Hub先頭", "16"),
+            ("直種", "17"),
+            ("Hub種", "18"),
+            ("比較", "19"),
+            ("一致", "20"),
+            ("説明不能", "21"),
+        ] {
+            assert_eq!(value_under(label), expected, "列 {label}");
+        }
+        assert!(lines[1].ends_with("100 / 100"));
+    }
+
+    #[test]
+    fn pair_table_is_empty_without_stats() {
+        assert!(pair_table_lines(&[]).is_empty());
+    }
+
+    /// profile ID は banto-hub の検証（空・パス区切り・`.`/`..` を拒否し、
+    /// 拒否すると黙って `default` に戻す）を通る形で、`default` ではない。
+    #[test]
+    fn unique_profile_id_is_a_valid_non_default_id() {
+        let id = unique_profile_id();
+        assert!(id.starts_with("p6-"));
+        assert_ne!(id, "default");
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    /// 既にリスナーがいるポートでは、起動前の確認が即座に中止を返す。
+    #[tokio::test]
+    async fn ensure_port_free_refuses_an_occupied_port() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let started = Instant::now();
+        let result = ensure_port_free(port, Duration::from_secs(10)).await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(listener);
+        assert!(ensure_port_free(port, Duration::from_secs(10))
+            .await
+            .is_ok());
+    }
 }
