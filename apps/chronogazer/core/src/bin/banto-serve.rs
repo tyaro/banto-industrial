@@ -42,7 +42,8 @@
 
 use banto_server::{start, static_router, with_security_headers, ServerConfig};
 use chronogazer_core::assets::FrontendAssets;
-use chronogazer_core::audit::{AuditEntry, AuditLogService};
+use chronogazer_core::audit::AuditEntry;
+use chronogazer_core::audit_spool::{build_audit_service, flush_at_startup};
 use chronogazer_core::backup::BackupService;
 // #383 段階2b / R1-C（C-2）: 収集ランタイム。この単体サーバーも
 // デスクトップアプリと同じく**起動時に自動開始**する（`api_router` に
@@ -150,7 +151,18 @@ async fn main() {
     let tags = TagService::new(pool.clone());
     // #393: 表示グループ（同じ pool）。
     let display_groups = DisplayGroupService::new(pool.clone());
-    let audit = AuditLogService::new(db);
+    // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・応答しない
+    // 監査は DB の隣の `audit-spool/` に退避し、`record` は 3 秒で戻る
+    // （`chronogazer_core::audit_spool` のモジュール doc）。マイグレーション
+    // （`init_db`、`0008` の `pending_id` を含む）は済んでいるので、前回の実行で
+    // 残った保留をここで 1 回流し込む。定期の流し込みは、最後に失敗しうる起動
+    // 手順（サーバー起動）の後で起こす（下）。
+    let db_dir = match db_path_buf.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let audit = build_audit_service(db, &db_path_buf);
+    flush_at_startup(&audit, "banto-serve").await;
     // Credential verifier from `chronogazer_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
     // fixed admin/admin check that used to live here directly. Also records
@@ -247,10 +259,7 @@ async fn main() {
     // しまうので、ここで基準を決めておく（`resolve_data_dir` の doc）。
     // `BANTO_DB` がファイル名だけのとき `parent()` は空になるので、
     // そのときは作業ディレクトリ（`"."`）を基準にする。
-    let data_base = match db_path_buf.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
+    let data_base = db_dir;
     let store_settings = store_config(&settings).await.unwrap_or_else(|err| {
         eprintln!("banto-serve: 時系列データの保存設定の読み取りに失敗しました（既定値で続行します）: {err}");
         Default::default()
@@ -278,6 +287,7 @@ async fn main() {
     // `with_security_headers`（banto #500）は最後（最外）に掛ける
     // （静的 UI・`/api/*`・SSE のすべてに付く。デスクトップ側の
     // `start_embedded_server` と同じ構成）。
+    let audit_for_spool = audit.clone();
     let app = with_security_headers(
         api_router(
             users,
@@ -301,6 +311,11 @@ async fn main() {
         .await
         .expect("server should start");
 
+    // #437: 定期の流し込みは、起動の失敗しうる手順がすべて済んでから起こす
+    // （先に起こすと、失敗して戻る経路にタスクが残る。banto-hub #557 の指摘）。
+    // 終了時に止める。
+    let audit_spool_handle = audit_for_spool.spawn_spool_flusher();
+
     println!("banto-serve: DB at {db_path}");
     println!("banto-serve: listening at:");
     for url in chronogazer_core::listening_urls(server.local_addr()) {
@@ -323,6 +338,11 @@ async fn main() {
         .expect("failed to listen for ctrl-c");
     println!("banto-serve: shutting down");
     server.stop().await;
+    if let Some(handle) = &audit_spool_handle {
+        // 流し込みの途中で止めても、ファイルは行が入ってから消すので失われない
+        // （次の起動で同じ `pending_id` を流し直し、1 行になる）。
+        handle.abort();
+    }
     // #383 段階2b / R1-C（C-2）: 収集（書き手）は**消費者を止めた後**に止める
     // - `src-tauri` の `shutdown_app_state` と同じ順序（理由はあちらの doc）。
     // ここを通らないと、tstore の最後の未 flush 分が落ちる。失敗しても

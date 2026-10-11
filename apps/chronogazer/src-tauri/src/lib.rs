@@ -3128,6 +3128,16 @@ async fn audit_log_list(
 /// role may read this (same rationale as `auth_config_get`: it only feeds a
 /// settings-screen display) - only `audit_config_apply` below is
 /// `admin`-only.
+/// #437: 監査の保留の状態（`GET /api/audit-log/spool` と同じ内容）。
+/// `admin` 限定（監査ログ画面の警告帯が読む）。
+#[tauri::command]
+async fn audit_spool_status(
+    state: State<'_, AppState>,
+) -> Result<chronogazer_core::audit_spool::AuditSpoolStatus, BantoError> {
+    require_role(&state, Role::Admin, "audit_log").await?;
+    Ok(chronogazer_core::audit_spool::spool_status(&state.audit))
+}
+
 #[tauri::command]
 async fn audit_config_get(state: State<'_, AppState>) -> Result<AuditSettings, BantoError> {
     require_role(&state, Role::Viewer, "settings").await?;
@@ -3877,6 +3887,11 @@ const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// （接続タスクの join と最終 flush）は**そのまま続く**。直後にプロセスが
 /// 終わるので実害は無く、失われうるのは最後の未 flush 分だけ - 詳しくは
 /// `chronogazer_core::collect` のモジュール doc「終了フックからの停止」。
+/// #437: 監査の保留の定期の流し込み（`AuditLogService::spawn_spool_flusher`）の
+/// `JoinHandle`。`setup()` の末尾で managed state にし、`RunEvent::Exit` で止める。
+/// 保留を開けなかったとき（保留なし）は `None`。
+struct AuditSpoolFlusher(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
+
 async fn shutdown_app_state(state: &AppState) {
     let cleanup = async {
         // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを
@@ -4138,7 +4153,20 @@ pub fn run() {
                 .expect("store_config should succeed");
             let collect_data_dir = resolve_data_dir(&data_dir, &store_settings.data_dir);
             let collect = CollectorService::new(pool.clone(), collect_data_dir);
-            let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
+            // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・応答
+            // しない監査は DB の隣（= アプリのデータディレクトリ）の
+            // `audit-spool/<DB ファイル名>/` に退避し、`record` は 3 秒で戻る
+            // （`chronogazer_core::audit_spool` のモジュール doc）。
+            // マイグレーション（`init_db`）は済んでいるので、前回の実行で残った
+            // 保留をここで 1 回流し込む。定期の流し込みは、この後の起動手順が
+            // すべて済んでから起こす（`setup()` の末尾）。
+            let audit = chronogazer_core::audit_spool::build_audit_service(
+                Db::Sqlite(pool.clone()),
+                &db_path,
+            );
+            tauri::async_runtime::block_on(chronogazer_core::audit_spool::flush_at_startup(
+                &audit, "banto",
+            ));
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
             // `chronogazer_core::rest::audited_credential_verifier`'s doc
@@ -4148,6 +4176,7 @@ pub fn run() {
             // the account on every request (`user_auth_state`), so a change
             // made from the webview's commands ends LAN sessions too.
             let rest_auth = user_auth_state(users.clone(), audit.clone());
+            let audit_for_spool = audit.clone();
 
             // Spec M17: record `restore_applied` now that a real
             // `AuditLogService` exists - `apply_pending_restore_at_startup`
@@ -4454,6 +4483,13 @@ pub fn run() {
                 pool,
             });
 
+            // #437: 監査の保留の定期の流し込みは、起動手順の最後（ここ）で起こす。
+            // ハンドルは `RunEvent::Exit` で止める（`AuditSpoolFlusher`）。
+            // `tokio::spawn` は tokio のランタイムの中で呼ぶ必要があるので
+            // `block_on` に包む。
+            let flusher = tauri::async_runtime::block_on(async { audit_for_spool.spawn_spool_flusher() });
+            app.manage(AuditSpoolFlusher(std::sync::Mutex::new(flusher)));
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4486,6 +4522,7 @@ pub fn run() {
             audit_log_list,
             audit_config_get,
             audit_config_apply,
+            audit_spool_status,
             backups_create,
             backups_list,
             backups_open_folder,
@@ -4569,6 +4606,13 @@ pub fn run() {
             //   （このクレートは CI の Linux コンテナでビルドすらできない）。
             //   そこは実機確認の領域 - relay-wright の W3-B2 と同じ状況。
             if let tauri::RunEvent::Exit = event {
+                // #437: 監査の保留の定期の流し込みを止める（途中で止めても、
+                // ファイルは行が入ってから消すので失われない）。
+                if let Some(flusher) = app_handle.try_state::<AuditSpoolFlusher>() {
+                    if let Some(handle) = flusher.0.lock().ok().and_then(|mut h| h.take()) {
+                        handle.abort();
+                    }
+                }
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     tauri::async_runtime::block_on(shutdown_app_state(&state));
                 }
