@@ -39,9 +39,11 @@ import {
 	type DeleteGuardToken,
 	type ListLoadState,
 	type ListSectionView,
-	type CreateFormGate
+	type CreateFormGate,
+	hubConnectionInput,
+	hubConnectionSavedMessage
 } from './tagsPageLogic';
-import type { Tag } from '#lib/banto/tagRegistryAdmin.js';
+import type { PlcConnection, Tag } from '#lib/banto/tagRegistryAdmin.js';
 
 // --- A: isSaveStillCurrent / runGuardedSave --------------------------------
 
@@ -822,5 +824,46 @@ describe('isRevisionConflict', () => {
 		expect(isRevisionConflict(new Error('x'))).toBe(false);
 		expect(isRevisionConflict(null)).toBe(false);
 		expect(isRevisionConflict('expectedRevision')).toBe(false);
+	});
+});
+
+// --- #383 段階3 P4: Hub 接続の「有効」（2026-10-11 オーナー決定） -----------------
+
+describe('hubConnectionInput / hubConnectionSavedMessage', () => {
+	const hub: PlcConnection = {
+		id: 7,
+		name: 'Hub',
+		protocol: 'hub',
+		host: '',
+		port: 0,
+		unitId: 1,
+		enabled: true,
+		wordOrder: '',
+		simulation: false
+	};
+
+	it('「有効」だけを変え、ほかは今の行の値のまま（host/port は持たない）で送る', () => {
+		expect(hubConnectionInput(hub, false)).toEqual({
+			name: 'Hub',
+			protocol: 'hub',
+			host: '',
+			port: 0,
+			unitId: 1,
+			enabled: false,
+			wordOrder: '',
+			simulation: false
+		});
+		expect(hubConnectionInput({ ...hub, enabled: false }, true).enabled).toBe(true);
+	});
+
+	it('切り替えたときだけ、購読と収集への影響を言う', () => {
+		expect(hubConnectionSavedMessage({ enabled: true }, { enabled: true })).toBe('更新しました');
+		const off = hubConnectionSavedMessage({ enabled: true }, { enabled: false });
+		expect(off).toContain('無効にしました');
+		expect(off).toContain('購読しません');
+		expect(off).toContain('収集を再起動');
+		const on = hubConnectionSavedMessage({ enabled: false }, { enabled: true });
+		expect(on).toContain('有効にしました');
+		expect(on).toContain('購読を再開');
 	});
 });

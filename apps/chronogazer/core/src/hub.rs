@@ -61,14 +61,33 @@
 //! `banto-collect` が PLC のタグと同じ tstore・同じ書き手・同じイベントで
 //! 収集する。ここはそのための**値の出口**だけを持つ:
 //!
-//! * **購読するタグ集合 = 画面の選択（`hub.record.selected_tags`）∪ 収集の
-//!   需要**（[`Subscription::collect_demand`]）。需要は収集の開始のたびに
-//!   レジストリから作り直す（[`HubService::prepare_collect`]、有効な hub
-//!   接続 → 有効なグループ → 有効なタグの `address` = 外部名。H3 の同一性）。
-//!   **設定 KV には書かない**（実行時の事実で、正はレジストリ）。選択タグは
-//!   設定画面での手動の購読のために残す（後方互換。P4 で「Hub から登録」が
-//!   入ったら役割を見直す）。和集合なので、選択と需要の片方だけが変わっても
-//!   もう片方の購読は止まらない。
+//! * **購読するタグ集合 = 登録済みの hub タグ ∪ 収集の需要**（#383 段階3 P4、
+//!   2026-10-11 オーナー決定。[`wanted_tags`]）。登録済みのタグは
+//!   レジストリの**有効な** hub 接続の下のすべてのタグの `address` = 外部名
+//!   （Hub 接続を無効にすると購読から外れる。2026-10-11 オーナー決定）
+//!   （[`Subscription::registered`]、H3 の同一性）で、**収集を止めていても
+//!   Hub の接続が設定されている限り購読する**（設定画面が登録済みのタグの
+//!   現在値を出せるように）。需要（[`Subscription::collect_demand`]）は収集の
+//!   開始のたびにレジストリの有効なタグから作り（[`HubService::prepare_collect`]）、
+//!   開始時の突き合わせの後の計画に絞る（[`HubService::narrow_collect`]）。
+//!   需要は登録済みの部分集合なので、**収集の開始・停止では購読の集合が
+//!   変わらず、張り直さない**。変わるのは登録を変えたときだけ
+//!   （[`HubService::registry_changed`]。そのときは 1 回張り直す - 下の
+//!   「登録の反映」）。どちらも**設定 KV には書かない**（正はレジストリ）。
+//! * **画面の選択（`hub.record.selected_tags`）は P4 で購読から外した**。
+//!   P3 までは選択 ∪ 需要を購読しており、収集中に選択を変えるたびに張り直して
+//!   数周期の切断と Bad が出ていた。選択は読み取りだけ残す（「Hub から追加」の
+//!   ダイアログが 1 度だけ事前にチェックする移行用。
+//!   [`HubService::catalog_for_registration`] / [`HubService::clear_legacy_selection`]）。
+//! * **登録の反映**: 登録済みの集合はレジストリを読み直して作る
+//!   （[`HubService::refresh_registered`]）。読み直すのは突き合わせの頭・
+//!   見張りの各周期・レジストリを変えた REST / Tauri の後
+//!   （[`HubService::registry_changed`]）の 3 か所で、集合が変わったときだけ
+//!   張り直しを 1 本予約する。`banto-tagclient` は購読の追加・削除を接続を
+//!   保ったまま行う口を持たない（`RestClient::start(requests)` の要求は世代の
+//!   間固定）ので、**収集中に hub タグを追加・削除すると、張り直しの間（数周期）
+//!   Hub 経由のタグは Bad になり、Hub の接続キーで切断・再接続のイベントが出る**。
+//!   登録を変えたときだけなので許容する（同オーナー決定）。
 //! * **収集が読むのは `watch` の写しだけ**（[`HubFeed`] / [`HubSampler`]）。
 //!   世代を張ったときに `TagClientHandle::state_watch()` を差し込み、止めた
 //!   ときに外す。収集の周期は `std::sync::RwLock` の読み取り 1 回 +
@@ -140,6 +159,9 @@ pub struct HubTagView {
     pub name: String,
     pub data_type: String,
     pub unit: Option<String>,
+    /// Hub 側のタグの小数桁（#383 段階3 P4: 「Hub から追加」で登録する
+    /// タグの小数桁の初期値に複製する）。
+    pub decimals: i64,
     pub tag_kind: String,
 }
 
@@ -150,9 +172,32 @@ impl From<&CatalogTag> for HubTagView {
             name: tag.name.clone(),
             data_type: tag.data_type.clone(),
             unit: tag.unit.clone(),
+            decimals: tag.decimals,
             tag_kind: tag.tag_kind.clone(),
         }
     }
+}
+
+/// 「Hub から追加」（#383 段階3 P4）のダイアログが 1 回の往復で必要と
+/// するもの。**editor が読める**ので、[`HubView`] の接続先・キー名は
+/// 載せない（`admin` 限定の設定画面だけが見る情報）。
+///
+/// * `tags` は [`HubView::tags`] と同じく、catalog を**読めたときだけ**
+///   `Some`（`[]` は「読めて 0 件」）。
+/// * `registered` はレジストリに登録済みの外部名（hub 接続の下のタグの
+///   `address`）。ダイアログは「登録済み」として選べなくする。
+/// * `legacy_selection` は P4 より前の設定画面で選んでいたタグ
+///   （`hub.record.selected_tags`）。**自動ではタグにしない**（グループと
+///   周期を持たないため）。ダイアログが 1 度だけ事前にチェックして注記を
+///   出し、最初の登録が成功したとき（または明示的に「使わない」を選んだ
+///   とき）に消す（[`HubService::clear_legacy_selection`]）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubCatalogView {
+    pub status: HubStatus,
+    pub tags: Option<Vec<HubTagView>>,
+    pub registered: Vec<String>,
+    pub legacy_selection: Vec<String>,
 }
 
 /// Hub 接続画面が 1 回の往復で必要とするものすべて。`status` は
@@ -168,6 +213,8 @@ pub struct HubView {
     pub status: HubStatus,
     pub endpoint: Option<String>,
     pub key_name: Option<String>,
+    /// P4 より前の設定画面で選んでいたタグ（後方互換で読むだけ。**購読の
+    /// 対象ではない** - モジュール doc「収集への供給」）。
     pub selected_tags: Vec<String>,
     pub tags: Option<Vec<HubTagView>>,
     /// 購読の状態（#383 段階1）。`status` の 6 状態とは**別軸**で、購読が
@@ -227,7 +274,12 @@ pub struct HubSubscriptionView {
     /// 世代を持っているときは `None`。
     pub reason: Option<String>,
     pub subscribed_count: usize,
-    /// 選んだのに catalog に無かった external name（Hub から消えた／権限で
+    /// 購読の対象として登録されている外部名（#383 段階3 P4: レジストリの
+    /// **有効な** hub 接続の下のタグ。収集の有無に関わらず購読する。Hub 接続を
+    /// 無効にすると外れる - 2026-10-11 オーナー決定）。ソート済み。
+    /// 設定画面はこれを「登録済みの Hub タグ」として読み取り専用で出す。
+    pub registered: Vec<String>,
+    /// 登録したのに catalog に無かった external name（Hub から消えた／権限で
     /// 見えない）。**空表示に潰さない**。
     pub unresolved: Vec<String>,
     /// そのままでは購読要求に載せられなかった external name（名前にカンマを
@@ -256,6 +308,7 @@ impl HubSubscriptionView {
     /// いたか」は有用な情報。
     fn stopped(
         reason: Option<String>,
+        registered: Vec<String>,
         unresolved: Vec<String>,
         unsupported: Vec<String>,
         last_error: Option<TagErrorKind>,
@@ -265,6 +318,7 @@ impl HubSubscriptionView {
             state: "stopped",
             reason,
             subscribed_count: 0,
+            registered,
             unresolved,
             unsupported,
             last_error: last_error.map(|kind| kind.as_str().to_owned()),
@@ -439,13 +493,14 @@ fn to_banto_error(error: BootstrapError) -> BantoError {
 const REASON_NOT_STARTED: &str = "購読の状態をまだ確認していません。";
 const REASON_NOT_CONFIGURED: &str = "Hubへの接続が設定されていません。";
 const REASON_NOT_CONNECTED: &str = "Hubに接続できていないため購読していません。";
-const REASON_NO_TAGS: &str = "購読するタグが選ばれていません。";
+const REASON_NO_TAGS: &str =
+    "Hub 経由のタグが登録されていないため購読していません（「タグ設定」の「Hub から追加」で登録します）。";
 const REASON_ALL_UNRESOLVED: &str =
-    "選んだタグがHubのタグ一覧に見つからないため、購読できるタグがありません。";
+    "登録したタグがHubのタグ一覧に見つからないため、購読できるタグがありません。";
 const REASON_ALL_UNSUPPORTED: &str =
-    "選んだタグをそのままでは購読できないため（名前が購読プロトコルの制約に合わない、または同じタグを重複して指している）、購読できるタグがありません。";
+    "登録したタグをそのままでは購読できないため（名前が購読プロトコルの制約に合わない、または同じタグを重複して指している）、購読できるタグがありません。";
 const REASON_NONE_SUBSCRIBABLE: &str =
-    "選んだタグはHubのタグ一覧に無いか、そのままでは購読できないため、購読できるタグがありません。";
+    "登録したタグはHubのタグ一覧に無いか、そのままでは購読できないため、購読できるタグがありません。";
 const REASON_NO_KEY: &str =
     "保存済みのAPIキーを取り出せないため購読できません（デスクトップアプリから接続し直してください）。";
 /// キーは取り出せたが Hub に拒否された。[`REASON_NO_KEY`] とは原因も次の
@@ -463,11 +518,6 @@ const REASON_KEY_TRIPPED: &str =
 /// 起こし直さない。ほかの停止理由（環境が直れば復帰する）と混ぜないために
 /// 独立した語彙にする。
 const REASON_SHUTTING_DOWN: &str = "アプリを終了しているため購読を停止しました。";
-/// 選択は保存できたが、直後の catalog 再取得に失敗した状態。**保存は成功
-/// している**ことと、**放っておいても見張りが張り直す**ことが伝わる文言に
-/// する（ユーザーに再操作を要求しない）。
-const REASON_SELECTION_CHANGED_REFRESH_FAILED: &str =
-    "選択を保存しましたが、Hubのタグ一覧を取り直せませんでした。まもなく自動で再試行します。";
 
 /// 購読プロトコル（`banto-tagclient` の `stream_core::validate_tag_selection`）
 /// が受け付けない external name か。
@@ -571,25 +621,48 @@ type SubscriptionIdentity = (String, Vec<String>);
 
 fn subscription_identity(
     record: Option<&HubRecord>,
+    registered: &[String],
     collect_demand: &[String],
 ) -> Option<SubscriptionIdentity> {
     let record = record?;
-    let mut tags = wanted_tags(record, collect_demand);
-    tags.sort();
-    tags.dedup();
-    Some((fingerprint_endpoint(&record.endpoint), tags))
+    Some((
+        fingerprint_endpoint(&record.endpoint),
+        wanted_set(registered, collect_demand),
+    ))
 }
 
-/// 購読するタグ集合（#383 段階3 P3）: 画面の選択の後ろに収集の需要を並べた
-/// もの。重複は [`plan_bindings`] が畳むのでここでは残してよい（選択の並びは
-/// 変えない - 画面の一覧の順をそのまま保つ）。
-fn wanted_tags(record: &HubRecord, collect_demand: &[String]) -> Vec<String> {
-    record
-        .selected_tags
-        .iter()
-        .chain(collect_demand)
-        .cloned()
-        .collect()
+/// 購読するタグ集合（#383 段階3 P4、2026-10-11 オーナー決定）: レジストリに
+/// **登録済みの** hub タグの外部名の後ろに、収集の需要を並べたもの。重複は
+/// [`plan_bindings`] が畳むのでここでは残してよい。
+///
+/// P3 までは画面の選択（`hub.record.selected_tags`）∪ 需要だった。選択を
+/// 収集中に変えるたびに購読を張り直し、数周期の切断と Bad が出たため、P4 で
+/// 選択を購読から外した（選択は読み取りだけ残す - 移行の事前チェック用）。
+/// 需要は収集の対象（有効なタグ）で、登録済みの部分集合なので、収集の開始・
+/// 停止では集合が変わらない（張り直さない）。変わるのは登録が変わったときだけ。
+fn wanted_tags(registered: &[String], collect_demand: &[String]) -> Vec<String> {
+    registered.iter().chain(collect_demand).cloned().collect()
+}
+
+/// [`wanted_tags`] のソート済み・重複なしの集合（同一性の比較用）。
+fn wanted_set(registered: &[String], collect_demand: &[String]) -> Vec<String> {
+    let mut tags = wanted_tags(registered, collect_demand);
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+/// 外部名の並びを比較用に正規化する（前後の空白を落とし、空を捨て、ソートして
+/// 重複を畳む）。レジストリ・収集の需要のどちらにも使う。
+fn normalized_names(names: Vec<String>) -> Vec<String> {
+    let mut names: Vec<String> = names
+        .into_iter()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// 覚えている「最後に値を受けた時刻」を、これからの購読でも出してよいか。
@@ -1074,9 +1147,13 @@ struct Subscription {
     credential_rejection: Option<RememberedRejection>,
     /// [`RetryPace::Slowly`] の待ち周期のカウンタ（[`takes_this_tick`]）。
     slow_retry_ticks: u32,
+    /// レジストリに登録済みの hub タグの外部名（#383 段階3 P4、
+    /// [`HubService::refresh_registered`]）。正規化済み（[`normalized_names`]）。
+    /// 収集の有無に関わらず購読する（[`wanted_tags`]）。
+    registered: Vec<String>,
     /// 収集が要る外部名（#383 段階3 P3、[`HubService::prepare_collect`]）。
-    /// 選択タグと合わせて購読する（[`wanted_tags`]）。収集が止まると空に戻す
-    /// （[`HubService::release_collect`]）。
+    /// 登録済みのタグと合わせて購読する（[`wanted_tags`]）。収集が止まると
+    /// 空に戻す（[`HubService::release_collect`]）。正規化済み。
     collect_demand: Vec<String>,
     /// 需要が変わったのに、まだ突き合わせ（[`HubService::reconcile_generation`]）
     /// が今の需要で判断していない。見張りはこれが立っている間だけ追加で
@@ -1102,6 +1179,7 @@ impl Default for Subscription {
             last_value_from: None,
             credential_rejection: None,
             slow_retry_ticks: 0,
+            registered: Vec::new(),
             collect_demand: Vec::new(),
             demand_pending: false,
             feed: HubFeed::default(),
@@ -1110,6 +1188,61 @@ impl Default for Subscription {
 }
 
 impl Subscription {
+    /// 登録済みの外部名を差し替える（#383 段階3 P4）。**購読するタグ集合
+    /// （[`wanted_set`]）が実際に変わったときだけ** [`Self::demand_pending`] を
+    /// 立て、その真偽を返す - 変わらない差し替えで Hub を叩かない（無駄撃ちの
+    /// 抑制、checklist §5）。
+    fn set_registered(&mut self, names: Vec<String>) -> bool {
+        let names = normalized_names(names);
+        if names == self.registered {
+            return false;
+        }
+        let before = wanted_set(&self.registered, &self.collect_demand);
+        self.registered = names;
+        self.mark_pending_if_changed(before)
+    }
+
+    /// レジストリから読み直した購読の対象（有効な Hub 接続の下の登録済みのタグ）を
+    /// 入れ、**収集の需要もその中に絞る**（2026-10-11 オーナーレビュー P2）。
+    ///
+    /// 需要は収集の開始の時点の計画なので、収集中に Hub 接続を無効にした・タグを
+    /// 消したときに需要だけが古い名前を持ち続けると、和集合（[`wanted_set`]）が
+    /// 変わらず購読が続いてしまう（「無効なら購読しない」に反する）。需要は常に
+    /// 購読の対象の部分集合に保つ。外した名前は収集の側では「購読していない」＝
+    /// Bad + null として記録され（`banto_collect::external` の表の「name absent」）、
+    /// 「収集を再起動」で計画から外れる。集合が変われば旗を立てる（1 回の張り直し）。
+    ///
+    /// レジストリを差し込んだ実行形態（[`HubService::refresh_registered`]）だけが
+    /// 呼ぶ。レジストリの無いテスト・実機確認の example は [`Self::set_registered`]。
+    fn set_registered_from_registry(&mut self, names: Vec<String>) -> bool {
+        let names = normalized_names(names);
+        let before = wanted_set(&self.registered, &self.collect_demand);
+        self.collect_demand
+            .retain(|name| names.binary_search(name).is_ok());
+        self.registered = names;
+        self.mark_pending_if_changed(before)
+    }
+
+    /// 収集の需要を差し替える。立て方は [`Self::set_registered`] と同じ
+    /// （集合が変わったときだけ）。
+    fn set_demand(&mut self, names: Vec<String>) -> bool {
+        let names = normalized_names(names);
+        if names == self.collect_demand {
+            return false;
+        }
+        let before = wanted_set(&self.registered, &self.collect_demand);
+        self.collect_demand = names;
+        self.mark_pending_if_changed(before)
+    }
+
+    fn mark_pending_if_changed(&mut self, before: Vec<String>) -> bool {
+        let changed = wanted_set(&self.registered, &self.collect_demand) != before;
+        if changed {
+            self.demand_pending = true;
+        }
+        changed
+    }
+
     /// 既存の世代を止める。エラーは best effort でログのみ - 購読の後始末で
     /// 接続の状態を壊さない。
     ///
@@ -1186,6 +1319,7 @@ impl Subscription {
         let Some(generation) = self.generation.as_ref() else {
             return HubSubscriptionView::stopped(
                 self.reason.clone(),
+                self.registered.clone(),
                 self.unresolved.clone(),
                 self.unsupported.clone(),
                 self.credential_rejection.map(|memory| memory.kind),
@@ -1197,6 +1331,7 @@ impl Subscription {
             state: connection_state_str(state.connection_state()),
             reason: None,
             subscribed_count: generation.fingerprint.1.len(),
+            registered: self.registered.clone(),
             unresolved: self.unresolved.clone(),
             unsupported: self.unsupported.clone(),
             last_error: state.last_error().map(|kind| kind.as_str().to_owned()),
@@ -1438,7 +1573,7 @@ const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
 /// drop できるのはローカルの future であって、**Hub が既に受け取って処理した
 /// 要求は取り消せない**。したがってこの上限は
 /// **Hub 側に副作用を残さない往復に**使う - `status` / `refresh_catalog` /
-/// `set_selected_tags` の再取得 / `resume_locked` はどれも `GET` の読み取り
+/// `resume_locked` はどれも `GET` の読み取り
 /// だけ。`adopt_manual_key` も同じ側で、ネットワークに出るのは
 /// `verify()`（`GET /api/v1/tags`）だけ、成功後の保存は OS キーリングと
 /// 設定という**ローカル 2 つ**に閉じている（#395 のレビュー P2 で crate の
@@ -1484,19 +1619,6 @@ const HUB_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
 fn hub_timeout_reason() -> String {
     format!(
         "Hubが{}秒以内に応答しませんでした。接続先とHubの状態を確認してください。",
-        HUB_OPERATION_TIMEOUT.as_secs()
-    )
-}
-
-/// [`HubService::set_selected_tags`] の再取得がタイムアウトしたときの理由。
-///
-/// この経路だけは**保存そのものは成功している**（再取得は best effort）ので、
-/// それが伝わらない [`hub_timeout_reason`] は使わない。見張りが next tick で
-/// 拾い直すことも添えて、ユーザーに再操作を要求しない
-/// （[`REASON_SELECTION_CHANGED_REFRESH_FAILED`] と同じ考え方）。
-fn selection_saved_hub_timeout_reason() -> String {
-    format!(
-        "選択を保存しましたが、Hubが{}秒以内に応答しませんでした。まもなく自動で再試行します。",
         HUB_OPERATION_TIMEOUT.as_secs()
     )
 }
@@ -1591,6 +1713,7 @@ impl HubCall {
         }
     }
 
+    #[cfg(test)]
     fn timed_out_flag(&self) -> bool {
         self.reason_override.is_some()
     }
@@ -1618,10 +1741,10 @@ struct HubInner {
     /// 見張り（30 秒ごとに `resume_inner()` → `hydrate()`）が割り込むと、
     /// 次の順序で**ユーザーの変更が黙って消える**:
     ///
-    /// 1. `set_selected_tags` が写しを更新（`dirty = true`）。
+    /// 1. 設定を変える操作（当時は選択の保存）が写しを更新（`dirty = true`）。
     /// 2. `flush()` の前に見張りのティックが `hydrate()` を呼ぶ → 写しが
     ///    **古い DB の値**で置き換わり、`dirty` も落ちる。
-    /// 3. `set_selected_tags` の `flush()` は「変更なし」と見て何も書かず
+    /// 3. その操作の `flush()` は「変更なし」と見て何も書かず
     ///    **成功を返す**。選択は保存されていないのに保存されたと見える。
     ///
     /// **ロック順序は一方向に固定**: この操作ロック（外）→ [`Self::subscription`]
@@ -1662,6 +1785,25 @@ struct HubInner {
     /// 答えを決め打ちするため。製品ビルドにはフィールドごと無い）。
     #[cfg(test)]
     prepare_answer_for_test: Mutex<Option<HubCollectReadiness>>,
+    /// 登録済みの hub タグを読むレジストリ（#383 段階3 P4、
+    /// [`HubService::attach_registry`]）。無ければ登録済みの集合は
+    /// [`HubService::set_registered_tags`] で与えたものだけ（テスト・実機確認の
+    /// example）。
+    registry: std::sync::OnceLock<sqlx::SqlitePool>,
+    /// [`HubService::registry_changed`] が張り直しのタスクを既に予約している
+    /// （二重起動の防止。予約したタスクが操作ロックを取った時点で降ろす -
+    /// それより後の変更は、そのタスクの突き合わせが読み直すレジストリに
+    /// 含まれる）。
+    registry_resync_queued: std::sync::atomic::AtomicBool,
+    /// 移行前の選択の消去を予約した（[`HubService::schedule_legacy_selection_clear`]）
+    /// が、まだ消せていない。立っている間は、ダイアログ用の catalog
+    /// （[`HubService::catalog_for_registration`]）が移行前の選択を**空として**返す
+    /// （消去が操作ロックを待っている間に事前チェックが出直さないように）。
+    /// 消せたら降ろす。失敗したら立てたまま（このプロセスの間は出さない。設定には
+    /// 残っているので、次の予約で消しに行く）。
+    legacy_clear_pending: std::sync::atomic::AtomicBool,
+    /// 消去のタスクが走っている（単発の保証。走っている間の予約は旗を立てるだけ）。
+    legacy_clear_running: std::sync::atomic::AtomicBool,
 }
 
 /// Hub 接続のサービス層。`src-tauri` の `hub_*` コマンドと
@@ -1713,6 +1855,10 @@ impl HubService {
                 generations_started: AtomicUsize::new(0),
                 #[cfg(test)]
                 prepare_answer_for_test: Mutex::new(None),
+                registry: std::sync::OnceLock::new(),
+                registry_resync_queued: std::sync::atomic::AtomicBool::new(false),
+                legacy_clear_pending: std::sync::atomic::AtomicBool::new(false),
+                legacy_clear_running: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -1761,7 +1907,9 @@ impl HubService {
     pub async fn prepare_collect(&self, names: Vec<String>) -> HubCollectReadiness {
         {
             let mut slot = self.inner.subscription.lock().await;
-            slot.collect_demand = names;
+            slot.set_demand(names);
+            // 開始は catalog を読み直して突き合わせる（下）。打ち切っても見張りが
+            // 反映できるよう、集合が変わらなくても旗は立てる。
             slot.demand_pending = true;
         }
         #[cfg(test)]
@@ -1798,11 +1946,220 @@ impl HubService {
     /// 取り下げた分の購読は、見張りが次の周期で計画し直すときに外れる
     /// （すぐ開始し直す再起動では、同じ需要が戻ってきて張り直しが起きない）。
     pub async fn release_collect(&self) {
-        let mut slot = self.inner.subscription.lock().await;
-        if !slot.collect_demand.is_empty() {
-            slot.collect_demand.clear();
-            slot.demand_pending = true;
+        // 需要は登録済みの部分集合なので、たいてい購読する集合は変わらず、
+        // そのときは旗も立たない（見張りが Hub を叩きに行かない）。
+        self.inner.subscription.lock().await.set_demand(Vec::new());
+    }
+
+    /// 収集の需要を、開始時の突き合わせの**後の**計画に絞る（#383 段階3 P4、
+    /// P3 の持ち越し）。`hubTagNotFound` / `hubTagTypeChanged` で外したタグを
+    /// 需要に残さない。**Hub は叩かない**（開始時に読んだ catalog で既に
+    /// 判断済み）。需要は登録済みの部分集合なので、購読する集合はたいてい
+    /// 変わらず、張り直しも起きない（[`Subscription::set_demand`]）。
+    pub async fn narrow_collect(&self, names: Vec<String>) {
+        self.inner.subscription.lock().await.set_demand(names);
+    }
+
+    /// 登録済みの hub タグを読むレジストリを差し込む（#383 段階3 P4）。
+    /// 実行形態の組み立て（`src-tauri` / `banto-serve`）が 1 回だけ呼ぶ。
+    /// 2 回目以降は無視する（最初のプールを使い続ける）。
+    pub fn attach_registry(&self, pool: sqlx::SqlitePool) {
+        let _ = self.inner.registry.set(pool);
+    }
+
+    /// レジストリを読み直して登録済みの集合を更新し、**購読するタグ集合が
+    /// 変わったか**を返す（#383 段階3 P4）。レジストリが無ければ何もしない
+    /// （`false`）。読めなければ前の集合を保つ（読めなかったことを「登録 0 件」
+    /// に潰さない - 潰すと購読が全部止まる）。
+    ///
+    /// 呼ぶ場所: 突き合わせの頭（[`Self::reconcile_generation`]。どの操作も
+    /// 最新の登録で計画する）、見張りの各周期（[`Self::supervise_once`]。
+    /// 登録の変更を知らせ損ねた経路も 30 秒以内に拾う）、
+    /// [`Self::registry_changed`]。
+    async fn refresh_registered(&self) -> bool {
+        let Some(pool) = self.inner.registry.get() else {
+            return false;
+        };
+        match crate::hub_tags::subscribed_external_names(pool).await {
+            Ok(names) => self
+                .inner
+                .subscription
+                .lock()
+                .await
+                .set_registered_from_registry(names),
+            Err(err) => {
+                eprintln!(
+                    "banto: 登録済みのHub経由のタグを読めませんでした（前の内容で購読を続けます）: {err}"
+                );
+                false
+            }
         }
+    }
+
+    /// レジストリ（接続・収集グループ・タグ）を変えた後に呼ぶ（#383 段階3
+    /// P4）。登録済みの hub タグの集合が変わっていれば、張り直しのタスクを
+    /// **1 本だけ**予約して、すぐ返る（REST・Tauri の保存を Hub の往復で
+    /// 待たせない）。変わっていなければ何もしない。
+    ///
+    /// **購読の張り直しは収集にも効く**: 収集中に hub タグを追加・削除すると、
+    /// 購読を 1 回張り直す間（数周期）Hub 経由のタグは Bad になり、Hub の接続
+    /// キーで切断・再接続のイベントが出る（`banto-tagclient` は購読の追加・
+    /// 削除を接続を保ったまま行う口を持たない - `start(requests)` の要求は
+    /// 固定）。登録を変えたときだけなので許容する（2026-10-11 オーナー決定）。
+    /// 予約したタスクは突き合わせの頭でレジストリを読み直すので、予約中に
+    /// 重なった変更も同じ 1 回で反映される。
+    pub async fn registry_changed(&self) {
+        if !self.refresh_registered().await || self.is_shutting_down() {
+            return;
+        }
+        if self
+            .inner
+            .registry_resync_queued
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let operation = service.begin_operation().await;
+            service
+                .inner
+                .registry_resync_queued
+                .store(false, Ordering::SeqCst);
+            let Ok(_operation) = operation else {
+                return;
+            };
+            if let Err(err) = service.resume_locked().await {
+                eprintln!(
+                    "banto: 登録の変更をHubの購読に反映できませんでした（見張りが再試行します）: {err}"
+                );
+            }
+        });
+    }
+
+    /// 登録済みの外部名を直接与えて、購読をすぐ突き合わせる（#383 段階3 P4）。
+    /// レジストリを差し込んでいない実行形態（実機確認の example
+    /// `hub_real_smoke`）のための口で、**レジストリを差し込んでいれば次の
+    /// 突き合わせでレジストリの内容に戻る**（正はレジストリ）。Hub に
+    /// 接続していなければ集合を覚えるだけ。
+    pub async fn set_registered_tags(&self, names: Vec<String>) -> Result<(), BantoError> {
+        self.inner.subscription.lock().await.set_registered(names);
+        self.resume_inner().await
+    }
+
+    /// 「Hub から追加」のダイアログ用（#383 段階3 P4）: catalog・登録済みの
+    /// 外部名・移行前の選択を 1 回で返す。[`Self::status`] と同じく catalog を
+    /// 読み直す（ダイアログを開いたとき・「一覧を更新」のときだけ呼ぶ。
+    /// ポーリングには使わない）。**発行は行わない**。
+    pub async fn catalog_for_registration(&self) -> Result<HubCatalogView, BantoError> {
+        let view = self.status().await?;
+        // 「登録済み」は購読の対象（有効な Hub 接続の下だけ）ではなく、レジストリの
+        // すべての hub タグ（無効にした Hub 接続の下のものも 2 本目として登録させない）。
+        let registered = match self.inner.registry.get() {
+            Some(pool) => crate::hub_tags::registered_external_names(pool).await?,
+            None => view.subscription.registered.clone(),
+        };
+        // 消去を予約済み（まだ操作ロックを待っている）なら、消えたものとして返す。
+        let legacy_selection = if self.inner.legacy_clear_pending.load(Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            self.inner
+                .mirror
+                .current()
+                .map(|record| record.selected_tags)
+                .unwrap_or_default()
+        };
+        Ok(HubCatalogView {
+            status: view.status,
+            tags: view.tags,
+            registered,
+            legacy_selection,
+        })
+    }
+
+    /// 「Hub から追加」の登録が成功した後に、移行前の選択の消去を**予約する**
+    /// （#383 段階3 P4）。**待たない**: 消去は操作ロックを取るので、`connect`
+    /// （最大 60 秒）が走っていると待たされる - それで登録の応答を遅らせない。
+    ///
+    /// * 予約した時点で [`HubInner::legacy_clear_pending`] を立てるので、消える
+    ///   前に開き直したダイアログにも事前チェックは出ない。
+    /// * 消去のタスクは**単発**（[`HubInner::legacy_clear_running`]）。走っている
+    ///   間の予約は旗だけ立てる（そのタスクが操作ロックの後で最新の記録を消すので
+    ///   足りる）。消去は冪等（消すものが無ければ何もしない）。
+    /// * 失敗はログに残し、旗は立てたまま（このプロセスの間は出さない。次の予約で
+    ///   また消しに行く）。
+    ///
+    /// 戻り値は「消すべき移行前の選択があったので予約した」か（写しを読むだけ。
+    /// 写しが未読込なら `false` でも予約はする）。
+    pub fn schedule_legacy_selection_clear(&self) -> bool {
+        let had_selection = self
+            .inner
+            .mirror
+            .current()
+            .is_some_and(|record| !record.selected_tags.is_empty());
+        if self.is_shutting_down() {
+            return had_selection;
+        }
+        self.inner
+            .legacy_clear_pending
+            .store(true, Ordering::SeqCst);
+        if self.inner.legacy_clear_running.swap(true, Ordering::SeqCst) {
+            return had_selection;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            // 消去は冪等で、操作ロックを取ってから最新の記録を読み直して消すので、
+            // 走っている間に重なった予約も同じ 1 回で満たされる（P4 から選択を
+            // 書き込む口は無く、新しい選択が後から現れることも無い）。
+            match service.clear_legacy_selection().await {
+                Ok(_) => service
+                    .inner
+                    .legacy_clear_pending
+                    .store(false, Ordering::SeqCst),
+                Err(err) => eprintln!(
+                    "banto: Hub から追加した後、以前の画面で選んでいたタグを消せませんでした（登録は完了しています。次の登録・「以前の選択を使わない」で再試行します）: {err}"
+                ),
+            }
+            service
+                .inner
+                .legacy_clear_running
+                .store(false, Ordering::SeqCst);
+        });
+        had_selection
+    }
+
+    /// テスト用: 移行前の選択の消去を予約済みで、まだ消せていないか。
+    #[cfg(test)]
+    pub(crate) fn legacy_clear_pending_for_test(&self) -> bool {
+        self.inner.legacy_clear_pending.load(Ordering::SeqCst)
+    }
+
+    /// テスト用: 操作ロックを外から握る（`connect` が走っている状態の再現）。
+    #[cfg(test)]
+    pub(crate) async fn hold_operation_lock_for_test(&self) -> AsyncMutexGuard<'_, ()> {
+        self.inner.operation.lock().await
+    }
+
+    /// P4 より前の設定画面で選んでいたタグ（`hub.record.selected_tags`）を
+    /// 消す（#383 段階3 P4 の移行）。消したら `true`、元から無ければ
+    /// `false`。**購読には影響しない**（P4 から選択は購読の対象ではない）
+    /// ので、Hub は叩かない。
+    pub async fn clear_legacy_selection(&self) -> Result<bool, BantoError> {
+        let _operation = self.begin_operation().await?;
+        let had_selection = self
+            .inner
+            .mirror
+            .current()
+            .is_some_and(|record| !record.selected_tags.is_empty());
+        if !had_selection {
+            return Ok(false);
+        }
+        self.inner
+            .bootstrapper
+            .set_selected_tags(Vec::new())
+            .map_err(to_banto_error)?;
+        self.flush().await?;
+        Ok(true)
     }
 
     /// テスト用: [`Self::prepare_collect`] の答えを決め打ちする
@@ -2112,6 +2469,9 @@ impl HubService {
         // ので、古いキーの理由が残っている - ここで捨てないと、保存済みの
         // 新しいキーで再試行されない（#449 レビュー P2-1）。
         let stored = self.inner.bootstrapper.stored_credential();
+        // #383 段階3 P4: 登録の変更を知らせ損ねた経路（設定パッケージの取り込み
+        // など）も、ここで拾う。集合が変わっていれば `demand_pending` が立つ。
+        self.refresh_registered().await;
         {
             let mut slot = self.inner.subscription.lock().await;
             if let Ok(stored) = stored {
@@ -2207,72 +2567,6 @@ impl HubService {
         self.finish(saved, call, Trigger::Observe).await
     }
 
-    /// 選択タグの保存。空でも保存できる（受入条件）。
-    ///
-    /// ワイヤ形（引数・戻り値）は #332 のまま。保存したあとに catalog を
-    /// 1 回読み直してから購読を張り直すだけで、**追加の 1 往復はユーザー
-    /// 操作なので許容**する（画面のポーリングはこの経路を通らない）。
-    /// 読み直しに失敗しても**保存は成功のまま返す** - 保存の成否と購読の
-    /// 張り直しは別事象で、前者を後者の失敗で覆さない。逆に、設定 DB への
-    /// 保存（[`Self::flush`]）が失敗したときは**失敗を返す**が、その前に
-    /// 購読の突き合わせ・停止まで必ず済ませる（#394 のレビュー P1-2）。
-    ///
-    /// ただし読み直しに失敗したときは**古い世代を止める**。選択を変えた
-    /// 以上、古い選択のタグの値はもう誤情報であり、**一時的に何も出ない
-    /// 方が、古い選択の値を流し続けるよりまし**だから。世代が無くなれば
-    /// 見張り（[`Self::spawn_supervisor`]）が次の周期で拾って張り直す -
-    /// 世代を生かしたままだと `Live` のまま据え置かれ、見張りも動かないので
-    /// 誰かが明示操作するまで古い値が流れ続けてしまう。
-    pub async fn set_selected_tags(&self, tags: Vec<String>) -> Result<(), BantoError> {
-        let _operation = self.begin_operation().await?;
-        self.inner
-            .bootstrapper
-            .set_selected_tags(tags)
-            .map_err(to_banto_error)?;
-        // 保存の失敗（`saved`）は最後に返すが、**途中で抜けない**
-        // （#394 のレビュー P1-2）。抜けると購読が古い選択のまま残り、
-        // 「保存もされず、購読も直らない」という一番悪い形になる。
-        let saved = self.flush().await;
-        match with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await {
-            Ok(mut call) => {
-                // 打ち切ったときも**保存は成功のまま**返す（再取得は best
-                // effort）。ただし理由は「保存できている」ことが伝わる方に
-                // 差し替える（#395 のレビュー対応）。状態自体は
-                // `Unreachable` なので、突き合わせが古い世代を止める。
-                if call.timed_out_flag() {
-                    call.reason_override = Some(selection_saved_hub_timeout_reason());
-                }
-                let saved_again = self.flush().await;
-                self.reconcile(&call, Trigger::Observe).await;
-                self.saved_outcome(saved.and(saved_again))?;
-            }
-            Err(err) => {
-                eprintln!(
-                    "banto: 選択タグ保存後のHubタグ一覧の再取得に失敗しました（古い購読を止めて再試行を待ちます）: {err}"
-                );
-                let mut slot = self.inner.subscription.lock().await;
-                // 選択が変わったなら、前の選択についての最終受信時刻はもう
-                // 別の購読の話（同じ選択で保存し直しただけなら残る）。
-                let identity = subscription_identity(
-                    self.inner.mirror.current().as_ref(),
-                    &slot.collect_demand,
-                );
-                slot.retain_last_value_for(identity.as_ref());
-                // 未解決・購読不可は**直前の選択**を catalog と突き合わせた
-                // 結果なので、選択が変わった今はもう何も語っていない。新しい
-                // 選択と並べて出すと理由（再取得できなかった）と中身が食い違う
-                // ため、`reconcile_with` の未接続分岐と同じく伏せる。
-                slot.unresolved.clear();
-                slot.unsupported.clear();
-                slot.stop(Some(REASON_SELECTION_CHANGED_REFRESH_FAILED.to_owned()))
-                    .await;
-                // 購読を整合させた**後で**保存の失敗を返す（上と同じ理由）。
-                saved?;
-            }
-        }
-        Ok(())
-    }
-
     /// 切断: ローカルの設定とキーリングだけを消す。Hub 側のキーは失効
     /// させない（他のインストールを巻き込まないため - crate 側の
     /// `disconnect` の doc comment参照）。
@@ -2287,24 +2581,6 @@ impl HubService {
         let saved = self.flush().await;
         let view = self.not_configured_view().await;
         saved.map(|()| view)
-    }
-
-    /// 報告すべき保存の失敗があるか（#395 のレビュー C）。
-    ///
-    /// [`Self::flush`] は写しが dirty な限り同じ変更を書き直すので、
-    /// **2 回目の呼び出しは 1 回目の再試行でもある**。1 回目が一時的な理由
-    /// （設定 DB のロックなど）で失敗し、2 回目で書けたのなら保存は成立して
-    /// いる - そこで「保存できませんでした」と返すと、実際には保存できて
-    /// いるのに UI が失敗を出す（嘘の表示になる）。
-    ///
-    /// 判断は結果の組み合わせではなく**写しに未書き込みが残っているか**で
-    /// 行う: これが `flush` の事後条件そのもので、`flush` を何回呼んでも
-    /// 同じ規準で答えられる。
-    fn saved_outcome(&self, reported: Result<(), BantoError>) -> Result<(), BantoError> {
-        if self.inner.mirror.pending().is_none() {
-            return Ok(());
-        }
-        reported
     }
 
     /// 設定の保存結果と、突き合わせ済みの [`HubView`] を 1 つの答えにする。
@@ -2450,9 +2726,13 @@ impl HubService {
         trigger: Trigger,
         reason_override: Option<&str>,
     ) {
+        // #383 段階3 P4: どの操作も**最新の登録**で計画する（購読ロックを取る
+        // 前に読む - 読み取りの間は購読ロックを握らない）。
+        self.refresh_registered().await;
         let record = self.inner.mirror.current();
         let mut slot = self.inner.subscription.lock().await;
-        let identity = subscription_identity(record.as_ref(), &slot.collect_demand);
+        let identity =
+            subscription_identity(record.as_ref(), &slot.registered, &slot.collect_demand);
         // #383 段階3 P3: ここから先は**今の**需要で判断するので、需要の変化は
         // 突き合わせ済みになる。世代を持てない分岐（未接続・キーの拒否など）でも
         // 降ろす - その後いつ張り直しに行くかは通常の見張りの規則
@@ -2498,8 +2778,11 @@ impl HubService {
         };
 
         // 2. 未解決タグ・購読できない名前は世代の有無に関わらず画面に出す。
-        //    購読するのは選択と収集の需要の和集合（#383 段階3 P3）。
-        let plan = plan_bindings(&wanted_tags(&record, &slot.collect_demand), catalog);
+        //    購読するのは登録済みのタグと収集の需要の和集合（#383 段階3 P4）。
+        let plan = plan_bindings(
+            &wanted_tags(&slot.registered, &slot.collect_demand),
+            catalog,
+        );
         slot.unresolved = plan.unresolved;
         slot.unsupported = plan.unsupported;
         if plan.requests.is_empty() {
@@ -3219,33 +3502,6 @@ mod tests {
         );
     }
 
-    // --- #395 レビュー C: 2 回目で書けたら「保存失敗」と言わない ------------
-
-    /// `flush()` は dirty な限り同じ変更を書き直すので、2 回目は 1 回目の
-    /// 再試行でもある。1 回目が一時的に失敗しても、2 回目で書けたなら保存は
-    /// 成立していて、そこで「保存できませんでした」と返すのは嘘になる。
-    #[tokio::test]
-    async fn a_retried_flush_that_succeeds_is_not_reported_as_a_failure() {
-        let (pool, settings, hub) = service_with_a_failed_write().await;
-        assert!(
-            hub.saved_outcome(Err(BantoError::Storage("1回目の失敗".to_owned())))
-                .is_err(),
-            "まだ書けていない間は失敗として報告する"
-        );
-
-        unblock_settings_writes(&pool).await;
-        hub.flush().await.expect("2 回目は同じ変更を書き直せる");
-
-        assert!(hub.inner.mirror.pending().is_none(), "dirty が解消する");
-        assert!(
-            hub.saved_outcome(Err(BantoError::Storage("1回目の失敗".to_owned())))
-                .is_ok(),
-            "2 回目で書けたのに 1 回目の失敗を返さない"
-        );
-        let stored = stored_record(&settings).await;
-        assert!(stored.contains("\"b\""), "実際に書かれている: {stored}");
-    }
-
     #[tokio::test]
     async fn installation_id_is_generated_once_and_reused() {
         let (settings, _hub) = service().await;
@@ -3328,9 +3584,18 @@ mod tests {
             .await
             .unwrap();
 
-        hub.set_selected_tags(vec!["line1.fast.temp02".to_owned()])
-            .await
-            .unwrap();
+        // #383 段階3 P4: 移行前の選択は読めて（ダイアログの事前チェック用）、
+        // 消すと記録の他の項目は保ったまま空になる。
+        let catalog = hub.catalog_for_registration().await.unwrap();
+        assert_eq!(
+            catalog.legacy_selection,
+            vec!["line1.fast.temp01".to_owned()]
+        );
+        assert!(hub.clear_legacy_selection().await.unwrap(), "消した");
+        assert!(
+            !hub.clear_legacy_selection().await.unwrap(),
+            "2 回目は消すものが無い"
+        );
 
         let stored = settings.get(KEY_HUB_RECORD).await.unwrap().unwrap();
         assert!(
@@ -3338,15 +3603,114 @@ mod tests {
             "no plaintext key may be stored: {stored}"
         );
         let read_back: HubRecord = serde_json::from_str(&stored).unwrap();
-        assert_eq!(
-            read_back.selected_tags,
-            vec!["line1.fast.temp02".to_owned()]
-        );
+        assert!(read_back.selected_tags.is_empty());
         assert_eq!(read_back.key_id, Some(3));
+        assert_eq!(read_back.endpoint, "http://127.0.0.1:3100");
+        assert!(hub
+            .catalog_for_registration()
+            .await
+            .unwrap()
+            .legacy_selection
+            .is_empty());
+    }
+
+    /// #383 段階3 P4（監査の追補）: 登録の後の移行前の選択の消去は**予約するだけで
+    /// 待たない**。操作ロックを握られていても（`connect` が最大 60 秒握る）すぐ戻り、
+    /// 予約の間は catalog が移行前の選択を空で返す（事前チェックが出直さない）。
+    /// ロックが空くと裏で消える。
+    ///
+    /// 反証: 予約を `clear_legacy_selection().await` に戻すと、ロックを握ったままの
+    /// 呼び出しが戻らず（この関数は同期なので書けない - 戻したら REST の
+    /// `tags_from_hub_does_not_wait_for_the_legacy_clear` が時間切れで落ちる）。
+    /// 予約の旗を catalog で見なくすると、下の「消える前の catalog」で落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scheduled_legacy_clear_returns_at_once_and_clears_after_the_lock() {
+        let (settings, hub) = service().await;
+        settings
+            .set(
+                KEY_HUB_RECORD,
+                &serde_json::to_string(&seed_record(&["a"])).unwrap(),
+            )
+            .await
+            .unwrap();
+        hub.hydrate().await.unwrap();
+
+        let held = hub.hold_operation_lock_for_test().await;
+        assert!(hub.schedule_legacy_selection_clear(), "消すべき選択がある");
+        // 2 回目の予約も待たずに戻る（タスクは単発で、旗を立てるだけ）。
+        hub.schedule_legacy_selection_clear();
+        assert!(hub.legacy_clear_pending_for_test());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let still: HubRecord =
+            serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            still.selected_tags,
+            owned(&["a"]),
+            "ロックを握られている間は消えない"
+        );
+        drop(held);
+
+        // 消える前でも catalog は空で返す（予約の旗）- ここで操作ロックを取りに行く
+        // ので、消去のタスクと順番に進む。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stored: HubRecord =
+                serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap())
+                    .unwrap();
+            if stored.selected_tags.is_empty() && !hub.legacy_clear_pending_for_test() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ロックが空いたら裏で消える"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(hub
+            .catalog_for_registration()
+            .await
+            .unwrap()
+            .legacy_selection
+            .is_empty());
+    }
+
+    /// 予約の旗が立っている間（消去がまだ操作ロックを待っている）は、設定に選択が
+    /// 残っていても catalog は移行前の選択を空で返す。
+    #[tokio::test]
+    async fn a_pending_legacy_clear_hides_the_selection_from_the_catalog() {
+        let (settings, hub) = service().await;
+        settings
+            .set(
+                KEY_HUB_RECORD,
+                &serde_json::to_string(&seed_record(&["a"])).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.catalog_for_registration()
+                .await
+                .unwrap()
+                .legacy_selection,
+            owned(&["a"])
+        );
+        hub.inner.legacy_clear_pending.store(true, Ordering::SeqCst);
+        assert!(hub
+            .catalog_for_registration()
+            .await
+            .unwrap()
+            .legacy_selection
+            .is_empty());
+    }
+
+    /// #383 段階3 P4: 未設定（記録が無い）なら消すものも無い（エラーにしない）。
+    #[tokio::test]
+    async fn clearing_the_legacy_selection_without_a_record_is_a_no_op() {
+        let (_settings, hub) = service().await;
+        assert!(!hub.clear_legacy_selection().await.unwrap());
     }
 
     #[tokio::test]
-    async fn an_empty_selection_is_savable_and_disconnect_clears_the_record() {
+    async fn a_cleared_selection_is_saved_and_disconnect_clears_the_record() {
         let (settings, hub) = service().await;
         let record = HubRecord {
             endpoint: "http://127.0.0.1:3100".to_owned(),
@@ -3361,7 +3725,7 @@ mod tests {
             .await
             .unwrap();
 
-        hub.set_selected_tags(Vec::new()).await.unwrap();
+        hub.clear_legacy_selection().await.unwrap();
         let stored: HubRecord =
             serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap()).unwrap();
         assert!(stored.selected_tags.is_empty());
@@ -4300,28 +4664,333 @@ mod tests {
         assert!(!keeps_last_value_at(None, None));
     }
 
-    /// 同一性は**接続先と選択タグだけ**で、catalog を読めていなくても計算
-    /// できる（「同じ購読が止まっているだけか」はまさに読めない場面で判断
-    /// したい）。選択の並び順や重複では変わらない。
+    /// 同一性は**接続先と購読するタグ集合（登録済み ∪ 需要）だけ**で、
+    /// catalog を読めていなくても計算できる（「同じ購読が止まっているだけか」は
+    /// まさに読めない場面で判断したい）。並び順や重複では変わらない。
+    /// #383 段階3 P4: 移行前の選択（`selected_tags`）は同一性に入らない。
     #[test]
     fn the_subscription_identity_ignores_order_and_duplicates() {
-        let base = keyring_record("http://127.0.0.1:3100", &["beta", "alpha"]);
-        let shuffled = keyring_record("http://127.0.0.1:3100/", &["alpha", "beta", "alpha"]);
+        let base = keyring_record("http://127.0.0.1:3100", &[]);
+        let slash_with_legacy = keyring_record("http://127.0.0.1:3100/", &["legacy"]);
         assert_eq!(
-            subscription_identity(Some(&base), &[]),
-            subscription_identity(Some(&shuffled), &[])
+            subscription_identity(Some(&base), &owned(&["beta", "alpha"]), &[]),
+            subscription_identity(
+                Some(&slash_with_legacy),
+                &owned(&["alpha", "beta", "alpha"]),
+                &[]
+            ),
+            "並び・重複・移行前の選択では変わらない"
         );
-        assert_eq!(subscription_identity(None, &[]), None);
-        // #383 段階3 P3: 収集の需要も同一性に入る（需要が変われば別の購読）。
+        assert_eq!(subscription_identity(None, &[], &[]), None);
+        let registered = owned(&["alpha", "beta"]);
+        // 需要が登録済みの外にはみ出せば別の購読。
         assert_ne!(
-            subscription_identity(Some(&base), &[]),
-            subscription_identity(Some(&base), &owned(&["gamma"]))
+            subscription_identity(Some(&base), &registered, &[]),
+            subscription_identity(Some(&base), &registered, &owned(&["gamma"]))
+        );
+        // 需要が登録済みの部分集合なら集合は変わらない（収集の開始・停止で
+        // 張り直さない）。
+        assert_eq!(
+            subscription_identity(Some(&base), &registered, &owned(&["alpha"])),
+            subscription_identity(Some(&base), &registered, &[]),
+            "登録済みと同じ名前の需要は集合を変えない"
+        );
+    }
+
+    /// #383 段階3 P4: 登録・需要の差し替えは、**購読する集合が変わったとき
+    /// だけ** `demand_pending` を立てる（変わらない差し替えで Hub を叩かない）。
+    #[test]
+    fn the_pending_flag_rises_only_when_the_wanted_set_changes() {
+        let mut slot = Subscription::default();
+        assert!(slot.set_registered(owned(&["b", "a"])), "空 → 2 件");
+        assert_eq!(slot.registered, owned(&["a", "b"]), "正規化して持つ");
+        slot.demand_pending = false;
+        assert!(
+            !slot.set_registered(owned(&["a", "b", "a", " "])),
+            "同じ集合"
+        );
+        assert!(!slot.demand_pending);
+        // 需要が登録済みの中に収まる間は集合が変わらない。
+        assert!(!slot.set_demand(owned(&["a"])));
+        assert!(!slot.set_demand(Vec::new()));
+        assert!(!slot.demand_pending);
+        // はみ出す需要（レジストリの読み直しが遅れた場合など）は変える。
+        assert!(slot.set_demand(owned(&["c"])));
+        assert!(slot.demand_pending);
+        slot.demand_pending = false;
+        // 登録を消すと（需要に残る c 以外が）集合から抜ける。
+        assert!(slot.set_registered(Vec::new()));
+        assert_eq!(
+            wanted_set(&slot.registered, &slot.collect_demand),
+            owned(&["c"])
+        );
+    }
+
+    /// #383 段階3 P4: 移行前の選択（`selected_tags`）だけでは購読しない
+    /// （選択を購読から外した - 収集中に選択を変えるたびの張り直しを無くす
+    /// ため）。購読するのは登録済みのタグ。
+    ///
+    /// 反証: `wanted_tags` に選択を戻すと、1 回目の突き合わせで世代が立って
+    /// 落ちる。
+    #[tokio::test]
+    async fn a_legacy_selection_alone_is_not_subscribed() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &[]).await;
+        hub.inner
+            .mirror
+            .reset(Some(keyring_record(&closed_endpoint(), &["a"])));
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+            Trigger::Observe,
+        )
+        .await;
+        assert!(
+            generation_sequence(&hub).await.is_none(),
+            "選択だけでは張らない"
+        );
+        let view = hub.subscription().await;
+        assert_eq!(view.reason.as_deref(), Some(REASON_NO_TAGS));
+        assert!(view.registered.is_empty());
+
+        register_for_test(&hub, &["a"]).await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+            Trigger::Observe,
+        )
+        .await;
+        assert!(generation_sequence(&hub).await.is_some(), "登録したら張る");
+        let view = hub.subscription().await;
+        assert_eq!(view.registered, owned(&["a"]));
+        assert_eq!(view.subscribed_count, 1);
+    }
+
+    /// #383 段階3 P4: 登録済みの集合はレジストリ（hub 接続の下のタグの外部名）
+    /// から作り、変わったときだけ旗を立てる。レジストリの変更は
+    /// `registry_changed` で反映される。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registered_tags_follow_the_registry() {
+        use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let settings = SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
+        let hub = HubService::new(settings, Arc::new(UnavailableKeyStore))
+            .await
+            .expect("HubService::new");
+        assert!(
+            !hub.refresh_registered().await,
+            "レジストリ未接続なら何もしない"
+        );
+        hub.attach_registry(pool.clone());
+        assert!(!hub.refresh_registered().await, "登録 0 件のまま");
+
+        let (connections, groups, tags) = (
+            PlcConnectionService::new(pool.clone()),
+            CollectionGroupService::new(pool.clone()),
+            TagService::new(pool.clone()),
+        );
+        let row = |external_name: &str, name: &str| crate::hub_tags::HubTagRow {
+            external_name: external_name.to_owned(),
+            name: name.to_owned(),
+            data_type: "f32".to_owned(),
+            unit: None,
+            decimals: None,
+        };
+        let registered = crate::hub_tags::register_from_hub(
+            &pool,
+            &connections,
+            &groups,
+            &tags,
+            crate::hub_tags::HubTagRegistration {
+                collection_group_id: None,
+                new_group: Some(crate::hub_tags::NewHubGroup {
+                    name: "g".to_owned(),
+                    period_ms: 1000,
+                }),
+                tags: vec![row("L.G.b", "b"), row("L.G.a", "a")],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(registered.ok);
+
+        assert!(hub.refresh_registered().await, "登録が増えた");
+        assert!(hub.inner.subscription.lock().await.demand_pending);
+        assert_eq!(
+            hub.subscription().await.registered,
+            owned(&["L.G.a", "L.G.b"])
+        );
+        hub.inner.subscription.lock().await.demand_pending = false;
+        assert!(
+            !hub.refresh_registered().await,
+            "変わらなければ旗を立てない"
+        );
+
+        // 削除は `registry_changed` で反映される（Hub 未設定なので張り直しの
+        // タスクはすぐ終わる）。
+        tags.delete(registered.tags[0].id).await.unwrap();
+        hub.registry_changed().await;
+        assert_eq!(hub.subscription().await.registered, owned(&["L.G.a"]));
+
+        // 2026-10-11 オーナー決定: Hub 接続を無効にすると購読から外れ、有効に戻すと戻る。
+        // 「登録済み」（ダイアログの判定）は無効でも変わらない。
+        //
+        // 反証: `subscribed_external_names` の `c.enabled = 1` を外すと、無効にした後も
+        // 購読に残ってここで落ちる。
+        let set_enabled = |enabled: bool| {
+            let connections = connections.clone();
+            let id = registered.connection_id.expect("hub connection");
+            async move {
+                let conn = connections.get(id).await.unwrap();
+                connections
+                    .update(
+                        id,
+                        banto_tags::PlcConnectionInput {
+                            name: conn.name,
+                            protocol: conn.protocol,
+                            host: conn.host,
+                            port: conn.port,
+                            unit_id: conn.unit_id,
+                            enabled,
+                            simulation: conn.simulation,
+                            word_order: conn.word_order,
+                            database: None,
+                            username: None,
+                            password: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        set_enabled(false).await;
+        hub.registry_changed().await;
+        assert!(
+            hub.subscription().await.registered.is_empty(),
+            "無効なら購読しない"
         );
         assert_eq!(
-            subscription_identity(Some(&base), &owned(&["alpha"])),
-            subscription_identity(Some(&base), &[]),
-            "選択と同じ名前の需要は集合を変えない"
+            crate::hub_tags::registered_external_names(&pool)
+                .await
+                .unwrap(),
+            owned(&["L.G.a"]),
+            "登録済みのまま"
         );
+        set_enabled(true).await;
+        hub.registry_changed().await;
+        assert_eq!(hub.subscription().await.registered, owned(&["L.G.a"]));
+    }
+
+    /// 2026-10-11 オーナーレビュー P2: **収集中に** Hub 接続を無効にしたら購読から外れる。
+    /// 収集の需要（開始時の計画）に名前が残っていると和集合が変わらず購読が続いて
+    /// いたので、レジストリを読み直すときに需要も購読の対象の中に絞る。有効に戻すと
+    /// 登録済みとして戻る（需要は次の開始で作り直す）。
+    ///
+    /// 反証: `set_registered_from_registry` の `retain` を外すと、無効にした後も
+    /// 和集合に `L.G.a` が残って落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabling_the_hub_connection_while_collecting_drops_the_subscription() {
+        use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let settings = SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
+        let hub = HubService::new(settings, Arc::new(UnavailableKeyStore))
+            .await
+            .expect("HubService::new");
+        hub.attach_registry(pool.clone());
+        let connections = PlcConnectionService::new(pool.clone());
+        let registered = crate::hub_tags::register_from_hub(
+            &pool,
+            &connections,
+            &CollectionGroupService::new(pool.clone()),
+            &TagService::new(pool.clone()),
+            crate::hub_tags::HubTagRegistration {
+                collection_group_id: None,
+                new_group: Some(crate::hub_tags::NewHubGroup {
+                    name: "g".to_owned(),
+                    period_ms: 1000,
+                }),
+                tags: vec![crate::hub_tags::HubTagRow {
+                    external_name: "L.G.a".to_owned(),
+                    name: "a".to_owned(),
+                    data_type: "f32".to_owned(),
+                    unit: None,
+                    decimals: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(registered.ok);
+        assert!(hub.refresh_registered().await);
+
+        // 収集の開始（需要 = 開始の時点の計画）。
+        hub.answer_prepare_for_test(HubCollectReadiness::Ready { catalog: None });
+        hub.prepare_collect(owned(&["L.G.a"])).await;
+        let wanted = |slot: &Subscription| wanted_set(&slot.registered, &slot.collect_demand);
+        {
+            let mut slot = hub.inner.subscription.lock().await;
+            assert_eq!(wanted(&slot), owned(&["L.G.a"]));
+            slot.demand_pending = false;
+        }
+
+        let id = registered.connection_id.expect("hub connection");
+        let set_enabled = |enabled: bool| {
+            let connections = connections.clone();
+            async move {
+                let conn = connections.get(id).await.unwrap();
+                connections
+                    .update(
+                        id,
+                        banto_tags::PlcConnectionInput {
+                            name: conn.name,
+                            protocol: conn.protocol,
+                            host: conn.host,
+                            port: conn.port,
+                            unit_id: conn.unit_id,
+                            enabled,
+                            simulation: conn.simulation,
+                            word_order: conn.word_order,
+                            database: None,
+                            username: None,
+                            password: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        set_enabled(false).await;
+        assert!(
+            hub.refresh_registered().await,
+            "購読する集合が変わった（張り直しを 1 回予約する）"
+        );
+        {
+            let slot = hub.inner.subscription.lock().await;
+            assert!(wanted(&slot).is_empty(), "収集中でも購読から外れる");
+            assert!(slot.collect_demand.is_empty());
+            assert!(slot.demand_pending);
+        }
+
+        set_enabled(true).await;
+        assert!(hub.refresh_registered().await);
+        let slot = hub.inner.subscription.lock().await;
+        assert_eq!(wanted(&slot), owned(&["L.G.a"]), "有効に戻すと購読に戻る");
+    }
+
+    /// #383 段階3 P4（P3 の持ち越し）: 需要を開始時の計画に絞っても、需要が
+    /// 登録済みの中に収まる限り購読する集合は変わらず、旗も立たない（Hub を
+    /// 叩かない・張り直さない）。
+    #[tokio::test]
+    async fn narrowing_the_demand_within_the_registered_set_does_not_resubscribe() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a", "gone"]).await;
+        {
+            let mut slot = hub.inner.subscription.lock().await;
+            slot.set_demand(owned(&["a", "gone"]));
+            slot.demand_pending = false;
+        }
+        hub.narrow_collect(owned(&["a"])).await;
+        let slot = hub.inner.subscription.lock().await;
+        assert_eq!(slot.collect_demand, owned(&["a"]));
+        assert!(!slot.demand_pending);
     }
 
     /// 切断すると、その Hub の受信時刻は残さない。
@@ -4346,13 +5015,15 @@ mod tests {
         );
     }
 
-    /// 接続先や選択タグが変わったら、前の購読の受信時刻は残さない。
+    /// 接続先や登録済みのタグ（#383 段階3 P4。P3 までは選択タグ）が変わったら、
+    /// 前の購読の受信時刻は残さない。
     #[tokio::test]
     async fn a_different_endpoint_or_selection_forgets_the_last_value_time() {
-        for changed in [
-            keyring_record("http://127.0.0.1:3101", &["alpha"]),
-            keyring_record("http://127.0.0.1:3100", &["beta"]),
+        for (endpoint, registered) in [
+            ("http://127.0.0.1:3101", ["alpha"]),
+            ("http://127.0.0.1:3100", ["beta"]),
         ] {
+            let changed = keyring_record(endpoint, &[]);
             let (_settings, hub) = service_with_keyring("http://127.0.0.1:3100", &["alpha"]).await;
             hub.reconcile_with(
                 &HubStatus::Connected { tag_count: 1 },
@@ -4363,6 +5034,7 @@ mod tests {
             hub.inner.subscription.lock().await.last_value_at = Some(1_234);
 
             hub.inner.mirror.reset(Some(changed));
+            register_for_test(&hub, &registered).await;
             hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
                 .await;
 
@@ -4513,7 +5185,6 @@ mod tests {
             REASON_NOT_CONNECTED,
             REASON_NOT_CONFIGURED,
             REASON_NOT_STARTED,
-            REASON_SELECTION_CHANGED_REFRESH_FAILED,
         ] {
             assert!(
                 needs_retry(None, Some(reason)),
@@ -4554,6 +5225,7 @@ mod tests {
             .await
             .unwrap();
         hub.hydrate().await.unwrap();
+        register_for_test(&hub, &["a", "gone"]).await;
 
         hub.reconcile_with(
             &HubStatus::Connected { tag_count: 1 },
@@ -4593,6 +5265,7 @@ mod tests {
             keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
             selected_tags: owned(&["gone1", "gone2"]),
         }));
+        register_for_test(&hub, &["gone1", "gone2"]).await;
 
         hub.reconcile_with(
             &HubStatus::Connected { tag_count: 1 },
@@ -4620,6 +5293,7 @@ mod tests {
             keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
             selected_tags: owned(&["gone"]),
         }));
+        register_for_test(&hub, &["gone"]).await;
         hub.reconcile_with(
             &HubStatus::Connected { tag_count: 0 },
             Some(&catalog(&[])),
@@ -4659,6 +5333,7 @@ mod tests {
             keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
             selected_tags: owned(&["a"]),
         }));
+        register_for_test(&hub, &["a"]).await;
 
         hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
             .await;
@@ -4695,6 +5370,7 @@ mod tests {
             keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
             selected_tags: owned(&["a,b"]),
         }));
+        register_for_test(&hub, &["a,b"]).await;
 
         hub.reconcile_with(
             &HubStatus::Connected { tag_count: 1 },
@@ -5681,9 +6357,21 @@ mod tests {
     /// 検証にはインメモリのキーストアを使う。
     ///
     /// レコードは設定 KV にも書く（`hydrate()` を通る経路のテストのため）。
+    /// #383 段階3 P4: 購読の対象は登録済みのタグ（レジストリ）。テストでは
+    /// レジストリを差し込まずに集合を直接与える（旗は立てない - 立てる
+    /// 経路は `the_pending_flag_rises_only_when_the_wanted_set_changes`）。
+    async fn register_for_test(hub: &HubService, names: &[&str]) {
+        let mut slot = hub.inner.subscription.lock().await;
+        slot.set_registered(owned(names));
+        slot.demand_pending = false;
+    }
+
+    /// keyring 付きのサービス。`registered` は購読の対象として**登録済み**の
+    /// 外部名（#383 段階3 P4。P3 までは記録の選択タグだった）。記録の選択は
+    /// 空にする。
     async fn service_with_keyring(
         endpoint: &str,
-        selected: &[&str],
+        registered: &[&str],
     ) -> (SettingsService, HubService) {
         use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 
@@ -5695,12 +6383,13 @@ mod tests {
         let hub = HubService::new(settings.clone(), Arc::clone(&keys) as Arc<dyn KeyStore>)
             .await
             .expect("HubService::new");
-        let record = keyring_record(endpoint, selected);
+        let record = keyring_record(endpoint, &[]);
         settings
             .set(KEY_HUB_RECORD, &serde_json::to_string(&record).unwrap())
             .await
             .unwrap();
         hub.inner.mirror.reset(Some(record));
+        register_for_test(&hub, registered).await;
         (settings, hub)
     }
 
@@ -5774,66 +6463,11 @@ mod tests {
         );
     }
 
-    /// 選択を変えた直後に catalog を取り直せなかったとき、**古い世代を
-    /// 生かしたままにしない**（#385 レビュー第2巡 A）。生かしたままだと
-    /// `Live` のまま据え置かれ、見張りも動かないので、ユーザーが選び直した
-    /// あとも古い選択のタグの値が流れ続けてしまう。
-    #[tokio::test]
-    async fn a_selection_change_whose_refresh_fails_drops_the_stale_generation() {
-        // 古い選択には「消えたタグ」と「購読できない名前」も混ぜておく -
-        // これらが選択変更後に残らないことまで確かめたいので。
-        let (settings, hub) = service_with_keyring(&closed_endpoint(), &["a", "gone", "x,y"]).await;
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
-        assert!(
-            generation_sequence(&hub).await.is_some(),
-            "まず古い選択で世代が立っている"
-        );
-        let before = hub.subscription().await;
-        assert_eq!(before.unresolved, owned(&["gone"]));
-        assert_eq!(before.unsupported, owned(&["x,y"]));
-
-        // `refresh_catalog()` が `Err` になる接続先へ差し替える（到達不能な
-        // 接続先は `Ok(Unreachable)` になり、そちらは通常の突き合わせで
-        // 世代が落ちるため、ここでは解釈できない綴りを使う）。
-        let broken = keyring_record("https://example.test", &["a", "gone", "x,y"]);
-        settings
-            .set(KEY_HUB_RECORD, &serde_json::to_string(&broken).unwrap())
-            .await
-            .unwrap();
-
-        hub.set_selected_tags(owned(&["b"]))
-            .await
-            .expect("保存の成否は再取得の失敗で覆さない");
-
-        assert!(
-            generation_sequence(&hub).await.is_none(),
-            "古い選択のまま値を流し続けない"
-        );
-        let view = hub.subscription().await;
-        assert_eq!(view.state, "stopped");
-        assert_eq!(
-            view.reason.as_deref(),
-            Some(REASON_SELECTION_CHANGED_REFRESH_FAILED)
-        );
-        // 未解決・購読不可は**直前の選択**の判定なので、選択が変わった今は
-        // 残さない（理由と中身が食い違う）。
-        assert!(view.unresolved.is_empty());
-        assert!(view.unsupported.is_empty());
-        // 選択自体は保存されている（見張りが次の周期で張り直す材料になる）。
-        let stored: HubRecord =
-            serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap()).unwrap();
-        assert_eq!(stored.selected_tags, owned(&["b"]));
-    }
-
-    /// 見張りのティックがユーザー操作に割り込んでも、**保存した選択が
-    /// 黙って消えない**（#385 レビュー第5巡 A）。
+    /// 見張りのティックがユーザー操作に割り込んでも、**保存した変更が
+    /// 黙って消えない**（#385 レビュー第5巡 A。#383 段階3 P4 で、当時の
+    /// 「選択の保存」の代わりに移行前の選択の消去で確かめる）。
     ///
-    /// 直列化が無いと次の順序で消える: `set_selected_tags` が写しを更新
+    /// 直列化が無いと次の順序で消える: 設定を変える操作が写しを更新
     /// （`dirty`）→ `flush()` の前に見張りの `hydrate()` が**古い DB の値**で
     /// 写しを置き換えて `dirty` を落とす → `flush()` は「変更なし」と見て
     /// 何も書かずに成功を返す。
@@ -5846,26 +6480,29 @@ mod tests {
         let (settings, hub) = service_with_keyring("https://example.test", &["a"]).await;
 
         for round in 0..5 {
-            let saved = format!("tag{round}");
+            // 移行前の選択がある記録を設定 KV に置き直す（毎回消すため）。
+            let seeded = keyring_record("https://example.test", &[&format!("tag{round}")]);
+            settings
+                .set(KEY_HUB_RECORD, &serde_json::to_string(&seeded).unwrap())
+                .await
+                .unwrap();
             let writer = hub.clone();
             let supervisor = hub.clone();
-            let tag = saved.clone();
-            // 見張りのティックと保存を本当に同時に走らせる。
+            // 見張りのティックと消去を本当に同時に走らせる。
             let (result, _) = tokio::join!(
-                async move { writer.set_selected_tags(vec![tag]).await },
+                async move { writer.clear_legacy_selection().await },
                 async move {
                     let _ = supervisor.resume_inner().await;
                 }
             );
-            result.expect("保存は成功する");
+            result.expect("消去は成功する");
 
             let stored: HubRecord =
                 serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap())
                     .unwrap();
-            assert_eq!(
-                stored.selected_tags,
-                vec![saved],
-                "第{round}回: 見張りの hydrate が保存を上書きしてはいけない"
+            assert!(
+                stored.selected_tags.is_empty(),
+                "第{round}回: 見張りの hydrate が消去を上書きしてはいけない"
             );
         }
     }

@@ -51,6 +51,8 @@ export interface HubTag {
 	name: string;
 	dataType: string;
 	unit: string | null;
+	/** Hub 側の小数桁（#383 段階3 P4: 「Hub から追加」で登録するタグの初期値）。 */
+	decimals: number;
 	tagKind: string;
 }
 
@@ -65,6 +67,11 @@ export interface HubView {
 	status: HubStatus;
 	endpoint: string | null;
 	keyName: string | null;
+	/**
+	 * P4 より前のこの画面で選んでいたタグ（`hub.record.selected_tags`）。
+	 * **読むだけ**で、購読の対象ではない（#383 段階3 P4）。「タグ設定」の
+	 * 「Hub から追加」が 1 度だけ事前にチェックし、登録すると消える。
+	 */
 	selectedTags: string[];
 	tags: HubTag[] | null;
 	subscription: HubSubscription;
@@ -97,7 +104,12 @@ export interface HubSubscription {
 	reason: string | null;
 	subscribedCount: number;
 	/**
-	 * 選んだのに Hub のタグ一覧に無かった external name（Hub から消えた／
+	 * 購読の対象として登録されている外部名（#383 段階3 P4: タグ設定の hub 接続の
+	 * 下のタグ。収集の有無に関わらず購読する）。ソート済み。
+	 */
+	registered: string[];
+	/**
+	 * 登録したのに Hub のタグ一覧に無かった external name（Hub から消えた／
 	 * 権限で見えない）。空表示に潰さない。
 	 */
 	unresolved: string[];
@@ -268,16 +280,43 @@ export async function refreshHubCatalog(signal?: AbortSignal): Promise<HubView> 
 	return httpJson<HubView>('/api/hub/refresh', { method: 'POST', signal });
 }
 
-/** `admin`-only: 選択タグの保存。空配列も正当な入力。 */
-export async function setHubSelectedTags(tags: string[], signal?: AbortSignal): Promise<void> {
+/**
+ * Mirrors `chronogazer_core::hub::HubCatalogView`（#383 段階3 P4）: 「Hub から
+ * 追加」のダイアログが 1 回の往復で読むもの。**editor が読める**ので接続先・
+ * キー名は無い。`tags` は {@link HubView.tags} と同じく `null` = 読めていない、
+ * `[]` = 読めて 0 件。
+ */
+export interface HubCatalog {
+	status: HubStatus;
+	tags: HubTag[] | null;
+	/** レジストリに登録済みの外部名（ダイアログは選べなくする）。 */
+	registered: string[];
+	/** P4 より前の設定画面で選んでいたタグ（1 度だけ事前にチェックする）。 */
+	legacySelection: string[];
+}
+
+/**
+ * `editor`-floor: 「Hub から追加」のダイアログ用の catalog（#383 段階3 P4）。
+ * Hub から読み直すので、ダイアログを開いたとき・「一覧を更新」のときだけ呼ぶ。
+ */
+export async function getHubCatalog(signal?: AbortSignal): Promise<HubCatalog> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<HubCatalog>('hub_catalog');
+	return httpJson<HubCatalog>('/api/hub/catalog', { method: 'GET', signal });
+}
+
+/**
+ * `editor`-floor: P4 より前の選択を使わずに消す（ダイアログの「以前の選択を
+ * 使わない」、#383 段階3 P4）。
+ */
+export async function dismissLegacyHubSelection(signal?: AbortSignal): Promise<void> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
-		await invokeCommand<void>('hub_set_selected_tags', { tags });
+		await invokeCommand<void>('hub_dismiss_legacy_selection');
 		return;
 	}
-	await httpJson<void>('/api/hub/selected-tags', {
-		method: 'PUT',
-		body: { tags },
+	await httpJson<void>('/api/hub/legacy-selection/dismiss', {
+		method: 'POST',
 		expectNoContent: true,
 		signal
 	});
@@ -348,7 +387,7 @@ export function hubStatusDetail(status: HubStatus): string {
 		case 'connected':
 			return status.tagCount === 0
 				? 'Hubにはまだタグが登録されていません。Hub側でタグを登録すると、ここに表示されます。'
-				: '購読するタグを選んで保存できます。';
+				: '購読するタグは「タグ設定」の「Hub から追加」で登録します。';
 		case 'authFailed':
 			return '保存済みのAPIキーが無効です。「接続」でキーを再発行できます（Hubがロックダウン済みの場合は連携が必要です）。';
 		case 'forbidden':
@@ -1143,10 +1182,9 @@ export interface HubAbandonedDisplay {
 	 *
 	 * 打ち切った操作はバックエンドで**完了している可能性がある**ので、状態を
 	 * 読み直せなかった時点で、**画面が持っている接続先と、次の操作が実際に触る
-	 * 接続先が食い違いうる**。`setHubSelectedTags` は**タグ名しか送らない**ので、
-	 * バックエンドの接続先が Hub B に変わっていると **B の購読設定に A のタグ
-	 * 選択が保存される** - #397 で塞いだ「下書きが接続先の境界を越える」型が、
-	 * 打ち切り経路で再発する。
+	 * 接続先が食い違いうる**。（P3 までは、タグ名しか送らない選択の保存で
+	 * **B の購読設定に A のタグ選択が保存される**型があった - #397。#383 段階3
+	 * P4 で選択の保存は無くなったが、接続・切断・キーの採用は同じ理由で止める。）
 	 *
 	 * **`connect` / `adopt` も止める**。打ち切った `connect` がまだ走っている
 	 * かもしれない状態で押し直せると、**Hub 側にキーを二重に発行**しうる
@@ -1197,7 +1235,7 @@ export function hubAbandonedDisplay(
 	return {
 		// **何ができない状態か**と**何を押せばよいか**まで書く（警告だけ出して
 		// 操作を止めないと、接続先を確認できないまま保存が通ってしまう）。
-		notice: `アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、操作は続いている可能性があります。現在の状態も読み取れなかったため、下の表示は最新ではありません。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新・選択の保存とタグの選択は止めています。「状態を再取得」を押して、現在の状態を読み直してください。`,
+		notice: `アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、操作は続いている可能性があります。現在の状態も読み取れなかったため、下の表示は最新ではありません。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新は止めています。「状態を再取得」を押して、現在の状態を読み直してください。`,
 		applyStatus: false,
 		blocksChanges: true
 	};
@@ -1265,63 +1303,9 @@ export function reconfirmStatusFailureNotice(
 	if (outcome === 'ok') return null;
 	const seconds = Math.round(HUB_UI_TIMEOUT_MS / 1000);
 	if (outcome === 'timedOut') {
-		return `状態の再取得も、アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、読み取りは続いている可能性があります。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新・選択の保存とタグの選択は止めたままです。もう一度「状態を再取得」を押してください。`;
+		return `状態の再取得も、アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、読み取りは続いている可能性があります。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新は止めたままです。もう一度「状態を再取得」を押してください。`;
 	}
-	return `状態の再取得に失敗しました（${errorText ?? '理由不明'}）。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新・選択の保存とタグの選択は止めたままです。もう一度「状態を再取得」を押してください。`;
-}
-
-/**
- * 選択の保存 1 回の結末（[`saveSelectionWithLimits`]）。
- */
-export interface SaveSelectionOutcome {
-	/**
-	 * 保存本体（`setHubSelectedTags`）の結末。**この明示操作の成否はこれだけで
-	 * 決まる** - 後続の読み取りが返らなくても `timedOut` にはならない。
-	 */
-	save: RunWithLimitOutcome<void>;
-	/**
-	 * 保存後の購読の読み直し。保存本体が成功したときだけ走る（`null` = 走らせて
-	 * いない）。失敗・打ち切りは**購読状態の取得失敗**として数える
-	 * （[`pollFailureOutcome`] → [`nextPollFailureCount`]）。
-	 */
-	subscriptionReread: SubscriptionReadOutcome | null;
-}
-
-/**
- * 選択の保存と、その直後の購読の読み直しを**別々の予算で**走らせる
- * （オーナーレビュー P2-2）。
- *
- * **なぜ分けるか**: 以前は保存も読み直しも 1 つの `runWithLimit(action,
- * HUB_UI_TIMEOUT_MS)` の内側にあった。保存本体が成功していても読み直しだけが
- * 返らないと**操作全体が `timedOut`** になり、「保存しました」と「操作は続いて
- * いる可能性があります」が同時に出る（結果が未確定であるかのような通知）。
- * **保存本体が成功した時点で明示操作の成否を確定させる**のが直し方で、
- * 「読み直しにも上限を足して全体の枠内に残す」のでは、保存本体が上限近くまで
- * かかったケースで同じ問題が残る。
- *
- * 保存後に読み直す意図は元のまま: **バックエンドは保存時に古い世代を止めて
- * いる**ので、次のポーリング（最大 2 秒）まで停止済みの古い値を「受信中」と
- * して出し続けないよう、ここで取り直す。ただしこれは**ベストエフォート**で、
- * 失敗しても保存の成功表示は消さない。
- *
- * `onSaved` は保存本体が `ok` のときだけ、読み直しに入る**前**に 1 回だけ
- * 呼ぶ（画面が「保存しました」を出すのがここ）。
- */
-export async function saveSelectionWithLimits(
-	save: (signal: AbortSignal) => Promise<void>,
-	readSubscription: (signal: AbortSignal) => Promise<HubSubscription>,
-	onSaved: () => void,
-	saveTimeoutMs: number = HUB_UI_TIMEOUT_MS,
-	subscriptionTimeoutMs: number = SUBSCRIPTION_POLL_TIMEOUT_MS
-): Promise<SaveSelectionOutcome> {
-	const saved = await runWithLimit(save, saveTimeoutMs);
-	if (saved.kind !== 'ok') return { save: saved, subscriptionReread: null };
-	onSaved();
-	const subscriptionReread = await readSubscriptionWithLimit(
-		readSubscription,
-		subscriptionTimeoutMs
-	);
-	return { save: saved, subscriptionReread };
+	return `状態の再取得に失敗しました（${errorText ?? '理由不明'}）。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新は止めたままです。もう一度「状態を再取得」を押してください。`;
 }
 
 /**
@@ -1379,135 +1363,11 @@ export function hubPollStaleNote(lastPolledAt: number | null): string {
 	return `購読状態を取得できていません。下の表示は${hubTimeLabel(lastPolledAt)}に取得したもので、最新ではありません。`;
 }
 
-// --- レビュー P2-B: 編集中（未保存）のタグ選択を黙って捨てない -------------
-//
-// `applyView()` はサーバーの `selectedTags` をそのまま `selected` に入れて
-// いたため、チェックを変えてから「選択を保存」の隣にある「一覧を更新」
-// （や「接続」）を押すと、確認も警告もなく元に戻っていた。#378 で決めた
-// 「未保存の入力を黙って捨てない」方針の対象から、ここだけ漏れていた。
-
-/** 2 つの選択が同じ集合か（純関数）。並び順は問わない - 画面のチェックは順序を持たない。 */
-export function sameSelection(a: readonly string[], b: readonly string[]): boolean {
-	if (a.length !== b.length) return false;
-	const inB = new Set(b);
-	return a.every((name) => inB.has(name));
-}
-
-/**
- * サーバーから届いた view を反映した結果（[`applyServerSelection`] の出力）。
- */
-export interface ServerSelectionOutcome {
-	/** 画面に出す選択。 */
-	selected: string[];
-	/** 反映後の未保存フラグ。 */
-	unsaved: boolean;
-	/** 接続先が変わったため、未保存の下書きを捨てたか（**黙って捨てない**ための合図）。 */
-	discardedForEndpointChange: boolean;
-}
-
-/**
- * サーバーから届いた view を反映するとき、画面に出す選択（純関数）。
- *
- * **未保存の変更があるときはサーバーの値で上書きしない**。`status`/`tags`/
- * `subscription`/`keyName` など他のフィールドは従来どおり上書きしてよい -
- * 問題になるのは編集中の `selected` だけ。
- *
- * ただし**未保存の下書きは接続先ごとのもの**（レビュー P2-2）。別の Hub に
- * 繋ぎ直すと `tags` は新しい Hub のものに入れ替わるのに、下書きだけが旧 Hub
- * のまま残り、**画面に出ていないタグ名が「選択を保存」の payload に混入した**
- * （保存は表示中のチェックボックスから組み直さず `selected` をそのまま送る）。
- * バックエンドは endpoint が変われば選択を引き継がない設計なので、フロント
- * だけがその境界を越えていた。
- *
- * 判定に使うのは**サーバーが返した endpoint 同士**（`selectionEndpoint` と
- * `view.endpoint`）で、入力欄の下書き（`endpointDraft`）とは比べない - まだ
- * 接続していない入力値なので、URL を打ち込んだ瞬間に「別の Hub」と判定して
- * しまう。`view.endpoint === null`（未設定・切断後）も「同じ Hub ではない」
- * 側に倒す。
- *
- * **catalog との積集合は取らない**: 同じ Hub で一時的に見えなくなっただけの
- * タグ（refresh が空振りした・権限が一瞬揺れた）の選択まで失う。判定は
- * **接続先の同一性のみ**。
- */
-export function applyServerSelection(
-	current: readonly string[],
-	serverSelected: readonly string[],
-	unsaved: boolean,
-	selectionEndpoint: string | null,
-	viewEndpoint: string | null
-): ServerSelectionOutcome {
-	const sameHub =
-		selectionEndpoint !== null && viewEndpoint !== null && selectionEndpoint === viewEndpoint;
-	if (unsaved && sameHub) {
-		return { selected: [...current], unsaved: true, discardedForEndpointChange: false };
-	}
-	return {
-		selected: [...serverSelected],
-		unsaved: false,
-		discardedForEndpointChange: unsaved
-	};
-}
-
-/**
- * 接続先の変更で未保存の下書きを捨てたことを伝える一文。
- *
- * #378「未保存の入力を黙って捨てない」の対で、捨てるのが正しい場面でも
- * **捨てたことは画面に出す**。**保存成功の文言（`savedNotice`）とは別の行に
- * 出し、文言も混ぜない** - 「保存しました」の隣に出ると、捨てたものが保存
- * されたように読めてしまう。
- *
- * 「別の Hub に接続した」と言い切らないのは、接続に失敗して記録が消えた場合
- * （`view.endpoint === null`）も同じ経路を通るため - どちらも「この下書きの
- * 宛先がもう無い」であって、起きたことは同じ。
- */
-export const SELECTION_DISCARDED_NOTICE =
-	'接続先が変わったため、未保存だった選択は破棄しました。表示しているのは、今の接続先に保存されている選択です。';
-
-/**
- * 「サーバー側の選択と異なります」の注記と、明示的に捨てる導線（「サーバーの
- * 内容に戻す」）を出すか（純関数）。
- *
- * 未保存でも**中身が同じに戻っている**なら出さない（触っただけで元に戻した
- * ときに警告を出しても、直す対象が無い）。
- */
-export function showsServerSelectionDiff(
-	current: readonly string[],
-	serverSelected: readonly string[],
-	unsaved: boolean
-): boolean {
-	return unsaved && !sameSelection(current, serverSelected);
-}
-
-/**
- * 選択の編集状態（未保存フラグ）に何が起きたか。**サーバーからの反映
- * （`applyView`）はこの一覧に無い**: 同じ Hub なら未保存フラグを動かさず、
- * 別の Hub なら [`applyServerSelection`] が反映と同時にフラグを降ろすので、
- * 遷移の判断がこの関数と 2 箇所に分かれない。
- */
-export type SelectionEvent = 'edited' | 'saved' | 'discarded' | 'disconnected';
-
-/**
- * 未保存フラグの遷移（純関数、総当たりでテストする）。
- *
- * `disconnected` で false にしてよいのは、**切断は接続レコードごと消す**
- * から - 保存先が無くなるので、未保存の選択を残しても戻す先が無い。
- */
-export function nextSelectionUnsaved(current: boolean, event: SelectionEvent): boolean {
-	switch (event) {
-		case 'edited':
-			return true;
-		case 'saved':
-		case 'discarded':
-		case 'disconnected':
-			return false;
-	}
-}
-
 /**
  * 未解決・購読不可の一覧に添える「残りはどうなっているか」の一文（純関数）。
  *
  * 1 件も購読できていないのに「残りのタグは購読しています」と言うと**嘘に
- * なる**（選んだ全部が未解決／購読不可のとき）。件数で出し分ける。
+ * なる**（登録した全部が未解決／購読不可のとき）。件数で出し分ける。
  */
 export function hubRemainderNote(subscribedCount: number): string {
 	return subscribedCount > 0

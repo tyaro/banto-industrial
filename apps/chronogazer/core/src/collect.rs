@@ -2519,7 +2519,13 @@ impl Lifecycle {
             build_config_lenient_with_thresholds(&snapshot, &thresholds, hub_source);
         let exclusions = exclusion_views(&exclusions);
         let external = match (&hub, config.has_external_connections()) {
-            (Some(hub), true) => Some(hub.collect_source()),
+            (Some(hub), true) => {
+                // #383 段階3 P4（P3 の持ち越し）: 開始時の突き合わせで外したタグ
+                // （`hubTagNotFound` / `hubTagTypeChanged`）を需要に残さない。
+                // 計画に残った外部名だけに絞る（Hub は叩かない）。
+                hub.narrow_collect(config.external_names()).await;
+                Some(hub.collect_source())
+            }
             // 収集する hub 接続が残らなかった（未設定・全部外れた）なら、
             // 出した需要はもう要らない。
             _ => {
@@ -3996,6 +4002,47 @@ mod tests {
 
         // 走っている収集は無いが、停止しても壊れず、需要も空のまま。
         settled(svc.stop().await.expect("stop"));
+        assert_eq!(hub.collect_demand_for_test().await, Vec::<String>::new());
+    }
+
+    /// #383 段階3 P4（P3 の持ち越し）: 開始時の突き合わせで外したタグ
+    /// （ここでは Hub から消えた `hubTagNotFound`）は需要に残さない - 需要は
+    /// 計画に残った外部名だけに絞る（Hub は叩かない）。
+    ///
+    /// 反証: 開始の `narrow_collect` を消すと、消えたタグの外部名が需要に残って
+    /// 落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tags_excluded_at_start_do_not_stay_in_the_hub_demand() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let (_hub_id, hub_group, _hub_tag) = seed_hub_connection(&pool).await;
+        let gone = seed_named_tag(&pool, hub_group, "gone", "PLC9.G.Gone").await;
+        let hub = hub_attached(
+            &svc,
+            &pool,
+            HubCollectReadiness::Ready {
+                catalog: Some(banto_collect::HubCatalog::from([(
+                    "PLC9.G.Temp".to_string(),
+                    "i16".to_string(),
+                )])),
+            },
+        )
+        .await;
+
+        match settled(svc.start().await.expect("start")) {
+            CollectorState::Running { exclusions, .. } => {
+                let listed: Vec<(i64, &str)> =
+                    exclusions.iter().map(|e| (e.id, e.reason)).collect();
+                assert_eq!(listed, vec![(gone, "hubTagNotFound")]);
+            }
+            other => panic!("Running を期待したが {other:?}"),
+        }
+        assert_eq!(
+            hub.collect_demand_for_test().await,
+            vec!["PLC9.G.Temp".to_string()],
+            "外したタグは需要に残さない"
+        );
+        svc.stop().await.expect("stop");
         assert_eq!(hub.collect_demand_for_test().await, Vec::<String>::new());
     }
 

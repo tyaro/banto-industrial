@@ -64,7 +64,13 @@
  *    動かないタグの見せ方（判定そのものは Rust 側。下記「E」）。
  */
 
-import type { Tag, TagDataType, TagInput } from '#lib/banto/tagRegistryAdmin.js';
+import type {
+	PlcConnection,
+	PlcConnectionInput,
+	Tag,
+	TagDataType,
+	TagInput
+} from '#lib/banto/tagRegistryAdmin.js';
 import type { TagThresholdsInput, ThresholdFields } from '#lib/banto/tagThresholdsAdmin.js';
 
 export interface FieldError {
@@ -438,6 +444,41 @@ export function connectionSavedMessage(
 	return after.simulation
 		? '更新しました。シミュレーションに切り替えました（値はデータファイルに記録されません）。収集中の場合は「収集を再起動」で反映されます'
 		: '更新しました。実機に切り替えました。収集中の場合は「収集を再起動」で反映されます';
+}
+
+// --- #383 段階3 P4: Hub 接続の有効・無効（2026-10-11 オーナー決定） -------------
+//
+// Hub 接続（`protocol: 'hub'`）の行は読み取り専用の欄に「有効」だけを出す。保存は
+// PLC 接続と同じ更新（`PUT /api/plc-connections/{id}`・`plc_connections_update`、全項目
+// 置換）なので、変えない項目は**今の行の値をそのまま**送る（host/port はサーバーが
+// ""/0 に揃える。`simulation` は省略 = 保存されている値を保つ）。
+
+/** Hub 接続の「有効」だけを変える更新の入力（純関数）。 */
+export function hubConnectionInput(conn: PlcConnection, enabled: boolean): PlcConnectionInput {
+	return {
+		name: conn.name,
+		protocol: 'hub',
+		host: '',
+		port: 0,
+		unitId: conn.unitId,
+		enabled,
+		wordOrder: conn.wordOrder,
+		simulation: conn.simulation
+	};
+}
+
+/**
+ * Hub 接続の保存に成功したときのトースト（純関数）。無効にすると、その接続の Hub の
+ * タグは**購読も収集もしない**（購読はすぐ張り直し、収集は「収集を再起動」から）。
+ */
+export function hubConnectionSavedMessage(
+	before: { enabled: boolean },
+	after: { enabled: boolean }
+): string {
+	if (before.enabled === after.enabled) return '更新しました';
+	return after.enabled
+		? 'Hub 接続を有効にしました。登録済みの Hub のタグの購読を再開します。収集中の場合は「収集を再起動」で記録が始まります'
+		: 'Hub 接続を無効にしました。この接続の Hub のタグは購読しません。収集中の場合は「収集を再起動」で収集からも外れます';
 }
 
 /** シミュレーションで値が動かないタグ 1 本（表示用）。 */

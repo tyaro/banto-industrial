@@ -4,8 +4,19 @@
 	 *
 	 * 手本は `routes/(app)/users/+page.svelte`: `BantoGrid`（一覧）+
 	 * `BantoForm`/`createFormStore`（新規作成・編集）+ 行クリックで下に編集
-	 * パネル。独自の Drawer / Modal / SplitPane / ツリーは作らない -
-	 * このアプリの `lib/components/` には4部品しか無く、このPRでも増やさない。
+	 * パネル。独自の Drawer / SplitPane / ツリーは作らない（R1-B の決定）。
+	 * 例外は #383 段階3 P4 の「Hub から追加」（`HubImportDialog.svelte`）だけで、
+	 * 中央モーダルは banto-hub の `Modal.svelte` を写して使う（層の約束・フォーカス
+	 * の閉じ込めと戻しを自作しないため）。
+	 *
+	 * **Hub 経由の接続（#383 段階3 P4）**: Hub 接続（`protocol: 'hub'`）は
+	 * 作成フォームでは作らず、「Hub から追加」がサーバー側で暗黙に作る。一覧では
+	 * 読み取り専用（ホスト・ポートを持たない。接続先と API キーは「設定 > Hub接続」）
+	 * で、行を選ぶと「有効」の切り替えと削除だけを出す（配下にグループがあれば削除は
+	 * サーバーが断る）。「有効」は PLC 接続と同じ更新・同じ未保存の確認で、無効にすると
+	 * その接続の Hub のタグは購読も収集もしない（2026-10-11 オーナー決定）。接続の行に
+	 * 版（楽観ロック）は無い - PLC 接続の編集と同じ。Hub 経由のタグの編集フォームはスケーリングの欄を出さない（Hub は
+	 * 工学値を送る。サーバーも断る）。
 	 *
 	 * 構成は PLC接続 / 収集グループ / タグ の3セクションを**縦並び**（タブでは
 	 * ない）で、FK の依存順（接続 → グループ → タグ）に並べる。理由: このアプリ
@@ -100,6 +111,7 @@
 		type ExclusionView
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import { exclusionUnitLabel } from '#lib/banto/collectAdmin.js';
+	import HubImportDialog from './HubImportDialog.svelte';
 	import {
 		getTagThresholds,
 		updateTagThresholds,
@@ -125,6 +137,8 @@
 		isRevisionConflict,
 		connectionModeLabel,
 		connectionSavedMessage,
+		hubConnectionInput,
+		hubConnectionSavedMessage,
 		unmovingSimulationTags,
 		simulationCoverageView,
 		configExclusionsView,
@@ -405,10 +419,33 @@
 			filterable: true,
 			filterType: 'text'
 		},
-		{ id: 'protocol', header: 'プロトコル', accessor: 'protocol', width: 110 },
-		{ id: 'host', header: 'ホスト', accessor: 'host', width: 140 },
-		{ id: 'port', header: 'ポート', accessor: 'port', width: 80, align: 'right' },
-		{ id: 'unitId', header: 'ユニットID', accessor: 'unitId', width: 90, align: 'right' },
+		{
+			id: 'protocol',
+			header: 'プロトコル',
+			accessor: (row) => (row.protocol === 'hub' ? 'Hub 経由' : row.protocol),
+			width: 110
+		},
+		// #383 段階3 P4: Hub 接続はホスト・ポートを持たない（接続先は「設定 > Hub接続」）。
+		{
+			id: 'host',
+			header: 'ホスト',
+			accessor: (row) => (row.protocol === 'hub' ? '—' : row.host),
+			width: 140
+		},
+		{
+			id: 'port',
+			header: 'ポート',
+			accessor: (row) => (row.protocol === 'hub' ? '—' : row.port),
+			width: 80,
+			align: 'right'
+		},
+		{
+			id: 'unitId',
+			header: 'ユニットID',
+			accessor: (row) => (row.protocol === 'hub' ? '—' : row.unitId),
+			width: 90,
+			align: 'right'
+		},
 		{
 			id: 'enabled',
 			header: '有効',
@@ -420,7 +457,8 @@
 			// #413: レジストリの値。シミュレーション接続は「値は記録されません」。
 			id: 'simulation',
 			header: '動作',
-			accessor: (row) => connectionModeLabel(row.simulation),
+			accessor: (row) =>
+				row.protocol === 'hub' ? 'Hub から受信' : connectionModeLabel(row.simulation),
 			width: 240
 		}
 	];
@@ -443,6 +481,85 @@
 			connectionSchema(PLC_EDIT),
 			connectionFormValues(PLC_EDIT, conn)
 		);
+		editHubConnectionStore = createFormStore(hubConnectionSchema(HUB_EDIT), {
+			[`${HUB_EDIT}Enabled`]: conn.enabled
+		});
+	}
+
+	/** #383 段階3 P4: 選んだ接続が Hub 接続か（編集フォームの代わりに読み取り専用の欄を出す）。 */
+	const selectedConnectionIsHub = $derived.by(() => selectedConnection?.protocol === 'hub');
+
+	// --- #383 段階3 P4: Hub 接続の「有効」（2026-10-11 オーナー決定） ---------------
+
+	const HUB_EDIT = 'hubEdit';
+
+	function hubConnectionSchema(prefix: string): FormSchema {
+		return {
+			fields: [
+				{
+					name: `${prefix}Enabled`,
+					label: '有効（無効にすると、この接続の Hub のタグは購読も収集もしません）',
+					type: 'checkbox',
+					default: true
+				}
+			]
+		};
+	}
+
+	const HUB_CONNECTION_WIRE_FIELDS = schemaWireFields(
+		HUB_EDIT,
+		hubConnectionSchema(HUB_EDIT).fields
+	);
+
+	let editHubConnectionStore = $state(
+		untrack(() => createFormStore(hubConnectionSchema(HUB_EDIT)))
+	);
+
+	/** Hub 接続の「有効」の保存（`saveConnection` と同じ取り違え対策）。 */
+	async function saveHubConnection(): Promise<void> {
+		if (!selectedConnection || savingConnection || deletingConnection) return;
+		const pending: SaveGuardToken<typeof editHubConnectionStore> = {
+			id: selectedConnection.id,
+			store: editHubConnectionStore
+		};
+		const before = selectedConnection;
+		savingConnection = true;
+		try {
+			const outcome = await runGuardedSave(
+				pending,
+				updatePlcConnection(
+					selectedConnection.id,
+					hubConnectionInput(
+						selectedConnection,
+						Boolean(editHubConnectionStore.values[`${HUB_EDIT}Enabled`])
+					)
+				),
+				() => ({ id: selectedConnection?.id, store: editHubConnectionStore })
+			);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', hubConnectionSavedMessage(before, outcome.entity));
+					editHubConnectionStore.markClean();
+					selectedConnection = outcome.entity;
+					await reloadConnections();
+					break;
+				case 'stale-success':
+					await reloadConnections();
+					break;
+				case 'error':
+					applyServerErrors(
+						HUB_EDIT,
+						HUB_CONNECTION_WIRE_FIELDS,
+						outcome.err,
+						editHubConnectionStore
+					);
+					break;
+				case 'stale-error':
+					break;
+			}
+		} finally {
+			savingConnection = false;
+		}
 	}
 
 	/**
@@ -814,7 +931,21 @@
 
 	const groupOptions = $derived(groupRows.map((g) => ({ value: g.id, label: g.name })));
 
-	function tagSchema(prefix: string): FormSchema {
+	/**
+	 * `hub` = Hub 経由のタグ（#383 段階3 P4）。アドレスは Hub のタグ名（外部名）で、
+	 * **スケーリングの欄を出さない**（Hub は工学値を送るので、ここで換算すると二重に
+	 * なる。サーバーの `banto-tags` も断る）。欄が無ければ `buildTagInput` は
+	 * スケーリングを `null` で送る。
+	 */
+	function tagSchema(prefix: string, hub = false): FormSchema {
+		const scalingFields: FormSchema['fields'] = hub
+			? []
+			: [
+					{ name: `${prefix}RawLo`, label: 'スケーリング: 生値 下限', type: 'number' },
+					{ name: `${prefix}RawHi`, label: 'スケーリング: 生値 上限', type: 'number' },
+					{ name: `${prefix}EngLo`, label: 'スケーリング: 工学値 下限', type: 'number' },
+					{ name: `${prefix}EngHi`, label: 'スケーリング: 工学値 上限', type: 'number' }
+				];
 		return {
 			fields: [
 				{ name: `${prefix}Name`, label: '名前', type: 'text', required: true, min: 1, max: 100 },
@@ -827,10 +958,10 @@
 				},
 				{
 					name: `${prefix}Address`,
-					label: 'デバイスアドレス',
+					label: hub ? 'Hub のタグ名（外部名）' : 'デバイスアドレス',
 					type: 'text',
 					required: true,
-					placeholder: 'D3000 / 40001 など'
+					placeholder: hub ? '接続名.グループ名.タグ名' : 'D3000 / 40001 など'
 				},
 				{
 					name: `${prefix}DataType`,
@@ -840,10 +971,7 @@
 					default: 'i16',
 					options: dataTypeOptions
 				},
-				{ name: `${prefix}RawLo`, label: 'スケーリング: 生値 下限', type: 'number' },
-				{ name: `${prefix}RawHi`, label: 'スケーリング: 生値 上限', type: 'number' },
-				{ name: `${prefix}EngLo`, label: 'スケーリング: 工学値 下限', type: 'number' },
-				{ name: `${prefix}EngHi`, label: 'スケーリング: 工学値 上限', type: 'number' },
+				...scalingFields,
 				{ name: `${prefix}Unit`, label: '単位', type: 'text' },
 				// min/max は banto_tags::tag の MIN_DECIMALS/MAX_DECIMALS と一致
 				// させる（クライアント側とサーバー側の検証範囲がずれると、
@@ -953,11 +1081,33 @@
 	let deletingTag = $state(false);
 
 	/** #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
+	/** #383 段階3 P4: 収集グループが Hub 接続の下にあるか。 */
+	function isHubGroup(groupId: number): boolean {
+		const group = groupRows.find((g) => g.id === groupId);
+		if (!group) return false;
+		return connectionRows.find((c) => c.id === group.plcConnectionId)?.protocol === 'hub';
+	}
+
+	/** 編集中のタグが Hub 経由か（スケーリングの欄を出さない）。選んだ時点で決める。 */
+	let selectedTagIsHub = $state(false);
+
 	function selectTag(tag: Tag): void {
 		if (!canWrite || savingTag || deletingTag || savingThresholds) return;
 		selectedTag = tag;
-		editTagStore = createFormStore(tagSchema(TAG_EDIT), tagFormValues(TAG_EDIT, tag));
+		selectedTagIsHub = isHubGroup(tag.collectionGroupId);
+		editTagStore = createFormStore(
+			tagSchema(TAG_EDIT, selectedTagIsHub),
+			tagFormValues(TAG_EDIT, tag)
+		);
 		void loadThresholds(tag.id);
+	}
+
+	// --- #383 段階3 P4: Hub から追加 -------------------------------------------
+
+	let hubDialogOpen = $state(false);
+
+	async function afterHubRegistration(): Promise<void> {
+		await Promise.all([reloadConnections(), reloadGroups(), reloadTags()]);
 	}
 
 	// --- #532: 記録計の側のしきい値（タグとは別の保存） -------------------------
@@ -1151,6 +1301,8 @@
 			createGroupStore.isDirty ||
 			createTagStore.isDirty ||
 			(selectedConnection !== null && editConnectionStore.isDirty) ||
+			// #383 段階3 P4: Hub 接続の「有効」（Hub 接続を選んでいる間だけ数える）。
+			(selectedConnection !== null && selectedConnectionIsHub && editHubConnectionStore.isDirty) ||
 			(selectedGroup !== null && editGroupStore.isDirty) ||
 			(selectedTag !== null && editTagStore.isDirty) ||
 			// #532: しきい値のフォームは読めたときだけ出るので、そのときだけ数える。
@@ -1387,7 +1539,34 @@
 				{/if}
 			</div>
 
-			{#if selectedConnection && canWrite}
+			{#if selectedConnection && canWrite && selectedConnectionIsHub}
+				<!-- #383 段階3 P4: Hub 接続は読み取り専用（ホスト・ポートを持たない）。 -->
+				<div class="detail hub-connection-detail">
+					<h4>{selectedConnection.name}（Hub 経由の接続）</h4>
+					<p class="note">
+						Hub から受信するタグの入れ物です。接続先と API キーは「設定 &gt;
+						Hub接続」（管理者）で設定します。タグは下の「タグ」の「Hub
+						から追加」で登録します。配下に収集グループがある間は削除できません。
+					</p>
+					<UnsavedChangesNotice pending={editHubConnectionStore.isDirty} label={UNSAVED_NOTICE} />
+					<BantoForm
+						schema={hubConnectionSchema(HUB_EDIT)}
+						store={editHubConnectionStore}
+						onSubmit={saveHubConnection}
+						submitting={savingConnection || deletingConnection}
+						submitLabel="保存"
+					>
+						<button
+							type="button"
+							class="danger"
+							onclick={handleDeleteConnection}
+							disabled={savingConnection || deletingConnection}
+						>
+							削除
+						</button>
+					</BantoForm>
+				</div>
+			{:else if selectedConnection && canWrite}
 				<div class="detail">
 					<h4>{selectedConnection.name} を編集</h4>
 					<UnsavedChangesNotice pending={editConnectionStore.isDirty} label={UNSAVED_NOTICE} />
@@ -1511,7 +1690,15 @@
 		</section>
 
 		<section class="registry-section">
-			<h3>タグ</h3>
+			<div class="section-head">
+				<h3>タグ</h3>
+				{#if canWrite}
+					<!-- #383 段階3 P4: Hub のカタログから登録する。 -->
+					<button type="button" class="secondary" onclick={() => (hubDialogOpen = true)}>
+						Hub から追加
+					</button>
+				{/if}
+			</div>
 			{#if canWrite}
 				<div class="create">
 					<h4>新規作成</h4>
@@ -1626,8 +1813,14 @@
 				<div class="detail">
 					<h4>{selectedTag.name} を編集</h4>
 					<UnsavedChangesNotice pending={editTagStore.isDirty} label={UNSAVED_NOTICE} />
+					{#if selectedTagIsHub}
+						<p class="note">
+							Hub 経由のタグです。アドレスは Hub
+							のタグ名（外部名）で、スケーリングは設定できません（Hub は工学値を送ります）。
+						</p>
+					{/if}
 					<BantoForm
-						schema={tagSchema(TAG_EDIT)}
+						schema={tagSchema(TAG_EDIT, selectedTagIsHub)}
 						store={editTagStore}
 						onSubmit={saveTag}
 						submitting={savingTag || deletingTag}
@@ -1671,6 +1864,16 @@
 				</div>
 			{/if}
 		</section>
+
+		{#if canWrite}
+			<HubImportDialog
+				open={hubDialogOpen}
+				connections={connectionRows}
+				groups={groupRows}
+				onclose={() => (hubDialogOpen = false)}
+				onregistered={() => void afterHubRegistration()}
+			/>
+		{/if}
 	{/if}
 </div>
 
@@ -1700,6 +1903,28 @@
 	h3 {
 		margin: 0;
 		font-size: 0.95rem;
+	}
+
+	.section-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+	}
+
+	button.secondary {
+		height: var(--banto-control-height);
+		box-sizing: border-box;
+		padding: 0 1rem;
+		background: transparent;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius-md);
+		color: inherit;
+		cursor: pointer;
+	}
+
+	button.secondary:hover {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
 	}
 
 	.thresholds-pane {

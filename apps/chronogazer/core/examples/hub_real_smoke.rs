@@ -1266,7 +1266,7 @@ async fn main() {
         // いたが誤り）。requested_tags が空でなければ上の
         // `Some(_) if !requested_tags.is_empty()` 分岐でそのまま
         // selected_tags になる - catalog に無い名前を指定しても
-        // set_selected_tags は成功し、購読は試みられて「未解決」として
+        // set_registered_tags は成功し、購読は試みられて「未解決」として
         // 報告される（plan_bindings、下の観測ログの unresolved 列を参照）。
         println!("  スキップ: catalogにタグが0件のため、選択できるタグがありません。");
         step4_result = StepResult::skipped("選択と購読", "catalogのタグが0件");
@@ -1276,10 +1276,14 @@ async fn main() {
             selected_tags.len(),
             selected_tags.join(", ")
         );
-        match hub1.set_selected_tags(selected_tags.clone()).await {
+        // #383 段階3 P4: 購読の対象は「登録済みのタグ」（ChronoGazer では
+        // レジストリの hub 接続の下のタグ）。この example はレジストリを
+        // 差し込まないので、`set_registered_tags` で直接与える（画面の選択は
+        // P4 で購読の対象から外した）。
+        match hub1.set_registered_tags(selected_tags.clone()).await {
             Ok(()) => {
                 println!(
-                    "  選択を保存しました。live到達を待ちます(最大{}秒)。",
+                    "  登録済みとして与えました。live到達を待ちます(最大{}秒)。",
                     LIVE_WAIT_TIMEOUT.as_secs()
                 );
                 match wait_for_live(&hub1, LIVE_WAIT_TIMEOUT, &mut tracker).await {
@@ -1336,9 +1340,9 @@ async fn main() {
                 }
             }
             Err(err) => {
-                println!("  タグ選択の保存に失敗しました: {err}");
+                println!("  登録済みタグでの購読の突き合わせに失敗しました: {err}");
                 step4_result =
-                    StepResult::fail("選択と購読", format!("set_selected_tags失敗: {err}"));
+                    StepResult::fail("選択と購読", format!("set_registered_tags失敗: {err}"));
             }
         }
     }

@@ -203,7 +203,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::routes::{
@@ -217,7 +217,8 @@ use banto_server::{
 };
 use banto_tags::{
     CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
-    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, MODBUS_PROTOCOL,
+    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, HUB_PROTOCOL,
+    MODBUS_PROTOCOL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -340,13 +341,6 @@ struct HubAdoptBody {
     key: String,
 }
 
-/// `PUT /api/hub/selected-tags` の body。空配列は正当な入力（受入条件）。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HubSelectedTagsBody {
-    tags: Vec<String>,
-}
-
 /// `settings_change`/`settings` の監査エントリを 1 本記録する（Hub 操作
 /// 共通）。`detail` には接続先とキー名までしか入れない - 平文キーは
 /// どの経路にも出さない。
@@ -421,18 +415,6 @@ async fn hub_subscription_handler(State(state): State<HubState>) -> Json<HubSubs
     Json(state.hub.subscription().await)
 }
 
-/// `PUT /api/hub/selected-tags`（`admin` 限定）。
-async fn hub_selected_tags_handler(
-    State(state): State<HubState>,
-    headers: HeaderMap,
-    Json(body): Json<HubSelectedTagsBody>,
-) -> Result<StatusCode, ApiError> {
-    let count = body.tags.len();
-    state.hub.set_selected_tags(body.tags).await?;
-    record_hub_change(&state, &headers, json!({ "hubSelectedTagCount": count })).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// `DELETE /api/hub`（`admin` 限定）: ローカルの設定とキーリングだけを消す。
 /// Hub 側のキーは失効させない（`banto_hub_bootstrap::Bootstrapper::disconnect`
 /// の doc comment参照）。
@@ -462,7 +444,6 @@ fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Route
         .route("/api/hub/adopt-key", post(hub_adopt_key_handler))
         .route("/api/hub/refresh", post(hub_refresh_handler))
         .route("/api/hub/subscription", get(hub_subscription_handler))
-        .route("/api/hub/selected-tags", put(hub_selected_tags_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             RoleGuard {
@@ -871,15 +852,19 @@ fn default_tag_decimals() -> i64 {
 /// 狭い許可リスト方式にしているのは、chronogazer が「PLC 直結」以外の
 /// 用途を一切持たないため（将来 `ALLOWED_PROTOCOLS` が5つ目を増やしても、
 /// ここで拒否されるのが安全側のデフォルト）。#383 段階3 P2 で 5 つ目の
-/// `"hub"`（Hub 経由の接続、2026-10-10 オーナー決定 H1）が増えたが、
-/// これは chronogazer のための種別で、作成の導線（Hub のカタログから登録）は
-/// P4 で足す。それまではここで拒否したままにする（レジストリの検証と、P3 の
-/// 収集 - `crate::collect` のモジュール doc「Hub 経由の接続」 - だけが先に入る）。REST の create/update ハンドラ
+/// `"hub"`（Hub 経由の接続、2026-10-10 オーナー決定 H1）が増えた。これは
+/// chronogazer のための種別なので、**P4（2026-10-11）で許可した**: 画面は
+/// 「Hub から追加」（`crate::hub_tags`）で暗黙に作り、一覧では読み取り専用で
+/// 出すが、REST・Tauri の作成・更新・削除も受け付ける（接続先とキーは
+/// `hub.record` にあり、この行は host/port を持たない - `banto-tags` が
+/// ""/0 に正規化する。Hub は 1 つ・グループを持つ間の削除やプロトコルの
+/// 付け替えの拒否も `banto-tags` が持つ）。**banto-hub は引き続き拒否する**
+/// （`apps/banto-hub/core/src/rest.rs`）。REST の create/update ハンドラ
 /// と、双方向対称の Tauri コマンド（`apps/chronogazer/src-tauri/src/lib.rs`
 /// の `plc_connections_create`/`plc_connections_update`）の両方から呼ぶ -
 /// 片方だけに書くともう片方の経路から通ってしまう。
 fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoError> {
-    const ALLOWED: [&str; 2] = [MODBUS_PROTOCOL, "slmp"];
+    const ALLOWED: [&str; 3] = [MODBUS_PROTOCOL, "slmp", HUB_PROTOCOL];
     if ALLOWED.contains(&protocol) {
         return Ok(());
     }
@@ -1229,6 +1214,9 @@ struct TagRegistryState {
     tags: TagService,
     // #393: タグの削除の前に、表示グループのペンからの参照を確かめる。
     display_groups: DisplayGroupService,
+    // #383 段階3 P4: 書き込みの後に `HubService::registry_changed` を呼ぶ
+    // （登録済みの hub タグの集合が変わったら購読に反映する）。
+    hub: HubService,
     auth: AuthState,
     audit: AuditLogService,
 }
@@ -1286,6 +1274,9 @@ async fn plc_connections_create(
         Some(plc_connection_audit_detail(&created)),
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(Json(PlcConnectionResponse::from(created)))
 }
 
@@ -1327,6 +1318,9 @@ async fn plc_connections_update(
         Some(plc_connection_audit_detail(&updated)),
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(Json(PlcConnectionResponse::from(updated)))
 }
 
@@ -1355,6 +1349,9 @@ async fn plc_connections_delete(
         None,
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1437,6 +1434,9 @@ async fn collection_groups_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(Json(created))
 }
 
@@ -1474,6 +1474,9 @@ async fn collection_groups_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(Json(updated))
 }
 
@@ -1502,6 +1505,9 @@ async fn collection_groups_delete(
         None,
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1550,6 +1556,9 @@ async fn tags_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(Json(created))
 }
 
@@ -1631,6 +1640,9 @@ async fn tags_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(Json(updated))
 }
 
@@ -1664,7 +1676,136 @@ async fn tags_delete(
         None,
     )
     .await;
+    // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（変わって
+    // いなければ何もしない）。
+    state.hub.registry_changed().await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- #383 段階3 P4: Hub から追加 ---------------------------------------------
+
+/// `/api/hub/catalog`・`/api/hub/legacy-selection/dismiss`・
+/// `/api/tags/from-hub` の state。タグの登録（editor）なので、`admin` 限定の
+/// [`hub_router`] とは別のルーターにする。
+#[derive(Clone)]
+struct HubRegistrationState {
+    hub: HubService,
+    pool: sqlx::SqlitePool,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+/// `GET /api/hub/catalog`（`editor` 以上、#383 段階3 P4）: 「Hub から追加」の
+/// ダイアログ用。catalog・登録済みの外部名・移行前の選択だけを返し、接続先や
+/// キー名は返さない（`GET /api/hub` は `admin` 限定のまま）。catalog を
+/// Hub から読み直す。読み取りなので監査しない。
+async fn hub_catalog_handler(
+    State(state): State<HubRegistrationState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::hub::HubCatalogView>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "GET",
+        "/api/hub/catalog",
+    )
+    .await?;
+    Ok(Json(state.hub.catalog_for_registration().await?))
+}
+
+/// `POST /api/hub/legacy-selection/dismiss`（`editor` 以上、#383 段階3 P4）:
+/// P4 より前の設定画面で選んでいたタグを使わずに消す（ダイアログの
+/// 「以前の選択を使わない」）。消したときだけ監査する。
+async fn hub_dismiss_legacy_selection_handler(
+    State(state): State<HubRegistrationState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "settings",
+        "POST",
+        "/api/hub/legacy-selection/dismiss",
+    )
+    .await?;
+    if state.hub.clear_legacy_selection().await? {
+        record_write(
+            &state.audit,
+            &state.auth,
+            &headers,
+            "settings_change",
+            "settings",
+            None,
+            Some(json!({ "hubLegacySelectionCleared": true, "reason": "dismissed" })),
+        )
+        .await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/tags/from-hub`（`editor` 以上、#383 段階3 P4）: Hub のカタログから
+/// 選んだタグを登録する（規則は `crate::hub_tags` のモジュール doc）。**常に
+/// 200**（banto-hub の `POST /api/tags/batch` と同じ）: 検証の不合格は
+/// `ok: false` と行ごとのエラー。成功したら監査し、購読に反映し
+/// （`HubService::registry_changed`）、移行前の選択の消去を予約する（待たない -
+/// `HubService::schedule_legacy_selection_clear`）。
+async fn tags_from_hub_handler(
+    State(state): State<HubRegistrationState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::hub_tags::HubTagRegistration>,
+) -> Result<Json<crate::hub_tags::HubRegistrationResult>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "POST",
+        "/api/tags/from-hub",
+    )
+    .await?;
+    let mut result = crate::hub_tags::register_from_hub(
+        &state.pool,
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        body,
+    )
+    .await?;
+    if result.ok {
+        record_write(
+            &state.audit,
+            &state.auth,
+            &headers,
+            "create",
+            "tags",
+            None,
+            Some(crate::hub_tags::registration_audit_detail(&result)),
+        )
+        .await;
+        state.hub.registry_changed().await;
+        // 待たない（操作ロックを `connect` が握っていても応答を遅らせない）。
+        result.legacy_selection_clear_scheduled = state.hub.schedule_legacy_selection_clear();
+    }
+    Ok(Json(result))
+}
+
+fn hub_registration_router(state: HubRegistrationState) -> Router {
+    let auth = state.auth.clone();
+    Router::new()
+        .route("/api/hub/catalog", get(hub_catalog_handler))
+        .route(
+            "/api/hub/legacy-selection/dismiss",
+            post(hub_dismiss_legacy_selection_handler),
+        )
+        .route("/api/tags/from-hub", post(tags_from_hub_handler))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
 /// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
@@ -1680,6 +1821,7 @@ fn tag_registry_router(
     collection_groups: CollectionGroupService,
     tags: TagService,
     display_groups: DisplayGroupService,
+    hub: HubService,
     audit: AuditLogService,
     auth: AuthState,
 ) -> Router {
@@ -1688,6 +1830,7 @@ fn tag_registry_router(
         collection_groups,
         tags,
         display_groups,
+        hub,
         auth: auth.clone(),
         audit,
     };
@@ -1818,7 +1961,24 @@ pub fn api_router(
         ))
         .merge(audit_spool_router(audit.clone(), auth.clone()))
         .merge(backups_router(backup, audit.clone(), auth.clone()))
-        .merge(hub_router(hub, audit.clone(), auth.clone()))
+        .merge({
+            // #383 段階3 P4: 購読の対象（登録済みの hub タグ）をレジストリから
+            // 読む。デスクトップ（`src-tauri`）は起動時にも差し込む（LAN の
+            // サーバーを開かない構成のため）。2 回目は無視される。
+            hub.attach_registry(display_groups.pool().clone());
+            hub_router(hub.clone(), audit.clone(), auth.clone())
+        })
+        // #383 段階3 P4: 「Hub から追加」（editor）。レジストリ 3 サービスと同じ
+        // pool（`DisplayGroupService::pool` の doc）。
+        .merge(hub_registration_router(HubRegistrationState {
+            hub: hub.clone(),
+            pool: display_groups.pool().clone(),
+            plc_connections: plc_connections.clone(),
+            collection_groups: collection_groups.clone(),
+            tags: tags.clone(),
+            auth: auth.clone(),
+            audit: audit.clone(),
+        }))
         .merge(collect_router(collect, audit.clone(), auth.clone()))
         .merge(display_groups::display_groups_router(
             display_groups.clone(),
@@ -1837,6 +1997,7 @@ pub fn api_router(
             collection_groups,
             tags,
             display_groups,
+            hub,
             audit,
             auth.clone(),
         ))
@@ -1915,6 +2076,21 @@ mod tests {
     /// (#414 段階2: a tag saved before the save-time address check).
     pub(super) async fn router_with_role_tokens_and_pool(
     ) -> (Router, String, String, String, sqlx::SqlitePool) {
+        let (router, admin, editor, viewer, pool, _hub) =
+            router_with_role_tokens_pool_and_hub().await;
+        (router, admin, editor, viewer, pool)
+    }
+
+    /// [`router_with_role_tokens_and_pool`] plus the router's `HubService`（#383 段階3
+    /// P4: 操作ロックを外から握るテストのため。`Clone` は同じ実体を指す）。
+    async fn router_with_role_tokens_pool_and_hub() -> (
+        Router,
+        String,
+        String,
+        String,
+        sqlx::SqlitePool,
+        crate::hub::HubService,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(Db::Sqlite(pool.clone()));
@@ -1977,7 +2153,7 @@ mod tests {
                 settings,
                 audit,
                 backup,
-                hub,
+                hub.clone(),
                 plc_connections,
                 collection_groups,
                 tags,
@@ -1991,6 +2167,7 @@ mod tests {
             editor_token,
             viewer_token,
             pool,
+            hub,
         )
     }
 
@@ -3989,12 +4166,13 @@ mod tests {
     /// [`reject_disallowed_connection_protocol`]: chronogazer は
     /// `"virtual"`/`"postgres"` 接続の作成を拒否する（banto-hub 固有の
     /// プロトコル）。人間可読な `field_errors` として返ることを固定する。
-    /// `"hub"`（#383 段階3 P2）も、作成の導線を足す P4 までは同じく拒否する。
+    /// `"hub"`（#383 段階3 P2）は P4（2026-10-11）で許可した - 下の
+    /// `a_hub_connection_can_be_created_once_and_deleted_only_when_empty`。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plc_connection_create_rejects_virtual_and_postgres_protocol_readably() {
         let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
 
-        for protocol in ["virtual", "postgres", "hub"] {
+        for protocol in ["virtual", "postgres"] {
             let mut payload = plc_connection_payload("not-allowed");
             payload["protocol"] = json!(protocol);
             let response = router
@@ -4009,6 +4187,346 @@ mod tests {
             let message = body["field_errors"][0]["message"].as_str().unwrap();
             assert!(!message.is_empty(), "protocol={protocol}: {message}");
         }
+    }
+
+    /// #383 段階3 P4: `"hub"` 接続は REST で作れる（host/port は持たない -
+    /// banto-tags が ""/0 に正規化）。Hub は 1 つまで、グループを持つ間は削除
+    /// できない（どちらも banto-tags の規則がそのまま返る）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hub_connection_can_be_created_once_and_deleted_only_when_empty() {
+        let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
+        let hub_payload = |name: &str| json!({ "name": name, "protocol": "hub", "host": "", "port": 0, "enabled": true });
+
+        let created = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/plc-connections",
+                &editor,
+                hub_payload("Hub"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body_json(created).await;
+        assert_eq!(created["protocol"], json!("hub"));
+        assert_eq!(created["host"], json!(""));
+        assert_eq!(created["port"], json!(0));
+        let hub_id = created["id"].as_i64().unwrap();
+
+        // 2026-10-11 オーナー決定: Hub 接続の有効・無効は PLC 接続と同じ更新で切り替える。
+        let disabled = router
+            .clone()
+            .oneshot(put_json_auth(
+                &format!("/api/plc-connections/{hub_id}"),
+                &editor,
+                json!({ "name": "Hub", "protocol": "hub", "host": "", "port": 0, "enabled": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let disabled = body_json(disabled).await;
+        assert_eq!(disabled["enabled"], json!(false));
+        assert_eq!(disabled["protocol"], json!("hub"));
+
+        let second = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/plc-connections",
+                &editor,
+                hub_payload("Hub 2"),
+            ))
+            .await
+            .unwrap();
+        assert!(second.status().is_client_error());
+        let second = body_json(second).await;
+        assert_eq!(second["field_errors"][0]["field"], json!("protocol"));
+
+        let group = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/collection-groups",
+                    &editor,
+                    json!({ "name": "hub-g", "plcConnectionId": hub_id, "periodMs": 1000 }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let group_id = group["id"]
+            .as_i64()
+            .expect("group under the hub connection");
+
+        let refused = router
+            .clone()
+            .oneshot(delete_auth(
+                &format!("/api/plc-connections/{hub_id}"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            refused.status().is_client_error(),
+            "グループを持つ間は消せない"
+        );
+
+        let removed = router
+            .clone()
+            .oneshot(delete_auth(
+                &format!("/api/collection-groups/{group_id}"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        let deleted = router
+            .oneshot(delete_auth(
+                &format!("/api/plc-connections/{hub_id}"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    }
+
+    fn hub_row(external_name: &str, name: &str, data_type: &str) -> serde_json::Value {
+        json!({
+            "externalName": external_name,
+            "name": name,
+            "dataType": data_type,
+            "unit": "℃",
+            "decimals": 1
+        })
+    }
+
+    /// #383 段階3 P4: 「Hub から追加」の REST 経路。editor が登録でき（hub 接続と
+    /// グループは暗黙に作る）、名前の衝突・登録済みは行ごとの `ok: false`
+    /// （常に 200）、viewer は拒否。登録したタグは書き込み不可・スケーリング
+    /// なし・アドレスは外部名で、ダイアログの catalog には登録済みとして出る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tags_from_hub_registers_rows_and_reports_per_row_errors() {
+        let (router, _admin, editor, viewer) = router_with_role_tokens().await;
+
+        let denied = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags/from-hub",
+                &viewer,
+                json!({ "newGroup": { "name": "g", "periodMs": 1000 }, "tags": [hub_row("L.G.a", "a", "f32")] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let response = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags/from-hub",
+                &editor,
+                json!({
+                    "newGroup": { "name": "hub-fast", "periodMs": 1000 },
+                    "tags": [hub_row("L.G.a", "a", "f32"), hub_row("L.G.b", "b", "bit")]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["connectionCreated"], json!(true));
+        assert_eq!(body["groupCreated"], json!(true));
+        assert_eq!(body["tags"][0]["address"], json!("L.G.a"));
+        assert_eq!(body["tags"][0]["writable"], json!(false));
+        assert_eq!(body["tags"][0]["rawLo"], json!(null));
+        assert_eq!(body["tags"][0]["decimals"], json!(1));
+        assert_eq!(body["legacySelectionClearScheduled"], json!(false));
+        let group_id = body["collectionGroup"]["id"].as_i64().unwrap();
+
+        let connections = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/plc-connections", &editor))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(connections[0]["protocol"], json!("hub"));
+        assert_eq!(connections[0]["name"], json!("Hub"));
+
+        let rejected = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/tags/from-hub",
+                    &editor,
+                    json!({
+                        "collectionGroupId": group_id,
+                        "tags": [hub_row("L2.G.a", "a", "f32"), hub_row("L.G.a", "a2", "f32"), hub_row("L.G.s", "s", "string")]
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(rejected["ok"], json!(false), "{rejected}");
+        let rows: Vec<(i64, String)> = rejected["rowErrors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["index"].as_i64().unwrap(),
+                    row["fieldErrors"][0]["field"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (0, "name".to_owned()),
+                (1, "externalName".to_owned()),
+                (2, "dataType".to_owned())
+            ]
+        );
+
+        // 2026-10-11（Codex）: 普通のタグの作成（`POST /api/tags`）でも、Hub 経由のタグの
+        // 外部名は一意（banto-tags の検証）。
+        let duplicate = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "a-again",
+                    "collectionGroupId": group_id,
+                    "address": "L.G.a",
+                    "dataType": "f32",
+                    "decimals": 0,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(duplicate.status().is_client_error());
+        let duplicate = body_json(duplicate).await;
+        assert_eq!(
+            duplicate["field_errors"][0]["field"],
+            json!("address"),
+            "{duplicate}"
+        );
+
+        // ダイアログ用の catalog: editor が読め（viewer は不可）、Hub 未接続でも
+        // 登録済みの外部名は返る（catalog は `null` = 読めていない）。
+        let forbidden = router
+            .clone()
+            .oneshot(get_auth("/api/hub/catalog", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let catalog = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/hub/catalog", &editor))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(catalog["status"]["state"], json!("notConfigured"));
+        assert_eq!(catalog["tags"], json!(null));
+        assert_eq!(catalog["registered"], json!(["L.G.a", "L.G.b"]));
+        assert_eq!(catalog["legacySelection"], json!([]));
+        assert!(
+            catalog.get("endpoint").is_none(),
+            "接続先は editor に出さない"
+        );
+
+        let dismissed = router
+            .oneshot(post_json_auth(
+                "/api/hub/legacy-selection/dismiss",
+                &editor,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dismissed.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// #383 段階3 P4（監査の追補）: 登録の応答は、移行前の選択の消去を**待たない**。
+    /// Hub の操作ロックを `connect` が握っている（最大 60 秒）状態でも登録はすぐ
+    /// 返り、`legacySelectionClearScheduled: true`。予約の間も catalog は移行前の
+    /// 選択を出さず、ロックが空くと設定から消える。
+    ///
+    /// 反証: ハンドラの予約を `clear_legacy_selection().await` に戻すと、応答が
+    /// 時間切れで落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tags_from_hub_does_not_wait_for_the_legacy_clear() {
+        let (router, _admin, editor, _viewer, pool, hub) =
+            router_with_role_tokens_pool_and_hub().await;
+        let settings = SettingsService::new(Db::Sqlite(pool));
+        let record = json!({
+            "endpoint": "http://127.0.0.1:3100",
+            "installationId": "inst",
+            "keyId": null,
+            "keyName": null,
+            "keyringAccount": "hub:127.0.0.1:3100/:inst",
+            "selectedTags": ["L.G.a"]
+        });
+        settings
+            .set("hub.record", &record.to_string())
+            .await
+            .unwrap();
+        let catalog = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/hub/catalog", &editor))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(catalog["legacySelection"], json!(["L.G.a"]), "{catalog}");
+
+        let held = hub.hold_operation_lock_for_test().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.clone().oneshot(post_json_auth(
+                "/api/tags/from-hub",
+                &editor,
+                json!({
+                    "newGroup": { "name": "hub-g", "periodMs": 1000 },
+                    "tags": [hub_row("L.G.a", "a", "f32")]
+                }),
+            )),
+        )
+        .await
+        .expect("操作ロックを握られていても登録の応答は待たない")
+        .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["legacySelectionClearScheduled"], json!(true));
+        assert!(hub.legacy_clear_pending_for_test());
+        drop(held);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let stored: serde_json::Value =
+                serde_json::from_str(&settings.get("hub.record").await.unwrap().unwrap()).unwrap();
+            if stored["selectedTags"] == json!([]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ロックが空いたら裏で消える: {stored}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let catalog = body_json(
+            router
+                .oneshot(get_auth("/api/hub/catalog", &editor))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(catalog["legacySelection"], json!([]));
     }
 
     /// banto-tags 自身の検証（`period_ms` は `ALLOWED_PERIOD_MS` のいずれか）

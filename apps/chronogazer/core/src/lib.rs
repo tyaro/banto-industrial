@@ -19,6 +19,9 @@ pub mod events;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
 pub mod hub;
+// #383 段階3 P4: 「Hub から追加」（Hub のカタログからタグを登録する）。REST と
+// Tauri の両方が同じ関数を呼ぶ - モジュール doc 参照。
+pub mod hub_tags;
 // #392 A1: 同じ DB を 2 プロセスで開かないための単一インスタンス排他。
 // デスクトップと `banto-serve` が DB を開く前に呼ぶ。
 pub mod instance_lock;

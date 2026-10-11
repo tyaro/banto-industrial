@@ -13,25 +13,22 @@
  *   `banto-serve` は OS キーリングを持てないので購読は常に張れない。
  * - 非 admin では `Hub接続` が見えず、`/settings/hub` への直接遷移が先頭の
  *   可視カテゴリへ弾かれること（`guardCategory`）。
- * -（観点別レビュー P2-B の回帰固定）**未保存のタグ選択が「一覧を更新」で
- *   黙って消えない**こと（#378「未保存の入力を黙って捨てない」）。修正前は
- *   `applyView()` がサーバーの `selectedTags` で無条件に上書きしており、
- *   チェックを変えてから隣の「一覧を更新」を押すと確認も警告もなく元に
- *   戻っていた。
+ * -（#383 段階3 P4、test 8・9）**タグの選択はこの画面から外した**: 購読する
+ *   のは「タグ設定」の「Hub から追加」で登録したタグで、この画面はそれを
+ *   現在値と一緒に**読み取り専用**で出す（チェックボックスも「選択を保存」も
+ *   無い）。以前この画面で選んでいたタグは件数の注記だけが出る。切断に
+ *   失敗したらエラーが出る（P3 までの test 8〜10 は選択の下書きの扱いを
+ *   固定していたが、選択が無くなったので置き換えた）。
  *
- *   この 1 本だけ `page.route` で `GET /api/hub`・`POST /api/hub/refresh` を
- *   差し替える（作法は `e2e/tests/tags.spec.ts` の `page.route` ゲートに
- *   倣う）。タグのチェックボックスは接続状態が `connected` のときにしか
- *   描かれず、`banto-serve` は OS キーリングを持てない（`UnavailableKeyStore`）
- *   ため、実サーバーだけでは `connected` に到達する手段が無い - この画面で
- *   Hub を実際に立てる仕組みはこのリポジトリの E2E に無い（上の doc
- *   comment 参照）。差し替えるのは一覧と選択を返す 2 本だけで、購読の
- *   ポーリング（`GET /api/hub/subscription`）は実サーバーのまま流す。
- * -（オーナーレビュー P2 の回帰固定 3 本、test 9〜11）**切断に失敗しても
- *   未保存の注記が消えない**こと、**別の Hub に繋ぎ直したら旧 Hub のタグ名が
- *   保存の payload に混ざらない**こと、**購読の読み取りが応答しないときに
- *   「状態を取得できていません」に切り替わる**こと。最後の 1 本は `page.route`
- *   で要求を**握ったまま応答しない**（即座に失敗するモックでは、ポーリングが
+ *   この 2 本は `page.route` で `GET /api/hub`（と test 8 は
+ *   `GET /api/hub/subscription`）を差し替える。接続済み・購読中の状態は
+ *   `banto-serve` が OS キーリングを持てない（`UnavailableKeyStore`）ため
+ *   実サーバーだけでは作れない - この画面で Hub を実際に立てる仕組みは
+ *   このリポジトリの E2E に無い（上の doc comment 参照）。「Hub から追加」の
+ *   ダイアログは `user-tags-from-hub.spec.ts` が固定する。
+ * -（オーナーレビュー P2 の回帰固定、test 10）**購読の読み取りが応答しない
+ *   ときに「状態を取得できていません」に切り替わる**こと。`page.route` で
+ *   要求を**握ったまま応答しない**（即座に失敗するモックでは、ポーリングが
  *   ループごと止まる欠陥を再現できない）。
  *
  * 「接続済み」「連携が必要」など Hub を実際に必要とする状態は
@@ -120,8 +117,12 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 		await expect(page.getByText('状態: 未設定')).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: '購読' })).toBeVisible();
 		await expect(page.getByText('購読: 停止')).toBeVisible();
-		await expect(page.getByText('値を受信していません。')).toBeVisible();
-		// 値の表は Live のときだけ。停止中に古い値や空の表を出さない。
+		// 停止の理由（Hub への接続が未設定）を出す。
+		await expect(page.getByText('Hubへの接続が設定されていません')).toBeVisible();
+		// #383 段階3 P4: 値の表の代わりに、登録済みの Hub タグが無いことを言う
+		// （P3 までの「値を受信していません。」から変わった。オーナー確認済み）。
+		await expect(page.getByText('Hub経由のタグはまだ登録されていません。')).toBeVisible();
+		// 値の表は出さない（停止中に古い値や空の表を出さない）。
 		await expect(page.getByRole('columnheader', { name: '品質' })).toHaveCount(0);
 	});
 
@@ -133,7 +134,8 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 		// 接続が失敗しても購読ブロックは「停止」のまま残る（消えない・
 		// 例外で画面が落ちない）。
 		await expect(page.getByText('購読: 停止')).toBeVisible();
-		await expect(page.getByText('値を受信していません。')).toBeVisible();
+		await expect(page.getByText('Hub経由のタグはまだ登録されていません。')).toBeVisible();
+		await expect(page.getByRole('columnheader', { name: '品質' })).toHaveCount(0);
 	});
 
 	test('6. 閲覧者アカウントを作成する（次のテストの前提）', async () => {
@@ -171,93 +173,13 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 		}
 	});
 
-	// 観点別レビュー P2-B の回帰固定。差し替えの理由はこのファイルの doc
-	// comment 参照（`connected` は実サーバーだけでは作れない）。
-	test('8. 未保存のタグ選択は「一覧を更新」で黙って消えず、明示的に捨てる導線が出る', async () => {
-		const SELECTED_TAG = 'line1.temp';
-		const UNSELECTED_TAG = 'line1.press';
-		// `HubView`（`chronogazer_core::hub::HubView`）と同じ形。サーバー側の
-		// 選択は `SELECTED_TAG` だけ。
-		const hubView = {
-			status: { state: 'connected', tagCount: 2 },
-			endpoint: 'http://127.0.0.1:3100',
-			keyName: 'chronogazer-e2e',
-			selectedTags: [SELECTED_TAG],
-			tags: [
-				{
-					externalName: SELECTED_TAG,
-					name: 'temp',
-					dataType: 'f32',
-					unit: 'degC',
-					tagKind: 'plc'
-				},
-				{
-					externalName: UNSELECTED_TAG,
-					name: 'press',
-					dataType: 'f32',
-					unit: 'kPa',
-					tagKind: 'plc'
-				}
-			],
-			subscription: {
-				state: 'stopped',
-				reason: '購読していません。',
-				subscribedCount: 0,
-				unresolved: [],
-				unsupported: [],
-				lastError: null,
-				lastValueAt: null,
-				values: []
-			}
-		};
-
-		await page.route('**/api/hub', async (route) => {
-			if (route.request().method() === 'GET') {
-				await route.fulfill({ json: hubView });
-				return;
-			}
-			await route.continue();
-		});
-		await page.route('**/api/hub/refresh', async (route) => {
-			await route.fulfill({ json: hubView });
-		});
-
-		try {
-			await page.goto('/settings/hub');
-			await expect(page.getByText('状態: 接続済み（タグ2件）')).toBeVisible();
-
-			const selectedBox = page.getByRole('checkbox', { name: SELECTED_TAG });
-			const unselectedBox = page.getByRole('checkbox', { name: UNSELECTED_TAG });
-			await expect(selectedBox).toBeChecked();
-			await expect(unselectedBox).not.toBeChecked();
-
-			// 未保存の変更を作る（保存はしない）。
-			await unselectedBox.check();
-			await expect(unselectedBox).toBeChecked();
-
-			// 「選択を保存」の隣にある「一覧を更新」を押す。修正前はここで
-			// チェックがサーバーの内容（SELECTED_TAG だけ）に戻っていた。
-			await page.getByRole('button', { name: '一覧を更新' }).click();
-
-			await expect(unselectedBox).toBeChecked();
-			await expect(selectedBox).toBeChecked();
-			await expect(page.getByText('選択に未保存の変更があります')).toBeVisible();
-
-			// 捨てるときは明示的に（黙って捨てない代わりの導線）。
-			await page.getByRole('button', { name: 'サーバーの内容に戻す' }).click();
-			await expect(unselectedBox).not.toBeChecked();
-			await expect(selectedBox).toBeChecked();
-			await expect(page.getByText('選択に未保存の変更があります')).toHaveCount(0);
-		} finally {
-			await page.unroute('**/api/hub/refresh');
-			await page.unroute('**/api/hub');
-		}
-	});
-
-	// --- オーナーレビュー P2 の回帰固定 ---------------------------------------
-
-	/** test 8 と同じ `HubView` の形。接続先とタグだけ差し替えて使う。 */
-	function hubViewFor(endpoint: string, tagNames: string[], selectedTags: string[]) {
+	/** `HubView`（`chronogazer_core::hub::HubView`）と同じ形。 */
+	function hubViewFor(
+		endpoint: string,
+		tagNames: string[],
+		selectedTags: string[],
+		subscription: Record<string, unknown>
+	) {
 		return {
 			status: { state: 'connected', tagCount: tagNames.length },
 			endpoint,
@@ -268,32 +190,81 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 				name: externalName,
 				dataType: 'f32',
 				unit: null,
+				decimals: 1,
 				tagKind: 'plc'
 			})),
-			subscription: {
-				state: 'stopped',
-				reason: '購読していません。',
-				subscribedCount: 0,
-				unresolved: [],
-				unsupported: [],
-				lastError: null,
-				lastValueAt: null,
-				values: []
-			}
+			subscription
 		};
 	}
 
-	// P2-1: 未保存フラグを `await` の前に降ろしていたため、切断が失敗すると
-	// エラーだけが出て注記が消え、次の「一覧を更新」でサーバーの選択に黙って
-	// 上書きされた（この PR で塞いだはずの穴が失敗経路に残っていた）。
-	test('9. 切断に失敗しても未保存の注記は残り、次の「一覧を更新」で選択が消えない', async () => {
-		const SELECTED_TAG = 'line1.temp';
-		const UNSELECTED_TAG = 'line1.press';
-		const view = hubViewFor(
-			'http://127.0.0.1:3100',
-			[SELECTED_TAG, UNSELECTED_TAG],
-			[SELECTED_TAG]
-		);
+	const STOPPED_SUBSCRIPTION = {
+		state: 'stopped',
+		reason: '購読していません。',
+		subscribedCount: 0,
+		registered: [],
+		unresolved: [],
+		unsupported: [],
+		lastError: null,
+		lastValueAt: null,
+		values: []
+	};
+
+	// #383 段階3 P4: 選択を購読から外した（収集中に選択を変えるたびの張り直しを
+	// 無くすため）。差し替えの理由はこのファイルの doc comment 参照。
+	test('8. タグの選択はこの画面に無く、登録済みのHubタグが現在値と一緒に読み取り専用で出る', async () => {
+		const REGISTERED = 'line1.temp';
+		const OTHER = 'line1.press';
+		const LEGACY = 'line1.old';
+		const subscription = {
+			state: 'live',
+			reason: null,
+			subscribedCount: 1,
+			registered: [REGISTERED],
+			unresolved: [],
+			unsupported: [],
+			lastError: null,
+			lastValueAt: 1_700_000_000_000,
+			values: [{ tag: REGISTERED, v: 21.5, q: 'good', t: 1_700_000_000_000, valueSource: 'real' }]
+		};
+		const view = hubViewFor('http://127.0.0.1:3100', [REGISTERED, OTHER], [LEGACY], subscription);
+
+		await page.route('**/api/hub', async (route) => {
+			if (route.request().method() === 'GET') {
+				await route.fulfill({ json: view });
+				return;
+			}
+			await route.continue();
+		});
+		await page.route('**/api/hub/subscription', async (route) => {
+			await route.fulfill({ json: subscription });
+		});
+
+		try {
+			await page.goto('/settings/hub');
+			await expect(page.getByText('状態: 接続済み（タグ2件）')).toBeVisible();
+			await expect(page.getByText('Hubのタグ: 2件')).toBeVisible();
+
+			// 選ぶ導線は無い。
+			await expect(page.getByRole('checkbox')).toHaveCount(0);
+			await expect(page.getByRole('button', { name: '選択を保存' })).toHaveCount(0);
+
+			// 登録済みのタグと現在値。
+			const table = page.getByRole('table', { name: '登録済みのHubタグ' });
+			await expect(table.getByRole('row').filter({ hasText: REGISTERED })).toContainText('21.5');
+			await expect(table.getByText(OTHER)).toHaveCount(0);
+			await expect(page.getByRole('link', { name: 'タグ設定', exact: true })).toBeVisible();
+
+			// 以前の選択は件数の注記だけ（購読していない）。
+			await expect(page.getByText('以前この画面で選んでいたタグが1件あります')).toBeVisible();
+		} finally {
+			await page.unroute('**/api/hub/subscription');
+			await page.unroute('**/api/hub');
+		}
+	});
+
+	// P2-1 の名残: 切断の失敗を握り潰さない（成功してから状態を落とす）。
+	test('9. 切断に失敗するとエラーが出て、接続済みの表示は残る', async () => {
+		const view = hubViewFor('http://127.0.0.1:3100', ['line1.temp'], [], STOPPED_SUBSCRIPTION);
 
 		await page.route('**/api/hub', async (route) => {
 			const method = route.request().method();
@@ -311,83 +282,15 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 			}
 			await route.continue();
 		});
-		await page.route('**/api/hub/refresh', async (route) => {
-			await route.fulfill({ json: view });
-		});
 
 		try {
 			await page.goto('/settings/hub');
-			await expect(page.getByText('状態: 接続済み（タグ2件）')).toBeVisible();
-
-			const unselectedBox = page.getByRole('checkbox', { name: UNSELECTED_TAG });
-			await unselectedBox.check();
-			await expect(page.getByText('選択に未保存の変更があります')).toBeVisible();
-
-			// 切断は失敗する。エラーは出るが、未保存の状態は落ちてはいけない。
+			await expect(page.getByText('状態: 接続済み（タグ1件）')).toBeVisible();
 			await page.getByRole('button', { name: '切断' }).click();
 			await expect(page.getByText('切断に失敗しました')).toBeVisible();
-			await expect(page.getByText('選択に未保存の変更があります')).toBeVisible();
-			await expect(unselectedBox).toBeChecked();
-
-			// 修正前はここでサーバーの選択（SELECTED_TAG だけ）に戻っていた。
-			await page.getByRole('button', { name: '一覧を更新' }).click();
-			await expect(unselectedBox).toBeChecked();
-			await expect(page.getByText('選択に未保存の変更があります')).toBeVisible();
+			await expect(page.getByText('状態: 接続済み（タグ1件）')).toBeVisible();
+			await expect(page.getByLabel('接続先URL')).toHaveValue('http://127.0.0.1:3100');
 		} finally {
-			await page.unroute('**/api/hub/refresh');
-			await page.unroute('**/api/hub');
-		}
-	});
-
-	// P2-2: 下書きは接続先ごとのもの。別の Hub に繋ぎ直すと `tags` だけが
-	// 入れ替わり、画面に出ていない旧 Hub のタグ名が保存の payload に混入した。
-	test('10. 別のHubに接続すると旧Hubの下書きは破棄され、保存の payload に混ざらない', async () => {
-		const HUB_A = 'http://127.0.0.1:3100';
-		const HUB_B = 'http://127.0.0.1:3200';
-		const TAG_A = 'hubA.temp';
-		const TAG_B = 'hubB.flow';
-		const viewA = hubViewFor(HUB_A, [TAG_A], []);
-		const viewB = hubViewFor(HUB_B, [TAG_B], [TAG_B]);
-		let savedTags: unknown = null;
-
-		await page.route('**/api/hub', async (route) => {
-			if (route.request().method() === 'GET') {
-				await route.fulfill({ json: viewA });
-				return;
-			}
-			await route.continue();
-		});
-		await page.route('**/api/hub/connect', async (route) => {
-			await route.fulfill({ json: viewB });
-		});
-		await page.route('**/api/hub/selected-tags', async (route) => {
-			savedTags = (route.request().postDataJSON() as { tags?: unknown }).tags;
-			await route.fulfill({ status: 204, body: '' });
-		});
-
-		try {
-			await page.goto('/settings/hub');
-			const tagABox = page.getByRole('checkbox', { name: TAG_A });
-			await tagABox.check();
-			await expect(page.getByText('選択に未保存の変更があります')).toBeVisible();
-
-			// Hub B へ繋ぎ直す。
-			await page.getByLabel('接続先URL').fill(HUB_B);
-			await page.getByRole('button', { name: '接続' }).click();
-
-			// 一覧は Hub B のものに入れ替わり、破棄したことが画面に出る。
-			await expect(page.getByRole('checkbox', { name: TAG_B })).toBeChecked();
-			await expect(page.getByRole('checkbox', { name: TAG_A })).toHaveCount(0);
-			await expect(page.getByText('未保存だった選択は破棄しました')).toBeVisible();
-			await expect(page.getByText('選択に未保存の変更があります')).toHaveCount(0);
-
-			await page.getByRole('button', { name: '選択を保存' }).click();
-			await expect(page.getByText('選択したタグ（1件）を保存しました。')).toBeVisible();
-			// 修正前は Hub A のタグ名がそのまま Hub B の保存に混ざっていた。
-			expect(savedTags).toEqual([TAG_B]);
-		} finally {
-			await page.unroute('**/api/hub/selected-tags');
-			await page.unroute('**/api/hub/connect');
 			await page.unroute('**/api/hub');
 		}
 	});
@@ -398,7 +301,7 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 	// 止まった（ユーザーがボタンを押すまで「受信中」＋最後の値が永久に残る）。
 	// 即座に失敗するモックではこの欠陥を再現できないので、ここでは要求を
 	// **握ったまま応答しない**。
-	test('11. 購読の読み取りが応答しないと「状態を取得できていません」に切り替わる', async () => {
+	test('10. 購読の読み取りが応答しないと「状態を取得できていません」に切り替わる', async () => {
 		/** 握った要求を最後に解放するための resolver。 */
 		const release: (() => void)[] = [];
 		// 解放後に届いた要求まで握ると、後片付けの `goto` が止まる。
