@@ -17,8 +17,15 @@
 //! event system (`banto://event`) - this is `TauriEventProvider`'s other
 //! half (`packages/admin-core/src/events.ts`) - and auto-starts the server
 //! if it was left enabled on a previous run.
+//!
+//! #392 A2 (docs/plan.md §5 H6 の A): the app is **tray-resident** - closing
+//! the main window hides it and collection keeps running; the tray's 「終了」
+//! (after a confirmation) runs the same exit cleanup as `RunEvent::Exit`
+//! exactly once ([`exit_cleanup_once`]). A second launch focuses the existing
+//! window (`tauri-plugin-single-instance`). See the [`tray`] module doc.
 
 mod keyring_store;
+mod tray;
 
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::{
@@ -3982,7 +3989,31 @@ const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// 保留を開けなかったとき（保留なし）は `None`。
 struct AuditSpoolFlusher(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
 
-async fn shutdown_app_state(state: &AppState) {
+/// What [`shutdown_app_state`] could not finish, so the tray's 「終了」 can
+/// tell the user instead of claiming everything was stopped cleanly (#392 A2).
+/// The `RunEvent::Exit` path (window-less, OS shutdown) only logs it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExitCleanupReport {
+    /// `CollectorService::stop` の失敗（最終 flush）の文言。
+    pub(crate) collect_stop_error: Option<String>,
+    /// [`EXIT_CLEANUP_BUDGET`] 以内に終わらず、途中で切り上げた。
+    pub(crate) timed_out: bool,
+    /// 切り上げたときの予算（秒）。文言に出すため。
+    pub(crate) budget_secs: u64,
+}
+
+async fn shutdown_app_state(state: &AppState) -> ExitCleanupReport {
+    // #392 A2 レビュー（2026-10-12）: 後始末に入ったら、終了処理の**取り消せない**
+    // 印を立て、以降の収集の開始（窓の Tauri コマンド・まだ止めていない LAN の
+    // REST・自動開始）を「終了処理中のため、収集を開始できません」で断る。
+    // この印は誰も下ろさない（トレイの遅れた `AskAgain` が下ろすのは確認の
+    // ための一時的な印だけ。`chronogazer_core::collect` の doc「終了の受付」）。
+    // OS のシャットダウン（`RunEvent::Exit`）でもトレイの「終了」でも、ここで
+    // 立てる。予算の外で、待たずに立てる。**印を立ててから下の `stop()` を
+    // 投入する**ので、その `stop()` が終端の操作になる: 前に並んだ開始は
+    // それが止め、後ろに並んだ開始（受付は印より前でも）はタスクが処理の直前に
+    // 断る（同 doc「受付から投入までの隙間」）。
+    let _ = state.collect.begin_shutdown();
     let cleanup = async {
         // `server_apply` が停止に使っているのと同じ経路（`take()` して
         // `RunningServer::stop()`）。`take()` しておくのは、ここで止めたものを
@@ -4000,9 +4031,13 @@ async fn shutdown_app_state(state: &AppState) {
         // `COLLECT_OPERATION_TIMEOUT` = 30 秒）は**ここでは見ない**:
         // それより短い [`EXIT_CLEANUP_BUDGET`]（5 秒）が必ず先に切れて
         // 上のメッセージを出すので、この経路で `pending` が立つことはない。
-        if let Err(err) = state.collect.stop().await {
-            eprintln!("banto: 終了時の収集の停止に失敗しました: {err}");
-        }
+        let collect_stop_error = match state.collect.stop().await {
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!("banto: 終了時の収集の停止に失敗しました: {err}");
+                Some(err.to_string())
+            }
+        };
 
         // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを
         // 無条件には待たない（`connect` の 60 秒で終了が固まるため）-
@@ -4015,18 +4050,70 @@ async fn shutdown_app_state(state: &AppState) {
         // 最後に DB。`close()` は全接続が返るのを待ってからプールを閉じる
         // ので、`-wal`/`-shm` が畳まれた状態でプロセスが終わる。
         state.pool.close().await;
+        collect_stop_error
     };
 
-    if tokio::time::timeout(EXIT_CLEANUP_BUDGET, cleanup)
-        .await
-        .is_err()
-    {
-        eprintln!(
-            "banto: 終了時の後始末が{}秒以内に終わらなかったため、途中で切り上げて終了します。",
-            EXIT_CLEANUP_BUDGET.as_secs()
-        );
+    match tokio::time::timeout(EXIT_CLEANUP_BUDGET, cleanup).await {
+        Ok(collect_stop_error) => ExitCleanupReport {
+            collect_stop_error,
+            ..ExitCleanupReport::default()
+        },
+        Err(_) => {
+            eprintln!(
+                "banto: 終了時の後始末が{}秒以内に終わらなかったため、途中で切り上げて終了します。",
+                EXIT_CLEANUP_BUDGET.as_secs()
+            );
+            ExitCleanupReport {
+                collect_stop_error: None,
+                timed_out: true,
+                budget_secs: EXIT_CLEANUP_BUDGET.as_secs(),
+            }
+        }
     }
 }
+
+/// [`exit_cleanup_once`] が後始末を 1 回に限るための入れ物（#392 A2）。
+/// `run()` が Builder で manage する。
+#[derive(Default)]
+struct ExitCleanupOnce(tokio::sync::OnceCell<ExitCleanupReport>);
+
+/// アプリの後始末（監査の保留の流し込みを止め、[`shutdown_app_state`]）を
+/// **プロセスで 1 回だけ**行う。呼び口は 2 つ:
+///
+/// - トレイの「終了」（[`tray`]）: 確認の後、`AppHandle::exit` の**前**に
+///   ここを待ち、結果（[`ExitCleanupReport`]）で失敗を利用者に知らせる。
+/// - `RunEvent::Exit`（[`run`]）: `exit` の後に必ず来るほか、**OS の
+///   シャットダウン・ログオフ**でも来る（tao が `WM_ENDSESSION` を受けて
+///   イベントループを畳み、その直後に `std::process::exit` する）。
+///
+/// 2 つ目以降の呼び出しは、1 つ目の後始末が**終わるのを待ってから**同じ
+/// 結果を返す（`OnceCell::get_or_init`）。トレイの「終了」の後始末の最中に
+/// OS のシャットダウンが来ても、後始末を二重に走らせず、途中で見捨てもしない
+/// （待つ時間は [`EXIT_CLEANUP_BUDGET`] で上限がある）。
+///
+/// `AppState` が無い（旧形式の DB・同じ DB の使用中で起動を止めた）ときは
+/// 閉じるものが無いので `None`。
+async fn exit_cleanup_once(app: &tauri::AppHandle) -> Option<ExitCleanupReport> {
+    let state = app.try_state::<AppState>()?;
+    let once = app.try_state::<ExitCleanupOnce>()?;
+    let report = once
+        .0
+        .get_or_init(|| async {
+            // #437: 監査の保留の定期の流し込みを止める（途中で止めても、
+            // ファイルは行が入ってから消すので失われない）。
+            if let Some(flusher) = app.try_state::<AuditSpoolFlusher>() {
+                if let Some(handle) = flusher.0.lock().ok().and_then(|mut h| h.take()) {
+                    handle.abort();
+                }
+            }
+            shutdown_app_state(&state).await
+        })
+        .await;
+    Some(report.clone())
+}
+
+/// メインの窓の label（tauri.conf.json・capabilities と一致させる）。
+const MAIN_WINDOW_LABEL: &str = "main";
 
 /// tauri.conf.json の `app.windows` のうち label が `main` の窓を、その設定の
 /// まま作る。設定側は `create: false`（Tauri が setup の前に自動で作らない）。
@@ -4036,7 +4123,7 @@ fn create_main_window(app: &tauri::App) -> tauri::Result<()> {
         .app
         .windows
         .iter()
-        .find(|window| window.label == "main")
+        .find(|window| window.label == MAIN_WINDOW_LABEL)
         .cloned()
         .expect("tauri.conf.json defines the main window");
     tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.build()?;
@@ -4151,6 +4238,24 @@ struct InstanceLockHolder(chronogazer_core::instance_lock::InstanceGuard);
 
 pub fn run() {
     tauri::Builder::default()
+        // #392 A2: 2 つ目の起動は既存の窓を前に出し、2 つ目のプロセスは
+        // プラグインの setup の中で（下の `setup()`・A1 の排他・DB に触れる前に）
+        // 終わる。プラグインは「他のプラグインより先に登録する」決まりなので
+        // 最初に置く（banto-hub と同じ）。単位はアプリの identifier（=
+        // アプリのデータディレクトリ = DB）で、Windows ではログオン
+        // セッションごと。別のセッションから同じ DB を開こうとした場合や
+        // `banto-serve` が先に使っている場合は、A1 の排他（下）が受け止めて
+        // エラーの窓を出す - 2 つ目の起動でそのエラーの窓が前に出る
+        // （`tray::open_main_window`）。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::open_main_window(app);
+        }))
+        // #392 A2: トレイの「終了」の確認と、× で隠した初回の通知
+        // （`banto-desktop-tray` が Rust 側から呼ぶ。JS 側の権限は使わない）。
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .manage(banto_desktop_tray::QuitGate::new())
+        .manage(ExitCleanupOnce::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("resolve app data dir");
             std::fs::create_dir_all(&data_dir).expect("create app data dir");
@@ -4236,6 +4341,10 @@ pub fn run() {
             // 開けた後にだけここで作る（旧形式の DB のときに空の画面が先に
             // 出ないように）。設定は tauri.conf.json の定義をそのまま使う。
             create_main_window(app)?;
+            // #392 A2: × は終了ではなく隠す（収集は続く）。初回だけ通知する。
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                banto_desktop_tray::hide_to_tray_on_close(&window, tray::TRAY_HINT);
+            }
 
             let events = event_channel();
             let users = UsersService::new(Db::Sqlite(pool.clone()));
@@ -4604,6 +4713,10 @@ pub fn run() {
             let flusher = tauri::async_runtime::block_on(async { audit_for_spool.spawn_spool_flusher() });
             app.manage(AuditSpoolFlusher(std::sync::Mutex::new(flusher)));
 
+            // #392 A2: トレイ（収集の状態・開く・終了）。`AppState` を manage
+            // した後に作る（状態の表示と「終了」が `AppState` を読むため）。
+            tray::install(app)?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4721,17 +4834,14 @@ pub fn run() {
             //   いう**経路全体**は、どのみち通常の unit test では再現できない
             //   （このクレートは CI の Linux コンテナでビルドすらできない）。
             //   そこは実機確認の領域 - relay-wright の W3-B2 と同じ状況。
+            //
+            // #392 A2: 後始末は [`exit_cleanup_once`] が 1 回に限る。トレイの
+            // 「終了」は `exit` の前に後始末を済ませてあるので、ここは済んだ
+            // 結果を受け取るだけ。OS のシャットダウン・ログオフでは tao が
+            // `WM_ENDSESSION` でここ（`Exit`）を呼んでから `process::exit`
+            // するので、窓を隠したまま（トレイ常駐中）でも収集はここで止まる。
             if let tauri::RunEvent::Exit = event {
-                // #437: 監査の保留の定期の流し込みを止める（途中で止めても、
-                // ファイルは行が入ってから消すので失われない）。
-                if let Some(flusher) = app_handle.try_state::<AuditSpoolFlusher>() {
-                    if let Some(handle) = flusher.0.lock().ok().and_then(|mut h| h.take()) {
-                        handle.abort();
-                    }
-                }
-                if let Some(state) = app_handle.try_state::<AppState>() {
-                    tauri::async_runtime::block_on(shutdown_app_state(&state));
-                }
+                tauri::async_runtime::block_on(exit_cleanup_once(app_handle));
             }
         });
 }
@@ -5039,7 +5149,9 @@ mod tests {
         // The budget is the outer bound; nothing here should take anywhere
         // near it, so a plain call is enough to catch a hang (the test would
         // never finish) as well as the wrong end state.
-        shutdown_app_state(&state).await;
+        let report = shutdown_app_state(&state).await;
+        // #392 A2: 何も失敗していなければ、トレイの「終了」は黙って終わる。
+        assert_eq!(report, ExitCleanupReport::default(), "後始末は全部済んだ");
 
         assert!(state.pool.is_closed(), "DBプールが閉じている");
         assert_eq!(

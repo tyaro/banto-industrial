@@ -273,7 +273,10 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
         WriteRateLimitConfig::default(),
     )));
     let controller = Arc::new(CollectionController::new(manager.clone()));
-    let status = controller.start(RunMode::Configured).await;
+    let status = controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
 
     let grpc_service = GrpcService::new(
@@ -767,7 +770,11 @@ async fn stream_values_keeps_streaming_when_all_simulation_starts() {
         "configured stream should send an initial batch"
     );
 
-    let status = app.controller.start(RunMode::AllSimulation).await;
+    let status = app
+        .controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
     assert_eq!(status.mode, RunMode::AllSimulation);
 
@@ -847,7 +854,11 @@ async fn stream_values_succeeds_and_continues_during_all_simulation() {
     )
     .await;
 
-    let status = app.controller.start(RunMode::AllSimulation).await;
+    let status = app
+        .controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
     assert_eq!(status.mode, RunMode::AllSimulation);
 
@@ -910,7 +921,10 @@ async fn stream_values_does_not_auto_end_on_collection_stop() {
     )
     .await;
 
-    app.controller.start(RunMode::AllSimulation).await;
+    app.controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
 
     let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
     let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;

@@ -1132,7 +1132,11 @@ async fn normal_topic_publishes_during_all_simulation() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let run_status = app.controller.start(RunMode::AllSimulation).await;
+    let run_status = app
+        .controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(run_status.state, CollectionState::Running);
 
     assert!(
@@ -1190,7 +1194,10 @@ async fn mqtt_publishing_continues_after_collection_stop_and_restart() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    app.controller.start(RunMode::AllSimulation).await;
+    app.controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert!(
         wait_until(Duration::from_secs(6), || async {
             status_mqtt_connected(&app.router, &app.token).await
@@ -1214,7 +1221,10 @@ async fn mqtt_publishing_continues_after_collection_stop_and_restart() {
     app.controller.stop().await;
 
     // 通常運転で再開 - 通常トピックへの発行が続く。
-    app.controller.start(RunMode::Configured).await;
+    app.controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     let baseline = live.snapshot().await.len();
     assert!(
         wait_until(Duration::from_secs(6), || async {
@@ -1320,7 +1330,11 @@ async fn mqtt_payload_carries_value_source_across_run_modes() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let run_status = app.controller.start(RunMode::Configured).await;
+    let run_status = app
+        .controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(run_status.state, CollectionState::Running);
     assert!(
         wait_until(Duration::from_secs(6), || async {
@@ -1349,7 +1363,11 @@ async fn mqtt_payload_carries_value_source_across_run_modes() {
     assert_eq!(computed_payload["value_source"], "computed");
 
     // --- AllSimulation: 実機タグの value_source が simulation へ切り替わる ---
-    let sim_status = app.controller.start(RunMode::AllSimulation).await;
+    let sim_status = app
+        .controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(sim_status.mode, RunMode::AllSimulation);
 
     assert!(

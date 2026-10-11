@@ -29,7 +29,20 @@ tauri-build = { version = "2", features = [] }
 banto-core = { workspace = true }
 banto-server = { workspace = true }
 chronogazer-core = { path = "../core" }
-tauri = { version = "2", features = [] }
+# #392 A2: トレイ常駐（`tray::install`）のために `tray-icon` feature を有効に
+# する（banto-hub-shell と同じ。tray-icon crate は既に Cargo.lock にある）。
+tauri = { version = "2", features = ["tray-icon"] }
+# #392 A2: 2 つ目の起動は既存の窓を前に出して終わる（banto-hub と同じ型）。
+tauri-plugin-single-instance = "2"
+# #392 A2: トレイの「終了」の確認・終了処理の失敗の知らせ（Rust 側の
+# `DialogExt` から直接呼ぶ。JS のバインディングは使わないので capabilities
+# への権限追加は不要）と、× で隠した初回の通知。どちらも banto-hub が既に
+# 使っている版で、Cargo.lock にパッケージは増えない。
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+# #392 A2: 窓の前面化・× で隠す・初回通知・終了の確認・終了の二重実行防止を
+# banto-hub と共有する。
+banto-desktop-tray = { path = "../../../crates/banto-desktop-tray" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Only for naming `tokio::sync::broadcast::Sender<ServerEvent>` /
@@ -37,8 +50,9 @@ serde_json = { workspace = true }
 # §3.5, §11.4) - tokio is already pulled in transitively via `tauri` and
 # `chronogazer-core`; this just makes a couple of its types nameable in
 # this crate's own source. `time` is for the exit cleanup's single
-# `tokio::time::timeout` (`shutdown_app_state`'s `EXIT_CLEANUP_BUDGET`) -
-# no timers are started anywhere else in this crate.
+# `tokio::time::timeout` (`shutdown_app_state`'s `EXIT_CLEANUP_BUDGET`) and,
+# since #392 A2, the tray's status poll (`tray::watch_status`'s
+# `tokio::time::sleep`) - no other timers are started in this crate.
 tokio = { workspace = true, features = ["sync", "time"] }
 qrcode = { workspace = true }
 futures-util = { workspace = true }

@@ -1053,7 +1053,10 @@ async fn controller_test_app(label: &str) -> ControllerTestApp {
         WriteRateLimitConfig::default(),
     )));
     let controller = Arc::new(CollectionController::new(manager.clone()));
-    let status = controller.start(RunMode::Configured).await;
+    let status = controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
 
     let grpc_service = GrpcService::new(
@@ -1215,7 +1218,11 @@ async fn api_key_catalog_and_values_follow_335_contract() {
     );
 
     // --- Configured 運転中: catalog 全件 + (b)/(e) ---
-    let status = app.controller.start(RunMode::Configured).await;
+    let status = app
+        .controller
+        .start(RunMode::Configured)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
 
     let (status_code, body) = get_json(&app.router, "/api/v1/tags", &key).await;
@@ -1243,7 +1250,11 @@ async fn api_key_catalog_and_values_follow_335_contract() {
     assert_eq!(status_code, StatusCode::OK);
 
     // --- AllSimulation 運転中: catalog もタグ単位の値読みも一切ゲートしない ---
-    let status = app.controller.start(RunMode::AllSimulation).await;
+    let status = app
+        .controller
+        .start(RunMode::AllSimulation)
+        .await
+        .expect("収集を開始できる");
     assert_eq!(status.state, CollectionState::Running);
     assert_eq!(status.mode, RunMode::AllSimulation);
 

@@ -24,6 +24,9 @@
 # #332: crates/banto-hub-bootstrap (Hub への自動接続 bootstrap - 試運転中の
 # 自己発行 → OS keyring → banto-tagclient への供給。keyring と設定保存は
 # trait で外出しし、アプリ非依存に保つ. docs/banto-hub-client-bootstrap.md).
+# #392 A2: crates/banto-desktop-tray (トレイ常駐の窓・終了まわりの共通部分 -
+# × で隠す・初回通知・終了の確認・終了の二重実行防止。banto-hub-shell と
+# ChronoGazer が共有する).
 [workspace]
 resolver = "2"
 members = [
@@ -40,6 +43,7 @@ members = [
     "crates/banto-tagclient",
     "crates/banto-hub-bootstrap",
     "crates/banto-instance-lock",
+    "crates/banto-desktop-tray",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
     "apps/banto-hub/core",

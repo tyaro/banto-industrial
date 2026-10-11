@@ -90,9 +90,14 @@
 //!   再構築する。
 //! - トレイ「アプリを終了」の確認ダイアログ（[`confirm_quit`]、
 //!   `tauri-plugin-dialog`）。T16-0 は確認なしだった。
-//! - `×` でトレイ格納した初回だけの OS 通知（[`maybe_notify_first_tray_hide`]、
+//! - `×` でトレイ格納した初回だけの OS 通知（[`TRAY_HINT`]、
 //!   `tauri-plugin-notification`）。既読フラグは `app_data_dir` 配下のファイルへ
 //!   永続化する（実装指示「できれば永続化」）。
+//!
+//! #392 A2 で、窓の前面化・× でトレイへ格納・初回通知・終了の確認ダイアログの
+//! 呼び出しは、ChronoGazer と共有する `banto-desktop-tray`（`crates/`）へ
+//! 移した（振る舞いは変えていない）。トレイのメニュー・状態の文言・終了処理の
+//! 中身はこの crate に残る。
 //!
 //! ## T16-2 で追加したもの（docs/banto-hub-t16-design.md §3「T16-2」）
 //!
@@ -198,6 +203,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(windows)]
 use std::time::Duration;
 
+use banto_desktop_tray::{
+    ConfirmPrompt, QuitAdmission, QuitAnswerDecision, QuitGate, QuitRequestDecision, TrayHint,
+};
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
 #[cfg(windows)]
 use banto_hub_core::host_switch::{
@@ -216,9 +224,7 @@ use banto_hub_core::service_operators::{is_current_process_admin, is_current_pro
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::webview::PageLoadEvent;
-use tauri::{AppHandle, Manager, Runtime, Webview, WebviewWindow, WindowEvent, Wry};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-use tauri_plugin_notification::NotificationExt;
+use tauri::{AppHandle, Manager, Runtime, Webview, WebviewWindow, Wry};
 use tokio::sync::Mutex as AsyncMutex;
 
 mod host_switch_ipc;
@@ -494,14 +500,9 @@ fn navigate_to_hub(window: &WebviewWindow, host_port: &str) {
 }
 
 /// トレイ「画面を開く」・第二インスタンス起動時の前面化で共有する処理
-/// （設計 §4.2/§4.3）。
+/// （設計 §4.2/§4.3）。中身は ChronoGazer と共有（`banto-desktop-tray`）。
 fn show_main_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        return;
-    };
-    let _ = window.unminimize();
-    let _ = window.show();
-    let _ = window.set_focus();
+    banto_desktop_tray::show_window(app, &[MAIN_WINDOW_LABEL]);
 }
 
 /// トレイ「アプリを終了」の実処理（確認ダイアログ通過後に [`confirm_quit`]
@@ -525,45 +526,118 @@ fn quit(app: &AppHandle) {
     app.exit(0);
 }
 
-/// トレイ「アプリを終了」クリック時のエントリポイント（T16-1、実装指示
-/// 3.「アプリを終了の確認」- T16-0 では確認なしだったものをここで追加）。
-///
-/// 収集中（[`tray_status::show_stop_item`]が真になる状態）かどうかで文言を
-/// 変える。キャンセルすれば[`quit`]は一切呼ばれない - ダイアログの結果を
-/// 見ずに副作用を起こさない。`show`（非ブロッキング版）を使うのは、
-/// `blocking_show`がメインスレッドでの使用を禁じているため
-/// （メニューイベントハンドラがどのスレッドで呼ばれても安全にする）。
-fn confirm_quit(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let controller = state
+/// 今の controller（サービス接続中・fallback なら `None`）。
+fn current_controller(app: &AppHandle) -> Option<Arc<CollectionController>> {
+    app.state::<AppState>()
         .controller
         .lock()
         .expect("controller mutex poisoned")
-        .clone();
-    let collecting = controller
-        .as_ref()
+        .clone()
+}
+
+/// 今、確認文を「収集を停止して終了」の側にすべき状態か
+/// （[`tray_status::show_stop_item`]が真になる状態）。controller が無い
+/// （サービス接続中・fallback）なら偽。**文言を選ぶためだけ**に使う -
+/// 終了へ進んでよいかの判断は [`ControllerQuitAdmission`] が印を立てて
+/// 読んだ状態で行う。
+fn currently_collecting(app: &AppHandle) -> bool {
+    current_controller(app)
         .map(|controller| tray_status::show_stop_item(&controller.status()))
-        .unwrap_or(false);
-    let message = if collecting {
+        .unwrap_or(false)
+}
+
+/// トレイの「アプリを終了」の答えで [`QuitGate::answer`] に渡す、終了の受付の
+/// 口（#392 A2 レビュー、2026-10-12。`banto_desktop_tray` の doc「終了の確定と
+/// 収集の開始の直列化」・`banto_hub_core::controller` の doc「終了の受付」）。
+///
+/// [`CollectionController::begin_quit_confirm`] は、収集の開始（REST・MCP の
+/// `start`/`start-all-simulation`/走行中の `mode`）が `Starting` を書くのと
+/// 同じロックで印を立てて状態を読むので、「停止中の文言で同意 → 状態を
+/// 読む → その直後に開始 → 古い『停止中』で終了へ進み、新しい収集を黙って
+/// 止める」が起きない。
+///
+/// controller が無い（サービス接続中・fallback）ときは、このプロセスに
+/// 止める収集が無いので常に「暇」で、印も無い（サービスの収集はサービスが
+/// 持ち、このアプリの終了では止めない - [`quit`] の doc）。controller は
+/// 答えを受けた時点のものを 1 つ掴み、立てた印と下ろす印が別の controller に
+/// なることはない。扱うのは**確認のための一時的な印**だけで、
+/// `RunningHub::shutdown` が立てる取り消せない印（`begin_shutdown`）は
+/// `AskAgain` で下ろせない（#392 A2 再レビュー P2-2）。
+struct ControllerQuitAdmission(Option<Arc<CollectionController>>);
+
+impl QuitAdmission for ControllerQuitAdmission {
+    fn begin_quit_confirm(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(|controller| tray_status::show_stop_item(&controller.begin_quit_confirm()))
+            .unwrap_or(false)
+    }
+
+    fn cancel_quit_confirm(&self) {
+        if let Some(controller) = &self.0 {
+            controller.cancel_quit_confirm();
+        }
+    }
+}
+
+/// 「アプリを終了」の確認文。収集中かどうかで変わる。
+fn quit_prompt_message(collecting: bool) -> &'static str {
+    if collecting {
         "収集を停止し、履歴を flush してから終了します。よろしいですか?"
     } else {
         "Banto Hub を終了します。よろしいですか?"
-    };
+    }
+}
 
+/// トレイ「アプリを終了」クリック時のエントリポイント（T16-1、実装指示
+/// 3.「アプリを終了の確認」- T16-0 では確認なしだったものをここで追加）。
+///
+/// 収集中かどうかで文言を変える。キャンセルすれば[`quit`]は一切呼ばれない -
+/// ダイアログの結果を見ずに副作用を起こさない。ダイアログは待たない版
+/// （[`banto_desktop_tray::ask_confirm`]）で、メニューイベントハンドラが
+/// どのスレッドで呼ばれても安全にする。
+///
+/// #392 A2（オーナー決定 2026-10-12）: 共有の [`QuitGate`] を通す。確認中・
+/// 終了処理中にもう一度「アプリを終了」が押されても、確認ダイアログを
+/// 2 つ出さず、[`quit`] を 2 回走らせない。「収集していない」文言で同意を
+/// 取った後に収集が始まっていたら（LAN の REST・MCP からの開始）、
+/// 黙って止めず「収集中」の文言でもう一度確かめる。その判断と終了の確定は、
+/// 収集の開始と [`ControllerQuitAdmission`] で直列化している（同意の後に
+/// 来た開始は 409 で断られる）。
+fn confirm_quit(app: &AppHandle) {
+    let Some(gate) = app.try_state::<QuitGate>() else {
+        return;
+    };
+    match gate.request() {
+        QuitRequestDecision::ShowPrompt => prompt_quit(app, currently_collecting(app)),
+        QuitRequestDecision::AlreadyConfirming | QuitRequestDecision::AlreadyQuitting => {}
+    }
+}
+
+/// 確認ダイアログを出す。`prompted_collecting` は文言を選んだ時点の状態
+/// （終了の受付の印を立てた時点の状態と比べて[`QuitGate::answer`]が判断する）。
+fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
     let app_handle = app.clone();
-    app.dialog()
-        .message(message)
-        .title("Banto Hub を終了")
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "終了".to_string(),
-            "キャンセル".to_string(),
-        ))
-        .show(move |confirmed| {
-            if confirmed {
-                quit(&app_handle);
+    banto_desktop_tray::ask_confirm(
+        app,
+        ConfirmPrompt {
+            title: "Banto Hub を終了",
+            message: quit_prompt_message(prompted_collecting),
+            ok_label: "終了",
+            cancel_label: "キャンセル",
+        },
+        move |confirmed| {
+            let Some(gate) = app_handle.try_state::<QuitGate>() else {
+                return;
+            };
+            let admission = ControllerQuitAdmission(current_controller(&app_handle));
+            match gate.answer(confirmed, prompted_collecting, &admission) {
+                QuitAnswerDecision::Proceed => quit(&app_handle),
+                QuitAnswerDecision::AskAgain => prompt_quit(&app_handle, true),
+                QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {}
             }
-        });
+        },
+    );
 }
 
 /// トレイ「収集を停止」クリック時のエントリポイント（desktop-plan §9.9
@@ -1342,48 +1416,18 @@ fn start_service(app: &AppHandle) {
 #[cfg(not(windows))]
 fn start_service(_app: &AppHandle) {}
 
-/// [`maybe_notify_first_tray_hide`] が既読フラグを永続化するファイルの
-/// パス。Hub 本体の DB/data_dir とは独立したシェル固有の状態なので、
-/// `app.path().app_data_dir()`（`tauri.conf.json`の`identifier`配下）に置く。
-/// `RunningHub`の起動に失敗していても書ける場所であること、複数
-/// profile／複数インストール間で共有すべきではないことの両方を満たす。
-fn tray_hint_flag_path(app: &AppHandle) -> Option<PathBuf> {
-    app.path()
-        .app_data_dir()
-        .ok()
-        .map(|dir| dir.join("tray-hint-shown"))
-}
-
-/// `×` でトレイへ格納した直後に呼ぶ（UX-7 / 実装指示 4.「初回だけ」）。
-///
-/// 既読フラグファイルが無ければ OS 通知を出してからフラグを作成する -
-/// 2回目以降の格納では通知しない。フラグの保存場所を解決できない、または
-/// 書き込みに失敗した場合は通知自体をあきらめる（毎回通知され続けるより、
-/// 通知が出ない方が実装指示の「初回だけ」という意図を壊さない安全側）。
-/// OS 通知 API 自体の失敗（通知権限なし等）も同様に無視する - 継続動作の
-/// 案内が1回出せなくても Hub の収集・UI 提供は妨げない。
-fn maybe_notify_first_tray_hide(app: &AppHandle) {
-    let Some(path) = tray_hint_flag_path(app) else {
-        return;
-    };
-    if path.exists() {
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    if std::fs::write(&path, b"1").is_err() {
-        return;
-    }
-    let _ = app
-        .notification()
-        .builder()
-        .title("Banto Hub")
-        .body("Banto Hub はタスクトレイで動作を続けます。")
-        .show();
-}
+/// `×` でトレイへ格納した初回だけ出す OS 通知（UX-7 / 実装指示 4.「初回
+/// だけ」）。既読フラグは Hub 本体の DB/data_dir とは独立したシェル固有の
+/// 状態なので、`app.path().app_data_dir()`（`tauri.conf.json`の`identifier`
+/// 配下）に置く - `RunningHub`の起動に失敗していても書ける場所であること、
+/// 複数 profile／複数インストール間で共有すべきではないことの両方を満たす。
+/// フラグを書けないときは通知をあきらめる（毎回通知され続けるより安全側）-
+/// 判断は [`banto_desktop_tray::notify_first_hide_once`]。
+const TRAY_HINT: TrayHint = TrayHint {
+    flag_file_name: "tray-hint-shown",
+    title: "Banto Hub",
+    body: "Banto Hub はタスクトレイで動作を続けます。",
+};
 
 /// 状態変化をトレイの tooltip とメニューへ反映する（[`watch_collection_status`]
 /// から毎回呼ばれる、デスクトップホスト専用）。tray が未`manage`のうちに
@@ -1451,6 +1495,8 @@ pub fn run() {
             sink_service_ipc::sink_service_start,
             sink_service_ipc::sink_service_stop,
         ])
+        // #392 A2: 「アプリを終了」の確認中・終了処理中の 2 回目を無視する。
+        .manage(QuitGate::new())
         .manage(AppState {
             hub: AsyncMutex::new(None),
             controller: StdMutex::new(None),
@@ -1477,16 +1523,9 @@ pub fn run() {
 
             // CloseRequested（×ボタン）はプロセスを終了せずトレイへ格納
             // するだけ（実装指示「CloseRequested -> prevent_close + hide」）。
-            // T16-1 で初回だけの継続通知を追加（UX-7）。
-            let window_to_hide = window.clone();
-            let app_handle_for_hide = app.handle().clone();
-            window.on_window_event(move |event| {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window_to_hide.hide();
-                    maybe_notify_first_tray_hide(&app_handle_for_hide);
-                }
-            });
+            // T16-1 で初回だけの継続通知を追加（UX-7）。#392 A2 で
+            // ChronoGazer と共有の `banto-desktop-tray` へ移した。
+            banto_desktop_tray::hide_to_tray_on_close(&window, TRAY_HINT);
 
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
@@ -1507,7 +1546,13 @@ pub fn run() {
                 state.can_operate_service,
                 desktop_started.as_ref().map(|(status, _)| status),
             )?;
-            let tray = TrayIconBuilder::new()
+            // 左クリック = 窓を戻す、右クリック = メニュー（オーナー決定
+            // 2026-10-12、ChronoGazer と共通）。メインの窓は `tauri.conf.json` で
+            // 定義済みで、ホストの種類（デスクトップ／サービス接続／fallback）に
+            // よらず存在し、閉じても破棄されず隠れるだけ - 戻す窓が無い状態は
+            // 無い。万一無ければ [`banto_desktop_tray::show_window`] は何もせず、
+            // メニューは右クリックで出る。
+            let tray_builder = TrayIconBuilder::new()
                 .icon(
                     app.default_window_icon()
                         .cloned()
@@ -1515,7 +1560,6 @@ pub fn run() {
                 )
                 .tooltip(tooltip)
                 .menu(&tray_menu)
-                .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_main_window(app),
                     "stop" => stop_collection(app),
@@ -1524,8 +1568,10 @@ pub fn run() {
                     "retry" => retry_startup(app),
                     "quit" => confirm_quit(app),
                     _ => {}
-                })
-                .build(app.handle())?;
+                });
+            let tray =
+                banto_desktop_tray::restore_window_on_left_click(tray_builder, show_main_window)
+                    .build(app.handle())?;
             // `TrayIcon`は参照カウント式で、最後の1つが drop されると消える
             // （tauri本体のdoc comment参照） - アプリの生存期間中ずっと
             // 保持するためだけに managed state へ入れる
@@ -1551,6 +1597,65 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「アプリを終了」の確認文は収集中かどうかで変わり、収集中の文言は
+    /// 停止と flush を明示する。確認の途中で収集が始まっていた場合は共有の
+    /// `QuitGate` が `AskAgain` を返し、`prompt_quit(app, true)` が収集中の
+    /// 文言で出し直す（#392 A2）。そのつなぎの文言と状態遷移を確かめる。
+    #[test]
+    fn quit_prompt_message_depends_on_collecting() {
+        assert!(quit_prompt_message(true).contains("収集を停止"));
+        assert!(quit_prompt_message(true).contains("flush"));
+        assert!(!quit_prompt_message(false).contains("収集を停止"));
+        assert_ne!(quit_prompt_message(true), quit_prompt_message(false));
+    }
+
+    /// 印を立てた時点で忙しかった（= 確認中に収集が始まっていた）ことにする
+    /// 偽の受付口。
+    struct BusyAdmission;
+
+    impl QuitAdmission for BusyAdmission {
+        fn begin_quit_confirm(&self) -> bool {
+            true
+        }
+        fn cancel_quit_confirm(&self) {}
+    }
+
+    /// 暇な文言で同意 → 待つ間に収集が始まった: 出し直し（Confirming のまま
+    /// なので 2 回目の「アプリを終了」は重ならない）、収集中の文言で同意すれば
+    /// 終了処理へ進み、その後の「アプリを終了」は無視される。印の上げ下げの
+    /// 全経路は `banto_desktop_tray` のテスト、開始との直列化は
+    /// `banto_hub_core::controller` のテストで固定している。
+    #[test]
+    fn quit_gate_asks_again_when_collection_started_while_confirming() {
+        let gate = QuitGate::new();
+        assert_eq!(gate.request(), QuitRequestDecision::ShowPrompt);
+        assert_eq!(
+            gate.answer(true, false, &BusyAdmission),
+            QuitAnswerDecision::AskAgain
+        );
+        assert_eq!(gate.request(), QuitRequestDecision::AlreadyConfirming);
+        assert_eq!(
+            gate.answer(true, true, &BusyAdmission),
+            QuitAnswerDecision::Proceed
+        );
+        assert_eq!(gate.request(), QuitRequestDecision::AlreadyQuitting);
+    }
+
+    /// controller が無い（サービス接続中・fallback）ときは、このプロセスに
+    /// 止める収集が無いので、暇な文言の同意でそのまま進む。
+    #[test]
+    fn without_a_controller_the_admission_is_never_busy() {
+        let admission = ControllerQuitAdmission(None);
+        assert!(!admission.begin_quit_confirm());
+        admission.cancel_quit_confirm();
+        let gate = QuitGate::new();
+        assert_eq!(gate.request(), QuitRequestDecision::ShowPrompt);
+        assert_eq!(
+            gate.answer(true, false, &admission),
+            QuitAnswerDecision::Proceed
+        );
+    }
     use banto_hub_core::profile_paths::resolve_profile_paths_from_env;
 
     /// #505: 窓（WebView）の CSP は、Hubの応答の CSP（banto の

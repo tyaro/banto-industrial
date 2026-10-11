@@ -18,8 +18,8 @@ tauri-build = { version = "2", features = [] }
 # 持たない（design P3・実装指示「二重 UI は作らない」）。
 banto-hub-core = { path = "../core" }
 # トレイアイコン（design §4.3）用に `tray-icon` feature を有効化する - tauri
-# crate の既定 feature には含まれない（chronogazer/relay-wright はトレイを
-# 使わないため既定のまま）。
+# crate の既定 feature には含まれない（chronogazer も #392 A2 でトレイを
+# 使うようになり、同じ feature を有効にしている）。
 tauri = { version = "2", features = ["tray-icon"] }
 # 設計 §4.2「単一インスタンス」: 第二インスタンスは既存ウィンドウを前面化して
 # 自身は終了する。
@@ -33,6 +33,11 @@ tauri-plugin-dialog = "2"
 # 上と同じ理由で JS 側バインディングは使わず、Rust 側 `NotificationExt` から
 # 直接呼ぶ。
 tauri-plugin-notification = "2"
+# #392 A2: 窓の前面化・× でトレイへ格納・初回通知・終了の確認ダイアログの
+# 呼び出しを ChronoGazer と共有する。上の dialog/notification プラグインは
+# この crate が使う `DialogExt`/`NotificationExt` の実体として、引き続き
+# `run()` で登録する。
+banto-desktop-tray = { path = "../../../crates/banto-desktop-tray" }
 # `RunningHub` を保持する `tokio::sync::Mutex`（AppState フィールド型を名指し
 # するためだけの依存 - chronogazer/src-tauri の `tokio` 依存と同じ理由。
 # `HubRuntime::start`/`RunningHub::shutdown` 自体は `tauri::async_runtime`

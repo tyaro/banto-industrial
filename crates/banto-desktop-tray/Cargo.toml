@@ -1,0 +1,21 @@
+[package]
+name = "banto-desktop-tray"
+description = "Tray-resident window behaviour shared by the banto-hub shell and ChronoGazer (#392 A2): restore the window, hide it on close with a one-time hint, the quit confirmation dialog and the quit gate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# トレイ自体（メニュー項目・状態の文言）はアプリごとに中身が違うので、この
+# crate は組み立てない。扱うのは窓・ダイアログ・通知と、トレイの左クリックの
+# 判定（`TrayIconEvent`、[`restore_window_on_left_click`]）だけ。
+tauri = { version = "2", features = ["tray-icon"] }
+# 終了の確認ダイアログ（Rust 側の `DialogExt` から直接呼ぶ。JS 側の
+# バインディングは使わないので capabilities への権限追加は不要）。
+tauri-plugin-dialog = "2"
+# × でトレイへ格納した初回だけの OS 通知（同じく Rust 側の `NotificationExt`）。
+tauri-plugin-notification = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
