@@ -400,7 +400,11 @@ impl CollectorConfig {
 
     /// #383 段階3 P3: does this config collect any external (`"hub"`)
     /// connection? [`crate::Collector::start_with_sources`] refuses such a
-    /// config without an [`crate::external::ExternalSource`].
+    /// config without an [`crate::external::ExternalSource`]. For a config
+    /// from the lenient build this means "at least one hub tag is
+    /// collected": an external group with no collectable tag is never
+    /// planned (`build_config_lenient_inner`), so neither is a connection
+    /// left without groups.
     pub fn has_external_connections(&self) -> bool {
         self.connections
             .iter()
@@ -1119,6 +1123,21 @@ fn build_config_lenient_inner(
                 }
                 continue;
             };
+
+            // #383 段階3 P3（PR #578 レビュー）: an external (`"hub"`) group
+            // with no collectable tag left (none registered, or every one
+            // excluded - vanished from / retyped on the Hub) is not planned
+            // at all - no task, no store group. A PLC group keeps the old
+            // behaviour (an empty group still gets a store group). So an
+            // external connection is in the plan **iff it collects at least
+            // one tag**, which is exactly what
+            // [`CollectorConfig::has_external_connections`] answers: a caller
+            // deciding "do I still need the Hub subscription for this run"
+            // (ChronoGazer's demand) cannot be told "yes" for a connection
+            // that records nothing.
+            if matches!(resolved, ResolvedConnection::Hub { .. }) && tag_plans.is_empty() {
+                continue;
+            }
 
             let gkey = group_key(group.id);
             conn_store_groups.push(GroupConfig {
@@ -2654,6 +2673,39 @@ mod tests {
             vec!["PLC9.G.Temp", "PLC9.G.Gone", "PLC9.G.Retyped"]
         );
         assert!(config_exclusions(&snapshot).is_empty());
+
+        // PR #578 review: when **every** hub tag is excluded, the hub group and
+        // connection are not planned at all (nothing to collect through
+        // them), so `has_external_connections` is false and the caller can
+        // drop its Hub demand. The exclusions still list each tag.
+        let retyped_everything: HubCatalog = HashMap::from([
+            ("PLC9.G.Temp".to_string(), "i32".to_string()),
+            ("PLC9.G.Retyped".to_string(), "f32".to_string()),
+        ]);
+        let (config, exclusions) = build_config_lenient_with_thresholds(
+            &snapshot,
+            &HashMap::new(),
+            HubSource::Available {
+                catalog: Some(&retyped_everything),
+            },
+        );
+        assert!(!config.has_external_connections());
+        let keys: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, vec![plc_key.as_str()]);
+        assert!(config
+            .store_config
+            .groups
+            .iter()
+            .all(|g| g.key != format!("grp:{hub_group}")));
+        let codes: Vec<(i64, &str)> = exclusions.iter().map(|e| (e.id, e.reason.code())).collect();
+        assert_eq!(
+            codes,
+            vec![
+                (ids[0], "hubTagTypeChanged"),
+                (ids[1], "hubTagNotFound"),
+                (ids[2], "hubTagTypeChanged"),
+            ]
+        );
     }
 
     #[tokio::test]

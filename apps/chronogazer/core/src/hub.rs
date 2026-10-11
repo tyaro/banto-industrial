@@ -1657,6 +1657,11 @@ struct HubInner {
     shutdown: watch::Sender<bool>,
     /// これまでに張った購読世代の本数（[`Generation::sequence`] の採番元）。
     generations_started: AtomicUsize,
+    /// **テスト専用**: 入っていれば [`HubService::prepare_collect`] は需要を
+    /// 入れた後、Hub に問い合わせずにこの答えを返す（収集側のテストが Hub の
+    /// 答えを決め打ちするため。製品ビルドにはフィールドごと無い）。
+    #[cfg(test)]
+    prepare_answer_for_test: Mutex<Option<HubCollectReadiness>>,
 }
 
 /// Hub 接続のサービス層。`src-tauri` の `hub_*` コマンドと
@@ -1706,6 +1711,8 @@ impl HubService {
                 supervisor_spawns: AtomicUsize::new(0),
                 shutdown: watch::channel(false).0,
                 generations_started: AtomicUsize::new(0),
+                #[cfg(test)]
+                prepare_answer_for_test: Mutex::new(None),
             }),
         })
     }
@@ -1757,6 +1764,16 @@ impl HubService {
             slot.collect_demand = names;
             slot.demand_pending = true;
         }
+        #[cfg(test)]
+        if let Some(answer) = self
+            .inner
+            .prepare_answer_for_test
+            .lock()
+            .expect("prepare_answer_for_test")
+            .clone()
+        {
+            return answer;
+        }
         let (reply, answer) = tokio::sync::oneshot::channel();
         let service = self.clone();
         tokio::spawn(async move {
@@ -1786,6 +1803,17 @@ impl HubService {
             slot.collect_demand.clear();
             slot.demand_pending = true;
         }
+    }
+
+    /// テスト用: [`Self::prepare_collect`] の答えを決め打ちする
+    /// （[`HubInner::prepare_answer_for_test`]）。
+    #[cfg(test)]
+    pub(crate) fn answer_prepare_for_test(&self, answer: HubCollectReadiness) {
+        *self
+            .inner
+            .prepare_answer_for_test
+            .lock()
+            .expect("prepare_answer_for_test") = Some(answer);
     }
 
     /// テスト用: 今の収集の需要。
