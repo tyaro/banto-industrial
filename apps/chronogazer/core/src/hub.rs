@@ -123,8 +123,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use banto_collect::{
-    ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource, ExternalValueSource,
-    HubCatalog,
+    ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource, HubCatalog,
 };
 use banto_core::BantoError;
 use banto_hub_bootstrap::{
@@ -134,8 +133,7 @@ use banto_hub_bootstrap::{
 };
 use banto_tagclient::{
     BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind as TagErrorKind,
-    TagClientConnectionState, TagClientHandle, TagClientState, ValueQuality, ValueSource,
-    ValuesSnapshot,
+    TagClientConnectionState, TagClientHandle, TagClientState, ValueQuality, ValuesSnapshot,
 };
 use serde::Serialize;
 use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -1417,7 +1415,6 @@ fn external_snapshot(
                         ExternalReading {
                             value: entry.v,
                             quality: external_quality(&entry.q),
-                            source: external_value_source(&entry.value_source),
                         },
                     )
                 })
@@ -1437,21 +1434,6 @@ fn external_quality(quality: &ValueQuality) -> ExternalQuality {
         ValueQuality::Stale => ExternalQuality::Stale,
         ValueQuality::Bad => ExternalQuality::Bad,
         ValueQuality::Unknown(_) => ExternalQuality::Unknown,
-    }
-}
-
-/// Hub の `value_source` → 収集の分類（H4・#413）。`simulation` と
-/// `derived_simulation`（シミュレーション入力を参照する演算タグ）は
-/// **記録しない**側。未知のラベルも記録しない（`banto-tagclient` が未知を
-/// 未知のまま保つのは「将来の Hub が黙って実値の出所にならない」ため。
-/// `banto_collect::external` のモジュール doc）。
-fn external_value_source(source: &ValueSource) -> ExternalValueSource {
-    match source {
-        ValueSource::Real | ValueSource::Computed | ValueSource::Internal | ValueSource::Db => {
-            ExternalValueSource::Measured
-        }
-        ValueSource::Simulation | ValueSource::DerivedSimulation => ExternalValueSource::Simulated,
-        ValueSource::Unknown(_) => ExternalValueSource::Unknown,
     }
 }
 
@@ -3036,7 +3018,7 @@ fn generate_installation_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use banto_tagclient::{StableTagId, ValueEntry};
+    use banto_tagclient::{StableTagId, ValueEntry, ValueSource};
 
     use super::*;
     use crate::db::init_db_memory;
@@ -4416,12 +4398,9 @@ mod tests {
         }
     }
 
-    /// Hub のラベルを収集の分類へ写す表（H4・#413）。`simulation` と
-    /// `derived_simulation` はどちらも「シミュレーション」（記録しない側）、
-    /// 未知の出所・品質は丸めない。
-    ///
-    /// 反証: `external_value_source` で `DerivedSimulation` を `Measured` 側に
-    /// 入れると、ここで落ちる。
+    /// Hub のラベルを収集の分類へ写す表（H4）。品質だけを写し、`value_source`
+    /// （`simulation`・`derived_simulation`・未知を含む）は解釈しない
+    /// （2026-10-11 オーナー決定）。未知の品質は丸めない。
     #[test]
     fn the_collect_snapshot_maps_hub_labels_without_rounding() {
         let values = ValuesSnapshot {
@@ -4466,28 +4445,20 @@ mod tests {
         assert!(snapshot.is_live());
         let read = |tag: &str| *snapshot.reading(tag).expect("held");
         use ExternalQuality as Q;
-        use ExternalValueSource as S;
-        for (tag, value, quality, source) in [
-            ("real", Some(1.0), Q::Good, S::Measured),
-            ("calc", Some(2.0), Q::Good, S::Measured),
-            ("mem", Some(3.0), Q::Good, S::Measured),
-            ("db", Some(4.0), Q::Good, S::Measured),
-            ("sim", Some(5.0), Q::Good, S::Simulated),
-            ("dsim", Some(6.0), Q::Good, S::Simulated),
-            ("future", Some(7.0), Q::Good, S::Unknown),
-            ("stale", Some(8.0), Q::Stale, S::Measured),
-            ("bad", None, Q::Bad, S::Measured),
-            ("odd", Some(9.0), Q::Unknown, S::Measured),
+        for (tag, value, quality) in [
+            ("real", Some(1.0), Q::Good),
+            ("calc", Some(2.0), Q::Good),
+            ("mem", Some(3.0), Q::Good),
+            ("db", Some(4.0), Q::Good),
+            // 出所が simulation・derived_simulation・未知でも品質だけで扱う。
+            ("sim", Some(5.0), Q::Good),
+            ("dsim", Some(6.0), Q::Good),
+            ("future", Some(7.0), Q::Good),
+            ("stale", Some(8.0), Q::Stale),
+            ("bad", None, Q::Bad),
+            ("odd", Some(9.0), Q::Unknown),
         ] {
-            assert_eq!(
-                read(tag),
-                ExternalReading {
-                    value,
-                    quality,
-                    source
-                },
-                "{tag}"
-            );
+            assert_eq!(read(tag), ExternalReading { value, quality }, "{tag}");
         }
     }
 
@@ -5801,13 +5772,12 @@ mod tests {
 
             let snapshot = hub.collect_source().snapshot();
             assert!(snapshot.is_live());
+            assert_eq!(snapshot.reading("alpha").map(|r| r.value), Some(Some(10.0)));
             assert_eq!(
-                snapshot.reading("alpha").map(|r| (r.value, r.source)),
-                Some((Some(10.0), ExternalValueSource::Measured))
-            );
-            assert_eq!(
-                snapshot.reading("beta").map(|r| (r.value, r.source)),
-                Some((Some(2.0), ExternalValueSource::Simulated))
+                // `beta` は Hub 側で simulation のラベルだが、解釈しない
+                // （2026-10-11）。値はそのまま渡る。
+                snapshot.reading("beta").map(|r| r.value),
+                Some(Some(2.0))
             );
 
             // 停止で需要は取り下がる（Hub は叩かない - 世代はそのまま）。

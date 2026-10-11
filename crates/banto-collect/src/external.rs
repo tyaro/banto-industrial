@@ -30,25 +30,23 @@
 //!
 //! ## The quality / record mapping (one pure function, [`classify_external`])
 //!
-//! | Link | Hub quality | Hub `value_source` | current value / quality | recorded (tstore) |
-//! | --- | --- | --- | --- | --- |
-//! | not Live | - | - | `null` / Bad | `null` |
-//! | Live, name absent (not subscribed / no value yet) | - | - | `null` / Bad | `null` |
-//! | Live | good, value present | measured (`real`/`computed`/`internal`/`db`) | value / Good | **value** |
-//! | Live | good, value present | `simulation` / `derived_simulation` | value / Good | `null` |
-//! | Live | good, value present | unknown label | value / Good | `null` |
-//! | Live | good, no value | any | `null` / Bad | `null` |
-//! | Live | stale | any | Hub's last value / Stale | `null` |
-//! | Live | bad, or an unknown label | any | `null` / Bad | `null` |
+//! | Link | Hub quality | current value / quality | recorded (tstore) |
+//! | --- | --- | --- | --- |
+//! | not Live | - | `null` / Bad | `null` |
+//! | Live, name absent (not subscribed / no value yet) | - | `null` / Bad | `null` |
+//! | Live | good, value present | value / Good | **value** |
+//! | Live | good, no value | `null` / Bad | `null` |
+//! | Live | stale | Hub's last value / Stale | `null` |
+//! | Live | bad, or an unknown label | `null` / Bad | `null` |
 //!
-//! - **Simulation values are shown but not recorded** - the same promise
-//!   #413 made for `simulation = true` connections (`crate::task`'s
-//!   `if ctx.simulation { return; }`): the current-value cache and threshold
-//!   events see them, the data file never does. Here it is per tag, because
-//!   the Hub labels each value. An **unknown** `value_source` is treated the
-//!   same way (shown, not recorded): `banto-tagclient` keeps unknown labels
-//!   as unknown precisely "so a future Hub cannot silently become a real
-//!   value source" - recording one would do exactly that.
+//! - **The Hub's `value_source` is not interpreted** (owner decision
+//!   2026-10-11, replacing the P3-era rule that did not record `simulation` /
+//!   `derived_simulation` / unknown labels): the Hub and this app have
+//!   separate responsibilities, and being able to check that the whole path
+//!   works with simulated values is worth more than keeping them out of the
+//!   file. A Good value is recorded whatever the Hub says produced it. (This
+//!   crate's *own* per-connection simulation, `simulation = true` on a PLC
+//!   connection, is a different thing and still records nothing, #413.)
 //! - **Hub `stale` records `null`**, consistent with this crate's own Stale:
 //!   a PLC tag goes Stale only when its updates stop, and a stopped update
 //!   leaves nothing in the data file. The Hub's stale value is the last one
@@ -92,25 +90,11 @@ pub enum ExternalQuality {
     Unknown,
 }
 
-/// Where the source says one value came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalValueSource {
-    /// A value of the physical process (banto-hub: `real`, `computed`,
-    /// `internal`, `db`). The only kind that is recorded.
-    Measured,
-    /// A simulated value (banto-hub: `simulation`, `derived_simulation`).
-    /// Shown, never recorded (#413).
-    Simulated,
-    /// A label this crate does not know. Shown, never recorded (module doc).
-    Unknown,
-}
-
 /// The latest value the source holds for one external name.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExternalReading {
     pub value: Option<f64>,
     pub quality: ExternalQuality,
-    pub source: ExternalValueSource,
 }
 
 /// One consistent view of everything the source holds, taken once per
@@ -196,10 +180,7 @@ pub(crate) fn classify_external(reading: Option<&ExternalReading>) -> ExternalTa
         (ExternalQuality::Good, Some(value)) => ExternalTagOutcome {
             shown: Some(value),
             quality: Quality::Good,
-            recorded: match reading.source {
-                ExternalValueSource::Measured => Some(value),
-                ExternalValueSource::Simulated | ExternalValueSource::Unknown => None,
-            },
+            recorded: Some(value),
         },
         (ExternalQuality::Stale, value) => ExternalTagOutcome {
             shown: value,
@@ -253,72 +234,40 @@ mod tests {
     use super::*;
     use crate::current::Quality;
 
-    fn reading(
-        value: Option<f64>,
-        quality: ExternalQuality,
-        source: ExternalValueSource,
-    ) -> ExternalReading {
-        ExternalReading {
-            value,
-            quality,
-            source,
-        }
+    fn reading(value: Option<f64>, quality: ExternalQuality) -> ExternalReading {
+        ExternalReading { value, quality }
     }
 
     /// The whole mapping table from the module doc, row by row.
     #[test]
     fn the_quality_and_record_mapping_table() {
         use ExternalQuality as Q;
-        use ExternalValueSource as S;
         // (input, shown, quality, recorded)
         type Row = (Option<ExternalReading>, Option<f64>, Quality, Option<f64>);
         let rows: Vec<Row> = vec![
             // not Live / absent
             (None, None, Quality::Bad, None),
-            // good + measured: shown and recorded
+            // good: shown and recorded (whatever the Hub's value_source was -
+            // the source is not part of a reading any more, 2026-10-11)
             (
-                Some(reading(Some(1.5), Q::Good, S::Measured)),
+                Some(reading(Some(1.5), Q::Good)),
                 Some(1.5),
                 Quality::Good,
                 Some(1.5),
-            ),
-            // good + simulated: shown, not recorded (#413)
-            (
-                Some(reading(Some(2.0), Q::Good, S::Simulated)),
-                Some(2.0),
-                Quality::Good,
-                None,
-            ),
-            // good + unknown source: shown, not recorded
-            (
-                Some(reading(Some(3.0), Q::Good, S::Unknown)),
-                Some(3.0),
-                Quality::Good,
-                None,
             ),
             // good without a value: Bad
-            (
-                Some(reading(None, Q::Good, S::Measured)),
-                None,
-                Quality::Bad,
-                None,
-            ),
+            (Some(reading(None, Q::Good)), None, Quality::Bad, None),
             // stale: last value shown as Stale, not recorded
             (
-                Some(reading(Some(4.0), Q::Stale, S::Measured)),
+                Some(reading(Some(4.0), Q::Stale)),
                 Some(4.0),
                 Quality::Stale,
                 None,
             ),
             // bad / unknown quality: Bad + null (never rounded to good)
+            (Some(reading(Some(5.0), Q::Bad)), None, Quality::Bad, None),
             (
-                Some(reading(Some(5.0), Q::Bad, S::Measured)),
-                None,
-                Quality::Bad,
-                None,
-            ),
-            (
-                Some(reading(Some(6.0), Q::Unknown, S::Measured)),
+                Some(reading(Some(6.0), Q::Unknown)),
                 None,
                 Quality::Bad,
                 None,
@@ -342,11 +291,7 @@ mod tests {
     fn a_down_snapshot_yields_no_reading_even_for_a_held_name() {
         let mut snapshot = ExternalSnapshot::live(HashMap::from([(
             "a.b.c".to_string(),
-            reading(
-                Some(1.0),
-                ExternalQuality::Good,
-                ExternalValueSource::Measured,
-            ),
+            reading(Some(1.0), ExternalQuality::Good),
         )]));
         assert!(snapshot.reading("a.b.c").is_some());
         snapshot.link = ExternalLink::Down { detail: None };

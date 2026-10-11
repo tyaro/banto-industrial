@@ -108,11 +108,10 @@ pub use event::{
 };
 pub use external::{
     ExternalLink, ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource,
-    ExternalValueSource,
 };
 pub use task::{
     default_client_factory, BackoffConfig, ClientFactory, ClientProtocol, ClientSpec,
-    ConnectionStatus,
+    ConnectionStatus, EXTERNAL_RECONNECT_ATTEMPT,
 };
 
 use sqlx::SqlitePool;

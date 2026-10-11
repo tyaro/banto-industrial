@@ -33,6 +33,13 @@
 //! without logging in - ADR-0012 / ADR-0017; 2026-10-04 オーナー決定で
 //! ChronoGazer でも閲覧公開を使う).
 //!
+//! `BANTO_HUB_MEMORY_KEYS` (`1` to keep the Hub API key in process memory
+//! instead of the unavailable OS keyring, **and** to let the collector collect
+//! `hub` connections - 開発・E2E 用。#383 段階3 P5): without it this server
+//! cannot save a Hub key (no keyring) and a `hub` connection is left out of
+//! the collection (`hubSourceUnavailable`). With it the key lives only until
+//! the process exits, so the Hub link is never resumed after a restart.
+//!
 //! `BANTO_VIEWER_PUBLIC` は admin-template v3.0.0 の `banto-serve.rs` の同名の
 //! 入口を写したもの（`BANTO_ALLOW_SETUP` と同じく開発・E2E 用）。保存されて
 //! いる設定を**書く**（プロセス内の上書きではない - 条件は
@@ -49,6 +56,8 @@ use chronogazer_core::backup::BackupService;
 // デスクトップアプリと同じく**起動時に自動開始**する（`api_router` に
 // `/api/collect*` を生やす以上、ここを配線しないと「呼べるが何も走って
 // いない」口になる）。
+use banto_hub_bootstrap::state::memory::MemoryKeyStore;
+use banto_hub_bootstrap::KeyStore;
 use chronogazer_core::collect::{resolve_data_dir, CollectorService};
 use chronogazer_core::db::{init_db, Db, InitDbError};
 use chronogazer_core::display_groups::DisplayGroupService;
@@ -238,7 +247,21 @@ async fn main() {
     // 書き込みが必ず失敗する `UnavailableKeyStore` を渡す。到達確認・
     // ロックダウン判定・未設定判定といった「キーを保存しない範囲」は
     // そのまま動くため、E2E はこのサーバーで実施できる。
-    let hub = HubService::new(settings.clone(), std::sync::Arc::new(UnavailableKeyStore))
+    //
+    // `BANTO_HUB_MEMORY_KEYS=1`（開発・E2E 用、#383 段階3 P5）のときだけ、キーを
+    // プロセス内メモリに置く `MemoryKeyStore` を渡し、収集にも Hub を繋ぐ（下の
+    // `attach_hub`）。実際の Hub 相手の収集をこのサーバーで通すための入口で、
+    // 既定ではどちらも変わらない。キーは終了で消える（再起動後の `resume` は
+    // 張り直せない）。
+    let hub_memory_keys = std::env::var("BANTO_HUB_MEMORY_KEYS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let key_store: std::sync::Arc<dyn KeyStore> = if hub_memory_keys {
+        std::sync::Arc::new(MemoryKeyStore::new())
+    } else {
+        std::sync::Arc::new(UnavailableKeyStore)
+    };
+    let hub = HubService::new(settings.clone(), key_store)
         .await
         .expect("HubService should initialize");
 
@@ -266,6 +289,10 @@ async fn main() {
     });
     let collect_data_dir = resolve_data_dir(&data_base, &store_settings.data_dir);
     let collect = CollectorService::new(pool_for_collect, collect_data_dir);
+    if hub_memory_keys {
+        // 自動開始（下で spawn）より前に繋ぐ。
+        collect.attach_hub(hub.clone());
+    }
 
     // 保持期間を過ぎた時系列データファイルの削除（#538）。起動時に 1 回、その後は
     // 日付が変わるたびに 1 回。失敗してもログに出すだけで、収集は止めない。

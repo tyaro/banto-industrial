@@ -1394,9 +1394,7 @@ mod tests {
         use crate::config::{build_config_lenient_with_thresholds, HubSource, RegistrySnapshot};
         use crate::current::Quality;
         use crate::event::EventKind;
-        use crate::external::{
-            ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource, ExternalValueSource,
-        };
+        use crate::external::{ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource};
         use banto_tags::{
             CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
             TagInput, TagService,
@@ -1406,6 +1404,8 @@ mod tests {
 
         /// The external names registered on the hub connection, in tag order.
         const MEASURED: &str = "PLC9.G.measured";
+        /// Labelled `simulation` by the Hub in real life; the label is not
+        /// interpreted any more (2026-10-11), so it is just another Good value.
         const SIMULATED: &str = "PLC9.G.simulated";
         const STALE: &str = "PLC9.G.stale";
         const BAD: &str = "PLC9.G.bad";
@@ -1455,15 +1455,10 @@ mod tests {
             }
         }
 
-        fn reading(
-            value: f64,
-            quality: ExternalQuality,
-            source: ExternalValueSource,
-        ) -> ExternalReading {
+        fn reading(value: f64, quality: ExternalQuality) -> ExternalReading {
             ExternalReading {
                 value: Some(value),
                 quality,
-                source,
             }
         }
 
@@ -1471,16 +1466,12 @@ mod tests {
         /// is deliberately missing.
         fn held_values() -> HashMap<String, ExternalReading> {
             use ExternalQuality as Q;
-            use ExternalValueSource as S;
             HashMap::from([
-                (MEASURED.to_string(), reading(7.0, Q::Good, S::Measured)),
-                (SIMULATED.to_string(), reading(8.0, Q::Good, S::Simulated)),
-                (STALE.to_string(), reading(9.0, Q::Stale, S::Measured)),
-                (BAD.to_string(), reading(10.0, Q::Bad, S::Measured)),
-                (
-                    UNKNOWN_QUALITY.to_string(),
-                    reading(11.0, Q::Unknown, S::Measured),
-                ),
+                (MEASURED.to_string(), reading(7.0, Q::Good)),
+                (SIMULATED.to_string(), reading(8.0, Q::Good)),
+                (STALE.to_string(), reading(9.0, Q::Stale)),
+                (BAD.to_string(), reading(10.0, Q::Bad)),
+                (UNKNOWN_QUALITY.to_string(), reading(11.0, Q::Unknown)),
             ])
         }
 
@@ -1675,11 +1666,11 @@ mod tests {
         /// The mapping table end to end, and **a steady value stays Good and
         /// is recorded on every cycle** (H4: the subscription is on-change, so
         /// an unchanged value is never re-sent - the snapshot here never
-        /// changes at all for the whole run). Simulated, stale, bad,
-        /// unknown-quality and absent values are never written; the PLC
+        /// changes at all for the whole run). Stale, bad, unknown-quality
+        /// and absent values are never written; the PLC
         /// connection beside it is untouched.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn live_values_are_recorded_every_cycle_and_mapped_by_quality_and_source() {
+        async fn live_values_are_recorded_every_cycle_and_mapped_by_quality() {
             let dir = TempDir::new();
             let source = MockSource::new(ExternalSnapshot::live(held_values()));
             let (collector, mut rx, keys) = start(&dir, source.clone()).await;
@@ -1697,7 +1688,7 @@ mod tests {
             assert_eq!(
                 (get(SIMULATED).value, get(SIMULATED).quality),
                 (Some(8.0), Quality::Good),
-                "a simulated value is still shown (#413)"
+                "a Good value is shown whatever the Hub labelled it (2026-10-11)"
             );
             assert_eq!(
                 (get(STALE).value, get(STALE).quality),
@@ -1722,8 +1713,8 @@ mod tests {
             for row in &hub_rows {
                 assert_eq!(
                     row,
-                    &vec![Some(7.0), None, None, None, None, None],
-                    "only the measured good value is recorded, on every row"
+                    &vec![Some(7.0), Some(8.0), None, None, None, None],
+                    "only the Good values are recorded, on every row"
                 );
             }
             assert_plc_rows_unaffected(&rows(&dir, &keys.plc_group).await);
@@ -1776,7 +1767,9 @@ mod tests {
             }
             assert_eq!(
                 collector.status().get(&keys.hub_conn),
-                Some(&ConnectionStatus::Reconnecting { attempt: 1 })
+                Some(&ConnectionStatus::Reconnecting {
+                    attempt: crate::task::EXTERNAL_RECONNECT_ATTEMPT
+                })
             );
             assert_eq!(
                 current.get(&keys.plc_tag).map(|s| s.quality),
