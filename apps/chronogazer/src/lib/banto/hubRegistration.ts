@@ -241,6 +241,12 @@ export function dialogDirty(
 export interface DialogSelectionState {
 	selected: string[];
 	initial: InitialSelection;
+	/**
+	 * この開いている間に「以前の選択を使わない」が成功したか（2026-10-11 オーナーレビュー
+	 * P2）。立っていれば、**後から届いた読み込み**（破棄より前にサーバーで作られた、
+	 * 以前の選択を含む応答）でも事前チェックと注記を出し直さない（{@link applyCatalogLoad}）。
+	 */
+	legacyDismissed: boolean;
 	/** この開いている間に、タグ一覧を 1 度でも**読めた**か（事前チェックを済ませたか）。 */
 	tagsRead: boolean;
 }
@@ -248,8 +254,24 @@ export interface DialogSelectionState {
 export const EMPTY_DIALOG_SELECTION: DialogSelectionState = {
 	selected: [],
 	initial: { selected: [], showLegacyNotice: false, legacySkipped: [] },
+	legacyDismissed: false,
 	tagsRead: false
 };
+
+/**
+ * 「以前の選択を使わない」が成功した後の状態（純関数）。事前チェックしたものだけを外し
+ * （利用者が自分で選んだものは残す）、注記を消し、**以後の読み込みでも以前の選択を
+ * 扱わない**印を立てる。
+ */
+export function applyLegacyDismissal(state: DialogSelectionState): DialogSelectionState {
+	const prechecked = new Set(state.initial.selected);
+	return {
+		...state,
+		selected: state.selected.filter((name) => !prechecked.has(name)),
+		initial: { selected: [], showLegacyNotice: false, legacySkipped: [] },
+		legacyDismissed: true
+	};
+}
 
 /**
  * catalog を読み込んだ後の選択（純関数。2026-10-11 オーナーレビュー P2）。
@@ -264,8 +286,10 @@ export const EMPTY_DIALOG_SELECTION: DialogSelectionState = {
  */
 export function applyCatalogLoad(
 	state: DialogSelectionState,
-	next: HubCatalog
+	loaded: HubCatalog
 ): DialogSelectionState {
+	// 破棄した後に届いた応答は、以前の選択を含んでいても無いものとして扱う。
+	const next = state.legacyDismissed ? { ...loaded, legacySelection: [] } : loaded;
 	if (next.tags === null) {
 		if (state.tagsRead) return state;
 		return { ...state, initial: initialSelection(next, false) };
@@ -273,7 +297,7 @@ export function applyCatalogLoad(
 	if (!state.tagsRead) {
 		const initial = initialSelection(next, false);
 		const merged = new Set([...state.selected, ...initial.selected]);
-		return { selected: [...merged], initial, tagsRead: true };
+		return { ...state, selected: [...merged], initial, tagsRead: true };
 	}
 	const registered = new Set(next.registered);
 	const byName = new Map(next.tags.map((tag) => [tag.externalName, tag]));

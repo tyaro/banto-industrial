@@ -6,6 +6,7 @@ import type { HubCatalog, HubTag } from './hubAdmin';
 import type { CollectionGroup, PlcConnection } from './tagRegistryAdmin';
 import {
 	applyCatalogLoad,
+	applyLegacyDismissal,
 	EMPTY_DIALOG_SELECTION,
 	availabilityLabel,
 	buildRegistration,
@@ -301,5 +302,47 @@ describe('applyCatalogLoad（読み込みのたびの選択。オーナーレビ
 		const back = applyCatalogLoad(outage, catalog({ legacySelection: ['L.G.temp'] }));
 		expect(back.selected).toEqual(['L.G.temp']);
 		expect(back.tagsRead).toBe(true);
+	});
+});
+
+describe('applyLegacyDismissal（「以前の選択を使わない」と遅れて届く読み込み。オーナーレビュー P2）', () => {
+	it('事前チェックしたものだけ外し、自分で選んだものは残す', () => {
+		const first = applyCatalogLoad(
+			EMPTY_DIALOG_SELECTION,
+			catalog({ legacySelection: ['L.G.temp'] })
+		);
+		const picked = { ...first, selected: [...first.selected, 'L.G.run'] };
+		const dismissed = applyLegacyDismissal(picked);
+		expect(dismissed.selected).toEqual(['L.G.run']);
+		expect(dismissed.initial.showLegacyNotice).toBe(false);
+		expect(dismissed.legacyDismissed).toBe(true);
+	});
+
+	it('初回が読めず（tags: null）、破棄の後に破棄より前の応答が遅れて届いても、以前の選択と注記は戻らない', () => {
+		// 1. 開いた直後: タグ一覧は読めず、以前の選択 [temp] の注記だけ。
+		const outage = applyCatalogLoad(
+			EMPTY_DIALOG_SELECTION,
+			catalog({ tags: null, legacySelection: ['L.G.temp'] })
+		);
+		expect(outage.initial.showLegacyNotice).toBe(true);
+		// 2. 再試行の GET が飛んでいる間に「以前の選択を使わない」が成功する。
+		const dismissed = applyLegacyDismissal(outage);
+		// 3. 破棄より前にサーバーで作られた応答（以前の選択 [temp] を含む、初めて読めた一覧）が届く。
+		const late = applyCatalogLoad(dismissed, catalog({ legacySelection: ['L.G.temp'] }));
+		expect(late.selected).toEqual([]);
+		expect(late.initial.showLegacyNotice).toBe(false);
+		expect(late.tagsRead).toBe(true);
+		expect(late.legacyDismissed).toBe(true);
+	});
+
+	it('読めた後の破棄でも、後から届く読み込みが以前の選択を事前チェックし直さない', () => {
+		const first = applyCatalogLoad(
+			EMPTY_DIALOG_SELECTION,
+			catalog({ legacySelection: ['L.G.temp'] })
+		);
+		const dismissed = applyLegacyDismissal(first);
+		const late = applyCatalogLoad(dismissed, catalog({ legacySelection: ['L.G.temp'] }));
+		expect(late.selected).toEqual([]);
+		expect(late.initial.showLegacyNotice).toBe(false);
 	});
 });

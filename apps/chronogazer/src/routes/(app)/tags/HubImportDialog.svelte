@@ -48,6 +48,7 @@
 		hubGroupsOf,
 		hubTagAvailability,
 		applyCatalogLoad,
+		applyLegacyDismissal,
 		legacyNoticeText,
 		registrationBlocker,
 		registrationSuccessMessage,
@@ -118,6 +119,8 @@
 
 	/** この開いている間に、タグ一覧を 1 度でも読めたか（`applyCatalogLoad`）。 */
 	let tagsRead = $state(false);
+	/** この開いている間に「以前の選択を使わない」が成功したか（`applyLegacyDismissal`）。 */
+	let legacyDismissed = $state(false);
 
 	async function load(): Promise<void> {
 		loadGeneration += 1;
@@ -130,7 +133,7 @@
 			catalog = next;
 			// 読めなかった（`tags: null`）ときは選択を変えない。初めて読めたら事前チェック、
 			// その後は今も選べるものだけ残す（判断は `applyCatalogLoad`）。
-			const applied = applyCatalogLoad({ selected, initial, tagsRead }, next);
+			const applied = applyCatalogLoad({ selected, initial, tagsRead, legacyDismissed }, next);
 			selected = applied.selected;
 			initial = applied.initial;
 			tagsRead = applied.tagsRead;
@@ -159,6 +162,7 @@
 		selected = [];
 		initial = { selected: [], showLegacyNotice: false, legacySkipped: [] };
 		tagsRead = false;
+		legacyDismissed = false;
 		target = defaultTarget(hubGroups);
 		rowErrors = new Map();
 		targetErrors = [];
@@ -197,10 +201,12 @@
 		dismissing = true;
 		try {
 			await dismissLegacyHubSelection();
-			const legacy = new Set(catalog?.legacySelection ?? []);
-			// 事前チェックしたものだけ外す（利用者が自分で選んだものは残す）。
-			selected = selected.filter((name) => !(legacy.has(name) && initial.selected.includes(name)));
-			initial = { selected: [], showLegacyNotice: false, legacySkipped: [] };
+			// 事前チェックしたものだけ外し、以後に届く読み込み（破棄より前にサーバーで
+			// 作られた応答を含む）でも以前の選択を扱わない（オーナーレビュー P2）。
+			const dismissed = applyLegacyDismissal({ selected, initial, tagsRead, legacyDismissed });
+			selected = dismissed.selected;
+			initial = dismissed.initial;
+			legacyDismissed = dismissed.legacyDismissed;
 			if (catalog) catalog = { ...catalog, legacySelection: [] };
 			toastStore.push('success', '以前の選択を消しました。');
 		} catch (err) {

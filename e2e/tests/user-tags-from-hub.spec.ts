@@ -22,6 +22,8 @@
  *    読み取り専用（ホストの欄が無い）。
  * 6. Hub 接続の「有効」を切り替えて保存できる（2026-10-11 オーナー決定。無効にした
  *    Hub 接続のタグは購読も収集もしない - Rust のテストが固定）。
+ * 7.（オーナーレビュー P2）以前の選択を破棄した後に、破棄より前の一覧が遅れて届いても
+ *    事前チェックと注記は戻らない（再試行の GET を握って再現する）。
  *
  * フィクスチャは `beforeAll` の先頭と `afterAll` の両方で REST から掃除する
  * （チェックリスト §3。タグ → 収集グループ → Hub 接続の順）。
@@ -269,5 +271,63 @@ test.describe.serial('chronogazer タグ設定の「Hub から追加」（#383 �
 		await enabled.check();
 		await connectionDetail.getByRole('button', { name: '保存' }).click();
 		await expect(page.getByText('Hub 接続を有効にしました')).toBeVisible();
+	});
+
+	// オーナーレビュー P2: 初回が読めず（tags: null）、再試行の GET が遅れている間に
+	// 「以前の選択を使わない」が成功したら、破棄より前に作られた応答（以前の選択を含む）
+	// が後から届いても、以前の選択の事前チェックと注記は戻らない。
+	test('7. 以前の選択を破棄した後に、破棄より前の一覧が遅れて届いても事前チェックは戻らない', async () => {
+		await page.unroute('**/api/hub/catalog');
+		let calls = 0;
+		const late: { release: (() => void) | null } = { release: null };
+		await page.route('**/api/hub/catalog', async (route) => {
+			calls += 1;
+			const real = (await (await route.fetch()).json()) as { registered: string[] };
+			if (calls === 1) {
+				await route.fulfill({
+					json: {
+						status: { state: 'unreachable', cause: 'transport' },
+						tags: null,
+						registered: real.registered,
+						legacySelection: [OTHER_TEMP]
+					}
+				});
+				return;
+			}
+			// 破棄より前の時点の応答を、破棄が終わるまで握る。
+			await new Promise<void>((resolve) => {
+				late.release = resolve;
+			});
+			await route.fulfill({
+				json: {
+					status: { state: 'connected', tagCount: CATALOG_TAGS.length },
+					tags: CATALOG_TAGS,
+					registered: real.registered,
+					legacySelection: [OTHER_TEMP]
+				}
+			});
+		});
+		try {
+			await page.getByRole('button', { name: 'Hub から追加' }).click();
+			await expect(dialog()).toBeVisible();
+			const notice = dialog().getByText('以前の Hub 接続の画面で選んでいたタグを');
+			await expect(notice).toBeVisible();
+			await dialog().getByRole('button', { name: '再試行' }).click();
+			await expect.poll(() => late.release !== null).toBe(true);
+
+			await dialog().getByRole('button', { name: '以前の選択を使わない' }).click();
+			await expect(page.getByText('以前の選択を消しました。')).toBeVisible();
+			await expect(notice).toHaveCount(0);
+
+			late.release?.();
+			await expect(checkbox(OTHER_TEMP)).toBeVisible();
+			await expect(checkbox(OTHER_TEMP)).not.toBeChecked();
+			await expect(notice).toHaveCount(0);
+
+			await dialog().getByRole('button', { name: '閉じる' }).click();
+			await expect(dialog()).toHaveCount(0);
+		} finally {
+			await page.unroute('**/api/hub/catalog');
+		}
 	});
 });
