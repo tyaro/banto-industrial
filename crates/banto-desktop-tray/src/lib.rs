@@ -94,7 +94,7 @@
 
 mod exit_once;
 
-pub use exit_once::{ExitCleanupOnce, ExitCleanupOutcome};
+pub use exit_once::{ExitCleanupOnce, ExitCleanupOutcome, ExitCleanupReport};
 
 use std::path::Path;
 use std::sync::Mutex;

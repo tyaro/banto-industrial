@@ -348,11 +348,12 @@ mod tests {
         slot.close();
         let slot = Arc::clone(slot);
         let stops = Arc::clone(stops);
-        once.run_or_wait(budget, move |deadline| {
+        once.run_or_wait((), budget, move |deadline| {
             run_hub_exit(&slot, deadline, |_hub| {
                 stops.fetch_add(1, SeqCst);
             })
         })
+        .outcome()
     }
 
     fn slot_with_hub() -> Arc<HubSlot<FakeHub>> {
@@ -416,13 +417,14 @@ mod tests {
             std::thread::spawn(move || {
                 slot.close();
                 let inner_slot = Arc::clone(&slot);
-                once.run_or_wait(LONG, move |deadline| {
+                once.run_or_wait((), LONG, move |deadline| {
                     run_hub_exit(&inner_slot, deadline, |_hub| {
                         stops.fetch_add(1, SeqCst);
                         in_shutdown_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                     })
                 })
+                .outcome()
             })
         };
         in_shutdown_rx.recv().unwrap();

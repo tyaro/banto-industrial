@@ -35,9 +35,17 @@
 //! 期限で戻れるようにするため。打ち切られても本体のスレッドは続く（直後に
 //! プロセスが終わる）。
 //!
-//! 期限までに終わらなかったことは [`ExitCleanupOutcome::TimedOut`] で返し、
+//! 期限までに終わらなかったことは [`ExitCleanupOutcome::TimedOut`]（[`ExitCleanupReport::outcome`]）で返し、
 //! 正常に終わった [`ExitCleanupOutcome::Finished`] と区別する。記録（ログ）は
 //! 呼び出し元が行う。
+//!
+//! # 結果の区別と記録
+//!
+//! 戻り値（[`ExitCleanupReport`]）は、その呼び出しが**実際に何をしたか**（本体を
+//! 走らせた／先行の結果を受け取った／先行の期限切れを受け取った／自分の予算で
+//! 待つのをやめた）を型で区別し、先行の起点も返す。記録する側は、本体を走らせた
+//! 呼び出しだけが結果を出し、受け取っただけの呼び出しは出さない（同じ後始末の
+//! 完了が 2 行出たり、待っていないのに自分の上限を名乗ったりしないように）。
 //!
 //! # 持たないもの
 //!
@@ -48,7 +56,7 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// [`ExitCleanupOnce::run_or_wait`] の結果。
+/// 後始末の**本体**の結果の見え方（[`ExitCleanupOnce::run_or_wait`] の一部）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitCleanupOutcome<R> {
     /// 後始末が終わった（この呼び出しが始めたものでも、先行のものの完了を
@@ -59,21 +67,63 @@ pub enum ExitCleanupOutcome<R> {
     TimedOut,
 }
 
-enum Phase<R> {
-    NotStarted,
-    Running { deadline: Instant },
-    Finished(R),
+/// [`ExitCleanupOnce::run_or_wait`] の結果。**この呼び出しが実際に何をしたか**を
+/// 型で区別する - 記録（ログ）の文言を「実際に起きたこと」に合わせるため。
+///
+/// - 後始末の本体を走らせた呼び出し（[`Self::RanWork`]）だけが、結果を
+///   「自分の後始末」として記録する。
+/// - 後から来た呼び出しは、先行の結果を**受け取っただけ**（[`Self::ReceivedPrior`]）
+///   なら記録しない（先行が記録する）。待てなかったときは、**どちらの上限で**
+///   待つのをやめたか（[`Self::PriorExpired`]・[`Self::OwnBudgetExpired`]）を
+///   区別する。後から来た呼び出しが、待っていないのに自分の上限を名乗らないように。
+///
+/// `T` は呼び出しの**起点**（トレイの終了・OS の終了など）の印。先行の起点を
+/// 文言に出すために、最初の呼び出しの値を覚えて返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitCleanupReport<R, T> {
+    /// この呼び出しが本体を走らせた（最初の呼び出し）。`TimedOut` はこの呼び出しの
+    /// `budget`（= 後始末の期限）で打ち切ったことを表す。
+    RanWork(ExitCleanupOutcome<R>),
+    /// 先行の本体が終わっていて（待っている間に終わったものを含む）、その結果を
+    /// 受け取った。`origin` は先行の起点。
+    ReceivedPrior { origin: T, result: R },
+    /// 先行の期限が来ても本体が終わらなかった（期限が既に過ぎていて待たずに
+    /// 戻ったものを含む）。この呼び出しの予算で切ったのではなく、先行の期限の
+    /// 結果を受け取っただけ。
+    PriorExpired { origin: T },
+    /// 先行の期限より**この呼び出しの予算の方が短く**、その予算で待つのを
+    /// やめた。先行の本体は期限まで続く。
+    OwnBudgetExpired { origin: T },
 }
 
-struct Inner<R> {
-    phase: Mutex<Phase<R>>,
+impl<R: Clone, T> ExitCleanupReport<R, T> {
+    /// 本体の結果だけを見る（誰が走らせたかを区別しない）。
+    pub fn outcome(&self) -> ExitCleanupOutcome<R> {
+        match self {
+            Self::RanWork(outcome) => outcome.clone(),
+            Self::ReceivedPrior { result, .. } => ExitCleanupOutcome::Finished(result.clone()),
+            Self::PriorExpired { .. } | Self::OwnBudgetExpired { .. } => {
+                ExitCleanupOutcome::TimedOut
+            }
+        }
+    }
+}
+
+enum Phase<R, T> {
+    NotStarted,
+    Running { deadline: Instant, origin: T },
+    Finished { result: R, origin: T },
+}
+
+struct Inner<R, T> {
+    phase: Mutex<Phase<R, T>>,
     finished: Condvar,
 }
 
-impl<R> Inner<R> {
+impl<R, T> Inner<R, T> {
     /// 中身は `Phase` 1 つで、ロック中に panic しても半端な値は残らない
     /// （書き換えは代入 1 回）ので、毒化は無視して中身を使う。
-    fn lock(&self) -> MutexGuard<'_, Phase<R>> {
+    fn lock(&self) -> MutexGuard<'_, Phase<R, T>> {
         self.phase
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -82,18 +132,19 @@ impl<R> Inner<R> {
 
 /// 終了の後始末を 1 回に限り、2 つ目以降には完了を待たせる（この module の doc）。
 ///
-/// アプリの管理状態（`app.manage(..)`）として 1 つ持つ。
-pub struct ExitCleanupOnce<R> {
-    inner: Arc<Inner<R>>,
+/// アプリの管理状態（`app.manage(..)`）として 1 つ持つ。`T` は呼び出しの起点の
+/// 印（[`ExitCleanupReport`]）で、区別が要らなければ `()`。
+pub struct ExitCleanupOnce<R, T = ()> {
+    inner: Arc<Inner<R, T>>,
 }
 
-impl<R> Default for ExitCleanupOnce<R> {
+impl<R, T> Default for ExitCleanupOnce<R, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R> ExitCleanupOnce<R> {
+impl<R, T> ExitCleanupOnce<R, T> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -109,10 +160,12 @@ impl<R> ExitCleanupOnce<R> {
     }
 }
 
-impl<R: Clone + Send + 'static> ExitCleanupOnce<R> {
+impl<R: Clone + Send + 'static, T: Clone + Send + 'static> ExitCleanupOnce<R, T> {
     /// 後始末がまだなら `work` を専用のスレッドで始め、どちらにしても
     /// 完了を**期限まで**待つ（この module の doc「予算」）。
     ///
+    /// - `origin`: この呼び出しの起点の印。最初の呼び出しのものが覚えられ、
+    ///   後から来た呼び出しの結果に先行の起点として入る。
     /// - `budget`: この呼び出しが待つ上限。最初の呼び出しなら、後始末の期限
     ///   （`work` に渡す `deadline`）にもなる。
     /// - `work`: 後始末の本体。最初の呼び出しの分だけが実行され、2 つ目以降に
@@ -120,39 +173,66 @@ impl<R: Clone + Send + 'static> ExitCleanupOnce<R> {
     ///   `deadline` で打ち切ること。
     ///
     /// `work` が panic したときは完了の印が付かないので、待つ側は期限で
-    /// [`ExitCleanupOutcome::TimedOut`] を受け取る（終了は止まらない）。
-    pub fn run_or_wait<F>(&self, budget: Duration, work: F) -> ExitCleanupOutcome<R>
+    /// 打ち切りを受け取る（終了は止まらない）。
+    pub fn run_or_wait<F>(&self, origin: T, budget: Duration, work: F) -> ExitCleanupReport<R, T>
     where
         F: FnOnce(Instant) -> R + Send + 'static,
     {
         let now = Instant::now();
-        let wait_until = {
+        let own_limit = now + budget;
+        let (wait_until, prior) = {
             let mut phase = self.inner.lock();
             match &*phase {
-                Phase::Finished(result) => return ExitCleanupOutcome::Finished(result.clone()),
-                Phase::Running { deadline } => (*deadline).min(now + budget),
+                Phase::Finished { result, origin } => {
+                    return ExitCleanupReport::ReceivedPrior {
+                        origin: origin.clone(),
+                        result: result.clone(),
+                    };
+                }
+                Phase::Running {
+                    deadline,
+                    origin: prior_origin,
+                } => (
+                    (*deadline).min(own_limit),
+                    Some((*deadline, prior_origin.clone())),
+                ),
                 Phase::NotStarted => {
-                    let deadline = now + budget;
-                    *phase = Phase::Running { deadline };
+                    *phase = Phase::Running {
+                        deadline: own_limit,
+                        origin: origin.clone(),
+                    };
                     let inner = Arc::clone(&self.inner);
                     // ロックを持ったままスレッドを作るだけ（本体はロックの外で
                     // 走る）。本体の完了は `finished` で知らせる。
                     std::thread::spawn(move || {
-                        let result = work(deadline);
-                        *inner.lock() = Phase::Finished(result);
+                        let result = work(own_limit);
+                        *inner.lock() = Phase::Finished { result, origin };
                         inner.finished.notify_all();
                     });
-                    deadline
+                    (own_limit, None)
                 }
             }
         };
-        self.wait_until(wait_until)
+        let outcome = self.wait_until(wait_until);
+        match (prior, outcome) {
+            (None, outcome) => ExitCleanupReport::RanWork(outcome),
+            (Some((_, origin)), ExitCleanupOutcome::Finished(result)) => {
+                ExitCleanupReport::ReceivedPrior { origin, result }
+            }
+            // 自分の上限の方が先行の期限より前: 自分の予算で切った。
+            (Some((deadline, origin)), ExitCleanupOutcome::TimedOut) if own_limit < deadline => {
+                ExitCleanupReport::OwnBudgetExpired { origin }
+            }
+            (Some((_, origin)), ExitCleanupOutcome::TimedOut) => {
+                ExitCleanupReport::PriorExpired { origin }
+            }
+        }
     }
 
     fn wait_until(&self, until: Instant) -> ExitCleanupOutcome<R> {
         let mut phase = self.inner.lock();
         loop {
-            if let Phase::Finished(result) = &*phase {
+            if let Phase::Finished { result, .. } = &*phase {
                 return ExitCleanupOutcome::Finished(result.clone());
             }
             let now = Instant::now();
@@ -183,7 +263,7 @@ mod tests {
     fn first_call_runs_the_work_and_waits_for_it() {
         let once = ExitCleanupOnce::new();
         assert!(!once.has_started());
-        let outcome = once.run_or_wait(LONG, |_deadline| 7);
+        let outcome = once.run_or_wait((), LONG, |_deadline| 7).outcome();
         assert_eq!(outcome, ExitCleanupOutcome::Finished(7));
         assert!(once.has_started());
     }
@@ -195,7 +275,9 @@ mod tests {
         let once = ExitCleanupOnce::new();
         for _ in 0..3 {
             let runs = Arc::clone(&runs);
-            let outcome = once.run_or_wait(LONG, move |_| runs.fetch_add(1, SeqCst) + 1);
+            let outcome = once
+                .run_or_wait((), LONG, move |_| runs.fetch_add(1, SeqCst) + 1)
+                .outcome();
             assert_eq!(outcome, ExitCleanupOutcome::Finished(1));
         }
         assert_eq!(runs.load(SeqCst), 1);
@@ -218,12 +300,13 @@ mod tests {
             let once = Arc::clone(&once);
             let runs = Arc::clone(&runs);
             std::thread::spawn(move || {
-                once.run_or_wait(LONG, move |_| {
+                once.run_or_wait((), LONG, move |_| {
                     runs.fetch_add(1, SeqCst);
                     started_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     "flushed"
                 })
+                .outcome()
             })
         };
         started_rx.recv().unwrap();
@@ -233,10 +316,12 @@ mod tests {
             let once = Arc::clone(&once);
             let runs = Arc::clone(&runs);
             std::thread::spawn(move || {
-                let outcome = once.run_or_wait(LONG, move |_| {
-                    runs.fetch_add(1, SeqCst);
-                    "second work must not run"
-                });
+                let outcome = once
+                    .run_or_wait((), LONG, move |_| {
+                        runs.fetch_add(1, SeqCst);
+                        "second work must not run"
+                    })
+                    .outcome();
                 second_tx.send(outcome.clone()).unwrap();
                 outcome
             })
@@ -271,9 +356,10 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    once.run_or_wait(LONG, move |_| {
+                    once.run_or_wait((), LONG, move |_| {
                         runs.fetch_add(1, SeqCst);
                     })
+                    .outcome()
                 })
             })
             .collect();
@@ -292,16 +378,21 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (done_tx, done_rx) = mpsc::channel();
         let started = Instant::now();
-        let outcome = once.run_or_wait(Duration::from_millis(50), move |_| {
-            release_rx.recv().unwrap();
-            done_tx.send(()).unwrap();
-            1
-        });
+        let outcome = once
+            .run_or_wait((), Duration::from_millis(50), move |_| {
+                release_rx.recv().unwrap();
+                done_tx.send(()).unwrap();
+                1
+            })
+            .outcome();
         assert_eq!(outcome, ExitCleanupOutcome::TimedOut);
         assert!(started.elapsed() < LONG);
 
         // 期限を過ぎた後の呼び出しは、本体が終わるまでは待たずに `TimedOut`。
-        assert_eq!(once.run_or_wait(LONG, |_| 2), ExitCleanupOutcome::TimedOut);
+        assert_eq!(
+            once.run_or_wait((), LONG, |_| 2).outcome(),
+            ExitCleanupOutcome::TimedOut
+        );
 
         release_tx.send(()).unwrap();
         done_rx.recv().unwrap();
@@ -309,7 +400,7 @@ mod tests {
         // 読み直す（上限付き）。本体は 2 回目を走らせない（結果は 1 のまま）。
         let give_up = Instant::now() + LONG;
         loop {
-            match once.run_or_wait(LONG, |_| 2) {
+            match once.run_or_wait((), LONG, |_| 2).outcome() {
                 ExitCleanupOutcome::Finished(value) => {
                     assert_eq!(value, 1);
                     break;
@@ -335,17 +426,20 @@ mod tests {
         let first = {
             let once = Arc::clone(&once);
             std::thread::spawn(move || {
-                once.run_or_wait(LONG, move |_| {
+                once.run_or_wait((), LONG, move |_| {
                     started_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                 })
             })
         };
         started_rx.recv().unwrap();
-        let second = once.run_or_wait(Duration::from_millis(50), |_| ());
-        assert_eq!(second, ExitCleanupOutcome::TimedOut);
+        let second = once.run_or_wait((), Duration::from_millis(50), |_| ());
+        assert_eq!(second.outcome(), ExitCleanupOutcome::TimedOut);
         release_tx.send(()).unwrap();
-        assert_eq!(first.join().unwrap(), ExitCleanupOutcome::Finished(()));
+        assert_eq!(
+            first.join().unwrap().outcome(),
+            ExitCleanupOutcome::Finished(())
+        );
     }
 
     /// 本体には最初の呼び出しの期限が渡り、2 つ目以降の予算では延びない。
@@ -353,11 +447,148 @@ mod tests {
     fn the_work_receives_the_first_callers_deadline() {
         let once = ExitCleanupOnce::new();
         let before = Instant::now();
-        let outcome = once.run_or_wait(Duration::from_secs(3), move |deadline| deadline);
+        let outcome = once
+            .run_or_wait((), Duration::from_secs(3), move |deadline| deadline)
+            .outcome();
         let ExitCleanupOutcome::Finished(deadline) = outcome else {
             panic!("expected Finished");
         };
         assert!(deadline >= before + Duration::from_secs(3));
         assert!(deadline <= Instant::now() + Duration::from_secs(3));
+    }
+
+    /// 戻り値の区別（1）: 最初の呼び出しは「本体を走らせた」。完了でも、自分の
+    /// 予算での打ち切りでも `RanWork`（先行は無いので `PriorExpired` などには
+    /// ならない）。
+    #[test]
+    fn the_first_call_reports_that_it_ran_the_work() {
+        let once: ExitCleanupOnce<u32, &'static str> = ExitCleanupOnce::new();
+        assert_eq!(
+            once.run_or_wait("tray", LONG, |_| 7),
+            ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(7))
+        );
+
+        let once: ExitCleanupOnce<u32, &'static str> = ExitCleanupOnce::new();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let timed_out = once.run_or_wait("tray", Duration::from_millis(50), move |_| {
+            release_rx.recv().ok();
+            1
+        });
+        assert_eq!(
+            timed_out,
+            ExitCleanupReport::RanWork(ExitCleanupOutcome::TimedOut)
+        );
+        drop(release_tx);
+    }
+
+    /// 戻り値の区別（2）: 後から来た呼び出しが終わった結果を受け取ったときは
+    /// 「先行の結果を受け取った」で、**先行の起点**が入る（自分の起点ではない）。
+    /// 本体を走らせた呼び出しではないので `RanWork` にはならない。
+    #[test]
+    fn a_later_call_reports_the_prior_result_and_the_prior_origin() {
+        let once: ExitCleanupOnce<u32, &'static str> = ExitCleanupOnce::new();
+        assert_eq!(
+            once.run_or_wait("tray", LONG, |_| 7),
+            ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(7))
+        );
+        let later = once.run_or_wait("exit-event", Duration::from_millis(50), |_| 99);
+        assert_eq!(
+            later,
+            ExitCleanupReport::ReceivedPrior {
+                origin: "tray",
+                result: 7
+            }
+        );
+        assert_eq!(later.outcome(), ExitCleanupOutcome::Finished(7));
+    }
+
+    /// 戻り値の区別（2'）: 後から来て**待っている間に**先行が終わった場合も
+    /// 「先行の結果を受け取った」（先行の起点つき）。
+    #[test]
+    fn a_later_call_that_waits_then_receives_reports_the_prior_result() {
+        let once: Arc<ExitCleanupOnce<u32, &'static str>> = Arc::new(ExitCleanupOnce::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = {
+            let once = Arc::clone(&once);
+            std::thread::spawn(move || {
+                once.run_or_wait("tray", LONG, move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    5
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        let second = {
+            let once = Arc::clone(&once);
+            std::thread::spawn(move || once.run_or_wait("exit-event", LONG, |_| 0))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            first.join().unwrap(),
+            ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(5))
+        );
+        assert_eq!(
+            second.join().unwrap(),
+            ExitCleanupReport::ReceivedPrior {
+                origin: "tray",
+                result: 5
+            }
+        );
+    }
+
+    /// 戻り値の区別（3）: 後から来た呼び出しが**自分の予算**（先行の期限より
+    /// 短い）で待つのをやめたときは `OwnBudgetExpired`。先行の起点つき。
+    #[test]
+    fn a_later_call_cut_by_its_own_budget_reports_it() {
+        let once: Arc<ExitCleanupOnce<(), &'static str>> = Arc::new(ExitCleanupOnce::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = {
+            let once = Arc::clone(&once);
+            std::thread::spawn(move || {
+                once.run_or_wait("tray", LONG, move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        let second = once.run_or_wait("exit-event", Duration::from_millis(50), |_| ());
+        assert_eq!(
+            second,
+            ExitCleanupReport::OwnBudgetExpired { origin: "tray" }
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            first.join().unwrap(),
+            ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(()))
+        );
+    }
+
+    /// 戻り値の区別（4）: 先行が期限で打ち切られた**後**に来た呼び出しは、待たずに
+    /// 先行の期限切れを受け取る。自分の予算で切ったのではないので
+    /// `OwnBudgetExpired` ではなく `PriorExpired`（「この経路の上限◯秒」と
+    /// 名乗らせない）。
+    #[test]
+    fn a_call_after_the_prior_deadline_reports_the_prior_expiry_not_its_own_budget() {
+        let once: ExitCleanupOnce<(), &'static str> = ExitCleanupOnce::new();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = once.run_or_wait("tray", Duration::from_millis(50), move |_| {
+            release_rx.recv().ok();
+        });
+        assert_eq!(
+            first,
+            ExitCleanupReport::RanWork(ExitCleanupOutcome::TimedOut)
+        );
+        let started = Instant::now();
+        let later = once.run_or_wait("exit-event", Duration::from_secs(5), |_| ());
+        assert_eq!(later, ExitCleanupReport::PriorExpired { origin: "tray" });
+        // 自分の 5 秒は待っていない。
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(later.outcome(), ExitCleanupOutcome::TimedOut);
+        drop(release_tx);
     }
 }

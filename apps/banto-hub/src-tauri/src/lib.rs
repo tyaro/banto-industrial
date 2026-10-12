@@ -221,8 +221,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use banto_desktop_tray::{
-    ConfirmPrompt, ExitCleanupOnce, ExitCleanupOutcome, QuitAdmission, QuitAnswerDecision,
-    QuitGate, QuitRequestDecision, TrayHint,
+    ConfirmPrompt, ExitCleanupOnce, ExitCleanupOutcome, ExitCleanupReport, QuitAdmission,
+    QuitAnswerDecision, QuitGate, QuitRequestDecision, TrayHint,
 };
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
 #[cfg(windows)]
@@ -606,7 +606,7 @@ const TRAY_QUIT_BUDGET: Duration = Duration::from_secs(15);
 const OS_EXIT_BUDGET: Duration = Duration::from_secs(5);
 
 /// 終了の後始末を 1 回に限るための入れ物（#586）。`run()` が manage する。
-struct ExitOnce(ExitCleanupOnce<HubExitReport>);
+struct ExitOnce(ExitCleanupOnce<HubExitReport, ExitTrigger>);
 
 /// 終了の後始末（#586）。トレイの「アプリを終了」（[`quit`]）と
 /// `RunEvent::Exit`（[`run`]）の両方から呼ばれる。
@@ -654,31 +654,80 @@ fn exit_cleanup(app: &AppHandle, trigger: ExitTrigger) {
     }
     let slot = Arc::clone(&state.hub);
     let budget = trigger.budget();
-    let outcome = once.0.run_or_wait(budget, move |deadline| {
+    let report = once.0.run_or_wait(trigger, budget, move |deadline| {
         run_hub_exit(&slot, deadline, |hub| {
             tauri::async_runtime::block_on(hub.shutdown());
         })
     });
-    match outcome {
-        ExitCleanupOutcome::Finished(HubExitReport { settled: true, .. }) => {
-            log_line(&format!(
-                "banto-hub-shell: 終了の後始末が完了しました（{}）",
-                trigger.label()
-            ));
-        }
-        ExitCleanupOutcome::Finished(HubExitReport { settled: false, .. }) => {
-            log_err_line(&format!(
-                "banto-hub-shell: 終了の後始末の期限までに、ホスト切替の停止・起動が終わりませんでした。待たずに終了します（{}）",
-                trigger.label()
-            ));
-        }
-        ExitCleanupOutcome::TimedOut => {
-            log_err_line(&format!(
+    match exit_log_line(trigger, budget, &report) {
+        Some(ExitLogLine::Info(line)) => log_line(&line),
+        Some(ExitLogLine::Error(line)) => log_err_line(&line),
+        None => {}
+    }
+}
+
+/// [`exit_cleanup`] が記録する 1 行（重さつき）。
+#[derive(Debug, PartialEq, Eq)]
+enum ExitLogLine {
+    Info(String),
+    Error(String),
+}
+
+/// 終了の後始末の結果（[`ExitCleanupReport`]）から、記録する文言を決める。
+/// **この呼び出しが実際にしたこと**に合う文言だけを出す純関数（#586）:
+///
+/// - 本体を走らせた最初の呼び出しだけが、完了／未了／打ち切りを自分の結果として
+///   出す。
+/// - 後から来て先行の結果を**受け取っただけ**の呼び出し（普通のトレイ終了の
+///   `app.exit(0)` から来る `RunEvent::Exit` が代表）は**何も出さない**。先行が
+///   同じ結果を出している。「控えめな 1 行」にしないのは、普通のトレイ終了で
+///   完了の行が 2 行出る状態（OS の終了が無いのに OS 経路の文言が出る）を
+///   なくすため。先行が打ち切られたあとで本体が裏で終わった場合も、先行の
+///   「待たずに終了します」の行が残っており、後から来た側の行は新しい情報に
+///   ならない。
+/// - 後から来て待てなかった呼び出しは、**どちらの上限で**やめたかを区別する。
+///   先行の期限が来ていた（または来た）なら、自分の上限は名乗らず、先行の
+///   期限切れを受け取ったと出す。自分の予算が先行の期限より短くて自分で
+///   やめたときだけ「この経路の上限◯秒」と出す。
+fn exit_log_line(
+    trigger: ExitTrigger,
+    budget: Duration,
+    report: &ExitCleanupReport<HubExitReport, ExitTrigger>,
+) -> Option<ExitLogLine> {
+    match report {
+        ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(HubExitReport {
+            settled: true,
+            ..
+        })) => Some(ExitLogLine::Info(format!(
+            "banto-hub-shell: 終了の後始末が完了しました（{}）",
+            trigger.label()
+        ))),
+        ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(HubExitReport {
+            settled: false,
+            ..
+        })) => Some(ExitLogLine::Error(format!(
+            "banto-hub-shell: 終了の後始末の期限までに、ホスト切替の停止・起動が終わりませんでした。待たずに終了します（{}）",
+            trigger.label()
+        ))),
+        ExitCleanupReport::RanWork(ExitCleanupOutcome::TimedOut) => {
+            Some(ExitLogLine::Error(format!(
                 "banto-hub-shell: 終了の後始末が期限までに終わらなかったため、待たずに終了します（この経路の上限{}秒、{}）",
                 budget.as_secs(),
                 trigger.label()
-            ));
+            )))
         }
+        ExitCleanupReport::ReceivedPrior { .. } => None,
+        ExitCleanupReport::PriorExpired { origin } => Some(ExitLogLine::Error(format!(
+            "banto-hub-shell: 先行の終了の後始末（{}）が期限までに終わっていなかったため、待たずに終了します（{}）",
+            origin.label(),
+            trigger.label()
+        ))),
+        ExitCleanupReport::OwnBudgetExpired { origin } => Some(ExitLogLine::Error(format!(
+            "banto-hub-shell: 先行の終了の後始末（{}）がまだ終わっていませんが、この経路の上限{}秒で待つのをやめ、待たずに終了します（{}）",
+            origin.label(),
+            budget.as_secs(),
+            trigger.label()
+        ))),
     }
 }
 
@@ -1778,7 +1827,9 @@ pub fn run() {
         .manage(QuitGate::new())
         // #586: 終了の後始末（トレイの「アプリを終了」と `RunEvent::Exit`）を
         // プロセスで 1 回に限り、2 つ目には完了を待たせる（[`exit_cleanup`]）。
-        .manage(ExitOnce(ExitCleanupOnce::new()))
+        .manage(ExitOnce(
+            ExitCleanupOnce::<HubExitReport, ExitTrigger>::new(),
+        ))
         .manage(AppState {
             hub: HubSlot::new(),
             controller: StdMutex::new(None),
@@ -1901,6 +1952,82 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settled() -> HubExitReport {
+        HubExitReport {
+            stopped_hub: true,
+            settled: true,
+        }
+    }
+
+    fn line(
+        report: &ExitCleanupReport<HubExitReport, ExitTrigger>,
+        trigger: ExitTrigger,
+    ) -> Option<ExitLogLine> {
+        exit_log_line(trigger, trigger.budget(), report)
+    }
+
+    /// #586 実機確認の 1: 普通のトレイ終了では完了ログが 1 行だけ。トレイが本体を
+    /// 走らせて「トレイの終了」と出し、`app.exit(0)` から来る `Exit` は済んだ結果を
+    /// 受け取っただけなので何も出さない（OS の終了の文言を出さない）。
+    #[test]
+    fn a_plain_tray_quit_logs_the_completion_once() {
+        let tray = ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(settled()));
+        let exit_event = ExitCleanupReport::ReceivedPrior {
+            origin: ExitTrigger::TrayQuit,
+            result: settled(),
+        };
+        let Some(ExitLogLine::Info(text)) = line(&tray, ExitTrigger::TrayQuit) else {
+            panic!("the tray quit logs the completion");
+        };
+        assert!(text.contains("完了しました") && text.contains("トレイの終了"));
+        assert_eq!(line(&exit_event, ExitTrigger::RunEventExit), None);
+    }
+
+    /// #586 実機確認の 2: トレイが 15 秒で打ち切られた後に来た `Exit` は、待たずに
+    /// 先行の期限切れを受け取る。自分の上限（5 秒）を名乗らず、先行の起点を出す。
+    #[test]
+    fn a_call_after_the_prior_expiry_does_not_claim_its_own_budget() {
+        let tray = ExitCleanupReport::RanWork(ExitCleanupOutcome::TimedOut);
+        let exit_event = ExitCleanupReport::PriorExpired {
+            origin: ExitTrigger::TrayQuit,
+        };
+        let Some(ExitLogLine::Error(first)) = line(&tray, ExitTrigger::TrayQuit) else {
+            panic!("the tray quit logs its own time-out");
+        };
+        assert!(first.contains("この経路の上限15秒"));
+        let Some(ExitLogLine::Error(text)) = line(&exit_event, ExitTrigger::RunEventExit) else {
+            panic!("the prior expiry is logged");
+        };
+        assert!(!text.contains("この経路の上限"));
+        assert!(!text.contains("5秒"));
+        assert!(text.contains("先行") && text.contains("トレイの終了"));
+    }
+
+    /// 後から来た呼び出しが自分の予算で待つのをやめたときだけ、その上限を名乗る。
+    #[test]
+    fn a_call_cut_by_its_own_budget_names_its_own_limit() {
+        let report = ExitCleanupReport::OwnBudgetExpired {
+            origin: ExitTrigger::TrayQuit,
+        };
+        let Some(ExitLogLine::Error(text)) = line(&report, ExitTrigger::RunEventExit) else {
+            panic!("the own-budget cut is logged");
+        };
+        assert!(text.contains("上限5秒") && text.contains("トレイの終了"));
+    }
+
+    /// 本体を走らせた呼び出しの「期限までに切替が落ち着かなかった」は従来どおり。
+    #[test]
+    fn an_unsettled_run_is_logged_as_an_error_by_the_caller_that_ran_it() {
+        let report = ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(HubExitReport {
+            stopped_hub: true,
+            settled: false,
+        }));
+        let Some(ExitLogLine::Error(text)) = line(&report, ExitTrigger::RunEventExit) else {
+            panic!("unsettled is an error");
+        };
+        assert!(text.contains("終わりませんでした"));
+    }
 
     /// 「アプリを終了」の確認文は収集中かどうかで変わり、収集中の文言は
     /// 停止と flush を明示する。確認の途中で収集が始まっていた場合は共有の
