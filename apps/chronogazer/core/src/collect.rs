@@ -1971,8 +1971,8 @@ impl CollectorService {
     }
 
     /// 起動時の自動開始（docs/r1-plan.md の R1-C「起動時に build_config →
-    /// start」）。`src-tauri` の `setup()` と `banto-serve` の `main()` が
-    /// **共通で通る唯一の口**で、どちらも `spawn` して投げっぱなしにする
+    /// start」）。`src-tauri` の `setup()` と [`crate::engine::EngineRuntime`]
+    /// （`banto-serve`）が**共通で通る唯一の口**で、どちらも `spawn` して投げっぱなしにする
     /// （`crate::hub` の `resume()` と同じ形 - 起動を待たせない）。
     ///
     /// **失敗しても起動は止めない**。握り潰しているように見えるが理由は
@@ -2094,6 +2094,13 @@ impl CollectorService {
         let mut admission = self.inner.ctx.admission();
         admission.shutting_down = true;
         admission.pending_starts > 0 || self.inner.ctx.state().is_collecting()
+    }
+
+    /// テスト専用: 終了処理の取り消せない印（[`Self::begin_shutdown`]）が立って
+    /// いるか（`crate::engine` の終了の順序のテストが見る）。
+    #[cfg(test)]
+    pub(crate) fn shutdown_marked(&self) -> bool {
+        self.inner.ctx.shutting_down()
     }
 
     /// 開始の受付（このモジュールの doc「終了の受付」）。印（どちらか）が

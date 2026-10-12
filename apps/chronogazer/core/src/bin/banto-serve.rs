@@ -40,6 +40,16 @@
 //! the collection (`hubSourceUnavailable`). With it the key lives only until
 //! the process exits, so the Hub link is never resumed after a restart.
 //!
+//! 起動と終了の組み立ては `chronogazer_core::engine::EngineRuntime`（#392 段階 B の
+//! B1-1、2026-10-12）。このファイルが決めるのは環境変数の読み方と既定値・
+//! 起動時の表示・Ctrl-C だけで、それらは乗り換えの前と変えていない（E2E が
+//! 依存する）。乗り換えで変わったのは終了で、デスクトップと同じ順序
+//! （収集の終了の印 → LAN の listener → 収集の停止（最終 flush）→ Hub の購読の
+//! 停止 → DB の pool を閉じる）を [`SHUTDOWN_BUDGET`] の中で行う（前は Hub と
+//! pool を閉じていなかった）。起動の失敗（同じ DB の使用中・DB を開けない・
+//! Hub の初期化・ポートの使用中）は理由を標準エラー出力に出して終了コード 1 で
+//! 終わる（前は Hub の初期化とポートの使用中が panic だった）。
+//!
 //! `BANTO_VIEWER_PUBLIC` は admin-template v3.0.0 の `banto-serve.rs` の同名の
 //! 入口を写したもの（`BANTO_ALLOW_SETUP` と同じく開発・E2E 用）。保存されて
 //! いる設定を**書く**（プロセス内の上書きではない - 条件は
@@ -47,35 +57,25 @@
 //! OFF に戻らない（設定画面か新しい DB で戻す）。書くのはこの 1 項目だけで、
 //! `server.enabled`・bind・port はそのまま残す。
 
-use banto_server::{start, static_router, with_security_headers, ServerConfig};
-use chronogazer_core::assets::FrontendAssets;
-use chronogazer_core::audit::AuditEntry;
-use chronogazer_core::audit_spool::{build_audit_service, flush_at_startup};
-use chronogazer_core::backup::BackupService;
-// #383 段階2b / R1-C（C-2）: 収集ランタイム。この単体サーバーも
-// デスクトップアプリと同じく**起動時に自動開始**する（`api_router` に
-// `/api/collect*` を生やす以上、ここを配線しないと「呼べるが何も走って
-// いない」口になる）。
 use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 use banto_hub_bootstrap::KeyStore;
-use chronogazer_core::collect::{resolve_data_dir, CollectorService};
-use chronogazer_core::db::{init_db, Db, InitDbError};
-use chronogazer_core::display_groups::DisplayGroupService;
-use chronogazer_core::events::event_channel;
-use chronogazer_core::hub::{HubService, UnavailableKeyStore};
-use chronogazer_core::instance_lock::{acquire_for_db, ChronoGazerHost};
-use chronogazer_core::rest::{api_router, user_auth_state};
-use chronogazer_core::settings::{store_config, ServerSettings, SettingsService};
-use chronogazer_core::users::UsersService;
-// #383 段階2a / R1-B: レジストリ3サービス。`chronogazer_core::lib.rs`の
-// re-export 経由（`db::DbPool`と同じ理由 - このバイナリ自身は banto-tags を
-// 直接 depend していない）。
-use chronogazer_core::{CollectionGroupService, PlcConnectionService, TagService};
+use banto_server::ServerConfig;
+use chronogazer_core::engine::{EngineConfig, EngineListen, EngineRuntime};
+use chronogazer_core::hub::UnavailableKeyStore;
+use chronogazer_core::instance_lock::ChronoGazerHost;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 8721;
 const DEFAULT_BIND: &str = "0.0.0.0";
 const DEFAULT_DB_PATH: &str = "./banto-dev.sqlite3";
+
+/// Ctrl-C からの終了の予算（`chronogazer_core::engine` のモジュール doc
+/// 「終了の順序」）。開発用なのでデスクトップの 5 秒より長めに取り、
+/// 計画中の `chronogazer-server` の Ctrl-C と同じ 15 秒にする
+/// （docs/chronogazer-service-design.md §3.1(b)）。
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() {
@@ -94,154 +94,6 @@ async fn main() {
 
     let db_path_buf = PathBuf::from(&db_path);
 
-    // #392 A1: 同じ DB を別のプロセス（デスクトップアプリや別の banto-serve）が
-    // 使っていれば、**DB に触れる前**（リストア予約の適用より前）に終了する。
-    // ガードは `main` の終わりまで持つ（Ctrl-C の後始末を抜けるまで）。
-    let _instance_lock = match acquire_for_db(&db_path_buf, ChronoGazerHost::Serve) {
-        Ok(guard) => guard,
-        Err(err) => {
-            eprintln!("banto-serve: {err}");
-            std::process::exit(1);
-        }
-    };
-
-    // Apply any staged restore (spec M17) BEFORE `init_db`/the pool is
-    // created - see `BackupService::apply_pending_restore_at_startup`'s doc
-    // comment for why this must run first. Best-effort at the top level:
-    // a failure here must not prevent the server from starting at all (the
-    // old db, if any, is left untouched on error - see that function's
-    // per-step safety notes).
-    //
-    // I2a（banto #280）: バックアップとリストア予約は DB ファイルごとの
-    // `<DB の親>/backups/<DB ファイル名>/` に置かれる。それより前の共有領域
-    // （`<DB の親>/backups/` 直下・`<DB の親>/restore-pending.sqlite3`）に
-    // ファイルが残っていると、ここで警告を出すだけで、移しも適用もしない
-    // （2026-10-04 オーナー決定: banto の既定どおり、移す処理は作らない）。
-    let applied_restore = match BackupService::apply_pending_restore_at_startup(&db_path_buf).await
-    {
-        Ok(applied) => applied,
-        Err(err) => {
-            eprintln!("banto-serve: 起動時のリストア適用に失敗しました: {err}");
-            None
-        }
-    };
-
-    // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は無い）。
-    // panic のメッセージで済ませず、何をすればよいかを stderr に出して終了する
-    // （`chronogazer_core::db` のモジュール doc「旧形式の DB の拒否」）。
-    let pool = match init_db(&db_path).await {
-        Ok(pool) => pool,
-        Err(InitDbError::Legacy(legacy)) => {
-            eprintln!("banto-serve: {legacy}");
-            std::process::exit(1);
-        }
-        Err(err) => {
-            eprintln!("banto-serve: DB の初期化に失敗しました: {err}");
-            std::process::exit(1);
-        }
-    };
-
-    let events = event_channel();
-    // I2a: users/settings/audit/backup は banto の `banto_admin_services` の
-    // サービス。バックエンドを問わない `Db` ハンドルを受けるので、同じ pool
-    // を `Db::Sqlite` で包んで渡す。
-    let db = Db::Sqlite(pool.clone());
-    let users = UsersService::new(db.clone());
-    let settings = SettingsService::new(db.clone());
-    let backup = BackupService::new(db_path_buf.clone(), db.clone());
-    // #383 段階2b / R1-C（C-2）: 収集サービス用の pool ハンドル。`audit` が
-    // 下で `pool` を消費するので、その前に取っておく。
-    let pool_for_collect = pool.clone();
-    // #383 段階2a / R1-B: レジストリ3サービス。`*Service::new(pool.clone())`
-    // の3行（指示書どおり）- テーブルは `db::init_db` が呼ぶ
-    // `banto_tags::migrate` で既に作成済み。
-    let plc_connections = PlcConnectionService::new(pool.clone());
-    let collection_groups = CollectionGroupService::new(pool.clone());
-    let tags = TagService::new(pool.clone());
-    // #393: 表示グループ（同じ pool）。
-    let display_groups = DisplayGroupService::new(pool.clone());
-    // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・応答しない
-    // 監査は DB の隣の `audit-spool/` に退避し、`record` は 3 秒で戻る
-    // （`chronogazer_core::audit_spool` のモジュール doc）。マイグレーション
-    // （`init_db`、`0008` の `pending_id` を含む）は済んでいるので、前回の実行で
-    // 残った保留をここで 1 回流し込む。定期の流し込みは、最後に失敗しうる起動
-    // 手順（サーバー起動）の後で起こす（下）。
-    let db_dir = match db_path_buf.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let audit = build_audit_service(db, &db_path_buf);
-    flush_at_startup(&audit, "banto-serve").await;
-    // Credential verifier from `chronogazer_core::rest` (spec §8.2),
-    // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
-    // fixed admin/admin check that used to live here directly. Also records
-    // `login`/`login_failed` audit entries (spec M14), and re-checks the
-    // account on every request so deleting/demoting/re-keying it ends its
-    // sessions (banto v1.7.0 #204).
-    let auth = user_auth_state(users.clone(), audit.clone());
-
-    // Spec M17: record `restore_applied` now that a real `AuditLogService`
-    // exists - `apply_pending_restore_at_startup` itself cannot do this (it
-    // runs before any pool/audit service exists at all).
-    if let Some(applied) = applied_restore {
-        audit
-            .record(AuditEntry {
-                actor_username: None,
-                actor_role: None,
-                action: "restore_applied",
-                resource: "backups",
-                entity_id: None,
-                detail: Some(serde_json::json!({
-                    "preRestoreBackupFileName": applied.pre_restore_backup_file_name,
-                })),
-                origin: "rest",
-                result: "ok",
-            })
-            .await;
-        println!(
-            "banto-serve: 起動時にリストアを適用しました（適用前の自動バックアップ: {}）",
-            applied.pre_restore_backup_file_name
-        );
-    }
-
-    // Startup prune (spec M14: "サーバ起動時に1回 + list実行時に軽く" - see
-    // `audit_log_list`'s doc comment in `rest.rs` for why no dedicated
-    // background task is needed beyond this plus that opportunistic prune).
-    // Best-effort: a prune failure here must not stop the server from
-    // starting.
-    match settings.audit_config().await {
-        Ok(config) => {
-            if let Err(err) = audit
-                .prune(config.retention_days, config.retention_rows)
-                .await
-            {
-                eprintln!("banto-serve: 起動時の監査ログの剪定に失敗しました: {err}");
-            }
-        }
-        Err(err) => eprintln!("banto-serve: 監査ログの保持設定の読み取りに失敗しました: {err}"),
-    }
-
-    // 閲覧公開の種まき（admin-template v3.0.0 の `banto-serve.rs` と同じ）。
-    // 新しい `ServerSettings` を作らず読み書きするので、前の実行や設定画面が
-    // 保存した `enabled`/bind/port は残る - このバイナリの待ち受けは
-    // `BANTO_BIND`/`PORT` から決まり、これらのキーは使わないので、ここで
-    // `enabled` を変えると同じ DB を開くデスクトップ版の挙動が黙って変わる。
-    // 剪定と同じく best-effort（失敗しても起動は止めない）。
-    if seed_viewer_public {
-        match settings.server_config().await {
-            Ok(config) => {
-                let seeded = ServerSettings {
-                    viewer_public: true,
-                    ..config
-                };
-                if let Err(err) = settings.set_server_config(&seeded).await {
-                    eprintln!("banto-serve: 閲覧公開設定の保存に失敗しました: {err}");
-                }
-            }
-            Err(err) => eprintln!("banto-serve: サーバー設定の読み取りに失敗しました: {err}"),
-        }
-    }
-
     // #332: この開発用サーバーには OS キーリングが無い（keyring は
     // `src-tauri` だけの依存 - ワークスペース `Cargo.toml` の注記参照）ので、
     // 書き込みが必ず失敗する `UnavailableKeyStore` を渡す。到達確認・
@@ -249,104 +101,53 @@ async fn main() {
     // そのまま動くため、E2E はこのサーバーで実施できる。
     //
     // `BANTO_HUB_MEMORY_KEYS=1`（開発・E2E 用、#383 段階3 P5）のときだけ、キーを
-    // プロセス内メモリに置く `MemoryKeyStore` を渡し、収集にも Hub を繋ぐ（下の
-    // `attach_hub`）。実際の Hub 相手の収集をこのサーバーで通すための入口で、
+    // プロセス内メモリに置く `MemoryKeyStore` を渡し、収集にも Hub を繋ぐ
+    // （`attach_hub`）。実際の Hub 相手の収集をこのサーバーで通すための入口で、
     // 既定ではどちらも変わらない。キーは終了で消える（再起動後の `resume` は
     // 張り直せない）。
     let hub_memory_keys = std::env::var("BANTO_HUB_MEMORY_KEYS")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let key_store: std::sync::Arc<dyn KeyStore> = if hub_memory_keys {
-        std::sync::Arc::new(MemoryKeyStore::new())
+    let key_store: Arc<dyn KeyStore> = if hub_memory_keys {
+        Arc::new(MemoryKeyStore::new())
     } else {
-        std::sync::Arc::new(UnavailableKeyStore)
+        Arc::new(UnavailableKeyStore)
     };
-    let hub = HubService::new(settings.clone(), key_store)
-        .await
-        .expect("HubService should initialize");
 
-    // #383 段階1: 保存済みの接続と選択タグがあれば購読を張り直す。この
-    // サーバーは `UnavailableKeyStore` なので実際には keyring からキーを
-    // 取り出せず、購読状態は理由付きの「停止」になる - それでも呼ぶのは、
-    // 起動経路をデスクトップと同じ形にしておくため。**起動は止めない**。
-    {
-        let hub = hub.clone();
-        tokio::spawn(async move { hub.resume().await });
-    }
-
-    // #383 段階2b / R1-C（C-2）: 収集ランタイム。`data.dir` の相対パスは
-    // **DB ファイルの置き場を基準**に解決する - デスクトップ側が
-    // 「アプリのデータディレクトリ基準」で解決しているのと同じ考え方で、
-    // そちらでも DB はそのディレクトリに置かれている。既定値 `"./data"` を
-    // そのまま使うとプロセスの作業ディレクトリに時系列ファイルを作って
-    // しまうので、ここで基準を決めておく（`resolve_data_dir` の doc）。
-    // `BANTO_DB` がファイル名だけのとき `parent()` は空になるので、
-    // そのときは作業ディレクトリ（`"."`）を基準にする。
-    let data_base = db_dir;
-    let store_settings = store_config(&settings).await.unwrap_or_else(|err| {
-        eprintln!("banto-serve: 時系列データの保存設定の読み取りに失敗しました（既定値で続行します）: {err}");
-        Default::default()
-    });
-    let collect_data_dir = resolve_data_dir(&data_base, &store_settings.data_dir);
-    let collect = CollectorService::new(pool_for_collect, collect_data_dir);
-    if hub_memory_keys {
-        // 自動開始（下で spawn）より前に繋ぐ。
-        collect.attach_hub(hub.clone());
-    }
-
-    // 保持期間を過ぎた時系列データファイルの削除（#538）。起動時に 1 回、その後は
-    // 日付が変わるたびに 1 回。失敗してもログに出すだけで、収集は止めない。
-    // 削除は収集サービス経由（書き手が今開いている日付のファイルは消さない）。
-    chronogazer_core::retention::spawn(settings.clone(), collect.clone());
-
-    // 起動時の自動開始（docs/r1-plan.md の R1-C）。`hub.resume()` と同じく
-    // **spawn して投げっぱなし** - 失敗しても起動は止めず、理由は状態に残る
-    // （`CollectorService::autostart` の doc）。**レジストリを後から編集
-    // しても自動では再起動しない**（反映は `POST /api/collect/restart`）。
+    // #383 段階2b / R1-C（C-2）: `data.dir` の相対パスは **DB ファイルの置き場を
+    // 基準**に解決する（デスクトップが「アプリのデータディレクトリ基準」で解決
+    // しているのと同じ考え方で、そちらでも DB はそのディレクトリにある）。
+    // `BANTO_DB` がファイル名だけのときは作業ディレクトリ（`"."`）を基準にする。
     //
-    // デスクトップアプリとこのサーバーが同じ DB を同時に開くことは、冒頭の
-    // 単一インスタンス排他（`_instance_lock`）が防ぐ。
+    // 待ち受けは `BANTO_BIND`/`PORT` から決まり、保存済みの `server.*` 設定は
+    // 使わない（必須: 開けなければ起動を止める）。
+    let engine = match EngineRuntime::start(EngineConfig {
+        data_base: EngineConfig::db_dir_of(&db_path_buf),
+        db_path: db_path_buf,
+        key_store,
+        attach_hub: hub_memory_keys,
+        host: ChronoGazerHost::Serve,
+        listen: EngineListen::Required(ServerConfig { bind, port }),
+        allow_setup,
+        seed_viewer_public,
+        log_label: "banto-serve",
+        audit_origin: "rest",
+    })
+    .await
     {
-        let collect = collect.clone();
-        tokio::spawn(async move { collect.autostart().await });
-    }
-
-    // `with_security_headers`（banto #500）は最後（最外）に掛ける
-    // （静的 UI・`/api/*`・SSE のすべてに付く。デスクトップ側の
-    // `start_embedded_server` と同じ構成）。
-    let audit_for_spool = audit.clone();
-    let app = with_security_headers(
-        api_router(
-            users,
-            settings,
-            audit,
-            backup,
-            hub,
-            plc_connections,
-            collection_groups,
-            tags,
-            collect.clone(),
-            display_groups,
-            auth,
-            events,
-            allow_setup,
-        )
-        .merge(static_router::<FrontendAssets>()),
-    );
-
-    let server = start(ServerConfig { bind, port }, app)
-        .await
-        .expect("server should start");
-
-    // #437: 定期の流し込みは、起動の失敗しうる手順がすべて済んでから起こす
-    // （先に起こすと、失敗して戻る経路にタスクが残る。banto-hub #557 の指摘）。
-    // 終了時に止める。
-    let audit_spool_handle = audit_for_spool.spawn_spool_flusher();
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("banto-serve: {err}");
+            std::process::exit(1);
+        }
+    };
 
     println!("banto-serve: DB at {db_path}");
     println!("banto-serve: listening at:");
-    for url in chronogazer_core::listening_urls(server.local_addr()) {
-        println!("  {url}");
+    if let Some(addr) = engine.server_slot().local_addr().await {
+        for url in chronogazer_core::listening_urls(addr) {
+            println!("  {url}");
+        }
     }
     if allow_setup {
         println!("banto-serve: first-run setup is ENABLED (BANTO_ALLOW_SETUP=1) - POST /api/auth/setup will create the first account");
@@ -364,22 +165,7 @@ async fn main() {
         .await
         .expect("failed to listen for ctrl-c");
     println!("banto-serve: shutting down");
-    // #392 A2 レビュー: 終了処理の取り消せない印を立て、以降の開始（まだ止めて
-    // いない REST・遅れて動いた自動開始）を断る。下の `collect.stop()` より前に
-    // 立てるので、その停止が終端の操作になる（`collect` の doc「終了の受付」。
-    // `src-tauri` の `shutdown_app_state` と同じ）。
-    let _ = collect.begin_shutdown();
-    server.stop().await;
-    if let Some(handle) = &audit_spool_handle {
-        // 流し込みの途中で止めても、ファイルは行が入ってから消すので失われない
-        // （次の起動で同じ `pending_id` を流し直し、1 行になる）。
-        handle.abort();
-    }
-    // #383 段階2b / R1-C（C-2）: 収集（書き手）は**消費者を止めた後**に止める
-    // - `src-tauri` の `shutdown_app_state` と同じ順序（理由はあちらの doc）。
-    // ここを通らないと、tstore の最後の未 flush 分が落ちる。失敗しても
-    // 終了は止めない。
-    if let Err(err) = collect.stop().await {
-        eprintln!("banto-serve: 終了時の収集の停止に失敗しました: {err}");
-    }
+    // デスクトップの `shutdown_app_state` と同じ順序（`chronogazer_core::engine`）。
+    // 失敗（最終 flush・予算切れ）はエンジンが標準エラー出力に出す。
+    let _report = engine.shutdown(SHUTDOWN_BUDGET).await;
 }

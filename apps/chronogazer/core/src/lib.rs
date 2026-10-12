@@ -15,6 +15,9 @@ pub mod db;
 // #393（#524 の段階 1）: 表示グループのデータモデル・検証・サービス。REST と
 // Tauri の両方が同じ検証関数・同じサービスを使う（モジュール doc 参照）。
 pub mod display_groups;
+// #392 段階 B（B1-1）: 起動と終了の組み立て（`EngineRuntime`）。`banto-serve` が
+// 使い、B1-2 でデスクトップ（`src-tauri`）も乗り換える - モジュール doc 参照。
+pub mod engine;
 pub mod events;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
