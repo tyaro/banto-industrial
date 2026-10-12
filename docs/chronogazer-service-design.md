@@ -1,8 +1,8 @@
 # ChronoGazer のサービス化（#392 段階 B）設計・計画
 
 作成日: 2026-10-12
-状態: **計画確定（2026-10-12 オーナー決定「おすすめで」）、B1-1（engine 抽出）実装済み・B1-2 以降は未実装**。#588 は実装済み。B1-1 で `chronogazer_core::engine`（`EngineRuntime`）を新設し `banto-serve` を乗り換えた（デスクトップの乗り換えは B1-2）。
-最終更新: 2026-10-12（B1-1 を実装: §4 の表の後に実装メモ）。2026-10-12（初版。調査の基準は main=970993e。論点 1〜14 のオーナー決定と H9 の決定（既存の `%APPDATA%` のデータは移行しない）を記録）
+状態: **計画確定（2026-10-12 オーナー決定「おすすめで」）、B1-1（engine 抽出）・B1-2（デスクトップの乗り換え）実装済み・B1-3 以降は未実装**。#588 は実装済み。B1-1 で `chronogazer_core::engine`（`EngineRuntime`）を新設し `banto-serve` を乗り換え、B1-2 でデスクトップ（`src-tauri`）も乗り換えた。
+最終更新: 2026-10-12（B1-2 を実装: §4 の B1-1 の実装メモの後に B1-2 の実装メモ。§1.2 の `ExitCleanupOnce` の行は済み）。2026-10-12（B1-1 を実装: §4 の表の後に実装メモ）。2026-10-12（初版。調査の基準は main=970993e。論点 1〜14 のオーナー決定と H9 の決定（既存の `%APPDATA%` のデータは移行しない）を記録）
 
 [plan.md](plan.md) §5 の #392（H6〜H11）の段階 B を、実装できる粒度に落とした計画書。R0 の「UI と独立」
 （[recorder-requirements.md](recorder-requirements.md) §4）を B で満たす。banto-hub 側の前例は
@@ -43,19 +43,19 @@
 
 ### 1.2 ChronoGazer での扱い
 
-| 部品                                                                                                         | 判断                                                                                                | 理由                                                                            |
-| ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `ServiceManager`・`ScmState`・`TransitionHandle`・`MockServiceManager`・`WindowsServiceManager::for_service` | 共有 crate へ抽出（仮称 `crates/banto-service-control`）                                            | 既にサービス名を引数で受ける。chronogazer-core を banto-hub-core に依存させない |
-| `service_install::install/uninstall`（sink も写し）                                                          | 抽出して引数化（`ServiceSpec { name, display, exe, args, start_type }`）                            | 3 つ目の写しを作らない                                                          |
-| `run_service_dispatcher`・`StoppedGate`・状態報告                                                            | 抽出（汎用のサービス本体ランナー。STOP と PRESHUTDOWN、停止中は `StopPending` と wait_hint）        | PRESHUTDOWN をここで 1 回だけ実装                                               |
-| `service_operators`                                                                                          | 抽出して引数化                                                                                      | ChronoGazer 用のグループ名                                                      |
-| `service_elevated` の Win32 部分                                                                             | ライブラリとして抽出、昇格する exe は製品ごと（`chronogazer-elev.exe`）                             | 昇格の境界は製品ごとに監査                                                      |
-| `hub_health` の trait・`host_switch` の engine                                                               | 抽出（汎用化。probe の HTTP 実装はパスと同一性検証を引数に）                                        | ChronoGazer は `/api/host` を見る                                               |
-| `hub_slot::HubSlot<T>`                                                                                       | B2 で切替を入れるなら共有へ                                                                         | 入れないなら不要                                                                |
-| `ExitCleanupOnce`                                                                                            | ChronoGazer の `exit_cleanup_once` を `banto_desktop_tray::ExitCleanupOnce` に寄せる（#392 の残件） | B2 で終了経路を触る                                                             |
-| `hub_log`                                                                                                    | 抽出。ChronoGazer は stderr もログファイルへ向け直す（`SetStdHandle`）                              | core と依存 crate が `eprintln!` を直接使う（30 か所以上）                      |
-| NSIS の `StopServiceIfRunning`                                                                               | 共通 `.nsh` に切り出し両インストーラから `!include`                                                 | H11 を同じ手順に                                                                |
-| profile の概念                                                                                               | 持ち込まない（1 台 1 インスタンス、A1 の排他単位は DB の正規化パスのまま）                          | YAGNI。ルート上書きの env だけ                                                  |
+| 部品                                                                                                         | 判断                                                                                                                 | 理由                                                                            |
+| ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `ServiceManager`・`ScmState`・`TransitionHandle`・`MockServiceManager`・`WindowsServiceManager::for_service` | 共有 crate へ抽出（仮称 `crates/banto-service-control`）                                                             | 既にサービス名を引数で受ける。chronogazer-core を banto-hub-core に依存させない |
+| `service_install::install/uninstall`（sink も写し）                                                          | 抽出して引数化（`ServiceSpec { name, display, exe, args, start_type }`）                                             | 3 つ目の写しを作らない                                                          |
+| `run_service_dispatcher`・`StoppedGate`・状態報告                                                            | 抽出（汎用のサービス本体ランナー。STOP と PRESHUTDOWN、停止中は `StopPending` と wait_hint）                         | PRESHUTDOWN をここで 1 回だけ実装                                               |
+| `service_operators`                                                                                          | 抽出して引数化                                                                                                       | ChronoGazer 用のグループ名                                                      |
+| `service_elevated` の Win32 部分                                                                             | ライブラリとして抽出、昇格する exe は製品ごと（`chronogazer-elev.exe`）                                              | 昇格の境界は製品ごとに監査                                                      |
+| `hub_health` の trait・`host_switch` の engine                                                               | 抽出（汎用化。probe の HTTP 実装はパスと同一性検証を引数に）                                                         | ChronoGazer は `/api/host` を見る                                               |
+| `hub_slot::HubSlot<T>`                                                                                       | B2 で切替を入れるなら共有へ                                                                                          | 入れないなら不要                                                                |
+| `ExitCleanupOnce`                                                                                            | ChronoGazer の `exit_cleanup_once` を `banto_desktop_tray::ExitCleanupOnce` に寄せる（#392 の残件。**B1-2 で済み**） | B2 で終了経路を触る                                                             |
+| `hub_log`                                                                                                    | 抽出。ChronoGazer は stderr もログファイルへ向け直す（`SetStdHandle`）                                               | core と依存 crate が `eprintln!` を直接使う（30 か所以上）                      |
+| NSIS の `StopServiceIfRunning`                                                                               | 共通 `.nsh` に切り出し両インストーラから `!include`                                                                  | H11 を同じ手順に                                                                |
+| profile の概念                                                                                               | 持ち込まない（1 台 1 インスタンス、A1 の排他単位は DB の正規化パスのまま）                                           | YAGNI。ルート上書きの env だけ                                                  |
 
 抽出だけの PR（挙動不変、hub と sink の既存テストが green）を先に出し、ChronoGazer が使う PR は後。
 
@@ -149,6 +149,21 @@
 - LAN の listener は **bind（ポートの確保）だけを自動開始より前**に行い、serve は後にした（§3.1(a) の順序からの変更）。`EngineListen::Required` で bind できなければ、収集・Hub の張り直し・保持期間の掃除を始めずに `Err` で戻る（失敗して戻る経路にタスクを残さない）。デスクトップの LAN の自動起動は `EngineListen::BestEffort`（失敗しても起動を続ける）。
 - 終了の予算は呼び出し側が渡す（デスクトップ 5 秒、`banto-serve` 15 秒）。済んだ手順は `ShutdownReport::completed` に順に残る。A1 の排他は `shutdown` では返さず、`RunningEngine` の drop で返す。
 - `banto-serve` の環境変数と既定値は不変。変わったのは終了の順序（Hub の購読の停止と pool を閉じる手順が加わった）と、起動の失敗（Hub の初期化・ポートの使用中）が panic ではなく終了コード 1 になったこと。
+
+**B1-2 の実装メモ（2026-10-12、実装済み）**:
+
+- `src-tauri` の `setup` は `EngineRuntime::open` → 窓（今までどおり DB を開けた後）→ `opened.events()` の webview への転送 → `lan_autostart_allowed` で `with_listen(BestEffort|Disabled)` → `start` → 自動ログイン（`initial_desktop_session` に切り出した）・Acrylic → `AppState` → トレイ。A1 の排他・旧形式の DB はエラーの窓（今までどおり）、それ以外の起動の失敗は今までどおり panic。
+- `AppState` はセッションまわり（`auth`・`auth_io`・`auth_config_lock`）と `services: EngineServices`・`server: Arc<ServerSlot>`（エンジンの slot）だけを持つ。`server_apply` は `ServerSlot::lock()`、LAN のルーターは `EngineServices::router(false)`。重複していたサービスの組み立て・`start_embedded_server`・監査の流し込みのハンドル・A1 のガードの管理状態は消した。Tauri のコマンドの中身は `state.x` → `state.services.x` の機械的な置き換えだけ。
+- 終了: `shutdown_app_state` は `RunningEngine::shutdown` を `ExitCleanupReport` に写すだけ。1 回化は `banto_desktop_tray::ExitCleanupOnce` に寄せ、banto-hub の `run_exit_cleanup` と同じ形（本体の結果の記録はワーカーの中で公開の前に 1 回、待ちの打ち切りは各呼び出しが記録）。予算は今までどおりトレイの終了・`RunEvent::Exit` とも 5 秒。待ちが期限で切れたときもトレイには `timed_out` を返し、#585 の失敗のダイアログの情報を落とさない。トレイの終了は条件変数で待つので tokio のワーカーではなく専用のスレッドから呼ぶ。
+- engine に `EngineConfig::store_config_required` を足した（下の差 (1)）。
+- B1-1 の engine の doc が挙げた、B1-1 より前のデスクトップとの差の扱い:
+  1. 保存設定（`data.dir`）を読めないとき: engine は既定値で続行していたが、**デスクトップは今までどおり起動を止める**（`store_config_required: true`、`EngineStartError::StoreConfig` で panic。既定値で続けると別の場所を設定していた利用者の時系列データを違う場所へ書き始めるため）。`banto-serve` は既定値で続行のまま。
+  2. 起動時にリストアを適用したときの標準出力の 1 行: 受け入れた（リリースビルドのデスクトップは標準出力が見えない。監査の `restore_applied` は今までどおり）。
+  3. 自動ログインが Hub と収集の組み立ての後: 受け入れた（どちらも spawn して投げっぱなし、`AppState` はその後に作るので Tauri のコマンドはまだ受けない。監査の `login` の記録の時刻が数ミリ秒遅れるだけ）。
+  4. LAN の bind が自動開始の spawn より前: 受け入れた（serve は後。bind の失敗は今までどおりログだけで起動を続ける）。
+  5. 保持期間の掃除を終了で abort: 受け入れた（以前はプロセスの終わりまで放っておいた。消すのは古い日付のファイルだけで、途中で止めても次の起動で続きを消す）。
+- ほかの観測できる差: 終了の後始末の結果を標準エラー出力に 1 行出す（「終了の後始末が完了しました（トレイの終了）」など。banto-hub と同じ）。
+- 検証: Windows の実機で、試験専用の identifier（`dev.tyaro.chronogazer.b12check`）のビルドを開発用 PLC 相手に動かし、(a) トレイの「終了」・(b) `WM_QUERYENDSESSION` → `WM_ENDSESSION` の模擬の両方で `collection_stopped` と終了直前の行が残り `-wal`/`-shm` が畳まれること、(c) `banto-serve` が同じ DB を使用中のときのエラーの窓と、2 つ目の起動でその窓が前に出ること、(d) 保存済みの LAN のポートが塞がっていても起動を続けること・Tauri の `server_apply` での入れ切り・2 つ目の起動で隠した窓が前に出ることを自動で確かめた。OS の実際のサインアウトはしていない（B3-5）。
 
 ## 5. 論点と決定（2026-10-12 オーナー決定「おすすめで ok」= すべて推奨どおり）
 

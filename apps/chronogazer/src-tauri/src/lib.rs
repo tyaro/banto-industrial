@@ -21,48 +21,60 @@
 //! #392 A2 (docs/plan.md §5 H6 の A): the app is **tray-resident** - closing
 //! the main window hides it and collection keeps running; the tray's 「終了」
 //! (after a confirmation) runs the same exit cleanup as `RunEvent::Exit`
-//! exactly once ([`exit_cleanup_once`]). A second launch focuses the existing
+//! exactly once ([`exit_cleanup`]). A second launch focuses the existing
 //! window (`tauri-plugin-single-instance`). See the [`tray`] module doc.
+//!
+//! #392 B1-2 (docs/chronogazer-service-design.md §4): startup and exit are the
+//! engine's (`chronogazer_core::engine`, shared with `banto-serve` and the
+//! future headless/service hosts). `setup()` opens it (A1 lock → staged
+//! restore → `init_db`), creates the window, decides the LAN auto-start, then
+//! starts it (services → Hub → collection → listener) and keeps only the
+//! desktop-only parts (window, webview event forwarding, autologin, Acrylic,
+//! tray, OS keyring). `AppState` holds the engine's service handles
+//! (`EngineServices`) and its LAN listener slot; the exit cleanup is the
+//! engine's shutdown, run once through the shared
+//! `banto_desktop_tray::ExitCleanupOnce` ([`exit_cleanup`]).
 
 mod keyring_store;
 mod tray;
 
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_server::{
-    bind as bind_listener, lan_urls_for_bind, static_router, with_security_headers, AuthState,
-    BoundServer, GrantKind, RunningServer, ServerConfig, ServerEvent,
+    bind as bind_listener, lan_urls_for_bind, BoundServer, GrantKind, RunningServer, ServerConfig,
 };
-use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogList, AuditLogService};
-use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+use chronogazer_core::backup::{BackupInfo, PendingRestoreInfo};
 // #383 段階2b / R1-C: 収集サービス。C-2 で `collect_*` コマンドと起動時の
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
-    registry_exclusions, resolve_data_dir, validate_history_request, CollectEventList,
-    CollectHistory, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
-    EventPage, ExclusionView, Readout, ValuesResponse, COLLECT_AUDIT_RESOURCE,
-    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    registry_exclusions, validate_history_request, CollectEventList, CollectHistory,
+    CollectOutcome, CollectorStateView, ConnectionView, EventPage, ExclusionView, Readout,
+    ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
-use chronogazer_core::db::{init_db, Db, InitDbError};
+use chronogazer_core::db::InitDbError;
 // #393: 表示グループ。検証・保存は REST と同じ `DisplayGroupService`。
 use chronogazer_core::display_groups::{
     audit_detail as display_group_audit_detail, DisplayGroup, DisplayGroupPayload,
     DisplayGroupService, AUDIT_RESOURCE as DISPLAY_GROUPS_RESOURCE,
 };
-use chronogazer_core::events::event_channel;
+// #392 B1-2: 起動と終了は `banto-serve` と共有のエンジン。
+use chronogazer_core::engine::{
+    EngineConfig, EngineListen, EngineRuntime, EngineServices, EngineStartError, RunningEngine,
+    ServerSlot,
+};
+use chronogazer_core::instance_lock::ChronoGazerHost;
 // #532: 記録計の側のタグごとのしきい値。検証・保存は REST と同じ `TagThresholdService`。
-use chronogazer_core::hub::{HubCatalogView, HubService, HubSubscriptionView, HubView};
+use chronogazer_core::hub::{HubCatalogView, HubSubscriptionView, HubView};
 use chronogazer_core::hub_tags::{
     register_from_hub, registration_audit_detail, HubRegistrationResult, HubTagRegistration,
 };
 use chronogazer_core::rest::{
-    api_router, plc_connection_audit_detail, update_plc_connection, user_auth_state,
-    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, TagPayload,
+    plc_connection_audit_detail, update_plc_connection, CollectionGroupPayload,
+    PlcConnectionPayload, PlcConnectionResponse, TagPayload,
 };
 use chronogazer_core::settings::{
-    auth_server_combination_allowed, store_config, AuditSettings, AuthSettings, ServerSettings,
-    SettingsService,
+    auth_server_combination_allowed, AuditSettings, AuthSettings, ServerSettings, SettingsService,
 };
 use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
 use chronogazer_core::tag_address::{
@@ -78,15 +90,16 @@ use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
 // re-export 経由（invariant: このクレートは banto-tags を直接 depend
 // しない - `db::DbPool` と同じ理由）。
-use chronogazer_core::{
-    CollectionGroup, CollectionGroupService, PlcConnectionService, Tag, TagService,
-};
+use chronogazer_core::{CollectionGroup, Tag};
+// #392 B1-2: 終了の後始末を 1 回に限る入れ物（banto-hub と共有、#586）。
+use banto_desktop_tray::{ExitCleanupOnce, ExitCleanupOutcome};
 use qrcode::render::svg;
 use qrcode::QrCode;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -112,7 +125,7 @@ struct AppState {
     /// write [`AppState::auth`] (credential verification / first-user setup,
     /// the auth-mode read, and `auth_config_apply`'s save), injected so tests
     /// can hold a command at that point and fix the completion order (banto
-    /// design §8.3). Production wraps `users`/`settings` below
+    /// design §8.3). Production wraps `services.users`/`services.settings`
     /// ([`AuthIo::production`]).
     auth_io: AuthIo,
     /// Serializes "read the auth-mode settings, decide, act on the decision"
@@ -127,78 +140,37 @@ struct AppState {
     /// std `Mutex` that is never held across an `.await`, so nothing can
     /// hold it while waiting for this lock - the reverse order cannot occur.
     auth_config_lock: AsyncMutex<()>,
-    /// The local credential store (spec §8.2): argon2id-hashed accounts in
-    /// the same SQLite settings DB as `settings` below. Shared with
-    /// `rest_auth`'s verifier closure so the webview session and the
-    /// embedded-server session always check the same accounts.
-    users: UsersService,
-    /// App settings (spec §12.1), including the embedded-server config
-    /// (spec §11.2/§11.4's enabled/bind/port).
-    settings: SettingsService,
-    /// App-wide resource-change/notice broadcast (spec §3.5): future
-    /// mutating services (R1-B) feed this, and it is fanned out two ways -
-    /// to the webview via the `banto://event` forwarding task spawned in
-    /// `setup()`, and (only while the embedded server is running) to LAN
-    /// browser clients via `GET /api/events` (`banto_server::sse_route`).
-    events: broadcast::Sender<ServerEvent>,
-    /// The embedded REST/SSE server's own bearer-token auth state
-    /// (`banto_server::AuthState`). Deliberately a SEPARATE token space from
-    /// `auth` above: the webview window never logs in through
-    /// `/api/auth/login`, so a LAN browser client logging in does not
-    /// implicitly authenticate the desktop window, and vice versa - each is
-    /// its own session, over its own transport (both sessions ultimately
-    /// check the same `users` credential store, though).
-    rest_auth: AuthState,
-    /// `Some` while LAN access is enabled and successfully bound; `None`
-    /// otherwise (disabled, or a previous bind attempt failed - see
-    /// `server_apply`).
-    server: AsyncMutex<Option<RunningServer>>,
-    /// Audit trail (spec M14): every mutating command below records a
-    /// `create`/`update`/`delete`/`password_reset`/`settings_change`/
-    /// `login`/`login_failed`/`logout`/`setup` entry here (`origin:
-    /// "tauri"`) once it has already succeeded, and [`require_role`] records
-    /// `denied` when an active session's role is too low. Shares the same
-    /// pool as `users`/`settings` (all three are `Clone` handles onto
-    /// the one on-disk SQLite DB, see `run()`'s `setup()`).
-    audit: AuditLogService,
-    /// Hub 接続（#332）: banto-hub への自動接続 bootstrap。OS キーリング
-    /// （`keyring_store::KeyringKeyStore`）と設定 KV を
-    /// `chronogazer_core::hub` が結び付けたもの。`Clone` ハンドル（内部は
-    /// `Arc`）なので、`start_embedded_server` にも同じ実体を渡して LAN
-    /// ブラウザの `/api/hub/*` とデスクトップの `hub_*` コマンドが同じ
-    /// 設定・同じキーリングを見るようにする。
-    hub: HubService,
-    /// Backup/restore (spec M17): `VACUUM INTO` snapshots into
-    /// `backups/<DB file name>/` next to the DB file (banto #280: per DB
-    /// file), plus the restore staging flow. banto's
-    /// `banto_admin_services::backup::BackupService` since I2a. Shares the
-    /// same pool as `users`/`settings`/`audit` - only its `db_path` is
-    /// unique to this service (needed to resolve that directory and the
-    /// `restore-pending.sqlite3` inside it, see that module's doc comment).
-    backup: BackupService,
-    /// #383 段階2a / R1-B: レジストリ3サービス（PLC接続/収集グループ/
-    /// タグ）。`users`/`settings`/`audit` と同じ pool を共有する `Clone`
-    /// ハンドル。`start_embedded_server` にも同じ実体を渡して、LAN
-    /// ブラウザの `/api/plc-connections|collection-groups|tags/*` と
-    /// デスクトップの `plc_connections_*`/`collection_groups_*`/`tags_*`
-    /// コマンドが同じレジストリを見るようにする。
-    plc_connections: PlcConnectionService,
-    collection_groups: CollectionGroupService,
-    tags: TagService,
-    /// #383 段階2b / R1-C: 収集ランタイム。**起動時に自動開始**し
-    /// （`setup()` が `CollectorService::autostart` を spawn する）、
-    /// `collect_*` コマンドと LAN ブラウザの `/api/collect*` が同じ実体を
-    /// 操作する。収集は「PLC から読んで tstore に書く」側なので、Tauri の
-    /// managed state が drop されないこのアプリでは、[`shutdown_app_state`]
-    /// が唯一の「止める場所」になる。
-    collect: CollectorService,
-    /// The one SQLite pool every service above is a `Clone` handle onto,
-    /// kept here solely so [`shutdown_app_state`] can `close()` it when the
-    /// app exits (flushing/removing the `-wal`/`-shm` sidecar files instead
-    /// of leaving them for the next launch to recover). Named through
-    /// `chronogazer_core`'s `DbPool` alias so this crate keeps its invariant
-    /// of adding no dependencies of its own (no direct `sqlx`).
-    pool: chronogazer_core::db::DbPool,
+    /// The engine's service handles (#392 B1-2: built by
+    /// `chronogazer_core::engine::OpenedEngine::start`, shared with
+    /// `banto-serve`; each is a `Clone` handle onto the one on-disk SQLite
+    /// pool). The webview's Tauri commands and the embedded LAN server's
+    /// `/api/*` (`EngineServices::router`) use the SAME handles, so both see
+    /// the same accounts (`users` - the webview session and the REST session
+    /// check the same credential store, spec §8.2), settings, Hub connection
+    /// (#332, OS keyring via `keyring_store::KeyringKeyStore`), registry
+    /// (#383 R1-B), collection runtime (#383 R1-C, auto-started by the
+    /// engine) and audit trail (spec M14: every mutating command below
+    /// records its entry with `origin: "tauri"` once it has succeeded, and
+    /// [`require_role`] records `denied`).
+    ///
+    /// `services.rest_auth` is the embedded REST/SSE server's own bearer-token
+    /// auth state - deliberately a SEPARATE token space from `auth` above:
+    /// the webview window never logs in through `/api/auth/login`, so a LAN
+    /// browser client logging in does not implicitly authenticate the
+    /// desktop window, and vice versa. `services.events` is the app-wide
+    /// resource-change/notice broadcast (spec §3.5), fanned out to the
+    /// webview (`banto://event`, `setup()`) and, while the embedded server
+    /// runs, to LAN browsers (`GET /api/events`).
+    ///
+    /// Nothing here is stopped by `AppState`: the exit cleanup stops the
+    /// engine itself ([`shutdown_app_state`]).
+    services: EngineServices,
+    /// The embedded LAN server: `Some` while LAN access is enabled and
+    /// successfully bound; `None` otherwise (disabled, or a previous bind
+    /// attempt failed - see `server_apply`). The engine's own slot
+    /// (`RunningEngine::server_slot`), so the engine's shutdown stops
+    /// whatever `server_apply` last put here.
+    server: Arc<ServerSlot>,
 }
 
 /// Result of `auth_login`/`auth_setup`. `superseded`/`seq` (banto #260,
@@ -459,12 +431,13 @@ async fn read_session_source(
 ) -> Result<Option<DesktopSession>, BantoError> {
     Ok(match cached {
         DesktopSession::Account(session) => state
+            .services
             .users
             .get_by_username(&session.username)
             .await?
             .map(DesktopSession::Account),
         DesktopSession::AuthDisabledLocal(session) => {
-            let config = state.settings.auth_config().await?;
+            let config = state.services.settings.auth_config().await?;
             config.disabled.then(|| {
                 DesktopSession::AuthDisabledLocal(UserIdentity {
                     role: config.disabled_role,
@@ -615,6 +588,7 @@ async fn require_role(
         Some(identity) if identity.role.at_least(min) => Ok(identity),
         Some(identity) => {
             state
+                .services
                 .audit
                 .record(AuditEntry {
                     actor_username: Some(&identity.username),
@@ -673,7 +647,7 @@ fn ping() -> &'static str {
 #[tauri::command]
 async fn auth_status(state: State<'_, AppState>) -> Result<AuthStatusResult, BantoError> {
     Ok(AuthStatusResult {
-        initialized: state.users.is_initialized().await?,
+        initialized: state.services.users.is_initialized().await?,
     })
 }
 
@@ -717,12 +691,20 @@ async fn setup_body(
     // is ever installed. Checked on entry so no account is created for a
     // setup that could not sign in; checked again at the install below
     // (the mode can be switched on while the account is being created).
-    if state.settings.auth_config().await?.disabled {
+    if state.services.settings.auth_config().await?.disabled {
         return Ok(auth_disabled_login_result(state));
     }
     match (state.auth_io.setup_first_user)(username, password, display_name).await {
         Ok(identity) => {
-            record_ok(&state.audit, &identity, "setup", "auth", None, None).await;
+            record_ok(
+                &state.services.audit,
+                &identity,
+                "setup",
+                "auth",
+                None,
+                None,
+            )
+            .await;
             install_account_unless_auth_disabled(state, seq_at_entry, identity).await
         }
         Err(err @ BantoError::Validation { .. }) => Err(err),
@@ -771,7 +753,7 @@ async fn install_account_unless_auth_disabled(
     identity: UserIdentity,
 ) -> Result<LoginResult, BantoError> {
     let _auth_config = state.auth_config_lock.lock().await;
-    if state.settings.auth_config().await?.disabled {
+    if state.services.settings.auth_config().await?.disabled {
         return Ok(auth_disabled_login_result(state));
     }
     Ok(install_login(
@@ -829,18 +811,27 @@ async fn login_body(
     // the (slow) password check, which then records nothing; and again at
     // the install, after the check (see
     // [`install_account_unless_auth_disabled`]).
-    if state.settings.auth_config().await?.disabled {
+    if state.services.settings.auth_config().await?.disabled {
         return Ok(auth_disabled_login_result(state));
     }
     match (state.auth_io.verify)(username.clone(), password).await? {
         Some(identity) => {
             // Recorded at verification success, before the install decides
             // (design §1.7, decision 7) - as for a superseded login.
-            record_ok(&state.audit, &identity, "login", "auth", None, None).await;
+            record_ok(
+                &state.services.audit,
+                &identity,
+                "login",
+                "auth",
+                None,
+                None,
+            )
+            .await;
             install_account_unless_auth_disabled(state, seq_at_entry, identity).await
         }
         None => {
             state
+                .services
                 .audit
                 .record(AuditEntry {
                     // Bounded like the REST path (banto #278, admin-template
@@ -954,7 +945,7 @@ async fn logout_body(state: &AppState) -> Result<LogoutResult, BantoError> {
     };
     if let Some(session) = previous {
         record_ok(
-            &state.audit,
+            &state.services.audit,
             session.identity(),
             "logout",
             "auth",
@@ -965,7 +956,7 @@ async fn logout_body(state: &AppState) -> Result<LogoutResult, BantoError> {
     }
     // Only `Installed` can happen here: with `seq` unchanged since the clear,
     // the slot is empty.
-    record_local_rebind(&state.audit, &rebind).await;
+    record_local_rebind(&state.services.audit, &rebind).await;
     Ok(LogoutResult { seq })
 }
 
@@ -1081,6 +1072,7 @@ async fn change_own_password(
         None => return Err(BantoError::Unauthorized),
     };
     let new_epoch = state
+        .services
         .users
         .change_password(&identity.username, current_password, new_password)
         .await?;
@@ -1106,7 +1098,7 @@ async fn change_own_password(
     // neither the old nor the new password (nor any hash) may ever be
     // recorded.
     record_ok(
-        &state.audit,
+        &state.services.audit,
         &identity,
         "password_change",
         "users",
@@ -1368,7 +1360,7 @@ async fn auth_config_get(state: State<'_, AppState>) -> Result<AuthSettings, Ban
 /// (the ESCAPE HATCH of [`auth_config_apply_body`]).
 async fn auth_config_get_body(state: &AppState) -> Result<AuthSettings, BantoError> {
     require_role(state, Role::Viewer, "settings").await?;
-    state.settings.auth_config().await
+    state.services.settings.auth_config().await
 }
 
 /// Toggle auth-disabled mode and its synthetic-identity role (spec M11).
@@ -1441,7 +1433,7 @@ async fn auth_config_apply_body(
     // unable to determine ANY role for the synthetic identity.
     let role = Role::from_str(disabled_role).unwrap_or(Role::Admin);
 
-    let mut config = state.settings.auth_config().await?;
+    let mut config = state.services.settings.auth_config().await?;
     // The settings before this apply (read under `auth_config_lock`, so no
     // other apply changes them meanwhile): a change of the mode's role while
     // the mode stays on always advances `seq` at the rebind below (S-98).
@@ -1453,9 +1445,9 @@ async fn auth_config_apply_body(
         // (`SettingsService::set_auth_config`), but should any save fail
         // part-way, the session must still follow what IS stored: re-read
         // it and re-bind/end from that, then report the error.
-        if let Ok(stored) = state.settings.auth_config().await {
+        if let Ok(stored) = state.services.settings.auth_config().await {
             let (rebind, ended_local) = apply_mode_to_session(state, &previous, &stored);
-            record_mode_session_change(&state.audit, &rebind, ended_local).await;
+            record_mode_session_change(&state.services.audit, &rebind, ended_local).await;
         }
         return Err(err);
     }
@@ -1485,6 +1477,7 @@ async fn auth_config_apply_body(
     // re-save of `false` touches nothing.
     let (rebind, ended_local) = apply_mode_to_session(state, &previous, &config);
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: actor.as_ref().map(|i| i.username.as_str()),
@@ -1501,7 +1494,7 @@ async fn auth_config_apply_body(
     // The session change is recorded after the settings change it follows
     // from: from the settings screen, the admin's session end (`logout`,
     // reason `auth_disabled`) and the synthetic `login`.
-    record_mode_session_change(&state.audit, &rebind, ended_local).await;
+    record_mode_session_change(&state.services.audit, &rebind, ended_local).await;
     Ok(config)
 }
 
@@ -1531,7 +1524,13 @@ async fn autologin_enable_body(
 ) -> Result<(), BantoError> {
     let actor = require_role(state, Role::Admin, "settings").await?;
 
-    if state.users.verify(username, password).await?.is_none() {
+    if state
+        .services
+        .users
+        .verify(username, password)
+        .await?
+        .is_none()
+    {
         return Err(BantoError::Validation {
             field_errors: vec![FieldError {
                 field: "password".to_string(),
@@ -1545,16 +1544,16 @@ async fn autologin_enable_body(
     // The same settings row as `auth_config_apply`: its read-modify-write
     // must not interleave with an apply's (a lost update of `disabled`).
     let auth_config_guard = state.auth_config_lock.lock().await;
-    let mut config = state.settings.auth_config().await?;
+    let mut config = state.services.settings.auth_config().await?;
     config.autologin_enabled = true;
     config.autologin_username = Some(username.to_string());
-    state.settings.set_auth_config(&config).await?;
+    state.services.settings.set_auth_config(&config).await?;
     drop(auth_config_guard);
     // Spec M14: the target `username` (never the password) is fine to
     // record - it identifies WHICH account autologin now applies to, no
     // different from `users_update`'s `role` detail.
     record_ok(
-        &state.audit,
+        &state.services.audit,
         &actor,
         "settings_change",
         "settings",
@@ -1587,17 +1586,17 @@ async fn autologin_disable_body(state: &AppState) -> Result<(), BantoError> {
 
     // See `autologin_enable_body`: same row as `auth_config_apply`.
     let auth_config_guard = state.auth_config_lock.lock().await;
-    let mut config = state.settings.auth_config().await?;
+    let mut config = state.services.settings.auth_config().await?;
     if let Some(username) = config.autologin_username.take() {
         if let Err(err) = keyring_store::delete_password(&username) {
             eprintln!("banto: 自動ログインの資格情報のキーリング削除に失敗しました: {err}");
         }
     }
     config.autologin_enabled = false;
-    state.settings.set_auth_config(&config).await?;
+    state.services.settings.set_auth_config(&config).await?;
     drop(auth_config_guard);
     record_ok(
-        &state.audit,
+        &state.services.audit,
         &actor,
         "settings_change",
         "settings",
@@ -1682,96 +1681,21 @@ fn build_status(
     }
 }
 
-/// Build the full `/api/*` + static-asset router (spec §11.1) and start
-/// serving on an already-[`bind_listener`]-ed listener (infallible: the bind -
+/// Start serving the full `/api/*` + static-asset router (spec §11.1,
+/// `EngineServices::router`, with `with_security_headers` outermost - banto
+/// #500) on an already-[`bind_listener`]-ed listener (infallible: the bind -
 /// the only step that can fail - happened before, so callers can do work such
-/// as saving settings between bind and serve; banto #294 review). Shared by
-/// `setup()` (auto-start on launch if LAN access was left enabled) and
-/// [`server_apply_body`] (spec §11.4's 「保存して適用」button).
+/// as saving settings between bind and serve; banto #294 review). Used by
+/// [`server_apply_body`] (spec §11.4's 「保存して適用」button); the auto-start
+/// on launch is the engine's (`EngineListen::BestEffort`).
 ///
-/// I2b: admin-template v3.0.0 の `src-tauri/src/lib.rs::start_embedded_server`
-/// の形（`BoundServer` を受けて `serve` する）に揃えた。ChronoGazer 固有の差は
-/// 渡すサービス（Hub・レジストリ 3 つ・収集）だけ。`async` なのは、`serve` が
-/// 中で tokio のタスクを起こすので、`setup()` からも `block_on` の中で呼ぶ
-/// ため（admin-template と同じ）。
-///
-/// Deliberately never names the intermediate `axum::Router` type anywhere -
-/// `axum` is not (and does not need to be) a direct dependency of this
-/// crate purely to support this one function: Rust only requires a crate to
-/// be listed in `[dependencies]` to *spell out* one of its types in source,
-/// and the router value here only ever flows through an inferred `let`
-/// binding on its way into `BoundServer::serve`.
-// Same shape as `chronogazer_core::rest::api_router` (which this wraps)
-// and for the same reason: distinct service handles, no natural struct to
-// bundle them into for a single call site.
-#[allow(clippy::too_many_arguments)]
-async fn start_embedded_server(
-    users: UsersService,
-    settings: SettingsService,
-    audit: AuditLogService,
-    backup: BackupService,
-    hub: HubService,
-    // #383 段階2a / R1-B: レジストリ3サービス。
-    plc_connections: PlcConnectionService,
-    collection_groups: CollectionGroupService,
-    tags: TagService,
-    // #383 段階2b / R1-C（C-2）: 収集ランタイム。デスクトップの `collect_*`
-    // コマンドと LAN ブラウザの `/api/collect*` が**同じ実体**を操作する
-    // ように、`hub` と同じく `AppState` のハンドルをそのまま渡す。
-    collect: CollectorService,
-    // #393: 表示グループ（同じ pool）。
-    display_groups: DisplayGroupService,
-    auth: AuthState,
-    events: broadcast::Sender<ServerEvent>,
-    bound: BoundServer,
-) -> RunningServer {
-    // `allow_setup: false` - the Tauri app's first-run setup goes through
-    // the `auth_setup` command above (`invoke()`, no network involved), not
-    // this REST endpoint. Only `banto-serve` (this repo's Tauri-free dev
-    // vehicle) opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`.
-    //
-    // `with_security_headers`（banto #500）は admin-template と同じく**最後（最外）**
-    // に掛け、静的 UI・`/api/*` の JSON・SSE のどれにも CSP などが付くようにする。
-    let router = with_security_headers(
-        api_router(
-            users,
-            settings,
-            audit,
-            backup,
-            hub,
-            plc_connections,
-            collection_groups,
-            tags,
-            collect,
-            display_groups,
-            auth,
-            events,
-            false,
-        )
-        .merge(static_router::<FrontendAssets>()),
-    );
-    bound.serve(router)
-}
-
-/// [`start_embedded_server`] with every service handle taken from `state`
-/// (the shared `rest_auth` included, so tokens outlive a restart).
-async fn serve_embedded(state: &AppState, bound: BoundServer) -> RunningServer {
-    start_embedded_server(
-        state.users.clone(),
-        state.settings.clone(),
-        state.audit.clone(),
-        state.backup.clone(),
-        state.hub.clone(),
-        state.plc_connections.clone(),
-        state.collection_groups.clone(),
-        state.tags.clone(),
-        state.collect.clone(),
-        display_groups_service(state),
-        state.rest_auth.clone(),
-        state.events.clone(),
-        bound,
-    )
-    .await
+/// `allow_setup: false` - the Tauri app's first-run setup goes through the
+/// `auth_setup` command above (`invoke()`, no network involved), not this
+/// REST endpoint. Only `banto-serve` (this repo's Tauri-free dev vehicle)
+/// opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`. The shared
+/// `rest_auth` is in `services`, so tokens outlive a restart.
+fn serve_embedded(state: &AppState, bound: BoundServer) -> RunningServer {
+    bound.serve(state.services.router(false))
 }
 
 /// Whether the LAN server may be auto-started on launch from the saved
@@ -1791,7 +1715,7 @@ fn lan_autostart_allowed(auth: &AuthSettings, server: &ServerSettings) -> bool {
 #[tauri::command]
 async fn server_status(state: State<'_, AppState>) -> Result<ServerStatusResult, BantoError> {
     require_role(&state, Role::Admin, "settings").await?;
-    let config = state.settings.server_config().await?;
+    let config = state.services.settings.server_config().await?;
     let running = state
         .server
         .lock()
@@ -1880,9 +1804,13 @@ async fn server_apply_body(
 
     // The saved config is the one the rollback below restores, and what the
     // running listener (if any) was started from.
-    let previous = state.settings.server_config().await?;
+    let previous = state.services.settings.server_config().await?;
     // Refuse an illegal auth/LAN combination BEFORE anything is stopped.
-    state.settings.validate_server_config(&config).await?;
+    state
+        .services
+        .settings
+        .validate_server_config(&config)
+        .await?;
 
     let was_running = slot.take();
     let had_running = was_running.is_some();
@@ -1911,10 +1839,7 @@ async fn server_apply_body(
         };
         // On error `bound` is dropped here, releasing the port.
         save_server_config_locked(state, &config).await?;
-        Ok(match bound {
-            Some(bound) => Some(serve_embedded(state, bound).await),
-            None => None,
-        })
+        Ok(bound.map(|bound| serve_embedded(state, bound)))
     }
     .await;
 
@@ -1923,7 +1848,7 @@ async fn server_apply_body(
             let running = started.as_ref().map(|server| server.local_addr());
             *slot = started;
             record_ok(
-                &state.audit,
+                &state.services.audit,
                 &actor,
                 "settings_change",
                 "settings",
@@ -1950,7 +1875,7 @@ async fn server_apply_body(
                 .await
                 {
                     Ok(bound) => {
-                        *slot = Some(serve_embedded(state, bound).await);
+                        *slot = Some(serve_embedded(state, bound));
                         restored = true;
                     }
                     Err(restore_err) => eprintln!(
@@ -1971,6 +1896,7 @@ async fn server_apply_body(
                 "error": err.to_string(),
             });
             state
+                .services
                 .audit
                 .record(AuditEntry {
                     actor_username: Some(&actor.username),
@@ -1998,7 +1924,7 @@ async fn save_server_config_locked(
     config: &ServerSettings,
 ) -> Result<(), BantoError> {
     let _auth_config = state.auth_config_lock.lock().await;
-    state.settings.set_server_config(config).await?;
+    state.services.settings.set_server_config(config).await?;
     if !config.viewer_public {
         // 閲覧公開 OFF: viewer-public grant tokens minted earlier (rest_auth
         // outlives server restarts) must not keep working. Order matters
@@ -2006,6 +1932,7 @@ async fn save_server_config_locked(
         // the kind is revoked - an issuance that judged `true` before the
         // save is refused by the generation this advances.
         state
+            .services
             .rest_auth
             .revoke_grant_tokens(&GrantKind::public_viewer());
     }
@@ -2033,7 +1960,7 @@ async fn settings_get(
 /// Body of [`settings_get`] (testable with a plain `&AppState`).
 async fn settings_get_body(state: &AppState, key: &str) -> Result<Option<String>, BantoError> {
     require_role(state, Role::Admin, "settings").await?;
-    state.settings.get(key).await
+    state.services.settings.get(key).await
 }
 
 /// `admin`-only (spec M10): writing settings (which include the embedded
@@ -2086,12 +2013,12 @@ async fn settings_set_body(
             "設定 {key} はこのコマンドでは変更できません。LAN 設定は接続の画面（server_apply）から変更してください"
         )));
     }
-    state.settings.set(&key, &value).await?;
+    state.services.settings.set(&key, &value).await?;
     // Spec M14: only the KEY is recorded, never the value - this is a
     // generic key/value store and the value could be anything, including
     // something sensitive a future setting might store here.
     record_ok(
-        &state.audit,
+        &state.services.audit,
         actor,
         "settings_change",
         "settings",
@@ -2119,7 +2046,11 @@ async fn ui_settings_get(
     key: String,
 ) -> Result<Option<String>, BantoError> {
     let identity = require_role(&state, Role::Viewer, "settings").await?;
-    state.settings.ui_get(&identity.username, &key).await
+    state
+        .services
+        .settings
+        .ui_get(&identity.username, &key)
+        .await
 }
 
 /// Write one of the calling user's OWN UI settings (spec M12). Any
@@ -2136,6 +2067,7 @@ async fn ui_settings_set(
 ) -> Result<(), BantoError> {
     let identity = require_role(&state, Role::Viewer, "settings").await?;
     state
+        .services
         .settings
         .ui_set(&identity.username, &key, &value)
         .await
@@ -2200,10 +2132,12 @@ async fn vibrancy_apply(
             .ok_or_else(|| BantoError::Other("メインウィンドウが見つかりません".to_string()))?;
         set_window_vibrancy(&window, enabled)?;
         state
+            .services
             .settings
             .set(KEY_DESKTOP_VIBRANCY, if enabled { "true" } else { "false" })
             .await?;
         state
+            .services
             .audit
             .record(AuditEntry {
                 actor_username: Some(&actor.username),
@@ -2238,6 +2172,7 @@ async fn vibrancy_status(state: State<'_, AppState>) -> Result<VibrancyStatus, B
     let supported = cfg!(target_os = "windows");
     let enabled = supported
         && state
+            .services
             .settings
             .get(KEY_DESKTOP_VIBRANCY)
             .await?
@@ -2276,7 +2211,7 @@ impl From<UserIdentity> for UserIdentityResult {
 #[tauri::command]
 async fn users_list(state: State<'_, AppState>) -> Result<Vec<UserSummary>, BantoError> {
     require_role(&state, Role::Admin, "users").await?;
-    state.users.list_users().await
+    state.services.users.list_users().await
 }
 
 /// `admin`-only (spec M10): create an additional account.
@@ -2290,10 +2225,12 @@ async fn users_create(
 ) -> Result<UserIdentityResult, BantoError> {
     let actor = require_role(&state, Role::Admin, "users").await?;
     let identity = state
+        .services
         .users
         .create_user(&username, &password, &display_name, role)
         .await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2334,8 +2271,13 @@ async fn users_update_body(
     role: Role,
 ) -> Result<UserSummary, BantoError> {
     let actor = require_role(state, Role::Admin, "users").await?;
-    let updated = state.users.update_user(id, display_name, role).await?;
+    let updated = state
+        .services
+        .users
+        .update_user(id, display_name, role)
+        .await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2369,8 +2311,13 @@ async fn users_reset_password_body(
     new_password: &str,
 ) -> Result<(), BantoError> {
     let actor = require_role(state, Role::Admin, "users").await?;
-    state.users.reset_password(id, new_password).await?;
     state
+        .services
+        .users
+        .reset_password(id, new_password)
+        .await?;
+    state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2399,8 +2346,13 @@ async fn users_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoEr
 /// Body of [`users_delete`] (see [`users_update_body`]).
 async fn users_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
     let acting = require_role(state, Role::Admin, "users").await?;
-    state.users.delete_user(id, Some(acting.id)).await?;
     state
+        .services
+        .users
+        .delete_user(id, Some(acting.id))
+        .await?;
+    state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&acting.username),
@@ -2451,6 +2403,7 @@ async fn plc_connections_list(
 ) -> Result<Vec<PlcConnectionResponse>, BantoError> {
     require_role(&state, Role::Viewer, "plc_connections").await?;
     Ok(state
+        .services
         .plc_connections
         .list(ListParams::default())
         .await?
@@ -2468,7 +2421,7 @@ async fn plc_connections_get(
 ) -> Result<PlcConnectionResponse, BantoError> {
     require_role(&state, Role::Viewer, "plc_connections").await?;
     Ok(PlcConnectionResponse::from(
-        state.plc_connections.get(id).await?,
+        state.services.plc_connections.get(id).await?,
     ))
 }
 
@@ -2481,10 +2434,12 @@ async fn plc_connections_create_body(
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
     let created = state
+        .services
         .plc_connections
         .create(input.into_create_input())
         .await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2499,7 +2454,7 @@ async fn plc_connections_create_body(
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(PlcConnectionResponse::from(created))
 }
 
@@ -2526,16 +2481,17 @@ async fn plc_connections_update_body(
     // #414 段階1: REST の `plc_connections_update` と同じ検査（両経路対称）。
     // 共通の更新（`update_plc_connection`）の**前に**呼ぶ。
     ensure_protocol_change_keeps_tags_readable(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
+        &state.services.plc_connections,
+        &state.services.collection_groups,
+        &state.services.tags,
         id,
         &input.protocol,
     )
     .await?;
     // #417 監査 P2: `simulation` の省略は既存行の値を保つ（REST と同じ関数）。
-    let updated = update_plc_connection(&state.plc_connections, id, input).await?;
+    let updated = update_plc_connection(&state.services.plc_connections, id, input).await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2549,7 +2505,7 @@ async fn plc_connections_update_body(
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(PlcConnectionResponse::from(updated))
 }
 
@@ -2570,9 +2526,9 @@ async fn simulation_coverage_list_body(
 ) -> Result<Vec<SimulationCoverageEntry>, BantoError> {
     require_role(state, Role::Viewer, "tags").await?;
     simulation_coverage(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
+        &state.services.plc_connections,
+        &state.services.collection_groups,
+        &state.services.tags,
     )
     .await
 }
@@ -2593,9 +2549,9 @@ async fn simulation_coverage_list(
 async fn config_exclusions_list_body(state: &AppState) -> Result<Vec<ExclusionView>, BantoError> {
     require_role(state, Role::Viewer, "tags").await?;
     registry_exclusions(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
+        &state.services.plc_connections,
+        &state.services.collection_groups,
+        &state.services.tags,
     )
     .await
 }
@@ -2618,8 +2574,9 @@ async fn config_exclusions_list(
 #[tauri::command]
 async fn plc_connections_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
     let actor = require_role(&state, Role::Editor, "plc_connections").await?;
-    state.plc_connections.delete(id).await?;
+    state.services.plc_connections.delete(id).await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2633,7 +2590,7 @@ async fn plc_connections_delete(state: State<'_, AppState>, id: i64) -> Result<(
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(())
 }
 
@@ -2644,6 +2601,7 @@ async fn collection_groups_list(
 ) -> Result<Vec<CollectionGroup>, BantoError> {
     require_role(&state, Role::Viewer, "collection_groups").await?;
     Ok(state
+        .services
         .collection_groups
         .list(ListParams::default())
         .await?
@@ -2657,7 +2615,7 @@ async fn collection_groups_get(
     id: i64,
 ) -> Result<CollectionGroup, BantoError> {
     require_role(&state, Role::Viewer, "collection_groups").await?;
-    state.collection_groups.get(id).await
+    state.services.collection_groups.get(id).await
 }
 
 /// `editor`+ (R0 §3.6): create a collection group.
@@ -2667,8 +2625,13 @@ async fn collection_groups_create(
     input: CollectionGroupPayload,
 ) -> Result<CollectionGroup, BantoError> {
     let actor = require_role(&state, Role::Editor, "collection_groups").await?;
-    let created = state.collection_groups.create(input.into()).await?;
+    let created = state
+        .services
+        .collection_groups
+        .create(input.into())
+        .await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2682,7 +2645,7 @@ async fn collection_groups_create(
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(created)
 }
 
@@ -2706,15 +2669,20 @@ async fn collection_groups_update_body(
     let actor = require_role(state, Role::Editor, "collection_groups").await?;
     // #414 段階1: REST の `collection_groups_update` と同じ検査（両経路対称）。
     ensure_group_move_keeps_tags_readable(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
+        &state.services.plc_connections,
+        &state.services.collection_groups,
+        &state.services.tags,
         id,
         input.plc_connection_id,
     )
     .await?;
-    let updated = state.collection_groups.update(id, input.into()).await?;
+    let updated = state
+        .services
+        .collection_groups
+        .update(id, input.into())
+        .await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2728,7 +2696,7 @@ async fn collection_groups_update_body(
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(updated)
 }
 
@@ -2738,8 +2706,9 @@ async fn collection_groups_update_body(
 #[tauri::command]
 async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
     let actor = require_role(&state, Role::Editor, "collection_groups").await?;
-    state.collection_groups.delete(id).await?;
+    state.services.collection_groups.delete(id).await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2753,7 +2722,7 @@ async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(())
 }
 
@@ -2761,14 +2730,14 @@ async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result
 #[tauri::command]
 async fn tags_list(state: State<'_, AppState>) -> Result<Vec<Tag>, BantoError> {
     require_role(&state, Role::Viewer, "tags").await?;
-    Ok(state.tags.list(ListParams::default()).await?.rows)
+    Ok(state.services.tags.list(ListParams::default()).await?.rows)
 }
 
 /// `viewer`+ (R0 §3.6): fetch one tag.
 #[tauri::command]
 async fn tags_get(state: State<'_, AppState>, id: i64) -> Result<Tag, BantoError> {
     require_role(&state, Role::Viewer, "tags").await?;
-    state.tags.get(id).await
+    state.services.tags.get(id).await
 }
 
 /// `editor`+ (R0 §3.6): create a tag.
@@ -2785,15 +2754,16 @@ async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, Ba
     input.reject_thresholds()?;
     // #414 段階1: REST の `tags_create` と同じ検査（両経路対称）。
     ensure_tag_fits_its_connection(
-        &state.plc_connections,
-        &state.collection_groups,
+        &state.services.plc_connections,
+        &state.services.collection_groups,
         input.collection_group_id,
         &input.address,
         &input.data_type,
     )
     .await?;
-    let created = state.tags.create(input.into()).await?;
+    let created = state.services.tags.create(input.into()).await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2807,7 +2777,7 @@ async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, Ba
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(created)
 }
 
@@ -2831,9 +2801,9 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
     // グループを変える更新も、入力のグループから接続を辿るので同じ検査で拾う。
     // 読む場所を変えずに無効化するだけの更新は検査しない（#418 P2）。
     ensure_tag_update_fits_its_connection(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
+        &state.services.plc_connections,
+        &state.services.collection_groups,
+        &state.services.tags,
         id,
         TagPlacement {
             collection_group_id: input.collection_group_id,
@@ -2843,8 +2813,9 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
         },
     )
     .await?;
-    let updated = update_tag_checked(&state.tags, id, input.into()).await?;
+    let updated = update_tag_checked(&state.services.tags, id, input.into()).await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2858,7 +2829,7 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(updated)
 }
 
@@ -2874,9 +2845,10 @@ async fn tags_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
     // #393（§3.7.9 の 8）: REST の `tags_delete` と同じく、表示グループの
     // ペンに割り当てられたタグは参照元を並べて削除を拒否する。
     display_groups_service(state)
-        .delete_tag_unless_referenced(&state.tags, id)
+        .delete_tag_unless_referenced(&state.services.tags, id)
         .await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -2890,17 +2862,15 @@ async fn tags_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
         })
         .await;
     // #383 段階3 P4: hub タグの登録が変わったら購読に反映する（REST と同じ）。
-    state.hub.registry_changed().await;
+    state.services.hub.registry_changed().await;
     Ok(())
 }
 
 // --- #393: 表示グループ ------------------------------------------------------
 
-/// 表示グループのサービス。`AppState` の pool から都度組む（`Clone` の pool
-/// ハンドルを包むだけなので軽い。`AppState` にフィールドを足さないのは、
-/// テストの `AppState` の組み立てを増やさないため）。
+/// 表示グループのサービス（エンジンのハンドル、#392 B1-2）。
 fn display_groups_service(state: &AppState) -> DisplayGroupService {
-    DisplayGroupService::new(state.pool.clone())
+    state.services.display_groups.clone()
 }
 
 /// 書き込みの監査（REST の `record_write` と同じ中身、`origin: "tauri"`）。
@@ -2912,7 +2882,7 @@ async fn record_display_group_write(
     detail: Option<serde_json::Value>,
 ) {
     record_ok(
-        &state.audit,
+        &state.services.audit,
         actor,
         action,
         DISPLAY_GROUPS_RESOURCE,
@@ -3051,7 +3021,7 @@ async fn display_groups_reorder_body(
 /// しきい値のサービス。`display_groups_service` と同じく `AppState` の pool から
 /// 都度組む（テストの `AppState` の組み立てを増やさないため）。
 fn tag_thresholds_service(state: &AppState) -> TagThresholdService {
-    TagThresholdService::new(state.pool.clone())
+    TagThresholdService::new(state.services.pool.clone())
 }
 
 /// `viewer`+ (R0 §3.6): 設定のあるタグのしきい値の一覧（タグ ID 順）。
@@ -3094,7 +3064,7 @@ async fn tag_thresholds_update_body(
     let actor = require_role(state, Role::Editor, TAG_THRESHOLDS_RESOURCE).await?;
     let updated = tag_thresholds_service(state).update(tag_id, &input).await?;
     record_ok(
-        &state.audit,
+        &state.services.audit,
         &actor,
         "update",
         TAG_THRESHOLDS_RESOURCE,
@@ -3132,14 +3102,15 @@ async fn audit_log_list_body(
 ) -> Result<AuditLogList, BantoError> {
     require_role(state, Role::Admin, "audit_log").await?;
     if as_of_id.is_none() {
-        if let Ok(config) = state.settings.audit_config().await {
+        if let Ok(config) = state.services.settings.audit_config().await {
             let _ = state
+                .services
                 .audit
                 .prune(config.retention_days, config.retention_rows)
                 .await;
         }
     }
-    state.audit.list_as_of(params, as_of_id).await
+    state.services.audit.list_as_of(params, as_of_id).await
 }
 
 /// See [`audit_log_list_body`] for the actual logic and the doc comment
@@ -3164,13 +3135,15 @@ async fn audit_spool_status(
     state: State<'_, AppState>,
 ) -> Result<chronogazer_core::audit_spool::AuditSpoolStatus, BantoError> {
     require_role(&state, Role::Admin, "audit_log").await?;
-    Ok(chronogazer_core::audit_spool::spool_status(&state.audit))
+    Ok(chronogazer_core::audit_spool::spool_status(
+        &state.services.audit,
+    ))
 }
 
 #[tauri::command]
 async fn audit_config_get(state: State<'_, AppState>) -> Result<AuditSettings, BantoError> {
     require_role(&state, Role::Viewer, "settings").await?;
-    state.settings.audit_config().await
+    state.services.settings.audit_config().await
 }
 
 /// `admin`-only (spec M14 Phase B): persist a new retention policy. `None`
@@ -3189,8 +3162,9 @@ async fn audit_config_apply(
         retention_days,
         retention_rows,
     };
-    state.settings.set_audit_config(&config).await?;
+    state.services.settings.set_audit_config(&config).await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3213,7 +3187,7 @@ async fn audit_config_apply(
     // subsequent `audit_config_get` would show `None` for the same field.
     // Re-reading keeps this command's response identical to what every
     // other reader of the setting sees.
-    state.settings.audit_config().await
+    state.services.settings.audit_config().await
 }
 
 // --- M17: SQLite backup/restore ---------------------------------------------
@@ -3224,8 +3198,9 @@ async fn audit_config_apply(
 /// cannot be constructed outside a running tauri app.
 async fn backups_create_body(state: &AppState) -> Result<BackupInfo, BantoError> {
     let actor = require_role(state, Role::Admin, "backups").await?;
-    let info = state.backup.create().await?;
+    let info = state.services.backup.create().await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3252,7 +3227,7 @@ async fn backups_create(state: State<'_, AppState>) -> Result<BackupInfo, BantoE
 #[tauri::command]
 async fn backups_list(state: State<'_, AppState>) -> Result<Vec<BackupInfo>, BantoError> {
     require_role(&state, Role::Admin, "backups").await?;
-    state.backup.list().await
+    state.services.backup.list().await
 }
 
 /// `backups_open_folder`'s response shape (spec M17): `path` is always the
@@ -3278,7 +3253,7 @@ struct OpenFolderResult {
 #[tauri::command]
 async fn backups_open_folder(state: State<'_, AppState>) -> Result<OpenFolderResult, BantoError> {
     require_role(&state, Role::Admin, "backups").await?;
-    let path = state.backup.backups_dir_display();
+    let path = state.services.backup.backups_dir_display();
 
     #[cfg(target_os = "windows")]
     {
@@ -3306,8 +3281,13 @@ async fn backups_open_folder(state: State<'_, AppState>) -> Result<OpenFolderRes
 /// [`backups_create_body`]).
 async fn backups_stage_restore_body(state: &AppState, file_name: &str) -> Result<(), BantoError> {
     let actor = require_role(state, Role::Admin, "backups").await?;
-    state.backup.stage_restore_from_file(file_name).await?;
     state
+        .services
+        .backup
+        .stage_restore_from_file(file_name)
+        .await?;
+    state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3340,14 +3320,15 @@ async fn backups_pending(
     state: State<'_, AppState>,
 ) -> Result<Option<PendingRestoreInfo>, BantoError> {
     require_role(&state, Role::Admin, "backups").await?;
-    Ok(state.backup.pending_restore().await)
+    Ok(state.services.backup.pending_restore().await)
 }
 
 /// Body of [`backups_cancel_restore`] (spec M14 split-function pattern).
 async fn backups_cancel_restore_body(state: &AppState) -> Result<(), BantoError> {
     let actor = require_role(state, Role::Admin, "backups").await?;
-    state.backup.cancel_pending_restore().await?;
+    state.services.backup.cancel_pending_restore().await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3401,7 +3382,7 @@ async fn require_hub_admin(state: &AppState) -> Result<UserIdentity, BantoError>
 #[tauri::command]
 async fn hub_status(state: State<'_, AppState>) -> Result<HubView, BantoError> {
     require_hub_admin(&state).await?;
-    state.hub.status().await
+    state.services.hub.status().await
 }
 
 /// 接続（保存済みキーがあれば再利用、無ければ試運転中の Hub にのみ `read`
@@ -3409,10 +3390,11 @@ async fn hub_status(state: State<'_, AppState>) -> Result<HubView, BantoError> {
 #[tauri::command]
 async fn hub_connect(state: State<'_, AppState>, endpoint: String) -> Result<HubView, BantoError> {
     let actor = require_hub_admin(&state).await?;
-    let view = state.hub.connect(&endpoint).await?;
+    let view = state.services.hub.connect(&endpoint).await?;
     // 監査 detail に入れてよいのは接続先と結果の状態まで。平文キーはどの
     // 経路にも出さない。
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3438,14 +3420,14 @@ async fn hub_connect(state: State<'_, AppState>, endpoint: String) -> Result<Hub
 #[tauri::command]
 async fn hub_subscription(state: State<'_, AppState>) -> Result<HubSubscriptionView, BantoError> {
     require_hub_admin(&state).await?;
-    Ok(state.hub.subscription().await)
+    Ok(state.services.hub.subscription().await)
 }
 
 /// タグ一覧の再取得。`admin` 限定。
 #[tauri::command]
 async fn hub_refresh_catalog(state: State<'_, AppState>) -> Result<HubView, BantoError> {
     require_hub_admin(&state).await?;
-    state.hub.refresh_catalog().await
+    state.services.hub.refresh_catalog().await
 }
 
 /// 「Hub から追加」のダイアログ用（#383 段階3 P4）: catalog・登録済みの
@@ -3459,7 +3441,7 @@ async fn hub_catalog(state: State<'_, AppState>) -> Result<HubCatalogView, Banto
 
 async fn hub_catalog_body(state: &AppState) -> Result<HubCatalogView, BantoError> {
     require_role(state, Role::Editor, "tags").await?;
-    state.hub.catalog_for_registration().await
+    state.services.hub.catalog_for_registration().await
 }
 
 /// 移行前の選択を使わずに消す（#383 段階3 P4、ダイアログの「以前の選択を
@@ -3472,8 +3454,9 @@ async fn hub_dismiss_legacy_selection(state: State<'_, AppState>) -> Result<(), 
 
 async fn hub_dismiss_legacy_selection_body(state: &AppState) -> Result<(), BantoError> {
     let actor = require_role(state, Role::Editor, "settings").await?;
-    if state.hub.clear_legacy_selection().await? {
+    if state.services.hub.clear_legacy_selection().await? {
         state
+            .services
             .audit
             .record(AuditEntry {
                 actor_username: Some(&actor.username),
@@ -3511,15 +3494,16 @@ async fn tags_register_from_hub_body(
 ) -> Result<HubRegistrationResult, BantoError> {
     let actor = require_role(state, Role::Editor, "tags").await?;
     let mut result = register_from_hub(
-        &state.pool,
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
+        &state.services.pool,
+        &state.services.plc_connections,
+        &state.services.collection_groups,
+        &state.services.tags,
         input,
     )
     .await?;
     if result.ok {
         state
+            .services
             .audit
             .record(AuditEntry {
                 actor_username: Some(&actor.username),
@@ -3532,9 +3516,10 @@ async fn tags_register_from_hub_body(
                 result: "ok",
             })
             .await;
-        state.hub.registry_changed().await;
+        state.services.hub.registry_changed().await;
         // 待たない（REST と同じ。`HubService::schedule_legacy_selection_clear`）。
-        result.legacy_selection_clear_scheduled = state.hub.schedule_legacy_selection_clear();
+        result.legacy_selection_clear_scheduled =
+            state.services.hub.schedule_legacy_selection_clear();
     }
     Ok(result)
 }
@@ -3552,8 +3537,9 @@ async fn hub_adopt_manual_key(
     key: String,
 ) -> Result<HubView, BantoError> {
     let actor = require_hub_admin(&state).await?;
-    let view = state.hub.adopt_manual_key(&endpoint, key).await?;
+    let view = state.services.hub.adopt_manual_key(&endpoint, key).await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3579,8 +3565,9 @@ async fn hub_adopt_manual_key(
 #[tauri::command]
 async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoError> {
     let actor = require_hub_admin(&state).await?;
-    let view = state.hub.disconnect().await?;
+    let view = state.services.hub.disconnect().await?;
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3666,6 +3653,7 @@ async fn record_collect_operation(
     outcome: &CollectOutcome,
 ) {
     state
+        .services
         .audit
         .record(AuditEntry {
             actor_username: Some(&actor.username),
@@ -3692,7 +3680,7 @@ async fn record_collect_operation(
 /// 割れないようにするため（`COLLECT_AUDIT_RESOURCE` や床の定数と同じ作法）。
 async fn collect_status_body(state: &AppState) -> Result<CollectorStateView, BantoError> {
     require_collect_reader(state).await?;
-    Ok(state.collect.state_view())
+    Ok(state.services.collect.state_view())
 }
 
 /// `GET`-ish command: 収集の現在の状態。**`viewer` 以上**
@@ -3729,7 +3717,7 @@ async fn collect_status(state: State<'_, AppState>) -> Result<CollectorStateView
 /// Body of [`collect_start`]（spec M14 split-function pattern）。
 async fn collect_start_body(state: &AppState) -> Result<CollectOutcome, BantoError> {
     let actor = require_collect_editor(state).await?;
-    let outcome = state.collect.start().await?;
+    let outcome = state.services.collect.start().await?;
     record_collect_operation(state, &actor, "start", &outcome).await;
     Ok(outcome)
 }
@@ -3743,7 +3731,7 @@ async fn collect_start(state: State<'_, AppState>) -> Result<CollectOutcome, Ban
 /// Body of [`collect_stop`]（spec M14 split-function pattern）。
 async fn collect_stop_body(state: &AppState) -> Result<CollectOutcome, BantoError> {
     let actor = require_collect_editor(state).await?;
-    let outcome = state.collect.stop().await?;
+    let outcome = state.services.collect.stop().await?;
     record_collect_operation(state, &actor, "stop", &outcome).await;
     Ok(outcome)
 }
@@ -3760,7 +3748,7 @@ async fn collect_stop(state: State<'_, AppState>) -> Result<CollectOutcome, Bant
 /// Body of [`collect_restart`]（spec M14 split-function pattern）。
 async fn collect_restart_body(state: &AppState) -> Result<CollectOutcome, BantoError> {
     let actor = require_collect_editor(state).await?;
-    let outcome = state.collect.restart().await?;
+    let outcome = state.services.collect.restart().await?;
     record_collect_operation(state, &actor, "restart", &outcome).await;
     Ok(outcome)
 }
@@ -3787,7 +3775,7 @@ async fn collect_restart(state: State<'_, AppState>) -> Result<CollectOutcome, B
 /// （REST と同じ [`ValuesResponse`]）。
 async fn collect_values_body(state: &AppState) -> Result<ValuesResponse, BantoError> {
     require_collect_reader(state).await?;
-    Ok(state.collect.values_response())
+    Ok(state.services.collect.values_response())
 }
 
 /// `GET`-ish command: タグごとの現在値。**`viewer` 以上**。
@@ -3810,7 +3798,7 @@ async fn collect_connections_body(
     state: &AppState,
 ) -> Result<Readout<HashMap<String, ConnectionView>>, BantoError> {
     require_collect_reader(state).await?;
-    Ok(state.collect.connections().await)
+    Ok(state.services.collect.connections().await)
 }
 
 /// `GET`-ish command: 接続ごとの状態。**`viewer` 以上**。
@@ -3837,6 +3825,7 @@ async fn collect_events_list_body(
 ) -> Result<Readout<CollectEventList>, BantoError> {
     require_collect_reader(state).await?;
     Ok(state
+        .services
         .collect
         .events(EventPage::new(offset, limit).as_of(as_of_id))
         .await)
@@ -3886,7 +3875,7 @@ async fn collect_history_body(
 ) -> Result<Readout<CollectHistory>, BantoError> {
     require_collect_reader(state).await?;
     let request = validate_history_request(&tag_ids, from_ms, to_ms, bins)?;
-    Ok(state.collect.history(&request).await)
+    Ok(state.services.collect.history(&request).await)
 }
 
 /// `GET`-ish command: タグごとの直近の履歴（R1-D の D-3a。間引いた最小・
@@ -3909,8 +3898,10 @@ async fn collect_history(
     collect_history_body(&state, tag_ids, from_ms, to_ms, bins).await
 }
 
-/// How long [`shutdown_app_state`] is allowed to take in total before the
-/// app gives up and exits anyway (#383 R1-C's prerequisite).
+/// How long the exit cleanup ([`shutdown_app_state`]) is allowed to take in
+/// total before the app gives up and exits anyway (#383 R1-C's prerequisite).
+/// Both entries into the cleanup ([`ExitTrigger`]: the tray's 「終了」 and
+/// `RunEvent::Exit`) use this same budget (as before #392 B1-2).
 ///
 /// **Why a budget at all**: every step below can, in principle, wait on
 /// something outside this process - the LAN server's graceful shutdown waits
@@ -3926,68 +3917,29 @@ async fn collect_history(
 /// the same PC/LAN, an in-process axum shutdown, an SQLite close) and
 /// normally completes in milliseconds. 5 seconds is far enough above that to
 /// never cut a healthy shutdown short, and short enough that a user who
-/// closed the window does not notice.
-const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The app's exit cleanup, split out of [`run`]'s `RunEvent::Exit` arm so it
-/// can be unit-tested against a synthetic [`AppState`] - see
-/// `exit_cleanup_closes_the_pool`, and [`run`] for what that test does NOT
-/// cover.
-///
-/// **Order matters**, and it is "消費者を先に止め、書き手はその後、みんなが
-/// 書き込む先は最後":
-///
-/// 1. **The embedded LAN server** - stops accepting new requests and lets
-///    in-flight ones finish. Its handlers use the same pool, so it has to be
-///    down before step 4.
-/// 2. **収集（#383 段階2b / R1-C）** - **消費者を全部止めた後、DB プールを
-///    閉じる前**。収集は PLC から読んだ値を tstore と `collect_events` に
-///    書く**書き手**なので、`banto-hub` の `RunningHub::shutdown`
-///    （`apps/banto-hub/core/src/runtime.rs`）が採っているのと同じ方針、
-///    すなわち「read-only な消費者（LAN サーバー）を先に止め、収集は依存が
-///    全部止まってから」に揃える。先に収集を止めてしまうと、まだ生きている
-///    消費者が「値が止まった収集エンジン」を観測する時間帯ができる。逆に
-///    DB プールより後ろへ回すと、最終 flush の書き込み先がもう閉じている。
-/// 3. **Hub subscriptions** - closes the WS generation and stops the
-///    supervisor, so nothing keeps waking up to touch the settings DB or the
-///    network after this point. **#383 段階3 P3 で収集の後ろへ移した**: Hub
-///    購読は Hub 経由の接続の値の出どころ（収集にとっての生産者）になったので、
-///    収集より先に止めると、終了のたびに Hub 接続の `plc_disconnected` と
-///    Bad の行が記録される。
-/// 4. **The SQLite pool** - closed last, once nothing can still use it.
-///
-/// Every step is best-effort: `HubService::shutdown` and `RunningServer::stop`
-/// swallow their own failures, `CollectorService::stop` の失敗（最終 flush）は
-/// ログに出すだけ、そして the whole sequence is capped by
-/// [`EXIT_CLEANUP_BUDGET`].
-///
-/// **テストの範囲**（#396 と同じ書き方）: この関数の**中身**は
-/// `exit_cleanup_closes_the_pool` が合成 [`AppState`] に対して実行して
-/// いる（#383 R1-C で収集の停止もそこに足した）が、**`tauri::RunEvent::Exit`
-/// から実際にここへ来る経路は自動テストしていない** - 理由と、それでも
-/// そこを試そうとした場合に何が要るかは [`run`] の `RunEvent::Exit` 腕の
-/// コメントに書いてある。
+/// closed the window does not notice. Windows also gives an app roughly 5
+/// seconds to handle `WM_ENDSESSION` (OS sign-out/shutdown) before it shows
+/// 「このアプリがシャットダウンを妨げています」.
 ///
 /// [`EXIT_CLEANUP_BUDGET`] は **5 秒のまま据え置いた**（#383 R1-C）。
 /// 収集の停止は「接続タスクを join して tstore を最終 flush する」だけで、
-/// どれもローカルのディスク操作。C-2 で起動時の自動開始が入ったので、
-/// **ここが実際に予算を食うのは今からが初めて** - **実機で 5 秒に収まらない
-/// ことが分かったら、勝手に増やさずオーナーに報告すること。**
+/// どれもローカルのディスク操作。**実機で 5 秒に収まらないことが分かったら、
+/// 勝手に増やさずオーナーに報告すること。**
 ///
 /// 収集の停止は自分でも上限を持つ（`COLLECT_OPERATION_TIMEOUT` = 30 秒）が、
 /// **この 5 秒の方が短いので、終了経路では必ずこちらが先に切る** - 窓を
-/// 閉じた利用者を 30 秒待たせないため（意図どおり）。
-///
-/// 予算が切れたときに何が起きるか（#406 レビュー P2 の後）:
+/// 閉じた利用者を 30 秒待たせないため（意図どおり）。予算が切れても、
 /// `CollectorService::stop` は**自分のライフサイクルタスクに依頼して待つ**
 /// だけなので、打ち切られるのは**待つ側だけ**で、タスク側の停止処理
 /// （接続タスクの join と最終 flush）は**そのまま続く**。直後にプロセスが
 /// 終わるので実害は無く、失われうるのは最後の未 flush 分だけ - 詳しくは
 /// `chronogazer_core::collect` のモジュール doc「終了フックからの停止」。
-/// #437: 監査の保留の定期の流し込み（`AuditLogService::spawn_spool_flusher`）の
-/// `JoinHandle`。`setup()` の末尾で managed state にし、`RunEvent::Exit` で止める。
-/// 保留を開けなかったとき（保留なし）は `None`。
-struct AuditSpoolFlusher(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
+const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The running engine (#392 B1-2), managed so the exit cleanup can stop it.
+/// Never dropped before the process ends (Tauri's managed state), which is
+/// also what keeps the A1 instance lock (held by the engine) until then.
+struct DesktopEngine(Arc<RunningEngine>);
 
 /// What [`shutdown_app_state`] could not finish, so the tray's 「終了」 can
 /// tell the user instead of claiming everything was stopped cleanly (#392 A2).
@@ -4002,83 +3954,65 @@ pub(crate) struct ExitCleanupReport {
     pub(crate) budget_secs: u64,
 }
 
-async fn shutdown_app_state(state: &AppState) -> ExitCleanupReport {
-    // #392 A2 レビュー（2026-10-12）: 後始末に入ったら、終了処理の**取り消せない**
-    // 印を立て、以降の収集の開始（窓の Tauri コマンド・まだ止めていない LAN の
-    // REST・自動開始）を「終了処理中のため、収集を開始できません」で断る。
-    // この印は誰も下ろさない（トレイの遅れた `AskAgain` が下ろすのは確認の
-    // ための一時的な印だけ。`chronogazer_core::collect` の doc「終了の受付」）。
-    // OS のシャットダウン（`RunEvent::Exit`）でもトレイの「終了」でも、ここで
-    // 立てる。予算の外で、待たずに立てる。**印を立ててから下の `stop()` を
-    // 投入する**ので、その `stop()` が終端の操作になる: 前に並んだ開始は
-    // それが止め、後ろに並んだ開始（受付は印より前でも）はタスクが処理の直前に
-    // 断る（同 doc「受付から投入までの隙間」）。
-    let _ = state.collect.begin_shutdown();
-    let cleanup = async {
-        // `server_apply` が停止に使っているのと同じ経路（`take()` して
-        // `RunningServer::stop()`）。`take()` しておくのは、ここで止めたものを
-        // 残しておく意味が無いのと、二重に stop されないようにするため。
-        if let Some(running) = state.server.lock().await.take() {
-            running.stop().await;
-        }
-
-        // #383 段階2b / R1-C: 収集（書き手）は消費者の後・DB の前 - 順序の
-        // 理由はこの関数の doc。走っていなければ `stop()` は何もしない
-        // （冪等）。失敗しても終了は止めない（失われうるのは tstore の
-        // 最後の未 flush 分だけで、固まる方が悪い）。
-        //
-        // `CollectOutcome::pending`（`stop()` 自身の上限
-        // `COLLECT_OPERATION_TIMEOUT` = 30 秒）は**ここでは見ない**:
-        // それより短い [`EXIT_CLEANUP_BUDGET`]（5 秒）が必ず先に切れて
-        // 上のメッセージを出すので、この経路で `pending` が立つことはない。
-        let collect_stop_error = match state.collect.stop().await {
-            Ok(_) => None,
-            Err(err) => {
-                eprintln!("banto: 終了時の収集の停止に失敗しました: {err}");
-                Some(err.to_string())
-            }
-        };
-
-        // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを
-        // 無条件には待たない（`connect` の 60 秒で終了が固まるため）-
-        // 理由は `chronogazer_core::hub::HubService::shutdown` の doc。
-        // #383 段階3 P3 で**収集の後ろ**に移した: Hub 購読は収集の値の
-        // 出どころ（生産者）になったので、先に止めると、終了のたびに Hub 接続の
-        // `plc_disconnected` と Bad の行が 1 周期ぶん記録される。
-        state.hub.shutdown().await;
-
-        // 最後に DB。`close()` は全接続が返るのを待ってからプールを閉じる
-        // ので、`-wal`/`-shm` が畳まれた状態でプロセスが終わる。
-        state.pool.close().await;
-        collect_stop_error
-    };
-
-    match tokio::time::timeout(EXIT_CLEANUP_BUDGET, cleanup).await {
-        Ok(collect_stop_error) => ExitCleanupReport {
-            collect_stop_error,
-            ..ExitCleanupReport::default()
+/// The app's exit cleanup body: the engine's own shutdown
+/// (`chronogazer_core::engine::RunningEngine::shutdown`, #392 B1-2), mapped
+/// onto [`ExitCleanupReport`]. The order and the reasons for it live in that
+/// module's doc (「終了の順序」): 収集の取り消せない終了の印（予算の外）→
+/// 監査の保留の定期の流し込みと保持期間の掃除の abort → LAN サーバー（消費者）→
+/// 収集（書き手、最終 flush と `collection_stopped`）→ Hub の購読（収集にとっての
+/// 生産者、#383 段階3 P3）→ SQLite の pool（みんなが書き込む先）.
+///
+/// `budget` is what is left of the exit deadline ([`ExitCleanupOnce`] hands
+/// the first caller's deadline to the body). `budget_secs` in the report is
+/// rounded UP to whole seconds, so a budget of 4.99 s that ran out still
+/// reads 「5 秒以内に終わらなかった」.
+async fn shutdown_app_state(engine: &RunningEngine, budget: Duration) -> ExitCleanupReport {
+    let report = engine.shutdown(budget).await;
+    ExitCleanupReport {
+        collect_stop_error: report.collect_stop_error,
+        timed_out: report.timed_out,
+        budget_secs: if report.timed_out {
+            ceil_secs(report.budget)
+        } else {
+            0
         },
-        Err(_) => {
-            eprintln!(
-                "banto: 終了時の後始末が{}秒以内に終わらなかったため、途中で切り上げて終了します。",
-                EXIT_CLEANUP_BUDGET.as_secs()
-            );
-            ExitCleanupReport {
-                collect_stop_error: None,
-                timed_out: true,
-                budget_secs: EXIT_CLEANUP_BUDGET.as_secs(),
+    }
+}
+
+/// `duration` in whole seconds, rounded up.
+fn ceil_secs(duration: Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
+}
+
+/// 終了の後始末に入った経路（記録の文言のため。予算はどちらも
+/// [`EXIT_CLEANUP_BUDGET`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitTrigger {
+    /// トレイの「終了」（確認の後、`AppHandle::exit` の**前**）。
+    TrayQuit,
+    /// `tauri::RunEvent::Exit`。トレイの終了の `app.exit(0)` の後にも来るほか、
+    /// OS のサインアウト・シャットダウンで来る（tao が `WM_ENDSESSION` で
+    /// イベントループを畳み、戻った直後に `std::process::exit` する）。
+    RunEventExit,
+}
+
+impl ExitTrigger {
+    fn label(self) -> &'static str {
+        match self {
+            ExitTrigger::TrayQuit => "トレイの終了",
+            ExitTrigger::RunEventExit => {
+                "アプリの終了イベント（OS のサインアウト・シャットダウンを含む）"
             }
         }
     }
 }
 
-/// [`exit_cleanup_once`] が後始末を 1 回に限るための入れ物（#392 A2）。
-/// `run()` が Builder で manage する。
-#[derive(Default)]
-struct ExitCleanupOnce(tokio::sync::OnceCell<ExitCleanupReport>);
+/// 終了の後始末を 1 回に限るための入れ物（#392 A2 → B1-2 で banto-hub と共有の
+/// `banto_desktop_tray::ExitCleanupOnce` に寄せた）。`run()` が manage する。
+struct ExitOnce(ExitCleanupOnce<ExitCleanupReport, ExitTrigger>);
 
-/// アプリの後始末（監査の保留の流し込みを止め、[`shutdown_app_state`]）を
-/// **プロセスで 1 回だけ**行う。呼び口は 2 つ:
+/// アプリの後始末（[`shutdown_app_state`]）を**プロセスで 1 回だけ**行う。
+/// 呼び口は 2 つ:
 ///
 /// - トレイの「終了」（[`tray`]）: 確認の後、`AppHandle::exit` の**前**に
 ///   ここを待ち、結果（[`ExitCleanupReport`]）で失敗を利用者に知らせる。
@@ -4087,29 +4021,151 @@ struct ExitCleanupOnce(tokio::sync::OnceCell<ExitCleanupReport>);
 ///   イベントループを畳み、その直後に `std::process::exit` する）。
 ///
 /// 2 つ目以降の呼び出しは、1 つ目の後始末が**終わるのを待ってから**同じ
-/// 結果を返す（`OnceCell::get_or_init`）。トレイの「終了」の後始末の最中に
-/// OS のシャットダウンが来ても、後始末を二重に走らせず、途中で見捨てもしない
-/// （待つ時間は [`EXIT_CLEANUP_BUDGET`] で上限がある）。
+/// 結果を返す（`ExitCleanupOnce::run_or_wait`。待つ上限は [`EXIT_CLEANUP_BUDGET`]、
+/// 先行の期限を超えては待たない）。トレイの「終了」の後始末の最中に OS の
+/// シャットダウンが来ても、後始末を二重に走らせず、途中で見捨てもしない。
+/// 本体は専用のスレッドで走り、呼び出し元は条件変数で待つ（**ブロックする**ので、
+/// tokio のワーカーから呼ばないこと。トレイは専用のスレッドから呼ぶ）。
 ///
-/// `AppState` が無い（旧形式の DB・同じ DB の使用中で起動を止めた）ときは
+/// 待ちが期限で切れたとき（本体は裏で続く）も、トレイが知らせられるよう
+/// `timed_out` の [`ExitCleanupReport`] にして返す（[`exit_report_for_caller`]）。
+///
+/// エンジンが無い（旧形式の DB・同じ DB の使用中で起動を止めた）ときは
 /// 閉じるものが無いので `None`。
-async fn exit_cleanup_once(app: &tauri::AppHandle) -> Option<ExitCleanupReport> {
-    let state = app.try_state::<AppState>()?;
-    let once = app.try_state::<ExitCleanupOnce>()?;
-    let report = once
-        .0
-        .get_or_init(|| async {
-            // #437: 監査の保留の定期の流し込みを止める（途中で止めても、
-            // ファイルは行が入ってから消すので失われない）。
-            if let Some(flusher) = app.try_state::<AuditSpoolFlusher>() {
-                if let Some(handle) = flusher.0.lock().ok().and_then(|mut h| h.take()) {
-                    handle.abort();
-                }
-            }
-            shutdown_app_state(&state).await
-        })
-        .await;
-    Some(report.clone())
+fn exit_cleanup(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitCleanupReport> {
+    let engine = Arc::clone(&app.try_state::<DesktopEngine>()?.0);
+    let once = app.try_state::<ExitOnce>()?;
+    Some(run_exit_cleanup(
+        &once.0,
+        trigger,
+        EXIT_CLEANUP_BUDGET,
+        move |deadline| {
+            let budget = deadline.saturating_duration_since(std::time::Instant::now());
+            tauri::async_runtime::block_on(shutdown_app_state(&engine, budget))
+        },
+        log_sink(),
+    ))
+}
+
+/// [`exit_cleanup`] が記録する 1 行（重さつき）。
+#[derive(Debug, PartialEq, Eq)]
+enum ExitLogLine {
+    Info(String),
+    Error(String),
+}
+
+/// 記録先。本番は標準エラー出力（[`log_sink`]）、テストは差し替えて数える。
+type ExitSink = Arc<dyn Fn(ExitLogLine) + Send + Sync>;
+
+fn log_sink() -> ExitSink {
+    Arc::new(|line| match line {
+        ExitLogLine::Info(line) | ExitLogLine::Error(line) => eprintln!("{line}"),
+    })
+}
+
+/// 終了の後始末を 1 回に限って走らせ、記録する（[`exit_cleanup`] の本体。
+/// banto-hub の `run_exit_cleanup` と同じ形、#586 のオーナーレビュー P2）。
+///
+/// 記録は 2 か所に分かれる:
+///
+/// - **後始末の本体の結果**は、本体を走らせた側の**ワーカーの中で、結果を
+///   公開する前に** 1 回だけ記録する（[`body_log_line`]）。公開してから
+///   呼び出し元が記録する作りだと、先行より先に結果を受け取った後続
+///   （OS の終了）が即座に戻り、`RunEvent::Exit` から戻った直後にプロセスが
+///   終わって、先行の診断が 1 行も残らないことがある。後続が受け取っただけの
+///   ときは出さない（二重にならない）。
+/// - **呼び出し元の待ちの打ち切り**（自分の予算・先行の期限切れ）は、各呼び出しが
+///   自分で記録する（[`wait_log_line`]）。
+///
+/// 戻り値はトレイが利用者に知らせるための [`ExitCleanupReport`]
+/// （[`exit_report_for_caller`]）。
+fn run_exit_cleanup(
+    once: &ExitCleanupOnce<ExitCleanupReport, ExitTrigger>,
+    trigger: ExitTrigger,
+    budget: Duration,
+    work: impl FnOnce(std::time::Instant) -> ExitCleanupReport + Send + 'static,
+    sink: ExitSink,
+) -> ExitCleanupReport {
+    let body_sink = Arc::clone(&sink);
+    let waited = once.run_or_wait(trigger, budget, move |deadline| {
+        let result = work(deadline);
+        // 結果を公開する前に記録する（この関数の doc）。
+        body_sink(body_log_line(trigger, &result));
+        result
+    });
+    if let Some(line) = wait_log_line(trigger, budget, &waited) {
+        sink(line);
+    }
+    exit_report_for_caller(&waited, budget)
+}
+
+/// 後始末の本体の結果の記録（本体を走らせた経路 `origin` の名で、1 回だけ）。
+/// 失敗の中身（最終 flush の失敗・予算切れ）は、エンジンがその場で標準エラー
+/// 出力に出している（`RunningEngine::shutdown`）。
+fn body_log_line(origin: ExitTrigger, result: &ExitCleanupReport) -> ExitLogLine {
+    if result.timed_out || result.collect_stop_error.is_some() {
+        ExitLogLine::Error(format!(
+            "banto: 終了の後始末を終えましたが、完全には済みませんでした（{}）",
+            origin.label()
+        ))
+    } else {
+        ExitLogLine::Info(format!(
+            "banto: 終了の後始末が完了しました（{}）",
+            origin.label()
+        ))
+    }
+}
+
+/// 呼び出し元の**待ち**の結果から、その呼び出しが記録する文言を決める純関数
+/// （banto-hub の `wait_log_line` と同じ区別）:
+///
+/// - 本体の完了を受け取った（`RanWork(Finished)`・`ReceivedPrior`）: 何も出さない
+///   （本体の結果は [`body_log_line`] がワーカーで記録済み）。
+/// - 自分が本体を走らせて自分の予算で切った（`RanWork(TimedOut)`）: 自分の上限を出す。
+/// - 後から来て待てなかったときは、**どちらの上限で**やめたかを区別する。
+fn wait_log_line(
+    trigger: ExitTrigger,
+    budget: Duration,
+    waited: &banto_desktop_tray::ExitCleanupReport<ExitCleanupReport, ExitTrigger>,
+) -> Option<ExitLogLine> {
+    use banto_desktop_tray::ExitCleanupReport as Waited;
+    match waited {
+        Waited::RanWork(ExitCleanupOutcome::Finished(_)) | Waited::ReceivedPrior { .. } => None,
+        Waited::RanWork(ExitCleanupOutcome::TimedOut) => Some(ExitLogLine::Error(format!(
+            "banto: 終了の後始末が期限までに終わらなかったため、待たずに終了します（この経路の上限{}秒、{}）",
+            budget.as_secs(),
+            trigger.label()
+        ))),
+        Waited::PriorExpired { origin } => Some(ExitLogLine::Error(format!(
+            "banto: 先行の終了の後始末（{}）が期限までに終わっていなかったため、待たずに終了します（{}）",
+            origin.label(),
+            trigger.label()
+        ))),
+        Waited::OwnBudgetExpired { origin } => Some(ExitLogLine::Error(format!(
+            "banto: 先行の終了の後始末（{}）がまだ終わっていませんが、この経路の上限{}秒で待つのをやめ、待たずに終了します（{}）",
+            origin.label(),
+            budget.as_secs(),
+            trigger.label()
+        ))),
+    }
+}
+
+/// 呼び出し元に返す [`ExitCleanupReport`]。本体の結果を受け取れたらそれ
+/// （先行の結果でも、最終 flush の失敗はそのまま伝わる）、待ちが期限で切れたら
+/// `timed_out`（トレイが「途中で切り上げました」を知らせる。#585 の情報を
+/// 落とさない）。
+fn exit_report_for_caller(
+    waited: &banto_desktop_tray::ExitCleanupReport<ExitCleanupReport, ExitTrigger>,
+    budget: Duration,
+) -> ExitCleanupReport {
+    match waited.outcome() {
+        ExitCleanupOutcome::Finished(report) => report,
+        ExitCleanupOutcome::TimedOut => ExitCleanupReport {
+            collect_stop_error: None,
+            timed_out: true,
+            budget_secs: ceil_secs(budget),
+        },
+    }
 }
 
 /// メインの窓の label（tauri.conf.json・capabilities と一致させる）。
@@ -4230,11 +4286,91 @@ fn open_startup_error_window(app: &tauri::App, notice: &StartupErrorNotice) -> t
     Ok(())
 }
 
-/// 単一インスタンス排他のガード（#392 A1）を、プロセスの終わりまで Tauri の
-/// 管理状態として持つ。`AppState` とは別にしてあるのは、排他に失敗して
-/// `AppState` を作らない経路でも（作る経路でも）寿命の扱いを変えないため。
-#[allow(dead_code)] // 持っていること自体が目的（Drop で OS の排他が返る）
-struct InstanceLockHolder(chronogazer_core::instance_lock::InstanceGuard);
+/// M11 bootstrap (`setup()`): the webview's starting session, in priority
+/// order -
+///   1. auth-disabled mode ("ログイン不要モード") - a synthetic identity, no
+///      login screen at all.
+///   2. desktop autologin - verify a keyring-stored credential against
+///      `users`, same as a normal login.
+///   3. neither - the ordinary login screen (`None`).
+///
+/// Split out of `setup()` in #392 B1-2 (unchanged otherwise): it takes the
+/// engine's service handles, because the engine now builds them.
+async fn initial_desktop_session(
+    services: &EngineServices,
+    auth_config: &AuthSettings,
+) -> Option<DesktopSession> {
+    let audit = &services.audit;
+    if auth_config.disabled {
+        // The ONE definition of the synthetic identity and its `login` entry,
+        // shared with `auth_config_apply_body` / `logout_body` (banto v2.0.0
+        // 移行): `local_identity` / `record_local_login`.
+        let local_identity = local_identity(auth_config.disabled_role);
+        record_local_login(audit, &local_identity).await;
+        return Some(DesktopSession::AuthDisabledLocal(local_identity));
+    }
+    if !auth_config.autologin_enabled {
+        return None;
+    }
+    let username = auth_config.autologin_username.as_ref()?;
+    let password = match keyring_store::get_password(username) {
+        Ok(password) => password,
+        Err(err) => {
+            // Keyring entry missing / backend unavailable - safe degrade to
+            // the login screen (spec M11).
+            eprintln!("banto: 自動ログインの資格情報の取得に失敗しました: {err}");
+            return None;
+        }
+    };
+    match services.users.verify(username, &password).await {
+        Ok(Some(identity)) => {
+            audit
+                .record(AuditEntry {
+                    actor_username: Some(&identity.username),
+                    actor_role: Some(identity.role.as_str()),
+                    action: "login",
+                    resource: "auth",
+                    entity_id: None,
+                    detail: Some(serde_json::json!({ "via": "autologin" })),
+                    origin: "tauri",
+                    result: "ok",
+                })
+                .await;
+            Some(DesktopSession::Account(identity))
+        }
+        Ok(None) => {
+            // Credentials no longer valid (e.g. the password was changed
+            // since autologin was set up) - spec M11: do NOT auto-disable the
+            // setting, just fall through to the login screen.
+            eprintln!(
+                "banto: 自動ログインの資格情報が無効です（パスワード変更等）。ログイン画面を表示します。"
+            );
+            record_autologin_failed(audit, username).await;
+            None
+        }
+        Err(err) => {
+            eprintln!("banto: 自動ログインの検証に失敗しました: {err}");
+            record_autologin_failed(audit, username).await;
+            None
+        }
+    }
+}
+
+/// [`initial_desktop_session`]'s `login_failed` entry for the autologin.
+async fn record_autologin_failed(audit: &AuditLogService, username: &str) {
+    audit
+        .record(AuditEntry {
+            actor_username: Some(username),
+            actor_role: None,
+            action: "login_failed",
+            resource: "auth",
+            entity_id: None,
+            detail: Some(serde_json::json!({ "via": "autologin" })),
+            origin: "tauri",
+            result: "failed",
+        })
+        .await;
+}
 
 pub fn run() {
     tauri::Builder::default()
@@ -4255,73 +4391,70 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(banto_desktop_tray::QuitGate::new())
-        .manage(ExitCleanupOnce::default())
+        .manage(ExitOnce(ExitCleanupOnce::new()))
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("resolve app data dir");
             std::fs::create_dir_all(&data_dir).expect("create app data dir");
             let db_path = data_dir.join("chronogazer.sqlite3");
 
-            // #392 A1: 同じ DB を別のプロセス（もう 1 つのデスクトップアプリや
-            // `banto-serve`）が使っていれば、**DB に触れる前**（リストア予約の
-            // 適用より前）に、メインの画面の代わりにエラーの窓を出して終わる。
-            // ガードはプロセスの終わりまで `manage` で持つ。リリースビルドは
-            // `windows_subsystem = "windows"` で stderr が見えないため窓で知らせる。
-            match chronogazer_core::instance_lock::acquire_for_db(
-                &db_path,
-                chronogazer_core::instance_lock::ChronoGazerHost::Desktop,
-            ) {
-                Ok(guard) => {
-                    app.manage(InstanceLockHolder(guard));
-                }
-                Err(failure) => {
+            // #392 B1-2: 起動の組み立ては `chronogazer_core::engine`（`banto-serve` と
+            // 共有）。ここに残すのはデスクトップ固有の部分（窓・webview への
+            // イベントの転送・LAN の自動起動の判定・自動ログイン・Acrylic・
+            // トレイ・OS キーリング）だけ。
+            //
+            // 前半（`EngineRuntime::open`）: A1 の排他（#392 A1、**DB に触れる前**）→
+            // リストア予約の適用（Spec M17、pool を作る前。失敗しても起動は止めない）
+            // → `init_db`。A1 の排他はエンジンが持ち、プロセスの終わり（エンジンを
+            // 持つ管理状態はプロセス終了まで drop されない）まで返さない。
+            //
+            // 失敗のうち、利用者に窓で知らせるのは今までどおり 2 つ:
+            // - 同じ DB を別のプロセス（もう 1 つのデスクトップアプリや
+            //   `banto-serve`）が使っている（A1）。
+            // - 旧形式の DB（DB スキーマの整理 2026-10-02。自動移行は無い。何を
+            //   すればよいかは `InitDbError::Legacy` の文言、手順は
+            //   apps/chronogazer/README.md）。
+            // リリースビルドは `windows_subsystem = "windows"` で stderr が見えない
+            // ので、メインの画面の代わりにエラー専用の窓を開く
+            // （[`open_startup_error_window`]）。`AppState` は manage しない - 開くのは
+            // コマンドを呼ばない静的ページだけで、閉じると最後の窓なのでプロセスが
+            // 終わる（`RunEvent::Exit` の後始末は `try_state` で何もしない）。
+            // それ以外（DB を開けない）は今までどおり panic で止める。
+            let opened = match tauri::async_runtime::block_on(EngineRuntime::open(
+                EngineConfig {
+                    db_path: db_path.clone(),
+                    // `data.dir` の相対パスは**アプリのデータディレクトリ基準**
+                    // （既定 `"./data"` をプロセスの作業ディレクトリに作らない）。
+                    data_base: data_dir.clone(),
+                    // #332: Hub の API キーは OS キーリング。
+                    key_store: Arc::new(keyring_store::KeyringKeyStore),
+                    // #383 段階3 P3: Hub 経由の接続を収集で記録する。
+                    attach_hub: true,
+                    host: ChronoGazerHost::Desktop,
+                    // LAN の自動起動は DB を開けた後に設定から決める（下）。
+                    listen: EngineListen::Disabled,
+                    // 初回セットアップは `auth_setup` コマンド（`invoke()`）で行い、
+                    // LAN の `POST /api/auth/setup` は開けない（`banto-serve` だけ）。
+                    allow_setup: false,
+                    seed_viewer_public: false,
+                    log_label: "banto",
+                    audit_origin: "tauri",
+                    // 保存設定（`data.dir`）を読めなければ起動を止める（B1-1 より
+                    // 前からのデスクトップの扱い。既定値で続けると、別の場所を設定
+                    // していた利用者の時系列データを違う場所へ書き始める）。
+                    store_config_required: true,
+                },
+            )) {
+                Ok(opened) => opened,
+                Err(EngineStartError::InstanceLock(failure)) => {
                     eprintln!("banto: {failure}");
                     let notice = StartupErrorNotice::already_running(&failure);
                     if let Err(err) = open_startup_error_window(app, &notice) {
                         eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
                         std::process::exit(1);
                     }
-                    // `AppState` は manage しない（旧形式の DB の拒否と同じ形）。
-                    // 窓を閉じると最後の窓なのでプロセスが終わる。
                     return Ok(());
                 }
-            }
-
-            // Spec M17: apply any staged restore BEFORE `init_db`/the pool is
-            // created - see `BackupService::apply_pending_restore_at_startup`'s
-            // doc comment for why this must run first (no pool may exist yet
-            // when a restore is applied). Best-effort at this top level: a
-            // failure here must never prevent the desktop app from starting
-            // at all - the current db (if any) is left untouched on error,
-            // per that function's own per-step safety notes.
-            //
-            // I2a（banto #280）: 予約もバックアップも
-            // `<データディレクトリ>/backups/chronogazer.sqlite3/` に置かれる。
-            // それより前の共有領域（`backups/` 直下・`restore-pending.sqlite3`）
-            // に残ったファイルは、この呼び出しが警告を出すだけで、移しも適用も
-            // しない（2026-10-04 オーナー決定: banto の既定どおり）。
-            let applied_restore = match tauri::async_runtime::block_on(
-                BackupService::apply_pending_restore_at_startup(&db_path),
-            ) {
-                Ok(applied) => applied,
-                Err(err) => {
-                    eprintln!("banto: 起動時のリストア適用に失敗しました: {err}");
-                    None
-                }
-            };
-
-            // init_db takes a filesystem path (not a sqlite:// URL) so
-            // Windows paths with drive letters/backslashes work unchanged.
-            //
-            // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は無い）。
-            // panic のメッセージで済ませず、何をすればよいかを出して終了する
-            // （`chronogazer_core::db` のモジュール doc「旧形式の DB の拒否」、
-            // 手順は apps/chronogazer/README.md）。リリースビルドは
-            // `windows_subsystem = "windows"` で stderr が見えないので、メインの
-            // 画面の代わりにエラー専用の窓を開く（[`open_startup_error_window`]）。
-            // stderr にも出す（開発ビルド用）。
-            let pool = match tauri::async_runtime::block_on(init_db(&db_path)) {
-                Ok(pool) => pool,
-                Err(InitDbError::Legacy(legacy)) => {
+                Err(EngineStartError::Database(InitDbError::Legacy(legacy))) => {
                     eprintln!("banto: {legacy}");
                     if let Err(err) =
                         open_startup_error_window(app, &StartupErrorNotice::new(&legacy))
@@ -4329,12 +4462,10 @@ pub fn run() {
                         eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
                         std::process::exit(1);
                     }
-                    // `AppState` は manage しない。開くのはコマンドを呼ばない
-                    // 静的ページだけで、閉じると最後の窓なのでプロセスが終わる
-                    // （`RunEvent::Exit` の後始末は `try_state` で何もしない）。
                     return Ok(());
                 }
-                Err(err) => panic!("init_db should succeed: {err}"),
+                Err(EngineStartError::Database(err)) => panic!("init_db should succeed: {err}"),
+                Err(err) => panic!("engine open should succeed: {err}"),
             };
 
             // メインの窓は tauri.conf.json で `create: false` にしてあり、DB を
@@ -4346,99 +4477,16 @@ pub fn run() {
                 banto_desktop_tray::hide_to_tray_on_close(&window, tray::TRAY_HINT);
             }
 
-            let events = event_channel();
-            let users = UsersService::new(Db::Sqlite(pool.clone()));
-            let settings = SettingsService::new(Db::Sqlite(pool.clone()));
-            let backup = BackupService::new(db_path.clone(), Db::Sqlite(pool.clone()));
-            // #383 段階2a / R1-B: レジストリ3サービス。テーブルは
-            // `init_db` が呼ぶ `banto_tags::migrate` で既に作成済み。
-            let plc_connections = PlcConnectionService::new(pool.clone());
-            let collection_groups = CollectionGroupService::new(pool.clone());
-            let tags = TagService::new(pool.clone());
-            // #383 段階2b / R1-C: 収集ランタイム。`data.dir` は設定から読み、
-            // **相対パスはこのアプリのデータディレクトリ基準**で解決する
-            // （既定 `"./data"` をそのまま使うと、プロセスの作業ディレクトリ
-            // という当てにならない場所に時系列ファイルを作ってしまう）。
-            // `retention.days` は収集では読まない - 古いファイルの削除は
-            // `chronogazer_core::retention`（下の spawn。#538）が、掃除のたびに
-            // 設定から読み直して行う。
-            //
-            // 開始は下の `autostart` まで待つ（`AppState` の他の材料が
-            // 揃ってから、ランタイムの上で spawn したいため）。
-            let store_settings = tauri::async_runtime::block_on(store_config(&settings))
-                .expect("store_config should succeed");
-            let collect_data_dir = resolve_data_dir(&data_dir, &store_settings.data_dir);
-            let collect = CollectorService::new(pool.clone(), collect_data_dir);
-            // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・応答
-            // しない監査は DB の隣（= アプリのデータディレクトリ）の
-            // `audit-spool/<DB ファイル名>/` に退避し、`record` は 3 秒で戻る
-            // （`chronogazer_core::audit_spool` のモジュール doc）。
-            // マイグレーション（`init_db`）は済んでいるので、前回の実行で残った
-            // 保留をここで 1 回流し込む。定期の流し込みは、この後の起動手順が
-            // すべて済んでから起こす（`setup()` の末尾）。
-            let audit = chronogazer_core::audit_spool::build_audit_service(
-                Db::Sqlite(pool.clone()),
-                &db_path,
-            );
-            tauri::async_runtime::block_on(chronogazer_core::audit_spool::flush_at_startup(
-                &audit, "banto",
-            ));
-            // Records `login`/`login_failed` audit entries (spec M14) from
-            // inside the verifier itself - see
-            // `chronogazer_core::rest::audited_credential_verifier`'s doc
-            // comment. This is the embedded LAN server's OWN session
-            // (`origin: "rest"`) - the webview's session goes through
-            // `auth_login` below instead. banto v1.7.0 #204: also re-checks
-            // the account on every request (`user_auth_state`), so a change
-            // made from the webview's commands ends LAN sessions too.
-            let rest_auth = user_auth_state(users.clone(), audit.clone());
-            let audit_for_spool = audit.clone();
-
-            // Spec M17: record `restore_applied` now that a real
-            // `AuditLogService` exists - `apply_pending_restore_at_startup`
-            // itself cannot record this (it runs before any pool/audit
-            // service exists at all). No caller identity exists at this
-            // point either (nobody has logged in yet) - mirrors how the
-            // auth-disabled bootstrap's synthetic `login` entry below has no
-            // "real" actor either.
-            if let Some(applied) = &applied_restore {
-                tauri::async_runtime::block_on(audit.record(AuditEntry {
-                    actor_username: None,
-                    actor_role: None,
-                    action: "restore_applied",
-                    resource: "backups",
-                    entity_id: None,
-                    detail: Some(serde_json::json!({
-                        "preRestoreBackupFileName": applied.pre_restore_backup_file_name,
-                    })),
-                    origin: "tauri",
-                    result: "ok",
-                }));
-            }
-
-            // Startup prune (spec M14: "アプリ起動時に1回 + list実行時に軽く" -
-            // see `audit_log_list`'s doc comment for why no dedicated
-            // background task is needed beyond this plus that opportunistic
-            // prune). Best-effort: a prune failure must never block startup.
-            match tauri::async_runtime::block_on(settings.audit_config()) {
-                Ok(config) => {
-                    if let Err(err) = tauri::async_runtime::block_on(
-                        audit.prune(config.retention_days, config.retention_rows),
-                    ) {
-                        eprintln!("banto: 起動時の監査ログの剪定に失敗しました: {err}");
-                    }
-                }
-                Err(err) => eprintln!("banto: 監査ログの保持設定の読み取りに失敗しました: {err}"),
-            }
-
             // Forward every resource-change/notice event onto the webview
             // (spec §3.5's TauriEventProvider side: the webview has no
             // network, so it cannot use the SSE endpoint a LAN browser
             // client uses - `banto://event` is the in-process equivalent,
             // fed by the SAME broadcast channel the REST server's SSE route
-            // fans out to browsers while running).
+            // fans out to browsers while running). Subscribed BEFORE
+            // `start()` so nothing the engine broadcasts while starting is
+            // missed.
             let app_handle = app.handle().clone();
-            let mut events_rx = events.subscribe();
+            let mut events_rx = opened.events().subscribe();
             tauri::async_runtime::spawn(async move {
                 loop {
                     match events_rx.recv().await {
@@ -4452,148 +4500,6 @@ pub fn run() {
                     }
                 }
             });
-
-            // M11 bootstrap: decide the webview's starting session before
-            // anything else, in priority order -
-            //   1. auth-disabled mode ("ログイン不要モード") - a synthetic
-            //      identity, no login screen at all.
-            //   2. desktop autologin - verify a keyring-stored credential
-            //      against `users`, same as a normal login.
-            //   3. neither - the ordinary login screen (`auth: None`).
-            let auth_config = tauri::async_runtime::block_on(settings.auth_config())
-                .expect("auth_config should succeed");
-            let initial_auth: Option<DesktopSession> = if auth_config.disabled {
-                // The ONE definition of the synthetic identity and its
-                // `login` entry, shared with `auth_config_apply_body` /
-                // `logout_body` (banto v2.0.0 移行): `local_identity` /
-                // `record_local_login`.
-                let local_identity = local_identity(auth_config.disabled_role);
-                tauri::async_runtime::block_on(record_local_login(&audit, &local_identity));
-                Some(DesktopSession::AuthDisabledLocal(local_identity))
-            } else if auth_config.autologin_enabled {
-                match &auth_config.autologin_username {
-                    Some(username) => match keyring_store::get_password(username) {
-                        Ok(password) => {
-                            match tauri::async_runtime::block_on(users.verify(username, &password))
-                            {
-                                Ok(Some(identity)) => {
-                                    tauri::async_runtime::block_on(audit.record(AuditEntry {
-                                        actor_username: Some(&identity.username),
-                                        actor_role: Some(identity.role.as_str()),
-                                        action: "login",
-                                        resource: "auth",
-                                        entity_id: None,
-                                        detail: Some(serde_json::json!({ "via": "autologin" })),
-                                        origin: "tauri",
-                                        result: "ok",
-                                    }));
-                                    Some(DesktopSession::Account(identity))
-                                }
-                                Ok(None) => {
-                                    // Credentials no longer valid (e.g. the
-                                    // password was changed since autologin
-                                    // was set up) - spec M11: do NOT
-                                    // auto-disable the setting, just fall
-                                    // through to the login screen.
-                                    eprintln!(
-                                        "banto: 自動ログインの資格情報が無効です（パスワード変更等）。ログイン画面を表示します。"
-                                    );
-                                    tauri::async_runtime::block_on(audit.record(AuditEntry {
-                                        actor_username: Some(username),
-                                        actor_role: None,
-                                        action: "login_failed",
-                                        resource: "auth",
-                                        entity_id: None,
-                                        detail: Some(serde_json::json!({ "via": "autologin" })),
-                                        origin: "tauri",
-                                        result: "failed",
-                                    }));
-                                    None
-                                }
-                                Err(err) => {
-                                    eprintln!("banto: 自動ログインの検証に失敗しました: {err}");
-                                    tauri::async_runtime::block_on(audit.record(AuditEntry {
-                                        actor_username: Some(username),
-                                        actor_role: None,
-                                        action: "login_failed",
-                                        resource: "auth",
-                                        entity_id: None,
-                                        detail: Some(serde_json::json!({ "via": "autologin" })),
-                                        origin: "tauri",
-                                        result: "failed",
-                                    }));
-                                    None
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            // Keyring entry missing / backend unavailable -
-                            // safe degrade to the login screen (spec M11).
-                            eprintln!("banto: 自動ログインの資格情報の取得に失敗しました: {err}");
-                            None
-                        }
-                    },
-                    None => None,
-                }
-            } else {
-                None
-            };
-
-            // #332: Hub 接続。`HubService::new` は `installation_id` を設定
-            // から読む（無ければ生成して保存する）ので非同期 - 他の起動時の
-            // 読み取りと同じく `block_on` する。失敗は起動を止める（設定 DB
-            // が書けない状態であり、他のサービスも同様に `expect` している）。
-            let hub = tauri::async_runtime::block_on(HubService::new(
-                settings.clone(),
-                std::sync::Arc::new(keyring_store::KeyringKeyStore),
-            ))
-            .expect("HubService should initialize");
-            // #383 段階3 P4: 購読の対象（登録済みの hub タグ）をレジストリから読む。
-            hub.attach_registry(pool.clone());
-
-            // #383 段階1: 保存済みの接続と選択タグがあれば、設定画面を
-            // 開かなくても購読を張り直す。Hub が落ちている・キーが無効に
-            // なっている等はここでは起動を止める理由にならないので、
-            // spawn して投げっぱなしにする（`resume` 自身が失敗を飲んで
-            // ログに出す）。
-            {
-                let hub = hub.clone();
-                tauri::async_runtime::spawn(async move { hub.resume().await });
-            }
-
-            // #383 段階2b / R1-C（C-2）: 収集の**起動時の自動開始**
-            // （docs/r1-plan.md の R1-C「起動時に build_config → start」）。
-            // すぐ上の `hub.resume()` と同じ形 - **spawn して投げっぱなし**に
-            // するので、tstore を開くのに手間取っても起動画面が待たされず、
-            // **失敗しても起動は止まらない**（理由は状態に残り、
-            // `collect_status` から見える。収集対象 0 件は失敗ではない）。
-            //
-            // **レジストリを後から編集しても自動では再起動しない** - 反映は
-            // 明示的な `collect_restart` だけ（理由は
-            // `chronogazer_core::collect` のモジュール doc）。
-            //
-            // **注意**: このアプリと `banto-serve` を同時に起動して同じ
-            // `data.dir` を指すと二重書き込みになる（防止機構は未実装 -
-            // 同モジュール doc「同じ `data.dir` を 2 つのプロセスで
-            // 開かないこと」）。
-            //
-            // #383 段階3 P3: Hub 経由の接続（`protocol = hub`）は上の Hub 購読から
-            // 値を取って同じ収集エンジンで記録する。**自動開始の前に**つなぐ
-            // （後からつないでも、走り出した収集には効かない）。
-            collect.attach_hub(hub.clone());
-            {
-                let collect = collect.clone();
-                tauri::async_runtime::spawn(async move { collect.autostart().await });
-            }
-
-            // 保持期間を過ぎた時系列データファイルの削除（#538）。起動時に 1 回、
-            // その後は日付が変わるたびに 1 回。失敗してもログに出すだけで収集は
-            // 止めない。削除は収集サービス経由（書き手が今開いている日付のファイルは
-            // 消さない）。
-            tauri::async_runtime::spawn(chronogazer_core::retention::run(
-                settings.clone(),
-                collect.clone(),
-            ));
 
             // If LAN access was left enabled on a previous run, start the
             // server immediately (spec §11.4) - from here on, the settings
@@ -4610,6 +4516,15 @@ pub fn run() {
             // written, and leave the inconsistency for the user to resolve
             // from the settings screen (this does NOT rewrite either
             // setting). I2b: the decision is [`lan_autostart_allowed`].
+            //
+            // The bind is best-effort (`EngineListen::BestEffort`): the desktop
+            // app itself works fine with no LAN access, so a failure (e.g. the
+            // persisted port now being in use) only goes to the log; the
+            // settings screen's `server_status` reports `running: false` and
+            // the user can pick a different port via `server_apply`.
+            let settings = opened.settings();
+            let auth_config = tauri::async_runtime::block_on(settings.auth_config())
+                .expect("auth_config should succeed");
             let server_config = tauri::async_runtime::block_on(settings.server_config())
                 .expect("server_config should succeed");
             let autostart = lan_autostart_allowed(&auth_config, &server_config);
@@ -4618,41 +4533,41 @@ pub fn run() {
                     "banto: 認証無効モードとLANアクセスが閲覧公開なしで同時に有効な不整合な設定を検出したため、LANサーバーの自動起動をスキップしました。設定画面でどちらかを無効にするか、閲覧公開を有効にしてください。"
                 );
             }
-            let initial_server = if autostart {
-                let runtime_config = ServerConfig {
+            let opened = opened.with_listen(if autostart {
+                EngineListen::BestEffort(ServerConfig {
                     bind: server_config.bind.clone(),
                     port: server_config.port,
-                };
-                match tauri::async_runtime::block_on(bind_listener(runtime_config)) {
-                    Ok(bound) => Some(tauri::async_runtime::block_on(start_embedded_server(
-                        users.clone(),
-                        settings.clone(),
-                        audit.clone(),
-                        backup.clone(),
-                        hub.clone(),
-                        plc_connections.clone(),
-                        collection_groups.clone(),
-                        tags.clone(),
-                        collect.clone(),
-                        DisplayGroupService::new(pool.clone()),
-                        rest_auth.clone(),
-                        events.clone(),
-                        bound,
-                    ))),
-                    Err(err) => {
-                        // Non-fatal: the desktop app itself works fine with
-                        // no LAN access; surface the failure (e.g. the
-                        // persisted port now being in use) to the log only.
-                        // The settings screen's `server_status` will report
-                        // `running: false` and the user can pick a different
-                        // port via `server_apply`.
-                        eprintln!("banto: 起動時のLANアクセス開始に失敗しました: {err}");
-                        None
-                    }
-                }
+                })
             } else {
-                None
+                EngineListen::Disabled
+            });
+
+            // 後半（`OpenedEngine::start`）: サービス・監査の保留の流し込み・
+            // 監査ログの剪定 → Hub（`attach_registry`）→ 収集（`attach_hub` は
+            // 自動開始より前）→ LAN の bind → Hub の張り直し・収集の自動開始・
+            // 保持期間の掃除（どれも spawn して投げっぱなし。失敗しても起動は
+            // 止めず、理由は状態に残る）→ LAN の serve → 監査の保留の定期の
+            // 流し込み。順序の理由は `chronogazer_core::engine` のモジュール doc。
+            // Hub の初期化（設定 DB が書けない）・保存設定の読み取りの失敗は、
+            // 今までどおり panic で止める。
+            let engine = match tauri::async_runtime::block_on(opened.start()) {
+                Ok(engine) => engine,
+                Err(EngineStartError::Hub(err)) => panic!("HubService should initialize: {err:?}"),
+                Err(EngineStartError::StoreConfig(err)) => {
+                    panic!("store_config should succeed: {err:?}")
+                }
+                Err(err) => panic!("engine start should succeed: {err}"),
             };
+            let services = engine.services().clone();
+
+            // M11 bootstrap: decide the webview's starting session (see
+            // [`initial_desktop_session`]). #392 B1-2: this now runs after the
+            // engine has started (Hub resume, collection autostart). Both are
+            // spawned and never awaited, and `AppState` (so every Tauri
+            // command) does not exist until below, so nothing observable
+            // changes.
+            let initial_auth =
+                tauri::async_runtime::block_on(initial_desktop_session(&services, &auth_config));
 
             // M12: re-apply the persisted vibrancy (Windows Acrylic) choice
             // on launch. Best-effort by design - a failure (old Windows 10
@@ -4663,7 +4578,7 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             {
                 let vibrancy_enabled = tauri::async_runtime::block_on(
-                    settings.get(KEY_DESKTOP_VIBRANCY),
+                    services.settings.get(KEY_DESKTOP_VIBRANCY),
                 )
                 .unwrap_or_else(|err| {
                     eprintln!("banto: vibrancy設定の読み取りに失敗しました: {err}");
@@ -4689,29 +4604,14 @@ pub fn run() {
 
             app.manage(AppState {
                 auth: Mutex::new(AuthSlot::new(initial_auth)),
-                auth_io: AuthIo::production(&users, &settings),
+                auth_io: AuthIo::production(&services.users, &services.settings),
                 auth_config_lock: AsyncMutex::new(()),
-                users,
-                settings,
-                events,
-                rest_auth,
-                server: AsyncMutex::new(initial_server),
-                audit,
-                backup,
-                hub,
-                plc_connections,
-                collection_groups,
-                tags,
-                collect,
-                pool,
+                server: Arc::clone(engine.server_slot()),
+                services,
             });
-
-            // #437: 監査の保留の定期の流し込みは、起動手順の最後（ここ）で起こす。
-            // ハンドルは `RunEvent::Exit` で止める（`AuditSpoolFlusher`）。
-            // `tokio::spawn` は tokio のランタイムの中で呼ぶ必要があるので
-            // `block_on` に包む。
-            let flusher = tauri::async_runtime::block_on(async { audit_for_spool.spawn_spool_flusher() });
-            app.manage(AuditSpoolFlusher(std::sync::Mutex::new(flusher)));
+            // 終了の後始末（[`exit_cleanup`]）がエンジンを止める。プロセスの
+            // 終わりまで drop されない（A1 の排他もそこまで持つ）。
+            app.manage(DesktopEngine(Arc::new(engine)));
 
             // #392 A2: トレイ（収集の状態・開く・終了）。`AppState` を manage
             // した後に作る（状態の表示と「終了」が `AppState` を読むため）。
@@ -4804,22 +4704,24 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             // #383 R1-C の前提: アプリの event loop が終わるときに、この
-            // プロセスが持っている外向きの資源を明示的に閉じる。`AppState`
-            // は Tauri の managed state なので**プロセス終了で Drop が
-            // 走らない** - ここを通らない限り、Hub の購読 WS は close を
+            // プロセスが持っている外向きの資源を明示的に閉じる。エンジン
+            // （`DesktopEngine`）は Tauri の managed state なので**プロセス終了で
+            // Drop が走らない** - ここを通らない限り、Hub の購読 WS は close を
             // 送らずに切れ、LAN サーバーは graceful shutdown せず、SQLite の
             // `-wal`/`-shm` が残る。収集エンジンを同じプロセスに載せる
             // オーナー決定（2026-09-18、docs/recorder-requirements.md §4）の
             // 下では、**ここが唯一の「止める場所」**になる。
             //
-            // Best effort: `try_state` が `None`（`setup()` が
-            // `app.manage(..)` に到達する前に落ちた）なら閉じるものは無い。
-            // 全体の上限は `shutdown_app_state` が持つ。
+            // Best effort: `try_state` が `None`（`setup()` がエンジンを
+            // `app.manage(..)` する前に起動を止めた）なら閉じるものは無い。
+            // 全体の上限は [`EXIT_CLEANUP_BUDGET`]。
             //
             // **テストの範囲**（#396 のレビュー C で訂正）:
             //
             // * 後始末の中身は `shutdown_app_state` の単体テスト
-            //   （`exit_cleanup_closes_the_pool`）で押さえてある。
+            //   （`exit_cleanup_closes_the_pool`、本物のエンジン相手）と
+            //   エンジンの終了の順序のテスト（`chronogazer_core::engine`）、
+            //   1 回に限る・記録の仕方は `run_exit_cleanup` のテストで押さえてある。
             // * `tauri::RunEvent::Exit` **自体は構築できる**（`#[non_exhaustive]`
             //   が付いているのは enum であって `Exit` variant ではない。
             //   このクレートで `let e = tauri::RunEvent::Exit;` が通ることを
@@ -4828,20 +4730,21 @@ pub fn run() {
             //   判断: 切り出した関数は `AppHandle` を要求し、それを作るには
             //   `tauri::test` のモックランタイム（このクレートでは未有効）で
             //   アプリを組み立てる必要がある一方、確かめられるのは
-            //   「`Exit` のときだけ `shutdown_app_state` を呼ぶ」という
+            //   「`Exit` のときだけ `exit_cleanup` を呼ぶ」という
             //   3 行の分岐だけになる。
             // * 「OS の終了 → Tauri のイベントループ → このコールバック」と
             //   いう**経路全体**は、どのみち通常の unit test では再現できない
             //   （このクレートは CI の Linux コンテナでビルドすらできない）。
             //   そこは実機確認の領域 - relay-wright の W3-B2 と同じ状況。
             //
-            // #392 A2: 後始末は [`exit_cleanup_once`] が 1 回に限る。トレイの
-            // 「終了」は `exit` の前に後始末を済ませてあるので、ここは済んだ
-            // 結果を受け取るだけ。OS のシャットダウン・ログオフでは tao が
+            // #392 A2 / B1-2: 後始末は [`exit_cleanup`]（共有の
+            // `ExitCleanupOnce`）が 1 回に限る。トレイの「終了」は `exit` の前に
+            // 後始末を済ませてあるので、ここは済んだ結果を受け取るだけ
+            // （記録もしない）。OS のシャットダウン・ログオフでは tao が
             // `WM_ENDSESSION` でここ（`Exit`）を呼んでから `process::exit`
             // するので、窓を隠したまま（トレイ常駐中）でも収集はここで止まる。
             if let tauri::RunEvent::Exit = event {
-                tauri::async_runtime::block_on(exit_cleanup_once(app_handle));
+                exit_cleanup(app_handle, ExitTrigger::RunEventExit);
             }
         });
 }
@@ -4849,6 +4752,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_server::AuthState;
+    use chronogazer_core::backup::BackupService;
+    use chronogazer_core::collect::CollectorService;
+    use chronogazer_core::db::Db;
+    use chronogazer_core::events::event_channel;
+    use chronogazer_core::hub::HubService;
+    use chronogazer_core::{CollectionGroupService, PlcConnectionService, TagService};
 
     /// DB スキーマの整理（2026-10-02）: 旧形式の DB を拒否したときの窓に出す
     /// 文は、DB のパスと対処（削除または退避して起動し直す）を含み、ページへ
@@ -5031,7 +4941,30 @@ mod tests {
     /// sharing the same `users` table (each with its own webview session and
     /// its own REST token space).
     async fn app_state_on(pool: chronogazer_core::db::DbPool) -> AppState {
-        let events = event_channel();
+        // 収集は起動しないので `data_dir` は使われない（`backup` の
+        // `"unused-in-tests"` と同じ扱い）。
+        let services = services_on(
+            pool,
+            PathBuf::from("unused-in-tests").join("chronogazer.sqlite3"),
+            PathBuf::from("unused-in-tests"),
+            // #383 段階3 P4: 本番の起動（エンジン）と同じくレジストリを差し込む。
+            true,
+        )
+        .await;
+        app_state_from(services)
+    }
+
+    /// The engine's service handles over `pool`, built the way
+    /// `chronogazer_core::engine::OpenedEngine::start` builds them but
+    /// without starting anything (no Hub resume, no collection autostart, no
+    /// listener) - #392 B1-2: `AppState` takes `EngineServices`, and the
+    /// command bodies under test only touch the handles.
+    async fn services_on(
+        pool: chronogazer_core::db::DbPool,
+        db_path: PathBuf,
+        data_dir: PathBuf,
+        attach_registry: bool,
+    ) -> EngineServices {
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         // #332: tests never touch a real OS keyring - `UnavailableKeyStore`
         // reads as "no entry" and refuses to write, so no test can leave a
@@ -5042,18 +4975,20 @@ mod tests {
         )
         .await
         .expect("HubService::new");
-        // #383 段階3 P4: 本番の起動（`setup`）と同じくレジストリを差し込む。
-        hub.attach_registry(pool.clone());
-        AppState {
-            auth: Mutex::new(AuthSlot::default()),
-            auth_config_lock: AsyncMutex::new(()),
-            auth_io: AuthIo::production(
-                &UsersService::new(Db::Sqlite(pool.clone())),
-                &SettingsService::new(Db::Sqlite(pool.clone())),
-            ),
+        if attach_registry {
+            hub.attach_registry(pool.clone());
+        }
+        EngineServices {
             users: UsersService::new(Db::Sqlite(pool.clone())),
             settings,
-            events,
+            audit: AuditLogService::new(Db::Sqlite(pool.clone())),
+            backup: BackupService::new(db_path, Db::Sqlite(pool.clone())),
+            hub,
+            plc_connections: PlcConnectionService::new(pool.clone()),
+            collection_groups: CollectionGroupService::new(pool.clone()),
+            tags: TagService::new(pool.clone()),
+            display_groups: DisplayGroupService::new(pool.clone()),
+            collect: CollectorService::new(pool.clone(), data_dir),
             // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
             // Tauri のセッションが同じアカウントの変更で終わることを、
             // 両経路をまたいで確かめるテストが使う。
@@ -5061,20 +4996,19 @@ mod tests {
                 UsersService::new(Db::Sqlite(pool.clone())),
                 AuditLogService::new(Db::Sqlite(pool.clone())),
             ),
-            server: AsyncMutex::new(None),
-            audit: AuditLogService::new(Db::Sqlite(pool.clone())),
-            backup: BackupService::new(
-                PathBuf::from("unused-in-tests").join("chronogazer.sqlite3"),
-                Db::Sqlite(pool.clone()),
-            ),
-            hub,
-            plc_connections: PlcConnectionService::new(pool.clone()),
-            collection_groups: CollectionGroupService::new(pool.clone()),
-            tags: TagService::new(pool.clone()),
-            // 収集は起動しないので `data_dir` は使われない（`backup` の
-            // `"unused-in-tests"` と同じ扱い）。
-            collect: CollectorService::new(pool.clone(), PathBuf::from("unused-in-tests")),
+            events: event_channel(),
             pool,
+        }
+    }
+
+    /// An [`AppState`] over `services` with no session and no running server.
+    fn app_state_from(services: EngineServices) -> AppState {
+        AppState {
+            auth: Mutex::new(AuthSlot::default()),
+            auth_config_lock: AsyncMutex::new(()),
+            auth_io: AuthIo::production(&services.users, &services.settings),
+            server: Arc::new(ServerSlot::default()),
+            services,
         }
     }
 
@@ -5099,75 +5033,254 @@ mod tests {
         let pool = chronogazer_core::db::init_db(&db_path)
             .await
             .expect("init_db");
-        let events = event_channel();
-        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
-        let hub = HubService::new(
-            settings.clone(),
-            std::sync::Arc::new(chronogazer_core::hub::UnavailableKeyStore),
-        )
-        .await
-        .expect("HubService::new");
-        let state = AppState {
-            auth: Mutex::new(AuthSlot::default()),
-            auth_config_lock: AsyncMutex::new(()),
-            auth_io: AuthIo::production(
-                &UsersService::new(Db::Sqlite(pool.clone())),
-                &SettingsService::new(Db::Sqlite(pool.clone())),
-            ),
-            users: UsersService::new(Db::Sqlite(pool.clone())),
-            settings,
-            events,
-            // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
-            // Tauri のセッションが同じアカウントの変更で終わることを、
-            // 両経路をまたいで確かめるテストが使う。
-            rest_auth: chronogazer_core::rest::user_auth_state(
-                UsersService::new(Db::Sqlite(pool.clone())),
-                AuditLogService::new(Db::Sqlite(pool.clone())),
-            ),
-            server: AsyncMutex::new(None),
-            audit: AuditLogService::new(Db::Sqlite(pool.clone())),
-            backup: BackupService::new(db_path, Db::Sqlite(pool.clone())),
-            hub,
-            plc_connections: PlcConnectionService::new(pool.clone()),
-            collection_groups: CollectionGroupService::new(pool.clone()),
-            tags: TagService::new(pool.clone()),
-            collect: CollectorService::new(pool.clone(), dir.path().join("data")),
-            pool,
-        };
-        (dir, state)
+        let services = services_on(pool, db_path, dir.path().join("data"), false).await;
+        (dir, app_state_from(services))
+    }
+
+    /// The desktop's engine configuration (`setup()`) over a temp directory,
+    /// with `UnavailableKeyStore` instead of the OS keyring.
+    fn desktop_engine_config(dir: &std::path::Path) -> EngineConfig {
+        EngineConfig {
+            db_path: dir.join("chronogazer.sqlite3"),
+            data_base: dir.to_path_buf(),
+            key_store: Arc::new(chronogazer_core::hub::UnavailableKeyStore),
+            attach_hub: true,
+            host: ChronoGazerHost::Desktop,
+            listen: EngineListen::Disabled,
+            allow_setup: false,
+            seed_viewer_public: false,
+            log_label: "banto",
+            audit_origin: "tauri",
+            store_config_required: true,
+        }
     }
 
     /// #383 R1-C's prerequisite: the exit cleanup closes the pool (and does
     /// not hang doing it). This covers the BODY of the exit hook only - see
     /// [`run`]'s comment for exactly what is and is not tested around it
-    /// (corrected in #396's review C).
+    /// (corrected in #396's review C). #392 B1-2: the body is the engine's
+    /// shutdown, so this runs against a real engine started the way
+    /// `setup()` starts it (the order itself is tested in
+    /// `chronogazer_core::engine`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exit_cleanup_closes_the_pool() {
-        let state = app_state().await;
-        assert!(!state.pool.is_closed(), "前提: 起動中はプールが開いている");
+        let dir = TempDir::new();
+        let engine = EngineRuntime::start(desktop_engine_config(dir.path()))
+            .await
+            .expect("engine start");
+        let services = engine.services().clone();
+        assert!(
+            !services.pool.is_closed(),
+            "前提: 起動中はプールが開いている"
+        );
 
         // The budget is the outer bound; nothing here should take anywhere
         // near it, so a plain call is enough to catch a hang (the test would
         // never finish) as well as the wrong end state.
-        let report = shutdown_app_state(&state).await;
+        let report = shutdown_app_state(&engine, EXIT_CLEANUP_BUDGET).await;
         // #392 A2: 何も失敗していなければ、トレイの「終了」は黙って終わる。
         assert_eq!(report, ExitCleanupReport::default(), "後始末は全部済んだ");
 
-        assert!(state.pool.is_closed(), "DBプールが閉じている");
+        assert!(services.pool.is_closed(), "DBプールが閉じている");
         assert_eq!(
-            state.hub.subscription().await.state,
+            services.hub.subscription().await.state,
             "stopped",
             "購読は止まっている"
         );
-        // #383 段階2b / R1-C: 収集も止まっている。この合成 `AppState` は
-        // 自動開始を通らない（`autostart()` を呼ぶのは `run()` の `setup()`
-        // だけ）ので、走っていない相手に `stop()` が「何もしない」で通る
-        // ことの確認も兼ねている。
-        assert_eq!(
-            state.collect.state(),
-            chronogazer_core::collect::CollectorState::Stopped,
-            "収集は止まっている"
+        // #383 段階2b / R1-C: 収集も止まっている（レジストリが空なので、
+        // 自動開始は何も起こさない）。
+        assert!(
+            !services.collect.state().is_collecting(),
+            "収集は止まっている: {:?}",
+            services.collect.state()
         );
+        drop(engine);
+    }
+
+    /// 終了の報告: 予算切れの秒数は切り上げる（期限の残り 4.99 秒で切れても
+    /// 「5 秒」と知らせる）。成功では 0。
+    #[test]
+    fn exit_report_budget_is_rounded_up() {
+        assert_eq!(ceil_secs(Duration::from_millis(4_990)), 5);
+        assert_eq!(ceil_secs(Duration::from_secs(5)), 5);
+        assert_eq!(ceil_secs(Duration::ZERO), 0);
+    }
+
+    /// 数えられる記録先（banto-hub の `counting_sink` と同じ）。`slow_body` なら、
+    /// 本体の行を記録する前に少し止まる（記録が遅い先行を作る）。
+    fn counting_sink(slow_body: bool) -> (ExitSink, Arc<Mutex<Vec<ExitLogLine>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink_lines = Arc::clone(&lines);
+        let sink: ExitSink = Arc::new(move |line| {
+            let is_body = match &line {
+                ExitLogLine::Info(text) => text.contains("完了しました"),
+                ExitLogLine::Error(text) => text.contains("完全には済みませんでした"),
+            };
+            if slow_body && is_body {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            sink_lines.lock().unwrap().push(line);
+        });
+        (sink, lines)
+    }
+
+    /// 普通のトレイの終了: 完了の記録は 1 行だけ。後から来る `RunEvent::Exit`
+    /// は結果を受け取るだけで記録しない。後始末の本体は 1 回だけ走る。
+    #[test]
+    fn a_plain_tray_quit_logs_one_completion_line() {
+        let once = ExitCleanupOnce::<ExitCleanupReport, ExitTrigger>::new();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sink, lines) = counting_sink(false);
+        let count = |runs: &Arc<std::sync::atomic::AtomicUsize>| {
+            let runs = Arc::clone(runs);
+            move |_deadline| {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ExitCleanupReport::default()
+            }
+        };
+        let tray = run_exit_cleanup(
+            &once,
+            ExitTrigger::TrayQuit,
+            EXIT_CLEANUP_BUDGET,
+            count(&runs),
+            Arc::clone(&sink),
+        );
+        let exit = run_exit_cleanup(
+            &once,
+            ExitTrigger::RunEventExit,
+            EXIT_CLEANUP_BUDGET,
+            count(&runs),
+            sink,
+        );
+        assert_eq!(tray, ExitCleanupReport::default());
+        assert_eq!(exit, ExitCleanupReport::default());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(matches!(&lines[0], ExitLogLine::Info(text) if text.contains("トレイの終了")));
+    }
+
+    /// #586 のオーナーレビュー P2 と同じ: 先行（トレイ）の記録が遅くても、結果を
+    /// 先に受け取った後続（OS の終了）が戻る時点で、本体の記録は済んでいる。
+    /// 記録を結果の公開より後（呼び出し元）に置く作りだと、後続が戻った時点で
+    /// 0 行になる（`RunEvent::Exit` から戻るとプロセスが終わるので、診断が残らない）。
+    #[test]
+    fn the_body_is_recorded_before_a_waiting_caller_gets_the_result() {
+        let once = Arc::new(ExitCleanupOnce::<ExitCleanupReport, ExitTrigger>::new());
+        let (sink, lines) = counting_sink(true);
+        let tray = {
+            let (once, sink) = (Arc::clone(&once), Arc::clone(&sink));
+            std::thread::spawn(move || {
+                run_exit_cleanup(
+                    &once,
+                    ExitTrigger::TrayQuit,
+                    EXIT_CLEANUP_BUDGET,
+                    |_| ExitCleanupReport::default(),
+                    sink,
+                )
+            })
+        };
+        while !once.has_started() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let os = run_exit_cleanup(
+            &once,
+            ExitTrigger::RunEventExit,
+            EXIT_CLEANUP_BUDGET,
+            |_| panic!("the second work must not run"),
+            Arc::clone(&sink),
+        );
+        assert_eq!(os, ExitCleanupReport::default());
+        // 後続が結果を受け取って戻った時点で、本体の記録はもうある。
+        assert_eq!(lines.lock().unwrap().len(), 1);
+        tray.join().unwrap();
+        assert_eq!(lines.lock().unwrap().len(), 1, "no duplicate line");
+    }
+
+    /// #585 の情報を落とさない: 最終 flush の失敗は、本体を走らせたトレイにも、
+    /// 結果を受け取っただけの後続にも、そのまま届く（トレイはダイアログで
+    /// 知らせる）。本体の記録は失敗の文言で 1 行。
+    #[test]
+    fn a_flush_failure_reaches_every_caller() {
+        let once = ExitCleanupOnce::<ExitCleanupReport, ExitTrigger>::new();
+        let (sink, lines) = counting_sink(false);
+        let failed = ExitCleanupReport {
+            collect_stop_error: Some("disk full".into()),
+            ..ExitCleanupReport::default()
+        };
+        let tray = {
+            let failed = failed.clone();
+            run_exit_cleanup(
+                &once,
+                ExitTrigger::TrayQuit,
+                EXIT_CLEANUP_BUDGET,
+                move |_| failed,
+                Arc::clone(&sink),
+            )
+        };
+        assert_eq!(tray, failed);
+        let message = tray::cleanup_failure_message(&tray).expect("失敗は知らせる");
+        assert!(message.contains("disk full"), "{message}");
+        let exit = run_exit_cleanup(
+            &once,
+            ExitTrigger::RunEventExit,
+            EXIT_CLEANUP_BUDGET,
+            |_| ExitCleanupReport::default(),
+            sink,
+        );
+        assert_eq!(exit, failed);
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(matches!(&lines[0], ExitLogLine::Error(text) if text.contains("トレイの終了")));
+    }
+
+    /// 待ちが期限で切れたとき（本体は裏で続く）も、トレイには「途中で切り
+    /// 上げた」（`timed_out`、予算の秒数つき）が届き、待ちの打ち切りを記録する。
+    /// 後から来た `RunEvent::Exit` は先行の期限切れを受け取り、自分の上限を
+    /// 名乗らない。
+    #[test]
+    fn a_timed_out_wait_is_reported_as_timed_out() {
+        let once = ExitCleanupOnce::<ExitCleanupReport, ExitTrigger>::new();
+        let (sink, lines) = counting_sink(false);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let tray = run_exit_cleanup(
+            &once,
+            ExitTrigger::TrayQuit,
+            Duration::from_millis(50),
+            move |_| {
+                release_rx.recv().ok();
+                ExitCleanupReport::default()
+            },
+            Arc::clone(&sink),
+        );
+        assert_eq!(
+            tray,
+            ExitCleanupReport {
+                collect_stop_error: None,
+                timed_out: true,
+                budget_secs: 1,
+            }
+        );
+        assert!(tray::cleanup_failure_message(&tray).is_some());
+        let exit = run_exit_cleanup(
+            &once,
+            ExitTrigger::RunEventExit,
+            EXIT_CLEANUP_BUDGET,
+            |_| ExitCleanupReport::default(),
+            Arc::clone(&sink),
+        );
+        assert!(exit.timed_out);
+        {
+            let lines = lines.lock().unwrap();
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(
+                matches!(&lines[0], ExitLogLine::Error(text) if text.contains("この経路の上限0秒") && text.contains("トレイの終了"))
+            );
+            assert!(
+                matches!(&lines[1], ExitLogLine::Error(text) if text.contains("先行の終了の後始末（トレイの終了）") && !text.contains("上限"))
+            );
+        }
+        drop(release_tx);
     }
 
     /// #463: `asOfId` 付きの取得（2 ブロック目以降）では剪定しない - 保持
@@ -5182,6 +5295,7 @@ mod tests {
     async fn audit_log_list_body_with_as_of_id_does_not_prune() {
         let state = app_state().await;
         let owner = state
+            .services
             .users
             .setup_first_user("owner", "password123", "オーナー")
             .await
@@ -5190,6 +5304,7 @@ mod tests {
 
         for action in ["a", "b", "c", "d", "e"] {
             state
+                .services
                 .audit
                 .try_record(AuditEntry {
                     actor_username: Some("owner"),
@@ -5206,6 +5321,7 @@ mod tests {
         }
         // #setup_first_user 自体は監査に残らないので、ここまでで 5 行。
         state
+            .services
             .settings
             .set_audit_config(&AuditSettings {
                 retention_days: None,
@@ -5216,14 +5332,14 @@ mod tests {
 
         let count = || async {
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log")
-                .fetch_one(&state.pool)
+                .fetch_one(&state.services.pool)
                 .await
                 .unwrap()
         };
         let before = count().await;
         assert_eq!(before, 5);
         let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM audit_log")
-            .fetch_one(&state.pool)
+            .fetch_one(&state.services.pool)
             .await
             .unwrap();
 
@@ -5249,6 +5365,7 @@ mod tests {
     async fn change_own_password_is_recorded_as_password_change() {
         let state = app_state().await;
         let owner = state
+            .services
             .users
             .setup_first_user("owner", "password123", "オーナー")
             .await
@@ -5261,6 +5378,7 @@ mod tests {
             .expect("change_own_password should succeed");
 
         let result = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5288,6 +5406,7 @@ mod tests {
     async fn failed_change_own_password_records_nothing() {
         let state = app_state().await;
         let owner = state
+            .services
             .users
             .setup_first_user("owner", "password123", "オーナー")
             .await
@@ -5299,6 +5418,7 @@ mod tests {
             .expect_err("wrong current password should fail");
 
         let result = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5318,6 +5438,7 @@ mod tests {
     async fn backups_create_records_a_backup_audit_entry() {
         let (_dir, state) = app_state_with_tempdir().await;
         let admin = state
+            .services
             .users
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
@@ -5330,11 +5451,12 @@ mod tests {
         assert!(info.file_name.starts_with("banto-"));
         assert!(info.size_bytes > 0);
 
-        let listed = state.backup.list().await.expect("list");
+        let listed = state.services.backup.list().await.expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].file_name, info.file_name);
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5357,6 +5479,7 @@ mod tests {
     async fn viewer_cannot_create_backups() {
         let (_dir, state) = app_state_with_tempdir().await;
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -5365,7 +5488,7 @@ mod tests {
 
         let err = backups_create_body(&state).await.unwrap_err();
         assert!(matches!(err, BantoError::Forbidden));
-        assert!(state.backup.list().await.unwrap().is_empty());
+        assert!(state.services.backup.list().await.unwrap().is_empty());
     }
 
     /// Stage a restore from an existing backup, then confirm it shows up as
@@ -5376,6 +5499,7 @@ mod tests {
     async fn stage_restore_then_pending_reports_it() {
         let (_dir, state) = app_state_with_tempdir().await;
         let admin = state
+            .services
             .users
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
@@ -5383,13 +5507,14 @@ mod tests {
         state.set_session_for_test(Some(DesktopSession::Account(admin)));
 
         let info = backups_create_body(&state).await.expect("create");
-        assert!(state.backup.pending_restore().await.is_none());
+        assert!(state.services.backup.pending_restore().await.is_none());
 
         backups_stage_restore_body(&state, &info.file_name)
             .await
             .expect("stage_restore should succeed");
 
         let pending = state
+            .services
             .backup
             .pending_restore()
             .await
@@ -5397,6 +5522,7 @@ mod tests {
         assert!(pending.size_bytes > 0);
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5414,9 +5540,14 @@ mod tests {
         backups_cancel_restore_body(&state)
             .await
             .expect("cancel_restore should succeed");
-        assert!(state.backup.pending_restore().await.is_none());
+        assert!(state.services.backup.pending_restore().await.is_none());
 
-        let audit_after_cancel = state.audit.list(ListParams::default()).await.unwrap();
+        let audit_after_cancel = state
+            .services
+            .audit
+            .list(ListParams::default())
+            .await
+            .unwrap();
         assert!(
             audit_after_cancel
                 .rows
@@ -5439,6 +5570,7 @@ mod tests {
     async fn denied_hub_command_is_recorded_under_the_hub_resource() {
         let state = app_state().await;
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -5451,6 +5583,7 @@ mod tests {
         assert!(matches!(err, BantoError::Forbidden));
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5479,6 +5612,7 @@ mod tests {
     async fn allowed_hub_command_records_no_denial() {
         let state = app_state().await;
         let admin = state
+            .services
             .users
             .create_user("admin", "password123", "管理者", Role::Admin)
             .await
@@ -5490,6 +5624,7 @@ mod tests {
             .expect("an admin must pass the hub admin guard");
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5528,11 +5663,13 @@ mod tests {
     async fn collect_reads_are_viewer_and_operations_are_editor_all_under_the_collect_resource() {
         let state = app_state().await;
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
         state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
@@ -5560,6 +5697,7 @@ mod tests {
         }
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5583,6 +5721,7 @@ mod tests {
 
         // editor は変更も通る - `admin` へ引き上げていないこと。
         let editor = state
+            .services
             .users
             .get_by_username("editor")
             .await
@@ -5606,6 +5745,7 @@ mod tests {
     async fn collect_start_with_no_targets_is_ok_and_audited() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
@@ -5629,6 +5769,7 @@ mod tests {
         );
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -5681,10 +5822,12 @@ mod tests {
         let blocked_data_dir = dir.path().join(MARKER);
         std::fs::write(&blocked_data_dir, b"not a directory").expect("block data dir");
         let mut state = app_state().await;
-        state.collect = CollectorService::new(state.pool.clone(), blocked_data_dir);
+        state.services.collect =
+            CollectorService::new(state.services.pool.clone(), blocked_data_dir);
 
         // 収集対象を 1 件だけ作る（`data.dir` がファイル = 起動が失敗する）。
         let conn = state
+            .services
             .plc_connections
             .create(
                 PlcConnectionPayload {
@@ -5702,6 +5845,7 @@ mod tests {
             .await
             .expect("create plc connection");
         let group = state
+            .services
             .collection_groups
             .create(
                 CollectionGroupPayload {
@@ -5715,6 +5859,7 @@ mod tests {
             .await
             .expect("create collection group");
         state
+            .services
             .tags
             .create(
                 TagPayload {
@@ -5741,11 +5886,13 @@ mod tests {
             .expect("create tag");
 
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -5823,6 +5970,7 @@ mod tests {
             .expect_err("未認証でイベント一覧が読めている");
 
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -5878,6 +6026,7 @@ mod tests {
             .expect_err("未認証で履歴が読めている");
 
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -5923,11 +6072,13 @@ mod tests {
     async fn hub_connections_and_hub_registration_work_over_tauri() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -6071,11 +6222,13 @@ mod tests {
     async fn plc_connection_simulation_is_saved_returned_and_audited_over_tauri() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -6088,6 +6241,7 @@ mod tests {
         assert!(created.simulation, "作成の応答に出る");
         assert!(
             state
+                .services
                 .plc_connections
                 .get(created.id)
                 .await
@@ -6126,6 +6280,7 @@ mod tests {
         );
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -6165,6 +6320,7 @@ mod tests {
         assert!(matches!(denied, Err(BantoError::Forbidden)), "{denied:?}");
         assert!(
             !state
+                .services
                 .plc_connections
                 .get(created.id)
                 .await
@@ -6193,6 +6349,7 @@ mod tests {
         );
 
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
@@ -6264,17 +6421,20 @@ mod tests {
     async fn tag_commands_refuse_thresholds_and_enforce_the_expected_revision() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create_user");
         state.set_session_for_test(Some(DesktopSession::Account(editor)));
         let conn = state
+            .services
             .plc_connections
             .create(connection_payload("modbus", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
+            .services
             .collection_groups
             .create(
                 CollectionGroupPayload {
@@ -6318,12 +6478,19 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(
-            state.tags.get(tag.id).await.unwrap().unit.as_deref(),
+            state
+                .services
+                .tags
+                .get(tag.id)
+                .await
+                .unwrap()
+                .unit
+                .as_deref(),
             Some("kPa")
         );
 
         // 削除済みのタグへの古い版の更新は NotFound（競合でも汎用エラーでもない）。
-        state.tags.delete(tag.id).await.expect("delete");
+        state.services.tags.delete(tag.id).await.expect("delete");
         let mut gone = tag_payload("t", group.id, "40001");
         gone.expected_revision = Some(tag.revision);
         let err = tags_update_body(&state, tag.id, gone)
@@ -6342,6 +6509,7 @@ mod tests {
     async fn tag_commands_refuse_an_address_the_connection_cannot_read() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
@@ -6349,11 +6517,13 @@ mod tests {
         state.set_session_for_test(Some(DesktopSession::Account(editor)));
 
         let modbus = state
+            .services
             .plc_connections
             .create(connection_payload("modbus", "modbus-tcp").into_create_input())
             .await
             .expect("create modbus connection");
         let slmp = state
+            .services
             .plc_connections
             .create(connection_payload("slmp", "slmp").into_create_input())
             .await
@@ -6361,6 +6531,7 @@ mod tests {
         let mut group_ids = Vec::new();
         for (name, conn) in [("modbus-group", modbus.id), ("slmp-group", slmp.id)] {
             let group = state
+                .services
                 .collection_groups
                 .create(
                     CollectionGroupPayload {
@@ -6427,6 +6598,7 @@ mod tests {
     async fn group_update_refuses_a_move_that_leaves_tags_unreadable() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
@@ -6440,6 +6612,7 @@ mod tests {
             ("slmp", "slmp"),
         ] {
             let conn = state
+                .services
                 .plc_connections
                 .create(connection_payload(name, protocol).into_create_input())
                 .await
@@ -6454,6 +6627,7 @@ mod tests {
             enabled: true,
         };
         let group = state
+            .services
             .collection_groups
             .create(group_payload(modbus).into())
             .await
@@ -6478,6 +6652,7 @@ mod tests {
             field_error.message
         );
         let unchanged = state
+            .services
             .collection_groups
             .get(group.id)
             .await
@@ -6512,6 +6687,7 @@ mod tests {
     async fn disabling_a_legacy_bad_tag_is_allowed_and_reenabling_is_refused() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
@@ -6519,11 +6695,13 @@ mod tests {
         state.set_session_for_test(Some(DesktopSession::Account(editor)));
 
         let conn = state
+            .services
             .plc_connections
             .create(connection_payload("modbus", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
+            .services
             .collection_groups
             .create(
                 CollectionGroupPayload {
@@ -6538,17 +6716,21 @@ mod tests {
             .expect("create collection group");
         // 正常なタグと、検査より前に保存された不正なタグ（既存データ）。
         state
+            .services
             .tags
             .create(tag_payload("good", group.id, "40001").into())
             .await
             .expect("create good tag");
         let legacy = state
+            .services
             .tags
             .create(tag_payload("legacy", group.id, "D3000").into())
             .await
             .expect("create legacy tag");
         assert!(
-            banto_collect::build_config(&state.pool).await.is_err(),
+            banto_collect::build_config(&state.services.pool)
+                .await
+                .is_err(),
             "前提が崩れている: 不正タグがあるのに build_config が通る"
         );
 
@@ -6558,10 +6740,10 @@ mod tests {
         tags_update_body(&state, legacy.id, disable)
             .await
             .expect("無効化だけの更新が拒否された");
-        assert!(!state.tags.get(legacy.id).await.unwrap().enabled);
+        assert!(!state.services.tags.get(legacy.id).await.unwrap().enabled);
 
         // その後の build_config は成功し、正常なタグだけが収集対象に残る。
-        let config = banto_collect::build_config(&state.pool)
+        let config = banto_collect::build_config(&state.services.pool)
             .await
             .expect("不正タグを無効化した後は build_config が通ること");
         assert_eq!(config.tag_count(), 1);
@@ -6571,7 +6753,7 @@ mod tests {
             .await
             .expect_err("アドレスを直さない再有効化が通った");
         assert_eq!(only_field_error(err).field, "address");
-        assert!(!state.tags.get(legacy.id).await.unwrap().enabled);
+        assert!(!state.services.tags.get(legacy.id).await.unwrap().enabled);
     }
 
     // --- banto v1.7.0 #204: session revocation (Tauri + REST) ---------------
@@ -6620,6 +6802,7 @@ mod tests {
     async fn desktop_login(pool: &chronogazer_core::db::DbPool, username: &str) -> AppState {
         let state = app_state_on(pool.clone()).await;
         let identity = state
+            .services
             .users
             .verify(username, "password123")
             .await
@@ -6641,18 +6824,18 @@ mod tests {
 
     fn router_for(state: &AppState) -> axum::Router {
         chronogazer_core::rest::api_router(
-            state.users.clone(),
-            state.settings.clone(),
-            state.audit.clone(),
-            state.backup.clone(),
-            state.hub.clone(),
-            state.plc_connections.clone(),
-            state.collection_groups.clone(),
-            state.tags.clone(),
-            state.collect.clone(),
+            state.services.users.clone(),
+            state.services.settings.clone(),
+            state.services.audit.clone(),
+            state.services.backup.clone(),
+            state.services.hub.clone(),
+            state.services.plc_connections.clone(),
+            state.services.collection_groups.clone(),
+            state.services.tags.clone(),
+            state.services.collect.clone(),
             display_groups_service(state),
-            state.rest_auth.clone(),
-            state.events.clone(),
+            state.services.rest_auth.clone(),
+            state.services.events.clone(),
             false,
         )
     }
@@ -6710,11 +6893,11 @@ mod tests {
 
         let admin = desktop_login(&pool, "admin").await;
         let router = router_for(&admin);
-        let admin_rest = rest_login(&admin.rest_auth, "admin", false).await;
-        let alice_rest = rest_login(&admin.rest_auth, "alice", false).await;
-        let alice_rest_remember = rest_login(&admin.rest_auth, "alice", true).await;
-        let alice_self_rest = rest_login(&admin.rest_auth, "alice", false).await;
-        let bob_rest = rest_login(&admin.rest_auth, "bob", true).await;
+        let admin_rest = rest_login(&admin.services.rest_auth, "admin", false).await;
+        let alice_rest = rest_login(&admin.services.rest_auth, "alice", false).await;
+        let alice_rest_remember = rest_login(&admin.services.rest_auth, "alice", true).await;
+        let alice_self_rest = rest_login(&admin.services.rest_auth, "alice", false).await;
+        let bob_rest = rest_login(&admin.services.rest_auth, "bob", true).await;
         Sessions {
             alice: desktop_login(&pool, "alice").await,
             alice_other: desktop_login(&pool, "alice").await,
@@ -6940,7 +7123,7 @@ mod tests {
             require_role(&again, Role::Editor, "test").await,
             Err(BantoError::Forbidden)
         ));
-        let token = rest_login(&s.admin.rest_auth, "alice", false).await;
+        let token = rest_login(&s.admin.services.rest_auth, "alice", false).await;
         assert_eq!(
             rest_can_read(&s.router, &token).await,
             axum::http::StatusCode::OK
@@ -6965,7 +7148,12 @@ mod tests {
             "session kept"
         );
         assert!(
-            s.admin.rest_auth.authenticate(&s.alice_rest).await.is_err(),
+            s.admin
+                .services
+                .rest_auth
+                .authenticate(&s.alice_rest)
+                .await
+                .is_err(),
             "REST re-check fails too"
         );
         assert_eq!(
@@ -6999,10 +7187,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_auth_disabled_session_ends_when_the_mode_is_turned_off() {
         let state = app_state().await;
-        let mut config = state.settings.auth_config().await.unwrap();
+        let mut config = state.services.settings.auth_config().await.unwrap();
         config.disabled = true;
         config.disabled_role = Role::Editor;
-        state.settings.set_auth_config(&config).await.unwrap();
+        state
+            .services
+            .settings
+            .set_auth_config(&config)
+            .await
+            .unwrap();
         state.set_session_for_test(Some(DesktopSession::AuthDisabledLocal(UserIdentity {
             id: LOCAL_SESSION_ID,
             username: "local".to_string(),
@@ -7023,7 +7216,12 @@ mod tests {
         ));
 
         config.disabled = false;
-        state.settings.set_auth_config(&config).await.unwrap();
+        state
+            .services
+            .settings
+            .set_auth_config(&config)
+            .await
+            .unwrap();
         assert!(matches!(
             require_role(&state, Role::Viewer, "test").await,
             Err(BantoError::Unauthorized)
@@ -7043,6 +7241,7 @@ mod tests {
     async fn auth_config_apply_is_recorded_as_settings_change() {
         let state = app_state().await;
         let admin = state
+            .services
             .users
             .setup_first_user("admin", "password123", "管理者")
             .await
@@ -7054,6 +7253,7 @@ mod tests {
             .expect("auth_config_apply should succeed");
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -7084,6 +7284,7 @@ mod tests {
         keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
         let state = app_state().await;
         let admin = state
+            .services
             .users
             .setup_first_user("admin", "password123", "管理者")
             .await
@@ -7095,6 +7296,7 @@ mod tests {
             .expect("autologin_enable should succeed");
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -7124,6 +7326,7 @@ mod tests {
     async fn autologin_disable_is_recorded_as_settings_change() {
         let state = app_state().await;
         let admin = state
+            .services
             .users
             .setup_first_user("admin", "password123", "管理者")
             .await
@@ -7135,6 +7338,7 @@ mod tests {
             .expect("autologin_disable should succeed");
 
         let audit = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -7199,7 +7403,7 @@ mod tests {
     /// Hold the first `auth_login` verification of `state`.
     fn hold_verify(state: &mut AppState) -> Hold {
         let (slot, hold) = gate();
-        let users = state.users.clone();
+        let users = state.services.users.clone();
         state.auth_io.verify = Arc::new(move |username, password| {
             let slot = slot.clone();
             let users = users.clone();
@@ -7214,7 +7418,7 @@ mod tests {
     /// Hold the first `auth_setup` account creation of `state`.
     fn hold_setup(state: &mut AppState) -> Hold {
         let (slot, hold) = gate();
-        let users = state.users.clone();
+        let users = state.services.users.clone();
         state.auth_io.setup_first_user = Arc::new(move |username, password, display_name| {
             let slot = slot.clone();
             let users = users.clone();
@@ -7231,7 +7435,7 @@ mod tests {
     /// Hold the first `auth_logout` auth-mode read of `state`.
     fn hold_auth_mode(state: &mut AppState) -> Hold {
         let (slot, hold) = gate();
-        let settings = state.settings.clone();
+        let settings = state.services.settings.clone();
         state.auth_io.auth_mode = Arc::new(move || {
             let slot = slot.clone();
             let settings = settings.clone();
@@ -7249,7 +7453,7 @@ mod tests {
     /// (`true`, the held command carries the value read BEFORE the hold).
     fn hold_auth_mode_call(state: &mut AppState, nth: usize, after_read: bool) -> Hold {
         let (slot, hold) = gate();
-        let settings = state.settings.clone();
+        let settings = state.services.settings.clone();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         state.auth_io.auth_mode = Arc::new(move || {
             let (slot, settings, calls) = (slot.clone(), settings.clone(), calls.clone());
@@ -7277,6 +7481,7 @@ mod tests {
 
     async fn audit_action_count(state: &AppState, action: &str) -> usize {
         state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -7311,6 +7516,7 @@ mod tests {
     /// `auth_disabled`。S-94 の付け替え）が 1 件増える。
     async fn enable_local_from_an_admin_session(state: &AppState, role: &str) {
         let admin = state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
@@ -7328,6 +7534,7 @@ mod tests {
     async fn s16_a_slow_login_does_not_undo_a_completed_logout() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("b", SLOT_PASSWORD, "B")
             .await
@@ -7357,6 +7564,7 @@ mod tests {
     async fn s16_login_reads_seq_before_its_first_await() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("b", SLOT_PASSWORD, "B")
             .await
@@ -7382,6 +7590,7 @@ mod tests {
     async fn s16_an_uncontested_login_installs_and_advances_seq() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("b", SLOT_PASSWORD, "B")
             .await
@@ -7412,6 +7621,7 @@ mod tests {
     async fn s17_a_slow_logout_does_not_clear_a_later_login() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("b", SLOT_PASSWORD, "B")
             .await
@@ -7446,6 +7656,7 @@ mod tests {
     async fn s17_logout_reads_seq_before_its_first_await() {
         let mut state = app_state().await;
         let a = state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -7473,6 +7684,7 @@ mod tests {
     async fn s17_an_uncontested_logout_clears_and_advances_seq() {
         let state = app_state().await;
         let a = state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -7509,8 +7721,14 @@ mod tests {
         assert!(!result.success);
         assert!(result.superseded);
         assert_eq!(read_slot(&state), (None, 1));
-        assert!(state.users.is_initialized().await.unwrap());
-        assert!(state.users.get_by_username("b").await.unwrap().is_some());
+        assert!(state.services.users.is_initialized().await.unwrap());
+        assert!(state
+            .services
+            .users
+            .get_by_username("b")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// S-19: a logout overtaken by a completed `auth_setup` keeps the setup's
@@ -7546,6 +7764,7 @@ mod tests {
     async fn s54_resolving_the_same_session_does_not_advance_seq() {
         let state = app_state().await;
         let a = state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -7563,6 +7782,7 @@ mod tests {
         }
 
         state
+            .services
             .users
             .update_user(a.id, "A（改名）", Role::Admin)
             .await
@@ -7581,11 +7801,13 @@ mod tests {
     async fn s64_a_role_change_resolves_to_none_and_advances_seq() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("owner", SLOT_PASSWORD, "オーナー")
             .await
             .unwrap();
         let a = state
+            .services
             .users
             .create_user("a", SLOT_PASSWORD, "A", Role::Editor)
             .await
@@ -7596,6 +7818,7 @@ mod tests {
         assert!(resolve_body(&state).await.unwrap().identity.is_some());
 
         state
+            .services
             .users
             .update_user(a.id, "A", Role::Viewer)
             .await
@@ -7621,6 +7844,7 @@ mod tests {
         assert_eq!((empty.checked, empty.current), (0, 0));
 
         let a = state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -7646,7 +7870,7 @@ mod tests {
     async fn s47_s67_the_auth_disabled_session_resolves_local_and_logout_keeps_seq() {
         let state = app_state().await;
         let set_mode = |role: Role| {
-            let settings = state.settings.clone();
+            let settings = state.services.settings.clone();
             async move {
                 let config = settings.auth_config().await.unwrap();
                 settings
@@ -7689,6 +7913,7 @@ mod tests {
     async fn s68_change_password_rebinds_and_advances_seq() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -7734,7 +7959,7 @@ mod tests {
     /// save (the apply still holds `auth_config_lock`).
     fn hold_after_save(state: &mut AppState) -> Hold {
         let (slot, hold) = gate();
-        let settings = state.settings.clone();
+        let settings = state.services.settings.clone();
         state.auth_io.save_auth_config = Arc::new(move |config| {
             let (slot, settings) = (slot.clone(), settings.clone());
             Box::pin(async move {
@@ -7753,7 +7978,7 @@ mod tests {
     /// `auth_config_lock`) is held before reading. Later reads pass.
     fn mode_turned_on_after_first_read_and_reread_held(state: &mut AppState) -> Hold {
         let (slot, hold) = gate();
-        let settings = state.settings.clone();
+        let settings = state.services.settings.clone();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         state.auth_io.auth_mode = Arc::new(move || {
             let (slot, settings, calls) = (slot.clone(), settings.clone(), calls.clone());
@@ -7798,6 +8023,7 @@ mod tests {
     async fn s67_a_logout_that_read_the_old_mode_is_overtaken_by_the_apply_rebind() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -7851,6 +8077,7 @@ mod tests {
     /// The audit rows for `action` (any order), as `(actor, detail)`.
     async fn audit_rows(state: &AppState, action: &str) -> Vec<(Option<String>, Option<String>)> {
         state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -7873,6 +8100,7 @@ mod tests {
     async fn s94_config_apply_true_rebinds_an_account_session_to_local() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
@@ -8004,11 +8232,18 @@ mod tests {
     async fn s103_settings_set_refuses_auth_keys() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
-        let admin = state.users.get_by_username("admin").await.unwrap().unwrap();
+        let admin = state
+            .services
+            .users
+            .get_by_username("admin")
+            .await
+            .unwrap()
+            .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(admin.clone())));
         let before = read_slot(&state);
         for key in [
@@ -8023,7 +8258,15 @@ mod tests {
                 "{key}: {result:?}"
             );
         }
-        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert!(
+            !state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled
+        );
         assert_eq!(read_slot(&state), before);
         settings_set_body(
             &state,
@@ -8042,6 +8285,7 @@ mod tests {
     async fn i2a_an_oversized_failed_login_username_is_bounded_in_the_audit_log() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
@@ -8079,7 +8323,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn settings_set_refuses_the_viewer_public_key() {
         let state = admin_app_state().await;
-        let admin = state.users.get_by_username("admin").await.unwrap().unwrap();
+        let admin = state
+            .services
+            .users
+            .get_by_username("admin")
+            .await
+            .unwrap()
+            .unwrap();
         let port = free_port();
         apply(&state, true, port, true).await.expect("ON");
         let (status, body) = http_on(port, "POST", "/api/auth/grant/publicViewer", None)
@@ -8089,7 +8339,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         let viewer = body["token"].as_str().expect("token").to_string();
 
-        let before = state.settings.server_config().await.unwrap();
+        let before = state.services.settings.server_config().await.unwrap();
         let attempts = [
             ("server.viewer_public", "false"),
             ("server.viewer_public", "true"),
@@ -8105,11 +8355,11 @@ mod tests {
             assert!(matches!(err, BantoError::BadRequest(_)), "{key}: {err:?}");
         }
 
-        let after = state.settings.server_config().await.unwrap();
+        let after = state.services.settings.server_config().await.unwrap();
         assert_eq!(after, before, "どのキーも保存されていない");
         assert!(after.viewer_public);
         assert!(
-            state.rest_auth.verify(&viewer),
+            state.services.rest_auth.verify(&viewer),
             "保存と同じくトークンも有効"
         );
         let (status, _) = http_on(port, "GET", "/api/tags", Some(&viewer))
@@ -8126,11 +8376,11 @@ mod tests {
     #[tokio::test]
     async fn i2a_backups_are_created_in_the_per_database_directory() {
         let (dir, state) = app_state_with_tempdir().await;
-        let created = state.backup.create().await.expect("create");
+        let created = state.services.backup.create().await.expect("create");
         let scope = dir.path().join("backups").join("chronogazer.sqlite3");
         assert!(scope.join(&created.file_name).is_file());
         assert_eq!(
-            state.backup.backups_dir_display(),
+            state.services.backup.backups_dir_display(),
             scope.display().to_string()
         );
     }
@@ -8138,7 +8388,7 @@ mod tests {
     /// Replace `auth_config_apply`'s save with one that stores only
     /// `auth.disabled` and then fails (a save interrupted part-way).
     fn save_fails_after_the_mode(state: &mut AppState) {
-        let settings = state.settings.clone();
+        let settings = state.services.settings.clone();
         state.auth_io.save_auth_config = Arc::new(move |config| {
             let settings = settings.clone();
             Box::pin(async move {
@@ -8161,26 +8411,49 @@ mod tests {
     async fn s104_a_save_failing_part_way_still_rebinds_the_session_to_what_is_stored() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
-            state.users.get_by_username("admin").await.unwrap().unwrap(),
+            state
+                .services
+                .users
+                .get_by_username("admin")
+                .await
+                .unwrap()
+                .unwrap(),
         )));
         save_fails_after_the_mode(&mut state);
         let (_, seq) = read_slot(&state);
 
         let result = auth_config_apply_body(&state, true, "admin").await;
         assert!(matches!(result, Err(BantoError::Storage(_))), "{result:?}");
-        assert!(state.settings.auth_config().await.unwrap().disabled);
+        assert!(
+            state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled
+        );
         let (session, seq_on) = read_slot(&state);
         assert!(is_local(&session), "follows disabled = true: {session:?}");
         assert_eq!(seq_on, seq + 1);
 
         let result = auth_config_apply_body(&state, false, "admin").await;
         assert!(result.is_err());
-        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert!(
+            !state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled
+        );
         assert_eq!(
             read_slot(&state),
             (None, seq_on + 1),
@@ -8259,8 +8532,9 @@ mod tests {
     async fn s98_a_role_change_advances_seq_even_if_a_settle_refreshed_the_slot_first() {
         let mut state = app_state().await;
         // Local(admin): the mode on with role admin, and its synthetic session.
-        let config = state.settings.auth_config().await.unwrap();
+        let config = state.services.settings.auth_config().await.unwrap();
         state
+            .services
             .settings
             .set_auth_config(&AuthSettings {
                 disabled: true,
@@ -8357,6 +8631,7 @@ mod tests {
     async fn s99_config_apply_false_again_is_a_no_op_for_the_session() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
@@ -8385,12 +8660,19 @@ mod tests {
     async fn s95_a_login_whose_check_was_overtaken_by_apply_true_is_refused() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
-            state.users.get_by_username("admin").await.unwrap().unwrap(),
+            state
+                .services
+                .users
+                .get_by_username("admin")
+                .await
+                .unwrap()
+                .unwrap(),
         )));
         let (_, seq_before) = read_slot(&state);
         let mut hold = hold_verify(&mut state);
@@ -8425,12 +8707,19 @@ mod tests {
     async fn s95_login_in_auth_disabled_mode_is_refused_before_the_check() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(
-            state.users.get_by_username("admin").await.unwrap().unwrap(),
+            state
+                .services
+                .users
+                .get_by_username("admin")
+                .await
+                .unwrap()
+                .unwrap(),
         )));
         auth_config_apply_body(&state, true, "editor")
             .await
@@ -8461,8 +8750,9 @@ mod tests {
         // ChronoGazer has no bootstrap window: with no account yet, the mode
         // and its synthetic session are set up directly (as `run()`'s
         // bootstrap would on a launch with `auth.disabled = true`).
-        let config = state.settings.auth_config().await.unwrap();
+        let config = state.services.settings.auth_config().await.unwrap();
         state
+            .services
             .settings
             .set_auth_config(&AuthSettings {
                 disabled: true,
@@ -8490,7 +8780,7 @@ mod tests {
         assert_eq!(result.error.as_deref(), Some(AUTH_DISABLED_LOGIN_MESSAGE));
         assert_eq!(read_slot(&state), before);
         assert!(
-            !state.users.is_initialized().await.unwrap(),
+            !state.services.users.is_initialized().await.unwrap(),
             "no account created"
         );
         assert_eq!(audit_action_count(&state, "setup").await, 0);
@@ -8514,6 +8804,7 @@ mod tests {
     async fn s67_config_apply_and_logout_install_local_only_once() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -8560,6 +8851,7 @@ mod tests {
         // admin-template starts from no session (bootstrap window); here the
         // first apply is an admin's, so the slot starts at `Account`, seq 1.
         let admin = state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
@@ -8575,7 +8867,13 @@ mod tests {
         tokio::pin!(apply_off);
         assert_stays_pending!(apply_off);
         assert!(
-            state.settings.auth_config().await.unwrap().disabled,
+            state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled,
             "apply(false) is waiting: it has not saved"
         );
         let (session, seq) = read_slot(&state);
@@ -8594,7 +8892,15 @@ mod tests {
         let config = apply_off.await.expect("apply(false)");
 
         assert!(!config.disabled);
-        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert!(
+            !state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled
+        );
         assert_eq!(read_slot(&state), (None, 3), "apply(false) ended it (S-99)");
         let answer = resolve_body(&state).await.expect("resolve");
         assert!(answer.identity.is_none());
@@ -8611,6 +8917,7 @@ mod tests {
     async fn s67_a_logout_reread_and_a_later_apply_false_are_serialized() {
         let mut state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -8628,7 +8935,13 @@ mod tests {
         tokio::pin!(apply_off);
         assert_stays_pending!(apply_off);
         assert!(
-            state.settings.auth_config().await.unwrap().disabled,
+            state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled,
             "apply(false) is waiting: it has not saved"
         );
         hold.release.send(()).unwrap();
@@ -8640,7 +8953,15 @@ mod tests {
         assert_eq!(result.seq, login.seq + 2);
         apply_off.await.expect("apply(false)");
 
-        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert!(
+            !state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled
+        );
         assert_eq!(
             read_slot(&state),
             (None, login.seq + 3),
@@ -8657,12 +8978,13 @@ mod tests {
     async fn s67_a_logout_whose_mode_reread_fails_still_succeeds() {
         let mut state = app_state().await;
         let a = state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
             .unwrap();
         state.set_session_for_test(Some(DesktopSession::Account(a)));
-        let settings = state.settings.clone();
+        let settings = state.services.settings.clone();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         state.auth_io.auth_mode = Arc::new(move || {
             let (settings, calls) = (settings.clone(), calls.clone());
@@ -8691,12 +9013,13 @@ mod tests {
         for _ in 0..3 {
             let mut state = app_state().await;
             state
+                .services
                 .users
                 .setup_first_user("b", SLOT_PASSWORD, "B")
                 .await
                 .unwrap();
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
-            let (verify_barrier, users) = (barrier.clone(), state.users.clone());
+            let (verify_barrier, users) = (barrier.clone(), state.services.users.clone());
             state.auth_io.verify = Arc::new(move |username, password| {
                 let (barrier, users) = (verify_barrier.clone(), users.clone());
                 Box::pin(async move {
@@ -8704,7 +9027,7 @@ mod tests {
                     users.verify(&username, &password).await
                 })
             });
-            let (mode_barrier, settings) = (barrier.clone(), state.settings.clone());
+            let (mode_barrier, settings) = (barrier.clone(), state.services.settings.clone());
             // Only the logout's FIRST mode read meets the login at the
             // barrier - a logout that cleared re-reads the mode (banto PR #264
             // review P1), and that second read has no partner.
@@ -8743,11 +9066,13 @@ mod tests {
     async fn s55_change_password_on_a_revoked_session_advances_seq_then_fails_unauthorized() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("owner", SLOT_PASSWORD, "オーナー")
             .await
             .unwrap();
         let a = state
+            .services
             .users
             .create_user("a", SLOT_PASSWORD, "A", Role::Editor)
             .await
@@ -8756,6 +9081,7 @@ mod tests {
             .await
             .expect("login");
         state
+            .services
             .users
             .update_user(a.id, "A", Role::Viewer)
             .await
@@ -8776,6 +9102,7 @@ mod tests {
     async fn s55_change_password_with_a_wrong_current_password_leaves_seq() {
         let state = app_state().await;
         state
+            .services
             .users
             .setup_first_user("a", SLOT_PASSWORD, "A")
             .await
@@ -8808,6 +9135,7 @@ mod tests {
     async fn kiosk_viewer_can_raise_its_role_and_turn_the_mode_off() {
         let state = app_state().await;
         let admin = state
+            .services
             .users
             .setup_first_user("admin", SLOT_PASSWORD, "Admin")
             .await
@@ -8860,7 +9188,15 @@ mod tests {
         auth_config_apply_body(&state, false, "viewer")
             .await
             .expect("viewer turns the mode off (escape hatch)");
-        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert!(
+            !state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled
+        );
         assert_eq!(read_slot(&state), (None, seq_viewer + 1));
 
         // With the mode off and no session, the escape hatch is closed.
@@ -8912,6 +9248,7 @@ mod tests {
         let changer = app_state_on(pool.clone()).await;
         let other = app_state_on(pool).await;
         changer
+            .services
             .users
             .setup_first_user("target", SLOT_PASSWORD, "Target")
             .await
@@ -9043,6 +9380,7 @@ mod tests {
     async fn admin_app_state() -> AppState {
         let state = app_state().await;
         let admin = state
+            .services
             .users
             .setup_first_user("admin", "password123", "管理者")
             .await
@@ -9069,6 +9407,7 @@ mod tests {
 
     async fn settings_change_entries(state: &AppState) -> Vec<(String, serde_json::Value)> {
         state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -9098,7 +9437,7 @@ mod tests {
         assert!(status.running);
         assert_eq!(status.port, port);
         assert!(status.viewer_public);
-        let saved = state.settings.server_config().await.unwrap();
+        let saved = state.services.settings.server_config().await.unwrap();
         assert_eq!(
             (
                 saved.enabled,
@@ -9136,7 +9475,7 @@ mod tests {
         let result = apply(&state, true, port_b, true).await;
 
         assert!(result.is_err(), "{result:?}");
-        let saved = state.settings.server_config().await.unwrap();
+        let saved = state.services.settings.server_config().await.unwrap();
         assert_eq!(saved.port, port_a);
         assert!(!saved.viewer_public, "閲覧公開も保存されていない");
         assert!(state.server.lock().await.is_some());
@@ -9167,14 +9506,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_apply_port_in_use_from_stopped_saves_nothing() {
         let state = admin_app_state().await;
-        let before = state.settings.server_config().await.unwrap();
+        let before = state.services.settings.server_config().await.unwrap();
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy");
         let port = occupied.local_addr().unwrap().port();
 
         let result = apply(&state, true, port, false).await;
 
         assert!(result.is_err(), "{result:?}");
-        assert_eq!(state.settings.server_config().await.unwrap(), before);
+        assert_eq!(
+            state.services.settings.server_config().await.unwrap(),
+            before
+        );
         assert!(state.server.lock().await.is_none());
         let entries = settings_change_entries(&state).await;
         assert_eq!(entries.len(), 1, "{entries:?}");
@@ -9192,17 +9534,25 @@ mod tests {
         let port_a = free_port();
         // Running with 閲覧公開 ON makes disabling auth legal.
         apply(&state, true, port_a, true).await.expect("apply A");
-        let mut auth = state.settings.auth_config().await.unwrap();
+        let mut auth = state.services.settings.auth_config().await.unwrap();
         auth.disabled = true;
-        state.settings.set_auth_config(&auth).await.expect("auth");
-        let before = state.settings.server_config().await.unwrap();
+        state
+            .services
+            .settings
+            .set_auth_config(&auth)
+            .await
+            .expect("auth");
+        let before = state.services.settings.server_config().await.unwrap();
 
         let result = apply(&state, true, free_port(), false).await;
 
         assert!(result.is_err(), "{result:?}");
         assert!(state.server.lock().await.is_some(), "nothing was stopped");
         assert!(answers_http(port_a).await);
-        assert_eq!(state.settings.server_config().await.unwrap(), before);
+        assert_eq!(
+            state.services.settings.server_config().await.unwrap(),
+            before
+        );
 
         let status = apply(&state, true, port_a, true).await.expect("viewer ON");
         assert!(status.running);
@@ -9222,7 +9572,15 @@ mod tests {
 
         let refused = auth_config_apply_body(&state, true, "viewer").await;
         assert!(refused.is_err(), "{refused:?}");
-        assert!(!state.settings.auth_config().await.unwrap().disabled);
+        assert!(
+            !state
+                .services
+                .settings
+                .auth_config()
+                .await
+                .unwrap()
+                .disabled
+        );
 
         apply(&state, true, port, true).await.expect("閲覧公開 ON");
         let applied = auth_config_apply_body(&state, true, "viewer")
@@ -9240,7 +9598,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_apply_is_serialized_with_auth_config_writes() {
         let state = admin_app_state().await;
-        let before = state.settings.server_config().await.unwrap();
+        let before = state.services.settings.server_config().await.unwrap();
         let port = free_port();
         let guard = state.auth_config_lock.lock().await;
 
@@ -9250,16 +9608,27 @@ mod tests {
         // lock we hold.
         drive_until!(applying, !port_is_free(port));
         assert_stays_pending!(applying);
-        assert_eq!(state.settings.server_config().await.unwrap(), before);
+        assert_eq!(
+            state.services.settings.server_config().await.unwrap(),
+            before
+        );
 
-        let mut auth = state.settings.auth_config().await.unwrap();
+        let mut auth = state.services.settings.auth_config().await.unwrap();
         auth.disabled = true;
-        state.settings.set_auth_config(&auth).await.expect("auth");
+        state
+            .services
+            .settings
+            .set_auth_config(&auth)
+            .await
+            .expect("auth");
         drop(guard);
         let result = applying.await;
 
         assert!(result.is_err(), "{result:?}");
-        assert_eq!(state.settings.server_config().await.unwrap(), before);
+        assert_eq!(
+            state.services.settings.server_config().await.unwrap(),
+            before
+        );
         assert!(state.server.lock().await.is_none());
         assert!(port_is_free(port), "the new listener must be released");
     }
@@ -9291,11 +9660,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, 403);
-        let account = rest_login(&state.rest_auth, "admin", false).await;
+        let account = rest_login(&state.services.rest_auth, "admin", false).await;
 
         apply(&state, true, port, false).await.expect("OFF");
 
-        assert!(!state.rest_auth.verify(&viewer));
+        assert!(!state.services.rest_auth.verify(&viewer));
         let (status, _) = http_on(port, "GET", "/api/tags", Some(&viewer))
             .await
             .unwrap();
@@ -9304,7 +9673,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, 403);
-        assert!(state.rest_auth.verify(&account), "ログインは残る");
+        assert!(state.services.rest_auth.verify(&account), "ログインは残る");
         let (status, _) = http_on(port, "GET", "/api/tags", Some(&account))
             .await
             .unwrap();
@@ -9319,18 +9688,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_apply_with_viewer_public_off_revokes_public_viewer_tokens() {
         let state = admin_app_state().await;
-        let spec = banto_server::GrantSpec::public_viewer(state.settings.clone());
+        let spec = banto_server::GrantSpec::public_viewer(state.services.settings.clone());
         let token = state
+            .services
             .rest_auth
-            .issue_grant_token(&spec, state.rest_auth.grant_generation(&spec.kind))
+            .issue_grant_token(&spec, state.services.rest_auth.grant_generation(&spec.kind))
             .expect("issued");
-        assert!(state.rest_auth.verify(&token));
+        assert!(state.services.rest_auth.verify(&token));
 
         apply(&state, false, free_port(), false)
             .await
             .expect("apply");
 
-        assert!(!state.rest_auth.verify(&token));
+        assert!(!state.services.rest_auth.verify(&token));
     }
 
     /// I2b（PR #499 レビュー P2）: ログイン不要モード + LAN + 閲覧公開が全部
@@ -9342,23 +9712,31 @@ mod tests {
         let state = admin_app_state().await;
         let port = free_port();
         apply(&state, true, port, true).await.expect("ON");
-        let mut auth = state.settings.auth_config().await.unwrap();
+        let mut auth = state.services.settings.auth_config().await.unwrap();
         auth.disabled = true;
-        state.settings.set_auth_config(&auth).await.expect("auth");
+        state
+            .services
+            .settings
+            .set_auth_config(&auth)
+            .await
+            .expect("auth");
         let (_, body) = http_on(port, "POST", "/api/auth/grant/publicViewer", None)
             .await
             .expect("answers");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         let viewer = body["token"].as_str().expect("token").to_string();
-        assert!(state.rest_auth.verify(&viewer));
+        assert!(state.services.rest_auth.verify(&viewer));
 
         let status = apply(&state, false, port, false).await.expect("stop");
 
         assert!(!status.running);
         assert!(state.server.lock().await.is_none());
-        let saved = state.settings.server_config().await.unwrap();
+        let saved = state.services.settings.server_config().await.unwrap();
         assert!(!saved.enabled && !saved.viewer_public);
-        assert!(!state.rest_auth.verify(&viewer), "閲覧者のトークンは失効");
+        assert!(
+            !state.services.rest_auth.verify(&viewer),
+            "閲覧者のトークンは失効"
+        );
         assert!(port_is_free(port));
     }
 
@@ -9375,7 +9753,15 @@ mod tests {
 
         assert!(!status.running);
         assert!(state.server.lock().await.is_none());
-        assert!(!state.settings.server_config().await.unwrap().enabled);
+        assert!(
+            !state
+                .services
+                .settings
+                .server_config()
+                .await
+                .unwrap()
+                .enabled
+        );
         assert!(port_is_free(port));
     }
 
@@ -9384,18 +9770,22 @@ mod tests {
     async fn server_apply_is_admin_only() {
         let state = app_state().await;
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create_user");
         state.set_session_for_test(Some(DesktopSession::Account(viewer)));
-        let before = state.settings.server_config().await.unwrap();
+        let before = state.services.settings.server_config().await.unwrap();
         let port = free_port();
 
         let err = apply(&state, true, port, false).await.unwrap_err();
 
         assert!(matches!(err, BantoError::Forbidden), "{err:?}");
-        assert_eq!(state.settings.server_config().await.unwrap(), before);
+        assert_eq!(
+            state.services.settings.server_config().await.unwrap(),
+            before
+        );
         assert!(state.server.lock().await.is_none());
         assert!(port_is_free(port));
         assert!(settings_change_entries(&state).await.is_empty());
@@ -9449,21 +9839,25 @@ mod tests {
     async fn tag_threshold_commands_rbac_audit_conflict_and_cascade() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create editor");
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create viewer");
         let conn = state
+            .services
             .plc_connections
             .create(connection_payload("plc", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
+            .services
             .collection_groups
             .create(
                 CollectionGroupPayload {
@@ -9477,6 +9871,7 @@ mod tests {
             .await
             .expect("create collection group");
         let tag = state
+            .services
             .tags
             .create(tag_payload("t1", group.id, "40001").into())
             .await
@@ -9524,6 +9919,7 @@ mod tests {
         assert!(tag_thresholds_list_body(&state).await.unwrap().is_empty());
 
         let page = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -9562,6 +9958,7 @@ mod tests {
     /// `display_groups` の監査の (action, result, origin)。
     async fn display_group_audit(state: &AppState) -> Vec<(String, String, String)> {
         let page = state
+            .services
             .audit
             .list(ListParams::default())
             .await
@@ -9588,22 +9985,26 @@ mod tests {
     async fn display_group_commands_crud_rbac_audit_and_tag_delete_refusal() {
         let state = app_state().await;
         let editor = state
+            .services
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
             .await
             .expect("create editor");
         let viewer = state
+            .services
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
             .await
             .expect("create viewer");
 
         let conn = state
+            .services
             .plc_connections
             .create(connection_payload("plc", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
+            .services
             .collection_groups
             .create(
                 CollectionGroupPayload {
@@ -9619,6 +10020,7 @@ mod tests {
         let mut tag_ids = Vec::new();
         for (name, address) in [("t1", "40001"), ("t2", "40002")] {
             let tag = state
+                .services
                 .tags
                 .create(tag_payload(name, group.id, address).into())
                 .await
@@ -9670,7 +10072,7 @@ mod tests {
         let field = only_field_error(err);
         assert_eq!(field.field, "displayGroups");
         assert!(field.message.contains("「L1改」"), "{}", field.message);
-        assert!(state.tags.get(tag_ids[0]).await.is_ok());
+        assert!(state.services.tags.get(tag_ids[0]).await.is_ok());
         tags_delete_body(&state, tag_ids[1])
             .await
             .expect("参照されていないタグは消せる");

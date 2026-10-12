@@ -51,6 +51,7 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 2026-10-12: §5 の #392 に段階 B（ChronoGazer のサービス化）の計画を確定した（オーナー決定「おすすめで」、未実装。H9 は
 既存の `%APPDATA%` のデータを移行しない、論点 1〜14 は推奨どおり。計画書は [chronogazer-service-design.md](chronogazer-service-design.md)）。
 同日: §5 の #392 の実装状況に、段階 B の B1-1（起動と終了を `chronogazer_core::engine` の `EngineRuntime` にまとめ、`banto-serve` を乗り換えた。終了はデスクトップと同じ順序になった）を実装したことを追記。
+同日: 同項に B1-2（デスクトップの起動と終了を `EngineRuntime` に乗り換え、終了の 1 回化を共有の `ExitCleanupOnce` に寄せた。挙動は不変）を実装したことを追記し、A2 の項の「ChronoGazer の `exit_cleanup_once` を共有 crate に寄せるかは未」を済みに直した。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -581,7 +582,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     - **H11 更新は「インストーラがサービスを停止 → 置換 → 開始」**（banto-hub の手順を流用）。
     - 手順: A1（プロファイルロックの共有 crate。デスクトップと `banto-serve` の両方）→ A2（トレイ）→
       B1（headless host + KeyStore）→ B2（シェル決定）→ B3（サービス + インストーラ + 実機 24h/72h）。
-    - **実装状況**: A1（2026-10-10、#565）・**A2（2026-10-11）実装済み**。段階 B は 2026-10-12 に計画確定（下の「段階 B の計画」）し、**B1-1（engine 抽出）を実装済み（2026-10-12）**: 起動と終了を `chronogazer_core::engine` の `EngineRuntime` にまとめ、`banto-serve` を乗り換えた（環境変数と既定値は不変。終了はデスクトップと同じ「印 → LAN → 収集（最終 flush）→ Hub → DB」になった）。デスクトップ（`src-tauri`）の乗り換えは B1-2。B1-2 以降は未。
+    - **実装状況**: A1（2026-10-10、#565）・**A2（2026-10-11）実装済み**。段階 B は 2026-10-12 に計画確定（下の「段階 B の計画」）し、**B1-1（engine 抽出）を実装済み（2026-10-12）**: 起動と終了を `chronogazer_core::engine` の `EngineRuntime` にまとめ、`banto-serve` を乗り換えた（環境変数と既定値は不変。終了はデスクトップと同じ「印 → LAN → 収集（最終 flush）→ Hub → DB」になった）。**B1-2（デスクトップの乗り換え）も実装済み（2026-10-12）**: `src-tauri` の `setup` と終了が `EngineRuntime` を使い、`AppState` はセッションまわりとエンジンのハンドルだけを持つ。終了の 1 回化は banto-hub と共有の `banto_desktop_tray::ExitCleanupOnce` に寄せた（挙動は不変。差の扱いは [chronogazer-service-design.md](chronogazer-service-design.md) §4 の B1-2 の実装メモ）。B1-3 以降は未。
       A2 で、ChronoGazer の**ウィンドウの × はアプリを終了せずに隠す**（収集・Hub 購読・LAN サーバーは
       動き続ける）ようになり、トレイ（左クリック・「開く」で窓を戻す、右クリックで「収集の状態・開く・終了」）に
       常駐する。収集が止まるのは、トレイの「終了」（確認の後、既存の終了処理 = LAN サーバー → 収集の停止と
@@ -618,7 +619,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
          新しい controller に終了の印が引き継がれない」も起こらなくなった。詳細は
          [banto-hub-t16-design.md](banto-hub-t16-design.md) §4.1 の #586 追記。
          ChronoGazer の `exit_cleanup_once`（`tokio::sync::OnceCell`）を共有 crate の `ExitCleanupOnce` に
-         寄せるかは未（#392 の残件）。
+         寄せるかは未（#392 の残件）。→ **#392 B1-2 で寄せた（2026-10-12、実装済み）**。
          → **#588（2026-10-12、実装済み）**: #587 の実機確認で、応答しない PLC が多いと終了の後始末が予算に
          収まらないことが分かった（20 本でトレイ 4.7 秒、40 本で OS の終了の 5 秒を超過、80 本で 12.4 秒、130 本で
          トレイの 15 秒を超過）。原因は `banto-collect` の `Collector::stop` が接続を 1 本ずつ「止める合図 → 終わるのを
