@@ -1943,7 +1943,8 @@ impl HubService {
     }
 
     /// 登録済みの hub タグを読むレジストリを差し込む（#383 段階3 P4）。
-    /// 実行形態の組み立て（`src-tauri` / `banto-serve`）が 1 回だけ呼ぶ。
+    /// 実行形態の組み立て（`src-tauri` と、`banto-serve` が使う
+    /// [`crate::engine::EngineRuntime`]）が 1 回だけ呼ぶ。
     /// 2 回目以降は無視する（最初のプールを使い続ける）。
     pub fn attach_registry(&self, pool: sqlx::SqlitePool) {
         let _ = self.inner.registry.set(pool);
@@ -2288,7 +2289,7 @@ impl HubService {
     }
 
     /// 終了の合図が上がっているか（[`HubInner::shutdown`]）。
-    fn is_shutting_down(&self) -> bool {
+    pub(crate) fn is_shutting_down(&self) -> bool {
         *self.inner.shutdown.borrow()
     }
 
