@@ -104,9 +104,16 @@ pub(crate) enum Prelude {
     },
 }
 
-/// 「もう一度確かめる」の起動前の処理（何も変えず、成功したら `retryStoreCheck` を監査に残す）。
-pub(crate) fn retry_prelude() -> Prelude {
-    Prelude::Noted(RecoveryNote::new(RecoveryChoice::RetryStoreCheck))
+/// 外部の入力（フォルダ選択・ファイル操作）を要らない対処の、起動前の処理。
+/// 「もう一度確かめる」は何も変えず、成功したら `retryStoreCheck` を監査に残す。
+pub(crate) fn simple_prelude(choice: RecoveryChoice) -> Option<Prelude> {
+    match choice {
+        RecoveryChoice::RetryStoreCheck => Some(Prelude::Noted(RecoveryNote::new(
+            RecoveryChoice::RetryStoreCheck,
+        ))),
+        RecoveryChoice::ResetStoreDir => Some(Prelude::StoreDir(StoreDirChoice::Default)),
+        _ => None,
+    }
 }
 
 /// [`crate::launch_desktop`] の失敗。
@@ -585,6 +592,13 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
     };
 
     let prelude = match choice {
+        // 何も変えずにやり直す（保存先の試し書きもやり直す）／既定の場所に戻す。
+        RecoveryChoice::RetryStoreCheck | RecoveryChoice::ResetStoreDir => {
+            match simple_prelude(choice) {
+                Some(prelude) => prelude,
+                None => return,
+            }
+        }
         RecoveryChoice::Quit => {
             app.exit(0);
             return;
@@ -597,9 +611,6 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
                 return;
             }
         },
-        RecoveryChoice::ResetStoreDir => Prelude::StoreDir(StoreDirChoice::Default),
-        // 何も変えずにやり直す（保存先の試し書きもやり直す）。
-        RecoveryChoice::RetryStoreCheck => retry_prelude(),
         RecoveryChoice::RecreateDatabase => {
             // 排他を取ってから退ける（取れなければ何も変えずに理由を返す）。
             match recovery::recreate_database(&paths.db_path, &recovery::broken_stamp_now()).await {
@@ -739,14 +750,20 @@ mod tests {
     /// だけ（core の `needs_confirmation` と食い違わない）。既定に戻す確認は
     /// 「記録は元の場所に残り画面からは見えなくなる」を先に伝える。
     #[test]
-    fn retry_keeps_an_audit_note_with_the_retry_choice() {
-        match retry_prelude() {
-            Prelude::Noted(note) => {
+    fn retry_maps_to_a_noted_prelude_with_the_retry_choice() {
+        // 「もう一度確かめる」→ 監査の記録つき（`Prelude::None` に戻すとここが落ちる）。
+        match simple_prelude(RecoveryChoice::RetryStoreCheck) {
+            Some(Prelude::Noted(note)) => {
                 assert_eq!(note.choice, RecoveryChoice::RetryStoreCheck);
                 assert!(note.detail.is_empty());
             }
             _ => panic!("再試行は監査の記録を持つ"),
         }
+        assert!(matches!(
+            simple_prelude(RecoveryChoice::ResetStoreDir),
+            Some(Prelude::StoreDir(StoreDirChoice::Default))
+        ));
+        assert!(simple_prelude(RecoveryChoice::RecreateDatabase).is_none());
     }
 
     #[test]
