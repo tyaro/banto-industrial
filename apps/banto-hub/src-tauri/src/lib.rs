@@ -653,17 +653,16 @@ fn exit_cleanup(app: &AppHandle, trigger: ExitTrigger) {
         let _ = controller.begin_shutdown();
     }
     let slot = Arc::clone(&state.hub);
-    let budget = trigger.budget();
-    let report = once.0.run_or_wait(trigger, budget, move |deadline| {
-        run_hub_exit(&slot, deadline, |hub| {
+    run_exit_cleanup(
+        &once.0,
+        slot,
+        trigger,
+        trigger.budget(),
+        |hub| {
             tauri::async_runtime::block_on(hub.shutdown());
-        })
-    });
-    match exit_log_line(trigger, budget, &report) {
-        Some(ExitLogLine::Info(line)) => log_line(&line),
-        Some(ExitLogLine::Error(line)) => log_err_line(&line),
-        None => {}
-    }
+        },
+        log_sink(),
+    );
 }
 
 /// [`exit_cleanup`] が記録する 1 行（重さつき）。
@@ -673,42 +672,90 @@ enum ExitLogLine {
     Error(String),
 }
 
-/// 終了の後始末の結果（[`ExitCleanupReport`]）から、記録する文言を決める。
-/// **この呼び出しが実際にしたこと**に合う文言だけを出す純関数（#586）:
+/// 記録先。本番は `hub_log`（[`log_sink`]）、テストは差し替えて数える。
+type ExitSink = Arc<dyn Fn(ExitLogLine) + Send + Sync>;
+
+fn log_sink() -> ExitSink {
+    Arc::new(|line| match line {
+        ExitLogLine::Info(line) => log_line(&line),
+        ExitLogLine::Error(line) => log_err_line(&line),
+    })
+}
+
+/// 終了の後始末を 1 回に限って走らせ、記録する（[`exit_cleanup`] の本体）。
 ///
-/// - 本体を走らせた最初の呼び出しだけが、完了／未了／打ち切りを自分の結果として
-///   出す。
-/// - 後から来て先行の結果を**受け取っただけ**の呼び出し（普通のトレイ終了の
-///   `app.exit(0)` から来る `RunEvent::Exit` が代表）は**何も出さない**。先行が
-///   同じ結果を出している。「控えめな 1 行」にしないのは、普通のトレイ終了で
-///   完了の行が 2 行出る状態（OS の終了が無いのに OS 経路の文言が出る）を
-///   なくすため。先行が打ち切られたあとで本体が裏で終わった場合も、先行の
-///   「待たずに終了します」の行が残っており、後から来た側の行は新しい情報に
-///   ならない。
-/// - 後から来て待てなかった呼び出しは、**どちらの上限で**やめたかを区別する。
-///   先行の期限が来ていた（または来た）なら、自分の上限は名乗らず、先行の
-///   期限切れを受け取ったと出す。自分の予算が先行の期限より短くて自分で
-///   やめたときだけ「この経路の上限◯秒」と出す。
-fn exit_log_line(
+/// 記録は 2 か所に分かれる（#586、オーナーレビュー P2）:
+///
+/// - **後始末の本体の結果**（完了・期限までに切替が落ち着かなかった）は、本体を
+///   走らせた側の**ワーカーの中で、結果を公開する前に** 1 回だけ記録する
+///   （[`body_log_line`]）。公開してから呼び出し元が記録する作りだと、先行より
+///   先に結果を受け取った後続（OS の終了）が即座に戻り、`RunEvent::Exit` から
+///   戻った直後にプロセスが終わって、先行の診断が 1 行も残らないことがある。
+///   先に記録してあれば、結果を受け取った側が即戻っても診断は失われない。
+///   記録は本体について 1 回だけなので、後続が受け取っただけのときは出さない
+///   （二重にならない）。
+/// - **呼び出し元の待ちの打ち切り**（自分の予算・先行の期限切れ）は、公開とは
+///   無関係な呼び出し元自身の判断なので、各呼び出しが自分で記録する
+///   （[`wait_log_line`]）。`RanWork(TimedOut)` の後に本体が裏で終わったときは、
+///   ワーカーが「完了しました」を後から記録する（「待たずに終了します」と
+///   矛盾しない: 前者は待ちの打ち切り、後者は本体の結果で、プロセスが先に
+///   終わればどちらかだけが残る）。
+fn run_exit_cleanup<H: Send + 'static>(
+    once: &ExitCleanupOnce<HubExitReport, ExitTrigger>,
+    slot: Arc<HubSlot<H>>,
+    trigger: ExitTrigger,
+    budget: Duration,
+    shutdown: impl FnOnce(H) + Send + 'static,
+    sink: ExitSink,
+) -> ExitCleanupReport<HubExitReport, ExitTrigger> {
+    let body_sink = Arc::clone(&sink);
+    let report = once.run_or_wait(trigger, budget, move |deadline| {
+        let result = run_hub_exit(&slot, deadline, shutdown);
+        // 結果を公開する前に記録する（この関数の doc）。
+        body_sink(body_log_line(trigger, &result));
+        result
+    });
+    if let Some(line) = wait_log_line(trigger, budget, &report) {
+        sink(line);
+    }
+    report
+}
+
+/// 後始末の本体の結果の記録（本体を走らせた経路 `origin` の名で、1 回だけ）。
+fn body_log_line(origin: ExitTrigger, result: &HubExitReport) -> ExitLogLine {
+    if result.settled {
+        ExitLogLine::Info(format!(
+            "banto-hub-shell: 終了の後始末が完了しました（{}）",
+            origin.label()
+        ))
+    } else {
+        ExitLogLine::Error(format!(
+            "banto-hub-shell: 終了の後始末の期限までに、ホスト切替の停止・起動が終わりませんでした。待たずに終了します（{}）",
+            origin.label()
+        ))
+    }
+}
+
+/// 呼び出し元の**待ち**の結果（[`ExitCleanupReport`]）から、その呼び出しが
+/// 記録する文言を決める純関数（#586）。本体の結果は [`body_log_line`] が
+/// ワーカーで記録済みなので、ここでは出さない:
+///
+/// - 本体の完了を受け取った（`RanWork(Finished)`・`ReceivedPrior`）: 何も出さない。
+///   普通のトレイ終了で `app.exit(0)` から来る `RunEvent::Exit` が OS の終了の
+///   文言で完了をもう 1 行出さない。
+/// - 自分が本体を走らせて自分の予算で切った（`RanWork(TimedOut)`）: 自分の上限を出す。
+/// - 後から来て待てなかったときは、**どちらの上限で**やめたかを区別する。先行の
+///   期限が来ていた（または来た）なら自分の上限は名乗らず、先行の期限切れを
+///   受け取ったと出す。自分の予算が先行の期限より短くて自分でやめたときだけ
+///   「この経路の上限◯秒」と出す。
+fn wait_log_line(
     trigger: ExitTrigger,
     budget: Duration,
     report: &ExitCleanupReport<HubExitReport, ExitTrigger>,
 ) -> Option<ExitLogLine> {
     match report {
-        ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(HubExitReport {
-            settled: true,
-            ..
-        })) => Some(ExitLogLine::Info(format!(
-            "banto-hub-shell: 終了の後始末が完了しました（{}）",
-            trigger.label()
-        ))),
-        ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(HubExitReport {
-            settled: false,
-            ..
-        })) => Some(ExitLogLine::Error(format!(
-            "banto-hub-shell: 終了の後始末の期限までに、ホスト切替の停止・起動が終わりませんでした。待たずに終了します（{}）",
-            trigger.label()
-        ))),
+        ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(_))
+        | ExitCleanupReport::ReceivedPrior { .. } => None,
         ExitCleanupReport::RanWork(ExitCleanupOutcome::TimedOut) => {
             Some(ExitLogLine::Error(format!(
                 "banto-hub-shell: 終了の後始末が期限までに終わらなかったため、待たずに終了します（この経路の上限{}秒、{}）",
@@ -716,7 +763,6 @@ fn exit_log_line(
                 trigger.label()
             )))
         }
-        ExitCleanupReport::ReceivedPrior { .. } => None,
         ExitCleanupReport::PriorExpired { origin } => Some(ExitLogLine::Error(format!(
             "banto-hub-shell: 先行の終了の後始末（{}）が期限までに終わっていなかったため、待たずに終了します（{}）",
             origin.label(),
@@ -1960,73 +2006,230 @@ mod tests {
         }
     }
 
-    fn line(
+    fn unsettled() -> HubExitReport {
+        HubExitReport {
+            stopped_hub: true,
+            settled: false,
+        }
+    }
+
+    fn wait_line(
         report: &ExitCleanupReport<HubExitReport, ExitTrigger>,
         trigger: ExitTrigger,
     ) -> Option<ExitLogLine> {
-        exit_log_line(trigger, trigger.budget(), report)
+        wait_log_line(trigger, trigger.budget(), report)
     }
 
-    /// #586 実機確認の 1: 普通のトレイ終了では完了ログが 1 行だけ。トレイが本体を
-    /// 走らせて「トレイの終了」と出し、`app.exit(0)` から来る `Exit` は済んだ結果を
-    /// 受け取っただけなので何も出さない（OS の終了の文言を出さない）。
+    /// 本体の結果の文言: 完了は info、期限までに切替が落ち着かなかったは error。
+    /// どちらも**本体を走らせた経路**の名で出る。
     #[test]
-    fn a_plain_tray_quit_logs_the_completion_once() {
-        let tray = ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(settled()));
-        let exit_event = ExitCleanupReport::ReceivedPrior {
-            origin: ExitTrigger::TrayQuit,
-            result: settled(),
+    fn the_body_line_names_the_origin_and_distinguishes_unsettled() {
+        let ExitLogLine::Info(done) = body_log_line(ExitTrigger::TrayQuit, &settled()) else {
+            panic!("settled is info");
         };
-        let Some(ExitLogLine::Info(text)) = line(&tray, ExitTrigger::TrayQuit) else {
-            panic!("the tray quit logs the completion");
-        };
-        assert!(text.contains("完了しました") && text.contains("トレイの終了"));
-        assert_eq!(line(&exit_event, ExitTrigger::RunEventExit), None);
-    }
-
-    /// #586 実機確認の 2: トレイが 15 秒で打ち切られた後に来た `Exit` は、待たずに
-    /// 先行の期限切れを受け取る。自分の上限（5 秒）を名乗らず、先行の起点を出す。
-    #[test]
-    fn a_call_after_the_prior_expiry_does_not_claim_its_own_budget() {
-        let tray = ExitCleanupReport::RanWork(ExitCleanupOutcome::TimedOut);
-        let exit_event = ExitCleanupReport::PriorExpired {
-            origin: ExitTrigger::TrayQuit,
-        };
-        let Some(ExitLogLine::Error(first)) = line(&tray, ExitTrigger::TrayQuit) else {
-            panic!("the tray quit logs its own time-out");
-        };
-        assert!(first.contains("この経路の上限15秒"));
-        let Some(ExitLogLine::Error(text)) = line(&exit_event, ExitTrigger::RunEventExit) else {
-            panic!("the prior expiry is logged");
-        };
-        assert!(!text.contains("この経路の上限"));
-        assert!(!text.contains("5秒"));
-        assert!(text.contains("先行") && text.contains("トレイの終了"));
-    }
-
-    /// 後から来た呼び出しが自分の予算で待つのをやめたときだけ、その上限を名乗る。
-    #[test]
-    fn a_call_cut_by_its_own_budget_names_its_own_limit() {
-        let report = ExitCleanupReport::OwnBudgetExpired {
-            origin: ExitTrigger::TrayQuit,
-        };
-        let Some(ExitLogLine::Error(text)) = line(&report, ExitTrigger::RunEventExit) else {
-            panic!("the own-budget cut is logged");
-        };
-        assert!(text.contains("上限5秒") && text.contains("トレイの終了"));
-    }
-
-    /// 本体を走らせた呼び出しの「期限までに切替が落ち着かなかった」は従来どおり。
-    #[test]
-    fn an_unsettled_run_is_logged_as_an_error_by_the_caller_that_ran_it() {
-        let report = ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(HubExitReport {
-            stopped_hub: true,
-            settled: false,
-        }));
-        let Some(ExitLogLine::Error(text)) = line(&report, ExitTrigger::RunEventExit) else {
+        assert!(done.contains("完了しました") && done.contains("トレイの終了"));
+        let ExitLogLine::Error(late) = body_log_line(ExitTrigger::TrayQuit, &unsettled()) else {
             panic!("unsettled is an error");
         };
-        assert!(text.contains("終わりませんでした"));
+        assert!(late.contains("終わりませんでした") && late.contains("トレイの終了"));
+    }
+
+    /// 待ちの文言（実機確認の 1・2）: 完了を受け取った側は何も出さない。トレイが
+    /// 打ち切られた後に来た `Exit` は自分の上限（5 秒）を名乗らず先行の期限切れを
+    /// 出す。自分の予算で切ったときだけその上限を名乗る。
+    #[test]
+    fn wait_lines_name_only_what_the_call_did() {
+        assert_eq!(
+            wait_line(
+                &ExitCleanupReport::RanWork(ExitCleanupOutcome::Finished(settled())),
+                ExitTrigger::TrayQuit
+            ),
+            None
+        );
+        assert_eq!(
+            wait_line(
+                &ExitCleanupReport::ReceivedPrior {
+                    origin: ExitTrigger::TrayQuit,
+                    result: settled()
+                },
+                ExitTrigger::RunEventExit
+            ),
+            None
+        );
+        let Some(ExitLogLine::Error(own)) = wait_line(
+            &ExitCleanupReport::RanWork(ExitCleanupOutcome::TimedOut),
+            ExitTrigger::TrayQuit,
+        ) else {
+            panic!("the tray quit logs its own time-out");
+        };
+        assert!(own.contains("この経路の上限15秒"));
+        let Some(ExitLogLine::Error(expired)) = wait_line(
+            &ExitCleanupReport::PriorExpired {
+                origin: ExitTrigger::TrayQuit,
+            },
+            ExitTrigger::RunEventExit,
+        ) else {
+            panic!("the prior expiry is logged");
+        };
+        assert!(!expired.contains("この経路の上限") && !expired.contains("5秒"));
+        assert!(expired.contains("先行") && expired.contains("トレイの終了"));
+        let Some(ExitLogLine::Error(cut)) = wait_line(
+            &ExitCleanupReport::OwnBudgetExpired {
+                origin: ExitTrigger::TrayQuit,
+            },
+            ExitTrigger::RunEventExit,
+        ) else {
+            panic!("the own-budget cut is logged");
+        };
+        assert!(cut.contains("上限5秒") && cut.contains("トレイの終了"));
+    }
+
+    /// 数えられる記録先。`slow_body` なら、本体の行を記録する前に少し止まる
+    /// （記録が遅い先行を作る）。
+    fn counting_sink(slow_body: bool) -> (ExitSink, Arc<StdMutex<Vec<ExitLogLine>>>) {
+        let lines = Arc::new(StdMutex::new(Vec::new()));
+        let sink_lines = Arc::clone(&lines);
+        let sink: ExitSink = Arc::new(move |line| {
+            let is_body = match &line {
+                ExitLogLine::Info(text) => text.contains("完了しました"),
+                ExitLogLine::Error(text) => text.contains("終わりませんでした"),
+            };
+            if slow_body && is_body {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            sink_lines.lock().unwrap().push(line);
+        });
+        (sink, lines)
+    }
+
+    /// 普通のトレイ終了: 完了ログは 1 行だけ。後から来る `Exit` は受け取るだけで
+    /// 出さない。
+    #[test]
+    fn a_plain_tray_quit_logs_one_completion_line() {
+        let once = ExitCleanupOnce::<HubExitReport, ExitTrigger>::new();
+        let slot = HubSlot::<u32>::new();
+        let (sink, lines) = counting_sink(false);
+        slot.close();
+        run_exit_cleanup(
+            &once,
+            Arc::clone(&slot),
+            ExitTrigger::TrayQuit,
+            Duration::from_secs(5),
+            |_| {},
+            Arc::clone(&sink),
+        );
+        let after = run_exit_cleanup(
+            &once,
+            slot,
+            ExitTrigger::RunEventExit,
+            Duration::from_secs(5),
+            |_| {},
+            sink,
+        );
+        assert!(matches!(after, ExitCleanupReport::ReceivedPrior { .. }));
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(matches!(&lines[0], ExitLogLine::Info(text) if text.contains("トレイの終了")));
+    }
+
+    /// オーナーレビュー P2: 先行（トレイ）の記録が遅くても、結果を先に受け取った
+    /// 後続（OS の終了）が戻る時点で、本体の記録は済んでいる。記録を結果の
+    /// 公開より後（呼び出し元）に置く作りだと、後続が戻った時点で 0 行になる。
+    #[test]
+    fn the_body_is_recorded_before_a_waiting_caller_gets_the_result() {
+        let once = Arc::new(ExitCleanupOnce::<HubExitReport, ExitTrigger>::new());
+        let slot = HubSlot::<u32>::new();
+        slot.close();
+        let (sink, lines) = counting_sink(true);
+        let tray = {
+            let (once, slot, sink) = (Arc::clone(&once), Arc::clone(&slot), Arc::clone(&sink));
+            std::thread::spawn(move || {
+                run_exit_cleanup(
+                    &once,
+                    slot,
+                    ExitTrigger::TrayQuit,
+                    Duration::from_secs(5),
+                    |_| {},
+                    sink,
+                )
+            })
+        };
+        while !once.has_started() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let os = run_exit_cleanup(
+            &once,
+            slot,
+            ExitTrigger::RunEventExit,
+            Duration::from_secs(5),
+            |_| {},
+            Arc::clone(&sink),
+        );
+        assert!(matches!(os, ExitCleanupReport::ReceivedPrior { .. }));
+        // 後続が結果を受け取って戻った時点で、本体の記録はもうある。
+        assert_eq!(lines.lock().unwrap().len(), 1);
+        tray.join().unwrap();
+        assert_eq!(lines.lock().unwrap().len(), 1, "no duplicate line");
+    }
+
+    /// 期限までに切替が落ち着かなかった診断は、後続が先に戻っても少なくとも 1 回
+    /// 残り、本体の分は 1 回だけ。
+    #[test]
+    fn an_unsettled_diagnostic_survives_a_waiter_returning_first() {
+        let once = Arc::new(ExitCleanupOnce::<HubExitReport, ExitTrigger>::new());
+        let slot = HubSlot::<u32>::new();
+        // 進行中の起動を 1 つ持ったままにして、落ち着かない（settled: false）ようにする。
+        let _ticket = slot.begin_start().expect("open slot accepts a start");
+        slot.close();
+        let (sink, lines) = counting_sink(true);
+        let tray = {
+            let (once, slot, sink) = (Arc::clone(&once), Arc::clone(&slot), Arc::clone(&sink));
+            std::thread::spawn(move || {
+                run_exit_cleanup(
+                    &once,
+                    slot,
+                    ExitTrigger::TrayQuit,
+                    Duration::from_millis(150),
+                    |_| {},
+                    sink,
+                )
+            })
+        };
+        while !once.has_started() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        run_exit_cleanup(
+            &once,
+            slot,
+            ExitTrigger::RunEventExit,
+            Duration::from_secs(5),
+            |_| {},
+            Arc::clone(&sink),
+        );
+        let seen = lines.lock().unwrap().len();
+        assert!(
+            seen >= 1,
+            "a diagnostic is already recorded when the waiter returns"
+        );
+        tray.join().unwrap();
+        // 呼び出し元の待ちが先に切れても、本体は裏で続いて自分の診断を 1 回記録する
+        // （待ちの打ち切りの行とは別）。記録されるまで上限付きで待つ。
+        let give_up = std::time::Instant::now() + Duration::from_secs(5);
+        let count_body_errors = || {
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| {
+                    matches!(line, ExitLogLine::Error(text) if text.contains("終わりませんでした"))
+                })
+                .count()
+        };
+        while count_body_errors() == 0 && std::time::Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(count_body_errors(), 1, "{:?}", lines.lock().unwrap());
     }
 
     /// 「アプリを終了」の確認文は収集中かどうかで変わり、収集中の文言は
