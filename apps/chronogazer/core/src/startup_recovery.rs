@@ -100,6 +100,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 use banto_core::BantoError;
 use serde::Serialize;
@@ -733,6 +734,10 @@ fn describe(err: &BantoError) -> String {
 }
 
 /// フォルダを（無ければ）作り、小さなファイルを書いて消せることを確かめる。
+///
+/// 試し書きのファイル名は乱数の nonce を含み、`create_new(true)`（既にあれば失敗）で作る。
+/// 既存のファイル（クラッシュで残った古い試し書き・PID の再利用・同じネットワークフォルダへ
+/// 書く別の PC のもの）を切り詰めて壊さない。名前が衝突したら nonce を替えてやり直す。
 pub async fn check_writable_dir(dir: &Path) -> Result<(), RecoveryError> {
     let fail = |what: &str, err: std::io::Error| {
         RecoveryError(format!(
@@ -743,17 +748,65 @@ pub async fn check_writable_dir(dir: &Path) -> Result<(), RecoveryError> {
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|err| fail("作れませんでした", err))?;
-    let probe = dir.join(format!(
-        ".chronogazer-write-check-{}.tmp",
-        std::process::id()
-    ));
-    tokio::fs::write(&probe, b"ok")
-        .await
-        .map_err(|err| fail("書き込みに使えません", err))?;
-    tokio::fs::remove_file(&probe)
-        .await
-        .map_err(|err| fail("書き込みに使えません（確認用のファイルを消せません）", err))?;
-    Ok(())
+    for _ in 0..WRITE_CHECK_ATTEMPTS {
+        let probe = write_check_path(dir);
+        let opened = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .await;
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(fail("書き込みに使えません", err)),
+        };
+        // ここから先は自分が作ったファイルだけ。どの経路でも消す（失敗・取消しでも残さない）。
+        let guard = WriteCheckFile(Some(probe));
+        file.write_all(b"ok")
+            .await
+            .map_err(|err| fail("書き込みに使えません", err))?;
+        file.flush()
+            .await
+            .map_err(|err| fail("書き込みに使えません", err))?;
+        drop(file);
+        return guard
+            .remove()
+            .await
+            .map_err(|err| fail("書き込みに使えません（確認用のファイルを消せません）", err));
+    }
+    Err(fail(
+        "書き込みに使えません",
+        std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+    ))
+}
+
+const WRITE_CHECK_ATTEMPTS: usize = 16;
+
+fn write_check_path(dir: &Path) -> PathBuf {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("システム乱数生成器の呼び出しに失敗しました");
+    dir.join(format!(
+        ".chronogazer-write-check-{:016x}.tmp",
+        u64::from_le_bytes(bytes)
+    ))
+}
+
+/// 試し書きのファイルの後始末（正常時は `remove` で消して結果を返し、それ以外は Drop で消す）。
+struct WriteCheckFile(Option<PathBuf>);
+
+impl WriteCheckFile {
+    async fn remove(mut self) -> std::io::Result<()> {
+        let path = self.0.take().expect("probe path is present");
+        tokio::fs::remove_file(&path).await
+    }
+}
+
+impl Drop for WriteCheckFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(test)]

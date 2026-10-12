@@ -787,3 +787,30 @@ async fn a_failed_restore_apply_puts_everything_back() {
     assert_eq!(snapshot(dir.path()), before, "元の状態に戻っていない");
     drop(acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("失敗の後は排他が返っている"));
 }
+
+/// 書き込み確認の試し書きは、既にあるファイル（旧方式の PID だけの名前を含む）を壊さず、
+/// 終わったら自分のファイルを残さない。
+#[tokio::test]
+async fn write_check_leaves_existing_files_untouched_and_cleans_up() {
+    let dir = TempDir::new();
+    let legacy = dir.path().join(format!(
+        ".chronogazer-write-check-{}.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&legacy, b"someone else's data").unwrap();
+    let other = dir.path().join("data.bin");
+    std::fs::write(&other, b"keep").unwrap();
+
+    for _ in 0..3 {
+        check_writable_dir(dir.path()).await.expect("書ける");
+    }
+
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"someone else's data");
+    assert_eq!(std::fs::read(&other).unwrap(), b"keep");
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "試し書きが残った: {names:?}");
+}

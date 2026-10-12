@@ -150,8 +150,10 @@
 	<body>
 		<h1 id="title">ChronoGazer を起動できません</h1>
 		<p id="message"></p>
-		<div class="notice" id="notice" hidden></div>
-		<p class="muted" id="busy" hidden>処理しています…（終わるまでこの窓は閉じられません）</p>
+		<div class="notice" id="notice" role="alert" hidden></div>
+		<p class="muted" id="busy" role="status" aria-live="polite" hidden>
+			処理しています…（終わるまでこの窓は閉じられません）
+		</p>
 
 		<div id="choices"></div>
 
@@ -165,10 +167,22 @@
 			</div>
 		</div>
 
-		<div class="panel" id="confirm-panel" hidden>
+		<div
+			class="panel"
+			id="confirm-panel"
+			role="alertdialog"
+			aria-labelledby="confirm-text"
+			aria-describedby="confirm-text"
+			hidden
+		>
 			<p id="confirm-text"></p>
 			<div class="actions">
-				<button type="button" class="danger" id="confirm-go"></button>
+				<button
+					type="button"
+					class="danger"
+					id="confirm-go"
+					aria-describedby="confirm-text"
+				></button>
 				<button type="button" id="confirm-cancel">やめる</button>
 			</div>
 		</div>
