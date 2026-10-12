@@ -8,6 +8,7 @@
 //! | --- | --- |
 //! | 既に起動中（A1）・旧形式の DB | 今までのエラーの窓のまま（[`WindowPlan::ExistingNotice`]） |
 //! | 保存先（`data.dir`）を読めない | ① 保存先のフォルダを選び直す ② 既定の場所に戻して起動する ③ 終了 |
+//! | 保存先に書き込めない（USB の取り外し・権限・ドライブが無い） | もう一度確かめる・① ・② ・③ |
 //! | DB が壊れている・開けない | ① バックアップから戻す ② 新しく作り直す ③ 終了 |
 //! | 新しい版の ChronoGazer が使った DB・それ以外 | ③ 終了だけ（理由を出す） |
 //!
@@ -35,6 +36,12 @@
 //!   （`EngineStartError::StoreConfig::data_dir_unreadable`）で DB 自体は壊れて
 //!   いないときだけ「保存先」の窓。DB が壊れている文言なら DB の窓、保持期間
 //!   など別の項目が読めないなら「開けない」の DB の窓（設定 DB の中身が読めない）。
+//! - 保存先に書き込めない（`EngineStartError::StoreDirUnwritable`、デスクトップは
+//!   起動時に解決済みの `data.dir` へ試し書きする - `EngineConfig::store_dir_check_required`）
+//!   は「書き込めない」の保存先の窓。値を読めない窓の選択肢に**「もう一度確かめる」**
+//!   を足す（USB を差し直した・権限を直した後に、何も変えずに起動をやり直す）。
+//! - DB が開けない理由が権限・他のソフトのロックでも「作り直す」は出す（オーナー決定
+//!   2026-10-12: ロック中なら名前の変更が失敗して理由が出るだけで、何も消さない）。
 //!
 //! # 対処（どれも消さない）
 //!
@@ -103,6 +110,8 @@ pub enum FailureKind {
     LegacyDatabase,
     /// 保存先（`data.dir`）の値を読めない。
     StoreDirUnreadable,
+    /// 保存先（解決済みの `data.dir`）に書き込めない（2026-10-12 オーナー決定で追加）。
+    StoreDirUnwritable,
     /// DB が壊れている（SQLite が「DB ではない」「壊れている」と言う）。
     DatabaseCorrupt,
     /// DB を開けない・設定を読めない（権限・他のソフトが使用中・ディスクなど）。
@@ -117,6 +126,8 @@ pub enum FailureKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RecoveryChoice {
+    /// もう一度確かめる（USB を差し直した・権限を直した後に、そのまま起動をやり直す）。
+    RetryStoreCheck,
     /// 保存先のフォルダを選び直す（フォルダ選択ダイアログ）。
     ChooseStoreDir,
     /// 既定の場所に戻して起動する。
@@ -133,6 +144,7 @@ impl RecoveryChoice {
     /// 窓から Rust へ選択を渡すときの名前（監査の `detail.choice` にも使う）。
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::RetryStoreCheck => "retryStoreCheck",
             Self::ChooseStoreDir => "chooseStoreDir",
             Self::ResetStoreDir => "resetStoreDir",
             Self::RestoreBackup => "restoreBackup",
@@ -144,6 +156,7 @@ impl RecoveryChoice {
     /// [`RecoveryChoice::as_str`] の逆。知らない名前は `None`。
     pub fn parse(name: &str) -> Option<Self> {
         [
+            Self::RetryStoreCheck,
             Self::ChooseStoreDir,
             Self::ResetStoreDir,
             Self::RestoreBackup,
@@ -181,6 +194,9 @@ pub fn plan(kind: FailureKind) -> WindowPlan {
         FailureKind::StoreDirUnreadable => {
             WindowPlan::Choices(vec![ChooseStoreDir, ResetStoreDir, Quit])
         }
+        FailureKind::StoreDirUnwritable => {
+            WindowPlan::Choices(vec![RetryStoreCheck, ChooseStoreDir, ResetStoreDir, Quit])
+        }
         FailureKind::DatabaseCorrupt | FailureKind::DatabaseUnopenable => {
             WindowPlan::Choices(vec![RestoreBackup, RecreateDatabase, Quit])
         }
@@ -207,6 +223,7 @@ pub fn classify(err: &EngineStartError) -> FailureKind {
             _ if *data_dir_unreadable => FailureKind::StoreDirUnreadable,
             other => other,
         },
+        EngineStartError::StoreDirUnwritable { .. } => FailureKind::StoreDirUnwritable,
         EngineStartError::Listen { .. } => FailureKind::Other,
     }
 }

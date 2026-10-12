@@ -168,7 +168,7 @@ use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
 use crate::settings::{read_data_dir, store_config, ServerSettings, SettingsService};
-use crate::startup_recovery::RecoveryNote;
+use crate::startup_recovery::{check_writable_dir, RecoveryNote};
 use crate::users::UsersService;
 use crate::{CollectionGroupService, PlcConnectionService, TagService};
 
@@ -218,6 +218,16 @@ pub struct EngineConfig {
     /// 設定していると、既定値で続けたときに時系列データを**違う場所へ**書き始めて
     /// しまうため（デスクトップは B1-1 より前から、ここで起動を止めていた）。
     pub store_config_required: bool,
+    /// 起動時に、解決済みの保存先（`data.dir`）に書き込めるかを確かめ、書けなければ
+    /// 起動を止めるか（#392、2026-10-12 オーナー決定）。`true`（デスクトップ）は
+    /// Hub を止めて pool を閉じてから [`EngineStartError::StoreDirUnwritable`] を返す
+    /// （USB の取り外し・権限・ドライブが無いなどで、収集の開始で初めてエラーに
+    /// なるのを起動時の対処の窓に前倒しする）。確かめ方は
+    /// [`crate::startup_recovery::check_writable_dir`]（無ければフォルダを作る - 収集の
+    /// 開始も作るので同じ扱い - 一時ファイルを書いて消す。既存の中身には触れない）。
+    /// `false`（`banto-serve`）は今までどおり確かめない（開発・E2E 用。書けなければ
+    /// 収集の開始がエラーを状態に残す）。
+    pub store_dir_check_required: bool,
 }
 
 impl EngineConfig {
@@ -248,6 +258,9 @@ pub enum EngineStartError {
         source: BantoError,
         data_dir_unreadable: bool,
     },
+    /// 解決済みの保存先に書き込めない（[`EngineConfig::store_dir_check_required`]
+    /// のときだけ）。`reason` は利用者向けの理由。
+    StoreDirUnwritable { dir: PathBuf, reason: String },
     /// [`EngineListen::Required`] の待ち受けを開けなかった。
     Listen {
         config: ServerConfig,
@@ -270,6 +283,7 @@ impl std::fmt::Display for EngineStartError {
                     "時系列データの保存設定の読み取りに失敗しました: {source}"
                 )
             }
+            Self::StoreDirUnwritable { reason, .. } => f.write_str(reason),
             Self::Listen { config, source } => write!(
                 f,
                 "待ち受け（{}:{}）を開始できませんでした: {source}",
@@ -287,6 +301,7 @@ impl std::error::Error for EngineStartError {
             Self::Hub(err)
             | Self::StoreConfig { source: err, .. }
             | Self::Listen { source: err, .. } => Some(err),
+            Self::StoreDirUnwritable { .. } => None,
         }
     }
 }
@@ -616,6 +631,17 @@ impl OpenedEngine {
             }
         };
         let collect_data_dir = resolve_data_dir(&cfg.data_base, &store_settings.data_dir);
+        // #392: 保存先に書き込めるか（`store_dir_check_required` のときだけ）。
+        if cfg.store_dir_check_required {
+            if let Err(err) = check_writable_dir(&collect_data_dir).await {
+                hub.shutdown().await;
+                pool.close().await;
+                return Err(EngineStartError::StoreDirUnwritable {
+                    dir: collect_data_dir,
+                    reason: err.0,
+                });
+            }
+        }
         let collect = CollectorService::new(pool.clone(), collect_data_dir);
         if cfg.attach_hub {
             // 自動開始（下）より前に繋ぐ。
@@ -909,6 +935,7 @@ mod tests {
             log_label: "engine-test",
             audit_origin: "rest",
             store_config_required: false,
+            store_dir_check_required: false,
         }
     }
 

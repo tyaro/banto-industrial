@@ -133,6 +133,9 @@ async fn main() {
         log_label: "banto-serve",
         audit_origin: "rest",
         store_config_required: false,
+        // #392: 保存先の試し書きはしない（今までどおり。開発・E2E 用で、書けなければ
+        // 収集の開始がエラーを状態に残す。E2E の前提を変えないため）。
+        store_dir_check_required: false,
     })
     .await
     {

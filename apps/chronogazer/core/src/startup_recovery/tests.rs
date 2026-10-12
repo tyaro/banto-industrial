@@ -22,6 +22,7 @@ fn config(dir: &Path) -> EngineConfig {
         audit_origin: "tauri",
         // デスクトップと同じ（保存設定を読めなければ止める）。
         store_config_required: true,
+        store_dir_check_required: true,
     }
 }
 
@@ -113,6 +114,14 @@ fn classify_maps_every_failure() {
             FailureKind::DatabaseUnopenable,
         ),
         (
+            "保存先に書き込めない",
+            EngineStartError::StoreDirUnwritable {
+                dir: PathBuf::from("E:/data"),
+                reason: "作れませんでした".to_string(),
+            },
+            FailureKind::StoreDirUnwritable,
+        ),
+        (
             "待ち受け",
             EngineStartError::Listen {
                 config: banto_server::ServerConfig {
@@ -142,6 +151,10 @@ fn plan_matches_the_owner_table() {
             WindowPlan::Choices(vec![ChooseStoreDir, ResetStoreDir, Quit]),
         ),
         (
+            FailureKind::StoreDirUnwritable,
+            WindowPlan::Choices(vec![RetryStoreCheck, ChooseStoreDir, ResetStoreDir, Quit]),
+        ),
+        (
             FailureKind::DatabaseCorrupt,
             WindowPlan::Choices(vec![RestoreBackup, RecreateDatabase, Quit]),
         ),
@@ -163,6 +176,7 @@ fn plan_matches_the_owner_table() {
         }
     }
     let confirmed: Vec<_> = [
+        RetryStoreCheck,
         ChooseStoreDir,
         ResetStoreDir,
         RestoreBackup,
@@ -181,6 +195,7 @@ fn plan_matches_the_owner_table() {
 #[test]
 fn choice_names_round_trip_and_unknown_names_are_refused() {
     for choice in [
+        RecoveryChoice::RetryStoreCheck,
         RecoveryChoice::ChooseStoreDir,
         RecoveryChoice::ResetStoreDir,
         RecoveryChoice::RestoreBackup,
@@ -594,4 +609,67 @@ async fn closing_an_opened_engine_releases_the_lock() {
     let db_path = opened.db_path().to_path_buf();
     opened.close().await;
     drop(acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("排他が返っている"));
+}
+
+/// 保存先に書き込めない（フォルダの代わりに同名のファイルがある）と、`start` は
+/// `StoreDirUnwritable` で止まり（保存先の「書き込めない」の窓・「もう一度確かめる」
+/// つき）、排他と pool を返し DB の設定は変えない。書けるようにしてから同じ設定で
+/// やり直す（=「もう一度確かめる」）と起動を続ける。`banto-serve` の設定
+/// （`store_dir_check_required: false`）は今までどおり確かめずに起動する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unwritable_store_dir_stops_until_it_becomes_writable() {
+    let dir = TempDir::new();
+    let blocked = dir.path().join("usb-data");
+    std::fs::write(&blocked, b"not a folder").unwrap();
+    let opened = EngineRuntime::open(config(dir.path())).await.expect("open");
+    crate::settings::set_data_dir(&opened.settings(), &blocked.display().to_string())
+        .await
+        .unwrap();
+    opened.close().await;
+
+    let err = match EngineRuntime::start(config(dir.path())).await {
+        Ok(_) => panic!("書き込めない保存先で起動した"),
+        Err(err) => err,
+    };
+    assert_eq!(classify(&err), FailureKind::StoreDirUnwritable, "{err}");
+    assert_eq!(
+        plan(classify(&err)),
+        WindowPlan::Choices(vec![
+            RecoveryChoice::RetryStoreCheck,
+            RecoveryChoice::ChooseStoreDir,
+            RecoveryChoice::ResetStoreDir,
+            RecoveryChoice::Quit,
+        ])
+    );
+    assert!(err.to_string().contains("usb-data"), "{err}");
+    let db_path = dir.path().join("chronogazer.sqlite3");
+    drop(acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("失敗の後は排他が返っている"));
+    assert_eq!(
+        std::fs::read(&blocked).unwrap(),
+        b"not a folder",
+        "保存先の場所の中身に触れた"
+    );
+
+    // banto-serve の設定は確かめない（今までどおり起動する）。
+    let engine = EngineRuntime::start(EngineConfig {
+        store_dir_check_required: false,
+        store_config_required: false,
+        ..config(dir.path())
+    })
+    .await
+    .expect("banto-serve は今までどおり起動する");
+    stop(engine).await;
+
+    // 書けるようにして「もう一度確かめる」（同じ設定でやり直す）。
+    std::fs::remove_file(&blocked).unwrap();
+    let engine = EngineRuntime::start(config(dir.path()))
+        .await
+        .expect("書けるようになったら起動を続ける");
+    assert_eq!(
+        read_data_dir(&engine.services().settings).await.unwrap(),
+        Some(blocked.display().to_string()),
+        "設定は変えない"
+    );
+    assert!(blocked.is_dir());
+    stop(engine).await;
 }

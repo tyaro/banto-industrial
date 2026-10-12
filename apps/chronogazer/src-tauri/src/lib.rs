@@ -4418,6 +4418,9 @@ fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
         // していた利用者の時系列データを違う場所へ書き始める）。止めた後は
         // 対処の窓で保存先を選び直せる（#392、[`startup`]）。
         store_config_required: true,
+        // 起動時に保存先へ書き込めるかを確かめ、書けなければ対処の窓（#392、
+        // 2026-10-12 オーナー決定）。
+        store_dir_check_required: true,
     }
 }
 
@@ -5116,6 +5119,7 @@ mod tests {
             log_label: "banto",
             audit_origin: "tauri",
             store_config_required: true,
+            store_dir_check_required: true,
         }
     }
 

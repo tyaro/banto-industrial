@@ -198,6 +198,10 @@ fn failure_text(kind: FailureKind) -> (&'static str, &'static str) {
             "時系列データの保存先を読み取れません",
             "設定に保存されている時系列データの保存先（data.dir）を読み取れないため、起動を止めました。保存先のフォルダを選び直すか、既定の場所に戻すと起動を続けられます。どちらを選んでも、今のデータベースや記録は消しません。",
         ),
+        FailureKind::StoreDirUnwritable => (
+            "時系列データの保存先に書き込めません",
+            "設定されている時系列データの保存先のフォルダに書き込めないため、起動を止めました（USB メモリやネットワークドライブが外れている、ドライブが無い、権限が無い など）。差し直す・権限を直すなどした後に「もう一度確かめる」を押すか、保存先のフォルダを選び直すか、既定の場所に戻すと起動を続けられます。どれを選んでも、今のデータベースや記録は消しません。",
+        ),
         FailureKind::DatabaseCorrupt => (
             "データベースが壊れています",
             "設定のデータベース（アカウント・接続・タグ・設定）が壊れていて開けないため、起動を止めました。バックアップから戻すか、新しく作り直すと起動できます。どちらを選んでも、今のデータベースのファイルは名前を変えて残します（消しません）。",
@@ -221,6 +225,12 @@ fn failure_text(kind: FailureKind) -> (&'static str, &'static str) {
 /// ファイル名。
 fn choice_view(choice: RecoveryChoice, default_dir: &str, db_name: &str) -> ChoiceView {
     let (label, description, confirm, confirm_label) = match choice {
+        RecoveryChoice::RetryStoreCheck => (
+            "もう一度確かめる".to_string(),
+            "USB メモリを差し直した・権限を直したなどの後に、同じ保存先でもう一度起動を試みます。".to_string(),
+            None,
+            None,
+        ),
         RecoveryChoice::ChooseStoreDir => (
             "保存先のフォルダを選び直す".to_string(),
             "フォルダを選ぶと、その場所を設定に保存して起動を続けます。".to_string(),
@@ -576,6 +586,8 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
             }
         },
         RecoveryChoice::ResetStoreDir => Prelude::StoreDir(StoreDirChoice::Default),
+        // 何も変えずにやり直す（保存先の試し書きもやり直す）。
+        RecoveryChoice::RetryStoreCheck => Prelude::None,
         RecoveryChoice::RecreateDatabase => {
             match recovery::set_aside_broken_db(&paths.db_path, &recovery::broken_stamp_now()).await
             {
@@ -716,6 +728,7 @@ mod tests {
     fn views_follow_the_core_plan_and_confirmation_rule() {
         for kind in [
             FailureKind::StoreDirUnreadable,
+            FailureKind::StoreDirUnwritable,
             FailureKind::DatabaseCorrupt,
             FailureKind::DatabaseUnopenable,
             FailureKind::DatabaseFromNewerVersion,
