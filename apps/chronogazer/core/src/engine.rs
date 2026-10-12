@@ -167,7 +167,7 @@ use crate::events::event_channel;
 use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
-use crate::settings::{read_data_dir, store_config, ServerSettings, SettingsService};
+use crate::settings::{data_dir_value_unreadable, store_config, ServerSettings, SettingsService};
 use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
 use crate::{CollectionGroupService, PlcConnectionService, TagService};
@@ -656,7 +656,7 @@ impl OpenedEngine {
             Err(err) if cfg.store_config_required => {
                 // 読めないのが保存先（`data.dir`）そのものかを、pool を閉じる前に
                 // 確かめる（起動時の対処の窓が「保存先を選び直す」を出すか決める）。
-                let data_dir_unreadable = read_data_dir(&settings).await.is_err();
+                let data_dir_unreadable = data_dir_value_unreadable(&pool).await;
                 hub.shutdown().await;
                 pool.close().await;
                 return Err(EngineStartError::StoreConfig {

@@ -171,6 +171,7 @@
 			class="panel"
 			id="confirm-panel"
 			role="alertdialog"
+			aria-modal="true"
 			aria-labelledby="confirm-text"
 			aria-describedby="confirm-text"
 			hidden
@@ -213,9 +214,36 @@
 					}
 				}
 
+				// 確認の表示中は、背後（確認の窓以外）を操作できなくする（inert）。
+				var opener = null;
+
+				function setBackgroundInert(value) {
+					var children = document.body.children;
+					for (var i = 0; i < children.length; i++) {
+						var node = children[i];
+						if (node.id === 'confirm-panel' || node.tagName === 'SCRIPT') {
+							continue;
+						}
+						node.inert = value;
+					}
+				}
+
 				function closePanels() {
 					el('backup-panel').hidden = true;
 					el('confirm-panel').hidden = true;
+					setBackgroundInert(false);
+					opener = null;
+				}
+
+				// 確認だけを閉じ（やめる）、押した起点のボタンへフォーカスを戻す。
+				function cancelConfirm() {
+					var target = opener;
+					el('confirm-panel').hidden = true;
+					setBackgroundInert(false);
+					opener = null;
+					if (target && !target.hidden && target.isConnected) {
+						target.focus();
+					}
 				}
 
 				// 選んだ対処を Rust に知らせる（on_navigation が受け取って取り消す）。
@@ -230,7 +258,12 @@
 				}
 
 				function confirmThen(choice, file) {
-					closePanels();
+					// 戻す先（バックアップの一覧の「戻す」か、選択肢のボタン）を覚えておく。
+					var from = document.activeElement;
+					el('confirm-panel').hidden = true;
+					if (!file) {
+						el('backup-panel').hidden = true;
+					}
 					var text = choice.confirm || '';
 					if (file) {
 						text = text.split('{file}').join(file);
@@ -240,6 +273,8 @@
 					el('confirm-go').onclick = function () {
 						send(choice.id, file);
 					};
+					opener = from && from !== document.body ? from : null;
+					setBackgroundInert(true);
 					el('confirm-panel').hidden = false;
 					el('confirm-go').focus();
 				}
@@ -351,7 +386,7 @@
 				}
 
 				el('backup-cancel').onclick = closePanels;
-				el('confirm-cancel').onclick = closePanels;
+				el('confirm-cancel').onclick = cancelConfirm;
 				window.__chronogazerRecovery = { render: render };
 
 				var initial = window.__CHRONOGAZER_RECOVERY__;

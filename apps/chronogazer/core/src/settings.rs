@@ -136,6 +136,37 @@ pub async fn read_data_dir(settings: &SettingsService) -> Result<Option<String>,
     settings.get(KEY_DATA_DIR).await
 }
 
+/// 読めないのが `data.dir` の**値そのもの**（TEXT として読めない BLOB・不正な UTF-8）か。
+///
+/// `database is locked`・I/O エラー・`settings` テーブルを読めない、といった**問い合わせ
+/// 全体（DB）の失敗**では `false` を返す（`BantoError` では sqlx の種類が潰れるので、
+/// pool へ直接問い合わせて型で見分ける）。起動時の対処の窓が、DB の障害を保存先の
+/// 窓に誤分類せず、バックアップから戻す・作り直すを出せるようにするため。
+pub async fn data_dir_value_unreadable(pool: &sqlx::SqlitePool) -> bool {
+    // 1. 値の型だけを読む（BLOB でも読める）。ここが失敗するのは DB の失敗。
+    let kind: Option<String> =
+        match sqlx::query_scalar("SELECT typeof(value) FROM settings WHERE key = ?1")
+            .bind(KEY_DATA_DIR)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(kind) => kind,
+            Err(_) => return false,
+        };
+    match kind.as_deref() {
+        None => false,
+        Some("text") => {
+            // 2. TEXT でも UTF-8 として読めないことがある（そのときだけ値の問題）。
+            sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?1")
+                .bind(KEY_DATA_DIR)
+                .fetch_optional(pool)
+                .await
+                .is_err()
+        }
+        Some(_) => true,
+    }
+}
+
 /// 保存先（`data.dir`）だけを書き換える（起動時の対処の窓の「保存先を選び直す」
 /// 「既定の場所に戻す」、[`crate::startup_recovery::apply_store_dir`]）。
 /// 保持期間には触れない。
@@ -173,6 +204,39 @@ mod tests {
     async fn service() -> SettingsService {
         let pool = migrate_memory().await.expect("migrate_memory");
         SettingsService::new(Db::Sqlite(pool))
+    }
+
+    /// 値が読めない（BLOB）→ 値の問題、テーブルが無いなど DB 全体の失敗 → 値の問題ではない。
+    #[tokio::test]
+    async fn data_dir_unreadable_separates_value_from_database_failures() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        assert!(!data_dir_value_unreadable(&pool).await, "未設定");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('data.dir', 'D:/x')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!data_dir_value_unreadable(&pool).await, "読める値");
+        sqlx::query("UPDATE settings SET value = X'FF00FE' WHERE key = 'data.dir'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(data_dir_value_unreadable(&pool).await, "BLOB");
+        sqlx::query("UPDATE settings SET value = CAST(X'FF00FE' AS TEXT) WHERE key = 'data.dir'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            data_dir_value_unreadable(&pool).await,
+            "不正な UTF-8 の TEXT"
+        );
+        sqlx::query("DROP TABLE settings")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !data_dir_value_unreadable(&pool).await,
+            "テーブルを読めない = DB の失敗"
+        );
     }
 
     /// 既定は `./data`・**90 日**（docs/recorder-requirements.md §3.4）。
