@@ -48,6 +48,8 @@ banto v5.0.0 追従（監査ログ画面の回避策の撤去、実装済み）�
 `RunningHub::shutdown` を通る。実装済み、Windows 実機の OS 終了は未確認）を直したことと、残件（ChronoGazer の後始末の 1 回を共有 crate に寄せるか）を追記。
 同日: 同項に、#587 のレビューでホスト切替そのものを終了の追跡に入れたこと（SCM を呼ぶ前なら取りやめ、呼んだ後は完走させて終了が待つ）を追記。
 同日: 同項に、#588（収集の停止が接続を 1 本ずつ止めていたため、応答しない PLC が多いと終了の予算に収まらなかった。全接続に先に合図を送ってからまとめて待つように直した。実装済み）を追記。
+2026-10-12: §5 の #392 に段階 B（ChronoGazer のサービス化）の計画を確定した（オーナー決定「おすすめで」、未実装。H9 は
+既存の `%APPDATA%` のデータを移行しない、論点 1〜14 は推奨どおり。計画書は [chronogazer-service-design.md](chronogazer-service-design.md)）。
 T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
@@ -572,13 +574,13 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
     - **H7 UI とエンジンは localhost REST で話す**（banto-hub と同じ。新しい IPC は作らない）。
     - **H8 サービス運用ではデスクトップの自動ログインを loopback grant に置き換える**（banto-hub の
       試運転 grant と同じ型）。
-    - **H9 データの置き場所は `%APPDATA%` から ProgramData へ移す**。既存データを移行するか捨ててよいかは
-      **未決**（サービス化の手順に入る前にオーナーが決める）。
+    - **H9 データの置き場所は `%APPDATA%` から ProgramData へ移す**。**既存の `%APPDATA%` のデータは移行しない
+      （不要、2026-10-12 オーナー決定）**。初回にログと画面で 1 回だけ旧データが使われない旨を案内し、自動では消さない。
     - **H10 サービスは Hub の API キーを machine スコープの DPAPI でファイルに保存する**。
     - **H11 更新は「インストーラがサービスを停止 → 置換 → 開始」**（banto-hub の手順を流用）。
     - 手順: A1（プロファイルロックの共有 crate。デスクトップと `banto-serve` の両方）→ A2（トレイ）→
       B1（headless host + KeyStore）→ B2（シェル決定）→ B3（サービス + インストーラ + 実機 24h/72h）。
-    - **実装状況**: A1（2026-10-10、#565）・**A2（2026-10-11）実装済み**。B1 以降は未。
+    - **実装状況**: A1（2026-10-10、#565）・**A2（2026-10-11）実装済み**。B1 以降は未（**B は 2026-10-12 に計画確定、未実装**。下の「段階 B の計画」）。
       A2 で、ChronoGazer の**ウィンドウの × はアプリを終了せずに隠す**（収集・Hub 購読・LAN サーバーは
       動き続ける）ようになり、トレイ（左クリック・「開く」で窓を戻す、右クリックで「収集の状態・開く・終了」）に
       常駐する。収集が止まるのは、トレイの「終了」（確認の後、既存の終了処理 = LAN サーバー → 収集の停止と
@@ -671,6 +673,24 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
           予算（5 秒）と競合し、待ち合わせの順序を新たに決める必要が出るため採らなかった（タスク側で断れば
           誰も待たない）。一時的な印はタスク側では見ない（それより前に受け付けた開始は「忙しい」として
           数えられ、トレイが確かめ直すので実行してよい）。
+
+    - **段階 B の計画（2026-10-12 オーナー決定「おすすめで」。詳細は [chronogazer-service-design.md](chronogazer-service-design.md)）**:
+      - **順序**: #588（収集の停止の並行化）を先に行い、その後 B1-1 から。
+      - **PR 分割**: B1-0 docs（この記録）→ B1-1 engine 抽出（`chronogazer_core::engine`、`banto-serve` を乗り換え）→
+        B1-2 Tauri を engine に → B1-3 `banto-secret-store`（DPAPI）→ B1-4 パスと host 種別（`/api/host`）→
+        B1-5 `chronogazer-server`（コンソール）→ B2-1 loopback grant と REST の差分 → B2-2 フロントのサービス接続モード →
+        B2-3 共有 crate（`banto-service-control`）の抽出 → B2-4 シェルの起動判定（任意 B2-5 切替）→
+        B3-1 サービスランナーの共有化（STOP と PRESHUTDOWN、#589 を直す）→ B3-2 サービス化 → B3-3 elev と ACL →
+        B3-4 インストーラ → B3-5 実機確認（24h → 72h soak）。
+      - **決定 1〜14 の要約**: (1) 切替は後回し（B2 は起動判定と fallback だけ）。(2) headless host は新しい bin
+        `chronogazer-server.exe`（`banto-serve` は開発・E2E 用に残す）。(3) 旧 `%APPDATA%` のデータは放置し、1 回だけ案内。
+        (4) デスクトップ host も DPAPI ファイルストア（`secrets\` にインストール利用者の Modify）。(5) 起動種別は OnDemand、
+        UI／elev で自動開始（遅延）を ON。(6) `ChronoGazer Operators` を別に作る。(7) サービス名 `ChronoGazer`、
+        データ `%ProgramData%\ChronoGazer\`、port 8721。(8) loopback grant: 未初期化の間は admin、初期化後は
+        `auth.local_grant`（既定 off）。(9) LAN 公開の変更はその場で listener を入れ替える。(10) リストアは「サービスを再起動して適用」。
+        (11) サービス host の書き込み先は ACL で保護したルート配下と管理者が登録した特定のディレクトリだけ（ドライブ単位は不可、reparse point を辿らずハンドルで判定。2026-10-12 #590 のレビューで書き換え）。(12) Hub との同居は SCM 依存なし。
+        (13) Hub・sink のサービスが SHUTDOWN/PRESHUTDOWN を受けない件は issue #589、B3-1 で直す。(14) ファイアウォールの受信規則は作らない。
+
   - **順序**: #383 段階3 を先に進め、#392 の A1 は並行。B1 は P3 の後。
   - 要件側は [recorder-requirements.md](recorder-requirements.md) §3.1・§4 に反映済み。
 
