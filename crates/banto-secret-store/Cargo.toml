@@ -1,0 +1,47 @@
+[package]
+name = "banto-secret-store"
+description = "File-backed secret store protected by DPAPI (machine scope) under a protected directory DACL, usable as banto-hub-bootstrap's KeyStore (#392 B1-3)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# `PlainProtector`（暗号化しない、テスト専用の Protector）と
+# `FileSecretStore::open_without_acl`（ディレクトリの ACL を確かめない）を
+# 公開する。下流のテスト（B1-5 の `chronogazer-server` 等）が dev-dependency
+# で有効にする想定。製品のビルドでは有効にしない。
+test-support = []
+
+[dependencies]
+# `impl KeyStore for FileSecretStore` のアダプタ（src/keystore.rs）。
+banto-hub-bootstrap = { path = "../banto-hub-bootstrap" }
+thiserror = { workspace = true }
+# 復号した平文を `Zeroizing` に入れて返し、中間のバッファも drop で消す。
+zeroize = { workspace = true }
+# ファイル名 = sha256(account) の hex（アカウント文字列をファイル名に出さない）。
+# どちらも既に workspace の依存木にあり、Cargo.lock に新しい版は増えない。
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# 既存の 0.61 系（banto-hub-core・banto-instance-lock と同じ版）。新しい crate は
+# 増えず、feature を足すだけ:
+# - Win32_Security_Cryptography: CryptProtectData / CryptUnprotectData（DPAPI）
+# - Win32_Security / Win32_Security_Authorization: SDDL からの記述子の作成、
+#   DACL の読み戻し（GetNamedSecurityInfoW・GetAce）、SID の文字列化、
+#   DACL の書き直し（SetNamedSecurityInfoW）
+# - Win32_Storage_FileSystem: CreateDirectoryW（作成と同時に DACL を付ける）、
+#   MoveFileExW（原子的な置換）
+# - Win32_System_Threading: OpenProcessToken（現在の利用者の SID）
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

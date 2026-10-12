@@ -874,8 +874,8 @@ async fn write_check_leaves_existing_files_untouched_and_cleans_up() {
 }
 
 /// 試し書きが失敗しても（読み取り専用で開いたファイルへの書き込みで再現）、
-/// `write_probe` はファイルを閉じてから戻るので、直後に消せる（Windows では開いたままの
-/// ファイルは消せない。#594 のレビュー）。
+/// `write_probe` はファイルを閉じてから戻るので、直後に消せる（開いたままのファイルを
+/// 消せるかは共有モードに依るため、閉じてから消す順序を保つ。#594 のレビュー）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_probe_write_closes_the_file_before_it_is_removed() {
     let dir = TempDir::new();
