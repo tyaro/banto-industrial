@@ -94,28 +94,35 @@
 //! OS キーリング・Acrylic・イベントの webview への転送・単一インスタンスの
 //! プラグイン。これらはデスクトップのシェル（`src-tauri`）に残る。
 //!
-//! # デスクトップの呼び方（B1-2、2026-10-12 実装）
+//! # デスクトップの呼び方（B1-2、2026-10-12 実装。同日 #392 の起動時の対処で更新）
 //!
 //! ```text
-//! setup():
-//!   opened = block_on(EngineRuntime::open(cfg{ host: Desktop, key_store: Keyring,
-//!                                              attach_hub: true, listen: Disabled,
-//!                                              store_config_required: true, .. }))
-//!       Err(InstanceLock)            -> 「既に起動中」のエラーの窓
-//!       Err(Database(Legacy))        -> 「旧形式の DB」のエラーの窓
-//!       それ以外の Err               -> 今までどおり panic
-//!   create_main_window(); hide_to_tray_on_close()       // DB を開けた後・サービスの前
+//! setup() → launch_desktop(prelude なし)（対処の窓で対処を選んだ後も同じ関数でやり直す）:
+//!   opened = EngineRuntime::open(cfg{ host: Desktop, key_store: Keyring,
+//!                                     attach_hub: true, listen: Disabled,
+//!                                     store_config_required: true, .. })
+//!   prelude: 保存先の書き換え（startup_recovery::apply_store_dir、失敗は opened.close()）
+//!            または対処の監査の予約（opened.with_recovery_note）
 //!   events の webview への転送を opened.events() に張る   // start より前に購読する
-//!   LAN の自動起動の判定（lan_autostart_allowed）を opened.settings() で読み、
+//!   LAN の自動起動の判定（lan_autostart_allowed）を opened.settings() で読み
+//!     （読めなければ opened.close() して Err）、
 //!     opened.with_listen(EngineListen::BestEffort(cfg) または Disabled)
-//!   engine = block_on(opened.start())                  // Err(Hub / StoreConfig) は panic
+//!   engine = opened.start()
 //!   自動ログイン（engine.services() の users/audit を使う）
-//!   Acrylic、AppState { services: engine.services().clone(), server: engine.server_slot() }
-//!   エンジンを管理状態に置く（プロセスの終わりまで drop しない）、tray::install()
+//!   AppState { services: engine.services().clone(), server: engine.server_slot() }、
+//!   エンジンを管理状態に置く（プロセスの終わりまで drop しない）
+//!   create_main_window(); hide_to_tray_on_close(); Acrylic; tray::install()
+//! 失敗（すべて Err、panic しない）:
+//!   Err(InstanceLock) / Err(Database(Legacy)) -> 今までのエラーの窓
+//!   それ以外 -> 対処の窓（crate::startup_recovery の classify / plan）
 //! shutdown_app_state(): engine.shutdown(予算) → ExitCleanupReport へ写す
 //!   （トレイの終了と RunEvent::Exit で 1 回だけ。banto_desktop_tray::ExitCleanupOnce）
 //! server_apply: engine.server_slot().lock() を入れ替える
 //! ```
+//!
+//! メインの窓は B1-2 では `open` と `start` の間に作っていたが、#392 の起動時の
+//! 対処で `start` の後（`AppState` を manage した後）に移した（`start` の失敗で
+//! メインの画面を出してから対処の窓に切り替えないため）。
 //!
 //! B1-1 より前のデスクトップとの差（どれも観測できる挙動を変えないと判断した。
 //! 理由は docs/chronogazer-service-design.md §4 の B1-2 の実装メモ）:
@@ -160,7 +167,8 @@ use crate::events::event_channel;
 use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
-use crate::settings::{store_config, ServerSettings, SettingsService};
+use crate::settings::{read_data_dir, store_config, ServerSettings, SettingsService};
+use crate::startup_recovery::RecoveryNote;
 use crate::users::UsersService;
 use crate::{CollectionGroupService, PlcConnectionService, TagService};
 
@@ -233,8 +241,13 @@ pub enum EngineStartError {
     /// `HubService::new`（`installation_id` の読み書き）の失敗。
     Hub(BantoError),
     /// 時系列データの保存設定を読めなかった（[`EngineConfig::store_config_required`]
-    /// のときだけ）。
-    StoreConfig(BantoError),
+    /// のときだけ）。`data_dir_unreadable` は、読めなかったのが保存先
+    /// （`data.dir`）そのものか（起動時の対処の窓の分類に使う。
+    /// [`crate::startup_recovery::classify`]）。
+    StoreConfig {
+        source: BantoError,
+        data_dir_unreadable: bool,
+    },
     /// [`EngineListen::Required`] の待ち受けを開けなかった。
     Listen {
         config: ServerConfig,
@@ -251,8 +264,11 @@ impl std::fmt::Display for EngineStartError {
             Self::Database(InitDbError::Legacy(legacy)) => legacy.fmt(f),
             Self::Database(err) => write!(f, "DB の初期化に失敗しました: {err}"),
             Self::Hub(err) => write!(f, "Hub 接続の初期化に失敗しました: {err}"),
-            Self::StoreConfig(err) => {
-                write!(f, "時系列データの保存設定の読み取りに失敗しました: {err}")
+            Self::StoreConfig { source, .. } => {
+                write!(
+                    f,
+                    "時系列データの保存設定の読み取りに失敗しました: {source}"
+                )
             }
             Self::Listen { config, source } => write!(
                 f,
@@ -268,7 +284,9 @@ impl std::error::Error for EngineStartError {
         match self {
             Self::InstanceLock(err) => Some(err),
             Self::Database(err) => Some(err),
-            Self::Hub(err) | Self::StoreConfig(err) | Self::Listen { source: err, .. } => Some(err),
+            Self::Hub(err)
+            | Self::StoreConfig { source: err, .. }
+            | Self::Listen { source: err, .. } => Some(err),
         }
     }
 }
@@ -406,6 +424,7 @@ impl EngineRuntime {
             instance_lock,
             pool,
             applied_restore,
+            recovery_note: None,
             events: event_channel(),
         })
     }
@@ -419,10 +438,32 @@ pub struct OpenedEngine {
     instance_lock: InstanceGuard,
     pool: DbPool,
     applied_restore: Option<AppliedRestoreInfo>,
+    /// 起動時の対処の窓で選ばれた対処（[`OpenedEngine::with_recovery_note`]）。
+    recovery_note: Option<RecoveryNote>,
     events: broadcast::Sender<ServerEvent>,
 }
 
 impl OpenedEngine {
+    /// 設定 DB のファイル。
+    pub fn db_path(&self) -> &Path {
+        &self.cfg.db_path
+    }
+
+    /// 起動時の対処の窓で選ばれた対処を、`start` で監査に残す
+    /// （`startup_recovery`。DB を開けない間は書けないので、開けた後に書く。
+    /// [`crate::startup_recovery`] のモジュール doc「監査」）。
+    pub fn with_recovery_note(mut self, note: RecoveryNote) -> Self {
+        self.recovery_note = Some(note);
+        self
+    }
+
+    /// `start` せずに閉じる: pool を閉じ（ファイルのハンドルを返す）、A1 の
+    /// 排他を返す。drop でも両方返るが、pool の接続は裏で閉じるので、続けて
+    /// DB のファイルを触る（名前を変える）前にはこちらを待つ。
+    pub async fn close(self) {
+        self.pool.close().await;
+        drop(self.instance_lock);
+    }
     /// 開いた pool（`start` の前に設定を読みたい host 用）。
     pub fn pool(&self) -> &DbPool {
         &self.pool
@@ -451,6 +492,7 @@ impl OpenedEngine {
             instance_lock,
             pool,
             applied_restore,
+            recovery_note,
             events,
         } = self;
         let label = cfg.log_label;
@@ -498,6 +540,11 @@ impl OpenedEngine {
                 "{label}: 起動時にリストアを適用しました（適用前の自動バックアップ: {}）",
                 applied.pre_restore_backup_file_name
             );
+        }
+        // 起動時の対処の窓で選ばれた対処（作り直し・バックアップからの戻し・
+        // 保存先の変更）。DB を開けない間は書けないので、開けた今記録する。
+        if let Some(note) = &recovery_note {
+            audit.record(note.audit_entry(cfg.audit_origin)).await;
         }
 
         // 起動時の剪定（spec M14「起動時に 1 回 + list 実行時に軽く」）。失敗しても
@@ -551,9 +598,15 @@ impl OpenedEngine {
         let store_settings = match store_config(&settings).await {
             Ok(store_settings) => store_settings,
             Err(err) if cfg.store_config_required => {
+                // 読めないのが保存先（`data.dir`）そのものかを、pool を閉じる前に
+                // 確かめる（起動時の対処の窓が「保存先を選び直す」を出すか決める）。
+                let data_dir_unreadable = read_data_dir(&settings).await.is_err();
                 hub.shutdown().await;
                 pool.close().await;
-                return Err(EngineStartError::StoreConfig(err));
+                return Err(EngineStartError::StoreConfig {
+                    source: err,
+                    data_dir_unreadable,
+                });
             }
             Err(err) => {
                 eprintln!(
@@ -981,7 +1034,16 @@ mod tests {
             Ok(_) => panic!("保存設定を読めないのに起動した"),
             Err(err) => err,
         };
-        assert!(matches!(err, EngineStartError::StoreConfig(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                EngineStartError::StoreConfig {
+                    data_dir_unreadable: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(!dir.path().join("data").exists(), "収集の置き場を作った");
         drop(
             acquire_for_db(&db_path, ChronoGazerHost::Serve)

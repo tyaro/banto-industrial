@@ -129,6 +129,26 @@ pub async fn store_config(settings: &SettingsService) -> Result<StoreSettings, B
     })
 }
 
+/// 保存先（`data.dir`）だけを読む（未設定は `None`）。起動に失敗したときに、
+/// 読めないのが保存先そのものかを見分けるため（[`crate::engine`] の
+/// `EngineStartError::StoreConfig`）。
+pub async fn read_data_dir(settings: &SettingsService) -> Result<Option<String>, BantoError> {
+    settings.get(KEY_DATA_DIR).await
+}
+
+/// 保存先（`data.dir`）だけを書き換える（起動時の対処の窓の「保存先を選び直す」
+/// 「既定の場所に戻す」、[`crate::startup_recovery::apply_store_dir`]）。
+/// 保持期間には触れない。
+pub async fn set_data_dir(settings: &SettingsService, data_dir: &str) -> Result<(), BantoError> {
+    settings.set(KEY_DATA_DIR, data_dir).await
+}
+
+/// 既定の保存先（`data.dir` の既定値。相対パスで、基準はアプリのデータ
+/// ディレクトリ）。
+pub fn default_data_dir() -> &'static str {
+    DEFAULT_DATA_DIR
+}
+
 /// 収集ランタイムの保存設定を保存する。`None`（無制限）は `"0"` として
 /// 書き戻す - banto の `SettingsService::set_audit_config` と同じ約束。2 つの
 /// キーは 1 つのトランザクションで書く（[`SettingsService::set_many`]）。
