@@ -23,7 +23,9 @@
 //! 1. **Per-connection stop, not a shared one.** `Collector::tasks`
 //!    is keyed by connection key, each entry owning its own
 //!    `watch::Sender<bool>` - stopping connection B can never touch A's
-//!    channel. [`Collector::stop`] simply signals and joins every entry.
+//!    channel. [`Collector::stop`] simply signals and joins every entry -
+//!    **every entry is signalled before the first join** (#588, see
+//!    "Stopping several tasks at once" below).
 //! 2. **The writer is a `watch` channel, not a bare `Arc`.** Every task holds
 //!    a `watch::Receiver<Arc<TsWriter>>` (via `TaskContext::writer_rx`) and
 //!    re-borrows it fresh on every append (`task.rs::record_group`) instead
@@ -137,6 +139,36 @@
 //! at start, and also by `apply_config` on a collector started without a
 //! source (checked first, before anything is touched: the collector stays
 //! exactly as it was, PR #578 review).
+//!
+//! ### Stopping several tasks at once (#588)
+//!
+//! A connection task only notices its stop signal between reads
+//! (`task.rs::run_connection` awaits `read_batch` inside the select arm), so
+//! a task blocked on a PLC that does not answer stops only when that read
+//! gives up (the response timeout, 1 s by default). Signalling and joining
+//! one task at a time therefore made a stop take roughly *N times* that
+//! wait: 20 unresponsive connections took 4.7 s, 80 took 12.4 s on real
+//! hardware - longer than banto-hub's shell exit budget (5 s on OS
+//! shutdown, 15 s from the tray) and ChronoGazer's (5 s), which then cut the
+//! final flush and `collection_stopped` off.
+//!
+//! [`Collector::stop`] and `apply_config`'s step 3 therefore go through
+//! `stop_tasks`: **send every stop signal first, then join**. The joins are
+//! still awaited one after another, but every task is already winding down
+//! concurrently, so the whole stop takes about one task's worth of waiting.
+//! What is deliberately *not* changed:
+//!
+//! - **The ordering promises.** The final flush (the single writer) and
+//!   `collection_stopped` still happen once, after *every* task has been
+//!   joined - i.e. after every task has released its `writer_rx`, which is
+//!   what lets `close_or_flush_writer` take sole ownership. A simulator
+//!   (T9-1) is still stopped only after its task has been joined.
+//! - **A failed task does not block the rest.** A task that panicked yields
+//!   a `JoinError` that is ignored exactly as before; every other task has
+//!   already been signalled and is still joined, and the flush still runs.
+//! - **No per-task timeout or `abort`.** Aborting a task mid-append would
+//!   weaken the "no buffered row is lost" guarantee; the wait is bounded by
+//!   the protocol's own response timeout instead.
 //!
 //! ### Why no `collection_started`/`collection_stopped` event
 //!
@@ -540,15 +572,19 @@ impl Collector {
         };
 
         // --- 3. Stop + join removed/replaced connections' tasks only -------
+        // #588: every task is signalled before the first join (`stop_tasks`,
+        // this module's doc comment "Stopping several tasks at once").
         // T9-1: a removed/replaced connection's simulator (if any) is stopped
         // right alongside its task - see this module's doc comment, "T9-1
         // addendum". Stopped after the task itself (the task may still be
         // mid-`read_batch` against it up to the moment it joins).
+        let stopping: Vec<ConnectionTask> = removed
+            .iter()
+            .chain(replaced.iter())
+            .filter_map(|key| self.tasks.remove(key))
+            .collect();
+        stop_tasks(stopping).await;
         for key in removed.iter().chain(replaced.iter()) {
-            if let Some(task) = self.tasks.remove(key) {
-                let _ = task.stop_tx.send(true);
-                let _ = task.handle.await;
-            }
             if let Some(sim) = self.simulators.remove(key) {
                 sim.stop().await;
             }
@@ -705,13 +741,12 @@ impl Collector {
     /// flush され行が失われない"). Emits `collection_stopped` last. Consumes
     /// `self`.
     pub async fn stop(mut self) -> Result<(), CollectError> {
-        // Signal, then drain every task. Each task closes its own socket and
-        // marks itself Stopped on the way out, releasing its writer_rx (and
-        // any transient per-append writer clone) with it.
-        for (_key, task) in self.tasks.drain() {
-            let _ = task.stop_tx.send(true);
-            let _ = task.handle.await;
-        }
+        // Signal every task, then drain them all (#588: all signals go out
+        // before the first join - this module's doc comment, "Stopping
+        // several tasks at once"). Each task closes its own socket and marks
+        // itself Stopped on the way out, releasing its writer_rx (and any
+        // transient per-append writer clone) with it.
+        stop_tasks(self.tasks.drain().map(|(_key, task)| task)).await;
 
         // T9-1: every remaining simulator goes down after its task (this
         // module's doc comment, "T9-1 addendum") - by construction there is
@@ -737,6 +772,24 @@ impl Collector {
             ))
             .await;
         Ok(())
+    }
+}
+
+/// Stop a set of connection tasks: send **every** stop signal first, then
+/// join them (#588, this module's doc comment "Stopping several tasks at
+/// once"). Sending is synchronous (`watch::Sender::send`), so by the time the
+/// first join is awaited every task has been told to stop and they all wind
+/// down concurrently - the total wait is about the slowest task's, not the
+/// sum. A task that panicked (`JoinError`) is ignored, as it always was, and
+/// never keeps the rest from being joined. Returns only once every task has
+/// finished, so a caller may rely on every `writer_rx` having been released.
+async fn stop_tasks(tasks: impl IntoIterator<Item = ConnectionTask>) {
+    let tasks: Vec<ConnectionTask> = tasks.into_iter().collect();
+    for task in &tasks {
+        let _ = task.stop_tx.send(true);
+    }
+    for task in tasks {
+        let _ = task.handle.await;
     }
 }
 
@@ -1959,6 +2012,330 @@ mod tests {
         assert_eq!(report.replaced, vec!["conn:1".to_string()]);
         assert_eq!(report.unchanged, Vec::<String>::new());
 
+        collector.stop().await.expect("stop should succeed");
+    }
+
+    // --- #588: stopping several tasks signals all of them before any join --
+    //
+    // A connection task notices its stop signal only between reads, so a
+    // task blocked on a PLC that never answers stops only when that read
+    // gives up. These tests drive that shape with a gate instead of a clock
+    // (see `GatedClient`), so they are deterministic rather than
+    // timing-based; `tests/integration.rs` covers the same thing against
+    // real unresponsive sockets, with a timing assertion.
+
+    /// A fake `PlcClient` for the #588 tests. Its **first** `read_batch`
+    /// blocks until the shared `release` gate opens and then succeeds; every
+    /// **later** `read_batch` never returns at all (a PLC that stopped
+    /// answering, with no response timeout to rescue it).
+    ///
+    /// That makes the stop order observable without timing: once the gate
+    /// opens, every task returns from its first read and loops. A task that
+    /// has *already* been told to stop sees that first (`run_connection`'s
+    /// select is `biased` towards the stop arm) and exits; one that has not
+    /// goes straight into its second read and hangs there for good. So the
+    /// stop completes only if every task was signalled before the gate
+    /// opened - i.e. before the first join was awaited.
+    ///
+    /// When `panic_on_read` is set the client panics in `read_batch`
+    /// instead, so its task ends with a `JoinError`.
+    struct GatedClient {
+        nth_read: usize,
+        in_first_read: Arc<AtomicUsize>,
+        release: watch::Receiver<bool>,
+        panic_on_read: bool,
+    }
+
+    impl PlcClient for GatedClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_batch<'a>(
+            &'a mut self,
+            requests: &'a [ReadRequest],
+        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
+            assert!(
+                !self.panic_on_read,
+                "GatedClient: deliberate panic for the #588 JoinError test"
+            );
+            self.nth_read += 1;
+            let first = self.nth_read == 1;
+            let in_first_read = self.in_first_read.clone();
+            let mut release = self.release.clone();
+            Box::pin(async move {
+                if !first {
+                    std::future::pending::<()>().await;
+                }
+                in_first_read.fetch_add(1, Ordering::SeqCst);
+                let _ = release.wait_for(|open| *open).await;
+                Ok(requests
+                    .iter()
+                    .map(|_| ReadResult::Value(TagValue::F64(5.0)))
+                    .collect())
+            })
+        }
+
+        fn disconnect(&mut self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    /// A [`GatedClient`] factory sharing one gate and one counter; the
+    /// connections whose key is in `panicking` get a panicking client, and
+    /// those in `ungated` a plain [`FakeClient`].
+    fn gated_factory(
+        in_first_read: &Arc<AtomicUsize>,
+        release: &watch::Receiver<bool>,
+        panicking: &[&str],
+        ungated: &[&str],
+    ) -> ClientFactory {
+        let in_first_read = in_first_read.clone();
+        let release = release.clone();
+        let panicking: HashSet<String> = panicking.iter().map(|k| (*k).to_string()).collect();
+        let ungated: HashSet<String> = ungated.iter().map(|k| (*k).to_string()).collect();
+        Arc::new(move |spec| {
+            if ungated.contains(&spec.connection_key) {
+                return Box::new(FakeClient {
+                    reads: Arc::new(AtomicUsize::new(0)),
+                }) as Box<dyn PlcClient>;
+            }
+            Box::new(GatedClient {
+                nth_read: 0,
+                in_first_read: in_first_read.clone(),
+                release: release.clone(),
+                panic_on_read: panicking.contains(&spec.connection_key),
+            }) as Box<dyn PlcClient>
+        })
+    }
+
+    /// Wait until `target` tasks are blocked in their first (gated) read.
+    async fn wait_in_first_read(in_first_read: &Arc<AtomicUsize>, target: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while in_first_read.load(Ordering::SeqCst) < target {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of {target} tasks reached their first read",
+                in_first_read.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Poll `fut` exactly once (it must not finish yet: every read is still
+    /// gated), open the gate, then give `fut` 10 s to finish. The `biased`
+    /// select guarantees the single poll happens before the gate opens.
+    async fn poll_once_then_release<F: std::future::Future>(
+        fut: F,
+        release_tx: &watch::Sender<bool>,
+        what: &str,
+    ) -> F::Output {
+        let mut fut = Box::pin(fut);
+        tokio::select! {
+            biased;
+            _ = &mut fut => panic!("{what} cannot finish while every read is gated"),
+            () = std::future::ready(()) => {}
+        }
+        release_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what} hung: some task was not signalled before the first join was \
+                     awaited, so it went on into a read that never returns (#588)"
+                )
+            })
+    }
+
+    /// `n` connections `conn:1..=n`, each with its own one-tag group
+    /// `grp:i` / `tag:i` - [`one_tag_config`] repeated.
+    fn n_conn_config(n: usize) -> CollectorConfig {
+        let mut connections = Vec::with_capacity(n);
+        let mut groups = Vec::with_capacity(n);
+        for i in 1..=n {
+            let mut one = one_tag_config();
+            let mut conn = one.connections.remove(0);
+            conn.key = format!("conn:{i}");
+            conn.groups[0].key = format!("grp:{i}");
+            conn.groups[0].tags[0].key = format!("tag:{i}");
+            connections.push(conn);
+            let mut group = one.store_config.groups.remove(0);
+            group.key = format!("grp:{i}");
+            group.name = format!("G{i}");
+            group.tags[0].key = format!("tag:{i}");
+            groups.push(group);
+        }
+        CollectorConfig {
+            connections,
+            store_config: StoreConfig { groups },
+        }
+    }
+
+    /// Writer options under which only `stop()`'s final flush can move rows
+    /// to disk, so rows a post-stop reader sees prove that flush ran.
+    fn flush_only_on_stop() -> CollectorOptions {
+        CollectorOptions {
+            writer_options: WriterOptions {
+                max_buffered_rows: 100_000,
+                flush_interval_ms: 3_600_000,
+            },
+            ..CollectorOptions::default()
+        }
+    }
+
+    /// Start `n` gated connections (those in `panicking` panic instead),
+    /// wait until every other one is blocked in its first read, then stop
+    /// via [`poll_once_then_release`]. Returns the live events seen.
+    async fn stop_with_gated_reads(
+        dir: &TempDir,
+        n: usize,
+        panicking: &[&str],
+    ) -> Vec<crate::event::CollectEvent> {
+        let in_first_read = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = watch::channel(false);
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect sqlite memory");
+        let events = EventSink::new(pool);
+        let mut rx = events.subscribe();
+        let collector = Collector::start_with_client_factory(
+            n_conn_config(n),
+            dir.path(),
+            Arc::new(SystemClock),
+            events,
+            flush_only_on_stop(),
+            gated_factory(&in_first_read, &release_rx, panicking, &[]),
+        )
+        .await
+        .expect("start_with_client_factory should succeed");
+
+        wait_in_first_read(&in_first_read, n - panicking.len()).await;
+        poll_once_then_release(collector.stop(), &release_tx, "stop()")
+            .await
+            .expect("stop should succeed");
+        drain_events(&mut rx)
+    }
+
+    /// Per group in `data_dir` (read after `stop()`), how many rows carry
+    /// [`GatedClient`]'s value - the one row its first read produced. (A
+    /// group also gets all-null rows for ticks before its connection came
+    /// up, which these tests do not count.)
+    async fn value_rows_per_group(data_dir: &std::path::Path) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for file in banto_tstore::list_data_files(data_dir).expect("list data files") {
+            let reader = banto_tstore::TsReader::open(&file.path)
+                .await
+                .expect("open reader");
+            let keys: Vec<String> = reader.groups().iter().map(|g| g.key.clone()).collect();
+            for key in keys {
+                let rows = reader
+                    .read_range(&key, 0, i64::MAX)
+                    .await
+                    .expect("read range");
+                let values = rows.iter().filter(|row| row.values[0] == Some(5.0)).count();
+                *counts.entry(key).or_insert(0) += values;
+            }
+        }
+        counts
+    }
+
+    /// **#588 regression.** `stop()` must signal every task before it awaits
+    /// the first join. With the old signal-then-join loop only the first
+    /// task is signalled when the gate opens; every other task goes on into
+    /// a read that never returns, and `stop()` hangs (see [`GatedClient`]).
+    /// The final flush and `collection_stopped` still come after every task,
+    /// exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_signals_every_task_before_joining_any() {
+        let dir = TempDir::new();
+        let events = stop_with_gated_reads(&dir, 20, &[]).await;
+
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::CollectionStopped),
+            1,
+            "collection_stopped must be emitted exactly once: {events:?}"
+        );
+        assert_eq!(
+            events.last().map(|e| e.kind),
+            Some(crate::event::EventKind::CollectionStopped),
+            "collection_stopped must come after every task's own events"
+        );
+        let counts = value_rows_per_group(dir.path()).await;
+        for i in 1..=20 {
+            let key = format!("grp:{i}");
+            assert_eq!(
+                counts.get(&key).copied(),
+                Some(1),
+                "{key}'s buffered value row must survive stop()'s final flush: {counts:?}"
+            );
+        }
+    }
+
+    /// #588: a task that panicked (its join yields a `JoinError`) must not
+    /// keep the other tasks from being stopped, nor the final flush and
+    /// `collection_stopped` from happening.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_task_does_not_block_stopping_the_rest() {
+        let dir = TempDir::new();
+        let events = stop_with_gated_reads(&dir, 5, &["conn:3"]).await;
+
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::CollectionStopped),
+            1,
+            "{events:?}"
+        );
+        let counts = value_rows_per_group(dir.path()).await;
+        for i in [1, 2, 4, 5] {
+            let key = format!("grp:{i}");
+            assert_eq!(counts.get(&key).copied(), Some(1), "{key}: {counts:?}");
+        }
+        assert_eq!(
+            counts.get("grp:3").copied().unwrap_or(0),
+            0,
+            "the panicked task never read a value: {counts:?}"
+        );
+    }
+
+    /// #588: `apply_config`'s step 3 stops removed tasks the same way - all
+    /// signalled before the first join. The store config is left unchanged
+    /// so no writer is opened (step 2) and the first poll reaches step 3.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_config_signals_every_removed_task_before_joining_any() {
+        let dir = TempDir::new();
+        let in_first_read = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = watch::channel(false);
+        // conn:1 stays and is never stopped by apply_config, so it reads
+        // normally (a gated one would end up in a read that never returns).
+        let factory = gated_factory(&in_first_read, &release_rx, &[], &["conn:1"]);
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect sqlite memory");
+        let mut collector = Collector::start_with_client_factory(
+            n_conn_config(10),
+            dir.path(),
+            Arc::new(SystemClock),
+            EventSink::new(pool),
+            flush_only_on_stop(),
+            factory.clone(),
+        )
+        .await
+        .expect("start_with_client_factory should succeed");
+        wait_in_first_read(&in_first_read, 9).await;
+
+        // Keep conn:1 only (conn:2..=10 are removed), same store config.
+        let mut keep_one = n_conn_config(1);
+        keep_one.store_config = n_conn_config(10).store_config;
+        let report = poll_once_then_release(
+            collector.apply_config(keep_one, factory),
+            &release_tx,
+            "apply_config",
+        )
+        .await
+        .expect("apply_config should succeed");
+        assert_eq!(report.removed.len(), 9, "{report:?}");
+        assert_eq!(report.unchanged, vec!["conn:1".to_string()]);
+        assert!(!report.writer_rotated);
+        assert_eq!(collector.tasks.len(), 1);
         collector.stop().await.expect("stop should succeed");
     }
 }
