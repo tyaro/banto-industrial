@@ -26,7 +26,9 @@
 //!   付ける（作ってから付けるまでの間に、親から継承した広い権限で見える時間を
 //!   作らない）。インストール利用者の SID は、作る前に `LookupAccountSidW` で
 //!   **利用者のアカウント（`SidTypeUser`）であること**を確かめる（Domain Users の
-//!   ような S-1-5-21 のグループを渡されても広げない）。
+//!   ような S-1-5-21 のグループを渡されても広げない）。解決できない SID も拒む
+//!   （fail closed。Microsoft Entra ID の利用者 `S-1-12-1-…` を含む - 下の
+//!   [`InstallUserSid`] の doc）。
 //! - **既にあれば**: DACL・所有者を読み戻して上の形と**完全に一致する**ことを
 //!   確かめ、違えば [`SecretStoreError::AclMismatch`] で失敗する（fail closed）。
 //!   **自動では直さない**（黙って広げることも狭めることもしない。違う形には、
@@ -67,22 +69,34 @@ pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
 /// インストール利用者の SID（文字列形式、例 `S-1-5-21-…-1001`）。
 ///
-/// 受け付けるのは `S-1-5-21-` で始まる（ローカル・ドメインのアカウントの領域の）
-/// SID だけ。Everyone（`S-1-1-0`）・Authenticated Users（`S-1-5-11`）・
+/// 受け付けるのは、利用者のアカウントが入る 2 つの領域の SID だけ:
+///
+/// - `S-1-5-21-…`: ローカル・Active Directory のアカウント。
+/// - `S-1-12-1-…`: Microsoft Entra ID（Azure AD）に参加した PC の Entra の利用者。
+///
+/// Everyone（`S-1-1-0`）・Authenticated Users（`S-1-5-11`）・
 /// BUILTIN の各グループ（`S-1-5-32-…`）・SYSTEM などはこの時点で拒む。文字は
 /// 数字と `-` だけに限る（SDDL に組み込むので、`)` や `;` で ACE を足されない）。
 /// 同じ領域のグループ（Domain Users など）は文字列では見分けられないので、
 /// Windows でディレクトリを作る・直すときに `LookupAccountSidW` で利用者の
-/// アカウントであることを確かめる。
+/// アカウントであることを確かめる（`SidTypeUser` 以外は拒む）。
+///
+/// Entra の利用者の SID は、その利用者でサインインしたことのある PC では
+/// `LookupAccountSidW` が解決し（`AzureAD\<名前>`、種類は `SidTypeUser`）、
+/// そのまま使える。**解決できないとき（その PC で一度もサインインしていない
+/// 利用者・名前の解決に Entra へ届かない等）は、グループと見分けられないので
+/// 拒む（fail closed、[`SecretStoreError::InvalidUserSid`]）**。インストールは
+/// その利用者自身のサインイン中に行う（B3-3 の昇格ヘルパは呼び出した利用者の
+/// SID を渡す）ので、通常は解決できる。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallUserSid(String);
 
 impl InstallUserSid {
     pub fn parse(s: &str) -> Result<Self> {
-        const PREFIX: &str = "S-1-5-21-";
-        let Some(rest) = s.strip_prefix(PREFIX) else {
+        const PREFIXES: [&str; 2] = ["S-1-5-21-", "S-1-12-1-"];
+        let Some(rest) = PREFIXES.iter().find_map(|prefix| s.strip_prefix(prefix)) else {
             return Err(SecretStoreError::InvalidUserSid(
-                "利用者のアカウントの SID（S-1-5-21-…）ではありません",
+                "利用者のアカウントの SID（S-1-5-21-… か S-1-12-1-…）ではありません",
             ));
         };
         let parts: Vec<&str> = rest.split('-').collect();
@@ -680,6 +694,14 @@ mod tests {
     #[test]
     fn sid_parsing_accepts_only_account_sids_without_sddl_metacharacters() {
         assert_eq!(user().as_str(), USER);
+        // Microsoft Entra ID の利用者。
+        let entra = "S-1-12-1-1234567890-1234567890-1234567890-1234567890";
+        assert_eq!(InstallUserSid::parse(entra).unwrap().as_str(), entra);
+        assert!(
+            DirAccess::with_install_user(InstallUserSid::parse(entra).unwrap())
+                .sddl()
+                .ends_with(&format!("(A;OICI;0x1301bf;;;{entra})"))
+        );
         for bad in [
             "",
             "S-1-1-0",
@@ -693,6 +715,18 @@ mod tests {
             "S-1-5-21-1-2;",
             "s-1-5-21-1-2",
             "S-1-5-21-1-12345678901",
+            // 利用者のアカウント以外の領域。
+            "S-1-5-32-544",
+            "S-1-5-32-547",
+            "S-1-5-19",
+            "S-1-5-20",
+            "S-1-5-4",
+            "S-1-5-80-1-2",
+            "S-1-12-",
+            "S-1-12-1-",
+            "S-1-12-1-1",
+            "S-1-12-2-1-2",
+            "S-1-12-1-1-2)(A;;FA;;;WD",
         ] {
             assert!(
                 matches!(
