@@ -1,8 +1,8 @@
 # ChronoGazer のサービス化（#392 段階 B）設計・計画
 
 作成日: 2026-10-12
-状態: **計画確定（2026-10-12 オーナー決定「おすすめで」）、B1-1（engine 抽出）・B1-2（デスクトップの乗り換え）と起動時の対処の窓（B1-2 の追補）・B1-3（`banto-secret-store`）実装済み・B1-4 以降は未実装**。#588 は実装済み。B1-1 で `chronogazer_core::engine`（`EngineRuntime`）を新設し `banto-serve` を乗り換え、B1-2 でデスクトップ（`src-tauri`）も乗り換えた。起動に失敗したときは panic せず、エラーの窓で対処を選ばせる（§4 の追補）。B1-3 で秘密の保存先の共有 crate `crates/banto-secret-store` を新設した（アプリへの配線は B1-5・B2-4）。
-最終更新: 2026-10-13（B1-3 を実装: §4 の追補の後に B1-3 の実装メモ。既にあるディレクトリの ACL が違うときの扱いを決めた）。2026-10-12（#594 のレビュー 3 件を §4 の追補に反映: 復旧の操作の前から A1 の排他を持つ・復元の適用を確かめる・画面の作成の失敗でエンジンを止める）。2026-10-12（起動時の保存先の試し書きと「もう一度確かめる」を §4 の追補に追加。同日の追加のオーナー決定）。2026-10-12（起動時の対処の窓のオーナー決定と実装: §4 の B1-2 の実装メモの後に追補）。2026-10-12（B1-2 を実装: §4 の B1-1 の実装メモの後に B1-2 の実装メモ。§1.2 の `ExitCleanupOnce` の行は済み）。2026-10-12（B1-1 を実装: §4 の表の後に実装メモ）。2026-10-12（初版。調査の基準は main=970993e。論点 1〜14 のオーナー決定と H9 の決定（既存の `%APPDATA%` のデータは移行しない）を記録）
+状態: **計画確定（2026-10-12 オーナー決定「おすすめで」）、B1-1（engine 抽出）・B1-2（デスクトップの乗り換え）と起動時の対処の窓（B1-2 の追補）・B1-3（`banto-secret-store`）・B1-4（パスと host 種別）実装済み・B1-5 以降は未実装**。#588 は実装済み。B1-1 で `chronogazer_core::engine`（`EngineRuntime`）を新設し `banto-serve` を乗り換え、B1-2 でデスクトップ（`src-tauri`）も乗り換えた。起動に失敗したときは panic せず、エラーの窓で対処を選ばせる（§4 の追補）。B1-3 で秘密の保存先の共有 crate `crates/banto-secret-store` を新設した（アプリへの配線は B1-5・B2-4）。B1-4 で `chronogazer_core::paths`（データのルートの解決と配置）・`ChronoGazerHost::{Server,Service}`・未認証の `GET /api/host`・`run\endpoint.json` の読み書きを足した（どの host もまだ使わない）。
+最終更新: 2026-10-13（B1-4 を実装: §4 の B1-3 の実装メモの後に B1-4 の実装メモ）。2026-10-13（B1-3 を実装: §4 の追補の後に B1-3 の実装メモ。既にあるディレクトリの ACL が違うときの扱いを決めた）。2026-10-12（#594 のレビュー 3 件を §4 の追補に反映: 復旧の操作の前から A1 の排他を持つ・復元の適用を確かめる・画面の作成の失敗でエンジンを止める）。2026-10-12（起動時の保存先の試し書きと「もう一度確かめる」を §4 の追補に追加。同日の追加のオーナー決定）。2026-10-12（起動時の対処の窓のオーナー決定と実装: §4 の B1-2 の実装メモの後に追補）。2026-10-12（B1-2 を実装: §4 の B1-1 の実装メモの後に B1-2 の実装メモ。§1.2 の `ExitCleanupOnce` の行は済み）。2026-10-12（B1-1 を実装: §4 の表の後に実装メモ）。2026-10-12（初版。調査の基準は main=970993e。論点 1〜14 のオーナー決定と H9 の決定（既存の `%APPDATA%` のデータは移行しない）を記録）
 
 [plan.md](plan.md) §5 の #392（H6〜H11）の段階 B を、実装できる粒度に落とした計画書。R0 の「UI と独立」
 （[recorder-requirements.md](recorder-requirements.md) §4）を B で満たす。banto-hub 側の前例は
@@ -67,7 +67,7 @@
 - `BANTO_HUB_MEMORY_KEYS=1`: 開発・E2E 専用（`MemoryKeyStore`＋`attach_hub`）。`e2e/tests/user-simulator-monitor-hub.spec.ts` が依存。
 - 自動ログイン: ログイン不要モード → 自動ログイン（OS キーリングのパスワード）→ ログイン画面。
 - データ: `%APPDATA%\dev.tyaro.chronogazer\`（`chronogazer.sqlite3`、`data\`、`backups\`、`audit-spool\`、`tray-hint-shown`）。`data.dir` は絶対パスも可。
-- A1: 排他単位は DB の正規化パス、mutex `Global\ChronoGazer.<hash>`、host 種別は `Desktop` と `Serve`。A2: トレイ常駐と単一インスタンス。ログオン時の自動起動なし。
+- A1: 排他単位は DB の正規化パス、mutex `Global\ChronoGazer.<hash>`、host 種別は `Desktop` と `Serve`（B1-4 で `Server`・`Service` を追加）。A2: トレイ常駐と単一インスタンス。ログオン時の自動起動なし。
 - REST に無い Tauri 専用の操作: LAN サーバー設定、認証モード、自動ログイン、Acrylic、バックアップフォルダを開く、汎用の `settings_get/set`、初回セットアップ。
 - 配布: `tauri.conf.json` の bundle は既定（NSIS currentUser）、専用インストーラなし。
 
@@ -210,6 +210,14 @@
 - **秘密を出さない**: crate はログを出さない。`SecretStoreError` は平文・blob・アカウントを持たない。`FileSecretStore` の `Debug` は手で実装（ディレクトリ・ACL の指定・protector の型名だけ）。復号した平文は `Zeroizing`、DPAPI の出力のバッファは消してから `LocalFree`。
 - **検証**: 単体テスト 34 件（全 OS: 形式の往復と壊れたファイルの全形、原子的な置き換え（一時ファイルを作った直後・置き換えの直前で失敗を注入しても元のファイルが残り一時ファイルが残らない、panic でも残らない）、別のアカウントの名前へのコピーとアカウントの欄の書き換えの拒否、削除の冪等性、並行の書き込みと読み込み、`KeyStore` の契約、エラー文言・`Debug` に秘密が出ない。Windows: DPAPI の往復・別の entropy と改ざんの拒否・ファイルに平文が入らない、作ったディレクトリの DACL の読み戻し（保護・継承なし・SYSTEM / Administrators がフル・今の利用者に変更・Users / Everyone / Authenticated Users / Interactive なし）、サービスだけの構成、既存のディレクトリの拒否と `reset_dir_acl` の後の受け入れ、開いた後の ACL の変更で読み書きが止まる、グループの SID の拒否）。反証: entropy からアカウントを外すと、アカウントの欄を書き換えたファイルのテスト（`PlainProtector` と DPAPI の両方）が落ちる。一時ファイルの guard を外すと失敗の注入と panic のテストが落ちる。
 - **CI**: `crates/**` の変更は Rust の workspace 全体（`windows-latest`）で回る。**Linux で Rust を回すジョブは `rust-db-source`（banto-hub-core・sink だけ）なので、この crate の非 Windows の経路（`UnsupportedPlatform`）は CI でコンパイルされない**（ローカルにも Linux のターゲットが無く未確認）。
+
+**B1-4 の実装メモ（2026-10-13、実装済み）**:
+
+- **`chronogazer_core::paths`（新設）**: ルートは `CHRONOGAZER_ROOT`（空は無視）→ Windows `%ProgramData%\ChronoGazer`（`%ProgramData%` が未設定・空なら `C:\ProgramData\ChronoGazer`）→ 非 Windows は `XDG_DATA_HOME` → `$HOME/.local/share` → `/var/lib`（banto-hub の `resolve_hub_root` と同じ作法）。判断は純関数 `resolve_data_root_impl(is_windows, ..)` で、環境を読むのは `resolve_data_root_from_env` だけ。`DataLayout` が §3.1(b) の配置（`db_path`・`instance_lock_path`・`data_dir`・`backups_dir`・`audit_spool_dir`・`logs_dir`・`secrets_dir`・`hub_keys_dir`・`run_dir`・`endpoint_file`）を組み立てる（ディレクトリは作らない。バックアップ・監査の保留は既存の「DB の隣 / 種別 / DB のファイル名」の規約のまま）。旧データの場所は `legacy_desktop_db_path[_in]`（`%APPDATA%\dev.tyaro.chronogazer\chronogazer.sqlite3`、場所を返すだけ。決定 3・H9 のとおり利用者として動くシェルとインストーラが案内に使う）。**どの host もまだ使わない**。
+- **`ChronoGazerHost::{Server, Service}`**: 診断ファイルの `host_kind` は `"server"` / `"service"`、A1 の「使用中」の文言は「chronogazer-server（コンソール）」「ChronoGazer サービス」。`InstanceGuard::scope()` で排他の単位の ID（mutex 名の末尾と同じ 16 桁の hex）を取れる。
+- **`GET /api/host`（未認証）**: `chronogazer_core::host_info`。`{ product: "chronogazer", hostKind, version, scope }` の 4 つだけ。`scope` は DB の正規化パスのハッシュ（不透明な ID）で、パス・フォルダ・利用者名・設定値は出さない。`/api/auth/status` と同じく `X-Banto-Client: banto` を要求する（無ければ 403。シェルの probe は自前なのでヘッダを付けられる。他の `/api` と同じ層に載るので CSRF 対策・セキュリティヘッダ・閲覧公開との関係が揃う）。banto-hub の `info.x-banto-hub-profile-id`（OpenAPI の文書に載せる形）には揃えなかった - ChronoGazer に OpenAPI の文書が無く、probe を 1 回の GET で済ませるため。`EngineServices` が `HostInfo` を持ち、`router()` が merge する（デスクトップの LAN サーバーにも出る）。
+- **`run\endpoint.json`**: `chronogazer_core::endpoint`。`{"schema":1,"port":8721,"pid":4321,"scope":"…","version":"…","hostKind":"service"}`（`port` は常に開く loopback の listener）。書き込みは同じフォルダの一時ファイル → `sync_all` → `rename`（原子的。失敗時は一時ファイルを消し、元のファイルを残す）。読む側 `read_endpoint` は無い・壊れた・64 KiB 超・`port`/`pid` が 0 を `None` に、`read_live_endpoint` は更に書いたプロセスが生きていなければ `None`（`banto_instance_lock::process_is_alive`。権限不足で調べられないときは「生きている」側に倒す。pid は再利用されるので最終確認は `/api/host` の `product`・`scope`）。`clear_endpoint` は自分の pid のファイルだけ消す。ACL（Users に読み取り可）は B3-3。**まだ誰も書かない**（B1-5 の `chronogazer-server` が書く）。
+- **検証**: 純関数のテスト（ルート解決の全分岐・配置・旧データの場所）、`/api/host` の REST テスト（未認証で 200・4 つのキーだけ・ヘッダ無しで 403・パスが出ない）と本物の listener 越しのエンジンのテスト、endpoint.json の往復・壊れた各形・原子的な置換（失敗の注入）・古いファイル（終了した子プロセスの pid）・`clear` が他人のファイルを消さない。反証: 一時ファイルを経由せず直接書くと原子的な置換のテスト、空の `CHRONOGAZER_ROOT` を無視しないと空文字のテスト、CSRF ヘッダの層を外すと 403 のテストが落ちる。
 
 ## 5. 論点と決定（2026-10-12 オーナー決定「おすすめで ok」= すべて推奨どおり）
 

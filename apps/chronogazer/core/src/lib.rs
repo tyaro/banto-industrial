@@ -17,17 +17,23 @@ pub mod db;
 pub mod display_groups;
 // #392 段階 B（B1-1）: 起動と終了の組み立て（`EngineRuntime`）。`banto-serve` が
 // 使い、B1-2 でデスクトップ（`src-tauri`）も乗り換える - モジュール doc 参照。
+pub mod endpoint;
 pub mod engine;
 pub mod events;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
 pub mod hub;
+// #392 B1-4: `GET /api/host`（未認証。シェルの probe が別製品・別 DB を見分ける）。
+pub mod host_info;
 // #383 段階3 P4: 「Hub から追加」（Hub のカタログからタグを登録する）。REST と
 // Tauri の両方が同じ関数を呼ぶ - モジュール doc 参照。
 pub mod hub_tags;
 // #392 A1: 同じ DB を 2 プロセスで開かないための単一インスタンス排他。
 // デスクトップと `banto-serve` が DB を開く前に呼ぶ。
 pub mod instance_lock;
+// #392 B1-4: データのルート（`CHRONOGAZER_ROOT`、既定 `%ProgramData%\ChronoGazer`）と
+// その下の配置、旧データの場所。まだどの host も使わない（B1-5・B2-4 が使う）。
+pub mod paths;
 pub mod rest;
 // #538: 保持期間（`retention.days`）を過ぎた時系列データファイルの削除
 // （起動時 + 日付が変わるたび）。`tauri`/`axum` に依存しない future を返す。
