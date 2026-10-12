@@ -767,9 +767,11 @@ pub async fn check_writable_dir(dir: &Path) -> Result<(), RecoveryError> {
         };
         // ここから先は自分が作ったファイルだけ。どの経路でも消す（失敗・取消しでも残さない）。
         let guard = WriteCheckFile(Some(probe));
-        // 書き込み・flush の結果を一度保持し、**ファイルを閉じてから**消す（Windows では
-        // 開いたままのファイルを消せない。`?` で早く戻ると guard が `file` より先に drop
-        // されて、ディスクが一杯などの検出すべき失敗のたびに試し書きが残る）。
+        // 書き込み・flush の結果を一度保持し、**ファイルを閉じてから**消す（Windows で
+        // 開いたままのファイルを消せるか・名前がいつ消えるかは、そのハンドルの共有モード
+        // （`FILE_SHARE_DELETE` の有無）と OS の削除の扱いに依る。tokio の `OpenOptions` は
+        // 既定で `FILE_SHARE_DELETE` を含むが、それに頼らず、閉じてから消す順序にして確実に
+        // 消す。`?` で早く戻ると guard が `file` より先に drop され、この順序が崩れる）。
         // `write_probe` は `file` を値で受けて関数の終わりに閉じ、キャンセル時も内側の
         // future（= `file`）が guard より先に drop される。
         let written = write_probe(file).await;
