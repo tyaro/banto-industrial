@@ -660,6 +660,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-secret-store"
+version = "0.1.0"
+dependencies = [
+ "banto-hub-bootstrap",
+ "hex",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "banto-server"
 version = "6.7.0"
 source = "git+https://github.com/tyaro/banto.git?tag=v6.7.0#1ffe507da973ca5103ede93b5ca438cda7c28d4e"
