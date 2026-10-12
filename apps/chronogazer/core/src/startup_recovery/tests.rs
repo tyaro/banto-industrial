@@ -872,3 +872,20 @@ async fn write_check_leaves_existing_files_untouched_and_cleans_up() {
     names.sort();
     assert_eq!(names.len(), 2, "試し書きが残った: {names:?}");
 }
+
+/// 試し書きが失敗しても（読み取り専用で開いたファイルへの書き込みで再現）、
+/// `write_probe` はファイルを閉じてから戻るので、直後に消せる（Windows では開いたままの
+/// ファイルは消せない。#594 のレビュー）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_probe_write_closes_the_file_before_it_is_removed() {
+    let dir = TempDir::new();
+    let path = dir.path().join("probe.tmp");
+    std::fs::write(&path, b"x").unwrap();
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .await
+        .unwrap();
+    assert!(super::write_probe(file).await.is_err(), "書けない");
+    std::fs::remove_file(&path).expect("閉じた後なので消せる");
+}

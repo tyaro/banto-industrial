@@ -760,29 +760,34 @@ pub async fn check_writable_dir(dir: &Path) -> Result<(), RecoveryError> {
             .create_new(true)
             .open(&probe)
             .await;
-        let mut file = match opened {
+        let file = match opened {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(fail("書き込みに使えません", err)),
         };
         // ここから先は自分が作ったファイルだけ。どの経路でも消す（失敗・取消しでも残さない）。
         let guard = WriteCheckFile(Some(probe));
-        file.write_all(b"ok")
-            .await
-            .map_err(|err| fail("書き込みに使えません", err))?;
-        file.flush()
-            .await
-            .map_err(|err| fail("書き込みに使えません", err))?;
-        drop(file);
-        return guard
-            .remove()
-            .await
+        // 書き込み・flush の結果を一度保持し、**ファイルを閉じてから**消す（Windows では
+        // 開いたままのファイルを消せない。`?` で早く戻ると guard が `file` より先に drop
+        // されて、ディスクが一杯などの検出すべき失敗のたびに試し書きが残る）。
+        // `write_probe` は `file` を値で受けて関数の終わりに閉じ、キャンセル時も内側の
+        // future（= `file`）が guard より先に drop される。
+        let written = write_probe(file).await;
+        let removed = guard.remove().await;
+        written.map_err(|err| fail("書き込みに使えません", err))?;
+        return removed
             .map_err(|err| fail("書き込みに使えません（確認用のファイルを消せません）", err));
     }
     Err(fail(
         "書き込みに使えません",
         std::io::Error::from(std::io::ErrorKind::AlreadyExists),
     ))
+}
+
+/// 試し書き（書いて flush する）。`file` は戻る前に閉じる（成功・失敗とも）。
+async fn write_probe(mut file: tokio::fs::File) -> std::io::Result<()> {
+    file.write_all(b"ok").await?;
+    file.flush().await
 }
 
 const WRITE_CHECK_ATTEMPTS: usize = 16;
