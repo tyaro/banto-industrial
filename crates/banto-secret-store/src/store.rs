@@ -99,6 +99,9 @@ impl<P: Protector> fmt::Debug for FileSecretStore<P> {
 impl<P: Protector> FileSecretStore<P> {
     /// `dir` を保存先にする。無ければ `access` の DACL で作り、あれば DACL を
     /// 確かめる（違えば [`SecretStoreError::AclMismatch`]。[`crate::acl`] の doc）。
+    /// どちらの経路でも、先にインストール利用者の SID が利用者のアカウントで
+    /// あることを確かめる（グループ・解決できない SID は
+    /// [`SecretStoreError::InvalidUserSid`]）。SID の検証はここでの 1 回だけ。
     /// 非 Windows では [`SecretStoreError::UnsupportedPlatform`]。
     pub fn open(dir: impl Into<PathBuf>, access: DirAccess, protector: P) -> Result<Self> {
         let dir = dir.into();
@@ -151,7 +154,11 @@ impl<P: Protector> FileSecretStore<P> {
             Ok(_) => {}
         }
         match &self.mode {
-            DirMode::Enforced(access) => crate::acl::verify_dir(&self.dir, access)?,
+            DirMode::Enforced(access) => {
+                // SID は open で確かめ済み（crate::acl の doc「インストール利用者の
+                // SID の検証」）。ここでは ACL の形だけを確かめ直す。
+                crate::acl::verify_dir_with_validated_sid(&self.dir, access)?
+            }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {}
         }
@@ -161,7 +168,9 @@ impl<P: Protector> FileSecretStore<P> {
     /// 書く前: 無ければ作り（期待の DACL で）、あれば確かめる。
     fn ensure_dir_for_write(&self) -> Result<()> {
         match &self.mode {
-            DirMode::Enforced(access) => crate::acl::ensure_dir(&self.dir, access),
+            DirMode::Enforced(access) => {
+                crate::acl::ensure_dir_with_validated_sid(&self.dir, access)
+            }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {
                 fs::create_dir_all(&self.dir).map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))

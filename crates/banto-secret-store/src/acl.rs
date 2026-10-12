@@ -38,6 +38,21 @@
 //! - [`crate::FileSecretStore`] は開くときだけでなく、**読む・書く・消すたびに**
 //!   この確認をする（途中で ACL が変えられたら、それ以降は使わない）。
 //!
+//! # インストール利用者の SID の検証
+//!
+//! `LookupAccountSidW` で利用者のアカウント（`SidTypeUser`）であることを確かめる
+//! のは、**ディレクトリが無い（作る）経路と既にある（確かめる）経路の分岐より
+//! 前**（[`ensure_dir`]・[`verify_dir`]・[`reset_dir_acl`] の頭）。既にある
+//! ディレクトリの ACL がグループの SID に「変更」を付けていて、所有者・保護属性も
+//! 検査に通る場合でも、グループの SID を受け入れないため（#595 のレビュー P2:
+//! 以前は作る経路でだけ確かめていた）。
+//!
+//! [`crate::FileSecretStore`] は [`crate::FileSecretStore::open`] で 1 回だけ
+//! 確かめ、読む・書く・消すたびの ACL の再確認では確かめ直さない。SID は open の
+//! 時点で [`DirAccess`] に固定され、その後は変わらない（ACL の再確認は「その固定
+//! した SID の形と一致するか」だけを見る）ため。名前の解決（ドメインでは
+//! ネットワークに出うる）を書き込みのたびに行わない、という理由もある。
+//!
 //! ファイル 1 つ 1 つの DACL は確かめない（ディレクトリから継承したものの
 //! はず。書き込みはファイルを丸ごと置き換えるので、書くたびに継承した形に戻る）。
 //!
@@ -242,12 +257,36 @@ pub fn check_dacl(
 /// 無ければ期待の DACL で作り、あれば確かめる（モジュール doc「作るとき・
 /// 既にあるとき」）。親ディレクトリは無ければ普通に作る（親の ACL は B3-3 の
 /// 担当で、ここでは触らない）。
+///
+/// **作る・確かめるのどちらの経路でも、先に**インストール利用者の SID が利用者の
+/// アカウントであることを `LookupAccountSidW` で確かめる（モジュール doc
+/// 「インストール利用者の SID の検証」）。
 pub fn ensure_dir(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
+    imp::ensure_user_account(access)?;
     imp::ensure_dir(dir, access)
 }
 
-/// 既にあるディレクトリを確かめる（作らない）。
+/// 既にあるディレクトリを確かめる（作らない）。[`ensure_dir`] と同じく、先に
+/// インストール利用者の SID を確かめる。
 pub fn verify_dir(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
+    imp::ensure_user_account(access)?;
+    imp::verify_dir(dir, access)
+}
+
+/// [`ensure_dir`] から SID の検証を除いたもの。`access` の SID を既に確かめた
+/// 呼び出し側（[`crate::FileSecretStore`] の読む・書く・消すたびの確認）だけが使う。
+pub(crate) fn ensure_dir_with_validated_sid(
+    dir: &std::path::Path,
+    access: &DirAccess,
+) -> Result<()> {
+    imp::ensure_dir(dir, access)
+}
+
+/// [`verify_dir`] から SID の検証を除いたもの（同上）。
+pub(crate) fn verify_dir_with_validated_sid(
+    dir: &std::path::Path,
+    access: &DirAccess,
+) -> Result<()> {
     imp::verify_dir(dir, access)
 }
 
@@ -277,6 +316,10 @@ mod imp {
 
     use super::{DirAccess, ObservedDacl};
     use crate::error::{Result, SecretStoreError};
+
+    pub(super) fn ensure_user_account(_access: &DirAccess) -> Result<()> {
+        Err(SecretStoreError::UnsupportedPlatform)
+    }
 
     pub(super) fn ensure_dir(_dir: &Path, _access: &DirAccess) -> Result<()> {
         Err(SecretStoreError::UnsupportedPlatform)
@@ -381,7 +424,7 @@ mod imp {
     }
 
     /// インストール利用者の SID が利用者のアカウントであること（グループではない）。
-    fn ensure_user_account(access: &DirAccess) -> Result<()> {
+    pub(super) fn ensure_user_account(access: &DirAccess) -> Result<()> {
         let Some(user) = access.install_user() else {
             return Ok(());
         };
@@ -439,10 +482,11 @@ mod imp {
     }
 
     pub(super) fn ensure_dir(dir: &Path, access: &DirAccess) -> Result<()> {
+        // SID の検証は呼び出し側（公開の `ensure_dir`・`FileSecretStore::open`）が
+        // 作る・確かめるの分岐より前に済ませている。
         if inspect(dir)? {
             return verify_dir(dir, access);
         }
-        ensure_user_account(access)?;
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))?;
@@ -1009,6 +1053,44 @@ mod tests {
 
             reset_dir_acl(&dir, &access).unwrap();
             verify_dir(&dir, &access).unwrap();
+        }
+
+        /// #595 P2: グループの SID に「変更」を付けた**既存の**ディレクトリも、
+        /// ACL の形の確認より前に SID の検証で拒む。
+        #[test]
+        fn an_existing_directory_granting_a_group_sid_is_refused() {
+            let me = me();
+            let machine = me.as_str().rsplit_once('-').unwrap().0;
+            let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
+            let group_access = DirAccess::with_install_user(group);
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("granted-to-group");
+            // テストの中で SDDL の形どおりに作る（SID の検証を通らない経路）。
+            ensure_dir_with_validated_sid(&dir, &group_access).ok();
+            assert!(dir.exists());
+
+            for err in [
+                ensure_dir(&dir, &group_access).unwrap_err(),
+                verify_dir(&dir, &group_access).unwrap_err(),
+                crate::FileSecretStore::open(&dir, group_access.clone(), crate::PlainProtector)
+                    .unwrap_err(),
+            ] {
+                assert!(
+                    matches!(err, SecretStoreError::InvalidUserSid(_)),
+                    "{err:?}"
+                );
+            }
+            // ACL の形とは関係なく、既存の経路でも SID を先に確かめる（ACL が違う
+            // フォルダでも、返るのは AclMismatch ではなく InvalidUserSid）。
+            let plain = root.path().join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            assert!(matches!(
+                ensure_dir(&plain, &group_access),
+                Err(SecretStoreError::InvalidUserSid(_))
+            ));
+
+            // 片付け（所有者は自分なので書き換えられる）。
+            reset_dir_acl(&dir, &DirAccess::with_install_user(me)).unwrap();
         }
 
         #[test]
