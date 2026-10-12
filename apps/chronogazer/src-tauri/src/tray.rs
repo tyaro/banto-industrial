@@ -66,6 +66,7 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
+use crate::startup::RECOVERY_WINDOW_LABEL;
 use crate::{AppState, ExitCleanupReport, ExitTrigger, LEGACY_DB_WINDOW_LABEL, MAIN_WINDOW_LABEL};
 
 /// × で隠した初回だけ出す通知（既読の印はアプリのデータディレクトリの
@@ -165,19 +166,20 @@ pub(crate) fn cleanup_failure_message(report: &ExitCleanupReport) -> Option<Stri
         .map(|err| format!("収集の停止中にエラーが発生しました: {err}\n\n{LOSS}"))
 }
 
-/// トレイを作って管理状態に入れ、状態表示の見張りを起こす。`setup()` の
-/// 最後（`AppState` を manage した後）に 1 回だけ呼ぶ。
-pub(crate) fn install(app: &tauri::App) -> tauri::Result<()> {
-    let handle = app.handle();
+/// トレイを作って管理状態に入れ、状態表示の見張りを起こす。起動
+/// （[`crate::launch_desktop`]）の最後（`AppState` を manage した後）に 1 回だけ
+/// 呼ぶ。失敗は起動の失敗としてエラーの窓に出る（#392、panic しない）。
+pub(crate) fn install(app: &AppHandle) -> tauri::Result<()> {
+    let handle = app;
     let label = current_label(handle);
     let menu = build_menu(handle, &label)?;
     // 左クリックは窓を戻す（メニューは右クリック）。
     let builder = TrayIconBuilder::new()
-        .icon(
-            app.default_window_icon()
-                .cloned()
-                .expect("tauri.conf.json の bundle.icon で既定アイコンを設定済み"),
-        )
+        .icon(app.default_window_icon().cloned().ok_or_else(|| {
+            // tauri.conf.json の bundle.icon で既定アイコンを設定済みなので
+            // 起きないはずだが、起きても panic せずに起動の失敗として知らせる。
+            tauri::Error::AssetNotFound("既定のウィンドウアイコン".to_string())
+        })?)
         .tooltip(tooltip_text(&label))
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -202,7 +204,16 @@ pub(crate) fn open_main_window(app: &AppHandle) {
     if quitting(app) {
         return;
     }
-    banto_desktop_tray::show_window(app, &[MAIN_WINDOW_LABEL, LEGACY_DB_WINDOW_LABEL]);
+    // 起動を止めたときのエラーの窓（旧形式の DB・既に起動中、#392 の対処の窓）も
+    // 2 つ目の起動で前に出す。
+    banto_desktop_tray::show_window(
+        app,
+        &[
+            MAIN_WINDOW_LABEL,
+            LEGACY_DB_WINDOW_LABEL,
+            RECOVERY_WINDOW_LABEL,
+        ],
+    );
 }
 
 fn quitting(app: &AppHandle) -> bool {
