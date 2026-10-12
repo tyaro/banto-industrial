@@ -749,7 +749,12 @@ pub async fn check_writable_dir(dir: &Path) -> Result<(), RecoveryError> {
         .await
         .map_err(|err| fail("作れませんでした", err))?;
     for _ in 0..WRITE_CHECK_ATTEMPTS {
-        let probe = write_check_path(dir);
+        let probe = write_check_path(dir).map_err(|err| {
+            RecoveryError(format!(
+                "保存先のフォルダ（{}）の書き込み確認で、試し書きの名前を作れませんでした: {err}",
+                dir.display()
+            ))
+        })?;
         let opened = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -782,13 +787,15 @@ pub async fn check_writable_dir(dir: &Path) -> Result<(), RecoveryError> {
 
 const WRITE_CHECK_ATTEMPTS: usize = 16;
 
-fn write_check_path(dir: &Path) -> PathBuf {
+/// 試し書きのパスを作る。OS の乱数源が使えないときは panic せず `Err`（窓に出せる）で返す。
+/// 乱数源の失敗は注入できないため、この分岐の単体テストは省略（`?` で伝えるだけ）。
+fn write_check_path(dir: &Path) -> Result<PathBuf, getrandom::Error> {
     let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).expect("システム乱数生成器の呼び出しに失敗しました");
-    dir.join(format!(
+    getrandom::fill(&mut bytes)?;
+    Ok(dir.join(format!(
         ".chronogazer-write-check-{:016x}.tmp",
         u64::from_le_bytes(bytes)
-    ))
+    )))
 }
 
 /// 試し書きのファイルの後始末（正常時は `remove` で消して結果を返し、それ以外は Drop で消す）。
@@ -796,8 +803,10 @@ struct WriteCheckFile(Option<PathBuf>);
 
 impl WriteCheckFile {
     async fn remove(mut self) -> std::io::Result<()> {
-        let path = self.0.take().expect("probe path is present");
-        tokio::fs::remove_file(&path).await
+        match self.0.take() {
+            Some(path) => tokio::fs::remove_file(&path).await,
+            None => Ok(()),
+        }
     }
 }
 
