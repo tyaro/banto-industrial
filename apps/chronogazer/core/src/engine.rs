@@ -594,8 +594,13 @@ impl OpenedEngine {
         }
         // 起動時の対処の窓で選ばれた対処（作り直し・バックアップからの戻し・
         // 保存先の変更）。DB を開けない間は書けないので、開けた今記録する。
+        // 「もう一度確かめる」だけは何も変えない対処なので、`start` の失敗しうる処理
+        // （保存先の書き込み確認・listener の bind）がすべて済んだ後に記録する（下）。
+        // 失敗して窓へ戻る再試行に成功の行を残さない（#594 のオーナーレビュー P2）。
         if let Some(note) = &recovery_note {
-            audit.record(note.audit_entry(cfg.audit_origin)).await;
+            if note.choice != crate::startup_recovery::RecoveryChoice::RetryStoreCheck {
+                audit.record(note.audit_entry(cfg.audit_origin)).await;
+            }
         }
 
         // 起動時の剪定（spec M14「起動時に 1 回 + list 実行時に軽く」）。失敗しても
@@ -745,6 +750,14 @@ impl OpenedEngine {
 
         // 10. 監査の保留の定期の流し込み（失敗しうる手順がすべて済んだ後）。
         let spool_flusher = services.audit.spawn_spool_flusher();
+        if let Some(note) = &recovery_note {
+            if note.choice == crate::startup_recovery::RecoveryChoice::RetryStoreCheck {
+                services
+                    .audit
+                    .record(note.audit_entry(cfg.audit_origin))
+                    .await;
+            }
+        }
 
         Ok(RunningEngine {
             services,

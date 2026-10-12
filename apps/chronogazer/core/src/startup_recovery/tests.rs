@@ -629,6 +629,45 @@ async fn a_successful_retry_is_recorded_in_the_audit() {
     stop(engine).await;
 }
 
+/// 保存先がまだ書けないまま「もう一度確かめる」を押しても成功の監査は残らず、
+/// 書けるようにして成功したときだけ 1 行残る（#594 のオーナーレビュー P2）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_is_audited_only_after_start_succeeds() {
+    let dir = TempDir::new();
+    let blocked = dir.path().join("usb-data");
+    std::fs::write(&blocked, b"not a folder").unwrap();
+    let opened = EngineRuntime::open(config(dir.path())).await.expect("open");
+    crate::settings::set_data_dir(&opened.settings(), &blocked.display().to_string())
+        .await
+        .unwrap();
+    opened.close().await;
+    let retry = || async {
+        EngineRuntime::open(config(dir.path()))
+            .await
+            .expect("open")
+            .with_recovery_note(RecoveryNote::new(RecoveryChoice::RetryStoreCheck))
+            .start()
+            .await
+    };
+
+    // 書けないまま 2 回押しても、成功の行は増えない。
+    for _ in 0..2 {
+        match retry().await {
+            Ok(_) => panic!("書き込めない保存先で起動した"),
+            Err(err) => assert_eq!(classify(&err), FailureKind::StoreDirUnwritable, "{err}"),
+        }
+    }
+    let engine = EngineRuntime::start(config(dir.path())).await;
+    assert!(engine.is_err());
+    std::fs::remove_file(&blocked).unwrap();
+    let engine = retry().await.expect("書けるようになったら起動できる");
+    let rows = audit_rows(&engine, "startup_recovery").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let detail: serde_json::Value = serde_json::from_str(&rows[0]).expect("JSON");
+    assert_eq!(detail["choice"], "retryStoreCheck");
+    stop(engine).await;
+}
+
 /// `OpenedEngine::close` は排他を返す（同じ DB をすぐ開き直せる）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_an_opened_engine_releases_the_lock() {
