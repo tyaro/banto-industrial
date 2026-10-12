@@ -610,6 +610,25 @@ async fn store_dir_choice_is_saved_and_startup_continues() {
     stop(engine).await;
 }
 
+/// 「もう一度確かめる」で起動できたら、監査に `startup_recovery`（choice=retryStoreCheck）が
+/// 残る（#594 のオーナー再レビュー）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_successful_retry_is_recorded_in_the_audit() {
+    let dir = TempDir::new();
+    let engine = EngineRuntime::open(config(dir.path()))
+        .await
+        .expect("open")
+        .with_recovery_note(RecoveryNote::new(RecoveryChoice::RetryStoreCheck))
+        .start()
+        .await
+        .expect("起動できる");
+    let rows = audit_rows(&engine, "startup_recovery").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let detail: serde_json::Value = serde_json::from_str(&rows[0]).expect("JSON");
+    assert_eq!(detail["choice"], "retryStoreCheck");
+    stop(engine).await;
+}
+
 /// `OpenedEngine::close` は排他を返す（同じ DB をすぐ開き直せる）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_an_opened_engine_releases_the_lock() {

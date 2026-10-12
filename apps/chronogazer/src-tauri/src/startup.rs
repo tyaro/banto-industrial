@@ -91,6 +91,9 @@ impl LaunchPaths {
 pub(crate) enum Prelude {
     /// 何もしない（最初の起動）。
     None,
+    /// 何も変えずにやり直す（「もう一度確かめる」）。起動に成功したときだけ、選んだ対処を
+    /// 監査に残す（#594 のオーナー再レビュー）。
+    Noted(RecoveryNote),
     /// DB を開けた後・`start` の前に保存先を書き換える。
     StoreDir(StoreDirChoice),
     /// 対処は済んでいる（名前の変更・リストアの適用）。対処の**前に**取った A1 の
@@ -99,6 +102,11 @@ pub(crate) enum Prelude {
         lock: recovery::RecoveryLock,
         note: RecoveryNote,
     },
+}
+
+/// 「もう一度確かめる」の起動前の処理（何も変えず、成功したら `retryStoreCheck` を監査に残す）。
+pub(crate) fn retry_prelude() -> Prelude {
+    Prelude::Noted(RecoveryNote::new(RecoveryChoice::RetryStoreCheck))
 }
 
 /// [`crate::launch_desktop`] の失敗。
@@ -591,7 +599,7 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
         },
         RecoveryChoice::ResetStoreDir => Prelude::StoreDir(StoreDirChoice::Default),
         // 何も変えずにやり直す（保存先の試し書きもやり直す）。
-        RecoveryChoice::RetryStoreCheck => Prelude::None,
+        RecoveryChoice::RetryStoreCheck => retry_prelude(),
         RecoveryChoice::RecreateDatabase => {
             // 排他を取ってから退ける（取れなければ何も変えずに理由を返す）。
             match recovery::recreate_database(&paths.db_path, &recovery::broken_stamp_now()).await {
@@ -730,6 +738,17 @@ mod tests {
     /// 窓の選択肢は core の判断どおりで、確認の文があるのは確認をはさむ対処
     /// だけ（core の `needs_confirmation` と食い違わない）。既定に戻す確認は
     /// 「記録は元の場所に残り画面からは見えなくなる」を先に伝える。
+    #[test]
+    fn retry_keeps_an_audit_note_with_the_retry_choice() {
+        match retry_prelude() {
+            Prelude::Noted(note) => {
+                assert_eq!(note.choice, RecoveryChoice::RetryStoreCheck);
+                assert!(note.detail.is_empty());
+            }
+            _ => panic!("再試行は監査の記録を持つ"),
+        }
+    }
+
     #[test]
     fn views_follow_the_core_plan_and_confirmation_rule() {
         for kind in [

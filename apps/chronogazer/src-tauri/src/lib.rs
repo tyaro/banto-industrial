@@ -4465,6 +4465,10 @@ async fn launch_desktop(
     let mut recovery_note = None;
     let opened = match prelude {
         Prelude::None => EngineRuntime::open(cfg).await,
+        Prelude::Noted(note) => {
+            recovery_note = Some(note);
+            EngineRuntime::open(cfg).await
+        }
         Prelude::StoreDir(choice) => {
             store_dir = Some(choice);
             EngineRuntime::open(cfg).await
