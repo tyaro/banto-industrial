@@ -132,6 +132,7 @@ async fn main() {
         seed_viewer_public,
         log_label: "banto-serve",
         audit_origin: "rest",
+        store_config_required: false,
     })
     .await
     {

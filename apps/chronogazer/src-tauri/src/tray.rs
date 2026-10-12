@@ -9,8 +9,8 @@
 //! - トレイのアイコンの**左クリック**か、メニューの「開く」で窓を戻す。
 //!   右クリックでメニュー（収集の状態・開く・終了）。
 //! - 「終了」は確認ダイアログを出し（収集中なら「収集を停止してから終了」の
-//!   文言）、同意されたら**既存の終了処理**（[`crate::exit_cleanup_once`] →
-//!   `shutdown_app_state`: LAN サーバー → 収集（最終 flush と
+//!   文言）、同意されたら**既存の終了処理**（[`crate::exit_cleanup`] →
+//!   エンジンの終了 `RunningEngine::shutdown`: LAN サーバー → 収集（最終 flush と
 //!   `collection_stopped`）→ Hub 購読 → DB の順）を通してから
 //!   `AppHandle::exit` する。
 //! - 2 つ目の起動は `tauri-plugin-single-instance` が受け、既存の窓を前に出して
@@ -38,13 +38,13 @@
 //!   後の開始は「終了処理中のため、収集を開始できません」のエラーで断られ、
 //!   確かめ直すとき（`AskAgain`）は印を下ろす（上げ下げは
 //!   [`QuitGate::answer`] が行う）。ここで扱うのは**確認のための一時的な
-//!   印**だけで、終了処理（[`crate::exit_cleanup_once`] →
-//!   `shutdown_app_state`、OS のシャットダウンを含む）は取り消せない印
+//!   印**だけで、終了処理（[`crate::exit_cleanup`] →
+//!   エンジンの終了、OS のシャットダウンを含む）は取り消せない印
 //!   （`CollectorService::begin_shutdown`）を立てる。遅れて届いた `AskAgain`
 //!   は後者を下ろせない（#392 A2 再レビュー P2-2）。
 //! - **終了処理中にもう一度「終了」**: [`banto_desktop_tray::QuitGate`] が
 //!   確認ダイアログを 2 つ出さず、終了処理を 2 回走らせない。終了処理の本体も
-//!   [`crate::exit_cleanup_once`] が 1 回に限る（OS のシャットダウンで
+//!   [`crate::exit_cleanup`] が 1 回に限る（OS のシャットダウンで
 //!   `RunEvent::Exit` が同時に来ても、走っている後始末の完了を待つだけ）。
 //! - **停止の失敗**: 失敗（最終 flush の失敗・予算切れ）を握りつぶさず、
 //!   何が起きたかをダイアログで知らせてから終了する。**プロセスは残さない**
@@ -66,7 +66,7 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
-use crate::{AppState, ExitCleanupReport, LEGACY_DB_WINDOW_LABEL, MAIN_WINDOW_LABEL};
+use crate::{AppState, ExitCleanupReport, ExitTrigger, LEGACY_DB_WINDOW_LABEL, MAIN_WINDOW_LABEL};
 
 /// × で隠した初回だけ出す通知（既読の印はアプリのデータディレクトリの
 /// `tray-hint-shown`。banto-hub と同じ名前だが、データディレクトリが
@@ -213,7 +213,7 @@ fn quitting(app: &AppHandle) -> bool {
 
 fn current_state(app: &AppHandle) -> Option<CollectorState> {
     app.try_state::<AppState>()
-        .map(|state| state.collect.state())
+        .map(|state| state.services.collect.state())
 }
 
 fn current_label(app: &AppHandle) -> String {
@@ -306,7 +306,7 @@ fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
             };
             let admission = CollectorQuitAdmission(
                 app.try_state::<AppState>()
-                    .map(|state| state.collect.clone()),
+                    .map(|state| state.services.collect.clone()),
             );
             match gate.answer(confirmed, prompted_collecting, &admission) {
                 QuitAnswerDecision::Proceed => quit(app.clone()),
@@ -328,8 +328,11 @@ fn quit(app: AppHandle) {
         let _guard = TRAY_LABEL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         apply_label(&app, "終了処理中…");
     }
-    tauri::async_runtime::spawn(async move {
-        let report = crate::exit_cleanup_once(&app).await;
+    // 後始末（[`crate::exit_cleanup`]）は完了を条件変数で**ブロックして**待つ
+    // （本体は共有の `ExitCleanupOnce` の専用スレッドで走る）ので、tokio の
+    // ワーカーを塞がないよう専用のスレッドから呼ぶ（#392 B1-2）。
+    std::thread::spawn(move || {
+        let report = crate::exit_cleanup(&app, ExitTrigger::TrayQuit);
         let failure = report.as_ref().and_then(cleanup_failure_message);
         match failure {
             None => app.exit(0),

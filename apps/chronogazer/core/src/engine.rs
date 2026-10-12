@@ -1,4 +1,5 @@
-//! 収集エンジンの起動と終了（#392 段階 B の B1-1、2026-10-12）。
+//! 収集エンジンの起動と終了（#392 段階 B の B1-1、2026-10-12。B1-2 でデスクトップも
+//! 乗り換えた）。
 //!
 //! ChronoGazer の「DB を開き、サービスを組み、Hub と収集を動かし、REST を
 //! 待ち受ける」組み立ては、これまでデスクトップ（`src-tauri` の `setup()` と
@@ -29,7 +30,10 @@
 //! 5. **Hub**: `HubService::new`（失敗は [`EngineStartError::Hub`]）→
 //!    `attach_registry`（デスクトップと同じく常に。REST のルーターも同じ pool を
 //!    差し込むが 2 回目は無視される）。
-//! 6. 収集サービスを組み、[`EngineConfig::attach_hub`] なら `attach_hub`
+//! 6. 収集サービスを組み（保存設定 `data.dir` を読めないとき、
+//!    [`EngineConfig::store_config_required`] なら Hub を止めて pool を閉じてから
+//!    [`EngineStartError::StoreConfig`]、そうでなければ既定値で続行）、
+//!    [`EngineConfig::attach_hub`] なら `attach_hub`
 //!    （**自動開始より前**。後から繋いでも走り出した収集には効かない）。
 //! 7. **LAN の listener の bind**（ポートの確保だけ。まだ要求を受けない）。
 //!    [`EngineListen::Required`] で bind できなければ、ここで Hub を止めて
@@ -46,8 +50,9 @@
 //!
 //! # 終了の順序（[`RunningEngine::shutdown`]）
 //!
-//! デスクトップの `shutdown_app_state` と同じ（理由の詳細はそちらの doc にも
-//! ある - 「消費者を先に止め、書き手はその後、みんなが書き込む先は最後」）:
+//! B1-1 より前のデスクトップの `shutdown_app_state` と同じ（「消費者を先に止め、
+//! 書き手はその後、みんなが書き込む先は最後」。B1-2 からデスクトップの
+//! `shutdown_app_state` はこれを呼ぶだけ）:
 //!
 //! 1. **収集の取り消せない終了の印**（`CollectorService::begin_shutdown`）。
 //!    予算の外で、待たずに立てる。以降の開始（まだ止めていない REST・遅れて
@@ -81,36 +86,47 @@
 //!   開けるのは `banto-serve` だけ）。
 //! - ログの接頭辞（`banto` / `banto-serve`）と、起動時の `restore_applied` の
 //!   監査の `origin`（`tauri` / `rest`）。今までの各 host の文言・値を保つため。
+//! - 保存設定を読めないときに起動を止めるか（`store_config_required`。
+//!   デスクトップ = 止める、`banto-serve` = 既定値で続行。どちらも B1-1 より前からの
+//!   各 host の扱い）。
 //!
 //! **このモジュールに入れないもの**（host 固有）: 窓・トレイ・自動ログイン・
 //! OS キーリング・Acrylic・イベントの webview への転送・単一インスタンスの
 //! プラグイン。これらはデスクトップのシェル（`src-tauri`）に残る。
 //!
-//! # B1-2 でデスクトップがこれをどう呼ぶか（見通し）
+//! # デスクトップの呼び方（B1-2、2026-10-12 実装）
 //!
 //! ```text
 //! setup():
 //!   opened = block_on(EngineRuntime::open(cfg{ host: Desktop, key_store: Keyring,
-//!                                              attach_hub: true, listen: Disabled, .. }))
-//!       Err(InstanceLock)            -> 今の「既に起動中」のエラーの窓
-//!       Err(Database(Legacy))        -> 今の「旧形式の DB」のエラーの窓
-//!   create_main_window(); hide_to_tray_on_close()       // DB を開けた後・サービスの前（今と同じ）
+//!                                              attach_hub: true, listen: Disabled,
+//!                                              store_config_required: true, .. }))
+//!       Err(InstanceLock)            -> 「既に起動中」のエラーの窓
+//!       Err(Database(Legacy))        -> 「旧形式の DB」のエラーの窓
+//!       それ以外の Err               -> 今までどおり panic
+//!   create_main_window(); hide_to_tray_on_close()       // DB を開けた後・サービスの前
 //!   events の webview への転送を opened.events() に張る   // start より前に購読する
 //!   LAN の自動起動の判定（lan_autostart_allowed）を opened.settings() で読み、
 //!     opened.with_listen(EngineListen::BestEffort(cfg) または Disabled)
-//!   engine = block_on(opened.start())
-//!   自動ログイン（engine.services() の users/audit/settings を使う）
-//!   Acrylic、AppState { engine.services() の各ハンドル, server: engine.server_slot() }
-//!   tray::install()
-//! shutdown_app_state(): engine.shutdown(EXIT_CLEANUP_BUDGET) → ExitCleanupReport へ写す
-//! server_apply: engine.server_slot().lock() を今の `AppState::server` と同じく使う
+//!   engine = block_on(opened.start())                  // Err(Hub / StoreConfig) は panic
+//!   自動ログイン（engine.services() の users/audit を使う）
+//!   Acrylic、AppState { services: engine.services().clone(), server: engine.server_slot() }
+//!   エンジンを管理状態に置く（プロセスの終わりまで drop しない）、tray::install()
+//! shutdown_app_state(): engine.shutdown(予算) → ExitCleanupReport へ写す
+//!   （トレイの終了と RunEvent::Exit で 1 回だけ。banto_desktop_tray::ExitCleanupOnce）
+//! server_apply: engine.server_slot().lock() を入れ替える
 //! ```
 //!
-//! 今のデスクトップとの順序の差は 2 つで、どちらも観測できる挙動を変えない:
+//! B1-1 より前のデスクトップとの差（どれも観測できる挙動を変えないと判断した。
+//! 理由は docs/chronogazer-service-design.md §4 の B1-2 の実装メモ）:
 //! (a) 自動ログイン（監査に `login` を書く）が Hub と収集の組み立ての後になる
-//! （どちらも spawn して投げっぱなしなので待たせない）、(b) LAN の listener の
-//! bind が自動開始の spawn より前になる（serve は後。上の 7.）。
-//!
+//! （どちらも spawn して投げっぱなしで、Tauri のコマンドはまだ受けない）、
+//! (b) LAN の listener の bind が自動開始の spawn より前になる（serve は後。上の 7.）、
+//! (c) 起動時にリストアを適用したときに標準出力へ 1 行出す（リリースビルドの
+//! デスクトップは標準出力が見えない）、(d) 保持期間の掃除を終了で abort する
+//! （以前はプロセスの終わりまで放っておいた。消すのは古い日付のファイルだけで、
+//! 途中で止めても次の起動で続きを消す）。
+
 //! # テスト
 //!
 //! 起動の失敗が `Result` で返ること（排他の競合では DB に触れない・DB を開けない・
@@ -187,6 +203,13 @@ pub struct EngineConfig {
     pub log_label: &'static str,
     /// 起動時の `restore_applied` の監査の `origin`（`tauri` / `rest`）。
     pub audit_origin: &'static str,
+    /// 時系列データの保存設定（`data.dir` など、[`store_config`]）を読めなかった
+    /// ときに起動を止めるか（B1-2、2026-10-12）。`false`（`banto-serve`）は既定値で
+    /// 続行する。`true`（デスクトップ）は Hub を止めて pool を閉じてから
+    /// [`EngineStartError::StoreConfig`] を返す - 利用者が `data.dir` を別の場所に
+    /// 設定していると、既定値で続けたときに時系列データを**違う場所へ**書き始めて
+    /// しまうため（デスクトップは B1-1 より前から、ここで起動を止めていた）。
+    pub store_config_required: bool,
 }
 
 impl EngineConfig {
@@ -209,6 +232,9 @@ pub enum EngineStartError {
     Database(InitDbError),
     /// `HubService::new`（`installation_id` の読み書き）の失敗。
     Hub(BantoError),
+    /// 時系列データの保存設定を読めなかった（[`EngineConfig::store_config_required`]
+    /// のときだけ）。
+    StoreConfig(BantoError),
     /// [`EngineListen::Required`] の待ち受けを開けなかった。
     Listen {
         config: ServerConfig,
@@ -225,6 +251,9 @@ impl std::fmt::Display for EngineStartError {
             Self::Database(InitDbError::Legacy(legacy)) => legacy.fmt(f),
             Self::Database(err) => write!(f, "DB の初期化に失敗しました: {err}"),
             Self::Hub(err) => write!(f, "Hub 接続の初期化に失敗しました: {err}"),
+            Self::StoreConfig(err) => {
+                write!(f, "時系列データの保存設定の読み取りに失敗しました: {err}")
+            }
             Self::Listen { config, source } => write!(
                 f,
                 "待ち受け（{}:{}）を開始できませんでした: {source}",
@@ -239,7 +268,7 @@ impl std::error::Error for EngineStartError {
         match self {
             Self::InstanceLock(err) => Some(err),
             Self::Database(err) => Some(err),
-            Self::Hub(err) | Self::Listen { source: err, .. } => Some(err),
+            Self::Hub(err) | Self::StoreConfig(err) | Self::Listen { source: err, .. } => Some(err),
         }
     }
 }
@@ -517,13 +546,22 @@ impl OpenedEngine {
 
         // #383 段階2b / R1-C: 収集。`data.dir` の相対パスは `data_base` 基準
         // （既定 `"./data"` をそのまま使うとプロセスの作業ディレクトリに書いて
-        // しまう）。設定を読めなければ既定値で続行する。
-        let store_settings = store_config(&settings).await.unwrap_or_else(|err| {
-            eprintln!(
-                "{label}: 時系列データの保存設定の読み取りに失敗しました（既定値で続行します）: {err}"
-            );
-            Default::default()
-        });
+        // しまう）。設定を読めなければ、`store_config_required` なら起動を止め
+        // （Hub を止めて pool を閉じて返す）、そうでなければ既定値で続行する。
+        let store_settings = match store_config(&settings).await {
+            Ok(store_settings) => store_settings,
+            Err(err) if cfg.store_config_required => {
+                hub.shutdown().await;
+                pool.close().await;
+                return Err(EngineStartError::StoreConfig(err));
+            }
+            Err(err) => {
+                eprintln!(
+                    "{label}: 時系列データの保存設定の読み取りに失敗しました（既定値で続行します）: {err}"
+                );
+                Default::default()
+            }
+        };
         let collect_data_dir = resolve_data_dir(&cfg.data_base, &store_settings.data_dir);
         let collect = CollectorService::new(pool.clone(), collect_data_dir);
         if cfg.attach_hub {
@@ -817,6 +855,7 @@ mod tests {
             seed_viewer_public: false,
             log_label: "engine-test",
             audit_origin: "rest",
+            store_config_required: false,
         }
     }
 
@@ -915,6 +954,44 @@ mod tests {
         let engine = EngineRuntime::start(config(dir.path(), EngineListen::Disabled))
             .await
             .expect("失敗した起動の後に同じ DB で起動できる");
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out);
+    }
+
+    /// 保存設定 `data.dir` を読めない DB（値を TEXT として読めない BLOB にする。
+    /// Hub の `installation_id` と監査の設定は読める）で、
+    /// `store_config_required` なら `Err(StoreConfig)` を返して排他と pool を返し、
+    /// 収集のデータディレクトリを作らない。`false` なら既定値で起動を続ける
+    /// （`banto-serve` の今までの扱い）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_store_config_stops_only_when_required() {
+        let dir = TempDir::new();
+        let opened = EngineRuntime::open(EngineConfig {
+            store_config_required: true,
+            ..config(dir.path(), EngineListen::Required(loopback_any_port()))
+        })
+        .await
+        .expect("open");
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('data.dir', X'FF00FE')")
+            .execute(opened.pool())
+            .await
+            .expect("data.dir を読めない値にする");
+        let err = match opened.start().await {
+            Ok(_) => panic!("保存設定を読めないのに起動した"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, EngineStartError::StoreConfig(_)), "{err:?}");
+        assert!(!dir.path().join("data").exists(), "収集の置き場を作った");
+        drop(
+            acquire_for_db(&db_path, ChronoGazerHost::Serve)
+                .expect("失敗した起動の後は排他が返っている"),
+        );
+
+        // 必須でなければ既定値で続行する。
+        let engine = EngineRuntime::start(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("既定値で続行する");
         let report = engine.shutdown(Duration::from_secs(10)).await;
         assert!(!report.timed_out);
     }
