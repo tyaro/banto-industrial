@@ -2019,30 +2019,52 @@ mod tests {
     //
     // A connection task notices its stop signal only between reads, so a
     // task blocked on a PLC that never answers stops only when that read
-    // gives up. These tests drive that shape with a gate instead of a clock
-    // (see `GatedClient`), so they are deterministic rather than
-    // timing-based; `tests/integration.rs` covers the same thing against
-    // real unresponsive sockets, with a timing assertion.
+    // gives up. These tests make "every task is signalled before the first
+    // join" a hard precondition for finishing at all, independent of timing
+    // and scheduling (see `GatedClient`); `tests/integration.rs` covers the
+    // same thing against real unresponsive sockets, with a timing assertion.
 
-    /// A fake `PlcClient` for the #588 tests. Its **first** `read_batch`
-    /// blocks until the shared `release` gate opens and then succeeds; every
-    /// **later** `read_batch` never returns at all (a PLC that stopped
-    /// answering, with no response timeout to rescue it).
+    /// Counts how many of the given tasks' stop channels have been sent
+    /// `true`, by watching receivers subscribed (in the test) to each
+    /// [`ConnectionTask::stop_tx`] - the very channel `stop_tasks` sends on.
+    /// Returns a receiver of that count.
+    fn watch_stop_signals<'a>(
+        tasks: impl IntoIterator<Item = &'a ConnectionTask>,
+    ) -> watch::Receiver<usize> {
+        let (count_tx, count_rx) = watch::channel(0usize);
+        let count_tx = Arc::new(count_tx);
+        for task in tasks {
+            let mut stop_rx = task.stop_tx.subscribe();
+            let count_tx = count_tx.clone();
+            tokio::spawn(async move {
+                if stop_rx.wait_for(|stop| *stop).await.is_ok() {
+                    count_tx.send_modify(|count| *count += 1);
+                }
+            });
+        }
+        count_rx
+    }
+
+    /// A fake `PlcClient` for the #588 tests - a **barrier on the stop
+    /// signals**. Its first `read_batch` blocks until `notified` (from
+    /// [`watch_stop_signals`]) reaches `all`, i.e. until **every** task
+    /// being stopped has been sent its stop signal, and then succeeds; every
+    /// later `read_batch` never returns (a PLC that stopped answering).
     ///
-    /// That makes the stop order observable without timing: once the gate
-    /// opens, every task returns from its first read and loops. A task that
-    /// has *already* been told to stop sees that first (`run_connection`'s
-    /// select is `biased` towards the stop arm) and exits; one that has not
-    /// goes straight into its second read and hangs there for good. So the
-    /// stop completes only if every task was signalled before the gate
-    /// opened - i.e. before the first join was awaited.
+    /// So no task can finish its read - and therefore no join can complete -
+    /// before every task has been signalled. A stop that signals and joins
+    /// one task at a time can never get past the first join (that task waits
+    /// for signals the stop will only send after the join): it deadlocks,
+    /// always, whatever the timing. A stop that signals everyone first lets
+    /// every read finish; each task then sees its stop (the select in
+    /// `run_connection` is `biased` towards it) before any second read.
     ///
     /// When `panic_on_read` is set the client panics in `read_batch`
     /// instead, so its task ends with a `JoinError`.
     struct GatedClient {
         nth_read: usize,
         in_first_read: Arc<AtomicUsize>,
-        release: watch::Receiver<bool>,
+        notified: Barrier,
         panic_on_read: bool,
     }
 
@@ -2062,13 +2084,22 @@ mod tests {
             self.nth_read += 1;
             let first = self.nth_read == 1;
             let in_first_read = self.in_first_read.clone();
-            let mut release = self.release.clone();
+            let notified = self.notified.clone();
             Box::pin(async move {
                 if !first {
                     std::future::pending::<()>().await;
                 }
                 in_first_read.fetch_add(1, Ordering::SeqCst);
-                let _ = release.wait_for(|open| *open).await;
+                // The barrier is armed by the test once every task is in
+                // here (it needs the tasks' stop channels, which exist only
+                // after start); poll until then.
+                let (mut count_rx, all) = loop {
+                    if let Some(armed) = notified.lock().expect("barrier lock").clone() {
+                        break armed;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                let _ = count_rx.wait_for(|count| *count >= all).await;
                 Ok(requests
                     .iter()
                     .map(|_| ReadResult::Value(TagValue::F64(5.0)))
@@ -2081,17 +2112,20 @@ mod tests {
         }
     }
 
-    /// A [`GatedClient`] factory sharing one gate and one counter; the
+    /// The shared, initially unarmed stop-signal barrier of [`GatedClient`].
+    type Barrier = Arc<std::sync::Mutex<Option<(watch::Receiver<usize>, usize)>>>;
+
+    /// A [`GatedClient`] factory sharing one barrier and one counter; the
     /// connections whose key is in `panicking` get a panicking client, and
     /// those in `ungated` a plain [`FakeClient`].
     fn gated_factory(
         in_first_read: &Arc<AtomicUsize>,
-        release: &watch::Receiver<bool>,
+        barrier: &Barrier,
         panicking: &[&str],
         ungated: &[&str],
     ) -> ClientFactory {
         let in_first_read = in_first_read.clone();
-        let release = release.clone();
+        let barrier = barrier.clone();
         let panicking: HashSet<String> = panicking.iter().map(|k| (*k).to_string()).collect();
         let ungated: HashSet<String> = ungated.iter().map(|k| (*k).to_string()).collect();
         Arc::new(move |spec| {
@@ -2103,7 +2137,7 @@ mod tests {
             Box::new(GatedClient {
                 nth_read: 0,
                 in_first_read: in_first_read.clone(),
-                release: release.clone(),
+                notified: barrier.clone(),
                 panic_on_read: panicking.contains(&spec.connection_key),
             }) as Box<dyn PlcClient>
         })
@@ -2122,27 +2156,21 @@ mod tests {
         }
     }
 
-    /// Poll `fut` exactly once (it must not finish yet: every read is still
-    /// gated), open the gate, then give `fut` 10 s to finish. The `biased`
-    /// select guarantees the single poll happens before the gate opens.
-    async fn poll_once_then_release<F: std::future::Future>(
-        fut: F,
-        release_tx: &watch::Sender<bool>,
-        what: &str,
-    ) -> F::Output {
-        let mut fut = Box::pin(fut);
-        tokio::select! {
-            biased;
-            _ = &mut fut => panic!("{what} cannot finish while every read is gated"),
-            () = std::future::ready(()) => {}
-        }
-        release_tx.send_replace(true);
+    /// Arm `barrier` on the stop signals of the tasks under `keys`: from now
+    /// on a gated read finishes only once all of them have been signalled.
+    fn arm_barrier(collector: &Collector, barrier: &Barrier, keys: &[String]) {
+        let count_rx = watch_stop_signals(keys.iter().map(|key| &collector.tasks[key]));
+        *barrier.lock().expect("barrier lock") = Some((count_rx, keys.len()));
+    }
+
+    /// Give `fut` 10 s: past that it is deadlocked on the barrier.
+    async fn within_barrier_deadline<F: std::future::Future>(fut: F, what: &str) -> F::Output {
         tokio::time::timeout(Duration::from_secs(10), fut)
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "{what} hung: some task was not signalled before the first join was \
-                     awaited, so it went on into a read that never returns (#588)"
+                    "{what} deadlocked: it awaited a join before signalling every task, \
+                     and no task can finish before every task is signalled (#588)"
                 )
             })
     }
@@ -2184,15 +2212,16 @@ mod tests {
     }
 
     /// Start `n` gated connections (those in `panicking` panic instead),
-    /// wait until every other one is blocked in its first read, then stop
-    /// via [`poll_once_then_release`]. Returns the live events seen.
+    /// wait until every other one is blocked in its first read, arm the
+    /// barrier on every task's stop signal (the panicked one's included),
+    /// then `stop()`. Returns the live events seen.
     async fn stop_with_gated_reads(
         dir: &TempDir,
         n: usize,
         panicking: &[&str],
     ) -> Vec<crate::event::CollectEvent> {
         let in_first_read = Arc::new(AtomicUsize::new(0));
-        let (release_tx, release_rx) = watch::channel(false);
+        let barrier: Barrier = Arc::default();
         let pool = banto_storage::connect_sqlite_memory()
             .await
             .expect("connect sqlite memory");
@@ -2204,13 +2233,15 @@ mod tests {
             Arc::new(SystemClock),
             events,
             flush_only_on_stop(),
-            gated_factory(&in_first_read, &release_rx, panicking, &[]),
+            gated_factory(&in_first_read, &barrier, panicking, &[]),
         )
         .await
         .expect("start_with_client_factory should succeed");
 
         wait_in_first_read(&in_first_read, n - panicking.len()).await;
-        poll_once_then_release(collector.stop(), &release_tx, "stop()")
+        let all: Vec<String> = collector.tasks.keys().cloned().collect();
+        arm_barrier(&collector, &barrier, &all);
+        within_barrier_deadline(collector.stop(), "stop()")
             .await
             .expect("stop should succeed");
         drain_events(&mut rx)
@@ -2240,11 +2271,9 @@ mod tests {
     }
 
     /// **#588 regression.** `stop()` must signal every task before it awaits
-    /// the first join. With the old signal-then-join loop only the first
-    /// task is signalled when the gate opens; every other task goes on into
-    /// a read that never returns, and `stop()` hangs (see [`GatedClient`]).
-    /// The final flush and `collection_stopped` still come after every task,
-    /// exactly once.
+    /// the first join - with the old signal-then-join loop it deadlocks on
+    /// [`GatedClient`]'s barrier. The final flush and `collection_stopped`
+    /// still come after every task, exactly once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_signals_every_task_before_joining_any() {
         let dir = TempDir::new();
@@ -2297,16 +2326,16 @@ mod tests {
     }
 
     /// #588: `apply_config`'s step 3 stops removed tasks the same way - all
-    /// signalled before the first join. The store config is left unchanged
-    /// so no writer is opened (step 2) and the first poll reaches step 3.
+    /// signalled before the first join, or it deadlocks on the barrier
+    /// (armed on the removed tasks only).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_config_signals_every_removed_task_before_joining_any() {
         let dir = TempDir::new();
         let in_first_read = Arc::new(AtomicUsize::new(0));
-        let (release_tx, release_rx) = watch::channel(false);
+        let barrier: Barrier = Arc::default();
         // conn:1 stays and is never stopped by apply_config, so it reads
-        // normally (a gated one would end up in a read that never returns).
-        let factory = gated_factory(&in_first_read, &release_rx, &[], &["conn:1"]);
+        // normally (a gated one would wait on a barrier nobody completes).
+        let factory = gated_factory(&in_first_read, &barrier, &[], &["conn:1"]);
         let pool = banto_storage::connect_sqlite_memory()
             .await
             .expect("connect sqlite memory");
@@ -2321,18 +2350,18 @@ mod tests {
         .await
         .expect("start_with_client_factory should succeed");
         wait_in_first_read(&in_first_read, 9).await;
+        let mut removed: Vec<String> = (2..=10).map(|i| format!("conn:{i}")).collect();
+        removed.sort(); // ApplyReport sorts its keys (conn:10 before conn:2)
+        arm_barrier(&collector, &barrier, &removed);
 
         // Keep conn:1 only (conn:2..=10 are removed), same store config.
         let mut keep_one = n_conn_config(1);
         keep_one.store_config = n_conn_config(10).store_config;
-        let report = poll_once_then_release(
-            collector.apply_config(keep_one, factory),
-            &release_tx,
-            "apply_config",
-        )
-        .await
-        .expect("apply_config should succeed");
-        assert_eq!(report.removed.len(), 9, "{report:?}");
+        let report =
+            within_barrier_deadline(collector.apply_config(keep_one, factory), "apply_config")
+                .await
+                .expect("apply_config should succeed");
+        assert_eq!(report.removed, removed, "{report:?}");
         assert_eq!(report.unchanged, vec!["conn:1".to_string()]);
         assert!(!report.writer_rotated);
         assert_eq!(collector.tasks.len(), 1);
