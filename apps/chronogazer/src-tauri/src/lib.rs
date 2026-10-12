@@ -26,16 +26,25 @@
 //!
 //! #392 B1-2 (docs/chronogazer-service-design.md §4): startup and exit are the
 //! engine's (`chronogazer_core::engine`, shared with `banto-serve` and the
-//! future headless/service hosts). `setup()` opens it (A1 lock → staged
-//! restore → `init_db`), creates the window, decides the LAN auto-start, then
-//! starts it (services → Hub → collection → listener) and keeps only the
-//! desktop-only parts (window, webview event forwarding, autologin, Acrylic,
-//! tray, OS keyring). `AppState` holds the engine's service handles
-//! (`EngineServices`) and its LAN listener slot; the exit cleanup is the
-//! engine's shutdown, run once through the shared
+//! future headless/service hosts). `setup()` runs [`launch_desktop`]: open it
+//! (A1 lock → staged restore → `init_db`), decide the LAN auto-start, start it
+//! (services → Hub → collection → listener), then the desktop-only parts
+//! (autologin, `AppState`, window, Acrylic, tray; plus webview event
+//! forwarding and the OS keyring). `AppState` holds the engine's service
+//! handles (`EngineServices`) and its LAN listener slot; the exit cleanup is
+//! the engine's shutdown, run once through the shared
 //! `banto_desktop_tray::ExitCleanupOnce` ([`exit_cleanup`]).
+//!
+//! #392 (2026-10-12 owner decision): a startup failure never panics. It opens
+//! an error window - the existing one for "already running" / an old-format
+//! DB, otherwise a window that lets the user pick a remedy (choose the data
+//! folder again / reset it, restore a backup / recreate the DB keeping the
+//! old file, or quit) and then retries [`launch_desktop`] in the same process.
+//! See the [`startup`] module.
 
 mod keyring_store;
+// #392（2026-10-12）: 起動に失敗したときの「エラーの窓と対処の選択」。
+mod startup;
 mod tray;
 
 use banto_core::{BantoError, FieldError, ListParams};
@@ -52,7 +61,6 @@ use chronogazer_core::collect::{
     CollectOutcome, CollectorStateView, ConnectionView, EventPage, ExclusionView, Readout,
     ValuesResponse, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
-use chronogazer_core::db::InitDbError;
 // #393: 表示グループ。検証・保存は REST と同じ `DisplayGroupService`。
 use chronogazer_core::display_groups::{
     audit_detail as display_group_audit_detail, DisplayGroup, DisplayGroupPayload,
@@ -60,8 +68,7 @@ use chronogazer_core::display_groups::{
 };
 // #392 B1-2: 起動と終了は `banto-serve` と共有のエンジン。
 use chronogazer_core::engine::{
-    EngineConfig, EngineListen, EngineRuntime, EngineServices, EngineStartError, RunningEngine,
-    ServerSlot,
+    EngineConfig, EngineListen, EngineRuntime, EngineServices, RunningEngine, ServerSlot,
 };
 use chronogazer_core::instance_lock::ChronoGazerHost;
 // #532: 記録計の側のタグごとのしきい値。検証・保存は REST と同じ `TagThresholdService`。
@@ -4173,7 +4180,9 @@ const MAIN_WINDOW_LABEL: &str = "main";
 
 /// tauri.conf.json の `app.windows` のうち label が `main` の窓を、その設定の
 /// まま作る。設定側は `create: false`（Tauri が setup の前に自動で作らない）。
-fn create_main_window(app: &tauri::App) -> tauri::Result<()> {
+fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    // tauri.conf.json で定義済みなので見つからないことは無いはずだが、無くても
+    // panic せず起動の失敗としてエラーの窓に出す（#392）。
     let config = app
         .config()
         .app
@@ -4181,8 +4190,8 @@ fn create_main_window(app: &tauri::App) -> tauri::Result<()> {
         .iter()
         .find(|window| window.label == MAIN_WINDOW_LABEL)
         .cloned()
-        .expect("tauri.conf.json defines the main window");
-    tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.build()?;
+        .ok_or_else(|| tauri::Error::WindowNotFound)?;
+    tauri::WebviewWindowBuilder::from_config(app, &config)?.build()?;
     Ok(())
 }
 
@@ -4270,8 +4279,20 @@ impl StartupErrorNotice {
     }
 }
 
+/// [`open_startup_error_window`] を開き、開けなければ終了する（#392 A1・旧形式の
+/// DB。[`startup::show_failure`] から）。
+fn show_startup_notice(app: &tauri::AppHandle, notice: &StartupErrorNotice) {
+    if let Err(err) = open_startup_error_window(app, notice) {
+        eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
+        std::process::exit(1);
+    }
+}
+
 /// 起動を止めたことを、メインの窓の代わりに小さな窓で見せる。
-fn open_startup_error_window(app: &tauri::App, notice: &StartupErrorNotice) -> tauri::Result<()> {
+fn open_startup_error_window(
+    app: &tauri::AppHandle,
+    notice: &StartupErrorNotice,
+) -> tauri::Result<()> {
     tauri::WebviewWindowBuilder::new(
         app,
         LEGACY_DB_WINDOW_LABEL,
@@ -4372,6 +4393,316 @@ async fn record_autologin_failed(audit: &AuditLogService, username: &str) {
         .await;
 }
 
+/// デスクトップのエンジンの設定（#392 B1-2）。
+fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
+    EngineConfig {
+        db_path: paths.db_path.clone(),
+        // `data.dir` の相対パスは**アプリのデータディレクトリ基準**
+        // （既定 `"./data"` をプロセスの作業ディレクトリに作らない）。
+        data_base: paths.data_dir.clone(),
+        // #332: Hub の API キーは OS キーリング。
+        key_store: Arc::new(keyring_store::KeyringKeyStore),
+        // #383 段階3 P3: Hub 経由の接続を収集で記録する。
+        attach_hub: true,
+        host: ChronoGazerHost::Desktop,
+        // LAN の自動起動は DB を開けた後に設定から決める（[`launch_desktop`]）。
+        listen: EngineListen::Disabled,
+        // 初回セットアップは `auth_setup` コマンド（`invoke()`）で行い、
+        // LAN の `POST /api/auth/setup` は開けない（`banto-serve` だけ）。
+        allow_setup: false,
+        seed_viewer_public: false,
+        log_label: "banto",
+        audit_origin: "tauri",
+        // 保存設定（`data.dir`）を読めなければ起動を止める（B1-1 より
+        // 前からのデスクトップの扱い。既定値で続けると、別の場所を設定
+        // していた利用者の時系列データを違う場所へ書き始める）。止めた後は
+        // 対処の窓で保存先を選び直せる（#392、[`startup`]）。
+        store_config_required: true,
+        // 起動時に保存先へ書き込めるかを確かめ、書けなければ対処の窓（#392、
+        // 2026-10-12 オーナー決定）。
+        store_dir_check_required: true,
+    }
+}
+
+/// デスクトップの起動の本体（`setup()` の最初の起動と、対処の窓で対処を選んだ後の
+/// やり直しの両方が呼ぶ。#392、2026-10-12）。
+///
+/// # 順序
+///
+/// 1. `EngineRuntime::open`（A1 の排他 → リストア予約の適用 → `init_db`）。
+/// 2. `prelude`（対処の窓で選ばれたもの）: 保存先の書き換え（DB を開けた後・
+///    `start` の前）か、済んだ対処の監査の記録の予約。
+/// 3. webview へのイベントの転送（`start` より前に購読して取りこぼさない）。
+/// 4. LAN の自動起動の判定（[`lan_autostart_allowed`]）→ `with_listen`。
+/// 5. `OpenedEngine::start`（サービス → Hub → 収集 → LAN → 監査の流し込み）。
+/// 6. 自動ログイン（[`initial_desktop_session`]）→ `AppState`・エンジンを manage。
+/// 7. **メインの窓**（× で隠す）→ Acrylic → トレイ。
+///
+/// メインの窓は B1-2 では `open` と `start` の間に作っていたが、**エンジンが
+/// 動き `AppState` を manage した後**に移した（#392）: `start` の失敗（Hub の
+/// 初期化・保存設定の読み取り）でメインの画面を出してから対処の窓に切り替える
+/// ことがないように。旧形式の DB で空の画面を先に出さない、という B1-2 の
+/// 理由もそのまま満たす（画面のコマンドが `AppState` より先に呼ばれることも
+/// 無くなる）。
+///
+/// 失敗はすべて `Err`（panic しない）。`open` の後の失敗は pool と A1 の排他を
+/// 返してから戻る（`start` の失敗はエンジンが、それより前は
+/// `OpenedEngine::close` が返す）ので、同じプロセスでやり直せる。
+/// [`startup::LaunchError::Window`]（エンジンが動いた後に画面を作れない）は、作りかけの
+/// メインの窓を破棄しエンジンを終了処理で止めてから戻る（[`abandon_after_window_failure`]、
+/// #594 のレビュー P2）。呼び出し側は「終了」だけの窓を出す。
+async fn launch_desktop(
+    app: &tauri::AppHandle,
+    paths: &startup::LaunchPaths,
+    prelude: startup::Prelude,
+) -> Result<(), startup::LaunchError> {
+    use startup::{LaunchError, Prelude};
+
+    // 対処の後なら、対処の**前に**取った A1 の排他をそのまま引き継ぐ（取り直さない。
+    // #594 のオーナーレビュー P1）。
+    let cfg = desktop_engine_config_for(paths);
+    let mut store_dir = None;
+    let mut recovery_note = None;
+    let opened = match prelude {
+        Prelude::None => EngineRuntime::open(cfg).await,
+        Prelude::Noted(note) => {
+            recovery_note = Some(note);
+            EngineRuntime::open(cfg).await
+        }
+        Prelude::StoreDir(choice) => {
+            store_dir = Some(choice);
+            EngineRuntime::open(cfg).await
+        }
+        Prelude::Recovered { lock, note } => {
+            recovery_note = Some(note);
+            EngineRuntime::open_with_recovery_lock(cfg, lock).await
+        }
+    }
+    .map_err(LaunchError::Engine)?;
+    let mut opened = match recovery_note {
+        Some(note) => opened.with_recovery_note(note),
+        None => opened,
+    };
+    if let Some(choice) = store_dir {
+        match chronogazer_core::startup_recovery::apply_store_dir(
+            &opened.settings(),
+            &paths.data_dir,
+            &choice,
+        )
+        .await
+        {
+            Ok(note) => opened = opened.with_recovery_note(note),
+            Err(err) => {
+                opened.close().await;
+                return Err(LaunchError::Recovery(err));
+            }
+        }
+    }
+
+    // Forward every resource-change/notice event onto the webview
+    // (spec §3.5's TauriEventProvider side: the webview has no
+    // network, so it cannot use the SSE endpoint a LAN browser
+    // client uses - `banto://event` is the in-process equivalent,
+    // fed by the SAME broadcast channel the REST server's SSE route
+    // fans out to browsers while running). Subscribed BEFORE
+    // `start()` so nothing the engine broadcasts while starting is
+    // missed. (If `start()` fails, the sender is dropped and this task
+    // ends on `Closed`.)
+    let app_handle = app.clone();
+    let mut events_rx = opened.events().subscribe();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match events_rx.recv().await {
+                Ok(event) => {
+                    let _ = app_handle.emit("banto://event", event);
+                }
+                // A slow/absent listener fell behind: skip the gap
+                // rather than tearing down the forwarding task.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // If LAN access was left enabled on a previous run, start the
+    // server immediately (spec §11.4) - from here on, the settings
+    // screen only needs to *change* state via `server_apply`.
+    //
+    // Spec M11 exclusivity is enforced at write-time
+    // (`SettingsService::set_server_config`/`set_auth_config`), but a
+    // hand-edited settings DB could still leave both
+    // `auth.disabled` and `server.enabled` set to `true` at once
+    // without `server.viewer_public` (the one combination the guards
+    // refuse, `auth_server_combination_allowed`, banto #288) - if so,
+    // refuse to auto-start the (would-be unauthenticated) LAN server
+    // rather than trust a state the app itself would never have
+    // written, and leave the inconsistency for the user to resolve
+    // from the settings screen (this does NOT rewrite either
+    // setting). I2b: the decision is [`lan_autostart_allowed`].
+    //
+    // The bind is best-effort (`EngineListen::BestEffort`): the desktop
+    // app itself works fine with no LAN access, so a failure (e.g. the
+    // persisted port now being in use) only goes to the log; the
+    // settings screen's `server_status` reports `running: false` and
+    // the user can pick a different port via `server_apply`.
+    //
+    // #392: reading these settings can fail (the settings DB is
+    // unreadable) - that is a startup failure shown in the recovery
+    // window, not a panic. The pool is closed first.
+    let settings = opened.settings();
+    let configs = match settings.auth_config().await {
+        Ok(auth_config) => match settings.server_config().await {
+            Ok(server_config) => Ok((auth_config, server_config)),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    let (auth_config, server_config) = match configs {
+        Ok(configs) => configs,
+        Err(err) => {
+            opened.close().await;
+            return Err(LaunchError::Settings(err));
+        }
+    };
+    let autostart = lan_autostart_allowed(&auth_config, &server_config);
+    if server_config.enabled && !autostart {
+        eprintln!(
+            "banto: 認証無効モードとLANアクセスが閲覧公開なしで同時に有効な不整合な設定を検出したため、LANサーバーの自動起動をスキップしました。設定画面でどちらかを無効にするか、閲覧公開を有効にしてください。"
+        );
+    }
+    let opened = opened.with_listen(if autostart {
+        EngineListen::BestEffort(ServerConfig {
+            bind: server_config.bind.clone(),
+            port: server_config.port,
+        })
+    } else {
+        EngineListen::Disabled
+    });
+
+    // 後半（`OpenedEngine::start`）: サービス・監査の保留の流し込み・
+    // 監査ログの剪定 → Hub（`attach_registry`）→ 収集（`attach_hub` は
+    // 自動開始より前）→ LAN の bind → Hub の張り直し・収集の自動開始・
+    // 保持期間の掃除（どれも spawn して投げっぱなし。失敗しても起動は
+    // 止めず、理由は状態に残る）→ LAN の serve → 監査の保留の定期の
+    // 流し込み。順序の理由は `chronogazer_core::engine` のモジュール doc。
+    // Hub の初期化（設定 DB が書けない）・保存設定の読み取りの失敗は `Err`
+    // （エンジンが Hub を止め pool を閉じてから返す）。
+    let engine = opened.start().await.map_err(LaunchError::Engine)?;
+    let services = engine.services().clone();
+
+    // M11 bootstrap: decide the webview's starting session (see
+    // [`initial_desktop_session`]). #392 B1-2: this now runs after the
+    // engine has started (Hub resume, collection autostart). Both are
+    // spawned and never awaited, and `AppState` (so every Tauri
+    // command) does not exist until below, so nothing observable
+    // changes.
+    let initial_auth = initial_desktop_session(&services, &auth_config).await;
+
+    app.manage(AppState {
+        auth: Mutex::new(AuthSlot::new(initial_auth)),
+        auth_io: AuthIo::production(&services.users, &services.settings),
+        auth_config_lock: AsyncMutex::new(()),
+        server: Arc::clone(engine.server_slot()),
+        services: services.clone(),
+    });
+    // 終了の後始末（[`exit_cleanup`]）がエンジンを止める。プロセスの
+    // 終わりまで drop されない（A1 の排他もそこまで持つ）。
+    app.manage(DesktopEngine(Arc::new(engine)));
+
+    // メインの窓は tauri.conf.json で `create: false` にしてあり、エンジンが
+    // 動いた後にだけここで作る（上の doc「順序」）。設定は tauri.conf.json の
+    // 定義をそのまま使う。
+    if let Err(err) = create_main_window(app) {
+        return Err(abandon_after_window_failure(app, err).await);
+    }
+    // #392 A2: × は終了ではなく隠す（収集は続く）。初回だけ通知する。
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        banto_desktop_tray::hide_to_tray_on_close(&window, tray::TRAY_HINT);
+    }
+
+    // M12: re-apply the persisted vibrancy (Windows Acrylic) choice
+    // on launch. Best-effort by design - a failure (old Windows 10
+    // build, missing window) must never block startup, so it is
+    // logged and otherwise ignored; the settings screen's
+    // `vibrancy_status`/`vibrancy_apply` remain the way to
+    // observe/repair the state.
+    #[cfg(target_os = "windows")]
+    {
+        let vibrancy_enabled = services
+            .settings
+            .get(KEY_DESKTOP_VIBRANCY)
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!("banto: vibrancy設定の読み取りに失敗しました: {err}");
+                None
+            })
+            .map(|value| value == "true")
+            .unwrap_or(false);
+        if vibrancy_enabled {
+            match app.get_webview_window(MAIN_WINDOW_LABEL) {
+                Some(window) => {
+                    if let Err(err) = set_window_vibrancy(&window, true) {
+                        eprintln!(
+                            "banto: 起動時のウィンドウAcrylic効果の適用に失敗しました: {err}"
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "banto: メインウィンドウが見つからないため、起動時のAcrylic効果の適用をスキップしました"
+                ),
+            }
+        }
+    }
+
+    // #392 A2: トレイ（収集の状態・開く・終了）。`AppState` を manage
+    // した後に作る（状態の表示と「終了」が `AppState` を読むため）。
+    if let Err(err) = install_tray(app) {
+        return Err(abandon_after_window_failure(app, err).await);
+    }
+
+    Ok(())
+}
+
+/// トレイを作る。デバッグビルドだけ、環境変数 `CHRONOGAZER_TEST_FAIL_TRAY` で失敗を
+/// 注入できる（#594 のレビュー P2 の実機確認用。リリースビルドには入らない）。
+fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CHRONOGAZER_TEST_FAIL_TRAY").is_some() {
+        return Err(tauri::Error::AssetNotFound(
+            "試験用に注入したトレイの作成の失敗".to_string(),
+        ));
+    }
+    tray::install(app)
+}
+
+/// エンジンが動いた後に画面（メインの窓・トレイ）を作れなかったときの片付け
+/// （#594 のレビュー P2）: 作りかけのメインの窓を破棄し、エンジンを終了処理で
+/// 止めてから戻る。呼び出し側は「終了」だけの窓を出す - その窓が最後の窓なので、
+/// 閉じればプロセスが終わる（メインの窓が残って × で隠れるだけになったり、トレイも
+/// 無いまま収集だけが動き続けたりしない）。エンジンの終了は `RunningEngine::shutdown`
+/// を直接待つ（`exit_cleanup` は条件変数で待つので非同期の文脈から呼ばない）。後で
+/// `RunEvent::Exit` の後始末がもう一度呼ぶが、止めるものが残っていないだけ
+/// （`shutdown` は何度呼んでもよい）。
+async fn abandon_after_window_failure(
+    app: &tauri::AppHandle,
+    err: tauri::Error,
+) -> startup::LaunchError {
+    eprintln!("banto: 画面を作れなかったため、収集を止めて終了の窓を出します: {err}");
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(destroy_err) = window.destroy() {
+            eprintln!("banto: メインの窓を破棄できませんでした: {destroy_err}");
+        }
+    }
+    let engine = app
+        .try_state::<DesktopEngine>()
+        .map(|engine| Arc::clone(&engine.0));
+    if let Some(engine) = engine {
+        let report = shutdown_app_state(&engine, EXIT_CLEANUP_BUDGET).await;
+        eprintln!("banto: 画面の作成の失敗による収集の停止: {report:?}");
+    }
+    startup::LaunchError::Window(err)
+}
+
 pub fn run() {
     tauri::Builder::default()
         // #392 A2: 2 つ目の起動は既存の窓を前に出し、2 つ目のプロセスは
@@ -4392,231 +4723,32 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(banto_desktop_tray::QuitGate::new())
         .manage(ExitOnce(ExitCleanupOnce::new()))
+        // #392: 起動に失敗したときの対処の窓の状態（[`startup`]）。
+        .manage(startup::RecoveryGate::default())
         .setup(|app| {
-            let data_dir = app.path().app_data_dir().expect("resolve app data dir");
-            std::fs::create_dir_all(&data_dir).expect("create app data dir");
-            let db_path = data_dir.join("chronogazer.sqlite3");
-
-            // #392 B1-2: 起動の組み立ては `chronogazer_core::engine`（`banto-serve` と
-            // 共有）。ここに残すのはデスクトップ固有の部分（窓・webview への
-            // イベントの転送・LAN の自動起動の判定・自動ログイン・Acrylic・
-            // トレイ・OS キーリング）だけ。
-            //
-            // 前半（`EngineRuntime::open`）: A1 の排他（#392 A1、**DB に触れる前**）→
-            // リストア予約の適用（Spec M17、pool を作る前。失敗しても起動は止めない）
-            // → `init_db`。A1 の排他はエンジンが持ち、プロセスの終わり（エンジンを
-            // 持つ管理状態はプロセス終了まで drop されない）まで返さない。
-            //
-            // 失敗のうち、利用者に窓で知らせるのは今までどおり 2 つ:
-            // - 同じ DB を別のプロセス（もう 1 つのデスクトップアプリや
-            //   `banto-serve`）が使っている（A1）。
-            // - 旧形式の DB（DB スキーマの整理 2026-10-02。自動移行は無い。何を
-            //   すればよいかは `InitDbError::Legacy` の文言、手順は
-            //   apps/chronogazer/README.md）。
-            // リリースビルドは `windows_subsystem = "windows"` で stderr が見えない
-            // ので、メインの画面の代わりにエラー専用の窓を開く
-            // （[`open_startup_error_window`]）。`AppState` は manage しない - 開くのは
-            // コマンドを呼ばない静的ページだけで、閉じると最後の窓なのでプロセスが
-            // 終わる（`RunEvent::Exit` の後始末は `try_state` で何もしない）。
-            // それ以外（DB を開けない）は今までどおり panic で止める。
-            let opened = match tauri::async_runtime::block_on(EngineRuntime::open(
-                EngineConfig {
-                    db_path: db_path.clone(),
-                    // `data.dir` の相対パスは**アプリのデータディレクトリ基準**
-                    // （既定 `"./data"` をプロセスの作業ディレクトリに作らない）。
-                    data_base: data_dir.clone(),
-                    // #332: Hub の API キーは OS キーリング。
-                    key_store: Arc::new(keyring_store::KeyringKeyStore),
-                    // #383 段階3 P3: Hub 経由の接続を収集で記録する。
-                    attach_hub: true,
-                    host: ChronoGazerHost::Desktop,
-                    // LAN の自動起動は DB を開けた後に設定から決める（下）。
-                    listen: EngineListen::Disabled,
-                    // 初回セットアップは `auth_setup` コマンド（`invoke()`）で行い、
-                    // LAN の `POST /api/auth/setup` は開けない（`banto-serve` だけ）。
-                    allow_setup: false,
-                    seed_viewer_public: false,
-                    log_label: "banto",
-                    audit_origin: "tauri",
-                    // 保存設定（`data.dir`）を読めなければ起動を止める（B1-1 より
-                    // 前からのデスクトップの扱い。既定値で続けると、別の場所を設定
-                    // していた利用者の時系列データを違う場所へ書き始める）。
-                    store_config_required: true,
-                },
+            let handle = app.handle().clone();
+            // #392（2026-10-12 オーナー決定）: 起動を止める失敗は panic せず、
+            // エラーの窓を出す（[`startup`] のモジュール doc）。データの置き場所を
+            // 決められない・作れないときは「終了」だけの窓。
+            let paths = match startup::LaunchPaths::resolve(&handle) {
+                Ok(paths) => paths,
+                Err(detail) => {
+                    startup::show_fatal(&handle, detail);
+                    return Ok(());
+                }
+            };
+            // 起動の本体（[`launch_desktop`]）。失敗は、既に起動中（A1）・旧形式の
+            // DB なら今までのエラーの窓、それ以外は対処を選ぶ窓
+            // （[`startup::show_failure`]）。どちらの窓もコマンドを呼ばない静的
+            // ページで、`AppState` は manage しない - 閉じると最後の窓なので
+            // プロセスが終わる（`RunEvent::Exit` の後始末は `try_state` で何もしない）。
+            if let Err(err) = tauri::async_runtime::block_on(launch_desktop(
+                &handle,
+                &paths,
+                startup::Prelude::None,
             )) {
-                Ok(opened) => opened,
-                Err(EngineStartError::InstanceLock(failure)) => {
-                    eprintln!("banto: {failure}");
-                    let notice = StartupErrorNotice::already_running(&failure);
-                    if let Err(err) = open_startup_error_window(app, &notice) {
-                        eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
-                        std::process::exit(1);
-                    }
-                    return Ok(());
-                }
-                Err(EngineStartError::Database(InitDbError::Legacy(legacy))) => {
-                    eprintln!("banto: {legacy}");
-                    if let Err(err) =
-                        open_startup_error_window(app, &StartupErrorNotice::new(&legacy))
-                    {
-                        eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
-                        std::process::exit(1);
-                    }
-                    return Ok(());
-                }
-                Err(EngineStartError::Database(err)) => panic!("init_db should succeed: {err}"),
-                Err(err) => panic!("engine open should succeed: {err}"),
-            };
-
-            // メインの窓は tauri.conf.json で `create: false` にしてあり、DB を
-            // 開けた後にだけここで作る（旧形式の DB のときに空の画面が先に
-            // 出ないように）。設定は tauri.conf.json の定義をそのまま使う。
-            create_main_window(app)?;
-            // #392 A2: × は終了ではなく隠す（収集は続く）。初回だけ通知する。
-            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                banto_desktop_tray::hide_to_tray_on_close(&window, tray::TRAY_HINT);
+                startup::show_failure(&handle, &paths, err);
             }
-
-            // Forward every resource-change/notice event onto the webview
-            // (spec §3.5's TauriEventProvider side: the webview has no
-            // network, so it cannot use the SSE endpoint a LAN browser
-            // client uses - `banto://event` is the in-process equivalent,
-            // fed by the SAME broadcast channel the REST server's SSE route
-            // fans out to browsers while running). Subscribed BEFORE
-            // `start()` so nothing the engine broadcasts while starting is
-            // missed.
-            let app_handle = app.handle().clone();
-            let mut events_rx = opened.events().subscribe();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match events_rx.recv().await {
-                        Ok(event) => {
-                            let _ = app_handle.emit("banto://event", event);
-                        }
-                        // A slow/absent listener fell behind: skip the gap
-                        // rather than tearing down the forwarding task.
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-
-            // If LAN access was left enabled on a previous run, start the
-            // server immediately (spec §11.4) - from here on, the settings
-            // screen only needs to *change* state via `server_apply`.
-            //
-            // Spec M11 exclusivity is enforced at write-time
-            // (`SettingsService::set_server_config`/`set_auth_config`), but a
-            // hand-edited settings DB could still leave both
-            // `auth.disabled` and `server.enabled` set to `true` at once
-            // without `server.viewer_public` (the one combination the guards
-            // refuse, `auth_server_combination_allowed`, banto #288) - if so,
-            // refuse to auto-start the (would-be unauthenticated) LAN server
-            // rather than trust a state the app itself would never have
-            // written, and leave the inconsistency for the user to resolve
-            // from the settings screen (this does NOT rewrite either
-            // setting). I2b: the decision is [`lan_autostart_allowed`].
-            //
-            // The bind is best-effort (`EngineListen::BestEffort`): the desktop
-            // app itself works fine with no LAN access, so a failure (e.g. the
-            // persisted port now being in use) only goes to the log; the
-            // settings screen's `server_status` reports `running: false` and
-            // the user can pick a different port via `server_apply`.
-            let settings = opened.settings();
-            let auth_config = tauri::async_runtime::block_on(settings.auth_config())
-                .expect("auth_config should succeed");
-            let server_config = tauri::async_runtime::block_on(settings.server_config())
-                .expect("server_config should succeed");
-            let autostart = lan_autostart_allowed(&auth_config, &server_config);
-            if server_config.enabled && !autostart {
-                eprintln!(
-                    "banto: 認証無効モードとLANアクセスが閲覧公開なしで同時に有効な不整合な設定を検出したため、LANサーバーの自動起動をスキップしました。設定画面でどちらかを無効にするか、閲覧公開を有効にしてください。"
-                );
-            }
-            let opened = opened.with_listen(if autostart {
-                EngineListen::BestEffort(ServerConfig {
-                    bind: server_config.bind.clone(),
-                    port: server_config.port,
-                })
-            } else {
-                EngineListen::Disabled
-            });
-
-            // 後半（`OpenedEngine::start`）: サービス・監査の保留の流し込み・
-            // 監査ログの剪定 → Hub（`attach_registry`）→ 収集（`attach_hub` は
-            // 自動開始より前）→ LAN の bind → Hub の張り直し・収集の自動開始・
-            // 保持期間の掃除（どれも spawn して投げっぱなし。失敗しても起動は
-            // 止めず、理由は状態に残る）→ LAN の serve → 監査の保留の定期の
-            // 流し込み。順序の理由は `chronogazer_core::engine` のモジュール doc。
-            // Hub の初期化（設定 DB が書けない）・保存設定の読み取りの失敗は、
-            // 今までどおり panic で止める。
-            let engine = match tauri::async_runtime::block_on(opened.start()) {
-                Ok(engine) => engine,
-                Err(EngineStartError::Hub(err)) => panic!("HubService should initialize: {err:?}"),
-                Err(EngineStartError::StoreConfig(err)) => {
-                    panic!("store_config should succeed: {err:?}")
-                }
-                Err(err) => panic!("engine start should succeed: {err}"),
-            };
-            let services = engine.services().clone();
-
-            // M11 bootstrap: decide the webview's starting session (see
-            // [`initial_desktop_session`]). #392 B1-2: this now runs after the
-            // engine has started (Hub resume, collection autostart). Both are
-            // spawned and never awaited, and `AppState` (so every Tauri
-            // command) does not exist until below, so nothing observable
-            // changes.
-            let initial_auth =
-                tauri::async_runtime::block_on(initial_desktop_session(&services, &auth_config));
-
-            // M12: re-apply the persisted vibrancy (Windows Acrylic) choice
-            // on launch. Best-effort by design - a failure (old Windows 10
-            // build, missing window) must never block startup, so it is
-            // logged and otherwise ignored; the settings screen's
-            // `vibrancy_status`/`vibrancy_apply` remain the way to
-            // observe/repair the state.
-            #[cfg(target_os = "windows")]
-            {
-                let vibrancy_enabled = tauri::async_runtime::block_on(
-                    services.settings.get(KEY_DESKTOP_VIBRANCY),
-                )
-                .unwrap_or_else(|err| {
-                    eprintln!("banto: vibrancy設定の読み取りに失敗しました: {err}");
-                    None
-                })
-                .map(|value| value == "true")
-                .unwrap_or(false);
-                if vibrancy_enabled {
-                    match app.get_webview_window("main") {
-                        Some(window) => {
-                            if let Err(err) = set_window_vibrancy(&window, true) {
-                                eprintln!(
-                                    "banto: 起動時のウィンドウAcrylic効果の適用に失敗しました: {err}"
-                                );
-                            }
-                        }
-                        None => eprintln!(
-                            "banto: メインウィンドウが見つからないため、起動時のAcrylic効果の適用をスキップしました"
-                        ),
-                    }
-                }
-            }
-
-            app.manage(AppState {
-                auth: Mutex::new(AuthSlot::new(initial_auth)),
-                auth_io: AuthIo::production(&services.users, &services.settings),
-                auth_config_lock: AsyncMutex::new(()),
-                server: Arc::clone(engine.server_slot()),
-                services,
-            });
-            // 終了の後始末（[`exit_cleanup`]）がエンジンを止める。プロセスの
-            // 終わりまで drop されない（A1 の排他もそこまで持つ）。
-            app.manage(DesktopEngine(Arc::new(engine)));
-
-            // #392 A2: トレイ（収集の状態・開く・終了）。`AppState` を manage
-            // した後に作る（状態の表示と「終了」が `AppState` を読むため）。
-            tray::install(app)?;
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -5052,6 +5184,7 @@ mod tests {
             log_label: "banto",
             audit_origin: "tauri",
             store_config_required: true,
+            store_dir_check_required: true,
         }
     }
 

@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="ja">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>ChronoGazer を起動できません</title>
+		<!--
+			起動に失敗したときに対処を選ぶ窓（#392、src-tauri/src/startup.rs）。
+			legacy-db.html と同じく SvelteKit のルートを経由しない静的ページで、
+			Tauri のコマンドは一切呼ばない（AppState は manage されていない）。
+			表示する内容は Rust 側が initialization_script で
+			window.__CHRONOGAZER_RECOVERY__ に入れ、描き直すときは
+			window.__chronogazerRecovery.render(...) を呼ぶ。選んだ対処は
+			/__recovery/<対処>?file=<バックアップ> へ移ろうとすることで Rust に
+			知らせる（Rust が on_navigation で受け取って移動を取り消す）。
+			文言はすべて textContent で入れる（パスなどが HTML として解釈されない）。
+		-->
+		<style>
+			:root {
+				color-scheme: light dark;
+				--bg: #ffffff;
+				--fg: #1f2328;
+				--muted: #59636e;
+				--accent: #b42318;
+				--code-bg: #f3f4f6;
+				--border: #d0d7de;
+				--button-bg: #f6f8fa;
+				--primary-bg: #0969da;
+				--primary-fg: #ffffff;
+				--danger-bg: #b42318;
+				--notice-bg: #fff1f0;
+			}
+			@media (prefers-color-scheme: dark) {
+				:root {
+					--bg: #1b1d21;
+					--fg: #e6e8eb;
+					--muted: #a3aab3;
+					--accent: #f97066;
+					--code-bg: #2a2d33;
+					--border: #3d434b;
+					--button-bg: #2a2d33;
+					--primary-bg: #2f81f7;
+					--primary-fg: #ffffff;
+					--danger-bg: #d1242f;
+					--notice-bg: #3a1d1d;
+				}
+			}
+			body {
+				margin: 0;
+				padding: 20px 24px;
+				background: var(--bg);
+				color: var(--fg);
+				font-family: 'Segoe UI', 'Yu Gothic UI', 'Meiryo', sans-serif;
+				font-size: 14px;
+				line-height: 1.6;
+			}
+			h1 {
+				margin: 0 0 12px;
+				font-size: 18px;
+				color: var(--accent);
+			}
+			h2 {
+				margin: 16px 0 8px;
+				font-size: 15px;
+			}
+			p {
+				margin: 0 0 10px;
+			}
+			code,
+			pre {
+				display: block;
+				padding: 8px 10px;
+				margin: 0 0 12px;
+				background: var(--code-bg);
+				border-radius: 4px;
+				word-break: break-all;
+				white-space: pre-wrap;
+				user-select: all;
+				font-family: Consolas, 'Cascadia Mono', monospace;
+				font-size: 13px;
+			}
+			.muted {
+				color: var(--muted);
+			}
+			.notice {
+				padding: 8px 10px;
+				margin: 0 0 12px;
+				border-left: 4px solid var(--accent);
+				background: var(--notice-bg);
+			}
+			.choice {
+				display: flex;
+				gap: 12px;
+				align-items: flex-start;
+				padding: 10px 0;
+				border-top: 1px solid var(--border);
+			}
+			.choice p {
+				margin: 0;
+			}
+			button {
+				flex: none;
+				min-width: 220px;
+				padding: 6px 14px;
+				border: 1px solid var(--border);
+				border-radius: 6px;
+				background: var(--button-bg);
+				color: var(--fg);
+				font: inherit;
+				cursor: pointer;
+				text-align: left;
+			}
+			button.primary {
+				background: var(--primary-bg);
+				border-color: var(--primary-bg);
+				color: var(--primary-fg);
+			}
+			button.danger {
+				background: var(--danger-bg);
+				border-color: var(--danger-bg);
+				color: var(--primary-fg);
+			}
+			button:disabled {
+				opacity: 0.5;
+				cursor: default;
+			}
+			.panel {
+				padding: 10px 12px;
+				margin: 8px 0 12px;
+				border: 1px solid var(--border);
+				border-radius: 6px;
+			}
+			.panel label {
+				display: block;
+				padding: 2px 0;
+			}
+			.actions {
+				display: flex;
+				gap: 8px;
+				margin-top: 10px;
+			}
+			.actions button {
+				min-width: 0;
+			}
+			[hidden] {
+				display: none !important;
+			}
+		</style>
+	</head>
+	<body>
+		<h1 id="title">ChronoGazer を起動できません</h1>
+		<p id="message"></p>
+		<div class="notice" id="notice" role="alert" hidden></div>
+		<p class="muted" id="busy" role="status" aria-live="polite" hidden>
+			処理しています…（終わるまでこの窓は閉じられません）
+		</p>
+
+		<div id="choices"></div>
+
+		<div class="panel" id="backup-panel" hidden>
+			<p>戻すバックアップを選んでください（新しい順）。</p>
+			<div id="backup-list"></div>
+			<p class="muted" id="backup-empty" hidden></p>
+			<div class="actions">
+				<button type="button" class="primary" id="backup-go" disabled></button>
+				<button type="button" id="backup-cancel">やめる</button>
+			</div>
+		</div>
+
+		<div
+			class="panel"
+			id="confirm-panel"
+			role="alertdialog"
+			aria-modal="true"
+			aria-labelledby="confirm-text"
+			aria-describedby="confirm-text"
+			hidden
+		>
+			<p id="confirm-text"></p>
+			<div class="actions">
+				<button
+					type="button"
+					class="danger"
+					id="confirm-go"
+					aria-describedby="confirm-text"
+				></button>
+				<button type="button" id="confirm-cancel">やめる</button>
+			</div>
+		</div>
+
+		<h2>詳しい理由</h2>
+		<pre id="detail"></pre>
+		<p class="muted" id="path-label" hidden>データベースのファイル:</p>
+		<code id="path" hidden></code>
+		<p class="muted" id="log-hint"></p>
+		<script>
+			(function () {
+				var current = null;
+				var busy = false;
+
+				function el(id) {
+					return document.getElementById(id);
+				}
+
+				function setBusy(value) {
+					busy = value;
+					el('busy').hidden = !value;
+					var buttons = document.querySelectorAll('button');
+					for (var i = 0; i < buttons.length; i++) {
+						buttons[i].disabled = value;
+					}
+					if (!value) {
+						updateBackupGo();
+					}
+				}
+
+				// 確認の表示中は、背後（確認の窓以外）を操作できなくする（inert）。
+				var opener = null;
+
+				function setBackgroundInert(value) {
+					var children = document.body.children;
+					for (var i = 0; i < children.length; i++) {
+						var node = children[i];
+						if (node.id === 'confirm-panel' || node.tagName === 'SCRIPT') {
+							continue;
+						}
+						node.inert = value;
+					}
+				}
+
+				function closePanels() {
+					el('backup-panel').hidden = true;
+					el('confirm-panel').hidden = true;
+					setBackgroundInert(false);
+					opener = null;
+				}
+
+				// 確認だけを閉じ（やめる）、押した起点のボタンへフォーカスを戻す。
+				function cancelConfirm() {
+					var target = opener;
+					el('confirm-panel').hidden = true;
+					setBackgroundInert(false);
+					opener = null;
+					if (target && !target.hidden && target.isConnected) {
+						target.focus();
+					}
+				}
+
+				// 選んだ対処を Rust に知らせる（on_navigation が受け取って取り消す）。
+				function send(id, file) {
+					closePanels();
+					setBusy(true);
+					var url = '/__recovery/' + encodeURIComponent(id);
+					if (file) {
+						url += '?file=' + encodeURIComponent(file);
+					}
+					window.location.href = url;
+				}
+
+				function confirmThen(choice, file) {
+					// 戻す先（バックアップの一覧の「戻す」か、選択肢のボタン）を覚えておく。
+					var from = document.activeElement;
+					el('confirm-panel').hidden = true;
+					if (!file) {
+						el('backup-panel').hidden = true;
+					}
+					var text = choice.confirm || '';
+					if (file) {
+						text = text.split('{file}').join(file);
+					}
+					el('confirm-text').textContent = text;
+					el('confirm-go').textContent = choice.confirmLabel || choice.label;
+					el('confirm-go').onclick = function () {
+						send(choice.id, file);
+					};
+					opener = from && from !== document.body ? from : null;
+					setBackgroundInert(true);
+					el('confirm-panel').hidden = false;
+					el('confirm-go').focus();
+				}
+
+				function selectedBackup() {
+					var picked = document.querySelector('input[name="backup"]:checked');
+					return picked ? picked.value : null;
+				}
+
+				function updateBackupGo() {
+					el('backup-go').disabled = busy || !selectedBackup();
+				}
+
+				function openBackups(choice) {
+					closePanels();
+					var list = el('backup-list');
+					list.textContent = '';
+					var backups = current.backups || [];
+					backups.forEach(function (backup, index) {
+						var label = document.createElement('label');
+						var input = document.createElement('input');
+						input.type = 'radio';
+						input.name = 'backup';
+						input.value = backup.fileName;
+						input.onchange = updateBackupGo;
+						if (index === 0) {
+							input.checked = true;
+						}
+						label.appendChild(input);
+						var size = Math.max(1, Math.round(backup.sizeBytes / 1024));
+						label.appendChild(
+							document.createTextNode(
+								' ' + backup.fileName + '（' + backup.createdAt + ' UTC、' + size + ' KB）'
+							)
+						);
+						list.appendChild(label);
+					});
+					var empty = el('backup-empty');
+					if (current.backupsError) {
+						empty.textContent = current.backupsError;
+						empty.hidden = false;
+					} else if (backups.length === 0) {
+						empty.textContent = 'バックアップがありません。新しく作り直すか、終了してください。';
+						empty.hidden = false;
+					} else {
+						empty.hidden = true;
+					}
+					el('backup-go').textContent = choice.confirmLabel || choice.label;
+					el('backup-go').onclick = function () {
+						var file = selectedBackup();
+						if (file) {
+							confirmThen(choice, file);
+						}
+					};
+					el('backup-panel').hidden = false;
+					updateBackupGo();
+				}
+
+				function onChoice(choice) {
+					if (busy) {
+						return;
+					}
+					if (choice.id === 'restoreBackup') {
+						openBackups(choice);
+					} else if (choice.confirm) {
+						confirmThen(choice, null);
+					} else {
+						send(choice.id, null);
+					}
+				}
+
+				function render(view) {
+					current = view;
+					document.title = view.title;
+					el('title').textContent = view.title;
+					el('message').textContent = view.message;
+					el('detail').textContent = view.detail;
+					el('path').textContent = view.path || '';
+					el('path').hidden = !view.path;
+					el('path-label').hidden = !view.path;
+					el('log-hint').textContent = view.logHint || '';
+					var notice = el('notice');
+					notice.textContent = view.notice || '';
+					notice.hidden = !view.notice;
+					var container = el('choices');
+					container.textContent = '';
+					(view.choices || []).forEach(function (choice, index) {
+						var row = document.createElement('div');
+						row.className = 'choice';
+						var button = document.createElement('button');
+						button.type = 'button';
+						button.id = 'choice-' + choice.id;
+						button.textContent = choice.label;
+						if (index === 0 && choice.id !== 'quit') {
+							button.className = 'primary';
+						}
+						button.onclick = function () {
+							onChoice(choice);
+						};
+						var description = document.createElement('p');
+						description.className = 'muted';
+						description.textContent = choice.description;
+						row.appendChild(button);
+						row.appendChild(description);
+						container.appendChild(row);
+					});
+					closePanels();
+					setBusy(false);
+				}
+
+				el('backup-cancel').onclick = closePanels;
+				el('confirm-cancel').onclick = cancelConfirm;
+				window.__chronogazerRecovery = { render: render };
+
+				var initial = window.__CHRONOGAZER_RECOVERY__;
+				if (initial) {
+					render(initial);
+				} else {
+					el('message').textContent =
+						'起動に失敗しました。詳しくは標準エラー出力を確認してください。';
+				}
+			})();
+		</script>
+	</body>
+</html>

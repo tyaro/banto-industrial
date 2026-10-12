@@ -94,28 +94,35 @@
 //! OS キーリング・Acrylic・イベントの webview への転送・単一インスタンスの
 //! プラグイン。これらはデスクトップのシェル（`src-tauri`）に残る。
 //!
-//! # デスクトップの呼び方（B1-2、2026-10-12 実装）
+//! # デスクトップの呼び方（B1-2、2026-10-12 実装。同日 #392 の起動時の対処で更新）
 //!
 //! ```text
-//! setup():
-//!   opened = block_on(EngineRuntime::open(cfg{ host: Desktop, key_store: Keyring,
-//!                                              attach_hub: true, listen: Disabled,
-//!                                              store_config_required: true, .. }))
-//!       Err(InstanceLock)            -> 「既に起動中」のエラーの窓
-//!       Err(Database(Legacy))        -> 「旧形式の DB」のエラーの窓
-//!       それ以外の Err               -> 今までどおり panic
-//!   create_main_window(); hide_to_tray_on_close()       // DB を開けた後・サービスの前
+//! setup() → launch_desktop(prelude なし)（対処の窓で対処を選んだ後も同じ関数でやり直す）:
+//!   opened = EngineRuntime::open(cfg{ host: Desktop, key_store: Keyring,
+//!                                     attach_hub: true, listen: Disabled,
+//!                                     store_config_required: true, .. })
+//!   prelude: 保存先の書き換え（startup_recovery::apply_store_dir、失敗は opened.close()）
+//!            または対処の監査の予約（opened.with_recovery_note）
 //!   events の webview への転送を opened.events() に張る   // start より前に購読する
-//!   LAN の自動起動の判定（lan_autostart_allowed）を opened.settings() で読み、
+//!   LAN の自動起動の判定（lan_autostart_allowed）を opened.settings() で読み
+//!     （読めなければ opened.close() して Err）、
 //!     opened.with_listen(EngineListen::BestEffort(cfg) または Disabled)
-//!   engine = block_on(opened.start())                  // Err(Hub / StoreConfig) は panic
+//!   engine = opened.start()
 //!   自動ログイン（engine.services() の users/audit を使う）
-//!   Acrylic、AppState { services: engine.services().clone(), server: engine.server_slot() }
-//!   エンジンを管理状態に置く（プロセスの終わりまで drop しない）、tray::install()
+//!   AppState { services: engine.services().clone(), server: engine.server_slot() }、
+//!   エンジンを管理状態に置く（プロセスの終わりまで drop しない）
+//!   create_main_window(); hide_to_tray_on_close(); Acrylic; tray::install()
+//! 失敗（すべて Err、panic しない）:
+//!   Err(InstanceLock) / Err(Database(Legacy)) -> 今までのエラーの窓
+//!   それ以外 -> 対処の窓（crate::startup_recovery の classify / plan）
 //! shutdown_app_state(): engine.shutdown(予算) → ExitCleanupReport へ写す
 //!   （トレイの終了と RunEvent::Exit で 1 回だけ。banto_desktop_tray::ExitCleanupOnce）
 //! server_apply: engine.server_slot().lock() を入れ替える
 //! ```
+//!
+//! メインの窓は B1-2 では `open` と `start` の間に作っていたが、#392 の起動時の
+//! 対処で `start` の後（`AppState` を manage した後）に移した（`start` の失敗で
+//! メインの画面を出してから対処の窓に切り替えないため）。
 //!
 //! B1-1 より前のデスクトップとの差（どれも観測できる挙動を変えないと判断した。
 //! 理由は docs/chronogazer-service-design.md §4 の B1-2 の実装メモ）:
@@ -160,7 +167,8 @@ use crate::events::event_channel;
 use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
-use crate::settings::{store_config, ServerSettings, SettingsService};
+use crate::settings::{data_dir_value_unreadable, store_config, ServerSettings, SettingsService};
+use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
 use crate::{CollectionGroupService, PlcConnectionService, TagService};
 
@@ -210,6 +218,16 @@ pub struct EngineConfig {
     /// 設定していると、既定値で続けたときに時系列データを**違う場所へ**書き始めて
     /// しまうため（デスクトップは B1-1 より前から、ここで起動を止めていた）。
     pub store_config_required: bool,
+    /// 起動時に、解決済みの保存先（`data.dir`）に書き込めるかを確かめ、書けなければ
+    /// 起動を止めるか（#392、2026-10-12 オーナー決定）。`true`（デスクトップ）は
+    /// Hub を止めて pool を閉じてから [`EngineStartError::StoreDirUnwritable`] を返す
+    /// （USB の取り外し・権限・ドライブが無いなどで、収集の開始で初めてエラーに
+    /// なるのを起動時の対処の窓に前倒しする）。確かめ方は
+    /// [`crate::startup_recovery::check_writable_dir`]（無ければフォルダを作る - 収集の
+    /// 開始も作るので同じ扱い - 一時ファイルを書いて消す。既存の中身には触れない）。
+    /// `false`（`banto-serve`）は今までどおり確かめない（開発・E2E 用。書けなければ
+    /// 収集の開始がエラーを状態に残す）。
+    pub store_dir_check_required: bool,
 }
 
 impl EngineConfig {
@@ -233,8 +251,16 @@ pub enum EngineStartError {
     /// `HubService::new`（`installation_id` の読み書き）の失敗。
     Hub(BantoError),
     /// 時系列データの保存設定を読めなかった（[`EngineConfig::store_config_required`]
-    /// のときだけ）。
-    StoreConfig(BantoError),
+    /// のときだけ）。`data_dir_unreadable` は、読めなかったのが保存先
+    /// （`data.dir`）そのものか（起動時の対処の窓の分類に使う。
+    /// [`crate::startup_recovery::classify`]）。
+    StoreConfig {
+        source: BantoError,
+        data_dir_unreadable: bool,
+    },
+    /// 解決済みの保存先に書き込めない（[`EngineConfig::store_dir_check_required`]
+    /// のときだけ）。`reason` は利用者向けの理由。
+    StoreDirUnwritable { dir: PathBuf, reason: String },
     /// [`EngineListen::Required`] の待ち受けを開けなかった。
     Listen {
         config: ServerConfig,
@@ -251,9 +277,13 @@ impl std::fmt::Display for EngineStartError {
             Self::Database(InitDbError::Legacy(legacy)) => legacy.fmt(f),
             Self::Database(err) => write!(f, "DB の初期化に失敗しました: {err}"),
             Self::Hub(err) => write!(f, "Hub 接続の初期化に失敗しました: {err}"),
-            Self::StoreConfig(err) => {
-                write!(f, "時系列データの保存設定の読み取りに失敗しました: {err}")
+            Self::StoreConfig { source, .. } => {
+                write!(
+                    f,
+                    "時系列データの保存設定の読み取りに失敗しました: {source}"
+                )
             }
+            Self::StoreDirUnwritable { reason, .. } => f.write_str(reason),
             Self::Listen { config, source } => write!(
                 f,
                 "待ち受け（{}:{}）を開始できませんでした: {source}",
@@ -268,7 +298,10 @@ impl std::error::Error for EngineStartError {
         match self {
             Self::InstanceLock(err) => Some(err),
             Self::Database(err) => Some(err),
-            Self::Hub(err) | Self::StoreConfig(err) | Self::Listen { source: err, .. } => Some(err),
+            Self::Hub(err)
+            | Self::StoreConfig { source: err, .. }
+            | Self::Listen { source: err, .. } => Some(err),
+            Self::StoreDirUnwritable { .. } => None,
         }
     }
 }
@@ -377,23 +410,59 @@ impl EngineRuntime {
     /// 起動の前半: A1 の排他 → リストア予約の適用 → `init_db`（モジュール doc の
     /// 1.〜3.）。排他を取れなければ DB には一切触れない。
     pub async fn open(cfg: EngineConfig) -> Result<OpenedEngine, EngineStartError> {
-        let label = cfg.log_label;
         let instance_lock =
             acquire_for_db(&cfg.db_path, cfg.host).map_err(EngineStartError::InstanceLock)?;
+        Self::open_locked(cfg, instance_lock, None).await
+    }
+
+    /// [`EngineRuntime::open`] と同じだが、起動時の対処が**先に取った** A1 の排他
+    /// （[`RecoveryLock`]）をそのまま引き継ぐ（取り直さない。復旧の変更から
+    /// エンジンまで排他が途切れない - #594 のオーナーレビュー P1）。対処の中で
+    /// 適用したリストアは `restore_applied` の監査に残る。`lock` の DB が `cfg` と
+    /// 違えば（呼び出し側の誤り）、`lock` を返して普通に排他を取る。
+    pub async fn open_with_recovery_lock(
+        cfg: EngineConfig,
+        lock: RecoveryLock,
+    ) -> Result<OpenedEngine, EngineStartError> {
+        if lock.db_path != cfg.db_path {
+            debug_assert_eq!(lock.db_path, cfg.db_path, "別の DB の排他");
+            drop(lock);
+            return Self::open(cfg).await;
+        }
+        let RecoveryLock {
+            guard,
+            applied_restore,
+            ..
+        } = lock;
+        Self::open_locked(cfg, guard, applied_restore).await
+    }
+
+    async fn open_locked(
+        cfg: EngineConfig,
+        instance_lock: InstanceGuard,
+        preapplied_restore: Option<AppliedRestoreInfo>,
+    ) -> Result<OpenedEngine, EngineStartError> {
+        let label = cfg.log_label;
 
         // Spec M17: リストア予約は pool を作る前に適用する
         // （`BackupService::apply_pending_restore_at_startup` の doc）。失敗しても
         // 起動は止めない（今の DB はそのまま残る）。I2a（banto #280）: 予約も
         // バックアップも `<DB の親>/backups/<DB ファイル名>/`。それより前の共有領域
         // に残ったファイルは警告だけ（2026-10-04 オーナー決定）。
-        let applied_restore =
-            match BackupService::apply_pending_restore_at_startup(&cfg.db_path).await {
+        // 起動時の対処で適用したリストアがあればそれ（そのときは予約は残っていない）。
+        // 通常の起動では、ここでの適用の失敗は今までどおり記録して続ける（今の DB は
+        // そのまま残る）。対処の窓の「バックアップから戻す」は適用を確かめてから
+        // ここへ来る（`startup_recovery::restore_from_backup`）。
+        let applied_restore = match preapplied_restore {
+            Some(applied) => Some(applied),
+            None => match BackupService::apply_pending_restore_at_startup(&cfg.db_path).await {
                 Ok(applied) => applied,
                 Err(err) => {
                     eprintln!("{label}: 起動時のリストア適用に失敗しました: {err}");
                     None
                 }
-            };
+            },
+        };
 
         // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は
         // 無い）。何をすればよいかは `InitDbError::Legacy` の文言にある。
@@ -406,6 +475,7 @@ impl EngineRuntime {
             instance_lock,
             pool,
             applied_restore,
+            recovery_note: None,
             events: event_channel(),
         })
     }
@@ -419,10 +489,32 @@ pub struct OpenedEngine {
     instance_lock: InstanceGuard,
     pool: DbPool,
     applied_restore: Option<AppliedRestoreInfo>,
+    /// 起動時の対処の窓で選ばれた対処（[`OpenedEngine::with_recovery_note`]）。
+    recovery_note: Option<RecoveryNote>,
     events: broadcast::Sender<ServerEvent>,
 }
 
 impl OpenedEngine {
+    /// 設定 DB のファイル。
+    pub fn db_path(&self) -> &Path {
+        &self.cfg.db_path
+    }
+
+    /// 起動時の対処の窓で選ばれた対処を、`start` で監査に残す
+    /// （`startup_recovery`。DB を開けない間は書けないので、開けた後に書く。
+    /// [`crate::startup_recovery`] のモジュール doc「監査」）。
+    pub fn with_recovery_note(mut self, note: RecoveryNote) -> Self {
+        self.recovery_note = Some(note);
+        self
+    }
+
+    /// `start` せずに閉じる: pool を閉じ（ファイルのハンドルを返す）、A1 の
+    /// 排他を返す。drop でも両方返るが、pool の接続は裏で閉じるので、続けて
+    /// DB のファイルを触る（名前を変える）前にはこちらを待つ。
+    pub async fn close(self) {
+        self.pool.close().await;
+        drop(self.instance_lock);
+    }
     /// 開いた pool（`start` の前に設定を読みたい host 用）。
     pub fn pool(&self) -> &DbPool {
         &self.pool
@@ -451,6 +543,7 @@ impl OpenedEngine {
             instance_lock,
             pool,
             applied_restore,
+            recovery_note,
             events,
         } = self;
         let label = cfg.log_label;
@@ -498,6 +591,16 @@ impl OpenedEngine {
                 "{label}: 起動時にリストアを適用しました（適用前の自動バックアップ: {}）",
                 applied.pre_restore_backup_file_name
             );
+        }
+        // 起動時の対処の窓で選ばれた対処（作り直し・バックアップからの戻し・
+        // 保存先の変更）。DB を開けない間は書けないので、開けた今記録する。
+        // 「もう一度確かめる」だけは何も変えない対処なので、`start` の失敗しうる処理
+        // （保存先の書き込み確認・listener の bind）がすべて済んだ後に記録する（下）。
+        // 失敗して窓へ戻る再試行に成功の行を残さない（#594 のオーナーレビュー P2）。
+        if let Some(note) = &recovery_note {
+            if note.choice != crate::startup_recovery::RecoveryChoice::RetryStoreCheck {
+                audit.record(note.audit_entry(cfg.audit_origin)).await;
+            }
         }
 
         // 起動時の剪定（spec M14「起動時に 1 回 + list 実行時に軽く」）。失敗しても
@@ -551,9 +654,15 @@ impl OpenedEngine {
         let store_settings = match store_config(&settings).await {
             Ok(store_settings) => store_settings,
             Err(err) if cfg.store_config_required => {
+                // 読めないのが保存先（`data.dir`）そのものかを、pool を閉じる前に
+                // 確かめる（起動時の対処の窓が「保存先を選び直す」を出すか決める）。
+                let data_dir_unreadable = data_dir_value_unreadable(&pool).await;
                 hub.shutdown().await;
                 pool.close().await;
-                return Err(EngineStartError::StoreConfig(err));
+                return Err(EngineStartError::StoreConfig {
+                    source: err,
+                    data_dir_unreadable,
+                });
             }
             Err(err) => {
                 eprintln!(
@@ -563,6 +672,17 @@ impl OpenedEngine {
             }
         };
         let collect_data_dir = resolve_data_dir(&cfg.data_base, &store_settings.data_dir);
+        // #392: 保存先に書き込めるか（`store_dir_check_required` のときだけ）。
+        if cfg.store_dir_check_required {
+            if let Err(err) = check_writable_dir(&collect_data_dir).await {
+                hub.shutdown().await;
+                pool.close().await;
+                return Err(EngineStartError::StoreDirUnwritable {
+                    dir: collect_data_dir,
+                    reason: err.0,
+                });
+            }
+        }
         let collect = CollectorService::new(pool.clone(), collect_data_dir);
         if cfg.attach_hub {
             // 自動開始（下）より前に繋ぐ。
@@ -630,6 +750,14 @@ impl OpenedEngine {
 
         // 10. 監査の保留の定期の流し込み（失敗しうる手順がすべて済んだ後）。
         let spool_flusher = services.audit.spawn_spool_flusher();
+        if let Some(note) = &recovery_note {
+            if note.choice == crate::startup_recovery::RecoveryChoice::RetryStoreCheck {
+                services
+                    .audit
+                    .record(note.audit_entry(cfg.audit_origin))
+                    .await;
+            }
+        }
 
         Ok(RunningEngine {
             services,
@@ -856,6 +984,7 @@ mod tests {
             log_label: "engine-test",
             audit_origin: "rest",
             store_config_required: false,
+            store_dir_check_required: false,
         }
     }
 
@@ -981,7 +1110,16 @@ mod tests {
             Ok(_) => panic!("保存設定を読めないのに起動した"),
             Err(err) => err,
         };
-        assert!(matches!(err, EngineStartError::StoreConfig(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                EngineStartError::StoreConfig {
+                    data_dir_unreadable: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(!dir.path().join("data").exists(), "収集の置き場を作った");
         drop(
             acquire_for_db(&db_path, ChronoGazerHost::Serve)

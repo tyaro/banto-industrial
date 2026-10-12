@@ -158,13 +158,26 @@ impl From<InitDbError> for BantoError {
 pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> {
     let path = path.as_ref();
     let pool = banto_storage::connect_sqlite(path).await?;
-    if is_legacy_schema(&pool).await? {
+    // 失敗して戻る経路では必ず pool を閉じてから返す（#392 の起動時の対処:
+    // 戻った直後に DB のファイルの名前を変えることがあり、Windows では開いた
+    // ままのハンドルが名前の変更を拒む）。
+    let legacy = match is_legacy_schema(&pool).await {
+        Ok(legacy) => legacy,
+        Err(err) => {
+            pool.close().await;
+            return Err(err.into());
+        }
+    };
+    if legacy {
         pool.close().await;
         return Err(InitDbError::Legacy(LegacyDatabase {
             path: path.to_path_buf(),
         }));
     }
-    run_migrations(&pool).await?;
+    if let Err(err) = run_migrations(&pool).await {
+        pool.close().await;
+        return Err(err.into());
+    }
     Ok(pool)
 }
 
