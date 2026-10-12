@@ -48,8 +48,9 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 # `test-util` enables tokio::time::pause for the virtual-time backoff tests;
-# `rt-multi-thread`/`macros` for #[tokio::test].
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+# `rt-multi-thread`/`macros` for #[tokio::test]; `net` for #588's unresponsive
+# PLC listener (`tests/integration.rs`).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util", "net"] }
 banto-storage = { workspace = true, features = ["sqlite"] }
 # T2-2 (docs/tag-server-design.md §6-5): collector.rs's client-factory
 # injection unit test needs a throwaway `data_dir` for `TsWriter::open` (no

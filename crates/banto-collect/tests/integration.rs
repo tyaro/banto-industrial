@@ -1582,6 +1582,125 @@ async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
     assert_eq!(count_events(&pool, "collection_stopped").await, 1);
 }
 
+/// #588: a TCP listener that accepts every connection and never answers -
+/// a PLC that stopped responding. Every accepted socket is kept open (and
+/// never read) for the listener task's life; returns its port.
+async fn unresponsive_plc() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an unresponsive PLC");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    (port, handle)
+}
+
+/// #588: start `n` Modbus connections against [`unresponsive_plc`] with the
+/// product's default timeouts (1 s response), let every task get into a read
+/// that will never be answered, and time `stop()`. Rows are only buffered
+/// (never flushed on interval or row count), so the per-group rows a
+/// post-stop reader sees prove `stop()`'s final flush ran; the returned
+/// count is how many of the `n` groups have at least one row.
+async fn time_stop_with_unresponsive_plcs(label: &str, n: usize) -> (Duration, usize, i64) {
+    let env = TempEnv::new(label);
+    let (port, listener) = unresponsive_plc().await;
+    let pool = open_registry(&env).await;
+    for i in 0..n {
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input(&format!("PLC{i}"), port))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input(&format!("G{i}"), conn.id, 100))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input(&format!("t{i}"), group.id, "40001", "i16"))
+            .await
+            .unwrap();
+    }
+    let config = build_config(&pool).await.unwrap();
+    let options = CollectorOptions {
+        writer_options: WriterOptions {
+            max_buffered_rows: 100_000,
+            flush_interval_ms: 3_600_000,
+        },
+        ..CollectorOptions::default()
+    };
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        options,
+    )
+    .await
+    .unwrap();
+    // Every connection connects (the listener accepts) and then waits on a
+    // read that never comes back; let several reads time out and restart so
+    // the tasks are spread over the 1 s response timeout, as in the field.
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            collector
+                .status()
+                .values()
+                .filter(|s| matches!(s, ConnectionStatus::Connected))
+                .count()
+                == n
+        })
+        .await,
+        "every connection should connect to the unresponsive listener"
+    );
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    let started = std::time::Instant::now();
+    collector.stop().await.unwrap();
+    let elapsed = started.elapsed();
+    listener.abort();
+
+    let mut groups_with_rows = 0;
+    for file in banto_tstore::list_data_files(&env.data_dir()).expect("list files") {
+        let reader = TsReader::open(&file.path).await.expect("open reader");
+        let keys: Vec<String> = reader.groups().iter().map(|g| g.key.clone()).collect();
+        for key in keys {
+            let rows = reader.read_range(&key, 0, i64::MAX).await.expect("read");
+            if !rows.is_empty() {
+                groups_with_rows += 1;
+            }
+        }
+    }
+    let stopped = count_events(&pool, "collection_stopped").await;
+    (elapsed, groups_with_rows, stopped)
+}
+
+/// **#588.** `stop()` with many connections whose PLC never answers must
+/// take about one response timeout, not one per connection: every task is
+/// signalled before the first join, so they all wind down at once. Before
+/// the fix (signal and join one at a time) 20 such connections took several
+/// seconds here and 4.7 s on real hardware (80 took 12.4 s) - past
+/// banto-hub's 5 s OS-shutdown budget and ChronoGazer's 5 s exit budget.
+/// The final flush and `collection_stopped` still happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_many_unresponsive_plcs_takes_about_one_timeout() {
+    let _serial = TEST_SERIAL.lock().await;
+    let (elapsed, groups_with_rows, stopped) =
+        time_stop_with_unresponsive_plcs("stop-unresponsive", 20).await;
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "stop() with 20 unresponsive PLCs took {elapsed:?} - the tasks were \
+         stopped one after another instead of together (#588)"
+    );
+    assert_eq!(
+        groups_with_rows, 20,
+        "every group's buffered rows must survive stop()'s final flush"
+    );
+    assert_eq!(stopped, 1, "collection_stopped must be recorded once");
+}
+
 // ---------------------------------------------------------------------------
 // collect_events persistence round-trip
 // ---------------------------------------------------------------------------
