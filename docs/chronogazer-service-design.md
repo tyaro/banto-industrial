@@ -1,8 +1,8 @@
 # ChronoGazer のサービス化（#392 段階 B）設計・計画
 
 作成日: 2026-10-12
-状態: **計画確定（2026-10-12 オーナー決定「おすすめで」）、未実装**。B1〜B3 の PR は一つも出ていない。順序は #588（収集の停止の並行化）を先に行い、その後 B1-1 から。
-最終更新: 2026-10-12（初版。調査の基準は main=970993e。論点 1〜14 のオーナー決定と H9 の決定（既存の `%APPDATA%` のデータは移行しない）を記録）
+状態: **計画確定（2026-10-12 オーナー決定「おすすめで」）、B1-1（engine 抽出）実装済み・B1-2 以降は未実装**。#588 は実装済み。B1-1 で `chronogazer_core::engine`（`EngineRuntime`）を新設し `banto-serve` を乗り換えた（デスクトップの乗り換えは B1-2）。
+最終更新: 2026-10-12（B1-1 を実装: §4 の表の後に実装メモ）。2026-10-12（初版。調査の基準は main=970993e。論点 1〜14 のオーナー決定と H9 の決定（既存の `%APPDATA%` のデータは移行しない）を記録）
 
 [plan.md](plan.md) §5 の #392（H6〜H11）の段階 B を、実装できる粒度に落とした計画書。R0 の「UI と独立」
 （[recorder-requirements.md](recorder-requirements.md) §4）を B で満たす。banto-hub 側の前例は
@@ -142,6 +142,13 @@
 | B3-3 elev と ACL                        | `chronogazer-elev.exe`、Operators、サービス ACL、データと secrets の ACL                                         | 実機で UAC、`sc sdshow`、非管理者の Operators で start/stop、Users に書き込み ACE なし、`secrets\` はインストール利用者以外の非管理者から読めない、**非昇格のインストール利用者で Desktop → Service → Desktop と切り替えても同じ Hub のキーを使い続けられる**（決定 4） |
 | B3-4 インストーラ                       | `apps/chronogazer/installer`、共通 nsh、`build-release.ps1`                                                      | 実機で新規・稼働中の上書き・アンインストール（ProgramData は残る）・再インストール                                                                                                                                                                                      |
 | B3-5 実機確認と docs                    | OS 再起動・サインアウト・シャットダウン・Hub と同居・24h → 72h soak                                              | R0 §4（72h で欠測ゼロ、メモリ増加なし）、結果を docs に                                                                                                                                                                                                                 |
+
+**B1-1 の実装メモ（2026-10-12、実装済み）**:
+
+- 起動は `EngineRuntime::open`（A1 の排他 → リストア予約の適用 → `init_db`）と `OpenedEngine::start`（サービス → Hub → 収集 → listener → 監査の定期の流し込み）の 2 段。デスクトップは今どおり DB を開けた後・サービスの前に窓を作るため、B1-2 では間で窓を作る。B1-2 の呼び方の見通しは `apps/chronogazer/core/src/engine.rs` のモジュール doc。
+- LAN の listener は **bind（ポートの確保）だけを自動開始より前**に行い、serve は後にした（§3.1(a) の順序からの変更）。`EngineListen::Required` で bind できなければ、収集・Hub の張り直し・保持期間の掃除を始めずに `Err` で戻る（失敗して戻る経路にタスクを残さない）。デスクトップの LAN の自動起動は `EngineListen::BestEffort`（失敗しても起動を続ける）。
+- 終了の予算は呼び出し側が渡す（デスクトップ 5 秒、`banto-serve` 15 秒）。済んだ手順は `ShutdownReport::completed` に順に残る。A1 の排他は `shutdown` では返さず、`RunningEngine` の drop で返す。
+- `banto-serve` の環境変数と既定値は不変。変わったのは終了の順序（Hub の購読の停止と pool を閉じる手順が加わった）と、起動の失敗（Hub の初期化・ポートの使用中）が panic ではなく終了コード 1 になったこと。
 
 ## 5. 論点と決定（2026-10-12 オーナー決定「おすすめで ok」= すべて推奨どおり）
 
