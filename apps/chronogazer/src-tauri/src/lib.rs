@@ -4448,8 +4448,9 @@ fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
 /// 失敗はすべて `Err`（panic しない）。`open` の後の失敗は pool と A1 の排他を
 /// 返してから戻る（`start` の失敗はエンジンが、それより前は
 /// `OpenedEngine::close` が返す）ので、同じプロセスでやり直せる。
-/// [`startup::LaunchError::Window`] だけはエンジンが動いたまま戻る
-/// （manage 済みなので、終了で `RunEvent::Exit` の後始末が止める）。
+/// [`startup::LaunchError::Window`]（エンジンが動いた後に画面を作れない）は、作りかけの
+/// メインの窓を破棄しエンジンを終了処理で止めてから戻る（[`abandon_after_window_failure`]、
+/// #594 のレビュー P2）。呼び出し側は「終了」だけの窓を出す。
 async fn launch_desktop(
     app: &tauri::AppHandle,
     paths: &startup::LaunchPaths,
@@ -4607,7 +4608,9 @@ async fn launch_desktop(
     // メインの窓は tauri.conf.json で `create: false` にしてあり、エンジンが
     // 動いた後にだけここで作る（上の doc「順序」）。設定は tauri.conf.json の
     // 定義をそのまま使う。
-    create_main_window(app).map_err(LaunchError::Window)?;
+    if let Err(err) = create_main_window(app) {
+        return Err(abandon_after_window_failure(app, err).await);
+    }
     // #392 A2: × は終了ではなく隠す（収集は続く）。初回だけ通知する。
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         banto_desktop_tray::hide_to_tray_on_close(&window, tray::TRAY_HINT);
@@ -4649,9 +4652,51 @@ async fn launch_desktop(
 
     // #392 A2: トレイ（収集の状態・開く・終了）。`AppState` を manage
     // した後に作る（状態の表示と「終了」が `AppState` を読むため）。
-    tray::install(app).map_err(LaunchError::Window)?;
+    if let Err(err) = install_tray(app) {
+        return Err(abandon_after_window_failure(app, err).await);
+    }
 
     Ok(())
+}
+
+/// トレイを作る。デバッグビルドだけ、環境変数 `CHRONOGAZER_TEST_FAIL_TRAY` で失敗を
+/// 注入できる（#594 のレビュー P2 の実機確認用。リリースビルドには入らない）。
+fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CHRONOGAZER_TEST_FAIL_TRAY").is_some() {
+        return Err(tauri::Error::AssetNotFound(
+            "試験用に注入したトレイの作成の失敗".to_string(),
+        ));
+    }
+    tray::install(app)
+}
+
+/// エンジンが動いた後に画面（メインの窓・トレイ）を作れなかったときの片付け
+/// （#594 のレビュー P2）: 作りかけのメインの窓を破棄し、エンジンを終了処理で
+/// 止めてから戻る。呼び出し側は「終了」だけの窓を出す - その窓が最後の窓なので、
+/// 閉じればプロセスが終わる（メインの窓が残って × で隠れるだけになったり、トレイも
+/// 無いまま収集だけが動き続けたりしない）。エンジンの終了は `RunningEngine::shutdown`
+/// を直接待つ（`exit_cleanup` は条件変数で待つので非同期の文脈から呼ばない）。後で
+/// `RunEvent::Exit` の後始末がもう一度呼ぶが、止めるものが残っていないだけ
+/// （`shutdown` は何度呼んでもよい）。
+async fn abandon_after_window_failure(
+    app: &tauri::AppHandle,
+    err: tauri::Error,
+) -> startup::LaunchError {
+    eprintln!("banto: 画面を作れなかったため、収集を止めて終了の窓を出します: {err}");
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(destroy_err) = window.destroy() {
+            eprintln!("banto: メインの窓を破棄できませんでした: {destroy_err}");
+        }
+    }
+    let engine = app
+        .try_state::<DesktopEngine>()
+        .map(|engine| Arc::clone(&engine.0));
+    if let Some(engine) = engine {
+        let report = shutdown_app_state(&engine, EXIT_CLEANUP_BUDGET).await;
+        eprintln!("banto: 画面の作成の失敗による収集の停止: {report:?}");
+    }
+    startup::LaunchError::Window(err)
 }
 
 pub fn run() {
