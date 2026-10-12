@@ -30,6 +30,10 @@
 //!   [`QuitGate::answer`] が、同意を受けたときに**印を立てて今の状態を読む**
 //!   のをこの口で行い、もう一度確かめるときは**必ず下ろす**（下の「終了の
 //!   確定と収集の開始の直列化」）。
+//! - [`ExitCleanupOnce`] — 終了の後始末（トレイの「終了」と `RunEvent::Exit`
+//!   = OS のサインアウト・シャットダウン）を**プロセスで 1 回だけ**走らせ、
+//!   2 つ目以降には**先行の完了を期限まで待たせる**入れ物（#586。中身は
+//!   `exit_once` module の doc）。後始末の中身はアプリが渡す。
 //!
 //! 持たないもの（アプリごとに中身が違う）:
 //!
@@ -87,6 +91,10 @@
 //! ダイアログ・通知の呼び出しそのものが共有したい中身なので、Tauri から
 //! 切り離すと何も残らない。判断の部分（[`QuitGate`]・[`claim_once_flag`]）
 //! だけは Tauri を起動せずにテストできる形に出してある。
+
+mod exit_once;
+
+pub use exit_once::{ExitCleanupOnce, ExitCleanupOutcome, ExitCleanupReport};
 
 use std::path::Path;
 use std::sync::Mutex;

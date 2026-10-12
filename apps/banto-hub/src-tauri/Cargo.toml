@@ -38,11 +38,6 @@ tauri-plugin-notification = "2"
 # この crate が使う `DialogExt`/`NotificationExt` の実体として、引き続き
 # `run()` で登録する。
 banto-desktop-tray = { path = "../../../crates/banto-desktop-tray" }
-# `RunningHub` を保持する `tokio::sync::Mutex`（AppState フィールド型を名指し
-# するためだけの依存 - chronogazer/src-tauri の `tokio` 依存と同じ理由。
-# `HubRuntime::start`/`RunningHub::shutdown` 自体は `tauri::async_runtime`
-# 経由で呼ぶため、実行そのものにはこの依存は要らない）。
-tokio = { workspace = true, features = ["sync"] }
 # Desktop↔Service 切替ウィザード（`host_switch_status`/`host_switch_progress`
 # invoke 面）の DTO・イベントペイロードのシリアライズ用。
 serde = { workspace = true }
