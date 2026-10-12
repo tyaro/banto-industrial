@@ -91,12 +91,12 @@
   run\endpoint.json   （port・pid・scope・version。シェルの probe 用。Users に読み取り可）
 ```
 
-- **H9: 既存の `%APPDATA%` は読まないし移さない**。初回起動で旧 DB が見つかったらログに 1 行案内するだけ（消さない）。
+- **H9: 既存の `%APPDATA%` は読まないし移さない**（消さない）。旧データの案内（決定 3）は **このエンジン（サービスでは LocalSystem で動き、利用者の `%APPDATA%` を指さない）ではなく、利用者として動くシェル（B2-4）が行う**（2026-10-12、#590 のレビュー）: シェルが対話ユーザーの `%APPDATA%\dev.tyaro.chronogazer\chronogazer.sqlite3` の存在を調べ、画面で 1 回だけ案内する。案内済みの印は**利用者ごと**（その利用者の `%LOCALAPPDATA%` 配下）に持つ。インストーラも、インストールした利用者の旧データを見つけたら完了画面で案内する。
 - `ChronoGazerHost` に `Server` と `Service` を追加。
 - 待ち受け: **loopback の listener は常に開く**（`127.0.0.1:<server.port>`）。`server.enabled` のときだけ LAN 用を足す（`0.0.0.0` なら 1 本にまとめる）。既定 port 8721（Hub の 8722 と衝突しない）。認証無効と LAN の不整合の判定はデスクトップと同じ。
 - `GET /api/host`（未認証、新設）: `{ product: "chronogazer", hostKind, version, scope }`。シェルの probe が別製品・別 DB・port 競合を見分ける。
 - KeyStore は常に `DpapiFileKeyStore`、`attach_hub` も常に。**`BANTO_HUB_MEMORY_KEYS` はこの bin では読まない**（`banto-serve` 専用のまま）。
-- 終了: Ctrl-C・Ctrl-Break・コンソールを閉じたとき（`SetConsoleCtrlHandler`）で `shutdown`（予算 15 秒）。
+- 終了: Ctrl-C・Ctrl-Break は `shutdown`（予算 15 秒）。**コンソールを閉じたとき（`CTRL_CLOSE_EVENT`）は Windows が待つ時間が約 5 秒しかない**ので別の経路・別の予算にし、OS の猶予内（例 4 秒）で最終 flush まで終える（2026-10-12、#590 のレビュー）。B1-5 の受入条件に「コンソールの × で閉じても `collection_stopped` と最後の行が残る」を実機で含める。
 - ログ: `logs\` に日付つきファイル、stderr も向け直す。保持日数は設定値（初期案 30 日）。
 
 **(c) `crates/banto-secret-store`（新設、H10）**: `Protector` trait、Windows 実装 `DpapiMachine`（`CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN`、`LocalFree`、平文は `zeroize`）、テスト用 `PlainProtector`。`FileSecretStore<P>`: 1 アカウント 1 ファイル（名前は `sha256(account)`）、中身はマジック `BSS1`・版数・アカウント・blob、entropy は `"banto-secret-store/v1:" + account`（ファイルを入れ替えても復号できない）、書き込みは一時ファイル → `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`、削除は「無ければ Ok」、プロセス内は `Mutex`。ディレクトリは継承しない保護された DACL（SYSTEM と Administrators が Full、**インストール利用者の SID に Modify**。決定 4 - 非昇格のデスクトップ host が同じキーを読み書きするため。Users や Operators 全体には付与しない）。作成・更新のたびにこの DACL を保つ（呼び出し側が指定したインストール利用者の SID を受け取る）。`impl KeyStore`、失敗は秘密を含めない。非 Windows は `UnsupportedPlatform` で fail closed。
@@ -118,7 +118,8 @@
 - 起動種別: 新規は OnDemand、UI／elev で「Windows 起動時に自動開始（遅延）」を ON。R0 §4 の 24/365 は自動起動 ON の運用で満たすと明記。
 - elev: `chronogazer-elev.exe`（requireAdministrator）の固定アクション: `setup-operators`、`grant-service-acl`、`grant-data-acl`、`service-install`、`service-uninstall`、`autostart-enable/disable`。
 - ACL: データのルートは SYSTEM・Administrators が Full、インストール利用者が Modify、Users なし。`secrets\` は継承を切り、SYSTEM・Administrators が Full、**インストール利用者の SID に Modify**（決定 4。Users・Operators 全体には付与しない）。
-- インストーラ: `apps/chronogazer/installer/`（hub と同じ xtask、NSIS、PerMachine、`+crt-static`）。同梱は `ChronoGazer.exe`（シェル）・`chronogazer-server.exe`・`chronogazer-elev.exe`。フックは H11 の順序（PREINSTALL: Running なら止めて記録、シェルを taskkill／POSTINSTALL: `elev service-install`、ProgramData と ACL、止めたものだけ再開／PREUNINSTALL: 登録解除、ProgramData は残す）。
+- インストーラ: `apps/chronogazer/installer/`（hub と同じ xtask、NSIS、PerMachine、`+crt-static`）。同梱は `ChronoGazer.exe`（シェル）・`chronogazer-server.exe`・`chronogazer-elev.exe`。フックは H11 の順序（PREINSTALL: Running なら止めて記録、シェルは**正常終了を頼んで後始末の完了を待つ**（下）／POSTINSTALL: `elev service-install`、ProgramData と ACL、止めたものだけ再開／PREUNINSTALL: 登録解除、ProgramData は残す）。
+- **インストーラによるシェルの停止**（2026-10-12、#590 のレビュー）: サービスが止まっている間はシェル自身が収集エンジンを持っている（デスクトップ host）ので、`taskkill /F` では `RunningEngine::shutdown` を通らず最終 flush と `collection_stopped` を失う。WM_CLOSE は A2 の close handler が窓を隠すだけでプロセスが残る。→ インストーラ専用の**正常終了の要求**（例: シェルの single-instance 経由の引数 `--quit-for-update`、またはシェルが持つ名前付きイベント）を送り、シェルは確認ダイアログを出さずに `exit_cleanup`（後始末を 1 回）を通して終了する。インストーラはプロセスの終了を上限（例 20 秒）まで待ち、**上限を超えたときだけ**「最後の数秒の記録が失われる可能性があります」と警告してから強制終了する。B3-4 の受入条件に「デスクトップ host で収集中に上書きインストール → `collection_stopped` と最後の行が残る」「応答しないシェルは警告の後に強制終了される」を実機で含める。
 - 実機確認: 新規・稼働中の上書き・アンインストールして再インストール、OS の再起動（OnDemand と自動起動）、サインアウトしても収集が続く、シャットダウンで最終 flush と `collection_stopped`、Hub と同居、**24h → 72h の soak**（サービスの working set、行の抜け、`null`）。
 
 ## 4. PR の分け方と受入条件
@@ -156,7 +157,7 @@
 8. **loopback grant の権限**: 未初期化の間は admin、初期化後は設定 `auth.local_grant` = off / viewer / editor / admin、**既定 off**。identity は合成の `local`。ロールの変更は当面「サービスの再起動で反映」。
 9. **サービスで LAN の公開設定を変えたとき**: その場で listener を入れ替える（`ServerSlot`）。loopback の listener は常時。
 10. **リストアの適用**: UI に「サービスを再起動して適用」（Operators のみ。それ以外は案内文）。
-11. **`data.dir` の制限**: サービス host ではデータのルート配下か、明示的に許可したドライブだけ。ネットワークドライブは LocalSystem から見えないことも案内。
+11. **`data.dir` の制限**（2026-10-12 #590 のレビューで書き換え、オーナー承認）: サービス host が書き込む先は、**ACL で保護したデータのルート配下と、管理者が登録した特定のディレクトリだけ**（ドライブ単位の許可はしない - ドライブ単位では LocalSystem による任意パスへの書き込みを制限できない）。判定はパス文字列ではなく、**開いたハンドルで行う**: 各要素を reparse point（ジャンクション・シンボリックリンク）を辿らずに開き（`FILE_FLAG_OPEN_REPARSE_POINT`）、reparse point があれば拒否し、`GetFinalPathNameByHandleW` で得た最終パスが許可ルートの配下であることを確かめ、そのハンドル（またはその配下）にだけ書く（確認と書き込みの間のすり替え＝TOCTOU を防ぐ）。登録できるのは管理者（elev 経由）だけで、登録先には SYSTEM・Administrators・インストール利用者だけの ACL を付ける。ネットワークドライブは LocalSystem から見えないことも案内。B3-3 の受入条件に「許可ルートの中にジャンクションを置いても外へ書けない」「登録していない場所・ドライブ直下は拒否」を含める。
 12. **Hub との同居**: インストーラは別々、SCM の依存関係は付けない（Hub が後から上がるのは resume で吸収）。同じ PC の Hub へ loopback で接続、キーは #332 の self-issue。
 13. **Hub の SHUTDOWN/PRESHUTDOWN の欠け**: 別 issue（#589）にし、B3-1 の共有ランナーで一緒に直す。
 14. **ファイアウォール**: インストーラは受信規則を作らない（LAN 公開は利用者の明示操作、案内だけ）。
