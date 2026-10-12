@@ -93,8 +93,12 @@ pub(crate) enum Prelude {
     None,
     /// DB を開けた後・`start` の前に保存先を書き換える。
     StoreDir(StoreDirChoice),
-    /// 対処は済んでいる（名前の変更・リストアの予約）。監査に残すだけ。
-    Note(RecoveryNote),
+    /// 対処は済んでいる（名前の変更・リストアの適用）。対処の**前に**取った A1 の
+    /// 排他をそのままエンジンへ引き継ぎ（#594 のオーナーレビュー P1）、監査に残す。
+    Recovered {
+        lock: recovery::RecoveryLock,
+        note: RecoveryNote,
+    },
 }
 
 /// [`crate::launch_desktop`] の失敗。
@@ -589,15 +593,15 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
         // 何も変えずにやり直す（保存先の試し書きもやり直す）。
         RecoveryChoice::RetryStoreCheck => Prelude::None,
         RecoveryChoice::RecreateDatabase => {
-            match recovery::set_aside_broken_db(&paths.db_path, &recovery::broken_stamp_now()).await
-            {
-                Ok(set_aside) => {
+            // 排他を取ってから退ける（取れなければ何も変えずに理由を返す）。
+            match recovery::recreate_database(&paths.db_path, &recovery::broken_stamp_now()).await {
+                Ok(recovery::Prepared { lock, set_aside }) => {
                     let mut note = RecoveryNote::new(RecoveryChoice::RecreateDatabase);
                     if let Some(name) = set_aside.broken_file_name() {
                         eprintln!("banto: 壊れた DB を {name} として残しました");
                         note = note.with("brokenFileName", name);
                     }
-                    Prelude::Note(note)
+                    Prelude::Recovered { lock, note }
                 }
                 Err(err) => {
                     rerender_with_notice(&app, Some(err.to_string())).await;
@@ -618,14 +622,16 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
             )
             .await
             {
-                Ok(set_aside) => {
+                // 排他を取ってから予約・退避・適用まで済ませ、適用を確かめてある
+                // （適用されなければ元に戻して Err）。
+                Ok(recovery::Prepared { lock, set_aside }) => {
                     let mut note = RecoveryNote::new(RecoveryChoice::RestoreBackup)
                         .with("backupFileName", file);
                     if let Some(name) = set_aside.broken_file_name() {
                         eprintln!("banto: 壊れた DB を {name} として残しました");
                         note = note.with("brokenFileName", name);
                     }
-                    Prelude::Note(note)
+                    Prelude::Recovered { lock, note }
                 }
                 Err(err) => {
                     rerender_with_notice(&app, Some(err.to_string())).await;

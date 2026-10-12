@@ -4457,26 +4457,42 @@ async fn launch_desktop(
 ) -> Result<(), startup::LaunchError> {
     use startup::{LaunchError, Prelude};
 
-    let opened = EngineRuntime::open(desktop_engine_config_for(paths))
-        .await
-        .map_err(LaunchError::Engine)?;
+    // 対処の後なら、対処の**前に**取った A1 の排他をそのまま引き継ぐ（取り直さない。
+    // #594 のオーナーレビュー P1）。
+    let cfg = desktop_engine_config_for(paths);
+    let mut store_dir = None;
+    let mut recovery_note = None;
     let opened = match prelude {
-        Prelude::None => opened,
-        Prelude::Note(note) => opened.with_recovery_note(note),
-        Prelude::StoreDir(choice) => match chronogazer_core::startup_recovery::apply_store_dir(
+        Prelude::None => EngineRuntime::open(cfg).await,
+        Prelude::StoreDir(choice) => {
+            store_dir = Some(choice);
+            EngineRuntime::open(cfg).await
+        }
+        Prelude::Recovered { lock, note } => {
+            recovery_note = Some(note);
+            EngineRuntime::open_with_recovery_lock(cfg, lock).await
+        }
+    }
+    .map_err(LaunchError::Engine)?;
+    let mut opened = match recovery_note {
+        Some(note) => opened.with_recovery_note(note),
+        None => opened,
+    };
+    if let Some(choice) = store_dir {
+        match chronogazer_core::startup_recovery::apply_store_dir(
             &opened.settings(),
             &paths.data_dir,
             &choice,
         )
         .await
         {
-            Ok(note) => opened.with_recovery_note(note),
+            Ok(note) => opened = opened.with_recovery_note(note),
             Err(err) => {
                 opened.close().await;
                 return Err(LaunchError::Recovery(err));
             }
-        },
-    };
+        }
+    }
 
     // Forward every resource-change/notice event onto the webview
     // (spec §3.5's TauriEventProvider side: the webview has no

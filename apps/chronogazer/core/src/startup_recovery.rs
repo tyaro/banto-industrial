@@ -55,9 +55,12 @@
 //!   （`crate::test_support` のモジュール doc）ので、名前の変更は短く再試行する。
 //! - **バックアップから戻す**（[`restore_from_backup`]）: 今のリストアと
 //!   **同じ仕組み・同じ安全策**（`BackupService::stage_restore_from_file` で
-//!   整合性検査と必須テーブルを確かめて予約 → 次の `EngineRuntime::open` の
-//!   `apply_pending_restore_at_startup` がもう一度検査して適用、
-//!   `restore_applied` の監査）。ただし予約の後に、壊れた DB を作り直しと同じ
+//!   整合性検査と必須テーブルを確かめて予約 → `apply_pending_restore_at_startup`
+//!   がもう一度検査して適用、`restore_applied` の監査）。適用は次の `open` に任せず
+//!   **対処の中で行い、適用されたことを確かめる**（#594 のレビュー P1: 通常の起動は
+//!   適用の失敗を記録して続けるので、退けた後の `init_db` が空の DB を作ってしまう）。
+//!   適用されなければ予約を取り消し、退けた DB を元の名前に戻して理由を返す。
+//!   予約の後に、壊れた DB を作り直しと同じ
 //!   形で `.broken-<日時>` へ退ける: リストアの適用は今の DB の本体だけを
 //!   `pre-restore-*` に写して `-wal`・`-shm` を消すので、壊れた DB の WAL に
 //!   残った記録を失いうるため（「消さない」）。退けられなければ予約を取り消す。
@@ -81,6 +84,14 @@
 //! 新しいプロセスが単一インスタンスのプラグイン・A1 の排他にぶつかりうること
 //! と、選んだ対処を新しいプロセスへ渡す経路が要ること。
 //!
+//! # A1 の排他（#594 のオーナーレビュー P1）
+//!
+//! 作り直す・戻すは、ファイルを変える**前に** [`lock_for_recovery`] でエンジンと同じ
+//! 排他を取り（取れなければ何も変えずに理由を返す）、[`RecoveryLock`] として
+//! `EngineRuntime::open_with_recovery_lock` へ途切れずに引き継ぐ。窓を出している間
+//! ずっとは持たない（その間は何も変えていないので不要で、持つと同じ DB を使う
+//! `banto-serve` などを利用者が確かめて止める対処の邪魔になる）。
+//!
 //! # 監査
 //!
 //! 選ばれた対処は、DB を開けた後の `OpenedEngine::start` が `startup_recovery`
@@ -94,10 +105,11 @@ use banto_core::BantoError;
 use serde::Serialize;
 
 use crate::audit::AuditEntry;
-use crate::backup::{BackupInfo, BackupService};
+use crate::backup::{AppliedRestoreInfo, BackupInfo, BackupService};
 use crate::collect::resolve_data_dir;
 use crate::db::{Db, InitDbError};
 use crate::engine::EngineStartError;
+use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard};
 use crate::settings::{default_data_dir, set_data_dir, SettingsService};
 
 /// 起動の失敗の分類（[`classify`]）。
@@ -362,7 +374,10 @@ const RENAME_RETRY: RetryPolicy = RetryPolicy {
 
 /// 壊れた DB を `<DB 名>.broken-<stamp>` へ名前を変えて残す（モジュール doc
 /// 「対処」）。DB が無ければ何もせずに `Ok`（`broken_db: None`）。
-pub async fn set_aside_broken_db(db_path: &Path, stamp: &str) -> Result<SetAside, RecoveryError> {
+pub(crate) async fn set_aside_broken_db(
+    db_path: &Path,
+    stamp: &str,
+) -> Result<SetAside, RecoveryError> {
     set_aside_with(db_path, stamp, RENAME_RETRY).await
 }
 
@@ -488,13 +503,106 @@ pub async fn list_backups(db_path: &Path) -> Result<Vec<BackupInfo>, BantoError>
     result
 }
 
-/// バックアップから戻す（モジュール doc「対処」）: 予約（検査つき）→ 壊れた DB を
-/// 退ける。適用は次の `EngineRuntime::open`。退けられなければ予約を取り消す。
+/// 復旧の操作（DB・付随ファイル・リストアの予約を変える）の間ずっと持つ A1 の排他
+/// （#594 のオーナーレビュー P1）。[`lock_for_recovery`] で**変更の前に**取り、
+/// `EngineRuntime::open_with_recovery_lock` へ途切れずに引き継ぐ（その後は
+/// エンジンが持つ）。
+pub struct RecoveryLock {
+    pub(crate) guard: InstanceGuard,
+    pub(crate) db_path: PathBuf,
+    /// 復旧の中で適用したリストア（`restore_applied` の監査に使う）。
+    pub(crate) applied_restore: Option<AppliedRestoreInfo>,
+}
+
+impl std::fmt::Debug for RecoveryLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryLock")
+            .field("db_path", &self.db_path)
+            .field("applied_restore", &self.applied_restore)
+            .finish()
+    }
+}
+
+/// 復旧の操作の前に、エンジンと同じ A1 の排他を取る。取れなければ（`banto-serve`
+/// や別の ChronoGazer が同じ DB を使用中）何も変えずに理由を返す。
+pub fn lock_for_recovery(db_path: &Path) -> Result<RecoveryLock, RecoveryError> {
+    let guard = acquire_for_db(db_path, ChronoGazerHost::Desktop).map_err(|failure| {
+        RecoveryError(format!(
+            "{failure}（対処は行っていません。ファイルは何も変えていません。）"
+        ))
+    })?;
+    Ok(RecoveryLock {
+        guard,
+        db_path: db_path.to_path_buf(),
+        applied_restore: None,
+    })
+}
+
+/// 排他を持ったまま済ませた対処（[`recreate_database`]・[`restore_from_backup`]）。
+#[derive(Debug)]
+pub struct Prepared {
+    /// `EngineRuntime::open_with_recovery_lock` へ渡す排他。
+    pub lock: RecoveryLock,
+    pub set_aside: SetAside,
+}
+
+/// 新しく作り直す: 排他を取ってから（取れなければ何も変えない）壊れた DB を退ける。
+pub async fn recreate_database(db_path: &Path, stamp: &str) -> Result<Prepared, RecoveryError> {
+    let lock = lock_for_recovery(db_path)?;
+    let set_aside = set_aside_broken_db(db_path, stamp).await?;
+    Ok(Prepared { lock, set_aside })
+}
+
+/// 退けたファイルを元の名前に戻す（逆順）。
+async fn undo_set_aside(set_aside: &SetAside) -> Result<(), RecoveryError> {
+    let mut failed = Vec::new();
+    for (orig, moved_to) in set_aside.moved.iter().rev() {
+        if let Err(err) = rename_with_retry(moved_to, orig, RENAME_RETRY).await {
+            failed.push(format!(
+                "{} → {}: {err}",
+                moved_to.display(),
+                orig.display()
+            ));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(RecoveryError(format!(
+            "退けたファイルを元の名前に戻せませんでした（消してはいません）: {}",
+            failed.join(", ")
+        )))
+    }
+}
+
+/// バックアップから戻す（モジュール doc「対処」）: 排他を取る → 予約（検査つき）→
+/// 壊れた DB を退ける → **ここで適用し、実際に適用されたことを確かめる**
+/// （#594 のレビュー P1: 適用に失敗したまま `init_db` が空の DB を作り、戻せたかの
+/// ように続けない）。適用されなければ予約を取り消し、退けた DB を元の名前に戻して
+/// 理由を返す（何も消さない）。適用は今のリストアと同じ
+/// `BackupService::apply_pending_restore_at_startup`。
 pub async fn restore_from_backup(
     db_path: &Path,
     backup_file_name: &str,
     stamp: &str,
-) -> Result<SetAside, RecoveryError> {
+) -> Result<Prepared, RecoveryError> {
+    restore_with(db_path, backup_file_name, stamp, |path| async move {
+        BackupService::apply_pending_restore_at_startup(&path).await
+    })
+    .await
+}
+
+async fn restore_with<F, Fut>(
+    db_path: &Path,
+    backup_file_name: &str,
+    stamp: &str,
+    apply: F,
+) -> Result<Prepared, RecoveryError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<AppliedRestoreInfo>, BantoError>>,
+{
+    let mut lock = lock_for_recovery(db_path)?;
     let pool = banto_storage::connect_sqlite_memory()
         .await
         .map_err(|err| RecoveryError(format!("リストアの準備に失敗しました: {err}")))?;
@@ -509,21 +617,52 @@ pub async fn restore_from_backup(
                     describe(&err)
                 ))
             })?;
-        match set_aside_broken_db(db_path, stamp).await {
-            Ok(set_aside) => Ok(set_aside),
+        let set_aside = match set_aside_broken_db(db_path, stamp).await {
+            Ok(set_aside) => set_aside,
             Err(err) => {
                 if let Err(cancel) = backup.cancel_pending_restore().await {
                     return Err(RecoveryError(format!(
                         "{err} また、リストアの予約を取り消せませんでした（次の起動で適用されます）: {cancel}"
                     )));
                 }
-                Err(err)
+                return Err(err);
+            }
+        };
+        let reason = match apply(db_path.to_path_buf()).await {
+            Ok(Some(applied)) => return Ok((set_aside, applied)),
+            Ok(None) => "予約したバックアップが検査に通らず、適用されませんでした".to_string(),
+            Err(err) => describe(&err),
+        };
+        // 適用されなかった: 予約を取り消し、退けた DB を元に戻す（空の DB で続けない）。
+        let mut message =
+            format!("バックアップ（{backup_file_name}）を適用できませんでした: {reason}。");
+        if let Err(cancel) = backup.cancel_pending_restore().await {
+            message.push_str(&format!(
+                " リストアの予約を取り消せませんでした（次の起動で適用されることがあります）: {cancel}。"
+            ));
+        }
+        if std::fs::symlink_metadata(db_path).is_ok() {
+            // 適用の途中で何かが元の名前に置かれた: 上書きしないよう戻さない。
+            message.push_str(&format!(
+                " 元のデータベースは {} に残しています（消していません）。",
+                set_aside
+                    .broken_file_name()
+                    .unwrap_or_else(|| "退けた名前".to_string())
+            ));
+        } else {
+            match undo_set_aside(&set_aside).await {
+                Ok(()) => message
+                    .push_str(" 元のデータベースは元の名前に戻しました（何も変えていません）。"),
+                Err(err) => message.push_str(&format!(" {err}")),
             }
         }
+        Err(RecoveryError(message))
     }
     .await;
     pool.close().await;
-    result
+    let (set_aside, applied) = result?;
+    lock.applied_restore = Some(applied);
+    Ok(Prepared { lock, set_aside })
 }
 
 /// 保存先の選び直し（[`apply_store_dir`]）。

@@ -168,7 +168,7 @@ use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
 use crate::settings::{read_data_dir, store_config, ServerSettings, SettingsService};
-use crate::startup_recovery::{check_writable_dir, RecoveryNote};
+use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
 use crate::{CollectionGroupService, PlcConnectionService, TagService};
 
@@ -410,23 +410,59 @@ impl EngineRuntime {
     /// 起動の前半: A1 の排他 → リストア予約の適用 → `init_db`（モジュール doc の
     /// 1.〜3.）。排他を取れなければ DB には一切触れない。
     pub async fn open(cfg: EngineConfig) -> Result<OpenedEngine, EngineStartError> {
-        let label = cfg.log_label;
         let instance_lock =
             acquire_for_db(&cfg.db_path, cfg.host).map_err(EngineStartError::InstanceLock)?;
+        Self::open_locked(cfg, instance_lock, None).await
+    }
+
+    /// [`EngineRuntime::open`] と同じだが、起動時の対処が**先に取った** A1 の排他
+    /// （[`RecoveryLock`]）をそのまま引き継ぐ（取り直さない。復旧の変更から
+    /// エンジンまで排他が途切れない - #594 のオーナーレビュー P1）。対処の中で
+    /// 適用したリストアは `restore_applied` の監査に残る。`lock` の DB が `cfg` と
+    /// 違えば（呼び出し側の誤り）、`lock` を返して普通に排他を取る。
+    pub async fn open_with_recovery_lock(
+        cfg: EngineConfig,
+        lock: RecoveryLock,
+    ) -> Result<OpenedEngine, EngineStartError> {
+        if lock.db_path != cfg.db_path {
+            debug_assert_eq!(lock.db_path, cfg.db_path, "別の DB の排他");
+            drop(lock);
+            return Self::open(cfg).await;
+        }
+        let RecoveryLock {
+            guard,
+            applied_restore,
+            ..
+        } = lock;
+        Self::open_locked(cfg, guard, applied_restore).await
+    }
+
+    async fn open_locked(
+        cfg: EngineConfig,
+        instance_lock: InstanceGuard,
+        preapplied_restore: Option<AppliedRestoreInfo>,
+    ) -> Result<OpenedEngine, EngineStartError> {
+        let label = cfg.log_label;
 
         // Spec M17: リストア予約は pool を作る前に適用する
         // （`BackupService::apply_pending_restore_at_startup` の doc）。失敗しても
         // 起動は止めない（今の DB はそのまま残る）。I2a（banto #280）: 予約も
         // バックアップも `<DB の親>/backups/<DB ファイル名>/`。それより前の共有領域
         // に残ったファイルは警告だけ（2026-10-04 オーナー決定）。
-        let applied_restore =
-            match BackupService::apply_pending_restore_at_startup(&cfg.db_path).await {
+        // 起動時の対処で適用したリストアがあればそれ（そのときは予約は残っていない）。
+        // 通常の起動では、ここでの適用の失敗は今までどおり記録して続ける（今の DB は
+        // そのまま残る）。対処の窓の「バックアップから戻す」は適用を確かめてから
+        // ここへ来る（`startup_recovery::restore_from_backup`）。
+        let applied_restore = match preapplied_restore {
+            Some(applied) => Some(applied),
+            None => match BackupService::apply_pending_restore_at_startup(&cfg.db_path).await {
                 Ok(applied) => applied,
                 Err(err) => {
                     eprintln!("{label}: 起動時のリストア適用に失敗しました: {err}");
                     None
                 }
-            };
+            },
+        };
 
         // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は
         // 無い）。何をすればよいかは `InitDbError::Legacy` の文言にある。

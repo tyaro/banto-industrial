@@ -270,7 +270,7 @@ async fn corrupt_db_is_classified_then_recreated_keeping_the_old_file() {
     assert_eq!(classify(&err), FailureKind::DatabaseCorrupt, "{err}");
     drop(acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("失敗の後は排他が返っている"));
 
-    let set_aside = set_aside_broken_db(&db_path, "20261012-153005")
+    let Prepared { lock, set_aside } = recreate_database(&db_path, "20261012-153005")
         .await
         .expect("名前を変える");
     let broken = dir
@@ -286,7 +286,9 @@ async fn corrupt_db_is_classified_then_recreated_keeping_the_old_file() {
 
     let note = RecoveryNote::new(RecoveryChoice::RecreateDatabase)
         .with("brokenFileName", set_aside.broken_file_name().unwrap());
-    let engine = EngineRuntime::open(config(dir.path()))
+    // 排他は対処からエンジンへ途切れずに引き継ぐ（その間に別のプロセスは取れない）。
+    assert!(acquire_for_db(&db_path, ChronoGazerHost::Serve).is_err());
+    let engine = EngineRuntime::open_with_recovery_lock(config(dir.path()), lock)
         .await
         .expect("新しい DB を開ける")
         .with_recovery_note(note)
@@ -435,16 +437,23 @@ async fn restore_from_backup_uses_the_restore_path_and_keeps_the_broken_db() {
         vec![backup.file_name.clone()]
     );
 
-    let set_aside = restore_from_backup(&db_path, &backup.file_name, "20261012-153005")
-        .await
-        .expect("戻す");
+    let Prepared { lock, set_aside } =
+        restore_from_backup(&db_path, &backup.file_name, "20261012-153005")
+            .await
+            .expect("戻す");
+    // 適用は対処の中で済んでいる（予約は残っていない）。
+    assert!(db_path.exists());
+    assert!(!dir
+        .path()
+        .join("backups/chronogazer.sqlite3/restore-pending.sqlite3")
+        .exists());
     let broken = set_aside.broken_db.clone().expect("壊れた DB を退けた");
     assert_eq!(std::fs::read(&broken).unwrap(), b"garbage".repeat(500));
 
     let note = RecoveryNote::new(RecoveryChoice::RestoreBackup)
         .with("backupFileName", backup.file_name.clone())
         .with("brokenFileName", set_aside.broken_file_name().unwrap());
-    let engine = EngineRuntime::open(config(dir.path()))
+    let engine = EngineRuntime::open_with_recovery_lock(config(dir.path()), lock)
         .await
         .expect("戻した DB を開ける")
         .with_recovery_note(note)
@@ -672,4 +681,109 @@ async fn unwritable_store_dir_stops_until_it_becomes_writable() {
     );
     assert!(blocked.is_dir());
     stop(engine).await;
+}
+
+/// ディレクトリの中身（相対パス → 中身）。何も変わっていないことを比べる。
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.strip_prefix(root).unwrap().display().to_string();
+            if path.is_dir() {
+                out.insert(name.clone(), Vec::new());
+                walk(root, &path, out);
+            } else if !name.ends_with(".instance.lock") {
+                // A1 の排他のファイル（中身は持ち主の診断）は比べない。
+                out.insert(name, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// #594 のオーナーレビュー P1: 同じ DB を別のプロセス（`banto-serve`）が使用中なら、
+/// 作り直す・バックアップから戻すは排他を取れずに理由を返し、DB・付随ファイル・
+/// リストアの予約が**一切変わらない**。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_does_nothing_while_another_process_holds_the_db() {
+    let dir = TempDir::new();
+    let engine = start(dir.path()).await;
+    let backup = engine
+        .services()
+        .backup
+        .create()
+        .await
+        .expect("バックアップ");
+    stop(engine).await;
+    let db_path = make_corrupt_db_keeping_backups(dir.path());
+    std::fs::write(dir.path().join("chronogazer.sqlite3-wal"), b"wal").unwrap();
+    let before = snapshot(dir.path());
+
+    let _serve = acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("banto-serve が使用中");
+    let err = recreate_database(&db_path, "20261012-153005")
+        .await
+        .expect_err("使用中の DB は作り直さない");
+    assert!(err.0.contains("使用中"), "{err}");
+    let err = restore_from_backup(&db_path, &backup.file_name, "20261012-153005")
+        .await
+        .expect_err("使用中の DB には戻さない");
+    assert!(err.0.contains("使用中"), "{err}");
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "使用中の DB のまわりのファイルが変わった"
+    );
+}
+
+/// 起動して閉じた DB を壊す（バックアップは残す）。
+fn make_corrupt_db_keeping_backups(dir: &Path) -> PathBuf {
+    let db_path = dir.join("chronogazer.sqlite3");
+    std::fs::write(
+        &db_path,
+        b"this is not a sqlite database at all".repeat(200),
+    )
+    .expect("DB を壊す");
+    db_path
+}
+
+/// #594 のレビュー P1（Codex）: 予約は検査を通ったが適用に失敗したら、空の DB で
+/// 続けずに理由を返し、予約を取り消して退けた DB を元の名前に戻す（何も消さない）。
+/// 排他も返る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_restore_apply_puts_everything_back() {
+    let dir = TempDir::new();
+    let engine = start(dir.path()).await;
+    let backup = engine
+        .services()
+        .backup
+        .create()
+        .await
+        .expect("バックアップ");
+    stop(engine).await;
+    let db_path = make_corrupt_db_keeping_backups(dir.path());
+    std::fs::write(dir.path().join("chronogazer.sqlite3-wal"), b"wal").unwrap();
+    let before = snapshot(dir.path());
+
+    // 適用の I/O エラー（最終の rename の失敗など）を注入する。
+    let err = restore_with(&db_path, &backup.file_name, "20261012-153005", |_| async {
+        Err(BantoError::Other("注入した適用の失敗".to_string()))
+    })
+    .await
+    .expect_err("適用できなければ失敗");
+    assert!(err.0.contains("適用できませんでした"), "{err}");
+    assert!(err.0.contains("注入した適用の失敗"), "{err}");
+    assert!(err.0.contains("元の名前に戻しました"), "{err}");
+    assert_eq!(snapshot(dir.path()), before, "元の状態に戻っていない");
+
+    // 適用されなかった（検査に通らなかった）場合も同じ。
+    let err = restore_with(&db_path, &backup.file_name, "20261012-153005", |_| async {
+        Ok(None)
+    })
+    .await
+    .expect_err("適用されなければ失敗");
+    assert!(err.0.contains("適用されませんでした"), "{err}");
+    assert_eq!(snapshot(dir.path()), before, "元の状態に戻っていない");
+    drop(acquire_for_db(&db_path, ChronoGazerHost::Serve).expect("失敗の後は排他が返っている"));
 }
