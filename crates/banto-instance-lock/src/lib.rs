@@ -291,24 +291,26 @@ pub fn process_is_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn process_is_alive_impl(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
     };
     // SAFETY: 返ったハンドルは下で必ず閉じる。
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
         if handle.is_null() {
             // 存在しない pid は ERROR_INVALID_PARAMETER。権限不足（SYSTEM 所有の
             // サービスを一般利用者が調べる等）は「生きている」側に倒す。
             return GetLastError() != ERROR_INVALID_PARAMETER;
         }
-        let mut code: u32 = 0;
-        let ok = GetExitCodeProcess(handle, &mut code);
+        // 終了済みでもハンドルが残っていれば開けるので、待機で見る。終了コードを
+        // STILL_ACTIVE（259）と比べる方法は、259 で終わったプロセスを永遠に
+        // 生きていると読むので使わない。
+        let wait = WaitForSingleObject(handle, 0);
         CloseHandle(handle);
-        // 終了済みでもハンドルが残っていれば開けるので、終了コードで見る。
-        ok == 0 || code == STILL_ACTIVE as u32
+        // 終了済み（シグナル状態）だけが死んでいる。タイムアウト・失敗は生きている側。
+        wait != WAIT_OBJECT_0
     }
 }
 
@@ -408,6 +410,21 @@ mod tests {
         let pid = child.id();
         child.wait().expect("wait");
         // wait 済み（ハンドルは Child がまだ持つので Windows でも終了コードで判定される）。
+        assert!(!process_is_alive(pid));
+    }
+
+    /// 終了コード 259（= STILL_ACTIVE と同じ値）で終わったプロセスも死んでいると
+    /// 判定する（#596 のレビュー）。
+    #[cfg(windows)]
+    #[test]
+    fn process_is_alive_is_false_for_a_child_that_exited_with_259() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 259"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let status = child.wait().expect("wait");
+        assert_eq!(status.code(), Some(259));
         assert!(!process_is_alive(pid));
     }
 
