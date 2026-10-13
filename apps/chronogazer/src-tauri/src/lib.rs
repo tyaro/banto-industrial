@@ -81,7 +81,7 @@ use chronogazer_core::rest::{
     PlcConnectionPayload, PlcConnectionResponse, TagPayload,
 };
 use chronogazer_core::settings::{
-    auth_server_combination_allowed, AuditSettings, AuthSettings, ServerSettings, SettingsService,
+    lan_autostart_allowed, AuditSettings, AuthSettings, ServerSettings, SettingsService,
 };
 use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
 use chronogazer_core::tag_address::{
@@ -1703,18 +1703,6 @@ fn build_status(
 /// `rest_auth` is in `services`, so tokens outlive a restart.
 fn serve_embedded(state: &AppState, bound: BoundServer) -> RunningServer {
     bound.serve(state.services.router(false))
-}
-
-/// Whether the LAN server may be auto-started on launch from the saved
-/// settings (I2b; admin-template v3.0.0 の `setup()` の判定を純関数に出した
-/// もの): LAN が有効で、認証モードとの組み合わせが banto の保存時の判定
-/// （[`auth_server_combination_allowed`]、banto #288）でも許されるとき。
-/// 「ログイン不要モード + LAN」は閲覧公開が ON のときだけ通る。手で書き換えた
-/// DB などで許されない組み合わせが残っていたら、ログイン無しの LAN サーバーを
-/// 信用して開けずに起動を見送る（どちらの設定も書き換えない）。
-fn lan_autostart_allowed(auth: &AuthSettings, server: &ServerSettings) -> bool {
-    server.enabled
-        && auth_server_combination_allowed(auth.disabled, server.enabled, server.viewer_public)
 }
 
 /// `GET`-ish command: current persisted settings + live running state (spec

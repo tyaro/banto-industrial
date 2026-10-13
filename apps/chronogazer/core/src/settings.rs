@@ -180,6 +180,19 @@ pub fn default_data_dir() -> &'static str {
     DEFAULT_DATA_DIR
 }
 
+/// 起動時に保存済みの設定から LAN の待ち受けを開いてよいか（I2b。admin-template
+/// v3.0.0 の `setup()` の判定を純関数に出したもの。#392 B1-5 でデスクトップ
+/// （`src-tauri`）から移し、`chronogazer-server` と共有する）: LAN が有効で、
+/// 認証モードとの組み合わせが banto の保存時の判定
+/// （[`auth_server_combination_allowed`]、banto #288）でも許されるとき。
+/// 「ログイン不要モード + LAN」は閲覧公開が ON のときだけ通る。手で書き換えた
+/// DB などで許されない組み合わせが残っていたら、ログイン無しの LAN サーバーを
+/// 信用して開けずに起動を見送る（どちらの設定も書き換えない）。
+pub fn lan_autostart_allowed(auth: &AuthSettings, server: &ServerSettings) -> bool {
+    server.enabled
+        && auth_server_combination_allowed(auth.disabled, server.enabled, server.viewer_public)
+}
+
 /// 収集ランタイムの保存設定を保存する。`None`（無制限）は `"0"` として
 /// 書き戻す - banto の `SettingsService::set_audit_config` と同じ約束。2 つの
 /// キーは 1 つのトランザクションで書く（[`SettingsService::set_many`]）。
