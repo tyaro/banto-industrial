@@ -28,7 +28,12 @@
 //!    開けない理由と対処、リストア予約の警告を日次ログに残す）。
 //! 5. リストア予約の適用 → DB の初期化（`LockedServer::open`）→ Hub のキーの保存先 →
 //!    エンジン（`OpenedServer::start`）。失敗は理由と対処をコンソールとログに出し、
-//!    終了コード 3 で終わる。対処は自動では行わない。
+//!    終了コード 3 で終わる。対処は自動では行わない。**理由・対処を出してログを
+//!    書き出し終えてから**起動の失敗を知らせる（起動中に閉じたウィンドウのハンドラーが
+//!    待っている。#598 監査 F1）。段の間（DB の初期化の前・エンジンの開始の前・開始の
+//!    後）で止める合図を見て、来ていれば起動を中止する（終了コード 3。開始の後なら
+//!    案内を出さずに後始末へ。#598 監査 F3）。段の途中（DB を開いている最中など）は
+//!    止めない。
 //! 6. 止める合図を待ち、後始末（`run\endpoint.json` を消す → エンジンの終了）を
 //!    `banto_exit_once::ExitCleanupOnce` で 1 回だけ行う。Ctrl-C・Ctrl-Break は
 //!    15 秒、コンソールのウィンドウを閉じた（`CTRL_CLOSE_EVENT`）・ログオフ・
@@ -165,8 +170,21 @@ enum Phase {
         server: Arc<StartedServer>,
         runtime: tokio::runtime::Handle,
     },
-    /// 起動に失敗した（後始末するものが無い）。
-    Failed,
+    /// 起動に失敗した・中止した（後始末するものが無い）。`code` は main が終わる
+    /// ときの終了コード（close 系のハンドラーも同じ値で終わる）。
+    Failed {
+        code: i32,
+    },
+}
+
+/// [`StopController::cleanup`] で後始末するエンジンが無い理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoEngine {
+    /// 起動に失敗した・起動を中止した（main が理由を出し、ログを書き出し終えている）。
+    StartFailed { code: i32 },
+    /// 予算の中で起動が終わらなかった（#598 監査 F8）。main はまだ起動の途中で、
+    /// 起動が終わったら [`StopController::set_ready`] がそれを知らせる。
+    StartAbandoned,
 }
 
 struct ControlState {
@@ -179,6 +197,9 @@ struct ControlState {
     /// main が終わりに入った（ログを書き出して `exit` する）。この後の close 系の
     /// ハンドラーは何もせずに待つ（main の書き出しを邪魔しない）。
     exiting: bool,
+    /// close 系のハンドラーが起動の終わりを待ちきれずに諦めた（#598 監査 F3・F8）。
+    /// main は起動が終わっても `Ready` にせず、すぐに止める（[`StopController::set_ready`]）。
+    start_abandoned: bool,
 }
 
 /// 止める合図と後始末の 1 回化（モジュール doc の 5.）。main のスレッドと、
@@ -248,6 +269,7 @@ impl StopController {
                 requested: None,
                 closing: 0,
                 exiting: false,
+                start_abandoned: false,
             }),
             changed: Condvar::new(),
             once: ExitCleanupOnce::new(),
@@ -291,6 +313,26 @@ impl StopController {
         self.changed.notify_all();
     }
 
+    /// 止める合図が既に来ているか（#598 監査 F3: main が起動の段の間で見て、起動を
+    /// 中止する）。
+    fn stop_requested(&self) -> Option<StopOrigin> {
+        self.lock().requested
+    }
+
+    /// 起動の成功を知らせる（`Ready`）。close 系のハンドラーが起動の終わりを待ちきれずに
+    /// 諦めていたら（[`NoEngine::StartAbandoned`]）`Ready` にせず `false`: そのハンドラーは
+    /// もう後始末をしないので、main がすぐに止める。判定と設定を 1 つの lock の中で行い、
+    /// 諦めと `Ready` の行き違いを作らない。
+    fn set_ready(&self, server: Arc<StartedServer>, runtime: tokio::runtime::Handle) -> bool {
+        let mut state = self.lock();
+        if state.start_abandoned {
+            return false;
+        }
+        state.phase = Phase::Ready { server, runtime };
+        self.changed.notify_all();
+        true
+    }
+
     /// close 系のハンドラーの始まり。main が既に終わりに入っていれば `false`。
     fn begin_close(&self) -> bool {
         let mut state = self.lock();
@@ -331,23 +373,25 @@ impl StopController {
 
     /// 後始末（`ExitCleanupOnce`。2 つ目以降の呼び出しは先行の完了を自分の予算まで
     /// 待つ）。エンジンがまだ起動中なら、起動の終わりを `budget` の中で待つ。
-    /// 後始末するものが無ければ（起動に失敗した・待ちきれない）`None`。
+    /// 後始末するものが無ければ（起動に失敗した・中止した・待ちきれない）`Err`。
+    /// 待ちきれなかったときは諦めた印を立てる（[`StopController::set_ready`]）。
     fn cleanup(
         &self,
         origin: StopOrigin,
         budget: Duration,
-    ) -> Option<ExitCleanupReport<ServerShutdownSummary, StopOrigin>> {
+    ) -> Result<ExitCleanupReport<ServerShutdownSummary, StopOrigin>, NoEngine> {
         let deadline = Instant::now() + budget;
         let (server, runtime) = {
             let mut state = self.lock();
             loop {
                 match &state.phase {
                     Phase::Ready { server, runtime } => break (server.clone(), runtime.clone()),
-                    Phase::Failed => return None,
+                    Phase::Failed { code } => return Err(NoEngine::StartFailed { code: *code }),
                     Phase::Starting => {
                         let now = Instant::now();
                         if now >= deadline {
-                            return None;
+                            state.start_abandoned = true;
+                            return Err(NoEngine::StartAbandoned);
                         }
                         state = self
                             .changed
@@ -359,7 +403,7 @@ impl StopController {
             }
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
-        Some(run_cleanup(
+        Ok(run_cleanup(
             &self.once,
             origin,
             remaining,
@@ -378,17 +422,27 @@ impl StopController {
     fn report(
         &self,
         origin: StopOrigin,
-        report: Option<ExitCleanupReport<ServerShutdownSummary, StopOrigin>>,
+        report: Result<ExitCleanupReport<ServerShutdownSummary, StopOrigin>, NoEngine>,
     ) -> i32 {
         match report {
-            None => {
+            // 理由と対処は main が出し、ログも書き出し終えている（`finish_start_failure`）。
+            Err(NoEngine::StartFailed { code }) => {
                 eprintln!(
-                    "{SERVER_LABEL}: 止めるエンジンがありません（{}）",
+                    "{SERVER_LABEL}: 起動に失敗した・中止したため、止めるエンジンはありません（{}）",
                     origin.label()
                 );
-                EXIT_START_FAILED
+                code
             }
-            Some(ExitCleanupReport::RanWork(outcome)) => match outcome {
+            // #598 監査 F8: 起動が予算の中で終わらなかった。最終の書き出しはしていない。
+            Err(NoEngine::StartAbandoned) => {
+                eprintln!(
+                    "{SERVER_LABEL}: 起動が終わる前に止める合図を受け、{}秒の中で起動が終わらなかったため、起動の途中のまま終わります（{}）",
+                    origin.budget().as_secs(),
+                    origin.label()
+                );
+                server_host::EXIT_SHUTDOWN_INCOMPLETE
+            }
+            Ok(ExitCleanupReport::RanWork(outcome)) => match outcome {
                 // 本体の結果はワーカーが公開の前に記録済み（`run_cleanup`）。
                 banto_exit_once::ExitCleanupOutcome::Finished(summary) => summary.exit_code(),
                 banto_exit_once::ExitCleanupOutcome::TimedOut => {
@@ -400,15 +454,15 @@ impl StopController {
                     server_host::EXIT_SHUTDOWN_INCOMPLETE
                 }
             },
-            Some(ExitCleanupReport::ReceivedPrior { result, .. }) => result.exit_code(),
-            Some(ExitCleanupReport::PriorExpired { origin: prior }) => {
+            Ok(ExitCleanupReport::ReceivedPrior { result, .. }) => result.exit_code(),
+            Ok(ExitCleanupReport::PriorExpired { origin: prior }) => {
                 eprintln!(
                     "{SERVER_LABEL}: 終了の後始末（{}で開始）が期限内に終わりませんでした。",
                     prior.label()
                 );
                 server_host::EXIT_SHUTDOWN_INCOMPLETE
             }
-            Some(ExitCleanupReport::OwnBudgetExpired { origin: prior }) => {
+            Ok(ExitCleanupReport::OwnBudgetExpired { origin: prior }) => {
                 eprintln!(
                     "{SERVER_LABEL}: 終了の後始末（{}で開始）を{}秒まで待ちましたが終わりませんでした（{}）。",
                     prior.label(),
@@ -479,10 +533,7 @@ fn run(options: CliOptions) -> i32 {
     // 作らない - ログもまだ開いていないので、理由はコンソールだけに出す）。
     let locked = match server_host::lock(layout.clone()) {
         Ok(locked) => locked,
-        Err(failure) => {
-            controller.set_phase(Phase::Failed);
-            return report_start_failure(&controller, &failure);
-        }
+        Err(failure) => return report_start_failure(&controller, &failure),
     };
 
     // 4. ログ（排他を取った後・リストア予約の適用と DB の初期化の前。#598 の
@@ -496,9 +547,7 @@ fn run(options: CliOptions) -> i32 {
             // 止める（Ctrl のハンドラーの登録の失敗と同じ扱い。#598 の Copilot の指摘）。
             // 理由はログファイルへ直接（`open_log` が書いた）とコンソールに出す。
             eprintln!("{SERVER_LABEL}: {reason}");
-            eprintln!("{SERVER_LABEL}: 終了します（終了コード {EXIT_START_FAILED}）");
-            controller.set_phase(Phase::Failed);
-            return EXIT_START_FAILED;
+            return finish_start_failure(&controller, EXIT_START_FAILED);
         }
     };
     controller.set_flush(flush);
@@ -525,13 +574,19 @@ fn run(options: CliOptions) -> i32 {
         None => println!("{SERVER_LABEL}: ログファイルには書きません（コンソールだけ）"),
     }
 
+    // 起動の段の間で止める合図を見る（#598 監査 F3）: 合図の後に DB の初期化・
+    // 待ち受け・収集の開始・`endpoint.json` まで進めない。段の途中（DB を開いている
+    // 最中など）は止めない（DB の操作を途中で落とさない。checklist §5）。
+    if let Some(origin) = controller.stop_requested() {
+        return abort_start(&controller, origin);
+    }
+
     // 5. リストア予約の適用 → DB の初期化（失敗はログにも残る）。
+    #[cfg(debug_assertions)]
+    test_slow_open(&controller);
     let opened = match runtime.block_on(locked.open()) {
         Ok(opened) => opened,
-        Err(failure) => {
-            controller.set_phase(Phase::Failed);
-            return report_start_failure(&controller, &failure);
-        }
+        Err(failure) => return report_start_failure(&controller, &failure),
     };
 
     // 6. Hub のキーの保存先（排他を取った後）とエンジン。
@@ -542,23 +597,43 @@ fn run(options: CliOptions) -> i32 {
             layout.hub_keys_dir().display()
         );
     }
+    if let Some(origin) = controller.stop_requested() {
+        runtime.block_on(opened.close());
+        return abort_start(&controller, origin);
+    }
     let server = match runtime.block_on(opened.start(key_store)) {
         Ok(server) => Arc::new(server),
-        Err(failure) => {
-            controller.set_phase(Phase::Failed);
-            return report_start_failure(&controller, &failure);
-        }
+        Err(failure) => return report_start_failure(&controller, &failure),
     };
     if let Some(log) = &log {
         if let Ok(mut log) = log.lock() {
             log.set_retention(server.log_retention_days());
         }
     }
-    runtime.block_on(announce(&server));
-    controller.set_phase(Phase::Ready {
-        server: server.clone(),
-        runtime: runtime.handle().clone(),
-    });
+    // 起動の最中に合図が来ていたら、待ち受けの案内を出さずにすぐ後始末へ進む
+    // （Ctrl-C なら下の `wait_request` がすぐ返り、close 系なら待っているハンドラーが
+    // 後始末する）。
+    if controller.stop_requested().is_none() {
+        runtime.block_on(announce(&server));
+    }
+    if !controller.set_ready(server.clone(), runtime.handle().clone()) {
+        // close 系のハンドラーが起動の終わりを待ちきれずに諦め、プロセスを終わらせ
+        // ようとしている（#598 監査 F3・F8）。後始末する者がいないので、終わるまでの
+        // 間に `endpoint.json` を消し、収集を止めにいく（間に合うとは限らない。既知の
+        // 制限）。ハンドラーが走っていればプロセスの終わりはハンドラーに任せる。
+        eprintln!("{SERVER_LABEL}: 起動の途中で閉じられた後に起動が終わったため、すぐに止めます");
+        let summary = runtime.block_on(server.shutdown(CLOSE_MARGIN));
+        if !controller.claim_exit() {
+            loop {
+                std::thread::park();
+            }
+        }
+        controller.flush(Duration::from_millis(500));
+        std::mem::forget(runtime);
+        return summary
+            .exit_code()
+            .max(server_host::EXIT_SHUTDOWN_INCOMPLETE);
+    }
 
     // 7. 止める合図を待って後始末。
     let origin = controller.wait_request();
@@ -597,10 +672,55 @@ fn report_start_failure(controller: &StopController, failure: &server_host::Star
     for line in &failure.guidance {
         eprintln!("{SERVER_LABEL}:   {line}");
     }
-    let code = failure.exit_code();
+    finish_start_failure(controller, failure.exit_code())
+}
+
+/// 起動の途中で止める合図を受けた（#598 監査 F3）: 起動を中止して終了コード 3。
+fn abort_start(controller: &StopController, origin: StopOrigin) -> i32 {
+    eprintln!(
+        "{SERVER_LABEL}: 起動の途中で停止の合図（{}）を受けたため、起動を中止します",
+        origin.label()
+    );
+    finish_start_failure(controller, EXIT_START_FAILED)
+}
+
+/// 起動の失敗・中止の終わり: 終了の行を出し、**ログを書き出し終えてから**、起動に
+/// 失敗したこと（`Phase::Failed`）を知らせる（#598 のオーナーレビュー P2・監査 F1）。
+/// 起動中に閉じたウィンドウのハンドラーが起動の終わりを待っていると、`Failed` の
+/// 通知で起き、ログを閉じて戻る（プロセスが終わる）ので、先に知らせると理由と対処が
+/// 日次ログに残らない。通知はここだけで行い、各分岐で順序を誤らないようにする。
+fn finish_start_failure(controller: &StopController, code: i32) -> i32 {
     eprintln!("{SERVER_LABEL}: 終了します（終了コード {code}）");
     controller.flush(Duration::from_secs(2));
+    controller.set_phase(Phase::Failed { code });
     code
+}
+
+/// デバッグビルドだけ: 環境変数 `CHRONOGAZER_TEST_SLOW_OPEN_MS` があれば、DB を開く
+/// 前に、止める合図が来るか、その ms が過ぎるまで待つ（起動の途中の停止の統合テスト
+/// 用。待ちに入ったことを 1 行出すので、テストはそれを見てから合図を送る）。
+#[cfg(debug_assertions)]
+fn test_slow_open(controller: &StopController) {
+    let Some(ms) = std::env::var("CHRONOGAZER_TEST_SLOW_OPEN_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    eprintln!("{SERVER_LABEL}: テスト用に DB を開く前で待ちます（CHRONOGAZER_TEST_SLOW_OPEN_MS）");
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let mut state = controller.lock();
+    while state.requested.is_none() {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        state = controller
+            .changed
+            .wait_timeout(state, deadline - now)
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
+    }
 }
 
 async fn announce(server: &StartedServer) {
@@ -898,20 +1018,101 @@ mod tests {
     fn cleanup_waits_for_the_start_within_its_budget() {
         let controller = Arc::new(StopController::new());
         let started = Instant::now();
-        assert!(controller
-            .cleanup(StopOrigin::Close, Duration::from_millis(200))
-            .is_none());
+        assert!(matches!(
+            controller.cleanup(StopOrigin::Close, Duration::from_millis(200)),
+            Err(NoEngine::StartAbandoned)
+        ));
         assert!(started.elapsed() >= Duration::from_millis(200));
 
+        let controller = Arc::new(StopController::new());
         let waiter = {
             let controller = controller.clone();
             std::thread::spawn(move || {
                 controller.cleanup(StopOrigin::Close, Duration::from_secs(10))
             })
         };
-        std::thread::sleep(Duration::from_millis(50));
-        controller.set_phase(Phase::Failed);
-        assert!(waiter.join().unwrap().is_none());
+        controller.set_phase(Phase::Failed { code: 2 });
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NoEngine::StartFailed { code: 2 })
+        ));
+    }
+
+    /// #598 監査 F8: close 系のハンドラーが起動の終わりを待ちきれずに諦めたら、後から
+    /// 起動が終わっても `Ready` にしない（main がすぐ止める）。諦めていなければ `Ready`。
+    #[test]
+    fn a_start_abandoned_by_the_close_handler_is_not_published_as_ready() {
+        let controller = StopController::new();
+        assert!(controller
+            .cleanup(StopOrigin::Close, Duration::ZERO)
+            .is_err_and(|reason| reason == NoEngine::StartAbandoned));
+        assert!(controller.lock().start_abandoned);
+        // 起動に失敗したことを知らされた待ちは「諦め」ではない。
+        let controller = StopController::new();
+        controller.set_phase(Phase::Failed { code: 3 });
+        assert!(controller
+            .cleanup(StopOrigin::Close, Duration::ZERO)
+            .is_err_and(|reason| reason == NoEngine::StartFailed { code: 3 }));
+        assert!(!controller.lock().start_abandoned);
+        assert_eq!(
+            controller.report(StopOrigin::Close, Err(NoEngine::StartAbandoned)),
+            server_host::EXIT_SHUTDOWN_INCOMPLETE
+        );
+        assert_eq!(
+            controller.report(StopOrigin::Close, Err(NoEngine::StartFailed { code: 2 })),
+            2,
+            "起動の失敗の終了コード（A1 の 2）を close 系のハンドラーも使う"
+        );
+    }
+
+    /// #598 監査 F3: 合図は記録した時点で main から見える（起動の段の間で中止する）。
+    #[test]
+    fn a_stop_request_is_visible_to_the_starting_main() {
+        let controller = StopController::new();
+        assert_eq!(controller.stop_requested(), None);
+        controller.request(StopOrigin::Interrupt);
+        assert_eq!(controller.stop_requested(), Some(StopOrigin::Interrupt));
+        controller.request(StopOrigin::Close);
+        assert_eq!(controller.stop_requested(), Some(StopOrigin::Interrupt));
+    }
+
+    /// #598 のオーナーレビュー P2・監査 F1: 起動の失敗は、理由・対処・終了の行を出して
+    /// ログを書き出し終えてから `Failed` を知らせる。起動の終わりを待っている close 系の
+    /// ハンドラー（`cleanup`）が戻った時点で、書き出しは終わっている。
+    #[test]
+    fn a_start_failure_is_flushed_before_the_waiting_close_handler_wakes() {
+        let controller = Arc::new(StopController::new());
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let flushed = flushed.clone();
+            controller.set_flush(Box::new(move |_wait| {
+                std::thread::sleep(Duration::from_millis(100));
+                flushed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let controller = controller.clone();
+            let flushed = flushed.clone();
+            std::thread::spawn(move || {
+                let _ = entered_tx.send(());
+                let result = controller.cleanup(StopOrigin::Close, Duration::from_secs(10));
+                (result, flushed.load(std::sync::atomic::Ordering::SeqCst))
+            })
+        };
+        entered_rx.recv().unwrap();
+        let failure = server_host::StartFailure {
+            kind: chronogazer_core::startup_recovery::FailureKind::Other,
+            message: "テスト".to_string(),
+            guidance: Vec::new(),
+        };
+        assert_eq!(report_start_failure(&controller, &failure), 3);
+        let (result, flushed_when_woken) = waiter.join().unwrap();
+        assert!(matches!(result, Err(NoEngine::StartFailed { code: 3 })));
+        assert!(
+            flushed_when_woken,
+            "ログの書き出しの前に close 系のハンドラーが起きた"
+        );
     }
 
     /// 合図は最初のものが残り、待っている main を起こす。

@@ -42,6 +42,8 @@ use chronogazer_core::settings::SettingsService;
 const WAIT_LIMIT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(100);
 const ADMIN_PASSWORD: &str = "admin-pass-1";
+/// OS がコンソールの close でプロセスを終わらせたときの終了コード。
+const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
 
 // --- 足場 ---------------------------------------------------------------------
 
@@ -707,6 +709,114 @@ async fn a_broken_db_failure_is_written_to_the_daily_log() {
         assert!(log.contains(expected), "{expected} がログに無い:\n{log}");
     }
     sandbox.assert_profile_untouched();
+}
+
+/// 起動の途中（DB を開く前）で止まって待つ bin を起動する（デバッグビルドだけの
+/// `CHRONOGAZER_TEST_SLOW_OPEN_MS`。合図が来るまで、上限まで待つ）。待ちに入った
+/// 印が出力に出るまで待ってから返す（合図はその後に送るので、時間に依存しない）。
+async fn spawn_paused_before_open(sandbox: &Sandbox) -> Server {
+    let server = Server::spawn_with_env(
+        sandbox,
+        sandbox.root.to_str().unwrap(),
+        &[("CHRONOGAZER_TEST_SLOW_OPEN_MS", "60000")],
+    );
+    wait_for("DB を開く前の待ち", async || {
+        sandbox
+            .output_text()
+            .contains("テスト用に DB を開く前で待ちます")
+            .then_some(())
+    })
+    .await;
+    server
+}
+
+/// 止めた後の DB のイベントの種類（新しい順）。
+async fn event_kinds(sandbox: &Sandbox) -> Vec<String> {
+    let layout = sandbox.layout();
+    let pool = init_db(layout.db_path()).await.expect("開き直す");
+    let reader = CollectorService::new(pool.clone(), layout.data_dir());
+    let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
+        Readout::Ready { data } => data.rows,
+        other => panic!("イベントが読めない: {}", other.as_str()),
+    };
+    pool.close().await;
+    rows.into_iter().map(|row| row.kind).collect()
+}
+
+/// #598 監査 F1: 起動の失敗（壊れた DB）の最中にコンソールのウィンドウを閉じても、
+/// 理由と対処が日次ログに残る（起動の終わりを待つハンドラーは、main がログを
+/// 書き出し終えてから起きる）。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_failure_while_closing_is_still_written_to_the_daily_log() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(&sandbox.root).unwrap();
+    std::fs::write(sandbox.layout().db_path(), vec![0x5a_u8; 8192]).unwrap();
+    let mut server = spawn_paused_before_open(&sandbox).await;
+    server.send("close");
+    let status = server.wait_exit().await;
+    assert!(
+        matches!(status.code(), Some(3) | Some(STATUS_CONTROL_C_EXIT)),
+        "{status:?}: {}",
+        sandbox.output_text()
+    );
+    let log = log_text(&sandbox);
+    for expected in [
+        "起動できませんでした",
+        "作り直す",
+        "終了します（終了コード 3）",
+    ] {
+        assert!(log.contains(expected), "{expected} がログに無い:\n{log}");
+    }
+    sandbox.assert_profile_untouched();
+}
+
+/// #598 監査 F3: 起動の途中（DB を開いている最中）に止める合図が来たら、待ち受け・
+/// 収集の開始・`endpoint.json` まで進めずに起動を中止する（終了コード 3）。
+async fn a_stop_during_the_start_aborts_it(stop_line: &str) {
+    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sandbox = Sandbox::new();
+    prepare_root(&sandbox, Some(sim.addr().port()), false).await;
+    let mut server = spawn_paused_before_open(&sandbox).await;
+    server.send(stop_line);
+    let status = server.wait_exit().await;
+    let output = sandbox.output_text();
+    if stop_line == "close" {
+        assert!(
+            matches!(status.code(), Some(3) | Some(STATUS_CONTROL_C_EXIT)),
+            "{status:?}: {output}"
+        );
+    } else {
+        assert_eq!(status.code(), Some(3), "{output}");
+    }
+    assert!(output.contains("起動を中止します"), "{output}");
+    assert!(
+        !sandbox.layout().endpoint_file().exists(),
+        "endpoint.json を書いた"
+    );
+    let kinds = event_kinds(&sandbox).await;
+    assert!(
+        !kinds.iter().any(|kind| kind == "collection_started"),
+        "収集を始めた: {kinds:?}"
+    );
+    #[cfg(windows)]
+    {
+        let log = log_text(&sandbox);
+        assert!(log.contains("起動を中止します"), "{log}");
+    }
+    sandbox.assert_profile_untouched();
+    drop(sim);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_during_the_start_aborts_it() {
+    a_stop_during_the_start_aborts_it("ctrl-c").await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_during_the_start_aborts_it() {
+    a_stop_during_the_start_aborts_it("close").await;
 }
 
 /// #598 のオーナーレビュー P2: リストア予約の適用の警告（ここでは壊れた予約ファイル。
