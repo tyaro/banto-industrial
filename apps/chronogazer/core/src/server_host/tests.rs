@@ -274,7 +274,9 @@ fn just_before_midnight_jst() -> i64 {
 }
 
 /// 日付が変わると次のファイルへ移り、各行に時刻が付く。保持日数を設定するまでは
-/// 消さず、設定すると自分の形の古いファイルだけ消す。
+/// 消さず、設定すると自分の形の古いファイルだけ消す。削除は `ServerLog` の中では
+/// 行わず、`LogPrune` として返す（返すだけでは何も消えない。#598 の Copilot の指摘:
+/// ログの `Mutex` を持ったまま上限の無い削除をしない）。
 #[test]
 fn server_log_rotates_by_local_date_and_prunes_only_after_retention_is_known() {
     let dir = TempDir::new();
@@ -293,10 +295,10 @@ fn server_log_rotates_by_local_date_and_prunes_only_after_retention_is_known() {
         log.current_path(),
         logs.join("chronogazer-server-2026-10-13.log")
     );
-    log.write_line("一行目");
+    assert_eq!(log.write_line("一行目"), None);
     // まだ保持日数を知らないので消さない（日付が変わっても）。
     clock.advance_ms(4_000);
-    log.write_line("二行目");
+    assert_eq!(log.write_line("二行目"), None);
     assert!(old.exists(), "保持日数を読む前に消した");
     assert_eq!(
         log.current_path(),
@@ -309,7 +311,11 @@ fn server_log_rotates_by_local_date_and_prunes_only_after_retention_is_known() {
     let second = std::fs::read_to_string(logs.join("chronogazer-server-2026-10-14.log")).unwrap();
     assert_eq!(second, "[2026-10-14 00:00:02] 二行目\n");
 
-    log.set_retention(Some(30));
+    let prune = log
+        .set_retention(Some(30))
+        .expect("保持日数があれば削除を返す");
+    assert!(old.exists(), "ServerLog の中で消した");
+    prune.run();
     assert!(!old.exists(), "古い自分のログが残った");
     assert!(
         foreign.exists() && other.exists(),
@@ -320,16 +326,20 @@ fn server_log_rotates_by_local_date_and_prunes_only_after_retention_is_known() {
     // 無制限（None）なら、日付が変わっても消さない。
     let older = logs.join("chronogazer-server-2025-06-01.log");
     std::fs::write(&older, "x").unwrap();
-    log.set_retention(None);
+    assert_eq!(log.set_retention(None), None);
     clock.advance_ms(DAY_MS);
-    log.write_line("三行目");
+    assert_eq!(log.write_line("三行目"), None);
     assert!(older.exists());
-    // 保持日数ありで日付が変わると、そのときに消す。
-    log.set_retention(Some(600));
+    // 保持日数ありで日付が変わると、そのときの削除を返す。
+    log.set_retention(Some(600)).expect("削除").run();
     assert!(older.exists(), "600 日以内のものを消した");
     log.retention_days = Some(30);
     clock.advance_ms(DAY_MS);
-    log.write_line("四行目");
+    let prune = log
+        .write_line("四行目")
+        .expect("日付の切り替えで削除を返す");
+    assert!(older.exists(), "ServerLog の中で消した");
+    prune.run();
     assert!(!older.exists(), "日付の切り替えで消えなかった");
 }
 

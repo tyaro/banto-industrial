@@ -33,7 +33,10 @@
 //!    待っている。#598 監査 F1）。段の間（DB の初期化の前・エンジンの開始の前・開始の
 //!    後）で止める合図を見て、来ていれば起動を中止する（終了コード 3。開始の後なら
 //!    案内を出さずに後始末へ。#598 監査 F3）。段の途中（DB を開いている最中など）は
-//!    止めない。
+//!    止めない。開始の後は、上限の無い処理（ログの古いファイルの削除・待ち受けの
+//!    案内）より**先に**動いていることを公開する（close 系のハンドラーが起動の
+//!    終わりを待ちきれずに後始末を飛ばさないため。削除はログのロックの外・別の
+//!    スレッド。#598 の Copilot の指摘）。
 //! 6. 止める合図を待ち、後始末（`run\endpoint.json` を消す → エンジンの終了）を
 //!    `banto_exit_once::ExitCleanupOnce` で 1 回だけ行う。Ctrl-C・Ctrl-Break は
 //!    15 秒、コンソールのウィンドウを閉じた（`CTRL_CLOSE_EVENT`）・ログオフ・
@@ -614,17 +617,17 @@ fn run(options: CliOptions) -> i32 {
         Ok(server) => Arc::new(server),
         Err(failure) => return report_start_failure(&controller, &failure),
     };
-    if let Some(log) = &log {
-        if let Ok(mut log) = log.lock() {
-            log.set_retention(server.log_retention_days());
-        }
-    }
-    // 起動の最中に合図が来ていたら、待ち受けの案内を出さずにすぐ後始末へ進む
-    // （Ctrl-C なら下の `wait_request` がすぐ返り、close 系なら待っているハンドラーが
-    // 後始末する）。
-    if controller.stop_requested().is_none() {
-        runtime.block_on(announce(&server));
-    }
+    // 収集と待ち受けを始めた後は、上限の無い処理（ログの古いファイルの削除、
+    // ログへ流れる案内の出力）より**先に**動いていることを公開する（`set_ready`。
+    // #598 の Copilot の指摘）。公開の前に長引くと、起動の終わりを待つ close 系の
+    // ハンドラーが 4 秒の予算で諦め（`StartAbandoned`）、`server.shutdown` を呼ばずに
+    // 最終の書き出しと `collection_stopped` を飛ばす。ここで取るログのロックは
+    // 保持日数を書き込むだけ（ファイルシステムに触れない）。
+    let log_prune = log.as_ref().and_then(|log| {
+        log.lock()
+            .ok()
+            .and_then(|mut log| log.set_retention(server.log_retention_days()))
+    });
     if !controller.set_ready(server.clone(), runtime.handle().clone()) {
         // close 系のハンドラーが起動の終わりを待ちきれずに諦め、プロセスを終わらせ
         // ようとしている（#598 監査 F3・F8）。後始末する者がいないので、終わるまでの
@@ -642,6 +645,17 @@ fn run(options: CliOptions) -> i32 {
         return summary
             .exit_code()
             .max(server_host::EXIT_SHUTDOWN_INCOMPLETE);
+    }
+    // 古いログの削除はログのロックの外・別のスレッドで（終了の最後の行の記録と
+    // 書き出しを待たせない。終了はこの削除を待たない）。
+    if let Some(prune) = log_prune {
+        spawn_log_prune(prune);
+    }
+    // 起動の最中に合図が来ていたら、待ち受けの案内を出さない（Ctrl-C なら下の
+    // `wait_request` がすぐ返り、close 系なら待っていたハンドラーが既に後始末して
+    // いる）。案内は公開の後なので、出力が詰まっても終了を待たせない。
+    if controller.stop_requested().is_none() {
+        runtime.block_on(announce(&server));
     }
 
     // 7. 止める合図を待って後始末。
@@ -735,6 +749,31 @@ fn test_slow_open(controller: &StopController) {
     }
 }
 
+/// 古いログファイルの削除を別のスレッドで走らせる（ログのロックを手放した後に
+/// 呼ぶ。`server_host` のモジュール doc「ログ」）。デバッグビルドだけ、環境変数
+/// `CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS` があれば、削除の前にその ms だけ待つ
+/// （起動後の削除が長引いている最中の終了の統合テスト用。待ちに入ったことを 1 行
+/// 出すので、テストはそれを見てから合図を送る）。
+fn spawn_log_prune(prune: server_host::LogPrune) {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let _ = std::thread::Builder::new()
+            .name("chronogazer-log-prune".to_string())
+            .spawn(move || {
+                eprintln!(
+                    "{SERVER_LABEL}: テスト用にログの古いファイルの削除の前で待ちます（CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS）"
+                );
+                std::thread::sleep(Duration::from_millis(ms));
+                prune.run();
+            });
+        return;
+    }
+    prune.spawn();
+}
+
 async fn announce(server: &StartedServer) {
     let engine = server.engine();
     if let Some(addr) = engine.loopback_addr().await {
@@ -818,7 +857,8 @@ fn open_log(layout: &DataLayout) -> Result<OpenedLog, String> {
                 "標準出力・標準エラー出力をログへ向け直せませんでした。日次ログに診断が残らないため、起動しません: {err}"
             );
             if let Ok(mut log) = log.lock() {
-                log.write_line(&format!("{SERVER_LABEL}: {reason}"));
+                // 保持日数をまだ読んでいないので削除は返らない。
+                let _ = log.write_line(&format!("{SERVER_LABEL}: {reason}"));
                 log.flush();
             }
             Err(reason)

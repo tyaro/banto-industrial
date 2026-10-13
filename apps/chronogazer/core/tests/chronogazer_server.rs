@@ -798,6 +798,79 @@ async fn closing_during_the_start_aborts_it() {
     a_stop_during_the_start_aborts_it("close").await;
 }
 
+/// #598 の Copilot の指摘: 起動後のログの古いファイルの削除が長引いている最中
+/// （デバッグビルドだけの `CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS` で削除の前に待たせる）に
+/// 止めても、最終の書き出し・`collection_stopped`・終わりの行が残り、`endpoint.json`
+/// が消える。以前は削除を「動いていることの公開」（`set_ready`）の前に、ログの
+/// ロックを持ったまま行っていたので、close のハンドラーが起動の終わりを 4 秒で
+/// 諦め（`StartAbandoned`）、後始末を飛ばしていた。削除はその間に終わらないので、
+/// 古いファイルは残る（途中で終わってもログは壊れない）。
+async fn a_stop_during_the_log_prune_still_flushes(stop_line: &str, expected_lines: &[&str]) {
+    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sandbox = Sandbox::new();
+    prepare_root(&sandbox, Some(sim.addr().port()), false).await;
+    let logs = sandbox.layout().logs_dir();
+    std::fs::create_dir_all(&logs).unwrap();
+    let old_log = logs.join("chronogazer-server-2020-01-01.log");
+    std::fs::write(&old_log, "[2020-01-01 00:00:00] 古い行\n").unwrap();
+
+    let mut server = Server::spawn_with_env(
+        &sandbox,
+        sandbox.root.to_str().unwrap(),
+        &[("CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS", "60000")],
+    );
+    let port = wait_ready(&sandbox, &server).await;
+    wait_for("ログの削除の前の待ち", async || {
+        sandbox
+            .output_text()
+            .contains("テスト用にログの古いファイルの削除の前で待ちます")
+            .then_some(())
+    })
+    .await;
+    let token = setup_admin(port).await;
+    wait_collecting(port, &token).await;
+    server.send(stop_line);
+    let status = server.wait_exit().await;
+    drop(sim);
+    assert_eq!(status.code(), Some(0), "{}", sandbox.output_text());
+    assert_stopped_cleanly(&sandbox).await;
+    assert!(old_log.exists(), "削除の待ちの間に消えた");
+    #[cfg(windows)]
+    {
+        let log = log_text(&sandbox);
+        for expected in expected_lines {
+            assert!(log.contains(expected), "{expected} がログに無い:\n{log}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = expected_lines;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_during_the_log_prune_still_flushes() {
+    a_stop_during_the_log_prune_still_flushes(
+        "ctrl-c",
+        &[
+            "終了の後始末が完了しました（Ctrl-C）",
+            "終了しました（終了コード 0）",
+        ],
+    )
+    .await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_during_the_log_prune_still_flushes() {
+    a_stop_during_the_log_prune_still_flushes(
+        "close",
+        &[
+            "終了の後始末が完了しました（コンソールのウィンドウを閉じた）",
+            "終了します（コンソールのウィンドウを閉じた、終了コード 0）",
+        ],
+    )
+    .await;
+}
+
 /// #598 のオーナーレビュー P2: リストア予約の適用の警告（ここでは壊れた予約ファイル。
 /// 適用をやめて起動を続ける）が日次ログに残る。
 #[cfg(windows)]

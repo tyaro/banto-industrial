@@ -78,6 +78,15 @@
 //! 読むので、それまでは消さない（既定値で先に消すと、長く残す設定の利用者のログを
 //! 消してしまう）。標準出力・標準エラー出力をこのファイルへ向け直すのは bin の
 //! 担当（Windows の `SetStdHandle`。core と依存 crate が `eprintln!` を直接使う）。
+//!
+//! 古いファイルの削除は [`ServerLog`] の中では行わず、[`LogPrune`] として呼び出し側へ
+//! 返す（#598 の Copilot の指摘）。ディレクトリの列挙と削除には上限が無い（UNC の
+//! ルート・大きなフォルダ）ので、ログの `Mutex` を持ったまま行うと、終了の最後の
+//! 行の記録と書き出し（同じ `Mutex` を取る）を待たせ、close 系の 4 秒の予算を
+//! 超えうる。呼び出し側はロックを手放してから別のスレッドで走らせる
+//! （[`LogPrune::spawn`]）。消すのは今日の分より古い自分の名前の形のファイルだけで、
+//! 今書いているファイルには触れないので、削除の途中でプロセスが終わってもログは
+//! 壊れない（消し残しは次の機会に消える）。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -742,6 +751,46 @@ pub fn log_files_to_prune<'a>(
         .collect()
 }
 
+/// 古いログファイルの削除の 1 回分（モジュール doc「ログ」）。ログの `Mutex` の外で
+/// 走らせる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "ログの Mutex を手放してから run か spawn で消す"]
+pub struct LogPrune {
+    dir: PathBuf,
+    today: LocalDate,
+    retention_days: u32,
+}
+
+impl LogPrune {
+    /// このスレッドで消す（列挙と削除に上限は無い。失敗は捨てる）。
+    pub fn run(self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        for name in log_files_to_prune(
+            names.iter().map(String::as_str),
+            self.today,
+            self.retention_days,
+        ) {
+            let _ = std::fs::remove_file(self.dir.join(name));
+        }
+    }
+
+    /// 別のスレッドで消す（待たない。スレッドを作れなければ今回は消さない）。
+    /// プロセスの終わりでは待たれずに打ち切られる（今書いているファイルには
+    /// 触れないので、ログは壊れない）。
+    pub fn spawn(self) {
+        let _ = std::thread::Builder::new()
+            .name("chronogazer-log-prune".to_string())
+            .spawn(move || self.run());
+    }
+}
+
 /// 日付ごとのログファイル（モジュール doc「ログ」）。書き込みの失敗は捨てる
 /// （ログが書けないことで収集を止めない）。
 pub struct ServerLog {
@@ -793,46 +842,42 @@ impl ServerLog {
         &self.dir
     }
 
-    /// 1 行書く（先頭に時刻）。日付が変わっていれば次のファイルへ移り、古いものを消す。
-    pub fn write_line(&mut self, line: &str) {
+    /// 1 行書く（先頭に時刻）。日付が変わっていれば次のファイルへ移り、古いものの
+    /// 削除を返す（ロックを手放してから走らせる。モジュール doc「ログ」）。
+    pub fn write_line(&mut self, line: &str) -> Option<LogPrune> {
         let now_ms = self.clock.now_ms();
         let offset_ms = self.clock.utc_offset_ms();
         let today = LocalDate::from_epoch_ms(now_ms, offset_ms);
         let rotate = !matches!(&self.current, Some((date, _)) if *date == today);
+        let mut prune = None;
         if rotate {
             // 開けなければ前のファイルに書き続ける（次の行でまた試す）。
             if let Ok(file) = self.open_file(today) {
                 self.current = Some((today, file));
-                self.prune(today);
+                prune = self.prune(today);
             }
         }
         if let Some((_, file)) = self.current.as_mut() {
             let _ = writeln!(file, "[{}] {line}", format_timestamp(now_ms, offset_ms));
         }
+        prune
     }
 
-    /// 保持日数を設定し（`None` = 無制限）、すぐに古いものを消す。
-    pub fn set_retention(&mut self, retention_days: Option<u32>) {
+    /// 保持日数を設定し（`None` = 無制限）、古いものの削除を返す（ロックを手放して
+    /// から走らせる。モジュール doc「ログ」）。
+    pub fn set_retention(&mut self, retention_days: Option<u32>) -> Option<LogPrune> {
         self.retention_days = retention_days;
         let today = self.today();
-        self.prune(today);
+        self.prune(today)
     }
 
-    fn prune(&self, today: LocalDate) {
-        let Some(days) = self.retention_days else {
-            return;
-        };
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        let names: Vec<String> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect();
-        for name in log_files_to_prune(names.iter().map(String::as_str), today, days) {
-            let _ = std::fs::remove_file(self.dir.join(name));
-        }
+    /// 削除の 1 回分（ファイルシステムには触れない）。保持日数を知らないなら `None`。
+    fn prune(&self, today: LocalDate) -> Option<LogPrune> {
+        self.retention_days.map(|retention_days| LogPrune {
+            dir: self.dir.clone(),
+            today,
+            retention_days,
+        })
     }
 
     /// ディスクへ書き出す（終了の前）。

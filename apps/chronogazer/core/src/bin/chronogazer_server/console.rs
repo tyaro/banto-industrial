@@ -266,8 +266,11 @@ fn pump(
         while text.ends_with('\n') || text.ends_with('\r') {
             text.pop();
         }
-        if let Ok(mut log) = log.lock() {
-            log.write_line(&text);
+        // 日付の切り替えで出る古いファイルの削除は、ロックを手放してから別の
+        // スレッドで（上限の無い削除で、終了の最後の行の記録を待たせない）。
+        let prune = log.lock().ok().and_then(|mut log| log.write_line(&text));
+        if let Some(prune) = prune {
+            crate::spawn_log_prune(prune);
         }
         if let Some(tee) = tee {
             // 溢れた（コンソールが止まっている）・写すスレッドが無いなら捨てる。
@@ -401,9 +404,13 @@ impl StdioRedirect {
             eprintln!("{line}");
             return;
         }
-        if let Ok(mut log) = self.log.lock() {
-            log.write_line(line);
+        let prune = self.log.lock().ok().and_then(|mut log| {
+            let prune = log.write_line(line);
             log.flush();
+            prune
+        });
+        if let Some(prune) = prune {
+            crate::spawn_log_prune(prune);
         }
         if let Some(tee) = &self.tee {
             tee.send(line.to_string());
