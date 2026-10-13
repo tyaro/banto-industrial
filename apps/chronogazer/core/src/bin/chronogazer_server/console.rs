@@ -88,7 +88,62 @@ pub struct StdioRedirect {
     /// [`StdioRedirect::write_through`] がパイプを通さずに書く先。
     log: Arc<Mutex<ServerLog>>,
     /// コンソールへ写す列（[`StdioRedirect::write_through`] も使う）。
-    tee: Option<SyncSender<String>>,
+    tee: Option<TeeQueue>,
+}
+
+/// コンソールへ写す列とそのワーカー（#598 の Copilot の指摘）。`finish` で
+/// [`TeeQueue::close_and_wait`] を呼び、送り口を手放してワーカーが残りを書き終える
+/// （列が空になって終わる）のを予算の範囲で待つ。送り口を持ち続けるとワーカーは
+/// 終われず、`exit` の前のコンソールへの最後の写しが失われうる。
+struct TeeQueue {
+    tx: Mutex<Option<SyncSender<String>>>,
+    done: Mutex<Option<Receiver<()>>>,
+}
+
+impl TeeQueue {
+    /// ワーカーを起こす。`write` は 1 行をコンソール（など）へ書く。返す 2 つ目は
+    /// パイプのポンプが使う送り口（ポンプが終わると手放す）。
+    fn spawn(
+        write: impl FnMut(&str) + Send + 'static,
+    ) -> std::io::Result<(Self, SyncSender<String>)> {
+        let (tx, rx) = mpsc::sync_channel::<String>(TEE_QUEUE);
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut write = write;
+        std::thread::Builder::new()
+            .name("server-log-tee".into())
+            .spawn(move || {
+                for line in rx {
+                    write(&line);
+                }
+                let _ = done_tx.send(());
+            })?;
+        Ok((
+            Self {
+                tx: Mutex::new(Some(tx.clone())),
+                done: Mutex::new(Some(done_rx)),
+            },
+            tx,
+        ))
+    }
+
+    /// 列に入れる（溢れた・もう閉じたなら捨てる）。
+    fn send(&self, line: String) {
+        if let Some(tx) = self.tx.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = tx.try_send(line);
+        }
+    }
+
+    /// 送り口を手放し、ワーカーが残りを書き終えて終わるのを `wait` まで待つ。
+    /// 終わったら `true`。コンソールが止まっている（QuickEdit の選択中など）と
+    /// 予算を超えては待たずに諦める（`false`。ログには既に書いてある）。他の送り口
+    /// （パイプのポンプ）が残っていれば、それが手放すまでワーカーは終わらない。
+    fn close_and_wait(&self, wait: Duration) -> bool {
+        self.tx.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match self.done.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            Some(done) => done.recv_timeout(wait).is_ok(),
+            None => true,
+        }
+    }
 }
 
 /// 標準出力・標準エラー出力を `log` へ向け直し、元の標準エラー出力にも写す。
@@ -105,19 +160,18 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
     let original_out = RawHandle::new(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) });
     let original_err = RawHandle::new(unsafe { GetStdHandle(STD_ERROR_HANDLE) });
 
-    let (tee_tx, tee_rx) = mpsc::sync_channel::<String>(TEE_QUEUE);
-    let direct_tee = original_err.is_usable().then(|| tee_tx.clone());
     let direct_log = Arc::clone(&log);
-    if original_err.is_usable() {
-        std::thread::Builder::new()
-            .name("server-log-tee".into())
-            .spawn(move || tee_to_console(original_err, tee_rx))?;
-    }
+    let (direct_tee, pump_tee) = if original_err.is_usable() {
+        let (queue, pump_tx) = TeeQueue::spawn(console_writer(original_err))?;
+        (Some(queue), Some(pump_tx))
+    } else {
+        (None, None)
+    };
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("server-log".into())
         .spawn(move || {
-            pump(read, &log, original_err.is_usable().then_some(tee_tx));
+            pump(read, &log, pump_tee);
             if let Ok(mut log) = log.lock() {
                 log.flush();
             }
@@ -213,11 +267,11 @@ fn pump(read: RawHandle, log: &Mutex<ServerLog>, tee: Option<SyncSender<String>>
 
 /// 列の行を元の標準エラー出力へ書く（コンソールなら UTF-16 で `WriteConsoleW`、
 /// それ以外（パイプ・ファイル）なら UTF-8 で `WriteFile`）。失敗は捨てる。
-fn tee_to_console(target: RawHandle, rx: Receiver<String>) {
+fn console_writer(target: RawHandle) -> impl FnMut(&str) + Send + 'static {
     let mut mode = 0;
     // SAFETY: 出力のポインタは有効なローカル変数。
     let is_console = unsafe { GetConsoleMode(target.get(), &mut mode) } != FALSE;
-    for line in rx {
+    move |line: &str| {
         if is_console {
             let wide: Vec<u16> = format!("{line}\r\n").encode_utf16().collect();
             let mut written = 0;
@@ -264,14 +318,16 @@ impl StdioRedirect {
             log.flush();
         }
         if let Some(tee) = &self.tee {
-            let _ = tee.try_send(line.to_string());
+            tee.send(line.to_string());
         }
     }
 
-    /// 標準ハンドルを元に戻し、残りをログに書き終えるのを `wait` まで待つ
-    /// （モジュール doc「向け直し」。2 回目以降の呼び出しも、最初の呼び出しが
-    /// 終わるまで戻らない）。
+    /// 標準ハンドルを元に戻し、残りをログに書き終え、コンソールへの写しを書き終える
+    /// のを `wait` まで待つ（モジュール doc「向け直し」。2 回目以降の呼び出しも、
+    /// 最初の呼び出しが終わるまで戻らない）。コンソールが止まっていて写しを書き
+    /// 終えられなければ予算で諦める（ログには既に書いてある）。
     pub fn finish(&self, wait: Duration) {
+        let deadline = std::time::Instant::now() + wait;
         let mut done = self.done.lock().unwrap_or_else(|p| p.into_inner());
         if self.finished.swap(true, Ordering::SeqCst) {
             return;
@@ -282,9 +338,63 @@ impl StdioRedirect {
             SetStdHandle(STD_ERROR_HANDLE, self.original_err.get());
             CloseHandle(self.write.get());
         }
+        // ポンプが残りをログに書き終える（終わると自分の写しの送り口を手放す）。
         if let Some(rx) = done.take() {
-            let _ = rx.recv_timeout(wait);
+            let _ = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         }
+        // コンソールへの写しを書き終える（#598 の Copilot の指摘）。
+        if let Some(tee) = &self.tee {
+            tee.close_and_wait(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最後の行を列に入れた直後に閉じても、写しのワーカーが書き終えるまで待つ
+    /// （書き先が遅くても）。反証: 送り口を手放さない・待たないと落ちる。
+    #[test]
+    fn close_and_wait_lets_the_tee_worker_write_the_last_line() {
+        let written = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = written.clone();
+        let (queue, pump_tx) = TeeQueue::spawn(move |line: &str| {
+            std::thread::sleep(Duration::from_millis(200));
+            sink.lock().unwrap().push(line.to_string());
+        })
+        .unwrap();
+        drop(pump_tx); // ポンプは終わった
+        queue.send("first".to_string());
+        queue.send("終了の後始末が完了しました".to_string());
+        assert!(
+            queue.close_and_wait(Duration::from_secs(5)),
+            "ワーカーが終わらない"
+        );
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![
+                "first".to_string(),
+                "終了の後始末が完了しました".to_string()
+            ]
+        );
+        // 閉じた後に入れたものは捨てる。
+        queue.send("late".to_string());
+        assert_eq!(written.lock().unwrap().len(), 2);
+    }
+
+    /// 書き先が止まっている（コンソールの選択中など）と、予算を超えては待たない。
+    #[test]
+    fn close_and_wait_gives_up_after_the_budget_when_the_console_is_stuck() {
+        let (queue, pump_tx) = TeeQueue::spawn(|_line: &str| {
+            std::thread::sleep(Duration::from_secs(3600));
+        })
+        .unwrap();
+        drop(pump_tx);
+        queue.send("stuck".to_string());
+        let started = std::time::Instant::now();
+        assert!(!queue.close_and_wait(Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 
