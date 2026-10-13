@@ -18,8 +18,14 @@
 //! スレッドが止まらないようにする。パイプの書き込み側のバッファは 64 KiB。
 //!
 //! 終了のとき（[`StdioRedirect::finish`]）は、標準ハンドルを元に戻してから
-//! パイプの書き込み側を閉じ、読み取り側が残りを書き終えてファイルを
-//! `sync_all` するのを上限つきで待つ。**何度呼んでも、どのスレッドから呼んでも、
+//! パイプへ**番兵の行**（[`PIPE_END`]）を書き、読み取り側が番兵より前の行を書き
+//! 終えてファイルを `sync_all` するのを上限つきで待つ。**パイプの書き込み側は閉じない**
+//! （#598 監査 F4）: `eprintln!` は書くたびに `GetStdHandle` → `WriteFile` を行うので、
+//! 標準ハンドルを戻した直後に閉じると、その間にいた書き手が閉じた番号へ書きうる。
+//! 番号はすぐ別のオブジェクト（DB の接続・データファイルなど）に再利用されうるので、
+//! ログの行がそのファイルへ書かれかねない。書き込み側はプロセスの終わりまで開いた
+//! まま（番号を再利用させない）で、読み取り側は番兵の後もパイプを読み続ける（遅れて
+//! 来た行で書き手が詰まらないよう、ログへ書き続ける。書き出し・写しはしない）。**何度呼んでも、どのスレッドから呼んでも、
 //! 最初の呼び出しが終わるまで後の呼び出しも戻らない**（Ctrl のハンドラーのスレッドと
 //! main のスレッドの両方が呼ぶ。片方がプロセスを終わらせる前に、もう片方の
 //! 書き出しを切らない）。
@@ -58,6 +64,9 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 const PIPE_BUFFER: u32 = 64 * 1024;
 /// コンソールへ写す行の列の上限（溢れたら捨てる）。
 const TEE_QUEUE: usize = 4096;
+/// 向け直しの終わりの印（[`StdioRedirect::finish`] がパイプへ書く 1 行）。NUL を
+/// 含むので、ふつうの出力の行とは重ならない。
+const PIPE_END: &[u8] = b"\0chronogazer-server: end of the stdio redirect\0\n";
 
 /// `HANDLE`（生ポインタ）をスレッドの間で渡すための入れ物。
 #[derive(Clone, Copy)]
@@ -148,6 +157,18 @@ impl TeeQueue {
 
 /// 標準出力・標準エラー出力を `log` へ向け直し、元の標準エラー出力にも写す。
 pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedirect> {
+    // SAFETY: 標準ハンドルの取得は副作用が無い。
+    let original_out = RawHandle::new(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) });
+    let original_err = RawHandle::new(unsafe { GetStdHandle(STD_ERROR_HANDLE) });
+    // 写しのワーカーはパイプより先に作る（#598 監査 F7: 作れなかったときにパイプの
+    // ハンドルを漏らさない。ここで失敗すれば何も作っていない）。
+    let (direct_tee, pump_tee) = if original_err.is_usable() {
+        let (queue, pump_tx) = TeeQueue::spawn(console_writer(original_err))?;
+        (Some(queue), Some(pump_tx))
+    } else {
+        (None, None)
+    };
+
     let mut read: HANDLE = std::ptr::null_mut();
     let mut write: HANDLE = std::ptr::null_mut();
     // SAFETY: 出力の 2 つのポインタは有効なローカル変数。属性は既定（継承しない）。
@@ -156,29 +177,27 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
     }
     let read = RawHandle::new(read);
     let write = RawHandle::new(write);
-    // SAFETY: 標準ハンドルの取得は副作用が無い。
-    let original_out = RawHandle::new(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) });
-    let original_err = RawHandle::new(unsafe { GetStdHandle(STD_ERROR_HANDLE) });
 
     let direct_log = Arc::clone(&log);
-    let (direct_tee, pump_tee) = if original_err.is_usable() {
-        let (queue, pump_tx) = TeeQueue::spawn(console_writer(original_err))?;
-        (Some(queue), Some(pump_tx))
-    } else {
-        (None, None)
-    };
     let (done_tx, done_rx) = mpsc::channel();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("server-log".into())
         .spawn(move || {
-            pump(read, &log, pump_tee);
-            if let Ok(mut log) = log.lock() {
-                log.flush();
-            }
-            // SAFETY: 読み取り側はこのスレッドだけが持つ。
+            pump(read, &log, pump_tee, done_tx);
+            // SAFETY: 読み取り側はこのスレッドだけが持つ（書き込み側は閉じないので、
+            // ふつうはここに来ない）。
             unsafe { CloseHandle(read.get()) };
-            let _ = done_tx.send(());
-        })?;
+        });
+    if let Err(err) = spawned {
+        // まだ標準ハンドルを差し替えていない（誰も書き込み側を持っていない）ので、
+        // 両方を閉じてよい（#598 監査 F7）。
+        // SAFETY: どちらもこの関数だけが持つハンドル。
+        unsafe {
+            CloseHandle(read.get());
+            CloseHandle(write.get());
+        }
+        return Err(err);
+    }
 
     // ここから先の `println!`/`eprintln!` はパイプへ行く。両方の差し替えが成功した
     // ときだけ向け直したことにする（#598 の Copilot の指摘）。片方でも失敗したら
@@ -187,7 +206,7 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
     // 差し替えの失敗を注入できる（統合テスト用）。
     let inject_failure = cfg!(debug_assertions)
         && std::env::var("CHRONOGAZER_TEST_FAIL_STDIO_REDIRECT").as_deref() == Ok("1");
-    // SAFETY: 書き込み側のハンドルは `finish` で閉じるまで有効。
+    // SAFETY: 書き込み側のハンドルはプロセスの終わりまで閉じない（有効なまま）。
     let out_ok = unsafe { SetStdHandle(STD_OUTPUT_HANDLE, write.get()) } != FALSE;
     let err_ok = out_ok
         && !inject_failure
@@ -200,13 +219,9 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
         } else {
             std::io::Error::last_os_error()
         };
-        // SAFETY: 元のハンドルに戻し、書き込み側を閉じる（読み取り側のスレッドは
-        // EOF で終わる）。
-        unsafe {
-            SetStdHandle(STD_OUTPUT_HANDLE, original_out.get());
-            SetStdHandle(STD_ERROR_HANDLE, original_err.get());
-            CloseHandle(write.get());
-        }
+        // 元のハンドルに戻し、番兵を書く（書き込み側は閉じない。差し替えた標準出力を
+        // 他のスレッドが掴んだかもしれないため。`finish` と同じ）。
+        end_redirect(write, original_out, original_err);
         let _ = done_rx.recv_timeout(Duration::from_secs(1));
         return Err(error);
     }
@@ -221,12 +236,32 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
     })
 }
 
-/// パイプを読み、行ごとにログと（あれば）コンソールの列へ渡す。書き込み側が
-/// すべて閉じられる（[`StdioRedirect::finish`]）と終わる。
-fn pump(read: RawHandle, log: &Mutex<ServerLog>, tee: Option<SyncSender<String>>) {
+/// パイプを読み、行ごとにログと（あれば）コンソールの列へ渡す。番兵の行
+/// （[`PIPE_END`]、[`StdioRedirect::finish`] が書く）が来たら、それより前の行を
+/// 書き終えたログを書き出し（`sync_all`）、写しの送り口を手放して `done` で知らせる。
+/// その後もパイプを読み続け、遅れて来た行はログへ書くだけにする（書き手を詰まらせ
+/// ない）。書き込み側がすべて閉じられたら終わる（ふつうは閉じない）。
+fn pump(
+    read: RawHandle,
+    log: &Mutex<ServerLog>,
+    tee: Option<SyncSender<String>>,
+    done: mpsc::Sender<()>,
+) {
     let mut buffer = vec![0_u8; 8192];
     let mut pending: Vec<u8> = Vec::new();
-    let emit = |bytes: &[u8]| {
+    let mut tee = tee;
+    let mut done = Some(done);
+    let finish = |tee: &mut Option<SyncSender<String>>, done: &mut Option<mpsc::Sender<()>>| {
+        if let Some(done) = done.take() {
+            if let Ok(mut log) = log.lock() {
+                log.flush();
+            }
+            // 写しのワーカーが残りを書き終えて終われるよう、送り口を手放す。
+            tee.take();
+            let _ = done.send(());
+        }
+    };
+    let emit = |bytes: &[u8], tee: &Option<SyncSender<String>>| {
         let mut text = String::from_utf8_lossy(bytes).into_owned();
         while text.ends_with('\n') || text.ends_with('\r') {
             text.pop();
@@ -234,7 +269,7 @@ fn pump(read: RawHandle, log: &Mutex<ServerLog>, tee: Option<SyncSender<String>>
         if let Ok(mut log) = log.lock() {
             log.write_line(&text);
         }
-        if let Some(tee) = &tee {
+        if let Some(tee) = tee {
             // 溢れた（コンソールが止まっている）・写すスレッドが無いなら捨てる。
             let _ = tee.try_send(text);
         }
@@ -257,11 +292,64 @@ fn pump(read: RawHandle, log: &Mutex<ServerLog>, tee: Option<SyncSender<String>>
         pending.extend_from_slice(&buffer[..count as usize]);
         while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = pending.drain(..=pos).collect();
-            emit(&line);
+            if line == PIPE_END {
+                finish(&mut tee, &mut done);
+                continue;
+            }
+            emit(&line, &tee);
         }
     }
     if !pending.is_empty() {
-        emit(&pending);
+        emit(&pending, &tee);
+    }
+    finish(&mut tee, &mut done);
+}
+
+/// 向け直しを終える: 標準ハンドルを元に戻し、パイプへ番兵を書く（モジュール doc
+/// 「向け直し」。#598 監査 F4）。差し替えは Rust の標準出力・標準エラー出力の lock を
+/// 持って行う: Rust の書き込みは lock の中で `GetStdHandle` → `WriteFile` を行うので、
+/// lock を持っていた書き手は差し替えの前に書き終え（その行は番兵より前にある）、後の
+/// 書き手は元のハンドルへ書く。番兵の書き込みは別のスレッドで行う（読み取り側が
+/// 止まってパイプが一杯でも、呼び出し側は `done` を上限つきで待つだけにする）。
+fn end_redirect(write: RawHandle, original_out: RawHandle, original_err: RawHandle) {
+    use std::io::Write as _;
+    {
+        let mut stdout = std::io::stdout().lock();
+        // 改行の無い `print!` の残りを、差し替えの前にパイプへ出し切る。
+        let _ = stdout.flush();
+        let _stderr = std::io::stderr().lock();
+        // SAFETY: 元のハンドルに戻すだけ。
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, original_out.get());
+            SetStdHandle(STD_ERROR_HANDLE, original_err.get());
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("server-log-end".into())
+        .spawn(move || write_all(write, PIPE_END));
+    if spawned.is_err() {
+        write_all(write, PIPE_END);
+    }
+}
+
+/// `bytes` をすべて `handle` へ書く（失敗したら諦める）。
+fn write_all(handle: RawHandle, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let mut written = 0_u32;
+        // SAFETY: バッファと長さは `bytes` のもの。同期 I/O。
+        let ok = unsafe {
+            WriteFile(
+                handle.get(),
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == FALSE || written == 0 {
+            return;
+        }
+        bytes = &bytes[written as usize..];
     }
 }
 
@@ -322,9 +410,9 @@ impl StdioRedirect {
         }
     }
 
-    /// 標準ハンドルを元に戻し、残りをログに書き終え、コンソールへの写しを書き終える
-    /// のを `wait` まで待つ（モジュール doc「向け直し」。2 回目以降の呼び出しも、
-    /// 最初の呼び出しが終わるまで戻らない）。コンソールが止まっていて写しを書き
+    /// 標準ハンドルを元に戻し、番兵より前の行をログに書き終え、コンソールへの写しを
+    /// 書き終えるのを `wait` まで待つ（モジュール doc「向け直し」。2 回目以降の呼び出し
+    /// も、最初の呼び出しが終わるまで戻らない）。パイプの書き込み側は閉じない。コンソールが止まっていて写しを書き
     /// 終えられなければ予算で諦める（ログには既に書いてある）。
     pub fn finish(&self, wait: Duration) {
         let deadline = std::time::Instant::now() + wait;
@@ -332,13 +420,8 @@ impl StdioRedirect {
         if self.finished.swap(true, Ordering::SeqCst) {
             return;
         }
-        // SAFETY: 元のハンドルに戻す。書き込み側は自分だけが閉じる（1 回だけ）。
-        unsafe {
-            SetStdHandle(STD_OUTPUT_HANDLE, self.original_out.get());
-            SetStdHandle(STD_ERROR_HANDLE, self.original_err.get());
-            CloseHandle(self.write.get());
-        }
-        // ポンプが残りをログに書き終える（終わると自分の写しの送り口を手放す）。
+        end_redirect(self.write, self.original_out, self.original_err);
+        // ポンプが番兵より前の行をログに書き終える（そのとき自分の写しの送り口を手放す）。
         if let Some(rx) = done.take() {
             let _ = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         }
@@ -381,6 +464,60 @@ mod tests {
         // 閉じた後に入れたものは捨てる。
         queue.send("late".to_string());
         assert_eq!(written.lock().unwrap().len(), 2);
+    }
+
+    /// #598 監査 F4: ポンプは書き込み側が閉じられなくても番兵で `done` を知らせ、
+    /// 番兵より前の行はすべてログにあり、写しの送り口も手放している。番兵の後に来た
+    /// 行でも書き手は詰まらない（ポンプが読み続ける）。
+    #[test]
+    fn the_pump_finishes_on_the_sentinel_without_closing_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Mutex::new(
+            ServerLog::open(dir.path(), Arc::new(banto_tstore::SystemClock)).unwrap(),
+        ));
+        let mut read: HANDLE = std::ptr::null_mut();
+        let mut write: HANDLE = std::ptr::null_mut();
+        // SAFETY: 出力のポインタは有効なローカル変数。
+        assert_ne!(
+            unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), PIPE_BUFFER) },
+            FALSE
+        );
+        let (read, write) = (RawHandle::new(read), RawHandle::new(write));
+        let (tee_tx, tee_rx) = mpsc::sync_channel::<String>(TEE_QUEUE);
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let log = log.clone();
+            std::thread::spawn(move || pump(read, &log, Some(tee_tx), done_tx));
+        }
+        write_all(write, "一行目\n".as_bytes());
+        // 番兵と同じ書き込みで続く行は、番兵の後の行として扱う。
+        let mut tail = "二行目\n".as_bytes().to_vec();
+        tail.extend_from_slice(PIPE_END);
+        tail.extend_from_slice(b"after\n");
+        write_all(write, &tail);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("番兵で done が来ない");
+        let text = std::fs::read_to_string(log.lock().unwrap().current_path()).unwrap();
+        assert!(text.contains("一行目") && text.contains("二行目"), "{text}");
+        // 写しの送り口を手放している（受け手の列は番兵の前の 2 行で終わる）。
+        assert_eq!(
+            tee_rx.iter().collect::<Vec<_>>(),
+            vec!["一行目".to_string(), "二行目".to_string()]
+        );
+        // 番兵の後も読み続けるので、パイプの大きさを超えて書いても詰まらない。
+        let (wrote_tx, wrote_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = vec![b'x'; 1023];
+            line.push(b'\n');
+            for _ in 0..256 {
+                write_all(write, &line);
+            }
+            let _ = wrote_tx.send(());
+        });
+        wrote_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("番兵の後の書き込みが詰まった");
     }
 
     /// 書き先が止まっている（コンソールの選択中など）と、予算を超えては待たない。
