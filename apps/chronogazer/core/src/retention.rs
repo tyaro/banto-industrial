@@ -55,6 +55,14 @@
 //! 最後まで終えてから止まる**。合図の `Sender` が drop されたとき（持ち主の
 //! [`RetentionTask`] がいなくなった）も「止める」として扱う。
 //!
+//! [`RetentionTask::stop`] は `&self` で、`JoinHandle` を**終わりが実際に
+//! 取れるまで手放さない**（PR #597 のレビュー）。呼び出し側の時間切れ
+//! （`tokio::time::timeout`）で `stop()` の future が落ちても handle は
+//! [`RetentionTask`] の中に残るので、もう一度 `stop()` を呼べば、まだ走って
+//! いる掃除の終わりを改めて待つ。handle を取り出して await する形だと、時間
+//! 切れで handle ごと落ちてタスクが切り離され、次の `stop()` は掃除の途中でも
+//! すぐ「止まった」と返してしまう。
+//!
 //! abort しない理由: 掃除は最初に [`store_config`] で設定 DB を読み、その
 //! `pool.acquire()` は新しい接続を開くことが多い。sqlx（sqlite）の接続の確立は
 //! 別の OS スレッドで進むので、確立の途中で future を落とすと、そのスレッドは
@@ -274,12 +282,14 @@ pub async fn run_with(
 /// 止まるが、終わりは待たない。
 pub struct RetentionTask {
     stop: watch::Sender<bool>,
-    handle: JoinHandle<()>,
+    /// ループの `JoinHandle`。終わりを取れたら `None` にする。`stop()` の
+    /// future が途中で落ちても残る（モジュール doc「止め方」）。
+    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl RetentionTask {
     /// 止める合図を受ける future を作って、今のランタイムに spawn する。
-    fn spawn_with<F, Fut>(make: F) -> Self
+    pub(crate) fn spawn_with<F, Fut>(make: F) -> Self
     where
         F: FnOnce(watch::Receiver<bool>) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
@@ -287,7 +297,7 @@ impl RetentionTask {
         let (stop, receiver) = watch::channel(false);
         Self {
             stop,
-            handle: tokio::spawn(make(receiver)),
+            handle: tokio::sync::Mutex::new(Some(tokio::spawn(make(receiver)))),
         }
     }
 
@@ -298,10 +308,19 @@ impl RetentionTask {
     }
 
     /// 止める合図を送り、ループの終わりを待つ。掃除の途中なら、その掃除が
-    /// 最後まで終わってから返る。
-    pub async fn stop(self) {
+    /// 最後まで終わってから返る。何度呼んでもよく、**途中で落とされても**
+    /// （時間切れ）handle は手放さないので、次の呼び出しがまた終わりを待つ。
+    /// 終わりを一度取れた後は、すぐ返る。
+    pub async fn stop(&self) {
         self.request_stop();
-        if let Err(err) = self.handle.await {
+        let mut slot = self.handle.lock().await;
+        let Some(handle) = slot.as_mut() else {
+            return;
+        };
+        // `&mut JoinHandle` を待つ: ここで落とされても handle は `slot` に残る。
+        let result = handle.await;
+        *slot = None;
+        if let Err(err) = result {
             if err.is_panic() {
                 eprintln!("banto: 保持期間の掃除のタスクが異常終了していました: {err}");
             }
@@ -664,7 +683,11 @@ mod tests {
         tokio::time::timeout(STOP_DEADLINE, entered.notified())
             .await
             .expect("起動時の掃除が削除役に入る");
-        let stopper = tokio::spawn(task.stop());
+        let task = Arc::new(task);
+        let stopper = {
+            let task = task.clone();
+            tokio::spawn(async move { task.stop().await })
+        };
         // 止める側を走らせる（合図は送られ、終わりを待っている）。ここは
         // 「まだ返らないこと」を見るだけで、順序は通知で作ってある。
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -680,6 +703,49 @@ mod tests {
             .expect("stop() が panic しない");
         assert!(finished.load(Ordering::SeqCst), "掃除が最後まで走った");
         assert!(!cancelled.load(Ordering::SeqCst), "掃除が途中で落とされた");
+    }
+
+    /// `stop()` が時間切れで落とされても、掃除のタスクは追い続ける: 次の
+    /// `stop()` は掃除がまだ走っていれば返らず、終われば返る（PR #597 の
+    /// レビュー。handle を取り出して待つ形だと、2 回目は素通りする）。
+    #[tokio::test]
+    async fn stop_again_after_a_timed_out_stop_still_waits_for_the_sweep() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let task = {
+            let (entered, release, finished) = (entered.clone(), release.clone(), finished.clone());
+            RetentionTask::spawn_with(move |_stop| async move {
+                entered.notify_one();
+                release.notified().await;
+                finished.store(true, Ordering::SeqCst);
+            })
+        };
+        tokio::time::timeout(STOP_DEADLINE, entered.notified())
+            .await
+            .expect("掃除が途中に入る");
+
+        let short = Duration::from_millis(100);
+        assert!(
+            tokio::time::timeout(short, task.stop()).await.is_err(),
+            "1 回目の stop() が掃除の途中で返った"
+        );
+        assert!(
+            tokio::time::timeout(short, task.stop()).await.is_err(),
+            "時間切れの後の stop() が掃除の途中で返った"
+        );
+        assert!(!finished.load(Ordering::SeqCst));
+
+        release.notify_one();
+        tokio::time::timeout(STOP_DEADLINE, task.stop())
+            .await
+            .expect("掃除が終われば stop() が返る");
+        assert!(finished.load(Ordering::SeqCst));
+        // 終わりを取った後は何度呼んでもすぐ返る。
+        tokio::time::timeout(STOP_DEADLINE, task.stop())
+            .await
+            .expect("終わった後の stop() はすぐ返る");
     }
 
     /// 次の確認までの待ち（1 時間）の間に止めると、待ちを打ち切ってすぐ返る。

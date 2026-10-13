@@ -64,7 +64,12 @@
 //!    掃除が終わってから止まる。掃除は設定 DB を読むので pool より前で、
 //!    abort はしない（接続の確立の途中で落とすと、その接続が pool の外に残り、
 //!    7. の後で WAL を本体へ書き戻す。理由は [`crate::retention`] の
-//!    「止め方」）。
+//!    「止め方」）。予算が切れてこの待ちが落ちても、掃除のタスクは終わりが
+//!    取れるまで追い続ける: もう一度 `shutdown` を呼ぶと、まだ走っている掃除の
+//!    終わりを（その予算の中で）待ち、終わっていなければ
+//!    [`ShutdownStep::RetentionStopped`] を報告せずに時間切れを返す（PR #597 の
+//!    レビュー。以前は handle を取り出していたので、2 回目は掃除の途中でも
+//!    素通りして pool を閉じていた）。
 //! 4. **LAN の listener**（[`ServerSlot`] から取り出して `stop`）。ハンドラーは
 //!    同じ pool を使うので pool より前。
 //! 5. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
@@ -784,7 +789,7 @@ impl OpenedEngine {
             listen_error,
             background: std::sync::Mutex::new(BackgroundTasks {
                 spool_flusher,
-                retention: Some(retention),
+                retention: Arc::new(retention),
             }),
             #[cfg(test)]
             observations: std::sync::Mutex::new(None),
@@ -795,9 +800,12 @@ impl OpenedEngine {
 
 /// 終了で止める背景タスク。監査の保留の流し込みは abort、保持期間の掃除は
 /// 止める合図を送って終わりを待つ（モジュール doc「終了の順序」の 2.・3.）。
+/// 掃除は終わりを取れるまで**取り出さない**: 終了が時間切れで手順 3. の
+/// 待ちを落としても、もう一度の `shutdown` がまだ走っている掃除を待つ
+/// （[`crate::retention`] の「止め方」、PR #597 のレビュー）。
 struct BackgroundTasks {
     spool_flusher: Option<JoinHandle<()>>,
-    retention: Option<RetentionTask>,
+    retention: Arc<RetentionTask>,
 }
 
 /// [`RunningEngine::shutdown`] の手順（[`ShutdownReport::completed`] に、
@@ -872,7 +880,8 @@ impl RunningEngine {
     }
 
     /// 終了（モジュール doc「終了の順序」）。何度呼んでもよい（2 回目以降は
-    /// 止めるものが残っていない）が、同時に 2 回走らせないのは呼び出し側の
+    /// 止めるものが残っていない。ただし前回が時間切れで保持期間の掃除が
+    /// まだ終わっていなければ、それを待つ）が、同時に 2 回走らせないのは呼び出し側の
     /// 責任（デスクトップは `ExitCleanupOnce`）。
     pub async fn shutdown(&self, budget: Duration) -> ShutdownReport {
         let label = self.log_label;
@@ -894,21 +903,18 @@ impl RunningEngine {
             if let Some(handle) = background.spool_flusher.take() {
                 handle.abort();
             }
-            let retention = background.retention.take();
-            if let Some(task) = &retention {
-                task.request_stop();
-            }
-            retention
+            background.retention.request_stop();
+            background.retention.clone()
         };
         completed.push(ShutdownStep::BackgroundTasksAborted);
 
         let mut collect_stop_error = None;
         let cleanup = async {
             // 3. 保持期間の掃除の終わり（abort しない。設定 DB を読むので pool より前）。
+            // 前回の終了が時間切れでここを落としていても、まだ走っている掃除を
+            // 待つ（終わっていなければ `RetentionStopped` を報告しない）。
             self.observe(ShutdownStep::RetentionStopped);
-            if let Some(task) = retention {
-                task.stop().await;
-            }
+            retention.stop().await;
             completed.push(ShutdownStep::RetentionStopped);
 
             // 4. 消費者（LAN）。
@@ -1218,6 +1224,65 @@ mod tests {
         assert_eq!(engine.server_slot().local_addr().await, None);
         let report = engine.shutdown(Duration::from_secs(10)).await;
         assert!(!report.timed_out);
+        assert!(engine.services().pool.is_closed());
+    }
+
+    /// 保持期間の掃除が終了の予算より長いとき: 1 回目の `shutdown` は時間切れで
+    /// 掃除の待ちを落とすが、掃除のタスクは追い続ける。2 回目の `shutdown` は
+    /// 掃除がまだ走っていれば `RetentionStopped` を報告せず（pool も閉じない）、
+    /// 掃除を放せば待って最後まで終える（PR #597 のレビュー）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_again_waits_for_a_retention_sweep_that_outlived_the_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new();
+        let engine = EngineRuntime::start(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("start");
+
+        // 掃除を「途中で止まっている掃除」（合図を見ずに `release` を待つ）に差し替える。
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let stuck = {
+            let (entered, release, finished) = (entered.clone(), release.clone(), finished.clone());
+            Arc::new(RetentionTask::spawn_with(move |_stop| async move {
+                entered.notify_one();
+                release.notified().await;
+                finished.store(true, Ordering::SeqCst);
+            }))
+        };
+        let original = {
+            let mut background = engine.background.lock().unwrap();
+            std::mem::replace(&mut background.retention, stuck)
+        };
+        original.stop().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("掃除が途中に入る");
+
+        let short = Duration::from_millis(200);
+        for attempt in 1..=2 {
+            let report = engine.shutdown(short).await;
+            assert!(report.timed_out, "{attempt} 回目が時間切れにならない");
+            assert_eq!(
+                report.completed,
+                vec![ShutdownStep::Marked, ShutdownStep::BackgroundTasksAborted],
+                "{attempt} 回目: 掃除が終わっていないのに先へ進んだ"
+            );
+            assert!(!finished.load(Ordering::SeqCst));
+            assert!(
+                !engine.services().pool.is_closed(),
+                "{attempt} 回目: 掃除の途中で pool を閉じた"
+            );
+        }
+
+        // 掃除を放すと、次の `shutdown` は掃除の終わりを待ってから最後まで進む。
+        release.notify_one();
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out);
+        assert!(report.completed.contains(&ShutdownStep::RetentionStopped));
+        assert_eq!(report.completed.last(), Some(&ShutdownStep::PoolClosed));
+        assert!(finished.load(Ordering::SeqCst), "掃除が最後まで走った");
         assert!(engine.services().pool.is_closed());
     }
 
