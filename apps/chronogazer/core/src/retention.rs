@@ -683,16 +683,25 @@ mod tests {
         tokio::time::timeout(STOP_DEADLINE, entered.notified())
             .await
             .expect("起動時の掃除が削除役に入る");
+        // 止める合図が実際に送られたことを、合図の受け手を 1 つ足して観測する
+        // （sleep で「stop() が先に走ったはず」とはしない。PR #597 のレビュー）。
+        // `stop()` は合図を送ってから終わりを待つので、ここを抜けた時点で
+        // `stop()` は必ず掃除の途中に呼ばれている。abort する実装なら、この
+        // 時点で abort も済んでいて、掃除の future は二度と poll されない
+        // （= `release` の前に落とされ、`cancelled` が立つ）。
+        let mut requested = task.stop.subscribe();
         let task = Arc::new(task);
         let stopper = {
             let task = task.clone();
             tokio::spawn(async move { task.stop().await })
         };
-        // 止める側を走らせる（合図は送られ、終わりを待っている）。ここは
-        // 「まだ返らないこと」を見るだけで、順序は通知で作ってある。
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(STOP_DEADLINE, requested.wait_for(|stop| *stop))
+            .await
+            .expect("止める合図が送られる")
+            .expect("合図の Sender が生きている");
+        // 掃除は `release` まで終われないので、ここで返っていたら掃除を
+        // 待たずに返った（時間に依らず決まる）。
         assert!(!stopper.is_finished(), "掃除の途中で stop() が返った");
-        assert!(!cancelled.load(Ordering::SeqCst), "掃除が途中で落とされた");
         assert!(!finished.load(Ordering::SeqCst));
 
         // 掃除を終わらせると、次の確認（1 時間後）を待たずに止まる。
