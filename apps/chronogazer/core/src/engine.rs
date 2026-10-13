@@ -59,38 +59,61 @@
 //!
 //! 1. **収集の取り消せない終了の印**（`CollectorService::begin_shutdown`）。
 //!    予算の外で、待たずに立てる。以降の開始（まだ止めていない REST・遅れて
-//!    動いた自動開始）は断られ、下の 4. の `stop()` が終端の操作になる。
-//! 2. 背景タスク（監査の保留の定期の流し込み・保持期間の掃除）を abort する。
-//!    流し込みは途中で止めても失われない（ファイルは行が入ってから消す）。
-//!    これも予算の外（abort は待たない）。
-//! 3. **listener**（LAN の [`ServerSlot`] と常時の loopback の slot から取り出して
+//!    動いた自動開始）は断られ、下の 5. の `stop()` が終端の操作になる。
+//! 2. 背景タスク: 監査の保留の定期の流し込みを abort し、保持期間の掃除に
+//!    止まる合図を送る。流し込みは途中で止めても失われない（ファイルは行が
+//!    入ってから消す）。これも予算の外（どちらも待たない）。
+//! 3. **保持期間の掃除の終わりを待つ**（2026-10-13）。掃除の途中なら、その
+//!    掃除が終わってから止まる。掃除は設定 DB を読むので pool より前で、
+//!    abort はしない（接続の確立の途中で落とすと、その接続が pool の外に残り、
+//!    7. の後で WAL を本体へ書き戻す。理由は [`crate::retention`] の
+//!    「止め方」）。予算が切れてこの待ちが落ちても、掃除のタスクは終わりが
+//!    取れるまで追い続ける: もう一度 `shutdown` を呼ぶと、まだ走っている掃除の
+//!    終わりを（その予算の中で）待ち、終わっていなければ
+//!    [`ShutdownStep::RetentionStopped`] を報告せずに時間切れを返す（PR #597 の
+//!    レビュー。以前は handle を取り出していたので、2 回目は掃除の途中でも
+//!    素通りして pool を閉じていた）。
+//! 4. **listener**（LAN の [`ServerSlot`] と常時の loopback の slot から取り出して
 //!    `stop`）。ハンドラーは同じ pool を使うので pool より前。**slot の lock の取得から
 //!    停止までを待つのは [`listener_stop_cap`]（予算の 4 分の 1、最大 1 秒）まで**
 //!    （#598 のオーナーレビュー P1。lock の取得を含めたのは同じ PR の Copilot の指摘で、
-//!    デスクトップの `server_apply` が適用の間ずっと lock を持つため）: banto の `RunningServer::stop` は開いている要求の完了を最大 5 秒
-//!    待つので、本文を送り切らない要求 1 本で、コンソールを閉じたときの予算（約
-//!    3.5 秒）を使い切って 4. の最終 flush を飛ばしていた。上限を超えたら待つのを
-//!    やめて 4. へ進む（停止そのものは裏のタスクで続き、banto の 5 秒で中断される。
+//!    デスクトップの `server_apply` が適用の間ずっと lock を持つため）: banto の
+//!    `RunningServer::stop` は開いている要求の完了を最大 5 秒待つので、本文を送り
+//!    切らない要求 1 本で、コンソールを閉じたときの予算（約 3.5 秒）を使い切って
+//!    5. の最終 flush を飛ばしていた。上限を超えたら待つのをやめて 5. へ進む（停止
+//!    そのものは裏のタスクで続き、banto の 5 秒で中断される。
 //!    [`ShutdownReport::listener_stop_abandoned`]）。**順序の約束（消費者 → 書き手 →
 //!    生産者 → DB）は変わらない**: 新しい接続は停止の合図で受け付けなくなり、残った
 //!    要求が収集を始めることは 1. の取り消せない印が断る。残った要求が DB を触っても
-//!    pool はまだ開いている（6. で閉じる。閉じた後に届いた要求は DB のエラーになる
+//!    pool はまだ開いている（7. で閉じる。閉じた後に届いた要求は DB のエラーになる
 //!    だけで、記録は失わない）。デスクトップ（5 秒）・Ctrl-C（15 秒）の経路も同じ。
 //!    待つのをやめた停止のタスクは、lock が空き次第そのとき slot にあるもの（適用が
 //!    置いた新しい listener を含む）を止めるので、終了の後に listener を残さない。
 //!    `server_apply` の側を「停止の間 lock を持たない」形に変えなかったのは、適用の間
 //!    lock を持つことが、並行する適用の直列化と、状態の表示が停止〜再起動の隙間を
 //!    見ないための約束（banto #287・#294 の形）で、崩すと途中の状態が見えるため。
-//! 4. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
-//! 5. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
+//! 5. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
+//! 6. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
 //!    値の出どころ（収集にとっての生産者）なので、収集より後（#383 段階3 P3）。
-//! 6. **SQLite の pool を閉じる**（`-wal`/`-shm` を畳む）。
+//! 7. **SQLite の pool を閉じる**（`-wal`/`-shm` を畳む）。
 //!
-//! 3.〜6. は呼び出し側が渡す予算（デスクトップは 5 秒、`banto-serve` は 15 秒）
+//! 残りの危険: 監査の保留の定期の流し込み（banto の `spawn_spool_flusher`）は
+//! 止める口が abort しかないので abort のままにしてある。30 秒ごとの流し込みの
+//! 最中に終了が重なると、保持期間の掃除と同じく pool の外の接続が 7. の後で
+//! DB を書き戻しうる。banto 側に止める合図を足すのが筋（ここでは直していない）。
+//!
+//! 3.〜7. は呼び出し側が渡す予算（デスクトップは 5 秒、`banto-serve` は 15 秒）
 //! の中で行い、切れたら途中で切り上げて [`ShutdownReport::timed_out`] を立てる
 //! （終了で固まるより後始末の一部を失う方がよい。理由はデスクトップの
 //! `EXIT_CLEANUP_BUDGET` の doc）。どこまで済んだかは
 //! [`ShutdownReport::completed`] に順に残る。
+//!
+//! 時間切れで返った後も保持期間の掃除が走っていることがある（3. の待ちを
+//! 落としただけで、掃除そのものは止めない）。その掃除のタスクは **A1 の排他
+//! （の `Arc`）を持っている**ので、[`RunningEngine`] を drop しても掃除が
+//! 終わるまで排他は返らず、別のプロセスが同じ DB を開いている間に裏で掃除が
+//! DB に触れることはない（PR #597 のレビュー）。同じプロセスで同じ DB を
+//! 開き直す経路（起動時の対処の窓など）も、それまでは排他を取れない。
 //!
 //! **A1 の排他は `shutdown` では返さない**。[`RunningEngine`] を drop したとき
 //! （普通はプロセスの終わり）に返る。終了の途中で別のプロセスが同じ DB を
@@ -157,9 +180,10 @@
 //! （どちらも spawn して投げっぱなしで、Tauri のコマンドはまだ受けない）、
 //! (b) LAN の listener の bind が自動開始の spawn より前になる（serve は後。上の 7.）、
 //! (c) 起動時にリストアを適用したときに標準出力へ 1 行出す（リリースビルドの
-//! デスクトップは標準出力が見えない）、(d) 保持期間の掃除を終了で abort する
-//! （以前はプロセスの終わりまで放っておいた。消すのは古い日付のファイルだけで、
-//! 途中で止めても次の起動で続きを消す）。
+//! デスクトップは標準出力が見えない）、(d) 保持期間の掃除を終了で止める
+//! （以前はプロセスの終わりまで放っておいた。B1-2 では abort していたが、
+//! 2026-10-13 から止める合図を送って予算の中で終わりを待つ。掃除の途中なら
+//! それを終えてから止まるので、終了がその分だけ延びうる）。
 
 //! # テスト
 //!
@@ -195,6 +219,7 @@ use crate::host_info::{host_router, HostInfo};
 use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
+use crate::retention::RetentionTask;
 use crate::settings::{data_dir_value_unreadable, store_config, ServerSettings, SettingsService};
 use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
@@ -865,7 +890,14 @@ impl OpenedEngine {
         }
         // #538: 保持期間を過ぎた時系列データファイルの削除（起動時 + 日付が
         // 変わるたび）。
-        let retention = crate::retention::spawn(settings.clone(), collect.clone());
+        // 掃除のタスクにも A1 の排他を持たせる（[`spawn_retention`]）。
+        let instance_lock = Arc::new(instance_lock);
+        let retention = {
+            let (settings, collect) = (settings.clone(), collect.clone());
+            spawn_retention(&instance_lock, move |stop| {
+                crate::retention::run(settings, collect, stop)
+            })
+        };
 
         let services = EngineServices {
             users,
@@ -919,7 +951,7 @@ impl OpenedEngine {
             listen_error,
             background: std::sync::Mutex::new(BackgroundTasks {
                 spool_flusher,
-                retention: Some(retention),
+                retention: Arc::new(retention),
             }),
             #[cfg(test)]
             observations: std::sync::Mutex::new(None),
@@ -928,10 +960,26 @@ impl OpenedEngine {
     }
 }
 
-/// 終了で abort する背景タスク。
+/// 保持期間の掃除を spawn し、A1 の排他（の `Arc`）を掃除のタスクに持たせる。
+/// 終了が時間切れで返り [`RunningEngine`] が drop されても、掃除が終わる
+/// まで排他を返さない（別のプロセスが同じ DB を開いている間に、裏で掃除が
+/// DB に触れない。PR #597 のレビュー）。
+fn spawn_retention<F, Fut>(instance_lock: &Arc<InstanceGuard>, make: F) -> RetentionTask
+where
+    F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    crate::retention::spawn_holding(instance_lock.clone(), make)
+}
+
+/// 終了で止める背景タスク。監査の保留の流し込みは abort、保持期間の掃除は
+/// 止める合図を送って終わりを待つ（モジュール doc「終了の順序」の 2.・3.）。
+/// 掃除は終わりを取れるまで**取り出さない**: 終了が時間切れで手順 3. の
+/// 待ちを落としても、もう一度の `shutdown` がまだ走っている掃除を待つ
+/// （[`crate::retention`] の「止め方」、PR #597 のレビュー）。
 struct BackgroundTasks {
     spool_flusher: Option<JoinHandle<()>>,
-    retention: Option<JoinHandle<()>>,
+    retention: Arc<RetentionTask>,
 }
 
 /// [`RunningEngine::shutdown`] の手順（[`ShutdownReport::completed`] に、
@@ -940,9 +988,13 @@ struct BackgroundTasks {
 pub enum ShutdownStep {
     /// 収集の取り消せない終了の印を立てた。
     Marked,
-    /// 監査の保留の定期の流し込みと保持期間の掃除を abort した。
-    BackgroundTasksAborted,
-    /// listener（LAN と常時の loopback）を止めた（走っていなければ何もしない）。
+    /// 監査の保留の定期の流し込みを abort し、保持期間の掃除に止まる合図を
+    /// 送った（どちらも待たない）。
+    BackgroundTasksStopRequested,
+    /// 保持期間の掃除が終わった（掃除の途中なら終わってから）。
+    RetentionStopped,
+    /// listener（LAN と常時の loopback）を止めた（走っていなければ何もしない。
+    /// 上限で待つのをやめたときも、待つのをやめた時点で済んだものとする）。
     ListenerStopped,
     /// 収集を止めた（最終 flush。失敗は [`ShutdownReport::collect_stop_error`]）。
     CollectStopped,
@@ -968,7 +1020,7 @@ pub struct ShutdownReport {
     pub budget: Duration,
 }
 
-/// 終了で listener の停止を待つ上限（モジュール doc「終了の順序」の 3.）。予算の
+/// 終了で listener の停止を待つ上限（モジュール doc「終了の順序」の 4.）。予算の
 /// 4 分の 1、最大 1 秒。残りを最終 flush（収集の停止）以降に回す。
 pub fn listener_stop_cap(budget: Duration) -> Duration {
     (budget / 4).min(Duration::from_secs(1))
@@ -988,7 +1040,9 @@ pub struct RunningEngine {
     #[cfg(test)]
     observations: std::sync::Mutex<Option<Vec<ShutdownObservation>>>,
     /// A1 の排他。drop で返る（モジュール doc）。
-    _instance_lock: InstanceGuard,
+    /// 保持期間の掃除のタスクも同じ `Arc` を持つので、排他が返るのは両方が
+    /// いなくなったとき（[`spawn_retention`]）。
+    _instance_lock: Arc<InstanceGuard>,
 }
 
 impl RunningEngine {
@@ -1021,7 +1075,8 @@ impl RunningEngine {
     }
 
     /// 終了（モジュール doc「終了の順序」）。何度呼んでもよい（2 回目以降は
-    /// 止めるものが残っていない）が、同時に 2 回走らせないのは呼び出し側の
+    /// 止めるものが残っていない。ただし前回が時間切れで保持期間の掃除が
+    /// まだ終わっていなければ、それを待つ）が、同時に 2 回走らせないのは呼び出し側の
     /// 責任（デスクトップは `ExitCleanupOnce`）。
     pub async fn shutdown(&self, budget: Duration) -> ShutdownReport {
         let label = self.log_label;
@@ -1033,9 +1088,9 @@ impl RunningEngine {
         let _ = services.collect.begin_shutdown();
         completed.push(ShutdownStep::Marked);
 
-        // 2. 背景タスク（abort は待たない）。
-        self.observe(ShutdownStep::BackgroundTasksAborted);
-        {
+        // 2. 背景タスク（流し込みは abort、掃除は合図だけ。どちらも待たない）。
+        self.observe(ShutdownStep::BackgroundTasksStopRequested);
+        let retention = {
             let mut background = self
                 .background
                 .lock()
@@ -1043,17 +1098,23 @@ impl RunningEngine {
             if let Some(handle) = background.spool_flusher.take() {
                 handle.abort();
             }
-            if let Some(handle) = background.retention.take() {
-                handle.abort();
-            }
-        }
-        completed.push(ShutdownStep::BackgroundTasksAborted);
+            background.retention.request_stop();
+            background.retention.clone()
+        };
+        completed.push(ShutdownStep::BackgroundTasksStopRequested);
 
         let mut collect_stop_error = None;
         let mut listener_stop_abandoned = false;
         let cleanup = async {
-            // 3. 消費者（LAN、続いて常時の loopback）。
-            // 停止は裏のタスクで並べて始め、上限までだけ待つ（モジュール doc の 3.）。
+            // 3. 保持期間の掃除の終わり（abort しない。設定 DB を読むので pool より前）。
+            // 前回の終了が時間切れでここを落としていても、まだ走っている掃除を
+            // 待つ（終わっていなければ `RetentionStopped` を報告しない）。
+            self.observe(ShutdownStep::RetentionStopped);
+            retention.stop().await;
+            completed.push(ShutdownStep::RetentionStopped);
+
+            // 4. 消費者（LAN、続いて常時の loopback）。
+            // 停止は裏のタスクで並べて始め、上限までだけ待つ（モジュール doc の 4.）。
             self.observe(ShutdownStep::ListenerStopped);
             // slot の lock の取得も上限の区間に含める（#598 の Copilot の指摘）: デスク
             // トップの `server_apply` は適用の間ずっと slot の lock を持ち、その中で古い
@@ -1083,7 +1144,7 @@ impl RunningEngine {
             }
             completed.push(ShutdownStep::ListenerStopped);
 
-            // 4. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
+            // 5. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
             // 終了は止めない。
             self.observe(ShutdownStep::CollectStopped);
             if let Err(err) = services.collect.stop().await {
@@ -1092,12 +1153,12 @@ impl RunningEngine {
             }
             completed.push(ShutdownStep::CollectStopped);
 
-            // 5. 生産者（Hub の購読）。
+            // 6. 生産者（Hub の購読）。
             self.observe(ShutdownStep::HubShutdown);
             services.hub.shutdown().await;
             completed.push(ShutdownStep::HubShutdown);
 
-            // 6. みんなが書き込む先（DB）。
+            // 7. みんなが書き込む先（DB）。
             self.observe(ShutdownStep::PoolClosed);
             services.pool.close().await;
             completed.push(ShutdownStep::PoolClosed);
@@ -1611,6 +1672,121 @@ mod tests {
         assert!(engine.services().pool.is_closed());
     }
 
+    /// 保持期間の掃除が終了の予算より長いとき: 1 回目の `shutdown` は時間切れで
+    /// 掃除の待ちを落とすが、掃除のタスクは追い続ける。2 回目の `shutdown` は
+    /// 掃除がまだ走っていれば `RetentionStopped` を報告せず（pool も閉じない）、
+    /// 掃除を放せば待って最後まで終える（PR #597 のレビュー）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_again_waits_for_a_retention_sweep_that_outlived_the_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new();
+        let engine = EngineRuntime::start(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("start");
+
+        // 掃除を「途中で止まっている掃除」（合図を見ずに `release` を待つ）に差し替える。
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let stuck = {
+            let (entered, release, finished) = (entered.clone(), release.clone(), finished.clone());
+            Arc::new(RetentionTask::spawn_with(move |_stop| async move {
+                entered.notify_one();
+                release.notified().await;
+                finished.store(true, Ordering::SeqCst);
+            }))
+        };
+        let original = {
+            let mut background = engine.background.lock().unwrap();
+            std::mem::replace(&mut background.retention, stuck)
+        };
+        original.stop().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("掃除が途中に入る");
+
+        let short = Duration::from_millis(200);
+        for attempt in 1..=2 {
+            let report = engine.shutdown(short).await;
+            assert!(report.timed_out, "{attempt} 回目が時間切れにならない");
+            assert_eq!(
+                report.completed,
+                vec![
+                    ShutdownStep::Marked,
+                    ShutdownStep::BackgroundTasksStopRequested
+                ],
+                "{attempt} 回目: 掃除が終わっていないのに先へ進んだ"
+            );
+            assert!(!finished.load(Ordering::SeqCst));
+            assert!(
+                !engine.services().pool.is_closed(),
+                "{attempt} 回目: 掃除の途中で pool を閉じた"
+            );
+        }
+
+        // 掃除を放すと、次の `shutdown` は掃除の終わりを待ってから最後まで進む。
+        release.notify_one();
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out);
+        assert!(report.completed.contains(&ShutdownStep::RetentionStopped));
+        assert_eq!(report.completed.last(), Some(&ShutdownStep::PoolClosed));
+        assert!(finished.load(Ordering::SeqCst), "掃除が最後まで走った");
+        assert!(engine.services().pool.is_closed());
+    }
+
+    /// 終了が時間切れで返り、エンジンが drop されても、まだ走っている保持期間の
+    /// 掃除が A1 の排他を持ち続ける（別のプロセスが同じ DB を開けない）。掃除が
+    /// 終わると排他が返る（PR #597 のレビュー）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retention_sweep_that_outlived_shutdown_keeps_the_instance_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new();
+        let cfg = config(dir.path(), EngineListen::Disabled);
+        let db_path = cfg.db_path.clone();
+        let engine = EngineRuntime::start(cfg).await.expect("start");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let stuck = {
+            let (entered, release, finished) = (entered.clone(), release.clone(), finished.clone());
+            Arc::new(spawn_retention(
+                &engine._instance_lock,
+                move |_stop| async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    finished.store(true, Ordering::SeqCst);
+                },
+            ))
+        };
+        let original = {
+            let mut background = engine.background.lock().unwrap();
+            std::mem::replace(&mut background.retention, stuck)
+        };
+        original.stop().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("掃除が途中に入る");
+
+        let report = engine.shutdown(Duration::from_millis(200)).await;
+        assert!(report.timed_out);
+        drop(engine);
+        assert!(
+            matches!(
+                acquire_for_db(&db_path, ChronoGazerHost::Serve),
+                Err(InstanceLockFailure::AlreadyRunning { .. })
+            ),
+            "掃除が走っているのに排他が返った"
+        );
+
+        release.notify_one();
+        wait_until("掃除が終わって排他が返ること", || {
+            acquire_for_db(&db_path, ChronoGazerHost::Serve).is_ok()
+        })
+        .await;
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
     /// レジストリに「シミュレータの Modbus TCP 接続 1 / グループ 1 / タグ 1」を
     /// 入れる（`tests/collect_roundtrip.rs` の `register` と同じ形）。
     async fn register_modbus(pool: &DbPool, port: u16) {
@@ -1666,7 +1842,8 @@ mod tests {
             .expect("タグ");
     }
 
-    /// 終了の順序: 印 → 背景タスク → listener → 収集 → Hub → pool。シミュレータ
+    /// 終了の順序: 印 → 背景タスク → 保持期間の掃除の終わり → listener → 収集
+    /// → Hub → pool。シミュレータ
     /// 相手に**本当に収集している**エンジンで、各手順の直前の実際の状態を見る。
     /// どの 2 つを入れ替えても、どこかの直前の状態が食い違って落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1701,7 +1878,8 @@ mod tests {
             report.completed,
             vec![
                 ShutdownStep::Marked,
-                ShutdownStep::BackgroundTasksAborted,
+                ShutdownStep::BackgroundTasksStopRequested,
+                ShutdownStep::RetentionStopped,
                 ShutdownStep::ListenerStopped,
                 ShutdownStep::CollectStopped,
                 ShutdownStep::HubShutdown,
@@ -1731,7 +1909,14 @@ mod tests {
                 marked: true,
                 listener_open: true,
                 collecting: true,
-                ..obs(ShutdownStep::BackgroundTasksAborted)
+                ..obs(ShutdownStep::BackgroundTasksStopRequested)
+            },
+            // 保持期間の掃除を待つ前。まだ何も止めていない（印だけ）。
+            ShutdownObservation {
+                marked: true,
+                listener_open: true,
+                collecting: true,
+                ..obs(ShutdownStep::RetentionStopped)
             },
             ShutdownObservation {
                 marked: true,
