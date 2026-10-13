@@ -100,6 +100,9 @@ fn listen_plan_table() {
         assert_eq!(plan.loopback, cfg(loopback, 8721), "{label}");
         assert_eq!(plan.lan, lan.map(|lan| cfg(lan, 8721)), "{label}");
         assert_eq!(plan.exposes_lan(), exposes, "{label}");
+        // `0.0.0.0` にまとめたときだけ、開けなければ `127.0.0.1` に落とす（#598）。
+        let expected_fallback = (plan.loopback.bind == "0.0.0.0").then(|| cfg("127.0.0.1", 8721));
+        assert_eq!(plan.loopback_fallback, expected_fallback, "{label}");
     }
 }
 
@@ -440,9 +443,35 @@ async fn setup_is_closed_while_exposed_to_the_lan() {
     let started = start(options(dir.path())).await.expect("start");
     assert_eq!(started.plan().loopback.bind, "0.0.0.0");
     assert!(started.plan().exposes_lan());
+    assert!(started.exposes_lan().await);
     let port = started.engine().loopback_addr().await.unwrap().port();
     let (status, _) = post_setup(&format!("http://127.0.0.1:{port}/api/auth/setup")).await;
     assert_eq!(status, 403);
+    assert_eq!(
+        started.shutdown(Duration::from_secs(15)).await.exit_code(),
+        0
+    );
+}
+
+/// #598 のレビュー: 計画では LAN に出す（特定の IP）が、その bind が失敗して
+/// loopback だけで動いているなら、最初の管理者の作成を開ける（新しい環境で作る
+/// 手段を失わない）。LAN を開けなかった理由は残る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_opens_when_the_planned_lan_listener_could_not_bind() {
+    let dir = TempDir::new();
+    prepare_root(
+        dir.path(),
+        &[("server.enabled", "true"), ("server.bind", "203.0.113.1")],
+    )
+    .await;
+    let started = start(options(dir.path())).await.expect("start");
+    assert!(started.plan().exposes_lan(), "計画では LAN に出す");
+    assert!(!started.exposes_lan().await, "実際には LAN に出ていない");
+    assert!(started.engine().listen_error().is_some());
+    let port = started.engine().loopback_addr().await.unwrap().port();
+    let (status, body) = post_setup(&format!("http://127.0.0.1:{port}/api/auth/setup")).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["success"], true, "{body}");
     assert_eq!(
         started.shutdown(Duration::from_secs(15)).await.exit_code(),
         0

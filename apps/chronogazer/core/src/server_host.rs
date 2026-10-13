@@ -36,11 +36,19 @@
 //!   後の方が `WSAEADDRINUSE` になる）。bind が loopback そのもの（`127.0.0.1` など・
 //!   `localhost`）なら LAN の分は無い（loopback の 1 本だけ）。それ以外（特定の
 //!   LAN の IP）は 2 本。
-//! - `POST /api/auth/setup`（最初の管理者の作成）は **LAN に出していないときだけ**
-//!   開ける（[`ListenPlan::exposes_lan`]）。その間に届くのは同じ PC からの要求だけで、
-//!   デスクトップの初回セットアップ（その PC の前の人が最初の管理者になる）と同じ
-//!   範囲。LAN に出しているときに開けると、LAN の誰でも最初の管理者になれてしまう。
-//!   B2-1 の loopback grant が入ったら、そちらに置き換える。
+//! - 1 本にまとめた `0.0.0.0` を開けない（別のプロセスが `<LAN の IP>:port` だけを
+//!   持っている等）ときは、`127.0.0.1:port` に落として起動を続け、LAN を開けなかった
+//!   理由を残す（[`ListenPlan::loopback_fallback`]、#598 のレビュー。「loopback は常に、
+//!   LAN は best-effort」の約束をまとめた場合にも守る）。
+//! - `POST /api/auth/setup`（最初の管理者の作成）は、**実際に loopback のアドレスに
+//!   bind できた listener だけ**で開ける（計画ではなく bind の結果で決める。#598 の
+//!   レビュー。`OpenedEngine::with_loopback_only_setup`）。そこに届くのは同じ PC からの
+//!   要求だけで、デスクトップの初回セットアップ（その PC の前の人が最初の管理者に
+//!   なる）と同じ範囲。LAN の bind が失敗して loopback だけで動いていれば開く（新しい
+//!   環境で最初の管理者を作る手段を失わない）。`0.0.0.0` で LAN に出ている listener と
+//!   LAN の listener では閉じる（LAN の誰でも最初の管理者になれてしまう）。後から LAN の
+//!   listener を入れ替える経路（決定 9）のルーターも閉じたまま。B2-1 の loopback grant が
+//!   入ったら、そちらに置き換える。
 //!
 //! # 起動の失敗（[`StartFailure`]）
 //!
@@ -156,12 +164,16 @@ pub struct ListenPlan {
     /// 常に開く listener。普通は `127.0.0.1`、LAN と 1 本にまとめたときは
     /// `0.0.0.0`。開けなければ起動を止める。
     pub loopback: ServerConfig,
+    /// `loopback` を開けなかったときの代わり（`loopback` を `0.0.0.0` にまとめた
+    /// ときだけ `127.0.0.1:port`）。
+    pub loopback_fallback: Option<ServerConfig>,
     /// 足す LAN の listener（開けなくても起動を続ける）。
     pub lan: Option<ServerConfig>,
 }
 
 impl ListenPlan {
-    /// LAN から届く listener があるか（`POST /api/auth/setup` を開けない条件）。
+    /// 計画の上で LAN から届く listener があるか（実際に開けたかは
+    /// [`StartedServer::exposes_lan`]）。
     pub fn exposes_lan(&self) -> bool {
         self.lan.is_some() || !bind_is_loopback(&self.loopback.bind)
     }
@@ -195,12 +207,14 @@ pub fn listen_plan(server: &ServerSettings, lan_allowed: bool) -> ListenPlan {
     if !lan_allowed {
         return ListenPlan {
             loopback,
+            loopback_fallback: None,
             lan: None,
         };
     }
     if bind_is_loopback(&server.bind) {
         return ListenPlan {
             loopback,
+            loopback_fallback: None,
             lan: None,
         };
     }
@@ -210,11 +224,13 @@ pub fn listen_plan(server: &ServerSettings, lan_allowed: bool) -> ListenPlan {
                 bind: server.bind.trim().to_string(),
                 port,
             },
+            loopback_fallback: Some(loopback),
             lan: None,
         };
     }
     ListenPlan {
         loopback,
+        loopback_fallback: None,
         lan: Some(ServerConfig {
             bind: server.bind.clone(),
             port,
@@ -517,10 +533,14 @@ pub async fn start(options: ServerOptions) -> Result<StartedServer, StartFailure
         Some(config) => EngineListen::BestEffort(config.clone()),
         None => EngineListen::Disabled,
     };
-    let engine = opened
+    let mut opened = opened
         .with_loopback(plan.loopback.clone())
         .with_listen(lan)
-        .with_allow_setup(!plan.exposes_lan())
+        .with_loopback_only_setup();
+    if let Some(fallback) = &plan.loopback_fallback {
+        opened = opened.with_loopback_fallback(fallback.clone());
+    }
+    let engine = opened
         .start()
         .await
         .map_err(|err| failure_from_engine(&err, &layout))?;
@@ -556,6 +576,18 @@ impl StartedServer {
 
     pub fn plan(&self) -> &ListenPlan {
         &self.plan
+    }
+
+    /// 実際に LAN から届く listener が開いているか（常時の listener が loopback 以外の
+    /// アドレス（`0.0.0.0`）に bind できた、または LAN の listener が開いている）。
+    /// 最初の管理者の作成が閉じているかと同じ条件。
+    pub async fn exposes_lan(&self) -> bool {
+        let loopback_exposed = self
+            .engine
+            .loopback_addr()
+            .await
+            .is_some_and(|addr| !addr.ip().is_loopback());
+        loopback_exposed || self.engine.server_slot().local_addr().await.is_some()
     }
 
     /// 設定のログの保持日数（`None` は無制限）。

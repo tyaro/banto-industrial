@@ -455,7 +455,7 @@ async fn announce(server: &StartedServer) {
             "{SERVER_LABEL}: 待ち受け（この PC から）: http://127.0.0.1:{}/",
             addr.port()
         );
-        if server.plan().loopback.bind != "127.0.0.1" {
+        if !addr.ip().is_loopback() {
             for url in chronogazer_core::listening_urls(addr) {
                 println!("{SERVER_LABEL}: 待ち受け（LAN）: {url}");
             }
@@ -471,7 +471,7 @@ async fn announce(server: &StartedServer) {
             "{SERVER_LABEL}: LAN の待ち受けを開けませんでした（この PC からは使えます）: {err}"
         );
     }
-    if server.plan().exposes_lan() {
+    if server.exposes_lan().await {
         println!(
             "{SERVER_LABEL}: LAN に公開しているため、最初の管理者の作成（/api/auth/setup）は閉じています"
         );
