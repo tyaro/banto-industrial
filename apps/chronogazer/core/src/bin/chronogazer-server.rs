@@ -190,6 +190,54 @@ struct StopController {
     /// 標準出力・標準エラー出力の向け直しの後始末（無ければ何もしない）。ログは
     /// A1 の排他を取った後に開くので、後から入れる（[`StopController::set_flush`]）。
     flush: Mutex<Option<Flush>>,
+    /// 後始末の本体の結果を、戻る前にディスクまで書く記録先（無ければ標準エラー
+    /// 出力。[`StopController::set_record`]）。
+    record: Mutex<Option<LineSink>>,
+}
+
+/// 1 行を記録する口（戻った時点で記録が済んでいること）。
+type LineSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 後始末の本体の結果の記録（本体を走らせた経路 `origin` の名で、本体について
+/// 1 回だけ）。最終の書き出しの失敗と、完了（予算切れでなければ）。予算切れは
+/// エンジンが自分で 1 行出している（`engine::RunningEngine::shutdown`）。
+fn body_log_lines(origin: StopOrigin, summary: &ServerShutdownSummary) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(err) = &summary.report.collect_stop_error {
+        lines.push(format!(
+            "{SERVER_LABEL}: 最終の書き出しに失敗しました: {err}"
+        ));
+    }
+    if !summary.report.timed_out {
+        lines.push(format!(
+            "{SERVER_LABEL}: 終了の後始末が完了しました（{}）",
+            origin.label()
+        ));
+    }
+    lines
+}
+
+/// 後始末を 1 回だけ走らせ、2 つ目以降には完了を待たせる（`ExitCleanupOnce`）。
+/// **本体の結果の記録は、本体を走らせたワーカーの中で、結果を公開する前に書き終える**
+/// （#598 のレビュー。banto-hub の `run_exit_cleanup` と同じ形、#587）: 後から来た
+/// 待ち手（例: Ctrl-C の後始末の途中で閉じたウィンドウのハンドラー）は結果の
+/// 公開と同時に起きて戻り、Windows はハンドラーの戻りでプロセスを終わらせる
+/// ので、公開の後に記録すると完了の行が残らないことがある。待ちの打ち切りの記録は
+/// 各呼び出しが出す（[`StopController::report`]）。
+fn run_cleanup(
+    once: &ExitCleanupOnce<ServerShutdownSummary, StopOrigin>,
+    origin: StopOrigin,
+    budget: Duration,
+    work: impl FnOnce(Instant) -> ServerShutdownSummary + Send + 'static,
+    record: LineSink,
+) -> ExitCleanupReport<ServerShutdownSummary, StopOrigin> {
+    once.run_or_wait(origin, budget, move |deadline| {
+        let summary = work(deadline);
+        for line in body_log_lines(origin, &summary) {
+            record(&line);
+        }
+        summary
+    })
 }
 
 impl StopController {
@@ -204,7 +252,20 @@ impl StopController {
             changed: Condvar::new(),
             once: ExitCleanupOnce::new(),
             flush: Mutex::new(None),
+            record: Mutex::new(None),
         }
+    }
+
+    fn set_record(&self, record: LineSink) {
+        *self.record.lock().unwrap_or_else(|p| p.into_inner()) = Some(record);
+    }
+
+    fn record_sink(&self) -> LineSink {
+        self.record
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or_else(|| Arc::new(|line: &str| eprintln!("{line}")))
     }
 
     fn set_flush(&self, flush: Flush) {
@@ -298,15 +359,18 @@ impl StopController {
             }
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
-        Some(
-            self.once
-                .run_or_wait(origin, remaining, move |work_deadline| {
-                    let engine_budget = work_deadline
-                        .saturating_duration_since(Instant::now())
-                        .saturating_sub(CLOSE_MARGIN);
-                    runtime.block_on(server.shutdown(engine_budget))
-                }),
-        )
+        Some(run_cleanup(
+            &self.once,
+            origin,
+            remaining,
+            move |work_deadline| {
+                let engine_budget = work_deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(CLOSE_MARGIN);
+                runtime.block_on(server.shutdown(engine_budget))
+            },
+            self.record_sink(),
+        ))
     }
 
     /// 後始末の結果を出す（本体を走らせた呼び出しだけが結果を出す。banto-hub・
@@ -325,10 +389,8 @@ impl StopController {
                 EXIT_START_FAILED
             }
             Some(ExitCleanupReport::RanWork(outcome)) => match outcome {
-                banto_exit_once::ExitCleanupOutcome::Finished(summary) => {
-                    describe_summary(origin, &summary);
-                    summary.exit_code()
-                }
+                // 本体の結果はワーカーが公開の前に記録済み（`run_cleanup`）。
+                banto_exit_once::ExitCleanupOutcome::Finished(summary) => summary.exit_code(),
                 banto_exit_once::ExitCleanupOutcome::TimedOut => {
                     eprintln!(
                         "{SERVER_LABEL}: 終了の後始末が{}秒以内に終わりませんでした（{}）。最後の数秒の記録が失われた可能性があります。",
@@ -384,20 +446,6 @@ impl StopController {
     }
 }
 
-fn describe_summary(origin: StopOrigin, summary: &ServerShutdownSummary) {
-    if let Some(err) = &summary.report.collect_stop_error {
-        eprintln!("{SERVER_LABEL}: 最終の書き出しに失敗しました: {err}");
-    }
-    if summary.report.timed_out {
-        // エンジンが自分で 1 行出している（`engine::RunningEngine::shutdown`）。
-        return;
-    }
-    println!(
-        "{SERVER_LABEL}: 終了の後始末が完了しました（{}）",
-        origin.label()
-    );
-}
-
 fn run(options: CliOptions) -> i32 {
     // 1. ルート。
     let root = resolve_data_root_from_env();
@@ -440,7 +488,7 @@ fn run(options: CliOptions) -> i32 {
     // 4. ログ（排他を取った後・リストア予約の適用と DB の初期化の前。#598 の
     // オーナーレビュー P2: DB を開けない理由と対処、リストア予約の警告を日次ログに
     // 残す。Windows だけ - 標準ハンドルの向け直しは Windows の API）。
-    let (log, flush) = match open_log(&layout) {
+    let (log, flush, record) = match open_log(&layout) {
         Ok(opened) => opened,
         Err(reason) => {
             // 日次ログはこの bin の唯一の永続の診断（サービスではコンソールも無い）。
@@ -454,6 +502,9 @@ fn run(options: CliOptions) -> i32 {
         }
     };
     controller.set_flush(flush);
+    if let Some(record) = record {
+        controller.set_record(record);
+    }
     println!(
         "{SERVER_LABEL}: 起動します（版 {}、pid {}）",
         env!("CARGO_PKG_VERSION"),
@@ -588,7 +639,8 @@ async fn announce(server: &StartedServer) {
 
 type Flush = Box<dyn Fn(Duration) + Send + Sync>;
 
-type OpenedLog = (Option<Arc<Mutex<ServerLog>>>, Flush);
+/// 開いたログ・向け直しの後始末・パイプを通さない記録先（[`StopController::set_record`]）。
+type OpenedLog = (Option<Arc<Mutex<ServerLog>>>, Flush, Option<LineSink>);
 
 /// 日次ログを開き、標準出力・標準エラー出力をそこへ向け直す。
 ///
@@ -606,13 +658,18 @@ fn open_log(layout: &DataLayout) -> Result<OpenedLog, String> {
                 "{SERVER_LABEL}: ログ（{}）を開けませんでした。コンソールだけに出します: {err}",
                 layout.logs_dir().display()
             );
-            return Ok((None, Box::new(|_| {})));
+            return Ok((None, Box::new(|_| {}), None));
         }
     };
     match console::redirect_stdio(log.clone()) {
         Ok(redirect) => {
             let redirect = Arc::new(redirect);
-            Ok((Some(log), Box::new(move |wait| redirect.finish(wait))))
+            let through = Arc::clone(&redirect);
+            Ok((
+                Some(log),
+                Box::new(move |wait| redirect.finish(wait)),
+                Some(Arc::new(move |line: &str| through.write_through(line))),
+            ))
         }
         Err(err) => {
             let reason = format!(
@@ -629,7 +686,7 @@ fn open_log(layout: &DataLayout) -> Result<OpenedLog, String> {
 
 #[cfg(not(windows))]
 fn open_log(_layout: &DataLayout) -> Result<OpenedLog, String> {
-    Ok((None, Box::new(|_| {})))
+    Ok((None, Box::new(|_| {}), None))
 }
 
 /// 止める合図の受け口を用意する。Windows のコンソールの Ctrl のハンドラーを
@@ -754,6 +811,75 @@ mod tests {
             !controller.begin_close(),
             "main の終わりの後に close を始めた"
         );
+    }
+
+    fn finished_summary() -> ServerShutdownSummary {
+        ServerShutdownSummary {
+            report: chronogazer_core::engine::ShutdownReport {
+                completed: Vec::new(),
+                collect_stop_error: None,
+                timed_out: false,
+                listener_stop_abandoned: false,
+                budget: Duration::from_secs(1),
+            },
+            endpoint_cleared: true,
+        }
+    }
+
+    /// #598 のレビュー（banto-hub #587 と同じ型）: 後始末の本体の結果の記録は、本体を
+    /// 走らせたワーカーの中で結果を公開する前に済む。記録が遅くても、後から来た
+    /// 待ち手（`ReceivedPrior`）が戻った時点で完了の行は既にあり、ちょうど 1 行。
+    #[test]
+    fn the_body_result_is_recorded_before_a_waiter_returns() {
+        let once = Arc::new(ExitCleanupOnce::new());
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let slow_record: LineSink = {
+            let lines = lines.clone();
+            Arc::new(move |line: &str| {
+                std::thread::sleep(Duration::from_millis(300));
+                lines.lock().unwrap().push(line.to_string());
+            })
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let first = {
+            let (once, record) = (once.clone(), slow_record.clone());
+            std::thread::spawn(move || {
+                run_cleanup(
+                    &once,
+                    StopOrigin::Interrupt,
+                    Duration::from_secs(10),
+                    move |_| {
+                        let _ = entered_tx.send(());
+                        std::thread::sleep(Duration::from_millis(100));
+                        finished_summary()
+                    },
+                    record,
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+        // 本体の途中で後から来た待ち手（閉じたウィンドウのハンドラー）。
+        let report = run_cleanup(
+            &once,
+            StopOrigin::Close,
+            Duration::from_secs(10),
+            |_| unreachable!("本体は 1 回だけ"),
+            slow_record,
+        );
+        assert!(
+            matches!(report, ExitCleanupReport::ReceivedPrior { .. }),
+            "{report:?}"
+        );
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec!["chronogazer-server: 終了の後始末が完了しました（Ctrl-C）".to_string()],
+            "待ち手が戻った時点で完了の行が無い・2 行ある"
+        );
+        assert!(matches!(
+            first.join().unwrap(),
+            ExitCleanupReport::RanWork(_)
+        ));
+        assert_eq!(lines.lock().unwrap().len(), 1);
     }
 
     #[test]

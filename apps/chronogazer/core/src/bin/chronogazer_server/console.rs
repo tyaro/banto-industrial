@@ -85,6 +85,10 @@ pub struct StdioRedirect {
     original_err: RawHandle,
     done: Mutex<Option<Receiver<()>>>,
     finished: AtomicBool,
+    /// [`StdioRedirect::write_through`] がパイプを通さずに書く先。
+    log: Arc<Mutex<ServerLog>>,
+    /// コンソールへ写す列（[`StdioRedirect::write_through`] も使う）。
+    tee: Option<SyncSender<String>>,
 }
 
 /// 標準出力・標準エラー出力を `log` へ向け直し、元の標準エラー出力にも写す。
@@ -102,6 +106,8 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
     let original_err = RawHandle::new(unsafe { GetStdHandle(STD_ERROR_HANDLE) });
 
     let (tee_tx, tee_rx) = mpsc::sync_channel::<String>(TEE_QUEUE);
+    let direct_tee = original_err.is_usable().then(|| tee_tx.clone());
+    let direct_log = Arc::clone(&log);
     if original_err.is_usable() {
         std::thread::Builder::new()
             .name("server-log-tee".into())
@@ -156,6 +162,8 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
         original_err,
         done: Mutex::new(Some(done_rx)),
         finished: AtomicBool::new(false),
+        log: direct_log,
+        tee: direct_tee,
     })
 }
 
@@ -241,6 +249,25 @@ fn tee_to_console(target: RawHandle, rx: Receiver<String>) {
 }
 
 impl StdioRedirect {
+    /// 1 行を**パイプを通さずに**ログファイルへ書いてディスクへ書き出し
+    /// （`sync_all`）、コンソールの列にも入れる。戻った時点で行はディスクにある
+    /// （#598: 後始末の本体の結果の記録を、結果を公開する前に確実に残すため。
+    /// `eprintln!` はパイプを通り、読み取り側のスレッドが書くまでの間に OS が
+    /// プロセスを終わらせうる）。向け直しを終えた後は標準エラー出力へ。
+    pub fn write_through(&self, line: &str) {
+        if self.finished.load(Ordering::SeqCst) {
+            eprintln!("{line}");
+            return;
+        }
+        if let Ok(mut log) = self.log.lock() {
+            log.write_line(line);
+            log.flush();
+        }
+        if let Some(tee) = &self.tee {
+            let _ = tee.try_send(line.to_string());
+        }
+    }
+
     /// 標準ハンドルを元に戻し、残りをログに書き終えるのを `wait` まで待つ
     /// （モジュール doc「向け直し」。2 回目以降の呼び出しも、最初の呼び出しが
     /// 終わるまで戻らない）。
