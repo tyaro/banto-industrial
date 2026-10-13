@@ -35,7 +35,10 @@
 //! `--control-stdin`（自動テスト用。使い方には出さない）: 標準入力の行で止める
 //! （`ctrl-c` = Ctrl-C と同じ経路、`close` = `CTRL_CLOSE_EVENT` のハンドラーと
 //! 同じ関数を呼んだ後、OS と同じくプロセスを終わらせる。標準入力が閉じたら Ctrl-C と
-//! 同じ）。標準入力を握っている者はプロセスを止められるので、新しい権限は与えない。
+//! 同じ）。**デバッグビルドだけ**（`#[cfg(debug_assertions)]`。統合テストは
+//! debug ビルドで動く）。リリースビルドでは未知の引数として拒否する（終了コード 64）-
+//! 標準入力をつないだ親プロセスなどから停止を指示できる入口を本番に残さないため
+//! （デスクトップの `CHRONOGAZER_TEST_FAIL_TRAY` と同じ扱い）。
 
 #[cfg(windows)]
 #[path = "chronogazer_server/console.rs"]
@@ -84,11 +87,27 @@ fn parse_args(args: &[String]) -> Result<Option<CliOptions>, String> {
     for arg in args {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
-            "--control-stdin" => options.control_stdin = true,
+            other if accept_debug_only_arg(other, &mut options) => {}
             other => return Err(format!("不明な引数です: '{other}'")),
         }
     }
     Ok(Some(options))
+}
+
+/// テスト用の隠し引数（`--control-stdin`）。**デバッグビルドだけ**受け付ける
+/// （モジュール doc）。リリースビルドでは常に `false` で、未知の引数として拒否される。
+#[cfg(debug_assertions)]
+fn accept_debug_only_arg(arg: &str, options: &mut CliOptions) -> bool {
+    if arg == "--control-stdin" {
+        options.control_stdin = true;
+        return true;
+    }
+    false
+}
+
+#[cfg(not(debug_assertions))]
+fn accept_debug_only_arg(_arg: &str, _options: &mut CliOptions) -> bool {
+    false
 }
 
 fn print_usage() {
@@ -568,12 +587,16 @@ mod tests {
         assert_eq!(parse_args(&[]), Ok(Some(CliOptions::default())));
         assert_eq!(parse_args(&args(&["--help"])), Ok(None));
         assert_eq!(parse_args(&args(&["-h"])), Ok(None));
+        // テスト用の隠し引数はデバッグビルドだけ受け、リリースビルドでは拒否する。
+        #[cfg(debug_assertions)]
         assert_eq!(
             parse_args(&args(&["--control-stdin"])),
             Ok(Some(CliOptions {
                 control_stdin: true
             }))
         );
+        #[cfg(not(debug_assertions))]
+        assert!(parse_args(&args(&["--control-stdin"])).is_err());
         // B3 の `run-service` などはまだ無い。
         for unknown in ["run-service", "install", "--port", "x"] {
             assert!(parse_args(&args(&[unknown])).is_err(), "{unknown}");
