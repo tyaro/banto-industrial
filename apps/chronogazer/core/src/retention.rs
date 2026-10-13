@@ -63,6 +63,11 @@
 //! 切れで handle ごと落ちてタスクが切り離され、次の `stop()` は掃除の途中でも
 //! すぐ「止まった」と返してしまう。
 //!
+//! エンジンは掃除のタスクに **A1 の排他（の `Arc`）を持たせる**
+//! （[`spawn_holding`]）。終了が時間切れで返ってエンジンが drop されても、
+//! 掃除が終わるまで排他は返らないので、別のプロセスが同じ DB を開いて
+//! いる間に裏でこの掃除が DB に触れることはない（PR #597 のレビュー）。
+//!
 //! abort しない理由: 掃除は最初に [`store_config`] で設定 DB を読み、その
 //! `pool.acquire()` は新しい接続を開くことが多い。sqlx（sqlite）の接続の確立は
 //! 別の OS スレッドで進むので、確立の途中で future を落とすと、そのスレッドは
@@ -248,7 +253,11 @@ pub async fn run_with(
 ) {
     let mut last_swept: Option<LocalDate> = None;
     loop {
-        if *stop.borrow_and_update() {
+        // `has_changed()` が `Err` = `Sender` が drop された（持ち主がいなくなった）。
+        // 値だけを見ると、合図を送らずに drop されたとき（タスクの最初の poll
+        // より前・待ちの `sleep` が勝った直後）は `false` のままで、持ち主が
+        // 消えた後に掃除を 1 回まるごと走らせてしまう（PR #597 のレビュー）。
+        if stop.has_changed().is_err() || *stop.borrow_and_update() {
             return;
         }
         let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
@@ -276,7 +285,7 @@ pub async fn run_with(
     }
 }
 
-/// spawn 済みの常駐ループ（[`spawn`]）と、その止める合図。止めるのは
+/// spawn 済みの常駐ループ（[`spawn_holding`]）と、その止める合図。止めるのは
 /// [`RetentionTask::stop`]（abort しない。モジュール doc「止め方」）。drop すると
 /// 合図の `Sender` が落ちるので、ループは（掃除の途中ならそれを終えてから）
 /// 止まるが、終わりは待たない。
@@ -328,9 +337,23 @@ impl RetentionTask {
     }
 }
 
-/// [`run`] を現在のランタイムに spawn する（エンジンの起動から）。
-pub fn spawn(settings: SettingsService, collect: CollectorService) -> RetentionTask {
-    RetentionTask::spawn_with(move |stop| run(settings, collect, stop))
+/// 常駐ループ（エンジンからは [`run`]）を今のランタイムに spawn し、`hold` を
+/// **ループが終わるまで**タスクに持たせる。エンジンは A1 の排他（の `Arc`）を
+/// 渡す: 終了が時間切れで返り、エンジンが drop された後も、掃除が DB に
+/// 触れている間は排他を返さない（モジュール doc「止め方」、PR #597 のレビュー）。
+pub(crate) fn spawn_holding<H, F, Fut>(hold: H, make: F) -> RetentionTask
+where
+    H: Send + 'static,
+    F: FnOnce(watch::Receiver<bool>) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    RetentionTask::spawn_with(move |stop| {
+        let looping = make(stop);
+        async move {
+            let _hold = hold;
+            looping.await
+        }
+    })
 }
 
 #[cfg(test)]
@@ -772,6 +795,37 @@ mod tests {
         tokio::time::timeout(STOP_DEADLINE, task.stop())
             .await
             .expect("待ちの間に止めればすぐ返る");
+    }
+
+    /// 合図を送らずに `Sender` を drop したら（タスクの最初の poll より前に持ち主が
+    /// いなくなった）、掃除を 1 回も走らせずに止まる。値は `false` のままなので、
+    /// 値だけを見ると掃除を 1 回まるごと走らせる（PR #597 のレビュー）。
+    #[tokio::test]
+    async fn a_sender_dropped_before_the_first_poll_runs_no_sweep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let prune: Pruner = {
+            let sweeps = sweeps.clone();
+            Arc::new(move |_days, _today| {
+                sweeps.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(0) })
+            })
+        };
+        let svc = settings_with(Some(7)).await;
+        let clock = Arc::new(ManualClock::new(DAY1_MS, OFFSET_MS));
+        let (sender, receiver) = watch::channel(false);
+        drop(sender);
+        tokio::time::timeout(
+            STOP_DEADLINE,
+            run_with(svc, prune, clock, LONG_INTERVAL, receiver),
+        )
+        .await
+        .expect("持ち主がいなければすぐ止まる");
+        assert_eq!(
+            sweeps.load(Ordering::SeqCst),
+            0,
+            "持ち主が消えた後に掃除した"
+        );
     }
 
     /// 合図の `Sender` を drop しても（持ち主がいなくなった）ループは止まる。
