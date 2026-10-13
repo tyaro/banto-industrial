@@ -56,18 +56,28 @@
 //!
 //! 1. **収集の取り消せない終了の印**（`CollectorService::begin_shutdown`）。
 //!    予算の外で、待たずに立てる。以降の開始（まだ止めていない REST・遅れて
-//!    動いた自動開始）は断られ、下の 4. の `stop()` が終端の操作になる。
-//! 2. 背景タスク（監査の保留の定期の流し込み・保持期間の掃除）を abort する。
-//!    流し込みは途中で止めても失われない（ファイルは行が入ってから消す）。
-//!    これも予算の外（abort は待たない）。
-//! 3. **LAN の listener**（[`ServerSlot`] から取り出して `stop`）。ハンドラーは
+//!    動いた自動開始）は断られ、下の 5. の `stop()` が終端の操作になる。
+//! 2. 背景タスク: 監査の保留の定期の流し込みを abort し、保持期間の掃除に
+//!    止まる合図を送る。流し込みは途中で止めても失われない（ファイルは行が
+//!    入ってから消す）。これも予算の外（どちらも待たない）。
+//! 3. **保持期間の掃除の終わりを待つ**（2026-10-13）。掃除の途中なら、その
+//!    掃除が終わってから止まる。掃除は設定 DB を読むので pool より前で、
+//!    abort はしない（接続の確立の途中で落とすと、その接続が pool の外に残り、
+//!    7. の後で WAL を本体へ書き戻す。理由は [`crate::retention`] の
+//!    「止め方」）。
+//! 4. **LAN の listener**（[`ServerSlot`] から取り出して `stop`）。ハンドラーは
 //!    同じ pool を使うので pool より前。
-//! 4. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
-//! 5. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
+//! 5. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
+//! 6. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
 //!    値の出どころ（収集にとっての生産者）なので、収集より後（#383 段階3 P3）。
-//! 6. **SQLite の pool を閉じる**（`-wal`/`-shm` を畳む）。
+//! 7. **SQLite の pool を閉じる**（`-wal`/`-shm` を畳む）。
 //!
-//! 3.〜6. は呼び出し側が渡す予算（デスクトップは 5 秒、`banto-serve` は 15 秒）
+//! 残りの危険: 監査の保留の定期の流し込み（banto の `spawn_spool_flusher`）は
+//! 止める口が abort しかないので abort のままにしてある。30 秒ごとの流し込みの
+//! 最中に終了が重なると、保持期間の掃除と同じく pool の外の接続が 7. の後で
+//! DB を書き戻しうる。banto 側に止める合図を足すのが筋（ここでは直していない）。
+//!
+//! 3.〜7. は呼び出し側が渡す予算（デスクトップは 5 秒、`banto-serve` は 15 秒）
 //! の中で行い、切れたら途中で切り上げて [`ShutdownReport::timed_out`] を立てる
 //! （終了で固まるより後始末の一部を失う方がよい。理由はデスクトップの
 //! `EXIT_CLEANUP_BUDGET` の doc）。どこまで済んだかは
@@ -130,9 +140,10 @@
 //! （どちらも spawn して投げっぱなしで、Tauri のコマンドはまだ受けない）、
 //! (b) LAN の listener の bind が自動開始の spawn より前になる（serve は後。上の 7.）、
 //! (c) 起動時にリストアを適用したときに標準出力へ 1 行出す（リリースビルドの
-//! デスクトップは標準出力が見えない）、(d) 保持期間の掃除を終了で abort する
-//! （以前はプロセスの終わりまで放っておいた。消すのは古い日付のファイルだけで、
-//! 途中で止めても次の起動で続きを消す）。
+//! デスクトップは標準出力が見えない）、(d) 保持期間の掃除を終了で止める
+//! （以前はプロセスの終わりまで放っておいた。B1-2 では abort していたが、
+//! 2026-10-13 から止める合図を送って予算の中で終わりを待つ。掃除の途中なら
+//! それを終えてから止まるので、終了がその分だけ延びうる）。
 
 //! # テスト
 //!
@@ -168,6 +179,7 @@ use crate::host_info::{host_router, HostInfo};
 use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
+use crate::retention::RetentionTask;
 use crate::settings::{data_dir_value_unreadable, store_config, ServerSettings, SettingsService};
 use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
@@ -781,10 +793,11 @@ impl OpenedEngine {
     }
 }
 
-/// 終了で abort する背景タスク。
+/// 終了で止める背景タスク。監査の保留の流し込みは abort、保持期間の掃除は
+/// 止める合図を送って終わりを待つ（モジュール doc「終了の順序」の 2.・3.）。
 struct BackgroundTasks {
     spool_flusher: Option<JoinHandle<()>>,
-    retention: Option<JoinHandle<()>>,
+    retention: Option<RetentionTask>,
 }
 
 /// [`RunningEngine::shutdown`] の手順（[`ShutdownReport::completed`] に、
@@ -793,8 +806,11 @@ struct BackgroundTasks {
 pub enum ShutdownStep {
     /// 収集の取り消せない終了の印を立てた。
     Marked,
-    /// 監査の保留の定期の流し込みと保持期間の掃除を abort した。
+    /// 監査の保留の定期の流し込みを abort し、保持期間の掃除に止まる合図を
+    /// 送った（どちらも待たない）。
     BackgroundTasksAborted,
+    /// 保持期間の掃除が終わった（掃除の途中なら終わってから）。
+    RetentionStopped,
     /// LAN の listener を止めた（走っていなければ何もしない）。
     ListenerStopped,
     /// 収集を止めた（最終 flush。失敗は [`ShutdownReport::collect_stop_error`]）。
@@ -868,9 +884,9 @@ impl RunningEngine {
         let _ = services.collect.begin_shutdown();
         completed.push(ShutdownStep::Marked);
 
-        // 2. 背景タスク（abort は待たない）。
+        // 2. 背景タスク（流し込みは abort、掃除は合図だけ。どちらも待たない）。
         self.observe(ShutdownStep::BackgroundTasksAborted);
-        {
+        let retention = {
             let mut background = self
                 .background
                 .lock()
@@ -878,20 +894,29 @@ impl RunningEngine {
             if let Some(handle) = background.spool_flusher.take() {
                 handle.abort();
             }
-            if let Some(handle) = background.retention.take() {
-                handle.abort();
+            let retention = background.retention.take();
+            if let Some(task) = &retention {
+                task.request_stop();
             }
-        }
+            retention
+        };
         completed.push(ShutdownStep::BackgroundTasksAborted);
 
         let mut collect_stop_error = None;
         let cleanup = async {
-            // 3. 消費者（LAN）。
+            // 3. 保持期間の掃除の終わり（abort しない。設定 DB を読むので pool より前）。
+            self.observe(ShutdownStep::RetentionStopped);
+            if let Some(task) = retention {
+                task.stop().await;
+            }
+            completed.push(ShutdownStep::RetentionStopped);
+
+            // 4. 消費者（LAN）。
             self.observe(ShutdownStep::ListenerStopped);
             self.server.stop().await;
             completed.push(ShutdownStep::ListenerStopped);
 
-            // 4. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
+            // 5. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
             // 終了は止めない。
             self.observe(ShutdownStep::CollectStopped);
             if let Err(err) = services.collect.stop().await {
@@ -900,12 +925,12 @@ impl RunningEngine {
             }
             completed.push(ShutdownStep::CollectStopped);
 
-            // 5. 生産者（Hub の購読）。
+            // 6. 生産者（Hub の購読）。
             self.observe(ShutdownStep::HubShutdown);
             services.hub.shutdown().await;
             completed.push(ShutdownStep::HubShutdown);
 
-            // 6. みんなが書き込む先（DB）。
+            // 7. みんなが書き込む先（DB）。
             self.observe(ShutdownStep::PoolClosed);
             services.pool.close().await;
             completed.push(ShutdownStep::PoolClosed);
@@ -1251,7 +1276,8 @@ mod tests {
             .expect("タグ");
     }
 
-    /// 終了の順序: 印 → 背景タスク → listener → 収集 → Hub → pool。シミュレータ
+    /// 終了の順序: 印 → 背景タスク → 保持期間の掃除の終わり → listener → 収集
+    /// → Hub → pool。シミュレータ
     /// 相手に**本当に収集している**エンジンで、各手順の直前の実際の状態を見る。
     /// どの 2 つを入れ替えても、どこかの直前の状態が食い違って落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1287,6 +1313,7 @@ mod tests {
             vec![
                 ShutdownStep::Marked,
                 ShutdownStep::BackgroundTasksAborted,
+                ShutdownStep::RetentionStopped,
                 ShutdownStep::ListenerStopped,
                 ShutdownStep::CollectStopped,
                 ShutdownStep::HubShutdown,
@@ -1317,6 +1344,13 @@ mod tests {
                 listener_open: true,
                 collecting: true,
                 ..obs(ShutdownStep::BackgroundTasksAborted)
+            },
+            // 保持期間の掃除を待つ前。まだ何も止めていない（印だけ）。
+            ShutdownObservation {
+                marked: true,
+                listener_open: true,
+                collecting: true,
+                ..obs(ShutdownStep::RetentionStopped)
             },
             ShutdownObservation {
                 marked: true,
