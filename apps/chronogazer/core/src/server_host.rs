@@ -654,7 +654,10 @@ impl StartedServer {
 
     /// 実際に LAN から届く listener が開いているか（常時の listener が loopback 以外の
     /// アドレス（`0.0.0.0`）に bind できた、または LAN の listener が開いている）。
-    /// 最初の管理者の作成が閉じているかと同じ条件。
+    /// 最初の管理者の作成は listener ごとに決まるので、この値とは一致しない（#598
+    /// 監査 F2）: 特定の LAN の IP を別に開いた 2 本の形では、これは `true` でも
+    /// loopback の listener では作成が開いている。この PC からも閉じるのは、常時の
+    /// listener を `0.0.0.0` にまとめたときだけ（モジュール doc「待ち受け」）。
     pub async fn exposes_lan(&self) -> bool {
         let loopback_exposed = self
             .engine
