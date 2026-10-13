@@ -633,6 +633,50 @@ async fn a_failed_ctrl_handler_registration_stops_before_anything_is_created() {
     sandbox.assert_profile_untouched();
 }
 
+/// #598 のオーナーレビュー P2: A1 の排他を取った後・DB の初期化の前にログを始める
+/// ので、壊れた DB で起動して終了コード 3 で終わるとき、その理由と対処が日次ログに
+/// 残る。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_db_failure_is_written_to_the_daily_log() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(&sandbox.root).unwrap();
+    std::fs::write(sandbox.layout().db_path(), vec![0x5a_u8; 8192]).unwrap();
+    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    let status = server.wait_exit().await;
+    assert_eq!(status.code(), Some(3), "{}", sandbox.output_text());
+    let log = log_text(&sandbox);
+    for expected in [
+        "起動できませんでした",
+        "作り直す",
+        "終了します（終了コード 3）",
+    ] {
+        assert!(log.contains(expected), "{expected} がログに無い:\n{log}");
+    }
+    sandbox.assert_profile_untouched();
+}
+
+/// #598 のオーナーレビュー P2: リストア予約の適用の警告（ここでは壊れた予約ファイル。
+/// 適用をやめて起動を続ける）が日次ログに残る。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_restore_warning_is_written_to_the_daily_log() {
+    let sandbox = Sandbox::new();
+    prepare_root(&sandbox, None, false).await;
+    let pending = sandbox
+        .layout()
+        .backups_dir()
+        .join("restore-pending.sqlite3");
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    std::fs::write(&pending, b"not a sqlite file").unwrap();
+    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    wait_ready(&sandbox, &server).await;
+    server.send("ctrl-c");
+    assert_eq!(server.wait_exit().await.code(), Some(0));
+    let log = log_text(&sandbox);
+    assert!(log.contains("リストア予約ファイルが不正"), "{log}");
+}
+
 /// 相対パスのルートは拒否（終了コード 3）。作業ディレクトリに何も作らない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relative_root_is_rejected_without_creating_anything() {

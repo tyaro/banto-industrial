@@ -18,12 +18,18 @@
 //! このファイルは次を組むだけ:
 //!
 //! 1. ルートを解決して検証（相対パスは終了コード 3）。
-//! 2. ログを開き（`<root>\logs\chronogazer-server-YYYY-MM-DD.log`）、標準出力・標準
+//! 2. コンソールの Ctrl を受ける（[`StopController`]）。登録できなければ何も作らずに
+//!    終了コード 3（#598）。
+//! 3. ルートを作って A1 の排他を取る（`server_host::lock`）。取れなければルートの下に
+//!    何も作らず、理由はコンソールだけに出して終了コード 2。
+//! 4. ログを開き（`<root>\logs\chronogazer-server-YYYY-MM-DD.log`）、標準出力・標準
 //!    エラー出力をそこへ向け直してコンソールにも写す（Windows。`chronogazer_server/console.rs`）。
-//! 3. コンソールの Ctrl を受ける（[`StopController`]）。
-//! 4. `server_host::start`。失敗は理由と対処をコンソール（とログ）に出し、
-//!    終了コード（A1 の使用中 = 2、それ以外 = 3）で終わる。対処は自動では行わない。
-//! 5. 止める合図を待ち、後始末（`run\endpoint.json` を消す → エンジンの終了）を
+//!    **リストア予約の適用と DB の初期化より前**（#598 のオーナーレビュー P2: DB を
+//!    開けない理由と対処、リストア予約の警告を日次ログに残す）。
+//! 5. リストア予約の適用 → DB の初期化（`LockedServer::open`）→ Hub のキーの保存先 →
+//!    エンジン（`OpenedServer::start`）。失敗は理由と対処をコンソールとログに出し、
+//!    終了コード 3 で終わる。対処は自動では行わない。
+//! 6. 止める合図を待ち、後始末（`run\endpoint.json` を消す → エンジンの終了）を
 //!    `banto_exit_once::ExitCleanupOnce` で 1 回だけ行う。Ctrl-C・Ctrl-Break は
 //!    15 秒、コンソールのウィンドウを閉じた（`CTRL_CLOSE_EVENT`）・ログオフ・
 //!    シャットダウンは 4 秒（OS が待つのは約 5 秒）で、ハンドラーのスレッドが
@@ -383,17 +389,19 @@ fn run(options: CliOptions) -> i32 {
         }
     };
 
-    // 3. A1 の排他と DB（ルートの下に作るのはここから。排他を取れなければ何も
+    // 3. A1 の排他だけ（ルートの下に作るのはここから。排他を取れなければ何も
     // 作らない - ログもまだ開いていないので、理由はコンソールだけに出す）。
-    let opened = match runtime.block_on(server_host::open(layout.clone())) {
-        Ok(opened) => opened,
+    let locked = match server_host::lock(layout.clone()) {
+        Ok(locked) => locked,
         Err(failure) => {
             controller.set_phase(Phase::Failed);
             return report_start_failure(&controller, &failure);
         }
     };
 
-    // 4. ログ（排他を取った後。Windows だけ - 標準ハンドルの向け直しは Windows の API）。
+    // 4. ログ（排他を取った後・リストア予約の適用と DB の初期化の前。#598 の
+    // オーナーレビュー P2: DB を開けない理由と対処、リストア予約の警告を日次ログに
+    // 残す。Windows だけ - 標準ハンドルの向け直しは Windows の API）。
     let (log, flush) = open_log(&layout);
     controller.set_flush(flush);
     println!(
@@ -416,7 +424,16 @@ fn run(options: CliOptions) -> i32 {
         None => println!("{SERVER_LABEL}: ログファイルには書きません（コンソールだけ）"),
     }
 
-    // 5. Hub のキーの保存先（排他を取った後）とエンジン。
+    // 5. リストア予約の適用 → DB の初期化（失敗はログにも残る）。
+    let opened = match runtime.block_on(locked.open()) {
+        Ok(opened) => opened,
+        Err(failure) => {
+            controller.set_phase(Phase::Failed);
+            return report_start_failure(&controller, &failure);
+        }
+    };
+
+    // 6. Hub のキーの保存先（排他を取った後）とエンジン。
     let (key_store, key_store_error) = server_host::open_key_store(&layout);
     if let Some(reason) = key_store_error {
         eprintln!(
@@ -442,7 +459,7 @@ fn run(options: CliOptions) -> i32 {
         runtime: runtime.handle().clone(),
     });
 
-    // 5. 止める合図を待って後始末。
+    // 7. 止める合図を待って後始末。
     let origin = controller.wait_request();
     if origin != StopOrigin::Interrupt {
         // ウィンドウを閉じた・ログオフ・シャットダウン: 後始末・結果の表示・ログの

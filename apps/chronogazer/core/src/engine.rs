@@ -441,9 +441,18 @@ impl EngineRuntime {
     /// 起動の前半: A1 の排他 → リストア予約の適用 → `init_db`（モジュール doc の
     /// 1.〜3.）。排他を取れなければ DB には一切触れない。
     pub async fn open(cfg: EngineConfig) -> Result<OpenedEngine, EngineStartError> {
+        Self::lock(cfg)?.open().await
+    }
+
+    /// 起動の最初の段だけ: A1 の排他を取る（DB・リストア予約・監査の保留のどれにも
+    /// 触れない）。続きは [`LockedEngine::open`]。間に host の準備を挟みたいとき用
+    /// （#598 のオーナーレビュー P2: `chronogazer-server` は排他を取った後・リストア
+    /// 予約の適用と `init_db` の前にログを開き、DB を開けない理由やリストアの警告を
+    /// 日次ログに残す）。
+    pub fn lock(cfg: EngineConfig) -> Result<LockedEngine, EngineStartError> {
         let instance_lock =
             acquire_for_db(&cfg.db_path, cfg.host).map_err(EngineStartError::InstanceLock)?;
-        Self::open_locked(cfg, instance_lock, None).await
+        Ok(LockedEngine { cfg, instance_lock })
     }
 
     /// [`EngineRuntime::open`] と同じだが、起動時の対処が**先に取った** A1 の排他
@@ -512,6 +521,19 @@ impl EngineRuntime {
             loopback_only_setup: false,
             events: event_channel(),
         })
+    }
+}
+
+/// A1 の排他だけを取ったエンジン（[`EngineRuntime::lock`]）。drop すると排他を返す。
+pub struct LockedEngine {
+    cfg: EngineConfig,
+    instance_lock: InstanceGuard,
+}
+
+impl LockedEngine {
+    /// 起動の前半の残り: リストア予約の適用 → `init_db`（モジュール doc の 2.〜3.）。
+    pub async fn open(self) -> Result<OpenedEngine, EngineStartError> {
+        EngineRuntime::open_locked(self.cfg, self.instance_lock, None).await
     }
 }
 

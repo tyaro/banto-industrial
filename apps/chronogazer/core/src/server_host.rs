@@ -93,8 +93,8 @@ use banto_tstore::{Clock, LocalDate};
 
 use crate::endpoint::{clear_endpoint, write_endpoint, EndpointInfo};
 use crate::engine::{
-    EngineConfig, EngineListen, EngineRuntime, EngineStartError, OpenedEngine, RunningEngine,
-    ShutdownReport,
+    EngineConfig, EngineListen, EngineRuntime, EngineStartError, LockedEngine, OpenedEngine,
+    RunningEngine, ShutdownReport,
 };
 use crate::instance_lock::ChronoGazerHost;
 use crate::paths::DataLayout;
@@ -491,9 +491,39 @@ pub struct OpenedServer {
     layout: DataLayout,
 }
 
-/// 起動の前半: ルートを作り（ルートそのものだけ）、A1 の排他 → DB（モジュール doc）。
-/// 排他を取れなければ、ルートの下には何も作らない（DB も）。
+/// [`lock`] と [`LockedServer::open`] を続けて行う（間に何も挟まないテスト用）。
 pub async fn open(layout: DataLayout) -> Result<OpenedServer, StartFailure> {
+    lock(layout)?.open().await
+}
+
+/// A1 の排他だけを取った `chronogazer-server`（[`lock`]）。bin はこの後に日次ログを
+/// 開いてから [`LockedServer::open`]（リストア予約の適用・`init_db`）へ進む
+/// （#598 のオーナーレビュー P2: DB を開けない理由・対処や、リストア予約の警告を
+/// 日次ログに残す）。drop すると排他を返す。
+pub struct LockedServer {
+    locked: LockedEngine,
+    layout: DataLayout,
+}
+
+impl LockedServer {
+    pub fn layout(&self) -> &DataLayout {
+        &self.layout
+    }
+
+    /// リストア予約の適用 → `init_db`。
+    pub async fn open(self) -> Result<OpenedServer, StartFailure> {
+        let LockedServer { locked, layout } = self;
+        let opened = locked
+            .open()
+            .await
+            .map_err(|err| failure_from_engine(&err, &layout))?;
+        Ok(OpenedServer { opened, layout })
+    }
+}
+
+/// 起動の最初の段: ルートを作り（ルートそのものだけ）、A1 の排他を取る（モジュール
+/// doc）。排他を取れなければ、ルートの下には何も作らない（DB も）。
+pub fn lock(layout: DataLayout) -> Result<LockedServer, StartFailure> {
     // 初回（`%ProgramData%\ChronoGazer` がまだ無い）はルートを作る。A1 の排他の
     // 診断ファイルと DB はその直下に置く。
     if let Err(err) = std::fs::create_dir_all(layout.root()) {
@@ -507,7 +537,7 @@ pub async fn open(layout: DataLayout) -> Result<OpenedServer, StartFailure> {
         });
     }
     let db_path = layout.db_path();
-    let opened = EngineRuntime::open(EngineConfig {
+    let locked = EngineRuntime::lock(EngineConfig {
         data_base: layout.root().to_path_buf(),
         db_path,
         // 本物は排他を取った後に `OpenedServer::start` が渡す（`with_key_store`）。
@@ -526,9 +556,8 @@ pub async fn open(layout: DataLayout) -> Result<OpenedServer, StartFailure> {
         store_config_required: true,
         store_dir_check_required: true,
     })
-    .await
     .map_err(|err| failure_from_engine(&err, &layout))?;
-    Ok(OpenedServer { opened, layout })
+    Ok(LockedServer { locked, layout })
 }
 
 impl OpenedServer {
