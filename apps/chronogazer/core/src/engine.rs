@@ -35,8 +35,10 @@
 //!    [`EngineStartError::StoreConfig`]、そうでなければ既定値で続行）、
 //!    [`EngineConfig::attach_hub`] なら `attach_hub`
 //!    （**自動開始より前**。後から繋いでも走り出した収集には効かない）。
-//! 7. **LAN の listener の bind**（ポートの確保だけ。まだ要求を受けない）。
-//!    [`EngineListen::Required`] で bind できなければ、ここで Hub を止めて
+//! 7. **listener の bind**（ポートの確保だけ。まだ要求を受けない）。先に
+//!    常時の loopback の listener（[`OpenedEngine::with_loopback`]、
+//!    `chronogazer-server` だけ。#392 B1-5）を必須で、次に LAN の listener。
+//!    loopback か [`EngineListen::Required`] で bind できなければ、ここで Hub を止めて
 //!    pool を閉じてから [`EngineStartError::Listen`] を返す - **収集を始める前に
 //!    失敗する**ので、失敗して戻る経路に収集・Hub の張り直し・保持期間の掃除の
 //!    タスクが残らない（計画書の順序「resume/autostart/retention → listener」
@@ -44,7 +46,8 @@
 //! 8. `hub.resume()`・`collect.autostart()`（どちらも spawn して投げっぱなし。
 //!    失敗しても起動は止めず、理由は状態に残る）、保持期間の掃除
 //!    （[`crate::retention`]）。
-//! 9. bind 済みの listener で serve を始め、[`ServerSlot`] に置く。
+//! 9. bind 済みの listener で serve を始め、[`ServerSlot`] に置く（loopback は
+//!    入れ替えない別の slot、LAN は入れ替えられる slot）。
 //! 10. **監査の保留の定期の流し込み**。起動の失敗しうる手順がすべて済んでから
 //!     起こす（先に起こすと失敗して戻る経路にタスクが残る。banto-hub #557）。
 //!
@@ -60,8 +63,8 @@
 //! 2. 背景タスク（監査の保留の定期の流し込み・保持期間の掃除）を abort する。
 //!    流し込みは途中で止めても失われない（ファイルは行が入ってから消す）。
 //!    これも予算の外（abort は待たない）。
-//! 3. **LAN の listener**（[`ServerSlot`] から取り出して `stop`）。ハンドラーは
-//!    同じ pool を使うので pool より前。
+//! 3. **listener**（LAN の [`ServerSlot`]、続いて常時の loopback の slot から
+//!    取り出して `stop`）。ハンドラーは同じ pool を使うので pool より前。
 //! 4. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
 //! 5. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
 //!    値の出どころ（収集にとっての生産者）なので、収集より後（#383 段階3 P3）。
@@ -80,15 +83,21 @@
 //! # host ごとの差（[`EngineConfig`]）
 //!
 //! - KeyStore（デスクトップ = OS キーリング、`banto-serve` =
-//!   `UnavailableKeyStore` か `BANTO_HUB_MEMORY_KEYS=1` の `MemoryKeyStore`）と
+//!   `UnavailableKeyStore` か `BANTO_HUB_MEMORY_KEYS=1` の `MemoryKeyStore`、
+//!   `chronogazer-server` = DPAPI のファイル（`crate::server_host::open_key_store`））と
 //!   `attach_hub` の有無。
-//! - 待ち受け（[`EngineListen`]）と `allow_setup`（`POST /api/auth/setup` を
-//!   開けるのは `banto-serve` だけ）。
+//! - 待ち受け（[`EngineListen`]、`chronogazer-server` は加えて常時の loopback）と
+//!   `allow_setup`（`POST /api/auth/setup` を開けるのは `banto-serve` と、LAN に
+//!   出していないときの `chronogazer-server`）。
 //! - ログの接頭辞（`banto` / `banto-serve`）と、起動時の `restore_applied` の
 //!   監査の `origin`（`tauri` / `rest`）。今までの各 host の文言・値を保つため。
 //! - 保存設定を読めないときに起動を止めるか（`store_config_required`。
 //!   デスクトップ = 止める、`banto-serve` = 既定値で続行。どちらも B1-1 より前からの
-//!   各 host の扱い）。
+//!   各 host の扱い。`chronogazer-server` はデスクトップと同じく止める）。
+//!
+//! `chronogazer-server`（#392 B1-5）の組み立ては [`crate::server_host::start`]
+//! （`open` → 設定から待ち受けの形 → `with_loopback`・`with_listen`・
+//! `with_allow_setup` → `start` → `run\endpoint.json`）。
 //!
 //! **このモジュールに入れないもの**（host 固有）: 窓・トレイ・自動ログイン・
 //! OS キーリング・Acrylic・イベントの webview への転送・単一インスタンスの
@@ -480,6 +489,7 @@ impl EngineRuntime {
             pool,
             applied_restore,
             recovery_note: None,
+            loopback: None,
             events: event_channel(),
         })
     }
@@ -495,6 +505,8 @@ pub struct OpenedEngine {
     applied_restore: Option<AppliedRestoreInfo>,
     /// 起動時の対処の窓で選ばれた対処（[`OpenedEngine::with_recovery_note`]）。
     recovery_note: Option<RecoveryNote>,
+    /// 常時の loopback の listener（[`OpenedEngine::with_loopback`]）。
+    loopback: Option<ServerConfig>,
     events: broadcast::Sender<ServerEvent>,
 }
 
@@ -540,6 +552,24 @@ impl OpenedEngine {
         self
     }
 
+    /// 常時の loopback の listener を足す（#392 B1-5、`chronogazer-server`。
+    /// 設計書 §3.1(b)「loopback の listener は常に開く」・決定 9）。**必須**: bind
+    /// できなければ [`EngineListen::Required`] と同じく収集を始める前に
+    /// [`EngineStartError::Listen`] で戻る。LAN の [`ServerSlot`] とは別の入れ物に
+    /// 置き、LAN の入れ替え（決定 9）の対象にしない。LAN と重なる bind（`0.0.0.0`）
+    /// を 1 本にまとめるのは呼び出し側（`chronogazer_core::server_host::ListenPlan`）。
+    pub fn with_loopback(mut self, config: ServerConfig) -> Self {
+        self.loopback = Some(config);
+        self
+    }
+
+    /// `POST /api/auth/setup` を開けるかを差し替える（`start` の前に待ち受けの
+    /// 形から決める host 用。`chronogazer-server` は LAN に出していないときだけ開ける）。
+    pub fn with_allow_setup(mut self, allow_setup: bool) -> Self {
+        self.cfg.allow_setup = allow_setup;
+        self
+    }
+
     /// 起動の後半（モジュール doc の 4.〜10.）。
     pub async fn start(self) -> Result<RunningEngine, EngineStartError> {
         let OpenedEngine {
@@ -548,6 +578,7 @@ impl OpenedEngine {
             pool,
             applied_restore,
             recovery_note,
+            loopback,
             events,
         } = self;
         let label = cfg.log_label;
@@ -693,8 +724,22 @@ impl OpenedEngine {
             collect.attach_hub(hub.clone());
         }
 
-        // 7. LAN の listener の bind（ポートの確保だけ）。収集を始める前に失敗を
-        // 決める（モジュール doc の 7.）。
+        // 7. listener の bind（ポートの確保だけ）。収集を始める前に失敗を決める
+        // （モジュール doc の 7.）。常時の loopback（必須）が先。
+        let bound_loopback = match &loopback {
+            None => None,
+            Some(config) => match bind_listener(config.clone()).await {
+                Ok(bound) => Some(bound),
+                Err(source) => {
+                    hub.shutdown().await;
+                    pool.close().await;
+                    return Err(EngineStartError::Listen {
+                        config: config.clone(),
+                        source,
+                    });
+                }
+            },
+        };
         let (bound, listen_error) = match &cfg.listen {
             EngineListen::Disabled => (None, None),
             EngineListen::Required(config) => match bind_listener(config.clone()).await {
@@ -752,6 +797,8 @@ impl OpenedEngine {
 
         // 9. serve を始める。
         let server = bound.map(|bound: BoundServer| bound.serve(services.router(cfg.allow_setup)));
+        let loopback_server =
+            bound_loopback.map(|bound: BoundServer| bound.serve(services.router(cfg.allow_setup)));
 
         // 10. 監査の保留の定期の流し込み（失敗しうる手順がすべて済んだ後）。
         let spool_flusher = services.audit.spawn_spool_flusher();
@@ -767,6 +814,7 @@ impl OpenedEngine {
         Ok(RunningEngine {
             services,
             server: Arc::new(ServerSlot::new(server)),
+            loopback: ServerSlot::new(loopback_server),
             allow_setup: cfg.allow_setup,
             log_label: label,
             listen_error,
@@ -795,7 +843,7 @@ pub enum ShutdownStep {
     Marked,
     /// 監査の保留の定期の流し込みと保持期間の掃除を abort した。
     BackgroundTasksAborted,
-    /// LAN の listener を止めた（走っていなければ何もしない）。
+    /// listener（LAN と常時の loopback）を止めた（走っていなければ何もしない）。
     ListenerStopped,
     /// 収集を止めた（最終 flush。失敗は [`ShutdownReport::collect_stop_error`]）。
     CollectStopped,
@@ -822,6 +870,8 @@ pub struct ShutdownReport {
 pub struct RunningEngine {
     services: EngineServices,
     server: Arc<ServerSlot>,
+    /// 常時の loopback の listener（[`OpenedEngine::with_loopback`]）。入れ替えない。
+    loopback: ServerSlot,
     allow_setup: bool,
     log_label: &'static str,
     listen_error: Option<String>,
@@ -842,6 +892,12 @@ impl RunningEngine {
     /// LAN の listener の入れ物（デスクトップの `server_apply` が入れ替える）。
     pub fn server_slot(&self) -> &Arc<ServerSlot> {
         &self.server
+    }
+
+    /// 常時の loopback の listener の実際のアドレス（[`OpenedEngine::with_loopback`]
+    /// を使っていなければ `None`）。`run\endpoint.json` の `port` に使う。
+    pub async fn loopback_addr(&self) -> Option<SocketAddr> {
+        self.loopback.local_addr().await
     }
 
     /// LAN に出すルーター（`allow_setup` は起動時の設定のまま）。listener を
@@ -886,9 +942,10 @@ impl RunningEngine {
 
         let mut collect_stop_error = None;
         let cleanup = async {
-            // 3. 消費者（LAN）。
+            // 3. 消費者（LAN、続いて常時の loopback）。
             self.observe(ShutdownStep::ListenerStopped);
             self.server.stop().await;
+            self.loopback.stop().await;
             completed.push(ShutdownStep::ListenerStopped);
 
             // 4. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
@@ -938,12 +995,12 @@ impl RunningEngine {
             observations.push(ShutdownObservation {
                 before: step,
                 marked: self.services.collect.shutdown_marked(),
-                listener_open: self
-                    .server
-                    .inner
-                    .try_lock()
-                    .map(|server| server.is_some())
-                    .unwrap_or(true),
+                listener_open: [&*self.server, &self.loopback].iter().any(|slot| {
+                    slot.inner
+                        .try_lock()
+                        .map(|server| server.is_some())
+                        .unwrap_or(true)
+                }),
                 collecting: self.services.collect.state().is_collecting(),
                 hub_shutting_down: self.services.hub.is_shutting_down(),
                 pool_closed: self.services.pool.is_closed(),
@@ -1172,6 +1229,69 @@ mod tests {
             .expect("既定値で続行する");
         let report = engine.shutdown(Duration::from_secs(10)).await;
         assert!(!report.timed_out);
+    }
+
+    /// #392 B1-5: 常時の loopback と LAN の 2 本を同時に待ち受け、`/api/host` に
+    /// どちらからも答え、終了で両方が閉じる。`loopback_addr` は loopback の方。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_and_lan_listeners_serve_together_and_both_stop() {
+        let dir = TempDir::new();
+        let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(loopback_any_port())
+            .with_listen(EngineListen::BestEffort(loopback_any_port()))
+            .start()
+            .await
+            .expect("start");
+        let loopback = engine.loopback_addr().await.expect("loopback");
+        let lan = engine.server_slot().local_addr().await.expect("lan");
+        assert_ne!(loopback, lan, "2 本の別々の listener");
+        let client = reqwest::Client::new();
+        for addr in [loopback, lan] {
+            let response = client
+                .get(format!("http://{addr}/api/host"))
+                .header("X-Banto-Client", "banto")
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), 200, "{addr}");
+        }
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out);
+        assert!(
+            std::net::TcpStream::connect(loopback).is_err(),
+            "loopback が残った"
+        );
+        assert!(std::net::TcpStream::connect(lan).is_err(), "LAN が残った");
+        assert_eq!(engine.loopback_addr().await, None);
+    }
+
+    /// #392 B1-5: 常時の loopback は必須。ポートが塞がっていれば LAN が無くても
+    /// `Err(Listen)` で戻り、排他と pool を返す（同じ DB でもう一度起動できる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_loopback_port_is_an_error_and_releases_everything() {
+        let dir = TempDir::new();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = occupied.local_addr().expect("addr").port();
+        let result = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(ServerConfig {
+                bind: "127.0.0.1".to_string(),
+                port,
+            })
+            .start()
+            .await;
+        match result {
+            Ok(_) => panic!("塞がった loopback のポートで起動できた"),
+            Err(EngineStartError::Listen { config, .. }) => assert_eq!(config.port, port),
+            Err(other) => panic!("{other:?}"),
+        }
+        let engine = EngineRuntime::start(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("失敗した起動の後に同じ DB で起動できる");
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
     }
 
     /// 任意の待ち受けを開けないときは起動を続け、理由を残す。
