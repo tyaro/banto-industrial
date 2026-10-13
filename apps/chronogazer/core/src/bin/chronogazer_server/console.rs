@@ -120,11 +120,35 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
             let _ = done_tx.send(());
         })?;
 
-    // ここから先の `println!`/`eprintln!` はパイプへ行く。
+    // ここから先の `println!`/`eprintln!` はパイプへ行く。両方の差し替えが成功した
+    // ときだけ向け直したことにする（#598 の Copilot の指摘）。片方でも失敗したら
+    // 元に戻し、パイプを閉じて `Err`（呼び出し側は起動を止める）。デバッグビルド
+    // だけ、環境変数 `CHRONOGAZER_TEST_FAIL_STDIO_REDIRECT=1` で標準エラー出力の
+    // 差し替えの失敗を注入できる（統合テスト用）。
+    let inject_failure = cfg!(debug_assertions)
+        && std::env::var("CHRONOGAZER_TEST_FAIL_STDIO_REDIRECT").as_deref() == Ok("1");
     // SAFETY: 書き込み側のハンドルは `finish` で閉じるまで有効。
-    unsafe {
-        SetStdHandle(STD_OUTPUT_HANDLE, write.get());
-        SetStdHandle(STD_ERROR_HANDLE, write.get());
+    let out_ok = unsafe { SetStdHandle(STD_OUTPUT_HANDLE, write.get()) } != FALSE;
+    let err_ok = out_ok
+        && !inject_failure
+        && unsafe { SetStdHandle(STD_ERROR_HANDLE, write.get()) } != FALSE;
+    if !err_ok {
+        let error = if inject_failure && out_ok {
+            std::io::Error::other(
+                "テスト用に標準エラー出力の差し替えの失敗を注入しました（CHRONOGAZER_TEST_FAIL_STDIO_REDIRECT）",
+            )
+        } else {
+            std::io::Error::last_os_error()
+        };
+        // SAFETY: 元のハンドルに戻し、書き込み側を閉じる（読み取り側のスレッドは
+        // EOF で終わる）。
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, original_out.get());
+            SetStdHandle(STD_ERROR_HANDLE, original_err.get());
+            CloseHandle(write.get());
+        }
+        let _ = done_rx.recv_timeout(Duration::from_secs(1));
+        return Err(error);
     }
     Ok(StdioRedirect {
         write,

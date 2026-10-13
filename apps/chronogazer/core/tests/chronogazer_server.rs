@@ -581,6 +581,59 @@ async fn an_unfinished_http_request_does_not_skip_the_final_flush_on_close() {
     );
 }
 
+/// #598 の Copilot の指摘: Ctrl-C の後始末の間にコンソールのウィンドウを閉じても、
+/// main が先に `exit` して close のハンドラーの最後の行を切らない（ハンドラーが
+/// 終わってから OS と同じくプロセスが終わる）。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_during_a_ctrl_c_shutdown_keeps_the_close_handlers_last_lines() {
+    let sandbox = Sandbox::new();
+    // `ctrl-c` と `close` を続けて送る（標準入力のスレッドが順に処理する）。
+    let status = collect_then_stop(&sandbox, "ctrl-c\nclose").await;
+    assert_eq!(
+        status.code(),
+        Some(0xC000_013A_u32 as i32),
+        "close のハンドラーの前に main が終わった: {}",
+        sandbox.output_text()
+    );
+    assert_stopped_cleanly(&sandbox).await;
+    let log = log_text(&sandbox);
+    // 後始末の本体を走らせるのは先に `ExitCleanupOnce` に入った方（main の Ctrl-C か
+    // close のハンドラー）で、どちらでも 1 回だけ。close のハンドラーの最後の行は必ず残る。
+    assert_eq!(
+        log.matches("終了の後始末が完了しました").count(),
+        1,
+        "後始末の完了がちょうど 1 回でない:\n{log}"
+    );
+    for expected in [
+        "停止します（Ctrl-C）",
+        "終了します（コンソールのウィンドウを閉じた、終了コード 0）",
+    ] {
+        assert!(log.contains(expected), "{expected} がログに無い:\n{log}");
+    }
+}
+
+/// #598 の Copilot の指摘: 標準出力・標準エラー出力の向け直しに失敗したら、起動を
+/// 止め（終了コード 3）、理由を日次ログに直接残す（失敗はデバッグビルドだけの
+/// 環境変数で注入する）。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_stdio_redirect_stops_the_start_and_is_logged() {
+    let sandbox = Sandbox::new();
+    let mut server = Server::spawn_with_env(
+        &sandbox,
+        sandbox.root.to_str().unwrap(),
+        &[("CHRONOGAZER_TEST_FAIL_STDIO_REDIRECT", "1")],
+    );
+    let status = server.wait_exit().await;
+    let output = sandbox.output_text();
+    assert_eq!(status.code(), Some(3), "{output}");
+    assert!(output.contains("ログへ向け直せませんでした"), "{output}");
+    let log = log_text(&sandbox);
+    assert!(log.contains("ログへ向け直せませんでした"), "{log}");
+    assert!(!sandbox.layout().endpoint_file().exists());
+}
+
 /// デスクトップが同じ DB を使っていれば A1 で拒否され、終了コード 2。DB も
 /// `endpoint.json` も作らない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

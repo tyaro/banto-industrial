@@ -172,6 +172,13 @@ enum Phase {
 struct ControlState {
     phase: Phase,
     requested: Option<StopOrigin>,
+    /// 走っている close 系のハンドラー（[`StopController::on_close`]）の数。
+    /// Ctrl-C の後に close 系の事象が来たとき、main がその終わりを待たずに
+    /// `exit` しないため（#598 の Copilot の指摘）。
+    closing: usize,
+    /// main が終わりに入った（ログを書き出して `exit` する）。この後の close 系の
+    /// ハンドラーは何もせずに待つ（main の書き出しを邪魔しない）。
+    exiting: bool,
 }
 
 /// 止める合図と後始末の 1 回化（モジュール doc の 5.）。main のスレッドと、
@@ -191,6 +198,8 @@ impl StopController {
             state: Mutex::new(ControlState {
                 phase: Phase::Starting,
                 requested: None,
+                closing: 0,
+                exiting: false,
             }),
             changed: Condvar::new(),
             once: ExitCleanupOnce::new(),
@@ -219,6 +228,28 @@ impl StopController {
         let mut state = self.lock();
         state.requested.get_or_insert(origin);
         self.changed.notify_all();
+    }
+
+    /// close 系のハンドラーの始まり。main が既に終わりに入っていれば `false`。
+    fn begin_close(&self) -> bool {
+        let mut state = self.lock();
+        if state.exiting {
+            return false;
+        }
+        state.closing += 1;
+        true
+    }
+
+    /// main の終わり: close 系のハンドラーが走っていなければ終わりに入る（`true`。
+    /// 以後のハンドラーは何もしない）。走っていれば `false` で、終わり（結果の表示・
+    /// ログの書き出し・プロセスの終了）はハンドラーに任せる。
+    fn claim_exit(&self) -> bool {
+        let mut state = self.lock();
+        if state.closing > 0 {
+            return false;
+        }
+        state.exiting = true;
+        true
     }
 
     fn set_phase(&self, phase: Phase) {
@@ -332,6 +363,13 @@ impl StopController {
     /// 終わる（モジュール doc）。
     fn on_close(&self, origin: StopOrigin) -> i32 {
         let started = Instant::now();
+        if !self.begin_close() {
+            // main が既に終わり（ログの書き出しと `exit`）に入っている。戻ると OS が
+            // プロセスを終わらせ、main の書き出しを切るので、main の `exit` を待つ。
+            loop {
+                std::thread::park();
+            }
+        }
         self.request(origin);
         let report = self.cleanup(origin, origin.budget());
         let code = self.report(origin, report);
@@ -402,7 +440,19 @@ fn run(options: CliOptions) -> i32 {
     // 4. ログ（排他を取った後・リストア予約の適用と DB の初期化の前。#598 の
     // オーナーレビュー P2: DB を開けない理由と対処、リストア予約の警告を日次ログに
     // 残す。Windows だけ - 標準ハンドルの向け直しは Windows の API）。
-    let (log, flush) = open_log(&layout);
+    let (log, flush) = match open_log(&layout) {
+        Ok(opened) => opened,
+        Err(reason) => {
+            // 日次ログはこの bin の唯一の永続の診断（サービスではコンソールも無い）。
+            // 向け直せないまま動かすと起動・停止・失敗の記録が残らないので、起動を
+            // 止める（Ctrl のハンドラーの登録の失敗と同じ扱い。#598 の Copilot の指摘）。
+            // 理由はログファイルへ直接（`open_log` が書いた）とコンソールに出す。
+            eprintln!("{SERVER_LABEL}: {reason}");
+            eprintln!("{SERVER_LABEL}: 終了します（終了コード {EXIT_START_FAILED}）");
+            controller.set_phase(Phase::Failed);
+            return EXIT_START_FAILED;
+        }
+    };
     controller.set_flush(flush);
     println!(
         "{SERVER_LABEL}: 起動します（版 {}、pid {}）",
@@ -474,6 +524,15 @@ fn run(options: CliOptions) -> i32 {
     let report = controller.cleanup(origin, origin.budget());
     let code = controller.report(origin, report);
     println!("{SERVER_LABEL}: 終了しました（終了コード {code}）");
+    if !controller.claim_exit() {
+        // Ctrl-C の後始末の間にウィンドウを閉じた・ログオフ・シャットダウンが来た:
+        // その close 系のハンドラーが結果の表示とログの書き出しを終えてから戻り、
+        // OS がプロセスを終わらせる。こちらが先に `exit` してハンドラーの最後の行を
+        // 切らないよう、ここでは何もせず待つ（#598 の Copilot の指摘）。
+        loop {
+            std::thread::park();
+        }
+    }
     controller.flush(Duration::from_secs(2));
     // ランタイムは drop しない（止めたエンジンの残りのタスクを待たない）。A1 の
     // 排他はプロセスの終わりで OS が返す。
@@ -529,8 +588,17 @@ async fn announce(server: &StartedServer) {
 
 type Flush = Box<dyn Fn(Duration) + Send + Sync>;
 
+type OpenedLog = (Option<Arc<Mutex<ServerLog>>>, Flush);
+
+/// 日次ログを開き、標準出力・標準エラー出力をそこへ向け直す。
+///
+/// - ログのファイルを開けない（`logs\` に書けない）ときは、コンソールだけで続ける
+///   （`Ok((None, ..))`。書けない場所には向け直しようがない。理由はコンソールに出す）。
+/// - ログは開けたが向け直せない（`SetStdHandle` の失敗）ときは `Err`: 起動を止める。
+///   理由はログファイルに直接書いておく（向け直さずに動くと、core と依存 crate の
+///   `eprintln!` が日次ログに入らず、起動・停止・失敗の診断を失うため）。
 #[cfg(windows)]
-fn open_log(layout: &DataLayout) -> (Option<Arc<Mutex<ServerLog>>>, Flush) {
+fn open_log(layout: &DataLayout) -> Result<OpenedLog, String> {
     let log = match ServerLog::open(layout.logs_dir(), Arc::new(banto_tstore::SystemClock)) {
         Ok(log) => Arc::new(Mutex::new(log)),
         Err(err) => {
@@ -538,24 +606,30 @@ fn open_log(layout: &DataLayout) -> (Option<Arc<Mutex<ServerLog>>>, Flush) {
                 "{SERVER_LABEL}: ログ（{}）を開けませんでした。コンソールだけに出します: {err}",
                 layout.logs_dir().display()
             );
-            return (None, Box::new(|_| {}));
+            return Ok((None, Box::new(|_| {})));
         }
     };
     match console::redirect_stdio(log.clone()) {
         Ok(redirect) => {
             let redirect = Arc::new(redirect);
-            (Some(log), Box::new(move |wait| redirect.finish(wait)))
+            Ok((Some(log), Box::new(move |wait| redirect.finish(wait))))
         }
         Err(err) => {
-            eprintln!("{SERVER_LABEL}: 標準出力をログへ向け直せませんでした: {err}");
-            (None, Box::new(|_| {}))
+            let reason = format!(
+                "標準出力・標準エラー出力をログへ向け直せませんでした。日次ログに診断が残らないため、起動しません: {err}"
+            );
+            if let Ok(mut log) = log.lock() {
+                log.write_line(&format!("{SERVER_LABEL}: {reason}"));
+                log.flush();
+            }
+            Err(reason)
         }
     }
 }
 
 #[cfg(not(windows))]
-fn open_log(_layout: &DataLayout) -> (Option<Arc<Mutex<ServerLog>>>, Flush) {
-    (None, Box::new(|_| {}))
+fn open_log(_layout: &DataLayout) -> Result<OpenedLog, String> {
+    Ok((None, Box::new(|_| {})))
 }
 
 /// 止める合図の受け口を用意する。Windows のコンソールの Ctrl のハンドラーを
@@ -660,6 +734,26 @@ mod tests {
         for unknown in ["run-service", "install", "--port", "x"] {
             assert!(parse_args(&args(&[unknown])).is_err(), "{unknown}");
         }
+    }
+
+    /// #598 の Copilot の指摘: close 系のハンドラーが走っている間は main が終わりに
+    /// 入らない（その終わりを待つ）。main が終わりに入った後の close 系のハンドラーは
+    /// 何もしない（main の書き出しを邪魔しない）。
+    #[test]
+    fn main_yields_to_a_running_close_handler_and_vice_versa() {
+        let controller = StopController::new();
+        assert!(controller.begin_close());
+        assert!(
+            !controller.claim_exit(),
+            "close のハンドラーの途中で main が終わった"
+        );
+
+        let controller = StopController::new();
+        assert!(controller.claim_exit());
+        assert!(
+            !controller.begin_close(),
+            "main の終わりの後に close を始めた"
+        );
     }
 
     #[test]
