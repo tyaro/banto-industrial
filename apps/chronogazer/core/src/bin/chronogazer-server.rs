@@ -658,7 +658,6 @@ fn run(options: CliOptions) -> i32 {
     println!("{SERVER_LABEL}: 停止します（{}）", origin.label());
     let report = controller.cleanup(origin, origin.budget());
     let code = controller.report(origin, report);
-    println!("{SERVER_LABEL}: 終了しました（終了コード {code}）");
     if !controller.claim_exit() {
         // Ctrl-C の後始末の間にウィンドウを閉じた・ログオフ・シャットダウンが来た:
         // その close 系のハンドラーが結果の表示とログの書き出しを終えてから戻り、
@@ -668,6 +667,10 @@ fn run(options: CliOptions) -> i32 {
             std::thread::park();
         }
     }
+    // 終わりの行は、終わりを main が受け持つと決まってから出す（#598 監査 F6: close 系の
+    // ハンドラーに任せるときに出すと、その `flush` がパイプを閉じた後になりえて、行が
+    // ログに入るかが決まらない。そのときはハンドラーが自分の終わりの行を出す）。
+    println!("{SERVER_LABEL}: 終了しました（終了コード {code}）");
     controller.flush(Duration::from_secs(2));
     // ランタイムは drop しない（止めたエンジンの残りのタスクを待たない）。A1 の
     // 排他はプロセスの終わりで OS が返す。

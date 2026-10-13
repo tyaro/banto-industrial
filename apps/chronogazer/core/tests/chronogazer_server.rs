@@ -596,6 +596,12 @@ async fn closing_during_a_ctrl_c_shutdown_keeps_the_close_handlers_last_lines() 
     ] {
         assert!(log.contains(expected), "{expected} がログに無い:\n{log}");
     }
+    // #598 監査 F6: 終わりを close のハンドラーに任せた main は、自分の終わりの行を
+    // 出さない（出すと、ハンドラーがパイプを閉じた後になりえてログに入るかが決まらない）。
+    assert!(
+        !log.contains("終了しました（終了コード"),
+        "終わりを任せた main が終わりの行を出した:\n{log}"
+    );
 }
 
 /// #598 の Copilot の指摘: 標準出力・標準エラー出力の向け直しに失敗したら、起動を
