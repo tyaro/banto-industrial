@@ -55,6 +55,33 @@ cargo run -p chronogazer-core --bin banto-serve
 `BANTO_VIEWER_PUBLIC=1`（閲覧公開を ON で保存する。外しても OFF には戻らない）も
 環境変数で指定できる（`core/src/bin/banto-serve.rs`）。
 
+### 画面の無い本番用のエンジン `chronogazer-server`（2026-10-13〜、#392 B1-5）
+
+`banto-serve`（開発・E2E 用）とは別の、本番用の headless host。今はコンソールで動かす形だけで、
+Windows サービスとしての登録は #392 の B3。
+
+```sh
+cargo build -p chronogazer-core --bin chronogazer-server --features embed-ui
+target\debug\chronogazer-server.exe        # Ctrl-C で停止
+```
+
+- **データ**: `%ProgramData%\ChronoGazer\`（無ければ作る）。環境変数 `CHRONOGAZER_ROOT` で変えられる
+  （**絶対パスだけ**。相対パスは拒否して終了コード 3）。デスクトップ版の `%APPDATA%\dev.tyaro.chronogazer\`
+  は読まない・移さない。配置は DB `chronogazer.sqlite3`、時系列データ `data\`、バックアップ `backups\`、
+  Hub の API キー `secrets\hub-keys\`（DPAPI で守ったファイル。ディレクトリは SYSTEM・Administrators と
+  起動した利用者だけ）、ログ `logs\`、所在 `run\endpoint.json`（動いている間だけ）。
+- **待ち受け**: `http://127.0.0.1:<port>/`（設定 `server.port`、既定 8721）は常に開く。LAN は設定
+  `server.enabled` がデスクトップ版と同じ条件を満たすときだけ `server.bind` に足す（`0.0.0.0` なら 1 本）。
+  LAN に出していない間は、この PC のブラウザから最初の管理者を作れる（LAN に出しているときは作れない）。
+- **ログ**: `logs\chronogazer-server-YYYY-MM-DD.log`（各行に時刻。標準エラー出力もここへ向け直し、
+  コンソールにも同じものを出す）。保持は設定 `log.retention_days`（既定 30 日、`0` で無制限）。
+- **止め方**: Ctrl-C（後始末は最大 15 秒）。コンソールのウィンドウを閉じても、最終の書き出しと
+  `collection_stopped` を残してから終わる（OS の猶予に合わせて最大 4 秒）。ログオフでも終わる
+  （サインアウトをまたいで動かすのはサービス化の後）。
+- **終了コード**: 0 正常、1 後始末が時間内に終わらなかった・最終の書き出しに失敗、2 同じデータを
+  別の ChronoGazer（デスクトップ版・`banto-serve` など）が使用中、3 その他の起動の失敗（理由と、
+  手で行う対処をコンソールとログに出す。自動では何も直さない）。
+
 ### 旧形式の DB で起動しないとき（2026-10-02〜）
 
 DB スキーマを banto の admin-template と同じ形に整理した（2026-10-02）ため、それより
@@ -126,7 +153,7 @@ LAN アクセスはそのまま動き続け、アプリはタスクトレイに�
 - Windows のシャットダウン・ログオフでも同じ終了処理を通す。
 - banto-hub のデスクトップ版のトレイも同じ操作（左クリックでウィンドウを戻す、右クリックでメニュー）。
 - **ログオン時の自動起動は無い**。アプリを起動しない限り収集しないのは従来どおり（UI から独立した
-  サービスでの収集は #392 の B で扱う）。
+  サービスでの収集は #392 の B で扱う。画面の無いコンソール版は上の `chronogazer-server`）。
 
 ## 起動時の判定と「サーバーに接続できません」（2026-10-04〜）
 
