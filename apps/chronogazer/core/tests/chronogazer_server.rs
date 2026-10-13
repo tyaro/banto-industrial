@@ -134,8 +134,13 @@ struct Server {
 
 impl Server {
     fn spawn(sandbox: &Sandbox, root: &str) -> Self {
+        Self::spawn_with_env(sandbox, root, &[])
+    }
+
+    fn spawn_with_env(sandbox: &Sandbox, root: &str, envs: &[(&str, &str)]) -> Self {
         let output = File::create(&sandbox.output).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_chronogazer-server"))
+            .envs(envs.iter().copied())
             .arg("--control-stdin")
             .env("CHRONOGAZER_ROOT", root)
             .env("APPDATA", &sandbox.appdata)
@@ -592,6 +597,39 @@ async fn refuses_the_db_the_desktop_is_using_with_exit_code_2() {
     assert!(output.contains("デスクトップ"), "{output}");
     assert!(!db_path.exists());
     assert!(!sandbox.layout().endpoint_file().exists());
+    // #598 の Copilot の指摘: 排他を取れない側は、ルートの下に何も作らない（Hub の
+    // キーの保存先を自分の ACL で作って、動いている側の保存先を使えなくしない）。
+    let layout = sandbox.layout();
+    for dir in [
+        layout.secrets_dir(),
+        layout.logs_dir(),
+        layout.run_dir(),
+        layout.data_dir(),
+    ] {
+        assert!(!dir.exists(), "{} を作った", dir.display());
+    }
+    sandbox.assert_profile_untouched();
+}
+
+/// #598 の Copilot の指摘: Ctrl のハンドラーを登録できなければ、制御された停止の
+/// 手段が無いまま収集しないよう、何も作らずに終了コード 3 で終わる（失敗はデバッグ
+/// ビルドだけの環境変数で注入する）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_ctrl_handler_registration_stops_before_anything_is_created() {
+    let sandbox = Sandbox::new();
+    let mut server = Server::spawn_with_env(
+        &sandbox,
+        sandbox.root.to_str().unwrap(),
+        &[("CHRONOGAZER_TEST_FAIL_CTRL_HANDLER", "1")],
+    );
+    let status = server.wait_exit().await;
+    let output = sandbox.output_text();
+    assert_eq!(status.code(), Some(3), "{output}");
+    assert!(
+        output.contains("Ctrl のハンドラーを登録できませんでした"),
+        "{output}"
+    );
+    assert!(!sandbox.root.exists(), "ルートを作った");
     sandbox.assert_profile_untouched();
 }
 

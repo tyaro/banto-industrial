@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use banto_exit_once::{ExitCleanupOnce, ExitCleanupReport};
 use chronogazer_core::paths::{resolve_data_root_from_env, DataLayout};
 use chronogazer_core::server_host::{
-    self, ServerLog, ServerOptions, ServerShutdownSummary, StartedServer, CLOSE_MARGIN, CLOSE_WAIT,
+    self, ServerLog, ServerShutdownSummary, StartedServer, CLOSE_MARGIN, CLOSE_WAIT,
     EXIT_START_FAILED, EXIT_USAGE, INTERRUPT_BUDGET, SERVER_LABEL,
 };
 
@@ -174,12 +174,13 @@ struct StopController {
     state: Mutex<ControlState>,
     changed: Condvar,
     once: ExitCleanupOnce<ServerShutdownSummary, StopOrigin>,
-    /// 標準出力・標準エラー出力の向け直しの後始末（無ければ何もしない）。
-    flush: Box<dyn Fn(Duration) + Send + Sync>,
+    /// 標準出力・標準エラー出力の向け直しの後始末（無ければ何もしない）。ログは
+    /// A1 の排他を取った後に開くので、後から入れる（[`StopController::set_flush`]）。
+    flush: Mutex<Option<Flush>>,
 }
 
 impl StopController {
-    fn new(flush: Box<dyn Fn(Duration) + Send + Sync>) -> Self {
+    fn new() -> Self {
         Self {
             state: Mutex::new(ControlState {
                 phase: Phase::Starting,
@@ -187,7 +188,19 @@ impl StopController {
             }),
             changed: Condvar::new(),
             once: ExitCleanupOnce::new(),
-            flush,
+            flush: Mutex::new(None),
+        }
+    }
+
+    fn set_flush(&self, flush: Flush) {
+        *self.flush.lock().unwrap_or_else(|p| p.into_inner()) = Some(flush);
+    }
+
+    /// ログの書き出しを `wait` まで待つ（ログを開いていなければ何もしない）。
+    fn flush(&self, wait: Duration) {
+        let flush = self.flush.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(flush) = flush.as_ref() {
+            flush(wait);
         }
     }
 
@@ -322,7 +335,7 @@ impl StopController {
         );
         // 書き出しは OS の猶予（約 5 秒）の残りで。
         let flush_wait = Duration::from_millis(4_800).saturating_sub(started.elapsed());
-        (self.flush)(flush_wait.max(Duration::from_millis(200)));
+        self.flush(flush_wait.max(Duration::from_millis(200)));
         code
     }
 }
@@ -350,13 +363,39 @@ fn run(options: CliOptions) -> i32 {
     }
     let layout = DataLayout::new(root);
 
-    // 2. ログ（Windows だけ。標準ハンドルの向け直しは Windows の API）。
+    // 2. 止める合図（ルートの下に何も作らない。登録できなければ起動しない）。
+    let controller = Arc::new(StopController::new());
+    if let Err(err) = install_stop_sources(&controller, &options) {
+        eprintln!(
+            "{SERVER_LABEL}: Ctrl のハンドラーを登録できませんでした。Ctrl-C やコンソールを閉じたときに後始末（最終の書き出し）を通せないため、起動しません: {err}"
+        );
+        return EXIT_START_FAILED;
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("{SERVER_LABEL}: 非同期ランタイムを作れませんでした: {err}");
+            return EXIT_START_FAILED;
+        }
+    };
+
+    // 3. A1 の排他と DB（ルートの下に作るのはここから。排他を取れなければ何も
+    // 作らない - ログもまだ開いていないので、理由はコンソールだけに出す）。
+    let opened = match runtime.block_on(server_host::open(layout.clone())) {
+        Ok(opened) => opened,
+        Err(failure) => {
+            controller.set_phase(Phase::Failed);
+            return report_start_failure(&controller, &failure);
+        }
+    };
+
+    // 4. ログ（排他を取った後。Windows だけ - 標準ハンドルの向け直しは Windows の API）。
     let (log, flush) = open_log(&layout);
-
-    // 3. 止める合図。
-    let controller = Arc::new(StopController::new(flush));
-    install_stop_sources(&controller, &options);
-
+    controller.set_flush(flush);
     println!(
         "{SERVER_LABEL}: 起動します（版 {}、pid {}）",
         env!("CARGO_PKG_VERSION"),
@@ -377,7 +416,7 @@ fn run(options: CliOptions) -> i32 {
         None => println!("{SERVER_LABEL}: ログファイルには書きません（コンソールだけ）"),
     }
 
-    // 4. 起動。
+    // 5. Hub のキーの保存先（排他を取った後）とエンジン。
     let (key_store, key_store_error) = server_host::open_key_store(&layout);
     if let Some(reason) = key_store_error {
         eprintln!(
@@ -385,34 +424,11 @@ fn run(options: CliOptions) -> i32 {
             layout.hub_keys_dir().display()
         );
     }
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("{SERVER_LABEL}: 非同期ランタイムを作れませんでした: {err}");
-            controller.set_phase(Phase::Failed);
-            (controller.flush)(Duration::from_secs(2));
-            return EXIT_START_FAILED;
-        }
-    };
-    let started = runtime.block_on(server_host::start(ServerOptions {
-        layout: layout.clone(),
-        key_store,
-    }));
-    let server = match started {
+    let server = match runtime.block_on(opened.start(key_store)) {
         Ok(server) => Arc::new(server),
         Err(failure) => {
-            eprintln!("{SERVER_LABEL}: 起動できませんでした: {}", failure.message);
-            for line in &failure.guidance {
-                eprintln!("{SERVER_LABEL}:   {line}");
-            }
-            let code = failure.exit_code();
-            eprintln!("{SERVER_LABEL}: 終了します（終了コード {code}）");
             controller.set_phase(Phase::Failed);
-            (controller.flush)(Duration::from_secs(2));
-            return code;
+            return report_start_failure(&controller, &failure);
         }
     };
     if let Some(log) = &log {
@@ -441,10 +457,22 @@ fn run(options: CliOptions) -> i32 {
     let report = controller.cleanup(origin, origin.budget());
     let code = controller.report(origin, report);
     println!("{SERVER_LABEL}: 終了しました（終了コード {code}）");
-    (controller.flush)(Duration::from_secs(2));
+    controller.flush(Duration::from_secs(2));
     // ランタイムは drop しない（止めたエンジンの残りのタスクを待たない）。A1 の
     // 排他はプロセスの終わりで OS が返す。
     std::mem::forget(runtime);
+    code
+}
+
+/// 起動の失敗を出して終了コードを返す（ログを開いていればログにも）。
+fn report_start_failure(controller: &StopController, failure: &server_host::StartFailure) -> i32 {
+    eprintln!("{SERVER_LABEL}: 起動できませんでした: {}", failure.message);
+    for line in &failure.guidance {
+        eprintln!("{SERVER_LABEL}:   {line}");
+    }
+    let code = failure.exit_code();
+    eprintln!("{SERVER_LABEL}: 終了します（終了コード {code}）");
+    controller.flush(Duration::from_secs(2));
     code
 }
 
@@ -513,7 +541,22 @@ fn open_log(_layout: &DataLayout) -> (Option<Arc<Mutex<ServerLog>>>, Flush) {
     (None, Box::new(|_| {}))
 }
 
-fn install_stop_sources(controller: &Arc<StopController>, options: &CliOptions) {
+/// 止める合図の受け口を用意する。Windows のコンソールの Ctrl のハンドラーを
+/// 登録できなければ `Err`（#598 の Copilot の指摘: 登録に失敗したまま起動すると、
+/// Ctrl-C やコンソールを閉じたときに Windows の既定の終了になり、`endpoint.json` の
+/// 削除と最終の書き出しを飛ばす。制御された停止の手段が無いまま収集させない）。
+/// デバッグビルドだけ、環境変数 `CHRONOGAZER_TEST_FAIL_CTRL_HANDLER=1` で登録の失敗を
+/// 注入できる（統合テスト用。デスクトップの `CHRONOGAZER_TEST_FAIL_TRAY` と同じ扱い）。
+fn install_stop_sources(
+    controller: &Arc<StopController>,
+    options: &CliOptions,
+) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CHRONOGAZER_TEST_FAIL_CTRL_HANDLER").as_deref() == Ok("1") {
+        return Err(
+            "テスト用に登録の失敗を注入しました（CHRONOGAZER_TEST_FAIL_CTRL_HANDLER）".to_string(),
+        );
+    }
     #[cfg(windows)]
     {
         let handler = controller.clone();
@@ -529,9 +572,7 @@ fn install_stop_sources(controller: &Arc<StopController>, options: &CliOptions) 
                 handler.on_close(StopOrigin::Shutdown);
             }
         }));
-        if let Err(err) = installed {
-            eprintln!("{SERVER_LABEL}: Ctrl のハンドラーを登録できませんでした: {err}");
-        }
+        installed.map_err(|err| err.to_string())?;
     }
     #[cfg(not(windows))]
     {
@@ -572,6 +613,7 @@ fn install_stop_sources(controller: &Arc<StopController>, options: &CliOptions) 
             }
         });
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -617,7 +659,7 @@ mod tests {
     /// 後始末するものが無い（`None`）。待ちは予算で切れる。
     #[test]
     fn cleanup_waits_for_the_start_within_its_budget() {
-        let controller = Arc::new(StopController::new(Box::new(|_| {})));
+        let controller = Arc::new(StopController::new());
         let started = Instant::now();
         assert!(controller
             .cleanup(StopOrigin::Close, Duration::from_millis(200))
@@ -638,7 +680,7 @@ mod tests {
     /// 合図は最初のものが残り、待っている main を起こす。
     #[test]
     fn the_first_request_wins_and_wakes_the_waiter() {
-        let controller = Arc::new(StopController::new(Box::new(|_| {})));
+        let controller = Arc::new(StopController::new());
         let waiter = {
             let controller = controller.clone();
             std::thread::spawn(move || controller.wait_request())

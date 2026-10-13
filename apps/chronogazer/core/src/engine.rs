@@ -64,9 +64,10 @@
 //!    流し込みは途中で止めても失われない（ファイルは行が入ってから消す）。
 //!    これも予算の外（abort は待たない）。
 //! 3. **listener**（LAN の [`ServerSlot`] と常時の loopback の slot から取り出して
-//!    `stop`）。ハンドラーは同じ pool を使うので pool より前。**待つのは
-//!    [`listener_stop_cap`]（予算の 4 分の 1、最大 1 秒）まで**（#598 のオーナー
-//!    レビュー P1）: banto の `RunningServer::stop` は開いている要求の完了を最大 5 秒
+//!    `stop`）。ハンドラーは同じ pool を使うので pool より前。**slot の lock の取得から
+//!    停止までを待つのは [`listener_stop_cap`]（予算の 4 分の 1、最大 1 秒）まで**
+//!    （#598 のオーナーレビュー P1。lock の取得を含めたのは同じ PR の Copilot の指摘で、
+//!    デスクトップの `server_apply` が適用の間ずっと lock を持つため）: banto の `RunningServer::stop` は開いている要求の完了を最大 5 秒
 //!    待つので、本文を送り切らない要求 1 本で、コンソールを閉じたときの予算（約
 //!    3.5 秒）を使い切って 4. の最終 flush を飛ばしていた。上限を超えたら待つのを
 //!    やめて 4. へ進む（停止そのものは裏のタスクで続き、banto の 5 秒で中断される。
@@ -75,6 +76,11 @@
 //!    要求が収集を始めることは 1. の取り消せない印が断る。残った要求が DB を触っても
 //!    pool はまだ開いている（6. で閉じる。閉じた後に届いた要求は DB のエラーになる
 //!    だけで、記録は失わない）。デスクトップ（5 秒）・Ctrl-C（15 秒）の経路も同じ。
+//!    待つのをやめた停止のタスクは、lock が空き次第そのとき slot にあるもの（適用が
+//!    置いた新しい listener を含む）を止めるので、終了の後に listener を残さない。
+//!    `server_apply` の側を「停止の間 lock を持たない」形に変えなかったのは、適用の間
+//!    lock を持つことが、並行する適用の直列化と、状態の表示が停止〜再起動の隙間を
+//!    見ないための約束（banto #287・#294 の形）で、崩すと途中の状態が見えるため。
 //! 4. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
 //! 5. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
 //!    値の出どころ（収集にとっての生産者）なので、収集より後（#383 段階3 P3）。
@@ -565,6 +571,14 @@ impl OpenedEngine {
         &self.events
     }
 
+    /// Hub の API キーの置き場を差し替える（#598 の Copilot の指摘、`chronogazer-server`）。
+    /// 保存先（`secrets\hub-keys\`）の作成・ACL の付与は共有のルートの下に物を作るので、
+    /// A1 の排他を取った後（`open` の後）に行い、ここで渡す。`start` が使う。
+    pub fn with_key_store(mut self, key_store: Arc<dyn KeyStore>) -> Self {
+        self.cfg.key_store = key_store;
+        self
+    }
+
     /// 待ち受けを差し替える（`start` の前に設定から決める host 用）。
     pub fn with_listen(mut self, listen: EngineListen) -> Self {
         self.cfg.listen = listen;
@@ -877,7 +891,7 @@ impl OpenedEngine {
         Ok(RunningEngine {
             services,
             server: Arc::new(ServerSlot::new(server)),
-            loopback: ServerSlot::new(loopback_server),
+            loopback: Arc::new(ServerSlot::new(loopback_server)),
             allow_setup: lan_allow_setup,
             log_label: label,
             listen_error,
@@ -943,7 +957,7 @@ pub struct RunningEngine {
     services: EngineServices,
     server: Arc<ServerSlot>,
     /// 常時の loopback の listener（[`OpenedEngine::with_loopback`]）。入れ替えない。
-    loopback: ServerSlot,
+    loopback: Arc<ServerSlot>,
     allow_setup: bool,
     log_label: &'static str,
     listen_error: Option<String>,
@@ -1019,11 +1033,21 @@ impl RunningEngine {
             // 3. 消費者（LAN、続いて常時の loopback）。
             // 停止は裏のタスクで並べて始め、上限までだけ待つ（モジュール doc の 3.）。
             self.observe(ShutdownStep::ListenerStopped);
+            // slot の lock の取得も上限の区間に含める（#598 の Copilot の指摘）: デスク
+            // トップの `server_apply` は適用の間ずっと slot の lock を持ち、その中で古い
+            // listener の graceful な停止（最大 5 秒）を待つので、lock を上限の外で待つと
+            // 予算を使い切って最終 flush を飛ばしうる。上限で待つのをやめたタスクは、
+            // lock が空き次第そのとき slot にあるもの（適用が置いた新しい listener を
+            // 含む）を取り出して止める - 終了の後に listener を残さない。
             let mut stops = Vec::new();
-            for slot in [&*self.server, &self.loopback] {
-                if let Some(running) = slot.inner.lock().await.take() {
-                    stops.push(tokio::spawn(running.stop()));
-                }
+            for slot in [&self.server, &self.loopback] {
+                let slot = Arc::clone(slot);
+                stops.push(tokio::spawn(async move {
+                    let running = slot.inner.lock().await.take();
+                    if let Some(running) = running {
+                        running.stop().await;
+                    }
+                }));
             }
             let cap = listener_stop_cap(budget);
             let waited =
@@ -1085,7 +1109,7 @@ impl RunningEngine {
             observations.push(ShutdownObservation {
                 before: step,
                 marked: self.services.collect.shutdown_marked(),
-                listener_open: [&*self.server, &self.loopback].iter().any(|slot| {
+                listener_open: [&self.server, &self.loopback].iter().any(|slot| {
                     slot.inner
                         .try_lock()
                         .map(|server| server.is_some())
@@ -1355,6 +1379,66 @@ mod tests {
         );
         assert!(std::net::TcpStream::connect(lan).is_err(), "LAN が残った");
         assert_eq!(engine.loopback_addr().await, None);
+    }
+
+    /// #598 の Copilot の指摘: デスクトップの `server_apply` のように LAN の slot の lock を
+    /// 持ったまま止まっている者がいても、終了は上限で listener の待ちをやめて収集を止め、
+    /// `collection_stopped` が残る。lock が空いたら、そのとき slot にある listener
+    /// （適用が置いた新しいもの）も止める。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_server_slot_lock_does_not_skip_the_final_flush() {
+        let dir = TempDir::new();
+        let sim = simulation::start(Protocol::ModbusTcp).await;
+        let cfg = config(dir.path(), EngineListen::Required(loopback_any_port()));
+        let db_path = cfg.db_path.clone();
+        let opened = EngineRuntime::open(cfg).await.expect("open");
+        register_modbus(opened.pool(), sim.addr().port()).await;
+        let engine = opened.start().await.expect("start");
+        let collect = engine.services().collect.clone();
+        wait_until("自動開始で収集が走ること", || {
+            matches!(collect.state(), CollectorState::Running { .. })
+        })
+        .await;
+
+        // 適用の途中: slot の lock を持ったまま、終了の予算より長く止まる。
+        let slot = engine.server_slot().clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let applier = tokio::spawn(async move {
+            let guard = slot.lock().await;
+            let _ = locked_tx.send(());
+            let _ = release_rx.await;
+            drop(guard);
+        });
+        locked_rx.await.expect("lock を取った");
+
+        let budget = Duration::from_secs(3);
+        let report = engine.shutdown(budget).await;
+        assert!(!report.timed_out, "{report:?}");
+        assert!(report.listener_stop_abandoned);
+        assert!(report.completed.contains(&ShutdownStep::CollectStopped));
+        let lan = engine.server_slot().clone();
+
+        // lock が空けば、裏の停止のタスクが残っていた listener を止める。
+        let _ = release_tx.send(());
+        applier.await.unwrap();
+        wait_until("裏の停止で LAN の slot が空になること", || {
+            lan.inner.try_lock().map(|s| s.is_none()).unwrap_or(false)
+        })
+        .await;
+
+        drop(engine);
+        let pool = init_db(&db_path).await.expect("開き直す");
+        let reader = CollectorService::new(pool.clone(), dir.path().join("data"));
+        let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
+            Readout::Ready { data } => data.rows,
+            other => panic!("イベントが読めない: {}", other.as_str()),
+        };
+        assert_eq!(
+            rows.first().map(|row| row.kind.as_str()),
+            Some("collection_stopped")
+        );
+        pool.close().await;
     }
 
     /// listener の停止を待つ上限は予算の 4 分の 1、最大 1 秒（最終 flush の予算を残す）。

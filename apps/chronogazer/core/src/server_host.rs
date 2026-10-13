@@ -93,7 +93,8 @@ use banto_tstore::{Clock, LocalDate};
 
 use crate::endpoint::{clear_endpoint, write_endpoint, EndpointInfo};
 use crate::engine::{
-    EngineConfig, EngineListen, EngineRuntime, EngineStartError, RunningEngine, ShutdownReport,
+    EngineConfig, EngineListen, EngineRuntime, EngineStartError, OpenedEngine, RunningEngine,
+    ShutdownReport,
 };
 use crate::instance_lock::ChronoGazerHost;
 use crate::paths::DataLayout;
@@ -473,10 +474,26 @@ pub fn parse_log_retention(raw: Option<&str>) -> Option<u32> {
     }
 }
 
-/// 起動（モジュール doc）。A1 の排他 → DB → 設定から待ち受けの形 → エンジン →
-/// `run\endpoint.json`。失敗は分類して [`StartFailure`]。
+/// 起動（[`open`] → [`OpenedServer::start`]。間に何も挟まないテスト用）。
 pub async fn start(options: ServerOptions) -> Result<StartedServer, StartFailure> {
     let ServerOptions { layout, key_store } = options;
+    open(layout).await?.start(key_store).await
+}
+
+/// A1 の排他を取って DB を開いた `chronogazer-server`（[`open`]）。ルートの下に
+/// 何かを作る処理（ログ・Hub のキーの保存先・`run\endpoint.json`）は、これを得た後
+/// （= 排他を持っている間）に行う（#598 の Copilot の指摘: 先に作ると、同じルートで
+/// 2 人目が起動したときに、排他で弾かれる側が `secrets\hub-keys\` を自分の ACL で
+/// 作ってしまい、動いている側の Hub のキーの保存先が使えなくなりうる）。drop すると
+/// 排他と pool を返す。
+pub struct OpenedServer {
+    opened: OpenedEngine,
+    layout: DataLayout,
+}
+
+/// 起動の前半: ルートを作り（ルートそのものだけ）、A1 の排他 → DB（モジュール doc）。
+/// 排他を取れなければ、ルートの下には何も作らない（DB も）。
+pub async fn open(layout: DataLayout) -> Result<OpenedServer, StartFailure> {
     // 初回（`%ProgramData%\ChronoGazer` がまだ無い）はルートを作る。A1 の排他の
     // 診断ファイルと DB はその直下に置く。
     if let Err(err) = std::fs::create_dir_all(layout.root()) {
@@ -493,7 +510,10 @@ pub async fn start(options: ServerOptions) -> Result<StartedServer, StartFailure
     let opened = EngineRuntime::open(EngineConfig {
         data_base: layout.root().to_path_buf(),
         db_path,
-        key_store,
+        // 本物は排他を取った後に `OpenedServer::start` が渡す（`with_key_store`）。
+        key_store: Arc::new(FailedKeyStore::new(
+            "Hub の API キーの保存先をまだ開いていません",
+        )),
         attach_hub: true,
         host: ChronoGazerHost::Server,
         listen: EngineListen::Disabled,
@@ -508,7 +528,32 @@ pub async fn start(options: ServerOptions) -> Result<StartedServer, StartFailure
     })
     .await
     .map_err(|err| failure_from_engine(&err, &layout))?;
+    Ok(OpenedServer { opened, layout })
+}
 
+impl OpenedServer {
+    pub fn layout(&self) -> &DataLayout {
+        &self.layout
+    }
+
+    /// 開いたまま閉じる（排他と pool を返す）。
+    pub async fn close(self) {
+        self.opened.close().await;
+    }
+
+    /// 起動の後半: 設定から待ち受けの形 → エンジン（`key_store` を使う）→
+    /// `run\endpoint.json`。失敗は分類して [`StartFailure`]。
+    pub async fn start(self, key_store: Arc<dyn KeyStore>) -> Result<StartedServer, StartFailure> {
+        let OpenedServer { opened, layout } = self;
+        let opened = opened.with_key_store(key_store);
+        start_opened(opened, layout).await
+    }
+}
+
+async fn start_opened(
+    opened: OpenedEngine,
+    layout: DataLayout,
+) -> Result<StartedServer, StartFailure> {
     let settings = opened.settings();
     let read = async {
         let auth = settings.auth_config().await?;
