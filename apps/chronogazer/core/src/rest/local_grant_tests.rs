@@ -651,3 +651,92 @@ async fn server_settings_are_admin_only_and_put_needs_a_server_host() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
+
+/// #600 のレビュー: `localDesktop`（admin）のトークンで `localGrant` を変えると、失効が
+/// 要求自身のトークンも消すが、監査の操作者は失効の前に確定しているので残る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_session_changing_the_setting_is_audited_with_its_actor() {
+    let admin = LocalGrantSetting::Role(Role::Admin);
+    let f = fixture_with(
+        LocalGrantStart::Initialized(admin),
+        true,
+        &[Role::Admin],
+        Some(admin),
+    )
+    .await;
+    let (_, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let token = token.expect("token");
+    let (status, body) = send(
+        &f.router,
+        "PUT",
+        "/api/settings/auth",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&token),
+        Some(json!({ "localGrant": "viewer" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        identity(&f.router, &token).await.1.is_null(),
+        "自分のトークンが失効していない"
+    );
+    let changes = f
+        .audit
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| row.action == "settings_change")
+        .collect::<Vec<_>>();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].actor_username.as_deref(), Some("localDesktop"));
+    assert_eq!(changes[0].actor_role.as_deref(), Some("admin"));
+}
+
+/// #600 のレビュー: ログイン不要モードの欄は、値が `null` でも欄があれば `400`
+/// （保存は変わらない）。欄が無ければ通る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_disabled_fields_are_refused_even_when_null() {
+    let f = fixture(
+        LocalGrantStart::Initialized(LocalGrantSetting::Off),
+        true,
+        &[Role::Admin],
+    )
+    .await;
+    let admin = login(&f.router, "admin").await;
+    for body in [
+        json!({ "localGrant": "viewer", "disabled": null }),
+        json!({ "localGrant": "viewer", "disabledRole": null }),
+        json!({ "localGrant": "viewer", "disabled": false }),
+        json!({ "localGrant": "viewer", "disabledRole": "admin" }),
+    ] {
+        let (status, response) = send(
+            &f.router,
+            "PUT",
+            "/api/settings/auth",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            Some(&admin),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+    }
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Off
+    );
+    let (status, response) = send(
+        &f.router,
+        "PUT",
+        "/api/settings/auth",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&admin),
+        Some(json!({ "localGrant": "viewer" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+}

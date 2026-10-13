@@ -196,6 +196,11 @@ impl LanControl {
         if let Some(addr) = self.slot.local_addr().await {
             return Some(addr);
         }
+        self.always_on_lan_addr().await
+    }
+
+    /// LAN に出ている常時の listener（`0.0.0.0` にまとめたとき）のアドレス。
+    async fn always_on_lan_addr(&self) -> Option<SocketAddr> {
         match &self.always_on {
             Some(always_on) => always_on
                 .slot
@@ -234,6 +239,10 @@ pub async fn current_status(
     settings: &SettingsService,
     lan: &LanControl,
 ) -> Result<ServerStatusView, BantoError> {
+    // LAN の slot を持ったまま保存値と実行中のアドレスを読む（#600 のレビュー）。
+    // [`apply_server_settings`] は適用の間ずっと slot を持つので、これで並行の適用の
+    // 途中（古い保存値と新しい listener、またはその逆）を混ぜた応答を返さない。
+    let slot = lan.slot.lock().await;
     let config = settings.server_config().await?;
     let restart_required = if lan.always_on.is_some() {
         let auth = settings.auth_config().await?;
@@ -241,7 +250,12 @@ pub async fn current_status(
     } else {
         false
     };
-    let running = lan.running_lan_addr().await;
+    let running = match slot.as_ref().map(RunningServer::local_addr) {
+        Some(addr) => Some(addr),
+        // 常時の listener は入れ替えないので、slot を持たずに読んでよい。
+        None => lan.always_on_lan_addr().await,
+    };
+    drop(slot);
     Ok(build_status(&config, running, restart_required))
 }
 
@@ -521,11 +535,11 @@ pub struct AuthConfigView {
 #[serde(rename_all = "camelCase")]
 struct AuthConfigPayload {
     local_grant: String,
-    #[serde(default)]
-    disabled: Option<serde_json::Value>,
-    #[serde(default)]
-    disabled_role: Option<serde_json::Value>,
 }
+
+/// ログイン不要モードの欄（値が `null` でも、欄があれば断る - #600 のレビュー。
+/// `Option<Value>` では明示の `null` が「無い」と区別できず、更新が通ってしまった）。
+const AUTH_DISABLED_FIELDS: [&str; 2] = ["disabled", "disabledRole"];
 
 // --- REST ----------------------------------------------------------------------------
 
@@ -671,9 +685,29 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
         );
     }
     let headers = req.headers().clone();
-    let Json(payload) = match Json::<AuthConfigPayload>::from_request(req, &()).await {
+    let Json(body) =
+        match Json::<serde_json::Map<String, serde_json::Value>>::from_request(req, &()).await {
+            Ok(body) => body,
+            Err(rejection) => return rejection.into_response(),
+        };
+    if AUTH_DISABLED_FIELDS
+        .iter()
+        .any(|field| body.contains_key(*field))
+    {
+        return ApiError(BantoError::BadRequest(
+            "ログイン不要モードは REST からは変更できません（デスクトップの画面の設定から変更してください。サービスではこの PC からの接続（localGrant）を使います）".to_string(),
+        ))
+        .into_response();
+    }
+    let payload = match serde_json::from_value::<AuthConfigPayload>(serde_json::Value::Object(body))
+    {
         Ok(payload) => payload,
-        Err(rejection) => return rejection.into_response(),
+        Err(err) => {
+            return ApiError(BantoError::BadRequest(format!(
+                "本文を読めません（{{\"localGrant\": \"off\"}} の形）: {err}"
+            )))
+            .into_response()
+        }
     };
     match auth_settings_apply(&state, &headers, payload).await {
         Ok(view) => Json(view).into_response(),
@@ -686,12 +720,11 @@ async fn auth_settings_apply(
     headers: &HeaderMap,
     payload: AuthConfigPayload,
 ) -> Result<AuthConfigView, ApiError> {
-    if payload.disabled.is_some() || payload.disabled_role.is_some() {
-        return Err(ApiError(BantoError::BadRequest(
-            "ログイン不要モードは REST からは変更できません（デスクトップの画面の設定から変更してください。サービスではこの PC からの接続（localGrant）を使います）".to_string(),
-        )));
-    }
     let value = LocalGrantSetting::parse(&payload.local_grant)?;
+    // 操作者は保存・失効の**前に**確定する（#600 のレビュー）: `localDesktop` の admin の
+    // トークンで値を変えると、下の失効がこの要求自身のトークンも消し、後から引くと
+    // 操作者が空のまま特権の変更が監査に残る（banto-hub の lock-down と同じ扱い）。
+    let actor = actor_identity(headers, &state.auth);
     let revoked = {
         let _guard = state.auth_config_lock.lock().await;
         let previous = read_setting(&state.settings).await?;
@@ -704,7 +737,6 @@ async fn auth_settings_apply(
             0
         }
     };
-    let actor = actor_identity(headers, &state.auth);
     state
         .audit
         .record(AuditEntry {
