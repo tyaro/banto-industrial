@@ -42,8 +42,6 @@ use chronogazer_core::settings::SettingsService;
 const WAIT_LIMIT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(100);
 const ADMIN_PASSWORD: &str = "admin-pass-1";
-/// OS がコンソールの close でプロセスを終わらせたときの終了コード。
-const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
 
 // --- 足場 ---------------------------------------------------------------------
 
@@ -519,21 +517,16 @@ async fn collects_from_a_plc_and_stops_cleanly_on_ctrl_c() {
     }
 }
 
-/// `CTRL_CLOSE_EVENT` のハンドラーと同じ関数（`StopController::on_close`）を通した
-/// 後に、OS と同じくプロセスが終わる（`STATUS_CONTROL_C_EXIT`）。それでも最終の
-/// 書き出し・`endpoint.json` の削除・ログの終了の行が残る。
+/// `CTRL_CLOSE_EVENT` のハンドラーと同じ関数（`close_and_exit`）を通すと、後始末の
+/// 結果の終了コード（0）でプロセスが自分で終わる（#598 監査 F5。OS が終わらせるのを
+/// 当てにしない）。最終の書き出し・`endpoint.json` の削除・ログの終了の行が残る。
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_the_console_window_still_flushes_within_the_short_budget() {
     let sandbox = Sandbox::new();
     let started = Instant::now();
     let status = collect_then_stop(&sandbox, "close").await;
-    assert_eq!(
-        status.code(),
-        Some(0xC000_013A_u32 as i32),
-        "{}",
-        sandbox.output_text()
-    );
+    assert_eq!(status.code(), Some(0), "{}", sandbox.output_text());
     assert_stopped_cleanly(&sandbox).await;
     let log = log_text(&sandbox);
     for expected in [
@@ -569,12 +562,7 @@ async fn an_unfinished_http_request_does_not_delay_the_final_flush_on_ctrl_c() {
 async fn an_unfinished_http_request_does_not_skip_the_final_flush_on_close() {
     let sandbox = Sandbox::new();
     let (status, _) = collect_then_stop_with(&sandbox, "close", true).await;
-    assert_eq!(
-        status.code(),
-        Some(0xC000_013A_u32 as i32),
-        "{}",
-        sandbox.output_text()
-    );
+    assert_eq!(status.code(), Some(0), "{}", sandbox.output_text());
     assert_stopped_cleanly(&sandbox).await;
     let log = log_text(&sandbox);
     assert!(
@@ -585,19 +573,14 @@ async fn an_unfinished_http_request_does_not_skip_the_final_flush_on_close() {
 
 /// #598 の Copilot の指摘: Ctrl-C の後始末の間にコンソールのウィンドウを閉じても、
 /// main が先に `exit` して close のハンドラーの最後の行を切らない（ハンドラーが
-/// 終わってから OS と同じくプロセスが終わる）。
+/// 後始末の結果の終了コードでプロセスを終わらせる）。
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_during_a_ctrl_c_shutdown_keeps_the_close_handlers_last_lines() {
     let sandbox = Sandbox::new();
     // `ctrl-c` と `close` を続けて送る（標準入力のスレッドが順に処理する）。
     let status = collect_then_stop(&sandbox, "ctrl-c\nclose").await;
-    assert_eq!(
-        status.code(),
-        Some(0xC000_013A_u32 as i32),
-        "close のハンドラーの前に main が終わった: {}",
-        sandbox.output_text()
-    );
+    assert_eq!(status.code(), Some(0), "{}", sandbox.output_text());
     assert_stopped_cleanly(&sandbox).await;
     let log = log_text(&sandbox);
     // 後始末の本体を走らせるのは先に `ExitCleanupOnce` に入った方（main の Ctrl-C か
@@ -755,11 +738,8 @@ async fn a_start_failure_while_closing_is_still_written_to_the_daily_log() {
     let mut server = spawn_paused_before_open(&sandbox).await;
     server.send("close");
     let status = server.wait_exit().await;
-    assert!(
-        matches!(status.code(), Some(3) | Some(STATUS_CONTROL_C_EXIT)),
-        "{status:?}: {}",
-        sandbox.output_text()
-    );
+    // main もハンドラーも起動の失敗の終了コードで終わる（#598 監査 F5）。
+    assert_eq!(status.code(), Some(3), "{}", sandbox.output_text());
     let log = log_text(&sandbox);
     for expected in [
         "起動できませんでした",
@@ -781,14 +761,7 @@ async fn a_stop_during_the_start_aborts_it(stop_line: &str) {
     server.send(stop_line);
     let status = server.wait_exit().await;
     let output = sandbox.output_text();
-    if stop_line == "close" {
-        assert!(
-            matches!(status.code(), Some(3) | Some(STATUS_CONTROL_C_EXIT)),
-            "{status:?}: {output}"
-        );
-    } else {
-        assert_eq!(status.code(), Some(3), "{output}");
-    }
+    assert_eq!(status.code(), Some(3), "{output}");
     assert!(output.contains("起動を中止します"), "{output}");
     assert!(
         !sandbox.layout().endpoint_file().exists(),

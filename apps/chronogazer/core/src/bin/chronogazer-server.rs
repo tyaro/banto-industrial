@@ -38,15 +38,16 @@
 //!    `banto_exit_once::ExitCleanupOnce` で 1 回だけ行う。Ctrl-C・Ctrl-Break は
 //!    15 秒、コンソールのウィンドウを閉じた（`CTRL_CLOSE_EVENT`）・ログオフ・
 //!    シャットダウンは 4 秒（OS が待つのは約 5 秒）で、ハンドラーのスレッドが
-//!    後始末とログの書き出しの完了を待ってから戻る。
+//!    後始末とログの書き出しの完了を待ち、**自分でプロセスを終わらせる**
+//!    （[`close_and_exit`]。ハンドラーから戻ったときに OS が終わらせるのを当てに
+//!    しない。#598 監査 F5）。
 //!
 //! 終了コード: 0 正常、1 後始末が予算内に終わらなかった・最終 flush に失敗、
 //! 2 同じデータを別のプロセスが使用中、3 その他の起動の失敗、64 引数が違う。
 //!
 //! `--control-stdin`（自動テスト用。使い方には出さない）: 標準入力の行で止める
 //! （`ctrl-c` = Ctrl-C と同じ経路、`close` = `CTRL_CLOSE_EVENT` のハンドラーと
-//! 同じ関数を呼んだ後、OS と同じくプロセスを終わらせる。標準入力が閉じたら Ctrl-C と
-//! 同じ）。**デバッグビルドだけ**（`#[cfg(debug_assertions)]`。統合テストは
+//! 同じ関数 [`close_and_exit`] を呼ぶ。標準入力が閉じたら Ctrl-C と同じ）。**デバッグビルドだけ**（`#[cfg(debug_assertions)]`。統合テストは
 //! debug ビルドで動く）。リリースビルドでは未知の引数として拒否する（終了コード 64）-
 //! 標準入力をつないだ親プロセスなどから停止を指示できる入口を本番に残さないため
 //! （デスクトップの `CHRONOGAZER_TEST_FAIL_TRAY` と同じ扱い）。
@@ -65,10 +66,6 @@ use chronogazer_core::server_host::{
     self, ServerLog, ServerShutdownSummary, StartedServer, CLOSE_MARGIN, CLOSE_WAIT,
     EXIT_START_FAILED, EXIT_USAGE, INTERRUPT_BUDGET, SERVER_LABEL,
 };
-
-/// `CTRL_CLOSE_EVENT` でハンドラーから戻ったときに OS が使う終了コード
-/// （`STATUS_CONTROL_C_EXIT`）。`--control-stdin` の `close` はこれで終わる。
-const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -475,8 +472,8 @@ impl StopController {
     }
 
     /// コンソールのウィンドウを閉じた・ログオフ・シャットダウン: このスレッド
-    /// （Ctrl のハンドラー）で後始末とログの書き出しの完了を待つ。戻るとプロセスが
-    /// 終わる（モジュール doc）。
+    /// （Ctrl のハンドラー）で後始末とログの書き出しの完了を待ち、終了コードを返す
+    /// （呼び出し側 [`close_and_exit`] がそのコードでプロセスを終わらせる）。
     fn on_close(&self, origin: StopOrigin) -> i32 {
         let started = Instant::now();
         if !self.begin_close() {
@@ -498,6 +495,18 @@ impl StopController {
         self.flush(flush_wait.max(Duration::from_millis(200)));
         code
     }
+}
+
+/// close 系の事象（ウィンドウを閉じた・ログオフ・シャットダウン）の受け口:
+/// [`StopController::on_close`] の後に、その終了コードで**自分で**プロセスを終わらせる
+/// （#598 監査 F5）。Windows はハンドラーから戻るとプロセスを終わらせるが、ログオフ・
+/// シャットダウンで終わらせる時機は OS 次第で、戻った後もプロセスが残ると main は
+/// 待ったまま（`park`）になる。終了コードも OS の `STATUS_CONTROL_C_EXIT` ではなく
+/// 後始末の結果にする。本物のハンドラーと `--control-stdin` の `close` が同じ関数を通る。
+/// main が既に終わりに入っていれば、`on_close` は main の `exit` を待って戻らない。
+fn close_and_exit(controller: &StopController, origin: StopOrigin) -> ! {
+    let code = controller.on_close(origin);
+    std::process::exit(code)
 }
 
 fn run(options: CliOptions) -> i32 {
@@ -830,15 +839,9 @@ fn install_stop_sources(
         let handler = controller.clone();
         let installed = console::install_ctrl_handler(Box::new(move |kind| match kind {
             console::CtrlKind::Interrupt => handler.request(StopOrigin::Interrupt),
-            console::CtrlKind::Close => {
-                handler.on_close(StopOrigin::Close);
-            }
-            console::CtrlKind::Logoff => {
-                handler.on_close(StopOrigin::Logoff);
-            }
-            console::CtrlKind::Shutdown => {
-                handler.on_close(StopOrigin::Shutdown);
-            }
+            console::CtrlKind::Close => close_and_exit(&handler, StopOrigin::Close),
+            console::CtrlKind::Logoff => close_and_exit(&handler, StopOrigin::Logoff),
+            console::CtrlKind::Shutdown => close_and_exit(&handler, StopOrigin::Shutdown),
         }));
         installed.map_err(|err| err.to_string())?;
     }
@@ -870,11 +873,7 @@ fn install_stop_sources(
                     }
                     Ok(_) => match line.trim() {
                         "ctrl-c" => handler.request(StopOrigin::Interrupt),
-                        "close" => {
-                            handler.on_close(StopOrigin::Close);
-                            // OS はハンドラーから戻るとプロセスを終わらせる。
-                            std::process::exit(STATUS_CONTROL_C_EXIT);
-                        }
+                        "close" => close_and_exit(&handler, StopOrigin::Close),
                         _ => {}
                     },
                 }
