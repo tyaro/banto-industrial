@@ -45,6 +45,38 @@
 //!
 //! 結果は標準エラー出力のログに残す（banto-hub も監査やイベントには残さず
 //! ログだけ。ChronoGazer の `collect_events` は収集の出来事用なので使わない）。
+//!
+//! # 止め方（abort しない。2026-10-13）
+//!
+//! 常駐ループは [`RetentionTask`] の**止める合図**（`tokio::sync::watch`）で
+//! 止め、`JoinHandle::abort()` では止めない。[`RetentionTask::stop`] は合図を
+//! 送ってから**ループの終わりを待つ**。合図が効くのは掃除と掃除の間（次の確認
+//! までの待ち）だけで、**掃除（設定の読み取りと削除）の途中なら、その掃除を
+//! 最後まで終えてから止まる**。合図の `Sender` が drop されたとき（持ち主の
+//! [`RetentionTask`] がいなくなった）も「止める」として扱う。
+//!
+//! [`RetentionTask::stop`] は `&self` で、`JoinHandle` を**終わりが実際に
+//! 取れるまで手放さない**（PR #597 のレビュー）。呼び出し側の時間切れ
+//! （`tokio::time::timeout`）で `stop()` の future が落ちても handle は
+//! [`RetentionTask`] の中に残るので、もう一度 `stop()` を呼べば、まだ走って
+//! いる掃除の終わりを改めて待つ。handle を取り出して await する形だと、時間
+//! 切れで handle ごと落ちてタスクが切り離され、次の `stop()` は掃除の途中でも
+//! すぐ「止まった」と返してしまう。
+//!
+//! エンジンは掃除のタスクに **A1 の排他（の `Arc`）を持たせる**
+//! （[`spawn_holding`]）。終了が時間切れで返ってエンジンが drop されても、
+//! 掃除が終わるまで排他は返らないので、別のプロセスが同じ DB を開いて
+//! いる間に裏でこの掃除が DB に触れることはない（PR #597 のレビュー）。
+//!
+//! abort しない理由: 掃除は最初に [`store_config`] で設定 DB を読み、その
+//! `pool.acquire()` は新しい接続を開くことが多い。sqlx（sqlite）の接続の確立は
+//! 別の OS スレッドで進むので、確立の途中で future を落とすと、そのスレッドは
+//! 呼び出し側がいなくなっても DB を開いたまま続き、**pool の勘定の外で**自分で
+//! 閉じる。`Pool::close()` はこの接続を待たないので、終了（エンジンの
+//! `shutdown` の pool を閉じる手順）が返った**後で** `sqlite3_close` が WAL を
+//! 本体へ書き戻し `-wal`/`-shm` を消す。`startup_recovery` のテストで、終了の
+//! 直後にゴミで上書きした DB の先頭が `SQLite format 3` に戻っていた（負荷時
+//! だけ。終了の後 7〜720 ms DB のファイルが開いたままだった）。
 
 use std::future::Future;
 use std::pin::Pin;
@@ -52,6 +84,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_tstore::{Clock, LocalDate, SystemClock};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::collect::CollectorService;
@@ -187,30 +220,50 @@ fn sweep_is_done(outcome: &SweepOutcome) -> bool {
     !matches!(outcome, SweepOutcome::SettingsUnreadable(_))
 }
 
-/// 起動時 + 日付が変わるたびに掃除し続ける（終わらない）。呼び出し側が
+/// 起動時 + 日付が変わるたびに掃除し続ける（`stop` の合図が立つか、その
+/// `Sender` が drop されるまで。止め方はモジュール doc「止め方」）。呼び出し側が
 /// spawn する（`src-tauri` は新規依存を持たない規約なので、`tokio::spawn`
 /// ではなく future を返す形にして、ランタイムは呼ぶ側が選ぶ）。
-pub async fn run(settings: SettingsService, collect: CollectorService) {
+pub async fn run(
+    settings: SettingsService,
+    collect: CollectorService,
+    stop: watch::Receiver<bool>,
+) {
     run_with(
         settings,
         pruner_for(collect),
         Arc::new(SystemClock),
         CHECK_INTERVAL,
+        stop,
     )
     .await
 }
 
 /// [`run`] の削除役・時計・間隔を差し替えられる版（テスト用に公開）。
+///
+/// 1 周は「合図が立っていれば抜ける → 必要なら掃除を**最後まで**行う（掃除は
+/// 合図と競わせない = 途中で止めない）→ `interval` か合図（または `Sender` の
+/// drop）のどちらか早い方まで待つ」。
 pub async fn run_with(
     settings: SettingsService,
     prune: Pruner,
     clock: Arc<dyn Clock>,
     interval: Duration,
+    mut stop: watch::Receiver<bool>,
 ) {
     let mut last_swept: Option<LocalDate> = None;
     loop {
+        // `has_changed()` が `Err` = `Sender` が drop された（持ち主がいなくなった）。
+        // 値だけを見ると、合図を送らずに drop されたとき（タスクの最初の poll
+        // より前・待ちの `sleep` が勝った直後）は `false` のままで、持ち主が
+        // 消えた後に掃除を 1 回まるごと走らせてしまう（PR #597 のレビュー）。
+        if stop.has_changed().is_err() || *stop.borrow_and_update() {
+            return;
+        }
         let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
         if needs_sweep(last_swept, today) {
+            // 掃除は合図と競わせない（`select!` に入れない）。DB の読み取りと
+            // 削除の途中で止めると、sqlx の接続が pool の外に残る（モジュール doc）。
             let outcome = sweep_once(&settings, &prune, clock.as_ref()).await;
             // 設定を読めなかったときは日付を記録せず、次の確認でやり直す。
             // それ以外は失敗しても同じ日に掃除し直さない（毎分のログ溢れを避ける）。
@@ -219,13 +272,88 @@ pub async fn run_with(
                 last_swept = Some(today);
             }
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            changed = stop.changed() => {
+                // `Err` = `Sender` が drop された（持ち主がいなくなった）。
+                // これも止める。`Ok` なら次の周の先頭で値を見る。
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
-/// [`run`] を現在のランタイムに spawn する（`banto-serve` 用）。
-pub fn spawn(settings: SettingsService, collect: CollectorService) -> JoinHandle<()> {
-    tokio::spawn(run(settings, collect))
+/// spawn 済みの常駐ループ（[`spawn_holding`]）と、その止める合図。止めるのは
+/// [`RetentionTask::stop`]（abort しない。モジュール doc「止め方」）。drop すると
+/// 合図の `Sender` が落ちるので、ループは（掃除の途中ならそれを終えてから）
+/// 止まるが、終わりは待たない。
+pub struct RetentionTask {
+    stop: watch::Sender<bool>,
+    /// ループの `JoinHandle`。終わりを取れたら `None` にする。`stop()` の
+    /// future が途中で落ちても残る（モジュール doc「止め方」）。
+    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl RetentionTask {
+    /// 止める合図を受ける future を作って、今のランタイムに spawn する。
+    pub(crate) fn spawn_with<F, Fut>(make: F) -> Self
+    where
+        F: FnOnce(watch::Receiver<bool>) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (stop, receiver) = watch::channel(false);
+        Self {
+            stop,
+            handle: tokio::sync::Mutex::new(Some(tokio::spawn(make(receiver)))),
+        }
+    }
+
+    /// 止める合図だけを送る（待たない）。何度呼んでもよい。終わりを待つのは
+    /// [`RetentionTask::stop`]。
+    pub fn request_stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// 止める合図を送り、ループの終わりを待つ。掃除の途中なら、その掃除が
+    /// 最後まで終わってから返る。何度呼んでもよく、**途中で落とされても**
+    /// （時間切れ）handle は手放さないので、次の呼び出しがまた終わりを待つ。
+    /// 終わりを一度取れた後は、すぐ返る。
+    pub async fn stop(&self) {
+        self.request_stop();
+        let mut slot = self.handle.lock().await;
+        let Some(handle) = slot.as_mut() else {
+            return;
+        };
+        // `&mut JoinHandle` を待つ: ここで落とされても handle は `slot` に残る。
+        let result = handle.await;
+        *slot = None;
+        if let Err(err) = result {
+            if err.is_panic() {
+                eprintln!("banto: 保持期間の掃除のタスクが異常終了していました: {err}");
+            }
+        }
+    }
+}
+
+/// 常駐ループ（エンジンからは [`run`]）を今のランタイムに spawn し、`hold` を
+/// **ループが終わるまで**タスクに持たせる。エンジンは A1 の排他（の `Arc`）を
+/// 渡す: 終了が時間切れで返り、エンジンが drop された後も、掃除が DB に
+/// 触れている間は排他を返さない（モジュール doc「止め方」、PR #597 のレビュー）。
+pub(crate) fn spawn_holding<H, F, Fut>(hold: H, make: F) -> RetentionTask
+where
+    H: Send + 'static,
+    F: FnOnce(watch::Receiver<bool>) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    RetentionTask::spawn_with(move |stop| {
+        let looping = make(stop);
+        async move {
+            let _hold = hold;
+            looping.await
+        }
+    })
 }
 
 #[cfg(test)]
@@ -467,12 +595,12 @@ mod tests {
         let day0 = touch(&dir, date(0));
         let svc = settings_with(Some(7)).await;
         let clock = Arc::new(ManualClock::new(DAY1_MS + 100 * DAY_MS, OFFSET_MS));
-        let handle = tokio::spawn(run_with(
-            svc.clone(),
-            dir_pruner(dir.path()),
-            clock.clone(),
-            Duration::from_millis(20),
-        ));
+        let task = {
+            let (svc, prune, clock) = (svc.clone(), dir_pruner(dir.path()), clock.clone());
+            RetentionTask::spawn_with(move |stop| {
+                run_with(svc, prune, clock, Duration::from_millis(20), stop)
+            })
+        };
 
         async fn wait_until_gone(path: &Path) {
             for _ in 0..200 {
@@ -495,6 +623,232 @@ mod tests {
         clock.set_now_ms(DAY1_MS + 101 * DAY_MS);
         wait_until_gone(&day1).await;
         assert!(!day1.exists(), "日付が変わったら掃除する");
-        handle.abort();
+        tokio::time::timeout(Duration::from_secs(10), task.stop())
+            .await
+            .expect("止める合図で止まる");
+    }
+
+    /// 待ちの上限（`interval` が長くても止まるまでの時間の上限）。負荷の高い CI
+    /// でも落ちない程度に大きく、`LONG_INTERVAL` よりは十分に小さく。
+    const STOP_DEADLINE: Duration = Duration::from_secs(5);
+    /// 「次の確認まで待っている間」を作るための長い間隔。
+    const LONG_INTERVAL: Duration = Duration::from_secs(3600);
+
+    /// 削除役の future が最後まで走らずに drop されたら `cancelled` を立てる。
+    struct CancelProbe {
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        done: bool,
+    }
+
+    impl Drop for CancelProbe {
+        fn drop(&mut self) {
+            if !self.done {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// 呼ばれるたびに `swept` を鳴らす削除役（何も消さない）。
+    fn notifying_pruner(swept: Arc<tokio::sync::Notify>) -> Pruner {
+        Arc::new(move |_days, _today| {
+            let swept = swept.clone();
+            Box::pin(async move {
+                swept.notify_one();
+                Ok(0)
+            })
+        })
+    }
+
+    /// 掃除の途中で止める合図を送っても、その掃除はキャンセルされず最後まで
+    /// 走り、`stop()` はその掃除が終わるまで返らない（abort しない。モジュール
+    /// doc「止め方」）。順序は sleep ではなく通知で作る。
+    #[tokio::test]
+    async fn stop_during_a_sweep_waits_for_the_sweep_to_finish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let prune: Pruner = {
+            let (entered, release, finished, cancelled) = (
+                entered.clone(),
+                release.clone(),
+                finished.clone(),
+                cancelled.clone(),
+            );
+            Arc::new(move |_days, _today| {
+                let (entered, release, finished, cancelled) = (
+                    entered.clone(),
+                    release.clone(),
+                    finished.clone(),
+                    cancelled.clone(),
+                );
+                Box::pin(async move {
+                    let mut probe = CancelProbe {
+                        cancelled,
+                        done: false,
+                    };
+                    entered.notify_one();
+                    release.notified().await;
+                    finished.store(true, Ordering::SeqCst);
+                    probe.done = true;
+                    Ok(0)
+                })
+            })
+        };
+        let svc = settings_with(Some(7)).await;
+        let clock = Arc::new(ManualClock::new(DAY1_MS, OFFSET_MS));
+        let task =
+            RetentionTask::spawn_with(move |stop| run_with(svc, prune, clock, LONG_INTERVAL, stop));
+
+        // 削除の途中（`release` 待ち）に入ったのを確かめてから止める。
+        tokio::time::timeout(STOP_DEADLINE, entered.notified())
+            .await
+            .expect("起動時の掃除が削除役に入る");
+        // 止める合図が実際に送られたことを、合図の受け手を 1 つ足して観測する
+        // （sleep で「stop() が先に走ったはず」とはしない。PR #597 のレビュー）。
+        // `stop()` は合図を送ってから終わりを待つので、ここを抜けた時点で
+        // `stop()` は必ず掃除の途中に呼ばれている。abort する実装なら、この
+        // 時点で abort も済んでいて、掃除の future は二度と poll されない
+        // （= `release` の前に落とされ、`cancelled` が立つ）。
+        let mut requested = task.stop.subscribe();
+        let task = Arc::new(task);
+        let stopper = {
+            let task = task.clone();
+            tokio::spawn(async move { task.stop().await })
+        };
+        tokio::time::timeout(STOP_DEADLINE, requested.wait_for(|stop| *stop))
+            .await
+            .expect("止める合図が送られる")
+            .expect("合図の Sender が生きている");
+        // 掃除は `release` まで終われないので、ここで返っていたら掃除を
+        // 待たずに返った（時間に依らず決まる）。
+        assert!(!stopper.is_finished(), "掃除の途中で stop() が返った");
+        assert!(!finished.load(Ordering::SeqCst));
+
+        // 掃除を終わらせると、次の確認（1 時間後）を待たずに止まる。
+        release.notify_one();
+        tokio::time::timeout(STOP_DEADLINE, stopper)
+            .await
+            .expect("掃除が終われば stop() が返る")
+            .expect("stop() が panic しない");
+        assert!(finished.load(Ordering::SeqCst), "掃除が最後まで走った");
+        assert!(!cancelled.load(Ordering::SeqCst), "掃除が途中で落とされた");
+    }
+
+    /// `stop()` が時間切れで落とされても、掃除のタスクは追い続ける: 次の
+    /// `stop()` は掃除がまだ走っていれば返らず、終われば返る（PR #597 の
+    /// レビュー。handle を取り出して待つ形だと、2 回目は素通りする）。
+    #[tokio::test]
+    async fn stop_again_after_a_timed_out_stop_still_waits_for_the_sweep() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let task = {
+            let (entered, release, finished) = (entered.clone(), release.clone(), finished.clone());
+            RetentionTask::spawn_with(move |_stop| async move {
+                entered.notify_one();
+                release.notified().await;
+                finished.store(true, Ordering::SeqCst);
+            })
+        };
+        tokio::time::timeout(STOP_DEADLINE, entered.notified())
+            .await
+            .expect("掃除が途中に入る");
+
+        let short = Duration::from_millis(100);
+        assert!(
+            tokio::time::timeout(short, task.stop()).await.is_err(),
+            "1 回目の stop() が掃除の途中で返った"
+        );
+        assert!(
+            tokio::time::timeout(short, task.stop()).await.is_err(),
+            "時間切れの後の stop() が掃除の途中で返った"
+        );
+        assert!(!finished.load(Ordering::SeqCst));
+
+        release.notify_one();
+        tokio::time::timeout(STOP_DEADLINE, task.stop())
+            .await
+            .expect("掃除が終われば stop() が返る");
+        assert!(finished.load(Ordering::SeqCst));
+        // 終わりを取った後は何度呼んでもすぐ返る。
+        tokio::time::timeout(STOP_DEADLINE, task.stop())
+            .await
+            .expect("終わった後の stop() はすぐ返る");
+    }
+
+    /// 次の確認までの待ち（1 時間）の間に止めると、待ちを打ち切ってすぐ返る。
+    #[tokio::test]
+    async fn stop_while_waiting_returns_promptly() {
+        let swept = Arc::new(tokio::sync::Notify::new());
+        let svc = settings_with(Some(7)).await;
+        let clock = Arc::new(ManualClock::new(DAY1_MS, OFFSET_MS));
+        let prune = notifying_pruner(swept.clone());
+        let task =
+            RetentionTask::spawn_with(move |stop| run_with(svc, prune, clock, LONG_INTERVAL, stop));
+        tokio::time::timeout(STOP_DEADLINE, swept.notified())
+            .await
+            .expect("起動時の掃除が走る");
+        tokio::time::timeout(STOP_DEADLINE, task.stop())
+            .await
+            .expect("待ちの間に止めればすぐ返る");
+    }
+
+    /// 合図を送らずに `Sender` を drop したら（タスクの最初の poll より前に持ち主が
+    /// いなくなった）、掃除を 1 回も走らせずに止まる。値は `false` のままなので、
+    /// 値だけを見ると掃除を 1 回まるごと走らせる（PR #597 のレビュー）。
+    #[tokio::test]
+    async fn a_sender_dropped_before_the_first_poll_runs_no_sweep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let prune: Pruner = {
+            let sweeps = sweeps.clone();
+            Arc::new(move |_days, _today| {
+                sweeps.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(0) })
+            })
+        };
+        let svc = settings_with(Some(7)).await;
+        let clock = Arc::new(ManualClock::new(DAY1_MS, OFFSET_MS));
+        let (sender, receiver) = watch::channel(false);
+        drop(sender);
+        tokio::time::timeout(
+            STOP_DEADLINE,
+            run_with(svc, prune, clock, LONG_INTERVAL, receiver),
+        )
+        .await
+        .expect("持ち主がいなければすぐ止まる");
+        assert_eq!(
+            sweeps.load(Ordering::SeqCst),
+            0,
+            "持ち主が消えた後に掃除した"
+        );
+    }
+
+    /// 合図の `Sender` を drop しても（持ち主がいなくなった）ループは止まる。
+    #[tokio::test]
+    async fn dropping_the_sender_stops_the_loop() {
+        let swept = Arc::new(tokio::sync::Notify::new());
+        let svc = settings_with(Some(7)).await;
+        let clock = Arc::new(ManualClock::new(DAY1_MS, OFFSET_MS));
+        let (sender, receiver) = watch::channel(false);
+        let handle = tokio::spawn(run_with(
+            svc,
+            notifying_pruner(swept.clone()),
+            clock,
+            LONG_INTERVAL,
+            receiver,
+        ));
+        tokio::time::timeout(STOP_DEADLINE, swept.notified())
+            .await
+            .expect("起動時の掃除が走る");
+        drop(sender);
+        tokio::time::timeout(STOP_DEADLINE, handle)
+            .await
+            .expect("Sender の drop で止まる")
+            .expect("ループが panic しない");
     }
 }

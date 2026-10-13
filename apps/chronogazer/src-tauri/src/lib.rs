@@ -3965,7 +3965,8 @@ pub(crate) struct ExitCleanupReport {
 /// (`chronogazer_core::engine::RunningEngine::shutdown`, #392 B1-2), mapped
 /// onto [`ExitCleanupReport`]. The order and the reasons for it live in that
 /// module's doc (「終了の順序」): 収集の取り消せない終了の印（予算の外）→
-/// 監査の保留の定期の流し込みと保持期間の掃除の abort → LAN サーバー（消費者）→
+/// 監査の保留の定期の流し込みの abort と保持期間の掃除への止める合図（予算の外）→
+/// 保持期間の掃除の終わり（abort しない）→ LAN サーバー（消費者）→
 /// 収集（書き手、最終 flush と `collection_stopped`）→ Hub の購読（収集にとっての
 /// 生産者、#383 段階3 P3）→ SQLite の pool（みんなが書き込む先）.
 ///
