@@ -416,7 +416,26 @@ async fn wait_collecting(port: u16, token: &str) {
 }
 
 /// 起動 → 収集 → `stop_line` で停止。終了の状態を返す。
-async fn collect_then_stop(sandbox: &Sandbox, stop_line: &str) -> ExitStatus {
+/// 収集中に、本文を送り切らない要求を 1 本開いたままにする（#598 のオーナー
+/// レビュー P1 の再現）: `Content-Length: 100` で本文の先頭 1 バイトだけ送る。
+/// 返した接続を持っている間、サーバーの graceful な停止はこの要求を待つ。
+fn hold_unfinished_request(port: u16) -> std::net::TcpStream {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("接続");
+    let head = format!(
+        "POST /api/auth/login HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Banto-Client: banto\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    stream
+}
+
+/// 起動 → 収集 → `stop_line` で停止（`hold_slow` なら、その前に本文を送り切らない
+/// 要求を開いたままにする）。終了の状態と、停止の指示から終了までの時間を返す。
+async fn collect_then_stop_with(
+    sandbox: &Sandbox,
+    stop_line: &str,
+    hold_slow: bool,
+) -> (ExitStatus, Duration) {
     let sim = simulation::start(Protocol::ModbusTcp).await;
     prepare_root(sandbox, Some(sim.addr().port()), false).await;
     let mut server = Server::spawn(sandbox, sandbox.root.to_str().unwrap());
@@ -435,10 +454,22 @@ async fn collect_then_stop(sandbox: &Sandbox, stop_line: &str) -> ExitStatus {
 
     let token = setup_admin(port).await;
     wait_collecting(port, &token).await;
+    let held = hold_slow.then(|| hold_unfinished_request(port));
+    if held.is_some() {
+        // 要求の先頭がサーバーに読まれて、本文を待つ状態になってから止める。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let stopping = Instant::now();
     server.send(stop_line);
     let status = server.wait_exit().await;
+    let elapsed = stopping.elapsed();
+    drop(held);
     drop(sim);
-    status
+    (status, elapsed)
+}
+
+async fn collect_then_stop(sandbox: &Sandbox, stop_line: &str) -> ExitStatus {
+    collect_then_stop_with(sandbox, stop_line, false).await.0
 }
 
 async fn assert_stopped_cleanly(sandbox: &Sandbox) {
@@ -506,6 +537,43 @@ async fn closing_the_console_window_still_flushes_within_the_short_budget() {
     }
     assert!(!log.contains("停止します（Ctrl-C）"), "{log}");
     assert!(started.elapsed() < WAIT_LIMIT);
+}
+
+/// #598 のオーナーレビュー P1: 本文を送り切らない HTTP の要求を開いたまま Ctrl-C で
+/// 止めても、listener の停止を待ちきらずに収集を止める（listener の待ちは上限 1 秒。
+/// 以前は banto の graceful の待ち 5 秒を使い切ってから収集を止めていた）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfinished_http_request_does_not_delay_the_final_flush_on_ctrl_c() {
+    let sandbox = Sandbox::new();
+    let (status, elapsed) = collect_then_stop_with(&sandbox, "ctrl-c", true).await;
+    assert_eq!(status.code(), Some(0), "{}", sandbox.output_text());
+    assert_stopped_cleanly(&sandbox).await;
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "止まるまで {elapsed:?}（listener の停止を待ちすぎ）"
+    );
+}
+
+/// #598 のオーナーレビュー P1: 同じ要求を開いたままコンソールのウィンドウを閉じても
+/// （予算 4 秒）、最終の書き出しと `collection_stopped` が残る。以前は listener の
+/// 停止の待ちが予算を使い切り、収集を止めないまま OS がプロセスを終わらせていた。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfinished_http_request_does_not_skip_the_final_flush_on_close() {
+    let sandbox = Sandbox::new();
+    let (status, _) = collect_then_stop_with(&sandbox, "close", true).await;
+    assert_eq!(
+        status.code(),
+        Some(0xC000_013A_u32 as i32),
+        "{}",
+        sandbox.output_text()
+    );
+    assert_stopped_cleanly(&sandbox).await;
+    let log = log_text(&sandbox);
+    assert!(
+        log.contains("終了の後始末が完了しました（コンソールのウィンドウを閉じた）"),
+        "{log}"
+    );
 }
 
 /// デスクトップが同じ DB を使っていれば A1 で拒否され、終了コード 2。DB も

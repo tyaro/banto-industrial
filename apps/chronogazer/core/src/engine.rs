@@ -63,8 +63,18 @@
 //! 2. 背景タスク（監査の保留の定期の流し込み・保持期間の掃除）を abort する。
 //!    流し込みは途中で止めても失われない（ファイルは行が入ってから消す）。
 //!    これも予算の外（abort は待たない）。
-//! 3. **listener**（LAN の [`ServerSlot`]、続いて常時の loopback の slot から
-//!    取り出して `stop`）。ハンドラーは同じ pool を使うので pool より前。
+//! 3. **listener**（LAN の [`ServerSlot`] と常時の loopback の slot から取り出して
+//!    `stop`）。ハンドラーは同じ pool を使うので pool より前。**待つのは
+//!    [`listener_stop_cap`]（予算の 4 分の 1、最大 1 秒）まで**（#598 のオーナー
+//!    レビュー P1）: banto の `RunningServer::stop` は開いている要求の完了を最大 5 秒
+//!    待つので、本文を送り切らない要求 1 本で、コンソールを閉じたときの予算（約
+//!    3.5 秒）を使い切って 4. の最終 flush を飛ばしていた。上限を超えたら待つのを
+//!    やめて 4. へ進む（停止そのものは裏のタスクで続き、banto の 5 秒で中断される。
+//!    [`ShutdownReport::listener_stop_abandoned`]）。**順序の約束（消費者 → 書き手 →
+//!    生産者 → DB）は変わらない**: 新しい接続は停止の合図で受け付けなくなり、残った
+//!    要求が収集を始めることは 1. の取り消せない印が断る。残った要求が DB を触っても
+//!    pool はまだ開いている（6. で閉じる。閉じた後に届いた要求は DB のエラーになる
+//!    だけで、記録は失わない）。デスクトップ（5 秒）・Ctrl-C（15 秒）の経路も同じ。
 //! 4. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
 //! 5. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
 //!    値の出どころ（収集にとっての生産者）なので、収集より後（#383 段階3 P3）。
@@ -915,8 +925,17 @@ pub struct ShutdownReport {
     pub collect_stop_error: Option<String>,
     /// 予算以内に終わらず、途中で切り上げた。
     pub timed_out: bool,
+    /// listener の停止を [`listener_stop_cap`] で待ちきれず、裏に残して次へ進んだ
+    /// （開いたままの要求があった）。
+    pub listener_stop_abandoned: bool,
     /// 渡された予算。
     pub budget: Duration,
+}
+
+/// 終了で listener の停止を待つ上限（モジュール doc「終了の順序」の 3.）。予算の
+/// 4 分の 1、最大 1 秒。残りを最終 flush（収集の停止）以降に回す。
+pub fn listener_stop_cap(budget: Duration) -> Duration {
+    (budget / 4).min(Duration::from_secs(1))
 }
 
 /// 動いているエンジン（[`OpenedEngine::start`]）。
@@ -995,11 +1014,27 @@ impl RunningEngine {
         completed.push(ShutdownStep::BackgroundTasksAborted);
 
         let mut collect_stop_error = None;
+        let mut listener_stop_abandoned = false;
         let cleanup = async {
             // 3. 消費者（LAN、続いて常時の loopback）。
+            // 停止は裏のタスクで並べて始め、上限までだけ待つ（モジュール doc の 3.）。
             self.observe(ShutdownStep::ListenerStopped);
-            self.server.stop().await;
-            self.loopback.stop().await;
+            let mut stops = Vec::new();
+            for slot in [&*self.server, &self.loopback] {
+                if let Some(running) = slot.inner.lock().await.take() {
+                    stops.push(tokio::spawn(running.stop()));
+                }
+            }
+            let cap = listener_stop_cap(budget);
+            let waited =
+                tokio::time::timeout(cap, futures_util::future::join_all(stops.iter_mut())).await;
+            if waited.is_err() {
+                listener_stop_abandoned = true;
+                eprintln!(
+                    "{label}: 待ち受けの停止が{}ミリ秒で終わらなかった（開いたままの要求がある）ため、待たずに収集の停止へ進みます。",
+                    cap.as_millis()
+                );
+            }
             completed.push(ShutdownStep::ListenerStopped);
 
             // 4. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
@@ -1032,6 +1067,7 @@ impl RunningEngine {
             completed,
             collect_stop_error,
             timed_out,
+            listener_stop_abandoned,
             budget,
         }
     }
@@ -1319,6 +1355,23 @@ mod tests {
         );
         assert!(std::net::TcpStream::connect(lan).is_err(), "LAN が残った");
         assert_eq!(engine.loopback_addr().await, None);
+    }
+
+    /// listener の停止を待つ上限は予算の 4 分の 1、最大 1 秒（最終 flush の予算を残す）。
+    #[test]
+    fn listener_stop_cap_leaves_most_of_the_budget_to_the_final_flush() {
+        assert_eq!(
+            listener_stop_cap(Duration::from_millis(3_500)),
+            Duration::from_millis(875)
+        );
+        assert_eq!(
+            listener_stop_cap(Duration::from_secs(5)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            listener_stop_cap(Duration::from_secs(15)),
+            Duration::from_secs(1)
+        );
     }
 
     /// `POST /api/auth/setup` の HTTP の状態（最初の管理者の作成）。
