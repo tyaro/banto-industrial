@@ -397,6 +397,18 @@ async fn post_setup(url: &str) -> (u16, serde_json::Value) {
     (status, serde_json::from_str(&text).unwrap_or_default())
 }
 
+/// `POST /api/auth/grant/localDesktop`（この PC からの接続、#392 B2-1）の HTTP の状態。
+async fn post_local_grant(url: &str) -> u16 {
+    reqwest::Client::new()
+        .post(url)
+        .header("X-Banto-Client", "banto")
+        .send()
+        .await
+        .expect("send")
+        .status()
+        .as_u16()
+}
+
 fn options(root: &Path) -> ServerOptions {
     ServerOptions {
         layout: DataLayout::new(root),
@@ -429,6 +441,15 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     let (status, host) = get_json(&format!("http://{addr}/api/host")).await;
     assert_eq!(status, 200);
     assert_eq!(host["hostKind"], "server");
+    // #392 B2-1: 未初期化の間は、この PC から管理者として入れる。
+    assert_eq!(
+        started.engine().services().local_grant,
+        crate::local_grant::LocalGrantStart::Uninitialized
+    );
+    assert_eq!(
+        post_local_grant(&format!("http://{addr}/api/auth/grant/localDesktop")).await,
+        200
+    );
     let (status, body) = post_setup(&format!("http://{addr}/api/auth/setup")).await;
     assert_eq!(status, 200);
     assert_eq!(body["success"], true, "{body}");
@@ -457,6 +478,18 @@ async fn setup_is_closed_while_exposed_to_the_lan() {
     let port = started.engine().loopback_addr().await.unwrap().port();
     let (status, _) = post_setup(&format!("http://127.0.0.1:{port}/api/auth/setup")).await;
     assert_eq!(status, 403);
+    // #392 B2-1: この PC からの接続（`localDesktop`）も同じく閉じる。
+    assert_eq!(
+        started.engine().services().local_grant,
+        crate::local_grant::LocalGrantStart::Unsupported
+    );
+    assert_eq!(
+        post_local_grant(&format!(
+            "http://127.0.0.1:{port}/api/auth/grant/localDesktop"
+        ))
+        .await,
+        403
+    );
     assert_eq!(
         started.shutdown(Duration::from_secs(15)).await.exit_code(),
         0

@@ -64,6 +64,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use banto_exit_once::{ExitCleanupOnce, ExitCleanupReport};
+use chronogazer_core::local_grant::LocalGrantStart;
 use chronogazer_core::paths::{resolve_data_root_from_env, DataLayout};
 use chronogazer_core::server_host::{
     self, ServerLog, ServerShutdownSummary, StartedServer, CLOSE_MARGIN, CLOSE_WAIT,
@@ -811,6 +812,22 @@ async fn announce(server: &StartedServer) {
                 "{SERVER_LABEL}: LAN に公開した 1 本の待ち受け（0.0.0.0）にまとめているため、最初の管理者の作成（/api/auth/setup）はこの PC からも閉じています"
             ),
         }
+    }
+    // この PC からの接続（`localDesktop`、#392 B2-1）: setup と同じ listener だけで開く。
+    let loopback_local = engine
+        .loopback_addr()
+        .await
+        .is_some_and(|addr| addr.ip().is_loopback());
+    let local_grant = engine.services().local_grant;
+    match (loopback_local, local_grant.issued_role()) {
+        (true, Some(_)) if local_grant == LocalGrantStart::Uninitialized => println!(
+            "{SERVER_LABEL}: 最初の管理者を作るまでの間、この PC（127.0.0.1）からはログインなしで管理者として入れます"
+        ),
+        (true, Some(role)) => println!(
+            "{SERVER_LABEL}: この PC（127.0.0.1）からはログインなしで {} として入れます（設定 auth.local_grant）",
+            role.as_str()
+        ),
+        _ => {}
     }
     if let Some(err) = server.endpoint_error() {
         eprintln!("{SERVER_LABEL}: {err}");

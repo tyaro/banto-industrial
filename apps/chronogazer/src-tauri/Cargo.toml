@@ -54,7 +54,6 @@ serde_json = { workspace = true }
 # since #392 A2, the tray's status poll (`tray::watch_status`'s
 # `tokio::time::sleep`) - no other timers are started in this crate.
 tokio = { workspace = true, features = ["sync", "time"] }
-qrcode = { workspace = true }
 futures-util = { workspace = true }
 # OS keyring storage for the auto-login credential (spec M11) and, since
 # #332, the self-issued banto-hub API key. See the workspace `Cargo.toml`'s

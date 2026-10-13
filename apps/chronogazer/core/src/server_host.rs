@@ -42,13 +42,22 @@
 //!   LAN は best-effort」の約束をまとめた場合にも守る）。
 //! - `POST /api/auth/setup`（最初の管理者の作成）は、**実際に loopback のアドレスに
 //!   bind できた listener だけ**で開ける（計画ではなく bind の結果で決める。#598 の
-//!   レビュー。`OpenedEngine::with_loopback_only_setup`）。そこに届くのは同じ PC からの
+//!   レビュー。`OpenedEngine::with_loopback_local_access`）。そこに届くのは同じ PC からの
 //!   要求だけで、デスクトップの初回セットアップ（その PC の前の人が最初の管理者に
 //!   なる）と同じ範囲。LAN の bind が失敗して loopback だけで動いていれば開く（新しい
 //!   環境で最初の管理者を作る手段を失わない）。`0.0.0.0` で LAN に出ている listener と
 //!   LAN の listener では閉じる（LAN の誰でも最初の管理者になれてしまう）。後から LAN の
-//!   listener を入れ替える経路（決定 9）のルーターも閉じたまま。B2-1 の loopback grant が
-//!   入ったら、そちらに置き換える。
+//!   listener を入れ替える経路（決定 9）のルーターも閉じたまま。
+//! - **この PC からの接続（`localDesktop` の grant、#392 B2-1、[`crate::local_grant`]）**も
+//!   同じ listener だけで開く（未初期化の間は admin、初期化後は設定 `auth.local_grant`、
+//!   既定 off）。setup は置き換えずに併存させ、どちらにも **Host の確認**（peer と Host の
+//!   両方が loopback。DNS rebinding 対策）をかける。B1-5 の既知の制限「LAN に出していない
+//!   間は同じ PC の任意のプロセスが最初の管理者を作れる」は、デスクトップの初回セット
+//!   アップと同じ範囲として受け入れ（grant の未初期化の admin も同じ性質）、ブラウザーで
+//!   開いた外のページから作られる経路だけを Host の確認で塞いだ。
+//! - LAN の公開設定は REST（`PUT /api/settings/server`、[`crate::server_admin`]）から
+//!   変えられ、LAN の listener はその場で入れ替わる（決定 9）。常時の listener の形が
+//!   変わる設定（ポート・`0.0.0.0`）は保存だけで、次の起動から。
 //!
 //! # 起動の失敗（[`StartFailure`]）
 //!
@@ -619,7 +628,7 @@ async fn start_opened(
     let mut opened = opened
         .with_loopback(plan.loopback.clone())
         .with_listen(lan)
-        .with_loopback_only_setup();
+        .with_loopback_local_access();
     if let Some(fallback) = &plan.loopback_fallback {
         opened = opened.with_loopback_fallback(fallback.clone());
     }
