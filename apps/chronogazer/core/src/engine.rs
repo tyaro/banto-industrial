@@ -164,6 +164,7 @@ use crate::collect::{resolve_data_dir, CollectorService};
 use crate::db::{init_db, Db, DbPool, InitDbError};
 use crate::display_groups::DisplayGroupService;
 use crate::events::event_channel;
+use crate::host_info::{host_router, HostInfo};
 use crate::hub::HubService;
 use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, InstanceLockFailure};
 use crate::rest::{api_router, user_auth_state};
@@ -370,6 +371,8 @@ pub struct EngineServices {
     pub events: broadcast::Sender<ServerEvent>,
     /// 全サービスが共有する SQLite の pool（終了の最後に閉じる）。
     pub pool: DbPool,
+    /// `GET /api/host` の応答（host 種別と排他の単位。#392 B1-4）。
+    pub host: HostInfo,
 }
 
 impl EngineServices {
@@ -392,6 +395,7 @@ impl EngineServices {
                 self.events.clone(),
                 allow_setup,
             )
+            .merge(host_router(self.host.clone()))
             .merge(static_router::<FrontendAssets>()),
         )
     }
@@ -743,6 +747,7 @@ impl OpenedEngine {
             rest_auth,
             events,
             pool,
+            host: HostInfo::new(cfg.host, instance_lock.scope()),
         };
 
         // 9. serve を始める。
@@ -1004,6 +1009,41 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// B1-4: 本番と同じ組み立ての listener が `GET /api/host` に未認証で答え、
+    /// host 種別と A1 の排他の単位（DB のパスのハッシュ）を返す。DB のパスは出ない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn api_host_answers_unauthenticated_with_kind_and_scope_but_no_path() {
+        let dir = TempDir::new();
+        let mut cfg = config(dir.path(), EngineListen::Required(loopback_any_port()));
+        cfg.host = ChronoGazerHost::Server;
+        let db_path = cfg.db_path.clone();
+        let engine = EngineRuntime::start(cfg).await.expect("start");
+        let addr = engine.server_slot().local_addr().await.expect("listening");
+
+        let (expected_scope, _) = banto_instance_lock::path_scope_id(&db_path).unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/api/host");
+        let response = client
+            .get(&url)
+            .header("X-Banto-Client", "banto")
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), 200);
+        let json: serde_json::Value =
+            serde_json::from_str(&response.text().await.expect("text")).expect("json");
+        assert_eq!(json["product"], "chronogazer");
+        assert_eq!(json["hostKind"], "server");
+        assert_eq!(json["scope"], expected_scope.as_str());
+        assert!(!json.to_string().contains(dir.path().to_str().unwrap()));
+
+        // ヘッダが無ければ他の /api と同じく 403。
+        let no_header = client.get(&url).send().await.expect("send");
+        assert_eq!(no_header.status(), 403);
+
+        engine.shutdown(Duration::from_secs(15)).await;
     }
 
     /// 排他の競合では `Err(InstanceLock)` を返し、DB・監査の保留・バックアップの

@@ -51,13 +51,21 @@ pub enum ChronoGazerHost {
     Desktop,
     /// `banto-serve`（開発・E2E 用の単体サーバー）。
     Serve,
+    /// `chronogazer-server` のコンソールモード（#392 B1-4。実体は B1-5）。
+    Server,
+    /// `chronogazer-server` を Windows サービスとして動かしたもの
+    /// （#392 B1-4。実体は B3）。
+    Service,
 }
 
 impl ChronoGazerHost {
-    fn as_str(self) -> &'static str {
+    /// 診断ファイルの `host_kind` と `GET /api/host` の `hostKind` に使う文字列。
+    pub fn as_str(self) -> &'static str {
         match self {
             ChronoGazerHost::Desktop => "desktop",
             ChronoGazerHost::Serve => "serve",
+            ChronoGazerHost::Server => "server",
+            ChronoGazerHost::Service => "service",
         }
     }
 
@@ -66,6 +74,8 @@ impl ChronoGazerHost {
         match host_kind {
             "desktop" => "ChronoGazer デスクトップアプリ",
             "serve" => "banto-serve",
+            "server" => "chronogazer-server（コンソール）",
+            "service" => "ChronoGazer サービス",
             _ => "別のプロセス",
         }
     }
@@ -146,6 +156,16 @@ fn already_running_message(db: &Path, owner: &Option<OwnerInfo>) -> String {
 /// 排他を保持している間だけ生存するガード。プロセスの終わりまで持ち続ける。
 pub struct InstanceGuard {
     _guard: InstanceLockGuard,
+    scope: String,
+}
+
+impl InstanceGuard {
+    /// この排他の単位の ID（mutex 名の `Global\ChronoGazer.<ID>` の `<ID>`。
+    /// DB の正規化パスのハッシュで、パスそのものは含まない）。`GET /api/host` と
+    /// `run\endpoint.json` の `scope`（#392 B1-4）。
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
 }
 
 /// `db_path` の DB を開く前に、その DB の排他を取る。
@@ -181,7 +201,10 @@ pub fn acquire_for_db(
     let lock_file = canonical.with_file_name(lock_name);
 
     match banto_instance_lock::try_acquire(&mutex_name, &lock_file, host.as_str()) {
-        Ok(guard) => Ok(InstanceGuard { _guard: guard }),
+        Ok(guard) => Ok(InstanceGuard {
+            _guard: guard,
+            scope: id,
+        }),
         Err(InstanceLockError::AlreadyHeld { owner }) => Err(InstanceLockFailure::AlreadyRunning {
             db: canonical,
             owner,
@@ -196,6 +219,38 @@ pub fn acquire_for_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_host_kind_has_a_distinct_wire_name_and_a_readable_description() {
+        let all = [
+            ChronoGazerHost::Desktop,
+            ChronoGazerHost::Serve,
+            ChronoGazerHost::Server,
+            ChronoGazerHost::Service,
+        ];
+        let names: std::collections::HashSet<_> = all.iter().map(|h| h.as_str()).collect();
+        assert_eq!(names.len(), all.len());
+        for host in all {
+            assert_ne!(
+                ChronoGazerHost::describe(host.as_str()),
+                "別のプロセス",
+                "{host:?} の表示名が無い"
+            );
+        }
+        assert_eq!(ChronoGazerHost::Server.as_str(), "server");
+        assert_eq!(ChronoGazerHost::Service.as_str(), "service");
+    }
+
+    #[test]
+    fn the_guard_exposes_the_opaque_scope_used_in_the_mutex_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        let guard = acquire_for_db(&db, ChronoGazerHost::Server).expect("ok");
+        let (id, _) = banto_instance_lock::path_scope_id(&db).unwrap();
+        assert_eq!(guard.scope(), id);
+        assert_eq!(guard.scope().len(), 16);
+        assert!(!guard.scope().contains(dir.path().to_str().unwrap()));
+    }
 
     #[test]
     fn second_open_of_the_same_db_is_refused_with_the_owner() {

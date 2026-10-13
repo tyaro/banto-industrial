@@ -274,6 +274,57 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// `pid` のプロセスが今も生きているか（#392 B1-4。`run/endpoint.json` の
+/// 古さの判定用）。**生きていると言い切れないときは `true`** を返す（権限が
+/// 足りず調べられない・OS が答えない）。古いファイルを「生きている」と誤って
+/// 読むほうが、生きているサービスのファイルを「無い」と読むより害が小さい
+/// （前者は接続を試みて失敗するだけ、後者は二重起動の判断を誤らせうる）。
+/// pid は再利用されるので、`true` は「そのファイルを書いたプロセスが生きている」
+/// の証明ではない（同じ pid の別プロセスでも `true`）。`pid == 0` は `false`。
+pub fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    process_is_alive_impl(pid)
+}
+
+#[cfg(windows)]
+fn process_is_alive_impl(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: 返ったハンドルは下で必ず閉じる。
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            // 存在しない pid は ERROR_INVALID_PARAMETER。権限不足（SYSTEM 所有の
+            // サービスを一般利用者が調べる等）は「生きている」側に倒す。
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        // 終了済みでもハンドルが残っていれば開けるので、待機で見る。終了コードを
+        // STILL_ACTIVE（259）と比べる方法は、259 で終わったプロセスを永遠に
+        // 生きていると読むので使わない。
+        let wait = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        // 終了済み（シグナル状態）だけが死んでいる。タイムアウト・失敗は生きている側。
+        wait != WAIT_OBJECT_0
+    }
+}
+
+#[cfg(not(windows))]
+fn process_is_alive_impl(pid: u32) -> bool {
+    // SAFETY: シグナル 0 は存在確認だけで何も送らない。
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // ESRCH = 存在しない。EPERM（他ユーザーのプロセス）は生きている。
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 /// 対象ファイルのパスから、排他の単位になる短い安定 ID（16 桁の小文字 hex）を
 /// 作る。同じファイルを指すパス（相対・絶対・`..` 入り）は同じ ID になり、
 /// 別のファイルは別の ID になる。
@@ -338,6 +389,43 @@ mod tests {
 
     fn lock_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         dir.path().join(name)
+    }
+
+    #[test]
+    fn process_is_alive_sees_this_process_and_rejects_pid_zero() {
+        assert!(process_is_alive(std::process::id()));
+        assert!(!process_is_alive(0));
+    }
+
+    #[test]
+    fn process_is_alive_is_false_for_a_finished_child() {
+        let mut command = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = command.spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+        // wait 済み（ハンドルは Child がまだ持つので Windows でも終了コードで判定される）。
+        assert!(!process_is_alive(pid));
+    }
+
+    /// 終了コード 259（= STILL_ACTIVE と同じ値）で終わったプロセスも死んでいると
+    /// 判定する（#596 のレビュー）。
+    #[cfg(windows)]
+    #[test]
+    fn process_is_alive_is_false_for_a_child_that_exited_with_259() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 259"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let status = child.wait().expect("wait");
+        assert_eq!(status.code(), Some(259));
+        assert!(!process_is_alive(pid));
     }
 
     #[test]

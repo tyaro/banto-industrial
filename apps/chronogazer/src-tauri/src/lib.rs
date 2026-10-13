@@ -5130,6 +5130,10 @@ mod tests {
             ),
             events: event_channel(),
             pool,
+            host: chronogazer_core::host_info::HostInfo::new(
+                chronogazer_core::instance_lock::ChronoGazerHost::Desktop,
+                "test",
+            ),
         }
     }
 
