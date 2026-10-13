@@ -72,18 +72,17 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   起動した利用者だけ）、ログ `logs\`、所在 `run\endpoint.json`（動いている間だけ）。
 - **待ち受け**: `http://127.0.0.1:<port>/`（設定 `server.port`、既定 8721）は常に開く。LAN は設定
   `server.enabled` がデスクトップ版と同じ条件を満たすときだけ `server.bind` に足す（`0.0.0.0` なら 1 本）。
-  最初の管理者の作成（`/api/auth/setup`）は待ち受けごとに決まる: `127.0.0.1` の待ち受けでは開き（この PC の
-  ブラウザから作れる）、LAN の待ち受けでは閉じる。特定の LAN の IP を別の待ち受けで開いていても `127.0.0.1` では
-  作れる。`server.bind = 0.0.0.0` で 1 本にまとめたときだけ、この PC からも作れない。作成は、要求の送り元と
-  `Host` の両方が `127.0.0.1`・`localhost`・`[::1]` のときだけ受け付ける（外のページからの DNS rebinding を防ぐ。
-  #392 B2-1）。
-- **この PC からの接続（ログインなし、#392 B2-1）**: `127.0.0.1` の待ち受けで、送り元と `Host` の両方が
-  この PC のときだけ、`POST /api/auth/grant/localDesktop` でログインせずにセッションを受け取れる。最初の
+  最初の管理者の作成（`/api/auth/setup`）は要求ごとに決まる: 要求の送り元と `Host` の両方がこの PC
+  （`127.0.0.1`・`localhost`・`[::1]`）のときだけ受け付け、LAN からの要求では閉じる（`0.0.0.0` で 1 本に
+  まとめていても同じ。外のページからの DNS rebinding も防ぐ。#392 B2-1、2026-10-14）。この PC のブラウザで
+  `http://127.0.0.1:<port>/` を開けば作れる。
+- **この PC からの接続（ログインなし、#392 B2-1）**: 要求の送り元と `Host` の両方がこの PC のときだけ、`POST /api/auth/grant/localDesktop` でログインせずにセッションを受け取れる。最初の
   管理者を作るまでの間は管理者、作った後は設定 `auth.local_grant`（`off`・`viewer`・`editor`・`admin`、
-  **既定 `off`**）の権限。受け取った記録は監査ログに `login`（`via: localGrant`、操作者 `local`）で残る。
-  設定は管理者が `PUT /api/settings/auth`（`{"localGrant":"viewer"}` など）で変える。発行をやめる方向は
-  すぐ効き（発行済みのセッションも切れる）、新しい権限で入れるのは**次の起動から**。LAN の待ち受け・
-  `0.0.0.0` でまとめた待ち受けでは発行しない。同じ PC で reverse proxy の後ろに置くと、この確認は効かない。
+  **既定 `off`**）の権限。受け取った記録は監査ログに `login`（`via: localGrant`、操作者 `localDesktop`）で残る。
+  設定は管理者がこの PC から `PUT /api/settings/auth`（`{"localGrant":"viewer"}` など）で変える（LAN からは
+  変えられない）。発行をやめる方向は
+  すぐ効き（発行済みのセッションも切れる）、新しい権限で入れるのは**次の起動から**。LAN からの要求
+  （`0.0.0.0` でまとめた待ち受けでも）・LAN 専用の待ち受けでは発行しない。同じ PC で reverse proxy の後ろに置くと、この確認は効かない。
 - **LAN の公開設定（#392 B2-1）**: 管理者が `GET`/`PUT /api/settings/server`（`{enabled,bind,port,viewerPublic}`）
   で読み書きできる。`PUT` はこの PC からの要求だけ受け付け、LAN の待ち受けをその場で開け閉めする。ポートの
   変更と `0.0.0.0` への出し入れは保存だけして `restartRequired: true` を返す（次の起動から）。ログイン不要

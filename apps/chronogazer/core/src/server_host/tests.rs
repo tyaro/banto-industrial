@@ -461,10 +461,25 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     assert!(std::net::TcpStream::connect(addr).is_err());
 }
 
-/// LAN に出しているとき（bind `0.0.0.0` を 1 本にまとめる）は、最初の管理者の
-/// 作成を開けない（LAN の誰でも最初の管理者になれてしまうため）。
+/// この PC の非 loopback の IPv4（LAN 側）。無い環境では `None`。
+fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    banto_server::lan_urls_for_bind("0.0.0.0", 1)
+        .into_iter()
+        .filter_map(|url| {
+            url.strip_prefix("http://")?
+                .strip_suffix(":1")?
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+        })
+        .find(|ip| !ip.is_loopback())
+}
+
+/// LAN に出しているとき（bind `0.0.0.0` を 1 本にまとめる）も、最初の管理者の作成と
+/// この PC からの接続（`localDesktop`）は、要求ごとに peer と Host の両方が loopback なら
+/// 開く。LAN からの要求（peer が LAN）は同じ listener でも閉じる（2026-10-14 オーナー
+/// 決定。B1-5 では listener 単位で、この PC からも閉じていた）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn setup_is_closed_while_exposed_to_the_lan() {
+async fn setup_and_local_grant_follow_the_request_on_the_merged_wildcard_listener() {
     let dir = TempDir::new();
     prepare_root(
         dir.path(),
@@ -475,21 +490,39 @@ async fn setup_is_closed_while_exposed_to_the_lan() {
     assert_eq!(started.plan().loopback.bind, "0.0.0.0");
     assert!(started.plan().exposes_lan());
     assert!(started.exposes_lan().await);
-    let port = started.engine().loopback_addr().await.unwrap().port();
-    let (status, _) = post_setup(&format!("http://127.0.0.1:{port}/api/auth/setup")).await;
-    assert_eq!(status, 403);
-    // #392 B2-1: この PC からの接続（`localDesktop`）も同じく閉じる。
     assert_eq!(
         started.engine().services().local_grant,
-        crate::local_grant::LocalGrantStart::Unsupported
+        crate::local_grant::LocalGrantStart::Uninitialized
     );
+    let port = started.engine().loopback_addr().await.unwrap().port();
+
+    // LAN から（peer が LAN の IP）は閉じる。LAN の IP が無い環境では確かめない。
+    if let Some(lan_ip) = first_lan_ipv4() {
+        let base = format!("http://{lan_ip}:{port}");
+        let (status, body) = get_json(&format!("{base}/api/auth/status")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["grants"]["localDesktop"], false, "{body}");
+        assert_eq!(
+            post_local_grant(&format!("{base}/api/auth/grant/localDesktop")).await,
+            403
+        );
+        let (status, _) = post_setup(&format!("{base}/api/auth/setup")).await;
+        assert_eq!(status, 403, "LAN から最初の管理者を作れた");
+    } else {
+        eprintln!(
+            "skip: この環境には非 loopback の IPv4 アドレスが無い（LAN からの要求は確かめない）"
+        );
+    }
+
+    // この PC から（peer も Host も 127.0.0.1）は開く。
+    let base = format!("http://127.0.0.1:{port}");
     assert_eq!(
-        post_local_grant(&format!(
-            "http://127.0.0.1:{port}/api/auth/grant/localDesktop"
-        ))
-        .await,
-        403
+        post_local_grant(&format!("{base}/api/auth/grant/localDesktop")).await,
+        200
     );
+    let (status, body) = post_setup(&format!("{base}/api/auth/setup")).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["success"], true, "{body}");
     assert_eq!(
         started.shutdown(Duration::from_secs(15)).await.exit_code(),
         0

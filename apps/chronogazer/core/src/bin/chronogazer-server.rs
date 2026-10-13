@@ -798,36 +798,27 @@ async fn announce(server: &StartedServer) {
             "{SERVER_LABEL}: LAN の待ち受けを開けませんでした（この PC からは使えます）: {err}"
         );
     }
-    // 最初の管理者の作成（`/api/auth/setup`）は listener ごと（#598 監査 F2）: loopback の
-    // アドレスに bind できた常時の listener だけで開き、LAN の listener では閉じる。
-    // 特定の LAN の IP を別に開いた 2 本の形でも、この PC の 127.0.0.1 からは作れる。
-    // `0.0.0.0` の 1 本にまとめたときだけ、この PC からも作れない。
-    if server.exposes_lan().await {
-        match engine.loopback_addr().await {
-            Some(addr) if addr.ip().is_loopback() => println!(
-                "{SERVER_LABEL}: 最初の管理者の作成（/api/auth/setup）は LAN の待ち受けでは閉じています（この PC の http://127.0.0.1:{}/ からは作れます）",
-                addr.port()
-            ),
-            _ => println!(
-                "{SERVER_LABEL}: LAN に公開した 1 本の待ち受け（0.0.0.0）にまとめているため、最初の管理者の作成（/api/auth/setup）はこの PC からも閉じています"
-            ),
+    // 最初の管理者の作成（`/api/auth/setup`）とこの PC からの接続（`localDesktop`、
+    // #392 B2-1）は、常時の listener への、この PC からの要求（peer と Host の両方が
+    // loopback）だけで開く（2026-10-14 オーナー決定。`0.0.0.0` にまとめても同じ）。
+    if let Some(addr) = engine.loopback_addr().await {
+        let port = addr.port();
+        if server.exposes_lan().await {
+            println!(
+                "{SERVER_LABEL}: 最初の管理者の作成とログインなしの接続は、この PC の http://127.0.0.1:{port}/ からだけ行えます（LAN からは閉じています）"
+            );
         }
-    }
-    // この PC からの接続（`localDesktop`、#392 B2-1）: setup と同じ listener だけで開く。
-    let loopback_local = engine
-        .loopback_addr()
-        .await
-        .is_some_and(|addr| addr.ip().is_loopback());
-    let local_grant = engine.services().local_grant;
-    match (loopback_local, local_grant.issued_role()) {
-        (true, Some(_)) if local_grant == LocalGrantStart::Uninitialized => println!(
-            "{SERVER_LABEL}: 最初の管理者を作るまでの間、この PC（127.0.0.1）からはログインなしで管理者として入れます"
-        ),
-        (true, Some(role)) => println!(
-            "{SERVER_LABEL}: この PC（127.0.0.1）からはログインなしで {} として入れます（設定 auth.local_grant）",
-            role.as_str()
-        ),
-        _ => {}
+        let local_grant = engine.services().local_grant;
+        match local_grant.issued_role() {
+            Some(_) if local_grant == LocalGrantStart::Uninitialized => println!(
+                "{SERVER_LABEL}: 最初の管理者を作るまでの間、この PC（http://127.0.0.1:{port}/）からはログインなしで管理者として入れます"
+            ),
+            Some(role) => println!(
+                "{SERVER_LABEL}: この PC（http://127.0.0.1:{port}/）からはログインなしで {} として入れます（設定 auth.local_grant）",
+                role.as_str()
+            ),
+            None => {}
+        }
     }
     if let Some(err) = server.endpoint_error() {
         eprintln!("{SERVER_LABEL}: {err}");

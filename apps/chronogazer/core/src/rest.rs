@@ -8,8 +8,8 @@
 //! | Method | Path               | Body           | Response              |
 //! |--------|--------------------|----------------|------------------------|
 //! | GET    | `/api/auth/status`   | -              | `{initialized,grants}` (NO auth required; `grants` is `{ localDesktop: bool, publicViewer: bool }` - `publicViewer` is the live `server.viewer_public`, `localDesktop` is `crate::local_grant`'s judgment for THIS peer and Host) |
-//! | POST   | `/api/auth/grant/{kind}` | -          | `{success,token}` for `publicViewer` while 閲覧公開 is ON (`403` while OFF; banto v3.0.0 ADR-0017, 2026-10-04 owner decision) and for `localDesktop` (#392 B2-1: only on `chronogazer-server`'s loopback listener, peer AND Host loopback, admin while uninitialized, else `auth.local_grant`; `403` otherwise). `404` for any other kind |
-//! | POST   | `/api/auth/setup`     | `{username,password,displayName}` | `{success,error?,token?}` (needs `allow_setup`; on `chronogazer-server`'s loopback listener also peer AND Host loopback, #392 B2-1) |
+//! | POST   | `/api/auth/grant/{kind}` | -          | `{success,token}` for `publicViewer` while 閲覧公開 is ON (`403` while OFF; banto v3.0.0 ADR-0017, 2026-10-04 owner decision) and for `localDesktop` (#392 B2-1: only on `chronogazer-server`'s always-on listener (`127.0.0.1`, or the merged `0.0.0.0` one), per request peer AND Host loopback, admin while uninitialized, else `auth.local_grant`; `403` otherwise). `404` for any other kind |
+//! | POST   | `/api/auth/setup`     | `{username,password,displayName}` | `{success,error?,token?}` (needs `allow_setup`; on `chronogazer-server`'s always-on listener: per request peer AND Host loopback, #392 B2-1) |
 //! | POST   | `/api/auth/login`    | `{username,password}` | `{success,error?,token?}` |
 //! | POST   | `/api/auth/logout`   | -              | 200                    |
 //! | GET    | `/api/auth/check`    | -              | `bool`                 |
@@ -1957,8 +1957,8 @@ pub fn api_router(
         .expect("the viewer-public grant registers on an empty registry");
     // #392 B2-1: この PC からの接続（`localDesktop`、`crate::local_grant`）。どの
     // listener にも登録し（`status.grants.localDesktop` が常にあり、閉じている listener
-    // では発行が `404` ではなく `403`）、開けるのは loopback に bind できた
-    // `chronogazer-server` の常時の listener だけ（条件の中で判定）。
+    // では発行が `404` ではなく `403`）、開けるのは `chronogazer-server` の常時の
+    // listener への、この PC からの要求（peer と Host の両方が loopback）だけ。
     grants
         .register(local_desktop_grant_spec(
             host.local,

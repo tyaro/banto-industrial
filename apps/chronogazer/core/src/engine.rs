@@ -139,7 +139,8 @@
 //!   `attach_hub` の有無。
 //! - 待ち受け（[`EngineListen`]、`chronogazer-server` は加えて常時の loopback）と
 //!   `allow_setup`（`POST /api/auth/setup` を開けるのは `banto-serve` と、
-//!   `chronogazer-server` の**実際に loopback のアドレスに bind できた listener だけ**。
+//!   `chronogazer-server` の常時の listener への**この PC からの要求だけ**（peer と Host。
+//!   2026-10-14 オーナー決定で listener 単位から要求ごとに変えた）。
 //!   [`OpenedEngine::with_loopback_local_access`]）。
 //! - ログの接頭辞（`banto` / `banto-serve`）と、起動時の `restore_applied` の
 //!   監査の `origin`（`tauri` / `rest`）。今までの各 host の文言・値を保つため。
@@ -473,7 +474,7 @@ impl EngineServices {
         let access = HostAccess {
             local: LocalAccess {
                 start: self.local_grant,
-                loopback_listener: loopback_local,
+                always_on_listener: loopback_local,
             },
             lan: LanControl {
                 slot: self.lan_slot.clone(),
@@ -707,18 +708,19 @@ impl OpenedEngine {
         self
     }
 
-    /// 最初の管理者の作成（`POST /api/auth/setup`）を、**実際に loopback のアドレスに
-    /// bind できた listener のルーターだけ**に開ける（#392 B1-5、#598 のレビュー。
-    /// `chronogazer-server`）。計画ではなく bind の結果で決めるので、LAN の bind が
-    /// 失敗して loopback だけで動いていれば開き、`0.0.0.0` で LAN に出ていれば閉じる。
-    /// LAN の listener と、後から LAN を入れ替えるときの [`RunningEngine::router`]
-    /// （決定 9）は常に閉じる - LAN に出る listener で開けたままにしない。
-    /// [`EngineConfig::allow_setup`]（`banto-serve`）が `true` ならそちらが優先（全部で開く）。
-    ///
-    /// #392 B2-1: 同じ listener のルーターだけで、この PC からの接続の grant
-    /// （`localDesktop`、[`crate::local_grant`]）も開け、最初の管理者の作成に Host の
-    /// 確認（peer と Host の両方が loopback）をかける。発行の形（未初期化なら admin、
-    /// 初期化済みなら設定 `auth.local_grant`）は `start` で 1 回だけ決める。
+    /// 常時の listener（[`OpenedEngine::with_loopback`]）のルーターで、**この PC からの
+    /// 要求だけ**に最初の管理者の作成（`POST /api/auth/setup`）とこの PC からの接続の
+    /// grant（`localDesktop`、[`crate::local_grant`]）を開ける（`chronogazer-server`）。
+    /// 「この PC から」は要求ごとに peer と Host の両方が loopback かで決める
+    /// （[`crate::local_grant::local_access_middleware`]）。これが本当の境界で、常時の
+    /// listener が `0.0.0.0` にまとめた 1 本でも、LAN からの要求は peer が LAN なので
+    /// 閉じる（2026-10-14 オーナー決定。B1-5 では「loopback に bind できた listener
+    /// だけ」と listener 単位で決めていた）。LAN 専用の listener（LAN の slot）と、後から
+    /// LAN を入れ替えるときの [`RunningEngine::router`]（決定 9）は常に閉じる
+    /// （多層の防御。LAN の IP に bind した listener に loopback の peer は来ない）。
+    /// [`EngineConfig::allow_setup`]（`banto-serve`）が `true` なら setup はそちらが
+    /// 優先（全部で開く）。発行の形（未初期化なら admin、初期化済みなら設定
+    /// `auth.local_grant`）は `start` で 1 回だけ決める。
     pub fn with_loopback_local_access(mut self) -> Self {
         self.loopback_local_access = true;
         self
@@ -958,13 +960,11 @@ impl OpenedEngine {
         };
 
         // #392 B2-1: この PC からの接続（`localDesktop`）の発行の形。常時の listener を
-        // 実際に loopback のアドレスに bind できた host（`chronogazer-server`。`0.0.0.0`
-        // にまとめたときは発行しない）だけ、起動時に 1 回決める（ロールの変更は再起動で
-        // 反映 - `crate::local_grant`）。
-        let loopback_is_local = loopback_local_access
-            && bound_loopback
-                .as_ref()
-                .is_some_and(|bound| bound.local_addr().ip().is_loopback());
+        // 開けた host（`chronogazer-server`）だけ、起動時に 1 回決める（ロールの変更は
+        // 再起動で反映 - `crate::local_grant`）。bind のアドレス（`0.0.0.0` にまとめたか）
+        // では決めない: 「この PC から」は要求ごとに peer と Host で確かめる
+        // （2026-10-14 オーナー決定）。
+        let loopback_is_local = loopback_local_access && bound_loopback.is_some();
         let local_grant = if loopback_is_local {
             LocalGrantStart::resolve(&users, &settings, label).await
         } else {
@@ -1002,9 +1002,9 @@ impl OpenedEngine {
         let listen_error = listen_error.or(fallback_error);
 
         // 9. serve を始める。最初の管理者の作成は `allow_setup`（全部）か、
-        // `loopback_local_access` なら実際に loopback のアドレスに bind できた常時の
-        // listener だけ（LAN の listener と後の入れ替えは閉じる）。この PC からの接続の
-        // grant（#392 B2-1）も同じ listener だけ。
+        // `loopback_local_access` なら常時の listener の、この PC からの要求（peer と
+        // Host の両方が loopback）だけ（LAN の listener と後の入れ替えは閉じる）。
+        // この PC からの接続の grant（#392 B2-1）も同じ。
         let lan_allow_setup = cfg.allow_setup;
         let server =
             bound.map(|bound: BoundServer| bound.serve(services.router(lan_allow_setup, false)));
@@ -1689,7 +1689,7 @@ mod tests {
     /// listener だけで最初の管理者の作成を開け、LAN の listener（と後の入れ替えの
     /// ルーター）は閉じる - アドレスが loopback でも LAN の slot は閉じる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn setup_opens_only_on_the_loopback_listener() {
+    async fn setup_opens_only_on_the_always_on_listener() {
         let dir = TempDir::new();
         let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
             .await
@@ -2201,7 +2201,7 @@ mod tests {
     /// slot の listener（アドレスが loopback でも）では `403`。Host が loopback で
     /// なければ常時の listener でも `403`（本物の serve の `ConnectInfo` の上で）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_grant_opens_only_on_the_loopback_listener() {
+    async fn local_grant_opens_only_on_the_always_on_listener() {
         let dir = TempDir::new();
         let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
             .await

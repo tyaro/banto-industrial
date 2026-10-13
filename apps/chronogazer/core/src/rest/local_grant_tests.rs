@@ -49,15 +49,15 @@ struct Fixture {
     audit: AuditLogService,
 }
 
-async fn fixture(start: LocalGrantStart, loopback_listener: bool, accounts: &[Role]) -> Fixture {
-    fixture_with(start, loopback_listener, accounts, None).await
+async fn fixture(start: LocalGrantStart, always_on_listener: bool, accounts: &[Role]) -> Fixture {
+    fixture_with(start, always_on_listener, accounts, None).await
 }
 
 /// `accounts` を先に作り（最初は setup で admin）、`setting` を保存してからルーターを組む
 /// （エンジンが起動時に決める `start` と DB の状態を揃える）。
 async fn fixture_with(
     start: LocalGrantStart,
-    loopback_listener: bool,
+    always_on_listener: bool,
     accounts: &[Role],
     setting: Option<LocalGrantSetting>,
 ) -> Fixture {
@@ -93,7 +93,7 @@ async fn fixture_with(
     let host = HostAccess {
         local: LocalAccess {
             start,
-            loopback_listener,
+            always_on_listener,
         },
         lan: LanControl::detached(),
         ..HostAccess::closed()
@@ -111,7 +111,7 @@ async fn fixture_with(
         DisplayGroupService::new(pool),
         auth,
         tx,
-        loopback_listener,
+        always_on_listener,
         host,
     );
     Fixture {
@@ -223,7 +223,7 @@ async fn grant_logins(audit: &AuditLogService) -> usize {
         .into_iter()
         .filter(|row| {
             row.action == "login"
-                && row.actor_username.as_deref() == Some("local")
+                && row.actor_username.as_deref() == Some("localDesktop")
                 && row
                     .detail
                     .as_deref()
@@ -248,7 +248,7 @@ async fn uninitialized_issues_admin_until_the_first_account_exists() {
     let token = token.expect("token");
     let (status, me) = identity(&f.router, &token).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(me["id"], "local", "{me}");
+    assert_eq!(me["id"], "localDesktop", "{me}");
     assert_eq!(me["role"], "admin", "{me}");
     assert_eq!(me["kind"], "localDesktop", "{me}");
     assert_eq!(
@@ -373,7 +373,7 @@ async fn a_loopback_peer_with_a_foreign_host_is_refused() {
     assert_eq!(body["grants"]["publicViewer"], false, "{body}");
 }
 
-/// LAN の listener のルーター（`loopback_listener: false`）は、peer と Host が
+/// LAN の listener のルーター（`always_on_listener: false`）は、peer と Host が
 /// loopback でも発行しない（`404` ではなく `403`、status は `false`）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lan_listener_never_issues() {
@@ -419,7 +419,7 @@ async fn initialized_issues_the_configured_role() {
         assert_eq!(status, StatusCode::OK, "{role:?}");
         let (_, me) = identity(&f.router, &token.unwrap()).await;
         assert_eq!(me["role"], role.as_str(), "{me}");
-        assert_eq!(me["id"], "local", "{me}");
+        assert_eq!(me["id"], "localDesktop", "{me}");
     }
 }
 
@@ -511,6 +511,65 @@ async fn changing_the_setting_closes_now_and_reopens_after_a_restart() {
     );
     let saved = crate::local_grant::read_setting(&f.settings).await.unwrap();
     assert_eq!(saved, LocalGrantSetting::Role(Role::Admin));
+
+    // 変更はこの PC からの要求だけ（2026-10-14 オーナー決定）。LAN の peer・この PC 以外の
+    // Host からは admin でも `403` で、保存は変わらない。
+    for (peer, host) in [
+        (Some(LAN), Some(LOCAL_HOST)),
+        (Some(LOCAL), Some("evil.example")),
+    ] {
+        let (status, body) = send(
+            &f.router,
+            "PUT",
+            "/api/settings/auth",
+            peer,
+            host,
+            Some(&admin),
+            Some(json!({ "localGrant": "off" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{peer:?} {host:?}: {body}");
+    }
+    let saved = crate::local_grant::read_setting(&f.settings).await.unwrap();
+    assert_eq!(saved, LocalGrantSetting::Role(Role::Admin));
+}
+
+/// 常時の listener（`0.0.0.0` にまとめた 1 本を含む）でも、最初の管理者の作成は要求ごと:
+/// LAN の peer・この PC 以外の Host は `403`、この PC からは作れる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_on_the_always_on_listener_needs_a_request_from_this_pc() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let setup = json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" });
+    for (peer, host) in [
+        (Some(LAN), Some(LOCAL_HOST)),
+        (Some(LAN), Some("192.168.1.5:8721")),
+        (Some(LOCAL), Some("evil.example:8721")),
+        (None, Some(LOCAL_HOST)),
+    ] {
+        let (status, body) = send(
+            &f.router,
+            "POST",
+            "/api/auth/setup",
+            peer,
+            host,
+            None,
+            Some(setup.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{peer:?} {host:?}: {body}");
+    }
+    assert!(!f.users.is_initialized().await.unwrap());
+    let (status, body) = send(
+        &f.router,
+        "POST",
+        "/api/auth/setup",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        None,
+        Some(setup),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// 発行の上限（`max_sessions`）を超えたら、最古のトークンから失効する。

@@ -40,16 +40,16 @@
 //!   持っている等）ときは、`127.0.0.1:port` に落として起動を続け、LAN を開けなかった
 //!   理由を残す（[`ListenPlan::loopback_fallback`]、#598 のレビュー。「loopback は常に、
 //!   LAN は best-effort」の約束をまとめた場合にも守る）。
-//! - `POST /api/auth/setup`（最初の管理者の作成）は、**実際に loopback のアドレスに
-//!   bind できた listener だけ**で開ける（計画ではなく bind の結果で決める。#598 の
-//!   レビュー。`OpenedEngine::with_loopback_local_access`）。そこに届くのは同じ PC からの
-//!   要求だけで、デスクトップの初回セットアップ（その PC の前の人が最初の管理者に
-//!   なる）と同じ範囲。LAN の bind が失敗して loopback だけで動いていれば開く（新しい
-//!   環境で最初の管理者を作る手段を失わない）。`0.0.0.0` で LAN に出ている listener と
-//!   LAN の listener では閉じる（LAN の誰でも最初の管理者になれてしまう）。後から LAN の
-//!   listener を入れ替える経路（決定 9）のルーターも閉じたまま。
+//! - `POST /api/auth/setup`（最初の管理者の作成）は、常時の listener への**この PC からの
+//!   要求**（peer と Host の両方が loopback）だけで開ける（`OpenedEngine::
+//!   with_loopback_local_access`）。デスクトップの初回セットアップ（その PC の前の人が
+//!   最初の管理者になる）と同じ範囲。`0.0.0.0` にまとめた 1 本でも、LAN からの要求は
+//!   peer が LAN なので閉じる（2026-10-14 オーナー決定で、B1-5 の「loopback に bind
+//!   できた listener だけ」から要求ごとの確認に変えた。以前は `0.0.0.0` のときこの PC
+//!   からも作れなかった）。LAN 専用の listener と、後から LAN の listener を入れ替える
+//!   経路（決定 9）のルーターでは常に閉じる。
 //! - **この PC からの接続（`localDesktop` の grant、#392 B2-1、[`crate::local_grant`]）**も
-//!   同じ listener だけで開く（未初期化の間は admin、初期化後は設定 `auth.local_grant`、
+//!   同じく常時の listener への、この PC からの要求だけで開く（未初期化の間は admin、初期化後は設定 `auth.local_grant`、
 //!   既定 off）。setup は置き換えずに併存させ、どちらにも **Host の確認**（peer と Host の
 //!   両方が loopback。DNS rebinding 対策）をかける。B1-5 の既知の制限「LAN に出していない
 //!   間は同じ PC の任意のプロセスが最初の管理者を作れる」は、デスクトップの初回セット
@@ -672,10 +672,8 @@ impl StartedServer {
 
     /// 実際に LAN から届く listener が開いているか（常時の listener が loopback 以外の
     /// アドレス（`0.0.0.0`）に bind できた、または LAN の listener が開いている）。
-    /// 最初の管理者の作成は listener ごとに決まるので、この値とは一致しない（#598
-    /// 監査 F2）: 特定の LAN の IP を別に開いた 2 本の形では、これは `true` でも
-    /// loopback の listener では作成が開いている。この PC からも閉じるのは、常時の
-    /// listener を `0.0.0.0` にまとめたときだけ（モジュール doc「待ち受け」）。
+    /// 最初の管理者の作成とこの PC からの接続は、この値に関係なく常時の listener への
+    /// この PC からの要求で開く（2026-10-14 オーナー決定。モジュール doc「待ち受け」）。
     pub async fn exposes_lan(&self) -> bool {
         let loopback_exposed = self
             .engine

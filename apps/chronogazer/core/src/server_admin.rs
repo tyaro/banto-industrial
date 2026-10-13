@@ -15,7 +15,7 @@
 //! | GET | `/api/settings/server` | - | [`ServerStatusView`]（admin） |
 //! | PUT | `/api/settings/server` | `{enabled,bind,port,viewerPublic}` | [`ServerStatusView`]（admin、**この PC からの要求だけ**、`chronogazer-server` だけ） |
 //! | GET | `/api/settings/auth` | - | [`AuthConfigView`]（admin） |
-//! | PUT | `/api/settings/auth` | `{localGrant}` | [`AuthConfigView`]（admin） |
+//! | PUT | `/api/settings/auth` | `{localGrant}` | [`AuthConfigView`]（admin、**この PC からの要求だけ**） |
 //!
 //! 監査は Tauri のコマンドと同じ `settings_change`（`resource: settings`）で、
 //! `origin: rest`。権限の拒否は `RoleGuard` が `denied` を残す。
@@ -661,11 +661,31 @@ async fn auth_settings_get(
     Ok(Json(auth_view(&state).await?))
 }
 
-async fn auth_settings_put(
-    State(state): State<SettingsAdminState>,
-    headers: HeaderMap,
-    Json(payload): Json<AuthConfigPayload>,
-) -> Result<Json<AuthConfigView>, ApiError> {
+async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request) -> Response {
+    // `localGrant` は「この PC から誰に何を渡すか」なので、変更もこの PC からの要求だけ
+    // （`PUT /api/settings/server` と同じ扱い。LAN からは admin でも `403`。2026-10-14
+    // オーナー決定）。
+    if !request_is_loopback_local(&req) {
+        return forbidden_with(
+            "この PC からの接続の設定は、この PC からの接続（127.0.0.1）でだけ変更できます",
+        );
+    }
+    let headers = req.headers().clone();
+    let Json(payload) = match Json::<AuthConfigPayload>::from_request(req, &()).await {
+        Ok(payload) => payload,
+        Err(rejection) => return rejection.into_response(),
+    };
+    match auth_settings_apply(&state, &headers, payload).await {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn auth_settings_apply(
+    state: &SettingsAdminState,
+    headers: &HeaderMap,
+    payload: AuthConfigPayload,
+) -> Result<AuthConfigView, ApiError> {
     if payload.disabled.is_some() || payload.disabled_role.is_some() {
         return Err(ApiError(BantoError::BadRequest(
             "ログイン不要モードは REST からは変更できません（デスクトップの画面の設定から変更してください。サービスではこの PC からの接続（localGrant）を使います）".to_string(),
@@ -684,7 +704,7 @@ async fn auth_settings_put(
             0
         }
     };
-    let actor = actor_identity(&headers, &state.auth);
+    let actor = actor_identity(headers, &state.auth);
     state
         .audit
         .record(AuditEntry {
@@ -701,5 +721,5 @@ async fn auth_settings_put(
             result: "ok",
         })
         .await;
-    Ok(Json(auth_view(&state).await?))
+    Ok(auth_view(state).await?)
 }

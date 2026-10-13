@@ -8,11 +8,16 @@
 //!
 //! # 発行の条件（レビューはここから）
 //!
-//! 1. **listener**: `chronogazer-server` の**実際に loopback のアドレスに bind できた
-//!    常時の listener** のルーターだけ（[`LocalAccess::loopback_listener`]、B1-5 の
-//!    setup と同じ作り。`crate::engine::OpenedEngine::with_loopback_local_access`）。
-//!    LAN の listener・`0.0.0.0` にまとめた listener・デスクトップの LAN サーバー・
-//!    `banto-serve` では kind を登録したうえで条件を常に偽にする（`404` ではなく `403`、
+//! 1. **listener**: `chronogazer-server` の**常時の listener**（`127.0.0.1`、または
+//!    `0.0.0.0` にまとめた 1 本）のルーターだけ（[`LocalAccess::always_on_listener`]。
+//!    `crate::engine::OpenedEngine::with_loopback_local_access`）。**本当の境界は下の
+//!    2.・3. の要求ごとの確認**で、`0.0.0.0` の 1 本でも LAN からの要求は peer が LAN
+//!    なので閉じる（2026-10-14 オーナー決定。最初は loopback に bind できた listener
+//!    だけにしていた）。listener の条件は多層の防御として「LAN 専用の listener（LAN の
+//!    slot）では常に閉じる」だけを残す。デスクトップの LAN サーバーと `banto-serve`
+//!    も閉じたまま（デスクトップの画面は Tauri の経路で入り、LAN サーバーは LAN の
+//!    ブラウザーのためのもの。`banto-serve` は開発・E2E 用で、サービスの代わりにしない）。
+//!    閉じている listener でも kind は登録し、条件を常に偽にする（`404` ではなく `403`、
 //!    `status.grants.localDesktop` は `false`）。
 //! 2. **peer が loopback**（banto の `GrantSpec::require_loopback_peer`。peer 不明は拒否）。
 //! 3. **Host が loopback**（`127.0.0.1`・`[::1]`・`localhost`、ポートは任意。DNS rebinding
@@ -46,8 +51,9 @@
 //!
 //! # 未初期化の間と最初の管理者の作成（`POST /api/auth/setup`）
 //!
-//! - setup は B1-5 のまま、同じ listener（loopback に bind できた常時の listener）だけで
-//!   開き、**併存**させる。grant の admin は「最初のアカウントを作るまでの間、この PC から
+//! - setup は置き換えずに**併存**させ、grant と同じく常時の listener の、この PC からの
+//!   要求（peer と Host の両方が loopback）だけで開く（`0.0.0.0` にまとめた 1 本でも、
+//!   LAN からの要求は閉じる。2026-10-14 オーナー決定）。grant の admin は「最初のアカウントを作るまでの間、この PC から
 //!   設定を始められる」ためのもので、最初のアカウントは setup（必ず admin）で作る。
 //! - setup にも同じ **Host の確認**をかける（[`local_access_middleware`]。B1-5 の既知の
 //!   制限「LAN に出していない間は同じ PC の任意のプロセスが最初の管理者を作れる」のうち、
@@ -65,12 +71,13 @@
 //!
 //! 発行（banto の `grant_router` は監査しない - キオスクの再読み込みで埋もれるため）に
 //! 成功したら `login`（`resource: auth`、`detail: { via: "localGrant" }`、actor は合成の
-//! `local` と発行した role、`origin: rest`）を残す。デスクトップの自動ログインの
+//! `localDesktop` と発行した role、`origin: rest`）を残す。デスクトップの自動ログインの
 //! `detail: { via: "autologin" }` と同じ作法。admin 相当になりうる口なので、発行の数は
 //! `max_sessions`（[`LOCAL_GRANT_MAX_SESSIONS`]）で小さく抑え、発行のたびに記録する。
-//! その後の操作は普通のセッションと同じく `actor_username: "local"` で記録される
-//! （ログイン不要モードの合成のセッションも `local` だが、あちらは画面の Tauri の経路
-//! = `origin: tauri`、こちらは REST = `origin: rest` で見分けられる）。
+//! その後の操作は普通のセッションと同じく `actor_username: "localDesktop"` で記録される
+//! （identity の名前は kind と同じ。banto-hub の試運転の `commissioning` と同じ綴りの
+//! 作法。ログイン不要モードの合成のセッション `local` と監査で取り違えないよう、
+//! 2026-10-14 オーナー決定で `local` から変えた）。
 //!
 //! # 守れないもの
 //!
@@ -103,8 +110,9 @@ use crate::users::{Role, UsersService};
 /// `identity.kind`・画面の `SessionKind` で同じ文字列）。
 pub const LOCAL_DESKTOP_GRANT_KIND: &str = "localDesktop";
 
-/// grant のセッションの合成の identity の `id`（決定 8「identity は合成の `local`」）。
-pub const LOCAL_GRANT_ACTOR_ID: &str = "local";
+/// grant のセッションの合成の identity の `id`（kind と同じ。決定 8 の「合成の `local`」を、
+/// ログイン不要モードの `local` と見分けるため 2026-10-14 オーナー決定で変えた）。
+pub const LOCAL_GRANT_ACTOR_ID: &str = "localDesktop";
 
 /// 初期化後の権限の設定キー（`auth.` の名前空間 - デスクトップの汎用の
 /// `settings_set` は書けない。書くのは REST の `PUT /api/settings/auth` だけ）。
@@ -245,9 +253,11 @@ impl LocalGrantStart {
 pub struct LocalAccess {
     /// エンジンの起動時に決まった発行の形。
     pub start: LocalGrantStart,
-    /// このルーターが、実際に loopback のアドレスに bind できた常時の listener の
-    /// ものか（`chronogazer-server`）。`false` なら grant は常に閉じる。
-    pub loopback_listener: bool,
+    /// このルーターが `chronogazer-server` の常時の listener（`127.0.0.1` か、`0.0.0.0`
+    /// にまとめた 1 本）のものか。`false`（LAN 専用の listener など）なら grant は常に
+    /// 閉じる。`true` でも、開くのは要求ごとに peer と Host の両方が loopback のとき
+    /// だけ（モジュール doc）。
+    pub always_on_listener: bool,
 }
 
 impl LocalAccess {
@@ -255,13 +265,13 @@ impl LocalAccess {
     pub fn closed() -> Self {
         Self {
             start: LocalGrantStart::Unsupported,
-            loopback_listener: false,
+            always_on_listener: false,
         }
     }
 
     /// このルーターで grant が開きうるか（条件はリクエストのたびに別に読む）。
     pub fn may_issue(&self) -> bool {
-        self.loopback_listener && self.start.issued_role().is_some()
+        self.always_on_listener && self.start.issued_role().is_some()
     }
 }
 
@@ -344,7 +354,7 @@ pub async fn local_access_middleware(
     }
 
     let is_setup = is_post && path == SETUP_PATH;
-    if is_setup && state.access.loopback_listener && !local {
+    if is_setup && state.access.always_on_listener && !local {
         return forbidden_with(
             "最初の管理者の作成は、この PC の http://127.0.0.1:<port>/ からだけ行えます",
         );
@@ -531,14 +541,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_loopback_listener_with_a_role_may_issue() {
+    fn only_the_always_on_listener_with_a_role_may_issue() {
         let open = LocalAccess {
             start: LocalGrantStart::Uninitialized,
-            loopback_listener: true,
+            always_on_listener: true,
         };
         assert!(open.may_issue());
         assert!(!LocalAccess {
-            loopback_listener: false,
+            always_on_listener: false,
             ..open
         }
         .may_issue());
