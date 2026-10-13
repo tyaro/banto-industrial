@@ -35,8 +35,10 @@
 //!    [`EngineStartError::StoreConfig`]、そうでなければ既定値で続行）、
 //!    [`EngineConfig::attach_hub`] なら `attach_hub`
 //!    （**自動開始より前**。後から繋いでも走り出した収集には効かない）。
-//! 7. **LAN の listener の bind**（ポートの確保だけ。まだ要求を受けない）。
-//!    [`EngineListen::Required`] で bind できなければ、ここで Hub を止めて
+//! 7. **listener の bind**（ポートの確保だけ。まだ要求を受けない）。先に
+//!    常時の loopback の listener（[`OpenedEngine::with_loopback`]、
+//!    `chronogazer-server` だけ。#392 B1-5）を必須で、次に LAN の listener。
+//!    loopback か [`EngineListen::Required`] で bind できなければ、ここで Hub を止めて
 //!    pool を閉じてから [`EngineStartError::Listen`] を返す - **収集を始める前に
 //!    失敗する**ので、失敗して戻る経路に収集・Hub の張り直し・保持期間の掃除の
 //!    タスクが残らない（計画書の順序「resume/autostart/retention → listener」
@@ -44,7 +46,8 @@
 //! 8. `hub.resume()`・`collect.autostart()`（どちらも spawn して投げっぱなし。
 //!    失敗しても起動は止めず、理由は状態に残る）、保持期間の掃除
 //!    （[`crate::retention`]）。
-//! 9. bind 済みの listener で serve を始め、[`ServerSlot`] に置く。
+//! 9. bind 済みの listener で serve を始め、[`ServerSlot`] に置く（loopback は
+//!    入れ替えない別の slot、LAN は入れ替えられる slot）。
 //! 10. **監査の保留の定期の流し込み**。起動の失敗しうる手順がすべて済んでから
 //!     起こす（先に起こすと失敗して戻る経路にタスクが残る。banto-hub #557）。
 //!
@@ -56,25 +59,54 @@
 //!
 //! 1. **収集の取り消せない終了の印**（`CollectorService::begin_shutdown`）。
 //!    予算の外で、待たずに立てる。以降の開始（まだ止めていない REST・遅れて
-//!    動いた自動開始）は断られ、下の 5. の `stop()` が終端の操作になる。
+//!    動いた自動開始）は断られ、下の 4. の `stop()` が終端の操作になる。
 //! 2. 背景タスク: 監査の保留の定期の流し込みを abort し、保持期間の掃除に
 //!    止まる合図を送る。流し込みは途中で止めても失われない（ファイルは行が
-//!    入ってから消す）。これも予算の外（どちらも待たない）。
-//! 3. **保持期間の掃除の終わりを待つ**（2026-10-13）。掃除の途中なら、その
-//!    掃除が終わってから止まる。掃除は設定 DB を読むので pool より前で、
-//!    abort はしない（接続の確立の途中で落とすと、その接続が pool の外に残り、
-//!    7. の後で WAL を本体へ書き戻す。理由は [`crate::retention`] の
-//!    「止め方」）。予算が切れてこの待ちが落ちても、掃除のタスクは終わりが
-//!    取れるまで追い続ける: もう一度 `shutdown` を呼ぶと、まだ走っている掃除の
-//!    終わりを（その予算の中で）待ち、終わっていなければ
-//!    [`ShutdownStep::RetentionStopped`] を報告せずに時間切れを返す（PR #597 の
-//!    レビュー。以前は handle を取り出していたので、2 回目は掃除の途中でも
-//!    素通りして pool を閉じていた）。
-//! 4. **LAN の listener**（[`ServerSlot`] から取り出して `stop`）。ハンドラーは
-//!    同じ pool を使うので pool より前。
-//! 5. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
-//! 6. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
+//!    入ってから消す）。これも予算の外（どちらも待たない）。**掃除の終わりを
+//!    待つのは 6.**（下）。
+//! 3. **listener**（LAN の [`ServerSlot`] と常時の loopback の slot から取り出して
+//!    `stop`）。ハンドラーは同じ pool を使うので pool より前。**slot の lock の取得から
+//!    停止までを待つのは [`listener_stop_cap`]（予算の 4 分の 1、最大 1 秒）まで**
+//!    （#598 のオーナーレビュー P1。lock の取得を含めたのは同じ PR の Copilot の指摘で、
+//!    デスクトップの `server_apply` が適用の間ずっと lock を持つため）: banto の
+//!    `RunningServer::stop` は開いている要求の完了を最大 5 秒待つので、本文を送り
+//!    切らない要求 1 本で、コンソールを閉じたときの予算（約 3.5 秒）を使い切って
+//!    4. の最終 flush を飛ばしていた。上限を超えたら待つのをやめて 4. へ進む（停止
+//!    そのものは裏のタスクで続き、banto の 5 秒で中断される。
+//!    [`ShutdownReport::listener_stop_abandoned`]）。**順序の約束（消費者 → 書き手 →
+//!    生産者 → DB）は変わらない**: 新しい接続は停止の合図で受け付けなくなり、残った
+//!    要求が収集を始めることは 1. の取り消せない印が断る。残った要求が DB を触っても
+//!    pool はまだ開いている（7. で閉じる。閉じた後に届いた要求は DB のエラーになる
+//!    だけで、記録は失わない）。デスクトップ（5 秒）・Ctrl-C（15 秒）の経路も同じ。
+//!    待つのをやめた停止のタスクは、lock が空き次第そのとき slot にあるもの（適用が
+//!    置いた新しい listener を含む）を止めるので、終了の後に listener を残さない。
+//!    `server_apply` の側を「停止の間 lock を持たない」形に変えなかったのは、適用の間
+//!    lock を持つことが、並行する適用の直列化と、状態の表示が停止〜再起動の隙間を
+//!    見ないための約束（banto #287・#294 の形）で、崩すと途中の状態が見えるため。
+//! 4. **収集の停止**（最終 flush）。消費者（LAN）の後・Hub と DB の前。
+//! 5. **Hub の購読の停止**（`HubService::shutdown`）。Hub は Hub 経由の接続の
 //!    値の出どころ（収集にとっての生産者）なので、収集より後（#383 段階3 P3）。
+//! 6. **保持期間の掃除の終わりを待つ**（#597、2026-10-13。#598 で収集の停止の後へ
+//!    移した）。掃除の途中なら、その掃除が終わってから止まる。掃除は設定 DB を
+//!    読むので pool より前で、abort はしない（接続の確立の途中で落とすと、その
+//!    接続が pool の外に残り、7. の後で WAL を本体へ書き戻す。理由は
+//!    [`crate::retention`] の「止め方」）。#597 の約束は「終了の後に DB に触れない」
+//!    （= pool を閉じる前に掃除が終わっている）なので、待つ位置が pool を閉じる
+//!    直前でも守れる。**収集の停止より後に置くのは**、掃除の待ち（設定の読み取り・
+//!    次の確認までの待ちを含む）が最終 flush の予算を食わないようにするため
+//!    （#598 のオーナーレビュー P1 の方針。コンソールを閉じたときは約 3.5 秒しか
+//!    無い）。**掃除と収集の停止が重なっても壊れない**: 削除
+//!    （[`CollectorService::prune_data_files`]）と停止はどちらも収集の
+//!    `writer_gate` を取ってから書き手に触れるので直列になる（削除が書き手を
+//!    掴んだまま停止が close に進むことも、close の途中で書き手なしの削除が走る
+//!    ことも無い。`collect` の `Published::writer` の doc）。ただし**削除の最中に
+//!    終了が来たら、4. はその削除が終わるまで待つ**（ゲートの直列化。削除そのものは
+//!    同期のファイル削除で短い。これは待つ位置を動かしても変わらない残りの待ち）。
+//!    予算が切れてこの待ちが落ちても、掃除のタスクは終わりが取れるまで追い続ける:
+//!    もう一度 `shutdown` を呼ぶと、まだ走っている掃除の終わりを（その予算の中で）
+//!    待ち、終わっていなければ [`ShutdownStep::RetentionStopped`] を報告せず、
+//!    **pool も閉じずに**時間切れを返す（PR #597 のレビュー。以前は handle を
+//!    取り出していたので、2 回目は掃除の途中でも素通りして pool を閉じていた）。
 //! 7. **SQLite の pool を閉じる**（`-wal`/`-shm` を畳む）。
 //!
 //! 残りの危険: 監査の保留の定期の流し込み（banto の `spawn_spool_flusher`）は
@@ -88,7 +120,7 @@
 //! `EXIT_CLEANUP_BUDGET` の doc）。どこまで済んだかは
 //! [`ShutdownReport::completed`] に順に残る。
 //!
-//! 時間切れで返った後も保持期間の掃除が走っていることがある（3. の待ちを
+//! 時間切れで返った後も保持期間の掃除が走っていることがある（6. の待ちを
 //! 落としただけで、掃除そのものは止めない）。その掃除のタスクは **A1 の排他
 //! （の `Arc`）を持っている**ので、[`RunningEngine`] を drop しても掃除が
 //! 終わるまで排他は返らず、別のプロセスが同じ DB を開いている間に裏で掃除が
@@ -102,15 +134,23 @@
 //! # host ごとの差（[`EngineConfig`]）
 //!
 //! - KeyStore（デスクトップ = OS キーリング、`banto-serve` =
-//!   `UnavailableKeyStore` か `BANTO_HUB_MEMORY_KEYS=1` の `MemoryKeyStore`）と
+//!   `UnavailableKeyStore` か `BANTO_HUB_MEMORY_KEYS=1` の `MemoryKeyStore`、
+//!   `chronogazer-server` = DPAPI のファイル（`crate::server_host::open_key_store`））と
 //!   `attach_hub` の有無。
-//! - 待ち受け（[`EngineListen`]）と `allow_setup`（`POST /api/auth/setup` を
-//!   開けるのは `banto-serve` だけ）。
+//! - 待ち受け（[`EngineListen`]、`chronogazer-server` は加えて常時の loopback）と
+//!   `allow_setup`（`POST /api/auth/setup` を開けるのは `banto-serve` と、
+//!   `chronogazer-server` の**実際に loopback のアドレスに bind できた listener だけ**。
+//!   [`OpenedEngine::with_loopback_only_setup`]）。
 //! - ログの接頭辞（`banto` / `banto-serve`）と、起動時の `restore_applied` の
 //!   監査の `origin`（`tauri` / `rest`）。今までの各 host の文言・値を保つため。
 //! - 保存設定を読めないときに起動を止めるか（`store_config_required`。
 //!   デスクトップ = 止める、`banto-serve` = 既定値で続行。どちらも B1-1 より前からの
-//!   各 host の扱い）。
+//!   各 host の扱い。`chronogazer-server` はデスクトップと同じく止める）。
+//!
+//! `chronogazer-server`（#392 B1-5）の組み立ては [`crate::server_host::start`]
+//! （`open` → 設定から待ち受けの形 → `with_loopback`（`0.0.0.0` なら
+//! `with_loopback_fallback` も）・`with_listen`・`with_loopback_only_setup` → `start` →
+//! `run\endpoint.json`）。
 //!
 //! **このモジュールに入れないもの**（host 固有）: 窓・トレイ・自動ログイン・
 //! OS キーリング・Acrylic・イベントの webview への転送・単一インスタンスの
@@ -438,9 +478,18 @@ impl EngineRuntime {
     /// 起動の前半: A1 の排他 → リストア予約の適用 → `init_db`（モジュール doc の
     /// 1.〜3.）。排他を取れなければ DB には一切触れない。
     pub async fn open(cfg: EngineConfig) -> Result<OpenedEngine, EngineStartError> {
+        Self::lock(cfg)?.open().await
+    }
+
+    /// 起動の最初の段だけ: A1 の排他を取る（DB・リストア予約・監査の保留のどれにも
+    /// 触れない）。続きは [`LockedEngine::open`]。間に host の準備を挟みたいとき用
+    /// （#598 のオーナーレビュー P2: `chronogazer-server` は排他を取った後・リストア
+    /// 予約の適用と `init_db` の前にログを開き、DB を開けない理由やリストアの警告を
+    /// 日次ログに残す）。
+    pub fn lock(cfg: EngineConfig) -> Result<LockedEngine, EngineStartError> {
         let instance_lock =
             acquire_for_db(&cfg.db_path, cfg.host).map_err(EngineStartError::InstanceLock)?;
-        Self::open_locked(cfg, instance_lock, None).await
+        Ok(LockedEngine { cfg, instance_lock })
     }
 
     /// [`EngineRuntime::open`] と同じだが、起動時の対処が**先に取った** A1 の排他
@@ -504,8 +553,24 @@ impl EngineRuntime {
             pool,
             applied_restore,
             recovery_note: None,
+            loopback: None,
+            loopback_fallback: None,
+            loopback_only_setup: false,
             events: event_channel(),
         })
+    }
+}
+
+/// A1 の排他だけを取ったエンジン（[`EngineRuntime::lock`]）。drop すると排他を返す。
+pub struct LockedEngine {
+    cfg: EngineConfig,
+    instance_lock: InstanceGuard,
+}
+
+impl LockedEngine {
+    /// 起動の前半の残り: リストア予約の適用 → `init_db`（モジュール doc の 2.〜3.）。
+    pub async fn open(self) -> Result<OpenedEngine, EngineStartError> {
+        EngineRuntime::open_locked(self.cfg, self.instance_lock, None).await
     }
 }
 
@@ -519,6 +584,13 @@ pub struct OpenedEngine {
     applied_restore: Option<AppliedRestoreInfo>,
     /// 起動時の対処の窓で選ばれた対処（[`OpenedEngine::with_recovery_note`]）。
     recovery_note: Option<RecoveryNote>,
+    /// 常時の loopback の listener（[`OpenedEngine::with_loopback`]）。
+    loopback: Option<ServerConfig>,
+    /// 常時の listener を開けなかったときの代わり（[`OpenedEngine::with_loopback_fallback`]）。
+    loopback_fallback: Option<ServerConfig>,
+    /// 最初の管理者の作成を loopback に bind できた listener だけに開ける
+    /// （[`OpenedEngine::with_loopback_only_setup`]）。
+    loopback_only_setup: bool,
     events: broadcast::Sender<ServerEvent>,
 }
 
@@ -558,9 +630,51 @@ impl OpenedEngine {
         &self.events
     }
 
+    /// Hub の API キーの置き場を差し替える（#598 の Copilot の指摘、`chronogazer-server`）。
+    /// 保存先（`secrets\hub-keys\`）の作成・ACL の付与は共有のルートの下に物を作るので、
+    /// A1 の排他を取った後（`open` の後）に行い、ここで渡す。`start` が使う。
+    pub fn with_key_store(mut self, key_store: Arc<dyn KeyStore>) -> Self {
+        self.cfg.key_store = key_store;
+        self
+    }
+
     /// 待ち受けを差し替える（`start` の前に設定から決める host 用）。
     pub fn with_listen(mut self, listen: EngineListen) -> Self {
         self.cfg.listen = listen;
+        self
+    }
+
+    /// 常時の loopback の listener を足す（#392 B1-5、`chronogazer-server`。
+    /// 設計書 §3.1(b)「loopback の listener は常に開く」・決定 9）。**必須**: bind
+    /// できなければ [`EngineListen::Required`] と同じく収集を始める前に
+    /// [`EngineStartError::Listen`] で戻る。LAN の [`ServerSlot`] とは別の入れ物に
+    /// 置き、LAN の入れ替え（決定 9）の対象にしない。LAN と重なる bind（`0.0.0.0`）
+    /// を 1 本にまとめるのは呼び出し側（`chronogazer_core::server_host::ListenPlan`）。
+    pub fn with_loopback(mut self, config: ServerConfig) -> Self {
+        self.loopback = Some(config);
+        self
+    }
+
+    /// 常時の listener（[`OpenedEngine::with_loopback`]）を開けなかったときに代わりに
+    /// 開くもの（#598 のレビュー）。`chronogazer-server` は LAN の `0.0.0.0` を常時の
+    /// listener に 1 本にまとめるので、別のプロセスが `<LAN の IP>:port` を持っている
+    /// などでワイルドカードの bind が失敗しても、`127.0.0.1:port` に落として起動を
+    /// 続ける（「loopback は常に、LAN は best-effort」）。落としたときの理由は
+    /// [`RunningEngine::listen_error`] に残る。代わりも開けなければ `Err(Listen)`。
+    pub fn with_loopback_fallback(mut self, config: ServerConfig) -> Self {
+        self.loopback_fallback = Some(config);
+        self
+    }
+
+    /// 最初の管理者の作成（`POST /api/auth/setup`）を、**実際に loopback のアドレスに
+    /// bind できた listener のルーターだけ**に開ける（#392 B1-5、#598 のレビュー。
+    /// `chronogazer-server`）。計画ではなく bind の結果で決めるので、LAN の bind が
+    /// 失敗して loopback だけで動いていれば開き、`0.0.0.0` で LAN に出ていれば閉じる。
+    /// LAN の listener と、後から LAN を入れ替えるときの [`RunningEngine::router`]
+    /// （決定 9）は常に閉じる - LAN に出る listener で開けたままにしない。
+    /// [`EngineConfig::allow_setup`]（`banto-serve`）が `true` ならそちらが優先（全部で開く）。
+    pub fn with_loopback_only_setup(mut self) -> Self {
+        self.loopback_only_setup = true;
         self
     }
 
@@ -572,6 +686,9 @@ impl OpenedEngine {
             pool,
             applied_restore,
             recovery_note,
+            loopback,
+            loopback_fallback,
+            loopback_only_setup,
             events,
         } = self;
         let label = cfg.log_label;
@@ -717,8 +834,38 @@ impl OpenedEngine {
             collect.attach_hub(hub.clone());
         }
 
-        // 7. LAN の listener の bind（ポートの確保だけ）。収集を始める前に失敗を
-        // 決める（モジュール doc の 7.）。
+        // 7. listener の bind（ポートの確保だけ）。収集を始める前に失敗を決める
+        // （モジュール doc の 7.）。常時の loopback（必須）が先。
+        // 開けなければ代わり（`with_loopback_fallback`）を試し、理由を残す。
+        let mut fallback_error = None;
+        let bound_loopback = match &loopback {
+            None => None,
+            Some(config) => {
+                let first = bind_listener(config.clone()).await;
+                let result = match (first, &loopback_fallback) {
+                    (Ok(bound), _) => Ok(bound),
+                    (Err(err), Some(fallback)) => {
+                        eprintln!(
+                            "{label}: 待ち受け（{}:{}）を開けなかったため、{}:{} だけで続けます: {err}",
+                            config.bind, config.port, fallback.bind, fallback.port
+                        );
+                        fallback_error = Some(err.to_string());
+                        bind_listener(fallback.clone())
+                            .await
+                            .map_err(|source| (fallback.clone(), source))
+                    }
+                    (Err(source), None) => Err((config.clone(), source)),
+                };
+                match result {
+                    Ok(bound) => Some(bound),
+                    Err((config, source)) => {
+                        hub.shutdown().await;
+                        pool.close().await;
+                        return Err(EngineStartError::Listen { config, source });
+                    }
+                }
+            }
+        };
         let (bound, listen_error) = match &cfg.listen {
             EngineListen::Disabled => (None, None),
             EngineListen::Required(config) => match bind_listener(config.clone()).await {
@@ -781,8 +928,20 @@ impl OpenedEngine {
             host: HostInfo::new(cfg.host, instance_lock.scope()),
         };
 
-        // 9. serve を始める。
-        let server = bound.map(|bound: BoundServer| bound.serve(services.router(cfg.allow_setup)));
+        let listen_error = listen_error.or(fallback_error);
+
+        // 9. serve を始める。最初の管理者の作成は `allow_setup`（全部）か、
+        // `loopback_only_setup` なら実際に loopback のアドレスに bind できた常時の
+        // listener だけ（LAN の listener と後の入れ替えは閉じる）。
+        let lan_allow_setup = cfg.allow_setup;
+        let loopback_allow_setup = |bound: &BoundServer| {
+            cfg.allow_setup || (loopback_only_setup && bound.local_addr().ip().is_loopback())
+        };
+        let server = bound.map(|bound: BoundServer| bound.serve(services.router(lan_allow_setup)));
+        let loopback_server = bound_loopback.map(|bound: BoundServer| {
+            let allow = loopback_allow_setup(&bound);
+            bound.serve(services.router(allow))
+        });
 
         // 10. 監査の保留の定期の流し込み（失敗しうる手順がすべて済んだ後）。
         let spool_flusher = services.audit.spawn_spool_flusher();
@@ -798,7 +957,8 @@ impl OpenedEngine {
         Ok(RunningEngine {
             services,
             server: Arc::new(ServerSlot::new(server)),
-            allow_setup: cfg.allow_setup,
+            loopback: Arc::new(ServerSlot::new(loopback_server)),
+            allow_setup: lan_allow_setup,
             log_label: label,
             listen_error,
             background: std::sync::Mutex::new(BackgroundTasks {
@@ -843,14 +1003,16 @@ pub enum ShutdownStep {
     /// 監査の保留の定期の流し込みを abort し、保持期間の掃除に止まる合図を
     /// 送った（どちらも待たない）。
     BackgroundTasksStopRequested,
-    /// 保持期間の掃除が終わった（掃除の途中なら終わってから）。
-    RetentionStopped,
-    /// LAN の listener を止めた（走っていなければ何もしない）。
+    /// listener（LAN と常時の loopback）を止めた（走っていなければ何もしない。
+    /// 上限で待つのをやめたときも、待つのをやめた時点で済んだものとする）。
     ListenerStopped,
     /// 収集を止めた（最終 flush。失敗は [`ShutdownReport::collect_stop_error`]）。
     CollectStopped,
     /// Hub の購読を止めた。
     HubShutdown,
+    /// 保持期間の掃除が終わった（掃除の途中なら終わってから）。収集の停止の後
+    /// （モジュール doc の 6.）。
+    RetentionStopped,
     /// SQLite の pool を閉じた。
     PoolClosed,
 }
@@ -864,14 +1026,25 @@ pub struct ShutdownReport {
     pub collect_stop_error: Option<String>,
     /// 予算以内に終わらず、途中で切り上げた。
     pub timed_out: bool,
+    /// listener の停止を [`listener_stop_cap`] で待ちきれず、裏に残して次へ進んだ
+    /// （開いたままの要求があった）。
+    pub listener_stop_abandoned: bool,
     /// 渡された予算。
     pub budget: Duration,
+}
+
+/// 終了で listener の停止を待つ上限（モジュール doc「終了の順序」の 3.）。予算の
+/// 4 分の 1、最大 1 秒。残りを最終 flush（収集の停止）以降に回す。
+pub fn listener_stop_cap(budget: Duration) -> Duration {
+    (budget / 4).min(Duration::from_secs(1))
 }
 
 /// 動いているエンジン（[`OpenedEngine::start`]）。
 pub struct RunningEngine {
     services: EngineServices,
     server: Arc<ServerSlot>,
+    /// 常時の loopback の listener（[`OpenedEngine::with_loopback`]）。入れ替えない。
+    loopback: Arc<ServerSlot>,
     allow_setup: bool,
     log_label: &'static str,
     listen_error: Option<String>,
@@ -896,13 +1069,20 @@ impl RunningEngine {
         &self.server
     }
 
+    /// 常時の loopback の listener の実際のアドレス（[`OpenedEngine::with_loopback`]
+    /// を使っていなければ `None`）。`run\endpoint.json` の `port` に使う。
+    pub async fn loopback_addr(&self) -> Option<SocketAddr> {
+        self.loopback.local_addr().await
+    }
+
     /// LAN に出すルーター（`allow_setup` は起動時の設定のまま）。listener を
     /// 入れ替えるときに使う。
     pub fn router(&self) -> Router {
         self.services.router(self.allow_setup)
     }
 
-    /// [`EngineListen::BestEffort`] の待ち受けを開けなかったときの理由。
+    /// [`EngineListen::BestEffort`] の待ち受けを開けなかったとき、または常時の
+    /// listener を代わり（[`OpenedEngine::with_loopback_fallback`]）に落としたときの理由。
     pub fn listen_error(&self) -> Option<&str> {
         self.listen_error.as_deref()
     }
@@ -937,20 +1117,40 @@ impl RunningEngine {
         completed.push(ShutdownStep::BackgroundTasksStopRequested);
 
         let mut collect_stop_error = None;
+        let mut listener_stop_abandoned = false;
         let cleanup = async {
-            // 3. 保持期間の掃除の終わり（abort しない。設定 DB を読むので pool より前）。
-            // 前回の終了が時間切れでここを落としていても、まだ走っている掃除を
-            // 待つ（終わっていなければ `RetentionStopped` を報告しない）。
-            self.observe(ShutdownStep::RetentionStopped);
-            retention.stop().await;
-            completed.push(ShutdownStep::RetentionStopped);
-
-            // 4. 消費者（LAN）。
+            // 3. 消費者（LAN、続いて常時の loopback）。
+            // 停止は裏のタスクで並べて始め、上限までだけ待つ（モジュール doc の 3.）。
             self.observe(ShutdownStep::ListenerStopped);
-            self.server.stop().await;
+            // slot の lock の取得も上限の区間に含める（#598 の Copilot の指摘）: デスク
+            // トップの `server_apply` は適用の間ずっと slot の lock を持ち、その中で古い
+            // listener の graceful な停止（最大 5 秒）を待つので、lock を上限の外で待つと
+            // 予算を使い切って最終 flush を飛ばしうる。上限で待つのをやめたタスクは、
+            // lock が空き次第そのとき slot にあるもの（適用が置いた新しい listener を
+            // 含む）を取り出して止める - 終了の後に listener を残さない。
+            let mut stops = Vec::new();
+            for slot in [&self.server, &self.loopback] {
+                let slot = Arc::clone(slot);
+                stops.push(tokio::spawn(async move {
+                    let running = slot.inner.lock().await.take();
+                    if let Some(running) = running {
+                        running.stop().await;
+                    }
+                }));
+            }
+            let cap = listener_stop_cap(budget);
+            let waited =
+                tokio::time::timeout(cap, futures_util::future::join_all(stops.iter_mut())).await;
+            if waited.is_err() {
+                listener_stop_abandoned = true;
+                eprintln!(
+                    "{label}: 待ち受けの停止が{}ミリ秒で終わらなかった（開いたままの要求がある）ため、待たずに収集の停止へ進みます。",
+                    cap.as_millis()
+                );
+            }
             completed.push(ShutdownStep::ListenerStopped);
 
-            // 5. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
+            // 4. 書き手（収集）。走っていなければ何もしない（冪等）。失敗しても
             // 終了は止めない。
             self.observe(ShutdownStep::CollectStopped);
             if let Err(err) = services.collect.stop().await {
@@ -959,10 +1159,18 @@ impl RunningEngine {
             }
             completed.push(ShutdownStep::CollectStopped);
 
-            // 6. 生産者（Hub の購読）。
+            // 5. 生産者（Hub の購読）。
             self.observe(ShutdownStep::HubShutdown);
             services.hub.shutdown().await;
             completed.push(ShutdownStep::HubShutdown);
+
+            // 6. 保持期間の掃除の終わり（abort しない。設定 DB を読むので pool より前。
+            // 収集の停止の後に待つ - モジュール doc の 6.）。前回の終了が時間切れで
+            // ここを落としていても、まだ走っている掃除を待つ（終わっていなければ
+            // `RetentionStopped` を報告せず、pool も閉じない）。
+            self.observe(ShutdownStep::RetentionStopped);
+            retention.stop().await;
+            completed.push(ShutdownStep::RetentionStopped);
 
             // 7. みんなが書き込む先（DB）。
             self.observe(ShutdownStep::PoolClosed);
@@ -980,6 +1188,7 @@ impl RunningEngine {
             completed,
             collect_stop_error,
             timed_out,
+            listener_stop_abandoned,
             budget,
         }
     }
@@ -997,12 +1206,12 @@ impl RunningEngine {
             observations.push(ShutdownObservation {
                 before: step,
                 marked: self.services.collect.shutdown_marked(),
-                listener_open: self
-                    .server
-                    .inner
-                    .try_lock()
-                    .map(|server| server.is_some())
-                    .unwrap_or(true),
+                listener_open: [&self.server, &self.loopback].iter().any(|slot| {
+                    slot.inner
+                        .try_lock()
+                        .map(|server| server.is_some())
+                        .unwrap_or(true)
+                }),
                 collecting: self.services.collect.state().is_collecting(),
                 hub_shutting_down: self.services.hub.is_shutting_down(),
                 pool_closed: self.services.pool.is_closed(),
@@ -1233,6 +1442,228 @@ mod tests {
         assert!(!report.timed_out);
     }
 
+    /// #392 B1-5: 常時の loopback と LAN の 2 本を同時に待ち受け、`/api/host` に
+    /// どちらからも答え、終了で両方が閉じる。`loopback_addr` は loopback の方。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_and_lan_listeners_serve_together_and_both_stop() {
+        let dir = TempDir::new();
+        let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(loopback_any_port())
+            .with_listen(EngineListen::BestEffort(loopback_any_port()))
+            .start()
+            .await
+            .expect("start");
+        let loopback = engine.loopback_addr().await.expect("loopback");
+        let lan = engine.server_slot().local_addr().await.expect("lan");
+        assert_ne!(loopback, lan, "2 本の別々の listener");
+        let client = reqwest::Client::new();
+        for addr in [loopback, lan] {
+            let response = client
+                .get(format!("http://{addr}/api/host"))
+                .header("X-Banto-Client", "banto")
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), 200, "{addr}");
+        }
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out);
+        assert!(
+            std::net::TcpStream::connect(loopback).is_err(),
+            "loopback が残った"
+        );
+        assert!(std::net::TcpStream::connect(lan).is_err(), "LAN が残った");
+        assert_eq!(engine.loopback_addr().await, None);
+    }
+
+    /// #598 の Copilot の指摘: デスクトップの `server_apply` のように LAN の slot の lock を
+    /// 持ったまま止まっている者がいても、終了は上限で listener の待ちをやめて収集を止め、
+    /// `collection_stopped` が残る。lock が空いたら、そのとき slot にある listener
+    /// （適用が置いた新しいもの）も止める。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_server_slot_lock_does_not_skip_the_final_flush() {
+        let dir = TempDir::new();
+        let sim = simulation::start(Protocol::ModbusTcp).await;
+        let cfg = config(dir.path(), EngineListen::Required(loopback_any_port()));
+        let db_path = cfg.db_path.clone();
+        let opened = EngineRuntime::open(cfg).await.expect("open");
+        register_modbus(opened.pool(), sim.addr().port()).await;
+        let engine = opened.start().await.expect("start");
+        let collect = engine.services().collect.clone();
+        wait_until("自動開始で収集が走ること", || {
+            matches!(collect.state(), CollectorState::Running { .. })
+        })
+        .await;
+
+        // 適用の途中: slot の lock を持ったまま、終了の予算より長く止まる。
+        let slot = engine.server_slot().clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let applier = tokio::spawn(async move {
+            let guard = slot.lock().await;
+            let _ = locked_tx.send(());
+            let _ = release_rx.await;
+            drop(guard);
+        });
+        locked_rx.await.expect("lock を取った");
+
+        let budget = Duration::from_secs(3);
+        let report = engine.shutdown(budget).await;
+        assert!(!report.timed_out, "{report:?}");
+        assert!(report.listener_stop_abandoned);
+        assert!(report.completed.contains(&ShutdownStep::CollectStopped));
+        let lan = engine.server_slot().clone();
+
+        // lock が空けば、裏の停止のタスクが残っていた listener を止める。
+        let _ = release_tx.send(());
+        applier.await.unwrap();
+        wait_until("裏の停止で LAN の slot が空になること", || {
+            lan.inner.try_lock().map(|s| s.is_none()).unwrap_or(false)
+        })
+        .await;
+
+        drop(engine);
+        let pool = init_db(&db_path).await.expect("開き直す");
+        let reader = CollectorService::new(pool.clone(), dir.path().join("data"));
+        let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
+            Readout::Ready { data } => data.rows,
+            other => panic!("イベントが読めない: {}", other.as_str()),
+        };
+        assert_eq!(
+            rows.first().map(|row| row.kind.as_str()),
+            Some("collection_stopped")
+        );
+        pool.close().await;
+    }
+
+    /// listener の停止を待つ上限は予算の 4 分の 1、最大 1 秒（最終 flush の予算を残す）。
+    #[test]
+    fn listener_stop_cap_leaves_most_of_the_budget_to_the_final_flush() {
+        assert_eq!(
+            listener_stop_cap(Duration::from_millis(3_500)),
+            Duration::from_millis(875)
+        );
+        assert_eq!(
+            listener_stop_cap(Duration::from_secs(5)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            listener_stop_cap(Duration::from_secs(15)),
+            Duration::from_secs(1)
+        );
+    }
+
+    /// `POST /api/auth/setup` の HTTP の状態（最初の管理者の作成）。
+    async fn post_setup(addr: SocketAddr) -> u16 {
+        let body = serde_json::json!({
+            "username": "admin",
+            "password": "admin-pass-1",
+            "displayName": "管理者",
+        });
+        reqwest::Client::new()
+            .post(format!("http://{addr}/api/auth/setup"))
+            .header("X-Banto-Client", "banto")
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("send")
+            .status()
+            .as_u16()
+    }
+
+    /// bind できないアドレス（TEST-NET-3。この PC のアドレスではない）。
+    fn unbindable() -> ServerConfig {
+        ServerConfig {
+            bind: "203.0.113.1".to_string(),
+            port: 0,
+        }
+    }
+
+    /// #598 のレビュー: 常時の listener（`0.0.0.0` にまとめたもの）を開けなくても、
+    /// 代わりの `127.0.0.1` に落として起動を続け、理由を残す。落とした先は loopback
+    /// なので最初の管理者の作成が開く。代わりが無ければ `Err(Listen)`（反証の対照）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unbindable_primary_falls_back_to_loopback_and_keeps_running() {
+        let dir = TempDir::new();
+        let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(unbindable())
+            .with_loopback_fallback(loopback_any_port())
+            .with_loopback_only_setup()
+            .start()
+            .await
+            .expect("代わりの loopback で起動を続ける");
+        let addr = engine.loopback_addr().await.expect("loopback");
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert!(engine.listen_error().is_some(), "落とした理由が残らない");
+        assert_eq!(post_setup(addr).await, 200);
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+        drop(engine);
+
+        // 代わりが無ければ起動を止める。
+        let result = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(unbindable())
+            .start()
+            .await;
+        assert!(matches!(result, Err(EngineStartError::Listen { .. })));
+    }
+
+    /// #598 のレビュー: `with_loopback_only_setup` は、loopback に bind できた常時の
+    /// listener だけで最初の管理者の作成を開け、LAN の listener（と後の入れ替えの
+    /// ルーター）は閉じる - アドレスが loopback でも LAN の slot は閉じる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_opens_only_on_the_loopback_listener() {
+        let dir = TempDir::new();
+        let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(loopback_any_port())
+            .with_listen(EngineListen::BestEffort(loopback_any_port()))
+            .with_loopback_only_setup()
+            .start()
+            .await
+            .expect("start");
+        let lan = engine.server_slot().local_addr().await.expect("lan");
+        let loopback = engine.loopback_addr().await.expect("loopback");
+        assert_eq!(post_setup(lan).await, 403, "LAN の listener で開いている");
+        assert!(!engine.allow_setup, "入れ替えのルーターで開いている");
+        assert_eq!(post_setup(loopback).await, 200);
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
+
+    /// #392 B1-5: 常時の loopback は必須。ポートが塞がっていれば LAN が無くても
+    /// `Err(Listen)` で戻り、排他と pool を返す（同じ DB でもう一度起動できる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_loopback_port_is_an_error_and_releases_everything() {
+        let dir = TempDir::new();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = occupied.local_addr().expect("addr").port();
+        let result = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(ServerConfig {
+                bind: "127.0.0.1".to_string(),
+                port,
+            })
+            .start()
+            .await;
+        match result {
+            Ok(_) => panic!("塞がった loopback のポートで起動できた"),
+            Err(EngineStartError::Listen { config, .. }) => assert_eq!(config.port, port),
+            Err(other) => panic!("{other:?}"),
+        }
+        let engine = EngineRuntime::start(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("失敗した起動の後に同じ DB で起動できる");
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
+
     /// 任意の待ち受けを開けないときは起動を続け、理由を残す。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn busy_best_effort_port_keeps_the_engine() {
@@ -1292,11 +1723,16 @@ mod tests {
         for attempt in 1..=2 {
             let report = engine.shutdown(short).await;
             assert!(report.timed_out, "{attempt} 回目が時間切れにならない");
+            // 収集の停止までは進み（#598: 掃除の待ちは収集の停止の後）、掃除の
+            // 終わりと pool を閉じる手順は報告しない。
             assert_eq!(
                 report.completed,
                 vec![
                     ShutdownStep::Marked,
-                    ShutdownStep::BackgroundTasksStopRequested
+                    ShutdownStep::BackgroundTasksStopRequested,
+                    ShutdownStep::ListenerStopped,
+                    ShutdownStep::CollectStopped,
+                    ShutdownStep::HubShutdown,
                 ],
                 "{attempt} 回目: 掃除が終わっていないのに先へ進んだ"
             );
@@ -1315,6 +1751,77 @@ mod tests {
         assert_eq!(report.completed.last(), Some(&ShutdownStep::PoolClosed));
         assert!(finished.load(Ordering::SeqCst), "掃除が最後まで走った");
         assert!(engine.services().pool.is_closed());
+    }
+
+    /// #598: 保持期間の掃除が終わらないまま（途中で止まっている）でも、コンソールを
+    /// 閉じたときと同じ短い予算の終了で、収集の停止（最終 flush・`collection_stopped`）
+    /// は行われる。掃除の終わりは収集の停止の後に待つので、時間切れでも pool は
+    /// 閉じない（#597 の約束）。反証: 掃除の待ちを収集の停止の前に戻すと落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_retention_sweep_does_not_skip_the_final_flush() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new();
+        let sim = simulation::start(Protocol::ModbusTcp).await;
+        let opened = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open");
+        register_modbus(opened.pool(), sim.addr().port()).await;
+        let engine = opened.start().await.expect("start");
+        let collect = engine.services().collect.clone();
+        wait_until("自動開始で収集が走ること", || {
+            matches!(collect.state(), CollectorState::Running { .. })
+        })
+        .await;
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let stuck = {
+            let (entered, release, finished) = (entered.clone(), release.clone(), finished.clone());
+            Arc::new(RetentionTask::spawn_with(move |_stop| async move {
+                entered.notify_one();
+                release.notified().await;
+                finished.store(true, Ordering::SeqCst);
+            }))
+        };
+        let original = {
+            let mut background = engine.background.lock().unwrap();
+            std::mem::replace(&mut background.retention, stuck)
+        };
+        original.stop().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("掃除が途中に入る");
+
+        // コンソールを閉じたときのエンジンの予算（約 3.5 秒）。
+        let report = engine.shutdown(Duration::from_millis(3_500)).await;
+        assert!(
+            report.timed_out,
+            "掃除が終わっていないのに時間切れにならない"
+        );
+        assert!(
+            report.completed.contains(&ShutdownStep::CollectStopped),
+            "{report:?}"
+        );
+        assert!(!report.completed.contains(&ShutdownStep::RetentionStopped));
+        assert!(
+            !engine.services().pool.is_closed(),
+            "掃除の途中で pool を閉じた"
+        );
+        let rows: Vec<CollectEventRow> = match collect.events(EventPage::default()).await {
+            Readout::Ready { data } => data.rows,
+            other => panic!("イベントが読めない: {}", other.as_str()),
+        };
+        assert_eq!(
+            rows.first().map(|row| row.kind.as_str()),
+            Some("collection_stopped")
+        );
+
+        release.notify_one();
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out);
+        assert_eq!(report.completed.last(), Some(&ShutdownStep::PoolClosed));
+        assert!(finished.load(Ordering::SeqCst));
     }
 
     /// 終了が時間切れで返り、エンジンが drop されても、まだ走っている保持期間の
@@ -1462,10 +1969,10 @@ mod tests {
             vec![
                 ShutdownStep::Marked,
                 ShutdownStep::BackgroundTasksStopRequested,
-                ShutdownStep::RetentionStopped,
                 ShutdownStep::ListenerStopped,
                 ShutdownStep::CollectStopped,
                 ShutdownStep::HubShutdown,
+                ShutdownStep::RetentionStopped,
                 ShutdownStep::PoolClosed,
             ]
         );
@@ -1494,13 +2001,6 @@ mod tests {
                 collecting: true,
                 ..obs(ShutdownStep::BackgroundTasksStopRequested)
             },
-            // 保持期間の掃除を待つ前。まだ何も止めていない（印だけ）。
-            ShutdownObservation {
-                marked: true,
-                listener_open: true,
-                collecting: true,
-                ..obs(ShutdownStep::RetentionStopped)
-            },
             ShutdownObservation {
                 marked: true,
                 listener_open: true,
@@ -1518,7 +2018,13 @@ mod tests {
                 marked: true,
                 ..obs(ShutdownStep::HubShutdown)
             },
-            // Hub が止まり、pool はまだ開いている。
+            // Hub が止まり、保持期間の掃除の終わりを待つ前（収集は止まっている）。
+            ShutdownObservation {
+                marked: true,
+                hub_shutting_down: true,
+                ..obs(ShutdownStep::RetentionStopped)
+            },
+            // 掃除が終わり、pool はまだ開いている。
             ShutdownObservation {
                 marked: true,
                 hub_shutting_down: true,

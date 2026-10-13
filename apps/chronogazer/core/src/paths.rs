@@ -1,9 +1,9 @@
 //! データの置き場所（ルート）の解決と、その下の配置（#392 段階 B の B1-4、
 //! `docs/chronogazer-service-design.md` §3.1(b)・決定 7）。
 //!
-//! **この PR ではどの host もまだこのルートを使わない**（デスクトップは今の
-//! `%APPDATA%\dev.tyaro.chronogazer\` のまま）。B1-5 の `chronogazer-server` と
-//! B2-4 のシェル（デスクトップ host を ProgramData へ寄せる）が使う。
+//! 使うのは B1-5 の `chronogazer-server`（`crate::server_host`）。デスクトップは
+//! まだ今の `%APPDATA%\dev.tyaro.chronogazer\` のままで、B2-4 のシェルが
+//! デスクトップ host をこのルートへ寄せる。
 //!
 //! # ルートの解決（[`resolve_data_root`]）
 //!
@@ -17,9 +17,10 @@
 //!
 //! 環境の読み取りは [`resolve_data_root_from_env`] だけが行い、判断は純関数
 //! [`resolve_data_root_impl`]（`is_windows` を引数で受ける）にあるので、全分岐を
-//! どの OS でもテストできる。`CHRONOGAZER_ROOT` が相対パスでもそのまま使う
-//! （相対の基準はプロセスの作業ディレクトリで、サービスでは `System32` になる。
-//! 本番では絶対パスを指定すること。banto-hub の `BANTO_HUB_ROOT` と同じ扱い）。
+//! どの OS でもテストできる。ここでは `CHRONOGAZER_ROOT` が相対パスでもそのまま返す
+//! （banto-hub の `BANTO_HUB_ROOT` と同じ）が、`chronogazer-server` は相対パスを
+//! 拒否して起動しない（#392 B1-5、`crate::server_host::validate_root`。相対の基準は
+//! プロセスの作業ディレクトリで、サービスでは `System32` になるため）。
 //!
 //! # 配置（[`DataLayout`]）
 //!

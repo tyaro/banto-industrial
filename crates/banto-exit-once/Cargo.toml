@@ -1,0 +1,11 @@
+[package]
+name = "banto-exit-once"
+description = "Run the exit cleanup exactly once per process and make later callers wait for it within their own budget (#586; split out of banto-desktop-tray in #392 B1-5 so headless hosts can use it without Tauri)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `std` だけ。依存を持たない（Tauri にも tokio にも依存しない）ので、デスクトップの
+# シェル（`banto-desktop-tray` が再公開）と画面の無い `chronogazer-server` の両方が使える。
+[dependencies]

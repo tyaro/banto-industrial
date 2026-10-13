@@ -43,6 +43,13 @@ banto-hub-bootstrap = { path = "../../../crates/banto-hub-bootstrap" }
 # （`crate::instance_lock`）。banto-hub の profile_lock と共有の仕組み。
 banto-instance-lock = { path = "../../../crates/banto-instance-lock" }
 banto-tagclient = { path = "../../../crates/banto-tagclient" }
+# #392 B1-5: `chronogazer-server` の Hub の API キーの保存先（DPAPI machine の
+# ファイル、`server_host::open_key_store`）。非 Windows では `UnsupportedPlatform`
+# で fail closed する（コンパイルは通る）。
+banto-secret-store = { path = "../../../crates/banto-secret-store" }
+# #392 B1-5: `chronogazer-server` の終了（Ctrl-C と CTRL_CLOSE_EVENT）を 1 回に
+# する（デスクトップと同じ `ExitCleanupOnce`。std だけの crate）。
+banto-exit-once = { path = "../../../crates/banto-exit-once" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -66,6 +73,21 @@ futures-util = { workspace = true }
 # 生成に使っているのと同じワークスペース依存を使う（Cargo.lock に新しい
 # ノードを増やさない）。
 getrandom = { workspace = true }
+
+# #392 B1-5: `chronogazer-server`（bin）のコンソールの扱い - Ctrl の受け取り
+# （`SetConsoleCtrlHandler`）と、標準出力・標準エラー出力のログファイルへの
+# 向け直し（`CreatePipe`・`SetStdHandle`・`ReadFile`・`WriteConsoleW`）。既存の
+# 0.61 系（banto-secret-store・banto-instance-lock と同じ版）で、feature を足す
+# だけ（Cargo.lock にノードは増えない）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }
 
 [dev-dependencies]
 # `test-util` (#394 レビュー P1-1): `HUB_OPERATION_TIMEOUT` のテストを
@@ -105,6 +127,11 @@ windows-sys = { version = "0.61", features = [
 [[bin]]
 name = "banto-serve"
 path = "src/bin/banto-serve.rs"
+
+# #392 B1-5: 画面の無い本番用の host（コンソール。B3 で同じ exe にサービスを足す）。
+[[bin]]
+name = "chronogazer-server"
+path = "src/bin/chronogazer-server.rs"
 
 # R1-C C-4: 開発用 PLC（`examples/dev_plc.rs`。E2E の `webServer` と
 # `pnpm dev:plc` が起動する）。`test = true` は、この example の引数解釈の

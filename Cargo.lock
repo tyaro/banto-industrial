@@ -499,11 +499,16 @@ dependencies = [
 name = "banto-desktop-tray"
 version = "0.1.0"
 dependencies = [
+ "banto-exit-once",
  "tauri",
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tempfile",
 ]
+
+[[package]]
+name = "banto-exit-once"
+version = "0.1.0"
 
 [[package]]
 name = "banto-expr"
@@ -1078,9 +1083,11 @@ dependencies = [
  "banto-admin-services",
  "banto-collect",
  "banto-core",
+ "banto-exit-once",
  "banto-hub-bootstrap",
  "banto-instance-lock",
  "banto-plc",
+ "banto-secret-store",
  "banto-server",
  "banto-storage",
  "banto-tagclient",
