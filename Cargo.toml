@@ -47,6 +47,7 @@ members = [
     "crates/banto-hub-bootstrap",
     "crates/banto-instance-lock",
     "crates/banto-desktop-tray",
+    "crates/banto-exit-once",
     "crates/banto-secret-store",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",

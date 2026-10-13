@@ -33,7 +33,10 @@
 //! - [`ExitCleanupOnce`] — 終了の後始末（トレイの「終了」と `RunEvent::Exit`
 //!   = OS のサインアウト・シャットダウン）を**プロセスで 1 回だけ**走らせ、
 //!   2 つ目以降には**先行の完了を期限まで待たせる**入れ物（#586。中身は
-//!   `exit_once` module の doc）。後始末の中身はアプリが渡す。
+//!   `banto-exit-once` crate の doc）。後始末の中身はアプリが渡す。#392 B1-5
+//!   （2026-10-13）で Tauri に依存しない `crates/banto-exit-once` へ移し、ここは
+//!   再公開だけにした（画面の無い `chronogazer-server` のコンソールの終了も
+//!   同じ仕組みで 1 回化するため。`chronogazer-core` は Tauri に依存できない）。
 //!
 //! 持たないもの（アプリごとに中身が違う）:
 //!
@@ -92,9 +95,7 @@
 //! 切り離すと何も残らない。判断の部分（[`QuitGate`]・[`claim_once_flag`]）
 //! だけは Tauri を起動せずにテストできる形に出してある。
 
-mod exit_once;
-
-pub use exit_once::{ExitCleanupOnce, ExitCleanupOutcome, ExitCleanupReport};
+pub use banto_exit_once::{ExitCleanupOnce, ExitCleanupOutcome, ExitCleanupReport};
 
 use std::path::Path;
 use std::sync::Mutex;

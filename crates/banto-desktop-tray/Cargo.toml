@@ -7,6 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# 終了の後始末の 1 回化（`ExitCleanupOnce`）。#392 B1-5 で Tauri に依存しない
+# crate へ移したものを再公開する（`std` だけの path 依存）。
+banto-exit-once = { path = "../banto-exit-once" }
 # トレイ自体（メニュー項目・状態の文言）はアプリごとに中身が違うので、この
 # crate は組み立てない。扱うのは窓・ダイアログ・通知と、トレイの左クリックの
 # 判定（`TrayIconEvent`、[`restore_window_on_left_click`]）だけ。
