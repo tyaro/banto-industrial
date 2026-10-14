@@ -674,12 +674,15 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
             "LAN の公開設定は、この PC からの接続（127.0.0.1）でだけ変更できます",
         );
     }
-    let headers = req.headers().clone();
+    // 操作者は本文を待つ**前に**、要求のヘッダーから確定する（#600 の Copilot レビュー）:
+    // 本文が届くのを待つ間に、別の `PUT /api/settings/auth` が `localDesktop` の grant を
+    // 失効させると、後から引いた操作者は空になるのに、認可済みの変更は適用されて操作者
+    // なしで監査に残る。
+    let actor = actor_identity(req.headers(), &state.auth);
     let Json(payload) = match Json::<ServerSettingsPayload>::from_request(req, &()).await {
         Ok(payload) => payload,
         Err(rejection) => return rejection.into_response(),
     };
-    let actor = actor_identity(&headers, &state.auth);
     let config = ServerSettings {
         enabled: payload.enabled,
         bind: payload.bind,
@@ -750,7 +753,12 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
             "この PC からの接続の設定は、この PC からの接続（127.0.0.1）でだけ変更できます",
         );
     }
-    let headers = req.headers().clone();
+    // 操作者は本文を待つ前と、保存・失効の前に確定する（#600 のレビューと Copilot
+    // レビュー）: `localDesktop` の admin のトークンで値を変えると、下の失効がこの要求
+    // 自身のトークンも消し、後から引くと操作者が空のまま特権の変更が監査に残る
+    // （banto-hub の lock-down と同じ扱い）。本文を待つ間に別の要求が失効させた場合も
+    // 同じ（`server_settings_put` と同じ扱い）。
+    let actor = actor_identity(req.headers(), &state.auth);
     let Json(body) =
         match Json::<serde_json::Map<String, serde_json::Value>>::from_request(req, &()).await {
             Ok(body) => body,
@@ -779,10 +787,6 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
         Ok(value) => value,
         Err(err) => return ApiError(err).into_response(),
     };
-    // 操作者は保存・失効の**前に**確定する（#600 のレビュー）: `localDesktop` の admin の
-    // トークンで値を変えると、下の失効がこの要求自身のトークンも消し、後から引くと
-    // 操作者が空のまま特権の変更が監査に残る（banto-hub の lock-down と同じ扱い）。
-    let actor = actor_identity(&headers, &state.auth);
     // 保存・失効・監査は応答の future から切り離す（#600 の監査 F4。保存と失効の間に
     // await は無いが、その後の監査の行が接続の切断で落ちうる）。
     let label = state.log_label;

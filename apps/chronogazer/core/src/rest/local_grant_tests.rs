@@ -1079,3 +1079,75 @@ async fn deeply_nested_bodies_cannot_bypass_the_reserved_name_check() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
     assert_eq!(f.users.list_users().await.unwrap().len(), 1);
 }
+
+/// #600 の Copilot レビュー: 設定の `PUT` は操作者を本文を待つ前に確定する。本文が届くのを
+/// 待つ間に `localDesktop` の grant が失効しても（別の `PUT /api/settings/auth` と同じ
+/// 効果を、本文の最初の poll の後に直接の失効で作る）、認可済みの変更は操作者つきで
+/// 監査に残る。
+///
+/// 反証: `auth_settings_put` の `actor_identity` を本文を読んだ後に戻すと、監査の
+/// 操作者が空になってこのテストが落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settings_actor_is_fixed_before_the_body_arrives() {
+    let admin = LocalGrantSetting::Role(Role::Admin);
+    let f = fixture_with(
+        LocalGrantStart::Initialized(admin),
+        true,
+        &[Role::Admin],
+        Some(admin),
+    )
+    .await;
+    let (_, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let token = token.expect("token");
+
+    // 最初に poll されたら知らせ、`release` が来るまで本文を出さない。
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let state = Some((polled_tx, release_rx));
+    let stream = futures_util::stream::unfold(state, |state| async move {
+        let (polled_tx, release_rx) = state?;
+        let _ = polled_tx.send(());
+        let _ = release_rx.await;
+        Some((
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(
+                json!({ "localGrant": "viewer" }).to_string(),
+            )),
+            None,
+        ))
+    });
+    let mut request = Request::builder()
+        .method("PUT")
+        .uri("/api/settings/auth")
+        .header("X-Banto-Client", "banto")
+        .header("Host", LOCAL_HOST)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from_stream(stream))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(LOCAL));
+    let router = f.router.clone();
+    let pending = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+
+    polled_rx.await.expect("本文が読まれなかった");
+    assert_eq!(
+        f.auth
+            .revoke_grant_tokens(&crate::local_grant::local_desktop_grant_kind()),
+        1
+    );
+    release_tx.send(()).unwrap();
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let changes = f
+        .audit
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| row.action == "settings_change")
+        .collect::<Vec<_>>();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].actor_username.as_deref(), Some("localDesktop"));
+    assert_eq!(changes[0].actor_role.as_deref(), Some("admin"));
+}
