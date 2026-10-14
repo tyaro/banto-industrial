@@ -72,6 +72,12 @@ use crate::{AppState, ExitCleanupReport, ExitTrigger, LEGACY_DB_WINDOW_LABEL, MA
 /// × で隠した初回だけ出す通知（既読の印はアプリのデータディレクトリの
 /// `tray-hint-shown`。banto-hub と同じ名前だが、データディレクトリが
 /// アプリごとに別なので混ざらない）。
+///
+/// #392 B2-4b でエンジンのデータはデータのルート（`%ProgramData%\ChronoGazer`）へ
+/// 移ったが、この印は利用者ごとの画面の状態なので、共有 crate
+/// （`banto_desktop_tray::notify_first_hide_once`）が置く `app_data_dir()`
+/// （`%APPDATA%\dev.tyaro.chronogazer`）のまま。旧 DB が無ければ、フォルダが
+/// あっても旧データの案内（`crate::legacy_notice`）は出ない。
 pub(crate) const TRAY_HINT: TrayHint = TrayHint {
     flag_file_name: "tray-hint-shown",
     title: "ChronoGazer",

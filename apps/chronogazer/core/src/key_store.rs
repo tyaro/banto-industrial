@@ -1,9 +1,10 @@
 //! Hub の API キーの保存先（#392 段階 B、決定 4・H10）。
 //!
 //! B1-5 で `crate::server_host` に置いた [`open_key_store`] と [`FailedKeyStore`] を、
-//! B2-4a で（挙動を変えずに）ここへ移した。`chronogazer-server` に加え、B2-4b で
+//! B2-4a で（挙動を変えずに）ここへ移した。`chronogazer-server` に加え、B2-4b から
 //! デスクトップ host も同じ保存先（`<root>\secrets\hub-keys\`、
-//! `banto_secret_store::FileSecretStore<DpapiMachine>`）を使うため。
+//! `banto_secret_store::FileSecretStore<DpapiMachine>`）を使う（`src-tauri` の
+//! `desktop_key_store`。#332 から B2-4a までの OS キーリングのキーは移さない）。
 //! `crate::server_host` は再公開するので、既存の `server_host::open_key_store`・
 //! `server_host::FailedKeyStore` の参照はそのまま動く。
 

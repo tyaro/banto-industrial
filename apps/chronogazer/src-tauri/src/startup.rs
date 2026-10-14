@@ -33,6 +33,27 @@
 //! メインの窓・トレイができた後に対処の窓を閉じる。失敗したら同じ窓に新しい
 //! 理由と選択肢を出す（対処そのものの失敗 = フォルダに書けない・バックアップが
 //! 壊れている・名前を変えられない、も同じ窓に理由を出して選び直せる）。
+//!
+//! # データの置き場所（[`LaunchPaths`]、#392 B2-4b）
+//!
+//! デスクトップ host も `chronogazer-server` と同じデータのルート
+//! （`chronogazer_core::paths::DataLayout`。既定 `%ProgramData%\ChronoGazer`、
+//! `CHRONOGAZER_ROOT` で上書き）を使う（設計書 §3.2「デスクトップ host も ProgramData
+//! を使う」- サービスとデスクトップで DB が分かれると、同じ PLC を二重にポーリングし
+//! 履歴も割れる）。DB は `<root>\chronogazer.sqlite3`、`data.dir` の相対パスの基準は
+//! ルート（既定の時系列データは `<root>\data`）、バックアップ・監査の保留は DB の隣の
+//! 規約のまま `<root>\backups\…`・`<root>\audit-spool\…` になる。ルートの検証
+//! （`validate_root`）と作成（O6 の保護された DACL）は `chronogazer-server` と同じ
+//! 関数を通す。ルートを使えない・作れないときは「終了」だけの窓
+//! （[`show_fatal`]）。同じルートを `chronogazer-server`（コンソール・サービス）が
+//! 使っていれば A1 の排他で止まり、今までの「既に起動しています」の窓が、使っている
+//! 側（サービス・コンソール版）を名指しして出る（`StartupErrorNotice::already_running`）。
+//!
+//! 旧データ（`%APPDATA%\dev.tyaro.chronogazer\`）は**読まない・移さない・消さない**
+//! （H9）。案内は [`crate::legacy_notice`]。デスクトップ host はログファイル
+//! （`<root>\logs`）も `run\endpoint.json` も書かない（どちらも `chronogazer-server`
+//! のもの。endpoint はシェルの probe がサービスを探すためのもので、デスクトップが
+//! 書くと別の host を指す）。
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -41,6 +62,8 @@ use banto_core::BantoError;
 use chronogazer_core::backup::BackupInfo;
 use chronogazer_core::db::InitDbError;
 use chronogazer_core::engine::EngineStartError;
+use chronogazer_core::paths::{create_root_dir, resolve_data_root, DataLayout, ROOT_ENV};
+use chronogazer_core::server_host::validate_root;
 use chronogazer_core::startup_recovery::{
     self as recovery, FailureKind, RecoveryChoice, RecoveryError, RecoveryNote, StoreDirChoice,
     WindowPlan,
@@ -58,33 +81,59 @@ const RECOVERY_PAGE: &str = "startup-recovery.html";
 /// 窓が対処を知らせるときに移ろうとするパスの頭（[`navigation_decision`]）。
 const ACTION_PATH_PREFIX: &str = "/__recovery/";
 
-/// デスクトップのデータの置き場所。
+/// デスクトップのデータの置き場所（モジュール doc「データの置き場所」）。
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchPaths {
-    /// アプリのデータディレクトリ（`data.dir` の相対パスの基準）。
+    /// データのルートの配置（`chronogazer-server` と同じ）。
+    pub(crate) layout: DataLayout,
+    /// データのルート（`data.dir` の相対パスの基準。`layout.root()` と同じ）。
     pub(crate) data_dir: PathBuf,
-    /// 設定 DB。
+    /// 設定 DB（`layout.db_path()`）。
     pub(crate) db_path: PathBuf,
 }
 
 impl LaunchPaths {
-    /// アプリのデータディレクトリを決めて作る。
-    pub(crate) fn resolve(app: &AppHandle) -> Result<Self, String> {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|err| format!("アプリのデータの置き場所を決められませんでした: {err}"))?;
-        std::fs::create_dir_all(&data_dir).map_err(|err| {
+    /// 配置から組み立てる（ファイルシステムには触れない）。
+    pub(crate) fn from_layout(layout: DataLayout) -> Self {
+        Self {
+            data_dir: layout.root().to_path_buf(),
+            db_path: layout.db_path(),
+            layout,
+        }
+    }
+
+    /// 環境（`CHRONOGAZER_ROOT`、無ければ `%ProgramData%\ChronoGazer`）からルートを
+    /// 決め、確かめて、無ければ作る（[`Self::prepare`]）。
+    pub(crate) fn resolve() -> Result<Self, String> {
+        Self::prepare(layout_from_vars(|name| std::env::var(name).ok()))
+    }
+
+    /// ルートを確かめ（絶対パスで、`.`・`..` を含まない。`chronogazer-server` と同じ
+    /// `validate_root`）、無ければ保護された DACL で作る（O6、
+    /// `chronogazer_core::paths::create_root_dir`。既にあるルートには触らない）。
+    /// どちらの失敗も「終了」だけの窓に出す文言で返す（ルートの下には何も作らない）。
+    pub(crate) fn prepare(layout: DataLayout) -> Result<Self, String> {
+        validate_root(layout.root())
+            .map_err(|err| format!("データの置き場所を使えません: {err}"))?;
+        create_root_dir(&layout).map_err(|err| {
             format!(
-                "アプリのデータの置き場所（{}）を作れませんでした: {err}",
-                data_dir.display()
+                "データの置き場所（{}）を作れませんでした: {err}",
+                layout.root().display()
             )
         })?;
-        Ok(Self {
-            db_path: data_dir.join("chronogazer.sqlite3"),
-            data_dir,
-        })
+        Ok(Self::from_layout(layout))
     }
+}
+
+/// 環境変数の読み方を受けてルートの配置を決める（純関数。テストは読み方を差し替える）。
+/// 優先順位は `chronogazer_core::paths::resolve_data_root` のとおり。
+fn layout_from_vars(var: impl Fn(&str) -> Option<String>) -> DataLayout {
+    DataLayout::new(resolve_data_root(
+        var(ROOT_ENV).as_deref(),
+        var("ProgramData").as_deref(),
+        var("XDG_DATA_HOME").as_deref(),
+        var("HOME").as_deref(),
+    ))
 }
 
 /// 起動の前にすること（対処の窓で選ばれたもの）。
@@ -454,10 +503,7 @@ pub(crate) fn show_fatal(app: &AppHandle, detail: String) {
         notice: None,
     };
     *app.state::<RecoveryGate>().lock() = Some(RecoverySession {
-        paths: LaunchPaths {
-            data_dir: PathBuf::new(),
-            db_path: PathBuf::new(),
-        },
+        paths: LaunchPaths::from_layout(DataLayout::new(PathBuf::new())),
         kind: FailureKind::Other,
         choices: vec![RecoveryChoice::Quit],
         detail,
@@ -738,12 +784,7 @@ mod tests {
     use super::*;
 
     fn paths() -> LaunchPaths {
-        LaunchPaths {
-            data_dir: PathBuf::from(r"C:\Users\a\AppData\Roaming\dev.tyaro.chronogazer"),
-            db_path: PathBuf::from(
-                r"C:\Users\a\AppData\Roaming\dev.tyaro.chronogazer\chronogazer.sqlite3",
-            ),
-        }
+        LaunchPaths::from_layout(DataLayout::new(r"C:\ProgramData\ChronoGazer"))
     }
 
     /// 窓の選択肢は core の判断どおりで、確認の文があるのは確認をはさむ対処
@@ -890,5 +931,104 @@ mod tests {
         assert!(page.contains("{file}"));
         assert!(page.contains("textContent"));
         assert!(!page.contains("innerHTML"), "文言は HTML として入れない");
+    }
+
+    // --- データの置き場所（#392 B2-4b） -----------------------------------------
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    /// `CHRONOGAZER_ROOT` があればそれがルートで、DB・`data.dir` の基準・バックアップは
+    /// その下（`chronogazer-server` と同じ配置）。`%APPDATA%` は見ない。
+    #[test]
+    fn env_root_wins_and_everything_lives_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cg-root");
+        let layout = layout_from_vars(vars(&[
+            ("CHRONOGAZER_ROOT", root.to_str().unwrap()),
+            ("ProgramData", r"C:\ProgramData"),
+            ("APPDATA", r"C:\Users\a\AppData\Roaming"),
+        ]));
+        assert_eq!(layout.root(), root);
+        let paths = LaunchPaths::prepare(layout).expect("prepare");
+        assert!(root.is_dir(), "ルートを作る");
+        assert_eq!(paths.data_dir, root);
+        assert_eq!(paths.db_path, root.join("chronogazer.sqlite3"));
+        assert_eq!(paths.layout.db_path(), paths.db_path);
+        // ルートの下には何も作らない（DB は A1 の排他を取った後のエンジンが作る）。
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    /// 未設定・空の `CHRONOGAZER_ROOT` は既定（Windows は `%ProgramData%\ChronoGazer`、
+    /// それ以外は `$XDG_DATA_HOME/ChronoGazer`）。
+    #[test]
+    fn default_root_is_program_data_chronogazer() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        for env_root in [None, Some("")] {
+            let mut pairs = vec![("ProgramData", base), ("XDG_DATA_HOME", base)];
+            if let Some(value) = env_root {
+                pairs.push(("CHRONOGAZER_ROOT", value));
+            }
+            let layout = layout_from_vars(vars(&pairs));
+            assert_eq!(layout.root(), dir.path().join("ChronoGazer"));
+        }
+        let paths = LaunchPaths::prepare(layout_from_vars(vars(&[
+            ("ProgramData", base),
+            ("XDG_DATA_HOME", base),
+        ])))
+        .expect("prepare");
+        assert!(dir.path().join("ChronoGazer").is_dir());
+        assert_eq!(
+            paths.db_path,
+            dir.path().join("ChronoGazer").join("chronogazer.sqlite3")
+        );
+    }
+
+    /// 使えないルート（相対・`.`・`..` を含む・ファイル）は理由を返し、何も作らない。
+    #[test]
+    fn invalid_roots_are_refused_without_creating_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("ChronoGazer");
+        for root in [
+            PathBuf::from("relative-root"),
+            real.join("child").join(".."),
+            real.join("."),
+        ] {
+            let err = LaunchPaths::prepare(DataLayout::new(&root)).unwrap_err();
+            assert!(err.contains("データの置き場所を使えません"), "{err}");
+            assert!(err.contains("CHRONOGAZER_ROOT"), "{err}");
+            assert!(!real.exists(), "{root:?}");
+        }
+        assert!(!PathBuf::from("relative-root").exists());
+
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = LaunchPaths::prepare(DataLayout::new(&file)).unwrap_err();
+        assert!(err.contains("作れませんでした"), "{err}");
+    }
+
+    /// O6: 作ったルートは保護された DACL（Users なし）。DACL の中身そのものは
+    /// `chronogazer_core::paths` のテストが確かめる。ここでは同じ関数を通ったことを
+    /// 「継承しない」で確かめる。
+    #[cfg(windows)]
+    #[test]
+    fn created_root_is_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ChronoGazer");
+        LaunchPaths::prepare(DataLayout::new(&root)).expect("prepare");
+        let dacl = banto_secret_store::acl::read_dir_dacl(&root).unwrap();
+        assert!(dacl.protected, "{dacl:?}");
+        assert!(dacl
+            .aces
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|ace| ace.sid != "S-1-5-32-545"));
     }
 }
