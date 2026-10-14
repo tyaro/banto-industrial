@@ -23,6 +23,9 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { STARTUP_AUTO_RETRIES, STARTUP_RETRY_DELAY_MS } from './startup';
 
 const core = vi.hoisted(() => ({ initBanto: vi.fn(), connectEvents: vi.fn() }));
+// #392 B2-2: サービスへ navigate した Tauri の窓で invoke を呼ばないことを見る。
+const tauriCore = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock('@tauri-apps/api/core', () => ({ invoke: tauriCore.invoke }));
 vi.mock('@banto/admin-core', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@banto/admin-core')>()),
 	initBanto: core.initBanto,
@@ -197,5 +200,44 @@ describe('bantoReady: demo になる経路', { timeout: 30_000 }, () => {
 		await setup.bantoReady;
 
 		expect(setup.getBantoMode()).toBe('server');
+	});
+});
+
+describe('bantoReady: Tauri の内部オブジェクトがある窓（#392 B2-2）', { timeout: 30_000 }, () => {
+	it('origin がサービス（http://127.0.0.1:<port>）なら probe して server（invoke しない）', async () => {
+		vi.stubGlobal('location', { origin: 'http://127.0.0.1:8721' });
+		vi.stubGlobal('window', {
+			__TAURI_INTERNALS__: {},
+			location: { origin: 'http://127.0.0.1:8721' }
+		});
+		const fetchMock = vi.fn(async () => json(401, { kind: 'unauthorized' }));
+		vi.stubGlobal('fetch', fetchMock);
+
+		const { setup } = await loadSetup();
+		await setup.bantoReady;
+
+		expect(setup.isTauri()).toBe(false);
+		expect(setup.getBantoMode()).toBe('server');
+		expect(fetchMock).toHaveBeenCalledWith(
+			'http://127.0.0.1:8721/api/auth/check',
+			expect.anything()
+		);
+		expect(core.connectEvents).toHaveBeenCalledTimes(1);
+		expect(tauriCore.invoke).not.toHaveBeenCalled();
+	});
+
+	it('origin が Tauri 自身（http://tauri.localhost）なら probe せずに tauri', async () => {
+		vi.stubGlobal('window', {
+			__TAURI_INTERNALS__: {},
+			location: { origin: 'http://tauri.localhost' }
+		});
+		const fetchMock = vi.fn(async () => json(200, false));
+		vi.stubGlobal('fetch', fetchMock);
+
+		const { setup } = await loadSetup();
+		await setup.bantoReady;
+
+		expect(setup.getBantoMode()).toBe('tauri');
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
