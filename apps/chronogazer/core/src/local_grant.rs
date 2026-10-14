@@ -109,6 +109,17 @@
 //!   `settings_change` を `result: "failed"` で残す。`admin` の保存の失敗では grant は
 //!   閉じたまま（fail closed）で、画面はログイン画面へ戻る。`off` の保存の失敗では
 //!   先に保存された値で開いたままになりうるので、エラーとしてログに明記する。
+//! - **保存と 2 回目の失効は同じ lock の下**（#392 B2-2 のレビュー）: 最初の失効から選択の
+//!   保存までの間に、先に保存されていた値で開いた条件のまま新しいトークンが発行されうる
+//!   （grant のセッションは条件を読み直さない）。[`save_setup_choice`] は lock を握ったまま
+//!   保存し（既に `off` なら書かない）、同期でもう一度失効させてから lock を外す（消えた数は
+//!   最初の失効と同じ形の `revoke_grants` に残す）。最初の失効はそのまま残す（保存が
+//!   失敗しても未初期化の間のトークンは必ず消える）。
+//! - **設定の REST は lock の下で認可を確かめ直す**: `PUT /api/settings/auth`・
+//!   `PUT /api/settings/server` は認可を lock の手前で済ませるので、lock を待つ間に失効した
+//!   トークン（setup の後の失効など）で、setup が保存した `off` を書き戻せた。lock を取った
+//!   後に要求のトークンをもう一度 `authenticate` し、無効なら何もせず `401`
+//!   （`crate::server_admin::recheck_token`。監査は認証の層の `401` と同じく残さない）。
 //!
 //! # 後処理は応答から切り離す（#600 の監査 F1・F2・F4）
 //!
@@ -880,23 +891,7 @@ pub(crate) async fn finish_setup(
         may_have_initialized,
     );
     if revoked > 0 {
-        state
-            .audit
-            .record(AuditEntry {
-                actor_username: None,
-                actor_role: None,
-                action: "revoke_grants",
-                resource: "auth",
-                entity_id: None,
-                detail: Some(serde_json::json!({
-                    "kind": LOCAL_DESKTOP_GRANT_KIND,
-                    "reason": "initialized",
-                    "revokedGrants": revoked,
-                })),
-                origin: "rest",
-                result: "ok",
-            })
-            .await;
+        record_setup_revocation(state, revoked).await;
     }
     if let Some((value, token)) = choice {
         save_setup_choice(state, value, token.as_deref()).await;
@@ -914,6 +909,28 @@ pub(crate) async fn finish_setup(
                 .into_response()
         }
     }
+}
+
+/// setup の後の失効の監査（`revoke_grants`、`reason: initialized`）。最初の失効と、
+/// 選択の保存の後の 2 回目の失効（[`save_setup_choice`]）で同じ形。
+async fn record_setup_revocation(state: &LocalAccessState, revoked: usize) {
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: None,
+            actor_role: None,
+            action: "revoke_grants",
+            resource: "auth",
+            entity_id: None,
+            detail: Some(serde_json::json!({
+                "kind": LOCAL_DESKTOP_GRANT_KIND,
+                "reason": "initialized",
+                "revokedGrants": revoked,
+            })),
+            origin: "rest",
+            result: "ok",
+        })
+        .await;
 }
 
 /// setup の後に保存する設定 `auth.local_grant` と、操作者を引くトークン（モジュール doc
@@ -962,17 +979,31 @@ async fn save_setup_choice(
             .map(|session| session.identity),
         None => None,
     };
-    let saved = {
+    // lock を握ったまま「保存 → 2 回目の失効（同期）」（#392 B2-2 のレビュー、Codex P1・
+    // オーナー P2-2）: 最初の失効（`finish_setup`）からこの保存までの間に、先に保存されて
+    // いた値（未初期化の間に `PUT /api/settings/auth` で保存した admin など）で開いた条件の
+    // まま新しいトークンが発行されうる。grant のセッションは条件を毎回読み直さないので、
+    // 保存の後に `off` へ閉じてもそのトークンは残る。保存した値で条件が閉じた後に、
+    // もう一度失効させる。書かない（既に `off`）ときも失効は行う。
+    let (saved, revoked_again) = {
         let _guard = state.settings_lock.lock().await;
-        if value == LocalGrantSetting::Off
+        let saved = if value == LocalGrantSetting::Off
             && matches!(
                 read_setting(&state.settings).await,
                 Ok(LocalGrantSetting::Off)
-            )
-        {
-            return;
-        }
-        write_setting(&state.settings, value).await
+            ) {
+            None
+        } else {
+            Some(write_setting(&state.settings, value).await)
+        };
+        let revoked = state.auth.revoke_grant_tokens(&local_desktop_grant_kind());
+        (saved, revoked)
+    };
+    if revoked_again > 0 {
+        record_setup_revocation(state, revoked_again).await;
+    }
+    let Some(saved) = saved else {
+        return;
     };
     let result = match (&saved, value) {
         (Ok(()), _) => "ok",

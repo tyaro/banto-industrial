@@ -21,6 +21,7 @@
  */
 import {
 	grantFallback,
+	resolveSettled,
 	type AuthProvider,
 	type GrantStatus,
 	type ResolveResult,
@@ -67,6 +68,25 @@ export async function enterCredentiallessGrant(
 	return grantFallback(controller, provider, local.ticket, {
 		kind: PUBLIC_VIEWER_GRANT_KIND
 	});
+}
+
+/**
+ * ログイン画面の「閲覧のみで続ける」（#392 B2-2 のレビュー、オーナー P2-1・Copilot）:
+ * **明示的に閲覧公開（`publicViewer`）を選ぶ**。ガードの自動の順序（`localDesktop` が
+ * 先）に任せて `/monitor` へ移るだけだと、両方使えるときにガードが `localDesktop`
+ * （admin になりうる）を発行し、利用者が選んだ閲覧の制限が効かなかった。ここで
+ * セッションを確定させてから移れば、ガードは既にあるセッションを上書きしない
+ * （`grantFallback` は確定した `none` のときだけ呼ばれる）。
+ *
+ * 返すのは `grantFallback` と同じ結果。既にセッションがあればそのまま（何も発行しない）。
+ */
+export async function enterPublicViewer(
+	controller: SessionController,
+	provider: Pick<AuthProvider, 'status' | 'enterGrant'>
+): Promise<Exclude<ResolveResult, { outcome: 'superseded' }>> {
+	const first = await resolveSettled(controller, { cause: 'navigation' });
+	if (first.outcome === 'unverified' || first.snapshot.status !== 'none') return first;
+	return grantFallback(controller, provider, first.ticket, { kind: PUBLIC_VIEWER_GRANT_KIND });
 }
 
 /** ログイン画面（`routes/login/+page.svelte`）に出す、資格情報なしの口と初回セットアップの選択。 */

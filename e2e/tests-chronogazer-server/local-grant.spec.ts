@@ -15,6 +15,8 @@
  * 3. サーバーを再起動しても、新しいブラウザーの文脈で `/` → ログインなしで監視画面。
  * 4. ログアウト → ログイン画面（自動では入り直さない）に「この PC として続ける」→
  *    押すと監視画面。
+ * 4b. 閲覧公開も ON のとき、ログイン画面の「閲覧のみで続ける」は閲覧者（`publicViewer`・
+ *    viewer）になり、この PC からの接続（admin）を先に発行しない（#392 B2-2 のレビュー）。
  * 5. 設定 › セキュリティでこの PC からの接続を「使わない」にすると、自分のセッションも
  *    閉じてログイン画面へ。再起動の後も `/` はログイン画面。
  * 6. 別の新しいルートでチェックを外して作成すると、今までどおり作ったアカウントの
@@ -26,7 +28,14 @@
  * 一時ディレクトリの中（`%ProgramData%` には触れない）。止め方は `--control-stdin` の
  * `ctrl-c`（Ctrl-C と同じ経路）、終わらなければ上限の後に kill する。
  */
-import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import {
+	expect,
+	test,
+	type APIRequestContext,
+	type Browser,
+	type BrowserContext,
+	type Page
+} from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -201,6 +210,29 @@ async function createFirstAdmin(page: Page, username: string, optIn: boolean): P
 	await page.getByRole('button', { name: 'アカウントを作成' }).click();
 }
 
+/**
+ * 閲覧公開（`server.viewerPublic`）を切り替える。この PC からの接続（admin）の
+ * トークンを受け取り、`PUT /api/settings/server` で LAN は無効のまま保存する。
+ */
+async function setViewerPublic(request: APIRequestContext, on: boolean): Promise<void> {
+	const granted = await request.post(`${BASE_URL}/api/auth/grant/localDesktop`, {
+		headers: CSRF_HEADERS
+	});
+	expect(granted.ok(), await granted.text()).toBe(true);
+	const { token } = (await granted.json()) as { token: string };
+	const headers = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+	const current = await request.get(`${BASE_URL}/api/settings/server`, { headers });
+	expect(current.ok(), await current.text()).toBe(true);
+	const status = (await current.json()) as { bind: string; port: number };
+	const saved = await request.put(`${BASE_URL}/api/settings/server`, {
+		headers,
+		data: { enabled: false, bind: status.bind, port: status.port, viewerPublic: on }
+	});
+	expect(saved.ok(), await saved.text()).toBe(true);
+	expect(((await saved.json()) as { viewerPublic: boolean }).viewerPublic).toBe(on);
+	await request.post(`${BASE_URL}/api/auth/logout`, { headers });
+}
+
 test.describe.serial('この PC からの接続（初回セットアップで選ぶ）', () => {
 	let root: string;
 	let server: RunningServer | null = null;
@@ -287,6 +319,39 @@ test.describe.serial('この PC からの接続（初回セットアップで選
 		await page.getByRole('button', { name: 'この PC として続ける' }).click();
 		await expectThisPcSession(page);
 		await context.close();
+	});
+
+	test('4b. 両方使えるとき「閲覧のみで続ける」は閲覧者になる（localDesktop を先に発行しない）', async ({
+		browser,
+		request
+	}) => {
+		// 閲覧公開を ON にする（この PC からの接続の admin で設定の REST を呼ぶ）。
+		await setViewerPublic(request, true);
+		try {
+			const { context, page } = await shellLikeContext(browser);
+			await page.goto('/login');
+			await expect(page.getByRole('button', { name: 'この PC として続ける' })).toBeVisible();
+			await page.getByRole('button', { name: '閲覧のみで続ける' }).click();
+			await expect(page).toHaveURL(/\/monitor$/);
+			const me = await page.evaluate(async () => {
+				const token = sessionStorage.getItem('banto.auth.token');
+				const res = await fetch('/api/auth/identity', {
+					headers: { 'X-Banto-Client': 'banto', Authorization: `Bearer ${token}` }
+				});
+				return (await res.json()) as { kind?: string; role?: string };
+			});
+			expect(me.kind).toBe('publicViewer');
+			expect(me.role).toBe('viewer');
+			// 閲覧公開の表示: ヘッダーは「ログイン」、「この PC」ではない。設定は許可リストの外。
+			await expect(page.locator('header').getByRole('button', { name: 'ログイン' })).toBeVisible();
+			await expect(page.locator('header').getByText('この PC', { exact: true })).toHaveCount(0);
+			await page.goto('/settings/security');
+			await expect(page).toHaveURL(/\/monitor$/);
+			await expect(page.getByTestId('local-grant-select')).toHaveCount(0);
+			await context.close();
+		} finally {
+			await setViewerPublic(request, false);
+		}
 	});
 
 	test('5. セキュリティで「使わない」にすると自分も閉じてログイン画面、再起動後も / はログイン画面', async ({

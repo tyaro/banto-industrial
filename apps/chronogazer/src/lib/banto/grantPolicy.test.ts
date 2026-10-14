@@ -17,6 +17,7 @@ import {
 } from '@banto/admin-core';
 import {
 	enterCredentiallessGrant,
+	enterPublicViewer,
 	localDesktopAvailable,
 	loginEntries,
 	needsFirstAdmin
@@ -111,6 +112,34 @@ describe('enterCredentiallessGrant（localDesktop → publicViewer）', () => {
 	it('どちらも使えなければ確定した none のまま（ガードが /login へ）', async () => {
 		const { result, enterGrant } = await enter({ initialized: true, grants: {} }, []);
 		expect(result.outcome).toBe('confirmed');
+		expect(result.snapshot.status).toBe('none');
+		expect(enterGrant).not.toHaveBeenCalled();
+	});
+});
+
+describe('enterPublicViewer（「閲覧のみで続ける」は明示的に閲覧公開）', () => {
+	async function viewer(status: GrantStatus, grantable: string[]) {
+		const p = grantProvider(status, grantable);
+		initBanto({ dataProvider: {} as DataProvider, authProvider: p.auth, resources: [] });
+		const result = await enterPublicViewer(getSessionController(), p.auth);
+		return { result, enterGrant: p.enterGrant };
+	}
+
+	it('localDesktop も使えるときでも publicViewer に入る（localDesktop を試さない）', async () => {
+		const { result, enterGrant } = await viewer(
+			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
+			['localDesktop', 'publicViewer']
+		);
+		expect(result.snapshot.status).toBe('active');
+		expect(result.snapshot.kind).toBe('publicViewer');
+		expect(enterGrant.mock.calls.map((call) => call[0])).toEqual(['publicViewer']);
+	});
+
+	it('閲覧公開が OFF なら none のまま（localDesktop には入らない）', async () => {
+		const { result, enterGrant } = await viewer(
+			{ initialized: true, grants: { localDesktop: true, publicViewer: false } },
+			['localDesktop']
+		);
 		expect(result.snapshot.status).toBe('none');
 		expect(enterGrant).not.toHaveBeenCalled();
 	});

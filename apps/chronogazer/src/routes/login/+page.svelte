@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { getAuthProvider, notify } from '@banto/admin-core';
+	import { getAuthProvider, getSessionController, notify } from '@banto/admin-core';
 	import { resolveAppPath } from '#lib/navigation.js';
 	import { bantoReady, getBantoMode } from '#lib/banto/setup.js';
-	import { loginEntries } from '#lib/banto/grantPolicy.js';
+	import { enterPublicViewer, loginEntries } from '#lib/banto/grantPolicy.js';
 
 	// Undecided until `status()` resolves (or is absent, treated as
 	// "already initialized" - see below): render nothing rather than
@@ -71,11 +71,23 @@
 		})();
 	});
 
-	// (app) のガードが閲覧者のセッションを自分で発行する（`+layout.ts` の
-	// `grantFallback` → `enterGrant('publicViewer')`）ので、ここはガードの
-	// かかる画面へ移るだけ。
-	function continueAsViewer(): void {
-		goto(resolveAppPath('/monitor'));
+	// #392 B2-2 のレビュー（オーナー P2-1・Copilot）: 閲覧者のセッションをここで明示的に
+	// 発行して確定してから移る（`enterPublicViewer`）。ガードに任せると、この PC からの
+	// 接続（`localDesktop`）も使えるときにガードがそちらを先に発行し、閲覧の制限が
+	// 効かなかった。ガードは既にあるセッションを上書きしない。
+	async function continueAsViewer(): Promise<void> {
+		error = null;
+		submitting = true;
+		try {
+			const result = await enterPublicViewer(getSessionController(), getAuthProvider());
+			if (result.outcome === 'confirmed' && result.snapshot.status === 'active') {
+				goto(resolveAppPath('/monitor'));
+			} else {
+				error = '閲覧のみで入れませんでした。しばらくしてからもう一度試してください';
+			}
+		} finally {
+			submitting = false;
+		}
 	}
 
 	// 「この PC として続ける」も同じ: ガードが `localDesktop` を先に試す
@@ -241,7 +253,12 @@
 			{/if}
 
 			{#if showContinueAsViewer}
-				<button type="button" class="continue-as-viewer" onclick={continueAsViewer}>
+				<button
+					type="button"
+					class="continue-as-viewer"
+					onclick={continueAsViewer}
+					disabled={submitting}
+				>
 					閲覧のみで続ける
 				</button>
 			{/if}

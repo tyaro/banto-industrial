@@ -1750,6 +1750,8 @@ async fn server_apply_body(
         auth_config_lock: &state.auth_config_lock,
         origin: "tauri",
         log_label: "banto",
+        // 画面の呼び出しはトークンを持たない（Tauri のセッションは別の仕組み）。
+        recheck_token: None,
     };
     apply_server_settings(
         &ctx,

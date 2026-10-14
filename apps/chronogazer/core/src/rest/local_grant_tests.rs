@@ -49,6 +49,9 @@ struct Fixture {
     settings: SettingsService,
     audit: AuditLogService,
     auth: banto_server::AuthState,
+    /// REST の設定の書き込みの lock（`HostAccess::settings_lock`。外から握って処理を
+    /// 決定的に止めるテスト用）。
+    settings_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 async fn fixture(start: LocalGrantStart, always_on_listener: bool, accounts: &[Role]) -> Fixture {
@@ -92,12 +95,14 @@ async fn fixture_with(
             .expect("HubService::new");
     let auth = super::user_auth_state(users.clone(), audit.clone());
     let (tx, _rx) = broadcast::channel(16);
+    let settings_lock = Arc::new(tokio::sync::Mutex::new(()));
     let host = HostAccess {
         local: LocalAccess {
             start,
             always_on_listener,
         },
         lan: LanControl::detached(),
+        settings_lock: settings_lock.clone(),
         ..HostAccess::closed()
     };
     let router = api_router(
@@ -122,6 +127,7 @@ async fn fixture_with(
         settings,
         audit,
         auth,
+        settings_lock,
     }
 }
 
@@ -1084,15 +1090,18 @@ async fn deeply_nested_bodies_cannot_bypass_the_reserved_name_check() {
     assert_eq!(f.users.list_users().await.unwrap().len(), 1);
 }
 
-/// #600 の Copilot レビュー: 設定の `PUT` は操作者を本文を待つ前に確定する。本文が届くのを
-/// 待つ間に `localDesktop` の grant が失効しても（別の `PUT /api/settings/auth` と同じ
-/// 効果を、本文の最初の poll の後に直接の失効で作る）、認可済みの変更は操作者つきで
-/// 監査に残る。
+/// #600 の Copilot レビューで「本文を待つ間に grant が失効しても、認可済みの変更は操作者
+/// つきで通す」と決めていたが、#392 B2-2 のレビュー（Copilot）で改めた: 認可は lock の
+/// 手前で済むので、待つ間に失効したトークンで変更を通すと、setup が保存した `off` を
+/// 書き戻せる。lock を取った後に認可を確かめ直し、無効なら何もせず `401`（設定は変わらず、
+/// `settings_change` も残らない）。本文の最初の poll の後（= 認可の層を通った後）に
+/// 直接の失効で作る。操作者を本文の前に確定する扱い（自分の変更で自分のトークンが
+/// 失効する場合）は `a_grant_session_changing_the_setting_is_audited_with_its_actor` が守る。
 ///
-/// 反証: `auth_settings_put` の `actor_identity` を本文を読んだ後に戻すと、監査の
-/// 操作者が空になってこのテストが落ちる。
+/// 反証: `auth_settings_apply` の lock の下の再確認を外すと、`200` で設定が viewer になって
+/// このテストが落ちる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_settings_actor_is_fixed_before_the_body_arrives() {
+async fn a_token_revoked_while_the_body_arrives_is_refused_under_the_lock() {
     let admin = LocalGrantSetting::Role(Role::Admin);
     let f = fixture_with(
         LocalGrantStart::Initialized(admin),
@@ -1140,8 +1149,13 @@ async fn the_settings_actor_is_fixed_before_the_body_arrives() {
     );
     release_tx.send(()).unwrap();
     let response = pending.await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        admin,
+        "失効したトークンで設定が変わった"
+    );
     let changes = f
         .audit
         .list(ListParams::default())
@@ -1150,10 +1164,8 @@ async fn the_settings_actor_is_fixed_before_the_body_arrives() {
         .rows
         .into_iter()
         .filter(|row| row.action == "settings_change")
-        .collect::<Vec<_>>();
-    assert_eq!(changes.len(), 1, "{changes:?}");
-    assert_eq!(changes[0].actor_username.as_deref(), Some("localDesktop"));
-    assert_eq!(changes[0].actor_role.as_deref(), Some("admin"));
+        .count();
+    assert_eq!(changes, 0);
 }
 
 /// #600 の Copilot レビュー: 予約名（ここでは `localDesktop`）のアカウントがある DB
@@ -1602,4 +1614,255 @@ async fn setup_without_opting_in_overrides_a_value_saved_before_setup() {
     );
     assert_eq!(changes[0].result, "ok");
     assert_eq!(changes[0].actor_username.as_deref(), Some("owner"));
+}
+
+/// `revoke_grants`（setup の後の失効）の監査の行の数。
+async fn setup_revocations(audit: &AuditLogService) -> usize {
+    audit
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| row.action == "revoke_grants")
+        .count()
+}
+
+/// 上限つきで `cond` が真になるまで待つ（時間で決めず、状態の変化を待つ）。
+async fn wait_until<F, Fut>(what: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond().await {
+        assert!(tokio::time::Instant::now() < deadline, "{what} にならない");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// `POST /api/auth/setup` を別のタスクで送る（応答はハンドルで待つ）。
+fn spawn_setup(router: &Router, body: Value) -> tokio::task::JoinHandle<StatusCode> {
+    let router = router.clone();
+    tokio::spawn(async move {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/auth/setup")
+            .header("X-Banto-Client", "banto")
+            .header("Host", LOCAL_HOST)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(LOCAL));
+        router.oneshot(request).await.unwrap().status()
+    })
+}
+
+/// #392 B2-2 のレビュー（Codex P1・オーナー P2-2）: 未初期化の間に `admin` を先に保存した
+/// まま、チェックを外して作ると、最初の失効から `off` の保存までの間は先に保存された
+/// `admin` で条件が開いているので、別の要求が新しいトークン T を受け取れる。grant の
+/// セッションは条件を読み直さないので、`off` の保存の後も T が残っていた。保存と
+/// 2 回目の失効を同じ lock の下で行うので、T も失効する。
+///
+/// lock を外から握って保存の手前で止め（最初の失効は済んでいる = 監査の行で見る）、
+/// その間に T を受け取り、lock を放して setup の終わりを待つ。
+///
+/// 反証: `save_setup_choice` の 2 回目の失効を外すと、T で設定を読めて落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_issued_before_the_setup_choice_is_saved_is_revoked() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let (_, first) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let (status, body) = send(
+        &f.router,
+        "PUT",
+        "/api/settings/auth",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&first.expect("token")),
+        Some(json!({ "localGrant": "admin" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 上の保存で失効したので、未初期化の間のトークンをもう一度受け取る（最初の失効の対象）。
+    let (_, before) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let before = before.expect("token");
+
+    let held = f.settings_lock.clone().lock_owned().await;
+    let setup = spawn_setup(
+        &f.router,
+        json!({ "username": "owner", "password": PASSWORD, "displayName": "x" }),
+    );
+    let audit = f.audit.clone();
+    wait_until("最初の失効の監査", || {
+        let audit = audit.clone();
+        async move { setup_revocations(&audit).await >= 1 }
+    })
+    .await;
+    assert!(identity(&f.router, &before).await.1.is_null());
+
+    // 最初の失効の後・`off` の保存の前: 先に保存された admin で発行される。
+    let (status, late) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    assert_eq!(status, StatusCode::OK);
+    let late = late.expect("token");
+    assert!(!identity(&f.router, &late).await.1.is_null());
+
+    drop(held);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), setup)
+            .await
+            .expect("setup が終わらない")
+            .unwrap(),
+        StatusCode::OK
+    );
+
+    assert!(
+        identity(&f.router, &late).await.1.is_null(),
+        "保存の前に発行されたトークンが残っている"
+    );
+    let (status, _) = send(
+        &f.router,
+        "GET",
+        "/api/settings/auth",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&late),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Off
+    );
+    assert_eq!(
+        setup_revocations(&f.audit).await,
+        2,
+        "2 回目の失効の監査が無い"
+    );
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        false
+    );
+}
+
+/// #392 B2-2 のレビュー（Copilot）: `PUT /api/settings/auth` は認可を lock の手前で済ませる
+/// ので、未初期化の間の admin のトークン T0 で認可を通った `PUT {localGrant: "admin"}` が
+/// lock を待つ間に setup（チェックなし）が T0 を失効させ `off` を保存しても、その後で lock を
+/// 取って `admin` を書き戻せた。lock の下で認可を確かめ直すので `401` で何も書かない。
+///
+/// lock を外から握り、T0 の `PUT` を本文の最初の poll（= 認可の層を通った）まで進め、
+/// setup を送って最初の失効（監査の行）を待ってから lock を放す。lock の取り合いの順
+/// （`PUT` と setup の保存のどちらが先か）に関わらず、`PUT` は `401`・設定は `off`。
+///
+/// 反証: `auth_settings_apply` の lock の下の再確認を外すと、`PUT` が `200` になって落ちる
+/// （`PUT` が先に lock を取れば最後は `off` になるが、応答で分かる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_put_waiting_for_the_lock_cannot_undo_the_setup_choice() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let (_, t0) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let t0 = t0.expect("token");
+
+    let held = f.settings_lock.clone().lock_owned().await;
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let state = Some((polled_tx, release_rx));
+    let stream = futures_util::stream::unfold(state, |state| async move {
+        let (polled_tx, release_rx) = state?;
+        let _ = polled_tx.send(());
+        let _ = release_rx.await;
+        Some((
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(
+                json!({ "localGrant": "admin" }).to_string(),
+            )),
+            None,
+        ))
+    });
+    let mut request = Request::builder()
+        .method("PUT")
+        .uri("/api/settings/auth")
+        .header("X-Banto-Client", "banto")
+        .header("Host", LOCAL_HOST)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {t0}"))
+        .body(Body::from_stream(stream))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(LOCAL));
+    let router = f.router.clone();
+    let put = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+    polled_rx.await.expect("本文が読まれなかった");
+    release_tx.send(()).unwrap();
+
+    let setup = spawn_setup(
+        &f.router,
+        json!({ "username": "owner", "password": PASSWORD, "displayName": "x" }),
+    );
+    let audit = f.audit.clone();
+    wait_until("setup の最初の失効の監査", || {
+        let audit = audit.clone();
+        async move { setup_revocations(&audit).await >= 1 }
+    })
+    .await;
+    drop(held);
+
+    let put = tokio::time::timeout(std::time::Duration::from_secs(10), put)
+        .await
+        .expect("PUT が終わらない")
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), setup)
+            .await
+            .expect("setup が終わらない")
+            .unwrap(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Off
+    );
+    let changes = f
+        .audit
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| {
+            row.action == "settings_change"
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("\"localGrant\":\"admin\""))
+        })
+        .count();
+    assert_eq!(changes, 0, "失効したトークンの変更が監査に残った");
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        false
+    );
+}
+
+/// #392 B2-2 のレビュー: lock の下の認可の再確認（`server_admin::recheck_token`。
+/// `PUT /api/settings/server` と `PUT /api/settings/auth` で共有）。有効なトークンと
+/// トークンの無い経路（デスクトップの Tauri のコマンド）は通し、失効したトークンは
+/// `Unauthorized`。`PUT /api/settings/server` の配線は、このルーターの host では `PUT` が
+/// 入れ替えの前に `403` になるので、ここでは関数だけを確かめる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lock_recheck_refuses_a_revoked_token() {
+    use crate::server_admin::recheck_token;
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let (_, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let token = token.expect("token");
+    assert!(recheck_token(&f.auth, Some(&token)).await.is_ok());
+    assert!(recheck_token(&f.auth, None).await.is_ok());
+    f.auth
+        .revoke_grant_tokens(&crate::local_grant::local_desktop_grant_kind());
+    assert!(matches!(
+        recheck_token(&f.auth, Some(&token)).await,
+        Err(banto_core::BantoError::Unauthorized)
+    ));
+    assert!(matches!(
+        recheck_token(&f.auth, Some("not-a-token")).await,
+        Err(banto_core::BantoError::Unauthorized)
+    ));
 }
