@@ -718,7 +718,7 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
     match applied {
         Ok(Ok(status)) => Json(status).into_response(),
         Ok(Err(err)) => ApiError(err).into_response(),
-        Err(refusal) => refusal,
+        Err(failed) => failed.into_response(),
     }
 }
 
@@ -793,7 +793,7 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
     match applied {
         Ok(Ok(view)) => Json(view).into_response(),
         Ok(Err(err)) => err.into_response(),
-        Err(refusal) => refusal,
+        Err(failed) => failed.into_response(),
     }
 }
 

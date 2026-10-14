@@ -477,7 +477,7 @@ pub async fn local_access_middleware(
     };
     match run_detached("localDesktop の発行・最初の管理者の作成", detached).await {
         Ok(response) => response,
-        Err(refusal) => refusal,
+        Err(failed) => failed.into_response(),
     }
 }
 
@@ -491,27 +491,34 @@ pub async fn local_access_middleware(
 /// `JoinHandle` の drop はタスクを止めず、最後まで完結する。応答の外形は変えない
 /// （handler は結果をそのまま返す）。
 ///
-/// タスクが panic したら（`JoinError`）`500` を返す: 副作用がどこまで済んだかは分からない
-/// ので、呼び出し側には「状態を読み直す」ように伝え、理由はログに残す。
-pub(crate) async fn run_detached<F>(label: &str, work: F) -> Result<F::Output, Response>
+/// タスクが panic したら（`JoinError`）[`DetachedTaskFailed`]（応答は `500`）を返す:
+/// 副作用がどこまで済んだかは分からないので、呼び出し側には「状態を読み直す」ように
+/// 伝え、理由はログに残す。
+pub(crate) async fn run_detached<F>(label: &str, work: F) -> Result<F::Output, DetachedTaskFailed>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match tokio::spawn(work).await {
-        Ok(output) => Ok(output),
-        Err(err) => {
-            eprintln!("{label}: 処理のタスクが途中で終わりました: {err}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody::Other {
-                    message:
-                        "処理が途中で止まりました。状態を読み直してから、もう一度試してください"
-                            .to_string(),
-                }),
-            )
-                .into_response())
-        }
+    tokio::spawn(work).await.map_err(|err| {
+        eprintln!("{label}: 処理のタスクが途中で終わりました: {err}");
+        DetachedTaskFailed
+    })
+}
+
+/// [`run_detached`] のタスクが最後まで走らなかった（panic）。応答は `500`。
+#[derive(Debug)]
+pub(crate) struct DetachedTaskFailed;
+
+impl IntoResponse for DetachedTaskFailed {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody::Other {
+                message: "処理が途中で止まりました。状態を読み直してから、もう一度試してください"
+                    .to_string(),
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -699,12 +706,15 @@ mod tests {
     #[tokio::test]
     async fn run_detached_turns_a_panic_into_500() {
         assert_eq!(run_detached("test", async { 7 }).await.ok(), Some(7));
-        let refusal = run_detached("test", async {
+        let failed = run_detached("test", async {
             panic!("boom");
         })
         .await
         .expect_err("panic を結果として返した");
-        assert_eq!(refusal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            failed.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
