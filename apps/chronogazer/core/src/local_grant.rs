@@ -243,7 +243,8 @@ impl LocalGrantStart {
         match self {
             Self::Unsupported => false,
             Self::Uninitialized => initialized_now && saved != LocalGrantSetting::Off,
-            Self::Initialized(started) => *started != saved,
+            // `off` にする（閉じる）のはすぐ効くので再起動は要らない（#600 のレビュー）。
+            Self::Initialized(started) => *started != saved && saved != LocalGrantSetting::Off,
         }
     }
 }
@@ -572,7 +573,9 @@ mod tests {
         assert!(!LocalGrantStart::Uninitialized.restart_required(Off, true));
         assert!(LocalGrantStart::Uninitialized.restart_required(viewer, true));
         assert!(!LocalGrantStart::Initialized(viewer).restart_required(viewer, true));
-        assert!(LocalGrantStart::Initialized(viewer).restart_required(Off, true));
+        // 閉じる方向（`off`）はすぐ効く。
+        assert!(!LocalGrantStart::Initialized(viewer).restart_required(Off, true));
+        assert!(LocalGrantStart::Initialized(viewer).restart_required(R(Role::Admin), true));
         assert!(LocalGrantStart::Initialized(Off).restart_required(viewer, true));
     }
 

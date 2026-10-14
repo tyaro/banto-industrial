@@ -234,7 +234,7 @@ use crate::instance_lock::{acquire_for_db, ChronoGazerHost, InstanceGuard, Insta
 use crate::local_grant::{LocalAccess, LocalGrantStart};
 use crate::rest::{api_router, user_auth_state, HostAccess};
 use crate::retention::RetentionTask;
-use crate::server_admin::{AlwaysOnListener, LanControl, LanRouterFactory};
+use crate::server_admin::{AlwaysOnListener, LanControl, LanRouterFactory, LanStatusCache};
 use crate::settings::{data_dir_value_unreadable, store_config, ServerSettings, SettingsService};
 use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
@@ -395,6 +395,14 @@ impl ServerSlot {
         self.inner.lock().await
     }
 
+    /// 待たずに取る（取れなければ `Err`）。状態の表示が、適用の途中で待たないため
+    /// （`crate::server_admin::current_status`）。
+    pub fn try_lock(
+        &self,
+    ) -> Result<AsyncMutexGuard<'_, Option<RunningServer>>, tokio::sync::TryLockError> {
+        self.inner.try_lock()
+    }
+
     /// 走っている listener の実際のアドレス。
     pub async fn local_addr(&self) -> Option<SocketAddr> {
         self.inner
@@ -454,6 +462,9 @@ pub struct EngineServices {
     pub settings_lock: Arc<AsyncMutex<()>>,
     /// ログの接頭辞（[`EngineConfig::log_label`]）。
     pub log_label: &'static str,
+    /// 最後に一貫して読めた LAN の状態（`GET /api/settings/server` が適用の途中に返す。
+    /// `crate::server_admin::LanStatusCache`）。
+    pub lan_status: LanStatusCache,
 }
 
 impl EngineServices {
@@ -482,6 +493,7 @@ impl EngineServices {
                 slot: self.lan_slot.clone(),
                 always_on: self.always_on.clone(),
                 router: Some(factory),
+                published: self.lan_status.clone(),
             },
             settings_lock: self.settings_lock.clone(),
             log_label: self.log_label,
@@ -1000,6 +1012,7 @@ impl OpenedEngine {
             local_grant,
             settings_lock: Arc::new(AsyncMutex::new(())),
             log_label: label,
+            lan_status: Arc::new(std::sync::Mutex::new(None)),
         };
 
         let listen_error = listen_error.or(fallback_error);
@@ -2425,6 +2438,80 @@ mod tests {
                 "skip: この環境には非 loopback の IPv4 アドレスが無い（LAN の入れ替えは確かめない）"
             );
         }
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
+
+    /// #600 の再レビュー: 状態の `GET /api/settings/server` は LAN の slot を待たない。
+    /// 適用は slot を持ったまま古い LAN の listener を graceful に止め、停止はその listener
+    /// の上の要求の終わりを待つので、その listener 経由の `GET` が slot を待つと、適用が
+    /// banto の 5 秒の打ち切りまで止まる。ここでは適用の途中を「slot を外から持つ」ことで
+    /// 作り（時間に頼らない）、LAN の listener 経由の `GET` がすぐ（上限 2 秒）、適用の前の
+    /// 一貫した状態で返ることを確かめる。slot を放した後は新しい状態を読む。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_get_does_not_wait_for_an_apply_in_progress() {
+        let dir = TempDir::new();
+        let port = free_port();
+        let opened = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open");
+        let settings = opened.settings();
+        let saved = settings.server_config().await.unwrap();
+        settings
+            .set_server_config(&ServerSettings { port, ..saved })
+            .await
+            .unwrap();
+        let engine = opened
+            .with_loopback(ServerConfig {
+                bind: "127.0.0.1".to_string(),
+                port,
+            })
+            .with_listen(EngineListen::BestEffort(loopback_any_port()))
+            .with_loopback_local_access()
+            .start()
+            .await
+            .expect("start");
+        let loopback = engine.loopback_addr().await.expect("loopback");
+        let lan = engine.server_slot().local_addr().await.expect("lan");
+        assert_eq!(post_setup(loopback).await, 200);
+        let (_, body) = http(
+            loopback,
+            "POST",
+            "/api/auth/login",
+            &loopback.to_string(),
+            None,
+            Some(serde_json::json!({ "username": "admin", "password": "admin-pass-1" })),
+        )
+        .await;
+        let token = body["token"].as_str().expect("token").to_string();
+        let get = || {
+            let token = token.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    http(
+                        lan,
+                        "GET",
+                        "/api/settings/server",
+                        &lan.to_string(),
+                        Some(&token),
+                        None,
+                    ),
+                )
+                .await
+                .expect("GET が LAN の slot を待って止まった")
+            }
+        };
+        let (status, before) = get().await;
+        assert_eq!(status, 200, "{before}");
+        assert_eq!(before["running"], true, "{before}");
+
+        // 適用の途中（slot を持っている）。`GET` は待たずに適用の前の状態を返す。
+        let guard = engine.server_slot().lock().await;
+        let (status, during) = get().await;
+        assert_eq!(status, 200, "{during}");
+        assert_eq!(during, before);
+        drop(guard);
+
         assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
     }
 }

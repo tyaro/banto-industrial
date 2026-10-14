@@ -173,6 +173,19 @@ pub struct LanControl {
     /// 新しい LAN の listener に載せるルーター（REST の `PUT` が使う。デスクトップは
     /// Tauri のコマンドが自分で渡す）。
     pub router: Option<LanRouterFactory>,
+    /// 最後に一貫して読めた状態（[`LanStatusCache`]）。
+    pub published: LanStatusCache,
+}
+
+/// 最後に一貫して読めた LAN の状態（`GET /api/settings/server` が適用の途中に返すもの。
+/// #600 のレビュー）。適用（[`apply_server_settings`]）が終わるたび、と、slot を待たずに
+/// 取れた `GET` のたびに書き換える。エンジンに 1 つ（`EngineServices::lan_status`）。
+pub type LanStatusCache = Arc<std::sync::Mutex<Option<ServerStatusView>>>;
+
+fn publish(cache: &LanStatusCache, view: &ServerStatusView) {
+    *cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(view.clone());
 }
 
 impl LanControl {
@@ -182,6 +195,7 @@ impl LanControl {
             slot: Arc::new(ServerSlot::default()),
             always_on: None,
             router: None,
+            published: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -200,7 +214,7 @@ impl LanControl {
     }
 
     /// LAN に出ている常時の listener（`0.0.0.0` にまとめたとき）のアドレス。
-    async fn always_on_lan_addr(&self) -> Option<SocketAddr> {
+    pub async fn always_on_lan_addr(&self) -> Option<SocketAddr> {
         match &self.always_on {
             Some(always_on) => always_on
                 .slot
@@ -238,11 +252,21 @@ impl LanControl {
 pub async fn current_status(
     settings: &SettingsService,
     lan: &LanControl,
-) -> Result<ServerStatusView, BantoError> {
-    // LAN の slot を持ったまま保存値と実行中のアドレスを読む（#600 のレビュー）。
-    // [`apply_server_settings`] は適用の間ずっと slot を持つので、これで並行の適用の
-    // 途中（古い保存値と新しい listener、またはその逆）を混ぜた応答を返さない。
-    let slot = lan.slot.lock().await;
+) -> Result<Option<ServerStatusView>, BantoError> {
+    // 保存値と実行中のアドレスを混ぜずに読む（#600 のレビュー）が、**slot を待たない**
+    // （#600 の再レビュー）: 適用（[`apply_server_settings`]）は slot を持ったまま古い
+    // LAN の listener を graceful に止めるので、その listener 経由の `GET` が slot を
+    // 待つと、停止はその要求の終わりを待ち、banto の 5 秒の打ち切りまで適用が止まる。
+    // slot が空いていれば持ったまま読み（この間に来た適用は待つだけで、`GET` は
+    // 必ず終わる）、適用の途中なら最後に公開された状態（適用の前の一貫した状態）を
+    // 返す。どちらも無いとき（起動の後に一度も読めていないうちの適用の途中）は `None`。
+    let Ok(slot) = lan.slot.try_lock() else {
+        return Ok(lan
+            .published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone());
+    };
     let config = settings.server_config().await?;
     let restart_required = if lan.always_on.is_some() {
         let auth = settings.auth_config().await?;
@@ -255,8 +279,10 @@ pub async fn current_status(
         // 常時の listener は入れ替えないので、slot を持たずに読んでよい。
         None => lan.always_on_lan_addr().await,
     };
+    let view = build_status(&config, running, restart_required);
+    publish(&lan.published, &view);
     drop(slot);
-    Ok(build_status(&config, running, restart_required))
+    Ok(Some(view))
 }
 
 // --- 適用（デスクトップと REST で共有） ------------------------------------------
@@ -321,6 +347,12 @@ pub async fn apply_server_settings(
     } else {
         None
     };
+    // 失敗したときに公開する状態（何も保存しないので、いまの保存値のまま）。
+    let previous = ctx.settings.server_config().await?;
+    let restart_required_for = |config: &ServerSettings| {
+        auth.as_ref()
+            .is_some_and(|auth| ctx.lan.restart_required(auth, config))
+    };
 
     if let Some(auth) = &auth {
         if ctx.lan.restart_required(auth, &config) {
@@ -341,7 +373,16 @@ pub async fn apply_server_settings(
                 save_server_config_locked(ctx, &config).await
             }
             .await;
-            let running = slot.as_ref().map(RunningServer::local_addr);
+            let running = match slot.as_ref().map(RunningServer::local_addr) {
+                Some(addr) => Some(addr),
+                None => ctx.lan.always_on_lan_addr().await,
+            };
+            // slot を手放す前に、適用の結果の状態を公開する（`GET` は slot を待たない）。
+            let view = match &outcome {
+                Ok(()) => build_status(&config, running, true),
+                Err(_) => build_status(&previous, running, restart_required_for(&previous)),
+            };
+            publish(&ctx.lan.published, &view);
             drop(slot);
             return match outcome {
                 Ok(()) => {
@@ -358,11 +399,7 @@ pub async fn apply_server_settings(
                         }),
                     )
                     .await;
-                    let running = match running {
-                        Some(addr) => Some(addr),
-                        None => ctx.lan.running_lan_addr().await,
-                    };
-                    Ok(build_status(&config, running, true))
+                    Ok(view)
                 }
                 Err(err) => {
                     record(
@@ -415,6 +452,12 @@ pub async fn apply_server_settings(
         Ok(started) => {
             let started_addr = started.as_ref().map(RunningServer::local_addr);
             *slot = started;
+            let running = match started_addr {
+                Some(addr) => Some(addr),
+                None => ctx.lan.always_on_lan_addr().await,
+            };
+            let view = build_status(&config, running, false);
+            publish(&ctx.lan.published, &view);
             drop(slot);
             record(
                 ctx,
@@ -428,11 +471,7 @@ pub async fn apply_server_settings(
                 }),
             )
             .await;
-            let running = match started_addr {
-                Some(addr) => Some(addr),
-                None => ctx.lan.running_lan_addr().await,
-            };
-            Ok(build_status(&config, running, false))
+            Ok(view)
         }
         Err(err) => {
             // 何も保存していない。動いていた listener を開き直し、いまの状態を（変わって
@@ -455,6 +494,14 @@ pub async fn apply_server_settings(
                     ),
                 }
             }
+            let running = match slot.as_ref().map(RunningServer::local_addr) {
+                Some(addr) => Some(addr),
+                None => ctx.lan.always_on_lan_addr().await,
+            };
+            publish(
+                &ctx.lan.published,
+                &build_status(&previous, running, restart_required_for(&previous)),
+            );
             drop(slot);
             record(
                 ctx,
@@ -591,10 +638,19 @@ fn forbidden_with(message: &str) -> Response {
         .into_response()
 }
 
-async fn server_settings_get(
-    State(state): State<SettingsAdminState>,
-) -> Result<Json<ServerStatusView>, ApiError> {
-    Ok(Json(current_status(&state.settings, &state.lan).await?))
+async fn server_settings_get(State(state): State<SettingsAdminState>) -> Response {
+    match current_status(&state.settings, &state.lan).await {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody::Other {
+                message: "LAN の設定を適用している途中です。少し待ってから読み直してください"
+                    .to_string(),
+            }),
+        )
+            .into_response(),
+        Err(err) => ApiError(err).into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]

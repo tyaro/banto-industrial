@@ -1730,6 +1730,7 @@ async fn server_apply_body(
         slot: Arc::clone(&state.server),
         always_on: None,
         router: None,
+        published: state.services.lan_status.clone(),
     };
     // The new listener's router: `allow_setup: false` - the Tauri app's
     // first-run setup goes through the `auth_setup` command above (`invoke()`,
@@ -4953,6 +4954,7 @@ mod tests {
             local_grant: chronogazer_core::local_grant::LocalGrantStart::Unsupported,
             settings_lock: Arc::new(AsyncMutex::new(())),
             log_label: "banto",
+            lan_status: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
