@@ -37,8 +37,8 @@ use crate::AppState;
 
 #[cfg(windows)]
 use banto_hub_core::service_manager::{
-    ServiceManager, ServiceManagerError, WindowsServiceManager, SINK_SERVICE_DISPLAY_NAME,
-    SINK_SERVICE_NAME,
+    describe_service_error, ServiceManager, ServiceManagerError, WindowsServiceManager,
+    SINK_SERVICE_DISPLAY_NAME, SINK_SERVICE_NAME,
 };
 
 /// [`sink_service_status`]の戻り値。[`crate::host_switch_ipc::HostSwitchStatusDto`]
@@ -70,9 +70,11 @@ fn build_sink_service_manager() -> WindowsServiceManager {
     )
 }
 
+/// 利用者に見せる文言。共有 crate の`Display`は B2-4a で中立になったので、
+/// banto-hub の従来の文言を組み立てる`describe_service_error`を通す。
 #[cfg(windows)]
 fn describe_error(err: ServiceManagerError) -> String {
-    err.to_string()
+    describe_service_error(&err)
 }
 
 /// `BantoHubSink`の SCM 状態を照会する（読み取り専用、権限不問）。

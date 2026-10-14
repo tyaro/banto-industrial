@@ -295,7 +295,7 @@
 
 - `apps/banto-hub/core/src/service_manager.rs` から `ServiceManager`・`ScmState`・`ServiceStatusSummary`・`ServiceManagerError`・`TransitionHandle`・`MockServiceManager`・`WindowsServiceManager`（`for_service`）と単体テストを `crates/banto-service-control` へ移した。banto-hub-core の `service_manager` は `pub use banto_service_control::*` で再公開するので、既存の `banto_hub_core::service_manager::...` は無改造で動く。
 - banto-hub-core に残したもの（製品の知識）: `SERVICE_NAME`・`SERVICE_DISPLAY_NAME`・`RUN_SERVICE_ARG`・`SINK_SERVICE_NAME`・`SINK_SERVICE_DISPLAY_NAME`、および `BantoHub` 向けのコンストラクタ `hub_service_manager(executable_path)`（旧 `WindowsServiceManager::new`。外部 crate の型には inherent メソッドを足せないため自由関数にし、呼び出し 2 か所を書き換えた）。
-- 差は 2 点だけ: `MockServiceManager` が `NotFound` に載せる既定のサービス名が `BantoHub` ではなく中立な `mock-service` になった（`with_service_name` で差し替え可。hub のテストは名前を見ていない）。エラーの文言（先頭の `banto-hub:`）は挙動不変のためそのままにした。ChronoGazer が使う PR で文言を中立にするか決める。
+- 差は 2 点だけ: `MockServiceManager` が `NotFound` に載せる既定のサービス名が `BantoHub` ではなく中立な `mock-service` になった（`with_service_name` で差し替え可。hub のテストは名前を見ていない）。エラーの文言（先頭の `banto-hub:`）は挙動不変のためそのままにした。ChronoGazer が使う PR で文言を中立にするか決める。**→ B2-4a で中立にした**（2026-10-14 オーナー決定 O9）: crate の `Display` は先頭の `banto-hub:` を外し、権限不足は「サービス操作の権限がありません」（「管理者」を名指ししない）。banto-hub の利用者に見える文言は `banto_hub_core::service_manager::describe_service_error` が B2-3 までと 1 文字も変えずに組み立てる（§4 の B2-4a の実装メモ）。
 
 **B2-2 の実装メモ（2026-10-14、実装済み）**:
 

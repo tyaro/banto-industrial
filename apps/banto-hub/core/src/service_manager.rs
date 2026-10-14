@@ -103,6 +103,32 @@ pub const RUN_SERVICE_ARG: &str = "run-service";
 
 pub use banto_service_control::*;
 
+/// [`ServiceManagerError`]を banto-hub の利用者に見せる文言にする。
+///
+/// #392 B2-4a で共有 crate の`Display`が製品名を含まない中立な文言に
+/// なった（先頭の`banto-hub: `が無く、権限不足は「管理者」を名指し
+/// しない）。banto-hub の画面・ログ・`banto-hub-elev`の出力は B2-3 まで
+/// と同じ文言を出し続けるため、利用者に見える箇所（シェルの Sink の
+/// 起動・停止、[`crate::host_switch`]の`Faulted`の理由、
+/// [`crate::service_elevated::ElevatedError::ServiceManager`]）はこの関数を
+/// 通す。文言は B2-3 までの`Display`と 1 文字も変えない（golden テスト）。
+pub fn describe_service_error(err: &ServiceManagerError) -> String {
+    match err {
+        ServiceManagerError::NotFound(name) => {
+            format!("banto-hub: サービス '{name}' が見つかりません（未登録の可能性）")
+        }
+        ServiceManagerError::AccessDenied => {
+            "banto-hub: サービス操作の権限がありません（管理者権限が必要です）".to_string()
+        }
+        ServiceManagerError::Timeout(timeout) => {
+            format!("banto-hub: サービスの状態遷移が {timeout:?} 以内に完了しませんでした")
+        }
+        ServiceManagerError::Other(detail) => {
+            format!("banto-hub: サービス操作に失敗しました: {detail}")
+        }
+    }
+}
+
 /// `BantoHub`向けの[`WindowsServiceManager`]を作る（B2-3 までの
 /// `WindowsServiceManager::new(executable_path)`と同じ内容: サービス名・
 /// 表示名・起動引数は[`SERVICE_NAME`]・[`SERVICE_DISPLAY_NAME`]・
@@ -125,6 +151,30 @@ mod tests {
         assert_eq!(super::SERVICE_NAME, "BantoHub");
         assert_eq!(super::RUN_SERVICE_ARG, "run-service");
         assert_eq!(super::SINK_SERVICE_NAME, "BantoHubSink");
+    }
+
+    /// banto-hub の利用者に見える文言は B2-3 までの`Display`と同じ
+    /// （B2-4a で共有 crate の文言を中立にした後も変わらない）。
+    #[test]
+    fn describe_service_error_keeps_the_previous_hub_wording() {
+        use super::{describe_service_error, ServiceManagerError};
+        use std::time::Duration;
+        assert_eq!(
+            describe_service_error(&ServiceManagerError::NotFound("BantoHub".to_string())),
+            "banto-hub: サービス 'BantoHub' が見つかりません（未登録の可能性）"
+        );
+        assert_eq!(
+            describe_service_error(&ServiceManagerError::AccessDenied),
+            "banto-hub: サービス操作の権限がありません（管理者権限が必要です）"
+        );
+        assert_eq!(
+            describe_service_error(&ServiceManagerError::Timeout(Duration::from_millis(1500))),
+            "banto-hub: サービスの状態遷移が 1.5s 以内に完了しませんでした"
+        );
+        assert_eq!(
+            describe_service_error(&ServiceManagerError::Other("os error 1056".to_string())),
+            "banto-hub: サービス操作に失敗しました: os error 1056"
+        );
     }
 
     /// 共有 crate の型が`service_manager`経由で引き続き使えること

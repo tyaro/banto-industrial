@@ -28,7 +28,9 @@
 //! `BantoHubSink`の定数と`BantoHub`向けのコンストラクタだけを持つ）。差は
 //! [`MockServiceManager`]が`NotFound`に載せる既定のサービス名が
 //! 製品名ではない中立な値になったこと（[`MockServiceManager::with_service_name`]
-//! で差し替えられる）だけ。
+//! で差し替えられる）だけ。B2-4a で[`ServiceManagerError`]の`Display`を
+//! 製品名を含まない中立な文言にした（banto-hub の従来の文言は
+//! banto-hub-core の`describe_service_error`が組み立てる）。
 
 use std::time::{Duration, Instant};
 
@@ -79,22 +81,32 @@ pub struct ServiceStatusSummary {
 /// SCM 操作の失敗を分類したエラー。設計 §4 の契約に沿い、T16-2 の
 /// fallback UI が「権限がない」「見つからない」「タイムアウトした」等を
 /// 文言分岐できる粒度にした。
+///
+/// `Display`の文言は製品名を含まない中立な形（#392 B2-4a）。B2-3 の抽出
+/// 時点では banto-hub の文言（先頭の`banto-hub: `、権限不足の
+/// 「（管理者権限が必要です）」）のままだったが、ChronoGazer も同じ型を
+/// 使うため中立にした。banto-hub の利用者に見える文言は
+/// `banto_hub_core::service_manager::describe_service_error`が従来どおりに
+/// 組み立てる。
 #[derive(Debug, Clone, Error)]
 pub enum ServiceManagerError {
     /// サービスが SCM に見つからない（`open_service`失敗、未登録）。
-    #[error("banto-hub: サービス '{0}' が見つかりません（未登録の可能性）")]
+    #[error("サービス '{0}' が見つかりません（未登録の可能性）")]
     NotFound(String),
-    /// 権限不足（管理者権限、または P3 の`BantoHub Operators`
-    /// メンバーシップが必要）。
-    #[error("banto-hub: サービス操作の権限がありません（管理者権限が必要です）")]
+    /// 権限不足（管理者権限、または製品ごとの Operators グループ
+    /// （banto-hub なら P3 の`BantoHub Operators`）のメンバーシップが必要）。
+    /// 文言は「管理者」を名指ししない（Operators で足りる製品があるため。
+    /// 製品固有の案内は消費側が組み立てる - banto-hub は
+    /// `banto_hub_core::service_manager::describe_service_error`）。
+    #[error("サービス操作の権限がありません")]
     AccessDenied,
     /// [`TransitionHandle::wait_until_settled`]が期限内に目標状態へ到達
     /// できなかった。
-    #[error("banto-hub: サービスの状態遷移が {0:?} 以内に完了しませんでした")]
+    #[error("サービスの状態遷移が {0:?} 以内に完了しませんでした")]
     Timeout(Duration),
     /// 上記に当てはまらないその他のエラー（Windows API のエラー文字列を
     /// そのまま保持する診断用）。
-    #[error("banto-hub: サービス操作に失敗しました: {0}")]
+    #[error("サービス操作に失敗しました: {0}")]
     Other(String),
 }
 
@@ -758,6 +770,31 @@ mod tests {
         assert_eq!(
             ScmState::Other("Paused".to_string()).to_string(),
             "Other(Paused)"
+        );
+    }
+
+    /// 文言は製品名・「管理者」を含まない中立な形（B2-4a）。banto-hub の
+    /// 従来の文言は banto-hub-core の`describe_service_error`が持つ。
+    #[test]
+    fn error_display_is_product_neutral() {
+        let all = [
+            ServiceManagerError::NotFound("ChronoGazer".to_string()),
+            ServiceManagerError::AccessDenied,
+            ServiceManagerError::Timeout(Duration::from_secs(3)),
+            ServiceManagerError::Other("os error 5".to_string()),
+        ];
+        for err in &all {
+            let text = err.to_string();
+            assert!(!text.contains("banto-hub"), "{text}");
+            assert!(!text.contains("管理者"), "{text}");
+        }
+        assert_eq!(
+            ServiceManagerError::AccessDenied.to_string(),
+            "サービス操作の権限がありません"
+        );
+        assert_eq!(
+            ServiceManagerError::NotFound("ChronoGazer".to_string()).to_string(),
+            "サービス 'ChronoGazer' が見つかりません（未登録の可能性）"
         );
     }
 
