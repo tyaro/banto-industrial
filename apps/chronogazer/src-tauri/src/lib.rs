@@ -50,10 +50,28 @@
 //! each user once that the old `%APPDATA%\dev.tyaro.chronogazer` data is no
 //! longer used ([`legacy_notice`], decision 3 / O10). The old data is never
 //! read, moved or deleted (H9).
+//!
+//! #392 B2-4c (docs/chronogazer-service-design.md §4): `setup()` no longer
+//! always starts the in-process engine. [`shell::start`] asks the SCM about
+//! the `ChronoGazer` service (and probes its `GET /api/host` when it is
+//! `Running`), then picks one of three views with the pure
+//! `chronogazer_core::shell_launch::decide`: connect a window to the
+//! service's own HTTP UI (`http://127.0.0.1:<port>/`, no `AppState`, no
+//! capabilities), run the engine in-process as before ([`launch_desktop`]),
+//! or show a fallback window (SCM state, the probe's reason, retry / open
+//! logs / quit). The service view is watched every 5 s and falls back when
+//! the service goes away; the fallback view reconnects by itself, and only
+//! the user's 「再試行」 starts the in-process engine. The tray follows the
+//! view (three menus, [`tray`]). The exit cleanup first closes the shell's
+//! door and waits for a running transition ([`shell::ShellGate`]), so an
+//! engine that a retry finishes starting after the exit began is shut down
+//! instead of being left running. See the [`shell`] module.
 
 mod keyring_store;
 // #392 B2-4b（決定 3・O10）: 旧データ（`%APPDATA%`）の 1 回だけの案内。
 mod legacy_notice;
+// #392 B2-4c: シェルの配線（3 つの画面・見張り・終了との競合）。
+mod shell;
 // #392（2026-10-12）: 起動に失敗したときの「エラーの窓と対処の選択」。
 mod startup;
 mod tray;
@@ -3886,6 +3904,20 @@ struct ExitOnce(ExitCleanupOnce<ExitCleanupReport, ExitTrigger>);
 /// エンジンが無い（旧形式の DB・同じ DB の使用中で起動を止めた）ときは
 /// 閉じるものが無いので `None`。
 fn exit_cleanup(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitCleanupReport> {
+    // #392 B2-4c: 先にシェルの扉を閉じ（以後の移り変わりと、エンジンを置くことを
+    // 断る）、走っている移り変わり（Fallback の「再試行」の Desktop の起動）の終わりを
+    // 予算まで待つ。待った後にエンジンを探すので、移り変わりの中で置かれたエンジンも
+    // 止める。置く前に扉が閉じたエンジンは `launch_desktop` がその場で止める
+    // （`shell::ShellGate::admit`）。
+    if let Some(shell) = app.try_state::<shell::ShellState>() {
+        if !shell.gate.begin_exit(EXIT_CLEANUP_BUDGET) {
+            eprintln!(
+                "banto: シェルの切り替えが {} 秒以内に終わらなかったため、待たずに終了処理へ進みます（{}）",
+                EXIT_CLEANUP_BUDGET.as_secs(),
+                trigger.label()
+            );
+        }
+    }
     let engine = Arc::clone(&app.try_state::<DesktopEngine>()?.0);
     let once = app.try_state::<ExitOnce>()?;
     Some(run_exit_cleanup(
@@ -4368,6 +4400,12 @@ async fn launch_desktop(
 ) -> Result<(), startup::LaunchError> {
     use startup::{LaunchError, Prelude};
 
+    // #392 B2-4c: 終了に入っていたら起動しない（Fallback の「再試行」・対処の窓の
+    // やり直しが終了と重なったとき。`shell::ShellGate`）。
+    if shell::exiting(app) {
+        return Err(LaunchError::Exiting);
+    }
+
     // 対処の後なら、対処の**前に**取った A1 の排他をそのまま引き継ぐ（取り直さない。
     // #594 のオーナーレビュー P1）。
     let cfg = desktop_engine_config_for(paths);
@@ -4490,6 +4528,12 @@ async fn launch_desktop(
     } else {
         EngineListen::Disabled
     });
+    // #392 B2-4c: 収集・LAN を始める前に、もう一度終了を確かめる（窓を狭める。最後の
+    // 確かめは下の `admit`）。
+    if shell::exiting(app) {
+        opened.close().await;
+        return Err(LaunchError::Exiting);
+    }
 
     // 後半（`OpenedEngine::start`）: サービス・監査の保留の流し込み・
     // 監査ログの剪定 → Hub（`attach_registry`）→ 収集（`attach_hub` は
@@ -4510,16 +4554,37 @@ async fn launch_desktop(
     // changes.
     let initial_auth = initial_desktop_session(&services, &auth_config).await;
 
-    app.manage(AppState {
-        auth: Mutex::new(AuthSlot::new(initial_auth)),
-        auth_io: AuthIo::production(&services.users, &services.settings),
-        auth_config_lock: AsyncMutex::new(()),
-        server: Arc::clone(engine.server_slot()),
-        services: services.clone(),
-    });
     // 終了の後始末（[`exit_cleanup`]）がエンジンを止める。プロセスの
     // 終わりまで drop されない（A1 の排他もそこまで持つ）。
-    app.manage(DesktopEngine(Arc::new(engine)));
+    // #392 B2-4c: 置くのはシェルの終了の扉と同じロックの中（`ShellGate::admit`）。
+    // 扉が既に閉じていたら置かずに、ここで止める（後始末はもう始まっていて、この
+    // エンジンを見ない。banto-hub の `discard_started_hub` と同じ考え）。
+    let engine = Arc::new(engine);
+    let install = || {
+        app.manage(AppState {
+            auth: Mutex::new(AuthSlot::new(initial_auth)),
+            auth_io: AuthIo::production(&services.users, &services.settings),
+            auth_config_lock: AsyncMutex::new(()),
+            server: Arc::clone(engine.server_slot()),
+            services: services.clone(),
+        });
+        app.manage(DesktopEngine(Arc::clone(&engine)));
+    };
+    let admitted = match app.try_state::<shell::ShellState>() {
+        Some(shell) => shell.gate.admit(install),
+        None => {
+            install();
+            true
+        }
+    };
+    if !admitted {
+        eprintln!("banto: 終了処理中のため、起動し終えた記録エンジンを使わずに停止します");
+        let report = shutdown_app_state(&engine, EXIT_CLEANUP_BUDGET).await;
+        if report != ExitCleanupReport::default() {
+            eprintln!("banto: 起動し終えた記録エンジンの停止: {report:?}");
+        }
+        return Err(LaunchError::Exiting);
+    }
 
     // メインの窓は tauri.conf.json で `create: false` にしてあり、エンジンが
     // 動いた後にだけここで作る（上の doc「順序」）。設定は tauri.conf.json の
@@ -4650,25 +4715,14 @@ pub fn run() {
             // 決められない・作れないときは「終了」だけの窓。
             // #392 B2-4b: データのルート（既定 `%ProgramData%\ChronoGazer`、
             // `CHRONOGAZER_ROOT` で上書き）。使えない・作れないときも「終了」だけの窓。
-            let paths = match startup::LaunchPaths::resolve() {
-                Ok(paths) => paths,
-                Err(detail) => {
-                    startup::show_fatal(&handle, detail);
-                    return Ok(());
-                }
-            };
-            // 起動の本体（[`launch_desktop`]）。失敗は、既に起動中（A1）・旧形式の
-            // DB なら今までのエラーの窓、それ以外は対処を選ぶ窓
+            // #392 B2-4c: SCM と health を見て、サービスへつなぐ・プロセスの中で
+            // 起動する（[`launch_desktop`]、今までの起動）・接続できない状態を見せる、の
+            // どれかで始める（[`shell::start`]）。Desktop の起動の失敗は、既に起動中
+            // （A1）・旧形式の DB なら今までのエラーの窓、それ以外は対処を選ぶ窓
             // （[`startup::show_failure`]）。どちらの窓もコマンドを呼ばない静的
             // ページで、`AppState` は manage しない - 閉じると最後の窓なので
             // プロセスが終わる（`RunEvent::Exit` の後始末は `try_state` で何もしない）。
-            if let Err(err) = tauri::async_runtime::block_on(launch_desktop(
-                &handle,
-                &paths,
-                startup::Prelude::None,
-            )) {
-                startup::show_failure(&handle, &paths, err);
-            }
+            shell::start(&handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

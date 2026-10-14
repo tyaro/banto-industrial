@@ -65,6 +65,10 @@ keyring = { workspace = true }
 # engine (`desktop_key_store` in `src/lib.rs`, opened by
 # `chronogazer_core::key_store::open_key_store`).
 banto-hub-bootstrap = { path = "../../../crates/banto-hub-bootstrap" }
+# #392 B2-4c: シェルの起動判定・見張りで SCM を照会する（`shell::observe_scm` が
+# `WindowsServiceManager` を作る）。`chronogazer-core` が既に使っている同じ path crate
+# で、Cargo.lock にパッケージは増えない。
+banto-service-control = { path = "../../../crates/banto-service-control" }
 
 # `#[tokio::test]` for this crate's own unit tests (spec M14: the
 # `change_own_password` audit-recording test) - the runtime/macros features

@@ -102,19 +102,12 @@ impl LaunchPaths {
         }
     }
 
-    /// 環境（`CHRONOGAZER_ROOT`、無ければ `%ProgramData%\ChronoGazer`）からルートを
-    /// 決め、確かめて、無ければ作る（[`Self::prepare`]）。
-    pub(crate) fn resolve() -> Result<Self, String> {
-        Self::prepare(layout_from_vars(|name| std::env::var(name).ok()))
-    }
-
     /// ルートを確かめ（絶対パスで、`.`・`..` を含まない。`chronogazer-server` と同じ
     /// `validate_root`）、無ければ保護された DACL で作る（O6、
     /// `chronogazer_core::paths::create_root_dir`。既にあるルートには触らない）。
     /// どちらの失敗も「終了」だけの窓に出す文言で返す（ルートの下には何も作らない）。
     pub(crate) fn prepare(layout: DataLayout) -> Result<Self, String> {
-        validate_root(layout.root())
-            .map_err(|err| format!("データの置き場所を使えません: {err}"))?;
+        check_root(&layout)?;
         create_root_dir(&layout).map_err(|err| {
             format!(
                 "データの置き場所（{}）を作れませんでした: {err}",
@@ -123,6 +116,20 @@ impl LaunchPaths {
         })?;
         Ok(Self::from_layout(layout))
     }
+}
+
+/// 環境（`CHRONOGAZER_ROOT`、無ければ `%ProgramData%\ChronoGazer`）からルートの配置を
+/// 決める（ファイルシステムには触れない）。#392 B2-4c: シェルは起動判定（SCM・probe）の
+/// 前にこれで配置だけを決め、[`check_root`] で確かめる。ルートを作る
+/// （[`LaunchPaths::prepare`]）のは Desktop に決まったときだけ（サービスへつなぐ・
+/// fallback ではルートを作らない - probe も無いルートを作らない、`service_probe` の doc）。
+pub(crate) fn layout_from_env() -> DataLayout {
+    layout_from_vars(|name| std::env::var(name).ok())
+}
+
+/// ルートを確かめるだけ（作らない。`validate_root`、[`LaunchPaths::prepare`] と同じ文言）。
+pub(crate) fn check_root(layout: &DataLayout) -> Result<(), String> {
+    validate_root(layout.root()).map_err(|err| format!("データの置き場所を使えません: {err}"))
 }
 
 /// 環境変数の読み方を受けてルートの配置を決める（純関数。テストは読み方を差し替える）。
@@ -176,6 +183,9 @@ pub(crate) enum LaunchError {
     Recovery(RecoveryError),
     /// エンジンは動いたが画面（メインの窓・トレイ）を作れなかった。
     Window(tauri::Error),
+    /// 終了処理に入っていたので起動しなかった・起動し終えたエンジンを置かずに止めた
+    /// （#392 B2-4c、`crate::shell::ShellGate`）。呼び出し側は窓を出さない。
+    Exiting,
 }
 
 impl std::fmt::Display for LaunchError {
@@ -185,6 +195,7 @@ impl std::fmt::Display for LaunchError {
             Self::Settings(err) => write!(f, "設定の読み取りに失敗しました: {err}"),
             Self::Recovery(err) => err.fmt(f),
             Self::Window(err) => write!(f, "画面を作れませんでした: {err}"),
+            Self::Exiting => write!(f, "終了処理中のため、記録エンジンを起動しませんでした"),
         }
     }
 }
@@ -195,7 +206,9 @@ fn kind_of(err: &LaunchError) -> FailureKind {
     match err {
         LaunchError::Engine(err) => recovery::classify(err),
         LaunchError::Settings(err) => recovery::classify_settings_error(err),
-        LaunchError::Recovery(_) | LaunchError::Window(_) => FailureKind::Other,
+        LaunchError::Recovery(_) | LaunchError::Window(_) | LaunchError::Exiting => {
+            FailureKind::Other
+        }
     }
 }
 
@@ -451,6 +464,11 @@ impl RecoveryGate {
 
 /// 起動の失敗を窓で知らせる（`setup()` の最初の起動から）。
 pub(crate) fn show_failure(app: &AppHandle, paths: &LaunchPaths, err: LaunchError) {
+    // #392 B2-4c: 終了処理中なら窓を出さない（プロセスが終わる）。
+    if matches!(err, LaunchError::Exiting) {
+        eprintln!("banto: {err}");
+        return;
+    }
     eprintln!("banto: 起動に失敗しました: {err}");
     // 既に起動中・旧形式の DB は今までのエラーの窓のまま。
     match &err {
@@ -706,7 +724,22 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
         }
     };
 
+    // #392 B2-4c: やり直しの起動はシェルの移り変わりとして行う（終了処理は、その
+    // 終わりを待ってからエンジンを探す。`crate::shell` のモジュール doc「並行」）。
+    // 終了に入っていたら起動しない（窓は処理中のまま。プロセスが終わる）。
+    let _transition = match app.try_state::<crate::shell::ShellState>() {
+        Some(shell) => match shell.gate.begin_transition() {
+            Ok(guard) => Some(guard),
+            Err(refused) => {
+                eprintln!("banto: 対処の後の起動を行いません（{refused:?}）");
+                return;
+            }
+        },
+        None => None,
+    };
     match crate::launch_desktop(&app, &paths, prelude).await {
+        // 終了処理に入った: 何も出さない（プロセスが終わる）。
+        Err(LaunchError::Exiting) => {}
         Ok(()) => {
             *app.state::<RecoveryGate>().lock() = None;
             if let Some(window) = app.get_webview_window(RECOVERY_WINDOW_LABEL) {

@@ -53,6 +53,25 @@
 //!   おり（`CollectorService::stop` の doc）、DB プールは既に閉じている。
 //! - **終了処理中は窓を開かない**: 閉じた DB の上で画面を操作させないため、
 //!   終了処理に入ったら窓を隠し、「開く」・左クリック・2 つ目の起動を無視する。
+//!
+//! # 3 つの態（#392 B2-4c、[`TrayMode`]・[`menu_spec`]）
+//!
+//! シェルの画面（[`crate::shell`]）に合わせてメニューを変える。トレイは 1 つだけで、
+//! 画面が変わったら作り直さずにメニューと tooltip を差し替える（[`refresh`]。
+//! [`install`] も 2 回目以降は差し替えるだけ）。
+//!
+//! | 態       | 1 行目（押せない）                     | 項目                                 |
+//! | -------- | -------------------------------------- | ------------------------------------ |
+//! | Desktop  | 収集の状態（A2 のまま）                | 開く・終了                           |
+//! | Service  | 「サービス: 実行中」                   | 開く・終了（サービスは止まりません） |
+//! | Fallback | 「サービス: <状態>（接続できません）」 | 開く・再試行・終了                   |
+//!
+//! サービスの開始・停止はトレイに出さない（O4、B2-5）。Service の「終了」は確認の文で
+//! 「サービスは止まらず収集を続ける」と知らせる。Fallback の「終了」は止めるものが
+//! 無いので確認しない（**判断**。ただし確認の答えと同じ受付（[`QuitGate`]）を通すので、
+//! 「再試行」で Desktop が起動し終えて収集中になっていれば、収集中の文言で確かめ直す）。
+//! どの態でも終了処理は [`crate::exit_cleanup`] を通る（シェルの移り変わりの終わりを
+//! 待ち、エンジンがあれば止める）。
 
 use std::time::Duration;
 
@@ -66,6 +85,7 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
+use crate::shell::{FALLBACK_WINDOW_LABEL, SERVICE_WINDOW_LABEL};
 use crate::startup::RECOVERY_WINDOW_LABEL;
 use crate::{AppState, ExitCleanupReport, ExitTrigger, LEGACY_DB_WINDOW_LABEL, MAIN_WINDOW_LABEL};
 
@@ -83,6 +103,112 @@ pub(crate) const TRAY_HINT: TrayHint = TrayHint {
     title: "ChronoGazer",
     body: "ChronoGazer はタスクトレイで動作を続けます（収集も続きます）。終了するにはトレイのアイコンを右クリックして「終了」を選んでください。",
 };
+
+/// サービスの画面の × で隠した初回の通知（印は [`TRAY_HINT`] と共有 = 利用者ごとに
+/// 1 回だけ）。収集を続けるのはサービスなので、そう書く。
+pub(crate) const SERVICE_TRAY_HINT: TrayHint = TrayHint {
+    flag_file_name: TRAY_HINT.flag_file_name,
+    title: "ChronoGazer",
+    body: "ChronoGazer の画面はタスクトレイに格納されました（記録エンジンのサービスは収集を続けます）。終了するにはトレイのアイコンを右クリックして「終了」を選んでください。",
+};
+
+/// 接続できない状態の窓の × で隠した初回の通知（印は [`TRAY_HINT`] と共有）。
+pub(crate) const FALLBACK_TRAY_HINT: TrayHint = TrayHint {
+    flag_file_name: TRAY_HINT.flag_file_name,
+    title: "ChronoGazer",
+    body: "ChronoGazer はタスクトレイで動作を続けます（サービスに接続できるようになると自動でつなぎます）。終了するにはトレイのアイコンを右クリックして「終了」を選んでください。",
+};
+
+/// トレイの態（モジュール doc「3 つの態」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrayMode {
+    /// プロセスの中でエンジンを動かしている（A2 のまま）。
+    Desktop,
+    /// サービスの画面へつないでいる。
+    Service,
+    /// 接続できない状態を見せている（`scm` は SCM の状態の短い文言）。
+    Fallback { scm: String },
+}
+
+/// メニューの 1 項目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MenuEntry {
+    /// 押せない状態の行（tooltip にも使う）。
+    Status(String),
+    Separator,
+    Item {
+        id: &'static str,
+        text: &'static str,
+    },
+}
+
+/// メニューの組み立て（純関数。モジュール doc の表）。`label` は Desktop の収集の
+/// 状態の文言（ほかの態では使わない - このプロセスは収集していない）。
+pub(crate) fn menu_spec(mode: &TrayMode, label: &str) -> Vec<MenuEntry> {
+    let open = MenuEntry::Item {
+        id: "open",
+        text: "開く",
+    };
+    match mode {
+        TrayMode::Desktop => vec![
+            MenuEntry::Status(label.to_string()),
+            MenuEntry::Separator,
+            open,
+            MenuEntry::Item {
+                id: "quit",
+                text: "終了",
+            },
+        ],
+        TrayMode::Service => vec![
+            MenuEntry::Status("サービス: 実行中".to_string()),
+            MenuEntry::Separator,
+            open,
+            MenuEntry::Item {
+                id: "quit",
+                text: "終了（サービスは止まりません）",
+            },
+        ],
+        TrayMode::Fallback { scm } => vec![
+            MenuEntry::Status(format!("サービス: {scm}（接続できません）")),
+            MenuEntry::Separator,
+            open,
+            MenuEntry::Item {
+                id: "retry",
+                text: "再試行",
+            },
+            MenuEntry::Item {
+                id: "quit",
+                text: "終了",
+            },
+        ],
+    }
+}
+
+/// メニューの 1 行目（tooltip に出す）。
+fn status_of(spec: &[MenuEntry]) -> &str {
+    spec.iter()
+        .find_map(|entry| match entry {
+            MenuEntry::Status(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or("")
+}
+
+/// 終了の前に確認するか（Fallback は止めるものが無いので確認しない）。
+pub(crate) fn needs_quit_confirm(mode: &TrayMode) -> bool {
+    !matches!(mode, TrayMode::Fallback { .. })
+}
+
+/// 態に合わせた終了の確認の本文。Desktop と、収集中で確かめ直すときは
+/// [`quit_prompt_message`]。
+pub(crate) fn quit_prompt_for(mode: &TrayMode, collecting: bool) -> &'static str {
+    match mode {
+        TrayMode::Service if !collecting => {
+            "ChronoGazer の画面を終了します。記録エンジン（サービス）は止まらず、収集を続けます。よろしいですか?"
+        }
+        _ => quit_prompt_message(collecting),
+    }
+}
 
 /// トレイの状態表示を読み直す間隔。読むのはメモリ上の状態だけ
 /// （`CollectorService::state` はネットワークもディスクも DB も触らない）で、
@@ -175,10 +301,18 @@ pub(crate) fn cleanup_failure_message(report: &ExitCleanupReport) -> Option<Stri
 /// トレイを作って管理状態に入れ、状態表示の見張りを起こす。起動
 /// （[`crate::launch_desktop`]）の最後（`AppState` を manage した後）に 1 回だけ
 /// 呼ぶ。失敗は起動の失敗としてエラーの窓に出る（#392、panic しない）。
+///
+/// #392 B2-4c: シェルの態（[`TrayMode`]）に合わせて作る。Service・Fallback の起動では
+/// 窓より先に作る。2 回目以降（Fallback の「再試行」で Desktop が起動した）は
+/// 作り直さず、今の態に差し替えるだけ。
 pub(crate) fn install(app: &AppHandle) -> tauri::Result<()> {
+    if installed(app) {
+        refresh(app);
+        return Ok(());
+    }
     let handle = app;
-    let label = current_label(handle);
-    let menu = build_menu(handle, &label)?;
+    let spec = current_spec(handle);
+    let menu = build_menu(handle, &spec)?;
     // 左クリックは窓を戻す（メニューは右クリック）。
     let builder = TrayIconBuilder::new()
         .icon(app.default_window_icon().cloned().ok_or_else(|| {
@@ -186,10 +320,11 @@ pub(crate) fn install(app: &AppHandle) -> tauri::Result<()> {
             // 起きないはずだが、起きても panic せずに起動の失敗として知らせる。
             tauri::Error::AssetNotFound("既定のウィンドウアイコン".to_string())
         })?)
-        .tooltip(tooltip_text(&label))
+        .tooltip(tooltip_text(status_of(&spec)))
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => open_main_window(app),
+            "retry" => crate::shell::request_retry(app),
             "quit" => request_quit(app),
             _ => {}
         });
@@ -199,8 +334,24 @@ pub(crate) fn install(app: &AppHandle) -> tauri::Result<()> {
     // 管理状態で持つ（banto-hub と同じ）。
     app.manage(tray);
 
-    tauri::async_runtime::spawn(watch_status(handle.clone(), label));
+    tauri::async_runtime::spawn(watch_status(handle.clone(), spec));
     Ok(())
+}
+
+/// トレイを作ってあるか。
+pub(crate) fn installed(app: &AppHandle) -> bool {
+    app.try_state::<TrayIcon<Wry>>().is_some()
+}
+
+/// 今の態でメニューと tooltip を差し替える（シェルの画面が変わったとき）。終了処理に
+/// 入っていたら「終了処理中」を上書きしない。
+pub(crate) fn refresh(app: &AppHandle) {
+    let spec = current_spec(app);
+    let _guard = TRAY_LABEL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    if quitting(app) {
+        return;
+    }
+    apply_spec(app, &spec);
 }
 
 /// 窓を戻す（トレイの「開く」・左クリック・2 つ目の起動）。終了処理に
@@ -212,10 +363,13 @@ pub(crate) fn open_main_window(app: &AppHandle) {
     }
     // 起動を止めたときのエラーの窓（旧形式の DB・既に起動中、#392 の対処の窓）も
     // 2 つ目の起動で前に出す。
+    // #392 B2-4c: サービスの画面・接続できない状態の窓も（同時にあるのは 1 種類）。
     banto_desktop_tray::show_window(
         app,
         &[
             MAIN_WINDOW_LABEL,
+            SERVICE_WINDOW_LABEL,
+            FALLBACK_WINDOW_LABEL,
             LEGACY_DB_WINDOW_LABEL,
             RECOVERY_WINDOW_LABEL,
         ],
@@ -245,36 +399,51 @@ fn currently_collecting(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn build_menu(app: &AppHandle, label: &str) -> tauri::Result<Menu<Wry>> {
-    let status = MenuItemBuilder::with_id("status", label)
-        .enabled(false)
-        .build(app)?;
-    MenuBuilder::new(app)
-        .item(&status)
-        .separator()
-        .text("open", "開く")
-        .text("quit", "終了")
-        .build()
+/// 今の態と収集の状態からメニューを組む。
+fn current_spec(app: &AppHandle) -> Vec<MenuEntry> {
+    menu_spec(&crate::shell::current_tray_mode(app), &current_label(app))
 }
 
-fn apply_label(app: &AppHandle, label: &str) {
+fn build_menu(app: &AppHandle, spec: &[MenuEntry]) -> tauri::Result<Menu<Wry>> {
+    let mut builder = MenuBuilder::new(app);
+    for entry in spec {
+        builder = match entry {
+            MenuEntry::Status(text) => {
+                let status = MenuItemBuilder::with_id("status", text)
+                    .enabled(false)
+                    .build(app)?;
+                builder.item(&status)
+            }
+            MenuEntry::Separator => builder.separator(),
+            MenuEntry::Item { id, text } => builder.text(*id, *text),
+        };
+    }
+    builder.build()
+}
+
+fn apply_spec(app: &AppHandle, spec: &[MenuEntry]) {
     let Some(tray) = app.try_state::<TrayIcon<Wry>>() else {
         return;
     };
-    let _ = tray.set_tooltip(Some(tooltip_text(label)));
-    if let Ok(menu) = build_menu(app, label) {
+    let _ = tray.set_tooltip(Some(tooltip_text(status_of(spec))));
+    if let Ok(menu) = build_menu(app, spec) {
         let _ = tray.set_menu(Some(menu));
     }
+}
+
+/// 状態の行だけのメニュー（「終了処理中…」）。
+fn apply_label(app: &AppHandle, label: &str) {
+    apply_spec(app, &[MenuEntry::Status(label.to_string())]);
 }
 
 /// 収集の状態をトレイへ映す見張り。`install` から 1 回だけ起こす（二重起動
 /// しない）。文言が変わったときだけトレイを書き換える。終了処理に入ったら
 /// 抜ける（「終了処理中」の表示を上書きしないため）。プロセスが終われば
 /// ランタイムごと消える。
-async fn watch_status(app: AppHandle, mut shown: String) {
+async fn watch_status(app: AppHandle, mut shown: Vec<MenuEntry>) {
     loop {
         tokio::time::sleep(STATUS_POLL_INTERVAL).await;
-        let label = current_label(&app);
+        let spec = current_spec(&app);
         // 「終了中か」の確認と書き換えを、`quit` の「終了処理中」の書き換えと
         // 同じロックの中で行う - 確認の直後に終了へ入られても、古い状態で
         // 「終了処理中」を上書きしない。
@@ -282,9 +451,9 @@ async fn watch_status(app: AppHandle, mut shown: String) {
         if quitting(&app) {
             break;
         }
-        if label != shown {
-            apply_label(&app, &label);
-            shown = label;
+        if spec != shown {
+            apply_spec(&app, &spec);
+            shown = spec;
         }
     }
 }
@@ -293,13 +462,20 @@ async fn watch_status(app: AppHandle, mut shown: String) {
 /// （[`watch_status`] の注記）。
 static TRAY_LABEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// トレイの「終了」。
-fn request_quit(app: &AppHandle) {
+/// トレイの「終了」（#392 B2-4c からは接続できない状態の窓の「終了」も）。
+pub(crate) fn request_quit(app: &AppHandle) {
     let Some(gate) = app.try_state::<QuitGate>() else {
         return;
     };
     match gate.request() {
-        QuitRequestDecision::ShowPrompt => prompt_quit(app, currently_collecting(app)),
+        QuitRequestDecision::ShowPrompt => {
+            if needs_quit_confirm(&crate::shell::current_tray_mode(app)) {
+                prompt_quit(app, currently_collecting(app));
+            } else {
+                // 確認しない態（Fallback）: 同意したものとして同じ受付を通す。
+                on_quit_answer(app.clone(), true, false);
+            }
+        }
         // 確認ダイアログは出ている／終了処理は走っている - どちらも 2 つ目は
         // 作らない。
         QuitRequestDecision::AlreadyConfirming | QuitRequestDecision::AlreadyQuitting => {}
@@ -308,44 +484,54 @@ fn request_quit(app: &AppHandle) {
 
 fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
     let app_for_answer = app.clone();
+    let mode = crate::shell::current_tray_mode(app);
     banto_desktop_tray::ask_confirm(
         app,
         ConfirmPrompt {
             title: "ChronoGazer を終了",
-            message: quit_prompt_message(prompted_collecting),
+            message: quit_prompt_for(&mode, prompted_collecting),
             ok_label: "終了",
             cancel_label: "キャンセル",
         },
-        move |confirmed| {
-            let app = app_for_answer;
-            let Some(gate) = app.try_state::<QuitGate>() else {
-                return;
-            };
-            let admission = CollectorQuitAdmission(
-                app.try_state::<AppState>()
-                    .map(|state| state.services.collect.clone()),
-            );
-            match gate.answer(confirmed, prompted_collecting, &admission) {
-                QuitAnswerDecision::Proceed => quit(app.clone()),
-                QuitAnswerDecision::AskAgain => prompt_quit(&app, true),
-                QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {}
-            }
-        },
+        move |confirmed| on_quit_answer(app_for_answer, confirmed, prompted_collecting),
     );
+}
+
+/// 確認の答え（確認しない態では「同意」として直接呼ぶ）。
+fn on_quit_answer(app: AppHandle, confirmed: bool, prompted_collecting: bool) {
+    let Some(gate) = app.try_state::<QuitGate>() else {
+        return;
+    };
+    let admission = CollectorQuitAdmission(
+        app.try_state::<AppState>()
+            .map(|state| state.services.collect.clone()),
+    );
+    match gate.answer(confirmed, prompted_collecting, &admission) {
+        QuitAnswerDecision::Proceed => quit(app.clone()),
+        QuitAnswerDecision::AskAgain => prompt_quit(&app, true),
+        QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {}
+    }
 }
 
 /// 確認を通った後の終了。窓を隠し、トレイを「終了処理中」にしてから、
 /// 既存の終了処理を 1 回だけ通す。済まなかったことがあれば知らせてから
 /// 終了する。
 fn quit(app: AppHandle) {
-    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        let _ = window.hide();
+    for label in [
+        MAIN_WINDOW_LABEL,
+        SERVICE_WINDOW_LABEL,
+        FALLBACK_WINDOW_LABEL,
+    ] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.hide();
+        }
     }
     {
         let _guard = TRAY_LABEL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         apply_label(&app, "終了処理中…");
     }
-    // 後始末（[`crate::exit_cleanup`]）は完了を条件変数で**ブロックして**待つ
+    // 後始末（[`crate::exit_cleanup`]）は、シェルの移り変わり（「再試行」の Desktop の
+    // 起動）の終わりと後始末の完了を条件変数で**ブロックして**待つ
     // （本体は共有の `ExitCleanupOnce` の専用スレッドで走る）ので、tokio の
     // ワーカーを塞がないよう専用のスレッドから呼ぶ（#392 B1-2）。
     std::thread::spawn(move || {
@@ -431,6 +617,82 @@ mod tests {
     fn quit_prompt_mentions_stopping_only_when_collecting() {
         assert!(quit_prompt_message(true).contains("収集を停止"));
         assert!(!quit_prompt_message(false).contains("収集"));
+    }
+
+    fn items(spec: &[MenuEntry]) -> Vec<(&'static str, &'static str)> {
+        spec.iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Item { id, text } => Some((*id, *text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #392 B2-4c: 3 つの態のメニュー（モジュール doc の表）。Desktop は A2 のまま。
+    #[test]
+    fn menu_spec_per_mode() {
+        let desktop = menu_spec(&TrayMode::Desktop, "収集停止中");
+        assert_eq!(desktop[0], MenuEntry::Status("収集停止中".to_string()));
+        assert_eq!(desktop[1], MenuEntry::Separator);
+        assert_eq!(items(&desktop), vec![("open", "開く"), ("quit", "終了")]);
+        assert_eq!(
+            tooltip_text(status_of(&desktop)),
+            "ChronoGazer — 収集停止中"
+        );
+
+        // Service は収集の状態を出さない（このプロセスは収集していない）。
+        let service = menu_spec(&TrayMode::Service, "収集停止中");
+        assert_eq!(
+            service[0],
+            MenuEntry::Status("サービス: 実行中".to_string())
+        );
+        assert_eq!(
+            items(&service),
+            vec![("open", "開く"), ("quit", "終了（サービスは止まりません）")]
+        );
+        // サービスの開始・停止は出さない（O4）。
+        assert_eq!(items(&service).len(), 2);
+
+        let fallback = menu_spec(
+            &TrayMode::Fallback {
+                scm: "開始中".to_string(),
+            },
+            "x",
+        );
+        assert_eq!(
+            fallback[0],
+            MenuEntry::Status("サービス: 開始中（接続できません）".to_string())
+        );
+        assert_eq!(
+            items(&fallback),
+            vec![("open", "開く"), ("retry", "再試行"), ("quit", "終了")]
+        );
+    }
+
+    /// 終了の確認: Desktop は A2 のまま、Service はサービスが止まらないこと、Fallback は
+    /// 確認しない。
+    #[test]
+    fn quit_prompt_per_mode() {
+        assert_eq!(
+            quit_prompt_for(&TrayMode::Desktop, true),
+            quit_prompt_message(true)
+        );
+        assert_eq!(
+            quit_prompt_for(&TrayMode::Desktop, false),
+            quit_prompt_message(false)
+        );
+        let service = quit_prompt_for(&TrayMode::Service, false);
+        assert!(service.contains("止まらず"), "{service}");
+        // 収集中で確かめ直すとき（「再試行」で Desktop が動き出した）は収集中の文言。
+        assert_eq!(
+            quit_prompt_for(&TrayMode::Service, true),
+            quit_prompt_message(true)
+        );
+        assert!(needs_quit_confirm(&TrayMode::Desktop));
+        assert!(needs_quit_confirm(&TrayMode::Service));
+        assert!(!needs_quit_confirm(&TrayMode::Fallback {
+            scm: "停止".into()
+        }));
     }
 
     /// 終了処理の結果: 問題が無ければ黙って終わり、最終 flush の失敗・予算切れは
