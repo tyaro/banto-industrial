@@ -655,6 +655,36 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
         session.paths.clone()
     };
 
+    // #392 B2-4c（PR #608 のオーナーレビュー P2）: DB のファイルの名前を変える対処
+    // （作り直す・バックアップから戻す）は、受け付けた時点から起動のやり直しの終わり
+    // （失敗なら巻き戻しの終わり）まで、シェルの復旧の札を持つ。その間のトレイの
+    // 「終了」は断られる（`crate::shell` のモジュール doc「DB の復旧の途中は終了させ
+    // ない」）。終了の予約・終了の後なら対処を始めない。
+    let renames_files = matches!(
+        choice,
+        RecoveryChoice::RecreateDatabase | RecoveryChoice::RestoreBackup
+    );
+    let mut recovery_guard = None;
+    if renames_files {
+        if let Some(shell) = app.try_state::<crate::shell::ShellState>() {
+            match shell.gate.begin_recovery() {
+                Ok(guard) => recovery_guard = Some(guard),
+                Err(refused) => {
+                    eprintln!("banto: 対処を始めません（{refused:?}）");
+                    rerender_with_notice(
+                        &app,
+                        Some(
+                            "終了処理中、または別の処理の途中のため、この対処を始めませんでした。"
+                                .to_string(),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+
     let prelude = match choice {
         // 何も変えずにやり直す（保存先の試し書きもやり直す）／既定の場所に戻す。
         RecoveryChoice::RetryStoreCheck | RecoveryChoice::ResetStoreDir => {
@@ -727,15 +757,17 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
     // #392 B2-4c: やり直しの起動はシェルの移り変わりとして行う（終了処理は、その
     // 終わりを待ってからエンジンを探す。`crate::shell` のモジュール doc「並行」）。
     // 終了に入っていたら起動しない（窓は処理中のまま。プロセスが終わる）。
-    let _transition = match app.try_state::<crate::shell::ShellState>() {
-        Some(shell) => match shell.gate.begin_transition() {
+    // 復旧の札を持っていればそれを、無ければここで移り変わりの札を取る。
+    let _transition = match (recovery_guard, app.try_state::<crate::shell::ShellState>()) {
+        (Some(guard), _) => Some(guard),
+        (None, Some(shell)) => match shell.gate.begin_transition() {
             Ok(guard) => Some(guard),
             Err(refused) => {
                 eprintln!("banto: 対処の後の起動を行いません（{refused:?}）");
                 return;
             }
         },
-        None => None,
+        (None, None) => None,
     };
     match crate::launch_desktop(&app, &paths, prelude).await {
         // 終了処理に入った: 何も出さない（プロセスが終わる）。

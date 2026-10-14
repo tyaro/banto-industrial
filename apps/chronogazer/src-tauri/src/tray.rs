@@ -469,6 +469,14 @@ pub(crate) fn request_quit(app: &AppHandle) {
     };
     match gate.request() {
         QuitRequestDecision::ShowPrompt => {
+            // DB の復旧の途中なら確認も出さずに断る（確定の時点でも確かめ直す -
+            // [`confirm_quit`]）。
+            if crate::shell::recovering(app) {
+                let admission = CollectorQuitAdmission(None);
+                let _ = gate.answer(false, false, &admission);
+                tell_quit_refused(app);
+                return;
+            }
             if needs_quit_confirm(&crate::shell::current_tray_mode(app)) {
                 prompt_quit(app, currently_collecting(app));
             } else {
@@ -506,11 +514,74 @@ fn on_quit_answer(app: AppHandle, confirmed: bool, prompted_collecting: bool) {
         app.try_state::<AppState>()
             .map(|state| state.services.collect.clone()),
     );
-    match gate.answer(confirmed, prompted_collecting, &admission) {
-        QuitAnswerDecision::Proceed => quit(app.clone()),
-        QuitAnswerDecision::AskAgain => prompt_quit(&app, true),
-        QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {}
+    let step = confirm_quit(
+        confirmed,
+        || crate::shell::reserve_quit(&app),
+        || crate::shell::release_quit(&app),
+        |confirmed| gate.answer(confirmed, prompted_collecting, &admission),
+    );
+    match step {
+        QuitStep::Proceed => quit(app.clone()),
+        QuitStep::AskAgain => prompt_quit(&app, true),
+        QuitStep::Refused => tell_quit_refused(&app),
+        QuitStep::Nothing => {}
     }
+}
+
+/// 確認の答えの後にすること（[`confirm_quit`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitStep {
+    /// 終了処理へ進む（終了の予約は持ったまま。扉は後始末が閉じる）。
+    Proceed,
+    /// 収集中の文言で確かめ直す（予約は下ろした）。
+    AskAgain,
+    /// DB の復旧の途中なので断った（確認の段階は戻した）。
+    Refused,
+    /// 取り消し・遅れて届いた答え（予約は下ろした）。
+    Nothing,
+}
+
+/// 確認の答えを、シェルの終了の予約と合わせて確定する（PR #608 のオーナーレビュー
+/// P2）。同意なら**先に**終了を予約し（`reserve`。DB の復旧の途中なら断られる）、
+/// 断られたら答えを「取り消し」として渡して確認の段階を戻す（`app.exit` へ進まない）。
+/// 予約できたら答えを渡し、終了へ進まなかったら予約を下ろす（`release`）。`answer` は
+/// `QuitGate::answer`（引数は渡す「同意」）。
+pub(crate) fn confirm_quit(
+    confirmed: bool,
+    reserve: impl FnOnce() -> Result<(), crate::shell::QuitRefused>,
+    release: impl FnOnce(),
+    answer: impl FnOnce(bool) -> QuitAnswerDecision,
+) -> QuitStep {
+    if !confirmed {
+        let _ = answer(false);
+        return QuitStep::Nothing;
+    }
+    if reserve().is_err() {
+        let _ = answer(false);
+        return QuitStep::Refused;
+    }
+    match answer(true) {
+        QuitAnswerDecision::Proceed => QuitStep::Proceed,
+        QuitAnswerDecision::AskAgain => {
+            release();
+            QuitStep::AskAgain
+        }
+        QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {
+            release();
+            QuitStep::Nothing
+        }
+    }
+}
+
+/// 終了を断ったことを知らせる。
+fn tell_quit_refused(app: &AppHandle) {
+    eprintln!("banto: データベースの復旧の途中のため、トレイの終了を断りました");
+    app.dialog()
+        .message(crate::shell::RECOVERY_IN_PROGRESS_MESSAGE)
+        .title("ChronoGazer を終了")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCustom("OK".to_string()))
+        .show(|_| {});
 }
 
 /// 確認を通った後の終了。窓を隠し、トレイを「終了処理中」にしてから、
@@ -666,6 +737,79 @@ mod tests {
         assert_eq!(
             items(&fallback),
             vec![("open", "開く"), ("retry", "再試行"), ("quit", "終了")]
+        );
+    }
+
+    struct NotBusy;
+    impl QuitAdmission for NotBusy {
+        fn begin_quit_confirm(&self) -> bool {
+            false
+        }
+        fn cancel_quit_confirm(&self) {}
+    }
+
+    /// PR #608 のオーナーレビュー P2: DB の復旧の途中に確定した「終了」は断られ、
+    /// 終了処理（`app.exit`）へ進まず、確認の段階も戻る。復旧が終われば通る。
+    #[test]
+    fn quit_confirmed_during_recovery_is_refused_then_allowed_after() {
+        use crate::shell::{ShellGate, ShellView};
+        let shell = ShellGate::new(ShellView::Desktop);
+        let quit_gate = QuitGate::new();
+        let recovery = shell.begin_recovery().expect("recovery");
+
+        assert_eq!(quit_gate.request(), QuitRequestDecision::ShowPrompt);
+        let step = confirm_quit(
+            true,
+            || shell.reserve_quit(),
+            || shell.release_quit(),
+            |confirmed| quit_gate.answer(confirmed, false, &NotBusy),
+        );
+        assert_eq!(step, QuitStep::Refused);
+        assert_eq!(quit_gate.phase(), QuitPhase::Idle);
+        assert!(!shell.is_exiting());
+
+        drop(recovery);
+        assert_eq!(quit_gate.request(), QuitRequestDecision::ShowPrompt);
+        let step = confirm_quit(
+            true,
+            || shell.reserve_quit(),
+            || shell.release_quit(),
+            |confirmed| quit_gate.answer(confirmed, false, &NotBusy),
+        );
+        assert_eq!(step, QuitStep::Proceed);
+        assert_eq!(quit_gate.phase(), QuitPhase::Quitting);
+        // 予約は持ったまま: この後の新しい復旧は始まらない。
+        assert!(shell.begin_recovery().is_err());
+    }
+
+    /// 取り消し・確かめ直しでは予約を下ろす（復旧を塞ぎ続けない）。
+    #[test]
+    fn quit_reservation_is_released_unless_proceeding() {
+        use crate::shell::{ShellGate, ShellView};
+        let shell = ShellGate::new(ShellView::Desktop);
+        let quit_gate = QuitGate::new();
+        quit_gate.request();
+        let step = confirm_quit(
+            false,
+            || shell.reserve_quit(),
+            || shell.release_quit(),
+            |confirmed| quit_gate.answer(confirmed, false, &NotBusy),
+        );
+        assert_eq!(step, QuitStep::Nothing);
+        drop(shell.begin_recovery().expect("not reserved after cancel"));
+
+        quit_gate.request();
+        let step = confirm_quit(
+            true,
+            || shell.reserve_quit(),
+            || shell.release_quit(),
+            |_| QuitAnswerDecision::AskAgain,
+        );
+        assert_eq!(step, QuitStep::AskAgain);
+        drop(
+            shell
+                .begin_recovery()
+                .expect("not reserved after ask-again"),
         );
     }
 

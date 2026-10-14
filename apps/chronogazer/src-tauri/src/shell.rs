@@ -70,6 +70,23 @@
 //!   確認は同じロックの中で行うので、「置いたのに後始末が見落とす」「後始末が
 //!   終わった後に置く」のどちらも起きない。トレイの「終了」は移り変わりの終わりを
 //!   待ってから終わる。
+//! - **DB の復旧の途中は終了させない**（PR #608 のオーナーレビュー P2）: 対処の窓の
+//!   「作り直す」「バックアップから戻す」は DB の付随ファイルと本体を別々に名前を
+//!   変え、失敗したら戻す（`chronogazer_core::startup_recovery`）。途中でプロセスが
+//!   終わると、現用の側と `.broken` の側にファイルが分かれた復旧が残りうる。そこで
+//!   対処を受け付けた時点から起動のやり直しの終わりまで、**復旧の札**
+//!   （[`ShellGate::begin_recovery`]。移り変わりの札に「復旧中」の印を足したもの）を
+//!   持つ。トレイの「終了」は確定の前に [`ShellGate::reserve_quit`] で終了を予約し、
+//!   復旧中なら**断る**（ダイアログで「復旧の途中です。終わってから終了して
+//!   ください」と知らせ、確認の段階を戻す）。**判断**: 5 秒で打ち切って進むのでも
+//!   完了まで黙って保留するのでもなく断る - 打ち切りは今回の問題そのもので、保留は
+//!   利用者から見ると「終了を押したのに何も起きない」になり、復旧が長い（大きな DB の
+//!   名前の変更が他のソフトに掴まれて再試行している）と理由が分からないため。予約が
+//!   立っている間は新しい復旧を始めない（対処の窓に「終了処理中」と出す）。予約と
+//!   復旧の印は同じロックの中で見るので、「確かめた後に復旧が始まる」隙は無い。
+//!   窓の × は今までどおり対処の窓の `busy` が防ぐ。OS のシャットダウン
+//!   （`RunEvent::Exit`）は断れないので、移り変わりと同じく予算まで待ってから進む
+//!   （既知の制限。設計書の B2-4c の実装メモ）。
 //! - **見張りは 1 つだけ**: `setup()` で Service・Fallback に決まったときに 1 回だけ
 //!   起こし、Desktop になる・終了に入ると抜ける。SCM の照会・probe（最大 1.5 秒）は
 //!   tokio のワーカーを塞がないよう `spawn_blocking` で行う。SCM が `Running` でない
@@ -589,6 +606,16 @@ pub(crate) enum TransitionRefused {
     Stale,
 }
 
+/// トレイの「終了」の予約を断った理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitRefused {
+    /// DB の復旧（作り直す・バックアップから戻す）の途中。
+    RecoveryInProgress,
+}
+
+/// 終了を断ったときに利用者へ出す文。
+pub(crate) const RECOVERY_IN_PROGRESS_MESSAGE: &str = "データベースの復旧の途中です。途中で終了すると復旧が半端なまま残るおそれがあるため、終了できません。対処の窓で復旧が終わってから、もう一度終了してください。";
+
 /// 見張りが観測の前に取る控え。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PollSnapshot {
@@ -613,6 +640,10 @@ struct GateInner {
     transition: bool,
     /// 終了に入った（扉が閉じた）。
     exiting: bool,
+    /// トレイの「終了」が予約された（確定の直前から。新しい復旧を始めない）。
+    quit_reserved: bool,
+    /// DB の復旧の札が出ている（終了の予約を断る）。
+    recovering: bool,
     /// Service の画面で続けて不健康だった回数。
     streak: u32,
 }
@@ -632,6 +663,8 @@ impl ShellGate {
                 generation: 0,
                 transition: false,
                 exiting: false,
+                quit_reserved: false,
+                recovering: false,
                 streak: 0,
             }),
             idle: Condvar::new(),
@@ -712,6 +745,46 @@ impl ShellGate {
         })
     }
 
+    /// DB の復旧の札を取る（対処の窓の「作り直す」「バックアップから戻す」を受け付けた
+    /// 時点から、起動のやり直しの終わりまで持つ）。終了の予約・終了の後は断る
+    /// （`Exiting`）。札を返すと「復旧中」の印も下りる。
+    pub(crate) fn begin_recovery(self: &Arc<Self>) -> Result<TransitionGuard, TransitionRefused> {
+        let mut inner = self.lock();
+        if inner.exiting || inner.quit_reserved {
+            return Err(TransitionRefused::Exiting);
+        }
+        if inner.transition {
+            return Err(TransitionRefused::Busy);
+        }
+        inner.transition = true;
+        inner.recovering = true;
+        Ok(TransitionGuard {
+            gate: Arc::clone(self),
+            finished: false,
+        })
+    }
+
+    /// 復旧の途中か。
+    pub(crate) fn is_recovering(&self) -> bool {
+        self.lock().recovering
+    }
+
+    /// トレイの「終了」を確定する前の予約。復旧の途中なら断る。予約の後は新しい
+    /// 復旧を始めない。確定しなかったら [`Self::release_quit`] で下ろす。
+    pub(crate) fn reserve_quit(&self) -> Result<(), QuitRefused> {
+        let mut inner = self.lock();
+        if inner.recovering {
+            return Err(QuitRefused::RecoveryInProgress);
+        }
+        inner.quit_reserved = true;
+        Ok(())
+    }
+
+    /// 終了の予約を下ろす（確認で取り消された・確かめ直すとき）。
+    pub(crate) fn release_quit(&self) {
+        self.lock().quit_reserved = false;
+    }
+
     /// 扉が閉じていなければ、同じロックの中で `install` を走らせる（エンジンを置く）。
     /// 走らせたら `true`。閉じていれば走らせずに `false`（呼び出し側がエンジンを止める）。
     pub(crate) fn admit(&self, install: impl FnOnce()) -> bool {
@@ -767,6 +840,7 @@ impl TransitionGuard {
             inner.generation = inner.generation.wrapping_add(1);
             inner.streak = 0;
             inner.transition = false;
+            inner.recovering = false;
         }
         self.finished = true;
         self.gate.idle.notify_all();
@@ -778,7 +852,11 @@ impl Drop for TransitionGuard {
         if self.finished {
             return;
         }
-        self.gate.lock().transition = false;
+        {
+            let mut inner = self.gate.lock();
+            inner.transition = false;
+            inner.recovering = false;
+        }
         self.gate.idle.notify_all();
     }
 }
@@ -799,6 +877,28 @@ pub(crate) fn current_tray_mode(app: &AppHandle) -> TrayMode {
     app.try_state::<ShellState>()
         .map(|shell| tray_mode(&shell.gate.view()))
         .unwrap_or(TrayMode::Desktop)
+}
+
+/// トレイの「終了」の予約（`ShellState` が無ければ通す）。
+pub(crate) fn reserve_quit(app: &AppHandle) -> Result<(), QuitRefused> {
+    match app.try_state::<ShellState>() {
+        Some(shell) => shell.gate.reserve_quit(),
+        None => Ok(()),
+    }
+}
+
+/// 終了の予約を下ろす。
+pub(crate) fn release_quit(app: &AppHandle) {
+    if let Some(shell) = app.try_state::<ShellState>() {
+        shell.gate.release_quit();
+    }
+}
+
+/// DB の復旧の途中か（`ShellState` が無ければ偽）。
+pub(crate) fn recovering(app: &AppHandle) -> bool {
+    app.try_state::<ShellState>()
+        .map(|shell| shell.gate.is_recovering())
+        .unwrap_or(false)
 }
 
 /// 終了の扉が閉じているか（`ShellState` が無ければ偽）。
@@ -1855,6 +1955,48 @@ mod tests {
         guard.finish(ShellView::Desktop);
         assert!(rx.recv_timeout(Duration::from_secs(10)).expect("returns"));
         waiter.join().unwrap();
+    }
+
+    /// PR #608 のオーナーレビュー P2: DB の復旧の途中のトレイの「終了」は断られ
+    /// （予約できない = 確定に進まない）、復旧が終わった後なら通る。
+    #[test]
+    fn quit_is_refused_while_recovering_and_allowed_after() {
+        let gate = ShellGate::new(ShellView::Desktop);
+        let recovery = gate.begin_recovery().expect("recovery");
+        assert!(gate.is_recovering());
+        assert_eq!(
+            gate.reserve_quit().unwrap_err(),
+            QuitRefused::RecoveryInProgress
+        );
+        // 断っても扉は閉じない（終了処理へ進んでいない）。
+        assert!(!gate.is_exiting());
+        // 復旧の失敗（札を落とす）でも成功（finish）でも、終われば通る。
+        drop(recovery);
+        assert!(!gate.is_recovering());
+        assert!(gate.reserve_quit().is_ok());
+        gate.release_quit();
+        let recovery = gate.begin_recovery().expect("recovery again");
+        assert!(gate.reserve_quit().is_err());
+        recovery.finish(ShellView::Desktop);
+        assert!(gate.reserve_quit().is_ok());
+    }
+
+    /// 終了を予約した後は新しい復旧を始めない（予約を下ろせば始められる）。普通の
+    /// 移り変わりの札は「復旧中」にしない。
+    #[test]
+    fn recovery_does_not_start_after_quit_is_reserved() {
+        let gate = ShellGate::new(ShellView::Desktop);
+        gate.reserve_quit().expect("reserve");
+        assert_eq!(
+            gate.begin_recovery().unwrap_err(),
+            TransitionRefused::Exiting
+        );
+        gate.release_quit();
+        drop(gate.begin_recovery().expect("after release"));
+        let plain = gate.begin_transition().expect("plain");
+        assert!(!gate.is_recovering());
+        assert!(gate.reserve_quit().is_ok());
+        drop(plain);
     }
 
     /// 移り変わりが終わらなければ、予算で待つのをやめる。
