@@ -62,14 +62,25 @@
 //!   （generation）を控え、適用するときに世代が変わっていたら捨てる
 //!   （[`ShellGate::begin_transition_at`]）。
 //! - **終了との競合**: 終了の後始末（[`crate::exit_cleanup`]）は最初に
-//!   [`ShellGate::begin_exit`] で扉を閉じ（以後の移り変わりを断る）、走っている移り
-//!   変わりの終わりを予算（`EXIT_CLEANUP_BUDGET`）まで待ってから、エンジンを探す。
+//!   [`ShellGate::close`] で扉を閉じ（以後の移り変わりを断る）、走っている移り
+//!   変わりの終わりを上限まで待ってから（[`ShellGate::wait_idle`]、上限は下の「待ちの
+//!   上限は終了の起点で分ける」）、エンジンを探す。
 //!   「再試行」の [`crate::launch_desktop`] が扉が閉じた後に起動し終えたら、エンジンを
 //!   置かずにその場で止める（[`ShellGate::admit`]。banto-hub の `discard_started_hub` と
 //!   同じ考え）。エンジンを置くこと（`AppState`・`DesktopEngine` の manage）と扉の
 //!   確認は同じロックの中で行うので、「置いたのに後始末が見落とす」「後始末が
 //!   終わった後に置く」のどちらも起きない。トレイの「終了」は移り変わりの終わりを
 //!   待ってから終わる。
+//! - **待ちの上限は終了の起点で分ける**（PR #608 の全体監査 F2・F3、
+//!   `crate::exit_budgets`）: トレイ・Fallback の「終了」（自発的な終了。専用のスレッドで
+//!   待つので画面は塞がない）は、移り変わり（「再試行」の Desktop の起動）を長く（60 秒）
+//!   待つ - 短く切ると、起動し終えたエンジンを止めずにプロセスが終わりうる。OS の
+//!   シャットダウン（`RunEvent::Exit`、メインスレッド）は、移り変わりの待ちと後始末で
+//!   **1 つの 5 秒の期限**を分け合う（OS の猶予を超えない）。さらにエンジンが既に
+//!   置かれていれば移り変わりを待たない（窓を作る移り変わりはメインスレッドを待つので
+//!   終わらない。エンジンは見つかるので後始末で止められる）。エンジンは `start()` の
+//!   直後に置く（`crate::launch_desktop`）ので、「収集が動いているのに後始末から
+//!   見えない」区間は `start()` の中だけ。
 //! - **DB の復旧の途中は終了させない**（PR #608 のオーナーレビュー P2）: 対処の窓の
 //!   「作り直す」「バックアップから戻す」は DB の付随ファイルと本体を別々に名前を
 //!   変え、失敗したら戻す（`chronogazer_core::startup_recovery`）。途中でプロセスが
@@ -798,11 +809,24 @@ impl ShellGate {
     }
 
     /// 終了の扉を閉じ、走っている移り変わりの終わりを `budget` まで待つ。終わりを
-    /// 待てた（または無かった）ら `true`。何度呼んでもよい。
+    /// 待てた（または無かった）ら `true`。何度呼んでもよい（本番は `exit_cleanup` が
+    /// [`Self::close`] と [`Self::wait_idle`] を分けて呼ぶ。テストの近道）。
+    #[cfg(test)]
     pub(crate) fn begin_exit(&self, budget: Duration) -> bool {
+        self.close();
+        self.wait_idle(budget)
+    }
+
+    /// 終了の扉を閉じるだけ（待たない）。以後の移り変わり・エンジンを置くことを断る。
+    pub(crate) fn close(&self) {
+        self.lock().exiting = true;
+    }
+
+    /// 走っている移り変わりの終わりを `budget` まで待つ。終わりを待てた（または
+    /// 無かった）ら `true`。
+    pub(crate) fn wait_idle(&self, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;
         let mut inner = self.lock();
-        inner.exiting = true;
         while inner.transition {
             let now = Instant::now();
             if now >= deadline {
@@ -1023,13 +1047,12 @@ fn start_desktop(app: &AppHandle, layout: DataLayout) {
             return;
         }
     };
-    if let Err(err) = tauri::async_runtime::block_on(crate::launch_desktop(
-        app,
-        &paths,
-        crate::startup::Prelude::None,
-    )) {
-        crate::startup::show_failure(app, &paths, err);
-    }
+    // `setup()` のメインスレッド（runtime の外）なので `block_on` してよい。
+    tauri::async_runtime::block_on(async {
+        if let Err(err) = crate::launch_desktop(app, &paths, crate::startup::Prelude::None).await {
+            crate::startup::show_failure(app, &paths, err).await;
+        }
+    });
 }
 
 /// トレイを作る（失敗は記録して `false`。窓の × はそのとき隠さずに閉じる - 戻す
@@ -1305,7 +1328,7 @@ async fn switch_to_desktop(app: &AppHandle, guard: TransitionGuard) {
             return;
         }
         Err(err) => {
-            crate::startup::show_failure(app, &paths, err);
+            crate::startup::show_failure(app, &paths, err).await;
             destroy_window(app, FALLBACK_WINDOW_LABEL);
             guard.finish(ShellView::Desktop);
         }
@@ -1954,9 +1977,26 @@ mod tests {
         // 札の中で扉が閉じたのが見える（起動し終えたエンジンは置かずに止める）。
         assert!(gate.is_exiting());
         assert!(!gate.admit(|| panic!("扉が閉じた後に置いてはいけない")));
+        let finished_at = Instant::now();
         guard.finish(ShellView::Desktop);
         assert!(rx.recv_timeout(Duration::from_secs(10)).expect("returns"));
+        // 長い上限（10 秒）でも、札が返れば待たずに戻る（PR #608 の全体監査 F2）。
+        assert!(finished_at.elapsed() < Duration::from_secs(5));
         waiter.join().unwrap();
+    }
+
+    /// 扉を閉じるだけなら待たない。閉じた後の待ちは札の終わりまで。
+    #[test]
+    fn close_does_not_wait_and_wait_idle_is_bounded() {
+        let gate = ShellGate::new(ShellView::Service { port: 1 });
+        let guard = gate.begin_transition().expect("transition");
+        let started = Instant::now();
+        gate.close();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(gate.is_exiting());
+        assert!(!gate.wait_idle(Duration::from_millis(50)));
+        drop(guard);
+        assert!(gate.wait_idle(Duration::from_millis(50)));
     }
 
     /// PR #608 のオーナーレビュー P2: DB の復旧の途中のトレイの「終了」は断られ

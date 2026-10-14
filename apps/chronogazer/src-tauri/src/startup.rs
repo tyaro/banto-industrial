@@ -183,7 +183,8 @@ pub(crate) enum LaunchError {
     Recovery(RecoveryError),
     /// エンジンは動いたが画面（メインの窓・トレイ）を作れなかった。
     Window(tauri::Error),
-    /// 終了処理に入っていたので起動しなかった・起動し終えたエンジンを置かずに止めた
+    /// 終了処理に入っていたので起動しなかった・起動し終えたエンジンを置かずに止めた・
+    /// 置いた後に終了が始まったので画面を作らなかった（置いたエンジンは後始末が止める）
     /// （#392 B2-4c、`crate::shell::ShellGate`）。呼び出し側は窓を出さない。
     Exiting,
 }
@@ -462,8 +463,12 @@ impl RecoveryGate {
     }
 }
 
-/// 起動の失敗を窓で知らせる（`setup()` の最初の起動から）。
-pub(crate) fn show_failure(app: &AppHandle, paths: &LaunchPaths, err: LaunchError) {
+/// 起動の失敗を窓で知らせる（`setup()` の最初の起動と、Fallback の「再試行」から）。
+///
+/// #392 B2-4c（PR #608 の全体監査 F1）: `async`。「再試行」は tokio のワーカーの上から
+/// 呼ぶので、バックアップの一覧を `block_on` で読むと runtime の入れ子で panic していた。
+/// 一覧は [`list_backups_async`] を await する（このモジュールに `block_on` は無い）。
+pub(crate) async fn show_failure(app: &AppHandle, paths: &LaunchPaths, err: LaunchError) {
     // #392 B2-4c: 終了処理中なら窓を出さない（プロセスが終わる）。
     if matches!(err, LaunchError::Exiting) {
         eprintln!("banto: {err}");
@@ -486,7 +491,7 @@ pub(crate) fn show_failure(app: &AppHandle, paths: &LaunchPaths, err: LaunchErro
     let engine_running = matches!(err, LaunchError::Window(_));
     let choices = choices_for(kind);
     let detail = err.to_string();
-    let backups = backups_for(&choices, paths);
+    let backups = list_backups_async(&choices, paths).await;
     let view = build_view(kind, &choices, detail.clone(), paths, backups, None);
     *app.state::<RecoveryGate>().lock() = Some(RecoverySession {
         paths: paths.clone(),
@@ -540,14 +545,6 @@ fn choices_for(kind: FailureKind) -> Vec<RecoveryChoice> {
         // 「終了」だけ（理由は詳しい理由に出る）。
         WindowPlan::ExistingNotice => vec![RecoveryChoice::Quit],
     }
-}
-
-fn backups_for(choices: &[RecoveryChoice], paths: &LaunchPaths) -> Result<Vec<BackupInfo>, String> {
-    if !choices.contains(&RecoveryChoice::RestoreBackup) {
-        return Ok(Vec::new());
-    }
-    tauri::async_runtime::block_on(recovery::list_backups(&paths.db_path))
-        .map_err(|err| format!("バックアップの一覧を読めませんでした: {err}"))
 }
 
 fn open_recovery_window(app: &AppHandle, view: &RecoveryView) -> tauri::Result<()> {
@@ -671,14 +668,7 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
                 Ok(guard) => recovery_guard = Some(guard),
                 Err(refused) => {
                     eprintln!("banto: 対処を始めません（{refused:?}）");
-                    rerender_with_notice(
-                        &app,
-                        Some(
-                            "終了処理中、または別の処理の途中のため、この対処を始めませんでした。"
-                                .to_string(),
-                        ),
-                    )
-                    .await;
+                    rerender_with_notice(&app, Some(refused_notice(refused).to_string())).await;
                     return;
                 }
             }
@@ -762,8 +752,16 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
         (Some(guard), _) => Some(guard),
         (None, Some(shell)) => match shell.gate.begin_transition() {
             Ok(guard) => Some(guard),
+            // 終了処理に入った: 何もしない（プロセスが終わる）。
+            Err(crate::shell::TransitionRefused::Exiting) => {
+                eprintln!("banto: 終了処理中のため、対処の後の起動を行いません");
+                return;
+            }
+            // 別の移り変わりの途中（PR #608 の全体監査 F4）: 処理中を解いて選び直せる
+            // ようにする（そのままだとボタンが無効・× も閉じられないまま残る）。
             Err(refused) => {
                 eprintln!("banto: 対処の後の起動を行いません（{refused:?}）");
+                rerender_with_notice(&app, Some(refused_notice(refused).to_string())).await;
                 return;
             }
         },
@@ -817,6 +815,18 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
                     Some("対処の後も起動できませんでした。下の理由を確かめて、もう一度選んでください。".to_string()),
                 ),
             );
+        }
+    }
+}
+
+/// シェルの札を取れなかったときに対処の窓へ出す文（純関数）。
+pub(crate) fn refused_notice(refused: crate::shell::TransitionRefused) -> &'static str {
+    match refused {
+        crate::shell::TransitionRefused::Exiting => {
+            "終了処理中のため、この対処を始めませんでした。"
+        }
+        crate::shell::TransitionRefused::Busy | crate::shell::TransitionRefused::Stale => {
+            "別の処理の途中です。しばらくしてから、もう一度選んでください。"
         }
     }
 }
@@ -1095,5 +1105,37 @@ mod tests {
             .unwrap()
             .iter()
             .all(|ace| ace.sid != "S-1-5-32-545"));
+    }
+
+    /// PR #608 の全体監査 F1: バックアップの一覧は runtime の中（Fallback の「再試行」は
+    /// tokio のワーカーの上）から読んでも panic しない（`block_on` の入れ子にしない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backups_listing_runs_inside_a_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LaunchPaths::from_layout(DataLayout::new(dir.path().join("missing-root")));
+        let choices = vec![RecoveryChoice::RestoreBackup, RecoveryChoice::Quit];
+        // 一覧が空でも読めない理由でもよい（panic しないこと）。
+        let listed = list_backups_async(&choices, &paths).await;
+        assert!(
+            matches!(&listed, Ok(list) if list.is_empty()) || listed.is_err(),
+            "{listed:?}"
+        );
+        // 戻す対処が無ければ読まない。
+        assert_eq!(
+            list_backups_async(&[RecoveryChoice::Quit], &paths)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// PR #608 の全体監査 F4: 札を取れなかった理由ごとの文。
+    #[test]
+    fn refused_notices() {
+        use crate::shell::TransitionRefused;
+        assert!(refused_notice(TransitionRefused::Exiting).contains("終了処理中"));
+        assert!(refused_notice(TransitionRefused::Busy).contains("別の処理の途中"));
+        assert!(!refused_notice(TransitionRefused::Busy).contains("終了"));
     }
 }

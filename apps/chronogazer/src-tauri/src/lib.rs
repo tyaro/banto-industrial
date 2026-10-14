@@ -3906,14 +3906,22 @@ struct ExitOnce(ExitCleanupOnce<ExitCleanupReport, ExitTrigger>);
 fn exit_cleanup(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitCleanupReport> {
     // #392 B2-4c: 先にシェルの扉を閉じ（以後の移り変わりと、エンジンを置くことを
     // 断る）、走っている移り変わり（Fallback の「再試行」の Desktop の起動）の終わりを
-    // 予算まで待つ。待った後にエンジンを探すので、移り変わりの中で置かれたエンジンも
+    // 待つ。待った後にエンジンを探すので、移り変わりの中で置かれたエンジンも
     // 止める。置く前に扉が閉じたエンジンは `launch_desktop` がその場で止める
-    // （`shell::ShellGate::admit`）。
+    // （`shell::ShellGate::admit`）。待ちの上限は起点で分ける（[`exit_budgets`]、
+    // PR #608 の全体監査 F2・F3）。
+    let budgets = exit_budgets(trigger);
+    let started = std::time::Instant::now();
     if let Some(shell) = app.try_state::<shell::ShellState>() {
-        if !shell.gate.begin_exit(EXIT_CLEANUP_BUDGET) {
+        shell.gate.close();
+        // エンジンが既に置かれていれば、OS の終了では移り変わりを待たない（窓を作る
+        // 移り変わりはメインスレッドを待つので終わらない。エンジンは見つかる）。
+        let registered = app.try_state::<DesktopEngine>().is_some();
+        let wait = !(budgets.shared_deadline && registered);
+        if wait && !shell.gate.wait_idle(budgets.transition_wait) {
             eprintln!(
                 "banto: シェルの切り替えが {} 秒以内に終わらなかったため、待たずに終了処理へ進みます（{}）",
-                EXIT_CLEANUP_BUDGET.as_secs(),
+                ceil_secs(budgets.transition_wait),
                 trigger.label()
             );
         }
@@ -3923,13 +3931,61 @@ fn exit_cleanup(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitClea
     Some(run_exit_cleanup(
         &once.0,
         trigger,
-        EXIT_CLEANUP_BUDGET,
+        budgets.cleanup_after(started.elapsed()),
         move |deadline| {
             let budget = deadline.saturating_duration_since(std::time::Instant::now());
             tauri::async_runtime::block_on(shutdown_app_state(&engine, budget))
         },
         log_sink(),
     ))
+}
+
+/// 自発的な終了（トレイ・Fallback の「終了」）が移り変わりを待つ上限。
+const TRANSITION_WAIT_ON_QUIT: Duration = Duration::from_secs(60);
+
+/// [`exit_cleanup`] の待ちの上限（[`exit_budgets`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExitBudgets {
+    /// シェルの移り変わりの終わりを待つ上限。
+    pub(crate) transition_wait: Duration,
+    /// 後始末の上限（`shared_deadline` なら移り変わりの待ちと分け合う全体）。
+    pub(crate) cleanup: Duration,
+    /// 移り変わりの待ちと後始末で 1 つの期限を分け合う。
+    pub(crate) shared_deadline: bool,
+}
+
+impl ExitBudgets {
+    /// 移り変わりを `waited` だけ待った後の、後始末の予算。
+    pub(crate) fn cleanup_after(&self, waited: Duration) -> Duration {
+        if self.shared_deadline {
+            self.cleanup.saturating_sub(waited)
+        } else {
+            self.cleanup
+        }
+    }
+}
+
+/// 終了の起点ごとの待ちの上限（純関数。PR #608 の全体監査 F2・F3、`shell` の
+/// モジュール doc「待ちの上限は終了の起点で分ける」）。
+///
+/// - トレイの「終了」（Fallback の窓の「終了」を含む。専用のスレッドで待つ）: 移り
+///   変わりは長く（60 秒）待つ - 短く切ると、「再試行」で起動し終えたエンジン（自動開始
+///   した収集を含む）を止めずにプロセスが終わりうる。後始末は今までどおり 5 秒。
+/// - `RunEvent::Exit`（OS のサインアウト・シャットダウン、メインスレッド）: 移り変わりの
+///   待ちと後始末で **1 つの 5 秒の期限**を分け合う（OS の猶予を超えない）。
+pub(crate) fn exit_budgets(trigger: ExitTrigger) -> ExitBudgets {
+    match trigger {
+        ExitTrigger::TrayQuit => ExitBudgets {
+            transition_wait: TRANSITION_WAIT_ON_QUIT,
+            cleanup: EXIT_CLEANUP_BUDGET,
+            shared_deadline: false,
+        },
+        ExitTrigger::RunEventExit => ExitBudgets {
+            transition_wait: EXIT_CLEANUP_BUDGET,
+            cleanup: EXIT_CLEANUP_BUDGET,
+            shared_deadline: true,
+        },
+    }
 }
 
 /// [`exit_cleanup`] が記録する 1 行（重さつき）。
@@ -4543,7 +4599,17 @@ async fn launch_desktop(
     // 流し込み。順序の理由は `chronogazer_core::engine` のモジュール doc。
     // Hub の初期化（設定 DB が書けない）・保存設定の読み取りの失敗は `Err`
     // （エンジンが Hub を止め pool を閉じてから返す）。
-    let engine = opened.start().await.map_err(LaunchError::Engine)?;
+    // #392 B2-4c（PR #608 の全体監査 F2）: `start()` の直後にエンジンを置く（扉と同じ
+    // ロックの中、[`start_and_register`]）。`start()` は収集の自動開始を起こすので、
+    // ここから先で終了が始まっても後始末がエンジンを見つけて止められる。扉が既に閉じて
+    // いれば置かずにその場で止める。
+    let shell_gate = app
+        .try_state::<shell::ShellState>()
+        .map(|shell| Arc::clone(&shell.gate));
+    let engine = start_and_register(opened, shell_gate.as_deref(), |engine| {
+        app.manage(DesktopEngine(engine));
+    })
+    .await?;
     let services = engine.services().clone();
 
     // M11 bootstrap: decide the webview's starting session (see
@@ -4554,35 +4620,15 @@ async fn launch_desktop(
     // changes.
     let initial_auth = initial_desktop_session(&services, &auth_config).await;
 
-    // 終了の後始末（[`exit_cleanup`]）がエンジンを止める。プロセスの
-    // 終わりまで drop されない（A1 の排他もそこまで持つ）。
-    // #392 B2-4c: 置くのはシェルの終了の扉と同じロックの中（`ShellGate::admit`）。
-    // 扉が既に閉じていたら置かずに、ここで止める（後始末はもう始まっていて、この
-    // エンジンを見ない。banto-hub の `discard_started_hub` と同じ考え）。
-    let engine = Arc::new(engine);
-    let install = || {
-        app.manage(AppState {
-            auth: Mutex::new(AuthSlot::new(initial_auth)),
-            auth_io: AuthIo::production(&services.users, &services.settings),
-            auth_config_lock: AsyncMutex::new(()),
-            server: Arc::clone(engine.server_slot()),
-            services: services.clone(),
-        });
-        app.manage(DesktopEngine(Arc::clone(&engine)));
-    };
-    let admitted = match app.try_state::<shell::ShellState>() {
-        Some(shell) => shell.gate.admit(install),
-        None => {
-            install();
-            true
-        }
-    };
-    if !admitted {
-        eprintln!("banto: 終了処理中のため、起動し終えた記録エンジンを使わずに停止します");
-        let report = shutdown_app_state(&engine, EXIT_CLEANUP_BUDGET).await;
-        if report != ExitCleanupReport::default() {
-            eprintln!("banto: 起動し終えた記録エンジンの停止: {report:?}");
-        }
+    app.manage(AppState {
+        auth: Mutex::new(AuthSlot::new(initial_auth)),
+        auth_io: AuthIo::production(&services.users, &services.settings),
+        auth_config_lock: AsyncMutex::new(()),
+        server: Arc::clone(engine.server_slot()),
+        services: services.clone(),
+    });
+    // 終了が始まっていたら画面を作らない（エンジンは置いてあるので、後始末が止める）。
+    if shell::exiting(app) {
         return Err(LaunchError::Exiting);
     }
 
@@ -4643,6 +4689,38 @@ async fn launch_desktop(
     legacy_notice::show_once(app, &paths.layout);
 
     Ok(())
+}
+
+/// エンジンを始め、その直後に終了の扉と同じロックの中で置く（`install`。本番は
+/// `DesktopEngine` の manage。PR #608 の全体監査 F2）。終了の後始末
+/// （[`exit_cleanup`]）がエンジンを止める。プロセスの終わりまで drop されない（A1 の
+/// 排他もそこまで持つ）。扉が既に閉じていたら置かずに、ここで止めて
+/// `Err(Exiting)`（後始末はもう始まっていて、このエンジンを見ない。banto-hub の
+/// `discard_started_hub` と同じ考え）。`gate` が無い（テスト・`ShellState` の前）なら
+/// そのまま置く。
+async fn start_and_register(
+    opened: chronogazer_core::engine::OpenedEngine,
+    gate: Option<&shell::ShellGate>,
+    install: impl FnOnce(Arc<RunningEngine>),
+) -> Result<Arc<RunningEngine>, startup::LaunchError> {
+    let engine = Arc::new(opened.start().await.map_err(startup::LaunchError::Engine)?);
+    let to_install = Arc::clone(&engine);
+    let admitted = match gate {
+        Some(gate) => gate.admit(|| install(to_install)),
+        None => {
+            install(to_install);
+            true
+        }
+    };
+    if !admitted {
+        eprintln!("banto: 終了処理中のため、起動し終えた記録エンジンを使わずに停止します");
+        let report = shutdown_app_state(&engine, EXIT_CLEANUP_BUDGET).await;
+        if report != ExitCleanupReport::default() {
+            eprintln!("banto: 起動し終えた記録エンジンの停止: {report:?}");
+        }
+        return Err(startup::LaunchError::Exiting);
+    }
+    Ok(engine)
 }
 
 /// トレイを作る。デバッグビルドだけ、環境変数 `CHRONOGAZER_TEST_FAIL_TRAY` で失敗を
@@ -5317,6 +5395,79 @@ mod tests {
             services.collect.state()
         );
         drop(engine);
+    }
+
+    /// PR #608 の全体監査 F2: エンジンは `start()` の直後に、扉が開いていれば置かれる
+    /// （置いた時点で動いている）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_and_register_installs_a_running_engine_right_after_start() {
+        let dir = TempDir::new();
+        let opened = EngineRuntime::open(desktop_engine_config(dir.path()))
+            .await
+            .expect("open");
+        let gate = shell::ShellGate::new(shell::ShellView::Desktop);
+        let mut installed: Option<Arc<RunningEngine>> = None;
+        let engine = start_and_register(opened, Some(gate.as_ref()), |engine| {
+            // 置かれた時点でエンジンは動いている（pool が開いている）。
+            assert!(!engine.services().pool.is_closed());
+            installed = Some(engine);
+        })
+        .await
+        .expect("registered");
+        let installed = installed.expect("start の直後に置かれる");
+        assert!(Arc::ptr_eq(&installed, &engine));
+        // 置いたエンジンは後始末が止める（ここでは直接止める）。
+        let report = shutdown_app_state(&engine, EXIT_CLEANUP_BUDGET).await;
+        assert_eq!(report, ExitCleanupReport::default());
+        assert!(engine.services().pool.is_closed());
+    }
+
+    /// 扉が閉じた後に起動し終えたエンジンは置かずにその場で止める（pool が閉じる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_and_register_discards_when_the_door_is_closed() {
+        let dir = TempDir::new();
+        let opened = EngineRuntime::open(desktop_engine_config(dir.path()))
+            .await
+            .expect("open");
+        let gate = shell::ShellGate::new(shell::ShellView::Desktop);
+        gate.close();
+        let mut installed = false;
+        let result = start_and_register(opened, Some(gate.as_ref()), |_| installed = true).await;
+        assert!(matches!(result, Err(startup::LaunchError::Exiting)));
+        assert!(!installed);
+        // A1 の排他も返っている: 同じ DB をもう一度開ける。
+        let reopened = EngineRuntime::start(desktop_engine_config(dir.path()))
+            .await
+            .expect("止めた後は同じ DB を開ける");
+        shutdown_app_state(&reopened, EXIT_CLEANUP_BUDGET).await;
+    }
+
+    /// PR #608 の全体監査 F2・F3: 待ちの上限の表。トレイの終了は移り変わりを長く待ち
+    /// 後始末は 5 秒、OS の終了は移り変わりの待ちと後始末を合わせて 5 秒に収める。
+    #[test]
+    fn exit_budget_table() {
+        let tray = exit_budgets(ExitTrigger::TrayQuit);
+        assert_eq!(tray.transition_wait, Duration::from_secs(60));
+        assert!(!tray.shared_deadline);
+        for waited in [0, 1, 5, 59, 60] {
+            assert_eq!(
+                tray.cleanup_after(Duration::from_secs(waited)),
+                EXIT_CLEANUP_BUDGET
+            );
+        }
+        let os = exit_budgets(ExitTrigger::RunEventExit);
+        assert_eq!(os.transition_wait, EXIT_CLEANUP_BUDGET);
+        assert!(os.shared_deadline);
+        for waited_ms in [0u64, 1, 1_000, 4_999, 5_000, 6_000] {
+            let waited = Duration::from_millis(waited_ms).min(os.transition_wait);
+            let total = waited + os.cleanup_after(waited);
+            assert!(total <= EXIT_CLEANUP_BUDGET, "{waited_ms} ms -> {total:?}");
+        }
+        assert_eq!(
+            os.cleanup_after(Duration::from_secs(1)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(os.cleanup_after(Duration::from_secs(9)), Duration::ZERO);
     }
 
     /// 終了の報告: 予算切れの秒数は切り上げる（期限の残り 4.99 秒で切れても
