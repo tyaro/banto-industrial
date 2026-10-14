@@ -94,6 +94,7 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,
@@ -113,6 +114,7 @@ fn modbus_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,
@@ -433,8 +435,52 @@ async fn slmp_test_direct_dial_reports_ok_without_connection_id() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["ok"], true, "{body:?}");
     assert!(body["error"].is_null(), "{body:?}");
+    // 省略時は移行前と同じ R フレーム（ワードのサブコマンド 0x0002）。
+    assert_eq!(sim.last_subcommand(), Some(0x0002), "{body:?}");
 
     sim.stop();
+}
+
+/// #605: 直接ダイヤルはフォームの CPU 種別をフレームに載せる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_test_direct_dial_uses_the_requested_cpu_type() {
+    let app = test_app("t12-slmp-cpu").await;
+    for (cpu, sub) in [("R", 0x0002u16), ("Q", 0x0000u16)] {
+        let sim = SlmpSimulator::start().await;
+        let mut payload = test_payload("slmp", "127.0.0.1", sim.addr.port(), false);
+        payload["cpuType"] = json!(cpu);
+        let (status, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cpu} {body:?}");
+        assert_eq!(body["ok"], true, "{cpu} {body:?}");
+        assert_eq!(sim.last_subcommand(), Some(sub), "{cpu}");
+        sim.stop();
+    }
+}
+
+/// #605: 未知の CPU 種別はダイヤルせず拒否する（R への黙ったフォールバックではない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_test_rejects_an_unknown_cpu_type() {
+    let app = test_app("t12-slmp-cpu-unknown").await;
+    let mut payload = test_payload("slmp", "127.0.0.1", 1, false);
+    payload["cpuType"] = json!("L");
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false, "{body:?}");
+    assert_eq!(body["error"]["kind"], "protocol", "{body:?}");
 }
 
 // ---------------------------------------------------------------------------

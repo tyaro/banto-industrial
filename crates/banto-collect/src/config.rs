@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use banto_core::ListParams;
-use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, WordOrder};
+use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, SlmpCpu, WordOrder};
 use banto_tags::{
     scaling::Scaling, CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService,
     Tag, TagService,
@@ -493,9 +493,12 @@ impl RegistrySnapshot {
     /// Callers use this with a transaction/savepoint so proposed mutations and
     /// all three registry reads observe one transaction-local state.
     pub async fn load_connection(connection: &mut SqliteConnection) -> Result<Self, CollectError> {
+        // Column names must match `PlcConnection` (`banto-tags`' `COLUMNS`).
+        // `FromRow` looks them up by name, so a missing name fails every
+        // preflight with "no column found" even though the table has the column.
         let connections = sqlx::query_as::<_, PlcConnection>(
             "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order, \
-             database, username, password \
+             cpu_type, database, username, password \
              FROM plc_connections ORDER BY id",
         )
         .fetch_all(&mut *connection)
@@ -1356,15 +1359,16 @@ fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, ExclusionR
 /// fell back to [`SlmpConfig::default`]'s `WordOrder::LowHigh` regardless of
 /// what the device actually needed, silently byte-swapping any u32/f32 tag
 /// read through a connection that required `WordOrder::HighLow`.
-/// `banto-tags::PlcConnection` still has no columns for SLMP's CPU series or
-/// access route (network/PC/IO/area id; `unit_id` is Modbus-only and is not
-/// read here), so those fields still fall back to [`SlmpConfig::default`] (R
-/// series CPU, the CPU-on-the-other-end access route). **Known
-/// limitation**: a device that needs a non-default CPU series or a routed
+/// #605: `cpu` comes from `plc_connections.cpu_type` (migration `0021`,
+/// `"Q"` / `"R"`, default `"R"` = the historical [`SlmpConfig::default`]).
+/// An unrecognized string fails open to [`SlmpCpu::R`] - the same posture as
+/// [`parse_word_order`] - because the SQL `CHECK` already rejects anything
+/// else; this is defense in depth for a hand-edited row, not a path normal
+/// CRUD can take. The access route (network/PC/IO/area id) still has no
+/// columns and falls back to [`SlmpConfig::default`] (the CPU on the other
+/// end of this socket). **Known limitation**: a routed
 /// (not-directly-connected) access route cannot be configured through the
-/// registry today - adding those would need new `plc_connections` columns,
-/// deliberately out of scope for both I8 and P3-b (P3-b task instructions:
-/// "word_order に集中し、他は trivial でない限り実装しない").
+/// registry today.
 /// `connect_timeout`/`response_timeout` are overridden uniformly by
 /// [`crate::collector::Collector::start`] from [`crate::collector::CollectorOptions`],
 /// exactly like [`modbus_config_for`]'s.
@@ -1380,8 +1384,18 @@ fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, ExclusionReason> 
         // because the two crates have no dependency relationship to hang a
         // shared helper off of, and it is three lines.
         word_order: parse_word_order(&conn.word_order),
+        cpu: parse_cpu_type(&conn.cpu_type),
         ..SlmpConfig::default()
     })
+}
+
+/// #605: `"Q"` → [`SlmpCpu::Q`]. `"R"` と、CHECK を通らない手編集の値は
+/// [`SlmpCpu::R`]（この列を足す前のフレーム形式）。
+fn parse_cpu_type(value: &str) -> SlmpCpu {
+    match value {
+        "Q" => SlmpCpu::Q,
+        _ => SlmpCpu::R,
+    }
 }
 
 /// Shared by both [`slmp_config_for`] and [`modbus_config_for`] - originally
@@ -1598,6 +1612,7 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            cpu_type: None,
             database: None,
             username: None,
             password: None,
@@ -2195,6 +2210,32 @@ mod tests {
         }
     }
 
+    /// #605: 省略した `cpu_type` は R（移行前と同じ）。明示した Q は
+    /// `SlmpConfig.cpu` まで届く。
+    #[tokio::test]
+    async fn slmp_config_carries_cpu_type_and_defaults_to_r() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+
+        let omitted = plc_svc
+            .create(conn_input_slmp("DefaultR", 5007))
+            .await
+            .unwrap();
+        assert_eq!(omitted.cpu_type, "R");
+
+        let mut q_input = conn_input_slmp("QSeries", 5008);
+        q_input.cpu_type = Some("Q".to_string());
+        let q = plc_svc.create(q_input).await.unwrap();
+        assert_eq!(q.cpu_type, "Q");
+
+        let built = slmp_config_for(&q).expect("port");
+        assert_eq!(built.cpu, SlmpCpu::Q);
+
+        let mut hand_edited = q.clone();
+        hand_edited.cpu_type = "nope".to_string();
+        assert_eq!(slmp_config_for(&hand_edited).expect("port").cpu, SlmpCpu::R);
+    }
+
     /// Regression test for the bug fixed 2026-09-08 (see [`modbus_config_for`]'s
     /// doc comment for the full history): `modbus_config_for` must carry the
     /// connection's own `word_order` column into the built `ModbusTcpConfig`,
@@ -2398,6 +2439,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -2459,6 +2501,7 @@ mod tests {
                 enabled: true,
                 simulation: false,
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: Some("erp".to_string()),
                 username: Some("reader".to_string()),
                 password: None,

@@ -73,6 +73,8 @@ struct State {
     /// see `write_command_count`/`read_command_count`.
     read_commands: usize,
     write_commands: usize,
+    /// #605: 直前の要求のサブコマンド。Q のワードは `0x0000`、R のワードは `0x0002`。
+    last_subcommand: Option<u16>,
     /// T8 RMW race simulation: a one-shot XOR mask applied to `(device,
     /// number)`'s word immediately after the *next* write that lands there
     /// completes - simulating a PLC scan clobbering a bit between our write
@@ -213,6 +215,12 @@ impl Simulator {
         self.state.lock().unwrap().read_commands
     }
 
+    /// #605: 直前の要求のサブコマンド。まだ要求が無ければ `None`。
+    /// Q シリーズのワードアクセスは `0x0000`、iQ-R は `0x0002`。
+    pub fn last_subcommand(&self) -> Option<u16> {
+        self.state.lock().unwrap().last_subcommand
+    }
+
     /// T8 (docs/tag-server-design.md §6.1) RMW race test support: XOR
     /// `xor_mask` into `(device, number)`'s word immediately after the next
     /// write that lands there completes, simulating the PLC's own scan
@@ -343,6 +351,9 @@ fn parse_device_field(command: &[u8]) -> Option<DeviceField> {
 
 fn build_response(state: &Arc<Mutex<State>>, route: &Route, command: &[u8]) -> Vec<u8> {
     let mut state = state.lock().unwrap();
+    if command.len() >= 4 {
+        state.last_subcommand = Some(u16::from_le_bytes([command[2], command[3]]));
+    }
 
     if command.len() < 2 {
         return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);

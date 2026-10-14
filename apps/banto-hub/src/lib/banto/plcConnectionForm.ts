@@ -35,7 +35,13 @@
  *    read-on-demand/書き込み経路とでワード順の解釈が食い違っていた実バグの
  *    是正）、`slmp` = `low_high`（MELSEC標準、従来どおり変更無し）。
  */
-import type { PlcConnection, PlcConnectionInput, PlcProtocol, WordOrder } from './tagRegistryAdmin';
+import type {
+	CpuType,
+	PlcConnection,
+	PlcConnectionInput,
+	PlcProtocol,
+	WordOrder
+} from './tagRegistryAdmin';
 import { nextSequentialName } from './sequentialName';
 
 /**
@@ -207,6 +213,8 @@ export interface PlcConnectionFormState {
 	enabled: boolean;
 	simulation: boolean;
 	wordOrder: WordOrder;
+	/** #605: SLMP の CPU 種別。プロトコルを切り替えても値は残す。 */
+	cpuType: CpuType;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB 名。 */
 	database: string;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB ユーザー名。 */
@@ -250,6 +258,7 @@ export function blankConnectionForm(): PlcConnectionFormState {
 		// ワード順（{@link DEFAULT_WORD_ORDERS}）に一致させる - ここでの既定
 		// protocol は 'modbus-tcp' なので、その既定 'high_low' を使う。
 		wordOrder: DEFAULT_WORD_ORDERS['modbus-tcp'],
+		cpuType: 'R',
 		database: '',
 		username: '',
 		password: '',
@@ -272,6 +281,7 @@ export function connectionToForm(c: PlcConnection): PlcConnectionFormState {
 		enabled: c.enabled,
 		simulation: c.simulation,
 		wordOrder: c.wordOrder,
+		cpuType: c.cpuType,
 		database: c.database ?? '',
 		username: c.username ?? '',
 		password: '',
@@ -350,7 +360,8 @@ export function formToConnectionInput(form: PlcConnectionFormState): PlcConnecti
 		unitId: Number(form.unitId),
 		enabled: form.enabled,
 		simulation: form.simulation,
-		wordOrder: form.wordOrder
+		wordOrder: form.wordOrder,
+		cpuType: form.cpuType
 	};
 	if (form.protocol !== POSTGRES_PROTOCOL) return base;
 	return {

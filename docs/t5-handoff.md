@@ -73,7 +73,8 @@ $env:BANTO_ALLOW_SETUP="1"; .\target\release\banto-hub.exe   # 初回セット�
 - MQTT のタグ毎発行モード設定 / 削除タグの retain クリア（§5.3 注記）
 - broker: 削除セッションのタスク即時 join（現在は全ハンドル drop 待ち）
 - SLMP の CPU 種別・アクセスルート・word order のレジストリ設定
-  （現在は banto-plc 既定値固定 — T2-0 の既知制約）
+  （当時は banto-plc 既定値固定 — T2-0 の既知制約。word order は #127、
+  CPU 種別は #605 で接続ごとに設定できる。アクセスルートは未露出）
 - 既存2アプリの LAN モード既定ポート 8721 重複（§10-7 発見）
 - `banto-tagclient` SDK の起票（T1 完了時起票と決定済み・未起票。
   SCADA 計画の具体化と同時に着手 — §7）

@@ -446,6 +446,7 @@ async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
             enabled: true,
             simulation: false,
             word_order: "low_high".to_string(),
+            cpu_type: None,
             database: Some(target.database.clone()),
             username: Some(target.username.clone()),
             password: target.password.clone(),

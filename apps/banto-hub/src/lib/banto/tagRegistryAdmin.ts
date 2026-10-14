@@ -74,6 +74,14 @@ export const WORD_ORDER_OPTIONS: { value: WordOrder; label: string }[] = [
 	{ value: 'high_low', label: 'high_low（Modbus/IEEE慣習）' }
 ];
 
+/** #605: SLMP の CPU 種別。既定は `R`（iQ-R）。Q シリーズは `Q`。 */
+export type CpuType = 'Q' | 'R';
+
+export const CPU_TYPE_OPTIONS: { value: CpuType; label: string }[] = [
+	{ value: 'R', label: 'iQ-R（R）' },
+	{ value: 'Q', label: 'Qシリーズ（Q）' }
+];
+
 /** Mirrors `banto_tags::PlcConnection`. */
 export interface PlcConnection {
 	id: number;
@@ -90,6 +98,8 @@ export interface PlcConnection {
 	simulation: boolean;
 	/** P3-b（監査指摘 2026-08-12）。{@link WordOrder}参照。 */
 	wordOrder: WordOrder;
+	/** #605: SLMP の CPU 種別。SLMP 以外の行も列は持つ（既定 `R`）。 */
+	cpuType: CpuType;
 	/**
 	 * S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: `protocol ===
 	 * 'postgres'` 接続が対象とする DB 名。他プロトコルでは常に `null` -
@@ -159,6 +169,12 @@ export interface PlcConnectionInput {
 	simulation: boolean;
 	/** P3-b（監査指摘 2026-08-12）. See {@link PlcConnection.wordOrder}. */
 	wordOrder: WordOrder;
+	/**
+	 * #605: SLMP の CPU 種別。省略時、作成は `R`、更新は既存の値を保つ
+	 * （この項目を知らないクライアントが Q を R に戻さない）。
+	 * フォームは常に送る。
+	 */
+	cpuType?: CpuType;
 	/**
 	 * S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: 'postgres'`
 	 * 接続の DB 名 - mirrors `banto_hub_core::rest::PlcConnectionPayload
@@ -981,6 +997,8 @@ export interface PlcConnectionTestRequest {
 	unitId: number;
 	simulation: boolean;
 	connectionId?: number;
+	/** #605: 直接ダイヤル時の SLMP CPU 種別。省略は R。 */
+	cpuType?: CpuType;
 }
 
 /**

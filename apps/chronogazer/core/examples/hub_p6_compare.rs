@@ -677,6 +677,7 @@ async fn register_direct(
             enabled: true,
             simulation: false,
             word_order: WORD_ORDER.to_owned(),
+            cpu_type: None,
             database: None,
             username: None,
             password: None,

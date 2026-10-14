@@ -271,6 +271,21 @@ pub const WORD_ORDER_LOW_HIGH: &str = "low_high";
 /// matching back-fill of existing rows).
 pub const WORD_ORDER_HIGH_LOW: &str = "high_low";
 
+/// #605: MELSEC-Q（QJ71E71 など）。4 バイトのデバイス番地、サブコマンド
+/// `0x0000`/`0x0001`。`banto_plc::SlmpCpu::Q` に対応する。
+pub const CPU_TYPE_Q: &str = "Q";
+
+/// #605: iQ-R。6 バイトのデバイス番地、サブコマンド `0x0002`/`0x0003`。
+/// migration `0021` の列既定であり、この列を足す前の
+/// `SlmpConfig::default().cpu`（`SlmpCpu::R`）と同じ。
+pub const CPU_TYPE_R: &str = "R";
+
+/// #605: `plc_connections.cpu_type` が取りうる値。migration `0021` の
+/// `CHECK` と二重管理する（[`ALLOWED_WORD_ORDERS`] と同じ「TEXT + CHECK」）。
+/// L シリーズはフレームが Q 互換だが、今回の接続単位の選択は Q/R だけ
+/// （他局・マルチ CPU と同じく範囲外）。
+pub const ALLOWED_CPU_TYPES: &[&str] = &[CPU_TYPE_Q, CPU_TYPE_R];
+
 /// Modbus TCP - the first protocol this registry ever spoke (plan.md §3's I2
 /// decision) and the first entry of [`ALLOWED_PROTOCOLS`]. Named as a
 /// constant (rather than left as a bare literal at its use sites) because
@@ -532,6 +547,25 @@ fn stored_password_for_create(password: &Option<String>) -> Option<String> {
     }
 }
 
+/// #605: 作成時に保存する CPU 種別。未指定は [`CPU_TYPE_R`]。
+/// 呼び出し前に [`validate_plc_connection_input`] を通していること。
+fn cpu_type_for_create(value: &Option<String>) -> String {
+    match value.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => CPU_TYPE_R.to_string(),
+    }
+}
+
+/// #605: 更新時にバインドする CPU 種別。`None` は SQL の `NULL` になり、
+/// `COALESCE(NULL, cpu_type)` が既存値を保つ。空文字も未指定と同じ。
+/// 呼び出し前に [`validate_plc_connection_input`] を通していること。
+fn cpu_type_for_update(value: &Option<String>) -> Option<String> {
+    match value.as_deref() {
+        Some(s) if !s.is_empty() => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 /// [`PlcConnectionService::update`]'s password rule (this crate's
 /// `PlcConnectionInput::password` doc comment, "update" case): `None` keeps
 /// `existing`, `Some("")` clears it, any other `Some(s)` replaces it.
@@ -569,6 +603,10 @@ pub struct PlcConnection {
     /// simply carry a value nothing reads, the same treatment `unit_id` gets
     /// for SLMP (this module's doc comment, above).
     pub word_order: String,
+    /// #605: SLMP の CPU 種別（[`CPU_TYPE_Q`] / [`CPU_TYPE_R`]）。既定は
+    /// [`CPU_TYPE_R`] で、この列を足す前のフレーム形式を保つ。SLMP 以外の
+    /// プロトコルでは収集・broker は読まない。
+    pub cpu_type: String,
     /// S1 (this module's doc comment, "`\"postgres\"`" section): the DB name
     /// a `"postgres"` connection targets. Always `None` for every other
     /// protocol.
@@ -677,6 +715,20 @@ pub struct PlcConnectionInput {
     /// or deserialize a `PlcConnectionInput` directly.
     #[serde(default)]
     pub word_order: String,
+    /// #605. SLMP の CPU 種別。
+    ///
+    /// **作成と更新で省略の意味が違う**（パスワードの tri-state と同じ理由:
+    /// この項目を知らないクライアントの更新で、保存済みの Q を黙って R に
+    /// 戻さない）:
+    ///
+    /// - 作成: `None`（省略）と `Some("")` は [`CPU_TYPE_R`]。`Some("Q")` /
+    ///   `Some("R")` はその値。それ以外は検証エラー。
+    /// - 更新: `None` と `Some("")` は**既存行の値を保つ**
+    ///   （`cpu_type = COALESCE(NULL, cpu_type)`）。明示した `"Q"` / `"R"`
+    ///   だけ置き換える。未知の値は検証エラーで、既定へのフォールバックは
+    ///   しない。
+    #[serde(default)]
+    pub cpu_type: Option<String>,
     /// S1. See [`PlcConnection::database`]'s doc comment. Required
     /// (non-empty after trim) when `protocol == `[`POSTGRES_PROTOCOL`],
     /// forbidden (must be `None`/empty) otherwise.
@@ -806,6 +858,17 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
         });
     }
 
+    // #605: 空文字と None は「未指定」（作成は R、更新は既存を保つ）なので
+    // ここでは弾かない。明示された未知の値だけ拒否する。
+    if let Some(cpu_type) = input.cpu_type.as_deref() {
+        if !cpu_type.is_empty() && !ALLOWED_CPU_TYPES.contains(&cpu_type) {
+            errors.push(FieldError {
+                field: "cpuType".to_string(),
+                message: format!("CPU種別は {} のいずれかです", ALLOWED_CPU_TYPES.join(", ")),
+            });
+        }
+    }
+
     // T9-1 (this module's doc comment, "simulation" section): a "virtual"
     // connection dials nothing, so "simulate this connection" is a category
     // error, not a redundant-but-harmless flag - reject rather than silently
@@ -899,6 +962,7 @@ fn column_map() -> ColumnMap {
         .column("enabled", "enabled")
         .column("simulation", "simulation")
         .column("wordOrder", "word_order")
+        .column("cpuType", "cpu_type")
         .column("database", "database")
         .column("username", "username")
     // S1: `password` is deliberately NOT listed here - filtering/sorting
@@ -909,7 +973,7 @@ fn column_map() -> ColumnMap {
 
 const RESOURCE: &str = "plc_connections";
 const COLUMNS: &str =
-    "id, name, protocol, host, port, unit_id, enabled, simulation, word_order, database, username, password";
+    "id, name, protocol, host, port, unit_id, enabled, simulation, word_order, cpu_type, database, username, password";
 
 /// Service layer for the `plc_connections` resource. `Clone` is cheap
 /// (`SqlitePool` is `Arc`-backed), matching the pattern of every resource
@@ -981,8 +1045,8 @@ impl PlcConnectionService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, database, username, password) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, cpu_type, database, username, password) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(&input.protocol)
@@ -992,6 +1056,7 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(input.simulation)
         .bind(&input.word_order)
+        .bind(cpu_type_for_create(&input.cpu_type))
         .bind(stored_database)
         .bind(stored_username)
         .bind(stored_password)
@@ -1021,8 +1086,8 @@ impl PlcConnectionService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, database, username, password) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, cpu_type, database, username, password) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(&input.protocol)
@@ -1032,6 +1097,7 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(input.simulation)
         .bind(&input.word_order)
+        .bind(cpu_type_for_create(&input.cpu_type))
         .bind(stored_database)
         .bind(stored_username)
         .bind(stored_password)
@@ -1143,7 +1209,7 @@ impl PlcConnectionService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = COALESCE(?, simulation), word_order = ?, database = ?, username = ?, password = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = COALESCE(?, simulation), word_order = ?, cpu_type = COALESCE(?, cpu_type), database = ?, username = ?, password = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
@@ -1154,6 +1220,7 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(simulation_to_store)
         .bind(&input.word_order)
+        .bind(cpu_type_for_update(&input.cpu_type))
         .bind(stored_database)
         .bind(stored_username)
         .bind(stored_password)
@@ -1221,7 +1288,7 @@ impl PlcConnectionService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ?, database = ?, username = ?, password = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ?, cpu_type = COALESCE(?, cpu_type), database = ?, username = ?, password = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
@@ -1232,6 +1299,7 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(input.simulation)
         .bind(&input.word_order)
+        .bind(cpu_type_for_update(&input.cpu_type))
         .bind(stored_database)
         .bind(stored_username)
         .bind(stored_password)
@@ -1508,6 +1576,7 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            cpu_type: None,
             database: None,
             username: None,
             password: None,
@@ -1530,6 +1599,46 @@ mod tests {
 
         let fetched = svc.get(created.id).await.expect("get should succeed");
         assert_eq!(fetched, created);
+        assert_eq!(created.cpu_type, CPU_TYPE_R);
+    }
+
+    /// #605: 作成の省略は R。更新の省略は既存の Q を保つ。未知の値は拒否し、
+    /// 行は Q のまま。空文字の更新も省略と同じ（R に戻さない）。
+    #[tokio::test]
+    async fn cpu_type_omitted_on_update_preserves_q_and_unknown_is_rejected() {
+        let svc = service().await;
+        let created = svc.create(sample_input("cpu-line")).await.unwrap();
+        assert_eq!(created.cpu_type, "R");
+
+        let mut q = sample_input("cpu-line");
+        q.cpu_type = Some("Q".to_string());
+        let updated = svc.update(created.id, q).await.unwrap();
+        assert_eq!(updated.cpu_type, "Q");
+
+        let mut omit = sample_input("cpu-line");
+        omit.host = "192.168.1.11".to_string();
+        omit.cpu_type = None;
+        let kept = svc.update(created.id, omit).await.unwrap();
+        assert_eq!(kept.host, "192.168.1.11");
+        assert_eq!(kept.cpu_type, "Q");
+
+        let mut blank = sample_input("cpu-line");
+        blank.cpu_type = Some(String::new());
+        let kept_blank = svc.update(created.id, blank).await.unwrap();
+        assert_eq!(kept_blank.cpu_type, "Q");
+
+        let mut bad = sample_input("cpu-line");
+        bad.cpu_type = Some("L".to_string());
+        match svc.update(created.id, bad).await.unwrap_err() {
+            BantoError::Validation { field_errors } => {
+                assert!(
+                    field_errors.iter().any(|e| e.field == "cpuType"),
+                    "{field_errors:?}"
+                );
+            }
+            other => panic!("expected validation, got {other:?}"),
+        }
+        assert_eq!(svc.get(created.id).await.unwrap().cpu_type, "Q");
     }
 
     #[tokio::test]
@@ -1944,6 +2053,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -1991,6 +2101,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -2025,6 +2136,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -2481,6 +2593,7 @@ mod tests {
             enabled: true,
             simulation: false,
             word_order: "low_high".to_string(),
+            cpu_type: None,
             database: Some("appdb".to_string()),
             username: Some("appuser".to_string()),
             password: None,
@@ -2635,6 +2748,7 @@ mod tests {
                 simulation: true,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -2668,6 +2782,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -3410,6 +3525,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,

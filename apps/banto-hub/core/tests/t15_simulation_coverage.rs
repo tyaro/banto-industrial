@@ -293,6 +293,7 @@ async fn create_connection(pool: &SqlitePool, name: &str, protocol: &str, port: 
             simulation: false,
 
             word_order: "low_high".to_string(),
+            cpu_type: None,
             database: None,
             username: None,
             password: None,

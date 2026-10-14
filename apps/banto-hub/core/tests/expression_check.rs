@@ -94,6 +94,7 @@ fn virtual_conn_input(name: &str) -> PlcConnectionInput {
         enabled: true,
         simulation: false,
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,

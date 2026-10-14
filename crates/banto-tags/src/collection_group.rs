@@ -673,6 +673,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -705,6 +706,7 @@ mod tests {
             enabled: true,
             simulation: false,
             word_order: "low_high".to_string(),
+            cpu_type: None,
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             password: None,

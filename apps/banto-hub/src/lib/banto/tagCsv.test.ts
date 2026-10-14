@@ -43,6 +43,7 @@ const CONN_A: PlcConnection = {
 	enabled: true,
 	simulation: false,
 	wordOrder: 'low_high',
+	cpuType: 'R',
 	database: null,
 	username: null,
 	passwordSet: false
@@ -57,6 +58,7 @@ const CONN_B: PlcConnection = {
 	enabled: true,
 	simulation: false,
 	wordOrder: 'low_high',
+	cpuType: 'R',
 	database: null,
 	username: null,
 	passwordSet: false
@@ -73,6 +75,7 @@ const CONN_PG: PlcConnection = {
 	enabled: true,
 	simulation: false,
 	wordOrder: 'low_high',
+	cpuType: 'R',
 	database: 'appdb',
 	username: 'appuser',
 	passwordSet: true

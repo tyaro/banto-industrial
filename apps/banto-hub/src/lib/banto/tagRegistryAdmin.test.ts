@@ -76,12 +76,14 @@ const connectionInput: PlcConnectionInput = {
 	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high'
+	wordOrder: 'low_high',
+	cpuType: 'R'
 };
 
 const connectionResource: PlcConnection = {
 	id: 1,
 	...connectionInput,
+	cpuType: 'R',
 	database: null,
 	username: null,
 	passwordSet: false

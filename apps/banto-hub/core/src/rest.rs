@@ -2251,6 +2251,11 @@ pub struct PlcConnectionPayload {
     /// プロトコル依存の既定が適用される。
     #[serde(default = "default_plc_word_order")]
     pub word_order: String,
+    /// #605: SLMP の CPU 種別（`"Q"` / `"R"`）。省略と空文字は
+    /// `banto_tags::PlcConnectionInput::cpu_type` と同じ意味
+    /// （作成は `"R"`、更新は既存の値を保つ）。未知の値は検証エラー。
+    #[serde(default)]
+    pub cpu_type: Option<String>,
     /// S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: "postgres"`
     /// 接続の DB 名。他プロトコルでは省略（`None`）のままにする -
     /// `banto_tags::plc_connection::validate_plc_connection_input`が
@@ -2290,6 +2295,8 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             // P3-b: wired through - see `PlcConnectionPayload::word_order`'s
             // doc comment.
             word_order: payload.word_order,
+            // #605: 省略は None のままサービスへ渡す（作成は R、更新は既存を保つ）。
+            cpu_type: payload.cpu_type,
             // S1: wired through verbatim - see `PlcConnectionPayload::database`/
             // `::username`/`::password`'s doc comments for the (create vs.
             // update) semantics of `password` specifically.
@@ -2346,6 +2353,8 @@ pub struct PlcConnectionResponse {
     pub enabled: bool,
     pub simulation: bool,
     pub word_order: String,
+    /// #605: `"Q"` または `"R"`。SLMP 以外の行も列は持つ（既定 `"R"`）。
+    pub cpu_type: String,
     pub database: Option<String>,
     pub username: Option<String>,
     /// S1: true のとき、この接続には非空のパスワードが保存されている
@@ -2366,6 +2375,7 @@ impl From<PlcConnection> for PlcConnectionResponse {
             enabled: conn.enabled,
             simulation: conn.simulation,
             word_order: conn.word_order,
+            cpu_type: conn.cpu_type.clone(),
             database: conn.database,
             username: conn.username,
             password_set,
@@ -3275,6 +3285,12 @@ pub struct PlcConnectionTestPayload {
     /// ため)。
     #[serde(default)]
     pub connection_id: Option<i64>,
+    /// #605: 直接ダイヤルの SLMP フレームに使う CPU 種別。省略・`"R"` は
+    /// iQ-R、`"Q"` は Q シリーズ。未知の値はダイヤルせず失敗にする。
+    /// 既存セッションを再利用する経路では、最後に適用された接続の CPU で
+    /// 読む（2 本目の TCP を張らない既存の制約と同じ）。
+    #[serde(default)]
+    pub cpu_type: Option<String>,
 }
 
 /// `POST /api/plc-connections/test` の応答。`ToSchema` は付けない - 下記
@@ -3294,6 +3310,22 @@ pub struct PlcConnectionTestError {
     pub kind: String,
     /// 日本語、対処ヒント込み。
     pub message: String,
+}
+
+/// #605: 接続テストの直接ダイヤルが使う CPU。省略・空・`"R"` は iQ-R、
+/// `"Q"` は Q シリーズ。それ以外はダイヤルせずエラーにする
+/// （収集側の「手編集行は R に倒す」とは違い、画面から来た未知の値は拒否する）。
+fn slmp_cpu_from_test_payload(
+    cpu_type: &Option<String>,
+) -> Result<banto_plc::SlmpCpu, PlcConnectionTestError> {
+    match cpu_type.as_deref() {
+        None | Some("") | Some("R") => Ok(banto_plc::SlmpCpu::R),
+        Some("Q") => Ok(banto_plc::SlmpCpu::Q),
+        Some(other) => Err(PlcConnectionTestError {
+            kind: "protocol".to_string(),
+            message: format!("CPU種別が不正です（Q または R を指定してください）: {other}"),
+        }),
+    }
 }
 
 /// [`PlcError`]を[`PlcConnectionTestError`]に分類する(Modbus・SLMP直接
@@ -3588,6 +3620,11 @@ async fn test_slmp_connection(
 
     // 直接ダイヤル(connectionId が無い、またはセッションが見つからない場合)。
     // SLMP は unit_id を使わないので port のみ検証する。
+    // #605: フォームの CPU 種別をフレームに載せる。未知の値はダイヤルしない。
+    let cpu = match slmp_cpu_from_test_payload(&payload.cpu_type) {
+        Ok(cpu) => cpu,
+        Err(err) => return (false, Some(err)),
+    };
     let port = match u16::try_from(payload.port) {
         Ok(port) => port,
         Err(_) => {
@@ -3604,6 +3641,7 @@ async fn test_slmp_connection(
     let config = SlmpConfig {
         host: payload.host.clone(),
         port,
+        cpu,
         connect_timeout: PLC_TEST_TIMEOUT,
         response_timeout: PLC_TEST_TIMEOUT,
         ..Default::default()
@@ -13711,6 +13749,7 @@ mod tests {
                 enabled: true,
                 simulation: false,
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -14375,6 +14414,7 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    cpu_type: None,
                     database: None,
                     username: None,
                     password: None,
@@ -14533,6 +14573,7 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    cpu_type: None,
                     database: None,
                     username: None,
                     password: None,

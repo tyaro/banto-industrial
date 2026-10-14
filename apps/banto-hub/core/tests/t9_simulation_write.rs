@@ -98,6 +98,7 @@ fn conn_input(name: &str, protocol: &str, port: u16, simulation: bool) -> PlcCon
         enabled: true,
         simulation,
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,

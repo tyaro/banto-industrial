@@ -1,7 +1,7 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
+状態: **実装追従中（2026-10-14 更新: §9 P3-b の SLMP CPU 種別を接続ごとに選べるようにした（#605、migration `0021`、既定 R。Q は QJ71E71 の 4E フレーム。アクセスルートは未露出）。2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
 セッションの確定は banto v2.0.0 の SessionController に寄せ、試運転は policy runner の `adopt`/`end` で
 確定・終了することを追記（v2 移行 PR1d、banto-hub v0.2.0-alpha.26。サーバー側の設計・wire は変更なし）。
 2026-09-30 更新: §4.1 のバインディングキーを外部名のみに改め、安定 ID によるリネーム検出を撤回（オーナー決定、scada-design.md §9.6）。2026-09-24 更新: §6 の 6 項に、書き込み受付の停止を DB と状態ファイルの
@@ -39,8 +39,8 @@ Hub タグを購読して値を受ける）の完了を §7 の移行表に反�
 A/B/C が揃った**。
 起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
-（Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
-バックログ。SLMP の word order 自体は #127 で完了済み）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
+（Windows 実機往復・72h soak）と P3-b の残件（SLMP アクセスルート露出。
+CPU 種別は #605 で接続ごとに選べる。word order 自体は #127 で完了済み）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
 オーナー判断待ちの未決事項は §10。T14 以降の運転計画・UI/UX 決定台帳は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)、docs 全体の地図は
 [README.md](README.md)。UX 改善（T9〜T13）の経緯は [ux-plan.md](ux-plan.md)（アーカイブ）。
@@ -1730,10 +1730,21 @@ SLMP 接続の収集が有効になった（管理 UI の「収集は未対応�
 同じ形で存在していた。`plc_connections.word_order`（migration `0010`、
 既定 `low_high` で後方互換）を追加し、`banto_tags::PlcConnection`/
 `PlcConnectionInput` → 両クレートの `SlmpConfig` 構築 → banto-hub の
-`plc-connections` フォーム（"slmp" 選択時のみ表示）まで配線した。CPU 種別 /
-アクセスルート（network/PC/IO/area id）は今回のスコープ外
+`plc-connections` フォーム（"slmp" 選択時のみ表示）まで配線した。当時、CPU 種別 /
+アクセスルート（network/PC/IO/area id）はスコープ外だった
 （`banto-collect::config::slmp_config_for` の doc comment に "Known
 limitation" として明記、別スライス候補）。
+
+**2026-10-14 追記（#605）**: CPU 種別は接続ごとに選べる。`plc_connections.cpu_type`
+（migration `0021`、既定 `R` で、この列を足す前の `SlmpCpu::R` と同じ）を
+収集・broker の読み書き・接続テスト・管理 UI / REST / MCP・構成パッケージまで
+配線した。Q は QJ71E71-100 などの 4E バイナリ（デバイス番地 4 バイト、
+サブコマンド `0x0000`/`0x0001`）。同じ IP・ポートで R から Q へ変えると
+broker セッションを捨てて作り直し、収集タスクも入れ替える。作成 API と、
+`cpuType` を持たない旧構成パッケージの取り込みは R になる。REST/MCP の
+更新でこの項目を省略したときは、既存行の値を保つ（Q を R に戻さない）。
+アクセスルートは引き続き未露出。L シリーズはフレームが Q 互換だが
+選択対象には入れていない。
 
 **2026-09-08 追記**: 上の `plc_connections.word_order` 列は SLMP 向けに
 導入したものだったが、同じ列を Modbus 経路が正しく参照していなかった

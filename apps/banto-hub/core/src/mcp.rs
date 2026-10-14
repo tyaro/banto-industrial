@@ -609,6 +609,11 @@ fn tool_definitions() -> Vec<Value> {
                         "enum": ["low_high", "high_low"],
                         "description": "SLMP のワード順。既定値 low_high。postgres では無視される(既定値で固定)。",
                     },
+                    "cpuType": {
+                        "type": "string",
+                        "enum": ["Q", "R"],
+                        "description": "SLMP の CPU 種別。省略時は R（iQ-R。Q シリーズは Q）。未知の値は拒否する。SLMP 以外では保存されるが使われない。",
+                    },
                     "database": {
                         "type": ["string", "null"],
                         "description": "protocol: postgres 接続の DB 名(必須)。他プロトコルでは null。",
@@ -647,7 +652,7 @@ fn tool_definitions() -> Vec<Value> {
         // (admin スコープ必須・有効化ガードなし)。
         json!({
             "name": "update_connection",
-            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。cpuType だけは省略でき、省略すると既存の CPU 種別を保つ。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -670,6 +675,11 @@ fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": ["low_high", "high_low"],
                         "description": "SLMP のワード順。postgres では無視される。",
+                    },
+                    "cpuType": {
+                        "type": "string",
+                        "enum": ["Q", "R"],
+                        "description": "SLMP の CPU 種別（Q または R）。省略すると既存の値を保つ（この項目を知らないクライアントが Q を R に戻さない）。未知の値は拒否する。必須キーには含めない。",
                     },
                     "database": {
                         "type": ["string", "null"],
@@ -722,6 +732,11 @@ fn tool_definitions() -> Vec<Value> {
                     "connectionId": {
                         "type": "integer",
                         "description": "保存済み接続を編集中にテストする場合のみ指定。SLMP で既存の broker セッションがあればそれを再利用し、2本目をダイヤルしない。",
+                    },
+                    "cpuType": {
+                        "type": "string",
+                        "enum": ["Q", "R"],
+                        "description": "SLMP の直接ダイヤルに使う CPU 種別。省略時は R。既存セッションを再利用するときは、最後に適用した接続の CPU で読む。",
                     },
                 },
                 "required": ["protocol", "host", "port"],

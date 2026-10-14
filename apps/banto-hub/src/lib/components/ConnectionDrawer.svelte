@@ -93,6 +93,7 @@
 		testSavedPlcConnection,
 		updatePlcConnection,
 		POSTGRES_PROTOCOL,
+		CPU_TYPE_OPTIONS,
 		WORD_ORDER_OPTIONS,
 		hasWordOrder,
 		type DbConnectionTestOutcome,
@@ -454,7 +455,8 @@
 				port: Number(form.port),
 				unitId: Number(form.unitId),
 				simulation: form.simulation,
-				connectionId: connection?.id
+				connectionId: connection?.id,
+				cpuType: form.protocol === 'slmp' ? form.cpuType : undefined
 			});
 		} catch (err) {
 			// 401/403・CSRF拒否・ネットワークエラーなど（`ok: false` はここに来ない
@@ -731,6 +733,20 @@
 					{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
 				</label>
 			{/if}
+			{#if form.protocol === 'slmp'}
+				<label class="field">
+					CPU種別
+					<select bind:value={form.cpuType} disabled={readOnly}>
+						{#each CPU_TYPE_OPTIONS as opt (opt.value)}
+							<option value={opt.value}>{opt.label}</option>
+						{/each}
+					</select>
+					<span class="hint">
+						MELSEC のフレーム形式です。QJ71E71 などの Q シリーズは Q、iQ-R は R
+						を選んでください。違うと接続できてもタグが Bad になります。既定は R です。
+					</span>
+				</label>
+			{/if}
 		{/if}
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
@@ -828,6 +844,12 @@
 				<dt>ワード順</dt>
 				<dd>
 					{WORD_ORDER_OPTIONS.find((o) => o.value === form.wordOrder)?.label ?? form.wordOrder}
+				</dd>
+			{/if}
+			{#if form.protocol === 'slmp'}
+				<dt>CPU種別</dt>
+				<dd>
+					{CPU_TYPE_OPTIONS.find((o) => o.value === form.cpuType)?.label ?? form.cpuType}
 				</dd>
 			{/if}
 		{/if}

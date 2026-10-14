@@ -167,6 +167,7 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			enabled: true,
 			simulation: false,
 			wordOrder: 'high_low',
+			cpuType: 'R',
 			database: '',
 			username: '',
 			password: '',
@@ -185,6 +186,7 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			enabled: true,
 			simulation: false,
 			wordOrder: 'high_low',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false
@@ -198,6 +200,7 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			enabled: true,
 			simulation: false,
 			wordOrder: 'high_low',
+			cpuType: 'R',
 			database: '',
 			username: '',
 			password: '',
@@ -216,6 +219,7 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false
@@ -228,7 +232,8 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high'
+			wordOrder: 'low_high',
+			cpuType: 'R'
 		});
 	});
 
@@ -243,6 +248,7 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser',
 			passwordSet: true
@@ -277,6 +283,7 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			// フォーム自体は onProtocolChange を経由しない素の状態遷移
 			// （spread による直接上書き）なので、追従ロジックの対象外。
 			wordOrder: 'high_low',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser',
 			password: 'hunter2'
@@ -397,6 +404,7 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'high_low',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false
@@ -417,6 +425,7 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'high_low',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false
@@ -437,6 +446,7 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'high_low',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false

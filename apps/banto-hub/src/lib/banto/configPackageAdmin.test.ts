@@ -108,7 +108,8 @@ const pkg: ConfigPackage = {
 			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high'
+			wordOrder: 'low_high',
+			cpuType: 'R'
 		}
 	],
 	collectionGroups: [
@@ -218,6 +219,7 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 				enabled: true,
 				simulation: false,
 				wordOrder: 'low_high',
+				cpuType: 'R',
 				database: null,
 				username: null,
 				passwordSet: false
@@ -233,6 +235,7 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false
@@ -298,6 +301,7 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false
@@ -357,6 +361,7 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: null,
 			username: null,
 			passwordSet: false
@@ -425,6 +430,7 @@ describe('applyConfigPackage: postgres（DB Source）接続の import はパス�
 					enabled: true,
 					simulation: false,
 					wordOrder: 'low_high',
+					cpuType: 'R',
 					database: 'appdb',
 					username: 'appuser'
 				}
@@ -445,6 +451,7 @@ describe('applyConfigPackage: postgres（DB Source）接続の import はパス�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser',
 			passwordSet: false
@@ -463,6 +470,7 @@ describe('applyConfigPackage: postgres（DB Source）接続の import はパス�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser'
 		});
@@ -489,6 +497,7 @@ describe('applyConfigPackage: postgres（DB Source）グループの querySql �
 					enabled: true,
 					simulation: false,
 					wordOrder: 'low_high',
+					cpuType: 'R',
 					database: 'appdb',
 					username: 'appuser'
 				}
@@ -515,6 +524,7 @@ describe('applyConfigPackage: postgres（DB Source）グループの querySql �
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser',
 			passwordSet: false
@@ -563,6 +573,7 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 		enabled: true,
 		simulation: false,
 		wordOrder: 'low_high' as const,
+		cpuType: 'R' as const,
 		database: 'appdb',
 		username: 'appuser'
 	};
@@ -587,6 +598,7 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 				enabled: true,
 				simulation: false,
 				wordOrder: 'low_high',
+				cpuType: 'R',
 				database: 'appdb',
 				username: 'appuser',
 				passwordSet: true
@@ -610,6 +622,7 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 				enabled: true,
 				simulation: false,
 				wordOrder: 'low_high',
+				cpuType: 'R',
 				database: 'appdb',
 				username: 'appuser',
 				passwordSet: false
@@ -633,6 +646,7 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 				enabled: true,
 				simulation: false,
 				wordOrder: 'low_high',
+				cpuType: 'R',
 				database: null,
 				username: null,
 				passwordSet: false
@@ -649,7 +663,8 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high'
+					wordOrder: 'low_high',
+					cpuType: 'R'
 				},
 				{
 					name: 'plc2',
@@ -659,7 +674,8 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high'
+					wordOrder: 'low_high',
+					cpuType: 'R'
 				}
 			])
 		);
@@ -685,6 +701,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 				enabled: true,
 				simulation: false,
 				wordOrder: 'low_high',
+				cpuType: 'R',
 				database: 'appdb',
 				username: 'appuser'
 			}
@@ -716,6 +733,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser',
 			passwordSet: false
@@ -831,6 +849,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser',
 			passwordSet: false

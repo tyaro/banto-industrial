@@ -1570,6 +1570,7 @@ mod tests {
                 enabled: true,
                 simulation: false,
                 word_order: "high_low".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,

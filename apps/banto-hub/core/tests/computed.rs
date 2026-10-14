@@ -104,6 +104,7 @@ fn modbus_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,
@@ -121,6 +122,7 @@ fn virtual_conn_input(name: &str) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,
@@ -1127,6 +1129,7 @@ fn slmp_conn_input(name: &str, simulation: bool) -> PlcConnectionInput {
         simulation,
 
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,

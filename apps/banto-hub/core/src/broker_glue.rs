@@ -587,6 +587,17 @@ impl HubSessions {
 /// へ改名した。以降のこの struct の doc comment は「SLMP 専用」ではなく
 /// 実際の挙動（任意の broker 管理対象プロトコル）を説明する。
 ///
+/// #605: broker セッションを捨てて作り直すかの比較キー。
+/// host/port が同じでも SLMP の CPU 種別が変わっていれば別セッションにする
+/// （`ensure_connection` は接続 id だけで既存セッションを再利用するため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialIdentity {
+    host: String,
+    port: i64,
+    /// `protocol == "slmp"` のとき `cpu_type`。それ以外は空文字。
+    slmp_cpu: String,
+}
+
 /// [`HubSessions`] と対の
 /// ライフサイクル(`bin/banto_hub`が構築し、`CollectorManager`の外で
 /// `rebuild`を跨いで生存させ、プロセス終了時に一度だけ [`Self::shutdown`])
@@ -612,7 +623,10 @@ pub struct BrokerSimRegistry {
     /// 各接続 id について直近に「実際にダイヤルした(host, port)」を記録する -
     /// [`Self::resolve`]が「宛先が変わったか」を判定するための唯一の情報源。
     /// エントリなし(`None`)は「初回」を意味し、常に "changed" 扱いになる。
-    last_target: tokio::sync::Mutex<HashMap<i64, (String, i64)>>,
+    /// 各接続 id について直近に解決した宛先。host/port に加え、SLMP のときは
+    /// CPU 種別も載せる（#605）。同じ IP・ポートで R→Q に変えても、ここが
+    /// 違えば `changed` になり、呼び出し側が古い broker セッションを捨てる。
+    last_target: tokio::sync::Mutex<HashMap<i64, DialIdentity>>,
 }
 
 impl BrokerSimRegistry {
@@ -720,8 +734,20 @@ impl BrokerSimRegistry {
         drop(simulators);
 
         let mut last_target = self.last_target.lock().await;
-        let changed = last_target.get(&conn.id) != Some(&target);
-        last_target.insert(conn.id, target.clone());
+        // #605: SLMP だけ CPU 種別を同一性に含める。Modbus のセッションは
+        // この列を使わないので、列の値が変わっても再接続しない。
+        let slmp_cpu = if conn.protocol == "slmp" {
+            conn.cpu_type.clone()
+        } else {
+            String::new()
+        };
+        let identity = DialIdentity {
+            host: target.0.clone(),
+            port: target.1,
+            slmp_cpu,
+        };
+        let changed = last_target.get(&conn.id) != Some(&identity);
+        last_target.insert(conn.id, identity);
         (target.0, target.1, changed)
     }
 
@@ -863,6 +889,7 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            cpu_type: "R".to_string(),
             database: None,
             username: None,
             password: None,
@@ -920,6 +947,69 @@ mod tests {
         }
     }
 
+    /// #605: 同じ host/port で CPU だけ R→Q に変えると `resolve` が changed を
+    /// 返し、セッションを捨てて作り直すとフレームのサブコマンドが Q になる。
+    /// 捨てずに `ensure_connection` だけ呼ぶと id 再利用で R のまま残る。
+    /// Modbus は CPU 列をセッションの同一性に含めない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpu_only_change_replaces_the_slmp_broker_session() {
+        use banto_plc::{Address, BatchReadRequest, DataType, ReadRequest};
+
+        let sim = Simulator::start().await;
+        let sessions = HubSessions::new(banto_broker::BackoffConfig::default());
+        let registry = BrokerSimRegistry::new();
+        let mut conn = slmp_conn(1, sim.addr.port());
+
+        let (_, _, changed) = registry.resolve(&conn).await;
+        assert!(changed);
+        sessions.ensure_connection(&conn).expect("R session");
+        read_until_connected(&sessions, conn.id).await;
+        assert_eq!(sim.last_subcommand(), Some(0x0002), "既定 R のワード読み");
+
+        let (_, _, changed) = registry.resolve(&conn).await;
+        assert!(!changed, "同じ CPU ではセッションを捨てない");
+
+        conn.cpu_type = "Q".to_string();
+        let (_, _, changed) = registry.resolve(&conn).await;
+        assert!(changed, "CPU だけの変更でも changed");
+        assert!(sessions.remove(conn.id));
+        sessions.ensure_connection(&conn).expect("Q session");
+        read_until_connected(&sessions, conn.id).await;
+        assert_eq!(
+            sim.last_subcommand(),
+            Some(0x0000),
+            "作り直したセッションは Q"
+        );
+
+        let mut modbus = modbus_conn(2, 502);
+        let (_, _, changed) = registry.resolve(&modbus).await;
+        assert!(changed);
+        modbus.cpu_type = "Q".to_string();
+        let (_, _, changed) = registry.resolve(&modbus).await;
+        assert!(!changed, "Modbus は CPU 列では再接続しない");
+
+        sessions.shutdown().await;
+        sim.stop();
+
+        async fn read_until_connected(sessions: &HubSessions, id: i64) {
+            let handle = sessions.handle_for(id).expect("handle");
+            let request = BatchReadRequest::Numeric(ReadRequest {
+                address: Address::parse_slmp("D0").expect("addr"),
+                data_type: DataType::U16,
+            });
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match handle.read(vec![request]).await {
+                    Ok(_) => return,
+                    Err(_) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(err) => panic!("read failed: {err}"),
+                }
+            }
+        }
+    }
+
     fn spec_for(conn: &PlcConnection) -> banto_collect::ClientSpec {
         banto_collect::ClientSpec {
             protocol: match conn.protocol.as_str() {
@@ -931,6 +1021,7 @@ mod tests {
             port: conn.port as u16,
             unit_id: conn.unit_id as u8,
             word_order: banto_plc::WordOrder::LowHigh,
+            cpu: banto_plc::SlmpCpu::R,
             connect_timeout: std::time::Duration::from_millis(200),
             response_timeout: std::time::Duration::from_millis(200),
         }

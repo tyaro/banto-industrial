@@ -171,6 +171,7 @@ async fn register(pool: &SqlitePool, port: u16) -> Vec<RegisteredGroup> {
             // ではなく、外に立てたシミュレータを普通の PLC として登録する。
             simulation: false,
             word_order: String::new(),
+            cpu_type: None,
             database: None,
             username: None,
             password: None,

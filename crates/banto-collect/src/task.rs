@@ -129,7 +129,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use banto_plc::{
-    ModbusTcpClient, PlcClient, PlcError, ReadResult, SlmpClient, TagValue, WordOrder,
+    ModbusTcpClient, PlcClient, PlcError, ReadResult, SlmpClient, SlmpCpu, TagValue, WordOrder,
 };
 use banto_tags::scale_raw;
 use banto_tstore::{Clock, TsWriter};
@@ -295,6 +295,12 @@ pub struct ClientSpec {
     /// decode with `WordOrder::default()` no matter what the connection was
     /// registered with.
     pub word_order: WordOrder,
+    /// #605: SLMP の CPU 種別。Modbus では読まれない（`SlmpCpu::R` を入れておく）。
+    /// `slmp_config_for` が `plc_connections.cpu_type` から埋めた値を、
+    /// [`default_client_factory`] が `..Default::default()` に頼らず読む。
+    /// ここを落とすと収集の直接クライアントだけが常に R フレームになる
+    /// （#334 の `word_order` と同じ落ち方）。
+    pub cpu: SlmpCpu,
 }
 
 /// A caller-supplied seam for building the `PlcClient` a connection task
@@ -348,6 +354,7 @@ fn client_spec(plan: &ConnectionPlan) -> ClientSpec {
             connect_timeout: cfg.connect_timeout,
             response_timeout: cfg.response_timeout,
             word_order: cfg.word_order,
+            cpu: SlmpCpu::R,
         },
         ProtocolConfig::Slmp(cfg) => ClientSpec {
             connection_key: plan.key.clone(),
@@ -358,6 +365,7 @@ fn client_spec(plan: &ConnectionPlan) -> ClientSpec {
             connect_timeout: cfg.connect_timeout,
             response_timeout: cfg.response_timeout,
             word_order: cfg.word_order,
+            cpu: cfg.cpu,
         },
         // `crate::collector` spawns `run_external_connection` for these, never
         // `run_connection` (the only caller of this function).
@@ -393,6 +401,7 @@ pub fn default_client_factory() -> ClientFactory {
                 connect_timeout: spec.connect_timeout,
                 response_timeout: spec.response_timeout,
                 word_order: spec.word_order,
+                cpu: spec.cpu,
                 ..banto_plc::SlmpConfig::default()
             })),
         }
@@ -2022,5 +2031,51 @@ mod tests {
     fn client_spec_carries_slmp_word_order_low_high() {
         let spec = client_spec(&slmp_plan(WordOrder::LowHigh));
         assert_eq!(spec.word_order, WordOrder::LowHigh);
+    }
+
+    /// #605: `ClientSpec` が SLMP の CPU を落とすと、直接クライアントは常に R
+    /// になる（#334 の word_order と同じ穴）。
+    #[test]
+    fn client_spec_carries_slmp_cpu() {
+        let mut plan = slmp_plan(WordOrder::LowHigh);
+        match &mut plan.config {
+            ProtocolConfig::Slmp(cfg) => cfg.cpu = SlmpCpu::Q,
+            _ => panic!("slmp plan"),
+        }
+        assert_eq!(client_spec(&plan).cpu, SlmpCpu::Q);
+    }
+
+    /// #605: factory が `spec.cpu` をフレームに載せる。Q のワード読みは
+    /// サブコマンド `0x0000`、R は `0x0002`。
+    #[tokio::test]
+    async fn default_client_factory_sends_the_configured_cpu_subcommand() {
+        use banto_plc::slmp::simulator::Simulator;
+        use banto_plc::{Address, DataType, ReadRequest};
+
+        for (cpu, sub) in [(SlmpCpu::R, 0x0002u16), (SlmpCpu::Q, 0x0000u16)] {
+            let sim = Simulator::start().await;
+            let spec = ClientSpec {
+                connection_key: "conn:1".to_string(),
+                protocol: ClientProtocol::Slmp,
+                host: sim.addr.ip().to_string(),
+                port: sim.addr.port(),
+                unit_id: 0,
+                connect_timeout: Duration::from_millis(500),
+                response_timeout: Duration::from_millis(500),
+                word_order: WordOrder::LowHigh,
+                cpu,
+            };
+            let mut client = default_client_factory()(&spec);
+            client.connect().await.expect("connect");
+            client
+                .read_batch(&[ReadRequest {
+                    address: Address::parse_slmp("D0").expect("addr"),
+                    data_type: DataType::U16,
+                }])
+                .await
+                .expect("read");
+            assert_eq!(sim.last_subcommand(), Some(sub), "{cpu:?}");
+            sim.stop();
+        }
     }
 }
