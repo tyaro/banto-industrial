@@ -458,10 +458,12 @@ pub struct EngineServices {
 
 impl EngineServices {
     /// listener に載せるルーター（REST・SSE・静的 UI、最外に `with_security_headers`。
-    /// banto #500）。`loopback_local` は、実際に loopback のアドレスに bind できた
-    /// `chronogazer-server` の常時の listener のものか（`localDesktop` の grant を開け、
-    /// 最初の管理者の作成に Host の確認をかける。#392 B2-1、[`crate::local_grant`]）。
-    pub fn router(&self, allow_setup: bool, loopback_local: bool) -> Router {
+    /// banto #500）。`always_on_listener` は `chronogazer-server` の常時の listener の印
+    /// （`127.0.0.1` でも、`0.0.0.0` にまとめた 1 本でも `true`。bind のアドレスは見ない）。
+    /// `true` のルーターでは、この PC からの要求（要求ごとに peer と Host の両方が
+    /// loopback）にだけ `localDesktop` の grant を開け、最初の管理者の作成にも同じ確認を
+    /// かける（#392 B2-1、[`crate::local_grant`]）。LAN 専用の listener は `false`。
+    pub fn router(&self, allow_setup: bool, always_on_listener: bool) -> Router {
         // LAN の listener を入れ替えるときに載せるルーター（REST の `PUT
         // /api/settings/server`）。閉じた形（setup も grant も無し）。この関数は
         // `EngineServices` の写しを持つので、slot → listener → ルーター → この関数 →
@@ -474,7 +476,7 @@ impl EngineServices {
         let access = HostAccess {
             local: LocalAccess {
                 start: self.local_grant,
-                always_on_listener: loopback_local,
+                always_on_listener,
             },
             lan: LanControl {
                 slot: self.lan_slot.clone(),
@@ -630,8 +632,9 @@ pub struct OpenedEngine {
     loopback: Option<ServerConfig>,
     /// 常時の listener を開けなかったときの代わり（[`OpenedEngine::with_loopback_fallback`]）。
     loopback_fallback: Option<ServerConfig>,
-    /// 最初の管理者の作成とこの PC からの接続（`localDesktop`）を、loopback に bind
-    /// できた listener だけに開ける（[`OpenedEngine::with_loopback_local_access`]）。
+    /// 常時の listener のルーターで、最初の管理者の作成とこの PC からの接続
+    /// （`localDesktop`）を、この PC からの要求にだけ開ける
+    /// （[`OpenedEngine::with_loopback_local_access`]）。
     loopback_local_access: bool,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -964,8 +967,8 @@ impl OpenedEngine {
         // 再起動で反映 - `crate::local_grant`）。bind のアドレス（`0.0.0.0` にまとめたか）
         // では決めない: 「この PC から」は要求ごとに peer と Host で確かめる
         // （2026-10-14 オーナー決定）。
-        let loopback_is_local = loopback_local_access && bound_loopback.is_some();
-        let local_grant = if loopback_is_local {
+        let always_on_local_access = loopback_local_access && bound_loopback.is_some();
+        let local_grant = if always_on_local_access {
             LocalGrantStart::resolve(&users, &settings, label).await
         } else {
             LocalGrantStart::Unsupported
@@ -1009,7 +1012,10 @@ impl OpenedEngine {
         let server =
             bound.map(|bound: BoundServer| bound.serve(services.router(lan_allow_setup, false)));
         let loopback_server = bound_loopback.map(|bound: BoundServer| {
-            bound.serve(services.router(cfg.allow_setup || loopback_is_local, loopback_is_local))
+            bound.serve(services.router(
+                cfg.allow_setup || always_on_local_access,
+                always_on_local_access,
+            ))
         });
         *lan_slot.lock().await = server;
         *loopback_slot.lock().await = loopback_server;
@@ -1685,8 +1691,8 @@ mod tests {
         assert!(matches!(result, Err(EngineStartError::Listen { .. })));
     }
 
-    /// #598 のレビュー: `with_loopback_local_access` は、loopback に bind できた常時の
-    /// listener だけで最初の管理者の作成を開け、LAN の listener（と後の入れ替えの
+    /// #598 のレビュー: `with_loopback_local_access` は、常時の listener（の、この PC
+    /// からの要求）だけで最初の管理者の作成を開け、LAN の listener（と後の入れ替えの
     /// ルーター）は閉じる - アドレスが loopback でも LAN の slot は閉じる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn setup_opens_only_on_the_always_on_listener() {
@@ -2197,7 +2203,7 @@ mod tests {
             .find(|ip| !ip.is_loopback())
     }
 
-    /// `localDesktop` は loopback に bind できた常時の listener だけで発行し、LAN の
+    /// `localDesktop` は常時の listener（の、この PC からの要求）だけで発行し、LAN の
     /// slot の listener（アドレスが loopback でも）では `403`。Host が loopback で
     /// なければ常時の listener でも `403`（本物の serve の `ConnectInfo` の上で）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

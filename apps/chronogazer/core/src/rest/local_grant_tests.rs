@@ -740,3 +740,83 @@ async fn auth_disabled_fields_are_refused_even_when_null() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
 }
+
+/// #600 のオーナーレビュー P2: kind を percent encode した別表記
+/// （`local%44esktop`・`%6CocalDesktop`）でも、banto の発行口は decode して発行する。
+/// 発行と `login`（`via: localGrant`）の監査は 1 対 1 で、別表記でも LAN の peer・別の
+/// Host は `403` のまま。接頭辞・status・setup を別表記にした要求はどのルートにも
+/// 当たらない（axum は生のパスで振り分ける。`404` か外側の認証の層の `401`）ので、
+/// 確認を素通りしない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_kind_spellings_are_audited_and_still_checked() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let spellings = [
+        "/api/auth/grant/localDesktop",
+        "/api/auth/grant/local%44esktop",
+        "/api/auth/grant/%6CocalDesktop",
+        "/api/auth/grant/%6c%6f%63%61%6c%44%65%73%6b%74%6f%70",
+    ];
+    for path in spellings {
+        for (peer, host) in [
+            (Some(LAN), Some(LOCAL_HOST)),
+            (Some(LOCAL), Some("evil.example")),
+        ] {
+            let (status, body) = send(&f.router, "POST", path, peer, host, None, None).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{path} {peer:?} {host:?}: {body}"
+            );
+        }
+    }
+    assert_eq!(grant_logins(&f.audit).await, 0);
+    for (i, path) in spellings.iter().enumerate() {
+        let (status, body) = send(
+            &f.router,
+            "POST",
+            path,
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let token = body["token"].as_str().expect("token");
+        let (_, me) = identity(&f.router, token).await;
+        assert_eq!(me["kind"], "localDesktop", "{path}: {me}");
+        assert_eq!(
+            grant_logins(&f.audit).await,
+            i + 1,
+            "{path} の発行が監査に残らない"
+        );
+    }
+
+    // 別表記の接頭辞・status・setup は、LAN から送っても何も開けない。
+    let setup = json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" });
+    for (method, path, body) in [
+        ("POST", "/api/auth/gr%61nt/localDesktop", None),
+        ("GET", "/api/auth/st%61tus", None),
+        ("POST", "/api/auth/s%65tup", Some(setup.clone())),
+        ("POST", "/api/auth/setup/", Some(setup)),
+    ] {
+        let (status, response) = send(
+            &f.router,
+            method,
+            path,
+            Some(LAN),
+            Some(LOCAL_HOST),
+            None,
+            body,
+        )
+        .await;
+        // どのルートにも当たらない（`404`、または外側の認証の層の `401`）。
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED,
+            "{path}: {status} {response}"
+        );
+        assert!(response.get("token").is_none(), "{path}: {response}");
+        assert!(response.get("grants").is_none(), "{path}: {response}");
+    }
+    assert!(!f.users.is_initialized().await.unwrap());
+}

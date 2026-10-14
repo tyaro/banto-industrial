@@ -369,14 +369,22 @@ pub async fn local_access_middleware(
         }
     }
 
-    let is_local_grant_issue =
-        is_post && path.strip_prefix(GRANT_PREFIX) == Some(LOCAL_DESKTOP_GRANT_KIND);
+    // 発行の監査は、生のパスの kind ではなく**発行されたトークンのセッションの kind**で
+    // 判断する（#600 のオーナーレビュー P2）: banto の発行口は `Path<String>` で kind を
+    // percent decode するので、`/api/auth/grant/local%44esktop` でも `localDesktop` が
+    // 発行される。生の文字列と比べると、その別表記で発行の監査が抜けていた。
+    // （peer と Host の確認は接頭辞 `/api/auth/grant/` で掛けるので別表記でも素通り
+    // しない。axum のルーティングは decode しない生のパスで行うので、接頭辞・status・
+    // setup・users を別表記にした要求はどのルートにも当たらない。）
+    let is_grant_issue = is_post && path.starts_with(GRANT_PREFIX);
 
     let response = next.run(req).await;
 
-    if is_local_grant_issue && response.status().is_success() {
-        record_grant_login(&state).await;
-    }
+    let response = if is_grant_issue && response.status().is_success() {
+        audit_issued_grant(&state, response).await
+    } else {
+        response
+    };
     if is_setup && response.status().is_success() {
         revoke_bootstrap_grants(&state).await;
     }
@@ -422,14 +430,42 @@ async fn refuse_first_account_by_grant(
     }
 }
 
-/// 発行の成功を監査に残す（モジュール doc「監査」）。
-async fn record_grant_login(state: &LocalAccessState) {
-    let role = state
-        .access
-        .start
-        .issued_role()
-        .map(|role| role.as_str())
-        .unwrap_or("viewer");
+/// grant の発行の応答の上限（`{success, token}` だけなので十分に小さい）。
+const GRANT_RESPONSE_LIMIT: usize = 64 * 1024;
+
+/// 発行の成功の応答から発行されたトークンを読み、そのセッションの kind が
+/// `localDesktop` なら監査に残す。応答はそのまま組み直して返す。
+async fn audit_issued_grant(state: &LocalAccessState, response: Response) -> Response {
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, GRANT_RESPONSE_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            // 読めなければトークンを渡せない（発行は成り立たない）。理由だけ残す。
+            eprintln!("grant の発行の応答を読めませんでした: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody::Other {
+                    message: "grant の発行の応答を読めませんでした".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let token = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value["token"].as_str().map(str::to_owned));
+    if let Some(token) = token {
+        if let Ok(Some(session)) = state.auth.authenticate(&token).await {
+            if session.grant.as_ref().map(GrantKind::as_str) == Some(LOCAL_DESKTOP_GRANT_KIND) {
+                record_grant_login(state, &session.identity.role).await;
+            }
+        }
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+/// 発行の成功を監査に残す（モジュール doc「監査」）。`role` は発行したセッションのもの。
+async fn record_grant_login(state: &LocalAccessState, role: &str) {
     state
         .audit
         .record(AuditEntry {
