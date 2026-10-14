@@ -64,6 +64,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use banto_exit_once::{ExitCleanupOnce, ExitCleanupReport};
+use chronogazer_core::local_grant::LocalGrantStart;
 use chronogazer_core::paths::{resolve_data_root_from_env, DataLayout};
 use chronogazer_core::server_host::{
     self, ServerLog, ServerShutdownSummary, StartedServer, CLOSE_MARGIN, CLOSE_WAIT,
@@ -797,19 +798,26 @@ async fn announce(server: &StartedServer) {
             "{SERVER_LABEL}: LAN の待ち受けを開けませんでした（この PC からは使えます）: {err}"
         );
     }
-    // 最初の管理者の作成（`/api/auth/setup`）は listener ごと（#598 監査 F2）: loopback の
-    // アドレスに bind できた常時の listener だけで開き、LAN の listener では閉じる。
-    // 特定の LAN の IP を別に開いた 2 本の形でも、この PC の 127.0.0.1 からは作れる。
-    // `0.0.0.0` の 1 本にまとめたときだけ、この PC からも作れない。
-    if server.exposes_lan().await {
-        match engine.loopback_addr().await {
-            Some(addr) if addr.ip().is_loopback() => println!(
-                "{SERVER_LABEL}: 最初の管理者の作成（/api/auth/setup）は LAN の待ち受けでは閉じています（この PC の http://127.0.0.1:{}/ からは作れます）",
-                addr.port()
+    // 最初の管理者の作成（`/api/auth/setup`）とこの PC からの接続（`localDesktop`、
+    // #392 B2-1）は、常時の listener への、この PC からの要求（peer と Host の両方が
+    // loopback）だけで開く（2026-10-14 オーナー決定。`0.0.0.0` にまとめても同じ）。
+    if let Some(addr) = engine.loopback_addr().await {
+        let port = addr.port();
+        if server.exposes_lan().await {
+            println!(
+                "{SERVER_LABEL}: 最初の管理者の作成とログインなしの接続は、この PC の http://127.0.0.1:{port}/ からだけ行えます（LAN からは閉じています）"
+            );
+        }
+        let local_grant = engine.services().local_grant;
+        match local_grant.issued_role() {
+            Some(_) if local_grant == LocalGrantStart::Uninitialized => println!(
+                "{SERVER_LABEL}: 最初の管理者を作るまでの間、この PC（http://127.0.0.1:{port}/）からはログインなしで管理者として入れます"
             ),
-            _ => println!(
-                "{SERVER_LABEL}: LAN に公開した 1 本の待ち受け（0.0.0.0）にまとめているため、最初の管理者の作成（/api/auth/setup）はこの PC からも閉じています"
+            Some(role) => println!(
+                "{SERVER_LABEL}: この PC（http://127.0.0.1:{port}/）からはログインなしで {} として入れます（設定 auth.local_grant）",
+                role.as_str()
             ),
+            None => {}
         }
     }
     if let Some(err) = server.endpoint_error() {

@@ -48,11 +48,12 @@ mod startup;
 mod tray;
 
 use banto_core::{BantoError, FieldError, ListParams};
-use banto_server::{
-    bind as bind_listener, lan_urls_for_bind, BoundServer, GrantKind, RunningServer, ServerConfig,
-};
+use banto_server::ServerConfig;
 use chronogazer_core::audit::{AuditEntry, AuditLogList, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, PendingRestoreInfo};
+use chronogazer_core::server_admin::{
+    apply_server_settings, ApplyActor, ApplyContext, LanControl, ServerStatusView,
+};
 // #383 段階2b / R1-C: 収集サービス。C-2 で `collect_*` コマンドと起動時の
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
@@ -100,8 +101,6 @@ use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 use chronogazer_core::{CollectionGroup, Tag};
 // #392 B1-2: 終了の後始末を 1 回に限る入れ物（banto-hub と共有、#586）。
 use banto_desktop_tray::{ExitCleanupOnce, ExitCleanupOutcome};
-use qrcode::render::svg;
-use qrcode::QrCode;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -693,6 +692,9 @@ async fn setup_body(
     password: String,
     display_name: String,
 ) -> Result<LoginResult, BantoError> {
+    // #600 のレビュー: 合成の identity と同じアカウント名は作らせない
+    // （`chronogazer_core::local_grant::RESERVED_USERNAMES`、REST と同じ判定・同じ誤り）。
+    chronogazer_core::local_grant::check_username_not_reserved(&username)?;
     let (_, seq_at_entry) = read_slot(state);
     // Owner decision on banto #266 (S-95): in auth-disabled mode no account session
     // is ever installed. Checked on entry so no account is created for a
@@ -1619,90 +1621,19 @@ async fn autologin_disable(state: State<'_, AppState>) -> Result<(), BantoError>
     autologin_disable_body(&state).await
 }
 
-/// One LAN access URL plus its QR code, rendered as an inline SVG string
-/// (spec §11.4).
-#[derive(Debug, Clone, Serialize)]
-struct QrSvgEntry {
-    url: String,
-    svg: String,
-}
-
 /// `server_status`/`server_apply`'s shared response shape - mirrors
-/// `src/lib/banto/serverAdmin.ts::ServerStatus` field-for-field.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerStatusResult {
-    enabled: bool,
-    running: bool,
-    bind: String,
-    port: u16,
-    /// 閲覧公開 (ADR-0012; I2b, 2026-10-04 owner decision): whether LAN
-    /// clients may obtain a synthetic `viewer` session without logging in.
-    /// Persisted alongside the other server settings and therefore reported
-    /// (and applied) here, even though it only ever has an effect on the LAN
-    /// surface, not in this window (admin-template v3.0.0 と同じ).
-    viewer_public: bool,
-    urls: Vec<String>,
-    qr_svgs: Vec<QrSvgEntry>,
-}
+/// `src/lib/banto/serverAdmin.ts::ServerStatus` field-for-field. #392 B2-1: moved
+/// to `chronogazer_core::server_admin` (the REST `/api/settings/server` returns
+/// the same shape); `restartRequired` is always `false` on the desktop.
+type ServerStatusResult = ServerStatusView;
 
-/// Render `data` (a LAN access URL) as an inline SVG QR code (spec §11.4).
-/// Falls back to an empty string on an encoding failure rather than
-/// panicking - our inputs are short `http://host:port` strings well within
-/// QR capacity, so this should not happen in practice, but this only feeds
-/// a settings-screen `{@html}` display, not anything load-bearing.
-fn qr_svg_for(data: &str) -> String {
-    QrCode::new(data)
-        .map(|code| code.render::<svg::Color>().min_dimensions(160, 160).build())
-        .unwrap_or_default()
-}
-
-/// `running` is the embedded server's bound address while it runs. Its URLs
-/// then come from that address (`chronogazer_core::listening_urls`, the same
-/// as `banto-serve`'s startup log - PR1a オーナーレビュー P3); with no server
-/// running they come from the saved `bind`/`port` (the settings screen only
-/// offers IP choices for `bind`, so it parses).
+/// The desktop's status: `running` is the embedded server's bound address
+/// while it runs (`chronogazer_core::server_admin::build_status`).
 fn build_status(
     config: &ServerSettings,
     running: Option<std::net::SocketAddr>,
 ) -> ServerStatusResult {
-    let urls = match running {
-        Some(addr) => chronogazer_core::listening_urls(addr),
-        None => lan_urls_for_bind(&config.bind, config.port),
-    };
-    let qr_svgs = urls
-        .iter()
-        .map(|url| QrSvgEntry {
-            url: url.clone(),
-            svg: qr_svg_for(url),
-        })
-        .collect();
-    ServerStatusResult {
-        enabled: config.enabled,
-        running: running.is_some(),
-        bind: config.bind.clone(),
-        port: config.port,
-        viewer_public: config.viewer_public,
-        urls,
-        qr_svgs,
-    }
-}
-
-/// Start serving the full `/api/*` + static-asset router (spec §11.1,
-/// `EngineServices::router`, with `with_security_headers` outermost - banto
-/// #500) on an already-[`bind_listener`]-ed listener (infallible: the bind -
-/// the only step that can fail - happened before, so callers can do work such
-/// as saving settings between bind and serve; banto #294 review). Used by
-/// [`server_apply_body`] (spec §11.4's 「保存して適用」button); the auto-start
-/// on launch is the engine's (`EngineListen::BestEffort`).
-///
-/// `allow_setup: false` - the Tauri app's first-run setup goes through the
-/// `auth_setup` command above (`invoke()`, no network involved), not this
-/// REST endpoint. Only `banto-serve` (this repo's Tauri-free dev vehicle)
-/// opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`. The shared
-/// `rest_auth` is in `services`, so tokens outlive a restart.
-fn serve_embedded(state: &AppState, bound: BoundServer) -> RunningServer {
-    bound.serve(state.services.router(false))
+    chronogazer_core::server_admin::build_status(config, running, false)
 }
 
 /// `GET`-ish command: current persisted settings + live running state (spec
@@ -1743,8 +1674,9 @@ async fn server_status(state: State<'_, AppState>) -> Result<ServerStatusResult,
 /// viewer token under a stale `viewer_public`). Serving a bound listener
 /// cannot fail, so there is no state in which the settings are saved but the
 /// server did not start. If the bind or the save fails, the listener is
-/// dropped, nothing is saved, the previously running server is restarted from
-/// the unchanged saved settings, and the command returns the error - so the
+/// dropped, nothing is saved, the previously running server is restarted at
+/// the address it was running on (#392 B2-1; before, from the unchanged saved
+/// bind/port - the same address), and the command returns the error - so the
 /// saved values and the live server never silently diverge. `enabled = false`
 /// has no new listener (stop -> save). The attempt is audited as
 /// `settings_change` / `result: "failed"` (`detail.saved: false`); a success
@@ -1753,7 +1685,7 @@ async fn server_status(state: State<'_, AppState>) -> Result<ServerStatusResult,
 ///
 /// Lock order (#294 review): `state.server` -> `auth_config_lock` (see
 /// `AppState::auth_config_lock`). The final validation + save + token
-/// revocation run under `auth_config_lock` ([`save_server_config_locked`]),
+/// revocation run under `auth_config_lock` (`chronogazer_core::server_admin`'s `save_server_config_locked`),
 /// so they are serialized with `auth_config_apply` and the other `auth.*`
 /// writers; the lock is NOT held while the old server stops or while binding.
 ///
@@ -1775,9 +1707,9 @@ async fn server_apply(
 /// Body of [`server_apply`] over a plain `&AppState`, so the whole apply -
 /// authorization, the bind -> save -> serve order, the rollback and the
 /// audit - is testable without a Tauri `State` (admin-template v3.0.0 の
-/// `server_apply_body` の写し。差は `build_status` に渡す稼働中のアドレス
-/// （PR1a オーナーレビュー P3）と、サービスの組み立て（[`serve_embedded`]）
-/// だけ）。
+/// `server_apply_body` の写しだったもの。#392 B2-1 から本体は
+/// `chronogazer_core::server_admin::apply_server_settings` で、REST の
+/// `PUT /api/settings/server` と共有する）。
 async fn server_apply_body(
     state: &AppState,
     enabled: bool,
@@ -1792,146 +1724,42 @@ async fn server_apply_body(
         port,
         viewer_public,
     };
-
-    // Held for the WHOLE apply: concurrent applies are serialized, and
-    // `server_status` cannot observe the stopped-but-not-yet-restarted gap.
-    let mut slot = state.server.lock().await;
-
-    // The saved config is the one the rollback below restores, and what the
-    // running listener (if any) was started from.
-    let previous = state.services.settings.server_config().await?;
-    // Refuse an illegal auth/LAN combination BEFORE anything is stopped.
-    state
-        .services
-        .settings
-        .validate_server_config(&config)
-        .await?;
-
-    let was_running = slot.take();
-    let had_running = was_running.is_some();
-    if let Some(running) = was_running {
-        running.stop().await;
-    }
-
-    // banto #287 / #294 review: bind -> save -> serve. The new settings are
-    // saved only AFTER the new listener is bound (so a port in use fails
-    // here, before anything is stored), and the listener only starts
-    // answering requests AFTER the save. Without the last part, a request
-    // (e.g. `POST /api/auth/grant/publicViewer`, which reads the SAVED
-    // `viewer_public`) could hit the new listener while the old values were
-    // still stored.
-    let outcome: Result<Option<RunningServer>, BantoError> = async {
-        let bound = if config.enabled {
-            Some(
-                bind_listener(ServerConfig {
-                    bind: config.bind.clone(),
-                    port: config.port,
-                })
-                .await?,
-            )
-        } else {
-            None
-        };
-        // On error `bound` is dropped here, releasing the port.
-        save_server_config_locked(state, &config).await?;
-        Ok(bound.map(|bound| serve_embedded(state, bound)))
-    }
-    .await;
-
-    match outcome {
-        Ok(started) => {
-            let running = started.as_ref().map(|server| server.local_addr());
-            *slot = started;
-            record_ok(
-                &state.services.audit,
-                &actor,
-                "settings_change",
-                "settings",
-                None,
-                Some(serde_json::json!({
-                    "serverEnabled": config.enabled,
-                    "bind": config.bind,
-                    "port": config.port,
-                    "viewerPublic": config.viewer_public,
-                })),
-            )
-            .await;
-            Ok(build_status(&config, running))
-        }
-        Err(err) => {
-            // Nothing was saved. Bring back the server that was running so
-            // the live state matches the (unchanged) saved settings again.
-            let mut restored = !had_running;
-            if had_running {
-                match bind_listener(ServerConfig {
-                    bind: previous.bind.clone(),
-                    port: previous.port,
-                })
-                .await
-                {
-                    Ok(bound) => {
-                        *slot = Some(serve_embedded(state, bound));
-                        restored = true;
-                    }
-                    Err(restore_err) => eprintln!(
-                        "banto: LAN設定の適用に失敗し、旧設定でのサーバー再起動にも失敗しました: {restore_err}"
-                    ),
-                }
-            }
-            // The failed attempt is audited too (an applied change and a
-            // refused/failed one both leave a record), with the same
-            // `resource`/`action` as the success entry.
-            let detail = serde_json::json!({
-                "serverEnabled": config.enabled,
-                "bind": config.bind,
-                "port": config.port,
-                "viewerPublic": config.viewer_public,
-                "saved": false,
-                "restoredPrevious": restored,
-                "error": err.to_string(),
-            });
-            state
-                .services
-                .audit
-                .record(AuditEntry {
-                    actor_username: Some(&actor.username),
-                    actor_role: Some(actor.role.as_str()),
-                    action: "settings_change",
-                    resource: "settings",
-                    entity_id: None,
-                    detail: Some(detail),
-                    origin: "tauri",
-                    result: "failed",
-                })
-                .await;
-            Err(err)
-        }
-    }
-}
-
-/// Re-validate (inside `set_server_config`, which re-reads `auth.disabled`),
-/// save the `server.*` settings and revoke public viewer tokens, all under
-/// `auth_config_lock` so no `auth.*` write can interleave between the check
-/// and the save (#294 review). Caller holds `state.server` (order: server ->
-/// auth_config_lock). admin-template v3.0.0 の同名関数の写し。
-async fn save_server_config_locked(
-    state: &AppState,
-    config: &ServerSettings,
-) -> Result<(), BantoError> {
-    let _auth_config = state.auth_config_lock.lock().await;
-    state.services.settings.set_server_config(config).await?;
-    if !config.viewer_public {
-        // 閲覧公開 OFF: viewer-public grant tokens minted earlier (rest_auth
-        // outlives server restarts) must not keep working. Order matters
-        // (ADR-0017 §2): the closed condition is persisted above FIRST, then
-        // the kind is revoked - an issuance that judged `true` before the
-        // save is refused by the generation this advances.
-        state
-            .services
-            .rest_auth
-            .revoke_grant_tokens(&GrantKind::public_viewer());
-    }
-    Ok(())
+    // #392 B2-1: the order, rollback and audit live in
+    // `chronogazer_core::server_admin::apply_server_settings`, shared with the
+    // REST `PUT /api/settings/server` of `chronogazer-server`. The desktop has no
+    // always-on listener, so every change is applied live (never
+    // `restartRequired`). Lock order: `state.server` -> `auth_config_lock`.
+    let lan = LanControl {
+        slot: Arc::clone(&state.server),
+        always_on: None,
+        router: None,
+        published: state.services.lan_status.clone(),
+    };
+    // The new listener's router: `allow_setup: false` - the Tauri app's
+    // first-run setup goes through the `auth_setup` command above (`invoke()`,
+    // no network involved), not the REST endpoint - and no `localDesktop`
+    // grant (the desktop's LAN server is a LAN listener). The shared
+    // `rest_auth` is in `services`, so tokens outlive a restart.
+    let router = || state.services.router(false, false);
+    let ctx = ApplyContext {
+        settings: &state.services.settings,
+        audit: &state.services.audit,
+        rest_auth: &state.services.rest_auth,
+        lan: &lan,
+        router: &router,
+        auth_config_lock: &state.auth_config_lock,
+        origin: "tauri",
+        log_label: "banto",
+    };
+    apply_server_settings(
+        &ctx,
+        config,
+        ApplyActor {
+            username: Some(&actor.username),
+            role: Some(actor.role.as_str()),
+        },
+    )
+    .await
 }
 
 /// `admin`-only (banto v2.0.0 移行で admin-template に揃えた): the settings
@@ -2218,7 +2046,20 @@ async fn users_create(
     display_name: String,
     role: Role,
 ) -> Result<UserIdentityResult, BantoError> {
-    let actor = require_role(&state, Role::Admin, "users").await?;
+    users_create_body(&state, username, password, display_name, role).await
+}
+
+/// Body of [`users_create`] (a plain `&AppState`, testable without Tauri).
+async fn users_create_body(
+    state: &AppState,
+    username: String,
+    password: String,
+    display_name: String,
+    role: Role,
+) -> Result<UserIdentityResult, BantoError> {
+    let actor = require_role(state, Role::Admin, "users").await?;
+    // #600 のレビュー: 合成の identity と同じアカウント名は作らせない（REST と同じ）。
+    chronogazer_core::local_grant::check_username_not_reserved(&username)?;
     let identity = state
         .services
         .users
@@ -3954,9 +3795,10 @@ pub(crate) struct ExitCleanupReport {
 /// onto [`ExitCleanupReport`]. The order and the reasons for it live in that
 /// module's doc (「終了の順序」): 収集の取り消せない終了の印（予算の外）→
 /// 監査の保留の定期の流し込みの abort と保持期間の掃除への止める合図（予算の外）→
-/// 保持期間の掃除の終わり（abort しない）→ LAN サーバー（消費者）→
+/// LAN サーバー（消費者。停止を待つのは予算の 4 分の 1・最大 1 秒まで）→
 /// 収集（書き手、最終 flush と `collection_stopped`）→ Hub の購読（収集にとっての
-/// 生産者、#383 段階3 P3）→ SQLite の pool（みんなが書き込む先）.
+/// 生産者、#383 段階3 P3）→ 保持期間の掃除の終わり（abort しない。収集・Hub の
+/// 後、pool の前 - #598）→ SQLite の pool（みんなが書き込む先）.
 ///
 /// `budget` is what is left of the exit deadline ([`ExitCleanupOnce`] hands
 /// the first caller's deadline to the body). `budget_secs` in the report is
@@ -5123,6 +4965,12 @@ mod tests {
                 chronogazer_core::instance_lock::ChronoGazerHost::Desktop,
                 "test",
             ),
+            lan_slot: Arc::new(ServerSlot::default()),
+            always_on: None,
+            local_grant: chronogazer_core::local_grant::LocalGrantStart::Unsupported,
+            settings_lock: Arc::new(AsyncMutex::new(())),
+            log_label: "banto",
+            lan_status: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -5132,7 +4980,7 @@ mod tests {
             auth: Mutex::new(AuthSlot::default()),
             auth_config_lock: AsyncMutex::new(()),
             auth_io: AuthIo::production(&services.users, &services.settings),
-            server: Arc::new(ServerSlot::default()),
+            server: Arc::clone(&services.lan_slot),
             services,
         }
     }
@@ -6963,6 +6811,7 @@ mod tests {
             state.services.rest_auth.clone(),
             state.services.events.clone(),
             false,
+            chronogazer_core::rest::HostAccess::closed(),
         )
     }
 
@@ -9764,7 +9613,7 @@ mod tests {
     /// 閲覧者のトークンを得て読める（書けない）。OFF で適用し直すと、その
     /// トークンは新しいサーバーでも `401` になり（ADR-0017: 保存の後の
     /// `revoke_grant_tokens`）、発行も `403`。本物のログインのセッションは
-    /// 残る。反証: `save_server_config_locked` の失効を外すと、OFF 後も
+    /// 残る。反証: `chronogazer_core::server_admin` の `save_server_config_locked` の失効を外すと、OFF 後も
     /// トークンが読めて落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_apply_viewer_public_round_trip_and_revocation() {
@@ -10226,5 +10075,63 @@ mod tests {
                 "tauri".to_string()
             ))
         );
+    }
+
+    /// #600 のレビュー: 合成の identity と同じアカウント名（`local`・`localDesktop`・
+    /// `public`、大文字小文字・前後の空白を問わず）は、デスクトップの初回セットアップでも
+    /// アカウントの作成でも欄の誤り（`username`）で断り、アカウントを作らない。普通の
+    /// 名前は通る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_usernames_are_refused_on_the_desktop_paths() {
+        let state = app_state().await;
+        for name in ["local", " LocalDesktop ", "PUBLIC"] {
+            let result = setup_body(
+                &state,
+                name.to_string(),
+                "password123".to_string(),
+                "名前".to_string(),
+            )
+            .await;
+            match result {
+                Err(BantoError::Validation { field_errors }) => {
+                    assert_eq!(field_errors[0].field, "username", "{name}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        assert!(!state.services.users.is_initialized().await.unwrap());
+
+        let state = admin_app_state().await;
+        let result = users_create_body(
+            &state,
+            "localdesktop".to_string(),
+            "password123".to_string(),
+            "名前".to_string(),
+            Role::Viewer,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(BantoError::Validation { .. })),
+            "{result:?}"
+        );
+        let created = users_create_body(
+            &state,
+            "operator".to_string(),
+            "password123".to_string(),
+            "運転員".to_string(),
+            Role::Viewer,
+        )
+        .await;
+        assert!(created.is_ok(), "{created:?}");
+        let names: Vec<String> = state
+            .services
+            .users
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|user| user.username)
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 }

@@ -397,6 +397,18 @@ async fn post_setup(url: &str) -> (u16, serde_json::Value) {
     (status, serde_json::from_str(&text).unwrap_or_default())
 }
 
+/// `POST /api/auth/grant/localDesktop`（この PC からの接続、#392 B2-1）の HTTP の状態。
+async fn post_local_grant(url: &str) -> u16 {
+    reqwest::Client::new()
+        .post(url)
+        .header("X-Banto-Client", "banto")
+        .send()
+        .await
+        .expect("send")
+        .status()
+        .as_u16()
+}
+
 fn options(root: &Path) -> ServerOptions {
     ServerOptions {
         layout: DataLayout::new(root),
@@ -429,6 +441,15 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     let (status, host) = get_json(&format!("http://{addr}/api/host")).await;
     assert_eq!(status, 200);
     assert_eq!(host["hostKind"], "server");
+    // #392 B2-1: 未初期化の間は、この PC から管理者として入れる。
+    assert_eq!(
+        started.engine().services().local_grant,
+        crate::local_grant::LocalGrantStart::Uninitialized
+    );
+    assert_eq!(
+        post_local_grant(&format!("http://{addr}/api/auth/grant/localDesktop")).await,
+        200
+    );
     let (status, body) = post_setup(&format!("http://{addr}/api/auth/setup")).await;
     assert_eq!(status, 200);
     assert_eq!(body["success"], true, "{body}");
@@ -440,10 +461,25 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     assert!(std::net::TcpStream::connect(addr).is_err());
 }
 
-/// LAN に出しているとき（bind `0.0.0.0` を 1 本にまとめる）は、最初の管理者の
-/// 作成を開けない（LAN の誰でも最初の管理者になれてしまうため）。
+/// この PC の非 loopback の IPv4（LAN 側）。無い環境では `None`。
+fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    banto_server::lan_urls_for_bind("0.0.0.0", 1)
+        .into_iter()
+        .filter_map(|url| {
+            url.strip_prefix("http://")?
+                .strip_suffix(":1")?
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+        })
+        .find(|ip| !ip.is_loopback())
+}
+
+/// LAN に出しているとき（bind `0.0.0.0` を 1 本にまとめる）も、最初の管理者の作成と
+/// この PC からの接続（`localDesktop`）は、要求ごとに peer と Host の両方が loopback なら
+/// 開く。LAN からの要求（peer が LAN）は同じ listener でも閉じる（2026-10-14 オーナー
+/// 決定。B1-5 では listener 単位で、この PC からも閉じていた）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn setup_is_closed_while_exposed_to_the_lan() {
+async fn setup_and_local_grant_follow_the_request_on_the_merged_wildcard_listener() {
     let dir = TempDir::new();
     prepare_root(
         dir.path(),
@@ -454,9 +490,39 @@ async fn setup_is_closed_while_exposed_to_the_lan() {
     assert_eq!(started.plan().loopback.bind, "0.0.0.0");
     assert!(started.plan().exposes_lan());
     assert!(started.exposes_lan().await);
+    assert_eq!(
+        started.engine().services().local_grant,
+        crate::local_grant::LocalGrantStart::Uninitialized
+    );
     let port = started.engine().loopback_addr().await.unwrap().port();
-    let (status, _) = post_setup(&format!("http://127.0.0.1:{port}/api/auth/setup")).await;
-    assert_eq!(status, 403);
+
+    // LAN から（peer が LAN の IP）は閉じる。LAN の IP が無い環境では確かめない。
+    if let Some(lan_ip) = first_lan_ipv4() {
+        let base = format!("http://{lan_ip}:{port}");
+        let (status, body) = get_json(&format!("{base}/api/auth/status")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["grants"]["localDesktop"], false, "{body}");
+        assert_eq!(
+            post_local_grant(&format!("{base}/api/auth/grant/localDesktop")).await,
+            403
+        );
+        let (status, _) = post_setup(&format!("{base}/api/auth/setup")).await;
+        assert_eq!(status, 403, "LAN から最初の管理者を作れた");
+    } else {
+        eprintln!(
+            "skip: この環境には非 loopback の IPv4 アドレスが無い（LAN からの要求は確かめない）"
+        );
+    }
+
+    // この PC から（peer も Host も 127.0.0.1）は開く。
+    let base = format!("http://127.0.0.1:{port}");
+    assert_eq!(
+        post_local_grant(&format!("{base}/api/auth/grant/localDesktop")).await,
+        200
+    );
+    let (status, body) = post_setup(&format!("{base}/api/auth/setup")).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["success"], true, "{body}");
     assert_eq!(
         started.shutdown(Duration::from_secs(15)).await.exit_code(),
         0

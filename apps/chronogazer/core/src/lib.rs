@@ -31,11 +31,17 @@ pub mod hub_tags;
 // #392 A1: 同じ DB を 2 プロセスで開かないための単一インスタンス排他。
 // デスクトップと `banto-serve` が DB を開く前に呼ぶ。
 pub mod instance_lock;
+// #392 B2-1: この PC からの接続を通す grant `localDesktop`（peer と Host の両方が
+// loopback、未初期化なら admin、初期化後は設定 `auth.local_grant`）。
+pub mod local_grant;
 // #392 B1-4: データのルート（`CHRONOGAZER_ROOT`、既定 `%ProgramData%\ChronoGazer`）と
 // その下の配置、旧データの場所。B1-5 の `chronogazer-server` が使う（デスクトップは
 // B2-4 で寄せる）。
 pub mod paths;
 pub mod rest;
+// #392 B2-1: LAN の公開設定と認証の設定（デスクトップの Tauri のコマンドと REST の
+// `/api/settings/*` が同じ適用の関数を使う）。
+pub mod server_admin;
 // #392 B1-5: 画面の無い本番用の host `chronogazer-server` の、OS に依存しない部分
 // （待ち受けの形・ルートの検証・起動の失敗の案内・KeyStore・日付ごとのログ）。
 pub mod server_host;

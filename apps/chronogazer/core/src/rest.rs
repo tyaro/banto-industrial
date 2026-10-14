@@ -7,9 +7,9 @@
 //!
 //! | Method | Path               | Body           | Response              |
 //! |--------|--------------------|----------------|------------------------|
-//! | GET    | `/api/auth/status`   | -              | `{initialized,grants}` (NO auth required; `grants` is `{ publicViewer: bool }` - the live `server.viewer_public`) |
-//! | POST   | `/api/auth/grant/{kind}` | -          | `{success,token}` for `publicViewer` while 閲覧公開 is ON (`403` while OFF, `404` for any other kind; banto v3.0.0 ADR-0017, 2026-10-04 owner decision) |
-//! | POST   | `/api/auth/setup`     | `{username,password,displayName}` | `{success,error?,token?}` (needs `allow_setup`) |
+//! | GET    | `/api/auth/status`   | -              | `{initialized,grants}` (NO auth required; `grants` is `{ localDesktop: bool, publicViewer: bool }` - `publicViewer` is the live `server.viewer_public`, `localDesktop` is `crate::local_grant`'s judgment for THIS peer and Host) |
+//! | POST   | `/api/auth/grant/{kind}` | -          | `{success,token}` for `publicViewer` while 閲覧公開 is ON (`403` while OFF; banto v3.0.0 ADR-0017, 2026-10-04 owner decision) and for `localDesktop` (#392 B2-1: only on `chronogazer-server`'s always-on listener (`127.0.0.1`, or the merged `0.0.0.0` one), per request peer AND Host loopback, admin while uninitialized, else `auth.local_grant`; `403` otherwise). `404` for any other kind |
+//! | POST   | `/api/auth/setup`     | `{username,password,displayName}` | `{success,error?,token?}` (needs `allow_setup`; on `chronogazer-server`'s always-on listener: per request peer AND Host loopback, #392 B2-1) |
 //! | POST   | `/api/auth/login`    | `{username,password}` | `{success,error?,token?}` |
 //! | POST   | `/api/auth/logout`   | -              | 200                    |
 //! | GET    | `/api/auth/check`    | -              | `bool`                 |
@@ -59,6 +59,10 @@
 //! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionView}>` (viewer+, C-3a / `simulation` = #413) |
 //! | GET    | `/api/collect/events?offset=&limit=&asOfId=` | -    | `Readout<CollectEventList>` (viewer+, C-3a / `asOfId` = #409) |
 //! | GET    | `/api/collect/history?tagIds=&fromMs=&toMs=&bins=` | - | `Readout<CollectHistory>` (viewer+, R1-D の D-3a) |
+//! | GET    | `/api/settings/server` | -                  | `ServerStatusView` (admin, #392 B2-1。表は `crate::server_admin` の doc) |
+//! | PUT    | `/api/settings/server` | `{enabled,bind,port,viewerPublic}` | `ServerStatusView` (admin、この PC からの要求だけ、`chronogazer-server` だけ) |
+//! | GET    | `/api/settings/auth`   | -                  | `AuthConfigView` (admin) |
+//! | PUT    | `/api/settings/auth`   | `{localGrant}`     | `AuthConfigView` (admin。ログイン不要モードは REST では変えない) |
 //!
 //! `/api/ui-settings/*` (spec M12 SettingsProvider migration): per-user UI
 //! settings (theme/preset/dock layout), namespaced by the caller's own
@@ -229,6 +233,10 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::BackupService;
+use crate::local_grant::{
+    local_access_middleware, local_desktop_grant_spec, LocalAccess, LocalAccessState,
+};
+use crate::server_admin::{settings_admin_router, LanControl, SettingsAdminState};
 // #393: 表示グループ。ルーターは子モジュール（`rest/display_groups.rs`）に置く。
 use crate::display_groups::DisplayGroupService;
 mod display_groups;
@@ -239,6 +247,9 @@ mod tag_thresholds;
 // #437: 監査の保留の REST の経路（保留・流し込み・状態の口）のテスト。
 #[cfg(test)]
 mod audit_spool_tests;
+// #392 B2-1: この PC からの接続（`localDesktop`）と設定の REST（`/api/settings/*`）。
+#[cfg(test)]
+mod local_grant_tests;
 use crate::collect::ExclusionView;
 use crate::collect::{
     parse_tag_ids, validate_history_request, CollectEventList, CollectHistory, CollectOutcome,
@@ -1917,6 +1928,10 @@ pub fn api_router(
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
+    // #392 B2-1: この listener がこの PC からの接続（`localDesktop`）を開けるか、LAN の
+    // 入れ替え（`/api/settings/server`）に要るもの。単体のルーター・LAN の listener は
+    // [`HostAccess::closed`]。
+    host: HostAccess,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -1940,6 +1955,33 @@ pub fn api_router(
     grants
         .register(GrantSpec::public_viewer(settings.clone()))
         .expect("the viewer-public grant registers on an empty registry");
+    // #392 B2-1: この PC からの接続（`localDesktop`、`crate::local_grant`）。どの
+    // listener にも登録し（`status.grants.localDesktop` が常にあり、閉じている listener
+    // では発行が `404` ではなく `403`）、開けるのは `chronogazer-server` の常時の
+    // listener への、この PC からの要求（peer と Host の両方が loopback）だけ。
+    grants
+        .register(local_desktop_grant_spec(
+            host.local,
+            users.clone(),
+            settings.clone(),
+        ))
+        .expect("the localDesktop grant registers next to publicViewer");
+    let local_access = LocalAccessState {
+        access: host.local,
+        users: users.clone(),
+        auth: auth.clone(),
+        audit: audit.clone(),
+    };
+    let settings_admin = settings_admin_router(SettingsAdminState {
+        settings: settings.clone(),
+        users: users.clone(),
+        audit: audit.clone(),
+        auth: auth.clone(),
+        lan: host.lan,
+        local_grant: host.local.start,
+        auth_config_lock: host.settings_lock,
+        log_label: host.log_label,
+    });
 
     Router::new()
         .merge(audited_auth_routes)
@@ -2002,7 +2044,40 @@ pub fn api_router(
             auth.clone(),
         ))
         .merge(ui_settings_router(settings, auth))
+        .merge(settings_admin)
+        // #392 B2-1: Host の確認（status・grant・setup）と、未初期化の間の grant の
+        // 扱い（`crate::local_grant::local_access_middleware`）。CSRF の確認の内側。
+        .layer(middleware::from_fn_with_state(
+            local_access,
+            local_access_middleware,
+        ))
         .layer(middleware::from_fn(require_banto_client_header))
+}
+
+/// [`api_router`] に渡す、listener ごとの host の扱い（#392 B2-1）。
+#[derive(Clone)]
+pub struct HostAccess {
+    /// この PC からの接続（`localDesktop`）の開け閉め。
+    pub local: LocalAccess,
+    /// LAN の listener の入れ物（`/api/settings/server`）。
+    pub lan: LanControl,
+    /// REST の設定の書き込みの lock（`crate::engine::EngineServices::settings_lock`）。
+    pub settings_lock: Arc<tokio::sync::Mutex<()>>,
+    /// ログの接頭辞。
+    pub log_label: &'static str,
+}
+
+impl HostAccess {
+    /// エンジンに繋がっていない・LAN に出る listener の扱い（grant は閉じ、
+    /// `PUT /api/settings/server` は断る）。
+    pub fn closed() -> Self {
+        Self {
+            local: LocalAccess::closed(),
+            lan: LanControl::detached(),
+            settings_lock: Arc::new(tokio::sync::Mutex::new(())),
+            log_label: "banto",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2162,6 +2237,7 @@ mod tests {
                 auth,
                 tx,
                 false,
+                HostAccess::closed(),
             ),
             admin_token,
             editor_token,
@@ -2202,6 +2278,7 @@ mod tests {
                 auth,
                 tx,
                 false,
+                HostAccess::closed(),
             ),
             token,
         )
@@ -2390,6 +2467,7 @@ mod tests {
             auth,
             tx,
             allow_setup,
+            HostAccess::closed(),
         )
     }
 
@@ -2600,6 +2678,7 @@ mod tests {
                 auth,
                 tx,
                 allow_setup,
+                HostAccess::closed(),
             ),
             audit,
         )
@@ -3140,6 +3219,7 @@ mod tests {
             auth,
             tx,
             false,
+            HostAccess::closed(),
         );
         (
             router,
@@ -3236,6 +3316,7 @@ mod tests {
             auth,
             tx,
             false,
+            HostAccess::closed(),
         );
         (dir, router, admin_token, editor_token, viewer_token)
     }
@@ -6336,6 +6417,7 @@ mod tests {
             auth,
             tx,
             allow_setup,
+            HostAccess::closed(),
         );
         (dir, router, users)
     }
@@ -6562,6 +6644,7 @@ mod tests {
             auth,
             tx,
             false,
+            HostAccess::closed(),
         );
         (router, settings, audit)
     }
@@ -6596,7 +6679,7 @@ mod tests {
         .await;
         assert_eq!(
             status["grants"],
-            json!({ "publicViewer": false }),
+            json!({ "localDesktop": false, "publicViewer": false }),
             "{status}"
         );
         let response = router
@@ -6624,7 +6707,7 @@ mod tests {
         .await;
         assert_eq!(
             status["grants"],
-            json!({ "publicViewer": true }),
+            json!({ "localDesktop": false, "publicViewer": true }),
             "{status}"
         );
         let response = router

@@ -73,6 +73,10 @@ futures-util = { workspace = true }
 # 生成に使っているのと同じワークスペース依存を使う（Cargo.lock に新しい
 # ノードを増やさない）。
 getrandom = { workspace = true }
+# #392 B2-1: LAN の公開設定の状態の表示（アクセス URL の QR コード）を
+# `crate::server_admin` に移した（デスクトップの `src-tauri` と REST で共有）。
+# `src-tauri` が既に使っている workspace 版なので Cargo.lock にノードは増えない。
+qrcode = { workspace = true }
 
 # #392 B1-5: `chronogazer-server`（bin）のコンソールの扱い - Ctrl の受け取り
 # （`SetConsoleCtrlHandler`）と、標準出力・標準エラー出力のログファイルへの
