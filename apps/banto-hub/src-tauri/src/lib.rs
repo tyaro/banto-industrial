@@ -238,7 +238,7 @@ use banto_hub_core::profile_paths::{build_hub_config_from_env, resolve_profile_p
 use banto_hub_core::runtime::{HubRuntime, RunningHub};
 use banto_hub_core::service_manager::ScmState;
 #[cfg(windows)]
-use banto_hub_core::service_manager::{ServiceManager, WindowsServiceManager};
+use banto_hub_core::service_manager::{hub_service_manager, ServiceManager, WindowsServiceManager};
 use banto_hub_core::service_operators::{is_current_process_admin, is_current_process_operator};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
@@ -989,7 +989,7 @@ fn format_host_port(host: &str, port: u16) -> String {
 /// 必要はなく、`current_exe()`（このシェル自身のパス）を仮に渡しておく。
 #[cfg(windows)]
 fn build_service_manager() -> WindowsServiceManager {
-    WindowsServiceManager::new(std::env::current_exe().unwrap_or_default())
+    hub_service_manager(std::env::current_exe().unwrap_or_default())
 }
 
 /// T16-2 の中核 - SCM 状態 + health probe から今回の起動でどのホストに

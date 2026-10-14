@@ -1,0 +1,15 @@
+[package]
+name = "banto-service-control"
+description = "Windows SCM state / transition control (query, start, stop, restart, auto-start) with a mock for tests, shared by banto-hub, banto-hub-sink and ChronoGazer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# banto-hub-core が `service_manager.rs` で使っていたのと同じ版（SCM の
+# open / query / start / stop / change_config）。
+windows-service = "0.8.1"

@@ -35,6 +35,7 @@ banto-tags = { path = "../../../crates/banto-tags" }
 # 以前ここにあった `[target.'cfg(not(windows))'.dependencies] libc` は
 # 同 crate 側へ移動（このパッケージの他のコードは使っていない）。
 banto-instance-lock = { path = "../../../crates/banto-instance-lock" }
+banto-service-control = { path = "../../../crates/banto-service-control" }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its
 # PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
@@ -209,7 +210,8 @@ path = "src/bin/banto-hub-elev.rs"
 # （`src/bin/win_service.rs` 参照）。
 #
 # T17-0（docs/banto-hub-t17-design.md §3「T17-0」）でこのパッケージの lib
-# クレート（`src/service_manager.rs`の`WindowsServiceManager`）もこの依存を
+# クレート（`src/service_manager.rs`の`WindowsServiceManager`、B2-3 で共有
+# crate `banto-service-control` へ移動。そちらにも同じ依存がある）もこの依存を
 # 使うようになった - このセクションは `[[bin]]`/lib 共通（Cargo.toml は
 # ターゲット別に依存を分けられないため）なので新規セクションは追加せず、
 # ここに1本化してある。

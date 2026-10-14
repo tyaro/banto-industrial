@@ -544,6 +544,7 @@ dependencies = [
  "banto-plc",
  "banto-plc-write",
  "banto-server",
+ "banto-service-control",
  "banto-storage",
  "banto-tags",
  "banto-tstore",
@@ -693,6 +694,14 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "banto-service-control"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "windows-service",
 ]
 
 [[package]]
