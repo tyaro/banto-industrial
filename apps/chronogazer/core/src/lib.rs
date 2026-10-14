@@ -45,6 +45,9 @@ pub mod server_admin;
 // #392 B1-5: 画面の無い本番用の host `chronogazer-server` の、OS に依存しない部分
 // （待ち受けの形・ルートの検証・起動の失敗の案内・KeyStore・日付ごとのログ）。
 pub mod server_host;
+// #392 B2-4a: シェルがサービスの health を確かめる probe（`run\endpoint.json` →
+// `GET /api/host`、O8 の条件）。std の TCP だけで、Tauri に依存しない。
+pub mod service_probe;
 // #538: 保持期間（`retention.days`）を過ぎた時系列データファイルの削除
 // （起動時 + 日付が変わるたび）。`tauri`/`axum` に依存しない future を返す。
 pub mod retention;
