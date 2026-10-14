@@ -5,8 +5,8 @@
  * 判定すると invoke の経路を選んで壊れるので、origin が Tauri 自身のアセットのものかも
  * 見る。
  */
-import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import tauriConf from '../../../src-tauri/tauri.conf.json';
 import { TAURI_DEV_ORIGIN, TAURI_ORIGINS, isTauri, isTauriOrigin } from './environment';
 
 afterEach(() => {
@@ -47,10 +47,7 @@ describe('isTauriOrigin（純関数）', () => {
 
 describe('TAURI_DEV_ORIGIN は tauri.conf.json の devUrl と同じ', () => {
 	it('devUrl の origin', () => {
-		const conf = JSON.parse(
-			readFileSync(new URL('../../../src-tauri/tauri.conf.json', import.meta.url), 'utf8')
-		) as { build: { devUrl: string } };
-		expect(new URL(conf.build.devUrl).origin).toBe(TAURI_DEV_ORIGIN);
+		expect(new URL(tauriConf.build.devUrl).origin).toBe(TAURI_DEV_ORIGIN);
 	});
 });
 
