@@ -38,6 +38,36 @@ URL にするときは `resolveAppPath()`（`src/lib/navigation.ts`）を通す�
 pnpm --filter chronogazer tauri dev
 ```
 
+**開発では `CHRONOGAZER_ROOT` を作業用のフォルダに向ける**（#392 B2-4b、2026-10-14〜）。デスクトップ版も
+既定では `%ProgramData%\ChronoGazer\` を使うので、何も指定しないと `tauri dev` が本番と同じ場所に DB を作る
+（下の「データの置き場所」）。絶対パスで指定する（例 PowerShell: `$env:CHRONOGAZER_ROOT = "D:\scratch\cg-dev"`、
+Git Bash: `CHRONOGAZER_ROOT=/d/scratch/cg-dev pnpm --filter chronogazer tauri dev`）。
+
+### データの置き場所（デスクトップ版、#392 B2-4b、2026-10-14〜）
+
+デスクトップ版も `chronogazer-server`（下）と同じ**データのルート**を使う: 既定 `%ProgramData%\ChronoGazer\`、
+環境変数 `CHRONOGAZER_ROOT`（**絶対パスだけ**。`.`・`..` を含むパスも断る）で変えられる。サービスと
+デスクトップで DB が分かれると、同じ PLC を二重に読み、履歴も割れるため。
+
+- ルートの下: DB `chronogazer.sqlite3`、時系列データ `data\`（`data.dir` の既定）、バックアップ
+  `backups\chronogazer.sqlite3\`、監査の保留 `audit-spool\chronogazer.sqlite3\`、Hub の API キー
+  `secrets\hub-keys\`（DPAPI で守ったファイル。以前の版は OS キーリング）。デスクトップ版はログ `logs\` と
+  `run\endpoint.json` は書かない（`chronogazer-server` のもの）。
+- ルートが無ければ作る。そのときは継承しない ACL（SYSTEM・Administrators にフル、作った利用者に「変更」、
+  Users なし）を付ける。**同じ PC の他の利用者はそのデータを使えない**（起動するとデータを使えない旨のエラーの窓が出る）。
+  既にあるルートの ACL には触らない。ルートを使えない・作れないときは理由と「終了」だけの窓が出る。
+- 同じルートを `chronogazer-server`（コンソール・サービス）が使っていると、デスクトップ版は起動せず
+  「この PC で ChronoGazer のサービス（またはコンソール版）が同じデータを使っています」の窓を出す。
+- 利用者ごとに残るもの: 自動ログインのパスワード（OS キーリング）、画面の状態（WebView のデータ、
+  `%LOCALAPPDATA%\dev.tyaro.chronogazer\`）、トレイの初回の通知の既読の印
+  （`%APPDATA%\dev.tyaro.chronogazer\tray-hint-shown`）、旧データの案内の既読の印
+  （`%LOCALAPPDATA%\dev.tyaro.chronogazer\legacy-data-notice-shown`）。
+- **以前の版のデータ**（`%APPDATA%\dev.tyaro.chronogazer\` の DB・時系列データ・バックアップ）は
+  **使われない**。読まない・移さない・消さない。旧 DB が残っていれば、起動に成功した後に 1 回だけ
+  （利用者ごと）「使われません。要らなければ手で削除してください」と案内する。アカウント・接続・タグ・
+  設定は引き継がれないので初回セットアップからやり直し、Hub 経由のタグを使うときは「設定 > Hub接続」から
+  接続し直す（以前の版が OS キーリングに入れた Hub のキーも残るだけで使われない）。
+
 LANモード（Tauri無し、REST + 静的配信のみのバイナリ。webkit2gtk が無い
 コンテナ環境でも動く開発用サーバー。設定画面の LAN モードトグルが将来
 呼び出すのと同じ経路のプレビュー用途）:
@@ -66,7 +96,8 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
 ```
 
 - **データ**: `%ProgramData%\ChronoGazer\`（無ければ作る）。環境変数 `CHRONOGAZER_ROOT` で変えられる
-  （**絶対パスだけ**。相対パスは拒否して終了コード 3）。デスクトップ版の `%APPDATA%\dev.tyaro.chronogazer\`
+  （**絶対パスだけ**。相対パスは拒否して終了コード 3）。2026-10-14〜 デスクトップ版も同じルートを使う
+  （上の「データの置き場所」。同時には動かせない）。以前の版のデスクトップ版の `%APPDATA%\dev.tyaro.chronogazer\`
   は読まない・移さない。配置は DB `chronogazer.sqlite3`、時系列データ `data\`、バックアップ `backups\`、
   Hub の API キー `secrets\hub-keys\`（DPAPI で守ったファイル。ディレクトリは SYSTEM・Administrators と
   起動した利用者だけ）、ログ `logs\`、所在 `run\endpoint.json`（動いている間だけ）。
@@ -114,8 +145,8 @@ DB スキーマを banto の admin-template と同じ形に整理した（2026-1
 自動移行は作らない）。アプリを終了してから、そのパスの DB を（`-wal`・`-shm`
 があれば一緒に）削除または別名へ退避し、起動し直す。新しい DB はアカウントも
 接続・タグも空なので、初回セットアップからやり直す。DB の場所はデスクトップ版が
-アプリのデータディレクトリの `chronogazer.sqlite3`（Windows は
-`%APPDATA%\dev.tyaro.chronogazer\chronogazer.sqlite3`）、`banto-serve` が
+データのルートの `chronogazer.sqlite3`（既定 `%ProgramData%\ChronoGazer\chronogazer.sqlite3`。
+2026-10-14 より前の版は `%APPDATA%\dev.tyaro.chronogazer\chronogazer.sqlite3`）、`banto-serve` が
 `BANTO_DB`（既定 `./banto-dev.sqlite3`）。
 
 ### 起動に失敗したとき（2026-10-12〜）
@@ -147,7 +178,8 @@ DB スキーマを banto の admin-template と同じ形に整理した（2026-1
 開けない**（開くと 2 つの収集エンジンが同じ時系列ファイルに書き込んで壊れる）。DB を開く前に OS の排他
 （Windows は名前付き mutex `Global\ChronoGazer.<DB パスのハッシュ>`、それ以外は DB の隣の
 `<DB のファイル名>.instance.lock` への `flock`）を取り、取れなければ DB に触れずに終了する。
-デスクトップ版は「ChronoGazer は既に起動しています」の小さな窓（閉じると終了）、`banto-serve` は標準エラーに
+デスクトップ版は「ChronoGazer は既に起動しています」の小さな窓（閉じると終了。使っているのが
+`chronogazer-server` のときは「この PC で ChronoGazer のサービス（またはコンソール版）が同じデータを使っています」）、`banto-serve` は標準エラーに
 理由を出して非 0 で終了する。**DB が違えば同時に動かせる**（E2E が一時ディレクトリごとに `banto-serve` を
 立てるのはこのため）。プロセスが落ちても OS が排他を返すので、ロックが残って起動できなくなることはない
 （`.instance.lock` ファイルが残っていても無害）。別の DB は同時に動かせるが、**解決した `data.dir` が同じ**（相対でも絶対でも。同じフォルダに
@@ -157,14 +189,15 @@ DB ごとに専用のフォルダか `data.dir` を割り当てること。DB �
 
 デスクトップ版をもう一度起動したとき（同じログオンセッション）は、この排他より先に
 `tauri-plugin-single-instance` が受け、既に動いている ChronoGazer のウィンドウを前に出して 2 つ目は
-何もせずに終わる（2026-10-11〜、#392 A2）。上の「既に起動しています」の窓が出るのは、`banto-serve` が
-同じ DB を使っているときや、別のログオンセッションから同じ DB を開こうとしたとき。
+何もせずに終わる（2026-10-11〜、#392 A2）。上の「既に起動しています」の窓が出るのは、`banto-serve`・
+`chronogazer-server` が同じ DB を使っているときや、別のログオンセッションから同じ DB を開こうとしたとき
+（2026-10-14〜 DB は PC に 1 つの `%ProgramData%\ChronoGazer\` なので、別の利用者のデスクトップ版とも当たる）。
 
 ### ウィンドウを閉じても収集は続く（トレイ常駐、2026-10-11〜）
 
 デスクトップ版のウィンドウの × は**アプリを終了せずにウィンドウを隠す**（#392 A2）。収集・Hub の購読・
 LAN アクセスはそのまま動き続け、アプリはタスクトレイに残る（初回だけ OS の通知で知らせる。既読の印は
-アプリのデータディレクトリの `tray-hint-shown`）。
+`%APPDATA%\dev.tyaro.chronogazer\tray-hint-shown`。データのルートが変わった後もここのまま）。
 
 - トレイのアイコンの**左クリック**か、右クリックのメニューの「開く」でウィンドウを戻す。メニューの 1 行目は
   収集の状態（2 秒ごとに読み直す）。
@@ -246,6 +279,7 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
   無効なトークンのログアウトは監査ログに記録しない（banto #278）。
 - バックアップとリストアの予約は DB ファイルごとのフォルダ
   `<DB のフォルダ>/backups/<DB ファイル名>/`（デスクトップ版は
+  `%ProgramData%\ChronoGazer\backups\chronogazer.sqlite3\`。2026-10-14 より前の版は
   `%APPDATA%\dev.tyaro.chronogazer\backups\chronogazer.sqlite3\`）に置く（banto #280）。
   **それより前の版で作ったバックアップ**（`<DB のフォルダ>/backups/` 直下の
   `*.sqlite3`、`<DB のフォルダ>/restore-pending.sqlite3`）は一覧に出ず、自動では
@@ -259,7 +293,8 @@ ON の間だけ有効で、OFF にするとその場でセッションが終わ�
 ディスクが満杯・接続を握られて応答しない）ときは、監査を **DB ファイルの隣の
 `audit-spool/<DB ファイル名>/`** に 1 件 1 ファイルで退避して、操作はそのまま成功させる
 （banto v6.5.0 の監査の保留、banto ADR-0019。banto-hub と同じ仕組み）。デスクトップ版では
-`%APPDATA%\dev.tyaro.chronogazer\audit-spool\chronogazer.sqlite3\`、`banto-serve` では
+`%ProgramData%\ChronoGazer\audit-spool\chronogazer.sqlite3\`（2026-10-14 より前の版は
+`%APPDATA%\dev.tyaro.chronogazer\audit-spool\chronogazer.sqlite3\`）、`banto-serve` では
 `BANTO_DB` のフォルダ（既定 `./audit-spool/banto-dev.sqlite3/`）。**DB ファイルごとに
 分ける**のは、同じフォルダの `a.sqlite3` と `b.sqlite3` が保留を共有すると、B の起動時の
 流し込みが A の監査を B に入れて消すため（バックアップの `backups/<DB ファイル名>/` と
