@@ -18,6 +18,9 @@
 //! - アドレスは安全範囲の中だけ。範囲の入口は [`Ctx::addr`]。
 //! - 試験の後は 0 や false で埋めず、書き込む前に読んだ元の値を戻す
 //!   （`[restore]`）。試験中の true/false 書き込み（`[trial]`）とは別。
+//!   SLMP は PLC の拒否を呼び出しの `Err` ではなく個別の `WriteResult::Bad`
+//!   で返す。復元は全件の成功と件数を見てから読み戻し、元の値と違うときは
+//!   アドレスと元の値を出して失敗する（成功の表示には進まない）。
 //! - 各フェーズは前段が失敗したら止まる。タイムアウトは数秒。
 //!
 //! ## 実行方法
@@ -400,7 +403,123 @@ async fn phase1_read_only(ctx: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
+/// 復元の 1 点。失敗したときに、アドレスと手で戻す元の値を出せるようにする。
+struct RestoreItem {
+    address: String,
+    original: String,
+}
+
+fn format_word(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && (0.0..=f64::from(u16::MAX)).contains(&value) {
+        let word = value as u16;
+        format!("{value} (0x{word:04X})")
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_bit(value: bool) -> String {
+    value.to_string()
+}
+
+fn restore_needed(items: &[RestoreItem]) -> String {
+    let pairs = items
+        .iter()
+        .map(|item| format!("{}={}", item.address, item.original))
+        .collect::<Vec<_>>()
+        .join("、");
+    format!("手で戻すときの元の値: {pairs}")
+}
+
+/// 復元書き込みが PLC に届いたかを検査する。
+///
+/// `write_once` の外側が `Ok` でも、SLMP のデバイス拒否は
+/// [`WriteResult::Bad`] になる（`banto-plc-write` の `execute_slmp_writes`）。
+/// 件数不足も、個別の `Bad` も復元失敗にする。成功の表示はこの関数が
+/// `Ok` を返したあとだけ。
+fn require_restore_accepted(
+    kind: &str,
+    items: &[RestoreItem],
+    results: &[WriteResult],
+) -> Result<(), String> {
+    if results.len() != items.len() {
+        return Err(format!(
+            "{kind}の復元: 書き込み結果が {} 件、対象が {} 件で一致しません。{}",
+            results.len(),
+            items.len(),
+            restore_needed(items),
+        ));
+    }
+    let rejected: Vec<String> = results
+        .iter()
+        .zip(items)
+        .filter(|(result, _)| !result.is_ok())
+        .map(|(result, item)| {
+            format!(
+                "{}（元の値 {}、結果 {result:?}）",
+                item.address, item.original
+            )
+        })
+        .collect();
+    if !rejected.is_empty() {
+        return Err(format!(
+            "{kind}の復元: PLC が書き込みを拒否しました（呼び出しは成功、個別結果は Bad）。{}",
+            rejected.join("、")
+        ));
+    }
+    Ok(())
+}
+
+/// 読み戻しが元の値と一致するかを検査する。違う点はアドレスと元の値を出す。
+fn require_restore_readback(
+    kind: &str,
+    items: &[RestoreItem],
+    actuals: &[String],
+) -> Result<(), String> {
+    if actuals.len() != items.len() {
+        return Err(format!(
+            "{kind}の復元: 読み戻しが {} 件、対象が {} 件で一致しません。{}",
+            actuals.len(),
+            items.len(),
+            restore_needed(items),
+        ));
+    }
+    let mismatched: Vec<String> = items
+        .iter()
+        .zip(actuals)
+        .filter(|(item, actual)| item.original != **actual)
+        .map(|(item, actual)| {
+            format!(
+                "{}（元の値 {}、読み戻し {actual}）",
+                item.address, item.original
+            )
+        })
+        .collect();
+    if !mismatched.is_empty() {
+        return Err(format!(
+            "{kind}の復元: 読み戻しが元の値と一致しません。{}",
+            mismatched.join("、")
+        ));
+    }
+    Ok(())
+}
+
 async fn restore_words(ctx: &Ctx, offsets: &[u32], values: &[f64]) -> Result<(), String> {
+    if offsets.len() != values.len() {
+        return Err(format!(
+            "ワードの復元: 対象 {} 件と元の値 {} 件が一致しません",
+            offsets.len(),
+            values.len()
+        ));
+    }
+    let items: Vec<RestoreItem> = offsets
+        .iter()
+        .zip(values)
+        .map(|(&offset, &value)| RestoreItem {
+            address: ctx.d(offset),
+            original: format_word(value),
+        })
+        .collect();
     let writes: Vec<BatchWriteRequest> = offsets
         .iter()
         .zip(values)
@@ -413,8 +532,65 @@ async fn restore_words(ctx: &Ctx, offsets: &[u32], values: &[f64]) -> Result<(),
             })
         })
         .collect();
-    let result = write_once(ctx, &writes).await?;
-    println!("[restore] ワードを元の値へ戻しました: {result:?}");
+    let result = write_once(ctx, &writes)
+        .await
+        .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
+    require_restore_accepted("ワード", &items, &result)?;
+    let reads: Vec<ReadRequest> = items
+        .iter()
+        .map(|item| u16_read(ctx, &item.address))
+        .collect();
+    let read_back = read_once(ctx, &reads)
+        .await
+        .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
+    let actuals: Vec<String> = read_back
+        .iter()
+        .map(|got| match word_number(got) {
+            Ok(value) => format_word(value),
+            Err(err) => format!("読めない: {err}"),
+        })
+        .collect();
+    require_restore_readback("ワード", &items, &actuals)?;
+    println!(
+        "[restore] ワードを元の値へ戻し、読み戻しで一致を確認しました: {}",
+        restore_needed(&items)
+    );
+    Ok(())
+}
+
+/// 1 点のビットを元の値へ戻し、受理と読み戻しの両方を確認する。
+async fn restore_bit(ctx: &Ctx, raw: &str, saved: bool) -> Result<(), String> {
+    let items = vec![RestoreItem {
+        address: raw.to_string(),
+        original: format_bit(saved),
+    }];
+    let result = write_once(
+        ctx,
+        &[BatchWriteRequest::Numeric(WriteRequest {
+            address: ctx.addr(raw),
+            data_type: DataType::Bit,
+            value: TagValue::Bit(saved),
+        })],
+    )
+    .await
+    .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
+    require_restore_accepted("ビット", &items, &result)?;
+    let read_back = read_once(
+        ctx,
+        &[ReadRequest {
+            address: ctx.addr(raw),
+            data_type: DataType::Bit,
+        }],
+    )
+    .await
+    .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
+    let actual = match read_back.first().map(bit_number) {
+        Some(Ok(value)) => format_bit(value),
+        Some(Err(err)) => format!("読めない: {err}"),
+        None => "結果なし".to_string(),
+    };
+    require_restore_readback("ビット", &items, &[actual])?;
+    println!("[restore] {raw} を元の値 {saved} へ戻し、読み戻しで一致を確認しました");
     Ok(())
 }
 
@@ -581,18 +757,7 @@ async fn restore_phase2(
 ) -> Result<(), String> {
     restore_words(ctx, pattern_offsets, saved_pattern).await?;
     restore_words(ctx, &[D_BIT_OFFSET], &[saved_bit_word]).await?;
-    let m_text = ctx.m(0);
-    let result = write_once(
-        ctx,
-        &[BatchWriteRequest::Numeric(WriteRequest {
-            address: ctx.addr(&m_text),
-            data_type: DataType::Bit,
-            value: TagValue::Bit(saved_m),
-        })],
-    )
-    .await?;
-    println!("[restore] {m_text} を元の値 {saved_m} へ戻しました: {result:?}");
-    Ok(())
+    restore_bit(ctx, &ctx.m(0), saved_m).await
 }
 
 async fn phase3_string_roundtrip(ctx: &Ctx) -> Result<(), String> {
@@ -954,5 +1119,58 @@ mod tests {
         assert_eq!(cli.cpu, SlmpCpu::Q);
         assert_eq!(cli.port, 5007);
         assert!(parse_args(&["--cpu".into(), "L".into()]).is_err());
+    }
+
+    fn word_item(address: &str, value: u16) -> RestoreItem {
+        RestoreItem {
+            address: address.to_string(),
+            original: format_word(f64::from(value)),
+        }
+    }
+
+    /// `write_once` が `Ok(vec![Bad])` を返したときと同じ。外側の成功だけで
+    /// 復元成功にしない。失敗の文言にアドレスと元の値がある。
+    #[test]
+    fn restore_treats_an_inner_bad_as_failure() {
+        let items = vec![word_item("D3000", 0x1111), word_item("D3001", 0x2222)];
+        let results = vec![
+            WriteResult::Ok,
+            WriteResult::Bad(banto_plc_write::PlcWriteError::SlmpEndCode {
+                code: 0xC059,
+                message: "wrong command".to_string(),
+            }),
+        ];
+        let err = require_restore_accepted("ワード", &items, &results).unwrap_err();
+        assert!(err.contains("D3001"), "{err}");
+        assert!(err.contains("0x2222"), "{err}");
+        assert!(err.contains("Bad"), "{err}");
+        assert!(!err.contains("戻し、読み戻しで一致"), "{err}");
+    }
+
+    #[test]
+    fn restore_rejects_a_short_result_list() {
+        let items = vec![word_item("D3000", 1)];
+        let err = require_restore_accepted("ワード", &items, &[]).unwrap_err();
+        assert!(err.contains("D3000"), "{err}");
+        assert!(err.contains("0x0001"), "{err}");
+    }
+
+    #[test]
+    fn restore_readback_mismatch_names_the_address_and_the_original() {
+        let items = vec![RestoreItem {
+            address: "M1000".to_string(),
+            original: format_bit(false),
+        }];
+        let err = require_restore_readback("ビット", &items, &["true".to_string()]).unwrap_err();
+        assert!(err.contains("M1000"), "{err}");
+        assert!(err.contains("false"), "{err}");
+        assert!(err.contains("true"), "{err}");
+    }
+
+    #[test]
+    fn restore_accepts_matching_results_and_readback() {
+        let items = vec![word_item("D3000", 0x1111)];
+        require_restore_accepted("ワード", &items, &[WriteResult::Ok]).unwrap();
+        require_restore_readback("ワード", &items, &[format_word(f64::from(0x1111u16))]).unwrap();
     }
 }
