@@ -1,8 +1,16 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { getAuthProvider, notify } from '@banto/admin-core';
+	import { getAuthProvider, getSessionController, notify } from '@banto/admin-core';
 	import { resolveAppPath } from '#lib/navigation.js';
 	import { bantoReady, getBantoMode } from '#lib/banto/setup.js';
+	import {
+		enteredKind,
+		enterPublicViewer,
+		enterThisPc,
+		LOCAL_DESKTOP_GRANT_KIND,
+		loginEntries,
+		PUBLIC_VIEWER_GRANT_KIND
+	} from '#lib/banto/grantPolicy.js';
 
 	// Undecided until `status()` resolves (or is absent, treated as
 	// "already initialized" - see below): render nothing rather than
@@ -40,6 +48,17 @@
 	// バックエンドが無い。`status()` が返ってから決める。
 	let showContinueAsViewer = $state(false);
 
+	// #392 B2-2（2026-10-14 オーナー決定 3・7）: サービスの host（`chronogazer-server`）の
+	// この PC からの画面だけ（`status().grants.localDesktop`、`loginEntries`）。
+	// - 「この PC として続ける」: ログアウトの後はガードの外のこの画面に来るので自動では
+	//   入り直さない。押したらガードのかかる画面へ移り、ガードが `localDesktop` に入る。
+	// - 初回セットアップの「この PC からはログインなしで使う（管理者）」: 既定でチェック。
+	//   選ぶと setup の本文に `localGrant: 'admin'` を載せ、サーバーが設定
+	//   `auth.local_grant` を admin にする（設定の既定は off のまま）。
+	let showContinueAsThisPc = $state(false);
+	let showLocalGrantOptIn = $state(false);
+	let localGrantOptIn = $state(true);
+
 	const LOGIN_SUPERSEDED_MESSAGE = '別のセッションが先に確定しました。現在のセッションで開きます。';
 
 	$effect(() => {
@@ -52,15 +71,53 @@
 			// behave as if an account already exists, i.e. the normal login
 			// form.
 			mode = status && !status.initialized ? 'setup' : 'login';
-			showContinueAsViewer = getBantoMode() === 'server' && status?.grants?.publicViewer === true;
+			const entries = loginEntries(getBantoMode(), status);
+			showContinueAsViewer = entries.continueAsViewer;
+			showContinueAsThisPc = entries.continueAsThisPc;
+			showLocalGrantOptIn = entries.localGrantOptIn;
 		})();
 	});
 
-	// (app) のガードが閲覧者のセッションを自分で発行する（`+layout.ts` の
-	// `grantFallback` → `enterGrant('publicViewer')`）ので、ここはガードの
-	// かかる画面へ移るだけ。
-	function continueAsViewer(): void {
-		goto(resolveAppPath('/monitor'));
+	// #392 B2-2 のレビュー（オーナー P2-1・P2・Copilot）: 2 つのボタンはどちらも、選んだ口の
+	// セッションをここで明示的に確定してから移る（`enterPublicViewer`・`enterThisPc`）。
+	// ガードに任せると、この PC からの接続も使えるときにガードがそちらを先に発行し、閲覧の
+	// 制限が効かなかった。ブラウザの「戻る」でここへ来て別のセッションが残っていれば、
+	// 押した = 切り替える操作としてログアウトしてから入る。結果が選んだ kind のときだけ
+	// 移り、それ以外（切り替えられない・入れない）は留まって理由を出す。ガードは既にある
+	// セッションを上書きしない。
+	async function continueWith(
+		enter: typeof enterPublicViewer,
+		kind: string,
+		failure: string
+	): Promise<void> {
+		error = null;
+		submitting = true;
+		try {
+			const result = await enter(getSessionController(), getAuthProvider());
+			if (enteredKind(result, kind)) {
+				goto(resolveAppPath('/monitor'));
+			} else {
+				error = failure;
+			}
+		} finally {
+			submitting = false;
+		}
+	}
+
+	function continueAsViewer(): Promise<void> {
+		return continueWith(
+			enterPublicViewer,
+			PUBLIC_VIEWER_GRANT_KIND,
+			'閲覧のみに切り替えられませんでした。しばらくしてからもう一度試してください'
+		);
+	}
+
+	function continueAsThisPc(): Promise<void> {
+		return continueWith(
+			enterThisPc,
+			LOCAL_DESKTOP_GRANT_KIND,
+			'この PC からの接続に切り替えられませんでした。しばらくしてからもう一度試してください'
+		);
 	}
 
 	async function submitLogin(event: SubmitEvent) {
@@ -107,8 +164,24 @@
 				error = 'この環境では初期セットアップに対応していません';
 				return;
 			}
-			const result = await setup({ username, password, displayName });
+			const optedIn = showLocalGrantOptIn && localGrantOptIn;
+			const params: Record<string, unknown> = { username, password, displayName };
+			if (optedIn) params.localGrant = 'admin';
+			const result = await setup(params);
 			if (result.success) {
+				if (optedIn) {
+					// setup は作った管理者のトークンを保存して返す。この PC からの接続で
+					// 使い続けると選んだので、そのセッションを閉じてから（`enterGrant` は
+					// 資格情報が無いときだけ入る）ガードのかかる画面へ移り、ガードが
+					// `localDesktop`（サーバーが setup の応答の前に設定を admin にした）に
+					// 入る。設定を保存できなかったときは grant が閉じたままなので、ガードは
+					// ログイン画面へ戻す（fail closed）。
+					try {
+						await getAuthProvider().logout();
+					} catch {
+						// 閉じられなくてもガードが今の資格情報で確定する。
+					}
+				}
 				goto(resolveAppPath('/monitor'));
 			} else if (result.superseded) {
 				notify('info', LOGIN_SUPERSEDED_MESSAGE);
@@ -148,6 +221,17 @@
 				<input type="password" bind:value={passwordConfirm} autocomplete="new-password" />
 			</label>
 
+			{#if showLocalGrantOptIn}
+				<label class="remember">
+					<input type="checkbox" bind:checked={localGrantOptIn} />
+					この PC からはログインなしで使う（管理者）
+				</label>
+				<p class="note opt-in-note">
+					この PC で動いているプログラムは誰でも管理者として操作できます。共用の PC
+					では外してください（あとで設定の「セキュリティ」から変えられます）。
+				</p>
+			{/if}
+
 			{#if error}
 				<p class="error">{error}</p>
 			{/if}
@@ -186,8 +270,24 @@
 
 			<button type="submit" disabled={submitting}>ログイン</button>
 
+			{#if showContinueAsThisPc}
+				<button
+					type="button"
+					class="continue-as-viewer"
+					onclick={continueAsThisPc}
+					disabled={submitting}
+				>
+					この PC として続ける
+				</button>
+			{/if}
+
 			{#if showContinueAsViewer}
-				<button type="button" class="continue-as-viewer" onclick={continueAsViewer}>
+				<button
+					type="button"
+					class="continue-as-viewer"
+					onclick={continueAsViewer}
+					disabled={submitting}
+				>
 					閲覧のみで続ける
 				</button>
 			{/if}
@@ -260,6 +360,11 @@
 	.remember input {
 		padding: 0;
 		width: auto;
+	}
+
+	.opt-in-note {
+		margin-top: -0.6rem;
+		text-align: left;
 	}
 
 	.error {

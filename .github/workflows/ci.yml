@@ -381,6 +381,17 @@ jobs:
       - name: Run E2E public-viewer suite (chronogazer)
         run: pnpm e2e:public-viewer
 
+      # #392 B2-2: サービス接続モード（grant localDesktop）の E2E。banto-serve は
+      # localDesktop を常に閉じるので、本番の headless host chronogazer-server を
+      # スペックが子プロセスとして起動・再起動・停止する（ポート 8807。テスト用の
+      # ポートの注入と --control-stdin はデバッグビルドだけ）。UI は上の
+      # frontend のビルドを embed-ui で埋め込む。
+      - name: Build chronogazer-server (embed-ui)
+        run: cargo build -p chronogazer-core --bin chronogazer-server --features embed-ui
+
+      - name: Run E2E service-connection suite (chronogazer)
+        run: pnpm e2e:server
+
       - name: Upload Playwright report (chronogazer)
         if: failure()
         uses: actions/upload-artifact@v7
@@ -389,6 +400,7 @@ jobs:
           path: |
             e2e/playwright-report/
             e2e/playwright-report-public-viewer/
+            e2e/playwright-report-chronogazer-server/
           retention-days: 7
 
   # T18-1 (docs/banto-hub-desktop-plan.md §16.3): apps/banto-hub has its own

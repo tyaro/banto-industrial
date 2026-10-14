@@ -16,17 +16,94 @@
 	 * 表示する - 元 `+page.svelte` の page-level effect が失敗したときの
 	 * `authError` 表示と同じ見た目（`authSettingsStore.svelte.ts` の doc
 	 * comment参照）。保存操作自体の失敗は従来どおりトーストのみ。
+	 *
+	 * #392 B2-2: サービスの host（`chronogazer-server`）の HTTP の画面（`server`
+	 * モード、admin）では、ログイン不要モードは読むだけ（REST では変えられない - それは
+	 * デスクトップの窓のセッションを作り直す仕組み）にし、代わりにこの PC からの接続
+	 * （`auth.local_grant`: off / viewer / editor / admin）を出す。変えられるのは
+	 * `settingsEditableHere`（この PC から開いた画面）のときだけ。保存すると発行済みの
+	 * `localDesktop` のトークン（この画面のセッションを含みうる）が失効するので、
+	 * 保存の後は `refreshAll()` で確定し直す（入れなくなればログイン画面へ）。
 	 */
 	import { refreshAll } from '$app/navigation';
-	import { isTauri } from '#lib/banto/setup.js';
+	import { getBantoMode, isTauri } from '#lib/banto/setup.js';
+	import { getHostInfo, settingsEditableHere } from '#lib/banto/hostInfo.js';
+	import { isAdmin } from '#lib/permissions.js';
+	import { sessionStore } from '#lib/session.svelte.js';
 	import { toastStore } from '#lib/toast.svelte.js';
-	import { applyAuthSettings, type AuthDisabledRole } from '#lib/banto/authAdmin.js';
+	import {
+		applyAuthSettings,
+		applyLocalGrant,
+		type AuthDisabledRole,
+		type LocalGrantSetting
+	} from '#lib/banto/authAdmin.js';
 	import { UnsavedChangesNotice } from '@banto/forms';
 	import { guardUnsavedChanges, UNSAVED_DISCARD, UNSAVED_NOTICE } from '#lib/unsavedChanges.js';
 	import { authSettingsStore } from './authSettingsStore.svelte';
 	import { canManageAuthMode, errorMessage } from './shared';
 
 	const tauri = isTauri();
+	const server = getBantoMode() === 'server';
+
+	const localGrantOptions: { value: LocalGrantSetting; label: string }[] = [
+		{ value: 'off', label: '使わない（ログインが必要）' },
+		{ value: 'viewer', label: '閲覧者' },
+		{ value: 'editor', label: '編集者' },
+		{ value: 'admin', label: '管理者' }
+	];
+	let localGrantDraft = $state<LocalGrantSetting>('off');
+	let applyingLocalGrant = $state(false);
+	let restEditable = $state(false);
+
+	$effect(() => {
+		const next = authSettingsStore.value?.localGrant;
+		if (next) localGrantDraft = next;
+	});
+
+	$effect(() => {
+		if (!server) return;
+		void (async () => {
+			try {
+				const host = await getHostInfo();
+				restEditable = settingsEditableHere(host.hostKind, window.location.hostname);
+			} catch {
+				restEditable = false;
+			}
+		})();
+	});
+
+	const localGrantDirty = $derived(
+		authSettingsStore.value?.localGrant !== undefined &&
+			localGrantDraft !== authSettingsStore.value.localGrant
+	);
+	const localGrantGuard = guardUnsavedChanges({
+		isDirty: () => server && localGrantDirty,
+		isSaving: () => applyingLocalGrant
+	});
+
+	async function saveLocalGrant(): Promise<void> {
+		if (
+			localGrantDraft !== 'off' &&
+			!window.confirm(
+				'この PC で動いているプログラムは、ログインなしでこの権限の操作ができるようになります。この PC を完全に信頼できる場合のみ続行してください。'
+			)
+		) {
+			return;
+		}
+		applyingLocalGrant = true;
+		try {
+			authSettingsStore.apply(await applyLocalGrant(localGrantDraft));
+			toastStore.push('success', 'この PC からの接続の設定を更新しました');
+			applyingLocalGrant = false;
+			// 値が変わると発行済みの `localDesktop` のトークン（この画面のものも）が失効
+			// するので、ガードから確定し直す（SecuritySection の上の保存と同じ形）。
+			await refreshAll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			applyingLocalGrant = false;
+		}
+	}
 
 	const authDisabledRoleOptions: { value: AuthDisabledRole; label: string }[] = [
 		{ value: 'admin', label: '管理者' },
@@ -122,6 +199,72 @@
 		}
 	}
 </script>
+
+{#if server && isAdmin(sessionStore.role) && authSettingsStore.value?.localGrantSupported}
+	<section>
+		<h2>この PC からの接続</h2>
+		<p class="note">
+			サービスを動かしているこの PC
+			の画面（http://127.0.0.1:&lt;ポート&gt;/）から、ログインなしで入るときの権限です。LAN
+			の他の端末には効きません。
+		</p>
+
+		{#if restEditable}
+			<div class="server-fields">
+				<label class="field">
+					ログインなしで入るときの権限
+					<select bind:value={localGrantDraft} data-testid="local-grant-select">
+						{#each localGrantOptions as option (option.value)}
+							<option value={option.value}>{option.label}</option>
+						{/each}
+					</select>
+				</label>
+			</div>
+
+			<div class="save-row">
+				<button type="button" onclick={saveLocalGrant} disabled={applyingLocalGrant}
+					>保存して適用</button
+				>
+				{#if localGrantDirty}
+					<button
+						type="button"
+						onclick={() => {
+							if (authSettingsStore.value?.localGrant)
+								localGrantDraft = authSettingsStore.value.localGrant;
+						}}
+						disabled={applyingLocalGrant}
+					>
+						{UNSAVED_DISCARD}
+					</button>
+				{/if}
+				<UnsavedChangesNotice pending={localGrantGuard.pending} label={UNSAVED_NOTICE} />
+			</div>
+		{:else}
+			<p class="status">
+				現在の設定: <strong
+					>{localGrantOptions.find((option) => option.value === authSettingsStore.value?.localGrant)
+						?.label ?? '—'}</strong
+				>
+			</p>
+			<p class="note">この設定は、サービスを動かしている PC から開いた画面でだけ変更できます。</p>
+		{/if}
+
+		{#if authSettingsStore.value?.localGrantRestartRequired}
+			<p class="note">
+				保存した権限で入れるのは、サービスを次に起動したときからです（「使わない」にするのはすぐ効きます）。
+			</p>
+		{/if}
+
+		{#if authSettingsStore.error}
+			<p class="error">{authSettingsStore.error}</p>
+		{/if}
+
+		<p class="status">
+			ログイン不要モード: <strong>{authSettingsStore.value?.disabled ? '有効' : '無効'}</strong
+			>（デスクトップアプリの画面だけに効く設定で、ここからは変更できません）
+		</p>
+	</section>
+{/if}
 
 {#if tauri && canManage}
 	<section>

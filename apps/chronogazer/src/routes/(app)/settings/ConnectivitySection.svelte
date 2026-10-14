@@ -20,9 +20,18 @@
 	 * なるので `isProviderError` で本文を出す。ChronoGazer 固有の差: 文言は
 	 * i18n ではなく日本語の直書き、未保存の変更の警告・読み込み失敗時の
 	 * 編集不可・システム情報カードは無い（従来どおり）。
+	 *
+	 * #392 B2-2: サービスの host（`chronogazer-server`）の HTTP の画面（`server`
+	 * モード）では、同じ形を REST（`/api/settings/server`、`serverAdmin.ts`）で読み書き
+	 * する。変えられるのは `hostInfo.ts` の `settingsEditableHere`（サービスの host を
+	 * この PC から開いた画面）のときだけで、それ以外（LAN の IP で開いた画面・
+	 * `banto-serve`）は状態を読むだけにして理由を出す（サーバーの `403` が本当の境界）。
+	 * 常時の listener の形が変わる設定（ポート・`0.0.0.0`）は保存だけで次の起動から
+	 * （応答の `restartRequired`）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
-	import { isTauri } from '#lib/banto/setup.js';
+	import { getBantoMode, isTauri } from '#lib/banto/setup.js';
+	import { getHostInfo, settingsEditableHere } from '#lib/banto/hostInfo.js';
 	import {
 		applyServerSettings,
 		getServerStatus,
@@ -37,6 +46,12 @@
 	import { lanToggleLocked } from './lanToggle';
 
 	const tauri = isTauri();
+	// #392 B2-2: サービスの host の HTTP の画面（REST で読む）。
+	const server = getBantoMode() === 'server';
+	// この画面から変えられるか（`server` のときは `GET /api/host` を読んでから決める。
+	// 読むまで・読めなければ変えられない側）。
+	let restEditable = $state(false);
+	const editable = $derived(tauri || (server && restEditable));
 
 	let serverStatus = $state<ServerStatus | null>(null);
 	let bindDraft = $state('127.0.0.1');
@@ -79,12 +94,24 @@
 	}
 
 	$effect(() => {
-		if (!tauri) return;
+		if (!tauri && !server) return;
 		void (async () => {
 			try {
 				applyStatusToDrafts(await getServerStatus());
 			} catch (err) {
 				serverError = messageOf(err);
+			}
+		})();
+	});
+
+	$effect(() => {
+		if (!server) return;
+		void (async () => {
+			try {
+				const host = await getHostInfo();
+				restEditable = settingsEditableHere(host.hostKind, window.location.hostname);
+			} catch {
+				restEditable = false;
 			}
 		})();
 	});
@@ -141,7 +168,7 @@
 {#if isAdmin(sessionStore.role)}
 	<section>
 		<h2>LANアクセス（組み込みWebサーバ）</h2>
-		{#if tauri}
+		{#if editable}
 			<!-- admin-template と同じ（ADR-0012）: 「ログイン不要モード + LAN」を
 			     許すための opt-in。依存関係が上から読めるように LAN の切り替えの
 			     上に置く - これを入れると下の切り替えが使えるようになる。 -->
@@ -172,6 +199,10 @@
 					<select bind:value={bindDraft}>
 						<option value="127.0.0.1">127.0.0.1 のみ</option>
 						<option value="0.0.0.0">0.0.0.0（LAN公開）</option>
+						{#if bindDraft !== '127.0.0.1' && bindDraft !== '0.0.0.0'}
+							<!-- 特定の LAN の IP（REST・設定ファイルで保存したもの）も選べたまま出す。 -->
+							<option value={bindDraft}>{bindDraft}</option>
+						{/if}
 					</select>
 				</label>
 
@@ -195,6 +226,12 @@
 				<p class="error">{serverError}</p>
 			{/if}
 
+			{#if serverStatus?.restartRequired}
+				<p class="note">
+					保存した設定（ポート・0.0.0.0 への公開）は、サービスを次に起動したときから反映されます。
+				</p>
+			{/if}
+
 			{#if serverStatus}
 				<p class="status">
 					状態: <strong>{serverStatus.running ? '稼働中' : '停止中'}</strong>
@@ -212,6 +249,25 @@
 					{/if}
 				{/if}
 			{/if}
+		{:else if server}
+			<!-- #392 B2-2: サービスの設定を、この PC 以外から（LAN の IP で）開いた画面・
+			     REST の変更を受けない host（banto-serve）。読むだけ。 -->
+			{#if serverError}
+				<p class="error">{serverError}</p>
+			{/if}
+			{#if serverStatus}
+				<p class="status">
+					状態: <strong>{serverStatus.running ? '稼働中' : '停止中'}</strong>（{serverStatus.enabled
+						? '有効'
+						: '無効'}、{serverStatus.bind}:{serverStatus.port}、閲覧公開 {serverStatus.viewerPublic
+						? 'ON'
+						: 'OFF'}）
+				</p>
+			{/if}
+			<p class="note">
+				LAN の公開設定は、サービスを動かしている PC で http://127.0.0.1:&lt;ポート&gt;/
+				から開いた画面でだけ変更できます。
+			</p>
 		{:else}
 			<p class="note">サーバー設定はデスクトップアプリでのみ変更できます。</p>
 		{/if}

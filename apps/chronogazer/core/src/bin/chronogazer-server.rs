@@ -54,6 +54,12 @@
 //! debug ビルドで動く）。リリースビルドでは未知の引数として拒否する（終了コード 64）-
 //! 標準入力をつないだ親プロセスなどから停止を指示できる入口を本番に残さないため
 //! （デスクトップの `CHRONOGAZER_TEST_FAIL_TRAY` と同じ扱い）。
+//!
+//! `CHRONOGAZER_TEST_PORT`（E2E 用、#392 B2-2。**デバッグビルドだけ**）: DB を開いた
+//! 後・待ち受けの形を決める前に、設定 `server.port`（常時の listener のポート）を
+//! その値で保存する（[`test_port_from_env`]）。一時ルートの新しい DB でも E2E の固定の
+//! ポート（8807）で待ち受けるため。リリースビルドでは読まない（設定 DB だけが
+//! ポートを決める、の約束を本番で崩さない）。
 
 #[cfg(windows)]
 #[path = "chronogazer_server/console.rs"]
@@ -602,6 +608,13 @@ fn run(options: CliOptions) -> i32 {
         Err(failure) => return report_start_failure(&controller, &failure),
     };
 
+    #[cfg(debug_assertions)]
+    if let Err(reason) = runtime.block_on(apply_test_port(&opened)) {
+        eprintln!("{SERVER_LABEL}: {reason}");
+        runtime.block_on(opened.close());
+        return finish_start_failure(&controller, EXIT_START_FAILED);
+    }
+
     // 6. Hub のキーの保存先（排他を取った後）とエンジン。
     let (key_store, key_store_error) = server_host::open_key_store(&layout);
     if let Some(reason) = key_store_error {
@@ -748,6 +761,54 @@ fn test_slow_open(controller: &StopController) {
             .unwrap_or_else(|p| p.into_inner())
             .0;
     }
+}
+
+/// テスト用のポート（`CHRONOGAZER_TEST_PORT`、モジュール doc）を読む。**デバッグ
+/// ビルドだけ**値を返し、リリースビルドでは常に `Ok(None)`（読まない）。`raw` は環境
+/// 変数の値。1〜65535 の整数でなければ `Err`（起動を止める - 黙って既定のポートで
+/// 動くと、E2E が別のサーバーに繋がりうる）。
+#[cfg(debug_assertions)]
+fn test_port_from_env(raw: Option<&str>) -> Result<Option<u16>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u16>() {
+        Ok(port) if port != 0 => Ok(Some(port)),
+        _ => Err(format!(
+            "CHRONOGAZER_TEST_PORT は 1〜65535 の整数にしてください（{raw}）"
+        )),
+    }
+}
+
+/// リリースビルドの形（読まない）。呼ぶのはテストだけ（`apply_test_port` はデバッグ
+/// ビルドだけにある）。
+#[cfg(all(test, not(debug_assertions)))]
+fn test_port_from_env(_raw: Option<&str>) -> Result<Option<u16>, String> {
+    Ok(None)
+}
+
+/// デバッグビルドだけ: `CHRONOGAZER_TEST_PORT` があれば設定 `server.port` に保存する
+/// （待ち受けの形は `OpenedServer::start` が保存値から決める）。
+#[cfg(debug_assertions)]
+async fn apply_test_port(opened: &server_host::OpenedServer) -> Result<(), String> {
+    let raw = std::env::var("CHRONOGAZER_TEST_PORT").ok();
+    let Some(port) = test_port_from_env(raw.as_deref())? else {
+        return Ok(());
+    };
+    let settings = opened.settings();
+    let mut config = settings
+        .server_config()
+        .await
+        .map_err(|err| format!("テスト用のポートを保存する前に設定を読めませんでした: {err}"))?;
+    config.port = port;
+    settings
+        .set_server_config(&config)
+        .await
+        .map_err(|err| format!("テスト用のポートを保存できませんでした: {err}"))?;
+    eprintln!(
+        "{SERVER_LABEL}: テスト用に server.port を {port} にしました（CHRONOGAZER_TEST_PORT）"
+    );
+    Ok(())
 }
 
 /// 古いログファイルの削除を別のスレッドで走らせる（ログのロックを手放した後に
@@ -970,6 +1031,25 @@ mod tests {
         // B3 の `run-service` などはまだ無い。
         for unknown in ["run-service", "install", "--port", "x"] {
             assert!(parse_args(&args(&[unknown])).is_err(), "{unknown}");
+        }
+    }
+
+    /// #392 B2-2: `CHRONOGAZER_TEST_PORT` はデバッグビルドだけ読み、リリースビルドでは
+    /// どんな値でも無視する（`--control-stdin` と同じ扱い）。
+    #[test]
+    fn test_port_is_read_only_in_debug_builds() {
+        assert_eq!(test_port_from_env(None), Ok(None));
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(test_port_from_env(Some("8807")), Ok(Some(8807)));
+            assert_eq!(test_port_from_env(Some(" 8807 ")), Ok(Some(8807)));
+            for bad in ["0", "65536", "-1", "x", ""] {
+                assert!(test_port_from_env(Some(bad)).is_err(), "{bad}");
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        for any in ["8807", "0", "x"] {
+            assert_eq!(test_port_from_env(Some(any)), Ok(None), "{any}");
         }
     }
 

@@ -22,7 +22,8 @@
 	 * ポーリングは元々不要（元 `+page.svelte` も1回読むだけだった）なので、
 	 * ここでは1回だけ `load()` する。失敗時は `authSettingsStore.error` に
 	 * 記録する（元 `+page.svelte` の `authError` と同じ見た目を
-	 * `SecuritySection.svelte` 側で保つため）。
+	 * `SecuritySection.svelte` 側で保つため）。`server` モード（サービスの画面、
+	 * #392 B2-2）の初回ロードは、カテゴリの可視性に要るので `+layout.ts` が行う。
 	 */
 	import { page } from '$app/state';
 	import { isTauri } from '#lib/banto/setup.js';

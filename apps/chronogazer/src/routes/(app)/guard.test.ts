@@ -1,6 +1,7 @@
 // banto v4.0.0 の admin-template `routes/(app)/guard.test.ts` を写した（#321、
 // v4.0.0 で閲覧公開の許可リストと `error(status, message)` の本体を足した #325）。
-// chronogazer 固有の差: i18n（Paraglide）と `syncLocaleFromProvider` が無いので
+// chronogazer 固有の差: 資格情報なしの口が `localDesktop` → `publicViewer` の順
+// （#392 B2-2、`grantPolicy.ts`）。i18n（Paraglide）と `syncLocaleFromProvider` が無いので
 // そのモックを外した。テストの URL は `/dashboard` を `/monitor` に、許可リストは
 // ChronoGazer の `navigation.ts` の `publicViewer` の項目（監視・ヒストリカル・
 // イベント）に、エラー画面の本文は `SESSION_CHECK_FAILED_MESSAGE` に変えた。
@@ -137,5 +138,62 @@ describe('(app) guard: public-viewer screen allowlist (viewer-public-plan §3.1-
 			expect(isRedirect(err)).toBe(true);
 			expect((err as { status: number; location: string }).location).toBe('/monitor');
 		}
+	});
+});
+
+describe('(app) guard: credential-less entries in order (#392 B2-2)', () => {
+	const none = (generation: number) => ({
+		outcome: 'confirmed',
+		snapshot: { status: 'none', kind: null, generation },
+		ticket: { generation }
+	});
+	const provider = { status: vi.fn(), enterGrant: vi.fn() };
+
+	beforeEach(() => {
+		mocks.ready = true;
+		mocks.publicNavItems = [{ path: '/monitor' }];
+		vi.clearAllMocks();
+		mocks.getSessionController.mockReturnValue({});
+		mocks.getAuthProvider.mockReturnValue(provider);
+		mocks.resolveSettled.mockResolvedValue(none(1));
+	});
+
+	it('tries localDesktop first and stops there when it entered', async () => {
+		mocks.grantFallback.mockResolvedValueOnce({
+			outcome: 'confirmed',
+			snapshot: { status: 'active', kind: 'localDesktop', generation: 2 },
+			ticket: { generation: 2 }
+		});
+		await expect(load(event)).resolves.toEqual({ sessionGeneration: 2 });
+		expect(mocks.grantFallback).toHaveBeenCalledTimes(1);
+		const [, , ticket, options] = mocks.grantFallback.mock.calls[0];
+		expect(ticket).toEqual({ generation: 1 });
+		expect(options.kind).toBe('localDesktop');
+		expect(options.available({ initialized: false, grants: { localDesktop: true } })).toBe(true);
+		expect(options.available({ initialized: true, grants: { publicViewer: true } })).toBe(false);
+	});
+
+	it('falls back to publicViewer with the ticket of the confirmed none, then /login', async () => {
+		mocks.grantFallback.mockResolvedValueOnce(none(4)).mockResolvedValueOnce(none(5));
+		const err = await load(event).then(
+			() => null,
+			(e: unknown) => e
+		);
+		expect(isRedirect(err)).toBe(true);
+		expect((err as { location: string }).location).toBe('/login');
+		expect(mocks.grantFallback).toHaveBeenCalledTimes(2);
+		expect(mocks.grantFallback.mock.calls[0][3].kind).toBe('localDesktop');
+		expect(mocks.grantFallback.mock.calls[1][2]).toEqual({ generation: 4 });
+		expect(mocks.grantFallback.mock.calls[1][3]).toEqual({ kind: 'publicViewer' });
+	});
+
+	it('an unverified localDesktop entry is the retry page, without trying publicViewer', async () => {
+		mocks.grantFallback.mockResolvedValueOnce({ outcome: 'unverified', snapshot: {} });
+		const err = await load(event).then(
+			() => null,
+			(e: unknown) => e
+		);
+		expect(isHttpError(err, 503)).toBe(true);
+		expect(mocks.grantFallback).toHaveBeenCalledTimes(1);
 	});
 });

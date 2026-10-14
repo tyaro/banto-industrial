@@ -1,6 +1,12 @@
 // banto v3.0.0（タグ v3.0.0 = f0dcece）の admin-template
 // `apps/admin-template/src/lib/banto/environment.ts` からコピー（I2c、banto #286）。
-// chronogazer 固有の差: なし（本文は無改変）。
+// chronogazer 固有の差（#392 B2-2、2026-10-14）: `isTauri()` が origin も見る
+// （`TAURI_ORIGINS`・`isTauriOrigin`）。banto の写しは `__TAURI_INTERNALS__` の有無
+// だけを見るが、ChronoGazer のシェルがサービス（`chronogazer-server`）の
+// `http://127.0.0.1:<port>/` へ navigate すると、Tauri はその窓にも
+// `__TAURI_INTERNALS__` を注入するので、invoke の経路を選んで壊れる（設計書
+// docs/chronogazer-service-design.md §0・§3.2）。banto 側にも同じ直しを提案する
+// （別 issue）。それ以外は無改変。
 /**
  * Environment detection for the three spec §11.1 runtime environments
  * (Tauri webview / embedded-server LAN browser / plain vite dev-preview).
@@ -12,9 +18,43 @@
  * entry point for the app.
  */
 
-/** True inside the Tauri webview, false in a plain browser tab (spec §11.1). */
+/**
+ * Tauri が自分のアセットを配る origin（#392 B2-2）。Windows（WebView2）は
+ * `http://tauri.localhost`（`app.windows[].useHttpsScheme` なら `https://`）、
+ * macOS・Linux は `tauri://localhost`。
+ */
+export const TAURI_ORIGINS: readonly string[] = [
+	'http://tauri.localhost',
+	'https://tauri.localhost',
+	'tauri://localhost'
+];
+
+/**
+ * `tauri dev` の窓の origin（`src-tauri/tauri.conf.json` の `build.devUrl` と同じ。
+ * `environment.test.ts` が一致を確かめる）。開発ビルド（`import.meta.env.DEV`）でだけ
+ * Tauri 自身の origin として数える - 本番のビルドに `localhost:1420` を許す理由は無い。
+ */
+export const TAURI_DEV_ORIGIN = 'http://localhost:1420';
+
+/**
+ * `origin` が Tauri 自身のアセットの origin か（純関数。`devOrigin` は開発ビルドだけ
+ * 渡す）。サービスの `http://127.0.0.1:<port>` などは偽。
+ */
+export function isTauriOrigin(origin: string, devOrigin?: string): boolean {
+	return TAURI_ORIGINS.includes(origin) || (devOrigin !== undefined && origin === devOrigin);
+}
+
+/**
+ * True inside the Tauri webview showing Tauri's own assets, false in a plain
+ * browser tab (spec §11.1) - and false in a Tauri window that navigated to the
+ * service's HTTP UI (#392 B2-2): Tauri injects `__TAURI_INTERNALS__` there too,
+ * but that page must use the HTTP `server` mode (the service's REST), not
+ * `invoke()`. So both must hold: the internals exist AND the origin is one of
+ * Tauri's own (`TAURI_ORIGINS`, plus `TAURI_DEV_ORIGIN` in a dev build).
+ */
 export function isTauri(): boolean {
-	return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+	if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return false;
+	return isTauriOrigin(window.location.origin, import.meta.env.DEV ? TAURI_DEV_ORIGIN : undefined);
 }
 
 /** Shared with the `*Admin.ts` modules (spec M10's `/api/users/*` calls need the same CSRF header every other fetch() here sends). */

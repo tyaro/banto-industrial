@@ -41,6 +41,9 @@ e2e/playwright-report/
 # e2e/public-viewer.playwright.config.ts（閲覧公開、#507）の出力先
 e2e/test-results-public-viewer/
 e2e/playwright-report-public-viewer/
+# e2e/chronogazer-server.playwright.config.ts（サービス接続、#392 B2-2）の出力先
+e2e/test-results-chronogazer-server/
+e2e/playwright-report-chronogazer-server/
 e2e/.cache/
 /test-results/
 

@@ -3,17 +3,15 @@
 // 起動待ちの延期に差し替え）（v3 移行、I2b で
 // 閲覧公開の `grantFallback` を戻した - 2026-10-04 オーナー決定で ChronoGazer
 // でも閲覧公開を使う）。
-// chronogazer 固有の差: エラー画面の本文は i18n ではなく
+// chronogazer 固有の差: 確定した `none` の資格情報なしの口は `grantFallback` を
+// 直接呼ばず、`enterCredentiallessGrant`（`localDesktop` → `publicViewer` の順。
+// #392 B2-2、`#lib/banto/grantPolicy.ts`）。エラー画面の本文は i18n ではなく
 // `SESSION_CHECK_FAILED_MESSAGE`（日本語）。ロケールの同期
 // （`syncLocaleFromProvider`）は無い。`base` は使わない（ChronoGazer は
 // ルート直下に配信する）。
 import { error, redirect } from '@sveltejs/kit';
-import {
-	getAuthProvider,
-	getSessionController,
-	grantFallback,
-	resolveSettled
-} from '@banto/admin-core';
+import { getAuthProvider, getSessionController, resolveSettled } from '@banto/admin-core';
+import { enterCredentiallessGrant } from '#lib/banto/grantPolicy.js';
 import { isBantoReady } from '#lib/banto/setup.js';
 import { deferUntilStarted } from '#lib/banto/startupGate.js';
 import { SESSION_CHECK_FAILED_MESSAGE } from '#lib/banto/sessionGuard.js';
@@ -56,15 +54,19 @@ import { publicNavItems, resolveAppPath } from '#lib/navigation.js';
 //   `unverified` is the error page, not /login (S-66); only a confirmed
 //   `none` goes to /login. Only the HTTP provider implements `status()`'s
 //   `grants` and `enterGrant()`; Tauri/demo go straight to /login.
+// - #392 B2-2: before the public viewer, the `localDesktop` grant (this PC's
+//   connection to the service, `chronogazer-server`) is tried first -
+//   `enterCredentiallessGrant` chains the two `grantFallback`s
+//   (`#lib/banto/grantPolicy.ts`). After a logout the tab is on /login, which
+//   this guard does not cover, so it is not re-entered automatically there
+//   (2026-10-14 owner decision 3: /login offers「この PC として続ける」).
 export async function load({ url }) {
 	deferUntilStarted(isBantoReady(), () => STARTING_MESSAGE);
 	const controller = getSessionController();
 	let result = await resolveSettled(controller, { cause: 'navigation' });
 	if (result.outcome === 'unverified') sessionCheckFailed();
 	if (result.snapshot.status === 'none') {
-		result = await grantFallback(controller, getAuthProvider(), result.ticket, {
-			kind: 'publicViewer'
-		});
+		result = await enterCredentiallessGrant(controller, getAuthProvider(), result.ticket);
 		if (result.outcome === 'unverified') sessionCheckFailed();
 		if (result.snapshot.status !== 'active') redirect(307, resolveAppPath('/login'));
 	}

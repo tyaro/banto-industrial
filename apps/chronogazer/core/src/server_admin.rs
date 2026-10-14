@@ -63,7 +63,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody};
-use banto_server::routes::{actor_identity, require_role_at_least, RoleGuard};
+use banto_server::routes::{actor_identity, bearer_token, require_role_at_least, RoleGuard};
 use banto_server::{
     bind as bind_listener, lan_urls_for_bind, request_is_loopback_local, require_auth, ApiError,
     AuthState, GrantKind, Identity, RunningServer, ServerConfig,
@@ -311,6 +311,25 @@ pub struct ApplyContext<'a> {
     pub origin: &'a str,
     /// ログの接頭辞（`banto` / `chronogazer-server`）。
     pub log_label: &'a str,
+    /// REST の要求のトークン（#392 B2-2 のレビュー）。`Some` なら LAN の slot を取った
+    /// **後**にもう一度 `authenticate` し、無効（失効済み・期限切れ）なら何もせずに
+    /// `401`。認可は lock の手前で済んでいるので、lock を待つ間に失効したトークン
+    /// （setup の後の失効など）で変更を通さないため。デスクトップの Tauri のコマンドは
+    /// トークンを持たないので `None`。
+    pub recheck_token: Option<&'a str>,
+}
+
+/// lock を取った後の認可の再確認（[`ApplyContext::recheck_token`]）。`Ok(None)`（失効済み・
+/// 期限切れ）は `Unauthorized`、読めない（DB の失敗）はその誤り。監査は残さない（認証の
+/// 層の `401` と同じ扱い。何も変えていない）。
+pub(crate) async fn recheck_token(auth: &AuthState, token: Option<&str>) -> Result<(), BantoError> {
+    let Some(token) = token else {
+        return Ok(());
+    };
+    match auth.authenticate(token).await? {
+        Some(_) => Ok(()),
+        None => Err(BantoError::Unauthorized),
+    }
 }
 
 /// LAN の設定を適用する（spec §11.4 の「保存して適用」。admin-template v3.0.0 の
@@ -340,6 +359,8 @@ pub async fn apply_server_settings(
     actor: ApplyActor<'_>,
 ) -> Result<ServerStatusView, BantoError> {
     let mut slot = ctx.lan.slot.lock().await;
+    // 認可は lock の手前で済んでいる。待つ間に失効したトークンでは何もしない。
+    recheck_token(ctx.rest_auth, ctx.recheck_token).await?;
 
     // 許されない認証と LAN の組み合わせは、何かを止める前に断る。
     ctx.settings.validate_server_config(&config).await?;
@@ -679,6 +700,8 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
     // 失効させると、後から引いた操作者は空になるのに、認可済みの変更は適用されて操作者
     // なしで監査に残る。
     let actor = actor_identity(req.headers(), &state.auth);
+    // lock を取った後の再確認に使う（所有値にして切り離したタスクへ渡す）。
+    let token = bearer_token(req.headers()).map(str::to_owned);
     let Json(payload) = match Json::<ServerSettingsPayload>::from_request(req, &()).await {
         Ok(payload) => payload,
         Err(rejection) => return rejection.into_response(),
@@ -706,6 +729,7 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
             auth_config_lock: &state.auth_config_lock,
             origin: "rest",
             log_label: state.log_label,
+            recheck_token: token.as_deref(),
         };
         apply_server_settings(
             &ctx,
@@ -759,6 +783,7 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
     // （banto-hub の lock-down と同じ扱い）。本文を待つ間に別の要求が失効させた場合も
     // 同じ（`server_settings_put` と同じ扱い）。
     let actor = actor_identity(req.headers(), &state.auth);
+    let token = bearer_token(req.headers()).map(str::to_owned);
     let Json(body) =
         match Json::<serde_json::Map<String, serde_json::Value>>::from_request(req, &()).await {
             Ok(body) => body,
@@ -791,7 +816,7 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
     // await は無いが、その後の監査の行が接続の切断で落ちうる）。
     let label = state.log_label;
     let applied = run_detached(label, async move {
-        auth_settings_apply(&state, actor, value).await
+        auth_settings_apply(&state, actor, value, token).await
     })
     .await;
     match applied {
@@ -805,9 +830,14 @@ async fn auth_settings_apply(
     state: &SettingsAdminState,
     actor: Option<Identity>,
     value: LocalGrantSetting,
+    token: Option<String>,
 ) -> Result<AuthConfigView, ApiError> {
     let revoked = {
         let _guard = state.auth_config_lock.lock().await;
+        // #392 B2-2 のレビュー: lock を待つ間に失効したトークン（setup の後の失効など）で、
+        // setup が保存した `off` を書き戻させない。認可は lock の手前で済んでいるので、
+        // lock の下でもう一度確かめる。
+        recheck_token(&state.auth, token.as_deref()).await?;
         let previous = read_setting(&state.settings).await?;
         write_setting(&state.settings, value).await?;
         // ADR-0017: 閉じた条件を保存してから失効。値が変わったときだけ（同じ値の保存で
