@@ -436,8 +436,11 @@ pub async fn local_access_middleware(
         // JSON として読める本文は object だけを通す（#600 の監査 F3）: 上流の
         // `SetupRequest`・`CreateUserRequest` は普通の `derive(Deserialize)` なので serde の
         // 配列の表現（`["localDesktop", "pw", "x"]`）も受理し、`username` の欄だけを見ると
-        // 予約名の検査を素通りする。JSON として読めない本文は従来どおり上流に任せる
-        // （上流が型・Content-Type で断る）。
+        // 予約名の検査を素通りする。JSON として読めない本文も `400` で断る（fail closed。
+        // #600 のオーナーレビュー P2）: `serde_json::Value` の読み手には再帰の上限（128）が
+        // あるが、上流は知らない欄を `IgnoredAny` で読み飛ばすのでその上限に当たらない。
+        // 知らない欄を深い入れ子にした本文はここでは読めず、上流では読めるので、上流に
+        // 任せると予約名の検査を素通りしていた。
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(serde_json::Value::Object(object)) => {
                 if let Some(username) = object.get("username").and_then(|value| value.as_str()) {
@@ -452,7 +455,12 @@ pub async fn local_access_middleware(
                 ))
                 .into_response()
             }
-            Err(_) => {}
+            Err(_) => {
+                return banto_server::ApiError(BantoError::BadRequest(
+                    "本文を JSON として読めません".to_string(),
+                ))
+                .into_response()
+            }
         }
         req = Request::from_parts(parts, axum::body::Body::from(bytes));
     }

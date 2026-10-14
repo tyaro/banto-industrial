@@ -1011,3 +1011,71 @@ async fn array_bodies_are_refused_on_the_account_paths() {
     }
     assert_eq!(f.users.list_users().await.unwrap().len(), 1);
 }
+
+/// 生の本文を送る（`send` は `Value` を `to_string` するので、`serde_json::Value` が読めない
+/// 本文 - 深すぎる入れ子など - を作れない）。
+async fn send_raw(
+    router: &Router,
+    path: &str,
+    token: Option<&str>,
+    body: String,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("X-Banto-Client", "banto")
+        .header("Host", LOCAL_HOST)
+        .header("Content-Type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut request = builder.body(Body::from(body)).unwrap();
+    request.extensions_mut().insert(ConnectInfo(LOCAL));
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// #600 のオーナーレビュー P2: `serde_json::Value` の読み手には再帰の上限（128）があるが、
+/// 上流の `SetupRequest`・`CreateUserRequest` は知らない欄を `IgnoredAny` で読み飛ばすので
+/// その上限に当たらない。知らない欄を 130 段の配列にした本文は「JSON として読めない」
+/// になり、上流に素通りして予約名のアカウントができていた。読めない本文は `400` で断る
+/// （fail closed）。setup・`POST /api/users` の両方で、アカウントの数は増えない。
+///
+/// 反証: `local_access_middleware` の `Err(_)` を素通り（`{}`）に戻すと、setup が
+/// 成功して `localDesktop` のアカウントができ、このテストが落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deeply_nested_bodies_cannot_bypass_the_reserved_name_check() {
+    let nested = format!("{}0{}", "[".repeat(130), "]".repeat(130));
+    assert!(
+        serde_json::from_str::<Value>(&nested).is_err(),
+        "入れ子が Value の再帰の上限を超えていない"
+    );
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let setup = format!(
+        r#"{{"username":"localDesktop","password":"{PASSWORD}","displayName":"x","unused":{nested}}}"#
+    );
+    let (status, response) = send_raw(&f.router, "/api/auth/setup", None, setup).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert!(!f.users.is_initialized().await.unwrap());
+
+    let f = fixture(
+        LocalGrantStart::Initialized(LocalGrantSetting::Off),
+        true,
+        &[Role::Admin],
+    )
+    .await;
+    let admin = login(&f.router, "admin").await;
+    let create = format!(
+        r#"{{"username":"localDesktop","password":"{PASSWORD}","displayName":"x","role":"viewer","unused":{nested}}}"#
+    );
+    let (status, response) = send_raw(&f.router, "/api/users", Some(&admin), create).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(f.users.list_users().await.unwrap().len(), 1);
+}
