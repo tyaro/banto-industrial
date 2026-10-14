@@ -16,8 +16,10 @@ import {
 	type ResolvedAuth
 } from '@banto/admin-core';
 import {
+	enteredKind,
 	enterCredentiallessGrant,
 	enterPublicViewer,
+	enterThisPc,
 	localDesktopAvailable,
 	loginEntries,
 	needsFirstAdmin
@@ -27,9 +29,9 @@ import {
  * `enterGrant(kind)` が `grantable` に含まれる kind のときだけトークンを保存したことに
  * し、次の `resolve()` がその kind のセッションを返す provider。
  */
-function grantProvider(status: GrantStatus, grantable: string[]) {
+function grantProvider(status: GrantStatus, grantable: string[], initial: string | null = null) {
 	let revision = 1;
-	let held: string | null = null;
+	let held: string | null = initial;
 	const listeners = new Set<() => void>();
 	const rev = () => `${revision}.0` as CredentialRevision;
 	const enterGrant = vi.fn(async (kind: string) => {
@@ -39,9 +41,17 @@ function grantProvider(status: GrantStatus, grantable: string[]) {
 		for (const listener of [...listeners]) listener();
 		return { success: true };
 	});
+	// ログアウト: 保存しているセッションを消す（ログイン不要モードの `local` は閉じない -
+	// デスクトップの Tauri と同じく断られる形）。
+	const logout = vi.fn(async () => {
+		if (held === 'local') return;
+		held = null;
+		revision += 1;
+		for (const listener of [...listeners]) listener();
+	});
 	const auth: AuthProvider = {
 		login: async () => ({ success: true }),
-		logout: async () => {},
+		logout,
 		resolve: async (): Promise<ResolvedAuth> => {
 			const r = rev();
 			if (held === null) return { status: 'none', checked: r, current: r };
@@ -60,7 +70,7 @@ function grantProvider(status: GrantStatus, grantable: string[]) {
 		status: vi.fn(async () => status),
 		enterGrant
 	};
-	return { auth, enterGrant };
+	return { auth, enterGrant, logout };
 }
 
 async function enter(status: GrantStatus, grantable: string[]) {
@@ -118,12 +128,39 @@ describe('enterCredentiallessGrant（localDesktop → publicViewer）', () => {
 });
 
 describe('enterPublicViewer（「閲覧のみで続ける」は明示的に閲覧公開）', () => {
-	async function viewer(status: GrantStatus, grantable: string[]) {
-		const p = grantProvider(status, grantable);
+	async function viewer(status: GrantStatus, grantable: string[], initial: string | null = null) {
+		const p = grantProvider(status, grantable, initial);
 		initBanto({ dataProvider: {} as DataProvider, authProvider: p.auth, resources: [] });
 		const result = await enterPublicViewer(getSessionController(), p.auth);
-		return { result, enterGrant: p.enterGrant };
+		return { result, enterGrant: p.enterGrant, logout: p.logout };
 	}
+	const both = { initialized: true, grants: { localDesktop: true, publicViewer: true } };
+
+	it('既に localDesktop のセッション（戻るで来た）なら、ログアウトしてから publicViewer に切り替える', async () => {
+		const { result, enterGrant, logout } = await viewer(
+			both,
+			['localDesktop', 'publicViewer'],
+			'localDesktop'
+		);
+		expect(logout).toHaveBeenCalledTimes(1);
+		expect(enterGrant.mock.calls.map((call) => call[0])).toEqual(['publicViewer']);
+		expect(enteredKind(result, 'publicViewer')).toBe(true);
+	});
+
+	it('既に publicViewer ならそのまま（ログアウトも発行もしない）', async () => {
+		const { result, enterGrant, logout } = await viewer(both, ['publicViewer'], 'publicViewer');
+		expect(logout).not.toHaveBeenCalled();
+		expect(enterGrant).not.toHaveBeenCalled();
+		expect(enteredKind(result, 'publicViewer')).toBe(true);
+	});
+
+	it('ログイン不要モード（local）は切り替えず、結果は publicViewer ではない（呼び出し側は進まない）', async () => {
+		const { result, enterGrant, logout } = await viewer(both, ['publicViewer'], 'local');
+		expect(logout).not.toHaveBeenCalled();
+		expect(enterGrant).not.toHaveBeenCalled();
+		expect(result.snapshot.kind).toBe('local');
+		expect(enteredKind(result, 'publicViewer')).toBe(false);
+	});
 
 	it('localDesktop も使えるときでも publicViewer に入る（localDesktop を試さない）', async () => {
 		const { result, enterGrant } = await viewer(
@@ -142,6 +179,54 @@ describe('enterPublicViewer（「閲覧のみで続ける」は明示的に閲�
 		);
 		expect(result.snapshot.status).toBe('none');
 		expect(enterGrant).not.toHaveBeenCalled();
+	});
+});
+
+describe('enterThisPc（「この PC として続ける」も明示的に選ぶ）', () => {
+	it('既に publicViewer なら、ログアウトしてから localDesktop に切り替える', async () => {
+		const p = grantProvider(
+			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
+			['localDesktop', 'publicViewer'],
+			'publicViewer'
+		);
+		initBanto({ dataProvider: {} as DataProvider, authProvider: p.auth, resources: [] });
+		const result = await enterThisPc(getSessionController(), p.auth);
+		expect(p.logout).toHaveBeenCalledTimes(1);
+		expect(p.enterGrant.mock.calls.map((call) => call[0])).toEqual(['localDesktop']);
+		expect(enteredKind(result, 'localDesktop')).toBe(true);
+	});
+
+	it('localDesktop が使えなければ none（呼び出し側は進まない）', async () => {
+		const p = grantProvider({ initialized: true, grants: { publicViewer: true } }, [
+			'localDesktop',
+			'publicViewer'
+		]);
+		initBanto({ dataProvider: {} as DataProvider, authProvider: p.auth, resources: [] });
+		const result = await enterThisPc(getSessionController(), p.auth);
+		expect(p.enterGrant).not.toHaveBeenCalled();
+		expect(enteredKind(result, 'localDesktop')).toBe(false);
+	});
+});
+
+describe('enteredKind（呼び出し側が進むか）', () => {
+	const active = (kind: string) =>
+		({
+			outcome: 'confirmed',
+			snapshot: { status: 'active', kind },
+			ticket: {}
+		}) as unknown as Parameters<typeof enteredKind>[0];
+	it('選んだ kind の確定した active だけ真', () => {
+		expect(enteredKind(active('publicViewer'), 'publicViewer')).toBe(true);
+		expect(enteredKind(active('localDesktop'), 'publicViewer')).toBe(false);
+		expect(enteredKind(active('account'), 'publicViewer')).toBe(false);
+		expect(
+			enteredKind(
+				{ outcome: 'unverified', error: null, snapshot: {} } as unknown as Parameters<
+					typeof enteredKind
+				>[0],
+				'publicViewer'
+			)
+		).toBe(false);
 	});
 });
 

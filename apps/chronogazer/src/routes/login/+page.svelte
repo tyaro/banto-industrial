@@ -3,7 +3,14 @@
 	import { getAuthProvider, getSessionController, notify } from '@banto/admin-core';
 	import { resolveAppPath } from '#lib/navigation.js';
 	import { bantoReady, getBantoMode } from '#lib/banto/setup.js';
-	import { enterPublicViewer, loginEntries } from '#lib/banto/grantPolicy.js';
+	import {
+		enteredKind,
+		enterPublicViewer,
+		enterThisPc,
+		LOCAL_DESKTOP_GRANT_KIND,
+		loginEntries,
+		PUBLIC_VIEWER_GRANT_KIND
+	} from '#lib/banto/grantPolicy.js';
 
 	// Undecided until `status()` resolves (or is absent, treated as
 	// "already initialized" - see below): render nothing rather than
@@ -71,29 +78,46 @@
 		})();
 	});
 
-	// #392 B2-2 のレビュー（オーナー P2-1・Copilot）: 閲覧者のセッションをここで明示的に
-	// 発行して確定してから移る（`enterPublicViewer`）。ガードに任せると、この PC からの
-	// 接続（`localDesktop`）も使えるときにガードがそちらを先に発行し、閲覧の制限が
-	// 効かなかった。ガードは既にあるセッションを上書きしない。
-	async function continueAsViewer(): Promise<void> {
+	// #392 B2-2 のレビュー（オーナー P2-1・P2・Copilot）: 2 つのボタンはどちらも、選んだ口の
+	// セッションをここで明示的に確定してから移る（`enterPublicViewer`・`enterThisPc`）。
+	// ガードに任せると、この PC からの接続も使えるときにガードがそちらを先に発行し、閲覧の
+	// 制限が効かなかった。ブラウザの「戻る」でここへ来て別のセッションが残っていれば、
+	// 押した = 切り替える操作としてログアウトしてから入る。結果が選んだ kind のときだけ
+	// 移り、それ以外（切り替えられない・入れない）は留まって理由を出す。ガードは既にある
+	// セッションを上書きしない。
+	async function continueWith(
+		enter: typeof enterPublicViewer,
+		kind: string,
+		failure: string
+	): Promise<void> {
 		error = null;
 		submitting = true;
 		try {
-			const result = await enterPublicViewer(getSessionController(), getAuthProvider());
-			if (result.outcome === 'confirmed' && result.snapshot.status === 'active') {
+			const result = await enter(getSessionController(), getAuthProvider());
+			if (enteredKind(result, kind)) {
 				goto(resolveAppPath('/monitor'));
 			} else {
-				error = '閲覧のみで入れませんでした。しばらくしてからもう一度試してください';
+				error = failure;
 			}
 		} finally {
 			submitting = false;
 		}
 	}
 
-	// 「この PC として続ける」も同じ: ガードが `localDesktop` を先に試す
-	// （`enterCredentiallessGrant`）。
-	function continueAsThisPc(): void {
-		goto(resolveAppPath('/monitor'));
+	function continueAsViewer(): Promise<void> {
+		return continueWith(
+			enterPublicViewer,
+			PUBLIC_VIEWER_GRANT_KIND,
+			'閲覧のみに切り替えられませんでした。しばらくしてからもう一度試してください'
+		);
+	}
+
+	function continueAsThisPc(): Promise<void> {
+		return continueWith(
+			enterThisPc,
+			LOCAL_DESKTOP_GRANT_KIND,
+			'この PC からの接続に切り替えられませんでした。しばらくしてからもう一度試してください'
+		);
 	}
 
 	async function submitLogin(event: SubmitEvent) {
@@ -247,7 +271,12 @@
 			<button type="submit" disabled={submitting}>ログイン</button>
 
 			{#if showContinueAsThisPc}
-				<button type="button" class="continue-as-viewer" onclick={continueAsThisPc}>
+				<button
+					type="button"
+					class="continue-as-viewer"
+					onclick={continueAsThisPc}
+					disabled={submitting}
+				>
 					この PC として続ける
 				</button>
 			{/if}

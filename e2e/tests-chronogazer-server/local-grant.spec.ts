@@ -15,8 +15,9 @@
  * 3. サーバーを再起動しても、新しいブラウザーの文脈で `/` → ログインなしで監視画面。
  * 4. ログアウト → ログイン画面（自動では入り直さない）に「この PC として続ける」→
  *    押すと監視画面。
- * 4b. 閲覧公開も ON のとき、ログイン画面の「閲覧のみで続ける」は閲覧者（`publicViewer`・
- *    viewer）になり、この PC からの接続（admin）を先に発行しない（#392 B2-2 のレビュー）。
+ * 4b. 閲覧公開も ON のとき、ログイン画面の「この PC として続ける」→ 監視画面 → 戻る →
+ *    「閲覧のみで続ける」で閲覧者（`publicViewer`・viewer）に切り替わる（残っていた
+ *    この PC の admin のセッションのまま進まない。#392 B2-2 のレビュー）。
  * 5. 設定 › セキュリティでこの PC からの接続を「使わない」にすると、自分のセッションも
  *    閉じてログイン画面へ。再起動の後も `/` はログイン画面。
  * 6. 別の新しいルートでチェックを外して作成すると、今までどおり作ったアカウントの
@@ -321,7 +322,7 @@ test.describe.serial('この PC からの接続（初回セットアップで選
 		await context.close();
 	});
 
-	test('4b. 両方使えるとき「閲覧のみで続ける」は閲覧者になる（localDesktop を先に発行しない）', async ({
+	test('4b. 両方使えるとき「閲覧のみで続ける」は閲覧者になる（この PC のセッションから戻っても切り替わる）', async ({
 		browser,
 		request
 	}) => {
@@ -330,7 +331,13 @@ test.describe.serial('この PC からの接続（初回セットアップで選
 		try {
 			const { context, page } = await shellLikeContext(browser);
 			await page.goto('/login');
-			await expect(page.getByRole('button', { name: 'この PC として続ける' })).toBeVisible();
+			// 先に「この PC として続ける」で admin のセッションに入り、ブラウザの「戻る」で
+			// ログイン画面へ戻ってから「閲覧のみで続ける」を押す（オーナー再レビュー P2:
+			// 残っていた admin のセッションのまま監視画面へ進んでいた）。
+			await page.getByRole('button', { name: 'この PC として続ける' }).click();
+			await expectThisPcSession(page);
+			await page.goBack();
+			await expect(page).toHaveURL(/\/login$/);
 			await page.getByRole('button', { name: '閲覧のみで続ける' }).click();
 			await expect(page).toHaveURL(/\/monitor$/);
 			const me = await page.evaluate(async () => {

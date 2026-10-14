@@ -71,22 +71,78 @@ export async function enterCredentiallessGrant(
 }
 
 /**
- * ログイン画面の「閲覧のみで続ける」（#392 B2-2 のレビュー、オーナー P2-1・Copilot）:
- * **明示的に閲覧公開（`publicViewer`）を選ぶ**。ガードの自動の順序（`localDesktop` が
- * 先）に任せて `/monitor` へ移るだけだと、両方使えるときにガードが `localDesktop`
- * （admin になりうる）を発行し、利用者が選んだ閲覧の制限が効かなかった。ここで
- * セッションを確定させてから移れば、ガードは既にあるセッションを上書きしない
- * （`grantFallback` は確定した `none` のときだけ呼ばれる）。
+ * ログイン画面のボタンで、資格情報なしの口 `kind` を**明示的に選ぶ**（#392 B2-2 の
+ * レビュー、オーナー P2-1・P2・Copilot）。ガードの自動の順序（`localDesktop` が先）に
+ * 任せて `/monitor` へ移るだけだと、両方使えるときにガードが `localDesktop`（admin に
+ * なりうる）を発行し、利用者が選んだ閲覧の制限が効かなかった。ここでセッションを確定
+ * させてから移れば、ガードは既にあるセッションを上書きしない（`grantFallback` は確定した
+ * `none` のときだけ呼ばれる）。
  *
- * 返すのは `grantFallback` と同じ結果。既にセッションがあればそのまま（何も発行しない）。
+ * - 既に `kind` のセッションなら、そのまま返す。
+ * - 別の active なセッション（`localDesktop`・普通のアカウント。ブラウザの「戻る」で
+ *   ログイン画面に来た場合など）は、ボタンを押した = 切り替える明示の操作として、まず
+ *   provider の `logout()`（サーバーのトークンも失効させる）で閉じ、確定し直してから
+ *   `kind` に入る。
+ * - ログイン不要モードの合成のセッション（`kind: 'local'`。デスクトップの窓だけ）は
+ *   ログアウトで閉じられないので、切り替えずにそのまま返す。
+ *
+ * 呼び出し側は結果が `kind` のセッションか（[`enteredKind`]）を確かめてから移る。
  */
-export async function enterPublicViewer(
+export async function enterGrantExplicitly(
 	controller: SessionController,
-	provider: Pick<AuthProvider, 'status' | 'enterGrant'>
+	provider: Pick<AuthProvider, 'status' | 'enterGrant' | 'logout'>,
+	kind: string,
+	available?: (status: GrantStatus) => boolean
 ): Promise<Exclude<ResolveResult, { outcome: 'superseded' }>> {
-	const first = await resolveSettled(controller, { cause: 'navigation' });
-	if (first.outcome === 'unverified' || first.snapshot.status !== 'none') return first;
-	return grantFallback(controller, provider, first.ticket, { kind: PUBLIC_VIEWER_GRANT_KIND });
+	let current = await resolveSettled(controller, { cause: 'navigation' });
+	if (current.outcome === 'unverified') return current;
+	if (current.snapshot.status === 'active') {
+		if (current.snapshot.kind === kind || current.snapshot.kind === LOGIN_FREE_KIND) {
+			return current;
+		}
+		try {
+			await provider.logout();
+		} catch {
+			// 閉じられたかは下の確定で決める。
+		}
+		current = await resolveSettled(controller, { cause: 'signal' });
+		if (current.outcome === 'unverified' || current.snapshot.status !== 'none') return current;
+	}
+	if (current.snapshot.status !== 'none') return current;
+	return grantFallback(controller, provider, current.ticket, { kind, available });
+}
+
+/** ログイン不要モードの合成のセッションの kind（ログアウトでは閉じない）。 */
+const LOGIN_FREE_KIND = 'local';
+
+/** 「閲覧のみで続ける」: 閲覧公開を明示的に選ぶ（[`enterGrantExplicitly`]）。 */
+export function enterPublicViewer(
+	controller: SessionController,
+	provider: Pick<AuthProvider, 'status' | 'enterGrant' | 'logout'>
+): Promise<Exclude<ResolveResult, { outcome: 'superseded' }>> {
+	return enterGrantExplicitly(controller, provider, PUBLIC_VIEWER_GRANT_KIND);
+}
+
+/** 「この PC として続ける」: この PC からの接続を明示的に選ぶ（[`enterGrantExplicitly`]）。 */
+export function enterThisPc(
+	controller: SessionController,
+	provider: Pick<AuthProvider, 'status' | 'enterGrant' | 'logout'>
+): Promise<Exclude<ResolveResult, { outcome: 'superseded' }>> {
+	return enterGrantExplicitly(
+		controller,
+		provider,
+		LOCAL_DESKTOP_GRANT_KIND,
+		localDesktopAvailable
+	);
+}
+
+/** 結果が `kind` の確定した active なセッションか（呼び出し側はこれが真のときだけ移る）。 */
+export function enteredKind(result: ResolveResult, kind: string): boolean {
+	return (
+		result.outcome === 'confirmed' &&
+		result.snapshot.status === 'active' &&
+		result.snapshot.kind === kind
+	);
 }
 
 /** ログイン画面（`routes/login/+page.svelte`）に出す、資格情報なしの口と初回セットアップの選択。 */
