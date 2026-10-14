@@ -1649,18 +1649,20 @@ mod tests {
         assert_eq!(odd, ShellTestHooks::default());
     }
 
-    /// このテストのビルド（デバッグ）では、本番の `test_hooks` も口を読む経路に入る
-    /// （リリースでは `#[cfg(not(debug_assertions))]` の側。`cargo check --release` で
-    /// 確かめる）。
+    /// 本番の `test_hooks` はビルドのプロファイルに従う: デバッグは口を読み、リリースは
+    /// `#[cfg(not(debug_assertions))]` の側で何も読まない（`cargo test --release` で、
+    /// 口の環境変数を置いたまま回して確かめる）。
     #[test]
     fn production_hooks_follow_build_profile() {
-        const { assert!(cfg!(debug_assertions)) };
-        // 環境変数が無ければ既定（CI・開発機で値を置いていない前提を確かめるだけ）。
-        if std::env::var_os(TEST_SERVICE_NAME_ENV).is_none()
-            && std::env::var_os(TEST_ACCEPT_HOST_KIND_ENV).is_none()
-        {
-            assert_eq!(test_hooks(), ShellTestHooks::default());
-        }
+        // 今のビルドの期待値: デバッグなら環境変数から組み立てた値、リリースなら
+        // 環境に関係なく既定（PR #608 の Copilot レビュー: どちらのプロファイルでも
+        // テストがコンパイルでき、リリースの側の振る舞いも確かめる）。
+        let expected = if cfg!(debug_assertions) {
+            test_hooks_from(true, |name| std::env::var(name).ok())
+        } else {
+            ShellTestHooks::default()
+        };
+        assert_eq!(test_hooks(), expected);
     }
 
     /// Fallback の窓のボタンの受け付け: 知っている 3 つだけ。ページそのものは許し、
