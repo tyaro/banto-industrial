@@ -911,6 +911,8 @@ async fn setup_revokes_even_if_the_db_cannot_be_read_again() {
         users: unreadable,
         auth: f.auth.clone(),
         audit: f.audit.clone(),
+        settings: f.settings.clone(),
+        settings_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     let revocations = || async {
         f.audit
@@ -926,6 +928,7 @@ async fn setup_revokes_even_if_the_db_cannot_be_read_again() {
     let response = finish_setup(
         &state,
         (StatusCode::OK, axum::Json(json!({ "success": false }))).into_response(),
+        false,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -939,6 +942,7 @@ async fn setup_revokes_even_if_the_db_cannot_be_read_again() {
             axum::Json(json!({ "success": true, "token": "new-admin" })),
         )
             .into_response(),
+        false,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1221,4 +1225,314 @@ async fn a_reserved_name_account_closes_the_initialized_grant() {
     let (status, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(token.is_some());
+}
+
+/// 監査の行のうち `settings_change` で `detail.via` が `setup` のもの（#392 B2-2）。
+async fn setup_opt_in_changes(audit: &AuditLogService) -> Vec<crate::audit::AuditLogEntry> {
+    audit
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| {
+            row.action == "settings_change"
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("\"via\":\"setup\""))
+        })
+        .collect()
+}
+
+/// #392 B2-2: 初回セットアップで「この PC からはログインなしで使う」を選ぶと
+/// （本文の `"localGrant": "admin"`）、setup の後処理が設定を `admin` にし、未初期化で
+/// 起動したまま（再起動なしで）`localDesktop` を admin で発行し続ける。未初期化の間の
+/// トークンは今までどおり失効し、監査には setup・`revoke_grants`・`settings_change`
+/// （操作者は作られた管理者、`via: setup`）が残る。その後に設定を `off` にすると
+/// すぐ閉じ、`viewer` は再起動から、`admin` に戻すと再起動なしで開く（起動時の role が
+/// admin のため）。
+///
+/// 反証: `local_desktop_grant_spec` の未初期化の条件を「いま未初期化」だけに戻すと、
+/// setup の後の status が `false` になって落ちる。`finish_setup` で選択を保存しないと、
+/// 同じく落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opting_in_at_setup_keeps_the_admin_grant_without_a_restart() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let (_, before) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let before = before.expect("token");
+
+    let (status, body) = send(
+        &f.router,
+        "POST",
+        "/api/auth/setup",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&before),
+        Some(json!({
+            "username": "owner",
+            "password": PASSWORD,
+            "displayName": "管理者",
+            "localGrant": "admin",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true, "{body}");
+    let owner_token = body["token"].as_str().expect("token").to_string();
+
+    // 未初期化の間のトークンは失効している。
+    assert!(
+        identity(&f.router, &before).await.1.is_null(),
+        "未初期化の間の admin のトークンが残っている"
+    );
+    // 設定は `admin` で、再起動なしで発行が続く。
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Role(Role::Admin)
+    );
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        true
+    );
+    let (status, after) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    assert_eq!(status, StatusCode::OK);
+    let after = after.expect("token");
+    let (_, me) = identity(&f.router, &after).await;
+    assert_eq!(me["id"], "localDesktop", "{me}");
+    assert_eq!(me["role"], "admin", "{me}");
+    // LAN の peer には開かない（要求ごとの確認は変わらない）。
+    let (status, _) = grant(&f.router, Some(LAN), Some(LOCAL_HOST)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 監査: setup（banto）・revoke_grants・settings_change（via setup、操作者は owner）。
+    let rows = f.audit.list(ListParams::default()).await.unwrap().rows;
+    assert!(
+        rows.iter()
+            .any(|row| row.action == "setup" && row.actor_username.as_deref() == Some("owner")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.action == "revoke_grants"),
+        "{rows:?}"
+    );
+    let changes = setup_opt_in_changes(&f.audit).await;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].actor_username.as_deref(), Some("owner"));
+    assert_eq!(changes[0].actor_role.as_deref(), Some("admin"));
+    assert_eq!(changes[0].result, "ok");
+    assert_eq!(changes[0].origin, "rest");
+
+    // 設定の画面の読み: `admin` で再起動は要らない。
+    let (status, body) = send(
+        &f.router,
+        "GET",
+        "/api/settings/auth",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&owner_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["localGrant"], "admin", "{body}");
+    assert_eq!(body["localGrantRestartRequired"], false, "{body}");
+
+    let put = |value: &'static str| {
+        let router = f.router.clone();
+        let token = owner_token.clone();
+        async move {
+            send(
+                &router,
+                "PUT",
+                "/api/settings/auth",
+                Some(LOCAL),
+                Some(LOCAL_HOST),
+                Some(&token),
+                Some(json!({ "localGrant": value })),
+            )
+            .await
+        }
+    };
+    // `off` にするとすぐ閉じ、発行済みは失効する。
+    let (status, body) = put("off").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(identity(&f.router, &after).await.1.is_null());
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        false
+    );
+    // `viewer` は起動時の role と違うので再起動から。
+    let (status, body) = put("viewer").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["localGrantRestartRequired"], true, "{body}");
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        false
+    );
+    // `admin` に戻すと再起動なしで開く。
+    let (status, body) = put("admin").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["localGrantRestartRequired"], false, "{body}");
+    let (status, _) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// #392 B2-2: 選ばない setup（欄が無い・`null`）は今までどおり: 初期化で grant は閉じ、
+/// 設定は `off` のまま、選択の `settings_change` は残らない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_without_opting_in_closes_the_grant() {
+    for local_grant in [None, Some(Value::Null)] {
+        let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+        let mut body = json!({ "username": "owner", "password": PASSWORD, "displayName": "x" });
+        if let Some(value) = local_grant.clone() {
+            body["localGrant"] = value;
+        }
+        let (status, body) = send(
+            &f.router,
+            "POST",
+            "/api/auth/setup",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            None,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(
+            status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+            false,
+            "{local_grant:?}"
+        );
+        let (status, _) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            crate::local_grant::read_setting(&f.settings).await.unwrap(),
+            LocalGrantSetting::Off
+        );
+        assert!(setup_opt_in_changes(&f.audit).await.is_empty());
+    }
+}
+
+/// #392 B2-2: `admin` 以外の値（他の role・`off`・型違い）は setup を走らせずに `400`
+/// （アカウントを作らない）。発行しうる形でないルーター（デスクトップ・`banto-serve` の
+/// `Unsupported`）で選んでも `400`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_opt_in_value_is_refused_before_the_account_is_created() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    for value in [json!("viewer"), json!("off"), json!("root"), json!(true)] {
+        let (status, body) = send(
+            &f.router,
+            "POST",
+            "/api/auth/setup",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            None,
+            Some(json!({
+                "username": "owner",
+                "password": PASSWORD,
+                "displayName": "x",
+                "localGrant": value.clone(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {body}");
+        assert!(!f.users.is_initialized().await.unwrap(), "{value}");
+    }
+    let f = fixture(LocalGrantStart::Unsupported, true, &[]).await;
+    let (status, body) = send(
+        &f.router,
+        "POST",
+        "/api/auth/setup",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        None,
+        Some(json!({
+            "username": "owner",
+            "password": PASSWORD,
+            "displayName": "x",
+            "localGrant": "admin",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(!f.users.is_initialized().await.unwrap());
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Off
+    );
+}
+
+/// #392 B2-2: 選んでいても、setup が確かに成功したときだけ保存する（`success: false`・
+/// 読めない本文では書かない - 失効は今までどおり読めない本文でも行う）。保存に失敗しても
+/// 応答は変えず、`result: "failed"` の監査が残って grant は閉じたまま（fail closed）。
+///
+/// 反証: `finish_setup` の保存の判断を `setup_may_have_initialized` に替えると、読めない
+/// 本文で設定が `admin` になって落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_opt_in_is_saved_only_after_a_confirmed_success() {
+    use axum::response::IntoResponse;
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let state = |settings: SettingsService| LocalAccessState {
+        access: LocalAccess {
+            start: LocalGrantStart::Uninitialized,
+            always_on_listener: true,
+        },
+        users: f.users.clone(),
+        auth: f.auth.clone(),
+        audit: f.audit.clone(),
+        settings,
+        settings_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let ok_state = state(f.settings.clone());
+
+    // `success: false` と読めない本文では書かない。
+    for response in [
+        (StatusCode::OK, axum::Json(json!({ "success": false }))).into_response(),
+        (StatusCode::OK, "not json").into_response(),
+    ] {
+        let response = finish_setup(&ok_state, response, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Off
+    );
+    assert!(setup_opt_in_changes(&f.audit).await.is_empty());
+
+    // 保存に失敗しても応答は成功のまま。監査は `failed`、設定は変わらず grant は閉じる。
+    let closed = migrate_memory().await.expect("migrate_memory");
+    closed.close().await;
+    let failing = state(SettingsService::new(Db::Sqlite(closed)));
+    f.users
+        .setup_first_user("owner", PASSWORD, "x")
+        .await
+        .expect("setup_first_user");
+    let response = finish_setup(
+        &failing,
+        (
+            StatusCode::OK,
+            axum::Json(json!({ "success": true, "token": "unknown-token" })),
+        )
+            .into_response(),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let changes = setup_opt_in_changes(&f.audit).await;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].result, "failed");
+    assert_eq!(
+        changes[0].actor_username, None,
+        "読めないトークンで操作者を作った"
+    );
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Off
+    );
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        false
+    );
 }

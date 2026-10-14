@@ -1971,6 +1971,8 @@ pub fn api_router(
         users: users.clone(),
         auth: auth.clone(),
         audit: audit.clone(),
+        settings: settings.clone(),
+        settings_lock: host.settings_lock.clone(),
     };
     let settings_admin = settings_admin_router(SettingsAdminState {
         settings: settings.clone(),
