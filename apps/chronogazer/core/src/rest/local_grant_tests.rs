@@ -30,7 +30,8 @@ use crate::collect::CollectorService;
 use crate::db::{migrate_memory, Db};
 use crate::display_groups::DisplayGroupService;
 use crate::local_grant::{
-    write_setting, LocalAccess, LocalGrantSetting, LocalGrantStart, LOCAL_GRANT_MAX_SESSIONS,
+    finish_setup, write_setting, LocalAccess, LocalAccessState, LocalGrantSetting, LocalGrantStart,
+    LOCAL_GRANT_MAX_SESSIONS,
 };
 use crate::server_admin::LanControl;
 use crate::settings::SettingsService;
@@ -47,6 +48,7 @@ struct Fixture {
     users: UsersService,
     settings: SettingsService,
     audit: AuditLogService,
+    auth: banto_server::AuthState,
 }
 
 async fn fixture(start: LocalGrantStart, always_on_listener: bool, accounts: &[Role]) -> Fixture {
@@ -109,7 +111,7 @@ async fn fixture_with(
         TagService::new(pool.clone()),
         CollectorService::new(pool.clone(), PathBuf::from("unused-in-tests")),
         DisplayGroupService::new(pool),
-        auth,
+        auth.clone(),
         tx,
         always_on_listener,
         host,
@@ -119,6 +121,7 @@ async fn fixture_with(
         users,
         settings,
         audit,
+        auth,
     }
 }
 
@@ -880,4 +883,73 @@ async fn reserved_usernames_are_refused_on_the_rest_paths() {
     .await;
     assert!(status.is_success(), "{status}: {body}");
     assert_eq!(f.users.list_users().await.unwrap().len(), 2);
+}
+
+/// #600 の監査 F1: setup の後の失効は DB を読み直さない。setup が commit した後に
+/// アカウントの有無を読めなくても（ここでは閉じた pool の `UsersService` を渡す）、本文が
+/// `success: true` なら未初期化の間の admin のトークンを失効させ、監査に残す。
+/// `success: false` なら失効しない。応答はそのまま返す。
+///
+/// 反証: `finish_setup` に `state.users.is_initialized()` の読み直し（`Ok(true)` でなければ
+/// 何もしない）を戻すと、このテストが「トークンが残っている」で落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_revokes_even_if_the_db_cannot_be_read_again() {
+    use axum::response::IntoResponse;
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let (_, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let token = token.expect("token");
+
+    let closed = migrate_memory().await.expect("migrate_memory");
+    closed.close().await;
+    let unreadable = UsersService::new(Db::Sqlite(closed));
+    assert!(unreadable.is_initialized().await.is_err());
+    let state = LocalAccessState {
+        access: LocalAccess {
+            start: LocalGrantStart::Uninitialized,
+            always_on_listener: true,
+        },
+        users: unreadable,
+        auth: f.auth.clone(),
+        audit: f.audit.clone(),
+    };
+    let revocations = || async {
+        f.audit
+            .list(ListParams::default())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .filter(|row| row.action == "revoke_grants")
+            .count()
+    };
+
+    let response = finish_setup(
+        &state,
+        (StatusCode::OK, axum::Json(json!({ "success": false }))).into_response(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!identity(&f.router, &token).await.1.is_null());
+    assert_eq!(revocations().await, 0);
+
+    let response = finish_setup(
+        &state,
+        (
+            StatusCode::OK,
+            axum::Json(json!({ "success": true, "token": "new-admin" })),
+        )
+            .into_response(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["token"], "new-admin", "応答の本文が変わった: {body}");
+    assert!(
+        identity(&f.router, &token).await.1.is_null(),
+        "DB を読めないときに未初期化の間の admin のトークンが残っている"
+    );
+    assert_eq!(revocations().await, 1);
 }

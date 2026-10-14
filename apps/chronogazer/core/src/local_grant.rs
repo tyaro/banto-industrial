@@ -65,7 +65,14 @@
 //!   誰もいない状態に閉じ込められるため。
 //! - setup が成功して初期化されたら、未初期化の間に発行した admin のトークンを失効させる
 //!   （「未初期化の間だけ admin」。条件はアカウントの行で閉じているので、順序は ADR-0017
-//!   どおり）。
+//!   どおり）。成否は応答の本文の `success` で決め（上流は失敗でも `200` を返す）、DB は
+//!   読み直さない。読めない本文は失効へ倒す（#600 の監査 F1、[`setup_may_have_initialized`]）。
+//!
+//! # 後処理は応答から切り離す（#600 の監査 F1・F2・F4）
+//!
+//! hyper 1.x は応答を待つ間に相手の FIN を読むと service の future を捨てる。発行とその
+//! 監査、setup とその後の失効、設定の REST の適用（`crate::server_admin`）は
+//! [`run_detached`] で別のタスクにして、接続を切られても最後まで完結させる。
 //!
 //! # 監査
 //!
@@ -390,7 +397,8 @@ const ACCOUNT_BODY_LIMIT: usize = 64 * 1024;
 ///   なければ `ConnectInfo` を外す（banto の判定が peer 不明として閉じる）。
 /// - `POST /api/auth/setup`: loopback の listener のルーターでは、peer と Host の両方が
 ///   loopback でなければ `403`（`banto-serve` の `BANTO_ALLOW_SETUP` は開発用なので
-///   変えない）。成功して初期化されたら、未初期化の間の admin のトークンを失効させる。
+///   変えない）。成功して初期化されたら、未初期化の間の admin のトークンを失効させる
+///   （[`finish_setup`]）。
 /// - `POST /api/users`: 未初期化の間に `localDesktop` のセッションから来たら `400`。
 /// - `POST /api/auth/grant/localDesktop` の成功: 監査に `login`（`via: localGrant`）。
 pub async fn local_access_middleware(
@@ -470,10 +478,11 @@ pub async fn local_access_middleware(
         } else {
             response
         };
-        if is_setup && response.status().is_success() {
-            revoke_bootstrap_grants(&state).await;
+        if is_setup {
+            finish_setup(&state, response).await
+        } else {
+            response
         }
-        response
     };
     match run_detached("localDesktop の発行・最初の管理者の作成", detached).await {
         Ok(response) => response,
@@ -612,15 +621,45 @@ async fn record_grant_login(state: &LocalAccessState, role: &str) {
         .await;
 }
 
-/// 最初の管理者ができたら、未初期化の間に発行した admin のトークンを失効させる。
-async fn revoke_bootstrap_grants(state: &LocalAccessState) {
-    if state.access.start != LocalGrantStart::Uninitialized {
-        return;
+/// setup の応答の本文の上限（`{success, token, ...}` だけなので十分に小さい）。
+const SETUP_RESPONSE_LIMIT: usize = 64 * 1024;
+
+/// setup の応答から、最初の管理者ができた**かもしれない**か（#600 の監査 F1）。`body` は
+/// 応答の本文（読めなかったら `None`）。
+///
+/// 上流（banto の `auth_setup_handler`）は、成功で `200 {success: true}`、既に初期化
+/// 済み・保存の失敗でも `200 {success: false}` を返す。HTTP の状態は setup の成否では
+/// ないので本文で決める: 2xx 以外と、本文が `success: false` を言うときだけ「できて
+/// いない」。2xx で本文が読めない・解釈できないときは「できたかもしれない」として失効へ
+/// 倒す（fail closed。失効しすぎても、未初期化のままなら grant をもう一度受け取れる）。
+pub(crate) fn setup_may_have_initialized(status: StatusCode, body: Option<&[u8]>) -> bool {
+    if !status.is_success() {
+        return false;
     }
-    if !matches!(state.users.is_initialized().await, Ok(true)) {
-        return;
+    let said_failure = body
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .is_some_and(|value| value.get("success") == Some(&serde_json::Value::Bool(false)));
+    !said_failure
+}
+
+/// setup の後処理（モジュール doc「未初期化の間と最初の管理者の作成」）: 最初の管理者が
+/// できた（かもしれない）なら、未初期化の間に発行した admin のトークンを失効させる。
+///
+/// #600 の監査 F1: DB を読み直さない（setup は commit 済みなのに、追加の
+/// `is_initialized()` だけが一時的に失敗すると失効が飛び、admin のトークンが寿命まで
+/// 残っていた）。判断は応答の本文だけ（[`setup_may_have_initialized`]）で、失効は同期で
+/// すぐ行い、監査の記録はその後（[`local_access_middleware`] の切り離したタスクの中）。
+pub(crate) async fn finish_setup(state: &LocalAccessState, response: Response) -> Response {
+    if state.access.start != LocalGrantStart::Uninitialized || !response.status().is_success() {
+        return response;
     }
-    let revoked = state.auth.revoke_grant_tokens(&local_desktop_grant_kind());
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, SETUP_RESPONSE_LIMIT).await;
+    let revoked = if setup_may_have_initialized(parts.status, bytes.as_deref().ok()) {
+        state.auth.revoke_grant_tokens(&local_desktop_grant_kind())
+    } else {
+        0
+    };
     if revoked > 0 {
         state
             .audit
@@ -639,6 +678,19 @@ async fn revoke_bootstrap_grants(state: &LocalAccessState) {
                 result: "ok",
             })
             .await;
+    }
+    match bytes {
+        Ok(bytes) => Response::from_parts(parts, axum::body::Body::from(bytes)),
+        Err(err) => {
+            eprintln!("最初の管理者の作成の応答を読めませんでした: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody::Other {
+                    message: "最初の管理者の作成の応答を読めませんでした。ログイン画面から入り直してください".to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -699,6 +751,36 @@ mod tests {
             reserved_accounts(["admin", "Local", "op", "localDesktop"]),
             vec!["Local".to_string(), "localDesktop".to_string()]
         );
+    }
+
+    /// #600 の監査 F1: setup の成否は HTTP の状態ではなく本文の `success` で決め、
+    /// 読めない・解釈できない 2xx は失効へ倒す（fail closed）。
+    #[test]
+    fn setup_success_is_read_from_the_body_and_fails_closed() {
+        let ok = StatusCode::OK;
+        let cases: [(StatusCode, Option<&[u8]>, bool); 9] = [
+            (ok, Some(br#"{"success":true,"token":"t"}"#), true),
+            (ok, Some(br#"{"success":false,"error":"x"}"#), false),
+            (ok, Some(b"not json"), true),
+            (ok, None, true),
+            (ok, Some(b"{}"), true),
+            (ok, Some(br#"{"success":"false"}"#), true),
+            (ok, Some(b"[false]"), true),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(br#"{"success":true}"#),
+                false,
+            ),
+            (StatusCode::FORBIDDEN, None, false),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                setup_may_have_initialized(status, body),
+                expected,
+                "{status} {:?}",
+                body.map(String::from_utf8_lossy)
+            );
+        }
     }
 
     /// #600 の監査: 切り離したタスクが panic したら `500` を返す（呼び出し側は panic

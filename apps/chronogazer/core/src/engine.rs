@@ -2717,4 +2717,117 @@ mod tests {
         }
         assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
     }
+
+    /// #600 の監査 F1: 未初期化の間に受け取った `localDesktop`（admin）のトークンは、
+    /// setup を送った側が commit の直後に接続を切っても失効する（setup の commit と失効・
+    /// 監査を応答の future から切り離した）。setup が commit したのを DB で見てから FIN を
+    /// 送る（それより前に切ると、hyper は本文を読む前に要求ごと捨て、setup 自体が
+    /// 起きない - 何も変わらないので約束は破れない）。
+    ///
+    /// commit の**後**の await 点で捨てられる組み合わせは時間でしか作れないので、この
+    /// テストは修正を戻しても落ちるとは限らない（反証はコミット本文）。決定的な守りは、
+    /// 本文で判断する純関数の表（`local_grant` の
+    /// `setup_success_is_read_from_the_body_and_fails_closed`）と、DB が読めなくても失効する
+    /// こと（`rest::local_grant_tests` の `setup_revokes_even_if_the_db_cannot_be_read_again`）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_revokes_the_bootstrap_grant_even_if_the_client_disconnects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = TempDir::new();
+        let engine = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open")
+            .with_loopback(loopback_any_port())
+            .with_loopback_local_access()
+            .start()
+            .await
+            .expect("start");
+        let loopback = engine.loopback_addr().await.expect("loopback");
+        let host = loopback.to_string();
+        let (status, body) = http(
+            loopback,
+            "POST",
+            "/api/auth/grant/localDesktop",
+            &host,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let token = body["token"].as_str().expect("token").to_string();
+        let (_, me) = http(
+            loopback,
+            "GET",
+            "/api/auth/identity",
+            &host,
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(me["role"], "admin", "{me}");
+
+        // setup を送り、commit したら書き込み側を閉じる（FIN）。応答が返るかどうかは問わない。
+        let request = raw_request(
+            "POST",
+            "/api/auth/setup",
+            &host,
+            None,
+            &serde_json::json!({
+                "username": "admin", "password": "admin-pass-1", "displayName": "管理者"
+            }),
+        );
+        let mut stream = tokio::net::TcpStream::connect(loopback)
+            .await
+            .expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let users = engine.services().users.clone();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !users.is_initialized().await.unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "setup が 20 秒以内に commit しなかった"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        stream.shutdown().await.expect("shutdown");
+        let mut ignored = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut ignored))
+            .await
+            .expect("FIN の後も接続が閉じられない");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let revoked = engine
+                .services()
+                .audit
+                .list(banto_core::ListParams::default())
+                .await
+                .unwrap()
+                .rows
+                .into_iter()
+                .any(|row| row.action == "revoke_grants");
+            if revoked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "切断した setup の後の失効の監査の行（revoke_grants）が 20 秒以内に出なかった"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(engine.services().users.is_initialized().await.unwrap());
+        let (_, me) = http(
+            loopback,
+            "GET",
+            "/api/auth/identity",
+            &host,
+            Some(&token),
+            None,
+        )
+        .await;
+        assert!(
+            me.is_null(),
+            "未初期化の間の admin のトークンが残っている: {me}"
+        );
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
 }
