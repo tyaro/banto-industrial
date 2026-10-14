@@ -41,8 +41,19 @@
 //! folder again / reset it, restore a backup / recreate the DB keeping the
 //! old file, or quit) and then retries [`launch_desktop`] in the same process.
 //! See the [`startup`] module.
+//!
+//! #392 B2-4b (docs/chronogazer-service-design.md §4): the desktop host uses
+//! the same data root as `chronogazer-server` (`%ProgramData%\ChronoGazer`,
+//! overridable with `CHRONOGAZER_ROOT`; [`startup::LaunchPaths`]), keeps the
+//! Hub API key in the DPAPI file store under that root ([`desktop_key_store`],
+//! decision 4 - the auto-login password stays in the OS keyring), and tells
+//! each user once that the old `%APPDATA%\dev.tyaro.chronogazer` data is no
+//! longer used ([`legacy_notice`], decision 3 / O10). The old data is never
+//! read, moved or deleted (H9).
 
 mod keyring_store;
+// #392 B2-4b（決定 3・O10）: 旧データ（`%APPDATA%`）の 1 回だけの案内。
+mod legacy_notice;
 // #392（2026-10-12）: 起動に失敗したときの「エラーの窓と対処の選択」。
 mod startup;
 mod tray;
@@ -153,7 +164,8 @@ struct AppState {
     /// `/api/*` (`EngineServices::router`) use the SAME handles, so both see
     /// the same accounts (`users` - the webview session and the REST session
     /// check the same credential store, spec §8.2), settings, Hub connection
-    /// (#332, OS keyring via `keyring_store::KeyringKeyStore`), registry
+    /// (#332; since #392 B2-4b the key lives in the DPAPI file store under the
+    /// data root, [`desktop_key_store`]), registry
     /// (#383 R1-B), collection runtime (#383 R1-C, auto-started by the
     /// engine) and audit trail (spec M14: every mutating command below
     /// records its entry with `origin: "tauri"` once it has succeeded, and
@@ -3367,7 +3379,8 @@ async fn tags_register_from_hub_body(
 ///
 /// `key` は**ログにも監査 detail にも出さない**（`autologin_enable` が
 /// パスワードを出さないのと同じ扱い）。平文は
-/// `keyring_store::KeyringKeyStore` 経由で OS キーリングにだけ入る。
+/// Hub の API キーの保存先（#392 B2-4b から `<root>\secrets\hub-keys\` の DPAPI の
+/// ファイル、[`desktop_key_store`]）にだけ入る。
 #[tauri::command]
 async fn hub_adopt_manual_key(
     state: State<'_, AppState>,
@@ -4045,6 +4058,12 @@ struct StartupErrorNotice {
     closing: String,
 }
 
+/// A1 の診断ファイルの host の種別が `chronogazer-server`（コンソール・サービス）か
+/// （#392 B2-4b。「既に起動しています」の窓で名指しするため）。
+fn is_server_host_kind(host_kind: &str) -> bool {
+    host_kind == ChronoGazerHost::Server.as_str() || host_kind == ChronoGazerHost::Service.as_str()
+}
+
 impl StartupErrorNotice {
     fn new(legacy: &chronogazer_core::db::LegacyDatabase) -> Self {
         Self {
@@ -4066,17 +4085,43 @@ impl StartupErrorNotice {
     fn already_running(failure: &chronogazer_core::instance_lock::InstanceLockFailure) -> Self {
         use chronogazer_core::instance_lock::InstanceLockFailure;
         let (title, message, path, steps) = match failure {
+            // #392 B2-4b: デスクトップも `chronogazer-server` と同じデータのルートを使う
+            // ので、同じ PC のサービス・コンソール版が使っていれば止まる。診断ファイルの
+            // host の種別からそれと分かるときは名指しする。
+            InstanceLockFailure::AlreadyRunning { db, owner }
+                if owner
+                    .as_ref()
+                    .is_some_and(|owner| is_server_host_kind(&owner.host_kind)) =>
+            {
+                (
+                    "この PC で ChronoGazer のサービス（またはコンソール版）が同じデータを使っています",
+                    concat!(
+                        "このデータは、この PC で動いている ChronoGazer のサービス",
+                        "（ChronoGazer 記録エンジン）またはコンソール版（chronogazer-server）が使用中です。",
+                        "同じデータを 2 つのプロセスで開くと時系列データが二重に書き込まれて",
+                        "壊れるため、デスクトップ版の起動を中止しました。"
+                    )
+                    .to_string(),
+                    chronogazer_core::instance_lock::display_path(db),
+                    concat!(
+                        "コンソール版を動かしているときは、そのウィンドウで Ctrl-C を押して止めてから、",
+                        "サービスとして動かしているときはサービスを止めてから、もう一度起動してください。"
+                    ),
+                )
+            }
             InstanceLockFailure::AlreadyRunning { db, .. } => (
                 "ChronoGazer は既に起動しています",
                 concat!(
-                    "このデータベースは既に別の ChronoGazer（または banto-serve）が使用中です。",
+                    "このデータベースは既に別の ChronoGazer（デスクトップ版・サービス・コンソール版）",
+                    "または banto-serve が使用中です。",
                     "同じデータベースを 2 つのプロセスで開くと時系列データが二重に書き込まれて",
                     "壊れるため、起動を中止しました。"
                 )
                 .to_string(),
                 chronogazer_core::instance_lock::display_path(db),
                 concat!(
-                    "先に起動している ChronoGazer（タスクトレイ・タスクバーを確認してください）",
+                    "先に起動している ChronoGazer（タスクトレイ・タスクバーを確認してください。",
+                    "サービス・コンソール版のこともあります）",
                     "または banto-serve を終了してから、もう一度起動してください。"
                 ),
             ),
@@ -4230,11 +4275,17 @@ async fn record_autologin_failed(audit: &AuditLogService, username: &str) {
 fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
     EngineConfig {
         db_path: paths.db_path.clone(),
-        // `data.dir` の相対パスは**アプリのデータディレクトリ基準**
-        // （既定 `"./data"` をプロセスの作業ディレクトリに作らない）。
+        // `data.dir` の相対パスは**データのルート基準**（#392 B2-4b。既定 `"./data"` を
+        // プロセスの作業ディレクトリに作らない。`chronogazer-server` と同じ）。
         data_base: paths.data_dir.clone(),
-        // #332: Hub の API キーは OS キーリング。
-        key_store: Arc::new(keyring_store::KeyringKeyStore),
+        // #392 B2-4b（決定 4）: Hub の API キーは `<root>\secrets\hub-keys\` の DPAPI の
+        // ファイル。保存先の作成・ACL の付与は共有のルートの下に物を作るので、A1 の
+        // 排他を取った後（`open` の後）に [`desktop_key_store`] で開いて
+        // `with_key_store` で差し替える（`chronogazer-server` と同じ順序）。ここでは
+        // 開く前の置き場所（使われることは無い）。
+        key_store: Arc::new(chronogazer_core::key_store::FailedKeyStore::new(
+            "Hub の API キーの保存先をまだ開いていません",
+        )),
         // #383 段階3 P3: Hub 経由の接続を収集で記録する。
         attach_hub: true,
         host: ChronoGazerHost::Desktop,
@@ -4255,6 +4306,32 @@ fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
         // 2026-10-12 オーナー決定）。
         store_dir_check_required: true,
     }
+}
+
+/// デスクトップ host の Hub の API キーの保存先（#392 B2-4b、決定 4）。
+///
+/// `chronogazer-server` と同じ `chronogazer_core::key_store::open_key_store`
+/// （`<root>\secrets\hub-keys\`、DPAPI machine、ディレクトリの ACL は SYSTEM・
+/// Administrators にフル + **今の利用者**に「変更」）。開けない（別の利用者が先に
+/// 作った・ACL が違う・Windows でない）ときは起動を止めず、Hub の操作のたびに
+/// その理由で失敗する `FailedKeyStore` を返し、理由を 1 行ログに出す（PLC の収集は
+/// 止めない。fail closed のまま - 保てないキーを発行しない）。
+///
+/// #332 で OS キーリングに入れていた Hub のキーは**移さない**（読まない・消さない。
+/// 旧データの DB と同じく H9 の扱い）。新しいルートの DB には Hub の接続の記録が
+/// 無いので、利用者が接続し直す（旧データの案内 [`legacy_notice`] で知らせる）。
+/// 自動ログインのパスワードは OS キーリングのまま（[`keyring_store`]）。
+fn desktop_key_store(
+    layout: &chronogazer_core::paths::DataLayout,
+) -> Arc<dyn banto_hub_bootstrap::KeyStore> {
+    let (store, reason) = chronogazer_core::key_store::open_key_store(layout);
+    if let Some(reason) = reason {
+        eprintln!(
+            "banto: Hub の API キーの保存先（{}）を開けませんでした。Hub への接続はこの理由で失敗します（PLC の収集は続けます）: {reason}",
+            layout.hub_keys_dir().display()
+        );
+    }
+    store
 }
 
 /// デスクトップの起動の本体（`setup()` の最初の起動と、対処の窓で対処を選んだ後の
@@ -4312,6 +4389,8 @@ async fn launch_desktop(
         }
     }
     .map_err(LaunchError::Engine)?;
+    // #392 B2-4b: A1 の排他を取った後に Hub のキーの保存先を開く（[`desktop_key_store`]）。
+    let opened = opened.with_key_store(desktop_key_store(&paths.layout));
     let mut opened = match recovery_note {
         Some(note) => opened.with_recovery_note(note),
         None => opened,
@@ -4493,6 +4572,11 @@ async fn launch_desktop(
         return Err(abandon_after_window_failure(app, err).await);
     }
 
+    // #392 B2-4b（決定 3・O10）: 旧データ（`%APPDATA%\dev.tyaro.chronogazer`）が
+    // 残っていれば、利用者ごとに 1 回だけ案内する（起動に成功した後だけ。読まない・
+    // 移さない・消さない）。
+    legacy_notice::show_once(app, &paths.layout);
+
     Ok(())
 }
 
@@ -4541,12 +4625,13 @@ pub fn run() {
         // #392 A2: 2 つ目の起動は既存の窓を前に出し、2 つ目のプロセスは
         // プラグインの setup の中で（下の `setup()`・A1 の排他・DB に触れる前に）
         // 終わる。プラグインは「他のプラグインより先に登録する」決まりなので
-        // 最初に置く（banto-hub と同じ）。単位はアプリの identifier（=
-        // アプリのデータディレクトリ = DB）で、Windows ではログオン
-        // セッションごと。別のセッションから同じ DB を開こうとした場合や
-        // `banto-serve` が先に使っている場合は、A1 の排他（下）が受け止めて
-        // エラーの窓を出す - 2 つ目の起動でそのエラーの窓が前に出る
-        // （`tray::open_main_window`）。
+        // 最初に置く（banto-hub と同じ）。単位はアプリの identifier で、
+        // Windows ではログオンセッションごと（#392 B2-4b からデータのルートは
+        // `%ProgramData%\ChronoGazer` で PC に 1 つなので、単位は DB と一致しない）。
+        // 別のセッションから同じ DB を開こうとした場合や、`banto-serve`・
+        // `chronogazer-server`（コンソール・サービス）が先に使っている場合は、
+        // A1 の排他（下）が受け止めてエラーの窓を出す - 2 つ目の起動でそのエラーの
+        // 窓が前に出る（`tray::open_main_window`）。
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::open_main_window(app);
         }))
@@ -4563,7 +4648,9 @@ pub fn run() {
             // #392（2026-10-12 オーナー決定）: 起動を止める失敗は panic せず、
             // エラーの窓を出す（[`startup`] のモジュール doc）。データの置き場所を
             // 決められない・作れないときは「終了」だけの窓。
-            let paths = match startup::LaunchPaths::resolve(&handle) {
+            // #392 B2-4b: データのルート（既定 `%ProgramData%\ChronoGazer`、
+            // `CHRONOGAZER_ROOT` で上書き）。使えない・作れないときも「終了」だけの窓。
+            let paths = match startup::LaunchPaths::resolve() {
                 Ok(paths) => paths,
                 Err(detail) => {
                     startup::show_fatal(&handle, detail);
@@ -4783,6 +4870,111 @@ mod tests {
         assert!(script.starts_with("window.__CHRONOGAZER_LEGACY_DB__ = "));
         // DB には触れていない（ロックは DB ファイルを作らない）。
         assert!(!db.exists());
+        // 診断ファイルが banto-serve を指すときは、サービス向けの文ではない。
+        assert!(!notice.title.contains("サービス"), "{}", notice.title);
+    }
+
+    /// #392 B2-4b: 同じデータのルートを `chronogazer-server`（コンソール・サービス）が
+    /// 使っているときは、それと分かる見出しと止め方を出す。
+    #[test]
+    fn already_running_notice_names_the_service_or_console_server() {
+        use chronogazer_core::instance_lock::{acquire_for_db, ChronoGazerHost};
+        for holder in [ChronoGazerHost::Server, ChronoGazerHost::Service] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = chronogazer_core::paths::DataLayout::new(dir.path());
+            let _first = acquire_for_db(&layout.db_path(), holder).expect("first ok");
+            let failure = acquire_for_db(&layout.db_path(), ChronoGazerHost::Desktop)
+                .err()
+                .expect("second must fail");
+            let notice = StartupErrorNotice::already_running(&failure);
+            assert_eq!(
+                notice.title,
+                "この PC で ChronoGazer のサービス（またはコンソール版）が同じデータを使っています",
+                "{holder:?}"
+            );
+            assert!(notice.message.contains("使用中"), "{}", notice.message);
+            assert!(
+                notice.steps.contains("サービスを止めて"),
+                "{}",
+                notice.steps
+            );
+            assert!(notice.steps.contains("Ctrl-C"), "{}", notice.steps);
+            assert!(
+                notice.path.contains("chronogazer.sqlite3"),
+                "{}",
+                notice.path
+            );
+        }
+        assert!(is_server_host_kind("server"));
+        assert!(is_server_host_kind("service"));
+        assert!(!is_server_host_kind("desktop"));
+        assert!(!is_server_host_kind("serve"));
+        assert!(!is_server_host_kind(""));
+    }
+
+    /// #392 B2-4b（決定 4）: 保存先を開けないときは起動を止めず、Hub の操作が
+    /// その理由で失敗する KeyStore（`FailedKeyStore`、fail closed）になる。
+    #[test]
+    fn desktop_key_store_falls_back_to_a_failing_store_when_it_cannot_open() {
+        use banto_hub_bootstrap::error::ErrorKind;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = chronogazer_core::paths::DataLayout::new(dir.path());
+        // `secrets` をファイルにしておくと `secrets\hub-keys\` を作れない
+        // （Windows 以外はそもそも DPAPI が無いので開けない）。
+        std::fs::write(layout.secrets_dir(), b"not a directory").unwrap();
+        let store = desktop_key_store(&layout);
+        for err in [
+            store.get("hub:a").unwrap_err(),
+            store.set("hub:a", "secret-value").unwrap_err(),
+            store.delete("hub:a").unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), ErrorKind::KeyStore);
+            assert!(
+                err.to_string()
+                    .contains("Hub の API キーの保存先を使えません"),
+                "{err}"
+            );
+            assert!(!err.to_string().contains("secret-value"));
+        }
+    }
+
+    /// #392 B2-4b（決定 4）: 開ければ `<root>\secrets\hub-keys\` の DPAPI のファイルに
+    /// 書き、同じルートを開き直しても読める（OS キーリングではない）。
+    #[cfg(windows)]
+    #[test]
+    fn desktop_key_store_uses_the_dpapi_files_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = chronogazer_core::paths::DataLayout::new(dir.path());
+        let store = desktop_key_store(&layout);
+        assert_eq!(store.get("hub:a").expect("get"), None);
+        store.set("hub:a", "secret-value").expect("set");
+        assert!(layout.hub_keys_dir().is_dir());
+        assert_eq!(
+            std::fs::read_dir(layout.hub_keys_dir()).unwrap().count(),
+            1,
+            "1 アカウント 1 ファイル"
+        );
+        let reopened = desktop_key_store(&layout);
+        assert_eq!(
+            reopened.get("hub:a").expect("get").as_deref(),
+            Some("secret-value")
+        );
+        reopened.delete("hub:a").expect("delete");
+        assert_eq!(reopened.get("hub:a").expect("get"), None);
+    }
+
+    /// #392 B2-4b: デスクトップのエンジンは `chronogazer-server` と同じ配置
+    /// （DB はルートの直下、`data.dir` の基準はルート）を使う。
+    #[test]
+    fn desktop_engine_config_uses_the_data_root_layout() {
+        let layout = chronogazer_core::paths::DataLayout::new(r"C:\ProgramData\ChronoGazer");
+        let paths = startup::LaunchPaths::from_layout(layout.clone());
+        let cfg = desktop_engine_config_for(&paths);
+        assert_eq!(cfg.db_path, layout.db_path());
+        assert_eq!(cfg.data_base, layout.root());
+        assert_eq!(cfg.host, ChronoGazerHost::Desktop);
+        // A1 の排他の前は Hub のキーの保存先を開かない（`launch_desktop` が後で差し替える）。
+        assert!(cfg.key_store.get("hub:a").is_err());
     }
 
     /// エラー専用のページは Tauri のコマンドを呼ばない（そのとき `AppState`

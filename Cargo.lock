@@ -1065,6 +1065,7 @@ dependencies = [
  "banto-core",
  "banto-desktop-tray",
  "banto-hub-bootstrap",
+ "banto-secret-store",
  "banto-server",
  "chronogazer-core",
  "futures-util",

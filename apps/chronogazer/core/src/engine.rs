@@ -133,7 +133,9 @@
 //!
 //! # host ごとの差（[`EngineConfig`]）
 //!
-//! - KeyStore（デスクトップ = OS キーリング、`banto-serve` =
+//! - KeyStore（デスクトップ = B2-4b から `chronogazer-server` と同じ DPAPI のファイル
+//!   （`crate::key_store::open_key_store`。A1 の排他の後に `with_key_store` で渡す。
+//!   それまでは OS キーリング）、`banto-serve` =
 //!   `UnavailableKeyStore` か `BANTO_HUB_MEMORY_KEYS=1` の `MemoryKeyStore`、
 //!   `chronogazer-server` = DPAPI のファイル（`crate::server_host::open_key_store`））と
 //!   `attach_hub` の有無。
@@ -153,8 +155,8 @@
 //! `with_loopback_fallback` も）・`with_listen`・`with_loopback_local_access` → `start` →
 //! `run\endpoint.json`）。
 //!
-//! **このモジュールに入れないもの**（host 固有）: 窓・トレイ・自動ログイン・
-//! OS キーリング・Acrylic・イベントの webview への転送・単一インスタンスの
+//! **このモジュールに入れないもの**（host 固有）: 窓・トレイ・自動ログイン
+//! （パスワードは OS キーリング）・Acrylic・イベントの webview への転送・単一インスタンスの
 //! プラグイン。これらはデスクトップのシェル（`src-tauri`）に残る。
 //!
 //! # デスクトップの呼び方（B1-2、2026-10-12 実装。同日 #392 の起動時の対処で更新）

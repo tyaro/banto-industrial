@@ -1,9 +1,9 @@
 //! データの置き場所（ルート）の解決と、その下の配置（#392 段階 B の B1-4、
 //! `docs/chronogazer-service-design.md` §3.1(b)・決定 7）。
 //!
-//! 使うのは B1-5 の `chronogazer-server`（`crate::server_host`）。デスクトップは
-//! まだ今の `%APPDATA%\dev.tyaro.chronogazer\` のままで、B2-4 のシェルが
-//! デスクトップ host をこのルートへ寄せる。
+//! 使うのは B1-5 の `chronogazer-server`（`crate::server_host`）と、B2-4b からの
+//! デスクトップ host（`src-tauri` の `startup::LaunchPaths`。以前の
+//! `%APPDATA%\dev.tyaro.chronogazer\` から寄せた）。
 //!
 //! # ルートの解決（[`resolve_data_root`]）
 //!
@@ -53,7 +53,8 @@
 //! と同じ判断）。**既にあるルートの ACL には触らない**（読まない・確かめない・
 //! 直さない。前の版・管理者・インストーラが作ったものはそのまま使う）。
 //! 非 Windows は `create_dir_all`。使うのは `chronogazer-server` の起動
-//! （`crate::server_host::lock`）と、B2-4b からデスクトップ host。
+//! （`crate::server_host::lock`）と、B2-4b からのデスクトップ host（`src-tauri` の
+//! `startup::LaunchPaths::prepare`）。
 //!
 //! # 旧データ（[`legacy_desktop_db_path`]）
 //!

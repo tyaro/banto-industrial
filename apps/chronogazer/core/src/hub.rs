@@ -11,7 +11,9 @@
 //! * 発行規則・6 状態・スコープのホワイトリストは
 //!   [`banto_hub_bootstrap`] 側にある（アプリ非依存）。このモジュールは
 //!   「どこに保存するか」だけを与える。
-//! * 平文の API キーは **OS キーリングだけ**に入る（[`KeyStore`]）。設定 KV
+//! * 平文の API キーは **KeyStore だけ**に入る（[`KeyStore`]。デスクトップと
+//!   `chronogazer-server` は `<root>\secrets\hub-keys\` の DPAPI のファイル
+//!   （`crate::key_store`、#392 B2-4b。それまでのデスクトップは OS キーリング））。設定 KV
 //!   には [`HubRecord`] の JSON（接続先・キー ID・キー名・キーリングの
 //!   アカウント名・選択タグ）しか書かない - この型にキー欄が無いことが、
 //!   「設定 DB に平文が無い」ことの根拠になる。
@@ -468,7 +470,7 @@ fn to_banto_error(error: BootstrapError) -> BantoError {
             "このスコープの自動発行は許可されていません: {detail}"
         )),
         BootstrapErrorKind::KeyStore => BantoError::Other(if detail.is_empty() {
-            "OSキーリングを利用できません".to_string()
+            "Hub の API キーの保存先を利用できません".to_string()
         } else {
             detail
         }),
@@ -1800,8 +1802,9 @@ impl HubService {
     /// このインストールの `installation_id` を設定から読み（無ければ生成
     /// して保存し）、bootstrapper を組み立てる。
     ///
-    /// `keys` は実行形態ごとに差し替える: デスクトップ（`src-tauri`）は OS
-    /// キーリング、`banto-serve` は [`UnavailableKeyStore`]。
+    /// `keys` は実行形態ごとに差し替える: デスクトップ（`src-tauri`）と
+    /// `chronogazer-server` は DPAPI のファイル（`crate::key_store`、#392 B2-4b）、
+    /// `banto-serve` は [`UnavailableKeyStore`]。
     pub async fn new(
         settings: SettingsService,
         keys: Arc<dyn KeyStore>,
