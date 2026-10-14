@@ -56,6 +56,21 @@
 //! ファイル 1 つ 1 つの DACL は確かめない（ディレクトリから継承したものの
 //! はず。書き込みはファイルを丸ごと置き換えるので、書くたびに継承した形に戻る）。
 //!
+//! # 無いときだけ作る（[`create_dir_if_absent`]、#392 B2-4a）
+//!
+//! 秘密の保存先とは別に、**データのルート**（ChronoGazer の
+//! `%ProgramData%\ChronoGazer`。2026-10-14 オーナー決定 O6）を同じ形の保護された DACL
+//! で作るための口。[`ensure_dir`] と違い、**既にあれば何もしない**（DACL を読まず、
+//! 確かめず、直さない - 既にあるルートは前の版・管理者・インストーラが作ったもので、
+//! 形を問わずそのまま使う）。無いときだけ、[`ensure_dir`] と同じ記述子を
+//! `CreateDirectoryW` に渡して作るのと同時に付ける。インストール利用者の SID の
+//! 検証（利用者のアカウントであること）は**作る経路でだけ**行う（既にあるときは
+//! SID を使わないので、検証の失敗で既存のルートを使えなくしない）。確かめてから
+//! 作るまでの間に誰かが作った（`ERROR_ALREADY_EXISTS`）ときも、その形を問わず
+//! 「作らなかった」を返す。親ディレクトリは無ければ普通に作る（親の ACL は
+//! 継承のまま）。記述子・SID の検証の unsafe なコードをこの crate の外へ複製しない
+//! ため、ここに置いた。
+//!
 //! # 非 Windows
 //!
 //! DACL の概念が無いので、作る・確かめる・直すはどれも
@@ -290,6 +305,15 @@ pub(crate) fn verify_dir_with_validated_sid(
     imp::verify_dir(dir, access)
 }
 
+/// 無ければ期待の DACL で作り（`true`）、既にあれば何もしない（`false`。DACL を
+/// 読まない・確かめない・直さない）。モジュール doc「無いときだけ作る」。
+/// インストール利用者の SID は作る経路でだけ確かめる。既にあるパスがディレクトリで
+/// なければ [`AclMismatch::NotADirectory`]。シンボリックリンク・ジャンクションは
+/// 辿った先がディレクトリなら「既にある」。
+pub fn create_dir_if_absent(dir: &std::path::Path, access: &DirAccess) -> Result<bool> {
+    imp::create_dir_if_absent(dir, access)
+}
+
 /// 既にあるディレクトリの DACL を、期待の形に**書き直す**（明示的な修復。
 /// 管理者の操作から呼ぶ）。中のファイル・サブディレクトリへは OS が継承を
 /// 伝える。**所有者は変えない**ので、所有者が許可外なら直した後も
@@ -330,6 +354,10 @@ mod imp {
     }
 
     pub(super) fn reset_dir_acl(_dir: &Path, _access: &DirAccess) -> Result<()> {
+        Err(SecretStoreError::UnsupportedPlatform)
+    }
+
+    pub(super) fn create_dir_if_absent(_dir: &Path, _access: &DirAccess) -> Result<bool> {
         Err(SecretStoreError::UnsupportedPlatform)
     }
 
@@ -511,6 +539,43 @@ mod imp {
             // 確かめてから作るまでの間に誰かが作った: 作った側の形を確かめる。
         }
         verify_dir(dir, access)
+    }
+
+    pub(super) fn create_dir_if_absent(dir: &Path, access: &DirAccess) -> Result<bool> {
+        // 辿った先で判断する（既にあるルートがリンクでも、今までどおり使う）。
+        match std::fs::metadata(dir) {
+            Ok(meta) if meta.is_dir() => return Ok(false),
+            Ok(_) => return Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SecretStoreError::io(IoOp::InspectDir, &e)),
+        }
+        // 作る経路でだけ SID を確かめる（モジュール doc「無いときだけ作る」）。
+        ensure_user_account(access)?;
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))?;
+        }
+        let sd = descriptor(access)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: 0,
+        };
+        let path = wide(dir);
+        // SAFETY: `path` は NUL 終端、`attributes` と記述子は呼び出しの間生きている。
+        let ok = unsafe { CreateDirectoryW(path.as_ptr(), &attributes) };
+        if ok == 0 {
+            let os_error = last_error();
+            if os_error == ERROR_ALREADY_EXISTS {
+                // 確かめてから作るまでの間に誰かが作った: 形を問わずそのまま使う。
+                return Ok(false);
+            }
+            return Err(SecretStoreError::io(
+                IoOp::CreateDir,
+                &std::io::Error::from_raw_os_error(os_error as i32),
+            ));
+        }
+        Ok(true)
     }
 
     pub(super) fn verify_dir(dir: &Path, access: &DirAccess) -> Result<()> {
@@ -957,6 +1022,10 @@ mod tests {
             reset_dir_acl(dir, &access),
             Err(SecretStoreError::UnsupportedPlatform)
         );
+        assert_eq!(
+            create_dir_if_absent(dir, &access),
+            Err(SecretStoreError::UnsupportedPlatform)
+        );
     }
 
     #[cfg(windows)]
@@ -1091,6 +1160,56 @@ mod tests {
 
             // 片付け（所有者は自分なので書き換えられる）。
             reset_dir_acl(&dir, &DirAccess::with_install_user(me)).unwrap();
+        }
+
+        /// #392 B2-4a（O6）: 無ければ保護された DACL で作り、既にあれば触らない。
+        #[test]
+        fn create_dir_if_absent_creates_protected_and_leaves_existing_untouched() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("parent").join("ChronoGazer");
+            let access = DirAccess::with_install_user(me());
+            assert!(create_dir_if_absent(&dir, &access).unwrap());
+            let dacl = read_dir_dacl(&dir).unwrap();
+            check_dacl(&dacl, &access).unwrap();
+            has_no_broad_groups(&dacl);
+
+            // 2 回目は何もしない（作った形のまま）。
+            assert!(!create_dir_if_absent(&dir, &access).unwrap());
+            assert_eq!(read_dir_dacl(&dir).unwrap(), dacl);
+
+            // 既にある普通のフォルダ（継承の DACL）は、形が違っても触らない。
+            let plain = root.path().join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            let before = read_dir_dacl(&plain).unwrap();
+            assert!(!create_dir_if_absent(&plain, &access).unwrap());
+            assert_eq!(read_dir_dacl(&plain).unwrap(), before);
+            assert!(!before.protected);
+
+            // 既にあるパスがファイルなら作らずに断る。
+            let file = root.path().join("file");
+            std::fs::write(&file, b"x").unwrap();
+            assert!(matches!(
+                create_dir_if_absent(&file, &access),
+                Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory))
+            ));
+        }
+
+        /// 作る経路でだけ SID を確かめる: グループの SID では作らない。既にある
+        /// フォルダは SID を使わないので、グループの SID でも何もせず `false`。
+        #[test]
+        fn create_dir_if_absent_checks_the_sid_only_when_creating() {
+            let me = me();
+            let machine = me.as_str().rsplit_once('-').unwrap().0;
+            let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
+            let group_access = DirAccess::with_install_user(group);
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("g");
+            assert!(matches!(
+                create_dir_if_absent(&dir, &group_access),
+                Err(SecretStoreError::InvalidUserSid(_))
+            ));
+            assert!(!dir.exists(), "拒んだときはフォルダを作らない");
+            assert!(!create_dir_if_absent(root.path(), &group_access).unwrap());
         }
 
         #[test]

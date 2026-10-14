@@ -39,7 +39,21 @@
 //! 規約（`BackupService`・[`crate::audit_spool::spool_dir`]）のままで、DB を
 //! `<root>\chronogazer.sqlite3` に置けば自然にこの配置になる。ここの関数群は
 //! それを**同じ規約で組み立てるだけ**で、ディレクトリは作らない（作る側は
-//! 各サービス・B3 のインストーラ）。
+//! 各サービス・B3 のインストーラ）。例外はルートそのもの（下の「ルートの作成」）。
+//!
+//! # ルートの作成（[`create_root_dir`]、#392 B2-4a、2026-10-14 オーナー決定 O6）
+//!
+//! ルートが**まだ無いときだけ**、継承しない保護された DACL（SYSTEM・Administrators に
+//! フル、**このプロセスの利用者**に「変更」、Users などには何も付けない）で作る
+//! （Windows。形と作り方は `banto_secret_store::acl::create_dir_if_absent` - 秘密の
+//! 保存先と同じ記述子・SID の検証を使い、unsafe なコードを複製しない）。
+//! `%ProgramData%` の既定の継承（Users に読み取りと作成）のまま作ると、同じ PC の
+//! 一般の利用者が DB・ログを読めてしまうため。利用者の欄は
+//! [`current_process_dir_access`]（LocalSystem で動いていれば付けない。`crate::key_store`
+//! と同じ判断）。**既にあるルートの ACL には触らない**（読まない・確かめない・
+//! 直さない。前の版・管理者・インストーラが作ったものはそのまま使う）。
+//! 非 Windows は `create_dir_all`。使うのは `chronogazer-server` の起動
+//! （`crate::server_host::lock`）と、B2-4b からデスクトップ host。
 //!
 //! # 旧データ（[`legacy_desktop_db_path`]）
 //!
@@ -183,6 +197,46 @@ impl DataLayout {
     /// 待ち受け中のエンジンの所在（[`crate::endpoint`]）。
     pub fn endpoint_file(&self) -> PathBuf {
         self.run_dir().join(crate::endpoint::ENDPOINT_FILE_NAME)
+    }
+}
+
+/// ルートを、まだ無ければ作る（モジュール doc「ルートの作成」）。今作ったら `true`、
+/// 既にあれば何もせず `false`。失敗の理由は文言で返す（秘密は含まない）。
+pub fn create_root_dir(layout: &DataLayout) -> Result<bool, String> {
+    let root = layout.root();
+    // 既にあれば ACL の指定（利用者の SID）も求めない（既存のルートを使えなく
+    // しない）。
+    if root.is_dir() {
+        return Ok(false);
+    }
+    create_root_dir_impl(root)
+}
+
+#[cfg(windows)]
+fn create_root_dir_impl(root: &Path) -> Result<bool, String> {
+    let access = current_process_dir_access().map_err(|err| err.to_string())?;
+    banto_secret_store::acl::create_dir_if_absent(root, &access).map_err(|err| err.to_string())
+}
+
+#[cfg(not(windows))]
+fn create_root_dir_impl(root: &Path) -> Result<bool, String> {
+    std::fs::create_dir_all(root).map_err(|err| err.to_string())?;
+    Ok(true)
+}
+
+/// このプロセスが作るディレクトリの ACL の指定（Windows）: 利用者のアカウントで
+/// 動いていればその SID に「変更」、LocalSystem など利用者のアカウントでなければ
+/// SYSTEM・Administrators だけ。データのルート（[`create_root_dir`]）と Hub の
+/// API キーの保存先（`crate::key_store::open_key_store`）が同じ判断を使う。
+#[cfg(windows)]
+pub fn current_process_dir_access(
+) -> Result<banto_secret_store::DirAccess, banto_secret_store::SecretStoreError> {
+    use banto_secret_store::{acl::current_user_sid, DirAccess, SecretStoreError};
+    match current_user_sid() {
+        Ok(sid) => Ok(DirAccess::with_install_user(sid)),
+        // LocalSystem など、利用者のアカウントではない（`InvalidUserSid`）。
+        Err(SecretStoreError::InvalidUserSid(_)) => Ok(DirAccess::service_only()),
+        Err(err) => Err(err),
     }
 }
 
@@ -360,5 +414,86 @@ mod tests {
         let layout = DataLayout::new(PathBuf::from("/pd").join("ChronoGazer"));
         let legacy = legacy_desktop_db_path_in(Some("/roaming")).unwrap();
         assert!(!legacy.starts_with(layout.root()));
+    }
+    /// O6: 無いルートは作る。既にあるルートはそのまま（Windows の ACL は下の
+    /// `windows_root_acl`）。
+    #[test]
+    fn create_root_dir_creates_only_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = DataLayout::new(dir.path().join("parent").join("ChronoGazer"));
+        assert_eq!(create_root_dir(&layout), Ok(true));
+        assert!(layout.root().is_dir());
+        assert_eq!(create_root_dir(&layout), Ok(false));
+
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(create_root_dir(&DataLayout::new(&file)).is_err());
+    }
+
+    #[cfg(windows)]
+    mod windows_root_acl {
+        use super::super::*;
+        use banto_secret_store::acl::{
+            current_user_sid, read_dir_dacl, ACCESS_ALLOWED_ACE_TYPE, ADMINISTRATORS_SID,
+            FULL_ACCESS_MASK, INHERIT_FLAGS, MODIFY_ACCESS_MASK, SYSTEM_SID,
+        };
+
+        /// 作ったルートは保護された DACL で、ACE はちょうど SYSTEM・Administrators の
+        /// フルと今の利用者の「変更」の 3 つ（Users などは無い）。
+        #[test]
+        fn a_created_root_has_exactly_the_protected_dacl() {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = DataLayout::new(dir.path().join("ChronoGazer"));
+            assert_eq!(create_root_dir(&layout), Ok(true));
+
+            let dacl = read_dir_dacl(layout.root()).unwrap();
+            assert!(dacl.protected, "継承しない: {dacl:?}");
+            let me = current_user_sid().unwrap();
+            let mut aces: Vec<_> = dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|ace| {
+                    assert_eq!(ace.ace_type, ACCESS_ALLOWED_ACE_TYPE, "{dacl:?}");
+                    assert_eq!(ace.flags, INHERIT_FLAGS, "継承された ACE は無い: {dacl:?}");
+                    (ace.sid.clone(), ace.mask)
+                })
+                .collect();
+            aces.sort();
+            let mut expected = vec![
+                (SYSTEM_SID.to_string(), FULL_ACCESS_MASK),
+                (ADMINISTRATORS_SID.to_string(), FULL_ACCESS_MASK),
+                (me.as_str().to_string(), MODIFY_ACCESS_MASK),
+            ];
+            expected.sort();
+            assert_eq!(aces, expected, "{dacl:?}");
+            for broad in ["S-1-5-32-545", "S-1-1-0", "S-1-5-11", "S-1-5-4"] {
+                assert!(aces.iter().all(|(sid, _)| sid != broad), "{dacl:?}");
+            }
+
+            // 下に作るもの（DB・ログ）は同じ ACE を継承し、Users は入らない。
+            let logs = layout.logs_dir();
+            std::fs::create_dir_all(&logs).unwrap();
+            let child = read_dir_dacl(&logs).unwrap();
+            assert!(child
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|ace| ace.sid != "S-1-5-32-545"));
+        }
+
+        /// 既にあるルートの ACL には触らない（継承の DACL のまま）。
+        #[test]
+        fn an_existing_root_is_left_untouched() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("existing");
+            std::fs::create_dir(&root).unwrap();
+            let before = read_dir_dacl(&root).unwrap();
+            assert!(!before.protected);
+            assert_eq!(create_root_dir(&DataLayout::new(&root)), Ok(false));
+            assert_eq!(read_dir_dacl(&root).unwrap(), before);
+        }
     }
 }

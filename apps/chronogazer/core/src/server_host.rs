@@ -104,7 +104,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use banto_hub_bootstrap::error::{Error as BootstrapError, ErrorKind as BootstrapErrorKind};
 use banto_hub_bootstrap::KeyStore;
 use banto_server::ServerConfig;
 use banto_tstore::{Clock, LocalDate};
@@ -360,89 +359,9 @@ fn failure_from_engine(err: &EngineStartError, layout: &DataLayout) -> StartFail
 
 // --- KeyStore -----------------------------------------------------------------
 
-/// 開けなかった KeyStore の代わり: すべての操作がその理由で失敗する
-/// （`ErrorKind::KeyStore`。bootstrap は fail closed し、保てないキーを発行しない）。
-/// 理由に秘密は入らない（`SecretStoreError` の文言）。
-#[derive(Debug, Clone)]
-pub struct FailedKeyStore {
-    reason: String,
-}
-
-impl FailedKeyStore {
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-        }
-    }
-
-    fn error(&self) -> BootstrapError {
-        BootstrapError::with_detail(
-            BootstrapErrorKind::KeyStore,
-            format!("Hub の API キーの保存先を使えません: {}", self.reason),
-        )
-    }
-}
-
-impl KeyStore for FailedKeyStore {
-    fn get(&self, _account: &str) -> banto_hub_bootstrap::error::Result<Option<String>> {
-        Err(self.error())
-    }
-
-    fn set(&self, _account: &str, _secret: &str) -> banto_hub_bootstrap::error::Result<()> {
-        Err(self.error())
-    }
-
-    fn delete(&self, _account: &str) -> banto_hub_bootstrap::error::Result<()> {
-        Err(self.error())
-    }
-}
-
-/// Hub の API キーの保存先（`<root>\secrets\hub-keys\`、DPAPI machine）を開く。
-/// 開けなければ [`FailedKeyStore`] と理由（ログに出す）を返す。
-///
-/// ディレクトリの ACL の利用者（決定 4 のインストール利用者の欄）は、**今の
-/// プロセスの利用者**:
-///
-/// - コンソールを一般の利用者が動かすと、`%ProgramData%` の既定の ACL で
-///   `ChronoGazer\` は作れる（作った人が所有者）が、SYSTEM・Administrators だけの
-///   ディレクトリでは自分で読み書きできない（所有者も許可の外で、`banto-secret-store`
-///   の確認に通らない）。その人に「変更」を付ければ、作った本人が使え、他の
-///   一般の利用者は読めない。
-/// - 昇格したコンソールでも、トークンの利用者はその人の SID（所有者は
-///   Administrators）なので同じ形になる。
-/// - LocalSystem（`S-1-5-18`。利用者のアカウントの SID ではない）で動いていれば
-///   利用者の ACE を付けない（B3 のサービスは、登録時にインストール利用者の SID を
-///   渡す形にする）。
-///
-/// 先に別の利用者が作ったディレクトリ（ACL が違う）は使わない（`AclMismatch`、
-/// 自動では直さない - B1-3 の決定）。B3-3 の昇格ヘルパが ACL を整える。
-pub fn open_key_store(layout: &DataLayout) -> (Arc<dyn KeyStore>, Option<String>) {
-    match open_key_store_impl(layout) {
-        Ok(store) => (store, None),
-        Err(reason) => (Arc::new(FailedKeyStore::new(reason.clone())), Some(reason)),
-    }
-}
-
-#[cfg(windows)]
-fn open_key_store_impl(layout: &DataLayout) -> Result<Arc<dyn KeyStore>, String> {
-    use banto_secret_store::acl::current_user_sid;
-    use banto_secret_store::{DirAccess, DpapiMachine, FileSecretStore};
-
-    let access = match current_user_sid() {
-        Ok(sid) => DirAccess::with_install_user(sid),
-        // LocalSystem など、利用者のアカウントではない（`InvalidUserSid`）。
-        Err(banto_secret_store::SecretStoreError::InvalidUserSid(_)) => DirAccess::service_only(),
-        Err(err) => return Err(err.to_string()),
-    };
-    FileSecretStore::open(layout.hub_keys_dir(), access, DpapiMachine)
-        .map(|store| Arc::new(store) as Arc<dyn KeyStore>)
-        .map_err(|err| err.to_string())
-}
-
-#[cfg(not(windows))]
-fn open_key_store_impl(_layout: &DataLayout) -> Result<Arc<dyn KeyStore>, String> {
-    Err("この OS では Hub の API キーを保存できません（DPAPI は Windows だけ）".to_string())
-}
+// #392 B2-4a: Hub の API キーの保存先を開く関数と、開けなかったときの代わりは
+// デスクトップ（B2-4b）と共有するため `crate::key_store` へ移した。挙動は同じ。
+pub use crate::key_store::{open_key_store, FailedKeyStore};
 
 // --- 起動と終了 ---------------------------------------------------------------
 
@@ -543,8 +462,10 @@ impl LockedServer {
 /// doc）。排他を取れなければ、ルートの下には何も作らない（DB も）。
 pub fn lock(layout: DataLayout) -> Result<LockedServer, StartFailure> {
     // 初回（`%ProgramData%\ChronoGazer` がまだ無い）はルートを作る。A1 の排他の
-    // 診断ファイルと DB はその直下に置く。
-    if let Err(err) = std::fs::create_dir_all(layout.root()) {
+    // 診断ファイルと DB はその直下に置く。#392 B2-4a（O6）: 無いときだけ、保護された
+    // DACL（SYSTEM・Administrators にフル、このプロセスの利用者に「変更」、Users なし）
+    // で作る。既にあるルートには触らない（`crate::paths::create_root_dir`）。
+    if let Err(err) = crate::paths::create_root_dir(&layout) {
         return Err(StartFailure {
             kind: FailureKind::Other,
             message: format!(

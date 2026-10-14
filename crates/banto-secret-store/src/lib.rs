@@ -28,7 +28,9 @@
 //! - [`acl`]: 保存先ディレクトリの保護された DACL（SYSTEM・Administrators に
 //!   フル、指定したインストール利用者に「変更」、Users などには何も付けない）。
 //!   無ければその DACL で作り、あれば確かめ、違えば失敗する（自動では直さない。
-//!   詳細と理由は [`acl`] の doc）。
+//!   詳細と理由は [`acl`] の doc）。同じ形の DACL で、**無いときだけ**ディレクトリを
+//!   作る口 [`acl::create_dir_if_absent`] もある（ChronoGazer のデータのルート、#392
+//!   B2-4a。既にあれば触らない）。
 //! - `impl banto_hub_bootstrap::KeyStore for FileSecretStore<_>`（`src/keystore.rs`）。
 //!
 //! # DPAPI machine スコープの意味と限界（計画書 §6）

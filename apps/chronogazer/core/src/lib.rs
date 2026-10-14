@@ -31,6 +31,10 @@ pub mod hub_tags;
 // #392 A1: 同じ DB を 2 プロセスで開かないための単一インスタンス排他。
 // デスクトップと `banto-serve` が DB を開く前に呼ぶ。
 pub mod instance_lock;
+// #392 B2-4a: Hub の API キーの保存先（DPAPI のファイル、`<root>\secrets\hub-keys\`）と
+// 開けなかったときの代わり。B1-5 で `server_host` に置いたものを、デスクトップ host
+// （B2-4b）と共有するため移した（`server_host` は再公開）。
+pub mod key_store;
 // #392 B2-1: この PC からの接続を通す grant `localDesktop`（peer と Host の両方が
 // loopback、未初期化なら admin、初期化後は設定 `auth.local_grant`）。
 pub mod local_grant;

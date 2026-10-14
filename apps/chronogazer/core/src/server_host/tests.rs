@@ -189,20 +189,6 @@ fn console_guidance_names_the_manual_steps_for_each_kind() {
     }
 }
 
-#[test]
-fn failed_key_store_fails_closed_on_every_operation() {
-    let store = FailedKeyStore::new("ACL が違います");
-    for err in [
-        store.get("a").unwrap_err(),
-        store.set("a", "secret-value").unwrap_err(),
-        store.delete("a").unwrap_err(),
-    ] {
-        assert_eq!(err.kind(), BootstrapErrorKind::KeyStore);
-        assert!(err.to_string().contains("ACL が違います"), "{err}");
-        assert!(!err.to_string().contains("secret-value"));
-    }
-}
-
 // --- ログ ---------------------------------------------------------------------
 
 #[test]
