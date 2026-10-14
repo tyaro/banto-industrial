@@ -123,6 +123,56 @@ pub const LOCAL_GRANT_SETTING_KEY: &str = "auth.local_grant";
 /// 最古が失効する。
 pub const LOCAL_GRANT_MAX_SESSIONS: usize = 16;
 
+/// アカウント名として使えない名前（#600 のレビュー、2026-10-14）: 資格情報なしの合成の
+/// セッションの identity と同じ名前。監査の行は `actor_username`/`actor_role` しか
+/// 持たないので、同じ名前のアカウントがあると「誰が操作したか」を区別できない。
+/// `local` = ログイン不要モード（デスクトップ）、`localDesktop` = この PC からの接続、
+/// `public` = 閲覧公開（banto の `PUBLIC_VIEWER_ID`）。上流（banto）の検証は長さだけ
+/// なので、ChronoGazer の経路（REST の setup・`POST /api/users`、デスクトップの
+/// `auth_setup`・`users_create`）で banto のサービスを呼ぶ前に断る。比べ方は前後の空白を
+/// 除き（banto も除いて保存する）、大文字小文字を区別しない。アカウント名の変更の口は
+/// 無い（`PUT /api/users/{id}` は表示名と role だけ）。
+pub const RESERVED_USERNAMES: [&str; 3] = [
+    "local",
+    LOCAL_GRANT_ACTOR_ID,
+    banto_server::PUBLIC_VIEWER_ID,
+];
+
+/// `username` が予約名か（[`RESERVED_USERNAMES`]）。
+pub fn is_reserved_username(username: &str) -> bool {
+    let name = username.trim();
+    RESERVED_USERNAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
+/// 予約名なら、banto のアカウント名の検証と同じ形（`422`、欄 `username`）の誤りを返す
+/// （画面は既存の欄の誤りとして出す）。
+pub fn check_username_not_reserved(username: &str) -> Result<(), BantoError> {
+    if is_reserved_username(username) {
+        return Err(BantoError::Validation {
+            field_errors: vec![banto_core::FieldError {
+                field: "username".to_string(),
+                message: format!(
+                    "「{}」は内部で使う名前のため、アカウント名にできません",
+                    username.trim()
+                ),
+            }],
+        });
+    }
+    Ok(())
+}
+
+/// 既にある予約名のアカウント（起動時の警告用。[`RESERVED_USERNAMES`] の前に作られた
+/// DB。自動では直さない）。
+pub fn reserved_accounts<'a>(usernames: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    usernames
+        .into_iter()
+        .filter(|name| is_reserved_username(name))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// [`LOCAL_DESKTOP_GRANT_KIND`] を `GrantKind` として返す。
 pub fn local_desktop_grant_kind() -> GrantKind {
     GrantKind::new(LOCAL_DESKTOP_GRANT_KIND).expect("`localDesktop` は grant kind の文法に合う")
@@ -331,6 +381,8 @@ const STATUS_PATH: &str = "/api/auth/status";
 const GRANT_PREFIX: &str = "/api/auth/grant/";
 const SETUP_PATH: &str = "/api/auth/setup";
 const USERS_PATH: &str = "/api/users";
+/// アカウントを作る本文の上限（名前・パスワード・表示名だけなので十分に大きい）。
+const ACCOUNT_BODY_LIMIT: usize = 64 * 1024;
 
 /// `/api` 全体に掛ける前段（モジュール doc）:
 ///
@@ -359,6 +411,29 @@ pub async fn local_access_middleware(
         return forbidden_with(
             "最初の管理者の作成は、この PC の http://127.0.0.1:<port>/ からだけ行えます",
         );
+    }
+
+    // アカウントを作る経路では予約名を断る（[`RESERVED_USERNAMES`]）。
+    if is_post && (path == SETUP_PATH || path == USERS_PATH) {
+        let (parts, body) = req.into_parts();
+        let bytes = match axum::body::to_bytes(body, ACCOUNT_BODY_LIMIT).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return banto_server::ApiError(BantoError::BadRequest(
+                    "本文が大きすぎるか、読めません".to_string(),
+                ))
+                .into_response()
+            }
+        };
+        let username = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value["username"].as_str().map(str::to_owned));
+        if let Some(username) = username {
+            if let Err(err) = check_username_not_reserved(&username) {
+                return banto_server::ApiError(err).into_response();
+            }
+        }
+        req = Request::from_parts(parts, axum::body::Body::from(bytes));
     }
 
     if is_post && path == USERS_PATH {
@@ -545,6 +620,30 @@ mod tests {
             );
         }
         assert!(LocalGrantSetting::parse("root").is_err());
+    }
+
+    #[test]
+    fn synthetic_identities_are_reserved_usernames() {
+        for name in [
+            "local",
+            "localDesktop",
+            "public",
+            " Local ",
+            "LOCALDESKTOP",
+            "localdesktop",
+            "Public",
+        ] {
+            assert!(is_reserved_username(name), "{name}");
+            assert!(check_username_not_reserved(name).is_err(), "{name}");
+        }
+        for name in ["admin", "localuser", "local2", "publicist", "operator"] {
+            assert!(!is_reserved_username(name), "{name}");
+            assert!(check_username_not_reserved(name).is_ok(), "{name}");
+        }
+        assert_eq!(
+            reserved_accounts(["admin", "Local", "op", "localDesktop"]),
+            vec!["Local".to_string(), "localDesktop".to_string()]
+        );
     }
 
     #[test]

@@ -820,3 +820,64 @@ async fn encoded_kind_spellings_are_audited_and_still_checked() {
     }
     assert!(!f.users.is_initialized().await.unwrap());
 }
+
+/// #600 のレビュー: 合成の identity と同じアカウント名は、REST の setup と
+/// `POST /api/users` で欄の誤り（`422`、`username`）になり、アカウントを作らない。
+/// 普通の名前は通る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_usernames_are_refused_on_the_rest_paths() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    for name in ["localDesktop", " Local ", "PUBLIC"] {
+        let (status, body) = send(
+            &f.router,
+            "POST",
+            "/api/auth/setup",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            None,
+            Some(json!({ "username": name, "password": PASSWORD, "displayName": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}: {body}");
+        assert_eq!(body["field_errors"][0]["field"], "username", "{body}");
+    }
+    assert!(!f.users.is_initialized().await.unwrap());
+
+    let (status, body) = send(
+        &f.router,
+        "POST",
+        "/api/auth/setup",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        None,
+        Some(json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let admin = body["token"].as_str().expect("token").to_string();
+    for name in ["localdesktop", "local", "Public "] {
+        let (status, body) = send(
+            &f.router,
+            "POST",
+            "/api/users",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            Some(&admin),
+            Some(json!({ "username": name, "password": PASSWORD, "displayName": "x", "role": "viewer" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}: {body}");
+    }
+    let (status, body) = send(
+        &f.router,
+        "POST",
+        "/api/users",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&admin),
+        Some(json!({ "username": "operator", "password": PASSWORD, "displayName": "運転員", "role": "viewer" })),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body}");
+    assert_eq!(f.users.list_users().await.unwrap().len(), 2);
+}

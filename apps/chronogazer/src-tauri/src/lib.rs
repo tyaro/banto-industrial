@@ -692,6 +692,9 @@ async fn setup_body(
     password: String,
     display_name: String,
 ) -> Result<LoginResult, BantoError> {
+    // #600 のレビュー: 合成の identity と同じアカウント名は作らせない
+    // （`chronogazer_core::local_grant::RESERVED_USERNAMES`、REST と同じ判定・同じ誤り）。
+    chronogazer_core::local_grant::check_username_not_reserved(&username)?;
     let (_, seq_at_entry) = read_slot(state);
     // Owner decision on banto #266 (S-95): in auth-disabled mode no account session
     // is ever installed. Checked on entry so no account is created for a
@@ -2043,7 +2046,20 @@ async fn users_create(
     display_name: String,
     role: Role,
 ) -> Result<UserIdentityResult, BantoError> {
-    let actor = require_role(&state, Role::Admin, "users").await?;
+    users_create_body(&state, username, password, display_name, role).await
+}
+
+/// Body of [`users_create`] (a plain `&AppState`, testable without Tauri).
+async fn users_create_body(
+    state: &AppState,
+    username: String,
+    password: String,
+    display_name: String,
+    role: Role,
+) -> Result<UserIdentityResult, BantoError> {
+    let actor = require_role(state, Role::Admin, "users").await?;
+    // #600 のレビュー: 合成の identity と同じアカウント名は作らせない（REST と同じ）。
+    chronogazer_core::local_grant::check_username_not_reserved(&username)?;
     let identity = state
         .services
         .users
@@ -10059,5 +10075,63 @@ mod tests {
                 "tauri".to_string()
             ))
         );
+    }
+
+    /// #600 のレビュー: 合成の identity と同じアカウント名（`local`・`localDesktop`・
+    /// `public`、大文字小文字・前後の空白を問わず）は、デスクトップの初回セットアップでも
+    /// アカウントの作成でも欄の誤り（`username`）で断り、アカウントを作らない。普通の
+    /// 名前は通る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_usernames_are_refused_on_the_desktop_paths() {
+        let state = app_state().await;
+        for name in ["local", " LocalDesktop ", "PUBLIC"] {
+            let result = setup_body(
+                &state,
+                name.to_string(),
+                "password123".to_string(),
+                "名前".to_string(),
+            )
+            .await;
+            match result {
+                Err(BantoError::Validation { field_errors }) => {
+                    assert_eq!(field_errors[0].field, "username", "{name}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        assert!(!state.services.users.is_initialized().await.unwrap());
+
+        let state = admin_app_state().await;
+        let result = users_create_body(
+            &state,
+            "localdesktop".to_string(),
+            "password123".to_string(),
+            "名前".to_string(),
+            Role::Viewer,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(BantoError::Validation { .. })),
+            "{result:?}"
+        );
+        let created = users_create_body(
+            &state,
+            "operator".to_string(),
+            "password123".to_string(),
+            "運転員".to_string(),
+            Role::Viewer,
+        )
+        .await;
+        assert!(created.is_ok(), "{created:?}");
+        let names: Vec<String> = state
+            .services
+            .users
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|user| user.username)
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
     }
 }

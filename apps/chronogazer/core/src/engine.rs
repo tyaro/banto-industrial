@@ -825,6 +825,22 @@ impl OpenedEngine {
             Err(err) => eprintln!("{label}: 監査ログの保持設定の読み取りに失敗しました: {err}"),
         }
 
+        // #600 のレビュー: 合成の identity と同じ名前（`crate::local_grant::RESERVED_USERNAMES`）
+        // のアカウントは、監査で資格情報なしのセッションと区別できない。今は作れないが、
+        // それより前に作られた DB にあれば警告だけ出す（アカウントは変えない・起動も
+        // 止めない）。
+        if let Ok(accounts) = users.list_users().await {
+            let reserved = crate::local_grant::reserved_accounts(
+                accounts.iter().map(|account| account.username.as_str()),
+            );
+            if !reserved.is_empty() {
+                eprintln!(
+                    "{label}: 警告: アカウント名 {} は、ログインなしのセッション（ログイン不要モード・この PC からの接続・閲覧公開）と同じ名前のため、監査ログで区別できません。別の名前のアカウントを作って移り、このアカウントを削除してください",
+                    reserved.join("・")
+                );
+            }
+        }
+
         // 閲覧公開の種まき（`banto-serve` の `BANTO_VIEWER_PUBLIC`、admin-template
         // v3.0.0 と同じ）。保存済みの設定を読み書きするので `enabled`/bind/port は
         // 残る。失敗しても起動は止めない。
