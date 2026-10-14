@@ -628,7 +628,7 @@ fn service_uninstall_delegate() -> Result<(), ElevatedError> {
 fn set_autostart(enabled: bool) -> Result<(), ElevatedError> {
     use crate::service_manager::ServiceManager as _;
     let exe_path = sibling_banto_hub_exe_path()?;
-    let manager = crate::service_manager::WindowsServiceManager::new(exe_path);
+    let manager = crate::service_manager::hub_service_manager(exe_path);
     manager.set_auto_start(enabled)?;
     Ok(())
 }
