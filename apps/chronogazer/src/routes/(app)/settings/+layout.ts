@@ -1,9 +1,10 @@
 import { isAdmin } from '#lib/permissions.js';
-import { isTauri } from '#lib/banto/setup.js';
+import { getBantoMode, isTauri } from '#lib/banto/setup.js';
 import { isAuditLogAvailable } from '#lib/banto/auditLogAdmin.js';
 import { isBackupsAvailable } from '#lib/banto/backupsAdmin.js';
 import { sessionStore } from '#lib/session.svelte.js';
-import { canManageAuthMode } from './shared';
+import { authSettingsStore } from './authSettingsStore.svelte';
+import { canManageAuthMode, errorMessage } from './shared';
 import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
 
 /**
@@ -25,7 +26,13 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   「バックアップ/リストア」`backupsAvailable && isAdmin` の OR
  *   （どちらか一方でも見えれば data カテゴリ自体は可視）。
  * - `security`: 元「認証」section の `tauri && canManageAuthMode`
- *   （`canManageAuthMode` は `shared.ts` 参照）。
+ *   （`canManageAuthMode` は `shared.ts` 参照）。#392 B2-2 で、サービスの host
+ *   （`chronogazer-server`）の HTTP の画面（`server` モード）でも admin なら出す:
+ *   この PC からの接続（`localGrant`）の設定と、ログイン不要モードの読むだけの表示。
+ *   条件は `GET /api/settings/auth` の `localGrantSupported`（`chronogazer-server`
+ *   だけ `true`。`banto-serve`・LAN の画面のデスクトップは出さない）。その読み取りは
+ *   ここで `authSettingsStore` に入れる（`server` モードの初回ロード。Tauri は従来
+ *   どおり `+layout.svelte`）。読めなければ出さない。
  * - `hub`（#332、新設）: `connectivity` と同じ `isAdmin(sessionStore.role)`。
  *   Hub への接続は `connectivity`（自アプリの LAN 公開）と同じ「サーバ
  *   制御系 = admin」の範囲。実行形態による可用性（プレーンな `vite dev`
@@ -59,12 +66,23 @@ export async function load({ parent }) {
 	const admin = isAdmin(sessionStore.role);
 	const tauri = isTauri();
 
+	// #392 B2-2: `server` モードの admin は認証の設定を REST で読む（上の doc）。
+	const server = getBantoMode() === 'server';
+	if (server && admin) {
+		try {
+			await authSettingsStore.load();
+		} catch (err) {
+			authSettingsStore.error = errorMessage(err);
+		}
+	}
+	const localGrantSupported = server && authSettingsStore.value?.localGrantSupported === true;
+
 	const visible: Record<SettingsCategoryId, boolean> = {
 		appearance: true,
 		account: true,
 		connectivity: admin,
 		data: admin && (isAuditLogAvailable() || isBackupsAvailable()),
-		security: tauri && canManageAuthMode(),
+		security: (tauri && canManageAuthMode()) || (server && admin && localGrantSupported),
 		hub: admin,
 		collect: true
 	};

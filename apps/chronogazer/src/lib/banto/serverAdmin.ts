@@ -1,16 +1,24 @@
 // banto v3.0.0 の admin-template
 // `apps/admin-template/src/lib/banto/serverAdmin.ts` からコピー（I2b、2026-10-04）。
-// chronogazer 固有の差: なし（本文は無改変。doc が挙げる `systemAdmin.ts` は ChronoGazer には無い）。
+// chronogazer 固有の差（#392 B2-2、2026-10-14）: `server` モード（サービスの
+// `chronogazer-server` の HTTP の画面）では Tauri のコマンドの代わりに REST
+// （`GET`/`PUT /api/settings/server`、B2-1）を呼び、応答の `restartRequired` を持つ。
+// demo では reject する。エラーの正規化は `restJson.ts` に寄せた（doc が挙げる
+// `systemAdmin.ts` は ChronoGazer には無い）。
 /**
- * Thin wrapper around the src-tauri embedded-server lifecycle commands
- * (spec §11.4). Every export here only makes sense inside the Tauri
- * webview - callers must guard with `isTauri()` (setup.ts) first, same as
- * any other capability-gated UI (spec §11.3: functionality a LAN browser
- * client cannot use is hidden by capability judgement, not disabled/greyed
- * out).
+ * The embedded-server (LAN access) settings (spec §11.4). Inside the Tauri
+ * webview: the src-tauri lifecycle commands (`server_status`/`server_apply`).
+ * In a browser tab served by the service host (`chronogazer-server`, #392
+ * B2-2): the same shape over REST, admin-only; the server accepts a change
+ * only from this PC (`hostInfo.ts`'s `settingsEditableHere`), and a change of
+ * the always-on listener's shape (the port, `0.0.0.0`) is saved for the next
+ * start (`restartRequired`). Callers still hide what they cannot use
+ * (spec §11.3).
  */
 import { invoke } from '@tauri-apps/api/core';
-import { isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
+import { ProviderError } from '@banto/admin-core';
+import { restJson, toProviderError } from './restJson';
+import { getBantoMode } from './setup';
 
 /** One LAN access URL and its QR code (as an inline SVG string), for the settings screen (spec §11.4). */
 export interface QrSvg {
@@ -33,31 +41,19 @@ export interface ServerStatus {
 	viewerPublic: boolean;
 	urls: string[];
 	qrSvgs: QrSvg[];
+	/**
+	 * REST only (#392 B2-2, `chronogazer-server`): the saved settings change the
+	 * always-on listener (the port, `0.0.0.0`) and take effect from the next
+	 * start. Absent from the Tauri commands' answer.
+	 */
+	restartRequired?: boolean;
 }
 
-const ERROR_KINDS = new Set([
-	'not_found',
-	'validation',
-	'bad_request',
-	'unauthorized',
-	'forbidden',
-	'storage',
-	'other'
-]);
+/** The message a settings call rejects with when there is no backend (plain `vite dev`/demo). */
+export const SERVER_SETTINGS_DEMO_MESSAGE = 'デモモードでは利用できません';
 
-/** Same type guard as systemAdmin.ts / providers/tauri.ts (spec §10/§11.1). */
-function isErrorBody(value: unknown): value is ErrorBody {
-	if (typeof value !== 'object' || value === null) return false;
-	const kind = (value as { kind?: unknown }).kind;
-	return typeof kind === 'string' && ERROR_KINDS.has(kind);
-}
-
-/** Tauri rejects with a `{ kind, message }` object, not an `Error` (Issue #287). */
-export function toProviderError(err: unknown): ProviderError {
-	if (isProviderError(err)) return err;
-	if (isErrorBody(err)) return new ProviderError(err);
-	const message = err instanceof Error ? err.message : String(err);
-	return new ProviderError({ kind: 'other', message });
+function demoModeError(): ProviderError {
+	return new ProviderError({ kind: 'other', message: SERVER_SETTINGS_DEMO_MESSAGE });
 }
 
 async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -69,16 +65,27 @@ async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Pr
 }
 
 /** Current persisted settings + live running state (spec §11.4). */
-export function getServerStatus(): Promise<ServerStatus> {
+export async function getServerStatus(): Promise<ServerStatus> {
+	const mode = getBantoMode();
+	if (mode === 'server') return restJson<ServerStatus>('/api/settings/server', { method: 'GET' });
+	if (mode === 'demo') throw demoModeError();
 	return invokeCommand('server_status');
 }
 
 /** Persist new settings, stop/restart the server to match, and return the resulting status. */
-export function applyServerSettings(
+export async function applyServerSettings(
 	enabled: boolean,
 	bind: string,
 	port: number,
 	viewerPublic: boolean
 ): Promise<ServerStatus> {
+	const mode = getBantoMode();
+	if (mode === 'server') {
+		return restJson<ServerStatus>('/api/settings/server', {
+			method: 'PUT',
+			body: { enabled, bind, port, viewerPublic }
+		});
+	}
+	if (mode === 'demo') throw demoModeError();
 	return invokeCommand('server_apply', { enabled, bind, port, viewerPublic });
 }
