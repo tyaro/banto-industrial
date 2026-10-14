@@ -1536,3 +1536,70 @@ async fn the_opt_in_is_saved_only_after_a_confirmed_success() {
         false
     );
 }
+
+/// #392 B2-2 の監査: 初回セットアップの選択は常に決定的。未初期化の間に grant の admin の
+/// トークンから `PUT /api/settings/auth {localGrant: "admin"}` を先に保存しておいても、
+/// チェックを外して作れば、setup の後処理が `off` にして grant は閉じる（status `false`・
+/// 発行は `403`・監査に `settings_change`（`off`・`via: setup`、操作者は作った管理者）が
+/// 1 行）。
+///
+/// 反証: `finish_setup` の `off` の保存を外す（`setup_choice` が選ばなかったときに `None`
+/// を返す）と、先に保存した `admin` で grant が開いたままになって落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_without_opting_in_overrides_a_value_saved_before_setup() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let (_, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let token = token.expect("token");
+    let (status, body) = send(
+        &f.router,
+        "PUT",
+        "/api/settings/auth",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(&token),
+        Some(json!({ "localGrant": "admin" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Role(Role::Admin)
+    );
+
+    let (status, body) = send(
+        &f.router,
+        "POST",
+        "/api/auth/setup",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        None,
+        Some(json!({ "username": "owner", "password": PASSWORD, "displayName": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true, "{body}");
+
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        false,
+        "チェックを外した作成の後も grant が開いている"
+    );
+    let (status, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(token.is_none());
+    assert_eq!(
+        crate::local_grant::read_setting(&f.settings).await.unwrap(),
+        LocalGrantSetting::Off
+    );
+    let changes = setup_opt_in_changes(&f.audit).await;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert!(
+        changes[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("\"localGrant\":\"off\"")),
+        "{changes:?}"
+    );
+    assert_eq!(changes[0].result, "ok");
+    assert_eq!(changes[0].actor_username.as_deref(), Some("owner"));
+}
