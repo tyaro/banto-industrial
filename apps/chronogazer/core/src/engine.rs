@@ -827,15 +827,16 @@ impl OpenedEngine {
 
         // #600 のレビュー: 合成の identity と同じ名前（`crate::local_grant::RESERVED_USERNAMES`）
         // のアカウントは、監査で資格情報なしのセッションと区別できない。今は作れないが、
-        // それより前に作られた DB にあれば警告だけ出す（アカウントは変えない・起動も
-        // 止めない）。
+        // それより前に作られた DB にあれば警告を出す（アカウントは変えない・起動も
+        // 止めない）。その間、初期化後の `localDesktop` の発行は断る（fail closed。
+        // `crate::local_grant::has_reserved_accounts`、#600 の Copilot レビュー）。
         if let Ok(accounts) = users.list_users().await {
             let reserved = crate::local_grant::reserved_accounts(
                 accounts.iter().map(|account| account.username.as_str()),
             );
             if !reserved.is_empty() {
                 eprintln!(
-                    "{label}: 警告: アカウント名 {} は、ログインなしのセッション（ログイン不要モード・この PC からの接続・閲覧公開）と同じ名前のため、監査ログで区別できません。別の名前のアカウントを作って移り、このアカウントを削除してください",
+                    "{label}: 警告: アカウント名 {} は、ログインなしのセッション（ログイン不要モード・この PC からの接続・閲覧公開）と同じ名前のため、監査ログで区別できません。解消するまで、この PC からの接続（localDesktop）は発行しません。別の名前のアカウントを作って移り、このアカウントを削除してください",
                     reserved.join("・")
                 );
             }

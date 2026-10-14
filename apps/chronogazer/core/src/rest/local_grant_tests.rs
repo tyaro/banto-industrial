@@ -1151,3 +1151,74 @@ async fn the_settings_actor_is_fixed_before_the_body_arrives() {
     assert_eq!(changes[0].actor_username.as_deref(), Some("localDesktop"));
     assert_eq!(changes[0].actor_role.as_deref(), Some("admin"));
 }
+
+/// #600 の Copilot レビュー: 予約名（ここでは `localDesktop`）のアカウントがある DB
+/// （予約名の検査より前に作られたもの。ここでは REST の前段を通さずに直接作る）では、
+/// 初期化後の `localDesktop` を発行しない（fail closed）。status は `false`、発行は
+/// 説明つきの `409` で、トークンも監査の `login` も無い（status と発行が食い違わない）。
+/// 別表記の kind でも同じ。予約名のアカウントを消せば、再起動なしで開く。
+///
+/// 反証: `local_desktop_grant_spec` の条件から `has_reserved_accounts` を外すと、status が
+/// `true` になってこのテストが落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reserved_name_account_closes_the_initialized_grant() {
+    let admin = LocalGrantSetting::Role(Role::Admin);
+    let f = fixture_with(
+        LocalGrantStart::Initialized(admin),
+        true,
+        &[Role::Admin],
+        Some(admin),
+    )
+    .await;
+    let colliding = f
+        .users
+        .create_user("localDesktop", PASSWORD, "x", Role::Viewer)
+        .await
+        .expect("create_user");
+
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        false
+    );
+    for path in [
+        "/api/auth/grant/localDesktop",
+        "/api/auth/grant/local%44esktop",
+    ] {
+        let (status, body) = send(
+            &f.router,
+            "POST",
+            path,
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+        assert!(body.get("token").is_none(), "{path}: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("別の名前")),
+            "{path}: {body}"
+        );
+    }
+    // LAN の peer には理由を言わない（条件の `403` のまま）。
+    let (status, token) = grant(&f.router, Some(LAN), Some(LOCAL_HOST)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(token.is_none());
+    assert_eq!(grant_logins(&f.audit).await, 0);
+
+    // 予約名のアカウントを消せば開く（条件はリクエストのたびに読む）。
+    f.users
+        .delete_user(colliding.id, None)
+        .await
+        .expect("delete_user");
+    assert_eq!(
+        status_grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await,
+        true
+    );
+    let (status, token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(token.is_some());
+}

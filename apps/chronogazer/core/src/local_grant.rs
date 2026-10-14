@@ -33,6 +33,10 @@
 //!    済みで起動したら設定 `auth.local_grant`（`off`/`viewer`/`editor`/`admin`、
 //!    **既定 off**、決定 8）の値。条件は「いま初期化済み かつ いまの設定が起動時の
 //!    値と同じ」をリクエストのたびに読む。
+//! 5. **予約名のアカウントが無い**（初期化後だけ。#600 の Copilot レビュー）: 合成の
+//!    identity と同じ名前（[`RESERVED_USERNAMES`]）のアカウントがあると、監査で発行した
+//!    セッションの操作と区別できないので、条件を偽にする（status も `false`）。発行の
+//!    要求には、別の名前のアカウントに移るよう伝える `409` を返す（[`has_reserved_accounts`]）。
 //!
 //! # ロールの変更は再起動で反映（決定 8）
 //!
@@ -170,8 +174,8 @@ pub fn check_username_not_reserved(username: &str) -> Result<(), BantoError> {
     Ok(())
 }
 
-/// 既にある予約名のアカウント（起動時の警告用。[`RESERVED_USERNAMES`] の前に作られた
-/// DB。自動では直さない）。
+/// 既にある予約名のアカウント（起動時の警告と [`has_reserved_accounts`] 用。
+/// [`RESERVED_USERNAMES`] の前に作られた DB。自動では直さない）。
 pub fn reserved_accounts<'a>(usernames: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     usernames
         .into_iter()
@@ -179,6 +183,19 @@ pub fn reserved_accounts<'a>(usernames: impl IntoIterator<Item = &'a str>) -> Ve
         .map(str::to_owned)
         .collect()
 }
+
+/// 予約名のアカウントが 1 つでもあるか（#600 の Copilot レビュー、fail closed）。あれば
+/// 初期化後の `localDesktop` の発行を断る（[`local_desktop_grant_spec`] の条件 - status と
+/// 発行で共有 - と、[`local_access_middleware`] の説明つきの `409`）: 発行したセッションの
+/// 操作は `actor_username: "localDesktop"` で監査に残るので、同じ名前のアカウントが
+/// あると、どちらの操作か区別できない。
+pub async fn has_reserved_accounts(users: &UsersService) -> Result<bool, BantoError> {
+    let accounts = users.list_users().await?;
+    Ok(!reserved_accounts(accounts.iter().map(|account| account.username.as_str())).is_empty())
+}
+
+/// 予約名のアカウントがあるときの、初期化後の発行を断る理由（[`has_reserved_accounts`]）。
+const RESERVED_ACCOUNT_REFUSAL: &str = "この PC からの接続（localDesktop）は、内部で使う名前（local・localDesktop・public）のアカウントがあるため発行できません（監査ログで区別できないため）。別の名前の管理者のアカウントを作ってそちらに移り、その名前のアカウントを削除してください";
 
 /// [`LOCAL_DESKTOP_GRANT_KIND`] を `GrantKind` として返す。
 pub fn local_desktop_grant_kind() -> GrantKind {
@@ -358,7 +375,9 @@ pub fn local_desktop_grant_spec(
         (true, LocalGrantStart::Initialized(started)) => Arc::new(move || {
             let (users, settings) = (users.clone(), settings.clone());
             Box::pin(async move {
-                Ok(users.is_initialized().await? && read_setting(&settings).await? == started)
+                Ok(users.is_initialized().await?
+                    && read_setting(&settings).await? == started
+                    && !has_reserved_accounts(&users).await?)
             })
         }),
         _ => Arc::new(|| Box::pin(async { Ok(false) })),
@@ -483,6 +502,28 @@ pub async fn local_access_middleware(
     // setup・users を別表記にした要求はどのルートにも当たらない。）
     let is_grant_issue = is_post && path.starts_with(GRANT_PREFIX);
 
+    // 予約名のアカウントがあれば、初期化後の `localDesktop` の発行を説明つきの `409` で
+    // 断る（#600 の Copilot レビュー、[`has_reserved_accounts`]）。断る本体は条件の側
+    // （status と発行で共有）にあり、ここは理由を伝えるだけ。この PC からの要求だけに
+    // 答える（LAN の peer には条件の `403` のまま、アカウントの名前の有無を漏らさない）。
+    // kind は banto と同じく percent decode して比べる（別表記でも同じ説明を返す）。
+    if is_grant_issue
+        && local
+        && state.access.may_issue()
+        && matches!(state.access.start, LocalGrantStart::Initialized(_))
+        && percent_decode(&path[GRANT_PREFIX.len()..]).as_deref() == Some(LOCAL_DESKTOP_GRANT_KIND)
+    {
+        if let Ok(true) = has_reserved_accounts(&state.users).await {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorBody::Other {
+                    message: RESERVED_ACCOUNT_REFUSAL.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
     if !(is_grant_issue || is_setup) {
         return next.run(req).await;
     }
@@ -509,6 +550,25 @@ pub async fn local_access_middleware(
         Ok(response) => response,
         Err(failed) => failed.into_response(),
     }
+}
+
+/// パスの 1 区間の percent decode（banto の発行口の `Path<String>` と同じ読み方の
+/// 範囲で十分: `%XX` を 1 バイトにし、UTF-8 として読めなければ `None`）。
+fn percent_decode(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = segment.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// `work` を応答の future から切り離して最後まで走らせ、その結果を待つ（#600 の監査
@@ -818,6 +878,25 @@ mod tests {
             failed.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn percent_decode_reads_the_kind_like_banto() {
+        assert_eq!(
+            percent_decode("local%44esktop").as_deref(),
+            Some("localDesktop")
+        );
+        assert_eq!(
+            percent_decode("%6c%6F%63alDesktop").as_deref(),
+            Some("localDesktop")
+        );
+        assert_eq!(
+            percent_decode("publicViewer").as_deref(),
+            Some("publicViewer")
+        );
+        assert_eq!(percent_decode("bad%4"), None);
+        assert_eq!(percent_decode("bad%zz"), None);
+        assert_eq!(percent_decode("%ff"), None);
     }
 
     #[test]
