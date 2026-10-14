@@ -31,6 +31,10 @@ pub mod hub_tags;
 // #392 A1: 同じ DB を 2 プロセスで開かないための単一インスタンス排他。
 // デスクトップと `banto-serve` が DB を開く前に呼ぶ。
 pub mod instance_lock;
+// #392 B2-4a: Hub の API キーの保存先（DPAPI のファイル、`<root>\secrets\hub-keys\`）と
+// 開けなかったときの代わり。B1-5 で `server_host` に置いたものを、デスクトップ host
+// （B2-4b）と共有するため移した（`server_host` は再公開）。
+pub mod key_store;
 // #392 B2-1: この PC からの接続を通す grant `localDesktop`（peer と Host の両方が
 // loopback、未初期化なら admin、初期化後は設定 `auth.local_grant`）。
 pub mod local_grant;
@@ -45,12 +49,18 @@ pub mod server_admin;
 // #392 B1-5: 画面の無い本番用の host `chronogazer-server` の、OS に依存しない部分
 // （待ち受けの形・ルートの検証・起動の失敗の案内・KeyStore・日付ごとのログ）。
 pub mod server_host;
+// #392 B2-4a: シェルがサービスの health を確かめる probe（`run\endpoint.json` →
+// `GET /api/host`、O8 の条件）。std の TCP だけで、Tauri に依存しない。
+pub mod service_probe;
 // #538: 保持期間（`retention.days`）を過ぎた時系列データファイルの削除
 // （起動時 + 日付が変わるたび）。`tauri`/`axum` に依存しない future を返す。
 pub mod retention;
 // #393 / #525: 楽観ロックの食い違いの表し方（タグ・表示グループ共通）。
 pub mod revision;
 pub mod settings;
+// #392 B2-4a: シェルの起動判定（サービスへつなぐ・プロセスの中で動かす・fallback）の
+// 純関数。Tauri にも SCM にも触れない（観測は呼び出し側）- モジュール doc 参照。
+pub mod shell_launch;
 // #392（2026-10-12 オーナー決定）: 起動に失敗したときの「エラーの窓と対処の
 // 選択」の判断（純関数）と対処（作り直す・バックアップから戻す・保存先を
 // 選び直す）。窓は各シェル（今はデスクトップの `src-tauri`）が出す。

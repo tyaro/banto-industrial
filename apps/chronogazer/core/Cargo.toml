@@ -50,6 +50,10 @@ banto-secret-store = { path = "../../../crates/banto-secret-store" }
 # #392 B1-5: `chronogazer-server` の終了（Ctrl-C と CTRL_CLOSE_EVENT）を 1 回に
 # する（デスクトップと同じ `ExitCleanupOnce`。std だけの crate）。
 banto-exit-once = { path = "../../../crates/banto-exit-once" }
+# #392 B2-4a: シェルの起動判定（`crate::shell_launch`）が SCM の状態の型
+# （`ScmState`）を使う。SCM を叩く実装（`WindowsServiceManager`）はシェルの
+# `src-tauri` が B2-4c で使う。banto-hub と共有の crate。
+banto-service-control = { path = "../../../crates/banto-service-control" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

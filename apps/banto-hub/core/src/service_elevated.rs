@@ -148,8 +148,9 @@
 //!
 //! Win32 API 呼び出しの失敗は[`ElevatedError`]（thiserror、日本語メッセージ）
 //! にマッピングする。[`crate::service_operators::OperatorsError`]・
-//! [`crate::service_manager::ServiceManagerError`]は`#[from]`で透過的に
-//! 包む。
+//! [`crate::service_manager::ServiceManagerError`]は`#[from]`で包む
+//! （前者は透過、後者の文言は`describe_service_error`で banto-hub の文言に
+//! する。B2-4a）。
 //!
 //! ## 非 Windows ビルド
 //!
@@ -384,9 +385,12 @@ pub enum ElevatedError {
     /// （`lookup_account_sid`の再利用元、モジュール doc参照）。
     #[error(transparent)]
     Operators(#[from] crate::service_operators::OperatorsError),
-    /// [`crate::service_manager`]側のエラーをそのまま透過する
-    /// （`autostart-enable`/`autostart-disable`が使う）。
-    #[error(transparent)]
+    /// [`crate::service_manager`]側のエラーを包む
+    /// （`autostart-enable`/`autostart-disable`が使う）。文言は
+    /// [`crate::service_manager::describe_service_error`]で banto-hub の
+    /// 従来の文言にする（#392 B2-4a で共有 crate の`Display`が中立になった
+    /// ため、以前の`#[error(transparent)]`のままでは文言が変わる）。
+    #[error("{}", crate::service_manager::describe_service_error(.0))]
     ServiceManager(#[from] crate::service_manager::ServiceManagerError),
     /// `grant-profile-acl`の`[profile-id]`引数が不正
     /// （[`crate::profile_paths::validate_profile_id`]が拒否する文字列）。
@@ -1343,6 +1347,17 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `banto-hub-elev`の出力（`banto-hub-elev: {err}`）は B2-3 までと同じ
+    /// 文言（B2-4a で共有 crate の`Display`が中立になった後も）。
+    #[test]
+    fn service_manager_error_keeps_the_hub_wording() {
+        let err = ElevatedError::from(crate::service_manager::ServiceManagerError::AccessDenied);
+        assert_eq!(
+            err.to_string(),
+            "banto-hub: サービス操作の権限がありません（管理者権限が必要です）"
+        );
+    }
 
     #[test]
     fn parse_accepts_all_documented_actions() {

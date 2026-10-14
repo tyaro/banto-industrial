@@ -176,6 +176,10 @@ pub enum SecretStoreError {
     AclApi { call: &'static str, os_error: u32 },
     #[error("この OS ではフォルダの権限を設定できないため、秘密の保存先を使えません")]
     UnsupportedPlatform,
+    /// `.`・`..`（点だけの名前）を含むパス。作るときに OS が正規化して、確かめた
+    /// 場所と別の場所を作りうるため断る（#392 B2-4a、PR #604 のレビュー）。
+    #[error("フォルダのパスに「.」や「..」が含まれているため使えません")]
+    DotSegmentInPath,
 }
 
 impl SecretStoreError {

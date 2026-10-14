@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::hub_health::{HealthOutcome, HubHealthProbe};
-use crate::service_manager::{ScmState, ServiceManager};
+use crate::service_manager::{describe_service_error, ScmState, ServiceManager};
 
 /// 定常状態として観測される実行ホスト（desktop-plan §16.3
 /// 「実行ホストは offline/desktop/service の3値」）。
@@ -545,7 +545,7 @@ where
                         Ok(StepOutcome::Progressed)
                     }
                     Err(err) => {
-                        let reason = err.to_string();
+                        let reason = describe_service_error(&err);
                         Ok(self.fault(FaultStage::ServiceStopping, HostKind::Service, reason))
                     }
                 }
@@ -592,7 +592,7 @@ where
                 StepOutcome::Progressed
             }
             Err(err) => {
-                let reason = err.to_string();
+                let reason = describe_service_error(&err);
                 self.fault(FaultStage::ServiceStarting, HostKind::Offline, reason)
             }
         }
@@ -629,7 +629,7 @@ where
                 self.fault_for_current_phase(reason)
             }
             Err(err) => {
-                let reason = err.to_string();
+                let reason = describe_service_error(&err);
                 self.fault_for_current_phase(reason)
             }
         }
@@ -665,7 +665,7 @@ where
         let status = match self.service_manager.query_status() {
             Ok(status) => status,
             Err(err) => {
-                let reason = err.to_string();
+                let reason = describe_service_error(&err);
                 return self.fault_for_current_phase(reason);
             }
         };
@@ -874,6 +874,13 @@ mod tests {
             } => {
                 assert_eq!(*reached, HostKind::Offline);
                 assert_eq!(*stage, FaultStage::ServiceStarting);
+                // 利用者に見える理由は B2-3 までと同じ banto-hub の文言
+                // （B2-4a: 共有 crate の`Display`は中立になったが、ここは
+                // `describe_service_error`を通す）。
+                assert_eq!(
+                    reason,
+                    "banto-hub: サービス操作の権限がありません（管理者権限が必要です）"
+                );
                 reason.clone()
             }
             other => panic!("expected Faulted, got {other:?}"),
