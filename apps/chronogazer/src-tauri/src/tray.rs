@@ -72,6 +72,28 @@
 //! 「再試行」で Desktop が起動し終えて収集中になっていれば、収集中の文言で確かめ直す）。
 //! どの態でも終了処理は [`crate::exit_cleanup`] を通る（シェルの移り変わりの終わりを
 //! 待ち、エンジンがあれば止める）。
+//!
+//! # メインスレッドとロック（PR #608 の Copilot レビュー）
+//!
+//! トレイのメニューの作成・差し替え・tooltip は、Windows ではメインスレッド（イベント
+//! ループ）で行われ、他のスレッドから呼ぶとメインスレッドの処理を**待つ**。一方、
+//! メニューの選択・窓の `on_navigation`・確認ダイアログの答えはメインスレッドから
+//! 来る。そこで次を約束にする:
+//!
+//! - **ロックを握ったままトレイの API を呼ばない**（メインスレッドを待たない）。以前は
+//!   見張りと `quit` の書き換えを 1 つのロックで直列にしていたが、見張りがロックを
+//!   握ったままメインスレッドを待ち、メインスレッドの `quit` が同じロックを待つと
+//!   止まる。書き換えは [`post_spec`] で**メインスレッドへ渡すだけ**（待たない）にし、
+//!   ロックをやめた。書き換えはすべてメインスレッドの上で順に走るので、「終了処理中」の
+//!   後に古い表示が来ても、その時点で終了の段階を見て何もしない（[`should_apply`]）。
+//! - **メインスレッドから来た終了は、重い処理を別のスレッドへ渡す**: 確認を省く態
+//!   （Fallback）の終了は確定の手順ごと別のスレッドで行い、後始末（移り変わり・エンジンの
+//!   停止を待つ）は今までどおり専用のスレッドで行う。メインスレッドの上で取るロックは
+//!   `QuitGate`・`ShellGate`・収集の受付の短いものだけで、どれも中でメインスレッドを
+//!   待たない（`ShellGate` の `admit` の中の `manage` もメインスレッドを使わない）。
+//!
+//! この並行はモックのランタイムでは再現できないので単体テストは無い（構造で防ぐ:
+//! トレイの書き換えに使うロック自体が無い）。書き換えの判断だけを純関数でテストする。
 
 use std::time::Duration;
 
@@ -346,12 +368,28 @@ pub(crate) fn installed(app: &AppHandle) -> bool {
 /// 今の態でメニューと tooltip を差し替える（シェルの画面が変わったとき）。終了処理に
 /// 入っていたら「終了処理中」を上書きしない。
 pub(crate) fn refresh(app: &AppHandle) {
-    let spec = current_spec(app);
-    let _guard = TRAY_LABEL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    if quitting(app) {
-        return;
+    post_spec(app, current_spec(app), false);
+}
+
+/// トレイの書き換えをメインスレッドへ渡す（**待たない**。モジュール doc「メイン
+/// スレッドとロック」）。`even_when_quitting` が偽なら、メインスレッドで実際に書き換える
+/// 時点で終了処理に入っていれば何もしない（「終了処理中」を古い状態で上書きしない）。
+fn post_spec(app: &AppHandle, spec: Vec<MenuEntry>, even_when_quitting: bool) {
+    let handle = app.clone();
+    let posted = app.run_on_main_thread(move || {
+        if should_apply(even_when_quitting, quitting(&handle)) {
+            apply_spec(&handle, &spec);
+        }
+    });
+    if let Err(err) = posted {
+        eprintln!("banto: トレイの表示を更新できませんでした: {err}");
     }
-    apply_spec(app, &spec);
+}
+
+/// メインスレッドで書き換える時点の判断（純関数）: 「終了処理中」の書き換えは常に、
+/// それ以外は終了処理に入っていなければ。
+pub(crate) fn should_apply(even_when_quitting: bool, quitting_now: bool) -> bool {
+    even_when_quitting || !quitting_now
 }
 
 /// 窓を戻す（トレイの「開く」・左クリック・2 つ目の起動）。終了処理に
@@ -431,11 +469,6 @@ fn apply_spec(app: &AppHandle, spec: &[MenuEntry]) {
     }
 }
 
-/// 状態の行だけのメニュー（「終了処理中…」）。
-fn apply_label(app: &AppHandle, label: &str) {
-    apply_spec(app, &[MenuEntry::Status(label.to_string())]);
-}
-
 /// 収集の状態をトレイへ映す見張り。`install` から 1 回だけ起こす（二重起動
 /// しない）。文言が変わったときだけトレイを書き換える。終了処理に入ったら
 /// 抜ける（「終了処理中」の表示を上書きしないため）。プロセスが終われば
@@ -444,23 +477,18 @@ async fn watch_status(app: AppHandle, mut shown: Vec<MenuEntry>) {
     loop {
         tokio::time::sleep(STATUS_POLL_INTERVAL).await;
         let spec = current_spec(&app);
-        // 「終了中か」の確認と書き換えを、`quit` の「終了処理中」の書き換えと
-        // 同じロックの中で行う - 確認の直後に終了へ入られても、古い状態で
-        // 「終了処理中」を上書きしない。
-        let _guard = TRAY_LABEL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         if quitting(&app) {
             break;
         }
+        // 書き換えはメインスレッドへ渡すだけ（待たない）。確認の直後に終了へ入られても、
+        // メインスレッドで書き換える時点でもう一度確かめるので、古い状態で
+        // 「終了処理中」を上書きしない（[`post_spec`]）。
         if spec != shown {
-            apply_spec(&app, &spec);
+            post_spec(&app, spec.clone(), false);
             shown = spec;
         }
     }
 }
-
-/// トレイの文言の書き換えを、見張りと `quit` の間で直列にするロック
-/// （[`watch_status`] の注記）。
-static TRAY_LABEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// トレイの「終了」（#392 B2-4c からは接続できない状態の窓の「終了」も）。
 pub(crate) fn request_quit(app: &AppHandle) {
@@ -480,8 +508,11 @@ pub(crate) fn request_quit(app: &AppHandle) {
             if needs_quit_confirm(&crate::shell::current_tray_mode(app)) {
                 prompt_quit(app, currently_collecting(app));
             } else {
-                // 確認しない態（Fallback）: 同意したものとして同じ受付を通す。
-                on_quit_answer(app.clone(), true, false);
+                // 確認しない態（Fallback）: 同意したものとして同じ受付を通す。メニュー・
+                // 窓のボタン（`on_navigation`）はメインスレッドから来るので、終了の処理は
+                // 別のスレッドへ渡してメインスレッドを塞がない（PR #608 の Copilot レビュー）。
+                let app = app.clone();
+                std::thread::spawn(move || on_quit_answer(app, true, false));
             }
         }
         // 確認ダイアログは出ている／終了処理は走っている - どちらも 2 つ目は
@@ -597,10 +628,13 @@ fn quit(app: AppHandle) {
             let _ = window.hide();
         }
     }
-    {
-        let _guard = TRAY_LABEL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        apply_label(&app, "終了処理中…");
-    }
+    // 終了の段階（`QuitPhase::Quitting`）は確認の答えで既に立っているので、この後に
+    // メインスレッドで書き換わる他の表示は何もしない（[`should_apply`]）。
+    post_spec(
+        &app,
+        vec![MenuEntry::Status("終了処理中…".to_string())],
+        true,
+    );
     // 後始末（[`crate::exit_cleanup`]）は、シェルの移り変わり（「再試行」の Desktop の
     // 起動）の終わりと後始末の完了を条件変数で**ブロックして**待つ
     // （本体は共有の `ExitCleanupOnce` の専用スレッドで走る）ので、tokio の
@@ -811,6 +845,15 @@ mod tests {
                 .begin_recovery()
                 .expect("not reserved after ask-again"),
         );
+    }
+
+    /// 終了処理に入った後は「終了処理中」以外の書き換えをしない。
+    #[test]
+    fn only_the_quitting_label_is_applied_after_quit() {
+        assert!(should_apply(false, false));
+        assert!(!should_apply(false, true));
+        assert!(should_apply(true, true));
+        assert!(should_apply(true, false));
     }
 
     /// 終了の確認: Desktop は A2 のまま、Service はサービスが止まらないこと、Fallback は
