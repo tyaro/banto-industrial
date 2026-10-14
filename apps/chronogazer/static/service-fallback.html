@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ja">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>ChronoGazer</title>
+		<!--
+			記録エンジン（サービス）に接続できないときの窓（#392 B2-4c、
+			src-tauri/src/shell.rs）。startup-recovery.html と同じく SvelteKit の
+			ルートを経由しない静的ページで、Tauri のコマンドは一切呼ばない
+			（AppState は manage されていない）。表示する内容は Rust 側が
+			initialization_script で window.__CHRONOGAZER_SHELL_FALLBACK__ に入れ、
+			描き直すときは window.__chronogazerShellFallback.render(...) を呼ぶ。
+			ボタンは /__shell/<retry|open-logs|quit> へ移ろうとすることで Rust に
+			知らせる（Rust が on_navigation で受け取って移動を取り消す）。
+			文言はすべて textContent で入れる（パスなどが HTML として解釈されない）。
+		-->
+		<style>
+			:root {
+				color-scheme: light dark;
+				--bg: #ffffff;
+				--fg: #1f2328;
+				--muted: #59636e;
+				--accent: #9a6700;
+				--code-bg: #f3f4f6;
+				--border: #d0d7de;
+				--button-bg: #f6f8fa;
+				--primary-bg: #0969da;
+				--primary-fg: #ffffff;
+				--notice-bg: #fff8c5;
+			}
+			@media (prefers-color-scheme: dark) {
+				:root {
+					--bg: #1b1d21;
+					--fg: #e6e8eb;
+					--muted: #a3aab3;
+					--accent: #d29922;
+					--code-bg: #2a2d33;
+					--border: #3d434b;
+					--button-bg: #2a2d33;
+					--primary-bg: #2f81f7;
+					--primary-fg: #ffffff;
+					--notice-bg: #3b2e0a;
+				}
+			}
+			body {
+				margin: 0;
+				padding: 20px 24px;
+				background: var(--bg);
+				color: var(--fg);
+				font-family: 'Segoe UI', 'Yu Gothic UI', 'Meiryo', sans-serif;
+				font-size: 14px;
+				line-height: 1.6;
+			}
+			h1 {
+				margin: 0 0 12px;
+				font-size: 18px;
+				color: var(--accent);
+			}
+			h2 {
+				margin: 16px 0 8px;
+				font-size: 15px;
+			}
+			p {
+				margin: 0 0 10px;
+			}
+			dl {
+				display: grid;
+				grid-template-columns: max-content 1fr;
+				gap: 4px 12px;
+				margin: 0 0 12px;
+			}
+			dt {
+				color: var(--muted);
+			}
+			dd {
+				margin: 0;
+			}
+			ul {
+				margin: 0 0 12px;
+				padding-left: 20px;
+			}
+			code {
+				display: block;
+				padding: 8px 10px;
+				margin: 0 0 12px;
+				background: var(--code-bg);
+				border-radius: 4px;
+				word-break: break-all;
+				user-select: all;
+				font-family: Consolas, 'Cascadia Mono', monospace;
+				font-size: 13px;
+			}
+			.muted {
+				color: var(--muted);
+			}
+			.notice {
+				padding: 8px 10px;
+				margin: 0 0 12px;
+				border-left: 4px solid var(--accent);
+				background: var(--notice-bg);
+			}
+			.actions {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 8px;
+				margin: 12px 0;
+			}
+			button {
+				padding: 6px 14px;
+				border: 1px solid var(--border);
+				border-radius: 6px;
+				background: var(--button-bg);
+				color: var(--fg);
+				font: inherit;
+				cursor: pointer;
+			}
+			button.primary {
+				background: var(--primary-bg);
+				border-color: var(--primary-bg);
+				color: var(--primary-fg);
+			}
+			button:disabled {
+				opacity: 0.5;
+				cursor: default;
+			}
+			[hidden] {
+				display: none !important;
+			}
+		</style>
+	</head>
+	<body>
+		<h1 id="title">記録エンジン（サービス）に接続できません</h1>
+		<p id="message"></p>
+		<div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+		<p class="muted" id="busy" role="status" aria-live="polite" hidden>確かめています…</p>
+
+		<dl>
+			<dt>サービスの状態</dt>
+			<dd id="scm"></dd>
+			<dt>接続の確認</dt>
+			<dd id="health"></dd>
+		</dl>
+
+		<div class="actions">
+			<button type="button" class="primary" id="retry">再試行</button>
+			<button type="button" id="open-logs">ログのフォルダを開く</button>
+			<button type="button" id="quit">終了</button>
+		</div>
+
+		<h2>どうすればよいか</h2>
+		<ul id="steps"></ul>
+		<p class="muted">サービスのログのフォルダ:</p>
+		<code id="logs-path"></code>
+		<p class="muted">
+			この窓を閉じても ChronoGazer はタスクトレイで動作を続けます（トレイの「開く」で戻せます）。
+		</p>
+		<script>
+			(function () {
+				var busy = false;
+
+				function el(id) {
+					return document.getElementById(id);
+				}
+
+				function setBusy(value) {
+					busy = value;
+					el('busy').hidden = !value;
+					var buttons = document.querySelectorAll('button');
+					for (var i = 0; i < buttons.length; i++) {
+						buttons[i].disabled = value;
+					}
+				}
+
+				// 押したボタンを Rust に知らせる（on_navigation が受け取って取り消す）。
+				function send(action, markBusy) {
+					if (busy) {
+						return;
+					}
+					if (markBusy) {
+						setBusy(true);
+					}
+					window.location.href = '/__shell/' + action;
+				}
+
+				function render(view) {
+					document.title = 'ChronoGazer — ' + view.title;
+					el('title').textContent = view.title;
+					el('message').textContent = view.message;
+					el('scm').textContent = view.scm;
+					el('health').textContent = view.health;
+					el('logs-path').textContent = view.logsPath || '';
+					var notice = el('notice');
+					notice.textContent = view.notice || '';
+					notice.hidden = !view.notice;
+					var steps = el('steps');
+					steps.textContent = '';
+					(view.steps || []).forEach(function (step) {
+						var item = document.createElement('li');
+						item.textContent = step;
+						steps.appendChild(item);
+					});
+					setBusy(!!view.busy);
+				}
+
+				el('retry').onclick = function () {
+					send('retry', true);
+				};
+				el('open-logs').onclick = function () {
+					send('open-logs', false);
+				};
+				el('quit').onclick = function () {
+					send('quit', false);
+				};
+				window.__chronogazerShellFallback = { render: render };
+
+				var initial = window.__CHRONOGAZER_SHELL_FALLBACK__;
+				if (initial) {
+					render(initial);
+				} else {
+					el('message').textContent =
+						'記録エンジン（サービス）に接続できません。詳しくは標準エラー出力を確認してください。';
+				}
+			})();
+		</script>
+	</body>
+</html>

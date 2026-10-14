@@ -266,8 +266,12 @@ pub(crate) fn show_once(app: &AppHandle, layout: &DataLayout) {
         .title(text.title)
         .kind(MessageDialogKind::Info)
         .buttons(MessageDialogButtons::Ok);
-    // メインの窓の前に出す（親が無いと、できたばかりのメインの窓の後ろに隠れうる）。
-    if let Some(window) = app.get_webview_window(crate::MAIN_WINDOW_LABEL) {
+    // メインの窓（B2-4c からはサービスの画面の窓も）の前に出す（親が無いと、
+    // できたばかりの窓の後ろに隠れうる）。
+    if let Some(window) = [crate::MAIN_WINDOW_LABEL, crate::shell::SERVICE_WINDOW_LABEL]
+        .into_iter()
+        .find_map(|label| app.get_webview_window(label))
+    {
         dialog = dialog.parent(&window);
     }
     dialog.show(move |_| {
