@@ -2,6 +2,7 @@
 //! #123) single-tag write.
 
 use std::fmt;
+use std::time::Duration;
 
 use reqwest::{Client, ClientBuilder, StatusCode};
 
@@ -13,6 +14,13 @@ use crate::secret::SecretApiKey;
 use crate::types::{CatalogSnapshot, ValuesSnapshot};
 use crate::write::{send_write, validate_write_name, RequestedValue};
 use crate::ws_transport::WebSocketConnection;
+
+/// One REST call (`fetch_catalog`, `fetch_values`, `write_tag`, including
+/// the response body). A peer that accepts and never answers must not pin
+/// the caller forever. Callers with a tighter deadline (OS preshutdown)
+/// still race the request against their own stop signal; this is the
+/// backstop, matching the sink's Hub API client.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A banto-hub REST client that connects directly to its endpoint, without
 /// redirects or system/environment proxy configuration. Reads
@@ -26,11 +34,13 @@ pub struct RestClient {
 }
 
 impl RestClient {
-    /// Construct a client with redirects disabled.
+    /// Construct a client with redirects disabled and a [`REQUEST_TIMEOUT`]
+    /// bound on each call.
     pub fn new(endpoint: Endpoint, secret: SecretApiKey) -> Result<Self> {
         let http = ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|_| {
                 tracing::warn!("failed to build the banto-hub REST client");

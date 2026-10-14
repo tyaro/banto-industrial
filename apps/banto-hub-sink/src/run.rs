@@ -8,7 +8,10 @@
 //!
 //! 3 つの締め切り（設定取得・状態 push・購読の生存確認）のうち最も早い
 //! ものまで眠り、来たものだけを処理する。停止シグナル（コンソールの
-//! Ctrl-C / SCM の STOP / OS の PRESHUTDOWN）はどの待ちからでも即座に抜ける。
+//! Ctrl-C / SCM の STOP / OS の PRESHUTDOWN）は、眠りの間だけでなく
+//! その処理の `await`（設定取得・状態 push・購読の確認と、その中の
+//! catalog 取得）の途中でも抜ける。応答しない相手に捕まって
+//! PRESHUTDOWN の作業予算を使い切らないため。
 //!
 //! - **設定取得**（既定 30 秒）: `GET /api/sink/config` を取り、前回適用した
 //!   集合との差分だけを start/stop する（`banto_hub_core::db_source::
@@ -70,8 +73,9 @@ const HEALTH_TICK: Duration = Duration::from_secs(1);
 /// 同じ 30 秒相当）。
 const DEFAULT_REPLAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// 停止時に flusher の join を待つ上限（これを超えたら abort - commit 前
-/// なので二重書き込みにはならない）。
+/// 停止時に flusher の join とプールの close を合わせた上限（これを超えたら
+/// abort し、閉じていないプールは待たずに捨てる。commit 前なので二重
+/// 書き込みにはならない。応答しない DB の `pool.close()` もこの中）。
 const FLUSHER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 停止時の drain 監視のポーリング間隔。
@@ -832,6 +836,7 @@ where
     loop {
         let wake_at = next_config_at.min(next_status_at).min(next_health_at);
         tokio::select! {
+            biased;
             request = &mut shutdown => {
                 stop_request = request;
                 break;
@@ -839,18 +844,45 @@ where
             _ = tokio::time::sleep_until(wake_at) => {}
         }
         let now = Instant::now();
+        // 各作業は停止合図と一緒に待つ。future を捨てたときの資源は
+        // `Engine::shutdown` か、その future の drop（flusher は abort、
+        // 購読は `Subscription` の drop）が引き取る。
         if now >= next_config_at {
-            let ok = engine.refresh_config().await;
-            next_config_at =
-                Instant::now() + next_config_delay(ok, config_refresh, engine.config_attempt);
+            tokio::select! {
+                biased;
+                request = &mut shutdown => {
+                    stop_request = request;
+                    break;
+                }
+                ok = engine.refresh_config() => {
+                    next_config_at = Instant::now()
+                        + next_config_delay(ok, config_refresh, engine.config_attempt);
+                }
+            }
         }
         if now >= next_status_at {
-            engine.push_status().await;
-            next_status_at = Instant::now() + status_push;
+            tokio::select! {
+                biased;
+                request = &mut shutdown => {
+                    stop_request = request;
+                    break;
+                }
+                _ = engine.push_status() => {
+                    next_status_at = Instant::now() + status_push;
+                }
+            }
         }
         if now >= next_health_at {
-            engine.ensure_subscription().await;
-            next_health_at = Instant::now() + health_tick;
+            tokio::select! {
+                biased;
+                request = &mut shutdown => {
+                    stop_request = request;
+                    break;
+                }
+                _ = engine.ensure_subscription() => {
+                    next_health_at = Instant::now() + health_tick;
+                }
+            }
         }
     }
 
@@ -1177,5 +1209,218 @@ mod tests {
         assert!(cut.contains("打ち切りました"));
         assert!(cut.contains("送信できなかった行: 12"));
         assert!(cut.contains("warn"));
+    }
+
+    /// サービスログを差し替えるテストを直列化する。
+    /// `std::sync::Mutex` は await をまたげない（clippy）。
+    async fn service_log_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    fn enable_test_service_log(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("banto-hub-sink-{name}-{}.log", std::process::id()));
+        crate::log::enable_service_log_file(&path).expect("service log");
+        path
+    }
+
+    /// 起動後の catalog 再取得を握ったまま OsShutdown が来ても、
+    /// 運転ループがそこから抜けて `Engine::shutdown` まで進む。
+    #[tokio::test]
+    async fn held_catalog_still_reaches_shutdown_within_the_deadline() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("held-catalog");
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let hub_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let tags_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let held_tx = Arc::new(std::sync::Mutex::new(Some(held_tx)));
+        let tags_seen_for_server = tags_seen.clone();
+        tokio::spawn(async move {
+            let config = r#"{"generatedAt":1,"groups":[{"id":1,"name":"g","dbConnectionId":10,"mode":"interval","intervalMs":60000,"tableName":"public.tag_history","storeBad":false,"tags":[{"connectionId":1,"groupId":2,"tagId":5,"externalName":"line1.fast.temp01"}]}],"connections":[{"id":10,"name":"db","host":"127.0.0.1","port":1,"database":"erp","username":"app","password":"pw"}]}"#;
+            let catalog = r#"{"revision":1,"run_id":1,"collection_mode":"configured","tags":[]}"#;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let tags_seen = tags_seen_for_server.clone();
+                let held_tx = held_tx.clone();
+                let config = config.to_owned();
+                let catalog = catalog.to_owned();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = stream;
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => {
+                                request.extend_from_slice(&buf[..count]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    if line.starts_with("GET /api/v1/tags ") {
+                        let n = tags_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if n == 0 {
+                            let body = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{catalog}",
+                                catalog.len()
+                            );
+                            let _ = stream.write_all(body.as_bytes()).await;
+                        } else {
+                            if let Some(tx) = held_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            std::future::pending::<()>().await;
+                        }
+                    } else if line.starts_with("GET /api/sink/config ") {
+                        let body = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{config}",
+                            config.len()
+                        );
+                        let _ = stream.write_all(body.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let config = SidecarConfig {
+            hub_url,
+            api_key: "bh_test.secret".to_owned(),
+            config_refresh: Duration::from_secs(60),
+            status_push: Duration::from_secs(60),
+            queue_max_rows: 100,
+            flush_interval: Duration::from_secs(60),
+            batch_size: 100,
+            shutdown_flush: Duration::from_millis(50),
+        };
+        let options = SidecarOptions {
+            table_recheck: Duration::from_secs(30),
+            health_tick: Duration::from_millis(40),
+            replan_interval: Duration::from_millis(10),
+        };
+        let shutdown = async move {
+            held_rx.await.expect("second catalog request");
+            StopRequest::OsShutdown {
+                deadline: StdInstant::now() + Duration::from_millis(800),
+            }
+        };
+        let started = StdInstant::now();
+        tokio::time::timeout(Duration::from_secs(3), run(config, options, shutdown))
+            .await
+            .expect("握った catalog のまま shutdown に入れなかった")
+            .expect("run");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown まで {:?}",
+            started.elapsed()
+        );
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            text.contains("停止しました")
+                && (text.contains("OS シャットダウンの停止が完了しました")
+                    || text.contains("OS シャットダウンの予算で停止を打ち切りました")),
+            "{text}"
+        );
+    }
+
+    /// 応答しない DB でも `Engine::shutdown` が未送信行のログと
+    /// 「停止しました」まで進む（サービスの Stopped 報告の手前）。
+    #[tokio::test]
+    async fn unresponsive_db_still_reaches_stopped_within_the_deadline() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("blackhole-db");
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let hub_url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => {
+                                request.extend_from_slice(&buf[..count]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let config = SidecarConfig {
+            hub_url,
+            api_key: "bh_test.secret".to_owned(),
+            config_refresh: Duration::from_secs(60),
+            status_push: Duration::from_secs(60),
+            queue_max_rows: 100,
+            flush_interval: Duration::from_secs(60),
+            batch_size: 100,
+            shutdown_flush: Duration::ZERO,
+        };
+        let mut engine = Engine::new(config, SidecarOptions::default()).expect("engine");
+        let group = group(1, 10, "public.tag_history");
+        let runtime = crate::group::GroupRuntime::new(&group, 100, 0).expect("group");
+        runtime.push_rows(vec![crate::queue::Row {
+            ts_ms: 1,
+            tag_id: 5,
+            external_name: "line1.fast.temp01".to_owned(),
+            value: Some(1.0),
+            quality: "good".to_owned(),
+        }]);
+        engine.groups.insert(Arc::new(runtime));
+        let (handle, _server) = crate::flush::flusher_on_blackhole_pool(10).await;
+        engine.flushers.insert(10, handle);
+
+        let started = StdInstant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            engine.shutdown(StopRequest::OsShutdown {
+                deadline: StdInstant::now() + Duration::from_millis(700),
+            }),
+        )
+        .await
+        .expect("応答しない DB のまま Stopped の手前まで進めなかった");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            text.contains("停止時に 1 行を送信できませんでした") && text.contains("停止しました"),
+            "{text}"
+        );
     }
 }
