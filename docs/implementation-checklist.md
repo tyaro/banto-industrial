@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-14（§5 に「handler の中で `await` をまたぐ副作用は接続の切断で捨てられる」を追加。#600 の全体監査 F1・F2・F4）
+最終更新: 2026-10-15（§2 に「実機で Tauri のシェルを動かすときは試験専用の identifier でビルドする」を追加。#392 B2-4b の実機確認で、`APPDATA`・`LOCALAPPDATA` を差し替えても Tauri のデータの場所は隔離されず、オーナーの実データの場所に印を作った）
+2026-10-14（§5 に「handler の中で `await` をまたぐ副作用は接続の切断で捨てられる」を追加。#600 の全体監査 F1・F2・F4）
 2026-10-13（§5 に「DB を触る背景タスクを `abort()` で止めない」を追加。ChronoGazer の保持期間の掃除。同日 #597 のレビューで「待ちを時間切れで落とすときは handle を手放さない」を追記）
 2026-10-12（§5 に「反証で戻したファイルを `cp` で書き戻すと cargo が作り直さないことがある」を追加。#586）
 2026-10-10（§5 に「時間切れになったテストの非同期処理は次のテストへ漏れる」を追加。#559、ChronoGazer の `setup.test.ts`）
@@ -64,6 +65,7 @@
    - [ ] **banto の版を上げるときに `cargo update -p banto-core -p banto-storage -p banto-server -p banto-admin-services` を使わない**。タグを付け替えるだけのつもりでも、cargo は同時に無関係な crate を**再解決して降格する**（2026-10-04 の v3.0.0 追従で `windows-sys 0.61.2 → 0.60.2`・`socket2 0.6.4 → 0.5.10` が 10 か所以上付け替わった。#450/#465/#484 と同じ型）。`Cargo.lock` の banto 4 crate の `version`/`source`（コミット SHA はタグの `git rev-parse <tag>^{commit}`）を**手で書き換え**、`cargo metadata --locked` が通ることで確かめる。
    - [ ] **`@banto/*` の git 依存を上げるとき `pnpm-lock.yaml` を手で書き換えない**（Cargo.lock と逆）。SHA・specifier だけ直すと `packages:` の `version:` が旧版のまま残り、pnpm は「lock は最新」と判断して再解決しない。ストアを再利用する `pnpm install --frozen-lockfile`（CI のキャッシュ復元・別 checkout）が `ERR_PNPM_UNEXPECTED_PKG_CONTENT_IN_STORE`（lock の 5.0.0 と実 manifest の 5.1.0 の食い違い）で落ちる。#515 のオーナーレビュー P2、2026-10-07。対処: `packages:`/`snapshots:` の `@banto/*` 項目を消してから `pnpm install --no-frozen-lockfile` で再生成し、各 `version:` が取得元の実 `package.json` と一致することを確認する。
 10. [ ] **push したら、その head に対して CI の run が実際に起動したか確認する**（`gh run list --branch <branch> --limit 5`）。**PR がコンフリクトしていると GitHub はマージ ref を作れず、`on: pull_request` の CI / Supply Chain は起動しない**（Copilot のレビューは別イベントなので走り続け、気付きにくい）。起動していなければ `gh pr view <n> --json mergeable` を疑い、main を取り込んで解決する。**ローカルで緑でも、CI が走っていなければ緑ではない。**
+11. [ ] **実機で Tauri のシェル（`src-tauri`）を動かす確認は、試験専用の identifier でビルドし、`CHRONOGAZER_ROOT` を作業用のフォルダに向ける**。`APPDATA`・`LOCALAPPDATA` の環境変数を差し替えても、Tauri の `app_local_data_dir()`・`app_data_dir()`・WebView2 のデータは Windows の既知のフォルダの API で解決されるので**隔離されない**（2026-10-15、#392 B2-4b の実機確認: 試験が旧データの案内の既読の印をオーナーの実際の `%LOCALAPPDATA%\dev.tyaro.chronogazer` に作った。オーナー許可で削除済み）。identifier はビルド時に `TAURI_CONFIG='{"identifier":"dev.tyaro.chronogazer.<試験名>"}'` で上書きする（#585 の A2 の実機確認と同じ）。終わったら試験用の identifier のフォルダ（`%APPDATA%`・`%LOCALAPPDATA%` の下）と作業用のルートを消す。
 
 ## 3. E2E の罠（全部踏んだ）
 
