@@ -116,7 +116,7 @@ use crate::engine::{
 };
 use crate::instance_lock::ChronoGazerHost;
 use crate::paths::DataLayout;
-use crate::settings::{lan_autostart_allowed, AuthSettings, ServerSettings};
+use crate::settings::{lan_autostart_allowed, AuthSettings, ServerSettings, SettingsService};
 use crate::startup_recovery::{
     classify, classify_settings_error, plan, FailureKind, RecoveryChoice, WindowPlan,
 };
@@ -586,6 +586,12 @@ impl OpenedServer {
     /// 開いたまま閉じる（排他と pool を返す）。
     pub async fn close(self) {
         self.opened.close().await;
+    }
+
+    /// 設定 DB（bin のデバッグビルドだけのテスト用のポート `CHRONOGAZER_TEST_PORT` が
+    /// 待ち受けを決める前に書く。#392 B2-2）。
+    pub fn settings(&self) -> SettingsService {
+        self.opened.settings()
     }
 
     /// 起動の後半: 設定から待ち受けの形 → エンジン（`key_store` を使う）→

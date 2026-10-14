@@ -134,6 +134,14 @@ const TABLE = [
 		{ ...NONE, run_e2e_chronogazer: true }
 	],
 	[
+		'chronogazer のサービス接続 E2E（spec と config、#392 B2-2）',
+		[
+			'e2e/tests-chronogazer-server/local-grant.spec.ts',
+			'e2e/chronogazer-server.playwright.config.ts'
+		],
+		{ ...NONE, run_e2e_chronogazer: true }
+	],
+	[
 		'E2E 共通（tsconfig）は両方',
 		['e2e/tsconfig.json'],
 		{ ...NONE, run_e2e_hub: true, run_e2e_chronogazer: true }

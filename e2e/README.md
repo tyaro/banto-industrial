@@ -1,13 +1,14 @@
 # e2e/ — Playwright E2E スイート
 
-このリポジトリには独立した4つの Playwright config がある。いずれも「LAN/REST モードの実サーバーに対する DOM テスト」で、モックした frontend ではない。ポート・一時 DB・出力ディレクトリは互いに分離してあるので、同一マシンで独立に実行できる。
+このリポジトリには独立した5つの Playwright config がある。いずれも「LAN/REST モードの実サーバーに対する DOM テスト」で、モックした frontend ではない。ポート・一時 DB・出力ディレクトリは互いに分離してあるので、同一マシンで独立に実行できる。
 
-| config                                | 対象                          | コマンド                  | CI             |
-| ------------------------------------- | ----------------------------- | ------------------------- | -------------- |
-| `playwright.config.ts`                | ChronoGazer smoke             | `pnpm e2e`                | ✅             |
-| `public-viewer.playwright.config.ts`  | ChronoGazer 閲覧公開 (#507)   | `pnpm e2e:public-viewer`  | ✅             |
-| `banto-hub.playwright.config.ts`      | banto-hub 本体 (T18 機能一式) | `pnpm e2e:banto-hub`      | ✅             |
-| `banto-hub-perf.playwright.config.ts` | banto-hub 性能計測（後述）    | `pnpm e2e:banto-hub:perf` | ❌ opt-in のみ |
+| config                                    | 対象                                 | コマンド                  | CI             |
+| ----------------------------------------- | ------------------------------------ | ------------------------- | -------------- |
+| `playwright.config.ts`                    | ChronoGazer smoke                    | `pnpm e2e`                | ✅             |
+| `public-viewer.playwright.config.ts`      | ChronoGazer 閲覧公開 (#507)          | `pnpm e2e:public-viewer`  | ✅             |
+| `chronogazer-server.playwright.config.ts` | ChronoGazer サービス接続 (#392 B2-2) | `pnpm e2e:server`         | ✅             |
+| `banto-hub.playwright.config.ts`          | banto-hub 本体 (T18 機能一式)        | `pnpm e2e:banto-hub`      | ✅             |
+| `banto-hub-perf.playwright.config.ts`     | banto-hub 性能計測（後述）           | `pnpm e2e:banto-hub:perf` | ❌ opt-in のみ |
 
 `relay-wright.playwright.config.ts`（relay-wright 自身の E2E）は、relay-wright アプリ本体が 2026-09-24 に main から外され、タグ `archive/relay-wright-2026-09-24` に退避されたのに合わせて削除した（オーナー決定、docs/plan.md §4b）。
 
@@ -22,6 +23,7 @@
 | chronogazer 閲覧公開          | 8804   |
 | banto-hub                     | 8805   |
 | chronogazer 断線 E2E の PLC   | 8806   |
+| chronogazer サービス接続      | 8807   |
 
 banto-hub は 2026-10-09 のオーナー決定で 8799 から 8805 に移した（オーナーが 8799 を
 別の作業で使うため。banto 本体の E2E は今も 8799 を使う）。
@@ -58,15 +60,25 @@ banto-hub は 2026-10-09 のオーナー決定で 8799 から 8805 に移した�
 使われていれば落ちる（他のプロセスの PLC を自分のものと取り違えない）。子プロセスは
 `afterAll` とワーカーの終了時に必ず止める。
 
+8807 は `pnpm e2e:server`（#392 B2-2、2026-10-14）の `chronogazer-server`（本番の
+headless host）。`banto-serve` はこの PC からの接続（grant `localDesktop`）を常に閉じる
+ので、スペック（`e2e/tests-chronogazer-server/local-grant.spec.ts`）が
+`chronogazer-server` を**自分で子プロセスとして起動・再起動・停止する**（`webServer` は
+無い）。データのルートは実行ごとの一時ディレクトリの中（`CHRONOGAZER_ROOT`）で、
+ポートはデバッグビルドだけの `CHRONOGAZER_TEST_PORT` で 8807 にする。起動前にポートが
+使われていれば落ちる。止め方はデバッグビルドだけの `--control-stdin` の `ctrl-c`。
+出力先は `e2e/test-results-chronogazer-server/`。
+
 ## ビルド前提
 
-いずれの config も `webServer` は `cargo run` ではなく**ビルド済みバイナリ**を直接起動する（起動をほぼ瞬時にし、テスト実行中の不意な再コンパイルを避けるため）。実行前に:
+いずれの config も `webServer`（`pnpm e2e:server` はスペック自身）は `cargo run` ではなく**ビルド済みバイナリ**を直接起動する（起動をほぼ瞬時にし、テスト実行中の不意な再コンパイルを避けるため）。実行前に:
 
 ```sh
 pnpm install
 pnpm build                                                          # フロントの静的ビルド（assets.rs が embed する）
 cargo build -p chronogazer-core --bin banto-serve --features embed-ui   # pnpm e2e 用
 cargo build -p chronogazer-core --example dev_plc                      # pnpm e2e 用（開発用 PLC）
+cargo build -p chronogazer-core --bin chronogazer-server --features embed-ui  # pnpm e2e:server 用
 cargo build -p banto-hub-core --bin banto-hub --features embed-ui       # pnpm e2e:banto-hub / :perf 用
 pnpm exec playwright install chromium                               # 初回のみ
 ```
