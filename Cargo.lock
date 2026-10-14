@@ -604,6 +604,7 @@ dependencies = [
  "banto-collect",
  "banto-hub-core",
  "banto-server",
+ "banto-service-control",
  "banto-tagclient",
  "banto-tags",
  "banto-tstore",
@@ -702,6 +703,7 @@ version = "0.1.0"
 dependencies = [
  "thiserror 2.0.21",
  "windows-service",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

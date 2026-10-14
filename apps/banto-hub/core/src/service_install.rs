@@ -44,8 +44,11 @@
 //!
 //! アップグレード時に既存サービスの起動種別を意図せず上書きしないよう
 //! （design §5「上書きインストール時の既存サービス設定保持」）、
-//! [`install`] は SCM に同名サービスが既に存在する場合は**何も変更せず**
-//! 早期リターンするようにした（下記 [`install`] のドキュメント参照）。
+//! [`install`] は SCM に同名サービスが既に存在する場合、起動種別・
+//! 実行ファイル・ACL は変えずに早期リターンする。#589 以降、その経路でも
+//! OS シャットダウンの待ち時間（PRESHUTDOWN）だけは希望値でなければ更新し、
+//! 読み戻して確認する（`wait_hint` では延びない。既定は build 15063 以降
+//! 10 秒）。
 //!
 //! 唯一の差分は [`install`] が `exe_path_override` 引数を取れるようにした
 //! ことだけ - `banto-hub.exe install`（`win_service::install`が`None`を渡す）
@@ -74,7 +77,10 @@ use windows_service::service::{
 use windows_service::service_manager::{ServiceManager as WinScm, ServiceManagerAccess};
 
 #[cfg(windows)]
-use crate::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
+use crate::service_manager::{
+    describe_preshutdown_outcome, ensure_preshutdown_timeout, PRESHUTDOWN_TIMEOUT, RUN_SERVICE_ARG,
+    SERVICE_NAME,
+};
 
 /// `win_service.rs`のモジュール doc「サービス名・表示名・起動種別」参照。
 #[cfg(windows)]
@@ -95,15 +101,20 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 /// 同じディレクトリの`banto-hub.exe`を指すために使う - モジュール doc
 /// 参照）。
 ///
-/// **既に同名のサービスが登録済みの場合は何もせず早期リターンする**
-/// （T17-4、design §5「上書きインストール時の既存サービス設定保持」）。
-/// アップグレード時に NSIS post-install フックが毎回この関数を呼ぶため
-/// （`installer/hooks/service-hooks.nsh`）、ここで新規作成せず既存の
-/// `ServiceInfo`（起動種別を含む - オーナーが手動で `AutoStart` に
-/// 変更している場合も含む）をそのまま保持する。設定
+/// **既に同名のサービスが登録済みの場合、起動種別・実行ファイル・ACL は
+/// 変えずに早期リターンする**（T17-4、design §5「上書きインストール時の
+/// 既存サービス設定保持」）。アップグレード時に NSIS post-install フックが
+/// 毎回この関数を呼ぶため（`installer/hooks/service-hooks.nsh`）、ここで
+/// 新規作成せず既存の `ServiceInfo`（起動種別を含む - オーナーが手動で
+/// `AutoStart` に変更している場合も含む）をそのまま保持する。設定
 /// （実行ファイルパス・起動種別等）を変更したい場合は、先に
 /// [`uninstall`]してから明示的に`install`し直すか、管理 UI /
 /// `sc.exe config`を使うこと（docs/banto-hub-operations.md に手順を記載）。
+///
+/// 例外は OS シャットダウンの待ち時間（#589）。新規作成でも既設でも
+/// [`apply_preshutdown_timeout`] が `SERVICE_CONFIG_PRESHUTDOWN_INFO` だけを
+/// 希望値に揃え、読み戻す。起動している旧バイナリは再起動するまで
+/// PRESHUTDOWN を受けない。
 ///
 /// 失敗時は`eprintln!`で案内した上で`std::process::exit(1)`する（CLI ツール
 /// としての既存挙動そのまま - モジュール doc「挙動は一切変えていない」）。
@@ -124,11 +135,12 @@ pub fn install(exe_path_override: Option<&Path>) {
         .is_ok()
     {
         println!(
-            "banto-hub: Windows サービス '{SERVICE_NAME}' は既に登録されています（既存の起動種別・設定は変更していません）"
+            "banto-hub: Windows サービス '{SERVICE_NAME}' は既に登録されています（起動種別・実行ファイル・ACL は変更していません）"
         );
         println!(
-            "banto-hub:   設定を変更する場合は管理 UI、または `sc.exe config {SERVICE_NAME} start=demand|auto` を使ってください"
+            "banto-hub:   起動種別を変える場合は管理 UI、または `sc.exe config {SERVICE_NAME} start=demand|auto` を使ってください"
         );
+        apply_preshutdown_timeout();
         return;
     }
 
@@ -170,6 +182,7 @@ pub fn install(exe_path_override: Option<&Path>) {
     if let Err(err) = service.set_description(SERVICE_DESCRIPTION) {
         eprintln!("banto-hub: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}");
     }
+    apply_preshutdown_timeout();
     // OnDemand には遅延自動開始の概念が無い（Windows API 仕様 -
     // `set_delayed_auto_start`は`AutoStart`にのみ意味を持つ）ため、
     // T17-4 以降は呼び出さない。
@@ -225,6 +238,18 @@ pub fn uninstall() {
     println!(
         "banto-hub: （このプロセスのハンドルが閉じるまで完全な削除が遅延することがあります - Windows API の仕様）"
     );
+}
+
+/// PRESHUTDOWN の待ち時間を希望値に揃える。起動種別と ACL は変えない。
+/// 失敗したら install 自体を失敗にする（黙って 10 秒の既定のままにしない）。
+#[cfg(windows)]
+fn apply_preshutdown_timeout() {
+    match ensure_preshutdown_timeout(SERVICE_NAME, PRESHUTDOWN_TIMEOUT) {
+        Ok(outcome) => println!("banto-hub: {}", describe_preshutdown_outcome(&outcome)),
+        Err(err) => fail(&format!(
+            "banto-hub: OS シャットダウンの待ち時間（PRESHUTDOWN）を設定できませんでした: {err}"
+        )),
+    }
 }
 
 #[cfg(windows)]

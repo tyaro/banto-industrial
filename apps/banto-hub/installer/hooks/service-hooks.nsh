@@ -77,8 +77,10 @@
 ;     起動しない**（T17-4 の「収集を勝手に始めない」方針を維持）。
 ;
 ; いずれのサブコマンドも冪等 - 既に登録済みのサービスに対して `install`/
-; `service-install` を呼んでも既存設定は変更しない（T17-4、
-; apps/banto-hub/core/src/service_install.rs 参照）。
+; `service-install` を呼んでも起動種別・実行ファイル・ACL は変更しない
+; （T17-4、apps/banto-hub/core/src/service_install.rs 参照）。
+; #589 以降、その経路でも PRESHUTDOWN の待ち時間（30 秒）だけは更新し、
+; 読み戻して確認する。
 ;
 ; (6) デスクトップショートカットの削除（I4 追従、
 ;     docs/banto-hub-installer-design.md §7-3「デスクトップショートカット

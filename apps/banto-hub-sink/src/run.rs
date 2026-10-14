@@ -8,7 +8,7 @@
 //!
 //! 3 つの締め切り（設定取得・状態 push・購読の生存確認）のうち最も早い
 //! ものまで眠り、来たものだけを処理する。停止シグナル（コンソールの
-//! Ctrl-C / SCM の STOP）はどの待ちからでも即座に抜ける。
+//! Ctrl-C / SCM の STOP / OS の PRESHUTDOWN）はどの待ちからでも即座に抜ける。
 //!
 //! - **設定取得**（既定 30 秒）: `GET /api/sink/config` を取り、前回適用した
 //!   集合との差分だけを start/stop する（`banto_hub_core::db_source::
@@ -34,11 +34,17 @@
 //! だけ flush → flusher 停止 → 残りを dropped に計上 → 最後の状態 push`。
 //! 最後の push まで済ませてから終了コード 0 で抜けるので、Hub 側には
 //! 「取りこぼした行数」まで残る。
+//!
+//! OS の PRESHUTDOWN（#589）では、この列の合計が SCM の待ち時間を超えうる
+//! （flush 秒数は全体の上限ではない。flusher ごとに最大 2 秒、状態 push は
+//! HTTP の上限 10 秒）。そのときは残り時間で各段階を頭打ちにし、
+//! 完了と打ち切りを終了前のログで区別する。通常の STOP / Ctrl-C は
+//! 設定の flush のまま打ち切らない。
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -70,6 +76,51 @@ const FLUSHER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 停止時の drain 監視のポーリング間隔。
 const DRAIN_POLL: Duration = Duration::from_millis(50);
+
+/// OS シャットダウンで購読の停止に使ってよい上限。通常停止では掛けない
+/// （購読の停止が延びても、これまでどおり終わるまで待つ）。
+const OS_SUBSCRIPTION_STOP_CAP: Duration = Duration::from_secs(2);
+
+/// OS シャットダウンで最後の状態 push に使ってよい上限。
+/// HTTP クライアントの上限は 10 秒なので、flush のあとに予算を使い切らない
+/// よう短くする。通常停止ではクライアントの上限のまま待つ。
+const OS_STATUS_PUSH_CAP: Duration = Duration::from_secs(5);
+
+/// [`run`] に渡す停止合図の出力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequest {
+    /// Ctrl-C と SCM の STOP。設定の `shutdown_flush` と flusher ごとの
+    /// 停止待ちをそのまま使う。全体の打ち切りはしない。
+    Graceful,
+    /// OS の PRESHUTDOWN。`deadline` を過ぎたら残りを打ち切り、
+    /// 書けなかった行数をログに残す。
+    OsShutdown {
+        /// この時刻を過ぎたら打ち切る（SCM の待ち時間より前）。
+        deadline: StdInstant,
+    },
+}
+
+/// この段階に使ってよい時間。`remaining` が `None` のときは通常停止で、
+/// 設定値をそのまま返す。OS シャットダウンでは残り時間で頭を抑える。
+fn phase_limit(remaining: Option<Duration>, configured: Duration) -> Duration {
+    match remaining {
+        None => configured,
+        Some(left) => configured.min(left),
+    }
+}
+
+/// OS シャットダウンの完了と打ち切りを区別するログ行。
+fn os_shutdown_log_line(completed: bool, unsent_rows: usize) -> String {
+    if completed {
+        format!(
+            "banto-hub-sink: OS シャットダウンの停止が完了しました（送信できなかった行: {unsent_rows}）"
+        )
+    } else {
+        format!(
+            "banto-hub-sink: warn: OS シャットダウンの予算で停止を打ち切りました（送信できなかった行: {unsent_rows}）"
+        )
+    }
+}
 
 /// 実行時の調整値。**設定ファイルには出さない**（運用者が触る値ではなく、
 /// テストが実時間を待たないための注入口）。
@@ -619,31 +670,74 @@ impl Engine {
 
     // --- 停止（設計 §5.6） --------------------------------------------------
 
-    async fn shutdown(mut self) {
+    async fn shutdown(mut self, request: StopRequest) {
         log_line("banto-hub-sink: 停止します（残りのキューを flush します）");
+        let os_deadline = match request {
+            StopRequest::Graceful => None,
+            StopRequest::OsShutdown { deadline } => Some(deadline),
+        };
+        let mut cutoff = false;
         // 1. 行の生産を止める。
         for (_, task) in self.producers.drain() {
             task.abort();
         }
-        // 2. 購読を止める（Hub 側の購読を残さない）。
+        // 2. 購読を止める（Hub 側の購読を残さない）。通常停止は終わるまで
+        // 待つ。OS シャットダウンだけ残り時間で頭を抑える。
         if let Some(subscription) = self.subscription.take() {
-            subscription.stop().await;
+            match os_deadline {
+                None => subscription.stop().await,
+                Some(deadline) => {
+                    let limit = phase_limit(
+                        Some(deadline.saturating_duration_since(StdInstant::now())),
+                        OS_SUBSCRIPTION_STOP_CAP,
+                    );
+                    if limit.is_zero()
+                        || tokio::time::timeout(limit, subscription.stop())
+                            .await
+                            .is_err()
+                    {
+                        cutoff = true;
+                    }
+                }
+            }
         }
-        // 3. 残キューを最大 shutdown_flush_secs だけ流す。
+        // 3. 残キューを最大 shutdown_flush_secs だけ流す。OS シャットダウンでは
+        // その上限と残り時間の短い方。
         for flusher in self.flushers.values() {
             flusher.request_drain();
         }
-        let deadline = Instant::now() + self.config.shutdown_flush;
-        while Instant::now() < deadline {
+        let flush_end = {
+            let configured = StdInstant::now() + self.config.shutdown_flush;
+            match os_deadline {
+                Some(deadline) => configured.min(deadline),
+                None => configured,
+            }
+        };
+        while StdInstant::now() < flush_end {
             if self.groups.all().iter().all(|group| group.queued() == 0) {
                 break;
             }
             tokio::time::sleep(DRAIN_POLL).await;
         }
-        // 4. flusher を止める。
+        if os_deadline.is_some_and(|deadline| StdInstant::now() >= deadline)
+            && self.groups.all().iter().any(|group| group.queued() > 0)
+        {
+            cutoff = true;
+        }
+        // 4. flusher を止める。通常停止は各 2 秒。OS シャットダウンは残り時間。
         let flushers: Vec<FlusherHandle> = self.flushers.drain().map(|(_, f)| f).collect();
         for flusher in flushers {
-            flusher.stop(FLUSHER_STOP_TIMEOUT).await;
+            let limit = match os_deadline {
+                None => FLUSHER_STOP_TIMEOUT,
+                Some(deadline) => phase_limit(
+                    Some(deadline.saturating_duration_since(StdInstant::now())),
+                    FLUSHER_STOP_TIMEOUT,
+                ),
+            };
+            if os_deadline.is_some() && limit.is_zero() {
+                cutoff = true;
+            }
+            flusher.stop(limit).await;
         }
         // 5. 流しきれなかった行は dropped に計上する。
         let mut lost = 0usize;
@@ -656,8 +750,35 @@ impl Engine {
             ));
         }
         // 6. 最後の状態 push（上の dropped を含んだ状態を Hub に残す）。
-        self.push_status().await;
+        // OS シャットダウンで予算が尽きたら push を待たずに打ち切る。
+        match os_deadline {
+            None => self.push_status().await,
+            Some(deadline) => {
+                let limit = phase_limit(
+                    Some(deadline.saturating_duration_since(StdInstant::now())),
+                    OS_STATUS_PUSH_CAP,
+                );
+                if limit.is_zero()
+                    || tokio::time::timeout(limit, self.push_status())
+                        .await
+                        .is_err()
+                {
+                    cutoff = true;
+                    log_err_line(
+                        "banto-hub-sink: warn: 最後の状態 push を OS シャットダウンの予算内に終えられませんでした",
+                    );
+                }
+            }
+        }
+        if os_deadline.is_some() {
+            if cutoff {
+                log_err_line(&os_shutdown_log_line(false, lost));
+            } else {
+                log_line(&os_shutdown_log_line(true, lost));
+            }
+        }
         log_line("banto-hub-sink: 停止しました");
+        crate::log::sync_service_log();
     }
 }
 
@@ -673,7 +794,7 @@ pub async fn run<F>(
     shutdown: F,
 ) -> Result<(), HubApiError>
 where
-    F: Future<Output = ()>,
+    F: Future<Output = StopRequest>,
 {
     let status_push = config.status_push;
     let config_refresh = config.config_refresh;
@@ -699,7 +820,7 @@ where
 
     // 起動直後は「取れるまで待つ」だけ - 取れなくても終了しない。
     let ok = tokio::select! {
-        _ = &mut shutdown => { engine.shutdown().await; return Ok(()); }
+        request = &mut shutdown => { engine.shutdown(request).await; return Ok(()); }
         ok = engine.refresh_config() => ok,
     };
     let now = Instant::now();
@@ -707,10 +828,14 @@ where
     let mut next_status_at = now;
     let mut next_health_at = now + health_tick;
 
+    let stop_request;
     loop {
         let wake_at = next_config_at.min(next_status_at).min(next_health_at);
         tokio::select! {
-            _ = &mut shutdown => break,
+            request = &mut shutdown => {
+                stop_request = request;
+                break;
+            }
             _ = tokio::time::sleep_until(wake_at) => {}
         }
         let now = Instant::now();
@@ -729,7 +854,8 @@ where
         }
     }
 
-    engine.shutdown().await;
+    // ループを抜けるのは停止合図を受け取ったときだけ。
+    engine.shutdown(stop_request).await;
     Ok(())
 }
 
@@ -1019,5 +1145,37 @@ mod tests {
         );
         let short = Duration::from_secs(5);
         assert_eq!(next_config_delay(false, short, 9), short);
+    }
+
+    /// 通常停止は設定値のまま。OS シャットダウンは残り時間で頭を抑える。
+    #[test]
+    fn phase_limit_keeps_graceful_stops_and_caps_os_shutdown() {
+        assert_eq!(
+            phase_limit(None, Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            phase_limit(Some(Duration::from_secs(27)), Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            phase_limit(Some(Duration::from_secs(3)), Duration::from_secs(60)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            phase_limit(Some(Duration::ZERO), Duration::from_secs(5)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn os_shutdown_log_distinguishes_completion_from_cutoff() {
+        let done = os_shutdown_log_line(true, 0);
+        let cut = os_shutdown_log_line(false, 12);
+        assert!(done.contains("完了しました"));
+        assert!(done.contains("送信できなかった行: 0"));
+        assert!(cut.contains("打ち切りました"));
+        assert!(cut.contains("送信できなかった行: 12"));
+        assert!(cut.contains("warn"));
     }
 }

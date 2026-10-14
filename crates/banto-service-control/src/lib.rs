@@ -17,7 +17,9 @@
 //!   — それらを束ねる薄いラッパー（banto-hub の`BantoHub`向け等）は製品側
 //!   crate が持つ。
 //! - `install`/`uninstall`（サービスの登録・解除）は扱わない。最小面は
-//!   query / start / stop / restart / set_auto_start だけ。
+//!   query / start / stop / restart / set_auto_start だけ。例外は
+//!   `ensure_preshutdown_timeout`（#589、Windows のみ）で、OS シャットダウンの
+//!   待ち時間だけを読み書きする。起動種別・実行ファイル・ACL は変えない。
 //!
 //! ## 履歴
 //!
@@ -35,6 +37,9 @@
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+mod shutdown;
+pub use shutdown::*;
 
 /// SCM 上のサービス状態（desktop-plan §9.9 のフォールバック UI が判定する
 /// 「サービス: 停止/実行中」「STOP_PENDING」等はこの enum の値そのもの -

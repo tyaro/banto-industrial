@@ -1,0 +1,513 @@
+//! OS シャットダウンでサービスが最終 flush を通すための、ホスト非依存の判断。
+//!
+//! Windows の SCM は、サービスが `SERVICE_ACCEPT_PRESHUTDOWN` を報告している
+//! ときだけ `SERVICE_CONTROL_PRESHUTDOWN` を送る。送らないサービスは
+//! シャットダウンで停止処理を通らずにプロセスを終わらされる（#589）。
+//! `SERVICE_ACCEPT_SHUTDOWN` と `SERVICE_ACCEPT_PRESHUTDOWN` は同時に
+//! 受け付けられない（相互排他）。こちらは待ち時間を指定できる PRESHUTDOWN
+//! だけを受ける。
+//!
+//! 待ち時間の既定は Windows 10 build 15063 以降 10 秒で、`SetServiceStatus`
+//! の `wait_hint` では延びない。延びるのは `ChangeServiceConfig2W` の
+//! `SERVICE_CONFIG_PRESHUTDOWN_INFO` だけ。既に登録済みのサービスへも
+//! 同じ値を書き、読み戻して確認する（起動種別と ACL は触らない）。
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use crate::ServiceManagerError;
+
+/// SCM が PRESHUTDOWN を送ってから、サービスが `Stopped` を報告するまで
+/// 待つ上限。build 15063 以降の既定 10 秒では、sink の既定 flush（5 秒）と
+/// flusher の停止待ち・状態 push が収まらない。Hub の収集停止（tstore の
+/// 最終 flush を含む）の余裕もここに含める。
+pub const PRESHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `Stopped` の報告と、完了または打ち切りのログをディスクへ書く余裕。
+/// 停止処理の本体は [`stop_work_budget`] まで。ここを超えても SCM は
+/// [`PRESHUTDOWN_TIMEOUT`] までは待ってからプロセスを終わらせうる。
+pub const PRESHUTDOWN_REPORT_MARGIN: Duration = Duration::from_secs(3);
+
+/// 停止処理の本体に使ってよい時間。[`PRESHUTDOWN_TIMEOUT`] から
+/// [`PRESHUTDOWN_REPORT_MARGIN`] を引いた残り。引いた結果が負になる
+/// ときはゼロ。
+pub fn stop_work_budget(preshutdown_timeout: Duration) -> Duration {
+    preshutdown_timeout.saturating_sub(PRESHUTDOWN_REPORT_MARGIN)
+}
+
+/// ハンドラが受けた SCM 制御の種別。Windows の列挙をこの crate の外へ
+/// 漏らさないための写し。製品側が `ServiceControl` から写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScmControlKind {
+    /// 状態の問い合わせ。停止しない。
+    Interrogate,
+    /// `Stop-Service` / `sc stop`。
+    Stop,
+    /// OS シャットダウン（PRESHUTDOWN を受け付けているサービスだけ）。
+    Preshutdown,
+    /// OS シャットダウンの後段。PRESHUTDOWN と同時には受け付けられない。
+    Shutdown,
+    /// この製品が扱わない制御。
+    Other,
+}
+
+/// 最終 flush を含む停止経路へ入る合図。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopSignal {
+    /// 運用者の停止。製品の通常の停止（設定どおりの flush。全体の打ち切りはしない）。
+    ServiceStop,
+    /// OS の PRESHUTDOWN。[`stop_work_budget`] 以内に終える。
+    OsPreshutdown,
+}
+
+/// 制御を停止合図へ写す。`Shutdown` は受け付けないので `None`
+/// （PRESHUTDOWN と相互排他。両方を受理する実装にはしない）。
+pub fn stop_signal(control: ScmControlKind) -> Option<StopSignal> {
+    match control {
+        ScmControlKind::Stop => Some(StopSignal::ServiceStop),
+        ScmControlKind::Preshutdown => Some(StopSignal::OsPreshutdown),
+        ScmControlKind::Shutdown | ScmControlKind::Interrogate | ScmControlKind::Other => None,
+    }
+}
+
+/// 最初の停止合図。`received_at` は SCM が制御を届けた時刻で、
+/// OS シャットダウンの予算はこの時刻から数える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopNotice {
+    /// 最初に届いた停止合図。後から来た制御では上書きしない。
+    pub signal: StopSignal,
+    /// ハンドラが合図を記録した時刻。
+    pub received_at: Instant,
+}
+
+/// 最初の停止合図だけを `slot` に記録する。2 回目以降は `false` で、
+/// 中身は変えない（STOP の後に別の制御が来ても、先に始めた停止を
+/// やり直さない）。
+pub fn record_first_stop(slot: &Mutex<Option<StopNotice>>, signal: StopSignal) -> bool {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_some() {
+        return false;
+    }
+    *guard = Some(StopNotice {
+        signal,
+        received_at: Instant::now(),
+    });
+    true
+}
+
+/// SCM へ報告する状態。pending 以外は checkpoint と wait_hint を 0 にする
+/// （`SetServiceStatus` の決まり）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServicePhase {
+    /// 制御を受け付ける稼働中。
+    Running,
+    /// 停止処理の途中。制御は受け付けない。
+    StopPending,
+    /// 停止済み。これ以降の報告は製品側のゲートが落とす。
+    Stopped,
+}
+
+/// 1 回の `SetServiceStatus` に載せる中身（終了コードとサービス種別は
+/// 呼び出し側が足す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceStatusPlan {
+    /// 報告する状態。
+    pub phase: ServicePhase,
+    /// `SERVICE_ACCEPT_STOP` を載せるか。
+    pub accept_stop: bool,
+    /// `SERVICE_ACCEPT_PRESHUTDOWN` を載せるか。SHUTDOWN は載せない。
+    pub accept_preshutdown: bool,
+    /// pending の進捗。非 pending は 0。StopPending は 1 以上。
+    pub checkpoint: u32,
+    /// 次の状態報告までの見込み。非 pending は 0。StopPending は 0 より大きい。
+    pub wait_hint: Duration,
+}
+
+/// 稼働中に受け付ける制御。STOP（通常停止）と PRESHUTDOWN（OS の
+/// シャットダウン）。SHUTDOWN は付けない。
+pub fn running_status() -> ServiceStatusPlan {
+    ServiceStatusPlan {
+        phase: ServicePhase::Running,
+        accept_stop: true,
+        accept_preshutdown: true,
+        checkpoint: 0,
+        wait_hint: Duration::ZERO,
+    }
+}
+
+/// 停止済み。制御は受け付けない。
+pub fn stopped_status() -> ServiceStatusPlan {
+    ServiceStatusPlan {
+        phase: ServicePhase::Stopped,
+        accept_stop: false,
+        accept_preshutdown: false,
+        checkpoint: 0,
+        wait_hint: Duration::ZERO,
+    }
+}
+
+/// 停止処理に入った報告。`checkpoint` が 0、または `wait_hint` が 0 の
+/// ときは `None`（pending で両方を 0 にすると SCM は進捗が無いと扱う）。
+pub fn stop_pending_status(checkpoint: u32, wait_hint: Duration) -> Option<ServiceStatusPlan> {
+    if checkpoint == 0 || wait_hint.is_zero() {
+        return None;
+    }
+    Some(ServiceStatusPlan {
+        phase: ServicePhase::StopPending,
+        accept_stop: false,
+        accept_preshutdown: false,
+        checkpoint,
+        wait_hint,
+    })
+}
+
+/// 停止通知のあと SCM へ出す状態の順。先に StopPending、後始末のあと
+/// Stopped を 1 回。`wait_hint` が 0 のときは計画を作れない。
+pub fn stop_status_sequence(wait_hint: Duration) -> Option<(ServiceStatusPlan, ServiceStatusPlan)> {
+    let pending = stop_pending_status(1, wait_hint)?;
+    Some((pending, stopped_status()))
+}
+
+/// 登録済みサービスの PRESHUTDOWN 待ち時間を、希望値と比べた結果。
+/// 起動種別と ACL の変更は含まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreshutdownConfigAction {
+    /// 読み戻した値が既に希望と一致する。書き込まない。
+    AlreadySet,
+    /// 未読か、値が違う。希望値を書く。`previous_ms` は書けた場合の以前の値。
+    Update {
+        /// 書き込む前に読めたミリ秒。読めなければ `None`。
+        previous_ms: Option<u32>,
+    },
+}
+
+/// 今のミリ秒と希望のミリ秒から、書く必要があるかを決める純関数。
+pub fn preshutdown_config_action(
+    current_ms: Option<u32>,
+    desired_ms: u32,
+) -> PreshutdownConfigAction {
+    match current_ms {
+        Some(ms) if ms == desired_ms => PreshutdownConfigAction::AlreadySet,
+        other => PreshutdownConfigAction::Update { previous_ms: other },
+    }
+}
+
+/// [`ensure_preshutdown_timeout`] が読み戻しまで終えた結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreshutdownEnsureOutcome {
+    /// 書き込んだか、既に一致していたか。
+    pub action: PreshutdownConfigAction,
+    /// 設定しようとしたミリ秒。
+    pub desired_ms: u32,
+    /// 最後に読み戻したミリ秒。希望と一致している。
+    pub readback_ms: u32,
+}
+
+/// install が利用者に出す文言。起動種別と ACL を変えていないことを含む。
+pub fn describe_preshutdown_outcome(outcome: &PreshutdownEnsureOutcome) -> String {
+    match outcome.action {
+        PreshutdownConfigAction::AlreadySet => format!(
+            "OS シャットダウンの待ち時間（PRESHUTDOWN）は既に {} ミリ秒です（読み戻して確認しました。起動種別と ACL は変更していません）",
+            outcome.readback_ms
+        ),
+        PreshutdownConfigAction::Update {
+            previous_ms: Some(previous),
+        } => format!(
+            "OS シャットダウンの待ち時間（PRESHUTDOWN）を {previous} ミリ秒から {} ミリ秒に更新し、読み戻して確認しました（起動種別と ACL は変更していません）",
+            outcome.desired_ms
+        ),
+        PreshutdownConfigAction::Update { previous_ms: None } => format!(
+            "OS シャットダウンの待ち時間（PRESHUTDOWN）を {} ミリ秒に設定し、読み戻して確認しました（以前の値は読めませんでした。起動種別と ACL は変更していません）",
+            outcome.desired_ms
+        ),
+    }
+}
+
+/// `timeout` をミリ秒の `u32` にする。収まらなければ `None`
+/// （`set_preshutdown_timeout` は収まらない値で panic するため、呼ぶ前に弾く）。
+pub fn preshutdown_timeout_ms(timeout: Duration) -> Option<u32> {
+    u32::try_from(timeout.as_millis()).ok()
+}
+
+/// サービスの PRESHUTDOWN 待ち時間を `timeout` にし、読み戻して確認する。
+///
+/// 既に同じ値なら書き込まない。違うときだけ
+/// `ChangeServiceConfig2W`（`SERVICE_CONFIG_PRESHUTDOWN_INFO`）を呼ぶ。
+/// `ChangeServiceConfigW`（起動種別・実行ファイル・アカウント）と
+/// サービス DACL は触らない。
+///
+/// サービスが未登録なら [`ServiceManagerError::NotFound`]。
+#[cfg(windows)]
+pub fn ensure_preshutdown_timeout(
+    service_name: &str,
+    timeout: Duration,
+) -> Result<PreshutdownEnsureOutcome, ServiceManagerError> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let desired_ms = preshutdown_timeout_ms(timeout).ok_or_else(|| {
+        ServiceManagerError::Other("PRESHUTDOWN の待ち時間が u32 ミリ秒に収まりません".to_string())
+    })?;
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|err| map_win_err(service_name, err))?;
+    let service = manager
+        .open_service(
+            service_name,
+            ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG,
+        )
+        .map_err(|err| map_win_err(service_name, err))?;
+
+    let current_ms = query_preshutdown_ms(&service).ok();
+    let action = preshutdown_config_action(current_ms, desired_ms);
+    if !matches!(action, PreshutdownConfigAction::AlreadySet) {
+        service
+            .set_preshutdown_timeout(timeout)
+            .map_err(|err| map_win_err(service_name, err))?;
+    }
+
+    let readback_ms = query_preshutdown_ms(&service).map_err(|detail| {
+        ServiceManagerError::Other(format!(
+            "PRESHUTDOWN の待ち時間を読み戻せませんでした: {detail}"
+        ))
+    })?;
+    if readback_ms != desired_ms {
+        return Err(ServiceManagerError::Other(format!(
+            "PRESHUTDOWN の待ち時間の読み戻しが一致しません（希望 {desired_ms} ミリ秒、実際 {readback_ms} ミリ秒）"
+        )));
+    }
+
+    Ok(PreshutdownEnsureOutcome {
+        action,
+        desired_ms,
+        readback_ms,
+    })
+}
+
+/// `QueryServiceConfig2W` で PRESHUTDOWN のミリ秒を読む。
+/// 失敗理由は OS のエラー文字列。
+#[cfg(windows)]
+fn query_preshutdown_ms(service: &windows_service::service::Service) -> Result<u32, String> {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::System::Services::{
+        QueryServiceConfig2W, SERVICE_CONFIG_PRESHUTDOWN_INFO, SERVICE_PRESHUTDOWN_INFO,
+    };
+
+    let mut info = SERVICE_PRESHUTDOWN_INFO {
+        dwPreshutdownTimeout: 0,
+    };
+    let mut needed = 0u32;
+    // SAFETY: `info` は `SERVICE_PRESHUTDOWN_INFO` の大きさだけ生きていて、
+    // 呼び出しが返るまで借用する。ハンドルは `service` が持つ。
+    let ok = unsafe {
+        QueryServiceConfig2W(
+            service.raw_handle(),
+            SERVICE_CONFIG_PRESHUTDOWN_INFO,
+            &mut info as *mut SERVICE_PRESHUTDOWN_INFO as *mut u8,
+            size_of::<SERVICE_PRESHUTDOWN_INFO>() as u32,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(info.dwPreshutdownTimeout)
+    }
+}
+
+/// `windows-service` のエラーを [`ServiceManagerError`] に写す。
+/// 未登録と権限不足だけを分け、残りは診断用の文字列。
+#[cfg(windows)]
+fn map_win_err(service_name: &str, err: windows_service::Error) -> ServiceManagerError {
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    if let windows_service::Error::Winapi(io_err) = &err {
+        match io_err.raw_os_error() {
+            Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
+                return ServiceManagerError::NotFound(service_name.to_string());
+            }
+            Some(ERROR_ACCESS_DENIED) => return ServiceManagerError::AccessDenied,
+            _ => {}
+        }
+    }
+    ServiceManagerError::Other(err.to_string())
+}
+
+/// 計画の受理フラグを `windows-service` のビットへ写す。
+/// SHUTDOWN は立てない（PRESHUTDOWN と相互排他）。
+#[cfg(windows)]
+pub fn controls_accepted(
+    plan: &ServiceStatusPlan,
+) -> windows_service::service::ServiceControlAccept {
+    use windows_service::service::ServiceControlAccept;
+    let mut flags = ServiceControlAccept::empty();
+    if plan.accept_stop {
+        flags |= ServiceControlAccept::STOP;
+    }
+    if plan.accept_preshutdown {
+        flags |= ServiceControlAccept::PRESHUTDOWN;
+    }
+    flags
+}
+
+/// 計画を `ServiceStatus` にする。終了コードとサービス種別は呼び出し側の値。
+#[cfg(windows)]
+pub fn service_status_from_plan(
+    plan: &ServiceStatusPlan,
+    service_type: windows_service::service::ServiceType,
+    exit_code: windows_service::service::ServiceExitCode,
+) -> windows_service::service::ServiceStatus {
+    use windows_service::service::{ServiceState, ServiceStatus};
+    let current_state = match plan.phase {
+        ServicePhase::Running => ServiceState::Running,
+        ServicePhase::StopPending => ServiceState::StopPending,
+        ServicePhase::Stopped => ServiceState::Stopped,
+    };
+    ServiceStatus {
+        service_type,
+        current_state,
+        controls_accepted: controls_accepted(plan),
+        exit_code,
+        checkpoint: plan.checkpoint,
+        wait_hint: plan.wait_hint,
+        process_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_and_preshutdown_enter_the_graceful_path() {
+        assert_eq!(
+            stop_signal(ScmControlKind::Stop),
+            Some(StopSignal::ServiceStop)
+        );
+        assert_eq!(
+            stop_signal(ScmControlKind::Preshutdown),
+            Some(StopSignal::OsPreshutdown)
+        );
+    }
+
+    /// SHUTDOWN は PRESHUTDOWN と同時に受け付けられない。受理しない制御は
+    /// 停止経路へ入れない（来ても NotImplemented のまま）。
+    #[test]
+    fn shutdown_interrogate_and_other_are_not_stop_signals() {
+        for control in [
+            ScmControlKind::Shutdown,
+            ScmControlKind::Interrogate,
+            ScmControlKind::Other,
+        ] {
+            assert_eq!(stop_signal(control), None);
+        }
+    }
+
+    #[test]
+    fn work_budget_keeps_a_margin_for_the_stopped_report() {
+        assert_eq!(
+            stop_work_budget(PRESHUTDOWN_TIMEOUT),
+            Duration::from_secs(27)
+        );
+        assert_eq!(stop_work_budget(Duration::from_secs(2)), Duration::ZERO);
+        assert_eq!(preshutdown_timeout_ms(PRESHUTDOWN_TIMEOUT), Some(30_000));
+    }
+
+    #[test]
+    fn running_accepts_stop_and_preshutdown_only() {
+        let plan = running_status();
+        assert!(plan.accept_stop);
+        assert!(plan.accept_preshutdown);
+        assert_eq!(plan.checkpoint, 0);
+        assert_eq!(plan.wait_hint, Duration::ZERO);
+        assert!(!stopped_status().accept_stop);
+        assert!(!stopped_status().accept_preshutdown);
+    }
+
+    #[test]
+    fn stop_pending_requires_checkpoint_and_wait_hint() {
+        assert!(stop_pending_status(0, Duration::from_secs(30)).is_none());
+        assert!(stop_pending_status(1, Duration::ZERO).is_none());
+        let plan = stop_pending_status(1, PRESHUTDOWN_TIMEOUT).expect("valid pending");
+        assert_eq!(plan.phase, ServicePhase::StopPending);
+        assert_eq!(plan.checkpoint, 1);
+        assert_eq!(plan.wait_hint, PRESHUTDOWN_TIMEOUT);
+        assert!(!plan.accept_stop);
+        assert!(!plan.accept_preshutdown);
+    }
+
+    /// 通知のあと StopPending、後始末のあと Stopped が 1 回、の順。
+    #[test]
+    fn stop_sequence_is_pending_then_stopped_once() {
+        let (pending, stopped) = stop_status_sequence(PRESHUTDOWN_TIMEOUT).expect("sequence");
+        assert_eq!(pending.phase, ServicePhase::StopPending);
+        assert_eq!(pending.checkpoint, 1);
+        assert_eq!(stopped.phase, ServicePhase::Stopped);
+        assert_eq!(stopped.checkpoint, 0);
+        assert!(stop_status_sequence(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn first_stop_signal_wins() {
+        let slot = Mutex::new(None);
+        assert!(record_first_stop(&slot, StopSignal::OsPreshutdown));
+        assert!(!record_first_stop(&slot, StopSignal::ServiceStop));
+        let notice = slot.lock().unwrap().expect("recorded");
+        assert_eq!(notice.signal, StopSignal::OsPreshutdown);
+    }
+
+    #[test]
+    fn preshutdown_action_skips_write_when_already_set() {
+        assert_eq!(
+            preshutdown_config_action(Some(30_000), 30_000),
+            PreshutdownConfigAction::AlreadySet
+        );
+        assert_eq!(
+            preshutdown_config_action(Some(10_000), 30_000),
+            PreshutdownConfigAction::Update {
+                previous_ms: Some(10_000)
+            }
+        );
+        assert_eq!(
+            preshutdown_config_action(None, 30_000),
+            PreshutdownConfigAction::Update { previous_ms: None }
+        );
+    }
+
+    #[test]
+    fn describe_outcome_mentions_that_start_type_and_acl_stay() {
+        let already = describe_preshutdown_outcome(&PreshutdownEnsureOutcome {
+            action: PreshutdownConfigAction::AlreadySet,
+            desired_ms: 30_000,
+            readback_ms: 30_000,
+        });
+        assert!(already.contains("30000"));
+        assert!(already.contains("起動種別"));
+        assert!(already.contains("ACL"));
+
+        let updated = describe_preshutdown_outcome(&PreshutdownEnsureOutcome {
+            action: PreshutdownConfigAction::Update {
+                previous_ms: Some(10_000),
+            },
+            desired_ms: 30_000,
+            readback_ms: 30_000,
+        });
+        assert!(updated.contains("10000"));
+        assert!(updated.contains("30000"));
+        assert!(updated.contains("起動種別"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_running_bits_are_stop_and_preshutdown_not_shutdown() {
+        use windows_service::service::ServiceControlAccept;
+        let accept = controls_accepted(&running_status());
+        assert!(accept.contains(ServiceControlAccept::STOP));
+        assert!(accept.contains(ServiceControlAccept::PRESHUTDOWN));
+        assert!(!accept.contains(ServiceControlAccept::SHUTDOWN));
+        let pending = stop_pending_status(1, PRESHUTDOWN_TIMEOUT).expect("pending");
+        assert!(controls_accepted(&pending).is_empty());
+    }
+}

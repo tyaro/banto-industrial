@@ -33,7 +33,7 @@
 
 #[cfg(windows)]
 use banto_hub_sink::service;
-use banto_hub_sink::{load_config, run, SidecarOptions};
+use banto_hub_sink::{load_config, run, SidecarOptions, StopRequest};
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -100,10 +100,12 @@ fn run_console() {
         run(config, SidecarOptions::default(), async {
             // Ctrl-C を受けたら停止処理（残キューの flush → 最後の状態
             // push）へ入る。listen 自体に失敗するのは異常なので、その
-            // 場合は「即停止」に倒す。
+            // 場合は「即停止」に倒す。コンソールは SCM ではないので
+            // OS のシャットダウン通知はここには来ない（サービスが受ける）。
             if tokio::signal::ctrl_c().await.is_err() {
                 eprintln!("banto-hub-sink: Ctrl-C の待受に失敗しました");
             }
+            StopRequest::Graceful
         })
         .await
     });
