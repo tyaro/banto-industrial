@@ -200,6 +200,17 @@ impl DataLayout {
     }
 }
 
+/// パスに `.`・`..`（Windows では `...` のような点だけの名前も）の要素があるか。
+/// 文字列の要素で見る（`Path::components` は途中の `.` を読み飛ばすため）。区切りは
+/// Windows では `\` と `/`、それ以外は `/`。OS が作るときに正規化して別の場所を
+/// 指しうるパスを、ルートとして使う前に断るため（`crate::server_host::validate_root`）。
+pub fn has_dot_segment(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let is_separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    text.split(is_separator)
+        .any(|segment| !segment.is_empty() && segment.chars().all(|c| c == '.'))
+}
+
 /// ルートを、まだ無ければ作る（モジュール doc「ルートの作成」）。今作ったら `true`、
 /// 既にあれば何もせず `false`。失敗の理由は文言で返す（秘密は含まない）。
 pub fn create_root_dir(layout: &DataLayout) -> Result<bool, String> {
@@ -482,6 +493,20 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|ace| ace.sid != "S-1-5-32-545"));
+        }
+
+        /// PR #604 のレビュー: 末尾に `..` を持つ未作成のルートは、何も作らずに断る
+        /// （以前は親の作成が本当のルートを継承の ACL で先に作り、`CreateDirectoryW`
+        /// の正規化で「既にある」になって保護された DACL が付かなかった）。
+        #[test]
+        fn a_root_with_dot_segments_is_refused_without_creating_anything() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("ChronoGazer");
+            for root in [real.join("child").join(".."), real.join(".")] {
+                let err = create_root_dir(&DataLayout::new(&root)).unwrap_err();
+                assert!(!err.is_empty());
+                assert!(!real.exists(), "本当のルートを作らない: {root:?}");
+            }
         }
 
         /// 既にあるルートの ACL には触らない（継承の DACL のまま）。

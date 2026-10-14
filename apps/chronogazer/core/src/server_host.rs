@@ -171,6 +171,16 @@ pub fn validate_root(root: &Path) -> Result<(), String> {
             crate::paths::ROOT_ENV
         ));
     }
+    // `.`・`..`（と点だけの名前）を含むパスは、OS が作るときに正規化して別の場所を
+    // 指しうる（例 `…\ChronoGazer\child\..`: 親を先に普通の継承の ACL で作ってしまい、
+    // 保護された DACL が付かない。PR #604 のレビュー）。副作用なしで断る。
+    if crate::paths::has_dot_segment(root) {
+        return Err(format!(
+            "データのルート（{}）に「.」や「..」が含まれています。{} には「.」「..」を含まない絶対パス（例: D:\\ChronoGazer）を指定してください。",
+            root.display(),
+            crate::paths::ROOT_ENV
+        ));
+    }
     Ok(())
 }
 

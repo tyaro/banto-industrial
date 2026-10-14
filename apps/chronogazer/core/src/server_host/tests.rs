@@ -46,6 +46,42 @@ fn windows_absolute_roots_are_accepted_but_drive_relative_ones_are_not() {
     assert!(validate_root(Path::new(r"C:ChronoGazer")).is_err());
 }
 
+/// PR #604 のレビュー: `.`・`..` を含む絶対パスも断る（文言は相対パスと同じく
+/// 環境変数の名前と例を出す）。
+#[test]
+fn roots_with_dot_segments_are_rejected() {
+    let cases: &[&str] = if cfg!(windows) {
+        &[
+            r"C:\ProgramData\ChronoGazer\child\..",
+            r"C:\ProgramData\ChronoGazer\.",
+            r"C:\ProgramData\.\ChronoGazer",
+            r"C:\ProgramData\..\ChronoGazer",
+            r"C:/ProgramData/ChronoGazer/child/..",
+            r"C:\ProgramData\ChronoGazer\...",
+            r"\\server\share\..\ChronoGazer",
+        ]
+    } else {
+        &[
+            "/var/lib/ChronoGazer/child/..",
+            "/var/lib/ChronoGazer/.",
+            "/var/./lib/ChronoGazer",
+            "/var/lib/../ChronoGazer",
+        ]
+    };
+    for root in cases {
+        let err = validate_root(Path::new(root)).expect_err(root);
+        assert!(err.contains("CHRONOGAZER_ROOT"), "{err}");
+        assert!(err.contains(".."), "{err}");
+    }
+    // 名前の一部としての点は通す。
+    let fine = if cfg!(windows) {
+        r"C:\ProgramData\Chrono.Gazer\v1..2"
+    } else {
+        "/var/lib/Chrono.Gazer/v1..2"
+    };
+    assert!(validate_root(Path::new(fine)).is_ok());
+}
+
 #[cfg(not(windows))]
 #[test]
 fn unix_absolute_roots_are_accepted() {

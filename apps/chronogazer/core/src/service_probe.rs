@@ -276,14 +276,17 @@ fn parse_http_response(raw: &[u8]) -> HttpParse {
     }
     let body = if chunked {
         match decode_chunked(rest) {
-            Some(body) => body,
-            None => return HttpParse::Truncated,
+            Ok(body) => body,
+            Err(ChunkError::Truncated) => return HttpParse::Truncated,
+            Err(ChunkError::Malformed) => return HttpParse::NotHttp,
         }
     } else if let Some(len) = content_length {
-        if rest.len() < len {
-            return HttpParse::Truncated;
+        // 宣言の長さは相手の言い値: 読めた分（上限 64 KiB）と比べてから切り出す
+        // （大きな値でも足し算・範囲外の slice をしない）。
+        match rest.get(..len) {
+            Some(body) => body.to_vec(),
+            None => return HttpParse::Truncated,
         }
-        rest[..len].to_vec()
     } else {
         // `Connection: close` で長さの無い応答は、閉じるまでが本文。
         rest.to_vec()
@@ -291,23 +294,43 @@ fn parse_http_response(raw: &[u8]) -> HttpParse {
     HttpParse::Response { status, body }
 }
 
-/// chunked の本文をつなぐ。最後の 0 の chunk まで揃っていなければ `None`。
-fn decode_chunked(mut rest: &[u8]) -> Option<Vec<u8>> {
+#[derive(Debug, PartialEq, Eq)]
+enum ChunkError {
+    /// 最後の 0 の chunk まで届かないうちに閉じられた（宣言の長さが読めた分より長い）。
+    Truncated,
+    /// chunk の形ではない（長さが 16 進でない・chunk の後ろが CRLF でない）。
+    Malformed,
+}
+
+/// chunked の本文をつなぐ。chunk の長さは相手の言い値なので、**足し算は
+/// `checked_add`、切り出しは残りのバイト数と比べてから**行う（`fffffffffffffffe`
+/// のような長さでも overflow・範囲外の slice で panic しない。PR #604 のレビュー）。
+fn decode_chunked(mut rest: &[u8]) -> Result<Vec<u8>, ChunkError> {
     let mut body = Vec::new();
     loop {
-        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
-        let size_text = std::str::from_utf8(&rest[..line_end]).ok()?;
+        let line_end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or(ChunkError::Truncated)?;
+        let size_text =
+            std::str::from_utf8(&rest[..line_end]).map_err(|_| ChunkError::Malformed)?;
         let size_text = size_text.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_text, 16).ok()?;
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| ChunkError::Malformed)?;
         rest = &rest[line_end + 2..];
         if size == 0 {
-            return Some(body);
+            return Ok(body);
         }
-        if rest.len() < size + 2 {
-            return None;
+        // chunk の中身と、その後ろの CRLF。
+        let needed = size.checked_add(2).ok_or(ChunkError::Malformed)?;
+        if rest.len() < needed {
+            return Err(ChunkError::Truncated);
         }
-        body.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
+        let (data, after) = rest.split_at(size);
+        if !after.starts_with(b"\r\n") {
+            return Err(ChunkError::Malformed);
+        }
+        body.extend_from_slice(data);
+        rest = &after[2..];
     }
 }
 
@@ -511,6 +534,70 @@ mod tests {
         assert_eq!(
             parse_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{}"),
             HttpParse::Truncated
+        );
+    }
+
+    /// PR #604 のレビュー: 相手の言い値の長さで panic しない（debug の overflow・
+    /// release の範囲外の slice）。巨大な chunk の長さ・`Content-Length`、chunk の
+    /// 後ろが CRLF でない形。
+    #[test]
+    fn hostile_lengths_do_not_panic() {
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffe\r\n"
+            ),
+            HttpParse::NotHttp
+        );
+        // 表せるが読めた分より長い長さは「途中で切れた」。
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n{}"
+            ),
+            HttpParse::Truncated
+        );
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nab\r\n"
+            ),
+            HttpParse::NotHttp
+        );
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n"
+            ),
+            HttpParse::NotHttp
+        );
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}XX0\r\n\r\n"
+            ),
+            HttpParse::NotHttp
+        );
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n{}\r\n0\r\n\r\n"
+            ),
+            HttpParse::NotHttp
+        );
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n{}"
+            ),
+            HttpParse::Truncated
+        );
+        assert_eq!(
+            parse_http_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\n{}"
+            ),
+            HttpParse::NotHttp
+        );
+        assert_eq!(
+            decode_chunked(b"fffffffffffffffe\r\n"),
+            Err(ChunkError::Malformed)
+        );
+        assert_eq!(
+            decode_chunked(b"ffffffffffffffff\r\n"),
+            Err(ChunkError::Malformed)
         );
     }
 
@@ -743,6 +830,34 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    /// PR #604 のレビュー: 表せない chunk の長さ（`fffffffffffffffe` に CRLF の 2 を
+    /// 足すと溢れる）を言って閉じる相手でも panic しない。
+    #[test]
+    fn a_huge_chunk_size_from_a_real_listener_does_not_panic() {
+        let port = spawn_listener(|mut stream| {
+            read_request_head(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffe\r\n",
+            );
+        });
+        let health = probe_endpoint(
+            &endpoint(port, SCOPE),
+            ChronoGazerHost::Service,
+            None,
+            PROBE_TIMEOUT,
+        );
+        // 届き方（相手が閉じる前に読めた分）で、形の誤り（`NotChronoGazer`）にも
+        // 途中で切れた（`ProbeFailed`）にもなりうる。どちらでも panic しないこと。
+        // 形の判定そのものは `hostile_lengths_do_not_panic` が固定する。
+        assert!(
+            matches!(
+                health,
+                ServiceHealth::NotChronoGazer { .. } | ServiceHealth::ProbeFailed(_)
+            ),
+            "{health:?}"
         );
     }
 

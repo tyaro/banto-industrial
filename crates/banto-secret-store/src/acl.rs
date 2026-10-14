@@ -277,6 +277,7 @@ pub fn check_dacl(
 /// アカウントであることを `LookupAccountSidW` で確かめる（モジュール doc
 /// 「インストール利用者の SID の検証」）。
 pub fn ensure_dir(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
+    reject_dot_segments(dir)?;
     imp::ensure_user_account(access)?;
     imp::ensure_dir(dir, access)
 }
@@ -311,7 +312,25 @@ pub(crate) fn verify_dir_with_validated_sid(
 /// なければ [`AclMismatch::NotADirectory`]。シンボリックリンク・ジャンクションは
 /// 辿った先がディレクトリなら「既にある」。
 pub fn create_dir_if_absent(dir: &std::path::Path, access: &DirAccess) -> Result<bool> {
+    reject_dot_segments(dir)?;
     imp::create_dir_if_absent(dir, access)
+}
+
+/// `.`・`..`（と点だけの名前）の要素を含むパスを、何も作らずに断る（多重の防御。
+/// PR #604 のレビュー）。親を `create_dir_all` で作ってから `CreateDirectoryW` が
+/// 正規化すると、例えば `…\X\child\..` では親の作成が本当の `X` を継承の ACL で先に
+/// 作り、`CreateDirectoryW` が「既にある」になって保護された DACL が付かない。
+/// `Path::components` は途中の `.` を読み飛ばすので、文字列の要素で見る。
+fn reject_dot_segments(dir: &std::path::Path) -> Result<()> {
+    let text = dir.to_string_lossy();
+    let is_separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    if text
+        .split(is_separator)
+        .any(|segment| !segment.is_empty() && segment.chars().all(|c| c == '.'))
+    {
+        return Err(SecretStoreError::DotSegmentInPath);
+    }
+    Ok(())
 }
 
 /// 既にあるディレクトリの DACL を、期待の形に**書き直す**（明示的な修復。
@@ -1192,6 +1211,36 @@ mod tests {
                 create_dir_if_absent(&file, &access),
                 Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory))
             ));
+        }
+
+        /// PR #604 のレビュー: `.`・`..` を含むパスは、親も含めて何も作らずに断る
+        /// （`ensure_dir` も同じ）。
+        #[test]
+        fn dot_segments_are_refused_without_creating_anything() {
+            let root = tempfile::tempdir().unwrap();
+            let real = root.path().join("X");
+            let access = DirAccess::with_install_user(me());
+            for dir in [
+                real.join("child").join(".."),
+                real.join("."),
+                real.join("..").join("X"),
+                std::path::PathBuf::from(format!("{}\\...", real.display())),
+            ] {
+                assert_eq!(
+                    create_dir_if_absent(&dir, &access),
+                    Err(SecretStoreError::DotSegmentInPath),
+                    "{dir:?}"
+                );
+                assert_eq!(
+                    ensure_dir(&dir, &access),
+                    Err(SecretStoreError::DotSegmentInPath),
+                    "{dir:?}"
+                );
+                assert!(!real.exists(), "何も作らない: {dir:?}");
+                assert!(!real.join("child").exists());
+            }
+            // 名前の一部としての点は通す。
+            assert!(create_dir_if_absent(&root.path().join("a.b..c"), &access).unwrap());
         }
 
         /// 作る経路でだけ SID を確かめる: グループの SID では作らない。既にある
