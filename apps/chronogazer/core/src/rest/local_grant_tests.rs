@@ -953,3 +953,61 @@ async fn setup_revokes_even_if_the_db_cannot_be_read_again() {
     );
     assert_eq!(revocations().await, 1);
 }
+
+/// #600 の監査 F3: JSON の配列の本文（serde の struct の配列の表現）は、予約名でも
+/// 普通の名前でも、setup・`POST /api/users` の両方で `400` になり、アカウントを作らない
+/// （上流は配列の表現も受理するので、`username` の欄だけを見ると予約名を素通りした）。
+///
+/// 反証: `local_access_middleware` の「object 以外は `400`」をやめると、予約名の配列の
+/// 本文の setup が `400` にならず（上流が受理する）このテストが落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn array_bodies_are_refused_on_the_account_paths() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    for body in [
+        json!(["localDesktop", PASSWORD, "x"]),
+        json!(["admin", PASSWORD, "管理者"]),
+    ] {
+        let (status, response) = send(
+            &f.router,
+            "POST",
+            "/api/auth/setup",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            None,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+    }
+    assert!(!f.users.is_initialized().await.unwrap());
+
+    let (status, body) = send(
+        &f.router,
+        "POST",
+        "/api/auth/setup",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        None,
+        Some(json!({ "username": "admin", "password": PASSWORD, "displayName": "管理者" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let admin = body["token"].as_str().expect("token").to_string();
+    for body in [
+        json!(["PUBLIC", PASSWORD, "x", "viewer"]),
+        json!(["operator", PASSWORD, "運転員", "viewer"]),
+    ] {
+        let (status, response) = send(
+            &f.router,
+            "POST",
+            "/api/users",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            Some(&admin),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+    }
+    assert_eq!(f.users.list_users().await.unwrap().len(), 1);
+}

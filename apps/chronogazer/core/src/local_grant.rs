@@ -433,13 +433,26 @@ pub async fn local_access_middleware(
                 .into_response()
             }
         };
-        let username = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| value["username"].as_str().map(str::to_owned));
-        if let Some(username) = username {
-            if let Err(err) = check_username_not_reserved(&username) {
-                return banto_server::ApiError(err).into_response();
+        // JSON として読める本文は object だけを通す（#600 の監査 F3）: 上流の
+        // `SetupRequest`・`CreateUserRequest` は普通の `derive(Deserialize)` なので serde の
+        // 配列の表現（`["localDesktop", "pw", "x"]`）も受理し、`username` の欄だけを見ると
+        // 予約名の検査を素通りする。JSON として読めない本文は従来どおり上流に任せる
+        // （上流が型・Content-Type で断る）。
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Object(object)) => {
+                if let Some(username) = object.get("username").and_then(|value| value.as_str()) {
+                    if let Err(err) = check_username_not_reserved(username) {
+                        return banto_server::ApiError(err).into_response();
+                    }
+                }
             }
+            Ok(_) => {
+                return banto_server::ApiError(BantoError::BadRequest(
+                    "本文は JSON の object（{\"username\": ...} の形）で送ってください".to_string(),
+                ))
+                .into_response()
+            }
+            Err(_) => {}
         }
         req = Request::from_parts(parts, axum::body::Body::from(bytes));
     }
