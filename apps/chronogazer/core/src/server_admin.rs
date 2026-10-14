@@ -57,7 +57,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{FromRequest, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -66,7 +66,7 @@ use banto_core::{BantoError, ErrorBody};
 use banto_server::routes::{actor_identity, require_role_at_least, RoleGuard};
 use banto_server::{
     bind as bind_listener, lan_urls_for_bind, request_is_loopback_local, require_auth, ApiError,
-    AuthState, GrantKind, RunningServer, ServerConfig,
+    AuthState, GrantKind, Identity, RunningServer, ServerConfig,
 };
 use qrcode::render::svg;
 use qrcode::QrCode;
@@ -76,7 +76,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::engine::ServerSlot;
 use crate::local_grant::{
-    local_desktop_grant_kind, read_setting, write_setting, LocalGrantSetting, LocalGrantStart,
+    local_desktop_grant_kind, read_setting, run_detached, write_setting, LocalGrantSetting,
+    LocalGrantStart,
 };
 use crate::server_host::listen_plan_from_settings;
 use crate::settings::{AuthSettings, ServerSettings, SettingsService};
@@ -679,36 +680,45 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
         Err(rejection) => return rejection.into_response(),
     };
     let actor = actor_identity(&headers, &state.auth);
-    let factory = state.lan.router.clone().expect("rest_apply_supported");
-    let router = move || factory();
-    let ctx = ApplyContext {
-        settings: &state.settings,
-        audit: &state.audit,
-        rest_auth: &state.auth,
-        lan: &state.lan,
-        router: &router,
-        auth_config_lock: &state.auth_config_lock,
-        origin: "rest",
-        log_label: state.log_label,
-    };
     let config = ServerSettings {
         enabled: payload.enabled,
         bind: payload.bind,
         port: payload.port,
         viewer_public: payload.viewer_public,
     };
-    match apply_server_settings(
-        &ctx,
-        config,
-        ApplyActor {
-            username: actor.as_ref().map(|identity| identity.id.as_str()),
-            role: actor.as_ref().map(|identity| identity.role.as_str()),
-        },
-    )
-    .await
-    {
-        Ok(status) => Json(status).into_response(),
-        Err(err) => ApiError(err).into_response(),
+    // 適用（古い listener の停止・bind・保存・巻き戻し・監査）は応答の future から
+    // 切り離す（#600 の監査 F2・F4、`crate::local_grant::run_detached`）: handler の中で
+    // 待つと、要求を送った側が接続を切ったときに hyper が future を捨て、slot が空のまま
+    // （保存値は「公開」なのに LAN は止まったまま）・監査の行が無いまま終わる。
+    let label = state.log_label;
+    let applied = run_detached(label, async move {
+        let factory = state.lan.router.clone().expect("rest_apply_supported");
+        let router = move || factory();
+        let ctx = ApplyContext {
+            settings: &state.settings,
+            audit: &state.audit,
+            rest_auth: &state.auth,
+            lan: &state.lan,
+            router: &router,
+            auth_config_lock: &state.auth_config_lock,
+            origin: "rest",
+            log_label: state.log_label,
+        };
+        apply_server_settings(
+            &ctx,
+            config,
+            ApplyActor {
+                username: actor.as_ref().map(|identity| identity.id.as_str()),
+                role: actor.as_ref().map(|identity| identity.role.as_str()),
+            },
+        )
+        .await
+    })
+    .await;
+    match applied {
+        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Err(err)) => ApiError(err).into_response(),
+        Err(refusal) => refusal,
     }
 }
 
@@ -765,22 +775,33 @@ async fn auth_settings_put(State(state): State<SettingsAdminState>, req: Request
             .into_response()
         }
     };
-    match auth_settings_apply(&state, &headers, payload).await {
-        Ok(view) => Json(view).into_response(),
-        Err(err) => err.into_response(),
+    let value = match LocalGrantSetting::parse(&payload.local_grant) {
+        Ok(value) => value,
+        Err(err) => return ApiError(err).into_response(),
+    };
+    // 操作者は保存・失効の**前に**確定する（#600 のレビュー）: `localDesktop` の admin の
+    // トークンで値を変えると、下の失効がこの要求自身のトークンも消し、後から引くと
+    // 操作者が空のまま特権の変更が監査に残る（banto-hub の lock-down と同じ扱い）。
+    let actor = actor_identity(&headers, &state.auth);
+    // 保存・失効・監査は応答の future から切り離す（#600 の監査 F4。保存と失効の間に
+    // await は無いが、その後の監査の行が接続の切断で落ちうる）。
+    let label = state.log_label;
+    let applied = run_detached(label, async move {
+        auth_settings_apply(&state, actor, value).await
+    })
+    .await;
+    match applied {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err(err)) => err.into_response(),
+        Err(refusal) => refusal,
     }
 }
 
 async fn auth_settings_apply(
     state: &SettingsAdminState,
-    headers: &HeaderMap,
-    payload: AuthConfigPayload,
+    actor: Option<Identity>,
+    value: LocalGrantSetting,
 ) -> Result<AuthConfigView, ApiError> {
-    let value = LocalGrantSetting::parse(&payload.local_grant)?;
-    // 操作者は保存・失効の**前に**確定する（#600 のレビュー）: `localDesktop` の admin の
-    // トークンで値を変えると、下の失効がこの要求自身のトークンも消し、後から引くと
-    // 操作者が空のまま特権の変更が監査に残る（banto-hub の lock-down と同じ扱い）。
-    let actor = actor_identity(headers, &state.auth);
     let revoked = {
         let _guard = state.auth_config_lock.lock().await;
         let previous = read_setting(&state.settings).await?;

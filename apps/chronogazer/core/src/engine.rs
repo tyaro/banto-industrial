@@ -2530,4 +2530,191 @@ mod tests {
 
         assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
     }
+
+    /// 要求を送り、`started()` が成り立つ（handler の処理が始まった）のを待ってから
+    /// 書き込み側を閉じ（FIN）、応答が来ずに接続が閉じられる（hyper が service の future
+    /// を捨てた）ことを確かめる。待ちはどれも上限つき（時間で成否を決めない）。
+    async fn send_then_disconnect(addr: SocketAddr, request: String, started: impl Fn() -> bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        wait_until("handler の処理の開始", &started).await;
+        stream.shutdown().await.expect("shutdown");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            .await
+            .expect("FIN の後も接続が閉じられない（hyper が future を捨てていない）")
+            .expect("read");
+        assert!(
+            response.is_empty(),
+            "切断した要求に応答が返った（処理が止まっていない）: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    /// 生の HTTP/1.1 の要求（`Connection: close` は付けない - 応答の前に切る）。
+    fn raw_request(
+        method: &str,
+        path: &str,
+        host: &str,
+        token: Option<&str>,
+        body: &serde_json::Value,
+    ) -> String {
+        let body = body.to_string();
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nX-Banto-Client: banto\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some(token) = token {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(&body);
+        request
+    }
+
+    async fn settings_changes_ok(engine: &RunningEngine) -> usize {
+        engine
+            .services()
+            .audit
+            .list(banto_core::ListParams::default())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .filter(|row| {
+                row.action == "settings_change" && row.origin == "rest" && row.result == "ok"
+            })
+            .count()
+    }
+
+    /// #600 の監査 F2: `PUT /api/settings/server` を送った側が適用の途中で接続を切っても、
+    /// 適用（古い LAN の listener の停止・保存・監査）は最後まで完結し、保存値と実際の
+    /// listener が食い違わない。適用の途中は「設定の lock を外から持つ」ことで作る
+    /// （古い listener を止めた後、保存の手前で決定的に止まる。時間に頼らない）。
+    ///
+    /// 反証: `server_settings_put` の `run_detached` をやめて handler の中で
+    /// `apply_server_settings` を待つと、切断で future が捨てられ、保存値は `enabled: true`
+    /// のまま LAN は止まり、監査の行も出ない（この上限つきの待ちが落ちる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_put_completes_even_if_the_client_disconnects() {
+        let dir = TempDir::new();
+        let port = free_port();
+        let opened = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
+            .await
+            .expect("open");
+        let settings = opened.settings();
+        let saved = settings.server_config().await.unwrap();
+        settings
+            .set_server_config(&ServerSettings {
+                enabled: true,
+                bind: "127.0.0.1".to_string(),
+                port,
+                ..saved
+            })
+            .await
+            .unwrap();
+        let engine = opened
+            .with_loopback(ServerConfig {
+                bind: "127.0.0.1".to_string(),
+                port,
+            })
+            .with_listen(EngineListen::BestEffort(loopback_any_port()))
+            .with_loopback_local_access()
+            .start()
+            .await
+            .expect("start");
+        let loopback = engine.loopback_addr().await.expect("loopback");
+        let host = loopback.to_string();
+        assert!(engine.server_slot().local_addr().await.is_some());
+        assert_eq!(post_setup(loopback).await, 200);
+        let (_, body) = http(
+            loopback,
+            "POST",
+            "/api/auth/login",
+            &host,
+            None,
+            Some(serde_json::json!({ "username": "admin", "password": "admin-pass-1" })),
+        )
+        .await;
+        let token = body["token"].as_str().expect("token").to_string();
+
+        // 適用が slot を取ったら（= 処理が始まったら）切る。適用は保存の手前の設定の
+        // lock で止まっている。
+        let disconnect = |body: serde_json::Value| {
+            let request = raw_request("PUT", "/api/settings/server", &host, Some(&token), &body);
+            let slot = engine.server_slot().clone();
+            let lock = engine.services().settings_lock.clone();
+            async move {
+                let held = lock.lock_owned().await;
+                send_then_disconnect(loopback, request, || slot.try_lock().is_err()).await;
+                drop(held);
+            }
+        };
+        let engine_ref = &engine;
+        let wait_for_changes = |count: usize| async move {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while settings_changes_ok(engine_ref).await < count {
+                assert!(
+                    Instant::now() < deadline,
+                    "切断した適用の監査の行（settings_change ok）が 20 秒以内に出なかった"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+
+        disconnect(serde_json::json!({
+            "enabled": false, "bind": "127.0.0.1", "port": port, "viewerPublic": false
+        }))
+        .await;
+        wait_for_changes(1).await;
+        let saved = engine.services().settings.server_config().await.unwrap();
+        assert!(!saved.enabled, "切断で保存が飛んだ: {saved:?}");
+        assert!(engine.server_slot().local_addr().await.is_none());
+        let (status, body) = http(
+            loopback,
+            "GET",
+            "/api/settings/server",
+            &host,
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["enabled"], false, "{body}");
+        assert_eq!(body["running"], false, "{body}");
+
+        // LAN の IP があれば、開く方向（新しい listener を bind して置く）も切断で
+        // 捨てられないことを確かめる。
+        if let Some(lan_ip) = first_lan_ipv4() {
+            disconnect(serde_json::json!({
+                "enabled": true, "bind": lan_ip.to_string(), "port": port, "viewerPublic": false
+            }))
+            .await;
+            wait_for_changes(2).await;
+            assert_eq!(
+                engine.server_slot().local_addr().await,
+                Some(SocketAddr::from((lan_ip, port)))
+            );
+            let (status, body) = http(
+                loopback,
+                "GET",
+                "/api/settings/server",
+                &host,
+                Some(&token),
+                None,
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["running"], true, "{body}");
+            assert_eq!(body["bind"], lan_ip.to_string(), "{body}");
+            assert_eq!(body["urls"][0], format!("http://{lan_ip}:{port}"), "{body}");
+        } else {
+            eprintln!(
+                "skip: この環境には非 loopback の IPv4 アドレスが無い（開く方向は確かめない）"
+            );
+        }
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
 }

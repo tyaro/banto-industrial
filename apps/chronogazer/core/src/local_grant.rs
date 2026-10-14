@@ -454,17 +454,65 @@ pub async fn local_access_middleware(
     // setup・users を別表記にした要求はどのルートにも当たらない。）
     let is_grant_issue = is_post && path.starts_with(GRANT_PREFIX);
 
-    let response = next.run(req).await;
-
-    let response = if is_grant_issue && response.status().is_success() {
-        audit_issued_grant(&state, response).await
-    } else {
+    if !(is_grant_issue || is_setup) {
+        return next.run(req).await;
+    }
+    // 発行（とその監査）・setup（とその後の失効）は、応答の future から切り離して最後まで
+    // 走らせる（#600 の監査 F1・F4。[`run_detached`]）: hyper 1.x は応答を待つ間に
+    // 相手の FIN を読むと service の future を捨てるので、`.await` をまたぐ後処理は
+    // 接続を切られると飛ぶ（発行したのに監査が無い・初期化したのに admin のトークンが
+    // 残る）。上流の処理（発行・setup の commit）ごと切り離すので、どの await 点で
+    // 切られても、上流の副作用と後処理は揃って完結する。
+    let detached = async move {
+        let response = next.run(req).await;
+        let response = if is_grant_issue && response.status().is_success() {
+            audit_issued_grant(&state, response).await
+        } else {
+            response
+        };
+        if is_setup && response.status().is_success() {
+            revoke_bootstrap_grants(&state).await;
+        }
         response
     };
-    if is_setup && response.status().is_success() {
-        revoke_bootstrap_grants(&state).await;
+    match run_detached("localDesktop の発行・最初の管理者の作成", detached).await {
+        Ok(response) => response,
+        Err(refusal) => refusal,
     }
-    response
+}
+
+/// `work` を応答の future から切り離して最後まで走らせ、その結果を待つ（#600 の監査
+/// F1・F2・F4）。
+///
+/// hyper 1.x（`half_close: false`）は応答を待っている間に相手の FIN を読むと接続を閉じ、
+/// service の future（= handler）を捨てる。handler の中で `.await` をまたぐ副作用
+/// （listener の入れ替え・保存・失効・監査）は、そこで途中のまま捨てられる。`work` は
+/// `tokio::spawn` した別のタスクで走るので、呼び出し側（handler）が捨てられても
+/// `JoinHandle` の drop はタスクを止めず、最後まで完結する。応答の外形は変えない
+/// （handler は結果をそのまま返す）。
+///
+/// タスクが panic したら（`JoinError`）`500` を返す: 副作用がどこまで済んだかは分からない
+/// ので、呼び出し側には「状態を読み直す」ように伝え、理由はログに残す。
+pub(crate) async fn run_detached<F>(label: &str, work: F) -> Result<F::Output, Response>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(output) => Ok(output),
+        Err(err) => {
+            eprintln!("{label}: 処理のタスクが途中で終わりました: {err}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody::Other {
+                    message:
+                        "処理が途中で止まりました。状態を読み直してから、もう一度試してください"
+                            .to_string(),
+                }),
+            )
+                .into_response())
+        }
+    }
 }
 
 fn forbidden_with(message: &str) -> Response {
@@ -644,6 +692,19 @@ mod tests {
             reserved_accounts(["admin", "Local", "op", "localDesktop"]),
             vec!["Local".to_string(), "localDesktop".to_string()]
         );
+    }
+
+    /// #600 の監査: 切り離したタスクが panic したら `500` を返す（呼び出し側は panic
+    /// しない）。終わればその結果を返す。
+    #[tokio::test]
+    async fn run_detached_turns_a_panic_into_500() {
+        assert_eq!(run_detached("test", async { 7 }).await.ok(), Some(7));
+        let refusal = run_detached("test", async {
+            panic!("boom");
+        })
+        .await
+        .expect_err("panic を結果として返した");
+        assert_eq!(refusal.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
