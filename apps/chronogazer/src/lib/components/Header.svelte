@@ -49,6 +49,11 @@
 			>ログイン</button
 		>
 	{:else if !sessionStore.authDisabled}
+		{#if sessionStore.localDesktop}
+			<!-- #392 B2-2: サービスへのこの PC からの接続（`localDesktop`）。アカウントは
+			     無いが、ログアウトしてアカウントでログインし直せるようボタンは残す。 -->
+			<span class="session-label" title="この PC からの接続（ログインなし）">この PC</span>
+		{/if}
 		<button type="button" class="icon-button" onclick={logout}>ログアウト</button>
 	{/if}
 </header>
@@ -85,6 +90,14 @@
 		border-radius: var(--banto-radius);
 		cursor: pointer;
 		font-size: 0.875rem;
+	}
+
+	.session-label {
+		color: var(--banto-text-muted);
+		font-size: 0.8rem;
+		padding: 0.15rem 0.5rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
 	}
 
 	.icon-button:hover {

@@ -7,6 +7,7 @@
 	import { isNavigationSettled } from '#lib/banto/navigationSettled.svelte.js';
 	import { resolveAppPath } from '#lib/navigation.js';
 	import Header from '#lib/components/Header.svelte';
+	import SetupBanner from '#lib/components/SetupBanner.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
@@ -110,6 +111,7 @@
 	<Sidebar />
 	<div class="main">
 		<Header />
+		<SetupBanner />
 		<main>
 			{#if data.sessionGeneration === sessionController.snapshot.generation}
 				{#key data.sessionGeneration}

@@ -1,7 +1,8 @@
 // banto v3.0.0 の admin-template
 // `apps/admin-template/src/lib/session.svelte.ts` からコピー（v3 移行）。
-// chronogazer 固有の差: なし（I2b で閲覧公開を使うことになり、v3 移行時に
-// 削った `publicViewer` を戻した。2026-10-04 オーナー決定）。
+// chronogazer 固有の差: I2b で閲覧公開を使うことになり、v3 移行時に
+// 削った `publicViewer` を戻した（2026-10-04 オーナー決定）。#392 B2-2 で
+// この PC からの接続の `localDesktop` を足した。
 /**
  * Current session's identity/role (Svelte 5 runes), spec M10 RBAC.
  *
@@ -58,6 +59,19 @@ class SessionStore {
 	readonly publicViewer: boolean = $derived.by(() => {
 		const snapshot = getSessionController().snapshot;
 		return snapshot.status === 'active' && snapshot.kind === 'publicViewer';
+	});
+
+	/**
+	 * Is this the synthetic "this PC" session of the service host (#392 B2-2,
+	 * the `localDesktop` grant of `chronogazer-server`, design §3.2)? Marked by
+	 * the issuer's `identity.kind === 'localDesktop'` like `publicViewer`. It
+	 * has no account (no password to change - `AccountSection.svelte`), but it
+	 * keeps the logout button (`Header.svelte`): logging out goes to /login,
+	 * which offers「この PC として続ける」.
+	 */
+	readonly localDesktop: boolean = $derived.by(() => {
+		const snapshot = getSessionController().snapshot;
+		return snapshot.status === 'active' && snapshot.kind === 'localDesktop';
 	});
 }
 

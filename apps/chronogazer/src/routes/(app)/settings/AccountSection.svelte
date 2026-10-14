@@ -43,7 +43,10 @@
 	// ときは欄を残すので未保存の表示も残り、成功すれば欄を空にして消える。
 	// （Tauri 専用の自動ログインのフォームは上流と同じく対象外。）
 	const passwordFormShown = $derived(
-		!sessionStore.publicViewer && !sessionStore.authDisabled && !!changePassword
+		!sessionStore.publicViewer &&
+			!sessionStore.localDesktop &&
+			!sessionStore.authDisabled &&
+			!!changePassword
 	);
 	const passwordDirty = $derived(
 		passwordFormShown && (currentPassword !== '' || newPassword !== '' || newPasswordConfirm !== '')
@@ -174,6 +177,13 @@
 		     画面は閲覧公開のナビの許可リストに無く、ガードが監視へ移すので届かない
 		     はずだが、二重の守りとしてアカウントの UI を出さない。 -->
 		<p class="note">閲覧公開のセッションではアカウントの操作はできません。</p>
+	{:else if sessionStore.localDesktop}
+		<!-- #392 B2-2: この PC からの接続（`localDesktop`）には users の行が無い（上流は
+		     grant のセッションのパスワード変更を断る）。 -->
+		<p class="note">
+			この PC
+			からの接続（ログインなし）ではアカウントがないため、パスワード変更はできません。アカウントのパスワードを変えるときは、ログアウトしてそのアカウントでログインしてください。
+		</p>
 	{:else if sessionStore.authDisabled}
 		<p class="note">ログイン不要モードではアカウントがないため、パスワード変更はできません。</p>
 	{:else if changePassword}
