@@ -78,8 +78,8 @@ use windows_service::service_manager::{ServiceManager as WinScm, ServiceManagerA
 
 #[cfg(windows)]
 use crate::service_manager::{
-    describe_preshutdown_outcome, ensure_preshutdown_timeout, PRESHUTDOWN_TIMEOUT, RUN_SERVICE_ARG,
-    SERVICE_NAME,
+    ensure_preshutdown_timeout, preshutdown_report, PreshutdownReport, PRESHUTDOWN_TIMEOUT,
+    RUN_SERVICE_ARG, SERVICE_NAME,
 };
 
 /// `win_service.rs`のモジュール doc「サービス名・表示名・起動種別」参照。
@@ -241,14 +241,19 @@ pub fn uninstall() {
 }
 
 /// PRESHUTDOWN の待ち時間を希望値に揃える。起動種別と ACL は変えない。
-/// 失敗したら install 自体を失敗にする（黙って 10 秒の既定のままにしない）。
+/// 失敗しても install は失敗にしない（警告 1 行を標準エラー出力へ。OS の既定の
+/// 待ち時間で動く。新規登録の直後に「登録済みなのに失敗」にしない・
+/// インストーラが毎回呼ぶ既存登録の経路でアップグレードを止めないため）。
 #[cfg(windows)]
 fn apply_preshutdown_timeout() {
-    match ensure_preshutdown_timeout(SERVICE_NAME, PRESHUTDOWN_TIMEOUT) {
-        Ok(outcome) => println!("banto-hub: {}", describe_preshutdown_outcome(&outcome)),
-        Err(err) => fail(&format!(
-            "banto-hub: OS シャットダウンの待ち時間（PRESHUTDOWN）を設定できませんでした: {err}"
-        )),
+    // 失敗しても install は止めない（警告 1 行、終了コード 0）。
+    // `service-install` はこの後に Operators・ACL の付与を続ける。
+    match preshutdown_report(&ensure_preshutdown_timeout(
+        SERVICE_NAME,
+        PRESHUTDOWN_TIMEOUT,
+    )) {
+        PreshutdownReport::Applied(line) => println!("banto-hub: {line}"),
+        PreshutdownReport::Warning(line) => eprintln!("banto-hub: warn: {line}"),
     }
 }
 

@@ -72,9 +72,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_service_control::{
-    describe_preshutdown_outcome, ensure_preshutdown_timeout, record_first_stop, running_status,
+    ensure_preshutdown_timeout, preshutdown_report, record_first_stop, running_status,
     service_status_from_plan, stop_pending_status, stop_signal, stop_work_budget, stopped_status,
-    ScmControlKind, ServiceStatusPlan, StopNotice, StopSignal, PRESHUTDOWN_TIMEOUT,
+    PreshutdownReport, ScmControlKind, ServiceStatusPlan, StopNotice, StopPendingHeartbeat,
+    StopSignal, PRESHUTDOWN_TIMEOUT, STOP_PENDING_HEARTBEAT,
 };
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceErrorControl, ServiceExitCode, ServiceInfo,
@@ -109,15 +110,15 @@ pub const GRANT_SERVICE_ACL_ARG: &str = "grant-service-acl";
 pub const ELEV_EXE_NAME: &str = "banto-hub-elev.exe";
 
 /// PRESHUTDOWN の待ち時間を希望値に揃える。起動種別と ACL は変えない。
-/// 失敗したら install 自体を失敗にする。
+/// 失敗しても install は失敗にしない（警告 1 行、終了コード 0。OS の既定の
+/// 待ち時間で動く。[`banto_service_control::PreshutdownReport::Warning`]）。
 fn apply_preshutdown_timeout() {
-    match ensure_preshutdown_timeout(SERVICE_NAME, PRESHUTDOWN_TIMEOUT) {
-        Ok(outcome) => {
-            println!("banto-hub-sink: {}", describe_preshutdown_outcome(&outcome));
-        }
-        Err(err) => fail(&format!(
-            "banto-hub-sink: OS シャットダウンの待ち時間（PRESHUTDOWN）を設定できませんでした: {err}"
-        )),
+    match preshutdown_report(&ensure_preshutdown_timeout(
+        SERVICE_NAME,
+        PRESHUTDOWN_TIMEOUT,
+    )) {
+        PreshutdownReport::Applied(line) => println!("banto-hub-sink: {line}"),
+        PreshutdownReport::Warning(line) => eprintln!("banto-hub-sink: warn: {line}"),
     }
 }
 
@@ -361,6 +362,10 @@ fn run_service_body(_arguments: Vec<OsString>) {
     // ように共有する。Running を報告するより前にセットする。
     let status_slot: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
     let handler_status = status_slot.clone();
+    // 停止中に checkpoint を進めて StopPending を報告し続ける見張り。
+    // Stopped を報告する前に止める（下の `report_status`）。
+    let heartbeat_slot: Arc<Mutex<Option<StopPendingHeartbeat>>> = Arc::new(Mutex::new(None));
+    let handler_heartbeat = heartbeat_slot.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match scm_control_kind(&control_event) {
             ScmControlKind::Interrogate => ServiceControlHandlerResult::NoError,
@@ -373,6 +378,15 @@ fn run_service_body(_arguments: Vec<OsString>) {
                             if let Some(plan) = stop_pending_status(1, PRESHUTDOWN_TIMEOUT) {
                                 push_status(handle, &plan, ServiceExitCode::Win32(0));
                             }
+                            let handle = *handle;
+                            let heartbeat = StopPendingHeartbeat::start(
+                                STOP_PENDING_HEARTBEAT,
+                                PRESHUTDOWN_TIMEOUT,
+                                move |plan| push_status(&handle, &plan, ServiceExitCode::Win32(0)),
+                            );
+                            *handler_heartbeat
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(heartbeat);
                         }
                         handler_notify.notify_one();
                     }
@@ -395,6 +409,15 @@ fn run_service_body(_arguments: Vec<OsString>) {
     let _ = status_slot.set(status_handle);
 
     let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
+        if current_state == ServiceState::Stopped {
+            let heartbeat = heartbeat_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(heartbeat) = heartbeat {
+                heartbeat.stop();
+            }
+        }
         let plan = match current_state {
             // 稼働中は STOP と PRESHUTDOWN。SHUTDOWN は相互排他なので付けない。
             ServiceState::Running => running_status(),

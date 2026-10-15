@@ -54,7 +54,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::config::SidecarConfig;
-use crate::flush::{backoff_delay, build_pool, spawn_flusher, FlushOptions, FlusherHandle};
+use crate::flush::{
+    backoff_delay, build_pool, spawn_flusher, FlushOptions, FlusherHandle, FlusherStopOutcome,
+};
 use crate::group::{
     run_interval_producer, run_on_change_producer, GroupRegistry, GroupRuntime, GroupSetupError,
     SinkMode, DEFAULT_TABLE_RECHECK,
@@ -360,7 +362,8 @@ impl Engine {
         // 2. 変わった/消えた接続の flusher を止める。
         for id in &plan.connections_to_stop {
             if let Some(flusher) = self.flushers.remove(id) {
-                flusher.stop(FLUSHER_STOP_TIMEOUT).await;
+                // 設定反映の停止は打ち切りでも続ける（ログは stop が出す）。
+                let _ = flusher.stop(FLUSHER_STOP_TIMEOUT).await;
             }
         }
 
@@ -738,10 +741,12 @@ impl Engine {
                     FLUSHER_STOP_TIMEOUT,
                 ),
             };
-            if os_deadline.is_some() && limit.is_zero() {
+            // 期限切れで abort した・プールを閉じ切れなかったときも打ち切り
+            // （「完了しました」と出さない）。通常停止はログに出さないので
+            // 結果は使わない。
+            if flusher.stop(limit).await == FlusherStopOutcome::CutShort && os_deadline.is_some() {
                 cutoff = true;
             }
-            flusher.stop(limit).await;
         }
         // 5. 流しきれなかった行は dropped に計上する。
         let mut lost = 0usize;
@@ -1407,19 +1412,28 @@ mod tests {
         let (handle, _server) = crate::flush::flusher_on_blackhole_pool(10).await;
         engine.flushers.insert(10, handle);
 
+        // 期限は flusher の停止の上限（2 秒）より長くする。flusher は 2 秒で
+        // 打ち切られ、その後の状態 push は期限内に済む - 打ち切りの記録が
+        // flusher の結果だけから来ることを確かめるため（#589 のレビュー）。
         let started = StdInstant::now();
         tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(6),
             engine.shutdown(StopRequest::OsShutdown {
-                deadline: StdInstant::now() + Duration::from_millis(700),
+                deadline: StdInstant::now() + FLUSHER_STOP_TIMEOUT + Duration::from_secs(2),
             }),
         )
         .await
         .expect("応答しない DB のまま Stopped の手前まで進めなかった");
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(6));
         let text = std::fs::read_to_string(&log_path).unwrap_or_default();
         assert!(
             text.contains("停止時に 1 行を送信できませんでした") && text.contains("停止しました"),
+            "{text}"
+        );
+        // flusher を期限で打ち切ったので「完了」とは書かない。
+        assert!(
+            text.contains("OS シャットダウンの予算で停止を打ち切りました")
+                && !text.contains("OS シャットダウンの停止が完了しました"),
             "{text}"
         );
     }

@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use crate::windows_impl::map_win_err;
-#[cfg(windows)]
 use crate::ServiceManagerError;
 
 /// SCM が PRESHUTDOWN を送ってから、サービスが `Stopped` を報告するまで
@@ -171,6 +170,80 @@ pub fn stop_status_sequence(wait_hint: Duration) -> Option<(ServiceStatusPlan, S
     Some((pending, stopped_status()))
 }
 
+/// 停止処理の途中で StopPending を報告し直す間隔。`wait_hint`
+/// （[`PRESHUTDOWN_TIMEOUT`] の 30 秒）より十分短くする。
+pub const STOP_PENDING_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// 停止処理の途中、一定間隔で checkpoint を 1 つずつ進めて StopPending を
+/// 報告し続ける見張り（専用スレッド 1 本）。
+///
+/// SCM（`sc stop`・`Stop-Service`）は、StopPending の `wait_hint` の間に
+/// checkpoint が進まないと「応答しない」とみなす。checkpoint 1 のまま
+/// 30 秒を超える停止（flusher が多い・flush の設定が長い）でも、進んでいる
+/// 限り待ち時間切れを報告させないため。OS の PRESHUTDOWN の待ち時間は
+/// これでは延びない（[`PRESHUTDOWN_TIMEOUT`] が上限のまま）。
+///
+/// **Stopped を報告する前に必ず [`Self::stop`] する**（stop はスレッドの
+/// 終わりを待つので、Stopped の後に StopPending が届かない）。drop でも
+/// 同じく止まる。
+pub struct StopPendingHeartbeat {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StopPendingHeartbeat {
+    /// 最初の StopPending（checkpoint 1）は呼び出し側が報告済みとして、
+    /// `interval` ごとに checkpoint 2, 3, ... を `report` に渡す。
+    /// `wait_hint` が 0 なら何も報告しない見張りを返す。
+    pub fn start<F>(interval: Duration, wait_hint: Duration, report: F) -> Self
+    where
+        F: Fn(ServiceStatusPlan) + Send + 'static,
+    {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let mut checkpoint: u32 = 1;
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        checkpoint = checkpoint.saturating_add(1);
+                        match stop_pending_status(checkpoint, wait_hint) {
+                            Some(plan) => report(plan),
+                            None => return,
+                        }
+                    }
+                    // 停止の合図、または送り手が消えた。
+                    _ => return,
+                }
+            }
+        });
+        Self {
+            stop_tx: Some(stop_tx),
+            thread: Some(thread),
+        }
+    }
+
+    /// 見張りを止め、スレッドの終わりまで待つ。この後に StopPending は
+    /// 報告されない。
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for StopPendingHeartbeat {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// 登録済みサービスの PRESHUTDOWN 待ち時間を、希望値と比べた結果。
 /// 起動種別と ACL の変更は含まない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +296,33 @@ pub fn describe_preshutdown_outcome(outcome: &PreshutdownEnsureOutcome) -> Strin
             "OS シャットダウンの待ち時間（PRESHUTDOWN）を {} ミリ秒に設定し、読み戻して確認しました（以前の値は読めませんでした。起動種別と ACL は変更していません）",
             outcome.desired_ms
         ),
+    }
+}
+
+/// install が PRESHUTDOWN の待ち時間を揃えた結果を、利用者に出す 1 行に
+/// する（[`preshutdown_report`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreshutdownReport {
+    /// 揃えて読み戻しまで確認した。標準出力に出す。
+    Applied(String),
+    /// 揃えられなかった。**install は失敗にしない**: 標準エラー出力（と
+    /// ログ）に理由を 1 行残し、終了コードは 0 のまま。サービスは OS の
+    /// 既定の待ち時間で動く。新規登録の直後に失敗して「登録済みなのに
+    /// 失敗」にしない・インストーラが毎回呼ぶ既存登録の経路でアップグレードを
+    /// 止めないため（#589 のオーナーレビュー）。
+    Warning(String),
+}
+
+/// [`ensure_preshutdown_timeout`] の結果を [`PreshutdownReport`] にする。
+/// 失敗は常に [`PreshutdownReport::Warning`]（呼び出し側は終了しない）。
+pub fn preshutdown_report(
+    result: &Result<PreshutdownEnsureOutcome, ServiceManagerError>,
+) -> PreshutdownReport {
+    match result {
+        Ok(outcome) => PreshutdownReport::Applied(describe_preshutdown_outcome(outcome)),
+        Err(err) => PreshutdownReport::Warning(format!(
+            "OS シャットダウンの待ち時間（PRESHUTDOWN）を設定できませんでした（サービスの登録はそのままで、OS の既定の待ち時間で動きます。もう一度 install を実行すると設定し直します）: {err}"
+        )),
     }
 }
 
@@ -363,6 +463,69 @@ pub fn service_status_from_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 停止の見張りは checkpoint を 2 から 1 つずつ進め、stop の後は
+    /// 何も報告しない（Stopped の後に StopPending を出さない）。
+    #[test]
+    fn heartbeat_advances_the_checkpoint_and_goes_quiet_after_stop() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let heartbeat = StopPendingHeartbeat::start(
+            Duration::from_millis(20),
+            PRESHUTDOWN_TIMEOUT,
+            move |plan| sink.lock().unwrap().push(plan),
+        );
+        let started = Instant::now();
+        while seen.lock().unwrap().len() < 3 {
+            assert!(started.elapsed() < Duration::from_secs(5), "報告が来ない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        heartbeat.stop();
+        let after_stop = seen.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(80));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), after_stop, "stop の後に報告した");
+        for (index, plan) in seen.iter().enumerate() {
+            assert_eq!(plan.phase, ServicePhase::StopPending);
+            assert_eq!(plan.checkpoint, index as u32 + 2);
+            assert_eq!(plan.wait_hint, PRESHUTDOWN_TIMEOUT);
+            assert!(!plan.accept_stop && !plan.accept_preshutdown);
+        }
+    }
+
+    /// PRESHUTDOWN を設定できなくても install は失敗にしない: どの失敗も
+    /// 警告で、理由と「登録はそのまま・OS の既定で動く」を含む。
+    #[test]
+    fn a_preshutdown_failure_is_a_warning_not_an_install_failure() {
+        for err in [
+            ServiceManagerError::AccessDenied,
+            ServiceManagerError::NotFound("Svc".to_owned()),
+            ServiceManagerError::Other("readback mismatch".to_owned()),
+        ] {
+            let reason = err.to_string();
+            match preshutdown_report(&Err(err)) {
+                PreshutdownReport::Warning(line) => {
+                    assert!(line.contains(&reason), "{line}");
+                    assert!(line.contains("OS の既定の待ち時間で動きます"), "{line}");
+                    assert!(!line.contains('\n'), "1 行に収める: {line}");
+                }
+                PreshutdownReport::Applied(line) => panic!("失敗が成功扱い: {line}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_applied_preshutdown_reports_the_readback() {
+        let outcome = PreshutdownEnsureOutcome {
+            action: PreshutdownConfigAction::AlreadySet,
+            desired_ms: 30_000,
+            readback_ms: 30_000,
+        };
+        assert_eq!(
+            preshutdown_report(&Ok(outcome)),
+            PreshutdownReport::Applied(describe_preshutdown_outcome(&outcome))
+        );
+    }
 
     #[test]
     fn stop_and_preshutdown_enter_the_graceful_path() {

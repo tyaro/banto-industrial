@@ -123,6 +123,17 @@ pub fn build_pool(connection: &SinkConfigConnection) -> Result<PgPool, String> {
         .connect_lazy_with(options))
 }
 
+/// [`FlusherHandle::stop`] の結果。OS シャットダウンの停止ログで、
+/// 「完了」と「打ち切り」を分けるために使う（#589）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum FlusherStopOutcome {
+    /// タスクが期限内に終わり、プールも閉じた。
+    Completed,
+    /// 期限内に終わらず abort した、またはプールを閉じ切れなかった。
+    CutShort,
+}
+
 /// 走っている flusher 1 本への操作口。
 pub struct FlusherHandle {
     pub connection_id: i64,
@@ -160,7 +171,11 @@ impl FlusherHandle {
     /// この future が途中で drop されたとき（運転ループが停止合図で設定
     /// 反映の `stop` を打ち切ったとき）は [`Drop`] がタスクを abort する。
     /// `JoinHandle` の drop は detach するだけで、abort しない。
-    pub async fn stop(mut self, timeout: Duration) {
+    ///
+    /// 期限内に join とプールの close が両方済んだら
+    /// [`FlusherStopOutcome::Completed`]、どちらかを打ち切ったら
+    /// [`FlusherStopOutcome::CutShort`]。
+    pub async fn stop(mut self, timeout: Duration) -> FlusherStopOutcome {
         self.stop.notify_one();
         let deadline = tokio::time::Instant::now() + timeout;
 
@@ -193,6 +208,11 @@ impl FlusherHandle {
                 self.connection_id,
                 timeout.as_secs_f64()
             ));
+        }
+        if joined && closed {
+            FlusherStopOutcome::Completed
+        } else {
+            FlusherStopOutcome::CutShort
         }
     }
 }
@@ -667,8 +687,13 @@ mod tests {
         };
 
         let start = tokio::time::Instant::now();
-        handle.stop(Duration::from_millis(50)).await;
+        let outcome = handle.stop(Duration::from_millis(50)).await;
         let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            FlusherStopOutcome::CutShort,
+            "abort したら打ち切り"
+        );
 
         // タイムアウト時間は大幅に超えていないはず（abort + await は速い）。
         assert!(
@@ -723,10 +748,15 @@ mod tests {
         let (handle, _server) = flusher_on_blackhole_pool(7).await;
         let budget = Duration::from_millis(400);
         let started = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(2), handle.stop(budget))
+        let outcome = tokio::time::timeout(Duration::from_secs(2), handle.stop(budget))
             .await
             .expect("応答しない DB の pool.close() が stop の期限の外で待っている");
         let elapsed = started.elapsed();
+        assert_eq!(
+            outcome,
+            FlusherStopOutcome::CutShort,
+            "プールを閉じ切れなかったら打ち切り"
+        );
         assert!(
             elapsed >= Duration::from_millis(250),
             "ping が固まっているのに close が期限を待たずに戻った: {elapsed:?}"

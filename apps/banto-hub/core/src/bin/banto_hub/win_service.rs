@@ -69,8 +69,8 @@ use banto_hub_core::runtime::{HubRuntime, HubStartError};
 // 変更不要）。
 use banto_hub_core::service_manager::{
     record_first_stop, running_status, service_status_from_plan, stop_pending_status, stop_signal,
-    stop_work_budget, stopped_status, ScmControlKind, ServiceStatusPlan, StopNotice, StopSignal,
-    PRESHUTDOWN_TIMEOUT,
+    stop_work_budget, stopped_status, ScmControlKind, ServiceStatusPlan, StopNotice,
+    StopPendingHeartbeat, StopSignal, PRESHUTDOWN_TIMEOUT, STOP_PENDING_HEARTBEAT,
 };
 pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 
@@ -354,6 +354,10 @@ fn run_service_body(_arguments: Vec<OsString>) {
     // ように共有する。Running を報告するより前にセットする。
     let status_slot: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
     let handler_status = status_slot.clone();
+    // 停止中に checkpoint を進めて StopPending を報告し続ける見張り。
+    // Stopped を報告する前に止める（下の `report_status`）。
+    let heartbeat_slot: Arc<Mutex<Option<StopPendingHeartbeat>>> = Arc::new(Mutex::new(None));
+    let handler_heartbeat = heartbeat_slot.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match scm_control_kind(&control_event) {
             ScmControlKind::Interrogate => ServiceControlHandlerResult::NoError,
@@ -366,6 +370,15 @@ fn run_service_body(_arguments: Vec<OsString>) {
                             if let Some(plan) = stop_pending_status(1, PRESHUTDOWN_TIMEOUT) {
                                 push_status(handle, &plan, ServiceExitCode::Win32(0));
                             }
+                            let handle = *handle;
+                            let heartbeat = StopPendingHeartbeat::start(
+                                STOP_PENDING_HEARTBEAT,
+                                PRESHUTDOWN_TIMEOUT,
+                                move |plan| push_status(&handle, &plan, ServiceExitCode::Win32(0)),
+                            );
+                            *handler_heartbeat
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(heartbeat);
                         }
                         handler_notify.notify_one();
                     }
@@ -392,6 +405,16 @@ fn run_service_body(_arguments: Vec<OsString>) {
     // 「なぜ必要か」「なぜ終了コードの上書きが危険か」を書いた）。
     let stopped_gate = StoppedGate::default();
     let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
+        // Stopped の前に見張りを止める（Stopped の後に StopPending を出さない）。
+        if current_state == ServiceState::Stopped {
+            let heartbeat = heartbeat_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(heartbeat) = heartbeat {
+                heartbeat.stop();
+            }
+        }
         // 2回目以降（＝既に`Stopped`を報告済み）は SCM を呼ばずに黙って
         // 戻る。SCM を呼ぶと最初に報告した非0終了コードを Win32(0) で
         // 上書きしかねない上、実際には API エラーになって紛らわしい
