@@ -55,8 +55,9 @@
 //! 判断の略号: `go` = 許す（札を出す・進む）、`ok` = 反映した、`ign` = 何もしない、
 //! `exit`/`busy`/`stale`/`nofb`/`rec`/`conf`/`quit`/`qing`/`rbusy` = 断る（終了処理中・
 //! 別の札がある・観測が古い・Fallback でない・復旧中・確認中・終了処理中（トレイ）・
-//! 終了が確定している・対処の窓が処理中）、`eng` = 断る（エンジンが置かれている。注 2）、`obs`/`skip`/`stop` = 見張りの観測・今回は
-//! 見ない・見張りを終える、`ask`/`noask` = 確認を出す／出さずに同意として進む（Fallback）、
+//! 終了が確定している・対処の窓が処理中）、`eng` = 断る（エンジンが置かれている。
+//! 注 2）、`obs`/`skip`/`stop` = 見張りの観測・今回は見ない・見張りを終える、
+//! `ask`/`noask` = 確認を出す／出さずに同意として進む（Fallback）、
 //! `proceed`/`again`/`cancel` = 確認の答え（終了へ進む・収集中の文言で確かめ直す・
 //! 取り消し）、`w60`/`w5`/`nowait` = 移り変わりの終わりを 60 秒・5 秒待つ・待たない。
 //!
@@ -837,8 +838,10 @@ impl Lifecycle {
     /// ロックを握ったまま呼んだ外の処理からの再入を検知して panic する（モジュール doc
     /// 「ロックと待ち」。そのまま取りに行くと止まる）。
     fn lock(&self) -> MutexGuard<'_, LifecycleState> {
+        // 印（`IN_LOCKED_CALLBACK`）がデバッグビルドにしか無いので、`cfg` で囲んで普通の
+        // `assert!` にする（`debug_assert!` だと release でも式の型検査で印が要る）。
         #[cfg(debug_assertions)]
-        debug_assert!(
+        assert!(
             !IN_LOCKED_CALLBACK.with(std::cell::Cell::get),
             "lifecycle の再入: ロックを握ったまま呼んだ install・QuitAdmission の中から lifecycle を呼んだ"
         );
