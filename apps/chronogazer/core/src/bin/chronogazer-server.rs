@@ -37,6 +37,12 @@
 //!    案内）より**先に**動いていることを公開する（close 系のハンドラーが起動の
 //!    終わりを待ちきれずに後始末を飛ばさないため。削除はログのロックの外・別の
 //!    スレッド。#598 の Copilot の指摘）。
+//!
+//!    1.・3.〜5.（エンジンの開始まで）の順序は `chronogazer_server/start.rs`
+//!    （`start::start_server`）に 1 か所で置き、B3-2 の Windows サービスと共有する
+//!    （#392 B3-2a、挙動は不変）。コンソールは host の種類 `server` と、ACL の利用者
+//!    としてこのプロセスの利用者を渡し、止める合図・ログの書き出し・失敗の公開は
+//!    [`StopController`] が差し込む（`start::StartHooks`）。
 //! 6. 止める合図を待ち、後始末（`run\endpoint.json` を消す → エンジンの終了）を
 //!    `banto_exit_once::ExitCleanupOnce` で 1 回だけ行う。Ctrl-C・Ctrl-Break は
 //!    15 秒、コンソールのウィンドウを閉じた（`CTRL_CLOSE_EVENT`）・ログオフ・
@@ -64,18 +70,21 @@
 #[cfg(windows)]
 #[path = "chronogazer_server/console.rs"]
 mod console;
+#[path = "chronogazer_server/start.rs"]
+mod start;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use banto_exit_once::{ExitCleanupOnce, ExitCleanupReport};
+use chronogazer_core::instance_lock::ChronoGazerHost;
 use chronogazer_core::local_grant::LocalGrantStart;
-use chronogazer_core::paths::{resolve_data_root_from_env, DataLayout};
+use chronogazer_core::paths::{DataLayout, DirAccessSource};
 use chronogazer_core::server_host::{
     self, ServerLog, ServerShutdownSummary, StartedServer, CLOSE_MARGIN, CLOSE_WAIT,
     EXIT_START_FAILED, EXIT_USAGE, INTERRUPT_BUDGET, SERVER_LABEL,
 };
+use start::{StartHooks, StartSpec, Started};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -520,13 +529,11 @@ fn close_and_exit(controller: &StopController, origin: StopOrigin) -> ! {
 }
 
 fn run(options: CliOptions) -> i32 {
-    // 1. ルート。
-    let root = resolve_data_root_from_env();
-    if let Err(message) = server_host::validate_root(&root) {
-        eprintln!("{SERVER_LABEL}: {message}");
-        return EXIT_START_FAILED;
-    }
-    let layout = DataLayout::new(root);
+    // 1. ルート（起動の順序は `chronogazer_server/start.rs`。サービスと共有）。
+    let layout = match start::resolve_layout() {
+        Ok(layout) => layout,
+        Err(code) => return code,
+    };
 
     // 2. 止める合図（ルートの下に何も作らない。登録できなければ起動しない）。
     let controller = Arc::new(StopController::new());
@@ -548,88 +555,21 @@ fn run(options: CliOptions) -> i32 {
         }
     };
 
-    // 3. A1 の排他だけ（ルートの下に作るのはここから。排他を取れなければ何も
-    // 作らない - ログもまだ開いていないので、理由はコンソールだけに出す）。
-    let locked = match server_host::lock(layout.clone()) {
-        Ok(locked) => locked,
-        Err(failure) => return report_start_failure(&controller, &failure),
-    };
-
-    // 4. ログ（排他を取った後・リストア予約の適用と DB の初期化の前。#598 の
-    // オーナーレビュー P2: DB を開けない理由と対処、リストア予約の警告を日次ログに
-    // 残す。Windows だけ - 標準ハンドルの向け直しは Windows の API）。
-    let (log, flush, record) = match open_log(&layout) {
-        Ok(opened) => opened,
-        Err(reason) => {
-            // 日次ログはこの bin の唯一の永続の診断（サービスではコンソールも無い）。
-            // 向け直せないまま動かすと起動・停止・失敗の記録が残らないので、起動を
-            // 止める（Ctrl のハンドラーの登録の失敗と同じ扱い。#598 の Copilot の指摘）。
-            // 理由はログファイルへ直接（`open_log` が書いた）とコンソールに出す。
-            eprintln!("{SERVER_LABEL}: {reason}");
-            return finish_start_failure(&controller, EXIT_START_FAILED);
-        }
-    };
-    controller.set_flush(flush);
-    if let Some(record) = record {
-        controller.set_record(record);
-    }
-    println!(
-        "{SERVER_LABEL}: 起動します（版 {}、pid {}）",
-        env!("CARGO_PKG_VERSION"),
-        std::process::id()
-    );
-    println!(
-        "{SERVER_LABEL}: データのルート: {}",
-        layout.root().display()
-    );
-    match &log {
-        Some(log) => println!(
-            "{SERVER_LABEL}: ログ: {}",
-            log.lock()
-                .map(|log| log.current_path())
-                .unwrap_or_else(|_| PathBuf::from("?"))
-                .display()
-        ),
-        None => println!("{SERVER_LABEL}: ログファイルには書きません（コンソールだけ）"),
-    }
-
-    // 起動の段の間で止める合図を見る（#598 監査 F3）: 合図の後に DB の初期化・
-    // 待ち受け・収集の開始・`endpoint.json` まで進めない。段の途中（DB を開いている
-    // 最中など）は止めない（DB の操作を途中で落とさない。checklist §5）。
-    if let Some(origin) = controller.stop_requested() {
-        return abort_start(&controller, origin);
-    }
-
-    // 5. リストア予約の適用 → DB の初期化（失敗はログにも残る）。
-    #[cfg(debug_assertions)]
-    test_slow_open(&controller);
-    let opened = match runtime.block_on(locked.open()) {
-        Ok(opened) => opened,
-        Err(failure) => return report_start_failure(&controller, &failure),
-    };
-
-    #[cfg(debug_assertions)]
-    if let Err(reason) = runtime.block_on(apply_test_port(&opened)) {
-        eprintln!("{SERVER_LABEL}: {reason}");
-        runtime.block_on(opened.close());
-        return finish_start_failure(&controller, EXIT_START_FAILED);
-    }
-
-    // 6. Hub のキーの保存先（排他を取った後）とエンジン。
-    let (key_store, key_store_error) = server_host::open_key_store(&layout);
-    if let Some(reason) = key_store_error {
-        eprintln!(
-            "{SERVER_LABEL}: Hub の API キーの保存先（{}）を使えません。Hub 経由の収集は動きません（PLC の収集は続けます）: {reason}",
-            layout.hub_keys_dir().display()
-        );
-    }
-    if let Some(origin) = controller.stop_requested() {
-        runtime.block_on(opened.close());
-        return abort_start(&controller, origin);
-    }
-    let server = match runtime.block_on(opened.start(key_store)) {
-        Ok(server) => Arc::new(server),
-        Err(failure) => return report_start_failure(&controller, &failure),
+    // 3.〜6. A1 の排他 → ログ → リストア予約の適用と DB の初期化 → Hub のキーの
+    // 保存先 → エンジン（`start::start_server`。段の間の止める合図と失敗の報告の
+    // 順序もそこ）。コンソールは host の種類 `server`、ACL の利用者はこのプロセスの
+    // 利用者。
+    let Started { server, log } = match start::start_server(
+        &runtime,
+        StartSpec {
+            layout: &layout,
+            host: ChronoGazerHost::Server,
+            access: &DirAccessSource::CurrentProcess,
+        },
+        controller.as_ref(),
+    ) {
+        Ok(started) => started,
+        Err(code) => return code,
     };
     // 収集と待ち受けを始めた後は、上限の無い処理（ログの古いファイルの削除、
     // ログへ流れる案内の出力）より**先に**動いていることを公開する（`set_ready`。
@@ -706,22 +646,31 @@ fn run(options: CliOptions) -> i32 {
     code
 }
 
-/// 起動の失敗を出して終了コードを返す（ログを開いていればログにも）。
-fn report_start_failure(controller: &StopController, failure: &server_host::StartFailure) -> i32 {
-    eprintln!("{SERVER_LABEL}: 起動できませんでした: {}", failure.message);
-    for line in &failure.guidance {
-        eprintln!("{SERVER_LABEL}:   {line}");
+/// コンソールの起動の順序の差し込み（`start::start_server`）。
+impl StartHooks for StopController {
+    fn stop_requested(&self) -> Option<&'static str> {
+        StopController::stop_requested(self).map(StopOrigin::label)
     }
-    finish_start_failure(controller, failure.exit_code())
-}
 
-/// 起動の途中で止める合図を受けた（#598 監査 F3）: 起動を中止して終了コード 3。
-fn abort_start(controller: &StopController, origin: StopOrigin) -> i32 {
-    eprintln!(
-        "{SERVER_LABEL}: 起動の途中で停止の合図（{}）を受けたため、起動を中止します",
-        origin.label()
-    );
-    finish_start_failure(controller, EXIT_START_FAILED)
+    fn open_log(&self, layout: &DataLayout) -> Result<OpenedLog, String> {
+        open_log(layout)
+    }
+
+    fn log_opened(&self, flush: Flush, record: Option<LineSink>) {
+        self.set_flush(flush);
+        if let Some(record) = record {
+            self.set_record(record);
+        }
+    }
+
+    fn finish_start_failure(&self, code: i32) -> i32 {
+        finish_start_failure(self, code)
+    }
+
+    fn before_open(&self) {
+        #[cfg(debug_assertions)]
+        test_slow_open(self);
+    }
 }
 
 /// 起動の失敗・中止の終わり: 終了の行を出し、**ログを書き出し終えてから**、起動に
@@ -1246,7 +1195,10 @@ mod tests {
             message: "テスト".to_string(),
             guidance: Vec::new(),
         };
-        assert_eq!(report_start_failure(&controller, &failure), 3);
+        assert_eq!(
+            start::report_start_failure(controller.as_ref(), &failure),
+            3
+        );
         let (result, flushed_when_woken) = waiter.join().unwrap();
         assert!(matches!(result, Err(NoEngine::StartFailed { code: 3 })));
         assert!(

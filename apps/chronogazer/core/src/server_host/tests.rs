@@ -435,6 +435,7 @@ fn options(root: &Path) -> ServerOptions {
     ServerOptions {
         layout: DataLayout::new(root),
         key_store: Arc::new(MemoryKeyStore::new()),
+        host: ChronoGazerHost::Server,
     }
 }
 
@@ -481,6 +482,49 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     assert_eq!(summary.exit_code(), EXIT_OK);
     assert!(!started.endpoint_file().exists());
     assert!(std::net::TcpStream::connect(addr).is_err());
+}
+
+/// #392 B3-2a: 渡した host の種類（サービス）が、A1 の診断ファイル・`GET /api/host`
+/// の `hostKind`・`run\endpoint.json` の `host_kind` のすべてに届く（コンソールの
+/// `server` の固定ではない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_given_host_kind_reaches_the_lock_the_host_api_and_the_endpoint() {
+    let dir = TempDir::new();
+    prepare_root(dir.path(), &[]).await;
+    let layout = DataLayout::new(dir.path());
+    let locked = lock(
+        layout.clone(),
+        ChronoGazerHost::Service,
+        &DirAccessSource::CurrentProcess,
+    )
+    .expect("lock");
+
+    // A1 の診断ファイル: 2 人目は持ち主を「service」と読む。
+    match crate::instance_lock::acquire_for_db(&layout.db_path(), ChronoGazerHost::Desktop) {
+        Err(crate::instance_lock::InstanceLockFailure::AlreadyRunning { owner, .. }) => {
+            let owner = owner.expect("診断ファイルを読める");
+            assert_eq!(owner.host_kind, "service");
+            assert_eq!(owner.pid, std::process::id());
+        }
+        Err(other) => panic!("AlreadyRunning のはず: {other}"),
+        Ok(_) => panic!("同じ DB の排他を 2 つ取れた"),
+    }
+
+    let opened = locked.open().await.expect("open");
+    let started = opened
+        .start(Arc::new(MemoryKeyStore::new()))
+        .await
+        .expect("start");
+    let addr = started.engine().loopback_addr().await.expect("loopback");
+    let endpoint = crate::endpoint::read_endpoint(started.endpoint_file()).expect("endpoint.json");
+    assert_eq!(endpoint.host_kind, "service");
+    let (status, host) = get_json(&format!("http://{addr}/api/host")).await;
+    assert_eq!(status, 200);
+    assert_eq!(host["hostKind"], "service");
+    assert_eq!(
+        started.shutdown(Duration::from_secs(15)).await.exit_code(),
+        EXIT_OK
+    );
 }
 
 /// この PC の非 loopback の IPv4（LAN 側）。無い環境では `None`。

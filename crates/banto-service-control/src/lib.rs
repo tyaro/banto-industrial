@@ -30,6 +30,11 @@
 //!   コードは製品が持つ）。既に登録済みなら起動種別・実行ファイル・ACL は
 //!   変えず、OS シャットダウンの待ち時間（`shutdown` の
 //!   [`ensure_preshutdown_timeout`]、#589）だけを揃える。
+//! - **サービスごとの設定値**（#392 B3-2a）: `parameters`
+//!   （`write_service_parameter`・`read_service_parameter`、Windows だけ）が
+//!   `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters` の REG_SZ を
+//!   読み書きする。登録時に記録してサービス本体が起動時に読む値（ChronoGazer の
+//!   インストール利用者の SID）のため。値の名前と意味は製品が持つ。
 //!
 //! ## 履歴
 //!
@@ -58,9 +63,14 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 mod install;
+mod parameters;
 mod runner;
 mod shutdown;
 pub use install::*;
+// 公開しているのは Windows だけの関数（非 Windows では空の再公開になり、
+// `unused_imports` で clippy が落ちる）。
+#[cfg(windows)]
+pub use parameters::*;
 pub use runner::*;
 pub use shutdown::*;
 

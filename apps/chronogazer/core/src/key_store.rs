@@ -7,6 +7,10 @@
 //! `desktop_key_store`。#332 から B2-4a までの OS キーリングのキーは移さない）。
 //! `crate::server_host` は再公開するので、既存の `server_host::open_key_store`・
 //! `server_host::FailedKeyStore` の参照はそのまま動く。
+//!
+//! B3-2a で、ACL の利用者の欄を呼び出し側が決める [`open_key_store_with`] を足した
+//! （サービスがインストール利用者の SID を渡す。[`open_key_store`] は今のプロセスの
+//! 利用者を渡す薄い包みで、挙動は同じ）。
 
 use std::sync::Arc;
 
@@ -72,7 +76,37 @@ impl KeyStore for FailedKeyStore {
 /// 先に別の利用者が作ったディレクトリ（ACL が違う）は使わない（`AclMismatch`、
 /// 自動では直さない - B1-3 の決定）。B3-3 の昇格ヘルパが ACL を整える。
 pub fn open_key_store(layout: &DataLayout) -> (Arc<dyn KeyStore>, Option<String>) {
-    match open_key_store_impl(layout) {
+    into_key_store(open_key_store_impl(layout))
+}
+
+/// [`open_key_store`] の、ディレクトリの ACL の利用者の欄を呼び出し側が決める形
+/// （#392 B3-2a）。サービス（LocalSystem）は登録時に記録したインストール利用者の
+/// SID を渡す（今のプロセスの利用者は SYSTEM で、`service_only` で開くとデスクトップ
+/// が作った 3 つの ACE の `hub-keys` が `AclMismatch` になるため。B2-4a の申し送り
+/// (3)）。開けないときの扱い（[`FailedKeyStore`] と理由）は [`open_key_store`] と同じ。
+pub fn open_key_store_with(
+    layout: &DataLayout,
+    access: banto_secret_store::DirAccess,
+) -> (Arc<dyn KeyStore>, Option<String>) {
+    into_key_store(open_key_store_with_impl(layout, access))
+}
+
+/// [`crate::paths::DirAccessSource`] の決め方で開く（今のプロセスの利用者なら
+/// [`open_key_store`]、指定があれば [`open_key_store_with`]）。
+pub fn open_key_store_from(
+    layout: &DataLayout,
+    access: &crate::paths::DirAccessSource,
+) -> (Arc<dyn KeyStore>, Option<String>) {
+    match access {
+        crate::paths::DirAccessSource::CurrentProcess => open_key_store(layout),
+        crate::paths::DirAccessSource::Given(access) => open_key_store_with(layout, access.clone()),
+    }
+}
+
+fn into_key_store(
+    opened: Result<Arc<dyn KeyStore>, String>,
+) -> (Arc<dyn KeyStore>, Option<String>) {
+    match opened {
         Ok(store) => (store, None),
         Err(reason) => (Arc::new(FailedKeyStore::new(reason.clone())), Some(reason)),
     }
@@ -80,11 +114,19 @@ pub fn open_key_store(layout: &DataLayout) -> (Arc<dyn KeyStore>, Option<String>
 
 #[cfg(windows)]
 fn open_key_store_impl(layout: &DataLayout) -> Result<Arc<dyn KeyStore>, String> {
-    use banto_secret_store::{DpapiMachine, FileSecretStore};
-
     // 今のプロセスの利用者に「変更」（LocalSystem なら付けない）。データのルートを
     // 作るときと同じ判断（`crate::paths::current_process_dir_access`）。
     let access = crate::paths::current_process_dir_access().map_err(|err| err.to_string())?;
+    open_key_store_with_impl(layout, access)
+}
+
+#[cfg(windows)]
+fn open_key_store_with_impl(
+    layout: &DataLayout,
+    access: banto_secret_store::DirAccess,
+) -> Result<Arc<dyn KeyStore>, String> {
+    use banto_secret_store::{DpapiMachine, FileSecretStore};
+
     FileSecretStore::open(layout.hub_keys_dir(), access, DpapiMachine)
         .map(|store| Arc::new(store) as Arc<dyn KeyStore>)
         .map_err(|err| err.to_string())
@@ -92,8 +134,19 @@ fn open_key_store_impl(layout: &DataLayout) -> Result<Arc<dyn KeyStore>, String>
 
 #[cfg(not(windows))]
 fn open_key_store_impl(_layout: &DataLayout) -> Result<Arc<dyn KeyStore>, String> {
-    Err("この OS では Hub の API キーを保存できません（DPAPI は Windows だけ）".to_string())
+    Err(NO_DPAPI.to_string())
 }
+
+#[cfg(not(windows))]
+fn open_key_store_with_impl(
+    _layout: &DataLayout,
+    _access: banto_secret_store::DirAccess,
+) -> Result<Arc<dyn KeyStore>, String> {
+    Err(NO_DPAPI.to_string())
+}
+
+#[cfg(not(windows))]
+const NO_DPAPI: &str = "この OS では Hub の API キーを保存できません（DPAPI は Windows だけ）";
 
 #[cfg(test)]
 mod tests {
@@ -111,6 +164,41 @@ mod tests {
             assert!(err.to_string().contains("ACL が違います"), "{err}");
             assert!(!err.to_string().contains("secret-value"));
         }
+    }
+
+    /// #392 B3-2a: 利用者の欄を渡す形は、渡した指定で保存先を作る。利用者の SID を
+    /// 渡せばその SID に「変更」が付いて使え、グループの SID なら作らずに理由を返す
+    /// （渡した指定が使われている証拠。今のプロセスの利用者なら開ける）。
+    #[cfg(windows)]
+    #[test]
+    fn open_key_store_with_uses_the_given_access() {
+        use banto_secret_store::acl::{current_user_sid, read_dir_dacl, MODIFY_ACCESS_MASK};
+        use banto_secret_store::{DirAccess, InstallUserSid};
+
+        let dir = tempfile::tempdir().unwrap();
+        let me = current_user_sid().unwrap();
+
+        let layout = DataLayout::new(dir.path().join("user"));
+        let (store, reason) =
+            open_key_store_with(&layout, DirAccess::with_install_user(me.clone()));
+        assert_eq!(reason, None);
+        store.set("hub-a", "secret-value").unwrap();
+        assert_eq!(store.get("hub-a").unwrap().as_deref(), Some("secret-value"));
+        let dacl = read_dir_dacl(&layout.hub_keys_dir()).unwrap();
+        assert!(dacl
+            .aces
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|ace| ace.sid == me.as_str() && ace.mask == MODIFY_ACCESS_MASK));
+
+        let machine = me.as_str().rsplit_once('-').unwrap().0;
+        let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
+        let layout = DataLayout::new(dir.path().join("group"));
+        let (store, reason) = open_key_store_with(&layout, DirAccess::with_install_user(group));
+        assert!(reason.is_some(), "グループの SID で開けた");
+        assert!(store.get("hub-a").is_err(), "fail closed");
+        assert!(!layout.hub_keys_dir().exists(), "断ったときは作らない");
     }
 
     /// `server_host` からの再公開で、B1-5 の参照がそのまま使える。

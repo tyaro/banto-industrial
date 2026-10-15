@@ -52,6 +52,8 @@
 //! [`current_process_dir_access`]（LocalSystem で動いていれば付けない。`crate::key_store`
 //! と同じ判断）。**既にあるルートの ACL には触らない**（読まない・確かめない・
 //! 直さない。前の版・管理者・インストーラが作ったものはそのまま使う）。
+//! 利用者の欄を呼び出し側が決める形は [`create_root_dir_with`]（#392 B3-2a。
+//! サービスはインストール利用者の SID を渡す）。
 //! 非 Windows は `create_dir_all`。使うのは `chronogazer-server` の起動
 //! （`crate::server_host::lock`）と、B2-4b からのデスクトップ host（`src-tauri` の
 //! `startup::LaunchPaths::prepare`）。
@@ -214,26 +216,78 @@ pub fn has_dot_segment(path: &Path) -> bool {
 
 /// ルートを、まだ無ければ作る（モジュール doc「ルートの作成」）。今作ったら `true`、
 /// 既にあれば何もせず `false`。失敗の理由は文言で返す（秘密は含まない）。
+/// 利用者の欄は今のプロセスの利用者（[`current_process_dir_access`]）。指定するときは
+/// [`create_root_dir_with`]。
 pub fn create_root_dir(layout: &DataLayout) -> Result<bool, String> {
-    let root = layout.root();
     // 既にあれば ACL の指定（利用者の SID）も求めない（既存のルートを使えなく
     // しない）。
+    if layout.root().is_dir() {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    let access = current_process_dir_access().map_err(|err| err.to_string())?;
+    // Windows 以外は ACL を付けない（`create_dir_all`）。
+    #[cfg(not(windows))]
+    let access = banto_secret_store::DirAccess::service_only();
+    create_root_dir_with(layout, &access)
+}
+
+/// [`create_root_dir`] の、作るときの ACL の利用者の欄を呼び出し側が決める形
+/// （#392 B3-2a）。サービス（LocalSystem）は登録時に記録したインストール利用者の
+/// SID を渡す（今のプロセスの利用者は SYSTEM で、利用者の ACE を付けられないため）。
+/// 既にあるルートには触らない（`access` も使わない）。Windows 以外では `access` を
+/// 使わない（`create_dir_all`）。
+pub fn create_root_dir_with(
+    layout: &DataLayout,
+    access: &banto_secret_store::DirAccess,
+) -> Result<bool, String> {
+    let root = layout.root();
     if root.is_dir() {
         return Ok(false);
     }
-    create_root_dir_impl(root)
+    create_root_dir_impl(root, access)
 }
 
 #[cfg(windows)]
-fn create_root_dir_impl(root: &Path) -> Result<bool, String> {
-    let access = current_process_dir_access().map_err(|err| err.to_string())?;
-    banto_secret_store::acl::create_dir_if_absent(root, &access).map_err(|err| err.to_string())
+fn create_root_dir_impl(
+    root: &Path,
+    access: &banto_secret_store::DirAccess,
+) -> Result<bool, String> {
+    banto_secret_store::acl::create_dir_if_absent(root, access).map_err(|err| err.to_string())
 }
 
 #[cfg(not(windows))]
-fn create_root_dir_impl(root: &Path) -> Result<bool, String> {
+fn create_root_dir_impl(
+    root: &Path,
+    _access: &banto_secret_store::DirAccess,
+) -> Result<bool, String> {
     std::fs::create_dir_all(root).map_err(|err| err.to_string())?;
     Ok(true)
+}
+
+/// 作るディレクトリ（データのルート・Hub の API キーの保存先）の ACL の利用者の欄の
+/// 決め方（#392 B3-2a）。`chronogazer-server` の起動の順序（コンソールとサービスで
+/// 共有）が受け取る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirAccessSource {
+    /// 今のプロセスの利用者（Windows では [`current_process_dir_access`]）。**作る・
+    /// 開くときに初めて調べる**（既にあるルートでは調べない。B2-4a からの挙動の
+    /// まま）。コンソールとデスクトップ。
+    CurrentProcess,
+    /// 呼び出し側が決めた指定。サービス（LocalSystem）が登録時に記録したインストール
+    /// 利用者の SID を渡す（B3-2b）。
+    Given(banto_secret_store::DirAccess),
+}
+
+impl DirAccessSource {
+    /// この決め方でルートを、まだ無ければ作る（[`create_root_dir`] /
+    /// [`create_root_dir_with`]）。
+    pub fn create_root_dir(&self, layout: &DataLayout) -> Result<bool, String> {
+        match self {
+            Self::CurrentProcess => create_root_dir(layout),
+            Self::Given(access) => create_root_dir_with(layout, access),
+        }
+    }
 }
 
 /// このプロセスが作るディレクトリの ACL の指定（Windows）: 利用者のアカウントで
@@ -494,6 +548,65 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|ace| ace.sid != "S-1-5-32-545"));
+        }
+
+        /// #392 B3-2a: 利用者の欄を渡す形は、渡した指定で作る（今のプロセスの利用者で
+        /// はない）。`service_only` なら SYSTEM・Administrators の 2 つだけ、利用者の
+        /// SID を渡せばその SID に「変更」。グループの SID は作らずに断る（渡した指定が
+        /// 使われている証拠。今のプロセスの利用者なら作れる）。
+        #[test]
+        fn create_root_dir_with_uses_the_given_access() {
+            use banto_secret_store::{acl::reset_dir_acl, DirAccess, InstallUserSid};
+
+            let dir = tempfile::tempdir().unwrap();
+            let me = current_user_sid().unwrap();
+
+            let service_only = DataLayout::new(dir.path().join("service-only"));
+            assert_eq!(
+                create_root_dir_with(&service_only, &DirAccess::service_only()),
+                Ok(true)
+            );
+            let dacl = read_dir_dacl(service_only.root()).unwrap();
+            assert!(dacl.protected, "{dacl:?}");
+            let mut aces: Vec<_> = dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|ace| (ace.sid.clone(), ace.mask))
+                .collect();
+            aces.sort();
+            let mut expected = vec![
+                (SYSTEM_SID.to_string(), FULL_ACCESS_MASK),
+                (ADMINISTRATORS_SID.to_string(), FULL_ACCESS_MASK),
+            ];
+            expected.sort();
+            assert_eq!(aces, expected, "利用者の ACE を付けない: {dacl:?}");
+            // 片付け（所有者は自分なので書き換えられる）。
+            reset_dir_acl(
+                service_only.root(),
+                &DirAccess::with_install_user(me.clone()),
+            )
+            .unwrap();
+
+            let user = DataLayout::new(dir.path().join("install-user"));
+            assert_eq!(
+                create_root_dir_with(&user, &DirAccess::with_install_user(me.clone())),
+                Ok(true)
+            );
+            let dacl = read_dir_dacl(user.root()).unwrap();
+            assert!(dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|ace| ace.sid == me.as_str() && ace.mask == MODIFY_ACCESS_MASK));
+
+            let machine = me.as_str().rsplit_once('-').unwrap().0;
+            let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
+            let refused = DataLayout::new(dir.path().join("group"));
+            assert!(create_root_dir_with(&refused, &DirAccess::with_install_user(group)).is_err());
+            assert!(!refused.root().exists(), "断ったときは作らない");
         }
 
         /// PR #604 のレビュー: 末尾に `..` を持つ未作成のルートは、何も作らずに断る
