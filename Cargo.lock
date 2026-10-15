@@ -574,7 +574,6 @@ dependencies = [
  "tower",
  "utoipa",
  "utoipa-swagger-ui",
- "windows-service",
  "windows-sys 0.61.2",
 ]
 

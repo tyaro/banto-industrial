@@ -8,7 +8,8 @@
 //! このモジュールはそれを再公開（`pub use banto_service_control::*`）し、
 //! banto-hub 固有の定数（[`SERVICE_NAME`]・[`RUN_SERVICE_ARG`]・
 //! `BantoHubSink`の名前）と`BantoHub`向けのコンストラクタ
-//! （[`hub_service_manager`]）だけを持つ。既存の
+//! （[`hub_service_manager`]）だけを持つ（#392 B3-1 で、登録と再登録が
+//! 共有する登録内容[`hub_service_spec`]と説明文の定数も足した）。既存の
 //! `banto_hub_core::service_manager::...`の参照は無改造で動く。以下の
 //! 節は T17-0・S6 当時の経緯の記録（型の説明は移動先の crate 冒頭 doc 参照）。
 //!
@@ -80,11 +81,16 @@
 /// ソース（以前は`win_service.rs`だけが`"BantoHub"`を定義していた）。
 pub const SERVICE_NAME: &str = "BantoHub";
 
-/// `BantoHub`の SCM 表示名（`win_service.rs::install`と同じ値）。S6 の
-/// [`WindowsServiceManager::for_service`]汎化に伴い、`windows_impl`内部
-/// 専用だった定数をここへ公開した（モジュール doc「サービス名の汎化」節
-/// 参照）。
+/// `BantoHub`の SCM 表示名。S6 の[`WindowsServiceManager::for_service`]
+/// 汎化に伴い、`windows_impl`内部専用だった定数をここへ公開した（モジュール
+/// doc「サービス名の汎化」節参照）。#392 B3-1 で`service_install.rs`の
+/// 複製を消し、登録もこの定数（[`hub_service_spec`]）を使う。
 pub const SERVICE_DISPLAY_NAME: &str = "banto-hub タグサーバー";
+
+/// `BantoHub`の SCM 説明文（`install`の新規登録で設定する。#392 B3-1 で
+/// `service_install.rs`から移した）。
+pub const SERVICE_DESCRIPTION: &str =
+    "banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/tag-server-design.md 参照。";
 
 /// `BantoHubSink`（外部 DB 連携 S5 のサイドカー）の SCM サービス名。
 /// `apps/banto-hub-sink/src/service.rs::SERVICE_NAME`と同じ値の複製（モジュール
@@ -96,9 +102,9 @@ pub const SINK_SERVICE_NAME: &str = "BantoHubSink";
 pub const SINK_SERVICE_DISPLAY_NAME: &str = "banto-hub DB Sink サイドカー";
 
 /// SCM がサービス開始時に子プロセスへ渡す起動引数
-/// （`bin/banto-hub.rs`の`run-service`サブコマンド）。[`WindowsServiceManager`]
-/// が起動種別変更時にサービス登録を再構築する際、`win_service.rs::install`と
-/// 同じ起動コマンドラインを再現するために使う。
+/// （`bin/banto-hub.rs`の`run-service`サブコマンド）。登録
+/// （[`hub_service_spec`]）と、[`WindowsServiceManager`]が起動種別変更時に
+/// サービス登録を再構築するときの両方が使う。
 pub const RUN_SERVICE_ARG: &str = "run-service";
 
 pub use banto_service_control::*;
@@ -129,19 +135,32 @@ pub fn describe_service_error(err: &ServiceManagerError) -> String {
     }
 }
 
+/// `BantoHub`の登録内容（#392 B3-1）。`install`（`service_install.rs`）と
+/// [`hub_service_manager`]（`set_auto_start`の再登録）が同じ値を使う 1 か所:
+/// サービス名・表示名・説明文・起動引数`run-service`・新規は手動開始
+/// （T17-4）・OS シャットダウンの待ち時間 30 秒（#589）。それまでは表示名
+/// などが`service_install.rs`・`win_service.rs`・このファイルに複製されていた。
+pub fn hub_service_spec(executable_path: std::path::PathBuf) -> ServiceSpec {
+    ServiceSpec {
+        name: SERVICE_NAME,
+        display_name: SERVICE_DISPLAY_NAME,
+        description: Some(SERVICE_DESCRIPTION),
+        executable: executable_path,
+        launch_arguments: vec![std::ffi::OsString::from(RUN_SERVICE_ARG)],
+        start_kind: ServiceStartKind::OnDemand,
+        preshutdown_timeout: PRESHUTDOWN_TIMEOUT,
+    }
+}
+
 /// `BantoHub`向けの[`WindowsServiceManager`]を作る（B2-3 までの
 /// `WindowsServiceManager::new(executable_path)`と同じ内容: サービス名・
-/// 表示名・起動引数は[`SERVICE_NAME`]・[`SERVICE_DISPLAY_NAME`]・
-/// [`RUN_SERVICE_ARG`]）。`executable_path`は`set_auto_start`での再登録に使う
-/// 実行ファイルパスで、通常は`std::env::current_exe()`を渡す。
+/// 表示名・起動引数は[`hub_service_spec`]の[`SERVICE_NAME`]・
+/// [`SERVICE_DISPLAY_NAME`]・[`RUN_SERVICE_ARG`]）。`executable_path`は
+/// `set_auto_start`での再登録に使う実行ファイルパスで、通常は
+/// `std::env::current_exe()`を渡す。
 #[cfg(windows)]
 pub fn hub_service_manager(executable_path: std::path::PathBuf) -> WindowsServiceManager {
-    WindowsServiceManager::for_service(
-        SERVICE_NAME,
-        SERVICE_DISPLAY_NAME,
-        executable_path,
-        vec![std::ffi::OsString::from(RUN_SERVICE_ARG)],
-    )
+    WindowsServiceManager::for_spec(&hub_service_spec(executable_path))
 }
 
 #[cfg(test)]
@@ -151,6 +170,29 @@ mod tests {
         assert_eq!(super::SERVICE_NAME, "BantoHub");
         assert_eq!(super::RUN_SERVICE_ARG, "run-service");
         assert_eq!(super::SINK_SERVICE_NAME, "BantoHubSink");
+    }
+
+    /// 登録内容は B3-1 の前の`service_install::install`の`ServiceInfo`・
+    /// 説明文・PRESHUTDOWN と同じ。
+    #[test]
+    fn hub_service_spec_keeps_the_registration() {
+        use super::{hub_service_spec, ServiceStartKind, PRESHUTDOWN_TIMEOUT};
+        let exe = std::path::PathBuf::from(r"C:\Program Files\BantoHub\banto-hub.exe");
+        let spec = hub_service_spec(exe.clone());
+        assert_eq!(spec.name, "BantoHub");
+        assert_eq!(spec.display_name, "banto-hub タグサーバー");
+        assert_eq!(
+            spec.description,
+            Some("banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/tag-server-design.md 参照。")
+        );
+        assert_eq!(spec.executable, exe);
+        assert_eq!(
+            spec.launch_arguments,
+            vec![std::ffi::OsString::from("run-service")]
+        );
+        assert_eq!(spec.start_kind, ServiceStartKind::OnDemand);
+        assert_eq!(PRESHUTDOWN_TIMEOUT, std::time::Duration::from_secs(30));
+        assert_eq!(spec.preshutdown_timeout, PRESHUTDOWN_TIMEOUT);
     }
 
     /// banto-hub の利用者に見える文言は B2-3 までの`Display`と同じ
