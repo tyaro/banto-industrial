@@ -15,13 +15,6 @@ use crate::types::{CatalogSnapshot, ValuesSnapshot};
 use crate::write::{send_write, validate_write_name, RequestedValue};
 use crate::ws_transport::WebSocketConnection;
 
-/// One REST call (`fetch_catalog`, `fetch_values`, `write_tag`, including
-/// the response body). A peer that accepts and never answers must not pin
-/// the caller forever. Callers with a tighter deadline (OS preshutdown)
-/// still race the request against their own stop signal; this is the
-/// backstop, matching the sink's Hub API client.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// A banto-hub REST client that connects directly to its endpoint, without
 /// redirects or system/environment proxy configuration. Reads
 /// ([`fetch_catalog`](Self::fetch_catalog), [`fetch_values`](Self::fetch_values))
@@ -34,18 +27,47 @@ pub struct RestClient {
 }
 
 impl RestClient {
-    /// Construct a client with redirects disabled and a [`REQUEST_TIMEOUT`]
-    /// bound on each call.
+    /// Construct a client with redirects disabled. No per-request time limit
+    /// is applied: a caller that owns a deadline (for example an outer
+    /// `tokio::time::timeout` that reports its own timeout reason) keeps that
+    /// contract. Use [`with_request_timeout`](Self::with_request_timeout) to
+    /// opt in to a bound on each call.
     pub fn new(endpoint: Endpoint, secret: SecretApiKey) -> Result<Self> {
-        let http = ClientBuilder::new()
+        Self::build(endpoint, secret, None)
+    }
+
+    /// Like [`new`](Self::new), but bound each REST call made through this
+    /// client by `timeout`: [`fetch_catalog`](Self::fetch_catalog),
+    /// [`fetch_values`](Self::fetch_values), [`write_tag`](Self::write_tag),
+    /// and the catalog/snapshot requests of the worker started by
+    /// [`start`](Self::start), each including reading the response body. A
+    /// call that runs out of time fails with [`ErrorKind::Transport`], the
+    /// same category as any other failed send. The WebSocket stream is not
+    /// bounded by it.
+    ///
+    /// Opt-in so that a bound wanted by one caller never changes another
+    /// caller's deadline contract (#589: a limit applied to every client made
+    /// the SDK fail before a caller's own, longer deadline, and that caller's
+    /// timeout reason was lost).
+    pub fn with_request_timeout(
+        endpoint: Endpoint,
+        secret: SecretApiKey,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::build(endpoint, secret, Some(timeout))
+    }
+
+    fn build(endpoint: Endpoint, secret: SecretApiKey, timeout: Option<Duration>) -> Result<Self> {
+        let mut builder = ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|_| {
-                tracing::warn!("failed to build the banto-hub REST client");
-                Error::new(ErrorKind::Transport)
-            })?;
+            .no_proxy();
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let http = builder.build().map_err(|_| {
+            tracing::warn!("failed to build the banto-hub REST client");
+            Error::new(ErrorKind::Transport)
+        })?;
         Ok(Self {
             endpoint,
             secret,
@@ -458,6 +480,37 @@ mod tests {
             client(address).fetch_catalog().await.unwrap_err().kind(),
             ErrorKind::Transport
         );
+    }
+
+    /// #589: the per-request bound is opt-in. A peer that accepts and never
+    /// answers (the listener stays bound but never responds; the kernel
+    /// completes the handshake from its backlog) fails the opted-in client
+    /// as `transport`, while the default client keeps waiting so that a
+    /// caller's own outer deadline - and its timeout reason - still wins.
+    #[tokio::test]
+    async fn request_timeout_is_opt_in_and_bounds_a_silent_peer() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = || Endpoint::new(format!("{address}/private-prefix")).unwrap();
+        let secret = || SecretApiKey::new(test_secret()).unwrap();
+
+        let bounded =
+            RestClient::with_request_timeout(endpoint(), secret(), Duration::from_millis(200))
+                .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), bounded.fetch_catalog())
+            .await
+            .expect("the opted-in bound must end the call")
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Transport);
+
+        let unbounded = RestClient::new(endpoint(), secret()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), unbounded.fetch_catalog())
+                .await
+                .is_err(),
+            "the default client must not impose its own limit"
+        );
+        drop(listener);
     }
 
     #[tokio::test]

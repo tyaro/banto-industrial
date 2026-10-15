@@ -69,6 +69,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::SidecarConfig;
+use crate::hub_api::REQUEST_TIMEOUT;
 
 /// 1 タグの最新値（`banto_tagclient::ValueEntry` から必要な 3 つだけ）。
 #[derive(Clone, Debug, PartialEq)]
@@ -152,10 +153,18 @@ pub fn plan_bindings(desired: &[String], catalog: &CatalogSnapshot) -> BindingPl
     }
 }
 
+/// Hub の REST クライアント。1 回の REST 呼び出し（catalog・値の snapshot。
+/// 購読の worker が再接続で引くものも含む）を [`REQUEST_TIMEOUT`] で
+/// 頭打ちにする（#589）。応答しない Hub に通常運転の再計画が捕まり続けない
+/// ための歯止めで、停止はこれを待たない（運転ループが停止合図と `select` する）。
+///
+/// 上限は SDK の既定ではなく、この Sink が opt-in で掛ける。SDK の既定に
+/// 上限を入れると、外側に自分の期限を持つ利用側（ChronoGazer の Hub 操作の
+/// 15 秒）が、その期限より先に `transport` で失敗して期限切れの理由を失う。
 fn rest_client(config: &SidecarConfig) -> Result<RestClient, banto_tagclient::Error> {
     let endpoint = Endpoint::new(&config.hub_url)?;
     let secret = SecretApiKey::new(config.api_key.clone())?;
-    RestClient::new(endpoint, secret)
+    RestClient::with_request_timeout(endpoint, secret, REQUEST_TIMEOUT)
 }
 
 /// catalog を 1 回取得して `desired` の購読計画を返す。**購読は張らない**

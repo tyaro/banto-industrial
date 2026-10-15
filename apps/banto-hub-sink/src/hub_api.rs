@@ -38,8 +38,9 @@ use crate::config::SidecarConfig;
 
 /// 1 リクエストの上限。Hub は同一マシンのループバックなので短くてよいが、
 /// 起動直後（Hub が SQLite を開いている最中）に取りこぼさない程度の余裕は
-/// 見る。
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 見る。Hub の catalog・値の REST（[`crate::values`] の `RestClient`）にも
+/// 同じ上限を掛ける（#589）。
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `GET /api/sink/config` の応答（Hub 側 `SinkConfigResponse`）。
 #[derive(Clone, Debug, Deserialize, PartialEq)]
