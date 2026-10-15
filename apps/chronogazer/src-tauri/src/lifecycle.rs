@@ -115,10 +115,23 @@
 //!
 //! # ロックと待ち
 //!
-//! - ロックは 1 つ（[`Lifecycle`] の `Mutex`）。中で呼ぶのは、エンジンを置く `install`
-//!   （`AppHandle::manage`。メインスレッドを使わない）と、終了の確認の答えでの収集の
-//!   受付（`QuitAdmission`。収集側の短いロック）だけ。ロックの順序は「この状態機械 →
+//! - ロックは 1 つ（[`Lifecycle`] の `Mutex`）。ロックを握ったまま呼ぶ外の処理は 2 つ
+//!   だけ: エンジンを置く `install`（[`Lifecycle::admit`]）と、終了の確認の答えでの収集の
+//!   受付（`QuitAdmission`、[`Lifecycle::answer_quit`]）。ロックの順序は「この状態機械 →
 //!   収集の受付」の一方向（収集側はここを参照しない）。窓・トレイの操作はロックの外で行う。
+//! - **ロックを握ったまま呼ぶ処理（`install`・`QuitAdmission`）の中では**（PR #611 の
+//!   オーナーレビュー 2）:
+//!   - **この状態機械（`Lifecycle` のどのメソッドも）を呼ばない** - 同じロックをもう一度
+//!     取りに行って止まる（`std::sync::Mutex` は再入できない）。
+//!   - **メインスレッドを待たない**（窓・トレイ・ダイアログの操作をしない）- メインスレッドが
+//!     このロックを待っていると互いに止まる。
+//!   - してよいのは即時に終わる登録・読み取りだけ（`install` なら `AppHandle::manage`、
+//!     収集の受付なら収集側の短いロックの中の印の上げ下げ）。
+//!
+//!   デバッグビルドでは、この約束を破った再入を検知して panic する（スレッドローカルの
+//!   印。ロックを握ったまま外の処理を呼ぶ間だけ立て、その間にこのスレッドがロックを
+//!   取りに来たら `debug_assert!` で落とす。止まるより先に落ちるので原因が分かる）。
+//!   リリースビルドには入らない。
 //! - 待つのは [`Lifecycle::wait_idle`]（条件変数。待つ間はロックを手放す）だけで、上限は
 //!   [`exit_budgets`] が出来事ごとに決める。メインスレッドから呼ぶのは `RunEvent::Exit`
 //!   だけで、その上限は後始末と合わせて 5 秒。トレイの終了は専用のスレッドで待つ。
@@ -132,6 +145,37 @@ use banto_desktop_tray::{
 };
 
 use crate::shell::{FallbackState, ShellView};
+
+// ---------------------------------------------------------------------------
+// 再入の検知（デバッグビルドだけ。モジュール doc「ロックと待ち」）
+// ---------------------------------------------------------------------------
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// このスレッドが、ロックを握ったまま外の処理（`install`・`QuitAdmission`）を
+    /// 呼んでいる最中か。
+    static IN_LOCKED_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// ロックを握ったまま外の処理 `f` を呼ぶ（デバッグビルドでは、その間の再入を検知する
+/// 印を立てる。panic しても印は下ろす）。
+fn call_under_lock<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(debug_assertions)]
+    {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IN_LOCKED_CALLBACK.with(|flag| flag.set(self.0));
+            }
+        }
+        let _reset = Reset(IN_LOCKED_CALLBACK.with(|flag| flag.replace(true)));
+        f()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        f()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 待ちの上限（純関数）
@@ -750,8 +794,15 @@ impl Lifecycle {
         lifecycle
     }
 
-    /// 中身は代入だけで書き換えるので、毒化は無視して中身を使う。
+    /// 中身は代入だけで書き換えるので、毒化は無視して中身を使う。デバッグビルドでは、
+    /// ロックを握ったまま呼んだ外の処理からの再入を検知して panic する（モジュール doc
+    /// 「ロックと待ち」。そのまま取りに行くと止まる）。
     fn lock(&self) -> MutexGuard<'_, LifecycleState> {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            !IN_LOCKED_CALLBACK.with(std::cell::Cell::get),
+            "lifecycle の再入: ロックを握ったまま呼んだ install・QuitAdmission の中から lifecycle を呼んだ"
+        );
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -880,6 +931,12 @@ impl Lifecycle {
 
     /// 扉が閉じていなければ、同じロックの中で `install` を走らせる（エンジンを置く）。
     /// 走らせたら `true`。閉じていれば走らせずに `false`（呼び出し側がエンジンを止める）。
+    ///
+    /// **`install` はロックを握ったまま呼ぶ**（扉の確認と置くことを分けないため）。
+    /// `install` の中では、この状態機械（`Lifecycle` のどのメソッドも）を呼ばない（再入で
+    /// 止まる。デバッグビルドでは検知して panic する）・メインスレッドを待たない（窓・
+    /// トレイ・ダイアログを操作しない）。してよいのは `AppHandle::manage` のような即時の
+    /// 登録だけ（モジュール doc「ロックと待ち」）。
     pub(crate) fn admit(&self, install: impl FnOnce()) -> bool {
         let mut state = self.lock();
         let (next, decision) = step(&state, &Event::EngineAdmit);
@@ -887,7 +944,7 @@ impl Lifecycle {
         if decision != Decision::Proceed {
             return false;
         }
-        install();
+        call_under_lock(install);
         drop(state);
         true
     }
@@ -906,7 +963,8 @@ impl Lifecycle {
     /// 終了の確認の答え（確認しない態では同意として呼ぶ）。同意で確認中・復旧中で
     /// ないときだけ、**同じロックの中で**収集の受付の印を立てて忙しいかを読み
     /// （`QuitAdmission::begin_quit_confirm`）、確かめ直すときは印を下ろす。ロックの順序は
-    /// 「この状態機械 → 収集の受付」の一方向。
+    /// 「この状態機械 → 収集の受付」の一方向。`admission` の中では `admit` の `install` と
+    /// 同じく、この状態機械を呼ばない・メインスレッドを待たない。
     pub(crate) fn answer_quit(
         &self,
         confirmed: bool,
@@ -914,7 +972,8 @@ impl Lifecycle {
         admission: &dyn QuitAdmission,
     ) -> QuitAnswerOutcome {
         let mut state = self.lock();
-        let now_busy = needs_admission(&state, confirmed) && admission.begin_quit_confirm();
+        let now_busy = needs_admission(&state, confirmed)
+            && call_under_lock(|| admission.begin_quit_confirm());
         let (next, decision) = step(
             &state,
             &Event::QuitAnswer {
@@ -928,7 +987,7 @@ impl Lifecycle {
             unreachable!("QuitAnswer decides QuitAnswer: {decision:?}");
         };
         if outcome == QuitAnswerOutcome::AskAgain {
-            admission.cancel_quit_confirm();
+            call_under_lock(|| admission.cancel_quit_confirm());
         }
         outcome
     }
@@ -1963,6 +2022,49 @@ mod tests {
         assert!(!gate.tray_may_apply(false));
         assert!(gate.tray_may_apply(true));
         assert!(!gate.may_open_window());
+    }
+
+    /// PR #611 のオーナーレビュー 2: `install` の中から状態機械を呼ぶ（再入）と、
+    /// デバッグビルドでは止まる前に panic で知らせる。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "lifecycle の再入")]
+    fn reentering_from_install_is_detected_in_debug_builds() {
+        let gate = Lifecycle::started(ShellView::Desktop);
+        gate.admit(|| {
+            let _ = gate.view();
+        });
+    }
+
+    /// 収集の受付の中からの再入も同じく検知する。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "lifecycle の再入")]
+    fn reentering_from_the_quit_admission_is_detected_in_debug_builds() {
+        struct Reentrant<'a>(&'a Lifecycle);
+        impl QuitAdmission for Reentrant<'_> {
+            fn begin_quit_confirm(&self) -> bool {
+                self.0.may_open_window()
+            }
+            fn cancel_quit_confirm(&self) {}
+        }
+        let gate = Lifecycle::started(ShellView::Desktop);
+        gate.request_quit();
+        gate.answer_quit(true, false, &Reentrant(&gate));
+    }
+
+    /// 外の処理が終われば（panic で抜けても）印は下り、同じスレッドから普通に呼べる。
+    #[test]
+    fn the_reentry_mark_is_cleared_after_the_callback() {
+        let gate = Lifecycle::started(ShellView::Desktop);
+        assert!(gate.admit(|| {}));
+        assert_eq!(gate.view(), Some(ShellView::Desktop));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gate.admit(|| panic!("install failed"));
+        }));
+        assert!(unwound.is_err());
+        // 毒化は無視して中身を使う（`lock`）。印も残っていない。
+        assert!(gate.launch_may_proceed());
     }
 
     /// 対処の窓: 処理中は二度押しを無視し × で閉じさせない。終われば戻る。
