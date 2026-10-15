@@ -15,8 +15,10 @@
 //!   `SERVICE_EXIT_CODE` だけでは見分けられない - panic はログの行で見分ける。
 //! - 停止の予算（[`service_stop_budget`]）: SCM の STOP はコンソールの Ctrl-C と同じ
 //!   [`INTERRUPT_BUDGET`]（15 秒）、OS の PRESHUTDOWN は `StopNotice::os_work_deadline`
-//!   （受けてから 27 秒）までの残りから、Stopped の報告とログの書き出しの分
-//!   [`PRESHUTDOWN_REPORT_RESERVE`]（1 秒）を引いたもの（負なら 0）。
+//!   （受けてから 27 秒）までの残りから、後のログの書き出しの上限
+//!   [`SERVICE_LOG_FLUSH_WAIT`]（2 秒）と Stopped の報告の余裕
+//!   [`PRESHUTDOWN_REPORT_RESERVE`]（1 秒）を引いたもの（負なら 0）。書き出しの待ちも
+//!   期限までの残りで頭打ちにする（[`service_flush_wait`]。PR #618 の Codex の指摘）。
 //! - インストール利用者の SID（2026-10-15 オーナー決定 D1〜D4）: 登録のときに
 //!   `HKLM\SYSTEM\CurrentControlSet\Services\ChronoGazer\Parameters\InstallUserSid`
 //!   （[`INSTALL_USER_SID_VALUE`]）に記録し、サービスは起動のたびに読んで、データの
@@ -78,13 +80,40 @@ pub fn service_exit_for(code: i32) -> ServiceExit {
     }
 }
 
-/// 停止の予算（モジュール doc）。`now` は停止を始める時刻。
+/// 後始末の後に、日次ログの書き出し（向け直しの終わり）を待つ上限。
+pub const SERVICE_LOG_FLUSH_WAIT: Duration = Duration::from_secs(2);
+
+/// 停止の予算（モジュール doc）。`now` は停止を始める時刻。**この後のログの書き出しの
+/// 待ち（[`service_flush_wait`]、最大 [`SERVICE_LOG_FLUSH_WAIT`]）と Stopped の報告の
+/// 余裕（[`PRESHUTDOWN_REPORT_RESERVE`]）を含めて**期限に収まるように引く（PR #618 の
+/// Codex の指摘 P2）:
+///
+/// - STOP: [`INTERRUPT_BUDGET`]（15 秒）。書き出しと余裕を足しても heartbeat の見込み
+///   [`SERVICE_EXPECTED_STOP`]（20 秒）に収まる（テストで固定）。
+/// - PRESHUTDOWN: 期限 − `now` − 書き出しの上限 − 余裕（負なら 0）。受けた直後なら
+///   27 − 2 − 1 = 24 秒。
 pub fn service_stop_budget(notice: &StopNotice, now: Instant) -> Duration {
     match notice.os_work_deadline() {
         None => INTERRUPT_BUDGET,
         Some(deadline) => deadline
             .saturating_duration_since(now)
+            .saturating_sub(SERVICE_LOG_FLUSH_WAIT)
             .saturating_sub(PRESHUTDOWN_REPORT_RESERVE),
+    }
+}
+
+/// 後始末（またはその途中の打ち切り）の後に、ログの書き出しを待つ上限。`now` は
+/// 待ちを始める時刻。STOP は [`SERVICE_LOG_FLUSH_WAIT`]、PRESHUTDOWN はそれを
+/// 「期限 − `now` − 余裕」で頭打ちにする（負なら 0）。後始末が予算を使い切っても、
+/// 書き出しの待ちで期限を超えない。
+pub fn service_flush_wait(notice: &StopNotice, now: Instant) -> Duration {
+    match notice.os_work_deadline() {
+        None => SERVICE_LOG_FLUSH_WAIT,
+        Some(deadline) => SERVICE_LOG_FLUSH_WAIT.min(
+            deadline
+                .saturating_duration_since(now)
+                .saturating_sub(PRESHUTDOWN_REPORT_RESERVE),
+        ),
     }
 }
 
@@ -536,27 +565,27 @@ mod tests {
     }
 
     #[test]
-    fn stop_budget_is_15s_for_stop_and_the_os_deadline_minus_1s_for_preshutdown() {
+    fn stop_budget_leaves_room_for_the_log_flush_and_the_report() {
         let received = Instant::now();
         assert_eq!(
             service_stop_budget(&notice(StopSignal::ServiceStop, received), received),
             Duration::from_secs(15)
         );
-        // 受けた直後: 27 秒 - 1 秒。
+        // 受けた直後: 27 秒 - 書き出し 2 秒 - 余裕 1 秒。
         assert_eq!(
             service_stop_budget(&notice(StopSignal::OsPreshutdown, received), received),
-            Duration::from_secs(26)
+            Duration::from_secs(24)
         );
-        // 10 秒たってから始めた: 残りの 17 秒 - 1 秒。
+        // 10 秒たってから始めた: 残りの 17 秒 - 2 秒 - 1 秒。
         assert_eq!(
             service_stop_budget(
                 &notice(StopSignal::OsPreshutdown, received),
                 received + Duration::from_secs(10)
             ),
-            Duration::from_secs(16)
+            Duration::from_secs(14)
         );
-        // 期限の 0.5 秒前・期限を過ぎた: 0（負にしない）。
-        for late in [Duration::from_millis(26_500), Duration::from_secs(60)] {
+        // 期限の 2.5 秒前・期限を過ぎた: 0（負にしない）。
+        for late in [Duration::from_millis(24_500), Duration::from_secs(60)] {
             assert_eq!(
                 service_stop_budget(
                     &notice(StopSignal::OsPreshutdown, received),
@@ -565,14 +594,58 @@ mod tests {
                 Duration::ZERO
             );
         }
-        // STOP はいつ始めても 15 秒（打ち切りの期限は無い）。
+        // 書き出しの待ちも、期限の 1 秒前を過ぎたら 0。
+        for late in [26, 27, 60] {
+            let late = Duration::from_secs(late);
+            assert_eq!(
+                service_flush_wait(
+                    &notice(StopSignal::OsPreshutdown, received),
+                    received + late
+                ),
+                Duration::ZERO,
+                "{late:?}"
+            );
+        }
+        // STOP はいつ始めても 15 秒・書き出し 2 秒（打ち切りの期限は無い）。
+        let late = received + Duration::from_secs(60);
         assert_eq!(
-            service_stop_budget(
-                &notice(StopSignal::ServiceStop, received),
-                received + Duration::from_secs(60)
-            ),
+            service_stop_budget(&notice(StopSignal::ServiceStop, received), late),
             Duration::from_secs(15)
         );
+        assert_eq!(
+            service_flush_wait(&notice(StopSignal::ServiceStop, received), late),
+            SERVICE_LOG_FLUSH_WAIT
+        );
+        // STOP: 後始末 + 書き出し + 余裕が heartbeat の見込みに収まる。
+        assert!(
+            INTERRUPT_BUDGET + SERVICE_LOG_FLUSH_WAIT + PRESHUTDOWN_REPORT_RESERVE
+                <= SERVICE_EXPECTED_STOP
+        );
+    }
+
+    /// PR #618 の Codex の指摘 P2: PRESHUTDOWN では、どの時点で始めても、後始末が予算を
+    /// 使い切ってから書き出しを上限まで待っても、期限の 1 秒前（Stopped の報告の余裕）を
+    /// 超えない。始めた時点で既に過ぎていれば、どちらも 0。
+    #[test]
+    fn preshutdown_budget_plus_flush_never_passes_the_os_deadline() {
+        let received = Instant::now();
+        let notice = notice(StopSignal::OsPreshutdown, received);
+        let limit = notice.os_work_deadline().unwrap() - PRESHUTDOWN_REPORT_RESERVE;
+        for start_ms in (0..=30_000).step_by(250) {
+            let start = received + Duration::from_millis(start_ms);
+            let budget = service_stop_budget(&notice, start);
+            // 最悪の場合: 後始末が予算を使い切ってから書き出しを待つ。
+            let flush_start = start + budget;
+            let flush = service_flush_wait(&notice, flush_start);
+            if start <= limit {
+                assert!(
+                    flush_start + flush <= limit,
+                    "{start_ms} ms: budget {budget:?} flush {flush:?}"
+                );
+            } else {
+                assert!(budget.is_zero() && flush.is_zero(), "{start_ms} ms");
+            }
+        }
     }
 
     #[test]

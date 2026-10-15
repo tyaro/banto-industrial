@@ -140,7 +140,7 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
 
 同じ `chronogazer-server.exe` を Windows サービス `ChronoGazer`（表示名「ChronoGazer 記録エンジン」、
 LocalSystem、手動開始）として登録する。サインアウトしても止まらず、OS のシャットダウンでは最終 flush と
-`collection_stopped` を残してから止まる（PRESHUTDOWN、最大 26 秒）。UAC の昇格ヘルパとインストーラは
+`collection_stopped` を残してから止まる（PRESHUTDOWN、後始末は最大 24 秒）。UAC の昇格ヘルパとインストーラは
 これから（B3-3・B3-4）なので、今は**管理者として実行した PowerShell**（★）から手で行う。
 
 1. **exe を `C:\Program Files\ChronoGazer\` に置いてから登録する**。LocalSystem のサービスは SYSTEM の権限で

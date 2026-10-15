@@ -29,7 +29,7 @@
 //!    待ち受けの案内より先）、止める合図（SCM の STOP・OS の PRESHUTDOWN）を待つ。
 //! 6. 後始末: `StartedServer::shutdown`（`run\endpoint.json` を消す → エンジンの終了と
 //!    最終 flush）に予算（`server_service::service_stop_budget`。STOP は 15 秒、
-//!    PRESHUTDOWN は OS の期限の 1 秒前まで）を渡す。エンジンが予算で自分を打ち切る
+//!    PRESHUTDOWN は OS の期限から後の書き出しの 2 秒と余裕の 1 秒を引いた残り）を渡す。エンジンが予算で自分を打ち切る
 //!    ので、予算超過の見張り（`OverrunWatch`）は使わない。終了コードは
 //!    `server_service::service_exit_for`。
 //!
@@ -38,7 +38,11 @@
 //!
 //! ログは B1-5 と同じ日次ログ（`<root>\logs\chronogazer-server-YYYY-MM-DD.log`）で、
 //! 標準出力・標準エラー出力をそこへ向け直す（Session 0 にはコンソールが無いので、
-//! コンソールへの写しは自然に無くなる）。ランナーの `open_log` は使わない（A1 の
+//! コンソールへの写しは自然に無くなる）。**日次ログを開けなければ起動しない**（終了
+//! コード 3。コンソールはコンソールだけで続けるが、サービスでは診断がすべて黙って
+//! 失われるため。`open_required_log`、PR #618 の Codex の指摘）。後始末の後の書き出しの
+//! 待ちは PRESHUTDOWN の期限までの残りで頭打ちにする（`server_service::service_flush_wait`）。
+//! ランナーの `open_log` は使わない（A1 の
 //! 排他を取る前にルートの下に何も作らない、B1-5 の約束）。そのため、ランナーが
 //! 書く制御ハンドラの登録の失敗の行は、どこにも残らない（既知の制限）。
 
@@ -60,10 +64,11 @@ use chronogazer_core::paths::{
 use chronogazer_core::server_host::{self, EXIT_START_FAILED, SERVER_LABEL};
 use chronogazer_core::server_service::{
     access_from_parameter, install_exit_code, install_lines, install_user_unavailable_lines,
-    plan_sid_record, service_exit_for, service_running_line, service_starting_line,
-    service_stop_budget, service_stop_done_line, service_stop_hint_line, service_stop_reason_line,
-    service_stopped_line, stop_signal_label, uninstall_lines, InstallReport, RootPreparation,
-    SidRecordPlan, SidRecordResult, INSTALL_USER_SID_VALUE, SERVICE_EXPECTED_STOP,
+    plan_sid_record, service_exit_for, service_flush_wait, service_running_line,
+    service_starting_line, service_stop_budget, service_stop_done_line, service_stop_hint_line,
+    service_stop_reason_line, service_stopped_line, stop_signal_label, uninstall_lines,
+    InstallReport, RootPreparation, SidRecordPlan, SidRecordResult, INSTALL_USER_SID_VALUE,
+    SERVICE_EXPECTED_STOP, SERVICE_LOG_FLUSH_WAIT,
 };
 use chronogazer_core::shell_launch::{chronogazer_service_spec, SERVICE_NAME};
 
@@ -113,7 +118,7 @@ impl ServerProgram {
                 read_service_parameter(SERVICE_NAME, INSTALL_USER_SID_VALUE)
                     .map_err(|err| err.to_string())
             }),
-            Box::new(crate::open_log),
+            Box::new(open_required_log),
         )
     }
 
@@ -224,7 +229,8 @@ impl ServerProgram {
         }
         let exit = service_exit_for(summary.exit_code());
         println!("{}", service_stopped_line(exit));
-        self.flush(Duration::from_secs(2));
+        // 書き出しの待ちも PRESHUTDOWN の期限までの残りで頭打ち（PR #618 の Codex の指摘）。
+        self.flush(service_flush_wait(&notice, Instant::now()));
         exit
     }
 }
@@ -298,9 +304,37 @@ impl StartHooks for ServiceHooks<'_> {
         } else {
             eprintln!("{SERVER_LABEL}: Windows サービスの起動に失敗しました（終了コード {code}）");
         }
-        self.program.flush(Duration::from_secs(2));
+        // 起動の途中で PRESHUTDOWN を受けていれば、その期限までの残りで頭打ち。
+        let wait = self
+            .ctx
+            .stop_notice()
+            .map_or(SERVICE_LOG_FLUSH_WAIT, |notice| {
+                service_flush_wait(&notice, Instant::now())
+            });
+        self.program.flush(wait);
         code
     }
+}
+
+/// サービスの日次ログを開く（PR #618 の Codex の指摘 P2）。コンソールの `crate::open_log`
+/// は、ログのファイルを開けない（`logs\` に書けない・ディスクが無い）ときコンソール
+/// だけで続ける（`Ok((None, ..))`）が、サービス（Session 0）にはコンソールが無く、
+/// そのまま動くと起動・収集・停止の診断がすべて黙って失われる。サービスではそれを
+/// 起動の失敗にする（`start::start_server` が終了コード 3 で止め、Running を報告
+/// しない）。残るのは SCM の終了コードと、標準エラー出力（Session 0 では見えない）だけ。
+fn open_required_log(layout: &DataLayout) -> Result<OpenedLog, String> {
+    require_log(crate::open_log(layout)?, layout)
+}
+
+/// 開けたログが無ければ起動を止める理由（[`open_required_log`]）。
+fn require_log(opened: OpenedLog, layout: &DataLayout) -> Result<OpenedLog, String> {
+    if opened.0.is_none() {
+        return Err(format!(
+            "日次ログ（{}）を開けませんでした。Windows サービスにはコンソールが無く、起動・収集・停止の診断が残らないため、起動しません",
+            layout.logs_dir().display()
+        ));
+    }
+    Ok(opened)
 }
 
 /// tokio のランタイムを、drop のときに残りのタスクを待たずに落とす入れ物
@@ -909,6 +943,50 @@ mod tests {
         ] {
             assert!(!path.exists(), "{} を作った", path.display());
         }
+    }
+
+    /// PR #618 の Codex の指摘: 日次ログを開けない（`logs` がファイルで、ディレクトリを
+    /// 作れない）ときは、コンソールのように黙って続けず、Running を報告せずに
+    /// Stopped(3)。本番と同じ開き方（`open_required_log`）を通す（開けないので
+    /// テストのプロセスの標準ハンドルは差し替わらない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unopenable_daily_log_stops_with_3_before_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = DataLayout::new(dir.path().join("root"));
+        prepare_root_db(&layout, None).await;
+        std::fs::write(layout.logs_dir(), b"not a directory").unwrap();
+        let program = ServerProgram::new(
+            Box::new({
+                let layout = layout.clone();
+                move || Ok(layout.clone())
+            }),
+            Box::new(|| Ok(Some(current_user_sid().unwrap().as_str().to_string()))),
+            Box::new(open_required_log),
+        );
+        let running = spawn(program);
+        let seen = running.seen.clone();
+        // Running か Stopped のどちらかが報告されるまで待つ（Running になったら、
+        // `Running` の drop が STOP を送って止める）。
+        wait_for("Running か Stopped の報告", async || {
+            phases(&seen)
+                .iter()
+                .any(|(phase, _)| matches!(phase, ServicePhase::Running | ServicePhase::Stopped))
+                .then_some(())
+        })
+        .await;
+        assert!(
+            !phases(&seen)
+                .iter()
+                .any(|(phase, _)| *phase == ServicePhase::Running),
+            "ログを開けないのに Running を報告した: {:?}",
+            phases(&seen)
+        );
+        assert_eq!(running.join(), Some(ServiceExit::Specific(3)));
+        assert_eq!(
+            phases(&seen),
+            vec![(ServicePhase::Stopped, ServiceExit::Specific(3))]
+        );
+        assert!(!layout.endpoint_file().exists(), "endpoint.json を書いた");
     }
 
     /// OS の PRESHUTDOWN: OS の期限（受けてから 27 秒）より前に Stopped(0) まで終わる。
