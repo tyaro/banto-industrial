@@ -74,6 +74,19 @@
 //! する」効果に限られる、低リスクな追加チェックとして扱う - 昇格していない
 //! 通常の管理者アカウントは従来どおり`BantoHub Operators`への登録が必要
 //! （desktop-plan 同節「管理者は常に UAC 経路へ」の方針とも矛盾しない）。
+//!
+//! ## #392 B3-3a: Win32 の部分は共有 crate へ
+//!
+//! `LookupAccountNameW`・`CheckTokenMembership`の呼び出しは、ChronoGazer の
+//! elev（B3-3b）と共有するため共有 crate `banto-service-elev`
+//! （[`banto_service_elev::is_current_process_member`]・
+//! [`banto_service_elev::is_current_process_admin`]・
+//! `banto_service_elev::lookup_account_sid`）へ移した。呼び出しの順序・
+//! 「未作成なら`Ok(false)`」・非 Windows で`Ok(false)`は移す前のまま。
+//! このモジュールに残したのは banto-hub の知識（グループ名
+//! [`OPERATORS_GROUP_NAME`]と説明文[`OPERATORS_GROUP`]）と、共有 crate の
+//! 中立な文言のエラーを従来の文言の[`OperatorsError`]へ写すこと
+//! （`OperatorsError::from_elev`）だけ。
 
 use thiserror::Error;
 
@@ -86,7 +99,7 @@ pub const OPERATORS_GROUP_NAME: &str = "BantoHub Operators";
 /// （[`is_current_process_admin`]、T16-2 第二スライス）。`LookupAccountNameW`
 /// は英語名でロケールに関わらず解決できる（[`OPERATORS_GROUP_NAME`]と
 /// 同じ理由）。
-pub const ADMINISTRATORS_GROUP_NAME: &str = "Administrators";
+pub const ADMINISTRATORS_GROUP_NAME: &str = banto_service_elev::ADMINISTRATORS_GROUP_NAME;
 
 /// [`is_current_process_operator`] の失敗モード。
 ///
@@ -108,177 +121,87 @@ pub enum OperatorsError {
          (CheckTokenMembership, os error {os_error})"
     )]
     CheckTokenMembership { os_error: u32 },
+    /// 共有 crate（`banto-service-elev`）のその他のエラー。このモジュールの
+    /// 経路（メンバーシップの判定・SID の解決）からは返らない（#392 B3-3a で
+    /// 写しを網羅にするための変種）。
+    #[error(transparent)]
+    Elev(banto_service_elev::ElevError),
 }
 
+/// `BantoHub Operators`グループの名前と説明文（`setup-operators`が
+/// [`banto_service_elev::ensure_local_group`]に渡す。説明文は #392 B3-3a で
+/// `service_elevated.rs`から移した - 文言は変えていない）。
+pub const OPERATORS_GROUP: banto_service_elev::OperatorsGroup = banto_service_elev::OperatorsGroup {
+    name: OPERATORS_GROUP_NAME,
+    comment: "banto-hub のサービス操作（開始/停止/状態照会）を委任されたユーザーのグループ（banto-hub-elev.exe が自動作成）",
+};
+
 /// 現在のプロセスが [`OPERATORS_GROUP_NAME`] ローカルグループのメンバーかを
-/// 判定する（非 Windows 版）。
+/// 判定する。
 ///
-/// banto-hub は Windows 専用製品だが、ワークスペース全体は非 Windows でも
-/// `cargo check --workspace` が通る必要がある（`profile_lock.rs` 等と同じ
-/// 事情）。非 Windows には Windows ローカルグループという概念が無いため、
-/// 常に安全側の `Ok(false)`（操作不可）を返す。
-#[cfg(not(windows))]
+/// グループがこのマシンにまだ作成されていない場合はエラーにせず
+/// `Ok(false)`を返す - 「Operators 委任の日常操作はできないが UAC 経由の
+/// 管理者操作は妨げない」という安全側の既定に合わせるため（呼び出し元は
+/// `false`を「委任された日常操作は不可、UAC へ回す」判断にそのまま使える）。
+///
+/// 非 Windows（banto-hub は Windows 専用製品だが、ワークスペース全体は
+/// 非 Windows でも`cargo check --workspace`が通る必要がある）では、Windows
+/// ローカルグループという概念が無いため常に安全側の`Ok(false)`（操作不可）。
+///
+/// #392 B3-3a で Win32 の呼び出し（`LookupAccountNameW`→
+/// `CheckTokenMembership`）は[`banto_service_elev::is_current_process_member`]
+/// へ移した（挙動は不変）。ここはエラーを従来の文言へ写すだけ。
 pub fn is_current_process_operator() -> Result<bool, OperatorsError> {
-    Ok(false)
+    banto_service_elev::is_current_process_member(OPERATORS_GROUP_NAME)
+        .map_err(OperatorsError::from_elev)
 }
 
 /// 現在のプロセスが Windows ローカル Administrators グループのメンバーかを
-/// 判定する（非 Windows 版、T16-2 第二スライス）。[`is_current_process_operator`]
-/// の非 Windows 版と同じ理由で常に安全側の`Ok(false)`を返す。
-#[cfg(not(windows))]
-pub fn is_current_process_admin() -> Result<bool, OperatorsError> {
-    Ok(false)
-}
-
-/// 現在のプロセスが [`OPERATORS_GROUP_NAME`] ローカルグループのメンバーかを
-/// 判定する（Windows 版）。
-///
-/// グループがこのマシンにまだ作成されていない場合（このスライス時点の
-/// 全環境を含む - slice 2 で UAC helper がインストール時に作成する）は
-/// エラーにせず `Ok(false)` を返す - 「Operators 委任の日常操作はできないが
-/// UAC 経由の管理者操作は妨げない」という安全側の既定に合わせるため
-/// （呼び出し元は `false` を「委任された日常操作は不可、UAC へ回す」判断に
-/// そのまま使える）。
-#[cfg(windows)]
-pub fn is_current_process_operator() -> Result<bool, OperatorsError> {
-    windows_impl::is_current_process_member_of(OPERATORS_GROUP_NAME)
-}
-
-/// 現在のプロセスが Windows ローカル Administrators グループのメンバーかを
-/// 判定する（Windows 版、T16-2 第二スライス - モジュール doc「T16-2 第二
-/// スライスで追加した is_current_process_admin」節参照）。
+/// 判定する（T16-2 第二スライス - モジュール doc「T16-2 第二スライスで追加した
+/// is_current_process_admin」節参照）。
 ///
 /// [`is_current_process_operator`]と同じ`CheckTokenMembership`経路を
-/// グループ名だけ変えて再利用する - Administrators は未作成になることが
-/// ない組み込みグループなので、`lookup_account_sid`が`Ok(None)`
-/// （グループ未検出）を返すことは実運用上起こらないはずだが、万一起きても
-/// 同じ「安全側で`false`」規約に従う。
-#[cfg(windows)]
+/// グループ名だけ変えて再利用する（[`banto_service_elev::is_current_process_admin`]
+/// は[`ADMINISTRATORS_GROUP_NAME`]と同じ英語名を引く）- Administrators は
+/// 未作成になることがない組み込みグループだが、万一見つからなくても同じ
+/// 「安全側で`false`」規約に従う。非 Windows は常に`Ok(false)`。
 pub fn is_current_process_admin() -> Result<bool, OperatorsError> {
-    windows_impl::is_current_process_member_of(ADMINISTRATORS_GROUP_NAME)
+    banto_service_elev::is_current_process_admin().map_err(OperatorsError::from_elev)
 }
 
-// T17-2 スライス2（`service_elevated.rs`）が`lookup_account_sid`を
-// `BantoHub Operators`グループだけでなく指定ユーザー名の SID 解決にも
-// 再利用するため`pub(crate)`にした - スライス1時点では`is_current_process_
-// operator`専用のプライベートヘルパーだったが、`LookupAccountNameW`自体は
-// ユーザー・ローカルグループのどちらの名前解決にも使える汎用 API なので
-// （関数doc参照）、実装を複製せずここを再利用する。
+impl OperatorsError {
+    /// 共有 crate のエラー（中立な文言）を従来の banto-hub の文言の変種へ写す
+    /// （#392 B3-3a）。メンバーシップの判定・SID の解決が返しうるのは
+    /// `LookupAccountName`と`CheckTokenMembership`だけで、残りは
+    /// [`OperatorsError::Elev`]（このモジュールの経路からは返らない）。
+    pub(crate) fn from_elev(err: banto_service_elev::ElevError) -> Self {
+        use banto_service_elev::ElevError;
+        match err {
+            ElevError::LookupAccountName { name, os_error } => OperatorsError::LookupAccountName {
+                group: name,
+                os_error,
+            },
+            ElevError::CheckTokenMembership { os_error } => {
+                OperatorsError::CheckTokenMembership { os_error }
+            }
+            other => OperatorsError::Elev(other),
+        }
+    }
+}
+
+// T17-2 スライス2（`service_elevated.rs`）・profile ACL（`profile_acl.rs`）が
+// アカウント名からの SID の解決に使う。#392 B3-3a で本体は
+// [`banto_service_elev::lookup_account_sid`]へ移し、ここはエラーを従来の
+// 文言へ写す薄い包みだけにした。
 #[cfg(windows)]
 pub(crate) mod windows_impl {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NONE_MAPPED};
-    use windows_sys::Win32::Security::{
-        CheckTokenMembership, LookupAccountNameW, PSID, SID_NAME_USE,
-    };
-
     use super::OperatorsError;
 
-    /// 指定したローカルグループ（[`super::OPERATORS_GROUP_NAME`]または
-    /// [`super::ADMINISTRATORS_GROUP_NAME`]）に現在のプロセスが属するかを
-    /// 判定する共通実装（T16-2 第二スライスで
-    /// `is_current_process_operator`から切り出し、Administrators 判定
-    /// （[`super::is_current_process_admin`]）と共有できるようにした）。
-    pub(super) fn is_current_process_member_of(group_name: &str) -> Result<bool, OperatorsError> {
-        let mut sid = match lookup_account_sid(group_name)? {
-            Some(sid) => sid,
-            // グループ未作成 - モジュール doc・関数 doc の「安全側で false」節。
-            None => return Ok(false),
-        };
-
-        let mut is_member: i32 = 0;
-        // SAFETY: `sid`はこのスコープで生存しており、`lookup_group_sid`が
-        // `LookupAccountNameW`から書き込ませたバイト列そのもの（有効な
-        // `SID`構造体のレイアウト）。`hToken=NULL`は呼び出しスレッドの
-        // 偽装トークン、無ければプロセス主トークンを複製して使う既定挙動
-        // （MSDN `CheckTokenMembership` 参照）。
-        let ok = unsafe {
-            CheckTokenMembership(
-                std::ptr::null_mut(),
-                sid.as_mut_ptr() as PSID,
-                &mut is_member,
-            )
-        };
-        if ok == 0 {
-            let os_error = unsafe { GetLastError() };
-            return Err(OperatorsError::CheckTokenMembership { os_error });
-        }
-        Ok(is_member != 0)
-    }
-
     /// アカウント名（ユーザー名またはローカルグループ名）からこのマシン
-    /// 上の SID を解決する。
-    ///
-    /// `LookupAccountNameW`はユーザーだけでなくローカルグループ（エイリアス、
-    /// `SidTypeAlias`）の名前解決にも使える汎用 API - `service_elevated.rs`
-    /// （T17-2 スライス2）が`BantoHub Operators`グループと指定ユーザー名の
-    /// 両方の SID 解決にこの関数を再利用する。`ERROR_NONE_MAPPED`
-    /// （名前がどのアカウントにも一致しない = 未作成/未存在）は`Ok(None)`
-    /// として区別し、それ以外の失敗のみ`Err`にする - 呼び出し元
-    /// （[`is_current_process_operator`]はこれを「未作成なら false」に、
-    /// `service_elevated`は「アカウント未検出」エラーにそれぞれ変換する）。
+    /// 上の SID を解決する。名前がどのアカウントにも一致しない（未作成/
+    /// 未存在）ときは`Ok(None)`、それ以外の失敗だけ`Err`。
     pub(crate) fn lookup_account_sid(name: &str) -> Result<Option<Vec<u8>>, OperatorsError> {
-        let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let mut sid_size: u32 = 0;
-        let mut domain_size: u32 = 0;
-        let mut sid_name_use: SID_NAME_USE = 0;
-
-        // 1回目: サイズ問い合わせ。バッファ長 0 で呼び、必要な `sid_size`/
-        // `domain_size`を`ERROR_INSUFFICIENT_BUFFER`と共に受け取る
-        // `LookupAccountNameW`の標準的な2段呼び出しパターン
-        // （戻り値の成否そのものは見ず、`GetLastError`で分岐する）。
-        unsafe {
-            LookupAccountNameW(
-                std::ptr::null(),
-                wide_name.as_ptr(),
-                std::ptr::null_mut(),
-                &mut sid_size,
-                std::ptr::null_mut(),
-                &mut domain_size,
-                &mut sid_name_use,
-            );
-        }
-        let first_error = unsafe { GetLastError() };
-        if first_error == ERROR_NONE_MAPPED {
-            return Ok(None);
-        }
-        if sid_size == 0 {
-            return Err(OperatorsError::LookupAccountName {
-                group: name.to_string(),
-                os_error: first_error,
-            });
-        }
-
-        let mut sid_buf = vec![0u8; sid_size as usize];
-        let mut domain_buf = vec![0u16; domain_size.max(1) as usize];
-
-        // 2回目: 実際の SID・ドメイン名バッファを渡して解決する。
-        // SAFETY: `sid_buf`/`domain_buf`は直前に確保した1回目の呼び出しが
-        // 報告したサイズちょうどのバッファで、`sid_size`/`domain_size`へ
-        // 実際の書き込みサイズが上書きされる（呼び出し規約どおり）。
-        let ok = unsafe {
-            LookupAccountNameW(
-                std::ptr::null(),
-                wide_name.as_ptr(),
-                sid_buf.as_mut_ptr() as PSID,
-                &mut sid_size,
-                domain_buf.as_mut_ptr(),
-                &mut domain_size,
-                &mut sid_name_use,
-            )
-        };
-        if ok == 0 {
-            let os_error = unsafe { GetLastError() };
-            if os_error == ERROR_NONE_MAPPED {
-                return Ok(None);
-            }
-            return Err(OperatorsError::LookupAccountName {
-                group: name.to_string(),
-                os_error,
-            });
-        }
-
-        Ok(Some(sid_buf))
+        banto_service_elev::lookup_account_sid(name).map_err(OperatorsError::from_elev)
     }
 }
 

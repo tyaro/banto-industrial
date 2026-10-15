@@ -41,6 +41,16 @@ banto-desktop-tray = { path = "../../../crates/banto-desktop-tray" }
 # Desktop↔Service 切替ウィザード（`host_switch_status`/`host_switch_progress`
 # invoke 面）の DTO・イベントペイロードのシリアライズ用。
 serde = { workspace = true }
+# `set_service_autostart` invoke が `banto-hub-elev.exe` を UAC 昇格して
+# 起動する（`ShellExecuteExW`、verb "runas"）。#392 B3-3a で、ここに直接
+# 持っていた Win32 の呼び出し（と `windows-sys` の依存）を共有 crate の
+# `banto_service_elev::launch::run_elevated` へ移した（ChronoGazer のシェルも
+# 同じ口を使う）。昇格プロセスをいつ起動するかを決めるのは composition root で
+# あるこの crate、という役割分担は変わらない。エラーの型（`LaunchError`）は
+# 全 OS で使えるので、文言の写しのテストが Windows 以外でも動くよう、
+# target を限らない依存にしている（Win32 の部分は crate の中で
+# `#[cfg(windows)]`）。
+banto-service-elev = { path = "../../../crates/banto-service-elev" }
 
 # #505 のテスト専用: 窓の CSP（`tauri.conf.json`）が Hub の応答の CSP（banto の
 # `CONTENT_SECURITY_POLICY`）に Tauri の IPC を足しただけか、banto の
@@ -51,19 +61,3 @@ serde = { workspace = true }
 banto-server = { workspace = true }
 serde_json = { workspace = true }
 
-# `set_service_autostart` invoke が `banto-hub-elev.exe` を UAC 昇格して
-# 起動する（`ShellExecuteExW`、verb "runas"）ためだけの Windows API 依存。
-# `apps/banto-hub/core`が既に同じ 0.61 系を使っている（`core/Cargo.toml`
-# 参照）ので新規バージョン系列は増えない。`banto_hub_core::service_elevated`
-# 側は昇格後の実処理（`autostart-enable`/`-disable`）だけを持ち、昇格
-# プロセス自体の起動はシェル側の責務（呼び出し元がどのプロセスを UI 経由で
-# 起動するかを決めるのは composition root であるこの crate、という既存の
-# 役割分担と同じ）。
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_System_Registry",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }

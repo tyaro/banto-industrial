@@ -120,7 +120,7 @@
 //! `BantoHub`サービスオブジェクトの**既存 DACL に追記する形**（丸ごと置換
 //! しない - `QueryServiceObjectSecurity`→`GetSecurityDescriptorDacl`→
 //! `SetEntriesInAclW`でマージ→`SetServiceObjectSecurity`、
-//! [`windows_impl::grant_service_acl`]参照）で、`BantoHub Operators`グループの
+//! [`banto_service_elev::grant_service_operators`]参照）で、`BantoHub Operators`グループの
 //! SID に対して次の ACE のみを追加する:
 //!
 //! ```text
@@ -147,7 +147,8 @@
 //! ## エラーハンドリング
 //!
 //! Win32 API 呼び出しの失敗は[`ElevatedError`]（thiserror、日本語メッセージ）
-//! にマッピングする。[`crate::service_operators::OperatorsError`]・
+//! にマッピングする（共有 crate `banto-service-elev`のエラーは
+//! [`map_elev_error`]で移す前と同じ文言の変種へ写す - 下の「#392 B3-3a」節）。[`crate::service_operators::OperatorsError`]・
 //! [`crate::service_manager::ServiceManagerError`]は`#[from]`で包む
 //! （前者は透過、後者の文言は`describe_service_error`で banto-hub の文言に
 //! する。B2-4a）。
@@ -196,6 +197,37 @@
 //! `grant-service-acl BantoHubSink`引数付きで起動するだけ - Win32 の
 //! SDDL/ACE コードはこのモジュールの実装1箇所のままで、サイドカー側は
 //! 一切複製しない。
+//!
+//! ## #392 B3-3a: Win32 の部分を共有 crate `banto-service-elev`へ
+//!
+//! ChronoGazer の昇格ヘルパー（`chronogazer-elev.exe`、B3-3b）と同じ Win32 の
+//! 呼び出しを使うため、次をこのモジュール（と[`crate::service_operators`]）
+//! から共有 crate へ移した（2026-10-16 オーナー決定: 昇格する exe は製品ごと、
+//! 共有するのは Win32 の部品だけ）:
+//!
+//! - ローカルグループの作成（`NetLocalGroupAdd`）→
+//!   [`banto_service_elev::ensure_local_group`]
+//! - 名前でのメンバーの追加（`NetLocalGroupAddMembers` level 3）→
+//!   [`banto_service_elev::add_member_name`]
+//! - サービス DACL への Operators の ACE（`QueryServiceObjectSecurity`→
+//!   `SetEntriesInAclW`（`SET_ACCESS`）→`SetServiceObjectSecurity`）→
+//!   [`banto_service_elev::grant_service_operators`]
+//! - アクセス権の数値・SDDL の権利の文字列 →
+//!   [`banto_service_elev::OPERATORS_SERVICE_ACCESS_MASK`]・
+//!   [`banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS`]
+//!
+//! **このモジュールに残したもの**（昇格の境界）: 9 つの固定アクション
+//! （[`ElevatedAction`]）、アクションごとの引数の検証（`run`）、手順の順序
+//! （`service-install`の install → setup-operators → grant-service-acl →
+//! grant-profile-acl）、グループ名と説明文（[`crate::service_operators::OPERATORS_GROUP`]）、
+//! 既定のサービス名、利用者に見える文言（[`ElevatedError`]）、`GetUserNameW`・
+//! コンソールの入出力、profile ACL（[`crate::profile_acl`]）。exe と
+//! マニフェスト（`bin/banto-hub-elev.rs`・`banto-hub-elev.manifest`）も変えて
+//! いない。挙動は不変: Win32 の呼び出しの順序・引数・「既に存在する」とみなす
+//! 戻り値は移す前のまま、標準エラー出力の文言は[`map_elev_error`]で移す前と
+//! 1 バイトも変えない（golden テスト`elev_error_wording_is_unchanged`）。
+//! `banto-hub-sink`は従来どおり`banto-hub-elev.exe grant-service-acl BantoHubSink`
+//! を子プロセスで呼ぶ（変更なし）。
 
 use thiserror::Error;
 
@@ -285,22 +317,22 @@ impl std::fmt::Display for ElevatedAction {
 /// [`ElevatedAction::GrantServiceAcl`]が付与する Win32 サービスアクセス権の
 /// ビットマスク（`SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
 /// SERVICE_START | SERVICE_STOP`の数値そのもの、モジュール doc「SDDL」節
-/// 参照）。windows-sys の対応する定数へ依存を増やさず、
-/// クロスプラットフォームでテストできるようこのモジュール冒頭に平文の
-/// 数値で持つ - 実際の値が windows-sys の定数と一致することは
-/// `service_acl_access_mask_matches_win32_constants`（`#[cfg(windows)]`）が
-/// 固定する。
-pub const OPERATORS_SERVICE_ACCESS_MASK: u32 = 0x0001 | 0x0004 | 0x0010 | 0x0020;
+/// 参照）。#392 B3-3a から共有 crate の
+/// [`banto_service_elev::OPERATORS_SERVICE_ACCESS_MASK`]（同じ数値）を指す -
+/// windows-sys の定数と一致することはその crate の
+/// `numeric_constants_match_windows_sys`（`#[cfg(windows)]`）が固定する。
+pub const OPERATORS_SERVICE_ACCESS_MASK: u32 = banto_service_elev::OPERATORS_SERVICE_ACCESS_MASK;
 
 /// 上記アクセス権を SDDL のサービス用アクセス権文字列で表したもの
 /// （モジュール doc「SDDL」節参照、`CC`+`LC`+`RP`+`WP`）。
-pub const OPERATORS_SERVICE_ACL_SDDL_RIGHTS: &str = "CCLCRPWP";
+pub const OPERATORS_SERVICE_ACL_SDDL_RIGHTS: &str =
+    banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS;
 
 /// [`ElevatedAction::GrantServiceAcl`]が実際に追加する ACE を表す SDDL
 /// テンプレート - `{sid}`の部分は実行時に解決した`BantoHub Operators`の
 /// SID（`S-1-5-21-...`形式）に置き換わる。**このモジュールは実際には
 /// `ConvertStringSecurityDescriptorToSecurityDescriptorW`でこの文字列を
-/// パースするのではなく**、[`windows_impl::grant_service_acl`]が
+/// パースするのではなく**、[`banto_service_elev::grant_service_operators`]が
 /// `EXPLICIT_ACCESS_W`+`SetEntriesInAclW`で同じ内容の ACE を直接組み立てる
 /// （SID は実行時解決が必要なため、静的な SDDL 文字列に埋め込めない -
 /// モジュール doc参照）。この定数はドキュメント・監査用の表現。
@@ -325,7 +357,7 @@ pub enum ElevatedError {
     /// (1379)以外の理由で失敗した - どちらも「グループが既に存在する」を
     /// 意味する Win32 の戻り値だが、実機検証で環境によって後者が返る
     /// ケースを確認したため両方を成功として扱う
-    /// （`create_group_if_missing`参照）。
+    /// （`create_group_if_missing`・`banto_service_elev::classify_group_add_status`参照）。
     #[error(
         "banto-hub-elev: ローカルグループ '{group}' の作成に失敗しました (NetLocalGroupAdd, status {status})"
     )]
@@ -334,7 +366,7 @@ pub enum ElevatedError {
     /// `ERROR_MEMBER_IN_ALIAS`(1378)以外の理由で失敗した（典型例: 指定
     /// ユーザーが存在しない = `NERR_UserNotFound`）。どちらも「既に
     /// メンバーである」を意味する Win32 の戻り値 -
-    /// `add_member_if_missing`参照。
+    /// `add_member_if_missing`・`banto_service_elev::classify_member_add_status`参照。
     #[error(
         "banto-hub-elev: ユーザー '{user}' をグループ '{group}' に追加できませんでした (NetLocalGroupAddMembers, status {status})"
     )]
@@ -451,6 +483,57 @@ pub enum ElevatedError {
     /// `bin/banto-hub.rs`と同じパターン）に失敗した。
     #[error("banto-hub-elev: 非同期ランタイムの起動に失敗しました: {0}")]
     RuntimeStartFailed(String),
+    /// 共有 crate（`banto-service-elev`）のエラーのうち、banto-hub の経路からは
+    /// 返らないもの（SID で渡すメンバーの追加の`InvalidSid`・`ConvertSid`）。
+    /// [`map_elev_error`]の写しを網羅にするための変種（#392 B3-3a）。
+    #[error("banto-hub-elev: {0}")]
+    Elev(banto_service_elev::ElevError),
+}
+
+/// 共有 crate `banto-service-elev` のエラー（中立な文言）を、移す前と同じ
+/// 文言の[`ElevatedError`]へ写す（#392 B3-3a）。`banto-hub-elev`の標準エラー
+/// 出力（`banto-hub-elev: {err}`）は移す前と 1 バイトも変わらない
+/// （`elev_error_wording_is_unchanged`の golden テスト）。
+/// 呼ぶのは Windows だけの経路とテストなので、それ以外では作らない（Linux の
+/// clippy の `dead_code`）。
+#[cfg(any(windows, test))]
+pub(crate) fn map_elev_error(err: banto_service_elev::ElevError) -> ElevatedError {
+    use banto_service_elev::ElevError as E;
+    match err {
+        E::LookupAccountName { .. } | E::CheckTokenMembership { .. } => {
+            ElevatedError::Operators(crate::service_operators::OperatorsError::from_elev(err))
+        }
+        E::CreateGroup { group, status } => ElevatedError::CreateGroupFailed { group, status },
+        E::AddMember {
+            member,
+            group,
+            status,
+        } => ElevatedError::AddMemberFailed {
+            user: member,
+            group,
+            status,
+        },
+        E::GroupNotFound(group) => ElevatedError::OperatorsGroupNotFound(group),
+        E::OpenScm(os_error) => ElevatedError::OpenScmFailed(os_error),
+        E::OpenService { service, os_error } => {
+            ElevatedError::OpenServiceFailed { service, os_error }
+        }
+        E::QuerySecurity { service, os_error } => {
+            ElevatedError::QuerySecurityFailed { service, os_error }
+        }
+        E::GetDacl(os_error) => ElevatedError::GetDaclFailed(os_error),
+        E::SetEntriesInAcl(status) => ElevatedError::SetEntriesInAclFailed(status),
+        E::InitializeSecurityDescriptor(os_error) => {
+            ElevatedError::InitializeSecurityDescriptorFailed(os_error)
+        }
+        E::SetSecurityDescriptorDacl(os_error) => {
+            ElevatedError::SetSecurityDescriptorDaclFailed(os_error)
+        }
+        E::SetServiceSecurity { service, os_error } => {
+            ElevatedError::SetServiceSecurityFailed { service, os_error }
+        }
+        other @ (E::InvalidSid(_) | E::ConvertSid { .. }) => ElevatedError::Elev(other),
+    }
 }
 
 /// [`ElevatedAction::SetupOperators`]の本体（`user`省略時は現在の対話
@@ -850,52 +933,15 @@ fn resolve_service_acl_target(args: &[String]) -> &str {
 #[cfg(windows)]
 mod windows_impl {
     use windows_sys::Win32::Foundation::{
-        GetLastError, LocalFree, ERROR_ALIAS_EXISTS, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_MEMBER_IN_ALIAS, HLOCAL, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::NetworkManagement::NetManagement::{
-        NERR_GroupExists, NERR_Success, NERR_UserInGroup, NetLocalGroupAdd,
-        NetLocalGroupAddMembers, LOCALGROUP_INFO_1, LOCALGROUP_MEMBERS_INFO_3,
-    };
-    use windows_sys::Win32::Security::Authorization::{
-        SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_IS_GROUP,
-        TRUSTEE_IS_SID, TRUSTEE_W,
-    };
-    use windows_sys::Win32::Security::{
-        GetSecurityDescriptorDacl, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL,
-        PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR,
+        GetLastError, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
     };
-    use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceObjectSecurity,
-        SetServiceObjectSecurity, SC_HANDLE, SC_MANAGER_CONNECT,
-    };
     use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 
-    use super::{ElevatedError, OPERATORS_SERVICE_ACCESS_MASK};
-    use crate::service_operators::{windows_impl::lookup_account_sid, OPERATORS_GROUP_NAME};
-
-    /// `DACL_SECURITY_INFORMATION`（`windows-sys`は`Win32_System_Services`
-    /// 側からもこの値を再エクスポートしていないため、値そのもの
-    /// （MSDN で安定して文書化された定数）をここで定義する -
-    /// `service_install.rs`等の既存 doc が採る「見つからない定数は
-    /// ハードコードする」方針と同じ）。
-    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    /// `SECURITY_DESCRIPTOR_REVISION`（同上の理由でハードコード。値は
-    /// `windows-sys`の`Win32::System::SystemServices`側にも同じ`1`が
-    /// 定義されている）。
-    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
-    /// サービスオブジェクトの DACL を読む・書き換えるための標準アクセス権
-    /// （`STANDARD_RIGHTS_READ`/`_WRITE`相当。数値はどの securable object
-    /// にも共通の Win32 標準値 - MSDN `ACCESS_MASK`参照）。
-    const READ_CONTROL: u32 = 0x0002_0000;
-    const WRITE_DAC: u32 = 0x0004_0000;
-
-    fn to_wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
+    use super::{map_elev_error, ElevatedError};
+    use crate::service_operators::OPERATORS_GROUP;
 
     /// 現在のプロセスの実行アカウント名を`GetUserNameW`で取得する。
     ///
@@ -1022,96 +1068,32 @@ mod windows_impl {
         Ok(())
     }
 
+    /// `BantoHub Operators`を無ければ作る（#392 B3-3a で Win32 の本体は
+    /// [`banto_service_elev::ensure_local_group`]へ移した。`NERR_GroupExists`・
+    /// `ERROR_ALIAS_EXISTS`を「既にある」とみなすのも移す前のまま - T17-2 の
+    /// 実機で 2 回目に後者が返る環境を確かめた）。
     fn create_group_if_missing() -> Result<(), ElevatedError> {
-        let mut name_wide = to_wide(OPERATORS_GROUP_NAME);
-        let mut comment_wide = to_wide(
-            "banto-hub のサービス操作（開始/停止/状態照会）を委任されたユーザーのグループ（banto-hub-elev.exe が自動作成）",
-        );
-        let info = LOCALGROUP_INFO_1 {
-            lgrpi1_name: name_wide.as_mut_ptr(),
-            lgrpi1_comment: comment_wide.as_mut_ptr(),
-        };
-        let mut parm_err: u32 = 0;
-        // SAFETY: `info`は`name_wide`/`comment_wide`（このスコープで生存）
-        // へのポインタのみを持つ。`level=1`は`LOCALGROUP_INFO_1`に対応する
-        // （NetLocalGroupAdd の契約）。
-        let status = unsafe {
-            NetLocalGroupAdd(
-                std::ptr::null(),
-                1,
-                &info as *const LOCALGROUP_INFO_1 as *const u8,
-                &mut parm_err,
-            )
-        };
-        // `NERR_Success`/`NERR_GroupExists`は windows-sys 側の定数名が
-        // 大文字始まりでない（`Win32 ヘッダー名をそのまま踏襲）ため、
-        // パターンマッチにすると`non_upper_case_globals`警告になる
-        // （`clippy -D warnings`で失敗する）- `if`の等値比較にして回避する。
-        //
-        // `ERROR_ALIAS_EXISTS`(1379)も`NERR_GroupExists`(2223)と同じく
-        // 「グループが既に存在する」を意味する - T17-2 実機検証で、2回目の
-        // `setup-operators`実行時に`NetLocalGroupAdd`が`NERR_GroupExists`
-        // ではなく`ERROR_ALIAS_EXISTS`を返すケースを確認したため、両方を
-        // 冪等な成功として扱う（`ElevatedError::CreateGroupFailed`doc参照）。
-        if status == NERR_Success || status == NERR_GroupExists || status == ERROR_ALIAS_EXISTS {
-            // 既に存在するグループも冪等性のため成功として扱う
-            // （モジュール doc「setup-operators」節参照）。
-            return Ok(());
-        }
-        Err(ElevatedError::CreateGroupFailed {
-            group: OPERATORS_GROUP_NAME.to_string(),
-            status,
-        })
+        banto_service_elev::ensure_local_group(&OPERATORS_GROUP)
+            .map(|_| ())
+            .map_err(map_elev_error)
     }
 
+    /// 利用者を名前で`BantoHub Operators`へ足す（既にメンバーなら何もしない。
+    /// Win32 の本体は[`banto_service_elev::add_member_name`]、#392 B3-3a）。
     fn add_member_if_missing(user_name: &str) -> Result<(), ElevatedError> {
-        let group_wide = to_wide(OPERATORS_GROUP_NAME);
-        let mut member_wide = to_wide(user_name);
-        let info = LOCALGROUP_MEMBERS_INFO_3 {
-            lgrmi3_domainandname: member_wide.as_mut_ptr(),
-        };
-        // SAFETY: `group_wide`/`member_wide`はこのスコープで生存している。
-        // `level=3`は`LOCALGROUP_MEMBERS_INFO_3`（名前ベース、SID解決は
-        // API内部で行われる）に対応する。
-        let status = unsafe {
-            NetLocalGroupAddMembers(
-                std::ptr::null(),
-                group_wide.as_ptr(),
-                3,
-                &info as *const LOCALGROUP_MEMBERS_INFO_3 as *const u8,
-                1,
-            )
-        };
-        // 上の`create_group_if_missing`と同じ理由で`if`の等値比較にする。
-        // `ERROR_MEMBER_IN_ALIAS`(1378)も`NERR_UserInGroup`(2236)と同じく
-        // 「既にメンバーである」を意味する（MSDN 上、`NetLocalGroupAddMembers`
-        // はどちらの値も返しうる - `create_group_if_missing`の
-        // `ERROR_ALIAS_EXISTS`と対になる注記、`ElevatedError::AddMemberFailed`
-        // doc参照）。
-        if status == NERR_Success || status == NERR_UserInGroup || status == ERROR_MEMBER_IN_ALIAS {
-            // 既にメンバーの場合も冪等性のため成功として扱う。
-            return Ok(());
-        }
-        Err(ElevatedError::AddMemberFailed {
-            user: user_name.to_string(),
-            group: OPERATORS_GROUP_NAME.to_string(),
-            status,
-        })
+        banto_service_elev::add_member_name(&OPERATORS_GROUP, user_name)
+            .map(|_| ())
+            .map_err(map_elev_error)
     }
 
     /// [`super::grant_service_acl_for`]の本体（モジュール doc「SDDL」節・
-    /// 「S6 申し送りの follow-up」節参照）。`service_name`以外は
-    /// パラメータ化前の`grant_service_acl`から1バイトも変えていない。
+    /// 「S6 申し送りの follow-up」節参照）。#392 B3-3a で Win32 の本体
+    /// （グループの SID の解決 → SCM → 既存の DACL への`SET_ACCESS`のマージ →
+    /// `SetServiceObjectSecurity`）は[`banto_service_elev::grant_service_operators`]
+    /// へ移した。順序・付ける ACE は移す前のまま。
     pub(super) fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
-        let mut operators_sid = lookup_account_sid(OPERATORS_GROUP_NAME)?.ok_or_else(|| {
-            ElevatedError::OperatorsGroupNotFound(OPERATORS_GROUP_NAME.to_string())
-        })?;
-
-        let scm = open_scm()?;
-        let result = grant_service_acl_with_scm(scm, service_name, &mut operators_sid);
-        // SAFETY: `scm`は`open_scm`が返した有効なハンドル。
-        unsafe { CloseServiceHandle(scm) };
-        result
+        banto_service_elev::grant_service_operators(service_name, &OPERATORS_GROUP)
+            .map_err(map_elev_error)
     }
 
     /// [`super::grant_profile_acl`]の本体（モジュール doc「profile ACL」節
@@ -1147,199 +1129,6 @@ mod windows_impl {
         let paths = crate::profile_paths::resolve_profile_paths(&root, profile_id)?;
 
         crate::profile_acl::grant_profile_owner_acl(&paths.profile_dir, user_name)?;
-        Ok(())
-    }
-
-    fn open_scm() -> Result<SC_HANDLE, ElevatedError> {
-        // SAFETY: 引数はすべて null（ローカルマシン・既定データベース）。
-        let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
-        if scm.is_null() {
-            let os_error = unsafe { GetLastError() };
-            return Err(ElevatedError::OpenScmFailed(os_error));
-        }
-        Ok(scm)
-    }
-
-    fn grant_service_acl_with_scm(
-        scm: SC_HANDLE,
-        service_name: &str,
-        operators_sid: &mut [u8],
-    ) -> Result<(), ElevatedError> {
-        let service_wide = to_wide(service_name);
-        // SAFETY: `scm`は呼び出し元が確保した有効なハンドル。
-        let service = unsafe { OpenServiceW(scm, service_wide.as_ptr(), READ_CONTROL | WRITE_DAC) };
-        if service.is_null() {
-            let os_error = unsafe { GetLastError() };
-            return Err(ElevatedError::OpenServiceFailed {
-                service: service_name.to_string(),
-                os_error,
-            });
-        }
-
-        let result = grant_service_acl_with_service(service, service_name, operators_sid);
-        // SAFETY: `service`は直前に`OpenServiceW`が返した有効なハンドル。
-        unsafe { CloseServiceHandle(service) };
-        result
-    }
-
-    fn grant_service_acl_with_service(
-        service: SC_HANDLE,
-        service_name: &str,
-        operators_sid: &mut [u8],
-    ) -> Result<(), ElevatedError> {
-        // 1回目: 必要バッファサイズの問い合わせ（`QueryServiceObjectSecurity`
-        // の標準的な2段呼び出しパターン - `service_operators.rs`の
-        // `LookupAccountNameW`と同じ考え方）。
-        let mut needed: u32 = 0;
-        // SAFETY: バッファ長 0・null ポインタで呼ぶのは Win32 の想定どおり
-        // （FALSE を返し`needed`へ必要サイズを書き込む）。
-        unsafe {
-            QueryServiceObjectSecurity(
-                service,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                0,
-                &mut needed,
-            )
-        };
-        if needed == 0 {
-            let os_error = unsafe { GetLastError() };
-            return Err(ElevatedError::QuerySecurityFailed {
-                service: service_name.to_string(),
-                os_error,
-            });
-        }
-
-        let mut sd_buf = vec![0u8; needed as usize];
-        // SAFETY: `sd_buf`は直前の呼び出しが報告したサイズちょうどの
-        // バッファ。
-        let ok = unsafe {
-            QueryServiceObjectSecurity(
-                service,
-                DACL_SECURITY_INFORMATION,
-                sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR,
-                needed,
-                &mut needed,
-            )
-        };
-        if ok == 0 {
-            let os_error = unsafe { GetLastError() };
-            return Err(ElevatedError::QuerySecurityFailed {
-                service: service_name.to_string(),
-                os_error,
-            });
-        }
-
-        let mut dacl_present: i32 = 0;
-        let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
-        let mut dacl_defaulted: i32 = 0;
-        // SAFETY: `sd_buf`は直前に`QueryServiceObjectSecurity`が書き込んだ
-        // 有効なセキュリティ記述子。
-        let ok = unsafe {
-            GetSecurityDescriptorDacl(
-                sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR,
-                &mut dacl_present,
-                &mut dacl_ptr,
-                &mut dacl_defaulted,
-            )
-        };
-        if ok == 0 {
-            let os_error = unsafe { GetLastError() };
-            return Err(ElevatedError::GetDaclFailed(os_error));
-        }
-        let old_dacl: *const ACL = if dacl_present != 0 {
-            dacl_ptr as *const ACL
-        } else {
-            std::ptr::null()
-        };
-
-        let trustee = TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_GROUP,
-            // Win32 API の慣例どおり、`ptstrName`フィールドへ SID への
-            // ポインタをそのままキャストして渡す
-            // （`TrusteeForm=TRUSTEE_IS_SID`の場合の契約 - MSDN
-            // `TRUSTEE`構造体参照）。
-            ptstrName: operators_sid.as_mut_ptr() as *mut u16,
-        };
-
-        let explicit_access = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: OPERATORS_SERVICE_ACCESS_MASK,
-            // `SET_ACCESS`: 同じ trustee の既存エントリがあれば置き換える
-            // （`GRANT_ACCESS`のような加算マージではない）- 再実行しても
-            // 権限が増え続けない冪等性を保つため。
-            grfAccessMode: SET_ACCESS,
-            // サービスオブジェクトは子オブジェクトを持たないため継承は
-            // 無関係（`NO_INHERITANCE`は数値上`0` - `windows-sys`に定数が
-            // 存在しないため直接`0`を使う）。
-            grfInheritance: 0,
-            Trustee: trustee,
-        };
-
-        let mut new_acl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: `old_dacl`は上で取得した有効な（または未設定なら null の）
-        // ACL、`explicit_access`はこのスコープで生存している。
-        let status = unsafe { SetEntriesInAclW(1, &explicit_access, old_dacl, &mut new_acl) };
-        if status != 0 {
-            return Err(ElevatedError::SetEntriesInAclFailed(status));
-        }
-
-        let cleanup_new_acl = || {
-            // SAFETY: `new_acl`は`SetEntriesInAclW`が`LocalAlloc`で確保した
-            // メモリ（MSDN の契約どおり`LocalFree`で解放する）。
-            unsafe { LocalFree(new_acl as HLOCAL) };
-        };
-
-        let mut new_sd = SECURITY_DESCRIPTOR::default();
-        // SAFETY: `new_sd`はこのスコープの固定サイズローカル変数。
-        let ok = unsafe {
-            InitializeSecurityDescriptor(
-                &mut new_sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
-                SECURITY_DESCRIPTOR_REVISION,
-            )
-        };
-        if ok == 0 {
-            let os_error = unsafe { GetLastError() };
-            cleanup_new_acl();
-            return Err(ElevatedError::InitializeSecurityDescriptorFailed(os_error));
-        }
-
-        // SAFETY: `new_acl`は直前に構築した有効な ACL、`new_sd`は
-        // 初期化済みのセキュリティ記述子。
-        let ok = unsafe {
-            SetSecurityDescriptorDacl(
-                &mut new_sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
-                1,
-                new_acl,
-                0,
-            )
-        };
-        if ok == 0 {
-            let os_error = unsafe { GetLastError() };
-            cleanup_new_acl();
-            return Err(ElevatedError::SetSecurityDescriptorDaclFailed(os_error));
-        }
-
-        // SAFETY: `service`は呼び出し元が確保した有効なハンドル、`new_sd`は
-        // 直前に DACL を設定済みの有効なセキュリティ記述子。
-        let ok = unsafe {
-            SetServiceObjectSecurity(
-                service,
-                DACL_SECURITY_INFORMATION,
-                &mut new_sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
-            )
-        };
-        cleanup_new_acl();
-        if ok == 0 {
-            let os_error = unsafe { GetLastError() };
-            return Err(ElevatedError::SetServiceSecurityFailed {
-                service: service_name.to_string(),
-                os_error,
-            });
-        }
-
         Ok(())
     }
 }
@@ -1489,38 +1278,120 @@ mod tests {
         assert_eq!(resolve_service_acl_target(&args), "BantoHubSink");
     }
 
-    /// `create_group_if_missing`/`add_member_if_missing`が「既に存在する」
-    /// 判定に使う追加の Win32 エラーコードの実値を固定する - T17-2 実機
-    /// 検証（2回目の`setup-operators`実行）で`NetLocalGroupAdd`が
-    /// `NERR_GroupExists`(2223)ではなく`ERROR_ALIAS_EXISTS`(1379)を返す
-    /// ケースを確認した際の回帰防止。windows-sys のクレートバージョン変更で
-    /// これらの数値が変わった場合にビルドが失敗する
-    /// （`#[cfg(windows)]`のみ - MSDN で安定して文書化された Win32 の
-    /// エラーコードだが、非 Windows ビルドでは windows-sys 自体を使わない）。
-    #[cfg(windows)]
+    /// 「既に存在する」とみなす Win32 の戻り値（`ERROR_ALIAS_EXISTS`(1379)・
+    /// `ERROR_MEMBER_IN_ALIAS`(1378)を含む - T17-2 の実機で見つけた不具合の
+    /// 回帰防止）とアクセス権の windows-sys の定数との一致は、#392 B3-3a で
+    /// 本体と一緒に`banto-service-elev`のテスト（`classify_*`・
+    /// `numeric_constants_match_windows_sys`）へ移した。ここでは banto-hub が
+    /// その分類に従うことだけを固定する。
     #[test]
-    fn alias_exists_error_codes_match_win32_constants() {
-        use windows_sys::Win32::Foundation::{ERROR_ALIAS_EXISTS, ERROR_MEMBER_IN_ALIAS};
+    fn group_and_member_exists_codes_are_treated_as_success() {
+        use banto_service_elev::{
+            classify_group_add_status, classify_member_add_status, GroupOutcome, MemberOutcome,
+        };
+        assert_eq!(classify_group_add_status(2223), Some(GroupOutcome::Existed));
+        assert_eq!(classify_group_add_status(1379), Some(GroupOutcome::Existed));
         assert_eq!(
-            ERROR_ALIAS_EXISTS, 1379,
-            "ERROR_ALIAS_EXISTS の値が変わった"
+            classify_member_add_status(2236),
+            Some(MemberOutcome::AlreadyMember)
         );
         assert_eq!(
-            ERROR_MEMBER_IN_ALIAS, 1378,
-            "ERROR_MEMBER_IN_ALIAS の値が変わった"
+            classify_member_add_status(1378),
+            Some(MemberOutcome::AlreadyMember)
         );
     }
 
-    #[cfg(windows)]
+    /// `banto-hub-elev`がエラーで出す行（`banto-hub-elev: {err}`）の文言を、
+    /// #392 B3-3a で Win32 の本体を共有 crate へ移す前と 1 バイトも変えない
+    /// （golden。期待値は移す前の`#[error]`の書式から組み立てた文字列そのもの）。
     #[test]
-    fn service_acl_access_mask_matches_win32_constants() {
-        use windows_sys::Win32::System::Services::{
-            SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STOP,
-        };
-        assert_eq!(
-            OPERATORS_SERVICE_ACCESS_MASK,
-            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP
-        );
+    fn elev_error_wording_is_unchanged() {
+        use banto_service_elev::ElevError as E;
+        let cases: Vec<(E, &str)> = vec![
+            (
+                E::LookupAccountName {
+                    name: "BantoHub Operators".into(),
+                    os_error: 1332,
+                },
+                "banto-hub: ローカルグループ 'BantoHub Operators' の SID 解決に失敗しました (LookupAccountNameW, os error 1332)",
+            ),
+            (
+                E::CheckTokenMembership { os_error: 5 },
+                "banto-hub: プロセストークンのメンバーシップ確認に失敗しました (CheckTokenMembership, os error 5)",
+            ),
+            (
+                E::CreateGroup {
+                    group: "BantoHub Operators".into(),
+                    status: 5,
+                },
+                "banto-hub-elev: ローカルグループ 'BantoHub Operators' の作成に失敗しました (NetLocalGroupAdd, status 5)",
+            ),
+            (
+                E::AddMember {
+                    member: "DESKTOP\\owner".into(),
+                    group: "BantoHub Operators".into(),
+                    status: 2221,
+                },
+                "banto-hub-elev: ユーザー 'DESKTOP\\owner' をグループ 'BantoHub Operators' に追加できませんでした (NetLocalGroupAddMembers, status 2221)",
+            ),
+            (
+                E::GroupNotFound("BantoHub Operators".into()),
+                "banto-hub-elev: グループ 'BantoHub Operators' がまだ作成されていません。先に setup-operators を実行してください",
+            ),
+            (
+                E::OpenScm(5),
+                "banto-hub-elev: Service Control Manager への接続に失敗しました (os error 5)",
+            ),
+            (
+                E::OpenService {
+                    service: "BantoHubSink".into(),
+                    os_error: 1060,
+                },
+                "banto-hub-elev: サービス 'BantoHubSink' のオープンに失敗しました (os error 1060)",
+            ),
+            (
+                E::QuerySecurity {
+                    service: "BantoHub".into(),
+                    os_error: 5,
+                },
+                "banto-hub-elev: サービス 'BantoHub' のセキュリティ記述子取得に失敗しました (QueryServiceObjectSecurity, os error 5)",
+            ),
+            (
+                E::GetDacl(87),
+                "banto-hub-elev: 既存 DACL の取得に失敗しました (GetSecurityDescriptorDacl, os error 87)",
+            ),
+            (
+                E::SetEntriesInAcl(87),
+                "banto-hub-elev: ACL への ACE 追加に失敗しました (SetEntriesInAclW, status 87)",
+            ),
+            (
+                E::InitializeSecurityDescriptor(87),
+                "banto-hub-elev: セキュリティ記述子の初期化に失敗しました (InitializeSecurityDescriptor, os error 87)",
+            ),
+            (
+                E::SetSecurityDescriptorDacl(87),
+                "banto-hub-elev: DACL の設定に失敗しました (SetSecurityDescriptorDacl, os error 87)",
+            ),
+            (
+                E::SetServiceSecurity {
+                    service: "BantoHub".into(),
+                    os_error: 5,
+                },
+                "banto-hub-elev: サービス 'BantoHub' へのセキュリティ記述子適用に失敗しました (SetServiceObjectSecurity, os error 5)",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(map_elev_error(err).to_string(), expected);
+        }
+    }
+
+    /// banto-hub の経路からは返らない変種も、`banto-hub-elev: `を付けて出す
+    /// （写しが網羅であることの確認）。
+    #[test]
+    fn elev_errors_outside_hub_paths_keep_the_prefix() {
+        let err = map_elev_error(banto_service_elev::ElevError::InvalidSid("x".into()));
+        assert!(matches!(err, ElevatedError::Elev(_)));
+        assert!(err.to_string().starts_with("banto-hub-elev: "));
     }
 
     #[cfg(windows)]

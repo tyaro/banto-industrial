@@ -160,7 +160,11 @@
 //!   `BantoHub`サービスへの限定 DACL 付与（`grant-service-acl`）、profile
 //!   ディレクトリへの owner DACL 付与（`grant-profile-acl`、
 //!   [`profile_acl`]へ委譲）を行う - [`service_operators`]が残した
-//!   「グループ作成・SDDL 付与は次スライス」を引き継ぐ
+//!   「グループ作成・SDDL 付与は次スライス」を引き継ぐ。#392 B3-3a で
+//!   [`service_operators`]と合わせて Win32 の呼び出し（グループ・メンバー・
+//!   サービス DACL の ACE・トークンのメンバーシップ）を共有 crate
+//!   `banto-service-elev`へ移した（アクション・引数の検証・手順・文言は
+//!   ここに残る。挙動は不変）
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み

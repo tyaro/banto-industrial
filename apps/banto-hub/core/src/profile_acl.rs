@@ -53,8 +53,8 @@
 //!
 //! ## マージ方針（既存 SYSTEM/Administrators ACE を壊さない）
 //!
-//! [`crate::service_elevated::windows_impl::grant_service_acl_with_service`]
-//! と同じパターン - `GetNamedSecurityInfoW`で既存 DACL を取得し、
+//! サービス DACL への ACE の付与（`banto_service_elev::grant_service_operators`、
+//! #392 B3-3a で`service_elevated.rs`から共有 crate へ移した）と同じパターン - `GetNamedSecurityInfoW`で既存 DACL を取得し、
 //! `SetEntriesInAclW`へ`oldacl`として渡すことで、指定した3トラスティ
 //! （SYSTEM/Administrators/owner）以外の既存 ACE をそのまま残す。
 //! `grfAccessMode = SET_ACCESS`は「同じトラスティの既存エントリを置き
@@ -256,7 +256,7 @@ pub(crate) mod windows_impl {
         // 再帰呼び出しの都度クローンする - SID は高々数十バイトで、
         // `TRUSTEE_W::ptstrName`が要求する`*mut u16`（実体は SID バイト列
         // へのポインタ、Win32 API の慣例どおり）を得るには可変バッファが
-        // 必要なため（`service_elevated.rs`の`grant_service_acl_with_service`
+        // 必要なため（`banto_service_elev::grant_service_operators`
         // と同じ理由）。
         let mut owner_sid = owner_sid.to_vec();
         let mut system_sid = system_sid.to_vec();
@@ -272,7 +272,7 @@ pub(crate) mod windows_impl {
         let mut sd_ptr: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: `wide_path`はこの呼び出しが終わるまでスコープ内で生存する
         // NUL 終端 UTF-16 文字列。DACL 以外（owner/group/SACL）は取得しない
-        // - `service_elevated.rs::grant_service_acl_with_service`の
+        // - `banto_service_elev::grant_service_operators`の
         // `QueryServiceObjectSecurity`呼び出しと同じ「DACL だけ触る」方針。
         let query_status = unsafe {
             GetNamedSecurityInfoW(

@@ -30,6 +30,10 @@
 # スコープで守ったファイルを、保護された DACL のディレクトリに置く秘密の保存先。
 # `banto_hub_bootstrap::KeyStore` を実装し、サービスとデスクトップの両方の host が
 # 同じ Hub のキーを使う. docs/chronogazer-service-design.md §3.1(c)).
+# #392 B3-3a: crates/banto-service-elev (製品ごとの昇格ヘルパーが使う Win32 の
+# 部品 - ローカルグループ・サービス DACL の ACE・トークンのメンバーシップ・
+# runas の起動。昇格の境界（アクションと引数の検証）は製品の elev が持つ.
+# docs/chronogazer-service-design.md §4 の B3-3a).
 [workspace]
 resolver = "2"
 members = [
@@ -50,6 +54,7 @@ members = [
     "crates/banto-exit-once",
     "crates/banto-secret-store",
     "crates/banto-service-control",
+    "crates/banto-service-elev",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
     "apps/banto-hub/core",
