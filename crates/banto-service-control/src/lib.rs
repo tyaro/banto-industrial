@@ -67,6 +67,9 @@ mod parameters;
 mod runner;
 mod shutdown;
 pub use install::*;
+// 公開しているのは Windows だけの関数（非 Windows では空の再公開になり、
+// `unused_imports` で clippy が落ちる）。
+#[cfg(windows)]
 pub use parameters::*;
 pub use runner::*;
 pub use shutdown::*;
