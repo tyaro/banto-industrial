@@ -37,6 +37,9 @@ tokio = { workspace = true, features = [
 # 未知キーを拒否するため serde 統合が要る。Cargo.lock には既に 1.1.2 系が
 # （他の推移的依存経由で）存在するので新規バージョン系列は増えない。
 toml = "1"
+# OS シャットダウンの停止合図と PRESHUTDOWN 待ち時間（#589）。
+# Hub と同じ共有 crate。サイドカーは banto-hub-core を本番依存にしない。
+banto-service-control = { path = "../../crates/banto-service-control" }
 # サービスログ行のローカル時刻表示。`banto-tstore` が同じ理由・同じ
 # feature 構成でこのクレートを使っている（`crates/banto-tstore/Cargo.toml`
 # の依存コメント参照: Windows 専用製品なので `local-offset` の Unix 側の

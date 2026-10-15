@@ -1,7 +1,7 @@
 # banto-industrial + 記録計アプリ 計画
 
 作成日: 2026-07-12（過去アプリ棚卸しと記録計構想の議論に基づく）
-状態: **進行中。I系（I0〜I6）実装済み（I6 = banto-broker として抽出済み）、
+状態: **進行中。2026-10-14: #589（Hub と sink のサービスが OS のシャットダウンで最終 flush する）を実装。I系（I0〜I6）実装済み（I6 = banto-broker として抽出済み）、
 W系（relay-wright）は W5 まで実装済みだったが **2026-09-17 に凍結**（構想の練り直し、§4b）、
 **2026-09-24 に main から外してタグ `archive/relay-wright-2026-09-24` に退避した**。T系（タグサーバー、
 §4c）は T0〜T21 実装済み（試運転モード/ロックダウン・収集開始停止 UI・タグ名
@@ -688,7 +688,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
         B1-2 Tauri を engine に → B1-3 `banto-secret-store`（DPAPI）→ B1-4 パスと host 種別（`/api/host`）→
         B1-5 `chronogazer-server`（コンソール）→ B2-1 loopback grant と REST の差分 → B2-2 フロントのサービス接続モード →
         B2-3 共有 crate（`banto-service-control`）の抽出 → B2-4 シェルの起動判定（任意 B2-5 切替）→
-        B3-1 サービスランナーの共有化（STOP と PRESHUTDOWN、#589 を直す）→ B3-2 サービス化 → B3-3 elev と ACL →
+        B3-1 サービスランナーの共有化（STOP と PRESHUTDOWN の汎用ランナー。#589 の Hub と sink は 2026-10-14 に方針だけ先に直した）→ B3-2 サービス化 → B3-3 elev と ACL →
         B3-4 インストーラ → B3-5 実機確認（24h → 72h soak）。
       - **決定 1〜14 の要約**: (1) 切替は後回し（B2 は起動判定と fallback だけ）。(2) headless host は新しい bin
         `chronogazer-server.exe`（`banto-serve` は開発・E2E 用に残す）。(3) 旧 `%APPDATA%` のデータは放置し、1 回だけ案内。
@@ -697,7 +697,7 @@ I1 CRUD の rebuild 失敗握り潰しは全構成 preflight へ置き換える�
         データ `%ProgramData%\ChronoGazer\`、port 8721。(8) loopback grant: 未初期化の間は admin、初期化後は
         `auth.local_grant`（既定 off）。(9) LAN 公開の変更はその場で listener を入れ替える。(10) リストアは「サービスを再起動して適用」。
         (11) サービス host の書き込み先は ACL で保護したルート配下と管理者が登録した特定のディレクトリだけ（ドライブ単位は不可、reparse point を辿らずハンドルで判定。2026-10-12 #590 のレビューで書き換え）。(12) Hub との同居は SCM 依存なし。
-        (13) Hub・sink のサービスが SHUTDOWN/PRESHUTDOWN を受けない件は issue #589、B3-1 で直す。(14) ファイアウォールの受信規則は作らない。
+        (13) Hub・sink のサービスが SHUTDOWN/PRESHUTDOWN を受けない件は issue #589。2026-10-14 にコードで直した（PRESHUTDOWN 30 秒。共有ランナー B3-1 の全体抽出はまだ）。(14) ファイアウォールの受信規則は作らない。
 
   - **順序**: #383 段階3 を先に進め、#392 の A1 は並行。B1 は P3 の後。
   - 要件側は [recorder-requirements.md](recorder-requirements.md) §3.1・§4 に反映済み。

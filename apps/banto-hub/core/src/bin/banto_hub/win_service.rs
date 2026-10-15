@@ -45,13 +45,14 @@
 
 use std::cell::Cell;
 use std::ffi::OsString;
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+use windows_service::service::{ServiceControl, ServiceExitCode, ServiceState, ServiceType};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use banto_hub_core::controller::{CollectionState, RunMode};
@@ -66,6 +67,10 @@ use banto_hub_core::runtime::{HubRuntime, HubStartError};
 // 1バイトも変えていない（`pub use`での再公開なので、このファイル内・
 // `bin/banto-hub.rs`からの`win_service::SERVICE_NAME`/`RUN_SERVICE_ARG`参照は
 // 変更不要）。
+use banto_hub_core::service_manager::{
+    record_first_stop, service_status_from_plan, stop_signal, stop_work_budget, ScmControlKind,
+    ServiceStatusPlan, ServiceStatusReporter, StopNotice, StopSignal, PRESHUTDOWN_TIMEOUT,
+};
 pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 
 // T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）:
@@ -199,6 +204,81 @@ impl StoppedGate {
     }
 }
 
+/// `ServiceControl` を共有 crate の種別へ写す。
+fn scm_control_kind(control: &ServiceControl) -> ScmControlKind {
+    match control {
+        ServiceControl::Interrogate => ScmControlKind::Interrogate,
+        ServiceControl::Stop => ScmControlKind::Stop,
+        ServiceControl::Preshutdown => ScmControlKind::Preshutdown,
+        ServiceControl::Shutdown => ScmControlKind::Shutdown,
+        _ => ScmControlKind::Other,
+    }
+}
+
+/// 停止に入ったときのログ。通常の STOP と OS の PRESHUTDOWN を区別する。
+fn hub_stop_reason_line(signal: StopSignal) -> String {
+    match signal {
+        StopSignal::ServiceStop => {
+            "banto-hub: 停止要求を受けました（SCM の STOP）。最終 flush を行います".to_string()
+        }
+        StopSignal::OsPreshutdown => {
+            "banto-hub: OS のシャットダウンを受けました（PRESHUTDOWN）。最終 flush を行います"
+                .to_string()
+        }
+    }
+}
+
+/// 最終 flush を含む停止が予算内に終わったときのログ。
+fn hub_stop_done_line(signal: StopSignal) -> String {
+    match signal {
+        StopSignal::ServiceStop => {
+            "banto-hub: 最終 flush を含む停止が完了しました（SCM の STOP）".to_string()
+        }
+        StopSignal::OsPreshutdown => {
+            "banto-hub: 最終 flush を含む停止が完了しました（PRESHUTDOWN）".to_string()
+        }
+    }
+}
+
+/// OS シャットダウンの作業予算を超えても停止が終わっていないときのログ。
+/// プロセスは止めない（収集の停止を abort しない）。SCM が
+/// [`PRESHUTDOWN_TIMEOUT`] でプロセスを終わらせうる、という警告。
+fn hub_stop_overrun_line() -> &'static str {
+    "banto-hub: warn: OS シャットダウンの予算内に最終 flush が終わりませんでした（SCM がプロセスを終了させる可能性があります）"
+}
+
+/// 通常の STOP で Hub の停止にかかる見込み。`ServiceStatusReporter` の
+/// heartbeat は、これを 5 秒の刻みで割った回数まで StopPending の
+/// checkpoint を進め、その後は進めない（停止が固まったら、`wait_hint` の
+/// 30 秒の後に SCM が応答なしを報告できるように）。収集停止は打ち切らない
+/// ので、これを超えても停止そのものは続く。
+const HUB_EXPECTED_STOP: Duration = Duration::from_secs(60);
+
+/// 計画を SCM へ送る。失敗はログだけ（停止処理自体は続ける）。
+fn push_status(handle: &ServiceStatusHandle, plan: &ServiceStatusPlan, exit_code: ServiceExitCode) {
+    if let Err(err) =
+        handle.set_service_status(service_status_from_plan(plan, SERVICE_TYPE, exit_code))
+    {
+        log_err_line(&format!(
+            "banto-hub: サービス状態の報告に失敗しました: {err}"
+        ));
+    }
+}
+
+/// OS シャットダウンの作業予算を超えたら警告を 1 行書いてログをディスクへ出す。
+/// `finished` を送ると、予算内に終わったものとして警告を出さずに戻る。
+fn spawn_overrun_watch(deadline_in: Duration) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || match rx.recv_timeout(deadline_in) {
+        Err(RecvTimeoutError::Timeout) => {
+            log_err_line(hub_stop_overrun_line());
+            hub_log::sync_service_log();
+        }
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+    });
+    (tx, handle)
+}
+
 /// `bin/banto-hub.rs`の`install`サブコマンド用引数リテラル。
 pub const INSTALL_ARG: &str = "install";
 /// `bin/banto-hub.rs`の`uninstall`サブコマンド用引数リテラル。
@@ -272,20 +352,34 @@ fn run_service_body(_arguments: Vec<OsString>) {
 
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let handler_notify = shutdown_notify.clone();
+    // 最初の STOP / PRESHUTDOWN だけを記録する。ハンドラはすぐ戻り、
+    // 最終 flush は下のランタイム側（`RunningHub::shutdown`）が行う。
+    let stop_notice: Arc<Mutex<Option<StopNotice>>> = Arc::new(Mutex::new(None));
+    let handler_notice = stop_notice.clone();
+    // SCM への状態報告（Running → StopPending と heartbeat → Stopped）は
+    // `ServiceStatusReporter` 1 つが同じロックの下で行う。ハンドラが停止を
+    // 始める前に停止処理が Stopped まで進んでも、Stopped の後には何も報告
+    // しない（#589 の再レビュー P2）。`register` の後にセットする。
+    let reporter_slot: Arc<OnceLock<ServiceStatusReporter<ServiceExitCode>>> =
+        Arc::new(OnceLock::new());
+    let handler_reporter = reporter_slot.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
-        match control_event {
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            // SCM からの停止要求 = このバイナリの停止トリガー（この
-            // `Notify`を`notified().await`で待ってから
-            // `RunningHub::shutdown`を呼ぶ - 下記参照）。
-            // MQTT→gRPC→Collector→broker→サーバーの既存シャットダウン順序は
-            // `RunningHub::shutdown`（T14-1、`banto_hub_core::runtime`）側が
-            // そのまま実行する。
-            ServiceControl::Stop => {
-                handler_notify.notify_one();
-                ServiceControlHandlerResult::NoError
-            }
-            _ => ServiceControlHandlerResult::NotImplemented,
+        match scm_control_kind(&control_event) {
+            ScmControlKind::Interrogate => ServiceControlHandlerResult::NoError,
+            // STOP も PRESHUTDOWN も同じ停止経路（最終 flush まで）。
+            // SHUTDOWN は PRESHUTDOWN と同時に受け付けないのでここには来ない。
+            kind => match stop_signal(kind) {
+                Some(signal) => {
+                    if record_first_stop(&handler_notice, signal) {
+                        if let Some(reporter) = handler_reporter.get() {
+                            reporter.begin_stop();
+                        }
+                        handler_notify.notify_one();
+                    }
+                    ServiceControlHandlerResult::NoError
+                }
+                None => ServiceControlHandlerResult::NotImplemented,
+            },
         }
     };
 
@@ -298,6 +392,16 @@ fn run_service_body(_arguments: Vec<OsString>) {
             return;
         }
     };
+    let reporter = ServiceStatusReporter::new(
+        move |plan: &ServiceStatusPlan, exit_code: ServiceExitCode| {
+            push_status(&status_handle, plan, exit_code);
+        },
+        ServiceExitCode::Win32(0),
+    );
+    // Hub の停止（収集停止・tstore の flush・broker・HTTP）の見込み。
+    // heartbeat はこれを 5 秒の刻みで割った回数まで checkpoint を進める。
+    reporter.set_expected_stop(HUB_EXPECTED_STOP);
+    let _ = reporter_slot.set(reporter.clone());
 
     // 起動失敗パスの`return`が async ブロックからしか抜けないせいで
     // `Stopped`が2回報告される問題を止めるゲート（[`StoppedGate`]の doc に
@@ -307,27 +411,24 @@ fn run_service_body(_arguments: Vec<OsString>) {
         // 2回目以降（＝既に`Stopped`を報告済み）は SCM を呼ばずに黙って
         // 戻る。SCM を呼ぶと最初に報告した非0終了コードを Win32(0) で
         // 上書きしかねない上、実際には API エラーになって紛らわしい
-        // エラーログだけが残る。
+        // エラーログだけが残る（`reporter` も Stopped の後は報告しないが、
+        // `has_reported_stopped` の判断はこのゲートが持つ）。
         if !stopped_gate.accept_report(current_state) {
             return;
         }
-        let controls_accepted = if current_state == ServiceState::Running {
-            ServiceControlAccept::STOP
-        } else {
-            ServiceControlAccept::empty()
-        };
-        if let Err(err) = status_handle.set_service_status(ServiceStatus {
-            service_type: SERVICE_TYPE,
-            current_state,
-            controls_accepted,
-            exit_code,
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        }) {
-            log_err_line(&format!(
-                "banto-hub: サービス状態の報告に失敗しました: {err}"
-            ));
+        match current_state {
+            // 稼働中は STOP と PRESHUTDOWN。SHUTDOWN は相互排他なので付けない。
+            // 停止が始まった後は報告しない。
+            ServiceState::Running => {
+                reporter.report_running();
+            }
+            ServiceState::StopPending => {
+                reporter.begin_stop();
+            }
+            // 起動失敗の Stopped も、停止完了の Stopped も 1 回だけ。
+            _ => {
+                reporter.report_stopped(exit_code);
+            }
         }
     };
 
@@ -399,10 +500,44 @@ fn run_service_body(_arguments: Vec<OsString>) {
             report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
             return;
         }
-        report_status(ServiceState::Running, ServiceExitCode::Win32(0));
-        log_line("banto-hub: Windows サービスとして起動しました");
-        shutdown_notify.notified().await;
+        // 起動中に STOP / PRESHUTDOWN が来ていたら Running を報告しない
+        // （受理フラグを立てた瞬間に停止へ入る）。
+        let already_stopping = stop_notice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if !already_stopping {
+            report_status(ServiceState::Running, ServiceExitCode::Win32(0));
+            log_line("banto-hub: Windows サービスとして起動しました");
+            shutdown_notify.notified().await;
+        }
+        let notice = stop_notice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(StopNotice {
+                signal: StopSignal::ServiceStop,
+                received_at: std::time::Instant::now(),
+            });
+        log_line(&hub_stop_reason_line(notice.signal));
+        hub_log::sync_service_log();
+        let overrun = match notice.signal {
+            StopSignal::OsPreshutdown => {
+                let elapsed = notice.received_at.elapsed();
+                let remain = stop_work_budget(PRESHUTDOWN_TIMEOUT).saturating_sub(elapsed);
+                Some(spawn_overrun_watch(remain))
+            }
+            StopSignal::ServiceStop => None,
+        };
+        // 通常の STOP も OS の PRESHUTDOWN も、収集の停止は打ち切らない
+        // （tstore の最終 flush を abort しない）。OS 側の上限は SCM の
+        // PRESHUTDOWN 待ち時間で、超えたら上の見張りが警告を残す。
         hub.shutdown().await;
+        if let Some((tx, handle)) = overrun {
+            let _ = tx.send(());
+            let _ = handle.join();
+        }
+        log_line(&hub_stop_done_line(notice.signal));
+        hub_log::sync_service_log();
     });
 
     // 起動失敗パス（async ブロック内で`Stopped`を報告済み）でここへ落ちて
@@ -491,6 +626,36 @@ mod tests {
         assert!(gate.accept_report(ServiceState::Stopped));
         assert!(!gate.accept_report(ServiceState::Running));
         assert!(!gate.accept_report(ServiceState::StopPending));
+    }
+
+    /// 停止処理の途中の `StopPending` ではゲートを閉じない。閉じるのは
+    /// `Stopped` を報告したあとだけ（#589 の StopPending → Stopped）。
+    #[test]
+    fn stopped_gate_allows_stop_pending_before_stopped() {
+        let gate = StoppedGate::default();
+
+        assert!(gate.accept_report(ServiceState::Running));
+        assert!(gate.accept_report(ServiceState::StopPending));
+        assert!(!gate.has_reported_stopped());
+        assert!(gate.accept_report(ServiceState::Stopped));
+        assert!(gate.has_reported_stopped());
+    }
+
+    /// 通常の STOP と OS の PRESHUTDOWN をログで区別する（実機確認の目印）。
+    #[test]
+    fn hub_stop_lines_distinguish_scm_stop_from_os_preshutdown() {
+        let stop = hub_stop_reason_line(StopSignal::ServiceStop);
+        assert!(stop.contains("SCM の STOP"), "{stop}");
+        assert!(stop.contains("最終 flush"), "{stop}");
+        let os = hub_stop_reason_line(StopSignal::OsPreshutdown);
+        assert!(os.contains("OS のシャットダウン"), "{os}");
+        assert!(os.contains("PRESHUTDOWN"), "{os}");
+
+        assert!(hub_stop_done_line(StopSignal::ServiceStop).contains("SCM の STOP"));
+        assert!(hub_stop_done_line(StopSignal::OsPreshutdown).contains("PRESHUTDOWN"));
+        let overrun = hub_stop_overrun_line();
+        assert!(overrun.contains("warn"), "{overrun}");
+        assert!(overrun.contains("予算"), "{overrun}");
     }
 
     /// 正常系（`Running`報告 → 停止時に`Stopped`報告）が従来どおり通ることを

@@ -18,10 +18,12 @@
 //! SCM の依存関係は「停止順序」も縛るため、Hub の再起動でサイドカーまで
 //! 巻き込まれる方が困る。
 //!
-//! ## 既にインストール済みなら何もしない
+//! ## 既にインストール済みなら起動種別と ACL は変えない
 //!
 //! banto-hub の `service_install::install` と同じ（アップグレード時に
-//! 既存の起動種別を上書きしないため）。
+//! 既存の起動種別を上書きしないため）。#589 以降、新規でも既設でも
+//! OS シャットダウンの待ち時間（PRESHUTDOWN）だけは希望値に揃え、
+//! 読み戻して確認する。
 //!
 //! ## サービス ACL の付与（`grant-service-acl`、S6 レビュー指摘の follow-up）
 //!
@@ -67,20 +69,26 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+use banto_service_control::{
+    ensure_preshutdown_timeout, preshutdown_report, record_first_stop, service_status_from_plan,
+    stop_signal, stop_work_budget, PreshutdownReport, ScmControlKind, ServiceStatusPlan,
+    ServiceStatusReporter, StopNotice, StopSignal, PRESHUTDOWN_TIMEOUT,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service::{
+    ServiceAccess, ServiceControl, ServiceErrorControl, ServiceExitCode, ServiceInfo,
+    ServiceStartType, ServiceState, ServiceType,
+};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 use windows_service::service_manager::{ServiceManager as WinScm, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::config::load_config;
 use crate::log::{self, log_err_line, log_line};
-use crate::run::{run, SidecarOptions};
+use crate::run::{run, SidecarOptions, StopRequest};
 
 /// SCM 上のサービス名。
 pub const SERVICE_NAME: &str = "BantoHubSink";
@@ -99,6 +107,19 @@ pub const GRANT_SERVICE_ACL_ARG: &str = "grant-service-acl";
 /// （`apps/banto-hub/core/src/bin/banto-hub-elev.rs`）。モジュール doc
 /// 「サービス ACL の付与」節参照。
 pub const ELEV_EXE_NAME: &str = "banto-hub-elev.exe";
+
+/// PRESHUTDOWN の待ち時間を希望値に揃える。起動種別と ACL は変えない。
+/// 失敗しても install は失敗にしない（警告 1 行を標準エラー出力へ、終了コード 0。
+/// 実際の待ち時間は未確認のまま。[`banto_service_control::PreshutdownReport::Warning`]）。
+fn apply_preshutdown_timeout() {
+    match preshutdown_report(&ensure_preshutdown_timeout(
+        SERVICE_NAME,
+        PRESHUTDOWN_TIMEOUT,
+    )) {
+        PreshutdownReport::Applied(line) => println!("banto-hub-sink: {line}"),
+        PreshutdownReport::Warning(line) => eprintln!("banto-hub-sink: warn: {line}"),
+    }
+}
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -121,8 +142,9 @@ pub fn install() {
         .is_ok()
     {
         println!(
-            "banto-hub-sink: Windows サービス '{SERVICE_NAME}' は既に登録されています（既存の設定は変更していません）"
+            "banto-hub-sink: Windows サービス '{SERVICE_NAME}' は既に登録されています（起動種別・実行ファイル・ACL は変更していません）"
         );
+        apply_preshutdown_timeout();
         return;
     }
 
@@ -157,6 +179,7 @@ pub fn install() {
     if let Err(err) = service.set_description(SERVICE_DESCRIPTION) {
         eprintln!("banto-hub-sink: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}");
     }
+    apply_preshutdown_timeout();
 
     println!("banto-hub-sink: Windows サービス '{SERVICE_NAME}' を登録しました");
     println!("banto-hub-sink:   表示名: {SERVICE_DISPLAY_NAME}");
@@ -284,6 +307,42 @@ fn service_main(arguments: Vec<OsString>) {
     }
 }
 
+/// `ServiceControl` を共有 crate の種別へ写す。
+fn scm_control_kind(control: &ServiceControl) -> ScmControlKind {
+    match control {
+        ServiceControl::Interrogate => ScmControlKind::Interrogate,
+        ServiceControl::Stop => ScmControlKind::Stop,
+        ServiceControl::Preshutdown => ScmControlKind::Preshutdown,
+        ServiceControl::Shutdown => ScmControlKind::Shutdown,
+        _ => ScmControlKind::Other,
+    }
+}
+
+/// 計画を SCM へ送る。失敗はログだけ（停止処理自体は続ける）。
+fn push_status(handle: &ServiceStatusHandle, plan: &ServiceStatusPlan, exit_code: ServiceExitCode) {
+    if let Err(err) =
+        handle.set_service_status(service_status_from_plan(plan, SERVICE_TYPE, exit_code))
+    {
+        log_err_line(&format!(
+            "banto-hub-sink: サービス状態の報告に失敗しました: {err}"
+        ));
+    }
+}
+
+/// 通常の STOP の見込みのうち、設定の flush 以外の余裕（flusher ごとの停止
+/// 最大 2 秒・購読の停止・状態 push の HTTP 上限 10 秒を見込む）。
+const SINK_STOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 記録した合図を停止要求にする。OS の作業予算は合図を受けた時刻から数える。
+fn stop_request_from_notice(notice: StopNotice) -> StopRequest {
+    match notice.signal {
+        StopSignal::ServiceStop => StopRequest::Graceful,
+        StopSignal::OsPreshutdown => StopRequest::OsShutdown {
+            deadline: notice.received_at + stop_work_budget(PRESHUTDOWN_TIMEOUT),
+        },
+    }
+}
+
 fn run_service_body(_arguments: Vec<OsString>) {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -298,14 +357,34 @@ fn run_service_body(_arguments: Vec<OsString>) {
 
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let handler_notify = shutdown_notify.clone();
+    // 最初の STOP / PRESHUTDOWN だけを記録する。ハンドラはすぐ戻り、
+    // 残キューの flush は下の `run` が行う。
+    let stop_notice: Arc<Mutex<Option<StopNotice>>> = Arc::new(Mutex::new(None));
+    let handler_notice = stop_notice.clone();
+    // SCM への状態報告（Running → StopPending と heartbeat → Stopped）は
+    // `ServiceStatusReporter` 1 つが同じロックの下で行う。ハンドラが停止を
+    // 始める前に停止処理が Stopped まで進んでも、Stopped の後には何も報告
+    // しない（#589 の再レビュー P2）。`register` の後にセットする。
+    let reporter_slot: Arc<OnceLock<ServiceStatusReporter<ServiceExitCode>>> =
+        Arc::new(OnceLock::new());
+    let handler_reporter = reporter_slot.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
-        match control_event {
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            ServiceControl::Stop => {
-                handler_notify.notify_one();
-                ServiceControlHandlerResult::NoError
-            }
-            _ => ServiceControlHandlerResult::NotImplemented,
+        match scm_control_kind(&control_event) {
+            ScmControlKind::Interrogate => ServiceControlHandlerResult::NoError,
+            // STOP も PRESHUTDOWN も同じ停止経路（最終 flush まで）。
+            // SHUTDOWN は PRESHUTDOWN と同時に受け付けないのでここには来ない。
+            kind => match stop_signal(kind) {
+                Some(signal) => {
+                    if record_first_stop(&handler_notice, signal) {
+                        if let Some(reporter) = handler_reporter.get() {
+                            reporter.begin_stop();
+                        }
+                        handler_notify.notify_one();
+                    }
+                    ServiceControlHandlerResult::NoError
+                }
+                None => ServiceControlHandlerResult::NotImplemented,
+            },
         }
     };
 
@@ -318,31 +397,28 @@ fn run_service_body(_arguments: Vec<OsString>) {
             return;
         }
     };
+    let reporter = ServiceStatusReporter::new(
+        move |plan: &ServiceStatusPlan, exit_code: ServiceExitCode| {
+            push_status(&status_handle, plan, exit_code);
+        },
+        ServiceExitCode::Win32(0),
+    );
+    let _ = reporter_slot.set(reporter.clone());
 
     let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
-        let controls_accepted = if current_state == ServiceState::Running {
-            ServiceControlAccept::STOP
-        } else {
-            ServiceControlAccept::empty()
-        };
-        if let Err(err) = status_handle.set_service_status(ServiceStatus {
-            service_type: SERVICE_TYPE,
-            current_state,
-            controls_accepted,
-            exit_code,
-            checkpoint: 0,
-            // 停止処理は残キューの flush（既定 5 秒）を含むので、SCM に
-            // 待ち時間のヒントを渡す（設計 §5.6）。
-            wait_hint: if current_state == ServiceState::StopPending {
-                Duration::from_secs(15)
-            } else {
-                Duration::default()
-            },
-            process_id: None,
-        }) {
-            log_err_line(&format!(
-                "banto-hub-sink: サービス状態の報告に失敗しました: {err}"
-            ));
+        match current_state {
+            // 稼働中は STOP と PRESHUTDOWN。SHUTDOWN は相互排他なので付けない。
+            // 停止が始まった後は報告しない。
+            ServiceState::Running => {
+                reporter.report_running();
+            }
+            ServiceState::StopPending => {
+                reporter.begin_stop();
+            }
+            // 起動失敗の Stopped も、停止完了の Stopped も 1 回だけ。
+            _ => {
+                reporter.report_stopped(exit_code);
+            }
         }
     };
 
@@ -356,6 +432,11 @@ fn run_service_body(_arguments: Vec<OsString>) {
             return;
         }
     };
+    // 通常の STOP の見込み: 設定の flush と、flusher ごとの停止・購読の停止・
+    // 最後の状態 push の余裕。heartbeat はこれを 5 秒の刻みで割った回数まで
+    // checkpoint を進め、その後は進めない（停止が固まったら SCM が応答なしを
+    // 報告できるように）。
+    reporter.set_expected_stop(config.shutdown_flush + SINK_STOP_MARGIN);
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -368,13 +449,36 @@ fn run_service_body(_arguments: Vec<OsString>) {
         }
     };
 
-    report_status(ServiceState::Running, ServiceExitCode::Win32(0));
-    log_line("banto-hub-sink: Windows サービスとして起動しました");
+    // 起動中に STOP / PRESHUTDOWN が来ていたら Running を報告しない
+    // （受理フラグを立てた瞬間に停止へ入る）。
+    let already_stopping = stop_notice
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    if !already_stopping {
+        report_status(ServiceState::Running, ServiceExitCode::Win32(0));
+        log_line("banto-hub-sink: Windows サービスとして起動しました");
+    }
 
     let notify = shutdown_notify.clone();
+    let notice_slot = stop_notice.clone();
     let result = runtime.block_on(async move {
         run(config, SidecarOptions::default(), async move {
-            notify.notified().await;
+            let already = notice_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some();
+            if !already {
+                notify.notified().await;
+            }
+            let notice = notice_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or(StopNotice {
+                    signal: StopSignal::ServiceStop,
+                    received_at: std::time::Instant::now(),
+                });
+            stop_request_from_notice(notice)
         })
         .await
     });
@@ -423,6 +527,36 @@ mod tests {
     fn find_elev_exe_in_returns_none_when_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(find_elev_exe_in(dir.path()), None);
+    }
+
+    /// SCM の STOP は設定どおりの flush（全体の打ち切りなし）。
+    #[test]
+    fn service_stop_notice_stays_graceful() {
+        let notice = StopNotice {
+            signal: StopSignal::ServiceStop,
+            received_at: std::time::Instant::now(),
+        };
+        assert_eq!(stop_request_from_notice(notice), StopRequest::Graceful);
+    }
+
+    /// OS の PRESHUTDOWN は合図を受けた時刻から作業予算（30 秒 − 3 秒）を足した
+    /// 期限で打ち切る。
+    #[test]
+    fn os_preshutdown_notice_sets_the_work_budget_deadline() {
+        let received_at = std::time::Instant::now();
+        let notice = StopNotice {
+            signal: StopSignal::OsPreshutdown,
+            received_at,
+        };
+        match stop_request_from_notice(notice) {
+            StopRequest::OsShutdown { deadline } => {
+                assert_eq!(
+                    deadline.saturating_duration_since(received_at),
+                    stop_work_budget(PRESHUTDOWN_TIMEOUT)
+                );
+            }
+            StopRequest::Graceful => panic!("OS の PRESHUTDOWN は Graceful にしない"),
+        }
     }
 
     /// ディレクトリと同名の`banto-hub-elev.exe`（ファイルではない）は

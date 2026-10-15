@@ -68,7 +68,7 @@ use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
-use banto_hub_sink::{run, SidecarConfig, SidecarOptions};
+use banto_hub_sink::{run, SidecarConfig, SidecarOptions, StopRequest};
 use banto_server::{start, AuthState, Identity, ServerConfig};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
@@ -621,6 +621,7 @@ async fn sidecar_writes_rows_recovers_from_a_missing_table_and_pushes_a_final_st
     let sidecar = tokio::spawn(async move {
         run(config, fast_sidecar_options(), async move {
             shutdown_signal.notified().await;
+            StopRequest::Graceful
         })
         .await
     });
@@ -768,6 +769,7 @@ async fn on_change_mode_writes_once_for_a_constant_value() {
     let sidecar = tokio::spawn(async move {
         run(config, fast_sidecar_options(), async move {
             shutdown_signal.notified().await;
+            StopRequest::Graceful
         })
         .await
     });
@@ -819,6 +821,7 @@ async fn starting_without_a_hub_waits_instead_of_exiting() {
     let sidecar = tokio::spawn(async move {
         run(config, fast_sidecar_options(), async move {
             shutdown_signal.notified().await;
+            StopRequest::Graceful
         })
         .await
     });

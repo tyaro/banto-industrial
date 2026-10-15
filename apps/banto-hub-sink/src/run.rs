@@ -8,7 +8,10 @@
 //!
 //! 3 つの締め切り（設定取得・状態 push・購読の生存確認）のうち最も早い
 //! ものまで眠り、来たものだけを処理する。停止シグナル（コンソールの
-//! Ctrl-C / SCM の STOP）はどの待ちからでも即座に抜ける。
+//! Ctrl-C / SCM の STOP / OS の PRESHUTDOWN）は、眠りの間だけでなく
+//! その処理の `await`（設定取得・状態 push・購読の確認と、その中の
+//! catalog 取得）の途中でも抜ける。応答しない相手に捕まって
+//! PRESHUTDOWN の作業予算を使い切らないため。
 //!
 //! - **設定取得**（既定 30 秒）: `GET /api/sink/config` を取り、前回適用した
 //!   集合との差分だけを start/stop する（`banto_hub_core::db_source::
@@ -34,18 +37,26 @@
 //! だけ flush → flusher 停止 → 残りを dropped に計上 → 最後の状態 push`。
 //! 最後の push まで済ませてから終了コード 0 で抜けるので、Hub 側には
 //! 「取りこぼした行数」まで残る。
+//!
+//! OS の PRESHUTDOWN（#589）では、この列の合計が SCM の待ち時間を超えうる
+//! （flush 秒数は全体の上限ではない。flusher ごとに最大 2 秒、状態 push は
+//! HTTP の上限 10 秒）。そのときは残り時間で各段階を頭打ちにし、
+//! 完了と打ち切りを終了前のログで区別する。通常の STOP / Ctrl-C は
+//! 設定の flush のまま打ち切らない。
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::config::SidecarConfig;
-use crate::flush::{backoff_delay, build_pool, spawn_flusher, FlushOptions, FlusherHandle};
+use crate::flush::{
+    backoff_delay, build_pool, spawn_flusher, FlushOptions, FlusherHandle, FlusherStopOutcome,
+};
 use crate::group::{
     run_interval_producer, run_on_change_producer, GroupRegistry, GroupRuntime, GroupSetupError,
     SinkMode, DEFAULT_TABLE_RECHECK,
@@ -64,12 +75,58 @@ const HEALTH_TICK: Duration = Duration::from_secs(1);
 /// 同じ 30 秒相当）。
 const DEFAULT_REPLAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// 停止時に flusher の join を待つ上限（これを超えたら abort - commit 前
-/// なので二重書き込みにはならない）。
+/// 停止時に flusher の join とプールの close を合わせた上限（これを超えたら
+/// abort し、閉じていないプールは待たずに捨てる。commit 前なので二重
+/// 書き込みにはならない。応答しない DB の `pool.close()` もこの中）。
 const FLUSHER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 停止時の drain 監視のポーリング間隔。
 const DRAIN_POLL: Duration = Duration::from_millis(50);
+
+/// OS シャットダウンで購読の停止に使ってよい上限。通常停止では掛けない
+/// （購読の停止が延びても、これまでどおり終わるまで待つ）。
+const OS_SUBSCRIPTION_STOP_CAP: Duration = Duration::from_secs(2);
+
+/// OS シャットダウンで最後の状態 push に使ってよい上限。
+/// HTTP クライアントの上限は 10 秒なので、flush のあとに予算を使い切らない
+/// よう短くする。通常停止ではクライアントの上限のまま待つ。
+const OS_STATUS_PUSH_CAP: Duration = Duration::from_secs(5);
+
+/// [`run`] に渡す停止合図の出力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequest {
+    /// Ctrl-C と SCM の STOP。設定の `shutdown_flush` と flusher ごとの
+    /// 停止待ちをそのまま使う。全体の打ち切りはしない。
+    Graceful,
+    /// OS の PRESHUTDOWN。`deadline` を過ぎたら残りを打ち切り、
+    /// 書けなかった行数をログに残す。
+    OsShutdown {
+        /// この時刻を過ぎたら打ち切る（SCM の待ち時間より前）。
+        deadline: StdInstant,
+    },
+}
+
+/// この段階に使ってよい時間。`remaining` が `None` のときは通常停止で、
+/// 設定値をそのまま返す。OS シャットダウンでは残り時間で頭を抑える。
+fn phase_limit(remaining: Option<Duration>, configured: Duration) -> Duration {
+    match remaining {
+        None => configured,
+        Some(left) => configured.min(left),
+    }
+}
+
+/// OS シャットダウンの完了と打ち切りを区別するログ行。
+fn os_shutdown_log_line(completed: bool, unsent_rows: usize) -> String {
+    if completed {
+        format!(
+            "banto-hub-sink: OS シャットダウンの停止が完了しました（送信できなかった行: {unsent_rows}）"
+        )
+    } else {
+        format!(
+            "banto-hub-sink: warn: OS シャットダウンの予算で停止を打ち切りました（送信できなかった行: {unsent_rows}）"
+        )
+    }
+}
 
 /// 実行時の調整値。**設定ファイルには出さない**（運用者が触る値ではなく、
 /// テストが実時間を待たないための注入口）。
@@ -305,7 +362,8 @@ impl Engine {
         // 2. 変わった/消えた接続の flusher を止める。
         for id in &plan.connections_to_stop {
             if let Some(flusher) = self.flushers.remove(id) {
-                flusher.stop(FLUSHER_STOP_TIMEOUT).await;
+                // 設定反映の停止は打ち切りでも続ける（ログは stop が出す）。
+                let _ = flusher.stop(FLUSHER_STOP_TIMEOUT).await;
             }
         }
 
@@ -619,31 +677,76 @@ impl Engine {
 
     // --- 停止（設計 §5.6） --------------------------------------------------
 
-    async fn shutdown(mut self) {
+    async fn shutdown(mut self, request: StopRequest) {
         log_line("banto-hub-sink: 停止します（残りのキューを flush します）");
+        let os_deadline = match request {
+            StopRequest::Graceful => None,
+            StopRequest::OsShutdown { deadline } => Some(deadline),
+        };
+        let mut cutoff = false;
         // 1. 行の生産を止める。
         for (_, task) in self.producers.drain() {
             task.abort();
         }
-        // 2. 購読を止める（Hub 側の購読を残さない）。
+        // 2. 購読を止める（Hub 側の購読を残さない）。通常停止は終わるまで
+        // 待つ。OS シャットダウンだけ残り時間で頭を抑える。
         if let Some(subscription) = self.subscription.take() {
-            subscription.stop().await;
+            match os_deadline {
+                None => subscription.stop().await,
+                Some(deadline) => {
+                    let limit = phase_limit(
+                        Some(deadline.saturating_duration_since(StdInstant::now())),
+                        OS_SUBSCRIPTION_STOP_CAP,
+                    );
+                    if limit.is_zero()
+                        || tokio::time::timeout(limit, subscription.stop())
+                            .await
+                            .is_err()
+                    {
+                        cutoff = true;
+                    }
+                }
+            }
         }
-        // 3. 残キューを最大 shutdown_flush_secs だけ流す。
+        // 3. 残キューを最大 shutdown_flush_secs だけ流す。OS シャットダウンでは
+        // その上限と残り時間の短い方。
         for flusher in self.flushers.values() {
             flusher.request_drain();
         }
-        let deadline = Instant::now() + self.config.shutdown_flush;
-        while Instant::now() < deadline {
+        let flush_end = {
+            let configured = StdInstant::now() + self.config.shutdown_flush;
+            match os_deadline {
+                Some(deadline) => configured.min(deadline),
+                None => configured,
+            }
+        };
+        while StdInstant::now() < flush_end {
             if self.groups.all().iter().all(|group| group.queued() == 0) {
                 break;
             }
             tokio::time::sleep(DRAIN_POLL).await;
         }
-        // 4. flusher を止める。
+        if os_deadline.is_some_and(|deadline| StdInstant::now() >= deadline)
+            && self.groups.all().iter().any(|group| group.queued() > 0)
+        {
+            cutoff = true;
+        }
+        // 4. flusher を止める。通常停止は各 2 秒。OS シャットダウンは残り時間。
         let flushers: Vec<FlusherHandle> = self.flushers.drain().map(|(_, f)| f).collect();
         for flusher in flushers {
-            flusher.stop(FLUSHER_STOP_TIMEOUT).await;
+            let limit = match os_deadline {
+                None => FLUSHER_STOP_TIMEOUT,
+                Some(deadline) => phase_limit(
+                    Some(deadline.saturating_duration_since(StdInstant::now())),
+                    FLUSHER_STOP_TIMEOUT,
+                ),
+            };
+            // 期限切れで abort した・プールを閉じ切れなかったときも打ち切り
+            // （「完了しました」と出さない）。通常停止はログに出さないので
+            // 結果は使わない。
+            if flusher.stop(limit).await == FlusherStopOutcome::CutShort && os_deadline.is_some() {
+                cutoff = true;
+            }
         }
         // 5. 流しきれなかった行は dropped に計上する。
         let mut lost = 0usize;
@@ -656,8 +759,35 @@ impl Engine {
             ));
         }
         // 6. 最後の状態 push（上の dropped を含んだ状態を Hub に残す）。
-        self.push_status().await;
+        // OS シャットダウンで予算が尽きたら push を待たずに打ち切る。
+        match os_deadline {
+            None => self.push_status().await,
+            Some(deadline) => {
+                let limit = phase_limit(
+                    Some(deadline.saturating_duration_since(StdInstant::now())),
+                    OS_STATUS_PUSH_CAP,
+                );
+                if limit.is_zero()
+                    || tokio::time::timeout(limit, self.push_status())
+                        .await
+                        .is_err()
+                {
+                    cutoff = true;
+                    log_err_line(
+                        "banto-hub-sink: warn: 最後の状態 push を OS シャットダウンの予算内に終えられませんでした",
+                    );
+                }
+            }
+        }
+        if os_deadline.is_some() {
+            if cutoff {
+                log_err_line(&os_shutdown_log_line(false, lost));
+            } else {
+                log_line(&os_shutdown_log_line(true, lost));
+            }
+        }
         log_line("banto-hub-sink: 停止しました");
+        crate::log::sync_service_log();
     }
 }
 
@@ -673,7 +803,7 @@ pub async fn run<F>(
     shutdown: F,
 ) -> Result<(), HubApiError>
 where
-    F: Future<Output = ()>,
+    F: Future<Output = StopRequest>,
 {
     let status_push = config.status_push;
     let config_refresh = config.config_refresh;
@@ -699,7 +829,7 @@ where
 
     // 起動直後は「取れるまで待つ」だけ - 取れなくても終了しない。
     let ok = tokio::select! {
-        _ = &mut shutdown => { engine.shutdown().await; return Ok(()); }
+        request = &mut shutdown => { engine.shutdown(request).await; return Ok(()); }
         ok = engine.refresh_config() => ok,
     };
     let now = Instant::now();
@@ -707,29 +837,62 @@ where
     let mut next_status_at = now;
     let mut next_health_at = now + health_tick;
 
+    let stop_request;
     loop {
         let wake_at = next_config_at.min(next_status_at).min(next_health_at);
         tokio::select! {
-            _ = &mut shutdown => break,
+            biased;
+            request = &mut shutdown => {
+                stop_request = request;
+                break;
+            }
             _ = tokio::time::sleep_until(wake_at) => {}
         }
         let now = Instant::now();
+        // 各作業は停止合図と一緒に待つ。future を捨てたときの資源は
+        // `Engine::shutdown` か、その future の drop（flusher は abort、
+        // 購読は `Subscription` の drop）が引き取る。
         if now >= next_config_at {
-            let ok = engine.refresh_config().await;
-            next_config_at =
-                Instant::now() + next_config_delay(ok, config_refresh, engine.config_attempt);
+            tokio::select! {
+                biased;
+                request = &mut shutdown => {
+                    stop_request = request;
+                    break;
+                }
+                ok = engine.refresh_config() => {
+                    next_config_at = Instant::now()
+                        + next_config_delay(ok, config_refresh, engine.config_attempt);
+                }
+            }
         }
         if now >= next_status_at {
-            engine.push_status().await;
-            next_status_at = Instant::now() + status_push;
+            tokio::select! {
+                biased;
+                request = &mut shutdown => {
+                    stop_request = request;
+                    break;
+                }
+                _ = engine.push_status() => {
+                    next_status_at = Instant::now() + status_push;
+                }
+            }
         }
         if now >= next_health_at {
-            engine.ensure_subscription().await;
-            next_health_at = Instant::now() + health_tick;
+            tokio::select! {
+                biased;
+                request = &mut shutdown => {
+                    stop_request = request;
+                    break;
+                }
+                _ = engine.ensure_subscription() => {
+                    next_health_at = Instant::now() + health_tick;
+                }
+            }
         }
     }
 
-    engine.shutdown().await;
+    // ループを抜けるのは停止合図を受け取ったときだけ。
+    engine.shutdown(stop_request).await;
     Ok(())
 }
 
@@ -1019,5 +1182,259 @@ mod tests {
         );
         let short = Duration::from_secs(5);
         assert_eq!(next_config_delay(false, short, 9), short);
+    }
+
+    /// 通常停止は設定値のまま。OS シャットダウンは残り時間で頭を抑える。
+    #[test]
+    fn phase_limit_keeps_graceful_stops_and_caps_os_shutdown() {
+        assert_eq!(
+            phase_limit(None, Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            phase_limit(Some(Duration::from_secs(27)), Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            phase_limit(Some(Duration::from_secs(3)), Duration::from_secs(60)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            phase_limit(Some(Duration::ZERO), Duration::from_secs(5)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn os_shutdown_log_distinguishes_completion_from_cutoff() {
+        let done = os_shutdown_log_line(true, 0);
+        let cut = os_shutdown_log_line(false, 12);
+        assert!(done.contains("完了しました"));
+        assert!(done.contains("送信できなかった行: 0"));
+        assert!(cut.contains("打ち切りました"));
+        assert!(cut.contains("送信できなかった行: 12"));
+        assert!(cut.contains("warn"));
+    }
+
+    /// サービスログを差し替えるテストを直列化する。
+    /// `std::sync::Mutex` は await をまたげない（clippy）。
+    async fn service_log_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    fn enable_test_service_log(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("banto-hub-sink-{name}-{}.log", std::process::id()));
+        crate::log::enable_service_log_file(&path).expect("service log");
+        path
+    }
+
+    /// 起動後の catalog 再取得を握ったまま OsShutdown が来ても、
+    /// 運転ループがそこから抜けて `Engine::shutdown` まで進む。
+    #[tokio::test]
+    async fn held_catalog_still_reaches_shutdown_within_the_deadline() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("held-catalog");
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let hub_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let tags_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let held_tx = Arc::new(std::sync::Mutex::new(Some(held_tx)));
+        let tags_seen_for_server = tags_seen.clone();
+        tokio::spawn(async move {
+            let config = r#"{"generatedAt":1,"groups":[{"id":1,"name":"g","dbConnectionId":10,"mode":"interval","intervalMs":60000,"tableName":"public.tag_history","storeBad":false,"tags":[{"connectionId":1,"groupId":2,"tagId":5,"externalName":"line1.fast.temp01"}]}],"connections":[{"id":10,"name":"db","host":"127.0.0.1","port":1,"database":"erp","username":"app","password":"pw"}]}"#;
+            let catalog = r#"{"revision":1,"run_id":1,"collection_mode":"configured","tags":[]}"#;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let tags_seen = tags_seen_for_server.clone();
+                let held_tx = held_tx.clone();
+                let config = config.to_owned();
+                let catalog = catalog.to_owned();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = stream;
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => {
+                                request.extend_from_slice(&buf[..count]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    if line.starts_with("GET /api/v1/tags ") {
+                        let n = tags_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if n == 0 {
+                            let body = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{catalog}",
+                                catalog.len()
+                            );
+                            let _ = stream.write_all(body.as_bytes()).await;
+                        } else {
+                            if let Some(tx) = held_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            std::future::pending::<()>().await;
+                        }
+                    } else if line.starts_with("GET /api/sink/config ") {
+                        let body = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{config}",
+                            config.len()
+                        );
+                        let _ = stream.write_all(body.as_bytes()).await;
+                    } else {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let config = SidecarConfig {
+            hub_url,
+            api_key: "bh_test.secret".to_owned(),
+            config_refresh: Duration::from_secs(60),
+            status_push: Duration::from_secs(60),
+            queue_max_rows: 100,
+            flush_interval: Duration::from_secs(60),
+            batch_size: 100,
+            shutdown_flush: Duration::from_millis(50),
+        };
+        let options = SidecarOptions {
+            table_recheck: Duration::from_secs(30),
+            health_tick: Duration::from_millis(40),
+            replan_interval: Duration::from_millis(10),
+        };
+        let shutdown = async move {
+            held_rx.await.expect("second catalog request");
+            StopRequest::OsShutdown {
+                deadline: StdInstant::now() + Duration::from_millis(800),
+            }
+        };
+        let started = StdInstant::now();
+        tokio::time::timeout(Duration::from_secs(3), run(config, options, shutdown))
+            .await
+            .expect("握った catalog のまま shutdown に入れなかった")
+            .expect("run");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown まで {:?}",
+            started.elapsed()
+        );
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            text.contains("停止しました")
+                && (text.contains("OS シャットダウンの停止が完了しました")
+                    || text.contains("OS シャットダウンの予算で停止を打ち切りました")),
+            "{text}"
+        );
+    }
+
+    /// 応答しない DB でも `Engine::shutdown` が未送信行のログと
+    /// 「停止しました」まで進む（サービスの Stopped 報告の手前）。
+    #[tokio::test]
+    async fn unresponsive_db_still_reaches_stopped_within_the_deadline() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("blackhole-db");
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let hub_url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(count) => {
+                                request.extend_from_slice(&buf[..count]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let config = SidecarConfig {
+            hub_url,
+            api_key: "bh_test.secret".to_owned(),
+            config_refresh: Duration::from_secs(60),
+            status_push: Duration::from_secs(60),
+            queue_max_rows: 100,
+            flush_interval: Duration::from_secs(60),
+            batch_size: 100,
+            shutdown_flush: Duration::ZERO,
+        };
+        let mut engine = Engine::new(config, SidecarOptions::default()).expect("engine");
+        let group = group(1, 10, "public.tag_history");
+        let runtime = crate::group::GroupRuntime::new(&group, 100, 0).expect("group");
+        runtime.push_rows(vec![crate::queue::Row {
+            ts_ms: 1,
+            tag_id: 5,
+            external_name: "line1.fast.temp01".to_owned(),
+            value: Some(1.0),
+            quality: "good".to_owned(),
+        }]);
+        engine.groups.insert(Arc::new(runtime));
+        let (handle, _server) = crate::flush::flusher_on_blackhole_pool(10).await;
+        engine.flushers.insert(10, handle);
+
+        // 期限は flusher の停止の上限（2 秒）より長くする。flusher は 2 秒で
+        // 打ち切られ、その後の状態 push は期限内に済む - 打ち切りの記録が
+        // flusher の結果だけから来ることを確かめるため（#589 のレビュー）。
+        let started = StdInstant::now();
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            engine.shutdown(StopRequest::OsShutdown {
+                deadline: StdInstant::now() + FLUSHER_STOP_TIMEOUT + Duration::from_secs(2),
+            }),
+        )
+        .await
+        .expect("応答しない DB のまま Stopped の手前まで進めなかった");
+        assert!(started.elapsed() < Duration::from_secs(6));
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            text.contains("停止時に 1 行を送信できませんでした") && text.contains("停止しました"),
+            "{text}"
+        );
+        // flusher を期限で打ち切ったので「完了」とは書かない。
+        assert!(
+            text.contains("OS シャットダウンの予算で停止を打ち切りました")
+                && !text.contains("OS シャットダウンの停止が完了しました"),
+            "{text}"
+        );
     }
 }

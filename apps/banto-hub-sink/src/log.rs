@@ -151,6 +151,20 @@ fn local_timestamp() -> String {
     )
 }
 
+/// サービスログをディスクへ出す。OS がシャットダウンでプロセスを
+/// 終わらせる前に、完了または打ち切りの行を残すため（#589）。
+/// ファイルを開いていなければ何もしない。
+pub fn sync_service_log() {
+    let Some(slot) = SERVICE_LOG_FILE.get() else {
+        return;
+    };
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(file) = guard.as_mut() else {
+        return;
+    };
+    let _ = file.sync_data();
+}
+
 /// `println!` 相当 + （サービスモードのみ）ログファイルへのミラー。
 pub fn log_line(msg: &str) {
     println!("{msg}");

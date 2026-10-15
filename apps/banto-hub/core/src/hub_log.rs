@@ -125,6 +125,21 @@ fn format_timestamp(epoch_ms: i64, utc_offset_ms: i64) -> String {
     )
 }
 
+/// サービスログをディスクへ出す。`File` の `flush` は何もしないので
+/// `sync_data` を使う。OS シャットダウンで SCM がプロセスを終わらせる
+/// 前に、完了または打ち切りの行を残すため（#589）。ファイルを開いていなければ
+/// 何もしない。
+pub fn sync_service_log() {
+    let Some(slot) = SERVICE_LOG_FILE.get() else {
+        return;
+    };
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(file) = guard.as_mut() else {
+        return;
+    };
+    let _ = file.sync_data();
+}
+
 /// `println!`相当 + （サービスモードのみ）ログファイルへのミラー。
 pub fn log_line(msg: &str) {
     println!("{msg}");
