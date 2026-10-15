@@ -3563,7 +3563,7 @@ fn slmp_session_cpu_refusal(
     Some(PlcConnectionTestError {
         kind: "protocol".to_string(),
         message: format!(
-            "この接続は収集中で、保存済みの CPU 種別（{session_cpu:?}）のセッションを使っています。             フォームの CPU 種別（{requested_cpu:?}）は、保存してからテストしてください。"
+            "この接続は収集中で、保存済みの CPU 種別（{session_cpu:?}）のセッションを使っています。フォームの CPU 種別（{requested_cpu:?}）は、保存してからテストしてください。"
         ),
     })
 }
