@@ -246,12 +246,14 @@ function expectNullableNumber(value: unknown, path: string): number | null {
 }
 
 /**
- * #605: `cpuType` は旧パッケージには無い。省略と `null` は `"R"`
- * （この項目を足す前のフレーム形式）。`"Q"` / `"R"` はそのまま。
- * それ以外は拒否する（R へ黙って倒さない）。
+ * #605: `cpuType` は旧パッケージには無い。省略と `null` は `undefined` のまま
+ * 返す（作成は R、更新は既存の値を保つ。REST/MCP の「省略は既存を保つ」と
+ * 同じ。ここで `"R"` を入れると、既存の Q 接続を同名の旧パッケージの取り込みが
+ * R に戻してしまう）。`"Q"` / `"R"` はそのまま。それ以外は拒否する
+ * （R へ黙って倒さない）。
  */
-function expectCpuType(value: unknown, path: string): CpuType {
-	if (value === undefined || value === null) return 'R';
+function expectCpuType(value: unknown, path: string): CpuType | undefined {
+	if (value === undefined || value === null) return undefined;
 	if (value === 'Q' || value === 'R') return value;
 	throw new ConfigPackageParseError(`${path} は Q / R のいずれかである必要があります`);
 }

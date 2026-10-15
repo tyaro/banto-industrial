@@ -742,7 +742,7 @@
 						{/each}
 					</select>
 					<span class="hint">
-						MELSEC のフレーム形式です。QJ71E71 などの Q シリーズは Q、iQ-R は R
+						MELSEC のフレーム形式です。QJ71E71 などの Q シリーズは Q、iQ-R は R、L シリーズは Q
 						を選んでください。違うと接続できてもタグが Bad になります。既定は R です。
 					</span>
 				</label>

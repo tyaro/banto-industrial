@@ -3287,8 +3287,9 @@ pub struct PlcConnectionTestPayload {
     pub connection_id: Option<i64>,
     /// #605: 直接ダイヤルの SLMP フレームに使う CPU 種別。省略・`"R"` は
     /// iQ-R、`"Q"` は Q シリーズ。未知の値はダイヤルせず失敗にする。
-    /// 既存セッションを再利用する経路では、最後に適用された接続の CPU で
-    /// 読む（2 本目の TCP を張らない既存の制約と同じ）。
+    /// 既存セッションを再利用する経路で、保存済みセッションの CPU と食い違う
+    /// ときは試さずに「保存してからテストしてください」と返す（2 本目の TCP を
+    /// 張らない既存の制約があるため、直接ダイヤルには切り替えない）。
     #[serde(default)]
     pub cpu_type: Option<String>,
 }
@@ -3551,6 +3552,26 @@ async fn test_slmp_connection(
 ) -> (bool, Option<PlcConnectionTestError>) {
     if let Some(connection_id) = payload.connection_id {
         if let Some(handle) = manager.sessions().handle_for(connection_id) {
+            // #605: 保存済みセッションの CPU とフォームの CPU が違うとき、
+            // セッションの読みはフォームの値を試したことにならない。かといって
+            // 2 本目をダイヤルすると、1 本しか受けない機器（R08ENCPU など）では
+            // 誤診になる。なのでテストせず、保存してから試すよう案内する。
+            // 省略（MCP など）は「保存済みのまま」とみなして比較しない。
+            if let Some(requested) = payload.cpu_type.as_deref().filter(|c| !c.is_empty()) {
+                if let Some(applied) = manager.applied_slmp_cpu(connection_id).await {
+                    if applied != requested {
+                        return (
+                            false,
+                            Some(PlcConnectionTestError {
+                                kind: "protocol".to_string(),
+                                message: format!(
+                                    "この接続は収集中で、保存済みの CPU 種別（{applied}）のセッションを使っています。                                     フォームの CPU 種別（{requested}）は、保存してからテストしてください。"
+                                ),
+                            }),
+                        );
+                    }
+                }
+            }
             let requests = vec![BatchReadRequest::Numeric(ReadRequest {
                 address: Address::parse_slmp("D0").expect("valid literal"),
                 data_type: DataType::U16,

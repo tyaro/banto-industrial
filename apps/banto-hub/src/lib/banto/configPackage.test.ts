@@ -349,16 +349,17 @@ describe('configPackage', () => {
 		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
 	});
 
-	// #605: cpuType は旧パッケージには無い。省略は R。明示した Q は往復する。
+	// #605: cpuType は旧パッケージには無い。省略は undefined のまま（作成は R、更新は既存を保つ）。
+	// 明示した Q は往復する。
 	// 未知の値は拒否する（R へ黙って倒さない）。
-	it('parseConfigPackage は cpuType を持たない旧パッケージを R 既定で受け入れる', () => {
+	it('parseConfigPackage は cpuType を持たない旧パッケージを undefined のまま受け入れる（R を入れない）', () => {
 		const pkg = makePackage();
 		const withoutCpu = {
 			...pkg,
 			plcConnections: pkg.plcConnections.map(({ cpuType: _cpuType, ...rest }) => rest)
 		};
 		const parsed = parseConfigPackage(JSON.stringify(withoutCpu));
-		expect(parsed.plcConnections[0].cpuType).toBe('R');
+		expect(parsed.plcConnections[0].cpuType).toBeUndefined();
 	});
 
 	it('buildConfigPackage/parseConfigPackage は SLMP 接続の cpuType Q を往復する', () => {

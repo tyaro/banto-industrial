@@ -736,7 +736,7 @@ fn tool_definitions() -> Vec<Value> {
                     "cpuType": {
                         "type": "string",
                         "enum": ["Q", "R"],
-                        "description": "SLMP の直接ダイヤルに使う CPU 種別。省略時は R。既存セッションを再利用するときは、最後に適用した接続の CPU で読む。",
+                        "description": "SLMP の直接ダイヤルに使う CPU 種別。省略時は R。connectionId の既存セッションを再利用するとき、保存済みの CPU と違えば試さず「保存してからテスト」と返す。",
                     },
                 },
                 "required": ["protocol", "host", "port"],

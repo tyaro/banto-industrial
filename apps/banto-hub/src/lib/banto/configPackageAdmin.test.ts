@@ -20,6 +20,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ConfigPackage } from './configPackage';
+import { parseConfigPackage } from './configPackage';
 
 // `vi.mock` ファクトリはファイル先頭に hoist されるため、参照するクラスは
 // `vi.hoisted` で一緒に巻き上げる必要がある（通常の top-level const/class
@@ -895,5 +896,64 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 
 		expect(inspection.warnings.some((w) => w.includes('no-such-connection'))).toBe(true);
 		expect(inspection.warnings.some((w) => w.includes('no-such-tag'))).toBe(true);
+	});
+});
+
+describe('applyConfigPackage: cpuType を持たない旧パッケージ（#605）', () => {
+	const slmpConn = {
+		id: 7,
+		name: 'plcq',
+		protocol: 'slmp' as const,
+		host: '10.0.0.8',
+		port: 5007,
+		unitId: 0,
+		enabled: true,
+		simulation: false,
+		wordOrder: 'low_high' as const,
+		cpuType: 'Q' as const,
+		database: null,
+		username: null,
+		passwordSet: false
+	};
+
+	function legacyPackage(name: string): ConfigPackage {
+		const legacy = {
+			...pkg,
+			plcConnections: [
+				{
+					name,
+					protocol: 'slmp',
+					host: '10.0.0.8',
+					port: 5007,
+					unitId: 0,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high'
+				}
+			],
+			collectionGroups: [],
+			tags: []
+		};
+		return parseConfigPackage(JSON.stringify(legacy));
+	}
+
+	it('既存の Q 接続の更新に cpuType を載せない（サーバーが既存の Q を保つ）', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([slmpConn]);
+		vi.mocked(updatePlcConnection).mockResolvedValue(slmpConn);
+		await applyConfigPackage(legacyPackage('plcq'));
+		const sent = vi.mocked(updatePlcConnection).mock.calls[0][1];
+		expect(sent.cpuType).toBeUndefined();
+	});
+
+	it('新しい接続の作成にも cpuType を載せない（サーバーの既定 R になる）', async () => {
+		vi.mocked(createPlcConnection).mockResolvedValue({
+			...slmpConn,
+			id: 8,
+			name: 'plcnew',
+			cpuType: 'R'
+		});
+		await applyConfigPackage(legacyPackage('plcnew'));
+		const sent = vi.mocked(createPlcConnection).mock.calls[0][0];
+		expect(sent.cpuType).toBeUndefined();
 	});
 });

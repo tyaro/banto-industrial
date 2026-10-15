@@ -267,6 +267,105 @@ async fn both_cpu_series_frame_layouts_work() {
     }
 }
 
+/// 要求を 1 つ受け取って中身だけ返す偽サーバーに、クライアントが実際に送る
+/// 4E バイナリの要求フレームを丸ごと捕まえる。応答は返さない（クライアントは
+/// タイムアウトで失敗するが、このテストは要求のバイト列だけを見る）。
+async fn capture_request_frame(cpu: SlmpCpu, raw: &str, data_type: DataType) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // 先頭 13 バイト（サブヘッダ〜データ長）のあと、データ長ぶん
+        // （監視タイマー 2B から後ろ）が続く。
+        let mut head = [0u8; 13];
+        stream.read_exact(&mut head).await.unwrap();
+        let rest_len = u16::from_le_bytes([head[11], head[12]]) as usize;
+        let mut rest = vec![0u8; rest_len];
+        stream.read_exact(&mut rest).await.unwrap();
+        let mut frame = head.to_vec();
+        frame.extend(rest);
+        frame
+    });
+    let mut client = SlmpClient::new(SlmpConfig {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        cpu,
+        connect_timeout: Duration::from_millis(500),
+        response_timeout: Duration::from_millis(200),
+        ..Default::default()
+    });
+    client.connect().await.unwrap();
+    let _ = client.read_batch(&[req(raw, data_type)]).await;
+    server.await.unwrap()
+}
+
+/// #605: Q と R の要求フレームを、仕様（MC プロトコル 4E バイナリ、
+/// コマンド 0401 一括読み出し）から手で書き下したバイト列で固定する。
+/// 実装から導いた値ではない。Q は番地 3B + デバイスコード 1B で
+/// サブコマンド 0x0000（ワード）/ 0x0001（ビット）、R は番地 4B +
+/// デバイスコード 2B でサブコマンド 0x0002 / 0x0003。
+/// 共通部分は、サブヘッダ 5400、シリアル 0100（既定の `serial_id` 1）、
+/// 予約 0000、ネットワーク 00、PC FF、要求先 I/O FF03、局番 00、
+/// データ長、監視タイマー 1000（既定 0x0010）。
+#[tokio::test]
+async fn request_frames_for_q_and_r_match_the_hand_written_wire_bytes() {
+    // D100 を 1 ワード（D のコード 0xA8）。
+    let q_word: Vec<u8> = vec![
+        0x54, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, // 共通
+        0x0C, 0x00, // データ長 = 2 + 2 + 2 + 4 + 2
+        0x10, 0x00, // 監視タイマー
+        0x01, 0x04, 0x00, 0x00, // コマンド 0401、サブコマンド 0000
+        0x64, 0x00, 0x00, 0xA8, // 番地 100 (3B) + デバイスコード D
+        0x01, 0x00, // 点数 1
+    ];
+    let r_word: Vec<u8> = vec![
+        0x54, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, //
+        0x0E, 0x00, // データ長 = 2 + 2 + 2 + 6 + 2
+        0x10, 0x00, //
+        0x01, 0x04, 0x02, 0x00, // サブコマンド 0002
+        0x64, 0x00, 0x00, 0x00, 0xA8, 0x00, // 番地 100 (4B) + デバイスコード D (2B)
+        0x01, 0x00,
+    ];
+    // M100 を 1 点（M のコード 0x90）。
+    let q_bit: Vec<u8> = vec![
+        0x54, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, //
+        0x0C, 0x00, //
+        0x10, 0x00, //
+        0x01, 0x04, 0x01, 0x00, // サブコマンド 0001
+        0x64, 0x00, 0x00, 0x90, //
+        0x01, 0x00,
+    ];
+    let r_bit: Vec<u8> = vec![
+        0x54, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, //
+        0x0E, 0x00, //
+        0x10, 0x00, //
+        0x01, 0x04, 0x03, 0x00, // サブコマンド 0003
+        0x64, 0x00, 0x00, 0x00, 0x90, 0x00, //
+        0x01, 0x00,
+    ];
+    assert_eq!(
+        capture_request_frame(SlmpCpu::Q, "D100", DataType::U16).await,
+        q_word,
+        "Q ワード"
+    );
+    assert_eq!(
+        capture_request_frame(SlmpCpu::R, "D100", DataType::U16).await,
+        r_word,
+        "R ワード"
+    );
+    assert_eq!(
+        capture_request_frame(SlmpCpu::Q, "M100", DataType::Bit).await,
+        q_bit,
+        "Q ビット"
+    );
+    assert_eq!(
+        capture_request_frame(SlmpCpu::R, "M100", DataType::Bit).await,
+        r_bit,
+        "R ビット"
+    );
+}
+
 /// The tripwire this module exists for (see `mod.rs`'s doc comment and the
 /// `slmp` note in the workspace `Cargo.toml`): a real non-zero end code, built
 /// by the real wrapped crate from real bytes, must classify as a *per-request*

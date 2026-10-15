@@ -751,6 +751,16 @@ impl BrokerSimRegistry {
         (target.0, target.1, changed)
     }
 
+    /// #605: `connection_id` のセッションが最後に解決された SLMP の CPU 種別。
+    /// SLMP 以外・未解決は `None`。
+    pub async fn applied_slmp_cpu(&self, connection_id: i64) -> Option<String> {
+        let last_target = self.last_target.lock().await;
+        last_target
+            .get(&connection_id)
+            .map(|identity| identity.slmp_cpu.clone())
+            .filter(|cpu| !cpu.is_empty())
+    }
+
     /// `connection_id`用に追跡しているシミュレータ(あれば)を停止・忘却し、
     /// `last_target`のエントリも忘れる。有効な broker 管理接続の集合
     /// (SLMP / Modbus TCP)から外れた接続(削除・無効化・プロトコル変更)の
