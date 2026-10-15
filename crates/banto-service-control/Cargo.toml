@@ -13,3 +13,10 @@ thiserror = { workspace = true }
 # banto-hub-core が `service_manager.rs` で使っていたのと同じ版（SCM の
 # open / query / start / stop / change_config）。
 windows-service = "0.8.1"
+# PRESHUTDOWN 待ち時間の読み戻し（`QueryServiceConfig2W`）。
+# `windows-service` 0.8 は設定だけを公開していて、読み戻しは無い。
+# 同じ 0.61 系（`windows-service` が既に依存している）に feature を足す。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+] }

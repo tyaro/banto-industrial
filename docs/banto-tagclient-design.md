@@ -25,6 +25,7 @@ S4b-1互換候補では、`origin/main` 509bf0e（Banto v1.4.0）との統合検
 close コードと理由文を捨てずに分類し（`close::classify_close`）、`unauthorized` + 理由ごとの
 `last_error`（`key_revoked` / `key_expired` / `key_tripped` / `key_not_found` /
 `credential_rejected`）で止まって**再接続しない**ようにした（§4 の分類表・§5 の状態機械）。
+**#589（2026-10-15）**: 1回のREST呼び出し（catalog・値snapshot・書き込み。workerの再接続時の取得を含む）の上限を、opt-inの`RestClient::with_request_timeout`で足した（時間切れは`transport`）。既定の`new`は上限なしのままにする。既定に上限を入れると、外側に自分の期限を持つ利用側（ChronoGazerのHub操作の15秒）がSDKの`transport`で先に失敗し、期限切れの理由を失うため。使うのはbanto-hub-sink（10秒）だけ。
 **W1（2026-09-01）**では、Issue #123の残スコープだった単一タグ書き込み
 （`RestClient::write_tag`）を実装した。`POST /api/v1/values/{tag}`を1回送るだけで、
 `worker.rs`の再接続・backoff機構には一切乗せない（自動再送をしない、§4.4のオーナー決定）。
@@ -211,6 +212,8 @@ pub struct RestClient { /* Endpoint + opaque SecretApiKey + reqwest Client */ }
 
 impl RestClient {
 	pub fn new(endpoint: Endpoint, secret: SecretApiKey) -> Result<Self>;
+	// #589（2026-10-15）: 1回のREST呼び出しの上限はopt-in。`new`は上限なしのまま。
+	pub fn with_request_timeout(endpoint: Endpoint, secret: SecretApiKey, timeout: Duration) -> Result<Self>;
 	pub async fn fetch_catalog(&self) -> Result<CatalogSnapshot>;
 	pub async fn fetch_values(&self, tags: &[&str]) -> Result<ValuesSnapshot>;
 	// W1（2026-09-01、Issue #123）: 単一タグ書き込み。§4.4参照。

@@ -34,7 +34,9 @@
 //! [`FlusherHandle::request_drain`] で「間隔を待たず、空になるまで
 //! 流し続ける」モードへ入る（設計 §5.6 の停止時 flush）。
 //! [`FlusherHandle::stop`] は周回の切れ目・バックオフの待ち・
-//! 間隔待ちのいずれからでも即座に抜ける。
+//! 間隔待ちのいずれからでも即座に抜ける。渡した `timeout` はタスクの
+//! join と `pool.close()` の合計の期限で、応答しない DB が返却時の
+//! ping で許可を握ったままでも、その期限で戻る。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -121,6 +123,17 @@ pub fn build_pool(connection: &SinkConfigConnection) -> Result<PgPool, String> {
         .connect_lazy_with(options))
 }
 
+/// [`FlusherHandle::stop`] の結果。OS シャットダウンの停止ログで、
+/// 「完了」と「打ち切り」を分けるために使う（#589）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum FlusherStopOutcome {
+    /// タスクが期限内に終わり、プールも閉じた。
+    Completed,
+    /// 期限内に終わらず abort した、またはプールを閉じ切れなかった。
+    CutShort,
+}
+
 /// 走っている flusher 1 本への操作口。
 pub struct FlusherHandle {
     pub connection_id: i64,
@@ -145,25 +158,224 @@ impl FlusherHandle {
         self.wake.notify_one();
     }
 
-    /// 停止して join する。`timeout` を超えたら abort する（DB が固まって
-    /// いる場合に停止処理ごと止まらないため - トランザクションは
-    /// commit 前なので abort しても二重書き込みにはならない）。
-    pub async fn stop(self, timeout: Duration) {
+    /// 停止して join し、プールも閉じる。`timeout` は join と
+    /// [`PgPool::close`] の**合計**の絶対期限。
+    ///
+    /// sqlx 0.9 は接続をプールへ戻すときに ping し、その間セマフォの許可を
+    /// 握ったままにする。`close` はその許可が全部戻るまで待つので、応答
+    /// しない DB では `close().await` が終わらない。期限を超えたらタスクを
+    /// abort し、閉じ切れていないプールは待たずに捨てて戻る（commit 前
+    /// なので abort しても二重書き込みにはならない）。呼び出した側は
+    /// 未送信行の計上と Stopped の報告を続けられる。
+    ///
+    /// この future が途中で drop されたとき（運転ループが停止合図で設定
+    /// 反映の `stop` を打ち切ったとき）は [`Drop`] がタスクを abort する。
+    /// `JoinHandle` の drop は detach するだけで、abort しない。
+    ///
+    /// 期限内に join とプールの close が両方済んだら
+    /// [`FlusherStopOutcome::Completed`]、どちらかを打ち切ったら
+    /// [`FlusherStopOutcome::CutShort`]。
+    pub async fn stop(mut self, timeout: Duration) -> FlusherStopOutcome {
         self.stop.notify_one();
-        let mut task = self.task;
-        match tokio::time::timeout(timeout, &mut task).await {
-            Ok(_) => {}
-            Err(_) => {
-                log_err_line(&format!(
-                    "banto-hub-sink: warn: 接続 id={} の flusher が {}秒で停止しませんでした（強制終了します）",
-                    self.connection_id,
-                    timeout.as_secs_f64()
-                ));
-                task.abort();
-                let _ = task.await;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        let join_limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let joined = !join_limit.is_zero()
+            && tokio::time::timeout(join_limit, &mut self.task)
+                .await
+                .is_ok();
+        if !joined {
+            log_err_line(&format!(
+                "banto-hub-sink: warn: 接続 id={} の flusher が {}秒で停止しませんでした（強制終了します）",
+                self.connection_id,
+                timeout.as_secs_f64()
+            ));
+            self.task.abort();
+            let join_limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !join_limit.is_zero() {
+                let _ = tokio::time::timeout(join_limit, &mut self.task).await;
             }
         }
-        self.pool.close().await;
+
+        let close_limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let closed = !close_limit.is_zero()
+            && tokio::time::timeout(close_limit, self.pool.close())
+                .await
+                .is_ok();
+        if !closed {
+            log_err_line(&format!(
+                "banto-hub-sink: warn: 接続 id={} のプールを {}秒以内に閉じられませんでした（待たずに停止を続けます）",
+                self.connection_id,
+                timeout.as_secs_f64()
+            ));
+        }
+        if joined && closed {
+            FlusherStopOutcome::Completed
+        } else {
+            FlusherStopOutcome::CutShort
+        }
+    }
+}
+
+impl Drop for FlusherHandle {
+    fn drop(&mut self) {
+        // `stop` が最後まで走ったあとの abort は、すでに終わったタスクに
+        // 対する no-op。途中で future が捨てられたときは、detach せずに
+        // ここで止める。
+        self.task.abort();
+    }
+}
+
+/// 応答しない PostgreSQL に接続を 1 本出した状態の flusher。
+/// 停止合図で接続を返し、返却時の ping（sqlx 0.9）が応答を待つところまで
+/// 進めてからタスクを終わらせる。`pool.close()` はその ping が許可を
+/// 握っている間は戻らない。
+#[cfg(test)]
+pub(crate) async fn flusher_on_blackhole_pool(connection_id: i64) -> (FlusherHandle, TestServer) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (ping_tx, ping_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        if read_startup(&mut stream).await.is_err() {
+            return;
+        }
+        if stream.write_all(&postgres_ready_for_query()).await.is_err() {
+            return;
+        }
+        let mut buf = [0_u8; 1024];
+        let mut saw_ping = false;
+        let mut ping_tx = Some(ping_tx);
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) if !saw_ping => {
+                    saw_ping = true;
+                    if let Some(tx) = ping_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let options = PgConnectOptions::new()
+        .host("127.0.0.1")
+        .port(port)
+        .username("app")
+        .database("erp")
+        .password("pw")
+        .ssl_mode(PgSslMode::Disable);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(3))
+        .test_before_acquire(false)
+        .connect_lazy_with(options);
+    let conn = pool
+        .acquire()
+        .await
+        .expect("startup handshake with the blackhole server");
+
+    let stop = Arc::new(Notify::new());
+    let stop_for_task = stop.clone();
+    let task = tokio::spawn(async move {
+        stop_for_task.notified().await;
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(2), ping_rx)
+            .await
+            .expect("return-to-pool ping did not reach the server")
+            .expect("ping channel closed");
+    });
+
+    let handle = FlusherHandle {
+        connection_id,
+        connection: SinkConfigConnection {
+            id: connection_id,
+            name: "erp-db".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: i64::from(port),
+            database: Some("erp".to_string()),
+            username: Some("app".to_string()),
+            password: Some("pw".to_string()),
+        },
+        pool,
+        wake: Arc::new(Notify::new()),
+        stop,
+        draining: Arc::new(AtomicBool::new(false)),
+        task,
+    };
+    (handle, TestServer { task: server })
+}
+
+#[cfg(test)]
+async fn read_startup(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut len_buf = [0_u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let mut len = i32::from_be_bytes(len_buf);
+    // sslmode が Prefer でも Disable でも、先頭が SSLRequest なら 'N' を返す。
+    if len == 8 {
+        let mut code_buf = [0_u8; 4];
+        stream.read_exact(&mut code_buf).await?;
+        if i32::from_be_bytes(code_buf) == 80877103 {
+            stream.write_all(b"N").await?;
+            stream.read_exact(&mut len_buf).await?;
+            len = i32::from_be_bytes(len_buf);
+        }
+    }
+    let rest = usize::try_from(len).unwrap_or(0).saturating_sub(4);
+    if rest > 0 && rest < 8192 {
+        let mut body = vec![0_u8; rest];
+        stream.read_exact(&mut body).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn postgres_ready_for_query() -> Vec<u8> {
+    fn message(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 4 + body.len());
+        out.push(tag);
+        out.extend_from_slice(&(4 + body.len() as i32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+    fn cstring_pair(name: &str, value: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(value.as_bytes());
+        body.push(0);
+        message(b'S', &body)
+    }
+    let mut out = message(b'R', &0_i32.to_be_bytes());
+    out.extend(cstring_pair("server_version", "15.0"));
+    out.extend(cstring_pair("client_encoding", "UTF8"));
+    out.extend(cstring_pair("DateStyle", "ISO, MDY"));
+    out.extend(cstring_pair("integer_datetimes", "on"));
+    out.extend(message(b'K', &[0, 0, 0, 1, 0, 0, 0, 2]));
+    out.extend(message(b'Z', b"I"));
+    out
+}
+
+/// テスト用サーバタスク。drop で abort する。
+#[cfg(test)]
+pub(crate) struct TestServer {
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -475,8 +687,13 @@ mod tests {
         };
 
         let start = tokio::time::Instant::now();
-        handle.stop(Duration::from_millis(50)).await;
+        let outcome = handle.stop(Duration::from_millis(50)).await;
         let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            FlusherStopOutcome::CutShort,
+            "abort したら打ち切り"
+        );
 
         // タイムアウト時間は大幅に超えていないはず（abort + await は速い）。
         assert!(
@@ -484,6 +701,69 @@ mod tests {
             "stop は {}ms で返るべき（elapsed: {:?}）",
             50,
             elapsed
+        );
+    }
+
+    /// `stop` の future を捨てても flusher タスクは detach されず abort される。
+    /// 運転ループが設定反映の途中で停止合図を受けたときの引き渡し。
+    #[tokio::test]
+    async fn dropping_stop_aborts_the_flusher_task() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Notify::new());
+        let entered_for_task = entered.clone();
+        let task = tokio::spawn(async move {
+            struct Tell(Option<tokio::sync::oneshot::Sender<()>>);
+            impl Drop for Tell {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _tell = Tell(Some(tx));
+            entered_for_task.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let handle = FlusherHandle {
+            connection_id: 1,
+            connection: connection(5432),
+            pool: build_pool(&connection(5432)).expect("pool"),
+            wake: Arc::new(Notify::new()),
+            stop: Arc::new(Notify::new()),
+            draining: Arc::new(AtomicBool::new(false)),
+            task,
+        };
+        entered.notified().await;
+        drop(handle.stop(Duration::from_secs(30)));
+        tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("タスクは abort されて drop される")
+            .expect("oneshot");
+    }
+
+    /// 返却時の ping が戻らない DB でも、`stop` に渡した期限で
+    /// `pool.close()` まで含めて戻る（期限の外で無期限に待たない）。
+    #[tokio::test]
+    async fn stop_returns_within_the_budget_when_pool_close_pings_a_blackhole() {
+        let (handle, _server) = flusher_on_blackhole_pool(7).await;
+        let budget = Duration::from_millis(400);
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), handle.stop(budget))
+            .await
+            .expect("応答しない DB の pool.close() が stop の期限の外で待っている");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            outcome,
+            FlusherStopOutcome::CutShort,
+            "プールを閉じ切れなかったら打ち切り"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "ping が固まっているのに close が期限を待たずに戻った: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop が期限 {budget:?} を大きく超えた: {elapsed:?}"
         );
     }
 }

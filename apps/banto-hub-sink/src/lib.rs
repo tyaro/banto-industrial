@@ -102,4 +102,4 @@ pub mod status;
 pub mod values;
 
 pub use config::{load_config, SidecarConfig, DEFAULT_CONFIG_FILE_NAME, ENV_CONFIG_PATH};
-pub use run::{run, SidecarOptions};
+pub use run::{run, SidecarOptions, StopRequest};
