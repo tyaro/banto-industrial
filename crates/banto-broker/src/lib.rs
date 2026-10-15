@@ -469,9 +469,19 @@ pub struct BrokerHandle {
     tx: mpsc::Sender<Job>,
     /// See [`Self::status_watch`].
     status_rx: watch::Receiver<BrokerConnectionStatus>,
+    /// #605: このセッションを作ったときの SLMP の CPU 種別（SLMP 以外は
+    /// `None`）。handle と同じ世代のメタデータで、後から別のレジストリを
+    /// 引き直さない。接続テストが「いま読むセッションの CPU」を比べるために使う。
+    slmp_cpu: Option<SlmpCpu>,
 }
 
 impl BrokerHandle {
+    /// #605: このセッションを作ったときの SLMP の CPU 種別。SLMP 以外は `None`。
+    /// 設定を変えて作り直されたセッションの handle は、新しい値を持つ。
+    pub fn slmp_cpu(&self) -> Option<SlmpCpu> {
+        self.slmp_cpu
+    }
+
     /// Submit a (possibly mixed numeric + string, S2 文字列タグ) read batch
     /// and await its result. Fails fast with [`BrokerError::Disconnected`] if
     /// the session is down - see the module doc's queued-request-while-down
@@ -543,6 +553,11 @@ pub struct ReadOnlyHandle {
 }
 
 impl ReadOnlyHandle {
+    /// Identical to [`BrokerHandle::slmp_cpu`].
+    pub fn slmp_cpu(&self) -> Option<SlmpCpu> {
+        self.inner.slmp_cpu()
+    }
+
     /// Identical to [`BrokerHandle::read`].
     pub async fn read(
         &self,
@@ -625,6 +640,7 @@ pub fn spawn_test_handle_with_status(
             connection_id,
             tx,
             status_rx,
+            slmp_cpu: None,
         },
         status_tx,
         task,
@@ -747,7 +763,11 @@ fn spawn_slmp_driver(
     backoff: BackoffConfig,
     shutdown_rx: watch::Receiver<bool>,
 ) -> (BrokerHandle, TaskEntry) {
-    spawn_task(conn.id, slmp_config_for(conn, port), backoff, shutdown_rx)
+    let config = slmp_config_for(conn, port);
+    let cpu = config.cpu;
+    let (mut handle, task) = spawn_task(conn.id, config, backoff, shutdown_rx);
+    handle.slmp_cpu = Some(cpu);
+    (handle, task)
 }
 
 /// [`DriverSpawn`] for `"modbus-tcp"` (#131, 2026-09-01): build this
@@ -1058,6 +1078,7 @@ fn spawn_task_with_connector(
             connection_id,
             tx,
             status_rx,
+            slmp_cpu: None,
         },
         TaskEntry {
             stop_tx,

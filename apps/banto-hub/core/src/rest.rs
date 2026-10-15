@@ -3541,6 +3541,33 @@ async fn test_modbus_connection(
     }
 }
 
+/// #605: 既存セッションを再利用する前の CPU 照合。`session_cpu` は読む handle が
+/// 作成時に持っていた CPU。フォームの CPU（`requested`、省略・空は「保存済みのまま」
+/// で比べない）と違えば、保存してからテストするよう案内するエラーを返す。
+/// 未知の値は直接ダイヤルと同じく不正として返す。
+fn slmp_session_cpu_refusal(
+    session_cpu: Option<banto_plc::SlmpCpu>,
+    requested: &Option<String>,
+) -> Option<PlcConnectionTestError> {
+    if requested.as_deref().is_none_or(str::is_empty) {
+        return None;
+    }
+    let requested_cpu = match slmp_cpu_from_test_payload(requested) {
+        Ok(cpu) => cpu,
+        Err(err) => return Some(err),
+    };
+    let session_cpu = session_cpu?;
+    if session_cpu == requested_cpu {
+        return None;
+    }
+    Some(PlcConnectionTestError {
+        kind: "protocol".to_string(),
+        message: format!(
+            "この接続は収集中で、保存済みの CPU 種別（{session_cpu:?}）のセッションを使っています。             フォームの CPU 種別（{requested_cpu:?}）は、保存してからテストしてください。"
+        ),
+    })
+}
+
 /// SLMP の接続テスト。`payload.connection_id`があり、その接続の broker
 /// セッションが既に生きていれば、それを再利用して読む(新規ダイヤルしない -
 /// 実機 R08ENCPU は対象ポートが既に使用中だと2本目を受け付けないため、これを
@@ -3556,21 +3583,10 @@ async fn test_slmp_connection(
             // セッションの読みはフォームの値を試したことにならない。かといって
             // 2 本目をダイヤルすると、1 本しか受けない機器（R08ENCPU など）では
             // 誤診になる。なのでテストせず、保存してから試すよう案内する。
-            // 省略（MCP など）は「保存済みのまま」とみなして比較しない。
-            if let Some(requested) = payload.cpu_type.as_deref().filter(|c| !c.is_empty()) {
-                if let Some(applied) = manager.applied_slmp_cpu(connection_id).await {
-                    if applied != requested {
-                        return (
-                            false,
-                            Some(PlcConnectionTestError {
-                                kind: "protocol".to_string(),
-                                message: format!(
-                                    "この接続は収集中で、保存済みの CPU 種別（{applied}）のセッションを使っています。                                     フォームの CPU 種別（{requested}）は、保存してからテストしてください。"
-                                ),
-                            }),
-                        );
-                    }
-                }
+            // 比べる CPU は、いま読む handle 自身が持つ（別のレジストリを引き直さない。
+            // 引き直すと、設定の反映と交差して古いセッションを新しい CPU で通してしまう）。
+            if let Some(refusal) = slmp_session_cpu_refusal(handle.slmp_cpu(), &payload.cpu_type) {
+                return (false, Some(refusal));
             }
             let requests = vec![BatchReadRequest::Numeric(ReadRequest {
                 address: Address::parse_slmp("D0").expect("valid literal"),
@@ -9924,6 +9940,68 @@ mod tests {
     use tower::ServiceExt;
 
     const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
+
+    fn slmp_conn_with_cpu(id: i64, cpu: &str) -> banto_tags::PlcConnection {
+        banto_tags::PlcConnection {
+            id,
+            name: format!("conn-{id}"),
+            protocol: "slmp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 5007,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            cpu_type: cpu.to_string(),
+            database: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// #605 P2: 接続テストが比べる CPU は、いま読む handle 自身が作成時に持っていた
+    /// CPU でなければならない。古い R の handle を取ったあと、読む前に設定の反映
+    /// （`BrokerSimRegistry::resolve`）が新しい Q を公開する、という交差を
+    /// 同期点で再現する。別のレジストリ（resolve が公開した最新の CPU）を引くと
+    /// 要求の Q と一致して通ってしまうが、handle の CPU（R）で比べるので断られる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_cpu_check_uses_the_handle_generation_not_the_latest_published_cpu() {
+        let sessions = crate::broker_glue::HubSessions::new(banto_broker::BackoffConfig::default());
+        let registry = crate::broker_glue::BrokerSimRegistry::new();
+        let old = slmp_conn_with_cpu(1, "R");
+        registry.resolve(&old).await;
+        sessions.ensure_connection(&old).unwrap();
+
+        // 1. 古い R の handle を取る。
+        let handle = sessions.handle_for(1).expect("live session");
+        assert_eq!(handle.slmp_cpu(), Some(banto_plc::SlmpCpu::R));
+
+        // 2. 読む前に、設定の反映が新しい Q を公開する（古いセッションはまだ生きている）。
+        let (_, _, changed) = registry.resolve(&slmp_conn_with_cpu(1, "Q")).await;
+        assert!(changed, "Q の公開は resolve で changed になる");
+
+        // 3. 要求の Q との比較は、古い handle の CPU（R）に対して行われ、断られる。
+        let refusal = slmp_session_cpu_refusal(handle.slmp_cpu(), &Some("Q".to_string()))
+            .expect("R のセッションを Q の要求で通さない");
+        assert_eq!(refusal.kind, "protocol");
+        assert!(
+            refusal.message.contains("保存してからテスト"),
+            "{}",
+            refusal.message
+        );
+
+        // 世代が同じなら通る。作り直したあとの handle は Q を持つ。
+        assert!(slmp_session_cpu_refusal(handle.slmp_cpu(), &Some("R".to_string())).is_none());
+        assert!(slmp_session_cpu_refusal(handle.slmp_cpu(), &None).is_none());
+        assert!(sessions.stop_and_join(1).await);
+        sessions
+            .ensure_connection(&slmp_conn_with_cpu(1, "Q"))
+            .unwrap();
+        let fresh = sessions.handle_for(1).expect("rebuilt session");
+        assert_eq!(fresh.slmp_cpu(), Some(banto_plc::SlmpCpu::Q));
+        assert!(slmp_session_cpu_refusal(fresh.slmp_cpu(), &Some("Q".to_string())).is_none());
+        sessions.shutdown().await;
+    }
 
     /// A `CollectorManager` for router-composition tests that never actually
     /// rebuild (I1 CRUD tests below only cover auth/RBAC/plumbing, not the

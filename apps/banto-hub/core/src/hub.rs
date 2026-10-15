@@ -955,13 +955,6 @@ impl CollectorManager {
         &self.sessions
     }
 
-    /// #605: `connection_id` の broker セッションが最後にダイヤルした SLMP の
-    /// CPU 種別（`"Q"` / `"R"`）。接続テストが、フォームの CPU と食い違う
-    /// セッションを再利用して読まないために使う。未解決なら `None`。
-    pub async fn applied_slmp_cpu(&self, connection_id: i64) -> Option<String> {
-        self.sim_registry.applied_slmp_cpu(connection_id).await
-    }
-
     /// The shared clock (design: 値のタイムスタンプはサンプル取得時刻 - `rest.rs`
     /// uses this for the `/api/v1/values` snapshot's own `t` field and for a
     /// sample-less tag's fallback timestamp).
