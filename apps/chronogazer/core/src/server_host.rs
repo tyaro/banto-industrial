@@ -114,7 +114,7 @@ use crate::engine::{
     RunningEngine, ShutdownReport,
 };
 use crate::instance_lock::ChronoGazerHost;
-use crate::paths::DataLayout;
+use crate::paths::{DataLayout, DirAccessSource};
 use crate::settings::{lan_autostart_allowed, AuthSettings, ServerSettings, SettingsService};
 use crate::startup_recovery::{
     classify, classify_settings_error, plan, FailureKind, RecoveryChoice, WindowPlan,
@@ -371,7 +371,9 @@ fn failure_from_engine(err: &EngineStartError, layout: &DataLayout) -> StartFail
 
 // #392 B2-4a: Hub の API キーの保存先を開く関数と、開けなかったときの代わりは
 // デスクトップ（B2-4b）と共有するため `crate::key_store` へ移した。挙動は同じ。
-pub use crate::key_store::{open_key_store, FailedKeyStore};
+pub use crate::key_store::{
+    open_key_store, open_key_store_from, open_key_store_with, FailedKeyStore,
+};
 
 // --- 起動と終了 ---------------------------------------------------------------
 
@@ -379,6 +381,10 @@ pub use crate::key_store::{open_key_store, FailedKeyStore};
 pub struct ServerOptions {
     pub layout: DataLayout,
     pub key_store: Arc<dyn KeyStore>,
+    /// A1 の診断ファイル・`GET /api/host`・`run\endpoint.json` に出す host の種類
+    /// （コンソールは [`ChronoGazerHost::Server`]、サービスは
+    /// [`ChronoGazerHost::Service`]。#392 B3-2a）。
+    pub host: ChronoGazerHost,
 }
 
 /// 動いている `chronogazer-server`。
@@ -423,8 +429,12 @@ pub fn parse_log_retention(raw: Option<&str>) -> Option<u32> {
 
 /// 起動（[`open`] → [`OpenedServer::start`]。間に何も挟まないテスト用）。
 pub async fn start(options: ServerOptions) -> Result<StartedServer, StartFailure> {
-    let ServerOptions { layout, key_store } = options;
-    open(layout).await?.start(key_store).await
+    let ServerOptions {
+        layout,
+        key_store,
+        host,
+    } = options;
+    open(layout, host).await?.start(key_store).await
 }
 
 /// A1 の排他を取って DB を開いた `chronogazer-server`（[`open`]）。ルートの下に
@@ -436,11 +446,15 @@ pub async fn start(options: ServerOptions) -> Result<StartedServer, StartFailure
 pub struct OpenedServer {
     opened: OpenedEngine,
     layout: DataLayout,
+    host: ChronoGazerHost,
 }
 
-/// [`lock`] と [`LockedServer::open`] を続けて行う（間に何も挟まないテスト用）。
-pub async fn open(layout: DataLayout) -> Result<OpenedServer, StartFailure> {
-    lock(layout)?.open().await
+/// [`lock`] と [`LockedServer::open`] を続けて行う（間に何も挟まないテスト用。
+/// ルートの ACL の利用者は今のプロセスの利用者）。
+pub async fn open(layout: DataLayout, host: ChronoGazerHost) -> Result<OpenedServer, StartFailure> {
+    lock(layout, host, &DirAccessSource::CurrentProcess)?
+        .open()
+        .await
 }
 
 /// A1 の排他だけを取った `chronogazer-server`（[`lock`]）。bin はこの後に日次ログを
@@ -450,6 +464,7 @@ pub async fn open(layout: DataLayout) -> Result<OpenedServer, StartFailure> {
 pub struct LockedServer {
     locked: LockedEngine,
     layout: DataLayout,
+    host: ChronoGazerHost,
 }
 
 impl LockedServer {
@@ -459,23 +474,40 @@ impl LockedServer {
 
     /// リストア予約の適用 → `init_db`。
     pub async fn open(self) -> Result<OpenedServer, StartFailure> {
-        let LockedServer { locked, layout } = self;
+        let LockedServer {
+            locked,
+            layout,
+            host,
+        } = self;
         let opened = locked
             .open()
             .await
             .map_err(|err| failure_from_engine(&err, &layout))?;
-        Ok(OpenedServer { opened, layout })
+        Ok(OpenedServer {
+            opened,
+            layout,
+            host,
+        })
     }
 }
 
 /// 起動の最初の段: ルートを作り（ルートそのものだけ）、A1 の排他を取る（モジュール
 /// doc）。排他を取れなければ、ルートの下には何も作らない（DB も）。
-pub fn lock(layout: DataLayout) -> Result<LockedServer, StartFailure> {
+///
+/// `host` は A1 の診断ファイル・`GET /api/host`・`run\endpoint.json` に出す種類、
+/// `access` はルートを作るときの ACL の利用者の欄（#392 B3-2a。コンソールは
+/// [`ChronoGazerHost::Server`] と [`DirAccessSource::CurrentProcess`]、サービスは
+/// [`ChronoGazerHost::Service`] とインストール利用者の SID）。
+pub fn lock(
+    layout: DataLayout,
+    host: ChronoGazerHost,
+    access: &DirAccessSource,
+) -> Result<LockedServer, StartFailure> {
     // 初回（`%ProgramData%\ChronoGazer` がまだ無い）はルートを作る。A1 の排他の
     // 診断ファイルと DB はその直下に置く。#392 B2-4a（O6）: 無いときだけ、保護された
-    // DACL（SYSTEM・Administrators にフル、このプロセスの利用者に「変更」、Users なし）
+    // DACL（SYSTEM・Administrators にフル、`access` の利用者に「変更」、Users なし）
     // で作る。既にあるルートには触らない（`crate::paths::create_root_dir`）。
-    if let Err(err) = crate::paths::create_root_dir(&layout) {
+    if let Err(err) = access.create_root_dir(&layout) {
         return Err(StartFailure {
             kind: FailureKind::Other,
             message: format!(
@@ -494,7 +526,7 @@ pub fn lock(layout: DataLayout) -> Result<LockedServer, StartFailure> {
             "Hub の API キーの保存先をまだ開いていません",
         )),
         attach_hub: true,
-        host: ChronoGazerHost::Server,
+        host,
         listen: EngineListen::Disabled,
         allow_setup: false,
         seed_viewer_public: false,
@@ -506,7 +538,11 @@ pub fn lock(layout: DataLayout) -> Result<LockedServer, StartFailure> {
         store_dir_check_required: true,
     })
     .map_err(|err| failure_from_engine(&err, &layout))?;
-    Ok(LockedServer { locked, layout })
+    Ok(LockedServer {
+        locked,
+        layout,
+        host,
+    })
 }
 
 impl OpenedServer {
@@ -528,15 +564,20 @@ impl OpenedServer {
     /// 起動の後半: 設定から待ち受けの形 → エンジン（`key_store` を使う）→
     /// `run\endpoint.json`。失敗は分類して [`StartFailure`]。
     pub async fn start(self, key_store: Arc<dyn KeyStore>) -> Result<StartedServer, StartFailure> {
-        let OpenedServer { opened, layout } = self;
+        let OpenedServer {
+            opened,
+            layout,
+            host,
+        } = self;
         let opened = opened.with_key_store(key_store);
-        start_opened(opened, layout).await
+        start_opened(opened, layout, host).await
     }
 }
 
 async fn start_opened(
     opened: OpenedEngine,
     layout: DataLayout,
+    host: ChronoGazerHost,
 ) -> Result<StartedServer, StartFailure> {
     let settings = opened.settings();
     let read = async {
@@ -580,7 +621,7 @@ async fn start_opened(
             let info = EndpointInfo::for_current_process(
                 addr.port(),
                 engine.services().host.scope.clone(),
-                ChronoGazerHost::Server.as_str(),
+                host.as_str(),
             );
             write_endpoint(&endpoint_file, &info)
                 .err()
