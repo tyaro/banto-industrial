@@ -590,3 +590,10 @@ pub fn install_ctrl_handler(callback: CtrlCallback) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// Ctrl のハンドラーをこのプロセスで登録したか（テスト用。#392 B3-2b: サービスの
+/// 本体はコンソールのハンドラーを登録しない、を確かめる）。
+#[cfg(test)]
+pub fn ctrl_handler_installed() -> bool {
+    CTRL_CALLBACK.get().is_some()
+}

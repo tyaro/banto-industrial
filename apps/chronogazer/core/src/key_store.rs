@@ -192,6 +192,12 @@ mod tests {
             .iter()
             .any(|ace| ace.sid == me.as_str() && ace.mask == MODIFY_ACCESS_MASK));
 
+        // グループの SID の作り方とその前提は `crate::paths` の
+        // `create_root_dir_with_uses_the_given_access` と同じ（PR #617 のレビュー）。
+        assert!(
+            me.as_str().starts_with("S-1-5-21-"),
+            "ローカル・ドメインの利用者のアカウントで走らせる前提（グループの SID を -513 で作る）: {me:?}"
+        );
         let machine = me.as_str().rsplit_once('-').unwrap().0;
         let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
         let layout = DataLayout::new(dir.path().join("group"));

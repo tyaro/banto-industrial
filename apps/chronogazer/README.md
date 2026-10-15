@@ -87,8 +87,9 @@ cargo run -p chronogazer-core --bin banto-serve
 
 ### 画面の無い本番用のエンジン `chronogazer-server`（2026-10-13〜、#392 B1-5）
 
-`banto-serve`（開発・E2E 用）とは別の、本番用の headless host。今はコンソールで動かす形だけで、
-Windows サービスとしての登録は #392 の B3。
+`banto-serve`（開発・E2E 用）とは別の、本番用の headless host。コンソールで動かす形と、同じ exe を
+Windows サービス `ChronoGazer` として動かす形（2026-10-15〜、#392 B3-2b。下の「Windows サービスとして
+動かす」）がある。
 
 ```sh
 cargo build -p chronogazer-core --bin chronogazer-server --features embed-ui
@@ -122,7 +123,7 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   コンソールにも同じものを出す）。保持は設定 `log.retention_days`（既定 30 日、`0` で無制限）。
 - **止め方**: Ctrl-C（後始末は最大 15 秒）。コンソールのウィンドウを閉じたときも、通常は最終の書き出しと
   `collection_stopped` を残してから終わる（OS の猶予に合わせて最大 4 秒。例外は下の既知の制限）。ログオフでも終わる
-  （サインアウトをまたいで動かすのはサービス化の後）。
+  （サインアウトをまたいで動かすのは下の Windows サービス）。
 - **終了コード**: 0 正常、1 後始末が時間内に終わらなかった・最終の書き出しに失敗、2 同じデータを
   別の ChronoGazer（デスクトップ版・`banto-serve` など）が使用中、3 その他の起動の失敗（理由と、
   手で行う対処をコンソールとログに出す。自動では何も直さない）。起動の途中で Ctrl-C・ウィンドウを閉じると、
@@ -134,6 +135,51 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
   諦める（ログには残る）。`logs\` と DB は同じ PC の他の利用者から読める（サービス化の権限の整理まで）。
   最初の管理者を作るまでの間は、同じ PC のプログラムが最初の管理者を作れ、ログインなしで管理者として入れる
   （デスクトップ版の初回セットアップと同じ範囲。ブラウザーで開いた外のページからは `Host` の確認で作れない）。
+
+#### Windows サービスとして動かす（2026-10-15〜、#392 B3-2b）
+
+同じ `chronogazer-server.exe` を Windows サービス `ChronoGazer`（表示名「ChronoGazer 記録エンジン」、
+LocalSystem、手動開始）として登録する。サインアウトしても止まらず、OS のシャットダウンでは最終 flush と
+`collection_stopped` を残してから止まる（PRESHUTDOWN、後始末は最大 24 秒）。UAC の昇格ヘルパとインストーラは
+これから（B3-3・B3-4）なので、今は**管理者として実行した PowerShell**（★）から手で行う。
+
+1. **exe を `C:\Program Files\ChronoGazer\` に置いてから登録する**。LocalSystem のサービスは SYSTEM の権限で
+   動くので、一般の利用者が書き換えられる場所（`target\`・ダウンロード・デスクトップなど）の exe を登録すると、
+   その利用者が SYSTEM の権限でプログラムを動かせてしまう（Program Files の外なら `install` が警告する）。
+
+   ```powershell
+   pnpm --filter chronogazer build
+   cargo build --release -p chronogazer-core --bin chronogazer-server --features embed-ui
+   # ★
+   New-Item -ItemType Directory -Force 'C:\Program Files\ChronoGazer'
+   Copy-Item target\release\chronogazer-server.exe 'C:\Program Files\ChronoGazer\'
+   ```
+
+2. ★ 登録: `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' install`。データを使う利用者のアカウント
+   （画面を使う人）でサインインして実行する。その利用者が**インストール利用者**として
+   `HKLM\SYSTEM\CurrentControlSet\Services\ChronoGazer\Parameters\InstallUserSid` に記録され、データのルートと
+   Hub の API キーの保存先の ACL に「変更」で入る（デスクトップ版とサービスで同じ Hub のキーを使える）。別の利用者に
+   するときは `install --install-user-sid S-1-5-21-…`。データのルートが無ければ、ここでその利用者の ACL で作る
+   （既にあれば触らない）。もう一度実行しても登録・記録は変えない（違う利用者を指定したときは警告だけ。変えるには
+   `uninstall` してから `install`）。
+3. ★ 開始・停止: `Start-Service ChronoGazer` / `Stop-Service ChronoGazer`（停止の後始末は最大 15 秒）。状態は
+   `sc.exe query ChronoGazer`、ログは `<データ>\logs\chronogazer-server-YYYY-MM-DD.log`（コンソール版と同じ
+   ファイル。サービスの行は「Windows サービス」「SCM の STOP」「PRESHUTDOWN」を含む）。動いている間は
+   デスクトップ版の ChronoGazer を起動すると、プロセスの中でエンジンを動かさずにサービスの画面を開く。
+4. ★ 解除: `& 'C:\Program Files\ChronoGazer\chronogazer-server.exe' uninstall`（動いていれば止めてから解除。
+   インストール利用者の記録も消える。**データは残す**）。
+
+- **終了コード**（`sc.exe query ChronoGazer` の `SERVICE_EXIT_CODE`）: 0 正常、1 後始末が時間内に終わらなかった・
+  最終の書き出しに失敗（**サービス本体の panic も 1**。ログの「サービス本体が予期せず panic しました」の行で
+  見分ける）、2 同じデータをデスクトップ版・コンソール版が使用中（このときはログに何も書かない。イベント
+  ビューアーの System に 7024）、3 その他の起動の失敗。`install`・`uninstall` は失敗すると終了コード 1。
+  `run-service` は SCM が呼ぶもので、手で実行すると案内を出して終了コード 1。
+- インストール利用者の記録が無い・壊れているときも起動するが、SYSTEM・Administrators だけの ACL で続け、
+  デスクトップ版と Hub のキーを共有できない（ログに理由と対処が出る。`install` をやり直す）。
+- `CHRONOGAZER_ROOT` でデータの場所を変えるなら、**マシン全体の環境変数**にする（サービスに個別に設定すると、
+  デスクトップ版が別の場所を見てサービスにつながらない）。サービスは OS の起動時の環境を使うので、変えたら OS を
+  再起動する。
+- 手動開始なので OS を再起動しただけでは始まらない（自動開始は B3-3 で入る予定）。
 
 ### 旧形式の DB で起動しないとき（2026-10-02〜）
 
