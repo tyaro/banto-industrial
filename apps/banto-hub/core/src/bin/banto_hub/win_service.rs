@@ -271,6 +271,11 @@ impl ServiceProgram for HubProgram {
                 return ServiceExit::Specific(EXIT_CODE_RUNTIME_OR_COLLECT_FAILED);
             }
         };
+        // ランタイムは先に預け、Stopped の報告の後で落とす（移す前と同じ
+        // 順序）。`block_on` の中で panic しても、手元の参照がアンワインドで
+        // 落ちるだけで、ランタイム自体の drop は Stopped の後になる
+        // （`banto_service_control::ServiceContext::hold_until_stopped`）。
+        let runtime = ctx.hold_until_stopped(runtime);
 
         // env 読み取り（T14-1 でホスト側へ移設、T17-1 で3ホスト共通の
         // `banto_hub_core::profile_paths::build_hub_config_from_env`へ一本化 -
@@ -333,6 +338,10 @@ impl ServiceProgram for HubProgram {
             // （tstore の最終 flush を abort しない）。OS 側の上限は SCM の
             // PRESHUTDOWN 待ち時間で、超えたら上の見張りが警告を残す。
             hub.shutdown().await;
+            // `finish` は見張りのスレッドの終わりを同期で待つが、待つのは
+            // 「合図を受けて抜けるまで」（または警告の 1 行とログの書き出し）
+            // だけで短い。停止の最後の段で、このランタイムで他に進める
+            // タスクも無いので、ワーカーを少し止めても構わない。
             if let Some(watch) = overrun {
                 watch.finish();
             }
@@ -346,8 +355,6 @@ impl ServiceProgram for HubProgram {
         if exit == ServiceExit::Success {
             log_line("banto-hub: Windows サービスを停止しました");
         }
-        // 移す前と同じく、ランタイムは`Stopped`の報告の後で落とす。
-        ctx.drop_after_stopped(runtime);
         exit
     }
 }

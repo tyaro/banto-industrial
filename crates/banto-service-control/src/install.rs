@@ -186,6 +186,11 @@ pub fn install_service(spec: &ServiceSpec) -> Result<InstallOutcome, InstallErro
     let manager = WinScm::local_computer(None::<&str>, manager_access)
         .map_err(|err| InstallError::Connect(err.to_string()))?;
 
+    // 開けたら「既に登録済み」。開けなかった理由は区別しない（権限エラーでも
+    // 未登録と同じく新規作成へ進む）- 移す前の Hub と sink の
+    // `open_service(..).is_ok()` と同じ判定。`CREATE_SERVICE` で接続できた
+    // （= 管理者）なら QUERY_CONFIG で開けないことは実際にはほぼ無く、その
+    // 場合も作成が「既に存在する」（1073）などで失敗して終了コード 1 になる。
     if manager
         .open_service(spec.name, ServiceAccess::QUERY_CONFIG)
         .is_ok()

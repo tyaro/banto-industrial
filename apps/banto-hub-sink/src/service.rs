@@ -391,6 +391,11 @@ impl ServiceProgram for SinkProgram {
                 return ServiceExit::Specific(EXIT_CODE_RUN_FAILED);
             }
         };
+        // ランタイムは先に預け、Stopped の報告の後で落とす（移す前と同じ
+        // 順序）。`block_on` の中で panic しても、手元の参照がアンワインドで
+        // 落ちるだけで、ランタイム自体の drop は Stopped の後になる
+        // （`banto_service_control::ServiceContext::hold_until_stopped`）。
+        let runtime = ctx.hold_until_stopped(runtime);
 
         // 起動中に STOP / PRESHUTDOWN が来ていたら Running を報告しない
         // （受理フラグを立てた瞬間に停止へ入る）。そのまま `run` へ進み、
@@ -412,8 +417,6 @@ impl ServiceProgram for SinkProgram {
                 ServiceExit::Specific(EXIT_CODE_RUN_FAILED)
             }
         };
-        // 移す前と同じく、ランタイムは Stopped の報告の後で落とす。
-        ctx.drop_after_stopped(runtime);
         exit
     }
 }
