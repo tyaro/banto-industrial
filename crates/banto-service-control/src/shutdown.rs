@@ -82,6 +82,21 @@ pub struct StopNotice {
     pub received_at: Instant,
 }
 
+impl StopNotice {
+    /// OS の PRESHUTDOWN のとき、停止処理の本体を終えるべき時刻
+    /// （`received_at` + [`stop_work_budget`]（[`PRESHUTDOWN_TIMEOUT`]））。
+    /// 運用者の STOP は全体を打ち切らないので `None`（#392 B3-1 で、Hub の
+    /// 予算超過の見張りと sink の打ち切りの期限の計算をここへ寄せた）。
+    pub fn os_work_deadline(&self) -> Option<Instant> {
+        match self.signal {
+            StopSignal::ServiceStop => None,
+            StopSignal::OsPreshutdown => {
+                Some(self.received_at + stop_work_budget(PRESHUTDOWN_TIMEOUT))
+            }
+        }
+    }
+}
+
 /// 最初の停止合図だけを `slot` に記録する。2 回目以降は `false` で、
 /// 中身は変えない（STOP の後に別の制御が来ても、先に始めた停止を
 /// やり直さない）。
@@ -105,7 +120,7 @@ pub enum ServicePhase {
     Running,
     /// 停止処理の途中。制御は受け付けない。
     StopPending,
-    /// 停止済み。これ以降の報告は製品側のゲートが落とす。
+    /// 停止済み。これ以降の報告は [`ServiceStatusReporter`] が落とす。
     Stopped,
 }
 

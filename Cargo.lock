@@ -702,6 +702,7 @@ name = "banto-service-control"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.21",
+ "tokio",
  "windows-service",
  "windows-sys 0.61.2",
 ]

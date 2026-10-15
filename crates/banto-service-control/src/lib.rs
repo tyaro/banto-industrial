@@ -16,10 +16,20 @@
 //!   **製品の知識（既定のサービス名・起動引数など）はこの crate に持たせない**
 //!   — それらを束ねる薄いラッパー（banto-hub の`BantoHub`向け等）は製品側
 //!   crate が持つ。
-//! - `install`/`uninstall`（サービスの登録・解除）は扱わない。最小面は
-//!   query / start / stop / restart / set_auto_start だけ。例外は
-//!   `ensure_preshutdown_timeout`（#589、Windows のみ）で、OS シャットダウンの
-//!   待ち時間だけを読み書きする。起動種別・実行ファイル・ACL は変えない。
+//! - [`ServiceManager`] trait の最小面は query / start / stop / restart /
+//!   set_auto_start だけ。登録・解除は trait に入れず、別の手順
+//!   （下の `install`）として持つ。
+//! - **サービス本体の側**（#392 B3-1）: `runner`（[`run_service`]・
+//!   [`ServiceProgram`]・[`ServiceContext`]・[`ServiceExit`]）が SCM との
+//!   やりとり（ディスパッチャ、制御ハンドラ、STOP と PRESHUTDOWN、
+//!   Running → StopPending → Stopped の報告、本体の panic）を 1 か所で行う。
+//!   製品はログの開き方と本体と終了コードの意味だけを持つ。
+//! - **登録・解除**（#392 B3-1）: `install`（[`ServiceSpec`]・
+//!   [`install_service`]・[`uninstall_service`]）が SCM の手順を持ち、結果を
+//!   値で返す（表示もプロセスの終了もしない - 利用者に見える文言と終了
+//!   コードは製品が持つ）。既に登録済みなら起動種別・実行ファイル・ACL は
+//!   変えず、OS シャットダウンの待ち時間（`shutdown` の
+//!   [`ensure_preshutdown_timeout`]、#589）だけを揃える。
 //!
 //! ## 履歴
 //!
@@ -33,12 +43,25 @@
 //! で差し替えられる）だけ。B2-4a で[`ServiceManagerError`]の`Display`を
 //! 製品名を含まない中立な文言にした（banto-hub の従来の文言は
 //! banto-hub-core の`describe_service_error`が組み立てる）。
+//!
+//! B3-1 で、banto-hub（`bin/banto_hub/win_service.rs`・`service_install.rs`）と
+//! banto-hub-sink（`service.rs`）に写しで並んでいたサービス本体のランナーと
+//! 登録・解除の手順をここへ移した（`runner`・`install`）。両製品は
+//! [`ServiceProgram`] を実装して [`run_service`] を呼び、install/uninstall の
+//! 文言は移す前と 1 バイトも変えていない（各製品の golden テスト）。差は
+//! 本体の panic で Stopped（`ServiceSpecific(1)`）を報告するようになった
+//! こと（2026-10-15 オーナー決定 D2）と、手動で `run-service` を実行した
+//! ときの案内の文言を製品共通にしたこと（同 D3、標準エラー出力だけ）。
 
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+mod install;
+mod runner;
 mod shutdown;
+pub use install::*;
+pub use runner::*;
 pub use shutdown::*;
 
 /// SCM 上のサービス状態（desktop-plan §9.9 のフォールバック UI が判定する
@@ -357,8 +380,9 @@ impl ServiceManager for MockServiceManager {
 /// Windows 実 SCM を叩く[`ServiceManager`]実装（T17-0 スコープ）。
 ///
 /// 各製品のサービス登録（`install`/`uninstall`）とは独立した経路 -
-/// 登録の CLI はこの型を経由せず、`windows-service`クレートを直接呼ぶ
-/// （この crate は登録・解除を扱わない。crate 冒頭の doc 参照）。
+/// 登録は [`install_service`]/[`uninstall_service`] が行い、この型を
+/// 経由しない（同じ [`ServiceSpec`] から [`WindowsServiceManager::for_spec`]
+/// で作れば、登録と同じ名前・表示名・実行ファイル・引数になる）。
 ///
 /// ## `set_auto_start`の制約
 ///
@@ -369,8 +393,8 @@ impl ServiceManager for MockServiceManager {
 /// エスケープ**される（`windows-service`クレートの`escape_wide`）。
 /// そのため、`query_config`で取得した「既にエスケープ済みの生コマンド
 /// ライン文字列」を`executable_path`にそのまま渡すと二重エスケープで
-/// 壊れる。安全のため[`WindowsServiceManager`]は各製品のインストーラ
-/// （banto-hub なら`win_service.rs::install`）と同じ組み立て方
+/// 壊れる。安全のため[`WindowsServiceManager`]は登録（[`install_service`]）と
+/// 同じ組み立て方
 /// （`executable_path` + `launch_arguments`）で`ServiceInfo`を再構築する -
 /// 呼び出し時点で
 /// **実際にサービスへ登録されている実行ファイルパスと`executable_path`が
@@ -437,6 +461,17 @@ mod windows_impl {
                 executable_path,
                 launch_arguments,
             }
+        }
+
+        /// 登録と同じ [`crate::ServiceSpec`] から作る（名前・表示名・
+        /// 実行ファイル・起動引数を 1 か所で決めるため。#392 B3-1）。
+        pub fn for_spec(spec: &crate::ServiceSpec) -> Self {
+            Self::for_service(
+                spec.name,
+                spec.display_name,
+                spec.executable.clone(),
+                spec.launch_arguments.clone(),
+            )
         }
     }
 
