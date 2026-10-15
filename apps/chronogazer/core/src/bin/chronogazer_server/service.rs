@@ -14,8 +14,8 @@
 //! # 本体（[`ServerProgram::run`]）
 //!
 //! 1. ルートの解決と検証（使えなければ何も作らずに終了コード 3。ログもまだ無い）。
-//! 2. 記録したインストール利用者の SID を読む（`Parameters\InstallUserSid`）。使えなければ
-//!    `service_only` で続け、ログを開いたら理由と対処を 1 行出す（D4）。
+//! 2. 記録したインストール利用者の SID を読む（`Parameters\InstallUserSid`）。
+//!    使えなければ `service_only` で続け、ログを開いたら理由と対処を 1 行出す（D4）。
 //! 3. tokio のランタイム（`ServiceContext::hold_until_stopped` で預け、Stopped の報告の
 //!    後で、残りのタスクを待たずに落とす - コンソールの `mem::forget` と同じ扱い）。
 //! 4. 起動の順序はコンソールと同じ `start::start_server`（A1 の排他 → ログ → DB →
@@ -41,8 +41,8 @@
 //! コンソールへの写しは自然に無くなる）。**日次ログを開けなければ起動しない**（終了
 //! コード 3。コンソールはコンソールだけで続けるが、サービスでは診断がすべて黙って
 //! 失われるため。`open_required_log`、PR #618 の Codex の指摘）。後始末の後の書き出しの
-//! 待ちは PRESHUTDOWN の期限までの残りで頭打ちにする（`server_service::service_flush_wait`）。
-//! ランナーの `open_log` は使わない（A1 の
+//! 待ちは PRESHUTDOWN の期限までの残りで頭打ちにする
+//! （`server_service::service_flush_wait`）。ランナーの `open_log` は使わない（A1 の
 //! 排他を取る前にルートの下に何も作らない、B1-5 の約束）。そのため、ランナーが
 //! 書く制御ハンドラの登録の失敗の行は、どこにも残らない（既知の制限）。
 
@@ -1038,19 +1038,19 @@ mod tests {
 
         let me = current_user_sid().unwrap();
         let hub_keys = layout.hub_keys_dir();
-        if hub_keys.exists() {
-            let dacl = read_dir_dacl(&hub_keys).unwrap();
-            assert!(
-                dacl.aces
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .all(|ace| ace.sid != me.as_str()),
-                "記録が無いのに利用者の ACE を付けた: {dacl:?}"
-            );
-            // 片付け（所有者は自分なので書き換えられる）。
-            reset_dir_acl(&hub_keys, &DirAccess::with_install_user(me)).unwrap();
-        }
+        // 起動は Hub のキーの保存先を必ず作る（`open_key_store_with` → `FileSecretStore::open`）。
+        assert!(hub_keys.exists(), "Hub のキーの保存先を作っていない");
+        let dacl = read_dir_dacl(&hub_keys).unwrap();
+        assert!(
+            dacl.aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|ace| ace.sid != me.as_str()),
+            "記録が無いのに利用者の ACE を付けた: {dacl:?}"
+        );
+        // 片付け（所有者は自分なので書き換えられる）。
+        reset_dir_acl(&hub_keys, &DirAccess::with_install_user(me)).unwrap();
     }
 
     /// 起動の途中（DB を開く前）に STOP を受けたら、起動を中止して Stopped(0)（失敗では

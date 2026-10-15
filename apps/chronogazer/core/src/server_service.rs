@@ -181,7 +181,7 @@ pub fn access_from_parameter(read: Result<Option<&str>, &str>) -> (DirAccess, Op
     let problem = match read {
         Ok(Some(raw)) => match InstallUserSid::parse(raw) {
             Ok(sid) => return (DirAccess::with_install_user(sid), None),
-            Err(_) => format!("インストール利用者の記録（{INSTALL_USER_SID_LOCATION}）が SID の形ではありません（{raw:?}）"),
+            Err(_) => format!("インストール利用者の記録（{INSTALL_USER_SID_LOCATION}）が利用者のアカウントの SID ではありません（{raw:?}）"),
         },
         Ok(None) => format!("インストール利用者の記録（{INSTALL_USER_SID_LOCATION}）がありません"),
         Err(err) => format!(
@@ -203,7 +203,8 @@ pub fn access_from_parameter(read: Result<Option<&str>, &str>) -> (DirAccess, Op
 pub enum SidRecordPlan {
     /// 記録が無い: 書く。
     Write,
-    /// 記録はあるが SID の形ではない: 書き直す（`previous` は元の値）。
+    /// 記録はあるが利用者のアカウントの SID ではない（形が違う・グループの領域など）:
+    /// 書き直す（`previous` は元の値）。
     Replace { previous: String },
     /// 同じ SID が記録済み: 何もしない。
     KeepSame,
@@ -390,7 +391,7 @@ pub fn install_lines(report: &InstallReport) -> Vec<ConsoleLine> {
             )));
             if let Some(previous) = replaced {
                 lines.push(ConsoleLine::Stderr(format!(
-                    "{SERVER_LABEL}: warn: 記録されていた値（{previous:?}）は SID の形ではなかったため書き直しました"
+                    "{SERVER_LABEL}: warn: 記録されていた値（{previous:?}）は利用者のアカウントの SID ではなかったため書き直しました"
                 )));
             }
         }
@@ -443,7 +444,10 @@ pub fn install_lines(report: &InstallReport) -> Vec<ConsoleLine> {
             "{SERVER_LABEL}: warn: データのルートを使えません: {reason}（このままではサービスも起動しません）"
         ))),
     }
-    if install_exit_code(report) == 0 {
+    // 成功の案内は、登録と記録が済み、ルートも使えるときだけ（ルートが使えなければ
+    // サービスは起動しない。終了コードは 0 のまま - 既知の制限 4、PR #618 のレビュー）。
+    let root_unusable = matches!(report.root, Some(RootPreparation::Unusable(_)));
+    if install_exit_code(report) == 0 && !root_unusable {
         lines.push(ConsoleLine::Stdout(format!(
             "{SERVER_LABEL}: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service {SERVICE_NAME}"
         )));
@@ -693,8 +697,11 @@ mod tests {
         );
         for (read, reason) in [
             (Ok(None), "がありません"),
-            (Ok(Some("S-1-5-32-544")), "SID の形ではありません"),
-            (Ok(Some("")), "SID の形ではありません"),
+            (
+                Ok(Some("S-1-5-32-544")),
+                "利用者のアカウントの SID ではありません",
+            ),
+            (Ok(Some("")), "利用者のアカウントの SID ではありません"),
             (
                 Err("アクセスが拒否されました"),
                 "読めませんでした: アクセスが拒否されました",
@@ -825,7 +832,7 @@ mod tests {
                 out("chronogazer-server:   起動種別: 手動（Demand） - OS の再起動だけでは開始しません"),
                 err(r"chronogazer-server: warn: 実行ファイルが C:\Program Files の外にあります。一般の利用者が書き換えられる場所の exe を LocalSystem のサービスとして登録すると、権限の昇格に使われます。C:\Program Files\ChronoGazer\ に置いてから、uninstall → install で登録し直してください"),
                 out(r"chronogazer-server:   インストール利用者: S-1-5-21-1111111111-2222222222-3333333333-1001（HKLM\SYSTEM\CurrentControlSet\Services\ChronoGazer\Parameters\InstallUserSid に記録しました）"),
-                err(r#"chronogazer-server: warn: 記録されていた値（"garbage"）は SID の形ではなかったため書き直しました"#),
+                err(r#"chronogazer-server: warn: 記録されていた値（"garbage"）は利用者のアカウントの SID ではなかったため書き直しました"#),
                 err(r"chronogazer-server: warn: データのルート（C:\ProgramData\ChronoGazer）を作れませんでした: os error 5（サービスの開始のときにもう一度作ります）"),
                 out("chronogazer-server: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service ChronoGazer"),
             ]
@@ -878,6 +885,35 @@ mod tests {
                 err("chronogazer-server: warn: 今回の利用者（S-1-5-21-1111111111-2222222222-3333333333-1001）は記録と違います。記録は変えていません（変えるには uninstall してから install し直してください）"),
                 out(r"chronogazer-server:   データのルート: C:\ProgramData\ChronoGazer（既にあります。ACL は変えていません）"),
                 out("chronogazer-server: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service ChronoGazer"),
+            ]
+        );
+        assert_eq!(install_exit_code(&report), 0);
+    }
+
+    /// PR #618 のオーナーレビュー: ルートの指定が使えないときは、終了コードは 0 のまま
+    /// （既知の制限 4）だが、「登録しました（手動開始）」の成功の案内は出さない。
+    #[test]
+    fn install_golden_with_an_unusable_root() {
+        let report = report(
+            created(None),
+            Some(SidRecordResult::Written {
+                sid: USER.to_string(),
+                replaced: None,
+            }),
+            Some(RootPreparation::Unusable(
+                "CHRONOGAZER_ROOT が絶対パスではありません".to_string(),
+            )),
+        );
+        assert_eq!(
+            install_lines(&report),
+            vec![
+                out("chronogazer-server: PRESHUTDOWN の行"),
+                out("chronogazer-server: Windows サービス 'ChronoGazer' を登録しました"),
+                out("chronogazer-server:   表示名: ChronoGazer 記録エンジン"),
+                out(r"chronogazer-server:   実行ファイル: C:\Program Files\ChronoGazer\chronogazer-server.exe"),
+                out("chronogazer-server:   起動種別: 手動（Demand） - OS の再起動だけでは開始しません"),
+                out(r"chronogazer-server:   インストール利用者: S-1-5-21-1111111111-2222222222-3333333333-1001（HKLM\SYSTEM\CurrentControlSet\Services\ChronoGazer\Parameters\InstallUserSid に記録しました）"),
+                err("chronogazer-server: warn: データのルートを使えません: CHRONOGAZER_ROOT が絶対パスではありません（このままではサービスも起動しません）"),
             ]
         );
         assert_eq!(install_exit_code(&report), 0);
