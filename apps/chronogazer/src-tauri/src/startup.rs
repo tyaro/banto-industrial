@@ -924,10 +924,15 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
 }
 
 /// シェルの札を取れなかったときに対処の窓へ出す文（純関数）。札の行（復旧の札・対処の
-/// 後の起動）が返すのは `Exiting`・`Busy` だけで、ほかの理由は来ない（来ても「別の処理の
-/// 途中」）。理由を足したらここで文を選ぶ（網羅の `match`）。
+/// 後の起動）が返すのは `Exiting`・`Busy` だけで、ほかの理由は来ない（PR #611 の
+/// レビュー 3: デバッグビルドでは `debug_assert!` で落とす。リリースビルドでは「別の
+/// 処理の途中」）。理由を足したらここで文を選ぶ（網羅の `match`）。
 pub(crate) fn refused_notice(refused: crate::lifecycle::Refusal) -> &'static str {
     use crate::lifecycle::Refusal;
+    debug_assert!(
+        matches!(refused, Refusal::Exiting | Refusal::Busy),
+        "対処の窓の札の行からは来ない理由: {refused:?}"
+    );
     match refused {
         Refusal::Exiting => "終了処理中のため、この対処を始めませんでした。",
         Refusal::Busy
@@ -937,7 +942,10 @@ pub(crate) fn refused_notice(refused: crate::lifecycle::Refusal) -> &'static str
         | Refusal::AlreadyConfirming
         | Refusal::AlreadyQuitting
         | Refusal::Quitting
-        | Refusal::RecoveryBusy => "別の処理の途中です。しばらくしてから、もう一度選んでください。",
+        | Refusal::RecoveryBusy
+        | Refusal::EngineRunning => {
+            "別の処理の途中です。しばらくしてから、もう一度選んでください。"
+        }
     }
 }
 
@@ -1302,5 +1310,13 @@ mod tests {
         assert!(refused_notice(Refusal::Exiting).contains("終了処理中"));
         assert!(refused_notice(Refusal::Busy).contains("別の処理の途中"));
         assert!(!refused_notice(Refusal::Busy).contains("終了"));
+    }
+
+    /// PR #611 のレビュー 3: 来ないはずの理由はデバッグビルドで落とす。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "対処の窓の札の行からは来ない理由")]
+    fn an_unexpected_refusal_is_caught_in_debug_builds() {
+        let _ = refused_notice(crate::lifecycle::Refusal::Stale);
     }
 }

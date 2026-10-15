@@ -55,7 +55,7 @@
 //! 判断の略号: `go` = 許す（札を出す・進む）、`ok` = 反映した、`ign` = 何もしない、
 //! `exit`/`busy`/`stale`/`nofb`/`rec`/`conf`/`quit`/`qing`/`rbusy` = 断る（終了処理中・
 //! 別の札がある・観測が古い・Fallback でない・復旧中・確認中・終了処理中（トレイ）・
-//! 終了が確定している・対処の窓が処理中）、`obs`/`skip`/`stop` = 見張りの観測・今回は
+//! 終了が確定している・対処の窓が処理中）、`eng` = 断る（エンジンが置かれている。注 2）、`obs`/`skip`/`stop` = 見張りの観測・今回は
 //! 見ない・見張りを終える、`ask`/`noask` = 確認を出す／出さずに同意として進む（Fallback）、
 //! `proceed`/`again`/`cancel` = 確認の答え（終了へ進む・収集中の文言で確かめ直す・
 //! 取り消し）、`w60`/`w5`/`nowait` = 移り変わりの終わりを 60 秒・5 秒待つ・待たない。
@@ -69,8 +69,8 @@
 //! | 見張りの適用（同じ世代）                           | go     | go      | go      | go      | go      | go      | busy   | busy   | busy   | go      | go      | busy   | exit   | exit   | exit   |
 //! | 見張りの適用（古い世代）                           | stale  | stale   | stale   | stale   | stale   | stale   | busy   | busy   | busy   | stale   | stale   | busy   | exit   | exit   | exit   |
 //! | 「再試行」（Fallback の窓・トレイ）                | nofb   | nofb    | nofb    | nofb    | go      | go      | busy   | busy   | busy   | nofb    | nofb    | busy   | exit   | exit   | exit   |
-//! | 対処の後の起動（確かめ直す・既定・選び直す）       | go     | go      | go      | go      | go      | go      | busy   | busy   | busy   | go      | go      | busy   | exit   | exit   | exit   |
-//! | 復旧の札（作り直す・戻す）                         | go     | go      | go      | go      | go      | go      | busy   | busy   | busy   | go      | exit    | exit   | exit   | exit   | exit   |
+//! | 対処の後の起動（確かめ直す・既定・選び直す）（注 1）| go     | go      | go      | go      | go      | go      | busy   | busy   | busy   | go      | go      | busy   | exit   | exit   | exit   |
+//! | 復旧の札（作り直す・戻す）（注 2）                 | go     | eng     | go      | go      | go      | go      | busy   | busy   | busy   | go      | exit    | exit   | exit   | exit   | exit   |
 //! | 札を返す（新しい画面を置く）                       | ign    | ign     | ign     | ign     | ign     | ign     | ok     | ok     | ok     | ign     | ign     | ok     | ign    | ok     | ign    |
 //! | 札を返す（取りやめ）                               | ign    | ign     | ign     | ign     | ign     | ign     | ok     | ok     | ok     | ign     | ign     | ok     | ign    | ok     | ign    |
 //! | 起動を続けてよいか（`launch_desktop`）             | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | go      | go     | exit   | exit   | exit   |
@@ -85,9 +85,36 @@
 //! | 窓を開く（「開く」・左クリック・2 つ目の起動）     | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | qing    | qing   | qing   | qing   | go     |
 //! | トレイの書き換え（ふつう）                         | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | qing    | qing   | qing   | qing   | go     |
 //! | トレイの書き換え（「終了処理中」）                 | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | go      | go     | go     | go     | go     |
-//! | 対処の窓のボタン                                   | go     | go      | go      | go      | go      | go      | go     | go     | rbusy  | rbusy   | go      | go     | go     | go     | go     |
+//! | 対処の窓のボタン（注 1）                           | go     | go      | go      | go      | go      | go      | go     | go     | rbusy  | rbusy   | go      | go     | go     | go     | go     |
 //! | 対処の窓の処理の終わり                             | ok     | ok      | ok      | ok      | ok      | ok      | ok     | ok     | ok     | ok      | ok      | ok     | ok     | ok     | ok     |
 //! | 対処の窓の ×                                       | go     | go      | go      | go      | go      | go      | go     | go     | rbusy  | rbusy   | go      | go     | go     | go     | go     |
+//!
+//! 表の注:
+//!
+//! - **注 1（Q・Qt の「対処の窓のボタン」「対処の後の起動」が `go`）**: 終了が確定しても
+//!   扉はまだ開いているので、対処の窓の操作は受け付ける（旧実装と同じ）。意図したもの:
+//!   ファイルの名前を変える対処（作り直す・戻す）は次の「復旧の札」の行が `exit` で断り
+//!   （対処の窓に「終了処理中のため、この対処を始めませんでした」）、DB の復旧が終了で
+//!   中断されることはない。ファイルを変えない対処（確かめ直す・既定に戻す・選び直す）の
+//!   後の起動は札を取って `launch_desktop` に入るが、トレイの終了は確定の直後に専用の
+//!   スレッドで扉を閉じ（`exit_cleanup` → [`Lifecycle::begin_exit`]）、起動は「起動を
+//!   続けてよいか」「エンジンを置く」の行（`exit`）で止まる（置く前なら
+//!   `start_and_register` がその場で止める）。扉より先に置けたエンジンは、後始末が札の
+//!   終わりを待って（トレイの終了は 60 秒まで）見つけて止める。どちらの経路も最終 flush
+//!   を通る。
+//! - **注 2（D の「復旧の札」が `eng`）**: エンジンが置かれた後は復旧の札を出さない
+//!   （PR #611 のレビュー）。OS の終了の「エンジンが置かれていれば移り変わりを待たない」
+//!   （[`step`] の `ExitBegin`）は、**待たずに進んでも DB の復旧（名前の変更・リストアの
+//!   適用）の途中で切れない**ことを前提にしている。前提が成り立つ理由: 復旧の札を取るのは
+//!   エンジンが無いときだけ（この行。今の配線でも「作り直す」「戻す」を出すのは DB を
+//!   開けなかったときだけで、エンジンを置いた後の失敗（画面を作れない）は「終了」だけの
+//!   窓）で、札を持ったままエンジンが置かれるのは、対処の後の起動（`launch_desktop`）が
+//!   `start()` を終えた後だけ。名前の変更・リストアの適用は `launch_desktop` の**前**に
+//!   済んでいるので、その後に待たずに後始末へ進んでも復旧は半端にならない（置いた
+//!   エンジンは後始末が止める）。つまり「復旧の札とエンジン」の組は存在するが、
+//!   **エンジンを置く出来事でしか作られない**（約束のテストで確かめる）。`ExitBegin` に
+//!   「この組が無い」という `debug_assert!` は置けない（対処の後の起動の最中に OS の終了が
+//!   来ると正当にこの組になる）。
 //!
 //! 表に出てこない約束（テスト `invariants_hold_from_every_state` が印のすべての組で
 //! 確かめる）:
@@ -97,6 +124,8 @@
 //! - 見張りは Desktop を観測しない（Desktop・Starting では見張りを終える。移り変わりの
 //!   判断 `shell::on_tick` が Desktop を返さないことは `shell` の表のテスト）。
 //! - 復旧の札と終了の確定は同時に立たない（どちらも同じロックの中で相手を見て断る）。
+//! - 復旧の札を取るのはエンジンが無いときだけ。復旧の札とエンジンが並ぶのは、札を
+//!   持ったままエンジンを置いた（対処の後の起動が `start()` を終えた）ときだけ（表の注 2）。
 //! - 札は常に 1 つ。見張りの古い世代の適用は断る。世代は札を返して新しい画面を置いた
 //!   ときだけ 1 増える。
 //! - OS の終了は、移り変わりの待ちと後始末で 1 つの 5 秒の期限を分け合う
@@ -464,6 +493,8 @@ pub(crate) enum Refusal {
     Quitting,
     /// 対処の窓が処理中。
     RecoveryBusy,
+    /// エンジンが置かれている（復旧の札を出さない。モジュール doc の表の注 2）。
+    EngineRunning,
 }
 
 /// 終了の確認の答えの結果。
@@ -567,6 +598,10 @@ pub(crate) fn step(state: &LifecycleState, event: &Event) -> (LifecycleState, De
                 Decision::Refused(Refusal::Exiting)
             } else if state.ticket != Ticket::None {
                 Decision::Refused(Refusal::Busy)
+            } else if state.engine {
+                // 前提の固定（モジュール doc の表の注 2）: 今の配線では来ない。
+                // エンジンが置かれた後の復旧は、OS の終了が待たずに進む前提を崩す。
+                Decision::Refused(Refusal::EngineRunning)
             } else {
                 next.ticket = Ticket::Recovery;
                 Decision::Proceed
@@ -656,6 +691,10 @@ pub(crate) fn step(state: &LifecycleState, event: &Event) -> (LifecycleState, De
             Decision::QuitAnswer(outcome)
         }
         Event::ExitBegin(trigger) => {
+            // 前提（モジュール doc の表の注 2）: 下の「エンジンが置かれていれば待たない」は、
+            // 待たずに進んでも DB の復旧の途中で切れないことを前提にする。復旧の札は
+            // エンジンが無いときだけ取り、札を持ったままエンジンが置かれるのは、復旧（名前の
+            // 変更・リストアの適用）が済んだ後の起動が `start()` を終えた後だけ。
             next.exiting = true;
             let budgets = exit_budgets(*trigger);
             // エンジンが既に置かれていれば、OS の終了では移り変わりを待たない（窓を作る
@@ -1234,6 +1273,7 @@ mod tests {
             Decision::Refused(Refusal::AlreadyQuitting) => "quit",
             Decision::Refused(Refusal::Quitting) => "qing",
             Decision::Refused(Refusal::RecoveryBusy) => "rbusy",
+            Decision::Refused(Refusal::EngineRunning) => "eng",
             Decision::Proceed => "go",
             Decision::Observe { .. } => "obs",
             Decision::SkipTick => "skip",
@@ -1277,7 +1317,7 @@ mod tests {
             ("見張りの適用（古い世代）", Event::MonitorApply { generation: GEN - 1 }, ["stale", "stale", "stale", "stale", "stale", "stale", "busy", "busy", "busy", "stale", "stale", "busy", "exit", "exit", "exit"]),
             ("再試行", Event::Retry, ["nofb", "nofb", "nofb", "nofb", "go", "go", "busy", "busy", "busy", "nofb", "nofb", "busy", "exit", "exit", "exit"]),
             ("対処の後の起動", Event::RecoveryRelaunch, ["go", "go", "go", "go", "go", "go", "busy", "busy", "busy", "go", "go", "busy", "exit", "exit", "exit"]),
-            ("復旧の札", Event::RecoveryBegin, ["go", "go", "go", "go", "go", "go", "busy", "busy", "busy", "go", "exit", "exit", "exit", "exit", "exit"]),
+            ("復旧の札", Event::RecoveryBegin, ["go", "eng", "go", "go", "go", "go", "busy", "busy", "busy", "go", "exit", "exit", "exit", "exit", "exit"]),
             ("札を返す（新しい画面）", Event::TransitionFinish(ShellView::Desktop), ["ign", "ign", "ign", "ign", "ign", "ign", "ok", "ok", "ok", "ign", "ign", "ok", "ign", "ok", "ign"]),
             ("札を返す（取りやめ）", Event::TransitionAbort, ["ign", "ign", "ign", "ign", "ign", "ign", "ok", "ok", "ok", "ign", "ign", "ok", "ign", "ok", "ign"]),
             ("起動を続けてよいか", Event::LaunchCheck, ["go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "exit", "exit", "exit"]),
@@ -1369,6 +1409,12 @@ mod tests {
             Some(ShellView::Service { port: 8721 }),
             Some(fallback_view()),
         ]
+    }
+
+    /// 復旧の札とエンジンが同時に立つ組（モジュール doc の表の注 2。エンジンを置く出来事
+    /// でしか作られない）。
+    fn recovery_with_engine(state: &LifecycleState) -> bool {
+        state.engine && state.ticket == Ticket::Recovery
     }
 
     /// 印のすべての組（画面 4 × 札 3 × 終了の段階 3 × 扉 2 × エンジン 2 × 対処の窓 2）。
@@ -1495,6 +1541,12 @@ mod tests {
                 };
                 if !both(&state) {
                     assert!(!both(&next), "復旧と終了の確定が並んだ: {at}");
+                }
+                // 復旧の札とエンジンが並ぶのは、札を持ったままエンジンを置いたときだけ
+                // （復旧の札はエンジンが無いときだけ取る。表の注 2）。
+                if !recovery_with_engine(&state) && recovery_with_engine(&next) {
+                    assert_eq!(event, Event::EngineAdmit, "{at}");
+                    assert_eq!(state.ticket, Ticket::Recovery, "{at}");
                 }
                 // 札は常に 1 つ: 札がある間に別の札を出さない（返すのは札を返す出来事だけ）。
                 if state.ticket != Ticket::None {
@@ -1627,6 +1679,47 @@ mod tests {
                     }
                     assert!(next.exiting);
                     assert_eq!(next.engine, state.engine);
+                }
+            }
+        }
+    }
+
+    /// 表の注 2: エンジンが置かれた状態からは、どの状態でも復旧の札を出さない。
+    #[test]
+    fn recovery_ticket_is_only_taken_without_an_engine() {
+        assert_eq!(all_states().len(), 288);
+        for state in all_states().into_iter().filter(|state| state.engine) {
+            let (next, decision) = step(&state, &Event::RecoveryBegin);
+            assert_ne!(decision, Decision::Proceed, "{state:?}");
+            assert_eq!(next.ticket, state.ticket, "{state:?}");
+            if !state.exiting && state.quit != QuitPhase::Quitting && state.ticket == Ticket::None {
+                assert_eq!(
+                    decision,
+                    Decision::Refused(Refusal::EngineRunning),
+                    "{state:?}"
+                );
+            }
+        }
+    }
+
+    /// PR #611 のレビュー 3: 対処の窓が札を取れなかった理由は、`refused_notice` が想定する
+    /// ものだけ（`Exiting`・`Busy`）。対処の窓が「作り直す」「戻す」を出すのはエンジンが
+    /// 置かれていないときだけなので、復旧の札はエンジンの無い状態で確かめる。デバッグ
+    /// ビルドでは、想定外の理由を渡すと `refused_notice` の `debug_assert!` で落ちる。
+    #[test]
+    fn recovery_window_refusals_are_only_the_ones_refused_notice_expects() {
+        for state in all_states() {
+            let mut events = vec![Event::RecoveryRelaunch];
+            if !state.engine {
+                events.push(Event::RecoveryBegin);
+            }
+            for event in events {
+                if let (_, Decision::Refused(refusal)) = step(&state, &event) {
+                    assert!(
+                        matches!(refusal, Refusal::Exiting | Refusal::Busy),
+                        "{state:?} × {event:?} -> {refusal:?}"
+                    );
+                    assert!(!crate::startup::refused_notice(refusal).is_empty());
                 }
             }
         }
