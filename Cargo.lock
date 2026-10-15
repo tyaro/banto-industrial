@@ -545,6 +545,7 @@ dependencies = [
  "banto-plc-write",
  "banto-server",
  "banto-service-control",
+ "banto-service-elev",
  "banto-storage",
  "banto-tags",
  "banto-tstore",
@@ -584,6 +585,7 @@ dependencies = [
  "banto-desktop-tray",
  "banto-hub-core",
  "banto-server",
+ "banto-service-elev",
  "serde",
  "serde_json",
  "tauri",
@@ -591,7 +593,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

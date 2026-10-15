@@ -246,58 +246,97 @@ pub(crate) fn resolve_elev_exe() -> Option<PathBuf> {
     None
 }
 
+/// `banto-hub-elev.exe <action>`を UAC で昇格して起動し、終わりを待つ。
+/// #392 B3-3a で Win32 の呼び出し（`ShellExecuteExW` の runas → 待ち →
+/// 終了コード）は共有 crate の[`banto_service_elev::launch::run_elevated`]へ
+/// 移した。ここは結果を移す前と同じ文言へ写すだけ（[`elev_result_message`]）。
 #[cfg(windows)]
 fn run_elev_uac(elev: &Path, action: &str) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, WaitForSingleObject, INFINITE,
-    };
-    use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    elev_result_message(banto_service_elev::launch::run_elevated(elev, &[action]))
+}
 
-    let file: Vec<u16> = elev
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let params: Vec<u16> = action.encode_utf16().chain(std::iter::once(0)).collect();
-    let verb: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
-
-    let mut info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
-    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    info.fMask = SEE_MASK_NOCLOSEPROCESS;
-    info.lpVerb = verb.as_ptr();
-    info.lpFile = file.as_ptr();
-    info.lpParameters = params.as_ptr();
-    info.nShow = SW_SHOWNORMAL;
-
-    // SAFETY: 文字列は NUL 終端でこのスコープで生存する。
-    let ok = unsafe { ShellExecuteExW(&mut info) };
-    if ok == 0 {
-        return Err("UAC の起動に失敗しました（拒否されたか、elev を起動できません）".into());
-    }
-    if info.hProcess.is_null() {
-        return Err("昇格プロセスのハンドルを取得できませんでした".into());
-    }
-    // SAFETY: ShellExecuteExW が返した有効なプロセスハンドル。
-    let wait = unsafe { WaitForSingleObject(info.hProcess, INFINITE) };
-    let mut exit_code: u32 = 1;
-    if wait == WAIT_OBJECT_0 {
-        unsafe {
-            GetExitCodeProcess(info.hProcess, &mut exit_code);
+/// [`run_elev_uac`]の結果を、移す前（#392 B3-3a より前、このモジュールが
+/// `ShellExecuteExW` を直接呼んでいたとき）と同じ文言にする（純関数）。
+///
+/// - 起動の失敗（UAC で「いいえ」・exe を起動できない）→ 従来の 1 文
+///   （os error は出していなかったので出さない）。
+/// - 待てなかった・終了コードを読めなかった → 移す前は終了コードの初期値 1 の
+///   まま「exit code 1」と出していたので、同じ文言にする。
+/// - 引数の形が違う（`InvalidToken`）は、渡すのが固定のアクション名だけなので
+///   この経路では起きない。万一のときは共有 crate の文言をそのまま出す。
+#[cfg(any(windows, test))]
+fn elev_result_message(
+    result: Result<u32, banto_service_elev::launch::LaunchError>,
+) -> Result<(), String> {
+    use banto_service_elev::launch::LaunchError;
+    let exit_code = match result {
+        Ok(code) => code,
+        Err(LaunchError::ShellExecute(_)) => {
+            return Err("UAC の起動に失敗しました（拒否されたか、elev を起動できません）".into());
         }
-    }
-    unsafe {
-        CloseHandle(info.hProcess);
-    }
+        Err(LaunchError::NoProcessHandle) => {
+            return Err("昇格プロセスのハンドルを取得できませんでした".into());
+        }
+        Err(LaunchError::Wait(_) | LaunchError::ExitCode(_)) => 1,
+        Err(err @ LaunchError::InvalidToken(_)) => return Err(err.to_string()),
+    };
     if exit_code == 0 {
         Ok(())
     } else {
         Err(format!(
             "banto-hub-elev が失敗しました (exit code {exit_code})"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::elev_result_message;
+    use banto_service_elev::launch::LaunchError;
+
+    /// #392 B3-3a: 共有 crate へ移した後も、invoke が返す文言は移す前と
+    /// 1 バイトも変えない（golden）。
+    #[test]
+    fn elev_launch_wording_is_unchanged() {
+        assert_eq!(elev_result_message(Ok(0)), Ok(()));
+        assert_eq!(
+            elev_result_message(Ok(1)),
+            Err("banto-hub-elev が失敗しました (exit code 1)".to_string())
+        );
+        assert_eq!(
+            elev_result_message(Ok(64)),
+            Err("banto-hub-elev が失敗しました (exit code 64)".to_string())
+        );
+        assert_eq!(
+            elev_result_message(Err(LaunchError::ShellExecute(1223))),
+            Err("UAC の起動に失敗しました（拒否されたか、elev を起動できません）".to_string())
+        );
+        assert_eq!(
+            elev_result_message(Err(LaunchError::NoProcessHandle)),
+            Err("昇格プロセスのハンドルを取得できませんでした".to_string())
+        );
+        // 移す前は待ち・終了コードの取得に失敗すると初期値 1 のまま報告していた。
+        for err in [LaunchError::Wait(0xFFFF_FFFF), LaunchError::ExitCode(6)] {
+            assert_eq!(
+                elev_result_message(Err(err)),
+                Err("banto-hub-elev が失敗しました (exit code 1)".to_string())
+            );
+        }
+    }
+
+    /// 渡すアクション名（`autostart-enable`/`-disable`）は昇格の引数の形に
+    /// 収まる（`InvalidToken`の経路に入らない）。
+    #[test]
+    fn autostart_actions_are_valid_launch_tokens() {
+        use banto_hub_core::service_elevated::ElevatedAction;
+        for action in [
+            ElevatedAction::AUTOSTART_ENABLE,
+            ElevatedAction::AUTOSTART_DISABLE,
+        ] {
+            assert!(
+                banto_service_elev::launch::is_valid_token(action),
+                "{action}"
+            );
+        }
     }
 }

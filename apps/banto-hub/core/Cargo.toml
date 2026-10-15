@@ -36,6 +36,12 @@ banto-tags = { path = "../../../crates/banto-tags" }
 # 同 crate 側へ移動（このパッケージの他のコードは使っていない）。
 banto-instance-lock = { path = "../../../crates/banto-instance-lock" }
 banto-service-control = { path = "../../../crates/banto-service-control" }
+# #392 B3-3a: `banto-hub-elev`（`service_elevated.rs`）と`service_operators.rs`の
+# Win32 の部分（ローカルグループの作成・メンバーの追加、サービス DACL への
+# Operators の ACE、トークンのメンバーシップ、`LookupAccountNameW`）を
+# ChronoGazer の elev と共有する crate へ移した。アクション・引数の検証・
+# 手順の順序・文言は banto-hub に残る。
+banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its
 # PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
@@ -224,6 +230,11 @@ path = "src/bin/banto-hub-elev.rs"
 # （`OpenSCManagerW`/`OpenServiceW`/`QueryServiceObjectSecurity`/
 # `SetServiceObjectSecurity`、SCM 生 API）、`Win32_System_WindowsProgramming`
 # （`GetUserNameW`、`setup-operators`のユーザー省略時デフォルト解決）。
+# #392 B3-3a でグループ・サービス DACL の呼び出しは共有 crate
+# `banto-service-elev`へ移したので、このパッケージからは
+# `Win32_NetworkManagement_NetManagement`・`Win32_System_Services`を外した
+# （`Win32_Security_Authorization`は`profile_acl.rs`が、
+# `Win32_System_WindowsProgramming`は`GetUserNameW`がまだ使う）。
 #
 # profile ACL 追加スライス（docs/banto-hub-desktop-plan.md §11、
 # `src/profile_acl.rs`）: `Win32_Storage_FileSystem`を追加した -
@@ -244,12 +255,10 @@ path = "src/bin/banto-hub-elev.rs"
 # クレートは増えず、既存の`windows-sys`0.61系列に feature を足すだけ）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_NetworkManagement_NetManagement",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
-    "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
