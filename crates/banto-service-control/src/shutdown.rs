@@ -174,74 +174,222 @@ pub fn stop_status_sequence(wait_hint: Duration) -> Option<(ServiceStatusPlan, S
 /// （[`PRESHUTDOWN_TIMEOUT`] の 30 秒）より十分短くする。
 pub const STOP_PENDING_HEARTBEAT: Duration = Duration::from_secs(5);
 
-/// 停止処理の途中、一定間隔で checkpoint を 1 つずつ進めて StopPending を
-/// 報告し続ける見張り（専用スレッド 1 本）。
-///
-/// SCM（`sc stop`・`Stop-Service`）は、StopPending の `wait_hint` の間に
-/// checkpoint が進まないと「応答しない」とみなす。checkpoint 1 のまま
-/// 30 秒を超える停止（flusher が多い・flush の設定が長い）でも、進んでいる
-/// 限り待ち時間切れを報告させないため。OS の PRESHUTDOWN の待ち時間は
-/// これでは延びない（[`PRESHUTDOWN_TIMEOUT`] が上限のまま）。
-///
-/// **Stopped を報告する前に必ず [`Self::stop`] する**（stop はスレッドの
-/// 終わりを待つので、Stopped の後に StopPending が届かない）。drop でも
-/// 同じく止まる。
-pub struct StopPendingHeartbeat {
-    stop_tx: Option<std::sync::mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+/// 停止にかかる見込み `expected_stop` から、heartbeat が進めてよい
+/// checkpoint の上限を決める（最初の 1 + `interval` の刻みで割った回数、
+/// 切り上げ）。上限に達したら checkpoint を進めない - 停止が固まったときに
+/// SCM の「応答なし」を隠し続けないため。`interval` が 0 なら 1。
+pub fn heartbeat_checkpoint_limit(expected_stop: Duration, interval: Duration) -> u32 {
+    if interval.is_zero() {
+        return 1;
+    }
+    let ticks = expected_stop.as_nanos().div_ceil(interval.as_nanos());
+    u32::try_from(ticks).unwrap_or(u32::MAX).saturating_add(1)
 }
 
-impl StopPendingHeartbeat {
-    /// 最初の StopPending（checkpoint 1）は呼び出し側が報告済みとして、
-    /// `interval` ごとに checkpoint 2, 3, ... を `report` に渡す。
-    /// `wait_hint` が 0 なら何も報告しない見張りを返す。
-    pub fn start<F>(interval: Duration, wait_hint: Duration, report: F) -> Self
-    where
-        F: Fn(ServiceStatusPlan) + Send + 'static,
-    {
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            let mut checkpoint: u32 = 1;
-            loop {
-                match stop_rx.recv_timeout(interval) {
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        checkpoint = checkpoint.saturating_add(1);
-                        match stop_pending_status(checkpoint, wait_hint) {
-                            Some(plan) => report(plan),
-                            None => return,
-                        }
-                    }
-                    // 停止の合図、または送り手が消えた。
-                    _ => return,
-                }
-            }
-        });
+/// サービスが SCM へ出す状態報告を 1 か所に集める（Running → StopPending
+/// （checkpoint を進める heartbeat つき）→ Stopped）。
+///
+/// **約束**: 状態の移り変わりと報告は 1 つの `Mutex` の中で行う。
+/// - Stopped を報告した後は、どの報告も（Running も StopPending も
+///   heartbeat の報告も）しない。Stopped の後の `SetServiceStatus` は
+///   クラッシュしうる（Microsoft の文書）。
+/// - 停止の合図を受ける側（制御ハンドラ）が [`Self::begin_stop`] を呼ぶ
+///   より先に、停止処理が [`Self::report_stopped`] まで進んでも、後から
+///   来た `begin_stop` は何も報告せず heartbeat も始めない（#589 の
+///   再レビュー P2: 合図を公開してから heartbeat を保存するまでの間に
+///   Stopped が追い越していた）。
+/// - heartbeat のスレッドも、報告の前に同じロックの中で Stopped でない
+///   ことを確かめる。
+/// - Running は、停止が始まった後には報告しない。
+///
+/// heartbeat は [`STOP_PENDING_HEARTBEAT`] ごとに checkpoint を 1 つ進めて
+/// StopPending を報告し直す。SCM（`sc stop`・`Stop-Service`）は
+/// `wait_hint` の間に checkpoint が進まないと応答なしとみなすので、30 秒を
+/// 超える停止でも進んでいる限り待ち時間切れを出させない。ただし
+/// [`Self::set_expected_stop`] の見込みから決めた上限
+/// （[`heartbeat_checkpoint_limit`]）で進めるのをやめる - heartbeat は停止の
+/// 処理が実際に進んでいるかを見ていないので、上限が無いと停止が固まっても
+/// 応答なしが出なくなる。上限の後 `wait_hint` を過ぎても Stopped が来なければ、
+/// SCM は従来どおり応答なしと報告する。OS の PRESHUTDOWN の待ち時間は
+/// これでは延びない。
+///
+/// `E` は Stopped に載せる終了コードの型（Windows では `ServiceExitCode`）。
+/// Running と StopPending には `ok_exit` を載せる。`report` はロックの中で
+/// 呼ばれるので、この型を呼び返してはいけない。
+pub struct ServiceStatusReporter<E> {
+    shared: std::sync::Arc<ReporterShared<E>>,
+}
+
+impl<E> Clone for ServiceStatusReporter<E> {
+    fn clone(&self) -> Self {
         Self {
-            stop_tx: Some(stop_tx),
-            thread: Some(thread),
-        }
-    }
-
-    /// 見張りを止め、スレッドの終わりまで待つ。この後に StopPending は
-    /// 報告されない。
-    pub fn stop(mut self) {
-        self.shutdown();
-    }
-
-    fn shutdown(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            shared: self.shared.clone(),
         }
     }
 }
 
-impl Drop for StopPendingHeartbeat {
-    fn drop(&mut self) {
-        self.shutdown();
+type ReportFn<E> = Box<dyn Fn(&ServiceStatusPlan, E) + Send + Sync>;
+
+struct ReporterShared<E> {
+    state: Mutex<ReporterState>,
+    heartbeat: Mutex<Option<HeartbeatThread>>,
+    report: ReportFn<E>,
+    ok_exit: E,
+    wait_hint: Duration,
+    interval: Duration,
+}
+
+struct ReporterState {
+    phase: ReporterPhase,
+    max_checkpoint: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReporterPhase {
+    Starting,
+    Running,
+    Stopping { checkpoint: u32 },
+    Stopped,
+}
+
+struct HeartbeatThread {
+    stop_tx: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl<E: Copy + Send + Sync + 'static> ServiceStatusReporter<E> {
+    /// `wait_hint` は [`PRESHUTDOWN_TIMEOUT`]、heartbeat の間隔は
+    /// [`STOP_PENDING_HEARTBEAT`]。停止の見込みは既定で
+    /// [`PRESHUTDOWN_TIMEOUT`]（[`Self::set_expected_stop`] で変える）。
+    pub fn new<F>(report: F, ok_exit: E) -> Self
+    where
+        F: Fn(&ServiceStatusPlan, E) + Send + Sync + 'static,
+    {
+        Self::with_timing(
+            report,
+            ok_exit,
+            PRESHUTDOWN_TIMEOUT,
+            STOP_PENDING_HEARTBEAT,
+            PRESHUTDOWN_TIMEOUT,
+        )
     }
+
+    fn with_timing<F>(
+        report: F,
+        ok_exit: E,
+        wait_hint: Duration,
+        interval: Duration,
+        expected_stop: Duration,
+    ) -> Self
+    where
+        F: Fn(&ServiceStatusPlan, E) + Send + Sync + 'static,
+    {
+        Self {
+            shared: std::sync::Arc::new(ReporterShared {
+                state: Mutex::new(ReporterState {
+                    phase: ReporterPhase::Starting,
+                    max_checkpoint: heartbeat_checkpoint_limit(expected_stop, interval),
+                }),
+                heartbeat: Mutex::new(None),
+                report: Box::new(report),
+                ok_exit,
+                wait_hint,
+                interval,
+            }),
+        }
+    }
+
+    /// 停止にかかる見込みを変える（heartbeat の checkpoint の上限）。
+    pub fn set_expected_stop(&self, expected_stop: Duration) {
+        let mut state = lock(&self.shared.state);
+        state.max_checkpoint = heartbeat_checkpoint_limit(expected_stop, self.shared.interval);
+    }
+
+    /// Running を報告する。停止が始まった後・Stopped の後は報告せず `false`。
+    pub fn report_running(&self) -> bool {
+        let mut state = lock(&self.shared.state);
+        if state.phase != ReporterPhase::Starting {
+            return false;
+        }
+        state.phase = ReporterPhase::Running;
+        (self.shared.report)(&running_status(), self.shared.ok_exit);
+        true
+    }
+
+    /// 停止に入る: StopPending（checkpoint 1）を報告し、heartbeat を始める。
+    /// 既に停止中、または Stopped を報告済みなら何もせず `false`。
+    pub fn begin_stop(&self) -> bool {
+        let mut state = lock(&self.shared.state);
+        if !matches!(
+            state.phase,
+            ReporterPhase::Starting | ReporterPhase::Running
+        ) {
+            return false;
+        }
+        let Some(plan) = stop_pending_status(1, self.shared.wait_hint) else {
+            return false;
+        };
+        state.phase = ReporterPhase::Stopping { checkpoint: 1 };
+        (self.shared.report)(&plan, self.shared.ok_exit);
+        // スレッドの登録もロックの中で行う（Stopped の側は、このロックを
+        // 取って Stopped にしてから heartbeat を取り出す）。
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let shared = self.shared.clone();
+        let thread = std::thread::spawn(move || heartbeat_loop(&shared, &stop_rx));
+        *lock(&self.shared.heartbeat) = Some(HeartbeatThread { stop_tx, thread });
+        true
+    }
+
+    /// Stopped を 1 回だけ報告する。以後は何も報告しない。2 回目は `false`。
+    /// heartbeat のスレッドは、ロックを放してから止めて終わりを待つ。
+    pub fn report_stopped(&self, exit: E) -> bool {
+        let heartbeat = {
+            let mut state = lock(&self.shared.state);
+            if state.phase == ReporterPhase::Stopped {
+                return false;
+            }
+            state.phase = ReporterPhase::Stopped;
+            (self.shared.report)(&stopped_status(), exit);
+            lock(&self.shared.heartbeat).take()
+        };
+        if let Some(heartbeat) = heartbeat {
+            let _ = heartbeat.stop_tx.send(());
+            let _ = heartbeat.thread.join();
+        }
+        true
+    }
+}
+
+fn heartbeat_loop<E: Copy>(shared: &ReporterShared<E>, stop_rx: &std::sync::mpsc::Receiver<()>) {
+    loop {
+        match stop_rx.recv_timeout(shared.interval) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let mut state = lock(&shared.state);
+                let ReporterPhase::Stopping { checkpoint } = state.phase else {
+                    // Stopped（または想定外の状態）: 何も報告しない。
+                    return;
+                };
+                if checkpoint >= state.max_checkpoint {
+                    // 見込みを超えた。進めるのをやめ、SCM の判断に任せる。
+                    return;
+                }
+                let next = checkpoint + 1;
+                let Some(plan) = stop_pending_status(next, shared.wait_hint) else {
+                    return;
+                };
+                state.phase = ReporterPhase::Stopping { checkpoint: next };
+                (shared.report)(&plan, shared.ok_exit);
+            }
+            // 止める合図、または送り手が消えた。
+            _ => return,
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 登録済みサービスの PRESHUTDOWN 待ち時間を、希望値と比べた結果。
@@ -305,9 +453,9 @@ pub fn describe_preshutdown_outcome(outcome: &PreshutdownEnsureOutcome) -> Strin
 pub enum PreshutdownReport {
     /// 揃えて読み戻しまで確認した。標準出力に出す。
     Applied(String),
-    /// 揃えられなかった。**install は失敗にしない**: 標準エラー出力（と
-    /// ログ）に理由を 1 行残し、終了コードは 0 のまま。サービスは OS の
-    /// 既定の待ち時間で動く。新規登録の直後に失敗して「登録済みなのに
+    /// 揃えられなかった。**install は失敗にしない**: 標準エラー出力に
+    /// 理由を 1 行残し、終了コードは 0 のまま。実際の待ち時間は確かめられて
+    /// いない（以前の設定のままか、OS の既定のままの可能性がある）。新規登録の直後に失敗して「登録済みなのに
     /// 失敗」にしない・インストーラが毎回呼ぶ既存登録の経路でアップグレードを
     /// 止めないため（#589 のオーナーレビュー）。
     Warning(String),
@@ -321,7 +469,7 @@ pub fn preshutdown_report(
     match result {
         Ok(outcome) => PreshutdownReport::Applied(describe_preshutdown_outcome(outcome)),
         Err(err) => PreshutdownReport::Warning(format!(
-            "OS シャットダウンの待ち時間（PRESHUTDOWN）を設定できませんでした（サービスの登録はそのままで、OS の既定の待ち時間で動きます。もう一度 install を実行すると設定し直します）: {err}"
+            "OS シャットダウンの待ち時間（PRESHUTDOWN）を設定できませんでした（サービスの登録はそのままです。実際の待ち時間は確認できていません - 以前の設定のままか、OS の既定のままの可能性があります。もう一度 install を実行すると設定し直します）: {err}"
         )),
     }
 }
@@ -464,33 +612,134 @@ pub fn service_status_from_plan(
 mod tests {
     use super::*;
 
-    /// 停止の見張りは checkpoint を 2 から 1 つずつ進め、stop の後は
-    /// 何も報告しない（Stopped の後に StopPending を出さない）。
-    #[test]
-    fn heartbeat_advances_the_checkpoint_and_goes_quiet_after_stop() {
+    /// 記録した報告（計画と終了コード）。
+    type Seen = std::sync::Arc<Mutex<Vec<(ServiceStatusPlan, u32)>>>;
+
+    /// 報告を記録する reporter（終了コードは u32）。
+    fn recording_reporter(
+        interval: Duration,
+        expected_stop: Duration,
+    ) -> (ServiceStatusReporter<u32>, Seen) {
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let heartbeat = StopPendingHeartbeat::start(
-            Duration::from_millis(20),
+        let reporter = ServiceStatusReporter::with_timing(
+            move |plan: &ServiceStatusPlan, exit: u32| sink.lock().unwrap().push((*plan, exit)),
+            0,
             PRESHUTDOWN_TIMEOUT,
-            move |plan| sink.lock().unwrap().push(plan),
+            interval,
+            expected_stop,
         );
-        let started = Instant::now();
-        while seen.lock().unwrap().len() < 3 {
-            assert!(started.elapsed() < Duration::from_secs(5), "報告が来ない");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        heartbeat.stop();
-        let after_stop = seen.lock().unwrap().len();
-        std::thread::sleep(Duration::from_millis(80));
+        (reporter, seen)
+    }
+
+    #[test]
+    fn checkpoint_limit_divides_the_expected_stop_by_the_interval() {
+        let five = Duration::from_secs(5);
+        assert_eq!(heartbeat_checkpoint_limit(Duration::ZERO, five), 1);
+        assert_eq!(heartbeat_checkpoint_limit(Duration::from_secs(5), five), 2);
+        assert_eq!(heartbeat_checkpoint_limit(Duration::from_secs(6), five), 3);
+        assert_eq!(heartbeat_checkpoint_limit(Duration::from_secs(35), five), 8);
+        assert_eq!(heartbeat_checkpoint_limit(five, Duration::ZERO), 1);
+    }
+
+    /// heartbeat は checkpoint を 2 から 1 つずつ進め、上限で止まる。
+    /// Stopped の後は何も報告しない。
+    #[test]
+    fn heartbeat_advances_up_to_the_limit_and_nothing_follows_stopped() {
+        // 見込み 3 刻み → 上限 4（1 + 3）。
+        let interval = Duration::from_millis(10);
+        let (reporter, seen) = recording_reporter(interval, interval * 3);
+        assert!(reporter.report_running());
+        assert!(reporter.begin_stop());
+        assert!(!reporter.begin_stop(), "2 回目の停止は報告しない");
+        assert!(!reporter.report_running(), "停止の後に Running を出さない");
+        std::thread::sleep(Duration::from_millis(200));
+        let pending: Vec<u32> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(plan, _)| plan.phase == ServicePhase::StopPending)
+            .map(|(plan, _)| plan.checkpoint)
+            .collect();
+        assert_eq!(pending, vec![1, 2, 3, 4], "上限 4 で進めるのをやめる");
+
+        assert!(reporter.report_stopped(7));
+        assert!(!reporter.report_stopped(0), "Stopped は 1 回だけ");
+        assert!(!reporter.begin_stop());
+        assert!(!reporter.report_running());
+        std::thread::sleep(Duration::from_millis(50));
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), after_stop, "stop の後に報告した");
-        for (index, plan) in seen.iter().enumerate() {
-            assert_eq!(plan.phase, ServicePhase::StopPending);
-            assert_eq!(plan.checkpoint, index as u32 + 2);
-            assert_eq!(plan.wait_hint, PRESHUTDOWN_TIMEOUT);
-            assert!(!plan.accept_stop && !plan.accept_preshutdown);
+        let (last, exit) = seen.last().copied().unwrap();
+        assert_eq!(last.phase, ServicePhase::Stopped);
+        assert_eq!(exit, 7);
+        assert_eq!(
+            seen.iter()
+                .filter(|(plan, _)| plan.phase == ServicePhase::Stopped)
+                .count(),
+            1
+        );
+    }
+
+    /// heartbeat が刻もうとしてロックを待っている間に Stopped になった場合、
+    /// ロックを取った heartbeat は何も報告しない（報告の前に同じロックの中で
+    /// 確かめる）。ロックをテストが握って、heartbeat を決定的に待たせる。
+    #[test]
+    fn a_heartbeat_waiting_for_the_lock_does_not_report_after_stopped() {
+        let (reporter, seen) =
+            recording_reporter(Duration::from_millis(1), Duration::from_secs(60));
+        assert!(reporter.begin_stop());
+        {
+            let mut state = lock(&reporter.shared.state);
+            // heartbeat の刻み（1ms）を何度も過ぎるまで握る - スレッドは
+            // 報告しようとしてこのロックを待つ。
+            std::thread::sleep(Duration::from_millis(50));
+            // Stopped の報告がロックを取って状態を変えたのと同じ形。
+            state.phase = ReporterPhase::Stopped;
         }
+        std::thread::sleep(Duration::from_millis(50));
+        let phases: Vec<ServicePhase> = seen.lock().unwrap().iter().map(|(p, _)| p.phase).collect();
+        assert_eq!(
+            phases,
+            vec![ServicePhase::StopPending],
+            "Stopped の後に heartbeat が報告した"
+        );
+    }
+
+    /// #589 再レビュー P2: ハンドラが停止の合図を公開してから heartbeat を
+    /// 始めるまでの間に、停止処理が先に Stopped まで進んだ場合。後から来た
+    /// `begin_stop` は何も報告しない。
+    #[test]
+    fn a_late_begin_stop_after_stopped_reports_nothing() {
+        let (reporter, seen) =
+            recording_reporter(Duration::from_millis(1), Duration::from_secs(60));
+        assert!(reporter.report_running());
+        let notice = std::sync::Arc::new(Mutex::new(None::<StopNotice>));
+
+        let published = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handler = {
+            let reporter = reporter.clone();
+            let notice = notice.clone();
+            let published = published.clone();
+            let resume = resume.clone();
+            std::thread::spawn(move || {
+                // ハンドラ: 合図を公開する。
+                assert!(record_first_stop(&notice, StopSignal::ServiceStop));
+                published.wait();
+                // ここで止まっている間に、停止処理が Stopped まで進む。
+                resume.wait();
+                reporter.begin_stop()
+            })
+        };
+        published.wait();
+        // 停止処理: 合図はもう公開済みなので待たずに終わり、Stopped を出す。
+        assert!(notice.lock().unwrap().is_some());
+        assert!(reporter.report_stopped(0));
+        resume.wait();
+        assert!(!handler.join().unwrap(), "Stopped の後に停止を始めた");
+        std::thread::sleep(Duration::from_millis(20));
+        let phases: Vec<ServicePhase> = seen.lock().unwrap().iter().map(|(p, _)| p.phase).collect();
+        assert_eq!(phases, vec![ServicePhase::Running, ServicePhase::Stopped]);
     }
 
     /// PRESHUTDOWN を設定できなくても install は失敗にしない: どの失敗も
@@ -506,7 +755,10 @@ mod tests {
             match preshutdown_report(&Err(err)) {
                 PreshutdownReport::Warning(line) => {
                     assert!(line.contains(&reason), "{line}");
-                    assert!(line.contains("OS の既定の待ち時間で動きます"), "{line}");
+                    assert!(
+                        line.contains("実際の待ち時間は確認できていません"),
+                        "{line}"
+                    );
                     assert!(!line.contains('\n'), "1 行に収める: {line}");
                 }
                 PreshutdownReport::Applied(line) => panic!("失敗が成功扱い: {line}"),

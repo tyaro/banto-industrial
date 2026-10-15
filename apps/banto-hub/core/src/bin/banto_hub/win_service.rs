@@ -68,9 +68,8 @@ use banto_hub_core::runtime::{HubRuntime, HubStartError};
 // `bin/banto-hub.rs`からの`win_service::SERVICE_NAME`/`RUN_SERVICE_ARG`参照は
 // 変更不要）。
 use banto_hub_core::service_manager::{
-    record_first_stop, running_status, service_status_from_plan, stop_pending_status, stop_signal,
-    stop_work_budget, stopped_status, ScmControlKind, ServiceStatusPlan, StopNotice,
-    StopPendingHeartbeat, StopSignal, PRESHUTDOWN_TIMEOUT, STOP_PENDING_HEARTBEAT,
+    record_first_stop, service_status_from_plan, stop_signal, stop_work_budget, ScmControlKind,
+    ServiceStatusPlan, ServiceStatusReporter, StopNotice, StopSignal, PRESHUTDOWN_TIMEOUT,
 };
 pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 
@@ -248,6 +247,13 @@ fn hub_stop_overrun_line() -> &'static str {
     "banto-hub: warn: OS シャットダウンの予算内に最終 flush が終わりませんでした（SCM がプロセスを終了させる可能性があります）"
 }
 
+/// 通常の STOP で Hub の停止にかかる見込み。`ServiceStatusReporter` の
+/// heartbeat は、これを 5 秒の刻みで割った回数まで StopPending の
+/// checkpoint を進め、その後は進めない（停止が固まったら、`wait_hint` の
+/// 30 秒の後に SCM が応答なしを報告できるように）。収集停止は打ち切らない
+/// ので、これを超えても停止そのものは続く。
+const HUB_EXPECTED_STOP: Duration = Duration::from_secs(60);
+
 /// 計画を SCM へ送る。失敗はログだけ（停止処理自体は続ける）。
 fn push_status(handle: &ServiceStatusHandle, plan: &ServiceStatusPlan, exit_code: ServiceExitCode) {
     if let Err(err) =
@@ -350,14 +356,13 @@ fn run_service_body(_arguments: Vec<OsString>) {
     // 最終 flush は下のランタイム側（`RunningHub::shutdown`）が行う。
     let stop_notice: Arc<Mutex<Option<StopNotice>>> = Arc::new(Mutex::new(None));
     let handler_notice = stop_notice.clone();
-    // `register` が返すハンドルを、ハンドラが StopPending をすぐ報告できる
-    // ように共有する。Running を報告するより前にセットする。
-    let status_slot: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
-    let handler_status = status_slot.clone();
-    // 停止中に checkpoint を進めて StopPending を報告し続ける見張り。
-    // Stopped を報告する前に止める（下の `report_status`）。
-    let heartbeat_slot: Arc<Mutex<Option<StopPendingHeartbeat>>> = Arc::new(Mutex::new(None));
-    let handler_heartbeat = heartbeat_slot.clone();
+    // SCM への状態報告（Running → StopPending と heartbeat → Stopped）は
+    // `ServiceStatusReporter` 1 つが同じロックの下で行う。ハンドラが停止を
+    // 始める前に停止処理が Stopped まで進んでも、Stopped の後には何も報告
+    // しない（#589 の再レビュー P2）。`register` の後にセットする。
+    let reporter_slot: Arc<OnceLock<ServiceStatusReporter<ServiceExitCode>>> =
+        Arc::new(OnceLock::new());
+    let handler_reporter = reporter_slot.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match scm_control_kind(&control_event) {
             ScmControlKind::Interrogate => ServiceControlHandlerResult::NoError,
@@ -366,19 +371,8 @@ fn run_service_body(_arguments: Vec<OsString>) {
             kind => match stop_signal(kind) {
                 Some(signal) => {
                     if record_first_stop(&handler_notice, signal) {
-                        if let Some(handle) = handler_status.get() {
-                            if let Some(plan) = stop_pending_status(1, PRESHUTDOWN_TIMEOUT) {
-                                push_status(handle, &plan, ServiceExitCode::Win32(0));
-                            }
-                            let handle = *handle;
-                            let heartbeat = StopPendingHeartbeat::start(
-                                STOP_PENDING_HEARTBEAT,
-                                PRESHUTDOWN_TIMEOUT,
-                                move |plan| push_status(&handle, &plan, ServiceExitCode::Win32(0)),
-                            );
-                            *handler_heartbeat
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(heartbeat);
+                        if let Some(reporter) = handler_reporter.get() {
+                            reporter.begin_stop();
                         }
                         handler_notify.notify_one();
                     }
@@ -398,41 +392,44 @@ fn run_service_body(_arguments: Vec<OsString>) {
             return;
         }
     };
-    let _ = status_slot.set(status_handle);
+    let reporter = ServiceStatusReporter::new(
+        move |plan: &ServiceStatusPlan, exit_code: ServiceExitCode| {
+            push_status(&status_handle, plan, exit_code);
+        },
+        ServiceExitCode::Win32(0),
+    );
+    // Hub の停止（収集停止・tstore の flush・broker・HTTP）の見込み。
+    // heartbeat はこれを 5 秒の刻みで割った回数まで checkpoint を進める。
+    reporter.set_expected_stop(HUB_EXPECTED_STOP);
+    let _ = reporter_slot.set(reporter.clone());
 
     // 起動失敗パスの`return`が async ブロックからしか抜けないせいで
     // `Stopped`が2回報告される問題を止めるゲート（[`StoppedGate`]の doc に
     // 「なぜ必要か」「なぜ終了コードの上書きが危険か」を書いた）。
     let stopped_gate = StoppedGate::default();
     let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
-        // Stopped の前に見張りを止める（Stopped の後に StopPending を出さない）。
-        if current_state == ServiceState::Stopped {
-            let heartbeat = heartbeat_slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(heartbeat) = heartbeat {
-                heartbeat.stop();
-            }
-        }
         // 2回目以降（＝既に`Stopped`を報告済み）は SCM を呼ばずに黙って
         // 戻る。SCM を呼ぶと最初に報告した非0終了コードを Win32(0) で
         // 上書きしかねない上、実際には API エラーになって紛らわしい
-        // エラーログだけが残る。
+        // エラーログだけが残る（`reporter` も Stopped の後は報告しないが、
+        // `has_reported_stopped` の判断はこのゲートが持つ）。
         if !stopped_gate.accept_report(current_state) {
             return;
         }
-        let plan = match current_state {
+        match current_state {
             // 稼働中は STOP と PRESHUTDOWN。SHUTDOWN は相互排他なので付けない。
-            ServiceState::Running => running_status(),
-            ServiceState::StopPending => match stop_pending_status(1, PRESHUTDOWN_TIMEOUT) {
-                Some(plan) => plan,
-                None => return,
-            },
-            // 起動失敗の Stopped も、停止完了の Stopped も制御は受け付けない。
-            _ => stopped_status(),
-        };
-        push_status(&status_handle, &plan, exit_code);
+            // 停止が始まった後は報告しない。
+            ServiceState::Running => {
+                reporter.report_running();
+            }
+            ServiceState::StopPending => {
+                reporter.begin_stop();
+            }
+            // 起動失敗の Stopped も、停止完了の Stopped も 1 回だけ。
+            _ => {
+                reporter.report_stopped(exit_code);
+            }
+        }
     };
 
     let runtime = match tokio::runtime::Runtime::new() {

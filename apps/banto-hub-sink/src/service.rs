@@ -72,10 +72,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_service_control::{
-    ensure_preshutdown_timeout, preshutdown_report, record_first_stop, running_status,
-    service_status_from_plan, stop_pending_status, stop_signal, stop_work_budget, stopped_status,
-    PreshutdownReport, ScmControlKind, ServiceStatusPlan, StopNotice, StopPendingHeartbeat,
-    StopSignal, PRESHUTDOWN_TIMEOUT, STOP_PENDING_HEARTBEAT,
+    ensure_preshutdown_timeout, preshutdown_report, record_first_stop, service_status_from_plan,
+    stop_signal, stop_work_budget, PreshutdownReport, ScmControlKind, ServiceStatusPlan,
+    ServiceStatusReporter, StopNotice, StopSignal, PRESHUTDOWN_TIMEOUT,
 };
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceErrorControl, ServiceExitCode, ServiceInfo,
@@ -110,8 +109,8 @@ pub const GRANT_SERVICE_ACL_ARG: &str = "grant-service-acl";
 pub const ELEV_EXE_NAME: &str = "banto-hub-elev.exe";
 
 /// PRESHUTDOWN の待ち時間を希望値に揃える。起動種別と ACL は変えない。
-/// 失敗しても install は失敗にしない（警告 1 行、終了コード 0。OS の既定の
-/// 待ち時間で動く。[`banto_service_control::PreshutdownReport::Warning`]）。
+/// 失敗しても install は失敗にしない（警告 1 行を標準エラー出力へ、終了コード 0。
+/// 実際の待ち時間は未確認のまま。[`banto_service_control::PreshutdownReport::Warning`]）。
 fn apply_preshutdown_timeout() {
     match preshutdown_report(&ensure_preshutdown_timeout(
         SERVICE_NAME,
@@ -330,6 +329,10 @@ fn push_status(handle: &ServiceStatusHandle, plan: &ServiceStatusPlan, exit_code
     }
 }
 
+/// 通常の STOP の見込みのうち、設定の flush 以外の余裕（flusher ごとの停止
+/// 最大 2 秒・購読の停止・状態 push の HTTP 上限 10 秒を見込む）。
+const SINK_STOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 記録した合図を停止要求にする。OS の作業予算は合図を受けた時刻から数える。
 fn stop_request_from_notice(notice: StopNotice) -> StopRequest {
     match notice.signal {
@@ -358,14 +361,13 @@ fn run_service_body(_arguments: Vec<OsString>) {
     // 残キューの flush は下の `run` が行う。
     let stop_notice: Arc<Mutex<Option<StopNotice>>> = Arc::new(Mutex::new(None));
     let handler_notice = stop_notice.clone();
-    // `register` が返すハンドルを、ハンドラが StopPending をすぐ報告できる
-    // ように共有する。Running を報告するより前にセットする。
-    let status_slot: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
-    let handler_status = status_slot.clone();
-    // 停止中に checkpoint を進めて StopPending を報告し続ける見張り。
-    // Stopped を報告する前に止める（下の `report_status`）。
-    let heartbeat_slot: Arc<Mutex<Option<StopPendingHeartbeat>>> = Arc::new(Mutex::new(None));
-    let handler_heartbeat = heartbeat_slot.clone();
+    // SCM への状態報告（Running → StopPending と heartbeat → Stopped）は
+    // `ServiceStatusReporter` 1 つが同じロックの下で行う。ハンドラが停止を
+    // 始める前に停止処理が Stopped まで進んでも、Stopped の後には何も報告
+    // しない（#589 の再レビュー P2）。`register` の後にセットする。
+    let reporter_slot: Arc<OnceLock<ServiceStatusReporter<ServiceExitCode>>> =
+        Arc::new(OnceLock::new());
+    let handler_reporter = reporter_slot.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match scm_control_kind(&control_event) {
             ScmControlKind::Interrogate => ServiceControlHandlerResult::NoError,
@@ -374,19 +376,8 @@ fn run_service_body(_arguments: Vec<OsString>) {
             kind => match stop_signal(kind) {
                 Some(signal) => {
                     if record_first_stop(&handler_notice, signal) {
-                        if let Some(handle) = handler_status.get() {
-                            if let Some(plan) = stop_pending_status(1, PRESHUTDOWN_TIMEOUT) {
-                                push_status(handle, &plan, ServiceExitCode::Win32(0));
-                            }
-                            let handle = *handle;
-                            let heartbeat = StopPendingHeartbeat::start(
-                                STOP_PENDING_HEARTBEAT,
-                                PRESHUTDOWN_TIMEOUT,
-                                move |plan| push_status(&handle, &plan, ServiceExitCode::Win32(0)),
-                            );
-                            *handler_heartbeat
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(heartbeat);
+                        if let Some(reporter) = handler_reporter.get() {
+                            reporter.begin_stop();
                         }
                         handler_notify.notify_one();
                     }
@@ -406,28 +397,29 @@ fn run_service_body(_arguments: Vec<OsString>) {
             return;
         }
     };
-    let _ = status_slot.set(status_handle);
+    let reporter = ServiceStatusReporter::new(
+        move |plan: &ServiceStatusPlan, exit_code: ServiceExitCode| {
+            push_status(&status_handle, plan, exit_code);
+        },
+        ServiceExitCode::Win32(0),
+    );
+    let _ = reporter_slot.set(reporter.clone());
 
     let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
-        if current_state == ServiceState::Stopped {
-            let heartbeat = heartbeat_slot
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(heartbeat) = heartbeat {
-                heartbeat.stop();
+        match current_state {
+            // 稼働中は STOP と PRESHUTDOWN。SHUTDOWN は相互排他なので付けない。
+            // 停止が始まった後は報告しない。
+            ServiceState::Running => {
+                reporter.report_running();
+            }
+            ServiceState::StopPending => {
+                reporter.begin_stop();
+            }
+            // 起動失敗の Stopped も、停止完了の Stopped も 1 回だけ。
+            _ => {
+                reporter.report_stopped(exit_code);
             }
         }
-        let plan = match current_state {
-            // 稼働中は STOP と PRESHUTDOWN。SHUTDOWN は相互排他なので付けない。
-            ServiceState::Running => running_status(),
-            ServiceState::StopPending => match stop_pending_status(1, PRESHUTDOWN_TIMEOUT) {
-                Some(plan) => plan,
-                None => return,
-            },
-            _ => stopped_status(),
-        };
-        push_status(&status_handle, &plan, exit_code);
     };
 
     // 設定ファイルが無い/壊れているのは復旧不能なので、SCM へ失敗を報告
@@ -440,6 +432,11 @@ fn run_service_body(_arguments: Vec<OsString>) {
             return;
         }
     };
+    // 通常の STOP の見込み: 設定の flush と、flusher ごとの停止・購読の停止・
+    // 最後の状態 push の余裕。heartbeat はこれを 5 秒の刻みで割った回数まで
+    // checkpoint を進め、その後は進めない（停止が固まったら SCM が応答なしを
+    // 報告できるように）。
+    reporter.set_expected_stop(config.shutdown_flush + SINK_STOP_MARGIN);
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,

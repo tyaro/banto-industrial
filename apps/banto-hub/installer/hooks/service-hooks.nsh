@@ -82,7 +82,10 @@
 ; #589 以降、その経路でも PRESHUTDOWN の待ち時間（30 秒）だけは更新し、
 ; 読み戻して確認する。設定できなかったときも `install` は終了コード 0 で
 ; 警告を 1 行出すだけ（2026-10-15）- 下の `$0 != 0` の案内には出ず、
-; `service-install` は続く Operators・ACL の付与まで進む。
+; `service-install` は続く Operators・ACL の付与まで進む。その警告は
+; 標準エラー出力だけで、`ExecWait` は子の出力を取り込まないので
+; インストーラには表示も記録もされない（確認はレジストリの
+; `PreshutdownTimeout`、docs/banto-hub-operations.md §11）。
 ;
 ; (6) デスクトップショートカットの削除（I4 追従、
 ;     docs/banto-hub-installer-design.md §7-3「デスクトップショートカット
