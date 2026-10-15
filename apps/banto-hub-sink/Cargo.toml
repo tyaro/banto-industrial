@@ -37,8 +37,12 @@ tokio = { workspace = true, features = [
 # 未知キーを拒否するため serde 統合が要る。Cargo.lock には既に 1.1.2 系が
 # （他の推移的依存経由で）存在するので新規バージョン系列は増えない。
 toml = "1"
-# OS シャットダウンの停止合図と PRESHUTDOWN 待ち時間（#589）。
-# Hub と同じ共有 crate。サイドカーは banto-hub-core を本番依存にしない。
+# サービスの共有ランナーと登録・解除の手順（#392 B3-1）、OS シャットダウンの
+# 停止合図と PRESHUTDOWN 待ち時間（#589）。Hub と同じ共有 crate。設計 §5.6
+# 「サービス起動順は Hub → sink」で banto-hub と同じ SCM の手順
+# （`install`/`uninstall`/`run-service`）を使うが、B3-1 以降このクレートは
+# `windows-service` を直接使わない。サイドカーは banto-hub-core を本番依存に
+# しない。
 banto-service-control = { path = "../../crates/banto-service-control" }
 # サービスログ行のローカル時刻表示。`banto-tstore` が同じ理由・同じ
 # feature 構成でこのクレートを使っている（`crates/banto-tstore/Cargo.toml`
@@ -46,15 +50,6 @@ banto-service-control = { path = "../../crates/banto-service-control" }
 # 制約は当たらない）。`banto-tstore` 自体を依存に足すと sqlx-sqlite が
 # サイドカーの exe へ入ってしまうため、そちらは使わず `time` を直接持つ。
 time = { version = "0.3", default-features = false, features = ["local-offset"] }
-
-# 設計 §5.6「サービス起動順は Hub → sink」: banto-hub と**同じ**
-# `windows-service` クレート・同じ SCM パターン（`install`/`uninstall`/
-# `run-service` サブコマンド、`service_dispatcher::start` +
-# `service_control_handler::register`）を使う。banto-hub 側の理由は
-# `apps/banto-hub/core/Cargo.toml` の同名依存のコメント参照 - 非 Windows
-# ビルドにはこの依存もそれを使うコードも一切含まれない。
-[target.'cfg(windows)'.dependencies]
-windows-service = "0.8.1"
 
 [dev-dependencies]
 # 統合テスト（tests/sidecar.rs）が Hub を**プロセス内**に立てるため。

@@ -61,8 +61,9 @@
 //! - [`run`][]: 上記を束ねる実行ループ（設定の差分適用・状態 push・SDK の
 //!   監督・停止時の flush）。テスト可能にするため `main.rs` ではなくこの
 //!   lib 側に置いてある。
-//! - [`service`][]（Windows のみ）: banto-hub と同じ `windows-service` の
-//!   SCM パターン（`install`/`uninstall`/`run-service`）に加え、
+//! - [`service`][]（Windows のみ）: banto-hub と同じ共有 crate
+//!   `banto-service-control` のランナーと登録の手順（`install`/`uninstall`/
+//!   `run-service`、#392 B3-1）に加え、
 //!   `banto-hub-elev.exe`（banto-hub 側の UAC 昇格ヘルパー）を子プロセスで
 //!   呼ぶだけの `grant-service-acl`（S6 レビュー指摘の follow-up、
 //!   `service` のモジュール doc「サービス ACL の付与」節参照）。
