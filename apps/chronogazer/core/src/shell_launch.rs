@@ -46,6 +46,30 @@ use banto_service_control::{ScmState, ServiceManager};
 pub const SERVICE_NAME: &str = "ChronoGazer";
 /// SCM 上の表示名（決定 7）。
 pub const SERVICE_DISPLAY_NAME: &str = "ChronoGazer 記録エンジン";
+/// SCM 上の説明文（#392 B3-2b。`install` の新規登録で設定する）。
+pub const SERVICE_DESCRIPTION: &str =
+    "ChronoGazer の記録エンジン（PLC のデータ収集と保存）を常駐実行します。データ: %ProgramData%\\ChronoGazer。";
+/// SCM がサービスの開始で `chronogazer-server.exe` に渡す引数（#392 B3-2b）。
+pub const RUN_SERVICE_ARG: &str = "run-service";
+
+/// ChronoGazer のサービスの登録内容（#392 B3-2b。`chronogazer-server.exe install` が
+/// `banto_service_control::install_service` に渡す）。名前・表示名はシェルの照会
+/// （B2-4c）と同じ定数。LocalSystem・OwnProcess・手動開始（OS の再起動だけでは
+/// 始まらない。自動開始は B3-3 の elev）・OS シャットダウンの待ち時間 30 秒
+/// （PRESHUTDOWN。最終 flush の予算はその内側、`crate::server_service`）。
+pub fn chronogazer_service_spec(
+    executable: std::path::PathBuf,
+) -> banto_service_control::ServiceSpec {
+    banto_service_control::ServiceSpec {
+        name: SERVICE_NAME,
+        display_name: SERVICE_DISPLAY_NAME,
+        description: Some(SERVICE_DESCRIPTION),
+        executable,
+        launch_arguments: vec![std::ffi::OsString::from(RUN_SERVICE_ARG)],
+        start_kind: banto_service_control::ServiceStartKind::OnDemand,
+        preshutdown_timeout: banto_service_control::PRESHUTDOWN_TIMEOUT,
+    }
+}
 
 /// SCM の観測の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,5 +352,30 @@ mod tests {
     fn names_match_decision_7() {
         assert_eq!(SERVICE_NAME, "ChronoGazer");
         assert_eq!(SERVICE_DISPLAY_NAME, "ChronoGazer 記録エンジン");
+    }
+
+    /// #392 B3-2b: 登録内容の golden（名前・表示名・説明文・起動引数・手動開始・
+    /// PRESHUTDOWN 30 秒）。
+    #[test]
+    fn service_spec_golden() {
+        use banto_service_control::{ServiceSpec, ServiceStartKind};
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        let exe = PathBuf::from(r"C:\Program Files\ChronoGazer\chronogazer-server.exe");
+        assert_eq!(
+            chronogazer_service_spec(exe.clone()),
+            ServiceSpec {
+                name: "ChronoGazer",
+                display_name: "ChronoGazer 記録エンジン",
+                description: Some(
+                    "ChronoGazer の記録エンジン（PLC のデータ収集と保存）を常駐実行します。データ: %ProgramData%\\ChronoGazer。"
+                ),
+                executable: exe,
+                launch_arguments: vec![std::ffi::OsString::from("run-service")],
+                start_kind: ServiceStartKind::OnDemand,
+                preshutdown_timeout: Duration::from_secs(30),
+            }
+        );
     }
 }

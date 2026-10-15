@@ -49,6 +49,10 @@ pub mod server_admin;
 // #392 B1-5: 画面の無い本番用の host `chronogazer-server` の、OS に依存しない部分
 // （待ち受けの形・ルートの検証・起動の失敗の案内・KeyStore・日付ごとのログ）。
 pub mod server_host;
+// #392 B3-2b: `chronogazer-server` の Windows サービスの形の、OS に依存しない判断と
+// 文言（終了コード・停止の予算・インストール利用者の SID・install/uninstall の文言）。
+// SCM とのやりとりは `banto-service-control`、本体と登録の手順は bin。
+pub mod server_service;
 // #392 B2-4a: シェルがサービスの health を確かめる probe（`run\endpoint.json` →
 // `GET /api/host`、O8 の条件）。std の TCP だけで、Tauri に依存しない。
 pub mod service_probe;

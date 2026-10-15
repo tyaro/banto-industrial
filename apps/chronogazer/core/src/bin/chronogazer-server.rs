@@ -1,14 +1,20 @@
 //! `chronogazer-server`: 画面の無い本番用の ChronoGazer の記録エンジン（#392 段階 B
 //! の B1-5、2026-10-13。設計は docs/chronogazer-service-design.md §3.1(b)）。
 //!
-//! B1 ではコンソールで動かす形だけ（引数なし）。同じ exe に Windows サービス
-//! （`run-service`・`install`・`uninstall`）を足すのは B3。開発・E2E 用の
+//! B1 ではコンソールで動かす形だけ（引数なし）。B3-2b（2026-10-15）で同じ exe に
+//! Windows サービス（`run-service`・`install`・`uninstall`、Windows だけ）を足した
+//! （`chronogazer_server/service.rs`。下の「Windows サービス」）。開発・E2E 用の
 //! `banto-serve` とは別物で、あちらの既定（`0.0.0.0`・`./banto-dev.sqlite3`・
 //! `BANTO_HUB_MEMORY_KEYS`）は持ち込まない。
 //!
 //! ```text
 //! chronogazer-server.exe            コンソールで起動（Ctrl-C で停止）
 //! chronogazer-server.exe --help     使い方
+//! chronogazer-server.exe install [--install-user-sid S-1-5-21-…]
+//!                                   サービス `ChronoGazer` を登録（管理者、Windows だけ）
+//! chronogazer-server.exe uninstall  登録を解除（データは残す。管理者、Windows だけ）
+//! chronogazer-server.exe run-service
+//!                                   SCM がサービスの開始で呼ぶ（手で実行すると終了コード 1）
 //! ```
 //!
 //! 環境変数は `CHRONOGAZER_ROOT`（データのルート。既定 `%ProgramData%\ChronoGazer`。
@@ -52,7 +58,23 @@
 //!    しない。#598 監査 F5）。
 //!
 //! 終了コード: 0 正常、1 後始末が予算内に終わらなかった・最終 flush に失敗、
-//! 2 同じデータを別のプロセスが使用中、3 その他の起動の失敗、64 引数が違う。
+//! 2 同じデータを別のプロセスが使用中、3 その他の起動の失敗、64 引数が違う
+//! （`run-service`・`install`・`uninstall` の後の余計な引数、Windows 以外でのこの 3 つ
+//! を含む）。
+//!
+//! # Windows サービス（#392 B3-2b）
+//!
+//! - `run-service`: 共有ランナー（`banto_service_control::run_service`）に
+//!   `ServerProgram` を渡す。起動の順序はコンソールと同じ `start::start_server`
+//!   （host の種類は `service`、ACL の利用者は登録時に記録したインストール利用者の SID）。
+//!   **コンソールの Ctrl のハンドラーは登録しない**（サービスのプロセスにも
+//!   `CTRL_LOGOFF_EVENT` が届き、コンソールのハンドラーはログオフで後始末して終わる
+//!   ため、サインアウトのたびにサービスが止まってしまう）。止める合図は SCM の STOP と
+//!   OS の PRESHUTDOWN だけ。SCM の外で実行されたら案内の 2 行（製品共通）を出して
+//!   終了コード 1（何も作らない）。
+//! - `install`・`uninstall`: 共有の手順（`install_service`・`uninstall_service`）と、
+//!   インストール利用者の SID の記録（`Parameters\InstallUserSid`）、ルートの用意。
+//!   文言と終了コードの判断は `chronogazer_core::server_service`（どの OS でもテスト）。
 //!
 //! `--control-stdin`（自動テスト用。使い方には出さない）: 標準入力の行で止める
 //! （`ctrl-c` = Ctrl-C と同じ経路、`close` = `CTRL_CLOSE_EVENT` のハンドラーと
@@ -70,6 +92,9 @@
 #[cfg(windows)]
 #[path = "chronogazer_server/console.rs"]
 mod console;
+#[cfg(windows)]
+#[path = "chronogazer_server/service.rs"]
+mod service;
 #[path = "chronogazer_server/start.rs"]
 mod start;
 
@@ -88,8 +113,8 @@ use start::{StartHooks, StartSpec, Started};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let options = match parse_args(&args) {
-        Ok(Some(options)) => options,
+    let mode = match parse_args(&args) {
+        Ok(Some(mode)) => mode,
         Ok(None) => {
             print_usage();
             return;
@@ -100,7 +125,16 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
-    std::process::exit(run(options));
+    let code = match mode {
+        Mode::Console(options) => run(options),
+        #[cfg(windows)]
+        Mode::RunService => service::run_service_dispatcher(),
+        #[cfg(windows)]
+        Mode::Install { install_user_sid } => service::install(install_user_sid),
+        #[cfg(windows)]
+        Mode::Uninstall => service::uninstall(),
+    };
+    std::process::exit(code);
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -108,8 +142,89 @@ struct CliOptions {
     control_stdin: bool,
 }
 
+/// 動かし方（#392 B3-2b）。サービスの 3 つは Windows だけ（それ以外の OS では
+/// [`parse_args`] が引数の誤りとして断る）。
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// コンソール（引数なし、B1-5 のまま）。
+    Console(CliOptions),
+    /// SCM がサービスの開始で呼ぶ（`run-service`）。
+    #[cfg(windows)]
+    RunService,
+    /// サービスの登録（`install [--install-user-sid SID]`）。SID を省けば実行した
+    /// 利用者（D1）。
+    #[cfg(windows)]
+    Install {
+        install_user_sid: Option<banto_secret_store::InstallUserSid>,
+    },
+    /// 登録の解除（`uninstall`）。
+    #[cfg(windows)]
+    Uninstall,
+}
+
+/// サービスの部分コマンド（最初の引数だけ。コンソールの引数の後には置けない）。
+const SERVICE_COMMANDS: [&str; 3] = [
+    chronogazer_core::shell_launch::RUN_SERVICE_ARG,
+    "install",
+    "uninstall",
+];
+
 /// 引数の解釈。`Ok(None)` は使い方の表示だけ。
-fn parse_args(args: &[String]) -> Result<Option<CliOptions>, String> {
+fn parse_args(args: &[String]) -> Result<Option<Mode>, String> {
+    if let Some(command) = args
+        .first()
+        .filter(|first| SERVICE_COMMANDS.contains(&first.as_str()))
+    {
+        return parse_service_command(command, &args[1..]).map(Some);
+    }
+    parse_console_args(args).map(|options| options.map(Mode::Console))
+}
+
+/// サービスの部分コマンドの解釈（Windows）。余計な・未知の引数は断る。
+#[cfg(windows)]
+fn parse_service_command(command: &str, rest: &[String]) -> Result<Mode, String> {
+    match command {
+        "install" => {
+            let mut install_user_sid = None;
+            let mut rest = rest.iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--install-user-sid" if install_user_sid.is_none() => {
+                        let value = rest
+                            .next()
+                            .ok_or("--install-user-sid には SID（S-1-5-21-…）を続けてください")?;
+                        let sid =
+                            banto_secret_store::InstallUserSid::parse(value).map_err(|err| {
+                                format!("--install-user-sid の値が使えません（{value}）: {err}")
+                            })?;
+                        install_user_sid = Some(sid);
+                    }
+                    other => return Err(format!("install の不明な引数です: '{other}'")),
+                }
+            }
+            Ok(Mode::Install { install_user_sid })
+        }
+        _ => {
+            if let Some(extra) = rest.first() {
+                return Err(format!("{command} には引数を付けられません: '{extra}'"));
+            }
+            Ok(if command == "uninstall" {
+                Mode::Uninstall
+            } else {
+                Mode::RunService
+            })
+        }
+    }
+}
+
+/// Windows 以外: サービスの部分コマンドは使えない（引数の誤り、終了コード 64）。
+#[cfg(not(windows))]
+fn parse_service_command(command: &str, _rest: &[String]) -> Result<Mode, String> {
+    Err(format!("'{command}' は Windows だけで使えます"))
+}
+
+/// コンソールの引数（B1-5 のまま）。
+fn parse_console_args(args: &[String]) -> Result<Option<CliOptions>, String> {
     let mut options = CliOptions::default();
     for arg in args {
         match arg.as_str() {
@@ -145,6 +260,12 @@ fn print_usage() {
         chronogazer_core::paths::ROOT_ENV
     );
     eprintln!("  ログ: <データ>\\logs\\chronogazer-server-YYYY-MM-DD.log");
+    #[cfg(windows)]
+    {
+        eprintln!("Windows サービス（管理者として実行した PowerShell から）:");
+        eprintln!("  chronogazer-server.exe install [--install-user-sid S-1-5-21-…]  サービス ChronoGazer を登録");
+        eprintln!("  chronogazer-server.exe uninstall                                 登録を解除（データは残す）");
+    }
 }
 
 /// 止める合図の起点。
@@ -609,7 +730,10 @@ fn run(options: CliOptions) -> i32 {
     // `wait_request` がすぐ返り、close 系なら待っていたハンドラーが既に後始末して
     // いる）。案内は公開の後なので、出力が詰まっても終了を待たせない。
     if controller.stop_requested().is_none() {
-        runtime.block_on(announce(&server));
+        runtime.block_on(announce(
+            &server,
+            &format!("{SERVER_LABEL}: Ctrl-C で停止します"),
+        ));
     }
 
     // 7. 止める合図を待って後始末。
@@ -785,7 +909,9 @@ fn spawn_log_prune(prune: server_host::LogPrune) {
     prune.spawn();
 }
 
-async fn announce(server: &StartedServer) {
+/// 待ち受けの案内。`stop_hint` は最後の 1 行（止め方。コンソールは Ctrl-C、
+/// サービスは `Stop-Service`）。
+async fn announce(server: &StartedServer, stop_hint: &str) {
     let engine = server.engine();
     if let Some(addr) = engine.loopback_addr().await {
         println!(
@@ -833,7 +959,7 @@ async fn announce(server: &StartedServer) {
     if let Some(err) = server.endpoint_error() {
         eprintln!("{SERVER_LABEL}: {err}");
     }
-    println!("{SERVER_LABEL}: Ctrl-C で停止します");
+    println!("{stop_hint}");
 }
 
 type Flush = Box<dyn Fn(Duration) + Send + Sync>;
@@ -964,22 +1090,81 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_nothing_help_and_the_hidden_control_flag() {
-        assert_eq!(parse_args(&[]), Ok(Some(CliOptions::default())));
+        assert_eq!(
+            parse_args(&[]),
+            Ok(Some(Mode::Console(CliOptions::default())))
+        );
         assert_eq!(parse_args(&args(&["--help"])), Ok(None));
         assert_eq!(parse_args(&args(&["-h"])), Ok(None));
         // テスト用の隠し引数はデバッグビルドだけ受け、リリースビルドでは拒否する。
         #[cfg(debug_assertions)]
         assert_eq!(
             parse_args(&args(&["--control-stdin"])),
-            Ok(Some(CliOptions {
+            Ok(Some(Mode::Console(CliOptions {
                 control_stdin: true
-            }))
+            })))
         );
         #[cfg(not(debug_assertions))]
         assert!(parse_args(&args(&["--control-stdin"])).is_err());
-        // B3 の `run-service` などはまだ無い。
-        for unknown in ["run-service", "install", "--port", "x"] {
+        for unknown in ["--port", "x", "Install", "--install-user-sid"] {
             assert!(parse_args(&args(&[unknown])).is_err(), "{unknown}");
+        }
+        // サービスの部分コマンドは最初の引数だけ（コンソールの引数の後には置けない）。
+        assert!(parse_args(&args(&["--help", "install"])).is_ok());
+        assert!(parse_args(&args(&["x", "run-service"])).is_err());
+    }
+
+    /// #392 B3-2b: サービスの部分コマンド（Windows）。余計な・未知の引数は断る
+    /// （終了コード 64）。
+    #[cfg(windows)]
+    #[test]
+    fn parse_args_accepts_the_service_commands_on_windows() {
+        const SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        assert_eq!(
+            parse_args(&args(&["run-service"])),
+            Ok(Some(Mode::RunService))
+        );
+        assert_eq!(parse_args(&args(&["uninstall"])), Ok(Some(Mode::Uninstall)));
+        assert_eq!(
+            parse_args(&args(&["install"])),
+            Ok(Some(Mode::Install {
+                install_user_sid: None
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["install", "--install-user-sid", SID])),
+            Ok(Some(Mode::Install {
+                install_user_sid: Some(banto_secret_store::InstallUserSid::parse(SID).unwrap())
+            }))
+        );
+        for bad in [
+            &["run-service", "x"][..],
+            &["run-service", "--control-stdin"],
+            &["uninstall", "--force"],
+            &["install", "x"],
+            &["install", "--install-user-sid"],
+            // 利用者のアカウントの SID ではない（Administrators・Everyone）。
+            &["install", "--install-user-sid", "S-1-5-32-544"],
+            &["install", "--install-user-sid", "S-1-1-0"],
+            &[
+                "install",
+                "--install-user-sid",
+                SID,
+                "--install-user-sid",
+                SID,
+            ],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// #392 B3-2b: Windows 以外ではサービスの部分コマンドを断る（終了コード 64）。
+    #[cfg(not(windows))]
+    #[test]
+    fn parse_args_rejects_the_service_commands_off_windows() {
+        for command in ["run-service", "install", "uninstall"] {
+            let err = parse_args(&args(&[command])).unwrap_err();
+            assert!(err.contains("Windows だけ"), "{err}");
         }
     }
 

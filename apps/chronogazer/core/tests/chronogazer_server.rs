@@ -11,6 +11,9 @@
 //! - デスクトップと同じ DB を指すと A1 で拒否（終了コード 2）。
 //! - `%APPDATA%`・`%LOCALAPPDATA%`・作業ディレクトリに何も作らない。
 //! - 相対パスの `CHRONOGAZER_ROOT` は拒否（終了コード 3、何も作らない）。
+//! - （#392 B3-2b）`run-service` を手で実行すると案内の 2 行と終了コード 1（何も
+//!   作らない）。サービスの本体のテストは bin の `chronogazer_server/service.rs`
+//!   （SCM の代わりに共有ランナーの芯へ偽の登録を渡す）。
 //!
 //! 止め方は bin の隠し引数 `--control-stdin`（標準入力の `ctrl-c` / `close`）。
 //! 本物のコンソールの Ctrl（`SetConsoleCtrlHandler`）は、テストのプロセスから
@@ -902,6 +905,46 @@ async fn a_relative_root_is_rejected_without_creating_anything() {
     let output = sandbox.output_text();
     assert_eq!(status.code(), Some(3), "{output}");
     assert!(output.contains("絶対パスではありません"), "{output}");
+    sandbox.assert_profile_untouched();
+}
+
+/// #392 B3-2b: `run-service` を手で実行すると（SCM の外）、製品共通の案内の 2 行を出して
+/// 終了コード 1。サービスの本体は動かないので、データのルートを作らない。Windows 以外では
+/// 引数の誤り（64）。
+#[test]
+fn running_run_service_by_hand_explains_and_creates_nothing() {
+    let sandbox = Sandbox::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_chronogazer-server"))
+        .arg("run-service")
+        .env("CHRONOGAZER_ROOT", &sandbox.root)
+        .env("APPDATA", &sandbox.appdata)
+        .env("LOCALAPPDATA", &sandbox.local_appdata)
+        .current_dir(&sandbox.cwd)
+        .stdin(Stdio::null())
+        .output()
+        .expect("chronogazer-server を起動できる");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    #[cfg(windows)]
+    {
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2, "{stderr}");
+        assert!(
+            lines[0].starts_with("chronogazer-server: service_dispatcher の起動に失敗しました: "),
+            "{stderr}"
+        );
+        assert_eq!(
+            lines[1],
+            "chronogazer-server: 'run-service' は SCM がサービス開始時に呼ぶ内部エントリポイントです。手動では実行できません（`install` → `Start-Service` で起動してください）"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(output.status.code(), Some(64), "{stderr}");
+        assert!(stderr.contains("Windows だけ"), "{stderr}");
+    }
+    assert!(output.stdout.is_empty());
+    assert!(!sandbox.root.exists(), "データのルートを作った");
     sandbox.assert_profile_untouched();
 }
 
