@@ -220,16 +220,19 @@ pub fn has_dot_segment(path: &Path) -> bool {
 /// [`create_root_dir_with`]。
 pub fn create_root_dir(layout: &DataLayout) -> Result<bool, String> {
     // 既にあれば ACL の指定（利用者の SID）も求めない（既存のルートを使えなく
-    // しない）。
-    if layout.root().is_dir() {
+    // しない）。確かめはここだけで、作る本体を直接呼ぶ（`create_root_dir_with` を
+    // 通すと同じ確かめを 2 回する。PR #617 のレビュー）。
+    let root = layout.root();
+    if root.is_dir() {
         return Ok(false);
     }
     #[cfg(windows)]
     let access = current_process_dir_access().map_err(|err| err.to_string())?;
-    // Windows 以外は ACL を付けない（`create_dir_all`）。
+    // Windows 以外は ACL を付けない（`create_dir_all`）。ここで渡す指定は
+    // `create_root_dir_impl` の型を合わせるためだけで、使われない。
     #[cfg(not(windows))]
     let access = banto_secret_store::DirAccess::service_only();
-    create_root_dir_with(layout, &access)
+    create_root_dir_impl(root, &access)
 }
 
 /// [`create_root_dir`] の、作るときの ACL の利用者の欄を呼び出し側が決める形
@@ -602,6 +605,15 @@ mod tests {
                 .iter()
                 .any(|ace| ace.sid == me.as_str() && ace.mask == MODIFY_ACCESS_MASK));
 
+            // グループの SID は、今の利用者の SID の末尾を 513（そのマシン・ドメインの
+            // 「なし」/ Domain Users）に変えて作る。今の利用者がローカルかドメインの
+            // 利用者のアカウント（S-1-5-21-…）である前提（開発機・GitHub の Windows の
+            // ランナー）。CI の利用者が変わったら（Entra の S-1-12-1-… など）この作り方を
+            // 見直す（PR #617 のレビュー）。前提が崩れたらここで理由つきで落とす。
+            assert!(
+                me.as_str().starts_with("S-1-5-21-"),
+                "ローカル・ドメインの利用者のアカウントで走らせる前提（グループの SID を -513 で作る）: {me:?}"
+            );
             let machine = me.as_str().rsplit_once('-').unwrap().0;
             let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
             let refused = DataLayout::new(dir.path().join("group"));
