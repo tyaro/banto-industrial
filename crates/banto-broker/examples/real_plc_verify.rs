@@ -755,9 +755,39 @@ async fn restore_phase2(
     saved_bit_word: f64,
     saved_m: bool,
 ) -> Result<(), String> {
-    restore_words(ctx, pattern_offsets, saved_pattern).await?;
-    restore_words(ctx, &[D_BIT_OFFSET], &[saved_bit_word]).await?;
-    restore_bit(ctx, &ctx.m(0), saved_m).await
+    // 1 組が拒否・不一致でも、残りの組は必ず試みる（`?` で打ち切ると、通信が生きていて
+    // 戻せたはずの領域が試験値のまま残る）。失敗は全部集めて、元の値つきで報告する。
+    let m_raw = ctx.m(0);
+    run_restore_steps(vec![
+        Box::pin(restore_words(ctx, pattern_offsets, saved_pattern)),
+        Box::pin(restore_words(ctx, &[D_BIT_OFFSET], &[saved_bit_word])),
+        Box::pin(restore_bit(ctx, &m_raw, saved_m)),
+    ])
+    .await
+}
+
+type RestoreStep<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>>;
+
+/// 復元の各組を先頭から順にすべて実行し、失敗をまとめて返す。
+/// どの組が先に失敗しても、あとの組は飛ばさない。
+async fn run_restore_steps(steps: Vec<RestoreStep<'_>>) -> Result<(), String> {
+    let total = steps.len();
+    let mut failures = Vec::new();
+    for step in steps {
+        if let Err(err) = step.await {
+            failures.push(err);
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "復元できなかった組が {} / {total} 件あります。{}",
+            failures.len(),
+            failures.join(" / ")
+        ))
+    }
 }
 
 async fn phase3_string_roundtrip(ctx: &Ctx) -> Result<(), String> {
@@ -1172,5 +1202,51 @@ mod tests {
         let items = vec![word_item("D3000", 0x1111)];
         require_restore_accepted("ワード", &items, &[WriteResult::Ok]).unwrap();
         require_restore_readback("ワード", &items, &[format_word(f64::from(0x1111u16))]).unwrap();
+    }
+
+    /// 最初の組だけが失敗しても、残り 2 組の復元は呼ばれ、報告に失敗した組の
+    /// アドレスと元の値が残る。終わりの 2 組が失敗したときも同じ。
+    #[tokio::test]
+    async fn restore_steps_run_all_even_when_the_first_fails() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let step = |ok: Result<(), String>| -> RestoreStep<'_> {
+            let calls = &calls;
+            Box::pin(async move {
+                calls.set(calls.get() + 1);
+                ok
+            })
+        };
+        let err = run_restore_steps(vec![
+            step(Err(
+                "ワードの復元: D3000（元の値 4369 (0x1111)、結果 Bad）".to_string()
+            )),
+            step(Ok(())),
+            step(Ok(())),
+        ])
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 3, "後続の復元が飛ばされた");
+        assert!(err.contains("D3000"), "{err}");
+        assert!(err.contains("0x1111"), "{err}");
+        assert!(err.contains("1 / 3"), "{err}");
+
+        calls.set(0);
+        let err = run_restore_steps(vec![
+            step(Err("D3000 失敗（元の値 1）".to_string())),
+            step(Ok(())),
+            step(Err("M1000 失敗（元の値 true）".to_string())),
+        ])
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 3);
+        assert!(err.contains("D3000") && err.contains("M1000"), "{err}");
+        assert!(err.contains("2 / 3"), "{err}");
+
+        calls.set(0);
+        run_restore_steps(vec![step(Ok(())), step(Ok(())), step(Ok(()))])
+            .await
+            .unwrap();
+        assert_eq!(calls.get(), 3);
     }
 }
