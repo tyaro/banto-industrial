@@ -1,12 +1,12 @@
 //! T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）:
 //! banto-hub を Windows サービスとして常駐実行するための SCM 連携。
-//! `windows-service`クレート（本実装、`Cargo.toml`の
-//! `[target.'cfg(windows)'.dependencies]`参照）を使う。
+//! `windows-service`クレート（本実装）を使う - #392 B3-1 以降は直接ではなく、
+//! 共有 crate `banto-service-control` のランナー経由（下の「共有ランナー」）。
 //!
 //! **このファイル全体が Windows 専用** - `bin/banto-hub.rs`側で
 //! `#[cfg(windows)] mod win_service;`としてしか読み込まれないので、
 //! 非 Windows（このワークスペースの CI 含む）ビルドにはこのファイルの
-//! コードも `windows-service`クレートへの依存も一切含まれない。
+//! コードは一切含まれない。
 //!
 //! ## 3つのエントリポイント
 //!
@@ -20,6 +20,24 @@
 //!   エントリポイント（同`run-service`サブコマンド - installで登録した
 //!   起動引数そのもの。人間が直接叩く想定ではない）
 //!
+//! ## 共有ランナー（#392 B3-1、2026-10-15）
+//!
+//! SCM とのやりとり（`define_windows_service!`・ディスパッチャ・制御ハンドラ・
+//! STOP と PRESHUTDOWN・Running → StopPending（heartbeat）→ Stopped の報告・
+//! 本体の panic）は共有 crate `banto-service-control` のランナーへ移した
+//! （banto-hub-sink と同じもの。ChronoGazer も B3-2 で使う）。このファイルに
+//! 残るのは本体[`HubProgram`]（ログの開き方、Hub の起動と停止、終了コード
+//! 1/2/3）だけ。ログを開いてから制御ハンドラを登録する順序、Running を
+//! 報告する時機（Configured 収集が Running になった後）、終了コードは変えて
+//! いない。#330 の`StoppedGate`は消した: 本体は`Stopped`を報告する口を
+//! 持たず、終了コードを**返す**ので、起動失敗の後に`Win32(0)`で上書きする
+//! 経路そのものが無くなった（共有 crate の`run_program_with`のテストが
+//! 「起動失敗は`Stopped(n)`を 1 回だけ・Running なし」を固定する）。
+//! 差は、本体の panic で`Stopped`（`ServiceSpecific(1)`）を報告するように
+//! なったこと（オーナー決定 D2）と、手動で`run-service`を実行したときの
+//! 案内の文言が sink と共通になったこと（同 D3、標準エラー出力だけ・
+//! 終了コード 1 は不変）。
+//!
 //! ## サービス名・表示名・起動種別
 //!
 //! サービス名 `BantoHub`・表示名「banto-hub タグサーバー」。
@@ -30,7 +48,7 @@
 //! （`banto_hub_core::service_install::install`参照）- OS 再起動だけで
 //! banto-hub の収集が始まらないようにするための決定で、`Start-Service`
 //! または管理 UI からの明示操作でのみサービスが開始する。サービスが
-//! 実際に開始したときにサービス本体（[`run_service_body`]）が即座に
+//! 実際に開始したときにサービス本体（[`HubProgram`]）が即座に
 //! `Configured` 収集を開始する挙動自体は変えていない。
 //!
 //! 自動開始を有効にしたい場合（`banto_hub_core::service_manager::
@@ -43,23 +61,17 @@
 //! 判断）。`OnDemand`には遅延自動開始の概念が無い（Windows API 仕様）ため
 //! `install`ではこの呼び出しを行わない。
 
-use std::cell::Cell;
-use std::ffi::OsString;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-
-use windows_service::service::{ServiceControl, ServiceExitCode, ServiceState, ServiceType};
-use windows_service::service_control_handler::{
-    self, ServiceControlHandlerResult, ServiceStatusHandle,
-};
-use windows_service::{define_windows_service, service_dispatcher};
 
 use banto_hub_core::controller::{CollectionState, RunMode};
 use banto_hub_core::hub_log::{self, log_err_line, log_line};
 use banto_hub_core::profile_lock::{HubHostKind, ProfileLockError};
 use banto_hub_core::profile_paths::{build_hub_config_from_env, resolve_profile_paths_from_env};
 use banto_hub_core::runtime::{HubRuntime, HubStartError};
+use banto_hub_core::service_manager::{
+    dispatch_failure_lines, run_service, OverrunWatch, ServiceContext, ServiceExit, ServiceProgram,
+    StopSignal,
+};
 // T17-0（docs/banto-hub-t17-design.md §3「T17-0」）: サービス名・起動引数は
 // `banto_hub_core::service_manager`（`WindowsServiceManager`が実 SCM 再登録
 // 時に使う値と同じもの）を単一のソースとして再利用する - このファイルは
@@ -67,61 +79,52 @@ use banto_hub_core::runtime::{HubRuntime, HubStartError};
 // 1バイトも変えていない（`pub use`での再公開なので、このファイル内・
 // `bin/banto-hub.rs`からの`win_service::SERVICE_NAME`/`RUN_SERVICE_ARG`参照は
 // 変更不要）。
-use banto_hub_core::service_manager::{
-    record_first_stop, service_status_from_plan, stop_signal, stop_work_budget, ScmControlKind,
-    ServiceStatusPlan, ServiceStatusReporter, StopNotice, StopSignal, PRESHUTDOWN_TIMEOUT,
-};
 pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 
-// T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）:
-// `install`/`uninstall`の本体は`banto_hub_core::service_install`へ移設した
-// - 新設の UAC 昇格ヘルパー`banto-hub-elev.exe`（別バイナリターゲット）が
-// 同じ SCM 登録・登録解除ロジックを呼べるようにするため
-// （`service_install.rs`のモジュール doc 参照）。ここに残る`SERVICE_TYPE`は
-// `report_status`（このファイル下部）がまだ使うので削除していない -
-// `service_install.rs`側にも同じ値の複製が1つ増えている（そちら側の
-// モジュール doc 参照、値を変えるときは両方直すこと）。
-const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+/// ログ行と案内の先頭に付ける製品名。
+const LABEL: &str = "banto-hub";
 
-/// 2026-09-07 I4 実機検証で見つかったバグの修正で新設した
-/// `report_status(Stopped, ServiceExitCode::ServiceSpecific(_))`用の非0
-/// exit code。`sc query`の`ERROR CONTROL`や `Get-EventLog`から起動失敗の
-/// 種別を後から区別できるようにするための診断値（Win32 予約値との衝突は
-/// 無い - アプリ定義の小さい整数）。既存の`1`（tokio ランタイム構築失敗・
-/// 「Configured 収集開始失敗」の2箇所、[`run_service_body`]参照）は
-/// このバグ修正のスコープ外のため変更していない。
+/// SCM へ報告するサービス固有の終了コード（`Stopped`の
+/// `ServiceExitCode::ServiceSpecific(_)`）。`sc query`の
+/// `SERVICE_EXIT_CODE` や`Get-EventLog`から起動失敗の種別を後から区別
+/// できるようにするための診断値（Win32 予約値との衝突は無い - アプリ定義の
+/// 小さい整数）。
 ///
-/// - [`EXIT_CODE_PROFILE_LOCK_HELD`]:
+/// - [`EXIT_CODE_RUNTIME_OR_COLLECT_FAILED`]（1）: tokio ランタイムの構築
+///   失敗・「Configured 収集開始失敗」（2026-09-07 の I4 の修正より前から
+///   ある値）。本体の panic も、共有ランナーが同じ 1 で報告する
+///   （`banto_service_control::PANIC_EXIT_CODE`、#392 B3-1 のオーナー決定 D2）。
+/// - [`EXIT_CODE_PROFILE_LOCK_HELD`]（2、2026-09-07 I4 実機検証で新設）:
 ///   `HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { .. })` -
 ///   既にシェル/別サービスが同じ profile を保持している（Operator の
 ///   `sc start`操作ミス等、日常的に起こり得る - バグではない）。
-/// - [`EXIT_CODE_START_FAILED`]: 上記以外の`HubStartError`（DB open 失敗・
-///   ポート bind 失敗等）。
+/// - [`EXIT_CODE_START_FAILED`]（3、同）: 上記以外の`HubStartError`
+///   （DB open 失敗・ポート bind 失敗等）。
+const EXIT_CODE_RUNTIME_OR_COLLECT_FAILED: u32 = 1;
 const EXIT_CODE_PROFILE_LOCK_HELD: u32 = 2;
 const EXIT_CODE_START_FAILED: u32 = 3;
 
 /// [`HubStartError`]から、SCM へ報告する非0 exit code とサービスログへ
 /// 書く診断メッセージを組み立てる純関数（I/O・SCM 呼び出しを一切行わない
-/// ので単体テストできる - 2026-09-07 I4 実機検証で見つかったバグの修正、
-/// [`run_service_body`]のモジュール doc 参照）。
+/// ので単体テストできる - 2026-09-07 I4 実機検証で見つかったバグの修正）。
 ///
-/// **観測されたバグ**: `run_service_body`は以前、`HubRuntime::start`が
+/// **観測されたバグ**: サービス本体は以前、`HubRuntime::start`が
 /// 失敗した場合に`panic!`していた（旧 `hub_run::run`の`expect()`群と
 /// 「同等の異常終了」を意図した実装 - 実装指示 T14-1 §6）。しかし
 /// `HubStartError::ProfileLock(AlreadyHeld)`は「シェルが既に profile
 /// ロックを握っている状態で Operator が`sc start BantoHub`した」という
 /// 日常的に起こり得る操作であり、プログラミングバグではない。この`panic!`
-/// は`service_main`（このファイル）の`catch_unwind`に捕まるだけで、
-/// `report_status(ServiceState::Stopped, ...)`が一度も呼ばれないまま
-/// 処理が終わる - SCM は最後に報告された状態（`register`直後の暗黙の
-/// `START_PENDING`、checkpoint 0）を信じ続け、`sc query`が
+/// は`service_main`の`catch_unwind`に捕まるだけで、`Stopped`が一度も
+/// 報告されないまま処理が終わる - SCM は最後に報告された状態（`register`
+/// 直後の暗黙の`START_PENDING`、checkpoint 0）を信じ続け、`sc query`が
 /// `START_PENDING`のまま固まって見える（実機観察: `taskkill /F`でしか
 /// プロセスを止められなかった）。
 ///
-/// この関数はその`panic!`分岐の代わりに、[`run_service_body`]が
-/// `log_err_line`→`report_status(Stopped, ServiceSpecific(_))`→
-/// `return`という、隣の「Configured 収集開始失敗」分岐と同じ（既に
-/// 実機で動作実績のある）作法で失敗を報告できるようにする。
+/// この関数はその`panic!`分岐の代わりに、本体（[`HubProgram::run`]）が
+/// `log_err_line`→終了コードを返す（共有ランナーが`Stopped`を報告する）
+/// という、隣の「Configured 収集開始失敗」分岐と同じ作法で失敗を報告
+/// できるようにする（#392 B3-1 以降は、本体が panic しても共有ランナーが
+/// `Stopped`（`ServiceSpecific(1)`）を報告する）。
 fn describe_start_failure(err: &HubStartError) -> (u32, String) {
     if let HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { profile_id, owner }) = err {
         let owner_desc = owner
@@ -139,80 +142,6 @@ fn describe_start_failure(err: &HubStartError) -> (u32, String) {
         EXIT_CODE_START_FAILED,
         format!("banto-hub: 起動に失敗しました: {err}"),
     )
-}
-
-/// [`run_service_body`]の`report_status`が「一度`Stopped`を報告したら、
-/// それ以降の状態報告を SCM へ送らない」ようにするためのゲート
-/// （2026-09-07 I4 実機検証で見つかった「停止の二重報告」バグ、issue #330）。
-///
-/// **なぜ必要か（async ブロック内の`return`は関数を抜けない）**:
-/// [`run_service_body`]の起動失敗パスは`runtime.block_on(async move { .. })`
-/// に渡した async ブロックの中にあるため、そこでの`return`は
-/// **async ブロックから抜けるだけ**で`run_service_body`自体は続行し、
-/// 関数末尾の
-/// `log_line("..停止しました")` + `report_status(Stopped, Win32(0))`が必ず
-/// 実行されてしまう。つまり起動失敗時は`Stopped`が2回報告される。
-/// 実機ログにはその2回目が「サービス状態の報告に失敗しました:
-/// IO error in winapi call」として残っていた。
-///
-/// **なぜ終了コードの上書きが危険か**: 2回目の報告は
-/// `ServiceExitCode::Win32(0)`（= 正常終了）である。今のところ 1回目の
-/// `Stopped`で SCM 側のハンドルが無効化され、2回目の Win32 API 呼び出しが
-/// **失敗するおかげで**1回目のサービス固有終了コード
-/// （[`EXIT_CODE_PROFILE_LOCK_HELD`] / [`EXIT_CODE_START_FAILED`]）が
-/// SCM に残っているだけで、この「API が失敗してくれること」に依存した
-/// 状態になっている。もし 2回目が成功すれば、#327 で入れた
-/// 「起動失敗をサービス固有コードで SCM に伝える」設計が終了コード 0 で
-/// 上書きされて壊れる（`sc query`や`Get-EventLog`から失敗種別が読めなく
-/// なる）。API 呼び出しの失敗頼みをやめ、こちら側で明示的に止めるのが
-/// このゲートの目的。
-///
-/// SCM に一切触れない純粋なロジックなので単体テストできる
-/// （`windows-service`の`service_control_handler::register`等は実サービス
-/// プロセスのスレッドでしか呼べず単体テストできない - このファイルの
-/// モジュール doc 参照）。[`run_service_body`]の中だけで、単一スレッドから
-/// 使う想定なので[`Cell`]で足りる（`Arc<AtomicBool>`は不要）。
-#[derive(Default)]
-struct StoppedGate {
-    stopped_reported: Cell<bool>,
-}
-
-impl StoppedGate {
-    /// `current_state`の報告を SCM へ送ってよいかを判定する。送ってよい
-    /// 場合、それが`Stopped`なら「報告済み」として記録する（＝以降は
-    /// `Stopped`かどうかに関わらず`false`を返す）。
-    ///
-    /// 呼び出し側は`false`のとき **SCM 呼び出しもエラーログも行わずに**
-    /// 何もしないこと - 「二重報告が API エラーになった」という紛らわしい
-    /// ログを消すのも、このバグ修正の一部だから。
-    fn accept_report(&self, current_state: ServiceState) -> bool {
-        if self.stopped_reported.get() {
-            return false;
-        }
-        if current_state == ServiceState::Stopped {
-            self.stopped_reported.set(true);
-        }
-        true
-    }
-
-    /// 既に`Stopped`を報告済みか（読み取り専用、記録は変えない）。
-    /// [`run_service_body`]末尾の「Windows サービスを停止しました」ログを
-    /// 出すかどうかの判定に使う - 起動失敗で終わったのに「停止しました」と
-    /// 書かれるのは誤解を招く（実機ログで実際に紛らわしかった）。
-    fn has_reported_stopped(&self) -> bool {
-        self.stopped_reported.get()
-    }
-}
-
-/// `ServiceControl` を共有 crate の種別へ写す。
-fn scm_control_kind(control: &ServiceControl) -> ScmControlKind {
-    match control {
-        ServiceControl::Interrogate => ScmControlKind::Interrogate,
-        ServiceControl::Stop => ScmControlKind::Stop,
-        ServiceControl::Preshutdown => ScmControlKind::Preshutdown,
-        ServiceControl::Shutdown => ScmControlKind::Shutdown,
-        _ => ScmControlKind::Other,
-    }
 }
 
 /// 停止に入ったときのログ。通常の STOP と OS の PRESHUTDOWN を区別する。
@@ -242,7 +171,7 @@ fn hub_stop_done_line(signal: StopSignal) -> String {
 
 /// OS シャットダウンの作業予算を超えても停止が終わっていないときのログ。
 /// プロセスは止めない（収集の停止を abort しない）。SCM が
-/// [`PRESHUTDOWN_TIMEOUT`] でプロセスを終わらせうる、という警告。
+/// PRESHUTDOWN の待ち時間（30 秒）でプロセスを終わらせうる、という警告。
 fn hub_stop_overrun_line() -> &'static str {
     "banto-hub: warn: OS シャットダウンの予算内に最終 flush が終わりませんでした（SCM がプロセスを終了させる可能性があります）"
 }
@@ -253,31 +182,6 @@ fn hub_stop_overrun_line() -> &'static str {
 /// 30 秒の後に SCM が応答なしを報告できるように）。収集停止は打ち切らない
 /// ので、これを超えても停止そのものは続く。
 const HUB_EXPECTED_STOP: Duration = Duration::from_secs(60);
-
-/// 計画を SCM へ送る。失敗はログだけ（停止処理自体は続ける）。
-fn push_status(handle: &ServiceStatusHandle, plan: &ServiceStatusPlan, exit_code: ServiceExitCode) {
-    if let Err(err) =
-        handle.set_service_status(service_status_from_plan(plan, SERVICE_TYPE, exit_code))
-    {
-        log_err_line(&format!(
-            "banto-hub: サービス状態の報告に失敗しました: {err}"
-        ));
-    }
-}
-
-/// OS シャットダウンの作業予算を超えたら警告を 1 行書いてログをディスクへ出す。
-/// `finished` を送ると、予算内に終わったものとして警告を出さずに戻る。
-fn spawn_overrun_watch(deadline_in: Duration) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || match rx.recv_timeout(deadline_in) {
-        Err(RecvTimeoutError::Timeout) => {
-            log_err_line(hub_stop_overrun_line());
-            hub_log::sync_service_log();
-        }
-        Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
-    });
-    (tx, handle)
-}
 
 /// `bin/banto-hub.rs`の`install`サブコマンド用引数リテラル。
 pub const INSTALL_ARG: &str = "install";
@@ -301,253 +205,158 @@ pub fn uninstall() {
 }
 
 /// SCM がサービス開始時に呼ぶ内部エントリポイント（`run-service`
-/// サブコマンド）。人間が直接叩いても`service_dispatcher::start`が
-/// エラーを返すだけ（SCM 経由以外での呼び出しは想定されていない -
-/// `windows-service`クレート自体の制約）。
+/// サブコマンド）。本体は[`HubProgram`]で、共有ランナー
+/// （`banto_service_control::run_service`）に渡す。人間が直接叩いても
+/// ディスパッチャの起動がエラーを返すだけ（SCM 経由以外での呼び出しは
+/// 想定されていない - Windows の制約）で、製品共通の案内（#392 B3-1 の
+/// オーナー決定 D3）を標準エラー出力に出して終了コード 1。
 pub fn run_service_dispatcher() {
-    if let Err(err) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
-        eprintln!("banto-hub: service_dispatcher の起動に失敗しました: {err}");
-        eprintln!(
-            "banto-hub: 'run-service' は SCM がサービス開始時に呼ぶ内部エントリポイントです。手動実行はできません（`install`→`Start-Service`経由で起動してください）"
-        );
+    if let Err(err) = run_service(HubProgram) {
+        for line in dispatch_failure_lines(LABEL, &err) {
+            eprintln!("{line}");
+        }
         std::process::exit(1);
     }
 }
 
-define_windows_service!(ffi_service_main, service_main);
+/// Hub のサービス本体（共有ランナーに渡す、#392 B3-1）。SCM との
+/// やりとり（制御ハンドラ、Running → StopPending → Stopped の報告、
+/// panic）は共有ランナーが持ち、ここは起動・停止の中身と終了コードだけ。
+struct HubProgram;
 
-/// `windows-service`が生成する低レベル FFI エントリポイントから呼ばれる
-/// 高レベルの本体。ここで panic すると FFI 境界を越えてアンワインドし得る
-/// ため（Rust の `extern "system"` 境界を越えるアンワインドは望ましくない）、
-/// 実処理は[`run_service_body`]に切り出し、[`std::panic::catch_unwind`]で
-/// 包む。
-fn service_main(arguments: Vec<OsString>) {
-    if let Err(err) = std::panic::catch_unwind(|| run_service_body(arguments)) {
-        // ここまで来た時点でログファイルが開けているかどうかも分からない
-        // ため、確実に見える手段として stderr に直接書く（サービスとしては
-        // 誰にも見えないが、`hub_log`経由の書き込み自体が panic の原因に
-        // なっていた場合の保険）。
-        eprintln!("banto-hub: サービス本体が予期せず panic しました: {err:?}");
-    }
-}
-
-fn run_service_body(_arguments: Vec<OsString>) {
-    // ログファイル（このファイルのモジュール doc、`hub_log`のモジュール
-    // doc 参照）- `HubRuntime::start`（T14-1、`banto_hub_core::runtime`）が
-    // 最初の1行を出すより前に開いておく。
-    //
-    // T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）:
-    // `resolve_profile_paths_from_env`で profile の`logs_dir`（既定値）を
-    // 先に解決する - 下の`build_hub_config_from_env`と同じ env
-    // （`BANTO_HUB_ROOT`/`BANTO_HUB_PROFILE`）を読むので、同一プロセス内で
-    // 両者が食い違うことはない。
-    let log_dir = hub_log::resolve_service_log_dir(&resolve_profile_paths_from_env().logs_dir);
-    let log_path = log_dir.join(hub_log::SERVICE_LOG_FILE_NAME);
-    if let Err(err) = hub_log::enable_service_log_file(&log_path) {
-        eprintln!(
-            "banto-hub: サービスログファイル {} を開けませんでした: {err}",
-            log_path.display()
-        );
+impl ServiceProgram for HubProgram {
+    fn service_name(&self) -> &str {
+        SERVICE_NAME
     }
 
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let handler_notify = shutdown_notify.clone();
-    // 最初の STOP / PRESHUTDOWN だけを記録する。ハンドラはすぐ戻り、
-    // 最終 flush は下のランタイム側（`RunningHub::shutdown`）が行う。
-    let stop_notice: Arc<Mutex<Option<StopNotice>>> = Arc::new(Mutex::new(None));
-    let handler_notice = stop_notice.clone();
-    // SCM への状態報告（Running → StopPending と heartbeat → Stopped）は
-    // `ServiceStatusReporter` 1 つが同じロックの下で行う。ハンドラが停止を
-    // 始める前に停止処理が Stopped まで進んでも、Stopped の後には何も報告
-    // しない（#589 の再レビュー P2）。`register` の後にセットする。
-    let reporter_slot: Arc<OnceLock<ServiceStatusReporter<ServiceExitCode>>> =
-        Arc::new(OnceLock::new());
-    let handler_reporter = reporter_slot.clone();
-    let event_handler = move |control_event| -> ServiceControlHandlerResult {
-        match scm_control_kind(&control_event) {
-            ScmControlKind::Interrogate => ServiceControlHandlerResult::NoError,
-            // STOP も PRESHUTDOWN も同じ停止経路（最終 flush まで）。
-            // SHUTDOWN は PRESHUTDOWN と同時に受け付けないのでここには来ない。
-            kind => match stop_signal(kind) {
-                Some(signal) => {
-                    if record_first_stop(&handler_notice, signal) {
-                        if let Some(reporter) = handler_reporter.get() {
-                            reporter.begin_stop();
-                        }
-                        handler_notify.notify_one();
-                    }
-                    ServiceControlHandlerResult::NoError
-                }
-                None => ServiceControlHandlerResult::NotImplemented,
-            },
-        }
-    };
+    fn label(&self) -> &str {
+        LABEL
+    }
 
-    let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
-        Ok(handle) => handle,
-        Err(err) => {
-            log_err_line(&format!(
-                "banto-hub: サービスコントロールハンドラの登録に失敗しました: {err}"
-            ));
-            return;
+    /// ログファイル（このファイルのモジュール doc、`hub_log`のモジュール
+    /// doc 参照）- `HubRuntime::start`（T14-1、`banto_hub_core::runtime`）が
+    /// 最初の1行を出すより前、制御ハンドラの登録より前に開いておく。
+    ///
+    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）:
+    /// `resolve_profile_paths_from_env`で profile の`logs_dir`（既定値）を
+    /// 先に解決する - `run`の`build_hub_config_from_env`と同じ env
+    /// （`BANTO_HUB_ROOT`/`BANTO_HUB_PROFILE`）を読むので、同一プロセス内で
+    /// 両者が食い違うことはない。
+    fn open_log(&mut self) {
+        let log_dir = hub_log::resolve_service_log_dir(&resolve_profile_paths_from_env().logs_dir);
+        let log_path = log_dir.join(hub_log::SERVICE_LOG_FILE_NAME);
+        if let Err(err) = hub_log::enable_service_log_file(&log_path) {
+            eprintln!(
+                "banto-hub: サービスログファイル {} を開けませんでした: {err}",
+                log_path.display()
+            );
         }
-    };
-    let reporter = ServiceStatusReporter::new(
-        move |plan: &ServiceStatusPlan, exit_code: ServiceExitCode| {
-            push_status(&status_handle, plan, exit_code);
-        },
-        ServiceExitCode::Win32(0),
-    );
-    // Hub の停止（収集停止・tstore の flush・broker・HTTP）の見込み。
-    // heartbeat はこれを 5 秒の刻みで割った回数まで checkpoint を進める。
-    reporter.set_expected_stop(HUB_EXPECTED_STOP);
-    let _ = reporter_slot.set(reporter.clone());
+    }
 
-    // 起動失敗パスの`return`が async ブロックからしか抜けないせいで
-    // `Stopped`が2回報告される問題を止めるゲート（[`StoppedGate`]の doc に
-    // 「なぜ必要か」「なぜ終了コードの上書きが危険か」を書いた）。
-    let stopped_gate = StoppedGate::default();
-    let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
-        // 2回目以降（＝既に`Stopped`を報告済み）は SCM を呼ばずに黙って
-        // 戻る。SCM を呼ぶと最初に報告した非0終了コードを Win32(0) で
-        // 上書きしかねない上、実際には API エラーになって紛らわしい
-        // エラーログだけが残る（`reporter` も Stopped の後は報告しないが、
-        // `has_reported_stopped` の判断はこのゲートが持つ）。
-        if !stopped_gate.accept_report(current_state) {
-            return;
-        }
-        match current_state {
-            // 稼働中は STOP と PRESHUTDOWN。SHUTDOWN は相互排他なので付けない。
-            // 停止が始まった後は報告しない。
-            ServiceState::Running => {
-                reporter.report_running();
-            }
-            ServiceState::StopPending => {
-                reporter.begin_stop();
-            }
-            // 起動失敗の Stopped も、停止完了の Stopped も 1 回だけ。
-            _ => {
-                reporter.report_stopped(exit_code);
-            }
-        }
-    };
+    fn log_error(&self, line: &str) {
+        log_err_line(line);
+    }
 
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            log_err_line(&format!(
-                "banto-hub: tokio ランタイムの構築に失敗しました: {err}"
-            ));
-            report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
-            return;
-        }
-    };
+    fn run(&self, ctx: &ServiceContext) -> ServiceExit {
+        // Hub の停止（収集停止・tstore の flush・broker・HTTP）の見込み。
+        // heartbeat はこれを 5 秒の刻みで割った回数まで checkpoint を進める。
+        ctx.set_expected_stop(HUB_EXPECTED_STOP);
 
-    // env 読み取り（T14-1 でホスト側へ移設、T17-1 で3ホスト共通の
-    // `banto_hub_core::profile_paths::build_hub_config_from_env`へ一本化 -
-    // このファイルのモジュール doc 参照）は同期処理なので、ランタイムへ
-    // 入る前に済ませる。
-    let config = build_hub_config_from_env(HubHostKind::Service);
-    runtime.block_on(async move {
-        // 旧 `hub_run::run`はここで `expect("init_db should succeed")`等の
-        // 4箇所が panic していた（設計 §2「現行コード地図」）。T14-1 は
-        // `Result`化した際、いったんは「同等の異常終了」として明示的に
-        // `panic!`し直す実装にしていた（実装指示 T14-1 §6）が、2026-09-07
-        // I4 実機検証でこれがバグと判明した:
-        // `HubStartError::ProfileLock(AlreadyHeld)`（シェルが既に profile
-        // ロックを握っている状態で Operator が`sc start`する、日常的な
-        // 操作ミス）ですら`panic!`扱いになり、`catch_unwind`（このファイル
-        // 冒頭のモジュール doc 参照）に捕まるだけで
-        // `report_status(Stopped, ...)`が一度も呼ばれないため、SCM 側は
-        // `START_PENDING`のまま固まって見える（実機観察:
-        // `taskkill /F`でしかプロセスを止められなかった）。
-        // 直下の「Configured 収集開始失敗」分岐と同じ作法
-        // （`log_err_line`→`report_status(Stopped, ServiceSpecific(_))`→
-        // `return`）に統一する - [`describe_start_failure`]参照。
-        let hub = match HubRuntime::start(config).await {
-            Ok(hub) => hub,
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
             Err(err) => {
-                let (exit_code, message) = describe_start_failure(&err);
-                log_err_line(&message);
-                report_status(
-                    ServiceState::Stopped,
-                    ServiceExitCode::ServiceSpecific(exit_code),
-                );
-                return;
+                log_err_line(&format!(
+                    "banto-hub: tokio ランタイムの構築に失敗しました: {err}"
+                ));
+                return ServiceExit::Specific(EXIT_CODE_RUNTIME_OR_COLLECT_FAILED);
             }
         };
-        // 終了の受付（#392 A2 レビュー）の印を立てるのは、サービスのプロセスでは
-        // `RunningHub::shutdown` だけで、それはこの開始より後に呼ばれるため、
-        // ここで `Err` になる経路は今は無い。来ても「開始できなかった」ことに
-        // 変わりはないので、下の失敗と同じ作法で止める。
-        let start_status = match hub.controller().start(RunMode::Configured).await {
-            Ok(status) => status,
-            Err(refused) => {
+        // ランタイムは先に預け、Stopped の報告の後で落とす（移す前と同じ
+        // 順序）。`block_on` の中で panic しても、手元の参照がアンワインドで
+        // 落ちるだけで、ランタイム自体の drop は Stopped の後になる
+        // （`banto_service_control::ServiceContext::hold_until_stopped`）。
+        let runtime = ctx.hold_until_stopped(runtime);
+
+        // env 読み取り（T14-1 でホスト側へ移設、T17-1 で3ホスト共通の
+        // `banto_hub_core::profile_paths::build_hub_config_from_env`へ一本化 -
+        // このファイルのモジュール doc 参照）は同期処理なので、ランタイムへ
+        // 入る前に済ませる。
+        let config = build_hub_config_from_env(HubHostKind::Service);
+        let exit = runtime.block_on(async move {
+            // 起動に失敗したら panic せず、ログを書いて終了コードを返す
+            // （2026-09-07 I4 実機検証のバグの修正、[`describe_start_failure`]）。
+            // `Stopped`は共有ランナーが返した終了コードで 1 回だけ報告する
+            // （#392 B3-1 で`StoppedGate`（#330）は不要になった - 本体は
+            // 報告の口を持たない）。
+            let hub = match HubRuntime::start(config).await {
+                Ok(hub) => hub,
+                Err(err) => {
+                    let (exit_code, message) = describe_start_failure(&err);
+                    log_err_line(&message);
+                    return ServiceExit::Specific(exit_code);
+                }
+            };
+            // 終了の受付（#392 A2 レビュー）の印を立てるのは、サービスのプロセスでは
+            // `RunningHub::shutdown` だけで、それはこの開始より後に呼ばれるため、
+            // ここで `Err` になる経路は今は無い。来ても「開始できなかった」ことに
+            // 変わりはないので、下の失敗と同じ作法で止める。
+            let start_status = match hub.controller().start(RunMode::Configured).await {
+                Ok(status) => status,
+                Err(refused) => {
+                    log_err_line(&format!(
+                        "banto-hub: Configured 収集の開始に失敗しました: {refused}"
+                    ));
+                    hub.shutdown().await;
+                    return ServiceExit::Specific(EXIT_CODE_RUNTIME_OR_COLLECT_FAILED);
+                }
+            };
+            if start_status.state != CollectionState::Running {
                 log_err_line(&format!(
-                    "banto-hub: Configured 収集の開始に失敗しました: {refused}"
+                    "banto-hub: Configured 収集の開始に失敗しました: {:?}",
+                    start_status.last_error
                 ));
                 hub.shutdown().await;
-                report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
-                return;
+                return ServiceExit::Specific(EXIT_CODE_RUNTIME_OR_COLLECT_FAILED);
             }
-        };
-        if start_status.state != CollectionState::Running {
-            log_err_line(&format!(
-                "banto-hub: Configured 収集の開始に失敗しました: {:?}",
-                start_status.last_error
-            ));
-            hub.shutdown().await;
-            report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
-            return;
-        }
-        // 起動中に STOP / PRESHUTDOWN が来ていたら Running を報告しない
-        // （受理フラグを立てた瞬間に停止へ入る）。
-        let already_stopping = stop_notice
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some();
-        if !already_stopping {
-            report_status(ServiceState::Running, ServiceExitCode::Win32(0));
-            log_line("banto-hub: Windows サービスとして起動しました");
-            shutdown_notify.notified().await;
-        }
-        let notice = stop_notice
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unwrap_or(StopNotice {
-                signal: StopSignal::ServiceStop,
-                received_at: std::time::Instant::now(),
+            // 起動中に STOP / PRESHUTDOWN が来ていたら Running を報告しない
+            // （受理フラグを立てた瞬間に停止へ入る）。
+            if ctx.report_running() {
+                log_line("banto-hub: Windows サービスとして起動しました");
+            }
+            let notice = ctx.stopped().await;
+            log_line(&hub_stop_reason_line(notice.signal));
+            hub_log::sync_service_log();
+            // OS の PRESHUTDOWN の作業予算を超えたら警告を 1 行書いてログを
+            // ディスクへ出す（停止は打ち切らない）。
+            let overrun = notice.os_work_deadline().map(|deadline| {
+                OverrunWatch::spawn(deadline, || {
+                    log_err_line(hub_stop_overrun_line());
+                    hub_log::sync_service_log();
+                })
             });
-        log_line(&hub_stop_reason_line(notice.signal));
-        hub_log::sync_service_log();
-        let overrun = match notice.signal {
-            StopSignal::OsPreshutdown => {
-                let elapsed = notice.received_at.elapsed();
-                let remain = stop_work_budget(PRESHUTDOWN_TIMEOUT).saturating_sub(elapsed);
-                Some(spawn_overrun_watch(remain))
+            // 通常の STOP も OS の PRESHUTDOWN も、収集の停止は打ち切らない
+            // （tstore の最終 flush を abort しない）。OS 側の上限は SCM の
+            // PRESHUTDOWN 待ち時間で、超えたら上の見張りが警告を残す。
+            hub.shutdown().await;
+            // `finish` は見張りのスレッドの終わりを同期で待つが、待つのは
+            // 「合図を受けて抜けるまで」（または警告の 1 行とログの書き出し）
+            // だけで短い。停止の最後の段で、このランタイムで他に進める
+            // タスクも無いので、ワーカーを少し止めても構わない。
+            if let Some(watch) = overrun {
+                watch.finish();
             }
-            StopSignal::ServiceStop => None,
-        };
-        // 通常の STOP も OS の PRESHUTDOWN も、収集の停止は打ち切らない
-        // （tstore の最終 flush を abort しない）。OS 側の上限は SCM の
-        // PRESHUTDOWN 待ち時間で、超えたら上の見張りが警告を残す。
-        hub.shutdown().await;
-        if let Some((tx, handle)) = overrun {
-            let _ = tx.send(());
-            let _ = handle.join();
-        }
-        log_line(&hub_stop_done_line(notice.signal));
-        hub_log::sync_service_log();
-    });
+            log_line(&hub_stop_done_line(notice.signal));
+            hub_log::sync_service_log();
+            ServiceExit::Success
+        });
 
-    // 起動失敗パス（async ブロック内で`Stopped`を報告済み）でここへ落ちて
-    // きた場合は「停止しました」を出さない - 起動できていないのだから
-    // 誤解を招く。`report_status`側もゲートが弾くので、SCM への二重報告
-    // （非0終了コードの Win32(0) 上書き）も起きない。
-    if !stopped_gate.has_reported_stopped() {
-        log_line("banto-hub: Windows サービスを停止しました");
+        // 起動失敗で終わった場合は「停止しました」を出さない - 起動できて
+        // いないのだから誤解を招く。
+        if exit == ServiceExit::Success {
+            log_line("banto-hub: Windows サービスを停止しました");
+        }
+        exit
     }
-    report_status(ServiceState::Stopped, ServiceExitCode::Win32(0));
 }
 
 #[cfg(test)]
@@ -602,45 +411,6 @@ mod tests {
         );
     }
 
-    /// issue #330 の回帰テスト（起動失敗パス）: `Stopped`を一度報告したら、
-    /// 次の`Stopped`報告は拒否される。これが`run_service_body`の
-    /// 「async ブロック内の`return`が関数を抜けない」ことによる二重報告を
-    /// 止めている本体で、拒否しないと関数末尾の
-    /// `ServiceExitCode::Win32(0)`が 1回目のサービス固有終了コードを
-    /// 上書きし得る。
-    #[test]
-    fn stopped_gate_rejects_second_stopped_report() {
-        let gate = StoppedGate::default();
-
-        assert!(gate.accept_report(ServiceState::Stopped));
-        assert!(!gate.accept_report(ServiceState::Stopped));
-    }
-
-    /// issue #330: `Stopped`報告後は`Stopped`以外（`Running`等）の報告も
-    /// 拒否する - 一度 SCM へ停止を伝えたハンドルへの追加報告は、
-    /// 状態種別に関わらず行わない。
-    #[test]
-    fn stopped_gate_rejects_any_report_after_stopped() {
-        let gate = StoppedGate::default();
-
-        assert!(gate.accept_report(ServiceState::Stopped));
-        assert!(!gate.accept_report(ServiceState::Running));
-        assert!(!gate.accept_report(ServiceState::StopPending));
-    }
-
-    /// 停止処理の途中の `StopPending` ではゲートを閉じない。閉じるのは
-    /// `Stopped` を報告したあとだけ（#589 の StopPending → Stopped）。
-    #[test]
-    fn stopped_gate_allows_stop_pending_before_stopped() {
-        let gate = StoppedGate::default();
-
-        assert!(gate.accept_report(ServiceState::Running));
-        assert!(gate.accept_report(ServiceState::StopPending));
-        assert!(!gate.has_reported_stopped());
-        assert!(gate.accept_report(ServiceState::Stopped));
-        assert!(gate.has_reported_stopped());
-    }
-
     /// 通常の STOP と OS の PRESHUTDOWN をログで区別する（実機確認の目印）。
     #[test]
     fn hub_stop_lines_distinguish_scm_stop_from_os_preshutdown() {
@@ -658,38 +428,8 @@ mod tests {
         assert!(overrun.contains("予算"), "{overrun}");
     }
 
-    /// 正常系（`Running`報告 → 停止時に`Stopped`報告）が従来どおり通ることを
-    /// 固定する - ゲートは`Stopped`を通した後だけ閉じる。
-    #[test]
-    fn stopped_gate_allows_running_then_stopped() {
-        let gate = StoppedGate::default();
-
-        assert!(gate.accept_report(ServiceState::Running));
-        assert!(gate.accept_report(ServiceState::Stopped));
-    }
-
-    /// `has_reported_stopped`（末尾の「停止しました」ログを出すかの判定に
-    /// 使う読み取り専用メソッド）が期待どおりの値を返し、かつ問い合わせ
-    /// 自体はゲートの状態を変えないことを固定する。
-    #[test]
-    fn stopped_gate_reports_whether_stopped_was_already_reported() {
-        let gate = StoppedGate::default();
-        assert!(!gate.has_reported_stopped());
-
-        assert!(gate.accept_report(ServiceState::Running));
-        assert!(
-            !gate.has_reported_stopped(),
-            "Running の報告だけではゲートは閉じない"
-        );
-
-        assert!(gate.accept_report(ServiceState::Stopped));
-        assert!(gate.has_reported_stopped());
-        // 読み取り専用であることの確認（問い合わせ後も値は変わらない）。
-        assert!(gate.has_reported_stopped());
-    }
-
     /// 2026-09-07 I4 実機検証で見つかったバグの回帰テスト:
-    /// `run_service_body`が呼ぶのと同じ`HubRuntime::start`を、シェルが
+    /// `HubProgram::run`が呼ぶのと同じ`HubRuntime::start`を、シェルが
     /// 既に profile ロックを保持している状態で叩くと、`START_PENDING`の
     /// まま固まらず即座（5秒未満）に`HubStartError::ProfileLock(AlreadyHeld)`
     /// で返ることを確認する - `windows-service`クレートの SCM 連携

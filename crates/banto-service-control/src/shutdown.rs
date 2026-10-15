@@ -82,6 +82,21 @@ pub struct StopNotice {
     pub received_at: Instant,
 }
 
+impl StopNotice {
+    /// OS の PRESHUTDOWN のとき、停止処理の本体を終えるべき時刻
+    /// （`received_at` + [`stop_work_budget`]（[`PRESHUTDOWN_TIMEOUT`]））。
+    /// 運用者の STOP は全体を打ち切らないので `None`（#392 B3-1 で、Hub の
+    /// 予算超過の見張りと sink の打ち切りの期限の計算をここへ寄せた）。
+    pub fn os_work_deadline(&self) -> Option<Instant> {
+        match self.signal {
+            StopSignal::ServiceStop => None,
+            StopSignal::OsPreshutdown => {
+                Some(self.received_at + stop_work_budget(PRESHUTDOWN_TIMEOUT))
+            }
+        }
+    }
+}
+
 /// 最初の停止合図だけを `slot` に記録する。2 回目以降は `false` で、
 /// 中身は変えない（STOP の後に別の制御が来ても、先に始めた停止を
 /// やり直さない）。
@@ -105,7 +120,7 @@ pub enum ServicePhase {
     Running,
     /// 停止処理の途中。制御は受け付けない。
     StopPending,
-    /// 停止済み。これ以降の報告は製品側のゲートが落とす。
+    /// 停止済み。これ以降の報告は [`ServiceStatusReporter`] が落とす。
     Stopped,
 }
 
@@ -653,7 +668,27 @@ mod tests {
         assert!(reporter.begin_stop());
         assert!(!reporter.begin_stop(), "2 回目の停止は報告しない");
         assert!(!reporter.report_running(), "停止の後に Running を出さない");
-        std::thread::sleep(Duration::from_millis(200));
+        // 時間を決め打ちせず、checkpoint 4（上限）が報告されるまで待つ。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(plan, _)| plan.phase == ServicePhase::StopPending && plan.checkpoint == 4)
+        {
+            assert!(Instant::now() < deadline, "checkpoint 4 まで進まない");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // 上限に達した heartbeat のスレッドは、止める合図を待たずに自分で
+        // 終わる（それ以上刻まない）。終わったのを確かめてから数える。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock(&reporter.shared.heartbeat)
+            .as_ref()
+            .is_some_and(|heartbeat| heartbeat.thread.is_finished())
+        {
+            assert!(Instant::now() < deadline, "上限で heartbeat が終わらない");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let pending: Vec<u32> = seen
             .lock()
             .unwrap()
@@ -667,7 +702,8 @@ mod tests {
         assert!(!reporter.report_stopped(0), "Stopped は 1 回だけ");
         assert!(!reporter.begin_stop());
         assert!(!reporter.report_running());
-        std::thread::sleep(Duration::from_millis(50));
+        // `report_stopped` は heartbeat のスレッドの終わりを待ってから戻るので、
+        // ここで待つ必要は無い。
         let seen = seen.lock().unwrap();
         let (last, exit) = seen.last().copied().unwrap();
         assert_eq!(last.phase, ServicePhase::Stopped);
@@ -696,7 +732,14 @@ mod tests {
             // Stopped の報告がロックを取って状態を変えたのと同じ形。
             state.phase = ReporterPhase::Stopped;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // heartbeat のスレッドの終わりを待ってから確かめる。止める合図は
+        // 送らない（送り手も手元に持ったまま）ので、スレッドが終わるのは
+        // ロックを取って Stopped を見たときだけ。
+        let HeartbeatThread { stop_tx, thread } = lock(&reporter.shared.heartbeat)
+            .take()
+            .expect("heartbeat が始まっている");
+        thread.join().expect("heartbeat が panic しない");
+        drop(stop_tx);
         let phases: Vec<ServicePhase> = seen.lock().unwrap().iter().map(|(p, _)| p.phase).collect();
         assert_eq!(
             phases,

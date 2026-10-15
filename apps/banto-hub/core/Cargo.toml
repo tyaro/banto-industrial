@@ -198,25 +198,15 @@ path = "src/bin/banto-hub.rs"
 name = "banto-hub-elev"
 path = "src/bin/banto-hub-elev.rs"
 
-# T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）:
-# banto-hub を Windows サービスとして常駐実行するための SCM 連携
-# （service_manager でのインストール/アンインストール・
-# service_dispatcher/service_control_handler での起動・停止制御）。
-# banto-hub は Windows 専用前提（tstore と同じ）だが、このワークスペース
-# 自体は `cargo check --workspace --all-targets` を他プラットフォーム
-# （CI）でも通す必要があるため、`[target]` セクションで Windows 限定の
-# 依存にする - Linux 上ではこの依存自体が存在しないので、これを使う
-# コード側は必ず `#[cfg(windows)]` で追加ガードすること
-# （`src/bin/win_service.rs` 参照）。
-#
-# T17-0（docs/banto-hub-t17-design.md §3「T17-0」）でこのパッケージの lib
-# クレート（`src/service_manager.rs`の`WindowsServiceManager`、B2-3 で共有
-# crate `banto-service-control` へ移動。そちらにも同じ依存がある）もこの依存を
-# 使うようになった - このセクションは `[[bin]]`/lib 共通（Cargo.toml は
-# ターゲット別に依存を分けられないため）なので新規セクションは追加せず、
-# ここに1本化してある。
+# T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）の
+# Windows サービス化で使っていた `windows-service` クレートは、#392 B3-1 で
+# 直接の依存から外した: SCM の状態操作（B2-3）・サービス本体のランナーと
+# 登録・解除（B3-1）はすべて共有 crate `banto-service-control`（上の依存）が
+# 持つ。banto-hub は Windows 専用前提（tstore と同じ）だが、このワーク
+# スペース自体は `cargo check --workspace --all-targets` を他プラット
+# フォーム（CI）でも通す必要があるため、以下の Windows 限定の依存を使う
+# コード側は必ず `#[cfg(windows)]` で追加ガードすること。
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.8.1"
 # T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: `profile_lock.rs`が
 # `Global\BantoHub.<profile-id>`named mutex（`CreateMutexW`/`CloseHandle`/
 # `GetLastError`/`ERROR_ALREADY_EXISTS`）で Desktop/Service 間の排他を取る。

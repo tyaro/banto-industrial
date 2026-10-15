@@ -36,7 +36,7 @@ static SERVICE_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
 /// `path` を作成（既存なら追記）で開き、以降 [`log_line`]/[`log_err_line`]
 /// が呼ばれるたびにタイムスタンプ付きの1行を追記する状態にする。
-/// `win_service::run_service_body` が `HubRuntime::start`（T14-1、
+/// `win_service::HubProgram`（`open_log`）が `HubRuntime::start`（T14-1、
 /// `crate::runtime`）を呼ぶ**前**に一度だけ呼ぶ - コンソールモードは一度も
 /// 呼ばない。
 ///
@@ -206,7 +206,7 @@ mod tests {
     // な `OnceLock`に書き込む - 一度 Some になった後は同じテストバイナリ内の
     // 以後すべての `log_line`/`log_err_line`呼び出しがこのファイルへも
     // ミラーされ続ける（`OnceLock`は取り消せない）。本番では
-    // `win_service::run_service_body`がプロセス起動ごとに高々1回だけ呼ぶので
+    // `win_service::HubProgram::open_log`がプロセス起動ごとに高々1回だけ呼ぶので
     // 問題にならないが、テストでは他のテストとの意図しない相互作用を避ける
     // ため、このテストケース1つだけに留める（他のテストで `log_line`の
     // ファイルミラー有無をアサートしない）。ディレクトリは削除しない -

@@ -33,7 +33,7 @@
 //! （手動開始）へ変更した（docs/banto-hub-t17-design.md §1「P4」・
 //! §11「T17-4 実装メモ」参照）。目的は「OS 再起動だけで収集が始まる」
 //! ことの防止 - サービスが実際に開始したときにサービス本体
-//! （`win_service.rs::run_service_body`）が即座に `Configured` 収集を
+//! （`win_service.rs::HubProgram`）が即座に `Configured` 収集を
 //! 開始する既存挙動自体は変えていない。`OnDemand` には遅延自動開始の
 //! 概念が存在しない（`set_delayed_auto_start`は`AutoStart`にのみ意味を
 //! 持つ Windows API 仕様）ため、`OnDemand`確定後は同呼び出しを行わない。
@@ -57,43 +57,41 @@
 //! ではなく同じディレクトリの `banto-hub.exe` を登録対象にする必要がある
 //! ため、明示的にパスを渡せるようにした。
 //!
-//! `SERVICE_DISPLAY_NAME`/`SERVICE_TYPE` は `win_service.rs` のトップレベル
-//! 定数、`service_manager.rs` の `windows_impl::SERVICE_DISPLAY_NAME`/
-//! `SERVICE_TYPE`（`set_auto_start`の再登録用）と同じ値を持つ - 既に
-//! `service_manager.rs`のモジュール doc が「両ファイルを同時に直すこと」と
-//! 明記している2箇所複製に、このファイルで3箇所目が増える。値を変える
-//! ときは3箇所とも直すこと。
+//! ## #392 B3-1（2026-10-15）: 手順を共有 crate へ
+//!
+//! SCM の手順（接続・既に登録済みの判定・`ServiceInfo`・説明文・PRESHUTDOWN・
+//! 停止してから削除）は共有 crate `banto-service-control` の
+//! `install_service`/`uninstall_service` へ移した（banto-hub-sink と同じ手順を
+//! 使う）。このファイルに残るのは、結果を利用者に出す文言
+//! （`install_lines`/`uninstall_lines`）と終了コードだけで、どちらも移す前と
+//! 同じ（文言・出力先・順序は golden テスト、失敗は終了コード 1 -
+//! `banto-hub-elev service-install` とインストーラのフックが見る）。
+//!
+//! 登録内容（名前・表示名・説明文・起動引数・手動開始・PRESHUTDOWN）は
+//! [`crate::service_manager::hub_service_spec`] の 1 か所に寄せた（それまでは
+//! 表示名などがこのファイル・`win_service.rs`・`service_manager.rs` の
+//! 3 か所に複製されていた）。`WindowsServiceManager` の`set_auto_start`の
+//! 再登録も同じ spec から作る（`service_manager::hub_service_manager`）。
+//!
+//! 唯一の差は、自分の実行ファイルのパスを SCM への接続より先に求めるように
+//! なったこと（`std::env::current_exe()` の失敗と SCM への接続の失敗が
+//! 同時に起きたときだけ、先に出る文言が変わる。実際には起きない組み合わせ）。
 
-#[cfg(windows)]
-use std::ffi::OsString;
-#[cfg(windows)]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-#[cfg(windows)]
-use windows_service::service::{
-    ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
+use banto_service_control::{
+    preshutdown_console_line, ConsoleLine, InstallError, InstallKind, InstallOutcome, StopAttempt,
+    UninstallError, UninstallOutcome,
 };
-#[cfg(windows)]
-use windows_service::service_manager::{ServiceManager as WinScm, ServiceManagerAccess};
 
-#[cfg(windows)]
-use crate::service_manager::{
-    ensure_preshutdown_timeout, preshutdown_report, PreshutdownReport, PRESHUTDOWN_TIMEOUT,
-    RUN_SERVICE_ARG, SERVICE_NAME,
-};
+use crate::service_manager::{SERVICE_DISPLAY_NAME, SERVICE_NAME};
 
-/// `win_service.rs`のモジュール doc「サービス名・表示名・起動種別」参照。
-#[cfg(windows)]
-const SERVICE_DISPLAY_NAME: &str = "banto-hub タグサーバー";
-#[cfg(windows)]
-const SERVICE_DESCRIPTION: &str =
-    "banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/tag-server-design.md 参照。";
-#[cfg(windows)]
-const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+/// 文言の先頭に付ける製品名。
+const LABEL: &str = "banto-hub";
 
 /// Windows サービスとして登録する（管理者権限が必要 - 失敗時はその旨を
 /// 案内して終了する）。登録するバイナリパスには`RUN_SERVICE_ARG`を起動
-/// 引数として含める。
+/// 引数として含める（[`crate::service_manager::hub_service_spec`]）。
 ///
 /// `exe_path_override`: `None`なら`std::env::current_exe()`で自分自身を
 /// 登録対象にする（`banto-hub.exe install`の従来どおりの挙動）。`Some`が
@@ -112,148 +110,43 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 /// `sc.exe config`を使うこと（docs/banto-hub-operations.md に手順を記載）。
 ///
 /// 例外は OS シャットダウンの待ち時間（#589）。新規作成でも既設でも
-/// [`apply_preshutdown_timeout`] が `SERVICE_CONFIG_PRESHUTDOWN_INFO` だけを
-/// 希望値に揃え、読み戻す。起動している旧バイナリは再起動するまで
-/// PRESHUTDOWN を受けない。
+/// `SERVICE_CONFIG_PRESHUTDOWN_INFO` だけを希望値に揃え、読み戻す。揃え
+/// られなくても install は失敗にしない（警告 1 行を標準エラー出力へ。
+/// `service-install` はこの後に Operators・ACL の付与を続ける）。起動している
+/// 旧バイナリは再起動するまで PRESHUTDOWN を受けない。
 ///
 /// 失敗時は`eprintln!`で案内した上で`std::process::exit(1)`する（CLI ツール
 /// としての既存挙動そのまま - モジュール doc「挙動は一切変えていない」）。
 #[cfg(windows)]
 pub fn install(exe_path_override: Option<&Path>) {
-    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
-    let service_manager = match WinScm::local_computer(None::<&str>, manager_access) {
-        Ok(manager) => manager,
-        Err(err) => fail(&format!(
-            "banto-hub: Service Control Manager への接続に失敗しました: {err}"
-        )),
-    };
+    use banto_service_control::{install_service, print_console_lines};
 
-    // アップグレード時に既存の起動種別を上書きしないため（T17-4、design
-    // §5）、既に登録済みなら作り直さず早期リターンする。
-    if service_manager
-        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
-        .is_ok()
-    {
-        println!(
-            "banto-hub: Windows サービス '{SERVICE_NAME}' は既に登録されています（起動種別・実行ファイル・ACL は変更していません）"
-        );
-        println!(
-            "banto-hub:   起動種別を変える場合は管理 UI、または `sc.exe config {SERVICE_NAME} start=demand|auto` を使ってください"
-        );
-        apply_preshutdown_timeout();
-        return;
-    }
-
-    let exe_path: PathBuf = match exe_path_override {
+    let exe_path = match exe_path_override {
         Some(path) => path.to_path_buf(),
         None => match std::env::current_exe() {
             Ok(path) => path,
             Err(err) => fail(&format!(
-                "banto-hub: 自身の実行ファイルパスの取得に失敗しました: {err}"
+                "{LABEL}: 自身の実行ファイルパスの取得に失敗しました: {err}"
             )),
         },
     };
-
-    let service_info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
-        display_name: OsString::from(SERVICE_DISPLAY_NAME),
-        service_type: SERVICE_TYPE,
-        // T17-4（P4「Demand 化」、このファイルのモジュール doc参照）:
-        // 新規インストールの既定を手動開始にし、OS 再起動だけでは収集が
-        // 始まらないようにする。自動起動は管理 UI 等の明示操作でのみ
-        // 有効化する（`service_manager::WindowsServiceManager::
-        // set_auto_start(true)`が`AutoStart`+遅延自動開始を組み立てる）。
-        start_type: ServiceStartType::OnDemand,
-        error_control: ServiceErrorControl::Normal,
-        executable_path: exe_path.clone(),
-        launch_arguments: vec![OsString::from(RUN_SERVICE_ARG)],
-        dependencies: vec![],
-        // LocalSystem として実行（`win_service.rs`のモジュール doc参照）。
-        account_name: None,
-        account_password: None,
-    };
-
-    let service = match service_manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
-    {
-        Ok(service) => service,
-        Err(err) => fail(&format!("banto-hub: サービスの登録に失敗しました: {err}")),
-    };
-
-    if let Err(err) = service.set_description(SERVICE_DESCRIPTION) {
-        eprintln!("banto-hub: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}");
+    let result = install_service(&crate::service_manager::hub_service_spec(exe_path.clone()));
+    print_console_lines(&install_lines(&exe_path, &result));
+    if result.is_err() {
+        std::process::exit(1);
     }
-    apply_preshutdown_timeout();
-    // OnDemand には遅延自動開始の概念が無い（Windows API 仕様 -
-    // `set_delayed_auto_start`は`AutoStart`にのみ意味を持つ）ため、
-    // T17-4 以降は呼び出さない。
-
-    println!("banto-hub: Windows サービス '{SERVICE_NAME}' を登録しました");
-    println!("banto-hub:   表示名: {SERVICE_DISPLAY_NAME}");
-    println!("banto-hub:   実行ファイル: {}", exe_path.display());
-    println!("banto-hub:   起動種別: 手動（Demand） - OS 再起動だけでは開始しません");
-    println!(
-        "banto-hub: `Start-Service {SERVICE_NAME}` または管理 UI から明示的に開始してください"
-    );
-    println!(
-        "banto-hub: （OS 起動時に自動開始させたい場合は管理 UI の自動起動設定を有効にしてください）"
-    );
 }
 
 /// サービス登録を解除する（管理者権限が必要）。実行中なら先に停止する。
+/// 失敗したら終了コード 1。
 #[cfg(windows)]
 pub fn uninstall() {
-    let manager_access = ServiceManagerAccess::CONNECT;
-    let service_manager = match WinScm::local_computer(None::<&str>, manager_access) {
-        Ok(manager) => manager,
-        Err(err) => fail(&format!(
-            "banto-hub: Service Control Manager への接続に失敗しました: {err}"
-        )),
-    };
+    use banto_service_control::{print_console_lines, uninstall_service};
 
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = match service_manager.open_service(SERVICE_NAME, service_access) {
-        Ok(service) => service,
-        Err(err) => fail(&format!(
-            "banto-hub: サービス '{SERVICE_NAME}' が見つかりません（既に未登録の可能性）: {err}"
-        )),
-    };
-
-    match service.query_status() {
-        Ok(status) if status.current_state != ServiceState::Stopped => {
-            if let Err(err) = service.stop() {
-                eprintln!("banto-hub: サービスの停止に失敗しました: {err}");
-            } else {
-                println!("banto-hub: サービスを停止しました");
-            }
-        }
-        Ok(_) => {}
-        Err(err) => eprintln!("banto-hub: サービス状態の取得に失敗しました: {err}"),
-    }
-
-    if let Err(err) = service.delete() {
-        fail(&format!("banto-hub: サービスの削除に失敗しました: {err}"));
-    }
-
-    println!("banto-hub: Windows サービス '{SERVICE_NAME}' の登録を解除しました");
-    println!(
-        "banto-hub: （このプロセスのハンドルが閉じるまで完全な削除が遅延することがあります - Windows API の仕様）"
-    );
-}
-
-/// PRESHUTDOWN の待ち時間を希望値に揃える。起動種別と ACL は変えない。
-/// 失敗しても install は失敗にしない（警告 1 行を標準エラー出力へ。実際の
-/// 待ち時間は未確認のまま。新規登録の直後に「登録済みなのに失敗」にしない・
-/// インストーラが毎回呼ぶ既存登録の経路でアップグレードを止めないため）。
-#[cfg(windows)]
-fn apply_preshutdown_timeout() {
-    // 失敗しても install は止めない（警告 1 行、終了コード 0）。
-    // `service-install` はこの後に Operators・ACL の付与を続ける。
-    match preshutdown_report(&ensure_preshutdown_timeout(
-        SERVICE_NAME,
-        PRESHUTDOWN_TIMEOUT,
-    )) {
-        PreshutdownReport::Applied(line) => println!("banto-hub: {line}"),
-        PreshutdownReport::Warning(line) => eprintln!("banto-hub: warn: {line}"),
+    let result = uninstall_service(SERVICE_NAME);
+    print_console_lines(&uninstall_lines(&result));
+    if result.is_err() {
+        std::process::exit(1);
     }
 }
 
@@ -261,4 +154,258 @@ fn apply_preshutdown_timeout() {
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
+}
+
+/// `install` の結果を利用者に出す行にする（移す前の文言そのまま）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn install_lines(
+    exe_path: &Path,
+    result: &Result<InstallOutcome, InstallError>,
+) -> Vec<ConsoleLine> {
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(InstallError::Connect(err)) => {
+            return vec![ConsoleLine::Stderr(format!(
+                "{LABEL}: Service Control Manager への接続に失敗しました: {err}"
+            ))];
+        }
+        Err(InstallError::Create(err)) => {
+            return vec![ConsoleLine::Stderr(format!(
+                "{LABEL}: サービスの登録に失敗しました: {err}"
+            ))];
+        }
+    };
+    let mut lines = Vec::new();
+    match outcome.kind {
+        // アップグレード時に既存の起動種別を上書きしないため（T17-4、design
+        // §5）、既に登録済みなら作り直していない。
+        InstallKind::AlreadyRegistered => {
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}: Windows サービス '{SERVICE_NAME}' は既に登録されています（起動種別・実行ファイル・ACL は変更していません）"
+            )));
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}:   起動種別を変える場合は管理 UI、または `sc.exe config {SERVICE_NAME} start=demand|auto` を使ってください"
+            )));
+            lines.push(preshutdown_console_line(LABEL, &outcome.preshutdown));
+        }
+        InstallKind::Created => {
+            if let Some(err) = &outcome.description_error {
+                lines.push(ConsoleLine::Stderr(format!(
+                    "{LABEL}: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}"
+                )));
+            }
+            lines.push(preshutdown_console_line(LABEL, &outcome.preshutdown));
+            // OnDemand には遅延自動開始の概念が無い（Windows API 仕様 -
+            // `set_delayed_auto_start`は`AutoStart`にのみ意味を持つ）ため、
+            // T17-4 以降は呼び出さない。
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}: Windows サービス '{SERVICE_NAME}' を登録しました"
+            )));
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}:   表示名: {SERVICE_DISPLAY_NAME}"
+            )));
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}:   実行ファイル: {}",
+                exe_path.display()
+            )));
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}:   起動種別: 手動（Demand） - OS 再起動だけでは開始しません"
+            )));
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}: `Start-Service {SERVICE_NAME}` または管理 UI から明示的に開始してください"
+            )));
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}: （OS 起動時に自動開始させたい場合は管理 UI の自動起動設定を有効にしてください）"
+            )));
+        }
+    }
+    lines
+}
+
+/// `uninstall` の結果を利用者に出す行にする（移す前の文言そのまま）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn uninstall_lines(result: &Result<UninstallOutcome, UninstallError>) -> Vec<ConsoleLine> {
+    let stop_line = |stop: &StopAttempt| match stop {
+        StopAttempt::NotRunning => None,
+        StopAttempt::StopRequested => Some(ConsoleLine::Stdout(format!(
+            "{LABEL}: サービスを停止しました"
+        ))),
+        StopAttempt::StopFailed(err) => Some(ConsoleLine::Stderr(format!(
+            "{LABEL}: サービスの停止に失敗しました: {err}"
+        ))),
+        StopAttempt::QueryFailed(err) => Some(ConsoleLine::Stderr(format!(
+            "{LABEL}: サービス状態の取得に失敗しました: {err}"
+        ))),
+    };
+    match result {
+        Ok(outcome) => {
+            let mut lines: Vec<ConsoleLine> = stop_line(&outcome.stop).into_iter().collect();
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}: Windows サービス '{SERVICE_NAME}' の登録を解除しました"
+            )));
+            lines.push(ConsoleLine::Stdout(format!(
+                "{LABEL}: （このプロセスのハンドルが閉じるまで完全な削除が遅延することがあります - Windows API の仕様）"
+            )));
+            lines
+        }
+        Err(UninstallError::Connect(err)) => vec![ConsoleLine::Stderr(format!(
+            "{LABEL}: Service Control Manager への接続に失敗しました: {err}"
+        ))],
+        Err(UninstallError::Open(err)) => vec![ConsoleLine::Stderr(format!(
+            "{LABEL}: サービス '{SERVICE_NAME}' が見つかりません（既に未登録の可能性）: {err}"
+        ))],
+        Err(UninstallError::Delete { stop, error }) => {
+            let mut lines: Vec<ConsoleLine> = stop_line(stop).into_iter().collect();
+            lines.push(ConsoleLine::Stderr(format!(
+                "{LABEL}: サービスの削除に失敗しました: {error}"
+            )));
+            lines
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! install / uninstall の文言の golden（#392 B3-1）。期待値は共有 crate へ
+    //! 移す前の`install`/`uninstall`/`fail`が`println!`/`eprintln!`していた
+    //! 文字列をそのまま書き写したもの。順序（標準出力と標準エラー出力の
+    //! 並び）も移す前と同じ。
+
+    use super::*;
+    use banto_service_control::PreshutdownReport;
+    use std::path::PathBuf;
+
+    fn out(text: &str) -> ConsoleLine {
+        ConsoleLine::Stdout(text.to_string())
+    }
+
+    fn err(text: &str) -> ConsoleLine {
+        ConsoleLine::Stderr(text.to_string())
+    }
+
+    fn exe() -> PathBuf {
+        PathBuf::from(r"C:\Program Files\BantoHub\banto-hub.exe")
+    }
+
+    #[test]
+    fn install_golden_already_registered() {
+        let result = Ok(InstallOutcome {
+            kind: InstallKind::AlreadyRegistered,
+            description_error: None,
+            preshutdown: PreshutdownReport::Warning("PRESHUTDOWN の警告".to_string()),
+        });
+        assert_eq!(
+            install_lines(&exe(), &result),
+            vec![
+                out("banto-hub: Windows サービス 'BantoHub' は既に登録されています（起動種別・実行ファイル・ACL は変更していません）"),
+                out("banto-hub:   起動種別を変える場合は管理 UI、または `sc.exe config BantoHub start=demand|auto` を使ってください"),
+                err("banto-hub: warn: PRESHUTDOWN の警告"),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_golden_created() {
+        let result = Ok(InstallOutcome {
+            kind: InstallKind::Created,
+            description_error: Some("os error 5".to_string()),
+            preshutdown: PreshutdownReport::Applied("PRESHUTDOWN の行".to_string()),
+        });
+        assert_eq!(
+            install_lines(&exe(), &result),
+            vec![
+                err("banto-hub: サービスの説明文の設定に失敗しました（登録自体は完了）: os error 5"),
+                out("banto-hub: PRESHUTDOWN の行"),
+                out("banto-hub: Windows サービス 'BantoHub' を登録しました"),
+                out("banto-hub:   表示名: banto-hub タグサーバー"),
+                out(r"banto-hub:   実行ファイル: C:\Program Files\BantoHub\banto-hub.exe"),
+                out("banto-hub:   起動種別: 手動（Demand） - OS 再起動だけでは開始しません"),
+                out("banto-hub: `Start-Service BantoHub` または管理 UI から明示的に開始してください"),
+                out("banto-hub: （OS 起動時に自動開始させたい場合は管理 UI の自動起動設定を有効にしてください）"),
+            ]
+        );
+        let without_warning = Ok(InstallOutcome {
+            kind: InstallKind::Created,
+            description_error: None,
+            preshutdown: PreshutdownReport::Applied("PRESHUTDOWN の行".to_string()),
+        });
+        assert_eq!(install_lines(&exe(), &without_warning).len(), 7);
+    }
+
+    /// 失敗は 1 行だけ（Hub の`fail`は管理者権限の案内を足さない）。
+    #[test]
+    fn install_golden_failures() {
+        assert_eq!(
+            install_lines(
+                &exe(),
+                &Err(InstallError::Connect("os error 5".to_string()))
+            ),
+            vec![err(
+                "banto-hub: Service Control Manager への接続に失敗しました: os error 5"
+            )]
+        );
+        assert_eq!(
+            install_lines(
+                &exe(),
+                &Err(InstallError::Create("os error 1073".to_string()))
+            ),
+            vec![err(
+                "banto-hub: サービスの登録に失敗しました: os error 1073"
+            )]
+        );
+    }
+
+    #[test]
+    fn uninstall_golden() {
+        let removed = [
+            out("banto-hub: Windows サービス 'BantoHub' の登録を解除しました"),
+            out("banto-hub: （このプロセスのハンドルが閉じるまで完全な削除が遅延することがあります - Windows API の仕様）"),
+        ];
+        let cases = [
+            (StopAttempt::NotRunning, None),
+            (
+                StopAttempt::StopRequested,
+                Some(out("banto-hub: サービスを停止しました")),
+            ),
+            (
+                StopAttempt::StopFailed("os error 1061".to_string()),
+                Some(err(
+                    "banto-hub: サービスの停止に失敗しました: os error 1061",
+                )),
+            ),
+            (
+                StopAttempt::QueryFailed("os error 6".to_string()),
+                Some(err(
+                    "banto-hub: サービス状態の取得に失敗しました: os error 6",
+                )),
+            ),
+        ];
+        for (stop, line) in cases {
+            let mut expected: Vec<ConsoleLine> = line.into_iter().collect();
+            expected.extend(removed.iter().cloned());
+            assert_eq!(uninstall_lines(&Ok(UninstallOutcome { stop })), expected);
+        }
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::Connect("os error 5".to_string()))),
+            vec![err(
+                "banto-hub: Service Control Manager への接続に失敗しました: os error 5"
+            )]
+        );
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::Open("os error 1060".to_string()))),
+            vec![err(
+                "banto-hub: サービス 'BantoHub' が見つかりません（既に未登録の可能性）: os error 1060"
+            )]
+        );
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::Delete {
+                stop: StopAttempt::StopRequested,
+                error: "os error 1072".to_string(),
+            })),
+            vec![
+                out("banto-hub: サービスを停止しました"),
+                err("banto-hub: サービスの削除に失敗しました: os error 1072"),
+            ]
+        );
+    }
 }

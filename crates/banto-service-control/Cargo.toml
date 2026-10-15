@@ -8,6 +8,9 @@ publish.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+# サービス本体の非同期の待ち（`ServiceContext::stopped`、#392 B3-1）。
+# `Notify` だけを使うので `sync` だけ（ランタイムは製品が持つ）。
+tokio = { workspace = true, features = ["sync"] }
 
 [target.'cfg(windows)'.dependencies]
 # banto-hub-core が `service_manager.rs` で使っていたのと同じ版（SCM の
@@ -20,3 +23,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Services",
 ] }
+
+[dev-dependencies]
+# ランナーのテストで、非同期の本体を current_thread のランタイムで動かす。
+tokio = { workspace = true, features = ["rt", "sync"] }
