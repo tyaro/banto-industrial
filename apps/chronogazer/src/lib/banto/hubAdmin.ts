@@ -6,7 +6,8 @@
  * `apps/chronogazer/src-tauri/src/lib.rs`）、組み込みサーバー配下の LAN
  * ブラウザは `fetch()`（`/api/hub/*`、`apps/chronogazer/core/src/rest.rs`）。
  * どちらも同じ `chronogazer_core::hub::HubService` を呼ぶので、状態も
- * キーリングも 1 つしかない。
+ * API キーの保存先も 1 つしかない（#392 B2-4b からは OS キーリングではなく、
+ * データのルートの `secrets\hub-keys` にある DPAPI のファイル）。
  *
  * プレーンな `vite dev`/`vite preview`（Rust backend 無し）では Hub 接続を
  * 保持する場所そのものが無いため、すべて `DEMO_MODE_MESSAGE` で reject
@@ -324,8 +325,8 @@ export async function dismissLegacyHubSelection(signal?: AbortSignal): Promise<v
 
 /**
  * `admin`-only: ロックダウン済み Hub 向けの手動連携。`key` は平文なので
- * 画面側は `type="password"` で受け取り、ここから先は保存先（OS キーリング）
- * まで一方通行で流れる。
+ * 画面側は `type="password"` で受け取り、ここから先は保存先（データのルートの
+ * `secrets\hub-keys` にある DPAPI のファイル、#392 B2-4b）まで一方通行で流れる。
  *
  * [`connectHub`] と同じく**打ち切っても止まらない**非冪等な操作
  * （[`HUB_UI_TIMEOUT_MS`]）。
@@ -345,7 +346,7 @@ export async function adoptHubKey(
 	});
 }
 
-/** `admin`-only: 切断（ローカルの設定とキーリングのみ。Hub 側のキーは残る）。 */
+/** `admin`-only: 切断（ローカルの設定と保存したキーのみ。Hub 側のキーは残る）。 */
 export async function disconnectHub(signal?: AbortSignal): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_disconnect');

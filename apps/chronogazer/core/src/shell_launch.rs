@@ -40,7 +40,7 @@
 //! （判定は `crate::service_probe`）。それ以外の理由は Fallback の窓に出すために
 //! 種類ごとに分けて持つ。
 
-use banto_service_control::ScmState;
+use banto_service_control::{ScmState, ServiceManager};
 
 /// SCM 上の ChronoGazer のサービス名（決定 7。B3-2 のサービスの登録と同じ値）。
 pub const SERVICE_NAME: &str = "ChronoGazer";
@@ -104,6 +104,17 @@ pub enum LaunchDecision {
 /// 結果を見るかどうかを決める。
 pub fn needs_probe(scm: &ScmObservation) -> bool {
     matches!(scm, ScmObservation::State(ScmState::Running))
+}
+
+/// SCM の照会の結果を [`ScmObservation`] に直す（B2-4c。シェルは本番で
+/// `WindowsServiceManager`、テストは `MockServiceManager` を渡す）。照会の失敗は
+/// `ServiceManagerError` の文言（中立、秘密を含まない - O9）で [`ScmObservation::QueryFailed`]。
+/// 未登録はエラーではなく `ScmState::NotInstalled`（`ServiceManager::query_status` の契約）。
+pub fn observe_scm(manager: &impl ServiceManager) -> ScmObservation {
+    match manager.query_status() {
+        Ok(summary) => ScmObservation::State(summary.state),
+        Err(err) => ScmObservation::QueryFailed(err.to_string()),
+    }
 }
 
 /// 起動判定（モジュール doc の判定表）。`health` は [`needs_probe`] が真のときだけ
@@ -293,6 +304,23 @@ mod tests {
         assert_eq!(
             decide(&ScmObservation::QueryFailed("x".to_string()), None),
             LaunchDecision::Desktop { scm: None }
+        );
+    }
+
+    /// 照会の結果の写し方: 状態はそのまま、失敗は中立な文言で `QueryFailed`。
+    #[test]
+    fn observe_scm_maps_status_and_errors() {
+        use banto_service_control::{MockServiceManager, ServiceManagerError};
+        assert_eq!(
+            observe_scm(&MockServiceManager::not_installed()),
+            ScmObservation::State(ScmState::NotInstalled)
+        );
+        let mock = MockServiceManager::new();
+        assert_eq!(observe_scm(&mock), ScmObservation::State(ScmState::Stopped));
+        mock.inject_error(ServiceManagerError::AccessDenied);
+        assert_eq!(
+            observe_scm(&mock),
+            ScmObservation::QueryFailed("サービス操作の権限がありません".to_string())
         );
     }
 

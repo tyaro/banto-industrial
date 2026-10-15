@@ -1069,6 +1069,7 @@ dependencies = [
  "banto-hub-bootstrap",
  "banto-secret-store",
  "banto-server",
+ "banto-service-control",
  "chronogazer-core",
  "futures-util",
  "keyring",

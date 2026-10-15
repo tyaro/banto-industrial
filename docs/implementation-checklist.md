@@ -1,7 +1,9 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-14（§5 に「handler の中で `await` をまたぐ副作用は接続の切断で捨てられる」を追加。#600 の全体監査 F1・F2・F4）
+最終更新: 2026-10-15（§5 に「ChronoGazer のシェルの終了・切り替え・復旧の判断はライフサイクルの表を通す。入り口を足したら表に行を足す」を追加。PR #608 で同じ辺りの競合の指摘が 1 件ずつ出続けた）
+2026-10-15（§2 に「実機で Tauri のシェルを動かすときは試験専用の identifier でビルドする」を追加。#392 B2-4b の実機確認で、`APPDATA`・`LOCALAPPDATA` を差し替えても Tauri のデータの場所は隔離されず、オーナーの実データの場所に印を作った）
+2026-10-14（§5 に「handler の中で `await` をまたぐ副作用は接続の切断で捨てられる」を追加。#600 の全体監査 F1・F2・F4）
 2026-10-13（§5 に「DB を触る背景タスクを `abort()` で止めない」を追加。ChronoGazer の保持期間の掃除。同日 #597 のレビューで「待ちを時間切れで落とすときは handle を手放さない」を追記）
 2026-10-12（§5 に「反証で戻したファイルを `cp` で書き戻すと cargo が作り直さないことがある」を追加。#586）
 2026-10-10（§5 に「時間切れになったテストの非同期処理は次のテストへ漏れる」を追加。#559、ChronoGazer の `setup.test.ts`）
@@ -64,6 +66,7 @@
    - [ ] **banto の版を上げるときに `cargo update -p banto-core -p banto-storage -p banto-server -p banto-admin-services` を使わない**。タグを付け替えるだけのつもりでも、cargo は同時に無関係な crate を**再解決して降格する**（2026-10-04 の v3.0.0 追従で `windows-sys 0.61.2 → 0.60.2`・`socket2 0.6.4 → 0.5.10` が 10 か所以上付け替わった。#450/#465/#484 と同じ型）。`Cargo.lock` の banto 4 crate の `version`/`source`（コミット SHA はタグの `git rev-parse <tag>^{commit}`）を**手で書き換え**、`cargo metadata --locked` が通ることで確かめる。
    - [ ] **`@banto/*` の git 依存を上げるとき `pnpm-lock.yaml` を手で書き換えない**（Cargo.lock と逆）。SHA・specifier だけ直すと `packages:` の `version:` が旧版のまま残り、pnpm は「lock は最新」と判断して再解決しない。ストアを再利用する `pnpm install --frozen-lockfile`（CI のキャッシュ復元・別 checkout）が `ERR_PNPM_UNEXPECTED_PKG_CONTENT_IN_STORE`（lock の 5.0.0 と実 manifest の 5.1.0 の食い違い）で落ちる。#515 のオーナーレビュー P2、2026-10-07。対処: `packages:`/`snapshots:` の `@banto/*` 項目を消してから `pnpm install --no-frozen-lockfile` で再生成し、各 `version:` が取得元の実 `package.json` と一致することを確認する。
 10. [ ] **push したら、その head に対して CI の run が実際に起動したか確認する**（`gh run list --branch <branch> --limit 5`）。**PR がコンフリクトしていると GitHub はマージ ref を作れず、`on: pull_request` の CI / Supply Chain は起動しない**（Copilot のレビューは別イベントなので走り続け、気付きにくい）。起動していなければ `gh pr view <n> --json mergeable` を疑い、main を取り込んで解決する。**ローカルで緑でも、CI が走っていなければ緑ではない。**
+11. [ ] **実機で Tauri のシェル（`src-tauri`）を動かす確認は、試験専用の identifier でビルドし、`CHRONOGAZER_ROOT` を作業用のフォルダに向ける**。`APPDATA`・`LOCALAPPDATA` の環境変数を差し替えても、Tauri の `app_local_data_dir()`・`app_data_dir()`・WebView2 のデータは Windows の既知のフォルダの API で解決されるので**隔離されない**（2026-10-15、#392 B2-4b の実機確認: 試験が旧データの案内の既読の印をオーナーの実際の `%LOCALAPPDATA%\dev.tyaro.chronogazer` に作った。オーナー許可で削除済み）。identifier はビルド時に `TAURI_CONFIG='{"identifier":"dev.tyaro.chronogazer.<試験名>"}'` で上書きする（#585 の A2 の実機確認と同じ）。終わったら試験用の identifier のフォルダ（`%APPDATA%`・`%LOCALAPPDATA%` の下）と作業用のルートを消す。
 
 ## 3. E2E の罠（全部踏んだ）
 
@@ -92,6 +95,7 @@
 - [ ] **「自動で再試行します」と書いたら、本当に再試行する経路があるか確かめる**（#385: 終端状態が再試行対象から漏れていて文言が嘘になった）。
 - [ ] **「起こす条件」と「実際にやる条件」を 1 つの述語にする**（#385: `needs_retry` は起こすのに `must_restart...` が張り直さず空振り）。別々に状態を列挙しない。
 - [ ] **判断は純関数に出して、状態の総当たりを表でテストする**（モックの足場が重い経路ほど効く）。
+- [ ] **ChronoGazer のシェルの終了・切り替え・復旧の判断は、ライフサイクルの表（`apps/chronogazer/src-tauri/src/lifecycle.rs` の `step`）を通す。入り口を足したら表に行を足す**（`Event` に 1 つ・`step` に判断・テストの `transition_table` に全列の期待値を書き下した行・`all_events` に 1 つ）。入り口の側でその場で別の印を読んで確かめ直さない。PR #608 では判断が `QuitGate`・`ShellGate`・`RecoveryGate`・待ちの上限・`RunEvent::Exit` の扱いに散っていて、入り口を足すたびに確かめ方を書き直し、終了 × 移り変わり × 復旧の競合の指摘が 1 件ずつ出続けた（2026-10-15 オーナー決定で 1 つの状態機械に畳んだ）。
 - [ ] **ロック順序を一方向に固定**し、doc に書く（#385: 操作ロック → 購読ロック。読み取り専用のポーリング経路はロックを取らない）。
 - [ ] **バックグラウンドの見張り・ポーリングを足したら、次を必ず設計する**: 二重起動の防止 / 停止条件（親が落ちたら止まる）/ 停止と再開の競合 / **無駄撃ちの抑制**（変わりようのない安定状態で外部を叩かない）/ **飛行中の応答が新しい状態を巻き戻さない**こと。
 - [ ] **見張りの「放置してよい状態」を状態名だけで決めない**。下位ライブラリは同じ状態名に別々の意味を載せる（`banto-tagclient` の `Reconnecting` は「transport の backoff 中」と「**要求セットが catalog と食い違ったまま**待ち続けている」の両方）。**分類（`last_error`）まで見る**。#383 実機: タグを 1 つ消したら購読全体が二度と戻らなくなった。

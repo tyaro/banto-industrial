@@ -21,7 +21,9 @@
 //! `/__recovery/<対処>?file=<バックアップ>` へ移ろうとするのを
 //! `on_navigation` で受け取って取り消す（[`navigation_decision`]）。Rust は
 //! 今出している選択肢に含まれる対処だけを受け付け（[`RecoveryGate`]）、処理中は
-//! 二度押しを無視し、窓を閉じさせない（名前の変更の途中で終わらせない）。結果は
+//! 二度押しを無視し、窓を閉じさせない（名前の変更の途中で終わらせない。処理中の印は
+//! ライフサイクルの状態機械 [`crate::lifecycle`] の表の「対処の窓のボタン」「対処の窓の
+//! ×」「対処の窓の処理の終わり」の行が持つ - #392 B2-4c の後に、ここの入れ物から移した）。結果は
 //! `window.__chronogazerRecovery.render(<JSON>)` で同じ窓に描き直す。
 //! 確認（作り直す・戻す・既定に戻す）は窓の中で 1 回はさむ。
 //!
@@ -56,6 +58,7 @@
 //! 書くと別の host を指す）。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use banto_core::BantoError;
@@ -102,19 +105,12 @@ impl LaunchPaths {
         }
     }
 
-    /// 環境（`CHRONOGAZER_ROOT`、無ければ `%ProgramData%\ChronoGazer`）からルートを
-    /// 決め、確かめて、無ければ作る（[`Self::prepare`]）。
-    pub(crate) fn resolve() -> Result<Self, String> {
-        Self::prepare(layout_from_vars(|name| std::env::var(name).ok()))
-    }
-
     /// ルートを確かめ（絶対パスで、`.`・`..` を含まない。`chronogazer-server` と同じ
     /// `validate_root`）、無ければ保護された DACL で作る（O6、
     /// `chronogazer_core::paths::create_root_dir`。既にあるルートには触らない）。
     /// どちらの失敗も「終了」だけの窓に出す文言で返す（ルートの下には何も作らない）。
     pub(crate) fn prepare(layout: DataLayout) -> Result<Self, String> {
-        validate_root(layout.root())
-            .map_err(|err| format!("データの置き場所を使えません: {err}"))?;
+        check_root(&layout)?;
         create_root_dir(&layout).map_err(|err| {
             format!(
                 "データの置き場所（{}）を作れませんでした: {err}",
@@ -123,6 +119,20 @@ impl LaunchPaths {
         })?;
         Ok(Self::from_layout(layout))
     }
+}
+
+/// 環境（`CHRONOGAZER_ROOT`、無ければ `%ProgramData%\ChronoGazer`）からルートの配置を
+/// 決める（ファイルシステムには触れない）。#392 B2-4c: シェルは起動判定（SCM・probe）の
+/// 前にこれで配置だけを決め、[`check_root`] で確かめる。ルートを作る
+/// （[`LaunchPaths::prepare`]）のは Desktop に決まったときだけ（サービスへつなぐ・
+/// fallback ではルートを作らない - probe も無いルートを作らない、`service_probe` の doc）。
+pub(crate) fn layout_from_env() -> DataLayout {
+    layout_from_vars(|name| std::env::var(name).ok())
+}
+
+/// ルートを確かめるだけ（作らない。`validate_root`、[`LaunchPaths::prepare`] と同じ文言）。
+pub(crate) fn check_root(layout: &DataLayout) -> Result<(), String> {
+    validate_root(layout.root()).map_err(|err| format!("データの置き場所を使えません: {err}"))
 }
 
 /// 環境変数の読み方を受けてルートの配置を決める（純関数。テストは読み方を差し替える）。
@@ -176,6 +186,10 @@ pub(crate) enum LaunchError {
     Recovery(RecoveryError),
     /// エンジンは動いたが画面（メインの窓・トレイ）を作れなかった。
     Window(tauri::Error),
+    /// 終了処理に入っていたので起動しなかった・起動し終えたエンジンを置かずに止めた・
+    /// 置いた後に終了が始まったので画面を作らなかった（置いたエンジンは後始末が止める）
+    /// （#392 B2-4c、`crate::lifecycle`）。呼び出し側は窓を出さない。
+    Exiting,
 }
 
 impl std::fmt::Display for LaunchError {
@@ -185,6 +199,7 @@ impl std::fmt::Display for LaunchError {
             Self::Settings(err) => write!(f, "設定の読み取りに失敗しました: {err}"),
             Self::Recovery(err) => err.fmt(f),
             Self::Window(err) => write!(f, "画面を作れませんでした: {err}"),
+            Self::Exiting => write!(f, "終了処理中のため、記録エンジンを起動しませんでした"),
         }
     }
 }
@@ -195,7 +210,9 @@ fn kind_of(err: &LaunchError) -> FailureKind {
     match err {
         LaunchError::Engine(err) => recovery::classify(err),
         LaunchError::Settings(err) => recovery::classify_settings_error(err),
-        LaunchError::Recovery(_) | LaunchError::Window(_) => FailureKind::Other,
+        LaunchError::Recovery(_) | LaunchError::Window(_) | LaunchError::Exiting => {
+            FailureKind::Other
+        }
     }
 }
 
@@ -423,34 +440,146 @@ fn navigation_decision(url: &tauri::Url) -> Navigation {
     }
 }
 
-/// 対処の窓の状態（`run()` が manage する）。
+/// 対処の窓の中身（`run()` が manage する）。処理中（二度押しを無視し、窓を閉じさせ
+/// ない）の印は持たない - ライフサイクルの状態機械（[`crate::lifecycle`]）の表が持つ
+/// （[`accept_action`]・[`settle_action`]・[`may_close`]）。
+///
+/// 中身には世代（`generation`）を付け、中身を置き換える・選択肢を書き換えるたびに
+/// 新しい世代にする。ボタンの受け付けは [`accept_action`]（選択肢の確かめと処理中の印を
+/// 合わせて 1 つの受け付けにする）。
 #[derive(Default)]
-pub(crate) struct RecoveryGate(Mutex<Option<RecoverySession>>);
+pub(crate) struct RecoveryGate {
+    session: Mutex<Option<RecoverySession>>,
+    /// 最後に配った世代。
+    generation: AtomicU64,
+}
 
 struct RecoverySession {
     paths: LaunchPaths,
     kind: FailureKind,
     choices: Vec<RecoveryChoice>,
     detail: String,
-    /// 対処の実行中（二度押しを無視し、窓を閉じさせない）。
-    busy: bool,
+    /// 中身の世代（[`RecoveryGate::next_generation`]）。
+    generation: u64,
 }
 
 impl RecoveryGate {
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<RecoverySession>> {
-        self.0
+        self.session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 処理中か（窓の × を止める）。
-    fn busy(&self) -> bool {
-        self.lock().as_ref().map(|s| s.busy).unwrap_or(false)
+    /// 新しい世代（中身を置き換える・選択肢を書き換えるときに付け直す）。
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// 中身を置き換える（新しい世代を付ける）。
+    fn install(
+        &self,
+        paths: LaunchPaths,
+        kind: FailureKind,
+        choices: Vec<RecoveryChoice>,
+        detail: String,
+    ) {
+        let generation = self.next_generation();
+        *self.lock() = Some(RecoverySession {
+            paths,
+            kind,
+            choices,
+            detail,
+            generation,
+        });
+    }
+
+    /// `choice` が今出している選択肢なら、そのパスと中身の世代の控え。
+    fn offered(&self, choice: RecoveryChoice) -> Option<(LaunchPaths, u64)> {
+        let session = self.lock();
+        let session = session.as_ref()?;
+        session
+            .choices
+            .contains(&choice)
+            .then(|| (session.paths.clone(), session.generation))
+    }
+
+    /// 控えた世代の中身がまだ出ていて、`choice` がその選択肢か。
+    fn still_offered(&self, choice: RecoveryChoice, generation: u64) -> bool {
+        self.lock().as_ref().is_some_and(|session| {
+            session.generation == generation && session.choices.contains(&choice)
+        })
     }
 }
 
-/// 起動の失敗を窓で知らせる（`setup()` の最初の起動から）。
-pub(crate) fn show_failure(app: &AppHandle, paths: &LaunchPaths, err: LaunchError) {
+/// 対処の窓のボタンを受け付ける（PR #611 のオーナーレビュー 1）。今出している選択肢で、
+/// 処理中でなければ、パスを返して処理中の印を立てる。
+///
+/// 選択肢の確かめ（[`RecoveryGate`] のロック）と処理中の印（状態機械のロック）は別の
+/// ロックなので、「控える → 印を立てる → **控えた世代のままか確かめ直す**」の順にし、
+/// 確かめ直しで外れたら自分の立てた印を下ろして断る（印は残らない）。控えと印の間に
+/// 中身が描き直された（別の対処の失敗で選択肢が変わった・新しい失敗で窓の中身が
+/// 置き換わった）とき、古い選択肢の操作が新しい中身に対して走らない。世代で照合する
+/// ので、描き直した後に同じ選択肢があっても古い操作は通らない。
+///
+/// **判断**: 世代を状態機械に渡して同じロックの中で照合する形ではなく、印の後に
+/// 確かめ直す形にした。状態機械は窓の中身（選択肢・パス）を知らないままにしておける
+/// （表は印だけを扱う）うえ、印を立てた後に中身を変えるのは処理中の対処自身か、新しい
+/// 失敗の窓（印を下ろす側）だけなので、確かめ直しが通った後に古くなることも無いため。
+fn accept_action(
+    gate: &RecoveryGate,
+    lifecycle: Option<&crate::lifecycle::Lifecycle>,
+    choice: RecoveryChoice,
+) -> Option<LaunchPaths> {
+    let (paths, generation) = gate.offered(choice)?;
+    confirm_action(gate, lifecycle, choice, generation).then_some(paths)
+}
+
+/// [`accept_action`] の後半（印を立てて、控えた世代のままか確かめ直す）。
+fn confirm_action(
+    gate: &RecoveryGate,
+    lifecycle: Option<&crate::lifecycle::Lifecycle>,
+    choice: RecoveryChoice,
+    generation: u64,
+) -> bool {
+    if let Some(lifecycle) = lifecycle {
+        if !lifecycle.begin_recovery_action() {
+            return false;
+        }
+    }
+    if gate.still_offered(choice, generation) {
+        return true;
+    }
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.settle_recovery_action();
+    }
+    false
+}
+
+/// 対処の窓の処理が終わった（選び直せる・× で閉じられる。「対処の窓の処理の終わり」の行）。
+fn settle_action(app: &AppHandle) {
+    if let Some(lifecycle) = crate::shell::lifecycle(app) {
+        lifecycle.settle_recovery_action();
+    }
+}
+
+/// 対処の窓を × で閉じてよいか（処理中は閉じさせない。「対処の窓の ×」の行）。
+fn may_close(app: &AppHandle) -> bool {
+    crate::shell::lifecycle(app)
+        .map(|lifecycle| lifecycle.recovery_window_may_close())
+        .unwrap_or(true)
+}
+
+/// 起動の失敗を窓で知らせる（`setup()` の最初の起動と、Fallback の「再試行」から）。
+///
+/// #392 B2-4c（PR #608 の全体監査 F1）: `async`。「再試行」は tokio のワーカーの上から
+/// 呼ぶので、バックアップの一覧を `block_on` で読むと runtime の入れ子で panic していた。
+/// 一覧は [`list_backups_async`] を await する（このモジュールに `block_on` は無い）。
+pub(crate) async fn show_failure(app: &AppHandle, paths: &LaunchPaths, err: LaunchError) {
+    // #392 B2-4c: 終了処理中なら窓を出さない（プロセスが終わる）。
+    if matches!(err, LaunchError::Exiting) {
+        eprintln!("banto: {err}");
+        return;
+    }
     eprintln!("banto: 起動に失敗しました: {err}");
     // 既に起動中・旧形式の DB は今までのエラーの窓のまま。
     match &err {
@@ -468,15 +597,11 @@ pub(crate) fn show_failure(app: &AppHandle, paths: &LaunchPaths, err: LaunchErro
     let engine_running = matches!(err, LaunchError::Window(_));
     let choices = choices_for(kind);
     let detail = err.to_string();
-    let backups = backups_for(&choices, paths);
+    let backups = list_backups_async(&choices, paths).await;
     let view = build_view(kind, &choices, detail.clone(), paths, backups, None);
-    *app.state::<RecoveryGate>().lock() = Some(RecoverySession {
-        paths: paths.clone(),
-        kind,
-        choices,
-        detail,
-        busy: false,
-    });
+    app.state::<RecoveryGate>()
+        .install(paths.clone(), kind, choices, detail);
+    settle_action(app);
     if let Err(open_err) = open_recovery_window(app, &view) {
         eprintln!("banto: エラー表示の窓を開けませんでした: {open_err}");
         if engine_running {
@@ -502,13 +627,13 @@ pub(crate) fn show_fatal(app: &AppHandle, detail: String) {
         backups_error: None,
         notice: None,
     };
-    *app.state::<RecoveryGate>().lock() = Some(RecoverySession {
-        paths: LaunchPaths::from_layout(DataLayout::new(PathBuf::new())),
-        kind: FailureKind::Other,
-        choices: vec![RecoveryChoice::Quit],
+    app.state::<RecoveryGate>().install(
+        LaunchPaths::from_layout(DataLayout::new(PathBuf::new())),
+        FailureKind::Other,
+        vec![RecoveryChoice::Quit],
         detail,
-        busy: false,
-    });
+    );
+    settle_action(app);
     if let Err(err) = open_recovery_window(app, &view) {
         eprintln!("banto: エラー表示の窓を開けませんでした: {err}");
         std::process::exit(1);
@@ -522,14 +647,6 @@ fn choices_for(kind: FailureKind) -> Vec<RecoveryChoice> {
         // 「終了」だけ（理由は詳しい理由に出る）。
         WindowPlan::ExistingNotice => vec![RecoveryChoice::Quit],
     }
-}
-
-fn backups_for(choices: &[RecoveryChoice], paths: &LaunchPaths) -> Result<Vec<BackupInfo>, String> {
-    if !choices.contains(&RecoveryChoice::RestoreBackup) {
-        return Ok(Vec::new());
-    }
-    tauri::async_runtime::block_on(recovery::list_backups(&paths.db_path))
-        .map_err(|err| format!("バックアップの一覧を読めませんでした: {err}"))
 }
 
 fn open_recovery_window(app: &AppHandle, view: &RecoveryView) -> tauri::Result<()> {
@@ -565,7 +682,7 @@ fn open_recovery_window(app: &AppHandle, view: &RecoveryView) -> tauri::Result<(
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             // 対処の途中（名前の変更・起動のやり直し）で終わらせない。
-            if close_app.state::<RecoveryGate>().busy() {
+            if !may_close(&close_app) {
                 api.prevent_close();
             }
         }
@@ -587,13 +704,13 @@ fn rerender(app: &AppHandle, view: &RecoveryView) {
 
 /// 今の分類のまま、理由（`notice`）を付けて描き直し、処理中を解く。
 async fn rerender_with_notice(app: &AppHandle, notice: Option<String>) {
+    settle_action(app);
     let snapshot = {
         let gate = app.state::<RecoveryGate>();
-        let mut session = gate.lock();
-        let Some(session) = session.as_mut() else {
+        let session = gate.lock();
+        let Some(session) = session.as_ref() else {
             return;
         };
-        session.busy = false;
         (
             session.kind,
             session.choices.clone(),
@@ -623,19 +740,40 @@ async fn list_backups_async(
 
 /// 窓で選ばれた対処を実行し、起動をやり直す。
 async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<String>) {
-    // 今出している選択肢だけを、処理中でなければ受け付ける。
-    let paths = {
-        let gate = app.state::<RecoveryGate>();
-        let mut session = gate.lock();
-        let Some(session) = session.as_mut() else {
-            return;
-        };
-        if session.busy || !session.choices.contains(&choice) {
-            return;
-        }
-        session.busy = true;
-        session.paths.clone()
+    // 今出している選択肢だけを、処理中でなければ受け付ける（処理中は状態機械の表の
+    // 「対処の窓のボタン」の行。選択肢の確かめと印を合わせて 1 つの受け付けにする -
+    // [`accept_action`]）。
+    let Some(paths) = accept_action(
+        &app.state::<RecoveryGate>(),
+        crate::shell::lifecycle(&app).as_deref(),
+        choice,
+    ) else {
+        return;
     };
+
+    // #392 B2-4c（PR #608 のオーナーレビュー P2）: DB のファイルの名前を変える対処
+    // （作り直す・バックアップから戻す）は、受け付けた時点から起動のやり直しの終わり
+    // （失敗なら巻き戻しの終わり）まで、シェルの復旧の札を持つ。その間のトレイの
+    // 「終了」は断られる（`crate::shell` のモジュール doc「DB の復旧の途中は終了させ
+    // ない」）。終了の予約・終了の後なら対処を始めない。
+    let renames_files = matches!(
+        choice,
+        RecoveryChoice::RecreateDatabase | RecoveryChoice::RestoreBackup
+    );
+    let lifecycle = crate::shell::lifecycle(&app);
+    let mut recovery_guard = None;
+    if renames_files {
+        if let Some(lifecycle) = &lifecycle {
+            match lifecycle.begin_recovery() {
+                Ok(guard) => recovery_guard = Some(guard),
+                Err(refused) => {
+                    eprintln!("banto: 対処を始めません（{refused:?}）");
+                    rerender_with_notice(&app, Some(refused_notice(refused).to_string())).await;
+                    return;
+                }
+            }
+        }
+    }
 
     let prelude = match choice {
         // 何も変えずにやり直す（保存先の試し書きもやり直す）／既定の場所に戻す。
@@ -706,9 +844,35 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
         }
     };
 
+    // #392 B2-4c: やり直しの起動はシェルの移り変わりとして行う（終了処理は、その
+    // 終わりを待ってからエンジンを探す。`crate::shell` のモジュール doc「並行」）。
+    // 終了に入っていたら起動しない（窓は処理中のまま。プロセスが終わる）。
+    // 復旧の札を持っていればそれを、無ければここで移り変わりの札を取る。
+    let _transition = match (recovery_guard, &lifecycle) {
+        (Some(guard), _) => Some(guard),
+        (None, Some(lifecycle)) => match lifecycle.begin_relaunch() {
+            Ok(guard) => Some(guard),
+            // 終了処理に入った: 何もしない（プロセスが終わる）。
+            Err(crate::lifecycle::Refusal::Exiting) => {
+                eprintln!("banto: 終了処理中のため、対処の後の起動を行いません");
+                return;
+            }
+            // 別の移り変わりの途中（PR #608 の全体監査 F4）: 処理中を解いて選び直せる
+            // ようにする（そのままだとボタンが無効・× も閉じられないまま残る）。
+            Err(refused) => {
+                eprintln!("banto: 対処の後の起動を行いません（{refused:?}）");
+                rerender_with_notice(&app, Some(refused_notice(refused).to_string())).await;
+                return;
+            }
+        },
+        (None, None) => None,
+    };
     match crate::launch_desktop(&app, &paths, prelude).await {
+        // 終了処理に入った: 何も出さない（プロセスが終わる）。
+        Err(LaunchError::Exiting) => {}
         Ok(()) => {
             *app.state::<RecoveryGate>().lock() = None;
+            settle_action(&app);
             if let Some(window) = app.get_webview_window(RECOVERY_WINDOW_LABEL) {
                 // メインの窓ができた後なので、閉じてもアプリは終わらない。
                 let _ = window.destroy();
@@ -732,14 +896,17 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
             let detail = err.to_string();
             {
                 let gate = app.state::<RecoveryGate>();
+                let generation = gate.next_generation();
                 let mut session = gate.lock();
                 if let Some(session) = session.as_mut() {
                     session.kind = kind;
                     session.choices = choices.clone();
                     session.detail = detail.clone();
-                    session.busy = false;
+                    // 選択肢を書き換えた: 描き直す前の操作は通さない（[`accept_action`]）。
+                    session.generation = generation;
                 }
             }
+            settle_action(&app);
             let backups = list_backups_async(&choices, &paths).await;
             rerender(
                 &app,
@@ -752,6 +919,32 @@ async fn handle_action(app: AppHandle, choice: RecoveryChoice, file: Option<Stri
                     Some("対処の後も起動できませんでした。下の理由を確かめて、もう一度選んでください。".to_string()),
                 ),
             );
+        }
+    }
+}
+
+/// シェルの札を取れなかったときに対処の窓へ出す文（純関数）。札の行（復旧の札・対処の
+/// 後の起動）が返すのは `Exiting`・`Busy` だけで、ほかの理由は来ない（PR #611 の
+/// レビュー 3: デバッグビルドでは `debug_assert!` で落とす。リリースビルドでは「別の
+/// 処理の途中」）。理由を足したらここで文を選ぶ（網羅の `match`）。
+pub(crate) fn refused_notice(refused: crate::lifecycle::Refusal) -> &'static str {
+    use crate::lifecycle::Refusal;
+    debug_assert!(
+        matches!(refused, Refusal::Exiting | Refusal::Busy),
+        "対処の窓の札の行からは来ない理由: {refused:?}"
+    );
+    match refused {
+        Refusal::Exiting => "終了処理中のため、この対処を始めませんでした。",
+        Refusal::Busy
+        | Refusal::Stale
+        | Refusal::NotFallback
+        | Refusal::RecoveryInProgress
+        | Refusal::AlreadyConfirming
+        | Refusal::AlreadyQuitting
+        | Refusal::Quitting
+        | Refusal::RecoveryBusy
+        | Refusal::EngineRunning => {
+            "別の処理の途中です。しばらくしてから、もう一度選んでください。"
         }
     }
 }
@@ -782,6 +975,61 @@ async fn pick_folder(app: &AppHandle) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR #611 のオーナーレビュー 1: 控えた後に中身が描き直されたら（同じ選択肢が
+    /// 残っていても）、古い操作は断られ、処理中の印も残らない。
+    #[test]
+    fn a_stale_choice_is_refused_and_leaves_no_busy_mark() {
+        let lifecycle = crate::lifecycle::Lifecycle::started(crate::shell::ShellView::Desktop);
+        let gate = RecoveryGate::default();
+        let choices = vec![RecoveryChoice::RetryStoreCheck, RecoveryChoice::Quit];
+        gate.install(
+            paths(),
+            FailureKind::StoreDirUnwritable,
+            choices.clone(),
+            "a".into(),
+        );
+        let (_, generation) = gate
+            .offered(RecoveryChoice::RetryStoreCheck)
+            .expect("offered");
+        // 控えと印の間に描き直された（同じ選択肢のまま、新しい中身）。
+        gate.install(
+            paths(),
+            FailureKind::StoreDirUnwritable,
+            choices,
+            "b".into(),
+        );
+        assert!(!confirm_action(
+            &gate,
+            Some(&lifecycle),
+            RecoveryChoice::RetryStoreCheck,
+            generation
+        ));
+        // 印は残らない: 窓は閉じられ、次の操作は受け付けられる。
+        assert!(lifecycle.recovery_window_may_close());
+        assert!(accept_action(&gate, Some(&lifecycle), RecoveryChoice::RetryStoreCheck).is_some());
+    }
+
+    /// 今の選択肢は通り、処理中の印が立つ（二度押しは断る）。出していない選択肢は断る。
+    #[test]
+    fn a_current_choice_is_accepted_and_marks_busy() {
+        let lifecycle = crate::lifecycle::Lifecycle::started(crate::shell::ShellView::Desktop);
+        let gate = RecoveryGate::default();
+        assert!(accept_action(&gate, Some(&lifecycle), RecoveryChoice::Quit).is_none());
+        gate.install(
+            paths(),
+            FailureKind::DatabaseCorrupt,
+            vec![RecoveryChoice::RecreateDatabase, RecoveryChoice::Quit],
+            "x".into(),
+        );
+        assert!(accept_action(&gate, Some(&lifecycle), RecoveryChoice::ResetStoreDir).is_none());
+        assert!(lifecycle.recovery_window_may_close());
+        let accepted = accept_action(&gate, Some(&lifecycle), RecoveryChoice::RecreateDatabase)
+            .expect("current choice");
+        assert_eq!(accepted.db_path, paths().db_path);
+        assert!(!lifecycle.recovery_window_may_close());
+        assert!(accept_action(&gate, Some(&lifecycle), RecoveryChoice::Quit).is_none());
+    }
 
     fn paths() -> LaunchPaths {
         LaunchPaths::from_layout(DataLayout::new(r"C:\ProgramData\ChronoGazer"))
@@ -1030,5 +1278,45 @@ mod tests {
             .unwrap()
             .iter()
             .all(|ace| ace.sid != "S-1-5-32-545"));
+    }
+
+    /// PR #608 の全体監査 F1: バックアップの一覧は runtime の中（Fallback の「再試行」は
+    /// tokio のワーカーの上）から読んでも panic しない（`block_on` の入れ子にしない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backups_listing_runs_inside_a_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = LaunchPaths::from_layout(DataLayout::new(dir.path().join("missing-root")));
+        let choices = vec![RecoveryChoice::RestoreBackup, RecoveryChoice::Quit];
+        // 一覧が空でも読めない理由でもよい（panic しないこと）。
+        let listed = list_backups_async(&choices, &paths).await;
+        assert!(
+            matches!(&listed, Ok(list) if list.is_empty()) || listed.is_err(),
+            "{listed:?}"
+        );
+        // 戻す対処が無ければ読まない。
+        assert_eq!(
+            list_backups_async(&[RecoveryChoice::Quit], &paths)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// PR #608 の全体監査 F4: 札を取れなかった理由ごとの文。
+    #[test]
+    fn refused_notices() {
+        use crate::lifecycle::Refusal;
+        assert!(refused_notice(Refusal::Exiting).contains("終了処理中"));
+        assert!(refused_notice(Refusal::Busy).contains("別の処理の途中"));
+        assert!(!refused_notice(Refusal::Busy).contains("終了"));
+    }
+
+    /// PR #611 のレビュー 3: 来ないはずの理由はデバッグビルドで落とす。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "対処の窓の札の行からは来ない理由")]
+    fn an_unexpected_refusal_is_caught_in_debug_builds() {
+        let _ = refused_notice(crate::lifecycle::Refusal::Stale);
     }
 }
