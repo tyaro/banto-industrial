@@ -32,6 +32,7 @@ function connection(overrides: Partial<PlcConnection> = {}): PlcConnection {
 		enabled: true,
 		simulation: true,
 		wordOrder: 'low_high',
+		cpuType: 'R',
 		database: null,
 		username: null,
 		passwordSet: false,

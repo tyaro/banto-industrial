@@ -114,6 +114,9 @@ struct State {
     /// When set, requests are never answered - for exercising the client's
     /// response timeout without needing an unreachable host.
     hang: bool,
+    /// #605: 直前に受け取った要求のサブコマンド。Q のワード読みは `0x0000`、
+    /// R のワード読みは `0x0002`（ビットはそれぞれ `0x0001` / `0x0003`）。
+    last_subcommand: Option<u16>,
 }
 
 /// A running simulator instance. Dropping this does *not* stop the server (the
@@ -287,6 +290,12 @@ impl Simulator {
         self.state.lock().unwrap().write_commands
     }
 
+    /// #605: 直前の要求のサブコマンド。まだ要求が無ければ `None`。
+    /// Q シリーズのワードアクセスは `0x0000`、iQ-R は `0x0002`。
+    pub fn last_subcommand(&self) -> Option<u16> {
+        self.state.lock().unwrap().last_subcommand
+    }
+
     /// Every request whose group *starts* at `(device, start_number)` gets this
     /// end code instead of data. Persists until [`Simulator::clear_end_code`]
     /// (not one-shot), same contract as `modbus/simulator.rs`'s
@@ -449,6 +458,9 @@ fn parse_bulk_request(command: &[u8]) -> Option<BulkRequest> {
 
 fn build_response(state: &Arc<Mutex<State>>, route: &Route, command: &[u8]) -> Vec<u8> {
     let mut state = state.lock().unwrap();
+    if command.len() >= 4 {
+        state.last_subcommand = Some(u16::from_le_bytes([command[2], command[3]]));
+    }
 
     let code = if command.len() >= 2 {
         u16::from_le_bytes([command[0], command[1]])

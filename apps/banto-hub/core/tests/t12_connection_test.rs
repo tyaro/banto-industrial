@@ -94,6 +94,7 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,
@@ -113,6 +114,7 @@ fn modbus_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        cpu_type: None,
         database: None,
         username: None,
         password: None,
@@ -433,8 +435,52 @@ async fn slmp_test_direct_dial_reports_ok_without_connection_id() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["ok"], true, "{body:?}");
     assert!(body["error"].is_null(), "{body:?}");
+    // 省略時は移行前と同じ R フレーム（ワードのサブコマンド 0x0002）。
+    assert_eq!(sim.last_subcommand(), Some(0x0002), "{body:?}");
 
     sim.stop();
+}
+
+/// #605: 直接ダイヤルはフォームの CPU 種別をフレームに載せる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_test_direct_dial_uses_the_requested_cpu_type() {
+    let app = test_app("t12-slmp-cpu").await;
+    for (cpu, sub) in [("R", 0x0002u16), ("Q", 0x0000u16)] {
+        let sim = SlmpSimulator::start().await;
+        let mut payload = test_payload("slmp", "127.0.0.1", sim.addr.port(), false);
+        payload["cpuType"] = json!(cpu);
+        let (status, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cpu} {body:?}");
+        assert_eq!(body["ok"], true, "{cpu} {body:?}");
+        assert_eq!(sim.last_subcommand(), Some(sub), "{cpu}");
+        sim.stop();
+    }
+}
+
+/// #605: 未知の CPU 種別はダイヤルせず拒否する（R への黙ったフォールバックではない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_test_rejects_an_unknown_cpu_type() {
+    let app = test_app("t12-slmp-cpu-unknown").await;
+    let mut payload = test_payload("slmp", "127.0.0.1", 1, false);
+    payload["cpuType"] = json!("L");
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false, "{body:?}");
+    assert_eq!(body["error"]["kind"], "protocol", "{body:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +550,82 @@ async fn slmp_test_reuses_existing_broker_session_without_dialing_a_second_conne
         1,
         "the connection test must reuse the existing broker session, not open a second one"
     );
+
+    sim.stop();
+}
+
+/// #605: 保存済みセッションが Q のとき、フォームの CPU が R なら、セッションの
+/// 読み（Q のフレーム）をフォームの値の結果として返さない。2 本目もダイヤルせず
+/// （1 本しか受けない機器の誤診を避ける）、「保存してからテストしてください」と
+/// 返す。同じ CPU（Q）なら従来どおりセッションを再利用して読む。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_test_refuses_a_session_whose_cpu_differs_from_the_form() {
+    let app = test_app("t12-slmp-session-cpu").await;
+    let sim = SlmpSimulator::start().await;
+
+    let mut input = slmp_conn_input("lineq", sim.addr.port());
+    input.cpu_type = Some("Q".to_string());
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(input)
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("t1", group.id, "D100", "u16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+    let mut status_watch = app
+        .sessions
+        .status_watch(conn.id)
+        .expect("a broker session should exist");
+    status_watch
+        .wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected)
+        .await
+        .expect("broker session should report Connected");
+    assert_eq!(app.sessions.connection_count(), 1);
+
+    let post = |cpu: &'static str| {
+        let router = app.router.clone();
+        let token = app.admin_token.clone();
+        let port = sim.addr.port();
+        let id = conn.id;
+        async move {
+            admin_write(
+                &router,
+                "POST",
+                "/api/plc-connections/test",
+                &token,
+                json!({
+                    "protocol": "slmp",
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "unitId": 1,
+                    "simulation": false,
+                    "connectionId": id,
+                    "cpuType": cpu,
+                }),
+            )
+            .await
+        }
+    };
+
+    let (status, body) = post("R").await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false, "{body:?}");
+    assert_eq!(body["error"]["kind"], "protocol", "{body:?}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("保存してからテスト"), "{message}");
+    assert_eq!(app.sessions.connection_count(), 1, "2 本目をダイヤルしない");
+
+    let (status, body) = post("Q").await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], true, "{body:?}");
+    assert_eq!(sim.last_subcommand(), Some(0x0000), "Q のフレームで読む");
+    assert_eq!(app.sessions.connection_count(), 1);
 
     sim.stop();
 }

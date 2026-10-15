@@ -24,6 +24,7 @@ const BASE_CONNECTION: PlcConnection = {
 	enabled: true,
 	simulation: false,
 	wordOrder: 'low_high',
+	cpuType: 'R',
 	database: null,
 	username: null,
 	passwordSet: false
@@ -39,6 +40,7 @@ const VIRTUAL_CONNECTION: PlcConnection = {
 	enabled: true,
 	simulation: false,
 	wordOrder: 'low_high',
+	cpuType: 'R',
 	database: null,
 	username: null,
 	passwordSet: false
@@ -57,6 +59,7 @@ const DB_CONNECTION: PlcConnection = {
 	enabled: true,
 	simulation: false,
 	wordOrder: 'low_high',
+	cpuType: 'R',
 	database: 'appdb',
 	username: 'appuser',
 	passwordSet: true
@@ -198,7 +201,8 @@ describe('configPackage', () => {
 				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high'
+				wordOrder: 'low_high',
+				cpuType: 'R'
 			}
 		]);
 		expect(pkg.collectionGroups).toEqual([
@@ -343,6 +347,48 @@ describe('configPackage', () => {
 			plcConnections: pkg.plcConnections.map((c) => ({ ...c, wordOrder: 'middle_endian' }))
 		};
 		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
+	});
+
+	// #605: cpuType は旧パッケージには無い。省略は undefined のまま（作成は R、更新は既存を保つ）。
+	// 明示した Q は往復する。
+	// 未知の値は拒否する（R へ黙って倒さない）。
+	it('parseConfigPackage は cpuType を持たない旧パッケージを undefined のまま受け入れる（R を入れない）', () => {
+		const pkg = makePackage();
+		const withoutCpu = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map(({ cpuType: _cpuType, ...rest }) => rest)
+		};
+		const parsed = parseConfigPackage(JSON.stringify(withoutCpu));
+		expect(parsed.plcConnections[0].cpuType).toBeUndefined();
+	});
+
+	it('buildConfigPackage/parseConfigPackage は SLMP 接続の cpuType Q を往復する', () => {
+		const qSeries: PlcConnection = {
+			...BASE_CONNECTION,
+			protocol: 'slmp',
+			port: 5007,
+			cpuType: 'Q'
+		};
+		const pkg = buildConfigPackage({
+			plcConnections: [qSeries],
+			collectionGroups: [],
+			tags: [],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-10-14T00:00:00.000Z'
+		});
+		expect(pkg.plcConnections[0].cpuType).toBe('Q');
+		const parsed = parseConfigPackage(serializeConfigPackage(pkg));
+		expect(parsed.plcConnections[0].cpuType).toBe('Q');
+	});
+
+	it('parseConfigPackage は不正な cpuType を拒否する', () => {
+		const pkg = makePackage();
+		const withBadCpu = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map((c) => ({ ...c, cpuType: 'L' }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withBadCpu))).toThrow(/cpuType/);
 	});
 
 	// --- 2026-09-08 オーナー決定（issue #325 の修正）: modbus-tcp 接続の
@@ -502,6 +548,7 @@ describe('configPackage', () => {
 			enabled: true,
 			simulation: false,
 			wordOrder: 'low_high',
+			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser'
 		});

@@ -220,7 +220,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use banto_plc::{BatchReadRequest, BatchReadResult, SlmpConfig, WordOrder};
+use banto_plc::{BatchReadRequest, BatchReadResult, SlmpConfig, SlmpCpu, WordOrder};
 use banto_plc_write::{BatchWriteRequest, WriteResult};
 use banto_tags::PlcConnection;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -283,7 +283,19 @@ fn slmp_config_for(conn: &PlcConnection, port: u16) -> SlmpConfig {
         // with no error anywhere. See `parse_word_order`'s doc comment for
         // the fallback this now goes through.
         word_order: parse_word_order(&conn.word_order),
+        // #605: `cpu_type` 列（migration 0021）。未認識の文字列は R
+        // （この列を足す前の `SlmpConfig::default().cpu`）。CHECK があるので
+        // 通常の CRUD では Q/R 以外は来ない。
+        cpu: parse_cpu_type(&conn.cpu_type),
         ..SlmpConfig::default()
+    }
+}
+
+/// #605: `"Q"` だけ [`SlmpCpu::Q`]。それ以外は [`SlmpCpu::R`]。
+fn parse_cpu_type(value: &str) -> SlmpCpu {
+    match value {
+        "Q" => SlmpCpu::Q,
+        _ => SlmpCpu::R,
     }
 }
 
@@ -457,9 +469,19 @@ pub struct BrokerHandle {
     tx: mpsc::Sender<Job>,
     /// See [`Self::status_watch`].
     status_rx: watch::Receiver<BrokerConnectionStatus>,
+    /// #605: このセッションを作ったときの SLMP の CPU 種別（SLMP 以外は
+    /// `None`）。handle と同じ世代のメタデータで、後から別のレジストリを
+    /// 引き直さない。接続テストが「いま読むセッションの CPU」を比べるために使う。
+    slmp_cpu: Option<SlmpCpu>,
 }
 
 impl BrokerHandle {
+    /// #605: このセッションを作ったときの SLMP の CPU 種別。SLMP 以外は `None`。
+    /// 設定を変えて作り直されたセッションの handle は、新しい値を持つ。
+    pub fn slmp_cpu(&self) -> Option<SlmpCpu> {
+        self.slmp_cpu
+    }
+
     /// Submit a (possibly mixed numeric + string, S2 文字列タグ) read batch
     /// and await its result. Fails fast with [`BrokerError::Disconnected`] if
     /// the session is down - see the module doc's queued-request-while-down
@@ -531,6 +553,11 @@ pub struct ReadOnlyHandle {
 }
 
 impl ReadOnlyHandle {
+    /// Identical to [`BrokerHandle::slmp_cpu`].
+    pub fn slmp_cpu(&self) -> Option<SlmpCpu> {
+        self.inner.slmp_cpu()
+    }
+
     /// Identical to [`BrokerHandle::read`].
     pub async fn read(
         &self,
@@ -613,6 +640,7 @@ pub fn spawn_test_handle_with_status(
             connection_id,
             tx,
             status_rx,
+            slmp_cpu: None,
         },
         status_tx,
         task,
@@ -735,7 +763,11 @@ fn spawn_slmp_driver(
     backoff: BackoffConfig,
     shutdown_rx: watch::Receiver<bool>,
 ) -> (BrokerHandle, TaskEntry) {
-    spawn_task(conn.id, slmp_config_for(conn, port), backoff, shutdown_rx)
+    let config = slmp_config_for(conn, port);
+    let cpu = config.cpu;
+    let (mut handle, task) = spawn_task(conn.id, config, backoff, shutdown_rx);
+    handle.slmp_cpu = Some(cpu);
+    (handle, task)
 }
 
 /// [`DriverSpawn`] for `"modbus-tcp"` (#131, 2026-09-01): build this
@@ -1046,6 +1078,7 @@ fn spawn_task_with_connector(
             connection_id,
             tx,
             status_rx,
+            slmp_cpu: None,
         },
         TaskEntry {
             stop_tx,
@@ -1310,6 +1343,7 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            cpu_type: "R".to_string(),
             database: None,
             username: None,
             password: None,
@@ -1468,20 +1502,33 @@ mod tests {
         assert_eq!(slmp_config_for(&c, 5007).word_order, WordOrder::LowHigh);
     }
 
-    /// Every other [`SlmpConfig`] field `slmp_config_for` does not set stays
-    /// exactly [`SlmpConfig::default`]'s value - the "known limitation" this
-    /// module's fix deliberately did not expand (CPU series, access route,
-    /// timers; see the P3-b task's own report for why). Pins that scope so a
-    /// future edit to this function does not silently widen it.
+    /// #605: `cpu_type` はセッションのフレーム形式になる。既定の行（`"R"`）は
+    /// この列を足す前と同じ [`SlmpCpu::R`]。`"Q"` は Q フレーム。未知の文字列は
+    /// R に倒す（CHECK を通らない手編集行向け）。
     #[test]
-    fn slmp_config_for_only_overrides_host_port_and_word_order() {
+    fn slmp_config_for_maps_cpu_type_q_and_r() {
+        let mut c = conn(1, "slmp", "10.0.0.5", 5007);
+        assert_eq!(slmp_config_for(&c, 5007).cpu, SlmpCpu::R);
+
+        c.cpu_type = "Q".to_string();
+        assert_eq!(slmp_config_for(&c, 5007).cpu, SlmpCpu::Q);
+
+        c.cpu_type = "L".to_string();
+        assert_eq!(slmp_config_for(&c, 5007).cpu, SlmpCpu::R);
+    }
+
+    /// Every other [`SlmpConfig`] field `slmp_config_for` does not set stays
+    /// exactly [`SlmpConfig::default`]'s value. CPU 種別は #605 で接続列に
+    /// 出した。アクセスルートとタイマーは今も既定のまま（他局指定は範囲外）。
+    #[test]
+    fn slmp_config_for_only_overrides_host_port_word_order_and_cpu() {
         let c = conn(1, "slmp", "10.0.0.5", 5007);
         let config = slmp_config_for(&c, 5007);
         let default = SlmpConfig::default();
         assert_eq!(config.host, "10.0.0.5");
         assert_eq!(config.port, 5007);
         assert_eq!(config.word_order, WordOrder::LowHigh);
-        assert_eq!(config.cpu, default.cpu);
+        assert_eq!(config.cpu, SlmpCpu::R);
         assert_eq!(config.connect_timeout, default.connect_timeout);
         assert_eq!(config.response_timeout, default.response_timeout);
         assert_eq!(config.network_id, default.network_id);
@@ -1490,6 +1537,38 @@ mod tests {
         assert_eq!(config.area_id, default.area_id);
         assert_eq!(config.serial_id, default.serial_id);
         assert_eq!(config.cpu_timer, default.cpu_timer);
+    }
+
+    /// #605: 接続の `cpu_type` が、broker の読み取りと書き込みの両方で
+    /// シミュレータに届くサブコマンドになる。Q のワードは `0x0000`、R は `0x0002`。
+    /// 既定のまま（このテストを R 固定に戻す）だと Q の断言が落ちる。
+    #[tokio::test]
+    async fn cpu_type_selects_the_slmp_subcommand_for_read_and_write() {
+        for (cpu_type, word_sub) in [("R", 0x0002u16), ("Q", 0x0000u16)] {
+            let sim = Simulator::start().await;
+            let mut c = conn(1, "slmp", "127.0.0.1", sim.addr.port());
+            c.cpu_type = cpu_type.to_string();
+            let supervisor =
+                BrokerSupervisor::spawn(&[c], BackoffConfig::default()).expect("spawn");
+            let handle = supervisor.handle(1).expect("handle");
+            let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
+            assert_eq!(
+                sim.last_subcommand(),
+                Some(word_sub),
+                "{cpu_type} の読み取りサブコマンド"
+            );
+            handle
+                .write(vec![wreq("D0", DataType::U16, TagValue::F64(1.0))])
+                .await
+                .expect("write");
+            assert_eq!(
+                sim.last_subcommand(),
+                Some(word_sub),
+                "{cpu_type} の書き込みサブコマンド"
+            );
+            supervisor.shutdown().await;
+            sim.stop();
+        }
     }
 
     // -----------------------------------------------------------------

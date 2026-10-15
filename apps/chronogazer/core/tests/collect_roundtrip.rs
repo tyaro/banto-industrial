@@ -129,6 +129,7 @@ async fn register(pool: &SqlitePool, protocol: &str, port: u16, address: &str) -
             simulation: false,
             // "" = プロトコルの既定（u16 の 1 ワードなので結果は変わらない）。
             word_order: String::new(),
+            cpu_type: None,
             database: None,
             username: None,
             password: None,

@@ -94,13 +94,18 @@ async fn concurrent_reads_during_writes_never_corrupt_or_error() {
     });
 
     // Foreground: races the writer from the very first instant (the data
-    // directory may not even exist yet) through to completion, bounded by a
-    // generous wall-clock deadline rather than a fixed sleep/iteration count.
+    // directory may not even exist yet) through to completion. The bound is
+    // a hang timeout, not "the writer must finish in 10s": on windows-latest
+    // the 50 flushes were still in progress at 10s (46 rows committed, CI
+    // run 38620658017). Keep reading until every row is visible, or until
+    // the writer has finished and a few more reads have run, or until the
+    // hang timeout.
     let query = TsQuery::new(&dir_path);
     let requested_tags = tag_keys(&[TAG_KEY]);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_count = 0usize;
     let mut saw_all = false;
+    let mut reads_after_writer = 0u32;
 
     while Instant::now() < deadline {
         match query
@@ -155,11 +160,18 @@ async fn concurrent_reads_during_writes_never_corrupt_or_error() {
             saw_all = true;
             break;
         }
+        if writer_task.is_finished() {
+            reads_after_writer += 1;
+            if reads_after_writer >= 3 {
+                break;
+            }
+        }
     }
 
     assert!(
         saw_all,
-        "reader never observed all {ROW_COUNT} rows within the timeout (last saw {last_count})"
+        "reader never observed all {ROW_COUNT} rows (last saw {last_count}; writer finished: {})",
+        writer_task.is_finished()
     );
 
     writer_task.await.expect("writer task must not panic");

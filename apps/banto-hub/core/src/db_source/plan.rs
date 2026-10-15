@@ -346,6 +346,7 @@ mod tests {
             enabled,
             simulation: false,
             word_order: "low_high".to_string(),
+            cpu_type: "R".to_string(),
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             password: Some("s3cret".to_string()),

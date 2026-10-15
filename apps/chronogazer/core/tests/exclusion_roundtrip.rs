@@ -121,6 +121,7 @@ async fn connection(pool: &SqlitePool, name: &str, port: u16) -> i64 {
             enabled: true,
             simulation: false,
             word_order: String::new(),
+            cpu_type: None,
             database: None,
             username: None,
             password: None,

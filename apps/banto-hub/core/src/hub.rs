@@ -2405,6 +2405,7 @@ mod tests {
                 enabled: true,
                 simulation: true,
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -2607,6 +2608,7 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    cpu_type: "R".to_string(),
                     database: None,
                     username: None,
                     password: None,
@@ -2622,6 +2624,7 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    cpu_type: "R".to_string(),
                     database: None,
                     username: None,
                     password: None,
@@ -2637,6 +2640,7 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    cpu_type: "R".to_string(),
                     database: None,
                     username: None,
                     password: None,
@@ -2652,6 +2656,7 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    cpu_type: "R".to_string(),
                     database: None,
                     username: None,
                     password: None,
@@ -2698,6 +2703,7 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            cpu_type: "R".to_string(),
             database: None,
             username: None,
             password: None,
@@ -2713,6 +2719,7 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            cpu_type: "R".to_string(),
             database: None,
             username: None,
             password: None,
@@ -2801,6 +2808,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -2885,6 +2893,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -2935,6 +2944,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -3011,6 +3021,7 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,
@@ -3111,6 +3122,7 @@ mod tests {
                 simulation: true,
 
                 word_order: "low_high".to_string(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,

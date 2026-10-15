@@ -7,6 +7,7 @@
 import type {
 	CollectionGroup,
 	CollectionGroupInput,
+	CpuType,
 	PlcConnection,
 	PlcConnectionInput,
 	PlcProtocol,
@@ -245,6 +246,19 @@ function expectNullableNumber(value: unknown, path: string): number | null {
 }
 
 /**
+ * #605: `cpuType` は旧パッケージには無い。省略と `null` は `undefined` のまま
+ * 返す（作成は R、更新は既存の値を保つ。REST/MCP の「省略は既存を保つ」と
+ * 同じ。ここで `"R"` を入れると、既存の Q 接続を同名の旧パッケージの取り込みが
+ * R に戻してしまう）。`"Q"` / `"R"` はそのまま。それ以外は拒否する
+ * （R へ黙って倒さない）。
+ */
+function expectCpuType(value: unknown, path: string): CpuType | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (value === 'Q' || value === 'R') return value;
+	throw new ConfigPackageParseError(`${path} は Q / R のいずれかである必要があります`);
+}
+
+/**
  * P3-b（監査指摘 2026-08-12）: `wordOrder` は既存のエクスポート済み構成
  * パッケージ（この列を持たない旧スキーマ）にはまだ存在しない可能性がある
  * ので、`expectString` 等と違い省略を許容する — 省略時はバックエンドの既定
@@ -331,8 +345,19 @@ function filterVirtualConnections(connections: readonly PlcConnection[]): PlcCon
  * フィールド自体が無い）ため、詰め忘れようがない。
  */
 function sanitizeConnection(input: PlcConnection): ConfigPackagePlcConnection {
-	const { name, protocol, host, port, unitId, enabled, simulation, wordOrder, database, username } =
-		input;
+	const {
+		name,
+		protocol,
+		host,
+		port,
+		unitId,
+		enabled,
+		simulation,
+		wordOrder,
+		cpuType,
+		database,
+		username
+	} = input;
 	return {
 		name,
 		protocol,
@@ -342,6 +367,7 @@ function sanitizeConnection(input: PlcConnection): ConfigPackagePlcConnection {
 		enabled,
 		simulation,
 		wordOrder,
+		cpuType,
 		database: database ?? undefined,
 		username: username ?? undefined
 	};
@@ -548,6 +574,7 @@ function parsePlcConnections(raw: unknown): ConfigPackagePlcConnection[] {
 			enabled: expectBoolean(item.enabled, `plcConnections[${index}].enabled`),
 			simulation: expectBoolean(item.simulation, `plcConnections[${index}].simulation`),
 			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`, protocol),
+			cpuType: expectCpuType(item.cpuType, `plcConnections[${index}].cpuType`),
 			database: expectOptionalString(item.database, `plcConnections[${index}].database`),
 			username: expectOptionalString(item.username, `plcConnections[${index}].username`)
 		};

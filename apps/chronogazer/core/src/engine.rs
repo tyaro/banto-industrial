@@ -1999,6 +1999,7 @@ mod tests {
                 enabled: true,
                 simulation: false,
                 word_order: String::new(),
+                cpu_type: None,
                 database: None,
                 username: None,
                 password: None,

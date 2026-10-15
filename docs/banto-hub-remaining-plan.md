@@ -1,7 +1,7 @@
 # banto-hub 残作業 実行計画（2026-08 全量監査ベース）
 
 作成日: 2026-08-12
-状態: **オーナー承認・実行中**。2026-08-12 に docs 14 文書 + コード + GitHub を全量監査した
+状態: **オーナー承認・実行中**。2026-10-14: P3-b の SLMP CPU 種別は #605 で接続ごとに選べる（既定 R。アクセスルートは未露出）。2026-08-12 に docs 14 文書 + コード + GitHub を全量監査した
 結果を実行順に整理したもの。**進捗（2026-08-12）: Phase 0（#119）、監査フォロー①=stale ガード（#121）・
 ②最小対応（#121）・③稼働中 import ガード（#126）、profile_lock フレーク（#122）、Swagger UI（#124）、
 P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構造化エラー（#129、文言パース完全削除、
@@ -29,7 +29,7 @@ read/write・構造体タグ登録＋オフセットコピー・レシピ一括�
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
 [improvement-plan.md](improvement-plan.md) を正とし、本書はそれらの残項目の**優先順位と着手順**を定める索引。
-最終検証日(監査): 2026-08-12（進捗行の同期: 2026-09-06）
+最終検証日(監査): 2026-08-12（進捗行の同期: 2026-10-14）
 基準コミット: 889f622（監査時）／`d5ba55e`（T18-5a 判定記録後の現 main、2026-08-14）
 
 ## 0. 前提と現況
@@ -124,7 +124,9 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   relay-wright/chronogazer が使う経路）の両方が `host`/`port` 以外を `SlmpConfig::default()` 固定に
   しており、ワード順の異なる機種で u32/f32 の値化けに直結していた問題を解消。`plc_connections.word_order`
   （migration `0010`、既定 `low_high` で後方互換）→ フォーム（"slmp" 選択時のみ）まで end-to-end 配線。
-  **残: CPU 種別 / アクセスルート（network/PC/IO/area id）は別スライス候補**（`slmp_config_for` の
+  **CPU 種別は #605（2026-10-14）で接続ごとに選べる**（`plc_connections.cpu_type`、migration `0021`、
+  既定 `R`。Q は QJ71E71 の 4E フレーム。同じ IP・ポートでも R→Q でセッションを作り直す）。
+  **残: アクセスルート（network/PC/IO/area id）は別スライス候補**（`slmp_config_for` の
   doc comment に "Known limitation" として明記）。
 - **P3-c（完全完了、文言パース削除2026-08-12・transport共通化/classify_slmp_error統合2026-08-14）**:
   H9 SLMP 構造化エラー（[improvement-plan.md](improvement-plan.md) §H9）。オーナーが

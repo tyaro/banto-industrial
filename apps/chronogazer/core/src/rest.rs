@@ -958,6 +958,9 @@ impl PlcConnectionPayload {
             enabled: self.enabled,
             simulation,
             word_order: self.word_order,
+            // #605: chronogazer の画面はこの項目を送らない。作成は R、更新は
+            // 既存行を保つ（banto-tags の省略規則）。
+            cpu_type: None,
             // postgres 専用列。[`reject_disallowed_connection_protocol`]
             // が postgres 接続の作成を拒否するので常に `None` でよい。
             database: None,
