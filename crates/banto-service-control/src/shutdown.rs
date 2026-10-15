@@ -16,6 +16,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
+use crate::windows_impl::map_win_err;
+#[cfg(windows)]
 use crate::ServiceManagerError;
 
 /// SCM が PRESHUTDOWN を送ってから、サービスが `Stopped` を報告するまで
@@ -315,24 +317,6 @@ fn query_preshutdown_ms(service: &windows_service::service::Service) -> Result<u
     } else {
         Ok(info.dwPreshutdownTimeout)
     }
-}
-
-/// `windows-service` のエラーを [`ServiceManagerError`] に写す。
-/// 未登録と権限不足だけを分け、残りは診断用の文字列。
-#[cfg(windows)]
-fn map_win_err(service_name: &str, err: windows_service::Error) -> ServiceManagerError {
-    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-    const ERROR_ACCESS_DENIED: i32 = 5;
-    if let windows_service::Error::Winapi(io_err) = &err {
-        match io_err.raw_os_error() {
-            Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
-                return ServiceManagerError::NotFound(service_name.to_string());
-            }
-            Some(ERROR_ACCESS_DENIED) => return ServiceManagerError::AccessDenied,
-            _ => {}
-        }
-    }
-    ServiceManagerError::Other(err.to_string())
 }
 
 /// 計画の受理フラグを `windows-service` のビットへ写す。

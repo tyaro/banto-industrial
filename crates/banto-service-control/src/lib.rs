@@ -440,7 +440,13 @@ mod windows_impl {
         }
     }
 
-    fn map_win_err(service_name: &str, err: windows_service::Error) -> ServiceManagerError {
+    /// `windows-service` のエラーを [`ServiceManagerError`] に写す。
+    /// 未登録と権限不足だけを分け、残りは診断用の文字列。PRESHUTDOWN の
+    /// 待ち時間の設定（`shutdown::ensure_preshutdown_timeout`）も同じ写し方を使う。
+    pub(crate) fn map_win_err(
+        service_name: &str,
+        err: windows_service::Error,
+    ) -> ServiceManagerError {
         if let windows_service::Error::Winapi(io_err) = &err {
             match io_err.raw_os_error() {
                 Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
