@@ -37,12 +37,15 @@
 //!   **開始の受付と同じロックの中で印を立てて**忙しいかを読む。印が立った
 //!   後の開始は「終了処理中のため、収集を開始できません」のエラーで断られ、
 //!   確かめ直すとき（`AskAgain`）は印を下ろす（上げ下げは
-//!   [`QuitGate::answer`] が行う）。ここで扱うのは**確認のための一時的な
+//!   `crate::lifecycle::Lifecycle::answer_quit` が、共有の `QuitGate::answer` と同じ
+//!   形で行う）。ここで扱うのは**確認のための一時的な
 //!   印**だけで、終了処理（[`crate::exit_cleanup`] →
 //!   エンジンの終了、OS のシャットダウンを含む）は取り消せない印
 //!   （`CollectorService::begin_shutdown`）を立てる。遅れて届いた `AskAgain`
 //!   は後者を下ろせない（#392 A2 再レビュー P2-2）。
-//! - **終了処理中にもう一度「終了」**: [`banto_desktop_tray::QuitGate`] が
+//! - **終了処理中にもう一度「終了」**: ライフサイクルの状態機械
+//!   （[`crate::lifecycle`]。確認の段階は共有の `banto_desktop_tray::decide_request`・
+//!   `decide_answer` を表の中で使う。#392 B2-4c の後に `QuitGate` の入れ物から移した）が
 //!   確認ダイアログを 2 つ出さず、終了処理を 2 回走らせない。終了処理の本体も
 //!   [`crate::exit_cleanup`] が 1 回に限る（OS のシャットダウンで
 //!   `RunEvent::Exit` が同時に来ても、走っている後始末の完了を待つだけ）。
@@ -68,12 +71,12 @@
 //!
 //! サービスの開始・停止はトレイに出さない（O4、B2-5）。Service の「終了」は確認の文で
 //! 「サービスは止まらず収集を続ける」と知らせる。Fallback の「終了」は止めるものが
-//! 無いので確認しない（**判断**。ただし確認の答えと同じ受付（[`QuitGate`]）を通すので、
+//! 無いので確認しない（**判断**。ただし確認の答えと同じ受付（`Lifecycle::answer_quit`）を通すので、
 //! 「再試行」で Desktop が起動し終えて収集中になっていれば、収集中の文言で確かめ直す）。
 //! どの態でも終了処理は [`crate::exit_cleanup`] を通る（シェルの移り変わりの終わりを
 //! 待ち、エンジンがあれば止める）。待つ上限は、トレイ・Fallback の「終了」では移り変わりを
 //! 60 秒（専用のスレッドで待つので画面は塞がない）、OS の終了では後始末と合わせて 1 つの
-//! 5 秒の期限（`crate::exit_budgets`、PR #608 の全体監査 F2・F3）。
+//! 5 秒の期限（`crate::lifecycle::exit_budgets`、PR #608 の全体監査 F2・F3）。
 //!
 //! # メインスレッドとロック（PR #608 の Copilot レビュー）
 //!
@@ -87,28 +90,29 @@
 //!   握ったままメインスレッドを待ち、メインスレッドの `quit` が同じロックを待つと
 //!   止まる。書き換えは [`post_spec`] で**メインスレッドへ渡すだけ**（待たない）にし、
 //!   ロックをやめた。書き換えはすべてメインスレッドの上で順に走るので、「終了処理中」の
-//!   後に古い表示が来ても、その時点で終了の段階を見て何もしない（[`should_apply`]）。
+//!   後に古い表示が来ても、その時点で終了の段階を見て何もしない（状態機械の表の
+//!   「トレイの書き換え」の行）。
 //! - **メインスレッドから来た終了は、重い処理を別のスレッドへ渡す**: 確認を省く態
 //!   （Fallback）の終了は確定の手順ごと別のスレッドで行い、後始末（移り変わり・エンジンの
 //!   停止を待つ）は今までどおり専用のスレッドで行う。メインスレッドの上で取るロックは
-//!   `QuitGate`・`ShellGate`・収集の受付の短いものだけで、どれも中でメインスレッドを
-//!   待たない（`ShellGate` の `admit` の中の `manage` もメインスレッドを使わない）。
+//!   ライフサイクルの状態機械（[`crate::lifecycle`]、1 つ）・収集の受付の短いものだけで、
+//!   どれも中でメインスレッドを待たない（状態機械の `admit` の中の `manage` も
+//!   メインスレッドを使わない）。
 //!
 //! この並行はモックのランタイムでは再現できないので単体テストは無い（構造で防ぐ:
-//! トレイの書き換えに使うロック自体が無い）。書き換えの判断だけを純関数でテストする。
+//! トレイの書き換えに使うロック自体が無い）。書き換えの判断は状態機械の表の
+//! 「トレイの書き換え」の行でテストする。
 
 use std::time::Duration;
 
-use banto_desktop_tray::{
-    ConfirmPrompt, QuitAdmission, QuitAnswerDecision, QuitGate, QuitPhase, QuitRequestDecision,
-    TrayHint,
-};
+use banto_desktop_tray::{ConfirmPrompt, QuitAdmission, TrayHint};
 use chronogazer_core::collect::{CollectorService, CollectorState};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
+use crate::lifecycle::{QuitAnswerOutcome, QuitRequestOutcome};
 use crate::shell::{FALLBACK_WINDOW_LABEL, SERVICE_WINDOW_LABEL};
 use crate::startup::RECOVERY_WINDOW_LABEL;
 use crate::{AppState, ExitCleanupReport, ExitTrigger, LEGACY_DB_WINDOW_LABEL, MAIN_WINDOW_LABEL};
@@ -246,7 +250,7 @@ pub(crate) fn is_collecting(state: &CollectorState) -> bool {
     state.is_collecting()
 }
 
-/// 確認の答えで [`QuitGate::answer`] に渡す、終了の受付の口（このモジュールの
+/// 確認の答えで `Lifecycle::answer_quit` に渡す、終了の受付の口（このモジュールの
 /// doc「同意と収集の開始の競合」）。`AppState` が無い（起動を止めてエラーの
 /// 窓を出している）ときは止める収集が無いので、常に暇で印も無い。
 struct CollectorQuitAdmission(Option<CollectorService>);
@@ -375,11 +379,12 @@ pub(crate) fn refresh(app: &AppHandle) {
 
 /// トレイの書き換えをメインスレッドへ渡す（**待たない**。モジュール doc「メイン
 /// スレッドとロック」）。`even_when_quitting` が偽なら、メインスレッドで実際に書き換える
-/// 時点で終了処理に入っていれば何もしない（「終了処理中」を古い状態で上書きしない）。
+/// 時点で終了処理に入っていれば何もしない（「終了処理中」を古い状態で上書きしない。
+/// 状態機械の表の「トレイの書き換え」の行）。
 fn post_spec(app: &AppHandle, spec: Vec<MenuEntry>, even_when_quitting: bool) {
     let handle = app.clone();
     let posted = app.run_on_main_thread(move || {
-        if should_apply(even_when_quitting, quitting(&handle)) {
+        if tray_may_apply(&handle, even_when_quitting) {
             apply_spec(&handle, &spec);
         }
     });
@@ -388,17 +393,21 @@ fn post_spec(app: &AppHandle, spec: Vec<MenuEntry>, even_when_quitting: bool) {
     }
 }
 
-/// メインスレッドで書き換える時点の判断（純関数）: 「終了処理中」の書き換えは常に、
-/// それ以外は終了処理に入っていなければ。
-pub(crate) fn should_apply(even_when_quitting: bool, quitting_now: bool) -> bool {
-    even_when_quitting || !quitting_now
+/// トレイを書き換えてよいか（状態機械が無ければ書き換える）。
+fn tray_may_apply(app: &AppHandle, quitting_label: bool) -> bool {
+    crate::shell::lifecycle(app)
+        .map(|lifecycle| lifecycle.tray_may_apply(quitting_label))
+        .unwrap_or(true)
 }
 
 /// 窓を戻す（トレイの「開く」・左クリック・2 つ目の起動）。終了処理に
 /// 入っていたら何もしない。メインの窓が無い（起動を止めてエラーの窓を
 /// 出している）ときはエラーの窓を前に出す。
 pub(crate) fn open_main_window(app: &AppHandle) {
-    if quitting(app) {
+    let may_open = crate::shell::lifecycle(app)
+        .map(|lifecycle| lifecycle.may_open_window())
+        .unwrap_or(true);
+    if !may_open {
         return;
     }
     // 起動を止めたときのエラーの窓（旧形式の DB・既に起動中、#392 の対処の窓）も
@@ -414,12 +423,6 @@ pub(crate) fn open_main_window(app: &AppHandle) {
             RECOVERY_WINDOW_LABEL,
         ],
     );
-}
-
-fn quitting(app: &AppHandle) -> bool {
-    app.try_state::<QuitGate>()
-        .map(|gate| gate.phase() == QuitPhase::Quitting)
-        .unwrap_or(false)
 }
 
 fn current_state(app: &AppHandle) -> Option<CollectorState> {
@@ -479,7 +482,7 @@ async fn watch_status(app: AppHandle, mut shown: Vec<MenuEntry>) {
     loop {
         tokio::time::sleep(STATUS_POLL_INTERVAL).await;
         let spec = current_spec(&app);
-        if quitting(&app) {
+        if !tray_may_apply(&app, false) {
             break;
         }
         // 書き換えはメインスレッドへ渡すだけ（待たない）。確認の直後に終了へ入られても、
@@ -492,34 +495,28 @@ async fn watch_status(app: AppHandle, mut shown: Vec<MenuEntry>) {
     }
 }
 
-/// トレイの「終了」（#392 B2-4c からは接続できない状態の窓の「終了」も）。
+/// トレイの「終了」（#392 B2-4c からは接続できない状態の窓の「終了」も）。確認を
+/// 出すか・断るか・何もしないかは状態機械の表の「トレイ・Fallback の「終了」」の行
+/// （`Lifecycle::request_quit`）。
 pub(crate) fn request_quit(app: &AppHandle) {
-    let Some(gate) = app.try_state::<QuitGate>() else {
+    let Some(lifecycle) = crate::shell::lifecycle(app) else {
         return;
     };
-    match gate.request() {
-        QuitRequestDecision::ShowPrompt => {
-            // DB の復旧の途中なら確認も出さずに断る（確定の時点でも確かめ直す -
-            // [`confirm_quit`]）。
-            if crate::shell::recovering(app) {
-                let admission = CollectorQuitAdmission(None);
-                let _ = gate.answer(false, false, &admission);
-                tell_quit_refused(app);
-                return;
-            }
-            if needs_quit_confirm(&crate::shell::current_tray_mode(app)) {
-                prompt_quit(app, currently_collecting(app));
-            } else {
-                // 確認しない態（Fallback）: 同意したものとして同じ受付を通す。メニュー・
-                // 窓のボタン（`on_navigation`）はメインスレッドから来るので、終了の処理は
-                // 別のスレッドへ渡してメインスレッドを塞がない（PR #608 の Copilot レビュー）。
-                let app = app.clone();
-                std::thread::spawn(move || on_quit_answer(app, true, false));
-            }
+    match lifecycle.request_quit() {
+        QuitRequestOutcome::Ask { confirm: true } => prompt_quit(app, currently_collecting(app)),
+        // 確認しない態（Fallback）: 同意したものとして同じ受付を通す。メニュー・
+        // 窓のボタン（`on_navigation`）はメインスレッドから来るので、終了の処理は
+        // 別のスレッドへ渡してメインスレッドを塞がない（PR #608 の Copilot レビュー）。
+        QuitRequestOutcome::Ask { confirm: false } => {
+            let app = app.clone();
+            std::thread::spawn(move || on_quit_answer(app, true, false));
         }
+        // DB の復旧の途中なら確認も出さずに断る（確定の時点でも確かめ直す -
+        // [`on_quit_answer`]）。
+        QuitRequestOutcome::RecoveryInProgress => tell_quit_refused(app),
         // 確認ダイアログは出ている／終了処理は走っている - どちらも 2 つ目は
         // 作らない。
-        QuitRequestDecision::AlreadyConfirming | QuitRequestDecision::AlreadyQuitting => {}
+        QuitRequestOutcome::AlreadyHandled => {}
     }
 }
 
@@ -538,71 +535,22 @@ fn prompt_quit(app: &AppHandle, prompted_collecting: bool) {
     );
 }
 
-/// 確認の答え（確認しない態では「同意」として直接呼ぶ）。
+/// 確認の答え（確認しない態では「同意」として直接呼ぶ）。DB の復旧の途中の同意は
+/// 断り、同意で終了が確定したら新しい復旧を始めない（PR #608 のオーナーレビュー P2。
+/// どちらも状態機械の同じロックの中で決まる - `Lifecycle::answer_quit`）。
 fn on_quit_answer(app: AppHandle, confirmed: bool, prompted_collecting: bool) {
-    let Some(gate) = app.try_state::<QuitGate>() else {
+    let Some(lifecycle) = crate::shell::lifecycle(&app) else {
         return;
     };
     let admission = CollectorQuitAdmission(
         app.try_state::<AppState>()
             .map(|state| state.services.collect.clone()),
     );
-    let step = confirm_quit(
-        confirmed,
-        || crate::shell::reserve_quit(&app),
-        || crate::shell::release_quit(&app),
-        |confirmed| gate.answer(confirmed, prompted_collecting, &admission),
-    );
-    match step {
-        QuitStep::Proceed => quit(app.clone()),
-        QuitStep::AskAgain => prompt_quit(&app, true),
-        QuitStep::Refused => tell_quit_refused(&app),
-        QuitStep::Nothing => {}
-    }
-}
-
-/// 確認の答えの後にすること（[`confirm_quit`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuitStep {
-    /// 終了処理へ進む（終了の予約は持ったまま。扉は後始末が閉じる）。
-    Proceed,
-    /// 収集中の文言で確かめ直す（予約は下ろした）。
-    AskAgain,
-    /// DB の復旧の途中なので断った（確認の段階は戻した）。
-    Refused,
-    /// 取り消し・遅れて届いた答え（予約は下ろした）。
-    Nothing,
-}
-
-/// 確認の答えを、シェルの終了の予約と合わせて確定する（PR #608 のオーナーレビュー
-/// P2）。同意なら**先に**終了を予約し（`reserve`。DB の復旧の途中なら断られる）、
-/// 断られたら答えを「取り消し」として渡して確認の段階を戻す（`app.exit` へ進まない）。
-/// 予約できたら答えを渡し、終了へ進まなかったら予約を下ろす（`release`）。`answer` は
-/// `QuitGate::answer`（引数は渡す「同意」）。
-pub(crate) fn confirm_quit(
-    confirmed: bool,
-    reserve: impl FnOnce() -> Result<(), crate::shell::QuitRefused>,
-    release: impl FnOnce(),
-    answer: impl FnOnce(bool) -> QuitAnswerDecision,
-) -> QuitStep {
-    if !confirmed {
-        let _ = answer(false);
-        return QuitStep::Nothing;
-    }
-    if reserve().is_err() {
-        let _ = answer(false);
-        return QuitStep::Refused;
-    }
-    match answer(true) {
-        QuitAnswerDecision::Proceed => QuitStep::Proceed,
-        QuitAnswerDecision::AskAgain => {
-            release();
-            QuitStep::AskAgain
-        }
-        QuitAnswerDecision::Cancelled | QuitAnswerDecision::Ignored => {
-            release();
-            QuitStep::Nothing
-        }
+    match lifecycle.answer_quit(confirmed, prompted_collecting, &admission) {
+        QuitAnswerOutcome::Proceed => quit(app.clone()),
+        QuitAnswerOutcome::AskAgain => prompt_quit(&app, true),
+        QuitAnswerOutcome::RecoveryInProgress => tell_quit_refused(&app),
+        QuitAnswerOutcome::Cancelled | QuitAnswerOutcome::Ignored => {}
     }
 }
 
@@ -610,7 +558,7 @@ pub(crate) fn confirm_quit(
 fn tell_quit_refused(app: &AppHandle) {
     eprintln!("banto: データベースの復旧の途中のため、トレイの終了を断りました");
     app.dialog()
-        .message(crate::shell::RECOVERY_IN_PROGRESS_MESSAGE)
+        .message(crate::lifecycle::RECOVERY_IN_PROGRESS_MESSAGE)
         .title("ChronoGazer を終了")
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCustom("OK".to_string()))
@@ -630,8 +578,8 @@ fn quit(app: AppHandle) {
             let _ = window.hide();
         }
     }
-    // 終了の段階（`QuitPhase::Quitting`）は確認の答えで既に立っているので、この後に
-    // メインスレッドで書き換わる他の表示は何もしない（[`should_apply`]）。
+    // 終了の確定（状態機械の `QuitPhase::Quitting`）は確認の答えで既に立っているので、
+    // この後にメインスレッドで書き換わる他の表示は何もしない（[`post_spec`]）。
     post_spec(
         &app,
         vec![MenuEntry::Status("終了処理中…".to_string())],
@@ -774,88 +722,6 @@ mod tests {
             items(&fallback),
             vec![("open", "開く"), ("retry", "再試行"), ("quit", "終了")]
         );
-    }
-
-    struct NotBusy;
-    impl QuitAdmission for NotBusy {
-        fn begin_quit_confirm(&self) -> bool {
-            false
-        }
-        fn cancel_quit_confirm(&self) {}
-    }
-
-    /// PR #608 のオーナーレビュー P2: DB の復旧の途中に確定した「終了」は断られ、
-    /// 終了処理（`app.exit`）へ進まず、確認の段階も戻る。復旧が終われば通る。
-    #[test]
-    fn quit_confirmed_during_recovery_is_refused_then_allowed_after() {
-        use crate::shell::{ShellGate, ShellView};
-        let shell = ShellGate::new(ShellView::Desktop);
-        let quit_gate = QuitGate::new();
-        let recovery = shell.begin_recovery().expect("recovery");
-
-        assert_eq!(quit_gate.request(), QuitRequestDecision::ShowPrompt);
-        let step = confirm_quit(
-            true,
-            || shell.reserve_quit(),
-            || shell.release_quit(),
-            |confirmed| quit_gate.answer(confirmed, false, &NotBusy),
-        );
-        assert_eq!(step, QuitStep::Refused);
-        assert_eq!(quit_gate.phase(), QuitPhase::Idle);
-        assert!(!shell.is_exiting());
-
-        drop(recovery);
-        assert_eq!(quit_gate.request(), QuitRequestDecision::ShowPrompt);
-        let step = confirm_quit(
-            true,
-            || shell.reserve_quit(),
-            || shell.release_quit(),
-            |confirmed| quit_gate.answer(confirmed, false, &NotBusy),
-        );
-        assert_eq!(step, QuitStep::Proceed);
-        assert_eq!(quit_gate.phase(), QuitPhase::Quitting);
-        // 予約は持ったまま: この後の新しい復旧は始まらない。
-        assert!(shell.begin_recovery().is_err());
-    }
-
-    /// 取り消し・確かめ直しでは予約を下ろす（復旧を塞ぎ続けない）。
-    #[test]
-    fn quit_reservation_is_released_unless_proceeding() {
-        use crate::shell::{ShellGate, ShellView};
-        let shell = ShellGate::new(ShellView::Desktop);
-        let quit_gate = QuitGate::new();
-        quit_gate.request();
-        let step = confirm_quit(
-            false,
-            || shell.reserve_quit(),
-            || shell.release_quit(),
-            |confirmed| quit_gate.answer(confirmed, false, &NotBusy),
-        );
-        assert_eq!(step, QuitStep::Nothing);
-        drop(shell.begin_recovery().expect("not reserved after cancel"));
-
-        quit_gate.request();
-        let step = confirm_quit(
-            true,
-            || shell.reserve_quit(),
-            || shell.release_quit(),
-            |_| QuitAnswerDecision::AskAgain,
-        );
-        assert_eq!(step, QuitStep::AskAgain);
-        drop(
-            shell
-                .begin_recovery()
-                .expect("not reserved after ask-again"),
-        );
-    }
-
-    /// 終了処理に入った後は「終了処理中」以外の書き換えをしない。
-    #[test]
-    fn only_the_quitting_label_is_applied_after_quit() {
-        assert!(should_apply(false, false));
-        assert!(!should_apply(false, true));
-        assert!(should_apply(true, true));
-        assert!(should_apply(true, false));
     }
 
     /// 終了の確認: Desktop は A2 のまま、Service はサービスが止まらないこと、Fallback は

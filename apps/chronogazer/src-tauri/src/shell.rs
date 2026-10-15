@@ -53,49 +53,51 @@
 //! Healthy になった（再起動して port が変わった）ときも不健康に数え、Fallback を経て
 //! 新しい port へつなぎ直す。
 //!
-//! # 並行（[`ShellGate`]、Tauri に依存しない部分）
+//! # 並行（[`crate::lifecycle`]、Tauri に依存しない部分）
+//!
+//! 「移ってよいか・終わってよいか・何をどれだけ待つか」の判断は、すべてライフ
+//! サイクルの状態機械（[`crate::lifecycle`]、1 つのロックと 1 つの表）が持つ。ここは
+//! 表の判断に従って窓を作る・消すだけで、その場で別の印を読んで確かめ直さない。
+//! 表の行のうちシェルに関わるもの:
 //!
 //! - **移り変わりは 1 つずつ**: 移る処理（見張りの Service ↔ Fallback、「再試行」、
-//!   対処の窓の起動のやり直し）は [`ShellGate::begin_transition`] の札を持って行う。
-//!   札があれば「再試行」の二度押し・見張りの適用は何もしない。
+//!   対処の窓の起動のやり直し）は札（[`TransitionGuard`]）を持って行う。札があれば
+//!   「再試行」の二度押し・見張りの適用は何もしない。
 //! - **飛行中の観測が新しい状態を巻き戻さない**: 見張りは観測の前に画面の世代
 //!   （generation）を控え、適用するときに世代が変わっていたら捨てる
-//!   （[`ShellGate::begin_transition_at`]）。
-//! - **終了との競合**: 終了の後始末（[`crate::exit_cleanup`]）は最初に
-//!   [`ShellGate::close`] で扉を閉じ（以後の移り変わりを断る）、走っている移り
-//!   変わりの終わりを上限まで待ってから（[`ShellGate::wait_idle`]、上限は下の「待ちの
-//!   上限は終了の起点で分ける」）、エンジンを探す。
-//!   「再試行」の [`crate::launch_desktop`] が扉が閉じた後に起動し終えたら、エンジンを
-//!   置かずにその場で止める（[`ShellGate::admit`]。banto-hub の `discard_started_hub` と
-//!   同じ考え）。エンジンを置くこと（`AppState`・`DesktopEngine` の manage）と扉の
-//!   確認は同じロックの中で行うので、「置いたのに後始末が見落とす」「後始末が
-//!   終わった後に置く」のどちらも起きない。トレイの「終了」は移り変わりの終わりを
-//!   待ってから終わる。
+//!   （`Lifecycle::begin_transition_at`）。
+//! - **終了との競合**: 終了の後始末（[`crate::exit_cleanup`]）は最初に扉を閉じ
+//!   （`Lifecycle::begin_exit`。以後の移り変わり・エンジンを置くことを断る）、表が
+//!   「待つ」と決めたときは走っている移り変わりの終わりを上限まで待ってから
+//!   （`Lifecycle::wait_idle`）、エンジンを探す。「再試行」の [`crate::launch_desktop`] が
+//!   扉が閉じた後に起動し終えたら、エンジンを置かずにその場で止める
+//!   （`Lifecycle::admit`。banto-hub の `discard_started_hub` と同じ考え）。エンジンを
+//!   置くこと（`DesktopEngine` の manage）と扉の確認は同じロックの中で行うので、「置いた
+//!   のに後始末が見落とす」「後始末が終わった後に置く」のどちらも起きない。
 //! - **待ちの上限は終了の起点で分ける**（PR #608 の全体監査 F2・F3、
-//!   `crate::exit_budgets`）: トレイ・Fallback の「終了」（自発的な終了。専用のスレッドで
-//!   待つので画面は塞がない）は、移り変わり（「再試行」の Desktop の起動）を長く（60 秒）
-//!   待つ - 短く切ると、起動し終えたエンジンを止めずにプロセスが終わりうる。OS の
-//!   シャットダウン（`RunEvent::Exit`、メインスレッド）は、移り変わりの待ちと後始末で
-//!   **1 つの 5 秒の期限**を分け合う（OS の猶予を超えない）。さらにエンジンが既に
-//!   置かれていれば移り変わりを待たない（窓を作る移り変わりはメインスレッドを待つので
-//!   終わらない。エンジンは見つかるので後始末で止められる）。エンジンは `start()` の
-//!   直後に置く（`crate::launch_desktop`）ので、「収集が動いているのに後始末から
-//!   見えない」区間は `start()` の中だけ。
+//!   `crate::lifecycle::exit_budgets`）: トレイ・Fallback の「終了」（自発的な終了。専用の
+//!   スレッドで待つので画面は塞がない）は、移り変わり（「再試行」の Desktop の起動）を
+//!   長く（60 秒）待つ - 短く切ると、起動し終えたエンジンを止めずにプロセスが終わりうる。
+//!   OS のシャットダウン（`RunEvent::Exit`、メインスレッド）は、移り変わりの待ちと
+//!   後始末で **1 つの 5 秒の期限**を分け合う（OS の猶予を超えない）。さらにエンジンが
+//!   既に置かれていれば移り変わりを待たない（窓を作る移り変わりはメインスレッドを
+//!   待つので終わらない。エンジンは見つかるので後始末で止められる）。エンジンは
+//!   `start()` の直後に置く（`crate::launch_desktop`）ので、「収集が動いているのに
+//!   後始末から見えない」区間は `start()` の中だけ。
 //! - **DB の復旧の途中は終了させない**（PR #608 のオーナーレビュー P2）: 対処の窓の
 //!   「作り直す」「バックアップから戻す」は DB の付随ファイルと本体を別々に名前を
 //!   変え、失敗したら戻す（`chronogazer_core::startup_recovery`）。途中でプロセスが
 //!   終わると、現用の側と `.broken` の側にファイルが分かれた復旧が残りうる。そこで
 //!   対処を受け付けた時点から起動のやり直しの終わりまで、**復旧の札**
-//!   （[`ShellGate::begin_recovery`]。移り変わりの札に「復旧中」の印を足したもの）を
-//!   持つ。トレイの「終了」は確定の前に [`ShellGate::reserve_quit`] で終了を予約し、
-//!   復旧中なら**断る**（ダイアログで「復旧の途中です。終わってから終了して
-//!   ください」と知らせ、確認の段階を戻す）。**判断**: 5 秒で打ち切って進むのでも
+//!   （`Lifecycle::begin_recovery`）を持つ。トレイの「終了」は復旧中なら**断る**
+//!   （押した時点でも、確認の答えの時点でも。ダイアログで「復旧の途中です。終わってから
+//!   終了してください」と知らせ、確認の段階を戻す）。**判断**: 5 秒で打ち切って進むのでも
 //!   完了まで黙って保留するのでもなく断る - 打ち切りは今回の問題そのもので、保留は
 //!   利用者から見ると「終了を押したのに何も起きない」になり、復旧が長い（大きな DB の
-//!   名前の変更が他のソフトに掴まれて再試行している）と理由が分からないため。予約が
-//!   立っている間は新しい復旧を始めない（対処の窓に「終了処理中」と出す）。予約と
-//!   復旧の印は同じロックの中で見るので、「確かめた後に復旧が始まる」隙は無い。
-//!   窓の × は今までどおり対処の窓の `busy` が防ぐ。OS のシャットダウン
+//!   名前の変更が他のソフトに掴まれて再試行している）と理由が分からないため。終了が
+//!   確定した後は新しい復旧を始めない（対処の窓に「終了処理中」と出す）。確定と
+//!   復旧の札は同じロックの中で見るので、「確かめた後に復旧が始まる」隙は無い。
+//!   窓の × は対処の窓の処理中が防ぐ（同じ表の行）。OS のシャットダウン
 //!   （`RunEvent::Exit`）は断れないので、移り変わりと同じく予算まで待ってから進む
 //!   （既知の制限。設計書の B2-4c の実装メモ）。
 //! - **見張りは 1 つだけ**: `setup()` で Service・Fallback に決まったときに 1 回だけ
@@ -116,8 +118,8 @@
 //! 正式な受入は B3-1（本物のサービス）で行う。
 
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use banto_service_control::ScmState;
 use chronogazer_core::instance_lock::ChronoGazerHost;
@@ -130,6 +132,7 @@ use serde::Serialize;
 use tauri::utils::config::WindowConfig;
 use tauri::{AppHandle, Manager, Url, WebviewUrl};
 
+use crate::lifecycle::{Lifecycle, PollSnapshot, TransitionGuard};
 use crate::tray::TrayMode;
 
 /// サービスの画面の窓の label。capabilities（`main` だけ）の対象外。
@@ -603,333 +606,41 @@ pub(crate) fn service_window_config(base: &WindowConfig, port: u16, visible: boo
 }
 
 // ---------------------------------------------------------------------------
-// 並行（Tauri に依存しない）
-// ---------------------------------------------------------------------------
-
-/// 移り変わりを断った理由。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TransitionRefused {
-    /// 別の移り変わりが走っている。
-    Busy,
-    /// 終了に入った。
-    Exiting,
-    /// 観測の後に画面が変わった（見張りの古い結果）。
-    Stale,
-}
-
-/// トレイの「終了」の予約を断った理由。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuitRefused {
-    /// DB の復旧（作り直す・バックアップから戻す）の途中。
-    RecoveryInProgress,
-}
-
-/// 終了を断ったときに利用者へ出す文。
-pub(crate) const RECOVERY_IN_PROGRESS_MESSAGE: &str = "データベースの復旧の途中です。途中で終了すると復旧が半端なまま残るおそれがあるため、終了できません。対処の窓で復旧が終わってから、もう一度終了してください。";
-
-/// 見張りが観測の前に取る控え。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PollSnapshot {
-    /// 見張りを終える（終了に入った・Desktop になった）。
-    Stop,
-    /// 移り変わりの最中（今回は見ない）。
-    Busy,
-    /// 観測してよい。
-    Ready {
-        view: ShellView,
-        generation: u64,
-        streak: u32,
-    },
-}
-
-#[derive(Debug)]
-struct GateInner {
-    view: ShellView,
-    /// 画面が変わるたびに 1 増える。
-    generation: u64,
-    /// 移り変わりの札が出ている。
-    transition: bool,
-    /// 終了に入った（扉が閉じた）。
-    exiting: bool,
-    /// トレイの「終了」が予約された（確定の直前から。新しい復旧を始めない）。
-    quit_reserved: bool,
-    /// DB の復旧の札が出ている（終了の予約を断る）。
-    recovering: bool,
-    /// Service の画面で続けて不健康だった回数。
-    streak: u32,
-}
-
-/// 画面・移り変わり・終了の扉（モジュール doc「並行」）。
-#[derive(Debug)]
-pub(crate) struct ShellGate {
-    inner: Mutex<GateInner>,
-    idle: Condvar,
-}
-
-impl ShellGate {
-    pub(crate) fn new(view: ShellView) -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(GateInner {
-                view,
-                generation: 0,
-                transition: false,
-                exiting: false,
-                quit_reserved: false,
-                recovering: false,
-                streak: 0,
-            }),
-            idle: Condvar::new(),
-        })
-    }
-
-    /// 中身は代入だけで書き換えるので、毒化は無視して中身を使う。
-    fn lock(&self) -> MutexGuard<'_, GateInner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub(crate) fn view(&self) -> ShellView {
-        self.lock().view.clone()
-    }
-
-    pub(crate) fn is_exiting(&self) -> bool {
-        self.lock().exiting
-    }
-
-    /// 見張りの控え。
-    pub(crate) fn poll(&self) -> PollSnapshot {
-        let inner = self.lock();
-        if inner.exiting || inner.view == ShellView::Desktop {
-            return PollSnapshot::Stop;
-        }
-        if inner.transition {
-            return PollSnapshot::Busy;
-        }
-        PollSnapshot::Ready {
-            view: inner.view.clone(),
-            generation: inner.generation,
-            streak: inner.streak,
-        }
-    }
-
-    /// 見張りの不健康の回数を残す（控えの後に画面が変わった・移り変わりの最中なら
-    /// 捨てる）。
-    pub(crate) fn record_streak(&self, generation: u64, streak: u32) {
-        let mut inner = self.lock();
-        if inner.generation == generation && !inner.transition {
-            inner.streak = streak;
-        }
-    }
-
-    /// 移り変わりの札を取る（「再試行」・対処の窓のやり直し）。
-    pub(crate) fn begin_transition(self: &Arc<Self>) -> Result<TransitionGuard, TransitionRefused> {
-        self.begin(None)
-    }
-
-    /// 見張りの控えの世代のままなら札を取る。
-    pub(crate) fn begin_transition_at(
-        self: &Arc<Self>,
-        generation: u64,
-    ) -> Result<TransitionGuard, TransitionRefused> {
-        self.begin(Some(generation))
-    }
-
-    fn begin(
-        self: &Arc<Self>,
-        generation: Option<u64>,
-    ) -> Result<TransitionGuard, TransitionRefused> {
-        let mut inner = self.lock();
-        if inner.exiting {
-            return Err(TransitionRefused::Exiting);
-        }
-        if inner.transition {
-            return Err(TransitionRefused::Busy);
-        }
-        if generation.is_some_and(|generation| generation != inner.generation) {
-            return Err(TransitionRefused::Stale);
-        }
-        inner.transition = true;
-        Ok(TransitionGuard {
-            gate: Arc::clone(self),
-            finished: false,
-        })
-    }
-
-    /// DB の復旧の札を取る（対処の窓の「作り直す」「バックアップから戻す」を受け付けた
-    /// 時点から、起動のやり直しの終わりまで持つ）。終了の予約・終了の後は断る
-    /// （`Exiting`）。札を返すと「復旧中」の印も下りる。
-    pub(crate) fn begin_recovery(self: &Arc<Self>) -> Result<TransitionGuard, TransitionRefused> {
-        let mut inner = self.lock();
-        if inner.exiting || inner.quit_reserved {
-            return Err(TransitionRefused::Exiting);
-        }
-        if inner.transition {
-            return Err(TransitionRefused::Busy);
-        }
-        inner.transition = true;
-        inner.recovering = true;
-        Ok(TransitionGuard {
-            gate: Arc::clone(self),
-            finished: false,
-        })
-    }
-
-    /// 復旧の途中か。
-    pub(crate) fn is_recovering(&self) -> bool {
-        self.lock().recovering
-    }
-
-    /// トレイの「終了」を確定する前の予約。復旧の途中なら断る。予約の後は新しい
-    /// 復旧を始めない。確定しなかったら [`Self::release_quit`] で下ろす。
-    pub(crate) fn reserve_quit(&self) -> Result<(), QuitRefused> {
-        let mut inner = self.lock();
-        if inner.recovering {
-            return Err(QuitRefused::RecoveryInProgress);
-        }
-        inner.quit_reserved = true;
-        Ok(())
-    }
-
-    /// 終了の予約を下ろす（確認で取り消された・確かめ直すとき）。
-    pub(crate) fn release_quit(&self) {
-        self.lock().quit_reserved = false;
-    }
-
-    /// 扉が閉じていなければ、同じロックの中で `install` を走らせる（エンジンを置く）。
-    /// 走らせたら `true`。閉じていれば走らせずに `false`（呼び出し側がエンジンを止める）。
-    pub(crate) fn admit(&self, install: impl FnOnce()) -> bool {
-        let inner = self.lock();
-        if inner.exiting {
-            return false;
-        }
-        install();
-        drop(inner);
-        true
-    }
-
-    /// 終了の扉を閉じ、走っている移り変わりの終わりを `budget` まで待つ。終わりを
-    /// 待てた（または無かった）ら `true`。何度呼んでもよい（本番は `exit_cleanup` が
-    /// [`Self::close`] と [`Self::wait_idle`] を分けて呼ぶ。テストの近道）。
-    #[cfg(test)]
-    pub(crate) fn begin_exit(&self, budget: Duration) -> bool {
-        self.close();
-        self.wait_idle(budget)
-    }
-
-    /// 終了の扉を閉じるだけ（待たない）。以後の移り変わり・エンジンを置くことを断る。
-    pub(crate) fn close(&self) {
-        self.lock().exiting = true;
-    }
-
-    /// 走っている移り変わりの終わりを `budget` まで待つ。終わりを待てた（または
-    /// 無かった）ら `true`。
-    pub(crate) fn wait_idle(&self, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
-        let mut inner = self.lock();
-        while inner.transition {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            inner = self
-                .idle
-                .wait_timeout(inner, deadline - now)
-                .map(|(guard, _)| guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner().0);
-        }
-        true
-    }
-}
-
-/// 移り変わりの札。[`Self::finish`] で新しい画面を置いて返す。そのまま落とすと画面は
-/// 変えずに返す（失敗・取りやめ）。
-#[derive(Debug)]
-pub(crate) struct TransitionGuard {
-    gate: Arc<ShellGate>,
-    finished: bool,
-}
-
-impl TransitionGuard {
-    /// 札を取った時点の画面。
-    pub(crate) fn view(&self) -> ShellView {
-        self.gate.view()
-    }
-
-    /// 新しい画面を置いて札を返す。
-    pub(crate) fn finish(mut self, view: ShellView) {
-        {
-            let mut inner = self.gate.lock();
-            inner.view = view;
-            inner.generation = inner.generation.wrapping_add(1);
-            inner.streak = 0;
-            inner.transition = false;
-            inner.recovering = false;
-        }
-        self.finished = true;
-        self.gate.idle.notify_all();
-    }
-}
-
-impl Drop for TransitionGuard {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        {
-            let mut inner = self.gate.lock();
-            inner.transition = false;
-            inner.recovering = false;
-        }
-        self.gate.idle.notify_all();
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tauri の配線
 // ---------------------------------------------------------------------------
 
-/// シェルの状態（`setup()` が manage する）。
+/// シェルの状態（`setup()` が manage する）。画面・札・終了の判断は
+/// [`crate::lifecycle::Lifecycle`]（`run()` が manage する）が持つ。
 pub(crate) struct ShellState {
-    pub(crate) gate: Arc<ShellGate>,
     pub(crate) layout: DataLayout,
     hooks: ShellTestHooks,
 }
 
-/// 今のトレイの態（`ShellState` が無ければ Desktop）。
+/// ライフサイクルの状態機械（`run()` が manage する。無ければ `None`）。
+pub(crate) fn lifecycle(app: &AppHandle) -> Option<Arc<Lifecycle>> {
+    app.try_state::<Arc<Lifecycle>>()
+        .map(|lifecycle| Arc::clone(&lifecycle))
+}
+
+/// 画面からトレイの態を決める（画面が決まる前は Desktop）。
+pub(crate) fn tray_mode_of(view: Option<&ShellView>) -> TrayMode {
+    view.map(tray_mode).unwrap_or(TrayMode::Desktop)
+}
+
+/// 今のトレイの態（画面が決まっていなければ Desktop）。
 pub(crate) fn current_tray_mode(app: &AppHandle) -> TrayMode {
-    app.try_state::<ShellState>()
-        .map(|shell| tray_mode(&shell.gate.view()))
-        .unwrap_or(TrayMode::Desktop)
+    tray_mode_of(
+        lifecycle(app)
+            .and_then(|lifecycle| lifecycle.view())
+            .as_ref(),
+    )
 }
 
-/// トレイの「終了」の予約（`ShellState` が無ければ通す）。
-pub(crate) fn reserve_quit(app: &AppHandle) -> Result<(), QuitRefused> {
-    match app.try_state::<ShellState>() {
-        Some(shell) => shell.gate.reserve_quit(),
-        None => Ok(()),
-    }
-}
-
-/// 終了の予約を下ろす。
-pub(crate) fn release_quit(app: &AppHandle) {
-    if let Some(shell) = app.try_state::<ShellState>() {
-        shell.gate.release_quit();
-    }
-}
-
-/// DB の復旧の途中か（`ShellState` が無ければ偽）。
-pub(crate) fn recovering(app: &AppHandle) -> bool {
-    app.try_state::<ShellState>()
-        .map(|shell| shell.gate.is_recovering())
-        .unwrap_or(false)
-}
-
-/// 終了の扉が閉じているか（`ShellState` が無ければ偽）。
-pub(crate) fn exiting(app: &AppHandle) -> bool {
-    app.try_state::<ShellState>()
-        .map(|shell| shell.gate.is_exiting())
-        .unwrap_or(false)
+/// `launch_desktop` が続けてよいか（終了の扉が閉じていれば偽）。
+pub(crate) fn launch_may_proceed(app: &AppHandle) -> bool {
+    lifecycle(app)
+        .map(|lifecycle| lifecycle.launch_may_proceed())
+        .unwrap_or(true)
 }
 
 /// SCM を照会する（Windows だけ。それ以外は [`ScmObservation::NotWindows`]）。
@@ -1008,9 +719,10 @@ pub(crate) fn start(app: &AppHandle) {
         }
     );
     let view = initial_view(&decision);
-    let gate = ShellGate::new(view.clone());
+    if let Some(lifecycle) = lifecycle(app) {
+        lifecycle.start(view.clone());
+    }
     app.manage(ShellState {
-        gate,
         layout: layout.clone(),
         hooks,
     });
@@ -1138,7 +850,8 @@ fn rerender_fallback(app: &AppHandle, notice: Option<String>, busy: bool) {
     let Some(shell) = app.try_state::<ShellState>() else {
         return;
     };
-    let ShellView::Fallback(state) = shell.gate.view() else {
+    let Some(ShellView::Fallback(state)) = lifecycle(app).and_then(|lifecycle| lifecycle.view())
+    else {
         return;
     };
     let page = fallback_page_view(&state, &shell.layout.logs_dir(), notice, busy);
@@ -1221,18 +934,22 @@ pub(crate) fn request_retry(app: &AppHandle) {
 }
 
 async fn retry(app: AppHandle) {
-    let gate = match app.try_state::<ShellState>() {
-        Some(shell) => Arc::clone(&shell.gate),
-        None => return,
+    if app.try_state::<ShellState>().is_none() {
+        return;
+    }
+    let Some(lifecycle) = lifecycle(&app) else {
+        return;
     };
     // 二度押し・見張りの移り変わりの最中・終了の後は何もしない（窓が「確かめて
-    // います」のまま残らないよう、今の状態で描き直す）。
-    let Ok(guard) = gate.begin_transition() else {
-        rerender_fallback(&app, None, false);
-        return;
-    };
-    let ShellView::Fallback(current) = guard.view() else {
-        return;
+    // います」のまま残らないよう、今の状態で描き直す）。古いメニューから Fallback で
+    // ない画面で押されたときも何もしない（`lifecycle` の表の「再試行」の行）。
+    let (guard, current) = match lifecycle.begin_retry() {
+        Ok(granted) => granted,
+        Err(crate::lifecycle::Refusal::NotFallback) => return,
+        Err(_) => {
+            rerender_fallback(&app, None, false);
+            return;
+        }
     };
     rerender_fallback(&app, None, true);
     let Some((scm, health)) = observe_async(&app).await else {
@@ -1340,9 +1057,11 @@ async fn switch_to_desktop(app: &AppHandle, guard: TransitionGuard) {
 async fn monitor(app: AppHandle) {
     loop {
         tokio::time::sleep(MONITOR_INTERVAL).await;
-        let gate = match app.try_state::<ShellState>() {
-            Some(shell) => Arc::clone(&shell.gate),
-            None => break,
+        if app.try_state::<ShellState>().is_none() {
+            break;
+        }
+        let Some(gate) = lifecycle(&app) else {
+            break;
         };
         let (view, generation, streak) = match gate.poll() {
             PollSnapshot::Stop => break,
@@ -1386,7 +1105,6 @@ async fn monitor(app: AppHandle) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::mpsc;
 
     fn all_observations() -> Vec<ScmObservation> {
         vec![
@@ -1878,177 +1596,5 @@ mod tests {
                 scm: "開始中".to_string()
             }
         );
-    }
-
-    // ---- ShellGate ----
-
-    #[test]
-    fn transitions_are_one_at_a_time_and_stale_results_are_dropped() {
-        let gate = ShellGate::new(ShellView::Service { port: 1 });
-        let PollSnapshot::Ready { generation, .. } = gate.poll() else {
-            panic!("ready");
-        };
-        let guard = gate.begin_transition().expect("first");
-        assert_eq!(
-            gate.begin_transition().unwrap_err(),
-            TransitionRefused::Busy
-        );
-        assert_eq!(gate.poll(), PollSnapshot::Busy);
-        // 札の最中の不健康の回数は残さない。
-        gate.record_streak(generation, 1);
-        guard.finish(ShellView::Fallback(fallback(
-            ScmObservation::State(ScmState::Stopped),
-            FallbackCause::ServiceLost,
-        )));
-        // 控えの後に画面が変わった: 見張りの古い結果は捨てる。
-        assert_eq!(
-            gate.begin_transition_at(generation).unwrap_err(),
-            TransitionRefused::Stale
-        );
-        gate.record_streak(generation, 1);
-        let PollSnapshot::Ready {
-            generation: next,
-            streak,
-            ..
-        } = gate.poll()
-        else {
-            panic!("ready");
-        };
-        assert_ne!(next, generation);
-        assert_eq!(streak, 0);
-        // 同じ世代なら取れる。落とすと画面は変わらずに札が返る。
-        let guard = gate.begin_transition_at(next).expect("same generation");
-        drop(guard);
-        assert!(matches!(gate.view(), ShellView::Fallback(_)));
-        assert!(gate.begin_transition().is_ok());
-    }
-
-    #[test]
-    fn desktop_view_and_exit_stop_the_monitor() {
-        let gate = ShellGate::new(ShellView::Desktop);
-        assert_eq!(gate.poll(), PollSnapshot::Stop);
-        let gate = ShellGate::new(ShellView::Service { port: 1 });
-        assert!(gate.begin_exit(Duration::from_millis(10)));
-        assert_eq!(gate.poll(), PollSnapshot::Stop);
-    }
-
-    /// 終了の扉: 閉じた後は移り変わりもエンジンを置くことも断る（置かなかった
-    /// エンジンは呼び出し側が止める）。閉じる前なら置ける。
-    #[test]
-    fn exit_closes_the_door_for_transitions_and_engines() {
-        let gate = ShellGate::new(ShellView::Fallback(fallback(
-            ScmObservation::State(ScmState::Stopped),
-            FallbackCause::AtStartup,
-        )));
-        let mut installed = false;
-        assert!(gate.admit(|| installed = true));
-        assert!(installed);
-        assert!(gate.begin_exit(Duration::from_millis(10)));
-        assert!(gate.is_exiting());
-        let mut installed_after = false;
-        assert!(!gate.admit(|| installed_after = true));
-        assert!(!installed_after);
-        assert_eq!(
-            gate.begin_transition().unwrap_err(),
-            TransitionRefused::Exiting
-        );
-        // 何度呼んでもよい。
-        assert!(gate.begin_exit(Duration::from_millis(10)));
-    }
-
-    /// 終了は走っている移り変わり（「再試行」の Desktop の起動）の終わりを待つ。
-    #[test]
-    fn exit_waits_for_the_running_transition() {
-        let gate = ShellGate::new(ShellView::Fallback(fallback(
-            ScmObservation::State(ScmState::Stopped),
-            FallbackCause::AtStartup,
-        )));
-        let guard = gate.begin_transition().expect("transition");
-        let (tx, rx) = mpsc::channel();
-        let waiter = {
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || {
-                let waited = gate.begin_exit(Duration::from_secs(10));
-                tx.send(waited).unwrap();
-            })
-        };
-        // 札がある間は戻らない。
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
-        // 札の中で扉が閉じたのが見える（起動し終えたエンジンは置かずに止める）。
-        assert!(gate.is_exiting());
-        assert!(!gate.admit(|| panic!("扉が閉じた後に置いてはいけない")));
-        let finished_at = Instant::now();
-        guard.finish(ShellView::Desktop);
-        assert!(rx.recv_timeout(Duration::from_secs(10)).expect("returns"));
-        // 長い上限（10 秒）でも、札が返れば待たずに戻る（PR #608 の全体監査 F2）。
-        assert!(finished_at.elapsed() < Duration::from_secs(5));
-        waiter.join().unwrap();
-    }
-
-    /// 扉を閉じるだけなら待たない。閉じた後の待ちは札の終わりまで。
-    #[test]
-    fn close_does_not_wait_and_wait_idle_is_bounded() {
-        let gate = ShellGate::new(ShellView::Service { port: 1 });
-        let guard = gate.begin_transition().expect("transition");
-        let started = Instant::now();
-        gate.close();
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(gate.is_exiting());
-        assert!(!gate.wait_idle(Duration::from_millis(50)));
-        drop(guard);
-        assert!(gate.wait_idle(Duration::from_millis(50)));
-    }
-
-    /// PR #608 のオーナーレビュー P2: DB の復旧の途中のトレイの「終了」は断られ
-    /// （予約できない = 確定に進まない）、復旧が終わった後なら通る。
-    #[test]
-    fn quit_is_refused_while_recovering_and_allowed_after() {
-        let gate = ShellGate::new(ShellView::Desktop);
-        let recovery = gate.begin_recovery().expect("recovery");
-        assert!(gate.is_recovering());
-        assert_eq!(
-            gate.reserve_quit().unwrap_err(),
-            QuitRefused::RecoveryInProgress
-        );
-        // 断っても扉は閉じない（終了処理へ進んでいない）。
-        assert!(!gate.is_exiting());
-        // 復旧の失敗（札を落とす）でも成功（finish）でも、終われば通る。
-        drop(recovery);
-        assert!(!gate.is_recovering());
-        assert!(gate.reserve_quit().is_ok());
-        gate.release_quit();
-        let recovery = gate.begin_recovery().expect("recovery again");
-        assert!(gate.reserve_quit().is_err());
-        recovery.finish(ShellView::Desktop);
-        assert!(gate.reserve_quit().is_ok());
-    }
-
-    /// 終了を予約した後は新しい復旧を始めない（予約を下ろせば始められる）。普通の
-    /// 移り変わりの札は「復旧中」にしない。
-    #[test]
-    fn recovery_does_not_start_after_quit_is_reserved() {
-        let gate = ShellGate::new(ShellView::Desktop);
-        gate.reserve_quit().expect("reserve");
-        assert_eq!(
-            gate.begin_recovery().unwrap_err(),
-            TransitionRefused::Exiting
-        );
-        gate.release_quit();
-        drop(gate.begin_recovery().expect("after release"));
-        let plain = gate.begin_transition().expect("plain");
-        assert!(!gate.is_recovering());
-        assert!(gate.reserve_quit().is_ok());
-        drop(plain);
-    }
-
-    /// 移り変わりが終わらなければ、予算で待つのをやめる。
-    #[test]
-    fn exit_wait_is_bounded() {
-        let gate = ShellGate::new(ShellView::Service { port: 1 });
-        let _guard = gate.begin_transition().expect("transition");
-        let started = Instant::now();
-        assert!(!gate.begin_exit(Duration::from_millis(100)));
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

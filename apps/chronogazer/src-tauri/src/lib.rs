@@ -63,11 +63,19 @@
 //! the service goes away; the fallback view reconnects by itself, and only
 //! the user's 「再試行」 starts the in-process engine. The tray follows the
 //! view (three menus, [`tray`]). The exit cleanup first closes the shell's
-//! door and waits for a running transition ([`shell::ShellGate`]), so an
-//! engine that a retry finishes starting after the exit began is shut down
-//! instead of being left running. See the [`shell`] module.
+//! door and waits for a running transition, so an engine that a retry
+//! finishes starting after the exit began is shut down instead of being left
+//! running. See the [`shell`] module.
+//!
+//! After #392 B2-4c (2026-10-15 owner decision): every "may we exit / which
+//! state are we in / what to wait for and how long" decision of the shell
+//! (transitions, recovery, the tray's quit confirmation, the exit door and its
+//! budgets, opening windows) goes through ONE state machine with one lock and
+//! one explicit table, [`lifecycle`]. Adding an entry point is adding a row.
 
 mod keyring_store;
+// #392 B2-4c の後: シェルのライフサイクルの状態機械（終了・切り替え・復旧の判断の表）。
+mod lifecycle;
 // #392 B2-4b（決定 3・O10）: 旧データ（`%APPDATA%`）の 1 回だけの案内。
 mod legacy_notice;
 // #392 B2-4c: シェルの配線（3 つの画面・見張り・終了との競合）。
@@ -130,6 +138,8 @@ use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 use chronogazer_core::{CollectionGroup, Tag};
 // #392 B1-2: 終了の後始末を 1 回に限る入れ物（banto-hub と共有、#586）。
 use banto_desktop_tray::{ExitCleanupOnce, ExitCleanupOutcome};
+// 待ちの上限と終了の起点は状態機械（[`lifecycle`]）が持つ。
+use lifecycle::{ExitTrigger, EXIT_CLEANUP_BUDGET};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -3767,44 +3777,6 @@ async fn collect_history(
     collect_history_body(&state, tag_ids, from_ms, to_ms, bins).await
 }
 
-/// How long the exit cleanup ([`shutdown_app_state`]) is allowed to take in
-/// total before the app gives up and exits anyway (#383 R1-C's prerequisite).
-/// Both entries into the cleanup ([`ExitTrigger`]: the tray's 「終了」 and
-/// `RunEvent::Exit`) use this same budget (as before #392 B1-2).
-///
-/// **Why a budget at all**: every step below can, in principle, wait on
-/// something outside this process - the LAN server's graceful shutdown waits
-/// for in-flight requests (a LAN browser's long-lived `GET /api/events` SSE
-/// stream is exactly such a connection), and `SqlitePool::close` waits for
-/// every checked-out connection to come back. A window closing must never
-/// leave a process the user cannot see hanging around; **freezing on exit is
-/// worse than losing some of the cleanup**, because the OS tears the sockets
-/// and the file handles down for us anyway (SQLite recovers a `-wal` on the
-/// next launch by design).
-///
-/// **Why 5 seconds**: everything here is local (a WS close frame to a Hub on
-/// the same PC/LAN, an in-process axum shutdown, an SQLite close) and
-/// normally completes in milliseconds. 5 seconds is far enough above that to
-/// never cut a healthy shutdown short, and short enough that a user who
-/// closed the window does not notice. Windows also gives an app roughly 5
-/// seconds to handle `WM_ENDSESSION` (OS sign-out/shutdown) before it shows
-/// 「このアプリがシャットダウンを妨げています」.
-///
-/// [`EXIT_CLEANUP_BUDGET`] は **5 秒のまま据え置いた**（#383 R1-C）。
-/// 収集の停止は「接続タスクを join して tstore を最終 flush する」だけで、
-/// どれもローカルのディスク操作。**実機で 5 秒に収まらないことが分かったら、
-/// 勝手に増やさずオーナーに報告すること。**
-///
-/// 収集の停止は自分でも上限を持つ（`COLLECT_OPERATION_TIMEOUT` = 30 秒）が、
-/// **この 5 秒の方が短いので、終了経路では必ずこちらが先に切る** - 窓を
-/// 閉じた利用者を 30 秒待たせないため（意図どおり）。予算が切れても、
-/// `CollectorService::stop` は**自分のライフサイクルタスクに依頼して待つ**
-/// だけなので、打ち切られるのは**待つ側だけ**で、タスク側の停止処理
-/// （接続タスクの join と最終 flush）は**そのまま続く**。直後にプロセスが
-/// 終わるので実害は無く、失われうるのは最後の未 flush 分だけ - 詳しくは
-/// `chronogazer_core::collect` のモジュール doc「終了フックからの停止」。
-const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// The running engine (#392 B1-2), managed so the exit cleanup can stop it.
 /// Never dropped before the process ends (Tauri's managed state), which is
 /// also what keeps the A1 instance lock (held by the engine) until then.
@@ -3855,29 +3827,6 @@ fn ceil_secs(duration: Duration) -> u64 {
     duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
 }
 
-/// 終了の後始末に入った経路（記録の文言のため。予算はどちらも
-/// [`EXIT_CLEANUP_BUDGET`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExitTrigger {
-    /// トレイの「終了」（確認の後、`AppHandle::exit` の**前**）。
-    TrayQuit,
-    /// `tauri::RunEvent::Exit`。トレイの終了の `app.exit(0)` の後にも来るほか、
-    /// OS のサインアウト・シャットダウンで来る（tao が `WM_ENDSESSION` で
-    /// イベントループを畳み、戻った直後に `std::process::exit` する）。
-    RunEventExit,
-}
-
-impl ExitTrigger {
-    fn label(self) -> &'static str {
-        match self {
-            ExitTrigger::TrayQuit => "トレイの終了",
-            ExitTrigger::RunEventExit => {
-                "アプリの終了イベント（OS のサインアウト・シャットダウンを含む）"
-            }
-        }
-    }
-}
-
 /// 終了の後始末を 1 回に限るための入れ物（#392 A2 → B1-2 で banto-hub と共有の
 /// `banto_desktop_tray::ExitCleanupOnce` に寄せた）。`run()` が manage する。
 struct ExitOnce(ExitCleanupOnce<ExitCleanupReport, ExitTrigger>);
@@ -3908,22 +3857,22 @@ fn exit_cleanup(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitClea
     // 断る）、走っている移り変わり（Fallback の「再試行」の Desktop の起動）の終わりを
     // 待つ。待った後にエンジンを探すので、移り変わりの中で置かれたエンジンも
     // 止める。置く前に扉が閉じたエンジンは `launch_desktop` がその場で止める
-    // （`shell::ShellGate::admit`）。待ちの上限は起点で分ける（[`exit_budgets`]、
-    // PR #608 の全体監査 F2・F3）。
-    let budgets = exit_budgets(trigger);
+    // （`lifecycle::Lifecycle::admit`）。待つか・待ちの上限（起点で分ける。PR #608 の
+    // 全体監査 F2・F3）は状態機械の表が決める（`lifecycle::Lifecycle::begin_exit`。
+    // OS の終了でエンジンが既に置かれていれば待たない）。
     let started = std::time::Instant::now();
-    if let Some(shell) = app.try_state::<shell::ShellState>() {
-        shell.gate.close();
-        // エンジンが既に置かれていれば、OS の終了では移り変わりを待たない（窓を作る
-        // 移り変わりはメインスレッドを待つので終わらない。エンジンは見つかる）。
-        let registered = app.try_state::<DesktopEngine>().is_some();
-        let wait = !(budgets.shared_deadline && registered);
-        if wait && !shell.gate.wait_idle(budgets.transition_wait) {
-            eprintln!(
-                "banto: シェルの切り替えが {} 秒以内に終わらなかったため、待たずに終了処理へ進みます（{}）",
-                ceil_secs(budgets.transition_wait),
-                trigger.label()
-            );
+    let mut budgets = lifecycle::exit_budgets(trigger);
+    if let Some(lifecycle) = shell::lifecycle(app) {
+        let plan = lifecycle.begin_exit(trigger);
+        budgets = plan.budgets;
+        if let Some(wait) = plan.transition_wait {
+            if !lifecycle.wait_idle(wait) {
+                eprintln!(
+                    "banto: シェルの切り替えが {} 秒以内に終わらなかったため、待たずに終了処理へ進みます（{}）",
+                    ceil_secs(wait),
+                    trigger.label()
+                );
+            }
         }
     }
     let engine = Arc::clone(&app.try_state::<DesktopEngine>()?.0);
@@ -3938,54 +3887,6 @@ fn exit_cleanup(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitClea
         },
         log_sink(),
     ))
-}
-
-/// 自発的な終了（トレイ・Fallback の「終了」）が移り変わりを待つ上限。
-const TRANSITION_WAIT_ON_QUIT: Duration = Duration::from_secs(60);
-
-/// [`exit_cleanup`] の待ちの上限（[`exit_budgets`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExitBudgets {
-    /// シェルの移り変わりの終わりを待つ上限。
-    pub(crate) transition_wait: Duration,
-    /// 後始末の上限（`shared_deadline` なら移り変わりの待ちと分け合う全体）。
-    pub(crate) cleanup: Duration,
-    /// 移り変わりの待ちと後始末で 1 つの期限を分け合う。
-    pub(crate) shared_deadline: bool,
-}
-
-impl ExitBudgets {
-    /// 移り変わりを `waited` だけ待った後の、後始末の予算。
-    pub(crate) fn cleanup_after(&self, waited: Duration) -> Duration {
-        if self.shared_deadline {
-            self.cleanup.saturating_sub(waited)
-        } else {
-            self.cleanup
-        }
-    }
-}
-
-/// 終了の起点ごとの待ちの上限（純関数。PR #608 の全体監査 F2・F3、`shell` の
-/// モジュール doc「待ちの上限は終了の起点で分ける」）。
-///
-/// - トレイの「終了」（Fallback の窓の「終了」を含む。専用のスレッドで待つ）: 移り
-///   変わりは長く（60 秒）待つ - 短く切ると、「再試行」で起動し終えたエンジン（自動開始
-///   した収集を含む）を止めずにプロセスが終わりうる。後始末は今までどおり 5 秒。
-/// - `RunEvent::Exit`（OS のサインアウト・シャットダウン、メインスレッド）: 移り変わりの
-///   待ちと後始末で **1 つの 5 秒の期限**を分け合う（OS の猶予を超えない）。
-pub(crate) fn exit_budgets(trigger: ExitTrigger) -> ExitBudgets {
-    match trigger {
-        ExitTrigger::TrayQuit => ExitBudgets {
-            transition_wait: TRANSITION_WAIT_ON_QUIT,
-            cleanup: EXIT_CLEANUP_BUDGET,
-            shared_deadline: false,
-        },
-        ExitTrigger::RunEventExit => ExitBudgets {
-            transition_wait: EXIT_CLEANUP_BUDGET,
-            cleanup: EXIT_CLEANUP_BUDGET,
-            shared_deadline: true,
-        },
-    }
 }
 
 /// [`exit_cleanup`] が記録する 1 行（重さつき）。
@@ -4457,8 +4358,8 @@ async fn launch_desktop(
     use startup::{LaunchError, Prelude};
 
     // #392 B2-4c: 終了に入っていたら起動しない（Fallback の「再試行」・対処の窓の
-    // やり直しが終了と重なったとき。`shell::ShellGate`）。
-    if shell::exiting(app) {
+    // やり直しが終了と重なったとき。`lifecycle` の表の「起動を続けてよいか」の行）。
+    if !shell::launch_may_proceed(app) {
         return Err(LaunchError::Exiting);
     }
 
@@ -4586,7 +4487,7 @@ async fn launch_desktop(
     });
     // #392 B2-4c: 収集・LAN を始める前に、もう一度終了を確かめる（窓を狭める。最後の
     // 確かめは下の `admit`）。
-    if shell::exiting(app) {
+    if !shell::launch_may_proceed(app) {
         opened.close().await;
         return Err(LaunchError::Exiting);
     }
@@ -4603,10 +4504,8 @@ async fn launch_desktop(
     // ロックの中、[`start_and_register`]）。`start()` は収集の自動開始を起こすので、
     // ここから先で終了が始まっても後始末がエンジンを見つけて止められる。扉が既に閉じて
     // いれば置かずにその場で止める。
-    let shell_gate = app
-        .try_state::<shell::ShellState>()
-        .map(|shell| Arc::clone(&shell.gate));
-    let engine = start_and_register(opened, shell_gate.as_deref(), |engine| {
+    let lifecycle = shell::lifecycle(app);
+    let engine = start_and_register(opened, lifecycle.as_deref(), |engine| {
         app.manage(DesktopEngine(engine));
     })
     .await?;
@@ -4628,7 +4527,7 @@ async fn launch_desktop(
         services: services.clone(),
     });
     // 終了が始まっていたら画面を作らない（エンジンは置いてあるので、後始末が止める）。
-    if shell::exiting(app) {
+    if !shell::launch_may_proceed(app) {
         return Err(LaunchError::Exiting);
     }
 
@@ -4696,11 +4595,11 @@ async fn launch_desktop(
 /// （[`exit_cleanup`]）がエンジンを止める。プロセスの終わりまで drop されない（A1 の
 /// 排他もそこまで持つ）。扉が既に閉じていたら置かずに、ここで止めて
 /// `Err(Exiting)`（後始末はもう始まっていて、このエンジンを見ない。banto-hub の
-/// `discard_started_hub` と同じ考え）。`gate` が無い（テスト・`ShellState` の前）なら
-/// そのまま置く。
+/// `discard_started_hub` と同じ考え）。`gate` が無い（テスト）ならそのまま置く。
+/// 扉の確認と置くことは状態機械の表の「エンジンを置く」の行（`lifecycle::Lifecycle::admit`）。
 async fn start_and_register(
     opened: chronogazer_core::engine::OpenedEngine,
-    gate: Option<&shell::ShellGate>,
+    gate: Option<&lifecycle::Lifecycle>,
     install: impl FnOnce(Arc<RunningEngine>),
 ) -> Result<Arc<RunningEngine>, startup::LaunchError> {
     let engine = Arc::new(opened.start().await.map_err(startup::LaunchError::Engine)?);
@@ -4782,7 +4681,10 @@ pub fn run() {
         // （`banto-desktop-tray` が Rust 側から呼ぶ。JS 側の権限は使わない）。
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .manage(banto_desktop_tray::QuitGate::new())
+        // #392 B2-4c の後: シェルのライフサイクルの状態機械（トレイの終了の確認の段階・
+        // 移り変わり・復旧・終了の扉。`QuitGate` の代わりもこれ）。`setup()` より前に
+        // 置く（起動の判定の前は Starting）。
+        .manage(lifecycle::Lifecycle::new())
         .manage(ExitOnce(ExitCleanupOnce::new()))
         // #392: 起動に失敗したときの対処の窓の状態（[`startup`]）。
         .manage(startup::RecoveryGate::default())
@@ -5405,7 +5307,7 @@ mod tests {
         let opened = EngineRuntime::open(desktop_engine_config(dir.path()))
             .await
             .expect("open");
-        let gate = shell::ShellGate::new(shell::ShellView::Desktop);
+        let gate = lifecycle::Lifecycle::started(shell::ShellView::Desktop);
         let mut installed: Option<Arc<RunningEngine>> = None;
         let engine = start_and_register(opened, Some(gate.as_ref()), |engine| {
             // 置かれた時点でエンジンは動いている（pool が開いている）。
@@ -5429,8 +5331,8 @@ mod tests {
         let opened = EngineRuntime::open(desktop_engine_config(dir.path()))
             .await
             .expect("open");
-        let gate = shell::ShellGate::new(shell::ShellView::Desktop);
-        gate.close();
+        let gate = lifecycle::Lifecycle::started(shell::ShellView::Desktop);
+        gate.begin_exit(ExitTrigger::TrayQuit);
         let mut installed = false;
         let result = start_and_register(opened, Some(gate.as_ref()), |_| installed = true).await;
         assert!(matches!(result, Err(startup::LaunchError::Exiting)));
@@ -5440,34 +5342,6 @@ mod tests {
             .await
             .expect("止めた後は同じ DB を開ける");
         shutdown_app_state(&reopened, EXIT_CLEANUP_BUDGET).await;
-    }
-
-    /// PR #608 の全体監査 F2・F3: 待ちの上限の表。トレイの終了は移り変わりを長く待ち
-    /// 後始末は 5 秒、OS の終了は移り変わりの待ちと後始末を合わせて 5 秒に収める。
-    #[test]
-    fn exit_budget_table() {
-        let tray = exit_budgets(ExitTrigger::TrayQuit);
-        assert_eq!(tray.transition_wait, Duration::from_secs(60));
-        assert!(!tray.shared_deadline);
-        for waited in [0, 1, 5, 59, 60] {
-            assert_eq!(
-                tray.cleanup_after(Duration::from_secs(waited)),
-                EXIT_CLEANUP_BUDGET
-            );
-        }
-        let os = exit_budgets(ExitTrigger::RunEventExit);
-        assert_eq!(os.transition_wait, EXIT_CLEANUP_BUDGET);
-        assert!(os.shared_deadline);
-        for waited_ms in [0u64, 1, 1_000, 4_999, 5_000, 6_000] {
-            let waited = Duration::from_millis(waited_ms).min(os.transition_wait);
-            let total = waited + os.cleanup_after(waited);
-            assert!(total <= EXIT_CLEANUP_BUDGET, "{waited_ms} ms -> {total:?}");
-        }
-        assert_eq!(
-            os.cleanup_after(Duration::from_secs(1)),
-            Duration::from_secs(4)
-        );
-        assert_eq!(os.cleanup_after(Duration::from_secs(9)), Duration::ZERO);
     }
 
     /// 終了の報告: 予算切れの秒数は切り上げる（期限の残り 4.99 秒で切れても
