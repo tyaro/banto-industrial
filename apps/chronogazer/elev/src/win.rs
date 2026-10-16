@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use banto_secret_store::acl::{PinnedDir, PinnedDirInfo};
 use banto_secret_store::{DirAccess, InstallUserSid};
 use banto_service_control::{
-    read_service_parameter, uninstall_service, ServiceManager, ServiceManagerError, UninstallError,
-    UninstallOutcome, WindowsServiceManager,
+    query_service_command_line, read_service_parameter, uninstall_service, ServiceManager,
+    ServiceManagerError, UninstallError, UninstallOutcome, WindowsServiceManager,
 };
 use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome};
 use chronogazer_core::paths::{DataLayout, ROOT_ENV};
@@ -23,12 +23,14 @@ use windows_sys::Win32::System::Registry::{
     RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesCommon,
+    FOLDERID_ProgramFilesCommonX86, FOLDERID_ProgramFilesX86, FOLDERID_Public, FOLDERID_System,
+    FOLDERID_SystemX86, FOLDERID_UserProfiles, FOLDERID_Windows, SHGetKnownFolderPath,
 };
 
 use crate::{
-    resolve_machine_root, ElevOps, MachineEnvironment, PinnedDirOps, MACHINE_ENVIRONMENT_KEY,
-    OPERATORS_GROUP, SERVER_EXE_FILE_NAME,
+    resolve_machine_root, ElevOps, KnownFolders, MachineEnvironment, PinnedDirOps,
+    MACHINE_ENVIRONMENT_KEY, OPERATORS_GROUP, SERVER_EXE_FILE_NAME,
 };
 
 fn wide(text: &str) -> Vec<u16> {
@@ -45,6 +47,26 @@ impl MachineEnvironment for RegistryMachineEnvironment {
 
     fn program_data(&self) -> Result<PathBuf, String> {
         known_folder(&FOLDERID_ProgramData)
+    }
+
+    fn known_folders(&self) -> Result<KnownFolders, String> {
+        // どれか 1 つでも取れなければ止める（断る一覧が欠けたまま進まない）。
+        let get = |ids: &[&windows_sys::core::GUID]| -> Result<Vec<PathBuf>, String> {
+            ids.iter().map(|id| known_folder(id)).collect()
+        };
+        Ok(KnownFolders {
+            forbidden_inside: get(&[
+                &FOLDERID_Windows,
+                &FOLDERID_System,
+                &FOLDERID_SystemX86,
+                &FOLDERID_ProgramFiles,
+                &FOLDERID_ProgramFilesX86,
+                &FOLDERID_ProgramFilesCommon,
+                &FOLDERID_ProgramFilesCommonX86,
+                &FOLDERID_Public,
+            ])?,
+            forbidden_itself: get(&[&FOLDERID_ProgramData, &FOLDERID_UserProfiles])?,
+        })
     }
 }
 
@@ -139,8 +161,15 @@ impl ElevOps for WindowsOps {
         }
     }
 
-    fn program_files(&self) -> Option<PathBuf> {
-        known_folder(&FOLDERID_ProgramFiles).ok()
+    fn program_files_dirs(&self) -> Vec<PathBuf> {
+        [&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86]
+            .into_iter()
+            .filter_map(|id| known_folder(id).ok())
+            .collect()
+    }
+
+    fn registered_command_line(&self) -> Result<Option<String>, String> {
+        query_service_command_line(SERVICE_NAME).map_err(|err| err.to_string())
     }
 
     fn machine_root(&self) -> Result<PathBuf, String> {
@@ -208,7 +237,14 @@ mod tests {
     fn known_folders_resolve() {
         let program_data = RegistryMachineEnvironment.program_data().unwrap();
         assert!(program_data.is_absolute(), "{program_data:?}");
-        assert!(WindowsOps.program_files().unwrap().is_absolute());
+        let dirs = WindowsOps.program_files_dirs();
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert!(dirs.iter().all(|d| d.is_absolute()));
+        // 既知のフォルダの一覧が取れ、ProgramData の下の既定のルートは断られない。
+        let known = RegistryMachineEnvironment.known_folders().unwrap();
+        assert_eq!(known.forbidden_inside.len(), 8);
+        crate::reject_well_known_root(&program_data.join("ChronoGazer"), &known).unwrap();
+        assert!(crate::reject_well_known_root(&program_data, &known).is_err());
     }
 
     /// 読むだけ: 無い値は `None`、ある値（`Path` は必ずある）は読める。
@@ -243,8 +279,11 @@ mod tests {
         fn server_executable(&self) -> Result<PathBuf, String> {
             unreachable!("テストでは呼ばない")
         }
-        fn program_files(&self) -> Option<PathBuf> {
-            None
+        fn program_files_dirs(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        fn registered_command_line(&self) -> Result<Option<String>, String> {
+            unreachable!("テストでは呼ばない")
         }
         fn machine_root(&self) -> Result<PathBuf, String> {
             Ok(self.root.clone())

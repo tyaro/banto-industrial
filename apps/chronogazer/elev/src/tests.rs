@@ -200,6 +200,7 @@ fn the_operators_group_and_service_are_fixed() {
 struct FakeEnv {
     root: Result<Option<String>, String>,
     program_data: Result<PathBuf, String>,
+    known: Result<KnownFolders, String>,
 }
 
 impl MachineEnvironment for FakeEnv {
@@ -209,12 +210,43 @@ impl MachineEnvironment for FakeEnv {
     fn program_data(&self) -> Result<PathBuf, String> {
         self.program_data.clone()
     }
+    fn known_folders(&self) -> Result<KnownFolders, String> {
+        self.known.clone()
+    }
+}
+
+/// この PC 風の既知のフォルダ（Windows は本物と同じ形の文字列、それ以外は似せたもの）。
+fn known() -> KnownFolders {
+    #[cfg(windows)]
+    let (inside, itself) = (
+        vec![
+            r"C:\Windows",
+            r"C:\Windows\system32",
+            r"C:\Windows\SysWOW64",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\Program Files\Common Files",
+            r"C:\Program Files (x86)\Common Files",
+            r"C:\Users\Public",
+        ],
+        vec![r"C:\ProgramData", r"C:\Users"],
+    );
+    #[cfg(not(windows))]
+    let (inside, itself) = (
+        vec!["/win", "/win/system32", "/pf", "/pf86", "/users/public"],
+        vec!["/var/lib", "/users"],
+    );
+    KnownFolders {
+        forbidden_inside: inside.into_iter().map(PathBuf::from).collect(),
+        forbidden_itself: itself.into_iter().map(PathBuf::from).collect(),
+    }
 }
 
 fn env(root: Result<Option<&str>, &str>, program_data: Result<&str, &str>) -> FakeEnv {
     FakeEnv {
         root: root.map(|v| v.map(str::to_string)).map_err(str::to_string),
         program_data: program_data.map(PathBuf::from).map_err(str::to_string),
+        known: Ok(known()),
     }
 }
 
@@ -273,6 +305,97 @@ fn unusable_machine_roots_are_refused() {
     assert!(resolve_machine_root(&env(Err("x"), Ok(PD)))
         .unwrap_err()
         .contains("CHRONOGAZER_ROOT"));
+    // 既知のフォルダが取れなければ止める。
+    let mut no_known = env(Ok(None), Ok(PD));
+    no_known.known = Err("E_FAIL".to_string());
+    assert!(resolve_machine_root(&no_known).is_err());
+}
+
+/// 監査 B1 の反証: ドライブのルート・UNC・既知のシステムフォルダ（とその祖先・中）を
+/// ルートにしない。ProgramData・Users の**下**の専用のフォルダは使える。
+#[cfg(windows)]
+#[test]
+fn well_known_roots_are_refused() {
+    for bad in [
+        r"C:\",
+        r"D:\",
+        r"\\srv\share\cg",
+        r"\\?\C:\x",
+        r"\\.\C:\x",
+        r"C:\ProgramData",
+        r"c:\programdata\",
+        r"C:\Users",
+        r"C:\Windows\x",
+        r"C:\Windows",
+        r"C:\Program Files",
+        r"C:\Program Files\ChronoGazer",
+        r"C:\Program Files (x86)\cg",
+        r"C:\Program Files\Common Files\cg",
+        r"C:\Users\Public\cg",
+    ] {
+        assert!(
+            resolve_machine_root(&env(Ok(Some(bad)), Ok(PD))).is_err(),
+            "{bad}"
+        );
+    }
+    for good in [
+        r"D:\ChronoGazer",
+        r"C:\ProgramData\ChronoGazer",
+        r"C:\Users\me\cg",
+        r"C:\Program Files Evil\cg",
+        r"C:\WindowsData\cg",
+    ] {
+        assert_eq!(
+            resolve_machine_root(&env(Ok(Some(good)), Ok(PD))),
+            Ok(PathBuf::from(good)),
+            "{good}"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn well_known_roots_are_refused() {
+    for bad in [
+        "/",
+        "//srv/share",
+        "/var/lib",
+        "/var",
+        "/users",
+        "/win/x",
+        "/pf",
+        "/pf86/cg",
+    ] {
+        assert!(
+            resolve_machine_root(&env(Ok(Some(bad)), Ok(PD))).is_err(),
+            "{bad}"
+        );
+    }
+    for good in [
+        "/srv/ChronoGazer",
+        "/var/lib/ChronoGazer",
+        "/users/me/cg",
+        "/pfx/cg",
+    ] {
+        assert!(
+            resolve_machine_root(&env(Ok(Some(good)), Ok(PD))).is_ok(),
+            "{good}"
+        );
+    }
+}
+
+/// 監査 B1: ルートを断ったら `grant-data-acl` はフォルダを 1 つも開かない（2）。
+#[test]
+fn grant_data_acl_does_not_touch_a_refused_root() {
+    let mut fake = Fake::new();
+    fake.root = resolve_machine_root(&env(Ok(Some(PD)), Ok(PD)));
+    assert!(fake.root.is_err());
+    let (code, _) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_PRECONDITION);
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| c.starts_with("pin") || c.starts_with("create")));
 }
 
 // --- データの ACL の計画 ----------------------------------------------------------
@@ -366,7 +489,9 @@ impl PinnedDirOps for FakePinned {
 struct Fake {
     log: Log,
     server_exe: Result<PathBuf, String>,
-    program_files: Option<PathBuf>,
+    program_files: Vec<PathBuf>,
+    /// 登録されているコマンドライン（`registered_command_line`）。
+    registered: Result<Option<String>, String>,
     root: Result<PathBuf, String>,
     me: Result<InstallUserSid, String>,
     not_accounts: Vec<String>,
@@ -390,8 +515,23 @@ fn root_path() -> PathBuf {
     PathBuf::from(PD).join("ChronoGazer")
 }
 
+#[cfg(windows)]
+const PF: &str = r"C:\Program Files";
+#[cfg(not(windows))]
+const PF: &str = "/pf";
+#[cfg(windows)]
+const PF86: &str = r"C:\Program Files (x86)";
+#[cfg(not(windows))]
+const PF86: &str = "/pf86";
+
 fn exe_path() -> PathBuf {
-    PathBuf::from(r"C:\Program Files\ChronoGazer\chronogazer-server.exe")
+    PathBuf::from(PF)
+        .join("ChronoGazer")
+        .join("chronogazer-server.exe")
+}
+
+fn registered_line(exe: &Path) -> String {
+    format!("\"{}\" run-service", exe.display())
 }
 
 fn ok_report() -> InstallReport {
@@ -416,7 +556,8 @@ impl Fake {
         Self {
             log: Rc::new(RefCell::new(Vec::new())),
             server_exe: Ok(exe_path()),
-            program_files: Some(PathBuf::from(r"C:\Program Files")),
+            program_files: vec![PathBuf::from(PF), PathBuf::from(PF86)],
+            registered: Ok(Some(registered_line(&exe_path()))),
             root: Ok(root_path()),
             me: Ok(sid(USER)),
             not_accounts: Vec::new(),
@@ -465,8 +606,12 @@ impl ElevOps for Fake {
         self.record("server_executable".into());
         self.server_exe.clone()
     }
-    fn program_files(&self) -> Option<PathBuf> {
+    fn program_files_dirs(&self) -> Vec<PathBuf> {
         self.program_files.clone()
+    }
+    fn registered_command_line(&self) -> Result<Option<String>, String> {
+        self.record("registered".into());
+        self.registered.clone()
     }
     fn machine_root(&self) -> Result<PathBuf, String> {
         self.record("machine_root".into());
@@ -603,6 +748,8 @@ fn service_install_runs_every_step_in_order() {
             "server_executable".to_string(),
             "machine_root".to_string(),
             format!("check {USER}"),
+            // 登録の前にルートを確かめる（監査 B4。まだ無い）。
+            format!("pin {}", root.display()),
             format!("install {} {USER} {}", exe_path().display(), root.display()),
             // setup-operators（記録を読み直す）
             "read_install_user".to_string(),
@@ -655,7 +802,7 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert_eq!(code, EXIT_OK);
     let calls = fake.calls();
     assert_eq!(calls[2], format!("check {OTHER}"));
-    assert!(calls[3].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
+    assert!(calls[4].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
 
     // 反証: 利用者のアカウントでない SID（グループなど）なら何も登録しない（64）。
     let mut fake = Fake::new();
@@ -692,6 +839,24 @@ fn service_install_stops_at_the_first_failure() {
     fake.root = Err("相対パス".to_string());
     assert_eq!(exec(install.clone(), &fake).0, EXIT_PRECONDITION);
     assert!(!fake.calls().iter().any(|c| c.starts_with("install")));
+
+    // 監査 B4: 既にあるルートが見知らぬ所有者・reparse point なら、何も登録せずに 1。
+    for (reparse, owner) in [(false, STRANGER), (true, "S-1-5-32-544")] {
+        let fake = Fake::new().with_dir(root_path(), true, reparse, owner);
+        let (code, lines) = exec(install.clone(), &fake);
+        assert_eq!(code, EXIT_FAILED, "{lines:#?}");
+        assert!(!fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("install") || c == "ensure_group" || c == "grant_service_acl"));
+        assert!(resets(&fake).is_empty());
+        assert!(lines.iter().any(
+            |l| matches!(l, ConsoleLine::Stderr(t) if t.contains("（何も登録していません）"))
+        ));
+    }
+    // 信頼できる所有者の既存のルートなら続ける。
+    let fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
+    assert_eq!(exec(install.clone(), &fake).0, EXIT_OK);
 
     // 実行した利用者を決められない → 2。
     let mut fake = Fake::new();
@@ -748,7 +913,12 @@ fn service_install_stops_at_the_first_failure() {
         os_error: 5,
     });
     assert_eq!(exec(install.clone(), &fake).0, EXIT_FAILED);
-    assert!(!fake.calls().iter().any(|c| c.starts_with("pin")));
+    // 登録の前の確かめ（監査 B4）の 1 回だけ開き、データの ACL には進まない。
+    assert_eq!(
+        fake.calls().iter().filter(|c| c.starts_with("pin")).count(),
+        1
+    );
+    assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
 
     // データの ACL を断った → 1（最後の行は「完了しませんでした」）。
     let fake = Fake::new().with_dir(root_path(), true, true, "S-1-5-32-544");
@@ -903,9 +1073,25 @@ fn autostart_toggles_with_the_sibling_server_exe() {
             fake.calls(),
             vec![
                 "server_executable".to_string(),
+                "registered".to_string(),
                 format!("autostart {} {enabled}", exe_path().display())
             ]
         );
+        // 監査 B3: 登録の exe が違えば変えずに 1、未登録なら 2、読めなければ 1。
+        for (registered, code) in [
+            (
+                Ok(Some(registered_line(Path::new(r"C:\Users\me\x\chronogazer-server.exe")))),
+                EXIT_FAILED,
+            ),
+            (Ok(Some(format!("{} --other", registered_line(&exe_path())))), EXIT_FAILED),
+            (Ok(None), EXIT_PRECONDITION),
+            (Err("os error 5".to_string()), EXIT_FAILED),
+        ] {
+            let mut fake = Fake::new();
+            fake.registered = registered.clone();
+            assert_eq!(exec(action.clone(), &fake).0, code, "{registered:?}");
+            assert!(!fake.calls().iter().any(|c| c.starts_with("autostart")), "{registered:?}");
+        }
         let mut fake = Fake::new();
         fake.autostart = Err(ServiceManagerError::NotFound("ChronoGazer".to_string()));
         assert_eq!(exec(action.clone(), &fake).0, EXIT_PRECONDITION);
@@ -919,21 +1105,84 @@ fn autostart_toggles_with_the_sibling_server_exe() {
     }
 }
 
-/// Program Files の外の `chronogazer-server.exe` は警告する（止めはしない）。
+/// 監査 B2: Program Files（x86 を含む）の外の `chronogazer-server.exe` では、何も登録・
+/// 変更せずに 2。名前が前方一致するだけの `Program Files Evil` は外、Program Files の
+/// 場所が分からなければ止める。
 #[test]
-fn a_server_exe_outside_program_files_is_warned() {
+fn a_server_exe_outside_program_files_is_refused() {
+    let install = Action::ServiceInstall {
+        install_user_sid: None,
+    };
+    let evil = format!("{PF} Evil");
+    for (exe, dirs) in [
+        (
+            PathBuf::from(PD).join("me").join("chronogazer-server.exe"),
+            vec![PathBuf::from(PF), PathBuf::from(PF86)],
+        ),
+        (
+            PathBuf::from(&evil).join("chronogazer-server.exe"),
+            vec![PathBuf::from(PF), PathBuf::from(PF86)],
+        ),
+        // Program Files そのもの（中ではない）。
+        (PathBuf::from(PF), vec![PathBuf::from(PF)]),
+        (exe_path(), Vec::new()),
+    ] {
+        for action in [install.clone(), Action::AutostartEnable] {
+            let mut fake = Fake::new();
+            fake.server_exe = Ok(exe.clone());
+            fake.program_files = dirs.clone();
+            let (code, lines) = exec(action.clone(), &fake);
+            assert_eq!(code, EXIT_PRECONDITION, "{exe:?} {dirs:?} {lines:#?}");
+            assert_eq!(fake.calls(), vec!["server_executable"], "{exe:?}");
+        }
+    }
     let mut fake = Fake::new();
-    fake.server_exe = Ok(PathBuf::from(
-        r"C:\Users\me\Downloads\chronogazer-server.exe",
-    ));
-    let (code, lines) = exec(Action::AutostartEnable, &fake);
-    assert_eq!(code, EXIT_OK);
-    assert_eq!(
-        lines[0],
-        stderr(
-            r"chronogazer-elev: warn: 実行ファイルが C:\Program Files の外にあります。一般の利用者が書き換えられる場所の exe を LocalSystem のサービスとして登録すると、権限の昇格に使われます。C:\Program Files\ChronoGazer\ に置いてから、uninstall → install で登録し直してください"
-        )
+    fake.server_exe = Ok(PathBuf::from(&evil).join("chronogazer-server.exe"));
+    let (_, lines) = exec(Action::AutostartEnable, &fake);
+    assert!(
+        matches!(&lines[0], ConsoleLine::Stderr(t) if t.contains("は Program Files の外にあります"))
     );
+
+    // Program Files (x86) の下は通る。
+    let mut fake = Fake::new();
+    let x86 = PathBuf::from(PF86)
+        .join("ChronoGazer")
+        .join("chronogazer-server.exe");
+    fake.server_exe = Ok(x86.clone());
+    fake.registered = Ok(Some(registered_line(&x86)));
+    assert_eq!(exec(Action::AutostartEnable, &fake).0, EXIT_OK);
+    assert!(fake
+        .calls()
+        .contains(&format!("autostart {} true", x86.display())));
+}
+
+/// 監査 B3: 登録のコマンドラインの比べ方（引用符・空白・大文字小文字は同じとみなす）。
+#[test]
+fn registered_command_lines_are_compared_as_quoted_path_and_run_service() {
+    let exe = exe_path();
+    let text = exe.display().to_string();
+    for same in [
+        format!("\"{text}\" run-service"),
+        format!("  \"{text}\"   run-service  "),
+        format!("\"{}\" run-service", text.to_uppercase()),
+    ] {
+        assert!(registered_command_matches(&same, &exe), "{same}");
+    }
+    if !text.contains(' ') {
+        assert!(registered_command_matches(
+            &format!("{text} run-service"),
+            &exe
+        ));
+    }
+    for other in [
+        format!("\"{text}\""),
+        format!("\"{text}\" run-service x"),
+        format!("\"{text}x\" run-service"),
+        format!("\"{text}"),
+        String::new(),
+    ] {
+        assert!(!registered_command_matches(&other, &exe), "{other}");
+    }
 }
 
 #[test]

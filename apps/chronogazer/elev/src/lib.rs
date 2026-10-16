@@ -83,8 +83,8 @@ use banto_service_control::{ConsoleLine, ServiceManagerError, UninstallError, Un
 use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome, OperatorsGroup};
 use chronogazer_core::paths::{DataLayout, PRODUCT_DIR_NAME, ROOT_ENV};
 use chronogazer_core::server_service::{
-    executable_location_warning, install_result_lines, uninstall_lines, InstallReport,
-    InstallUserUnavailable, INSTALL_USER_SID_LOCATION,
+    install_result_lines, uninstall_lines, InstallReport, InstallUserUnavailable,
+    INSTALL_USER_SID_LOCATION,
 };
 use chronogazer_core::shell_launch::SERVICE_NAME;
 
@@ -296,6 +296,83 @@ pub trait MachineEnvironment {
     fn chronogazer_root(&self) -> Result<Option<String>, String>;
     /// マシンの ProgramData（`SHGetKnownFolderPath(FOLDERID_ProgramData)`）。
     fn program_data(&self) -> Result<PathBuf, String>;
+    /// ルートにしてはいけない既知のフォルダ（[`reject_well_known_root`]）。取れなければ
+    /// 理由（ルートを決めずに止める）。
+    fn known_folders(&self) -> Result<KnownFolders, String>;
+}
+
+/// ルートにしてはいけない既知のフォルダ（#392 B3-3b の監査 B1。Windows は
+/// `SHGetKnownFolderPath` で取る）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnownFolders {
+    /// そのもの・祖先・**中**も断る（OS・プログラムの置き場、だれでも書ける共有の場所）:
+    /// Windows・System・SystemX86・Program Files（x86・Common を含む）・Public。
+    pub forbidden_inside: Vec<PathBuf>,
+    /// そのもの・祖先だけを断る（中は使ってよい）: ProgramData・UserProfiles（`C:\Users`）。
+    pub forbidden_itself: Vec<PathBuf>,
+}
+
+/// パスの要素（大文字小文字を無視して比べるため小文字にする）。
+fn lower_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
+/// `inner` が `outer` そのものか、その中か（要素の境界で比べる。`Program Files Evil` は
+/// `Program Files` の中ではない）。
+fn is_same_or_inside(inner: &Path, outer: &Path) -> bool {
+    let inner = lower_components(inner);
+    let outer = lower_components(outer);
+    !outer.is_empty() && inner.len() >= outer.len() && inner[..outer.len()] == outer[..]
+}
+
+/// ルートが既知のシステムフォルダ・ドライブのルート・ネットワークの場所でないことを
+/// 確かめる（純関数。監査 B1）。`grant-data-acl` の書き直しはルートの下の**全体**に
+/// 伝わるので、`D:\`・`C:\ProgramData`・`C:\Users` などをルートにすると、他の製品・
+/// 利用者のデータの ACL を書き換えてしまう。断るのは:
+///
+/// - UNC・`\\?\`・`\\.\`（`\\` か `//` で始まる）。
+/// - ドライブのルート（普通の名前の要素が 1 つも無い）。
+/// - [`KnownFolders::forbidden_inside`] のそのもの・祖先・中。
+/// - [`KnownFolders::forbidden_itself`] のそのもの・祖先。
+pub fn reject_well_known_root(root: &Path, known: &KnownFolders) -> Result<(), String> {
+    let text = root.to_string_lossy();
+    if text.starts_with("\\\\") || text.starts_with("//") {
+        return Err(format!(
+            "データのルート（{}）はネットワークの場所か特殊なパス（\\\\…）です。ローカルのドライブのフォルダにしてください",
+            root.display()
+        ));
+    }
+    if !root
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "データのルート（{}）はドライブのルートです。専用のフォルダ（例: D:\\ChronoGazer）にしてください",
+            root.display()
+        ));
+    }
+    for folder in &known.forbidden_inside {
+        if is_same_or_inside(root, folder) || is_same_or_inside(folder, root) {
+            return Err(format!(
+                "データのルート（{}）は OS・プログラムの置き場か共有のフォルダ（{}）に重なります。専用のフォルダにしてください",
+                root.display(),
+                folder.display()
+            ));
+        }
+    }
+    for folder in &known.forbidden_itself {
+        if is_same_or_inside(folder, root) {
+            return Err(format!(
+                "データのルート（{}）は {} そのものかその上のフォルダです。その下の専用のフォルダにしてください",
+                root.display(),
+                folder.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// データのルートを**マシンの環境だけ**から決める（純関数。モジュール doc）:
@@ -304,7 +381,9 @@ pub trait MachineEnvironment {
 ///    （展開はこのプロセスの環境に頼ることになるため）。読めなければ止める
 ///    （ProgramData へ落とすと、サービスと違う場所を直しうるため）。
 /// 2. 無ければマシンの ProgramData + `ChronoGazer`。
-/// 3. どちらも `server_host::validate_root`（絶対パス・`.`/`..` なし）を通ること。
+/// 3. どちらも `server_host::validate_root`（絶対パス・`.`/`..` なし）と
+///    [`reject_well_known_root`]（システムフォルダ・ドライブのルート・UNC でない）を
+///    通ること。
 pub fn resolve_machine_root(env: &impl MachineEnvironment) -> Result<PathBuf, String> {
     let root = match env.chronogazer_root() {
         Err(error) => {
@@ -326,7 +405,38 @@ pub fn resolve_machine_root(env: &impl MachineEnvironment) -> Result<PathBuf, St
             .join(PRODUCT_DIR_NAME),
     };
     chronogazer_core::server_host::validate_root(&root)?;
+    let known = env
+        .known_folders()
+        .map_err(|error| format!("既知のフォルダの場所を取れませんでした: {error}"))?;
+    reject_well_known_root(&root, &known)?;
     Ok(root)
+}
+
+/// `exe` が Program Files（`program_files_dirs` のどれか。x86 を含む）の**中**にあるか
+/// （純関数。要素の境界で比べ、大文字小文字は無視。監査 B2）。場所が 1 つも分からなければ
+/// `false`（止める側）。
+pub fn is_inside_program_files(exe: &Path, program_files_dirs: &[PathBuf]) -> bool {
+    program_files_dirs.iter().any(|dir| {
+        is_same_or_inside(exe, dir) && lower_components(exe).len() > lower_components(dir).len()
+    })
+}
+
+/// 登録されているコマンドライン（SCM の生の文字列）が、`"<exe>" run-service` と同じか
+/// （純関数。監査 B3）。引用符の有無・前後の空白・大文字小文字の違いは同じとみなす。
+pub fn registered_command_matches(raw: &str, exe: &Path) -> bool {
+    let raw = raw.trim();
+    let (path, rest) = match raw.strip_prefix('"') {
+        Some(after) => match after.split_once('"') {
+            Some((path, rest)) => (path, rest),
+            None => return false,
+        },
+        None => match raw.split_once(' ') {
+            Some((path, rest)) => (path, rest),
+            None => (raw, ""),
+        },
+    };
+    path.to_lowercase() == exe.to_string_lossy().to_lowercase()
+        && rest.trim() == chronogazer_core::shell_launch::RUN_SERVICE_ARG
 }
 
 // --- データの ACL の計画 ----------------------------------------------------------
@@ -408,8 +518,12 @@ pub trait ElevOps {
 
     /// この exe の隣の `chronogazer-server.exe`（無ければ理由）。
     fn server_executable(&self) -> Result<PathBuf, String>;
-    /// マシンの Program Files（取れなければ `None`。警告に使うだけ）。
-    fn program_files(&self) -> Option<PathBuf>;
+    /// マシンの Program Files と Program Files (x86)（取れたものだけ。1 つも無ければ
+    /// 隣の exe を使わずに止める）。
+    fn program_files_dirs(&self) -> Vec<PathBuf>;
+    /// 登録されているサービスの実行のコマンドライン（SCM の生の文字列）。未登録なら
+    /// `Ok(None)`。
+    fn registered_command_line(&self) -> Result<Option<String>, String>;
     /// データのルート（[`resolve_machine_root`]）。
     fn machine_root(&self) -> Result<PathBuf, String>;
     /// このプロセスのトークンの利用者。
@@ -469,7 +583,10 @@ fn emit(out: Out<'_>, lines: Vec<ConsoleLine>) {
     }
 }
 
-/// 隣の `chronogazer-server.exe` を決める（無ければ 2）。Program Files の外なら警告。
+/// 隣の `chronogazer-server.exe` を決める（無ければ 2）。**Program Files（x86 を含む）の
+/// 外なら 2 で止める**（監査 B2。LocalSystem のサービスとして一般の利用者が書き換え
+/// られる場所の exe を登録すると、その場所に書ける誰もが SYSTEM の権限を得る。
+/// Program Files の場所が分からないときも止める）。
 fn server_executable<O: ElevOps>(ops: &O, out: Out<'_>) -> Result<PathBuf, i32> {
     let executable = ops.server_executable().map_err(|error| {
         out(err(&format!(
@@ -477,9 +594,12 @@ fn server_executable<O: ElevOps>(ops: &O, out: Out<'_>) -> Result<PathBuf, i32> 
         )));
         EXIT_PRECONDITION
     })?;
-    if let Some(warning) = executable_location_warning(&executable, ops.program_files().as_deref())
-    {
-        emit(out, relabel(vec![ConsoleLine::Stderr(warning)]));
+    if !is_inside_program_files(&executable, &ops.program_files_dirs()) {
+        out(err(&format!(
+            "{} は Program Files の外にあります。一般の利用者が書き換えられる場所の exe を LocalSystem のサービスとして使うと権限の昇格に使われるため、止めます（C:\\Program Files\\ChronoGazer\\ に置いた chronogazer-elev.exe を実行してください）",
+            executable.display()
+        )));
+        return Err(EXIT_PRECONDITION);
     }
     Ok(executable)
 }
@@ -569,6 +689,21 @@ fn service_install<O: ElevOps>(
         }
     };
 
+    // 0. 既にあるルートを、登録の**前に**確かめる（監査 B4）: reparse point・フォルダで
+    //    ない・見知らぬ所有者なら、何も登録せずに止める（先に作られたルートにサービスを
+    //    向けない）。開いたルートは最後の手順まで持つ。
+    let elevated_user = ops.current_user_sid().ok();
+    let _held_root = match preflight_root(
+        ops,
+        &root,
+        &sid,
+        elevated_user.as_ref().map(InstallUserSid::as_str),
+        out,
+    ) {
+        Ok(held) => held,
+        Err(code) => return code,
+    };
+
     // 1. 登録・記録・ルート（`chronogazer-server install` と同じ手順）。
     let result = ops.install(executable, sid, &DataLayout::new(root));
     let (lines, code) = install_result_lines(&result);
@@ -584,6 +719,40 @@ fn service_install<O: ElevOps>(
         }
     }
     EXIT_OK
+}
+
+/// `service-install` の前の、ルートの確かめ（監査 B4）。無ければ何もしない（`Ok(None)`。
+/// 登録の手順が作る）。あれば辿らずに開き、[`data_acl_plan`] で断る理由があれば 1。
+fn preflight_root<O: ElevOps>(
+    ops: &O,
+    root: &Path,
+    install_user: &InstallUserSid,
+    elevated_user: Option<&str>,
+    out: Out<'_>,
+) -> Result<Option<O::Pinned>, i32> {
+    let pinned = ops.pin_dir(root).map_err(|error| {
+        out(err(&format!(
+            "{}（{}）を開けませんでした: {error}（何も登録していません）",
+            DataDir::Root.label(),
+            root.display()
+        )));
+        EXIT_FAILED
+    })?;
+    let Some(pinned) = pinned else {
+        return Ok(None);
+    };
+    if let Err(refusal) = data_acl_plan(
+        &DirState::Present(pinned.info()),
+        install_user,
+        elevated_user,
+    ) {
+        out(err(&format!(
+            "{}（何も登録していません）",
+            refusal_line(DataDir::Root, root, &refusal)
+        )));
+        return Err(EXIT_FAILED);
+    }
+    Ok(Some(pinned))
 }
 
 fn service_uninstall<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
@@ -835,6 +1004,32 @@ fn autostart<O: ElevOps>(ops: &O, enabled: bool, out: Out<'_>) -> i32 {
         Ok(executable) => executable,
         Err(code) => return code,
     };
+    // 登録の組み立て直しは実行ファイルを隣の exe に書き換えるので、登録されている exe と
+    // 同じときだけ行う（監査 B3。別の場所の elev から登録の exe を差し替えさせない）。
+    match ops.registered_command_line() {
+        Ok(Some(raw)) if registered_command_matches(&raw, &executable) => {}
+        Ok(Some(raw)) => {
+            out(err(&format!(
+                "登録されている実行ファイル（{raw}）と、この exe の隣の {}（\"{}\" {}）が違います。変えずに止めます（service-uninstall → service-install で登録し直してください）",
+                SERVER_EXE_FILE_NAME,
+                executable.display(),
+                chronogazer_core::shell_launch::RUN_SERVICE_ARG
+            )));
+            return EXIT_FAILED;
+        }
+        Ok(None) => {
+            out(err(&format!(
+                "サービス '{SERVICE_NAME}' は登録されていません（先に service-install を実行してください）"
+            )));
+            return EXIT_PRECONDITION;
+        }
+        Err(error) => {
+            out(err(&format!(
+                "サービス '{SERVICE_NAME}' の登録を読めませんでした: {error}"
+            )));
+            return EXIT_FAILED;
+        }
+    }
     match ops.set_autostart(&executable, enabled) {
         Ok(()) => {
             out(out_line(&if enabled {
