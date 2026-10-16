@@ -6,6 +6,7 @@
 #             ├─ frontend-chronogazer   （条件付き）
 #             ├─ rust                   （条件付き。対象は workspace 全体か -p に絞る）
 #             ├─ rust-db-source         （条件付き。PostgreSQL）
+#             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
 #             ├─ e2e-chronogazer        （条件付き）
 #             └─ e2e-hub                （条件付き）
 #   ci-gate（必ず。if: always()）: 上の全ジョブを見て、failure / cancelled、または
@@ -17,9 +18,16 @@
 # `ci-changes.test.mjs`。ローカルでは `node --test .github/scripts/ci-changes.test.mjs`）。
 # - push（main）と PR 以外の起動はフル CI（安全側）。
 # - `.github/**`・`scripts/**`・どの規則にも当たらないパスはフル CI。
-# - `crates/**`・Cargo.toml / Cargo.lock・toolchain・proto は Rust workspace 全体 +
-#   両アプリの E2E。root の package.json / pnpm-lock.yaml / lint・format・TS 設定は
-#   全 frontend + 両 E2E。
+# - `crates/<name>/**` は、そのパッケージと、それに（推移的に）依存する workspace の
+#   パッケージだけを `-p` で clippy / test する（依存グラフは changes ジョブで
+#   `cargo metadata --no-deps --offline` から組む。normal・dev・build の path 依存）。
+#   E2E・PostgreSQL・linux-clippy は、届いたパッケージがそのジョブの build する
+#   パッケージ（ci-changes.mjs の JOB_PACKAGES）に当たるときだけ。グラフが読めない・
+#   どのパッケージにも属さない `crates/` のパス・workspace の 8 割以上に届くときは
+#   全体に倒す。
+# - root の Cargo.toml / Cargo.lock・toolchain・proto・.cargo・.config は Rust workspace
+#   全体 + 両アプリの E2E。root の package.json / pnpm-lock.yaml / lint・format・TS
+#   設定は全 frontend + 両 E2E。
 #
 # rust ジョブのテストは cargo-nextest（`--profile ci`、設定は `.config/nextest.toml`）。
 # doctest は nextest で走らないので `cargo test --doc` を別の段で回す。
@@ -30,7 +38,8 @@
 # 将来 `apps/banto-scada` を足すとき:
 #   1. ci-changes.mjs の RULES に `^apps/banto-scada/` → `scada`（E2E を足すなら
 #      `e2e/tests-banto-scada/` 等 → `e2e_scada`）を足し、AREAS・derive()
-#      （`run_frontend_scada` / `run_e2e_scada`）・RUST_PACKAGES.scada を足す。
+#      （`run_frontend_scada` / `run_e2e_scada`）・RUST_PACKAGES.scada・
+#      JOB_PACKAGES.run_e2e_scada を足す（`crates/scada-*` は依存グラフで拾われる）。
 #   2. ci-changes.test.mjs に「scada だけの変更」の行を足す。
 #   3. 下の `changes.outputs` に新しい出力を足す。
 #   4. frontend-hub / e2e-hub を写して frontend-scada / e2e-scada ジョブを足す
@@ -58,6 +67,7 @@ jobs:
       full: ${{ steps.classify.outputs.full }}
       docs: ${{ steps.classify.outputs.docs }}
       rust_all: ${{ steps.classify.outputs.rust_all }}
+      crates: ${{ steps.classify.outputs.crates }}
       frontend_all: ${{ steps.classify.outputs.frontend_all }}
       hub: ${{ steps.classify.outputs.hub }}
       chronogazer: ${{ steps.classify.outputs.chronogazer }}
@@ -70,6 +80,7 @@ jobs:
       run_rust: ${{ steps.classify.outputs.run_rust }}
       rust_args: ${{ steps.classify.outputs.rust_args }}
       run_rust_db_source: ${{ steps.classify.outputs.run_rust_db_source }}
+      run_linux_clippy: ${{ steps.classify.outputs.run_linux_clippy }}
       run_e2e_hub: ${{ steps.classify.outputs.run_e2e_hub }}
       run_e2e_chronogazer: ${{ steps.classify.outputs.run_e2e_chronogazer }}
     steps:
@@ -86,6 +97,17 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+
+      # 共有 crate の依存グラフ（`cargo metadata --no-deps --offline`、ネットワーク不要）と
+      # 判定表のテスト（実グラフで逆依存を確かめる）に cargo が要る。版はリポジトリの
+      # rust-toolchain.toml に従う（rustup 1.28 以降の引数なしの `rustup toolchain install`
+      # はそのファイルの toolchain を入れる）。ubuntu-latest に入っている rustup をそのまま
+      # 使い、dtolnay/rust-toolchain で stable を別に入れることはしない。判定の本番
+      # （Classify）で `cargo metadata` が失敗したときは、crates/ の変更を全体に倒す。
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          cargo --version
 
       # 判定表のテスト（判定の漏れは「必要なテストが走らない」側の失敗なので、
       # 判定そのものを毎回検証してから使う）。
@@ -259,10 +281,13 @@ jobs:
       # every workspace member (cheap), whatever the clippy/test scope below.
       - name: fmt
         run: cargo fmt --all --check
-      # Scope (`rust_args`, from the changes job): `--workspace` when crates/**,
-      # Cargo.toml/Cargo.lock, toolchain, proto or .github changed (and on
-      # every push to main); otherwise `-p` for the touched app's packages
-      # plus their consumers (see RUST_PACKAGES in .github/scripts/ci-changes.mjs).
+      # Scope (`rust_args`, from the changes job): `--workspace` when the root
+      # Cargo.toml/Cargo.lock, toolchain, proto, .cargo, .config or .github
+      # changed (and on every push to main); otherwise `-p` for the touched
+      # app's packages plus their consumers (RUST_PACKAGES in
+      # .github/scripts/ci-changes.mjs) and, for crates/<name>/**, that package
+      # plus every workspace package that depends on it, transitively, through
+      # normal/dev/build path dependencies (`cargo metadata` in the changes job).
       # The workspace scope has no --exclude: the Tauri src-tauri crate
       # (`chronogazer`) has real tests of its own - PR #39 fixed a compile
       # error in relay-wright's src-tauri tests (relay-wright has since been
@@ -305,8 +330,9 @@ jobs:
   # `rust` ジョブは緑のまま（ゲートの意味は
   # apps/banto-hub/core/tests/db_source.rs のモジュール doc 参照）。
   #
-  # #468: banto-hub・banto-hub-sink・crates・Cargo の共通設定を変えたとき
-  # （とフル CI のとき）だけ走る。
+  # #468: banto-hub・banto-hub-sink・Cargo の共通設定を変えたとき、共有 crate の変更が
+  # banto-hub-core か banto-hub-sink に届くとき（ci-changes.mjs の JOB_PACKAGES）、
+  # とフル CI のときだけ走る。
   #
   # nextest にしない理由: 3 ステップとも実 PostgreSQL 1 つを共有し、小さいので並列化の
   # 利得が薄い一方、プロセスが別になると DB 上の状態の取り合いが増える。
@@ -358,11 +384,13 @@ jobs:
   # #392 B3-3b の監査 Nit 1: メインの Rust ジョブは windows-latest なので、Windows 以外
   # だけで出る `dead_code` など（例: `banto-hub-core` の `resolve_service_acl_target`、
   # `chronogazer-elev` の Windows 専用の再公開の cfg 漏れ）を CI で捕まえられない。昇格
-  # まわりの 2 crate の lib を ubuntu で clippy する軽いジョブ（`run_rust` のときだけ）。
+  # まわりの 2 crate の lib を ubuntu で clippy する軽いジョブ。Rust の対象（`rust_args`）に
+  # この 2 つのどちらかが入るとき（workspace 全体を含む）だけ走る（`run_linux_clippy`。
+  # 判定は ci-changes.mjs の JOB_PACKAGES）。
   linux-clippy:
     name: Rust (linux clippy / 昇格まわり)
     needs: changes
-    if: needs.changes.outputs.run_rust == 'true'
+    if: needs.changes.outputs.run_linux_clippy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -580,7 +608,7 @@ jobs:
           check frontend-chronogazer run_frontend_chronogazer
           check rust run_rust
           check rust-db-source run_rust_db_source
-          check linux-clippy run_rust
+          check linux-clippy run_linux_clippy
           check e2e-chronogazer run_e2e_chronogazer
           check e2e-hub run_e2e_hub
 
