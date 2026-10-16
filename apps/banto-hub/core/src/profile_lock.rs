@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use crate::profile_paths::ProfilePaths;
 
-pub(crate) use banto_instance_lock::read_owner_info;
+pub(crate) use banto_instance_lock::{read_owner_info_detailed, OwnerInfoError};
 
 /// `profile.lock`の中身（診断用 JSON）。共有 crate の [`banto_instance_lock::OwnerInfo`]
 /// と同一の型（フィールド名・JSON の形は移行前のまま）。
@@ -158,8 +158,8 @@ mod tests {
         let _guard =
             try_acquire_profile_lock(&paths, HubHostKind::Service).expect("first acquire ok");
 
-        let owner =
-            read_owner_info(&paths.profile_dir.join(LOCK_FILE_NAME)).expect("owner info written");
+        let owner = banto_instance_lock::read_owner_info(&paths.profile_dir.join(LOCK_FILE_NAME))
+            .expect("owner info written");
         assert_eq!(owner.pid, std::process::id());
         assert_eq!(owner.host_kind, "service");
     }

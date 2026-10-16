@@ -5,6 +5,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 ## v0.2.0-alpha.30 — 2026-10-16（アルファ）
 
 - banto-hub の現在値で NaN・正負の無限大と、bit の 0/1 以外の値を欠測（`null`）・品質 Bad として返すようにした（#615）。REST・WebSocket・gRPC・MQTT・MCP と演算入力で共通。将来の OPC UA（#201）も同じ読み取り契約を使う。従来 Good として返っていた不正な数値・bit も Bad になる。値が欠けているサンプルも、生の品質が Good・Stale であっても Bad にする。演算タグ自身の不正な出力も Bad として依存先へ伝え、正常な値に戻れば復旧する。既存の試行時刻は変えない。
+- banto-hub のシェル・トレイの health 判定で、`profile.lock` が「アクセス拒否で読めない」ときを「無い・壊れている」と分けた（#626 PR-C）。ワイヤ上の profile-id が一致していれば Healthy として扱い、所有者以外の利用者（Operators だけの利用者・UAC の分割トークンの管理者）でも、profile ディレクトリを保護したあとにサービスの画面へ繋がる。無い・壊れている・その他の読み取り失敗は従来どおり「所有者不明」。`banto-instance-lock` に区別つきの `read_owner_info_detailed` を足した。
 
 ## v0.2.0-alpha.29 — 2026-10-05（アルファ）
 
