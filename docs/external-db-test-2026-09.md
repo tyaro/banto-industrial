@@ -1,7 +1,7 @@
 # 外部 DB 連携 検証手順（S3 手動 smoke / S7 実 DB 検証）
 
 作成日: 2026-09-07
-状態: **手順のみ（未実施）**。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。結果は §5 に記録する。
+状態: **手順のみ（未実施）**。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）と DB ユーザーの `SELECT`（#616）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。結果は §5 に記録する。
 対象: [banto-hub-external-db-design.md](banto-hub-external-db-design.md) の DB Source（#228）と DB Sink（#229）。設計の決定事項は同書 §6、実装の所在は §7。
 
 関連: [real-machine-test-2026-09.md](real-machine-test-2026-09.md)（実機検証の記録の書き方の先例）、[banto-hub-operations.md](banto-hub-operations.md)（Hub の起動・サービス化）。
@@ -13,7 +13,7 @@
 | 項目        | 内容                                                                                                                                                                                                                                              |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | PostgreSQL  | 15 以上。ローカル smoke は `127.0.0.1:5432`（テスト用、`postgres/postgres`）。S7 は **別マシン（LAN 越し）**の PostgreSQL                                                                                                                         |
-| DB ユーザー | Source 用: `SELECT` のみの読み取り専用ユーザー。Sink 用: 保存先テーブルへの `INSERT` のみ。**Hub とサイドカーは DDL を発行しない**（設計 §5.3）                                                                                                   |
+| DB ユーザー | Source 用: `SELECT` のみの読み取り専用ユーザー。Sink 用: 保存先テーブルへの `INSERT` と `SELECT`（`SELECT` は起動時と 30 秒ごとの検査 `SELECT ... LIMIT 0` に要る。2026-10-17 訂正、#616）。**Hub とサイドカーは DDL を発行しない**（設計 §5.3）  |
 | Hub         | `v0.2.0-alpha.1` 以降の main（S0〜S6 込み）。収集は Running にできる状態（PLC 接続は無くてもよい）                                                                                                                                                |
 | サイドカー  | `banto-hub-sink.exe`（`cargo build --release -p banto-hub-sink`）と、保護された置き場 `%ProgramData%\BantoHub\sink\banto-hub-sink.toml`（#630 以降は exe 隣を読まず、あると起動しない。置き場は `banto-hub-elev.exe prepare-sink-config` で作る） |
 | API キー    | サイドカー用に **`admin` + `read`** の両スコープ（設計 §5.2 訂正、2026-09-06）。API キー画面のプリセット（sink 画面のリンク）で発行できる                                                                                                         |

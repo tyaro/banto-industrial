@@ -1,7 +1,7 @@
 # banto-hub 外部 DB 連携 設計: DB Source（#228）と DB Sink（#229）
 
 作成日: 2026-09-06
-状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S6 は完了**。2026-10-17: §5.6 の設定ファイルの置き場を #630 の形（`%ProgramData%\BantoHub\sink\` だけ・保護されていなければ起動しない）に更新した。2026-10-15: §5.6 に、応答しない Hub と DB でも停止予算の中で停止まで進むことを追記。2026-10-14: §5.6 に OS シャットダウン（#589）の停止予算を追記。（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、S6 = #313、docs #302 / #304 / #307 / #308 / #312）。**残りは S7（実 DB 検証、オーナー同席。手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)）**。S6 の申し送り: `BantoHubSink` への Operators 向けサービス ACL 付与は #316 で対応済み（`banto-hub-sink grant-service-acl` が同梱の `banto-hub-elev` を呼ぶ）、シェルからの start / stop は実サービス未検証（S7 で確認）。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。**2026-09-30: Sink の購読は安定 ID ではなく `external_name` で行う（安定 ID は DB 行用。オーナー決定、scada-design.md §9.6、§5.2）。**コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
+状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S6 は完了**。2026-10-17: §5.6 の設定ファイルの置き場を #630 の形（`%ProgramData%\BantoHub\sink\` だけ・保護されていなければ起動しない）に更新し、§5.3・§6-7 の DB ユーザーの権限を「INSERT と SELECT」に訂正した（#616）。2026-10-15: §5.6 に、応答しない Hub と DB でも停止予算の中で停止まで進むことを追記。2026-10-14: §5.6 に OS シャットダウン（#589）の停止予算を追記。（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、S6 = #313、docs #302 / #304 / #307 / #308 / #312）。**残りは S7（実 DB 検証、オーナー同席。手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)）**。S6 の申し送り: `BantoHubSink` への Operators 向けサービス ACL 付与は #316 で対応済み（`banto-hub-sink grant-service-acl` が同梱の `banto-hub-elev` を呼ぶ）、シェルからの start / stop は実サービス未検証（S7 で確認）。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。**2026-09-30: Sink の購読は安定 ID ではなく `external_name` で行う（安定 ID は DB 行用。オーナー決定、scada-design.md §9.6、§5.2）。**コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
 対象: Issue [#228](https://github.com/tyaro/banto-industrial/issues/228)（外部 RDB の値をタグ空間へ取り込む Source）と [#229](https://github.com/tyaro/banto-industrial/issues/229)（タグ値を外部 RDB へ保存する Sink / Logger）。**2 件はペアで 1 設計**とし、DB 接続エンティティを共有する。
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース。§2 非スコープの「ロガー作らない」決定を本書 §2.1 で扱う）、[banto-hub-t20-design.md](banto-hub-t20-design.md)（値表現と read-on-demand の先例）、[banto-hub-t21-design.md](banto-hub-t21-design.md)（構成操作の MCP と監査の型）、[plan.md](plan.md) §1（「外部時系列DB読み出し・保存」は 3〜4 案件で再利用される共通資産）。
@@ -185,7 +185,7 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 ```
 
 - **long / narrow を v1 とする。** タグ追加でスキーマが変わらない・グループ間でテーブルを共有できる・実装が 1 種類で済む。wide（列 = タグ）はグループごとの DDL 管理と rename 追従が要るので第 2 段（§6-6）。
-- **CREATE TABLE は発行しない。** テーブルは利用者（DBA）が用意し、サイドカーは起動時と設定変更時に `SELECT ... LIMIT 0` で列の存在と型を検査して、合わなければそのグループを `error` にして止める（他グループには影響しない）。DB ユーザーは INSERT 権限だけで済む。Hub の UI には推奨 DDL を**表示**する（§6-7）。
+- **CREATE TABLE は発行しない。** テーブルは利用者（DBA）が用意し、サイドカーは起動時と設定変更時に `SELECT ... LIMIT 0` で列の存在と型を検査して、合わなければそのグループを `error` にして止める（他グループには影響しない）。DB ユーザーには保存先のテーブルへの **INSERT と SELECT** が要る（検査の `SELECT ... LIMIT 0` に SELECT が要る。2026-10-17 訂正、#616。以前は「INSERT 権限だけで済む」と書いていたが、INSERT だけでは検査が「アクセスが拒否されました」で通らず行が書かれない）。Hub の UI には推奨 DDL を**表示**する（§6-7）。
 - `external_name` を毎行に持たせるのは、DB 側だけで人が読めるようにするため。rename 後の行は新しい名前になる（履歴の名前は書き換えない）。
 
 ### 5.4 バッチとバックプレッシャ
@@ -222,7 +222,7 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 | 4   | Source のエンティティ配置（§4.1）                        | **案 A**（既存 3 階層の流用）                                                                            | protocol CHECK の再構築マイグレーション 1 本                    |
 | 5   | 文字列列の扱い（§4.4）                                   | **v1 は数値・bool・timestamp のみ**。文字列は要件が出た時点で (a)/(b) を選ぶ                             | `string` の `db` タグは登録拒否                                 |
 | 6   | Sink の保存スキーマ（§5.3）                              | **long 固定**。wide は第 2 段                                                                            |                                                                 |
-| 7   | Sink の DDL                                              | **発行しない**（起動時検査＋推奨 DDL の表示のみ）                                                        | DB ユーザーは INSERT 権限だけで済む                             |
+| 7   | Sink の DDL                                              | **発行しない**（起動時検査＋推奨 DDL の表示のみ）                                                        | DB ユーザーは INSERT と SELECT（検査用）が要る（#616 で訂正）   |
 | 8   | キュー溢れ・複数行結果の扱い（§4.2 / §5.4）              | Source: 先頭行採用＋warn 1 回。Sink: **最古を捨てて `dropped` 計上**                                     |                                                                 |
 | 9   | グループ周期の上限（§3-8）                               | v1 は既存集合（最大 60 s）のまま。5 分・1 時間は要望が出たら CHECK を拡張                                | 拡張はテーブル再構築                                            |
 | 10  | Source タグの書き込み（UPDATE）                          | **v1 は読み取り専用**                                                                                    | `db` タグは `writable = false` 固定                             |
