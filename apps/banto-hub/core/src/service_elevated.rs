@@ -435,6 +435,10 @@ pub enum ElevatedError {
     /// （profile-id の許可リスト・マシンの環境のルート。#626 の論点 8）。
     #[error(transparent)]
     ProfileTarget(#[from] crate::profile_grant::TargetError),
+    /// 対象の profile の DB の手前（`config`など）がジャンクション・ハードリンク・本当の
+    /// パスの不一致などで使えない（#626 PR-B の監査 B-5。DB を開かない）。
+    #[error("banto-hub-elev: {0}")]
+    ProfileTargetUnsafe(String),
     /// `reset-password`/`revert-to-commissioning`対象 profile の DB
     /// （`crate::db::init_db`）・アプリ層サービス（`UsersService`/
     /// `CommissioningService`/`AuditLogService`）から返るエラーをそのまま
@@ -757,20 +761,25 @@ fn set_autostart(enabled: bool) -> Result<(), ElevatedError> {
 /// [`crate::profile_paths::ProfilePaths`]を解決する（`reset-password`/
 /// `revert-to-commissioning`共通。#626 の論点 8: `grant-profile-acl`と同じく、
 /// profile-id は許可リスト、ルートは**マシンの環境だけ**で、このプロセスの環境変数は
-/// 読まない。判断は [`crate::profile_grant::resolve_target_profile`]）。DB ファイルが
+/// 読まない。判断は [`crate::profile_grant::resolve_target_profile`]）。
+///
+/// DB を開く**前に**、ルート → `profiles\` → profile → `config\` と DB のファイルを辿らずに
+/// 開いて確かめ（本当のパス・reparse point・ハードリンク）、返したものを DB を閉じるまで
+/// 持つ（#626 PR-B の監査 B-5、[`crate::profile_grant::open_target_profile`]）。DB ファイルが
 /// 実在しない場合は [`ElevatedError::ProfileDbNotFound`]で早期に拒否する。
 #[cfg(windows)]
 fn resolve_target_profile_paths(
     profile_id: Option<&str>,
-) -> Result<crate::profile_paths::ProfilePaths, ElevatedError> {
-    let paths = crate::profile_grant::resolve_target_profile(
-        &crate::profile_grant::win::RegistryMachineEnvironment,
-        profile_id,
-    )?;
-    if !paths.db_path.is_file() {
-        return Err(ElevatedError::ProfileDbNotFound(paths.db_path));
-    }
-    Ok(paths)
+) -> Result<
+    crate::profile_grant::OpenedTarget<crate::profile_grant::win::WindowsHubElevOps>,
+    ElevatedError,
+> {
+    use crate::profile_grant::{open_target_profile, win::WindowsHubElevOps, OpenTargetError};
+    open_target_profile(&WindowsHubElevOps, profile_id).map_err(|error| match error {
+        OpenTargetError::Target(error) => ElevatedError::ProfileTarget(error),
+        OpenTargetError::DbNotFound(path) => ElevatedError::ProfileDbNotFound(path),
+        OpenTargetError::Unsafe(reason) => ElevatedError::ProfileTargetUnsafe(reason),
+    })
 }
 
 /// DB を触る2アクション共通: 新しい`tokio::runtime::Runtime`を1回だけ立てて
@@ -793,7 +802,8 @@ where
 /// 「ロックダウン回復アクション」節参照）。
 #[cfg(windows)]
 fn reset_password_action(username: &str, profile_id: Option<&str>) -> Result<(), ElevatedError> {
-    let paths = resolve_target_profile_paths(profile_id)?;
+    // `_held`は DB を閉じるまで（この関数の終わりまで）持つ。
+    let (paths, _held) = resolve_target_profile_paths(profile_id)?;
 
     println!(
         "banto-hub-elev: profile '{}' のユーザー '{username}' のパスワードを再設定します。",
@@ -823,7 +833,8 @@ fn reset_password_action(username: &str, profile_id: Option<&str>) -> Result<(),
 /// モジュール doc「監査ログ」節参照）。
 #[cfg(windows)]
 fn revert_to_commissioning_action(profile_id: Option<&str>) -> Result<(), ElevatedError> {
-    let paths = resolve_target_profile_paths(profile_id)?;
+    // `_held`は DB を閉じるまで（この関数の終わりまで）持つ。
+    let (paths, _held) = resolve_target_profile_paths(profile_id)?;
 
     println!(
         "banto-hub-elev: profile '{}' を試運転モード（未ロックダウン・認証なし）へ戻します。",

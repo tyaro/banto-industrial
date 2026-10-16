@@ -614,8 +614,8 @@ fn carry_over_table() {
     }
 }
 
-/// 全体: 重複は 1 つにまとめ、DACL に現れた順に引き継ぐ。引き継いだ利用者のほかの ACE
-/// （拒否・読み取りだけ）は落とした側に残る。種類の問い合わせは引き継いだ SID には
+/// 全体: 重複は 1 つにまとめ、DACL に現れた順に引き継ぐ。拒否の ACE を持つ利用者は
+/// 引き継がない。引き継いだ利用者のほかの ACE（読み取りだけ）は落とした側に残る。種類の問い合わせは引き継いだ SID には
 /// 2 回目をしない。
 #[test]
 fn carry_over_keeps_order_dedups_and_reports_the_rest() {
@@ -634,8 +634,9 @@ fn carry_over_keeps_order_dedups_and_reports_the_rest() {
         asked.push(s.as_str().to_string());
         kinds(s)
     });
-    assert_eq!(plan.carried, vec![sid(OTHER), sid(USER)]);
-    assert_eq!(asked, vec![OTHER, USER, GROUP]);
+    // USER は拒否の ACE を持つので引き継がない（#626 PR-B の監査 B-2）。
+    assert_eq!(plan.carried, vec![sid(OTHER)]);
+    assert_eq!(asked, vec![OTHER, GROUP]);
     let reasons: Vec<(String, DropReason)> = plan
         .dropped
         .iter()
@@ -644,6 +645,7 @@ fn carry_over_keeps_order_dedups_and_reports_the_rest() {
     assert_eq!(
         reasons,
         vec![
+            (USER.to_string(), DropReason::HasDeny),
             (USER.to_string(), DropReason::LessThanModify),
             (USER.to_string(), DropReason::NotAllow),
             ("S-1-5-32-545".to_string(), DropReason::Inherited),
@@ -693,4 +695,44 @@ fn carried_users_build_the_multi_user_access() {
             "D:P(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)(A;OICI;0x1301bf;;;{USER})(A;OICI;0x1301bf;;;{OTHER})"
         )
     );
+}
+
+/// #626 PR-B の監査 B-2: 拒否の ACE（種類・継承・並びの前後を問わない）を持つ利用者の
+/// 許可は引き継がない（拒否が消えて権利が広がるため）。拒否の無い利用者は引き継ぐ。
+#[test]
+fn a_user_with_any_deny_is_not_carried() {
+    let modify = allow(OI_CI, MODIFY_ACCESS_MASK, USER);
+    for deny in [
+        ace(DENY, OI_CI, 0x0001_0000, USER),
+        ace(DENY, 0, 0x0000_0002, USER),
+        ace(DENY, OI_CI | INHERITED, FULL_ACCESS_MASK, USER),
+    ] {
+        for aces in [
+            vec![modify.clone(), deny.clone()],
+            vec![deny.clone(), modify.clone()],
+        ] {
+            let plan = plan_carry_over(&dacl(aces.clone()), kinds);
+            assert!(plan.carried.is_empty(), "{aces:?}: {plan:?}");
+            assert!(
+                plan.dropped.contains(&DroppedAce {
+                    ace: modify.clone(),
+                    reason: DropReason::HasDeny
+                }),
+                "{aces:?}: {plan:?}"
+            );
+            assert!(
+                plan.dropped.contains(&DroppedAce {
+                    ace: deny.clone(),
+                    reason: DropReason::NotAllow
+                }),
+                "{aces:?}: {plan:?}"
+            );
+        }
+    }
+    // 別の利用者の拒否は関係しない。
+    let plan = plan_carry_over(
+        &dacl(vec![modify.clone(), ace(DENY, OI_CI, 0x0001_0000, OTHER)]),
+        kinds,
+    );
+    assert_eq!(plan.carried, vec![sid(USER)]);
 }

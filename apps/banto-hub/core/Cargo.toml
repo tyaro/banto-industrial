@@ -258,7 +258,10 @@ path = "src/bin/banto-hub-elev.rs"
 # `src/profile_acl.rs`のために足した`Win32_Security_Authorization`・
 # `Win32_Storage_FileSystem`は、#626（2026-10-16）でその実装を消して
 # `banto-secret-store`に寄せたので外した（`src/profile_grant/win.rs`が使うのは
-# `OpenMutexW`の`Win32_System_Threading`だけ）。
+# `OpenMutexW`の`Win32_System_Threading`だけ）。同 PR の監査 B-5 で、
+# `reset-password`・`revert-to-commissioning`が DB のファイルを辿らずに開いて
+# 持つ（`CreateFileW`・`GetFileInformationByHandle`・`GetFinalPathNameByHandleW`）
+# ために`Win32_Storage_FileSystem`を戻した。
 #
 # ロックダウン回復アクション追加（docs/tag-server-design.md §5.6、
 # `service_elevated.rs`の`reset-password`/`revert-to-commissioning`）:
@@ -273,6 +276,7 @@ path = "src/bin/banto-hub-elev.rs"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

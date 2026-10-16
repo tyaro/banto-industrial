@@ -162,7 +162,21 @@ struct FakeOps {
     dirs: RefCell<HashMap<PathBuf, FakeDir>>,
     /// `create_dir`が作るフォルダ（既定は Administrators 所有。すり替えの再現に使う）。
     on_create: RefCell<HashMap<PathBuf, FakeDir>>,
+    /// `pin_file`が開けるファイル。
+    files: RefCell<HashMap<PathBuf, FileFacts>>,
     log: Log,
+}
+
+/// 偽の開いたままのファイル（drop を記録する）。
+struct FakeFile {
+    name: String,
+    log: Log,
+}
+
+impl Drop for FakeFile {
+    fn drop(&mut self) {
+        self.log.borrow_mut().push(format!("drop {}", self.name));
+    }
 }
 
 impl FakeOps {
@@ -204,6 +218,7 @@ impl FakeOps {
             in_use: Ok(false),
             dirs: RefCell::new(HashMap::new()),
             on_create: RefCell::new(HashMap::new()),
+            files: RefCell::new(HashMap::new()),
             log: Rc::new(RefCell::new(Vec::new())),
         };
         for dir in [root(), profiles(), profile()] {
@@ -266,6 +281,21 @@ impl HubElevOps for FakeOps {
             path: dir.to_path_buf(),
             dir: d,
             log: self.log.clone(),
+        }))
+    }
+    type HeldFile = FakeFile;
+    fn pin_file(&self, path: &Path) -> Result<Option<(FakeFile, FileFacts)>, String> {
+        self.log
+            .borrow_mut()
+            .push(format!("pin_file {}", name(path)));
+        Ok(self.files.borrow().get(path).cloned().map(|facts| {
+            (
+                FakeFile {
+                    name: name(path),
+                    log: self.log.clone(),
+                },
+                facts,
+            )
         }))
     }
     fn create_dir(&self, dir: &Path, how: CreateHow) -> Result<bool, String> {
@@ -816,12 +846,12 @@ fn carry_over_lines_golden() {
     assert_eq!(result, Ok(()), "{lines:#?}");
     assert!(ops
         .calls()
-        .contains(&format!("reset default [{ME},{ALICE},{BOB}]")));
+        .contains(&format!("reset default [{ME},{ALICE}]")));
     let p = profile();
     let expected = vec![
         format!("out banto-hub-elev: 今の DACL に「変更」を持つ利用者 {ALICE} を引き継ぎます"),
-        format!("out banto-hub-elev: 今の DACL に「変更」を持つ利用者 {BOB} を引き継ぎます"),
         format!("err banto-hub-elev: 警告: 利用者 {ALICE} の今の権限は「変更」より広い（フルコントロールなど）ので、「変更」に狭めます（ACL の変更・所有権の取得はできなくなります）"),
+        format!("err banto-hub-elev: 警告: 利用者 {BOB} には拒否の ACE があったので、許可の ACE（SID {BOB}・アクセス 0x1301bf・フラグ 0x03）を引き継ぎません（引き継ぐと拒否が消えて権利が広がるため）。要るなら grant-profile-acl {BOB} default を手で実行してください"),
         format!("err banto-hub-elev: 警告: 拒否の ACE（SID {BOB}・アクセス 0x10000・フラグ 0x03）を落とします。拒否を落とすと、その相手のアクセスが広がることがあります。要るなら書き直した後に付け直してください"),
         format!("out banto-hub-elev: 親から継承した ACE（SID {CAROL}・アクセス 0x1f01ff・フラグ 0x10）は引き継ぎません（保護した DACL には親から流れません）"),
         format!("err banto-hub-elev: 警告: この継承された ACE は profile の所有者（作った利用者 {CAROL}）のものです。この利用者は書き直した後にこの profile を開けなくなります。使い続けるなら grant-profile-acl {CAROL} default を実行してください"),
@@ -830,11 +860,11 @@ fn carry_over_lines_golden() {
         format!("out banto-hub-elev: 「変更」に足りない ACE（SID {ME}・アクセス 0x1200a9・フラグ 0x03。読み取りだけなど）は引き継ぎません"),
         format!("out banto-hub-elev: この PC の利用者のアカウントでない SID（グループなど）の ACE（SID {DOMAIN_USERS}・アクセス 0x1301bf・フラグ 0x03）は引き継ぎません"),
         format!("err banto-hub-elev: 警告: 利用者のアカウントかを確かめられなかったので、ACE（SID {DAVE}・アクセス 0x1301bf・フラグ 0x03）を引き継ぎません: RPC が届かない。この相手は書き直した後にこの profile を開けなくなります。名前の解決が戻ってから grant-profile-acl {DAVE} default を実行してください"),
-        format!("out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME}・{ALICE}・{BOB} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形）", p.display()),
+        format!("out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME}・{ALICE} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形）", p.display()),
         format!("err banto-hub-elev: 警告: profile の中の {} はジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました", p.join("x").display()),
         format!("err banto-hub-elev: 警告: profile の中の {} はハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）", p.join("f.txt").display()),
         format!("err banto-hub-elev: 警告: profile の中の {} を開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります）", p.join("locked").display()),
-        "err banto-hub-elev: 書き直しは終えましたが、上の警告 7 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
+        "err banto-hub-elev: 書き直しは終えましたが、上の警告 8 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
     ];
     assert_eq!(lines, expected);
 }
@@ -937,4 +967,277 @@ fn machine_root_wording() {
     let text = machine_root_text(&MachineRootError::NeedsExpansion("%X%".into()));
     assert!(text.contains("BANTO_HUB_ROOT"), "{text}");
     assert!(text.contains("展開しない絶対パス"), "{text}");
+}
+
+// --- #626 PR-B の監査の対応 ---------------------------------------------------------
+
+/// B-1: `service-install`では、profile が使用中のときだけ ACL の付け直しを飛ばして警告し、
+/// 成功にする（登録・Operators・サービス ACL は済んでいる）。使用中以外の断りは失敗。
+#[test]
+fn service_install_skips_the_acl_when_the_profile_is_in_use() {
+    let mut ops = FakeOps::new();
+    ops.in_use = Ok(true);
+    let log = ops.log.clone();
+    let mut lines = Vec::new();
+    let result = service_install(
+        &ops,
+        || -> Result<(), String> {
+            log.borrow_mut().push("register".into());
+            Ok(())
+        },
+        &mut |l| lines.push(l),
+    );
+    assert!(result.is_ok());
+    assert_eq!(ops.calls(), vec!["register", "in_use default"]);
+    assert_eq!(
+        texts(lines),
+        vec![format!(
+            "err banto-hub-elev: 警告: profile 'default' が使用中なので ACL の付け直しを飛ばしました（{}）。サービスとアプリを止めてから grant-profile-acl を実行してください",
+            crate::profile_paths::mutex_name("default")
+        )]
+    );
+
+    // 使用中かを確かめられない・所有者の断りは失敗のまま。
+    for setup in [
+        (|ops: &mut FakeOps| ops.in_use = Err("OpenMutexW".into())) as fn(&mut FakeOps),
+        |ops: &mut FakeOps| {
+            ops.dirs
+                .borrow_mut()
+                .get_mut(&profile())
+                .unwrap()
+                .info
+                .owner = EVIL.into();
+        },
+    ] {
+        let mut ops = FakeOps::new();
+        setup(&mut ops);
+        let result = service_install(&ops, || -> Result<(), String> { Ok(()) }, &mut |_| {});
+        assert!(matches!(result, Err(ServiceInstallError::Refused)));
+    }
+
+    // 手で実行する grant-profile-acl は、使用中なら断って失敗のまま。
+    let mut ops = FakeOps::new();
+    ops.in_use = Ok(true);
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Err(Refused));
+    assert!(lines[0].contains("は使用中です"), "{lines:#?}");
+}
+
+/// B-2: 指定の利用者そのものに拒否の ACE があっても指定どおり付けるが、拒否が消える旨の
+/// 警告を出す。ほかの利用者は拒否があれば引き継がない。
+#[test]
+fn deny_aces_block_carry_over_and_warn_for_the_named_user() {
+    let ops = FakeOps::new();
+    ops.dirs.borrow_mut().get_mut(&profile()).unwrap().dacl = Ok(ObservedDacl {
+        protected: false,
+        owner: ME.into(),
+        aces: Some(vec![
+            ace(0, 0x03, MODIFY_ACCESS_MASK, ME),
+            ace(1, 0x03, 0x0001_0000, ME),
+            ace(0, 0x03, MODIFY_ACCESS_MASK, ALICE),
+            ace(1, 0x10, 0x0000_0002, ALICE),
+        ]),
+    });
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops.calls().contains(&format!("reset default [{ME}]")));
+    let named = format!(
+        "err banto-hub-elev: 警告: 指定の利用者 {ME} には拒否の ACE がありましたが、指定どおり「変更」を付けます（拒否は消えます）"
+    );
+    assert!(lines.contains(&named), "{lines:#?}");
+    let other = format!("利用者 {ALICE} には拒否の ACE があったので");
+    assert!(lines.iter().any(|l| l.contains(&other)), "{lines:#?}");
+}
+
+/// C-1: 「変更」より広い警告は引き継いだ ACE だけを見る（引き継がない形の広い ACE では
+/// 出さない）。
+#[test]
+fn the_narrowing_warning_only_looks_at_carried_aces() {
+    let dacl = ObservedDacl {
+        protected: false,
+        owner: ME.into(),
+        aces: Some(vec![
+            // 指定の利用者のフル（NP つき = 引き継がない形）。
+            ace(0, 0x07, FULL_ACCESS_MASK, ME),
+            // ALICE は「変更」で引き継ぎ、別に「このフォルダだけ」のフルを持つ。
+            ace(0, 0x03, MODIFY_ACCESS_MASK, ALICE),
+            ace(0, 0x00, FULL_ACCESS_MASK, ALICE),
+        ]),
+    };
+    let carry = guard::plan_carry_over(&dacl, |_| AccountKind::User);
+    let plan = access_plan(&sid(ME), "default", &dacl, &carry);
+    let narrowing = plan
+        .lines
+        .iter()
+        .any(|l| matches!(l, ConsoleLine::Stderr(t) if t.contains("狭めます")));
+    assert!(!narrowing, "{:#?}", plan.lines);
+    assert_eq!(plan.warnings, 0);
+}
+
+/// C-3: 小文字の`s-1-`は名前として引かずに、大文字で書くよう案内して断る。
+#[test]
+fn a_lowercase_sid_is_refused_with_guidance() {
+    let ops = FakeOps::new();
+    let (result, lines) = run(&ops, Some("s-1-5-21-1-2-3-1001"), None);
+    assert_eq!(result, Err(Refused));
+    assert!(lines[0].contains("S-1- を大文字で"), "{lines:#?}");
+    assert!(ops.calls().is_empty());
+}
+
+/// B-6: ルート・profiles の段の所有者の断りは、所有者の取り直しを案内する
+/// （`grant-profile-acl <その利用者>`は profile の段だけ）。
+#[test]
+fn foreign_owner_guidance_depends_on_the_level() {
+    for (dir, expect_takeown) in [(root(), true), (profiles(), true), (profile(), false)] {
+        let ops = FakeOps::new();
+        ops.dirs.borrow_mut().get_mut(&dir).unwrap().info.owner = EVIL.into();
+        let (result, lines) = run(&ops, None, None);
+        assert_eq!(result, Err(Refused));
+        let line = lines.iter().find(|l| l.contains(EVIL)).unwrap();
+        if expect_takeown {
+            let tail = format!(
+                "（中身を確かめ、このフォルダの所有者を Administrators に取り直してから（takeown /f \"{}\" /a か icacls \"{}\" /setowner *S-1-5-32-544）、もう一度実行してください）",
+                dir.display(),
+                dir.display()
+            );
+            assert!(line.ends_with(&tail), "{line}");
+            assert!(!line.contains("grant-profile-acl"), "{line}");
+        } else {
+            assert!(line.contains("grant-profile-acl <その利用者>"), "{line}");
+            assert!(!line.contains("takeown"), "{line}");
+        }
+    }
+}
+
+// --- B-5: reset-password・revert-to-commissioning の対象 ------------------------------
+
+fn config() -> PathBuf {
+    profile().join("config")
+}
+
+fn db() -> PathBuf {
+    config().join("banto-hub.sqlite3")
+}
+
+fn target_ops() -> FakeOps {
+    let ops = FakeOps::new();
+    ops.dirs
+        .borrow_mut()
+        .insert(config(), FakeDir::owned_by(ME));
+    ops.files.borrow_mut().insert(
+        db(),
+        FileFacts {
+            is_dir: false,
+            is_reparse_point: false,
+            links: 1,
+            final_path: db(),
+        },
+    );
+    ops
+}
+
+/// 正常: ルート → profiles → profile → config → DB の順に辿らずに開き、持ったまま返す
+/// （閉じるのは返したものを drop したとき、逆の順）。
+#[test]
+fn open_target_profile_pins_every_level_and_holds_until_dropped() {
+    let ops = target_ops();
+    let (paths, held) = open_target_profile(&ops, None).unwrap();
+    assert_eq!(paths.db_path, db());
+    assert_eq!(
+        ops.calls(),
+        vec![
+            "pin BantoHub",
+            "pin profiles",
+            "pin default",
+            "pin config",
+            "pin_file banto-hub.sqlite3"
+        ]
+    );
+    drop(held);
+    assert_eq!(
+        ops.calls()[5..],
+        [
+            "drop banto-hub.sqlite3",
+            "drop config",
+            "drop default",
+            "drop profiles",
+            "drop BantoHub"
+        ]
+    );
+}
+
+/// 断る: config がジャンクション・途中の段の本当のパスが違う（すり替え）・DB が
+/// ハードリンク・reparse point・フォルダ・本当のパスが違う。無ければ DbNotFound。
+#[test]
+fn open_target_profile_refuses_links_and_swaps() {
+    type Tweak = Box<dyn Fn(&FakeOps)>;
+    let dir = |path: fn() -> PathBuf, f: fn(&mut FakeDir)| -> Tweak {
+        Box::new(move |ops: &FakeOps| f(ops.dirs.borrow_mut().get_mut(&path()).unwrap()))
+    };
+    let file = |f: fn(&mut FileFacts)| -> Tweak {
+        Box::new(move |ops: &FakeOps| f(ops.files.borrow_mut().get_mut(&db()).unwrap()))
+    };
+    let cases: Vec<(&str, Tweak, &str)> = vec![
+        (
+            "config junction",
+            dir(config, |d| d.info.is_reparse_point = true),
+            "reparse point",
+        ),
+        (
+            "config swapped",
+            dir(config, |d| d.final_path = Some(abs("elsewhere/config"))),
+            "本当の場所",
+        ),
+        (
+            "profile swapped",
+            dir(profile, |d| d.final_path = Some(abs("elsewhere/default"))),
+            "本当の場所",
+        ),
+        (
+            "profiles not a dir",
+            dir(profiles, |d| d.info.is_dir = false),
+            "フォルダではありません",
+        ),
+        ("db hardlink", file(|f| f.links = 2), "ハードリンク"),
+        (
+            "db reparse",
+            file(|f| f.is_reparse_point = true),
+            "reparse point",
+        ),
+        ("db dir", file(|f| f.is_dir = true), "フォルダです"),
+        (
+            "db elsewhere",
+            file(|f| f.final_path = abs("elsewhere/banto-hub.sqlite3")),
+            "本当の場所",
+        ),
+    ];
+    for (label, tweak, needle) in cases {
+        let ops = target_ops();
+        tweak(&ops);
+        match open_target_profile(&ops, None) {
+            Err(OpenTargetError::Unsafe(text)) => assert!(text.contains(needle), "{label}: {text}"),
+            Err(other) => panic!("{label}: {other:?}"),
+            Ok(_) => panic!("{label}: 通ってしまった"),
+        }
+    }
+    // 無い。
+    let ops = target_ops();
+    ops.files.borrow_mut().clear();
+    assert!(matches!(
+        open_target_profile(&ops, None),
+        Err(OpenTargetError::DbNotFound(path)) if path == db()
+    ));
+    let ops = target_ops();
+    ops.dirs.borrow_mut().remove(&config());
+    assert!(matches!(
+        open_target_profile(&ops, None),
+        Err(OpenTargetError::DbNotFound(_))
+    ));
+    // 不正な profile-id はどこも開かない。
+    let ops = target_ops();
+    assert!(matches!(
+        open_target_profile(&ops, Some("C:")),
+        Err(OpenTargetError::Target(_))
+    ));
+    assert!(ops.calls().is_empty());
 }

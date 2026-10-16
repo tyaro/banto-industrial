@@ -79,7 +79,7 @@ use banto_secret_store::acl::guard::{
     MachineEnvironment, MachineRootError, RealPathRefusal, RootFormProblem, WellKnownRootRefusal,
 };
 use banto_secret_store::acl::{
-    ObservedAce, ObservedDacl, PinnedDirInfo, ResetSkips, ACCESS_ALLOWED_ACE_TYPE,
+    ObservedAce, ObservedDacl, PinnedDirInfo, ResetSkips, ACCESS_ALLOWED_ACE_TYPE, INHERIT_FLAGS,
     MODIFY_ACCESS_MASK,
 };
 use banto_secret_store::{DirAccess, InstallUserSid};
@@ -111,6 +111,10 @@ const INHERITED_ACE_FLAG: u8 = 0x10;
 
 /// `ACCESS_DENIED_ACE_TYPE`。
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+/// 継承の形を見るビット（`OBJECT_INHERIT`・`CONTAINER_INHERIT`・`NO_PROPAGATE_INHERIT`・
+/// `INHERIT_ONLY`）。引き継ぐ ACE はこのうち`OICI`だけを持つ。
+const CARRY_SHAPE_MASK: u8 = 0x0F;
 
 // --- profile-id の許可リスト -------------------------------------------------------
 
@@ -249,6 +253,157 @@ pub fn resolve_target_profile(
     resolve_profile_paths(&root, id).map_err(TargetError::Path)
 }
 
+/// [`open_target_profile`] が開いて持っているもの（DB を閉じるまで持つ。drop で閉じる）。
+pub struct HeldTarget<P, F> {
+    /// ルート → `profiles\` → profile → `config\` の順（閉じるのは逆の順）。
+    dirs: Vec<P>,
+    file: Option<F>,
+}
+
+impl<P, F> Drop for HeldTarget<P, F> {
+    fn drop(&mut self) {
+        self.file.take();
+        while self.dirs.pop().is_some() {}
+    }
+}
+
+/// [`open_target_profile`] が返すもの（対象のパスと、DB を閉じるまで持つもの）。
+pub type OpenedTarget<O> = (
+    ProfilePaths,
+    HeldTarget<<O as HubElevOps>::Pinned, <O as HubElevOps>::HeldFile>,
+);
+
+/// [`open_target_profile`] の失敗。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenTargetError {
+    /// profile-id・ルートが使えない。
+    Target(TargetError),
+    /// DB のファイル（か、その上のフォルダ）が無い。
+    DbNotFound(PathBuf),
+    /// 辿らずに開いた結果、使えない（ジャンクション・本当のパスの不一致・ハードリンクなど）。
+    /// 中身は理由の文言。
+    Unsafe(String),
+}
+
+/// `reset-password`・`revert-to-commissioning`の対象の DB を、**開く前に**辿らずに開いて
+/// 確かめ、持ったままにする（#626 PR-B の監査 B-5、2026-10-16 オーナー決定）。
+///
+/// 1. [`resolve_target_profile`]（許可リストの profile-id・マシンの環境のルート）。
+/// 2. ルート → `profiles\` → profile → `config\` を順に`pin_dir`し、それぞれの本当の
+///    パスが「1 つ上の本当のパス + 名前」と同じ場所で既知のフォルダに当たらないこと、
+///    reparse point でなくフォルダであることを確かめる（profile の中に`config`の
+///    ジャンクションを置かれても、その先の DB を開かない）。
+/// 3. DB のファイルを辿らずに開き、フォルダでない・reparse point でない・ハードリンク
+///    （リンク数 2 以上）でない・本当のパスが「本当の`config` + 名前」であることを確かめる。
+///
+/// 返したものは DB を閉じるまで持つ（持っている間はどの段も名前の変更・削除ができない）。
+/// 作るものは何も無い（読むだけ）。所有者は確かめない（管理者として DB を開くだけで、
+/// ACL を書かないため）。
+pub fn open_target_profile<O: HubElevOps>(
+    ops: &O,
+    profile_id: Option<&str>,
+) -> Result<OpenedTarget<O>, OpenTargetError> {
+    let paths =
+        resolve_target_profile(ops.machine_env(), profile_id).map_err(OpenTargetError::Target)?;
+    let known = ops.machine_env().known_folders().map_err(|error| {
+        OpenTargetError::Target(TargetError::Root(machine_root_text(
+            &MachineRootError::KnownFoldersUnavailable(error),
+        )))
+    })?;
+    let config_dir = paths
+        .db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| paths.profile_dir.join("config"));
+    let mut held = HeldTarget {
+        dirs: Vec::new(),
+        file: None,
+    };
+    let levels: [(PathBuf, Option<&str>); 4] = [
+        (paths.root.clone(), None),
+        (paths.root.join(PROFILES_DIR), Some(PROFILES_DIR)),
+        (paths.profile_dir.clone(), Some(paths.profile_id.as_str())),
+        (config_dir.clone(), Some("config")),
+    ];
+    let mut real_parent: Option<PathBuf> = None;
+    for (dir, name) in levels {
+        let pinned = match ops.pin_dir(&dir) {
+            Ok(Some(pinned)) => pinned,
+            Ok(None) => return Err(OpenTargetError::DbNotFound(paths.db_path.clone())),
+            Err(error) => {
+                return Err(OpenTargetError::Unsafe(format!(
+                    "{} を開けませんでした: {error}",
+                    dir.display()
+                )))
+            }
+        };
+        let expected = match (&real_parent, name) {
+            (Some(parent), Some(name)) => parent.join(name),
+            _ => dir.clone(),
+        };
+        let real = pinned.final_path();
+        if let Err(refusal) = guard::check_real_path(&real, &expected, &known) {
+            return Err(OpenTargetError::Unsafe(match refusal {
+                RealPathRefusal::Mismatch => format!(
+                    "{} の本当の場所（{}）が期待（{}）と違います。途中のフォルダがジャンクションか短い名前の可能性があります。DB を開かずに止めます",
+                    dir.display(),
+                    real.display(),
+                    expected.display()
+                ),
+                RealPathRefusal::WellKnown(refusal) => format!(
+                    "{} の本当の場所が使えません: {}。DB を開かずに止めます",
+                    dir.display(),
+                    well_known_text(&real, &refusal)
+                ),
+            }));
+        }
+        let info = pinned.info();
+        if info.is_reparse_point || !info.is_dir {
+            return Err(OpenTargetError::Unsafe(format!(
+                "{} はジャンクション・シンボリックリンク（reparse point）か、フォルダではありません。DB を開かずに止めます",
+                dir.display()
+            )));
+        }
+        real_parent = Some(real);
+        held.dirs.push(pinned);
+    }
+    let (file, facts) = match ops.pin_file(&paths.db_path) {
+        Ok(Some(found)) => found,
+        Ok(None) => return Err(OpenTargetError::DbNotFound(paths.db_path.clone())),
+        Err(error) => {
+            return Err(OpenTargetError::Unsafe(format!(
+                "DB（{}）を開けませんでした: {error}",
+                paths.db_path.display()
+            )))
+        }
+    };
+    let db_name = paths
+        .db_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let expected = real_parent.unwrap_or(config_dir).join(db_name);
+    let problem = if facts.is_dir {
+        Some("フォルダです")
+    } else if facts.is_reparse_point {
+        Some("シンボリックリンクなどの reparse point です")
+    } else if facts.links >= 2 {
+        Some("ハードリンク（ほかの名前と中身を共有）です")
+    } else if !guard::paths_match(&facts.final_path, &expected) {
+        Some("本当の場所が期待と違います")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        return Err(OpenTargetError::Unsafe(format!(
+            "DB（{}）は{problem}。DB を開かずに止めます",
+            paths.db_path.display()
+        )));
+    }
+    held.file = Some(file);
+    Ok((paths, held))
+}
+
 // --- OS の操作 ---------------------------------------------------------------------
 
 /// 辿らずに開いたフォルダ（Windows は`banto_secret_store::acl::PinnedDir`）。持っている
@@ -296,6 +451,25 @@ pub trait HubElevOps {
     fn pin_dir(&self, dir: &Path) -> Result<Option<Self::Pinned>, String>;
     /// 無ければ作る（作ったら`true`、既にあれば`false`）。
     fn create_dir(&self, dir: &Path, how: CreateHow) -> Result<bool, String>;
+    /// [`HubElevOps::pin_file`] が返す、開いたままのファイル（drop で閉じる）。
+    type HeldFile;
+    /// ファイルを**辿らずに**開いて持つ（Windows は`FILE_FLAG_OPEN_REPARSE_POINT`、共有の
+    /// 削除なし - 持っている間は名前の変更・削除・すり替えができない）。無ければ`Ok(None)`。
+    /// `reset-password`・`revert-to-commissioning`が DB を開く前に使う（#626 PR-B の監査 B-5）。
+    fn pin_file(&self, path: &Path) -> Result<Option<(Self::HeldFile, FileFacts)>, String>;
+}
+
+/// [`HubElevOps::pin_file`] で開いたファイルの、ハンドルから読んだ情報。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFacts {
+    /// フォルダか。
+    pub is_dir: bool,
+    /// reparse point か（シンボリックリンクなど）。
+    pub is_reparse_point: bool,
+    /// ハードリンクの数（2 以上なら木の外の名前と中身を共有している）。
+    pub links: u32,
+    /// `GetFinalPathNameByHandleW`の本当のパス。
+    pub final_path: PathBuf,
 }
 
 // --- 行 ----------------------------------------------------------------------------
@@ -377,10 +551,18 @@ pub fn preflight<O: HubElevOps>(
     })
 }
 
-/// `user`引数が SID の形か（`S-1-`で始まる。大文字小文字を問わない）。
+/// `user`引数が SID の形か（`S-1-`で始まる。`InstallUserSid::parse`と同じく大文字だけ。
+/// 小文字の`s-1-`は [`looks_like_lowercase_sid`] で別に断る - #626 PR-B の監査 C-3）。
 fn looks_like_sid(arg: &str) -> bool {
-    arg.get(..4)
-        .is_some_and(|head| head.eq_ignore_ascii_case("S-1-"))
+    arg.starts_with("S-1-")
+}
+
+/// 小文字を含む`s-1-`の形（名前として引かずに、大文字で書くよう案内して断る）。
+fn looks_like_lowercase_sid(arg: &str) -> bool {
+    !looks_like_sid(arg)
+        && arg
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case("S-1-"))
 }
 
 /// 利用者を決めて確かめる（論点 5）: 名前は SID の文字列に → `InstallUserSid::parse` →
@@ -396,6 +578,12 @@ fn resolve_user<O: HubElevOps>(
     };
     let (shown, sid) = match arg {
         Some("") => return refuse(out, "利用者の引数が空です".to_string()),
+        Some(arg) if looks_like_lowercase_sid(arg) => {
+            return refuse(
+                out,
+                format!("{arg} は SID の形ですが、SID は S-1- を大文字で書いてください"),
+            )
+        }
         Some(arg) if looks_like_sid(arg) => match InstallUserSid::parse(arg) {
             Ok(sid) => (arg.to_string(), sid),
             Err(_) => {
@@ -522,10 +710,14 @@ pub fn access_plan(
         }
     }
     let in_new_dacl = |sid: &str| access.install_users().iter().any(|u| u.as_str() == sid);
-    for sid in access.install_users() {
+    // 「変更」より広い権限を狭める警告は、**引き継いだ ACE だけ**を見る（#626 PR-B の監査
+    // C-1。`plan_carry_over`が引き継ぐのと同じ形: 明示の許可・`OICI`・`INHERIT_ONLY`と
+    // `NO_PROPAGATE`なし・「変更」を含む）。
+    for sid in &carry.carried {
         let wider = dacl.aces.iter().flatten().any(|ace| {
             ace.ace_type == ACCESS_ALLOWED_ACE_TYPE
                 && ace.flags & INHERITED_ACE_FLAG == 0
+                && ace.flags & CARRY_SHAPE_MASK == INHERIT_FLAGS
                 && ace.sid == sid.as_str()
                 && ace.mask & MODIFY_ACCESS_MASK == MODIFY_ACCESS_MASK
                 && ace.mask & !MODIFY_ACCESS_MASK != 0
@@ -579,6 +771,20 @@ pub fn access_plan(
             DropReason::NotAnAccount => lines.push(out_line(&format!(
                 "この PC の利用者のアカウントでない SID（グループなど）の ACE（{ace}）は引き継ぎません"
             ))),
+            DropReason::HasDeny if dropped.ace.sid == user.as_str() => {
+                warnings += 1;
+                lines.push(err_line(&format!(
+                    "警告: 指定の利用者 {} には拒否の ACE がありましたが、指定どおり「変更」を付けます（拒否は消えます）",
+                    user.as_str()
+                )));
+            }
+            DropReason::HasDeny => {
+                warnings += 1;
+                lines.push(err_line(&format!(
+                    "警告: 利用者 {} には拒否の ACE があったので、許可の ACE（{ace}）を引き継ぎません（引き継ぐと拒否が消えて権利が広がるため）。要るなら grant-profile-acl {} {profile_id} を手で実行してください",
+                    dropped.ace.sid, dropped.ace.sid
+                )));
+            }
             DropReason::LookupFailed(reason) => {
                 warnings += 1;
                 lines.push(err_line(&format!(
@@ -645,6 +851,13 @@ impl Created {
 
 fn refusal_text(level: Level, dir: &Path, refusal: &DataAclRefusal) -> String {
     let reason = match refusal {
+        // ルート・profiles の段では、利用者を指定しても所有者は変わらない（この段は書き
+        // 直さない）ので、所有者の取り直しを案内する（#626 PR-B の監査 B-6）。
+        DataAclRefusal::ForeignOwner(owner) if level != Level::Profile => format!(
+            "所有者（{owner}）が SYSTEM・Administrators・指定の利用者・実行した管理者のどれでもありません。乗っ取りの恐れがあるため、止めます（中身を確かめ、このフォルダの所有者を Administrators に取り直してから（takeown /f \"{}\" /a か icacls \"{}\" /setowner *S-1-5-32-544）、もう一度実行してください）",
+            dir.display(),
+            dir.display()
+        ),
         DataAclRefusal::ReparsePoint => "ジャンクションかシンボリックリンク（reparse point）です。リンクの先を書き換えないよう、止めます（リンクを外して普通のフォルダにしてから、もう一度実行してください）".to_string(),
         DataAclRefusal::NotADirectory => "フォルダではありません。止めます".to_string(),
         DataAclRefusal::ForeignOwner(owner) => format!(
@@ -777,21 +990,47 @@ pub fn grant_profile_acl<O: HubElevOps>(
     pre: &Preflight,
     out: Out<'_>,
 ) -> Result<(), Refused> {
-    let id = pre.profile_id.as_str();
-    match ops.profile_in_use(id) {
-        Ok(false) => {}
-        Ok(true) => {
+    match grant_steps(ops, pre, out) {
+        Ok(()) => Ok(()),
+        Err(GrantStop::InUse) => {
+            let id = pre.profile_id.as_str();
             out(err_line(&format!(
                 "profile '{id}' は使用中です（Hub のサービスかアプリが開いています - {}）。サービスとアプリを止めてから、もう一度実行してください。何も変えていません",
                 crate::profile_paths::mutex_name(id)
             )));
-            return Err(Refused);
+            Err(Refused)
         }
+        Err(GrantStop::Refused) => Err(Refused),
+    }
+}
+
+/// [`grant_steps`] が止まった理由。使用中（mutex がある）だけを分けるのは、
+/// `service-install`がそのときだけ ACL の付け直しを飛ばして成功にするため（#626 PR-B の
+/// 監査 B-1、2026-10-16 オーナー決定 (a)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantStop {
+    /// profile が使用中（行はまだ出していない - 呼ぶ側が出す）。
+    InUse,
+    /// それ以外で断った（理由の行は出した）。
+    Refused,
+}
+
+impl From<Refused> for GrantStop {
+    fn from(_: Refused) -> Self {
+        GrantStop::Refused
+    }
+}
+
+fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<(), GrantStop> {
+    let id = pre.profile_id.as_str();
+    match ops.profile_in_use(id) {
+        Ok(false) => {}
+        Ok(true) => return Err(GrantStop::InUse),
         Err(error) => {
             out(err_line(&format!(
                 "profile '{id}' が使用中かを確かめられませんでした: {error}。何も変えていません"
             )));
-            return Err(Refused);
+            return Err(GrantStop::Refused);
         }
     }
     let mut created = Created(Vec::new());
@@ -832,7 +1071,7 @@ pub fn grant_profile_acl<O: HubElevOps>(
                 profile_dir.display()
             )));
             created.notice(out);
-            return Err(Refused);
+            return Err(GrantStop::Refused);
         }
     };
     let carry = guard::plan_carry_over(&dacl, |sid| ops.account_kind(sid));
@@ -848,7 +1087,7 @@ pub fn grant_profile_acl<O: HubElevOps>(
                 profile_dir.display()
             )));
             created.notice(out);
-            return Err(Refused);
+            return Err(GrantStop::Refused);
         }
     };
     let users: Vec<&str> = plan
@@ -884,6 +1123,13 @@ pub fn grant_profile_acl<O: HubElevOps>(
 /// 利用者・既定の profile）を済ませ、通らなければ何も登録しない。`register`は登録 →
 /// `setup-operators` → `grant-service-acl`（`crate::service_elevated`の今の手順）。
 /// 最後に [`grant_profile_acl`] を同じ確かめた値で行う。
+///
+/// **profile が使用中のときだけ**（mutex がある）、ACL の付け直しを飛ばした警告の行を出して
+/// 成功にする（#626 PR-B の監査 B-1、2026-10-16 オーナー決定 (a)）。シェルは × でトレイに
+/// 隠れるだけなので、インストーラの`taskkill`（`/F`なし）では終わらず、上書きインストールで
+/// mutex が残りうるため。登録・Operators・サービス ACL は済んでいる。それ以外の断り
+/// （所有者・本当のパス・reparse point など）は今どおり失敗。手で実行する
+/// `grant-profile-acl`は使用中でも断って失敗のまま（[`grant_profile_acl`]）。
 pub fn service_install<O: HubElevOps, E>(
     ops: &O,
     register: impl FnOnce() -> Result<(), E>,
@@ -896,7 +1142,18 @@ pub fn service_install<O: HubElevOps, E>(
         ServiceInstallError::Refused
     })?;
     register().map_err(ServiceInstallError::Register)?;
-    grant_profile_acl(ops, &pre, out).map_err(|Refused| ServiceInstallError::Refused)
+    match grant_steps(ops, &pre, out) {
+        Ok(()) => Ok(()),
+        Err(GrantStop::InUse) => {
+            out(err_line(&format!(
+                "警告: profile '{}' が使用中なので ACL の付け直しを飛ばしました（{}）。サービスとアプリを止めてから grant-profile-acl を実行してください",
+                pre.profile_id,
+                crate::profile_paths::mutex_name(&pre.profile_id)
+            )));
+            Ok(())
+        }
+        Err(GrantStop::Refused) => Err(ServiceInstallError::Refused),
+    }
 }
 
 /// [`service_install`] の失敗。

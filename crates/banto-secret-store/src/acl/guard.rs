@@ -31,8 +31,8 @@
 //! - [`data_acl_plan`] は、開いたフォルダの属性と所有者から、作る・書き直す・断るを決める
 //!   （reparse point・フォルダでない・見知らぬ所有者を断る）。
 //! - [`plan_carry_over`] は、書き直す前の DACL（`PinnedDir::read_dacl`）から、**引き継ぐ
-//!   利用者**（明示の許可で「変更」相当、`SidTypeUser`）と**落とすもの**（グループ・
-//!   well-known・継承・拒否など）を分ける。banto-hub の `grant-profile-acl` が、今の
+//!   利用者**（明示の許可で「変更」相当、`SidTypeUser`、拒否の ACE を持たない）と
+//!   **落とすもの**（グループ・well-known・継承・拒否・拒否を持つ利用者など）を分ける。banto-hub の `grant-profile-acl` が、今の
 //!   「足していく」意味を保護された DACL で保つため（#626 の論点 4 (b)）。
 
 use std::path::{Path, PathBuf};
@@ -358,6 +358,10 @@ pub enum DropReason {
     NotAUserSid,
     /// 利用者の領域の SID だが、利用者のアカウントではない（グループなど）。
     NotAnAccount,
+    /// 同じ SID に**拒否の ACE**がある（種類・継承を問わない）。許可だけを引き継ぐと、
+    /// 保護された DACL では拒否が消えて、その相手の権利が広がるので引き継がない（#626
+    /// PR-B の監査 B-2、安全側）。拒否の ACE そのものは [`DropReason::NotAllow`] で別に出る。
+    HasDeny,
     /// 利用者のアカウントかを確かめられなかった（[`AccountKind::LookupFailed`]）。
     LookupFailed(String),
 }
@@ -393,14 +397,16 @@ pub struct CarryOver {
 /// 4. `OICI` でない・`INHERIT_ONLY`・`NO_PROPAGATE_INHERIT` → [`DropReason::NotTreeWide`]。
 /// 5. マスクが「変更」を含まない → [`DropReason::LessThanModify`]（フルコントロールは
 ///    含むので、「変更」に**狭めて**引き継ぐ）。
-/// 6. `InstallUserSid::parse` に通らない → [`DropReason::NotAUserSid`]。
+/// 6. `InstallUserSid::parse` に通らない → [`DropReason::NotAUserSid`]。同じ SID に
+///    拒否の ACE がある（DACL のどこか。種類・継承を問わない）→ [`DropReason::HasDeny`]
+///    （#626 PR-B の監査 B-2）。
 /// 7. 既に引き継ぐと決めた SID → **どちらでもない**（同じ利用者の 2 つ目の ACE）。
 /// 8. `account` が [`AccountKind::NotAUser`] → [`DropReason::NotAnAccount`]、
 ///    [`AccountKind::LookupFailed`] → [`DropReason::LookupFailed`]。
 /// 9. それ以外 → 引き継ぐ。
 ///
-/// 引き継いだ利用者の、ほかの ACE（拒否・読み取りだけなど）は落とした側に残る（拒否が
-/// 消えるのを呼ぶ側が知らせられるように）。
+/// 引き継いだ利用者の、ほかの ACE（読み取りだけなど）は落とした側に残る。拒否の ACE を
+/// 持つ利用者は引き継がない（拒否が消えて権利が広がるため）。
 pub fn plan_carry_over(
     dacl: &ObservedDacl,
     mut account: impl FnMut(&InstallUserSid) -> AccountKind,
@@ -410,6 +416,12 @@ pub fn plan_carry_over(
         plan.null_dacl = true;
         return plan;
     };
+    // 拒否を持つ SID（許可でない ACE で SID のあるもの。拒否の種類・継承を問わない）。
+    let denied: Vec<&str> = aces
+        .iter()
+        .filter(|ace| ace.ace_type != ACCESS_ALLOWED_ACE_TYPE && !ace.sid.is_empty())
+        .map(|ace| ace.sid.as_str())
+        .collect();
     for ace in aces {
         let allow = ace.ace_type == ACCESS_ALLOWED_ACE_TYPE;
         if allow && (ace.sid == SYSTEM_SID || ace.sid == ADMINISTRATORS_SID) {
@@ -442,6 +454,10 @@ pub fn plan_carry_over(
             plan.dropped.push(drop(DropReason::NotAUserSid));
             continue;
         };
+        if denied.contains(&sid.as_str()) {
+            plan.dropped.push(drop(DropReason::HasDeny));
+            continue;
+        }
         if plan.carried.contains(&sid) {
             continue;
         }

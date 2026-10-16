@@ -24,7 +24,8 @@ use banto_secret_store::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 
 use super::super::{
-    grant_profile_acl, preflight, AccountKind, CreateHow, HubElevOps, PinnedProfileDir, Refused,
+    grant_profile_acl, open_target_profile, preflight, AccountKind, CreateHow, FileFacts,
+    HubElevOps, OpenTargetError, PinnedProfileDir, Refused,
 };
 use super::{RegistryMachineEnvironment, WindowsHubElevOps};
 
@@ -32,9 +33,15 @@ fn me() -> InstallUserSid {
     banto_secret_store::acl::current_user_sid().expect("今の利用者の SID")
 }
 
-/// 昇格した管理者として走っているか。違えば理由を出す（呼ぶ側が skip する）。
+/// 昇格した管理者として走っているか。違えば理由を出す（呼ぶ側が skip する）。`CI`の環境変数が
+/// あるのに管理者でなければ panic する（#626 PR-B の監査 B-3）。
 fn elevated_admin(test: &str) -> bool {
     let admin = banto_service_elev::is_current_process_admin().unwrap_or(false);
+    // CI（GitHub の Windows のランナー）は管理者のはず。管理者でなければ反証が黙って
+    // 飛ばされるので、skip せずに落とす（#626 PR-B の監査 B-3）。
+    if !admin && std::env::var_os("CI").is_some() {
+        panic!("{test}: CI なのに昇格した管理者ではない（書き直しの反証が走らない）");
+    }
     if !admin {
         eprintln!(
             "skip {test}: 昇格した管理者ではないので、所有者を Administrators に移せない（CI で確かめる）"
@@ -160,6 +167,10 @@ impl HubElevOps for TempOps {
     }
     fn create_dir(&self, dir: &Path, how: CreateHow) -> Result<bool, String> {
         WindowsHubElevOps.create_dir(dir, how)
+    }
+    type HeldFile = super::HeldFile;
+    fn pin_file(&self, path: &Path) -> Result<Option<(super::HeldFile, FileFacts)>, String> {
+        WindowsHubElevOps.pin_file(path)
     }
 }
 
@@ -566,4 +577,104 @@ fn set_reparse_to(dir: &Path, target: &Path) -> std::io::Result<()> {
         return Err(err);
     }
     Ok(())
+}
+
+// --- B-5: reset-password・revert-to-commissioning の対象（読むだけ。管理者でなくても走る） --
+
+/// 対象の profile の木（ルート・profiles・default・config と DB のファイル）を作る。
+fn make_target(base: &Path) -> PathBuf {
+    let root = base.join("BantoHub");
+    let config = root.join("profiles").join("default").join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("banto-hub.sqlite3"), b"db").unwrap();
+    root
+}
+
+fn open_target(root: &Path) -> Result<PathBuf, OpenTargetError> {
+    open_target_profile(&TempOps::new(root), None).map(|(paths, _held)| paths.db_path)
+}
+
+#[test]
+fn the_target_db_opens_when_nothing_is_linked() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = make_target(&long(parent.path()));
+    let db = open_target(&root).unwrap();
+    assert_eq!(
+        db,
+        root.join("profiles")
+            .join("default")
+            .join("config")
+            .join("banto-hub.sqlite3")
+    );
+}
+
+/// 持っている間は DB のファイルを消せない・名前を変えられない（すり替えられない）。
+/// SQLite と同じ読み書き・共有読み書きでは開ける。
+#[test]
+fn a_held_target_db_cannot_be_swapped_but_can_be_opened() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = make_target(&long(parent.path()));
+    let (paths, held) = open_target_profile(&TempOps::new(&root), None).unwrap();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.db_path)
+        .expect("SQLite と同じ開き方は通る");
+    assert!(std::fs::remove_file(&paths.db_path).is_err());
+    assert!(std::fs::rename(&paths.db_path, paths.db_path.with_extension("old")).is_err());
+    drop(held);
+    std::fs::rename(&paths.db_path, paths.db_path.with_extension("old")).unwrap();
+}
+
+/// config がジャンクションなら、その先の DB を開かずに断る。
+#[test]
+fn a_config_junction_is_refused_before_opening_the_db() {
+    let parent = tempfile::tempdir().unwrap();
+    let base = long(parent.path());
+    let root = base.join("BantoHub");
+    let profile = root.join("profiles").join("default");
+    std::fs::create_dir_all(&profile).unwrap();
+    let outside = base.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("banto-hub.sqlite3"), b"other").unwrap();
+    junction(&profile.join("config"), &outside);
+    match open_target(&root) {
+        Err(OpenTargetError::Unsafe(text)) => assert!(text.contains("reparse point"), "{text}"),
+        other => panic!("{other:?}"),
+    }
+    std::fs::remove_dir(profile.join("config")).unwrap();
+}
+
+/// 途中の要素（ルートの親）がジャンクションなら、本当のパスの比較で断る。
+#[test]
+fn a_target_behind_a_junction_in_the_middle_is_refused() {
+    let parent = tempfile::tempdir().unwrap();
+    let base = long(parent.path());
+    let elsewhere = base.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    make_target(&elsewhere);
+    let via = base.join("via");
+    junction(&via, &elsewhere);
+    match open_target(&via.join("BantoHub")) {
+        Err(OpenTargetError::Unsafe(text)) => assert!(text.contains("本当の場所"), "{text}"),
+        other => panic!("{other:?}"),
+    }
+    std::fs::remove_dir(&via).unwrap();
+}
+
+/// DB のファイルがハードリンクなら断る。
+#[test]
+fn a_hardlinked_target_db_is_refused() {
+    let parent = tempfile::tempdir().unwrap();
+    let base = long(parent.path());
+    let root = base.join("BantoHub");
+    let config = root.join("profiles").join("default").join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let outside = base.join("outside.sqlite3");
+    std::fs::write(&outside, b"other").unwrap();
+    std::fs::hard_link(&outside, config.join("banto-hub.sqlite3")).unwrap();
+    match open_target(&root) {
+        Err(OpenTargetError::Unsafe(text)) => assert!(text.contains("ハードリンク"), "{text}"),
+        other => panic!("{other:?}"),
+    }
 }
