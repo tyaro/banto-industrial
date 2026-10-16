@@ -209,6 +209,12 @@ Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
 | `grant-data-acl`                                  | データのルート・`secrets\`・`secrets\hub-keys\` を「SYSTEM・Administrators にフル、インストール利用者に変更、親から継承しない」にする。ジャンクション・見知らぬ所有者のフォルダは書き直さずに止める                               |
 | `autostart-enable` / `autostart-disable`          | 自動開始（遅延）にする / 手動開始に戻す                                                                                                                                                                                           |
 
+- **置き場所とデータの場所の制限**: `chronogazer-elev.exe` と `chronogazer-server.exe` が Program Files（x86 を含む）の
+  中に無ければ、何もせずに終了コード 2。データの場所（マシン全体の `CHRONOGAZER_ROOT`）がドライブのルート・ネットワークの
+  場所・`C:\Windows`・`C:\Program Files`・`C:\ProgramData` そのもの・`C:\Users` そのもの・`C:\Users\Public` などなら
+  2（その下の専用のフォルダにする）。`service-install` は、データのルートが既にあってジャンクションか、見知らぬ利用者の
+  持ち物なら、何も登録せずに 1。`autostart-enable` / `autostart-disable` は、登録されている実行ファイルが隣の
+  `chronogazer-server.exe` と同じときだけ動く（違えば 1）。
 - **終了コード**: 0 完了、1 失敗（書き直さずに止めたときも）、2 前提が無い（サービス未登録・インストール利用者の
   記録が無い・隣に `chronogazer-server.exe` が無いなど）、64 使い方の誤り。出力はどの行も `chronogazer-elev:` で始まる。
 - **昇格のしかた**: 管理者の PowerShell（★）からそのまま実行するか、昇格していない PowerShell から
