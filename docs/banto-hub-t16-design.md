@@ -267,6 +267,21 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 >   変わらないため）。一致した場合のみ、従来どおり`profile.lock`の読み取り
 >   確認（`MutexOwnerUnknown`/`Healthy`の分岐）へ進む - lock ファイル確認は
 >   ワイヤ確認の**後**に行う二次確認という位置づけに変わった。
+> - **`profile.lock` のアクセス拒否は Healthy（2026-10-16、#626 PR-C）**:
+>   profile ディレクトリを保護する（所有者・SYSTEM・Administrators だけ）と、
+>   所有者以外の利用者（Operators だけの利用者・UAC の分割トークンの管理者）
+>   は`profile.lock`を開けない。`banto_instance_lock::read_owner_info_detailed`
+>   が「無い」「アクセス拒否」「壊れている」「その他の I/O」を区別して返し、
+>   `http_hub_health::classify_lock_read`が**拒否だけ**を`Healthy`にする
+>   （ワイヤの profile-id 一致は先に済んでおり、`profile.lock`は profile-id
+>   を持たない二次確認のため。無い・壊れている・その他は従来どおり
+>   `MutexOwnerUnknown`）。拒否は「ファイルが在る確かな証拠」ではなく、
+>   「このトークンでは開けない」ことしか示さない（途中のディレクトリの
+>   検索権限が無くても同じ）。Windows の`File::open`はディレクトリも拒否で
+>   断るので、`PermissionDenied`のときは辿らない`symlink_metadata`で形を見て、
+>   通常のファイルでなければ`Corrupt`（= `MutexOwnerUnknown`）にする。
+>   metadata も取れないときは`Denied`のまま。新しい`HealthOutcome`は足していない（シェル・
+>   トレイは`Healthy`を既に画面接続・「サービスを開始」非表示として扱う）。
 > - 呼び出し元（`apps/banto-hub/src-tauri`）は無変更 -
 >   `HttpHubHealthProbe::with_host`等のコンストラクタのシグネチャは変わって
 >   いない。

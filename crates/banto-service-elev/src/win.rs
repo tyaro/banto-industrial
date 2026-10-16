@@ -13,7 +13,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     CheckTokenMembership, GetSecurityDescriptorDacl, InitializeSecurityDescriptor,
-    LookupAccountNameW, SetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR, PSID,
+    LookupAccountNameW, SetSecurityDescriptorDacl, SidTypeUser, ACL, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_DESCRIPTOR, SID_NAME_USE,
 };
 use windows_sys::Win32::System::Services::{
@@ -22,8 +22,8 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::{
-    classify_group_add_status, classify_member_add_status, is_valid_sid_string, ElevError,
-    GroupOutcome, MemberOutcome, OperatorsGroup, OPERATORS_SERVICE_ACCESS_MASK,
+    classify_group_add_status, classify_member_add_status, is_valid_sid_string, AccountSid,
+    ElevError, GroupOutcome, MemberOutcome, OperatorsGroup, OPERATORS_SERVICE_ACCESS_MASK,
 };
 
 /// `DACL_SECURITY_INFORMATION`（MSDN で安定して文書化された値。移す前の
@@ -65,6 +65,37 @@ impl Drop for LocalBox {
 /// その大きさのバッファで引く）。banto-hub の `profile_acl` も SYSTEM・
 /// Administrators・profile の owner の SID をこれで引く。
 pub fn lookup_account_sid(name: &str) -> Result<Option<Vec<u8>>, ElevError> {
+    Ok(lookup_account(name)?.map(|(sid, _)| sid))
+}
+
+/// アカウント名から SID を引き、**文字列形式**（`S-1-5-21-…`）と、その種類が
+/// 利用者のアカウント（`SidTypeUser`）かを返す（#626 PR-A。banto-hub の
+/// `grant-profile-acl` が、名前で受けた利用者を SID にしてグループ・well-known を
+/// 断るため）。無ければ `Ok(None)`、それ以外の失敗は [`ElevError::LookupAccountName`]。
+///
+/// 文字列化は純関数 [`crate::sid_bytes_to_string`]（`ConvertSidToStringSidW` と同じ
+/// 書式）。`LookupAccountNameW` が返した SID の形が壊れていることは無いはずだが、
+/// 万一そうなら `ERROR_INVALID_SID`（1337）の [`ElevError::LookupAccountName`]。
+/// 利用者のアカウントかを最終的に確かめるのは呼ぶ側（`banto_secret_store` の
+/// `InstallUserSid::parse` と `check_user_account`）。
+pub fn lookup_account_sid_string(name: &str) -> Result<Option<AccountSid>, ElevError> {
+    /// `ERROR_INVALID_SID`。
+    const ERROR_INVALID_SID: u32 = 1337;
+    let Some((sid, kind)) = lookup_account(name)? else {
+        return Ok(None);
+    };
+    let sid = crate::sid_bytes_to_string(&sid).ok_or_else(|| ElevError::LookupAccountName {
+        name: name.to_string(),
+        os_error: ERROR_INVALID_SID,
+    })?;
+    Ok(Some(AccountSid {
+        sid,
+        is_user: kind == SidTypeUser,
+    }))
+}
+
+/// `LookupAccountNameW` の 2 段の呼び出しの本体（SID のバイト列と種類）。
+fn lookup_account(name: &str) -> Result<Option<(Vec<u8>, SID_NAME_USE)>, ElevError> {
     let wide_name = to_wide(name);
 
     let mut sid_size: u32 = 0;
@@ -122,7 +153,7 @@ pub fn lookup_account_sid(name: &str) -> Result<Option<Vec<u8>>, ElevError> {
         });
     }
 
-    Ok(Some(sid_buf))
+    Ok(Some((sid_buf, sid_name_use)))
 }
 
 /// [`crate::is_current_process_member`] の本体。
