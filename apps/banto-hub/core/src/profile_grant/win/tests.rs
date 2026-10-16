@@ -185,6 +185,14 @@ impl HubElevOps for TempOps {
                 hook: RefCell::new(None),
             }))
     }
+    fn open_child(&self, parent: &Hooked, name: &str) -> Result<Option<Hooked>, String> {
+        Ok(WindowsHubElevOps
+            .open_child(&parent.inner, name)?
+            .map(|inner| Hooked {
+                inner,
+                hook: RefCell::new(None),
+            }))
+    }
     type HeldFile = super::HeldFile;
     fn pin_file(&self, path: &Path) -> Result<Option<(super::HeldFile, FileFacts)>, String> {
         WindowsHubElevOps.pin_file(path)
