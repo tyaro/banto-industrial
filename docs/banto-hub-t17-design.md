@@ -55,6 +55,10 @@ Desktop Hub 起動までのフル E2E は任意の追加確認として残す。
 断る・利用者のアカウントだけ・マシンの環境のルート・足していく）。§12 末尾
 「#626 の作り直し」。実機確認は 2026-10-17 に M1・M2・M4〜M7 を確認済み（M3 は
 監査の追試で代えた（実機では測っていない）。M8〜M10 は B3-4 のインストーラの実機確認へ）。**
+**2026-10-17（#642）: #641 のオーナーレビューの Nit（作ろうとしたら既にあった段を親の
+ハンドルから相対で開き直す・相対で作る名前の確かめを広げる・`COM0`/`LPT0`を予約名に）と
+実機確認の Nit 6（断ったときの最後の行の接頭辞が二重）を直した。§12 末尾「#642 の追補」。
+#642 の実機確認は未。**
 最終検証日(コード照合): 2026-09-01
 最終検証日(Windows 実機): 2026-10-17（#626 PR-B の M1・M2・M4〜M7。末尾「#626 の作り直し」の
 実機確認の結果）。2026-08-10（§8・§10・§11・§12、管理者 Cursor +
@@ -1003,7 +1007,8 @@ Administrators・指定の利用者・この昇格した利用者だけ（`data_
   でジャンクションに変えると、相対の作成は`ERROR_CANT_RESOLVE_FILENAME`（1921）で失敗し、
   外には何もできない（手元・非管理者で測定）。chronogazer-elev の`preflight_root`・
   `grant_dir`も同じ型（パスで作ってから確かめる）で、乗り換えは別の issue にする（おすすめ
-  どおり）。
+  どおり）。→ #642 で乗り換えた（docs/chronogazer-service-design.md §4 の B3-3b の実装メモ
+  「作る経路（#642）」）。
 - **2（P2）: 条件付き・オブジェクトの ACE の SID を読み落としていた**。`read_dacl`は種類
   5・6・9・10・11・12 の SID も読む（winnt.h の並び、`AceSize`の範囲を確かめる）。
   `plan_carry_over`は拒否の種類（1・6・10・12）を拒否として数え、条件付き・オブジェクトの
@@ -1035,4 +1040,28 @@ Administrators・指定の利用者・この昇格した利用者だけ（`data_
 - M1・M2・M4 のリンクの先（外の対象の DACL）が変わらないことの比較は、確認のスクリプトの不備で結果が出なかった。M1・M2 は書く前に断るので外へ書く経路は無く、M4 の先が変わらないことは CI（管理者）の `an_inner_junction_target_is_not_rewritten`・`a_hardlink_target_is_not_rewritten` で確かめている。
 - M3（旧バイナリとの比べ）は、旧実装でもジャンクションの先は変わらないことを PR-B の監査で追試済みなので、監査の追試で代えた（実機では測っていない）。ディレクトリのシンボリックリンクは測らない（上の「テスト」の項）。
 - M8（上書きインストール）・M9（owner でない利用者のシェル）・M10（over-the-shoulder）と、レビューの Should 1（書き直しの間に起動した Hub の失敗の文言）は、B3-4 のインストーラの実機確認とまとめて行う（2026-10-17 オーナー了承）。追跡は #392（B3-4）のコメントに TODO として書いた。
-- 気づき: 断ったときの最後の行の接頭辞が二重（`banto-hub-elev: banto-hub-elev: …`）。#642 で直す。
+- 気づき: 断ったときの最後の行の接頭辞が二重（`banto-hub-elev: banto-hub-elev: …`）。#642 で直した（下の「#642 の追補」）。
+
+**#642 の追補（2026-10-17、#641 のオーナーレビューの Nit 1〜5 と実機確認の Nit 6。どれも実害なし）**:
+
+- **Nit 5（作ろうとしたら既にあった段）**: `open_level`は、`create_child`が`Ok(None)`（確かめて
+  から作るまでの間に誰かが作った）の段を、パスではなく**親のハンドルから相対で**辿らずに開き
+  直す（`HubElevOps::open_child` → 共有に足した`PinnedDir::open_child_dir`。`create_child_dir`と
+  同じ`NtCreateFile`の`RootDirectory`で`FILE_OPEN | FILE_OPEN_REPARSE_POINT`。ファイル・
+  ジャンクションでもそのものを開くので、開いた後の本当のパス・属性・所有者の確かめは今どおり）。
+- **Nit 2（相対で作る・開く名前）**: 共有の`guard::is_plain_child_name`で、区切り・`:`・`.`/`..`に
+  加えて末尾の`.`と空白・`* ? < > | "`・予約デバイス名も断る（`NtCreateFile`は Win32 の正規化を
+  通らないため）。
+- **Nit 4（`COM0`・`LPT0`）**: 予約デバイス名の判定を共有の`guard::is_reserved_device_name`へ移し
+  （`profile_paths::is_reserved_device_name`はその再公開）、`COM0`・`LPT0`も断る。影響: elev の許可
+  リスト（`validate_strict_profile_id`）に加えて、**全体の`validate_profile_id`**も`com0`・`lpt0`
+  （`lpt0.x`なども）を断るようになる。ホスト（console・service・shell）は`BANTO_HUB_PROFILE`が
+  断られると警告を出して`default`を使い、`http_hub_health`の照合は「別の profile」として扱う。
+  ChronoGazer の比べ用のハーネス（`p6-<pid>-<時刻>`）・既定の`default`には当たらない。
+- **Nit 6（最後の行の接頭辞）**: `ElevatedError`の文言はほとんどが`banto-hub-elev: `で始まるのに、
+  bin が`banto-hub-elev: {err}`で出していた（`grant-profile-acl`に限らず、頭のある失敗はすべて
+  二重）。`service_elevated::failure_line`（純関数、golden）が頭の無い文言（`transparent`で包んだ
+  `ProfileIdError`・`banto-hub: `で始まるサービスの文言）にだけ 1 回付け、bin はそれを出す。
+- **Nit 1・3**: `banto-instance-lock`のテストの doc コメントの位置、`profile_grant.rs`の「論点 1〜11」。
+- 共有: ルートの親の確かめの判断を`guard::check_root_parent`（型の付いた理由）へ移し、
+  `root_parent_problem`は文言だけにした（chronogazer-elev と共有するため。文言は不変）。
