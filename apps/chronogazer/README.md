@@ -212,9 +212,14 @@ Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
 - **置き場所とデータの場所の制限**: `chronogazer-elev.exe` と `chronogazer-server.exe` が Program Files（x86 を含む）の
   中に無ければ、何もせずに終了コード 2。データの場所（マシン全体の `CHRONOGAZER_ROOT`）がドライブのルート・ネットワークの
   場所・`C:\Windows`・`C:\Program Files`・`C:\ProgramData` そのもの・`C:\Users` そのもの・`C:\Users\Public` などなら
-  2（その下の専用のフォルダにする）。`service-install` は、登録の前にデータのルートを（無ければ先に作って）確かめ、
-  ジャンクションか見知らぬ利用者の持ち物なら、何も登録せずに 1。`autostart-enable` / `autostart-disable` は、登録されている実行ファイルが隣の
-  `chronogazer-server.exe` と同じときだけ動く（違えば 1）。
+  2（その下の専用のフォルダにする）。**`CHRONOGAZER_ROOT` は長い名前で書く**（`C:\PROGRA~1` のような
+  8.3 の短い名前は、本当の場所と食い違うので断る。安全側）。`service-install` は、登録の前にデータのルートを
+  （無ければ**まず SYSTEM・Administrators だけの DACL で**先に作って）確かめ、ジャンクションか見知らぬ利用者の
+  持ち物なら、何も登録せずに 1（作ったフォルダが残るときはその旨を 1 行出す。利用者の「変更」は確かめが
+  通ってから付く）。`autostart-enable` / `autostart-disable` は、登録されている実行ファイルが隣の
+  `chronogazer-server.exe` と同じときだけ動く（違えば 1）。`grant-data-acl` は、データの中に利用者が
+  Administrators を拒否したファイルがあると、それを触らず飛ばして 1 行出し、ほかは続ける（そのファイルは
+  そのまま残る）。
 - **終了コード**: 0 完了、1 失敗（書き直さずに止めたときも）、2 前提が無い（サービス未登録・インストール利用者の
   記録が無い・隣に `chronogazer-server.exe` が無いなど）、64 使い方の誤り。出力はどの行も `chronogazer-elev:` で始まる。
 - **昇格のしかた**: 管理者の PowerShell（★）からそのまま実行するか、昇格していない PowerShell から
