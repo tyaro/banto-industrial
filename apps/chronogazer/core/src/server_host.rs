@@ -108,7 +108,7 @@ use banto_hub_bootstrap::KeyStore;
 use banto_server::ServerConfig;
 use banto_tstore::{Clock, LocalDate};
 
-use crate::endpoint::{clear_endpoint, write_endpoint, EndpointInfo};
+use crate::endpoint::{clear_endpoint, write_endpoint, EndpointClear, EndpointInfo};
 use crate::engine::{
     EngineConfig, EngineListen, EngineRuntime, EngineStartError, LockedEngine, OpenedEngine,
     RunningEngine, ShutdownReport,
@@ -400,12 +400,30 @@ pub struct StartedServer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerShutdownSummary {
     pub report: ShutdownReport,
-    /// `run\endpoint.json` を消した（自分のものが残っていた）。
-    pub endpoint_cleared: bool,
+    /// `run\endpoint.json` の後始末の結果（#599）。
+    pub endpoint: EndpointClear,
+    /// `run\endpoint.json` の場所（[`Self::endpoint_diagnostic`] の表示用）。
+    pub endpoint_file: PathBuf,
 }
 
 impl ServerShutdownSummary {
+    /// `run\endpoint.json` を残したことを知らせる 1 行（消せなかった・読めなかった・
+    /// 壊れていた。[`EndpointClear::diagnostic`]）。終了の記録で 1 回だけ出す。
+    pub fn endpoint_diagnostic(&self) -> Option<String> {
+        self.endpoint
+            .diagnostic(&self.endpoint_file)
+            .map(|line| format!("{SERVER_LABEL}: {line}"))
+    }
+
     /// 終了コード（後始末が予算内に終わり、最終 flush が通れば 0）。
+    ///
+    /// `run\endpoint.json` を消せなかったことは**終了コードに入れない**（#599）。
+    /// [`EXIT_SHUTDOWN_INCOMPLETE`] は「収集の後始末（予算・最終 flush）が終わらなかった」
+    /// の意味で、サービスでは SCM へ異常の終わり（`server_service::service_exit_for`）
+    /// として報告される。残ったファイルは書いたプロセス（自分）が生きていないので読む側
+    /// （`endpoint::read_live_endpoint`）が古いものとして読み飛ばし、次の起動が置き換え
+    /// るため、データにも次の接続にも影響しない。知らせるのはログの 1 行
+    /// （[`Self::endpoint_diagnostic`]）だけ。
     pub fn exit_code(&self) -> i32 {
         if self.report.timed_out || self.report.collect_stop_error.is_some() {
             EXIT_SHUTDOWN_INCOMPLETE
@@ -683,11 +701,13 @@ impl StartedServer {
     /// listener に繋がらない）。同時に 2 回走らせないのは呼び出し側
     /// （`banto_exit_once::ExitCleanupOnce`）。
     pub async fn shutdown(&self, budget: Duration) -> ServerShutdownSummary {
-        let endpoint_cleared = clear_endpoint(&self.endpoint_file, std::process::id());
+        // 消せなくても（#599）エンジンの停止・最終 flush へ進む。
+        let endpoint = clear_endpoint(&self.endpoint_file, std::process::id());
         let report = self.engine.shutdown(budget).await;
         ServerShutdownSummary {
             report,
-            endpoint_cleared,
+            endpoint,
+            endpoint_file: self.endpoint_file.clone(),
         }
     }
 }

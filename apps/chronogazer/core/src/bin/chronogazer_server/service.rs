@@ -218,6 +218,10 @@ impl ServerProgram {
         let budget = service_stop_budget(&notice, Instant::now());
         println!("{}", service_stop_reason_line(notice.signal, budget));
         let summary = runtime.block_on(server.shutdown(budget));
+        // #599: endpoint.json を残したこと（終了コードは変えない）。
+        if let Some(line) = summary.endpoint_diagnostic() {
+            eprintln!("{line}");
+        }
         if let Some(err) = &summary.report.collect_stop_error {
             eprintln!("{SERVER_LABEL}: 最終の書き出しに失敗しました: {err}");
         }

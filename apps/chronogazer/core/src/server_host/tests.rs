@@ -478,7 +478,8 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     assert_eq!(body["success"], true, "{body}");
 
     let summary = started.shutdown(Duration::from_secs(15)).await;
-    assert!(summary.endpoint_cleared);
+    assert_eq!(summary.endpoint, crate::endpoint::EndpointClear::Removed);
+    assert_eq!(summary.endpoint_diagnostic(), None);
     assert_eq!(summary.exit_code(), EXIT_OK);
     assert!(!started.endpoint_file().exists());
     assert!(std::net::TcpStream::connect(addr).is_err());
