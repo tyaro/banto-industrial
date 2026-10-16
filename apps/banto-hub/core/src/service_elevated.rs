@@ -497,9 +497,27 @@ pub enum ElevatedError {
     Elev(banto_service_elev::ElevError),
 }
 
+/// `banto-hub-elev`の出力の頭（`banto-hub-elev: `）。
+const ELEV_PREFIX: &str = "banto-hub-elev: ";
+
+/// 失敗したときに`banto-hub-elev`が標準エラー出力へ出す最後の 1 行（純関数。#642、#641 の
+/// 実機確認の Nit 6）。[`ElevatedError`] のほとんどの文言は既に`banto-hub-elev: `で始まる
+/// ので、そのときはそのまま出す（以前は bin が`banto-hub-elev: {err}`で出していて、頭が
+/// 二重になっていた - `banto-hub-elev: banto-hub-elev: 'grant-profile-acl' を中止しました…`）。
+/// 頭の無い文言（`#[error(transparent)]`で包んだ`ProfileIdError`・DB のエラーなど）にだけ
+/// 付ける。
+pub fn failure_line(err: &ElevatedError) -> String {
+    let text = err.to_string();
+    if text.starts_with(ELEV_PREFIX) {
+        text
+    } else {
+        format!("{ELEV_PREFIX}{text}")
+    }
+}
+
 /// 共有 crate `banto-service-elev` のエラー（中立な文言）を、移す前と同じ
 /// 文言の[`ElevatedError`]へ写す（#392 B3-3a）。`banto-hub-elev`の標準エラー
-/// 出力（`banto-hub-elev: {err}`）は移す前と 1 バイトも変わらない
+/// 出力（[`failure_line`]）の文言は移す前と 1 バイトも変わらない
 /// （`elev_error_wording_is_unchanged`の golden テスト）。
 /// 呼ぶのは Windows だけの経路とテストなので、それ以外では作らない（Linux の
 /// clippy の `dead_code`）。
@@ -1145,7 +1163,7 @@ mod windows_impl {
 mod tests {
     use super::*;
 
-    /// `banto-hub-elev`の出力（`banto-hub-elev: {err}`）は B2-3 までと同じ
+    /// `banto-hub-elev`の出力（[`failure_line`]）は B2-3 までと同じ
     /// 文言（B2-4a で共有 crate の`Display`が中立になった後も）。
     #[test]
     fn service_manager_error_keeps_the_hub_wording() {
@@ -1309,7 +1327,7 @@ mod tests {
         );
     }
 
-    /// `banto-hub-elev`がエラーで出す行（`banto-hub-elev: {err}`）の文言を、
+    /// `banto-hub-elev`がエラーで出す行（[`failure_line`]）の文言を、
     /// #392 B3-3a で Win32 の本体を共有 crate へ移す前と 1 バイトも変えない
     /// （golden。期待値は移す前の`#[error]`の書式から組み立てた文字列そのもの）。
     #[test]
@@ -1697,12 +1715,50 @@ mod tests {
     // 触る）は #626 で消した。手順・反証は`crate::profile_grant`のテスト（偽物の
     // `HubElevOps`と、一時フォルダのルートの実物）が受け持つ。
 
-    /// `ProfileAclRefused`の文言（`banto-hub-elev: {err}`で出す最後の行）。
+    /// `ProfileAclRefused`の文言（[`failure_line`]で出す最後の行）。
     #[test]
     fn profile_acl_refused_wording() {
         assert_eq!(
             ElevatedError::ProfileAclRefused(ElevatedAction::GRANT_PROFILE_ACL).to_string(),
             "banto-hub-elev: 'grant-profile-acl' を中止しました（理由は上の行）"
         );
+    }
+
+    /// #642（#641 の実機確認の Nit 6）: 断ったときの最後の行は、頭（`banto-hub-elev: `）が
+    /// 1 回だけ（golden）。文言に頭があるものはそのまま、頭の無い文言（`transparent`で包んだ
+    /// `ProfileIdError`・`banto-hub: `で始まるサービスの文言）には 1 回だけ付ける。
+    #[test]
+    fn failure_line_has_the_prefix_exactly_once() {
+        let cases: Vec<(ElevatedError, &str)> = vec![
+            (
+                ElevatedError::ProfileAclRefused(ElevatedAction::GRANT_PROFILE_ACL),
+                "banto-hub-elev: 'grant-profile-acl' を中止しました（理由は上の行）",
+            ),
+            (
+                ElevatedError::ProfileAclRefused(ElevatedAction::SERVICE_INSTALL),
+                "banto-hub-elev: 'service-install' を中止しました（理由は上の行）",
+            ),
+            (
+                ElevatedError::InvalidArgs("x".to_string()),
+                "banto-hub-elev: 引数が不正です: x",
+            ),
+            (
+                ElevatedError::ProfileTargetUnsafe("y".to_string()),
+                "banto-hub-elev: y",
+            ),
+            (
+                ElevatedError::ProfileId(crate::profile_paths::ProfileIdError::Empty),
+                "banto-hub-elev: profile id を空にすることはできません",
+            ),
+            (
+                ElevatedError::from(crate::service_manager::ServiceManagerError::AccessDenied),
+                "banto-hub-elev: banto-hub: サービス操作の権限がありません（管理者権限が必要です）",
+            ),
+        ];
+        for (err, expected) in cases {
+            let line = failure_line(&err);
+            assert_eq!(line, expected, "{err:?}");
+            assert_eq!(line.matches("banto-hub-elev: ").count(), 1, "{line}");
+        }
     }
 }

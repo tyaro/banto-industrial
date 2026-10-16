@@ -77,7 +77,9 @@ fn main() {
 
     let extra_args = &args[1..];
     if let Err(err) = banto_hub_core::service_elevated::run(action, extra_args) {
-        eprintln!("banto-hub-elev: {err}");
+        // 頭（`banto-hub-elev: `）は`failure_line`が 1 回だけ付ける（#642、#641 の実機確認の
+        // Nit 6: 文言に頭があるのにここでも付けて二重になっていた）。
+        eprintln!("{}", banto_hub_core::service_elevated::failure_line(&err));
         std::process::exit(1);
     }
 
