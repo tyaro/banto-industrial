@@ -1024,6 +1024,30 @@ pub struct CollectorManager {
     /// `hub_log::log_line`/`log_err_line` を配線し、Windows サービスモード
     /// でもこれらの診断がサービスログファイルに届くようにする。
     diag_log: DiagLog,
+    /// #616: 最後に出したシミュレーションの注意の文面と時刻（`clock` のミリ秒）。設定の
+    /// 1 回の変更で `rebuild`・`apply_run` が続けて呼ばれ、同じ注意が同じ時刻に 2〜4 回
+    /// 出ていたのを、[`sim_warning_due`] で抑える。シミュレーションの接続が無くなったら
+    /// `None` に戻す（再び有効にしたときに出す）。
+    last_sim_warning: std::sync::Mutex<Option<(String, i64)>>,
+}
+
+/// #616: 同じ文面のシミュレーションの注意を、続けて出さない間隔（10 分）。永久には抑えない
+/// （この間隔を過ぎた後の設定の適用では、もう一度出す）。
+pub const SIM_WARNING_REPEAT_MS: i64 = 10 * 60 * 1000;
+
+/// #616: シミュレーションの注意を今出すか（純関数）。出すのは、前に出していない（起動直後・
+/// シミュレーションの接続が無くなった後に再び有効にした）、文面が変わった（接続が増えた・
+/// 減った・名前が変わった）、同じ文面でも前に出してから [`SIM_WARNING_REPEAT_MS`] 以上経った、
+/// のどれか。時計が戻ったとき（`now_ms` が前より小さい）も出す。
+pub fn sim_warning_due(last: Option<&(String, i64)>, text: &str, now_ms: i64) -> bool {
+    match last {
+        None => true,
+        Some((last_text, at_ms)) => {
+            last_text != text
+                || now_ms < *at_ms
+                || now_ms.saturating_sub(*at_ms) >= SIM_WARNING_REPEAT_MS
+        }
+    }
 }
 
 /// T15-2 (docs/banto-hub-desktop-plan.md §9.7): 1タグがシミュレータの値生成
@@ -1176,6 +1200,7 @@ impl CollectorManager {
             writer_gate: AsyncMutex::new(()),
             revision_tx,
             diag_log: DiagLog::default(),
+            last_sim_warning: std::sync::Mutex::new(None),
         }
     }
 
@@ -2080,6 +2105,10 @@ impl CollectorManager {
     /// read failure here is logged (`self.diag_log.err_line`) and otherwise
     /// ignored - this is a diagnostic, never a reason to fail the rebuild
     /// that already committed successfully.
+    ///
+    /// #616: 同じ文面は続けて出さない（[`sim_warning_due`]。設定の 1 回の変更で
+    /// `rebuild`・`apply_run` が続けて呼ばれ、同じ時刻に 2〜4 回出ていた）。起動直後・
+    /// 再び有効にしたとき・文面が変わったとき・[`SIM_WARNING_REPEAT_MS`] を過ぎた後は出す。
     async fn log_simulation_warnings(&self) {
         let connections = match PlcConnectionService::new(self.pool.clone())
             .list(ListParams::default())
@@ -2100,12 +2129,25 @@ impl CollectorManager {
             .map(|c| format!("{} (id={})", c.name, c.id))
             .collect();
 
-        if !names.is_empty() {
-            self.diag_log.line(&format!(
-                "banto-hub: [注意] シミュレーションモードの接続が {} 件あります: {} - 本番運用では無効化してください",
-                names.len(),
-                names.join(", "),
-            ));
+        let mut last = self
+            .last_sim_warning
+            .lock()
+            .expect("sim warning lock poisoned");
+        if names.is_empty() {
+            // 無くなったら忘れる（再び有効にしたときに出す）。
+            *last = None;
+            return;
+        }
+        let text = format!(
+            "banto-hub: [注意] シミュレーションモードの接続が {} 件あります: {} - 本番運用では無効化してください",
+            names.len(),
+            names.join(", "),
+        );
+        let now_ms = self.clock.now_ms();
+        // #616: 設定の 1 回の変更で続けて呼ばれても、同じ文面は 1 回だけ出す。
+        if sim_warning_due(last.as_ref(), &text, now_ms) {
+            self.diag_log.line(&text);
+            *last = Some((text, now_ms));
         }
     }
 
@@ -3920,6 +3962,105 @@ mod tests {
                 "expected a simulation warning line, got: {captured_lines:?}"
             );
         }
+
+        manager.shutdown().await;
+    }
+
+    /// #616: シミュレーションの注意を出すかの表（純関数）。
+    #[test]
+    fn sim_warning_due_table() {
+        let text = "注意 A";
+        let last = |t: &str, at: i64| Some((t.to_string(), at));
+        let cases: Vec<(&str, Option<(String, i64)>, i64, bool)> = vec![
+            (
+                "前に出していない（起動直後・再び有効にした）",
+                None,
+                0,
+                true,
+            ),
+            ("同じ文面・すぐ", last(text, 1_000), 1_000, false),
+            (
+                "同じ文面・間隔の直前",
+                last(text, 1_000),
+                1_000 + SIM_WARNING_REPEAT_MS - 1,
+                false,
+            ),
+            (
+                "同じ文面・間隔を過ぎた（永久には抑えない）",
+                last(text, 1_000),
+                1_000 + SIM_WARNING_REPEAT_MS,
+                true,
+            ),
+            ("文面が変わった", last("注意 B", 1_000), 1_000, true),
+            ("時計が戻った", last(text, 5_000), 1_000, true),
+        ];
+        for (name, last, now, expected) in cases {
+            assert_eq!(
+                sim_warning_due(last.as_ref(), text, now),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    fn sim_input(simulation: bool) -> PlcConnectionInput {
+        PlcConnectionInput {
+            name: "simline".to_string(),
+            protocol: "modbus-tcp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 15024,
+            unit_id: 1,
+            enabled: true,
+            simulation,
+            word_order: "low_high".to_string(),
+            cpu_type: None,
+            database: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// #616: 設定の 1 回の変更で `rebuild`・`apply_run` が続けて呼ばれても、同じ注意は 1 回
+    /// だけ。間隔を過ぎた後・シミュレーションの接続を無くしてから再び有効にした後は、もう一度
+    /// 出す。
+    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_simulation_warning_is_not_repeated_for_the_same_change() {
+        let clock = Arc::new(banto_tstore::ManualClock::new(1_000, 0));
+        let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let manager = manager.with_diag_log(DiagLog::new(
+            move |msg| captured.lock().unwrap().push(msg.to_string()),
+            |_msg| {},
+        ));
+        let count = || {
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("シミュレーションモードの接続"))
+                .count()
+        };
+        let service = PlcConnectionService::new(pool.clone());
+        let created = service.create(sim_input(true)).await.unwrap();
+
+        for _ in 0..3 {
+            manager.rebuild().await.expect("rebuild should be Ok");
+        }
+        assert_eq!(count(), 1, "同じ変更で重複した");
+
+        clock.advance_ms(SIM_WARNING_REPEAT_MS);
+        manager.rebuild().await.expect("rebuild should be Ok");
+        assert_eq!(count(), 2, "間隔を過ぎたらもう一度出す");
+
+        // シミュレーションを外すと忘れ、再び有効にしたら（間隔の中でも）出す。
+        service.update(created.id, sim_input(false)).await.unwrap();
+        manager.rebuild().await.expect("rebuild should be Ok");
+        service.update(created.id, sim_input(true)).await.unwrap();
+        manager.rebuild().await.expect("rebuild should be Ok");
+        assert_eq!(count(), 3, "再び有効にしたら出す");
 
         manager.shutdown().await;
     }
