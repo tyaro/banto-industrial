@@ -173,7 +173,7 @@
 //!   狭める方向なので、それ自体では理由にしない。実効権限は計算せず、ACE の SID の
 //!   許可リストで判定する（グループの入れ子・条件の評価をしない分、多めに断る側に倒す）。
 //! - **ハンドル基準の子のファイル**: `PinnedDir::open_child_file` は確かめ済みのフォルダの
-//!   ハンドルを基準に、名前 1 要素の子を辿らずに読み取りだけで開き（共有に削除を含めない）、
+//!   ハンドルを基準に、名前 1 要素の子を辿らずに読み取りだけで開き（共有も読み取りだけ）、
 //!   `PinnedFile::read_to_end` は**そのハンドルのまま**読む（確かめてから読むまでの間に
 //!   すり替えられない）。`PinnedDir::create_child_file` は新しいファイルを、保護された DACL
 //!   （SYSTEM・Administrators にフル、継承のフラグなし）と所有者 Administrators を**作るのと
@@ -803,9 +803,13 @@ impl PinnedDir {
     /// 辿らずにそのものを開くので、呼ぶ側が [`PinnedFile::security`] と [`exposure`] で確かめる
     /// （[`PinnedFile::read_to_end`] はファイルでないもの・reparse point を読まずに断る）。
     /// 求めるのは読み取り（`READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_DATA`）だけで、
-    /// 共有に削除を含めない（持っている間は消す・名前を変える・すり替えることができない）。
-    /// 開けない（アクセス拒否など）は [`SecretStoreError::Io`]（`IoOp::OpenFile`、`kind` に
-    /// `PermissionDenied` など）。
+    /// 共有は**読み取りだけ**（`FILE_SHARE_READ`）: 持っている間は、ほかの主体が消す・名前を
+    /// 変える（すり替える）ことも、**中身を書き換える**ために書き込みで開くこともできない。
+    /// 既に書き込み（または削除）で開いているハンドルがあれば、開くこと自体が共有違反で失敗する
+    /// （ACL を締める前から書き込みで開いていた主体が、確かめた後に書き換えるのを防ぐ。#648）。
+    /// バックアップの意図（`FILE_OPEN_FOR_BACKUP_INTENT`）は付けず、DACL だけを門にする。
+    /// 開けない（アクセス拒否・共有違反など）は [`SecretStoreError::Io`]（`IoOp::OpenFile`、
+    /// `kind` に `PermissionDenied` など、`os_error` に `ERROR_SHARING_VIOLATION`(32) など）。
     pub fn open_child_file(&self, name: &str) -> Result<Option<PinnedFile>> {
         imp::open_child_file(self, name)
     }
@@ -832,8 +836,8 @@ impl PinnedDir {
 }
 
 /// [`PinnedDir::open_child_file`]・[`PinnedDir::create_child_file`] で、確かめ済みのフォルダの
-/// ハンドルを基準に辿らずに開いたファイル（#630）。持っている間は消す・名前を変えることを
-/// 誰にもさせない（共有に削除を含めない）。drop で閉じる。
+/// ハンドルを基準に辿らずに開いたファイル（#630）。持っている間は消す・名前を変える・中身を
+/// 書き換える（書き込みで開く）ことを誰にもさせない（共有は読み取りだけ。#648）。drop で閉じる。
 #[cfg(windows)]
 pub struct PinnedFile {
     handle: imp::OwnedHandle,
@@ -1955,7 +1959,7 @@ mod imp {
         let finish = || -> Result<(super::FileSecurity, std::path::PathBuf)> {
             write_all_and_flush(handle.raw(), contents)?;
             let security = security_of_handle(handle.raw())?;
-            #[allow(unused_mut)]
+            #[cfg_attr(not(test), allow(unused_mut))]
             let mut found = super::exposure(&security);
             #[cfg(test)]
             if FORCE_EXPOSED.with(std::cell::Cell::get) {
@@ -1974,8 +1978,9 @@ mod imp {
                 security,
             })),
             Err(error) => {
-                // 消せなかったときも元の失敗を返す（消す失敗で理由を上書きしない）。閉じたときに
-                // 消える。
+                // 消す印を付けられれば、閉じたときに消える。付けられなかったときは、作ったときの
+                // 保護された DACL（SYSTEM・Administrators だけ、所有者 Administrators）のまま
+                // 残る。どちらでも元の失敗を返す（消す失敗で理由を上書きしない）。
                 let _ = delete_by_handle(handle.raw());
                 drop(handle);
                 Err(error)
@@ -2041,7 +2046,7 @@ mod imp {
         file.seek(SeekFrom::Start(0)).map_err(read_error)?;
         let mut contents = Vec::new();
         (&mut *file)
-            .take(max_len as u64 + 1)
+            .take((max_len as u64).saturating_add(1))
             .read_to_end(&mut contents)
             .map_err(read_error)?;
         if contents.len() > max_len {
@@ -2124,8 +2129,8 @@ mod imp {
         /// `FILE_OPEN`（無ければ `Ok(None)`）。フォルダに限らない（ファイルでも開いて、
         /// 呼ぶ側が `PinnedDirInfo::is_dir` で断る - [`pin_dir`] と同じ）。
         Open,
-        /// `FILE_OPEN`（無ければ `Ok(None)`）で、読み取りだけの権利（#630。中身を読む）。
-        /// 種類を問わず開き、呼ぶ側が属性で断る。
+        /// `FILE_OPEN`（無ければ `Ok(None)`）で、読み取りだけの権利・読み取りだけの共有（#630・
+        /// #648。中身を読む）。種類を問わず開き、呼ぶ側が属性で断る。
         OpenFile,
         /// ファイルを `FILE_CREATE | FILE_NON_DIRECTORY_FILE` で、この記述子を付けて作る
         /// （既にあれば `Ok(None)`。#630）。書き込みと、失敗したときに消すための `DELETE` を
@@ -2136,8 +2141,9 @@ mod imp {
     /// 開いている `parent` を `RootDirectory` に、名前 1 要素の子を `NtCreateFile` で作るか
     /// 開く（`FILE_OPEN_REPARSE_POINT`。パスを解決し直さず、子がリンクでも辿らない）。
     /// フォルダ（`Create`・`Open`）は [`pin_dir`] と同じ権利（`WRITE_DAC | WRITE_OWNER` を
-    /// 含む）・共有（削除なし）で開く。ファイル（`OpenFile`・`CreateFile`）は [`ChildHow`] の
-    /// とおりで、どちらも共有に削除を含めない。
+    /// 含む）・共有（削除なし）・バックアップの意図つきで開く。ファイル（`OpenFile`・
+    /// `CreateFile`）は [`ChildHow`] のとおりで、どちらも共有は読み取りだけ、バックアップの
+    /// 意図は付けない（DACL だけを門にする。#648）。
     fn child_relative(
         parent: &super::PinnedDir,
         name: &str,
@@ -2205,13 +2211,10 @@ mod imp {
                 dir_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
             ),
-            ChildHow::OpenFile => (
-                None,
-                FILE_OPEN,
-                0,
-                read_access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ),
+            // 共有は読み取りだけ（#648 の P1）: 書き込みで開いているハンドルが既にあれば、開く
+            // こと自体が共有違反で失敗し、持っている間はほかの書き込みの開きも失敗する（ACL を
+            // 締める前から書き込みで開いていた主体が、確かめた後に中身を書き換えられない）。
+            ChildHow::OpenFile => (None, FILE_OPEN, 0, read_access, FILE_SHARE_READ),
             ChildHow::CreateFile(descriptor) => (
                 Some(descriptor),
                 FILE_CREATE,
@@ -2234,6 +2237,13 @@ mod imp {
         // SAFETY: `attributes` が指す名前・記述子は呼び出しの間だけ生きていればよい
         // （`wide_name` はこの関数の終わりまで、記述子は呼ぶ側が持つ）。`RootDirectory` は
         // 開いている親のハンドル。
+        // ファイル（#630）はバックアップの意図を付けない（#648 のオーナー Should 1。特権が
+        // 有効なトークンで DACL を迂回させず、DACL だけを門にする）。フォルダは今のまま。
+        let backup_intent = if is_file {
+            0
+        } else {
+            FILE_OPEN_FOR_BACKUP_INTENT
+        };
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
@@ -2247,7 +2257,7 @@ mod imp {
                 kind_option
                     | FILE_OPEN_REPARSE_POINT
                     | FILE_SYNCHRONOUS_IO_NONALERT
-                    | FILE_OPEN_FOR_BACKUP_INTENT,
+                    | backup_intent,
                 std::ptr::null(),
                 0,
             )
@@ -4372,13 +4382,31 @@ mod tests {
                     ..
                 })
             ));
-            // 持っている間は消す・名前を変えることができない（共有に削除を含めない）。
+            // 上限が `usize::MAX` でもあふれずに全部読む（#648 の P2）。
+            assert_eq!(file.read_to_end(usize::MAX).unwrap(), contents);
+            // 持っている間は消す・名前を変える・書き込みで開くことができない（共有は読み取り
+            // だけ。#648 の P1）。読み取りで開くことはできる。
             assert!(std::fs::remove_file(root.path().join("conf.toml")).is_err());
             assert!(std::fs::rename(
                 root.path().join("conf.toml"),
                 root.path().join("moved.toml")
             )
             .is_err());
+            let write_open = std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.path().join("conf.toml"));
+            assert_eq!(
+                write_open
+                    .as_ref()
+                    .err()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(32),
+                "書き込みの開きは共有違反（ERROR_SHARING_VIOLATION）: {write_open:?}"
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("conf.toml")).unwrap(),
+                contents
+            );
 
             assert!(parent.open_child_file("missing.toml").unwrap().is_none());
             let sub = parent.open_child_file("sub").unwrap().unwrap();
@@ -4423,7 +4451,7 @@ mod tests {
         }
 
         /// 読めないファイルは、`io::ErrorKind::PermissionDenied` を残して断る（sink が案内を
-        /// 出し分けるため）。管理者でも、バックアップの特権を有効にしていなければ同じ。
+        /// 出し分けるため）。ファイルはバックアップの意図を付けずに開くので、管理者でも同じ。
         #[test]
         fn open_child_file_reports_access_denied_as_permission_denied() {
             let root = tempfile::tempdir().unwrap();
@@ -4445,6 +4473,37 @@ mod tests {
             );
             drop(parent);
             set_dacl_sddl(&locked, &format!("D:(A;;FA;;;{})", me().as_str()));
+        }
+
+        /// #648 の P1: 別のハンドルが書き込みで開いたまま（共有はすべて許す）なら、確かめた後に
+        /// 中身を書き換えられうるので、`open_child_file` は共有違反で開かない。`Io { op:
+        /// OpenFile }` に OS のエラー番号（`ERROR_SHARING_VIOLATION` = 32）が残る。閉じれば開ける。
+        #[test]
+        fn open_child_file_refuses_while_another_handle_can_write() {
+            use std::os::windows::fs::OpenOptionsExt;
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("conf.toml"), b"x").unwrap();
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(0x7) // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                .open(root.path().join("conf.toml"))
+                .unwrap();
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            let result = parent.open_child_file("conf.toml");
+            assert!(
+                matches!(
+                    result,
+                    Err(SecretStoreError::Io {
+                        op: crate::error::IoOp::OpenFile,
+                        os_error: Some(32),
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            drop(writer);
+            let file = parent.open_child_file("conf.toml").unwrap().unwrap();
+            assert_eq!(file.read_to_end(16).unwrap(), b"x");
         }
 
         /// 置き場（フォルダ）の記述子をハンドルから読む。`service_only` で作った置き場は、
