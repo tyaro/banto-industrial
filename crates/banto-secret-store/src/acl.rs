@@ -86,7 +86,13 @@
 //!   （データのアクセスを求めないハンドルは共有の確かめに加わらない）、
 //!   `FILE_SHARE_DELETE` を渡さずに開くので、持っている間は誰もそのディレクトリを消す・名前を変える（= 確かめた後に
 //!   ジャンクションへすり替える）ことができない。`PinnedDir::reset_acl` はその
-//!   間にパスで [`reset_dir_acl`] を呼ぶ。
+//!   間にパスで [`reset_dir_acl`] と同じ DACL を書き、**所有者も
+//!   `BUILTIN\Administrators` に移す**（監査 B5、2026-10-16 オーナー決定。所有者は
+//!   DACL に関わらず ACL を変えられるので、インストール利用者が所有者のままだと書き
+//!   直した DACL を本人が広げられる。昇格した管理者のトークンの Administrators は
+//!   所有者にできる属性を持つので特権は要らない。昇格していなければ
+//!   `ERROR_INVALID_OWNER`（1307）で何も変えずに失敗することを確かめた）。パスの版の
+//!   [`reset_dir_acl`] は所有者を変えない（昇格していない呼び出し元もある）。
 //! - **中のジャンクション・ディレクトリのシンボリックリンクは辿らない**:
 //!   `SetNamedSecurityInfoW` の継承の伝播は、リンクそのもの（reparse point の
 //!   オブジェクト）の継承の ACE を書き換えるが、リンクの先（ルートの外）とその下は
@@ -427,9 +433,14 @@ impl PinnedDir {
         &self.info
     }
 
-    /// 開いたままのパスの DACL を [`reset_dir_acl`] で書き直す。**reparse point・
-    /// ディレクトリでないものには何もせずに断る**（呼ぶ側の確かめに加えた多重の
-    /// 防御）。所有者の確かめは呼ぶ側（どの所有者を受け入れるかは製品の判断）。
+    /// 開いたままのパスの DACL を [`reset_dir_acl`] と同じ形に書き直し、**所有者を
+    /// `BUILTIN\Administrators` に移す**（#392 B3-3b の監査 B5、2026-10-16 オーナー決定。
+    /// 所有者は DACL に関わらず ACL を変えられるので、インストール利用者が所有者のままだと
+    /// 書き直した DACL を本人がいつでも広げられる。インストール利用者の「変更」は残る）。
+    /// 昇格した管理者のプロセスから呼ぶ（昇格していなければ `ERROR_INVALID_OWNER`
+    /// で失敗し、何も変えない）。**reparse point・ディレクトリでないものには何もせずに
+    /// 断る**（呼ぶ側の確かめに加えた多重の防御）。今の所有者を受け入れるかの確かめは
+    /// 呼ぶ側（製品の判断）。
     pub fn reset_acl(&self, access: &DirAccess) -> Result<()> {
         if self.info.is_reparse_point {
             return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
@@ -439,7 +450,8 @@ impl PinnedDir {
         }
         // `self`（= ハンドル）を借りている間に呼ぶので、書き直しの間は閉じない。
         let _held = &self.handle;
-        reset_dir_acl(&self.path, access)
+        reject_dot_segments(&self.path)?;
+        imp::reset_dir_acl_and_owner(&self.path, access)
     }
 }
 
@@ -714,6 +726,16 @@ mod imp {
     }
 
     pub(super) fn reset_dir_acl(dir: &Path, access: &DirAccess) -> Result<()> {
+        set_dir_acl(dir, access, false)
+    }
+
+    /// [`reset_dir_acl`] に加えて、所有者を `BUILTIN\Administrators` に移す
+    /// （[`super::PinnedDir::reset_acl`]、#392 B3-3b の監査 B5）。
+    pub(super) fn reset_dir_acl_and_owner(dir: &Path, access: &DirAccess) -> Result<()> {
+        set_dir_acl(dir, access, true)
+    }
+
+    fn set_dir_acl(dir: &Path, access: &DirAccess, admins_owner: bool) -> Result<()> {
         if !inspect(dir)? {
             return Err(SecretStoreError::io(
                 IoOp::InspectDir,
@@ -731,15 +753,34 @@ mod imp {
         if ok == 0 || present == 0 || dacl.is_null() {
             return Err(api("GetSecurityDescriptorDacl", last_error()));
         }
+        // 所有者を移すときは Administrators の SID（LocalBox が解放）。
+        let owner = if admins_owner {
+            let text = wide_str(super::ADMINISTRATORS_SID);
+            let mut sid: PSID = std::ptr::null_mut();
+            // SAFETY: `text` は NUL 終端。成功すれば `sid` は LocalAlloc の領域。
+            if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
+                return Err(api("ConvertStringSidToSidW", last_error()));
+            }
+            Some(LocalBox(sid))
+        } else {
+            None
+        };
+        let mut info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        if owner.is_some() {
+            info |= OWNER_SECURITY_INFORMATION;
+        }
         let path = wide(dir);
-        // SAFETY: `path` は NUL 終端、`dacl` は `sd` が生きている間有効。
-        // PROTECTED_DACL で親からの継承を切る。所有者・グループ・SACL は変えない。
+        // SAFETY: `path` は NUL 終端、`dacl` は `sd` が、所有者の SID は `owner` が
+        // 生きている間有効。PROTECTED_DACL で親からの継承を切る。グループ・SACL は
+        // 変えない。所有者は `admins_owner` のときだけ Administrators に移す（昇格した
+        // トークンの Administrators は所有者にできる属性を持つので特権は要らない。
+        // 昇格していなければ ERROR_INVALID_OWNER(1307) で失敗する）。
         let status = unsafe {
             SetNamedSecurityInfoW(
                 path.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
+                info,
+                owner.as_ref().map_or(std::ptr::null_mut(), |sid| sid.0),
                 std::ptr::null_mut(),
                 dacl,
                 std::ptr::null(),
@@ -1260,6 +1301,11 @@ mod tests {
             current_user_sid().expect("今の利用者の SID")
         }
 
+        /// 昇格した管理者として走っているか（GitHub の Windows のランナーは管理者）。
+        fn is_elevated_admin() -> bool {
+            banto_service_elev::is_current_process_admin().unwrap_or(false)
+        }
+
         fn has_no_broad_groups(dacl: &ObservedDacl) {
             for ace in dacl.aces.as_ref().unwrap() {
                 for broad in ["S-1-5-32-545", "S-1-1-0", "S-1-5-11", "S-1-5-4"] {
@@ -1545,15 +1591,32 @@ mod tests {
                 }
             );
             assert_eq!(pinned.path(), plain.as_path());
-            pinned
-                .reset_acl(&DirAccess::with_install_user(me()))
-                .unwrap();
+            let reset = pinned.reset_acl(&DirAccess::with_install_user(me()));
             drop(pinned);
-            check_dacl(
-                &read_dir_dacl(&plain).unwrap(),
-                &DirAccess::with_install_user(me()),
-            )
-            .unwrap();
+            if is_elevated_admin() {
+                // #392 B3-3b の監査 B5: 書き直すと所有者は Administrators に移り、
+                // DACL は期待の形（インストール利用者の「変更」は残る）。
+                reset.unwrap();
+                let dacl = read_dir_dacl(&plain).unwrap();
+                assert_eq!(dacl.owner, ADMINISTRATORS_SID, "{dacl:?}");
+                check_dacl(&dacl, &DirAccess::with_install_user(me())).unwrap();
+            } else {
+                // 昇格していなければ所有者を Administrators にできず、何も変えずに失敗する
+                // （所有者を移す確かめは管理者で走る CI で行う）。
+                eprintln!(
+                    "skip: 昇格していないので、所有者を Administrators に移す確かめは CI で行う"
+                );
+                assert_eq!(
+                    reset,
+                    Err(SecretStoreError::AclApi {
+                        call: "SetNamedSecurityInfoW",
+                        os_error: 1307
+                    })
+                );
+                let dacl = read_dir_dacl(&plain).unwrap();
+                assert!(!dacl.protected, "失敗したのに DACL が変わった: {dacl:?}");
+                assert_eq!(dacl.owner, me().as_str());
+            }
 
             let outside = tempfile::tempdir().unwrap();
             let link = root.path().join("link");

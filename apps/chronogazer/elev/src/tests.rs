@@ -761,6 +761,8 @@ fn service_install_runs_every_step_in_order() {
             format!("pin {}", root.display()),
             format!("create {} {USER}", root.display()),
             format!("pin {}", root.display()),
+            // 作ったルートは所有者を Administrators に移す（監査 B5）。
+            format!("reset {} {USER}", root.display()),
             format!("install {} {USER} {}", exe_path().display(), root.display()),
             // setup-operators（記録を読み直す）
             "read_install_user".to_string(),
@@ -813,7 +815,7 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert_eq!(code, EXIT_OK);
     let calls = fake.calls();
     assert_eq!(calls[2], format!("check {OTHER}"));
-    assert!(calls[7].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
+    assert!(calls[8].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
     // 登録の前に作るルートも、渡した SID の DACL で作る（記録が無い = 渡した SID が残る）。
     assert_eq!(
         calls[5],
@@ -977,7 +979,11 @@ fn service_install_stops_at_the_first_failure() {
         .calls()
         .iter()
         .any(|c| c.starts_with("create") && c.contains("secrets")));
-    assert!(resets(&fake).is_empty());
+    // 書き直したのは、登録の前に作ったルート（所有者を移す、監査 B5）だけ。
+    assert_eq!(
+        resets(&fake),
+        vec![format!("reset {} {USER}", root_path().display())]
+    );
 
     // データの ACL を断った → 1（最後の行は「完了しませんでした」）。
     let fake = Fake::new().with_dir(root_path(), true, true, "S-1-5-32-544");

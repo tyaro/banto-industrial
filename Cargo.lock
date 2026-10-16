@@ -670,6 +670,7 @@ name = "banto-secret-store"
 version = "0.1.0"
 dependencies = [
  "banto-hub-bootstrap",
+ "banto-service-elev",
  "hex",
  "sha2 0.11.0",
  "tempfile",

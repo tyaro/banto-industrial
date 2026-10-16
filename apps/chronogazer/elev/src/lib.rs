@@ -45,7 +45,9 @@
 //!   `banto_secret_store::acl::pin_dir` で**辿らずに**開き（持っている間は名前の変更・
 //!   削除ができない）、reparse point（ジャンクション・シンボリックリンクなど）か、
 //!   所有者が SYSTEM・Administrators・インストール利用者・この昇格した利用者のどれでも
-//!   なければ**書き直さずに止める**。Users・Operators には何も付けない。
+//!   なければ**書き直さずに止める**。書き直すとき（作った直後も）は所有者を
+//!   `BUILTIN\Administrators` に移す（監査 B5、2026-10-16 オーナー決定。インストール
+//!   利用者の「変更」は残る）。Users・Operators には何も付けない。
 //!   中のジャンクションの先を書き換えないこと（伝播は辿らない）は
 //!   `banto_secret_store::acl` のテストが固定する。ハードリンクの扱いは既知の制限
 //!   （同じモジュール doc）。
@@ -753,10 +755,12 @@ fn preflight_root<O: ElevOps>(
             EXIT_FAILED
         })
     };
+    let access = DirAccess::with_install_user(install_user.clone());
+    let mut created = false;
     let pinned = match pin(out)? {
         Some(pinned) => pinned,
         None => {
-            let access = DirAccess::with_install_user(install_user.clone());
+            created = true;
             if let Err(error) = ops.create_dir(root, &access) {
                 out(err(&format!(
                     "{}（{}）を作れませんでした: {error}（何も登録していません）",
@@ -788,6 +792,19 @@ fn preflight_root<O: ElevOps>(
             refusal_line(DataDir::Root, root, &refusal)
         )));
         return Err(EXIT_FAILED);
+    }
+    // 作ったルートは、開いたまま所有者を Administrators に移す（監査 B5。DACL は作った
+    // ときと同じ形に書き直す）。既にあったルートはここでは変えない（登録の後の
+    // `grant-data-acl` が書き直す）。
+    if created {
+        if let Err(error) = pinned.reset_acl(&access) {
+            out(err(&format!(
+                "{}（{}）の所有者と ACL を整えられませんでした: {error}（何も登録していません）",
+                DataDir::Root.label(),
+                root.display()
+            )));
+            return Err(EXIT_FAILED);
+        }
     }
     Ok(pinned)
 }

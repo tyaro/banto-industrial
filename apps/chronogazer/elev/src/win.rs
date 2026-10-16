@@ -328,6 +328,17 @@ mod tests {
         }
     }
 
+    /// 昇格した管理者として走っているか。書き直しは所有者を Administrators に移す
+    /// （監査 B5）ので、昇格していなければ失敗する。そのときは理由を出して skip する
+    /// （GitHub の Windows のランナーは管理者なので CI では走る）。
+    fn elevated_admin(test: &str) -> bool {
+        let admin = banto_service_elev::is_current_process_admin().unwrap_or(false);
+        if !admin {
+            eprintln!("skip {test}: 昇格した管理者ではないので、所有者を Administrators に移せない（CI で確かめる）");
+        }
+        admin
+    }
+
     fn junction(link: &Path, target: &Path) {
         let status = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -355,6 +366,9 @@ mod tests {
     /// だけ（冪等）。どちらも期待の保護された DACL になる。
     #[test]
     fn grant_data_acl_creates_and_resets_in_a_temp_root() {
+        if !elevated_admin("grant_data_acl_creates_and_resets_in_a_temp_root") {
+            return;
+        }
         let me = WindowsOps.current_user_sid().unwrap();
         let access = DirAccess::with_install_user(me);
         let parent = tempfile::tempdir().unwrap();
@@ -366,6 +380,13 @@ mod tests {
                 let dacl = banto_secret_store::acl::read_dir_dacl(&dir).unwrap();
                 banto_secret_store::acl::check_dacl(&dacl, &access)
                     .unwrap_or_else(|err| panic!("{}: {err:?}", dir.display()));
+                // 監査 B5: 所有者は Administrators に移る（インストール利用者の「変更」は残る）。
+                assert_eq!(
+                    dacl.owner,
+                    banto_secret_store::acl::ADMINISTRATORS_SID,
+                    "{}",
+                    dir.display()
+                );
             }
             assert!(!layout.hub_keys_dir().exists());
         }
@@ -375,6 +396,11 @@ mod tests {
     /// grant-data-acl の書き直しで変わらない。
     #[test]
     fn grant_data_acl_does_not_rewrite_outside_a_child_junction() {
+        // 伝播がジャンクションを辿らないことそのものは banto-secret-store の
+        // `propagation_does_not_follow_child_junctions_or_symlinks`（管理者でなくても走る）。
+        if !elevated_admin("grant_data_acl_does_not_rewrite_outside_a_child_junction") {
+            return;
+        }
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("ChronoGazer");
         std::fs::create_dir(&root).unwrap();

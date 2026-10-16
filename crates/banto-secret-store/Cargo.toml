@@ -45,3 +45,6 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# テストが昇格した管理者として走っているかの判定だけ（所有者を Administrators に
+# 移す確かめは管理者でしかできない。#392 B3-3b の監査 B5）。本番の依存には足さない。
+banto-service-elev = { path = "../banto-service-elev" }
