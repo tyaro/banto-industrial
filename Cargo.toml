@@ -33,7 +33,10 @@
 # #392 B3-3a: crates/banto-service-elev (製品ごとの昇格ヘルパーが使う Win32 の
 # 部品 - ローカルグループ・サービス DACL の ACE・トークンのメンバーシップ・
 # runas の起動。昇格の境界（アクションと引数の検証）は製品の elev が持つ.
-# docs/chronogazer-service-design.md §4 の B3-3a).
+# docs/chronogazer-service-design.md §4 の B3-3a). #392 B3-3b: apps/chronogazer/elev
+# (`chronogazer-elev.exe` - ChronoGazer の UAC 昇格ヘルパー。固定の 7 アクションで
+# サービスの登録・Operators・サービス DACL の ACE・データと secrets の ACL・自動開始.
+# docs/chronogazer-service-design.md §4 の B3-3b).
 [workspace]
 resolver = "2"
 members = [
@@ -56,6 +59,7 @@ members = [
     "crates/banto-service-control",
     "crates/banto-service-elev",
     "apps/chronogazer/core",
+    "apps/chronogazer/elev",
     "apps/chronogazer/src-tauri",
     "apps/banto-hub/core",
     "apps/banto-hub/src-tauri",

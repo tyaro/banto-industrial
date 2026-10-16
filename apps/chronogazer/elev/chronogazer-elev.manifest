@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  #392 B3-3b: ChronoGazer の UAC 昇格ヘルパー `chronogazer-elev.exe` 専用の
+  アプリケーションマニフェスト。
+
+  `requestedExecutionLevel level="requireAdministrator"` により、OS はこの exe を
+  起動しようとしただけで UAC の昇格を求める（コードで自分を昇格させない - Windows
+  のローダーが埋め込みのマニフェストを見て処理する）。`chronogazer-server.exe`・
+  デスクトップのシェルには埋め込まない（`build.rs` が `chronogazer-elev` の bin に
+  だけリンクする）。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      version="1.0.0.0"
+      processorArchitecture="*"
+      name="ChronoGazer.Elev"
+      type="win32"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

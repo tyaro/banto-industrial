@@ -1,0 +1,54 @@
+[package]
+name = "chronogazer-elev"
+description = "ChronoGazer's UAC-elevated helper (chronogazer-elev.exe): fixed actions to register the ChronoGazer service, set up its Operators group and service ACE, apply the data/secrets directory ACLs and toggle autostart (#392 B3-3b)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 純関数（引数・行・計画・ルートの解決）と手順（`run`）は lib に置き、全 OS でテストする。
+# bin は引数を受け取って lib に渡すだけ（`src/main.rs`）。
+[lib]
+name = "chronogazer_elev"
+path = "src/lib.rs"
+
+# `test = false`: この bin には `requireAdministrator` のマニフェストが付くので、
+# bin のテストのバイナリも昇格を求めて起動できない（os error 740。banto-hub-elev で
+# 既知）。bin にテストは無く、テストはすべて lib に置く。
+[[bin]]
+name = "chronogazer-elev"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+# `server_service::install_with`（`chronogazer-server install` と同じ登録の手順を
+# プロセスの中で呼ぶ）・`paths`・`shell_launch` の定数。
+chronogazer-core = { path = "../core" }
+# ディレクトリの DACL（作る・辿らずに開く・書き直す）とインストール利用者の SID。
+banto-secret-store = { path = "../../../crates/banto-secret-store" }
+# 登録の解除・`Parameters` の読み取り・自動開始の切り替え・`ConsoleLine`。
+banto-service-control = { path = "../../../crates/banto-service-control" }
+# ローカルグループ・メンバー・サービス DACL の ACE（#392 B3-3a）。
+banto-service-elev = { path = "../../../crates/banto-service-elev" }
+
+[target.'cfg(windows)'.dependencies]
+# 既存の 0.61 系（新しい crate は増えない）:
+# - Win32_System_Registry: RegGetValueW（マシンの環境変数 CHRONOGAZER_ROOT を
+#   展開せずに読む）
+# - Win32_UI_Shell / Win32_System_Com: SHGetKnownFolderPath・CoTaskMemFree
+#   （マシンの ProgramData・Program Files。このプロセスの環境変数を読まない）
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+] }
+
+[build-dependencies]
+# `chronogazer-elev.exe` にだけ `requireAdministrator` のマニフェストを埋め込む
+# （banto-hub-core の `banto-hub-elev` と同じ。Cargo.lock に既にある 3.0 系）。
+embed-resource = "3.0"
+
+[dev-dependencies]
+# Windows のテストで一時ディレクトリの DACL を作る・書き直す（本物の ProgramData に触らない）。
+tempfile = { workspace = true }

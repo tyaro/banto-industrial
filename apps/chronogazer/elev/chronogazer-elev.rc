@@ -1,0 +1,8 @@
+// #392 B3-3b: `chronogazer-elev.exe` だけに `requireAdministrator` のマニフェストを
+// 埋め込むためのリソーススクリプト（`build.rs` が `embed_resource::compile_for` で
+// `chronogazer-elev` という `[[bin]]` 名にだけリンクする）。
+//
+// `1 24 "..."` は `CREATEPROCESS_MANIFEST_RESOURCE_ID` = 1、`RT_MANIFEST` = 24
+// （banto-hub-elev.rc と同じ、windows.h を要らない最小形）。
+
+1 24 "chronogazer-elev.manifest"
