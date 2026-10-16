@@ -73,27 +73,12 @@ pub enum ProfileIdError {
 }
 
 /// Windows の予約デバイス名か（大文字小文字を無視。最初の`.`より前を、末尾の空白を
-/// 除いて見るので`nul.txt`・`CON .log`も予約名。上付き数字の`COM¹`なども含む -
-/// Win32 はこれらをファイルではなくデバイスとして開く）。
-pub fn is_reserved_device_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
-    let upper = stem.to_ascii_uppercase();
-    const PLAIN: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
-    if PLAIN.contains(&upper.as_str()) {
-        return true;
-    }
-    let Some(rest) = upper
-        .strip_prefix("COM")
-        .or_else(|| upper.strip_prefix("LPT"))
-    else {
-        return false;
-    };
-    let mut digits = rest.chars();
-    matches!(
-        (digits.next(), digits.next()),
-        (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
-    )
-}
+/// 除いて見るので`nul.txt`・`CON .log`も予約名。`COM0`〜`COM9`・`LPT0`〜`LPT9`と
+/// 上付き数字の`COM¹`なども含む - Win32 はこれらをファイルではなくデバイスとして開く）。
+/// 判断は共有の`banto_secret_store::acl::guard::is_reserved_device_name`（#642 で移した。
+/// 昇格ヘルパーが親のハンドルを基準に作る名前の確かめと同じもの）。`COM0`・`LPT0`は
+/// #641 のオーナーレビュー Nit 4 で足した。
+pub use banto_secret_store::acl::guard::is_reserved_device_name;
 
 /// `profile_id`が絶対パスの1コンポーネントとしてそのまま安全に使えるかを
 /// 検証する - 空文字列、`/`・`\`（Windows パス区切り、非 Windows でも
@@ -360,6 +345,9 @@ mod tests {
             "aux",
             "COM1",
             "lpt9",
+            // #641 のオーナーレビュー Nit 4: `COM0`・`LPT0` も予約名として断る。
+            "COM0",
+            "lpt0",
             "nul.txt",
             "CON .log",
             "com\u{b9}",
@@ -376,7 +364,7 @@ mod tests {
             "console",
             "nul1",
             "com10",
-            "lpt0",
+            "lpt00",
             "auxiliary",
             "p6-123-456",
         ] {

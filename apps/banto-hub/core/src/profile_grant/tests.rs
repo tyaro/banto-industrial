@@ -404,6 +404,9 @@ fn strict_profile_id_table() {
         ("Con", Err(E::Reserved)),
         ("COM1", Err(E::Reserved)),
         ("lpt9", Err(E::Reserved)),
+        // #641 のオーナーレビュー Nit 4: `COM0`・`LPT0` も予約名。
+        ("COM0", Err(E::Reserved)),
+        ("lpt0", Err(E::Reserved)),
     ];
     for (id, expected) in cases {
         assert_eq!(validate_strict_profile_id(id), expected, "{id:?}");
