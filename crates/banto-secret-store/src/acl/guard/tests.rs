@@ -442,6 +442,74 @@ fn data_acl_plan_refuses_links_files_and_foreign_owners() {
     );
 }
 
+/// #630: 対象の利用者を持たない置き場（`sink\`）。所有者として許すのは SYSTEM・
+/// Administrators・この昇格した利用者だけで、利用者の領域の SID は誰であっても断る。
+/// `Some` を渡せば [`data_acl_plan`] と同じ。
+#[test]
+fn dir_acl_plan_without_a_user_trusts_only_system_admins_and_the_elevated_user() {
+    let cases: [(DirState, Option<&str>, Result<DataAclStep, DataAclRefusal>); 10] = [
+        (DirState::Absent, None, Ok(DataAclStep::Create)),
+        (info(true, false, "S-1-5-18"), None, Ok(DataAclStep::Reset)),
+        (
+            info(true, false, "S-1-5-32-544"),
+            None,
+            Ok(DataAclStep::Reset),
+        ),
+        (
+            info(true, false, ADMIN),
+            Some(ADMIN),
+            Ok(DataAclStep::Reset),
+        ),
+        (
+            info(true, false, ADMIN),
+            None,
+            Err(DataAclRefusal::ForeignOwner(ADMIN.to_string())),
+        ),
+        (
+            info(true, false, USER),
+            Some(ADMIN),
+            Err(DataAclRefusal::ForeignOwner(USER.to_string())),
+        ),
+        (
+            info(true, false, "S-1-5-32-545"),
+            Some(ADMIN),
+            Err(DataAclRefusal::ForeignOwner("S-1-5-32-545".to_string())),
+        ),
+        (
+            info(true, false, ""),
+            None,
+            Err(DataAclRefusal::ForeignOwner(String::new())),
+        ),
+        (
+            info(true, true, "S-1-5-32-544"),
+            Some(ADMIN),
+            Err(DataAclRefusal::ReparsePoint),
+        ),
+        (
+            info(false, false, "S-1-5-18"),
+            None,
+            Err(DataAclRefusal::NotADirectory),
+        ),
+    ];
+    for (state, elevated, expected) in cases {
+        assert_eq!(
+            dir_acl_plan(&state, None, elevated),
+            expected,
+            "{state:?} {elevated:?}"
+        );
+    }
+    // `Some` は `data_acl_plan` と同じ判断。
+    let me = sid(USER);
+    for owner in ["S-1-5-18", USER, STRANGER, ADMIN] {
+        let state = info(true, false, owner);
+        assert_eq!(
+            dir_acl_plan(&state, Some(&me), Some(ADMIN)),
+            data_acl_plan(&state, &me, Some(ADMIN)),
+            "{owner}"
+        );
+    }
+}
+
 // --- 引き継ぐ利用者 -----------------------------------------------------------------
 
 const OI_CI: u8 = 0x03;

@@ -27,6 +27,13 @@ pub enum IoOp {
     Replace,
     /// 秘密のファイルの削除。
     RemoveFile,
+    /// ファイルを辿らずに開いて属性・記述子を読む（[`crate::acl::inspect_file`]・
+    /// `PinnedDir::open_child_file`、#630）。
+    OpenFile,
+    /// 確かめ済みのフォルダの中にファイルを作る（`PinnedDir::create_child_file`、#630）。
+    CreateFile,
+    /// 作ったファイルへの書き込みとディスクへの書き出し（同上）。
+    WriteFile,
 }
 
 impl fmt::Display for IoOp {
@@ -40,6 +47,9 @@ impl fmt::Display for IoOp {
             Self::SyncTemp => "一時ファイルの書き出し",
             Self::Replace => "ファイルの置き換え",
             Self::RemoveFile => "削除",
+            Self::OpenFile => "ファイルの確認",
+            Self::CreateFile => "ファイルの作成",
+            Self::WriteFile => "ファイルへの書き込み",
         })
     }
 }
@@ -180,6 +190,10 @@ pub enum SecretStoreError {
     /// 場所と別の場所を作りうるため断る（#392 B2-4a、PR #604 のレビュー）。
     #[error("フォルダのパスに「.」や「..」が含まれているため使えません")]
     DotSegmentInPath,
+    /// 作ったファイルを読み戻したら保護されていなかった（`PinnedDir::create_child_file`、
+    /// #630）。作ったファイルは消してある。中身は [`crate::acl::exposure`] の理由。
+    #[error("作ったファイルが保護されていません（{0:?}）")]
+    Exposed(Vec<crate::acl::Exposure>),
 }
 
 impl SecretStoreError {
