@@ -498,6 +498,12 @@ impl ComputedEngine {
                 }
             };
 
+            let (value, quality) =
+                if value.is_some_and(|value| !crate::hub::valid_current_value(self_entry, value)) {
+                    (None, Quality::Bad)
+                } else {
+                    (value, quality)
+                };
             self.store.set_with_observation_time(
                 &self_entry.tag_key,
                 value,
@@ -621,6 +627,205 @@ mod tests {
             );
             store.observe_catalog(&enabled, &TagMap::default(), 800);
             assert!(store.reenabled_ms.read().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_current_values_are_bad_and_preserve_attempt_time() {
+        use crate::hub::{effective_sample, read_current_view};
+        for data_type in ["f64", "bit"] {
+            let mut entry = plc_entry("a", "c.g.a", 1);
+            entry.data_type = data_type.to_string();
+            for value in [
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                0.0,
+                1.0,
+                0.5,
+                2.0,
+            ] {
+                let valid =
+                    value.is_finite() && (data_type != "bit" || value == 0.0 || value == 1.0);
+                let sample = CurrentSample {
+                    value: Some(value),
+                    quality: Quality::Good,
+                    ptime_ms: 123,
+                };
+                assert_eq!(
+                    effective_sample(&entry, Some(sample), 999),
+                    (
+                        valid.then_some(value),
+                        if valid { Quality::Good } else { Quality::Bad },
+                        123
+                    )
+                );
+                entry.tag_kind = "internal".to_string();
+                let store = ServerTagStore::new();
+                store.set(&entry.tag_key, Some(value), Quality::Good, 123);
+                let view = read_current_view(&entry, None, &store, 999);
+                assert_eq!(view.source_time_ms, valid.then_some(123));
+                assert_eq!(view.quality_since_ms, Some(123));
+                assert_eq!(read_current_view(&entry, None, &store, 1_999), view);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_current_value_never_reads_as_good_or_stale() {
+        use crate::hub::effective_sample;
+        let entry = plc_entry("a", "c.g.a", 1);
+        for quality in [Quality::Good, Quality::Stale, Quality::Bad] {
+            assert_eq!(
+                effective_sample(
+                    &entry,
+                    Some(CurrentSample {
+                        value: None,
+                        quality,
+                        ptime_ms: 123
+                    }),
+                    999
+                ),
+                (None, Quality::Bad, 123)
+            );
+        }
+    }
+
+    #[test]
+    fn nonfinite_computed_output_is_bad_then_recovers() {
+        let mut input = plc_entry("a", "line1.fast.a", 1);
+        input.tag_kind = "internal".to_string();
+        let map = map_of(vec![
+            input,
+            computed_entry("b", "calc.x.b", 2, "line1.fast.a * 2"),
+            computed_entry("c", "calc.x.c", 3, "calc.x.b + 1"),
+        ]);
+        let store = Arc::new(ServerTagStore::new());
+        let engine = ComputedEngine::new(store.clone());
+        engine.commit(build_plan(&map).unwrap());
+        for (value, timestamp, observed, expected) in [
+            (f64::MAX, 100, 200, Quality::Bad),
+            (1.0, 300, 400, Quality::Good),
+        ] {
+            store.set("tag:1", Some(value), Quality::Good, timestamp);
+            engine.evaluate_tick(&map, None, observed);
+            for key in ["tag:2", "tag:3"] {
+                let reading = store.get_reading(key).unwrap();
+                assert_eq!(reading.sample.quality, expected);
+                assert_eq!(reading.sample.ptime_ms, timestamp);
+                assert_eq!(reading.quality_since_ms, Some(observed));
+                if expected == Quality::Bad {
+                    assert_eq!(reading.sample.value, None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_input_recovers_and_constant_bit_output_is_bad() {
+        let mut input = plc_entry("a", "line1.fast.a", 1);
+        input.tag_kind = "internal".to_string();
+        let mut constant = computed_entry("constant", "calc.x.constant", 3, "2");
+        constant.data_type = "bit".to_string();
+        let map = map_of(vec![
+            input,
+            computed_entry("b", "calc.x.b", 2, "line1.fast.a + 1"),
+            constant,
+        ]);
+        let store = Arc::new(ServerTagStore::new());
+        let engine = ComputedEngine::new(store.clone());
+        engine.commit(build_plan(&map).unwrap());
+        for (value, expected) in [
+            (f64::NAN, Quality::Bad),
+            (f64::INFINITY, Quality::Bad),
+            (f64::NEG_INFINITY, Quality::Bad),
+            (1.0, Quality::Good),
+        ] {
+            store.set("tag:1", Some(value), Quality::Good, 100);
+            engine.evaluate_tick(&map, None, 200);
+            assert_eq!(store.get("tag:2").unwrap().quality, expected);
+            assert_eq!(store.get("tag:3").unwrap().quality, Quality::Bad);
+            assert_eq!(
+                store.get_reading("tag:3").unwrap().quality_since_ms,
+                Some(200)
+            );
+        }
+    }
+
+    #[test]
+    fn on_change_reports_first_invalid_once_and_recovers() {
+        use crate::subscribe_core::{evaluate, initial_values, Mode, Subscription, TagPattern};
+        let mut entry = plc_entry("a", "line1.fast.a", 1);
+        entry.tag_kind = "internal".to_string();
+        let map = map_of(vec![entry]);
+        let store = ServerTagStore::new();
+        store.set("tag:1", Some(f64::NAN), Quality::Good, 100);
+        let patterns = vec![TagPattern::All];
+        let (first, _) = initial_values(&patterns, &map, None, &store, 200, None);
+        assert_eq!((first[0].v, first[0].q), (None, Quality::Bad));
+        // A subscriber that starts while Good must receive the first Bad
+        // transition as well as the later recovery.
+        store.set("tag:1", Some(42.0), Quality::Good, 210);
+        let (first, last) = initial_values(&patterns, &map, None, &store, 220, None);
+        assert_eq!((first[0].v, first[0].q), (Some(42.0), Quality::Good));
+        let mut sub = Subscription {
+            patterns,
+            mode: Mode::OnChange,
+            last,
+            next_due_ms: 0,
+        };
+        assert!(evaluate(&mut sub, &map, None, &store, 230, None).is_none());
+        store.set("tag:1", Some(f64::NAN), Quality::Good, 250);
+        let bad = evaluate(&mut sub, &map, None, &store, 300, None).unwrap();
+        assert_eq!(bad.len(), 1);
+        assert_eq!((bad[0].v, bad[0].q, bad[0].t), (None, Quality::Bad, 250));
+        assert!(evaluate(&mut sub, &map, None, &store, 350, None).is_none());
+        store.set("tag:1", Some(f64::INFINITY), Quality::Good, 400);
+        assert!(evaluate(&mut sub, &map, None, &store, 500, None).is_none());
+        store.set("tag:1", Some(42.0), Quality::Good, 600);
+        let recovered = evaluate(&mut sub, &map, None, &store, 700, None).unwrap();
+        assert_eq!(
+            (recovered[0].v, recovered[0].q, recovered[0].t),
+            (Some(42.0), Quality::Good, 600)
+        );
+        assert!(evaluate(&mut sub, &map, None, &store, 800, None).is_none());
+    }
+
+    #[test]
+    fn computed_invalid_bit_propagates_bad_and_recovers() {
+        let mut input = plc_entry("a", "line1.fast.a", 1);
+        input.tag_kind = "internal".to_string();
+        let mut bit = computed_entry("b", "calc.x.b", 2, "line1.fast.a * 2");
+        bit.data_type = "bit".to_string();
+        let map = map_of(vec![
+            input,
+            bit,
+            computed_entry("c", "calc.x.c", 3, "calc.x.b + 1"),
+        ]);
+        let store = Arc::new(ServerTagStore::new());
+        let engine = ComputedEngine::new(store.clone());
+        engine.commit(build_plan(&map).unwrap());
+        for (value, sample_time, observed, expected) in [
+            (0.0, 100, 200, Quality::Good),
+            (1.0, 300, 400, Quality::Bad),
+            (0.0, 500, 600, Quality::Good),
+        ] {
+            store.set("tag:1", Some(value), Quality::Good, sample_time);
+            engine.evaluate_tick(&map, None, observed);
+            for key in ["tag:2", "tag:3"] {
+                let reading = store.get_reading(key).unwrap();
+                assert_eq!(reading.sample.quality, expected);
+                assert_eq!(reading.sample.ptime_ms, sample_time);
+                assert_eq!(reading.quality_since_ms, Some(observed));
+                if expected == Quality::Bad {
+                    assert_eq!(reading.sample.value, None);
+                }
+            }
+            engine.evaluate_tick(&map, None, observed + 50);
+            assert_eq!(
+                store.get_reading("tag:2").unwrap().quality_since_ms,
+                Some(observed)
+            );
         }
     }
 

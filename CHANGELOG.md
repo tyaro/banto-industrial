@@ -2,6 +2,10 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.30 — 2026-10-16（アルファ）
+
+- banto-hub の現在値で NaN・正負の無限大と、bit の 0/1 以外の値を欠測（`null`）・品質 Bad として返すようにした（#615）。REST・WebSocket・gRPC・MQTT・MCP と演算入力で共通。将来の OPC UA（#201）も同じ読み取り契約を使う。従来 Good として返っていた不正な数値・bit も Bad になる。値が欠けているサンプルも、生の品質が Good・Stale であっても Bad にする。演算タグ自身の不正な出力も Bad として依存先へ伝え、正常な値に戻れば復旧する。既存の試行時刻は変えない。
+
 ## v0.2.0-alpha.29 — 2026-10-05（アルファ）
 
 banto v3.0.1（2026-10-05、patch。公開 API の追加・削除・改名なし）に追従した（Rust の `banto-*` と npm の `@banto/*` を同じタグに。経路 A）。その後 v4.0.0 を経て、banto v5.0.0（2026-10-06、`SnapshotListResource` の失敗の形の破壊的変更と、`banto-server` の CSP の `connect-src` を要求ごとに広げる API の追加）に追従した。banto-hub への影響は依存の版・監査ログ画面の失敗の扱い・デスクトップ版の `/status` の CSP で、REST の wire・設定・DB は変わらない。ただし、その後に入ったしきい値の除去（#533）は、タグの REST/MCP の wire・CSV・設定パッケージ・DB（`tags` の列）と収集の動作（しきい値のイベントを出さない）を変える（下の banto-hub の節）。配布物の構成・前提ランタイムは alpha.3 以降と同じ。alpha.28 の「旧形式の DB は起動を拒否する」はそのまま（上げる手順は alpha.28 の節）。

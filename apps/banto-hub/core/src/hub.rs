@@ -306,6 +306,11 @@ pub struct CurrentView {
     pub quality_since_ms: Option<i64>,
 }
 
+/// Values accepted by every current-value interface, including computed inputs.
+pub(crate) fn valid_current_value(entry: &TagEntry, value: f64) -> bool {
+    value.is_finite() && (entry.data_type != "bit" || value == 0.0 || value == 1.0)
+}
+
 fn effective_current_view(
     entry: &TagEntry,
     reading: Option<CurrentReading>,
@@ -322,6 +327,33 @@ fn effective_current_view(
         };
     }
     let reading = reading.expect("present reading checked above");
+    if !reading
+        .sample
+        .value
+        .is_some_and(|value| valid_current_value(entry, value))
+    {
+        return CurrentView {
+            value: None,
+            quality: Quality::Bad,
+            timestamp_ms,
+            // The raw store may have recorded an invalid bit as Good. It
+            // cannot provide a usable source time for that update.
+            source_time_ms: if reading.sample.quality == Quality::Good
+                && reading.sample.value.is_some()
+            {
+                reading.last_good_ms.filter(|time| *time != timestamp_ms)
+            } else {
+                reading.last_good_ms
+            },
+            quality_since_ms: Some(reading.quality_since_ms.map_or(timestamp_ms, |since| {
+                if reading.sample.quality == Quality::Bad {
+                    since
+                } else {
+                    since.max(timestamp_ms)
+                }
+            })),
+        };
+    }
     CurrentView {
         value: reading.sample.value,
         quality: reading.sample.quality,

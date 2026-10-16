@@ -11861,6 +11861,36 @@ mod tests {
     }
 
     #[test]
+    fn rest_current_invalid_values_serialize_as_null_bad() {
+        let mut tag = metadata_test_tag("internal", false, true);
+        let store = crate::computed::ServerTagStore::new();
+        let status = metadata_test_status(CollectionState::Stopped, RunMode::Configured);
+        for data_type in ["f32", "bit"] {
+            tag.data_type = data_type.to_string();
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0] {
+                if data_type != "bit" && value.is_finite() {
+                    continue;
+                }
+                store.set(&tag.tag_key, Some(value), banto_collect::Quality::Good, 123);
+                let json = serde_json::to_value(value_entry(
+                    &tag.external_name,
+                    &tag,
+                    None,
+                    &store,
+                    999,
+                    &status,
+                    &TagMap::default(),
+                    &empty_computed_engine(),
+                ))
+                .unwrap();
+                assert_eq!(json["v"], serde_json::Value::Null);
+                assert_eq!(json["q"], "bad");
+                assert_eq!(json["t"], 123);
+            }
+        }
+    }
+
+    #[test]
     fn rest_catalog_dto_separates_configured_and_effective_simulation() {
         let tag = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
         let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
