@@ -85,6 +85,11 @@ export const RULES = [
 	{ re: /^e2e\//, areas: ['e2e_hub', 'e2e_chronogazer'], why: 'E2E 共通（tsconfig 等）' },
 
 	// --- 文書・エージェント向け設定（lint/format だけ）
+	{
+		re: /^interop\/opcua\//,
+		areas: ['docs'],
+		why: 'OPC UA interop は専用 opcua-interop workflow で検証'
+	},
 	{ re: /^docs\//, areas: ['docs'], why: 'docs' },
 	{ re: /^[^/]+\.md$/, areas: ['docs'], why: 'root の Markdown' },
 	{ re: /^(LICENSE|\.gitignore)$/, areas: ['docs'], why: 'ライセンス・ignore' },

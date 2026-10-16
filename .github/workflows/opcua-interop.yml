@@ -1,0 +1,53 @@
+name: OPC UA interop
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opcua-interop.yml'
+      - 'interop/opcua/**'
+      - 'apps/banto-hub/core/**'
+      - 'apps/banto-hub/README.md'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'docs/banto-hub-opcua-verification.md'
+  pull_request:
+    paths:
+      - '.github/workflows/opcua-interop.yml'
+      - 'interop/opcua/**'
+      - 'apps/banto-hub/core/**'
+      - 'apps/banto-hub/README.md'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'docs/banto-hub-opcua-verification.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opcua-interop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  asyncua-smoke:
+    name: Linux asyncua interop smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build Hub (REST only)
+        run: cargo build --locked -p banto-hub-core --bin banto-hub
+      - name: Install pinned asyncua client
+        run: python -m pip install -r interop/opcua/requirements.txt
+      - name: Verify Hub through independent OPC UA client
+        run: python interop/opcua/smoke.py target/debug/banto-hub
