@@ -485,6 +485,18 @@ mod tests {
 
     /// 実マシンで動いているアプリ（BantoHub サービス等）の mutex と衝突しない
     /// よう、テストごとに一意な名前を使う。
+    fn unique_mutex_name(tag: &str) -> String {
+        format!(
+            "Global\\BantoInstanceLockTest.{tag}.{}.{}",
+            std::process::id(),
+            now_unix_ms()
+        )
+    }
+
+    fn lock_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        dir.path().join(name)
+    }
+
     /// #626 PR-B: 診断ファイルを書かずに持つ mutex は、持っている間は [`try_acquire`]・
     /// もう一度の [`try_hold_named_mutex`]（別のスレッドからも）を断り、放せば取れる。
     #[cfg(windows)]
@@ -509,18 +521,6 @@ mod tests {
         drop(again);
         let guard = try_acquire(&name, &lock_path(&dir, "y.lock"), "hub").expect("Hub も取れる");
         drop(guard);
-    }
-
-    fn unique_mutex_name(tag: &str) -> String {
-        format!(
-            "Global\\BantoInstanceLockTest.{tag}.{}.{}",
-            std::process::id(),
-            now_unix_ms()
-        )
-    }
-
-    fn lock_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-        dir.path().join(name)
     }
 
     #[test]
