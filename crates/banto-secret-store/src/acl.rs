@@ -1776,6 +1776,18 @@ mod tests {
             banto_service_elev::is_current_process_admin().unwrap_or(false)
         }
 
+        /// ファイル用の確かめ。ファイルへは継承のフラグ（OICI）を外した記述子を書くので、
+        /// 全 ACE の flags が 0 であることを確かめ、フォルダ用の `check_dacl` が期待する
+        /// 形（flags = OICI）に読み替えて、所有者・PROTECTED・SID と mask の組を確かめる。
+        fn check_file_dacl(observed: &ObservedDacl, access: &DirAccess) {
+            let mut as_dir = observed.clone();
+            for ace in as_dir.aces.as_mut().expect("DACL がある") {
+                assert_eq!(ace.flags, 0, "ファイルの ACE に継承のフラグ: {observed:?}");
+                ace.flags = INHERIT_FLAGS;
+            }
+            check_dacl(&as_dir, access).unwrap_or_else(|e| panic!("{e:?}: {observed:?}"));
+        }
+
         fn has_no_broad_groups(dacl: &ObservedDacl) {
             for ace in dacl.aces.as_ref().unwrap() {
                 for broad in ["S-1-5-32-545", "S-1-1-0", "S-1-5-11", "S-1-5-4"] {
@@ -2173,7 +2185,8 @@ mod tests {
             let skips = pinned.reset_acl(&access, Recurse::Tree).unwrap();
             drop(pinned);
 
-            // 普通の子（孫まで）は保護された DACL ＋ Administrators 所有。
+            // 普通の子（孫まで）は保護された DACL ＋ Administrators 所有。フォルダは継承の
+            // フラグ（OICI）付き、ファイルは継承無し（flags 0）の記述子。
             for path in [&dir, &normal, &deep] {
                 let dacl = read_dir_dacl(path).unwrap();
                 assert_eq!(
@@ -2182,7 +2195,11 @@ mod tests {
                     "{}: {dacl:?}",
                     path.display()
                 );
-                check_dacl(&dacl, &access).unwrap();
+                if path == &deep {
+                    check_file_dacl(&dacl, &access);
+                } else {
+                    check_dacl(&dacl, &access).unwrap();
+                }
             }
             // ジャンクション・ハードリンクは飛ばして記録。先は変えない。
             // 記録は本当のパス（TEMP が 8.3 の短い名前でも長い名前で返る）。
@@ -2212,19 +2229,16 @@ mod tests {
             std::fs::write(&normal, b"x").unwrap();
             let denied = dir.join("denied.txt");
             std::fs::write(&denied, b"x").unwrap();
-            // `denied` の DACL を「この利用者だけ・継承しない」にし、Administrators を外す。
-            // 所有者はこの利用者のままなので、Administrators は WRITE_DAC で開けない。
+            // `denied` の DACL を明示の拒否で作る。BA（Administrators）への拒否は、昇格した
+            // 利用者（CI）でも開けなくする。OW（OWNER RIGHTS）への拒否は、所有者が暗黙に持つ
+            // READ_CONTROL・WRITE_DAC を取り上げる。WRITE_OWNER は特権を有効にしないので通らない。
             let me = me();
-            let sddl = format!("D:P(A;;FA;;;{})", me.as_str());
-            let status = std::process::Command::new("icacls")
-                .arg(&denied)
-                .args(["/inheritance:r", "/grant:r"])
-                .arg(format!("*{}:F", me.as_str()))
-                .stdout(std::process::Stdio::null())
-                .status()
-                .expect("icacls");
-            assert!(status.success());
-            let _ = sddl;
+            deny_everyone_but_system(&denied);
+            assert_eq!(
+                open_for_write_dac_owner(&denied),
+                Err(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED),
+                "テストの前提: denied.txt は WRITE_DAC | WRITE_OWNER で開けない"
+            );
 
             let pinned = pin_dir(&dir).unwrap().unwrap();
             let skips = pinned
@@ -2237,6 +2251,11 @@ mod tests {
             // 開けない子は飛ばして記録、ほかは書けている。
             assert_eq!(skips.denied.len(), 1, "{skips:?}");
             assert!(skips.denied[0].ends_with("denied.txt"), "{skips:?}");
+            // ほかの子は書けている。
+            let normal_dacl = read_dir_dacl(&normal).unwrap();
+            assert_eq!(normal_dacl.owner, ADMINISTRATORS_SID, "{normal_dacl:?}");
+            // 開けない子は消せないかもしれない。tempdir の drop の失敗は無視される。
+            drop(root);
         }
 
         /// 監査 Must 2・受入 (a): ルートの中の子のジャンクションの先（outside）の DACL は、
@@ -2421,6 +2440,79 @@ mod tests {
                 "ジャンクションに変わったハンドルの列挙が中身を返した: {real:?}"
             );
             assert!(!names.iter().any(|n| n == "secret.txt"));
+        }
+
+        /// `path` の DACL を `D:P(D;;FA;;;BA)(D;;WDWO;;;OW)(A;;FA;;;SY)` にする（Administrators と
+        /// OWNER RIGHTS への明示の拒否）。
+        fn deny_everyone_but_system(path: &std::path::Path) {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::LocalFree;
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            };
+            use windows_sys::Win32::Security::{SetFileSecurityW, DACL_SECURITY_INFORMATION};
+
+            let sddl: Vec<u16> = "D:P(D;;FA;;;BA)(D;;WDWO;;;OW)(A;;FA;;;SY)"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: NUL 終端の SDDL。確保された記述子は下で LocalFree する。
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(ok, 0, "SDDL の変換: {}", last_error_test());
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: NUL 終端のパスと、上で作った有効な記述子。
+            let ok =
+                unsafe { SetFileSecurityW(wide.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+            let error = last_error_test();
+            // SAFETY: ConvertString...が LocalAlloc した記述子。
+            unsafe { LocalFree(descriptor) };
+            assert_ne!(ok, 0, "SetFileSecurityW: {error}");
+        }
+
+        /// `path` を `WRITE_DAC | WRITE_OWNER` で開く。開けなければ Win32 のエラー番号。
+        fn open_for_write_dac_owner(path: &std::path::Path) -> std::result::Result<(), u32> {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING, WRITE_DAC, WRITE_OWNER,
+            };
+
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: NUL 終端のパス。バックアップ権限は使わない（特権は有効にしない）。
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    WRITE_DAC | WRITE_OWNER,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(last_error_test());
+            }
+            // SAFETY: 上で開いた有効なハンドル。
+            unsafe { CloseHandle(handle) };
+            Ok(())
         }
 
         fn last_error_test() -> u32 {
