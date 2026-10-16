@@ -31,7 +31,7 @@ const NONE = {
 };
 
 const HUB_RUST = '-p banto-hub-core -p banto-hub-shell -p banto-hub-sink -p banto-tagclient';
-const CHRONO_RUST = '-p chronogazer -p chronogazer-core';
+const CHRONO_RUST = '-p chronogazer -p chronogazer-core -p chronogazer-elev';
 
 /** [名前, 変更ファイル, 期待するジョブ] */
 const TABLE = [
@@ -73,6 +73,17 @@ const TABLE = [
 		}
 	],
 	['crates の変更', ['crates/banto-tags/src/lib.rs'], ALL_BUT_FRONTEND()],
+	[
+		'chronogazer の elev だけ（昇格の境界）',
+		['apps/chronogazer/elev/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: CHRONO_RUST,
+			run_frontend_chronogazer: true,
+			run_e2e_chronogazer: true
+		}
+	],
 
 	// --- それ以外
 	[
@@ -162,7 +173,8 @@ const TABLE = [
 				'-p banto-hub-sink',
 				'-p banto-tagclient',
 				'-p chronogazer',
-				'-p chronogazer-core'
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
 			].join(' '),
 			run_rust_db_source: true,
 			run_e2e_hub: true,
