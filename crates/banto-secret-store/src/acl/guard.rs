@@ -28,6 +28,11 @@
 //!   **本当のパス**（`PinnedDir::final_path`）が期待のパスと同じ場所か（要素ごと・大文字
 //!   小文字を無視）と、本当のパスにも既知のフォルダの deny-list をかける（途中の要素の
 //!   ジャンクション・8.3 の短い名前で別の場所を開かされていたら気づく）。
+//! - [`check_root_parent`] は、無いルートを親のハンドルを基準に作る前に、辿らずに開いた
+//!   親を確かめる（本当のパス・reparse point でないフォルダ・ネットワークでない・OS と
+//!   プログラムの置き場の中でない。#642 で banto-hub-elev から移した）。
+//! - [`is_plain_child_name`]・[`is_reserved_device_name`] は、親のハンドルを基準に作る・
+//!   開く名前 1 要素の確かめ（`NtCreateFile` は Win32 の正規化を通らないため。#642）。
 //! - [`data_acl_plan`] は、開いたフォルダの属性と所有者から、作る・書き直す・断るを決める
 //!   （reparse point・フォルダでない・見知らぬ所有者を断る）。
 //! - [`plan_carry_over`] は、書き直す前の DACL（`PinnedDir::read_dacl`）から、**引き継ぐ
@@ -243,6 +248,107 @@ pub fn check_real_path(
         return Err(RealPathRefusal::Mismatch);
     }
     reject_well_known_root(real, known).map_err(RealPathRefusal::WellKnown)
+}
+
+// --- 無いルートを作る前の、親の確かめ ------------------------------------------------
+
+/// [`check_root_parent`] が断る理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootParentRefusal {
+    /// 本当のパスが期待のパスと違う場所（途中の要素のジャンクション・8.3 の短い名前）。
+    Mismatch,
+    /// reparse point（ジャンクション・シンボリックリンクなど）か、フォルダではない。
+    NotAPlainDirectory,
+    /// UNC・`\\?\`・`\\.\`（`\\` か `//` で始まる）。
+    NetworkOrSpecial,
+    /// [`KnownFolders::forbidden_inside`] のこのフォルダのそのもの・中。
+    InsideProtected(PathBuf),
+}
+
+/// 無いルートを**親のハンドルを基準に**作る前に、辿らずに開いた親を確かめる（純関数。
+/// #626 PR-B の再レビュー 1 で banto-hub-elev に入れたものを、#642 で chronogazer-elev と
+/// 共有するために移した）: 本当のパス（`real`）が期待（`expected`）と同じ場所・reparse
+/// point でないフォルダ・ネットワークの場所でない・OS とプログラムの置き場
+/// （[`KnownFolders::forbidden_inside`]）のそのもの・中でない。ProgramData そのもの
+/// （[`KnownFolders::forbidden_itself`]）・ドライブのルートは親として認める（既定の
+/// ルートは ProgramData の下、`D:\Product` の親は `D:\`）。この順に見る。
+pub fn check_root_parent(
+    real: &Path,
+    expected: &Path,
+    info: &PinnedDirInfo,
+    known: &KnownFolders,
+) -> Result<(), RootParentRefusal> {
+    if !paths_match(real, expected) {
+        return Err(RootParentRefusal::Mismatch);
+    }
+    if info.is_reparse_point || !info.is_dir {
+        return Err(RootParentRefusal::NotAPlainDirectory);
+    }
+    let text = real.to_string_lossy();
+    if text.starts_with("\\\\") || text.starts_with("//") {
+        return Err(RootParentRefusal::NetworkOrSpecial);
+    }
+    if let Some(folder) = known
+        .forbidden_inside
+        .iter()
+        .find(|folder| is_same_or_inside(real, folder))
+    {
+        return Err(RootParentRefusal::InsideProtected(folder.clone()));
+    }
+    Ok(())
+}
+
+// --- 名前 1 要素 --------------------------------------------------------------------
+
+/// Windows の予約デバイス名か（純関数。大文字小文字を無視。最初の `.` より前を、末尾の
+/// 空白を除いて見るので `nul.txt`・`CON .log` も予約名。`COM0`〜`COM9`・`LPT0`〜`LPT9`
+/// と上付き数字の `COM¹`・`LPT²`・`LPT³` も含む - Win32 はこれらをファイルではなく
+/// デバイスとして開く。`COM0`・`LPT0` は #641 のオーナーレビュー Nit 4 で足した: Microsoft の
+/// 「Naming Files」が予約名として挙げているため、確かめる側は断る側に倒す）。
+///
+/// banto-hub の profile-id（`profile_paths::validate_profile_id`）と、
+/// [`is_plain_child_name`]（`PinnedDir::create_child_dir`・`open_child_dir` の名前）が使う
+/// （#642 でここへ移した）。
+pub fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    const PLAIN: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+    if PLAIN.contains(&upper.as_str()) {
+        return true;
+    }
+    let Some(rest) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut digits = rest.chars();
+    matches!(
+        (digits.next(), digits.next()),
+        (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
+}
+
+/// 名前 1 要素として、親のハンドルを基準に作る・開く（`NtCreateFile` の `RootDirectory`）
+/// のに使ってよいか（純関数。#641 のオーナーレビュー Nit 2）。`NtCreateFile` は Win32 の
+/// パスの正規化を通らないので、Win32 から見ると別の名前・別の物になるものをここで断る:
+///
+/// - 空・区切り（`\`・`/`）・`:`（ドライブ・代替データストリーム）・NUL・制御文字。
+/// - ワイルドカードと Win32 で使えない文字（`*`・`?`・`<`・`>`・`|`・`"`）。
+/// - 末尾の `.` と空白（Win32 は落とすので、`secrets.` で作ったものは Win32 から
+///   `secrets` と区別できない。点だけの名前 `.`・`..` もここで断る）。
+/// - 予約デバイス名（[`is_reserved_device_name`]。`nul.txt` も）。
+pub fn is_plain_child_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.ends_with('.')
+        && !name.ends_with(' ')
+        && !name.chars().any(|c| {
+            matches!(
+                c,
+                '\\' | '/' | ':' | '\0' | '*' | '?' | '<' | '>' | '|' | '"'
+            ) || c.is_control()
+        })
+        && !is_reserved_device_name(name)
 }
 
 // --- 書き直す前の所有者の確かめ ----------------------------------------------------

@@ -21,6 +21,11 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
   - profile の今の DACL に種類の分からない ACE・SID を読めない ACE があると、書き直さずに断る。条件付き・オブジェクトの拒否も拒否として数え、条件付き・オブジェクトの許可は引き継がない。
   - `reset-password`・`revert-to-commissioning` は、DB を開く前に `profiles\`・profile・`config\` と DB のファイルを辿らずに開いて確かめ、ジャンクション・シンボリックリンク・ハードリンク・本当の場所の食い違いなら DB を開かずに断る。
   - `BANTO_DB`・`BANTO_HUB_DATA` で profile の外に置いた DB・データは対象外。詳細と既知の制限は docs/banto-hub-operations.md §11「profile ディレクトリの権限（ACL）」。
+- banto-hub-elev の小さな直し（#642。#641 のレビューと実機確認の Nit）:
+  - 断ったときの最後の行の接頭辞が二重（`banto-hub-elev: banto-hub-elev: …`）だったのを 1 回にした（`grant-profile-acl` に限らず、ほかのアクションの失敗の行も）。
+  - profile-id の予約名に `COM0`・`LPT0` を足した（elev の許可リストと、全体の profile-id の確かめの両方。`BANTO_HUB_PROFILE=com0` などは警告を出して `default` を使う）。
+  - `grant-profile-acl` で、作ろうとしたら既にあったフォルダ（確かめてから作るまでの間に誰かが作った）は、パスではなく確かめ済みの親のフォルダから相対で開き直す。相対で作る・開く名前は、末尾の `.` と空白・`* ? < > | "`・予約名も断る。
+- ChronoGazer の昇格ヘルパー `chronogazer-elev` の `grant-data-acl`・`service-install` も、無いデータのルート・`secrets\` を確かめ済みの親のフォルダの中に相対で作るようにした（#642。#626 の banto-hub-elev と同じ形）。途中のフォルダがジャンクションでも、外にフォルダを作ってから断ることはなくなった。ルートの親のフォルダは既にあることが必要（無ければ何も作らずに終了コード 2）。
 
 ## v0.2.0-alpha.30 — 2026-10-16（アルファ）
 

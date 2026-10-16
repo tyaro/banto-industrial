@@ -104,6 +104,10 @@ impl HubElevOps for WindowsHubElevOps {
             .create_child_dir(name, access)
             .map_err(|err| err.to_string())
     }
+
+    fn open_child(&self, parent: &PinnedDir, name: &str) -> Result<Option<PinnedDir>, String> {
+        parent.open_child_dir(name).map_err(|err| err.to_string())
+    }
 }
 
 /// [`pin_file`] で開いたままのファイル（drop で閉じる）。

@@ -1,6 +1,6 @@
 //! `banto-hub-elev grant-profile-acl`（と`reset-password`・`revert-to-commissioning`の
 //! 対象の profile の決め方）の中身（#626 PR-B、2026-10-16。計画のオーナー決定は
-//! 論点 1〜10 すべておすすめどおり - docs/banto-hub-t17-design.md §12 の #626 の節）。
+//! 論点 1〜11 すべておすすめどおり - docs/banto-hub-t17-design.md §12 の #626 の節）。
 //!
 //! **ここは昇格の境界**（管理者として動くプロセスが、昇格していない呼び出し元から
 //! 引数を受け、その利用者が中身を変えられるフォルダの DACL を書き直す）。そのため、
@@ -462,6 +462,12 @@ pub trait HubElevOps {
         name: &str,
         how: CreateHow,
     ) -> Result<Option<Self::Pinned>, String>;
+    /// 確かめ済みの`parent`（開いたハンドル）を基準に、名前 1 要素の子を**相対で辿らずに**
+    /// 開く（`PinnedDir::open_child_dir`）。無ければ`Ok(None)`。[`HubElevOps::create_child`]
+    /// が既にあった（`Ok(None)`）段を、パスで開き直さずに開くために使う（#641 のオーナー
+    /// レビュー Nit 5）。
+    fn open_child(&self, parent: &Self::Pinned, name: &str)
+        -> Result<Option<Self::Pinned>, String>;
     /// [`HubElevOps::pin_file`] が返す、開いたままのファイル（drop で閉じる）。
     type HeldFile;
     /// ファイルを**辿らずに**開いて持つ（Windows は`FILE_FLAG_OPEN_REPARSE_POINT`、共有の
@@ -896,44 +902,75 @@ enum Parent<'a, P> {
 /// ルートの親の確かめ（純関数）: 本当のパスが期待と同じ場所・フォルダ・reparse point で
 /// ない・ネットワークの場所でない・OS とプログラムの置き場（`forbidden_inside`）の中で
 /// ない。ProgramData そのもの（`forbidden_itself`）・ドライブのルートは親として認める
-/// （既定のルートは ProgramData の下、`D:\BantoHub`の親は`D:\`）。
+/// （既定のルートは ProgramData の下、`D:\BantoHub`の親は`D:\`）。判断は共有の
+/// `guard::check_root_parent`（#642 で chronogazer-elev と共有するために移した）、ここは
+/// 文言だけ。
 pub fn root_parent_problem(
     real: &Path,
     expected: &Path,
     info: &PinnedDirInfo,
     known: &KnownFolders,
 ) -> Option<String> {
-    if !guard::paths_match(real, expected) {
-        return Some(format!(
+    use guard::RootParentRefusal as R;
+    let refusal = guard::check_root_parent(real, expected, info, known).err()?;
+    Some(match refusal {
+        R::Mismatch => format!(
             "本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります",
             real.display()
-        ));
-    }
-    if info.is_reparse_point || !info.is_dir {
-        return Some(
+        ),
+        R::NotAPlainDirectory => {
             "ジャンクション・シンボリックリンク（reparse point）か、フォルダではありません"
-                .to_string(),
-        );
-    }
-    let text = real.to_string_lossy();
-    if text.starts_with("\\\\") || text.starts_with("//") {
-        return Some("ネットワークの場所か特殊なパスです".to_string());
-    }
-    if let Some(folder) = known
-        .forbidden_inside
-        .iter()
-        .find(|folder| guard::is_same_or_inside(real, folder))
-    {
-        return Some(format!(
+                .to_string()
+        }
+        R::NetworkOrSpecial => "ネットワークの場所か特殊なパスです".to_string(),
+        R::InsideProtected(folder) => format!(
             "OS・プログラムの置き場か共有のフォルダ（{}）の中です",
             folder.display()
-        ));
+        ),
+    })
+}
+
+/// [`create_or_open`] の結果。
+enum Made<P> {
+    /// 作った（作ったハンドル）。
+    Created(P),
+    /// 作ろうとしたら既にあった（親のハンドルから相対で開いたもの）。
+    Existed(P),
+    /// 作ろうとしたら既にあり、開き直すと無くなっていた。
+    Vanished,
+}
+
+/// [`create_or_open`] の失敗（作る・開き直すのどちらで失敗したか）。
+enum MadeError {
+    Create(String),
+    Open(String),
+}
+
+/// 確かめ済みの`parent`を基準に`name`を相対で作る。確かめてから作るまでの間に誰かが
+/// 作っていた（`create_child`が`Ok(None)`）なら、**パスではなく親のハンドルから相対で**
+/// 辿らずに開き直す（#641 のオーナーレビュー Nit 5。パスで開き直すと、その間に祖先を
+/// すり替えられたとき別の場所を開く。開いたものは呼ぶ側が本当のパス・属性・所有者で
+/// 確かめる）。
+fn create_or_open<O: HubElevOps>(
+    ops: &O,
+    parent: &O::Pinned,
+    name: &str,
+    how: CreateHow,
+) -> Result<Made<O::Pinned>, MadeError> {
+    match ops.create_child(parent, name, how) {
+        Ok(Some(pinned)) => Ok(Made::Created(pinned)),
+        Ok(None) => match ops.open_child(parent, name) {
+            Ok(Some(pinned)) => Ok(Made::Existed(pinned)),
+            Ok(None) => Ok(Made::Vanished),
+            Err(error) => Err(MadeError::Open(error)),
+        },
+        Err(error) => Err(MadeError::Create(error)),
     }
-    None
 }
 
 /// 1 つの段を開いて確かめる。無ければ**確かめ済みの親のハンドルを基準に相対で作り**、
-/// 作ったハンドルをそのまま使う（パスを解決し直さない - #626 PR-B の再レビュー 1）。
+/// 作ったハンドルをそのまま使う（パスを解決し直さない - #626 PR-B の再レビュー 1）。作ろうと
+/// したら既にあった段も、親のハンドルから相対で開き直す（[`create_or_open`]、#641 Nit 5）。
 /// ルートの段の親は、パスで辿らずに開いて [`root_parent_problem`] を通してから使い、
 /// 無ければ何も作らずに断る。本当のパスが`expected`と同じ場所で既知のフォルダに当たら
 /// ないこと、`data_acl_plan`（reparse point・フォルダでない・見知らぬ所有者）を通ること。
@@ -976,7 +1013,7 @@ fn open_level<O: HubElevOps>(
                 );
             };
             let made = match parent {
-                Parent::Pinned(parent) => ops.create_child(parent, name, level.create_how()),
+                Parent::Pinned(parent) => create_or_open(ops, parent, name, level.create_how()),
                 Parent::RootParent(slot) => {
                     let Some(parent_dir) = dir.parent() else {
                         return refuse(
@@ -1029,47 +1066,48 @@ fn open_level<O: HubElevOps>(
                             ),
                         );
                     }
-                    let made = ops.create_child(&parent_pinned, name, level.create_how());
+                    let made = create_or_open(ops, &parent_pinned, name, level.create_how());
                     *slot = Some(parent_pinned);
                     made
                 }
             };
             match made {
-                Ok(Some(pinned)) => {
+                Ok(Made::Created(pinned)) => {
                     created.0.push((level, dir.to_path_buf()));
                     pinned
                 }
-                // 確かめてから作るまでの間に誰かが作った。辿らずに開き直して確かめる。
-                Ok(None) => match ops.pin_dir(dir) {
-                    Ok(Some(pinned)) => pinned,
-                    Ok(None) => {
-                        return refuse(
-                            out,
-                            created,
-                            format!(
-                                "{}（{}）を作ろうとしたら既にあり、開き直すと無くなっていました。止めます",
-                                level.label(),
-                                dir.display()
-                            ),
-                        )
-                    }
-                    Err(error) => {
-                        return refuse(
-                            out,
-                            created,
-                            format!(
-                                "{}（{}）を開けませんでした: {error}",
-                                level.label(),
-                                dir.display()
-                            ),
-                        )
-                    }
-                },
-                Err(error) => {
+                Ok(Made::Existed(pinned)) => pinned,
+                Ok(Made::Vanished) => {
                     return refuse(
                         out,
                         created,
-                        format!("{}（{}）を作れませんでした: {error}", level.label(), dir.display()),
+                        format!(
+                        "{}（{}）を作ろうとしたら既にあり、開き直すと無くなっていました。止めます",
+                        level.label(),
+                        dir.display()
+                    ),
+                    )
+                }
+                Err(MadeError::Open(error)) => {
+                    return refuse(
+                        out,
+                        created,
+                        format!(
+                            "{}（{}）を開けませんでした: {error}",
+                            level.label(),
+                            dir.display()
+                        ),
+                    )
+                }
+                Err(MadeError::Create(error)) => {
+                    return refuse(
+                        out,
+                        created,
+                        format!(
+                            "{}（{}）を作れませんでした: {error}",
+                            level.label(),
+                            dir.display()
+                        ),
                     )
                 }
             }

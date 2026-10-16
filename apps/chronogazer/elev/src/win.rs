@@ -133,8 +133,19 @@ impl ElevOps for WindowsOps {
         banto_secret_store::acl::pin_dir(dir).map_err(|err| err.to_string())
     }
 
-    fn create_dir(&self, dir: &Path, access: &DirAccess) -> Result<bool, String> {
-        banto_secret_store::acl::create_dir_if_absent(dir, access).map_err(|err| err.to_string())
+    fn create_child(
+        &self,
+        parent: &PinnedDir,
+        name: &str,
+        access: &DirAccess,
+    ) -> Result<Option<PinnedDir>, String> {
+        parent
+            .create_child_dir(name, Some(access))
+            .map_err(|err| err.to_string())
+    }
+
+    fn open_child(&self, parent: &PinnedDir, name: &str) -> Result<Option<PinnedDir>, String> {
+        parent.open_child_dir(name).map_err(|err| err.to_string())
     }
 }
 
@@ -166,6 +177,17 @@ mod tests {
     /// （`WindowsOps`）で、サービス・グループ・HKLM には触らない（呼ばれたら panic）。
     struct TempRootOps {
         root: PathBuf,
+        /// 子を作る直前に 1 回だけ走るフック（確かめた親のその場のすり替え。#642）。
+        before_create: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    impl TempRootOps {
+        fn new(root: &Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                before_create: std::cell::RefCell::new(None),
+            }
+        }
     }
 
     impl ElevOps for TempRootOps {
@@ -221,8 +243,19 @@ mod tests {
         fn pin_dir(&self, dir: &Path) -> Result<Option<PinnedDir>, String> {
             WindowsOps.pin_dir(dir)
         }
-        fn create_dir(&self, dir: &Path, access: &DirAccess) -> Result<bool, String> {
-            WindowsOps.create_dir(dir, access)
+        fn create_child(
+            &self,
+            parent: &PinnedDir,
+            name: &str,
+            access: &DirAccess,
+        ) -> Result<Option<PinnedDir>, String> {
+            if let Some(hook) = self.before_create.borrow_mut().take() {
+                hook();
+            }
+            WindowsOps.create_child(parent, name, access)
+        }
+        fn open_child(&self, parent: &PinnedDir, name: &str) -> Result<Option<PinnedDir>, String> {
+            WindowsOps.open_child(parent, name)
         }
     }
 
@@ -265,11 +298,17 @@ mod tests {
         let mut lines = Vec::new();
         let code = crate::run(
             &crate::Action::GrantDataAcl,
-            &TempRootOps {
-                root: root.to_path_buf(),
-            },
+            &TempRootOps::new(root),
             &mut |line| lines.push(line),
         );
+        (code, lines)
+    }
+
+    fn grant_with(ops: &TempRootOps) -> (i32, Vec<banto_service_control::ConsoleLine>) {
+        let mut lines = Vec::new();
+        let code = crate::run(&crate::Action::GrantDataAcl, ops, &mut |line| {
+            lines.push(line)
+        });
         (code, lines)
     }
 
@@ -358,5 +397,209 @@ mod tests {
         );
         assert!(!outside.join("secrets").exists());
         std::fs::remove_dir(&root).unwrap();
+    }
+
+    // --- #642: 無いルートを確かめ済みの親の下だけに作る（#626 PR-B の Hub と同じ形） -----
+
+    fn has_line(lines: &[banto_service_control::ConsoleLine], needle: &str) -> bool {
+        lines.iter().any(|line| match line {
+            banto_service_control::ConsoleLine::Stdout(text)
+            | banto_service_control::ConsoleLine::Stderr(text) => text.contains(needle),
+        })
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn snapshot(paths: &[PathBuf]) -> Vec<banto_secret_store::acl::ObservedDacl> {
+        paths
+            .iter()
+            .map(|p| banto_secret_store::acl::read_dir_dacl(p).unwrap())
+            .collect()
+    }
+
+    /// 外の対象（継承を受け入れる DACL）: `outside`・`outside\f.txt`・`outside\data`。
+    /// 保護された対象では、書き換えがあっても変わらず偽の緑になるので、最初に確かめる。
+    fn make_outside(parent: &Path) -> (PathBuf, Vec<PathBuf>) {
+        let outside = parent.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("f.txt"), b"x").unwrap();
+        std::fs::create_dir(outside.join("data")).unwrap();
+        let watched = vec![outside.clone(), outside.join("f.txt"), outside.join("data")];
+        for path in &watched {
+            assert!(
+                !banto_secret_store::acl::read_dir_dacl(path)
+                    .unwrap()
+                    .protected,
+                "外の対象は継承を受け入れる DACL にする: {}",
+                path.display()
+            );
+        }
+        (outside, watched)
+    }
+
+    /// 反証（実物）: ルートが無く、その親（途中の要素）が外へのジャンクションのとき、外に
+    /// 何も作らず、外の一覧と DACL も変えずに断る（以前はパスで作ってから確かめていたので、
+    /// 断っても外にフォルダが残った。管理者でなくても走る）。(a) ルートの親そのものが
+    /// ジャンクション、(b) ルートの親の親がジャンクション。
+    #[test]
+    fn a_missing_root_behind_a_junction_creates_nothing_outside() {
+        let parent = tempfile::tempdir().unwrap();
+        let base = long(parent.path());
+        let (outside, watched) = make_outside(&base);
+        let before = (
+            snapshot(&watched),
+            listing(&outside),
+            listing(&outside.join("data")),
+        );
+        let via = base.join("via");
+        junction(&via, &outside);
+        for (root, needle) in [
+            (via.join("ChronoGazer"), "reparse point"),
+            (via.join("data").join("ChronoGazer"), "本当の場所"),
+        ] {
+            let (code, lines) = grant(&root);
+            assert_eq!(code, crate::EXIT_FAILED, "{lines:#?}");
+            assert!(has_line(&lines, needle), "{lines:#?}");
+            assert!(has_line(&lines, "何も作らずに止めます"), "{lines:#?}");
+            assert_eq!(
+                (
+                    snapshot(&watched),
+                    listing(&outside),
+                    listing(&outside.join("data"))
+                ),
+                before,
+                "{}",
+                root.display()
+            );
+        }
+        std::fs::remove_dir(&via).unwrap();
+    }
+
+    /// ルートの親も無ければ、何も作らずに断る（前提が無い = 2。親から作ることはしない）。
+    #[test]
+    fn a_missing_root_parent_creates_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let base = long(parent.path());
+        let root = base.join("missing").join("ChronoGazer");
+        let (code, lines) = grant(&root);
+        assert_eq!(code, crate::EXIT_PRECONDITION, "{lines:#?}");
+        assert!(has_line(&lines, "親から作ることはしません"), "{lines:#?}");
+        assert_eq!(listing(&base), Vec::<String>::new());
+    }
+
+    /// ルートの親を確かめた後・ルートを作る直前に、親をその場で外へのジャンクションに
+    /// 変えても（FSCTL）、親のハンドルを基準に作るので外には何もできない（パスで作ると
+    /// 外にできる。管理者でなくても走る）。
+    #[test]
+    fn a_root_parent_swapped_before_create_does_not_leak() {
+        let parent = tempfile::tempdir().unwrap();
+        let base = long(parent.path());
+        let (outside, watched) = make_outside(&base);
+        let before = (snapshot(&watched), listing(&outside));
+        let root_parent = base.join("rp");
+        std::fs::create_dir(&root_parent).unwrap();
+        let ops = TempRootOps::new(&root_parent.join("ChronoGazer"));
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let (root_parent, outside, swapped) =
+                (root_parent.clone(), outside.clone(), swapped.clone());
+            *ops.before_create.borrow_mut() = Some(Box::new(move || {
+                swapped.set(set_reparse_to(&root_parent, &outside).is_ok());
+            }));
+        }
+        let (code, lines) = grant_with(&ops);
+        if !swapped.get() {
+            if std::env::var_os("CI").is_some() {
+                panic!("CI で FSCTL_SET_REPARSE_POINT が失敗した");
+            }
+            eprintln!("skip: FSCTL_SET_REPARSE_POINT に権限が無い - CI で確かめる");
+            return;
+        }
+        assert_ne!(code, crate::EXIT_OK, "{lines:#?}");
+        assert_eq!((snapshot(&watched), listing(&outside)), before);
+        assert!(!outside.join("ChronoGazer").exists());
+        let _ = std::fs::remove_dir(&root_parent);
+    }
+
+    /// `dir`（空のフォルダ）を`target`へのジャンクションにする（`FSCTL_SET_REPARSE_POINT`。
+    /// テスト専用 - banto-hub-core の `profile_grant::win` のテストの同名の関数と同じ）。
+    fn set_reparse_to(dir: &Path, target: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let sub: Vec<u16> = std::ffi::OsStr::new(r"\??\")
+            .encode_wide()
+            .chain(target.as_os_str().encode_wide())
+            .collect();
+        let sub_bytes = (sub.len() * 2) as u16;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&0xA000_0003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+        let data_len = 8 + sub_bytes as usize + 2 + 2;
+        buf.extend_from_slice(&(data_len as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        buf.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+        buf.extend_from_slice(&sub_bytes.to_le_bytes()); // SubstituteNameLength
+        buf.extend_from_slice(&(sub_bytes + 2).to_le_bytes()); // PrintNameOffset
+        buf.extend_from_slice(&0u16.to_le_bytes()); // PrintNameLength
+        for w in &sub {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        let path: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `path`は NUL 終端。
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut returned = 0u32;
+        // SAFETY: `handle`は有効、`buf`は reparse データ。
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                buf.as_ptr().cast(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        let err = std::io::Error::last_os_error();
+        // SAFETY: `handle`は CreateFileW が返したもの。
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(())
     }
 }

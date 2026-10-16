@@ -55,6 +55,18 @@
 //!   中のジャンクションの先を書き換えないこと（伝播は辿らない）は
 //!   `banto_secret_store::acl` のテストが固定する。ハードリンクの扱いは既知の制限
 //!   （同じモジュール doc）。
+//! - **無いフォルダは、確かめ済みの親のハンドルを基準に相対で作る**（#642。#626 PR-B の
+//!   banto-hub-elev と同じ形）: ルートは、親を辿らずに開いて
+//!   `guard::check_root_parent`（本当のパスの一致・reparse point でないフォルダ・
+//!   ネットワークでない・OS とプログラムの置き場の中でない）を通してから、
+//!   `PinnedDir::create_child_dir`（`NtCreateFile` の `RootDirectory`）で作る。親が無ければ
+//!   **何も作らずに** [`EXIT_PRECONDITION`]（親から作ることはしない）。`secrets\` は確かめ済みの
+//!   ルートのハンドルを基準に作る。作る DACL は SYSTEM・Administrators だけ
+//!   （`DirAccess::service_only`）で、作ったハンドルをそのまま使い（パスで開き直さない）、
+//!   本当のパスと [`data_acl_plan`] を確かめた後に reset で利用者の「変更」を付ける。作ろう
+//!   としたら既にあったものは、親のハンドルから相対で辿らずに開き直す
+//!   （`PinnedDir::open_child_dir`）。以前（パスの `create_dir_if_absent`）は、途中の要素が
+//!   ジャンクションだと外にフォルダを作ってから断っていた。
 //! - **自動開始**: 登録の直後は手動（T17 P4、§3.3）。`autostart-enable` で自動（遅延）、
 //!   `autostart-disable` で手動に戻す（`WindowsServiceManager::set_auto_start`。登録を
 //!   隣の `chronogazer-server.exe` で組み立て直す）。
@@ -63,7 +75,8 @@
 //!
 //! [`EXIT_OK`] 0 = 完了、[`EXIT_FAILED`] 1 = 操作の失敗（断った場合を含む）、
 //! [`EXIT_PRECONDITION`] 2 = 前提が無い（サービス未登録・インストール利用者の記録が
-//! 無い・`chronogazer-server.exe` が隣に無い・ルートを決められない・グループが無い）、
+//! 無い・`chronogazer-server.exe` が隣に無い・ルートを決められない・無いルートの親の
+//! フォルダが無い（#642）・グループが無い）、
 //! [`EXIT_USAGE`] 64 = 使い方の誤り。Windows 以外はすべて 64。`service-install` は
 //! 最初に失敗した手順の終了コードで止める（後の手順は行わない）。
 //!
@@ -481,8 +494,21 @@ pub trait ElevOps {
     fn set_autostart(&self, executable: &Path, enabled: bool) -> Result<(), ServiceManagerError>;
     /// フォルダを辿らずに開く（無ければ `Ok(None)`）。
     fn pin_dir(&self, dir: &Path) -> Result<Option<Self::Pinned>, String>;
-    /// 無ければ保護された DACL で作る（作ったら `true`）。
-    fn create_dir(&self, dir: &Path, access: &DirAccess) -> Result<bool, String>;
+    /// 確かめ済みの `parent`（開いたハンドル）を基準に、名前 1 要素の子のフォルダを
+    /// **相対で**、`access` の保護された DACL で作り、作ったハンドルをそのまま辿らずに
+    /// 開いたものとして返す（パスを解決し直さない。`PinnedDir::create_child_dir`。#642）。
+    /// 既にあれば `Ok(None)`。
+    fn create_child(
+        &self,
+        parent: &Self::Pinned,
+        name: &str,
+        access: &DirAccess,
+    ) -> Result<Option<Self::Pinned>, String>;
+    /// 確かめ済みの `parent` を基準に、名前 1 要素の子を**相対で辿らずに**開く
+    /// （`PinnedDir::open_child_dir`）。無ければ `Ok(None)`。[`ElevOps::create_child`] が
+    /// 既にあった（`Ok(None)`）フォルダを、パスで開き直さずに開くために使う（#642）。
+    fn open_child(&self, parent: &Self::Pinned, name: &str)
+        -> Result<Option<Self::Pinned>, String>;
 }
 
 // --- 実行 ---------------------------------------------------------------------------
@@ -726,11 +752,166 @@ fn service_install<O: ElevOps>(
     EXIT_OK
 }
 
+/// 段の親（無いフォルダを作るときの基準。#642）。
+enum Parent<'a, P> {
+    /// ルート: 親はパスで辿らずに開いて [`guard::check_root_parent`] で確かめる（無ければ
+    /// 何も作らずに断る）。開いた親は `slot` に入れて、呼ぶ側が最後まで持つ。
+    RootParent(&'a mut Option<P>),
+    /// `secrets\`・`secrets\hub-keys\`: 確かめ済みの 1 つ上のフォルダのハンドル。
+    Pinned(&'a P),
+}
+
+/// [`guard::RootParentRefusal`] の文言（純関数）。
+fn root_parent_text(real: &Path, refusal: &guard::RootParentRefusal) -> String {
+    match refusal {
+        guard::RootParentRefusal::Mismatch => format!(
+            "本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります",
+            real.display()
+        ),
+        guard::RootParentRefusal::NotAPlainDirectory => {
+            "ジャンクション・シンボリックリンク（reparse point）か、フォルダではありません"
+                .to_string()
+        }
+        guard::RootParentRefusal::NetworkOrSpecial => {
+            "ネットワークの場所か特殊なパスです".to_string()
+        }
+        guard::RootParentRefusal::InsideProtected(folder) => format!(
+            "OS・プログラムの置き場か共有のフォルダ（{}）の中です",
+            folder.display()
+        ),
+    }
+}
+
+/// 無いフォルダを、**確かめ済みの親のハンドルを基準に相対で**作る（#642。#626 PR-B の
+/// banto-hub-elev と同じ形）。作るときの DACL は SYSTEM・Administrators だけ
+/// （[`DirAccess::service_only`]。利用者の「変更」は、本当のパスを確かめた後に呼ぶ側が
+/// reset で付ける）。パスを解決し直さないので、確かめた後に親の祖先や親そのものを
+/// ジャンクションにすり替えられても、外にフォルダはできない。
+///
+/// - ルート（[`Parent::RootParent`]）: 親を**パスで辿らずに開き**、
+///   [`guard::check_root_parent`]（本当のパスの一致・reparse point でないフォルダ・
+///   ネットワークでない・OS とプログラムの置き場の中でない）を通してから作る。親が
+///   無ければ**何も作らずに** [`EXIT_PRECONDITION`]（前提が無い。親から作ることはしない）、
+///   開けない・確かめが通らなければ [`EXIT_FAILED`]。
+/// - 作ろうとしたら既にあった（確かめてから作るまでの間に誰かが作った）なら、パスでは
+///   なく親のハンドルから相対で辿らずに開き直す（呼ぶ側が本当のパス・属性・所有者で
+///   確かめる）。
+///
+/// 返すのは開いたフォルダと、自分で作ったか。
+fn create_in_parent<O: ElevOps>(
+    ops: &O,
+    kind: DataDir,
+    dir: &Path,
+    parent: Parent<'_, O::Pinned>,
+    known: &KnownFolders,
+    out: Out<'_>,
+) -> Result<(O::Pinned, bool), i32> {
+    let refuse = |out: Out<'_>, text: String| {
+        out(err(&text));
+        Err(EXIT_FAILED)
+    };
+    let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return refuse(
+            out,
+            format!("{}（{}）の名前が分かりません", kind.label(), dir.display()),
+        );
+    };
+    let service_only = DirAccess::service_only();
+    let create_or_open = |parent: &O::Pinned| match ops.create_child(parent, name, &service_only) {
+        Ok(Some(pinned)) => Ok(Some((pinned, true))),
+        Ok(None) => ops
+            .open_child(parent, name)
+            .map(|found| found.map(|pinned| (pinned, false)))
+            .map_err(|error| (false, error)),
+        Err(error) => Err((true, error)),
+    };
+    let made = match parent {
+        Parent::Pinned(parent) => create_or_open(parent),
+        Parent::RootParent(slot) => {
+            let Some(parent_dir) = dir.parent() else {
+                return refuse(
+                    out,
+                    format!("{}（{}）の親が分かりません", kind.label(), dir.display()),
+                );
+            };
+            let parent_pinned = match ops.pin_dir(parent_dir) {
+                Ok(Some(pinned)) => pinned,
+                Ok(None) => {
+                    out(err(&format!(
+                        "{}（{}）の親（{}）がありません。親から作ることはしません（親のフォルダを作ってから、もう一度実行してください）",
+                        kind.label(),
+                        dir.display(),
+                        parent_dir.display()
+                    )));
+                    return Err(EXIT_PRECONDITION);
+                }
+                Err(error) => {
+                    return refuse(
+                        out,
+                        format!(
+                            "{}（{}）の親（{}）を開けませんでした: {error}",
+                            kind.label(),
+                            dir.display(),
+                            parent_dir.display()
+                        ),
+                    )
+                }
+            };
+            let real = parent_pinned.final_path();
+            if let Err(refusal) =
+                guard::check_root_parent(&real, parent_dir, &parent_pinned.info(), known)
+            {
+                return refuse(
+                    out,
+                    format!(
+                        "{}（{}）の親（{}）は{}。何も作らずに止めます",
+                        kind.label(),
+                        dir.display(),
+                        parent_dir.display(),
+                        root_parent_text(&real, &refusal)
+                    ),
+                );
+            }
+            let made = create_or_open(&parent_pinned);
+            *slot = Some(parent_pinned);
+            made
+        }
+    };
+    match made {
+        Ok(Some(found)) => Ok(found),
+        Ok(None) => refuse(
+            out,
+            format!(
+                "{}（{}）を作ろうとしたら既にあり、開き直すと無くなっていました。止めます",
+                kind.label(),
+                dir.display()
+            ),
+        ),
+        Err((true, error)) => refuse(
+            out,
+            format!(
+                "{}（{}）を作れませんでした: {error}",
+                kind.label(),
+                dir.display()
+            ),
+        ),
+        Err((false, error)) => refuse(
+            out,
+            format!(
+                "{}（{}）を開けませんでした: {error}",
+                kind.label(),
+                dir.display()
+            ),
+        ),
+    }
+}
+
 /// `service-install` の前の、ルートの用意と確かめ（監査 B4）。**無ければ elev 自身が先に
-/// 作る**（`create_dir_if_absent`、インストール利用者の `DirAccess` の保護された DACL）。
-/// 確かめてから登録の手順が作るまでの間に、ほかの利用者が先に作る隙間を残さないため。
-/// そのうえで辿らずに開き、[`data_acl_plan`] で断る理由（作った直後にすり替えられた
-/// 場合を含む）があれば、何も登録せずに 1。開いたルートは呼ぶ側が最後の手順まで持つ。
+/// 作る**（[`create_in_parent`]: 確かめ済みの親のハンドルを基準に、SYSTEM・Administrators
+/// だけの保護された DACL で。#642）。確かめてから登録の手順が作るまでの間に、ほかの
+/// 利用者が先に作る隙間を残さないため。そのうえで本当のパスと [`data_acl_plan`] で断る
+/// 理由があれば、何も登録せずに 1（親が無ければ 2）。開いたルート（と、作ったときは
+/// ルートの親）は呼ぶ側が最後の手順まで持つ。
 fn preflight_root<O: ElevOps>(
     ops: &O,
     root: &Path,
@@ -738,46 +919,32 @@ fn preflight_root<O: ElevOps>(
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
     out: Out<'_>,
-) -> Result<O::Pinned, i32> {
-    let pin = |out: Out<'_>| {
-        ops.pin_dir(root).map_err(|error| {
+) -> Result<(O::Pinned, Option<O::Pinned>), i32> {
+    let access = DirAccess::with_install_user(install_user.clone());
+    let mut root_parent = None;
+    let (pinned, created) = match ops.pin_dir(root) {
+        Ok(Some(pinned)) => (pinned, false),
+        Ok(None) => match create_in_parent(
+            ops,
+            DataDir::Root,
+            root,
+            Parent::RootParent(&mut root_parent),
+            known,
+            out,
+        ) {
+            Ok(found) => found,
+            Err(code) => {
+                out(err("（何も登録していません）"));
+                return Err(code);
+            }
+        },
+        Err(error) => {
             out(err(&format!(
                 "{}（{}）を開けませんでした: {error}（何も登録していません）",
                 DataDir::Root.label(),
                 root.display()
             )));
-            EXIT_FAILED
-        })
-    };
-    let access = DirAccess::with_install_user(install_user.clone());
-    let mut created = false;
-    let pinned = match pin(out)? {
-        Some(pinned) => pinned,
-        None => {
-            created = true;
-            // 監査 Must（オーナー案 a）: **作るときは SYSTEM・Administrators だけ**で作る
-            // （利用者の「変更」は、本当のパスを確かめた後に reset で付ける）。途中の要素の
-            // ジャンクションや、作った直後のその場のすり替えの先に、利用者が書けるフォルダを
-            // 残さないため。
-            if let Err(error) = ops.create_dir(root, &DirAccess::service_only()) {
-                out(err(&format!(
-                    "{}（{}）を作れませんでした: {error}（何も登録していません）",
-                    DataDir::Root.label(),
-                    root.display()
-                )));
-                return Err(EXIT_FAILED);
-            }
-            match pin(out)? {
-                Some(pinned) => pinned,
-                None => {
-                    out(err(&format!(
-                        "{}（{}）を作った後に開けませんでした（何も登録していません）",
-                        DataDir::Root.label(),
-                        root.display()
-                    )));
-                    return Err(EXIT_FAILED);
-                }
-            }
+            return Err(EXIT_FAILED);
         }
     };
     // 本当のパスが期待（root）と同じ場所で、既知のシステムフォルダに重ならないこと
@@ -813,11 +980,14 @@ fn preflight_root<O: ElevOps>(
             }
         }
     }
-    Ok(pinned)
+    Ok((pinned, root_parent))
 }
 
-/// 断ったとき、自分で作った（SYSTEM・Administrators だけの）フォルダが残っていることを
-/// 伝える 1 行（監査 Must。利用者の「変更」は付いていない）。
+/// 断ったとき、**自分で作った**（SYSTEM・Administrators だけの）フォルダが残っていることを
+/// 伝える 1 行（監査 Must。利用者の「変更」は付いていない）。#642 で作るのは確かめ済みの
+/// 親のハンドルを基準にした相対だけになったので、残るのは期待の場所（確かめた親の中）で、
+/// 外には残らない。作った直後の確かめ（本当のパス・[`data_acl_plan`]）で断ったときにだけ
+/// 出る（banto-hub-elev の `Created::notice` と同じ）。
 fn left_behind_notice(created: bool, kind: DataDir, dir: &Path, out: Out<'_>) {
     if created {
         out(err(&format!(
@@ -967,8 +1137,9 @@ impl DataDir {
     }
 }
 
-/// 1 つのフォルダを扱う。無ければ作る（`create_if_absent`）か何もしない。あれば
-/// 辿らずに開いて [`data_acl_plan`] のとおり書き直すか止める。開いたフォルダは返して、
+/// 1 つのフォルダを扱う。あれば辿らずに開き、無ければ作る（`create_if_absent`。
+/// [`create_in_parent`]: `parent` のハンドルを基準に相対で、#642）か何もしない。そのうえで
+/// 本当のパスと [`data_acl_plan`] のとおり書き直すか止める。開いたフォルダは返して、
 /// 呼ぶ側が全部の手順が終わるまで持つ（下のフォルダを扱う間に名前を変えさせない）。
 #[allow(clippy::too_many_arguments)]
 fn grant_dir<O: ElevOps>(
@@ -976,6 +1147,7 @@ fn grant_dir<O: ElevOps>(
     kind: DataDir,
     dir: &Path,
     expected: &Path,
+    parent: Parent<'_, O::Pinned>,
     known: &KnownFolders,
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
@@ -984,92 +1156,63 @@ fn grant_dir<O: ElevOps>(
     out: Out<'_>,
 ) -> Result<Option<O::Pinned>, i32> {
     let access = DirAccess::with_install_user(install_user.clone());
-    let mut created = false;
-    let mut tried_create = false;
-    // 1 回目に無ければ作り、2 回目で開いて確かめる（作る前に誰かが作ったときも同じ）。
-    // 作ってもまだ無ければ（作った直後に消された）、作り直さずに止める。
-    loop {
-        let pinned = ops.pin_dir(dir).map_err(|error| {
+    let (pinned, created) = match ops.pin_dir(dir) {
+        Ok(Some(pinned)) => (pinned, false),
+        Ok(None) if !create_if_absent => {
+            out(out_line(&format!(
+                "{}（{}）はまだありません（エンジンが初めて使うときに作ります）",
+                kind.label(),
+                dir.display()
+            )));
+            return Ok(None);
+        }
+        // 監査 Must（オーナー案 a）: 作るときは SYSTEM・Administrators だけ。利用者の
+        // 「変更」は、本当のパスを確かめた後の reset で付ける。
+        Ok(None) => create_in_parent(ops, kind, dir, parent, known, out)?,
+        Err(error) => {
             out(err(&format!(
                 "{}（{}）を開けませんでした: {error}",
                 kind.label(),
                 dir.display()
             )));
-            EXIT_FAILED
-        })?;
-        let Some(pinned) = pinned else {
-            if tried_create {
-                break;
-            }
-            if !create_if_absent {
-                out(out_line(&format!(
-                    "{}（{}）はまだありません（エンジンが初めて使うときに作ります）",
-                    kind.label(),
-                    dir.display()
-                )));
-                return Ok(None);
-            }
-            // 監査 Must（オーナー案 a）: 作るときは SYSTEM・Administrators だけ。利用者の
-            // 「変更」は、本当のパスを確かめた後の reset で付ける。
-            created = ops
-                .create_dir(dir, &DirAccess::service_only())
-                .map_err(|error| {
-                    out(err(&format!(
-                        "{}（{}）を作れませんでした: {error}",
-                        kind.label(),
-                        dir.display()
-                    )));
-                    EXIT_FAILED
-                })?;
-            tried_create = true;
-            continue;
-        };
-        // 本当のパスが期待と同じ場所で、既知のシステムフォルダに重ならないこと（監査
-        // Must 1。途中の要素のジャンクション・8.3 の短い名前・ルートの祖先のすり替えを塞ぐ）。
-        if let Err(code) = verify_final_path(&pinned, kind, expected, known, out) {
-            left_behind_notice(created, kind, dir, out);
-            return Err(code);
+            return Err(EXIT_FAILED);
         }
-        let info = pinned.info();
-        match data_acl_plan(&DirState::Present(info), install_user, elevated_user) {
-            Err(refusal) => {
-                out(err(&refusal_line(kind, dir, &refusal)));
-                left_behind_notice(created, kind, dir, out);
-                return Err(EXIT_FAILED);
-            }
-            // 確かめが通ったら利用者の「変更」を付ける（作った直後なら SYSTEM・Administrators
-            // だけの DACL に足す。既にあったフォルダはここで期待の形に書き直す）。
-            Ok(_) => {
-                let skips = pinned.reset_acl(&access, recurse).map_err(|error| {
-                    out(err(&format!(
-                        "{}（{}）の ACL を書き直せませんでした: {error}",
-                        kind.label(),
-                        dir.display()
-                    )));
-                    EXIT_FAILED
-                })?;
-                let what = if created {
-                    "作りました"
-                } else {
-                    "ACL を書き直しました"
-                };
-                out(out_line(&format!(
-                    "{}: {}（{what}。SYSTEM・Administrators にフル、インストール利用者 {} に変更、親から継承しない）",
-                    kind.label(),
-                    dir.display(),
-                    install_user.as_str()
-                )));
-                emit_skips(kind, &skips, out);
-                return Ok(Some(pinned));
-            }
-        }
+    };
+    // 本当のパスが期待と同じ場所で、既知のシステムフォルダに重ならないこと（監査
+    // Must 1。途中の要素のジャンクション・8.3 の短い名前・ルートの祖先のすり替えを塞ぐ）。
+    if let Err(code) = verify_final_path(&pinned, kind, expected, known, out) {
+        left_behind_notice(created, kind, dir, out);
+        return Err(code);
     }
-    out(err(&format!(
-        "{}（{}）を作った後に開けませんでした",
+    let info = pinned.info();
+    if let Err(refusal) = data_acl_plan(&DirState::Present(info), install_user, elevated_user) {
+        out(err(&refusal_line(kind, dir, &refusal)));
+        left_behind_notice(created, kind, dir, out);
+        return Err(EXIT_FAILED);
+    }
+    // 確かめが通ったら利用者の「変更」を付ける（作った直後なら SYSTEM・Administrators
+    // だけの DACL に足す。既にあったフォルダはここで期待の形に書き直す）。
+    let skips = pinned.reset_acl(&access, recurse).map_err(|error| {
+        out(err(&format!(
+            "{}（{}）の ACL を書き直せませんでした: {error}",
+            kind.label(),
+            dir.display()
+        )));
+        EXIT_FAILED
+    })?;
+    let what = if created {
+        "作りました"
+    } else {
+        "ACL を書き直しました"
+    };
+    out(out_line(&format!(
+        "{}: {}（{what}。SYSTEM・Administrators にフル、インストール利用者 {} に変更、親から継承しない）",
         kind.label(),
-        dir.display()
+        dir.display(),
+        install_user.as_str()
     )));
-    Err(EXIT_FAILED)
+    emit_skips(kind, &skips, out);
+    Ok(Some(pinned))
 }
 
 /// 書き直さずに止めたときの 1 行（純関数）。
@@ -1110,8 +1253,10 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
     // 開いたフォルダは最後まで持つ（ルート → secrets → hub-keys の順）。ルートを開いた
     // ら、下の期待のパスは**ルートの本当のパス**から組み立てる（ルートの祖先がジャンク
     // ションでも、下を「本当のルート\secrets」と比べれば、別の場所を開かされていたら
-    // 気づく。監査 Must 1）。
-    let mut held = Vec::new();
+    // 気づく。監査 Must 1）。無いフォルダは、確かめ済みの 1 つ上のハンドルを基準に作る
+    // （ルートは、辿らずに開いて確かめたルートの親のハンドル。#642）。
+    let mut root_parent: Option<O::Pinned> = None;
+    let mut held: Vec<O::Pinned> = Vec::new();
     let mut real_root: Option<PathBuf> = None;
     // ルートは中まで再帰する。`secrets`・`hub-keys` はルートの再帰で既に書かれているので、
     // その層では対象そのものだけ書く（監査 Nit 3。同じ部分木を最大 3 回書かない）。
@@ -1145,11 +1290,26 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
                 .as_ref()
                 .map_or_else(|| dir.clone(), |r| r.join("secrets").join("hub-keys")),
         };
+        let parent = match (kind, held.last()) {
+            (DataDir::Root, _) => Parent::RootParent(&mut root_parent),
+            (_, Some(up)) => Parent::Pinned(up),
+            // 1 つ上（ルート・secrets）は作るか開けていなければ先に止まっているので、
+            // ここには来ない（来たら止める側に倒す）。
+            (_, None) => {
+                out(err(&format!(
+                    "{}（{}）の 1 つ上のフォルダを開いていません。止めます",
+                    kind.label(),
+                    dir.display()
+                )));
+                return EXIT_FAILED;
+            }
+        };
         match grant_dir(
             ops,
             kind,
             &dir,
             &expected,
+            parent,
             &known,
             &sid,
             elevated_user,
@@ -1167,7 +1327,9 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
             Err(code) => return code,
         }
     }
-    drop(held);
+    // 開いた順の逆に閉じる（hub-keys → secrets → ルート → ルートの親）。
+    while held.pop().is_some() {}
+    drop(root_parent);
     EXIT_OK
 }
 

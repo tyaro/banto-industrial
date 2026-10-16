@@ -598,7 +598,8 @@ impl PinnedDir {
     /// 返す（#626 PR-B の再レビュー 1）。既にあれば `Ok(None)`（作らない）。
     ///
     /// `NtCreateFile` の `ObjectAttributes.RootDirectory` にこのハンドル、名前は `name`
-    /// 1 要素（区切り・`:`・`.`/`..` は断る）、`FILE_CREATE | FILE_DIRECTORY_FILE |
+    /// 1 要素（[`guard::is_plain_child_name`] が断るもの - 区切り・`:`・`.`/`..`・末尾の `.` と
+    /// 空白・`* ? < > | "`・予約デバイス名 - は断る）、`FILE_CREATE | FILE_DIRECTORY_FILE |
     /// FILE_OPEN_REPARSE_POINT` で作る。**パスを解決し直さない**ので、このフォルダの
     /// 祖先をジャンクションにすり替えられても、作るのはこのフォルダの中だけ。
     /// `access` が `Some` なら作るのと同時にその保護された DACL を付け（作ってから付ける
@@ -611,6 +612,19 @@ impl PinnedDir {
         access: Option<&DirAccess>,
     ) -> Result<Option<PinnedDir>> {
         imp::create_child_dir(self, name, access)
+    }
+
+    /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の子を**相対で辿らずに**
+    /// 開く（#641 のオーナーレビュー Nit 5）。無ければ `Ok(None)`。
+    ///
+    /// [`PinnedDir::create_child_dir`] と同じ作り（`NtCreateFile` の
+    /// `ObjectAttributes.RootDirectory` にこのハンドル、`FILE_OPEN | FILE_OPEN_REPARSE_POINT`、
+    /// 名前の確かめも同じ）で、**パスを解決し直さない**。作ろうとしたら既にあった
+    /// （`create_child_dir` が `Ok(None)`）子を、パスで開き直す代わりに使う（パスで開き直すと、
+    /// その間に祖先をすり替えられたとき別の場所を開く）。子がジャンクション・ファイルでも
+    /// 辿らずにそのものを開くので、呼ぶ側が [`PinnedDir::info`] で断る（[`pin_dir`] と同じ）。
+    pub fn open_child_dir(&self, name: &str) -> Result<Option<PinnedDir>> {
+        imp::open_child_dir(self, name)
     }
 }
 
@@ -1634,14 +1648,45 @@ mod imp {
         name: &str,
         access: Option<&DirAccess>,
     ) -> Result<Option<super::PinnedDir>> {
+        child_relative(parent, name, ChildHow::Create(access))
+    }
+
+    /// [`super::PinnedDir::open_child_dir`] の本体。
+    pub(super) fn open_child_dir(
+        parent: &super::PinnedDir,
+        name: &str,
+    ) -> Result<Option<super::PinnedDir>> {
+        child_relative(parent, name, ChildHow::Open)
+    }
+
+    /// [`child_relative`] が作るか開くか。
+    #[derive(Clone, Copy)]
+    enum ChildHow<'a> {
+        /// `FILE_CREATE | FILE_DIRECTORY_FILE`（既にあれば `Ok(None)`）。`Some` ならその
+        /// 保護された DACL を作るのと同時に付ける。
+        Create(Option<&'a DirAccess>),
+        /// `FILE_OPEN`（無ければ `Ok(None)`）。フォルダに限らない（ファイルでも開いて、
+        /// 呼ぶ側が `PinnedDirInfo::is_dir` で断る - [`pin_dir`] と同じ）。
+        Open,
+    }
+
+    /// 開いている `parent` を `RootDirectory` に、名前 1 要素の子を `NtCreateFile` で作るか
+    /// 開く（`FILE_OPEN_REPARSE_POINT`。パスを解決し直さず、子がリンクでも辿らない）。
+    /// 返すハンドルは [`pin_dir`] と同じ権利（`WRITE_DAC | WRITE_OWNER` を含む）・共有
+    /// （削除なし）で開く。
+    fn child_relative(
+        parent: &super::PinnedDir,
+        name: &str,
+        how: ChildHow<'_>,
+    ) -> Result<Option<super::PinnedDir>> {
         use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
         use windows_sys::Wdk::Storage::FileSystem::{
-            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT,
+            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
             FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
         };
         use windows_sys::Win32::Foundation::{
             RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, STATUS_OBJECT_NAME_COLLISION,
-            UNICODE_STRING,
+            STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
         };
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
@@ -1651,12 +1696,10 @@ mod imp {
 
         /// `ERROR_INVALID_NAME`。
         const ERROR_INVALID_NAME: u32 = 123;
-        let bad_name = name.is_empty()
-            || name.chars().all(|c| c == '.')
-            || name
-                .chars()
-                .any(|c| matches!(c, '\\' | '/' | ':' | '\0') || c.is_control());
-        if bad_name {
+        // `NtCreateFile` は Win32 の正規化を通らないので、Win32 から見ると別の名前・別の
+        // 物になるもの（末尾の `.` と空白・ワイルドカード・予約デバイス名など）も断る
+        // （#641 のオーナーレビュー Nit 2）。
+        if !super::guard::is_plain_child_name(name) {
             return Err(api("CreateChildDir(name)", ERROR_INVALID_NAME));
         }
         let wide_name: Vec<u16> = name.encode_utf16().collect();
@@ -1667,7 +1710,14 @@ mod imp {
             MaximumLength: bytes,
             Buffer: wide_name.as_ptr() as *mut u16,
         };
-        let descriptor = access.map(descriptor).transpose()?;
+        let (descriptor, disposition, kind_option) = match how {
+            ChildHow::Create(access) => (
+                access.map(descriptor).transpose()?,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE,
+            ),
+            ChildHow::Open => (None, FILE_OPEN, 0),
+        };
         let attributes = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: parent.handle.raw(),
@@ -1699,8 +1749,8 @@ mod imp {
                 std::ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_CREATE,
-                FILE_DIRECTORY_FILE
+                disposition,
+                kind_option
                     | FILE_OPEN_REPARSE_POINT
                     | FILE_SYNCHRONOUS_IO_NONALERT
                     | FILE_OPEN_FOR_BACKUP_INTENT,
@@ -1708,7 +1758,13 @@ mod imp {
                 0,
             )
         };
-        if status == STATUS_OBJECT_NAME_COLLISION {
+        let absent = match how {
+            ChildHow::Create(_) => status == STATUS_OBJECT_NAME_COLLISION,
+            ChildHow::Open => {
+                status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
+            }
+        };
+        if absent {
             return Ok(None);
         }
         if status < 0 {
@@ -3347,15 +3403,60 @@ mod tests {
             let dacl = read_dir_dacl(&root.path().join("locked")).unwrap();
             assert!(dacl.protected, "{dacl:?}");
             assert!(parent.create_child_dir("plain", None).unwrap().is_none());
-            for bad in ["", ".", "..", "a\\b", "a/b", "c:", "x:y"] {
+            // #641 のオーナーレビュー Nit 2: `NtCreateFile` は Win32 の正規化を通らないので、
+            // 末尾の `.` と空白・予約デバイス名（`COM0`・`LPT0` を含む）・Win32 で使えない
+            // 文字も断る（確かめを外すと、`x.`・`nul` などは本当に作れてしまう）。
+            for bad in [
+                "", ".", "..", "a\\b", "a/b", "c:", "x:y", "x.", "x ", "x. ", "nul", "COM0",
+                "lpt0", "con.txt", "a*", "a?", "a<b", "a>b", "a|b", "a\"b",
+            ] {
                 assert!(parent.create_child_dir(bad, None).is_err(), "{bad:?}");
+                assert!(parent.open_child_dir(bad).is_err(), "{bad:?}");
             }
+            assert_eq!(
+                std::fs::read_dir(root.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["locked", "plain"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                "断った名前で何かが作られた"
+            );
             drop((child, locked));
             // 片付け（保護された子は自分に権利が無いので、所有者として DACL を戻す）。
             set_dacl_sddl(
                 &root.path().join("locked"),
                 &format!("D:(A;OICI;FA;;;{})", me().as_str()),
             );
+        }
+
+        /// #641 のオーナーレビュー Nit 5: 確かめ済みの親のハンドルを基準に、既にある子を相対で
+        /// 辿らずに開く。無ければ `None`、ファイル・ジャンクションでもそのものを開く（呼ぶ側が
+        /// 属性で断る）。開いた子は親の本当のパス + 名前。
+        #[test]
+        fn open_child_dir_opens_relative_to_the_handle_without_following() {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("sub")).unwrap();
+            std::fs::write(root.path().join("file.txt"), b"x").unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            junction(&root.path().join("link"), outside.path());
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+
+            let sub = parent.open_child_dir("sub").unwrap().unwrap();
+            assert_eq!(sub.final_path(), parent.final_path().join("sub"));
+            assert!(sub.info().is_dir && !sub.info().is_reparse_point);
+            assert!(parent.open_child_dir("missing").unwrap().is_none());
+            let file = parent.open_child_dir("file.txt").unwrap().unwrap();
+            assert!(!file.info().is_dir);
+            let link = parent.open_child_dir("link").unwrap().unwrap();
+            assert!(link.info().is_reparse_point, "{link:?}");
+            assert_eq!(link.final_path(), parent.final_path().join("link"));
+            // 開いている間は消せない（共有に削除を含めない）。
+            assert!(std::fs::remove_dir(root.path().join("sub")).is_err());
+            drop((sub, file, link, parent));
+            std::fs::remove_dir(root.path().join("link")).unwrap();
         }
 
         /// 再レビュー 1: 親を開いて持ったまま、その場で FSCTL で外へのジャンクションに

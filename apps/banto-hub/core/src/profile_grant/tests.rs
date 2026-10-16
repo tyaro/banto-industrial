@@ -162,6 +162,12 @@ struct FakeOps {
     dirs: RefCell<HashMap<PathBuf, FakeDir>>,
     /// `create_dir`が作るフォルダ（既定は Administrators 所有。すり替えの再現に使う）。
     on_create: RefCell<HashMap<PathBuf, FakeDir>>,
+    /// `create_child`の直前に誰かが作っていた段（`create_child`は`Ok(None)`を返す）。
+    /// 親のハンドルから相対で開いたとき（`open_child`）だけ見え、パスで開くと見えない
+    /// （その間にパスが別の場所を指すようになった、の再現。#641 Nit 5）。
+    appear_on_create: RefCell<HashMap<PathBuf, FakeDir>>,
+    /// `appear_on_create`から移した、相対で開くときだけ見える段。
+    relative_only: RefCell<HashMap<PathBuf, FakeDir>>,
     /// `pin_file`が開けるファイル。
     files: RefCell<HashMap<PathBuf, FileFacts>>,
     log: Log,
@@ -218,6 +224,8 @@ impl FakeOps {
             in_use: Ok(false),
             dirs: RefCell::new(HashMap::new()),
             on_create: RefCell::new(HashMap::new()),
+            appear_on_create: RefCell::new(HashMap::new()),
+            relative_only: RefCell::new(HashMap::new()),
             files: RefCell::new(HashMap::new()),
             log: Rc::new(RefCell::new(Vec::new())),
         };
@@ -331,6 +339,10 @@ impl HubElevOps for FakeOps {
         if self.dirs.borrow().contains_key(&dir) {
             return Ok(None);
         }
+        if let Some(raced) = self.appear_on_create.borrow_mut().remove(&dir) {
+            self.relative_only.borrow_mut().insert(dir, raced);
+            return Ok(None);
+        }
         let made = self
             .on_create
             .borrow_mut()
@@ -340,6 +352,23 @@ impl HubElevOps for FakeOps {
         Ok(Some(FakePinned {
             path: dir,
             dir: made,
+            log: self.log.clone(),
+        }))
+    }
+    fn open_child(&self, parent: &FakePinned, name_: &str) -> Result<Option<FakePinned>, String> {
+        let dir = parent.path.join(name_);
+        self.log
+            .borrow_mut()
+            .push(format!("open {} under {}", name_, name(&parent.path)));
+        let found = self
+            .relative_only
+            .borrow()
+            .get(&dir)
+            .cloned()
+            .or_else(|| self.dirs.borrow().get(&dir).cloned());
+        Ok(found.map(|d| FakePinned {
+            path: dir,
+            dir: d,
             log: self.log.clone(),
         }))
     }
@@ -404,6 +433,9 @@ fn strict_profile_id_table() {
         ("Con", Err(E::Reserved)),
         ("COM1", Err(E::Reserved)),
         ("lpt9", Err(E::Reserved)),
+        // #641 のオーナーレビュー Nit 4: `COM0`・`LPT0` も予約名。
+        ("COM0", Err(E::Reserved)),
+        ("lpt0", Err(E::Reserved)),
     ];
     for (id, expected) in cases {
         assert_eq!(validate_strict_profile_id(id), expected, "{id:?}");
@@ -724,6 +756,62 @@ fn created_then_refused_leaves_a_notice_and_does_not_reset() {
         .iter()
         .all(|l| l.contains("親から継承した DACL のまま")));
     assert!(!ops.calls().iter().any(|c| c == "pin default"));
+}
+
+/// #641 のオーナーレビュー Nit 5: 確かめてから作るまでの間に誰かが作っていた段（`create_child`
+/// が`Ok(None)`）は、パスではなく**親のハンドルから相対で**開き直す。偽物では、その段は
+/// 相対で開いたときだけ見え、パスで開くと見えない（パスが別の場所を指すようになった）ので、
+/// パスで開き直すと「無くなっていました」で断る。
+#[test]
+fn a_level_created_by_someone_else_is_reopened_relative_to_the_parent() {
+    let ops = FakeOps::new();
+    ops.dirs.borrow_mut().remove(&profile());
+    ops.appear_on_create
+        .borrow_mut()
+        .insert(profile(), FakeDir::owned_by(ME));
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert_eq!(
+        ops.calls(),
+        vec![
+            "in_use default",
+            "pin BantoHub",
+            "pin profiles",
+            "pin default",
+            "create default under profiles ServiceOnly",
+            // パスで開き直さない（`pin default`は 1 回だけ）。
+            "open default under profiles",
+            "read_dacl default",
+            &format!("reset default [{ME}]"),
+            "drop default",
+            "drop profiles",
+            "drop BantoHub",
+            "drop hold default",
+        ]
+    );
+    // 自分で作ったものではないので「作りました」ではない。
+    assert!(lines[0].contains(": ACL を書き直しました（"), "{lines:#?}");
+
+    // ルートの段（親はルートの親のハンドル）も同じ。
+    let ops = FakeOps::new();
+    ops.remove_tree();
+    ops.appear_on_create
+        .borrow_mut()
+        .insert(root(), FakeDir::owned_by(ME));
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    let calls = ops.calls();
+    assert_eq!(
+        calls[..5],
+        [
+            "in_use default",
+            "pin BantoHub",
+            "pin ProgramData",
+            "create BantoHub under ProgramData Inherit",
+            "open BantoHub under ProgramData",
+        ]
+    );
+    assert_eq!(calls.iter().filter(|c| *c == "pin BantoHub").count(), 1);
 }
 
 /// 各段の断る分岐（本当のパス・reparse point・フォルダでない・所有者・開けない・
