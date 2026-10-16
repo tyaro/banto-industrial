@@ -85,27 +85,50 @@
 //!   **開いたハンドルから**読む。ハンドルは `FILE_LIST_DIRECTORY` を求め
 //!   （データのアクセスを求めないハンドルは共有の確かめに加わらない）、
 //!   `FILE_SHARE_DELETE` を渡さずに開くので、持っている間は誰もそのディレクトリを消す・名前を変える（= 確かめた後に
-//!   ジャンクションへすり替える）ことができない。`PinnedDir::reset_acl` はその
-//!   間にパスで [`reset_dir_acl`] と同じ DACL を書き、**所有者も
-//!   `BUILTIN\Administrators` に移す**（監査 B5、2026-10-16 オーナー決定。所有者は
+//!   ジャンクションへすり替える）ことができない。さらに `WRITE_DAC | WRITE_OWNER` を
+//!   求め、`PinnedDir::reset_acl` は**そのハンドルで** `SetSecurityInfo`（DACL と所有者）を
+//!   書く（監査 B2。パスで `SetNamedSecurityInfoW` を呼ぶと、名前の変更・削除は止められても、
+//!   `FILE_WRITE_ATTRIBUTES` は共有の確かめに加わらないので、確かめた後に**その場で**
+//!   `FSCTL_SET_REPARSE_POINT` でジャンクションにされ、書き直しがその先へ向きうる。
+//!   ハンドルに書けば、その場でリンクにされても書き換わるのはリンクそのものだけ -
+//!   ハンドルは `OPEN_REPARSE_POINT` で開いているため。テスト
+//!   `reset_acl_on_a_handle_turned_into_a_junction_stays_on_the_link`）。あわせて
+//!   **所有者を `BUILTIN\Administrators` に移す**（監査 B5、2026-10-16 オーナー決定。所有者は
 //!   DACL に関わらず ACL を変えられるので、インストール利用者が所有者のままだと書き
 //!   直した DACL を本人が広げられる。昇格した管理者のトークンの Administrators は
 //!   所有者にできる属性を持つので特権は要らない。昇格していなければ
 //!   `ERROR_INVALID_OWNER`（1307）で何も変えずに失敗することを確かめた）。パスの版の
-//!   [`reset_dir_acl`] は所有者を変えない（昇格していない呼び出し元もある）。
-//! - **中のジャンクション・ディレクトリのシンボリックリンクは辿らない**:
-//!   `SetNamedSecurityInfoW` の継承の伝播は、リンクそのもの（reparse point の
-//!   オブジェクト）の継承の ACE を書き換えるが、リンクの先（ルートの外）とその下は
-//!   変えない（テスト `propagation_does_not_follow_child_junctions_or_symlinks`）。
-//!   そのため辿らない版（ハンドルで `SetSecurityInfo` する版）は足していない。
-//! - **ハードリンクは別**: ファイルの記述子はリンクで共有されるので、ルートの中に
-//!   ルートの外のファイルへのハードリンクがあると、伝播はそのファイルの DACL を
-//!   書き換える（SYSTEM・Administrators にフル、インストール利用者に「変更」の
-//!   継承の ACE だけになる）。ただし OS のハードリンクの緩和策で、ハードリンクを
-//!   作るにはリンク先に書き込み（属性の書き込み）の権利が要る（書き込めない
-//!   ファイルへのリンクは `os error 5` で断られることを確かめた）。インストール
-//!   利用者が得られるのは、既に属性を書き込めるファイルへの「変更」だけで、
-//!   既知の制限として残す（docs/chronogazer-service-design.md §4 の B3-3b）。
+//!   [`reset_dir_acl`] は所有者を変えず、昇格していない呼び出し元（テストの片付け・
+//!   `paths` のデスクトップ経路）だけが使う。
+//! - **途中の要素のジャンクション・8.3 の短い名前も見分ける**: 開いた後に
+//!   `GetFinalPathNameByHandleW`（[`PinnedDir::final_path`]）で本当のパスを取り、呼ぶ側が
+//!   期待のパスと比べる（監査 Must 1。`FILE_FLAG_OPEN_REPARSE_POINT` が辿らないのは最後の
+//!   要素だけなので、`D:\data\ChronoGazer` の `D:\data` をジャンクションにすり替えられる
+//!   経路を、本当のパスで塞ぐ）。
+//! - **継承は自前で伝え、中のリンクは辿らない**: `SetNamedSecurityInfoW` と
+//!   `SetSecurityInfo`（ハンドル）の**自動の伝播**は、advapi がユーザーモードで木を歩いて
+//!   既にある子へ継承の ACE を書くが、**その過程で子のジャンクション・ハードリンクの
+//!   先にも書きうる**（Microsoft の仕様。#626 のオーナーレビュー P1）。そこで
+//!   `set_security_tree` は自動の伝播を使わず、対象そのものは `SetKernelObjectSecurity`
+//!   （伝播しない API）で書き、継承は自前で子へ伝える: 子を `FILE_FLAG_OPEN_REPARSE_POINT`
+//!   で辿らずに開き、**reparse point は飛ばし**（[`ResetSkips::reparse`]）、**ハードリンク
+//!   （リンク数 2 以上のファイル）も飛ばし**（[`ResetSkips::hardlink`]。記述子を共有するので
+//!   書くと木の外の名前のアクセスを変える。#624）、それ以外だけに同じ記述子を書いて、
+//!   フォルダなら子のハンドルを持ったまま再帰する。
+//!   - 【測った事実・自前の再帰】`PinnedDir::reset_acl` は、中の普通の子（孫まで）へ保護された
+//!     DACL と Administrators 所有を書き、子のジャンクションとハードリンクは飛ばして
+//!     `ResetSkips` に記録する。リンクの先（ルートの外）は変えない（テスト
+//!     `self_recursion_writes_children_and_skips_links`・`reset_acl_does_not_follow_a_child_junction`・
+//!     `reset_acl_does_not_rewrite_a_hardlink_target`・その場のすり替えは
+//!     `reset_acl_on_a_handle_turned_into_a_junction_stays_on_the_link`。所有者を移すので
+//!     昇格が要り、非管理者では 1307 で止まる - 書く側は CI で確かめる）。
+//!   - 【測った事実・OS の自動伝播】パスの版 `reset_dir_acl`（`SetNamedSecurityInfoW`）は、
+//!     既にある普通の子へ継承の ACE を OS が自動で伝える（テスト
+//!     `os_auto_propagation_reaches_existing_children`）。これが**子のリンクの先にも書きうる**
+//!     ので、昇格ヘルパーの書き直しでは使わない。
+//!   - 【仮説】自前の再帰は 1 階層ずつ、中身のあるフォルダは reparse point に変えられない・
+//!     ハンドルが名前の変更と削除を止める、という前提で、再帰の途中のすり替えも防ぐ。木の
+//!     祖先（本当のパスの上）は呼ぶ側が別に確かめる（[`PinnedDir::final_path`]）。
 //!
 //! # 非 Windows
 //!
@@ -402,12 +425,26 @@ pub struct PinnedDirInfo {
     pub owner: String,
 }
 
+/// [`PinnedDir::reset_acl`] が**触らずに飛ばした**中の子（#392 B3-3b の監査 Must 2）。
+/// 書くと木の外へ影響するので、報告だけして書き換えない。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResetSkips {
+    /// reparse point（ジャンクション・シンボリックリンクなど）。辿らず・触らない。
+    pub reparse: Vec<std::path::PathBuf>,
+    /// ハードリンク（ファイルでリンク数 2 以上）。記述子を共有するので触らない（#624）。
+    pub hardlink: Vec<std::path::PathBuf>,
+}
+
 /// パスを**辿らずに**開き、持っている間は消す・名前を変えることを誰にもさせない
 /// ディレクトリ（モジュール doc「既にあるディレクトリを直すとき」）。drop で閉じる。
 #[cfg(windows)]
 pub struct PinnedDir {
     handle: imp::OwnedHandle,
     path: std::path::PathBuf,
+    /// `GetFinalPathNameByHandleW` で解決した本当のパス（`\\?\` を外した DOS 形式。
+    /// 途中の要素のジャンクション・シンボリックリンク・8.3 の短い名前を辿った後の
+    /// 正規の姿）。呼ぶ側が期待のパスと比べる（#392 B3-3b の監査 Must 1）。
+    final_path: std::path::PathBuf,
     info: PinnedDirInfo,
 }
 
@@ -416,6 +453,7 @@ impl std::fmt::Debug for PinnedDir {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinnedDir")
             .field("path", &self.path)
+            .field("final_path", &self.final_path)
             .field("info", &self.info)
             .finish_non_exhaustive()
     }
@@ -428,30 +466,47 @@ impl PinnedDir {
         &self.path
     }
 
+    /// `GetFinalPathNameByHandleW` で解決した本当のパス（`\\?\` を外した DOS 形式）。
+    /// 途中の要素がジャンクション・シンボリックリンク・8.3 の短い名前でも、辿った後の
+    /// 正規の姿になる。呼ぶ側が期待のパスと比べて、別の場所を開かされていないかを
+    /// 確かめる（#392 B3-3b の監査 Must 1）。
+    pub fn final_path(&self) -> &std::path::Path {
+        &self.final_path
+    }
+
     /// 開いたハンドルから読んだ属性と所有者。
     pub fn info(&self) -> &PinnedDirInfo {
         &self.info
     }
 
-    /// 開いたままのパスの DACL を [`reset_dir_acl`] と同じ形に書き直し、**所有者を
-    /// `BUILTIN\Administrators` に移す**（#392 B3-3b の監査 B5、2026-10-16 オーナー決定。
-    /// 所有者は DACL に関わらず ACL を変えられるので、インストール利用者が所有者のままだと
-    /// 書き直した DACL を本人がいつでも広げられる。インストール利用者の「変更」は残る）。
-    /// 昇格した管理者のプロセスから呼ぶ（昇格していなければ `ERROR_INVALID_OWNER`
-    /// で失敗し、何も変えない）。**reparse point・ディレクトリでないものには何もせずに
-    /// 断る**（呼ぶ側の確かめに加えた多重の防御）。今の所有者を受け入れるかの確かめは
-    /// 呼ぶ側（製品の判断）。
-    pub fn reset_acl(&self, access: &DirAccess) -> Result<()> {
+    /// 開いたままの**ハンドルで**、このフォルダと中の子へ、保護された DACL と所有者
+    /// （`BUILTIN\Administrators`）を書く（#392 B3-3b の監査 Must 2・B5、2026-10-16 オーナー決定）。
+    ///
+    /// - 対象そのものは `SetKernelObjectSecurity`（**自動の継承の伝播をしない**）でハンドルに
+    ///   書く。パスではなくハンドル（`OPEN_REPARSE_POINT` で開いた）に書くので、確かめてから
+    ///   書くまでの間にその場で reparse point にされても、書き換わるのはリンクそのものだけ。
+    /// - 継承は**自前で**中の子へ伝える（`SetNamedSecurityInfoW` / `SetSecurityInfo` の自動の
+    ///   伝播は、advapi がユーザーモードで木を歩いて**子のジャンクション・ハードリンクの先にも
+    ///   書く**ため使わない）。子は `OPEN_REPARSE_POINT` で辿らずに開き、reparse point は
+    ///   飛ばし（[`ResetSkips::reparse`]）、ハードリンク（リンク数 2 以上のファイル）も
+    ///   飛ばす（[`ResetSkips::hardlink`]。記述子を共有するので、書くと木の外の名前の
+    ///   アクセスを変える。#624）。飛ばした子は返り値で報告する。
+    ///
+    /// 所有者を移すのは、所有者は DACL に関わらず ACL を変えられるため（インストール利用者が
+    /// 所有者のままだと書き直した DACL を本人が広げられる。インストール利用者の「変更」は残る）。
+    /// 昇格した管理者のプロセスから呼ぶ（昇格していなければ `ERROR_INVALID_OWNER` で失敗）。
+    /// **開いた時点で reparse point・ディレクトリでないものには何もせずに断る**（呼ぶ側の
+    /// 確かめに加えた多重の防御）。今の所有者を受け入れるかの確かめは呼ぶ側（製品の判断）。
+    pub fn reset_acl(&self, access: &DirAccess) -> Result<ResetSkips> {
         if self.info.is_reparse_point {
             return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
         }
         if !self.info.is_dir {
             return Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory));
         }
-        // `self`（= ハンドル）を借りている間に呼ぶので、書き直しの間は閉じない。
-        let _held = &self.handle;
-        reject_dot_segments(&self.path)?;
-        imp::reset_dir_acl_and_owner(&self.path, access)
+        let mut skips = ResetSkips::default();
+        imp::set_security_tree(self.handle.raw(), &self.final_path, access, &mut skips)?;
+        Ok(skips)
     }
 }
 
@@ -617,9 +672,18 @@ mod imp {
             )
         };
         if ok == 0 {
-            return Err(SecretStoreError::InvalidUserSid(
-                "この PC でアカウントを解決できません",
-            ));
+            use windows_sys::Win32::Foundation::ERROR_NONE_MAPPED;
+            let os_error = last_error();
+            // `ERROR_NONE_MAPPED`（この SID に名前が無い = アカウントではない）だけを
+            // 「アカウントでない」とみなし、それ以外（RPC 不達・アクセス拒否など）は
+            // **一時的な失敗**として別の種類で返す（#392 B3-3b の監査 Nit 2。呼ぶ側が
+            // 終了コードを 64 と 1 に分けられるように）。
+            if os_error == ERROR_NONE_MAPPED {
+                return Err(SecretStoreError::InvalidUserSid(
+                    "この PC にこの SID のアカウントがありません",
+                ));
+            }
+            return Err(api("LookupAccountSidW", os_error));
         }
         if kind != SidTypeUser {
             return Err(SecretStoreError::InvalidUserSid(
@@ -725,17 +789,11 @@ mod imp {
         check_dacl(&observed, access).map_err(SecretStoreError::AclMismatch)
     }
 
+    /// 期待の保護された DACL を**パスで**書き直す（所有者は変えない）。昇格していない
+    /// 呼び出し元（テストの片付け・`paths` のデスクトップ経路）も使う。`pin_dir` を
+    /// 持たない分、確かめてから書き直すまでの間にその場でリンクにされる余地があるので、
+    /// 昇格ヘルパーの書き直しは [`super::PinnedDir::reset_acl`]（ハンドルで書く）を使う。
     pub(super) fn reset_dir_acl(dir: &Path, access: &DirAccess) -> Result<()> {
-        set_dir_acl(dir, access, false)
-    }
-
-    /// [`reset_dir_acl`] に加えて、所有者を `BUILTIN\Administrators` に移す
-    /// （[`super::PinnedDir::reset_acl`]、#392 B3-3b の監査 B5）。
-    pub(super) fn reset_dir_acl_and_owner(dir: &Path, access: &DirAccess) -> Result<()> {
-        set_dir_acl(dir, access, true)
-    }
-
-    fn set_dir_acl(dir: &Path, access: &DirAccess, admins_owner: bool) -> Result<()> {
         if !inspect(dir)? {
             return Err(SecretStoreError::io(
                 IoOp::InspectDir,
@@ -744,43 +802,16 @@ mod imp {
         }
         ensure_user_account(access)?;
         let sd = descriptor(access)?;
-        let mut present = 0;
-        let mut defaulted = 0;
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: `sd` は直前に作った有効な記述子。`dacl` はその中を指す（解放しない）。
-        let ok =
-            unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) };
-        if ok == 0 || present == 0 || dacl.is_null() {
-            return Err(api("GetSecurityDescriptorDacl", last_error()));
-        }
-        // 所有者を移すときは Administrators の SID（LocalBox が解放）。
-        let owner = if admins_owner {
-            let text = wide_str(super::ADMINISTRATORS_SID);
-            let mut sid: PSID = std::ptr::null_mut();
-            // SAFETY: `text` は NUL 終端。成功すれば `sid` は LocalAlloc の領域。
-            if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
-                return Err(api("ConvertStringSidToSidW", last_error()));
-            }
-            Some(LocalBox(sid))
-        } else {
-            None
-        };
-        let mut info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
-        if owner.is_some() {
-            info |= OWNER_SECURITY_INFORMATION;
-        }
+        let dacl = dacl_of(&sd)?;
         let path = wide(dir);
-        // SAFETY: `path` は NUL 終端、`dacl` は `sd` が、所有者の SID は `owner` が
-        // 生きている間有効。PROTECTED_DACL で親からの継承を切る。グループ・SACL は
-        // 変えない。所有者は `admins_owner` のときだけ Administrators に移す（昇格した
-        // トークンの Administrators は所有者にできる属性を持つので特権は要らない。
-        // 昇格していなければ ERROR_INVALID_OWNER(1307) で失敗する）。
+        // SAFETY: `path` は NUL 終端、`dacl` は `sd` が生きている間有効。PROTECTED_DACL で
+        // 親からの継承を切る。所有者・グループ・SACL は変えない。
         let status = unsafe {
             SetNamedSecurityInfoW(
                 path.as_ptr(),
                 SE_FILE_OBJECT,
-                info,
-                owner.as_ref().map_or(std::ptr::null_mut(), |sid| sid.0),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 dacl,
                 std::ptr::null(),
@@ -788,6 +819,188 @@ mod imp {
         };
         if status != 0 {
             return Err(api("SetNamedSecurityInfoW", status));
+        }
+        Ok(())
+    }
+
+    /// `sd` の中の DACL のポインタ（`sd` が生きている間だけ有効。解放しない）。
+    fn dacl_of(sd: &LocalBox) -> Result<*mut ACL> {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `sd` は有効な記述子。`dacl` はその中を指す。
+        let ok =
+            unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) };
+        if ok == 0 || present == 0 || dacl.is_null() {
+            return Err(api("GetSecurityDescriptorDacl", last_error()));
+        }
+        Ok(dacl)
+    }
+
+    /// SDDL（所有者 `BUILTIN\\Administrators`・保護された DACL）から自己相対の記述子を作る。
+    fn owned_protected_sd(access: &DirAccess) -> Result<LocalBox> {
+        // `O:BA` で所有者を Administrators に、`access.sddl()` が `D:P(...)`（保護された DACL）。
+        let sddl = wide_str(&format!("O:BA{}", access.sddl()));
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `sddl` は NUL 終端。成功すれば `sd` は LocalAlloc の領域（LocalBox が解放）。
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(api(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                last_error(),
+            ));
+        }
+        Ok(LocalBox(sd))
+    }
+
+    /// 開いたハンドルの**そのオブジェクトだけ**に、所有者（Administrators）と保護された DACL を
+    /// 書く（`SetKernelObjectSecurity`、#392 B3-3b の監査 Must 2）。`SetNamedSecurityInfoW` や
+    /// `SetSecurityInfo` と違い、**自動の継承の伝播をしない**（advapi がユーザーモードで木を
+    /// 歩いて子へ書くこともしない）ので、中のジャンクション・ハードリンクの先には決して
+    /// 書かない。継承は呼ぶ側（[`set_security_tree`]）が、辿らずに開いた子へ自前で伝える。
+    /// ハンドルは `OPEN_REPARSE_POINT` で開いているので、その場で reparse point にされても
+    /// 書き換わるのはリンクそのものだけ。所有者を移すのは所有者が DACL に関わらず ACL を
+    /// 変えられるため（昇格したトークンの Administrators は所有者にできるので特権は要らない。
+    /// 昇格していなければ `ERROR_INVALID_OWNER`(1307) で失敗）。
+    fn set_object_security(handle: HANDLE, sd: &LocalBox) -> Result<()> {
+        use windows_sys::Win32::Security::SetKernelObjectSecurity;
+
+        // SAFETY: `handle` は WRITE_DAC|WRITE_OWNER で開いた有効なハンドル。`sd` は自己相対の
+        // 有効な記述子（所有者と保護された DACL を含む）。SACL は触らない。
+        let ok = unsafe {
+            SetKernelObjectSecurity(
+                handle,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                sd.0,
+            )
+        };
+        if ok == 0 {
+            return Err(api("SetKernelObjectSecurity", last_error()));
+        }
+        Ok(())
+    }
+
+    /// 辿らずに開いたハンドルの情報（[`open_no_follow`]）。
+    struct Opened {
+        handle: OwnedHandle,
+        is_dir: bool,
+        is_reparse: bool,
+        links: u32,
+    }
+
+    /// `path` を**辿らずに**（`OPEN_REPARSE_POINT`）、DACL と所有者を書ける権利で開く。
+    /// 無ければ `Ok(None)`。
+    fn open_no_follow(path: &Path) -> Result<Option<Opened>> {
+        use windows_sys::Win32::Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        };
+        let wide_path = wide(path);
+        // SAFETY: `wide_path` は NUL 終端。リンクを辿らない（OPEN_REPARSE_POINT）。共有に
+        // DELETE を含めないので、開いている間は名前の変更・削除ができない。
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC | WRITE_OWNER,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let os_error = last_error();
+            if os_error == ERROR_FILE_NOT_FOUND || os_error == ERROR_PATH_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(SecretStoreError::io(
+                IoOp::InspectDir,
+                &std::io::Error::from_raw_os_error(os_error as i32),
+            ));
+        }
+        let handle = OwnedHandle(handle);
+        // SAFETY: 全フィールドが整数の構造体。`handle` は有効。
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+            return Err(api("GetFileInformationByHandle", last_error()));
+        }
+        Ok(Some(Opened {
+            handle,
+            is_dir: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            is_reparse: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+            links: info.nNumberOfLinks,
+        }))
+    }
+
+    /// 開いた**ハンドルで**、そのオブジェクトと中の子へ、保護された DACL と所有者を書く
+    /// （[`super::PinnedDir::reset_acl`]、#392 B3-3b の監査 Must 2）。
+    ///
+    /// - 対象そのもの: `handle`（呼ぶ側が辿らずに開き、reparse でないことを確かめ済み）に
+    ///   [`set_object_security`]（自動の伝播をしない）で書く。
+    /// - 中の子: `real_dir`（`handle` の本当のパス）を列挙し、子を 1 つずつ辿らずに開いて、
+    ///   - **reparse point（ジャンクション・シンボリックリンクなど）は触らず・辿らず**、
+    ///     飛ばして [`super::ResetSkips::reparse`] に記録する。
+    ///   - **ハードリンク（ファイルでリンク数 2 以上）は触らず**、飛ばして
+    ///     [`super::ResetSkips::hardlink`] に記録する（記述子を共有するので、書くと外の
+    ///     名前のアクセスを変えてしまう。#624）。
+    ///   - それ以外は [`set_object_security`] で書き、フォルダなら**その子のハンドルを
+    ///     持ったまま**再帰する（中身のあるフォルダは reparse point に変えられない・
+    ///     ハンドルが名前の変更と削除を止めるので、再帰の間にすり替えられない）。
+    ///
+    /// 自動の伝播を使わず自前で辿らないので、木の外（リンクの先）の DACL は一切変えない。
+    pub(super) fn set_security_tree(
+        handle: HANDLE,
+        real_dir: &Path,
+        access: &DirAccess,
+        skips: &mut super::ResetSkips,
+    ) -> Result<()> {
+        ensure_user_account(access)?;
+        let sd = owned_protected_sd(access)?;
+        set_object_security(handle, &sd)?;
+        propagate(real_dir, &sd, skips)
+    }
+
+    fn propagate(dir: &Path, sd: &LocalBox, skips: &mut super::ResetSkips) -> Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => return Err(SecretStoreError::io(IoOp::InspectDir, &e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| SecretStoreError::io(IoOp::InspectDir, &e))?;
+            let child = entry.path();
+            let Some(opened) = open_no_follow(&child)? else {
+                continue; // 列挙と開くの間に消えた。
+            };
+            if opened.is_reparse {
+                skips.reparse.push(child);
+                continue; // 触らない・辿らない。
+            }
+            if !opened.is_dir && opened.links >= 2 {
+                skips.hardlink.push(child);
+                continue; // 記述子を共有するので触らない（外の名前のアクセスを変えない）。
+            }
+            set_object_security(opened.handle.raw(), sd)?;
+            if opened.is_dir {
+                // 子のハンドルを持ったまま再帰する（中身があれば reparse に変えられない・
+                // ハンドルが名前の変更と削除を止める）。
+                propagate(&child, sd, skips)?;
+            }
+            drop(opened);
         }
         Ok(())
     }
@@ -893,6 +1106,13 @@ mod imp {
     /// drop で `CloseHandle` するハンドル（[`super::PinnedDir`]）。
     pub(crate) struct OwnedHandle(HANDLE);
 
+    impl OwnedHandle {
+        /// 生のハンドル（開いている間だけ使う。閉じない）。
+        pub(crate) fn raw(&self) -> HANDLE {
+            self.0
+        }
+    }
+
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
             // SAFETY: `CreateFileW` が返した有効なハンドル。ここ以外では閉じない。
@@ -900,6 +1120,36 @@ mod imp {
                 CloseHandle(self.0);
             }
         }
+    }
+
+    /// 開いたハンドルの本当のパス（`GetFinalPathNameByHandleW`、`VOLUME_NAME_DOS` +
+    /// `FILE_NAME_NORMALIZED`）。先頭の `\\?\`（UNC は `\\?\UNC\` → `\\`）を外す。
+    fn final_path_of(handle: HANDLE) -> Result<std::path::PathBuf> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+        };
+        let flags = VOLUME_NAME_DOS | FILE_NAME_NORMALIZED;
+        // 1 回目は長さを問い合わせる（NUL を含まない文字数を返す）。
+        // SAFETY: `handle` は有効。長さ 0・NULL バッファは長さの問い合わせ。
+        let needed = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, flags) };
+        if needed == 0 {
+            return Err(api("GetFinalPathNameByHandleW", last_error()));
+        }
+        let mut buffer = vec![0u16; needed as usize + 1];
+        // SAFETY: `buffer` は `needed + 1` 文字ぶん。戻り値は NUL を含まない文字数。
+        let written = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags)
+        };
+        if written == 0 || written as usize >= buffer.len() {
+            return Err(api("GetFinalPathNameByHandleW", last_error()));
+        }
+        let text = String::from_utf16_lossy(&buffer[..written as usize]);
+        let stripped = text
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(text);
+        Ok(std::path::PathBuf::from(stripped))
     }
 
     pub(super) fn pin_dir(dir: &Path) -> Result<Option<super::PinnedDir>> {
@@ -911,7 +1161,7 @@ mod imp {
             CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
         };
 
         let path = wide(dir);
@@ -921,11 +1171,13 @@ mod imp {
         // **データのアクセス（`FILE_LIST_DIRECTORY` = `FILE_READ_DATA`）を必ず求める**:
         // 読み取り・書き込み・削除のどれも求めないハンドルは共有の確かめに加わらず、
         // 共有に DELETE を含めなくても名前の変更を止められない（テスト
-        // `a_pinned_dir_cannot_be_renamed_away_while_held` で確かめた）。
+        // `a_pinned_dir_cannot_be_renamed_away_while_held` で確かめた）。**`WRITE_DAC |
+        // WRITE_OWNER`** を求めるのは、このハンドルで `SetSecurityInfo`（DACL と所有者）を
+        // 書くため（監査 B2。パスで書くと、確かめた後にその場でリンクにされうる）。
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | WRITE_DAC | WRITE_OWNER,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -975,9 +1227,14 @@ mod imp {
         let owner = sid_string(owner)?;
         drop(sd);
 
+        // 本当のパス（途中の要素のジャンクション・8.3 の短い名前を辿った後）。`VOLUME_NAME_DOS`
+        // で `\\?\C:\…` を返すので、先頭の `\\?\`（UNC は `\\?\UNC\`）を外す。
+        let final_path = final_path_of(handle.0)?;
+
         Ok(Some(super::PinnedDir {
             handle,
             path: dir.to_path_buf(),
+            final_path,
             info: super::PinnedDirInfo {
                 is_dir: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
                 is_reparse_point: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
@@ -1524,53 +1781,6 @@ mod tests {
             assert!(status.success(), "mklink /J に失敗した");
         }
 
-        /// #392 B3-3b の反証（モジュール doc「既にあるディレクトリを直すとき」）:
-        /// ルートの DACL を書き直す伝播は、中のジャンクション・ディレクトリの
-        /// シンボリックリンクの先（ルートの外）を書き換えない。シンボリックリンクは
-        /// 作る権利（開発者モードなど）が無ければ、ジャンクションだけを確かめる。
-        #[test]
-        fn propagation_does_not_follow_child_junctions_or_symlinks() {
-            let root_parent = tempfile::tempdir().unwrap();
-            let root = root_parent.path().join("root");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(root.join("nested")).unwrap();
-            let outside_parent = tempfile::tempdir().unwrap();
-            let outside = outside_parent.path().join("outside");
-            std::fs::create_dir(&outside).unwrap();
-            std::fs::create_dir(outside.join("sub")).unwrap();
-            std::fs::write(outside.join("file.txt"), b"x").unwrap();
-            junction(&root.join("link"), &outside);
-            junction(&root.join("nested").join("deep-link"), &outside);
-            let symlink = std::os::windows::fs::symlink_dir(&outside, root.join("dsym")).is_ok();
-
-            let watched = [
-                outside.clone(),
-                outside.join("sub"),
-                outside.join("file.txt"),
-            ];
-            let before: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
-            reset_dir_acl(&root, &DirAccess::with_install_user(me())).unwrap();
-            let after: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
-            assert_eq!(
-                after, before,
-                "リンクの先の DACL が変わった（symlink: {symlink}）"
-            );
-            // ルート自身は書き直された。
-            check_dacl(
-                &read_dir_dacl(&root).unwrap(),
-                &DirAccess::with_install_user(me()),
-            )
-            .unwrap();
-
-            // 片付け（リンクだけを消す。先は消さない）。
-            std::fs::remove_dir(root.join("link")).unwrap();
-            std::fs::remove_dir(root.join("nested").join("deep-link")).unwrap();
-            if symlink {
-                std::fs::remove_dir(root.join("dsym")).unwrap();
-            }
-            assert!(outside.join("file.txt").exists());
-        }
-
         /// `pin_dir`: 無ければ `None`、普通のフォルダはディレクトリ・reparse point で
         /// ない・所有者は自分、ジャンクションは辿らずに reparse point として見え、
         /// `reset_acl` は何もせずに断る（先の DACL も変えない）。ファイルも断る。
@@ -1582,21 +1792,35 @@ mod tests {
             let plain = root.path().join("plain");
             std::fs::create_dir(&plain).unwrap();
             let pinned = pin_dir(&plain).unwrap().unwrap();
-            assert_eq!(
-                pinned.info(),
-                &PinnedDirInfo {
-                    is_dir: true,
-                    is_reparse_point: false,
-                    owner: me().as_str().to_string(),
-                }
+            assert!(pinned.info().is_dir);
+            assert!(!pinned.info().is_reparse_point);
+            // 作った直後の所有者は、作った人（一般の利用者なら自分、昇格した管理者なら
+            // 既定で Administrators）。本番の確かめ（`data_acl_plan`）はこの両方を許す。
+            // Must 3: CI の管理者で `me()` と決めつけると落ちていた。
+            assert!(
+                pinned.info().owner == me().as_str() || pinned.info().owner == ADMINISTRATORS_SID,
+                "作った直後の所有者が想定外: {:?}",
+                pinned.info()
             );
             assert_eq!(pinned.path(), plain.as_path());
+            // 本当のパス（`GetFinalPathNameByHandleW`）は、`canonicalize`（これも `\\?\` を
+            // 付ける）と、`\\?\` を外せば一致する。
+            assert_eq!(
+                pinned.final_path(),
+                std::fs::canonicalize(&plain)
+                    .unwrap()
+                    .to_string_lossy()
+                    .trim_start_matches(r"\\?\")
+                    .parse::<std::path::PathBuf>()
+                    .unwrap()
+            );
             let reset = pinned.reset_acl(&DirAccess::with_install_user(me()));
             drop(pinned);
             if is_elevated_admin() {
                 // #392 B3-3b の監査 B5: 書き直すと所有者は Administrators に移り、
-                // DACL は期待の形（インストール利用者の「変更」は残る）。
-                reset.unwrap();
+                // DACL は期待の形（インストール利用者の「変更」は残る）。子はいないので
+                // 飛ばした記録は空。
+                assert_eq!(reset.unwrap(), ResetSkips::default());
                 let dacl = read_dir_dacl(&plain).unwrap();
                 assert_eq!(dacl.owner, ADMINISTRATORS_SID, "{dacl:?}");
                 check_dacl(&dacl, &DirAccess::with_install_user(me())).unwrap();
@@ -1609,13 +1833,12 @@ mod tests {
                 assert_eq!(
                     reset,
                     Err(SecretStoreError::AclApi {
-                        call: "SetNamedSecurityInfoW",
+                        call: "SetKernelObjectSecurity",
                         os_error: 1307
                     })
                 );
                 let dacl = read_dir_dacl(&plain).unwrap();
                 assert!(!dacl.protected, "失敗したのに DACL が変わった: {dacl:?}");
-                assert_eq!(dacl.owner, me().as_str());
             }
 
             let outside = tempfile::tempdir().unwrap();
@@ -1644,6 +1867,281 @@ mod tests {
                 pin_dir(&root.path().join("x").join("..").join("plain")).unwrap_err(),
                 SecretStoreError::DotSegmentInPath
             );
+        }
+
+        /// `pin_dir` の反証（監査 Must 1）: 途中の要素がジャンクションでも、`final_path` は
+        /// 辿った後の本当のパスを返す。呼ぶ側はこれを期待のパスと比べて、別の場所を
+        /// 開かされていないか分かる。
+        #[test]
+        fn final_path_resolves_a_junction_in_the_middle() {
+            let base = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir(outside.path().join("ChronoGazer")).unwrap();
+            // base\link → outside。開くのは base\link\ChronoGazer（最後の要素ではなく
+            // 途中の link がジャンクション）。
+            junction(&base.path().join("link"), outside.path());
+            let opened = base.path().join("link").join("ChronoGazer");
+            let pinned = pin_dir(&opened).unwrap().unwrap();
+            // 開いたパス（見かけ）は base\link\ChronoGazer のまま。
+            assert_eq!(pinned.path(), opened.as_path());
+            // 本当のパスは outside\ChronoGazer（link を辿った後）。
+            let real = std::fs::canonicalize(outside.path().join("ChronoGazer")).unwrap();
+            assert_eq!(
+                pinned.final_path().to_string_lossy().to_lowercase(),
+                real.to_string_lossy()
+                    .trim_start_matches(r"\\?\")
+                    .to_lowercase()
+            );
+            assert_ne!(
+                pinned.final_path().to_string_lossy().to_lowercase(),
+                opened.to_string_lossy().to_lowercase()
+            );
+            drop(pinned);
+            std::fs::remove_dir(base.path().join("link")).unwrap();
+        }
+
+        /// 【測った事実・OS の自動伝播】パスの版 `reset_dir_acl`（`SetNamedSecurityInfoW`）は、
+        /// 書き直すと**既にある**中の普通の子へ継承の ACE を OS が自動で伝える（所有者は
+        /// 変えないので昇格は要らない）。これは `PinnedDir::reset_acl` が**使わない**経路だが、
+        /// 「OS の自動伝播は実在する（だから自前の再帰では使わない）」という前提の確認。
+        #[test]
+        fn os_auto_propagation_reaches_existing_children() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            let child = dir.join("child");
+            std::fs::create_dir(&child).unwrap();
+            let file = dir.join("f.txt");
+            std::fs::write(&file, b"x").unwrap();
+            reset_dir_acl(&dir, &DirAccess::with_install_user(me())).unwrap();
+            for path in [&child, &file] {
+                let dacl = read_dir_dacl(path).unwrap();
+                let aces = dacl.aces.as_ref().unwrap();
+                assert!(
+                    aces.iter()
+                        .any(|a| a.sid == SYSTEM_SID && a.flags & 0x10 != 0),
+                    "{}: 継承された ACE が伝わっていない: {dacl:?}",
+                    path.display()
+                );
+                assert!(aces.iter().any(|a| a.sid == me().as_str()));
+            }
+        }
+
+        /// 【測った事実・自前の再帰】`PinnedDir::reset_acl`（ハンドルの `SetKernelObjectSecurity`
+        /// ＋自前の再帰）は、中の普通の子へ保護された DACL と Administrators 所有を書き、
+        /// **子のジャンクションとハードリンクは触らず飛ばす**（`ResetSkips` に記録）。所有者を
+        /// 移すので昇格が要る。非管理者では 1307 で止まり（子を書く前）、CI で確かめる。
+        #[test]
+        fn self_recursion_writes_children_and_skips_links() {
+            if !is_elevated_admin() {
+                eprintln!(
+                    "skip self_recursion_writes_children_and_skips_links: 昇格していない（CI で確かめる）"
+                );
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            let normal = dir.join("normal");
+            std::fs::create_dir(&normal).unwrap();
+            let deep = normal.join("deep.txt");
+            std::fs::write(&deep, b"x").unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let outside_before = read_dir_dacl(outside.path()).unwrap();
+            junction(&dir.join("jlink"), outside.path());
+            let outside_file = outside.path().join("shared.txt");
+            std::fs::write(&outside_file, b"x").unwrap();
+            let outside_file_before = read_dir_dacl(&outside_file).unwrap();
+            std::fs::hard_link(&outside_file, dir.join("hard.txt")).unwrap();
+
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            let access = DirAccess::with_install_user(me());
+            let skips = pinned.reset_acl(&access).unwrap();
+            drop(pinned);
+
+            // 普通の子（孫まで）は保護された DACL ＋ Administrators 所有。
+            for path in [&dir, &normal, &deep] {
+                let dacl = read_dir_dacl(path).unwrap();
+                assert_eq!(
+                    dacl.owner,
+                    ADMINISTRATORS_SID,
+                    "{}: {dacl:?}",
+                    path.display()
+                );
+                check_dacl(&dacl, &access).unwrap();
+            }
+            // ジャンクション・ハードリンクは飛ばして記録。先は変えない。
+            assert_eq!(skips.reparse, vec![dir.join("jlink")]);
+            assert_eq!(skips.hardlink, vec![dir.join("hard.txt")]);
+            assert_eq!(read_dir_dacl(outside.path()).unwrap(), outside_before);
+            assert_eq!(read_dir_dacl(&outside_file).unwrap(), outside_file_before);
+
+            std::fs::remove_dir(dir.join("jlink")).unwrap();
+        }
+
+        /// 監査 Must 2・受入 (a): ルートの中の子のジャンクションの先（outside）の DACL は、
+        /// `reset_acl` で変わらない（昇格していれば飛ばして記録、していなければ 1307。どちらでも
+        /// outside は不変）。
+        #[test]
+        fn reset_acl_does_not_follow_a_child_junction() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("f.txt"), b"x").unwrap();
+            junction(&dir.join("jlink"), outside.path());
+            let before = read_dir_dacl(outside.path()).unwrap();
+            let before_file = read_dir_dacl(&outside.path().join("f.txt")).unwrap();
+
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            drop(pinned);
+
+            assert_eq!(read_dir_dacl(outside.path()).unwrap(), before);
+            assert_eq!(
+                read_dir_dacl(&outside.path().join("f.txt")).unwrap(),
+                before_file
+            );
+            std::fs::remove_dir(dir.join("jlink")).unwrap();
+        }
+
+        /// 監査 Must 2・受入 (b)・#624: ルートの中のハードリンク（outside のファイルへ）の
+        /// 先の DACL は、`reset_acl` で変わらない（ハードリンクは触らず飛ばす）。
+        #[test]
+        fn reset_acl_does_not_rewrite_a_hardlink_target() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("shared.txt");
+            std::fs::write(&target, b"x").unwrap();
+            let before = read_dir_dacl(&target).unwrap();
+            std::fs::hard_link(&target, dir.join("hard.txt")).unwrap();
+
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            drop(pinned);
+
+            assert_eq!(
+                read_dir_dacl(&target).unwrap(),
+                before,
+                "ハードリンクの先が変わった"
+            );
+        }
+
+        /// 監査 Must 2 の反証: pin を持ったまま、そのフォルダを**その場で**
+        /// `FSCTL_SET_REPARSE_POINT` でジャンクションにしても、`reset_acl` はハンドルに
+        /// 書くので、書き換わるのはリンクそのものだけ（先の DACL は変わらない）。
+        #[test]
+        fn reset_acl_on_a_handle_turned_into_a_junction_stays_on_the_link() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let before = read_dir_dacl(outside.path()).unwrap();
+
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            // pin を持ったまま、別のハンドルで dir をジャンクション（→ outside）にする。
+            match set_reparse_to(&dir, outside.path()) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("skip: FSCTL_SET_REPARSE_POINT に権限が無い（{e}）- CI で確かめる");
+                    return;
+                }
+            }
+            // reset_acl はハンドル（OPEN_REPARSE_POINT）に書くので、先には向かない。
+            // 昇格していれば成功（リンクそのものに書く）、していなければ所有者の移動で
+            // 1307。どちらでも outside の DACL は変わらない。
+            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            drop(pinned);
+            assert_eq!(
+                read_dir_dacl(outside.path()).unwrap(),
+                before,
+                "ジャンクションの先の DACL が変わった"
+            );
+            std::fs::remove_dir(&dir).unwrap();
+        }
+
+        /// `dir` を `target` へのジャンクションにする（`FSCTL_SET_REPARSE_POINT`。`dir` は
+        /// 空のフォルダ。テスト専用）。
+        fn set_reparse_to(dir: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::{
+                CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+            };
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            };
+            use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+            use windows_sys::Win32::System::IO::DeviceIoControl;
+
+            // `\??\<target>` を substitute name にした mount-point の reparse データ。
+            let sub: Vec<u16> = std::ffi::OsStr::new(r"\??\")
+                .encode_wide()
+                .chain(target.as_os_str().encode_wide())
+                .collect();
+            let sub_bytes = (sub.len() * 2) as u16;
+            let print_bytes = 0u16;
+            // IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003。
+            let mut buf: Vec<u8> = Vec::new();
+            buf.extend_from_slice(&0xA000_0003u32.to_le_bytes()); // ReparseTag
+            let data_len = 8 + sub_bytes as usize + 2 + print_bytes as usize + 2;
+            buf.extend_from_slice(&(data_len as u16).to_le_bytes()); // ReparseDataLength
+            buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+            buf.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+            buf.extend_from_slice(&sub_bytes.to_le_bytes()); // SubstituteNameLength
+            buf.extend_from_slice(&(sub_bytes + 2).to_le_bytes()); // PrintNameOffset
+            buf.extend_from_slice(&print_bytes.to_le_bytes()); // PrintNameLength
+            for w in &sub {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            buf.extend_from_slice(&0u16.to_le_bytes()); // substitute NUL
+            buf.extend_from_slice(&0u16.to_le_bytes()); // print NUL
+
+            let path: Vec<u16> = dir
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: `path` は NUL 終端。書き込みで開く（reparse を設定するため）。
+            let handle = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut returned = 0u32;
+            // SAFETY: `handle` は有効、`buf` は reparse データ。
+            let ok = unsafe {
+                DeviceIoControl(
+                    handle,
+                    FSCTL_SET_REPARSE_POINT,
+                    buf.as_ptr().cast(),
+                    buf.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            let err = std::io::Error::last_os_error();
+            // SAFETY: `handle` は CreateFileW が返したもの。
+            unsafe {
+                CloseHandle(handle);
+            }
+            if ok == 0 {
+                return Err(err);
+            }
+            Ok(())
         }
 
         /// `pin_dir` の反証: ハンドルを持っている間は、そのフォルダの名前を変えて
