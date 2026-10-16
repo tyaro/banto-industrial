@@ -1083,7 +1083,7 @@ RUSTSEC-2023-0071（RSA 秘密操作のタイミングサイドチャネル）�
 Phase 2 は None/Anonymous 固定でその操作を提供しないため、`deny.toml` で
 この advisory のみ期限付きで除外する。2027-01-15 または証明書・SecurityPolicy
 を扱う Phase 3 着手時の早い方で見直し、修正版が出たら依存を更新して除外を外す。
-根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/e42a725133677b6ca8fe00dcb83d487f9cd43a67/docs/adr/0001-async-opcua-base.md) に記録する。
+根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/c123d6fa2d3e26594d02919e90d20d10595e0b8d/docs/adr/0001-async-opcua-base.md) に記録する。
 
 ### 5.6 認証（全プロトコル共通)
 
