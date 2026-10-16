@@ -86,8 +86,9 @@
 //!   （データのアクセスを求めないハンドルは共有の確かめに加わらない）、
 //!   `FILE_SHARE_DELETE` を渡さずに開くので、持っている間は誰もそのディレクトリを消す・名前を変える（= 確かめた後に
 //!   ジャンクションへすり替える）ことができない。さらに `WRITE_DAC | WRITE_OWNER` を
-//!   求め、`PinnedDir::reset_acl` は**そのハンドルで** `SetSecurityInfo`（DACL と所有者）を
-//!   書く（監査 B2。パスで `SetNamedSecurityInfoW` を呼ぶと、名前の変更・削除は止められても、
+//!   求め、`PinnedDir::reset_acl` は**そのハンドルで** `SetKernelObjectSecurity`（DACL と
+//!   所有者。**自動の継承の伝播をしない** API）を書く（監査 B2・[A]。パスで
+//!   `SetNamedSecurityInfoW` を呼ぶと、名前の変更・削除は止められても、
 //!   `FILE_WRITE_ATTRIBUTES` は共有の確かめに加わらないので、確かめた後に**その場で**
 //!   `FSCTL_SET_REPARSE_POINT` でジャンクションにされ、書き直しがその先へ向きうる。
 //!   ハンドルに書けば、その場でリンクにされても書き換わるのはリンクそのものだけ -
@@ -110,11 +111,16 @@
 //!   既にある子へ継承の ACE を書くが、**その過程で子のジャンクション・ハードリンクの
 //!   先にも書きうる**（Microsoft の仕様。#626 のオーナーレビュー P1）。そこで
 //!   `set_security_tree` は自動の伝播を使わず、対象そのものは `SetKernelObjectSecurity`
-//!   （伝播しない API）で書き、継承は自前で子へ伝える: 子を `FILE_FLAG_OPEN_REPARSE_POINT`
-//!   で辿らずに開き、**reparse point は飛ばし**（[`ResetSkips::reparse`]）、**ハードリンク
-//!   （リンク数 2 以上のファイル）も飛ばし**（[`ResetSkips::hardlink`]。記述子を共有するので
-//!   書くと木の外の名前のアクセスを変える。#624）、それ以外だけに同じ記述子を書いて、
-//!   フォルダなら子のハンドルを持ったまま再帰する。
+//!   （伝播しない API）で書き、継承は自前で子へ伝える。**パスは一切使わない**（監査 [A]。
+//!   パスで列挙・パスで開くと、確かめた後に途中の要素をジャンクションに変えられて先を
+//!   辿る）: 子は、親のディレクトリの**ハンドル**を
+//!   `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` で列挙してファイル ID を取り、
+//!   `OpenFileById`（ヒント = 親のハンドル、`FILE_FLAG_OPEN_REPARSE_POINT`）で辿らずに開く。
+//!   開いた後に属性をハンドルから確かめ、**reparse point は飛ばし**（[`ResetSkips::reparse`]）、
+//!   **ハードリンク（リンク数 2 以上のファイル）も飛ばし**（[`ResetSkips::hardlink`]。記述子を
+//!   共有するので書くと木の外の名前のアクセスを変える。#624）、それ以外だけに同じ記述子を
+//!   書いて、フォルダならその子のハンドルを列挙元として再帰する。`.`・`..` は除き、列挙・
+//!   開く途中の失敗は fail closed（消えた子だけ飛ばす）。
 //!   - 【測った事実・自前の再帰】`PinnedDir::reset_acl` は、中の普通の子（孫まで）へ保護された
 //!     DACL と Administrators 所有を書き、子のジャンクションとハードリンクは飛ばして
 //!     `ResetSkips` に記録する。リンクの先（ルートの外）は変えない（テスト
@@ -126,9 +132,15 @@
 //!     既にある普通の子へ継承の ACE を OS が自動で伝える（テスト
 //!     `os_auto_propagation_reaches_existing_children`）。これが**子のリンクの先にも書きうる**
 //!     ので、昇格ヘルパーの書き直しでは使わない。
-//!   - 【仮説】自前の再帰は 1 階層ずつ、中身のあるフォルダは reparse point に変えられない・
-//!     ハンドルが名前の変更と削除を止める、という前提で、再帰の途中のすり替えも防ぐ。木の
-//!     祖先（本当のパスの上）は呼ぶ側が別に確かめる（[`PinnedDir::final_path`]）。
+//!   - 【測った事実・ハンドル列挙】ハンドルを持ったままそのディレクトリをその場で
+//!     ジャンクションに変えても、**元のハンドルの列挙はそのディレクトリ（空）そのものを返す**
+//!     （リンクの先の中身は返らない。テスト
+//!     `enumerating_a_handle_turned_into_a_junction_lists_the_empty_object`。管理者でなくても
+//!     走る）。再帰の途中のすり替えも、ID とハンドルだけで辿るので先に向かない（テスト
+//!     `a_child_swapped_to_a_junction_mid_recursion_does_not_leak`。子に書いた直後に
+//!     フックですり替える。子まで進むのは管理者のとき = CI）。
+//!   - 【仮説】ファイル ID は volume 内で安定で、`OpenFileById` はその object を開く - ID が
+//!     別の object に再割り当てされる窓は無い前提（ID で開いた後も属性をハンドルから確かめる）。
 //!
 //! # 非 Windows
 //!
@@ -485,7 +497,7 @@ impl PinnedDir {
     /// - 対象そのものは `SetKernelObjectSecurity`（**自動の継承の伝播をしない**）でハンドルに
     ///   書く。パスではなくハンドル（`OPEN_REPARSE_POINT` で開いた）に書くので、確かめてから
     ///   書くまでの間にその場で reparse point にされても、書き換わるのはリンクそのものだけ。
-    /// - 継承は**自前で**中の子へ伝える（`SetNamedSecurityInfoW` / `SetSecurityInfo` の自動の
+    /// - 継承は**自前で**中の子へ伝える（`SetNamedSecurityInfoW`・`SetSecurityInfo` の自動の
     ///   伝播は、advapi がユーザーモードで木を歩いて**子のジャンクション・ハードリンクの先にも
     ///   書く**ため使わない）。子は `OPEN_REPARSE_POINT` で辿らずに開き、reparse point は
     ///   飛ばし（[`ResetSkips::reparse`]）、ハードリンク（リンク数 2 以上のファイル）も
@@ -897,36 +909,80 @@ mod imp {
         links: u32,
     }
 
-    /// `path` を**辿らずに**（`OPEN_REPARSE_POINT`）、DACL と所有者を書ける権利で開く。
-    /// 無ければ `Ok(None)`。
-    fn open_no_follow(path: &Path) -> Result<Option<Opened>> {
+    // `set_security_tree` が再帰のときに子へ書いた直後に呼ぶフック（テスト専用。
+    // 子をその場で reparse point にすり替える反証 (d) に使う）。本番では `None`。
+    #[cfg(test)]
+    pub(super) type AfterChildHook = Box<dyn Fn(HANDLE)>;
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static AFTER_CHILD_WRITTEN: std::cell::RefCell<Option<AfterChildHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// 子を開くときの、DACL と所有者を書ける権利（`pin_dir` と同じ）。`FILE_LIST_DIRECTORY`
+    /// はフォルダの列挙に要る（ファイルでは読み取りになるだけで害はない）。
+    fn child_access() -> u32 {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        };
+        READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | WRITE_DAC | WRITE_OWNER
+    }
+
+    /// `handle` が指すオブジェクトの属性（ディレクトリか・reparse point か・リンク数）を
+    /// ハンドルから読む。
+    fn info_of(handle: HANDLE) -> Result<(bool, bool, u32)> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        // SAFETY: 全フィールドが整数の構造体。`handle` は有効。
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return Err(api("GetFileInformationByHandle", last_error()));
+        }
+        Ok((
+            info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+            info.nNumberOfLinks,
+        ))
+    }
+
+    /// `parent`（ディレクトリのハンドル）の中の `file_id` を、**パスを使わず**・辿らずに
+    /// 開く（`OpenFileById`、ヒント = 親のハンドル。監査 [A]: パスで開くと途中の要素の
+    /// ジャンクションを辿るので、ID で相対に開く）。消えていれば `Ok(None)`。
+    fn open_child_by_id(parent: HANDLE, file_id: i64) -> Result<Option<Opened>> {
         use windows_sys::Win32::Foundation::{
             ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
         };
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+            OpenFileById, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_TYPE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        let wide_path = wide(path);
-        // SAFETY: `wide_path` は NUL 終端。リンクを辿らない（OPEN_REPARSE_POINT）。共有に
-        // DELETE を含めないので、開いている間は名前の変更・削除ができない。
+        // windows-sys は `FILE_ID_DESCRIPTOR` の union を公開するので、FileId を入れる。
+        let descriptor = windows_sys::Win32::Storage::FileSystem::FILE_ID_DESCRIPTOR {
+            dwSize: std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_ID_DESCRIPTOR>(
+            ) as u32,
+            Type: 0 as FILE_ID_TYPE, // FileIdType
+            Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_ID_DESCRIPTOR_0 {
+                FileId: file_id,
+            },
+        };
+        // SAFETY: `parent` は有効なディレクトリのハンドル。`descriptor` は FileId。共有に
+        // DELETE を含めない。リンクは辿らない（OPEN_REPARSE_POINT）。
         let handle = unsafe {
-            CreateFileW(
-                wide_path.as_ptr(),
-                READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC | WRITE_OWNER,
+            OpenFileById(
+                parent,
+                &descriptor,
+                child_access(),
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
-                OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null_mut(),
             )
         };
         if handle == INVALID_HANDLE_VALUE {
             let os_error = last_error();
             if os_error == ERROR_FILE_NOT_FOUND || os_error == ERROR_PATH_NOT_FOUND {
-                return Ok(None);
+                return Ok(None); // 列挙と開くの間に消えた。
             }
             return Err(SecretStoreError::io(
                 IoOp::InspectDir,
@@ -934,35 +990,33 @@ mod imp {
             ));
         }
         let handle = OwnedHandle(handle);
-        // SAFETY: 全フィールドが整数の構造体。`handle` は有効。
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
-            return Err(api("GetFileInformationByHandle", last_error()));
-        }
+        let (is_dir, is_reparse, links) = info_of(handle.0)?;
         Ok(Some(Opened {
             handle,
-            is_dir: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
-            is_reparse: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
-            links: info.nNumberOfLinks,
+            is_dir,
+            is_reparse,
+            links,
         }))
     }
 
     /// 開いた**ハンドルで**、そのオブジェクトと中の子へ、保護された DACL と所有者を書く
-    /// （[`super::PinnedDir::reset_acl`]、#392 B3-3b の監査 Must 2）。
+    /// （[`super::PinnedDir::reset_acl`]、#392 B3-3b の監査 Must 2・[A]）。
     ///
     /// - 対象そのもの: `handle`（呼ぶ側が辿らずに開き、reparse でないことを確かめ済み）に
     ///   [`set_object_security`]（自動の伝播をしない）で書く。
-    /// - 中の子: `real_dir`（`handle` の本当のパス）を列挙し、子を 1 つずつ辿らずに開いて、
-    ///   - **reparse point（ジャンクション・シンボリックリンクなど）は触らず・辿らず**、
-    ///     飛ばして [`super::ResetSkips::reparse`] に記録する。
-    ///   - **ハードリンク（ファイルでリンク数 2 以上）は触らず**、飛ばして
-    ///     [`super::ResetSkips::hardlink`] に記録する（記述子を共有するので、書くと外の
-    ///     名前のアクセスを変えてしまう。#624）。
-    ///   - それ以外は [`set_object_security`] で書き、フォルダなら**その子のハンドルを
-    ///     持ったまま**再帰する（中身のあるフォルダは reparse point に変えられない・
-    ///     ハンドルが名前の変更と削除を止めるので、再帰の間にすり替えられない）。
+    /// - 中の子: **パスを一切使わず**、`handle` を列挙
+    ///   （`GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`）して得たファイル ID を、
+    ///   [`open_child_by_id`]（ヒント = 親のハンドル）で辿らずに開き、
+    ///   - **reparse point** は触らず・辿らず、飛ばして [`super::ResetSkips::reparse`] に記録。
+    ///   - **ハードリンク（ファイルでリンク数 2 以上）** は触らず、飛ばして
+    ///     [`super::ResetSkips::hardlink`] に記録（記述子を共有するので、書くと外の名前の
+    ///     アクセスを変える。#624 は「書き換えない」ことだけ解消。その名前の DACL は直らない）。
+    ///   - それ以外は [`set_object_security`] で書き、フォルダなら**その子のハンドルを列挙元
+    ///     として**再帰する。
     ///
-    /// 自動の伝播を使わず自前で辿らないので、木の外（リンクの先）の DACL は一切変えない。
+    /// ハンドルとファイル ID だけで辿るので、確かめてから書くまでの間に子を**その場で**
+    /// ジャンクションにされても、列挙はそのディレクトリ（空）そのものを返し、ID で開くのは
+    /// その object そのもの - リンクの先には決して向かない。
     pub(super) fn set_security_tree(
         handle: HANDLE,
         real_dir: &Path,
@@ -972,36 +1026,97 @@ mod imp {
         ensure_user_account(access)?;
         let sd = owned_protected_sd(access)?;
         set_object_security(handle, &sd)?;
-        propagate(real_dir, &sd, skips)
+        propagate(handle, real_dir, &sd, skips)
     }
 
-    fn propagate(dir: &Path, sd: &LocalBox, skips: &mut super::ResetSkips) -> Result<()> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) => return Err(SecretStoreError::io(IoOp::InspectDir, &e)),
+    /// `dir_handle` の中を列挙して、各子にハンドルで書く・再帰する（上の doc）。`display` は
+    /// 飛ばした子の報告のための表示用のパス（開くのには使わない）。
+    fn propagate(
+        dir_handle: HANDLE,
+        display: &Path,
+        sd: &LocalBox,
+        skips: &mut super::ResetSkips,
+    ) -> Result<()> {
+        use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
+            FILE_ID_BOTH_DIR_INFO,
         };
-        for entry in entries {
-            let entry = entry.map_err(|e| SecretStoreError::io(IoOp::InspectDir, &e))?;
-            let child = entry.path();
-            let Some(opened) = open_no_follow(&child)? else {
-                continue; // 列挙と開くの間に消えた。
+
+        // 8 バイト境界のバッファ（`FILE_ID_BOTH_DIR_INFO` はポインタ整列が要る）。
+        let mut buffer = vec![0u64; 8 * 1024];
+        let byte_len = (buffer.len() * 8) as u32;
+        let mut class = FileIdBothDirectoryRestartInfo; // 1 回目は最初から。
+        loop {
+            // SAFETY: `dir_handle` は FILE_LIST_DIRECTORY を持つディレクトリのハンドル。
+            // `buffer` は `byte_len` バイト。
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    dir_handle,
+                    class,
+                    buffer.as_mut_ptr().cast(),
+                    byte_len,
+                )
             };
-            if opened.is_reparse {
-                skips.reparse.push(child);
-                continue; // 触らない・辿らない。
+            if ok == 0 {
+                let e = last_error();
+                if e == ERROR_NO_MORE_FILES {
+                    return Ok(());
+                }
+                return Err(api("GetFileInformationByHandleEx", e));
             }
-            if !opened.is_dir && opened.links >= 2 {
-                skips.hardlink.push(child);
-                continue; // 記述子を共有するので触らない（外の名前のアクセスを変えない）。
+            class = FileIdBothDirectoryInfo; // 2 回目以降は続きから。
+            let base = buffer.as_ptr() as *const u8;
+            let mut offset = 0usize;
+            loop {
+                // SAFETY: `offset` は直前の `NextEntryOffset` で進めた、バッファ内の境界。
+                let entry = unsafe { &*(base.add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+                let name_len = entry.FileNameLength as usize / 2;
+                // SAFETY: `FileName` は可変長で `FileNameLength` バイト続く（バッファ内）。
+                let name_u16 =
+                    unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len) };
+                let name = String::from_utf16_lossy(name_u16);
+                if name != "." && name != ".." {
+                    handle_child(dir_handle, &display.join(&name), entry.FileId, sd, skips)?;
+                }
+                if entry.NextEntryOffset == 0 {
+                    break;
+                }
+                offset += entry.NextEntryOffset as usize;
             }
-            set_object_security(opened.handle.raw(), sd)?;
-            if opened.is_dir {
-                // 子のハンドルを持ったまま再帰する（中身があれば reparse に変えられない・
-                // ハンドルが名前の変更と削除を止める）。
-                propagate(&child, sd, skips)?;
-            }
-            drop(opened);
         }
+    }
+
+    fn handle_child(
+        parent: HANDLE,
+        display_child: &Path,
+        file_id: i64,
+        sd: &LocalBox,
+        skips: &mut super::ResetSkips,
+    ) -> Result<()> {
+        let Some(opened) = open_child_by_id(parent, file_id)? else {
+            return Ok(()); // 列挙と開くの間に消えた。
+        };
+        if opened.is_reparse {
+            skips.reparse.push(display_child.to_path_buf());
+            return Ok(()); // 触らない・辿らない。
+        }
+        if !opened.is_dir && opened.links >= 2 {
+            skips.hardlink.push(display_child.to_path_buf());
+            return Ok(()); // 記述子を共有するので触らない（外の名前のアクセスを変えない）。
+        }
+        set_object_security(opened.handle.raw(), sd)?;
+        #[cfg(test)]
+        AFTER_CHILD_WRITTEN.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(opened.handle.raw());
+            }
+        });
+        if opened.is_dir {
+            // 子のハンドルを列挙元として再帰する（ID とハンドルだけ。パスは使わない）。
+            propagate(opened.handle.raw(), display_child, sd, skips)?;
+        }
+        drop(opened);
         Ok(())
     }
 
@@ -1172,8 +1287,8 @@ mod imp {
         // 読み取り・書き込み・削除のどれも求めないハンドルは共有の確かめに加わらず、
         // 共有に DELETE を含めなくても名前の変更を止められない（テスト
         // `a_pinned_dir_cannot_be_renamed_away_while_held` で確かめた）。**`WRITE_DAC |
-        // WRITE_OWNER`** を求めるのは、このハンドルで `SetSecurityInfo`（DACL と所有者）を
-        // 書くため（監査 B2。パスで書くと、確かめた後にその場でリンクにされうる）。
+        // WRITE_OWNER`** を求めるのは、このハンドルで `SetKernelObjectSecurity`（DACL と
+        // 所有者）を書くため（監査 B2。パスで書くと、確かめた後にその場でリンクにされうる）。
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -2029,16 +2144,26 @@ mod tests {
             );
         }
 
-        /// 監査 Must 2 の反証: pin を持ったまま、そのフォルダを**その場で**
-        /// `FSCTL_SET_REPARSE_POINT` でジャンクションにしても、`reset_acl` はハンドルに
-        /// 書くので、書き換わるのはリンクそのものだけ（先の DACL は変わらない）。
+        /// 監査 Must 2・受入 (c)（強化）: pin を持ったまま、ルートを**その場で**
+        /// `FSCTL_SET_REPARSE_POINT` でジャンクションにしても、`reset_acl` はハンドルとファイル
+        /// ID だけで辿るので、リンクの先（outside）の**中身（ファイル・サブフォルダ）の DACL と
+        /// 所有者**は変わらない。
         #[test]
         fn reset_acl_on_a_handle_turned_into_a_junction_stays_on_the_link() {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("d");
             std::fs::create_dir(&dir).unwrap();
             let outside = tempfile::tempdir().unwrap();
-            let before = read_dir_dacl(outside.path()).unwrap();
+            let out_file = outside.path().join("f.txt");
+            std::fs::write(&out_file, b"x").unwrap();
+            let out_sub = outside.path().join("sub");
+            std::fs::create_dir(&out_sub).unwrap();
+            let watched = [
+                outside.path().to_path_buf(),
+                out_file.clone(),
+                out_sub.clone(),
+            ];
+            let before: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
 
             let pinned = pin_dir(&dir).unwrap().unwrap();
             // pin を持ったまま、別のハンドルで dir をジャンクション（→ outside）にする。
@@ -2049,17 +2174,164 @@ mod tests {
                     return;
                 }
             }
-            // reset_acl はハンドル（OPEN_REPARSE_POINT）に書くので、先には向かない。
-            // 昇格していれば成功（リンクそのものに書く）、していなければ所有者の移動で
-            // 1307。どちらでも outside の DACL は変わらない。
+            // 昇格していれば成功（dir の object そのものに書く）、していなければ 1307。
+            // どちらでも outside の中身は不変。
             let _ = pinned.reset_acl(&DirAccess::with_install_user(me()));
             drop(pinned);
+            let after: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
             assert_eq!(
-                read_dir_dacl(outside.path()).unwrap(),
-                before,
-                "ジャンクションの先の DACL が変わった"
+                after, before,
+                "ジャンクションの先の中身の DACL/所有者が変わった"
             );
             std::fs::remove_dir(&dir).unwrap();
+        }
+
+        /// 監査 [A] の実測（管理者でなくても走る）: 空のフォルダのハンドルを開き、別ハンドルで
+        /// その場でジャンクション（→ outside）に変えても、**元のハンドルの列挙**はそのフォルダ
+        /// そのもの（空）を返す - リンクの先（outside）の中身は返らない。これが自前の再帰が
+        /// 安全な根拠（列挙も開くもパスを使わずハンドル／ID だけ）。
+        #[test]
+        fn enumerating_a_handle_turned_into_a_junction_lists_the_empty_object() {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::{
+                CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+            };
+            use windows_sys::Win32::Storage::FileSystem::{
+                CreateFileW, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
+                FILE_LIST_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            };
+
+            let root = tempfile::tempdir().unwrap();
+            let empty = root.path().join("empty");
+            std::fs::create_dir(&empty).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret.txt"), b"x").unwrap();
+
+            let wide: Vec<u16> = empty
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: NUL 終端。列挙の権利で、辿らずに開く。
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(handle, INVALID_HANDLE_VALUE);
+
+            // ハンドルを持ったまま、別ハンドルで empty をジャンクションに変える。
+            if let Err(e) = set_reparse_to(&empty, outside.path()) {
+                // SAFETY: 上で開いた有効なハンドル。
+                unsafe { CloseHandle(handle) };
+                eprintln!("skip: FSCTL に権限が無い（{e}）- CI で確かめる");
+                return;
+            }
+
+            // 元のハンドルを列挙する。empty そのもの（空）が返り、outside の中身は返らない。
+            let mut buffer = vec![0u64; 8 * 1024];
+            // SAFETY: `handle` は FILE_LIST_DIRECTORY を持つ。`buffer` は十分大きい。
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    handle,
+                    FileIdBothDirectoryRestartInfo,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                )
+            };
+            let mut names = Vec::new();
+            if ok != 0 {
+                let base = buffer.as_ptr() as *const u8;
+                let mut offset = 0usize;
+                loop {
+                    // SAFETY: バッファ内の境界。
+                    let entry = unsafe { &*(base.add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+                    let len = entry.FileNameLength as usize / 2;
+                    // SAFETY: FileName は FileNameLength バイト続く。
+                    let n = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), len) };
+                    names.push(String::from_utf16_lossy(n));
+                    if entry.NextEntryOffset == 0 {
+                        break;
+                    }
+                    offset += entry.NextEntryOffset as usize;
+                }
+            } else {
+                assert_eq!(last_error_test(), ERROR_NO_MORE_FILES);
+            }
+            // SAFETY: 上で開いた有効なハンドル。
+            unsafe { CloseHandle(handle) };
+            let _ = std::fs::remove_dir(&empty);
+
+            // `.`・`..` 以外は無い（outside の secret.txt は見えない）。
+            let real: Vec<_> = names.iter().filter(|n| *n != "." && *n != "..").collect();
+            assert!(
+                real.is_empty(),
+                "ジャンクションに変わったハンドルの列挙が中身を返した: {real:?}"
+            );
+            assert!(!names.iter().any(|n| n == "secret.txt"));
+        }
+
+        fn last_error_test() -> u32 {
+            // SAFETY: 直前の Win32 呼び出しの失敗の理由を読むだけ。
+            unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        }
+
+        /// 監査 Must 2・受入 (d): **再帰の途中で**子（空のフォルダ）をその場でジャンクションに
+        /// すり替えても、outside の中身は変わらない。`AFTER_CHILD_WRITTEN` フックで、子に書いた
+        /// 直後に `empty` をジャンクション（→ outside）に変える。所有者を移すので、子まで進むのは
+        /// 管理者のとき（CI）。非管理者では 1307 で子へ進まず、フックは発火しないが outside は
+        /// 不変（どちらでも受入は満たす）。
+        #[test]
+        fn a_child_swapped_to_a_junction_mid_recursion_does_not_leak() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            // 普通のファイル（フックの発火のきっかけ）と、空のサブフォルダ `empty`。
+            std::fs::write(dir.join("a.txt"), b"x").unwrap();
+            let empty = dir.join("empty");
+            std::fs::create_dir(&empty).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret.txt"), b"x").unwrap();
+            let watched = [
+                outside.path().to_path_buf(),
+                outside.path().join("secret.txt"),
+            ];
+            let before: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
+
+            // 子に書いた直後、まだ `empty` が空のうちにジャンクションへ変える（1 回だけ試みる）。
+            let empty_for_hook = empty.clone();
+            let outside_for_hook = outside.path().to_path_buf();
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired2 = fired.clone();
+            super::super::imp::AFTER_CHILD_WRITTEN.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |_child_handle| {
+                    if !fired2.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = set_reparse_to(&empty_for_hook, &outside_for_hook);
+                    }
+                }));
+            });
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            let result = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            drop(pinned);
+            super::super::imp::AFTER_CHILD_WRITTEN.with(|h| *h.borrow_mut() = None);
+
+            let admin = is_elevated_admin();
+            if !admin {
+                eprintln!(
+                    "note: 非管理者なので子まで進まず（1307）、フックは発火していない - 書く側は CI"
+                );
+            }
+            let after: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
+            assert_eq!(after, before, "再帰の途中のすり替えで outside が変わった");
+            // 後片付け（`empty` がジャンクションなら外す）。
+            let _ = (result, std::fs::remove_dir(&empty));
         }
 
         /// `dir` を `target` へのジャンクションにする（`FSCTL_SET_REPARSE_POINT`。`dir` は
