@@ -848,8 +848,10 @@ impl PinnedDir {
     /// 作り・名前の確かめは [`PinnedDir::open_child_file`] と同じ（`FILE_OPEN |
     /// FILE_OPEN_REPARSE_POINT`、パスを解決し直さない）。違うのは求める権利で、**中身は求めず**
     /// （`FILE_READ_DATA` を含めない）、`READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC |
-    /// WRITE_OWNER | DELETE` を求める。`DELETE` を求めるので共有の確かめに加わり、共有に削除を
-    /// 含めないので、持っている間はほかの誰も消す・名前を変える・すり替えることができない。
+    /// WRITE_OWNER | DELETE` を求める。`DELETE` を求めるので共有の確かめに加わり、共有は
+    /// **読み取りだけ**なので、持っている間はほかの誰も書き込みに開く・消す・名前を変える・
+    /// すり替えることができず、既に書き込みに開いているプロセスがあれば開くこと自体が共有違反
+    /// （`SecretStoreError::Io` の `os_error` が 32）で失敗する。
     /// 子がフォルダ・リンクでも辿らずにそのものを開くので、呼ぶ側が [`PinnedFile::security`]
     /// で確かめる（[`PinnedFile::reset_acl`]・[`PinnedFile::delete`] も自分で断る）。
     /// [`PinnedFile::read_to_end`] は使えない（中身の権利を持たない）。
@@ -4774,8 +4776,37 @@ mod tests {
                 root.path().join("moved.example")
             )
             .is_err());
+            // 持っている間は、ほかの誰も書き込みに開けない（共有は読み取りだけ）。
+            assert!(std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.path().join("a.example"))
+                .is_err());
             file.delete().unwrap();
             assert!(!root.path().join("a.example").exists(), "閉じたら消える");
+
+            // 既に書き込みに開かれていれば、開くこと自体が共有違反で失敗する。
+            std::fs::write(root.path().join("busy.toml"), b"x").unwrap();
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.path().join("busy.toml"))
+                .unwrap();
+            let busy = parent.open_child_file_for_update("busy.toml");
+            assert!(
+                matches!(
+                    busy,
+                    Err(SecretStoreError::Io {
+                        op: crate::error::IoOp::OpenFile,
+                        os_error: Some(32),
+                        ..
+                    })
+                ),
+                "{busy:?}"
+            );
+            drop(writer);
+            assert!(parent
+                .open_child_file_for_update("busy.toml")
+                .unwrap()
+                .is_some());
 
             let sub = parent.open_child_file_for_update("sub").unwrap().unwrap();
             assert!(matches!(
