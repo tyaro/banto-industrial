@@ -3235,6 +3235,14 @@ async fn plc_connections_create(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
         Ok(created) => created,
         Err(err) => {
@@ -3246,7 +3254,7 @@ async fn plc_connections_create(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3306,6 +3314,14 @@ async fn plc_connections_update(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let updated = match state
         .plc_connections
         .update_tx(&mut tx, id, input.into())
@@ -3321,7 +3337,7 @@ async fn plc_connections_update(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3376,6 +3392,14 @@ async fn plc_connections_delete(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2、
     // `crate::sink`のモジュール doc comment「FK を張らない理由」参照）:
     // この接続を参照する sink group が1件でもあれば削除を拒否する
@@ -3405,7 +3429,7 @@ async fn plc_connections_delete(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4191,6 +4215,14 @@ async fn collection_groups_create(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let created = match state
         .collection_groups
         .create_tx(&mut tx, input.into())
@@ -4206,7 +4238,7 @@ async fn collection_groups_create(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4262,6 +4294,14 @@ async fn collection_groups_update(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let updated = match state
         .collection_groups
         .update_tx(&mut tx, id, input.into())
@@ -4277,7 +4317,7 @@ async fn collection_groups_update(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4332,6 +4372,14 @@ async fn collection_groups_delete(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     // T19 S2-b（UX-38）: `plc_connections_delete` と同じ理由・同じ形で
     // `cascade_delete_tx` を使う（属するタグごと1トランザクションで削除、
     // `banto_tags::collection_group::CollectionGroupService::cascade_delete_tx`
@@ -4347,7 +4395,7 @@ async fn collection_groups_delete(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4956,6 +5004,14 @@ async fn tags_create(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let created = match state.tags.create_tx(&mut tx, input.into()).await {
         Ok(created) => created,
         Err(err) => {
@@ -4967,7 +5023,7 @@ async fn tags_create(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -5052,6 +5108,14 @@ async fn tags_update(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     #[cfg(test)]
     tx_test_hook(&mut tx).await;
     let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
@@ -5070,7 +5134,7 @@ async fn tags_update(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -5125,6 +5189,14 @@ async fn tags_delete(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     if let Err(err) = state.tags.delete_tx(&mut tx, id).await {
         let _ = tx.rollback().await;
         return Err(ApiError(err).into());
@@ -5140,7 +5212,7 @@ async fn tags_delete(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -5401,6 +5473,14 @@ async fn execute_pending_apply(
         .await
         .map_err(storage_api_error)
         .map_err(PendingApplyError::Api)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(PendingApplyError::Api(err));
+        }
+    };
 
     let resource = match pending.source.as_str() {
         "plc_connections.create" => {
@@ -5704,7 +5784,7 @@ async fn execute_pending_apply(
     // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
     // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
     // comment「古い snapshot の窓」節）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -6099,6 +6179,14 @@ async fn tags_batch(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let outcome = match state.tags.create_batch_tx(&mut tx, &inputs).await {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -6120,7 +6208,7 @@ async fn tags_batch(
         }
         BatchTagOutcome::Valid { count, tags } => {
             // #341 レビュー対応: 上記と同じ - preflight 専用。
-            let _preflighted = match preflight_transaction(&mut tx).await {
+            let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     let _ = tx.rollback().await;
@@ -6314,6 +6402,14 @@ async fn tags_batch_update(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let outcome = match state.tags.update_batch_tx(&mut tx, &updates).await {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -6335,7 +6431,7 @@ async fn tags_batch_update(
         }
         BatchTagUpdateOutcome::Valid { count, tags } => {
             // #341 レビュー対応: 上記と同じ - preflight 専用。
-            let _preflighted = match preflight_transaction(&mut tx).await {
+            let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     let _ = tx.rollback().await;
@@ -6476,6 +6572,14 @@ async fn tags_batch_delete(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(storage_api_error)?;
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
     let outcome = match state.tags.delete_batch_tx(&mut tx, &ids).await {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -6503,7 +6607,7 @@ async fn tags_batch_delete(
                 }
             }
             // #341 レビュー対応: 上記と同じ - preflight 専用。
-            let _preflighted = match preflight_transaction(&mut tx).await {
+            let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     let _ = tx.rollback().await;
@@ -10066,16 +10170,62 @@ fn storage_api_error(error: sqlx::Error) -> ApiError {
     ApiError(BantoError::Storage(error.to_string()))
 }
 
+/// The registry as it was at the start of a write transaction, before the
+/// write (#635). [`preflight_transaction`] compares the registry after the
+/// write against it so that only the external-name collisions the write
+/// **creates** are rejected - collisions already in the DB (rows written
+/// before 2026-10-17) do not block unrelated edits or the edits that
+/// resolve them. Read it with [`registry_before`] right after `BEGIN
+/// IMMEDIATE` and before any write, on the same transaction.
+pub(crate) struct RegistryBefore(RegistrySnapshot);
+
+pub(crate) async fn registry_before(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<RegistryBefore, ApiError> {
+    RegistrySnapshot::load_connection(connection)
+        .await
+        .map(RegistryBefore)
+        .map_err(|err| preflight_api_error(format!("レジストリの読み取りに失敗しました: {err}")))
+}
+
+/// #635（2026-10-17 オーナー決定 案 A）: 接続・グループ・タグの作成・改名
+/// （グループの付け替えを含む）で、外部名（`conn.group.tag`）が既存のタグと
+/// 重なるなら検証エラーにする。判定は `crate::hub::new_external_name_collisions`
+/// （catalog と同じ組み立て方の純関数）。REST・MCP・未適用キューの適用・
+/// 一括作成／更新、設定パッケージの取り込み（REST の作成／更新を呼ぶ）は
+/// すべて [`preflight_transaction`] を通るので、ここ 1 か所で断る。
+fn reject_new_external_name_collisions(
+    before: &RegistryBefore,
+    after: &RegistrySnapshot,
+) -> Result<(), ApiError> {
+    let collisions = crate::hub::new_external_name_collisions(&before.0, after);
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError(BantoError::Validation {
+        field_errors: collisions
+            .iter()
+            .map(|collision| FieldError {
+                field: "name".to_string(),
+                message: collision.message(),
+            })
+            .collect(),
+    }))
+}
+
 // T21 S1-b（docs/banto-hub-t21-design.md §5）: `pub(crate)` so
 // `crate::mcp`'s config tools (`create_connection`/`delete_connection`) can
-// run the exact same in-transaction preflight REST does - signature and body
-// unchanged.
+// run the exact same in-transaction preflight REST does. #635 added
+// `before` (read with [`registry_before`] before the write): every write
+// passes it, deletes included, so a new write path cannot forget it.
 pub(crate) async fn preflight_transaction(
     connection: &mut sqlx::SqliteConnection,
+    before: &RegistryBefore,
 ) -> Result<RegistrySnapshot, ApiError> {
     let snapshot = RegistrySnapshot::load_connection(connection)
         .await
         .map_err(|err| preflight_api_error(format!("レジストリの読み取りに失敗しました: {err}")))?;
+    reject_new_external_name_collisions(before, &snapshot)?;
     preflight_snapshot(&snapshot)?;
     Ok(snapshot)
 }
@@ -10804,6 +10954,157 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{status_body:?}");
         assert_eq!(status_body["connections"].as_array().unwrap().len(), 1);
         assert_ne!(status_body["connections"][0]["status"], "unused");
+    }
+
+    /// #635（2026-10-17 オーナー決定 案 A）: 接続・グループ・タグの作成と改名で、
+    /// ドットを含む名前をつないだ外部名が既存のタグと重なれば 422 で断り、
+    /// どの既存のタグと重なるかを文言で示す。断った書き込みは残らない。
+    #[tokio::test]
+    async fn registry_writes_reject_a_new_external_name_collision() {
+        let env = test_env().await;
+        let (router, token) = (&env.router, env.admin_token.as_str());
+
+        async fn post_ok(
+            router: &Router,
+            token: &str,
+            path: &str,
+            body: serde_json::Value,
+        ) -> serde_json::Value {
+            let (status, created) = admin_post(router, path, token, body).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {created:?}");
+            created
+        }
+        fn assert_collision(status: StatusCode, body: &serde_json::Value, existing: &str) {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+            assert_eq!(body["field_errors"][0]["field"], "name", "{body:?}");
+            let message = body["field_errors"][0]["message"].as_str().unwrap_or("");
+            assert!(
+                message.contains("既存のタグ") && message.contains(existing),
+                "{message}"
+            );
+        }
+
+        // 既存: 接続「a.b」/ グループ「c」/ タグ「d」= 外部名 a.b.c.d
+        let ab = post_ok(
+            router,
+            token,
+            "/api/plc-connections",
+            json!({ "name": "a.b", "host": "127.0.0.1", "port": 15081 }),
+        )
+        .await;
+        let c = post_ok(
+            router,
+            token,
+            "/api/collection-groups",
+            json!({ "name": "c", "plcConnectionId": ab["id"], "periodMs": 1000 }),
+        )
+        .await;
+        let tag = |name: &str, group: &serde_json::Value| {
+            json!({
+                "name": name,
+                "collectionGroupId": group["id"],
+                "address": "40001",
+                "dataType": "i16",
+            })
+        };
+        post_ok(router, token, "/api/tags", tag("d", &c)).await;
+
+        // 作成: 接続「a」/ グループ「b.c」/ タグ「d」も a.b.c.d になる。
+        let a = post_ok(
+            router,
+            token,
+            "/api/plc-connections",
+            json!({ "name": "a", "host": "127.0.0.1", "port": 15082 }),
+        )
+        .await;
+        let bc = post_ok(
+            router,
+            token,
+            "/api/collection-groups",
+            json!({ "name": "b.c", "plcConnectionId": a["id"], "periodMs": 1000 }),
+        )
+        .await;
+        let (status, body) = admin_post(router, "/api/tags", token, tag("d", &bc)).await;
+        assert_collision(status, &body, "接続「a.b」/ グループ「c」/ タグ「d」");
+        assert!(body["field_errors"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("a.b.c.d")));
+
+        // タグの改名: 「e」で作ってから「d」へ変える。
+        let e = post_ok(router, token, "/api/tags", tag("e", &bc)).await;
+        let (status, body) = admin_put(
+            router,
+            &format!("/api/tags/{}", e["id"]),
+            token,
+            tag("d", &bc),
+        )
+        .await;
+        assert_collision(status, &body, "接続「a.b」/ グループ「c」/ タグ「d」");
+
+        // グループの改名: a.b / zz / y を作り、グループを「c2.x」へ変えると、
+        // 既存の a.b / c2 / x.y（= a.b.c2.x.y）と重なる。
+        let c2 = post_ok(
+            router,
+            token,
+            "/api/collection-groups",
+            json!({ "name": "c2", "plcConnectionId": ab["id"], "periodMs": 1000 }),
+        )
+        .await;
+        post_ok(router, token, "/api/tags", tag("x.y", &c2)).await;
+        let zz = post_ok(
+            router,
+            token,
+            "/api/collection-groups",
+            json!({ "name": "zz", "plcConnectionId": ab["id"], "periodMs": 1000 }),
+        )
+        .await;
+        post_ok(router, token, "/api/tags", tag("y", &zz)).await;
+        let (status, body) = admin_put(
+            router,
+            &format!("/api/collection-groups/{}", zz["id"]),
+            token,
+            json!({ "name": "c2.x", "plcConnectionId": ab["id"], "periodMs": 1000 }),
+        )
+        .await;
+        assert_collision(status, &body, "接続「a.b」/ グループ「c2」/ タグ「x.y」");
+
+        // 接続の改名: 接続「a」は使用中の名前なので先に消す。m / b.c2 / d を作り、
+        // m を「a」へ変えると a.b.c2.d になり、既存の a.b / c2 / d と重なる。
+        post_ok(router, token, "/api/tags", tag("d", &c2)).await;
+        let (status, body) =
+            admin_delete(router, &format!("/api/plc-connections/{}", a["id"]), token).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+        let m = post_ok(
+            router,
+            token,
+            "/api/plc-connections",
+            json!({ "name": "m", "host": "127.0.0.1", "port": 15083 }),
+        )
+        .await;
+        let bc2 = post_ok(
+            router,
+            token,
+            "/api/collection-groups",
+            json!({ "name": "b.c2", "plcConnectionId": m["id"], "periodMs": 1000 }),
+        )
+        .await;
+        post_ok(router, token, "/api/tags", tag("d", &bc2)).await;
+        let (status, body) = admin_put(
+            router,
+            &format!("/api/plc-connections/{}", m["id"]),
+            token,
+            json!({ "name": "a", "host": "127.0.0.1", "port": 15083 }),
+        )
+        .await;
+        assert_collision(status, &body, "接続「a.b」/ グループ「c2」/ タグ「d」");
+
+        // 断った書き込みは残らず、catalog に重なりは無い。
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM plc_connections")
+            .fetch_all(&env.pool)
+            .await
+            .unwrap();
+        assert!(names.contains(&"m".to_owned()) && !names.contains(&"a".to_owned()));
+        assert!(env.manager.tag_map().collisions().is_empty());
     }
 
     /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03)

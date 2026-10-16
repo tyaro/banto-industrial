@@ -93,7 +93,7 @@ use crate::pending_changes::PendingChangesService;
 use crate::rest::{
     api_key_rejection_response, bearer_token, commit_catalog_and_notify,
     compute_pending_base_fingerprint, compute_status, parse_requested_value, preflight_transaction,
-    run_plc_connection_test, unauthorized_response, validate_grpc_settings_body,
+    registry_before, run_plc_connection_test, unauthorized_response, validate_grpc_settings_body,
     validate_mqtt_settings_request, validate_store_settings_request, CollectionGroupPayload,
     CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse, MqttSettingsRequest,
     MqttSettingsResponse, PlcConnectionPayload, PlcConnectionResponse, PlcConnectionTestPayload,
@@ -1956,6 +1956,14 @@ async fn tool_create_connection(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
         Ok(created) => created,
         Err(err) => {
@@ -1964,7 +1972,7 @@ async fn tool_create_connection(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2079,6 +2087,14 @@ async fn tool_delete_connection(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let cascade = match state.plc_connections.cascade_delete_tx(&mut tx, id).await {
         Ok(cascade) => cascade,
         Err(err) => {
@@ -2087,7 +2103,7 @@ async fn tool_delete_connection(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2314,6 +2330,14 @@ async fn tool_update_connection(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let updated = match state
         .plc_connections
         .update_tx(&mut tx, id, input.into())
@@ -2326,7 +2350,7 @@ async fn tool_update_connection(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2509,6 +2533,14 @@ async fn tool_create_group(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let created = match state
         .collection_groups
         .create_tx(&mut tx, input.into())
@@ -2521,7 +2553,7 @@ async fn tool_create_group(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2629,6 +2661,14 @@ async fn tool_update_group(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let updated = match state
         .collection_groups
         .update_tx(&mut tx, id, input.into())
@@ -2641,7 +2681,7 @@ async fn tool_update_group(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2752,6 +2792,14 @@ async fn tool_delete_group(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let cascade = match state.collection_groups.cascade_delete_tx(&mut tx, id).await {
         Ok(cascade) => cascade,
         Err(err) => {
@@ -2760,7 +2808,7 @@ async fn tool_delete_group(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2912,6 +2960,14 @@ async fn tool_create_tag(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let created = match state.tags.create_tx(&mut tx, input.into()).await {
         Ok(created) => created,
         Err(err) => {
@@ -2920,7 +2976,7 @@ async fn tool_create_tag(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3034,6 +3090,14 @@ async fn tool_update_tag(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
         Ok(updated) => updated,
         // T18-1と同じ楽観ロック競合 - REST の `tags_update` の match と
@@ -3051,7 +3115,7 @@ async fn tool_update_tag(
         }
     };
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3199,12 +3263,20 @@ async fn tool_delete_tag(
             )));
         }
     };
+    // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
+    let registry_before = match registry_before(&mut tx).await {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(banto_error_tool_error(&err.0));
+        }
+    };
     if let Err(err) = state.tags.delete_tx(&mut tx, id).await {
         let _ = tx.rollback().await;
         return Ok(banto_error_tool_error(&err));
     }
     // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
-    let _preflighted = match preflight_transaction(&mut tx).await {
+    let _preflighted = match preflight_transaction(&mut tx, &registry_before).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
