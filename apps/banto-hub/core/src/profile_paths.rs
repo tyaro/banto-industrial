@@ -45,8 +45,9 @@ use crate::runtime::HubConfig;
 /// profile-id の既定値。env `BANTO_HUB_PROFILE`が空／未設定のとき使う。
 pub const DEFAULT_PROFILE_ID: &str = "default";
 
-/// `<profile-id>`の検証エラー（空文字列、パス区切り文字、`..`等）。
-#[derive(Debug, Error, PartialEq, Eq)]
+/// `<profile-id>`の検証エラー（空文字列、パス区切り文字、`..`、`:`、予約名、
+/// 末尾の`.`・空白）。
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ProfileIdError {
     #[error("profile id を空にすることはできません")]
     Empty,
@@ -54,11 +55,55 @@ pub enum ProfileIdError {
     PathSeparator(String),
     #[error("profile id にディレクトリ移動（'.'/'..'）は使えません: {0:?}")]
     DotSegment(String),
+    /// `:` を含む（#626、2026-10-16）。Windows の`Path::join`はドライブの接頭辞を
+    /// 持つ要素（`C:`・`x:y`）で**前を捨てる**ので、`root.join("profiles").join("C:")`
+    /// は`C:`（C: の今のフォルダ = ドライブ相対）になる。NTFS の代替データストリーム
+    /// （`default::$DATA`）も`:`で書く。
+    #[error(
+        "profile id に ':' は使えません（ドライブ・代替データストリームの指定になります）: {0:?}"
+    )]
+    Colon(String),
+    /// Windows の予約デバイス名（`CON`・`NUL`・`COM1` など。拡張子つきの`nul.txt`も）。
+    #[error("profile id に Windows の予約名（CON・NUL・COM1 など）は使えません: {0:?}")]
+    ReservedName(String),
+    /// 末尾が`.`か空白（Win32 がパスを正規化するときに落とすので、`default.`が
+    /// `default`と同じフォルダを指す。`...`は`profiles`そのものを指す）。
+    #[error("profile id の末尾に '.' や空白は使えません: {0:?}")]
+    TrailingDotOrSpace(String),
+}
+
+/// Windows の予約デバイス名か（大文字小文字を無視。最初の`.`より前を、末尾の空白を
+/// 除いて見るので`nul.txt`・`CON .log`も予約名。上付き数字の`COM¹`なども含む -
+/// Win32 はこれらをファイルではなくデバイスとして開く）。
+pub fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    const PLAIN: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+    if PLAIN.contains(&upper.as_str()) {
+        return true;
+    }
+    let Some(rest) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut digits = rest.chars();
+    matches!(
+        (digits.next(), digits.next()),
+        (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
 }
 
 /// `profile_id`が絶対パスの1コンポーネントとしてそのまま安全に使えるかを
 /// 検証する - 空文字列、`/`・`\`（Windows パス区切り、非 Windows でも
 /// 混乱を避けるため一律禁止）、`.`/`..`（ディレクトリ移動）を拒否する。
+///
+/// #626（2026-10-16 オーナー決定 論点 7）で、**Windows で別の場所を指しうるもの**も
+/// 断るようにした: `:`（ドライブ相対・代替データストリーム）、予約デバイス名、末尾の
+/// `.`・空白。既存の profile-id を使えなくしないよう、ここは許可リストにまでは狭めない
+/// （昇格ヘルパー`banto-hub-elev`だけは
+/// [`crate::profile_grant::validate_strict_profile_id`]の許可リストを使う）。
 pub fn validate_profile_id(profile_id: &str) -> Result<(), ProfileIdError> {
     if profile_id.is_empty() {
         return Err(ProfileIdError::Empty);
@@ -68,6 +113,15 @@ pub fn validate_profile_id(profile_id: &str) -> Result<(), ProfileIdError> {
     }
     if profile_id == "." || profile_id == ".." {
         return Err(ProfileIdError::DotSegment(profile_id.to_string()));
+    }
+    if profile_id.contains(':') {
+        return Err(ProfileIdError::Colon(profile_id.to_string()));
+    }
+    if profile_id.ends_with('.') || profile_id.ends_with(' ') {
+        return Err(ProfileIdError::TrailingDotOrSpace(profile_id.to_string()));
+    }
+    if is_reserved_device_name(profile_id) {
+        return Err(ProfileIdError::ReservedName(profile_id.to_string()));
     }
     Ok(())
 }
@@ -279,6 +333,84 @@ mod tests {
             validate_profile_id(".."),
             Err(ProfileIdError::DotSegment(_))
         ));
+    }
+
+    /// #626: Windows で別の場所を指しうるものを断る（`:`・予約名・末尾の`.`と空白）。
+    #[test]
+    fn validate_profile_id_rejects_names_that_point_elsewhere_on_windows() {
+        for id in ["C:", "x:y", "D:evil", "default::$DATA"] {
+            assert_eq!(
+                validate_profile_id(id),
+                Err(ProfileIdError::Colon(id.to_string())),
+                "{id:?}"
+            );
+        }
+        for id in ["default.", "default ", "...", "a. "] {
+            assert_eq!(
+                validate_profile_id(id),
+                Err(ProfileIdError::TrailingDotOrSpace(id.to_string())),
+                "{id:?}"
+            );
+        }
+        for id in [
+            "nul",
+            "NUL",
+            "Con",
+            "prn",
+            "aux",
+            "COM1",
+            "lpt9",
+            "nul.txt",
+            "CON .log",
+            "com\u{b9}",
+            "CONIN$",
+        ] {
+            assert_eq!(
+                validate_profile_id(id),
+                Err(ProfileIdError::ReservedName(id.to_string())),
+                "{id:?}"
+            );
+        }
+        // 予約名に似ているだけのものは通る。
+        for id in [
+            "console",
+            "nul1",
+            "com10",
+            "lpt0",
+            "auxiliary",
+            "p6-123-456",
+        ] {
+            assert!(validate_profile_id(id).is_ok(), "{id:?}");
+        }
+    }
+
+    /// #626 で見つけた穴の固定: `C:`・`x:y` を profile-id にすると、`resolve_profile_paths`
+    /// は断る（以前は`Path::join`がドライブ相対のパス`C:`を返し、昇格した
+    /// `grant-profile-acl`が C: の今のフォルダを再帰で書き換えうる経路だった）。
+    #[test]
+    fn resolve_profile_paths_rejects_drive_relative_ids() {
+        let root = PathBuf::from(r"C:\ProgramData\BantoHub");
+        for id in ["C:", "x:y", "D:evil"] {
+            assert!(
+                matches!(
+                    resolve_profile_paths(&root, id),
+                    Err(ProfileIdError::Colon(_))
+                ),
+                "{id:?}"
+            );
+        }
+    }
+
+    /// 上の確かめが要る理由（Windows の`Path::join`の挙動そのもの）を固定する: ドライブの
+    /// 接頭辞を持つ要素を join すると前が捨てられ、`profiles`の下ではなくなる。この挙動が
+    /// 変わったらこのテストが落ちる（そのときは確かめを外してよいかを見直す）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_join_with_a_drive_prefix_discards_the_base() {
+        let profiles = PathBuf::from(r"C:\ProgramData\BantoHub\profiles");
+        assert_eq!(profiles.join("C:"), PathBuf::from("C:"));
+        assert_eq!(profiles.join("x:y"), PathBuf::from("x:y"));
+        assert!(!profiles.join("C:").starts_with(&profiles));
     }
 
     #[test]
