@@ -96,6 +96,7 @@ const TABLE = [
 	['rust-toolchain.toml', ['rust-toolchain.toml'], ALL_BUT_FRONTEND()],
 	['proto', ['proto/tagserver/v1/tagserver.proto'], ALL_BUT_FRONTEND()],
 	['.cargo', ['.cargo/config.toml'], ALL_BUT_FRONTEND()],
+	['.config (nextest)', ['.config/nextest.toml'], ALL_BUT_FRONTEND()],
 	[
 		'pnpm-lock.yaml',
 		['pnpm-lock.yaml'],

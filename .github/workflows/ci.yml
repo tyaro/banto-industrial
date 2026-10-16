@@ -21,6 +21,12 @@
 #   両アプリの E2E。root の package.json / pnpm-lock.yaml / lint・format・TS 設定は
 #   全 frontend + 両 E2E。
 #
+# rust ジョブのテストは cargo-nextest（`--profile ci`、設定は `.config/nextest.toml`）。
+# doctest は nextest で走らないので `cargo test --doc` を別の段で回す。
+# デバッグ情報は `CARGO_PROFILE_DEV_DEBUG=line-tables-only` で軽くしている。
+# rust ジョブは clippy と nextest のビルドに `--timings` を付け、crate ごとの
+# ビルド時間の HTML を artifact（`cargo-timings`、14 日）に残す。
+#
 # 将来 `apps/banto-scada` を足すとき:
 #   1. ci-changes.mjs の RULES に `^apps/banto-scada/` → `scada`（E2E を足すなら
 #      `e2e/tests-banto-scada/` 等 → `e2e_scada`）を足し、AREAS・derive()
@@ -227,6 +233,12 @@ jobs:
     if: needs.changes.outputs.run_rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      # CI のビルドは実行ファイルの大きさとリンク時間が効く。デバッグ情報は行番号表
+      # （panic の場所・バックトレース）だけ残して軽くする。`test` プロファイルは
+      # `dev` を継承するので CARGO_PROFILE_TEST_DEBUG は要らない。Swatinem/rust-cache の
+      # キーは CARGO_* の env を含むので、この行を足した最初の 1 回はキャッシュが外れる。
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     # banto-tags (and every later I-series crate) depends on banto-core /
     # banto-storage via a git tag reference into tyaro/banto (see
     # crates/banto-tags/Cargo.toml, banto's docs/publishing.md). banto went
@@ -241,6 +253,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # `cache-workspace-crates` は見送った（#638 レビュー: rust-cache のキーにソースの中身が入らず、完全一致の復元では保存されない。checkout で更新時刻も新しくなり、自前の crate は結局ビルドし直しになる）。
       - uses: Swatinem/rust-cache@v2
       # rustfmt only parses/reformats - no compilation, so it always covers
       # every workspace member (cheap), whatever the clippy/test scope below.
@@ -259,9 +272,28 @@ jobs:
       # this job runs on windows-latest with Swatinem/rust-cache, where the
       # Tauri/WebView2 dependency build time is acceptable.
       - name: clippy
-        run: cargo clippy ${{ needs.changes.outputs.rust_args }} --all-targets -- -D warnings
-      - name: test
-        run: cargo test ${{ needs.changes.outputs.rust_args }}
+        run: cargo clippy ${{ needs.changes.outputs.rust_args }} --all-targets --timings -- -D warnings
+      # テストは cargo-nextest（テスト 1 件 = 1 プロセスで、バイナリをまたいで並列に
+      # 走る）。同時に走るとぶつかるテストは .config/nextest.toml の test-groups で
+      # 直列にしてある（理由もそこ）。ローカルでも `cargo nextest run` が使える。
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: test (nextest)
+        run: cargo nextest run ${{ needs.changes.outputs.rust_args }} --profile ci --timings
+      # nextest は doctest を走らせない。
+      - name: test (doctest)
+        run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
+      # crate ごとのビルド時間（clippy の check ビルドと nextest のテストビルド）。
+      # `--timings` は追加のビルドをしない（ビルドの二重化なし）。失敗しても残す。
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings
+          path: target/cargo-timings/cargo-timing-*.html
+          if-no-files-found: ignore
+          retention-days: 14
 
   # 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §7「S2 / S5 の統合
   # テストは CI で PostgreSQL のサービスコンテナを使う」）。上の `rust` ジョブ
@@ -275,6 +307,9 @@ jobs:
   #
   # #468: banto-hub・banto-hub-sink・crates・Cargo の共通設定を変えたとき
   # （とフル CI のとき）だけ走る。
+  #
+  # nextest にしない理由: 3 ステップとも実 PostgreSQL 1 つを共有し、小さいので並列化の
+  # 利得が薄い一方、プロセスが別になると DB 上の状態の取り合いが増える。
   #
   # apt でのシステムパッケージ導入は不要: banto-hub-core は Tauri/WebKitGTK に
   # 依存しない（`e2e-hub` ジョブが同じ ubuntu-latest で
@@ -299,6 +334,7 @@ jobs:
           --health-retries 5
     env:
       BANTO_TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -329,6 +365,8 @@ jobs:
     if: needs.changes.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

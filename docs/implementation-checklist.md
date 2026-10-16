@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-16（§2 に「新規ディレクトリ・ファイルを追加したら git add 後に ci-changes 分類テストを実行する」を追加。#632 で新設 interop/ の分類登録を忘れて changes と ci-gate が失敗した。網羅テストは git ls-files を見るため、追加ファイルをステージした後に実行する）
+最終更新: 2026-10-16（§2 に「CI は cargo nextest で走る。プロセス内の直列化は効かないので、同時に走るとぶつかるテストは `.config/nextest.toml` の test-groups へ」を追加。CI の rust ジョブを cargo-nextest に替えたことに伴う）
+2026-10-16（§2 に「新規ディレクトリ・ファイルを追加したら git add 後に ci-changes 分類テストを実行する」を追加。#632 で新設 interop/ の分類登録を忘れて changes と ci-gate が失敗した。網羅テストは git ls-files を見るため、追加ファイルをステージした後に実行する）
 2026-10-16（§5 に「OPC UA 設定の有効化 PUT は起動完了を待つため長めの上限を明示する」を追加。PR #627 の Windows CI で初回起動が 10 秒を超え、起動経路には一時 RSA 鍵生成も含まれる）
 2026-10-16（§2 に「Cargo の生成物は cargo/rustc/linker が動いていないことを確認してから掃除する」を追加。#201 の検証中、リンク中に `target/debug/examples` を消して欠けた object によりテストが失敗した）
 2026-10-15（§5 に「ChronoGazer のシェルの終了・切り替え・復旧の判断はライフサイクルの表を通す。入り口を足したら表に行を足す」を追加。PR #608 で同じ辺りの競合の指摘が 1 件ずつ出続けた）
@@ -55,6 +56,7 @@
 
 1. [ ] **`cargo fmt --all --check`** — **一番忘れる。#385 はこれだけで CI が落ちた。**
 2. [ ] `cargo test -p <触ったクレート>`
+   - [ ] **CI の rust ジョブはテストを `cargo nextest run`（テスト 1 件 = 1 プロセスで並列）で走らせる**（2026-10-16、doctest だけ `cargo test --doc`）。ローカルでも `cargo nextest run` が使える。**`static LOCK: Mutex` の「同じプロセス内の直列化」はプロセスが別になるので効かない**。プロセスをまたいで共有するもの（名前付き mutex・固定ポート・固定パス）を使うテストを足したら、`.config/nextest.toml` の test-groups に入れる（洗い出した範囲と理由もそこ）。
    - [ ] **容量を空けるための `target` 掃除は cargo/rustc/linker が動いていないことを確かめてから行う**。#201 の検証中、別リポジトリと共有した target の `debug/examples` をリンク中に削除し、必要な object がなくなってテストのリンクが失敗した（2026-10-16）。
 3. [ ] `cargo clippy -p <触ったクレート> --all-targets -- -D warnings`
 4. [ ] **`pnpm exec eslint <触った src と e2e>`** — **`pnpm --filter <app> check`（svelte-check）は ESLint を回さない。** CI には両方ある。
