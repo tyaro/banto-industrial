@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use banto_secret_store::acl::{
     Exposure, FileSecurity, ObservedAce, ObservedDacl, ADMINISTRATORS_SID, SYSTEM_SID,
@@ -233,7 +234,7 @@ struct FakeOps {
     dirs: HashMap<PathBuf, Result<Entry, OpenError>>,
     files: HashMap<PathBuf, Result<Entry, OpenError>>,
     contents: Result<Vec<u8>, String>,
-    log: RefCell<Vec<String>>,
+    log: Rc<RefCell<Vec<String>>>,
 }
 
 impl FakeOps {
@@ -248,7 +249,7 @@ impl FakeOps {
             dirs,
             files,
             contents: Ok(b"hub_url = \"http://127.0.0.1:8722\"\napi_key = \"bh_x.y\"\n".to_vec()),
-            log: RefCell::new(Vec::new()),
+            log: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -284,11 +285,30 @@ fn short(path: &Path) -> String {
 struct FakeDir {
     path: PathBuf,
     entry: Entry,
+    log: Rc<RefCell<Vec<String>>>,
 }
 
 struct FakeFile {
     path: PathBuf,
     entry: Entry,
+    log: Rc<RefCell<Vec<String>>>,
+}
+
+/// 閉じたこと（drop）を記録する（読んだらすぐ閉じる - #648 の再レビュー Nit 1）。
+impl Drop for FakeDir {
+    fn drop(&mut self) {
+        self.log
+            .borrow_mut()
+            .push(format!("close {}", short(&self.path)));
+    }
+}
+
+impl Drop for FakeFile {
+    fn drop(&mut self) {
+        self.log
+            .borrow_mut()
+            .push(format!("close {}", short(&self.path)));
+    }
 }
 
 impl PlaceOps for FakeOps {
@@ -309,6 +329,7 @@ impl PlaceOps for FakeOps {
             Some(Ok(entry)) => Ok(Some(FakeDir {
                 path: dir.to_path_buf(),
                 entry: entry.clone(),
+                log: self.log.clone(),
             })),
         }
     }
@@ -330,6 +351,7 @@ impl PlaceOps for FakeOps {
             Some(Ok(entry)) => Ok(Some(FakeFile {
                 path,
                 entry: entry.clone(),
+                log: self.log.clone(),
             })),
         }
     }
@@ -383,6 +405,9 @@ fn a_protected_place_is_read_after_every_check() {
             "dir_security sink".to_string(),
             "open banto-hub-sink.toml".to_string(),
             "read banto-hub-sink.toml".to_string(),
+            // 読んだらすぐ閉じる（#648 の再レビュー Nit 1）。ハンドルは関数の外へ出ない。
+            "close banto-hub-sink.toml".to_string(),
+            "close sink".to_string(),
         ]
     );
 }
@@ -968,6 +993,8 @@ mod windows {
             matches!(&got, Err(ConfigError::Unprotected { .. })),
             "{got:?}"
         );
+        // 断った後も、ファイルを持ち続けていない（#648 の再レビュー Nit 1）。
+        assert_exclusive_open(&file);
     }
 
     /// `prepare-sink-config` と同じ形（SYSTEM・Administrators だけ・所有者 Administrators）の
@@ -998,5 +1025,17 @@ mod windows {
         assert_eq!(text.as_bytes(), TOML);
         let config = crate::config::SidecarConfig::from_toml_str(&text, &path).unwrap();
         assert_eq!(config.hub_url, "http://127.0.0.1:8722");
+        // 読んだらすぐ閉じている: 共有なし・書き込みで開ける（持ち続けていれば共有違反）。
+        assert_exclusive_open(&path);
+    }
+
+    /// 共有なし（`share_mode(0)`）・書き込みで開けること = だれもハンドルを持っていない。
+    fn assert_exclusive_open(path: &Path) {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap_or_else(|e| panic!("{} を持ち続けている: {e}", path.display()));
     }
 }

@@ -396,13 +396,18 @@ pub fn read_protected<O: PlaceOps>(
         return Err(unprotected(dir_problems, file_problems));
     }
 
-    // 5. 確かめたハンドルのまま読む。
-    let bytes = ops
-        .read(&file, MAX_CONFIG_BYTES)
-        .map_err(|reason| ConfigError::Unverifiable {
-            path: file_path.clone(),
-            reason,
-        })?;
+    // 5. 確かめたハンドルのまま読み、**読んだらすぐ閉じる**（#648 の再レビュー Nit 1）。
+    // 共有は読み取りだけなので、sink が持ち続けると elev（`prepare-sink-config`）や
+    // インストーラが設定を整える・書き換えるときに共有違反になる。ファイル・置き場の
+    // ハンドルはこの関数の外へ出さない（返すのはパスと中身だけ）。失敗の経路でも、ここで
+    // 返るときに閉じる。
+    let read = ops.read(&file, MAX_CONFIG_BYTES);
+    drop(file);
+    drop(dir);
+    let bytes = read.map_err(|reason| ConfigError::Unverifiable {
+        path: file_path.clone(),
+        reason,
+    })?;
     let text = String::from_utf8(bytes).map_err(|_| ConfigError::Parse {
         path: file_path.clone(),
         message: "UTF-8 ではありません".to_string(),
