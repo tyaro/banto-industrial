@@ -119,9 +119,16 @@ const TABLE = [
 		}
 	],
 	['.github の変更はフル', ['.github/workflows/ci.yml'], ALL],
+	['OPC UA interop 専用 workflow の変更はフル', ['.github/workflows/opcua-interop.yml'], ALL],
 	['判定スクリプト自身もフル', ['.github/scripts/ci-changes.mjs'], ALL],
 	['scripts/ はフル', ['scripts/build-release.ps1'], ALL],
 	['どの規則にも当たらないパスはフル', ['some-new-dir/file.txt'], ALL],
+	[
+		'OPC UA interop の依存・試験ファイルだけ',
+		['interop/opcua/requirements.txt', 'interop/opcua/smoke.py'],
+		NONE
+	],
+	['未知の interop パスはフル', ['interop/other/smoke.py'], ALL],
 	['.gitattributes はフル', ['.gitattributes'], ALL],
 	[
 		'hub の E2E だけ',

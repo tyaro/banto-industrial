@@ -181,7 +181,7 @@ async def run(binary: Path):
                     "dataType": "f32", "enabled": True, "writable": True,
                     "tagKind": "internal", "retain": False,
                 })
-                external_name = f"mem.interop.number"
+                external_name = "mem.interop.number"
                 rest.expect("POST", "/api/collection/start", {})
                 issued = rest.expect("POST", "/api/api-keys", {
                     "name": "interop smoke key", "scopes": [f"write:{external_name}"],

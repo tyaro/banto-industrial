@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-16（§5 に「OPC UA 設定の有効化 PUT は起動完了を待つため長めの上限を明示する」を追加。PR #627 の Windows CI で初回起動が 10 秒を超え、起動経路には一時 RSA 鍵生成も含まれる）
+最終更新: 2026-10-16（§2 に「新規ディレクトリ・ファイルを追加したら git add 後に ci-changes 分類テストを実行する」を追加。#632 で新設 interop/ の分類登録を忘れて changes と ci-gate が失敗した。網羅テストは git ls-files を見るため、追加ファイルをステージした後に実行する）
+2026-10-16（§5 に「OPC UA 設定の有効化 PUT は起動完了を待つため長めの上限を明示する」を追加。PR #627 の Windows CI で初回起動が 10 秒を超え、起動経路には一時 RSA 鍵生成も含まれる）
 2026-10-16（§2 に「Cargo の生成物は cargo/rustc/linker が動いていないことを確認してから掃除する」を追加。#201 の検証中、リンク中に `target/debug/examples` を消して欠けた object によりテストが失敗した）
 2026-10-15（§5 に「ChronoGazer のシェルの終了・切り替え・復旧の判断はライフサイクルの表を通す。入り口を足したら表に行を足す」を追加。PR #608 で同じ辺りの競合の指摘が 1 件ずつ出続けた）
 2026-10-15（§2 に「実機で Tauri のシェルを動かすときは試験専用の identifier でビルドする」を追加。#392 B2-4b の実機確認で、`APPDATA`・`LOCALAPPDATA` を差し替えても Tauri のデータの場所は隔離されず、オーナーの実データの場所に印を作った）
@@ -62,6 +63,7 @@
 6. [ ] `pnpm exec prettier --write <編集した md/ts/svelte 全部>` → **整形後にもう一度 test と eslint**（整形が壊すことがある）
    - [ ] **`prettier --check .` をリポジトリ全体にかけない**（**`prettier --write .` は絶対にかけない**）。Windows の作業ツリーは CRLF なので、**main が CI で緑でもローカルでは 340 件の「差分あり」が出る**（CI は Linux/LF）。これを整形漏れと誤認して `--write .` を実行すると、**全ファイルの改行を書き換えた巨大な差分**になる。対象は**編集したファイルだけ**に絞る。全体を比べたいときは **`--end-of-line auto` を付ける**（2026-09-20: prettier 3.9.8 が整形結果を変えるかを調べて 340 件に当たった。**現行版で同じコマンドを回す対照**を取ったら同じ 340 件で、原因は版ではなく改行だった。**依存を上げる前後の比較は、必ず同じ条件で対照を取る**）。
    - [ ] **`npx sv migrate ...` は最後にルートの `pnpm run format`（= `prettier --write .`）を自分で走らせる**（`--no-install` でも止まらない）。2026-10-05 の banto-hub の SvelteKit 3 移行で、移行対象外の `.github/scripts/*.mjs`・`scripts/*.mjs` 4 ファイルが改行だけの差分になった。実行後は `git status --short` で対象アプリ外の変更を `git checkout --` で戻してからコミットする。
+   - [ ] **新しいディレクトリやファイルを追加したら `git add` 後に `node --test .github/scripts/ci-changes.test.mjs` を実行する**。全ファイル網羅テストは `git ls-files` の一覧を判定するため、未追跡ファイルは見えず、ステージ後に初めて失敗する（#632 の `interop/opcua/`）。
 7. [ ] E2E の前に必ず: `pnpm --filter <app> build` → **`cargo build -p <core> --bin <bin> --features embed-ui`**（**`--features embed-ui` を落とすと smoke が全滅する**）
    - [ ] **`cargo test -p chronogazer-core` の後は `banto-serve` を `--features embed-ui` で建て直してから E2E**。`cargo test` は統合テストのために同じ `target/debug/banto-serve` を **embed-ui なしで**作り直す（2026-10-09、R1-D の D-4: `cargo test` の後の `pnpm e2e` が「フロントエンドが埋め込まれていません」で smoke から全滅した）
    - [ ] **chronogazer の E2E（`pnpm e2e`）は、加えて `cargo build -p chronogazer-core --example dev_plc`**（2 つ目の `webServer` = 開発用 PLC。R1-C の C-4 で追加。ビルドし忘れると `webServer` の起動で全体が落ちる）
