@@ -509,8 +509,30 @@ pub fn data_acl_plan(
 pub trait PinnedDirOps {
     /// 開いたハンドルから読んだ属性と所有者。
     fn info(&self) -> PinnedDirInfo;
-    /// 開いたままの DACL を書き直す。
-    fn reset_acl(&self, access: &DirAccess) -> Result<(), String>;
+    /// `GetFinalPathNameByHandleW` で解決した本当のパス（途中の要素のジャンクション・
+    /// 8.3 の短い名前を辿った後。監査 Must 1）。
+    fn final_path(&self) -> PathBuf;
+    /// 開いたままの DACL と所有者を書き、中の子へ自前で伝える。飛ばした子（reparse point・
+    /// ハードリンク）を返す。
+    fn reset_acl(&self, access: &DirAccess) -> Result<banto_secret_store::acl::ResetSkips, String>;
+}
+
+/// 利用者のアカウントの確かめの失敗（監査 Nit 2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountCheck {
+    /// この PC にその SID のアカウントが無い（`ERROR_NONE_MAPPED`）・グループなど。使い方の
+    /// 誤り（`--install-user-sid` なら 64）。
+    NotAnAccount(String),
+    /// 一時的な失敗（RPC 不達・アクセス拒否など）。もう一度試せば変わりうる（1）。
+    Transient(String),
+}
+
+impl AccountCheck {
+    fn message(&self) -> &str {
+        match self {
+            Self::NotAnAccount(m) | Self::Transient(m) => m,
+        }
+    }
 }
 
 /// elev が OS に対してする操作（Windows の実装は `win::WindowsOps`。テストは偽物）。
@@ -528,10 +550,14 @@ pub trait ElevOps {
     fn registered_command_line(&self) -> Result<Option<String>, String>;
     /// データのルート（[`resolve_machine_root`]）。
     fn machine_root(&self) -> Result<PathBuf, String>;
+    /// ルートにしてはいけない既知のフォルダ（[`reject_well_known_root`]。本当のパスにも
+    /// かけるため。監査 Must 1）。
+    fn known_folders(&self) -> Result<KnownFolders, String>;
     /// このプロセスのトークンの利用者。
     fn current_user_sid(&self) -> Result<InstallUserSid, String>;
-    /// この PC の利用者のアカウント（`SidTypeUser`）か。
-    fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), String>;
+    /// この PC の利用者のアカウント（`SidTypeUser`）か。アカウントでない（`ERROR_NONE_MAPPED`・
+    /// グループなど）と一時的な失敗（RPC 不達など）を分ける（監査 Nit 2）。
+    fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), AccountCheck>;
     /// `chronogazer_core::server_service::install_with`。
     fn install(
         &self,
@@ -613,6 +639,37 @@ fn machine_root<O: ElevOps>(ops: &O, out: Out<'_>) -> Result<PathBuf, i32> {
     })
 }
 
+/// 開いたフォルダの**本当のパス**（`final_path`）が、期待のパスと同じ場所を指し、既知の
+/// システムフォルダに重ならないことを確かめる（監査 Must 1）。途中の要素のジャンクション・
+/// 8.3 の短い名前で別の場所を開かされていたら、ここで断る（1）。
+fn verify_final_path<P: PinnedDirOps>(
+    pinned: &P,
+    kind: DataDir,
+    expected: &Path,
+    known: &KnownFolders,
+    out: Out<'_>,
+) -> Result<(), i32> {
+    let real = pinned.final_path();
+    if lower_components(&real) != lower_components(expected) {
+        out(err(&format!(
+            "{}（{}）の本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります。書き直さずに止めます",
+            kind.label(),
+            expected.display(),
+            real.display()
+        )));
+        return Err(EXIT_FAILED);
+    }
+    if let Err(reason) = reject_well_known_root(&real, known) {
+        out(err(&format!(
+            "{}（{}）の本当の場所が使えません: {reason}。書き直さずに止めます",
+            kind.label(),
+            real.display()
+        )));
+        return Err(EXIT_FAILED);
+    }
+    Ok(())
+}
+
 /// 記録したインストール利用者（無い・不正・利用者のアカウントでない → 2、読めない → 1）。
 fn recorded_install_user<O: ElevOps>(ops: &O, out: Out<'_>) -> Result<InstallUserSid, i32> {
     let raw = match ops.read_install_user() {
@@ -638,9 +695,12 @@ fn recorded_install_user<O: ElevOps>(ops: &O, out: Out<'_>) -> Result<InstallUse
     })?;
     ops.check_user_account(&sid).map_err(|error| {
         out(err(&format!(
-            "記録されたインストール利用者（{}）はこの PC の利用者のアカウントとして確かめられません: {error}。service-uninstall → service-install で登録し直してください",
-            sid.as_str()
+            "記録されたインストール利用者（{}）はこの PC の利用者のアカウントとして確かめられません: {}。service-uninstall → service-install で登録し直してください",
+            sid.as_str(),
+            error.message()
         )));
+        // 記録が壊れている（アカウントでない）のも、一時的に確かめられないのも、ここでは
+        // 先へ進めない前提の欠落として扱う（2）。
         EXIT_PRECONDITION
     })?;
     Ok(sid)
@@ -661,12 +721,19 @@ fn service_install<O: ElevOps>(
     };
     let sid = match install_user_sid {
         Some(sid) => {
+            // 監査 Nit 2: アカウントでない（`--install-user-sid` の値の誤り）なら 64、
+            // 一時的な失敗（RPC 不達など）なら 1。どちらも何も登録しない。
             if let Err(error) = ops.check_user_account(&sid) {
+                let code = match error {
+                    AccountCheck::NotAnAccount(_) => EXIT_USAGE,
+                    AccountCheck::Transient(_) => EXIT_FAILED,
+                };
                 out(err(&format!(
-                    "{INSTALL_USER_SID_FLAG} の SID（{}）はこの PC の利用者のアカウントとして確かめられません: {error}（何も登録していません）",
-                    sid.as_str()
+                    "{INSTALL_USER_SID_FLAG} の SID（{}）をこの PC の利用者のアカウントとして確かめられません: {}（何も登録していません）",
+                    sid.as_str(),
+                    error.message()
                 )));
-                return EXIT_USAGE;
+                return code;
             }
             sid
         }
@@ -682,8 +749,9 @@ fn service_install<O: ElevOps>(
             };
             if let Err(error) = ops.check_user_account(&sid) {
                 out(err(&format!(
-                    "実行した利用者（{}）はこの PC の利用者のアカウントとして確かめられません: {error}。{INSTALL_USER_SID_FLAG} S-1-5-21-… で指定してください（何も登録していません）",
-                    sid.as_str()
+                    "実行した利用者（{}）をこの PC の利用者のアカウントとして確かめられません: {}。{INSTALL_USER_SID_FLAG} S-1-5-21-… で指定してください（何も登録していません）",
+                    sid.as_str(),
+                    error.message()
                 )));
                 return EXIT_PRECONDITION;
             }
@@ -700,14 +768,33 @@ fn service_install<O: ElevOps>(
     // いれば、`install_with` は記録を変えない）。今の記録を読めなければ渡す SID。
     let root_user = match ops.read_install_user() {
         Ok(existing) => match plan_sid_record(existing.as_deref(), &sid) {
-            SidRecordPlan::KeepDifferent { recorded } => recorded,
+            SidRecordPlan::KeepDifferent { recorded } => {
+                // 監査 Nit 4: 違う SID が既に記録済み（D2）なら、ルートは記録の SID で整える
+                // ことを 1 行で知らせる（登録の行の前に出す）。
+                out(out_line(&format!(
+                    "インストール利用者は記録済みの {} を使います（指定の {} ではなく。変えるには service-uninstall → service-install）",
+                    recorded.as_str(),
+                    sid.as_str()
+                )));
+                recorded
+            }
             _ => sid.clone(),
         },
         Err(_) => sid.clone(),
     };
+    let known = match ops.known_folders() {
+        Ok(known) => known,
+        Err(error) => {
+            out(err(&format!(
+                "既知のフォルダの場所を取れませんでした: {error}（何も登録していません）"
+            )));
+            return EXIT_PRECONDITION;
+        }
+    };
     let _held_root = match preflight_root(
         ops,
         &root,
+        &known,
         &root_user,
         elevated_user.as_ref().map(InstallUserSid::as_str),
         out,
@@ -741,6 +828,7 @@ fn service_install<O: ElevOps>(
 fn preflight_root<O: ElevOps>(
     ops: &O,
     root: &Path,
+    known: &KnownFolders,
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
     out: Out<'_>,
@@ -782,6 +870,12 @@ fn preflight_root<O: ElevOps>(
             }
         }
     };
+    // 本当のパスが期待（root）と同じ場所で、既知のシステムフォルダに重ならないこと
+    // （監査 Must 1。途中の要素のジャンクション・8.3 の短い名前を塞ぐ）。何も登録しない。
+    if let Err(code) = verify_final_path(&pinned, DataDir::Root, root, known, out) {
+        out(err("（何も登録していません）"));
+        return Err(code);
+    }
     if let Err(refusal) = data_acl_plan(
         &DirState::Present(pinned.info()),
         install_user,
@@ -797,16 +891,38 @@ fn preflight_root<O: ElevOps>(
     // ときと同じ形に書き直す）。既にあったルートはここでは変えない（登録の後の
     // `grant-data-acl` が書き直す）。
     if created {
-        if let Err(error) = pinned.reset_acl(&access) {
-            out(err(&format!(
-                "{}（{}）の所有者と ACL を整えられませんでした: {error}（何も登録していません）",
-                DataDir::Root.label(),
-                root.display()
-            )));
-            return Err(EXIT_FAILED);
+        match pinned.reset_acl(&access) {
+            Ok(skips) => emit_skips(DataDir::Root, &skips, out),
+            Err(error) => {
+                out(err(&format!(
+                    "{}（{}）の所有者と ACL を整えられませんでした: {error}（何も登録していません）",
+                    DataDir::Root.label(),
+                    root.display()
+                )));
+                return Err(EXIT_FAILED);
+            }
         }
     }
     Ok(pinned)
+}
+
+/// 書き直しのときに飛ばした子（reparse point・ハードリンク）を警告の 1 行で報告する
+/// （監査 Must 2。触っていないことを利用者に知らせる）。
+fn emit_skips(kind: DataDir, skips: &banto_secret_store::acl::ResetSkips, out: Out<'_>) {
+    for path in &skips.reparse {
+        out(err(&format!(
+            "{}: 中の {} はジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました",
+            kind.label(),
+            path.display()
+        )));
+    }
+    for path in &skips.hardlink {
+        out(err(&format!(
+            "{}: 中の {} はハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）",
+            kind.label(),
+            path.display()
+        )));
+    }
 }
 
 fn service_uninstall<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
@@ -925,10 +1041,13 @@ impl DataDir {
 /// 1 つのフォルダを扱う。無ければ作る（`create_if_absent`）か何もしない。あれば
 /// 辿らずに開いて [`data_acl_plan`] のとおり書き直すか止める。開いたフォルダは返して、
 /// 呼ぶ側が全部の手順が終わるまで持つ（下のフォルダを扱う間に名前を変えさせない）。
+#[allow(clippy::too_many_arguments)]
 fn grant_dir<O: ElevOps>(
     ops: &O,
     kind: DataDir,
     dir: &Path,
+    expected: &Path,
+    known: &KnownFolders,
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
     create_if_absent: bool,
@@ -971,6 +1090,9 @@ fn grant_dir<O: ElevOps>(
             tried_create = true;
             continue;
         };
+        // 本当のパスが期待と同じ場所で、既知のシステムフォルダに重ならないこと（監査
+        // Must 1。途中の要素のジャンクション・8.3 の短い名前・ルートの祖先のすり替えを塞ぐ）。
+        verify_final_path(&pinned, kind, expected, known, out)?;
         let info = pinned.info();
         match data_acl_plan(&DirState::Present(info), install_user, elevated_user) {
             Err(refusal) => {
@@ -980,7 +1102,7 @@ fn grant_dir<O: ElevOps>(
             // 作った直後でも書き直す（作ってから開くまでの間にすり替えられていても、
             // 開いたものを期待の形にする。同じ形なら何も変わらない）。
             Ok(_) => {
-                pinned.reset_acl(&access).map_err(|error| {
+                let skips = pinned.reset_acl(&access).map_err(|error| {
                     out(err(&format!(
                         "{}（{}）の ACL を書き直せませんでした: {error}",
                         kind.label(),
@@ -999,6 +1121,7 @@ fn grant_dir<O: ElevOps>(
                     dir.display(),
                     install_user.as_str()
                 )));
+                emit_skips(kind, &skips, out);
                 return Ok(Some(pinned));
             }
         }
@@ -1034,18 +1157,56 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
         Ok(root) => root,
         Err(code) => return code,
     };
+    let known = match ops.known_folders() {
+        Ok(known) => known,
+        Err(error) => {
+            out(err(&format!(
+                "既知のフォルダの場所を取れませんでした: {error}"
+            )));
+            return EXIT_PRECONDITION;
+        }
+    };
     let elevated_user = ops.current_user_sid().ok();
     let elevated_user = elevated_user.as_ref().map(InstallUserSid::as_str);
     let layout = DataLayout::new(root);
-    // 開いたフォルダは最後まで持つ（ルート → secrets → hub-keys の順）。
+    // 開いたフォルダは最後まで持つ（ルート → secrets → hub-keys の順）。ルートを開いた
+    // ら、下の期待のパスは**ルートの本当のパス**から組み立てる（ルートの祖先がジャンク
+    // ションでも、下を「本当のルート\secrets」と比べれば、別の場所を開かされていたら
+    // 気づく。監査 Must 1）。
     let mut held = Vec::new();
+    let mut real_root: Option<PathBuf> = None;
     for (kind, dir, create) in [
         (DataDir::Root, layout.root().to_path_buf(), true),
         (DataDir::Secrets, layout.secrets_dir(), true),
         (DataDir::HubKeys, layout.hub_keys_dir(), false),
     ] {
-        match grant_dir(ops, kind, &dir, &sid, elevated_user, create, out) {
-            Ok(pinned) => held.extend(pinned),
+        let expected = match kind {
+            DataDir::Root => layout.root().to_path_buf(),
+            DataDir::Secrets => real_root
+                .as_ref()
+                .map_or_else(|| dir.clone(), |r| r.join("secrets")),
+            DataDir::HubKeys => real_root
+                .as_ref()
+                .map_or_else(|| dir.clone(), |r| r.join("secrets").join("hub-keys")),
+        };
+        match grant_dir(
+            ops,
+            kind,
+            &dir,
+            &expected,
+            &known,
+            &sid,
+            elevated_user,
+            create,
+            out,
+        ) {
+            Ok(Some(pinned)) => {
+                if kind == DataDir::Root {
+                    real_root = Some(pinned.final_path());
+                }
+                held.push(pinned);
+            }
+            Ok(None) => {}
             Err(code) => return code,
         }
     }

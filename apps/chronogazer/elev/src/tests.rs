@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use banto_secret_store::acl::PinnedDirInfo;
+use banto_secret_store::acl::{PinnedDirInfo, ResetSkips};
 use banto_secret_store::{DirAccess, InstallUserSid};
 use banto_service_control::{
     ConsoleLine, InstallError, InstallKind, InstallOutcome, PreshutdownReport, ServiceManagerError,
@@ -467,6 +467,7 @@ type Log = Rc<RefCell<Vec<String>>>;
 
 struct FakePinned {
     path: PathBuf,
+    final_path: PathBuf,
     info: PinnedDirInfo,
     reset: Result<(), String>,
     log: Log,
@@ -476,13 +477,16 @@ impl PinnedDirOps for FakePinned {
     fn info(&self) -> PinnedDirInfo {
         self.info.clone()
     }
-    fn reset_acl(&self, access: &DirAccess) -> Result<(), String> {
+    fn final_path(&self) -> PathBuf {
+        self.final_path.clone()
+    }
+    fn reset_acl(&self, access: &DirAccess) -> Result<ResetSkips, String> {
         self.log.borrow_mut().push(format!(
             "reset {} {}",
             self.path.display(),
             access.install_user().map_or("-", InstallUserSid::as_str)
         ));
-        self.reset.clone()
+        self.reset.clone().map(|()| ResetSkips::default())
     }
 }
 
@@ -495,6 +499,8 @@ struct Fake {
     root: Result<PathBuf, String>,
     me: Result<InstallUserSid, String>,
     not_accounts: Vec<String>,
+    /// 一時的に確かめられない SID（`check_user_account` が `Transient`）。
+    transient_accounts: Vec<String>,
     install: Result<InstallReport, InstallUserUnavailable>,
     uninstall: Result<UninstallOutcome, UninstallError>,
     recorded: Result<Option<String>, String>,
@@ -506,6 +512,11 @@ struct Fake {
     autostart: Result<(), ServiceManagerError>,
     /// 今あるフォルダ（`pin_dir` が返す）。
     dirs: RefCell<BTreeMap<PathBuf, PinnedDirInfo>>,
+    /// 開いたフォルダの本当のパス（`final_path`）の差し替え（監査 Must 1 の反証。
+    /// 既定は開いたパスと同じ）。
+    final_paths: BTreeMap<PathBuf, PathBuf>,
+    /// 既知のフォルダ（`known_folders`）。
+    known: Result<KnownFolders, String>,
     /// `create_dir` が作るフォルダの所有者（`None` なら作ったと言うが置かない＝消された）。
     created_owner: Option<String>,
     create_error: Option<PathBuf>,
@@ -563,6 +574,7 @@ impl Fake {
             root: Ok(root_path()),
             me: Ok(sid(USER)),
             not_accounts: Vec::new(),
+            transient_accounts: Vec::new(),
             install: Ok(ok_report()),
             uninstall: Ok(UninstallOutcome {
                 stop: StopAttempt::NotRunning,
@@ -574,11 +586,20 @@ impl Fake {
             service_acl: Ok(()),
             autostart: Ok(()),
             dirs: RefCell::new(BTreeMap::new()),
+            final_paths: BTreeMap::new(),
+            known: Ok(known()),
             created_owner: Some("S-1-5-32-544".to_string()),
             create_error: None,
             reset_error: None,
             pin_error: None,
         }
+    }
+
+    /// 開いたフォルダの本当のパス（`final_path`）を差し替える（監査 Must 1 の反証:
+    /// 途中の要素のジャンクションで別の場所を開かされた状況）。
+    fn with_final_path(mut self, dir: PathBuf, real: PathBuf) -> Self {
+        self.final_paths.insert(dir, real);
+        self
     }
 
     fn with_dir(self, dir: PathBuf, is_dir: bool, reparse: bool, owner: &str) -> Self {
@@ -620,13 +641,22 @@ impl ElevOps for Fake {
         self.record("machine_root".into());
         self.root.clone()
     }
+    fn known_folders(&self) -> Result<KnownFolders, String> {
+        self.known.clone()
+    }
     fn current_user_sid(&self) -> Result<InstallUserSid, String> {
         self.me.clone()
     }
-    fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), String> {
+    fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), AccountCheck> {
         self.record(format!("check {}", sid.as_str()));
         if self.not_accounts.iter().any(|s| s == sid.as_str()) {
-            Err("利用者のアカウントではありません（グループなど）".to_string())
+            Err(AccountCheck::NotAnAccount(
+                "利用者のアカウントではありません（グループなど）".to_string(),
+            ))
+        } else if self.transient_accounts.iter().any(|s| s == sid.as_str()) {
+            Err(AccountCheck::Transient(
+                "RPC サーバーを利用できません".to_string(),
+            ))
         } else {
             Ok(())
         }
@@ -679,8 +709,14 @@ impl ElevOps for Fake {
             return Err("os error 32".to_string());
         }
         let shared = self.dirs.borrow().get(dir).cloned();
+        let final_path = self
+            .final_paths
+            .get(dir)
+            .cloned()
+            .unwrap_or_else(|| dir.to_path_buf());
         Ok(shared.map(|info| FakePinned {
             path: dir.to_path_buf(),
+            final_path,
             info,
             reset: if self.reset_error.as_deref() == Some(dir) {
                 Err("os error 5".to_string())
@@ -850,6 +886,58 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert!(lines
         .iter()
         .any(|l| matches!(l, ConsoleLine::Stderr(t) if t.contains("何も登録していません"))));
+
+    // 監査 Nit 2: 一時的に確かめられないだけなら 1（アカウントでないの 64 と分ける）。
+    // 監査 P2: どちらの失敗でも、ディレクトリを 1 つも作らない。
+    let mut fake = Fake::new();
+    fake.transient_accounts = vec![OTHER.to_string()];
+    let (code, _) = exec(
+        Action::ServiceInstall {
+            install_user_sid: Some(sid(OTHER)),
+        },
+        &fake,
+    );
+    assert_eq!(code, EXIT_FAILED);
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| c.starts_with("create") || c.starts_with("install")));
+}
+
+/// 監査 P2: 不正な SID（アカウントでない）・使えないルートを渡しても、確かめが終わる前に
+/// ディレクトリを 1 つも作らない（`create` を呼ばない）。
+#[test]
+fn service_install_creates_nothing_until_checks_pass() {
+    // アカウントでない SID。
+    let mut fake = Fake::new();
+    fake.not_accounts = vec![OTHER.to_string()];
+    exec(
+        Action::ServiceInstall {
+            install_user_sid: Some(sid(OTHER)),
+        },
+        &fake,
+    );
+    assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
+
+    // 使えないルート。
+    let mut fake = Fake::new();
+    fake.root = Err("CHRONOGAZER_ROOT が相対パスです".to_string());
+    exec(
+        Action::ServiceInstall {
+            install_user_sid: None,
+        },
+        &fake,
+    );
+    assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
+
+    // grant-data-acl も、記録が使えない・ルートが使えないときは開かない・作らない。
+    let mut fake = Fake::new();
+    fake.recorded = Ok(Some("S-1-5-32-545".to_string()));
+    exec(Action::GrantDataAcl, &fake);
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| c.starts_with("create") || c.starts_with("pin")));
 }
 
 /// 反証: 最初の失敗で止まる（後の手順を呼ばない）。終了コードはその手順のもの。
@@ -1008,7 +1096,7 @@ fn later_steps_use_the_recorded_sid_not_the_requested_one() {
     });
     fake.install = Ok(report);
     fake.recorded = Ok(Some(OTHER.to_string()));
-    let (code, _) = exec(
+    let (code, lines) = exec(
         Action::ServiceInstall {
             install_user_sid: None,
         },
@@ -1019,6 +1107,12 @@ fn later_steps_use_the_recorded_sid_not_the_requested_one() {
     assert!(fake
         .calls()
         .contains(&format!("create {} {OTHER}", root_path().display())));
+    // 監査 Nit 4: 記録の SID を使ったことを 1 行で知らせる（指定（実行した利用者 USER）とは別）。
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stdout(t)
+            if t.contains(&format!("記録済みの {OTHER} を使います")) && t.contains(USER))),
+        "{lines:#?}"
+    );
 }
 
 // --- 単独のアクション ---------------------------------------------------------------
@@ -1359,6 +1453,49 @@ fn grant_data_acl_refuses_a_root_owned_by_someone_else() {
     assert_eq!(
         lines[0],
         stderr(&format!("chronogazer-elev: データのルート（{}）は所有者（{STRANGER}）が SYSTEM・Administrators・インストール利用者のどれでもありません。乗っ取りの恐れがあるため、書き直さずに止めます（中身と所有者を確かめ、必要なら管理者が所有権を取り直してからもう一度実行してください）", root_path().display()))
+    );
+}
+
+/// 監査 Must 1: ルートの本当のパス（`final_path`）が期待と違えば（途中の要素がジャンクション・
+/// 8.3 の短い名前で別の場所を開かされた）、書き直さずに 1。secrets 以降は見ない。
+#[test]
+fn grant_data_acl_refuses_a_root_whose_real_path_differs() {
+    let elsewhere = PathBuf::from(PF).join("ChronoGazer");
+    let fake = Fake::new()
+        .with_dir(root_path(), true, false, "S-1-5-32-544")
+        .with_final_path(root_path(), elsewhere.clone());
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_FAILED);
+    assert!(resets(&fake).is_empty());
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("本当の場所") && t.contains(&elsewhere.display().to_string()))),
+        "{lines:#?}"
+    );
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| c.contains(&secrets().display().to_string())));
+}
+
+/// 監査 Must 1: 本当のパスが期待と一致していても、既知のシステムフォルダ（Program Files
+/// など。8.3 の短い名前で deny-list を抜けた場合を含む）に重なれば、`verify_final_path` の
+/// `reject_well_known_root` で断る。
+#[test]
+fn grant_data_acl_refuses_a_real_path_in_a_system_folder() {
+    // 期待も本当のパスも Program Files\ChronoGazer（8.3 の短い名前で deny-list を抜け、
+    // 開いたら Program Files 配下だった、を模す）。一致はするが、本当のパスへの
+    // `reject_well_known_root` で断る。
+    let pf_root = PathBuf::from(PF).join("ChronoGazer");
+    let mut fake = Fake::new().with_dir(pf_root.clone(), true, false, "S-1-5-32-544");
+    fake.root = Ok(pf_root.clone());
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_FAILED);
+    assert!(resets(&fake).is_empty());
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("本当の場所が使えません"))),
+        "{lines:#?}"
     );
 }
 

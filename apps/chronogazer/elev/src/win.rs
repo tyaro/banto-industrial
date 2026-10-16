@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 
 use crate::{
-    resolve_machine_root, ElevOps, KnownFolders, MachineEnvironment, PinnedDirOps,
+    resolve_machine_root, AccountCheck, ElevOps, KnownFolders, MachineEnvironment, PinnedDirOps,
     MACHINE_ENVIRONMENT_KEY, OPERATORS_GROUP, SERVER_EXE_FILE_NAME,
 };
 
@@ -140,7 +140,11 @@ impl PinnedDirOps for PinnedDir {
         PinnedDir::info(self).clone()
     }
 
-    fn reset_acl(&self, access: &DirAccess) -> Result<(), String> {
+    fn final_path(&self) -> PathBuf {
+        PinnedDir::final_path(self).to_path_buf()
+    }
+
+    fn reset_acl(&self, access: &DirAccess) -> Result<banto_secret_store::acl::ResetSkips, String> {
         PinnedDir::reset_acl(self, access).map_err(|err| err.to_string())
     }
 }
@@ -176,12 +180,23 @@ impl ElevOps for WindowsOps {
         resolve_machine_root(&RegistryMachineEnvironment)
     }
 
+    fn known_folders(&self) -> Result<KnownFolders, String> {
+        RegistryMachineEnvironment.known_folders()
+    }
+
     fn current_user_sid(&self) -> Result<InstallUserSid, String> {
         banto_secret_store::acl::current_user_sid().map_err(|err| err.to_string())
     }
 
-    fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), String> {
-        banto_secret_store::acl::check_user_account(sid).map_err(|err| err.to_string())
+    fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), AccountCheck> {
+        banto_secret_store::acl::check_user_account(sid).map_err(|err| match err {
+            // `ERROR_NONE_MAPPED`・グループなど = アカウントでない（使い方の誤り）。
+            banto_secret_store::SecretStoreError::InvalidUserSid(_) => {
+                AccountCheck::NotAnAccount(err.to_string())
+            }
+            // RPC 不達・アクセス拒否など = 一時的な失敗。
+            _ => AccountCheck::Transient(err.to_string()),
+        })
     }
 
     fn install(
@@ -247,9 +262,10 @@ mod tests {
         assert!(crate::reject_well_known_root(&program_data, &known).is_err());
     }
 
-    /// 読むだけ: 無い値は `None`、ある値（`Path` は必ずある）は読める。
+    /// 読むだけ: 無い値は `None`、ある値（`Path` は必ずある）は読める（`RRF_NOEXPAND` で
+    /// REG_EXPAND_SZ も保存された文字のまま返る。`%…%` を展開しない）。
     #[test]
-    fn hklm_strings_read_without_expanding() {
+    fn hklm_missing_value_is_none_and_existing_reads() {
         assert_eq!(
             read_hklm_string(
                 MACHINE_ENVIRONMENT_KEY,
@@ -257,7 +273,6 @@ mod tests {
             ),
             Ok(None)
         );
-        // `Path` は REG_EXPAND_SZ で `%SystemRoot%` を含むことが多い。展開しないこと。
         let path = read_hklm_string(MACHINE_ENVIRONMENT_KEY, "Path")
             .unwrap()
             .expect("マシンの Path");
@@ -288,10 +303,13 @@ mod tests {
         fn machine_root(&self) -> Result<PathBuf, String> {
             Ok(self.root.clone())
         }
+        fn known_folders(&self) -> Result<KnownFolders, String> {
+            RegistryMachineEnvironment.known_folders()
+        }
         fn current_user_sid(&self) -> Result<InstallUserSid, String> {
             WindowsOps.current_user_sid()
         }
-        fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), String> {
+        fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), AccountCheck> {
             WindowsOps.check_user_account(sid)
         }
         fn install(
@@ -396,8 +414,9 @@ mod tests {
     /// grant-data-acl の書き直しで変わらない。
     #[test]
     fn grant_data_acl_does_not_rewrite_outside_a_child_junction() {
-        // 伝播がジャンクションを辿らないことそのものは banto-secret-store の
-        // `propagation_does_not_follow_child_junctions_or_symlinks`（管理者でなくても走る）。
+        // 自前の再帰がジャンクション・ハードリンクを辿らないことそのものは
+        // banto-secret-store の `reset_acl_*` のテストが固定する（elev はそれを本物の
+        // grant-data-acl で一通り通す）。
         if !elevated_admin("grant_data_acl_does_not_rewrite_outside_a_child_junction") {
             return;
         }
