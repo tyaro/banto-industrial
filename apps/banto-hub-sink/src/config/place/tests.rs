@@ -938,6 +938,38 @@ mod windows {
         );
     }
 
+    /// 別のプロセスが設定ファイルを書き込みに開いていれば、開くこと自体が共有違反で失敗し、
+    /// 「書き込みに開かれています」として起動しない（`open_child_file` の共有は読み取りだけ -
+    /// #648 の P1）。閉じれば、次は保護の確かめまで進む。管理者でなくても走る。
+    #[test]
+    fn a_file_open_for_writing_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let base = long(base.path());
+        let dir = base.join("sink");
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("banto-hub-sink.toml");
+        std::fs::write(&file, TOML).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        let got = read_protected(&WindowsPlaceOps, &paths(&dir, vec![]));
+        assert!(
+            matches!(&got, Err(ConfigError::FileInUse { path }) if path == &file),
+            "{got:?}"
+        );
+        assert!(
+            got.as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("書き込みに開かれています"),
+            "{got:?}"
+        );
+        drop(writer);
+        let got = read_protected(&WindowsPlaceOps, &paths(&dir, vec![]));
+        assert!(
+            matches!(&got, Err(ConfigError::Unprotected { .. })),
+            "{got:?}"
+        );
+    }
+
     /// `prepare-sink-config` と同じ形（SYSTEM・Administrators だけ・所有者 Administrators）の
     /// 置き場とファイルは読める。管理者でしか作れない（CI）。
     #[test]
