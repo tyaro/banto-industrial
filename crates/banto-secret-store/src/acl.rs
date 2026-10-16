@@ -11,6 +11,8 @@
 //! | インストール利用者（指定したときだけ） | 変更（`0x1301BF`、ACL の変更・所有権の取得は含まない） | OI CI |
 //!
 //! SDDL では `D:P(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)(A;OICI;0x1301bf;;;<SID>)`。
+//! 利用者を複数にした [`DirAccess::with_install_users`]（#626 PR-A）では、最後の行が
+//! 利用者ごとに 1 つずつ並び（重複はまとめる）、所有者はそのどの利用者でもよい。
 //! Users・Everyone・Authenticated Users・Operators のグループには何も付けない。
 //! 中のファイルは OI で同じ ACE を継承する（一時ファイルも作った時点で継承し、
 //! 同じディレクトリの中の置換なのでそのまま本体になる）。
@@ -153,6 +155,8 @@
 //! [`InstallUserSid`] の文字列の検査と [`check_dacl`] の判定は純関数で、全 OS で
 //! テストする。
 
+pub mod guard;
+
 use crate::error::{AclMismatch, Result, SecretStoreError};
 
 /// SYSTEM。
@@ -168,7 +172,7 @@ pub const MODIFY_ACCESS_MASK: u32 = 0x0013_01BF;
 /// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`。
 pub const INHERIT_FLAGS: u8 = 0x03;
 /// `INHERITED_ACE`。
-const INHERITED_ACE_FLAG: u8 = 0x10;
+pub(crate) const INHERITED_ACE_FLAG: u8 = 0x10;
 /// `ACCESS_ALLOWED_ACE_TYPE`。
 pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
@@ -222,27 +226,58 @@ impl InstallUserSid {
 }
 
 /// 保存先ディレクトリに付ける権限の指定。
+///
+/// 利用者（「変更」を付ける相手）は 0 人（[`DirAccess::service_only`]）・1 人
+/// （[`DirAccess::with_install_user`]）・複数（[`DirAccess::with_install_users`]、#626
+/// PR-A。banto-hub の profile は owner が複数でありうる）。どの形でも DACL は保護され、
+/// SYSTEM・Administrators のフルと、利用者ごとの「変更」がちょうど 1 つずつ並ぶ。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirAccess {
-    install_user: Option<InstallUserSid>,
+    /// 重複なし・指定の順。
+    install_users: Vec<InstallUserSid>,
 }
 
 impl DirAccess {
     /// SYSTEM と Administrators だけ（サービスだけが使う構成）。
     pub fn service_only() -> Self {
-        Self { install_user: None }
+        Self {
+            install_users: Vec::new(),
+        }
     }
 
     /// SYSTEM と Administrators に加えて、インストール利用者に「変更」（決定 4 -
     /// 昇格していないデスクトップの host が同じキーを読み書きするため）。
     pub fn with_install_user(sid: InstallUserSid) -> Self {
         Self {
-            install_user: Some(sid),
+            install_users: vec![sid],
         }
     }
 
+    /// SYSTEM と Administrators に加えて、`sids` の**それぞれに**「変更」（#626 PR-A）。
+    /// 同じ SID は 1 つにまとめる（順は最初に現れた順）。空なら [`DirAccess::service_only`]、
+    /// 1 人なら [`DirAccess::with_install_user`] と同じ値になる。
+    pub fn with_install_users(sids: impl IntoIterator<Item = InstallUserSid>) -> Self {
+        let mut install_users: Vec<InstallUserSid> = Vec::new();
+        for sid in sids {
+            if !install_users.contains(&sid) {
+                install_users.push(sid);
+            }
+        }
+        Self { install_users }
+    }
+
+    /// 利用者が**ちょうど 1 人**のときだけ、その SID（0 人・複数なら `None`。複数を
+    /// 扱うときは [`DirAccess::install_users`]）。
     pub fn install_user(&self) -> Option<&InstallUserSid> {
-        self.install_user.as_ref()
+        match self.install_users.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// 「変更」を付ける利用者の全員（重複なし・指定の順）。
+    pub fn install_users(&self) -> &[InstallUserSid] {
+        &self.install_users
     }
 
     /// 期待する ACE（SID・アクセス）。
@@ -251,7 +286,7 @@ impl DirAccess {
             (SYSTEM_SID.to_owned(), FULL_ACCESS_MASK),
             (ADMINISTRATORS_SID.to_owned(), FULL_ACCESS_MASK),
         ];
-        if let Some(user) = &self.install_user {
+        for user in &self.install_users {
             aces.push((user.0.clone(), MODIFY_ACCESS_MASK));
         }
         aces
@@ -260,7 +295,7 @@ impl DirAccess {
     /// 作るとき・直すときに使う SDDL（`D:P` = 保護された DACL）。
     pub fn sddl(&self) -> String {
         let mut sddl = format!("D:P(A;OICI;FA;;;{SYSTEM_SID})(A;OICI;FA;;;{ADMINISTRATORS_SID})");
-        if let Some(user) = &self.install_user {
+        for user in &self.install_users {
             sddl.push_str(&format!("(A;OICI;{MODIFY_ACCESS_MASK:#x};;;{})", user.0));
         }
         sddl
@@ -333,9 +368,9 @@ pub fn check_dacl(
     let owner_allowed = observed.owner == SYSTEM_SID
         || observed.owner == ADMINISTRATORS_SID
         || access
-            .install_user
-            .as_ref()
-            .is_some_and(|user| user.0 == observed.owner);
+            .install_users
+            .iter()
+            .any(|user| user.0 == observed.owner);
     if !owner_allowed {
         return Err(AclMismatch::DisallowedOwner {
             sid: observed.owner.clone(),
@@ -397,15 +432,20 @@ pub fn create_dir_if_absent(dir: &std::path::Path, access: &DirAccess) -> Result
 /// 作り、`CreateDirectoryW` が「既にある」になって保護された DACL が付かない。
 /// `Path::components` は途中の `.` を読み飛ばすので、文字列の要素で見る。
 fn reject_dot_segments(dir: &std::path::Path) -> Result<()> {
-    let text = dir.to_string_lossy();
-    let is_separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
-    if text
-        .split(is_separator)
-        .any(|segment| !segment.is_empty() && segment.chars().all(|c| c == '.'))
-    {
+    if has_dot_segment(dir) {
         return Err(SecretStoreError::DotSegmentInPath);
     }
     Ok(())
+}
+
+/// パスに `.`・`..`（と点だけの名前）の要素があるか（文字列の要素で見る。区切りは
+/// Windows では `\` と `/`、それ以外は `/`）。[`reject_dot_segments`] と
+/// [`guard::resolve_machine_root`] が使う。
+pub(crate) fn has_dot_segment(path: &std::path::Path) -> bool {
+    let text = path.to_string_lossy();
+    let is_separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    text.split(is_separator)
+        .any(|segment| !segment.is_empty() && segment.chars().all(|c| c == '.'))
 }
 
 /// 既にあるディレクトリの DACL を、期待の形に**書き直す**（明示的な修復。
@@ -496,6 +536,14 @@ impl PinnedDir {
     /// 開いたハンドルから読んだ属性と所有者。
     pub fn info(&self) -> &PinnedDirInfo {
         &self.info
+    }
+
+    /// 開いたままの**ハンドルから**、今の DACL と所有者を読む（`GetSecurityInfo`。パスを
+    /// 使わないので、開いた後に途中の要素をすり替えられても別の場所を読まない。#626 PR-A:
+    /// banto-hub の `grant-profile-acl` が、書き直す前に引き継ぐ利用者を決めるため -
+    /// [`guard::plan_carry_over`]）。読むだけで何も変えない。
+    pub fn read_dacl(&self) -> Result<ObservedDacl> {
+        imp::read_dacl_of_handle(self.handle.raw())
     }
 
     /// 開いたままの**ハンドルで**、このフォルダと中の子へ、保護された DACL と所有者
@@ -680,9 +728,14 @@ mod imp {
 
     /// インストール利用者の SID が利用者のアカウントであること（グループではない）。
     pub(super) fn ensure_user_account(access: &DirAccess) -> Result<()> {
-        let Some(user) = access.install_user() else {
-            return Ok(());
-        };
+        // 複数の利用者（#626 PR-A）は全員を確かめる。1 人でも通らなければ何もしない。
+        for user in access.install_users() {
+            ensure_one_user_account(user)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_one_user_account(user: &super::InstallUserSid) -> Result<()> {
         let text = wide_str(user.as_str());
         let mut sid: PSID = std::ptr::null_mut();
         // SAFETY: `text` は NUL 終端。成功すれば `sid` は LocalAlloc の領域。
@@ -1259,8 +1312,40 @@ mod imp {
         if status != 0 {
             return Err(api("GetNamedSecurityInfoW", status));
         }
-        let sd = LocalBox(sd);
+        observe(LocalBox(sd), owner, dacl)
+    }
 
+    /// 開いたハンドルから DACL と所有者を読む（`GetSecurityInfo`。パスを使わない。
+    /// [`super::PinnedDir::read_dacl`]、#626 PR-A）。`handle` は `READ_CONTROL` を持つこと。
+    pub(super) fn read_dacl_of_handle(handle: HANDLE) -> Result<ObservedDacl> {
+        use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `handle` は READ_CONTROL で開いた有効なハンドル。成功すれば `sd` は
+        // LocalAlloc の領域で、`owner`・`dacl` はその中を指す（`sd` を解放するまで有効）。
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if status != 0 {
+            return Err(api("GetSecurityInfo", status));
+        }
+        observe(LocalBox(sd), owner, dacl)
+    }
+
+    /// 読んだ記述子（`sd`）の中の所有者と DACL を [`ObservedDacl`] にする。`owner`・`dacl` は
+    /// `sd` の中を指す（`sd` はここで持ち、読み終わってから解放する）。
+    fn observe(sd: LocalBox, owner: PSID, dacl: *mut ACL) -> Result<ObservedDacl> {
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
         // SAFETY: `sd` は有効な記述子。
@@ -1723,6 +1808,105 @@ mod tests {
             check_dacl(&service_owned_by_user, &DirAccess::service_only()),
             Err(AclMismatch::DisallowedOwner { .. })
         ));
+    }
+
+    /// #626 PR-A: 複数の利用者。0 人・1 人は既存の 2 つと同じ値・同じ SDDL で、重複は
+    /// まとめ、`install_user()` は 1 人のときだけ返す。
+    #[test]
+    fn multi_user_access_keeps_the_single_forms_and_lists_every_user() {
+        const OTHER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1002";
+        let other = InstallUserSid::parse(OTHER).unwrap();
+        assert_eq!(
+            DirAccess::with_install_users(Vec::new()),
+            DirAccess::service_only()
+        );
+        assert_eq!(
+            DirAccess::with_install_users([user()]),
+            DirAccess::with_install_user(user())
+        );
+        assert_eq!(
+            DirAccess::with_install_users([user(), user()]),
+            DirAccess::with_install_user(user())
+        );
+        let multi = DirAccess::with_install_users([user(), other.clone(), user()]);
+        assert_eq!(multi.install_users(), &[user(), other.clone()][..]);
+        assert_eq!(multi.install_user(), None);
+        assert_eq!(DirAccess::service_only().install_user(), None);
+        assert_eq!(
+            DirAccess::with_install_user(user()).install_user(),
+            Some(&user())
+        );
+        assert_eq!(
+            multi.sddl(),
+            format!(
+                "D:P(A;OICI;FA;;;S-1-5-18)(A;OICI;FA;;;S-1-5-32-544)(A;OICI;0x1301bf;;;{USER})(A;OICI;0x1301bf;;;{OTHER})"
+            )
+        );
+    }
+
+    /// #626 PR-A: 複数の利用者の確かめ。全員の「変更」がちょうど 1 つずつあり、所有者は
+    /// どの利用者でもよい。1 人欠けても・余分な利用者がいても・利用者が重なっても断る。
+    #[test]
+    fn check_accepts_exactly_every_user_of_a_multi_user_access() {
+        const OTHER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1002";
+        const THIRD: &str = "S-1-5-21-1111111111-2222222222-3333333333-1003";
+        let other = InstallUserSid::parse(OTHER).unwrap();
+        let multi = DirAccess::with_install_users([user(), other.clone()]);
+        let both = |owner: &str| {
+            let mut dacl = good(owner);
+            dacl.aces
+                .as_mut()
+                .unwrap()
+                .push(ace(OTHER, MODIFY_ACCESS_MASK));
+            dacl
+        };
+        for owner in [SYSTEM_SID, ADMINISTRATORS_SID, USER, OTHER] {
+            assert_eq!(check_dacl(&both(owner), &multi), Ok(()), "{owner}");
+        }
+        let mut reordered = both(SYSTEM_SID);
+        reordered.aces.as_mut().unwrap().reverse();
+        assert_eq!(check_dacl(&reordered, &multi), Ok(()));
+        // 1 人欠ける（今の 1 人の形）。
+        assert_eq!(
+            check_dacl(&good(SYSTEM_SID), &multi),
+            Err(AclMismatch::MissingAce {
+                sid: OTHER.to_owned(),
+                mask: MODIFY_ACCESS_MASK
+            })
+        );
+        // 余分な利用者（1 人の指定に 2 人の DACL）。
+        assert!(matches!(
+            check_dacl(&both(SYSTEM_SID), &DirAccess::with_install_user(user())),
+            Err(AclMismatch::UnexpectedAce { ref sid, .. }) if sid == OTHER
+        ));
+        // 3 人目・重なった ACE。
+        let mut third = both(SYSTEM_SID);
+        third
+            .aces
+            .as_mut()
+            .unwrap()
+            .push(ace(THIRD, MODIFY_ACCESS_MASK));
+        assert!(matches!(
+            check_dacl(&third, &multi),
+            Err(AclMismatch::UnexpectedAce { ref sid, .. }) if sid == THIRD
+        ));
+        let mut duplicated = both(SYSTEM_SID);
+        duplicated
+            .aces
+            .as_mut()
+            .unwrap()
+            .push(ace(OTHER, MODIFY_ACCESS_MASK));
+        assert!(matches!(
+            check_dacl(&duplicated, &multi),
+            Err(AclMismatch::UnexpectedAce { ref sid, .. }) if sid == OTHER
+        ));
+        // 利用者でない所有者。
+        assert_eq!(
+            check_dacl(&both(THIRD), &multi),
+            Err(AclMismatch::DisallowedOwner {
+                sid: THIRD.to_owned()
+            })
+        );
     }
 
     #[test]
@@ -2712,6 +2896,159 @@ mod tests {
                 "{err:?}"
             );
             assert!(!dir.exists(), "拒んだときはフォルダを作らない");
+        }
+
+        // --- #626 PR-A: 複数の利用者・ハンドルからの読み取り ----------------------------
+
+        /// 2 人目の利用者のアカウント（同じ領域の組み込みの Guest・DefaultAccount・
+        /// Administrator のどれか。どれも `SidTypeUser` で、無効でも解決できる）。この PC で
+        /// 1 つも解決できなければ `None`（理由を出して skip する）。本物のアカウントは
+        /// 変えない（DACL に SID を書くだけ）。
+        fn another_user() -> Option<InstallUserSid> {
+            let me = me();
+            let domain = me.as_str().rsplit_once('-').unwrap().0;
+            ["501", "503", "500"]
+                .into_iter()
+                .filter_map(|rid| InstallUserSid::parse(&format!("{domain}-{rid}")).ok())
+                .find(|sid| *sid != me && check_user_account(sid).is_ok())
+        }
+
+        /// 作る・確かめる（昇格していなくても走る）: 複数の利用者の DACL で作り、読み
+        /// 戻すと SY・BA のフルと、利用者ごとの「変更」がちょうど 1 つずつ並ぶ。1 人の
+        /// 指定では確かめが通らない。
+        #[test]
+        fn a_multi_user_directory_is_created_and_verified() {
+            let Some(other) = another_user() else {
+                eprintln!("skip a_multi_user_directory_is_created_and_verified: 2 人目の利用者のアカウントが無い");
+                return;
+            };
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("multi");
+            let access = DirAccess::with_install_users([me(), other.clone()]);
+            ensure_dir(&dir, &access).unwrap();
+
+            let dacl = read_dir_dacl(&dir).unwrap();
+            assert!(dacl.protected, "{dacl:?}");
+            let mut aces: Vec<_> = dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|a| (a.ace_type, a.flags, a.sid.clone(), a.mask))
+                .collect();
+            aces.sort();
+            let mut expected = vec![
+                (0, INHERIT_FLAGS, SYSTEM_SID.to_owned(), FULL_ACCESS_MASK),
+                (
+                    0,
+                    INHERIT_FLAGS,
+                    ADMINISTRATORS_SID.to_owned(),
+                    FULL_ACCESS_MASK,
+                ),
+                (
+                    0,
+                    INHERIT_FLAGS,
+                    me().as_str().to_owned(),
+                    MODIFY_ACCESS_MASK,
+                ),
+                (
+                    0,
+                    INHERIT_FLAGS,
+                    other.as_str().to_owned(),
+                    MODIFY_ACCESS_MASK,
+                ),
+            ];
+            expected.sort();
+            assert_eq!(aces, expected, "{dacl:?}");
+            has_no_broad_groups(&dacl);
+
+            verify_dir(&dir, &access).unwrap();
+            // 利用者の順を変えても同じ形として通る。
+            verify_dir(&dir, &DirAccess::with_install_users([other.clone(), me()])).unwrap();
+            // 1 人だけの指定では、もう 1 人の ACE が余分。
+            let err = verify_dir(&dir, &DirAccess::with_install_user(me())).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SecretStoreError::AclMismatch(AclMismatch::UnexpectedAce { ref sid, .. })
+                        if sid == other.as_str()
+                ),
+                "{err:?}"
+            );
+        }
+
+        /// 読むだけ（昇格していなくても走る）: `PinnedDir::read_dacl` は開いたハンドルから、
+        /// パスで読むのと同じ DACL と所有者を返す。
+        #[test]
+        fn read_dacl_reads_the_same_descriptor_from_the_handle() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("plain");
+            std::fs::create_dir(&dir).unwrap();
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            let from_handle = pinned.read_dacl().unwrap();
+            assert_eq!(from_handle, read_dir_dacl(&dir).unwrap());
+            assert_eq!(from_handle.owner, pinned.info().owner);
+            // 継承のフォルダ（tempdir の下）なので保護されておらず、継承の ACE がある。
+            assert!(!from_handle.protected, "{from_handle:?}");
+            assert!(from_handle
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|a| a.flags & INHERITED_ACE_FLAG != 0));
+        }
+
+        /// 書き直す（管理者のとき = CI）: 複数の利用者の `DirAccess` で `reset_acl` すると、
+        /// フォルダ・中のフォルダ・ファイルのどれも、読み戻した DACL が期待どおり（所有者は
+        /// Administrators）。書き直した後にハンドルから読んだ DACL を `plan_carry_over` に
+        /// かけると、ちょうどその利用者たちを引き継ぎ、何も落とさない。
+        #[test]
+        fn a_multi_user_reset_writes_every_user_and_carries_them_over() {
+            if !is_elevated_admin() {
+                eprintln!(
+                    "skip a_multi_user_reset_writes_every_user_and_carries_them_over: 昇格していない（CI で確かめる）"
+                );
+                return;
+            }
+            let Some(other) = another_user() else {
+                eprintln!("skip a_multi_user_reset_writes_every_user_and_carries_them_over: 2 人目の利用者のアカウントが無い");
+                return;
+            };
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            let child = dir.join("child");
+            std::fs::create_dir_all(&child).unwrap();
+            let file = child.join("f.txt");
+            std::fs::write(&file, b"x").unwrap();
+
+            let access = DirAccess::with_install_users([me(), other.clone()]);
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            // 書き直す前の DACL（tempdir の継承）からは、利用者を 1 人も引き継がない
+            // （継承の ACE は落とす側）。
+            let before = guard::plan_carry_over(&pinned.read_dacl().unwrap(), guard::account_kind);
+            assert!(before.carried.is_empty(), "{before:?}");
+            assert!(before
+                .dropped
+                .iter()
+                .all(|d| d.reason == guard::DropReason::Inherited));
+
+            let skips = pinned.reset_acl(&access, Recurse::Tree).unwrap();
+            assert_eq!(skips, ResetSkips::default());
+            for path in [&dir, &child] {
+                let dacl = read_dir_dacl(path).unwrap();
+                assert_eq!(dacl.owner, ADMINISTRATORS_SID, "{}", path.display());
+                check_dacl(&dacl, &access)
+                    .unwrap_or_else(|e| panic!("{}: {e:?} {dacl:?}", path.display()));
+            }
+            let file_dacl = read_dir_dacl(&file).unwrap();
+            assert_eq!(file_dacl.owner, ADMINISTRATORS_SID);
+            check_file_dacl(&file_dacl, &access);
+
+            let after = guard::plan_carry_over(&pinned.read_dacl().unwrap(), guard::account_kind);
+            assert_eq!(after.carried, vec![me(), other]);
+            assert!(after.dropped.is_empty(), "{after:?}");
+            assert!(!after.null_dacl);
+            drop(pinned);
         }
     }
 }

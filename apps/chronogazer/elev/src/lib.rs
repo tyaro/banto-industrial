@@ -11,7 +11,11 @@
 //!   トークン）は共有 crate `banto-service-elev`、ディレクトリの DACL は
 //!   `banto-secret-store`、サービスの登録は `chronogazer_core::server_service::install_with`
 //!   （`chronogazer-server.exe install` と同じ手順をプロセスの中で呼ぶ）。ここが持つのは
-//!   アクションの一覧・引数の検証・手順の順序・文言・終了コードだけ。
+//!   アクションの一覧・引数の検証・手順の順序・文言・終了コードだけ。書き直す前の
+//!   製品に依らない確かめ（既知のフォルダ・マシンの環境からのルート・本当のパスの比較・
+//!   所有者の確かめ）の判断は `banto_secret_store::acl::guard`（#626 PR-A で移した。
+//!   banto-hub-elev と共有）で、ここは ChronoGazer の名前（`CHRONOGAZER_ROOT`・
+//!   `ChronoGazer`）を渡して、型の付いた理由を文言にするだけ。
 //! - **アクションは固定の 7 つ**（[`Action`]。最初の引数が名前と完全に一致すること。
 //!   大文字小文字の違い・余計な引数・重ねた引数・空の引数は使い方の誤り
 //!   [`EXIT_USAGE`]）。サービス名（`ChronoGazer`）・グループ名
@@ -79,7 +83,7 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::{PinnedDirInfo, ADMINISTRATORS_SID, SYSTEM_SID};
+use banto_secret_store::acl::{guard, PinnedDirInfo};
 use banto_secret_store::{DirAccess, InstallUserSid};
 use banto_service_control::{ConsoleLine, ServiceManagerError, UninstallError, UninstallOutcome};
 use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome, OperatorsGroup};
@@ -117,10 +121,6 @@ pub const OPERATORS_GROUP: OperatorsGroup = OperatorsGroup {
 
 /// 登録する実行ファイルの名前（この exe の隣にあること）。
 pub const SERVER_EXE_FILE_NAME: &str = "chronogazer-server.exe";
-
-/// マシンの環境変数のレジストリキー（`HKLM` の下）。
-pub const MACHINE_ENVIRONMENT_KEY: &str =
-    r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 
 /// `--install-user-sid`。
 pub const INSTALL_USER_SID_FLAG: &str = "--install-user-sid";
@@ -289,92 +289,47 @@ pub fn finished_line(action: &Action, code: i32) -> ConsoleLine {
 }
 
 // --- データのルート（マシンの環境） ------------------------------------------------
+//
+// 判断（既知のフォルダ・マシンの環境からのルート・本当のパスの比較）は
+// `banto_secret_store::acl::guard`（#626 PR-A で移した。banto-hub-elev と共有）。ここに
+// 残すのは ChronoGazer の名前（`CHRONOGAZER_ROOT`・`ChronoGazer`）と文言だけ。
 
-/// マシンの環境の読み取り（Windows の実装は `win::RegistryMachineEnvironment`。
-/// テストは偽物）。
-pub trait MachineEnvironment {
-    /// `HKLM\…\Session Manager\Environment` の `CHRONOGAZER_ROOT` の生の値（展開しない）。
-    /// 無ければ `Ok(None)`。
-    fn chronogazer_root(&self) -> Result<Option<String>, String>;
-    /// マシンの ProgramData（`SHGetKnownFolderPath(FOLDERID_ProgramData)`）。
-    fn program_data(&self) -> Result<PathBuf, String>;
-    /// ルートにしてはいけない既知のフォルダ（[`reject_well_known_root`]）。取れなければ
-    /// 理由（ルートを決めずに止める）。
-    fn known_folders(&self) -> Result<KnownFolders, String>;
-}
-
-/// ルートにしてはいけない既知のフォルダ（#392 B3-3b の監査 B1。Windows は
-/// `SHGetKnownFolderPath` で取る）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct KnownFolders {
-    /// そのもの・祖先・**中**も断る（OS・プログラムの置き場、だれでも書ける共有の場所）:
-    /// Windows・System・SystemX86・Program Files（x86・Common を含む）・Public。
-    pub forbidden_inside: Vec<PathBuf>,
-    /// そのもの・祖先だけを断る（中は使ってよい）: ProgramData・UserProfiles（`C:\Users`）。
-    pub forbidden_itself: Vec<PathBuf>,
-}
-
-/// パスの要素（大文字小文字を無視して比べるため小文字にする）。
-fn lower_components(path: &Path) -> Vec<String> {
-    path.components()
-        .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
-        .collect()
-}
-
-/// `inner` が `outer` そのものか、その中か（要素の境界で比べる。`Program Files Evil` は
-/// `Program Files` の中ではない）。
-fn is_same_or_inside(inner: &Path, outer: &Path) -> bool {
-    let inner = lower_components(inner);
-    let outer = lower_components(outer);
-    !outer.is_empty() && inner.len() >= outer.len() && inner[..outer.len()] == outer[..]
-}
+/// マシンの環境の読み取り・既知のフォルダ（`banto_secret_store::acl::guard` から）。
+pub use banto_secret_store::acl::guard::{
+    KnownFolders, MachineEnvironment, MACHINE_ENVIRONMENT_KEY,
+};
 
 /// ルートが既知のシステムフォルダ・ドライブのルート・ネットワークの場所でないことを
 /// 確かめる（純関数。監査 B1）。`grant-data-acl` の書き直しはルートの下の**全体**に
 /// 伝わるので、`D:\`・`C:\ProgramData`・`C:\Users` などをルートにすると、他の製品・
-/// 利用者のデータの ACL を書き換えてしまう。断るのは:
-///
-/// - UNC・`\\?\`・`\\.\`（`\\` か `//` で始まる）。
-/// - ドライブのルート（普通の名前の要素が 1 つも無い）。
-/// - [`KnownFolders::forbidden_inside`] のそのもの・祖先・中。
-/// - [`KnownFolders::forbidden_itself`] のそのもの・祖先。
+/// 利用者のデータの ACL を書き換えてしまう。判断は
+/// `banto_secret_store::acl::guard::reject_well_known_root`、ここは文言だけ。
 pub fn reject_well_known_root(root: &Path, known: &KnownFolders) -> Result<(), String> {
-    let text = root.to_string_lossy();
-    if text.starts_with("\\\\") || text.starts_with("//") {
-        return Err(format!(
+    guard::reject_well_known_root(root, known).map_err(|refusal| well_known_line(root, &refusal))
+}
+
+/// [`guard::WellKnownRootRefusal`] の文言（純関数）。
+fn well_known_line(root: &Path, refusal: &guard::WellKnownRootRefusal) -> String {
+    match refusal {
+        guard::WellKnownRootRefusal::NetworkOrSpecial => format!(
             "データのルート（{}）はネットワークの場所か特殊なパス（\\\\…）です。ローカルのドライブのフォルダにしてください",
             root.display()
-        ));
-    }
-    if !root
-        .components()
-        .any(|c| matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err(format!(
+        ),
+        guard::WellKnownRootRefusal::DriveRoot => format!(
             "データのルート（{}）はドライブのルートです。専用のフォルダ（例: D:\\ChronoGazer）にしてください",
             root.display()
-        ));
+        ),
+        guard::WellKnownRootRefusal::OverlapsProtected(folder) => format!(
+            "データのルート（{}）は OS・プログラムの置き場か共有のフォルダ（{}）に重なります。専用のフォルダにしてください",
+            root.display(),
+            folder.display()
+        ),
+        guard::WellKnownRootRefusal::ContainsProtected(folder) => format!(
+            "データのルート（{}）は {} そのものかその上のフォルダです。その下の専用のフォルダにしてください",
+            root.display(),
+            folder.display()
+        ),
     }
-    for folder in &known.forbidden_inside {
-        if is_same_or_inside(root, folder) || is_same_or_inside(folder, root) {
-            return Err(format!(
-                "データのルート（{}）は OS・プログラムの置き場か共有のフォルダ（{}）に重なります。専用のフォルダにしてください",
-                root.display(),
-                folder.display()
-            ));
-        }
-    }
-    for folder in &known.forbidden_itself {
-        if is_same_or_inside(folder, root) {
-            return Err(format!(
-                "データのルート（{}）は {} そのものかその上のフォルダです。その下の専用のフォルダにしてください",
-                root.display(),
-                folder.display()
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// データのルートを**マシンの環境だけ**から決める（純関数。モジュール doc）:
@@ -386,41 +341,38 @@ pub fn reject_well_known_root(root: &Path, known: &KnownFolders) -> Result<(), S
 /// 3. どちらも `server_host::validate_root`（絶対パス・`.`/`..` なし）と
 ///    [`reject_well_known_root`]（システムフォルダ・ドライブのルート・UNC でない）を
 ///    通ること。
+///
+/// 判断は `banto_secret_store::acl::guard::resolve_machine_root`、ここは名前と文言だけ。
 pub fn resolve_machine_root(env: &impl MachineEnvironment) -> Result<PathBuf, String> {
-    let root = match env.chronogazer_root() {
-        Err(error) => {
-            return Err(format!(
-                "マシンの環境変数 {ROOT_ENV} を読めませんでした: {error}"
-            ))
+    use guard::MachineRootError as E;
+    guard::resolve_machine_root(env, ROOT_ENV, PRODUCT_DIR_NAME).map_err(|error| match error {
+        E::VariableUnreadable(error) => {
+            format!("マシンの環境変数 {ROOT_ENV} を読めませんでした: {error}")
         }
-        Ok(Some(value)) if !value.is_empty() => {
-            if value.contains('%') {
-                return Err(format!(
-                    "マシンの環境変数 {ROOT_ENV}（{value:?}）は展開が要る値です。展開しない絶対パス（例: D:\\ChronoGazer）にしてください"
-                ));
-            }
-            PathBuf::from(value)
+        E::NeedsExpansion(value) => format!(
+            "マシンの環境変数 {ROOT_ENV}（{value:?}）は展開が要る値です。展開しない絶対パス（例: D:\\ChronoGazer）にしてください"
+        ),
+        E::ProgramDataUnavailable(error) => {
+            format!("ProgramData の場所を取れませんでした: {error}")
         }
-        Ok(_) => env
-            .program_data()
-            .map_err(|error| format!("ProgramData の場所を取れませんでした: {error}"))?
-            .join(PRODUCT_DIR_NAME),
-    };
-    chronogazer_core::server_host::validate_root(&root)?;
-    let known = env
-        .known_folders()
-        .map_err(|error| format!("既知のフォルダの場所を取れませんでした: {error}"))?;
-    reject_well_known_root(&root, &known)?;
-    Ok(root)
+        // 形の誤りの文言は `chronogazer-server` と同じ（`server_host::validate_root`）。
+        E::InvalidForm { root, .. } => chronogazer_core::server_host::validate_root(&root)
+            .err()
+            .unwrap_or_else(|| format!("データのルート（{}）が使えません", root.display())),
+        E::KnownFoldersUnavailable(error) => {
+            format!("既知のフォルダの場所を取れませんでした: {error}")
+        }
+        E::WellKnown { root, refusal } => well_known_line(&root, &refusal),
+    })
 }
 
 /// `exe` が Program Files（`program_files_dirs` のどれか。x86 を含む）の**中**にあるか
 /// （純関数。要素の境界で比べ、大文字小文字は無視。監査 B2）。場所が 1 つも分からなければ
 /// `false`（止める側）。
 pub fn is_inside_program_files(exe: &Path, program_files_dirs: &[PathBuf]) -> bool {
-    program_files_dirs.iter().any(|dir| {
-        is_same_or_inside(exe, dir) && lower_components(exe).len() > lower_components(dir).len()
-    })
+    program_files_dirs
+        .iter()
+        .any(|dir| guard::is_same_or_inside(exe, dir) && !guard::paths_match(exe, dir))
 }
 
 /// 登録されているコマンドライン（SCM の生の文字列）が、`"<exe>" run-service` と同じか
@@ -442,65 +394,11 @@ pub fn registered_command_matches(raw: &str, exe: &Path) -> bool {
 }
 
 // --- データの ACL の計画 ----------------------------------------------------------
+//
+// 判断（[`data_acl_plan`]）は `banto_secret_store::acl::guard`（#626 PR-A で移した）。
 
-/// 扱うフォルダの今の状態（[`data_acl_plan`] の入力）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirState {
-    /// 無い。
-    Absent,
-    /// ある（辿らずに開いたハンドルから読んだ属性と所有者）。
-    Present(PinnedDirInfo),
-}
-
-/// フォルダに対してすること。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataAclStep {
-    /// 保護された DACL で作る（`create_dir_if_absent`）。
-    Create,
-    /// 保護された DACL に書き直す（`PinnedDir::reset_acl`）。
-    Reset,
-}
-
-/// 書き直さずに止める理由。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DataAclRefusal {
-    /// reparse point（ジャンクション・シンボリックリンクなど）。
-    ReparsePoint,
-    /// フォルダではない。
-    NotADirectory,
-    /// 所有者が許す範囲の外（乗っ取りの恐れ）。
-    ForeignOwner(String),
-}
-
-/// フォルダの状態から、することか止める理由を決める（純関数）。所有者として許すのは
-/// SYSTEM・Administrators・インストール利用者と、`elevated_user`（この昇格した
-/// プロセスのトークンの利用者。管理者なので信頼してよく、「作成者を所有者に」の
-/// 方針の PC でこのプロセスが作ったフォルダを断らないため）。
-pub fn data_acl_plan(
-    state: &DirState,
-    install_user: &InstallUserSid,
-    elevated_user: Option<&str>,
-) -> Result<DataAclStep, DataAclRefusal> {
-    let info = match state {
-        DirState::Absent => return Ok(DataAclStep::Create),
-        DirState::Present(info) => info,
-    };
-    if info.is_reparse_point {
-        return Err(DataAclRefusal::ReparsePoint);
-    }
-    if !info.is_dir {
-        return Err(DataAclRefusal::NotADirectory);
-    }
-    let owner = info.owner.as_str();
-    let allowed = owner == SYSTEM_SID
-        || owner == ADMINISTRATORS_SID
-        || owner == install_user.as_str()
-        || elevated_user == Some(owner);
-    if !allowed {
-        return Err(DataAclRefusal::ForeignOwner(owner.to_string()));
-    }
-    Ok(DataAclStep::Reset)
-}
+/// 扱うフォルダの状態・すること・断る理由と、その判断（純関数）。
+pub use banto_secret_store::acl::guard::{data_acl_plan, DataAclRefusal, DataAclStep, DirState};
 
 // --- OS の操作 ---------------------------------------------------------------------
 
@@ -654,24 +552,28 @@ fn verify_final_path<P: PinnedDirOps>(
     out: Out<'_>,
 ) -> Result<(), i32> {
     let real = pinned.final_path();
-    if lower_components(&real) != lower_components(expected) {
-        out(err(&format!(
-            "{}（{}）の本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります。書き直さずに止めます",
-            kind.label(),
-            expected.display(),
-            real.display()
-        )));
-        return Err(EXIT_FAILED);
+    // 判断は `guard::check_real_path`（#626 PR-A）。ここは文言だけ。
+    match guard::check_real_path(&real, expected, known) {
+        Ok(()) => Ok(()),
+        Err(guard::RealPathRefusal::Mismatch) => {
+            out(err(&format!(
+                "{}（{}）の本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります。書き直さずに止めます",
+                kind.label(),
+                expected.display(),
+                real.display()
+            )));
+            Err(EXIT_FAILED)
+        }
+        Err(guard::RealPathRefusal::WellKnown(refusal)) => {
+            out(err(&format!(
+                "{}（{}）の本当の場所が使えません: {}。書き直さずに止めます",
+                kind.label(),
+                real.display(),
+                well_known_line(&real, &refusal)
+            )));
+            Err(EXIT_FAILED)
+        }
     }
-    if let Err(reason) = reject_well_known_root(&real, known) {
-        out(err(&format!(
-            "{}（{}）の本当の場所が使えません: {reason}。書き直さずに止めます",
-            kind.label(),
-            real.display()
-        )));
-        return Err(EXIT_FAILED);
-    }
-    Ok(())
 }
 
 /// 記録したインストール利用者（無い・不正・利用者のアカウントでない → 2、読めない → 1）。

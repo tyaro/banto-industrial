@@ -30,7 +30,14 @@
 //!   無ければその DACL で作り、あれば確かめ、違えば失敗する（自動では直さない。
 //!   詳細と理由は [`acl`] の doc）。同じ形の DACL で、**無いときだけ**ディレクトリを
 //!   作る口 [`acl::create_dir_if_absent`] もある（ChronoGazer のデータのルート、#392
-//!   B2-4a。既にあれば触らない）。
+//!   B2-4a。既にあれば触らない）。利用者は 0 人・1 人のほか、複数にもできる
+//!   （[`DirAccess::with_install_users`]、#626 PR-A。利用者ごとに「変更」）。
+//! - [`acl::guard`]（#626 PR-A。chronogazer-elev から移した）: 昇格ヘルパーが DACL を
+//!   書き直す前の、製品に依らない確かめ（既知のフォルダ・マシンの環境からのルート・
+//!   本当のパスの比較・所有者の確かめ・書き直す前の DACL から引き継ぐ利用者の選び分け）。
+//!   判断は純関数で、断る理由は型の付いた値で返す（文言は製品の elev が持つ）。
+//!   ChronoGazer の `chronogazer-elev` が使い、banto-hub の `banto-hub-elev` も #626 PR-B で
+//!   使う。
 //! - `impl banto_hub_bootstrap::KeyStore for FileSecretStore<_>`（`src/keystore.rs`）。
 //!
 //! # DPAPI machine スコープの意味と限界（計画書 §6）

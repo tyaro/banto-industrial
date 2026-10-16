@@ -204,7 +204,9 @@ struct FakeEnv {
 }
 
 impl MachineEnvironment for FakeEnv {
-    fn chronogazer_root(&self) -> Result<Option<String>, String> {
+    fn machine_variable(&self, name: &str) -> Result<Option<String>, String> {
+        // ChronoGazer の変数だけを読む（#626 PR-A で共有の部品に移した後も同じ）。
+        assert_eq!(name, "CHRONOGAZER_ROOT");
         self.root.clone()
     }
     fn program_data(&self) -> Result<PathBuf, String> {
