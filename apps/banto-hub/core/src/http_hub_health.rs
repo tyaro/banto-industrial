@@ -56,10 +56,12 @@
 //!      `profile.lock`（[`crate::profile_lock::ProfileOwnerInfo`]、
 //!      所有者 PID・ホスト種別のみを持ち profile-id 自体は持たない -
 //!      `crate::profile_paths`のモジュール doc 参照）を読む -
-//!      無い・壊れている・読めない場合は[`HealthOutcome::MutexOwnerUnknown`]。
-//!      **アクセス拒否だけは[`HealthOutcome::Healthy`]**（#626 PR-C、
-//!      [`classify_lock_read`]。profile ディレクトリを保護すると所有者以外の
-//!      利用者は読めない。ワイヤの profile-id 一致は上で済んでいる）。
+//!      無い・壊れている（形が通常のファイルでない場合を含む）・その他の
+//!      I/O エラーは[`HealthOutcome::MutexOwnerUnknown`]。
+//!      **アクセス拒否（通常のファイルに見えるのに開けない）だけは
+//!      [`HealthOutcome::Healthy`]**（#626 PR-C、[`classify_lock_read`]。
+//!      profile ディレクトリを保護すると所有者以外の利用者は開けない。
+//!      ワイヤの profile-id 一致は上で済んでいる）。
 //! 5. 上記のいずれでもなければ [`HealthOutcome::Healthy`]。
 
 use std::io::{Read, Write};
@@ -181,9 +183,12 @@ impl HubHealthProbe for HttpHubHealthProbe {
 /// 管理者）は `profile.lock` を開けない。だが `profile.lock` は「所有者 PID と
 /// ホスト種別」を持つ二次確認で、**profile-id を持たない**。同じ Hub であること
 /// の決め手はワイヤの `x-banto-hub-profile-id` の一致で、それは先に通っている。
-/// 拒否は「ファイルが在って、この利用者には見せない」ことの確かな証拠であり
-/// （無ければ `NotFound`）、別の Hub に繋ぐ根拠は増えも減りもしない。一方、
-/// 無い・壊れている・読めないは従来どおり安全側（`MutexOwnerUnknown`）に保つ。
+/// 拒否は「この利用者のトークンでは開けない」ことしか示さない（途中の
+/// ディレクトリの検索権限が無くても同じ。ファイルが在る確かな証拠ではない）。
+/// それでも、別の Hub に繋ぐ根拠は増えも減りもしない（決め手はワイヤ）。
+/// ディレクトリなど通常のファイルでないものは、`banto-instance-lock` が辿らない
+/// metadata で見分けて `Corrupt` にするので、ここへは来ない。一方、無い・
+/// 壊れている・その他の I/O は従来どおり安全側（`MutexOwnerUnknown`）に保つ。
 fn classify_lock_read(
     read: Result<crate::profile_lock::ProfileOwnerInfo, OwnerInfoError>,
     version: String,
@@ -600,6 +605,22 @@ mod tests {
         assert_eq!(
             probe.probe("default", port),
             Ok(HealthOutcome::WrongProfileOrVersion)
+        );
+    }
+
+    /// `profile.lock` がディレクトリ（ACL は変えない）: Windows の `File::open` は
+    /// `PermissionDenied` を返すが、拒否ではないので Healthy にしてはならない。
+    #[test]
+    fn probe_returns_mutex_owner_unknown_when_lock_is_a_directory() {
+        let port = spawn_canned_http_server(ok_response(VALID_OPENAPI_BODY));
+        let root = TempDir::new("http-hub-health-dir-lock");
+        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        std::fs::create_dir_all(paths.profile_dir.join(LOCK_FILE_NAME)).unwrap();
+        let probe =
+            HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::MutexOwnerUnknown)
         );
     }
 

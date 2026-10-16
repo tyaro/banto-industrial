@@ -274,10 +274,13 @@ pub enum OwnerInfoError {
     /// ファイルが無い（`NotFound`）。まだ誰も取得していない、または消えた。
     #[error("診断ファイルがありません")]
     Missing,
-    /// アクセス拒否（`PermissionDenied`）。ファイルは在るが、この利用者の
-    /// トークンでは開けない（profile ディレクトリの ACL を保護した場合に、
-    /// 所有者以外の利用者がここへ来る）。**中身は分からない**ので、
-    /// 呼び出し側は「在る」ことしか前提にできない。
+    /// アクセス拒否（`PermissionDenied`）。この利用者のトークンでは開けない
+    /// （profile ディレクトリの ACL を保護した場合に、所有者以外の利用者が
+    /// ここへ来る）。**ファイルが在る確かな証拠ではない**: 途中のディレクトリの
+    /// 検索権限が無くても同じ種別になる。ただし、開けなかった対象を辿らずに
+    /// 調べられて通常のファイルでなければ（ディレクトリ・シンボリックリンク等。
+    /// Windows の `File::open` はディレクトリを `PermissionDenied` で断る）
+    /// ここへは来ず [`OwnerInfoError::Corrupt`] になる。中身は分からない。
     #[error("診断ファイルへのアクセスが拒否されました: {0}")]
     Denied(std::io::Error),
     /// 開けて読めたが JSON として解釈できない、または UTF-8 でない。
@@ -296,7 +299,17 @@ pub fn read_owner_info_detailed(lock_path: &Path) -> Result<OwnerInfo, OwnerInfo
     use std::io::ErrorKind;
     let mut file = File::open(lock_path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => OwnerInfoError::Missing,
-        ErrorKind::PermissionDenied => OwnerInfoError::Denied(e),
+        // Windows の `File::open` は `FILE_FLAG_BACKUP_SEMANTICS` を付けないので、
+        // ディレクトリも `PermissionDenied` になる。辿らない metadata で形を見て、
+        // 通常のファイルでないものは「拒否」ではなく「診断ファイルの形が壊れて
+        // いる」（`Corrupt`。中身を読めた壊れ方と同じ、呼び出し側は安全側）にする。
+        // metadata も取れないとき（拒否）は、拒否のままにする。
+        ErrorKind::PermissionDenied => match std::fs::symlink_metadata(lock_path) {
+            Ok(meta) if !meta.is_file() => {
+                OwnerInfoError::Corrupt("診断ファイルが通常のファイルではありません".to_string())
+            }
+            _ => OwnerInfoError::Denied(e),
+        },
         _ => OwnerInfoError::Io(e),
     })?;
     let mut contents = String::new();
@@ -490,6 +503,21 @@ mod tests {
             "got {result:?}"
         );
         assert!(read_owner_info(&path).is_none());
+    }
+
+    /// ディレクトリは、ACL を変えなくても Windows の `File::open` では
+    /// `PermissionDenied` になる。`Denied` にしてはならない。
+    #[test]
+    fn read_owner_info_detailed_does_not_call_a_directory_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = lock_path(&dir, "dir.lock");
+        std::fs::create_dir(&sub).unwrap();
+        let result = read_owner_info_detailed(&sub);
+        assert!(
+            !matches!(result, Err(OwnerInfoError::Denied(_))),
+            "got {result:?}"
+        );
+        assert!(result.is_err());
     }
 
     #[test]

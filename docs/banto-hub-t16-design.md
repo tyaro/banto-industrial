@@ -275,7 +275,12 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 >   `http_hub_health::classify_lock_read`が**拒否だけ**を`Healthy`にする
 >   （ワイヤの profile-id 一致は先に済んでおり、`profile.lock`は profile-id
 >   を持たない二次確認のため。無い・壊れている・その他は従来どおり
->   `MutexOwnerUnknown`）。新しい`HealthOutcome`は足していない（シェル・
+>   `MutexOwnerUnknown`）。拒否は「ファイルが在る確かな証拠」ではなく、
+>   「このトークンでは開けない」ことしか示さない（途中のディレクトリの
+>   検索権限が無くても同じ）。Windows の`File::open`はディレクトリも拒否で
+>   断るので、`PermissionDenied`のときは辿らない`symlink_metadata`で形を見て、
+>   通常のファイルでなければ`Corrupt`（= `MutexOwnerUnknown`）にする。
+>   metadata も取れないときは`Denied`のまま。新しい`HealthOutcome`は足していない（シェル・
 >   トレイは`Healthy`を既に画面接続・「サービスを開始」非表示として扱う）。
 > - 呼び出し元（`apps/banto-hub/src-tauri`）は無変更 -
 >   `HttpHubHealthProbe::with_host`等のコンストラクタのシグネチャは変わって
