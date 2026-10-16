@@ -781,3 +781,150 @@ fn a_user_with_any_deny_is_not_carried() {
     );
     assert_eq!(plan.carried, vec![sid(USER)]);
 }
+
+// --- 無いルートを作る前の、親の確かめ（#642） ---------------------------------------
+
+fn plain_dir(is_dir: bool, is_reparse_point: bool) -> PinnedDirInfo {
+    PinnedDirInfo {
+        is_dir,
+        is_reparse_point,
+        owner: ADMINISTRATORS_SID.to_string(),
+    }
+}
+
+/// 親として認めるもの（ProgramData そのもの・ドライブのルート・普通のフォルダ）と、断るもの
+/// （本当のパスの食い違い・reparse point・ファイル・ネットワーク・OS の置き場の中）。
+#[test]
+fn root_parent_table() {
+    use RootParentRefusal as R;
+    let ok = plain_dir(true, false);
+    let pd = PathBuf::from(PD);
+    let custom_parent = PathBuf::from(CUSTOM).parent().unwrap().to_path_buf();
+    #[cfg(windows)]
+    let (windows_child, unc) = (
+        PathBuf::from(r"C:\Windows\x"),
+        PathBuf::from(r"\\server\share"),
+    );
+    #[cfg(not(windows))]
+    let (windows_child, unc) = (PathBuf::from("/win/x"), PathBuf::from("//server/share"));
+    let cases: Vec<(PathBuf, PathBuf, PinnedDirInfo, Result<(), R>)> = vec![
+        (pd.clone(), pd.clone(), ok.clone(), Ok(())),
+        (
+            custom_parent.clone(),
+            custom_parent.clone(),
+            ok.clone(),
+            Ok(()),
+        ),
+        (pd.join("x"), pd.clone(), ok.clone(), Err(R::Mismatch)),
+        (
+            pd.clone(),
+            pd.clone(),
+            plain_dir(true, true),
+            Err(R::NotAPlainDirectory),
+        ),
+        (
+            pd.clone(),
+            pd.clone(),
+            plain_dir(false, false),
+            Err(R::NotAPlainDirectory),
+        ),
+        (
+            unc.clone(),
+            unc.clone(),
+            ok.clone(),
+            Err(R::NetworkOrSpecial),
+        ),
+        (
+            windows_child.clone(),
+            windows_child.clone(),
+            ok.clone(),
+            Err(R::InsideProtected(known().forbidden_inside[0].clone())),
+        ),
+    ];
+    for (real, expected, info, want) in cases {
+        assert_eq!(
+            check_root_parent(&real, &expected, &info, &known()),
+            want,
+            "{real:?} {expected:?} {info:?}"
+        );
+    }
+}
+
+// --- 名前 1 要素（#641 のオーナーレビュー Nit 2・Nit 4） -----------------------------
+
+#[test]
+fn reserved_device_names_include_com0_and_lpt0() {
+    for name in [
+        "nul",
+        "NUL",
+        "Con",
+        "prn",
+        "aux",
+        "COM0",
+        "com1",
+        "COM9",
+        "LPT0",
+        "lpt0",
+        "lpt9",
+        "nul.txt",
+        "CON .log",
+        "com\u{b9}",
+        "LPT\u{b3}",
+        "CONIN$",
+        "conout$",
+    ] {
+        assert!(is_reserved_device_name(name), "{name:?}");
+    }
+    for name in [
+        "console",
+        "nul1",
+        "com10",
+        "lpt00",
+        "auxiliary",
+        "COM",
+        "secrets",
+    ] {
+        assert!(!is_reserved_device_name(name), "{name:?}");
+    }
+}
+
+#[test]
+fn plain_child_names_refuse_what_win32_would_read_differently() {
+    for name in [
+        "secrets",
+        "hub-keys",
+        "ChronoGazer",
+        "BantoHub",
+        "a.b",
+        "x y",
+        "default",
+    ] {
+        assert!(is_plain_child_name(name), "{name:?}");
+    }
+    for name in [
+        "",
+        ".",
+        "..",
+        r"a\b",
+        "a/b",
+        "c:",
+        "x:y",
+        "a\0b",
+        "a\tb",
+        "a*",
+        "a?",
+        "a<b",
+        "a>b",
+        "a|b",
+        "a\"b",
+        "secrets.",
+        "secrets ",
+        "secrets. ",
+        "nul",
+        "COM0",
+        "lpt0",
+        "con.txt",
+    ] {
+        assert!(!is_plain_child_name(name), "{name:?}");
+    }
+}
