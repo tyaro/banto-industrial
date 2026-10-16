@@ -5,8 +5,108 @@
 import { execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { posix } from 'node:path';
 import { test } from 'node:test';
-import { classify, classifyAreas, RUST_PACKAGES } from './ci-changes.mjs';
+import { fileURLToPath } from 'node:url';
+import {
+	classify,
+	classifyAreas,
+	graphFromMetadata,
+	JOB_PACKAGES,
+	loadRustGraph,
+	owningPackage,
+	RDEPS_FULL_RATIO,
+	reverseDeps,
+	RUST_PACKAGES
+} from './ci-changes.mjs';
+
+const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+
+/**
+ * 表テスト用の固定の依存グラフ。実グラフ（`cargo metadata`）の一部を写したもの
+ * （辺が実グラフにもあることは下の「固定のグラフは実グラフの一部」で確かめる）。
+ * 実グラフが育っても表の期待が揺れないように、表はこちらで引く。
+ * @type {import('./ci-changes.mjs').RustGraph}
+ */
+const G = {
+	packages: [
+		{ name: 'banto-plc-address', dir: 'crates/banto-plc-address', deps: [] },
+		{ name: 'banto-tags', dir: 'crates/banto-tags', deps: ['banto-plc-address'] },
+		{ name: 'banto-instance-lock', dir: 'crates/banto-instance-lock', deps: [] },
+		{ name: 'banto-rtsp', dir: 'crates/banto-rtsp', deps: [] },
+		{ name: 'banto-tagclient', dir: 'crates/banto-tagclient', deps: [] },
+		{ name: 'banto-hub-bootstrap', dir: 'crates/banto-hub-bootstrap', deps: ['banto-tagclient'] },
+		{ name: 'banto-service-elev', dir: 'crates/banto-service-elev', deps: [] },
+		{ name: 'banto-service-control', dir: 'crates/banto-service-control', deps: [] },
+		{
+			name: 'banto-secret-store',
+			dir: 'crates/banto-secret-store',
+			// banto-service-elev は dev-dependency。
+			deps: ['banto-hub-bootstrap', 'banto-service-elev']
+		},
+		{
+			name: 'chronogazer-core',
+			dir: 'apps/chronogazer/core',
+			deps: [
+				'banto-hub-bootstrap',
+				'banto-instance-lock',
+				'banto-secret-store',
+				'banto-service-control',
+				'banto-tagclient',
+				'banto-tags'
+			]
+		},
+		{
+			name: 'chronogazer-elev',
+			dir: 'apps/chronogazer/elev',
+			deps: [
+				'banto-secret-store',
+				'banto-service-control',
+				'banto-service-elev',
+				'chronogazer-core'
+			]
+		},
+		{
+			name: 'chronogazer',
+			dir: 'apps/chronogazer/src-tauri',
+			deps: [
+				'banto-hub-bootstrap',
+				'banto-secret-store',
+				'banto-service-control',
+				'chronogazer-core'
+			]
+		},
+		{
+			name: 'banto-hub-core',
+			dir: 'apps/banto-hub/core',
+			deps: ['banto-instance-lock', 'banto-service-control', 'banto-service-elev', 'banto-tags']
+		},
+		{
+			name: 'banto-hub-shell',
+			dir: 'apps/banto-hub/src-tauri',
+			deps: ['banto-hub-core', 'banto-service-elev']
+		},
+		{
+			name: 'banto-hub-sink',
+			dir: 'apps/banto-hub-sink',
+			// banto-hub-core・banto-tags は dev-dependency。
+			deps: ['banto-hub-core', 'banto-service-control', 'banto-tagclient', 'banto-tags']
+		}
+	]
+};
+
+/** 実グラフ（`cargo metadata`）。1 回だけ読む。 */
+let realGraph;
+function real() {
+	realGraph ??= loadRustGraph(REPO_ROOT);
+	return realGraph;
+}
+
+/** `-p a -p b` → ['a', 'b']。`--workspace` は実グラフの全パッケージ。 */
+function rustPackages(rustArgs, graph) {
+	if (rustArgs === '--workspace') return graph.packages.map((p) => p.name);
+	return rustArgs === '' ? [] : rustArgs.split(' ').filter((w) => w !== '-p');
+}
 
 const ALL = {
 	run_lint_format: true,
@@ -15,6 +115,7 @@ const ALL = {
 	run_rust: true,
 	rust_args: '--workspace',
 	run_rust_db_source: true,
+	run_linux_clippy: true,
 	run_e2e_hub: true,
 	run_e2e_chronogazer: true
 };
@@ -26,6 +127,7 @@ const NONE = {
 	run_rust: false,
 	rust_args: '',
 	run_rust_db_source: false,
+	run_linux_clippy: false,
 	run_e2e_hub: false,
 	run_e2e_chronogazer: false
 };
@@ -45,6 +147,7 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_rust: true,
 			rust_args: HUB_RUST,
+			run_linux_clippy: true,
 			run_rust_db_source: true,
 			run_e2e_hub: true
 		}
@@ -57,6 +160,7 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_rust: true,
 			rust_args: HUB_RUST,
+			run_linux_clippy: true,
 			run_rust_db_source: true,
 			run_e2e_hub: true
 		}
@@ -69,10 +173,144 @@ const TABLE = [
 			run_frontend_chronogazer: true,
 			run_rust: true,
 			rust_args: CHRONO_RUST,
+			run_linux_clippy: true,
 			run_e2e_chronogazer: true
 		}
 	],
-	['crates の変更', ['crates/banto-tags/src/lib.rs'], ALL_BUT_FRONTEND()],
+	[
+		'crates の変更は、そのパッケージと逆依存だけ（banto-tags）',
+		['crates/banto-tags/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: [
+				'-p banto-hub-core',
+				'-p banto-hub-shell',
+				'-p banto-hub-sink',
+				'-p banto-tags',
+				'-p chronogazer',
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
+			].join(' '),
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true,
+			run_e2e_chronogazer: true
+		}
+	],
+	[
+		'banto-instance-lock だけ（両アプリの core に届く）',
+		['crates/banto-instance-lock/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: [
+				'-p banto-hub-core',
+				'-p banto-hub-shell',
+				'-p banto-hub-sink',
+				'-p banto-instance-lock',
+				'-p chronogazer',
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
+			].join(' '),
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true,
+			run_e2e_chronogazer: true
+		}
+	],
+	[
+		'banto-secret-store だけ（chronogazer にだけ届く。hub の E2E・PostgreSQL は走らない）',
+		['crates/banto-secret-store/src/acl.rs', 'crates/banto-secret-store/Cargo.toml'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: '-p banto-secret-store -p chronogazer -p chronogazer-core -p chronogazer-elev',
+			run_linux_clippy: true,
+			run_e2e_chronogazer: true
+		}
+	],
+	[
+		'banto-service-elev（dev-dependency を辿って banto-secret-store の逆依存まで届く）',
+		['crates/banto-service-elev/src/win.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: [
+				'-p banto-hub-core',
+				'-p banto-hub-shell',
+				'-p banto-hub-sink',
+				'-p banto-secret-store',
+				'-p banto-service-elev',
+				'-p chronogazer',
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
+			].join(' '),
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true,
+			run_e2e_chronogazer: true
+		}
+	],
+	[
+		'banto-tagclient（sink に届くので PostgreSQL は走る。hub の E2E は走らない）',
+		['crates/banto-tagclient/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: [
+				'-p banto-hub-bootstrap',
+				'-p banto-hub-sink',
+				'-p banto-secret-store',
+				'-p banto-tagclient',
+				'-p chronogazer',
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
+			].join(' '),
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_chronogazer: true
+		}
+	],
+	[
+		'逆依存の無い crate はその crate だけ',
+		['crates/banto-rtsp/src/lib.rs'],
+		{ ...NONE, run_rust: true, rust_args: '-p banto-rtsp' }
+	],
+	['crates/ の下でどのパッケージにも属さないパスは全体', ['crates/README.md'], ALL_BUT_FRONTEND()],
+	[
+		'グラフに無い crate（新しく足した等）は全体',
+		['crates/banto-new/src/lib.rs'],
+		ALL_BUT_FRONTEND()
+	],
+	[
+		'crates + root の Cargo.toml は全体（root が勝つ）',
+		['crates/banto-rtsp/Cargo.toml', 'Cargo.toml'],
+		ALL_BUT_FRONTEND()
+	],
+	[
+		'crates + hub の app は和集合',
+		['crates/banto-secret-store/src/lib.rs', 'apps/banto-hub/core/src/lib.rs'],
+		{
+			...NONE,
+			run_frontend_hub: true,
+			run_rust: true,
+			rust_args: [
+				'-p banto-hub-core',
+				'-p banto-hub-shell',
+				'-p banto-hub-sink',
+				'-p banto-secret-store',
+				'-p banto-tagclient',
+				'-p chronogazer',
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
+			].join(' '),
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true,
+			run_e2e_chronogazer: true
+		}
+	],
 	[
 		'chronogazer の elev だけ（昇格の境界）',
 		['apps/chronogazer/elev/src/lib.rs'],
@@ -80,6 +318,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: CHRONO_RUST,
+			run_linux_clippy: true,
 			run_frontend_chronogazer: true,
 			run_e2e_chronogazer: true
 		}
@@ -185,14 +424,15 @@ const TABLE = [
 				'-p chronogazer-elev'
 			].join(' '),
 			run_rust_db_source: true,
+			run_linux_clippy: true,
 			run_e2e_hub: true,
 			run_e2e_chronogazer: true
 		}
 	],
 	[
-		'docs + crates なら crates 側（全体）',
-		['docs/plan.md', 'crates/banto-expr/src/lib.rs'],
-		ALL_BUT_FRONTEND()
+		'docs + crates なら crates 側',
+		['docs/plan.md', 'crates/banto-rtsp/src/lib.rs'],
+		{ ...NONE, run_rust: true, rust_args: '-p banto-rtsp' }
 	],
 	['Windows 区切りでも同じ判定', ['apps\\banto-hub-sink\\src\\main.rs'], null],
 	['変更 0 件（空行だけ）', ['', '  '], NONE]
@@ -204,7 +444,7 @@ function ALL_BUT_FRONTEND() {
 
 for (const [name, files, expected] of TABLE) {
 	test(`PR: ${name}`, () => {
-		const got = classify({ event: 'pull_request', files }).jobs;
+		const got = classify({ event: 'pull_request', files, graph: G }).jobs;
 		const want = expected ?? {
 			...NONE,
 			run_rust: true,
@@ -254,21 +494,308 @@ test('リポジトリの全ファイルが明示の規則に当たる', (t) => {
 	assert.deepEqual(unmatched, []);
 });
 
-// RUST_PACKAGES の名前が workspace の実在パッケージと一致すること（改名で
+// RUST_PACKAGES・JOB_PACKAGES の名前が workspace の実在パッケージと一致すること（改名で
 // `cargo -p` が「そんなパッケージは無い」と落ちる / 対象から漏れるのを防ぐ）。
-test('RUST_PACKAGES は workspace の実在パッケージ', () => {
-	const root = new URL('../../', import.meta.url);
-	const cargo = readFileSync(new URL('Cargo.toml', root), 'utf8');
-	const members = [...cargo.match(/members\s*=\s*\[([^\]]*)\]/)[1].matchAll(/"([^"]+)"/g)].map(
-		(m) => m[1]
-	);
-	const names = new Set(
-		members.map((dir) => {
-			const toml = readFileSync(new URL(`${dir}/Cargo.toml`, root), 'utf8');
-			return toml.match(/^name\s*=\s*"([^"]+)"/m)[1];
-		})
-	);
-	for (const pkgs of Object.values(RUST_PACKAGES)) {
+test('RUST_PACKAGES・JOB_PACKAGES は workspace の実在パッケージ', () => {
+	const names = new Set(real().packages.map((p) => p.name));
+	for (const pkgs of [...Object.values(RUST_PACKAGES), ...Object.values(JOB_PACKAGES)]) {
 		for (const p of pkgs) assert.ok(names.has(p), `${p} は workspace に無い`);
 	}
+});
+
+// --- 共有 crate の依存グラフ（2026-10-16 オーナー決定）
+
+test('push（main）は crates/ の変更でもグラフに関係なくフル', () => {
+	const r = classify({ event: 'push', files: ['crates/banto-rtsp/src/lib.rs'], graph: G });
+	assert.deepEqual(r.jobs, ALL);
+});
+
+test('グラフが無い（cargo metadata の失敗）なら crates/ の変更は全体', () => {
+	const r = classify({ event: 'pull_request', files: ['crates/banto-rtsp/src/lib.rs'] });
+	assert.deepEqual(r.jobs, ALL_BUT_FRONTEND());
+	assert.match(r.crates.fallback ?? '', /依存グラフが無い/);
+});
+
+test(`逆依存が workspace の ${RDEPS_FULL_RATIO * 100}% 以上に届くなら全体`, () => {
+	// 5 パッケージのうち base を変えると 4/5 = 80% に届く。
+	const g = {
+		packages: [
+			{ name: 'base', dir: 'crates/base', deps: [] },
+			{ name: 'a', dir: 'crates/a', deps: ['base'] },
+			{ name: 'b', dir: 'crates/b', deps: ['a'] },
+			{ name: 'c', dir: 'crates/c', deps: ['base'] },
+			{ name: 'lone', dir: 'crates/lone', deps: [] }
+		]
+	};
+	const r = classify({ event: 'pull_request', files: ['crates/base/src/lib.rs'], graph: g });
+	assert.equal(r.jobs.rust_args, '--workspace');
+	assert.equal(r.jobs.run_e2e_hub, true);
+	assert.match(r.crates.fallback ?? '', /4\/5/);
+	// 2/5 = 40% なら -p のまま。
+	const r2 = classify({ event: 'pull_request', files: ['crates/a/src/lib.rs'], graph: g });
+	assert.equal(r2.jobs.rust_args, '-p a -p b');
+	assert.equal(r2.jobs.run_e2e_hub, false);
+	assert.equal(r2.crates.fallback, null);
+});
+
+test('graphFromMetadata は workspace の path 依存だけを normal・dev・build の別なく辺にする', () => {
+	const meta = {
+		workspace_root: 'D:\\ws',
+		workspace_members: ['x', 'y', 'z'],
+		packages: [
+			{
+				id: 'x',
+				name: 'x',
+				manifest_path: 'D:\\ws\\crates\\x\\Cargo.toml',
+				dependencies: [
+					{ name: 'serde', path: null, kind: null },
+					{ name: 'outside', path: 'D:\\elsewhere\\outside', kind: null }
+				]
+			},
+			{
+				id: 'y',
+				name: 'y',
+				manifest_path: 'D:\\ws\\apps\\y\\core\\Cargo.toml',
+				dependencies: [
+					{ name: 'x', path: 'D:\\ws\\crates\\x', kind: 'dev' },
+					{ name: 'x', path: 'D:\\ws\\crates\\x', kind: null, target: 'cfg(windows)' }
+				]
+			},
+			{
+				id: 'z',
+				name: 'z',
+				manifest_path: 'D:/ws/apps/z/Cargo.toml',
+				dependencies: [{ name: 'y', rename: 'yy', path: 'D:/ws/apps/y/core/', kind: 'build' }]
+			}
+		]
+	};
+	assert.deepEqual(graphFromMetadata(meta), {
+		packages: [
+			{ name: 'x', dir: 'crates/x', deps: [] },
+			{ name: 'y', dir: 'apps/y/core', deps: ['x'] },
+			{ name: 'z', dir: 'apps/z', deps: ['y'] }
+		]
+	});
+});
+
+test('ファイルの持ち主はディレクトリの最長一致（前方一致の取り違えをしない）', () => {
+	const g = {
+		packages: [
+			{ name: 'outer', dir: 'apps/hub', deps: [] },
+			{ name: 'inner', dir: 'apps/hub/core', deps: [] },
+			{ name: 'tags', dir: 'crates/banto-tags', deps: [] }
+		]
+	};
+	assert.equal(owningPackage(g, 'apps/hub/core/src/lib.rs'), 'inner');
+	assert.equal(owningPackage(g, 'apps/hub/src/x.rs'), 'outer');
+	assert.equal(owningPackage(g, 'crates/banto-tagsx/src/lib.rs'), null);
+	assert.equal(owningPackage(g, 'crates/README.md'), null);
+});
+
+test('固定のグラフ G は実グラフの一部（辺が実在する）', () => {
+	const byName = new Map(real().packages.map((p) => [p.name, p]));
+	for (const p of G.packages) {
+		const r = byName.get(p.name);
+		assert.ok(r, `${p.name} は実グラフに無い`);
+		assert.equal(p.dir, r.dir, `${p.name} のディレクトリ`);
+		for (const d of p.deps) assert.ok(r.deps.includes(d), `${p.name} → ${d} は実グラフに無い`);
+	}
+});
+
+test('実グラフ: 主な crate の逆依存が期待のパッケージを含む', () => {
+	const g = real();
+	const want = {
+		'banto-secret-store': ['chronogazer-core', 'chronogazer', 'chronogazer-elev'],
+		'banto-instance-lock': [
+			'chronogazer-core',
+			'chronogazer',
+			'chronogazer-elev',
+			'banto-hub-core',
+			'banto-hub-shell',
+			'banto-hub-sink'
+		],
+		'banto-service-control': [
+			'chronogazer-core',
+			'chronogazer',
+			'chronogazer-elev',
+			'banto-hub-core',
+			'banto-hub-shell',
+			'banto-hub-sink'
+		],
+		// dev-dependency（banto-secret-store → banto-service-elev）を辿る。
+		'banto-service-elev': ['banto-secret-store', 'chronogazer-core', 'banto-hub-core'],
+		// dev の辺（banto-hub-sink → banto-tags）も辿る。
+		'banto-tags': ['banto-hub-core', 'banto-hub-sink', 'chronogazer-core']
+	};
+	for (const [crate, users] of Object.entries(want)) {
+		const got = reverseDeps(g, [crate]);
+		for (const u of users) assert.ok(got.has(u), `${crate} の逆依存に ${u} が無い`);
+		assert.ok(got.size < g.packages.length, `${crate} の逆依存が workspace 全体になった`);
+	}
+});
+
+test('実グラフ: crates/ の下の追跡ファイルはすべてどれかのパッケージに属する', (t) => {
+	let files;
+	try {
+		files = execFileSync('git', ['ls-files', 'crates'], { encoding: 'utf8', cwd: REPO_ROOT })
+			.split('\n')
+			.filter((f) => f !== '');
+	} catch {
+		t.skip('git ls-files が使えない');
+		return;
+	}
+	const g = real();
+	assert.deepEqual(
+		files.filter((f) => owningPackage(g, f) === null),
+		[]
+	);
+});
+
+// 過去の実例（実グラフで引く）。今までの判定は 3 つとも workspace 全体だった。
+const PR_622 = [
+	'.github/scripts/ci-changes.mjs',
+	'.github/scripts/ci-changes.test.mjs',
+	'.github/workflows/ci.yml',
+	'Cargo.lock',
+	'Cargo.toml',
+	'apps/banto-hub/core/Cargo.toml',
+	'apps/banto-hub/core/src/bin/banto-hub-elev.rs',
+	'apps/banto-hub/core/src/service_elevated.rs',
+	'apps/chronogazer/README.md',
+	'apps/chronogazer/core/src/bin/chronogazer_server/service.rs',
+	'apps/chronogazer/core/src/server_service.rs',
+	'apps/chronogazer/elev/Cargo.toml',
+	'apps/chronogazer/elev/build.rs',
+	'apps/chronogazer/elev/chronogazer-elev.manifest',
+	'apps/chronogazer/elev/chronogazer-elev.rc',
+	'apps/chronogazer/elev/src/lib.rs',
+	'apps/chronogazer/elev/src/main.rs',
+	'apps/chronogazer/elev/src/tests.rs',
+	'apps/chronogazer/elev/src/win.rs',
+	'crates/banto-secret-store/Cargo.toml',
+	'crates/banto-secret-store/src/acl.rs',
+	'crates/banto-service-control/src/install.rs',
+	'docs/README.md',
+	'docs/chronogazer-service-design.md'
+];
+const PR_637 = [
+	'apps/chronogazer/elev/Cargo.toml',
+	'apps/chronogazer/elev/src/lib.rs',
+	'apps/chronogazer/elev/src/tests.rs',
+	'apps/chronogazer/elev/src/win.rs',
+	'crates/banto-secret-store/Cargo.toml',
+	'crates/banto-secret-store/src/acl.rs',
+	'crates/banto-secret-store/src/acl/guard.rs',
+	'crates/banto-secret-store/src/acl/guard/tests.rs',
+	'crates/banto-secret-store/src/acl/guard/win.rs',
+	'crates/banto-secret-store/src/lib.rs',
+	'crates/banto-service-elev/src/lib.rs',
+	'crates/banto-service-elev/src/win.rs',
+	'docs/chronogazer-service-design.md'
+];
+
+test('実例 #622: .github・root の Cargo.toml / Cargo.lock を含むので今までどおりフル', () => {
+	assert.deepEqual(classify({ event: 'pull_request', files: PR_622, graph: real() }).jobs, ALL);
+});
+
+test('実例 #622 から .github・root の Cargo を除いた部分: 逆依存に絞る', () => {
+	const files = PR_622.filter((f) => !/^(\.github\/|Cargo\.(toml|lock)$)/.test(f));
+	const g = real();
+	const jobs = classify({ event: 'pull_request', files, graph: g }).jobs;
+	const pkgs = rustPackages(jobs.rust_args, g);
+	for (const p of [
+		'banto-secret-store',
+		'banto-service-control',
+		'banto-hub-core',
+		'banto-hub-sink',
+		'chronogazer-core',
+		'chronogazer-elev'
+	]) {
+		assert.ok(pkgs.includes(p), `${p} が対象に無い`);
+	}
+	assert.ok(!pkgs.includes('banto-rtsp'));
+	assert.ok(pkgs.length < g.packages.length);
+	assert.equal(jobs.run_e2e_hub, true);
+	assert.equal(jobs.run_e2e_chronogazer, true);
+	assert.equal(jobs.run_rust_db_source, true);
+	assert.equal(jobs.run_linux_clippy, true);
+});
+
+test('実例 #637（banto-secret-store・banto-service-elev・chronogazer-elev）: 逆依存に絞る', () => {
+	const g = real();
+	const jobs = classify({ event: 'pull_request', files: PR_637, graph: g }).jobs;
+	const pkgs = rustPackages(jobs.rust_args, g);
+	for (const p of [
+		'banto-secret-store',
+		'banto-service-elev',
+		'chronogazer-core',
+		'chronogazer-elev',
+		'chronogazer',
+		// banto-service-elev → banto-hub-core（昇格の部品）。
+		'banto-hub-core',
+		'banto-hub-shell'
+	]) {
+		assert.ok(pkgs.includes(p), `${p} が対象に無い`);
+	}
+	for (const p of ['banto-tags', 'banto-plc', 'banto-rtsp', 'banto-tsquery']) {
+		assert.ok(!pkgs.includes(p), `${p} は対象に要らない`);
+	}
+	assert.equal(jobs.run_frontend_hub, false);
+	assert.equal(jobs.run_frontend_chronogazer, true);
+	assert.equal(jobs.run_e2e_hub, true);
+	assert.equal(jobs.run_e2e_chronogazer, true);
+});
+
+test('実例: banto-instance-lock だけの変更は両アプリの core と、その逆依存', () => {
+	const g = real();
+	const jobs = classify({
+		event: 'pull_request',
+		files: ['crates/banto-instance-lock/src/lib.rs'],
+		graph: g
+	}).jobs;
+	const pkgs = rustPackages(jobs.rust_args, g);
+	assert.ok(pkgs.includes('banto-instance-lock'));
+	assert.ok(pkgs.includes('chronogazer-core') && pkgs.includes('banto-hub-core'));
+	assert.ok(!pkgs.includes('banto-tags') && !pkgs.includes('banto-secret-store'));
+	assert.equal(jobs.run_frontend_hub || jobs.run_frontend_chronogazer, false);
+	assert.equal(jobs.run_e2e_hub && jobs.run_e2e_chronogazer, true);
+});
+
+// `include_str!` / `include_bytes!` で別パッケージのファイルを読む箇所は Cargo の依存に
+// 出ない。読まれる側のファイルが変わったとき、読む側のパッケージが Rust の対象に
+// 入ることを確かめる（入らなければ RUST_PACKAGES に足す。今は banto-tagclient が
+// banto-hub-core の stream.rs を読む 1 か所）。`concat!(env!("CARGO_MANIFEST_DIR"), ..)`
+// や実行時の `fs::read` は見ていない。
+test('パッケージをまたぐ include_str! / include_bytes! は読む側が対象に入る', (t) => {
+	let files;
+	try {
+		files = execFileSync('git', ['ls-files', '--', 'crates/*.rs', 'apps/*.rs'], {
+			encoding: 'utf8',
+			cwd: REPO_ROOT
+		})
+			.split('\n')
+			.filter((f) => f !== '');
+	} catch {
+		t.skip('git ls-files が使えない');
+		return;
+	}
+	const g = real();
+	const cross = [];
+	for (const file of files) {
+		const src = readFileSync(new URL(file, new URL('../../', import.meta.url)), 'utf8');
+		for (const m of src.matchAll(/include_(?:str|bytes)!\s*\(\s*"([^"]+)"\s*\)/g)) {
+			const target = posix.normalize(posix.join(posix.dirname(file), m[1]));
+			const reader = owningPackage(g, file);
+			const owner = owningPackage(g, target);
+			if (!reader || !owner || reader === owner) continue;
+			cross.push(`${reader} ← ${target}`);
+			const jobs = classify({ event: 'pull_request', files: [target], graph: g }).jobs;
+			assert.ok(
+				rustPackages(jobs.rust_args, g).includes(reader),
+				`${target} が変わっても ${reader}（${file} が読む）が対象に入らない`
+			);
+		}
+	}
+	// 走査が空振りしていないこと（既知の 1 か所を見つける）。
+	assert.ok(cross.includes('banto-tagclient ← apps/banto-hub/core/src/stream.rs'), cross.join());
 });
