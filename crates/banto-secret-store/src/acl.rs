@@ -2070,6 +2070,7 @@ mod tests {
             std::fs::hard_link(&outside_file, dir.join("hard.txt")).unwrap();
 
             let pinned = pin_dir(&dir).unwrap().unwrap();
+            let real_dir = pinned.final_path().to_path_buf();
             let access = DirAccess::with_install_user(me());
             let skips = pinned.reset_acl(&access).unwrap();
             drop(pinned);
@@ -2086,8 +2087,9 @@ mod tests {
                 check_dacl(&dacl, &access).unwrap();
             }
             // ジャンクション・ハードリンクは飛ばして記録。先は変えない。
-            assert_eq!(skips.reparse, vec![dir.join("jlink")]);
-            assert_eq!(skips.hardlink, vec![dir.join("hard.txt")]);
+            // 記録は本当のパス（TEMP が 8.3 の短い名前でも長い名前で返る）。
+            assert_eq!(skips.reparse, vec![real_dir.join("jlink")]);
+            assert_eq!(skips.hardlink, vec![real_dir.join("hard.txt")]);
             assert_eq!(read_dir_dacl(outside.path()).unwrap(), outside_before);
             assert_eq!(read_dir_dacl(&outside_file).unwrap(), outside_file_before);
 
