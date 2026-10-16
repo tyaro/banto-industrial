@@ -50,7 +50,8 @@ function currentToken(): string | null {
 async function request<T>(
 	method: 'GET' | 'PUT',
 	path: '/api/opcua-settings' | '/api/opcua-status',
-	body?: OpcUaSettings
+	body?: OpcUaSettings,
+	signal?: AbortSignal
 ): Promise<T> {
 	const headers: Record<string, string> = { ...CSRF_HEADER };
 	if (body) headers['Content-Type'] = 'application/json';
@@ -62,7 +63,8 @@ async function request<T>(
 		response = await fetch(path, {
 			method,
 			headers,
-			body: body ? JSON.stringify(body) : undefined
+			body: body ? JSON.stringify(body) : undefined,
+			signal
 		});
 	} catch {
 		throw new ProviderError({ kind: 'other', message: 'サーバーに接続できません' });
@@ -85,7 +87,12 @@ async function request<T>(
 		});
 	}
 
-	return (await response.json()) as T;
+	try {
+		return (await response.json()) as T;
+	} catch {
+		// 本文の読み取りも `signal` で打ち切られる。
+		throw new ProviderError({ kind: 'other', message: 'サーバーに接続できません' });
+	}
 }
 
 export function getOpcUaSettings(): Promise<OpcUaSettings> {
@@ -100,6 +107,7 @@ export function saveOpcUaSettings(input: OpcUaSettings): Promise<OpcUaSettings> 
 	return request<OpcUaSettings>('PUT', '/api/opcua-settings', input);
 }
 
-export function getOpcUaStatus(): Promise<OpcUaStatus> {
-	return request<OpcUaStatus>('GET', '/api/opcua-status');
+/** `signal` で打ち切れる（画面は期限つきで呼ぶ。`opcuaStatusPoller.ts`）。 */
+export function getOpcUaStatus(signal?: AbortSignal): Promise<OpcUaStatus> {
+	return request<OpcUaStatus>('GET', '/api/opcua-status', undefined, signal);
 }

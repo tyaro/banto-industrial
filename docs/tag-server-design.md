@@ -1080,7 +1080,12 @@ admin 限定の `GET /api/opcua-status` に `stopped`・`starting`・`running`
 次の PUT（有効・無効・設定の変更）が来たら後の要求が勝つ: 保存のたびに
 世代を進め、古い起動の結果は状態に書かず、開いてしまった listener は閉じる。
 次の起動は前の起動の後始末が終わってから bind する（停止と起動が重ならない）。
-Hub の起動時の復元だけは、これまでどおり起動の結果まで待つ。
+Hub の起動時の復元だけは、これまでどおり起動の結果まで待つ（上限 120 秒）。
+`OpcUaServer::start` の同期の処理（`builder.build`・鍵の生成）は blocking 用の
+スレッドで行い、async の worker を塞がない。起動処理の panic は `failed` にする。
+ここまでは #634 の PUT の非同期化で、鍵を保存して起動を速くする banto-opcua の
+`with_pki_dir`（banto-opcua#23）の採用（profile ごとの保護された場所・ACL の確認・
+`Error::Pki` の扱い・起動の直列化）は #634 に残っている。
 
 Hub の TagMap を周期的に照合し、タグの追加・削除・改名・型変更を OPC UA の
 Browse 空間へ反映する。Variable NodeId は `{connection}.{group}.{tag}` の

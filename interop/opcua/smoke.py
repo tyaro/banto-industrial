@@ -208,7 +208,9 @@ async def run(binary: Path):
                     "advertisedHost": None,
                 })
                 endpoint = f"opc.tcp://127.0.0.1:{opcua_port}/"
-                assert wait_opcua_running(rest)["endpoint"] == endpoint
+                running = wait_opcua_running(rest)
+                if running["endpoint"] != endpoint:
+                    raise RuntimeError(f"OPC UA status reports endpoint {running['endpoint']!r}, expected {endpoint!r}")
                 await wait_endpoint(endpoint)
 
                 async with Client(endpoint) as client:

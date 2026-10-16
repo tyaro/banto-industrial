@@ -1340,6 +1340,174 @@ mod tests {
             .expect("shutdown");
     }
 
+    /// OPC UA の管理 API の試験用: 生の HTTP/1.0 で 1 回呼び、状態と JSON を返す。
+    async fn call_path(
+        addr: std::net::SocketAddr,
+        path: &str,
+        operation: &str,
+        method: &str,
+        token: Option<&str>,
+        body: Option<&serde_json::Value>,
+        response_timeout: Duration,
+    ) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
+        let authorization = token
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nX-Banto-Client: banto\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|error| panic!("{operation}: connect REST: {error}"));
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .unwrap_or_else(|error| panic!("{operation}: write REST: {error}"));
+        let mut response = Vec::new();
+        tokio::time::timeout(response_timeout, stream.read_to_end(&mut response))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{operation}: REST response timed out after {response_timeout:?}")
+            })
+            .unwrap_or_else(|error| panic!("{operation}: read REST response: {error}"));
+        let raw = std::str::from_utf8(&response)
+            .unwrap_or_else(|error| panic!("{operation}: UTF-8 REST response: {error}"));
+        let (head, body) = raw
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("{operation}: HTTP response has no header/body separator"));
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("{operation}: HTTP response has no status"))
+            .parse()
+            .unwrap_or_else(|error| panic!("{operation}: invalid HTTP status: {error}"));
+        let json = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// PR #650 のオーナーレビュー P2: async の worker が 1 本でも、本物の starter が
+    /// listener を起動している（同期の鍵の生成をしている）間に、有効化の PUT と
+    /// 状態の GET が応答し、`starting` が見える。2 本の worker と非同期の待ちでは
+    /// この停止は見えないので、worker 1 本で書く。
+    ///
+    /// 反証: `real_starter` の `spawn_blocking` をやめて `OpcUaServer::start` を
+    /// そのまま await すると、鍵の生成が唯一の worker を塞ぎ、PUT が上限内に
+    /// 返らないか、最初の状態の GET が起動の終わった後の `running` になって落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn opcua_put_and_status_respond_during_a_real_start_on_one_worker() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-opcua-one-worker");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = init_db(&db_path).await.expect("init DB");
+        UsersService::new(Db::Sqlite(pool.clone()))
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup admin");
+        pool.close().await;
+        let hub = HubRuntime::start(HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_owned()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-opcua-one-worker".to_owned(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        })
+        .await
+        .expect("start Hub");
+        let addr = hub.local_addr();
+        let (status, login) = call_path(
+            addr,
+            "/api/auth/login",
+            "login",
+            "POST",
+            None,
+            Some(&serde_json::json!({"username": "admin", "password": "password123"})),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(status, 200, "{login}");
+        let token = login["token"].as_str().expect("admin token").to_owned();
+        let (status, mut settings) = call_path(
+            addr,
+            "/api/opcua-settings",
+            "read settings",
+            "GET",
+            Some(&token),
+            None,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve OPC port")
+            .local_addr()
+            .expect("OPC port")
+            .port();
+        settings["enabled"] = serde_json::json!(true);
+        settings["port"] = serde_json::json!(port);
+
+        let (status, _) = call_path(
+            addr,
+            "/api/opcua-settings",
+            "enable OPC UA (must not wait for the key generation)",
+            "PUT",
+            Some(&token),
+            Some(&settings),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, first) = call_path(
+            addr,
+            "/api/opcua-status",
+            "status during the start",
+            "GET",
+            Some(&token),
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(first["state"], "starting", "{first}");
+
+        let started = tokio::time::Instant::now();
+        loop {
+            let (_, body) = call_path(
+                addr,
+                "/api/opcua-status",
+                "status until running",
+                "GET",
+                Some(&token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await;
+            match body["state"].as_str() {
+                Some("running") => break,
+                Some("starting") => {}
+                other => panic!("unexpected OPC UA state {other:?}: {body}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "OPC UA listener did not start within 60s: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("OPC UA listener started");
+        hub.shutdown().await;
+    }
+
     /// 実 Hub の管理 API が保存・即時反映し、不正値を永続化しない。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn opcua_admin_settings_round_trip_and_reconfigure_listener() {
@@ -1363,52 +1531,6 @@ mod tests {
                 response_timeout,
             )
             .await
-        }
-
-        async fn call_path(
-            addr: std::net::SocketAddr,
-            path: &str,
-            operation: &str,
-            method: &str,
-            token: Option<&str>,
-            body: Option<&serde_json::Value>,
-            response_timeout: Duration,
-        ) -> (u16, serde_json::Value) {
-            let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
-            let authorization = token
-                .map(|token| format!("Authorization: Bearer {token}\r\n"))
-                .unwrap_or_default();
-            let request = format!(
-                "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nX-Banto-Client: banto\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                payload.len()
-            );
-            let mut stream = tokio::net::TcpStream::connect(addr)
-                .await
-                .unwrap_or_else(|error| panic!("{operation}: connect REST: {error}"));
-            stream
-                .write_all(request.as_bytes())
-                .await
-                .unwrap_or_else(|error| panic!("{operation}: write REST: {error}"));
-            let mut response = Vec::new();
-            tokio::time::timeout(response_timeout, stream.read_to_end(&mut response))
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("{operation}: REST response timed out after {response_timeout:?}")
-                })
-                .unwrap_or_else(|error| panic!("{operation}: read REST response: {error}"));
-            let raw = std::str::from_utf8(&response)
-                .unwrap_or_else(|error| panic!("{operation}: UTF-8 REST response: {error}"));
-            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or_else(|| {
-                panic!("{operation}: HTTP response has no header/body separator")
-            });
-            let status = head
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_else(|| panic!("{operation}: HTTP response has no status"))
-                .parse()
-                .unwrap_or_else(|error| panic!("{operation}: invalid HTTP status: {error}"));
-            let json = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
-            (status, json)
         }
 
         let dir = crate::test_support::TempDir::new("hub-runtime-opcua-admin");

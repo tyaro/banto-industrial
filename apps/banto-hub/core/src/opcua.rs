@@ -18,20 +18,34 @@
 //!   動いている listener は `apply` が `inner` のロックの下で止めてから
 //!   次の起動タスクを起こす。同じポートへ設定し直しても、古い listener と
 //!   取り合わない。
+//!   ただし `apply` が `stopped`（や次の `starting`）を返した時点では、古い
+//!   起動が開いた listener がまだ閉じ終わっていないことがある（古い起動
+//!   タスクが起動を終えてから閉じる）。次の bind はその後始末を待つ。
 //! - **終了**: [`OpcUaPublisher::shutdown`] は世代を進めて起動中のタスクの
 //!   終わりを待つ。起動しかけの listener を Hub の終了後に残さない。
 //! - ロックの順序: 起動タスクは `OpcUaServer::start` を待つ間 `inner` の
 //!   ロックを持たない（状態の読み取り・次の `apply` を塞がない）。
+//! - **async の worker を塞がない**（PR #650 のオーナーレビュー）:
+//!   `OpcUaServer::start` は中で同期の `builder.build`・RSA 鍵の生成
+//!   （`create_sample_keypair`）を行う。そのまま worker の上で走らせると、
+//!   worker が 1 本の runtime では鍵の生成の間、PUT の応答も状態の GET も
+//!   進まない。本番の starter は `spawn_blocking` の中で
+//!   `Handle::block_on` して blocking 用のスレッドで実行する。listener の
+//!   タスクは `Handle` の runtime（Hub の runtime）に spawn される。
+//! - **panic しても `starting` に残さない**: 起動タスクが panic したら、
+//!   世代が最新のときは `failed`（理由つき）にする。`initialize` の起動の
+//!   待ちには、ハングを検出するための有限の上限（[`SETTLE_LIMIT`]）がある。
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use banto_collect::Quality;
 use banto_opcua_server::model::{DataType, Quality as UaQuality, SampleTimestamps};
 use banto_opcua_server::{OpcUaServer, RunningServer, ServerConfig, TagReading};
-use futures_util::future::BoxFuture;
+use futures_util::future::{BoxFuture, FutureExt};
 use serde::Serialize;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -41,6 +55,10 @@ use crate::hub_log::log_err_line;
 use crate::settings::OpcUaSettings;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// `initialize` が listener の起動の結果を待つ上限（ハング検出用）。超えたら
+/// 警告の行を出して Hub の起動を続ける（状態は `starting` のまま見える）。
+const SETTLE_LIMIT: Duration = Duration::from_secs(120);
 
 /// listener の状態（#634）。`snake_case` で状態の API に出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -108,14 +126,28 @@ impl OpcUaStatus {
 type Starter =
     Arc<dyn Fn(ServerConfig) -> BoxFuture<'static, Result<RunningServer, String>> + Send + Sync>;
 
+/// 本番の starter。`OpcUaServer::start` の同期の処理（`builder.build`・
+/// 鍵の生成）を blocking 用のスレッドで行い、async の worker を塞がない
+/// （モジュール doc「async の worker を塞がない」）。
 fn real_starter() -> Starter {
     Arc::new(|config| {
         Box::pin(async move {
-            OpcUaServer::start(config)
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || handle.block_on(OpcUaServer::start(config)))
                 .await
+                .map_err(|err| format!("OPC UA の起動処理が異常終了しました: {err}"))?
                 .map_err(|err| err.to_string())
         })
     })
+}
+
+/// panic の内容を文言にする。
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "理由不明".to_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -214,12 +246,28 @@ impl OpcUaPublisher {
         self.wait_settled().await;
     }
 
-    /// 起動中でなくなるまで待つ。
+    /// 起動中でなくなるまで待つ（上限 [`SETTLE_LIMIT`]）。
     async fn wait_settled(&self) {
+        self.wait_settled_within(SETTLE_LIMIT).await;
+    }
+
+    /// 起動中でなくなるまで、`limit` を上限に待つ。上限を超えたら警告の行を
+    /// 出して戻り、`false` を返す。
+    async fn wait_settled_within(&self, limit: Duration) -> bool {
         let mut status = self.status.subscribe();
-        let _ = status
-            .wait_for(|status| status.state != OpcUaState::Starting)
-            .await;
+        let settled = tokio::time::timeout(
+            limit,
+            status.wait_for(|status| status.state != OpcUaState::Starting),
+        )
+        .await
+        .is_ok();
+        if !settled {
+            log_err_line(&format!(
+                "[WARN] banto-hub: OPC UA の起動が {} 秒以内に終わりませんでした。Hub の起動を続けます（状態は GET /api/opcua-status）",
+                limit.as_secs()
+            ));
+        }
+        settled
     }
 
     async fn apply_inner(self: &Arc<Self>, settings: &OpcUaSettings, only_if_uninitialized: bool) {
@@ -259,8 +307,33 @@ impl OpcUaPublisher {
         let previous = inner.start_task.take();
         let publisher = self.clone();
         inner.start_task = Some(tokio::spawn(async move {
-            publisher.run_start(generation, config, previous).await;
+            let outcome =
+                AssertUnwindSafe(publisher.clone().run_start(generation, config, previous))
+                    .catch_unwind()
+                    .await;
+            if let Err(panic) = outcome {
+                publisher
+                    .fail_after_panic(generation, panic_message(&*panic))
+                    .await;
+            }
         }));
+    }
+
+    /// 起動タスクが panic したとき、世代が最新で `starting` のままなら
+    /// `failed` にする（`starting` に残すと、起動の待ちが戻らず、同じ設定の
+    /// 保存が再試行にならず、画面が読み続ける）。
+    async fn fail_after_panic(&self, generation: u64, message: String) {
+        let inner = self.inner.lock().await;
+        let reason = format!("OPC UA の起動処理が異常終了しました（panic: {message}）");
+        log_err_line(&format!("banto-hub: {reason}"));
+        if inner.stopping
+            || inner.generation != generation
+            || self.status.borrow().state != OpcUaState::Starting
+        {
+            return;
+        }
+        self.status
+            .send_replace(OpcUaStatus::failed(generation, reason));
     }
 
     /// 起動タスクの本体。`generation` が最新のときだけ結果を書く。
@@ -544,11 +617,13 @@ mod tests {
                     .send(release_tx)
                     .expect("test receives start calls");
                 release_rx.await.expect("test releases the start")?;
-                OpcUaServer::start(config)
-                    .await
-                    .map_err(|err| err.to_string())
+                real_starter()(config).await
             })
         });
+        (publisher_with(starter).await, calls_rx)
+    }
+
+    async fn publisher_with(starter: Starter) -> Arc<OpcUaPublisher> {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
         let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
             crate::computed::ServerTagStore::new(),
@@ -564,7 +639,7 @@ mod tests {
             Arc::new(crate::broker_glue::BrokerSimRegistry::new()),
             computed,
         ));
-        (OpcUaPublisher::with_starter(manager, starter), calls_rx)
+        OpcUaPublisher::with_starter(manager, starter)
     }
 
     fn free_port() -> u16 {
@@ -727,6 +802,66 @@ mod tests {
             wait_state(&publisher, OpcUaState::Failed).await,
             OpcUaStatus::failed(2, "新しい起動の失敗".to_owned())
         );
+        publisher.shutdown().await;
+    }
+
+    /// PR #650 のオーナーレビュー: 起動タスクが panic したら `starting` に
+    /// 残さず `failed`（理由つき）にする。同じ設定の保存で再試行できる。
+    ///
+    /// 反証: `fail_after_panic` の呼び出しを外すと、状態が `starting` のまま
+    /// `wait_state(Failed)` が時間切れで落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_start_becomes_failed_and_can_be_retried() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starter: Starter = Arc::new({
+            let calls = calls.clone();
+            move |_config| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if call == 0 {
+                        panic!("鍵の生成で想定外の失敗");
+                    }
+                    Err("二度目は普通の失敗".to_owned())
+                })
+            }
+        });
+        let publisher = publisher_with(starter).await;
+        let settings = enabled(free_port());
+        publisher.apply(&settings).await;
+        let failed = wait_state(&publisher, OpcUaState::Failed).await;
+        assert_eq!(failed.generation, 1);
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("panic") && error.contains("鍵の生成")),
+            "{failed:?}"
+        );
+        assert!(publisher.wait_settled_within(Duration::from_secs(1)).await);
+
+        publisher.apply(&settings).await;
+        assert_eq!(
+            wait_state(&publisher, OpcUaState::Failed).await,
+            OpcUaStatus::failed(2, "二度目は普通の失敗".to_owned())
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        publisher.shutdown().await;
+    }
+
+    /// PR #650 のオーナーレビュー: 起動の待ちには有限の上限がある（起動が
+    /// 終わらなくても `initialize` が戻る）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_a_hung_start_is_bounded() {
+        let (publisher, mut calls) = gated_publisher().await;
+        publisher.apply(&enabled(free_port())).await;
+        let release = next_call(&mut calls).await;
+        assert!(
+            !publisher
+                .wait_settled_within(Duration::from_millis(200))
+                .await
+        );
+        assert_eq!(publisher.status().state, OpcUaState::Starting);
+        release.send(Err("後始末".to_owned())).expect("release");
         publisher.shutdown().await;
     }
 

@@ -37,6 +37,7 @@
 		opcUaStatusPill,
 		validateOpcUaSettings
 	} from '#lib/banto/opcuaSettingsForm.js';
+	import { OpcUaStatusPoller } from '#lib/banto/opcuaStatusPoller.js';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { errorMessage } from './shared';
 	import { mqttSettingsStore } from './mqttSettingsStore.svelte';
@@ -167,42 +168,32 @@
 	/*
 	 * listener の状態（#634）。保存（PUT）は起動の完了を待たずに返るので、
 	 * 起動中・起動済み・失敗（理由つき）・停止は `GET /api/opcua-status` で見る。
-	 * 起動中のあいだだけ 1 秒ごとに読み直す。要求に番号を振り、後から出した
-	 * 要求の応答より古い応答は捨てる（保存直後の読み直しとポーリングが
-	 * 前後しても、古い「起動中」で新しい結果を巻き戻さない）。
+	 * 起動中のあいだだけ 1 秒ごとに読み直し、1 回の取得には 5 秒の期限を
+	 * 付ける（取得が終わらずに「起動中…」で止まらない）。古い応答は捨てる。
+	 * 詳細は `OpcUaStatusPoller`（`opcuaStatusPoller.ts`）。
 	 */
 	let opcUaStatus: OpcUaStatus | null = $state(null);
 	let opcUaStatusError: string | null = $state(null);
-	let opcUaStatusTick = $state(0);
-	let opcUaStatusSeq = 0;
 	const opcUaPill = $derived(opcUaStatusPill(opcUaStatus));
-
-	async function refreshOpcUaStatus(): Promise<void> {
-		const seq = ++opcUaStatusSeq;
-		try {
-			const status = await getOpcUaStatus();
-			if (seq !== opcUaStatusSeq) return;
+	const opcUaPoller = new OpcUaStatusPoller({
+		load: (signal) => getOpcUaStatus(signal),
+		onStatus: (status) => {
 			opcUaStatus = status;
 			opcUaStatusError = null;
-		} catch (err) {
-			if (seq !== opcUaStatusSeq) return;
+		},
+		onError: (err) => {
 			opcUaStatusError = errorMessage(err);
-		} finally {
-			if (seq === opcUaStatusSeq) opcUaStatusTick += 1;
 		}
+	});
+
+	function refreshOpcUaStatus(): Promise<void> {
+		return opcUaPoller.refresh();
 	}
 
 	$effect(() => {
 		if (!canManageOpcUa) return;
 		void refreshOpcUaStatus();
-	});
-
-	$effect(() => {
-		// `opcUaStatusTick` を読むことで、読み直しが終わるたびに次を予約する。
-		void opcUaStatusTick;
-		if (!canManageOpcUa || opcUaStatus?.state !== 'starting') return;
-		const timer = setTimeout(() => void refreshOpcUaStatus(), 1000);
-		return () => clearTimeout(timer);
+		return () => opcUaPoller.stop();
 	});
 
 	$effect(() => {
