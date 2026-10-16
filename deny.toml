@@ -110,7 +110,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # 構造化エラー(SlmpError::{Device,Framing,Timeout,NotConnected,Io})を実装した
 # オーナーのフォークへ移行)を許可する。".git" 有無はどちらでも cargo 側の
 # 正規化により一致する。
-allow-git = ["https://github.com/tyaro/banto", "https://github.com/tyaro/slmp", "https://github.com/tyaro/banto-opcua", "https://github.com/FreeOpcUa/async-opcua"]
+allow-git = ["https://github.com/tyaro/banto", "https://github.com/tyaro/slmp", "https://github.com/tyaro/banto-opcua", "https://github.com/tyaro/async-opcua"]
 # #201 の banto-opcua #20 とその async-opcua 依存は公開 tag 前のため
 # Cargo.toml で commit rev を固定する。cargo-deny の required-git-spec は
 # source ごとの例外を持たないので、tag 強制を一時解除する。既存の

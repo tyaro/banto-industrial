@@ -1469,7 +1469,7 @@ mod tests {
             crypto::SecurityPolicy,
             types::{
                 AttributeId, DateTime, MessageSecurityMode, MonitoredItemCreateRequest, NodeId,
-                ReadValueId, StatusCode, TimestampsToReturn, UserTokenPolicy, Variant,
+                ReadValueId, StatusCode, TimestampsToReturn, UserTokenPolicy, Variant, WriteValue,
             },
         };
 
@@ -1663,18 +1663,104 @@ mod tests {
         };
         assert_eq!(current.source_timestamp, Some(source_at(1_700_000_000_000)));
 
+        let writes = session
+            .write(&[WriteValue::value_attr(id.clone(), Variant::Double(99.0))])
+            .await
+            .expect("Write response");
+        assert!(matches!(
+            writes.as_slice(),
+            [StatusCode::BadNotWritable | StatusCode::BadUserAccessDenied]
+        ));
+        assert_eq!(read().await.value, Some(Variant::Double(12.5)));
+        // 同じ現在値のまま複数回の照合・購読周期が経過しても、公開時刻だけで
+        // DataChange を発生させない。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), receiver.recv())
+                .await
+                .is_err(),
+            "unchanged value must not trigger DataChange"
+        );
+
+        // Hub の250ms照合とは別に100msの MonitoredItem を作る。
+        // 採取時刻が前値から50msだけ進んだ更新は次の照合・サンプリングまで
+        // 待たされるが、通知時刻を SourceTimestamp に上書きしてはならない。
+        let (sampled_sender, mut sampled_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sampled_subscription = session
+            .create_subscription(
+                Duration::from_millis(100),
+                30,
+                10,
+                0,
+                0,
+                true,
+                DataChangeCallback::new(move |value, _| {
+                    let _ = sampled_sender.send(value);
+                }),
+            )
+            .await
+            .expect("100ms subscription");
+        let mut sampled_request: MonitoredItemCreateRequest = id.clone().into();
+        sampled_request.requested_parameters.sampling_interval = 100.0;
+        let sampled_items = session
+            .create_monitored_items(
+                sampled_subscription,
+                TimestampsToReturn::Both,
+                vec![sampled_request],
+            )
+            .await
+            .expect("100ms monitored item");
+        assert_eq!(sampled_items[0].result.revised_sampling_interval, 100.0);
+        let sampled_initial =
+            tokio::time::timeout(Duration::from_secs(10), sampled_receiver.recv())
+                .await
+                .expect("100ms initial DataChange timeout")
+                .expect("100ms subscription closed");
+        assert_eq!(sampled_initial.value, Some(Variant::Double(12.5)));
+        assert_eq!(
+            sampled_initial.source_timestamp,
+            Some(source_at(1_700_000_000_000))
+        );
+        hub.manager.server_store().set(
+            &entry.tag_key,
+            Some(12.75),
+            Quality::Good,
+            1_700_000_000_050,
+        );
+        let sampled_update = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let value = sampled_receiver
+                    .recv()
+                    .await
+                    .expect("100ms subscription closed");
+                if value.value == Some(Variant::Double(12.75)) {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("100ms changed DataChange timeout");
+        assert_eq!(sampled_update.status(), StatusCode::Good);
+        assert_eq!(
+            sampled_update.source_timestamp,
+            Some(source_at(1_700_000_000_050))
+        );
+        assert_eq!(
+            read().await.source_timestamp,
+            sampled_update.source_timestamp
+        );
+
         hub.manager.server_store().set_with_observation_time(
             &entry.tag_key,
-            Some(12.5),
+            Some(12.75),
             Quality::Stale,
-            1_700_000_000_000,
+            1_700_000_000_050,
             1_700_000_001_000,
         );
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let value = receiver.recv().await.expect("subscription closed");
                 if value.status() == StatusCode::UncertainLastUsableValue {
-                    assert_eq!(value.value, Some(Variant::Double(12.5)));
+                    assert_eq!(value.value, Some(Variant::Double(12.75)));
                     assert_eq!(value.source_timestamp, Some(source_at(1_700_000_001_000)));
                     break;
                 }
@@ -1698,6 +1784,142 @@ mod tests {
         })
         .await
         .expect("Bad DataChange timeout");
+
+        hub.manager.server_store().set(
+            &entry.tag_key,
+            Some(13.5),
+            Quality::Good,
+            1_700_000_003_000,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if receiver.recv().await.expect("subscription closed").status() == StatusCode::Good
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Good recovery timeout");
+
+        let pool = hub.manager.pool();
+        sqlx::query("UPDATE tags SET enabled = 0 WHERE id = ?")
+            .bind(entry.ids.2)
+            .execute(&pool)
+            .await
+            .expect("disable tag");
+        hub.manager.rebuild().await.expect("publish disabled tag");
+        let disabled = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("disabled DataChange timeout")
+            .expect("subscription closed");
+        assert_eq!(disabled.status(), StatusCode::Bad);
+        assert_eq!(disabled.value, Some(Variant::Empty));
+        assert_eq!(read().await.status(), StatusCode::Bad);
+        assert!(hub.manager.tag_map().get(&entry.external_name).is_some());
+
+        sqlx::query("UPDATE tags SET enabled = 1 WHERE id = ?")
+            .bind(entry.ids.2)
+            .execute(&pool)
+            .await
+            .expect("re-enable tag");
+        hub.manager.rebuild().await.expect("publish enabled tag");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if receiver.recv().await.expect("subscription closed").status() == StatusCode::Good
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("re-enabled DataChange timeout");
+        assert_eq!(read().await.value, Some(Variant::Double(13.5)));
+
+        sqlx::query("UPDATE tags SET name = 'renamed' WHERE id = ?")
+            .bind(entry.ids.2)
+            .execute(&pool)
+            .await
+            .expect("rename tag");
+        hub.manager.rebuild().await.expect("publish renamed tag");
+        let old = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("rename DataChange timeout")
+            .expect("subscription closed");
+        assert_eq!(old.status(), StatusCode::BadNodeIdUnknown);
+        assert_eq!(read().await.status(), StatusCode::BadNodeIdUnknown);
+
+        let renamed_id = NodeId::new(namespace, "mem.opcua-group.renamed");
+        let renamed_read = session
+            .read(
+                &[ReadValueId {
+                    node_id: renamed_id.clone(),
+                    attribute_id: AttributeId::Value as u32,
+                    ..Default::default()
+                }],
+                TimestampsToReturn::Both,
+                0.0,
+            )
+            .await
+            .expect("Read renamed tag")
+            .remove(0);
+        assert_eq!(renamed_read.status(), StatusCode::Good);
+        assert_eq!(renamed_read.value, Some(Variant::Double(13.5)));
+
+        let (renamed_sender, mut renamed_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let renamed_subscription = session
+            .create_subscription(
+                Duration::from_millis(100),
+                30,
+                10,
+                0,
+                0,
+                true,
+                DataChangeCallback::new(move |value, _| {
+                    let _ = renamed_sender.send(value);
+                }),
+            )
+            .await
+            .expect("renamed subscription");
+        session
+            .create_monitored_items(
+                renamed_subscription,
+                TimestampsToReturn::Both,
+                vec![renamed_id.clone().into()],
+            )
+            .await
+            .expect("renamed monitored item");
+        let renamed_initial =
+            tokio::time::timeout(Duration::from_secs(10), renamed_receiver.recv())
+                .await
+                .expect("renamed initial DataChange timeout")
+                .expect("renamed subscription closed");
+        assert_eq!(renamed_initial.status(), StatusCode::Good);
+
+        TagService::new(pool)
+            .delete(entry.ids.2)
+            .await
+            .expect("delete tag");
+        hub.manager.rebuild().await.expect("publish deleted tag");
+        let deleted = tokio::time::timeout(Duration::from_secs(10), renamed_receiver.recv())
+            .await
+            .expect("delete DataChange timeout")
+            .expect("renamed subscription closed");
+        assert_eq!(deleted.status(), StatusCode::BadNodeIdUnknown);
+        let deleted_read = session
+            .read(
+                &[ReadValueId {
+                    node_id: renamed_id,
+                    attribute_id: AttributeId::Value as u32,
+                    ..Default::default()
+                }],
+                TimestampsToReturn::Both,
+                0.0,
+            )
+            .await
+            .expect("Read deleted tag")
+            .remove(0);
+        assert_eq!(deleted_read.status(), StatusCode::BadNodeIdUnknown);
 
         session.disconnect().await.expect("disconnect");
         task.abort();

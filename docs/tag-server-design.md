@@ -1064,13 +1064,14 @@ Browse 空間へ反映する。Variable NodeId は `{connection}.{group}.{tag}` 
 Boolean、その他の数値は工学値を Double で公開する。Read は共通の
 `read_current_view` から取り、Good/Bad/Stale を Good/Bad/
 UncertainLastUsableValue に写す。Good の SourceTimestamp は最後の有効サンプル、
-Bad/Stale は品質を認識した時刻で、未知なら設定しない。Read と sampling interval
-が 0 の購読はこの時刻を保持する。非ゼロの sampling interval で遅延した通知は、
-基盤の async-opcua が SourceTimestamp を次のサンプル時刻へ置き換えるため、
-厳密な採取時刻が必要な購読は sampling interval を 0 にする。
+Bad/Stale は品質を認識した時刻で、未知なら設定しない。Read と購読は
+sampling interval が 0 ms でも 100 ms でも SourceTimestamp に元の採取時刻を
+保持する。遅延通知でサンプリング時刻へ置き換わる問題は
+[async-opcua fork PR #1](https://github.com/tyaro/async-opcua/pull/1) の修正を使う。
 ServerTimestamp は公開時刻。値・品質・ソース/品質時刻が不変なら更新しないので、ServerTimestamp
-だけを理由に DataChange を起こさない。削除・改名は旧 NodeId に
-`BadNodeIdUnknown` を通知する。Read/Subscription のみで Write は拒否する。
+だけを理由に DataChange を起こさない。タグの無効化ではノードを残し、
+値を空・品質を Bad として通知する。削除・改名では旧 NodeId を取り除き、
+購読先へ `BadNodeIdUnknown` を通知する。Read/Subscription のみで Write は拒否する。
 
 Phase 2 は SecurityPolicy None / Anonymous の診断用。既定では loopback のみ、
 LAN 公開は管理者が bind と必要な advertisedHost を明示したときだけ行う。
@@ -1082,7 +1083,7 @@ RUSTSEC-2023-0071（RSA 秘密操作のタイミングサイドチャネル）�
 Phase 2 は None/Anonymous 固定でその操作を提供しないため、`deny.toml` で
 この advisory のみ期限付きで除外する。2027-01-15 または証明書・SecurityPolicy
 を扱う Phase 3 着手時の早い方で見直し、修正版が出たら依存を更新して除外を外す。
-根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/9c479973ca6e42c94e8ed9ae321fec3569035e0d/docs/adr/0001-async-opcua-base.md) に記録する。
+根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/e42a725133677b6ca8fe00dcb83d487f9cd43a67/docs/adr/0001-async-opcua-base.md) に記録する。
 
 ### 5.6 認証（全プロトコル共通)
 
