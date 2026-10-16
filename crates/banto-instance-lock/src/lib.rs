@@ -260,11 +260,66 @@ fn write_owner_info(file: &mut File, host_kind: &str) -> std::io::Result<()> {
 
 /// 診断ファイルから所有者情報を読む（読めなければ `None`）。排他の正当性には
 /// 関与しない読み取り専用ヘルパー（banto-hub の health プローブも使う）。
+///
+/// 「無い」「アクセス拒否」「壊れている」を区別したい呼び出し側は
+/// [`read_owner_info_detailed`] を使う（#626 PR-C。この関数は区別を捨てる）。
 pub fn read_owner_info(lock_path: &Path) -> Option<OwnerInfo> {
-    let mut file = File::open(lock_path).ok()?;
+    read_owner_info_detailed(lock_path).ok()
+}
+
+/// [`read_owner_info_detailed`] が読めなかった理由。エラーを 1 つの「読めない」に
+/// 潰さず、呼び出し側が扱いを変えられるようにする（#626 PR-C）。
+#[derive(Debug, Error)]
+pub enum OwnerInfoError {
+    /// ファイルが無い（`NotFound`）。まだ誰も取得していない、または消えた。
+    #[error("診断ファイルがありません")]
+    Missing,
+    /// アクセス拒否（`PermissionDenied`）。この利用者のトークンでは開けない
+    /// （profile ディレクトリの ACL を保護した場合に、所有者以外の利用者が
+    /// ここへ来る）。**ファイルが在る確かな証拠ではない**: 途中のディレクトリの
+    /// 検索権限が無くても同じ種別になる。ただし、開けなかった対象を辿らずに
+    /// 調べられて通常のファイルでなければ（ディレクトリ・シンボリックリンク等。
+    /// Windows の `File::open` はディレクトリを `PermissionDenied` で断る）
+    /// ここへは来ず [`OwnerInfoError::Corrupt`] になる。中身は分からない。
+    #[error("診断ファイルへのアクセスが拒否されました: {0}")]
+    Denied(std::io::Error),
+    /// 開けて読めたが JSON として解釈できない、または UTF-8 でない。
+    #[error("診断ファイルの中身が壊れています: {0}")]
+    Corrupt(String),
+    /// 上のいずれでもない I/O エラー（共有違反・デバイスエラー等）。
+    #[error("診断ファイルを読めませんでした: {0}")]
+    Io(std::io::Error),
+}
+
+/// [`read_owner_info`] の区別つき版。`NotFound`/`PermissionDenied` は
+/// `File::open` の失敗だけから決める（Windows の `ERROR_ACCESS_DENIED` は
+/// `PermissionDenied` に写る）。読み取り中の `InvalidData`（UTF-8 でない）と
+/// JSON の失敗は [`OwnerInfoError::Corrupt`]。
+pub fn read_owner_info_detailed(lock_path: &Path) -> Result<OwnerInfo, OwnerInfoError> {
+    use std::io::ErrorKind;
+    let mut file = File::open(lock_path).map_err(|e| match e.kind() {
+        ErrorKind::NotFound => OwnerInfoError::Missing,
+        // Windows の `File::open` は `FILE_FLAG_BACKUP_SEMANTICS` を付けないので、
+        // ディレクトリも `PermissionDenied` になる。辿らない metadata で形を見て、
+        // 通常のファイルでないものは「拒否」ではなく「診断ファイルの形が壊れて
+        // いる」（`Corrupt`。中身を読めた壊れ方と同じ、呼び出し側は安全側）にする。
+        // metadata も取れないとき（拒否）は、拒否のままにする。
+        ErrorKind::PermissionDenied => match std::fs::symlink_metadata(lock_path) {
+            Ok(meta) if !meta.is_file() => {
+                OwnerInfoError::Corrupt("診断ファイルが通常のファイルではありません".to_string())
+            }
+            _ => OwnerInfoError::Denied(e),
+        },
+        _ => OwnerInfoError::Io(e),
+    })?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents).ok()?;
-    serde_json::from_str(&contents).ok()
+    file.read_to_string(&mut contents)
+        .map_err(|e| match e.kind() {
+            ErrorKind::InvalidData => OwnerInfoError::Corrupt(e.to_string()),
+            ErrorKind::PermissionDenied => OwnerInfoError::Denied(e),
+            _ => OwnerInfoError::Io(e),
+        })?;
+    serde_json::from_str(&contents).map_err(|e| OwnerInfoError::Corrupt(e.to_string()))
 }
 
 fn now_unix_ms() -> i64 {
@@ -389,6 +444,80 @@ mod tests {
 
     fn lock_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         dir.path().join(name)
+    }
+
+    #[test]
+    fn read_owner_info_detailed_tells_missing_corrupt_and_ok_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = lock_path(&dir, "none.lock");
+        assert!(matches!(
+            read_owner_info_detailed(&missing),
+            Err(OwnerInfoError::Missing)
+        ));
+        let corrupt = lock_path(&dir, "bad.lock");
+        std::fs::write(&corrupt, "not json").unwrap();
+        assert!(matches!(
+            read_owner_info_detailed(&corrupt),
+            Err(OwnerInfoError::Corrupt(_))
+        ));
+        let non_utf8 = lock_path(&dir, "bin.lock");
+        std::fs::write(&non_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(matches!(
+            read_owner_info_detailed(&non_utf8),
+            Err(OwnerInfoError::Corrupt(_))
+        ));
+        let ok = lock_path(&dir, "ok.lock");
+        std::fs::write(
+            &ok,
+            r#"{"pid":7,"host_kind":"service","acquired_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        assert_eq!(read_owner_info_detailed(&ok).unwrap().pid, 7);
+        // 従来の薄い版は区別を捨てて None のまま。
+        assert!(read_owner_info(&missing).is_none());
+        assert!(read_owner_info(&corrupt).is_none());
+        assert!(read_owner_info(&ok).is_some());
+    }
+
+    /// 明示の拒否 ACE を付けたファイルは `Denied`（`Missing`/`Corrupt` ではない）。
+    #[cfg(windows)]
+    #[test]
+    fn read_owner_info_detailed_reports_denied_for_a_deny_ace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_path(&dir, "denied.lock");
+        std::fs::write(
+            &path,
+            r#"{"pid":7,"host_kind":"service","acquired_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        // Everyone (S-1-1-0) に「データ読み取り」の明示拒否。所有者にも効く。
+        let out = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/deny", "*S-1-1-0:(RD)"])
+            .output()
+            .expect("icacls");
+        assert!(out.status.success(), "icacls: {out:?}");
+        let result = read_owner_info_detailed(&path);
+        assert!(
+            matches!(result, Err(OwnerInfoError::Denied(_))),
+            "got {result:?}"
+        );
+        assert!(read_owner_info(&path).is_none());
+    }
+
+    /// ディレクトリは、ACL を変えなくても Windows の `File::open` では
+    /// `PermissionDenied` になる。`Denied` にしてはならない。
+    #[test]
+    fn read_owner_info_detailed_does_not_call_a_directory_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = lock_path(&dir, "dir.lock");
+        std::fs::create_dir(&sub).unwrap();
+        let result = read_owner_info_detailed(&sub);
+        assert!(
+            !matches!(result, Err(OwnerInfoError::Denied(_))),
+            "got {result:?}"
+        );
+        assert!(result.is_err());
     }
 
     #[test]

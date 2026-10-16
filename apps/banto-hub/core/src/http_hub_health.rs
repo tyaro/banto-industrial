@@ -56,7 +56,12 @@
 //!      `profile.lock`（[`crate::profile_lock::ProfileOwnerInfo`]、
 //!      所有者 PID・ホスト種別のみを持ち profile-id 自体は持たない -
 //!      `crate::profile_paths`のモジュール doc 参照）を読む -
-//!      開けない場合は[`HealthOutcome::MutexOwnerUnknown`]。
+//!      無い・壊れている（形が通常のファイルでない場合を含む）・その他の
+//!      I/O エラーは[`HealthOutcome::MutexOwnerUnknown`]。
+//!      **アクセス拒否（通常のファイルに見えるのに開けない）だけは
+//!      [`HealthOutcome::Healthy`]**（#626 PR-C、[`classify_lock_read`]。
+//!      profile ディレクトリを保護すると所有者以外の利用者は開けない。
+//!      ワイヤの profile-id 一致は上で済んでいる）。
 //! 5. 上記のいずれでもなければ [`HealthOutcome::Healthy`]。
 
 use std::io::{Read, Write};
@@ -65,7 +70,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::hub_health::{HealthOutcome, HubHealthProbe, ProbeError};
-use crate::profile_lock::{read_owner_info, LOCK_FILE_NAME};
+use crate::profile_lock::{read_owner_info_detailed, OwnerInfoError, LOCK_FILE_NAME};
 use crate::profile_paths::{resolve_profile_paths, validate_profile_id};
 
 /// probe 全体（TCP 接続 + HTTP 往復）に許すタイムアウト。desktop-plan の
@@ -154,9 +159,44 @@ impl HubHealthProbe for HttpHubHealthProbe {
             Err(_) => return Ok(HealthOutcome::WrongProfileOrVersion),
         };
         let lock_path = paths.profile_dir.join(LOCK_FILE_NAME);
-        match read_owner_info(&lock_path) {
-            Some(_owner) => Ok(HealthOutcome::Healthy { version }),
-            None => Ok(HealthOutcome::MutexOwnerUnknown),
+        Ok(classify_lock_read(
+            read_owner_info_detailed(&lock_path),
+            version,
+        ))
+    }
+}
+
+/// `profile.lock` の読み取り結果を [`HealthOutcome`] に写す純関数（#626 PR-C）。
+/// **ここに来る時点で、ワイヤ上の profile-id の一致（`expected_profile`）は
+/// 済んでいる**（呼び出し元が先に弾く）。
+///
+/// | 読み取り | 結果 |
+/// | --- | --- |
+/// | 読めた | `Healthy` |
+/// | アクセス拒否（`Denied`） | `Healthy` |
+/// | 無い（`Missing`） | `MutexOwnerUnknown` |
+/// | 壊れている（`Corrupt`） | `MutexOwnerUnknown` |
+/// | その他の I/O（`Io`） | `MutexOwnerUnknown` |
+///
+/// 拒否を `Healthy` にしてよい理由: profile ディレクトリを保護すると（#626
+/// PR-B）、所有者以外の利用者（Operators だけの利用者・UAC の分割トークンの
+/// 管理者）は `profile.lock` を開けない。だが `profile.lock` は「所有者 PID と
+/// ホスト種別」を持つ二次確認で、**profile-id を持たない**。同じ Hub であること
+/// の決め手はワイヤの `x-banto-hub-profile-id` の一致で、それは先に通っている。
+/// 拒否は「この利用者のトークンでは開けない」ことしか示さない（途中の
+/// ディレクトリの検索権限が無くても同じ。ファイルが在る確かな証拠ではない）。
+/// それでも、別の Hub に繋ぐ根拠は増えも減りもしない（決め手はワイヤ）。
+/// ディレクトリなど通常のファイルでないものは、`banto-instance-lock` が辿らない
+/// metadata で見分けて `Corrupt` にするので、ここへは来ない。一方、無い・
+/// 壊れている・その他の I/O は従来どおり安全側（`MutexOwnerUnknown`）に保つ。
+fn classify_lock_read(
+    read: Result<crate::profile_lock::ProfileOwnerInfo, OwnerInfoError>,
+    version: String,
+) -> HealthOutcome {
+    match read {
+        Ok(_) | Err(OwnerInfoError::Denied(_)) => HealthOutcome::Healthy { version },
+        Err(OwnerInfoError::Missing | OwnerInfoError::Corrupt(_) | OwnerInfoError::Io(_)) => {
+            HealthOutcome::MutexOwnerUnknown
         }
     }
 }
@@ -461,6 +501,126 @@ mod tests {
         assert_eq!(
             probe.probe("default", port),
             Ok(HealthOutcome::WrongProfileOrVersion)
+        );
+    }
+
+    fn sample_owner() -> crate::profile_lock::ProfileOwnerInfo {
+        crate::profile_lock::ProfileOwnerInfo {
+            pid: 1,
+            host_kind: "service".to_string(),
+            acquired_at_unix_ms: 0,
+        }
+    }
+
+    /// 読み取り結果 x 期待の表。拒否だけが Healthy、無い・壊れている・その他は
+    /// MutexOwnerUnknown。
+    #[test]
+    fn classify_lock_read_table() {
+        use std::io::{Error, ErrorKind};
+        let healthy = || HealthOutcome::Healthy {
+            version: "v1".to_string(),
+        };
+        let cases: Vec<(&str, Result<_, OwnerInfoError>, HealthOutcome)> = vec![
+            ("読めた", Ok(sample_owner()), healthy()),
+            (
+                "拒否",
+                Err(OwnerInfoError::Denied(Error::from(
+                    ErrorKind::PermissionDenied,
+                ))),
+                healthy(),
+            ),
+            (
+                "無い",
+                Err(OwnerInfoError::Missing),
+                HealthOutcome::MutexOwnerUnknown,
+            ),
+            (
+                "壊れている",
+                Err(OwnerInfoError::Corrupt("x".into())),
+                HealthOutcome::MutexOwnerUnknown,
+            ),
+            (
+                "その他の I/O",
+                Err(OwnerInfoError::Io(Error::from(ErrorKind::TimedOut))),
+                HealthOutcome::MutexOwnerUnknown,
+            ),
+        ];
+        for (name, read, expected) in cases {
+            assert_eq!(
+                classify_lock_read(read, "v1".to_string()),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_returns_mutex_owner_unknown_when_lock_file_corrupt() {
+        let port = spawn_canned_http_server(ok_response(VALID_OPENAPI_BODY));
+        let root = TempDir::new("http-hub-health-corrupt-lock");
+        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        std::fs::create_dir_all(&paths.profile_dir).unwrap();
+        std::fs::write(paths.profile_dir.join(LOCK_FILE_NAME), "not json").unwrap();
+        let probe =
+            HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::MutexOwnerUnknown)
+        );
+    }
+
+    /// 実際に拒否 ACE を付けた `profile.lock`: ワイヤの profile-id が一致すれば
+    /// Healthy、一致しなければ（拒否でも）WrongProfileOrVersion のまま。
+    #[cfg(windows)]
+    #[test]
+    fn probe_is_healthy_for_a_denied_lock_only_when_wire_profile_matches() {
+        let root = TempDir::new("http-hub-health-denied-lock");
+        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        std::fs::create_dir_all(&paths.profile_dir).unwrap();
+        let lock = paths.profile_dir.join(LOCK_FILE_NAME);
+        std::fs::write(
+            &lock,
+            r#"{"pid":1,"host_kind":"service","acquired_at_unix_ms":0}"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new("icacls")
+            .arg(&lock)
+            .args(["/deny", "*S-1-1-0:(RD)"])
+            .output()
+            .expect("icacls");
+        assert!(out.status.success(), "icacls: {out:?}");
+
+        let port = spawn_canned_http_server(ok_response(VALID_OPENAPI_BODY));
+        let probe =
+            HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::Healthy {
+                version: "v1".to_string()
+            })
+        );
+
+        // 拒否でも、ワイヤの profile-id が違えば別 Hub に繋がない。
+        let port = spawn_canned_http_server(ok_response(OPENAPI_BODY_WITH_OTHER_PROFILE_ID));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::WrongProfileOrVersion)
+        );
+    }
+
+    /// `profile.lock` がディレクトリ（ACL は変えない）: Windows の `File::open` は
+    /// `PermissionDenied` を返すが、拒否ではないので Healthy にしてはならない。
+    #[test]
+    fn probe_returns_mutex_owner_unknown_when_lock_is_a_directory() {
+        let port = spawn_canned_http_server(ok_response(VALID_OPENAPI_BODY));
+        let root = TempDir::new("http-hub-health-dir-lock");
+        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        std::fs::create_dir_all(paths.profile_dir.join(LOCK_FILE_NAME)).unwrap();
+        let probe =
+            HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::MutexOwnerUnknown)
         );
     }
 
