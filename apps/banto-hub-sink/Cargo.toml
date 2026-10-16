@@ -33,7 +33,7 @@ tokio = { workspace = true, features = [
     "signal",
     "time",
 ] }
-# exe 隣の `banto-hub-sink.toml`（設計 §5.6）。`deny_unknown_fields` で
+# `banto-hub-sink.toml`（設計 §5.6、#630 で置き場は `%ProgramData%\BantoHub\sink\`）。`deny_unknown_fields` で
 # 未知キーを拒否するため serde 統合が要る。Cargo.lock には既に 1.1.2 系が
 # （他の推移的依存経由で）存在するので新規バージョン系列は増えない。
 toml = "1"
@@ -50,8 +50,16 @@ banto-service-control = { path = "../../crates/banto-service-control" }
 # 制約は当たらない）。`banto-tstore` 自体を依存に足すと sqlx-sqlite が
 # サイドカーの exe へ入ってしまうため、そちらは使わず `time` を直接持つ。
 time = { version = "0.3", default-features = false, features = ["local-offset"] }
+# 設定ファイル（Hub の API キー入り）の置き場とファイルが保護されているかを、辿らずに
+# 開いたハンドルで確かめてから読む（#630。`config::place`）。unsafe な Win32 の部品は
+# この共有 crate に置き、サイドカーには複製しない。依存（banto-hub-bootstrap・
+# windows-sys など）はどれも既にこの exe の依存木にある。
+banto-secret-store = { path = "../../crates/banto-secret-store" }
 
 [dev-dependencies]
+# 管理者でしか走らない確かめ（保護された置き場から読む）のゲート（#630。
+# `config::place` のテスト。CI は管理者）。
+banto-service-elev = { path = "../../crates/banto-service-elev" }
 # 統合テスト（tests/sidecar.rs）が Hub を**プロセス内**に立てるため。
 # 本番のサイドカーは Hub に HTTP で繋ぐだけで、この依存は dev 限定
 # （配布バイナリには入らない）。
