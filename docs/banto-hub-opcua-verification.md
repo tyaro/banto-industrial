@@ -1,7 +1,7 @@
 # banto-hub OPC UA 検証
 
 状態: **自動 interop smoke 実装・Linux 実接続検証済み。Windows Service と UaExpert の実機確認は未実施。**
-最終更新: 2026-10-16（#201、Hub #627 マージ後の外部クライアント試験を追加）。
+最終更新: 2026-10-17（#636: 手動確認の手順 7 の文言の重複を直し、Machine 環境変数を消す後始末を手順 8 として追加）。2026-10-16（#201、Hub #627 マージ後の外部クライアント試験を追加）。
 
 ローカル確認: Hub `b130385`（`0.2.0-alpha.31`）、Rust 1.98.1、Python 3.12、asyncua 1.1.8。新しい CI ワークフローでの結果は PR のチェックを参照する。
 
@@ -45,7 +45,16 @@ Linux 専用の `.github/workflows/opcua-interop.yml` は Python 3.12 と固定 
 4. 初回 setup を行い、その後 `[Environment]::SetEnvironmentVariable('BANTO_ALLOW_SETUP', $null, 'Machine')` で初回 setup 用の環境変数を削除して VM を再起動する。サービス起動後に管理者として login し、internal 数値タグを作って収集を開始し、試験用 API キーの `write:mem.<group>.<tag>` スコープで初期値を書き込む。REST 専用ビルドには UI がないため、UI で操作する場合は `embed-ui` を含む配布ビルドを使う。REST の OPC UA 設定で有効化し、bind は `127.0.0.1` にする。
 5. UaExpert から `opc.tcp://127.0.0.1:<設定ポート>/` へ接続する。Security Policy None、Anonymous を選び、`Objects/Banto/mem/<group>/<tag>` を開く。
 6. タグが数値 `Double` と Good status で読めることを確認する。REST から値を変更し、UaExpert の subscription が新値を通知すること、変更がない間の Read で SourceTimestamp が保持されることを確認する。UaExpert から値を書こうとしたとき拒否され、値が変わらないことを確認する。
-7. OPC UA 設定を確認してサービスを再起動し、同じ endpoint と NodeId で接続できることを確認する。試験後は `Stop-Service BantoHub`、`.\banto-hub.exe uninstall` の順で停止・登録解除し、VM の試験 VM を破棄する。
+7. OPC UA 設定を確認してサービスを再起動し、同じ endpoint と NodeId で接続できることを確認する。試験後は `Stop-Service BantoHub`、`.\banto-hub.exe uninstall` の順で停止・登録解除し、試験 VM を破棄する。
+8. 試験 VM を破棄せずに再利用する場合は、手順 2 で設定した Machine 環境変数を管理者 PowerShell で削除する。途中で中断したときも同じく片付ける（手順 4 の前に中断すると `BANTO_ALLOW_SETUP` も残っているので、5 つすべてを消す）。
+
+   ```powershell
+   'BANTO_HUB_ROOT','BANTO_HUB_PROFILE','BANTO_BIND','PORT','BANTO_ALLOW_SETUP' | ForEach-Object {
+     [Environment]::SetEnvironmentVariable($_, $null, 'Machine')
+   }
+   ```
+
+   この手順も、専用 VM・実データなしの前提は変えない。既にこれらの変数を持っていた VM を再利用する場合は、手順 2 の前に元の値を記録しておき、削除ではなく元の値に戻す。
 
 ## 手動試験記録
 
