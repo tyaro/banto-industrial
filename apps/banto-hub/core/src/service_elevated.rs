@@ -920,7 +920,11 @@ fn too_many_args(action: ElevatedAction, got: usize, expected: &str) -> Elevated
 /// Win32 API を一切呼ばない純粋な文字列解決なので`#[cfg(windows)]`を
 /// 掛けていない - 非 Windows でもこのロジック自体は単体テストできる
 /// （`service_operators.rs`等の「Win32 非依存部分だけは cfg 無しでテスト
-/// する」既存方針と同じ）。
+/// する」既存方針と同じ）。本番で呼ぶのは Windows だけの [`run`] なので、
+/// `cfg(any(windows, test))` で包む（Windows 以外の lib のビルドで
+/// `dead_code` になり、Linux の `cargo clippy --lib -- -D warnings` が落ちて
+/// いた。#392 B3-3b で修正）。
+#[cfg(any(windows, test))]
 fn resolve_service_acl_target(args: &[String]) -> &str {
     args.first()
         .map(String::as_str)

@@ -879,6 +879,7 @@ name = "banto-secret-store"
 version = "0.1.0"
 dependencies = [
  "banto-hub-bootstrap",
+ "banto-service-elev",
  "hex",
  "sha2 0.11.0",
  "tempfile",
@@ -1356,6 +1357,19 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tower",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "chronogazer-elev"
+version = "0.2.0-alpha.31"
+dependencies = [
+ "banto-secret-store",
+ "banto-service-control",
+ "banto-service-elev",
+ "chronogazer-core",
+ "embed-resource",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

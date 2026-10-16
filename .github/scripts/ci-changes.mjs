@@ -100,7 +100,7 @@ export const RULES = [
  */
 export const RUST_PACKAGES = {
 	hub: ['banto-hub-core', 'banto-hub-shell', 'banto-hub-sink', 'banto-tagclient'],
-	chronogazer: ['chronogazer-core', 'chronogazer'],
+	chronogazer: ['chronogazer-core', 'chronogazer', 'chronogazer-elev'],
 	hub_sink: ['banto-hub-sink']
 };
 
