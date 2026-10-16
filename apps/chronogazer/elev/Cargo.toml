@@ -33,18 +33,14 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 
 [target.'cfg(windows)'.dependencies]
 # 既存の 0.61 系（新しい crate は増えない）:
-# - Win32_System_Registry: RegGetValueW（マシンの環境変数 CHRONOGAZER_ROOT を
-#   展開せずに読む）
-# - Win32_UI_Shell / Win32_System_Com: SHGetKnownFolderPath・CoTaskMemFree
-#   （マシンの ProgramData・Program Files。このプロセスの環境変数を読まない）
 # - Win32_System_LibraryLoader: SetDefaultDllDirectories（main の先頭で DLL の
 #   探し先を System32 に限る。監査 C4）
+# マシンの環境変数（RegGetValueW）・既知のフォルダ（SHGetKnownFolderPath）の読み取りは
+# #626 PR-A で `banto_secret_store::acl::guard::win` へ移した（その feature は
+# banto-secret-store が持つ）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_System_Com",
     "Win32_System_LibraryLoader",
-    "Win32_System_Registry",
-    "Win32_UI_Shell",
 ] }
 
 [build-dependencies]

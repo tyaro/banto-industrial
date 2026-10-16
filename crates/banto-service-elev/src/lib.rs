@@ -37,6 +37,12 @@
 //! - SID は文字列（`&str`）で受ける。`banto-secret-store` の `InstallUserSid` には
 //!   依存しない（この crate は「利用者のアカウントの SID か」という製品の
 //!   判断を持たない）。形の確かめは [`is_valid_sid_string`]。
+//! - **名前 → SID の文字列**: `lookup_account_sid_string`（Windows だけ、#626 PR-A）は
+//!   アカウント名を `LookupAccountNameW` で引き、文字列形式の SID（純関数
+//!   [`sid_bytes_to_string`]）と、種類が `SidTypeUser` か（[`AccountSid::is_user`]）を
+//!   返す。利用者のアカウントとして受け入れるかの判断は呼ぶ側（banto-hub の
+//!   `grant-profile-acl` は `banto_secret_store` の `InstallUserSid::parse` と
+//!   `check_user_account` で確かめる）。
 //!
 //! ## Windows 以外
 //!
@@ -72,8 +78,18 @@ mod win;
 #[cfg(windows)]
 pub use win::{
     add_member_name, add_member_sid, ensure_local_group, grant_service_operators,
-    lookup_account_sid,
+    lookup_account_sid, lookup_account_sid_string,
 };
+
+/// `lookup_account_sid_string`（Windows だけ）の結果（#626 PR-A）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSid {
+    /// 文字列形式の SID（`S-1-5-21-…`。`ConvertSidToStringSidW` と同じ書式）。
+    pub sid: String,
+    /// `LookupAccountNameW` の種類が `SidTypeUser`（利用者のアカウント）か。グループ・
+    /// well-known（Everyone など）・ドメイン・別名は `false`。
+    pub is_user: bool,
+}
 
 /// 製品ごとのローカルグループ（例: banto-hub の `BantoHub Operators`）。
 /// 名前と説明文は製品が定数で持つ（`const` で作れるように `&'static str`）。
@@ -175,6 +191,33 @@ pub fn is_valid_sid_string(s: &str) -> bool {
         sub_count += 1;
     }
     (1..=15).contains(&sub_count)
+}
+
+/// SID のバイト列（`SID` 構造体: 版・下位機関の数・6 バイトの識別子機関（ビッグエンディアン）・
+/// 下位機関（各 4 バイト、リトルエンディアン））を文字列形式（`S-1-5-21-…`）にする（純関数、
+/// #626 PR-A）。識別子機関が 32 ビットに収まらなければ `ConvertSidToStringSidW` と同じく
+/// `0x` の 12 桁の 16 進。形が壊れていれば（短い・版が 1 でない・下位機関が 15 を超える）
+/// `None`。後ろの余ったバイトは見ない（`LookupAccountNameW` のバッファは大きめでありうる）。
+pub fn sid_bytes_to_string(bytes: &[u8]) -> Option<String> {
+    let (&revision, rest) = bytes.split_first()?;
+    let (&count, rest) = rest.split_first()?;
+    if revision != 1 || count > 15 {
+        return None;
+    }
+    let authority = rest.get(..6)?;
+    let subs = rest.get(6..6 + 4 * usize::from(count))?;
+    let authority = authority
+        .iter()
+        .fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+    let mut text = if authority >> 32 == 0 {
+        format!("S-1-{authority}")
+    } else {
+        format!("S-1-0x{authority:012X}")
+    };
+    for chunk in subs.as_chunks::<4>().0 {
+        text.push_str(&format!("-{}", u32::from_le_bytes(*chunk)));
+    }
+    Some(text)
 }
 
 fn is_decimal_within(s: &str, max: u64) -> bool {
@@ -373,6 +416,84 @@ mod tests {
             "S-1-5-１８",
         ] {
             assert!(!is_valid_sid_string(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sid_bytes_format_like_convert_sid_to_string_sid() {
+        // S-1-5-18（SYSTEM）。
+        assert_eq!(
+            sid_bytes_to_string(&[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]).as_deref(),
+            Some("S-1-5-18")
+        );
+        // S-1-5-32-544（Administrators）。後ろの余りは見ない。
+        assert_eq!(
+            sid_bytes_to_string(&[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0, 9, 9])
+                .as_deref(),
+            Some("S-1-5-32-544")
+        );
+        // S-1-5-21-1111111111-2222222222-3333333333-1001。
+        let mut bytes = vec![1u8, 5, 0, 0, 0, 0, 0, 5];
+        for sub in [21u32, 1_111_111_111, 2_222_222_222, 3_333_333_333, 1001] {
+            bytes.extend_from_slice(&sub.to_le_bytes());
+        }
+        assert_eq!(
+            sid_bytes_to_string(&bytes).as_deref(),
+            Some("S-1-5-21-1111111111-2222222222-3333333333-1001")
+        );
+        // S-1-1-0（Everyone）・下位機関が 0 個。
+        assert_eq!(
+            sid_bytes_to_string(&[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]).as_deref(),
+            Some("S-1-1-0")
+        );
+        assert_eq!(
+            sid_bytes_to_string(&[1, 0, 0, 0, 0, 0, 0, 16]).as_deref(),
+            Some("S-1-16")
+        );
+        // 32 ビットを超える識別子機関は 16 進。
+        assert_eq!(
+            sid_bytes_to_string(&[1, 0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]).as_deref(),
+            Some("S-1-0x123456789ABC")
+        );
+        // 壊れた形。
+        for bad in [
+            &[][..],
+            &[1][..],
+            &[2, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0][..],
+            &[1, 16, 0, 0, 0, 0, 0, 5][..],
+            &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0][..],
+            &[1, 0, 0, 0, 0][..],
+        ] {
+            assert_eq!(sid_bytes_to_string(bad), None, "{bad:?}");
+        }
+    }
+
+    /// 読むだけ: 名前 → SID の文字列と種類。組み込みのグループ・well-known は利用者では
+    /// なく、無い名前は `None`（どれも本物のアカウントを変えない）。
+    #[cfg(windows)]
+    #[test]
+    fn lookup_account_sid_string_resolves_names_and_kinds() {
+        assert_eq!(
+            lookup_account_sid_string("Administrators"),
+            Ok(Some(AccountSid {
+                sid: "S-1-5-32-544".to_string(),
+                is_user: false,
+            }))
+        );
+        let everyone = lookup_account_sid_string("Everyone").unwrap().unwrap();
+        assert_eq!(everyone.sid, "S-1-1-0");
+        assert!(!everyone.is_user);
+        assert_eq!(
+            lookup_account_sid_string("banto-service-elev test account that does not exist"),
+            Ok(None)
+        );
+        // 今の利用者（USERDOMAIN\USERNAME）は利用者のアカウント。
+        if let (Ok(domain), Ok(user)) = (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            let me = lookup_account_sid_string(&format!(r"{domain}\{user}"))
+                .unwrap()
+                .expect("今の利用者");
+            assert!(me.is_user, "{me:?}");
+            assert!(is_valid_sid_string(&me.sid), "{me:?}");
         }
     }
 
