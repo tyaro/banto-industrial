@@ -34,6 +34,7 @@
 //!   同じ周期 - 呼び出し元がタイマを持つ、このモジュール自身はタイマを
 //!   持たない）で入力タグの値/品質の diff を検出し、変化があった演算タグ
 //!   だけをトポロジカル順に再計算して [`ServerTagStore`] へ書く。
+//!   `quality_since_ms` の品質遷移時刻は、入力の時刻ではなく評価で品質を認識した時刻を使う。
 //!
 //! ## 実装判断: なぜ diff 検出を保つか（unconditional recompute にしない理由）
 //!
@@ -89,6 +90,9 @@ use crate::hub::{read_current, TagEntry, TagMap};
 /// `tag_key`（`"tag:{id}"`）方式。
 pub struct ServerTagStore {
     map: RwLock<HashMap<String, StoredValue>>,
+    /// Effective quality can be interrupted by catalog disablement without
+    /// any sample write. Shared with PLC views; never changes source data.
+    reenabled_ms: RwLock<HashMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,7 +114,54 @@ impl ServerTagStore {
     pub fn new() -> Self {
         Self {
             map: RwLock::new(HashMap::new()),
+            reenabled_ms: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Called at every successful catalog publication, under the manager's
+    /// state lock. Readers never take that lock while holding this one.
+    pub(crate) fn observe_catalog(&self, previous: &TagMap, next: &TagMap, now_ms: i64) {
+        let previous_enabled: HashMap<_, _> = previous
+            .iter()
+            .map(|entry| (entry.tag_key.as_str(), entry.enabled))
+            .collect();
+        let next_enabled: HashMap<_, _> = next
+            .iter()
+            .map(|entry| (entry.tag_key.as_str(), entry.enabled))
+            .collect();
+        let mut reenabled = self
+            .reenabled_ms
+            .write()
+            .expect("catalog quality lock poisoned");
+        reenabled.retain(|key, _| next_enabled.contains_key(key.as_str()));
+        for (key, enabled) in next_enabled {
+            if enabled && previous_enabled.get(key) == Some(&false) {
+                reenabled.insert(key.to_string(), now_ms);
+            }
+        }
+    }
+
+    /// Disabled entries are effectively Bad. Resuming Good/Stale therefore
+    /// starts a new interval, while an already-Bad sample remains Bad across
+    /// that interval. Unknown metadata remains unknown.
+    pub(crate) fn effective_quality_since(
+        &self,
+        key: &str,
+        quality: Quality,
+        since: Option<i64>,
+    ) -> Option<i64> {
+        if quality == Quality::Bad {
+            return since;
+        }
+        let reenabled = self
+            .reenabled_ms
+            .read()
+            .expect("catalog quality lock poisoned");
+        since.map(|since| {
+            reenabled
+                .get(key)
+                .map_or(since, |resumed| since.max(*resumed))
+        })
     }
 
     /// `tag_key`（`crate::hub::TagEntry::tag_key`）の現在値。未知のキーは
@@ -523,6 +574,54 @@ mod tests {
             map.insert_for_test(entry);
         }
         map
+    }
+
+    #[test]
+    fn catalog_quality_epochs_are_shared_stable_and_removed_with_tag_keys() {
+        for kind in ["plc", "computed", "internal", "db"] {
+            let store = ServerTagStore::new();
+            let mut entry = plc_entry("t", "c.g.t", 1);
+            entry.tag_kind = kind.to_string();
+            let enabled = map_of(vec![entry.clone()]);
+            entry.enabled = false;
+            let disabled = map_of(vec![entry]);
+            store.set("tag:1", Some(42.0), Quality::Good, 100);
+            let raw = store.get_reading("tag:1");
+            store.observe_catalog(&enabled, &disabled, 200);
+            store.observe_catalog(&disabled, &enabled, 300);
+            store.observe_catalog(&enabled, &enabled, 400);
+            for quality in [Quality::Good, Quality::Stale] {
+                assert_eq!(
+                    store.effective_quality_since("tag:1", quality, Some(100)),
+                    Some(300)
+                );
+                assert_eq!(
+                    store.effective_quality_since("tag:1", quality, Some(500)),
+                    Some(500)
+                );
+            }
+            assert_eq!(
+                store.effective_quality_since("tag:1", Quality::Bad, Some(100)),
+                Some(100)
+            );
+            assert_eq!(
+                store.effective_quality_since("tag:1", Quality::Good, None),
+                None
+            );
+            assert_eq!(
+                store.get_reading("tag:1"),
+                raw,
+                "catalog epochs must never rewrite samples"
+            );
+            store.observe_catalog(&enabled, &disabled, 600);
+            store.observe_catalog(&disabled, &enabled, 700);
+            assert_eq!(
+                store.effective_quality_since("tag:1", Quality::Good, Some(100)),
+                Some(700)
+            );
+            store.observe_catalog(&enabled, &TagMap::default(), 800);
+            assert!(store.reenabled_ms.read().unwrap().is_empty());
+        }
     }
 
     #[test]

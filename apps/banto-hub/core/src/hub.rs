@@ -343,7 +343,10 @@ pub fn read_current_view(
     } else {
         server_store.get_reading(&entry.tag_key)
     };
-    effective_current_view(entry, reading, now_ms)
+    let mut view = effective_current_view(entry, reading, now_ms);
+    view.quality_since_ms =
+        server_store.effective_quality_since(&entry.tag_key, view.quality, view.quality_since_ms);
+    view
 }
 
 /// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
@@ -1271,6 +1274,8 @@ impl CollectorManager {
             let old_collector = self.collector.lock().await.take();
             let new_revision = {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
+                self.server_store()
+                    .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
                 inner.map = Arc::new(new_map);
                 inner.revision += 1;
                 inner.last_error = None;
@@ -1364,6 +1369,8 @@ impl CollectorManager {
         self.db_source.commit(db_source_plan);
         let new_revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            self.server_store()
+                .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
@@ -2024,6 +2031,8 @@ impl CollectorManager {
         self.db_source.commit(db_source_plan);
         let revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            self.server_store()
+                .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
@@ -2494,6 +2503,94 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// Re-enabling an unchanged server value begins a new effective Good
+    /// interval, even if no reads or source writes occurred while disabled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reenabled_server_value_starts_quality_at_catalog_publication() {
+        for (catalog_only, collecting) in [(true, false), (false, false), (false, true)] {
+            let clock = Arc::new(banto_tstore::ManualClock::new(1_000, 0));
+            let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
+            seed_running_simulation(&pool).await;
+            // Convert the fixture into a valid reserved internal connection.
+            sqlx::query("UPDATE plc_connections SET name='mem', protocol='virtual', host='', port=0, simulation=0")
+                .execute(&pool).await.unwrap();
+            sqlx::query("UPDATE collection_groups SET name='memory'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE tags SET tag_kind='internal', address=''")
+                .execute(&pool)
+                .await
+                .unwrap();
+            if collecting {
+                seed_running_simulation(&pool).await;
+            }
+            let publish = || async {
+                if catalog_only {
+                    let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+                    manager.commit_catalog(&snapshot).await.unwrap();
+                } else {
+                    manager.rebuild().await.unwrap();
+                }
+            };
+            publish().await;
+            assert_eq!(
+                manager.current_values().is_some(),
+                collecting && !catalog_only,
+                "fixture must select the intended collector publication branch"
+            );
+            let store = manager.server_store();
+            store.set("tag:1", Some(42.0), Quality::Good, 100);
+            let read = || {
+                let map = manager.tag_map();
+                read_current_view(
+                    map.get("mem.memory.t").unwrap(),
+                    manager.current_values().as_ref(),
+                    &store,
+                    clock.now_ms(),
+                )
+            };
+            assert_eq!(read().quality_since_ms, Some(100));
+            clock.set_now_ms(2_000);
+            sqlx::query("UPDATE tags SET enabled=0 WHERE id=1")
+                .execute(&pool)
+                .await
+                .unwrap();
+            publish().await;
+            // Deliberately no read during this disabled interval.
+            clock.set_now_ms(3_000);
+            sqlx::query("UPDATE tags SET enabled=1 WHERE id=1")
+                .execute(&pool)
+                .await
+                .unwrap();
+            publish().await;
+            let resumed = read();
+            assert_eq!(resumed.quality_since_ms, Some(3_000));
+            assert_eq!(resumed.source_time_ms, Some(100));
+            assert_eq!(resumed.timestamp_ms, 100);
+            assert_eq!(resumed.value, Some(42.0));
+            clock.set_now_ms(4_000);
+            publish().await;
+            assert_eq!(
+                read(),
+                resumed,
+                "unchanged catalogs must not move the epoch"
+            );
+            // Run-mode overrides do not disable internal tags or their cached
+            // values, so switching modes must not begin a new quality interval.
+            manager
+                .apply_run(crate::controller::RunMode::AllSimulation)
+                .await
+                .unwrap();
+            manager
+                .apply_run(crate::controller::RunMode::Configured)
+                .await
+                .unwrap();
+            assert_eq!(read(), resumed);
+            manager.shutdown().await;
+        }
     }
 
     fn local_today(clock: &dyn Clock) -> banto_tstore::LocalDate {
