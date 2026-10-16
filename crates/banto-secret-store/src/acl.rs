@@ -182,6 +182,12 @@
 //!   消してから失敗を返す。どれも `PinnedDir::create_child_dir`・`PinnedDir::open_child_dir`
 //!   と同じ `NtCreateFile` の相対の作り（`child_relative`）で、名前は
 //!   [`guard::is_plain_child_name`] で確かめる。
+//! - **ハンドル基準で整え直す・消す**（#630 PR-2。`banto-hub-elev prepare-sink-config`）:
+//!   `PinnedDir::open_child_file_for_update` は同じ作りで、中身を求めずに記述子を書く・消す
+//!   権利（`WRITE_DAC | WRITE_OWNER | DELETE`）で開く。`PinnedFile::reset_acl` はそのハンドルに
+//!   ファイル用の保護された DACL と所有者 Administrators を書き（書く直前に属性を読み直し、
+//!   reparse point・フォルダ・ハードリンクには書かない）、読み戻して [`exposure`] を確かめる。
+//!   `PinnedFile::delete` はそのハンドルで（`FileDispositionInfo`）消す。
 //! - 対象の利用者を持たない置き場の、作る・書き直す・断るの判断は
 //!   [`guard::dir_acl_plan`]（`install_user` に `None`）。
 //!
@@ -833,6 +839,23 @@ impl PinnedDir {
     pub fn create_child_file(&self, name: &str, contents: &[u8]) -> Result<Option<PinnedFile>> {
         imp::create_child_file(self, name, contents)
     }
+
+    /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の子を**相対で辿らずに**
+    /// 開く（#630 PR-2。`banto-hub-elev prepare-sink-config` が、置き場の中の設定ファイルの
+    /// 所有者・DACL を整え直し（[`PinnedFile::reset_acl`]）、`.example` を消して作り直す
+    /// （[`PinnedFile::delete`]）ため）。無ければ `Ok(None)`。
+    ///
+    /// 作り・名前の確かめは [`PinnedDir::open_child_file`] と同じ（`FILE_OPEN |
+    /// FILE_OPEN_REPARSE_POINT`、パスを解決し直さない）。違うのは求める権利で、**中身は求めず**
+    /// （`FILE_READ_DATA` を含めない）、`READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC |
+    /// WRITE_OWNER | DELETE` を求める。`DELETE` を求めるので共有の確かめに加わり、共有に削除を
+    /// 含めないので、持っている間はほかの誰も消す・名前を変える・すり替えることができない。
+    /// 子がフォルダ・リンクでも辿らずにそのものを開くので、呼ぶ側が [`PinnedFile::security`]
+    /// で確かめる（[`PinnedFile::reset_acl`]・[`PinnedFile::delete`] も自分で断る）。
+    /// [`PinnedFile::read_to_end`] は使えない（中身の権利を持たない）。
+    pub fn open_child_file_for_update(&self, name: &str) -> Result<Option<PinnedFile>> {
+        imp::open_child_file_for_update(self, name)
+    }
 }
 
 /// [`PinnedDir::open_child_file`]・[`PinnedDir::create_child_file`] で、確かめ済みのフォルダの
@@ -891,6 +914,39 @@ impl PinnedFile {
             ));
         }
         imp::read_handle_to_end(self.handle.raw(), max_len)
+    }
+
+    /// 開いたままの**ハンドルで**、このファイルに保護された DACL（SYSTEM・Administrators に
+    /// フル、継承のフラグなし）と所有者 `BUILTIN\Administrators` を書き、読み戻した記述子を
+    /// 返す（#630 PR-2。[`PinnedDir::open_child_file_for_update`] で開いたもの）。中身は
+    /// 読まない・変えない。
+    ///
+    /// - **書く直前にハンドルから属性を読み直し**、reparse point（[`AclMismatch::ReparsePoint`]）・
+    ///   フォルダ（`io::ErrorKind::IsADirectory`）・ハードリンク（リンク数 2 以上。記述子を
+    ///   共有するので、書くと別の名前のアクセスも変わる - #624。[`SecretStoreError::Exposed`] に
+    ///   [`Exposure::HardLinked`]）には何も書かずに断る。
+    /// - 書くのは `SetKernelObjectSecurity`（自動の継承の伝播をしない。[`PinnedDir::reset_acl`]
+    ///   と同じ）。所有者を Administrators にできるのは昇格した管理者・SYSTEM だけ（それ以外は
+    ///   `ERROR_INVALID_OWNER`(1307) で何も変えずに失敗する）。
+    /// - 書いた後に読み戻して [`exposure`] が空でなければ [`SecretStoreError::Exposed`]。
+    pub fn reset_acl(&self) -> Result<FileSecurity> {
+        imp::reset_file_acl(self.handle.raw())
+    }
+
+    /// 開いたままの**ハンドルで**このファイルを消す（#630 PR-2。`FileDispositionInfo` で消す印を
+    /// 付け、このハンドルを閉じたときに消える。名前で消さないので、確かめた物と別の物を
+    /// 消さない）。[`PinnedDir::open_child_file_for_update`] で開いたもの（`DELETE` を持つ）。
+    /// フォルダは消さずに断る（`io::ErrorKind::IsADirectory`）。リンク（reparse point）は、
+    /// リンクそのものを消す（`OPEN_REPARSE_POINT` で開いているので、先は消さない）。
+    pub fn delete(self) -> Result<()> {
+        if self.security.is_dir {
+            return Err(SecretStoreError::io(
+                crate::error::IoOp::RemoveFile,
+                &std::io::Error::from(std::io::ErrorKind::IsADirectory),
+            ));
+        }
+        imp::delete_file_by_handle(self.handle.raw())
+        // ここで `self` を落とし、ハンドルを閉じる（閉じたときに消える）。
     }
 }
 
@@ -1944,6 +2000,49 @@ mod imp {
             .transpose()
     }
 
+    /// [`super::PinnedDir::open_child_file_for_update`] の本体（#630 PR-2）。
+    pub(super) fn open_child_file_for_update(
+        parent: &super::PinnedDir,
+        name: &str,
+    ) -> Result<Option<super::PinnedFile>> {
+        child_relative(parent, name, ChildHow::OpenFileForUpdate)?
+            .map(|handle| pinned_file_from_handle(handle, &parent.path.join(name)))
+            .transpose()
+    }
+
+    /// [`super::PinnedFile::reset_acl`] の本体（#630 PR-2）: 属性を読み直してから、ファイル用の
+    /// 保護された記述子（所有者 Administrators）をハンドルに書き、読み戻して確かめる。
+    pub(super) fn reset_file_acl(handle: HANDLE) -> Result<super::FileSecurity> {
+        let before = security_of_handle(handle)?;
+        if before.is_reparse_point {
+            return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
+        }
+        if before.is_dir {
+            return Err(SecretStoreError::io(
+                IoOp::OpenFile,
+                &std::io::Error::from(std::io::ErrorKind::IsADirectory),
+            ));
+        }
+        if before.links >= 2 {
+            return Err(SecretStoreError::Exposed(vec![
+                super::Exposure::HardLinked(before.links),
+            ]));
+        }
+        let descriptor = owned_protected_sd(&DirAccess::service_only(), false)?;
+        set_object_security(handle, &descriptor)?;
+        let after = security_of_handle(handle)?;
+        let found = super::exposure(&after);
+        if !found.is_empty() {
+            return Err(SecretStoreError::Exposed(found));
+        }
+        Ok(after)
+    }
+
+    /// [`super::PinnedFile::delete`] の本体（#630 PR-2）。
+    pub(super) fn delete_file_by_handle(handle: HANDLE) -> Result<()> {
+        delete_by_handle(handle)
+    }
+
     /// [`super::PinnedDir::create_child_file`] の本体（#630）。
     pub(super) fn create_child_file(
         parent: &super::PinnedDir,
@@ -2132,6 +2231,9 @@ mod imp {
         /// `FILE_OPEN`（無ければ `Ok(None)`）で、読み取りだけの権利・読み取りだけの共有（#630・
         /// #648。中身を読む）。種類を問わず開き、呼ぶ側が属性で断る。
         OpenFile,
+        /// `FILE_OPEN`（無ければ `Ok(None)`）で、記述子を書く・消すための権利（#630 PR-2）。
+        /// 中身は求めない。種類を問わず開き、呼ぶ側が属性で断る。
+        OpenFileForUpdate,
         /// ファイルを `FILE_CREATE | FILE_NON_DIRECTORY_FILE` で、この記述子を付けて作る
         /// （既にあれば `Ok(None)`。#630）。書き込みと、失敗したときに消すための `DELETE` を
         /// 求め、共有は読み取りだけ。
@@ -2142,8 +2244,8 @@ mod imp {
     /// 開く（`FILE_OPEN_REPARSE_POINT`。パスを解決し直さず、子がリンクでも辿らない）。
     /// フォルダ（`Create`・`Open`）は [`pin_dir`] と同じ権利（`WRITE_DAC | WRITE_OWNER` を
     /// 含む）・共有（削除なし）・バックアップの意図つきで開く。ファイル（`OpenFile`・
-    /// `CreateFile`）は [`ChildHow`] のとおりで、どちらも共有は読み取りだけ、バックアップの
-    /// 意図は付けない（DACL だけを門にする。#648）。
+    /// `OpenFileForUpdate`・`CreateFile`）は [`ChildHow`] のとおりで、どれも共有は読み取り
+    /// だけ、バックアップの意図は付けない（DACL だけを門にする。#648）。
     fn child_relative(
         parent: &super::PinnedDir,
         name: &str,
@@ -2167,7 +2269,10 @@ mod imp {
 
         /// `ERROR_INVALID_NAME`。
         const ERROR_INVALID_NAME: u32 = 123;
-        let is_file = matches!(how, ChildHow::OpenFile | ChildHow::CreateFile(_));
+        let is_file = matches!(
+            how,
+            ChildHow::OpenFile | ChildHow::OpenFileForUpdate | ChildHow::CreateFile(_)
+        );
         let label = if is_file {
             "CreateChildFile(name)"
         } else {
@@ -2215,6 +2320,20 @@ mod imp {
             // こと自体が共有違反で失敗し、持っている間はほかの書き込みの開きも失敗する（ACL を
             // 締める前から書き込みで開いていた主体が、確かめた後に中身を書き換えられない）。
             ChildHow::OpenFile => (None, FILE_OPEN, 0, read_access, FILE_SHARE_READ),
+            // #630 PR-2: 中身は求めず、記述子を書く・消す権利。共有は `OpenFile` と同じく
+            // 読み取りだけ（書き込み中のファイルの所有者・DACL を書き換えない・消さない）。
+            ChildHow::OpenFileForUpdate => (
+                None,
+                FILE_OPEN,
+                0,
+                READ_CONTROL
+                    | FILE_READ_ATTRIBUTES
+                    | WRITE_DAC
+                    | WRITE_OWNER
+                    | DELETE
+                    | SYNCHRONIZE,
+                FILE_SHARE_READ,
+            ),
             ChildHow::CreateFile(descriptor) => (
                 Some(descriptor),
                 FILE_CREATE,
@@ -2264,7 +2383,7 @@ mod imp {
         };
         let absent = match how {
             ChildHow::Create(_) | ChildHow::CreateFile(_) => status == STATUS_OBJECT_NAME_COLLISION,
-            ChildHow::Open | ChildHow::OpenFile => {
+            ChildHow::Open | ChildHow::OpenFile | ChildHow::OpenFileForUpdate => {
                 status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
             }
         };
@@ -2277,7 +2396,7 @@ mod imp {
             // ファイル（#630）は `io::ErrorKind` を残す（sink がアクセス拒否を見分けて案内する
             // ため）。フォルダは今までどおり。
             return Err(match how {
-                ChildHow::OpenFile => SecretStoreError::io(
+                ChildHow::OpenFile | ChildHow::OpenFileForUpdate => SecretStoreError::io(
                     IoOp::OpenFile,
                     &std::io::Error::from_raw_os_error(os_error as i32),
                 ),
@@ -4621,6 +4740,134 @@ mod tests {
                 !root.path().join("rolled-back.toml").exists(),
                 "作ったファイルが消えていない"
             );
+        }
+
+        /// 記述子を書く・消す権利で開く（#630 PR-2）。中身は読めない。持っている間はほかの
+        /// 誰も消す・名前を変えることができない。ハンドルで消すと、閉じたときに消える。フォルダは
+        /// 消さずに断る。
+        #[test]
+        fn open_child_file_for_update_holds_and_deletes_through_the_handle() {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.example"), b"old").unwrap();
+            std::fs::write(outside.path().join("a.example"), b"outside").unwrap();
+            std::fs::create_dir(root.path().join("sub")).unwrap();
+            junction(&root.path().join("link"), outside.path());
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+
+            assert!(parent
+                .open_child_file_for_update("missing")
+                .unwrap()
+                .is_none());
+            let file = parent
+                .open_child_file_for_update("a.example")
+                .unwrap()
+                .unwrap();
+            assert_eq!(file.final_path(), parent.final_path().join("a.example"));
+            assert!(!file.security().is_dir && !file.security().is_reparse_point);
+            // 中身の権利は無い。
+            assert!(file.read_to_end(1024).is_err());
+            // 持っている間は消す・名前を変えることができない。
+            assert!(std::fs::remove_file(root.path().join("a.example")).is_err());
+            assert!(std::fs::rename(
+                root.path().join("a.example"),
+                root.path().join("moved.example")
+            )
+            .is_err());
+            file.delete().unwrap();
+            assert!(!root.path().join("a.example").exists(), "閉じたら消える");
+
+            let sub = parent.open_child_file_for_update("sub").unwrap().unwrap();
+            assert!(matches!(
+                sub.delete(),
+                Err(SecretStoreError::Io {
+                    kind: std::io::ErrorKind::IsADirectory,
+                    ..
+                })
+            ));
+            assert!(root.path().join("sub").is_dir(), "フォルダは消さない");
+            let link = parent.open_child_file_for_update("link").unwrap().unwrap();
+            assert!(link.security().is_reparse_point);
+            assert_eq!(
+                link.reset_acl(),
+                Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint))
+            );
+            for bad in ["", "..", r"a\b", "c:", "x.", "nul"] {
+                assert!(parent.open_child_file_for_update(bad).is_err(), "{bad:?}");
+            }
+            drop((link, parent));
+            std::fs::remove_dir(root.path().join("link")).unwrap();
+            assert_eq!(
+                std::fs::read(outside.path().join("a.example")).unwrap(),
+                b"outside"
+            );
+        }
+
+        /// ハードリンクには書かずに断る（記述子を共有するので、書くと木の外の名前のアクセスも
+        /// 変わる - #624）。外の名前の DACL は前後で同じ。管理者でなくても走る（書く前に断る）。
+        #[test]
+        fn reset_acl_refuses_a_hardlinked_file_without_writing() {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("victim.toml");
+            std::fs::write(&target, b"x").unwrap();
+            std::fs::hard_link(&target, root.path().join("banto-hub-sink.toml")).unwrap();
+            let before = read_dir_dacl(&target).unwrap();
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            let file = parent
+                .open_child_file_for_update("banto-hub-sink.toml")
+                .unwrap()
+                .unwrap();
+            assert_eq!(file.security().links, 2);
+            assert_eq!(
+                file.reset_acl(),
+                Err(SecretStoreError::Exposed(vec![Exposure::HardLinked(2)]))
+            );
+            assert_eq!(
+                read_dir_dacl(&target).unwrap(),
+                before,
+                "外の名前は変わらない"
+            );
+        }
+
+        /// 普通のファイルに、保護された DACL と所有者 Administrators をハンドルで書く。所有者を
+        /// 移すので昇格が要り、昇格していなければ 1307 で何も変えずに失敗する（手元）。昇格して
+        /// いれば（CI）書いた形を読み戻し、中身が変わらないことも確かめる。
+        #[test]
+        fn reset_acl_writes_the_protected_dacl_and_owner_through_the_handle() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("banto-hub-sink.toml");
+            let contents = b"hub_url = \"http://127.0.0.1:8722\"\n";
+            std::fs::write(&path, contents).unwrap();
+            let before = read_dir_dacl(&path).unwrap();
+            assert!(!before.protected, "継承の DACL から始める");
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            let file = parent
+                .open_child_file_for_update("banto-hub-sink.toml")
+                .unwrap()
+                .unwrap();
+            if !is_elevated_admin() {
+                assert_eq!(
+                    file.reset_acl(),
+                    Err(SecretStoreError::AclApi {
+                        call: "SetKernelObjectSecurity",
+                        os_error: 1307,
+                    })
+                );
+                assert_eq!(read_dir_dacl(&path).unwrap(), before, "何も変えない");
+                eprintln!(
+                    "skip: 所有者を Administrators に移す書き込みは管理者でだけ確かめる（CI）"
+                );
+                return;
+            }
+            let after = file.reset_acl().unwrap();
+            assert!(after.dacl.protected, "{after:?}");
+            assert_eq!(after.dacl.owner, ADMINISTRATORS_SID);
+            check_file_dacl(&after.dacl, &DirAccess::service_only());
+            assert_eq!(exposure(&after), vec![]);
+            assert_eq!(inspect_file(&path).unwrap(), Some(after));
+            drop((file, parent));
+            assert_eq!(std::fs::read(&path).unwrap(), contents, "中身は変えない");
         }
     }
 }
