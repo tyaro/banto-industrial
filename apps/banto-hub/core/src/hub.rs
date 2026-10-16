@@ -350,12 +350,10 @@ fn effective_current_view(
                 reading.last_good_ms
             },
             quality_since_ms: Some(reading.quality_since_ms.map_or(timestamp_ms, |since| {
-                if reading.sample.quality == Quality::Bad {
-                    since
-                } else if invalid_bit {
+                if invalid_bit && reading.sample.quality != Quality::Bad {
                     timestamp_ms
                 } else {
-                    since.max(timestamp_ms)
+                    since
                 }
             })),
         };

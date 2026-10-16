@@ -672,6 +672,40 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_nonfinite_and_missing_values_keep_first_bad_epoch() {
+        use crate::hub::read_current_view;
+        let mut entry = plc_entry("a", "c.g.a", 1);
+        entry.tag_kind = "internal".to_string();
+        let store = ServerTagStore::new();
+        store.set(&entry.tag_key, Some(42.0), Quality::Good, 100);
+        for (timestamp, value) in [
+            (200, Some(f64::NAN)),
+            (300, Some(f64::INFINITY)),
+            (400, Some(f64::NEG_INFINITY)),
+            (500, None),
+            (600, None),
+        ] {
+            store.set(&entry.tag_key, value, Quality::Good, timestamp);
+            let reading = store.get_reading(&entry.tag_key).unwrap();
+            assert_eq!(reading.quality_since_ms, Some(200));
+            let view = read_current_view(&entry, None, &store, 999);
+            assert_eq!((view.value, view.quality), (None, Quality::Bad));
+            assert_eq!(view.timestamp_ms, timestamp);
+            assert_eq!(view.source_time_ms, Some(100));
+            assert_eq!(view.quality_since_ms, Some(200));
+            assert_eq!(read_current_view(&entry, None, &store, 1_999), view);
+        }
+        store.set(&entry.tag_key, Some(42.0), Quality::Good, 700);
+        let recovered = read_current_view(&entry, None, &store, 999);
+        assert_eq!(
+            (recovered.value, recovered.quality),
+            (Some(42.0), Quality::Good)
+        );
+        assert_eq!(recovered.quality_since_ms, Some(700));
+        assert_eq!(recovered.source_time_ms, Some(700));
+    }
+
+    #[test]
     fn missing_current_value_never_reads_as_good_or_stale() {
         use crate::hub::effective_sample;
         let entry = plc_entry("a", "c.g.a", 1);
