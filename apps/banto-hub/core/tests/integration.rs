@@ -384,6 +384,45 @@ async fn e2e_read_via_rest_after_rebuild() {
     assert_eq!(json["v"], 1234.0);
     assert_eq!(json["q"], "good");
 
+    // The metadata view must select the collector even when the server store
+    // contains a conflicting value for the same stable key.
+    let collect = app.manager.current_values().unwrap();
+    let map = app.manager.tag_map();
+    let entry = map.get("line1.fast.temp01").unwrap();
+    let store = ServerTagStore::new();
+    store.set(&entry.tag_key, Some(-1.0), banto_collect::Quality::Bad, 1);
+    let view = banto_hub_core::hub::read_current_view(entry, Some(&collect), &store, 0);
+    assert_eq!(view.value, Some(1234.0));
+    assert_eq!(view.source_time_ms, Some(view.timestamp_ms));
+    assert!(view.quality_since_ms.is_some());
+    let mut disabled = entry.clone();
+    disabled.enabled = false;
+    let view = banto_hub_core::hub::read_current_view(&disabled, Some(&collect), &store, 0);
+    assert_eq!((view.source_time_ms, view.quality_since_ms), (None, None));
+    let missing = banto_hub_core::hub::read_current_view(entry, None, &store, 0);
+    assert_eq!(
+        (missing.source_time_ms, missing.quality_since_ms),
+        (None, None)
+    );
+
+    // Keep the last collector sample while stopping its feed, so its derived
+    // Stale metadata can be checked through the hub without polling races.
+    app.manager.shutdown().await;
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            collect.get(&entry.tag_key).unwrap().quality == banto_collect::Quality::Stale
+        })
+        .await
+    );
+    let stale = banto_hub_core::hub::read_current_view(entry, Some(&collect), &store, 0);
+    assert_eq!(stale.quality, banto_collect::Quality::Stale);
+    assert_eq!(stale.source_time_ms, Some(stale.timestamp_ms));
+    assert_eq!(stale.quality_since_ms, Some(stale.timestamp_ms + 251));
+    assert_eq!(
+        banto_hub_core::hub::read_current_view(entry, Some(&collect), &store, 0),
+        stale
+    );
+
     sim.stop();
 }
 
@@ -1241,9 +1280,27 @@ async fn plc_events_do_not_flap_while_the_plc_is_unreachable() {
         "the outage should be recorded as plc_disconnected"
     );
 
+    let collect = app.manager.current_values().unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            collect.get("tag:1").unwrap().quality == banto_collect::Quality::Bad
+        })
+        .await
+    );
+    let map = app.manager.tag_map();
+    let entry = map.get("line1.fast.temp01").unwrap();
+    let store = ServerTagStore::new();
+    let bad = banto_hub_core::hub::read_current_view(entry, Some(&collect), &store, 0);
+    assert!(bad.source_time_ms.is_some());
+    assert!(bad.quality_since_ms.is_some());
+
     // (a)/(b): 5秒以上そのまま放置しても、増えるのは「何も」であること。
     // 修正前はこの5秒（周期100ms）で50組前後積み上がっていた。
     tokio::time::sleep(Duration::from_secs(5)).await;
+    let later_bad = banto_hub_core::hub::read_current_view(entry, Some(&collect), &store, 0);
+    assert_eq!(later_bad.source_time_ms, bad.source_time_ms);
+    assert_eq!(later_bad.quality_since_ms, bad.quality_since_ms);
+    assert!(later_bad.timestamp_ms > bad.timestamp_ms);
     assert_eq!(
         count_collect_events(&app.pool, "plc_disconnected").await,
         1,

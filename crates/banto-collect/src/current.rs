@@ -40,8 +40,8 @@
 //! count: the display layers publish it as Bad (no usable value).
 //! Exposed through [`CurrentValuesHandle::snapshot_readings`]; the plain
 //! [`CurrentValuesHandle::get`]/[`CurrentValuesHandle::snapshot`] and
-//! [`CurrentSample`] are unchanged (banto-hub's computed/internal tag store
-//! builds [`CurrentSample`]s itself and does not track this).
+//! [`CurrentSample`] are unchanged. banto-hub's server tag store tracks
+//! equivalent metadata for computed, internal and DB tags.
 //!
 //! `std::sync::RwLock` (not `tokio::sync::RwLock`): reads come from the
 //! synchronous UI/render path and writes are short, non-`await` critical
@@ -97,6 +97,11 @@ pub struct CurrentReading {
     /// `ptime_ms` of the last Good sample with a finite value; `None` = none
     /// since this cache was created. Never advanced by Bad samples.
     pub last_good_ms: Option<i64>,
+    /// First timestamp of the current effective quality; derived Stale uses
+    /// the deterministic threshold crossing rather than the read time.
+    /// Missing/non-finite Good values count as Bad for this metadata, as
+    /// they do in the display layers; sample quality remains unchanged.
+    pub quality_since_ms: Option<i64>,
 }
 
 /// What the collection tasks store (before Stale derivation) plus the period
@@ -111,6 +116,7 @@ struct Entry {
     period_ms: u32,
     /// See [`CurrentReading::last_good_ms`].
     last_good_ms: Option<i64>,
+    quality_since_ms: i64,
 }
 
 /// Cheaply-cloneable shared handle onto the current-value cache. Clones share
@@ -156,6 +162,26 @@ impl CurrentValuesHandle {
         } else {
             map.get(tag_key).and_then(|previous| previous.last_good_ms)
         };
+        let effective_quality = if stored_quality == Quality::Good && !usable {
+            Quality::Bad
+        } else {
+            stored_quality
+        };
+        let quality_since_ms = map.get(tag_key).map_or(ptime_ms, |previous| {
+            let reading = Self::reading(previous, self.clock.now_ms());
+            let previous_quality = if previous.stored_quality == Quality::Good
+                && !previous.value.is_some_and(f64::is_finite)
+            {
+                Quality::Bad
+            } else {
+                reading.sample.quality
+            };
+            if previous_quality == effective_quality {
+                reading.quality_since_ms.unwrap_or(ptime_ms)
+            } else {
+                ptime_ms
+            }
+        });
         map.insert(
             tag_key.to_string(),
             Entry {
@@ -164,6 +190,7 @@ impl CurrentValuesHandle {
                 stored_quality,
                 period_ms,
                 last_good_ms,
+                quality_since_ms,
             },
         );
     }
@@ -180,7 +207,7 @@ impl CurrentValuesHandle {
             Quality::Stale => Quality::Stale,
             Quality::Good => {
                 let staleness_limit = (entry.period_ms as f64 * STALE_PERIOD_FACTOR) as i64;
-                if now_ms - entry.ptime_ms > staleness_limit {
+                if now_ms.saturating_sub(entry.ptime_ms) > staleness_limit {
                     Quality::Stale
                 } else {
                     Quality::Good
@@ -192,6 +219,36 @@ impl CurrentValuesHandle {
             ptime_ms: entry.ptime_ms,
             quality,
         }
+    }
+
+    fn reading(entry: &Entry, now_ms: i64) -> CurrentReading {
+        let sample = Self::derive(entry, now_ms);
+        let quality_since_ms = if sample.quality == Quality::Stale
+            && entry.stored_quality == Quality::Good
+            && entry.value.is_some_and(f64::is_finite)
+        {
+            entry
+                .ptime_ms
+                .saturating_add((entry.period_ms as f64 * STALE_PERIOD_FACTOR) as i64)
+                .saturating_add(1)
+        } else {
+            entry.quality_since_ms
+        };
+        CurrentReading {
+            sample,
+            last_good_ms: entry.last_good_ms,
+            quality_since_ms: Some(quality_since_ms),
+        }
+    }
+
+    /// Read a sample and its timestamps under one lock and one clock instant.
+    pub fn get_reading(&self, tag_key: &str) -> Option<CurrentReading> {
+        let now_ms = self.clock.now_ms();
+        let map = self
+            .map
+            .read()
+            .expect("current-value cache lock poisoned (a writer panicked)");
+        map.get(tag_key).map(|entry| Self::reading(entry, now_ms))
     }
 
     /// The latest sample for `tag_key`, with quality already upgraded to
@@ -230,15 +287,7 @@ impl CurrentValuesHandle {
             .read()
             .expect("current-value cache lock poisoned (a writer panicked)");
         map.iter()
-            .map(|(k, entry)| {
-                (
-                    k.clone(),
-                    CurrentReading {
-                        sample: Self::derive(entry, now_ms),
-                        last_good_ms: entry.last_good_ms,
-                    },
-                )
-            })
+            .map(|(k, entry)| (k.clone(), Self::reading(entry, now_ms)))
             .collect()
     }
 
@@ -348,6 +397,59 @@ mod tests {
         let s = handle.get("t1").unwrap();
         assert_eq!(s.value, Some(2.0));
         assert_eq!(s.ptime_ms, 500);
+    }
+
+    #[test]
+    fn timestamp_transitions_are_stable_and_stale_recovery_starts_good_again() {
+        let (handle, clock) = handle_at(1_000);
+        assert_eq!(handle.get_reading("missing"), None);
+        handle.set("t", Some(1.0), 1_000, Quality::Good, 101);
+        assert_eq!(
+            handle.get_reading("t").unwrap().quality_since_ms,
+            Some(1_000)
+        );
+        clock.set_now_ms(1_252);
+        assert_eq!(
+            handle.get_reading("t").unwrap().sample.quality,
+            Quality::Good
+        );
+        clock.set_now_ms(1_253);
+        let stale = handle.get_reading("t").unwrap();
+        assert_eq!(stale.sample.quality, Quality::Stale);
+        assert_eq!(stale.quality_since_ms, Some(1_253));
+        clock.set_now_ms(2_000);
+        assert_eq!(handle.get_reading("t"), Some(stale));
+        handle.set("t", Some(2.0), 2_000, Quality::Good, 101);
+        assert_eq!(
+            handle.get_reading("t").unwrap().quality_since_ms,
+            Some(2_000)
+        );
+        handle.set("t", None, 2_010, Quality::Bad, 101);
+        handle.set("t", None, 2_020, Quality::Bad, 101);
+        let bad = handle.get_reading("t").unwrap();
+        assert_eq!(bad.quality_since_ms, Some(2_010));
+        assert_eq!(bad.last_good_ms, Some(2_000));
+        handle.set("t", Some(2.0), 2_030, Quality::Stale, 101);
+        handle.set("t", Some(2.0), 2_040, Quality::Stale, 101);
+        assert_eq!(
+            handle.get_reading("t").unwrap().quality_since_ms,
+            Some(2_030)
+        );
+        assert_eq!(
+            handle.snapshot_readings()["t"],
+            handle.get_reading("t").unwrap()
+        );
+    }
+
+    #[test]
+    fn stale_derivation_handles_extreme_timestamps_without_overflow() {
+        let (handle, clock) = handle_at(i64::MIN);
+        handle.set("t", Some(1.0), i64::MIN, Quality::Good, 1);
+        clock.set_now_ms(i64::MAX);
+        assert_eq!(
+            handle.get_reading("t").unwrap().quality_since_ms,
+            Some(i64::MIN + 3)
+        );
     }
 
     fn last_good(handle: &CurrentValuesHandle, key: &str) -> Option<i64> {

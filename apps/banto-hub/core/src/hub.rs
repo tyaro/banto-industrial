@@ -201,8 +201,8 @@ use banto_broker::{
 };
 use banto_collect::{
     build_config_from, connections_with_collected_groups, ApplyReport, CollectEvent, Collector,
-    CollectorOptions, ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality,
-    RegistrySnapshot,
+    CollectorOptions, ConnectionStatus, CurrentReading, CurrentSample, CurrentValuesHandle,
+    EventSink, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
@@ -254,18 +254,16 @@ pub fn effective_sample(
     sample: Option<CurrentSample>,
     now_ms: i64,
 ) -> (Option<f64>, Quality, i64) {
-    if !entry.enabled {
-        (
-            None,
-            Quality::Bad,
-            sample.map(|s| s.ptime_ms).unwrap_or(now_ms),
-        )
-    } else {
-        match sample {
-            Some(s) => (s.value, s.quality, s.ptime_ms),
-            None => (None, Quality::Bad, now_ms),
-        }
-    }
+    let view = effective_current_view(
+        entry,
+        sample.map(|sample| CurrentReading {
+            sample,
+            last_good_ms: None,
+            quality_since_ms: None,
+        }),
+        now_ms,
+    );
+    (view.value, view.quality, view.timestamp_ms)
 }
 
 /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): the single read-path
@@ -280,8 +278,8 @@ pub fn effective_sample(
 /// `crate::write_path::execute_write`'s internal-tag branch) - both keyed by
 /// the same `entry.tag_key` (`"tag:{id}"`) convention, so a rename never
 /// loses the current value either way (`TagEntry::tag_key`'s own doc
-/// comment). Delegates entirely to [`effective_sample`] once the right
-/// `Option<CurrentSample>` is in hand, so the `!entry.enabled` /
+/// comment). Projects [`read_current_view`] onto the compatibility tuple,
+/// so the `!entry.enabled` /
 /// missing-sample rules stay defined in exactly one place regardless of
 /// `tag_kind`.
 pub fn read_current(
@@ -290,12 +288,62 @@ pub fn read_current(
     server_store: &ServerTagStore,
     now_ms: i64,
 ) -> (Option<f64>, Quality, i64) {
-    let sample = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
-        collect.and_then(|c| c.get(&entry.tag_key))
+    let view = read_current_view(entry, collect, server_store, now_ms);
+    (view.value, view.quality, view.timestamp_ms)
+}
+
+/// Current value plus source and quality-transition timestamps. This is an
+/// internal view; existing interface tuples retain their attempt timestamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentView {
+    pub value: Option<f64>,
+    pub quality: Quality,
+    pub timestamp_ms: i64,
+    /// Last finite Good sample time, retained across Bad/Stale; unknown for
+    /// missing or disabled tags and before the first usable sample.
+    pub source_time_ms: Option<i64>,
+    /// Start of the current quality, or None for missing/disabled tags.
+    pub quality_since_ms: Option<i64>,
+}
+
+fn effective_current_view(
+    entry: &TagEntry,
+    reading: Option<CurrentReading>,
+    now_ms: i64,
+) -> CurrentView {
+    let timestamp_ms = reading.map_or(now_ms, |r| r.sample.ptime_ms);
+    if !entry.enabled || reading.is_none() {
+        return CurrentView {
+            value: None,
+            quality: Quality::Bad,
+            timestamp_ms,
+            source_time_ms: None,
+            quality_since_ms: None,
+        };
+    }
+    let reading = reading.expect("present reading checked above");
+    CurrentView {
+        value: reading.sample.value,
+        quality: reading.sample.quality,
+        timestamp_ms,
+        source_time_ms: reading.last_good_ms,
+        quality_since_ms: reading.quality_since_ms,
+    }
+}
+
+/// Common timestamp-aware read path for PLC, computed, internal and DB tags.
+pub fn read_current_view(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> CurrentView {
+    let reading = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
+        collect.and_then(|c| c.get_reading(&entry.tag_key))
     } else {
-        server_store.get(&entry.tag_key)
+        server_store.get_reading(&entry.tag_key)
     };
-    effective_sample(entry, sample, now_ms)
+    effective_current_view(entry, reading, now_ms)
 }
 
 /// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
