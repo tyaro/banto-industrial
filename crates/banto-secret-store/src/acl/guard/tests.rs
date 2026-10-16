@@ -547,6 +547,11 @@ fn carry_over_table() {
             allow(OI_CI | INHERIT_ONLY, MODIFY_ACCESS_MASK, STRANGER),
             Drop(D::NotTreeWide),
         ),
+        // no-propagate（すぐ下の子までしか伝わらない）。OICI で書き直すと広がる。
+        (
+            allow(OI_CI | 0x04, MODIFY_ACCESS_MASK, STRANGER),
+            Drop(D::NotTreeWide),
+        ),
         // 変更に足りない（読み取りだけ・汎用の権利だけ）。
         (
             allow(OI_CI, READ_EXECUTE, STRANGER),

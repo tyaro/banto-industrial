@@ -311,6 +311,9 @@ pub fn data_acl_plan(
 /// `INHERIT_ONLY_ACE`（このオブジェクトそのものには効かず、子へ継承するだけの ACE）。
 const INHERIT_ONLY_ACE_FLAG: u8 = 0x08;
 
+/// `NO_PROPAGATE_INHERIT_ACE`（継承はすぐ下の子までで、孫以降には伝わらない）。
+const NO_PROPAGATE_INHERIT_ACE_FLAG: u8 = 0x04;
+
 /// [`plan_carry_over`] が SID の種類を問い合わせた結果（Windows では
 /// `banto_secret_store::acl::check_user_account` から作る）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,7 +347,8 @@ pub enum DropReason {
     NotAllow,
     /// 親から継承した ACE（`INHERITED_ACE`）。保護された DACL では流れなくなる。
     Inherited,
-    /// フォルダの中全体に効く形（`OICI`、`INHERIT_ONLY` なし）ではない。
+    /// フォルダの中全体に効く形（`OICI`、`INHERIT_ONLY` なし）ではない。no-propagate
+    /// （`NO_PROPAGATE_INHERIT_ACE`。すぐ下の子までしか伝わらない）も含む。
     NotTreeWide,
     /// 「変更」（`MODIFY_ACCESS_MASK`）に足りない（読み取りだけなど。汎用の権利
     /// `GENERIC_*` だけの ACE もここ）。
@@ -386,7 +390,7 @@ pub struct CarryOver {
 ///    フルで持つので、引き継ぎも報告もしない。継承された ACE でも同じ）。
 /// 2. 許可の ACE でない → [`DropReason::NotAllow`]。
 /// 3. 継承された → [`DropReason::Inherited`]。
-/// 4. `OICI` でない・`INHERIT_ONLY` → [`DropReason::NotTreeWide`]。
+/// 4. `OICI` でない・`INHERIT_ONLY`・`NO_PROPAGATE_INHERIT` → [`DropReason::NotTreeWide`]。
 /// 5. マスクが「変更」を含まない → [`DropReason::LessThanModify`]（フルコントロールは
 ///    含むので、「変更」に**狭めて**引き継ぐ）。
 /// 6. `InstallUserSid::parse` に通らない → [`DropReason::NotAUserSid`]。
@@ -423,7 +427,10 @@ pub fn plan_carry_over(
             plan.dropped.push(drop(DropReason::Inherited));
             continue;
         }
-        if ace.flags & INHERIT_FLAGS != INHERIT_FLAGS || ace.flags & INHERIT_ONLY_ACE_FLAG != 0 {
+        if ace.flags & INHERIT_FLAGS != INHERIT_FLAGS
+            || ace.flags & INHERIT_ONLY_ACE_FLAG != 0
+            || ace.flags & NO_PROPAGATE_INHERIT_ACE_FLAG != 0
+        {
             plan.dropped.push(drop(DropReason::NotTreeWide));
             continue;
         }
