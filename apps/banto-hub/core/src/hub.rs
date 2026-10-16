@@ -201,8 +201,8 @@ use banto_broker::{
 };
 use banto_collect::{
     build_config_from, connections_with_collected_groups, ApplyReport, CollectEvent, Collector,
-    CollectorOptions, ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality,
-    RegistrySnapshot,
+    CollectorOptions, ConnectionStatus, CurrentReading, CurrentSample, CurrentValuesHandle,
+    EventSink, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
@@ -254,18 +254,16 @@ pub fn effective_sample(
     sample: Option<CurrentSample>,
     now_ms: i64,
 ) -> (Option<f64>, Quality, i64) {
-    if !entry.enabled {
-        (
-            None,
-            Quality::Bad,
-            sample.map(|s| s.ptime_ms).unwrap_or(now_ms),
-        )
-    } else {
-        match sample {
-            Some(s) => (s.value, s.quality, s.ptime_ms),
-            None => (None, Quality::Bad, now_ms),
-        }
-    }
+    let view = effective_current_view(
+        entry,
+        sample.map(|sample| CurrentReading {
+            sample,
+            last_good_ms: None,
+            quality_since_ms: None,
+        }),
+        now_ms,
+    );
+    (view.value, view.quality, view.timestamp_ms)
 }
 
 /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): the single read-path
@@ -280,8 +278,8 @@ pub fn effective_sample(
 /// `crate::write_path::execute_write`'s internal-tag branch) - both keyed by
 /// the same `entry.tag_key` (`"tag:{id}"`) convention, so a rename never
 /// loses the current value either way (`TagEntry::tag_key`'s own doc
-/// comment). Delegates entirely to [`effective_sample`] once the right
-/// `Option<CurrentSample>` is in hand, so the `!entry.enabled` /
+/// comment). Projects [`read_current_view`] onto the compatibility tuple,
+/// so the `!entry.enabled` /
 /// missing-sample rules stay defined in exactly one place regardless of
 /// `tag_kind`.
 pub fn read_current(
@@ -290,12 +288,65 @@ pub fn read_current(
     server_store: &ServerTagStore,
     now_ms: i64,
 ) -> (Option<f64>, Quality, i64) {
-    let sample = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
-        collect.and_then(|c| c.get(&entry.tag_key))
+    let view = read_current_view(entry, collect, server_store, now_ms);
+    (view.value, view.quality, view.timestamp_ms)
+}
+
+/// Current value plus source and quality-transition timestamps. This is an
+/// internal view; existing interface tuples retain their attempt timestamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentView {
+    pub value: Option<f64>,
+    pub quality: Quality,
+    pub timestamp_ms: i64,
+    /// Last finite Good sample time, retained across Bad/Stale; unknown for
+    /// missing or disabled tags and before the first usable sample.
+    pub source_time_ms: Option<i64>,
+    /// Start of the current quality, or None for missing/disabled tags.
+    pub quality_since_ms: Option<i64>,
+}
+
+fn effective_current_view(
+    entry: &TagEntry,
+    reading: Option<CurrentReading>,
+    now_ms: i64,
+) -> CurrentView {
+    let timestamp_ms = reading.map_or(now_ms, |r| r.sample.ptime_ms);
+    if !entry.enabled || reading.is_none() {
+        return CurrentView {
+            value: None,
+            quality: Quality::Bad,
+            timestamp_ms,
+            source_time_ms: None,
+            quality_since_ms: None,
+        };
+    }
+    let reading = reading.expect("present reading checked above");
+    CurrentView {
+        value: reading.sample.value,
+        quality: reading.sample.quality,
+        timestamp_ms,
+        source_time_ms: reading.last_good_ms,
+        quality_since_ms: reading.quality_since_ms,
+    }
+}
+
+/// Common timestamp-aware read path for PLC, computed, internal and DB tags.
+pub fn read_current_view(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> CurrentView {
+    let reading = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
+        collect.and_then(|c| c.get_reading(&entry.tag_key))
     } else {
-        server_store.get(&entry.tag_key)
+        server_store.get_reading(&entry.tag_key)
     };
-    effective_sample(entry, sample, now_ms)
+    let mut view = effective_current_view(entry, reading, now_ms);
+    view.quality_since_ms =
+        server_store.effective_quality_since(&entry.tag_key, view.quality, view.quality_since_ms);
+    view
 }
 
 /// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
@@ -1223,6 +1274,8 @@ impl CollectorManager {
             let old_collector = self.collector.lock().await.take();
             let new_revision = {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
+                self.server_store()
+                    .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
                 inner.map = Arc::new(new_map);
                 inner.revision += 1;
                 inner.last_error = None;
@@ -1316,6 +1369,8 @@ impl CollectorManager {
         self.db_source.commit(db_source_plan);
         let new_revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            self.server_store()
+                .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
@@ -1976,6 +2031,8 @@ impl CollectorManager {
         self.db_source.commit(db_source_plan);
         let revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            self.server_store()
+                .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
@@ -2446,6 +2503,94 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// Re-enabling an unchanged server value begins a new effective Good
+    /// interval, even if no reads or source writes occurred while disabled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reenabled_server_value_starts_quality_at_catalog_publication() {
+        for (catalog_only, collecting) in [(true, false), (false, false), (false, true)] {
+            let clock = Arc::new(banto_tstore::ManualClock::new(1_000, 0));
+            let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
+            seed_running_simulation(&pool).await;
+            // Convert the fixture into a valid reserved internal connection.
+            sqlx::query("UPDATE plc_connections SET name='mem', protocol='virtual', host='', port=0, simulation=0")
+                .execute(&pool).await.unwrap();
+            sqlx::query("UPDATE collection_groups SET name='memory'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE tags SET tag_kind='internal', address=''")
+                .execute(&pool)
+                .await
+                .unwrap();
+            if collecting {
+                seed_running_simulation(&pool).await;
+            }
+            let publish = || async {
+                if catalog_only {
+                    let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+                    manager.commit_catalog(&snapshot).await.unwrap();
+                } else {
+                    manager.rebuild().await.unwrap();
+                }
+            };
+            publish().await;
+            assert_eq!(
+                manager.current_values().is_some(),
+                collecting && !catalog_only,
+                "fixture must select the intended collector publication branch"
+            );
+            let store = manager.server_store();
+            store.set("tag:1", Some(42.0), Quality::Good, 100);
+            let read = || {
+                let map = manager.tag_map();
+                read_current_view(
+                    map.get("mem.memory.t").unwrap(),
+                    manager.current_values().as_ref(),
+                    &store,
+                    clock.now_ms(),
+                )
+            };
+            assert_eq!(read().quality_since_ms, Some(100));
+            clock.set_now_ms(2_000);
+            sqlx::query("UPDATE tags SET enabled=0 WHERE id=1")
+                .execute(&pool)
+                .await
+                .unwrap();
+            publish().await;
+            // Deliberately no read during this disabled interval.
+            clock.set_now_ms(3_000);
+            sqlx::query("UPDATE tags SET enabled=1 WHERE id=1")
+                .execute(&pool)
+                .await
+                .unwrap();
+            publish().await;
+            let resumed = read();
+            assert_eq!(resumed.quality_since_ms, Some(3_000));
+            assert_eq!(resumed.source_time_ms, Some(100));
+            assert_eq!(resumed.timestamp_ms, 100);
+            assert_eq!(resumed.value, Some(42.0));
+            clock.set_now_ms(4_000);
+            publish().await;
+            assert_eq!(
+                read(),
+                resumed,
+                "unchanged catalogs must not move the epoch"
+            );
+            // Run-mode overrides do not disable internal tags or their cached
+            // values, so switching modes must not begin a new quality interval.
+            manager
+                .apply_run(crate::controller::RunMode::AllSimulation)
+                .await
+                .unwrap();
+            manager
+                .apply_run(crate::controller::RunMode::Configured)
+                .await
+                .unwrap();
+            assert_eq!(read(), resumed);
+            manager.shutdown().await;
+        }
     }
 
     fn local_today(clock: &dyn Clock) -> banto_tstore::LocalDate {

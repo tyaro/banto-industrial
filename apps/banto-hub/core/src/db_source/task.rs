@@ -700,11 +700,12 @@ fn on_group_failure(
 fn write_stale(store: &ServerTagStore, tag: &DbTagPlan, now_ms: i64) {
     match store.get(&tag.tag_key) {
         Some(previous) if previous.value.is_some() => {
-            store.set(
+            store.set_with_observation_time(
                 &tag.tag_key,
                 previous.value,
                 Quality::Stale,
                 previous.ptime_ms,
+                now_ms,
             );
         }
         _ => store.set(&tag.tag_key, None, Quality::Bad, now_ms),
@@ -863,7 +864,9 @@ mod tests {
     /// §4.3: 1回目の失敗は「直前値 + Stale」、2回目で Bad。
     #[test]
     fn group_failure_goes_stale_first_then_bad_on_the_second_consecutive_failure() {
-        let deps = deps();
+        let mut deps = deps();
+        let clock = Arc::new(banto_tstore::ManualClock::new(2_000, 0));
+        deps.clock = clock.clone();
         let plan = connection_plan();
         deps.status.apply_plan(
             &crate::db_source::plan::DbSourcePlan {
@@ -883,12 +886,21 @@ mod tests {
         assert_eq!(sample.value, Some(12.5), "1回目は直前値を残す");
         assert_eq!(sample.quality, Quality::Stale);
         assert_eq!(sample.ptime_ms, 1_000, "Stale は時刻も据え置く");
+        let stale = deps.store.get_reading("tag:1").unwrap();
+        assert_eq!(stale.last_good_ms, Some(1_000));
+        assert_eq!(stale.quality_since_ms, Some(2_000));
+        write_stale(&deps.store, &tag(1), 2_500);
+        assert_eq!(deps.store.get_reading("tag:1"), Some(stale));
+        clock.set_now_ms(3_000);
 
         on_group_failure(&plan, &mut group, &deps, "boom".to_string());
         let sample = deps.store.get("tag:1").expect("still present");
         assert_eq!(sample.value, None, "2周期連続で Bad へ落とす");
         assert_eq!(sample.quality, Quality::Bad);
 
+        let bad = deps.store.get_reading("tag:1").unwrap();
+        assert_eq!(bad.quality_since_ms, Some(3_000));
+        assert_eq!(bad.last_good_ms, Some(1_000));
         assert_eq!(group.consecutive_failures, 2);
         let status = deps.status.snapshot();
         assert_eq!(status[0].groups[0].last_error.as_deref(), Some("boom"));

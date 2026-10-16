@@ -34,6 +34,7 @@
 //!   同じ周期 - 呼び出し元がタイマを持つ、このモジュール自身はタイマを
 //!   持たない）で入力タグの値/品質の diff を検出し、変化があった演算タグ
 //!   だけをトポロジカル順に再計算して [`ServerTagStore`] へ書く。
+//!   `quality_since_ms` の品質遷移時刻は、入力の時刻ではなく評価で品質を認識した時刻を使う。
 //!
 //! ## 実装判断: なぜ diff 検出を保つか（unconditional recompute にしない理由）
 //!
@@ -76,7 +77,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use banto_collect::{CurrentSample, CurrentValuesHandle, Quality};
+use banto_collect::{CurrentReading, CurrentSample, CurrentValuesHandle, Quality};
 use banto_core::BantoError;
 use banto_expr::{CompiledExpr, Value};
 use banto_tags::{COMPUTED_TAG_KIND, STRING_DATA_TYPE};
@@ -89,6 +90,9 @@ use crate::hub::{read_current, TagEntry, TagMap};
 /// `tag_key`（`"tag:{id}"`）方式。
 pub struct ServerTagStore {
     map: RwLock<HashMap<String, StoredValue>>,
+    /// Effective quality can be interrupted by catalog disablement without
+    /// any sample write. Shared with PLC views; never changes source data.
+    reenabled_ms: RwLock<HashMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,6 +100,8 @@ struct StoredValue {
     value: Option<f64>,
     quality: Quality,
     ptime_ms: i64,
+    last_good_ms: Option<i64>,
+    quality_since_ms: i64,
 }
 
 impl Default for ServerTagStore {
@@ -108,7 +114,54 @@ impl ServerTagStore {
     pub fn new() -> Self {
         Self {
             map: RwLock::new(HashMap::new()),
+            reenabled_ms: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Called at every successful catalog publication, under the manager's
+    /// state lock. Readers never take that lock while holding this one.
+    pub(crate) fn observe_catalog(&self, previous: &TagMap, next: &TagMap, now_ms: i64) {
+        let previous_enabled: HashMap<_, _> = previous
+            .iter()
+            .map(|entry| (entry.tag_key.as_str(), entry.enabled))
+            .collect();
+        let next_enabled: HashMap<_, _> = next
+            .iter()
+            .map(|entry| (entry.tag_key.as_str(), entry.enabled))
+            .collect();
+        let mut reenabled = self
+            .reenabled_ms
+            .write()
+            .expect("catalog quality lock poisoned");
+        reenabled.retain(|key, _| next_enabled.contains_key(key.as_str()));
+        for (key, enabled) in next_enabled {
+            if enabled && previous_enabled.get(key) == Some(&false) {
+                reenabled.insert(key.to_string(), now_ms);
+            }
+        }
+    }
+
+    /// Disabled entries are effectively Bad. Resuming Good/Stale therefore
+    /// starts a new interval, while an already-Bad sample remains Bad across
+    /// that interval. Unknown metadata remains unknown.
+    pub(crate) fn effective_quality_since(
+        &self,
+        key: &str,
+        quality: Quality,
+        since: Option<i64>,
+    ) -> Option<i64> {
+        if quality == Quality::Bad {
+            return since;
+        }
+        let reenabled = self
+            .reenabled_ms
+            .read()
+            .expect("catalog quality lock poisoned");
+        since.map(|since| {
+            reenabled
+                .get(key)
+                .map_or(since, |resumed| since.max(*resumed))
+        })
     }
 
     /// `tag_key`（`crate::hub::TagEntry::tag_key`）の現在値。未知のキーは
@@ -127,20 +180,69 @@ impl ServerTagStore {
         })
     }
 
-    /// `tag_key` の現在値を書き換える。[`ComputedEngine`]（演算タグの評価
-    /// 結果）と `crate::write_path::execute_write`（内部タグへの書き込み）
-    /// の両方がこの1つの入口を通る。
+    /// Read the value and timestamp metadata from the same stored update.
+    pub fn get_reading(&self, tag_key: &str) -> Option<CurrentReading> {
+        let map = self
+            .map
+            .read()
+            .expect("ServerTagStore lock poisoned (a writer panicked)");
+        map.get(tag_key).map(|s| CurrentReading {
+            sample: CurrentSample {
+                value: s.value,
+                ptime_ms: s.ptime_ms,
+                quality: s.quality,
+            },
+            last_good_ms: s.last_good_ms,
+            quality_since_ms: Some(s.quality_since_ms),
+        })
+    }
+
+    /// `tag_key` の現在値を書き換える。値の時刻と品質の認識時刻が同じ
+    /// 更新（内部タグへの書き込み、DB の読み取り成功など）に使う。
+    /// 演算や DB Stale は `set_with_observation_time` で両者を分ける。
     pub fn set(&self, tag_key: &str, value: Option<f64>, quality: Quality, ptime_ms: i64) {
+        self.set_with_observation_time(tag_key, value, quality, ptime_ms, ptime_ms);
+    }
+
+    /// Record quality recognition separately from the source/legacy timestamp
+    /// (DB Stale retains its previous value time; computed inputs may be old).
+    pub(crate) fn set_with_observation_time(
+        &self,
+        tag_key: &str,
+        value: Option<f64>,
+        quality: Quality,
+        ptime_ms: i64,
+        observed_ms: i64,
+    ) {
         let mut map = self
             .map
             .write()
             .expect("ServerTagStore lock poisoned (a writer panicked)");
+        let usable = quality == Quality::Good && value.is_some_and(f64::is_finite);
+        let normalized = |quality, value: Option<f64>| {
+            if quality == Quality::Good && !value.is_some_and(f64::is_finite) {
+                Quality::Bad
+            } else {
+                quality
+            }
+        };
+        let previous = map.get(tag_key);
+        let last_good_ms = if usable {
+            Some(ptime_ms)
+        } else {
+            previous.and_then(|s| s.last_good_ms)
+        };
+        let quality_since_ms = previous
+            .filter(|s| normalized(s.quality, s.value) == normalized(quality, value))
+            .map_or(observed_ms, |s| s.quality_since_ms);
         map.insert(
             tag_key.to_string(),
             StoredValue {
                 value,
                 quality,
                 ptime_ms,
+                last_good_ms,
+                quality_since_ms,
             },
         );
     }
@@ -396,8 +498,13 @@ impl ComputedEngine {
                 }
             };
 
-            self.store
-                .set(&self_entry.tag_key, value, quality, trigger_time);
+            self.store.set_with_observation_time(
+                &self_entry.tag_key,
+                value,
+                quality,
+                trigger_time,
+                now_ms,
+            );
             baselines.insert(name.clone(), inputs);
         }
     }
@@ -467,6 +574,102 @@ mod tests {
             map.insert_for_test(entry);
         }
         map
+    }
+
+    #[test]
+    fn catalog_quality_epochs_are_shared_stable_and_removed_with_tag_keys() {
+        for kind in ["plc", "computed", "internal", "db"] {
+            let store = ServerTagStore::new();
+            let mut entry = plc_entry("t", "c.g.t", 1);
+            entry.tag_kind = kind.to_string();
+            let enabled = map_of(vec![entry.clone()]);
+            entry.enabled = false;
+            let disabled = map_of(vec![entry]);
+            store.set("tag:1", Some(42.0), Quality::Good, 100);
+            let raw = store.get_reading("tag:1");
+            store.observe_catalog(&enabled, &disabled, 200);
+            store.observe_catalog(&disabled, &enabled, 300);
+            store.observe_catalog(&enabled, &enabled, 400);
+            for quality in [Quality::Good, Quality::Stale] {
+                assert_eq!(
+                    store.effective_quality_since("tag:1", quality, Some(100)),
+                    Some(300)
+                );
+                assert_eq!(
+                    store.effective_quality_since("tag:1", quality, Some(500)),
+                    Some(500)
+                );
+            }
+            assert_eq!(
+                store.effective_quality_since("tag:1", Quality::Bad, Some(100)),
+                Some(100)
+            );
+            assert_eq!(
+                store.effective_quality_since("tag:1", Quality::Good, None),
+                None
+            );
+            assert_eq!(
+                store.get_reading("tag:1"),
+                raw,
+                "catalog epochs must never rewrite samples"
+            );
+            store.observe_catalog(&enabled, &disabled, 600);
+            store.observe_catalog(&disabled, &enabled, 700);
+            assert_eq!(
+                store.effective_quality_since("tag:1", Quality::Good, Some(100)),
+                Some(700)
+            );
+            store.observe_catalog(&enabled, &TagMap::default(), 800);
+            assert!(store.reenabled_ms.read().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn common_view_preserves_server_timestamps_and_legacy_tuple() {
+        use crate::hub::read_current_view;
+        for kind in ["computed", "internal", "db"] {
+            let store = ServerTagStore::new();
+            let mut entry = plc_entry("t", "c.g.t", 1);
+            entry.tag_kind = kind.to_string();
+            let missing = read_current_view(&entry, None, &store, 99);
+            assert_eq!(
+                (missing.source_time_ms, missing.quality_since_ms),
+                (None, None)
+            );
+            store.set(&entry.tag_key, Some(2.0), Quality::Good, 100);
+            let good = read_current_view(&entry, None, &store, 200);
+            assert_eq!(
+                (good.source_time_ms, good.quality_since_ms),
+                (Some(100), Some(100))
+            );
+            store.set(&entry.tag_key, None, Quality::Bad, 300);
+            store.set(&entry.tag_key, None, Quality::Bad, 400);
+            let bad = read_current_view(&entry, None, &store, 500);
+            assert_eq!(
+                (bad.source_time_ms, bad.quality_since_ms),
+                (Some(100), Some(300))
+            );
+            assert_eq!(
+                read_current(&entry, None, &store, 500),
+                (bad.value, bad.quality, bad.timestamp_ms)
+            );
+            store.set(&entry.tag_key, Some(2.0), Quality::Stale, 600);
+            store.set(&entry.tag_key, Some(2.0), Quality::Stale, 700);
+            assert_eq!(
+                store.get_reading(&entry.tag_key).unwrap().quality_since_ms,
+                Some(600)
+            );
+            entry.enabled = false;
+            let disabled = read_current_view(&entry, None, &store, 800);
+            assert_eq!(
+                (disabled.source_time_ms, disabled.quality_since_ms),
+                (None, None)
+            );
+            assert_eq!(disabled.timestamp_ms, 700);
+            // A new key has no usable source time for malformed Good.
+            store.set("invalid", Some(f64::INFINITY), Quality::Good, 900);
+            assert_eq!(store.get_reading("invalid").unwrap().last_good_ms, None);
+        }
     }
 
     fn plc_entry(name: &str, external_name: &str, tag_id: i64) -> TagEntry {
@@ -643,6 +846,39 @@ mod tests {
         engine.evaluate_tick(&map, None, 5_000);
         let second = store.get("tag:1").unwrap();
         assert_eq!(second.ptime_ms, 1_000, "unchanged inputs must not re-stamp");
+    }
+
+    #[test]
+    fn computed_quality_time_uses_observation_while_source_time_tracks_inputs() {
+        let mut input = plc_entry("a", "line1.fast.a", 1);
+        input.tag_kind = "internal".to_string();
+        let map = map_of(vec![
+            input,
+            computed_entry("b", "calc.x.b", 2, "line1.fast.a * 2"),
+        ]);
+        let store = Arc::new(ServerTagStore::new());
+        let engine = ComputedEngine::new(store.clone());
+        engine.commit(build_plan(&map).unwrap());
+        store.set("tag:1", Some(2.0), Quality::Good, 100);
+        engine.evaluate_tick(&map, None, 200);
+        let good = store.get_reading("tag:2").unwrap();
+        assert_eq!(good.last_good_ms, Some(100));
+        assert_eq!(good.quality_since_ms, Some(200));
+        store.set("tag:1", Some(2.0), Quality::Stale, 100);
+        engine.evaluate_tick(&map, None, 300);
+        let stale = store.get_reading("tag:2").unwrap();
+        assert_eq!(stale.sample.ptime_ms, 100);
+        assert_eq!(stale.quality_since_ms, Some(300));
+        assert_eq!(stale.last_good_ms, Some(100));
+        engine.evaluate_tick(&map, None, 400);
+        assert_eq!(store.get_reading("tag:2"), Some(stale));
+        store.set("tag:1", None, Quality::Bad, 100);
+        engine.evaluate_tick(&map, None, 500);
+        let bad = store.get_reading("tag:2").unwrap();
+        assert_eq!(bad.sample.quality, Quality::Bad);
+        assert_eq!(bad.sample.ptime_ms, 100);
+        assert_eq!(bad.quality_since_ms, Some(500));
+        assert_eq!(bad.last_good_ms, Some(100));
     }
 
     #[test]

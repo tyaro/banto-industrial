@@ -3164,6 +3164,7 @@ mod tests {
                     CurrentReading {
                         sample,
                         last_good_ms: None,
+                        quality_since_ms: None,
                     },
                 )
             })
@@ -3183,6 +3184,7 @@ mod tests {
                 quality,
             },
             last_good_ms,
+            quality_since_ms: None,
         };
         let data: HashMap<String, CurrentReading> = [
             (
