@@ -986,3 +986,36 @@ Administrators・指定の利用者・この昇格した利用者だけ（`data_
 - 反証（手元・非管理者）: B-2（共有の確かめを外す → 共有 2 本・hub 2 本が落ちる）、
   B-5（reparse point・リンク数・本当のパスの確かめをそれぞれ外す → 偽物と実物が
   1 本ずつ落ちる）、B-6（段の分岐を外す → 1 本）、B-1（使用中を分けない → 1 本）。
+
+**再レビューの対応（2026-10-17、オーナーと Codex のレビュー。PR #641）**:
+
+- **1（P1/P2）: 無い段を確かめる前にパスで作っていた**（HKLM のルートが
+  `D:\data\BantoHub`で`D:\data`が外へのジャンクションのとき、外に`BantoHub`を作ってから
+  断っていた）。共有の`banto_secret_store::acl::PinnedDir::create_child_dir`を足し、無い段は
+  **確かめ済みの親のハンドルを基準に**`NtCreateFile`（`RootDirectory` = 親のハンドル・名前
+  1 要素・`FILE_CREATE | FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT`・作る段の DACL）で
+  相対に作り、作ったハンドルをそのまま pin として使う。ルートの親はパスで辿らずに開いて、
+  本当のパス・reparse point でない・フォルダ・ネットワークでない・`forbidden_inside`の中で
+  ないことを確かめてから作る（ProgramData そのものとドライブのルートは親として認める）。
+  親が無ければ何も作らずに断る（`create_dir_all`はやめた）。親を持ったまま、その場で FSCTL
+  でジャンクションに変えると、相対の作成は`ERROR_CANT_RESOLVE_FILENAME`（1921）で失敗し、
+  外には何もできない（手元・非管理者で測定）。chronogazer-elev の`preflight_root`・
+  `grant_dir`も同じ型（パスで作ってから確かめる）で、乗り換えは別の issue にする（おすすめ
+  どおり）。
+- **2（P2）: 条件付き・オブジェクトの ACE の SID を読み落としていた**。`read_dacl`は種類
+  5・6・9・10・11・12 の SID も読む（winnt.h の並び、`AceSize`の範囲を確かめる）。
+  `plan_carry_over`は拒否の種類（1・6・10・12）を拒否として数え、条件付き・オブジェクトの
+  許可（5・9・11）は`ConditionalAllow`で引き継がず、種類の分からない ACE・SID を読めない
+  ACE は`CarryOver::blocked`に入れ、Hub は**引き継ぎを決めずに断る**（1）。ChronoGazer と
+  `FileSecretStore`の`check_dacl`は許可（種類 0）・`OICI`以外を全部食い違いとして断るので、
+  読み方が変わっても安全側は崩れない。
+- **3（Codex P2）: 使用中の確かめが一度きりだった**。`banto_instance_lock::try_hold_named_mutex`
+  （Hub の`try_acquire`と同じ`CreateMutexW`・既定のセキュリティ記述子で、診断ファイルを
+  書かない）で profile の mutex を**取って、書き直しが終わるまで持つ**。持っている間は Hub が
+  `AlreadyHeld`（または拒否）で起動に失敗する。全部のハンドルが閉じれば mutex は消えるので、
+  昇格した管理者が作った mutex が後の Hub（LocalSystem・利用者）に残ることはない。
+  `service-install`の中で使用中なら飛ばす扱い（B-1）は変えていない。
+- 反証（手元・非管理者）: ルートの親の確かめを外す → 偽物 1・実物 1 が落ちる。作成をパスに
+  戻す（`create_dir_all` + `pin_dir`）→ その場で親をジャンクションにする実物のテストが
+  落ちる。拒否の種類を 1 だけに戻す → 共有 2・実物（`XD`を付けて読み戻す）1 が落ちる。
+  Hub の`blocked`の確かめを外す → 1。mutex をすぐ放す → 3 が落ちる。
