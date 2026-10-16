@@ -512,9 +512,13 @@ pub trait PinnedDirOps {
     /// `GetFinalPathNameByHandleW` で解決した本当のパス（途中の要素のジャンクション・
     /// 8.3 の短い名前を辿った後。監査 Must 1）。
     fn final_path(&self) -> PathBuf;
-    /// 開いたままの DACL と所有者を書き、中の子へ自前で伝える。飛ばした子（reparse point・
-    /// ハードリンク）を返す。
-    fn reset_acl(&self, access: &DirAccess) -> Result<banto_secret_store::acl::ResetSkips, String>;
+    /// 開いたままの DACL と所有者を書き、`recurse` が `Tree` なら中の子へ自前で伝える。
+    /// 飛ばした子（reparse point・ハードリンク・開けない）を返す。
+    fn reset_acl(
+        &self,
+        access: &DirAccess,
+        recurse: banto_secret_store::acl::Recurse,
+    ) -> Result<banto_secret_store::acl::ResetSkips, String>;
 }
 
 /// 利用者のアカウントの確かめの失敗（監査 Nit 2）。
@@ -849,7 +853,11 @@ fn preflight_root<O: ElevOps>(
         Some(pinned) => pinned,
         None => {
             created = true;
-            if let Err(error) = ops.create_dir(root, &access) {
+            // 監査 Must（オーナー案 a）: **作るときは SYSTEM・Administrators だけ**で作る
+            // （利用者の「変更」は、本当のパスを確かめた後に reset で付ける）。途中の要素の
+            // ジャンクションや、作った直後のその場のすり替えの先に、利用者が書けるフォルダを
+            // 残さないため。
+            if let Err(error) = ops.create_dir(root, &DirAccess::service_only()) {
                 out(err(&format!(
                     "{}（{}）を作れませんでした: {error}（何も登録していません）",
                     DataDir::Root.label(),
@@ -873,6 +881,7 @@ fn preflight_root<O: ElevOps>(
     // 本当のパスが期待（root）と同じ場所で、既知のシステムフォルダに重ならないこと
     // （監査 Must 1。途中の要素のジャンクション・8.3 の短い名前を塞ぐ）。何も登録しない。
     if let Err(code) = verify_final_path(&pinned, DataDir::Root, root, known, out) {
+        left_behind_notice(created, DataDir::Root, root, out);
         out(err("（何も登録していません）"));
         return Err(code);
     }
@@ -881,17 +890,16 @@ fn preflight_root<O: ElevOps>(
         install_user,
         elevated_user,
     ) {
-        out(err(&format!(
-            "{}（何も登録していません）",
-            refusal_line(DataDir::Root, root, &refusal)
-        )));
+        out(err(&refusal_line(DataDir::Root, root, &refusal)));
+        left_behind_notice(created, DataDir::Root, root, out);
+        out(err("（何も登録していません）"));
         return Err(EXIT_FAILED);
     }
-    // 作ったルートは、開いたまま所有者を Administrators に移す（監査 B5。DACL は作った
-    // ときと同じ形に書き直す）。既にあったルートはここでは変えない（登録の後の
+    // 確かめが通ったら、作ったルートに利用者の「変更」を付ける（ハンドルで書く。所有者も
+    // Administrators に。監査 B5）。既にあったルートはここでは変えない（登録の後の
     // `grant-data-acl` が書き直す）。
     if created {
-        match pinned.reset_acl(&access) {
+        match pinned.reset_acl(&access, banto_secret_store::acl::Recurse::Tree) {
             Ok(skips) => emit_skips(DataDir::Root, &skips, out),
             Err(error) => {
                 out(err(&format!(
@@ -904,6 +912,18 @@ fn preflight_root<O: ElevOps>(
         }
     }
     Ok(pinned)
+}
+
+/// 断ったとき、自分で作った（SYSTEM・Administrators だけの）フォルダが残っていることを
+/// 伝える 1 行（監査 Must。利用者の「変更」は付いていない）。
+fn left_behind_notice(created: bool, kind: DataDir, dir: &Path, out: Out<'_>) {
+    if created {
+        out(err(&format!(
+            "{}（{}）を作りましたが、確かめが通らなかったので残っています（SYSTEM・Administrators だけが触れる DACL）",
+            kind.label(),
+            dir.display()
+        )));
+    }
 }
 
 /// 書き直しのときに飛ばした子（reparse point・ハードリンク）を警告の 1 行で報告する
@@ -919,6 +939,13 @@ fn emit_skips(kind: DataDir, skips: &banto_secret_store::acl::ResetSkips, out: O
     for path in &skips.hardlink {
         out(err(&format!(
             "{}: 中の {} はハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）",
+            kind.label(),
+            path.display()
+        )));
+    }
+    for path in &skips.denied {
+        out(err(&format!(
+            "{}: 中の {} を開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります。監査 Should 1）",
             kind.label(),
             path.display()
         )));
@@ -1051,6 +1078,7 @@ fn grant_dir<O: ElevOps>(
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
     create_if_absent: bool,
+    recurse: banto_secret_store::acl::Recurse,
     out: Out<'_>,
 ) -> Result<Option<O::Pinned>, i32> {
     let access = DirAccess::with_install_user(install_user.clone());
@@ -1079,30 +1107,38 @@ fn grant_dir<O: ElevOps>(
                 )));
                 return Ok(None);
             }
-            created = ops.create_dir(dir, &access).map_err(|error| {
-                out(err(&format!(
-                    "{}（{}）を作れませんでした: {error}",
-                    kind.label(),
-                    dir.display()
-                )));
-                EXIT_FAILED
-            })?;
+            // 監査 Must（オーナー案 a）: 作るときは SYSTEM・Administrators だけ。利用者の
+            // 「変更」は、本当のパスを確かめた後の reset で付ける。
+            created = ops
+                .create_dir(dir, &DirAccess::service_only())
+                .map_err(|error| {
+                    out(err(&format!(
+                        "{}（{}）を作れませんでした: {error}",
+                        kind.label(),
+                        dir.display()
+                    )));
+                    EXIT_FAILED
+                })?;
             tried_create = true;
             continue;
         };
         // 本当のパスが期待と同じ場所で、既知のシステムフォルダに重ならないこと（監査
         // Must 1。途中の要素のジャンクション・8.3 の短い名前・ルートの祖先のすり替えを塞ぐ）。
-        verify_final_path(&pinned, kind, expected, known, out)?;
+        if let Err(code) = verify_final_path(&pinned, kind, expected, known, out) {
+            left_behind_notice(created, kind, dir, out);
+            return Err(code);
+        }
         let info = pinned.info();
         match data_acl_plan(&DirState::Present(info), install_user, elevated_user) {
             Err(refusal) => {
                 out(err(&refusal_line(kind, dir, &refusal)));
+                left_behind_notice(created, kind, dir, out);
                 return Err(EXIT_FAILED);
             }
-            // 作った直後でも書き直す（作ってから開くまでの間にすり替えられていても、
-            // 開いたものを期待の形にする。同じ形なら何も変わらない）。
+            // 確かめが通ったら利用者の「変更」を付ける（作った直後なら SYSTEM・Administrators
+            // だけの DACL に足す。既にあったフォルダはここで期待の形に書き直す）。
             Ok(_) => {
-                let skips = pinned.reset_acl(&access).map_err(|error| {
+                let skips = pinned.reset_acl(&access, recurse).map_err(|error| {
                     out(err(&format!(
                         "{}（{}）の ACL を書き直せませんでした: {error}",
                         kind.label(),
@@ -1175,10 +1211,28 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
     // 気づく。監査 Must 1）。
     let mut held = Vec::new();
     let mut real_root: Option<PathBuf> = None;
-    for (kind, dir, create) in [
-        (DataDir::Root, layout.root().to_path_buf(), true),
-        (DataDir::Secrets, layout.secrets_dir(), true),
-        (DataDir::HubKeys, layout.hub_keys_dir(), false),
+    // ルートは中まで再帰する。`secrets`・`hub-keys` はルートの再帰で既に書かれているので、
+    // その層では対象そのものだけ書く（監査 Nit 3。同じ部分木を最大 3 回書かない）。
+    use banto_secret_store::acl::Recurse;
+    for (kind, dir, create, recurse) in [
+        (
+            DataDir::Root,
+            layout.root().to_path_buf(),
+            true,
+            Recurse::Tree,
+        ),
+        (
+            DataDir::Secrets,
+            layout.secrets_dir(),
+            true,
+            Recurse::ObjectOnly,
+        ),
+        (
+            DataDir::HubKeys,
+            layout.hub_keys_dir(),
+            false,
+            Recurse::ObjectOnly,
+        ),
     ] {
         let expected = match kind {
             DataDir::Root => layout.root().to_path_buf(),
@@ -1198,6 +1252,7 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
             &sid,
             elevated_user,
             create,
+            recurse,
             out,
         ) {
             Ok(Some(pinned)) => {

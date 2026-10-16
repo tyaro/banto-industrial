@@ -480,9 +480,17 @@ impl PinnedDirOps for FakePinned {
     fn final_path(&self) -> PathBuf {
         self.final_path.clone()
     }
-    fn reset_acl(&self, access: &DirAccess) -> Result<ResetSkips, String> {
+    fn reset_acl(
+        &self,
+        access: &DirAccess,
+        recurse: banto_secret_store::acl::Recurse,
+    ) -> Result<ResetSkips, String> {
+        let r = match recurse {
+            banto_secret_store::acl::Recurse::Tree => "tree",
+            banto_secret_store::acl::Recurse::ObjectOnly => "object",
+        };
         self.log.borrow_mut().push(format!(
-            "reset {} {}",
+            "reset {} {} {r}",
             self.path.display(),
             access.install_user().map_or("-", InstallUserSid::as_str)
         ));
@@ -798,10 +806,11 @@ fn service_install_runs_every_step_in_order() {
             // ACL の利用者は登録の後に残る記録の SID）。
             "read_install_user".to_string(),
             format!("pin {}", root.display()),
-            format!("create {} {USER}", root.display()),
+            // 監査 Must: 作るのは SYSTEM・Administrators だけ（利用者 ACE 無し = `-`）。
+            format!("create {} -", root.display()),
             format!("pin {}", root.display()),
-            // 作ったルートは所有者を Administrators に移す（監査 B5）。
-            format!("reset {} {USER}", root.display()),
+            // 確かめが通ってから、利用者の「変更」を付ける（ルートは tree）。
+            format!("reset {} {USER} tree", root.display()),
             format!("install {} {USER} {}", exe_path().display(), root.display()),
             // setup-operators（記録を読み直す）
             "read_install_user".to_string(),
@@ -814,13 +823,14 @@ fn service_install_runs_every_step_in_order() {
             "read_install_user".to_string(),
             format!("check {USER}"),
             "machine_root".to_string(),
-            // ルートは登録の前に作ってあるので、開いて書き直すだけ。
+            // ルートは登録の前に作ってあるので、開いて書き直すだけ（tree）。
             format!("pin {}", root.display()),
-            format!("reset {} {USER}", root.display()),
+            format!("reset {} {USER} tree", root.display()),
             format!("pin {}", secrets().display()),
-            format!("create {} {USER}", secrets().display()),
+            format!("create {} -", secrets().display()),
             format!("pin {}", secrets().display()),
-            format!("reset {} {USER}", secrets().display()),
+            // secrets はルートの再帰で書かれているので object だけ（監査 Nit 3）。
+            format!("reset {} {USER} object", secrets().display()),
             format!("pin {}", hub_keys().display()),
         ]
     );
@@ -854,15 +864,17 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert_eq!(code, EXIT_OK);
     let calls = fake.calls();
     assert_eq!(calls[2], format!("check {OTHER}"));
-    assert!(calls[8].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
-    // 登録の前に作るルートも、渡した SID の DACL で作る（記録が無い = 渡した SID が残る）。
+    // 監査 Must: ルートを作るのは SYSTEM・Administrators だけ（利用者 ACE 無し）。
+    assert_eq!(calls[5], format!("create {} -", root_path().display()));
+    // 利用者の「変更」は、本当のパスを確かめた後の reset でだけ付く（記録が無い = 渡した SID）。
     assert_eq!(
-        calls[5],
-        format!("create {} {OTHER}", root_path().display())
+        calls[7],
+        format!("reset {} {OTHER} tree", root_path().display())
     );
+    assert!(calls[8].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
 
     // D2: 違う SID（USER）が既に記録されていれば、登録の後も記録は USER のままなので、
-    // 先に作るルートの ACL の利用者も USER。
+    // reset で付ける利用者の「変更」も USER。
     let fake = Fake::new();
     let (code, _) = exec(
         Action::ServiceInstall {
@@ -873,7 +885,11 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert_eq!(code, EXIT_OK);
     assert!(fake
         .calls()
-        .contains(&format!("create {} {USER}", root_path().display())));
+        .contains(&format!("reset {} {USER} tree", root_path().display())));
+    // 作るのは SYSTEM・Administrators だけ（利用者 ACE 無し）。
+    assert!(fake
+        .calls()
+        .contains(&format!("create {} -", root_path().display())));
 
     // 反証: 利用者のアカウントでない SID（グループなど）なら何も登録しない（64）。
     let mut fake = Fake::new();
@@ -986,7 +1002,7 @@ fn service_install_stops_at_the_first_failure() {
         assert_eq!(code, EXIT_FAILED, "{created_owner:?} {lines:#?}");
         assert!(fake
             .calls()
-            .contains(&format!("create {} {USER}", root_path().display())));
+            .contains(&format!("create {} -", root_path().display())));
         assert!(!fake
             .calls()
             .iter()
@@ -1070,10 +1086,10 @@ fn service_install_stops_at_the_first_failure() {
         .calls()
         .iter()
         .any(|c| c.starts_with("create") && c.contains("secrets")));
-    // 書き直したのは、登録の前に作ったルート（所有者を移す、監査 B5）だけ。
+    // 書き直したのは、登録の前に作ったルート（所有者を移す、監査 B5）だけ（tree）。
     assert_eq!(
         resets(&fake),
-        vec![format!("reset {} {USER}", root_path().display())]
+        vec![format!("reset {} {USER} tree", root_path().display())]
     );
 
     // データの ACL を断った → 1（最後の行は「完了しませんでした」）。
@@ -1107,9 +1123,13 @@ fn later_steps_use_the_recorded_sid_not_the_requested_one() {
     );
     assert_eq!(code, EXIT_OK);
     assert!(fake.calls().contains(&format!("add_member {OTHER}")));
+    // 作るのは SYSTEM・Administrators だけ、利用者の「変更」は reset で記録の SID（OTHER）。
     assert!(fake
         .calls()
-        .contains(&format!("create {} {OTHER}", root_path().display())));
+        .contains(&format!("create {} -", root_path().display())));
+    assert!(fake
+        .calls()
+        .contains(&format!("reset {} {OTHER} tree", root_path().display())));
     // 監査 Nit 4: 記録の SID を使ったことを 1 行で知らせる（指定（実行した利用者 USER）とは別）。
     assert!(
         lines.iter().any(|l| matches!(l, ConsoleLine::Stdout(t)
@@ -1390,12 +1410,13 @@ fn grant_data_acl_resets_trusted_existing_dirs() {
         .with_dir(hub_keys(), true, false, USER);
     let (code, lines) = exec(Action::GrantDataAcl, &fake);
     assert_eq!(code, EXIT_OK, "{lines:#?}");
+    // ルートは tree、secrets・hub-keys はルートの再帰で済んでいるので object（監査 Nit 3）。
     assert_eq!(
         resets(&fake),
         vec![
-            format!("reset {} {USER}", root_path().display()),
-            format!("reset {} {USER}", secrets().display()),
-            format!("reset {} {USER}", hub_keys().display()),
+            format!("reset {} {USER} tree", root_path().display()),
+            format!("reset {} {USER} object", secrets().display()),
+            format!("reset {} {USER} object", hub_keys().display()),
         ]
     );
     assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
@@ -1435,6 +1456,9 @@ fn grant_data_acl_reports_each_skipped_child() {
     skips
         .hardlink
         .push(root_path().join("logs").join("hard.txt"));
+    skips
+        .denied
+        .push(root_path().join("data").join("locked.bin"));
     let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
     fake.reset_skips.insert(root_path(), skips);
     let (code, lines) = exec(Action::GrantDataAcl, &fake);
@@ -1447,6 +1471,12 @@ fn grant_data_acl_reports_each_skipped_child() {
     assert!(
         lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
             if t.contains("hard.txt") && t.contains("ハードリンク") && t.contains("#624"))),
+        "{lines:#?}"
+    );
+    // 監査 Should 1: 開けなかった子も 1 行出て、残る旨が付く。
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("locked.bin") && t.contains("開けなかった") && t.contains("残ります"))),
         "{lines:#?}"
     );
 }
@@ -1468,6 +1498,37 @@ fn grant_data_acl_refuses_a_reparse_point_root() {
         .calls()
         .contains(&format!("pin {}", secrets().display())));
     assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
+}
+
+/// 監査 Must（オーナー案 a）: 作るときは SYSTEM・Administrators だけ（利用者 ACE 無し）で、
+/// 利用者の「変更」は本当のパスを確かめた後の reset でだけ付く。反証: `with_final_path` で
+/// 本当のパスをずらすと、利用者付きの create も reset も呼ばれず、作ったフォルダが残る旨を出す。
+#[test]
+fn create_uses_service_only_and_user_change_comes_only_after_verify() {
+    // 正常: 無いルートを作って（`-`）、確かめ、reset で USER を付ける。
+    let fake = Fake::new();
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_OK, "{lines:#?}");
+    let calls = fake.calls();
+    assert!(calls.contains(&format!("create {} -", root_path().display())));
+    assert!(calls.contains(&format!("reset {} {USER} tree", root_path().display())));
+    // 利用者付きの create は無い。
+    assert!(!calls
+        .iter()
+        .any(|c| c.starts_with("create") && c.ends_with(USER)));
+
+    // 反証: 本当のパスをずらすと、create は `-` だけ、reset は呼ばれない。残る旨を出す。
+    let fake = Fake::new().with_final_path(root_path(), PathBuf::from(PF).join("ChronoGazer"));
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_FAILED);
+    let calls = fake.calls();
+    assert!(calls.contains(&format!("create {} -", root_path().display())));
+    assert!(!calls.iter().any(|c| c.starts_with("reset")));
+    assert!(!calls
+        .iter()
+        .any(|c| c.starts_with("create") && c.ends_with(USER)));
+    assert!(lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+        if t.contains("作りましたが、確かめが通らなかったので残っています"))));
 }
 
 /// 反証（O2）: 所有者が許す範囲の外（ProgramData に一般の利用者が先に作った）なら 1。
@@ -1539,7 +1600,7 @@ fn grant_data_acl_refuses_a_reparse_point_secrets_and_stops() {
         assert_eq!(code, EXIT_FAILED);
         assert_eq!(
             resets(&fake),
-            vec![format!("reset {} {USER}", root_path().display())],
+            vec![format!("reset {} {USER} tree", root_path().display())],
             "{lines:#?}"
         );
         assert!(!fake

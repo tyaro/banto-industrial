@@ -144,8 +144,12 @@ impl PinnedDirOps for PinnedDir {
         PinnedDir::final_path(self).to_path_buf()
     }
 
-    fn reset_acl(&self, access: &DirAccess) -> Result<banto_secret_store::acl::ResetSkips, String> {
-        PinnedDir::reset_acl(self, access).map_err(|err| err.to_string())
+    fn reset_acl(
+        &self,
+        access: &DirAccess,
+        recurse: banto_secret_store::acl::Recurse,
+    ) -> Result<banto_secret_store::acl::ResetSkips, String> {
+        PinnedDir::reset_acl(self, access, recurse).map_err(|err| err.to_string())
     }
 }
 
@@ -368,6 +372,15 @@ mod tests {
         assert!(status.success(), "mklink /J に失敗した");
     }
 
+    /// tempfile のパスは 8.3 の短い名前（CI のランナーは `C:\Users\RUNNER~1\…`）のことが
+    /// あり、`verify_final_path` が本当のパス（`runneradmin`）と食い違って断る。fixture の
+    /// 期待のルートは、作った親の**本当のパス**（`canonicalize` から `\\?\` を外す）で
+    /// 組み立てる（本番の短い名前を断る確かめは変えない。CI の 8.3 短縮名、再々レビュー）。
+    fn long(path: &Path) -> PathBuf {
+        let c = std::fs::canonicalize(path).unwrap();
+        PathBuf::from(c.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+    }
+
     fn grant(root: &Path) -> (i32, Vec<banto_service_control::ConsoleLine>) {
         let mut lines = Vec::new();
         let code = crate::run(
@@ -390,7 +403,7 @@ mod tests {
         let me = WindowsOps.current_user_sid().unwrap();
         let access = DirAccess::with_install_user(me);
         let parent = tempfile::tempdir().unwrap();
-        let layout = DataLayout::new(parent.path().join("ChronoGazer"));
+        let layout = DataLayout::new(long(parent.path()).join("ChronoGazer"));
         for _ in 0..2 {
             let (code, lines) = grant(layout.root());
             assert_eq!(code, crate::EXIT_OK, "{lines:#?}");
@@ -421,10 +434,10 @@ mod tests {
             return;
         }
         let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().join("ChronoGazer");
+        let root = long(parent.path()).join("ChronoGazer");
         std::fs::create_dir(&root).unwrap();
         let outside_parent = tempfile::tempdir().unwrap();
-        let outside = outside_parent.path().join("outside");
+        let outside = long(outside_parent.path()).join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("file.txt"), b"x").unwrap();
         junction(&root.join("link"), &outside);
@@ -448,9 +461,9 @@ mod tests {
     fn grant_data_acl_refuses_a_junction_root() {
         let parent = tempfile::tempdir().unwrap();
         let outside_parent = tempfile::tempdir().unwrap();
-        let outside = outside_parent.path().join("outside");
+        let outside = long(outside_parent.path()).join("outside");
         std::fs::create_dir(&outside).unwrap();
-        let root = parent.path().join("ChronoGazer");
+        let root = long(parent.path()).join("ChronoGazer");
         junction(&root, &outside);
         let before = banto_secret_store::acl::read_dir_dacl(&outside).unwrap();
         let (code, lines) = grant(&root);
