@@ -75,8 +75,9 @@
 //! PREINSTALL でサービス（`BantoHubSink`→`BantoHub`の順）とシェルを止め、
 //! POSTINSTALL で `banto-hub-elev.exe service-install`（Hub のサービス登録
 //! と Operators グループ・ACL 一式）→ `banto-hub-sink.exe install` →
-//! `banto-hub-sink.exe grant-service-acl` → `%ProgramData%\BantoHub\` の
-//! 作成と `banto-hub-sink.toml.example` の複製 → PREINSTALL で止めた
+//! `banto-hub-sink.exe grant-service-acl` → `banto-hub-elev.exe
+//! prepare-sink-config`（#630: 保護された置き場 `%ProgramData%\BantoHub\sink\` を
+//! 整え、`$INSTDIR` の `banto-hub-sink.toml.example` をそこへ差し替える）→ PREINSTALL で止めた
 //! サービスの再開、の順で実行する。PREUNINSTALL はシェルとサイドカーを
 //! 止めてからサービス登録を解除する。どのステップも失敗してインストーラ
 //! 自体を中断させない（`DetailPrint` で案内するだけ - T5-2 以来の方針）。
@@ -178,8 +179,9 @@ fn main() -> Result<()> {
         default_run: Some(SHELL_BINARY_NAME.to_string()),
     };
 
-    // §4.3「サイドカーの設定ファイルの置き場」（I1 時点では雛形の複製のみ、
-    // 実ファイルの生成・探索順変更は I2）。resources_map の値を空文字列に
+    // §4.3「サイドカーの設定ファイルの置き場」。雛形は $INSTDIR 直下に置き、
+    // `banto-hub-elev.exe prepare-sink-config`（#630）が exe の隣から読んで
+    // 保護された置き場 `%ProgramData%\BantoHub\sink\` へ差し替える。resources_map の値を空文字列に
     // すると、tauri-bundler は「元のファイル名のまま $INSTDIR 直下」に置く
     // （tauri-utils 2.9.3 の `ResourcePaths::resource_from_path` -
     // `{ "README.md": "" }` は `$INSTDIR/README.md` になる仕様、ソース確認

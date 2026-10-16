@@ -1,16 +1,26 @@
 # banto-hub-sink（DB Sink サイドカー）設定ファイルの雛形。
 #
-# インストーラが %ProgramData%\BantoHub\ に、このファイルを
-# `banto-hub-sink.toml.example` という名前のまま複製します（実際の
-# `banto-hub-sink.toml` は作成しません - API キーは Hub を起動して
-# 発行するまで存在しないため）。この雛形を同じフォルダで
-# `banto-hub-sink.toml` にリネームし、`api_key` を埋めてから
-# `Start-Service BantoHubSink` してください。
+# インストーラ（banto-hub-elev.exe prepare-sink-config）が、このファイルを
+# %ProgramData%\BantoHub\sink\banto-hub-sink.toml.example として置きます
+# （インストールのたびに差し替えます。ここに書き足したものは消えます）。
+# 実際の `banto-hub-sink.toml` は作りません - API キーは Hub を起動して
+# 発行するまで存在しないためです。
 #
-# 設定ファイルの探索順（I2 実装、docs/banto-hub-installer-design.md §4.4）:
-#   1. 環境変数 BANTO_HUB_SINK_CONFIG が指すパス
-#   2. %ProgramData%\BantoHub\banto-hub-sink.toml（このファイルの本来の置き場所）
-#   3. exe と同じディレクトリの banto-hub-sink.toml（後方互換）
+# 設定ファイルの置き場は %ProgramData%\BantoHub\sink\banto-hub-sink.toml
+# だけです（SYSTEM と Administrators だけが開ける置き場。旧いルート直下・
+# exe の隣は読みません。旧い場所にファイルがあると起動しません）。
+#
+# 作り方:
+#   1. 管理者としてメモ帳を開き（例: PowerShell で
+#      Start-Process notepad -Verb RunAs）、この置き場の中でこのファイルを
+#      コピーして banto-hub-sink.toml を作ります。外で作ったファイルを
+#      置き場へ移動しないでください（移動は元の ACL を持ってきます）。
+#   2. hub_url と api_key を書いて保存します。
+#   3. 管理者の PowerShell で banto-hub-elev.exe prepare-sink-config を実行し、
+#      置き場とファイルの所有者・ACL を整えます（メモ帳で保存すると所有者が
+#      編集した管理者になり、そのままでは sink が起動しません。編集のたびに
+#      実行してください）。
+#   4. Start-Service BantoHubSink
 #
 # 必須。Hub のループバック URL（§6-15: パスワードが平文で流れるため
 # Hub と同一マシンでの運用が前提）。既定ポートは 8722。
@@ -18,5 +28,5 @@ hub_url = "http://127.0.0.1:8722"
 
 # 必須。Hub の管理 UI で発行した API キー。スコープは `admin` と
 # `read` の両方が必要（admin だけでは /api/v1/{tags,values,stream} が
-# 403 になる）。このファイルに平文で置かれる - ファイルの ACL で守ること。
+# 403 になる）。このファイルに平文で置かれる - 置き場の ACL で守る。
 api_key = ""
