@@ -140,8 +140,10 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
 
 同じ `chronogazer-server.exe` を Windows サービス `ChronoGazer`（表示名「ChronoGazer 記録エンジン」、
 LocalSystem、手動開始）として登録する。サインアウトしても止まらず、OS のシャットダウンでは最終 flush と
-`collection_stopped` を残してから止まる（PRESHUTDOWN、後始末は最大 24 秒）。UAC の昇格ヘルパとインストーラは
-これから（B3-3・B3-4）なので、今は**管理者として実行した PowerShell**（★）から手で行う。
+`collection_stopped` を残してから止まる（PRESHUTDOWN、後始末は最大 24 秒）。インストーラはこれから（B3-4）
+なので、今は**管理者として実行した PowerShell**（★）から手で行う。Operators・ACL・自動開始まで含めて一度に
+整えるなら、下の「昇格ヘルパー `chronogazer-elev`」の `service-install` を使う（`install` と同じ登録をしてから
+続きを行う）。
 
 1. **exe を `C:\Program Files\ChronoGazer\` に置いてから登録する**。LocalSystem のサービスは SYSTEM の権限で
    動くので、一般の利用者が書き換えられる場所（`target\`・ダウンロード・デスクトップなど）の exe を登録すると、
@@ -182,7 +184,44 @@ LocalSystem、手動開始）として登録する。サインアウトしても
 - `CHRONOGAZER_ROOT` でデータの場所を変えるなら、**マシン全体の環境変数**にする（サービスに個別に設定すると、
   デスクトップ版が別の場所を見てサービスにつながらない）。サービスは OS の起動時の環境を使うので、変えたら OS を
   再起動する。
-- 手動開始なので OS を再起動しただけでは始まらない（自動開始は B3-3 で入る予定）。
+- 手動開始なので OS を再起動しただけでは始まらない（自動開始は下の `chronogazer-elev autostart-enable`）。
+
+#### 昇格ヘルパー `chronogazer-elev`（2026-10-16〜、#392 B3-3b）
+
+`chronogazer-elev.exe` は、サービスまわりの管理者の操作を**固定の 7 つのアクション**だけで行う UAC 昇格
+ヘルパー（実行すると UAC の昇格を求める）。`chronogazer-server.exe` と**同じフォルダ**
+（`C:\Program Files\ChronoGazer\`）に置く。登録する exe はいつも隣の `chronogazer-server.exe` で、データの
+場所はマシンの環境（マシン全体の `CHRONOGAZER_ROOT`、無ければ `%ProgramData%\ChronoGazer`）から決める
+（実行した人の環境変数は見ない）。
+
+```powershell
+cargo build --release -p chronogazer-elev
+# ★
+Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
+```
+
+| アクション                                        | すること                                                                                                                                                                                                                          |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `service-install [--install-user-sid S-1-5-21-…]` | `chronogazer-server install` と同じ登録 → `setup-operators` → `grant-service-acl` → `grant-data-acl`（最初の失敗で止める）。インストール利用者は指定した SID か実行した利用者（この PC の利用者のアカウントであることを確かめる） |
+| `service-uninstall`                               | 登録を解除（Operators のグループとデータは残す）                                                                                                                                                                                  |
+| `setup-operators`                                 | ローカルグループ `ChronoGazer Operators` を作り、記録したインストール利用者を足す（反映は次のサインインから）                                                                                                                     |
+| `grant-service-acl`                               | サービス `ChronoGazer` に `ChronoGazer Operators` の照会・開始・停止の権利を足す（設定の変更・削除・権限の変更は渡さない）                                                                                                        |
+| `grant-data-acl`                                  | データのルート・`secrets\`・`secrets\hub-keys\` を「SYSTEM・Administrators にフル、インストール利用者に変更、親から継承しない」にする。ジャンクション・見知らぬ所有者のフォルダは書き直さずに止める                               |
+| `autostart-enable` / `autostart-disable`          | 自動開始（遅延）にする / 手動開始に戻す                                                                                                                                                                                           |
+
+- **終了コード**: 0 完了、1 失敗（書き直さずに止めたときも）、2 前提が無い（サービス未登録・インストール利用者の
+  記録が無い・隣に `chronogazer-server.exe` が無いなど）、64 使い方の誤り。出力はどの行も `chronogazer-elev:` で始まる。
+- **昇格のしかた**: 管理者の PowerShell（★）からそのまま実行するか、昇格していない PowerShell から
+  `Start-Process 'C:\Program Files\ChronoGazer\chronogazer-elev.exe' -ArgumentList ... -Wait -PassThru`（UAC の
+  確認が出る。出力は別の窓）。昇格していない窓から直接呼んだときは、呼び方によって「要求された操作には
+  管理者特権が必要です」で何もせずに終わるか、UAC の確認を出す（どちらでも、確認なしに管理者の操作は行わない）。
+- **別の管理者の資格情報で昇格する（一般の利用者の PC）ときは、自分の SID を渡す**:
+  `service-install --install-user-sid ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)`
+  （昇格していない PowerShell で SID を取ってから渡す）。省くと、UAC で入力した管理者がインストール利用者に
+  なる。直すには `service-uninstall` → `service-install --install-user-sid <自分の SID>`。
+- `ChronoGazer Operators` のメンバーは、昇格せずに `sc.exe start ChronoGazer` / `sc.exe stop ChronoGazer` が
+  できる（設定の変更はできない）。データのフォルダには Operators・Users の権利を付けないので、画面を使う人は
+  インストール利用者にする。
 
 ### 旧形式の DB で起動しないとき（2026-10-02〜）
 
