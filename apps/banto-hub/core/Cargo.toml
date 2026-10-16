@@ -43,6 +43,16 @@ banto-service-control = { path = "../../../crates/banto-service-control" }
 # ChronoGazer の elev と共有する crate へ移した。アクション・引数の検証・
 # 手順の順序・文言は banto-hub に残る。
 banto-service-elev = { path = "../../../crates/banto-service-elev" }
+# #626（2026-10-16）: `grant-profile-acl`（`src/profile_grant.rs`）の書き直しを共有の
+# 部品に寄せた - 辿らずに開く`pin_dir`・ハンドルへ書く`PinnedDir::reset_acl`（自動の
+# 伝播を使わない自前の再帰）・`read_dacl`、書き直す前の確かめ（`acl::guard` の
+# マシンの環境のルート・本当のパスの比較・所有者・引き継ぐ利用者）、`InstallUserSid`・
+# `DirAccess`。以前の`src/profile_acl.rs`（パスの`SetNamedSecurityInfoW`）は消した。
+# 純粋な部品（`guard`・`InstallUserSid`）は全 OS で使い、手順の偽物のテストを Linux でも
+# 走らせるので、Windows 限定にしない。`banto-hub-bootstrap`・`banto-tagclient`が
+# 付いてくるが、どちらもこの crate が既に持つ依存（reqwest・tungstenite 等）の上で、
+# Cargo.lock に新しい crate は増えない。
+banto-secret-store = { path = "../../../crates/banto-secret-store" }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its
 # PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
@@ -182,9 +192,16 @@ rumqttd = { version = "0.20", default-features = false }
 # tokio/mio/tempfile 等が既に windows-sys 0.61 系を依存木に持っている
 # （Cargo.lock 参照）ので、同じバージョン系列を明示するだけ。テストコードの
 # みが使うので dev-dependency。
+#
+# #626（2026-10-16）: `src/profile_grant/win/tests.rs`の反証（その場の
+# すり替え）で、書き直しの直前にフォルダを`FSCTL_SET_REPARSE_POINT`で
+# ジャンクションにする（`CreateFileW`・`DeviceIoControl`）。本番には足さない。
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
@@ -199,7 +216,7 @@ path = "src/bin/banto-hub.rs"
 # `autostart-disable`の7アクションのみを受け付ける薄い CLI（本体は
 # `src/service_elevated.rs`、`crate::service_elevated`参照）。
 # `grant-profile-acl`は profile ACL 追加スライス（docs/banto-hub-desktop-plan.md
-# §11、`src/profile_acl.rs`）で追加した。`banto-hub-elev.manifest`
+# §11、#626 で`src/profile_grant.rs`に作り直した）で追加した。`banto-hub-elev.manifest`
 # （`requireAdministrator`、`build.rs`が embed-resource でこのバイナリにだけ
 # リンクする）により、実行するだけで OS が UAC 昇格プロンプトを出す。
 [[bin]]
@@ -235,19 +252,13 @@ path = "src/bin/banto-hub-elev.rs"
 # #392 B3-3a でグループ・サービス DACL の呼び出しは共有 crate
 # `banto-service-elev`へ移したので、このパッケージからは
 # `Win32_NetworkManagement_NetManagement`・`Win32_System_Services`を外した
-# （`Win32_Security_Authorization`は`profile_acl.rs`が、
-# `Win32_System_WindowsProgramming`は`GetUserNameW`がまだ使う）。
+# （`Win32_System_WindowsProgramming`は`GetUserNameW`がまだ使う）。
 #
-# profile ACL 追加スライス（docs/banto-hub-desktop-plan.md §11、
-# `src/profile_acl.rs`）: `Win32_Storage_FileSystem`を追加した -
-# `FILE_GENERIC_READ`/`FILE_GENERIC_WRITE`/`FILE_GENERIC_EXECUTE`/`DELETE`
-# （profile owner に付与する「変更(Modify)」アクセス権マスクの構成要素）・
-# `FILE_ALL_ACCESS`（SYSTEM/Administrators への Full Control）はこの
-# feature 配下にある。`GetNamedSecurityInfoW`/`SetNamedSecurityInfoW`・
-# `SE_FILE_OBJECT`・`DACL_SECURITY_INFORMATION`・
-# `OBJECT_INHERIT_ACE`/`CONTAINER_INHERIT_ACE`は既存の
-# `Win32_Security`/`Win32_Security_Authorization`に含まれるため新規
-# feature 追加は不要。
+# profile ACL 追加スライス（docs/banto-hub-desktop-plan.md §11）で
+# `src/profile_acl.rs`のために足した`Win32_Security_Authorization`・
+# `Win32_Storage_FileSystem`は、#626（2026-10-16）でその実装を消して
+# `banto-secret-store`に寄せたので外した（`src/profile_grant/win.rs`が使うのは
+# `OpenMutexW`の`Win32_System_Threading`だけ）。
 #
 # ロックダウン回復アクション追加（docs/tag-server-design.md §5.6、
 # `service_elevated.rs`の`reset-password`/`revert-to-commissioning`）:
@@ -262,8 +273,6 @@ path = "src/bin/banto-hub-elev.rs"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

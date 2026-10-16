@@ -115,14 +115,17 @@
 //!   profile 排他 - Windows は`Global\BantoHub.<profile-id>`named mutex、
 //!   非 Windows は profile ディレクトリの`flock`自体を排他の実体にする
 //!   （[`profile_lock::try_acquire_profile_lock`]）
-//! - [`profile_acl`]: profile ACL 追加スライス（docs/banto-hub-desktop-plan.md
-//!   §11）。LocalSystem（Windows サービス）が先に作成した profile
-//!   ディレクトリ・DB が対話ユーザーから readonly になる実機不具合
-//!   （docs/banto-hub-t16-design.md §3 実機メモ「attempt to write a
-//!   readonly database」）を、profile owner への明示 DACL 付与
-//!   （[`profile_acl::grant_profile_owner_acl`]）で解消する。`Users`
-//!   グループ全体には一切権限を与えない（desktop-plan §11）。呼び出し元は
-//!   [`service_elevated::ElevatedAction::GrantProfileAcl`]（UAC helper 経由）
+//! - [`profile_grant`]: profile ACL（docs/banto-hub-desktop-plan.md §11）。
+//!   LocalSystem（Windows サービス）が先に作成した profile ディレクトリ・DB が
+//!   対話ユーザーから readonly になる実機不具合（docs/banto-hub-t16-design.md
+//!   §3 実機メモ「attempt to write a readonly database」）を、profile owner への
+//!   「変更」で解消する。#626（2026-10-16）で昇格の境界として作り直した: 確かめ
+//!   （profile-id の許可リスト・利用者の SID と`SidTypeUser`・マシンの環境だけの
+//!   ルート・稼働中か）を全部通してから、辿らずに開いたハンドルへ保護された DACL を
+//!   書く（`banto_secret_store::acl`の`pin_dir`・`reset_acl`）。`Users`グループ全体には
+//!   一切権限を与えない。呼び出し元は
+//!   [`service_elevated::ElevatedAction::GrantProfileAcl`]（UAC helper 経由）と
+//!   `service-install`
 //! - [`hub_health`]: T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4）。
 //!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
 //!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」
@@ -159,7 +162,7 @@
 //!   `BantoHub Operators`の作成・メンバー追加（`setup-operators`）、
 //!   `BantoHub`サービスへの限定 DACL 付与（`grant-service-acl`）、profile
 //!   ディレクトリへの owner DACL 付与（`grant-profile-acl`、
-//!   [`profile_acl`]へ委譲）を行う - [`service_operators`]が残した
+//!   [`profile_grant`]へ委譲）を行う - [`service_operators`]が残した
 //!   「グループ作成・SDDL 付与は次スライス」を引き継ぐ。#392 B3-3a で
 //!   [`service_operators`]と合わせて Win32 の呼び出し（グループ・メンバー・
 //!   サービス DACL の ACE・トークンのメンバーシップ）を共有 crate
@@ -194,7 +197,7 @@ pub mod mcp;
 pub mod mqtt;
 pub mod opcua;
 pub mod pending_changes;
-pub mod profile_acl;
+pub mod profile_grant;
 pub mod profile_lock;
 pub mod profile_paths;
 pub mod read_path;
