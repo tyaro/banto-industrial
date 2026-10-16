@@ -1,7 +1,7 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-10-16 更新: #201 の診断用 OPC UA Phase 2 を追加。#615 の現在値の不正値を全 IF で欠測・Bad に統一。2026-10-14 更新: §9 P3-b の SLMP CPU 種別を接続ごとに選べるようにした（#605、migration `0021`、既定 R。Q は QJ71E71 の 4E フレーム。アクセスルートは未露出）。2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
+状態: **実装追従中（2026-10-17 更新: §5.5 の banto-opcua ADR へのリンクを、固定先と同じ banto-opcua main のコミット `d6e0291` に揃えた（#633）。2026-10-16 更新: #201 の診断用 OPC UA Phase 2 を追加。#615 の現在値の不正値を全 IF で欠測・Bad に統一。2026-10-14 更新: §9 P3-b の SLMP CPU 種別を接続ごとに選べるようにした（#605、migration `0021`、既定 R。Q は QJ71E71 の 4E フレーム。アクセスルートは未露出）。2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
 セッションの確定は banto v2.0.0 の SessionController に寄せ、試運転は policy runner の `adopt`/`end` で
 確定・終了することを追記（v2 移行 PR1d、banto-hub v0.2.0-alpha.26。サーバー側の設計・wire は変更なし）。
 2026-09-30 更新: §4.1 のバインディングキーを外部名のみに改め、安定 ID によるリネーム検出を撤回（オーナー決定、scada-design.md §9.6）。2026-09-24 更新: §6 の 6 項に、書き込み受付の停止を DB と状態ファイルの
@@ -1083,7 +1083,7 @@ RUSTSEC-2023-0071（RSA 秘密操作のタイミングサイドチャネル）�
 Phase 2 は None/Anonymous 固定でその操作を提供しないため、`deny.toml` で
 この advisory のみ期限付きで除外する。2027-01-15 または証明書・SecurityPolicy
 を扱う Phase 3 着手時の早い方で見直し、修正版が出たら依存を更新して除外を外す。
-根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/c123d6fa2d3e26594d02919e90d20d10595e0b8d/docs/adr/0001-async-opcua-base.md) に記録する。
+根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/d6e0291d492890261636a5103ea434665b02c476/docs/adr/0001-async-opcua-base.md) に記録する。
 
 ### 5.6 認証（全プロトコル共通)
 
