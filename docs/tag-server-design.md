@@ -1077,6 +1077,13 @@ LAN 公開は管理者が bind と必要な advertisedHost を明示したとき
 資格情報・暗号化・証明書管理を含む本番向け OPC UA は後続 Phase 3 の範囲であり、
 現段階で機密データを載せた LAN 公開はしない。
 
+`async-opcua-crypto` 経由の `rsa` 0.9.10 には未修正の
+RUSTSEC-2023-0071（RSA 秘密操作のタイミングサイドチャネル）がある。
+Phase 2 は None/Anonymous 固定でその操作を提供しないため、`deny.toml` で
+この advisory のみ期限付きで除外する。2027-01-15 または証明書・SecurityPolicy
+を扱う Phase 3 着手時の早い方で見直し、修正版が出たら依存を更新して除外を外す。
+根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/9c479973ca6e42c94e8ed9ae321fec3569035e0d/docs/adr/0001-async-opcua-base.md) に記録する。
+
 ### 5.6 認証（全プロトコル共通)
 
 - **管理 UI**: `banto_server` の bearer token セッション（既存のまま）

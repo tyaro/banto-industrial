@@ -117,7 +117,7 @@ allow-git = ["https://github.com/tyaro/banto", "https://github.com/tyaro/slmp", 
 # banto/slmp は Cargo.toml の tag 指定を維持する。#20 の tag 化後に戻す。
 
 [advisories]
-# 既定(deny)を維持: 既知の脆弱性(vulnerability)は無条件で CI を落とす。
+# 既定(deny)を維持: 既知の脆弱性(vulnerability)は原則 CI を落とす。
 #
 # unmaintained については、cargo-deny 0.18 以降のスキーマでは
 # deny/warn/allow のような lint level ではなく「どの範囲を対象にするか」
@@ -135,4 +135,11 @@ unmaintained = "workspace"
 unsound = "workspace"
 # yanked クレートは既定で "warn"(明示して分かりやすくする)。
 yanked = "warn"
-ignore = []
+# RUSTSEC-2023-0071 は async-opcua-crypto -> rsa 0.9.10 の未修正 advisory。
+# #201 Phase 2 の OPC UA は None/Anonymous 固定で RSA 秘密操作を提供しないため、
+# banto-opcua の docs/adr/0001-async-opcua-base.md と同じ期限付き例外とする。
+# 2027-01-15 または Phase 3（証明書・SecurityPolicy）着手時の早い方で見直し、
+# 修正版が出た場合は依存更新後にこの例外を削除する。
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Phase 2 uses None/Anonymous without RSA private operations; review by 2027-01-15 or when Phase 3 starts (banto-opcua ADR-0001)." },
+]
