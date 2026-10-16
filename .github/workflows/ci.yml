@@ -24,10 +24,8 @@
 # rust ジョブのテストは cargo-nextest（`--profile ci`、設定は `.config/nextest.toml`）。
 # doctest は nextest で走らないので `cargo test --doc` を別の段で回す。
 # デバッグ情報は `CARGO_PROFILE_DEV_DEBUG=line-tables-only` で軽くしている。
-# Swatinem/rust-cache は `cache-workspace-crates: true`（自前の crate もキャッシュ。
-# 容量に注意、下の rust ジョブのコメント参照）。rust ジョブは clippy と nextest の
-# ビルドに `--timings` を付け、crate ごとのビルド時間の HTML を artifact
-# （`cargo-timings`、14 日）に残す。
+# rust ジョブは clippy と nextest のビルドに `--timings` を付け、crate ごとの
+# ビルド時間の HTML を artifact（`cargo-timings`、14 日）に残す。
 #
 # 将来 `apps/banto-scada` を足すとき:
 #   1. ci-changes.mjs の RULES に `^apps/banto-scada/` → `scada`（E2E を足すなら
@@ -255,15 +253,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # cache-workspace-crates: 既定ではワークスペースの crate（banto-plc・banto-rtsp・
-      # apps の core など）はキャッシュに入らず、毎回ビルドし直す。true にすると、
-      # 触っていない crate はキャッシュから戻る。代わりにキャッシュの容量が増える。
-      # **GitHub の Actions キャッシュはリポジトリ全体で 10GB が上限**（超えると古いものから
-      # 追い出される。e2e など他ジョブのキャッシュも同じ枠）。増え方は Actions の
-      # キャッシュ一覧で見て、足りなければ false に戻す。
+      # `cache-workspace-crates` は見送った（#638 レビュー: rust-cache のキーにソースの中身が入らず、完全一致の復元では保存されない。checkout で更新時刻も新しくなり、自前の crate は結局ビルドし直しになる）。
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-workspace-crates: true
       # rustfmt only parses/reformats - no compilation, so it always covers
       # every workspace member (cheap), whatever the clippy/test scope below.
       - name: fmt
@@ -347,10 +338,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # 自前の crate もキャッシュする（理由と容量の注意は rust ジョブのコメント）。
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-workspace-crates: true
       # 統合テスト（実 PostgreSQL に対する正常/NULL/未対応型/0行/クエリ
       # エラー/接続断/構成変更/状態API/書き込み拒否）。
       - name: test (db_source integration)
@@ -384,10 +372,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # 自前の crate もキャッシュする（理由と容量の注意は rust ジョブのコメント）。
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-workspace-crates: true
       - name: clippy (chronogazer-elev / banto-hub-core の lib)
         run: cargo clippy -p chronogazer-elev -p banto-hub-core --lib -- -D warnings
 
