@@ -24,6 +24,10 @@
 # rust ジョブのテストは cargo-nextest（`--profile ci`、設定は `.config/nextest.toml`）。
 # doctest は nextest で走らないので `cargo test --doc` を別の段で回す。
 # デバッグ情報は `CARGO_PROFILE_DEV_DEBUG=line-tables-only` で軽くしている。
+# Swatinem/rust-cache は `cache-workspace-crates: true`（自前の crate もキャッシュ。
+# 容量に注意、下の rust ジョブのコメント参照）。rust ジョブは clippy と nextest の
+# ビルドに `--timings` を付け、crate ごとのビルド時間の HTML を artifact
+# （`cargo-timings`、14 日）に残す。
 #
 # 将来 `apps/banto-scada` を足すとき:
 #   1. ci-changes.mjs の RULES に `^apps/banto-scada/` → `scada`（E2E を足すなら
@@ -251,7 +255,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # cache-workspace-crates: 既定ではワークスペースの crate（banto-plc・banto-rtsp・
+      # apps の core など）はキャッシュに入らず、毎回ビルドし直す。true にすると、
+      # 触っていない crate はキャッシュから戻る。代わりにキャッシュの容量が増える。
+      # **GitHub の Actions キャッシュはリポジトリ全体で 10GB が上限**（超えると古いものから
+      # 追い出される。e2e など他ジョブのキャッシュも同じ枠）。増え方は Actions の
+      # キャッシュ一覧で見て、足りなければ false に戻す。
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-workspace-crates: true
       # rustfmt only parses/reformats - no compilation, so it always covers
       # every workspace member (cheap), whatever the clippy/test scope below.
       - name: fmt
@@ -269,7 +281,7 @@ jobs:
       # this job runs on windows-latest with Swatinem/rust-cache, where the
       # Tauri/WebView2 dependency build time is acceptable.
       - name: clippy
-        run: cargo clippy ${{ needs.changes.outputs.rust_args }} --all-targets -- -D warnings
+        run: cargo clippy ${{ needs.changes.outputs.rust_args }} --all-targets --timings -- -D warnings
       # テストは cargo-nextest（テスト 1 件 = 1 プロセスで、バイナリをまたいで並列に
       # 走る）。同時に走るとぶつかるテストは .config/nextest.toml の test-groups で
       # 直列にしてある（理由もそこ）。ローカルでも `cargo nextest run` が使える。
@@ -277,10 +289,20 @@ jobs:
         with:
           tool: cargo-nextest@0.9.148
       - name: test (nextest)
-        run: cargo nextest run ${{ needs.changes.outputs.rust_args }} --profile ci
+        run: cargo nextest run ${{ needs.changes.outputs.rust_args }} --profile ci --timings
       # nextest は doctest を走らせない。
       - name: test (doctest)
         run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
+      # crate ごとのビルド時間（clippy の check ビルドと nextest のテストビルド）。
+      # `--timings` は追加のビルドをしない（ビルドの二重化なし）。失敗しても残す。
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings
+          path: target/cargo-timings/cargo-timing-*.html
+          if-no-files-found: ignore
+          retention-days: 14
 
   # 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §7「S2 / S5 の統合
   # テストは CI で PostgreSQL のサービスコンテナを使う」）。上の `rust` ジョブ
@@ -325,7 +347,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # 自前の crate もキャッシュする（理由と容量の注意は rust ジョブのコメント）。
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-workspace-crates: true
       # 統合テスト（実 PostgreSQL に対する正常/NULL/未対応型/0行/クエリ
       # エラー/接続断/構成変更/状態API/書き込み拒否）。
       - name: test (db_source integration)
@@ -359,7 +384,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # 自前の crate もキャッシュする（理由と容量の注意は rust ジョブのコメント）。
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-workspace-crates: true
       - name: clippy (chronogazer-elev / banto-hub-core の lib)
         run: cargo clippy -p chronogazer-elev -p banto-hub-core --lib -- -D warnings
 
