@@ -26,8 +26,17 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { saveMqttSettings } from '#lib/banto/mqttSettingsAdmin.js';
 	import { saveGrpcSettings } from '#lib/banto/grpcSettingsAdmin.js';
-	import { getOpcUaSettings, saveOpcUaSettings } from '#lib/banto/opcuaSettingsAdmin.js';
-	import { isLanExposure, validateOpcUaSettings } from '#lib/banto/opcuaSettingsForm.js';
+	import {
+		getOpcUaSettings,
+		getOpcUaStatus,
+		saveOpcUaSettings,
+		type OpcUaStatus
+	} from '#lib/banto/opcuaSettingsAdmin.js';
+	import {
+		isLanExposure,
+		opcUaStatusPill,
+		validateOpcUaSettings
+	} from '#lib/banto/opcuaSettingsForm.js';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { errorMessage } from './shared';
 	import { mqttSettingsStore } from './mqttSettingsStore.svelte';
@@ -155,6 +164,47 @@
 	let opcUaAdvertisedHost = $state('');
 	const opcUaLanExposure = $derived(isLanExposure(opcUaBind, opcUaAdvertisedHost));
 
+	/*
+	 * listener の状態（#634）。保存（PUT）は起動の完了を待たずに返るので、
+	 * 起動中・起動済み・失敗（理由つき）・停止は `GET /api/opcua-status` で見る。
+	 * 起動中のあいだだけ 1 秒ごとに読み直す。要求に番号を振り、後から出した
+	 * 要求の応答より古い応答は捨てる（保存直後の読み直しとポーリングが
+	 * 前後しても、古い「起動中」で新しい結果を巻き戻さない）。
+	 */
+	let opcUaStatus: OpcUaStatus | null = $state(null);
+	let opcUaStatusError: string | null = $state(null);
+	let opcUaStatusTick = $state(0);
+	let opcUaStatusSeq = 0;
+	const opcUaPill = $derived(opcUaStatusPill(opcUaStatus));
+
+	async function refreshOpcUaStatus(): Promise<void> {
+		const seq = ++opcUaStatusSeq;
+		try {
+			const status = await getOpcUaStatus();
+			if (seq !== opcUaStatusSeq) return;
+			opcUaStatus = status;
+			opcUaStatusError = null;
+		} catch (err) {
+			if (seq !== opcUaStatusSeq) return;
+			opcUaStatusError = errorMessage(err);
+		} finally {
+			if (seq === opcUaStatusSeq) opcUaStatusTick += 1;
+		}
+	}
+
+	$effect(() => {
+		if (!canManageOpcUa) return;
+		void refreshOpcUaStatus();
+	});
+
+	$effect(() => {
+		// `opcUaStatusTick` を読むことで、読み直しが終わるたびに次を予約する。
+		void opcUaStatusTick;
+		if (!canManageOpcUa || opcUaStatus?.state !== 'starting') return;
+		const timer = setTimeout(() => void refreshOpcUaStatus(), 1000);
+		return () => clearTimeout(timer);
+	});
+
 	$effect(() => {
 		if (!canManageOpcUa) return;
 		let cancelled = false;
@@ -226,7 +276,13 @@
 		opcUaSaving = true;
 		try {
 			applyOpcUaSettings(await saveOpcUaSettings(input));
-			toastStore.push('success', 'OPC UA 設定を保存しました(即時適用されます)');
+			toastStore.push(
+				'success',
+				input.enabled
+					? 'OPC UA 設定を保存しました。サーバーを起動しています'
+					: 'OPC UA 設定を保存しました'
+			);
+			await refreshOpcUaStatus();
 		} catch (err) {
 			opcUaError = errorMessage(err);
 		} finally {
@@ -375,22 +431,36 @@
 			OPC UA
 			<span
 				class="status-pill"
-				class:ok={opcUaLoaded && !opcUaLoadFailed && opcUaSavedEnabled}
-				class:bad={!opcUaLoaded || opcUaLoadFailed || !opcUaSavedEnabled}
+				class:ok={opcUaPill.tone === 'ok'}
+				class:bad={opcUaPill.tone === 'bad'}
+				data-testid="opcua-status-pill"
 			>
-				{opcUaLoaded && !opcUaLoadFailed
-					? `設定: ${opcUaSavedEnabled ? '有効' : '無効'}`
-					: '設定: 未確認'}
+				{opcUaPill.label}
 			</span>
 		</h2>
+		{#if opcUaStatus?.state === 'starting'}
+			<p class="note" role="status">
+				OPC UA サーバーを起動しています。初回は 10 秒ほどかかることがあります。
+			</p>
+		{:else if opcUaStatus?.state === 'running' && opcUaStatus.endpoint}
+			<p class="note">エンドポイント: <code>{opcUaStatus.endpoint}</code></p>
+		{:else if opcUaStatus?.state === 'failed'}
+			<p class="error" role="alert">
+				OPC UA サーバーを起動できませんでした: {opcUaStatus.error ?? '理由不明'}
+				（設定を見直して保存し直すと、もう一度起動します）
+			</p>
+		{/if}
+		{#if opcUaStatusError}
+			<p class="error" role="alert">状態を読み取れませんでした: {opcUaStatusError}</p>
+		{/if}
 		{#if opcUaLoaded && opcUaLoadFailed}
 			<p class="error" role="alert">{opcUaError}</p>
 			<button type="button" onclick={retryLoadOpcUaSettings}>再読み込み</button>
 		{:else if opcUaLoaded}
 			<form onsubmit={submitOpcUaSettings}>
 				<p class="note">
-					上の表示は保存済みの設定です。実際の待受状態や起動失敗は Hub
-					の診断ログで確認してください。
+					上の表示はサーバーの実際の状態です。保存済みの設定:
+					{opcUaSavedEnabled ? '有効' : '無効'}
 				</p>
 				<label class="field checkbox">
 					<input type="checkbox" bind:checked={opcUaEnabled} />

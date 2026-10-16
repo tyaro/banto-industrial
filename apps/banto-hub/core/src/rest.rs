@@ -2112,6 +2112,14 @@ async fn opcua_settings_get(
     Ok(Json(settings.opcua_config().await?))
 }
 
+/// listener の状態（#634）。`PUT /api/opcua-settings` は保存して起動を始めたら
+/// すぐ返るので、起動中・起動済み・失敗（理由つき）・停止はここで見る。
+async fn opcua_status_get(
+    State(state): State<OpcUaSettingsAdminState>,
+) -> Json<crate::opcua::OpcUaStatus> {
+    Json(state.publisher.status())
+}
+
 fn valid_opcua_host(host: &str) -> bool {
     if host.is_empty() || host != host.trim() {
         return false;
@@ -2219,9 +2227,12 @@ async fn opcua_settings_put(
         }));
     }
     // クライアント切断で設定保存と listener 切り替えが途中停止しないよう切り離す。
+    // #634: `apply` は古い listener を止めて起動を背景タスクへ渡したら返る
+    // （起動の完了は待たない）。200 は「保存した・起動を始めた」までを意味し、
+    // 起動の結果は `GET /api/opcua-status` に出る。
     let applied = tokio::spawn(async move {
-        // 保存と適用を1つの順序にし、並行 PUT の古い listener が最後に
-        // 残ることを防ぐ。
+        // 保存と適用を1つの順序にし、並行 PUT の古い設定が後から適用されることを
+        // 防ぐ（起動どうしの順序と世代は `OpcUaPublisher` が守る）。
         let _write_guard = state.write_lock.lock().await;
         SettingsService::new(Db::Sqlite(state.manager.pool()))
             .set_opcua_config(&config)
@@ -2272,6 +2283,7 @@ pub(crate) fn opcua_settings_router(
             "/api/opcua-settings",
             get(opcua_settings_get).put(opcua_settings_put),
         )
+        .route("/api/opcua-status", get(opcua_status_get))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             SessionRoleGuard {

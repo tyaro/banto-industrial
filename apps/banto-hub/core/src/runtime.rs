@@ -1331,6 +1331,10 @@ mod tests {
         .await
         .expect("Hub REST must start despite OPC UA bind failure");
         assert_ne!(hub.local_addr().port(), busy);
+        // #634: bind の失敗は状態の API（`GET /api/opcua-status`）に理由つきで出る。
+        let status = hub.opcua.status();
+        assert_eq!(status.state, crate::opcua::OpcUaState::Failed);
+        assert!(status.error.is_some_and(|error| !error.is_empty()));
         tokio::time::timeout(Duration::from_secs(10), hub.shutdown())
             .await
             .expect("shutdown");
@@ -1349,12 +1353,33 @@ mod tests {
             body: Option<&serde_json::Value>,
             response_timeout: Duration,
         ) -> (u16, serde_json::Value) {
+            call_path(
+                addr,
+                "/api/opcua-settings",
+                operation,
+                method,
+                token,
+                body,
+                response_timeout,
+            )
+            .await
+        }
+
+        async fn call_path(
+            addr: std::net::SocketAddr,
+            path: &str,
+            operation: &str,
+            method: &str,
+            token: Option<&str>,
+            body: Option<&serde_json::Value>,
+            response_timeout: Duration,
+        ) -> (u16, serde_json::Value) {
             let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
             let authorization = token
                 .map(|token| format!("Authorization: Bearer {token}\r\n"))
                 .unwrap_or_default();
             let request = format!(
-                "{method} /api/opcua-settings HTTP/1.0\r\nHost: {addr}\r\nX-Banto-Client: banto\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nX-Banto-Client: banto\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()
             );
             let mut stream = tokio::net::TcpStream::connect(addr)
@@ -1495,21 +1520,52 @@ mod tests {
         let mut enabled = initial.clone();
         enabled["enabled"] = serde_json::json!(true);
         enabled["port"] = serde_json::json!(opcua_port);
-        // Windows CI では初回起動が 10 秒を超える場合がある。起動時には一時 RSA 鍵の
-        // 生成も行うため、ハング検出用の有限な上限を設けて起動完了を待つ。
+        // #634: 有効化の PUT は保存して起動を始めたらすぐ返る（他の PUT と同じ
+        // 10 秒の上限）。listener の起動は Windows CI で 10 秒を超えることがある
+        // （一時 RSA 鍵の生成を含む）ので、起動済みは状態の API で待つ
+        // （ハング検出用の有限な上限）。
         assert_eq!(
             call(
                 addr,
-                "enable OPC UA listener (may generate temporary RSA key)",
+                "enable OPC UA listener",
                 "PUT",
                 Some(token),
                 Some(&enabled),
-                Duration::from_secs(60),
+                Duration::from_secs(10),
             )
             .await
             .0,
             200
         );
+        let started = tokio::time::Instant::now();
+        let running = loop {
+            let (status, body) = call_path(
+                addr,
+                "/api/opcua-status",
+                "read OPC UA status",
+                "GET",
+                Some(token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await;
+            assert_eq!(status, 200);
+            match body["state"].as_str() {
+                Some("running") => break body,
+                Some("starting") => {}
+                other => panic!("unexpected OPC UA state {other:?}: {body}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "OPC UA listener did not start within 60s: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(
+            running["endpoint"],
+            serde_json::json!(format!("opc.tcp://127.0.0.1:{opcua_port}/"))
+        );
+        assert!(running["error"].is_null());
         assert_eq!(
             call(
                 addr,
@@ -1559,6 +1615,32 @@ mod tests {
         assert!(tokio::net::TcpStream::connect(("127.0.0.1", opcua_port))
             .await
             .is_err());
+        let (status, stopped) = call_path(
+            addr,
+            "/api/opcua-status",
+            "read OPC UA status after disable",
+            "GET",
+            Some(token),
+            None,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(
+            call_path(
+                addr,
+                "/api/opcua-status",
+                "unauthenticated OPC UA status",
+                "GET",
+                None,
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .0,
+            401
+        );
         hub.shutdown().await;
     }
 

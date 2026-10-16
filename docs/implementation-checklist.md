@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-16（§5 に「外から来た名前をパスに join する前に、Windows で別の場所を指しうるもの（`:`・予約名・末尾の `.` と空白）を断る」を追加。#626 の調査で、profile-id の `C:` が `Path::join` でドライブ相対のパスになり、昇格した `grant-profile-acl` が C: の今のフォルダを書き換えうる穴を見つけた）2026-10-16（§2 に「CI は cargo nextest で走る。プロセス内の直列化は効かないので、同時に走るとぶつかるテストは `.config/nextest.toml` の test-groups へ」を追加。CI の rust ジョブを cargo-nextest に替えたことに伴う）
+最終更新: 2026-10-17（§5 の「OPC UA 設定の有効化 PUT は初回起動に時間がかかる」を #634 に合わせて書き換えた。PUT は保存して起動を始めたらすぐ返り、起動の完了は `GET /api/opcua-status` で待つ。PUT の上限は他と同じ 10 秒に戻した）2026-10-16（§5 に「外から来た名前をパスに join する前に、Windows で別の場所を指しうるもの（`:`・予約名・末尾の `.` と空白）を断る」を追加。#626 の調査で、profile-id の `C:` が `Path::join` でドライブ相対のパスになり、昇格した `grant-profile-acl` が C: の今のフォルダを書き換えうる穴を見つけた）2026-10-16（§2 に「CI は cargo nextest で走る。プロセス内の直列化は効かないので、同時に走るとぶつかるテストは `.config/nextest.toml` の test-groups へ」を追加。CI の rust ジョブを cargo-nextest に替えたことに伴う）
 2026-10-16（§2 に「新規ディレクトリ・ファイルを追加したら git add 後に ci-changes 分類テストを実行する」を追加。#632 で新設 interop/ の分類登録を忘れて changes と ci-gate が失敗した。網羅テストは git ls-files を見るため、追加ファイルをステージした後に実行する）
 2026-10-16（§5 に「OPC UA 設定の有効化 PUT は起動完了を待つため長めの上限を明示する」を追加。PR #627 の Windows CI で初回起動が 10 秒を超え、起動経路には一時 RSA 鍵生成も含まれる）
 2026-10-16（§2 に「Cargo の生成物は cargo/rustc/linker が動いていないことを確認してから掃除する」を追加。#201 の検証中、リンク中に `target/debug/examples` を消して欠けた object によりテストが失敗した）
@@ -124,7 +124,7 @@
 - [ ] **`PlcConnection` に列を足すときは、`banto-tags` の `COLUMNS` だけでなく `banto-collect` の `RegistrySnapshot::load_connection` の SELECT も合わせる**。`FromRow` は名前で列を引くので、テーブルに列があっても SELECT から落とすと、preflight が「no column found for name」で 422 になる（#605。`load()` はサービス経由なので通り、トランザクション内の `load_connection` だけが落ち、hub の REST テストが 58 件落ちた）。
 - [ ] **並行テストの時間切れは、書き手が終わっていないことと読み手の欠落とを分ける**。`banto-tsquery` の `concurrent_reads_during_writes_never_corrupt_or_error` は、読み手が壊れていなくても 50 flush が 10 秒に収まらないと「46 件で打ち切り」になる（windows-latest、#605 の CI run 38620658017）。上限はハング用にし、書き手が終わったあとの読みで全件が見えることを確かめる。
 - [ ] **外から来た名前（profile-id など）をパスに join する前に、Windows で別の場所を指しうるものを断る**。Windows の `Path::join` は**ドライブの接頭辞を持つ要素（`C:`・`x:y`）で前を捨てる**ので、`root.join("profiles").join("C:")` は `C:`（C: の今のフォルダ = ドライブ相対）になる。`/`・`\`・`..` を断るだけでは足りない。`:`（代替データストリームも）・予約デバイス名（`NUL`・`COM1`、`nul.txt` も）・末尾の `.` と空白（Win32 の正規化で落ちる）も断り、昇格の境界では許可リスト（英数字・`_`・`-`）にする（#626、2026-10-16: `grant-profile-acl <user> C:` が昇格したプロセスの C: の今のフォルダを再帰で書き換えうる経路だった。`profile_paths::validate_profile_id`・`profile_grant::validate_strict_profile_id`）。
-- [ ] **OPC UA 設定の有効化 PUT は初回起動に時間がかかる場合がある**。`opcua_admin_settings_round_trip_and_reconfigure_listener` は Windows CI で初回 listener 起動が 10 秒を超えた（PR #627、run 38871877894）。起動経路には一時 RSA 鍵生成も含まれるが、タイムアウトの直接原因と確定したわけではない。この PUT にだけ明示的な長めの有限上限（60 秒）を与え、操作名をエラーに含める。GET・不正値・無効化 PUT の上限は 10 秒のままにし、長い上限はハング検出用として使う。
+- [ ] **OPC UA の listener の起動は時間がかかる場合がある（初回 10 秒超）。起動の完了は `GET /api/opcua-status` で待つ**。`opcua_admin_settings_round_trip_and_reconfigure_listener` は Windows CI で初回 listener 起動が 10 秒を超えた（PR #627、run 38871877894）。起動経路には一時 RSA 鍵生成も含まれるが、タイムアウトの直接原因と確定したわけではない。#634（2026-10-17）で `PUT /api/opcua-settings` は保存して起動を始めたらすぐ返る形にしたので、**PUT の上限は他と同じ 10 秒**にし、起動済み（`running`）を状態の API のポーリングで待つ。その待ちにだけ長めの有限上限（60 秒、ハング検出用）を与え、`failed` なら理由を出して落とす。PUT の 200 を「listener が待ち受けている」と読まない（interop の `smoke.py` も同じ）。
 
 ## 6. PR とマージの運用
 

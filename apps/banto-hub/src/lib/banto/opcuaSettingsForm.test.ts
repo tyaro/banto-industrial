@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isLanExposure, validateOpcUaSettings } from './opcuaSettingsForm';
+import { isLanExposure, opcUaStatusPill, validateOpcUaSettings } from './opcuaSettingsForm';
 import type { OpcUaSettings } from './opcuaSettingsAdmin';
 
 const defaults: OpcUaSettings = {
@@ -62,5 +62,28 @@ describe('OPC UA 設定フォーム', () => {
 		expect(isLanExposure('::1', 'localhost')).toBe(false);
 		expect(isLanExposure('0.0.0.0', 'hub.local')).toBe(true);
 		expect(isLanExposure('127.0.0.1', 'hub.local')).toBe(true);
+	});
+});
+
+describe('OPC UA の状態のピル（#634）', () => {
+	const base = { endpoint: null, error: null, generation: 1 };
+
+	it('起動中は中立、起動済みは ok、失敗・停止・未確認は bad', () => {
+		expect(opcUaStatusPill({ ...base, state: 'starting' })).toEqual({
+			label: '起動中…',
+			tone: null
+		});
+		expect(
+			opcUaStatusPill({ ...base, state: 'running', endpoint: 'opc.tcp://127.0.0.1:4840/' })
+		).toEqual({ label: '待受中', tone: 'ok' });
+		expect(opcUaStatusPill({ ...base, state: 'failed', error: 'bind' })).toEqual({
+			label: '起動失敗',
+			tone: 'bad'
+		});
+		expect(opcUaStatusPill({ ...base, state: 'stopped' })).toEqual({
+			label: '停止',
+			tone: 'bad'
+		});
+		expect(opcUaStatusPill(null)).toEqual({ label: '状態: 未確認', tone: 'bad' });
 	});
 });

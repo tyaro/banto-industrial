@@ -117,6 +117,20 @@ def stop_hub(process: subprocess.Popen, *, cleanup=False):
         raise RuntimeError(f"Hub did not exit successfully after SIGINT: {code}")
 
 
+def wait_opcua_running(rest: Rest, timeout: float = 60):
+    """PUT /api/opcua-settings は起動の完了を待たずに返る（#634）。状態の API で起動済みを待つ。"""
+    deadline = time.monotonic() + timeout
+    status = None
+    while time.monotonic() < deadline:
+        status = rest.expect("GET", "/api/opcua-status")
+        if status["state"] == "running":
+            return status
+        if status["state"] == "failed":
+            raise RuntimeError(f"OPC UA listener failed to start: {status}")
+        time.sleep(0.2)
+    raise TimeoutError(f"OPC UA listener did not start: {status}")
+
+
 async def wait_endpoint(url: str, timeout=60):
     deadline = time.monotonic() + timeout
     last_error = "no connection attempt"
@@ -192,8 +206,9 @@ async def run(binary: Path):
                     "enabled": True, "bind": "127.0.0.1", "port": opcua_port,
                     "endpointPath": "/", "namespaceUri": "urn:banto:opcua:tags",
                     "advertisedHost": None,
-                }, timeout=60)
+                })
                 endpoint = f"opc.tcp://127.0.0.1:{opcua_port}/"
+                assert wait_opcua_running(rest)["endpoint"] == endpoint
                 await wait_endpoint(endpoint)
 
                 async with Client(endpoint) as client:
