@@ -249,7 +249,12 @@ describe('localDesktopAvailable・needsFirstAdmin', () => {
 });
 
 describe('loginEntries（ログイン画面の出し分け）', () => {
-	const none = { continueAsThisPc: false, continueAsViewer: false, localGrantOptIn: false };
+	const none = {
+		continueAsThisPc: false,
+		continueAsViewer: false,
+		localGrantOptIn: false,
+		demoAccountHint: false
+	};
 	const cases: [string, 'tauri' | 'server' | 'demo', GrantStatus | undefined, typeof none][] = [
 		[
 			'server・初期化済み・localDesktop → この PC として続ける',
@@ -279,7 +284,7 @@ describe('loginEntries（ログイン画面の出し分け）', () => {
 			'server・両方',
 			'server',
 			{ initialized: true, grants: { localDesktop: true, publicViewer: true } },
-			{ continueAsThisPc: true, continueAsViewer: true, localGrantOptIn: false }
+			{ ...none, continueAsThisPc: true, continueAsViewer: true }
 		],
 		['server・status が読めない', 'server', undefined, none],
 		[
@@ -288,7 +293,26 @@ describe('loginEntries（ログイン画面の出し分け）', () => {
 			{ initialized: false, grants: { localDesktop: true, publicViewer: true } },
 			none
 		],
-		['demo は何も出さない', 'demo', { initialized: true, grants: { localDesktop: true } }, none]
+		[
+			'demo は資格情報なしの口を出さず、デモのアカウントの案内だけ（#612）',
+			'demo',
+			{ initialized: true, grants: { localDesktop: true } },
+			{ ...none, demoAccountHint: true }
+		],
+		[
+			'demo・status が無い → デモのアカウントの案内',
+			'demo',
+			undefined,
+			{ ...none, demoAccountHint: true }
+		],
+		['demo・未初期化 → 案内を出さない', 'demo', { initialized: false }, none],
+		[
+			'server（サービスの画面）・初期化済み・localDesktop なし → デモの案内を出さない（#612）',
+			'server',
+			{ initialized: true, grants: { localDesktop: false } },
+			none
+		],
+		['tauri・初期化済み → デモの案内を出さない（#612）', 'tauri', { initialized: true }, none]
 	];
 	for (const [label, mode, status, expected] of cases) {
 		it(label, () => {
