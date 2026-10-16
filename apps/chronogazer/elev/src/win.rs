@@ -231,6 +231,10 @@ mod tests {
     /// （GitHub の Windows のランナーは管理者なので CI では走る）。
     fn elevated_admin(test: &str) -> bool {
         let admin = banto_service_elev::is_current_process_admin().unwrap_or(false);
+        // CI で管理者でなければ反証が黙って飛ばされるので落とす（#626 PR-B の監査 B-3）。
+        if !admin && std::env::var_os("CI").is_some() {
+            panic!("{test}: CI なのに昇格した管理者ではない");
+        }
         if !admin {
             eprintln!("skip {test}: 昇格した管理者ではないので、所有者を Administrators に移せない（CI で確かめる）");
         }
