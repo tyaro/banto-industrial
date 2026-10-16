@@ -498,6 +498,8 @@ struct Fake {
     install: Result<InstallReport, InstallUserUnavailable>,
     uninstall: Result<UninstallOutcome, UninstallError>,
     recorded: Result<Option<String>, String>,
+    /// `install` に渡した SID（記録が無ければ、登録が書いたものとして後で読ませる）。
+    installed_sid: RefCell<Option<String>>,
     group: Result<GroupOutcome, ElevError>,
     member: Result<MemberOutcome, ElevError>,
     service_acl: Result<(), ElevError>,
@@ -566,6 +568,7 @@ impl Fake {
                 stop: StopAttempt::NotRunning,
             }),
             recorded: Ok(Some(USER.to_string())),
+            installed_sid: RefCell::new(None),
             group: Ok(GroupOutcome::Created),
             member: Ok(MemberOutcome::Added),
             service_acl: Ok(()),
@@ -640,6 +643,7 @@ impl ElevOps for Fake {
             sid.as_str(),
             layout.root().display()
         ));
+        *self.installed_sid.borrow_mut() = Some(sid.as_str().to_string());
         self.install.clone()
     }
     fn uninstall(&self) -> Result<UninstallOutcome, UninstallError> {
@@ -648,7 +652,10 @@ impl ElevOps for Fake {
     }
     fn read_install_user(&self) -> Result<Option<String>, String> {
         self.record("read_install_user".into());
-        self.recorded.clone()
+        match &self.recorded {
+            Ok(None) => Ok(self.installed_sid.borrow().clone()),
+            other => other.clone(),
+        }
     }
     fn ensure_group(&self) -> Result<GroupOutcome, ElevError> {
         self.record("ensure_group".into());
@@ -748,7 +755,11 @@ fn service_install_runs_every_step_in_order() {
             "server_executable".to_string(),
             "machine_root".to_string(),
             format!("check {USER}"),
-            // 登録の前にルートを確かめる（監査 B4。まだ無い）。
+            // 登録の前にルートを用意して確かめる（監査 B4。無いので elev が先に作る。
+            // ACL の利用者は登録の後に残る記録の SID）。
+            "read_install_user".to_string(),
+            format!("pin {}", root.display()),
+            format!("create {} {USER}", root.display()),
             format!("pin {}", root.display()),
             format!("install {} {USER} {}", exe_path().display(), root.display()),
             // setup-operators（記録を読み直す）
@@ -762,10 +773,8 @@ fn service_install_runs_every_step_in_order() {
             "read_install_user".to_string(),
             format!("check {USER}"),
             "machine_root".to_string(),
+            // ルートは登録の前に作ってあるので、開いて書き直すだけ。
             format!("pin {}", root.display()),
-            format!("create {} {USER}", root.display()),
-            format!("pin {}", root.display()),
-            // 作った直後でも開いて確かめ、書き直す。
             format!("reset {} {USER}", root.display()),
             format!("pin {}", secrets().display()),
             format!("create {} {USER}", secrets().display()),
@@ -792,7 +801,9 @@ fn service_install_runs_every_step_in_order() {
 
 #[test]
 fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
-    let fake = Fake::new();
+    // まだ記録が無い（初めての登録）。
+    let mut fake = Fake::new();
+    fake.recorded = Ok(None);
     let (code, _) = exec(
         Action::ServiceInstall {
             install_user_sid: Some(sid(OTHER)),
@@ -802,7 +813,26 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert_eq!(code, EXIT_OK);
     let calls = fake.calls();
     assert_eq!(calls[2], format!("check {OTHER}"));
-    assert!(calls[4].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
+    assert!(calls[7].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
+    // 登録の前に作るルートも、渡した SID の DACL で作る（記録が無い = 渡した SID が残る）。
+    assert_eq!(
+        calls[5],
+        format!("create {} {OTHER}", root_path().display())
+    );
+
+    // D2: 違う SID（USER）が既に記録されていれば、登録の後も記録は USER のままなので、
+    // 先に作るルートの ACL の利用者も USER。
+    let fake = Fake::new();
+    let (code, _) = exec(
+        Action::ServiceInstall {
+            install_user_sid: Some(sid(OTHER)),
+        },
+        &fake,
+    );
+    assert_eq!(code, EXIT_OK);
+    assert!(fake
+        .calls()
+        .contains(&format!("create {} {USER}", root_path().display())));
 
     // 反証: 利用者のアカウントでない SID（グループなど）なら何も登録しない（64）。
     let mut fake = Fake::new();
@@ -854,9 +884,34 @@ fn service_install_stops_at_the_first_failure() {
             |l| matches!(l, ConsoleLine::Stderr(t) if t.contains("（何も登録していません）"))
         ));
     }
-    // 信頼できる所有者の既存のルートなら続ける。
+    // 無いルートは elev が先に作るが、作った直後にすり替えられていたら（見知らぬ所有者・
+    // 作ったのに開けない）、install を呼ばずに 1。
+    for created_owner in [Some(STRANGER.to_string()), None] {
+        let mut fake = Fake::new();
+        fake.created_owner = created_owner.clone();
+        let (code, lines) = exec(install.clone(), &fake);
+        assert_eq!(code, EXIT_FAILED, "{created_owner:?} {lines:#?}");
+        assert!(fake
+            .calls()
+            .contains(&format!("create {} {USER}", root_path().display())));
+        assert!(!fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("install") || c == "ensure_group" || c == "grant_service_acl"));
+        assert!(resets(&fake).is_empty());
+    }
+    // 作れなければ 1、何も登録しない。
+    let mut fake = Fake::new();
+    fake.create_error = Some(root_path());
+    assert_eq!(exec(install.clone(), &fake).0, EXIT_FAILED);
+    assert!(!fake.calls().iter().any(|c| c.starts_with("install")));
+
+    // 信頼できる所有者の既存のルートなら続ける（作らない）。
     let fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
     assert_eq!(exec(install.clone(), &fake).0, EXIT_OK);
+    assert!(!fake.calls().iter().any(|c| c.starts_with("create ")
+        && c.contains(&format!("{} ", root_path().display()))
+        && !c.contains("secrets")));
 
     // 実行した利用者を決められない → 2。
     let mut fake = Fake::new();
@@ -913,12 +968,16 @@ fn service_install_stops_at_the_first_failure() {
         os_error: 5,
     });
     assert_eq!(exec(install.clone(), &fake).0, EXIT_FAILED);
-    // 登録の前の確かめ（監査 B4）の 1 回だけ開き、データの ACL には進まない。
+    // 登録の前の用意（監査 B4。作って開き直す）だけで、データの ACL には進まない。
     assert_eq!(
         fake.calls().iter().filter(|c| c.starts_with("pin")).count(),
-        1
+        2
     );
-    assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| c.starts_with("create") && c.contains("secrets")));
+    assert!(resets(&fake).is_empty());
 
     // データの ACL を断った → 1（最後の行は「完了しませんでした」）。
     let fake = Fake::new().with_dir(root_path(), true, true, "S-1-5-32-544");

@@ -83,8 +83,8 @@ use banto_service_control::{ConsoleLine, ServiceManagerError, UninstallError, Un
 use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome, OperatorsGroup};
 use chronogazer_core::paths::{DataLayout, PRODUCT_DIR_NAME, ROOT_ENV};
 use chronogazer_core::server_service::{
-    install_result_lines, uninstall_lines, InstallReport, InstallUserUnavailable,
-    INSTALL_USER_SID_LOCATION,
+    install_result_lines, plan_sid_record, uninstall_lines, InstallReport, InstallUserUnavailable,
+    SidRecordPlan, INSTALL_USER_SID_LOCATION,
 };
 use chronogazer_core::shell_launch::SERVICE_NAME;
 
@@ -689,14 +689,24 @@ fn service_install<O: ElevOps>(
         }
     };
 
-    // 0. 既にあるルートを、登録の**前に**確かめる（監査 B4）: reparse point・フォルダで
-    //    ない・見知らぬ所有者なら、何も登録せずに止める（先に作られたルートにサービスを
-    //    向けない）。開いたルートは最後の手順まで持つ。
+    // 0. ルートを登録の**前に**用意して確かめる（監査 B4）: 無ければ elev が保護された
+    //    DACL で作り、辿らずに開いて、reparse point・フォルダでない・見知らぬ所有者なら
+    //    何も登録せずに止める（ほかの利用者が先に作ったルートにサービスを向けない）。
+    //    開いたルートは最後の手順まで持つ。
     let elevated_user = ops.current_user_sid().ok();
+    // ルートの ACL の利用者は、登録の後に記録に残る SID（D2: 違う SID が既に記録されて
+    // いれば、`install_with` は記録を変えない）。今の記録を読めなければ渡す SID。
+    let root_user = match ops.read_install_user() {
+        Ok(existing) => match plan_sid_record(existing.as_deref(), &sid) {
+            SidRecordPlan::KeepDifferent { recorded } => recorded,
+            _ => sid.clone(),
+        },
+        Err(_) => sid.clone(),
+    };
     let _held_root = match preflight_root(
         ops,
         &root,
-        &sid,
+        &root_user,
         elevated_user.as_ref().map(InstallUserSid::as_str),
         out,
     ) {
@@ -721,25 +731,52 @@ fn service_install<O: ElevOps>(
     EXIT_OK
 }
 
-/// `service-install` の前の、ルートの確かめ（監査 B4）。無ければ何もしない（`Ok(None)`。
-/// 登録の手順が作る）。あれば辿らずに開き、[`data_acl_plan`] で断る理由があれば 1。
+/// `service-install` の前の、ルートの用意と確かめ（監査 B4）。**無ければ elev 自身が先に
+/// 作る**（`create_dir_if_absent`、インストール利用者の `DirAccess` の保護された DACL）。
+/// 確かめてから登録の手順が作るまでの間に、ほかの利用者が先に作る隙間を残さないため。
+/// そのうえで辿らずに開き、[`data_acl_plan`] で断る理由（作った直後にすり替えられた
+/// 場合を含む）があれば、何も登録せずに 1。開いたルートは呼ぶ側が最後の手順まで持つ。
 fn preflight_root<O: ElevOps>(
     ops: &O,
     root: &Path,
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
     out: Out<'_>,
-) -> Result<Option<O::Pinned>, i32> {
-    let pinned = ops.pin_dir(root).map_err(|error| {
-        out(err(&format!(
-            "{}（{}）を開けませんでした: {error}（何も登録していません）",
-            DataDir::Root.label(),
-            root.display()
-        )));
-        EXIT_FAILED
-    })?;
-    let Some(pinned) = pinned else {
-        return Ok(None);
+) -> Result<O::Pinned, i32> {
+    let pin = |out: Out<'_>| {
+        ops.pin_dir(root).map_err(|error| {
+            out(err(&format!(
+                "{}（{}）を開けませんでした: {error}（何も登録していません）",
+                DataDir::Root.label(),
+                root.display()
+            )));
+            EXIT_FAILED
+        })
+    };
+    let pinned = match pin(out)? {
+        Some(pinned) => pinned,
+        None => {
+            let access = DirAccess::with_install_user(install_user.clone());
+            if let Err(error) = ops.create_dir(root, &access) {
+                out(err(&format!(
+                    "{}（{}）を作れませんでした: {error}（何も登録していません）",
+                    DataDir::Root.label(),
+                    root.display()
+                )));
+                return Err(EXIT_FAILED);
+            }
+            match pin(out)? {
+                Some(pinned) => pinned,
+                None => {
+                    out(err(&format!(
+                        "{}（{}）を作った後に開けませんでした（何も登録していません）",
+                        DataDir::Root.label(),
+                        root.display()
+                    )));
+                    return Err(EXIT_FAILED);
+                }
+            }
+        }
     };
     if let Err(refusal) = data_acl_plan(
         &DirState::Present(pinned.info()),
@@ -752,7 +789,7 @@ fn preflight_root<O: ElevOps>(
         )));
         return Err(EXIT_FAILED);
     }
-    Ok(Some(pinned))
+    Ok(pinned)
 }
 
 fn service_uninstall<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
