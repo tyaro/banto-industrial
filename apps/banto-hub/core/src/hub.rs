@@ -332,13 +332,17 @@ fn effective_current_view(
         .value
         .is_some_and(|value| valid_current_value(entry, value))
     {
+        // A finite invalid bit can be stored as Good by the untyped cache
+        // and later derive Stale. Neither event makes that value usable or
+        // starts a new effective Bad interval.
+        let invalid_bit = reading.sample.value.is_some_and(f64::is_finite);
         return CurrentView {
             value: None,
             quality: Quality::Bad,
             timestamp_ms,
             // The raw store may have recorded an invalid bit as Good. It
             // cannot provide a usable source time for that update.
-            source_time_ms: if reading.sample.quality == Quality::Good
+            source_time_ms: if reading.sample.quality != Quality::Bad
                 && reading.sample.value.is_some()
             {
                 reading.last_good_ms.filter(|time| *time != timestamp_ms)
@@ -348,6 +352,8 @@ fn effective_current_view(
             quality_since_ms: Some(reading.quality_since_ms.map_or(timestamp_ms, |since| {
                 if reading.sample.quality == Quality::Bad {
                     since
+                } else if invalid_bit {
+                    timestamp_ms
                 } else {
                     since.max(timestamp_ms)
                 }
@@ -2535,6 +2541,76 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_plc_bit_metadata_is_stable_across_derived_stale() {
+        let clock = Arc::new(banto_tstore::ManualClock::new(1_000, 0));
+        let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
+        seed_running_simulation(&pool).await;
+        manager.rebuild().await.unwrap();
+        let collect = manager.current_values().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if collect.get("tag:1").is_some_and(|sample| {
+                    sample
+                        .value
+                        .is_some_and(|value| value != 0.0 && value != 1.0)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.shutdown().await;
+        let map = manager.tag_map();
+        let mut entry = map.iter().next().unwrap().clone();
+        entry.data_type = "bit".to_string();
+        let store = manager.server_store();
+        let raw = collect.get_reading(&entry.tag_key).unwrap();
+        assert_eq!(raw.sample.quality, Quality::Good);
+        assert_eq!(raw.last_good_ms, Some(raw.sample.ptime_ms));
+        let fresh = read_current_view(&entry, Some(&collect), &store, clock.now_ms());
+        assert_eq!((fresh.value, fresh.quality), (None, Quality::Bad));
+        assert_eq!(fresh.source_time_ms, None);
+        assert_eq!(fresh.quality_since_ms, Some(raw.sample.ptime_ms));
+        clock.set_now_ms(10_000);
+        let stale = collect.get_reading(&entry.tag_key).unwrap();
+        assert_eq!(stale.sample.quality, Quality::Stale);
+        assert_ne!(stale.quality_since_ms, raw.quality_since_ms);
+        assert_eq!(
+            read_current_view(&entry, Some(&collect), &store, clock.now_ms()),
+            fresh
+        );
+        clock.set_now_ms(20_000);
+        assert_eq!(
+            read_current_view(&entry, Some(&collect), &store, clock.now_ms()),
+            fresh
+        );
+        // An older usable receive remains meaningful; an explicit Bad
+        // sample also retains its existing quality interval.
+        for quality in [Quality::Good, Quality::Stale, Quality::Bad] {
+            let view = effective_current_view(
+                &entry,
+                Some(CurrentReading {
+                    sample: CurrentSample {
+                        value: Some(2.0),
+                        quality,
+                        ptime_ms: 1_000,
+                    },
+                    last_good_ms: Some(500),
+                    quality_since_ms: Some(700),
+                }),
+                20_000,
+            );
+            assert_eq!(view.source_time_ms, Some(500));
+            assert_eq!(
+                view.quality_since_ms,
+                Some(if quality == Quality::Bad { 700 } else { 1_000 })
+            );
+        }
     }
 
     /// Re-enabling an unchanged server value begins a new effective Good
