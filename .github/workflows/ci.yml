@@ -319,6 +319,25 @@ jobs:
       - name: test (banto-hub-sink)
         run: cargo test -p banto-hub-sink
 
+  # #392 B3-3b の監査 Nit 1: メインの Rust ジョブは windows-latest なので、Windows 以外
+  # だけで出る `dead_code` など（例: `banto-hub-core` の `resolve_service_acl_target`、
+  # `chronogazer-elev` の Windows 専用の再公開の cfg 漏れ）を CI で捕まえられない。昇格
+  # まわりの 2 crate の lib を ubuntu で clippy する軽いジョブ（`run_rust` のときだけ）。
+  linux-clippy:
+    name: Rust (linux clippy / 昇格まわり)
+    needs: changes
+    if: needs.changes.outputs.run_rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (chronogazer-elev / banto-hub-core の lib)
+        run: cargo clippy -p chronogazer-elev -p banto-hub-core --lib -- -D warnings
+
   # #468: 旧 `e2e` ジョブ（chronogazer と banto-hub を 1 ジョブで）を 2 つに
   # 分けた。hub だけの変更で chronogazer の build / Playwright を走らせない。
   # ジョブ ID が変わったので Swatinem/rust-cache のキーも e2e-chronogazer /
@@ -478,6 +497,7 @@ jobs:
       - frontend-chronogazer
       - rust
       - rust-db-source
+      - linux-clippy
       - e2e-chronogazer
       - e2e-hub
     runs-on: ubuntu-latest
@@ -522,6 +542,7 @@ jobs:
           check frontend-chronogazer run_frontend_chronogazer
           check rust run_rust
           check rust-db-source run_rust_db_source
+          check linux-clippy run_rust
           check e2e-chronogazer run_e2e_chronogazer
           check e2e-hub run_e2e_hub
 

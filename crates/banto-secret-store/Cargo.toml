@@ -32,7 +32,10 @@ hex = { workspace = true }
 #   DACL の読み戻し（GetNamedSecurityInfoW・GetAce）、SID の文字列化、
 #   DACL の書き直し（SetNamedSecurityInfoW）
 # - Win32_Storage_FileSystem: CreateDirectoryW（作成と同時に DACL を付ける）、
-#   MoveFileExW（原子的な置換）
+#   MoveFileExW（原子的な置換）、CreateFileW・GetFinalPathNameByHandleW（#392 B3-3b の
+#   監査 Must 1: pin したハンドルの本当のパス）
+# - Win32_Security_Authorization: SetSecurityInfo（#392 B3-3b の監査 Must 2: ハンドルで
+#   DACL と所有者を書く）
 # - Win32_System_Threading: OpenProcessToken（現在の利用者の SID）
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -45,3 +48,15 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# テストが昇格した管理者として走っているかの判定だけ（所有者を Administrators に
+# 移す確かめは管理者でしかできない。#392 B3-3b の監査 B5）。本番の依存には足さない。
+banto-service-elev = { path = "../banto-service-elev" }
+
+[target.'cfg(windows)'.dev-dependencies]
+# テストで、pin を持ったままフォルダをその場でジャンクションにする反証（#392 B3-3b の
+# 監査 Must 2）に DeviceIoControl / FSCTL_SET_REPARSE_POINT を使う。本番には足さない
+# （feature だけで新しい crate は増えない）。
+windows-sys = { version = "0.61", features = [
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }

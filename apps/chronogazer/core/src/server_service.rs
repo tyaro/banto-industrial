@@ -30,7 +30,15 @@
 //! - `install` / `uninstall` の文言（[`install_lines`]・[`uninstall_lines`]。出し先の
 //!   別と順序も含めて golden テスト）と終了コード（[`install_exit_code`]。失敗は 1）。
 //!   SCM への接続の失敗には「管理者として実行した PowerShell から」の案内を足す
-//!   （UAC の昇格は B3-3 の `chronogazer-elev`）。
+//!   （UAC で昇格する口は同じフォルダの `chronogazer-elev.exe`、B3-3b）。
+//! - `install` の本体（`install_with`、Windows だけ。#392 B3-3b で bin から移した）:
+//!   `chronogazer-server.exe install` と `chronogazer-elev.exe service-install` が
+//!   同じ手順を使う。違うのは、実行ファイル・データのルート・Program Files の場所を
+//!   どこから決めるかだけ（`chronogazer-server` はプロセスの環境、elev はマシンの
+//!   環境。`apps/chronogazer/elev` の lib doc）。結果の行と終了コードは
+//!   [`install_result_lines`]。記録と用意の手順（[`record_install_user`]・
+//!   [`prepare_root`]）は OS に依らない形で置き、テストは偽の読み書き・一時
+//!   ディレクトリで行う。
 //! - サービスのログの行（起動・停止の理由・完了）。どれも「Windows サービス」
 //!   「SCM の STOP」「PRESHUTDOWN」を名指しする（日次ログをコンソールの分と見分ける
 //!   ため。banto-hub の `hub_stop_reason_line` と同じ作法）。
@@ -44,6 +52,7 @@ use banto_service_control::{
     StopAttempt, StopNotice, StopSignal, UninstallError, UninstallOutcome,
 };
 
+use crate::paths::{create_root_dir_with, DataLayout};
 use crate::server_host::{
     EXIT_ALREADY_RUNNING, EXIT_OK, EXIT_SHUTDOWN_INCOMPLETE, INTERRUPT_BUDGET, SERVER_LABEL,
 };
@@ -64,8 +73,9 @@ pub const SERVICE_EXPECTED_STOP: Duration = Duration::from_secs(20);
 /// OS の PRESHUTDOWN の予算から、Stopped の報告とログの書き出しのために残す分。
 pub const PRESHUTDOWN_REPORT_RESERVE: Duration = Duration::from_secs(1);
 
-/// SCM に接続できないときの案内（管理者権限が要る）。
-pub const ELEVATION_HINT: &str = "管理者として実行した PowerShell から実行してください（UAC の昇格は B3-3 の chronogazer-elev で入る予定です）";
+/// SCM に接続できないときの案内（管理者権限が要る。UAC で昇格する口は同じフォルダの
+/// `chronogazer-elev.exe`、#392 B3-3b）。
+pub const ELEVATION_HINT: &str = "管理者として実行した PowerShell から実行するか、同じフォルダの chronogazer-elev.exe（UAC で昇格します）を使ってください";
 
 // --- サービスの本体 -------------------------------------------------------------
 
@@ -468,6 +478,127 @@ pub fn install_exit_code(report: &InstallReport) -> i32 {
     let failed =
         report.outcome.is_err() || report.sid.as_ref().is_some_and(SidRecordResult::is_failure);
     i32::from(failed)
+}
+
+/// `install_with` で、インストール利用者の SID を決められなかった（登録の前に止めた。
+/// 中身は理由の文言）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallUserUnavailable(pub String);
+
+/// `install_with` の結果を、利用者に出す行と終了コードにする（`chronogazer-server
+/// install` と elev が共有。#392 B3-3b で bin から移した - 出す行と終了コードは移す
+/// 前と同じ）。
+pub fn install_result_lines(
+    result: &Result<InstallReport, InstallUserUnavailable>,
+) -> (Vec<ConsoleLine>, i32) {
+    match result {
+        Err(InstallUserUnavailable(error)) => (install_user_unavailable_lines(error), 1),
+        Ok(report) => (install_lines(report), install_exit_code(report)),
+    }
+}
+
+/// インストール利用者の記録（`read` で今の値を読み、[`plan_sid_record`] のとおりに
+/// `write` する）。HKLM を触る関数はテストで偽物に差し替える。
+pub fn record_install_user(
+    requested: &InstallUserSid,
+    read: impl FnOnce() -> Result<Option<String>, String>,
+    write: impl FnOnce(&str) -> Result<(), String>,
+) -> SidRecordResult {
+    let existing = match read() {
+        Ok(existing) => existing,
+        Err(err) => return SidRecordResult::ReadFailed(err),
+    };
+    let sid = requested.as_str().to_string();
+    let written = |replaced: Option<String>| match write(&sid) {
+        Ok(()) => SidRecordResult::Written {
+            sid: sid.clone(),
+            replaced,
+        },
+        Err(error) => SidRecordResult::WriteFailed {
+            sid: sid.clone(),
+            error,
+        },
+    };
+    match plan_sid_record(existing.as_deref(), requested) {
+        SidRecordPlan::Write => written(None),
+        SidRecordPlan::Replace { previous } => written(Some(previous)),
+        SidRecordPlan::KeepSame => SidRecordResult::AlreadySame { sid },
+        SidRecordPlan::KeepDifferent { recorded } => SidRecordResult::KeptDifferent {
+            recorded: recorded.as_str().to_string(),
+            requested: sid,
+        },
+    }
+}
+
+/// D3: ルートが無ければ `sid` を利用者の欄にして作る（あれば触らない。O6）。
+pub fn prepare_root(layout: &DataLayout, sid: &InstallUserSid) -> RootPreparation {
+    let root = layout.root().to_path_buf();
+    if let Err(reason) = crate::server_host::validate_root(&root) {
+        return RootPreparation::Unusable(reason);
+    }
+    match create_root_dir_with(layout, &DirAccess::with_install_user(sid.clone())) {
+        Ok(true) => RootPreparation::Created(root),
+        Ok(false) => RootPreparation::Existing(root),
+        Err(error) => RootPreparation::Failed { root, error },
+    }
+}
+
+/// `install` の本体（Windows だけ。#392 B3-2b の bin の `install` から B3-3b で移した）:
+/// サービスを登録し、インストール利用者の SID を記録し（D1・D2）、ルートが無ければ
+/// その SID で作る（D3）。
+///
+/// - `executable`: 登録する `chronogazer-server.exe`（`chronogazer-server install` は
+///   自分、elev は隣の `chronogazer-server.exe`）。
+/// - `install_user_sid`: `None` なら実行した利用者（昇格していてもトークンの利用者は
+///   その人）。LocalSystem などで決められなければ、何も登録せずに
+///   [`InstallUserUnavailable`]。
+/// - `layout`: データのルート（`chronogazer-server` はプロセスの環境、elev はマシンの
+///   環境から決める）。
+/// - `program_files`: 実行ファイルの置き場所の警告に使う Program Files（`None` なら
+///   警告しない）。
+#[cfg(windows)]
+pub fn install_with(
+    executable: PathBuf,
+    install_user_sid: Option<InstallUserSid>,
+    layout: &DataLayout,
+    program_files: Option<PathBuf>,
+) -> Result<InstallReport, InstallUserUnavailable> {
+    use banto_service_control::{install_service, read_service_parameter, write_service_parameter};
+
+    let requested = match install_user_sid {
+        Some(sid) => sid,
+        None => banto_secret_store::acl::current_user_sid()
+            .map_err(|err| InstallUserUnavailable(err.to_string()))?,
+    };
+    let outcome = install_service(&crate::shell_launch::chronogazer_service_spec(
+        executable.clone(),
+    ));
+    let mut report = InstallReport {
+        executable,
+        program_files,
+        outcome,
+        sid: None,
+        root: None,
+    };
+    if report.outcome.is_ok() {
+        let record = record_install_user(
+            &requested,
+            || {
+                read_service_parameter(SERVICE_NAME, INSTALL_USER_SID_VALUE)
+                    .map_err(|err| err.to_string())
+            },
+            |sid| {
+                write_service_parameter(SERVICE_NAME, INSTALL_USER_SID_VALUE, sid)
+                    .map_err(|err| err.to_string())
+            },
+        );
+        report.root = record
+            .effective_sid()
+            .and_then(|sid| InstallUserSid::parse(sid).ok())
+            .map(|sid| prepare_root(layout, &sid));
+        report.sid = Some(record);
+    }
+    Ok(report)
 }
 
 // --- 解除（uninstall） --------------------------------------------------------------
@@ -930,7 +1061,7 @@ mod tests {
             install_lines(&connect),
             vec![
                 err("chronogazer-server: Service Control Manager への接続に失敗しました: os error 5"),
-                err("chronogazer-server:   管理者として実行した PowerShell から実行してください（UAC の昇格は B3-3 の chronogazer-elev で入る予定です）"),
+                err("chronogazer-server:   管理者として実行した PowerShell から実行するか、同じフォルダの chronogazer-elev.exe（UAC で昇格します）を使ってください"),
             ]
         );
         assert_eq!(install_exit_code(&connect), 1);
@@ -948,7 +1079,7 @@ mod tests {
         );
         assert_eq!(install_exit_code(&create), 1);
 
-        let hint = err("chronogazer-server:   サービスの登録は済んでいます。記録が無い間、サービスは SYSTEM・Administrators だけの ACL で動きます（デスクトップと Hub の API キーを共有できません）。管理者として実行した PowerShell から実行してください（UAC の昇格は B3-3 の chronogazer-elev で入る予定です）（install をやり直します）");
+        let hint = err("chronogazer-server:   サービスの登録は済んでいます。記録が無い間、サービスは SYSTEM・Administrators だけの ACL で動きます（デスクトップと Hub の API キーを共有できません）。管理者として実行した PowerShell から実行するか、同じフォルダの chronogazer-elev.exe（UAC で昇格します）を使ってください（install をやり直します）");
         let write = report(
             created(None),
             Some(SidRecordResult::WriteFailed {
@@ -1000,6 +1131,128 @@ mod tests {
                 err("chronogazer-server:   データを使う利用者のアカウントでサインインし、管理者として実行した PowerShell から実行するか、--install-user-sid S-1-5-21-… で指定してください（何も登録していません）"),
             ]
         );
+    }
+
+    /// #392 B3-3b: bin から移した `install` の結果の行と終了コード（移す前の bin と同じ:
+    /// SID を決められなければ 2 行と 1、それ以外は `install_lines` と
+    /// `install_exit_code`）。
+    #[test]
+    fn install_result_lines_match_the_previous_bin() {
+        let unavailable = Err(InstallUserUnavailable(
+            "利用者のアカウントの SID ではありません".to_string(),
+        ));
+        assert_eq!(
+            install_result_lines(&unavailable),
+            (
+                install_user_unavailable_lines("利用者のアカウントの SID ではありません"),
+                1
+            )
+        );
+        let ok = report(
+            created(None),
+            Some(SidRecordResult::Written {
+                sid: USER.to_string(),
+                replaced: None,
+            }),
+            Some(RootPreparation::Created(root())),
+        );
+        assert_eq!(
+            install_result_lines(&Ok(ok.clone())),
+            (install_lines(&ok), 0)
+        );
+        let failed = report(
+            Err(InstallError::Create("os error 1073".to_string())),
+            None,
+            None,
+        );
+        assert_eq!(
+            install_result_lines(&Ok(failed.clone())),
+            (install_lines(&failed), 1)
+        );
+    }
+
+    /// 記録の読み書き: 無ければ書く・同じなら書かない・違えば書かずに残す（D2）・
+    /// 不正なら書き直す・読めなければ書かない・書けなければ失敗（B3-2b の bin の
+    /// テストを #392 B3-3b で移した）。
+    #[test]
+    fn the_install_user_record_follows_the_plan() {
+        let writes = std::sync::Mutex::new(Vec::<String>::new());
+        let write = |value: &str| {
+            writes.lock().unwrap().push(value.to_string());
+            Ok(())
+        };
+        assert_eq!(
+            record_install_user(&sid(USER), || Ok(None), write),
+            SidRecordResult::Written {
+                sid: USER.to_string(),
+                replaced: None
+            }
+        );
+        assert_eq!(
+            record_install_user(&sid(USER), || Ok(Some(USER.to_string())), write),
+            SidRecordResult::AlreadySame {
+                sid: USER.to_string()
+            }
+        );
+        assert_eq!(
+            record_install_user(&sid(USER), || Ok(Some(OTHER.to_string())), write),
+            SidRecordResult::KeptDifferent {
+                recorded: OTHER.to_string(),
+                requested: USER.to_string()
+            }
+        );
+        assert_eq!(
+            record_install_user(&sid(USER), || Ok(Some("x".to_string())), write),
+            SidRecordResult::Written {
+                sid: USER.to_string(),
+                replaced: Some("x".to_string())
+            }
+        );
+        assert_eq!(
+            record_install_user(&sid(USER), || Err("os error 5".to_string()), write),
+            SidRecordResult::ReadFailed("os error 5".to_string())
+        );
+        // 書いたのは「無い」と「不正」の 2 回だけ。
+        assert_eq!(*writes.lock().unwrap(), vec![USER, USER]);
+        assert_eq!(
+            record_install_user(&sid(USER), || Ok(None), |_| Err("拒否".to_string())),
+            SidRecordResult::WriteFailed {
+                sid: USER.to_string(),
+                error: "拒否".to_string()
+            }
+        );
+    }
+
+    /// D3: 無いルートは渡した SID で作り、あるルートには触らない。使えないルートは
+    /// 作らない（B3-2b の bin のテストを #392 B3-3b で移した。ACL は Windows だけ）。
+    #[cfg(windows)]
+    #[test]
+    fn prepare_root_creates_with_the_recorded_sid_only_when_absent() {
+        use banto_secret_store::acl::{current_user_sid, read_dir_dacl};
+        let dir = tempfile::tempdir().unwrap();
+        let me = current_user_sid().unwrap();
+        let layout = DataLayout::new(dir.path().join("root"));
+        assert_eq!(
+            prepare_root(&layout, &me),
+            RootPreparation::Created(layout.root().to_path_buf())
+        );
+        let dacl = read_dir_dacl(layout.root()).unwrap();
+        assert!(dacl.protected, "{dacl:?}");
+        assert!(dacl
+            .aces
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|ace| ace.sid == me.as_str()));
+        assert_eq!(
+            prepare_root(&layout, &me),
+            RootPreparation::Existing(layout.root().to_path_buf())
+        );
+        assert!(matches!(
+            prepare_root(&DataLayout::new("relative"), &me),
+            RootPreparation::Unusable(_)
+        ));
+        assert!(!std::path::Path::new("relative").exists());
     }
 
     #[test]
@@ -1066,7 +1319,7 @@ mod tests {
             uninstall_lines(&Err(UninstallError::Connect("os error 5".to_string())), &root()),
             vec![
                 err("chronogazer-server: Service Control Manager への接続に失敗しました: os error 5"),
-                err("chronogazer-server:   管理者として実行した PowerShell から実行してください（UAC の昇格は B3-3 の chronogazer-elev で入る予定です）"),
+                err("chronogazer-server:   管理者として実行した PowerShell から実行するか、同じフォルダの chronogazer-elev.exe（UAC で昇格します）を使ってください"),
             ]
         );
         assert_eq!(

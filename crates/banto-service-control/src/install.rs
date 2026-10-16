@@ -257,9 +257,47 @@ pub fn uninstall_service(name: &str) -> Result<UninstallOutcome, UninstallError>
     }
 }
 
+/// 登録されているサービスの実行のコマンドライン（SCM の `lpBinaryPathName`。
+/// エスケープ済みの生の文字列、例 `"C:\Program Files\X\x.exe" run-service`）を
+/// 読む（#392 B3-3b。昇格ヘルパーが「登録の exe を書き換えてよいか」を確かめる）。
+/// 未登録なら `Ok(None)`。
+#[cfg(windows)]
+pub fn query_service_command_line(
+    name: &str,
+) -> Result<Option<String>, crate::ServiceManagerError> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager as WinScm, ServiceManagerAccess};
+
+    /// `ERROR_SERVICE_DOES_NOT_EXIST`。
+    const NOT_EXIST: i32 = 1060;
+    let manager = WinScm::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|err| crate::ServiceManagerError::Other(err.to_string()))?;
+    let service = match manager.open_service(name, ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => service,
+        Err(windows_service::Error::Winapi(io)) if io.raw_os_error() == Some(NOT_EXIST) => {
+            return Ok(None)
+        }
+        Err(err) => return Err(crate::ServiceManagerError::Other(err.to_string())),
+    };
+    let config = service
+        .query_config()
+        .map_err(|err| crate::ServiceManagerError::Other(err.to_string()))?;
+    Ok(Some(config.executable_path.to_string_lossy().into_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 読むだけ: 無いサービスは `None`（SCM には接続するが何も変えない）。
+    #[cfg(windows)]
+    #[test]
+    fn query_command_line_of_a_missing_service_is_none() {
+        assert_eq!(
+            query_service_command_line("banto-service-control-test-missing-service").unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn preshutdown_lines_go_to_stdout_or_stderr_with_the_label() {

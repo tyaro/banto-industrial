@@ -8,8 +8,10 @@
 //!   出して終了コード 1。本体はまだ作っていないので、データのルートの下にも何も
 //!   作らない。
 //! - [`install`]・[`uninstall`]: 共有の手順（`install_service`・`uninstall_service`）
-//!   と、インストール利用者の SID の記録（D1・D2）・ルートの用意（D3）。文言と
-//!   終了コードは `chronogazer_core::server_service`。
+//!   と、インストール利用者の SID の記録（D1・D2）・ルートの用意（D3）。`install` の
+//!   本体（`server_service::install_with`）・文言・終了コードは
+//!   `chronogazer_core::server_service`（本体は #392 B3-3b で lib へ移し、
+//!   `chronogazer-elev.exe service-install` と共有する）。
 //!
 //! # 本体（[`ServerProgram::run`]）
 //!
@@ -51,26 +53,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_secret_store::InstallUserSid;
 use banto_service_control::{
-    dispatch_failure_lines, install_service, print_console_lines, read_service_parameter,
-    run_service, uninstall_service, write_service_parameter, ServiceContext, ServiceExit,
-    ServiceProgram,
+    dispatch_failure_lines, print_console_lines, read_service_parameter, run_service,
+    uninstall_service, ServiceContext, ServiceExit, ServiceProgram,
 };
 use chronogazer_core::instance_lock::ChronoGazerHost;
-use chronogazer_core::paths::{
-    create_root_dir_with, resolve_data_root_from_env, DataLayout, DirAccessSource,
-};
+use chronogazer_core::paths::{resolve_data_root_from_env, DataLayout, DirAccessSource};
 use chronogazer_core::server_host::{self, EXIT_START_FAILED, SERVER_LABEL};
 use chronogazer_core::server_service::{
-    access_from_parameter, install_exit_code, install_lines, install_user_unavailable_lines,
-    plan_sid_record, service_exit_for, service_flush_wait, service_running_line,
-    service_starting_line, service_stop_budget, service_stop_done_line, service_stop_hint_line,
-    service_stop_reason_line, service_stopped_line, stop_signal_label, uninstall_lines,
-    InstallReport, RootPreparation, SidRecordPlan, SidRecordResult, INSTALL_USER_SID_VALUE,
-    SERVICE_EXPECTED_STOP, SERVICE_LOG_FLUSH_WAIT,
+    access_from_parameter, install_result_lines, install_with, service_exit_for,
+    service_flush_wait, service_running_line, service_starting_line, service_stop_budget,
+    service_stop_done_line, service_stop_hint_line, service_stop_reason_line, service_stopped_line,
+    stop_signal_label, uninstall_lines, INSTALL_USER_SID_VALUE, SERVICE_EXPECTED_STOP,
+    SERVICE_LOG_FLUSH_WAIT,
 };
-use chronogazer_core::shell_launch::{chronogazer_service_spec, SERVICE_NAME};
+use chronogazer_core::shell_launch::SERVICE_NAME;
 
 use crate::start::{self, StartHooks, StartSpec, Started};
 use crate::{Flush, LineSink, OpenedLog};
@@ -361,7 +359,11 @@ impl Drop for BackgroundRuntime {
 // --- 登録・解除 ---------------------------------------------------------------
 
 /// `install`: サービスを登録し、インストール利用者の SID を記録し（D1・D2）、ルートが
-/// 無ければその SID で作る（D3）。終了コード（失敗は 1）を返す。
+/// 無ければその SID で作る（D3）。終了コード（失敗は 1）を返す。本体は
+/// `server_service::install_with`（#392 B3-3b で lib へ移した。`chronogazer-elev.exe
+/// service-install` と共有）。ここで決めるのは、登録する実行ファイル（自分）・
+/// データのルートと Program Files の場所（このプロセスの環境）だけで、出す行と
+/// 終了コードは移す前と同じ。
 pub(crate) fn install(install_user_sid: Option<InstallUserSid>) -> i32 {
     let executable = match std::env::current_exe() {
         Ok(path) => path,
@@ -370,92 +372,15 @@ pub(crate) fn install(install_user_sid: Option<InstallUserSid>) -> i32 {
             return 1;
         }
     };
-    // 既定は実行した利用者（昇格していてもトークンの利用者はその人）。LocalSystem
-    // などで実行したら決められないので、何も登録せずに止める。
-    let requested = match install_user_sid {
-        Some(sid) => sid,
-        None => match banto_secret_store::acl::current_user_sid() {
-            Ok(sid) => sid,
-            Err(err) => {
-                print_console_lines(&install_user_unavailable_lines(&err.to_string()));
-                return 1;
-            }
-        },
-    };
-    let outcome = install_service(&chronogazer_service_spec(executable.clone()));
-    let mut report = InstallReport {
+    let result = install_with(
         executable,
-        program_files: std::env::var_os("ProgramFiles").map(PathBuf::from),
-        outcome,
-        sid: None,
-        root: None,
-    };
-    if report.outcome.is_ok() {
-        let record = record_install_user(
-            &requested,
-            || {
-                read_service_parameter(SERVICE_NAME, INSTALL_USER_SID_VALUE)
-                    .map_err(|err| err.to_string())
-            },
-            |sid| {
-                write_service_parameter(SERVICE_NAME, INSTALL_USER_SID_VALUE, sid)
-                    .map_err(|err| err.to_string())
-            },
-        );
-        report.root = record
-            .effective_sid()
-            .and_then(|sid| InstallUserSid::parse(sid).ok())
-            .map(|sid| prepare_root(&DataLayout::from_env(), &sid));
-        report.sid = Some(record);
-    }
-    print_console_lines(&install_lines(&report));
-    install_exit_code(&report)
-}
-
-/// インストール利用者の記録（`read` で今の値を読み、[`plan_sid_record`] のとおりに
-/// `write` する）。HKLM を触る関数はテストで偽物に差し替える。
-fn record_install_user(
-    requested: &InstallUserSid,
-    read: impl FnOnce() -> Result<Option<String>, String>,
-    write: impl FnOnce(&str) -> Result<(), String>,
-) -> SidRecordResult {
-    let existing = match read() {
-        Ok(existing) => existing,
-        Err(err) => return SidRecordResult::ReadFailed(err),
-    };
-    let sid = requested.as_str().to_string();
-    let written = |replaced: Option<String>| match write(&sid) {
-        Ok(()) => SidRecordResult::Written {
-            sid: sid.clone(),
-            replaced,
-        },
-        Err(error) => SidRecordResult::WriteFailed {
-            sid: sid.clone(),
-            error,
-        },
-    };
-    match plan_sid_record(existing.as_deref(), requested) {
-        SidRecordPlan::Write => written(None),
-        SidRecordPlan::Replace { previous } => written(Some(previous)),
-        SidRecordPlan::KeepSame => SidRecordResult::AlreadySame { sid },
-        SidRecordPlan::KeepDifferent { recorded } => SidRecordResult::KeptDifferent {
-            recorded: recorded.as_str().to_string(),
-            requested: sid,
-        },
-    }
-}
-
-/// D3: ルートが無ければ `sid` を利用者の欄にして作る（あれば触らない。O6）。
-fn prepare_root(layout: &DataLayout, sid: &InstallUserSid) -> RootPreparation {
-    let root = layout.root().to_path_buf();
-    if let Err(reason) = server_host::validate_root(&root) {
-        return RootPreparation::Unusable(reason);
-    }
-    match create_root_dir_with(layout, &DirAccess::with_install_user(sid.clone())) {
-        Ok(true) => RootPreparation::Created(root),
-        Ok(false) => RootPreparation::Existing(root),
-        Err(error) => RootPreparation::Failed { root, error },
-    }
+        install_user_sid,
+        &DataLayout::from_env(),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+    );
+    let (lines, code) = install_result_lines(&result);
+    print_console_lines(&lines);
+    code
 }
 
 /// `uninstall`: 登録を解除する（`Parameters` もサービスのキーと一緒に消える）。データは
@@ -479,6 +404,7 @@ mod tests {
 
     use banto_collect::{simulation, Protocol};
     use banto_secret_store::acl::{current_user_sid, read_dir_dacl, reset_dir_acl};
+    use banto_secret_store::DirAccess;
     use banto_service_control::{
         run_program_with, ControlHandler, ControlReply, ErrorLog, ScmControlKind, ServicePhase,
         ServiceStatusPlan,
@@ -495,95 +421,8 @@ mod tests {
 
     const WAIT_LIMIT: Duration = Duration::from_secs(40);
 
-    // --- install の記録（偽の読み書き） -----------------------------------------
-
-    const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
-    const OTHER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1002";
-
-    fn sid(text: &str) -> InstallUserSid {
-        InstallUserSid::parse(text).unwrap()
-    }
-
-    /// 記録の読み書き: 無ければ書く・同じなら書かない・違えば書かずに残す（D2）・
-    /// 不正なら書き直す・読めなければ書かない・書けなければ失敗。
-    #[test]
-    fn the_install_user_record_follows_the_plan() {
-        let writes = Mutex::new(Vec::<String>::new());
-        let write = |value: &str| {
-            writes.lock().unwrap().push(value.to_string());
-            Ok(())
-        };
-        assert_eq!(
-            record_install_user(&sid(USER), || Ok(None), write),
-            SidRecordResult::Written {
-                sid: USER.to_string(),
-                replaced: None
-            }
-        );
-        assert_eq!(
-            record_install_user(&sid(USER), || Ok(Some(USER.to_string())), write),
-            SidRecordResult::AlreadySame {
-                sid: USER.to_string()
-            }
-        );
-        assert_eq!(
-            record_install_user(&sid(USER), || Ok(Some(OTHER.to_string())), write),
-            SidRecordResult::KeptDifferent {
-                recorded: OTHER.to_string(),
-                requested: USER.to_string()
-            }
-        );
-        assert_eq!(
-            record_install_user(&sid(USER), || Ok(Some("x".to_string())), write),
-            SidRecordResult::Written {
-                sid: USER.to_string(),
-                replaced: Some("x".to_string())
-            }
-        );
-        assert_eq!(
-            record_install_user(&sid(USER), || Err("os error 5".to_string()), write),
-            SidRecordResult::ReadFailed("os error 5".to_string())
-        );
-        // 書いたのは「無い」と「不正」の 2 回だけ。
-        assert_eq!(*writes.lock().unwrap(), vec![USER, USER]);
-        assert_eq!(
-            record_install_user(&sid(USER), || Ok(None), |_| Err("拒否".to_string())),
-            SidRecordResult::WriteFailed {
-                sid: USER.to_string(),
-                error: "拒否".to_string()
-            }
-        );
-    }
-
-    /// D3: 無いルートは渡した SID で作り、あるルートには触らない。使えないルートは
-    /// 作らない。
-    #[test]
-    fn prepare_root_creates_with_the_recorded_sid_only_when_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let me = current_user_sid().unwrap();
-        let layout = DataLayout::new(dir.path().join("root"));
-        assert_eq!(
-            prepare_root(&layout, &me),
-            RootPreparation::Created(layout.root().to_path_buf())
-        );
-        let dacl = read_dir_dacl(layout.root()).unwrap();
-        assert!(dacl.protected, "{dacl:?}");
-        assert!(dacl
-            .aces
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|ace| ace.sid == me.as_str()));
-        assert_eq!(
-            prepare_root(&layout, &me),
-            RootPreparation::Existing(layout.root().to_path_buf())
-        );
-        assert!(matches!(
-            prepare_root(&DataLayout::new("relative"), &me),
-            RootPreparation::Unusable(_)
-        ));
-        assert!(!std::path::Path::new("relative").exists());
-    }
+    // `install` の記録（`record_install_user`）とルートの用意（`prepare_root`）の
+    // テストは、本体と一緒に #392 B3-3b で `chronogazer_core::server_service` へ移した。
 
     // --- サービス本体（偽の登録） ------------------------------------------------
 

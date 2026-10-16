@@ -50,6 +50,16 @@
 fn main() {
     use banto_hub_core::service_elevated::ElevatedAction;
 
+    // #392 B3-3b（監査 C4）: 昇格したプロセスの作業フォルダは呼び出し元が選べるので、
+    // これから読み込む DLL の探し先を System32 に限る（失敗しても続ける。既定の
+    // SafeDllSearchMode でも System32 は作業フォルダより先）。
+    // SAFETY: プロセス全体の設定を変えるだけで、ポインタを渡さない。
+    unsafe {
+        windows_sys::Win32::System::LibraryLoader::SetDefaultDllDirectories(
+            windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let Some(action_arg) = args.first() else {

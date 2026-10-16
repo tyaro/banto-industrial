@@ -253,12 +253,17 @@ path = "src/bin/banto-hub-elev.rs"
 # `SetConsoleMode`/`ENABLE_ECHO_INPUT`（`reset-password`が新しいパスワードを
 # 標準入力から読む際、コンソールのエコーを一時的に止めるため。新しい
 # クレートは増えず、既存の`windows-sys`0.61系列に feature を足すだけ）。
+#
+# #392 B3-3b（監査 C4）: `Win32_System_LibraryLoader`を追加した -
+# `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`（`banto-hub-elev`の
+# `main`の先頭で、昇格したプロセスの DLL の探し先を System32 に限る）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
