@@ -160,6 +160,10 @@ export const JOB_PACKAGES = {
  * `-p` を並べずに workspace 全体（`rust_all`）に倒す。全体とほとんど変わらない
  * 範囲を `-p` で流すと、main の全体キャッシュと feature の組み合わせがずれて
  * 作り直しが増えるだけになるため。
+ *
+ * 0.8 は暫定値（実測の根拠は無い）。分母は workspace 全体のパッケージ数で、今の
+ * 最大でも約 50% しか届かないので、実質は保険にとどまる。`-p` を十数個並べるより
+ * `--workspace` のほうがキャッシュで速いケースが出たら、実測して見直す（#640）。
  */
 export const RDEPS_FULL_RATIO = 0.8;
 
@@ -168,6 +172,22 @@ export const RDEPS_FULL_RATIO = 0.8;
  *   workspace のパッケージ。`dir` はリポジトリ相対（`/` 区切り、末尾 `/` なし）、
  *   `deps` は workspace の中の path 依存のパッケージ名（normal・dev・build のすべて）。
  */
+
+/**
+ * 変更パスの正規化（前後の空白を落とし、`\` を `/` にする）。パスを規則に当てる
+ * 側（`classifyAreas`）と、`crates/` に触れたかを見る側（`touchesCrates`）が
+ * 同じ実装を使う。
+ * @param {string} raw
+ */
+export const normalizePath = (raw) => raw.trim().replace(/\\/g, '/');
+
+/**
+ * 変更パスに `crates/` の下のものがあるか（依存グラフを読むかの判断）。
+ * @param {string[]} files
+ */
+export function touchesCrates(files) {
+	return files.some((f) => normalizePath(f).startsWith('crates/'));
+}
 
 const toSlash = (/** @type {string} */ p) => p.replace(/\\/g, '/').replace(/\/+$/, '');
 
@@ -207,13 +227,18 @@ export function graphFromMetadata(meta) {
 
 /**
  * ファイルが属するパッケージ（ディレクトリの最長一致）。無ければ null。
+ * ルート（`dir === ''`）がパッケージのときは、それ以外のパッケージに属さない
+ * `crates/` の下のパスの持ち主にしない（`crates/README.md` を全体に倒す安全側が
+ * 効かなくなるため）。今のルートは仮想マニフェストなので該当しない。
  * @param {RustGraph} graph
  * @param {string} file リポジトリ相対（`/` 区切り）
  */
 export function owningPackage(graph, file) {
 	let best = null;
 	for (const p of graph.packages) {
-		if (p.dir === '' || file === p.dir || file.startsWith(p.dir + '/')) {
+		const inside =
+			p.dir === '' ? !file.startsWith('crates/') : file === p.dir || file.startsWith(p.dir + '/');
+		if (inside) {
 			if (!best || p.dir.length > best.dir.length) best = p;
 		}
 	}
@@ -259,7 +284,7 @@ export function classifyAreas(files) {
 	const areas = Object.fromEntries(AREAS.map((a) => [a, false]));
 	const matches = [];
 	for (const raw of files) {
-		const file = raw.trim().replace(/\\/g, '/');
+		const file = normalizePath(raw);
 		if (file === '') continue;
 		const rule = RULES.find((r) => r.re.test(file));
 		const hit = rule
@@ -395,7 +420,7 @@ function main() {
 	// 読めなければ null のまま = crates/ の変更は workspace 全体に倒れる。
 	/** @type {RustGraph | null} */
 	let graph = null;
-	if (event === 'pull_request' && files?.some((f) => /^crates[\\/]/.test(f.trim()))) {
+	if (event === 'pull_request' && files && touchesCrates(files)) {
 		try {
 			graph = loadRustGraph(fileURLToPath(new URL('../../', import.meta.url)));
 		} catch (e) {

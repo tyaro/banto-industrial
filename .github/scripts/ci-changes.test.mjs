@@ -14,10 +14,12 @@ import {
 	graphFromMetadata,
 	JOB_PACKAGES,
 	loadRustGraph,
+	normalizePath,
 	owningPackage,
 	RDEPS_FULL_RATIO,
 	reverseDeps,
-	RUST_PACKAGES
+	RUST_PACKAGES,
+	touchesCrates
 } from './ci-changes.mjs';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -590,6 +592,48 @@ test('ファイルの持ち主はディレクトリの最長一致（前方一�
 	assert.equal(owningPackage(g, 'apps/hub/src/x.rs'), 'outer');
 	assert.equal(owningPackage(g, 'crates/banto-tagsx/src/lib.rs'), null);
 	assert.equal(owningPackage(g, 'crates/README.md'), null);
+});
+
+test('ルートがパッケージでも、crates/ の下の非パッケージパスの持ち主にしない', () => {
+	const g = {
+		packages: [
+			{ name: 'rootpkg', dir: '', deps: [] },
+			{ name: 'tags', dir: 'crates/banto-tags', deps: [] }
+		]
+	};
+	// crates/ の下でどのパッケージにも属さないパスは null（= 全体に倒れる）。
+	assert.equal(owningPackage(g, 'crates/README.md'), null);
+	assert.equal(owningPackage(g, 'crates/banto-tagsx/src/lib.rs'), null);
+	assert.equal(owningPackage(g, 'crates/banto-tags/src/lib.rs'), 'tags');
+	// crates/ の外のルート直下はルートのパッケージのもの。
+	assert.equal(owningPackage(g, 'src/main.rs'), 'rootpkg');
+	// 判定全体でも rust_all に倒れる。
+	const r = classify({ event: 'pull_request', files: ['crates/README.md'], graph: g });
+	assert.equal(r.jobs.rust_args, '--workspace');
+	assert.equal(r.areas.rust_all, true);
+});
+
+test('今のルートは仮想マニフェスト（ルートのパッケージが無い）', () => {
+	assert.equal(
+		real().packages.some((p) => p.dir === ''),
+		false,
+		'ルートがパッケージになった。owningPackage のルートの扱い（#640）を見直す'
+	);
+});
+
+test('パスの正規化は classifyAreas と crates/ の検出で同じ（バックスラッシュ区切り・前後の空白）', () => {
+	assert.equal(
+		normalizePath('  crates\\banto-tags\\src\\lib.rs \r\n'),
+		'crates/banto-tags/src/lib.rs'
+	);
+	for (const f of ['crates/x/a.rs', 'crates\\x\\a.rs', '  crates/x/a.rs\r', ' crates\\x\\a.rs ']) {
+		assert.equal(touchesCrates([f]), true, JSON.stringify(f));
+		assert.equal(classifyAreas([f]).matches[0].areas[0], 'crates', JSON.stringify(f));
+	}
+	for (const f of ['apps/crates/a.rs', 'docs/crates/a.md', 'cratesx/a.rs', '']) {
+		assert.equal(touchesCrates([f]), false, JSON.stringify(f));
+	}
+	assert.equal(touchesCrates(['docs/a.md', ' crates\\x\\a.rs']), true);
 });
 
 test('固定のグラフ G は実グラフの一部（辺が実在する）', () => {
