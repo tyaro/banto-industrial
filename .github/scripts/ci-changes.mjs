@@ -50,8 +50,13 @@ export const RULES = [
 
 	// --- Rust workspace 全体
 	// crates/** は両アプリが依存する（当面は依存グラフを解かず全体 + 両 E2E）。
-	// proto/** は banto-hub-core の build.rs が読む。.cargo/** は cargo 設定。
-	{ re: /^(crates|proto|\.cargo)\//, areas: ['rust_all'], why: '共有 crate / proto / cargo 設定' },
+	// proto/** は banto-hub-core の build.rs が読む。.cargo/** は cargo 設定、
+	// .config/** は cargo-nextest の設定（テストの並列・グループ）。
+	{
+		re: /^(crates|proto|\.cargo|\.config)\//,
+		areas: ['rust_all'],
+		why: '共有 crate / proto / cargo・nextest 設定'
+	},
 	{
 		re: /^(Cargo\.toml|Cargo\.lock|rust-toolchain(\.toml)?|deny\.toml|\.?rustfmt\.toml|\.?clippy\.toml)$/,
 		areas: ['rust_all'],

@@ -1,0 +1,74 @@
+# cargo-nextest の設定（CI の rust ジョブが `cargo nextest run --profile ci` で使う。
+# ローカルでも `cargo nextest run`（既定プロファイル）が使える）。
+#
+# ## なぜ nextest か
+#
+# `cargo test` はテストのバイナリ（lib・統合テスト 1 本ずつ）を直列に実行し、
+# バイナリの中だけがスレッド並列になる。banto-hub-core の lib（約 200 秒）や十数本の
+# 統合テストが順番待ちになっていた。nextest は「テスト 1 件 = 1 プロセス」で、
+# バイナリをまたいで並列に走らせる。
+#
+# ## 守りが変わる点（グループ化の理由）
+#
+# 1. プロセス内の直列化（`static LOCK: Mutex` など）は、テストごとにプロセスが別に
+#    なるので効かなくなる。直列にしたい意図があるものは test-groups に入れる。
+# 2. 逆に、`set_var` など「プロセス内の共有状態」は、プロセスが別になるので
+#    かえって安全になる（グループ不要）。
+# 3. バイナリをまたいで同時に走るようになるので、プロセスをまたぐ共有物
+#    （名前付き mutex・固定ポート・固定パス・実サービス）にぶつかる可能性が出る。
+#
+# ## 洗い出した範囲（2026-10-16。grep: Global\ / set_var / set_current_dir /
+#    static Mutex / 固定ポートの bind / temp_dir().join("固定名") / HKLM・SCM / keyring）
+#
+# - 名前付き mutex `Global\BantoHub.<profile-id>`（banto-hub-core の profile_lock）:
+#   テストが取る profile-id は大半が一意（"locked"・"locked-profile"・"creates-dirs"・
+#   "line-a" など）か `skip_profile_lock: true`。ただし `http_hub_health` の
+#   `probe_*` は実 id `"default"` を使い、2 本が実際に取り、他の数本は「取られていない」
+#   ことを前提にする。cargo test でもスレッド並列で衝突しうるものを、nextest では
+#   グループで直列にして確実にする → `hub-default-mutex`。
+#   （手元で本物の BantoHub サービスが動いていると、実物の mutex に当たって
+#   このグループの 2 本が落ちる。nextest でも cargo test でも同じ）
+# - `banto-instance-lock`・ChronoGazer の instance_lock: mutex 名にプロセス ID や
+#   DB パスのスコープ ID を含み、テストごとに一意 → グループ不要。
+# - 環境変数 `BANTO_HUB_ROOT` の set_var（hub runtime / win_service のテスト）:
+#   プロセスが別になるので安全 → グループ不要。
+# - 固定ポート: bind は全て port 0（OS 任せ）。`8721`・`3100` などは文字列やデータ
+#   としてのみ現れ、bind しない → グループ不要。
+# - 固定パス: `temp_dir().join("banto-tstore-test-...-missing-xyz")` は「存在しない
+#   ディレクトリ」を読むだけ。他は pid・カウンタ・nanos 入りで一意 → グループ不要。
+# - HKLM・SCM: テストは触らない（読み取りのみ。書く系は HKCU の一時キー）→ グループ不要。
+# - keyring: chronogazer の src-tauri のテストは mock builder を使う → グループ不要。
+# - 重いランタイムを複数立てるテスト（`heavy-runtime`）: banto-collect の統合テストは
+#   `static TEST_SERIAL`（#227）で「multi_thread ランタイムは同時に 1 つ」に絞って
+#   いた。プロセスが別になるとこの守りが効かないので、グループで置き換える。
+#   hub の soak（収集 + WS + MQTT を同時に維持して件数の下限を見る）と tsquery の
+#   performance_smoke / concurrency も、CPU を奪い合うと下限・時間切れで落ちるので同じ扱い。
+#
+# 新しく「同時に走るとぶつかる」テストを足したら、ここのグループに入れる
+# （docs/implementation-checklist.md §2）。
+
+[test-groups]
+hub-default-mutex = { max-threads = 1 }
+heavy-runtime = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(banto-hub-core) & binary_id(banto-hub-core) & test(/^http_hub_health::tests::probe_/)'
+test-group = 'hub-default-mutex'
+
+[[profile.default.overrides]]
+filter = '(package(banto-collect) & kind(test)) | (package(banto-hub-core) & binary(soak)) | (package(banto-tsquery) & (binary(performance_smoke) | binary(concurrency)))'
+test-group = 'heavy-runtime'
+
+# CI 用: `cargo nextest run --profile ci`。
+[profile.ci]
+# 1 本落ちても残りを最後まで走らせる（落ちたものを 1 回の CI で全部見る）。
+fail-fast = false
+# 再実行しない（不安定なテストを緑にしてしまわない）。
+retries = 0
+# 失敗したテストの出力は、その場と最後のまとめの両方に出す。
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "fail"
+final-status-level = "fail"
+# 固まったテストを 10 分で打ち切る（ジョブ全体の timeout-minutes: 45 に巻き込まない）。
+slow-timeout = { period = "120s", terminate-after = 5 }
