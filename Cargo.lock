@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "chronogazer-elev"
-version = "0.2.0-alpha.29"
+version = "0.2.0-alpha.30"
 dependencies = [
  "banto-secret-store",
  "banto-service-control",
