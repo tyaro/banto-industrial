@@ -264,8 +264,9 @@ struct HubProcess {
 
 /// 試験ごとに一意な profile ID（`p6-<ハーネスの pid>-<起動時刻 ms>`）。
 ///
-/// banto-hub の `validate_profile_id` は空・パス区切り・`.`/`..` だけを
-/// 拒否し、**拒否したときは黙って `default` に戻す**
+/// banto-hub の `validate_profile_id` は空・パス区切り・`.`/`..`・`:`・予約名
+/// （`NUL` など）・末尾の `.`/空白だけを拒否し（後の 3 つは #626 で足した）、
+/// **拒否したときは黙って `default` に戻す**
 /// （`profile_paths::resolve_profile_paths_from_env`）。英数字と `-` だけで
 /// 組み立てる（万一戻った場合も、応答元の照合 [`confirm_own_hub`] が
 /// profile ID の不一致で止める）。

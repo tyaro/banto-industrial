@@ -44,12 +44,16 @@ T16-2（サービス検出・native fallback）第一スライスは本書 §4 �
 契約（P5）に従い、T17-0/T17-3 が提供する API を消費する形で実装した
 （トレイ開始/停止の`HostSwitchEngine`経路は第二スライスで実機確認済み。
 切替ウィザード UI は 2026-08-11 実装）。**2026-08-10:
-profile ACL 追加スライス（desktop-plan §11、`profile_acl.rs`・
-`grant-profile-acl`）を実装済み（§12）- T16-2 実機検証で見つかった
+profile ACL 追加スライス（desktop-plan §11、`grant-profile-acl`）を実装済み
+（§12。2026-10-16 に #626 で`profile_grant.rs`へ作り直し、§12 末尾）- T16-2 実機検証で見つかった
 「LocalSystem 作成 profile が readonly になる」既知ギャップを解消する。
 同日 Windows 実機で `grant-profile-acl`（UAC）による owner Modify 付与と
 書き込み復旧を確認済み（§12「Windows 実機検証」）。サービス先行作成→
 Desktop Hub 起動までのフル E2E は任意の追加確認として残す。**
+**2026-10-16（#626 PR-B、オーナー決定）: `grant-profile-acl`を昇格の境界として
+作り直した（確かめてから辿らずに開いたハンドルへ保護された DACL を書く・使用中は
+断る・利用者のアカウントだけ・マシンの環境のルート・足していく）。§12 末尾
+「#626 の作り直し」。実機確認（M1〜M10）は未実施。**
 最終検証日(コード照合): 2026-09-01
 最終検証日(Windows 実機): 2026-08-10（§8・§10・§11・§12、管理者 Cursor +
 オーナー対話。Operators 非管理者委任・profile ACL 付与まで完了）。
@@ -753,8 +757,11 @@ T16-2 実機検証（§3・本書 §10 参照）で発見した既知ギャッ�
 （Windows サービス）が先に作成した `%ProgramData%\BantoHub\profiles\
 <profile-id>\...` は Users が書き込めず、Desktop/shell（対話ユーザー）
 起動が `attempt to write a readonly database` で失敗する - を、
-新設した [`profile_acl.rs`](../apps/banto-hub/core/src/profile_acl.rs)
-と新規固定アクション `grant-profile-acl` で解消した。
+新設した `profile_acl.rs` と新規固定アクション `grant-profile-acl` で解消した。
+**2026-10-16 に #626 で作り直した**（`profile_acl.rs`は消して
+[`profile_grant.rs`](../apps/banto-hub/core/src/profile_grant.rs)に置き換えた。
+下の「実装」「非 Windows ビルド」「テスト・検証状況」は 2026-08-10 時点の記録で、
+今の形は末尾の「#626 の作り直し」）。
 
 ### 実装
 
@@ -828,3 +835,114 @@ T16-2 実機検証（§3・本書 §10 参照）で発見した既知ギャッ�
   （上記 ACL 付与そのものは確認済み。`#[ignore]`テスト
   `service_elevated::tests::grant_profile_acl_applies_to_default_profile`
   も管理者シェルから手動実行可能）。
+
+### #626 の作り直し（2026-10-16、オーナー決定。上の「実装」は置き換えた）
+
+**背景**: 上の実装は、昇格したプロセスが**呼び出し元の環境変数**（`BANTO_HUB_ROOT`・
+`ProgramData`）でルートを決め、**パスで**（`SetNamedSecurityInfoW`・自動の伝播・
+`read_dir`の再帰）書いていた。profile の owner（標準利用者、または同じ利用者の中で
+動くマルウェア）が、昇格した書き込みを任意の場所へ向けられた（#626）。調査で、
+profile-id に`C:`・`x:y`を渡すと Windows の`Path::join`がドライブ相対のパスに
+なる穴も見つけた（issue 本文には無い）。
+
+**オーナー決定（2026-10-16「おすすめで」。計画の論点 1〜11 すべておすすめどおり）**:
+
+1. DACL は**保護された形**（親から継承しない。SYSTEM・Administrators のフル、
+   owner ごとに「変更」`0x1301BF`、所有者は Administrators）。書き込みは
+   `banto_secret_store::acl`の`pin_dir`（辿らずに開き、持っている間は名前の変更・
+   削除をさせない）と`PinnedDir::reset_acl`（ハンドルへ`SetKernelObjectSecurity`、
+   自動の伝播を使わない自前の再帰。reparse point・ハードリンク・開けない子は
+   飛ばして報告）だけ。
+2. ルートは**マシンの環境だけ**（HKLM の`BANTO_HUB_ROOT`を展開せずに読み、無ければ
+   ProgramData の既知フォルダ + `BantoHub`。`%`を含む値・相対・ドライブのルート・
+   UNC・OS とプログラムの置き場・ProgramData そのものは断る）。ルートと`profiles\`は
+   開いて本当のパスと所有者を確かめるだけで書かない。
+3. 所有者でない利用者のシェルの health は、`profile.lock`の「読めない（拒否）」と
+   「無い」を分ける（PR-C #631、t16-design §3 第三スライスの追記）。
+4. **足していく**意味を保つ: 書き直す前の DACL をハンドルから読み（`read_dacl`）、
+   `guard::plan_carry_over`で明示の許可・`OICI`・「変更」以上・`SidTypeUser`の
+   利用者を引き継ぎ、指定の利用者を足す（`DirAccess::with_install_users`）。
+   フルコントロールは「変更」に狭め、落とした ACE は 1 行ずつ出す（拒否の ACE・
+   確かめられずに落とした ACE・null DACL・所有者の継承の ACE・フルの狭めは警告）。
+5. `user`引数は名前か SID。名前は SID の文字列にし、`InstallUserSid::parse` →
+   `LookupAccountSidW`の`SidTypeUser`の順に確かめる。既定は**トークンの利用者の
+   SID**。グループ・well-known・無い名前は断る。`InstallUserSid`の記録（ChronoGazer
+   の`Parameters\InstallUserSid`）は作らない（profile ごとに owner が違いうる）。
+6. profile が**使用中なら断る**（`Global\BantoHub.<id>`の mutex を`OpenMutexW`で
+   見るだけ）。書き直しの間は子を共有の削除なしで開くので、稼働中の Hub の -wal の
+   削除・原子的な置換を共有違反にしうる。
+7. profile-id は elev では**許可リスト**（英数字・`_`・`-`の 64 文字まで、先頭は
+   英数字、予約名を除く）。全体の`validate_profile_id`にも`:`・予約名・末尾の`.`と
+   空白を断る処理を足した（既存の id を使えなくしないよう、全体は許可リストに
+   しない）。
+8. `reset-password`・`revert-to-commissioning`の対象も同じ「マシンのルート＋
+   許可リストの profile-id」（`profile_grant::resolve_target_profile`）。
+9. その場のすり替え（FSCTL）は CI（管理者）の反証テストで確かめる（実機では
+   タイミングを合わせられない）。
+10. 失敗の終了コードは今どおりすべて 1。
+11. ルート直下の`banto-hub-sink.toml`を`Users`が読める件は別 issue（#630）。
+
+**手順**（`apps/banto-hub/core/src/profile_grant.rs`）: 確かめ（`preflight`:
+profile-id → 利用者 → ルート、ファイルシステムに触らない）→ 使用中か →
+ルート → `profiles\` → profile の順に開く（無ければ作る: ルート・`profiles\`は親から
+継承する普通のフォルダ、profile は SYSTEM・Administrators だけの保護された DACL）→
+各段で本当のパスを「1 つ上の本当のパス + 名前」と比べ、`guard::data_acl_plan`
+（reparse point・フォルダでない・見知らぬ所有者）を通す → profile の DACL を読んで
+引き継ぐ利用者を決める → `reset_acl(.., Recurse::Tree)`。開いたフォルダは最後まで
+持つ。断ったとき自分で作ったフォルダが残れば 1 行で知らせる。`service-install`は
+登録の**前に**`preflight`を済ませ、通らなければ何も登録しない（ChronoGazer の B4 と
+同じ）。OS の操作は`HubElevOps`トレイトを通す。
+
+**所有者として許す相手**（#637 のオーナーレビュー Should の拡張点）: SYSTEM・
+Administrators・指定の利用者・この昇格した利用者だけ（`data_acl_plan`は利用者 1 人の
+シグネチャのまま、指定の利用者を渡す）。**引き継いだ利用者は所有者として許さない**
+（デスクトップ版が別の利用者で先に作った profile を初めて別の利用者へ付けるときは
+`ForeignOwner`で断る。文言で「その利用者を指定して実行」を案内する）。DACL に
+並べる利用者は`profile_grant::access_plan`だけが決め、`with_install_users`へ渡す
+一覧と報告の行が同じ関数から出る。
+
+**継承された owner の ACE**: デスクトップ版が先に作った profile では、作った利用者の
+権利が`CREATOR OWNER`由来の**継承された** ACE で付いていることがある。計画どおり
+引き継ぐのは**明示の** ACE だけで、継承された ACE は落とす。その利用者が指定の利用者
+なら新しい DACL に入るので問題ない。違う利用者で所有者のままなら上の所有者の
+確かめで断る。所有者が実行した管理者で、指定の利用者が別のときだけ、その管理者の
+継承の ACE が落ちて開けなくなりうるので、「この利用者は開けなくなる・
+`grant-profile-acl <その利用者>`を実行」の警告の行を出す。
+
+**利用者か確かめられなかった ACE**（`AccountKind::LookupFailed`）: 計画の「`SidTypeUser`
+で変更相当のものを引き継ぎ、落としたものを 1 行ずつ出す」に従い、**引き継がずに
+続ける**（警告の行。名前の解決が戻ってから`grant-profile-acl <その SID>`で足し直す
+案内）。昇格の境界として広げる向きの失敗ではない（落とすだけ）。
+
+**既知の制限**: 運用ガイド §11「profile ディレクトリの権限（ACL）」の 6 点
+（over-the-shoulder で既定の利用者が管理者になる・継承を切るので親や手で足した ACE が
+流れない・owner でない利用者は読めない・`BANTO_DB`/`BANTO_HUB_DATA`で外に置いた
+ものは対象外・Entra ID の利用者はその PC で一度サインインが要る・マシンの環境変数の
+変更は再起動までサービスと食い違う）。
+
+**テスト**:
+
+- 全 OS（偽の`HubElevOps`、`profile_grant/tests.rs`）: profile-id の許可リストの表、
+  不正な profile-id・利用者・ルートで**開く・作る・読む・書く・使用中の確かめが
+  1 回も呼ばれない**表（`invalid_input_has_no_side_effects`）、`service-install`が
+  確かめの失敗で登録しない、使用中なら何も触らない、開く順序と持ち続けること、
+  作った後に断ったときの知らせ、各段の断る分岐の到達、所有者の許可リスト、
+  引き継ぎと報告の行の golden。
+- Windows の実物（一時フォルダのルート、`profile_grant/win/tests.rs`）: 外の対象は
+  **継承を受け入れる DACL**（各テストで`!protected`を確かめる）。中のジャンクション・
+  末尾のリンク（profile とルート）・途中の要素のジャンクション・中のハードリンク・
+  その場の FSCTL の 5 種で外の DACL が変わらない。書き直した形（保護・3 ACE・
+  所有者 Administrators、中のファイルはフラグなし）、ルートと`profiles\`を書かない
+  こと、mutex を持っている間の使用中、本物の名前の解決で組み込み・無い名前・
+  グループの SID を断ること。書き直しを伴うものは所有者を Administrators に移すので
+  **管理者でだけ走る**（CI は管理者。非管理者では理由を出して skip）。一時パスは
+  本当のパス（長い名前）で組み立てる。
+- 反証（2026-10-16、手元・非管理者）: テストの書き直しを旧実装（パスの
+  `SetNamedSecurityInfoW`の再帰）に戻すと、末尾のリンク・ルートのジャンクション・
+  途中の要素のジャンクション・中のハードリンクで外の DACL が書き換わり、テストが
+  落ちた。**中のジャンクションは旧実装でも先が変わらなかった**（リンクそのものの
+  DACL が書き換わっただけ。Windows 11 26300、自分が所有する一時フォルダ。issue の
+  問題点 3 は「未検証の仮説」のままで、実機の M3 で確かめる）。中のジャンクション
+  のテストは、リンクを辿って書く実装を差し込むと落ちることで、検出できることを
+  確かめた。本当のパスの比較・所有者と reparse point の確かめ・使用中の確かめ・
+  利用者の種類の確かめ・引き継ぎを外すと、それぞれ対応するテストが落ちる。
