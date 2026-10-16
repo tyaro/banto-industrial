@@ -67,6 +67,25 @@ $env:BANTO_ALLOW_SETUP = "1"
 [../../docs/banto-hub-operations.md](../../docs/banto-hub-operations.md)
 の「起動・環境変数」節を参照。
 
+## OPC UA 外部クライアント smoke
+
+Python `asyncua==1.1.8` の独立クライアントで、実 Hub の OPC UA endpoint を確認する。
+試験は専用一時 DB/data directory と loopback ポートを使い、REST API 経由で
+試験タグを作る。
+
+次のコマンドはリポジトリルートから実行する。
+
+```sh
+cargo build --locked -p banto-hub-core --bin banto-hub
+python3.12 -m venv /tmp/banto-hub-opcua-interop-venv
+/tmp/banto-hub-opcua-interop-venv/bin/python -m pip install -r interop/opcua/requirements.txt
+/tmp/banto-hub-opcua-interop-venv/bin/python interop/opcua/smoke.py target/debug/banto-hub
+```
+
+検証範囲と未実施の Windows Service / UaExpert 手動確認は
+[../../docs/banto-hub-opcua-verification.md](../../docs/banto-hub-opcua-verification.md)
+を参照。
+
 ## 関連ドキュメント
 
 - 設計: [../../docs/tag-server-design.md](../../docs/tag-server-design.md)

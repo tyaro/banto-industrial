@@ -94,6 +94,12 @@ const KEY_MQTT_MIN_INTERVAL_MS: &str = "mqtt.min_interval_ms";
 const KEY_GRPC_ENABLED: &str = "grpc.enabled";
 const KEY_GRPC_BIND: &str = "grpc.bind";
 const KEY_GRPC_PORT: &str = "grpc.port";
+const KEY_OPCUA_ENABLED: &str = "opcua.enabled";
+const KEY_OPCUA_BIND: &str = "opcua.bind";
+const KEY_OPCUA_PORT: &str = "opcua.port";
+const KEY_OPCUA_ENDPOINT_PATH: &str = "opcua.endpoint_path";
+const KEY_OPCUA_NAMESPACE_URI: &str = "opcua.namespace_uri";
+const KEY_OPCUA_ADVERTISED_HOST: &str = "opcua.advertised_host";
 
 /// 保存されている保持期間（`retention.days`）の読み方。banto の
 /// `AuditSettings` と同じ約束（banto 側の同名の関数は非公開なので、ここに
@@ -255,6 +261,31 @@ impl Default for GrpcSettings {
     }
 }
 
+/// OPC UA は明示的に有効化するまで待受しない。Phase 2 は None/Anonymous 専用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpcUaSettings {
+    pub enabled: bool,
+    pub bind: String,
+    pub port: u16,
+    pub endpoint_path: String,
+    pub namespace_uri: String,
+    pub advertised_host: Option<String>,
+}
+
+impl Default for OpcUaSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1".to_owned(),
+            port: 4840,
+            endpoint_path: "/".to_owned(),
+            namespace_uri: "urn:banto:opcua:tags".to_owned(),
+            advertised_host: None,
+        }
+    }
+}
+
 /// hub 固有の設定キーの型付きラッパ（I3'、このモジュールの doc comment）。
 /// banto の [`SettingsService`] の汎用 `get`/`set_many` の上に乗る。
 ///
@@ -317,6 +348,12 @@ pub trait HubSettingsExt {
     fn set_grpc_config(
         &self,
         config: &GrpcSettings,
+    ) -> impl Future<Output = Result<(), BantoError>> + Send;
+
+    fn opcua_config(&self) -> impl Future<Output = Result<OpcUaSettings, BantoError>> + Send;
+    fn set_opcua_config(
+        &self,
+        config: &OpcUaSettings,
     ) -> impl Future<Output = Result<(), BantoError>> + Send;
 }
 
@@ -463,6 +500,53 @@ impl HubSettingsExt for SettingsService {
         ])
         .await
     }
+
+    async fn opcua_config(&self) -> Result<OpcUaSettings, BantoError> {
+        let defaults = OpcUaSettings::default();
+        Ok(OpcUaSettings {
+            enabled: self
+                .get(KEY_OPCUA_ENABLED)
+                .await?
+                .is_some_and(|v| v == "true"),
+            bind: self.get(KEY_OPCUA_BIND).await?.unwrap_or(defaults.bind),
+            port: self
+                .get(KEY_OPCUA_PORT)
+                .await?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.port),
+            endpoint_path: self
+                .get(KEY_OPCUA_ENDPOINT_PATH)
+                .await?
+                .unwrap_or(defaults.endpoint_path),
+            namespace_uri: self
+                .get(KEY_OPCUA_NAMESPACE_URI)
+                .await?
+                .unwrap_or(defaults.namespace_uri),
+            advertised_host: self
+                .get(KEY_OPCUA_ADVERTISED_HOST)
+                .await?
+                .filter(|v| !v.is_empty()),
+        })
+    }
+
+    async fn set_opcua_config(&self, config: &OpcUaSettings) -> Result<(), BantoError> {
+        let port = config.port.to_string();
+        self.set_many(&[
+            (
+                KEY_OPCUA_ENABLED,
+                if config.enabled { "true" } else { "false" },
+            ),
+            (KEY_OPCUA_BIND, &config.bind),
+            (KEY_OPCUA_PORT, &port),
+            (KEY_OPCUA_ENDPOINT_PATH, &config.endpoint_path),
+            (KEY_OPCUA_NAMESPACE_URI, &config.namespace_uri),
+            (
+                KEY_OPCUA_ADVERTISED_HOST,
+                config.advertised_host.as_deref().unwrap_or(""),
+            ),
+        ])
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -479,6 +563,25 @@ mod tests {
     async fn get_missing_key_is_none() {
         let svc = service().await;
         assert_eq!(svc.get("nope").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn opcua_settings_round_trip_is_atomic_and_defaults_disabled() {
+        let svc = service().await;
+        assert_eq!(
+            svc.opcua_config().await.expect("default"),
+            OpcUaSettings::default()
+        );
+        let config = OpcUaSettings {
+            enabled: true,
+            bind: "0.0.0.0".to_owned(),
+            port: 4841,
+            endpoint_path: "/line".to_owned(),
+            namespace_uri: "urn:site:tags".to_owned(),
+            advertised_host: Some("opcua.example.local".to_owned()),
+        };
+        svc.set_opcua_config(&config).await.expect("save");
+        assert_eq!(svc.opcua_config().await.expect("load"), config);
     }
 
     #[tokio::test]
