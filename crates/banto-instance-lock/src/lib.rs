@@ -258,6 +258,57 @@ fn write_owner_info(file: &mut File, host_kind: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// [`try_hold_named_mutex`] が取った名前付き mutex（drop で閉じる。全部のハンドルが
+/// 閉じれば mutex は消える）。
+#[cfg(windows)]
+pub struct NamedMutexGuard {
+    _mutex: WindowsMutexHandle,
+}
+
+/// **診断ファイルを書かずに**、名前付き mutex だけを取る（Windows だけ。#626 PR-B）。
+/// [`try_acquire`] と同じ`CreateMutexW`（既定のセキュリティ記述子・初期所有者あり）で、
+/// 取れれば`Some`、既にある（`ERROR_ALREADY_EXISTS`、またはアクセス拒否 = 権限の強い
+/// ほかの作り手が持っている）なら`None`。それ以外の失敗は`Err`。
+///
+/// 昇格ヘルパー（banto-hub-elev の`grant-profile-acl`）が、profile の書き直しの間だけ
+/// Hub と同じ mutex を持つために使う。持っている間は Hub の [`try_acquire`] が
+/// [`InstanceLockError::AlreadyHeld`]（または拒否）で起動に失敗する。診断ファイルを
+/// 書かないのは、確かめる前の profile のパスへ昇格したプロセスが書かないため。
+#[cfg(windows)]
+pub fn try_hold_named_mutex(name: &str) -> Result<Option<NamedMutexGuard>, std::io::Error> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
+    };
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide_name` は NUL 終端。null の属性は既定のセキュリティ記述子
+    // （[`try_acquire`] と同じ）。`SetLastError(0)` も同じ理由。
+    let handle = unsafe {
+        SetLastError(0);
+        CreateMutexW(std::ptr::null(), 1, wide_name.as_ptr())
+    };
+    if handle.is_null() {
+        // SAFETY: 直前の呼び出しのスレッドのエラー。
+        let last_error = unsafe { GetLastError() };
+        if last_error == ERROR_ACCESS_DENIED {
+            return Ok(None);
+        }
+        return Err(std::io::Error::from_raw_os_error(last_error as i32));
+    }
+    // SAFETY: 直前の呼び出しのスレッドのエラー。
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // SAFETY: `CreateMutexW`が返した有効なハンドル。
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+    Ok(Some(NamedMutexGuard {
+        _mutex: WindowsMutexHandle(handle),
+    }))
+}
+
 /// 診断ファイルから所有者情報を読む（読めなければ `None`）。排他の正当性には
 /// 関与しない読み取り専用ヘルパー（banto-hub の health プローブも使う）。
 ///
@@ -434,6 +485,32 @@ mod tests {
 
     /// 実マシンで動いているアプリ（BantoHub サービス等）の mutex と衝突しない
     /// よう、テストごとに一意な名前を使う。
+    /// #626 PR-B: 診断ファイルを書かずに持つ mutex は、持っている間は [`try_acquire`]・
+    /// もう一度の [`try_hold_named_mutex`]（別のスレッドからも）を断り、放せば取れる。
+    #[cfg(windows)]
+    #[test]
+    fn a_held_named_mutex_blocks_acquire_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = unique_mutex_name("hold");
+        let held = try_hold_named_mutex(&name).unwrap().expect("取れる");
+        assert!(matches!(
+            try_acquire(&name, &lock_path(&dir, "x.lock"), "hub"),
+            Err(InstanceLockError::AlreadyHeld { .. })
+        ));
+        let other = name.clone();
+        let from_thread =
+            std::thread::spawn(move || try_hold_named_mutex(&other).unwrap().is_none())
+                .join()
+                .unwrap();
+        assert!(from_thread, "別のスレッドからも取れない");
+        drop(held);
+        let again = try_hold_named_mutex(&name).unwrap();
+        assert!(again.is_some(), "放せば取れる");
+        drop(again);
+        let guard = try_acquire(&name, &lock_path(&dir, "y.lock"), "hub").expect("Hub も取れる");
+        drop(guard);
+    }
+
     fn unique_mutex_name(tag: &str) -> String {
         format!(
             "Global\\BantoInstanceLockTest.{tag}.{}.{}",

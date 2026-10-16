@@ -35,53 +35,17 @@ impl PinnedProfileDir for PinnedDir {
     }
 }
 
-/// `dir`を作る（親から継承する普通のフォルダ。無い親も作る）。作ったら`true`。
-fn create_inheriting_dir(dir: &Path) -> Result<bool, String> {
-    match std::fs::create_dir(dir) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let parent = dir
-                .parent()
-                .ok_or_else(|| format!("{} の親フォルダが分かりません", dir.display()))?;
-            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-            match std::fs::create_dir(dir) {
-                Ok(()) => Ok(true),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                Err(err) => Err(err.to_string()),
-            }
-        }
-        Err(err) => Err(err.to_string()),
-    }
-}
-
-/// `Global\BantoHub.<id>`の mutex があるか（`OpenMutexW(SYNCHRONIZE)`。作らない・
-/// 持たない）。開けた・アクセス拒否 = ある、`ERROR_FILE_NOT_FOUND` = 無い、それ以外は
-/// 確かめられない（理由）。
-pub fn mutex_exists(name: &str) -> Result<bool, String> {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
-    };
-    use windows_sys::Win32::System::Threading::OpenMutexW;
-    /// `SYNCHRONIZE`。
-    const SYNCHRONIZE: u32 = 0x0010_0000;
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `wide`は NUL 終端。開けたハンドルはすぐ閉じる。
-    let handle = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide.as_ptr()) };
-    if !handle.is_null() {
-        // SAFETY: `OpenMutexW`が返した有効なハンドル。
-        unsafe { CloseHandle(handle) };
-        return Ok(true);
-    }
-    // SAFETY: 直前の呼び出しのスレッドのエラー。
-    match unsafe { GetLastError() } {
-        ERROR_FILE_NOT_FOUND => Ok(false),
-        ERROR_ACCESS_DENIED => Ok(true),
-        other => Err(format!(
-            "OpenMutexW({name}) が失敗しました: {}",
-            std::io::Error::from_raw_os_error(other as i32)
-        )),
-    }
+/// profile の mutex（`Global\BantoHub.<id>`）を取って持つ（#626 PR-B の再レビュー 3）。
+/// Hub と同じ`CreateMutexW`（`banto_instance_lock::try_hold_named_mutex`。Hub の
+/// `try_acquire`と違い、確かめる前の profile のパスへ診断ファイルを書かない）。既に誰かが
+/// 持っていれば`Ok(None)`。昇格した管理者が作った mutex は既定のセキュリティ記述子
+/// （管理者・SYSTEM）で、全部のハンドルが閉じれば消えるので、後の Hub の起動には残らない。
+pub fn hold_profile_mutex(
+    profile_id: &str,
+) -> Result<Option<banto_instance_lock::NamedMutexGuard>, String> {
+    let name = crate::profile_paths::mutex_name(profile_id);
+    banto_instance_lock::try_hold_named_mutex(&name)
+        .map_err(|err| format!("{name} を取れませんでした: {err}"))
 }
 
 impl HubElevOps for WindowsHubElevOps {
@@ -106,8 +70,13 @@ impl HubElevOps for WindowsHubElevOps {
         guard::account_kind(sid)
     }
 
-    fn profile_in_use(&self, profile_id: &str) -> Result<bool, String> {
-        mutex_exists(&crate::profile_paths::mutex_name(profile_id))
+    type ProfileHold = banto_instance_lock::NamedMutexGuard;
+
+    fn hold_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<banto_instance_lock::NamedMutexGuard>, String> {
+        hold_profile_mutex(profile_id)
     }
 
     fn pin_dir(&self, dir: &Path) -> Result<Option<PinnedDir>, String> {
@@ -120,14 +89,20 @@ impl HubElevOps for WindowsHubElevOps {
         pin_file(path)
     }
 
-    fn create_dir(&self, dir: &Path, how: CreateHow) -> Result<bool, String> {
-        match how {
-            CreateHow::Inherit => create_inheriting_dir(dir),
-            CreateHow::ServiceOnly => {
-                banto_secret_store::acl::create_dir_if_absent(dir, &DirAccess::service_only())
-                    .map_err(|err| err.to_string())
-            }
-        }
+    fn create_child(
+        &self,
+        parent: &PinnedDir,
+        name: &str,
+        how: CreateHow,
+    ) -> Result<Option<PinnedDir>, String> {
+        let service_only = DirAccess::service_only();
+        let access = match how {
+            CreateHow::Inherit => None,
+            CreateHow::ServiceOnly => Some(&service_only),
+        };
+        parent
+            .create_child_dir(name, access)
+            .map_err(|err| err.to_string())
     }
 }
 

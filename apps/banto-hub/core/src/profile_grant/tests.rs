@@ -224,7 +224,19 @@ impl FakeOps {
         for dir in [root(), profiles(), profile()] {
             ops.dirs.borrow_mut().insert(dir, FakeDir::owned_by(ME));
         }
+        // ルートの親（ProgramData）。
+        ops.dirs
+            .borrow_mut()
+            .insert(program_data(), FakeDir::owned_by(SYSTEM_SID));
         ops
+    }
+
+    /// ルート・profiles・profile を消す（ルートの親の ProgramData は残す）。
+    fn remove_tree(&self) {
+        let mut dirs = self.dirs.borrow_mut();
+        for dir in [root(), profiles(), profile()] {
+            dirs.remove(&dir);
+        }
     }
 
     fn calls(&self) -> Vec<String> {
@@ -271,9 +283,15 @@ impl HubElevOps for FakeOps {
             .cloned()
             .unwrap_or(AccountKind::NotAUser)
     }
-    fn profile_in_use(&self, profile_id: &str) -> Result<bool, String> {
+    type ProfileHold = FakeFile;
+    fn hold_profile(&self, profile_id: &str) -> Result<Option<FakeFile>, String> {
         self.log.borrow_mut().push(format!("in_use {profile_id}"));
-        self.in_use.clone()
+        self.in_use.clone().map(|in_use| {
+            (!in_use).then(|| FakeFile {
+                name: format!("hold {profile_id}"),
+                log: self.log.clone(),
+            })
+        })
     }
     fn pin_dir(&self, dir: &Path) -> Result<Option<FakePinned>, String> {
         self.log.borrow_mut().push(format!("pin {}", name(dir)));
@@ -298,17 +316,32 @@ impl HubElevOps for FakeOps {
             )
         }))
     }
-    fn create_dir(&self, dir: &Path, how: CreateHow) -> Result<bool, String> {
-        self.log
-            .borrow_mut()
-            .push(format!("create {} {how:?}", name(dir)));
+    fn create_child(
+        &self,
+        parent: &FakePinned,
+        name_: &str,
+        how: CreateHow,
+    ) -> Result<Option<FakePinned>, String> {
+        let dir = parent.path.join(name_);
+        self.log.borrow_mut().push(format!(
+            "create {} under {} {how:?}",
+            name_,
+            name(&parent.path)
+        ));
+        if self.dirs.borrow().contains_key(&dir) {
+            return Ok(None);
+        }
         let made = self
             .on_create
             .borrow_mut()
-            .remove(dir)
+            .remove(&dir)
             .unwrap_or_else(|| FakeDir::owned_by(ADMINISTRATORS_SID));
-        self.dirs.borrow_mut().insert(dir.to_path_buf(), made);
-        Ok(true)
+        self.dirs.borrow_mut().insert(dir.clone(), made.clone());
+        Ok(Some(FakePinned {
+            path: dir,
+            dir: made,
+            log: self.log.clone(),
+        }))
     }
 }
 
@@ -606,6 +639,7 @@ fn normal_run_opens_in_order_and_holds_until_the_end() {
             "drop default",
             "drop profiles",
             "drop BantoHub",
+            "drop hold default",
         ]
     );
     let profile_dir = profile();
@@ -623,27 +657,29 @@ fn normal_run_opens_in_order_and_holds_until_the_end() {
 #[test]
 fn missing_dirs_are_created_then_checked_then_reset() {
     let ops = FakeOps::new();
-    ops.dirs.borrow_mut().clear();
+    ops.remove_tree();
     let (result, lines) = run(&ops, Some("alice"), Some("line-2"));
     assert_eq!(result, Ok(()), "{lines:#?}");
+    // 無い段は、確かめ済みの親のハンドルを基準に作り、作ったハンドルをそのまま使う
+    // （パスで開き直さない - #626 PR-B の再レビュー 1）。ルートの親は先に開いて確かめる。
     assert_eq!(
         ops.calls(),
         vec![
             "in_use line-2",
             "pin BantoHub",
-            "create BantoHub Inherit",
-            "pin BantoHub",
+            "pin ProgramData",
+            "create BantoHub under ProgramData Inherit",
             "pin profiles",
-            "create profiles Inherit",
-            "pin profiles",
+            "create profiles under BantoHub Inherit",
             "pin line-2",
-            "create line-2 ServiceOnly",
-            "pin line-2",
+            "create line-2 under profiles ServiceOnly",
             "read_dacl line-2",
             &format!("reset line-2 [{ALICE}]"),
             "drop line-2",
             "drop profiles",
             "drop BantoHub",
+            "drop ProgramData",
+            "drop hold line-2",
         ]
     );
     assert!(lines[0].contains(": 作りました（"), "{lines:#?}");
@@ -673,7 +709,7 @@ fn created_then_refused_leaves_a_notice_and_does_not_reset() {
 
     // ルートを作った後、profiles の本当のパスが食い違う → ルートと profiles の両方を知らせる。
     let ops = FakeOps::new();
-    ops.dirs.borrow_mut().clear();
+    ops.remove_tree();
     let mut swapped = FakeDir::owned_by(ADMINISTRATORS_SID);
     swapped.final_path = Some(abs("elsewhere/profiles"));
     ops.on_create.borrow_mut().insert(profiles(), swapped);
@@ -1240,4 +1276,146 @@ fn open_target_profile_refuses_links_and_swaps() {
         Err(OpenTargetError::Target(_))
     ));
     assert!(ops.calls().is_empty());
+}
+
+// --- #626 PR-B の再レビュー ----------------------------------------------------------
+
+/// 1: ルートが無いとき、ルートの親を開いて確かめるまで何も作らない。親が無い・本当の
+/// 場所が違う（途中のジャンクション）・reparse point・フォルダでない・OS の置き場の中なら、
+/// 何も作らずに断る。
+#[test]
+fn a_missing_root_is_created_only_under_a_checked_parent() {
+    type Tweak = Box<dyn Fn(&FakeOps)>;
+    let parent = |f: fn(&mut FakeDir)| -> Tweak {
+        Box::new(move |ops: &FakeOps| f(ops.dirs.borrow_mut().get_mut(&program_data()).unwrap()))
+    };
+    let cases: Vec<(&str, Tweak, &str)> = vec![
+        (
+            "no parent",
+            Box::new(|ops: &FakeOps| {
+                ops.dirs.borrow_mut().remove(&program_data());
+            }),
+            "親から作ることはしません",
+        ),
+        (
+            "parent behind a junction",
+            parent(|d| d.final_path = Some(abs("elsewhere/ProgramData"))),
+            "本当の場所",
+        ),
+        (
+            "parent is a reparse point",
+            parent(|d| d.info.is_reparse_point = true),
+            "reparse point",
+        ),
+        (
+            "parent not a dir",
+            parent(|d| d.info.is_dir = false),
+            "フォルダではありません",
+        ),
+        (
+            "parent inside Windows",
+            parent(|d| d.final_path = Some(abs("Windows"))),
+            "本当の場所",
+        ),
+    ];
+    for (label, tweak, needle) in cases {
+        let ops = FakeOps::new();
+        ops.remove_tree();
+        tweak(&ops);
+        let (result, lines) = run(&ops, None, None);
+        assert_eq!(result, Err(Refused), "{label}: {lines:#?}");
+        assert!(
+            !ops.calls().iter().any(|c| c.starts_with("create")),
+            "{label}: 作った: {:?}",
+            ops.calls()
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(needle)),
+            "{label}: {lines:#?}"
+        );
+        assert!(lines.iter().all(|l| !l.contains("残っています")), "{label}");
+    }
+}
+
+/// 1（純関数）: ルートの親の確かめ。ProgramData そのもの・ドライブのルートは親として
+/// 認め、OS の置き場の中・本当の場所の食い違いは断る。
+#[test]
+fn root_parent_table() {
+    let dir = |reparse: bool, is_dir: bool| PinnedDirInfo {
+        is_dir,
+        is_reparse_point: reparse,
+        owner: SYSTEM_SID.into(),
+    };
+    let ok = dir(false, true);
+    assert_eq!(
+        root_parent_problem(&program_data(), &program_data(), &ok, &known()),
+        None
+    );
+    let drive = abs("");
+    assert_eq!(root_parent_problem(&drive, &drive, &ok, &known()), None);
+    assert!(root_parent_problem(&abs("x"), &program_data(), &ok, &known()).is_some());
+    assert!(root_parent_problem(&abs("Windows/x"), &abs("Windows/x"), &ok, &known()).is_some());
+    assert!(root_parent_problem(&abs("data"), &abs("data"), &dir(true, true), &known()).is_some());
+    assert!(
+        root_parent_problem(&abs("data"), &abs("data"), &dir(false, false), &known()).is_some()
+    );
+}
+
+/// 2: 種類の分からない ACE・SID を読めない ACE があれば、引き継ぎを決めずに断る
+/// （書き直さない）。条件付きの許可は引き継がずに警告する。
+#[test]
+fn unknown_or_unreadable_aces_refuse_and_conditional_allows_are_not_carried() {
+    for blocked in [
+        ace(0x13, 0x03, MODIFY_ACCESS_MASK, ALICE),
+        ace(10, 0x03, 0x0004_0000, ""),
+    ] {
+        let ops = FakeOps::new();
+        ops.dirs.borrow_mut().get_mut(&profile()).unwrap().dacl = Ok(ObservedDacl {
+            protected: false,
+            owner: ME.into(),
+            aces: Some(vec![
+                ace(0, 0x03, MODIFY_ACCESS_MASK, ALICE),
+                blocked.clone(),
+            ]),
+        });
+        let (result, lines) = run(&ops, None, None);
+        assert_eq!(result, Err(Refused), "{blocked:?}: {lines:#?}");
+        assert!(!ops.calls().iter().any(|c| c.starts_with("reset")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("種類の分からない ACE か SID を読めない ACE")),
+            "{lines:#?}"
+        );
+    }
+
+    let ops = FakeOps::new();
+    ops.dirs.borrow_mut().get_mut(&profile()).unwrap().dacl = Ok(ObservedDacl {
+        protected: false,
+        owner: ME.into(),
+        aces: Some(vec![ace(9, 0x03, MODIFY_ACCESS_MASK, ALICE)]),
+    });
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops.calls().contains(&format!("reset default [{ME}]")));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("条件付き・オブジェクトの許可の ACE")),
+        "{lines:#?}"
+    );
+}
+
+/// 3: profile の mutex は書き直しが終わるまで持つ（放すのは最後）。
+#[test]
+fn the_profile_mutex_is_held_until_the_rewrite_ends() {
+    let ops = FakeOps::new();
+    let (result, _) = run(&ops, None, None);
+    assert_eq!(result, Ok(()));
+    let calls = ops.calls();
+    let reset = calls.iter().position(|c| c.starts_with("reset")).unwrap();
+    let released = calls.iter().position(|c| c == "drop hold default").unwrap();
+    assert_eq!(calls[0], "in_use default");
+    assert!(released > reset, "{calls:?}");
+    assert_eq!(released, calls.len() - 1, "{calls:?}");
 }

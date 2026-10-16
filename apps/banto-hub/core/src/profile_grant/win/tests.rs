@@ -116,6 +116,8 @@ struct TempOps {
     env: TempEnv,
     /// このパスを開いたときに付けるフック。
     hook: RefCell<Option<(PathBuf, Hook)>>,
+    /// 子を作る直前に 1 回だけ走るフック（親のその場のすり替え）。
+    before_create: RefCell<Option<Hook>>,
 }
 
 impl TempOps {
@@ -125,6 +127,7 @@ impl TempOps {
                 root: root.to_path_buf(),
             },
             hook: RefCell::new(None),
+            before_create: RefCell::new(None),
         }
     }
 }
@@ -145,8 +148,9 @@ impl HubElevOps for TempOps {
     fn account_kind(&self, sid: &InstallUserSid) -> AccountKind {
         WindowsHubElevOps.account_kind(sid)
     }
-    fn profile_in_use(&self, _profile_id: &str) -> Result<bool, String> {
-        Ok(false)
+    type ProfileHold = ();
+    fn hold_profile(&self, _profile_id: &str) -> Result<Option<()>, String> {
+        Ok(Some(()))
     }
     fn pin_dir(&self, dir: &Path) -> Result<Option<Hooked>, String> {
         let pinned = WindowsHubElevOps.pin_dir(dir)?;
@@ -165,8 +169,21 @@ impl HubElevOps for TempOps {
             }
         }))
     }
-    fn create_dir(&self, dir: &Path, how: CreateHow) -> Result<bool, String> {
-        WindowsHubElevOps.create_dir(dir, how)
+    fn create_child(
+        &self,
+        parent: &Hooked,
+        name: &str,
+        how: CreateHow,
+    ) -> Result<Option<Hooked>, String> {
+        if let Some(hook) = self.before_create.borrow_mut().take() {
+            hook();
+        }
+        Ok(WindowsHubElevOps
+            .create_child(&parent.inner, name, how)?
+            .map(|inner| Hooked {
+                inner,
+                hook: RefCell::new(None),
+            }))
     }
     type HeldFile = super::HeldFile;
     fn pin_file(&self, path: &Path) -> Result<Option<(super::HeldFile, FileFacts)>, String> {
@@ -464,19 +481,32 @@ fn an_in_place_fsctl_swap_stays_on_the_link() {
 
 /// 稼働中の確かめ: mutex を持っている間だけ「使用中」（管理者でなくても走る）。
 #[test]
-fn profile_in_use_sees_a_held_mutex() {
+fn the_profile_mutex_is_held_and_released() {
     let id = format!("t626-{}-{}", std::process::id(), line!());
-    assert_eq!(WindowsHubElevOps.profile_in_use(&id), Ok(false));
+    let name = crate::profile_paths::mutex_name(&id);
+    let held = WindowsHubElevOps
+        .hold_profile(&id)
+        .unwrap()
+        .expect("取れる");
+    // 持っている間は、Hub と同じ口（try_acquire）も、別のスレッドからも取れない。
     let dir = tempfile::tempdir().unwrap();
-    let guard = banto_instance_lock::try_acquire(
-        &crate::profile_paths::mutex_name(&id),
-        &dir.path().join("profile.lock"),
-        "test",
-    )
-    .expect("mutex を取れる");
-    assert_eq!(WindowsHubElevOps.profile_in_use(&id), Ok(true));
+    assert!(matches!(
+        banto_instance_lock::try_acquire(&name, &dir.path().join("a.lock"), "hub"),
+        Err(banto_instance_lock::InstanceLockError::AlreadyHeld { .. })
+    ));
+    let other = id.clone();
+    assert!(
+        std::thread::spawn(move || WindowsHubElevOps.hold_profile(&other).unwrap().is_none())
+            .join()
+            .unwrap()
+    );
+    drop(held);
+    // 放せば Hub が取れる（mutex は残らない）。
+    let guard = banto_instance_lock::try_acquire(&name, &dir.path().join("b.lock"), "hub")
+        .expect("放した後は Hub が取れる");
+    // Hub が持っている間は、elev は使用中として扱う。
+    assert!(WindowsHubElevOps.hold_profile(&id).unwrap().is_none());
     drop(guard);
-    assert_eq!(WindowsHubElevOps.profile_in_use(&id), Ok(false));
 }
 
 /// 本物の名前の解決: 組み込みのアカウント・無い名前・グループの SID は断り、ルートも
@@ -677,4 +707,90 @@ fn a_hardlinked_target_db_is_refused() {
         Err(OpenTargetError::Unsafe(text)) => assert!(text.contains("ハードリンク"), "{text}"),
         other => panic!("{other:?}"),
     }
+}
+
+// --- #626 PR-B の再レビュー 1: 無いルートを確かめ済みの親の下だけに作る ---------------
+
+/// ルートが無く、その親（途中の要素）が外へのジャンクションのとき、外に何も作らず、外の
+/// 一覧と DACL も変えずに断る（パスで作ってから断っていた穴の回帰。管理者でなくても走る）。
+#[test]
+fn a_missing_root_behind_a_junction_creates_nothing_outside() {
+    let parent = tempfile::tempdir().unwrap();
+    let base = long(parent.path());
+    let (outside, mut watched) = make_outside(&base);
+    std::fs::create_dir(outside.join("data")).unwrap();
+    watched.push(outside.join("data"));
+    let before = (
+        snapshot(&watched),
+        listing(&outside),
+        listing(&outside.join("data")),
+    );
+    let via = base.join("via");
+    junction(&via, &outside);
+    // (a) ルートの親そのものがジャンクション、(b) ルートの親の親がジャンクション。
+    for (root, needle) in [
+        (via.join("BantoHub"), "reparse point"),
+        (via.join("data").join("BantoHub"), "本当の場所"),
+    ] {
+        let (result, lines) = grant(&TempOps::new(&root), None);
+        assert_eq!(result, Err(Refused), "{lines:#?}");
+        assert!(has_line(&lines, needle), "{lines:#?}");
+        assert!(has_line(&lines, "何も作らずに止めます"), "{lines:#?}");
+        assert_eq!(
+            (
+                snapshot(&watched),
+                listing(&outside),
+                listing(&outside.join("data"))
+            ),
+            before
+        );
+    }
+    std::fs::remove_dir(&via).unwrap();
+}
+
+/// ルートの親も無ければ、何も作らずに断る（`create_dir_all`をしない）。
+#[test]
+fn a_missing_root_parent_creates_nothing() {
+    let parent = tempfile::tempdir().unwrap();
+    let base = long(parent.path());
+    let root = base.join("missing").join("BantoHub");
+    let (result, lines) = grant(&TempOps::new(&root), None);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(has_line(&lines, "親から作ることはしません"), "{lines:#?}");
+    assert!(!base.join("missing").exists());
+    assert_eq!(listing(&base), Vec::<String>::new());
+}
+
+/// ルートの親を確かめた後・ルートを作る直前に、親をその場で外へのジャンクションに
+/// 変えても（FSCTL）、親のハンドルを基準に作るので外には何もできない（パスで作り直すと
+/// 外にできる - 反証で確かめた。管理者でなくても走る）。
+#[test]
+fn a_root_parent_swapped_before_create_does_not_leak() {
+    let parent = tempfile::tempdir().unwrap();
+    let base = long(parent.path());
+    let (outside, watched) = make_outside(&base);
+    let before = (snapshot(&watched), listing(&outside));
+    let root_parent = base.join("rp");
+    std::fs::create_dir(&root_parent).unwrap();
+    let ops = TempOps::new(&root_parent.join("BantoHub"));
+    let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+    {
+        let (root_parent, outside, swapped) =
+            (root_parent.clone(), outside.clone(), swapped.clone());
+        *ops.before_create.borrow_mut() = Some(Box::new(move || {
+            swapped.set(set_reparse_to(&root_parent, &outside).is_ok());
+        }));
+    }
+    let (result, lines) = grant(&ops, None);
+    if !swapped.get() {
+        if std::env::var_os("CI").is_some() {
+            panic!("CI で FSCTL_SET_REPARSE_POINT が失敗した");
+        }
+        eprintln!("skip: FSCTL_SET_REPARSE_POINT に権限が無い - CI で確かめる");
+        return;
+    }
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert_eq!((snapshot(&watched), listing(&outside)), before);
+    assert!(!outside.join("BantoHub").exists());
+    let _ = std::fs::remove_dir(&root_parent);
 }

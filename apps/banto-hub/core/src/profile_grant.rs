@@ -423,9 +423,9 @@ pub trait PinnedProfileDir {
 /// フォルダの作り方（[`HubElevOps::create_dir`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateHow {
-    /// 親から継承する普通のフォルダ（ルート・`profiles\`。無い親も作る）。
+    /// 親から継承する普通のフォルダ（ルート・`profiles\`）。
     Inherit,
-    /// SYSTEM・Administrators だけの保護された DACL（profile。親は既にある）。
+    /// SYSTEM・Administrators だけの保護された DACL（profile）。
     ServiceOnly,
 }
 
@@ -445,12 +445,23 @@ pub trait HubElevOps {
     fn lookup_account_sid(&self, name: &str) -> Result<Option<String>, String>;
     /// SID がこの PC の利用者のアカウント（`SidTypeUser`）か（`LookupAccountSidW`）。
     fn account_kind(&self, sid: &InstallUserSid) -> AccountKind;
-    /// profile の mutex（`Global\BantoHub.<id>`）があるか（読むだけ）。
-    fn profile_in_use(&self, profile_id: &str) -> Result<bool, String>;
+    /// [`HubElevOps::hold_profile`] が返す、持っている間だけ有効な profile の排他。
+    type ProfileHold;
+    /// profile の mutex（`Global\BantoHub.<id>`、Hub と同じもの）を**取って持つ**
+    /// （#626 PR-B の再レビュー 3。書き直しの間に Hub が起動しないように）。既に誰かが
+    /// 持っていれば`Ok(None)`（使用中）。
+    fn hold_profile(&self, profile_id: &str) -> Result<Option<Self::ProfileHold>, String>;
     /// フォルダを辿らずに開く（無ければ`Ok(None)`）。
     fn pin_dir(&self, dir: &Path) -> Result<Option<Self::Pinned>, String>;
-    /// 無ければ作る（作ったら`true`、既にあれば`false`）。
-    fn create_dir(&self, dir: &Path, how: CreateHow) -> Result<bool, String>;
+    /// 確かめ済みの`parent`（開いたハンドル）を基準に、名前 1 要素の子のフォルダを**相対で**
+    /// 作り、作ったハンドルをそのまま辿らずに開いたものとして返す（パスを解決し直さない -
+    /// #626 PR-B の再レビュー 1）。既にあれば`Ok(None)`。
+    fn create_child(
+        &self,
+        parent: &Self::Pinned,
+        name: &str,
+        how: CreateHow,
+    ) -> Result<Option<Self::Pinned>, String>;
     /// [`HubElevOps::pin_file`] が返す、開いたままのファイル（drop で閉じる）。
     type HeldFile;
     /// ファイルを**辿らずに**開いて持つ（Windows は`FILE_FLAG_OPEN_REPARSE_POINT`、共有の
@@ -759,6 +770,12 @@ pub fn access_plan(
                     )));
                 }
             }
+            DropReason::ConditionalAllow => {
+                warnings += 1;
+                lines.push(err_line(&format!(
+                    "警告: 条件付き・オブジェクトの許可の ACE（{ace}）は引き継ぎません（条件を外して普通の許可にすると権利が広がるため）。要るなら書き直した後に付け直してください"
+                )));
+            }
             DropReason::NotTreeWide => lines.push(out_line(&format!(
                 "フォルダの中全体に効かない ACE（{ace}）は引き継ぎません"
             ))),
@@ -867,64 +884,195 @@ fn refusal_text(level: Level, dir: &Path, refusal: &DataAclRefusal) -> String {
     format!("{}（{}）は{reason}", level.label(), dir.display())
 }
 
-/// 1 つの段を開いて確かめる（無ければ作って開き直す）。本当のパスが`expected`と同じ
-/// 場所で既知のフォルダに当たらないこと、`data_acl_plan`（reparse point・フォルダで
-/// ない・見知らぬ所有者）を通ること。断るときは作ったものを知らせる。
+/// 段の親（無い段を作るときの基準）。
+enum Parent<'a, P> {
+    /// ルートの段: 親はパスで辿らずに開いて確かめる（無ければ作らずに断る）。開いた親は
+    /// `slot`に入れて、呼ぶ側が最後まで持つ。
+    RootParent(&'a mut Option<P>),
+    /// `profiles\`・profile の段: 確かめ済みの 1 つ上の段のハンドル。
+    Pinned(&'a P),
+}
+
+/// ルートの親の確かめ（純関数）: 本当のパスが期待と同じ場所・フォルダ・reparse point で
+/// ない・ネットワークの場所でない・OS とプログラムの置き場（`forbidden_inside`）の中で
+/// ない。ProgramData そのもの（`forbidden_itself`）・ドライブのルートは親として認める
+/// （既定のルートは ProgramData の下、`D:\BantoHub`の親は`D:\`）。
+pub fn root_parent_problem(
+    real: &Path,
+    expected: &Path,
+    info: &PinnedDirInfo,
+    known: &KnownFolders,
+) -> Option<String> {
+    if !guard::paths_match(real, expected) {
+        return Some(format!(
+            "本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります",
+            real.display()
+        ));
+    }
+    if info.is_reparse_point || !info.is_dir {
+        return Some(
+            "ジャンクション・シンボリックリンク（reparse point）か、フォルダではありません"
+                .to_string(),
+        );
+    }
+    let text = real.to_string_lossy();
+    if text.starts_with("\\\\") || text.starts_with("//") {
+        return Some("ネットワークの場所か特殊なパスです".to_string());
+    }
+    if let Some(folder) = known
+        .forbidden_inside
+        .iter()
+        .find(|folder| guard::is_same_or_inside(real, folder))
+    {
+        return Some(format!(
+            "OS・プログラムの置き場か共有のフォルダ（{}）の中です",
+            folder.display()
+        ));
+    }
+    None
+}
+
+/// 1 つの段を開いて確かめる。無ければ**確かめ済みの親のハンドルを基準に相対で作り**、
+/// 作ったハンドルをそのまま使う（パスを解決し直さない - #626 PR-B の再レビュー 1）。
+/// ルートの段の親は、パスで辿らずに開いて [`root_parent_problem`] を通してから使い、
+/// 無ければ何も作らずに断る。本当のパスが`expected`と同じ場所で既知のフォルダに当たら
+/// ないこと、`data_acl_plan`（reparse point・フォルダでない・見知らぬ所有者）を通ること。
+/// 断るときは作ったものを知らせる。
+#[allow(clippy::too_many_arguments)]
 fn open_level<O: HubElevOps>(
     ops: &O,
     pre: &Preflight,
     level: Level,
     dir: &Path,
     expected: &Path,
+    parent: Parent<'_, O::Pinned>,
     created: &mut Created,
     out: Out<'_>,
 ) -> Result<O::Pinned, Refused> {
-    let pin = |out: Out<'_>| {
-        ops.pin_dir(dir).map_err(|error| {
-            out(err_line(&format!(
-                "{}（{}）を開けませんでした: {error}",
-                level.label(),
-                dir.display()
-            )));
-            Refused
-        })
+    let refuse = |out: Out<'_>, created: &Created, text: String| {
+        out(err_line(&text));
+        created.notice(out);
+        Err(Refused)
     };
-    let pinned = match pin(out) {
+    let pinned = match ops.pin_dir(dir) {
         Ok(Some(pinned)) => pinned,
-        Ok(None) => {
-            match ops.create_dir(dir, level.create_how()) {
-                Ok(true) => created.0.push((level, dir.to_path_buf())),
-                Ok(false) => {}
-                Err(error) => {
-                    out(err_line(&format!(
-                        "{}（{}）を作れませんでした: {error}",
-                        level.label(),
-                        dir.display()
-                    )));
-                    created.notice(out);
-                    return Err(Refused);
-                }
-            }
-            match pin(out) {
-                Ok(Some(pinned)) => pinned,
-                Ok(None) => {
-                    out(err_line(&format!(
-                        "{}（{}）を作った後に開けませんでした（作り直さずに止めます）",
-                        level.label(),
-                        dir.display()
-                    )));
-                    created.notice(out);
-                    return Err(Refused);
-                }
-                Err(Refused) => {
-                    created.notice(out);
-                    return Err(Refused);
-                }
-            }
+        Err(error) => {
+            return refuse(
+                out,
+                created,
+                format!(
+                    "{}（{}）を開けませんでした: {error}",
+                    level.label(),
+                    dir.display()
+                ),
+            )
         }
-        Err(Refused) => {
-            created.notice(out);
-            return Err(Refused);
+        Ok(None) => {
+            let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+                return refuse(
+                    out,
+                    created,
+                    format!("{}（{}）の名前が分かりません", level.label(), dir.display()),
+                );
+            };
+            let made = match parent {
+                Parent::Pinned(parent) => ops.create_child(parent, name, level.create_how()),
+                Parent::RootParent(slot) => {
+                    let Some(parent_dir) = dir.parent() else {
+                        return refuse(
+                            out,
+                            created,
+                            format!("{}（{}）の親が分かりません", level.label(), dir.display()),
+                        );
+                    };
+                    let parent_pinned = match ops.pin_dir(parent_dir) {
+                        Ok(Some(pinned)) => pinned,
+                        Ok(None) => {
+                            return refuse(
+                                out,
+                                created,
+                                format!(
+                                    "{}（{}）の親（{}）がありません。親から作ることはしません（親を作ってから、もう一度実行してください）",
+                                    level.label(),
+                                    dir.display(),
+                                    parent_dir.display()
+                                ),
+                            )
+                        }
+                        Err(error) => {
+                            return refuse(
+                                out,
+                                created,
+                                format!(
+                                    "{}（{}）の親（{}）を開けませんでした: {error}",
+                                    level.label(),
+                                    dir.display(),
+                                    parent_dir.display()
+                                ),
+                            )
+                        }
+                    };
+                    if let Some(problem) = root_parent_problem(
+                        &parent_pinned.final_path(),
+                        parent_dir,
+                        &parent_pinned.info(),
+                        &pre.known,
+                    ) {
+                        return refuse(
+                            out,
+                            created,
+                            format!(
+                                "{}（{}）の親（{}）は{problem}。何も作らずに止めます",
+                                level.label(),
+                                dir.display(),
+                                parent_dir.display()
+                            ),
+                        );
+                    }
+                    let made = ops.create_child(&parent_pinned, name, level.create_how());
+                    *slot = Some(parent_pinned);
+                    made
+                }
+            };
+            match made {
+                Ok(Some(pinned)) => {
+                    created.0.push((level, dir.to_path_buf()));
+                    pinned
+                }
+                // 確かめてから作るまでの間に誰かが作った。辿らずに開き直して確かめる。
+                Ok(None) => match ops.pin_dir(dir) {
+                    Ok(Some(pinned)) => pinned,
+                    Ok(None) => {
+                        return refuse(
+                            out,
+                            created,
+                            format!(
+                                "{}（{}）を作ろうとしたら既にあり、開き直すと無くなっていました。止めます",
+                                level.label(),
+                                dir.display()
+                            ),
+                        )
+                    }
+                    Err(error) => {
+                        return refuse(
+                            out,
+                            created,
+                            format!(
+                                "{}（{}）を開けませんでした: {error}",
+                                level.label(),
+                                dir.display()
+                            ),
+                        )
+                    }
+                },
+                Err(error) => {
+                    return refuse(
+                        out,
+                        created,
+                        format!("{}（{}）を作れませんでした: {error}", level.label(), dir.display()),
+                    )
+                }
+            }
         }
     };
     let real = pinned.final_path();
@@ -943,18 +1091,14 @@ fn open_level<O: HubElevOps>(
                 well_known_text(&real, &refusal)
             ),
         };
-        out(err_line(&text));
-        created.notice(out);
-        return Err(Refused);
+        return refuse(out, created, text);
     }
     if let Err(refusal) = guard::data_acl_plan(
         &DirState::Present(pinned.info()),
         &pre.user,
         pre.elevated_user.as_ref().map(InstallUserSid::as_str),
     ) {
-        out(err_line(&refusal_text(level, dir, &refusal)));
-        created.notice(out);
-        return Err(Refused);
+        return refuse(out, created, refusal_text(level, dir, &refusal));
     }
     Ok(pinned)
 }
@@ -1023,23 +1167,27 @@ impl From<Refused> for GrantStop {
 
 fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<(), GrantStop> {
     let id = pre.profile_id.as_str();
-    match ops.profile_in_use(id) {
-        Ok(false) => {}
-        Ok(true) => return Err(GrantStop::InUse),
+    // profile の mutex を取り、書き直しが終わるまで持つ（#626 PR-B の再レビュー 3。持って
+    // いる間は Hub が起動に失敗するので、書き直しと競合しない）。
+    let _hold = match ops.hold_profile(id) {
+        Ok(Some(hold)) => hold,
+        Ok(None) => return Err(GrantStop::InUse),
         Err(error) => {
             out(err_line(&format!(
                 "profile '{id}' が使用中かを確かめられませんでした: {error}。何も変えていません"
             )));
             return Err(GrantStop::Refused);
         }
-    }
+    };
     let mut created = Created(Vec::new());
+    let mut root_parent: Option<O::Pinned> = None;
     let root = open_level(
         ops,
         pre,
         Level::Root,
         &pre.root,
         &pre.root,
+        Parent::RootParent(&mut root_parent),
         &mut created,
         out,
     )?;
@@ -1050,6 +1198,7 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
         Level::Profiles,
         &profiles_dir,
         &root.final_path().join(PROFILES_DIR),
+        Parent::Pinned(&root),
         &mut created,
         out,
     )?;
@@ -1060,6 +1209,7 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
         Level::Profile,
         &profile_dir,
         &profiles.final_path().join(id),
+        Parent::Pinned(&profiles),
         &mut created,
         out,
     )?;
@@ -1075,6 +1225,19 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
         }
     };
     let carry = guard::plan_carry_over(&dacl, |sid| ops.account_kind(sid));
+    // 種類の分からない ACE・SID を読めない ACE があれば、引き継ぎを決めずに断る（黙って
+    // 落とさない。#626 PR-B の再レビュー 2）。
+    if !carry.blocked.is_empty() {
+        for ace in &carry.blocked {
+            out(err_line(&format!(
+                "profile（{}）の今の DACL に、種類の分からない ACE か SID を読めない ACE（{}）があります。引き継ぐ利用者を決められないので、書き直さずに止めます（中身を確かめ、その ACE を外してからもう一度実行してください）",
+                profile_dir.display(),
+                ace_text(ace)
+            )));
+        }
+        created.notice(out);
+        return Err(GrantStop::Refused);
+    }
     let plan = access_plan(&pre.user, id, &dacl, &carry);
     for line in plan.lines {
         out(line);
@@ -1112,10 +1275,11 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
             "書き直しは終えましたが、上の警告 {warnings} 件（飛ばした子・落とした ACE など）を確かめてください"
         )));
     }
-    // 開いた順の逆に閉じる（profile → profiles → ルート）。
+    // 開いた順の逆に閉じる（profile → profiles → ルート → ルートの親）。mutex は最後。
     drop(profile);
     drop(profiles);
     drop(root);
+    drop(root_parent);
     Ok(())
 }
 

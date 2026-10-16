@@ -491,6 +491,7 @@ fn carry_over_table() {
         Carry,
         Drop(DropReason),
         Silent,
+        Block,
     }
     use DropReason as D;
     use Expect::*;
@@ -515,11 +516,27 @@ fn carry_over_table() {
             ace(DENY, OI_CI, FULL_ACCESS_MASK, SYSTEM_SID),
             Drop(D::NotAllow),
         ),
-        // オブジェクトの ACE（種類 5）も許可の ACE として扱わない。
+        // 条件付き・オブジェクトの許可（種類 5・9・11）は引き継がない（#626 PR-B の
+        // 再レビュー 2。条件を外すと広がる）。条件付き・オブジェクトの拒否（6・10・12）は拒否。
         (
             ace(5, OI_CI, MODIFY_ACCESS_MASK, STRANGER),
-            Drop(D::NotAllow),
+            Drop(D::ConditionalAllow),
         ),
+        (
+            ace(9, OI_CI, MODIFY_ACCESS_MASK, STRANGER),
+            Drop(D::ConditionalAllow),
+        ),
+        (
+            ace(11, OI_CI, MODIFY_ACCESS_MASK, STRANGER),
+            Drop(D::ConditionalAllow),
+        ),
+        (ace(6, OI_CI, 0x0004_0000, STRANGER), Drop(D::NotAllow)),
+        (ace(10, OI_CI, 0x0004_0000, STRANGER), Drop(D::NotAllow)),
+        (ace(12, OI_CI, 0x0004_0000, STRANGER), Drop(D::NotAllow)),
+        // 種類の分からない ACE・SID を読めない ACE は決めない（呼ぶ側が断る）。
+        (ace(0x13, OI_CI, MODIFY_ACCESS_MASK, STRANGER), Block),
+        (ace(DENY, OI_CI, MODIFY_ACCESS_MASK, ""), Block),
+        (ace(10, OI_CI, MODIFY_ACCESS_MASK, ""), Block),
         // ProgramData から継承した Users・CREATOR OWNER・利用者。
         (
             allow(OI_CI | INHERITED, READ_EXECUTE, "S-1-5-32-545"),
@@ -579,7 +596,7 @@ fn carry_over_table() {
             allow(OI_CI, MODIFY_ACCESS_MASK, "S-1-5-80-1-2-3-4-5"),
             Drop(D::NotAUserSid),
         ),
-        (allow(OI_CI, MODIFY_ACCESS_MASK, ""), Drop(D::NotAUserSid)),
+        (allow(OI_CI, MODIFY_ACCESS_MASK, ""), Block),
         // 利用者の領域のグループ（Domain Users など）・確かめられない。
         (
             allow(OI_CI, MODIFY_ACCESS_MASK, GROUP),
@@ -610,6 +627,13 @@ fn carry_over_table() {
                 );
             }
             Silent => assert_eq!(plan, CarryOver::default(), "{row:?}"),
+            Block => {
+                assert_eq!(plan.blocked, vec![row.clone()], "{row:?}");
+                assert!(
+                    plan.carried.is_empty() && plan.dropped.is_empty(),
+                    "{row:?}"
+                );
+            }
         }
     }
 }
@@ -670,7 +694,8 @@ fn carry_over_of_null_and_empty_dacls() {
         CarryOver {
             carried: Vec::new(),
             dropped: Vec::new(),
-            null_dacl: true
+            null_dacl: true,
+            blocked: Vec::new(),
         }
     );
     let plan = plan_carry_over(&dacl(Vec::new()), |_| unreachable!("問い合わせない"));
@@ -729,6 +754,26 @@ fn a_user_with_any_deny_is_not_carried() {
             );
         }
     }
+    // 条件付きの拒否（callback・object）も拒否として数える（#626 PR-B の再レビュー 2）。
+    for deny_type in [6u8, 10, 12] {
+        let plan = plan_carry_over(
+            &dacl(vec![
+                modify.clone(),
+                ace(deny_type, OI_CI, 0x0004_0000, USER),
+            ]),
+            kinds,
+        );
+        assert!(plan.carried.is_empty(), "{deny_type}: {plan:?}");
+    }
+    // 条件付きの許可は拒否として数えない（同じ利用者の普通の「変更」は引き継ぐ）。
+    let plan = plan_carry_over(
+        &dacl(vec![
+            modify.clone(),
+            ace(9, OI_CI, MODIFY_ACCESS_MASK, USER),
+        ]),
+        kinds,
+    );
+    assert_eq!(plan.carried, vec![sid(USER)]);
     // 別の利用者の拒否は関係しない。
     let plan = plan_carry_over(
         &dacl(vec![modify.clone(), ace(DENY, OI_CI, 0x0001_0000, OTHER)]),
