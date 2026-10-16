@@ -71,6 +71,36 @@
 //! 継承のまま）。記述子・SID の検証の unsafe なコードをこの crate の外へ複製しない
 //! ため、ここに置いた。
 //!
+//! # 既にあるディレクトリを直すとき（`pin_dir`・[`reset_dir_acl`]、#392 B3-3b）
+//!
+//! ChronoGazer の昇格ヘルパ（`chronogazer-elev.exe grant-data-acl`）は、管理者として
+//! データのルート・`secrets\`・`secrets\hub-keys\` の DACL を [`reset_dir_acl`] で
+//! 書き直す。インストール利用者はルートの中に「変更」を持つので、中に
+//! ジャンクション・シンボリックリンク・ハードリンクを置ける。次を確かめた
+//! （2026-10-16、Windows 11。下の `windows` テストが固定する）:
+//!
+//! - **書き直す対象そのものがリンクか**は、呼ぶ側が `pin_dir` で確かめる。
+//!   `pin_dir` はパスを `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`
+//!   で開き（リンクを辿らない）、属性（ディレクトリか・reparse point か）と所有者を
+//!   **開いたハンドルから**読む。ハンドルは `FILE_LIST_DIRECTORY` を求め
+//!   （データのアクセスを求めないハンドルは共有の確かめに加わらない）、
+//!   `FILE_SHARE_DELETE` を渡さずに開くので、持っている間は誰もそのディレクトリを消す・名前を変える（= 確かめた後に
+//!   ジャンクションへすり替える）ことができない。`PinnedDir::reset_acl` はその
+//!   間にパスで [`reset_dir_acl`] を呼ぶ。
+//! - **中のジャンクション・ディレクトリのシンボリックリンクは辿らない**:
+//!   `SetNamedSecurityInfoW` の継承の伝播は、リンクそのもの（reparse point の
+//!   オブジェクト）の継承の ACE を書き換えるが、リンクの先（ルートの外）とその下は
+//!   変えない（テスト `propagation_does_not_follow_child_junctions_or_symlinks`）。
+//!   そのため辿らない版（ハンドルで `SetSecurityInfo` する版）は足していない。
+//! - **ハードリンクは別**: ファイルの記述子はリンクで共有されるので、ルートの中に
+//!   ルートの外のファイルへのハードリンクがあると、伝播はそのファイルの DACL を
+//!   書き換える（SYSTEM・Administrators にフル、インストール利用者に「変更」の
+//!   継承の ACE だけになる）。ただし OS のハードリンクの緩和策で、ハードリンクを
+//!   作るにはリンク先に書き込み（属性の書き込み）の権利が要る（書き込めない
+//!   ファイルへのリンクは `os error 5` で断られることを確かめた）。インストール
+//!   利用者が得られるのは、既に属性を書き込めるファイルへの「変更」だけで、
+//!   既知の制限として残す（docs/chronogazer-service-design.md §4 の B3-3b）。
+//!
 //! # 非 Windows
 //!
 //! DACL の概念が無いので、作る・確かめる・直すはどれも
@@ -344,6 +374,81 @@ pub fn reset_dir_acl(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
 /// ディレクトリの DACL と所有者を読み戻す（診断・テスト用）。
 pub fn read_dir_dacl(dir: &std::path::Path) -> Result<ObservedDacl> {
     imp::read_dacl(dir)
+}
+
+/// インストール利用者の SID が、この PC で解決できる**利用者のアカウント**
+/// （`LookupAccountSidW` の `SidTypeUser`）であることを確かめる（#392 B3-3b。
+/// ディレクトリを作る・直す前と同じ確かめを、昇格ヘルパが SID を記録する前に
+/// 使う）。非 Windows は [`SecretStoreError::UnsupportedPlatform`]。
+pub fn check_user_account(sid: &InstallUserSid) -> Result<()> {
+    imp::ensure_user_account(&DirAccess::with_install_user(sid.clone()))
+}
+
+/// `pin_dir` で開いたディレクトリ（パス）の、開いたハンドルから読んだ情報。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedDirInfo {
+    /// ディレクトリか（`FILE_ATTRIBUTE_DIRECTORY`）。
+    pub is_dir: bool,
+    /// reparse point か（`FILE_ATTRIBUTE_REPARSE_POINT`。ジャンクション・
+    /// シンボリックリンクのほか、クラウドのファイルなど種類を問わない）。
+    pub is_reparse_point: bool,
+    /// 所有者の SID。
+    pub owner: String,
+}
+
+/// パスを**辿らずに**開き、持っている間は消す・名前を変えることを誰にもさせない
+/// ディレクトリ（モジュール doc「既にあるディレクトリを直すとき」）。drop で閉じる。
+#[cfg(windows)]
+pub struct PinnedDir {
+    handle: imp::OwnedHandle,
+    path: std::path::PathBuf,
+    info: PinnedDirInfo,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for PinnedDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedDir")
+            .field("path", &self.path)
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl PinnedDir {
+    /// 開いたパス。
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// 開いたハンドルから読んだ属性と所有者。
+    pub fn info(&self) -> &PinnedDirInfo {
+        &self.info
+    }
+
+    /// 開いたままのパスの DACL を [`reset_dir_acl`] で書き直す。**reparse point・
+    /// ディレクトリでないものには何もせずに断る**（呼ぶ側の確かめに加えた多重の
+    /// 防御）。所有者の確かめは呼ぶ側（どの所有者を受け入れるかは製品の判断）。
+    pub fn reset_acl(&self, access: &DirAccess) -> Result<()> {
+        if self.info.is_reparse_point {
+            return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
+        }
+        if !self.info.is_dir {
+            return Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory));
+        }
+        // `self`（= ハンドル）を借りている間に呼ぶので、書き直しの間は閉じない。
+        let _held = &self.handle;
+        reset_dir_acl(&self.path, access)
+    }
+}
+
+/// パスを辿らずに開いて [`PinnedDir`] を返す（モジュール doc「既にあるディレクトリを
+/// 直すとき」）。無ければ `Ok(None)`。`.`・`..` を含むパスは開かずに断る。
+#[cfg(windows)]
+pub fn pin_dir(dir: &std::path::Path) -> Result<Option<PinnedDir>> {
+    reject_dot_segments(dir)?;
+    imp::pin_dir(dir)
 }
 
 /// 今のプロセスのトークンの利用者の SID（デスクトップ host が自分を
@@ -744,6 +849,102 @@ mod imp {
         })
     }
 
+    /// drop で `CloseHandle` するハンドル（[`super::PinnedDir`]）。
+    pub(crate) struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: `CreateFileW` が返した有効なハンドル。ここ以外では閉じない。
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub(super) fn pin_dir(dir: &Path) -> Result<Option<super::PinnedDir>> {
+        use windows_sys::Win32::Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+        };
+
+        let path = wide(dir);
+        // SAFETY: `path` は NUL 終端。リンクを辿らず（OPEN_REPARSE_POINT）、
+        // ディレクトリも開けるように（BACKUP_SEMANTICS）。共有に DELETE を含めない
+        // ので、このハンドルを持っている間は誰も消す・名前を変えることができない。
+        // **データのアクセス（`FILE_LIST_DIRECTORY` = `FILE_READ_DATA`）を必ず求める**:
+        // 読み取り・書き込み・削除のどれも求めないハンドルは共有の確かめに加わらず、
+        // 共有に DELETE を含めなくても名前の変更を止められない（テスト
+        // `a_pinned_dir_cannot_be_renamed_away_while_held` で確かめた）。
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let os_error = last_error();
+            if os_error == ERROR_FILE_NOT_FOUND || os_error == ERROR_PATH_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(SecretStoreError::io(
+                IoOp::InspectDir,
+                &std::io::Error::from_raw_os_error(os_error as i32),
+            ));
+        }
+        let handle = OwnedHandle(handle);
+
+        // SAFETY: 全フィールドが整数の構造体（ゼロは有効な値）。
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` は有効、`info` は書き込み先。
+        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+            return Err(api("GetFileInformationByHandle", last_error()));
+        }
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `handle` は READ_CONTROL で開いた有効なハンドル。成功すれば `sd` は
+        // LocalAlloc の領域で、`owner` はその中を指す（`sd` を解放するまで有効）。
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if status != 0 {
+            return Err(api("GetSecurityInfo", status));
+        }
+        let sd = LocalBox(sd);
+        let owner = sid_string(owner)?;
+        drop(sd);
+
+        Ok(Some(super::PinnedDir {
+            handle,
+            path: dir.to_path_buf(),
+            info: super::PinnedDirInfo {
+                is_dir: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                is_reparse_point: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                owner,
+            },
+        }))
+    }
+
     pub(super) fn current_user_sid_string() -> Result<String> {
         let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: 今のプロセスの疑似ハンドル。成功すれば `token` を閉じる責任を持つ。
@@ -1045,6 +1246,10 @@ mod tests {
             create_dir_if_absent(dir, &access),
             Err(SecretStoreError::UnsupportedPlatform)
         );
+        assert_eq!(
+            check_user_account(&user()),
+            Err(SecretStoreError::UnsupportedPlatform)
+        );
     }
 
     #[cfg(windows)]
@@ -1259,6 +1464,153 @@ mod tests {
             ));
             assert!(!dir.exists(), "拒んだときはフォルダを作らない");
             assert!(!create_dir_if_absent(root.path(), &group_access).unwrap());
+        }
+
+        /// ジャンクション（`mklink /J`。管理者でなくても作れる）を作る。
+        fn junction(link: &std::path::Path, target: &std::path::Path) {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("cmd を起動できない");
+            assert!(status.success(), "mklink /J に失敗した");
+        }
+
+        /// #392 B3-3b の反証（モジュール doc「既にあるディレクトリを直すとき」）:
+        /// ルートの DACL を書き直す伝播は、中のジャンクション・ディレクトリの
+        /// シンボリックリンクの先（ルートの外）を書き換えない。シンボリックリンクは
+        /// 作る権利（開発者モードなど）が無ければ、ジャンクションだけを確かめる。
+        #[test]
+        fn propagation_does_not_follow_child_junctions_or_symlinks() {
+            let root_parent = tempfile::tempdir().unwrap();
+            let root = root_parent.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(root.join("nested")).unwrap();
+            let outside_parent = tempfile::tempdir().unwrap();
+            let outside = outside_parent.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::create_dir(outside.join("sub")).unwrap();
+            std::fs::write(outside.join("file.txt"), b"x").unwrap();
+            junction(&root.join("link"), &outside);
+            junction(&root.join("nested").join("deep-link"), &outside);
+            let symlink = std::os::windows::fs::symlink_dir(&outside, root.join("dsym")).is_ok();
+
+            let watched = [
+                outside.clone(),
+                outside.join("sub"),
+                outside.join("file.txt"),
+            ];
+            let before: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
+            reset_dir_acl(&root, &DirAccess::with_install_user(me())).unwrap();
+            let after: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
+            assert_eq!(
+                after, before,
+                "リンクの先の DACL が変わった（symlink: {symlink}）"
+            );
+            // ルート自身は書き直された。
+            check_dacl(
+                &read_dir_dacl(&root).unwrap(),
+                &DirAccess::with_install_user(me()),
+            )
+            .unwrap();
+
+            // 片付け（リンクだけを消す。先は消さない）。
+            std::fs::remove_dir(root.join("link")).unwrap();
+            std::fs::remove_dir(root.join("nested").join("deep-link")).unwrap();
+            if symlink {
+                std::fs::remove_dir(root.join("dsym")).unwrap();
+            }
+            assert!(outside.join("file.txt").exists());
+        }
+
+        /// `pin_dir`: 無ければ `None`、普通のフォルダはディレクトリ・reparse point で
+        /// ない・所有者は自分、ジャンクションは辿らずに reparse point として見え、
+        /// `reset_acl` は何もせずに断る（先の DACL も変えない）。ファイルも断る。
+        #[test]
+        fn pin_dir_reads_the_object_itself_without_following_links() {
+            let root = tempfile::tempdir().unwrap();
+            assert!(pin_dir(&root.path().join("absent")).unwrap().is_none());
+
+            let plain = root.path().join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            let pinned = pin_dir(&plain).unwrap().unwrap();
+            assert_eq!(
+                pinned.info(),
+                &PinnedDirInfo {
+                    is_dir: true,
+                    is_reparse_point: false,
+                    owner: me().as_str().to_string(),
+                }
+            );
+            assert_eq!(pinned.path(), plain.as_path());
+            pinned
+                .reset_acl(&DirAccess::with_install_user(me()))
+                .unwrap();
+            drop(pinned);
+            check_dacl(
+                &read_dir_dacl(&plain).unwrap(),
+                &DirAccess::with_install_user(me()),
+            )
+            .unwrap();
+
+            let outside = tempfile::tempdir().unwrap();
+            let link = root.path().join("link");
+            junction(&link, outside.path());
+            let before = read_dir_dacl(outside.path()).unwrap();
+            let pinned = pin_dir(&link).unwrap().unwrap();
+            assert!(pinned.info().is_reparse_point, "{:?}", pinned.info());
+            assert_eq!(
+                pinned.reset_acl(&DirAccess::with_install_user(me())),
+                Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint))
+            );
+            drop(pinned);
+            assert_eq!(read_dir_dacl(outside.path()).unwrap(), before);
+            std::fs::remove_dir(&link).unwrap();
+
+            let file = root.path().join("file");
+            std::fs::write(&file, b"x").unwrap();
+            let pinned = pin_dir(&file).unwrap().unwrap();
+            assert!(!pinned.info().is_dir);
+            assert_eq!(
+                pinned.reset_acl(&DirAccess::with_install_user(me())),
+                Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory))
+            );
+            assert_eq!(
+                pin_dir(&root.path().join("x").join("..").join("plain")).unwrap_err(),
+                SecretStoreError::DotSegmentInPath
+            );
+        }
+
+        /// `pin_dir` の反証: ハンドルを持っている間は、そのフォルダの名前を変えて
+        /// ジャンクションにすり替える・消すことができない（放せばできる）。
+        #[test]
+        fn a_pinned_dir_cannot_be_renamed_away_while_held() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("pinned");
+            std::fs::create_dir(&dir).unwrap();
+            let moved = root.path().join("moved");
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            assert!(
+                std::fs::rename(&dir, &moved).is_err(),
+                "持っている間に名前を変えられた"
+            );
+            assert!(std::fs::remove_dir(&dir).is_err(), "持っている間に消せた");
+            drop(pinned);
+            std::fs::rename(&dir, &moved).unwrap();
+        }
+
+        #[test]
+        fn check_user_account_accepts_me_and_refuses_a_group() {
+            check_user_account(&me()).unwrap();
+            let me = me();
+            let machine = me.as_str().rsplit_once('-').unwrap().0;
+            let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
+            assert!(matches!(
+                check_user_account(&group),
+                Err(SecretStoreError::InvalidUserSid(_))
+            ));
         }
 
         #[test]
