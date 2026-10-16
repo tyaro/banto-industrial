@@ -599,14 +599,13 @@ pub async fn local_access_middleware(
     // 断る（#600 の Copilot レビュー、[`has_reserved_accounts`]）。断る本体は条件の側
     // （status と発行で共有）にあり、ここは理由を伝えるだけ。この PC からの要求だけに
     // 答える（LAN の peer には条件の `403` のまま、アカウントの名前の有無を漏らさない）。
-    // kind は banto と同じく percent decode して比べる（別表記でも同じ説明を返す）。
+    // kind は banto と同じく percent decode して比べる（別表記でも同じ説明を返す）。判定は
+    // 監査と同じ `issued_role`（[`local_desktop_issue_role`]: 発行の POST・この listener が
+    // 発行しうる・decode した kind が `localDesktop`）を使い、1 か所にまとめる（PR #649 の
+    // オーナー Nit 1。挙動は同じ - `may_issue` は起動時の role があることを含む）。
     // 未初期化で起動した後の初期化済み（#392 B2-2 で、設定が `admin` なら開く）も同じ
     // なので、起動時の形は問わない（未初期化の間はアカウントが無く、常に偽）。
-    if is_grant_issue
-        && local
-        && state.access.may_issue()
-        && percent_decode(&path[GRANT_PREFIX.len()..]).as_deref() == Some(LOCAL_DESKTOP_GRANT_KIND)
-    {
+    if local && issued_role.is_some() {
         if let Ok(true) = has_reserved_accounts(&state.users).await {
             return (
                 StatusCode::CONFLICT,

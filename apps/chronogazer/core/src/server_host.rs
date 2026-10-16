@@ -421,9 +421,10 @@ impl ServerShutdownSummary {
     /// [`EXIT_SHUTDOWN_INCOMPLETE`] は「収集の後始末（予算・最終 flush）が終わらなかった」
     /// の意味で、サービスでは SCM へ異常の終わり（`server_service::service_exit_for`）
     /// として報告される。残ったファイルは書いたプロセス（自分）が生きていないので読む側
-    /// （`endpoint::read_live_endpoint`）が古いものとして読み飛ばし、次の起動が置き換え
-    /// るため、データにも次の接続にも影響しない。知らせるのはログの 1 行
-    /// （[`Self::endpoint_diagnostic`]）だけ。
+    /// （`endpoint::read_live_endpoint`）が古いものとして読み飛ばし、次の起動が置き換えを
+    /// 試みる。データには影響しない。原因が属性・ACL のように続くものなら次の起動の
+    /// 置き換えも失敗し（起動時に「書けなかった」の行が出る）、シェルはつなげないので、
+    /// 知らせるログの 1 行（[`Self::endpoint_diagnostic`]）に手で消す案内を入れる。
     pub fn exit_code(&self) -> i32 {
         if self.report.timed_out || self.report.collect_stop_error.is_some() {
             EXIT_SHUTDOWN_INCOMPLETE

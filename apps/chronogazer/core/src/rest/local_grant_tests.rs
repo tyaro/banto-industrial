@@ -2039,7 +2039,27 @@ async fn each_auth_put_answers_with_the_value_it_saved() {
 
     let dir = tempfile::tempdir().unwrap();
     let audit_path = dir.path().join("audit.sqlite3");
-    let audit_pool = crate::db::init_db(&audit_path).await.expect("init_db");
+    // 監査の DB は init_db で作って（スキーマ）、busy_timeout を長くした pool で開き直す
+    // （PR #649 のオーナー Nit 2）: 外から `BEGIN IMMEDIATE` で止めている間、A・B の監査の
+    // INSERT は SQLite の busy_timeout まで待つ。init_db（`banto_storage::connect_sqlite`）は
+    // sqlx の既定の 5 秒のままで、止めている間の待ち合わせ（`wait_until` 2 回、各上限
+    // 10 秒）は負荷の高い Windows の CI で超えうる。超えると監査の INSERT が失敗し、行の
+    // 数の確認が落ちる。待ち合わせの上限の合計より十分長い 120 秒にする。
+    crate::db::init_db(&audit_path)
+        .await
+        .expect("init_db")
+        .close()
+        .await;
+    let audit_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&audit_path)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .foreign_keys(true)
+                .busy_timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .unwrap();
     let audit = AuditLogService::new(Db::Sqlite(audit_pool.clone()));
     let router = settings_admin_router(SettingsAdminState {
         settings: f.settings.clone(),

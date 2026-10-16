@@ -34,7 +34,8 @@
 //! [`EndpointClear`] で「消した・無い・別のプロセスのもの」と区別して返し、終了の
 //! 側がログとコンソールに 1 行残す（#599。終了コードは変えない）。残ったファイルは
 //! 書いたプロセスが生きていないので、読む側は古いものとして読み飛ばし、次の起動が
-//! 置き換える。
+//! 置き換えを試みる。原因が属性・ACL のように続くものなら置き換えも失敗するので、
+//! 1 行には手で消す案内を入れる（[`EndpointClear::diagnostic`]）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -217,20 +218,30 @@ impl EndpointClear {
     ///
     /// 残ったファイルは、読む側（[`read_live_endpoint`]）が書いたプロセスの pid が
     /// 生きていないので古いものとして読み飛ばし、次の起動の [`write_endpoint`] が
-    /// 置き換える。そのため終了コードは変えない
+    /// 置き換えを試みる。そのため終了コードは変えない
     /// （`server_host::ServerShutdownSummary::exit_code`）。
+    ///
+    /// **自動で直るとは約束しない**（PR #649 の Codex P2）: 消せなかった・読めなかった
+    /// 原因が読み取り専用の属性や ACL のように続くものなら、次の起動の置き換え（rename）
+    /// も同じ理由で失敗し、サーバーは起動時に「書けなかった」の行を出して動き続けるが、
+    /// シェルは古い pid のファイルを断るので生きているポートを見つけられない。そのため
+    /// 文言は「置き換えを試みる・できなければ属性と権限を確かめて手で消す」にし、OS の
+    /// エラーがあれば同じ 1 行に入れる。
     pub fn diagnostic(&self, path: &Path) -> Option<String> {
         let path = path.display();
+        let advice = format!(
+            "次の起動で置き換えを試みます。置き換えられないときは、ファイルの属性・権限を確かめて、{path} を手で消してください"
+        );
         match self {
             Self::Removed | Self::Absent | Self::OtherOwner { .. } => None,
             Self::Unrecognized => Some(format!(
-                "接続先のファイル（{path}）の中身を読み取れないため、消さずに残しました（次の起動で置き換えます）"
+                "接続先のファイル（{path}）の中身を読み取れないため、消さずに残しました。{advice}"
             )),
             Self::ReadFailed(err) => Some(format!(
-                "接続先のファイル（{path}）を読めないため、消さずに残しました（次の起動で置き換えます）: {err}"
+                "接続先のファイル（{path}）を読めないため、消さずに残しました（{err}）。{advice}"
             )),
             Self::RemoveFailed(err) => Some(format!(
-                "接続先のファイル（{path}）を消せませんでした（次の起動で置き換えます）: {err}"
+                "接続先のファイル（{path}）を消せませんでした（{err}）。{advice}"
             )),
         }
     }
@@ -484,6 +495,46 @@ mod tests {
             EndpointClear::OtherOwner { pid: 1 },
         ] {
             assert_eq!(quiet.diagnostic(&path), None, "{quiet:?}");
+        }
+    }
+
+    /// PR #649 の Codex P2: 知らせる 1 行は「次の起動で置き換えます」と約束しない。
+    /// 置き換えを試みること・できなければ属性と権限を確かめて手で消すこと・OS の
+    /// エラー（あれば）を同じ 1 行に入れる（golden）。
+    #[test]
+    fn diagnostics_do_not_promise_an_automatic_fix() {
+        let path = PathBuf::from("root").join("run").join(ENDPOINT_FILE_NAME);
+        let shown = path.display().to_string();
+        let advice = format!(
+            "次の起動で置き換えを試みます。置き換えられないときは、ファイルの属性・権限を確かめて、{shown} を手で消してください"
+        );
+        assert_eq!(
+            EndpointClear::RemoveFailed("アクセスが拒否されました。 (os error 5)".to_string())
+                .diagnostic(&path)
+                .unwrap(),
+            format!(
+                "接続先のファイル（{shown}）を消せませんでした（アクセスが拒否されました。 (os error 5)）。{advice}"
+            )
+        );
+        assert_eq!(
+            EndpointClear::ReadFailed("os error 5".to_string())
+                .diagnostic(&path)
+                .unwrap(),
+            format!("接続先のファイル（{shown}）を読めないため、消さずに残しました（os error 5）。{advice}")
+        );
+        assert_eq!(
+            EndpointClear::Unrecognized.diagnostic(&path).unwrap(),
+            format!(
+                "接続先のファイル（{shown}）の中身を読み取れないため、消さずに残しました。{advice}"
+            )
+        );
+        for state in [
+            EndpointClear::RemoveFailed("x".to_string()),
+            EndpointClear::ReadFailed("x".to_string()),
+            EndpointClear::Unrecognized,
+        ] {
+            let line = state.diagnostic(&path).unwrap();
+            assert!(!line.contains("置き換えます"), "{line}");
         }
     }
 
