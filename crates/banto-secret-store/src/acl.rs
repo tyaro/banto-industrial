@@ -114,13 +114,17 @@
 //!   （伝播しない API）で書き、継承は自前で子へ伝える。**パスは一切使わない**（監査 [A]。
 //!   パスで列挙・パスで開くと、確かめた後に途中の要素をジャンクションに変えられて先を
 //!   辿る）: 子は、親のディレクトリの**ハンドル**を
-//!   `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` で列挙してファイル ID を取り、
-//!   `OpenFileById`（ヒント = 親のハンドル、`FILE_FLAG_OPEN_REPARSE_POINT`）で辿らずに開く。
+//!   `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)` で列挙して**128 ビットの**ファイル ID を取り（監査 Nit 2。ReFS・Dev Drive でも正しい）、
+//!   `OpenFileById`（`ExtendedFileIdType`、ヒント = 親のハンドル、`FILE_FLAG_OPEN_REPARSE_POINT`）で辿らずに開く。
 //!   開いた後に属性をハンドルから確かめ、**reparse point は飛ばし**（[`ResetSkips::reparse`]）、
 //!   **ハードリンク（リンク数 2 以上のファイル）も飛ばし**（[`ResetSkips::hardlink`]。記述子を
 //!   共有するので書くと木の外の名前のアクセスを変える。#624）、それ以外だけに同じ記述子を
-//!   書いて、フォルダならその子のハンドルを列挙元として再帰する。`.`・`..` は除き、列挙・
-//!   開く途中の失敗は fail closed（消えた子だけ飛ばす）。
+//!   書いて、フォルダならその子のハンドルを列挙元として再帰する。`.`・`..` は除く。
+//!   **開けない子**（利用者が Administrators を拒否した・所有権が無い。`ERROR_ACCESS_DENIED`）は
+//!   特権を有効にせず、触らず飛ばして [`ResetSkips::denied`] に記録する（監査 Should 1。そのまま
+//!   残る）。消えた子は飛ばし、それ以外の失敗は fail closed。ファイルには継承のフラグ（`OICI`）を
+//!   外した記述子を書く（監査 Nit 4。フォルダは `OICI`）。再帰の深さは上限 512 で、超えたら
+//!   1 で止める（監査 Nit 1。とても深いフォルダでスタックをあふれさせない）。
 //!   - 【測った事実・自前の再帰】`PinnedDir::reset_acl` は、中の普通の子（孫まで）へ保護された
 //!     DACL と Administrators 所有を書き、子のジャンクションとハードリンクは飛ばして
 //!     `ResetSkips` に記録する。リンクの先（ルートの外）は変えない（テスト
@@ -445,6 +449,9 @@ pub struct ResetSkips {
     pub reparse: Vec<std::path::PathBuf>,
     /// ハードリンク（ファイルでリンク数 2 以上）。記述子を共有するので触らない（#624）。
     pub hardlink: Vec<std::path::PathBuf>,
+    /// 開けなかった子（利用者が Administrators を拒否した・所有権が無いなど）。特権を
+    /// 有効にせず、触らず飛ばした（#392 B3-3b の監査 Should 1）。そのまま残る。
+    pub denied: Vec<std::path::PathBuf>,
 }
 
 /// パスを**辿らずに**開き、持っている間は消す・名前を変えることを誰にもさせない
@@ -509,7 +516,9 @@ impl PinnedDir {
     /// 昇格した管理者のプロセスから呼ぶ（昇格していなければ `ERROR_INVALID_OWNER` で失敗）。
     /// **開いた時点で reparse point・ディレクトリでないものには何もせずに断る**（呼ぶ側の
     /// 確かめに加えた多重の防御）。今の所有者を受け入れるかの確かめは呼ぶ側（製品の判断）。
-    pub fn reset_acl(&self, access: &DirAccess) -> Result<ResetSkips> {
+    /// `recurse` が偽なら、このフォルダそのものだけ書いて中へは下りない（監査 Nit 3:
+    /// すでにルートの再帰で書いた `secrets`・`hub-keys` を、その層でもう一度書き直さない）。
+    pub fn reset_acl(&self, access: &DirAccess, recurse: Recurse) -> Result<ResetSkips> {
         if self.info.is_reparse_point {
             return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
         }
@@ -517,9 +526,24 @@ impl PinnedDir {
             return Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory));
         }
         let mut skips = ResetSkips::default();
-        imp::set_security_tree(self.handle.raw(), &self.final_path, access, &mut skips)?;
+        imp::set_security_tree(
+            self.handle.raw(),
+            &self.final_path,
+            access,
+            matches!(recurse, Recurse::Tree),
+            &mut skips,
+        )?;
         Ok(skips)
     }
+}
+
+/// [`PinnedDir::reset_acl`] が、中の子まで書き直すか（監査 Nit 3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recurse {
+    /// このフォルダと、中の普通の子（孫まで）。
+    Tree,
+    /// このフォルダそのものだけ。
+    ObjectOnly,
 }
 
 /// パスを辿らずに開いて [`PinnedDir`] を返す（モジュール doc「既にあるディレクトリを
@@ -850,9 +874,19 @@ mod imp {
     }
 
     /// SDDL（所有者 `BUILTIN\\Administrators`・保護された DACL）から自己相対の記述子を作る。
-    fn owned_protected_sd(access: &DirAccess) -> Result<LocalBox> {
-        // `O:BA` で所有者を Administrators に、`access.sddl()` が `D:P(...)`（保護された DACL）。
-        let sddl = wide_str(&format!("O:BA{}", access.sddl()));
+    /// 自己相対の記述子を SDDL から作る。`inheritable` が真なら ACE に `OICI`（フォルダ用）、
+    /// 偽なら継承のフラグ無し（ファイル用。監査 Nit 4: ファイルに `(OI)(CI)` が付かない）。
+    /// どちらも `O:BA`（所有者 Administrators）と `D:P`（保護された DACL）。
+    fn owned_protected_sd(access: &DirAccess, inheritable: bool) -> Result<LocalBox> {
+        // `access.sddl()` は `D:P(A;OICI;FA;;;SY)...`。ファイルは `OICI` を外す（ACE の
+        // フラグ欄だけが OICI なので、文字列の `OICI` を取り除けば継承のフラグ無しになる）。
+        let dacl = access.sddl();
+        let dacl = if inheritable {
+            dacl
+        } else {
+            dacl.replace("OICI", "")
+        };
+        let sddl = wide_str(&format!("O:BA{dacl}"));
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: `sddl` は NUL 終端。成功すれば `sd` は LocalAlloc の領域（LocalBox が解放）。
         let ok = unsafe {
@@ -947,28 +981,40 @@ mod imp {
         ))
     }
 
-    /// `parent`（ディレクトリのハンドル）の中の `file_id` を、**パスを使わず**・辿らずに
-    /// 開く（`OpenFileById`、ヒント = 親のハンドル。監査 [A]: パスで開くと途中の要素の
-    /// ジャンクションを辿るので、ID で相対に開く）。消えていれば `Ok(None)`。
-    fn open_child_by_id(parent: HANDLE, file_id: i64) -> Result<Option<Opened>> {
+    /// [`open_child_by_id`] の結果。
+    enum ChildOpen {
+        Opened(Opened),
+        /// 列挙と開くの間に消えた。
+        Vanished,
+        /// 開けなかった（利用者が Administrators を拒否した・所有権が無いなど）。触らず飛ばす
+        /// （監査 Should 1。特権は有効にしない）。
+        Denied,
+    }
+
+    /// `parent`（ディレクトリのハンドル）の中の 128 ビットのファイル ID を、**パスを使わず**・
+    /// 辿らずに開く（`OpenFileById`、`ExtendedFileIdType`、ヒント = 親のハンドル。監査 [A]:
+    /// パスで開くと途中の要素のジャンクションを辿るので ID で相対に開く。Nit 2: 128 ビットの
+    /// ID で ReFS・Dev Drive でも正しく指す）。
+    fn open_child_by_id(parent: HANDLE, file_id: [u8; 16]) -> Result<ChildOpen> {
         use windows_sys::Win32::Foundation::{
-            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
         };
         use windows_sys::Win32::Storage::FileSystem::{
-            OpenFileById, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_TYPE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OpenFileById, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128,
+            FILE_ID_TYPE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
-        // windows-sys は `FILE_ID_DESCRIPTOR` の union を公開するので、FileId を入れる。
         let descriptor = windows_sys::Win32::Storage::FileSystem::FILE_ID_DESCRIPTOR {
             dwSize: std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_ID_DESCRIPTOR>(
             ) as u32,
-            Type: 0 as FILE_ID_TYPE, // FileIdType
+            Type: 2 as FILE_ID_TYPE, // ExtendedFileIdType
             Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_ID_DESCRIPTOR_0 {
-                FileId: file_id,
+                ExtendedFileId: FILE_ID_128 {
+                    Identifier: file_id,
+                },
             },
         };
-        // SAFETY: `parent` は有効なディレクトリのハンドル。`descriptor` は FileId。共有に
-        // DELETE を含めない。リンクは辿らない（OPEN_REPARSE_POINT）。
+        // SAFETY: `parent` は有効なディレクトリのハンドル。`descriptor` は 128 ビットの ID。
+        // 共有に DELETE を含めない。リンクは辿らない（OPEN_REPARSE_POINT）。
         let handle = unsafe {
             OpenFileById(
                 parent,
@@ -982,7 +1028,10 @@ mod imp {
         if handle == INVALID_HANDLE_VALUE {
             let os_error = last_error();
             if os_error == ERROR_FILE_NOT_FOUND || os_error == ERROR_PATH_NOT_FOUND {
-                return Ok(None); // 列挙と開くの間に消えた。
+                return Ok(ChildOpen::Vanished);
+            }
+            if os_error == ERROR_ACCESS_DENIED {
+                return Ok(ChildOpen::Denied);
             }
             return Err(SecretStoreError::io(
                 IoOp::InspectDir,
@@ -991,7 +1040,7 @@ mod imp {
         }
         let handle = OwnedHandle(handle);
         let (is_dir, is_reparse, links) = info_of(handle.0)?;
-        Ok(Some(Opened {
+        Ok(ChildOpen::Opened(Opened {
             handle,
             is_dir,
             is_reparse,
@@ -1005,7 +1054,7 @@ mod imp {
     /// - 対象そのもの: `handle`（呼ぶ側が辿らずに開き、reparse でないことを確かめ済み）に
     ///   [`set_object_security`]（自動の伝播をしない）で書く。
     /// - 中の子: **パスを一切使わず**、`handle` を列挙
-    ///   （`GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`）して得たファイル ID を、
+    ///   （`GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)`）して得た 128 ビットのファイル ID を、
     ///   [`open_child_by_id`]（ヒント = 親のハンドル）で辿らずに開き、
     ///   - **reparse point** は触らず・辿らず、飛ばして [`super::ResetSkips::reparse`] に記録。
     ///   - **ハードリンク（ファイルでリンク数 2 以上）** は触らず、飛ばして
@@ -1016,37 +1065,60 @@ mod imp {
     ///
     /// ハンドルとファイル ID だけで辿るので、確かめてから書くまでの間に子を**その場で**
     /// ジャンクションにされても、列挙はそのディレクトリ（空）そのものを返し、ID で開くのは
-    /// その object そのもの - リンクの先には決して向かない。
+    /// その object そのもの - リンクの先には決して向かない。`recurse` が偽なら対象そのものだけ
+    /// 書く（監査 Nit 3: すでにルートの再帰で書いた部分木を、`secrets`・`hub-keys` の層で
+    /// 書き直さない）。
     pub(super) fn set_security_tree(
         handle: HANDLE,
         real_dir: &Path,
         access: &DirAccess,
+        recurse: bool,
         skips: &mut super::ResetSkips,
     ) -> Result<()> {
         ensure_user_account(access)?;
-        let sd = owned_protected_sd(access)?;
-        set_object_security(handle, &sd)?;
-        propagate(handle, real_dir, &sd, skips)
+        let dir_sd = owned_protected_sd(access, true)?;
+        set_object_security(handle, &dir_sd)?;
+        if recurse {
+            let file_sd = owned_protected_sd(access, false)?;
+            propagate(handle, real_dir, &dir_sd, &file_sd, 0, skips)?;
+        }
+        Ok(())
     }
 
+    /// 自前の再帰の深さの上限（監査 Nit 1。これを超えたら 1 で止める。インストール利用者が
+    /// とても深いフォルダを作ってスタックをあふれさせるのを防ぐ）。
+    const MAX_DEPTH: u32 = 512;
+
     /// `dir_handle` の中を列挙して、各子にハンドルで書く・再帰する（上の doc）。`display` は
-    /// 飛ばした子の報告のための表示用のパス（開くのには使わない）。
+    /// 飛ばした子の報告のための表示用のパス（開くのには使わない）。`dir_sd` はフォルダ用
+    /// （`OICI`）、`file_sd` はファイル用（継承フラグ無し。Nit 4）。
     fn propagate(
         dir_handle: HANDLE,
         display: &Path,
-        sd: &LocalBox,
+        dir_sd: &LocalBox,
+        file_sd: &LocalBox,
+        depth: u32,
         skips: &mut super::ResetSkips,
     ) -> Result<()> {
         use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
         use windows_sys::Win32::Storage::FileSystem::{
-            FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
-            FILE_ID_BOTH_DIR_INFO,
+            FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, GetFileInformationByHandleEx,
+            FILE_ID_EXTD_DIR_INFO,
         };
 
-        // 8 バイト境界のバッファ（`FILE_ID_BOTH_DIR_INFO` はポインタ整列が要る）。
+        if depth >= MAX_DEPTH {
+            return Err(SecretStoreError::io(
+                IoOp::InspectDir,
+                &std::io::Error::other(format!(
+                    "フォルダの入れ子が深すぎます（{MAX_DEPTH} 段で打ち切り）"
+                )),
+            ));
+        }
+
+        // 8 バイト境界のバッファ（`FILE_ID_EXTD_DIR_INFO` はポインタ整列が要る）。
         let mut buffer = vec![0u64; 8 * 1024];
         let byte_len = (buffer.len() * 8) as u32;
-        let mut class = FileIdBothDirectoryRestartInfo; // 1 回目は最初から。
+        let mut class = FileIdExtdDirectoryRestartInfo; // 1 回目は最初から。
         loop {
             // SAFETY: `dir_handle` は FILE_LIST_DIRECTORY を持つディレクトリのハンドル。
             // `buffer` は `byte_len` バイト。
@@ -1065,19 +1137,27 @@ mod imp {
                 }
                 return Err(api("GetFileInformationByHandleEx", e));
             }
-            class = FileIdBothDirectoryInfo; // 2 回目以降は続きから。
+            class = FileIdExtdDirectoryInfo; // 2 回目以降は続きから。
             let base = buffer.as_ptr() as *const u8;
             let mut offset = 0usize;
             loop {
                 // SAFETY: `offset` は直前の `NextEntryOffset` で進めた、バッファ内の境界。
-                let entry = unsafe { &*(base.add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+                let entry = unsafe { &*(base.add(offset) as *const FILE_ID_EXTD_DIR_INFO) };
                 let name_len = entry.FileNameLength as usize / 2;
                 // SAFETY: `FileName` は可変長で `FileNameLength` バイト続く（バッファ内）。
                 let name_u16 =
                     unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len) };
                 let name = String::from_utf16_lossy(name_u16);
                 if name != "." && name != ".." {
-                    handle_child(dir_handle, &display.join(&name), entry.FileId, sd, skips)?;
+                    handle_child(
+                        dir_handle,
+                        &display.join(&name),
+                        entry.FileId.Identifier,
+                        dir_sd,
+                        file_sd,
+                        depth,
+                        skips,
+                    )?;
                 }
                 if entry.NextEntryOffset == 0 {
                     break;
@@ -1087,15 +1167,24 @@ mod imp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_child(
         parent: HANDLE,
         display_child: &Path,
-        file_id: i64,
-        sd: &LocalBox,
+        file_id: [u8; 16],
+        dir_sd: &LocalBox,
+        file_sd: &LocalBox,
+        depth: u32,
         skips: &mut super::ResetSkips,
     ) -> Result<()> {
-        let Some(opened) = open_child_by_id(parent, file_id)? else {
-            return Ok(()); // 列挙と開くの間に消えた。
+        let opened = match open_child_by_id(parent, file_id)? {
+            ChildOpen::Opened(opened) => opened,
+            ChildOpen::Vanished => return Ok(()),
+            ChildOpen::Denied => {
+                // 開けない子は触らず飛ばして記録（監査 Should 1。特権は有効にしない）。
+                skips.denied.push(display_child.to_path_buf());
+                return Ok(());
+            }
         };
         if opened.is_reparse {
             skips.reparse.push(display_child.to_path_buf());
@@ -1105,6 +1194,8 @@ mod imp {
             skips.hardlink.push(display_child.to_path_buf());
             return Ok(()); // 記述子を共有するので触らない（外の名前のアクセスを変えない）。
         }
+        // フォルダは継承つき（OICI）、ファイルは継承フラグ無し（Nit 4）。
+        let sd = if opened.is_dir { dir_sd } else { file_sd };
         set_object_security(opened.handle.raw(), sd)?;
         #[cfg(test)]
         AFTER_CHILD_WRITTEN.with(|hook| {
@@ -1114,7 +1205,14 @@ mod imp {
         });
         if opened.is_dir {
             // 子のハンドルを列挙元として再帰する（ID とハンドルだけ。パスは使わない）。
-            propagate(opened.handle.raw(), display_child, sd, skips)?;
+            propagate(
+                opened.handle.raw(),
+                display_child,
+                dir_sd,
+                file_sd,
+                depth + 1,
+                skips,
+            )?;
         }
         drop(opened);
         Ok(())
@@ -1929,7 +2027,7 @@ mod tests {
                     .parse::<std::path::PathBuf>()
                     .unwrap()
             );
-            let reset = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            let reset = pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree);
             drop(pinned);
             if is_elevated_admin() {
                 // #392 B3-3b の監査 B5: 書き直すと所有者は Administrators に移り、
@@ -1963,7 +2061,7 @@ mod tests {
             let pinned = pin_dir(&link).unwrap().unwrap();
             assert!(pinned.info().is_reparse_point, "{:?}", pinned.info());
             assert_eq!(
-                pinned.reset_acl(&DirAccess::with_install_user(me())),
+                pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree),
                 Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint))
             );
             drop(pinned);
@@ -1975,7 +2073,7 @@ mod tests {
             let pinned = pin_dir(&file).unwrap().unwrap();
             assert!(!pinned.info().is_dir);
             assert_eq!(
-                pinned.reset_acl(&DirAccess::with_install_user(me())),
+                pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree),
                 Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory))
             );
             assert_eq!(
@@ -2072,7 +2170,7 @@ mod tests {
             let pinned = pin_dir(&dir).unwrap().unwrap();
             let real_dir = pinned.final_path().to_path_buf();
             let access = DirAccess::with_install_user(me());
-            let skips = pinned.reset_acl(&access).unwrap();
+            let skips = pinned.reset_acl(&access, Recurse::Tree).unwrap();
             drop(pinned);
 
             // 普通の子（孫まで）は保護された DACL ＋ Administrators 所有。
@@ -2096,6 +2194,51 @@ mod tests {
             std::fs::remove_dir(dir.join("jlink")).unwrap();
         }
 
+        /// 監査 Should 1: 開けない子（Administrators を拒否した DACL）があっても、全体を
+        /// 止めず、飛ばして `ResetSkips::denied` に記録し、ほかの子は書く。特権は有効にしない。
+        /// 所有者を移すので管理者のとき（CI）だけ走る。
+        #[test]
+        fn a_child_that_denies_administrators_is_skipped_and_the_rest_continue() {
+            if !is_elevated_admin() {
+                eprintln!(
+                    "skip a_child_that_denies_administrators_is_skipped_and_the_rest_continue: 昇格していない（CI で確かめる）"
+                );
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            let normal = dir.join("normal.txt");
+            std::fs::write(&normal, b"x").unwrap();
+            let denied = dir.join("denied.txt");
+            std::fs::write(&denied, b"x").unwrap();
+            // `denied` の DACL を「この利用者だけ・継承しない」にし、Administrators を外す。
+            // 所有者はこの利用者のままなので、Administrators は WRITE_DAC で開けない。
+            let me = me();
+            let sddl = format!("D:P(A;;FA;;;{})", me.as_str());
+            let status = std::process::Command::new("icacls")
+                .arg(&denied)
+                .args(["/inheritance:r", "/grant:r"])
+                .arg(format!("*{}:F", me.as_str()))
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("icacls");
+            assert!(status.success());
+            let _ = sddl;
+
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            let skips = pinned
+                .reset_acl(&DirAccess::with_install_user(me.clone()), Recurse::Tree)
+                .unwrap();
+            drop(pinned);
+
+            let real_dir = read_dir_dacl(&dir).unwrap();
+            assert_eq!(real_dir.owner, ADMINISTRATORS_SID);
+            // 開けない子は飛ばして記録、ほかは書けている。
+            assert_eq!(skips.denied.len(), 1, "{skips:?}");
+            assert!(skips.denied[0].ends_with("denied.txt"), "{skips:?}");
+        }
+
         /// 監査 Must 2・受入 (a): ルートの中の子のジャンクションの先（outside）の DACL は、
         /// `reset_acl` で変わらない（昇格していれば飛ばして記録、していなければ 1307。どちらでも
         /// outside は不変）。
@@ -2111,7 +2254,7 @@ mod tests {
             let before_file = read_dir_dacl(&outside.path().join("f.txt")).unwrap();
 
             let pinned = pin_dir(&dir).unwrap().unwrap();
-            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree);
             drop(pinned);
 
             assert_eq!(read_dir_dacl(outside.path()).unwrap(), before);
@@ -2136,7 +2279,7 @@ mod tests {
             std::fs::hard_link(&target, dir.join("hard.txt")).unwrap();
 
             let pinned = pin_dir(&dir).unwrap().unwrap();
-            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree);
             drop(pinned);
 
             assert_eq!(
@@ -2178,7 +2321,7 @@ mod tests {
             }
             // 昇格していれば成功（dir の object そのものに書く）、していなければ 1307。
             // どちらでも outside の中身は不変。
-            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            let _ = pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree);
             drop(pinned);
             let after: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
             assert_eq!(
@@ -2308,27 +2451,42 @@ mod tests {
             let before: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
 
             // 子に書いた直後、まだ `empty` が空のうちにジャンクションへ変える（1 回だけ試みる）。
+            // Codex の Nit 5: フックが発火したこと・FSCTL が成功したことを記録して assert する。
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
             let empty_for_hook = empty.clone();
             let outside_for_hook = outside.path().to_path_buf();
-            let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired = Arc::new(AtomicBool::new(false));
+            let swap_ok = Arc::new(AtomicBool::new(false));
             let fired2 = fired.clone();
+            let swap_ok2 = swap_ok.clone();
             super::super::imp::AFTER_CHILD_WRITTEN.with(|h| {
                 *h.borrow_mut() = Some(Box::new(move |_child_handle| {
-                    if !fired2.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        let _ = set_reparse_to(&empty_for_hook, &outside_for_hook);
+                    if !fired2.swap(true, Ordering::SeqCst) {
+                        let ok = set_reparse_to(&empty_for_hook, &outside_for_hook).is_ok();
+                        swap_ok2.store(ok, Ordering::SeqCst);
                     }
                 }));
             });
             let pinned = pin_dir(&dir).unwrap().unwrap();
-            let result = pinned.reset_acl(&DirAccess::with_install_user(me()));
+            let result = pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree);
             drop(pinned);
             super::super::imp::AFTER_CHILD_WRITTEN.with(|h| *h.borrow_mut() = None);
 
-            let admin = is_elevated_admin();
-            if !admin {
+            if is_elevated_admin() {
+                // 管理者では子まで進むので、フックが発火し、すり替え（FSCTL）も成功したうえで、
+                // outside が変わらないことを確かめる。
+                assert!(result.is_ok(), "{result:?}");
+                assert!(fired.load(Ordering::SeqCst), "フックが発火していない");
+                assert!(
+                    swap_ok.load(Ordering::SeqCst),
+                    "FSCTL_SET_REPARSE_POINT が失敗した（反証にならない）"
+                );
+            } else {
                 eprintln!(
                     "note: 非管理者なので子まで進まず（1307）、フックは発火していない - 書く側は CI"
                 );
+                assert!(!fired.load(Ordering::SeqCst));
             }
             let after: Vec<_> = watched.iter().map(|p| read_dir_dacl(p).unwrap()).collect();
             assert_eq!(after, before, "再帰の途中のすり替えで outside が変わった");
