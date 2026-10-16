@@ -63,7 +63,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0-alpha.30"
+version = "0.2.0-alpha.31"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -75,6 +75,7 @@ publish = false
 # distribution method decided in banto's docs/publishing.md; see
 # crates/banto-tags/Cargo.toml for the feature set actually used.
 [workspace.dependencies]
+banto-opcua-server = { git = "https://github.com/tyaro/banto-opcua", rev = "9c479973ca6e42c94e8ed9ae321fec3569035e0d" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

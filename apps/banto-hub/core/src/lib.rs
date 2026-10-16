@@ -192,6 +192,7 @@ pub mod hub_health;
 pub mod hub_log;
 pub mod mcp;
 pub mod mqtt;
+pub mod opcua;
 pub mod pending_changes;
 pub mod profile_acl;
 pub mod profile_lock;

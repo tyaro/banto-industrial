@@ -1,7 +1,7 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-10-16 更新: #615 の現在値の不正値を全 IF で欠測・Bad に統一。2026-10-14 更新: §9 P3-b の SLMP CPU 種別を接続ごとに選べるようにした（#605、migration `0021`、既定 R。Q は QJ71E71 の 4E フレーム。アクセスルートは未露出）。2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
+状態: **実装追従中（2026-10-16 更新: #201 の診断用 OPC UA Phase 2 を追加。#615 の現在値の不正値を全 IF で欠測・Bad に統一。2026-10-14 更新: §9 P3-b の SLMP CPU 種別を接続ごとに選べるようにした（#605、migration `0021`、既定 R。Q は QJ71E71 の 4E フレーム。アクセスルートは未露出）。2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
 セッションの確定は banto v2.0.0 の SessionController に寄せ、試運転は policy runner の `adopt`/`end` で
 確定・終了することを追記（v2 移行 PR1d、banto-hub v0.2.0-alpha.26。サーバー側の設計・wire は変更なし）。
 2026-09-30 更新: §4.1 のバインディングキーを外部名のみに改め、安定 ID によるリネーム検出を撤回（オーナー決定、scada-design.md §9.6）。2026-09-24 更新: §6 の 6 項に、書き込み受付の停止を DB と状態ファイルの
@@ -102,7 +102,7 @@ Tauri アプリに in-process で埋め込まれて**いる。この構成は単
 自由にアクセスする」というモデル。本設計はこのタグ空間モデルを
 banto-industrial の資産で実現し、外部公開インターフェースとして
 **REST / WebSocket / MQTT / gRPC** を段階的に載せる
-（**OPC UA は工数対効果から後回し** — §5.5）。
+（OPC UA の診断用公開は §5.5。本番向けの認証・暗号化は後続）。
 
 ## 1. 位置づけ
 
@@ -112,7 +112,7 @@ banto-industrial の資産で実現し、外部公開インターフェースと
   PLC (MELSEC SLMP) ─────┤   タグサーバー（本設計）      ├── WebSocket (T1)
                          │   I1+I2/I2a+I3a/I3b を内蔵    ├── MQTT publish (T3)
                          │   タグ空間 = 現在値キャッシュ  ├── gRPC (T4)
-                         └──────────────────────────────┘    (OPC UA: 将来)
+                         └──────────────────────────────┘    (OPC UA: 既定無効)
                                      │
                           自己記述 tstore ファイル（I3a）
                           → banto-tsquery（I4）で別プロセスからも読める
@@ -198,7 +198,8 @@ ChronoGazer + relay-wright + 将来の SCADA」に分割して受け持つ — �
 - アラーム状態遷移管理（ACK 等）・多段通知
 - 汎用画面エディタ / 可視化（トレンド表示は ChronoGazer の商品価値。タグサーバーの
   管理 UI は設定と状態確認まで）
-- OPC UA / OPC DA サーバー（§5.5）
+- 本番向け OPC UA（認証・暗号化・証明書管理）/ OPC DA サーバー（§5.5。
+  診断用 OPC UA Phase 2 は #201 で追加）
 - **ロガー・日報・帳票機能**（FA-Server の FA-Logger / FA-Report 相当）:
   作らない（2026-08-04 オーナー決定）。記録は ChronoGazer の商品価値であり、
   タグサーバー側の tstore 書き込み（§3.3）はバックフィル用の内部実装で
@@ -802,13 +803,13 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 
 ### 4.4 現在値の不正値（2026-10-16 オーナー決定、#615）
 
-NaN・正負の無限大と bit の 0/1 以外は、共通の現在値読み取りで `value = None`・`Quality::Bad` にする。存在するサンプルの値が `None` の場合も、生の品質が Good・Stale であっても Bad にする。REST・WS・gRPC・MQTT・MCP・演算入力に同じ契約を適用する。OPC UA は未実装（#201）で、将来も同じ読み取り契約を使う。試行時刻は既存値を維持する。演算出力も保存前に同じ検証を行い、品質の認識時刻は評価時刻とする。正常な値に戻れば通常の品質へ戻る。不正なサンプル自身を正常値のソース時刻として公開しない。
+NaN・正負の無限大と bit の 0/1 以外は、共通の現在値読み取りで `value = None`・`Quality::Bad` にする。存在するサンプルの値が `None` の場合も、生の品質が Good・Stale であっても Bad にする。REST・WS・gRPC・MQTT・MCP・OPC UA・演算入力に同じ契約を適用する。試行時刻は既存値を維持する。演算出力も保存前に同じ検証を行い、品質の認識時刻は評価時刻とする。正常な値に戻れば通常の品質へ戻る。不正なサンプル自身を正常値のソース時刻として公開しない。
 
 PLC や直接保存された bit の不正値は、型別の品質履歴を持たないため、その試行時刻を Bad の認識時刻とする。同じサンプルを繰り返し読んでも時刻は変わらない。保存側が既に Bad としたサンプルは既存の品質遷移時刻を保つ。
 
 ## 5. 外部インターフェース設計
 
-優先順は **REST → WebSocket → (書き込み) → MQTT → gRPC → (OPC UA)**。
+実装順は **REST → WebSocket → (書き込み) → MQTT → gRPC → OPC UA Phase 2**。
 REST/WebSocket は axum に同居するため追加依存ゼロで先行できる。
 
 ### 5.1 REST（T0）
@@ -1047,17 +1048,34 @@ message TagValue {
   T4 スコープ外 - proto ファイル自体をリポジトリ内で版管理し、SDK 生成元
   とする方針（本節冒頭）で足りるとした。
 
-### 5.5 OPC UA（後回し — 判断の記録)
+### 5.5 OPC UA（#201 Phase 2、2026-10-16）
 
-FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
+`banto-opcua-server` を HubRuntime に組み込み、管理 API の
+`GET/PUT /api/opcua-settings` で有効化・再設定する。既定は無効、
+`127.0.0.1:4840/`、名前空間 `urn:banto:opcua:tags`。管理 API は admin
+セッションと CSRF ヘッダを要求する。Hub のコンソール・Windows Service
+は同じ起動・停止経路を使い、OPC UA の bind 等に失敗しても Hub 本体は継続する。
+設定変更と終了時には古い listener と同期タスクを停止する。
 
-- Rust の OPC UA サーバー実装（`opcua` クレート等）は情報モデル・
-  セキュリティポリシー・証明書管理まで含めると検証コストが大きい
-- 国内現場の実態として、上位接続の要求は REST/MQTT で足りるケースが増えている
-- **足場だけ確保**: 外部 IF は全て §4 のタグ空間セマンティクスの薄い皮として
-  実装する規律を守れば、OPC UA も「もう1枚の皮」として後付けできる。
-  タグの外部名・品質3値・タイムスタンプは OPC UA の
-  NodeId / StatusCode / SourceTimestamp へ素直に写像可能
+Hub の TagMap を周期的に照合し、タグの追加・削除・改名・型変更を OPC UA の
+Browse 空間へ反映する。Variable NodeId は `{connection}.{group}.{tag}` の
+外部名で、DB ID に依存しない。改名で NodeId は変わり、旧 NodeId の参照は切れる。
+各名前にドットを含むタグも、元の外部名を NodeId に使う。`string` と試験用サンプルタグは出さない。`bit` は
+Boolean、その他の数値は工学値を Double で公開する。Read は共通の
+`read_current_view` から取り、Good/Bad/Stale を Good/Bad/
+UncertainLastUsableValue に写す。Good の SourceTimestamp は最後の有効サンプル、
+Bad/Stale は品質を認識した時刻で、未知なら設定しない。Read と sampling interval
+が 0 の購読はこの時刻を保持する。非ゼロの sampling interval で遅延した通知は、
+基盤の async-opcua が SourceTimestamp を次のサンプル時刻へ置き換えるため、
+厳密な採取時刻が必要な購読は sampling interval を 0 にする。
+ServerTimestamp は公開時刻。値・品質・ソース/品質時刻が不変なら更新しないので、ServerTimestamp
+だけを理由に DataChange を起こさない。削除・改名は旧 NodeId に
+`BadNodeIdUnknown` を通知する。Read/Subscription のみで Write は拒否する。
+
+Phase 2 は SecurityPolicy None / Anonymous の診断用。既定では loopback のみ、
+LAN 公開は管理者が bind と必要な advertisedHost を明示したときだけ行う。
+資格情報・暗号化・証明書管理を含む本番向け OPC UA は後続 Phase 3 の範囲であり、
+現段階で機密データを載せた LAN 公開はしない。
 
 ### 5.6 認証（全プロトコル共通)
 

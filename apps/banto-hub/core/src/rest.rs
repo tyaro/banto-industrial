@@ -2095,6 +2095,257 @@ fn grpc_settings_router(
         ))
 }
 
+#[derive(Clone)]
+struct OpcUaSettingsAdminState {
+    manager: Arc<CollectorManager>,
+    publisher: Arc<crate::opcua::OpcUaPublisher>,
+    auth: AuthState,
+    audit: AuditLogService,
+    events: broadcast::Sender<ServerEvent>,
+    write_lock: Arc<AsyncMutex<()>>,
+}
+
+async fn opcua_settings_get(
+    State(state): State<OpcUaSettingsAdminState>,
+) -> Result<Json<crate::settings::OpcUaSettings>, ApiError> {
+    let settings = SettingsService::new(Db::Sqlite(state.manager.pool()));
+    Ok(Json(settings.opcua_config().await?))
+}
+
+fn valid_opcua_host(host: &str) -> bool {
+    if host.is_empty() || host != host.trim() {
+        return false;
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return ip.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    let dns = host.strip_suffix('.').unwrap_or(host);
+    dns.len() <= 253
+        && !dns.is_empty()
+        && dns.is_ascii()
+        && dns.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+}
+
+fn unspecified_opcua_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.strip_suffix('.')
+        .unwrap_or(bare)
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+}
+
+pub(crate) fn validate_opcua_settings(config: &crate::settings::OpcUaSettings) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    let mut invalid = |field: &str, message: &str| {
+        errors.push(FieldError {
+            field: field.to_owned(),
+            message: message.to_owned(),
+        })
+    };
+    let bind = config.bind.parse::<IpAddr>();
+    if bind.is_err() {
+        invalid("bind", "IP アドレスを指定してください");
+    }
+    if config.port == 0 {
+        invalid("port", "1〜65535 のポートを指定してください");
+    }
+    if config.endpoint_path.is_empty()
+        || !config.endpoint_path.starts_with('/')
+        || config.endpoint_path.chars().any(char::is_whitespace)
+        || config.endpoint_path.contains(['?', '#'])
+    {
+        invalid("endpointPath", "/ で始まるパスを指定してください");
+    }
+    if config.namespace_uri.is_empty()
+        || config.namespace_uri != config.namespace_uri.trim()
+        || config.namespace_uri == "http://opcfoundation.org/UA/"
+        || config.namespace_uri == "urn:banto:opcua:server"
+    {
+        invalid(
+            "namespaceUri",
+            "標準名前空間と異なる URI を指定してください",
+        );
+    }
+    let host = config.advertised_host.as_deref().filter(|h| !h.is_empty());
+    if let Some(host) = host {
+        if !valid_opcua_host(host) || unspecified_opcua_host(host) {
+            invalid(
+                "advertisedHost",
+                "ホスト名または IP アドレスのみ指定してください",
+            );
+        }
+    }
+    if bind.is_ok_and(|ip| ip.is_unspecified()) && host.is_none() {
+        invalid(
+            "advertisedHost",
+            "全インターフェース待受には公開ホストが必要です",
+        );
+    }
+    errors
+}
+
+async fn opcua_settings_put(
+    State(state): State<OpcUaSettingsAdminState>,
+    headers: HeaderMap,
+    Json(mut config): Json<crate::settings::OpcUaSettings>,
+) -> Result<Json<crate::settings::OpcUaSettings>, ApiError> {
+    if config.advertised_host.as_deref() == Some("") {
+        config.advertised_host = None;
+    }
+    let errors = validate_opcua_settings(&config);
+    if !errors.is_empty() {
+        return Err(ApiError(BantoError::Validation {
+            field_errors: errors,
+        }));
+    }
+    // クライアント切断で設定保存と listener 切り替えが途中停止しないよう切り離す。
+    let applied = tokio::spawn(async move {
+        // 保存と適用を1つの順序にし、並行 PUT の古い listener が最後に
+        // 残ることを防ぐ。
+        let _write_guard = state.write_lock.lock().await;
+        SettingsService::new(Db::Sqlite(state.manager.pool()))
+            .set_opcua_config(&config)
+            .await?;
+        state.publisher.apply(&config).await;
+        record_write(
+            &state.audit,
+            &state.auth,
+            &headers,
+            "update",
+            "opcua_settings",
+            Some("1"),
+            Some(
+                json!({"enabled": config.enabled, "bind": config.bind, "port": config.port,
+                "endpointPath": config.endpoint_path, "namespaceUri": config.namespace_uri,
+                "advertisedHost": config.advertised_host}),
+            ),
+        )
+        .await;
+        let _ = state.events.send(ServerEvent::ResourceChanged {
+            resource: "opcua_settings".to_owned(),
+        });
+        Ok::<_, BantoError>(config)
+    })
+    .await
+    .map_err(|err| ApiError(BantoError::Other(format!("OPC UA 設定タスク: {err}"))))??;
+    Ok(Json(applied))
+}
+
+/// HubRuntime から共通 publisher を渡す管理系の追加ルーター。
+pub(crate) fn opcua_settings_router(
+    manager: Arc<CollectorManager>,
+    publisher: Arc<crate::opcua::OpcUaPublisher>,
+    audit: AuditLogService,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+) -> Router {
+    let state = OpcUaSettingsAdminState {
+        manager,
+        publisher,
+        auth: auth.clone(),
+        audit: audit.clone(),
+        events,
+        write_lock: Arc::new(AsyncMutex::new(())),
+    };
+    Router::new()
+        .route(
+            "/api/opcua-settings",
+            get(opcua_settings_get).put(opcua_settings_put),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            SessionRoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "opcua_settings",
+                audit,
+            },
+            require_session_role,
+        ))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                operation: OperationKind::Normal,
+            },
+            require_session,
+        ))
+        .layer(middleware::from_fn(require_banto_client_header))
+}
+
+#[cfg(test)]
+mod opcua_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_loopback_and_disabled() {
+        let config = crate::settings::OpcUaSettings::default();
+        assert!(!config.enabled);
+        assert_eq!(config.bind, "127.0.0.1");
+        assert_eq!(config.port, 4840);
+        assert_eq!(config.endpoint_path, "/");
+        assert!(validate_opcua_settings(&config).is_empty());
+    }
+
+    #[test]
+    fn unspecified_bind_requires_a_real_advertised_host() {
+        let mut config = crate::settings::OpcUaSettings {
+            enabled: true,
+            bind: "0.0.0.0".to_owned(),
+            ..Default::default()
+        };
+        assert!(validate_opcua_settings(&config)
+            .iter()
+            .any(|e| e.field == "advertisedHost"));
+        config.advertised_host = Some("opcua.example.local".to_owned());
+        assert!(validate_opcua_settings(&config).is_empty());
+        config.advertised_host = Some("opc.tcp://evil:4840/".to_owned());
+        assert!(validate_opcua_settings(&config)
+            .iter()
+            .any(|e| e.field == "advertisedHost"));
+        config.advertised_host = Some("0:0:0:0:0:0:0:0".to_owned());
+        assert!(validate_opcua_settings(&config)
+            .iter()
+            .any(|e| e.field == "advertisedHost"));
+    }
+
+    #[test]
+    fn rejects_invalid_port_path_and_namespace() {
+        let config = crate::settings::OpcUaSettings {
+            port: 0,
+            endpoint_path: "relative".to_owned(),
+            namespace_uri: " ".to_owned(),
+            ..Default::default()
+        };
+        let fields: Vec<_> = validate_opcua_settings(&config)
+            .into_iter()
+            .map(|e| e.field)
+            .collect();
+        assert!(fields.contains(&"port".to_owned()));
+        assert!(fields.contains(&"endpointPath".to_owned()));
+        assert!(fields.contains(&"namespaceUri".to_owned()));
+    }
+}
+
 // --- 書き込み監査の閲覧 (T2-4、設計 §6-3): admin 限定、CSRF + bearer -------
 
 #[derive(Clone)]

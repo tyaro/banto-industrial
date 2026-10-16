@@ -18,6 +18,7 @@ default = []
 embed-ui = ["dep:rust-embed"]
 
 [dependencies]
+banto-opcua-server = { workspace = true }
 banto-core = { workspace = true }
 banto-storage = { workspace = true, features = ["sqlite"] }
 banto-server = { workspace = true }
@@ -133,6 +134,7 @@ protoc-bin-vendored = { workspace = true }
 embed-resource = "3.0"
 
 [dev-dependencies]
+async-opcua = { git = "https://github.com/FreeOpcUa/async-opcua", rev = "1ba60ed14177a2590ee75526af40602987a14123", default-features = false, features = ["client"] }
 # T3（docs/tag-server-design.md §5.3）: `net`は tests/mqtt.rs のポート探索
 # （空きポートへ bind → drop → その番号で rumqttd を起動）と起動確認用の
 # TCP プローブ接続のため - `axum`側の推移的依存で実質的にはこれまでも

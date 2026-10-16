@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-15（§5 に「ChronoGazer のシェルの終了・切り替え・復旧の判断はライフサイクルの表を通す。入り口を足したら表に行を足す」を追加。PR #608 で同じ辺りの競合の指摘が 1 件ずつ出続けた）
+最終更新: 2026-10-16（§2 に「Cargo の生成物は cargo/rustc/linker が動いていないことを確認してから掃除する」を追加。#201 の検証中、リンク中に `target/debug/examples` を消して欠けた object によりテストが失敗した）
+2026-10-15（§5 に「ChronoGazer のシェルの終了・切り替え・復旧の判断はライフサイクルの表を通す。入り口を足したら表に行を足す」を追加。PR #608 で同じ辺りの競合の指摘が 1 件ずつ出続けた）
 2026-10-15（§2 に「実機で Tauri のシェルを動かすときは試験専用の identifier でビルドする」を追加。#392 B2-4b の実機確認で、`APPDATA`・`LOCALAPPDATA` を差し替えても Tauri のデータの場所は隔離されず、オーナーの実データの場所に印を作った）
 2026-10-14（§5 に「並行テストの時間切れは、書き手が終わっていないことと読み手の欠落とを分ける」を追加。#605 の CI）
 2026-10-14（§5 に「`PlcConnection` の列を足すときは `RegistrySnapshot::load_connection` の SELECT も合わせる」を追加。#605）
@@ -52,6 +53,7 @@
 
 1. [ ] **`cargo fmt --all --check`** — **一番忘れる。#385 はこれだけで CI が落ちた。**
 2. [ ] `cargo test -p <触ったクレート>`
+   - [ ] **容量を空けるための `target` 掃除は cargo/rustc/linker が動いていないことを確かめてから行う**。#201 の検証中、別リポジトリと共有した target の `debug/examples` をリンク中に削除し、必要な object がなくなってテストのリンクが失敗した（2026-10-16）。
 3. [ ] `cargo clippy -p <触ったクレート> --all-targets -- -D warnings`
 4. [ ] **`pnpm exec eslint <触った src と e2e>`** — **`pnpm --filter <app> check`（svelte-check）は ESLint を回さない。** CI には両方ある。
 5. [ ] `pnpm --filter <app> check` → `pnpm --filter <app> test`
