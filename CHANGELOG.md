@@ -14,6 +14,9 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
   - profile-id は英数字・`_`・`-` の 64 文字まで（先頭は英数字、予約名を除く）。`reset-password`・`revert-to-commissioning` もこのルートと profile-id の決まりに揃えた。全体の profile-id（`BANTO_HUB_PROFILE` など）も `:`・予約名・末尾の `.` と空白を断る（不正なら従来どおり `default` に戻す）。
   - **確かめ終わるまで何もしない**: 不正な利用者・ルート・profile-id では、ACL を変えないだけでなくフォルダも作らない。`service-install` は確かめが通らなければサービスも登録しない。profile が使用中（サービス・アプリが開いている）なら断る（先に止める）。
   - profile の中のジャンクション・シンボリックリンク・ハードリンク・開けない子は辿らず書かず、警告の行を出す。ルート・`profiles\`・profile そのもの・途中のフォルダがジャンクションなら断る。所有者が SYSTEM・Administrators・指定の利用者・実行した管理者のどれでもなければ断る。ルートと `profiles\` の ACL は変えない。失敗は従来どおり終了コード 1。
+  - **インストーラの `service-install` では、profile が使用中（シェルがトレイに残っているなど）のときだけ、ACL の付け直しを飛ばして終了コード 0 で終わる**（サービスの登録・Operators・サービス ACL は済む。警告はインストーラには表示されないので、止めてから `grant-profile-acl` を手で実行する）。手で実行する `grant-profile-acl` は使用中なら断る。
+  - 拒否の ACE を持つ利用者は引き継がない（拒否が消えて権利が広がるため。警告の行）。ルート・`profiles\` の所有者で断ったときは、所有者を Administrators に取り直す手順を案内する。SID の引数は `S-1-` を大文字で書く。
+  - `reset-password`・`revert-to-commissioning` は、DB を開く前に `profiles\`・profile・`config\` と DB のファイルを辿らずに開いて確かめ、ジャンクション・シンボリックリンク・ハードリンク・本当の場所の食い違いなら DB を開かずに断る。
   - `BANTO_DB`・`BANTO_HUB_DATA` で profile の外に置いた DB・データは対象外。詳細と既知の制限は docs/banto-hub-operations.md §11「profile ディレクトリの権限（ACL）」。
 
 ## v0.2.0-alpha.30 — 2026-10-16（アルファ）
