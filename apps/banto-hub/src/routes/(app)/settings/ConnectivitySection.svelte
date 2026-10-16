@@ -26,6 +26,8 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { saveMqttSettings } from '#lib/banto/mqttSettingsAdmin.js';
 	import { saveGrpcSettings } from '#lib/banto/grpcSettingsAdmin.js';
+	import { getOpcUaSettings, saveOpcUaSettings } from '#lib/banto/opcuaSettingsAdmin.js';
+	import { isLanExposure, validateOpcUaSettings } from '#lib/banto/opcuaSettingsForm.js';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { errorMessage } from './shared';
 	import { mqttSettingsStore } from './mqttSettingsStore.svelte';
@@ -34,6 +36,7 @@
 
 	const canManageMqtt = $derived(isAdmin(sessionStore.role));
 	const canManageGrpc = $derived(isAdmin(sessionStore.role));
+	const canManageOpcUa = $derived(isAdmin(sessionStore.role));
 
 	const mqttQosOptions: { value: 0 | 1; label: string }[] = [
 		{ value: 0, label: '0（At most once）' },
@@ -136,6 +139,98 @@
 			grpcError = errorMessage(err);
 		} finally {
 			grpcSaving = false;
+		}
+	}
+
+	let opcUaLoaded = $state(false);
+	let opcUaLoadFailed = $state(false);
+	let opcUaSaving = $state(false);
+	let opcUaError: string | null = $state(null);
+	let opcUaEnabled = $state(false);
+	let opcUaSavedEnabled = $state(false);
+	let opcUaBind = $state('127.0.0.1');
+	let opcUaPort = $state(4840);
+	let opcUaEndpointPath = $state('/');
+	let opcUaNamespaceUri = $state('urn:banto:opcua:tags');
+	let opcUaAdvertisedHost = $state('');
+	const opcUaLanExposure = $derived(isLanExposure(opcUaBind, opcUaAdvertisedHost));
+
+	$effect(() => {
+		if (!canManageOpcUa) return;
+		let cancelled = false;
+		(async () => {
+			try {
+				const loaded = await getOpcUaSettings();
+				if (cancelled) return;
+				applyOpcUaSettings(loaded);
+			} catch (err) {
+				if (!cancelled) {
+					opcUaLoadFailed = true;
+					opcUaError = errorMessage(err);
+				}
+			} finally {
+				if (!cancelled) opcUaLoaded = true;
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	async function retryLoadOpcUaSettings(): Promise<void> {
+		opcUaError = null;
+		opcUaLoaded = false;
+		try {
+			applyOpcUaSettings(await getOpcUaSettings());
+			opcUaLoadFailed = false;
+		} catch (err) {
+			opcUaError = errorMessage(err);
+		} finally {
+			opcUaLoaded = true;
+		}
+	}
+
+	function applyOpcUaSettings(settings: {
+		enabled: boolean;
+		bind: string;
+		port: number;
+		endpointPath: string;
+		namespaceUri: string;
+		advertisedHost: string | null;
+	}): void {
+		opcUaEnabled = settings.enabled;
+		opcUaSavedEnabled = settings.enabled;
+		opcUaBind = settings.bind;
+		opcUaPort = settings.port;
+		opcUaEndpointPath = settings.endpointPath;
+		opcUaNamespaceUri = settings.namespaceUri;
+		opcUaAdvertisedHost = settings.advertisedHost ?? '';
+	}
+
+	async function submitOpcUaSettings(event: SubmitEvent): Promise<void> {
+		event.preventDefault();
+		opcUaError = null;
+		const input = {
+			enabled: opcUaEnabled,
+			bind: opcUaBind.trim(),
+			port: opcUaPort,
+			endpointPath: opcUaEndpointPath.trim(),
+			namespaceUri: opcUaNamespaceUri.trim(),
+			advertisedHost: opcUaAdvertisedHost.trim() || null
+		};
+		const validationError = validateOpcUaSettings(input);
+		if (validationError) {
+			opcUaError = validationError;
+			return;
+		}
+		opcUaSaving = true;
+		try {
+			applyOpcUaSettings(await saveOpcUaSettings(input));
+			toastStore.push('success', 'OPC UA 設定を保存しました(即時適用されます)');
+		} catch (err) {
+			opcUaError = errorMessage(err);
+		} finally {
+			opcUaSaving = false;
 		}
 	}
 </script>
@@ -267,6 +362,83 @@
 					REST/WebSocket とは別ポートで listen します(既定 50051)。無効化中はこのポートで一切 listen
 					しません。
 				</p>
+			</form>
+		{:else}
+			<p class="note">読み込み中...</p>
+		{/if}
+	</section>
+{/if}
+
+{#if canManageOpcUa}
+	<section>
+		<h2>
+			OPC UA
+			<span
+				class="status-pill"
+				class:ok={opcUaLoaded && !opcUaLoadFailed && opcUaSavedEnabled}
+				class:bad={!opcUaLoaded || opcUaLoadFailed || !opcUaSavedEnabled}
+			>
+				{opcUaLoaded && !opcUaLoadFailed
+					? `設定: ${opcUaSavedEnabled ? '有効' : '無効'}`
+					: '設定: 未確認'}
+			</span>
+		</h2>
+		{#if opcUaLoaded && opcUaLoadFailed}
+			<p class="error" role="alert">{opcUaError}</p>
+			<button type="button" onclick={retryLoadOpcUaSettings}>再読み込み</button>
+		{:else if opcUaLoaded}
+			<form onsubmit={submitOpcUaSettings}>
+				<p class="note">
+					上の表示は保存済みの設定です。実際の待受状態や起動失敗は Hub
+					の診断ログで確認してください。
+				</p>
+				<label class="field checkbox">
+					<input type="checkbox" bind:checked={opcUaEnabled} />
+					OPC UA サーバーを有効にする
+				</label>
+				<label class="field">
+					Bind アドレス
+					<input type="text" bind:value={opcUaBind} placeholder="127.0.0.1" required />
+				</label>
+				<label class="field">
+					ポート
+					<input type="number" min="1" max="65535" step="1" bind:value={opcUaPort} required />
+				</label>
+				<label class="field">
+					エンドポイントパス
+					<input type="text" bind:value={opcUaEndpointPath} placeholder="/" required />
+				</label>
+				<label class="field">
+					Namespace URI
+					<input
+						type="text"
+						bind:value={opcUaNamespaceUri}
+						placeholder="urn:banto:opcua:tags"
+						required
+					/>
+				</label>
+				<label class="field">
+					公開ホスト（任意）
+					<input type="text" bind:value={opcUaAdvertisedHost} placeholder="例: hub.example.local" />
+				</label>
+				<p class="note">
+					0.0.0.0 または :: で待ち受ける場合は、クライアントが接続するホスト名または IP
+					アドレスを入力してください。ポートや URL は不要です。
+				</p>
+				{#if opcUaLanExposure}
+					<p class="error" role="alert">
+						LAN への公開に注意: この OPC UA サーバーは SecurityPolicy None / Anonymous
+						のみです。認証・暗号化なしでタグ値が読めるため、信頼できる閉域網でのみ有効にしてください。
+					</p>
+				{:else}
+					<p class="note">
+						SecurityPolicy None / Anonymous のみ対応します。既定ではこの PC からのみ接続できます。
+					</p>
+				{/if}
+				{#if opcUaError}
+					<p class="error" role="alert">{opcUaError}</p>
+				{/if}
+				<button type="submit" disabled={opcUaSaving}>保存(即時適用)</button>
 			</form>
 		{:else}
 			<p class="note">読み込み中...</p>
