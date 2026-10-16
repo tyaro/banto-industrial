@@ -3970,8 +3970,9 @@ mod tests {
     #[test]
     fn sim_warning_due_table() {
         let text = "注意 A";
+        type Last = Option<(String, i64)>;
         let last = |t: &str, at: i64| Some((t.to_string(), at));
-        let cases: Vec<(&str, Option<(String, i64)>, i64, bool)> = vec![
+        let cases: Vec<(&str, Last, i64, bool)> = vec![
             (
                 "前に出していない（起動直後・再び有効にした）",
                 None,
