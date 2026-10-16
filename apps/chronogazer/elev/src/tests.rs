@@ -527,8 +527,13 @@ struct Fake {
     final_paths: BTreeMap<PathBuf, PathBuf>,
     /// 既知のフォルダ（`known_folders`）。
     known: Result<KnownFolders, String>,
-    /// `create_dir` が作るフォルダの所有者（`None` なら作ったと言うが置かない＝消された）。
+    /// `create_child` が作るフォルダの所有者。`None` なら「確かめてから作るまでの間に誰かが
+    /// 作った」（`create_child` は `Ok(None)`）: そのとき `raced` にあるものだけが、親の
+    /// ハンドルから相対で開いたとき（`open_child`）に見える（パスで開くと見えない）。
+    /// `raced` にも無ければ、開き直すと無くなっていた。
     created_owner: Option<String>,
+    /// 相対で開いたときだけ見えるフォルダ（`created_owner` が `None` のとき）。
+    raced: BTreeMap<PathBuf, PinnedDirInfo>,
     create_error: Option<PathBuf>,
     reset_error: Option<PathBuf>,
     pin_error: Option<PathBuf>,
@@ -578,7 +583,7 @@ fn ok_report() -> InstallReport {
 
 impl Fake {
     fn new() -> Self {
-        Self {
+        let fake = Self {
             log: Rc::new(RefCell::new(Vec::new())),
             server_exe: Ok(exe_path()),
             program_files: vec![PathBuf::from(PF), PathBuf::from(PF86)],
@@ -601,10 +606,41 @@ impl Fake {
             final_paths: BTreeMap::new(),
             known: Ok(known()),
             created_owner: Some("S-1-5-32-544".to_string()),
+            raced: BTreeMap::new(),
             create_error: None,
             reset_error: None,
             pin_error: None,
             reset_skips: BTreeMap::new(),
+        };
+        // ルートの親（ProgramData。SYSTEM の所有）。無いルートは、これを開いて確かめてから
+        // その下に相対で作る（#642）。
+        fake.dirs.borrow_mut().insert(
+            PathBuf::from(PD),
+            PinnedDirInfo {
+                is_dir: true,
+                is_reparse_point: false,
+                owner: "S-1-5-18".to_string(),
+            },
+        );
+        fake
+    }
+
+    fn pinned(&self, dir: &Path, info: PinnedDirInfo) -> FakePinned {
+        let final_path = self
+            .final_paths
+            .get(dir)
+            .cloned()
+            .unwrap_or_else(|| dir.to_path_buf());
+        FakePinned {
+            path: dir.to_path_buf(),
+            final_path,
+            info,
+            reset: if self.reset_error.as_deref() == Some(dir) {
+                Err("os error 5".to_string())
+            } else {
+                Ok(self.reset_skips.get(dir).cloned().unwrap_or_default())
+            },
+            log: self.log.clone(),
         }
     }
 
@@ -722,43 +758,46 @@ impl ElevOps for Fake {
             return Err("os error 32".to_string());
         }
         let shared = self.dirs.borrow().get(dir).cloned();
-        let final_path = self
-            .final_paths
-            .get(dir)
-            .cloned()
-            .unwrap_or_else(|| dir.to_path_buf());
-        Ok(shared.map(|info| FakePinned {
-            path: dir.to_path_buf(),
-            final_path,
-            info,
-            reset: if self.reset_error.as_deref() == Some(dir) {
-                Err("os error 5".to_string())
-            } else {
-                Ok(self.reset_skips.get(dir).cloned().unwrap_or_default())
-            },
-            log: self.log.clone(),
-        }))
+        Ok(shared.map(|info| self.pinned(dir, info)))
     }
-    fn create_dir(&self, dir: &Path, access: &DirAccess) -> Result<bool, String> {
+    fn create_child(
+        &self,
+        parent: &FakePinned,
+        name: &str,
+        access: &DirAccess,
+    ) -> Result<Option<Self::Pinned>, String> {
+        let dir = parent.path.join(name);
         self.record(format!(
             "create {} {}",
             dir.display(),
             access.install_user().map_or("-", InstallUserSid::as_str)
         ));
-        if self.create_error.as_deref() == Some(dir) {
+        if self.create_error.as_deref() == Some(dir.as_path()) {
             return Err("os error 5".to_string());
         }
-        if let Some(owner) = &self.created_owner {
-            self.dirs.borrow_mut().insert(
-                dir.to_path_buf(),
-                PinnedDirInfo {
-                    is_dir: true,
-                    is_reparse_point: false,
-                    owner: owner.clone(),
-                },
-            );
+        if self.dirs.borrow().contains_key(&dir) {
+            return Ok(None);
         }
-        Ok(true)
+        let Some(owner) = &self.created_owner else {
+            return Ok(None);
+        };
+        let info = PinnedDirInfo {
+            is_dir: true,
+            is_reparse_point: false,
+            owner: owner.clone(),
+        };
+        self.dirs.borrow_mut().insert(dir.clone(), info.clone());
+        Ok(Some(self.pinned(&dir, info)))
+    }
+    fn open_child(&self, parent: &FakePinned, name: &str) -> Result<Option<Self::Pinned>, String> {
+        let dir = parent.path.join(name);
+        self.record(format!("open {}", dir.display()));
+        let found = self
+            .raced
+            .get(&dir)
+            .cloned()
+            .or_else(|| self.dirs.borrow().get(&dir).cloned());
+        Ok(found.map(|info| self.pinned(&dir, info)))
     }
 }
 
@@ -808,9 +847,11 @@ fn service_install_runs_every_step_in_order() {
             // ACL の利用者は登録の後に残る記録の SID）。
             "read_install_user".to_string(),
             format!("pin {}", root.display()),
+            // #642: 無いルートは、親（ProgramData）を辿らずに開いて確かめてから、その
+            // ハンドルを基準に相対で作る（作ったハンドルをそのまま使い、パスで開き直さない）。
+            format!("pin {PD}"),
             // 監査 Must: 作るのは SYSTEM・Administrators だけ（利用者 ACE 無し = `-`）。
             format!("create {} -", root.display()),
-            format!("pin {}", root.display()),
             // 確かめが通ってから、利用者の「変更」を付ける（ルートは tree）。
             format!("reset {} {USER} tree", root.display()),
             format!("install {} {USER} {}", exe_path().display(), root.display()),
@@ -829,8 +870,8 @@ fn service_install_runs_every_step_in_order() {
             format!("pin {}", root.display()),
             format!("reset {} {USER} tree", root.display()),
             format!("pin {}", secrets().display()),
+            // 確かめ済みのルートのハンドルを基準に作る（#642）。
             format!("create {} -", secrets().display()),
-            format!("pin {}", secrets().display()),
             // secrets はルートの再帰で書かれているので object だけ（監査 Nit 3）。
             format!("reset {} {USER} object", secrets().display()),
             format!("pin {}", hub_keys().display()),
@@ -866,8 +907,10 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert_eq!(code, EXIT_OK);
     let calls = fake.calls();
     assert_eq!(calls[2], format!("check {OTHER}"));
-    // 監査 Must: ルートを作るのは SYSTEM・Administrators だけ（利用者 ACE 無し）。
-    assert_eq!(calls[5], format!("create {} -", root_path().display()));
+    // 監査 Must: ルートを作るのは SYSTEM・Administrators だけ（利用者 ACE 無し）。親（#642）を
+    // 開いて確かめた後。
+    assert_eq!(calls[5], format!("pin {PD}"));
+    assert_eq!(calls[6], format!("create {} -", root_path().display()));
     // 利用者の「変更」は、本当のパスを確かめた後の reset でだけ付く（記録が無い = 渡した SID）。
     assert_eq!(
         calls[7],
@@ -1620,7 +1663,8 @@ fn a_dir_swapped_right_after_creation_is_refused() {
     assert_eq!(code, EXIT_FAILED);
     assert!(resets(&fake).is_empty());
 
-    // 作ったと言うのに開けない（消された）ときも、作り直さずに止める。
+    // 作ろうとしたら既にあり、親のハンドルから相対で開き直すと無くなっていた（消された）
+    // ときも、作り直さずに止める。
     let mut fake = Fake::new();
     fake.created_owner = None;
     let (code, lines) = exec(Action::GrantDataAcl, &fake);
@@ -1632,9 +1676,197 @@ fn a_dir_swapped_right_after_creation_is_refused() {
             .count(),
         1
     );
-    assert!(lines.iter().any(
-        |l| matches!(l, ConsoleLine::Stderr(t) if t.contains("を作った後に開けませんでした"))
-    ));
+    assert!(lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+        if t.contains("を作ろうとしたら既にあり、開き直すと無くなっていました"))));
+}
+
+// --- #642: 作る経路は確かめ済みの親のハンドル基準 -----------------------------------
+
+/// 無いルートは、親を辿らずに開いて確かめた**後で**、そのハンドルを基準に作る（golden）。
+/// `secrets\` も、確かめ済みのルートのハンドルを基準に作る。作った後に開き直さない。
+#[test]
+fn a_missing_root_is_created_under_the_checked_parent() {
+    let fake = Fake::new();
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_OK, "{lines:#?}");
+    let root = root_path();
+    assert_eq!(
+        fake.calls(),
+        vec![
+            "read_install_user".to_string(),
+            format!("check {USER}"),
+            "machine_root".to_string(),
+            format!("pin {}", root.display()),
+            format!("pin {PD}"),
+            format!("create {} -", root.display()),
+            format!("reset {} {USER} tree", root.display()),
+            format!("pin {}", secrets().display()),
+            format!("create {} -", secrets().display()),
+            format!("reset {} {USER} object", secrets().display()),
+            format!("pin {}", hub_keys().display()),
+        ]
+    );
+}
+
+/// ルートの親が無ければ、何も作らずに 2（前提が無い。親から作ることはしない）。
+/// `service-install` も何も登録しない。
+#[test]
+fn a_missing_root_parent_creates_nothing_and_is_a_precondition() {
+    let install = Action::ServiceInstall {
+        install_user_sid: None,
+    };
+    for action in [Action::GrantDataAcl, install] {
+        let fake = Fake::new();
+        fake.dirs.borrow_mut().remove(&PathBuf::from(PD));
+        let (code, lines) = exec(action.clone(), &fake);
+        assert_eq!(code, EXIT_PRECONDITION, "{action:?} {lines:#?}");
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("create") || c.starts_with("install")),
+            "{action:?}"
+        );
+        assert!(
+            lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+                if t.contains(&format!("の親（{PD}）がありません。親から作ることはしません")))),
+            "{lines:#?}"
+        );
+    }
+}
+
+/// ルートの親の確かめが通らなければ（本当のパスの食い違い・reparse point・ファイル・
+/// OS の置き場の中）、何も作らずに 1。`service-install` も何も登録しない。
+#[test]
+fn a_root_parent_that_fails_the_check_creates_nothing() {
+    let pd = PathBuf::from(PD);
+    type Tweak = Box<dyn Fn(Fake) -> Fake>;
+    let cases: Vec<(&str, Tweak, &str)> = vec![
+        (
+            "mismatch",
+            Box::new(|f: Fake| f.with_final_path(PathBuf::from(PD), PathBuf::from(PF))),
+            "本当の場所",
+        ),
+        (
+            "reparse",
+            Box::new(|f: Fake| f.with_dir(PathBuf::from(PD), true, true, "S-1-5-18")),
+            "reparse point",
+        ),
+        (
+            "file",
+            Box::new(|f: Fake| f.with_dir(PathBuf::from(PD), false, false, "S-1-5-18")),
+            "フォルダではありません",
+        ),
+    ];
+    for (case, tweak, needle) in cases {
+        for action in [
+            Action::GrantDataAcl,
+            Action::ServiceInstall {
+                install_user_sid: None,
+            },
+        ] {
+            let fake = tweak(Fake::new());
+            let (code, lines) = exec(action.clone(), &fake);
+            assert_eq!(code, EXIT_FAILED, "{case} {action:?} {lines:#?}");
+            assert!(
+                !fake
+                    .calls()
+                    .iter()
+                    .any(|c| c.starts_with("create") || c.starts_with("install")),
+                "{case} {action:?}"
+            );
+            assert!(
+                lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+                    if t.contains(&format!("の親（{}）は", pd.display()))
+                        && t.contains(needle)
+                        && t.contains("何も作らずに止めます"))),
+                "{case} {lines:#?}"
+            );
+        }
+    }
+    // OS・プログラムの置き場の中の親（CHRONOGAZER_ROOT が Program Files の下を指す）。
+    let pf_child = PathBuf::from(PF).join("x");
+    let mut fake = Fake::new().with_dir(pf_child.clone(), true, false, "S-1-5-18");
+    fake.root = Ok(pf_child.join("ChronoGazer"));
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_FAILED, "{lines:#?}");
+    assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("OS・プログラムの置き場か共有のフォルダ") && t.contains("何も作らずに止めます"))),
+        "{lines:#?}"
+    );
+}
+
+/// 確かめてから作るまでの間に誰かが作っていたフォルダは、**パスではなく親のハンドルから
+/// 相対で**開き直して確かめる（偽物では相対で開いたときだけ見える）。自分で作ったもの
+/// ではないので「作りました」ではなく、確かめが通らなければ「残っています」も出さない。
+#[test]
+fn a_dir_created_by_someone_else_is_reopened_relative_to_the_parent() {
+    let mut fake = Fake::new();
+    fake.created_owner = None;
+    fake.raced.insert(
+        root_path(),
+        PinnedDirInfo {
+            is_dir: true,
+            is_reparse_point: false,
+            owner: "S-1-5-32-544".to_string(),
+        },
+    );
+    fake.raced.insert(
+        secrets(),
+        PinnedDirInfo {
+            is_dir: true,
+            is_reparse_point: false,
+            owner: USER.to_string(),
+        },
+    );
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_OK, "{lines:#?}");
+    let calls = fake.calls();
+    assert_eq!(
+        calls[3..],
+        [
+            format!("pin {}", root_path().display()),
+            format!("pin {PD}"),
+            format!("create {} -", root_path().display()),
+            format!("open {}", root_path().display()),
+            format!("reset {} {USER} tree", root_path().display()),
+            format!("pin {}", secrets().display()),
+            format!("create {} -", secrets().display()),
+            format!("open {}", secrets().display()),
+            format!("reset {} {USER} object", secrets().display()),
+            format!("pin {}", hub_keys().display()),
+        ]
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|l| !matches!(l, ConsoleLine::Stdout(t) if t.contains("作りました"))),
+        "{lines:#?}"
+    );
+
+    // 誰かが作ったものが見知らぬ所有者なら断るが、自分で作ったものではないので
+    // 「残っています」は出さない。
+    let mut fake = Fake::new();
+    fake.created_owner = None;
+    fake.raced.insert(
+        root_path(),
+        PinnedDirInfo {
+            is_dir: true,
+            is_reparse_point: false,
+            owner: STRANGER.to_string(),
+        },
+    );
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_FAILED, "{lines:#?}");
+    assert!(resets(&fake).is_empty());
+    assert!(
+        !lines
+            .iter()
+            .any(|l| matches!(l, ConsoleLine::Stderr(t) if t.contains("残っています"))),
+        "{lines:#?}"
+    );
 }
 
 #[test]
