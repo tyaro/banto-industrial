@@ -38,6 +38,13 @@
 //!   判断は純関数で、断る理由は型の付いた値で返す（文言は製品の elev が持つ）。
 //!   ChronoGazer の `chronogazer-elev` が使い、banto-hub の `banto-hub-elev` も #626 PR-B で
 //!   使う。
+//! - 置き場とファイルが保護されているか（#630。banto-hub-sink の設定ファイル）:
+//!   [`acl::inspect_file`]（辿らずに開いて、属性・リンク数・所有者・DACL をハンドルから読む）
+//!   と、その結果から「保護されていない」理由を 1 条件 1 理由で返す純関数 [`acl::exposure`]。
+//!   確かめ済みのフォルダのハンドルを基準に、子のファイルを辿らずに開いてそのハンドルのまま
+//!   読む `PinnedDir::open_child_file`・保護された DACL と所有者 Administrators を作るのと
+//!   同時に付けて作る `PinnedDir::create_child_file`（失敗したら作ったハンドルで消す）。
+//!   利用者を持たない置き場の判断は [`acl::guard::dir_acl_plan`]。
 //! - `impl banto_hub_bootstrap::KeyStore for FileSecretStore<_>`（`src/keystore.rs`）。
 //!
 //! # DPAPI machine スコープの意味と限界（計画書 §6）

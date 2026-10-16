@@ -34,7 +34,8 @@
 //! - [`is_plain_child_name`]・[`is_reserved_device_name`] は、親のハンドルを基準に作る・
 //!   開く名前 1 要素の確かめ（`NtCreateFile` は Win32 の正規化を通らないため。#642）。
 //! - [`data_acl_plan`] は、開いたフォルダの属性と所有者から、作る・書き直す・断るを決める
-//!   （reparse point・フォルダでない・見知らぬ所有者を断る）。
+//!   （reparse point・フォルダでない・見知らぬ所有者を断る）。対象の利用者を持たない置き場
+//!   （banto-hub-sink の `sink\`、#630）は [`dir_acl_plan`] に `None` を渡す。
 //! - [`plan_carry_over`] は、書き直す前の DACL（`PinnedDir::read_dacl`）から、**引き継ぐ
 //!   利用者**（明示の許可で「変更」相当、`SidTypeUser`、拒否の ACE を持たない）と
 //!   **落とすもの**（グループ・well-known・継承・拒否・拒否を持つ利用者など）を分ける。banto-hub の `grant-profile-acl` が、今の
@@ -391,6 +392,18 @@ pub fn data_acl_plan(
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
 ) -> Result<DataAclStep, DataAclRefusal> {
+    dir_acl_plan(state, Some(install_user), elevated_user)
+}
+
+/// [`data_acl_plan`] の、対象の利用者を持たない置き場でも使える形（#630。banto-hub-sink の
+/// 置き場 `sink\` は SYSTEM・Administrators だけで、利用者の ACE を付けない -
+/// `DirAccess::service_only`）。`install_user` が `None` なら、所有者として許すのは
+/// SYSTEM・Administrators・`elevated_user` だけ。`Some` なら [`data_acl_plan`] と同じ。
+pub fn dir_acl_plan(
+    state: &DirState,
+    install_user: Option<&InstallUserSid>,
+    elevated_user: Option<&str>,
+) -> Result<DataAclStep, DataAclRefusal> {
     let info = match state {
         DirState::Absent => return Ok(DataAclStep::Create),
         DirState::Present(info) => info,
@@ -404,7 +417,7 @@ pub fn data_acl_plan(
     let owner = info.owner.as_str();
     let allowed = owner == SYSTEM_SID
         || owner == ADMINISTRATORS_SID
-        || owner == install_user.as_str()
+        || install_user.is_some_and(|user| owner == user.as_str())
         || elevated_user == Some(owner);
     if !allowed {
         return Err(DataAclRefusal::ForeignOwner(owner.to_string()));

@@ -153,12 +153,44 @@
 //!   - 【仮説】ファイル ID は volume 内で安定で、`OpenFileById` はその object を開く - ID が
 //!     別の object に再割り当てされる窓は無い前提（ID で開いた後も属性をハンドルから確かめる）。
 //!
+//! # 置き場とファイルが保護されているか・ハンドル基準の子のファイル（#630）
+//!
+//! banto-hub-sink の設定ファイル（Hub の API キー入り）を、SYSTEM・Administrators だけの
+//! 置き場 `%ProgramData%\BantoHub\sink\` に置き、**保護されていなければ起動しない**
+//! （2026-10-17 オーナー決定）ための部品。sink・`banto-hub-elev` への配線は #630 の PR-2。
+//!
+//! - **辿らずに読む**: [`inspect_file`] はパスを `FILE_FLAG_OPEN_REPARSE_POINT |
+//!   FILE_FLAG_BACKUP_SEMANTICS` で開き（最後の要素がリンクでもそのもの。中身は求めない）、
+//!   属性・リンク数・所有者・DACL を**開いたハンドルから**読んで [`FileSecurity`] で返す。
+//!   ACE の読み方は `PinnedDir::read_dacl` と同じ（#641: 条件付き・オブジェクトの ACE の
+//!   SID も読み、種類の分からない・形の壊れた ACE は SID を空にする）。確かめ済みのフォルダの
+//!   `PinnedDir::security` も同じ形で返す。
+//! - **判定は純関数**: [`exposure`] は [`FileSecurity`] から「保護されていない」理由を、
+//!   1 条件 1 理由の [`Exposure`] ですべて返す（空なら保護されている）。reparse point・
+//!   ファイルでリンク数 2 以上・所有者が SYSTEM・Administrators・TrustedInstaller 以外・
+//!   null DACL・それら以外への**許可**の ACE（条件付き・オブジェクトの許可、継承・
+//!   `INHERIT_ONLY` の ACE も）・種類の分からない ACE・SID が読めない ACE。拒否の ACE は
+//!   狭める方向なので、それ自体では理由にしない。実効権限は計算せず、ACE の SID の
+//!   許可リストで判定する（グループの入れ子・条件の評価をしない分、多めに断る側に倒す）。
+//! - **ハンドル基準の子のファイル**: `PinnedDir::open_child_file` は確かめ済みのフォルダの
+//!   ハンドルを基準に、名前 1 要素の子を辿らずに読み取りだけで開き（共有に削除を含めない）、
+//!   `PinnedFile::read_to_end` は**そのハンドルのまま**読む（確かめてから読むまでの間に
+//!   すり替えられない）。`PinnedDir::create_child_file` は新しいファイルを、保護された DACL
+//!   （SYSTEM・Administrators にフル、継承のフラグなし）と所有者 Administrators を**作るのと
+//!   同時に**付けて作り、書いて書き出し、読み戻して [`exposure`] が空であることを確かめる。
+//!   途中で失敗した・保護されていなかったときは、作ったハンドルで（`FileDispositionInfo`）
+//!   消してから失敗を返す。どれも `PinnedDir::create_child_dir`・`PinnedDir::open_child_dir`
+//!   と同じ `NtCreateFile` の相対の作り（`child_relative`）で、名前は
+//!   [`guard::is_plain_child_name`] で確かめる。
+//! - 対象の利用者を持たない置き場の、作る・書き直す・断るの判断は
+//!   [`guard::dir_acl_plan`]（`install_user` に `None`）。
+//!
 //! # 非 Windows
 //!
-//! DACL の概念が無いので、作る・確かめる・直すはどれも
+//! DACL の概念が無いので、作る・確かめる・直す・[`inspect_file`] はどれも
 //! [`SecretStoreError::UnsupportedPlatform`] を返す（黙って成功にしない）。
-//! [`InstallUserSid`] の文字列の検査と [`check_dacl`] の判定は純関数で、全 OS で
-//! テストする。
+//! [`InstallUserSid`] の文字列の検査と [`check_dacl`]・[`exposure`] の判定は純関数で、
+//! 全 OS でテストする。
 
 pub mod guard;
 
@@ -486,6 +518,135 @@ pub struct PinnedDirInfo {
     pub owner: String,
 }
 
+/// TrustedInstaller（`NT SERVICE\TrustedInstaller`）。OS の部品の所有者で、[`exposure`] は
+/// SYSTEM・Administrators と同じく信頼する（Administrators より強い主体なので、許しても
+/// 境界は広がらない）。
+pub const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// 辿らずに開いたファイル・フォルダの、**開いたハンドルから**読んだ属性と記述子（#630。
+/// [`inspect_file`]・`PinnedDir::security`・`PinnedFile::security`）。[`exposure`] の入力。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileSecurity {
+    /// フォルダか（`FILE_ATTRIBUTE_DIRECTORY`）。偽ならファイル。
+    pub is_dir: bool,
+    /// reparse point か（ジャンクション・シンボリックリンクなど、種類を問わない）。
+    pub is_reparse_point: bool,
+    /// ハードリンクの数（`nNumberOfLinks`）。ファイルで 2 以上なら、記述子を共有する別の
+    /// 名前がある。
+    pub links: u32,
+    /// 所有者・保護の有無（`SE_DACL_PROTECTED`）・DACL（null DACL は `aces: None`）。ACE の
+    /// 読み方は [`PinnedDir::read_dacl`] と同じ（条件付き・オブジェクトの ACE の SID も読み、
+    /// 種類の分からない ACE・形の壊れた ACE は SID が空）。
+    pub dacl: ObservedDacl,
+}
+
+/// [`exposure`] が「保護されていない」と判定した理由（1 条件 1 理由。#630）。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Exposure {
+    /// reparse point（ジャンクション・シンボリックリンクなど。辿った先は確かめていない）。
+    ReparsePoint,
+    /// ファイルで、リンク数が 2 以上（記述子を共有する別の名前が、保護されていない場所に
+    /// ありうる）。中身はリンク数。
+    HardLinked(u32),
+    /// 所有者が SYSTEM・Administrators・TrustedInstaller 以外（所有者は DACL に関わらず
+    /// ACL を書き換えられる）。中身は所有者の SID。
+    ForeignOwner(String),
+    /// null DACL（全員にフルアクセス）。
+    NullDacl,
+    /// SYSTEM・Administrators・TrustedInstaller 以外への**許可**の ACE（普通の許可のほか、
+    /// 条件付き・オブジェクトの許可も。継承された ACE・`INHERIT_ONLY` の ACE も - フォルダ
+    /// ではこれから作るファイルへ伝わるため、区別せず数える）。
+    AllowsOther {
+        ace_type: u8,
+        flags: u8,
+        mask: u32,
+        sid: String,
+    },
+    /// 種類の分からない ACE（許可か拒否か分からないので、安全側に数える）。
+    UnknownAce { ace_type: u8, flags: u8, mask: u32 },
+    /// SID が読めない ACE（形が壊れている。拒否の種類でも、相手が分からないので数える）。
+    UnreadableSid { ace_type: u8, flags: u8, mask: u32 },
+}
+
+/// 信頼する主体（[`exposure`] の所有者と許可の ACE の相手）。
+fn is_trusted_sid(sid: &str) -> bool {
+    sid == SYSTEM_SID || sid == ADMINISTRATORS_SID || sid == TRUSTED_INSTALLER_SID
+}
+
+/// 置き場（フォルダ）・ファイルが**保護されていない**理由を、すべて返す（純関数、#630。空なら
+/// 保護されている）。sink の設定ファイル（Hub の API キー入り）のように、SYSTEM と
+/// Administrators だけが読み書きできるべきものの確かめに使う。見る順（返す順）:
+///
+/// 1. reparse point → [`Exposure::ReparsePoint`]。
+/// 2. ファイルでリンク数 2 以上 → [`Exposure::HardLinked`]。
+/// 3. 所有者が信頼する主体（SYSTEM・Administrators・TrustedInstaller）以外 →
+///    [`Exposure::ForeignOwner`]。
+/// 4. null DACL → [`Exposure::NullDacl`]（ACE は見ない）。
+/// 5. DACL の ACE を順に（1 つの ACE から理由は高々 1 つ）:
+///    - 種類が分からない → [`Exposure::UnknownAce`]。
+///    - SID が読めない → [`Exposure::UnreadableSid`]。
+///    - 拒否（条件付き・オブジェクトを含む）→ 理由にしない（狭める方向なので）。
+///    - 許可（普通・条件付き・オブジェクト）で、相手が信頼する主体以外 →
+///      [`Exposure::AllowsOther`]。マスク・継承のフラグは問わない（実効権限は計算しない。
+///      ACE の SID の許可リストで判定し、多めに断る側に倒す）。
+///
+/// DACL が保護されているか（`protected`）はそれ自体では理由にしない（継承した ACE も、相手が
+/// 信頼する主体だけなら保護されている。相手が違えば上の 5 で数える）。
+pub fn exposure(security: &FileSecurity) -> Vec<Exposure> {
+    let mut found = Vec::new();
+    if security.is_reparse_point {
+        found.push(Exposure::ReparsePoint);
+    }
+    if !security.is_dir && security.links >= 2 {
+        found.push(Exposure::HardLinked(security.links));
+    }
+    if !is_trusted_sid(&security.dacl.owner) {
+        found.push(Exposure::ForeignOwner(security.dacl.owner.clone()));
+    }
+    let Some(aces) = &security.dacl.aces else {
+        found.push(Exposure::NullDacl);
+        return found;
+    };
+    for ace in aces {
+        let (ace_type, flags, mask) = (ace.ace_type, ace.flags, ace.mask);
+        if !guard::is_known_dacl_ace_type(ace_type) {
+            found.push(Exposure::UnknownAce {
+                ace_type,
+                flags,
+                mask,
+            });
+        } else if ace.sid.is_empty() {
+            found.push(Exposure::UnreadableSid {
+                ace_type,
+                flags,
+                mask,
+            });
+        } else if guard::DENY_ACE_TYPES.contains(&ace_type) || is_trusted_sid(&ace.sid) {
+            // 拒否は狭める方向。信頼する主体への許可は境界の内側。
+        } else {
+            found.push(Exposure::AllowsOther {
+                ace_type,
+                flags,
+                mask,
+                sid: ace.sid.clone(),
+            });
+        }
+    }
+    found
+}
+
+/// パスを**辿らずに**開き（最後の要素がリンクでもそのものを開く）、開いたハンドルから属性・
+/// リンク数・所有者・DACL を読む（#630。ファイルでもフォルダでもよい）。無ければ `Ok(None)`。
+/// 中身は読まない（`READ_CONTROL | FILE_READ_ATTRIBUTES` だけを求め、共有はすべて許す）。
+/// 途中の要素は辿るので、場所の確かめが要るときは `pin_dir` の本当のパスを使い、中身を読む
+/// ときは `PinnedDir::open_child_file`（確かめたハンドルのまま読む）を使う。`.`・`..` を
+/// 含むパスは開かずに断る。非 Windows は [`SecretStoreError::UnsupportedPlatform`]。
+pub fn inspect_file(path: &std::path::Path) -> Result<Option<FileSecurity>> {
+    reject_dot_segments(path)?;
+    imp::inspect_file(path)
+}
+
 /// [`PinnedDir::reset_acl`] が**触らずに飛ばした**中の子（#392 B3-3b の監査 Must 2）。
 /// 書くと木の外へ影響するので、報告だけして書き換えない。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -626,6 +787,107 @@ impl PinnedDir {
     pub fn open_child_dir(&self, name: &str) -> Result<Option<PinnedDir>> {
         imp::open_child_dir(self, name)
     }
+
+    /// 開いたままの**ハンドルから**、このフォルダの属性・リンク数・所有者・DACL を読む
+    /// （#630。[`exposure`] で置き場が保護されているかを確かめるため）。読むだけ。
+    pub fn security(&self) -> Result<FileSecurity> {
+        imp::security_of_handle(self.handle.raw())
+    }
+
+    /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の子を**相対で辿らずに**
+    /// 開く（#630。中身を読むため）。無ければ `Ok(None)`。
+    ///
+    /// [`PinnedDir::open_child_dir`] と同じ作り（`NtCreateFile` の `RootDirectory` にこの
+    /// ハンドル、`FILE_OPEN | FILE_OPEN_REPARSE_POINT`、名前の確かめも
+    /// [`guard::is_plain_child_name`]）で、**パスを解決し直さない**。子がフォルダ・リンクでも
+    /// 辿らずにそのものを開くので、呼ぶ側が [`PinnedFile::security`] と [`exposure`] で確かめる
+    /// （[`PinnedFile::read_to_end`] はファイルでないもの・reparse point を読まずに断る）。
+    /// 求めるのは読み取り（`READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_DATA`）だけで、
+    /// 共有に削除を含めない（持っている間は消す・名前を変える・すり替えることができない）。
+    /// 開けない（アクセス拒否など）は [`SecretStoreError::Io`]（`IoOp::OpenFile`、`kind` に
+    /// `PermissionDenied` など）。
+    pub fn open_child_file(&self, name: &str) -> Result<Option<PinnedFile>> {
+        imp::open_child_file(self, name)
+    }
+
+    /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の**新しい**ファイルを
+    /// 相対で作り、`contents` を書いてディスクへ書き出す（#630。PR-2 の `prepare-sink-config`
+    /// が `.example` を置くため）。既にあれば `Ok(None)`（何も書かない・上書きしない）。
+    ///
+    /// - **作るのと同時に**、保護された DACL（SYSTEM・Administrators にフル、継承のフラグ
+    ///   なし）と所有者 `BUILTIN\Administrators` を付ける（`NtCreateFile` に記述子を渡す。
+    ///   作ってから付けるまでの間に、親から継承した権限で見える時間を作らない。所有者を
+    ///   明示するのは、「作成者を所有者に」の PC で昇格した利用者が所有者にならないため）。
+    ///   所有者を Administrators にできるのは昇格した管理者・SYSTEM だけ（それ以外は
+    ///   `ERROR_INVALID_OWNER` で何も作らずに失敗する）。
+    /// - 名前の確かめ・相対で作る作りは [`PinnedDir::create_child_dir`] と同じ
+    ///   （`FILE_CREATE | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT`）。
+    /// - 書いた後、作ったハンドルから記述子を読み戻して [`exposure`] が空であることを
+    ///   確かめる。書き込み・書き出し・読み戻しのどれかが失敗した、または保護されていなかった
+    ///   （[`SecretStoreError::Exposed`]）ときは、**作ったハンドルで**消してから（
+    ///   `FileDispositionInfo`。名前で消さないので、別の物を消さない）失敗を返す。
+    pub fn create_child_file(&self, name: &str, contents: &[u8]) -> Result<Option<PinnedFile>> {
+        imp::create_child_file(self, name, contents)
+    }
+}
+
+/// [`PinnedDir::open_child_file`]・[`PinnedDir::create_child_file`] で、確かめ済みのフォルダの
+/// ハンドルを基準に辿らずに開いたファイル（#630）。持っている間は消す・名前を変えることを
+/// 誰にもさせない（共有に削除を含めない）。drop で閉じる。
+#[cfg(windows)]
+pub struct PinnedFile {
+    handle: imp::OwnedHandle,
+    path: std::path::PathBuf,
+    /// `GetFinalPathNameByHandleW` で解決した本当のパス（[`PinnedDir::final_path`] と同じ形）。
+    final_path: std::path::PathBuf,
+    /// 開いた時点でハンドルから読んだ属性と記述子。
+    security: FileSecurity,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for PinnedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedFile")
+            .field("path", &self.path)
+            .field("final_path", &self.final_path)
+            .field("security", &self.security)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl PinnedFile {
+    /// 親の [`PinnedDir::path`] + 名前（表示用。開き直すのには使わない）。
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// 開いたハンドルの本当のパス（`\\?\` を外した DOS 形式）。
+    pub fn final_path(&self) -> &std::path::Path {
+        &self.final_path
+    }
+
+    /// 開いた時点でハンドルから読んだ属性・リンク数・所有者・DACL（[`exposure`] の入力）。
+    pub fn security(&self) -> &FileSecurity {
+        &self.security
+    }
+
+    /// 開いたままの**ハンドルから**、先頭から全部を読む（#630。確かめたハンドルのまま読むので、
+    /// 確かめてから読むまでの間に別の物へすり替えられない）。`max_len` バイトを超えるときは
+    /// 読まずに断る（`io::ErrorKind::FileTooLarge`）。フォルダは `io::ErrorKind::IsADirectory`、
+    /// reparse point は [`AclMismatch::ReparsePoint`] で、読まずに断る。
+    pub fn read_to_end(&self, max_len: usize) -> Result<Vec<u8>> {
+        if self.security.is_reparse_point {
+            return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
+        }
+        if self.security.is_dir {
+            return Err(SecretStoreError::io(
+                crate::error::IoOp::ReadFile,
+                &std::io::Error::from(std::io::ErrorKind::IsADirectory),
+            ));
+        }
+        imp::read_handle_to_end(self.handle.raw(), max_len)
+    }
 }
 
 /// [`PinnedDir::reset_acl`] が、中の子まで書き直すか（監査 Nit 3）。
@@ -680,6 +942,10 @@ mod imp {
     }
 
     pub(super) fn read_dacl(_dir: &Path) -> Result<ObservedDacl> {
+        Err(SecretStoreError::UnsupportedPlatform)
+    }
+
+    pub(super) fn inspect_file(_path: &Path) -> Result<Option<super::FileSecurity>> {
         Err(SecretStoreError::UnsupportedPlatform)
     }
 }
@@ -1648,7 +1914,10 @@ mod imp {
         name: &str,
         access: Option<&DirAccess>,
     ) -> Result<Option<super::PinnedDir>> {
-        child_relative(parent, name, ChildHow::Create(access))
+        let descriptor = access.map(descriptor).transpose()?;
+        child_relative(parent, name, ChildHow::Create(descriptor.as_ref()))?
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name)))
+            .transpose()
     }
 
     /// [`super::PinnedDir::open_child_dir`] の本体。
@@ -1656,99 +1925,324 @@ mod imp {
         parent: &super::PinnedDir,
         name: &str,
     ) -> Result<Option<super::PinnedDir>> {
-        child_relative(parent, name, ChildHow::Open)
+        child_relative(parent, name, ChildHow::Open)?
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name)))
+            .transpose()
     }
 
-    /// [`child_relative`] が作るか開くか。
+    /// [`super::PinnedDir::open_child_file`] の本体（#630）。
+    pub(super) fn open_child_file(
+        parent: &super::PinnedDir,
+        name: &str,
+    ) -> Result<Option<super::PinnedFile>> {
+        child_relative(parent, name, ChildHow::OpenFile)?
+            .map(|handle| pinned_file_from_handle(handle, &parent.path.join(name)))
+            .transpose()
+    }
+
+    /// [`super::PinnedDir::create_child_file`] の本体（#630）。
+    pub(super) fn create_child_file(
+        parent: &super::PinnedDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<Option<super::PinnedFile>> {
+        // ファイル用（継承のフラグなし）・所有者 Administrators・保護された DACL。
+        let descriptor = owned_protected_sd(&DirAccess::service_only(), false)?;
+        let Some(handle) = child_relative(parent, name, ChildHow::CreateFile(&descriptor))? else {
+            return Ok(None);
+        };
+        // ここから先の失敗は、作ったハンドルで消してから返す（名前で消さない）。
+        let finish = || -> Result<(super::FileSecurity, std::path::PathBuf)> {
+            write_all_and_flush(handle.raw(), contents)?;
+            let security = security_of_handle(handle.raw())?;
+            #[allow(unused_mut)]
+            let mut found = super::exposure(&security);
+            #[cfg(test)]
+            if FORCE_EXPOSED.with(std::cell::Cell::get) {
+                found.push(super::Exposure::NullDacl);
+            }
+            if !found.is_empty() {
+                return Err(SecretStoreError::Exposed(found));
+            }
+            Ok((security, final_path_of(handle.raw())?))
+        };
+        match finish() {
+            Ok((security, final_path)) => Ok(Some(super::PinnedFile {
+                handle,
+                path: parent.path.join(name),
+                final_path,
+                security,
+            })),
+            Err(error) => {
+                // 消せなかったときも元の失敗を返す（消す失敗で理由を上書きしない）。閉じたときに
+                // 消える。
+                let _ = delete_by_handle(handle.raw());
+                drop(handle);
+                Err(error)
+            }
+        }
+    }
+
+    // `create_child_file` の読み戻しの確かめに、理由を 1 つ足す（テスト専用。保護されて
+    // いなかったときに作ったファイルを消す経路の確かめ）。本番では常に偽。
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static FORCE_EXPOSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// 開いたハンドルのファイルを `FileDispositionInfo` で消す印を付ける（閉じたときに消える。
+    /// ハンドルは `DELETE` を持つこと。名前で消さないので、別の物を消さない）。
+    fn delete_by_handle(handle: HANDLE) -> Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        };
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `handle` は DELETE を持つ有効なハンドル。`info` は呼び出しの間生きている。
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FileDispositionInfo,
+                (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(SecretStoreError::io(
+                IoOp::RemoveFile,
+                &std::io::Error::from_raw_os_error(last_error() as i32),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `handle`（`FILE_WRITE_DATA`、同期 I/O）へ `contents` を全部書いて `FlushFileBuffers`。
+    fn write_all_and_flush(handle: HANDLE, contents: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        // 閉じるのは持ち主（OwnedHandle）なので、`File` には持たせない（ManuallyDrop）。
+        // SAFETY: `handle` はこの呼び出しの間開いている有効なファイルのハンドル。
+        let mut file =
+            std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle as _) });
+        file.write_all(contents)
+            .map_err(|e| SecretStoreError::io(IoOp::WriteFile, &e))?;
+        file.sync_all()
+            .map_err(|e| SecretStoreError::io(IoOp::WriteFile, &e))
+    }
+
+    /// [`super::PinnedFile::read_to_end`] の本体: 先頭から `max_len` バイトまで読む（超えたら
+    /// 断る）。
+    pub(super) fn read_handle_to_end(handle: HANDLE, max_len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::windows::io::FromRawHandle;
+        // SAFETY: `handle` はこの呼び出しの間開いている有効なファイルのハンドル（閉じない）。
+        let mut file =
+            std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle as _) });
+        let read_error = |e: std::io::Error| SecretStoreError::io(IoOp::ReadFile, &e);
+        file.seek(SeekFrom::Start(0)).map_err(read_error)?;
+        let mut contents = Vec::new();
+        (&mut *file)
+            .take(max_len as u64 + 1)
+            .read_to_end(&mut contents)
+            .map_err(read_error)?;
+        if contents.len() > max_len {
+            return Err(read_error(std::io::Error::from(
+                std::io::ErrorKind::FileTooLarge,
+            )));
+        }
+        Ok(contents)
+    }
+
+    /// 開いたハンドルから [`super::FileSecurity`] を読む（属性・リンク数・所有者・DACL）。
+    /// `handle` は `READ_CONTROL | FILE_READ_ATTRIBUTES` を持つこと。
+    pub(super) fn security_of_handle(handle: HANDLE) -> Result<super::FileSecurity> {
+        let (is_dir, is_reparse_point, links) = info_of(handle)?;
+        Ok(super::FileSecurity {
+            is_dir,
+            is_reparse_point,
+            links,
+            dacl: read_dacl_of_handle(handle)?,
+        })
+    }
+
+    /// 開いたハンドルから [`super::PinnedFile`] を組み立てる。
+    fn pinned_file_from_handle(handle: OwnedHandle, path: &Path) -> Result<super::PinnedFile> {
+        let security = security_of_handle(handle.raw())?;
+        let final_path = final_path_of(handle.raw())?;
+        Ok(super::PinnedFile {
+            handle,
+            path: path.to_path_buf(),
+            final_path,
+            security,
+        })
+    }
+
+    /// [`super::inspect_file`] の本体（#630）。
+    pub(super) fn inspect_file(path: &Path) -> Result<Option<super::FileSecurity>> {
+        use windows_sys::Win32::Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING, READ_CONTROL,
+        };
+        let wide_path = wide(path);
+        // SAFETY: `wide_path` は NUL 終端。リンクを辿らず（OPEN_REPARSE_POINT）、フォルダも
+        // 開けるように（BACKUP_SEMANTICS）。中身は求めない（属性と記述子だけ）ので、共有は
+        // すべて許す（ほかのプロセスの邪魔をしない）。
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                READ_CONTROL | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let os_error = last_error();
+            if os_error == ERROR_FILE_NOT_FOUND || os_error == ERROR_PATH_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(SecretStoreError::io(
+                IoOp::OpenFile,
+                &std::io::Error::from_raw_os_error(os_error as i32),
+            ));
+        }
+        let handle = OwnedHandle(handle);
+        security_of_handle(handle.raw()).map(Some)
+    }
+
+    /// [`child_relative`] が作るか開くか（権利・共有・作り方が決まる）。
     #[derive(Clone, Copy)]
     enum ChildHow<'a> {
-        /// `FILE_CREATE | FILE_DIRECTORY_FILE`（既にあれば `Ok(None)`）。`Some` ならその
-        /// 保護された DACL を作るのと同時に付ける。
-        Create(Option<&'a DirAccess>),
+        /// フォルダを `FILE_CREATE | FILE_DIRECTORY_FILE` で作る（既にあれば `Ok(None)`）。
+        /// `Some` ならその記述子（保護された DACL）を作るのと同時に付ける。
+        Create(Option<&'a LocalBox>),
         /// `FILE_OPEN`（無ければ `Ok(None)`）。フォルダに限らない（ファイルでも開いて、
         /// 呼ぶ側が `PinnedDirInfo::is_dir` で断る - [`pin_dir`] と同じ）。
         Open,
+        /// `FILE_OPEN`（無ければ `Ok(None)`）で、読み取りだけの権利（#630。中身を読む）。
+        /// 種類を問わず開き、呼ぶ側が属性で断る。
+        OpenFile,
+        /// ファイルを `FILE_CREATE | FILE_NON_DIRECTORY_FILE` で、この記述子を付けて作る
+        /// （既にあれば `Ok(None)`。#630）。書き込みと、失敗したときに消すための `DELETE` を
+        /// 求め、共有は読み取りだけ。
+        CreateFile(&'a LocalBox),
     }
 
     /// 開いている `parent` を `RootDirectory` に、名前 1 要素の子を `NtCreateFile` で作るか
     /// 開く（`FILE_OPEN_REPARSE_POINT`。パスを解決し直さず、子がリンクでも辿らない）。
-    /// 返すハンドルは [`pin_dir`] と同じ権利（`WRITE_DAC | WRITE_OWNER` を含む）・共有
-    /// （削除なし）で開く。
+    /// フォルダ（`Create`・`Open`）は [`pin_dir`] と同じ権利（`WRITE_DAC | WRITE_OWNER` を
+    /// 含む）・共有（削除なし）で開く。ファイル（`OpenFile`・`CreateFile`）は [`ChildHow`] の
+    /// とおりで、どちらも共有に削除を含めない。
     fn child_relative(
         parent: &super::PinnedDir,
         name: &str,
         how: ChildHow<'_>,
-    ) -> Result<Option<super::PinnedDir>> {
+    ) -> Result<Option<OwnedHandle>> {
         use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
         use windows_sys::Wdk::Storage::FileSystem::{
-            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
-            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+            FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
         };
         use windows_sys::Win32::Foundation::{
             RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, STATUS_OBJECT_NAME_COLLISION,
             STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
         };
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+            FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, READ_CONTROL,
+            SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
         };
         use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
         /// `ERROR_INVALID_NAME`。
         const ERROR_INVALID_NAME: u32 = 123;
+        let is_file = matches!(how, ChildHow::OpenFile | ChildHow::CreateFile(_));
+        let label = if is_file {
+            "CreateChildFile(name)"
+        } else {
+            "CreateChildDir(name)"
+        };
         // `NtCreateFile` は Win32 の正規化を通らないので、Win32 から見ると別の名前・別の
         // 物になるもの（末尾の `.` と空白・ワイルドカード・予約デバイス名など）も断る
         // （#641 のオーナーレビュー Nit 2）。
         if !super::guard::is_plain_child_name(name) {
-            return Err(api("CreateChildDir(name)", ERROR_INVALID_NAME));
+            return Err(api(label, ERROR_INVALID_NAME));
         }
         let wide_name: Vec<u16> = name.encode_utf16().collect();
-        let bytes = u16::try_from(wide_name.len() * 2)
-            .map_err(|_| api("CreateChildDir(name)", ERROR_INVALID_NAME))?;
+        let bytes =
+            u16::try_from(wide_name.len() * 2).map_err(|_| api(label, ERROR_INVALID_NAME))?;
         let unicode = UNICODE_STRING {
             Length: bytes,
             MaximumLength: bytes,
             Buffer: wide_name.as_ptr() as *mut u16,
         };
-        let (descriptor, disposition, kind_option) = match how {
-            ChildHow::Create(access) => (
-                access.map(descriptor).transpose()?,
+        // フォルダは `pin_dir` と同じ権利（`SYNCHRONIZE` は `FILE_SYNCHRONOUS_IO_NONALERT` の
+        // ため）。
+        let dir_access = READ_CONTROL
+            | FILE_READ_ATTRIBUTES
+            | FILE_LIST_DIRECTORY
+            | WRITE_DAC
+            | WRITE_OWNER
+            | SYNCHRONIZE;
+        let read_access = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_DATA | SYNCHRONIZE;
+        let (descriptor, disposition, kind_option, desired, share) = match how {
+            ChildHow::Create(descriptor) => (
+                descriptor,
                 FILE_CREATE,
                 FILE_DIRECTORY_FILE,
+                dir_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
             ),
-            ChildHow::Open => (None, FILE_OPEN, 0),
+            ChildHow::Open => (
+                None,
+                FILE_OPEN,
+                0,
+                dir_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ),
+            ChildHow::OpenFile => (
+                None,
+                FILE_OPEN,
+                0,
+                read_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ),
+            ChildHow::CreateFile(descriptor) => (
+                Some(descriptor),
+                FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE,
+                read_access | FILE_WRITE_DATA | DELETE,
+                FILE_SHARE_READ,
+            ),
         };
         let attributes = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: parent.handle.raw(),
             ObjectName: &unicode,
             Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: descriptor
-                .as_ref()
-                .map_or(std::ptr::null(), |sd| sd.0 as *const _),
+            SecurityDescriptor: descriptor.map_or(std::ptr::null(), |sd| sd.0 as *const _),
             SecurityQualityOfService: std::ptr::null(),
         };
         let mut handle: HANDLE = std::ptr::null_mut();
         // SAFETY: 全フィールドが整数・ポインタの構造体（ゼロは有効な値）。
         let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
         // SAFETY: `attributes` が指す名前・記述子は呼び出しの間だけ生きていればよい
-        // （`wide_name`・`descriptor` はこの関数の終わりまで生きる）。`RootDirectory` は
-        // 開いている親のハンドル。`pin_dir` と同じ権利・共有で開く（`SYNCHRONIZE` は
-        // `FILE_SYNCHRONOUS_IO_NONALERT` のため）。
+        // （`wide_name` はこの関数の終わりまで、記述子は呼ぶ側が持つ）。`RootDirectory` は
+        // 開いている親のハンドル。
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                READ_CONTROL
-                    | FILE_READ_ATTRIBUTES
-                    | FILE_LIST_DIRECTORY
-                    | WRITE_DAC
-                    | WRITE_OWNER
-                    | SYNCHRONIZE,
+                desired,
                 &attributes,
                 &mut status_block,
                 std::ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                share,
                 disposition,
                 kind_option
                     | FILE_OPEN_REPARSE_POINT
@@ -1759,8 +2253,8 @@ mod imp {
             )
         };
         let absent = match how {
-            ChildHow::Create(_) => status == STATUS_OBJECT_NAME_COLLISION,
-            ChildHow::Open => {
+            ChildHow::Create(_) | ChildHow::CreateFile(_) => status == STATUS_OBJECT_NAME_COLLISION,
+            ChildHow::Open | ChildHow::OpenFile => {
                 status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
             }
         };
@@ -1769,12 +2263,22 @@ mod imp {
         }
         if status < 0 {
             // SAFETY: NTSTATUS を Win32 のエラーに写すだけ。
-            return Err(api("NtCreateFile", unsafe {
-                RtlNtStatusToDosError(status)
-            }));
+            let os_error = unsafe { RtlNtStatusToDosError(status) };
+            // ファイル（#630）は `io::ErrorKind` を残す（sink がアクセス拒否を見分けて案内する
+            // ため）。フォルダは今までどおり。
+            return Err(match how {
+                ChildHow::OpenFile => SecretStoreError::io(
+                    IoOp::OpenFile,
+                    &std::io::Error::from_raw_os_error(os_error as i32),
+                ),
+                ChildHow::CreateFile(_) => SecretStoreError::io(
+                    IoOp::CreateFile,
+                    &std::io::Error::from_raw_os_error(os_error as i32),
+                ),
+                ChildHow::Create(_) | ChildHow::Open => api("NtCreateFile", os_error),
+            });
         }
-        let path = parent.path.join(name);
-        pinned_from_handle(OwnedHandle(handle), &path).map(Some)
+        Ok(Some(OwnedHandle(handle)))
     }
 
     pub(super) fn current_user_sid_string() -> Result<String> {
@@ -2156,6 +2660,210 @@ mod tests {
         );
     }
 
+    // --- #630: 保護されているかの判定（exposure） ------------------------------------
+
+    const USERS: &str = "S-1-5-32-545";
+
+    fn any_ace(ace_type: u8, flags: u8, mask: u32, sid: &str) -> ObservedAce {
+        ObservedAce {
+            ace_type,
+            flags,
+            mask,
+            sid: sid.to_owned(),
+        }
+    }
+
+    /// SYSTEM・Administrators だけに許可、所有者 Administrators の普通のファイル（保護されている）。
+    fn protected_file() -> FileSecurity {
+        FileSecurity {
+            is_dir: false,
+            is_reparse_point: false,
+            links: 1,
+            dacl: ObservedDacl {
+                protected: true,
+                owner: ADMINISTRATORS_SID.to_owned(),
+                aces: Some(vec![
+                    any_ace(0, 0, FULL_ACCESS_MASK, SYSTEM_SID),
+                    any_ace(0, 0, FULL_ACCESS_MASK, ADMINISTRATORS_SID),
+                ]),
+            },
+        }
+    }
+
+    fn with_ace(ace: ObservedAce) -> FileSecurity {
+        let mut security = protected_file();
+        security.dacl.aces.as_mut().unwrap().push(ace);
+        security
+    }
+
+    fn allows(ace: &ObservedAce) -> Vec<Exposure> {
+        vec![Exposure::AllowsOther {
+            ace_type: ace.ace_type,
+            flags: ace.flags,
+            mask: ace.mask,
+            sid: ace.sid.clone(),
+        }]
+    }
+
+    /// 判定の表（1 行 = 入力 1 つと、期待する理由のすべて）。
+    #[test]
+    fn exposure_table() {
+        let trusted_owner_cases = [SYSTEM_SID, ADMINISTRATORS_SID, TRUSTED_INSTALLER_SID];
+        // 1. 保護されている: 所有者が信頼する主体・許可の相手が信頼する主体だけ。
+        for owner in trusted_owner_cases {
+            let mut security = protected_file();
+            security.dacl.owner = owner.to_owned();
+            assert_eq!(exposure(&security), vec![], "{owner}");
+        }
+        // TrustedInstaller への許可・継承された信頼する主体の ACE・保護されていない DACL も
+        // それ自体では理由にしない。
+        let mut inherited_trusted =
+            with_ace(any_ace(0, 0x10, FULL_ACCESS_MASK, TRUSTED_INSTALLER_SID));
+        inherited_trusted.dacl.protected = false;
+        inherited_trusted.dacl.aces.as_mut().unwrap()[0].flags = 0x10;
+        assert_eq!(exposure(&inherited_trusted), vec![]);
+        // フォルダはリンク数を見ない（フォルダのリンク数は意味が違う）。
+        let mut dir = protected_file();
+        dir.is_dir = true;
+        dir.links = 3;
+        assert_eq!(exposure(&dir), vec![]);
+
+        // 2. 許可の ACE の相手が信頼する主体以外（種類・フラグ・マスクを問わない）。
+        let others = [
+            any_ace(0, 0x10, 0x0012_00A9, USERS), // Users の読み取り（継承）
+            any_ace(0, 0, 0x0012_00A9, "S-1-1-0"), // Everyone
+            any_ace(0, 0, 0x0012_00A9, "S-1-5-11"), // Authenticated Users
+            any_ace(0, 0, 0x0012_00A9, "S-1-5-4"), // INTERACTIVE
+            any_ace(0, 0, MODIFY_ACCESS_MASK, USER), // 個別の利用者
+            any_ace(0, 0, 0x0000_0002, USER),     // 書き込みだけ
+            any_ace(0, 0, 0x8000_0000, USER),     // GENERIC_READ だけ
+            any_ace(0, 0, 0x1000_0000, USERS),    // GENERIC_ALL
+            any_ace(0, 0x0b, 0x0012_00A9, "S-1-3-0"), // CREATOR OWNER（OI CI IO）
+            any_ace(0, 0x08, 0x0012_00A9, USERS), // INHERIT_ONLY も数える
+            any_ace(0, 0, 0, USERS),              // マスク 0 も数える
+            any_ace(5, 0, 0x0012_00A9, USERS),    // オブジェクトの許可
+            any_ace(9, 0, 0x0012_00A9, USER),     // 条件付きの許可
+            any_ace(11, 0, 0x0012_00A9, USER),    // 条件付き・オブジェクトの許可
+        ];
+        for ace in &others {
+            assert_eq!(exposure(&with_ace(ace.clone())), allows(ace), "{ace:?}");
+        }
+
+        // 3. 拒否の ACE は、それ自体では理由にしない（種類 1・6・10・12）。
+        for ace_type in guard::DENY_ACE_TYPES {
+            let ace = any_ace(ace_type, 0, FULL_ACCESS_MASK, USERS);
+            assert_eq!(exposure(&with_ace(ace.clone())), vec![], "{ace:?}");
+        }
+
+        // 4. 種類の分からない ACE（許可の複合 4・監査 2・ラベル 0x11 など）は安全側に数える。
+        for ace_type in [2u8, 3, 4, 7, 8, 13, 0x11, 0xff] {
+            let ace = any_ace(ace_type, 0, 0x0012_00A9, "");
+            assert_eq!(
+                exposure(&with_ace(ace)),
+                vec![Exposure::UnknownAce {
+                    ace_type,
+                    flags: 0,
+                    mask: 0x0012_00A9
+                }],
+                "{ace_type}"
+            );
+        }
+
+        // 5. SID が読めない ACE（許可でも拒否でも）は安全側に数える。
+        for ace_type in [0u8, 1, 5, 6, 9, 10, 11, 12] {
+            let ace = any_ace(ace_type, 0x03, 0x0012_00A9, "");
+            assert_eq!(
+                exposure(&with_ace(ace)),
+                vec![Exposure::UnreadableSid {
+                    ace_type,
+                    flags: 0x03,
+                    mask: 0x0012_00A9
+                }],
+                "{ace_type}"
+            );
+        }
+
+        // 6. 所有者が信頼する主体以外。
+        for owner in [USER, USERS, "S-1-1-0", "S-1-3-0", "S-1-5-19", ""] {
+            let mut security = protected_file();
+            security.dacl.owner = owner.to_owned();
+            assert_eq!(
+                exposure(&security),
+                vec![Exposure::ForeignOwner(owner.to_owned())],
+                "{owner:?}"
+            );
+        }
+
+        // 7. null DACL（ACE は見ない）。
+        let mut null = protected_file();
+        null.dacl.aces = None;
+        assert_eq!(exposure(&null), vec![Exposure::NullDacl]);
+
+        // 8. reparse point（ファイルでもフォルダでも）。
+        for is_dir in [false, true] {
+            let mut link = protected_file();
+            link.is_dir = is_dir;
+            link.is_reparse_point = true;
+            assert_eq!(exposure(&link), vec![Exposure::ReparsePoint], "{is_dir}");
+        }
+
+        // 9. ファイルでリンク数 2 以上。
+        for links in [2u32, 3, 1024] {
+            let mut linked = protected_file();
+            linked.links = links;
+            assert_eq!(exposure(&linked), vec![Exposure::HardLinked(links)]);
+        }
+
+        // 10. 重なれば全部を、決まった順に返す（1 つの ACE からは高々 1 つ）。
+        let users = any_ace(0, 0x10, 0x0012_00A9, USERS);
+        let mut worst = with_ace(users.clone());
+        worst.is_reparse_point = true;
+        worst.links = 2;
+        worst.dacl.owner = USER.to_owned();
+        worst
+            .dacl
+            .aces
+            .as_mut()
+            .unwrap()
+            .extend([any_ace(1, 0, FULL_ACCESS_MASK, USER), any_ace(4, 0, 1, "")]);
+        let mut expected = vec![
+            Exposure::ReparsePoint,
+            Exposure::HardLinked(2),
+            Exposure::ForeignOwner(USER.to_owned()),
+        ];
+        expected.extend(allows(&users));
+        expected.push(Exposure::UnknownAce {
+            ace_type: 4,
+            flags: 0,
+            mask: 1,
+        });
+        assert_eq!(exposure(&worst), expected);
+        worst.dacl.aces = None;
+        assert_eq!(
+            exposure(&worst),
+            vec![
+                Exposure::ReparsePoint,
+                Exposure::HardLinked(2),
+                Exposure::ForeignOwner(USER.to_owned()),
+                Exposure::NullDacl,
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_installer_sid_is_the_well_known_service_sid() {
+        assert_eq!(
+            TRUSTED_INSTALLER_SID,
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        );
+        assert!(is_trusted_sid(TRUSTED_INSTALLER_SID));
+        // 似た形のサービスの SID は信頼しない。
+        assert!(!is_trusted_sid(
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478465"
+        ));
+        assert!(!is_trusted_sid("S-1-5-80-0"));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn non_windows_fails_closed() {
@@ -2179,6 +2887,10 @@ mod tests {
         );
         assert_eq!(
             check_user_account(&user()),
+            Err(SecretStoreError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            inspect_file(&dir.join("banto-hub-sink.toml")),
             Err(SecretStoreError::UnsupportedPlatform)
         );
     }
@@ -3490,6 +4202,366 @@ mod tests {
             assert_eq!(after, before, "ジャンクションの先に子ができた");
             assert!(!outside.path().join("x").exists());
             let _ = std::fs::remove_dir(&dir);
+        }
+
+        // --- #630: ファイルの DACL を辿らずに読む・ハンドル基準の子のファイル -------------
+
+        const USERS_SID: &str = "S-1-5-32-545";
+
+        fn allows_to(found: &[Exposure], sid: &str) -> Option<u8> {
+            found.iter().find_map(|e| match e {
+                Exposure::AllowsOther { sid: s, flags, .. } if s == sid => Some(*flags),
+                _ => None,
+            })
+        }
+
+        /// 今のルート（`%ProgramData%\BantoHub`）の再現: Users に読み取りを継承で渡すフォルダの
+        /// 中に作ったファイルは、[`inspect_file`] で読むと Users への許可（継承の ACE）が
+        /// 理由になる。管理者でなくても走る（自分の一時フォルダだけ）。
+        #[test]
+        fn inspect_file_reports_an_inherited_users_read() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("root");
+            std::fs::create_dir(&dir).unwrap();
+            let me = me();
+            set_dacl_sddl(
+                &dir,
+                &format!(
+                    "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{me})(A;OICI;0x1200a9;;;BU)",
+                    me = me.as_str()
+                ),
+            );
+            let file = dir.join("banto-hub-sink.toml");
+            std::fs::write(&file, b"api_key = \"dummy\"").unwrap();
+
+            let security = inspect_file(&file).unwrap().unwrap();
+            assert!(
+                !security.is_dir && !security.is_reparse_point,
+                "{security:?}"
+            );
+            assert_eq!(security.links, 1);
+            assert!(!security.dacl.protected, "継承した DACL: {security:?}");
+            let found = exposure(&security);
+            let users = allows_to(&found, USERS_SID).expect("Users への許可が理由になる");
+            assert_ne!(users & INHERITED_ACE_FLAG, 0, "継承の ACE: {found:?}");
+            assert!(allows_to(&found, me.as_str()).is_some(), "{found:?}");
+            if security.dacl.owner == me.as_str() {
+                assert!(found.contains(&Exposure::ForeignOwner(me.as_str().to_owned())));
+            }
+            // 無いもの・`.`/`..` を含むパス。
+            assert_eq!(inspect_file(&dir.join("missing.toml")), Ok(None));
+            assert_eq!(
+                inspect_file(&dir.join("..").join("root").join("banto-hub-sink.toml")),
+                Err(SecretStoreError::DotSegmentInPath)
+            );
+        }
+
+        /// [`inspect_file`] はリンクを辿らず、そのものの属性を読む（ジャンクション・ハードリンク・
+        /// フォルダ）。null DACL・条件付きの許可・拒否の ACE も実物で読み戻して判定する。
+        #[test]
+        fn inspect_file_reads_links_dirs_and_odd_dacls_without_following() {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let me = me();
+
+            let dir = root.path().join("sub");
+            std::fs::create_dir(&dir).unwrap();
+            let security = inspect_file(&dir).unwrap().unwrap();
+            assert!(
+                security.is_dir && !security.is_reparse_point,
+                "{security:?}"
+            );
+
+            let link = root.path().join("link");
+            junction(&link, outside.path());
+            let security = inspect_file(&link).unwrap().unwrap();
+            assert!(security.is_reparse_point, "{security:?}");
+            assert!(exposure(&security).contains(&Exposure::ReparsePoint));
+
+            let first = root.path().join("a.toml");
+            std::fs::write(&first, b"x").unwrap();
+            let second = root.path().join("b.toml");
+            std::fs::hard_link(&first, &second).unwrap();
+            for name in [&first, &second] {
+                let security = inspect_file(name).unwrap().unwrap();
+                assert_eq!(security.links, 2, "{name:?}");
+                assert!(exposure(&security).contains(&Exposure::HardLinked(2)));
+            }
+
+            // null DACL（全員にフルアクセス）。
+            let null = root.path().join("null.toml");
+            std::fs::write(&null, b"x").unwrap();
+            set_dacl_sddl(&null, "D:NO_ACCESS_CONTROL");
+            let security = inspect_file(&null).unwrap().unwrap();
+            assert_eq!(security.dacl.aces, None, "{security:?}");
+            assert!(exposure(&security).contains(&Exposure::NullDacl));
+
+            // 条件付きの許可（XA、種類 9）は数え、拒否（D）は数えない（拒否の相手は Guests。自分を
+            // 含む Users を拒否すると自分が読めなくなる）。
+            let odd = root.path().join("odd.toml");
+            std::fs::write(&odd, b"x").unwrap();
+            set_dacl_sddl(
+                &odd,
+                &format!(
+                    "D:P(D;;FA;;;BG)(A;;FA;;;SY)(A;;FA;;;{me})(XA;;0x1200a9;;;BU;(Member_of {{SID(BA)}}))",
+                    me = me.as_str()
+                ),
+            );
+            let security = inspect_file(&odd).unwrap().unwrap();
+            assert!(security.dacl.protected);
+            let found = exposure(&security);
+            let conditional: Vec<_> = found
+                .iter()
+                .filter(|e| matches!(e, Exposure::AllowsOther { sid, .. } if sid == USERS_SID))
+                .collect();
+            assert_eq!(
+                conditional.len(),
+                1,
+                "条件付きの許可だけが数えられる: {found:?}"
+            );
+            assert!(
+                matches!(conditional[0], Exposure::AllowsOther { ace_type: 9, .. }),
+                "{found:?}"
+            );
+            // 拒否（Guests）は理由にならない。
+            let guests = "S-1-5-32-546";
+            assert!(
+                security
+                    .dacl
+                    .aces
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a.ace_type == 1 && a.sid == guests),
+                "{security:?}"
+            );
+            assert_eq!(allows_to(&found, guests), None, "{found:?}");
+            set_dacl_sddl(&odd, &format!("D:(A;;FA;;;{})", me.as_str()));
+            drop(security);
+            std::fs::remove_dir(&link).unwrap();
+        }
+
+        /// 確かめ済みのフォルダのハンドルを基準に、子のファイルを辿らずに開き、そのハンドルの
+        /// まま読む。リンク・フォルダは読まずに断り、持っている間は消せない。
+        #[test]
+        fn open_child_file_reads_through_the_handle_without_following() {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let contents = b"hub_url = \"http://127.0.0.1:8722\"\napi_key = \"dummy\"\n";
+            std::fs::write(root.path().join("conf.toml"), contents).unwrap();
+            std::fs::write(outside.path().join("conf.toml"), b"outside").unwrap();
+            std::fs::create_dir(root.path().join("sub")).unwrap();
+            junction(&root.path().join("link"), outside.path());
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+
+            let file = parent.open_child_file("conf.toml").unwrap().unwrap();
+            assert_eq!(file.final_path(), parent.final_path().join("conf.toml"));
+            assert_eq!(
+                Some(file.security().clone()),
+                inspect_file(&root.path().join("conf.toml")).unwrap(),
+                "パスで読んだものと同じ"
+            );
+            assert_eq!(file.read_to_end(1024).unwrap(), contents);
+            // 2 回目も先頭から。
+            assert_eq!(file.read_to_end(contents.len()).unwrap(), contents);
+            assert!(matches!(
+                file.read_to_end(contents.len() - 1),
+                Err(SecretStoreError::Io {
+                    op: crate::error::IoOp::ReadFile,
+                    kind: std::io::ErrorKind::FileTooLarge,
+                    ..
+                })
+            ));
+            // 持っている間は消す・名前を変えることができない（共有に削除を含めない）。
+            assert!(std::fs::remove_file(root.path().join("conf.toml")).is_err());
+            assert!(std::fs::rename(
+                root.path().join("conf.toml"),
+                root.path().join("moved.toml")
+            )
+            .is_err());
+
+            assert!(parent.open_child_file("missing.toml").unwrap().is_none());
+            let sub = parent.open_child_file("sub").unwrap().unwrap();
+            assert!(sub.security().is_dir);
+            assert!(matches!(
+                sub.read_to_end(1024),
+                Err(SecretStoreError::Io {
+                    kind: std::io::ErrorKind::IsADirectory,
+                    ..
+                })
+            ));
+            let link = parent.open_child_file("link").unwrap().unwrap();
+            assert!(link.security().is_reparse_point, "{link:?}");
+            assert_eq!(
+                link.read_to_end(1024),
+                Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint))
+            );
+            for bad in [
+                "",
+                ".",
+                "..",
+                "a\\b",
+                "a/b",
+                "c:",
+                "conf.toml:x",
+                "x.",
+                "x ",
+                "nul",
+                "con.txt",
+                "a*",
+                "a?",
+            ] {
+                assert!(parent.open_child_file(bad).is_err(), "{bad:?}");
+                assert!(parent.create_child_file(bad, b"x").is_err(), "{bad:?}");
+            }
+            drop((file, sub, link, parent));
+            std::fs::remove_dir(root.path().join("link")).unwrap();
+            assert_eq!(
+                std::fs::read(outside.path().join("conf.toml")).unwrap(),
+                b"outside"
+            );
+        }
+
+        /// 読めないファイルは、`io::ErrorKind::PermissionDenied` を残して断る（sink が案内を
+        /// 出し分けるため）。管理者でも、バックアップの特権を有効にしていなければ同じ。
+        #[test]
+        fn open_child_file_reports_access_denied_as_permission_denied() {
+            let root = tempfile::tempdir().unwrap();
+            let locked = root.path().join("locked.toml");
+            std::fs::write(&locked, b"x").unwrap();
+            set_dacl_sddl(&locked, "D:P(A;;FA;;;SY)");
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            let result = parent.open_child_file("locked.toml");
+            assert!(
+                matches!(
+                    result,
+                    Err(SecretStoreError::Io {
+                        op: crate::error::IoOp::OpenFile,
+                        kind: std::io::ErrorKind::PermissionDenied,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            drop(parent);
+            set_dacl_sddl(&locked, &format!("D:(A;;FA;;;{})", me().as_str()));
+        }
+
+        /// 置き場（フォルダ）の記述子をハンドルから読む。`service_only` で作った置き場は、
+        /// 所有者のほかに理由が無い。
+        #[test]
+        fn pinned_dir_security_reads_a_service_only_place() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            let sink = parent
+                .create_child_dir("sink", Some(&DirAccess::service_only()))
+                .unwrap()
+                .unwrap();
+            let security = sink.security().unwrap();
+            assert!(security.is_dir && !security.is_reparse_point);
+            assert!(security.dacl.protected, "{security:?}");
+            let mut sids: Vec<_> = security
+                .dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|a| a.sid.as_str())
+                .collect();
+            sids.sort_unstable();
+            assert_eq!(sids, [SYSTEM_SID, ADMINISTRATORS_SID]);
+            let found = exposure(&security);
+            if is_trusted_sid(&security.dacl.owner) {
+                assert_eq!(found, vec![]);
+            } else {
+                // 一般の利用者・「作成者を所有者に」の PC の管理者が作ると、作った利用者が所有者。
+                assert_eq!(
+                    found,
+                    vec![Exposure::ForeignOwner(security.dacl.owner.clone())]
+                );
+            }
+            drop((sink, parent));
+            set_dacl_sddl(
+                &root.path().join("sink"),
+                &format!("D:(A;OICI;FA;;;{})", me().as_str()),
+            );
+        }
+
+        /// 確かめ済みのフォルダのハンドルを基準に、保護された DACL と所有者 Administrators を
+        /// **作るのと同時に**付けてファイルを作る。所有者を Administrators にするので昇格が要り、
+        /// 昇格していなければ何も作らずに失敗する（手元）。昇格していれば（CI）作った
+        /// ファイルを読み戻して確かめ、保護されていなかったときは作ったファイルを消す。
+        #[test]
+        fn create_child_file_attaches_the_protected_dacl_at_creation() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            let contents = b"# example\nhub_url = \"http://127.0.0.1:8722\"\n";
+            let name = "banto-hub-sink.toml.example";
+
+            if !is_elevated_admin() {
+                let result = parent.create_child_file(name, contents);
+                assert!(
+                    matches!(
+                        result,
+                        Err(SecretStoreError::Io {
+                            op: crate::error::IoOp::CreateFile,
+                            ..
+                        })
+                    ),
+                    "{result:?}"
+                );
+                assert!(!root.path().join(name).exists(), "何も作らない");
+                eprintln!("skip: 所有者を Administrators にする作成は管理者でだけ確かめる（CI）");
+                return;
+            }
+
+            // 実際の形: 保護された置き場の中に作る。
+            let sink = parent
+                .create_child_dir("sink", Some(&DirAccess::service_only()))
+                .unwrap()
+                .unwrap();
+            for place in [&parent, &sink] {
+                let file = place.create_child_file(name, contents).unwrap().unwrap();
+                assert_eq!(file.final_path(), place.final_path().join(name));
+                let security = file.security();
+                assert!(!security.is_dir && !security.is_reparse_point);
+                assert_eq!(security.links, 1);
+                assert!(security.dacl.protected, "継承しない: {security:?}");
+                assert_eq!(security.dacl.owner, ADMINISTRATORS_SID, "{security:?}");
+                check_file_dacl(&security.dacl, &DirAccess::service_only());
+                assert_eq!(exposure(security), vec![]);
+                assert_eq!(file.read_to_end(1024).unwrap(), contents);
+                assert_eq!(
+                    inspect_file(&place.final_path().join(name))
+                        .unwrap()
+                        .as_ref(),
+                    Some(security),
+                );
+                drop(file);
+                // 既にあれば作らず、中身も変えない。
+                assert!(place.create_child_file(name, b"other").unwrap().is_none());
+                let again = place.open_child_file(name).unwrap().unwrap();
+                assert_eq!(again.read_to_end(1024).unwrap(), contents);
+            }
+            let note = sink.security().unwrap();
+            eprintln!(
+                "note: create_child_dir で作った置き場の所有者: {}（exposure: {:?}）",
+                note.dacl.owner,
+                exposure(&note)
+            );
+
+            // 読み戻しで保護されていなかったときは、作ったハンドルで消してから失敗を返す。
+            imp::FORCE_EXPOSED.with(|force| force.set(true));
+            let result = parent.create_child_file("rolled-back.toml", contents);
+            imp::FORCE_EXPOSED.with(|force| force.set(false));
+            assert!(
+                matches!(result, Err(SecretStoreError::Exposed(ref found)) if found == &[Exposure::NullDacl]),
+                "{result:?}"
+            );
+            assert!(
+                !root.path().join("rolled-back.toml").exists(),
+                "作ったファイルが消えていない"
+            );
         }
     }
 }
