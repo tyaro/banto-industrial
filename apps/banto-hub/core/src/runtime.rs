@@ -177,7 +177,7 @@ use crate::profile_lock::{
     try_acquire_profile_lock, HubHostKind, ProfileLockError, ProfileLockGuard,
 };
 use crate::profile_paths::{resolve_hub_root, resolve_profile_paths};
-use crate::rest::{api_router_with_controller, user_auth_state};
+use crate::rest::{api_router_with_controller, opcua_settings_router, user_auth_state};
 use crate::settings::{HubSettingsExt, SettingsService, DEFAULT_PORT};
 use crate::subscribe_core::EVAL_TICK_MS;
 use crate::users::UsersService;
@@ -664,6 +664,13 @@ impl HubRuntime {
             crate::settings::GrpcSettings::default()
         });
         grpc_server.apply(&grpc_settings).await;
+        let opcua = crate::opcua::OpcUaPublisher::new(manager.clone());
+        let opcua_settings = settings.opcua_config().await.unwrap_or_else(|err| {
+            log_err_line(&format!(
+                "banto-hub: OPC UA 設定の読み取りに失敗しました: {err}"
+            ));
+            crate::settings::OpcUaSettings::default()
+        });
 
         // セキュリティヘッダー（banto #500）は最後（最外）に掛け、静的 UI・
         // `/api/*`・SSE・WebSocket の upgrade 応答のすべてに付ける（ヘッダーを
@@ -671,6 +678,13 @@ impl HubRuntime {
         // 接続元にだけ CSP の `connect-src` に Tauri IPC を足す
         // （[`hub_security_headers`]、#505）。
         let audit_for_spool = audit.clone();
+        let opcua_admin = opcua_settings_router(
+            manager.clone(),
+            opcua.clone(),
+            audit.clone(),
+            auth.clone(),
+            events.clone(),
+        );
         let app = with_hub_security_headers(
             api_router_with_controller(
                 users,
@@ -692,6 +706,7 @@ impl HubRuntime {
                 rate_limiter,
                 profile_id,
             )
+            .merge(opcua_admin)
             .merge(static_router::<FrontendAssets>()),
         );
 
@@ -709,9 +724,13 @@ impl HubRuntime {
                     prune_handle.abort();
                     mqtt.shutdown().await;
                     grpc_server.shutdown().await;
+                    opcua.shutdown().await;
                     return Err(HubStartError::ServerStart(err));
                 }
             };
+        // REST が先にポートを確保する。同じポートを OPC UA に指定しても
+        // 失敗するのはオプションの OPC UA だけで、Hub 本体は継続する。
+        opcua.initialize(&opcua_settings).await;
 
         // 背景タスクの順序の約束（#557 のレビュー指摘）: 起動手順のうち失敗しうる
         // ものがすべて済んでから起こす。先に起こしたものは、失敗する経路で
@@ -758,6 +777,7 @@ impl HubRuntime {
         Ok(RunningHub {
             mqtt,
             grpc_server,
+            opcua,
             controller,
             db_source: manager.db_source_engine(),
             manager,
@@ -886,6 +906,7 @@ async fn start_with_port_fallback(
 pub struct RunningHub {
     mqtt: Arc<MqttPublisher>,
     grpc_server: Arc<GrpcServer>,
+    opcua: Arc<crate::opcua::OpcUaPublisher>,
     controller: Arc<CollectionController>,
     manager: Arc<CollectorManager>,
     sessions: Arc<HubSessions>,
@@ -983,6 +1004,7 @@ impl RunningHub {
         // T4: gRPC サーバーも `manager` の消費者(read-only)なので、mqtt と
         // 同じ理由で `manager.shutdown()` より先に止める。
         self.grpc_server.shutdown().await;
+        self.opcua.shutdown().await;
         self.manager.shutdown().await;
         self.sessions.shutdown().await;
         // T9-2: simulators must outlive both the collector's tasks
@@ -1270,6 +1292,738 @@ mod tests {
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0, "the OS should have assigned a real port");
 
+        hub.shutdown().await;
+    }
+
+    /// オプションの OPC UA が bind に失敗しても REST/Hub は起動する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opcua_busy_port_does_not_stop_hub() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-opcua-busy");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = init_db(&db_path).await.expect("init DB");
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold port");
+        let busy = holder.local_addr().expect("port").port();
+        let settings = SettingsService::new(Db::Sqlite(pool.clone()));
+        settings
+            .set_opcua_config(&crate::settings::OpcUaSettings {
+                enabled: true,
+                port: busy,
+                ..Default::default()
+            })
+            .await
+            .expect("save OPC UA settings");
+        pool.close().await;
+
+        let hub = HubRuntime::start(HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_owned()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-opcua-busy".to_owned(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        })
+        .await
+        .expect("Hub REST must start despite OPC UA bind failure");
+        assert_ne!(hub.local_addr().port(), busy);
+        tokio::time::timeout(Duration::from_secs(10), hub.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// 実 Hub の管理 API が保存・即時反映し、不正値を永続化しない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opcua_admin_settings_round_trip_and_reconfigure_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn call(
+            addr: std::net::SocketAddr,
+            operation: &str,
+            method: &str,
+            token: Option<&str>,
+            body: Option<&serde_json::Value>,
+            response_timeout: Duration,
+        ) -> (u16, serde_json::Value) {
+            let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
+            let authorization = token
+                .map(|token| format!("Authorization: Bearer {token}\r\n"))
+                .unwrap_or_default();
+            let request = format!(
+                "{method} /api/opcua-settings HTTP/1.0\r\nHost: {addr}\r\nX-Banto-Client: banto\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|error| panic!("{operation}: connect REST: {error}"));
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .unwrap_or_else(|error| panic!("{operation}: write REST: {error}"));
+            let mut response = Vec::new();
+            tokio::time::timeout(response_timeout, stream.read_to_end(&mut response))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{operation}: REST response timed out after {response_timeout:?}")
+                })
+                .unwrap_or_else(|error| panic!("{operation}: read REST response: {error}"));
+            let raw = std::str::from_utf8(&response)
+                .unwrap_or_else(|error| panic!("{operation}: UTF-8 REST response: {error}"));
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or_else(|| {
+                panic!("{operation}: HTTP response has no header/body separator")
+            });
+            let status = head
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_else(|| panic!("{operation}: HTTP response has no status"))
+                .parse()
+                .unwrap_or_else(|error| panic!("{operation}: invalid HTTP status: {error}"));
+            let json = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        let dir = crate::test_support::TempDir::new("hub-runtime-opcua-admin");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = init_db(&db_path).await.expect("init DB");
+        UsersService::new(Db::Sqlite(pool.clone()))
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup admin");
+        pool.close().await;
+
+        let hub = HubRuntime::start(HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_owned()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-opcua-admin".to_owned(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        })
+        .await
+        .expect("start Hub");
+        let addr = hub.local_addr();
+        let login_payload = r#"{"username":"admin","password":"password123"}"#;
+        let login_request = format!(
+            "POST /api/auth/login HTTP/1.0\r\nHost: {addr}\r\nX-Banto-Client: banto\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{login_payload}",
+            login_payload.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect login");
+        stream
+            .write_all(login_request.as_bytes())
+            .await
+            .expect("write login");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            .await
+            .expect("login response timeout")
+            .expect("read login");
+        let raw = std::str::from_utf8(&response).expect("UTF-8 login response");
+        let (_, body) = raw.split_once("\r\n\r\n").expect("login HTTP response");
+        let login: serde_json::Value = serde_json::from_str(body).expect("login JSON");
+        let token = login["token"].as_str().expect("admin token");
+
+        assert_eq!(
+            call(
+                addr,
+                "unauthenticated GET",
+                "GET",
+                None,
+                None,
+                Duration::from_secs(10)
+            )
+            .await
+            .0,
+            401
+        );
+        let (status, initial) = call(
+            addr,
+            "read initial settings",
+            "GET",
+            Some(token),
+            None,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(initial["enabled"], false);
+        assert!(hub.opcua.endpoint_and_namespace().await.is_none());
+
+        let mut invalid = initial.clone();
+        invalid["port"] = serde_json::json!(0);
+        assert_eq!(
+            call(
+                addr,
+                "reject invalid settings",
+                "PUT",
+                Some(token),
+                Some(&invalid),
+                Duration::from_secs(10),
+            )
+            .await
+            .0,
+            422
+        );
+        assert_eq!(
+            call(
+                addr,
+                "verify settings unchanged after invalid PUT",
+                "GET",
+                Some(token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .1,
+            initial
+        );
+
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve OPC port");
+        let opcua_port = holder.local_addr().expect("OPC port").port();
+        drop(holder);
+        let mut enabled = initial.clone();
+        enabled["enabled"] = serde_json::json!(true);
+        enabled["port"] = serde_json::json!(opcua_port);
+        // Windows CI では初回起動が 10 秒を超える場合がある。起動時には一時 RSA 鍵の
+        // 生成も行うため、ハング検出用の有限な上限を設けて起動完了を待つ。
+        assert_eq!(
+            call(
+                addr,
+                "enable OPC UA listener (may generate temporary RSA key)",
+                "PUT",
+                Some(token),
+                Some(&enabled),
+                Duration::from_secs(60),
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            call(
+                addr,
+                "verify enabled settings",
+                "GET",
+                Some(token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .1,
+            enabled
+        );
+        assert!(hub.opcua.endpoint_and_namespace().await.is_some());
+        tokio::net::TcpStream::connect(("127.0.0.1", opcua_port))
+            .await
+            .expect("OPC UA listener started");
+
+        enabled["enabled"] = serde_json::json!(false);
+        assert_eq!(
+            call(
+                addr,
+                "disable OPC UA listener",
+                "PUT",
+                Some(token),
+                Some(&enabled),
+                Duration::from_secs(10),
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            call(
+                addr,
+                "verify disabled settings",
+                "GET",
+                Some(token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .1,
+            enabled
+        );
+        assert!(hub.opcua.endpoint_and_namespace().await.is_none());
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", opcua_port))
+            .await
+            .is_err());
+        hub.shutdown().await;
+    }
+
+    /// Hub の internal 値が実際の OPC UA Read と購読まで届く結合テスト。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opcua_reads_and_subscribes_to_hub_internal_value() {
+        use opcua::{
+            client::{ClientBuilder, DataChangeCallback, IdentityToken},
+            crypto::SecurityPolicy,
+            types::{
+                AttributeId, DateTime, MessageSecurityMode, MonitoredItemCreateRequest, NodeId,
+                ReadValueId, StatusCode, TimestampsToReturn, UserTokenPolicy, Variant, WriteValue,
+            },
+        };
+
+        let dir = crate::test_support::TempDir::new("hub-runtime-opcua-read");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = init_db(&db_path).await.expect("init DB");
+        ensure_virtual_connection(&pool, MEM_CONNECTION_NAME).await;
+        let connection_id: i64 =
+            sqlx::query_scalar("SELECT id FROM plc_connections WHERE name = ?")
+                .bind(MEM_CONNECTION_NAME)
+                .fetch_one(&pool)
+                .await
+                .expect("mem connection");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(banto_tags::CollectionGroupInput {
+                name: "opcua-group".to_owned(),
+                plc_connection_id: connection_id,
+                period_ms: 100,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .expect("group");
+        TagService::new(pool.clone())
+            .create(banto_tags::TagInput {
+                name: "temperature".to_owned(),
+                collection_group_id: group.id,
+                address: String::new(),
+                data_type: "f32".to_owned(),
+                string_length: None,
+                string_encoding: "utf8".to_owned(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+                writable: false,
+                tag_kind: banto_tags::INTERNAL_TAG_KIND.to_owned(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            })
+            .await
+            .expect("internal tag");
+        let port_holder = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve OPC port");
+        let opcua_port = port_holder.local_addr().expect("port").port();
+        drop(port_holder);
+        SettingsService::new(Db::Sqlite(pool.clone()))
+            .set_opcua_config(&crate::settings::OpcUaSettings {
+                enabled: true,
+                port: opcua_port,
+                ..Default::default()
+            })
+            .await
+            .expect("save OPC UA settings");
+        pool.close().await;
+
+        let hub = HubRuntime::start(HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_owned()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-opcua-read".to_owned(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        })
+        .await
+        .expect("start Hub");
+        let (endpoint, namespace) = hub
+            .opcua
+            .endpoint_and_namespace()
+            .await
+            .expect("OPC UA is listening");
+        let entry = hub
+            .manager
+            .tag_map()
+            .get("mem.opcua-group.temperature")
+            .expect("catalog entry")
+            .clone();
+        let id = NodeId::new(namespace, entry.external_name.clone());
+
+        let pki = tempfile::tempdir().expect("client PKI");
+        let mut client = ClientBuilder::new()
+            .application_name("banto-hub-opcua-test")
+            .application_uri("urn:banto:hub:opcua:test")
+            .create_sample_keypair(true)
+            .pki_dir(pki.path())
+            .trust_server_certs(true)
+            .verify_server_certs(false)
+            .client()
+            .expect("client");
+        let (session, event_loop) = client
+            .connect_to_matching_endpoint(
+                (
+                    endpoint.as_str(),
+                    SecurityPolicy::None.to_str(),
+                    MessageSecurityMode::None,
+                    UserTokenPolicy::anonymous(),
+                ),
+                IdentityToken::Anonymous,
+            )
+            .await
+            .expect("connect");
+        let task = event_loop.spawn();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), session.wait_for_connection())
+                .await
+                .expect("connection timeout")
+        );
+        let read = || async {
+            session
+                .read(
+                    &[ReadValueId {
+                        node_id: id.clone(),
+                        attribute_id: AttributeId::Value as u32,
+                        ..Default::default()
+                    }],
+                    TimestampsToReturn::Both,
+                    0.0,
+                )
+                .await
+                .expect("Read")
+                .remove(0)
+        };
+        let initial = read().await;
+        assert_eq!(initial.status(), StatusCode::Bad);
+        assert_eq!(initial.source_timestamp, None);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let subscription = session
+            .create_subscription(
+                Duration::from_millis(100),
+                30,
+                10,
+                0,
+                0,
+                true,
+                DataChangeCallback::new(move |value, _| {
+                    let _ = sender.send(value);
+                }),
+            )
+            .await
+            .expect("subscription");
+        let request: MonitoredItemCreateRequest = id.clone().into();
+        session
+            .create_monitored_items(subscription, TimestampsToReturn::Both, vec![request])
+            .await
+            .expect("monitored item");
+        // MonitoredItem の登録応答だけでは初期通知の配達前のことがある。
+        // Bad を受け取ってから Good に変え、移行通知を取り逃がさない。
+        let subscribed_initial = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
+            .await
+            .expect("initial DataChange timeout")
+            .expect("subscription closed");
+        assert_eq!(subscribed_initial.status(), StatusCode::Bad);
+        hub.manager.server_store().set(
+            &entry.tag_key,
+            Some(12.5),
+            Quality::Good,
+            1_700_000_000_000,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let value = receiver.recv().await.expect("subscription closed");
+                if value.status() == StatusCode::Good {
+                    assert_eq!(value.value, Some(Variant::Double(12.5)));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Good DataChange timeout");
+        let current = read().await;
+        assert_eq!(current.status(), StatusCode::Good);
+        assert_eq!(current.value, Some(Variant::Double(12.5)));
+        let source_at = |ms| {
+            let time = std::time::UNIX_EPOCH + Duration::from_millis(ms);
+            DateTime::from(
+                banto_opcua_server::model::SampleTimestamps::new(Some(time), time)
+                    .source_ticks()
+                    .expect("OPC UA timestamp"),
+            )
+        };
+        assert_eq!(current.source_timestamp, Some(source_at(1_700_000_000_000)));
+
+        let writes = session
+            .write(&[WriteValue::value_attr(id.clone(), Variant::Double(99.0))])
+            .await
+            .expect("Write response");
+        assert!(matches!(
+            writes.as_slice(),
+            [StatusCode::BadNotWritable | StatusCode::BadUserAccessDenied]
+        ));
+        assert_eq!(read().await.value, Some(Variant::Double(12.5)));
+        // 同じ現在値のまま複数回の照合・購読周期が経過しても、公開時刻だけで
+        // DataChange を発生させない。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), receiver.recv())
+                .await
+                .is_err(),
+            "unchanged value must not trigger DataChange"
+        );
+
+        // Hub の250ms照合とは別に100msの MonitoredItem を作る。
+        // 採取時刻が前値から50msだけ進んだ更新は次の照合・サンプリングまで
+        // 待たされるが、通知時刻を SourceTimestamp に上書きしてはならない。
+        let (sampled_sender, mut sampled_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sampled_subscription = session
+            .create_subscription(
+                Duration::from_millis(100),
+                30,
+                10,
+                0,
+                0,
+                true,
+                DataChangeCallback::new(move |value, _| {
+                    let _ = sampled_sender.send(value);
+                }),
+            )
+            .await
+            .expect("100ms subscription");
+        let mut sampled_request: MonitoredItemCreateRequest = id.clone().into();
+        sampled_request.requested_parameters.sampling_interval = 100.0;
+        let sampled_items = session
+            .create_monitored_items(
+                sampled_subscription,
+                TimestampsToReturn::Both,
+                vec![sampled_request],
+            )
+            .await
+            .expect("100ms monitored item");
+        assert_eq!(sampled_items[0].result.revised_sampling_interval, 100.0);
+        let sampled_initial =
+            tokio::time::timeout(Duration::from_secs(10), sampled_receiver.recv())
+                .await
+                .expect("100ms initial DataChange timeout")
+                .expect("100ms subscription closed");
+        assert_eq!(sampled_initial.value, Some(Variant::Double(12.5)));
+        assert_eq!(
+            sampled_initial.source_timestamp,
+            Some(source_at(1_700_000_000_000))
+        );
+        hub.manager.server_store().set(
+            &entry.tag_key,
+            Some(12.75),
+            Quality::Good,
+            1_700_000_000_050,
+        );
+        let sampled_update = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let value = sampled_receiver
+                    .recv()
+                    .await
+                    .expect("100ms subscription closed");
+                if value.value == Some(Variant::Double(12.75)) {
+                    break value;
+                }
+            }
+        })
+        .await
+        .expect("100ms changed DataChange timeout");
+        assert_eq!(sampled_update.status(), StatusCode::Good);
+        assert_eq!(
+            sampled_update.source_timestamp,
+            Some(source_at(1_700_000_000_050))
+        );
+        assert_eq!(
+            read().await.source_timestamp,
+            sampled_update.source_timestamp
+        );
+
+        hub.manager.server_store().set_with_observation_time(
+            &entry.tag_key,
+            Some(12.75),
+            Quality::Stale,
+            1_700_000_000_050,
+            1_700_000_001_000,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let value = receiver.recv().await.expect("subscription closed");
+                if value.status() == StatusCode::UncertainLastUsableValue {
+                    assert_eq!(value.value, Some(Variant::Double(12.75)));
+                    assert_eq!(value.source_timestamp, Some(source_at(1_700_000_001_000)));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Stale DataChange timeout");
+
+        hub.manager
+            .server_store()
+            .set(&entry.tag_key, None, Quality::Bad, 1_700_000_002_000);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let value = receiver.recv().await.expect("subscription closed");
+                if value.status() == StatusCode::Bad {
+                    assert_eq!(value.value, Some(Variant::Empty));
+                    assert_eq!(value.source_timestamp, Some(source_at(1_700_000_002_000)));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Bad DataChange timeout");
+
+        hub.manager.server_store().set(
+            &entry.tag_key,
+            Some(13.5),
+            Quality::Good,
+            1_700_000_003_000,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if receiver.recv().await.expect("subscription closed").status() == StatusCode::Good
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Good recovery timeout");
+
+        let pool = hub.manager.pool();
+        sqlx::query("UPDATE tags SET enabled = 0 WHERE id = ?")
+            .bind(entry.ids.2)
+            .execute(&pool)
+            .await
+            .expect("disable tag");
+        hub.manager.rebuild().await.expect("publish disabled tag");
+        let disabled = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("disabled DataChange timeout")
+            .expect("subscription closed");
+        assert_eq!(disabled.status(), StatusCode::Bad);
+        assert_eq!(disabled.value, Some(Variant::Empty));
+        assert_eq!(read().await.status(), StatusCode::Bad);
+        assert!(hub.manager.tag_map().get(&entry.external_name).is_some());
+
+        sqlx::query("UPDATE tags SET enabled = 1 WHERE id = ?")
+            .bind(entry.ids.2)
+            .execute(&pool)
+            .await
+            .expect("re-enable tag");
+        hub.manager.rebuild().await.expect("publish enabled tag");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if receiver.recv().await.expect("subscription closed").status() == StatusCode::Good
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("re-enabled DataChange timeout");
+        assert_eq!(read().await.value, Some(Variant::Double(13.5)));
+
+        sqlx::query("UPDATE tags SET name = 'renamed' WHERE id = ?")
+            .bind(entry.ids.2)
+            .execute(&pool)
+            .await
+            .expect("rename tag");
+        hub.manager.rebuild().await.expect("publish renamed tag");
+        let old = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("rename DataChange timeout")
+            .expect("subscription closed");
+        assert_eq!(old.status(), StatusCode::BadNodeIdUnknown);
+        assert_eq!(read().await.status(), StatusCode::BadNodeIdUnknown);
+
+        let renamed_id = NodeId::new(namespace, "mem.opcua-group.renamed");
+        let renamed_read = session
+            .read(
+                &[ReadValueId {
+                    node_id: renamed_id.clone(),
+                    attribute_id: AttributeId::Value as u32,
+                    ..Default::default()
+                }],
+                TimestampsToReturn::Both,
+                0.0,
+            )
+            .await
+            .expect("Read renamed tag")
+            .remove(0);
+        assert_eq!(renamed_read.status(), StatusCode::Good);
+        assert_eq!(renamed_read.value, Some(Variant::Double(13.5)));
+
+        let (renamed_sender, mut renamed_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let renamed_subscription = session
+            .create_subscription(
+                Duration::from_millis(100),
+                30,
+                10,
+                0,
+                0,
+                true,
+                DataChangeCallback::new(move |value, _| {
+                    let _ = renamed_sender.send(value);
+                }),
+            )
+            .await
+            .expect("renamed subscription");
+        session
+            .create_monitored_items(
+                renamed_subscription,
+                TimestampsToReturn::Both,
+                vec![renamed_id.clone().into()],
+            )
+            .await
+            .expect("renamed monitored item");
+        let renamed_initial =
+            tokio::time::timeout(Duration::from_secs(10), renamed_receiver.recv())
+                .await
+                .expect("renamed initial DataChange timeout")
+                .expect("renamed subscription closed");
+        assert_eq!(renamed_initial.status(), StatusCode::Good);
+
+        TagService::new(pool)
+            .delete(entry.ids.2)
+            .await
+            .expect("delete tag");
+        hub.manager.rebuild().await.expect("publish deleted tag");
+        let deleted = tokio::time::timeout(Duration::from_secs(10), renamed_receiver.recv())
+            .await
+            .expect("delete DataChange timeout")
+            .expect("renamed subscription closed");
+        assert_eq!(deleted.status(), StatusCode::BadNodeIdUnknown);
+        let deleted_read = session
+            .read(
+                &[ReadValueId {
+                    node_id: renamed_id,
+                    attribute_id: AttributeId::Value as u32,
+                    ..Default::default()
+                }],
+                TimestampsToReturn::Both,
+                0.0,
+            )
+            .await
+            .expect("Read deleted tag")
+            .remove(0);
+        assert_eq!(deleted_read.status(), StatusCode::BadNodeIdUnknown);
+
+        session.disconnect().await.expect("disconnect");
+        task.abort();
         hub.shutdown().await;
     }
 
