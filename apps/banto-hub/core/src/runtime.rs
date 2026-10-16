@@ -1343,9 +1343,11 @@ mod tests {
 
         async fn call(
             addr: std::net::SocketAddr,
+            operation: &str,
             method: &str,
             token: Option<&str>,
             body: Option<&serde_json::Value>,
+            response_timeout: Duration,
         ) -> (u16, serde_json::Value) {
             let payload = body.map(serde_json::Value::to_string).unwrap_or_default();
             let authorization = token
@@ -1357,24 +1359,29 @@ mod tests {
             );
             let mut stream = tokio::net::TcpStream::connect(addr)
                 .await
-                .expect("connect REST");
+                .unwrap_or_else(|error| panic!("{operation}: connect REST: {error}"));
             stream
                 .write_all(request.as_bytes())
                 .await
-                .expect("write REST");
+                .unwrap_or_else(|error| panic!("{operation}: write REST: {error}"));
             let mut response = Vec::new();
-            tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            tokio::time::timeout(response_timeout, stream.read_to_end(&mut response))
                 .await
-                .expect("REST response timeout")
-                .expect("read REST");
-            let raw = std::str::from_utf8(&response).expect("UTF-8 REST response");
-            let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response");
+                .unwrap_or_else(|_| {
+                    panic!("{operation}: REST response timed out after {response_timeout:?}")
+                })
+                .unwrap_or_else(|error| panic!("{operation}: read REST response: {error}"));
+            let raw = std::str::from_utf8(&response)
+                .unwrap_or_else(|error| panic!("{operation}: UTF-8 REST response: {error}"));
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or_else(|| {
+                panic!("{operation}: HTTP response has no header/body separator")
+            });
             let status = head
                 .split_whitespace()
                 .nth(1)
-                .expect("HTTP status")
+                .unwrap_or_else(|| panic!("{operation}: HTTP response has no status"))
                 .parse()
-                .expect("numeric HTTP status");
+                .unwrap_or_else(|error| panic!("{operation}: invalid HTTP status: {error}"));
             let json = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
             (status, json)
         }
@@ -1427,16 +1434,60 @@ mod tests {
         let login: serde_json::Value = serde_json::from_str(body).expect("login JSON");
         let token = login["token"].as_str().expect("admin token");
 
-        assert_eq!(call(addr, "GET", None, None).await.0, 401);
-        let (status, initial) = call(addr, "GET", Some(token), None).await;
+        assert_eq!(
+            call(
+                addr,
+                "unauthenticated GET",
+                "GET",
+                None,
+                None,
+                Duration::from_secs(10)
+            )
+            .await
+            .0,
+            401
+        );
+        let (status, initial) = call(
+            addr,
+            "read initial settings",
+            "GET",
+            Some(token),
+            None,
+            Duration::from_secs(10),
+        )
+        .await;
         assert_eq!(status, 200);
         assert_eq!(initial["enabled"], false);
         assert!(hub.opcua.endpoint_and_namespace().await.is_none());
 
         let mut invalid = initial.clone();
         invalid["port"] = serde_json::json!(0);
-        assert_eq!(call(addr, "PUT", Some(token), Some(&invalid)).await.0, 422);
-        assert_eq!(call(addr, "GET", Some(token), None).await.1, initial);
+        assert_eq!(
+            call(
+                addr,
+                "reject invalid settings",
+                "PUT",
+                Some(token),
+                Some(&invalid),
+                Duration::from_secs(10),
+            )
+            .await
+            .0,
+            422
+        );
+        assert_eq!(
+            call(
+                addr,
+                "verify settings unchanged after invalid PUT",
+                "GET",
+                Some(token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .1,
+            initial
+        );
 
         let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve OPC port");
         let opcua_port = holder.local_addr().expect("OPC port").port();
@@ -1444,16 +1495,66 @@ mod tests {
         let mut enabled = initial.clone();
         enabled["enabled"] = serde_json::json!(true);
         enabled["port"] = serde_json::json!(opcua_port);
-        assert_eq!(call(addr, "PUT", Some(token), Some(&enabled)).await.0, 200);
-        assert_eq!(call(addr, "GET", Some(token), None).await.1, enabled);
+        // Windows CI では初回起動が 10 秒を超える場合がある。起動時には一時 RSA 鍵の
+        // 生成も行うため、ハング検出用の有限な上限を設けて起動完了を待つ。
+        assert_eq!(
+            call(
+                addr,
+                "enable OPC UA listener (may generate temporary RSA key)",
+                "PUT",
+                Some(token),
+                Some(&enabled),
+                Duration::from_secs(60),
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            call(
+                addr,
+                "verify enabled settings",
+                "GET",
+                Some(token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .1,
+            enabled
+        );
         assert!(hub.opcua.endpoint_and_namespace().await.is_some());
         tokio::net::TcpStream::connect(("127.0.0.1", opcua_port))
             .await
             .expect("OPC UA listener started");
 
         enabled["enabled"] = serde_json::json!(false);
-        assert_eq!(call(addr, "PUT", Some(token), Some(&enabled)).await.0, 200);
-        assert_eq!(call(addr, "GET", Some(token), None).await.1, enabled);
+        assert_eq!(
+            call(
+                addr,
+                "disable OPC UA listener",
+                "PUT",
+                Some(token),
+                Some(&enabled),
+                Duration::from_secs(10),
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            call(
+                addr,
+                "verify disabled settings",
+                "GET",
+                Some(token),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .1,
+            enabled
+        );
         assert!(hub.opcua.endpoint_and_namespace().await.is_none());
         assert!(tokio::net::TcpStream::connect(("127.0.0.1", opcua_port))
             .await
