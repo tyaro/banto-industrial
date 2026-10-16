@@ -424,14 +424,21 @@ pub enum ElevatedError {
     /// ため、以前の`#[error(transparent)]`のままでは文言が変わる）。
     #[error("{}", crate::service_manager::describe_service_error(.0))]
     ServiceManager(#[from] crate::service_manager::ServiceManagerError),
-    /// `grant-profile-acl`の`[profile-id]`引数が不正
-    /// （[`crate::profile_paths::validate_profile_id`]が拒否する文字列）。
+    /// profile-id が不正（[`crate::profile_paths::validate_profile_id`]が拒否する文字列）。
     #[error(transparent)]
     ProfileId(#[from] crate::profile_paths::ProfileIdError),
-    /// [`crate::profile_acl`]側のエラーをそのまま透過する
-    /// （`grant-profile-acl`本体、モジュール doc「profile ACL」節参照）。
+    /// `grant-profile-acl`（と`service-install`の最後の手順）が確かめで断った・書き直せ
+    /// なかった（#626。理由の行は[`crate::profile_grant`]が先に出している）。
+    #[error("banto-hub-elev: '{0}' を中止しました（理由は上の行）")]
+    ProfileAclRefused(&'static str),
+    /// `reset-password`・`revert-to-commissioning`の対象の profile を決められない
+    /// （profile-id の許可リスト・マシンの環境のルート。#626 の論点 8）。
     #[error(transparent)]
-    ProfileAcl(#[from] crate::profile_acl::ProfileAclError),
+    ProfileTarget(#[from] crate::profile_grant::TargetError),
+    /// 対象の profile の DB の手前（`config`など）がジャンクション・ハードリンク・本当の
+    /// パスの不一致などで使えない（#626 PR-B の監査 B-5。DB を開かない）。
+    #[error("banto-hub-elev: {0}")]
+    ProfileTargetUnsafe(String),
     /// `reset-password`/`revert-to-commissioning`対象 profile の DB
     /// （`crate::db::init_db`）・アプリ層サービス（`UsersService`/
     /// `CommissioningService`/`AuditLogService`）から返るエラーをそのまま
@@ -567,14 +574,29 @@ pub fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
 }
 
 /// [`ElevatedAction::GrantProfileAcl`]の本体（`user`/`profile_id`省略時は
-/// それぞれ現在の対話ユーザー／[`crate::profile_paths::DEFAULT_PROFILE_ID`]、
-/// モジュール doc「profile ACL」節参照）。
+/// それぞれこのプロセスのトークンの利用者／[`crate::profile_paths::DEFAULT_PROFILE_ID`]、
+/// モジュール doc「profile ACL」節参照）。確かめ（[`crate::profile_grant::preflight`]）を
+/// 全部通してから書き直す（[`crate::profile_grant::grant_profile_acl`]）。
 #[cfg(windows)]
 pub fn grant_profile_acl(
     user: Option<&str>,
     profile_id: Option<&str>,
 ) -> Result<(), ElevatedError> {
-    windows_impl::grant_profile_acl(user, profile_id)
+    use crate::profile_grant::{self, win::WindowsHubElevOps};
+    let ops = WindowsHubElevOps;
+    let mut out = print_line;
+    profile_grant::preflight(&ops, user, profile_id, &mut out)
+        .and_then(|pre| profile_grant::grant_profile_acl(&ops, &pre, &mut out))
+        .map_err(|_| ElevatedError::ProfileAclRefused(ElevatedAction::GRANT_PROFILE_ACL))
+}
+
+/// 行を標準出力・標準エラー出力へすぐ出す。
+#[cfg(windows)]
+fn print_line(line: banto_service_control::ConsoleLine) {
+    match line {
+        banto_service_control::ConsoleLine::Stdout(text) => println!("{text}"),
+        banto_service_control::ConsoleLine::Stderr(text) => eprintln!("{text}"),
+    }
 }
 
 // --- ロックダウン回復アクションの中核処理（Win32 非依存・非 Windows でも
@@ -672,28 +694,43 @@ fn sibling_banto_hub_exe_path() -> Result<std::path::PathBuf, ElevatedError> {
     Ok(dir.join("banto-hub.exe"))
 }
 
-/// [`ElevatedAction::ServiceInstall`]の本体 - `banto-hub.exe`を対象に
-/// [`crate::service_install::install`]を呼んだ後、`setup-operators`→
-/// `grant-service-acl`→`grant-profile-acl`（既定ユーザー・既定 profile）を
-/// 続けて実行する（実装指示の順序どおり）。`grant-profile-acl`を新規
+/// [`ElevatedAction::ServiceInstall`]の本体 - **登録の前に**`grant-profile-acl`の
+/// 純粋な確かめ（既定ユーザー・既定 profile・マシンの環境のルート、
+/// [`crate::profile_grant::preflight`]）を済ませ、通らなければ何も登録しない（#626。
+/// ChronoGazer の B4 と同じ）。その後`banto-hub.exe`を対象に
+/// [`crate::service_install::install`]を呼び、`setup-operators`→
+/// `grant-service-acl`→`grant-profile-acl`（同じ確かめた値）を続けて実行する
+/// （[`crate::profile_grant::service_install`]）。`grant-profile-acl`を新規
 /// インストール時点で流しておくことで、初回起動が Desktop/Service
 /// どちらであっても「LocalSystem 作成 profile が readonly になる」実機
-/// バグ（docs/banto-hub-t16-design.md §3 実機メモ、`crate::profile_acl`
-/// モジュール doc参照）を未然に防ぐ。
+/// バグ（docs/banto-hub-t16-design.md §3 実機メモ）を未然に防ぐ。上書きインストール
+/// でも既存の profile を保護された DACL へ書き直す（足していく意味は保つ - 論点 4）。
 ///
 /// `service_install::install`自体は失敗時に`eprintln!`案内の上で
 /// `std::process::exit(1)`する（`service_install.rs`のモジュール doc
 /// 「挙動は一切変えていない」参照）- そのため、このファイルの`Result`は
-/// 実質的に「install 成功後の setup-operators/grant-service-acl/
+/// 実質的に「登録の前の確かめ・install 成功後の setup-operators/grant-service-acl/
 /// grant-profile-acl の失敗」だけを表す。
 #[cfg(windows)]
 fn service_install_and_delegate() -> Result<(), ElevatedError> {
+    use crate::profile_grant::{self, win::WindowsHubElevOps, ServiceInstallError};
     let exe_path = sibling_banto_hub_exe_path()?;
-    crate::service_install::install(Some(&exe_path));
-    setup_operators(None)?;
-    grant_service_acl()?;
-    grant_profile_acl(None, None)?;
-    Ok(())
+    let mut out = print_line;
+    profile_grant::service_install(
+        &WindowsHubElevOps,
+        || {
+            crate::service_install::install(Some(&exe_path));
+            setup_operators(None)?;
+            grant_service_acl()
+        },
+        &mut out,
+    )
+    .map_err(|error| match error {
+        ServiceInstallError::Refused => {
+            ElevatedError::ProfileAclRefused(ElevatedAction::SERVICE_INSTALL)
+        }
+        ServiceInstallError::Register(error) => error,
+    })
 }
 
 /// [`ElevatedAction::ServiceUninstall`]の本体 -
@@ -721,27 +758,28 @@ fn set_autostart(enabled: bool) -> Result<(), ElevatedError> {
 }
 
 /// `[profile-id]`（省略時は既定 profile）から対象 profile の
-/// [`crate::profile_paths::ProfilePaths`]を解決する -
-/// `reset-password`/`revert-to-commissioning`共通（`grant-profile-acl`の
-/// root 解決ロジックと同じ4つの env、モジュール doc「profile-id の扱い」
-/// 節参照）。DB ファイルが実在しない場合は
-/// [`ElevatedError::ProfileDbNotFound`]で早期に拒否する。
+/// [`crate::profile_paths::ProfilePaths`]を解決する（`reset-password`/
+/// `revert-to-commissioning`共通。#626 の論点 8: `grant-profile-acl`と同じく、
+/// profile-id は許可リスト、ルートは**マシンの環境だけ**で、このプロセスの環境変数は
+/// 読まない。判断は [`crate::profile_grant::resolve_target_profile`]）。
+///
+/// DB を開く**前に**、ルート → `profiles\` → profile → `config\` と DB のファイルを辿らずに
+/// 開いて確かめ（本当のパス・reparse point・ハードリンク）、返したものを DB を閉じるまで
+/// 持つ（#626 PR-B の監査 B-5、[`crate::profile_grant::open_target_profile`]）。DB ファイルが
+/// 実在しない場合は [`ElevatedError::ProfileDbNotFound`]で早期に拒否する。
 #[cfg(windows)]
 fn resolve_target_profile_paths(
     profile_id: Option<&str>,
-) -> Result<crate::profile_paths::ProfilePaths, ElevatedError> {
-    let profile_id = profile_id.unwrap_or(crate::profile_paths::DEFAULT_PROFILE_ID);
-    let root = crate::profile_paths::resolve_hub_root(
-        std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
-        std::env::var("ProgramData").ok().as_deref(),
-        std::env::var("XDG_DATA_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    );
-    let paths = crate::profile_paths::resolve_profile_paths(&root, profile_id)?;
-    if !paths.db_path.is_file() {
-        return Err(ElevatedError::ProfileDbNotFound(paths.db_path));
-    }
-    Ok(paths)
+) -> Result<
+    crate::profile_grant::OpenedTarget<crate::profile_grant::win::WindowsHubElevOps>,
+    ElevatedError,
+> {
+    use crate::profile_grant::{open_target_profile, win::WindowsHubElevOps, OpenTargetError};
+    open_target_profile(&WindowsHubElevOps, profile_id).map_err(|error| match error {
+        OpenTargetError::Target(error) => ElevatedError::ProfileTarget(error),
+        OpenTargetError::DbNotFound(path) => ElevatedError::ProfileDbNotFound(path),
+        OpenTargetError::Unsafe(reason) => ElevatedError::ProfileTargetUnsafe(reason),
+    })
 }
 
 /// DB を触る2アクション共通: 新しい`tokio::runtime::Runtime`を1回だけ立てて
@@ -764,7 +802,8 @@ where
 /// 「ロックダウン回復アクション」節参照）。
 #[cfg(windows)]
 fn reset_password_action(username: &str, profile_id: Option<&str>) -> Result<(), ElevatedError> {
-    let paths = resolve_target_profile_paths(profile_id)?;
+    // `_held`は DB を閉じるまで（この関数の終わりまで）持つ。
+    let (paths, _held) = resolve_target_profile_paths(profile_id)?;
 
     println!(
         "banto-hub-elev: profile '{}' のユーザー '{username}' のパスワードを再設定します。",
@@ -794,7 +833,8 @@ fn reset_password_action(username: &str, profile_id: Option<&str>) -> Result<(),
 /// モジュール doc「監査ログ」節参照）。
 #[cfg(windows)]
 fn revert_to_commissioning_action(profile_id: Option<&str>) -> Result<(), ElevatedError> {
-    let paths = resolve_target_profile_paths(profile_id)?;
+    // `_held`は DB を閉じるまで（この関数の終わりまで）持つ。
+    let (paths, _held) = resolve_target_profile_paths(profile_id)?;
 
     println!(
         "banto-hub-elev: profile '{}' を試運転モード（未ロックダウン・認証なし）へ戻します。",
@@ -1098,42 +1138,6 @@ mod windows_impl {
     pub(super) fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
         banto_service_elev::grant_service_operators(service_name, &OPERATORS_GROUP)
             .map_err(map_elev_error)
-    }
-
-    /// [`super::grant_profile_acl`]の本体（モジュール doc「profile ACL」節
-    /// 参照）。`user`/`profile_id`省略時のデフォルト解決だけをここで行い、
-    /// 実際の DACL 組み立ては[`crate::profile_acl::grant_profile_owner_acl`]
-    /// （`crate::service_operators::windows_impl::lookup_account_sid`を
-    /// 内部で再利用する別モジュール）へ委譲する。
-    pub(super) fn grant_profile_acl(
-        user: Option<&str>,
-        profile_id: Option<&str>,
-    ) -> Result<(), ElevatedError> {
-        let user_owned;
-        let user_name: &str = match user {
-            Some(name) => name,
-            None => {
-                user_owned = current_user_name()?;
-                &user_owned
-            }
-        };
-        let profile_id = profile_id.unwrap_or(crate::profile_paths::DEFAULT_PROFILE_ID);
-
-        // root 解決は`crate::profile_paths::resolve_profile_paths_from_env`
-        // と同じ4つの env（`BANTO_HUB_ROOT`/`ProgramData`/`XDG_DATA_HOME`/
-        // `HOME`）を読む - `profile-id`だけはこの関数の引数を正とする
-        // （`BANTO_HUB_PROFILE`は読まない。「省略時は既定 profile」という
-        // モジュール doc の記述どおり固定的に振る舞わせるため）。
-        let root = crate::profile_paths::resolve_hub_root(
-            std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
-            std::env::var("ProgramData").ok().as_deref(),
-            std::env::var("XDG_DATA_HOME").ok().as_deref(),
-            std::env::var("HOME").ok().as_deref(),
-        );
-        let paths = crate::profile_paths::resolve_profile_paths(&root, profile_id)?;
-
-        crate::profile_acl::grant_profile_owner_acl(&paths.profile_dir, user_name)?;
-        Ok(())
     }
 }
 
@@ -1689,17 +1693,16 @@ mod tests {
             .expect("grant-service-acl should succeed against an installed BantoHubSink service");
     }
 
-    /// 実際に`%ProgramData%\BantoHub\profiles\<profile-id>\`へ ACL を
-    /// 適用する - `%ProgramData%`配下への書き込みには管理者権限が必要
-    /// なため`#[ignore]`。Windows 実機で、LocalSystem サービス起動後の
-    /// 実 profile ディレクトリに対して手動実行し、対話ユーザーで DB が
-    /// 書き込めるようになることを確認する
-    /// （docs/banto-hub-t16-design.md §3 実機メモの再現・解消確認）。
-    #[cfg(windows)]
+    // `grant_profile_acl_applies_to_default_profile`（`#[ignore]`、本物の`%ProgramData%`を
+    // 触る）は #626 で消した。手順・反証は`crate::profile_grant`のテスト（偽物の
+    // `HubElevOps`と、一時フォルダのルートの実物）が受け持つ。
+
+    /// `ProfileAclRefused`の文言（`banto-hub-elev: {err}`で出す最後の行）。
     #[test]
-    #[ignore = "管理者権限・%ProgramData% への書き込みが必要 - Windows 実機で手動実行"]
-    fn grant_profile_acl_applies_to_default_profile() {
-        grant_profile_acl(None, None)
-            .expect("grant-profile-acl should succeed for the current user / default profile");
+    fn profile_acl_refused_wording() {
+        assert_eq!(
+            ElevatedError::ProfileAclRefused(ElevatedAction::GRANT_PROFILE_ACL).to_string(),
+            "banto-hub-elev: 'grant-profile-acl' を中止しました（理由は上の行）"
+        );
     }
 }

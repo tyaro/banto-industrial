@@ -77,8 +77,11 @@
 ;     起動しない**（T17-4 の「収集を勝手に始めない」方針を維持）。
 ;
 ; いずれのサブコマンドも冪等 - 既に登録済みのサービスに対して `install`/
-; `service-install` を呼んでも起動種別・実行ファイル・ACL は変更しない
-; （T17-4、apps/banto-hub/core/src/service_install.rs 参照）。
+; `service-install` を呼んでも起動種別・実行ファイル・サービスの ACL は変更しない
+; （T17-4、apps/banto-hub/core/src/service_install.rs 参照）。ただし profile の ACL は
+; `service-install` のたびに保護された DACL へ書き直す（#626、既存の owner は引き継ぐ。
+; profile が使用中のときだけ書き直しを飛ばして 0 で終わる - 警告は標準エラー出力だけで
+; インストーラには残らない。docs/banto-hub-operations.md §11）。
 ; #589 以降、その経路でも PRESHUTDOWN の待ち時間（30 秒）だけは更新し、
 ; 読み戻して確認する。設定できなかったときも `install` は終了コード 0 で
 ; 警告を 1 行出すだけ（2026-10-15）- 下の `$0 != 0` の案内には出ず、

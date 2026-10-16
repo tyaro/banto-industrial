@@ -110,8 +110,12 @@
 //!   経路を、本当のパスで塞ぐ）。
 //! - **継承は自前で伝え、中のリンクは辿らない**: `SetNamedSecurityInfoW` と
 //!   `SetSecurityInfo`（ハンドル）の**自動の伝播**は、advapi がユーザーモードで木を歩いて
-//!   既にある子へ継承の ACE を書くが、**その過程で子のジャンクション・ハードリンクの
-//!   先にも書きうる**（Microsoft の仕様。#626 のオーナーレビュー P1）。そこで
+//!   既にある子へ継承の ACE を書く。**ハードリンクの子は記述子を共有するので、木の外の
+//!   名前のアクセスも変わる**（#624）。子の**ジャンクション**の先には届かないと測定した
+//!   （Windows 11 26300、2026-10-16。#626 PR-B の監査 C-5 と、banto-hub の旧実装での反証。
+//!   書き換わったのはリンクそのものの DACL だけ）。**ディレクトリのシンボリックリンクは
+//!   未測**（Microsoft の仕様は自動の伝播の範囲を明言していない - #626 のオーナーレビュー
+//!   P1）。そこで
 //!   `set_security_tree` は自動の伝播を使わず、対象そのものは `SetKernelObjectSecurity`
 //!   （伝播しない API）で書き、継承は自前で子へ伝える。**パスは一切使わない**（監査 [A]。
 //!   パスで列挙・パスで開くと、確かめた後に途中の要素をジャンクションに変えられて先を
@@ -136,8 +140,9 @@
 //!     昇格が要り、非管理者では 1307 で止まる - 書く側は CI で確かめる）。
 //!   - 【測った事実・OS の自動伝播】パスの版 `reset_dir_acl`（`SetNamedSecurityInfoW`）は、
 //!     既にある普通の子へ継承の ACE を OS が自動で伝える（テスト
-//!     `os_auto_propagation_reaches_existing_children`）。これが**子のリンクの先にも書きうる**
-//!     ので、昇格ヘルパーの書き直しでは使わない。
+//!     `os_auto_propagation_reaches_existing_children`）。ハードリンクの子では木の外の名前にも
+//!     効き、ディレクトリのシンボリックリンクの先は未測なので、昇格ヘルパーの書き直しでは
+//!     使わない（ジャンクションの先には届かないと測定 - 上）。
 //!   - 【測った事実・ハンドル列挙】ハンドルを持ったままそのディレクトリをその場で
 //!     ジャンクションに変えても、**元のハンドルの列挙はそのディレクトリ（空）そのものを返す**
 //!     （リンクの先の中身は返らない。テスト
@@ -553,8 +558,9 @@ impl PinnedDir {
     ///   書く。パスではなくハンドル（`OPEN_REPARSE_POINT` で開いた）に書くので、確かめてから
     ///   書くまでの間にその場で reparse point にされても、書き換わるのはリンクそのものだけ。
     /// - 継承は**自前で**中の子へ伝える（`SetNamedSecurityInfoW`・`SetSecurityInfo` の自動の
-    ///   伝播は、advapi がユーザーモードで木を歩いて**子のジャンクション・ハードリンクの先にも
-    ///   書く**ため使わない）。子は `OPEN_REPARSE_POINT` で辿らずに開き、reparse point は
+    ///   伝播は、advapi がユーザーモードで木を歩いて**ハードリンクの子では木の外の名前にも
+    ///   効く**ため使わない。子のジャンクションの先には届かないと測定、ディレクトリの
+    ///   シンボリックリンクは未測 - モジュール doc）。子は `OPEN_REPARSE_POINT` で辿らずに開き、reparse point は
     ///   飛ばし（[`ResetSkips::reparse`]）、ハードリンク（リンク数 2 以上のファイル）も
     ///   飛ばす（[`ResetSkips::hardlink`]。記述子を共有するので、書くと木の外の名前の
     ///   アクセスを変える。#624）。飛ばした子は返り値で報告する。
@@ -582,6 +588,29 @@ impl PinnedDir {
             &mut skips,
         )?;
         Ok(skips)
+    }
+}
+
+#[cfg(windows)]
+impl PinnedDir {
+    /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の子のフォルダを
+    /// **相対で**作り、作ったハンドルをそのまま辿らずに開いたもの（[`PinnedDir`]）として
+    /// 返す（#626 PR-B の再レビュー 1）。既にあれば `Ok(None)`（作らない）。
+    ///
+    /// `NtCreateFile` の `ObjectAttributes.RootDirectory` にこのハンドル、名前は `name`
+    /// 1 要素（区切り・`:`・`.`/`..` は断る）、`FILE_CREATE | FILE_DIRECTORY_FILE |
+    /// FILE_OPEN_REPARSE_POINT` で作る。**パスを解決し直さない**ので、このフォルダの
+    /// 祖先をジャンクションにすり替えられても、作るのはこのフォルダの中だけ。
+    /// `access` が `Some` なら作るのと同時にその保護された DACL を付け（作ってから付ける
+    /// までの間に広い権限で見える時間を作らない）、`None` なら親から継承する。
+    /// 返すハンドルは [`pin_dir`] と同じ権利（`WRITE_DAC | WRITE_OWNER` を含む）・共有
+    /// （削除なし）で開いている。
+    pub fn create_child_dir(
+        &self,
+        name: &str,
+        access: Option<&DirAccess>,
+    ) -> Result<Option<PinnedDir>> {
+        imp::create_child_dir(self, name, access)
     }
 }
 
@@ -663,11 +692,8 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    use super::{check_dacl, DirAccess, ObservedAce, ObservedDacl, ACCESS_ALLOWED_ACE_TYPE};
+    use super::{check_dacl, DirAccess, ObservedAce, ObservedDacl};
     use crate::error::{AclMismatch, IoOp, Result, SecretStoreError};
-
-    /// `ACCESS_DENIED_ACE_TYPE`（許可と同じ並び: ヘッダ・マスク・SID）。
-    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -1368,27 +1394,21 @@ mod imp {
                 }
                 // SAFETY: どの ACE も ACE_HEADER で始まる。
                 let header = unsafe { *(ace as *const ACE_HEADER) };
-                let observed = if header.AceType == ACCESS_ALLOWED_ACE_TYPE
-                    || header.AceType == ACCESS_DENIED_ACE_TYPE
-                {
-                    // 許可・拒否の ACE は ACE_HEADER（4 バイト）・マスク（4 バイト）・
-                    // SID の並び（ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE）。
-                    // SAFETY: 種類を確かめた上で、構造体の並びどおりに読む。
-                    let mask = unsafe { *((ace as *const u8).add(4) as *const u32) };
-                    let sid = unsafe { (ace as *mut u8).add(8) } as PSID;
-                    ObservedAce {
-                        ace_type: header.AceType,
-                        flags: header.AceFlags,
-                        mask,
-                        sid: sid_string(sid)?,
-                    }
-                } else {
-                    ObservedAce {
-                        ace_type: header.AceType,
-                        flags: header.AceFlags,
-                        mask: 0,
-                        sid: String::new(),
-                    }
+                // SAFETY: `GetAce` が返した ACE は `AceSize` バイトの連続した領域。
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(ace as *const u8, usize::from(header.AceSize))
+                };
+                let (mask, sid) = match ace_mask_and_sid_offset(header.AceType, bytes) {
+                    Some((mask, offset)) => (mask, sid_in(bytes, offset)?),
+                    // 種類の分からない ACE・形の壊れた ACE は SID を空にする（呼ぶ側の
+                    // `guard::plan_carry_over` は引き継ぎを決めずに断る）。
+                    None => (0, String::new()),
+                };
+                let observed = ObservedAce {
+                    ace_type: header.AceType,
+                    flags: header.AceFlags,
+                    mask,
+                    sid,
                 };
                 aces.push(observed);
             }
@@ -1399,6 +1419,66 @@ mod imp {
             owner,
             aces,
         })
+    }
+
+    /// DACL に現れうる ACE の、マスクと SID の位置（#626 PR-B の再レビュー 2: 条件付き・
+    /// オブジェクトの ACE の SID も読む。読み落とすと、条件付きの拒否のある利用者を
+    /// 引き継いでしまう）。並びは winnt.h の構造体どおり:
+    ///
+    /// - 許可・拒否（0・1）と callback（9・10）: ヘッダ 4・マスク 4・SID（callback は SID の
+    ///   後に条件のデータ）。
+    /// - オブジェクト（5・6）と callback object（11・12）: ヘッダ 4・マスク 4・Flags 4・
+    ///   `Flags` の 1 ビット目で ObjectType（16）・2 ビット目で InheritedObjectType（16）・SID。
+    ///
+    /// 種類が分からない・`AceSize` が足りないときは `None`（純関数）。
+    pub(super) fn ace_mask_and_sid_offset(ace_type: u8, bytes: &[u8]) -> Option<(u32, usize)> {
+        let read_u32 = |at: usize| -> Option<u32> {
+            bytes
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let mask = read_u32(4)?;
+        let offset = match ace_type {
+            0 | 1 | 9 | 10 => 8,
+            5 | 6 | 11 | 12 => {
+                let flags = read_u32(8)?;
+                let mut offset = 12;
+                if flags & 0x1 != 0 {
+                    offset += 16;
+                }
+                if flags & 0x2 != 0 {
+                    offset += 16;
+                }
+                offset
+            }
+            _ => return None,
+        };
+        sid_len_at(bytes, offset).map(|_| (mask, offset))
+    }
+
+    /// `bytes[offset..]` に収まる SID の長さ（Revision 1・SubAuthorityCount ≤ 15）。
+    fn sid_len_at(bytes: &[u8], offset: usize) -> Option<usize> {
+        let revision = *bytes.get(offset)?;
+        let count = usize::from(*bytes.get(offset + 1)?);
+        let len = 8 + 4 * count;
+        (revision == 1 && count <= 15 && bytes.len() >= offset + len).then_some(len)
+    }
+
+    /// `bytes[offset..]` の SID を文字列にする（[`ace_mask_and_sid_offset`] で長さを確かめた後）。
+    fn sid_in(bytes: &[u8], offset: usize) -> Result<String> {
+        let len = sid_len_at(bytes, offset).ok_or_else(|| api("ParseAceSid", 1337))?;
+        // `ConvertSidToStringSidW` へ渡すため、揃ったバッファにコピーする（ACE の中の SID は
+        // 4 バイト境界に揃っているが、念のため）。
+        let mut copy = vec![0u32; len.div_ceil(4)];
+        // SAFETY: `copy` は `len` バイト以上。`bytes[offset..offset + len]` は上で確かめた範囲。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes[offset..offset + len].as_ptr(),
+                copy.as_mut_ptr() as *mut u8,
+                len,
+            );
+        }
+        sid_string(copy.as_mut_ptr() as PSID)
     }
 
     /// drop で `CloseHandle` するハンドル（[`super::PinnedDir`]）。
@@ -1454,12 +1534,10 @@ mod imp {
         use windows_sys::Win32::Foundation::{
             ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
         };
-        use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
         };
 
         let path = wide(dir);
@@ -1493,8 +1571,17 @@ mod imp {
                 &std::io::Error::from_raw_os_error(os_error as i32),
             ));
         }
-        let handle = OwnedHandle(handle);
+        pinned_from_handle(OwnedHandle(handle), dir).map(Some)
+    }
 
+    /// 開いたハンドルから [`super::PinnedDir`] を組み立てる（属性・所有者・本当のパスを
+    /// ハンドルから読む。[`pin_dir`] と [`create_child_dir`] で共通）。
+    fn pinned_from_handle(handle: OwnedHandle, dir: &Path) -> Result<super::PinnedDir> {
+        use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_REPARSE_POINT,
+        };
         // SAFETY: 全フィールドが整数の構造体（ゼロは有効な値）。
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: `handle` は有効、`info` は書き込み先。
@@ -1529,7 +1616,7 @@ mod imp {
         // で `\\?\C:\…` を返すので、先頭の `\\?\`（UNC は `\\?\UNC\`）を外す。
         let final_path = final_path_of(handle.0)?;
 
-        Ok(Some(super::PinnedDir {
+        Ok(super::PinnedDir {
             handle,
             path: dir.to_path_buf(),
             final_path,
@@ -1538,7 +1625,100 @@ mod imp {
                 is_reparse_point: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
                 owner,
             },
-        }))
+        })
+    }
+
+    /// [`super::PinnedDir::create_child_dir`] の本体。
+    pub(super) fn create_child_dir(
+        parent: &super::PinnedDir,
+        name: &str,
+        access: Option<&DirAccess>,
+    ) -> Result<Option<super::PinnedDir>> {
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT,
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        };
+        use windows_sys::Win32::Foundation::{
+            RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, STATUS_OBJECT_NAME_COLLISION,
+            UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+        /// `ERROR_INVALID_NAME`。
+        const ERROR_INVALID_NAME: u32 = 123;
+        let bad_name = name.is_empty()
+            || name.chars().all(|c| c == '.')
+            || name
+                .chars()
+                .any(|c| matches!(c, '\\' | '/' | ':' | '\0') || c.is_control());
+        if bad_name {
+            return Err(api("CreateChildDir(name)", ERROR_INVALID_NAME));
+        }
+        let wide_name: Vec<u16> = name.encode_utf16().collect();
+        let bytes = u16::try_from(wide_name.len() * 2)
+            .map_err(|_| api("CreateChildDir(name)", ERROR_INVALID_NAME))?;
+        let unicode = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: wide_name.as_ptr() as *mut u16,
+        };
+        let descriptor = access.map(descriptor).transpose()?;
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.handle.raw(),
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: descriptor
+                .as_ref()
+                .map_or(std::ptr::null(), |sd| sd.0 as *const _),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: 全フィールドが整数・ポインタの構造体（ゼロは有効な値）。
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `attributes` が指す名前・記述子は呼び出しの間だけ生きていればよい
+        // （`wide_name`・`descriptor` はこの関数の終わりまで生きる）。`RootDirectory` は
+        // 開いている親のハンドル。`pin_dir` と同じ権利・共有で開く（`SYNCHRONIZE` は
+        // `FILE_SYNCHRONOUS_IO_NONALERT` のため）。
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                READ_CONTROL
+                    | FILE_READ_ATTRIBUTES
+                    | FILE_LIST_DIRECTORY
+                    | WRITE_DAC
+                    | WRITE_OWNER
+                    | SYNCHRONIZE,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE
+                    | FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_FOR_BACKUP_INTENT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status == STATUS_OBJECT_NAME_COLLISION {
+            return Ok(None);
+        }
+        if status < 0 {
+            // SAFETY: NTSTATUS を Win32 のエラーに写すだけ。
+            return Err(api("NtCreateFile", unsafe {
+                RtlNtStatusToDosError(status)
+            }));
+        }
+        let path = parent.path.join(name);
+        pinned_from_handle(OwnedHandle(handle), &path).map(Some)
     }
 
     pub(super) fn current_user_sid_string() -> Result<String> {
@@ -1956,8 +2136,15 @@ mod tests {
         }
 
         /// 昇格した管理者として走っているか（GitHub の Windows のランナーは管理者）。
+        /// `CI`の環境変数があるのに管理者でなければ panic する（管理者でしか走らない反証が
+        /// 黙って飛ばされないように。#626 PR-B の監査 B-3）。手元（`CI`なし）では`false`を
+        /// 返し、呼ぶ側が skip する。
         fn is_elevated_admin() -> bool {
-            banto_service_elev::is_current_process_admin().unwrap_or(false)
+            let admin = banto_service_elev::is_current_process_admin().unwrap_or(false);
+            if !admin && std::env::var_os("CI").is_some() {
+                panic!("CI なのに昇格した管理者ではない（管理者でしか走らない反証が走らない）");
+            }
+            admin
         }
 
         /// ファイル用の確かめ。ファイルへは継承のフラグ（OICI）を外した記述子を書くので、
@@ -3049,6 +3236,159 @@ mod tests {
             assert!(after.dropped.is_empty(), "{after:?}");
             assert!(!after.null_dacl);
             drop(pinned);
+        }
+
+        // --- #626 PR-B の再レビュー -------------------------------------------------
+
+        /// `path` の DACL を `sddl` にする（テスト専用。自分が所有者の一時フォルダだけ）。
+        fn set_dacl_sddl(path: &std::path::Path, sddl: &str) {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::LocalFree;
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            };
+            use windows_sys::Win32::Security::{SetFileSecurityW, DACL_SECURITY_INFORMATION};
+
+            let text: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: NUL 終端の SDDL。確保された記述子は下で LocalFree する。
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(ok, 0, "SDDL の変換（{sddl}）: {}", last_error_test());
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: NUL 終端のパスと、上で作った有効な記述子。
+            let ok =
+                unsafe { SetFileSecurityW(wide.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+            let error = last_error_test();
+            // SAFETY: ConvertString...が LocalAlloc した記述子。
+            unsafe { LocalFree(descriptor) };
+            assert_ne!(ok, 0, "SetFileSecurityW: {error}");
+        }
+
+        /// 再レビュー 2: 実際の DACL に条件付きの拒否（`XD`、ACCESS_DENIED_CALLBACK）を付けて
+        /// 読み戻すと、SID が読め、その利用者は引き継がれない（拒否として数える）。条件付きの
+        /// 許可（`XA`）は引き継がない。管理者でなくても走る（自分の一時フォルダの DACL だけ）。
+        #[test]
+        fn conditional_aces_are_read_back_and_block_carry_over() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("cond");
+            std::fs::create_dir(&dir).unwrap();
+            let me = me();
+            set_dacl_sddl(
+                &dir,
+                &format!(
+                    "D:P(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;{me})(XD;OICI;0x40000;;;{me};(Member_of {{SID(BA)}}))",
+                    me = me.as_str()
+                ),
+            );
+            let dacl = read_dir_dacl(&dir).unwrap();
+            let conditional = dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|ace| ace.ace_type == 10)
+                .expect("条件付きの拒否（種類 10）が読み戻せる");
+            assert_eq!(conditional.sid, me.as_str(), "{dacl:?}");
+            assert_eq!(conditional.mask, 0x0004_0000, "{dacl:?}");
+            let plan = guard::plan_carry_over(&dacl, guard::account_kind);
+            assert!(plan.carried.is_empty(), "{plan:?}");
+            assert!(plan.blocked.is_empty(), "{plan:?}");
+            assert!(plan
+                .dropped
+                .iter()
+                .any(|d| d.reason == guard::DropReason::HasDeny));
+
+            // 条件付きの許可（XA）だけの利用者は引き継がない。
+            set_dacl_sddl(
+                &dir,
+                &format!(
+                    "D:P(A;OICI;FA;;;SY)(XA;OICI;0x1301bf;;;{me};(Member_of {{SID(BA)}}))",
+                    me = me.as_str()
+                ),
+            );
+            let dacl = read_dir_dacl(&dir).unwrap();
+            let plan = guard::plan_carry_over(&dacl, guard::account_kind);
+            assert!(plan.carried.is_empty(), "{plan:?}");
+            assert!(plan.dropped.iter().any(
+                |d| d.reason == guard::DropReason::ConditionalAllow && d.ace.sid == me.as_str()
+            ));
+            // 片付け（読み書きできる形に戻す）。
+            set_dacl_sddl(&dir, &format!("D:(A;OICI;FA;;;{})", me.as_str()));
+        }
+
+        /// 再レビュー 1: 確かめ済みの親のハンドルを基準に子を相対で作る。継承の子・保護された
+        /// 子のどちらも、作ったハンドルの本当のパスは親の本当のパス + 名前で、既にあれば
+        /// 作らない。名前 1 要素でないものは断る。
+        #[test]
+        fn create_child_dir_creates_relative_to_the_handle() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            let child = parent.create_child_dir("plain", None).unwrap().unwrap();
+            assert_eq!(child.final_path(), parent.final_path().join("plain"));
+            assert!(child.info().is_dir && !child.info().is_reparse_point);
+            assert!(!read_dir_dacl(&root.path().join("plain")).unwrap().protected);
+            let service = DirAccess::service_only();
+            let locked = parent
+                .create_child_dir("locked", Some(&service))
+                .unwrap()
+                .unwrap();
+            assert_eq!(locked.final_path(), parent.final_path().join("locked"));
+            let dacl = read_dir_dacl(&root.path().join("locked")).unwrap();
+            assert!(dacl.protected, "{dacl:?}");
+            assert!(parent.create_child_dir("plain", None).unwrap().is_none());
+            for bad in ["", ".", "..", "a\\b", "a/b", "c:", "x:y"] {
+                assert!(parent.create_child_dir(bad, None).is_err(), "{bad:?}");
+            }
+            drop((child, locked));
+            // 片付け（保護された子は自分に権利が無いので、所有者として DACL を戻す）。
+            set_dacl_sddl(
+                &root.path().join("locked"),
+                &format!("D:(A;OICI;FA;;;{})", me().as_str()),
+            );
+        }
+
+        /// 再レビュー 1: 親を開いて持ったまま、その場で FSCTL で外へのジャンクションに
+        /// 変えても、親のハンドルを基準に作る子は外にできない（パスを解決し直さない）。
+        #[test]
+        fn create_child_dir_under_a_handle_turned_into_a_junction_does_not_leak() {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let before: Vec<_> = std::fs::read_dir(outside.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            let pinned = pin_dir(&dir).unwrap().unwrap();
+            if let Err(e) = set_reparse_to(&dir, outside.path()) {
+                if std::env::var_os("CI").is_some() {
+                    panic!("CI で FSCTL_SET_REPARSE_POINT が失敗した: {e}");
+                }
+                eprintln!("skip: FSCTL_SET_REPARSE_POINT に権限が無い（{e}）- CI で確かめる");
+                return;
+            }
+            let result = pinned.create_child_dir("x", None);
+            eprintln!("note: ジャンクションに変わったハンドルの下に作った結果: {result:?}");
+            drop(result);
+            drop(pinned);
+            let after: Vec<_> = std::fs::read_dir(outside.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(after, before, "ジャンクションの先に子ができた");
+            assert!(!outside.path().join("x").exists());
+            let _ = std::fs::remove_dir(&dir);
         }
     }
 }

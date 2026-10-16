@@ -666,7 +666,7 @@
 - `apps/chronogazer/src-tauri/src/lifecycle.rs`（シェルのライフサイクルの状態機械: 終了・切り替え・復旧の判断の表）、`shell.rs`（シェルの配線）、`tray.rs`、`startup.rs`（対処の窓）
 - `apps/chronogazer/core/src/bin/banto-serve.rs`
 - `crates/banto-service-control/src/runner.rs`（共有のサービス本体ランナー、B3-1）、`install.rs`（登録・解除の手順、B3-1）、`shutdown.rs`（PRESHUTDOWN と状態報告、#589）
-- `apps/banto-hub/core/src/bin/banto_hub/win_service.rs`、`service_manager.rs`、`service_install.rs`、`service_elevated.rs`、`profile_acl.rs`、`host_switch.rs`、`http_hub_health.rs`
+- `apps/banto-hub/core/src/bin/banto_hub/win_service.rs`、`service_manager.rs`、`service_install.rs`、`service_elevated.rs`、`profile_acl.rs`（#626 で `profile_grant.rs` に置き換え）、`host_switch.rs`、`http_hub_health.rs`
 - `apps/banto-hub/src-tauri/src/lib.rs`（`decide_startup`）
 - `apps/banto-hub/installer/hooks/service-hooks.nsh`
 - `crates/banto-hub-bootstrap/src/state.rs`（`KeyStore`）、`crates/banto-instance-lock/src/lib.rs`、`apps/chronogazer/core/src/instance_lock.rs`

@@ -7,7 +7,9 @@ T16-2 第一スライス（サービス検出・接続・native fallback・Opera
 ゲート）実装済み（下記 §3 T16-2 実装メモ参照）。2026-08-10 Windows
 実機でサービス接続／Desktop 起動の主要経路を確認済み（同メモ末尾）。
 同日発見の既知ギャップ「LocalSystem 作成 profile の ACL」（下記 §5）は
-T17 側（`profile_acl.rs`、docs/banto-hub-t17-design.md §12）で解消済み。
+T17 側（`grant-profile-acl`、docs/banto-hub-t17-design.md §12）で解消済み
+（2026-10-16 に #626 で`profile_grant.rs`へ作り直し、profile は保護された DACL
+になった。所有者以外のシェルの health は §3 第三スライスの #626 PR-C の追記）。
 T16-2 第二スライス（トレイ開始/停止の`HostSwitchEngine`完了待ち・
 Desktop 引き継ぎの安全化・`BANTO_BIND`対応 navigate/probe・Administrators
 ゲート緩和）実装済み（下記 §3 第二スライス実装メモ、§5 参照）。
@@ -27,6 +29,7 @@ invoke・実`ShellDesktopControl`・自動起動 UAC）実装済み（下記 §3
 **2026-10-12（#392 A2、オーナー決定）: トレイは左クリックでウィンドウを戻し右クリックでメニュー（ChronoGazer と揃えた）、「アプリを終了」は共有の `QuitGate` で二重にしない。**
 同日（#392 A2 レビュー）: 「アプリを終了」の同意から終了の確定までを、収集の開始（REST・MCP）と `CollectionController` の「終了の受付」の印で直列化した（印が立った後の開始は 409 で断る。docs/plan.md §5 #392）。
 同日（#586、実装済み・Windows 実機の OS 終了は未確認）: `RunEvent::Exit`（OS のサインアウト・シャットダウンを含む）でも `RunningHub::shutdown` を通すようにした（§4.1・§4.3 の #586 追記）。
+2026-10-16（#626 PR-B）: §5「LocalSystem 作成 profile の ACL」の`grant-profile-acl`を、保護された DACL に書き直す作り直しに合わせて更新した。
 最終検証日(コード照合): 2026-08-11
 最終検証日(Windows 実機): 2026-09-01（切替ウィザード UI の全経路 - Desktop→Service/Service→Desktop・自動起動 UAC・UAC キャンセル。2026-08-31 は Desktop→Service
 経路、下記 §3 切替ウィザード実機検証メモ）。T16-2 シェル第一・第二スライス
@@ -174,7 +177,9 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 > 検証時は config を消すか Users に Modify を付与して Desktop 経路を確認した
 > （§5「LocalSystem 作成 profile の ACL」参照）。
 > **その後の対応（同日）**: `grant-profile-acl`（profile owner への継承付き
-> Modify、`Users`全体には付与しない）で解消済み。
+> Modify、`Users`全体には付与しない）で解消済み。2026-10-16（#626）からは
+> 保護された DACL（親から継承しない。SYSTEM・Administrators のフル、owner の
+> 変更、所有者 Administrators）に書き直す形（t17-design §12「#626 の作り直し」）。
 
 > **T16-2 第二スライス実装メモ（2026-08-10）**: 第一スライスの
 > `decide_startup`（起動時の決定木）自体は変更せず、下記 §5 の既知の gap
@@ -524,14 +529,17 @@ banto-hub-shell (Tauri v2, Windows 優先)
   既知の限界として残る（低リスクと判断、対応は見送り）。
 - **LocalSystem 作成 profile の ACL**: サービス先行作成の DB が対話ユーザー
   から readonly になり Desktop 起動が失敗し得る（§3 実機メモ）。**2026-08-10
-  対応済み**: `profile_acl.rs`＋固定アクション`grant-profile-acl`
+  対応済み**: 固定アクション`grant-profile-acl`
   （docs/banto-hub-t17-design.md §12）で profile owner への DACL 付与
   （`Users`全体には付与しない、desktop-plan §11）を実装した。
-  `service-install`が新規インストール時に自動実行するため、通常は手動
-  操作不要。既存インストールで本エラーに遭遇した場合は
+  `service-install`がインストール（上書きを含む）のたびに実行するため、
+  通常は手動操作不要。本エラーに遭遇した場合は
   `banto-hub-elev.exe grant-profile-acl`で手動解消できる
-  （docs/banto-hub-operations.md §10「profile ディレクトリの権限
-  （ACL）」）。2026-08-10 実機で `grant-profile-acl`（UAC）による
+  （docs/banto-hub-operations.md §11「profile ディレクトリの権限
+  （ACL）」。先にサービスとアプリを止める）。**2026-10-16（#626）**: 昇格の
+  境界として`profile_grant.rs`に作り直した（確かめてから辿らずに開いた
+  ハンドルへ保護された DACL を書く・使用中は断る・利用者のアカウントだけ・
+  マシンの環境のルート）。2026-08-10 実機で `grant-profile-acl`（UAC）による
   owner Modify 付与と書き込み復旧を確認済み（t17-design §12）。
   サービス先行作成→Desktop Hub 起動までのフル E2E は任意の追加確認。
 

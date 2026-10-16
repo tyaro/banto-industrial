@@ -1,14 +1,16 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。2026-08-10: T17 詳細設計 [banto-hub-t17-design.md](banto-hub-t17-design.md) を追加し、同日オーナーが P1〜P6 を承認（設計確定）。同日 T17-0（`ServiceManager` trait / `MockServiceManager` / `WindowsServiceManager`、`apps/banto-hub/core/src/service_manager.rs`）を実装済み（既存 CLI 挙動不変、P4 Demand 化は T17-4）。T16-2 は同書 §4 / P5 の契約を消費する形で着手可（実機確認は後続）。続く `cursor/t17-1-profile-mutex-e3cb` で T17-1（profile path 一本化＋mutex/排他、`apps/banto-hub/core/src/profile_paths.rs`・`profile_lock.rs`）を実装済み（詳細は banto-hub-t17-design.md §8。3ホスト共通の絶対パス解決＋`HubRuntime::start`冒頭の profile 排他 - Windows は named mutex、非 Windows は flock 自体を排他の実体にする）。続く `cursor/t17-3-switch-txn-e3cb` で T17-3（Desktop↔Service 切替トランザクション、`apps/banto-hub/core/src/hub_health.rs`・`host_switch.rs`）を実装済み（詳細は banto-hub-t17-design.md §9。設計 §4 の `HubHealthProbe` を実装し、切替の各段階と失敗到達を `host_switch::HostSwitchEngine`/`SwitchPhase`/`FaultStage` で型として固定、T17-2 の Operators 権限確認は `can_operate_service: bool` のスタブで受け取る）。**2026-08-10: T17-1 Windows 実機検証済み**（[banto-hub-t17-design.md](banto-hub-t17-design.md) §8 — Session 0 サービス install/起動、profile mutex 二重起動拒否、SLMP `192.168.11.200:5200` で banto-hub 収集1本・PLC TCP 1本確認。`crates/banto-broker/examples/real_plc_verify.rs` を main 移植、`625401c`）。cross-session 時の mutex 診断（`Io` vs `AlreadyHeld`）改善は [improvement-plan.md](improvement-plan.md) §6 バックログ。**2026-08-10: T17-2 スライス1〜2実装済み**（`service_operators` /
+状態: **計画確定。2026-10-16: §11 の profile owner ACL を #626 の作り直し（保護された DACL・利用者のアカウントだけ・マシンの環境のルート）に合わせて注記を更新。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。2026-08-10: T17 詳細設計 [banto-hub-t17-design.md](banto-hub-t17-design.md) を追加し、同日オーナーが P1〜P6 を承認（設計確定）。同日 T17-0（`ServiceManager` trait / `MockServiceManager` / `WindowsServiceManager`、`apps/banto-hub/core/src/service_manager.rs`）を実装済み（既存 CLI 挙動不変、P4 Demand 化は T17-4）。T16-2 は同書 §4 / P5 の契約を消費する形で着手可（実機確認は後続）。続く `cursor/t17-1-profile-mutex-e3cb` で T17-1（profile path 一本化＋mutex/排他、`apps/banto-hub/core/src/profile_paths.rs`・`profile_lock.rs`）を実装済み（詳細は banto-hub-t17-design.md §8。3ホスト共通の絶対パス解決＋`HubRuntime::start`冒頭の profile 排他 - Windows は named mutex、非 Windows は flock 自体を排他の実体にする）。続く `cursor/t17-3-switch-txn-e3cb` で T17-3（Desktop↔Service 切替トランザクション、`apps/banto-hub/core/src/hub_health.rs`・`host_switch.rs`）を実装済み（詳細は banto-hub-t17-design.md §9。設計 §4 の `HubHealthProbe` を実装し、切替の各段階と失敗到達を `host_switch::HostSwitchEngine`/`SwitchPhase`/`FaultStage` で型として固定、T17-2 の Operators 権限確認は `can_operate_service: bool` のスタブで受け取る）。**2026-08-10: T17-1 Windows 実機検証済み**（[banto-hub-t17-design.md](banto-hub-t17-design.md) §8 — Session 0 サービス install/起動、profile mutex 二重起動拒否、SLMP `192.168.11.200:5200` で banto-hub 収集1本・PLC TCP 1本確認。`crates/banto-broker/examples/real_plc_verify.rs` を main 移植、`625401c`）。cross-session 時の mutex 診断（`Io` vs `AlreadyHeld`）改善は [improvement-plan.md](improvement-plan.md) §6 バックログ。**2026-08-10: T17-2 スライス1〜2実装済み**（`service_operators` /
 `service_elevated` / `service_install` / `banto-hub-elev.exe`、詳細は
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §10。Operators 委任の
 実機受け入れの一部（Operators 作成・ACL・setup-operators 冪等）と
 T16-2 配線は未了。詳細は同 §10）。**2026-08-10: profile ACL 追加スライス
-実装済み**（`apps/banto-hub/core/src/profile_acl.rs`＋固定アクション
-`grant-profile-acl`、詳細は [banto-hub-t17-design.md](banto-hub-t17-design.md)
-§12。T16-2 実機検証で見つかった「LocalSystem 作成 profile が対話ユーザーから
+実装済み**（固定アクション `grant-profile-acl`、詳細は
+[banto-hub-t17-design.md](banto-hub-t17-design.md) §12。2026-10-16 に #626 で
+昇格の境界として作り直し、`apps/banto-hub/core/src/profile_acl.rs` を
+`profile_grant.rs` に置き換えた - 確かめてから辿らずに開いたハンドルへ保護された
+DACL を書く。T16-2 実機検証で見つかった「LocalSystem 作成 profile が対話ユーザーから
 readonly になる」既知ギャップ（下記本節・§16.3 参照）を、profile owner への
 明示 DACL 付与（`Users` 全体には付与しない）で解消。`service-install` が
 新規インストール時に自動実行する。同日実機で `grant-profile-acl`（UAC）
@@ -2298,9 +2300,18 @@ fallback を配線した。詳細は
 owner ACL を設定する。グループ変更、profile owner 追加、ACL 変更は UAC を必要とする。
 
 > **2026-08-10 実装済み**: 上記の profile owner ACL 設定は
-> `apps/banto-hub/core/src/profile_acl.rs`（`grant_profile_owner_acl`）＋
 > UAC helper の固定アクション `grant-profile-acl` として実装した。詳細は
 > [banto-hub-t17-design.md](banto-hub-t17-design.md) §12 を参照。
+>
+> **2026-10-16 作り直し（#626、オーナー決定）**: 昇格した書き込みを呼び出し元が
+> 任意の場所へ向けられた穴を塞ぐため、`apps/banto-hub/core/src/profile_grant.rs` に
+> 置き換えた。profile の DACL は**保護された形**（親から継承しない。SYSTEM・
+> Administrators のフル、profile owner ごとに「変更」、所有者は Administrators）に
+> なり、この節の「`Users` 全体へ権限を与えない」は継承の読み取り（ProgramData の
+> `Users` の読み取り）まで含めて満たす。owner は名前か SID で指定する**利用者の
+> アカウント**だけで、既存の owner は引き継ぐ（足していく）。ルートはマシンの環境
+> だけから決め、profile が使用中なら断る。詳細と既知の制限は t17-design §12
+> 「#626 の作り直し」と運用ガイド §11。
 
 デスクトップ Hub は profile owner の権限で DB を直接更新するため、profile owner は
 ローカルデータを直接変更できる信頼済み管理者という脅威境界になる。ローカル利用者を

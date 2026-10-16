@@ -734,6 +734,7 @@ dependencies = [
  "banto-opcua-server",
  "banto-plc",
  "banto-plc-write",
+ "banto-secret-store",
  "banto-server",
  "banto-service-control",
  "banto-service-elev",

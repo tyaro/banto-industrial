@@ -29,11 +29,10 @@
 //!   （`NetLocalGroupAdd`/`NetLocalGroupAddMembers`）、対象サービスの
 //!   Security Descriptor への ACE 付与（`SetServiceObjectSecurity`）、
 //!   UAC helper 本体（`banto-hub-elev.exe`）は [`crate::service_elevated`]
-//!   （slice 2）が実装した。このモジュールは変更していない -
-//!   [`lookup_account_sid`][windows_impl::lookup_account_sid]（本来
-//!   `lookup_group_sid`という名前だった）を`pub(crate)`に広げ、
-//!   `service_elevated`がユーザー名/グループ名 SID 解決の両方に再利用できる
-//!   ようにしただけ。
+//!   （slice 2）が実装した。このモジュールは変更していない（以前ここにあった
+//!   `windows_impl::lookup_account_sid`の包みは、唯一の利用者だった
+//!   `profile_acl.rs`を #626 で消したのに合わせて消した。名前からの SID の
+//!   解決は`banto_service_elev::lookup_account_sid`・`lookup_account_sid_string`）。
 //!
 //! グループが未作成の環境（`service_elevated::setup_operators`実行前の
 //! 全環境を含む）では、[`is_current_process_operator`]は Windows API
@@ -186,22 +185,6 @@ impl OperatorsError {
             }
             other => OperatorsError::Elev(other),
         }
-    }
-}
-
-// T17-2 スライス2（`service_elevated.rs`）・profile ACL（`profile_acl.rs`）が
-// アカウント名からの SID の解決に使う。#392 B3-3a で本体は
-// [`banto_service_elev::lookup_account_sid`]へ移し、ここはエラーを従来の
-// 文言へ写す薄い包みだけにした。
-#[cfg(windows)]
-pub(crate) mod windows_impl {
-    use super::OperatorsError;
-
-    /// アカウント名（ユーザー名またはローカルグループ名）からこのマシン
-    /// 上の SID を解決する。名前がどのアカウントにも一致しない（未作成/
-    /// 未存在）ときは`Ok(None)`、それ以外の失敗だけ`Err`。
-    pub(crate) fn lookup_account_sid(name: &str) -> Result<Option<Vec<u8>>, OperatorsError> {
-        banto_service_elev::lookup_account_sid(name).map_err(OperatorsError::from_elev)
     }
 }
 

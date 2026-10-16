@@ -31,7 +31,7 @@
 //! 1 組）。tstore の剪定・一覧（`banto_tstore::files`）はファイル名が
 //! `YYYYMMDD-NNN.sqlite3` のファイルしか見ないので、サブディレクトリは触られない。
 //! 中身は監査の内容そのもの（`detail` を含む）なので、データディレクトリと同じ
-//! 扱いで守る（profile の ACL は継承で掛かる、`crate::profile_acl`）。
+//! 扱いで守る（profile の ACL は継承で掛かる、`crate::profile_grant`）。
 //!
 //! ## 作れなかったとき
 //!
