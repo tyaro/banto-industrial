@@ -469,7 +469,7 @@ struct FakePinned {
     path: PathBuf,
     final_path: PathBuf,
     info: PinnedDirInfo,
-    reset: Result<(), String>,
+    reset: Result<ResetSkips, String>,
     log: Log,
 }
 
@@ -486,7 +486,7 @@ impl PinnedDirOps for FakePinned {
             self.path.display(),
             access.install_user().map_or("-", InstallUserSid::as_str)
         ));
-        self.reset.clone().map(|()| ResetSkips::default())
+        self.reset.clone()
     }
 }
 
@@ -522,6 +522,8 @@ struct Fake {
     create_error: Option<PathBuf>,
     reset_error: Option<PathBuf>,
     pin_error: Option<PathBuf>,
+    /// 書き直しのときに飛ばした子（reparse・hardlink）を、そのフォルダに結びつける。
+    reset_skips: BTreeMap<PathBuf, ResetSkips>,
 }
 
 fn root_path() -> PathBuf {
@@ -592,6 +594,7 @@ impl Fake {
             create_error: None,
             reset_error: None,
             pin_error: None,
+            reset_skips: BTreeMap::new(),
         }
     }
 
@@ -721,7 +724,7 @@ impl ElevOps for Fake {
             reset: if self.reset_error.as_deref() == Some(dir) {
                 Err("os error 5".to_string())
             } else {
-                Ok(())
+                Ok(self.reset_skips.get(dir).cloned().unwrap_or_default())
             },
             log: self.log.clone(),
         }))
@@ -1422,6 +1425,30 @@ fn grant_data_acl_creates_root_and_secrets_but_not_hub_keys() {
     assert!(!fake
         .calls()
         .contains(&format!("create {} {USER}", hub_keys().display())));
+}
+
+/// 監査 [C]: 書き直しのときに飛ばした子（reparse・hardlink）が、elev の出力に 1 行ずつ出る。
+#[test]
+fn grant_data_acl_reports_each_skipped_child() {
+    let mut skips = ResetSkips::default();
+    skips.reparse.push(root_path().join("data").join("jlink"));
+    skips
+        .hardlink
+        .push(root_path().join("logs").join("hard.txt"));
+    let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
+    fake.reset_skips.insert(root_path(), skips);
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_OK, "{lines:#?}");
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("jlink") && t.contains("ジャンクションかシンボリックリンク") && t.contains("飛ばしました"))),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("hard.txt") && t.contains("ハードリンク") && t.contains("#624"))),
+        "{lines:#?}"
+    );
 }
 
 /// 反証（O2）: ルートがジャンクションなら、書き直さず・下も見ずに 1。
