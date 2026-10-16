@@ -20,6 +20,16 @@ use banto_service_control::print_console_lines;
 fn main() {
     use chronogazer_elev::{parse_args, run, usage_lines, win::WindowsOps, EXIT_USAGE};
 
+    // 昇格したプロセスの作業フォルダは呼び出し元が選べるので、これから読み込む DLL の
+    // 探し先を System32 に限る（監査 C4。失敗しても続ける。既定の SafeDllSearchMode でも
+    // System32 は作業フォルダより先）。
+    // SAFETY: プロセス全体の設定を変えるだけで、ポインタを渡さない。
+    unsafe {
+        windows_sys::Win32::System::LibraryLoader::SetDefaultDllDirectories(
+            windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+    }
+
     // UTF-8 にできない引数は、どのアクションにも当たらないので使い方の誤り。
     let mut args = Vec::new();
     for arg in std::env::args_os().skip(1) {

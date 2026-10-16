@@ -37,9 +37,12 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 #   展開せずに読む）
 # - Win32_UI_Shell / Win32_System_Com: SHGetKnownFolderPath・CoTaskMemFree
 #   （マシンの ProgramData・Program Files。このプロセスの環境変数を読まない）
+# - Win32_System_LibraryLoader: SetDefaultDllDirectories（main の先頭で DLL の
+#   探し先を System32 に限る。監査 C4）
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_UI_Shell",
 ] }
