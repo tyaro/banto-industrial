@@ -74,7 +74,7 @@
 ;     発行するもの（§4.4）。以前の NSIS の `CreateDirectory`/`CopyFiles` は継承の
 ;     DACL（Users が読める）で作ってしまうので使わない。ルート直下の旧い
 ;     `.example`・旧い toml には触らない（旧い toml があると sink は起動しない -
-;     docs/banto-hub-operations.md の DB Sink の節）。sink の `install`・
+;     docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」）。sink の `install`・
 ;     `grant-service-acl` の後、サービスの再開の前に呼ぶ（再開した sink が新しい
 ;     置き場を読むように）。
 ; (5) PREINSTALL で止めたものだけ `sc start` で再開する（Hub → Sink の順、
@@ -276,7 +276,7 @@ Var StopWaitCounter
   DetailPrint "banto-hub: サイドカーの設定ファイルの置き場 (%ProgramData%\BantoHub\sink) を整えています..."
   ExecWait '"$INSTDIR\banto-hub-elev.exe" prepare-sink-config' $0
   ${If} $0 != 0
-    DetailPrint "banto-hub: prepare-sink-config に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-sink-config （docs/banto-hub-operations.md の DB Sink の節参照）"
+    DetailPrint "banto-hub: prepare-sink-config に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-sink-config （docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」参照）"
   ${Else}
     DetailPrint "banto-hub: サイドカーの設定ファイルの置き場を整え、雛形 (banto-hub-sink.toml.example) を置きました。管理者のメモ帳で雛形をコピーして banto-hub-sink.toml を作り、編集の後に prepare-sink-config をもう一度実行してください。"
   ${EndIf}

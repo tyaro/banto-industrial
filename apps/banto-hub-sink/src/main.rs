@@ -98,7 +98,7 @@ fn run_console() {
                 eprintln!("banto-hub-sink: {line}");
             }
             eprintln!(
-                "banto-hub-sink: 置き場と編集の手順は docs/banto-hub-operations.md の DB Sink の節、\
+                "banto-hub-sink: 置き場と編集の手順は docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」、\
                  書式は `banto_hub_sink::config` のモジュール doc を参照してください"
             );
             std::process::exit(1);

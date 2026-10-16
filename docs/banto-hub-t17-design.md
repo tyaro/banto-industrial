@@ -2,6 +2,8 @@
 
 作成日: 2026-08-10
 状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。
+2026-10-17: §12 の #626 の決定 11（#630 の分離）に、#630 の結果（サイドカーの設定の
+置き場を保護された `sink\` に分けた）を 1 行足した。
 T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
 `apps/banto-hub/core/src/service_manager.rs`）は同日実装済み（§7）。
 T17-1（profile path 一本化＋mutex/排他、`profile_paths.rs`/
@@ -887,6 +889,9 @@ profile-id に`C:`・`x:y`を渡すと Windows の`Path::join`がドライブ相
    タイミングを合わせられない）。
 10. 失敗の終了コードは今どおりすべて 1。
 11. ルート直下の`banto-hub-sink.toml`を`Users`が読める件は別 issue（#630）。
+    → #630（2026-10-17）: ルートは触らず、サイドカーの設定の置き場を保護された
+    `%ProgramData%\BantoHub\sink\` だけにした（`banto-hub-elev prepare-sink-config`、
+    docs/banto-hub-installer-design.md §4.4）。
 
 **手順**（`apps/banto-hub/core/src/profile_grant.rs`）: 確かめ（`preflight`:
 profile-id → 利用者 → ルート、ファイルシステムに触らない）→ 使用中か →
