@@ -1129,7 +1129,7 @@ fn grant_service_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
         // ACE は既にあるが、DACL の並びが正規でなかったので整え直した（足してはいない）。#658
         Ok(ServiceAclOutcome::Reordered) => {
             out(out_line(&format!(
-                "サービス '{SERVICE_NAME}' の DACL には '{}' の ACE（{}: 照会・開始・停止）が既にあります（ACE の並びを整え直しました）",
+                "サービス '{SERVICE_NAME}' の DACL には '{}' の ACE（{}: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）",
                 OPERATORS_GROUP.name,
                 banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
             )));

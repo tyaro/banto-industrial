@@ -1268,7 +1268,7 @@ fn grant_service_acl_exit_codes() {
     assert_eq!(code, EXIT_OK);
     assert_eq!(
         lines[0],
-        stdout("chronogazer-elev: サービス 'ChronoGazer' の DACL には 'ChronoGazer Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（ACE の並びを整え直しました）")
+        stdout("chronogazer-elev: サービス 'ChronoGazer' の DACL には 'ChronoGazer Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）")
     );
 
     // 2 回目: ACE は既にある。「足しました」とは言わない（#628）。

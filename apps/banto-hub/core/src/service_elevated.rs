@@ -643,7 +643,7 @@ pub fn grant_service_acl_line(
             "banto-hub-elev: サービス '{service_name}' の DACL の '{group}' の ACE を、既定の権利（{RIGHTS}: 照会・開始・停止）に置き換えました"
         ),
         ServiceAclOutcome::Reordered => format!(
-            "banto-hub-elev: サービス '{service_name}' の DACL には '{group}' の ACE（{RIGHTS}: 照会・開始・停止）が既にあります（ACE の並びを整え直しました）"
+            "banto-hub-elev: サービス '{service_name}' の DACL には '{group}' の ACE（{RIGHTS}: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）"
         ),
         ServiceAclOutcome::AlreadyPresent => format!(
             "banto-hub-elev: サービス '{service_name}' の DACL には '{group}' の ACE（{RIGHTS}: 照会・開始・停止）が既にあります（変更していません）"
@@ -1366,7 +1366,7 @@ mod tests {
         );
         assert_eq!(
             line(O::Reordered),
-            "banto-hub-elev: サービス 'BantoHub' の DACL には 'BantoHub Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（ACE の並びを整え直しました）"
+            "banto-hub-elev: サービス 'BantoHub' の DACL には 'BantoHub Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）"
         );
         assert_eq!(
             line(O::AlreadyPresent),

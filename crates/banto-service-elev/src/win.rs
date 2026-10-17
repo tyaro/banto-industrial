@@ -302,14 +302,10 @@ pub fn grant_service_operators(
     let mut operators_sid = lookup_account_sid(group.name)?
         .ok_or_else(|| ElevError::GroupNotFound(group.name.to_string()))?;
 
-    // 結果の出し分け（消えた ACE が Operators のものか）に使う文字列形式。
-    let sid_text = crate::sid_bytes_to_string(&operators_sid).ok_or_else(|| {
-        ElevError::LookupAccountName {
-            name: group.name.to_string(),
-            // ERROR_INVALID_SID
-            os_error: 1337,
-        }
-    })?;
+    // 結果の出し分け（Operators の ACE が消えたか）に使う文字列形式。判定と表示にしか
+    // 使わないので、文字列にできなくても付与は止めない（空の文字列なら Operators の ACE は
+    // 1 つも見つからず、判定は書く側の `Added` に倒れる）。
+    let sid_text = crate::sid_bytes_to_string(&operators_sid).unwrap_or_default();
 
     let scm = open_scm()?;
     let result = grant_with_scm(
@@ -646,6 +642,10 @@ mod tests {
         // (c) 同じ相手に別の権利 → Replaced。
         let wider = format!("{EXISTING}(A;;CCDCLCRPWP;;;{OPERATORS})");
         assert_eq!(outcome(&wider, OPERATORS), ServiceAclOutcome::Replaced);
+        // 継承の ACE だけがある → 明示の許可を足すので Added（`SetEntriesInAclW` が継承の
+        // ACE を残しても、Operators の ACE が増えたことは変わらない）。
+        let inherited = format!("{EXISTING}(A;ID;CCLCRPWP;;;{OPERATORS})");
+        assert_eq!(outcome(&inherited, OPERATORS), ServiceAclOutcome::Added);
         // (e) 既にあるが並びが正規でない（許可の後ろに拒否）→ Reordered（足していない）。
         // `SetEntriesInAclW` は拒否を許可より前に並べ直すので、書く側に倒れる。
         let ours_ace = crate::operators_ace_sddl(OPERATORS).unwrap();
