@@ -11,6 +11,22 @@ export interface OpcUaSettings {
 	advertisedHost: string | null;
 }
 
+/**
+ * listener の状態（#634、`GET /api/opcua-status`）。設定の保存（PUT）は起動の
+ * 完了を待たずに返るので、起動中・起動済み・失敗（理由つき）・停止はここで見る。
+ */
+export type OpcUaState = 'stopped' | 'starting' | 'running' | 'failed';
+
+export interface OpcUaStatus {
+	state: OpcUaState;
+	/** 起動済みのときだけ、クライアントへ案内する endpoint の URL。 */
+	endpoint: string | null;
+	/** 失敗のときだけ、その理由。 */
+	error: string | null;
+	/** この状態を作った設定の世代。保存のたびに進む。 */
+	generation: number;
+}
+
 const ERROR_KINDS = new Set([
 	'not_found',
 	'validation',
@@ -31,7 +47,12 @@ function currentToken(): string | null {
 	return auth.getToken ? auth.getToken() : null;
 }
 
-async function request(method: 'GET' | 'PUT', body?: OpcUaSettings): Promise<OpcUaSettings> {
+async function request<T>(
+	method: 'GET' | 'PUT',
+	path: '/api/opcua-settings' | '/api/opcua-status',
+	body?: OpcUaSettings,
+	signal?: AbortSignal
+): Promise<T> {
 	const headers: Record<string, string> = { ...CSRF_HEADER };
 	if (body) headers['Content-Type'] = 'application/json';
 	const token = currentToken();
@@ -39,10 +60,11 @@ async function request(method: 'GET' | 'PUT', body?: OpcUaSettings): Promise<Opc
 
 	let response: Response;
 	try {
-		response = await fetch('/api/opcua-settings', {
+		response = await fetch(path, {
 			method,
 			headers,
-			body: body ? JSON.stringify(body) : undefined
+			body: body ? JSON.stringify(body) : undefined,
+			signal
 		});
 	} catch {
 		throw new ProviderError({ kind: 'other', message: 'サーバーに接続できません' });
@@ -65,14 +87,27 @@ async function request(method: 'GET' | 'PUT', body?: OpcUaSettings): Promise<Opc
 		});
 	}
 
-	return (await response.json()) as OpcUaSettings;
+	try {
+		return (await response.json()) as T;
+	} catch {
+		// 本文の読み取りも `signal` で打ち切られる。
+		throw new ProviderError({ kind: 'other', message: 'サーバーに接続できません' });
+	}
 }
 
 export function getOpcUaSettings(): Promise<OpcUaSettings> {
-	return request('GET');
+	return request<OpcUaSettings>('GET', '/api/opcua-settings');
 }
 
-/** 保存した設定はサーバーが即時適用する。 */
+/**
+ * 設定を保存する。サーバーは保存して listener の停止・起動を始めたらすぐ返る
+ * （#634）。起動の結果は {@link getOpcUaStatus} で見る。
+ */
 export function saveOpcUaSettings(input: OpcUaSettings): Promise<OpcUaSettings> {
-	return request('PUT', input);
+	return request<OpcUaSettings>('PUT', '/api/opcua-settings', input);
+}
+
+/** `signal` で打ち切れる（画面は期限つきで呼ぶ。`opcuaStatusPoller.ts`）。 */
+export function getOpcUaStatus(signal?: AbortSignal): Promise<OpcUaStatus> {
+	return request<OpcUaStatus>('GET', '/api/opcua-status', undefined, signal);
 }

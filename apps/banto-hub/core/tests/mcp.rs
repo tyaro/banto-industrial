@@ -5197,3 +5197,50 @@ async fn create_and_update_connection_reject_the_hub_protocol_before_queueing() 
         .unwrap();
     assert_eq!(protocol, "slmp");
 }
+
+/// #635（2026-10-17 オーナー決定 案 A）: MCP の `create_tag` も、ドットを含む
+/// 名前をつないだ外部名が既存のタグと重なるなら断り（REST と同じ
+/// `preflight_transaction`）、どの既存のタグと重なるかを示す。何も作らない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_tag_rejects_a_dotted_external_name_collision() {
+    let app = test_app("635-mcp-collision").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let ab = create_test_connection(&app, "a.b", 15091).await;
+    let c = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("c", ab, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("d", c.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+    let a = create_test_connection(&app, "a", 15092).await;
+    let bc = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("b.c", a, 100))
+        .await
+        .unwrap();
+    let before_rows = tags_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "d",
+                "collectionGroupId": bc.id,
+                "address": "D101",
+                "dataType": "u16",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("a.b.c.d") && text.contains("接続「a.b」/ グループ「c」/ タグ「d」"),
+        "{text}"
+    );
+    assert_eq!(tags_row_count(&app).await, before_rows);
+}

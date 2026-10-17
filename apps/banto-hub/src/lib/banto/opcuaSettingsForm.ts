@@ -1,4 +1,23 @@
-import type { OpcUaSettings } from './opcuaSettingsAdmin';
+import type { OpcUaSettings, OpcUaStatus } from './opcuaSettingsAdmin';
+
+/** 状態のピルの表示（#634）。`tone` は `ok`・`bad`・中立（`null`）。 */
+export function opcUaStatusPill(status: OpcUaStatus | null): {
+	label: string;
+	tone: 'ok' | 'bad' | null;
+} {
+	switch (status?.state) {
+		case 'running':
+			return { label: '待受中', tone: 'ok' };
+		case 'starting':
+			return { label: '起動中…', tone: null };
+		case 'failed':
+			return { label: '起動失敗', tone: 'bad' };
+		case 'stopped':
+			return { label: '停止', tone: 'bad' };
+		default:
+			return { label: '状態: 未確認', tone: 'bad' };
+	}
+}
 
 function isIpv4(value: string): boolean {
 	const octets = value.split('.');

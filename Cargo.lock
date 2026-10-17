@@ -827,12 +827,12 @@ dependencies = [
 [[package]]
 name = "banto-opcua-core"
 version = "0.1.0"
-source = "git+https://github.com/tyaro/banto-opcua?rev=c123d6fa2d3e26594d02919e90d20d10595e0b8d#c123d6fa2d3e26594d02919e90d20d10595e0b8d"
+source = "git+https://github.com/tyaro/banto-opcua?rev=d6e0291d492890261636a5103ea434665b02c476#d6e0291d492890261636a5103ea434665b02c476"
 
 [[package]]
 name = "banto-opcua-server"
 version = "0.1.0"
-source = "git+https://github.com/tyaro/banto-opcua?rev=c123d6fa2d3e26594d02919e90d20d10595e0b8d#c123d6fa2d3e26594d02919e90d20d10595e0b8d"
+source = "git+https://github.com/tyaro/banto-opcua?rev=d6e0291d492890261636a5103ea434665b02c476#d6e0291d492890261636a5103ea434665b02c476"
 dependencies = [
  "async-opcua",
  "banto-opcua-core",

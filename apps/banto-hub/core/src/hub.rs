@@ -490,14 +490,22 @@ pub struct TagMap {
     by_external: HashMap<String, TagEntry>,
     /// Stable display/listing order: connection name, then group name, then
     /// tag name (design's own hub.rs sketch: "catalog の安定順(connection,
-    /// group, tag の名前順)"). `collection_groups.name`/`plc_connections.name`
-    /// are each globally `UNIQUE`, and `tags.name` is `UNIQUE(collection_group_id,
-    /// name)` (migration 0011, 2026-08-31 オーナー決定: 全体一意→収集グループ内
-    /// 一意へ緩和 - 同型装置を複数台つないで同じ PLC アドレスを使う構成を
-    /// 許すため) - so external names still never collide: two tags sharing a
-    /// `name` must live in two different groups, and those groups' own
-    /// (globally-unique) names already differ.
+    /// group, tag の名前順)"). Each external name appears **once**.
+    ///
+    /// `collection_groups.name`/`plc_connections.name` are each globally
+    /// `UNIQUE`, and `tags.name` is `UNIQUE(collection_group_id, name)`
+    /// (migration 0011), but names may contain `.`, so two different
+    /// `(connection, group, tag)` triples can still join to the same
+    /// external name (`a.b`/`c`/`d` and `a`/`b.c`/`d` are both `a.b.c.d`,
+    /// #635). Since 2026-10-17 the registry writes reject a write that
+    /// creates such a collision (`crate::rest::preflight_transaction`), but
+    /// rows written before that may still collide: the last entry in
+    /// catalog order wins the name (`by_external`), the others are listed in
+    /// `collisions` and reported as warning lines when the catalog is
+    /// installed ([`warn_external_name_collisions`]).
     ordered: Vec<String>,
+    /// External names shared by more than one tag (#635), in catalog order.
+    collisions: Vec<ExternalNameCollision>,
 }
 
 impl TagMap {
@@ -522,6 +530,12 @@ impl TagMap {
 
     pub fn is_empty(&self) -> bool {
         self.ordered.is_empty()
+    }
+
+    /// External names shared by more than one tag (#635). Only the last tag
+    /// of each collision (catalog order) is reachable by its external name.
+    pub fn collisions(&self) -> &[ExternalNameCollision] {
+        &self.collisions
     }
 
     /// Test-only builder helper: insert one entry directly, bypassing
@@ -565,10 +579,67 @@ pub async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::Bant
     })
 }
 
-/// Build the external-name catalog from one registry snapshot. This is kept
-/// separate from the pool-reading compatibility wrapper so a catalog commit
-/// and a collector preflight can use exactly the same logical registry read.
-pub fn build_catalog_from(snapshot: &RegistrySnapshot) -> Result<TagMap, banto_core::BantoError> {
+/// The external name of one tag: `{connection}.{group}.{tag}` (design §4.1).
+/// The **only** place that joins the three names - the catalog and the
+/// collision check (#635) both go through [`catalog_entries`], which calls
+/// this, so the two can never disagree on how a name is assembled.
+pub fn external_name(connection: &str, group: &str, tag: &str) -> String {
+    format!("{connection}.{group}.{tag}")
+}
+
+/// One tag that shares its external name with another tag (#635).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollidingTag {
+    /// `(connection id, group id, tag id)`, as [`TagEntry::ids`].
+    pub ids: (i64, i64, i64),
+    pub connection: String,
+    pub group: String,
+    pub name: String,
+}
+
+impl CollidingTag {
+    fn describe(&self) -> String {
+        format!(
+            "接続「{}」/ グループ「{}」/ タグ「{}」（タグ ID {}）",
+            self.connection, self.group, self.name, self.ids.2
+        )
+    }
+}
+
+/// An external name shared by two or more tags (#635), with the tags in
+/// catalog order. The catalog's lookup resolves the name to the **last** one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalNameCollision {
+    pub external_name: String,
+    pub tags: Vec<CollidingTag>,
+}
+
+impl ExternalNameCollision {
+    /// The warning line for an existing collision (the Hub keeps running -
+    /// 2026-10-17 オーナー決定): which tags can no longer be reached by the
+    /// external name, and which one the name resolves to.
+    pub fn warning_line(&self) -> String {
+        let (winner, hidden) = self
+            .tags
+            .split_last()
+            .expect("a collision has at least two tags");
+        let hidden = hidden
+            .iter()
+            .map(CollidingTag::describe)
+            .collect::<Vec<_>>()
+            .join("、");
+        format!(
+            "[WARN] banto-hub: 外部名「{}」が複数のタグで重なっています（#635）。{hidden} は外部名で引けません（REST・WebSocket・MQTT・gRPC・OPC UA）。外部名は {} を指します。接続・グループ・タグのどれかの名前を変えてください",
+            self.external_name,
+            winner.describe()
+        )
+    }
+}
+
+/// Every catalog entry of `snapshot`, sorted in catalog order - the one
+/// assembly shared by [`build_catalog_from`] and
+/// [`external_name_collisions`].
+fn catalog_entries(snapshot: &RegistrySnapshot) -> Vec<TagEntry> {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
     let tags = &snapshot.tags;
@@ -584,7 +655,7 @@ pub fn build_catalog_from(snapshot: &RegistrySnapshot) -> Result<TagMap, banto_c
             continue;
         };
         entries.push(TagEntry {
-            external_name: format!("{}.{}.{}", conn.name, group.name, tag.name),
+            external_name: external_name(&conn.name, &group.name, &tag.name),
             tag_key: tag_key(tag.id),
             ids: (conn.id, group.id, tag.id),
             connection: conn.name.clone(),
@@ -607,17 +678,145 @@ pub fn build_catalog_from(snapshot: &RegistrySnapshot) -> Result<TagMap, banto_c
     entries.sort_by(|a, b| {
         (&a.connection, &a.group, &a.name).cmp(&(&b.connection, &b.group, &b.name))
     });
+    entries
+}
+
+/// Group sorted entries by external name and keep the shared ones.
+fn collisions_in(entries: &[TagEntry]) -> Vec<ExternalNameCollision> {
+    let mut by_name: HashMap<&str, Vec<&TagEntry>> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for entry in entries {
+        let members = by_name.entry(entry.external_name.as_str()).or_default();
+        if members.is_empty() {
+            order.push(entry.external_name.as_str());
+        }
+        members.push(entry);
+    }
+    order
+        .into_iter()
+        .filter_map(|name| {
+            let members = &by_name[name];
+            (members.len() > 1).then(|| ExternalNameCollision {
+                external_name: name.to_owned(),
+                tags: members
+                    .iter()
+                    .map(|entry| CollidingTag {
+                        ids: entry.ids,
+                        connection: entry.connection.clone(),
+                        group: entry.group.clone(),
+                        name: entry.name.clone(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// External names shared by more than one tag in `snapshot` (#635). Pure;
+/// assembles names exactly as [`build_catalog_from`] does.
+pub fn external_name_collisions(snapshot: &RegistrySnapshot) -> Vec<ExternalNameCollision> {
+    collisions_in(&catalog_entries(snapshot))
+}
+
+/// A collision that a registry write would **create** (#635): `introduced`
+/// are the tags the write created or renamed (their external name differs
+/// from `before`, or they did not exist), `existing` are the tags that
+/// already had this external name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewExternalNameCollision {
+    pub external_name: String,
+    pub introduced: Vec<CollidingTag>,
+    pub existing: Vec<CollidingTag>,
+}
+
+impl NewExternalNameCollision {
+    /// The validation message: which existing tag the name collides with.
+    pub fn message(&self) -> String {
+        let list = |tags: &[CollidingTag]| {
+            tags.iter()
+                .map(CollidingTag::describe)
+                .collect::<Vec<_>>()
+                .join("、")
+        };
+        if self.existing.is_empty() {
+            format!(
+                "外部名「{}」が、この変更で作る・変えるタグどうし（{}）で重なります。接続・グループ・タグの名前をドットでつないだ外部名が同じだと、外部から区別できません。名前を変えてください",
+                self.external_name,
+                list(&self.introduced)
+            )
+        } else {
+            format!(
+                "外部名「{}」が既存のタグ（{}）と重なります。接続・グループ・タグの名前をドットでつないだ外部名が同じだと、外部から区別できません。名前を変えてください",
+                self.external_name,
+                list(&self.existing)
+            )
+        }
+    }
+}
+
+/// The collisions a registry write creates, comparing the registry before
+/// and after the write (#635, 2026-10-17 オーナー決定 案 A). A collision
+/// counts as new when it pairs two tags that did not already share that
+/// external name before the write; collisions that already existed (rows
+/// written before this check) are left alone so that unrelated edits and
+/// the edits that resolve them still go through. Pure.
+pub fn new_external_name_collisions(
+    before: &RegistrySnapshot,
+    after: &RegistrySnapshot,
+) -> Vec<NewExternalNameCollision> {
+    let before_names: HashMap<i64, String> = catalog_entries(before)
+        .into_iter()
+        .map(|entry| (entry.ids.2, entry.external_name))
+        .collect();
+    external_name_collisions(after)
+        .into_iter()
+        .filter_map(|collision| {
+            let (existing, introduced): (Vec<_>, Vec<_>) = collision
+                .tags
+                .into_iter()
+                .partition(|tag| before_names.get(&tag.ids.2) == Some(&collision.external_name));
+            (!introduced.is_empty()).then_some(NewExternalNameCollision {
+                external_name: collision.external_name,
+                introduced,
+                existing,
+            })
+        })
+        .collect()
+}
+
+/// #635: report the collisions of a catalog being installed as warning
+/// lines (the Hub keeps running - 2026-10-17 オーナー決定). A collision
+/// already present in the catalog being replaced is not repeated.
+fn warn_external_name_collisions(old: &TagMap, new: &TagMap) {
+    for collision in &new.collisions {
+        if !old.collisions.contains(collision) {
+            crate::hub_log::log_err_line(&collision.warning_line());
+        }
+    }
+}
+
+/// Build the external-name catalog from one registry snapshot. This is kept
+/// separate from the pool-reading compatibility wrapper so a catalog commit
+/// and a collector preflight can use exactly the same logical registry read.
+pub fn build_catalog_from(snapshot: &RegistrySnapshot) -> Result<TagMap, banto_core::BantoError> {
+    let entries = catalog_entries(snapshot);
+    let collisions = collisions_in(&entries);
 
     let mut by_external = HashMap::with_capacity(entries.len());
     let mut ordered = Vec::with_capacity(entries.len());
     for entry in entries {
-        ordered.push(entry.external_name.clone());
-        by_external.insert(entry.external_name.clone(), entry);
+        // #635: a shared external name is listed once (at its first
+        // position); the lookup keeps the last entry, as before.
+        let name = entry.external_name.clone();
+        if by_external.insert(name.clone(), entry).is_none() {
+            ordered.push(name);
+        }
     }
 
     Ok(TagMap {
         by_external,
         ordered,
+        collisions,
     })
 }
 
@@ -1312,6 +1511,7 @@ impl CollectorManager {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
                 self.server_store()
                     .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
+                warn_external_name_collisions(&inner.map, &new_map);
                 inner.map = Arc::new(new_map);
                 inner.revision += 1;
                 inner.last_error = None;
@@ -1407,6 +1607,7 @@ impl CollectorManager {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             self.server_store()
                 .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
+            warn_external_name_collisions(&inner.map, &new_map);
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
@@ -2069,6 +2270,7 @@ impl CollectorManager {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             self.server_store()
                 .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
+            warn_external_name_collisions(&inner.map, &new_map);
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
@@ -2935,10 +3137,11 @@ mod tests {
     /// 緩和」の回帰防止: `tags.name` が2つのグループで重複していても、
     /// `external_name` は `{connection}.{group}.{tag}` の合成のまま従来どおり
     /// 組み立てられ、かつグループをまたいで衝突しないこと -
-    /// `TagMap`（旧 `ordered`フィールドの doc comment参照）が前提とする
     /// 「`collection_groups.name`/`plc_connections.name` は今もグローバルに
-    /// `UNIQUE` だから外部名は衝突しない」という理屈を、実際に
-    /// `build_catalog_from` を通して確かめる。DB を経由しない純粋関数テスト
+    /// `UNIQUE` だから、同じタグ名でもグループが違えば外部名は衝突しない」
+    /// ことを、実際に `build_catalog_from` を通して確かめる（名前にドットを
+    /// 含むときの重なりは #635、`build_catalog_from_detects_an_existing_dotted_name_collision`）。
+    /// DB を経由しない純粋関数テスト
     /// (`all_simulation_overrides_only_enabled_physical_connections` と同じ
     /// スタイル)。
     #[test]
@@ -3042,6 +3245,256 @@ mod tests {
         );
     }
 
+    /// #635 のテスト用: 名前だけ違う接続・グループ・タグで snapshot を組む。
+    /// `tags` は `(タグ ID, グループ ID, 名前)`。
+    fn named_snapshot(
+        connections: &[(i64, &str)],
+        groups: &[(i64, i64, &str)],
+        tags: &[(i64, i64, &str)],
+    ) -> RegistrySnapshot {
+        RegistrySnapshot {
+            connections: connections
+                .iter()
+                .map(|&(id, name)| PlcConnection {
+                    id,
+                    name: name.to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 502,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+                    word_order: "low_high".to_string(),
+                    cpu_type: "R".to_string(),
+                    database: None,
+                    username: None,
+                    password: None,
+                })
+                .collect(),
+            groups: groups
+                .iter()
+                .map(|&(id, conn, name)| banto_tags::CollectionGroup {
+                    id,
+                    name: name.to_string(),
+                    plc_connection_id: conn,
+                    period_ms: 1_000,
+                    enabled: true,
+                    default_writable: true,
+                    query_sql: None,
+                })
+                .collect(),
+            tags: tags
+                .iter()
+                .map(|&(id, group, name)| Tag {
+                    id,
+                    name: name.to_string(),
+                    collection_group_id: group,
+                    address: "40001".to_string(),
+                    data_type: "i16".to_string(),
+                    string_length: None,
+                    string_encoding: "utf8".to_string(),
+                    raw_lo: None,
+                    raw_hi: None,
+                    eng_lo: None,
+                    eng_hi: None,
+                    unit: None,
+                    decimals: 0,
+                    enabled: true,
+                    writable: false,
+                    tag_kind: "plc".to_string(),
+                    expression: None,
+                    retain: false,
+                    revision: 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// #635: 接続「a.b」/グループ「c」/タグ「d」と 接続「a」/グループ「b.c」/タグ「d」は
+    /// どちらも外部名 `a.b.c.d`。既にこう重なっているデータでも catalog は作れ、
+    /// 重なりを検出して警告の行を出す。一覧（`iter`・`len`）には外部名ごとに 1 回だけ
+    /// 出し、外部名で引けるのは catalog 順で最後のタグ。
+    #[test]
+    fn build_catalog_from_detects_an_existing_dotted_name_collision() {
+        let snapshot = named_snapshot(
+            &[(1, "a.b"), (2, "a")],
+            &[(10, 1, "c"), (20, 2, "b.c")],
+            &[(100, 10, "d"), (200, 20, "d"), (300, 20, "e")],
+        );
+
+        let map = build_catalog_from(&snapshot).expect("build_catalog_from");
+        assert_eq!(map.len(), 2, "a.b.c.d と a.b.c.e");
+        let listed: Vec<_> = map
+            .iter()
+            .map(|entry| entry.external_name.as_str())
+            .collect();
+        assert_eq!(listed, ["a.b.c.d", "a.b.c.e"], "重なった名前は 1 回だけ");
+        assert_eq!(map.get("a.b.c.d").expect("a.b.c.d").ids, (1, 10, 100));
+
+        let collisions = map.collisions();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions, external_name_collisions(&snapshot).as_slice());
+        let collision = &collisions[0];
+        assert_eq!(collision.external_name, "a.b.c.d");
+        let ids: Vec<_> = collision.tags.iter().map(|tag| tag.ids).collect();
+        assert_eq!(
+            ids,
+            [(2, 20, 200), (1, 10, 100)],
+            "catalog 順（接続名 a < a.b）"
+        );
+
+        let line = collision.warning_line();
+        assert!(
+            line.starts_with("[WARN] banto-hub: 外部名「a.b.c.d」"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "接続「a」/ グループ「b.c」/ タグ「d」（タグ ID 200） は外部名で引けません"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "外部名は 接続「a.b」/ グループ「c」/ タグ「d」（タグ ID 100） を指します"
+            ),
+            "{line}"
+        );
+    }
+
+    /// #635: 重なりの無い catalog は `collisions` が空。
+    #[test]
+    fn build_catalog_from_reports_no_collision_for_distinct_names() {
+        let snapshot = named_snapshot(
+            &[(1, "a.b"), (2, "a")],
+            &[(10, 1, "c"), (20, 2, "b.x")],
+            &[(100, 10, "d"), (200, 20, "d")],
+        );
+        let map = build_catalog_from(&snapshot).expect("build_catalog_from");
+        assert!(map.collisions().is_empty());
+        assert_eq!(map.len(), 2);
+    }
+
+    /// #635 案 A: 作成・改名（タグ・グループ・接続、グループの付け替え）で新しく
+    /// 生まれる重なりを返し、既存のタグを示す。既にあった重なりは数えない
+    /// （無関係な変更・重なりを解く変更を塞がない）。
+    #[test]
+    fn new_external_name_collisions_reports_only_collisions_the_write_creates() {
+        let base_conns: &[(i64, &str)] = &[(1, "a.b"), (2, "a")];
+        let base_groups: &[(i64, i64, &str)] = &[(10, 1, "c"), (20, 2, "b.c"), (30, 2, "x")];
+        let before = named_snapshot(base_conns, base_groups, &[(100, 10, "d"), (200, 20, "e")]);
+
+        // タグの作成
+        let created = named_snapshot(
+            base_conns,
+            base_groups,
+            &[(100, 10, "d"), (200, 20, "e"), (300, 20, "d")],
+        );
+        let new = new_external_name_collisions(&before, &created);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].external_name, "a.b.c.d");
+        assert_eq!(
+            new[0]
+                .introduced
+                .iter()
+                .map(|t| t.ids.2)
+                .collect::<Vec<_>>(),
+            [300]
+        );
+        assert_eq!(
+            new[0].existing.iter().map(|t| t.ids.2).collect::<Vec<_>>(),
+            [100]
+        );
+        let message = new[0].message();
+        assert!(
+            message.contains("外部名「a.b.c.d」が既存のタグ（接続「a.b」/ グループ「c」/ タグ「d」（タグ ID 100））と重なります"),
+            "{message}"
+        );
+
+        // タグの改名
+        let renamed = named_snapshot(base_conns, base_groups, &[(100, 10, "d"), (200, 20, "d")]);
+        let new = new_external_name_collisions(&before, &renamed);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].introduced[0].ids.2, 200);
+
+        // タグのグループの付け替え（x → b.c）
+        let before_move =
+            named_snapshot(base_conns, base_groups, &[(100, 10, "d"), (200, 30, "d")]);
+        let new = new_external_name_collisions(&before_move, &renamed);
+        assert_eq!(new.len(), 1, "付け替えも外部名が変わる");
+
+        // グループの改名（x → b.c は名前が使用中なので、b.c の無い構成で）
+        let before_group = named_snapshot(
+            base_conns,
+            &[(10, 1, "c"), (30, 2, "x")],
+            &[(100, 10, "d"), (200, 30, "d")],
+        );
+        let after_group = named_snapshot(
+            base_conns,
+            &[(10, 1, "c"), (30, 2, "b.c")],
+            &[(100, 10, "d"), (200, 30, "d")],
+        );
+        assert_eq!(
+            new_external_name_collisions(&before_group, &after_group).len(),
+            1
+        );
+
+        // 接続の改名（m → a）
+        let before_conn = named_snapshot(
+            &[(1, "a.b"), (2, "m")],
+            &[(10, 1, "c"), (20, 2, "b.c")],
+            &[(100, 10, "d"), (200, 20, "d")],
+        );
+        let after_conn = named_snapshot(
+            &[(1, "a.b"), (2, "a")],
+            &[(10, 1, "c"), (20, 2, "b.c")],
+            &[(100, 10, "d"), (200, 20, "d")],
+        );
+        assert_eq!(
+            new_external_name_collisions(&before_conn, &after_conn).len(),
+            1
+        );
+
+        // 同じ書き込みで作るタグどうしの重なり（一括作成）は、既存が無いと示す。
+        let empty = named_snapshot(base_conns, base_groups, &[]);
+        let new = new_external_name_collisions(&empty, &renamed);
+        assert_eq!(new.len(), 1);
+        assert!(new[0].existing.is_empty());
+        assert!(new[0]
+            .message()
+            .contains("この変更で作る・変えるタグどうし"));
+
+        // 既にあった重なりは数えない: 無関係なタグの追加・既存の重なりの解消。
+        let unrelated = named_snapshot(
+            base_conns,
+            base_groups,
+            &[(100, 10, "d"), (200, 20, "d"), (400, 30, "z")],
+        );
+        assert!(new_external_name_collisions(&renamed, &unrelated).is_empty());
+        assert!(new_external_name_collisions(&renamed, &before).is_empty());
+        // 既に重なっているタグに 3 つ目（接続「a」/ グループ「b」/ タグ「c.d」）を
+        // 足すのは新しい重なり。既存の 2 つを示す。
+        let third = named_snapshot(
+            base_conns,
+            &[(10, 1, "c"), (20, 2, "b.c"), (50, 2, "b")],
+            &[(100, 10, "d"), (200, 20, "d"), (600, 50, "c.d")],
+        );
+        let new = new_external_name_collisions(&renamed, &third);
+        assert_eq!(new.len(), 1);
+        assert_eq!(
+            new[0]
+                .introduced
+                .iter()
+                .map(|t| t.ids.2)
+                .collect::<Vec<_>>(),
+            [600]
+        );
+        assert_eq!(
+            new[0].existing.iter().map(|t| t.ids.2).collect::<Vec<_>>(),
+            [200, 100]
+        );
+    }
+
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3115,6 +3568,81 @@ mod tests {
         // its `EventSink` pool clone checked out - see
         // `crate::test_support`'s module doc for why that alone defeats
         // `TempDir::drop`'s retry regardless of ordering.
+        manager.shutdown().await;
+    }
+
+    /// #635: 既に外部名が重なっている DB（2026-10-17 の検証より前に書いた行）でも
+    /// catalog の再構築は失敗しない（起動を止めない、オーナー決定）。重なりは
+    /// catalog に載り、警告の行に出る（`warn_external_name_collisions`）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuild_keeps_running_with_an_existing_external_name_collision() {
+        let (_dir, manager, pool) = manager_env().await;
+        let mut ids = Vec::new();
+        for (conn_name, group_name, port) in [("a.b", "c", 15024), ("a", "b.c", 15025)] {
+            let conn = PlcConnectionService::new(pool.clone())
+                .create(PlcConnectionInput {
+                    name: conn_name.to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+                    word_order: "low_high".to_string(),
+                    cpu_type: None,
+                    database: None,
+                    username: None,
+                    password: None,
+                })
+                .await
+                .unwrap();
+            let group = CollectionGroupService::new(pool.clone())
+                .create(CollectionGroupInput {
+                    name: group_name.to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 100,
+                    enabled: true,
+                    default_writable: true,
+                    query_sql: None,
+                })
+                .await
+                .unwrap();
+            // サービスは外部名を知らないので、検証より前の行と同じく重なりを書ける。
+            let tag = TagService::new(pool.clone())
+                .create(TagInput {
+                    name: "d".to_string(),
+                    collection_group_id: group.id,
+                    address: "40001".to_string(),
+                    data_type: "i16".to_string(),
+                    string_length: None,
+                    string_encoding: "utf8".to_string(),
+                    raw_lo: None,
+                    raw_hi: None,
+                    eng_lo: None,
+                    eng_hi: None,
+                    unit: None,
+                    decimals: 0,
+                    enabled: false,
+                    writable: false,
+                    tag_kind: "plc".to_string(),
+                    expression: None,
+                    retain: false,
+                    expected_revision: None,
+                })
+                .await
+                .unwrap();
+            ids.push(tag.id);
+        }
+
+        manager
+            .rebuild()
+            .await
+            .expect("rebuild must not fail on a collision");
+        let map = manager.tag_map();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.collisions().len(), 1);
+        let hidden = &map.collisions()[0].tags[0];
+        assert_eq!((hidden.connection.as_str(), hidden.ids.2), ("a", ids[1]));
         manager.shutdown().await;
     }
 
