@@ -31,8 +31,8 @@ impl fmt::Display for IoOp {
         f.write_str(match self {
             Self::CreateDir => "フォルダの作成",
             Self::InspectDir => "フォルダの確認",
-            Self::ReadFile => "読み込み",
-            Self::RemoveFile => "削除",
+            Self::ReadFile => "ファイルの読み込み",
+            Self::RemoveFile => "ファイルの削除",
             Self::OpenFile => "ファイルの確認",
             Self::CreateFile => "ファイルの作成",
             Self::WriteFile => "ファイルへの書き込み",
@@ -97,7 +97,7 @@ impl fmt::Display for AclMismatch {
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SafeRootError {
-    #[error("フォルダ・ファイルの{op}に失敗しました（{kind}{}）", os_suffix(*.os_error))]
+    #[error("{op}に失敗しました（{kind}{}）", os_suffix(*.os_error))]
     Io {
         op: IoOp,
         kind: io::ErrorKind,
@@ -122,6 +122,8 @@ pub enum SafeRootError {
 }
 
 impl SafeRootError {
+    // 使うのは Windows の実装だけ（非 Windows の `imp` は UnsupportedPlatform を返す）。
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn io(op: IoOp, error: &io::Error) -> Self {
         Self::Io {
             op,

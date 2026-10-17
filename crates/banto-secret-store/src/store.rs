@@ -156,9 +156,8 @@ impl<P: Protector> FileSecretStore<P> {
         }
         match &self.mode {
             DirMode::Enforced(access) => {
-                // SID は open で確かめ済み（banto_safe_root::acl の doc「インストール利用者の
-                // SID の検証」）。ここでは ACL の形だけを確かめ直す。
-                banto_safe_root::acl::verify_dir_with_validated_sid(&self.dir, access)?
+                // SID の確かめも含む（open と同じ確かめなので結果は変わらない）。
+                banto_safe_root::acl::verify_dir(&self.dir, access)?
             }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {}
@@ -170,8 +169,7 @@ impl<P: Protector> FileSecretStore<P> {
     fn ensure_dir_for_write(&self) -> Result<()> {
         match &self.mode {
             DirMode::Enforced(access) => {
-                banto_safe_root::acl::ensure_dir_with_validated_sid(&self.dir, access)
-                    .map_err(SecretStoreError::from)
+                banto_safe_root::acl::ensure_dir(&self.dir, access).map_err(SecretStoreError::from)
             }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {

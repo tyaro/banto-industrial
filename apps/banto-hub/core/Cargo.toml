@@ -51,7 +51,8 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # 純粋な部品（`guard`・`InstallUserSid`）は全 OS で使い、手順の偽物のテストを Linux でも
 # 走らせるので、Windows 限定にしない。`banto-hub-bootstrap`・`banto-tagclient`が
 # 付いてくるが、どちらもこの crate が既に持つ依存（reqwest・tungstenite 等）の上で、
-# Cargo.lock に新しい crate は増えない。
+# Cargo.lock に新しい crate は増えない。これらの部品は `banto-safe-root`（#623 PR-1a で
+# `banto-secret-store` から分けた共有 crate）にある。
 banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its

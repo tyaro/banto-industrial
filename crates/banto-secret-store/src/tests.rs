@@ -382,8 +382,7 @@ mod windows {
     use super::*;
     use crate::{DirAccess, DpapiMachine};
     use banto_safe_root::acl::{
-        current_user_sid, ensure_dir_with_validated_sid, read_dir_dacl, reset_dir_acl,
-        MODIFY_ACCESS_MASK,
+        current_user_sid, read_dir_dacl, reset_dir_acl, MODIFY_ACCESS_MASK,
     };
     use banto_safe_root::AclMismatch;
 
@@ -501,8 +500,8 @@ mod windows {
         let group_access = DirAccess::with_install_user(group);
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("granted-to-group");
-        // SID の検証を通らない経路で、グループに「変更」を付けた形のフォルダを作る。
-        ensure_dir_with_validated_sid(&dir, &group_access).ok();
+        // open は ACL の形より前に SID を確かめるので、普通に作ったフォルダで足りる。
+        std::fs::create_dir(&dir).unwrap();
         assert!(dir.exists());
 
         let err = FileSecretStore::open(&dir, group_access.clone(), PlainProtector).unwrap_err();

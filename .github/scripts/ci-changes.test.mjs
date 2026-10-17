@@ -68,22 +68,12 @@ const G = {
 		{
 			name: 'chronogazer-elev',
 			dir: 'apps/chronogazer/elev',
-			deps: [
-				'banto-safe-root',
-				'banto-service-control',
-				'banto-service-elev',
-				'chronogazer-core'
-			]
+			deps: ['banto-safe-root', 'banto-service-control', 'banto-service-elev', 'chronogazer-core']
 		},
 		{
 			name: 'chronogazer',
 			dir: 'apps/chronogazer/src-tauri',
-			deps: [
-				'banto-hub-bootstrap',
-				'banto-safe-root',
-				'banto-service-control',
-				'chronogazer-core'
-			]
+			deps: ['banto-hub-bootstrap', 'banto-safe-root', 'banto-service-control', 'chronogazer-core']
 		},
 		{
 			name: 'banto-hub-core',

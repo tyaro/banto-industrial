@@ -442,22 +442,6 @@ pub fn verify_dir(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
     imp::verify_dir(dir, access)
 }
 
-/// [`ensure_dir`] から SID の検証を除いたもの。`access` の SID を既に確かめた
-/// 呼び出し側（`banto-secret-store` の `FileSecretStore` の読む・書く・消すたびの確認）
-/// だけが使う。
-// TODO(#623 PR-3): `FileSecretStore::open_in` で不要になったら消す。
-#[doc(hidden)]
-pub fn ensure_dir_with_validated_sid(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
-    imp::ensure_dir(dir, access)
-}
-
-/// [`verify_dir`] から SID の検証を除いたもの（同上）。
-// TODO(#623 PR-3): 同上。
-#[doc(hidden)]
-pub fn verify_dir_with_validated_sid(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
-    imp::verify_dir(dir, access)
-}
-
 /// 無ければ期待の DACL で作り（`true`）、既にあれば何もしない（`false`。DACL を
 /// 読まない・確かめない・直さない）。モジュール doc「無いときだけ作る」。
 /// インストール利用者の SID は作る経路でだけ確かめる。既にあるパスがディレクトリで
@@ -3154,7 +3138,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("granted-to-group");
             // テストの中で SDDL の形どおりに作る（SID の検証を通らない経路）。
-            ensure_dir_with_validated_sid(&dir, &group_access).ok();
+            imp::ensure_dir(&dir, &group_access).ok();
             assert!(dir.exists());
 
             for err in [
