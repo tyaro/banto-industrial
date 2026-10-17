@@ -123,12 +123,41 @@ pub enum MemberOutcome {
 /// [`grant_service_operators`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAclOutcome {
-    /// このとき ACE を足した（今の ACE は 1 つも消えていない）。
+    /// このとき Operators の ACE を足した（今ある Operators の ACE は消えていない）。
     Added,
-    /// 同じ相手の別の権利の ACE などを置き換えた（今の ACE が 1 つ以上消えた）。
+    /// Operators の別の権利の ACE を置き換えた（消えた ACE が Operators のものだった）。
     Replaced,
+    /// Operators の ACE は既にあり増えも減りもしていないが、DACL のほかの部分（並び・
+    /// 重複・ほかの相手の ACE）を正規の形に書き直した。
+    Reordered,
     /// 既に同じ ACE があった（何も書いていない）。
     AlreadyPresent,
+}
+
+/// [`grant_service_operators`] の結果を人に見せる本文にする（純関数。接頭辞は付けない。
+/// 呼び出し側が自分の名前を前に付ける）。「足しました」は実際に足したときだけ。
+pub fn grant_service_acl_message(
+    outcome: ServiceAclOutcome,
+    service_name: &str,
+    group_name: &str,
+) -> String {
+    let rights = OPERATORS_SERVICE_SDDL_RIGHTS;
+    match outcome {
+        ServiceAclOutcome::Added => format!(
+            "サービス '{service_name}' の DACL に '{group_name}' の ACE（{rights}: 照会・開始・停止）を足しました"
+        ),
+        // 同じ相手の別の権利の ACE（手で付けた広い権利など）を、既定の権利に置き換えた。
+        ServiceAclOutcome::Replaced => format!(
+            "サービス '{service_name}' の DACL の '{group_name}' の ACE を、既定の権利（{rights}: 照会・開始・停止）に置き換えました"
+        ),
+        // ACE は既にあるが、DACL の並びが正規でなかったので整え直した（足してはいない）。
+        ServiceAclOutcome::Reordered => format!(
+            "サービス '{service_name}' の DACL には '{group_name}' の ACE（{rights}: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）"
+        ),
+        ServiceAclOutcome::AlreadyPresent => format!(
+            "サービス '{service_name}' の DACL には '{group_name}' の ACE（{rights}: 照会・開始・停止）が既にあります（変更していません）"
+        ),
+    }
 }
 
 /// DACL の SDDL（`D:` の後の制御フラグ `P`・`AI`・`AR` などは読み飛ばす）から ACE の
@@ -162,34 +191,86 @@ fn dacl_aces(sddl: &str) -> Option<Vec<&str>> {
     (depth == 0).then_some(aces)
 }
 
+/// ACE の文字列（`(A;;CCLCRPWP;;;<SID>)`）の trustee（6 番目のフィールド）を取り出す
+/// （純関数）。条件つきの ACE は後ろにまだフィールドが続くので、6 番目だけを見る。
+fn ace_trustee(ace: &str) -> Option<&str> {
+    ace.strip_prefix('(')?.split(';').nth(5).map(|t| {
+        // ふつうの ACE は 6 番目のフィールドで閉じるので末尾に `)` が付く。条件つきの ACE は
+        // 後ろに `;(cond))` が続くので付かない。
+        t.strip_suffix(')').unwrap_or(t)
+    })
+}
+
+/// ACE の文字列のうち trustee（SID）だけを大文字にした形を返す（純関数）。
+/// trustee が取り出せなければ `None`。
+fn with_uppercase_trustee(ace: &str) -> Option<String> {
+    let trustee = ace_trustee(ace)?;
+    // `trustee` は `ace` の部分文字列なので、先頭からの位置はポインタの差で出せる。
+    let start = trustee.as_ptr() as usize - ace.as_ptr() as usize;
+    let end = start + trustee.len();
+    Some(format!(
+        "{}{}{}",
+        &ace[..start],
+        trustee.to_ascii_uppercase(),
+        &ace[end..]
+    ))
+}
+
 /// サービスの今の DACL（`current`）と、Operators の ACE を足して作り直した DACL
-/// （`merged`）の SDDL を比べて、結果を決める（純関数。#628）。
+/// （`merged`）の SDDL を比べて、結果を決める（純関数。#628・#658）。`operators_sid` は
+/// Operators の SID の文字列（`S-1-5-21-…`）。
 ///
 /// - 比べるのは **ACE の並び**だけ。制御フラグ（`D:P`・`D:AI` など）は無視する。作り直した
 ///   記述子は制御フラグを持たないので、今の記述子に付いていると文字列全体では毎回食い
 ///   違い、「既にあっても毎回足した」と読めてしまうため。
 /// - [`ServiceAclOutcome::AlreadyPresent`]（書き込みを省く）にするのは、ACE の並びが
 ///   **順序まで**同じときだけ。並びが違えば（順序だけの違いも）書く側に倒す。
-/// - 今の ACE が 1 つでも作り直した側に無ければ [`ServiceAclOutcome::Replaced`]（同じ
-///   相手の別の権利を置き換えた）、そうでなければ [`ServiceAclOutcome::Added`]。
-/// - どちらかの SDDL が読めなければ `Added`（これまでどおり書く）。
-pub fn classify_dacl_change(current: &str, merged: &str) -> ServiceAclOutcome {
+/// - 上のほかは、trustee が Operators の SID（大文字小文字を区別しない）の ACE だけを
+///   今と作り直した側から抜き出し、**集合として**（重複は 1 つに）比べる:
+///   同じなら [`ServiceAclOutcome::Reordered`]（Operators の ACE は変わらず、DACL の
+///   ほかの部分を書き直した。重複がまとまっただけ・ほかの相手の ACE がまとめられただけ
+///   もここ）、今の側がすべて作り直した側にもあれば [`ServiceAclOutcome::Added`]
+///   （継承・条件つき・オブジェクト・拒否の ACE だけがあったときに明示の許可を足した場合も）、
+///   今の側にだけある Operators の ACE があれば [`ServiceAclOutcome::Replaced`]。
+/// - どちらかの SDDL が読めない、または Operators の ACE がどちらにも見つからなければ `Added`（これまでどおり書く）。
+pub fn classify_dacl_change(current: &str, merged: &str, operators_sid: &str) -> ServiceAclOutcome {
     let (Some(current), Some(merged)) = (dacl_aces(current), dacl_aces(merged)) else {
         return ServiceAclOutcome::Added;
     };
     if current == merged {
         return ServiceAclOutcome::AlreadyPresent;
     }
-    let mut remaining = merged;
-    for ace in &current {
-        match remaining.iter().position(|m| m == ace) {
-            Some(i) => {
-                remaining.remove(i);
+    let is_operators =
+        |ace: &str| ace_trustee(ace).is_some_and(|t| t.eq_ignore_ascii_case(operators_sid));
+    // Operators の ACE だけを、集合として（重複は 1 つに）取り出して比べる。
+    // trustee 以外（種類・継承・条件・権利）は ACE の文字列そのもので区別する。
+    let operators_set = |aces: &[&str]| {
+        let mut set: Vec<String> = Vec::new();
+        for ace in aces.iter().filter(|a| is_operators(a)) {
+            // 大文字小文字を揃えるのは trustee（SID）だけ。残りは文字列そのもので比べる。
+            let Some(normalized) = with_uppercase_trustee(ace) else {
+                continue;
+            };
+            if !set.contains(&normalized) {
+                set.push(normalized);
             }
-            None => return ServiceAclOutcome::Replaced,
         }
+        set
+    };
+    let (before, after) = (operators_set(&current), operators_set(&merged));
+    if before.iter().all(|a| after.contains(a)) {
+        // 両方に Operators の ACE が見つからない（SID が文字列にできなかったとき）は
+        // 何も言えないので、書く側の `Added` に倒す。
+        if !before.is_empty() && before.len() == after.len() {
+            // Operators の ACE は変わっていない。DACL のほかの部分を書き直した。
+            ServiceAclOutcome::Reordered
+        } else {
+            // 今の側の Operators の ACE はすべて残り、足しただけ。
+            ServiceAclOutcome::Added
+        }
+    } else {
+        ServiceAclOutcome::Replaced
     }
-    ServiceAclOutcome::Added
 }
 
 /// Operators に付けるサービスのアクセス権（`SERVICE_QUERY_CONFIG(0x1) |
@@ -402,9 +483,13 @@ pub fn is_current_process_admin() -> Result<bool, ElevError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn classify_dacl_change_decides_by_the_ace_sequence_only() {
-        use super::{classify_dacl_change as c, ServiceAclOutcome as O};
+        use super::{classify_dacl_change as classify, ServiceAclOutcome as O};
+        const SID: &str = "S-1-5-21-1-2-3-1001";
+        let c = |current: &str, merged: &str| classify(current, merged, SID);
         let base = "(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)";
         let ours = "(A;;CCLCRPWP;;;S-1-5-21-1-2-3-1001)";
         let theirs = "(A;;CCDCLCRPWP;;;S-1-5-21-1-2-3-1001)";
@@ -436,9 +521,14 @@ mod tests {
                 "{flags}"
             );
         }
-        // 順序だけの違いは省かない（書く側に倒す）。
+        // Operators の ACE は既にあり、並びだけが違う → 足していない（Reordered）。
         assert_eq!(
             c(&format!("D:{ours}{base}"), &format!("D:{base}{ours}")),
+            O::Reordered
+        );
+        // Operators の SID が空（文字列にできなかった）なら Operators の ACE を見つけられず、書く側に倒す。
+        assert_eq!(
+            classify(&format!("D:{base}"), &format!("D:{base}{ours}"), ""),
             O::Added
         );
         // 読めなければ書く側に倒す。
@@ -455,7 +545,136 @@ mod tests {
         );
     }
 
-    use super::*;
+    /// #658: `Replaced` は、消えた ACE が Operators のものだったときだけ。
+    #[test]
+    fn classify_dacl_change_replaced_only_when_an_operators_ace_vanished() {
+        use super::{classify_dacl_change as classify, ServiceAclOutcome as O};
+        const SID: &str = "S-1-5-21-1-2-3-1001";
+        let ours = "(A;;CCLCRPWP;;;S-1-5-21-1-2-3-1001)";
+        let sy = "(A;;CCLCSWRPWPDTLOCRRC;;;SY)";
+        let ba = "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)";
+        let other = "(A;;CCLCRPWP;;;S-1-5-21-1-2-3-2002)";
+        let other_wide = "(A;;CCDCLCRPWP;;;S-1-5-21-1-2-3-2002)";
+        let deny = "(D;;CCLC;;;S-1-5-21-1-2-3-3003)";
+        // Operators の別の権利が消えた（大文字小文字の違う SID でも同じ相手）→ Replaced。
+        assert_eq!(
+            classify(
+                "D:(A;;CCDCLCRPWP;;;S-1-5-21-1-2-3-1001)",
+                &format!("D:{ours}"),
+                SID
+            ),
+            O::Replaced
+        );
+        assert_eq!(
+            classify(
+                &format!("D:{sy}(A;;CCDCLCRPWP;;;s-1-5-21-1-2-3-1001)"),
+                &format!("D:{sy}{ours}"),
+                "S-1-5-21-1-2-3-1001"
+            ),
+            O::Replaced
+        );
+        // ほかの相手の ACE がまとめられた・置き換わった（Operators の ACE は消えていない）→ Replaced にしない。
+        assert_eq!(
+            classify(
+                &format!("D:{sy}{other_wide}"),
+                &format!("D:{sy}{other}{ours}"),
+                SID
+            ),
+            O::Added
+        );
+        // 拒否の ACE が消えた → Replaced にしない（Operators の ACE が無ければ Added）。
+        assert_eq!(
+            classify(
+                &format!("D:{deny}{sy}{ba}"),
+                &format!("D:{sy}{ba}{ours}"),
+                SID
+            ),
+            O::Added
+        );
+        // Operators の ACE が既にあって、ほかの ACE が並べ直されただけ → Reordered。
+        assert_eq!(
+            classify(
+                &format!("D:{ba}{sy}{ours}"),
+                &format!("D:{sy}{ba}{ours}"),
+                SID
+            ),
+            O::Reordered
+        );
+        // 純関数は入力の組を固定しているだけ。実機の `SetEntriesInAclW(SET_ACCESS)` は
+        // Operators への拒否の ACE を消す（win.rs のテストで確認）ので、この拒否の入力は
+        // 「merged にも残った」という仮定の組で、実機では Replaced になる。
+        // Operators の継承・拒否・条件つきの ACE だけがあるところへ明示の許可を足した → Added。
+        for existing in [
+            "(A;ID;CCLCRPWP;;;S-1-5-21-1-2-3-1001)",
+            "(D;;DC;;;S-1-5-21-1-2-3-1001)",
+            "(XA;;CCLCRPWP;;;S-1-5-21-1-2-3-1001;(@User.Level>=3))",
+        ] {
+            assert_eq!(
+                classify(
+                    &format!("D:{sy}{existing}"),
+                    &format!("D:{sy}{existing}{ours}"),
+                    SID
+                ),
+                O::Added,
+                "{existing}"
+            );
+        }
+        // 実機と同じ組: Operators への拒否の ACE が merged で消えた → Replaced。
+        assert_eq!(
+            classify(
+                &format!("D:{sy}(D;;DC;;;S-1-5-21-1-2-3-1001)"),
+                &format!("D:{sy}{ours}"),
+                SID
+            ),
+            O::Replaced
+        );
+        // Operators の同じ ACE の重複が 1 つにまとまっただけ → Reordered。
+        assert_eq!(
+            classify(
+                &format!("D:{sy}{ours}{ours}"),
+                &format!("D:{sy}{ours}"),
+                SID
+            ),
+            O::Reordered
+        );
+        // ほかの相手の ACE がまとめられた（Operators の ACE は既にある）→ Reordered。
+        assert_eq!(
+            classify(
+                &format!("D:{sy}{other}{other}{ours}"),
+                &format!("D:{sy}{other}{ours}"),
+                SID
+            ),
+            O::Reordered
+        );
+    }
+
+    #[test]
+    fn grant_service_acl_message_distinguishes_the_outcomes() {
+        use super::{grant_service_acl_message as m, ServiceAclOutcome as O};
+        let all = [O::Added, O::Replaced, O::Reordered, O::AlreadyPresent];
+        let texts: Vec<String> = all.iter().map(|o| m(*o, "Svc", "Grp")).collect();
+        for (i, a) in texts.iter().enumerate() {
+            assert!(a.contains("'Svc'") && a.contains("'Grp'"), "{a}");
+            for b in &texts[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(texts[0].ends_with("を足しました"));
+    }
+
+    #[test]
+    fn ace_trustee_is_the_sixth_field() {
+        assert_eq!(
+            ace_trustee("(A;;CCLCRPWP;;;S-1-5-21-1)"),
+            Some("S-1-5-21-1")
+        );
+        assert_eq!(
+            ace_trustee("(XA;;FX;;;S-1-1-0;(@User.Level>=3))"),
+            Some("S-1-1-0")
+        );
+        assert_eq!(ace_trustee("(A;;CCLC)"), None);
+        assert_eq!(ace_trustee("A;;;;;SY"), None);
+    }
 
     #[test]
     fn access_mask_is_query_config_query_status_start_stop() {
