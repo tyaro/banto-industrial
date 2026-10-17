@@ -298,13 +298,13 @@ pub fn query_service_command_line(
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager as WinScm, ServiceManagerAccess};
 
-    /// `ERROR_SERVICE_DOES_NOT_EXIST`。
-    const NOT_EXIST: i32 = 1060;
     let manager = WinScm::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|err| crate::ServiceManagerError::Other(err.to_string()))?;
     let service = match manager.open_service(name, ServiceAccess::QUERY_CONFIG) {
         Ok(service) => service,
-        Err(windows_service::Error::Winapi(io)) if io.raw_os_error() == Some(NOT_EXIST) => {
+        Err(windows_service::Error::Winapi(io))
+            if io.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+        {
             return Ok(None)
         }
         Err(err) => return Err(crate::ServiceManagerError::Other(err.to_string())),
@@ -317,9 +317,10 @@ pub fn query_service_command_line(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn only_the_os_number_1060_means_not_installed() {
-        use super::{classify_open_failure, UninstallError};
         assert_eq!(
             classify_open_failure(Some(1060), "x".to_string()),
             UninstallError::NotInstalled
@@ -334,8 +335,6 @@ mod tests {
             UninstallError::Open("os error 1060".to_string())
         );
     }
-
-    use super::*;
 
     /// 読むだけ: 無いサービスは `None`（SCM には接続するが何も変えない）。
     #[cfg(windows)]
