@@ -308,27 +308,83 @@ fn an_invalid_spec_list_creates_nothing_when_guarded() {
         .is_none());
 }
 
+/// フォルダの所有者を今の利用者の SID に明示的に設定する（`SetNamedSecurityInfoW`）。管理者が
+/// 作ったフォルダの所有者は Administrators になるので、「許さない所有者」の確かめ（利用者
+/// 本人を許さない spec）のために、所有者を利用者本人へ移す。利用者自身の SID へは、昇格した
+/// 管理者なら移せる。
+fn set_owner_to_me(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let sid_text: Vec<u16> = me().as_str().encode_utf16().chain(Some(0)).collect();
+    let mut sid = std::ptr::null_mut();
+    // SAFETY: NUL 終端の SID 文字列。`sid` は LocalAlloc され、下で LocalFree する。
+    assert_ne!(
+        unsafe { ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid) },
+        0,
+        "ConvertStringSidToSidW"
+    );
+    // SAFETY: NUL 終端のパスと有効な SID。所有者だけを書く。
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            sid,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    // SAFETY: ConvertStringSidToSidW が LocalAlloc した SID。
+    unsafe { LocalFree(sid) };
+    assert_eq!(status, ERROR_SUCCESS, "SetNamedSecurityInfoW(owner)");
+}
+
 /// 所有者が SYSTEM・Administrators・指定の利用者のどれでもなければ断る（ここでは今の利用者を
-/// 許さない spec で、今の利用者が所有するフォルダを開く）。
+/// 許さない spec で、今の利用者が所有するフォルダを開く）。管理者（CI）が作ったフォルダの
+/// 所有者は Administrators になり許されるので、そこは別に確かめたうえで、所有者を今の利用者へ
+/// 明示的に移してから「許さない所有者は断る」を確かめる。
 #[test]
 fn a_root_owned_by_someone_not_allowed_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("root")).unwrap();
-    let refusal = open_root(&RootSpec {
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let spec = RootSpec {
         owners: Vec::new(),
-        ..guarded(dir.path().join("root"))
-    })
-    .unwrap_err();
+        ..guarded(root.clone())
+    };
     if crate::acl::tests::windows::is_elevated_admin() {
         // 管理者が作ったフォルダの所有者は Administrators になりうる（「作成者を所有者に」の
-        // 方針しだい）。そのときはこの確かめは成り立たない。
-        eprintln!("note: 管理者では所有者が Administrators のことがある: {refusal:?}");
-        return;
+        // 方針しだい）。Administrators なら許す。
+        match open_root(&spec) {
+            Ok(opened) => drop(opened),
+            Err(refusal) => {
+                assert_eq!(
+                    refusal,
+                    RootRefusal::ForeignOwner(me().as_str().to_string()),
+                    "Administrators 以外の所有者なら今の利用者のはず"
+                );
+            }
+        }
+        set_owner_to_me(&root);
     }
+    let refusal = open_root(&spec).unwrap_err();
     assert_eq!(
         refusal,
         RootRefusal::ForeignOwner(me().as_str().to_string())
     );
+    // 本人を許す spec なら開ける（所有者の確かめだけが断る理由だったこと）。
+    open_root(&guarded(root)).unwrap();
 }
 
 /// 【要実測 → 実測】握っている間は、ルートの**祖先**の名前の変更も断られる（Fable B-4-1）。

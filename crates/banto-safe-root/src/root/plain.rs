@@ -38,7 +38,18 @@ pub(super) fn open_root(spec: &RootSpec) -> std::result::Result<ManagedDir, Root
         Err(e) => return Err(root_io(IoOp::InspectDir)(e)),
     }
     let final_path = std::fs::canonicalize(&spec.expected).map_err(root_io(IoOp::InspectDir))?;
+    // 確かめてから作る・正規化するまでの間に、同じ名前へ普通のファイルが作られたかもしれない。
+    if !is_dir(&final_path).map_err(root_io(IoOp::InspectDir))? {
+        return Err(RootRefusal::Refused(crate::error::Refusal::NotADirectory));
+    }
     Ok(ManagedDir::plain(spec.expected.clone(), final_path))
+}
+
+/// `path`（リンクを辿った先）がディレクトリかをもう一度読む。`metadata` と `create_dir`・
+/// `canonicalize` の間に別のプロセスが同じ名前へ普通のファイルを作ると、`AlreadyExists` も
+/// `canonicalize` もファイルで成功してしまうので、最後に種類を確かめる。
+pub(super) fn is_dir(path: &Path) -> std::io::Result<bool> {
+    std::fs::metadata(path).map(|meta| meta.is_dir())
 }
 
 pub(super) fn open_managed_one(
@@ -68,6 +79,13 @@ pub(super) fn open_managed_one(
         Err(e) => return Err(refuse_io(IoOp::InspectDir)(e)),
     }
     let final_path = std::fs::canonicalize(&path).map_err(refuse_io(IoOp::InspectDir))?;
+    // create_dir が AlreadyExists で通った（別のプロセスが普通のファイルを作った）場合と、
+    // canonicalize がファイルで成功した場合を、ここで断る。
+    if !is_dir(&final_path).map_err(refuse_io(IoOp::InspectDir))? {
+        return Err(ManagedRefusal::Refused(
+            crate::error::Refusal::NotADirectory,
+        ));
+    }
     Ok(ManagedDir::plain(
         parent.display.join(spec.name),
         final_path,

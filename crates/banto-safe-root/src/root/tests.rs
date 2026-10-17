@@ -403,3 +403,44 @@ fn write_atomic_onto_a_directory_fails_without_leaving_a_temp_file() {
         .collect();
     assert_eq!(names, ["dest"], "一時ファイルが残った");
 }
+
+/// 名前に普通のファイルが既にあれば、Plain でもルート・管理フォルダとして開かない（確かめと
+/// 作成の間に別のプロセスがファイルを作った競合の、結果が同じになる分岐）。
+#[test]
+fn a_plain_file_in_place_of_a_directory_is_refused_in_plain_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_root = dir.path().join("file-root");
+    std::fs::write(&file_root, b"file").unwrap();
+    assert_eq!(
+        open_root(&plain_spec(file_root)).unwrap_err(),
+        RootRefusal::Refused(Refusal::NotADirectory)
+    );
+
+    let root = open_root(&plain_spec(dir.path().join("root"))).unwrap();
+    std::fs::write(root.final_path().join("data"), b"file").unwrap();
+    for create in [true, false] {
+        let stop = root
+            .open_managed(&[ManagedSpec {
+                create,
+                ..spec("data", None, "data")
+            }])
+            .unwrap_err();
+        assert_eq!(
+            stop.reason,
+            ManagedRefusal::Refused(Refusal::NotADirectory),
+            "create={create}"
+        );
+    }
+}
+
+/// 最後の種類の確かめ（`create_dir` が `AlreadyExists` で通ったあと・`canonicalize` のあとに
+/// 使う）はファイルを断り、ディレクトリを通し、無いものは I/O の失敗にする。
+#[test]
+fn the_final_directory_check_distinguishes_file_dir_and_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f");
+    std::fs::write(&file, b"x").unwrap();
+    assert!(plain::is_dir(dir.path()).unwrap());
+    assert!(!plain::is_dir(&file).unwrap());
+    assert!(plain::is_dir(&dir.path().join("absent")).is_err());
+}
