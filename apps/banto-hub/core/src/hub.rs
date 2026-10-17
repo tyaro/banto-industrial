@@ -2132,7 +2132,8 @@ impl CollectorManager {
         let mut last = self
             .last_sim_warning
             .lock()
-            .expect("sim warning lock poisoned");
+            // 診断のためだけに panic させない（#655 のレビュー Nit 4）。
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if names.is_empty() {
             // 無くなったら忘れる（再び有効にしたときに出す）。
             *last = None;
