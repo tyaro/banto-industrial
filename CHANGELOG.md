@@ -39,11 +39,17 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 - **挙動の変更**: 接続・グループ・タグの作成と改名（グループの付け替えを含む）で、外部名（`接続.グループ.タグ`）が既存のタグと重なるなら、検証エラー（422、項目 `name`）で断るようにした（#635）。名前にはドットを使えるので、接続 `a.b`/グループ `c`/タグ `d` と 接続 `a`/グループ `b.c`/タグ `d` はどちらも `a.b.c.d` になり、後から入った方だけが外部名で引け、もう一方は REST・WebSocket・MQTT・gRPC・OPC UA から参照できなくなっていた。エラーの文言はどの既存のタグと重なるかを示す。REST・MCP・未適用キューの適用・一括作成／更新・設定パッケージの取り込みのどれも同じ検証を通る。書き込みが新しく生んだ重なりだけを断り、既にある重なりは断らない（起動も止めない）: catalog を作るときに検出し、外部名で引けなくなっているタグを `[WARN]` の行に出す。catalog の一覧（`/api/v1/tags` など）に、重なった外部名が 2 回出ることも無くした。
 - **挙動の変更（出力・ログの文言が中心。終了コード・ACL の中身・登録の状態は変わらない。例外が 2 つ: サービスの DACL は ACE が既にあるとき書き込みを省く、共有 crate の公開 API の戻り値・variant が変わる）: chronogazer-elev の出力・ログの文言を操作の結果に合わせた（#628、B3-3b の実機確認の気づき 6 点）**:
   - 新規の登録で、PRESHUTDOWN の行を「Windows サービス 'ChronoGazer' を登録しました」の後ろ（表示名・実行ファイル・起動種別の次）に並べた。
-  - `service-install`・`grant-service-acl` の 2 回目以降は、サービスの DACL に Operators の ACE が既にあれば「足しました」ではなく「既にあります（変更していません）」と出し、同じ相手の別の権利を置き換えたときは「置き換えました」と出す。**既にあるときはサービスの DACL への書き込みも省く**（今と作り直した DACL の ACE の並びが順序まで同じときだけ。制御フラグは無視）。**共有 crate `banto-service-elev` の公開 API `grant_service_operators` の戻り値が `()` から `ServiceAclOutcome`（`Added`／`Replaced`／`AlreadyPresent`）に変わった**（banto-hub は `()` に畳んで挙動不変）。
+  - `service-install`・`grant-service-acl` の 2 回目以降は、サービスの DACL に Operators の ACE が既にあれば「足しました」ではなく「既にあります（変更していません）」と出し、同じ相手の別の権利を置き換えたときは「置き換えました」と出す。**既にあるときはサービスの DACL への書き込みも省く**（今と作り直した DACL の ACE の並びが順序まで同じときだけ。制御フラグは無視）。**共有 crate `banto-service-elev` の公開 API `grant_service_operators` の戻り値が `()` から `ServiceAclOutcome`（`Added`／`Replaced`／`AlreadyPresent`）に変わった**（banto-hub の表示は不変だが、サービスの DACL に ACE が既にあるときは書き込みを省く。表示は #658 で出し分けるようにした）。
   - 既に登録されているときの最後の行は「登録しました（手動開始）」ではなく「登録は済んでいました（今回は登録していません）」（`chronogazer-server install` も同じ）。
   - 作った直後の確かめで断ったときの「作りましたが、確かめが通らなかったので残っています」は、開いたフォルダの本当の場所を出す（期待のパスと違うときは期待のパスも添える）。
   - サービスのログの停止の案内に、`ChronoGazer Operators` のメンバーも `Stop-Service` で止められることを入れた。
   - 未登録のときの `service-uninstall`（`chronogazer-server uninstall` も）の理由を、英語の「IO error in winapi call」ではなく「サービス 'ChronoGazer' は登録されていません（解除するものがありません）」にした（終了コード 2 は同じ）。**共有 crate `banto-service-control` の `UninstallError` に `NotInstalled`（Win32 の番号 1060。文字列は解析しない）を足した**。`Open` の理由には OS の番号つきの文言が入る。Hub・sink の解除も未登録を型で見分け、Hub は「既に未登録です」、sink は「登録されていません」と出す。
+- サービス ACL・解除の文言と判定の直し（#658。#657 のレビューの指摘）:
+  - `banto_service_elev::grant_service_operators` の `ServiceAclOutcome` に `Reordered` を足し、`Replaced` は「消えた ACE が Operators の SID のもの」のときだけにした（ほかの相手の ACE が並べ直された・まとめられた・拒否の ACE が消えた、では言わない。判定は純関数 `classify_dacl_change`、Operators の SID を引数に取る）。ACE は既にあるが DACL の並びが正規でなかったときは「足しました」ではなく「…が既にあります（ACE の並びを整え直しました）」と出す（書く側に倒すのは今のまま）。
+  - banto-hub-elev の `grant-service-acl` も結果を出し分ける（足しました／置き換えました／既にあります（変更していません）／整え直しました）。以前は 1 行も出さなかった。`service-install` の中の手順も同じ。
+  - chronogazer-elev の `service-uninstall` は、サービスを開けなかった（権限不足・SCM の不調。`Open`）ときを終了コード 1 にした（以前は未登録と同じ 2）。2 は未登録（`NotInstalled`）だけ。
+  - banto-hub の `service-uninstall` の `Open` の理由は「見つかりません（既に未登録の可能性）」ではなく「を開けませんでした: OS の理由」（sink・chronogazer と同じ形）。
+  - Win32 の `ERROR_SERVICE_DOES_NOT_EXIST`（1060）の定数を `banto_service_control` の 1 か所にまとめた。
 - ChronoGazer の昇格ヘルパーの内部の整理（#628、#646 のレビューの Nit。挙動は変わらない）: `create_in_parent` のエラーを enum に、`grant-data-acl` の段の親を種類から明示的に選ぶ、`banto-secret-store` の相対で作る・開く操作の失敗の API 名を作る・開く・フォルダ・ファイルで分けた（`CreateChildDir`／`OpenChildDir`／`CreateChildFile`／`OpenChildFile`）。
 - 小さな直し（#654）: banto-hub の設定画面の OPC UA の状態の読み直し（`OpcUaStatusPoller`）は、`stop`（画面を離れる）を最後の決定にした。保存（PUT）を待つ間に画面を離れても、PUT が返った後の読み直しが破棄した画面から再開しない（再開は明示的な `start` だけ）。最初の取得が失敗して状態が無いときも、1 回は読み直す。
 
