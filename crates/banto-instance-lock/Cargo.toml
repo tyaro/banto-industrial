@@ -15,14 +15,14 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# 診断ファイルを辿らずに開いて確かめる部品（`nofollow::open_file_verified`。#623 PR-2 の
+# 中身を PR-1b で共有 crate へ移した）。非 Windows は自前の `O_NOFOLLOW` の版なので要らない。
+banto-safe-root = { path = "../banto-safe-root" }
 # banto-hub-core が `profile_lock.rs` で使っていたのと同じ 0.61 系・同じ
 # feature（`CreateMutexW`/`OpenMutexW` は `Win32_Security` を要求する）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
-    # 診断ファイルを辿らずに開いて確かめる（`CreateFileW` +
-    # `FILE_FLAG_OPEN_REPARSE_POINT`・`GetFinalPathNameByHandleW` 等、#623 PR-2）。
-    "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
 
@@ -32,3 +32,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+# テストで 8.3 の短い名前を作る（`GetShortPathNameW`）。本番には要らない。
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

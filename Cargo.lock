@@ -817,6 +817,7 @@ dependencies = [
 name = "banto-instance-lock"
 version = "0.1.0"
 dependencies = [
+ "banto-safe-root",
  "libc",
  "serde",
  "serde_json",
