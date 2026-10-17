@@ -58,6 +58,9 @@
 	let showContinueAsThisPc = $state(false);
 	let showLocalGrantOptIn = $state(false);
 	let localGrantOptIn = $state(true);
+	// #612: 「デモは admin / admin」の案内は demo だけ（サービスの画面・LAN・Tauri の窓で
+	// 出すと、そのアカウントがあるように読めて誤解を招く。`loginEntries`）。
+	let showDemoAccountHint = $state(false);
 
 	const LOGIN_SUPERSEDED_MESSAGE = '別のセッションが先に確定しました。現在のセッションで開きます。';
 
@@ -75,6 +78,7 @@
 			showContinueAsViewer = entries.continueAsViewer;
 			showContinueAsThisPc = entries.continueAsThisPc;
 			showLocalGrantOptIn = entries.localGrantOptIn;
+			showDemoAccountHint = entries.demoAccountHint;
 		})();
 	});
 
@@ -241,11 +245,9 @@
 	{:else if mode === 'login'}
 		<form onsubmit={submitLogin}>
 			<h1>🏮 ChronoGazer</h1>
-			<p class="note">
-				単体ブラウザ（デモ）モードは admin / admin
-				でログインできます。Tauri/LANモードでは初回起動時に
-				作成したアカウントでログインしてください。
-			</p>
+			{#if showDemoAccountHint}
+				<p class="note">単体ブラウザ（デモ）モードは admin / admin でログインできます。</p>
+			{/if}
 
 			<label>
 				ユーザー名

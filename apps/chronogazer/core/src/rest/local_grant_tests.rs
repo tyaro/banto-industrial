@@ -1866,3 +1866,310 @@ async fn the_lock_recheck_refuses_a_revoked_token() {
         Err(banto_core::BantoError::Unauthorized)
     ));
 }
+
+/// `login`（`via: localGrant`）の監査の行の actor_role（古い順）。
+async fn grant_login_roles(audit: &AuditLogService) -> Vec<Option<String>> {
+    let mut rows: Vec<_> = audit
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| {
+            row.action == "login"
+                && row.actor_username.as_deref() == Some("localDesktop")
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("localGrant"))
+        })
+        .collect();
+    rows.sort_by_key(|row| row.id);
+    rows.into_iter().map(|row| row.actor_role).collect()
+}
+
+/// #601 (1): 発行の後・監査の前に、同時の発行で FIFO の上限を超えて発行したトークンが
+/// 追い出されても、発行の監査（`login`）は 1 行残り、role は発行したセッションのもの。
+///
+/// 待ち合わせを決定的に置くため、`local_access_middleware` の下の発行口を、本物の
+/// `AuthState::issue_grant_token` で発行した直後に、上限（`max_sessions`）の数だけ
+/// 発行し直して追い出してから応答する口に差し替える（= 応答の前に追い出しが必ず済む）。
+/// kind は percent encode した別表記で送る（#600 の P2 の約束も保つ）。
+///
+/// 反証: 監査の前に応答のトークンを `authenticate` してセッションの kind と role を読む
+/// 形（#601 の前）に戻すと、追い出されたトークンを認証できず監査の行が 0 で落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_evicted_before_its_audit_is_still_audited_with_its_role() {
+    use crate::local_grant::{local_access_middleware, local_desktop_grant_spec};
+    use axum::middleware::from_fn_with_state;
+    use axum::routing::post;
+
+    let editor = LocalGrantSetting::Role(Role::Editor);
+    for (start, accounts, setting, role) in [
+        (LocalGrantStart::Uninitialized, &[][..], None, "admin"),
+        (
+            LocalGrantStart::Initialized(editor),
+            &[Role::Admin][..],
+            Some(editor),
+            "editor",
+        ),
+    ] {
+        let f = fixture_with(start, true, accounts, setting).await;
+        let access = LocalAccess {
+            start,
+            always_on_listener: true,
+        };
+        let spec = Arc::new(local_desktop_grant_spec(
+            access,
+            f.users.clone(),
+            f.settings.clone(),
+        ));
+        let issuer = {
+            let (auth, spec) = (f.auth.clone(), spec.clone());
+            move || async move {
+                let token = auth
+                    .issue_grant_token(&spec, auth.grant_generation(&spec.kind))
+                    .expect("issue");
+                // 発行と監査の間に、同時の発行が上限を埋めて追い出した。
+                for _ in 0..LOCAL_GRANT_MAX_SESSIONS {
+                    auth.issue_grant_token(&spec, auth.grant_generation(&spec.kind))
+                        .expect("issue");
+                }
+                assert!(
+                    auth.authenticate(&token).await.unwrap().is_none(),
+                    "追い出されていない"
+                );
+                axum::Json(json!({ "success": true, "token": token }))
+            }
+        };
+        let state = LocalAccessState {
+            access,
+            users: f.users.clone(),
+            auth: f.auth.clone(),
+            audit: f.audit.clone(),
+            settings: f.settings.clone(),
+            settings_lock: f.settings_lock.clone(),
+        };
+        let router = Router::new()
+            .route("/api/auth/grant/{kind}", post(issuer))
+            .layer(from_fn_with_state(state, local_access_middleware));
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/auth/grant/local%44esktop",
+            Some(LOCAL),
+            Some(LOCAL_HOST),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            grant_login_roles(&f.audit).await,
+            vec![Some(role.to_string())],
+            "{start:?}"
+        );
+    }
+}
+
+/// #601 (1): 本物のルーターに上限の 2 倍を超える発行を同時に送っても、成功した発行の
+/// 数だけ `login` の監査が残る（タイミング任せの確認。決定的な確認は上のテスト）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_grants_past_the_cap_are_audited_one_to_one() {
+    let f = fixture(LocalGrantStart::Uninitialized, true, &[]).await;
+    let count = LOCAL_GRANT_MAX_SESSIONS * 2 + 1;
+    let handles: Vec<_> = (0..count)
+        .map(|_| {
+            let router = f.router.clone();
+            tokio::spawn(async move { grant(&router, Some(LOCAL), Some(LOCAL_HOST)).await })
+        })
+        .collect();
+    for handle in handles {
+        let (status, token) = handle.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(token.is_some());
+    }
+    let roles = grant_login_roles(&f.audit).await;
+    assert_eq!(roles.len(), count, "発行と監査が 1 対 1 でない");
+    assert!(roles.iter().all(|role| role.as_deref() == Some("admin")));
+}
+
+/// `PUT /api/settings/auth` を送り、応答の `(localGrant, localGrantRestartRequired)`。
+async fn put_local_grant(router: &Router, token: &str, value: &str) -> (String, bool) {
+    let (status, body) = send(
+        router,
+        "PUT",
+        "/api/settings/auth",
+        Some(LOCAL),
+        Some(LOCAL_HOST),
+        Some(token),
+        Some(json!({ "localGrant": value })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}: {body}");
+    (
+        body["localGrant"].as_str().expect("localGrant").to_string(),
+        body["localGrantRestartRequired"]
+            .as_bool()
+            .expect("localGrantRestartRequired"),
+    )
+}
+
+/// #601 (2): 2 件の `PUT /api/settings/auth` が重なっても、各応答は**その要求が保存した
+/// 値**と、それに対応する `localGrantRestartRequired` を返す。最後の保存値と失効も保つ。
+///
+/// 待ち合わせを決定的に置くため、監査の書き込み先だけをファイルの DB に分け、外から
+/// 書き込みの lock（`BEGIN IMMEDIATE`）を握る: 要求 A（`editor`）が保存して lock を
+/// 外した後、監査の書き込みで止まっている間に、要求 B（`off`）が保存し終える
+/// （設定の値で確かめる）。それから監査の lock を放す。
+///
+/// 反証: 応答を lock の外で読み直す形（#601 の前）に戻すと、A の応答が B の値
+/// （`off`・再起動不要）になって落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_auth_put_answers_with_the_value_it_saved() {
+    use crate::server_admin::{settings_admin_router, SettingsAdminState};
+    use sqlx::{ConnectOptions, Connection};
+
+    let viewer = LocalGrantSetting::Role(Role::Viewer);
+    let start = LocalGrantStart::Initialized(viewer);
+    let f = fixture_with(start, true, &[Role::Admin], Some(viewer)).await;
+    let admin = login(&f.router, "admin").await;
+    let (_, local_token) = grant(&f.router, Some(LOCAL), Some(LOCAL_HOST)).await;
+    let local_token = local_token.expect("token");
+
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.sqlite3");
+    // 監査の DB は init_db で作って（スキーマ）、busy_timeout を長くした pool で開き直す
+    // （PR #649 のオーナー Nit 2）: 外から `BEGIN IMMEDIATE` で止めている間、A・B の監査の
+    // INSERT は SQLite の busy_timeout まで待つ。init_db（`banto_storage::connect_sqlite`）は
+    // sqlx の既定の 5 秒のままで、止めている間の待ち合わせ（`wait_until` 2 回、各上限
+    // 10 秒）は負荷の高い Windows の CI で超えうる。超えると監査の INSERT が失敗し、行の
+    // 数の確認が落ちる。待ち合わせの上限の合計より十分長い 120 秒にする。
+    crate::db::init_db(&audit_path)
+        .await
+        .expect("init_db")
+        .close()
+        .await;
+    let audit_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&audit_path)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .foreign_keys(true)
+                .busy_timeout(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .unwrap();
+    let audit = AuditLogService::new(Db::Sqlite(audit_pool.clone()));
+    let router = settings_admin_router(SettingsAdminState {
+        settings: f.settings.clone(),
+        users: f.users.clone(),
+        audit: audit.clone(),
+        auth: f.auth.clone(),
+        lan: LanControl::detached(),
+        local_grant: start,
+        auth_config_lock: Arc::new(tokio::sync::Mutex::new(())),
+        log_label: "test",
+    });
+
+    let mut blocker = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&audit_path)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut blocker)
+        .await
+        .unwrap();
+
+    let read = || {
+        let settings = f.settings.clone();
+        async move { crate::local_grant::read_setting(&settings).await.unwrap() }
+    };
+    let a = {
+        let (router, admin) = (router.clone(), admin.clone());
+        tokio::spawn(async move { put_local_grant(&router, &admin, "editor").await })
+    };
+    wait_until("A の保存", || async {
+        read().await == LocalGrantSetting::Role(Role::Editor)
+    })
+    .await;
+    let b = {
+        let (router, admin) = (router.clone(), admin.clone());
+        tokio::spawn(async move { put_local_grant(&router, &admin, "off").await })
+    };
+    wait_until("B の保存", || async {
+        read().await == LocalGrantSetting::Off
+    })
+    .await;
+    sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+    blocker.close().await.unwrap();
+
+    let within = std::time::Duration::from_secs(10);
+    let a = tokio::time::timeout(within, a)
+        .await
+        .expect("A が終わらない")
+        .unwrap();
+    let b = tokio::time::timeout(within, b)
+        .await
+        .expect("B が終わらない")
+        .unwrap();
+    // 起動時は viewer: editor は開く向きの変更なので再起動が要り、off はすぐ効く。
+    assert_eq!(a, ("editor".to_string(), true), "A の応答に別の要求の値");
+    assert_eq!(b, ("off".to_string(), false));
+    assert_eq!(read().await, LocalGrantSetting::Off, "最後の保存値");
+    assert!(
+        identity(&f.router, &local_token).await.1.is_null(),
+        "値の変更で grant のトークンが失効していない"
+    );
+    let changes = audit
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| row.action == "settings_change")
+        .count();
+    assert_eq!(changes, 2);
+    audit_pool.close().await;
+}
+
+/// #601 (2): 異なる値の `PUT /api/settings/auth` を同時に多数送っても、各応答の
+/// `localGrant` は自分の要求の値で、`localGrantRestartRequired` はその値に対応する
+/// （タイミング任せの確認。決定的な確認は上のテスト）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_auth_puts_each_answer_with_their_own_value() {
+    let viewer = LocalGrantSetting::Role(Role::Viewer);
+    let f = fixture_with(
+        LocalGrantStart::Initialized(viewer),
+        true,
+        &[Role::Admin],
+        Some(viewer),
+    )
+    .await;
+    let admin = login(&f.router, "admin").await;
+    // 起動時は viewer: viewer と off は再起動不要、editor と admin は要る。
+    let values = [
+        ("off", false),
+        ("viewer", false),
+        ("editor", true),
+        ("admin", true),
+    ];
+    let handles: Vec<_> = (0..24)
+        .map(|i| {
+            let (value, restart) = values[i % values.len()];
+            let (router, admin) = (f.router.clone(), admin.clone());
+            tokio::spawn(async move {
+                (
+                    value,
+                    restart,
+                    put_local_grant(&router, &admin, value).await,
+                )
+            })
+        })
+        .collect();
+    for handle in handles {
+        let (value, restart, answered) = handle.await.unwrap();
+        assert_eq!(answered, (value.to_string(), restart), "{value}");
+    }
+}
