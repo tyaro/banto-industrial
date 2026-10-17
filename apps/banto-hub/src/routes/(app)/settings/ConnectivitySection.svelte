@@ -192,7 +192,7 @@
 
 	$effect(() => {
 		if (!canManageOpcUa) return;
-		void refreshOpcUaStatus();
+		void opcUaPoller.start();
 		return () => opcUaPoller.stop();
 	});
 

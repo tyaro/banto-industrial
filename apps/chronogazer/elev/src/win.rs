@@ -10,7 +10,7 @@ use banto_service_control::{
     query_service_command_line, read_service_parameter, uninstall_service, ServiceManager,
     ServiceManagerError, UninstallError, UninstallOutcome, WindowsServiceManager,
 };
-use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome};
+use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome, ServiceAclOutcome};
 use chronogazer_core::paths::DataLayout;
 use chronogazer_core::server_service::{
     install_with, InstallReport, InstallUserUnavailable, INSTALL_USER_SID_VALUE,
@@ -120,7 +120,7 @@ impl ElevOps for WindowsOps {
         banto_service_elev::add_member_sid(&OPERATORS_GROUP, sid.as_str())
     }
 
-    fn grant_service_acl(&self) -> Result<(), ElevError> {
+    fn grant_service_acl(&self) -> Result<ServiceAclOutcome, ElevError> {
         banto_service_elev::grant_service_operators(SERVICE_NAME, &OPERATORS_GROUP)
     }
 
@@ -234,7 +234,7 @@ mod tests {
         fn add_member(&self, _: &InstallUserSid) -> Result<MemberOutcome, ElevError> {
             unreachable!("テストでは呼ばない")
         }
-        fn grant_service_acl(&self) -> Result<(), ElevError> {
+        fn grant_service_acl(&self) -> Result<ServiceAclOutcome, ElevError> {
             unreachable!("テストでは呼ばない")
         }
         fn set_autostart(&self, _: &Path, _: bool) -> Result<(), ServiceManagerError> {
@@ -522,7 +522,12 @@ mod tests {
             eprintln!("skip: FSCTL_SET_REPARSE_POINT に権限が無い - CI で確かめる");
             return;
         }
-        assert_ne!(code, crate::EXIT_OK, "{lines:#?}");
+        // 断った理由は「作れませんでした」（親のハンドルを基準にした作成が、すり替えられた
+        // 親では失敗する）。成功扱い（0）や別の理由（前提が無い 2・確かめの失敗）ではない（#646 Nit 4）。
+        assert_eq!(code, crate::EXIT_FAILED, "{lines:#?}");
+        assert!(has_line(&lines, "を作れませんでした"), "{lines:#?}");
+        assert!(has_line(&lines, "NtCreateFile"), "{lines:#?}");
+        assert!(has_line(&lines, "ChronoGazer"), "{lines:#?}");
         assert_eq!((snapshot(&watched), listing(&outside)), before);
         assert!(!outside.join("ChronoGazer").exists());
         let _ = std::fs::remove_dir(&root_parent);

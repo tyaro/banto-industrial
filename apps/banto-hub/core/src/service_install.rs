@@ -251,6 +251,9 @@ fn uninstall_lines(result: &Result<UninstallOutcome, UninstallError>) -> Vec<Con
         Err(UninstallError::Connect(err)) => vec![ConsoleLine::Stderr(format!(
             "{LABEL}: Service Control Manager への接続に失敗しました: {err}"
         ))],
+        Err(UninstallError::NotInstalled) => vec![ConsoleLine::Stderr(format!(
+            "{LABEL}: サービス '{SERVICE_NAME}' が見つかりません（既に未登録です）"
+        ))],
         Err(UninstallError::Open(err)) => vec![ConsoleLine::Stderr(format!(
             "{LABEL}: サービス '{SERVICE_NAME}' が見つかりません（既に未登録の可能性）: {err}"
         ))],
@@ -392,9 +395,15 @@ mod tests {
             )]
         );
         assert_eq!(
-            uninstall_lines(&Err(UninstallError::Open("os error 1060".to_string()))),
+            uninstall_lines(&Err(UninstallError::NotInstalled)),
             vec![err(
-                "banto-hub: サービス 'BantoHub' が見つかりません（既に未登録の可能性）: os error 1060"
+                "banto-hub: サービス 'BantoHub' が見つかりません（既に未登録です）"
+            )]
+        );
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::Open("os error 5".to_string()))),
+            vec![err(
+                "banto-hub: サービス 'BantoHub' が見つかりません（既に未登録の可能性）: os error 5"
             )]
         );
         assert_eq!(

@@ -147,9 +147,15 @@ pub fn service_running_line() -> String {
     )
 }
 
+/// ローカルグループ `ChronoGazer Operators`（サービスの開始・停止を委任された利用者。
+/// elev の `OPERATORS_GROUP` の名前と、停止の案内の文言が共有する）。
+pub const OPERATORS_GROUP_NAME: &str = "ChronoGazer Operators";
+
 /// 待ち受けの案内の最後の行（コンソールの「Ctrl-C で停止します」の代わり）。
 pub fn service_stop_hint_line() -> String {
-    format!("{SERVER_LABEL}: 管理者の PowerShell から Stop-Service {SERVICE_NAME} で停止します")
+    format!(
+        "{SERVER_LABEL}: 管理者の PowerShell、または '{OPERATORS_GROUP_NAME}' のメンバーが Stop-Service {SERVICE_NAME} で停止します"
+    )
 }
 
 /// 停止に入ったときの 1 行。
@@ -367,12 +373,8 @@ pub fn install_lines(report: &InstallReport) -> Vec<ConsoleLine> {
             lines.push(preshutdown_console_line(SERVER_LABEL, &outcome.preshutdown));
         }
         InstallKind::Created => {
-            if let Some(err) = &outcome.description_error {
-                lines.push(ConsoleLine::Stderr(format!(
-                    "{SERVER_LABEL}: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}"
-                )));
-            }
-            lines.push(preshutdown_console_line(SERVER_LABEL, &outcome.preshutdown));
+            // 先に「登録しました」を言い、その後に細かい設定（説明文・PRESHUTDOWN）を並べる
+            // （PRESHUTDOWN の行が登録の行より先に出ると、順番が逆に読める。#628）。
             lines.push(ConsoleLine::Stdout(format!(
                 "{SERVER_LABEL}: Windows サービス '{SERVICE_NAME}' を登録しました"
             )));
@@ -386,6 +388,12 @@ pub fn install_lines(report: &InstallReport) -> Vec<ConsoleLine> {
             lines.push(ConsoleLine::Stdout(format!(
                 "{SERVER_LABEL}:   起動種別: 手動（Demand） - OS の再起動だけでは開始しません"
             )));
+            if let Some(err) = &outcome.description_error {
+                lines.push(ConsoleLine::Stderr(format!(
+                    "{SERVER_LABEL}: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}"
+                )));
+            }
+            lines.push(preshutdown_console_line(SERVER_LABEL, &outcome.preshutdown));
             if let Some(warning) =
                 executable_location_warning(&report.executable, report.program_files.as_deref())
             {
@@ -458,9 +466,15 @@ pub fn install_lines(report: &InstallReport) -> Vec<ConsoleLine> {
     // サービスは起動しない。終了コードは 0 のまま - 既知の制限 4、PR #618 のレビュー）。
     let root_unusable = matches!(report.root, Some(RootPreparation::Unusable(_)));
     if install_exit_code(report) == 0 && !root_unusable {
-        lines.push(ConsoleLine::Stdout(format!(
-            "{SERVER_LABEL}: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service {SERVICE_NAME}"
-        )));
+        // 既に登録されていたときは「登録しました」と言わない（何も登録していない。#628）。
+        lines.push(ConsoleLine::Stdout(match outcome.kind {
+            InstallKind::Created => format!(
+                "{SERVER_LABEL}: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service {SERVICE_NAME}"
+            ),
+            InstallKind::AlreadyRegistered => format!(
+                "{SERVER_LABEL}: 登録は済んでいました（今回は登録していません）。開始: 管理者の PowerShell で Start-Service {SERVICE_NAME}"
+            ),
+        }));
     }
     lines
 }
@@ -642,8 +656,15 @@ pub fn uninstall_lines(
             )),
             ConsoleLine::Stderr(format!("{SERVER_LABEL}:   {ELEVATION_HINT}")),
         ],
+        // 未登録（ERROR_SERVICE_DOES_NOT_EXIST = 1060）は型で分かれ、日本語で案内する。OS の
+        // 理由（英語のことがある）を出すのは、それ以外（権限不足など）だけ。
+        Err(UninstallError::NotInstalled) => {
+            vec![ConsoleLine::Stderr(format!(
+                "{SERVER_LABEL}: サービス '{SERVICE_NAME}' は登録されていません（解除するものがありません）"
+            ))]
+        }
         Err(UninstallError::Open(err)) => vec![ConsoleLine::Stderr(format!(
-            "{SERVER_LABEL}: サービス '{SERVICE_NAME}' を開けません（未登録か、権限がありません）: {err}"
+            "{SERVER_LABEL}: サービス '{SERVICE_NAME}' を開けません（権限がないか、サービスの状態を確かめられません）: {err}"
         ))],
         Err(UninstallError::Delete { stop, error }) => {
             let mut lines: Vec<ConsoleLine> = stop_line(stop).into_iter().collect();
@@ -792,6 +813,11 @@ mod tests {
         assert!(service_running_line().contains("Windows サービスとして起動しました"));
         assert!(service_running_line().contains("SCM の STOP"));
         assert!(service_running_line().contains("PRESHUTDOWN"));
+        // 停止の案内は Operators のメンバーも止められることを言う（#628）。
+        assert_eq!(
+            service_stop_hint_line(),
+            "chronogazer-server: 管理者の PowerShell、または 'ChronoGazer Operators' のメンバーが Stop-Service ChronoGazer で停止します"
+        );
         assert_eq!(
             service_stop_reason_line(StopSignal::ServiceStop, Duration::from_secs(15)),
             "chronogazer-server: 停止要求を受けました（SCM の STOP）。最終 flush を行います（上限 15 秒）"
@@ -925,11 +951,11 @@ mod tests {
         assert_eq!(
             install_lines(&report),
             vec![
-                out("chronogazer-server: PRESHUTDOWN の行"),
                 out("chronogazer-server: Windows サービス 'ChronoGazer' を登録しました"),
                 out("chronogazer-server:   表示名: ChronoGazer 記録エンジン"),
                 out(r"chronogazer-server:   実行ファイル: C:\Program Files\ChronoGazer\chronogazer-server.exe"),
                 out("chronogazer-server:   起動種別: 手動（Demand） - OS の再起動だけでは開始しません"),
+                out("chronogazer-server: PRESHUTDOWN の行"),
                 out(r"chronogazer-server:   インストール利用者: S-1-5-21-1111111111-2222222222-3333333333-1001（HKLM\SYSTEM\CurrentControlSet\Services\ChronoGazer\Parameters\InstallUserSid に記録しました）"),
                 out(r"chronogazer-server:   データのルート: C:\ProgramData\ChronoGazer（作りました。SYSTEM・Administrators にフル、インストール利用者に変更）"),
                 out("chronogazer-server: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service ChronoGazer"),
@@ -955,12 +981,12 @@ mod tests {
         assert_eq!(
             install_lines(&report),
             vec![
-                err("chronogazer-server: サービスの説明文の設定に失敗しました（登録自体は完了）: os error 5"),
-                out("chronogazer-server: PRESHUTDOWN の行"),
                 out("chronogazer-server: Windows サービス 'ChronoGazer' を登録しました"),
                 out("chronogazer-server:   表示名: ChronoGazer 記録エンジン"),
                 out(r"chronogazer-server:   実行ファイル: C:\Users\me\Downloads\chronogazer-server.exe"),
                 out("chronogazer-server:   起動種別: 手動（Demand） - OS の再起動だけでは開始しません"),
+                err("chronogazer-server: サービスの説明文の設定に失敗しました（登録自体は完了）: os error 5"),
+                out("chronogazer-server: PRESHUTDOWN の行"),
                 err(r"chronogazer-server: warn: 実行ファイルが C:\Program Files の外にあります。一般の利用者が書き換えられる場所の exe を LocalSystem のサービスとして登録すると、権限の昇格に使われます。C:\Program Files\ChronoGazer\ に置いてから、uninstall → install で登録し直してください"),
                 out(r"chronogazer-server:   インストール利用者: S-1-5-21-1111111111-2222222222-3333333333-1001（HKLM\SYSTEM\CurrentControlSet\Services\ChronoGazer\Parameters\InstallUserSid に記録しました）"),
                 err(r#"chronogazer-server: warn: 記録されていた値（"garbage"）は利用者のアカウントの SID ではなかったため書き直しました"#),
@@ -989,7 +1015,7 @@ mod tests {
                 err("chronogazer-server: warn: PRESHUTDOWN の警告"),
                 out("chronogazer-server:   インストール利用者: S-1-5-21-1111111111-2222222222-3333333333-1001（記録済み）"),
                 out(r"chronogazer-server:   データのルート: C:\ProgramData\ChronoGazer（既にあります。ACL は変えていません）"),
-                out("chronogazer-server: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service ChronoGazer"),
+                out("chronogazer-server: 登録は済んでいました（今回は登録していません）。開始: 管理者の PowerShell で Start-Service ChronoGazer"),
             ]
         );
         assert_eq!(install_exit_code(&report), 0);
@@ -1015,7 +1041,7 @@ mod tests {
                 out("chronogazer-server:   インストール利用者: S-1-5-21-1111111111-2222222222-3333333333-1002（記録済み。変えていません）"),
                 err("chronogazer-server: warn: 今回の利用者（S-1-5-21-1111111111-2222222222-3333333333-1001）は記録と違います。記録は変えていません（変えるには uninstall してから install し直してください）"),
                 out(r"chronogazer-server:   データのルート: C:\ProgramData\ChronoGazer（既にあります。ACL は変えていません）"),
-                out("chronogazer-server: 登録しました（手動開始）。開始: 管理者の PowerShell で Start-Service ChronoGazer"),
+                out("chronogazer-server: 登録は済んでいました（今回は登録していません）。開始: 管理者の PowerShell で Start-Service ChronoGazer"),
             ]
         );
         assert_eq!(install_exit_code(&report), 0);
@@ -1038,11 +1064,11 @@ mod tests {
         assert_eq!(
             install_lines(&report),
             vec![
-                out("chronogazer-server: PRESHUTDOWN の行"),
                 out("chronogazer-server: Windows サービス 'ChronoGazer' を登録しました"),
                 out("chronogazer-server:   表示名: ChronoGazer 記録エンジン"),
                 out(r"chronogazer-server:   実行ファイル: C:\Program Files\ChronoGazer\chronogazer-server.exe"),
                 out("chronogazer-server:   起動種別: 手動（Demand） - OS の再起動だけでは開始しません"),
+                out("chronogazer-server: PRESHUTDOWN の行"),
                 out(r"chronogazer-server:   インストール利用者: S-1-5-21-1111111111-2222222222-3333333333-1001（HKLM\SYSTEM\CurrentControlSet\Services\ChronoGazer\Parameters\InstallUserSid に記録しました）"),
                 err("chronogazer-server: warn: データのルートを使えません: CHRONOGAZER_ROOT が絶対パスではありません（このままではサービスも起動しません）"),
             ]
@@ -1322,9 +1348,20 @@ mod tests {
                 err("chronogazer-server:   管理者として実行した PowerShell から実行するか、同じフォルダの chronogazer-elev.exe（UAC で昇格します）を使ってください"),
             ]
         );
+        // 未登録は日本語の案内にする（OS の英語の理由は出さない。#628）。
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::NotInstalled), &root()),
+            vec![err("chronogazer-server: サービス 'ChronoGazer' は登録されていません（解除するものがありません）")]
+        );
+        // 文字列に 1060 と書いてあっても、型が Open なら未登録の扱いにしない（文字列を解析しない）。
         assert_eq!(
             uninstall_lines(&Err(UninstallError::Open("os error 1060".to_string())), &root()),
-            vec![err("chronogazer-server: サービス 'ChronoGazer' を開けません（未登録か、権限がありません）: os error 1060")]
+            vec![err("chronogazer-server: サービス 'ChronoGazer' を開けません（権限がないか、サービスの状態を確かめられません）: os error 1060")]
+        );
+        // それ以外の理由（権限不足など）は OS の理由を添える。
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::Open("Access is denied. (os error 5)".to_string())), &root()),
+            vec![err("chronogazer-server: サービス 'ChronoGazer' を開けません（権限がないか、サービスの状態を確かめられません）: Access is denied. (os error 5)")]
         );
         assert_eq!(
             uninstall_lines(

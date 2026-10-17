@@ -606,6 +606,8 @@ test('ルートがパッケージでも、crates/ の下の非パッケージパ
 	assert.equal(owningPackage(g, 'crates/banto-tagsx/src/lib.rs'), null);
 	assert.equal(owningPackage(g, 'crates/banto-tags/src/lib.rs'), 'tags');
 	// crates/ の外のルート直下はルートのパッケージのもの。
+	// （関数単体の挙動を固定するだけ。本番では resolveCrates に crates 領域のファイルしか
+	// 渡らないので、この分岐は通らない。#647）
 	assert.equal(owningPackage(g, 'src/main.rs'), 'rootpkg');
 	// 判定全体でも rust_all に倒れる。
 	const r = classify({ event: 'pull_request', files: ['crates/README.md'], graph: g });
