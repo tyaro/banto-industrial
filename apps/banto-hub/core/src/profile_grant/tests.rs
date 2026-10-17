@@ -6,14 +6,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use banto_secret_store::acl::guard::{
-    AccountKind, KnownFolders, MachineEnvironment, MachineRootError,
-};
-use banto_secret_store::acl::{
+use banto_safe_root::acl::{
     ObservedAce, ObservedDacl, PinnedDirInfo, ResetSkips, ADMINISTRATORS_SID, FULL_ACCESS_MASK,
     MODIFY_ACCESS_MASK, SYSTEM_SID,
 };
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::guard::{AccountKind, KnownFolders, MachineEnvironment, MachineRootError};
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 
 use super::*;

@@ -155,7 +155,7 @@ enum Mode {
     /// 利用者（D1）。
     #[cfg(windows)]
     Install {
-        install_user_sid: Option<banto_secret_store::InstallUserSid>,
+        install_user_sid: Option<banto_safe_root::InstallUserSid>,
     },
     /// 登録の解除（`uninstall`）。
     #[cfg(windows)]
@@ -193,10 +193,9 @@ fn parse_service_command(command: &str, rest: &[String]) -> Result<Mode, String>
                         let value = rest
                             .next()
                             .ok_or("--install-user-sid には SID（S-1-5-21-…）を続けてください")?;
-                        let sid =
-                            banto_secret_store::InstallUserSid::parse(value).map_err(|err| {
-                                format!("--install-user-sid の値が使えません（{value}）: {err}")
-                            })?;
+                        let sid = banto_safe_root::InstallUserSid::parse(value).map_err(|err| {
+                            format!("--install-user-sid の値が使えません（{value}）: {err}")
+                        })?;
                         install_user_sid = Some(sid);
                     }
                     other => return Err(format!("install の不明な引数です: '{other}'")),
@@ -1144,7 +1143,7 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["install", "--install-user-sid", SID])),
             Ok(Some(Mode::Install {
-                install_user_sid: Some(banto_secret_store::InstallUserSid::parse(SID).unwrap())
+                install_user_sid: Some(banto_safe_root::InstallUserSid::parse(SID).unwrap())
             }))
         );
         for bad in [

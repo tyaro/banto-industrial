@@ -39,8 +39,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::guard::paths_match;
-use banto_secret_store::acl::{exposure, Exposure, FileSecurity};
+use banto_safe_root::acl::{exposure, Exposure, FileSecurity};
+use banto_safe_root::guard::paths_match;
 
 use super::{ConfigError, DEFAULT_CONFIG_FILE_NAME, PROGRAM_DATA_SUBDIR};
 
@@ -181,7 +181,7 @@ fn has_dot_segment(path: &Path) -> bool {
 /// 置き場・ファイルが保護されていない理由 1 つ（1 行になる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
-    /// `banto_secret_store::acl::exposure` の理由。
+    /// `banto_safe_root::acl::exposure` の理由。
     Exposure(Exposure),
     /// 置き場がフォルダではない。
     NotADirectory,
@@ -422,24 +422,24 @@ pub fn read_protected<O: PlaceOps>(
 pub mod win {
     use std::path::{Path, PathBuf};
 
-    use banto_secret_store::acl::{FileSecurity, PinnedDir, PinnedFile};
-    use banto_secret_store::SecretStoreError;
+    use banto_safe_root::acl::{FileSecurity, PinnedDir, PinnedFile};
+    use banto_safe_root::SafeRootError;
 
     use super::{OpenError, PlaceOps};
 
-    /// 本番の操作（`banto_secret_store::acl` の部品）。
+    /// 本番の操作（`banto_safe_root::acl` の部品）。
     pub struct WindowsPlaceOps;
 
     /// `ERROR_SHARING_VIOLATION`。
     const ERROR_SHARING_VIOLATION: i32 = 32;
 
-    fn open_error(error: SecretStoreError) -> OpenError {
+    fn open_error(error: SafeRootError) -> OpenError {
         match error {
-            SecretStoreError::Io {
+            SafeRootError::Io {
                 os_error: Some(ERROR_SHARING_VIOLATION),
                 ..
             } => OpenError::InUse,
-            SecretStoreError::Io {
+            SafeRootError::Io {
                 kind: std::io::ErrorKind::PermissionDenied,
                 ..
             } => OpenError::Denied,
@@ -452,13 +452,13 @@ pub mod win {
         type File = PinnedFile;
 
         fn exists(&self, path: &Path) -> Result<bool, String> {
-            banto_secret_store::acl::inspect_file(path)
+            banto_safe_root::acl::inspect_file(path)
                 .map(|found| found.is_some())
                 .map_err(|err| err.to_string())
         }
 
         fn pin_dir(&self, dir: &Path) -> Result<Option<PinnedDir>, OpenError> {
-            banto_secret_store::acl::pin_dir(dir).map_err(open_error)
+            banto_safe_root::acl::pin_dir(dir).map_err(open_error)
         }
 
         fn dir_final_path(&self, dir: &PinnedDir) -> PathBuf {
@@ -492,8 +492,8 @@ pub mod win {
 
     /// 既知のフォルダの ProgramData（環境変数 `ProgramData` は読まない）。
     pub fn program_data() -> Result<PathBuf, String> {
-        use banto_secret_store::acl::guard::MachineEnvironment;
-        banto_secret_store::acl::guard::win::RegistryMachineEnvironment.program_data()
+        use banto_safe_root::guard::MachineEnvironment;
+        banto_safe_root::guard::win::RegistryMachineEnvironment.program_data()
     }
 }
 

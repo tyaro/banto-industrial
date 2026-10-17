@@ -46,7 +46,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::{
     preshutdown_console_line, ConsoleLine, InstallError, InstallKind, InstallOutcome, ServiceExit,
     StopAttempt, StopNotice, StopSignal, UninstallError, UninstallOutcome,
@@ -581,7 +581,7 @@ pub fn install_with(
 
     let requested = match install_user_sid {
         Some(sid) => sid,
-        None => banto_secret_store::acl::current_user_sid()
+        None => banto_safe_root::acl::current_user_sid()
             .map_err(|err| InstallUserUnavailable(err.to_string()))?,
     };
     let outcome = install_service(&crate::shell_launch::chronogazer_service_spec(
@@ -1254,7 +1254,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn prepare_root_creates_with_the_recorded_sid_only_when_absent() {
-        use banto_secret_store::acl::{current_user_sid, read_dir_dacl};
+        use banto_safe_root::acl::{current_user_sid, read_dir_dacl};
         let dir = tempfile::tempdir().unwrap();
         let me = current_user_sid().unwrap();
         let layout = DataLayout::new(dir.path().join("root"));

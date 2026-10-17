@@ -34,14 +34,14 @@
 //!   verb `runas` → 終わりを待つ → 終了コード）。引数は**英数字と `-` だけの
 //!   トークン**に限る（SID `S-1-5-21-…` もこの形）- 引用符・空白・メタ文字を
 //!   通さないので、コマンドラインの組み立てで解釈が割れる余地が無い。
-//! - SID は文字列（`&str`）で受ける。`banto-secret-store` の `InstallUserSid` には
+//! - SID は文字列（`&str`）で受ける。`banto-safe-root` の `InstallUserSid` には
 //!   依存しない（この crate は「利用者のアカウントの SID か」という製品の
 //!   判断を持たない）。形の確かめは [`is_valid_sid_string`]。
 //! - **名前 → SID の文字列**: `lookup_account_sid_string`（Windows だけ、#626 PR-A）は
 //!   アカウント名を `LookupAccountNameW` で引き、文字列形式の SID（純関数
 //!   [`sid_bytes_to_string`]）と、種類が `SidTypeUser` か（[`AccountSid::is_user`]）を
 //!   返す。利用者のアカウントとして受け入れるかの判断は呼ぶ側（banto-hub の
-//!   `grant-profile-acl` は `banto_secret_store` の `InstallUserSid::parse` と
+//!   `grant-profile-acl` は `banto_safe_root` の `InstallUserSid::parse` と
 //!   `check_user_account` で確かめる）。
 //!
 //! ## Windows 以外

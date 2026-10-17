@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::acl::DirAccess;
+use banto_safe_root::DirAccess;
+
 use crate::error::{CorruptKind, InvalidAccount, IoOp, Result, SecretStoreError};
 use crate::format::{self, MAX_ACCOUNT_LEN, MAX_FILE_LEN, MAX_SECRET_LEN};
 use crate::protector::Protector;
@@ -55,7 +56,7 @@ fn validate_account(account: &str) -> Result<()> {
 /// ディレクトリの ACL をどう扱うか。
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DirMode {
-    /// 開く・読む・書く・消すたびに [`crate::acl`] の形を確かめる（製品）。
+    /// 開く・読む・書く・消すたびに `banto_safe_root::acl` の形を確かめる（製品）。
     Enforced(DirAccess),
     /// 確かめない（`test-support` / この crate のテストだけ）。
     #[cfg(any(test, feature = "test-support"))]
@@ -98,14 +99,14 @@ impl<P: Protector> fmt::Debug for FileSecretStore<P> {
 
 impl<P: Protector> FileSecretStore<P> {
     /// `dir` を保存先にする。無ければ `access` の DACL で作り、あれば DACL を
-    /// 確かめる（違えば [`SecretStoreError::AclMismatch`]。[`crate::acl`] の doc）。
+    /// 確かめる（違えば [`banto_safe_root::SafeRootError::AclMismatch`]。`banto_safe_root::acl` の doc）。
     /// どちらの経路でも、先にインストール利用者の SID が利用者のアカウントで
     /// あることを確かめる（グループ・解決できない SID は
-    /// [`SecretStoreError::InvalidUserSid`]）。SID の検証はここでの 1 回だけ。
-    /// 非 Windows では [`SecretStoreError::UnsupportedPlatform`]。
+    /// [`banto_safe_root::SafeRootError::InvalidUserSid`]）。SID の検証はここでの 1 回だけ。
+    /// 非 Windows では [`banto_safe_root::SafeRootError::UnsupportedPlatform`]。
     pub fn open(dir: impl Into<PathBuf>, access: DirAccess, protector: P) -> Result<Self> {
         let dir = dir.into();
-        crate::acl::ensure_dir(&dir, &access)?;
+        banto_safe_root::acl::ensure_dir(&dir, &access)?;
         Ok(Self::with_mode(dir, DirMode::Enforced(access), protector))
     }
 
@@ -155,9 +156,8 @@ impl<P: Protector> FileSecretStore<P> {
         }
         match &self.mode {
             DirMode::Enforced(access) => {
-                // SID は open で確かめ済み（crate::acl の doc「インストール利用者の
-                // SID の検証」）。ここでは ACL の形だけを確かめ直す。
-                crate::acl::verify_dir_with_validated_sid(&self.dir, access)?
+                // SID の確かめも含む（open と同じ確かめなので結果は変わらない）。
+                banto_safe_root::acl::verify_dir(&self.dir, access)?
             }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {}
@@ -169,7 +169,7 @@ impl<P: Protector> FileSecretStore<P> {
     fn ensure_dir_for_write(&self) -> Result<()> {
         match &self.mode {
             DirMode::Enforced(access) => {
-                crate::acl::ensure_dir_with_validated_sid(&self.dir, access)
+                banto_safe_root::acl::ensure_dir(&self.dir, access).map_err(SecretStoreError::from)
             }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {

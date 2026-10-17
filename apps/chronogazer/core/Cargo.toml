@@ -47,6 +47,7 @@ banto-tagclient = { path = "../../../crates/banto-tagclient" }
 # ファイル、`server_host::open_key_store`）。非 Windows では `UnsupportedPlatform`
 # で fail closed する（コンパイルは通る）。
 banto-secret-store = { path = "../../../crates/banto-secret-store" }
+banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # #392 B1-5: `chronogazer-server` の終了（Ctrl-C と CTRL_CLOSE_EVENT）を 1 回に
 # する（デスクトップと同じ `ExitCleanupOnce`。std だけの crate）。
 banto-exit-once = { path = "../../../crates/banto-exit-once" }
@@ -85,7 +86,7 @@ qrcode = { workspace = true }
 # #392 B1-5: `chronogazer-server`（bin）のコンソールの扱い - Ctrl の受け取り
 # （`SetConsoleCtrlHandler`）と、標準出力・標準エラー出力のログファイルへの
 # 向け直し（`CreatePipe`・`SetStdHandle`・`ReadFile`・`WriteConsoleW`）。既存の
-# 0.61 系（banto-secret-store・banto-instance-lock と同じ版）で、feature を足す
+# 0.61 系（banto-safe-root・banto-instance-lock と同じ版）で、feature を足す
 # だけ（Cargo.lock にノードは増えない）。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

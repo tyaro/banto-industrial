@@ -1,4 +1,4 @@
-//! `acl::guard` の純関数のテスト（全 OS。chronogazer-elev の同じテストを移して、文言の
+//! `guard` の純関数のテスト（全 OS。chronogazer-elev の同じテストを移して、文言の
 //! 代わりに型の付いた理由を確かめる形にした - #626 PR-A）。
 
 use std::path::PathBuf;
@@ -781,7 +781,7 @@ fn carried_users_build_the_multi_user_access() {
         ]),
         kinds,
     );
-    let access = crate::DirAccess::with_install_users(plan.carried);
+    let access = crate::acl::DirAccess::with_install_users(plan.carried);
     assert_eq!(
         access.sddl(),
         format!(

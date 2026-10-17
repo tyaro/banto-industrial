@@ -1270,7 +1270,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ChronoGazer");
         LaunchPaths::prepare(DataLayout::new(&root)).expect("prepare");
-        let dacl = banto_secret_store::acl::read_dir_dacl(&root).unwrap();
+        let dacl = banto_safe_root::acl::read_dir_dacl(&root).unwrap();
         assert!(dacl.protected, "{dacl:?}");
         assert!(dacl
             .aces

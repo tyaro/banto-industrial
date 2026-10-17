@@ -83,7 +83,7 @@ tempfile = { workspace = true }
 # #392 B2-4b のテスト専用: デスクトップが作ったデータのルートが保護された DACL
 # （O6）であることを `acl::read_dir_dacl` で確かめるため。`chronogazer-core` が
 # 通常依存として使っている同じ path crate で、Cargo.lock にパッケージは増えない。
-banto-secret-store = { path = "../../../crates/banto-secret-store" }
+banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # #418 オーナーレビュー P2 の回帰テスト専用: 不正タグを無効化した後に
 # `banto_collect::build_config` が通ることを、Tauri 経路のテストでも直接
 # 確かめるため。`chronogazer-core` が通常依存として使っている同じ path

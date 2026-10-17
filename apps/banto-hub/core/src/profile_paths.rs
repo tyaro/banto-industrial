@@ -75,10 +75,10 @@ pub enum ProfileIdError {
 /// Windows の予約デバイス名か（大文字小文字を無視。最初の`.`より前を、末尾の空白を
 /// 除いて見るので`nul.txt`・`CON .log`も予約名。`COM0`〜`COM9`・`LPT0`〜`LPT9`と
 /// 上付き数字の`COM¹`なども含む - Win32 はこれらをファイルではなくデバイスとして開く）。
-/// 判断は共有の`banto_secret_store::acl::guard::is_reserved_device_name`（#642 で移した。
+/// 判断は共有の`banto_safe_root::guard::is_reserved_device_name`（#642 で移した。
 /// 昇格ヘルパーが親のハンドルを基準に作る名前の確かめと同じもの）。`COM0`・`LPT0`は
 /// #641 のオーナーレビュー Nit 4 で足した。
-pub use banto_secret_store::acl::guard::is_reserved_device_name;
+pub use banto_safe_root::guard::is_reserved_device_name;
 
 /// `profile_id`が絶対パスの1コンポーネントとしてそのまま安全に使えるかを
 /// 検証する - 空文字列、`/`・`\`（Windows パス区切り、非 Windows でも

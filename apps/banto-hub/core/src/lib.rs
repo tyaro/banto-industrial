@@ -122,7 +122,7 @@
 //!   「変更」で解消する。#626（2026-10-16）で昇格の境界として作り直した: 確かめ
 //!   （profile-id の許可リスト・利用者の SID と`SidTypeUser`・マシンの環境だけの
 //!   ルート・稼働中か）を全部通してから、辿らずに開いたハンドルへ保護された DACL を
-//!   書く（`banto_secret_store::acl`の`pin_dir`・`reset_acl`）。`Users`グループ全体には
+//!   書く（`banto_safe_root::acl`の`pin_dir`・`reset_acl`）。`Users`グループ全体には
 //!   一切権限を与えない。呼び出し元は
 //!   [`service_elevated::ElevatedAction::GrantProfileAcl`]（UAC helper 経由）と
 //!   `service-install`

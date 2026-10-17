@@ -734,7 +734,7 @@ dependencies = [
  "banto-opcua-server",
  "banto-plc",
  "banto-plc-write",
- "banto-secret-store",
+ "banto-safe-root",
  "banto-server",
  "banto-service-control",
  "banto-service-elev",
@@ -795,7 +795,7 @@ dependencies = [
  "banto-broker",
  "banto-collect",
  "banto-hub-core",
- "banto-secret-store",
+ "banto-safe-root",
  "banto-server",
  "banto-service-control",
  "banto-service-elev",
@@ -878,11 +878,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-safe-root"
+version = "0.1.0"
+dependencies = [
+ "banto-service-elev",
+ "tempfile",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "banto-secret-store"
 version = "0.1.0"
 dependencies = [
  "banto-hub-bootstrap",
- "banto-service-elev",
+ "banto-safe-root",
  "hex",
  "sha2 0.11.0",
  "tempfile",
@@ -1308,7 +1318,7 @@ dependencies = [
  "banto-core",
  "banto-desktop-tray",
  "banto-hub-bootstrap",
- "banto-secret-store",
+ "banto-safe-root",
  "banto-server",
  "banto-service-control",
  "chronogazer-core",
@@ -1340,6 +1350,7 @@ dependencies = [
  "banto-hub-bootstrap",
  "banto-instance-lock",
  "banto-plc",
+ "banto-safe-root",
  "banto-secret-store",
  "banto-server",
  "banto-service-control",
@@ -1367,7 +1378,7 @@ dependencies = [
 name = "chronogazer-elev"
 version = "0.2.0-alpha.31"
 dependencies = [
- "banto-secret-store",
+ "banto-safe-root",
  "banto-service-control",
  "banto-service-elev",
  "chronogazer-core",

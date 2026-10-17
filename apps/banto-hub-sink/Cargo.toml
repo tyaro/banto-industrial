@@ -52,9 +52,10 @@ banto-service-control = { path = "../../crates/banto-service-control" }
 time = { version = "0.3", default-features = false, features = ["local-offset"] }
 # 設定ファイル（Hub の API キー入り）の置き場とファイルが保護されているかを、辿らずに
 # 開いたハンドルで確かめてから読む（#630。`config::place`）。unsafe な Win32 の部品は
-# この共有 crate に置き、サイドカーには複製しない。依存（banto-hub-bootstrap・
+# 共有 crate `banto-safe-root`（#623 PR-1a で `banto-secret-store` から分けた）に置き、
+# サイドカーには複製しない。依存（banto-hub-bootstrap・
 # windows-sys など）はどれも既にこの exe の依存木にある。
-banto-secret-store = { path = "../../crates/banto-secret-store" }
+banto-safe-root = { path = "../../crates/banto-safe-root" }
 
 [dev-dependencies]
 # 管理者でしか走らない確かめ（保護された置き場から読む）のゲート（#630。

@@ -78,7 +78,7 @@ pub fn lookup_account_sid(name: &str) -> Result<Option<Vec<u8>>, ElevError> {
 /// 文字列化は純関数 [`crate::sid_bytes_to_string`]（`ConvertSidToStringSidW` と同じ
 /// 書式）。`LookupAccountNameW` が返した SID の形が壊れていることは無いはずだが、
 /// 万一そうなら `ERROR_INVALID_SID`（1337）の [`ElevError::LookupAccountName`]。
-/// 利用者のアカウントかを最終的に確かめるのは呼ぶ側（`banto_secret_store` の
+/// 利用者のアカウントかを最終的に確かめるのは呼ぶ側（`banto_safe_root` の
 /// `InstallUserSid::parse` と `check_user_account`）。
 pub fn lookup_account_sid_string(name: &str) -> Result<Option<AccountSid>, ElevError> {
     /// `ERROR_INVALID_SID`。

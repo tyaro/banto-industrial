@@ -43,7 +43,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{
+use crate::acl::{
     InstallUserSid, ObservedAce, ObservedDacl, PinnedDirInfo, ACCESS_ALLOWED_ACE_TYPE,
     ADMINISTRATORS_SID, INHERITED_ACE_FLAG, INHERIT_FLAGS, MODIFY_ACCESS_MASK, SYSTEM_SID,
 };
@@ -209,7 +209,7 @@ pub fn resolve_machine_root(
         Some(RootFormProblem::Empty)
     } else if !root.is_absolute() {
         Some(RootFormProblem::NotAbsolute)
-    } else if super::has_dot_segment(&root) {
+    } else if crate::acl::has_dot_segment(&root) {
         Some(RootFormProblem::DotSegment)
     } else {
         None
@@ -449,7 +449,7 @@ pub fn is_known_dacl_ace_type(ace_type: u8) -> bool {
 }
 
 /// [`plan_carry_over`] が SID の種類を問い合わせた結果（Windows では
-/// `banto_secret_store::acl::check_user_account` から作る）。
+/// `banto_safe_root::acl::check_user_account` から作る）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountKind {
     /// この PC で解決できる利用者のアカウント（`SidTypeUser`）。
@@ -460,15 +460,15 @@ pub enum AccountKind {
     LookupFailed(String),
 }
 
-/// `sid` の種類をこの PC で問い合わせる（[`super::check_user_account`]、
+/// `sid` の種類をこの PC で問い合わせる（[`crate::acl::check_user_account`]、
 /// `LookupAccountSidW`）。[`plan_carry_over`] の `account` にそのまま渡せる。
-/// `ERROR_NONE_MAPPED`・グループなど（[`crate::SecretStoreError::InvalidUserSid`]）は
+/// `ERROR_NONE_MAPPED`・グループなど（[`crate::SafeRootError::InvalidUserSid`]）は
 /// [`AccountKind::NotAUser`]、それ以外の失敗（RPC 不達など。Windows 以外の
 /// `UnsupportedPlatform` も）は [`AccountKind::LookupFailed`]。
 pub fn account_kind(sid: &InstallUserSid) -> AccountKind {
-    match super::check_user_account(sid) {
+    match crate::acl::check_user_account(sid) {
         Ok(()) => AccountKind::User,
-        Err(crate::SecretStoreError::InvalidUserSid(_)) => AccountKind::NotAUser,
+        Err(crate::SafeRootError::InvalidUserSid(_)) => AccountKind::NotAUser,
         Err(error) => AccountKind::LookupFailed(error.to_string()),
     }
 }

@@ -15,12 +15,12 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::guard::{KnownFolders, MachineEnvironment};
-use banto_secret_store::acl::{
+use banto_safe_root::acl::{
     check_dacl, read_dir_dacl, ObservedDacl, PinnedDir, PinnedDirInfo, ResetSkips,
     ADMINISTRATORS_SID, INHERIT_FLAGS,
 };
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::guard::{KnownFolders, MachineEnvironment};
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 
 use super::super::{
@@ -30,7 +30,7 @@ use super::super::{
 use super::{RegistryMachineEnvironment, WindowsHubElevOps};
 
 fn me() -> InstallUserSid {
-    banto_secret_store::acl::current_user_sid().expect("今の利用者の SID")
+    banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")
 }
 
 /// 昇格した管理者として走っているか。違えば理由を出す（呼ぶ側が skip する）。`CI`の環境変数が
@@ -543,7 +543,7 @@ fn non_user_accounts_are_refused_without_side_effects() {
 }
 
 /// `dir`（空のフォルダ）を`target`へのジャンクションにする（`FSCTL_SET_REPARSE_POINT`。
-/// テスト専用 - banto-secret-store のテストの同名の関数と同じ）。
+/// テスト専用 - banto-safe-root のテストの同名の関数と同じ）。
 fn set_reparse_to(dir: &Path, target: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};

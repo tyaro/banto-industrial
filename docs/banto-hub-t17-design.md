@@ -873,7 +873,7 @@ profile-id に`C:`・`x:y`を渡すと Windows の`Path::join`がドライブ相
 
 1. DACL は**保護された形**（親から継承しない。SYSTEM・Administrators のフル、
    owner ごとに「変更」`0x1301BF`、所有者は Administrators）。書き込みは
-   `banto_secret_store::acl`の`pin_dir`（辿らずに開き、持っている間は名前の変更・
+   `banto_secret_store::acl`（#623 PR-1a で `banto_safe_root::acl` へ移した）の`pin_dir`（辿らずに開き、持っている間は名前の変更・
    削除をさせない）と`PinnedDir::reset_acl`（ハンドルへ`SetKernelObjectSecurity`、
    自動の伝播を使わない自前の再帰。reparse point・ハードリンク・開けない子は
    飛ばして報告）だけ。
