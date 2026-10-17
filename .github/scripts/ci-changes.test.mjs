@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import {
 	classify,
 	classifyAreas,
+	escapeRegExp,
 	graphFromMetadata,
 	JOB_PACKAGES,
 	loadRustGraph,
@@ -844,4 +845,21 @@ test('パッケージをまたぐ include_str! / include_bytes! は読む側が�
 	}
 	// 走査が空振りしていないこと（既知の 1 か所を見つける）。
 	assert.ok(cross.includes('banto-tagclient ← apps/banto-hub/core/src/stream.rs'), cross.join());
+});
+
+test('escapeRegExp は正規表現の特別な文字をすべて文字どおりにする', () => {
+	// 特別な文字を全部並べても、エスケープ後は元の文字列にだけ一致する。
+	const specials = '.*+?^${}()|[]\\';
+	const re = new RegExp('^' + escapeRegExp(specials) + '$');
+	assert.ok(re.test(specials));
+	assert.ok(!re.test('x'));
+	// 1 文字ずつでも、その文字だけに一致して、ほかの文字には一致しない。
+	for (const ch of specials) {
+		const one = new RegExp('^' + escapeRegExp(ch) + '$');
+		assert.ok(one.test(ch), ch);
+		assert.ok(!one.test('a'), ch);
+	}
+	// `crates/` のような特別でない文字はそのまま。ドットは任意の 1 文字にならない。
+	assert.equal(escapeRegExp('crates/'), 'crates/');
+	assert.ok(!new RegExp('^' + escapeRegExp('a.b') + '$').test('axb'));
 });

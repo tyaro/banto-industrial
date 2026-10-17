@@ -51,7 +51,8 @@ import { fileURLToPath } from 'node:url';
 export const CRATES_PREFIX = 'crates/';
 
 /** 文字列を正規表現のリテラルとして使うためのエスケープ。 */
-const escapeRegExp = (/** @type {string} */ text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export const escapeRegExp = (/** @type {string} */ text) =>
+	text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** 領域フラグ。`full` はすべてを走らせる。 */
 export const AREAS = [
