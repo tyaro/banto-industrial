@@ -128,8 +128,10 @@ fn io_error(op: IoOp, os_error: u32) -> SafeRootError {
 /// `ERROR_NOT_SAME_DEVICE`(17)、同じボリュームなら木の外のカレントへ移る）、ハンドル基準に
 /// ならない。ntdll を直接呼び、`RootDirectory` を明示する。
 ///
-/// 【仕様】宛先がフォルダ（ジャンクション・ディレクトリのシンボリックリンクを含む）なら置き換え
-/// られずに失敗する（Fable B-6。テスト `write_atomic_refuses_a_directory_or_junction_destination`）。
+/// 【実測】宛先が空の普通のフォルダなら `ERROR_ACCESS_DENIED` で失敗するが、**ジャンクション（・
+/// ディレクトリのシンボリックリンク）の宛先は置き換えてしまう**（Fable B-6 の「失敗する」は成り立た
+/// ない）。そのため呼び出し側（`ManagedDir::write_atomic`）が付け替えの前に宛先を属性だけで開いて
+/// 確かめ、フォルダ・リンクなら断る（テスト `write_atomic_refuses_a_directory_or_junction_destination`）。
 /// 宛先がファイルのシンボリックリンク・ハードリンクなら、**名前だけ**が置き換わり、リンクの先・
 /// 別名の中身は変わらない。POSIX の付け替えを知らないファイルシステムでは
 /// `FileRenameInformation`（`ReplaceIfExists`）でやり直す。
