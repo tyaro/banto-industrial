@@ -52,7 +52,7 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # 走らせるので、Windows 限定にしない。`banto-hub-bootstrap`・`banto-tagclient`が
 # 付いてくるが、どちらもこの crate が既に持つ依存（reqwest・tungstenite 等）の上で、
 # Cargo.lock に新しい crate は増えない。
-banto-secret-store = { path = "../../../crates/banto-secret-store" }
+banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its
 # PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
@@ -257,7 +257,7 @@ path = "src/bin/banto-hub-elev.rs"
 # profile ACL 追加スライス（docs/banto-hub-desktop-plan.md §11）で
 # `src/profile_acl.rs`のために足した`Win32_Security_Authorization`・
 # `Win32_Storage_FileSystem`は、#626（2026-10-16）でその実装を消して
-# `banto-secret-store`に寄せたので外した（`src/profile_grant/win.rs`が使うのは
+# `banto-safe-root`に寄せたので外した（`src/profile_grant/win.rs`が使うのは
 # `OpenMutexW`の`Win32_System_Threading`だけ）。同 PR の監査 B-5 で、
 # `reset-password`・`revert-to-commissioning`が DB のファイルを辿らずに開いて
 # 持つ（`CreateFileW`・`GetFileInformationByHandle`・`GetFinalPathNameByHandleW`）

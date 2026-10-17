@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use banto_secret_store::acl::{PinnedDirInfo, ResetSkips};
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::acl::{PinnedDirInfo, ResetSkips};
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::{
     ConsoleLine, InstallError, InstallKind, InstallOutcome, PreshutdownReport, ServiceManagerError,
     StopAttempt, UninstallError, UninstallOutcome,
@@ -485,11 +485,11 @@ impl PinnedDirOps for FakePinned {
     fn reset_acl(
         &self,
         access: &DirAccess,
-        recurse: banto_secret_store::acl::Recurse,
+        recurse: banto_safe_root::acl::Recurse,
     ) -> Result<ResetSkips, String> {
         let r = match recurse {
-            banto_secret_store::acl::Recurse::Tree => "tree",
-            banto_secret_store::acl::Recurse::ObjectOnly => "object",
+            banto_safe_root::acl::Recurse::Tree => "tree",
+            banto_safe_root::acl::Recurse::ObjectOnly => "object",
         };
         self.log.borrow_mut().push(format!(
             "reset {} {} {r}",

@@ -1,4 +1,4 @@
-//! 保存先ディレクトリの DACL（決定 4、計画書 §3.1(c)・§3.3）。
+//! 保護するディレクトリの DACL（決定 4、計画書 §3.1(c)・§3.3）。
 //!
 //! # 期待する形
 //!
@@ -32,13 +32,14 @@
 //!   （fail closed。Microsoft Entra ID の利用者 `S-1-12-1-…` を含む - 下の
 //!   [`InstallUserSid`] の doc）。
 //! - **既にあれば**: DACL・所有者を読み戻して上の形と**完全に一致する**ことを
-//!   確かめ、違えば [`SecretStoreError::AclMismatch`] で失敗する（fail closed）。
+//!   確かめ、違えば [`SafeRootError::AclMismatch`] で失敗する（fail closed）。
 //!   **自動では直さない**（黙って広げることも狭めることもしない。違う形には、
 //!   管理者が意図して変えた・別の製品が使っている・乗っ取りの準備、のどれも
 //!   ありうるため）。直すのは [`reset_dir_acl`] の明示的な呼び出しだけで、
 //!   B3-3 の昇格ヘルパ（管理者の操作）から使う想定。
-//! - [`crate::FileSecretStore`] は開くときだけでなく、**読む・書く・消すたびに**
-//!   この確認をする（途中で ACL が変えられたら、それ以降は使わない）。
+//! - 保存の層（`banto-secret-store` の `FileSecretStore`）は開くときだけでなく、
+//!   **読む・書く・消すたびに**この確認をする（途中で ACL が変えられたら、それ以降は
+//!   使わない）。
 //!
 //! # インストール利用者の SID の検証
 //!
@@ -49,7 +50,7 @@
 //! 検査に通る場合でも、グループの SID を受け入れないため（#595 のレビュー P2:
 //! 以前は作る経路でだけ確かめていた）。
 //!
-//! [`crate::FileSecretStore`] は [`crate::FileSecretStore::open`] で 1 回だけ
+//! 保存の層（`FileSecretStore::open`）は 1 回だけ
 //! 確かめ、読む・書く・消すたびの ACL の再確認では確かめ直さない。SID は open の
 //! 時点で [`DirAccess`] に固定され、その後は変わらない（ACL の再確認は「その固定
 //! した SID の形と一致するか」だけを見る）ため。名前の解決（ドメインでは
@@ -60,7 +61,7 @@
 //!
 //! # 無いときだけ作る（[`create_dir_if_absent`]、#392 B2-4a）
 //!
-//! 秘密の保存先とは別に、**データのルート**（ChronoGazer の
+//! ディレクトリ単位の確認とは別に、**データのルート**（ChronoGazer の
 //! `%ProgramData%\ChronoGazer`。2026-10-14 オーナー決定 O6）を同じ形の保護された DACL
 //! で作るための口。[`ensure_dir`] と違い、**既にあれば何もしない**（DACL を読まず、
 //! 確かめず、直さない - 既にあるルートは前の版・管理者・インストーラが作ったもので、
@@ -89,7 +90,7 @@
 //!   `FILE_SHARE_DELETE` を渡さずに開くので、持っている間は誰もそのディレクトリを消す・名前を変える（= 確かめた後に
 //!   ジャンクションへすり替える）ことができない。さらに `WRITE_DAC | WRITE_OWNER` を
 //!   求め、`PinnedDir::reset_acl` は**そのハンドルで** `SetKernelObjectSecurity`（DACL と
-//!   所有者。**自動の継承の伝播をしない** API）を書く（監査 B2・[A]。パスで
+//!   所有者。**自動の継承の伝播をしない** API）を書く（監査 B2・\[A\]。パスで
 //!   `SetNamedSecurityInfoW` を呼ぶと、名前の変更・削除は止められても、
 //!   `FILE_WRITE_ATTRIBUTES` は共有の確かめに加わらないので、確かめた後に**その場で**
 //!   `FSCTL_SET_REPARSE_POINT` でジャンクションにされ、書き直しがその先へ向きうる。
@@ -117,7 +118,7 @@
 //!   未測**（Microsoft の仕様は自動の伝播の範囲を明言していない - #626 のオーナーレビュー
 //!   P1）。そこで
 //!   `set_security_tree` は自動の伝播を使わず、対象そのものは `SetKernelObjectSecurity`
-//!   （伝播しない API）で書き、継承は自前で子へ伝える。**パスは一切使わない**（監査 [A]。
+//!   （伝播しない API）で書き、継承は自前で子へ伝える。**パスは一切使わない**（監査 \[A\]。
 //!   パスで列挙・パスで開くと、確かめた後に途中の要素をジャンクションに変えられて先を
 //!   辿る）: 子は、親のディレクトリの**ハンドル**を
 //!   `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)` で列挙して**128 ビットの**ファイル ID を取り（監査 Nit 2。ReFS・Dev Drive でも正しい）、
@@ -194,13 +195,12 @@
 //! # 非 Windows
 //!
 //! DACL の概念が無いので、作る・確かめる・直す・[`inspect_file`] はどれも
-//! [`SecretStoreError::UnsupportedPlatform`] を返す（黙って成功にしない）。
+//! [`SafeRootError::UnsupportedPlatform`] を返す（黙って成功にしない）。
 //! [`InstallUserSid`] の文字列の検査と [`check_dacl`]・[`exposure`] の判定は純関数で、
 //! 全 OS でテストする。
 
-pub mod guard;
-
-use crate::error::{AclMismatch, Result, SecretStoreError};
+use crate::error::{AclMismatch, Result, SafeRootError};
+use crate::guard;
 
 /// SYSTEM。
 pub const SYSTEM_SID: &str = "S-1-5-18";
@@ -237,7 +237,7 @@ pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 /// `LookupAccountSidW` が解決し（`AzureAD\<名前>`、種類は `SidTypeUser`）、
 /// そのまま使える。**解決できないとき（その PC で一度もサインインしていない
 /// 利用者・名前の解決に Entra へ届かない等）は、グループと見分けられないので
-/// 拒む（fail closed、[`SecretStoreError::InvalidUserSid`]）**。インストールは
+/// 拒む（fail closed、[`SafeRootError::InvalidUserSid`]）**。インストールは
 /// その利用者自身のサインイン中に行う（B3-3 の昇格ヘルパは呼び出した利用者の
 /// SID を渡す）ので、通常は解決できる。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,7 +247,7 @@ impl InstallUserSid {
     pub fn parse(s: &str) -> Result<Self> {
         const PREFIXES: [&str; 2] = ["S-1-5-21-", "S-1-12-1-"];
         let Some(rest) = PREFIXES.iter().find_map(|prefix| s.strip_prefix(prefix)) else {
-            return Err(SecretStoreError::InvalidUserSid(
+            return Err(SafeRootError::InvalidUserSid(
                 "利用者のアカウントの SID（S-1-5-21-… か S-1-12-1-…）ではありません",
             ));
         };
@@ -258,7 +258,7 @@ impl InstallUserSid {
                 .iter()
                 .all(|p| !p.is_empty() && p.len() <= 10 && p.bytes().all(|b| b.is_ascii_digit()));
         if !well_formed {
-            return Err(SecretStoreError::InvalidUserSid("SID の形式ではありません"));
+            return Err(SafeRootError::InvalidUserSid("SID の形式ではありません"));
         }
         Ok(Self(s.to_owned()))
     }
@@ -268,7 +268,7 @@ impl InstallUserSid {
     }
 }
 
-/// 保存先ディレクトリに付ける権限の指定。
+/// ディレクトリに付ける権限の指定。
 ///
 /// 利用者（「変更」を付ける相手）は 0 人（[`DirAccess::service_only`]）・1 人
 /// （[`DirAccess::with_install_user`]）・複数（[`DirAccess::with_install_users`]、#626
@@ -443,19 +443,18 @@ pub fn verify_dir(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
 }
 
 /// [`ensure_dir`] から SID の検証を除いたもの。`access` の SID を既に確かめた
-/// 呼び出し側（[`crate::FileSecretStore`] の読む・書く・消すたびの確認）だけが使う。
-pub(crate) fn ensure_dir_with_validated_sid(
-    dir: &std::path::Path,
-    access: &DirAccess,
-) -> Result<()> {
+/// 呼び出し側（`banto-secret-store` の `FileSecretStore` の読む・書く・消すたびの確認）
+/// だけが使う。
+// TODO(#623 PR-3): `FileSecretStore::open_in` で不要になったら消す。
+#[doc(hidden)]
+pub fn ensure_dir_with_validated_sid(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
     imp::ensure_dir(dir, access)
 }
 
 /// [`verify_dir`] から SID の検証を除いたもの（同上）。
-pub(crate) fn verify_dir_with_validated_sid(
-    dir: &std::path::Path,
-    access: &DirAccess,
-) -> Result<()> {
+// TODO(#623 PR-3): 同上。
+#[doc(hidden)]
+pub fn verify_dir_with_validated_sid(dir: &std::path::Path, access: &DirAccess) -> Result<()> {
     imp::verify_dir(dir, access)
 }
 
@@ -476,7 +475,7 @@ pub fn create_dir_if_absent(dir: &std::path::Path, access: &DirAccess) -> Result
 /// `Path::components` は途中の `.` を読み飛ばすので、文字列の要素で見る。
 fn reject_dot_segments(dir: &std::path::Path) -> Result<()> {
     if has_dot_segment(dir) {
-        return Err(SecretStoreError::DotSegmentInPath);
+        return Err(SafeRootError::DotSegmentInPath);
     }
     Ok(())
 }
@@ -507,7 +506,7 @@ pub fn read_dir_dacl(dir: &std::path::Path) -> Result<ObservedDacl> {
 /// インストール利用者の SID が、この PC で解決できる**利用者のアカウント**
 /// （`LookupAccountSidW` の `SidTypeUser`）であることを確かめる（#392 B3-3b。
 /// ディレクトリを作る・直す前と同じ確かめを、昇格ヘルパが SID を記録する前に
-/// 使う）。非 Windows は [`SecretStoreError::UnsupportedPlatform`]。
+/// 使う）。非 Windows は [`SafeRootError::UnsupportedPlatform`]。
 pub fn check_user_account(sid: &InstallUserSid) -> Result<()> {
     imp::ensure_user_account(&DirAccess::with_install_user(sid.clone()))
 }
@@ -647,7 +646,7 @@ pub fn exposure(security: &FileSecurity) -> Vec<Exposure> {
 /// 中身は読まない（`READ_CONTROL | FILE_READ_ATTRIBUTES` だけを求め、共有はすべて許す）。
 /// 途中の要素は辿るので、場所の確かめが要るときは `pin_dir` の本当のパスを使い、中身を読む
 /// ときは `PinnedDir::open_child_file`（確かめたハンドルのまま読む）を使う。`.`・`..` を
-/// 含むパスは開かずに断る。非 Windows は [`SecretStoreError::UnsupportedPlatform`]。
+/// 含むパスは開かずに断る。非 Windows は [`SafeRootError::UnsupportedPlatform`]。
 pub fn inspect_file(path: &std::path::Path) -> Result<Option<FileSecurity>> {
     reject_dot_segments(path)?;
     imp::inspect_file(path)
@@ -741,10 +740,10 @@ impl PinnedDir {
     /// すでにルートの再帰で書いた `secrets`・`hub-keys` を、その層でもう一度書き直さない）。
     pub fn reset_acl(&self, access: &DirAccess, recurse: Recurse) -> Result<ResetSkips> {
         if self.info.is_reparse_point {
-            return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
+            return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
         }
         if !self.info.is_dir {
-            return Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory));
+            return Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory));
         }
         let mut skips = ResetSkips::default();
         imp::set_security_tree(
@@ -814,7 +813,7 @@ impl PinnedDir {
     /// 既に書き込み（または削除）で開いているハンドルがあれば、開くこと自体が共有違反で失敗する
     /// （ACL を締める前から書き込みで開いていた主体が、確かめた後に書き換えるのを防ぐ。#648）。
     /// バックアップの意図（`FILE_OPEN_FOR_BACKUP_INTENT`）は付けず、DACL だけを門にする。
-    /// 開けない（アクセス拒否・共有違反など）は [`SecretStoreError::Io`]（`IoOp::OpenFile`、
+    /// 開けない（アクセス拒否・共有違反など）は [`SafeRootError::Io`]（`IoOp::OpenFile`、
     /// `kind` に `PermissionDenied` など、`os_error` に `ERROR_SHARING_VIOLATION`(32) など）。
     pub fn open_child_file(&self, name: &str) -> Result<Option<PinnedFile>> {
         imp::open_child_file(self, name)
@@ -834,7 +833,7 @@ impl PinnedDir {
     ///   （`FILE_CREATE | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT`）。
     /// - 書いた後、作ったハンドルから記述子を読み戻して [`exposure`] が空であることを
     ///   確かめる。書き込み・書き出し・読み戻しのどれかが失敗した、または保護されていなかった
-    ///   （[`SecretStoreError::Exposed`]）ときは、**作ったハンドルで**消してから（
+    ///   （[`SafeRootError::Exposed`]）ときは、**作ったハンドルで**消してから（
     ///   `FileDispositionInfo`。名前で消さないので、別の物を消さない）失敗を返す。
     pub fn create_child_file(&self, name: &str, contents: &[u8]) -> Result<Option<PinnedFile>> {
         imp::create_child_file(self, name, contents)
@@ -851,7 +850,7 @@ impl PinnedDir {
     /// WRITE_OWNER | DELETE` を求める。`DELETE` を求めるので共有の確かめに加わり、共有は
     /// **読み取りだけ**なので、持っている間はほかの誰も書き込みに開く・消す・名前を変える・
     /// すり替えることができず、既に書き込みに開いているプロセスがあれば開くこと自体が共有違反
-    /// （`SecretStoreError::Io` の `os_error` が 32）で失敗する。
+    /// （`SafeRootError::Io` の `os_error` が 32）で失敗する。
     /// 子がフォルダ・リンクでも辿らずにそのものを開くので、呼ぶ側が [`PinnedFile::security`]
     /// で確かめる（[`PinnedFile::reset_acl`]・[`PinnedFile::delete`] も自分で断る）。
     /// [`PinnedFile::read_to_end`] は使えない（中身の権利を持たない）。
@@ -907,10 +906,10 @@ impl PinnedFile {
     /// reparse point は [`AclMismatch::ReparsePoint`] で、読まずに断る。
     pub fn read_to_end(&self, max_len: usize) -> Result<Vec<u8>> {
         if self.security.is_reparse_point {
-            return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
+            return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
         }
         if self.security.is_dir {
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 crate::error::IoOp::ReadFile,
                 &std::io::Error::from(std::io::ErrorKind::IsADirectory),
             ));
@@ -925,12 +924,12 @@ impl PinnedFile {
     ///
     /// - **書く直前にハンドルから属性を読み直し**、reparse point（[`AclMismatch::ReparsePoint`]）・
     ///   フォルダ（`io::ErrorKind::IsADirectory`）・ハードリンク（リンク数 2 以上。記述子を
-    ///   共有するので、書くと別の名前のアクセスも変わる - #624。[`SecretStoreError::Exposed`] に
+    ///   共有するので、書くと別の名前のアクセスも変わる - #624。[`SafeRootError::Exposed`] に
     ///   [`Exposure::HardLinked`]）には何も書かずに断る。
     /// - 書くのは `SetKernelObjectSecurity`（自動の継承の伝播をしない。[`PinnedDir::reset_acl`]
     ///   と同じ）。所有者を Administrators にできるのは昇格した管理者・SYSTEM だけ（それ以外は
     ///   `ERROR_INVALID_OWNER`(1307) で何も変えずに失敗する）。
-    /// - 書いた後に読み戻して [`exposure`] が空でなければ [`SecretStoreError::Exposed`]。
+    /// - 書いた後に読み戻して [`exposure`] が空でなければ [`SafeRootError::Exposed`]。
     pub fn reset_acl(&self) -> Result<FileSecurity> {
         imp::reset_file_acl(self.handle.raw())
     }
@@ -942,7 +941,7 @@ impl PinnedFile {
     /// リンクそのものを消す（`OPEN_REPARSE_POINT` で開いているので、先は消さない）。
     pub fn delete(self) -> Result<()> {
         if self.security.is_dir {
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 crate::error::IoOp::RemoveFile,
                 &std::io::Error::from(std::io::ErrorKind::IsADirectory),
             ));
@@ -981,34 +980,34 @@ mod imp {
     use std::path::Path;
 
     use super::{DirAccess, ObservedDacl};
-    use crate::error::{Result, SecretStoreError};
+    use crate::error::{Result, SafeRootError};
 
     pub(super) fn ensure_user_account(_access: &DirAccess) -> Result<()> {
-        Err(SecretStoreError::UnsupportedPlatform)
+        Err(SafeRootError::UnsupportedPlatform)
     }
 
     pub(super) fn ensure_dir(_dir: &Path, _access: &DirAccess) -> Result<()> {
-        Err(SecretStoreError::UnsupportedPlatform)
+        Err(SafeRootError::UnsupportedPlatform)
     }
 
     pub(super) fn verify_dir(_dir: &Path, _access: &DirAccess) -> Result<()> {
-        Err(SecretStoreError::UnsupportedPlatform)
+        Err(SafeRootError::UnsupportedPlatform)
     }
 
     pub(super) fn reset_dir_acl(_dir: &Path, _access: &DirAccess) -> Result<()> {
-        Err(SecretStoreError::UnsupportedPlatform)
+        Err(SafeRootError::UnsupportedPlatform)
     }
 
     pub(super) fn create_dir_if_absent(_dir: &Path, _access: &DirAccess) -> Result<bool> {
-        Err(SecretStoreError::UnsupportedPlatform)
+        Err(SafeRootError::UnsupportedPlatform)
     }
 
     pub(super) fn read_dacl(_dir: &Path) -> Result<ObservedDacl> {
-        Err(SecretStoreError::UnsupportedPlatform)
+        Err(SafeRootError::UnsupportedPlatform)
     }
 
     pub(super) fn inspect_file(_path: &Path) -> Result<Option<super::FileSecurity>> {
-        Err(SecretStoreError::UnsupportedPlatform)
+        Err(SafeRootError::UnsupportedPlatform)
     }
 }
 
@@ -1035,7 +1034,7 @@ mod imp {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::{check_dacl, DirAccess, ObservedAce, ObservedDacl};
-    use crate::error::{AclMismatch, IoOp, Result, SecretStoreError};
+    use crate::error::{AclMismatch, IoOp, Result, SafeRootError};
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -1053,8 +1052,8 @@ mod imp {
         unsafe { GetLastError() }
     }
 
-    fn api(call: &'static str, os_error: u32) -> SecretStoreError {
-        SecretStoreError::AclApi { call, os_error }
+    fn api(call: &'static str, os_error: u32) -> SafeRootError {
+        SafeRootError::AclApi { call, os_error }
     }
 
     /// `LocalAlloc` で確保された領域を drop で `LocalFree` する。
@@ -1108,7 +1107,7 @@ mod imp {
         let mut sid: PSID = std::ptr::null_mut();
         // SAFETY: `text` は NUL 終端。成功すれば `sid` は LocalAlloc の領域。
         if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
-            return Err(SecretStoreError::InvalidUserSid("SID の形式ではありません"));
+            return Err(SafeRootError::InvalidUserSid("SID の形式ではありません"));
         }
         let sid = LocalBox(sid);
         let mut name = [0u16; 256];
@@ -1136,14 +1135,14 @@ mod imp {
             // **一時的な失敗**として別の種類で返す（#392 B3-3b の監査 Nit 2。呼ぶ側が
             // 終了コードを 64 と 1 に分けられるように）。
             if os_error == ERROR_NONE_MAPPED {
-                return Err(SecretStoreError::InvalidUserSid(
+                return Err(SafeRootError::InvalidUserSid(
                     "この PC にこの SID のアカウントがありません",
                 ));
             }
             return Err(api("LookupAccountSidW", os_error));
         }
         if kind != SidTypeUser {
-            return Err(SecretStoreError::InvalidUserSid(
+            return Err(SafeRootError::InvalidUserSid(
                 "利用者のアカウントではありません（グループなど）",
             ));
         }
@@ -1154,27 +1153,26 @@ mod imp {
         match std::fs::symlink_metadata(dir) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
-                    return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
+                    return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
                 }
                 if !meta.is_dir() {
-                    return Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory));
+                    return Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory));
                 }
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(SecretStoreError::io(IoOp::InspectDir, &e)),
+            Err(e) => Err(SafeRootError::io(IoOp::InspectDir, &e)),
         }
     }
 
     pub(super) fn ensure_dir(dir: &Path, access: &DirAccess) -> Result<()> {
-        // SID の検証は呼び出し側（公開の `ensure_dir`・`FileSecretStore::open`）が
+        // SID の検証は呼び出し側（公開の `ensure_dir`・保存の層の `FileSecretStore::open`）が
         // 作る・確かめるの分岐より前に済ませている。
         if inspect(dir)? {
             return verify_dir(dir, access);
         }
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))?;
+            std::fs::create_dir_all(parent).map_err(|e| SafeRootError::io(IoOp::CreateDir, &e))?;
         }
         let sd = descriptor(access)?;
         let attributes = SECURITY_ATTRIBUTES {
@@ -1188,7 +1186,7 @@ mod imp {
         if ok == 0 {
             let os_error = last_error();
             if os_error != ERROR_ALREADY_EXISTS {
-                return Err(SecretStoreError::io(
+                return Err(SafeRootError::io(
                     IoOp::CreateDir,
                     &std::io::Error::from_raw_os_error(os_error as i32),
                 ));
@@ -1202,15 +1200,14 @@ mod imp {
         // 辿った先で判断する（既にあるルートがリンクでも、今までどおり使う）。
         match std::fs::metadata(dir) {
             Ok(meta) if meta.is_dir() => return Ok(false),
-            Ok(_) => return Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory)),
+            Ok(_) => return Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(SecretStoreError::io(IoOp::InspectDir, &e)),
+            Err(e) => return Err(SafeRootError::io(IoOp::InspectDir, &e)),
         }
         // 作る経路でだけ SID を確かめる（モジュール doc「無いときだけ作る」）。
         ensure_user_account(access)?;
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))?;
+            std::fs::create_dir_all(parent).map_err(|e| SafeRootError::io(IoOp::CreateDir, &e))?;
         }
         let sd = descriptor(access)?;
         let attributes = SECURITY_ATTRIBUTES {
@@ -1227,7 +1224,7 @@ mod imp {
                 // 確かめてから作るまでの間に誰かが作った: 形を問わずそのまま使う。
                 return Ok(false);
             }
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::CreateDir,
                 &std::io::Error::from_raw_os_error(os_error as i32),
             ));
@@ -1237,13 +1234,13 @@ mod imp {
 
     pub(super) fn verify_dir(dir: &Path, access: &DirAccess) -> Result<()> {
         if !inspect(dir)? {
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::InspectDir,
                 &std::io::Error::from(std::io::ErrorKind::NotFound),
             ));
         }
         let observed = read_dacl(dir)?;
-        check_dacl(&observed, access).map_err(SecretStoreError::AclMismatch)
+        check_dacl(&observed, access).map_err(SafeRootError::AclMismatch)
     }
 
     /// 期待の保護された DACL を**パスで**書き直す（所有者は変えない）。昇格していない
@@ -1252,7 +1249,7 @@ mod imp {
     /// 昇格ヘルパーの書き直しは [`super::PinnedDir::reset_acl`]（ハンドルで書く）を使う。
     pub(super) fn reset_dir_acl(dir: &Path, access: &DirAccess) -> Result<()> {
         if !inspect(dir)? {
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::InspectDir,
                 &std::io::Error::from(std::io::ErrorKind::NotFound),
             ));
@@ -1454,7 +1451,7 @@ mod imp {
             if os_error == ERROR_ACCESS_DENIED {
                 return Ok(ChildOpen::Denied);
             }
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::InspectDir,
                 &std::io::Error::from_raw_os_error(os_error as i32),
             ));
@@ -1528,7 +1525,7 @@ mod imp {
         };
 
         if depth >= MAX_DEPTH {
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::InspectDir,
                 &std::io::Error::other(format!(
                     "フォルダの入れ子が深すぎます（{MAX_DEPTH} 段で打ち切り）"
@@ -1908,7 +1905,7 @@ mod imp {
             if os_error == ERROR_FILE_NOT_FOUND || os_error == ERROR_PATH_NOT_FOUND {
                 return Ok(None);
             }
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::InspectDir,
                 &std::io::Error::from_raw_os_error(os_error as i32),
             ));
@@ -2017,25 +2014,25 @@ mod imp {
     pub(super) fn reset_file_acl(handle: HANDLE) -> Result<super::FileSecurity> {
         let before = security_of_handle(handle)?;
         if before.is_reparse_point {
-            return Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint));
+            return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
         }
         if before.is_dir {
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::OpenFile,
                 &std::io::Error::from(std::io::ErrorKind::IsADirectory),
             ));
         }
         if before.links >= 2 {
-            return Err(SecretStoreError::Exposed(vec![
-                super::Exposure::HardLinked(before.links),
-            ]));
+            return Err(SafeRootError::Exposed(vec![super::Exposure::HardLinked(
+                before.links,
+            )]));
         }
         let descriptor = owned_protected_sd(&DirAccess::service_only(), false)?;
         set_object_security(handle, &descriptor)?;
         let after = security_of_handle(handle)?;
         let found = super::exposure(&after);
         if !found.is_empty() {
-            return Err(SecretStoreError::Exposed(found));
+            return Err(SafeRootError::Exposed(found));
         }
         Ok(after)
     }
@@ -2067,7 +2064,7 @@ mod imp {
                 found.push(super::Exposure::NullDacl);
             }
             if !found.is_empty() {
-                return Err(SecretStoreError::Exposed(found));
+                return Err(SafeRootError::Exposed(found));
             }
             Ok((security, final_path_of(handle.raw())?))
         };
@@ -2113,7 +2110,7 @@ mod imp {
             )
         };
         if ok == 0 {
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::RemoveFile,
                 &std::io::Error::from_raw_os_error(last_error() as i32),
             ));
@@ -2130,9 +2127,9 @@ mod imp {
         let mut file =
             std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle as _) });
         file.write_all(contents)
-            .map_err(|e| SecretStoreError::io(IoOp::WriteFile, &e))?;
+            .map_err(|e| SafeRootError::io(IoOp::WriteFile, &e))?;
         file.sync_all()
-            .map_err(|e| SecretStoreError::io(IoOp::WriteFile, &e))
+            .map_err(|e| SafeRootError::io(IoOp::WriteFile, &e))
     }
 
     /// [`super::PinnedFile::read_to_end`] の本体: 先頭から `max_len` バイトまで読む（超えたら
@@ -2143,7 +2140,7 @@ mod imp {
         // SAFETY: `handle` はこの呼び出しの間開いている有効なファイルのハンドル（閉じない）。
         let mut file =
             std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(handle as _) });
-        let read_error = |e: std::io::Error| SecretStoreError::io(IoOp::ReadFile, &e);
+        let read_error = |e: std::io::Error| SafeRootError::io(IoOp::ReadFile, &e);
         file.seek(SeekFrom::Start(0)).map_err(read_error)?;
         let mut contents = Vec::new();
         (&mut *file)
@@ -2212,7 +2209,7 @@ mod imp {
             if os_error == ERROR_FILE_NOT_FOUND || os_error == ERROR_PATH_NOT_FOUND {
                 return Ok(None);
             }
-            return Err(SecretStoreError::io(
+            return Err(SafeRootError::io(
                 IoOp::OpenFile,
                 &std::io::Error::from_raw_os_error(os_error as i32),
             ));
@@ -2286,7 +2283,7 @@ mod imp {
         // `NtCreateFile` は Win32 の正規化を通らないので、Win32 から見ると別の名前・別の
         // 物になるもの（末尾の `.` と空白・ワイルドカード・予約デバイス名など）も断る
         // （#641 のオーナーレビュー Nit 2）。
-        if !super::guard::is_plain_child_name(name) {
+        if !crate::guard::is_plain_child_name(name) {
             return Err(api(label, ERROR_INVALID_NAME));
         }
         let wide_name: Vec<u16> = name.encode_utf16().collect();
@@ -2401,11 +2398,11 @@ mod imp {
             // ファイル（#630）は `io::ErrorKind` を残す（sink がアクセス拒否を見分けて案内する
             // ため）。フォルダは今までどおり。
             return Err(match how {
-                ChildHow::OpenFile | ChildHow::OpenFileForUpdate => SecretStoreError::io(
+                ChildHow::OpenFile | ChildHow::OpenFileForUpdate => SafeRootError::io(
                     IoOp::OpenFile,
                     &std::io::Error::from_raw_os_error(os_error as i32),
                 ),
-                ChildHow::CreateFile(_) => SecretStoreError::io(
+                ChildHow::CreateFile(_) => SafeRootError::io(
                     IoOp::CreateFile,
                     &std::io::Error::from_raw_os_error(os_error as i32),
                 ),
@@ -2530,7 +2527,7 @@ mod tests {
             assert!(
                 matches!(
                     InstallUserSid::parse(bad),
-                    Err(SecretStoreError::InvalidUserSid(_))
+                    Err(SafeRootError::InvalidUserSid(_))
                 ),
                 "{bad:?} を受け付けた"
             );
@@ -3005,27 +3002,27 @@ mod tests {
         let access = DirAccess::service_only();
         assert_eq!(
             ensure_dir(dir, &access),
-            Err(SecretStoreError::UnsupportedPlatform)
+            Err(SafeRootError::UnsupportedPlatform)
         );
         assert_eq!(
             verify_dir(dir, &access),
-            Err(SecretStoreError::UnsupportedPlatform)
+            Err(SafeRootError::UnsupportedPlatform)
         );
         assert_eq!(
             reset_dir_acl(dir, &access),
-            Err(SecretStoreError::UnsupportedPlatform)
+            Err(SafeRootError::UnsupportedPlatform)
         );
         assert_eq!(
             create_dir_if_absent(dir, &access),
-            Err(SecretStoreError::UnsupportedPlatform)
+            Err(SafeRootError::UnsupportedPlatform)
         );
         assert_eq!(
             check_user_account(&user()),
-            Err(SecretStoreError::UnsupportedPlatform)
+            Err(SafeRootError::UnsupportedPlatform)
         );
         assert_eq!(
             inspect_file(&dir.join("banto-hub-sink.toml")),
-            Err(SecretStoreError::UnsupportedPlatform)
+            Err(SafeRootError::UnsupportedPlatform)
         );
     }
 
@@ -3136,10 +3133,7 @@ mod tests {
 
             let err = ensure_dir(&dir, &access).unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    SecretStoreError::AclMismatch(AclMismatch::NotProtected)
-                ),
+                matches!(err, SafeRootError::AclMismatch(AclMismatch::NotProtected)),
                 "{err:?}"
             );
             // 黙って直さない。
@@ -3166,13 +3160,8 @@ mod tests {
             for err in [
                 ensure_dir(&dir, &group_access).unwrap_err(),
                 verify_dir(&dir, &group_access).unwrap_err(),
-                crate::FileSecretStore::open(&dir, group_access.clone(), crate::PlainProtector)
-                    .unwrap_err(),
             ] {
-                assert!(
-                    matches!(err, SecretStoreError::InvalidUserSid(_)),
-                    "{err:?}"
-                );
+                assert!(matches!(err, SafeRootError::InvalidUserSid(_)), "{err:?}");
             }
             // ACL の形とは関係なく、既存の経路でも SID を先に確かめる（ACL が違う
             // フォルダでも、返るのは AclMismatch ではなく InvalidUserSid）。
@@ -3180,7 +3169,7 @@ mod tests {
             std::fs::create_dir(&plain).unwrap();
             assert!(matches!(
                 ensure_dir(&plain, &group_access),
-                Err(SecretStoreError::InvalidUserSid(_))
+                Err(SafeRootError::InvalidUserSid(_))
             ));
 
             // 片付け（所有者は自分なので書き換えられる）。
@@ -3215,7 +3204,7 @@ mod tests {
             std::fs::write(&file, b"x").unwrap();
             assert!(matches!(
                 create_dir_if_absent(&file, &access),
-                Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory))
+                Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory))
             ));
         }
 
@@ -3234,12 +3223,12 @@ mod tests {
             ] {
                 assert_eq!(
                     create_dir_if_absent(&dir, &access),
-                    Err(SecretStoreError::DotSegmentInPath),
+                    Err(SafeRootError::DotSegmentInPath),
                     "{dir:?}"
                 );
                 assert_eq!(
                     ensure_dir(&dir, &access),
-                    Err(SecretStoreError::DotSegmentInPath),
+                    Err(SafeRootError::DotSegmentInPath),
                     "{dir:?}"
                 );
                 assert!(!real.exists(), "何も作らない: {dir:?}");
@@ -3261,7 +3250,7 @@ mod tests {
             let dir = root.path().join("g");
             assert!(matches!(
                 create_dir_if_absent(&dir, &group_access),
-                Err(SecretStoreError::InvalidUserSid(_))
+                Err(SafeRootError::InvalidUserSid(_))
             ));
             assert!(!dir.exists(), "拒んだときはフォルダを作らない");
             assert!(!create_dir_if_absent(root.path(), &group_access).unwrap());
@@ -3330,7 +3319,7 @@ mod tests {
                 );
                 assert_eq!(
                     reset,
-                    Err(SecretStoreError::AclApi {
+                    Err(SafeRootError::AclApi {
                         call: "SetKernelObjectSecurity",
                         os_error: 1307
                     })
@@ -3347,7 +3336,7 @@ mod tests {
             assert!(pinned.info().is_reparse_point, "{:?}", pinned.info());
             assert_eq!(
                 pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree),
-                Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint))
+                Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint))
             );
             drop(pinned);
             assert_eq!(read_dir_dacl(outside.path()).unwrap(), before);
@@ -3359,11 +3348,11 @@ mod tests {
             assert!(!pinned.info().is_dir);
             assert_eq!(
                 pinned.reset_acl(&DirAccess::with_install_user(me()), Recurse::Tree),
-                Err(SecretStoreError::AclMismatch(AclMismatch::NotADirectory))
+                Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory))
             );
             assert_eq!(
                 pin_dir(&root.path().join("x").join("..").join("plain")).unwrap_err(),
-                SecretStoreError::DotSegmentInPath
+                SafeRootError::DotSegmentInPath
             );
         }
 
@@ -3968,7 +3957,7 @@ mod tests {
             let group = InstallUserSid::parse(&format!("{machine}-513")).unwrap();
             assert!(matches!(
                 check_user_account(&group),
-                Err(SecretStoreError::InvalidUserSid(_))
+                Err(SafeRootError::InvalidUserSid(_))
             ));
         }
 
@@ -3981,10 +3970,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("g");
             let err = ensure_dir(&dir, &DirAccess::with_install_user(group)).unwrap_err();
-            assert!(
-                matches!(err, SecretStoreError::InvalidUserSid(_)),
-                "{err:?}"
-            );
+            assert!(matches!(err, SafeRootError::InvalidUserSid(_)), "{err:?}");
             assert!(!dir.exists(), "拒んだときはフォルダを作らない");
         }
 
@@ -4060,7 +4046,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    SecretStoreError::AclMismatch(AclMismatch::UnexpectedAce { ref sid, .. })
+                    SafeRootError::AclMismatch(AclMismatch::UnexpectedAce { ref sid, .. })
                         if sid == other.as_str()
                 ),
                 "{err:?}"
@@ -4387,7 +4373,7 @@ mod tests {
             assert_eq!(inspect_file(&dir.join("missing.toml")), Ok(None));
             assert_eq!(
                 inspect_file(&dir.join("..").join("root").join("banto-hub-sink.toml")),
-                Err(SecretStoreError::DotSegmentInPath)
+                Err(SafeRootError::DotSegmentInPath)
             );
         }
 
@@ -4501,7 +4487,7 @@ mod tests {
             assert_eq!(file.read_to_end(contents.len()).unwrap(), contents);
             assert!(matches!(
                 file.read_to_end(contents.len() - 1),
-                Err(SecretStoreError::Io {
+                Err(SafeRootError::Io {
                     op: crate::error::IoOp::ReadFile,
                     kind: std::io::ErrorKind::FileTooLarge,
                     ..
@@ -4538,7 +4524,7 @@ mod tests {
             assert!(sub.security().is_dir);
             assert!(matches!(
                 sub.read_to_end(1024),
-                Err(SecretStoreError::Io {
+                Err(SafeRootError::Io {
                     kind: std::io::ErrorKind::IsADirectory,
                     ..
                 })
@@ -4547,7 +4533,7 @@ mod tests {
             assert!(link.security().is_reparse_point, "{link:?}");
             assert_eq!(
                 link.read_to_end(1024),
-                Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint))
+                Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint))
             );
             for bad in [
                 "",
@@ -4588,7 +4574,7 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(SecretStoreError::Io {
+                    Err(SafeRootError::Io {
                         op: crate::error::IoOp::OpenFile,
                         kind: std::io::ErrorKind::PermissionDenied,
                         ..
@@ -4618,7 +4604,7 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(SecretStoreError::Io {
+                    Err(SafeRootError::Io {
                         op: crate::error::IoOp::OpenFile,
                         os_error: Some(32),
                         ..
@@ -4687,7 +4673,7 @@ mod tests {
                 assert!(
                     matches!(
                         result,
-                        Err(SecretStoreError::Io {
+                        Err(SafeRootError::Io {
                             op: crate::error::IoOp::CreateFile,
                             ..
                         })
@@ -4739,7 +4725,7 @@ mod tests {
             let result = parent.create_child_file("rolled-back.toml", contents);
             imp::FORCE_EXPOSED.with(|force| force.set(false));
             assert!(
-                matches!(result, Err(SecretStoreError::Exposed(ref found)) if found == &[Exposure::NullDacl]),
+                matches!(result, Err(SafeRootError::Exposed(ref found)) if found == &[Exposure::NullDacl]),
                 "{result:?}"
             );
             assert!(
@@ -4798,7 +4784,7 @@ mod tests {
             assert!(
                 matches!(
                     busy,
-                    Err(SecretStoreError::Io {
+                    Err(SafeRootError::Io {
                         op: crate::error::IoOp::OpenFile,
                         os_error: Some(32),
                         ..
@@ -4815,7 +4801,7 @@ mod tests {
             let sub = parent.open_child_file_for_update("sub").unwrap().unwrap();
             assert!(matches!(
                 sub.delete(),
-                Err(SecretStoreError::Io {
+                Err(SafeRootError::Io {
                     kind: std::io::ErrorKind::IsADirectory,
                     ..
                 })
@@ -4825,7 +4811,7 @@ mod tests {
             assert!(link.security().is_reparse_point);
             assert_eq!(
                 link.reset_acl(),
-                Err(SecretStoreError::AclMismatch(AclMismatch::ReparsePoint))
+                Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint))
             );
             for bad in ["", "..", r"a\b", "c:", "x.", "nul"] {
                 assert!(parent.open_child_file_for_update(bad).is_err(), "{bad:?}");
@@ -4856,7 +4842,7 @@ mod tests {
             assert_eq!(file.security().links, 2);
             assert_eq!(
                 file.reset_acl(),
-                Err(SecretStoreError::Exposed(vec![Exposure::HardLinked(2)]))
+                Err(SafeRootError::Exposed(vec![Exposure::HardLinked(2)]))
             );
             assert_eq!(
                 read_dir_dacl(&target).unwrap(),
@@ -4884,7 +4870,7 @@ mod tests {
             if !is_elevated_admin() {
                 assert_eq!(
                     file.reset_acl(),
-                    Err(SecretStoreError::AclApi {
+                    Err(SafeRootError::AclApi {
                         call: "SetKernelObjectSecurity",
                         os_error: 1307,
                     })

@@ -37,6 +37,9 @@
 # (`chronogazer-elev.exe` - ChronoGazer の UAC 昇格ヘルパー。固定の 7 アクションで
 # サービスの登録・Operators・サービス DACL の ACE・データと secrets の ACL・自動開始.
 # docs/chronogazer-service-design.md §4 の B3-3b).
+# #623 PR-1a: crates/banto-safe-root (banto-secret-store の `acl`・`guard` を移した。
+# 利用者が触れうるフォルダの木を LocalSystem が辿らずに扱う、製品に依らない部品。
+# 本番の依存は windows-sys・thiserror だけ).
 [workspace]
 resolver = "2"
 members = [
@@ -55,6 +58,7 @@ members = [
     "crates/banto-instance-lock",
     "crates/banto-desktop-tray",
     "crates/banto-exit-once",
+    "crates/banto-safe-root",
     "crates/banto-secret-store",
     "crates/banto-service-control",
     "crates/banto-service-elev",

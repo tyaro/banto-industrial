@@ -17,7 +17,7 @@
 //!   `PlainProtector`（`test-support` feature、暗号化しない）。
 //! - [`FileSecretStore`]: 1 アカウント 1 ファイル。ファイル名は
 //!   `sha256(account)` の hex + `.bin`（[`file_name_for`]）、中身はマジック `BSS1`・
-//!   版数・アカウント・blob（[`format`]）。entropy は
+//!   版数・アカウント・blob（[`format`](mod@format)）。entropy は
 //!   `"banto-secret-store/v1:" + account`（[`entropy_for`]）なので、ファイルを
 //!   別のアカウントの名前に入れ替えても（中のアカウントの欄を書き換えても）
 //!   復号できない。読むときはファイルの中のアカウントの一致も確かめる。
@@ -25,29 +25,14 @@
 //!   `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`（非 Windows は `rename`）で
 //!   原子的に置き換え、一時ファイルは失敗・取消しでも消す。削除は「無ければ Ok」。
 //!   プロセスの中は `Mutex` で 1 つずつ。
-//! - [`acl`]: 保存先ディレクトリの保護された DACL（SYSTEM・Administrators に
-//!   フル、指定したインストール利用者に「変更」、Users などには何も付けない）。
-//!   無ければその DACL で作り、あれば確かめ、違えば失敗する（自動では直さない。
-//!   詳細と理由は [`acl`] の doc）。同じ形の DACL で、**無いときだけ**ディレクトリを
-//!   作る口 [`acl::create_dir_if_absent`] もある（ChronoGazer のデータのルート、#392
-//!   B2-4a。既にあれば触らない）。利用者は 0 人・1 人のほか、複数にもできる
-//!   （[`DirAccess::with_install_users`]、#626 PR-A。利用者ごとに「変更」）。
-//! - [`acl::guard`]（#626 PR-A。chronogazer-elev から移した）: 昇格ヘルパーが DACL を
-//!   書き直す前の、製品に依らない確かめ（既知のフォルダ・マシンの環境からのルート・
-//!   本当のパスの比較・所有者の確かめ・書き直す前の DACL から引き継ぐ利用者の選び分け）。
-//!   判断は純関数で、断る理由は型の付いた値で返す（文言は製品の elev が持つ）。
-//!   ChronoGazer の `chronogazer-elev` が使い、banto-hub の `banto-hub-elev` も #626 PR-B で
-//!   使う。
-//! - 置き場とファイルが保護されているか（#630。banto-hub-sink の設定ファイル）:
-//!   [`acl::inspect_file`]（辿らずに開いて、属性・リンク数・所有者・DACL をハンドルから読む）
-//!   と、その結果から「保護されていない」理由を 1 条件 1 理由で返す純関数 [`acl::exposure`]。
-//!   確かめ済みのフォルダのハンドルを基準に、子のファイルを辿らずに開いてそのハンドルのまま
-//!   読む `PinnedDir::open_child_file`・保護された DACL と所有者 Administrators を作るのと
-//!   同時に付けて作る `PinnedDir::create_child_file`（失敗したら作ったハンドルで消す）。
-//!   利用者を持たない置き場の判断は [`acl::guard::dir_acl_plan`]。#630 PR-2 で、中身を
-//!   求めずに記述子を書く・消す権利で開く `PinnedDir::open_child_file_for_update` と、
-//!   そのハンドルで保護された DACL と所有者を書く `PinnedFile::reset_acl`・消す
-//!   `PinnedFile::delete` を足した（`banto-hub-elev prepare-sink-config` が使う）。
+//! - ディレクトリの保護された DACL（SYSTEM・Administrators にフル、指定した
+//!   インストール利用者に「変更」、Users などには何も付けない）の作成・確認・書き直しと、
+//!   辿らずに開くフォルダ・ファイルのハンドル、昇格ヘルパー向けの確かめ（`guard`）は、
+//!   #623 PR-1a で **`banto-safe-root` へ移した**（挙動は同じ。`banto_safe_root::acl`・
+//!   `banto_safe_root::guard`）。[`FileSecretStore::open`] は、無ければその DACL で作り、
+//!   あれば確かめ、違えば [`SafeRootError::AclMismatch`] で失敗する（自動では直さない）。
+//!   引数の型 [`DirAccess`]・[`InstallUserSid`] は `banto-safe-root` のものをここから
+//!   再公開する。
 //! - `impl banto_hub_bootstrap::KeyStore for FileSecretStore<_>`（`src/keystore.rs`）。
 //!
 //! # DPAPI machine スコープの意味と限界（計画書 §6）
@@ -57,7 +42,7 @@
 //! コピー（バックアップ・ディスクの持ち出し）とオフラインの盗難だけ。
 //! **同じ PC の中での本当の境界はファイル（ディレクトリ）の ACL** で、だから
 //! この crate は ACL を設定できない環境（非 Windows）では
-//! [`SecretStoreError::UnsupportedPlatform`] で fail closed する（保存先として
+//! [`SafeRootError::UnsupportedPlatform`] で fail closed する（保存先として
 //! 使えない）。そのほかの限界:
 //!
 //! - OS キーリング（利用者スコープ）より広い: 管理者・SYSTEM と、ACL に載せた
@@ -84,7 +69,6 @@
 //! - 孤児のファイルの掃除（DB の `HubRecord` とキーファイルは別々に書くので、
 //!   片方だけ残ることはある。害は無い - 計画書 §6）。
 
-pub mod acl;
 pub mod error;
 pub mod format;
 mod keystore;
@@ -94,7 +78,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-pub use acl::{DirAccess, InstallUserSid};
+pub use banto_safe_root::{DirAccess, InstallUserSid, SafeRootError};
 pub use error::{Result, SecretStoreError};
 #[cfg(windows)]
 pub use protector::DpapiMachine;

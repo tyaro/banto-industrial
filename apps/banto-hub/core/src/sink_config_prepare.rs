@@ -19,7 +19,7 @@
 //!   既知のフォルダ・`.example` の中身）→ ルートを辿らずに開いて確かめる（本当のパス・
 //!   reparse point でないフォルダ・所有者）→ `sink\` を確かめ済みのルートのハンドル基準で開く
 //!   （無ければ SYSTEM・Administrators だけの DACL を**作るのと同時に**付けて作る）→ 本当の
-//!   パス・所有者（[`banto_secret_store::acl::guard::dir_acl_plan`] を利用者なしで。SYSTEM・
+//!   パス・所有者（[`banto_safe_root::guard::dir_acl_plan`] を利用者なしで。SYSTEM・
 //!   Administrators・昇格した本人以外なら**何も変えずに断る** - 一般の利用者が先に作った
 //!   `sink\` の乗っ取りを拒む）→ 中の設定ファイルと `.example` を置き場のハンドル基準で辿らずに
 //!   開いて確かめる（リンク・ハードリンク・フォルダ・別のプロセスが書き込みに開いているなら
@@ -40,7 +40,7 @@
 //!
 //! 行は `banto-hub-elev: ` で始まる。断ったときは理由の行を出して [`Refused`] を返し、呼ぶ側
 //! （`crate::service_elevated`）が終了コード 1 にする（#626 と同じく失敗はすべて 1）。
-//! `banto_secret_store::SecretStoreError::Exposed` は Debug の表記を出さず、
+//! `banto_safe_root::SafeRootError::Exposed` は Debug の表記を出さず、
 //! [`exposure_text`] で 1 理由ずつ人の読める文言に言い換える。
 //!
 //! ## テスト
@@ -52,11 +52,11 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::guard::{
+use banto_safe_root::acl::{exposure, Exposure, FileSecurity, PinnedDirInfo};
+use banto_safe_root::guard::{
     self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment, RealPathRefusal,
 };
-use banto_secret_store::acl::{exposure, Exposure, FileSecurity, PinnedDirInfo};
-use banto_secret_store::InstallUserSid;
+use banto_safe_root::InstallUserSid;
 use banto_service_control::ConsoleLine;
 
 use crate::profile_grant::{root_parent_problem, well_known_text, CreateHow, Out, Refused, LABEL};
@@ -87,7 +87,7 @@ fn err_line(text: &str) -> ConsoleLine {
     ConsoleLine::Stderr(format!("{LABEL}: {text}"))
 }
 
-/// [`Exposure`] の文言（純関数。`SecretStoreError::Exposed` の Debug の表記を出さないため）。
+/// [`Exposure`] の文言（純関数。`SafeRootError::Exposed` の Debug の表記を出さないため）。
 /// banto-hub-sink の `config::place::exposure_text` と文言を揃える（片方を直したらもう一方も）。
 pub fn exposure_text(found: &Exposure) -> String {
     match found {
@@ -113,11 +113,11 @@ pub fn exposure_text(found: &Exposure) -> String {
     }
 }
 
-/// `banto_secret_store` の失敗の文言（`Exposed` は理由を 1 つずつ言い換え、それ以外は
+/// `banto_safe_root` の失敗の文言（`Exposed` は理由を 1 つずつ言い換え、それ以外は
 /// `Display`）。
-pub fn secret_error_text(error: &banto_secret_store::SecretStoreError) -> String {
+pub fn secret_error_text(error: &banto_safe_root::SafeRootError) -> String {
     match error {
-        banto_secret_store::SecretStoreError::Exposed(found) => {
+        banto_safe_root::SafeRootError::Exposed(found) => {
             let reasons: Vec<String> = found.iter().map(exposure_text).collect();
             format!("書いた後も保護されていません（{}）", reasons.join("・"))
         }
@@ -127,7 +127,7 @@ pub fn secret_error_text(error: &banto_secret_store::SecretStoreError) -> String
 
 // --- OS の操作 ---------------------------------------------------------------------
 
-/// 辿らずに開いたフォルダ（Windows は `banto_secret_store::acl::PinnedDir`）。
+/// 辿らずに開いたフォルダ（Windows は `banto_safe_root::acl::PinnedDir`）。
 pub trait SinkDir {
     /// 開いたハンドルから読んだ属性と所有者。
     fn info(&self) -> PinnedDirInfo;
@@ -142,7 +142,7 @@ pub trait SinkDir {
 }
 
 /// 置き場のハンドル基準に、記述子を書く・消す権利で辿らずに開いたファイル（Windows は
-/// `banto_secret_store::acl::PinnedFile`）。持っている間はほかの誰も書き込みに開く・消す・
+/// `banto_safe_root::acl::PinnedFile`）。持っている間はほかの誰も書き込みに開く・消す・
 /// 名前を変えることができない。
 pub trait SinkFile {
     /// 開いた時点でハンドルから読んだ属性・リンク数・所有者・DACL。
@@ -728,9 +728,9 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
     match &config {
         Some(file) => {
             let owner = file.security().dacl.owner;
-            let trusted_owner = owner == banto_secret_store::acl::SYSTEM_SID
-                || owner == banto_secret_store::acl::ADMINISTRATORS_SID
-                || owner == banto_secret_store::acl::TRUSTED_INSTALLER_SID
+            let trusted_owner = owner == banto_safe_root::acl::SYSTEM_SID
+                || owner == banto_safe_root::acl::ADMINISTRATORS_SID
+                || owner == banto_safe_root::acl::TRUSTED_INSTALLER_SID
                 || Some(owner.as_str()) == elevated;
             if let Err(error) = file.reset_acl() {
                 return refuse(

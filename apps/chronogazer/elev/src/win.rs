@@ -4,8 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::{PinnedDir, PinnedDirInfo};
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::acl::{PinnedDir, PinnedDirInfo};
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::{
     query_service_command_line, read_service_parameter, uninstall_service, ServiceManager,
     ServiceManagerError, UninstallError, UninstallOutcome, WindowsServiceManager,
@@ -18,8 +18,8 @@ use chronogazer_core::server_service::{
 use chronogazer_core::shell_launch::{chronogazer_service_spec, SERVICE_NAME};
 
 /// マシンの環境を HKLM と既知のフォルダから読む（このプロセスの環境変数は読まない）。
-/// 実装は `banto_secret_store::acl::guard::win`（#626 PR-A で移した）。
-pub use banto_secret_store::acl::guard::win::RegistryMachineEnvironment;
+/// 実装は `banto_safe_root::guard::win`（#626 PR-A で移した）。
+pub use banto_safe_root::guard::win::RegistryMachineEnvironment;
 
 use crate::{
     resolve_machine_root, AccountCheck, ElevOps, KnownFolders, MachineEnvironment, PinnedDirOps,
@@ -41,8 +41,8 @@ impl PinnedDirOps for PinnedDir {
     fn reset_acl(
         &self,
         access: &DirAccess,
-        recurse: banto_secret_store::acl::Recurse,
-    ) -> Result<banto_secret_store::acl::ResetSkips, String> {
+        recurse: banto_safe_root::acl::Recurse,
+    ) -> Result<banto_safe_root::acl::ResetSkips, String> {
         PinnedDir::reset_acl(self, access, recurse).map_err(|err| err.to_string())
     }
 }
@@ -64,7 +64,7 @@ impl ElevOps for WindowsOps {
     }
 
     fn program_files_dirs(&self) -> Vec<PathBuf> {
-        banto_secret_store::acl::guard::win::program_files_dirs()
+        banto_safe_root::guard::win::program_files_dirs()
     }
 
     fn registered_command_line(&self) -> Result<Option<String>, String> {
@@ -80,13 +80,13 @@ impl ElevOps for WindowsOps {
     }
 
     fn current_user_sid(&self) -> Result<InstallUserSid, String> {
-        banto_secret_store::acl::current_user_sid().map_err(|err| err.to_string())
+        banto_safe_root::acl::current_user_sid().map_err(|err| err.to_string())
     }
 
     fn check_user_account(&self, sid: &InstallUserSid) -> Result<(), AccountCheck> {
-        banto_secret_store::acl::check_user_account(sid).map_err(|err| match err {
+        banto_safe_root::acl::check_user_account(sid).map_err(|err| match err {
             // `ERROR_NONE_MAPPED`・グループなど = アカウントでない（使い方の誤り）。
-            banto_secret_store::SecretStoreError::InvalidUserSid(_) => {
+            banto_safe_root::SafeRootError::InvalidUserSid(_) => {
                 AccountCheck::NotAnAccount(err.to_string())
             }
             // RPC 不達・アクセス拒否など = 一時的な失敗。
@@ -130,7 +130,7 @@ impl ElevOps for WindowsOps {
     }
 
     fn pin_dir(&self, dir: &Path) -> Result<Option<PinnedDir>, String> {
-        banto_secret_store::acl::pin_dir(dir).map_err(|err| err.to_string())
+        banto_safe_root::acl::pin_dir(dir).map_err(|err| err.to_string())
     }
 
     fn create_child(
@@ -154,7 +154,7 @@ mod tests {
     use super::*;
 
     /// 読むだけ: マシンの ProgramData は既知のフォルダから取れる（環境変数を見ない）。
-    /// HKLM の読み取りそのもののテストは `banto_secret_store::acl::guard::win` に移した
+    /// HKLM の読み取りそのもののテストは `banto_safe_root::guard::win` に移した
     /// （#626 PR-A）。
     #[test]
     fn known_folders_resolve() {
@@ -327,13 +327,13 @@ mod tests {
             let (code, lines) = grant(layout.root());
             assert_eq!(code, crate::EXIT_OK, "{lines:#?}");
             for dir in [layout.root().to_path_buf(), layout.secrets_dir()] {
-                let dacl = banto_secret_store::acl::read_dir_dacl(&dir).unwrap();
-                banto_secret_store::acl::check_dacl(&dacl, &access)
+                let dacl = banto_safe_root::acl::read_dir_dacl(&dir).unwrap();
+                banto_safe_root::acl::check_dacl(&dacl, &access)
                     .unwrap_or_else(|err| panic!("{}: {err:?}", dir.display()));
                 // 監査 B5: 所有者は Administrators に移る（インストール利用者の「変更」は残る）。
                 assert_eq!(
                     dacl.owner,
-                    banto_secret_store::acl::ADMINISTRATORS_SID,
+                    banto_safe_root::acl::ADMINISTRATORS_SID,
                     "{}",
                     dir.display()
                 );
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn grant_data_acl_does_not_rewrite_outside_a_child_junction() {
         // 自前の再帰がジャンクション・ハードリンクを辿らないことそのものは
-        // banto-secret-store の `reset_acl_*` のテストが固定する（elev はそれを本物の
+        // banto-safe-root の `reset_acl_*` のテストが固定する（elev はそれを本物の
         // grant-data-acl で一通り通す）。
         if !elevated_admin("grant_data_acl_does_not_rewrite_outside_a_child_junction") {
             return;
@@ -361,14 +361,14 @@ mod tests {
         std::fs::write(outside.join("file.txt"), b"x").unwrap();
         junction(&root.join("link"), &outside);
         let before = (
-            banto_secret_store::acl::read_dir_dacl(&outside).unwrap(),
-            banto_secret_store::acl::read_dir_dacl(&outside.join("file.txt")).unwrap(),
+            banto_safe_root::acl::read_dir_dacl(&outside).unwrap(),
+            banto_safe_root::acl::read_dir_dacl(&outside.join("file.txt")).unwrap(),
         );
         let (code, lines) = grant(&root);
         assert_eq!(code, crate::EXIT_OK, "{lines:#?}");
         let after = (
-            banto_secret_store::acl::read_dir_dacl(&outside).unwrap(),
-            banto_secret_store::acl::read_dir_dacl(&outside.join("file.txt")).unwrap(),
+            banto_safe_root::acl::read_dir_dacl(&outside).unwrap(),
+            banto_safe_root::acl::read_dir_dacl(&outside.join("file.txt")).unwrap(),
         );
         assert_eq!(after, before);
         std::fs::remove_dir(root.join("link")).unwrap();
@@ -384,7 +384,7 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         let root = long(parent.path()).join("ChronoGazer");
         junction(&root, &outside);
-        let before = banto_secret_store::acl::read_dir_dacl(&outside).unwrap();
+        let before = banto_safe_root::acl::read_dir_dacl(&outside).unwrap();
         let (code, lines) = grant(&root);
         assert_eq!(code, crate::EXIT_FAILED, "{lines:#?}");
         assert!(lines.iter().any(|line| matches!(
@@ -392,7 +392,7 @@ mod tests {
             banto_service_control::ConsoleLine::Stderr(text) if text.contains("reparse point")
         )));
         assert_eq!(
-            banto_secret_store::acl::read_dir_dacl(&outside).unwrap(),
+            banto_safe_root::acl::read_dir_dacl(&outside).unwrap(),
             before
         );
         assert!(!outside.join("secrets").exists());
@@ -417,10 +417,10 @@ mod tests {
         names
     }
 
-    fn snapshot(paths: &[PathBuf]) -> Vec<banto_secret_store::acl::ObservedDacl> {
+    fn snapshot(paths: &[PathBuf]) -> Vec<banto_safe_root::acl::ObservedDacl> {
         paths
             .iter()
-            .map(|p| banto_secret_store::acl::read_dir_dacl(p).unwrap())
+            .map(|p| banto_safe_root::acl::read_dir_dacl(p).unwrap())
             .collect()
     }
 
@@ -434,9 +434,7 @@ mod tests {
         let watched = vec![outside.clone(), outside.join("f.txt"), outside.join("data")];
         for path in &watched {
             assert!(
-                !banto_secret_store::acl::read_dir_dacl(path)
-                    .unwrap()
-                    .protected,
+                !banto_safe_root::acl::read_dir_dacl(path).unwrap().protected,
                 "外の対象は継承を受け入れる DACL にする: {}",
                 path.display()
             );

@@ -16,6 +16,8 @@ test-support = []
 [dependencies]
 # `impl KeyStore for FileSecretStore` のアダプタ（src/keystore.rs）。
 banto-hub-bootstrap = { path = "../banto-hub-bootstrap" }
+# ディレクトリの DACL・辿らない確かめ（#623 PR-1a で `acl` をここから移した）。
+banto-safe-root = { path = "../banto-safe-root" }
 thiserror = { workspace = true }
 # 復号した平文を `Zeroizing` に入れて返し、中間のバッファも drop で消す。
 zeroize = { workspace = true }
@@ -25,50 +27,15 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# 既存の 0.61 系（banto-hub-core・banto-instance-lock と同じ版）。新しい crate は
-# 増えず、feature を足すだけ:
+# 既存の 0.61 系（banto-hub-core・banto-instance-lock と同じ版）。feature は DPAPI と
+# 原子的な置換だけ（ACL・ハンドルまわりの feature は #623 PR-1a で banto-safe-root へ移した）:
 # - Win32_Security_Cryptography: CryptProtectData / CryptUnprotectData（DPAPI）
-# - Win32_Security / Win32_Security_Authorization: SDDL からの記述子の作成、
-#   DACL の読み戻し（GetNamedSecurityInfoW・GetAce）、SID の文字列化、
-#   DACL の書き直し（SetNamedSecurityInfoW）
-# - Win32_Storage_FileSystem: CreateDirectoryW（作成と同時に DACL を付ける）、
-#   MoveFileExW（原子的な置換）、CreateFileW・GetFinalPathNameByHandleW（#392 B3-3b の
-#   監査 Must 1: pin したハンドルの本当のパス）
-# - Win32_Security_Authorization: SetSecurityInfo（#392 B3-3b の監査 Must 2: ハンドルで
-#   DACL と所有者を書く）
-# - Win32_System_Threading: OpenProcessToken（現在の利用者の SID）
-# - Win32_System_Registry / Win32_UI_Shell / Win32_System_Com: `acl::guard::win`
-#   （#626 PR-A で chronogazer-elev から移した）の RegGetValueW（マシンの環境変数を
-#   展開せずに読む）・SHGetKnownFolderPath・CoTaskMemFree（既知のフォルダ）
-# - Wdk_Foundation / Wdk_Storage_FileSystem / Win32_System_IO: `PinnedDir::create_child_dir`
-#   の `NtCreateFile`（確かめ済みの親のハンドルを基準に、子のフォルダを相対で作る。
-#   #626 PR-B の再レビュー 1。ntdll の関数で、新しい crate は増えない）
+# - Win32_Storage_FileSystem: MoveFileExW（原子的な置換）
 windows-sys = { version = "0.61", features = [
-    "Wdk_Foundation",
-    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
-    "Win32_System_Com",
-    "Win32_System_IO",
-    "Win32_System_Registry",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# テストが昇格した管理者として走っているかの判定だけ（所有者を Administrators に
-# 移す確かめは管理者でしかできない。#392 B3-3b の監査 B5）。本番の依存には足さない。
-banto-service-elev = { path = "../banto-service-elev" }
-
-[target.'cfg(windows)'.dev-dependencies]
-# テストで、pin を持ったままフォルダをその場でジャンクションにする反証（#392 B3-3b の
-# 監査 Must 2）に DeviceIoControl / FSCTL_SET_REPARSE_POINT を使う。本番には足さない
-# （feature だけで新しい crate は増えない）。
-windows-sys = { version = "0.61", features = [
-    "Win32_System_IO",
-    "Win32_System_Ioctl",
-] }

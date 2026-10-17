@@ -53,6 +53,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
   - Win32 の `ERROR_SERVICE_DOES_NOT_EXIST`（1060）の定数を `banto_service_control` の 1 か所にまとめた。
 - ChronoGazer の昇格ヘルパーの内部の整理（#628、#646 のレビューの Nit。挙動は変わらない）: `create_in_parent` のエラーを enum に、`grant-data-acl` の段の親を種類から明示的に選ぶ、`banto-secret-store` の相対で作る・開く操作の失敗の API 名を作る・開く・フォルダ・ファイルで分けた（`CreateChildDir`／`OpenChildDir`／`CreateChildFile`／`OpenChildFile`）。
 - 小さな直し（#654）: banto-hub の設定画面の OPC UA の状態の読み直し（`OpcUaStatusPoller`）は、`stop`（画面を離れる）を最後の決定にした。保存（PUT）を待つ間に画面を離れても、PUT が返った後の読み直しが破棄した画面から再開しない（再開は明示的な `start` だけ）。最初の取得が失敗して状態が無いときも、1 回は読み直す。
+- 内部の整理（利用者への影響なし、#623 PR-1a）: `banto-secret-store` の `acl`（ディレクトリの DACL・辿らずに開くハンドル）と `guard`（昇格ヘルパーの確かめ）を、新しい共有 crate `banto-safe-root` へ丸ごと移した（挙動は同じ。エラーは `SafeRootError` に切り出し、文言は製品に依らない中立の形にした。`banto-secret-store` の `SecretStoreError` は `Root(SafeRootError)` で包む）。`DirAccess`・`InstallUserSid` は `banto-secret-store` からも引き続き公開する。旧い `banto_secret_store::acl` の互換の再公開は作っていない。
 
 ## v0.2.0-alpha.30 — 2026-10-16（アルファ）
 

@@ -6,12 +6,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use banto_secret_store::acl::guard::{KnownFolders, MachineEnvironment};
-use banto_secret_store::acl::{
+use banto_safe_root::acl::{
     Exposure, FileSecurity, ObservedAce, ObservedDacl, PinnedDirInfo, ADMINISTRATORS_SID,
     SYSTEM_SID,
 };
-use banto_secret_store::InstallUserSid;
+use banto_safe_root::guard::{KnownFolders, MachineEnvironment};
+use banto_safe_root::InstallUserSid;
 use banto_service_control::ConsoleLine;
 
 use super::*;
@@ -677,7 +677,7 @@ fn a_refusal_after_creating_reports_what_was_created() {
 fn write_failures_stop_with_a_reason() {
     let mut ops = FakeOps::new();
     ops.file_mut(CONFIG_FILE).reset = Err(secret_error_text(
-        &banto_secret_store::SecretStoreError::Exposed(vec![Exposure::HardLinked(2)]),
+        &banto_safe_root::SafeRootError::Exposed(vec![Exposure::HardLinked(2)]),
     ));
     let (result, lines) = run(&ops);
     assert_eq!(result, Err(Refused));

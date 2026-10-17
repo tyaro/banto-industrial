@@ -1,10 +1,10 @@
 //! [`super::SinkConfigOps`] の Windows の実装（本番）。部品はすべて
-//! `banto_secret_store::acl`（unsafe な Win32 をこの crate に複製しない）。
+//! `banto_safe_root::acl`（unsafe な Win32 をこの crate に複製しない）。
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::{FileSecurity, PinnedDir, PinnedDirInfo, PinnedFile, Recurse};
-use banto_secret_store::{DirAccess, InstallUserSid, SecretStoreError};
+use banto_safe_root::acl::{FileSecurity, PinnedDir, PinnedDirInfo, PinnedFile, Recurse};
+use banto_safe_root::{DirAccess, InstallUserSid, SafeRootError};
 
 use super::{
     secret_error_text, FileOpenError, SinkConfigOps, SinkDir, SinkFile, EXAMPLE_FILE,
@@ -81,7 +81,7 @@ impl SinkConfigOps for WindowsSinkConfigOps {
     }
 
     fn current_user_sid(&self) -> Result<InstallUserSid, String> {
-        banto_secret_store::acl::current_user_sid().map_err(|err| err.to_string())
+        banto_safe_root::acl::current_user_sid().map_err(|err| err.to_string())
     }
 
     fn example_contents(&self) -> Result<Vec<u8>, String> {
@@ -98,13 +98,13 @@ impl SinkConfigOps for WindowsSinkConfigOps {
     }
 
     fn exists(&self, path: &Path) -> Result<bool, String> {
-        banto_secret_store::acl::inspect_file(path)
+        banto_safe_root::acl::inspect_file(path)
             .map(|found| found.is_some())
             .map_err(|err| err.to_string())
     }
 
     fn pin_dir(&self, dir: &Path) -> Result<Option<PinnedDir>, String> {
-        banto_secret_store::acl::pin_dir(dir).map_err(|err| err.to_string())
+        banto_safe_root::acl::pin_dir(dir).map_err(|err| err.to_string())
     }
 
     fn create_child_dir(
@@ -135,7 +135,7 @@ impl SinkConfigOps for WindowsSinkConfigOps {
         parent
             .open_child_file_for_update(name)
             .map_err(|err| match err {
-                SecretStoreError::Io {
+                SafeRootError::Io {
                     os_error: Some(ERROR_SHARING_VIOLATION),
                     ..
                 } => FileOpenError::InUse,

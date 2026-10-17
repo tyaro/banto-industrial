@@ -86,7 +86,7 @@ pub fn open_key_store(layout: &DataLayout) -> (Arc<dyn KeyStore>, Option<String>
 /// (3)）。開けないときの扱い（[`FailedKeyStore`] と理由）は [`open_key_store`] と同じ。
 pub fn open_key_store_with(
     layout: &DataLayout,
-    access: banto_secret_store::DirAccess,
+    access: banto_safe_root::DirAccess,
 ) -> (Arc<dyn KeyStore>, Option<String>) {
     into_key_store(open_key_store_with_impl(layout, access))
 }
@@ -123,7 +123,7 @@ fn open_key_store_impl(layout: &DataLayout) -> Result<Arc<dyn KeyStore>, String>
 #[cfg(windows)]
 fn open_key_store_with_impl(
     layout: &DataLayout,
-    access: banto_secret_store::DirAccess,
+    access: banto_safe_root::DirAccess,
 ) -> Result<Arc<dyn KeyStore>, String> {
     use banto_secret_store::{DpapiMachine, FileSecretStore};
 
@@ -140,7 +140,7 @@ fn open_key_store_impl(_layout: &DataLayout) -> Result<Arc<dyn KeyStore>, String
 #[cfg(not(windows))]
 fn open_key_store_with_impl(
     _layout: &DataLayout,
-    _access: banto_secret_store::DirAccess,
+    _access: banto_safe_root::DirAccess,
 ) -> Result<Arc<dyn KeyStore>, String> {
     Err(NO_DPAPI.to_string())
 }
@@ -172,8 +172,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn open_key_store_with_uses_the_given_access() {
-        use banto_secret_store::acl::{current_user_sid, read_dir_dacl, MODIFY_ACCESS_MASK};
-        use banto_secret_store::{DirAccess, InstallUserSid};
+        use banto_safe_root::acl::{current_user_sid, read_dir_dacl, MODIFY_ACCESS_MASK};
+        use banto_safe_root::{DirAccess, InstallUserSid};
 
         let dir = tempfile::tempdir().unwrap();
         let me = current_user_sid().unwrap();

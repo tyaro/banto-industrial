@@ -7,6 +7,8 @@ use std::sync::Arc;
 use banto_hub_bootstrap::error::ErrorKind;
 use banto_hub_bootstrap::KeyStore;
 
+use banto_safe_root::SafeRootError;
+
 use crate::error::{CorruptKind, InvalidAccount, IoOp, SecretStoreError};
 use crate::format;
 use crate::store::{write_atomic, WriteStage};
@@ -369,15 +371,21 @@ fn opening_with_an_acl_fails_closed_off_windows() {
         PlainProtector,
     )
     .unwrap_err();
-    assert_eq!(err, SecretStoreError::UnsupportedPlatform);
+    assert_eq!(
+        err,
+        SecretStoreError::Root(SafeRootError::UnsupportedPlatform)
+    );
 }
 
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use crate::acl::{current_user_sid, read_dir_dacl, reset_dir_acl, MODIFY_ACCESS_MASK};
-    use crate::error::AclMismatch;
     use crate::{DirAccess, DpapiMachine};
+    use banto_safe_root::acl::{
+        current_user_sid, ensure_dir_with_validated_sid, read_dir_dacl, reset_dir_acl,
+        MODIFY_ACCESS_MASK,
+    };
+    use banto_safe_root::AclMismatch;
 
     fn access() -> DirAccess {
         DirAccess::with_install_user(current_user_sid().unwrap())
@@ -450,7 +458,9 @@ mod windows {
             assert!(
                 matches!(
                     err,
-                    SecretStoreError::AclMismatch(AclMismatch::MissingAce { .. })
+                    SecretStoreError::Root(SafeRootError::AclMismatch(
+                        AclMismatch::MissingAce { .. }
+                    ))
                 ),
                 "{err:?}"
             );
@@ -473,9 +483,38 @@ mod windows {
         let err = FileSecretStore::open(&dir, access(), DpapiMachine).unwrap_err();
         assert_eq!(
             err,
-            SecretStoreError::AclMismatch(AclMismatch::NotProtected)
+            SecretStoreError::Root(SafeRootError::AclMismatch(AclMismatch::NotProtected))
         );
         assert!(!read_dir_dacl(&dir).unwrap().protected, "黙って直さない");
         assert!(entries(&dir).is_empty());
+    }
+
+    /// #595 P2: グループの SID に「変更」を付けた**既存の**ディレクトリも、
+    /// `FileSecretStore::open` は ACL の形の確認より前に SID の検証で拒む。
+    /// （`banto-safe-root` の `acl` のテストから、`FileSecretStore` に依存する 1 件を
+    /// #623 PR-1a で移した。）
+    #[test]
+    fn open_refuses_an_existing_directory_granting_a_group_sid() {
+        let me = current_user_sid().unwrap();
+        let machine = me.as_str().rsplit_once('-').unwrap().0;
+        let group = banto_safe_root::InstallUserSid::parse(&format!("{machine}-513")).unwrap();
+        let group_access = DirAccess::with_install_user(group);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("granted-to-group");
+        // SID の検証を通らない経路で、グループに「変更」を付けた形のフォルダを作る。
+        ensure_dir_with_validated_sid(&dir, &group_access).ok();
+        assert!(dir.exists());
+
+        let err = FileSecretStore::open(&dir, group_access.clone(), PlainProtector).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SecretStoreError::Root(SafeRootError::InvalidUserSid(_))
+            ),
+            "{err:?}"
+        );
+
+        // 片付け（所有者は自分なので書き換えられる）。
+        reset_dir_acl(&dir, &DirAccess::with_install_user(me)).unwrap();
     }
 }

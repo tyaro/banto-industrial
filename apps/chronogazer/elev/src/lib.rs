@@ -9,11 +9,11 @@
 //!
 //! - **exe は製品ごと**（O1）。Win32 の部品（ローカルグループ・サービス DACL の ACE・
 //!   トークン）は共有 crate `banto-service-elev`、ディレクトリの DACL は
-//!   `banto-secret-store`、サービスの登録は `chronogazer_core::server_service::install_with`
+//!   `banto-safe-root`、サービスの登録は `chronogazer_core::server_service::install_with`
 //!   （`chronogazer-server.exe install` と同じ手順をプロセスの中で呼ぶ）。ここが持つのは
 //!   アクションの一覧・引数の検証・手順の順序・文言・終了コードだけ。書き直す前の
 //!   製品に依らない確かめ（既知のフォルダ・マシンの環境からのルート・本当のパスの比較・
-//!   所有者の確かめ）の判断は `banto_secret_store::acl::guard`（#626 PR-A で移した。
+//!   所有者の確かめ）の判断は `banto_safe_root::guard`（#626 PR-A で移した。
 //!   banto-hub-elev と共有）で、ここは ChronoGazer の名前（`CHRONOGAZER_ROOT`・
 //!   `ChronoGazer`）を渡して、型の付いた理由を文言にするだけ。
 //! - **アクションは固定の 7 つ**（[`Action`]。最初の引数が名前と完全に一致すること。
@@ -46,14 +46,14 @@
 //!   だけ。`DC`・`WD`・`WO`・`SD` は渡さない - `banto_service_elev` のモジュール doc）。
 //! - **データの ACL**（`grant-data-acl`、O2）: ルート → `secrets\` → `secrets\hub-keys\`
 //!   の順に、[`data_acl_plan`] のとおり作る・書き直す・断る。既にあるフォルダは
-//!   `banto_secret_store::acl::pin_dir` で**辿らずに**開き（持っている間は名前の変更・
+//!   `banto_safe_root::acl::pin_dir` で**辿らずに**開き（持っている間は名前の変更・
 //!   削除ができない）、reparse point（ジャンクション・シンボリックリンクなど）か、
 //!   所有者が SYSTEM・Administrators・インストール利用者・この昇格した利用者のどれでも
 //!   なければ**書き直さずに止める**。書き直すとき（作った直後も）は所有者を
 //!   `BUILTIN\Administrators` に移す（監査 B5、2026-10-16 オーナー決定。インストール
 //!   利用者の「変更」は残る）。Users・Operators には何も付けない。
 //!   中のジャンクションの先を書き換えないこと（伝播は辿らない）は
-//!   `banto_secret_store::acl` のテストが固定する。ハードリンクの扱いは既知の制限
+//!   `banto_safe_root::acl` のテストが固定する。ハードリンクの扱いは既知の制限
 //!   （同じモジュール doc）。
 //! - **無いフォルダは、確かめ済みの親のハンドルを基準に相対で作る**（#642。#626 PR-B の
 //!   banto-hub-elev と同じ形）: ルートは、親を辿らずに開いて
@@ -96,8 +96,9 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::{guard, PinnedDirInfo};
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::acl::PinnedDirInfo;
+use banto_safe_root::guard;
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::{ConsoleLine, ServiceManagerError, UninstallError, UninstallOutcome};
 use banto_service_elev::{
     ElevError, GroupOutcome, MemberOutcome, OperatorsGroup, ServiceAclOutcome,
@@ -306,19 +307,17 @@ pub fn finished_line(action: &Action, code: i32) -> ConsoleLine {
 // --- データのルート（マシンの環境） ------------------------------------------------
 //
 // 判断（既知のフォルダ・マシンの環境からのルート・本当のパスの比較）は
-// `banto_secret_store::acl::guard`（#626 PR-A で移した。banto-hub-elev と共有）。ここに
+// `banto_safe_root::guard`（#626 PR-A で移した。banto-hub-elev と共有）。ここに
 // 残すのは ChronoGazer の名前（`CHRONOGAZER_ROOT`・`ChronoGazer`）と文言だけ。
 
-/// マシンの環境の読み取り・既知のフォルダ（`banto_secret_store::acl::guard` から）。
-pub use banto_secret_store::acl::guard::{
-    KnownFolders, MachineEnvironment, MACHINE_ENVIRONMENT_KEY,
-};
+/// マシンの環境の読み取り・既知のフォルダ（`banto_safe_root::guard` から）。
+pub use banto_safe_root::guard::{KnownFolders, MachineEnvironment, MACHINE_ENVIRONMENT_KEY};
 
 /// ルートが既知のシステムフォルダ・ドライブのルート・ネットワークの場所でないことを
 /// 確かめる（純関数。監査 B1）。`grant-data-acl` の書き直しはルートの下の**全体**に
 /// 伝わるので、`D:\`・`C:\ProgramData`・`C:\Users` などをルートにすると、他の製品・
 /// 利用者のデータの ACL を書き換えてしまう。判断は
-/// `banto_secret_store::acl::guard::reject_well_known_root`、ここは文言だけ。
+/// `banto_safe_root::guard::reject_well_known_root`、ここは文言だけ。
 pub fn reject_well_known_root(root: &Path, known: &KnownFolders) -> Result<(), String> {
     guard::reject_well_known_root(root, known).map_err(|refusal| well_known_line(root, &refusal))
 }
@@ -357,7 +356,7 @@ fn well_known_line(root: &Path, refusal: &guard::WellKnownRootRefusal) -> String
 ///    [`reject_well_known_root`]（システムフォルダ・ドライブのルート・UNC でない）を
 ///    通ること。
 ///
-/// 判断は `banto_secret_store::acl::guard::resolve_machine_root`、ここは名前と文言だけ。
+/// 判断は `banto_safe_root::guard::resolve_machine_root`、ここは名前と文言だけ。
 pub fn resolve_machine_root(env: &impl MachineEnvironment) -> Result<PathBuf, String> {
     use guard::MachineRootError as E;
     guard::resolve_machine_root(env, ROOT_ENV, PRODUCT_DIR_NAME).map_err(|error| match error {
@@ -410,14 +409,14 @@ pub fn registered_command_matches(raw: &str, exe: &Path) -> bool {
 
 // --- データの ACL の計画 ----------------------------------------------------------
 //
-// 判断（[`data_acl_plan`]）は `banto_secret_store::acl::guard`（#626 PR-A で移した）。
+// 判断（[`data_acl_plan`]）は `banto_safe_root::guard`（#626 PR-A で移した）。
 
 /// 扱うフォルダの状態・すること・断る理由と、その判断（純関数）。
-pub use banto_secret_store::acl::guard::{data_acl_plan, DataAclRefusal, DataAclStep, DirState};
+pub use banto_safe_root::guard::{data_acl_plan, DataAclRefusal, DataAclStep, DirState};
 
 // --- OS の操作 ---------------------------------------------------------------------
 
-/// 辿らずに開いたフォルダ（Windows は `banto_secret_store::acl::PinnedDir`）。
+/// 辿らずに開いたフォルダ（Windows は `banto_safe_root::acl::PinnedDir`）。
 /// 持っている間は名前の変更・削除ができない。
 pub trait PinnedDirOps {
     /// 開いたハンドルから読んだ属性と所有者。
@@ -430,8 +429,8 @@ pub trait PinnedDirOps {
     fn reset_acl(
         &self,
         access: &DirAccess,
-        recurse: banto_secret_store::acl::Recurse,
-    ) -> Result<banto_secret_store::acl::ResetSkips, String>;
+        recurse: banto_safe_root::acl::Recurse,
+    ) -> Result<banto_safe_root::acl::ResetSkips, String>;
 }
 
 /// 利用者のアカウントの確かめの失敗（監査 Nit 2）。
@@ -979,7 +978,7 @@ fn preflight_root<O: ElevOps>(
     // Administrators に。監査 B5）。既にあったルートはここでは変えない（登録の後の
     // `grant-data-acl` が書き直す）。
     if created {
-        match pinned.reset_acl(&access, banto_secret_store::acl::Recurse::Tree) {
+        match pinned.reset_acl(&access, banto_safe_root::acl::Recurse::Tree) {
             Ok(skips) => emit_skips(DataDir::Root, &skips, out),
             Err(error) => {
                 out(err(&format!(
@@ -1019,7 +1018,7 @@ fn left_behind_notice(created: bool, kind: DataDir, expected: &Path, real: &Path
 
 /// 書き直しのときに飛ばした子（reparse point・ハードリンク）を警告の 1 行で報告する
 /// （監査 Must 2。触っていないことを利用者に知らせる）。
-fn emit_skips(kind: DataDir, skips: &banto_secret_store::acl::ResetSkips, out: Out<'_>) {
+fn emit_skips(kind: DataDir, skips: &banto_safe_root::acl::ResetSkips, out: Out<'_>) {
     for path in &skips.reparse {
         out(err(&format!(
             "{}: 中の {} はジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました",
@@ -1174,7 +1173,7 @@ fn grant_dir<O: ElevOps>(
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
     create_if_absent: bool,
-    recurse: banto_secret_store::acl::Recurse,
+    recurse: banto_safe_root::acl::Recurse,
     out: Out<'_>,
 ) -> Result<Option<O::Pinned>, i32> {
     let access = DirAccess::with_install_user(install_user.clone());
@@ -1282,7 +1281,7 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
     let mut real_root: Option<PathBuf> = None;
     // ルートは中まで再帰する。`secrets`・`hub-keys` はルートの再帰で既に書かれているので、
     // その層では対象そのものだけ書く（監査 Nit 3。同じ部分木を最大 3 回書かない）。
-    use banto_secret_store::acl::Recurse;
+    use banto_safe_root::acl::Recurse;
     for (kind, dir, create, recurse) in [
         (
             DataDir::Root,

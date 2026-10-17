@@ -9,11 +9,11 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::guard::{KnownFolders, MachineEnvironment};
-use banto_secret_store::acl::{
+use banto_safe_root::acl::{
     check_dacl, exposure, inspect_file, read_dir_dacl, Exposure, ADMINISTRATORS_SID, INHERIT_FLAGS,
 };
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::guard::{KnownFolders, MachineEnvironment};
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 
 use super::super::{
@@ -76,8 +76,8 @@ struct TempOps {
 
 impl SinkConfigOps for TempOps {
     type Env = TempEnv;
-    type Dir = banto_secret_store::acl::PinnedDir;
-    type File = banto_secret_store::acl::PinnedFile;
+    type Dir = banto_safe_root::acl::PinnedDir;
+    type File = banto_safe_root::acl::PinnedFile;
 
     fn machine_env(&self) -> &TempEnv {
         &self.env

@@ -25,7 +25,7 @@ test = false
 # プロセスの中で呼ぶ）・`paths`・`shell_launch` の定数。
 chronogazer-core = { path = "../core" }
 # ディレクトリの DACL（作る・辿らずに開く・書き直す）とインストール利用者の SID。
-banto-secret-store = { path = "../../../crates/banto-secret-store" }
+banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # 登録の解除・`Parameters` の読み取り・自動開始の切り替え・`ConsoleLine`。
 banto-service-control = { path = "../../../crates/banto-service-control" }
 # ローカルグループ・メンバー・サービス DACL の ACE（#392 B3-3a）。
@@ -36,8 +36,8 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # - Win32_System_LibraryLoader: SetDefaultDllDirectories（main の先頭で DLL の
 #   探し先を System32 に限る。監査 C4）
 # マシンの環境変数（RegGetValueW）・既知のフォルダ（SHGetKnownFolderPath）の読み取りは
-# #626 PR-A で `banto_secret_store::acl::guard::win` へ移した（その feature は
-# banto-secret-store が持つ）。
+# #626 PR-A で `banto_safe_root::guard::win` へ移した（その feature は
+# banto-safe-root が持つ）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",

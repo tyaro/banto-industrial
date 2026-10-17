@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use banto_secret_store::acl::{
+use banto_safe_root::acl::{
     Exposure, FileSecurity, ObservedAce, ObservedDacl, ADMINISTRATORS_SID, SYSTEM_SID,
 };
 
@@ -795,8 +795,8 @@ fn every_exposure_has_a_line() {
 mod windows {
     use std::path::{Path, PathBuf};
 
-    use banto_secret_store::acl::{pin_dir, Exposure, Recurse};
-    use banto_secret_store::DirAccess;
+    use banto_safe_root::acl::{pin_dir, Exposure, Recurse};
+    use banto_safe_root::DirAccess;
 
     use super::super::win::WindowsPlaceOps;
     use super::super::{read_protected, Paths, Problem, Source};

@@ -4,12 +4,12 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::guard::{self, AccountKind};
-use banto_secret_store::acl::{ObservedDacl, PinnedDir, PinnedDirInfo, ResetSkips};
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::acl::{ObservedDacl, PinnedDir, PinnedDirInfo, ResetSkips};
+use banto_safe_root::guard::{self, AccountKind};
+use banto_safe_root::{DirAccess, InstallUserSid};
 
 /// マシンの環境を HKLM と既知のフォルダから読む（このプロセスの環境変数は読まない）。
-pub use banto_secret_store::acl::guard::win::RegistryMachineEnvironment;
+pub use banto_safe_root::guard::win::RegistryMachineEnvironment;
 
 use super::{CreateHow, FileFacts, HubElevOps, PinnedProfileDir};
 
@@ -30,7 +30,7 @@ impl PinnedProfileDir for PinnedDir {
     }
 
     fn reset_acl_tree(&self, access: &DirAccess) -> Result<ResetSkips, String> {
-        PinnedDir::reset_acl(self, access, banto_secret_store::acl::Recurse::Tree)
+        PinnedDir::reset_acl(self, access, banto_safe_root::acl::Recurse::Tree)
             .map_err(|err| err.to_string())
     }
 }
@@ -57,7 +57,7 @@ impl HubElevOps for WindowsHubElevOps {
     }
 
     fn current_user_sid(&self) -> Result<InstallUserSid, String> {
-        banto_secret_store::acl::current_user_sid().map_err(|err| err.to_string())
+        banto_safe_root::acl::current_user_sid().map_err(|err| err.to_string())
     }
 
     fn lookup_account_sid(&self, name: &str) -> Result<Option<String>, String> {
@@ -80,7 +80,7 @@ impl HubElevOps for WindowsHubElevOps {
     }
 
     fn pin_dir(&self, dir: &Path) -> Result<Option<PinnedDir>, String> {
-        banto_secret_store::acl::pin_dir(dir).map_err(|err| err.to_string())
+        banto_safe_root::acl::pin_dir(dir).map_err(|err| err.to_string())
     }
 
     type HeldFile = HeldFile;

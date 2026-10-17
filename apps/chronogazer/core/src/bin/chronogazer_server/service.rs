@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use banto_secret_store::InstallUserSid;
+use banto_safe_root::InstallUserSid;
 use banto_service_control::{
     dispatch_failure_lines, print_console_lines, read_service_parameter, run_service,
     uninstall_service, ServiceContext, ServiceExit, ServiceProgram,
@@ -407,8 +407,8 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     use banto_collect::{simulation, Protocol};
-    use banto_secret_store::acl::{current_user_sid, read_dir_dacl, reset_dir_acl};
-    use banto_secret_store::DirAccess;
+    use banto_safe_root::acl::{current_user_sid, read_dir_dacl, reset_dir_acl};
+    use banto_safe_root::DirAccess;
     use banto_service_control::{
         run_program_with, ControlHandler, ControlReply, ErrorLog, ScmControlKind, ServicePhase,
         ServiceStatusPlan,

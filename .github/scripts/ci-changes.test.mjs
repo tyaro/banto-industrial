@@ -42,10 +42,15 @@ const G = {
 		{ name: 'banto-service-elev', dir: 'crates/banto-service-elev', deps: [] },
 		{ name: 'banto-service-control', dir: 'crates/banto-service-control', deps: [] },
 		{
+			name: 'banto-safe-root',
+			dir: 'crates/banto-safe-root',
+			// banto-service-elev は dev-dependency。
+			deps: ['banto-service-elev']
+		},
+		{
 			name: 'banto-secret-store',
 			dir: 'crates/banto-secret-store',
-			// banto-service-elev は dev-dependency。
-			deps: ['banto-hub-bootstrap', 'banto-service-elev']
+			deps: ['banto-hub-bootstrap', 'banto-safe-root']
 		},
 		{
 			name: 'chronogazer-core',
@@ -53,6 +58,7 @@ const G = {
 			deps: [
 				'banto-hub-bootstrap',
 				'banto-instance-lock',
+				'banto-safe-root',
 				'banto-secret-store',
 				'banto-service-control',
 				'banto-tagclient',
@@ -63,7 +69,7 @@ const G = {
 			name: 'chronogazer-elev',
 			dir: 'apps/chronogazer/elev',
 			deps: [
-				'banto-secret-store',
+				'banto-safe-root',
 				'banto-service-control',
 				'banto-service-elev',
 				'chronogazer-core'
@@ -74,7 +80,7 @@ const G = {
 			dir: 'apps/chronogazer/src-tauri',
 			deps: [
 				'banto-hub-bootstrap',
-				'banto-secret-store',
+				'banto-safe-root',
 				'banto-service-control',
 				'chronogazer-core'
 			]
@@ -82,7 +88,13 @@ const G = {
 		{
 			name: 'banto-hub-core',
 			dir: 'apps/banto-hub/core',
-			deps: ['banto-instance-lock', 'banto-service-control', 'banto-service-elev', 'banto-tags']
+			deps: [
+				'banto-instance-lock',
+				'banto-safe-root',
+				'banto-service-control',
+				'banto-service-elev',
+				'banto-tags'
+			]
 		},
 		{
 			name: 'banto-hub-shell',
@@ -93,7 +105,13 @@ const G = {
 			name: 'banto-hub-sink',
 			dir: 'apps/banto-hub-sink',
 			// banto-hub-core・banto-tags は dev-dependency。
-			deps: ['banto-hub-core', 'banto-service-control', 'banto-tagclient', 'banto-tags']
+			deps: [
+				'banto-hub-core',
+				'banto-safe-root',
+				'banto-service-control',
+				'banto-tagclient',
+				'banto-tags'
+			]
 		}
 	]
 };
@@ -234,7 +252,29 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-service-elev（dev-dependency を辿って banto-secret-store の逆依存まで届く）',
+		'banto-safe-root（#623 PR-1a の新 crate。hub・chronogazer の両方に届く）',
+		['crates/banto-safe-root/src/acl.rs', 'crates/banto-safe-root/Cargo.toml'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: [
+				'-p banto-hub-core',
+				'-p banto-hub-shell',
+				'-p banto-hub-sink',
+				'-p banto-safe-root',
+				'-p banto-secret-store',
+				'-p chronogazer',
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
+			].join(' '),
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true,
+			run_e2e_chronogazer: true
+		}
+	],
+	[
+		'banto-service-elev（dev-dependency を辿って banto-safe-root・banto-secret-store の逆依存まで届く）',
 		['crates/banto-service-elev/src/win.rs'],
 		{
 			...NONE,
@@ -243,6 +283,7 @@ const TABLE = [
 				'-p banto-hub-core',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink',
+				'-p banto-safe-root',
 				'-p banto-secret-store',
 				'-p banto-service-elev',
 				'-p chronogazer',
@@ -652,7 +693,15 @@ test('固定のグラフ G は実グラフの一部（辺が実在する）', ()
 test('実グラフ: 主な crate の逆依存が期待のパッケージを含む', () => {
 	const g = real();
 	const want = {
-		'banto-secret-store': ['chronogazer-core', 'chronogazer', 'chronogazer-elev'],
+		'banto-safe-root': [
+			'banto-secret-store',
+			'chronogazer-core',
+			'chronogazer',
+			'chronogazer-elev',
+			'banto-hub-core',
+			'banto-hub-sink'
+		],
+		'banto-secret-store': ['chronogazer-core', 'chronogazer'],
 		'banto-instance-lock': [
 			'chronogazer-core',
 			'chronogazer',
@@ -669,8 +718,13 @@ test('実グラフ: 主な crate の逆依存が期待のパッケージを含�
 			'banto-hub-shell',
 			'banto-hub-sink'
 		],
-		// dev-dependency（banto-secret-store → banto-service-elev）を辿る。
-		'banto-service-elev': ['banto-secret-store', 'chronogazer-core', 'banto-hub-core'],
+		// dev-dependency（banto-safe-root → banto-service-elev）を辿る。
+		'banto-service-elev': [
+			'banto-safe-root',
+			'banto-secret-store',
+			'chronogazer-core',
+			'banto-hub-core'
+		],
 		// dev の辺（banto-hub-sink → banto-tags）も辿る。
 		'banto-tags': ['banto-hub-core', 'banto-hub-sink', 'chronogazer-core']
 	};

@@ -45,7 +45,7 @@
 //!
 //! ルートが**まだ無いときだけ**、継承しない保護された DACL（SYSTEM・Administrators に
 //! フル、**このプロセスの利用者**に「変更」、Users などには何も付けない）で作る
-//! （Windows。形と作り方は `banto_secret_store::acl::create_dir_if_absent` - 秘密の
+//! （Windows。形と作り方は `banto_safe_root::acl::create_dir_if_absent` - 秘密の
 //! 保存先と同じ記述子・SID の検証を使い、unsafe なコードを複製しない）。
 //! `%ProgramData%` の既定の継承（Users に読み取りと作成）のまま作ると、同じ PC の
 //! 一般の利用者が DB・ログを読めてしまうため。利用者の欄は
@@ -231,7 +231,7 @@ pub fn create_root_dir(layout: &DataLayout) -> Result<bool, String> {
     // Windows 以外は ACL を付けない（`create_dir_all`）。ここで渡す指定は
     // `create_root_dir_impl` の型を合わせるためだけで、使われない。
     #[cfg(not(windows))]
-    let access = banto_secret_store::DirAccess::service_only();
+    let access = banto_safe_root::DirAccess::service_only();
     create_root_dir_impl(root, &access)
 }
 
@@ -242,7 +242,7 @@ pub fn create_root_dir(layout: &DataLayout) -> Result<bool, String> {
 /// 使わない（`create_dir_all`）。
 pub fn create_root_dir_with(
     layout: &DataLayout,
-    access: &banto_secret_store::DirAccess,
+    access: &banto_safe_root::DirAccess,
 ) -> Result<bool, String> {
     let root = layout.root();
     if root.is_dir() {
@@ -252,18 +252,12 @@ pub fn create_root_dir_with(
 }
 
 #[cfg(windows)]
-fn create_root_dir_impl(
-    root: &Path,
-    access: &banto_secret_store::DirAccess,
-) -> Result<bool, String> {
-    banto_secret_store::acl::create_dir_if_absent(root, access).map_err(|err| err.to_string())
+fn create_root_dir_impl(root: &Path, access: &banto_safe_root::DirAccess) -> Result<bool, String> {
+    banto_safe_root::acl::create_dir_if_absent(root, access).map_err(|err| err.to_string())
 }
 
 #[cfg(not(windows))]
-fn create_root_dir_impl(
-    root: &Path,
-    _access: &banto_secret_store::DirAccess,
-) -> Result<bool, String> {
+fn create_root_dir_impl(root: &Path, _access: &banto_safe_root::DirAccess) -> Result<bool, String> {
     std::fs::create_dir_all(root).map_err(|err| err.to_string())?;
     Ok(true)
 }
@@ -279,7 +273,7 @@ pub enum DirAccessSource {
     CurrentProcess,
     /// 呼び出し側が決めた指定。サービス（LocalSystem）が登録時に記録したインストール
     /// 利用者の SID を渡す（B3-2b）。
-    Given(banto_secret_store::DirAccess),
+    Given(banto_safe_root::DirAccess),
 }
 
 impl DirAccessSource {
@@ -299,12 +293,12 @@ impl DirAccessSource {
 /// API キーの保存先（`crate::key_store::open_key_store`）が同じ判断を使う。
 #[cfg(windows)]
 pub fn current_process_dir_access(
-) -> Result<banto_secret_store::DirAccess, banto_secret_store::SecretStoreError> {
-    use banto_secret_store::{acl::current_user_sid, DirAccess, SecretStoreError};
+) -> Result<banto_safe_root::DirAccess, banto_safe_root::SafeRootError> {
+    use banto_safe_root::{acl::current_user_sid, DirAccess, SafeRootError};
     match current_user_sid() {
         Ok(sid) => Ok(DirAccess::with_install_user(sid)),
         // LocalSystem など、利用者のアカウントではない（`InvalidUserSid`）。
-        Err(SecretStoreError::InvalidUserSid(_)) => Ok(DirAccess::service_only()),
+        Err(SafeRootError::InvalidUserSid(_)) => Ok(DirAccess::service_only()),
         Err(err) => Err(err),
     }
 }
@@ -502,7 +496,7 @@ mod tests {
     #[cfg(windows)]
     mod windows_root_acl {
         use super::super::*;
-        use banto_secret_store::acl::{
+        use banto_safe_root::acl::{
             current_user_sid, read_dir_dacl, ACCESS_ALLOWED_ACE_TYPE, ADMINISTRATORS_SID,
             FULL_ACCESS_MASK, INHERIT_FLAGS, MODIFY_ACCESS_MASK, SYSTEM_SID,
         };
@@ -559,7 +553,7 @@ mod tests {
         /// 使われている証拠。今のプロセスの利用者なら作れる）。
         #[test]
         fn create_root_dir_with_uses_the_given_access() {
-            use banto_secret_store::{acl::reset_dir_acl, DirAccess, InstallUserSid};
+            use banto_safe_root::{acl::reset_dir_acl, DirAccess, InstallUserSid};
 
             let dir = tempfile::tempdir().unwrap();
             let me = current_user_sid().unwrap();

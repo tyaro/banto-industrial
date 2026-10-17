@@ -23,7 +23,7 @@
 //!   SID の形）→ `LookupAccountSidW`の種類（`SidTypeUser`）の順に確かめる。グループ・
 //!   well-known・無い名前は断る。省けばこのプロセスの**トークンの利用者の SID**（同じく
 //!   確かめる）。
-//! - **ルートはマシンの環境だけ**（論点 2）: `banto_secret_store::acl::guard::resolve_machine_root`
+//! - **ルートはマシンの環境だけ**（論点 2）: `banto_safe_root::guard::resolve_machine_root`
 //!   に`BANTO_HUB_ROOT`・`BantoHub`を渡す（HKLM の値を展開せずに読み、無ければ
 //!   ProgramData の既知フォルダ + `BantoHub`。このプロセスの環境変数は読まない）。ルートと
 //!   `profiles\`は**開いて本当のパスと所有者を確かめるだけで、DACL は書かない**（無ければ
@@ -31,7 +31,7 @@
 //! - **稼働中は断る**（論点 6）: profile の mutex（`Global\BantoHub.<id>`）があれば何も
 //!   しない（書き直しの間、中の子を共有の削除なしで開くので、稼働中の Hub の -wal の
 //!   削除・原子的な置換を共有違反にしうる）。
-//! - **書き込みは共有の部品だけ**: profile は`banto_secret_store::acl::pin_dir`で辿らずに
+//! - **書き込みは共有の部品だけ**: profile は`banto_safe_root::acl::pin_dir`で辿らずに
 //!   開き、本当のパス（`final_path`）を「本当の`profiles` + id」と比べ、
 //!   `guard::data_acl_plan`（reparse point・フォルダでない・見知らぬ所有者を断る）を
 //!   通ってから、`PinnedDir::reset_acl(.., Recurse::Tree)`でハンドルに書く（自動の伝播を
@@ -74,15 +74,15 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_secret_store::acl::guard::{
-    self, AccountKind, CarryOver, DataAclRefusal, DirState, DropReason, KnownFolders,
-    MachineEnvironment, MachineRootError, RealPathRefusal, RootFormProblem, WellKnownRootRefusal,
-};
-use banto_secret_store::acl::{
+use banto_safe_root::acl::{
     ObservedAce, ObservedDacl, PinnedDirInfo, ResetSkips, ACCESS_ALLOWED_ACE_TYPE, INHERIT_FLAGS,
     MODIFY_ACCESS_MASK,
 };
-use banto_secret_store::{DirAccess, InstallUserSid};
+use banto_safe_root::guard::{
+    self, AccountKind, CarryOver, DataAclRefusal, DirState, DropReason, KnownFolders,
+    MachineEnvironment, MachineRootError, RealPathRefusal, RootFormProblem, WellKnownRootRefusal,
+};
+use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 use thiserror::Error;
 
@@ -406,7 +406,7 @@ pub fn open_target_profile<O: HubElevOps>(
 
 // --- OS の操作 ---------------------------------------------------------------------
 
-/// 辿らずに開いたフォルダ（Windows は`banto_secret_store::acl::PinnedDir`）。持っている
+/// 辿らずに開いたフォルダ（Windows は`banto_safe_root::acl::PinnedDir`）。持っている
 /// 間は名前の変更・削除ができない。
 pub trait PinnedProfileDir {
     /// 開いたハンドルから読んだ属性と所有者。

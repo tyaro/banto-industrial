@@ -1122,8 +1122,8 @@ async fn the_hub_key_lives_in_the_dpapi_file_and_resume_works_after_a_restart() 
         !raw.windows(HUB_KEY.len()).any(|w| w == HUB_KEY.as_bytes()),
         "キーのファイルに平文がある"
     );
-    // ディレクトリは保護された DACL（banto-secret-store の形）。
-    let dacl = banto_secret_store::acl::read_dir_dacl(&keys_dir).unwrap();
+    // ディレクトリは保護された DACL（banto-safe-root の形）。
+    let dacl = banto_safe_root::acl::read_dir_dacl(&keys_dir).unwrap();
     assert!(dacl.protected);
 
     // 2 回目: 何もしなくても、保存したキーで購読を張り直す。
