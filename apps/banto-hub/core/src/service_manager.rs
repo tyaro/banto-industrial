@@ -132,6 +132,9 @@ pub fn describe_service_error(err: &ServiceManagerError) -> String {
         ServiceManagerError::Other(detail) => {
             format!("banto-hub: サービス操作に失敗しました: {detail}")
         }
+        ServiceManagerError::InvalidState(state) => format!(
+            "banto-hub: サービスは {state} のため、引数つきの開始は要求できません（停止中のときだけ）"
+        ),
     }
 }
 

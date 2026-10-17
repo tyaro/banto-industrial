@@ -283,6 +283,11 @@ impl ServiceContext {
     /// （[`crate::ServiceManager::start_with_args`]）は `[1..]`。引数なしの
     /// 開始（`sc start`・`Start-Service` の既定）では先頭だけ。SCM の外
     /// （試験）では空。既存の製品は見ない（見ないままで挙動は変わらない）。
+    ///
+    /// **`[1..]` は信頼できない入力**: `SERVICE_START` の権利を持つ人
+    /// （Operators でも）が、どんな語をいくつでも渡せる。決まった値との
+    /// **完全一致だけ**で分岐し、パス・数値・コマンドとして解釈しない。
+    /// 知らない語は無視して通常の開始にするか、断って終える。
     pub fn start_args(&self) -> &[OsString] {
         &self.start_args
     }
@@ -293,6 +298,11 @@ impl ServiceContext {
     /// Running・停止が始まった後は何も報告せず `false`（`wait_hint` が 0
     /// でも `false`）。Running を報告せずに [`ServiceExit`] を返すと
     /// START_PENDING から直接 STOPPED になる（`relax-only` の道）。
+    ///
+    /// **START_PENDING の間、SCM は STOP を `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`
+    /// （1061）で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
+    /// 長い起動は、止められない時間を延ばす。`wait_hint` は約 49.7 日
+    /// （`u32` のミリ秒）で丸める。
     pub fn report_start_progress(&self, wait_hint: std::time::Duration) -> bool {
         self.reporter.report_start_progress(wait_hint)
     }

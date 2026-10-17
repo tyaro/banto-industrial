@@ -1,5 +1,6 @@
 //! Windows の糊: ディスパッチャ・制御ハンドラの登録・`SetServiceStatus` を
-//! [`super::run_program_with`] に差し込むだけ（判断は持たない）。
+//! [`super::run_program_with_args`] に差し込むだけ（判断は持たない）。
+//! `ServiceMain` の argv は `Handoff` 経由で `run_program_with_args` へ渡す。
 
 use std::ffi::OsString;
 use std::sync::OnceLock;

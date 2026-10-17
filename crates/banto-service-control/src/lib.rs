@@ -121,6 +121,14 @@ pub struct ServiceStatusSummary {
     /// SCM の `dwWaitHint`。pending の間の、次の進みまでの見込み。
     /// pending でなければ `Duration::ZERO`。
     pub wait_hint: Duration,
+    /// SCM の `dwWin32ExitCode`。正常は 0、サービス固有の終了コードで
+    /// 止まったときは `ERROR_SERVICE_SPECIFIC_ERROR`（1066）で、そのとき
+    /// 値は [`Self::service_specific_exit_code`] にある。未登録なら 0。
+    pub win32_exit_code: u32,
+    /// SCM の `dwServiceSpecificExitCode`。`win32_exit_code` が 1066 の
+    /// ときだけ意味を持つ（`relax-only` の 0／5 など、サービスが自分で
+    /// 返した終了コード）。未登録なら 0。
+    pub service_specific_exit_code: u32,
 }
 
 /// 2 回の照会から、pending（起動中・停止中）が**進んでいる**かを決める
@@ -131,6 +139,10 @@ pub struct ServiceStatusSummary {
 /// 始まりなので進んでいる扱い。`checkpoint` が増えない・戻ったときは止まって
 /// いる（期限を延ばさない）。pending でない `current` は `false`
 /// （待つ必要が無い）。
+///
+/// 2 回の照会の間にサービスが再起動して**同じ pending に戻った**とき
+/// （StartPending 5 → Running → StartPending 2）は「戻った」と見て `false`
+/// を返す。まれで、起きても期限を延ばさないだけの安全な側。
 pub fn pending_progress(
     previous: Option<&ServiceStatusSummary>,
     current: &ServiceStatusSummary,
@@ -175,6 +187,10 @@ pub enum ServiceManagerError {
     /// そのまま保持する診断用）。
     #[error("サービス操作に失敗しました: {0}")]
     Other(String),
+    /// 要求できる状態ではなかった（引数つきの開始は `Stopped` のときだけ。
+    /// 値は照会した現在の状態）。要求は出していない。
+    #[error("サービスは {0} のため、引数つきの開始は要求できません（停止中のときだけ）")]
+    InvalidState(ScmState),
 }
 
 /// start/stop/restart が返す、非同期な SCM 状態遷移の薄いハンドル。
@@ -240,9 +256,29 @@ pub trait ServiceManager {
 
     /// 引数を渡してサービス開始を要求する（`StartServiceW` の
     /// `lpServiceArgVectors`。サービスは `ServiceMain` の argv の `[1..]` で
-    /// 受け取る - `ServiceContext::start_args`）。冪等性は[`Self::start`]と
-    /// 同じ（既に`Running`なら要求せず、引数も渡らない）。Operators の権利
+    /// 受け取る - `ServiceContext::start_args`）。Operators の権利
     /// （`START`と`QUERY_STATUS`）だけで呼べる。
+    ///
+    /// 引数が**空**なら[`Self::start`]と同じ（冪等）。引数があるときは
+    /// **`Stopped` のときだけ**要求する。`Running`・pending など他の状態では
+    /// 要求を出さず[`ServiceManagerError::InvalidState`]で断る（[`Self::start`]
+    /// のような冪等な `Ok` にすると、引数が渡らなかったのに成功に見える）。
+    /// 照会と開始の間に別の操作が入った場合は、SCM が開始を断る
+    /// （`ERROR_SERVICE_ALREADY_RUNNING` など）。
+    ///
+    /// **返る[`TransitionHandle`]の目標は `Running` 固定**で、引数が Running
+    /// まで進む開始のときだけ `wait_until_settled` で待てる。`relax-only` の
+    /// ように Running を報告せず START_PENDING から STOPPED へ進む引数では
+    /// `Running` に着かないので毎回 `Timeout` になる。その完了は
+    /// `query_status` を自分でポーリングし、`StartPending` を通った後の
+    /// `Stopped` と終了コード（[`ServiceStatusSummary::win32_exit_code`]・
+    /// [`ServiceStatusSummary::service_specific_exit_code`]）で見る
+    /// （開始の直前の `Stopped` を「着いた」と取り違えないこと）。
+    ///
+    /// 引数は**信頼できない入力**として扱う: `START` の権利があれば
+    /// （Operators でも）誰でも任意の語・個数を渡せる。受ける側（サービス）
+    /// の決まった値だけを受け付ける責任は、`ServiceContext::start_args` の
+    /// 側にある。
     fn start_with_args(
         &self,
         args: &[std::ffi::OsString],
@@ -372,15 +408,16 @@ impl MockServiceManager {
             .clone()
     }
 
-    /// 状態を pending（`StartPending`／`StopPending`）にし、照会に載せる
-    /// checkpoint と wait hint を設定する（シェルの「進んでいる間は待つ」
-    /// 判断を試すテスト用）。pending でない状態を渡すと checkpoint・wait hint
-    /// は 0 として返す。
+    /// 状態を設定し、照会に載せる checkpoint と wait hint を設定する
+    /// （シェルの「進んでいる間は待つ」判断を試すテスト用）。pending
+    /// （`StartPending`／`StopPending`）でない状態を渡すと checkpoint・
+    /// wait hint は 0 として返す。
     pub fn set_pending_progress(&self, scm_state: ScmState, checkpoint: u32, wait_hint: Duration) {
         let mut state = self.state.lock().expect("mock state mutex poisoned");
+        let pending = matches!(scm_state, ScmState::StartPending | ScmState::StopPending);
         state.scm_state = scm_state;
-        state.checkpoint = checkpoint;
-        state.wait_hint = wait_hint;
+        state.checkpoint = if pending { checkpoint } else { 0 };
+        state.wait_hint = if pending { wait_hint } else { Duration::ZERO };
     }
 
     fn take_injected_error(state: &mut MockState) -> Option<ServiceManagerError> {
@@ -406,6 +443,8 @@ impl ServiceManager for MockServiceManager {
             pid: state.pid,
             checkpoint: state.checkpoint,
             wait_hint: state.wait_hint,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
         })
     }
 
@@ -424,14 +463,20 @@ impl ServiceManager for MockServiceManager {
         if !state.installed {
             return Err(ServiceManagerError::NotFound(state.service_name.clone()));
         }
-        // 冪等（設計 §4「多重クリック対策」）: 既に Running ならそのまま。
-        if state.scm_state != ScmState::Running {
-            state.scm_state = ScmState::Running;
-            state.pid = Some(MOCK_PID);
-            state.checkpoint = 0;
-            state.wait_hint = Duration::ZERO;
-            state.last_start_args = args.to_vec();
+        if args.is_empty() {
+            // 冪等（設計 §4「多重クリック対策」）: 既に Running ならそのまま。
+            if state.scm_state == ScmState::Running {
+                return Ok(TransitionHandle::new(ScmState::Running));
+            }
+        } else if state.scm_state != ScmState::Stopped {
+            // 引数つきは Stopped のときだけ（引数が渡らない Ok を作らない）。
+            return Err(ServiceManagerError::InvalidState(state.scm_state.clone()));
         }
+        state.scm_state = ScmState::Running;
+        state.pid = Some(MOCK_PID);
+        state.checkpoint = 0;
+        state.wait_hint = Duration::ZERO;
+        state.last_start_args = args.to_vec();
         Ok(TransitionHandle::new(ScmState::Running))
     }
 
@@ -537,6 +582,9 @@ mod windows_impl {
     use crate::ERROR_SERVICE_DOES_NOT_EXIST;
     /// Win32 エラーコード（`ERROR_ACCESS_DENIED`）。
     const ERROR_ACCESS_DENIED: i32 = 5;
+    /// Win32 エラーコード（`ERROR_SERVICE_SPECIFIC_ERROR`。
+    /// `dwServiceSpecificExitCode` を使う印）。
+    const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
 
     impl WindowsServiceManager {
         /// 任意のサービスを対象にするコンストラクタ（サービス名・表示名・
@@ -625,6 +673,25 @@ mod windows_impl {
         }
     }
 
+    /// `ServiceStatus::exit_code` を `dwWin32ExitCode` に戻す
+    /// （`ERROR_SERVICE_SPECIFIC_ERROR` はサービス固有コードを使う印）。
+    fn win32_exit_code(code: &windows_service::service::ServiceExitCode) -> u32 {
+        match code {
+            windows_service::service::ServiceExitCode::Win32(n) => *n,
+            windows_service::service::ServiceExitCode::ServiceSpecific(_) => {
+                ERROR_SERVICE_SPECIFIC_ERROR
+            }
+        }
+    }
+
+    /// `dwServiceSpecificExitCode`。`Win32` のときは 0。
+    fn specific_exit_code(code: &windows_service::service::ServiceExitCode) -> u32 {
+        match code {
+            windows_service::service::ServiceExitCode::Win32(_) => 0,
+            windows_service::service::ServiceExitCode::ServiceSpecific(n) => *n,
+        }
+    }
+
     impl ServiceManager for WindowsServiceManager {
         fn query_status(&self) -> Result<ServiceStatusSummary, ServiceManagerError> {
             let manager = open_scm(self.service_name, WinScmAccess::CONNECT)?;
@@ -638,6 +705,8 @@ mod windows_impl {
                         pid: None,
                         checkpoint: 0,
                         wait_hint: std::time::Duration::ZERO,
+                        win32_exit_code: 0,
+                        service_specific_exit_code: 0,
                     });
                 }
             };
@@ -653,6 +722,8 @@ mod windows_impl {
                 pid: status.process_id,
                 checkpoint: status.checkpoint,
                 wait_hint: status.wait_hint,
+                win32_exit_code: win32_exit_code(&status.exit_code),
+                service_specific_exit_code: specific_exit_code(&status.exit_code),
             })
         }
 
@@ -671,8 +742,19 @@ mod windows_impl {
             let status = service
                 .query_status()
                 .map_err(|err| map_win_err(self.service_name, err))?;
-            // 冪等（設計 §4「多重クリック対策」）。
-            if status.current_state != ServiceState::Running {
+            if args.is_empty() {
+                // 冪等（設計 §4「多重クリック対策」）。
+                if status.current_state != ServiceState::Running {
+                    service
+                        .start(args)
+                        .map_err(|err| map_win_err(self.service_name, err))?;
+                }
+            } else if status.current_state != ServiceState::Stopped {
+                // 引数つきは Stopped のときだけ（引数が渡らない Ok を作らない）。
+                return Err(ServiceManagerError::InvalidState(map_state(
+                    status.current_state,
+                )));
+            } else {
                 service
                     .start(args)
                     .map_err(|err| map_win_err(self.service_name, err))?;
@@ -1006,6 +1088,8 @@ mod tests {
             pid: None,
             checkpoint,
             wait_hint: Duration::from_secs(10),
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
         }
     }
 
@@ -1018,12 +1102,27 @@ mod tests {
             mock.last_start_args(),
             vec![std::ffi::OsString::from("relax-only")]
         );
-        // 既に Running なら要求せず、引数も変わらない（`start`と同じ冪等性）。
-        mock.start_with_args(&["other".into()]).unwrap();
+        // Running では引数つきの開始は断る（引数が渡らない Ok を作らない）。
+        assert!(matches!(
+            mock.start_with_args(&["other".into()]),
+            Err(ServiceManagerError::InvalidState(ScmState::Running))
+        ));
         assert_eq!(
             mock.last_start_args(),
             vec![std::ffi::OsString::from("relax-only")]
         );
+        // 引数が空なら `start` と同じ冪等（Running でも Ok で、引数は変わらない）。
+        mock.start_with_args(&[]).unwrap();
+        assert_eq!(
+            mock.last_start_args(),
+            vec![std::ffi::OsString::from("relax-only")]
+        );
+        // pending でも断る。
+        mock.set_pending_progress(ScmState::StartPending, 1, Duration::from_secs(1));
+        assert!(matches!(
+            mock.start_with_args(&["other".into()]),
+            Err(ServiceManagerError::InvalidState(ScmState::StartPending))
+        ));
         mock.stop().unwrap();
         mock.start().unwrap();
         assert!(mock.last_start_args().is_empty());
@@ -1049,6 +1148,15 @@ mod tests {
         mock.start().unwrap();
         let running = mock.query_status().unwrap();
         assert_eq!((running.checkpoint, running.wait_hint), (0, Duration::ZERO));
+        // pending でない状態に checkpoint・wait hint を渡しても 0 で返る。
+        mock.set_pending_progress(ScmState::Running, 3, Duration::from_secs(10));
+        let forced = mock.query_status().unwrap();
+        assert_eq!((forced.checkpoint, forced.wait_hint), (0, Duration::ZERO));
+        // 終了コードは正常（0, 0）。
+        assert_eq!(
+            (forced.win32_exit_code, forced.service_specific_exit_code),
+            (0, 0)
+        );
     }
 
     /// (前回, 今回) -> 進んでいるか、の表。

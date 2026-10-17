@@ -143,13 +143,20 @@ pub struct ServiceStatusPlan {
     pub wait_hint: Duration,
 }
 
+/// SCM の `dwWaitHint`（`u32` のミリ秒）に収まる最大の長さ（約 49.7 日）。
+/// `windows-service` は `wait_hint` を `u32` に変換できないと panic する
+/// （報告者の状態のロックを持ったまま）ので、これを超える値は丸める。
+pub const MAX_WAIT_HINT: Duration = Duration::from_millis(u32::MAX as u64);
+
 /// 起動の途中の報告（START_PENDING）。`checkpoint` が 0、または
 /// `wait_hint` が 0 のときは `None`（pending で両方を 0 にすると SCM は
-/// 進捗が無いと扱う）。制御は受け付けない（Running を報告して初めて受ける）。
+/// 進捗が無いと扱う）。`wait_hint` は [`MAX_WAIT_HINT`] で丸める。制御は
+/// 受け付けない（Running を報告して初めて受ける）。
 pub fn start_pending_status(checkpoint: u32, wait_hint: Duration) -> Option<ServiceStatusPlan> {
     if checkpoint == 0 || wait_hint.is_zero() {
         return None;
     }
+    let wait_hint = wait_hint.min(MAX_WAIT_HINT);
     Some(ServiceStatusPlan {
         phase: ServicePhase::StartPending,
         accept_stop: false,
@@ -347,7 +354,11 @@ impl<E: Copy + Send + Sync + 'static> ServiceStatusReporter<E> {
     /// 進め、`wait_hint`（次の報告までの見込み）を載せる。Running を報告
     /// する前にだけ使える。Running・停止が始まった後・Stopped の後、または
     /// `wait_hint` が 0 のときは報告せず `false`。checkpoint は単調に増える
-    /// （1 から）。
+    /// （1 から）。`wait_hint` は [`MAX_WAIT_HINT`] で丸める。
+    ///
+    /// **START_PENDING の間、SCM は STOP を `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`
+    /// （1061）で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
+    /// 長い起動は、止められない時間を延ばす。
     pub fn report_start_progress(&self, wait_hint: Duration) -> bool {
         let mut state = lock(&self.shared.state);
         if state.phase != ReporterPhase::Starting {
@@ -688,6 +699,21 @@ mod tests {
             expected_stop,
         );
         (reporter, seen)
+    }
+
+    #[test]
+    fn start_pending_status_clamps_a_wait_hint_beyond_u32_millis() {
+        let huge = Duration::from_secs(u64::MAX / 2);
+        let plan = start_pending_status(1, huge).unwrap();
+        assert_eq!(plan.wait_hint, MAX_WAIT_HINT);
+        assert!(u32::try_from(plan.wait_hint.as_millis()).is_ok());
+        let just_over = MAX_WAIT_HINT + Duration::from_millis(1);
+        assert_eq!(
+            start_pending_status(1, just_over).unwrap().wait_hint,
+            MAX_WAIT_HINT
+        );
+        let fine = Duration::from_secs(5);
+        assert_eq!(start_pending_status(1, fine).unwrap().wait_hint, fine);
     }
 
     #[test]
