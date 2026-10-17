@@ -1251,6 +1251,16 @@ fn grant_service_acl_exit_codes() {
     // 記録は読まない（SID を使わない）。
     assert_eq!(fake.calls(), vec!["grant_service_acl"]);
 
+    // 同じ相手の別の権利を置き換えたとき。
+    let mut replaced = Fake::new();
+    replaced.service_acl = Ok(ServiceAclOutcome::Replaced);
+    let (code, lines) = exec(Action::GrantServiceAcl, &replaced);
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(
+        lines[0],
+        stdout("chronogazer-elev: サービス 'ChronoGazer' の DACL の 'ChronoGazer Operators' の ACE を、既定の権利（CCLCRPWP: 照会・開始・停止）に置き換えました")
+    );
+
     // 2 回目: ACE は既にある。「足しました」とは言わない（#628）。
     let mut again = Fake::new();
     again.service_acl = Ok(ServiceAclOutcome::AlreadyPresent);
@@ -1441,7 +1451,7 @@ fn service_uninstall_keeps_the_group_and_the_data() {
     assert_eq!(fake.calls(), vec!["uninstall", "machine_root"]);
 
     let mut fake = Fake::new();
-    fake.uninstall = Err(UninstallError::Open("os error 1060".to_string()));
+    fake.uninstall = Err(UninstallError::NotInstalled);
     let (code, lines) = exec(Action::ServiceUninstall, &fake);
     assert_eq!(code, EXIT_PRECONDITION);
     // 未登録は日本語の案内（OS の英語の理由は出さない。#628）。

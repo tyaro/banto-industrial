@@ -123,10 +123,73 @@ pub enum MemberOutcome {
 /// [`grant_service_operators`] の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAclOutcome {
-    /// このとき ACE を足した（既に別の権利の ACE があれば置き換えた）。
+    /// このとき ACE を足した（今の ACE は 1 つも消えていない）。
     Added,
+    /// 同じ相手の別の権利の ACE などを置き換えた（今の ACE が 1 つ以上消えた）。
+    Replaced,
     /// 既に同じ ACE があった（何も書いていない）。
     AlreadyPresent,
+}
+
+/// DACL の SDDL（`D:` の後の制御フラグ `P`・`AI`・`AR` などは読み飛ばす）から ACE の
+/// 並びを取り出す（純関数）。条件つきの ACE の入れ子の括弧も 1 つの ACE として数える。
+/// 形が読めなければ `None`。
+fn dacl_aces(sddl: &str) -> Option<Vec<&str>> {
+    let rest = sddl.strip_prefix("D:")?;
+    // 制御フラグの部分には括弧が無い。ACE が無ければ空。
+    let start = rest.find('(').unwrap_or(rest.len());
+    let mut aces = Vec::new();
+    let (mut depth, mut from) = (0usize, 0usize);
+    for (i, c) in rest[start..].char_indices() {
+        match c {
+            '(' => {
+                if depth == 0 {
+                    from = start + i;
+                }
+                depth += 1;
+            }
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    aces.push(&rest[from..start + i + 1]);
+                }
+            }
+            // ACE の外に余計な文字（`S:` など）があれば読めないとみなす。
+            _ if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(aces)
+}
+
+/// サービスの今の DACL（`current`）と、Operators の ACE を足して作り直した DACL
+/// （`merged`）の SDDL を比べて、結果を決める（純関数。#628）。
+///
+/// - 比べるのは **ACE の並び**だけ。制御フラグ（`D:P`・`D:AI` など）は無視する。作り直した
+///   記述子は制御フラグを持たないので、今の記述子に付いていると文字列全体では毎回食い
+///   違い、「既にあっても毎回足した」と読めてしまうため。
+/// - [`ServiceAclOutcome::AlreadyPresent`]（書き込みを省く）にするのは、ACE の並びが
+///   **順序まで**同じときだけ。並びが違えば（順序だけの違いも）書く側に倒す。
+/// - 今の ACE が 1 つでも作り直した側に無ければ [`ServiceAclOutcome::Replaced`]（同じ
+///   相手の別の権利を置き換えた）、そうでなければ [`ServiceAclOutcome::Added`]。
+/// - どちらかの SDDL が読めなければ `Added`（これまでどおり書く）。
+pub fn classify_dacl_change(current: &str, merged: &str) -> ServiceAclOutcome {
+    let (Some(current), Some(merged)) = (dacl_aces(current), dacl_aces(merged)) else {
+        return ServiceAclOutcome::Added;
+    };
+    if current == merged {
+        return ServiceAclOutcome::AlreadyPresent;
+    }
+    let mut remaining = merged;
+    for ace in &current {
+        match remaining.iter().position(|m| m == ace) {
+            Some(i) => {
+                remaining.remove(i);
+            }
+            None => return ServiceAclOutcome::Replaced,
+        }
+    }
+    ServiceAclOutcome::Added
 }
 
 /// Operators に付けるサービスのアクセス権（`SERVICE_QUERY_CONFIG(0x1) |
@@ -339,6 +402,59 @@ pub fn is_current_process_admin() -> Result<bool, ElevError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn classify_dacl_change_decides_by_the_ace_sequence_only() {
+        use super::{classify_dacl_change as c, ServiceAclOutcome as O};
+        let base = "(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)";
+        let ours = "(A;;CCLCRPWP;;;S-1-5-21-1-2-3-1001)";
+        let theirs = "(A;;CCDCLCRPWP;;;S-1-5-21-1-2-3-1001)";
+        assert_eq!(
+            c(&format!("D:{base}{ours}"), &format!("D:{base}{ours}")),
+            O::AlreadyPresent
+        );
+        assert_eq!(
+            c(&format!("D:{base}"), &format!("D:{base}{ours}")),
+            O::Added
+        );
+        assert_eq!(
+            c(&format!("D:{base}{theirs}"), &format!("D:{base}{ours}")),
+            O::Replaced
+        );
+        // 制御フラグは無視する（今にだけ付いていても既にあるとみなす）。
+        for flags in ["P", "AI", "PAI", "ARPAI"] {
+            assert_eq!(
+                c(
+                    &format!("D:{flags}{base}{ours}"),
+                    &format!("D:{base}{ours}")
+                ),
+                O::AlreadyPresent,
+                "{flags}"
+            );
+            assert_eq!(
+                c(&format!("D:{flags}{base}"), &format!("D:{base}{ours}")),
+                O::Added,
+                "{flags}"
+            );
+        }
+        // 順序だけの違いは省かない（書く側に倒す）。
+        assert_eq!(
+            c(&format!("D:{ours}{base}"), &format!("D:{base}{ours}")),
+            O::Added
+        );
+        // 読めなければ書く側に倒す。
+        assert_eq!(c("S:(AU;SA;FA;;;WD)", &format!("D:{base}{ours}")), O::Added);
+        assert_eq!(
+            c(&format!("D:{base}("), &format!("D:{base}{ours}")),
+            O::Added
+        );
+        // 条件つきの ACE の入れ子の括弧は 1 つの ACE。
+        let cond = "(XA;;FX;;;S-1-1-0;(@User.Level>=3))";
+        assert_eq!(
+            c(&format!("D:{cond}{ours}"), &format!("D:{cond}{ours}")),
+            O::AlreadyPresent
+        );
+    }
+
     use super::*;
 
     #[test]

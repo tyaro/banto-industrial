@@ -385,12 +385,10 @@ fn grant_with_service(
     let merged = merged_dacl(sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR, operators_sid)?;
     let mut new_sd = absolute_sd_with_dacl(&merged)?;
 
-    // 足した結果が今と同じなら（既に同じ ACE がある）、書かない。SDDL に直せなければ
-    // 比べられないので、これまでどおり書く。
-    let current = dacl_sddl_of(sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR);
-    let merged_sddl = dacl_sddl_of(&mut new_sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR);
-    if matches!((&current, &merged_sddl), (Some(a), Some(b)) if a == b) {
-        return Ok(ServiceAclOutcome::AlreadyPresent);
+    // 足した結果が今と同じなら（既に同じ ACE がある）、書かない。
+    let outcome = outcome_for(sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR, &mut new_sd);
+    if outcome == ServiceAclOutcome::AlreadyPresent {
+        return Ok(outcome);
     }
 
     // SAFETY: `service` は有効なハンドル、`new_sd` は DACL を載せた有効な記述子で、
@@ -408,7 +406,21 @@ fn grant_with_service(
             os_error: last_error(),
         });
     }
-    Ok(ServiceAclOutcome::Added)
+    Ok(outcome)
+}
+
+/// 今の記述子（`current`。本番では `QueryServiceObjectSecurity` の自己相対形式）と、作り直した
+/// 記述子（`new_sd`。絶対形式）の DACL を SDDL にして、[`crate::classify_dacl_change`] で
+/// 結果を決める。SDDL に直せなければ `Added`（書く側に倒す）。本番とテストが同じ関数を通る。
+fn outcome_for(
+    current: PSECURITY_DESCRIPTOR,
+    new_sd: &mut SECURITY_DESCRIPTOR,
+) -> ServiceAclOutcome {
+    let merged = dacl_sddl_of(new_sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR);
+    match (dacl_sddl_of(current), merged) {
+        (Some(current), Some(merged)) => crate::classify_dacl_change(&current, &merged),
+        _ => ServiceAclOutcome::Added,
+    }
 }
 
 /// 記述子 `sd` の DACL を SDDL の文字列にする（比べるため。直せなければ `None`）。
@@ -584,6 +596,46 @@ mod tests {
             "(A;;CCLCSWLOCRRC;;;IU)",
         ] {
             assert!(merged.contains(kept), "{kept} が消えた: {merged}");
+        }
+    }
+
+    /// 本番と同じ比べ方（自己相対形式の今の記述子 × 作り直した絶対形式の記述子）で結果を
+    /// 決める。`existing` は SDDL（`D:P(...)` などの制御フラグ付きも可）。
+    fn outcome(existing: &str, sid: &str) -> ServiceAclOutcome {
+        let sd = sd_from_sddl(existing);
+        let sid = sid_from_str(sid);
+        let acl = merged_dacl(sd.0, sid.0).expect("merge");
+        let mut new_sd = absolute_sd_with_dacl(&acl).expect("absolute sd");
+        outcome_for(sd.0, &mut new_sd)
+    }
+
+    #[test]
+    fn outcome_is_decided_the_way_production_compares() {
+        // (b) 無い → Added。
+        assert_eq!(outcome(EXISTING, OPERATORS), ServiceAclOutcome::Added);
+        // (a) 既にある → AlreadyPresent（書き込みを省く）。
+        let with_ours = merge(EXISTING, OPERATORS);
+        assert_eq!(
+            outcome(&with_ours, OPERATORS),
+            ServiceAclOutcome::AlreadyPresent
+        );
+        // (c) 同じ相手に別の権利 → Replaced。
+        let wider = format!("{EXISTING}(A;;CCDCLCRPWP;;;{OPERATORS})");
+        assert_eq!(outcome(&wider, OPERATORS), ServiceAclOutcome::Replaced);
+        // (d) 元の記述子に制御フラグが付いていても、既にあれば AlreadyPresent、無ければ Added。
+        for flags in ["P", "AI", "PAI"] {
+            let existing_with = format!("D:{flags}{}", with_ours.trim_start_matches("D:"));
+            assert_eq!(
+                outcome(&existing_with, OPERATORS),
+                ServiceAclOutcome::AlreadyPresent,
+                "{flags}: {existing_with}"
+            );
+            let existing_without = format!("D:{flags}{}", EXISTING.trim_start_matches("D:"));
+            assert_eq!(
+                outcome(&existing_without, OPERATORS),
+                ServiceAclOutcome::Added,
+                "{flags}"
+            );
         }
     }
 

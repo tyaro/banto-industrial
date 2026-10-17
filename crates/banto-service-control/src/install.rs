@@ -107,7 +107,10 @@ pub struct UninstallOutcome {
 pub enum UninstallError {
     /// SCM に接続できなかった。
     Connect(String),
-    /// サービスを開けなかった（未登録・権限不足）。
+    /// サービスが登録されていない（`ERROR_SERVICE_DOES_NOT_EXIST` = 1060。文字列ではなく
+    /// OS の番号で見分ける）。
+    NotInstalled,
+    /// サービスを開けなかった（権限不足など。未登録は [`UninstallError::NotInstalled`]）。
     Open(String),
     /// 削除できなかった。`stop` はその前の停止の結果（表示の順序のため）。
     Delete {
@@ -224,14 +227,30 @@ pub fn install_service(spec: &ServiceSpec) -> Result<InstallOutcome, InstallErro
     })
 }
 
-/// `open_service` の失敗の文言。Win32 の失敗は OS の理由と番号（`(os error 1060)`）を含める
-/// （`windows_service::Error` の表示は "IO error in winapi call" だけで、未登録（1060）など
-/// を呼び出し側が見分けられない。#628）。
+/// `ERROR_SERVICE_DOES_NOT_EXIST`。
+pub const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+/// Win32 の番号（`raw_os_error()`）から `open_service` の失敗を分ける（純関数）。未登録
+/// （1060）は [`UninstallError::NotInstalled`]、それ以外は OS の理由（`message`）つきの
+/// [`UninstallError::Open`]。
+pub fn classify_open_failure(os_error: Option<i32>, message: String) -> UninstallError {
+    if os_error == Some(ERROR_SERVICE_DOES_NOT_EXIST) {
+        UninstallError::NotInstalled
+    } else {
+        UninstallError::Open(message)
+    }
+}
+
+/// `open_service` の失敗を分ける。`windows_service::Error` の表示は "IO error in winapi
+/// call" だけなので、Win32 の失敗は OS の理由と番号を文言に含め、番号で未登録を見分ける
+/// （#628）。
 #[cfg(windows)]
-fn describe_open_error(err: &windows_service::Error) -> String {
+fn classify_open_error(err: &windows_service::Error) -> UninstallError {
     match err {
-        windows_service::Error::Winapi(io) => io.to_string(),
-        other => other.to_string(),
+        windows_service::Error::Winapi(io) => {
+            classify_open_failure(io.raw_os_error(), io.to_string())
+        }
+        other => UninstallError::Open(other.to_string()),
     }
 }
 
@@ -248,7 +267,7 @@ pub fn uninstall_service(name: &str) -> Result<UninstallOutcome, UninstallError>
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
     let service = manager
         .open_service(name, access)
-        .map_err(|err| UninstallError::Open(describe_open_error(&err)))?;
+        .map_err(|err| classify_open_error(&err))?;
 
     let stop = match service.query_status() {
         Ok(status) if status.current_state != ServiceState::Stopped => match service.stop() {
@@ -298,6 +317,24 @@ pub fn query_service_command_line(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_os_number_1060_means_not_installed() {
+        use super::{classify_open_failure, UninstallError};
+        assert_eq!(
+            classify_open_failure(Some(1060), "x".to_string()),
+            UninstallError::NotInstalled
+        );
+        // 文字列に 1060 と書いてあっても、番号が違えば（無ければ）未登録にしない。
+        assert_eq!(
+            classify_open_failure(Some(5), "(os error 1060)".to_string()),
+            UninstallError::Open("(os error 1060)".to_string())
+        );
+        assert_eq!(
+            classify_open_failure(None, "os error 1060".to_string()),
+            UninstallError::Open("os error 1060".to_string())
+        );
+    }
+
     use super::*;
 
     /// 読むだけ: 無いサービスは `None`（SCM には接続するが何も変えない）。

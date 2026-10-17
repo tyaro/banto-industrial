@@ -784,6 +784,15 @@ fn root_parent_text(real: &Path, refusal: &guard::RootParentRefusal) -> String {
     }
 }
 
+/// [`create_in_parent`] の作る・開き直すの失敗（どちらの操作で落ちたかを文言に使う。
+/// banto-hub-elev の `MadeError` と同じ形。#628 / #646 Nit 1）。
+enum MadeError {
+    /// 作ろうとして失敗した。
+    Create(String),
+    /// 作ろうとしたら既にあり、開き直して失敗した。
+    Open(String),
+}
+
 /// 無いフォルダを、**確かめ済みの親のハンドルを基準に相対で**作る（#642。#626 PR-B の
 /// banto-hub-elev と同じ形）。作るときの DACL は SYSTEM・Administrators だけ
 /// （[`DirAccess::service_only`]。利用者の「変更」は、本当のパスを確かめた後に呼ぶ側が
@@ -799,15 +808,6 @@ fn root_parent_text(real: &Path, refusal: &guard::RootParentRefusal) -> String {
 ///   なく親のハンドルから相対で辿らずに開き直す（呼ぶ側が本当のパス・属性・所有者で
 ///   確かめる）。
 ///
-/// [`create_in_parent`] の作る・開き直すの失敗（どちらの操作で落ちたかを文言に使う。
-/// banto-hub-elev の `MadeError` と同じ形。#628 / #646 Nit 1）。
-enum MadeError {
-    /// 作ろうとして失敗した。
-    Create(String),
-    /// 作ろうとしたら既にあり、開き直して失敗した。
-    Open(String),
-}
-
 /// 返すのは開いたフォルダと、自分で作ったか。
 fn create_in_parent<O: ElevOps>(
     ops: &O,
@@ -1058,7 +1058,7 @@ fn service_uninstall<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
             EXIT_OK
         }
         // 管理者として動いているので、開けないのはほぼ「未登録」。
-        Err(UninstallError::Open(_)) => EXIT_PRECONDITION,
+        Err(UninstallError::NotInstalled | UninstallError::Open(_)) => EXIT_PRECONDITION,
         Err(_) => EXIT_FAILED,
     }
 }
@@ -1109,6 +1109,15 @@ fn grant_service_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
         Ok(ServiceAclOutcome::Added) => {
             out(out_line(&format!(
                 "サービス '{SERVICE_NAME}' の DACL に '{}' の ACE（{}: 照会・開始・停止）を足しました",
+                OPERATORS_GROUP.name,
+                banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
+            )));
+            EXIT_OK
+        }
+        // 同じ相手の別の権利の ACE（手で付けた広い権利など）を、既定の権利に置き換えた。
+        Ok(ServiceAclOutcome::Replaced) => {
+            out(out_line(&format!(
+                "サービス '{SERVICE_NAME}' の DACL の '{}' の ACE を、既定の権利（{}: 照会・開始・停止）に置き換えました",
                 OPERATORS_GROUP.name,
                 banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
             )));

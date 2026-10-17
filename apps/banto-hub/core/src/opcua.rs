@@ -21,11 +21,6 @@
 //!   ただし `apply` が `stopped`（や次の `starting`）を返した時点では、古い
 //!   起動が開いた listener がまだ閉じ終わっていないことがある（古い起動
 //!   タスクが起動を終えてから閉じる）。次の bind はその後始末を待つ。
-//!   なお、起動タスクが `previous`（前の起動タスク）を待つ**前**に panic すると、
-//!   `previous` の `JoinHandle` は捨てられるだけで、次の起動が前の起動の後始末を
-//!   待つ鎖はそこで切れる。実害はほぼ無い（panic しうるのはほぼ
-//!   `OpcUaServer::start` で、`spawn_blocking` の `JoinError` として受けている）
-//!   ので、鎖を保つ作りにはしていない（#654 Nit 2）。
 //! - **終了**: [`OpcUaPublisher::shutdown`] は世代を進めて起動中のタスクの
 //!   終わりを待つ。起動しかけの listener を Hub の終了後に残さない。
 //! - ロックの順序: 起動タスクは `OpcUaServer::start` を待つ間 `inner` の

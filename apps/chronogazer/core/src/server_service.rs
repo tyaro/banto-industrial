@@ -656,9 +656,9 @@ pub fn uninstall_lines(
             )),
             ConsoleLine::Stderr(format!("{SERVER_LABEL}:   {ELEVATION_HINT}")),
         ],
-        // 未登録（ERROR_SERVICE_DOES_NOT_EXIST = 1060）は日本語で案内する。OS の理由（英語の
-        // ことがある）を出すのは、それ以外（権限不足など）だけ。
-        Err(UninstallError::Open(err)) if err.contains("os error 1060") => {
+        // 未登録（ERROR_SERVICE_DOES_NOT_EXIST = 1060）は型で分かれ、日本語で案内する。OS の
+        // 理由（英語のことがある）を出すのは、それ以外（権限不足など）だけ。
+        Err(UninstallError::NotInstalled) => {
             vec![ConsoleLine::Stderr(format!(
                 "{SERVER_LABEL}: サービス '{SERVICE_NAME}' は登録されていません（解除するものがありません）"
             ))]
@@ -1348,18 +1348,16 @@ mod tests {
                 err("chronogazer-server:   管理者として実行した PowerShell から実行するか、同じフォルダの chronogazer-elev.exe（UAC で昇格します）を使ってください"),
             ]
         );
-        // 未登録（1060）は日本語の案内にする（OS の英語の理由は出さない。#628）。OS の文言と
-        // 番号つきの形（`uninstall_service` が返す形）も同じ。
-        for reason in [
-            "os error 1060",
-            "The specified service does not exist as an installed service. (os error 1060)",
-        ] {
-            assert_eq!(
-                uninstall_lines(&Err(UninstallError::Open(reason.to_string())), &root()),
-                vec![err("chronogazer-server: サービス 'ChronoGazer' は登録されていません（解除するものがありません）")],
-                "{reason}"
-            );
-        }
+        // 未登録は日本語の案内にする（OS の英語の理由は出さない。#628）。
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::NotInstalled), &root()),
+            vec![err("chronogazer-server: サービス 'ChronoGazer' は登録されていません（解除するものがありません）")]
+        );
+        // 文字列に 1060 と書いてあっても、型が Open なら未登録の扱いにしない（文字列を解析しない）。
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::Open("os error 1060".to_string())), &root()),
+            vec![err("chronogazer-server: サービス 'ChronoGazer' を開けません（権限がないか、サービスの状態を確かめられません）: os error 1060")]
+        );
         // それ以外の理由（権限不足など）は OS の理由を添える。
         assert_eq!(
             uninstall_lines(&Err(UninstallError::Open("Access is denied. (os error 5)".to_string())), &root()),

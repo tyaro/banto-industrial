@@ -43,6 +43,7 @@ export class OpcUaStatusPoller {
 	/** 画面を開いたとき。止めていた状態を戻して、いますぐ読み直す。 */
 	start(): Promise<void> {
 		this.stopped = false;
+		this.retriedInitial = false;
 		return this.refresh();
 	}
 

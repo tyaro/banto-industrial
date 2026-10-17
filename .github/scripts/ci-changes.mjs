@@ -50,6 +50,9 @@ import { fileURLToPath } from 'node:url';
 /** 共有 crate の置き場の前置き（RULES・`touchesCrates`・`owningPackage` が共有する）。 */
 export const CRATES_PREFIX = 'crates/';
 
+/** 文字列を正規表現のリテラルとして使うためのエスケープ。 */
+const escapeRegExp = (/** @type {string} */ text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /** 領域フラグ。`full` はすべてを走らせる。 */
 export const AREAS = [
 	'full',
@@ -76,7 +79,7 @@ export const RULES = [
 	{ re: /^\.gitattributes$/, areas: ['full'], why: '改行・属性（全ファイルに効く）' },
 
 	// --- 共有 crate（依存グラフで、そのパッケージと逆依存に絞る。`classify()` 参照）
-	{ re: new RegExp('^' + CRATES_PREFIX), areas: ['crates'], why: '共有 crate' },
+	{ re: new RegExp('^' + escapeRegExp(CRATES_PREFIX)), areas: ['crates'], why: '共有 crate' },
 
 	// --- Rust workspace 全体
 	// proto/** は banto-hub-core の build.rs が読む。.cargo/** は cargo 設定、

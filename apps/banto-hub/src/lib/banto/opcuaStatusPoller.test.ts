@@ -118,7 +118,12 @@ describe('OPC UA の状態の読み直し（#634、PR #650 の Codex P2）', () 
 			async () => {
 				throw new Error('boom again');
 			},
-			async () => status('running')
+			async () => {
+				throw new Error('boom after start');
+			},
+			async () => {
+				throw new Error('boom after start again');
+			}
 		];
 		const load = vi.fn(() => responses.shift()!());
 		const onError = vi.fn();
@@ -133,5 +138,13 @@ describe('OPC UA の状態の読み直し（#634、PR #650 の Codex P2）', () 
 		// 読み直しは 1 回だけ（失敗が続いても叩き続けない）。
 		await vi.advanceTimersByTimeAsync(10000);
 		expect(load).toHaveBeenCalledTimes(2);
+
+		// 画面を開き直す（start）と、また 1 回は読み直す。
+		await poller.start();
+		expect(load).toHaveBeenCalledTimes(3);
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(load).toHaveBeenCalledTimes(4);
+		await vi.advanceTimersByTimeAsync(10000);
+		expect(load).toHaveBeenCalledTimes(4);
 	});
 });

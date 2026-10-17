@@ -294,6 +294,9 @@ fn uninstall_lines(result: &Result<UninstallOutcome, UninstallError>) -> Vec<Con
         Err(UninstallError::Connect(err)) => fail_lines(format!(
             "{LABEL}: Service Control Manager への接続に失敗しました: {err}"
         )),
+        Err(UninstallError::NotInstalled) => fail_lines(format!(
+            "{LABEL}: サービス '{SERVICE_NAME}' は登録されていません"
+        )),
         Err(UninstallError::Open(err)) => fail_lines(format!(
             "{LABEL}: サービス '{SERVICE_NAME}' を開けませんでした: {err}"
         )),
@@ -640,9 +643,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            uninstall_lines(&Err(UninstallError::Open("os error 1060".to_string()))),
+            uninstall_lines(&Err(UninstallError::NotInstalled)),
             vec![
-                err("banto-hub-sink: サービス 'BantoHubSink' を開けませんでした: os error 1060"),
+                err("banto-hub-sink: サービス 'BantoHubSink' は登録されていません"),
+                err(ADMIN),
+            ]
+        );
+        assert_eq!(
+            uninstall_lines(&Err(UninstallError::Open("os error 5".to_string()))),
+            vec![
+                err("banto-hub-sink: サービス 'BantoHubSink' を開けませんでした: os error 5"),
                 err(ADMIN),
             ]
         );
