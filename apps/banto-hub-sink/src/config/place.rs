@@ -14,7 +14,8 @@
 //!   `BANTO_HUB_ROOT` には追従しない。
 //! - **コンソールの `run`**（[`RunMode::Console`]、開発・利用者として動かす形）:
 //!   [`super::ENV_CONFIG_PATH`] があればそのファイル（絶対パスに限る）、無ければ上と同じ。
-//!   環境変数で指したファイルにも**同じ保護の確かめ**をかける。
+//!   環境変数で指したファイルにも**同じ保護の確かめ**をかける。`BANTO_HUB_SINK_CONFIG` を
+//!   指していても、旧い置き場に toml があれば止まる（移行を強制するため。#655 のレビュー Nit 1）。
 //! - 旧い置き場（ルート直下の `banto-hub-sink.toml` と exe の隣）は読まない。そこに
 //!   ファイルがあれば（辿らずに見るだけ）、移し方とキーの失効・再発行を案内して起動しない。
 //!   旧いファイルを消したり動かしたりはしない。
@@ -213,7 +214,8 @@ impl Problem {
     }
 }
 
-/// [`Exposure`] の文言（純関数）。
+/// [`Exposure`] の文言（純関数）。banto-hub-core の `sink_config_prepare::exposure_text`
+/// （`banto-hub-elev prepare-sink-config`）と文言を揃える（片方を直したらもう一方も）。
 pub fn exposure_text(found: &Exposure) -> String {
     match found {
         Exposure::ReparsePoint => {

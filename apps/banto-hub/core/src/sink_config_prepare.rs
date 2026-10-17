@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use banto_secret_store::acl::guard::{
     self, DataAclRefusal, DirState, KnownFolders, MachineEnvironment, RealPathRefusal,
 };
-use banto_secret_store::acl::{Exposure, FileSecurity, PinnedDirInfo};
+use banto_secret_store::acl::{exposure, Exposure, FileSecurity, PinnedDirInfo};
 use banto_secret_store::InstallUserSid;
 use banto_service_control::ConsoleLine;
 
@@ -88,6 +88,7 @@ fn err_line(text: &str) -> ConsoleLine {
 }
 
 /// [`Exposure`] の文言（純関数。`SecretStoreError::Exposed` の Debug の表記を出さないため）。
+/// banto-hub-sink の `config::place::exposure_text` と文言を揃える（片方を直したらもう一方も）。
 pub fn exposure_text(found: &Exposure) -> String {
     match found {
         Exposure::ReparsePoint => {
@@ -132,6 +133,9 @@ pub trait SinkDir {
     fn info(&self) -> PinnedDirInfo;
     /// 本当のパス。
     fn final_path(&self) -> PathBuf;
+    /// 開いたハンドルから読んだ属性・所有者・DACL（整える前に、ほかの利用者へ開いていたかを
+    /// 見るため。#655 のレビュー Should 1）。
+    fn security(&self) -> Result<FileSecurity, String>;
     /// このフォルダそのものに、SYSTEM・Administrators だけの保護された DACL と所有者
     /// Administrators をハンドルで書く（中の子へは伝えない - `Recurse::ObjectOnly`）。
     fn reset_service_only(&self) -> Result<(), String>;
@@ -424,17 +428,102 @@ fn open_checked_file<O: SinkConfigOps>(
     }
 }
 
+/// 旧い置き場（ルート直下・exe の隣）の設定ファイルを知らせる行（辿らずに見るだけ。触らない）。
+fn legacy_notice<O: SinkConfigOps>(ops: &O, root: &Path, sink_path: &Path) -> Vec<ConsoleLine> {
+    let mut legacy = vec![root.join(CONFIG_FILE)];
+    if let Some(dir) = ops.exe_dir() {
+        legacy.push(dir.join(CONFIG_FILE));
+    }
+    let mut lines = Vec::new();
+    for path in legacy {
+        match ops.exists(&path) {
+            Ok(true) => lines.push(err_line(&format!(
+                "警告: 旧い置き場に設定ファイル {} があります。sink はこれを読まず、残っている間は起動しません。新しい置き場（{}）で .example をコピーして作り直し（旧いファイルを移動しないでください）、Hub でキーを失効・再発行してから、旧いファイルを消してください（このコマンドは旧いファイルに触りません）",
+                path.display(),
+                sink_path.join(CONFIG_FILE).display()
+            ))),
+            Ok(false) => {}
+            Err(error) => lines.push(err_line(&format!(
+                "警告: 旧い置き場 {} に設定ファイルがあるかを確かめられませんでした: {error}",
+                path.display()
+            ))),
+        }
+    }
+    lines
+}
+
+/// `exposure` のうち「ほかの利用者へ開いていた」ことを示す理由（純関数。#655 のレビュー
+/// Should 1）: SYSTEM・Administrators 以外への許可・null DACL・種類の分からない ACE・SID を
+/// 読めない ACE。所有者・リンクは含めない（所有者は別に扱い、リンクは別に断る）。
+pub fn opened_reasons(found: &[Exposure]) -> Vec<Exposure> {
+    found
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Exposure::AllowsOther { .. }
+                    | Exposure::NullDacl
+                    | Exposure::UnknownAce { .. }
+                    | Exposure::UnreadableSid { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// 本物の設定ファイルを整え直さずに断るか（純関数。#655 のレビュー Should 1）。断るなら理由の
+/// 文言を返す。
+///
+/// 規則: 置き場が開いていなかった**かつ**設定ファイルの `exposure` が `ForeignOwner` だけ
+/// （か空）なら整え直す（別の管理者がメモ帳で編集した場合 - オーナー決定 その 2）。置き場が
+/// ほかの利用者へ開いていた（[`opened_reasons`]）、または設定ファイルに `ForeignOwner` 以外の
+/// 理由が 1 つでもあれば断る。所有者が「ほかの管理者」かどうかは SID から見分けない（グループの
+/// 入れ子・ドメインの利用者で確かでないため）。保護された置き場の中に新しくファイルを作れるのは
+/// SYSTEM・Administrators だけで、外から移動したファイルは元の DACL（ほかの利用者への許可）を
+/// 持ってくるので、そちらは `AllowsOther` で断る側に入る。
+pub fn config_refusal(sink_was_open: &[Exposure], file_exposure: &[Exposure]) -> Option<String> {
+    let mut reasons: Vec<String> = sink_was_open
+        .iter()
+        .map(|found| format!("置き場: {}", exposure_text(found)))
+        .collect();
+    reasons.extend(
+        file_exposure
+            .iter()
+            .filter(|found| !matches!(found, Exposure::ForeignOwner(_)))
+            .map(|found| format!("設定ファイル: {}", exposure_text(found))),
+    );
+    if reasons.is_empty() {
+        return None;
+    }
+    // 開いていた形跡があるときは、所有者も手がかりとして並べる。
+    reasons.extend(
+        file_exposure
+            .iter()
+            .filter(|found| matches!(found, Exposure::ForeignOwner(_)))
+            .map(|found| format!("設定ファイル: {}", exposure_text(found))),
+    );
+    Some(reasons.join("・"))
+}
+
 /// `prepare-sink-config` の本体（モジュール doc「設計意図」）。
 pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<(), Refused> {
     let plan = preflight(ops, out)?;
     let mut created = Created::default();
+    let root_label = "Hub のルート";
+    let sink_label = "設定ファイルの置き場";
+    let sink_path = plan.root.join(SINK_DIR);
+
+    // 旧い置き場（知らせるだけ。触らない）。辿らずに見るだけなので確かめの最初に調べ、
+    // 断ったときにも出す（#655 のレビュー Nit 2）。
+    let legacy_lines = legacy_notice(ops, &plan.root, &sink_path);
     let refuse = |out: Out<'_>, created: &Created, text: String| {
         out(err_line(&text));
         created.notice(out);
+        for line in &legacy_lines {
+            out(line.clone());
+        }
         Err(Refused)
     };
-    let root_label = "Hub のルート";
-    let sink_label = "設定ファイルの置き場";
 
     // --- ルート（辿らずに開く。無ければ親を確かめてから、親のハンドル基準で作る） ------
     let mut root_parent: Option<O::Dir> = None;
@@ -525,7 +614,6 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
     }
 
     // --- 置き場（確かめ済みのルートのハンドル基準。無ければ保護された DACL で作る） -------
-    let sink_path = plan.root.join(SINK_DIR);
     let opened = match ops.open_child_dir(&root, SINK_DIR) {
         Ok(Some(sink)) => Ok((sink, false)),
         Ok(None) => create_or_open(ops, &root, SINK_DIR, CreateHow::ServiceOnly),
@@ -561,38 +649,52 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
         );
     }
 
+    // 整える前に、置き場がほかの利用者へ開いていたか（#655 のレビュー Should 1）。今作った
+    // 置き場は作るのと同時に保護しているので見ない。
+    let sink_was_open = if sink_created {
+        Vec::new()
+    } else {
+        match sink.security() {
+            Ok(security) => opened_reasons(&exposure(&security)),
+            Err(error) => {
+                return refuse(
+                    out,
+                    &created,
+                    format!(
+                        "{sink_label}（{}）の ACL を読めませんでした: {error}",
+                        sink_path.display()
+                    ),
+                )
+            }
+        }
+    };
+
     // --- 中のファイル（置き場のハンドル基準。辿らない） --------------------------------
     let config = match open_checked_file(ops, &sink, &sink_real, CONFIG_FILE, "設定ファイル", false)
     {
         Ok(found) => found,
         Err(text) => return refuse(out, &created, text),
     };
+    // 設定ファイルが、ほかの利用者の用意したもの・ほかの利用者に開いていたものでありうるなら
+    // 断る（#655 のレビュー Should 1）。所有者だけが違う（別の管理者がメモ帳で編集した）なら
+    // 整え直す（オーナー決定 その 2）。
+    if let Some(file) = &config {
+        if let Some(reasons) = config_refusal(&sink_was_open, &exposure(&file.security())) {
+            return refuse(
+                out,
+                &created,
+                format!(
+                    "設定ファイル（{}）は、整える前にほかの利用者が用意した・読めた恐れがあります（{reasons}）。何も変えずに止めます。中身を確かめ、設定ファイルを消して、置き場の中の {EXAMPLE_FILE} から作り直してから、もう一度実行してください。キーはほかの利用者に読まれた恐れがあるので、Hub で失効し、新しいキーを発行して書いてください",
+                    sink_path.join(CONFIG_FILE).display()
+                ),
+            );
+        }
+    }
     // `.example` はリンク・ハードリンクでも、そのものを消して作り直すだけ（先は辿らない）。
     let example = match open_checked_file(ops, &sink, &sink_real, EXAMPLE_FILE, "雛形", true) {
         Ok(found) => found,
         Err(text) => return refuse(out, &created, text),
     };
-
-    // 旧い置き場（知らせるだけ。触らない）。
-    let mut legacy = vec![plan.root.join(CONFIG_FILE)];
-    if let Some(dir) = ops.exe_dir() {
-        legacy.push(dir.join(CONFIG_FILE));
-    }
-    let mut legacy_lines = Vec::new();
-    for path in legacy {
-        match ops.exists(&path) {
-            Ok(true) => legacy_lines.push(err_line(&format!(
-                "警告: 旧い置き場に設定ファイル {} があります。sink はこれを読まず、残っている間は起動しません。新しい置き場（{}）で .example をコピーして作り直し（旧いファイルを移動しないでください）、Hub でキーを失効・再発行してから、旧いファイルを消してください（このコマンドは旧いファイルに触りません）",
-                path.display(),
-                sink_path.join(CONFIG_FILE).display()
-            ))),
-            Ok(false) => {}
-            Err(error) => legacy_lines.push(err_line(&format!(
-                "警告: 旧い置き場 {} に設定ファイルがあるかを確かめられませんでした: {error}",
-                path.display()
-            ))),
-        }
-    }
 
     // --- ここから書く ------------------------------------------------------------------
     if let Err(error) = sink.reset_service_only() {
@@ -614,6 +716,13 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
             "所有者と ACL を整えました"
         }
     )));
+    if !sink_was_open.is_empty() {
+        let reasons: Vec<String> = sink_was_open.iter().map(exposure_text).collect();
+        out(err_line(&format!(
+            "警告: 整える前は、ほかの利用者が{sink_label}の中に書けました（{}）。中に心当たりの無いファイルが無いか確かめてください",
+            reasons.join("・")
+        )));
+    }
 
     let config_path = sink_path.join(CONFIG_FILE);
     match &config {
@@ -624,11 +733,14 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
                 || owner == banto_secret_store::acl::TRUSTED_INSTALLER_SID
                 || Some(owner.as_str()) == elevated;
             if let Err(error) = file.reset_acl() {
-                out(err_line(&format!(
-                    "設定ファイル（{}）の所有者と ACL を書けませんでした: {error}",
-                    config_path.display()
-                )));
-                return Err(Refused);
+                return refuse(
+                    out,
+                    &Created::default(),
+                    format!(
+                        "設定ファイル（{}）の所有者と ACL を書けませんでした: {error}",
+                        config_path.display()
+                    ),
+                );
             }
             out(out_line(&format!(
                 "設定ファイル（{}）: 所有者と ACL を整えました（中身は読んでいません・変えていません）",
@@ -650,11 +762,14 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
     let example_path = sink_path.join(EXAMPLE_FILE);
     if let Some(file) = example {
         if let Err(error) = file.delete() {
-            out(err_line(&format!(
-                "雛形（{}）を消せませんでした: {error}",
-                example_path.display()
-            )));
-            return Err(Refused);
+            return refuse(
+                out,
+                &Created::default(),
+                format!(
+                    "雛形（{}）を消せませんでした: {error}",
+                    example_path.display()
+                ),
+            );
         }
     }
     match ops.create_child_file(&sink, EXAMPLE_FILE, &plan.example) {
@@ -663,22 +778,28 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
             example_path.display()
         ))),
         Ok(false) => {
-            out(err_line(&format!(
-                "雛形（{}）を作ろうとしたら既にありました（消した直後に誰かが作った・まだ消えていない）。もう一度実行してください",
-                example_path.display()
-            )));
-            return Err(Refused);
+            return refuse(
+                out,
+                &Created::default(),
+                format!(
+                    "雛形（{}）を作ろうとしたら既にありました（消した直後に誰かが作った・まだ消えていない）。もう一度実行してください",
+                    example_path.display()
+                ),
+            );
         }
         Err(error) => {
-            out(err_line(&format!(
-                "雛形（{}）を作れませんでした: {error}",
-                example_path.display()
-            )));
-            return Err(Refused);
+            return refuse(
+                out,
+                &Created::default(),
+                format!(
+                    "雛形（{}）を作れませんでした: {error}",
+                    example_path.display()
+                ),
+            );
         }
     }
-    for line in legacy_lines {
-        out(line);
+    for line in &legacy_lines {
+        out(line.clone());
     }
     // 開いた順の逆に閉じる。
     drop(sink);

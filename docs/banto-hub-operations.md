@@ -1762,7 +1762,11 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- targe
      置き場 `%ProgramData%\BantoHub\sink\` を、確かめ終えてから SYSTEM・
      Administrators だけ・所有者 Administrators の保護された ACL で作ります
      （あれば整えます）。中に本物の `banto-hub-sink.toml` があれば所有者と ACL を
-     整え直し（中身は読まない・変えない）、`banto-hub-sink.toml.example` を
+     整え直し（中身は読まない・変えない。ただし、整える前に置き場や設定ファイルが
+     ほかの利用者へ開いていた - 手で作った `sink\` に一般の利用者が置いた・外から
+     移動した - なら、何も変えずに断ります。中身を確かめて設定ファイルを消し、
+     `.example` から作り直し、キーを失効・再発行してください。所有者だけが別の
+     管理者のときは整え直して警告を出します）、`banto-hub-sink.toml.example` を
      **インストールのたびに差し替えます**（#630、2026-10-17）。一般の利用者が先に
      作った `sink\`（所有者が SYSTEM・Administrators・実行した管理者以外）は、
      何も変えずに断ります。そのときは所有者を取り直さず、中身を確かめてから

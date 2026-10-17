@@ -25,6 +25,10 @@ impl SinkDir for PinnedDir {
         PinnedDir::final_path(self).to_path_buf()
     }
 
+    fn security(&self) -> Result<FileSecurity, String> {
+        PinnedDir::security(self).map_err(|err| secret_error_text(&err))
+    }
+
     fn reset_service_only(&self) -> Result<(), String> {
         PinnedDir::reset_acl(self, &DirAccess::service_only(), Recurse::ObjectOnly)
             .map(|_| ())

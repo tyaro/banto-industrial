@@ -8,7 +8,8 @@ use std::rc::Rc;
 
 use banto_secret_store::acl::guard::{KnownFolders, MachineEnvironment};
 use banto_secret_store::acl::{
-    Exposure, FileSecurity, ObservedDacl, PinnedDirInfo, ADMINISTRATORS_SID, SYSTEM_SID,
+    Exposure, FileSecurity, ObservedAce, ObservedDacl, PinnedDirInfo, ADMINISTRATORS_SID,
+    SYSTEM_SID,
 };
 use banto_secret_store::InstallUserSid;
 use banto_service_control::ConsoleLine;
@@ -73,6 +74,8 @@ struct DirEntry {
     is_reparse_point: bool,
     real: Option<PathBuf>,
     reset: Result<(), String>,
+    /// 今の DACL の ACE（既定は空 = ほかの利用者へは開いていない）。
+    aces: Vec<ObservedAce>,
 }
 
 impl DirEntry {
@@ -83,7 +86,35 @@ impl DirEntry {
             is_reparse_point: false,
             real: None,
             reset: Ok(()),
+            aces: Vec::new(),
         }
+    }
+
+    /// `%ProgramData%` から継承した形（`Users` のファイル作成・`CREATOR OWNER` のフル）。
+    fn inherited_open(owner: &str) -> Self {
+        let mut entry = Self::owned_by(owner);
+        entry.aces = vec![users_ace(0x0000_0116, 0x12), creator_owner_ace()];
+        entry
+    }
+}
+
+const USERS: &str = "S-1-5-32-545";
+
+fn users_ace(mask: u32, flags: u8) -> ObservedAce {
+    ObservedAce {
+        ace_type: 0,
+        flags,
+        mask,
+        sid: USERS.to_string(),
+    }
+}
+
+fn creator_owner_ace() -> ObservedAce {
+    ObservedAce {
+        ace_type: 0,
+        flags: 0x1B,
+        mask: 0x1F01FF,
+        sid: "S-1-3-0".to_string(),
     }
 }
 
@@ -137,6 +168,18 @@ impl SinkDir for FakeDir {
     }
     fn final_path(&self) -> PathBuf {
         self.entry.real.clone().unwrap_or_else(|| self.path.clone())
+    }
+    fn security(&self) -> Result<FileSecurity, String> {
+        Ok(FileSecurity {
+            is_dir: self.entry.is_dir,
+            is_reparse_point: self.entry.is_reparse_point,
+            links: 1,
+            dacl: ObservedDacl {
+                protected: self.entry.aces.is_empty(),
+                owner: self.entry.owner.clone(),
+                aces: Some(self.entry.aces.clone()),
+            },
+        })
     }
     fn reset_service_only(&self) -> Result<(), String> {
         self.log
@@ -380,12 +423,13 @@ fn checks_everything_before_the_first_write() {
     assert_eq!(
         ops.calls(),
         vec![
+            // 旧い置き場は確かめの最初に見る（断ったときにも知らせるため。読むだけ）。
+            format!("exists {}", root().join(CONFIG_FILE).display()),
+            format!("exists {}", exe_dir().join(CONFIG_FILE).display()),
             "pin BantoHub".to_string(),
             "open_dir sink".to_string(),
             format!("open_file {CONFIG_FILE}"),
             format!("open_file {EXAMPLE_FILE}"),
-            format!("exists {}", root().join(CONFIG_FILE).display()),
-            format!("exists {}", exe_dir().join(CONFIG_FILE).display()),
             "WRITE reset_dir sink".to_string(),
             format!("WRITE reset_file {CONFIG_FILE}"),
             format!("WRITE delete {EXAMPLE_FILE}"),
@@ -412,7 +456,8 @@ fn creates_a_missing_root_and_place_relative_to_the_checked_parent() {
     let (result, lines) = run(&ops);
     assert_eq!(result, Ok(()), "{lines:#?}");
     assert_eq!(
-        ops.calls()[..5],
+        // 最初の 2 つは旧い置き場の確かめ（読むだけ）。
+        ops.calls()[2..7],
         [
             "pin BantoHub".to_string(),
             "pin ProgramData".to_string(),
@@ -733,4 +778,160 @@ fn foreign_owner_wording_differs_by_level() {
         )
     );
     assert!(!sink_text.contains("takeown"), "{sink_text}");
+}
+
+// --- 整える前に開いていたか（#655 のレビュー Should 1） ------------------------------
+
+const OTHER_ADMIN: &str = "S-1-5-21-1-2-3-1500";
+
+/// 管理者が手で作った（継承の DACL の）`sink\` に、一般の利用者が先に置いた設定ファイルは、
+/// 整え直さずに断る（何も書かない・失効の案内）。
+#[test]
+fn a_config_planted_in_an_open_place_is_refused() {
+    let mut ops = FakeOps::new();
+    ops.set_dir(sink(), DirEntry::inherited_open(ADMINISTRATORS_SID));
+    let file = ops.file_mut(CONFIG_FILE);
+    file.security.dacl.owner = EVIL.to_string();
+    file.security.dacl.aces = Some(vec![
+        ObservedAce {
+            ace_type: 0,
+            flags: 0x10,
+            mask: 0x1F01FF,
+            sid: EVIL.to_string(),
+        },
+        users_ace(0x1200A9, 0x10),
+    ]);
+    let (result, lines) = run(&ops);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(
+        has(&lines, "ほかの利用者が用意した・読めた恐れ"),
+        "{lines:#?}"
+    );
+    assert!(has(&lines, "失効"), "{lines:#?}");
+    assert!(has(&lines, EVIL), "所有者も手がかりに出す: {lines:#?}");
+    assert!(ops.writes().is_empty(), "{:?}", ops.calls());
+}
+
+/// 置き場は保護されていても、設定ファイルがほかの利用者に開いていた（外から移動した）なら断る。
+#[test]
+fn a_config_open_to_others_is_refused_even_in_a_protected_place() {
+    let mut ops = FakeOps::new();
+    ops.file_mut(CONFIG_FILE)
+        .security
+        .dacl
+        .aces
+        .as_mut()
+        .unwrap()
+        .push(users_ace(0x1200A9, 0x10));
+    let (result, lines) = run(&ops);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(has(&lines, USERS), "{lines:#?}");
+    assert!(ops.writes().is_empty(), "{:?}", ops.calls());
+}
+
+/// `sink\` だけが開いていて、設定ファイルが無ければ、整えたうえで知らせる。
+#[test]
+fn an_open_place_without_a_config_is_fixed_with_a_notice() {
+    let mut ops = FakeOps::new();
+    ops.set_dir(sink(), DirEntry::inherited_open(ADMINISTRATORS_SID));
+    ops.files.remove(&sink().join(CONFIG_FILE));
+    let (result, lines) = run(&ops);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops.calls().contains(&"WRITE reset_dir sink".to_string()));
+    assert!(
+        has(
+            &lines,
+            "整える前は、ほかの利用者が設定ファイルの置き場の中に書けました"
+        ),
+        "{lines:#?}"
+    );
+}
+
+/// 所有者だけが別の管理者（置き場は保護、ファイルの理由は所有者だけ）なら、整え直して警告する
+/// （オーナー決定 その 2）。
+#[test]
+fn a_config_owned_by_another_admin_is_fixed_with_a_warning() {
+    let mut ops = FakeOps::new();
+    ops.file_mut(CONFIG_FILE).security.dacl.owner = OTHER_ADMIN.to_string();
+    let (result, lines) = run(&ops);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops
+        .calls()
+        .contains(&format!("WRITE reset_file {CONFIG_FILE}")));
+    assert!(
+        has(&lines, &format!("所有者は {OTHER_ADMIN} でした")),
+        "{lines:#?}"
+    );
+    assert!(!has(&lines, "書けました"), "{lines:#?}");
+}
+
+/// 断る規則の表（純関数）。
+#[test]
+fn config_refusal_table() {
+    let owner = Exposure::ForeignOwner(OTHER_ADMIN.to_string());
+    let allows = Exposure::AllowsOther {
+        ace_type: 0,
+        flags: 0,
+        mask: 0x1200A9,
+        sid: USERS.to_string(),
+    };
+    let unknown = Exposure::UnknownAce {
+        ace_type: 99,
+        flags: 0,
+        mask: 1,
+    };
+    let cases: Vec<(&str, Vec<Exposure>, Vec<Exposure>, bool)> = vec![
+        ("何も無い", vec![], vec![], false),
+        ("所有者だけ", vec![], vec![owner.clone()], false),
+        ("置き場が開いていた", vec![allows.clone()], vec![], true),
+        (
+            "置き場が開いていた・所有者",
+            vec![allows.clone()],
+            vec![owner.clone()],
+            true,
+        ),
+        ("置き場の null DACL", vec![Exposure::NullDacl], vec![], true),
+        ("ファイルが開いていた", vec![], vec![allows.clone()], true),
+        (
+            "ファイルの分からない ACE",
+            vec![],
+            vec![unknown.clone()],
+            true,
+        ),
+        (
+            "ファイルの null DACL",
+            vec![],
+            vec![Exposure::NullDacl, owner.clone()],
+            true,
+        ),
+    ];
+    for (name, sink_open, file, refuse) in cases {
+        assert_eq!(
+            config_refusal(&sink_open, &file).is_some(),
+            refuse,
+            "{name}"
+        );
+    }
+    // 置き場の理由として拾うのは、開いていた形跡だけ（所有者・リンクは拾わない）。
+    assert_eq!(
+        opened_reasons(&[
+            owner.clone(),
+            Exposure::ReparsePoint,
+            allows.clone(),
+            unknown.clone()
+        ]),
+        vec![allows, unknown]
+    );
+}
+
+/// 断ったときも、旧い置き場の知らせを出す（#655 のレビュー Nit 2）。
+#[test]
+fn a_refusal_also_reports_the_legacy_config() {
+    let ops = FakeOps::new();
+    ops.set_dir(root(), DirEntry::owned_by(EVIL));
+    let mut ops = ops;
+    ops.existing.insert(root().join(CONFIG_FILE), Ok(true));
+    let (result, lines) = run(&ops);
+    assert_eq!(result, Err(Refused));
+    assert!(has(&lines, "旧い置き場に設定ファイル"), "{lines:#?}");
 }
