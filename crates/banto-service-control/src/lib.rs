@@ -446,10 +446,9 @@ mod windows_impl {
 
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
-    /// Win32 エラーコード（`ERROR_SERVICE_DOES_NOT_EXIST`）- サービス未登録
-    /// の判定に使う。`windows-sys`の対応する定数へ依存を増やさず、
-    /// 文書化された固定値をそのまま使う。
-    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    // `ERROR_SERVICE_DOES_NOT_EXIST`（サービス未登録の判定）は 1 か所に定義した
+    // `crate::install` のものを使う（#658。三つに散らばっていた）。
+    use crate::ERROR_SERVICE_DOES_NOT_EXIST;
     /// Win32 エラーコード（`ERROR_ACCESS_DENIED`）。
     const ERROR_ACCESS_DENIED: i32 = 5;
 

@@ -1261,6 +1261,16 @@ fn grant_service_acl_exit_codes() {
         stdout("chronogazer-elev: サービス 'ChronoGazer' の DACL の 'ChronoGazer Operators' の ACE を、既定の権利（CCLCRPWP: 照会・開始・停止）に置き換えました")
     );
 
+    // ACE は既にあるが並びが正規でなかった。「足しました」とは言わない（#658）。
+    let mut reordered = Fake::new();
+    reordered.service_acl = Ok(ServiceAclOutcome::Reordered);
+    let (code, lines) = exec(Action::GrantServiceAcl, &reordered);
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(
+        lines[0],
+        stdout("chronogazer-elev: サービス 'ChronoGazer' の DACL には 'ChronoGazer Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）")
+    );
+
     // 2 回目: ACE は既にある。「足しました」とは言わない（#628）。
     let mut again = Fake::new();
     again.service_acl = Ok(ServiceAclOutcome::AlreadyPresent);
@@ -1459,6 +1469,10 @@ fn service_uninstall_keeps_the_group_and_the_data() {
         lines[0],
         stderr("chronogazer-elev: サービス 'ChronoGazer' は登録されていません（解除するものがありません）")
     );
+    // 開けなかった（権限不足など）は前提不足ではなく失敗（service-install を先にしても直らない。#658）。
+    let mut fake = Fake::new();
+    fake.uninstall = Err(UninstallError::Open("os error 5".to_string()));
+    assert_eq!(exec(Action::ServiceUninstall, &fake).0, EXIT_FAILED);
     let mut fake = Fake::new();
     fake.uninstall = Err(UninstallError::Delete {
         stop: StopAttempt::NotRunning,

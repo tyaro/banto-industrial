@@ -587,10 +587,10 @@ pub fn setup_operators(user: Option<&str>) -> Result<(), ElevatedError> {
 /// [`ElevatedAction::GrantServiceAcl`]の本体（`BantoHub`固定）。モジュール
 /// doc「SDDL」節参照 - [`grant_service_acl_for`]の薄いラッパー（モジュール
 /// doc「S6 申し送りの follow-up」節参照）。`banto-hub-elev.exe
-/// grant-service-acl`（引数無し）はこの関数を呼ぶため、挙動は S6 以前と
-/// 1バイトも変えていない。
+/// grant-service-acl`（引数無し）はこの関数を呼ぶ。付ける ACE は S6 以前と同じ。
+/// 結果（足した・既にある など）を返し、呼び出し側が 1 行出す（#658）。
 #[cfg(windows)]
-pub fn grant_service_acl() -> Result<(), ElevatedError> {
+pub fn grant_service_acl() -> Result<banto_service_elev::ServiceAclOutcome, ElevatedError> {
     grant_service_acl_for(crate::service_manager::SERVICE_NAME)
 }
 
@@ -602,7 +602,9 @@ pub fn grant_service_acl() -> Result<(), ElevatedError> {
 /// 異なるだけで、ACE の中身（`BantoHub Operators`への
 /// query-config/query-status/start/stop のみ許可）は完全に同一。
 #[cfg(windows)]
-pub fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
+pub fn grant_service_acl_for(
+    service_name: &str,
+) -> Result<banto_service_elev::ServiceAclOutcome, ElevatedError> {
     windows_impl::grant_service_acl_for(service_name)
 }
 
@@ -621,6 +623,20 @@ pub fn grant_profile_acl(
     profile_grant::preflight(&ops, user, profile_id, &mut out)
         .and_then(|pre| profile_grant::grant_profile_acl(&ops, &pre, &mut out))
         .map_err(|_| ElevatedError::ProfileAclRefused(ElevatedAction::GRANT_PROFILE_ACL))
+}
+
+/// `grant-service-acl`の結果を利用者に出す 1 行にする（純関数。#658）。「足しました」は
+/// 実際に足したときだけ。2 回目以降（ACE が既にある）は「既にあります」、別の権利の ACE を
+/// 置き換えたときは「置き換えました」、ACE は既にあるが DACL の並びが正規でなかったときは
+/// 「整え直しました」と出し分ける。
+pub fn grant_service_acl_line(
+    service_name: &str,
+    outcome: banto_service_elev::ServiceAclOutcome,
+) -> banto_service_control::ConsoleLine {
+    let group = crate::service_operators::OPERATORS_GROUP.name;
+    let body = banto_service_elev::grant_service_acl_message(outcome, service_name, group);
+    let text = format!("banto-hub-elev: {body}");
+    banto_service_control::ConsoleLine::Stdout(text)
 }
 
 /// 行を標準出力・標準エラー出力へすぐ出す。
@@ -754,7 +770,12 @@ fn service_install_and_delegate() -> Result<(), ElevatedError> {
         || {
             crate::service_install::install(Some(&exe_path));
             setup_operators(None)?;
-            grant_service_acl()
+            let outcome = grant_service_acl()?;
+            print_line(grant_service_acl_line(
+                crate::service_manager::SERVICE_NAME,
+                outcome,
+            ));
+            Ok(())
         },
         &mut out,
     )
@@ -920,7 +941,10 @@ pub fn run(action: ElevatedAction, args: &[String]) -> Result<(), ElevatedError>
             if args.len() > 1 {
                 return Err(too_many_args(action, args.len(), "0〜1"));
             }
-            grant_service_acl_for(resolve_service_acl_target(args))
+            let service_name = resolve_service_acl_target(args);
+            let outcome = grant_service_acl_for(service_name)?;
+            print_line(grant_service_acl_line(service_name, outcome));
+            Ok(())
         }
         ElevatedAction::GrantProfileAcl => {
             if args.len() > 2 {
@@ -1182,9 +1206,10 @@ mod windows_impl {
     /// （グループの SID の解決 → SCM → 既存の DACL への`SET_ACCESS`のマージ →
     /// `SetServiceObjectSecurity`）は[`banto_service_elev::grant_service_operators`]
     /// へ移した。順序・付ける ACE は移す前のまま。
-    pub(super) fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
+    pub(super) fn grant_service_acl_for(
+        service_name: &str,
+    ) -> Result<banto_service_elev::ServiceAclOutcome, ElevatedError> {
         banto_service_elev::grant_service_operators(service_name, &OPERATORS_GROUP)
-            .map(|_| ())
             .map_err(map_elev_error)
     }
 }
@@ -1307,6 +1332,33 @@ mod tests {
                 "SDDL テンプレートに禁止権限 '{forbidden}' が含まれている"
             );
         }
+    }
+
+    /// #658: `grant-service-acl`の結果の 4 通りを出し分ける（「足しました」は足したときだけ）。
+    #[test]
+    fn grant_service_acl_line_distinguishes_the_outcomes() {
+        use banto_service_control::ConsoleLine;
+        use banto_service_elev::ServiceAclOutcome as O;
+        let line = |o| match grant_service_acl_line("BantoHub", o) {
+            ConsoleLine::Stdout(text) => text,
+            ConsoleLine::Stderr(text) => panic!("標準エラー出力になっている: {text}"),
+        };
+        assert_eq!(
+            line(O::Added),
+            "banto-hub-elev: サービス 'BantoHub' の DACL に 'BantoHub Operators' の ACE（CCLCRPWP: 照会・開始・停止）を足しました"
+        );
+        assert_eq!(
+            line(O::Replaced),
+            "banto-hub-elev: サービス 'BantoHub' の DACL の 'BantoHub Operators' の ACE を、既定の権利（CCLCRPWP: 照会・開始・停止）に置き換えました"
+        );
+        assert_eq!(
+            line(O::Reordered),
+            "banto-hub-elev: サービス 'BantoHub' の DACL には 'BantoHub Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）"
+        );
+        assert_eq!(
+            line(O::AlreadyPresent),
+            "banto-hub-elev: サービス 'BantoHub' の DACL には 'BantoHub Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（変更していません）"
+        );
     }
 
     /// [`resolve_service_acl_target`]（S6 申し送りの follow-up、モジュール

@@ -255,7 +255,7 @@ fn uninstall_lines(result: &Result<UninstallOutcome, UninstallError>) -> Vec<Con
             "{LABEL}: サービス '{SERVICE_NAME}' が見つかりません（既に未登録です）"
         ))],
         Err(UninstallError::Open(err)) => vec![ConsoleLine::Stderr(format!(
-            "{LABEL}: サービス '{SERVICE_NAME}' が見つかりません（既に未登録の可能性）: {err}"
+            "{LABEL}: サービス '{SERVICE_NAME}' を開けませんでした: {err}"
         ))],
         Err(UninstallError::Delete { stop, error }) => {
             let mut lines: Vec<ConsoleLine> = stop_line(stop).into_iter().collect();
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(
             uninstall_lines(&Err(UninstallError::Open("os error 5".to_string()))),
             vec![err(
-                "banto-hub: サービス 'BantoHub' が見つかりません（既に未登録の可能性）: os error 5"
+                "banto-hub: サービス 'BantoHub' を開けませんでした: os error 5"
             )]
         );
         assert_eq!(
