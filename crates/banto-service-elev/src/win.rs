@@ -646,6 +646,14 @@ mod tests {
         // ACE を残しても、Operators の ACE が増えたことは変わらない）。
         let inherited = format!("{EXISTING}(A;ID;CCLCRPWP;;;{OPERATORS})");
         assert_eq!(outcome(&inherited, OPERATORS), ServiceAclOutcome::Added);
+        // Operators への拒否の ACE だけがある → `SET_ACCESS` は同じ相手の拒否の ACE も消す
+        // （実機で確かめた）。消えたのは Operators の ACE なので Replaced（#658 レビュー）。
+        let deny_only = format!("{EXISTING}(D;;DC;;;{OPERATORS})");
+        assert_eq!(
+            outcome(&deny_only, OPERATORS),
+            ServiceAclOutcome::Replaced,
+            "{deny_only}"
+        );
         // (e) 既にあるが並びが正規でない（許可の後ろに拒否）→ Reordered（足していない）。
         // `SetEntriesInAclW` は拒否を許可より前に並べ直すので、書く側に倒れる。
         let ours_ace = crate::operators_ace_sddl(OPERATORS).unwrap();

@@ -1109,38 +1109,11 @@ const ERROR_SERVICE_DOES_NOT_EXIST: u32 =
 
 fn grant_service_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
     match ops.grant_service_acl() {
-        Ok(ServiceAclOutcome::Added) => {
-            out(out_line(&format!(
-                "サービス '{SERVICE_NAME}' の DACL に '{}' の ACE（{}: 照会・開始・停止）を足しました",
+        Ok(outcome) => {
+            out(out_line(&banto_service_elev::grant_service_acl_message(
+                outcome,
+                SERVICE_NAME,
                 OPERATORS_GROUP.name,
-                banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
-            )));
-            EXIT_OK
-        }
-        // 同じ相手の別の権利の ACE（手で付けた広い権利など）を、既定の権利に置き換えた。
-        Ok(ServiceAclOutcome::Replaced) => {
-            out(out_line(&format!(
-                "サービス '{SERVICE_NAME}' の DACL の '{}' の ACE を、既定の権利（{}: 照会・開始・停止）に置き換えました",
-                OPERATORS_GROUP.name,
-                banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
-            )));
-            EXIT_OK
-        }
-        // ACE は既にあるが、DACL の並びが正規でなかったので整え直した（足してはいない）。#658
-        Ok(ServiceAclOutcome::Reordered) => {
-            out(out_line(&format!(
-                "サービス '{SERVICE_NAME}' の DACL には '{}' の ACE（{}: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）",
-                OPERATORS_GROUP.name,
-                banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
-            )));
-            EXIT_OK
-        }
-        // 2 回目以降: ACE は 1 つのまま（足していない）。#628
-        Ok(ServiceAclOutcome::AlreadyPresent) => {
-            out(out_line(&format!(
-                "サービス '{SERVICE_NAME}' の DACL には '{}' の ACE（{}: 照会・開始・停止）が既にあります（変更していません）",
-                OPERATORS_GROUP.name,
-                banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
             )));
             EXIT_OK
         }

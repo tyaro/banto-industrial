@@ -134,6 +134,32 @@ pub enum ServiceAclOutcome {
     AlreadyPresent,
 }
 
+/// [`grant_service_operators`] の結果を人に見せる本文にする（純関数。接頭辞は付けない。
+/// 呼び出し側が自分の名前を前に付ける）。「足しました」は実際に足したときだけ。
+pub fn grant_service_acl_message(
+    outcome: ServiceAclOutcome,
+    service_name: &str,
+    group_name: &str,
+) -> String {
+    let rights = OPERATORS_SERVICE_SDDL_RIGHTS;
+    match outcome {
+        ServiceAclOutcome::Added => format!(
+            "サービス '{service_name}' の DACL に '{group_name}' の ACE（{rights}: 照会・開始・停止）を足しました"
+        ),
+        // 同じ相手の別の権利の ACE（手で付けた広い権利など）を、既定の権利に置き換えた。
+        ServiceAclOutcome::Replaced => format!(
+            "サービス '{service_name}' の DACL の '{group_name}' の ACE を、既定の権利（{rights}: 照会・開始・停止）に置き換えました"
+        ),
+        // ACE は既にあるが、DACL の並びが正規でなかったので整え直した（足してはいない）。
+        ServiceAclOutcome::Reordered => format!(
+            "サービス '{service_name}' の DACL には '{group_name}' の ACE（{rights}: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）"
+        ),
+        ServiceAclOutcome::AlreadyPresent => format!(
+            "サービス '{service_name}' の DACL には '{group_name}' の ACE（{rights}: 照会・開始・停止）が既にあります（変更していません）"
+        ),
+    }
+}
+
 /// DACL の SDDL（`D:` の後の制御フラグ `P`・`AI`・`AR` などは読み飛ばす）から ACE の
 /// 並びを取り出す（純関数）。条件つきの ACE の入れ子の括弧も 1 つの ACE として数える。
 /// 形が読めなければ `None`。
@@ -169,9 +195,25 @@ fn dacl_aces(sddl: &str) -> Option<Vec<&str>> {
 /// （純関数）。条件つきの ACE は後ろにまだフィールドが続くので、6 番目だけを見る。
 fn ace_trustee(ace: &str) -> Option<&str> {
     ace.strip_prefix('(')?.split(';').nth(5).map(|t| {
-        // 条件つきの ACE で `)` が付いたまま終わる形（フィールドが 6 つで閉じる）に備える。
+        // ふつうの ACE は 6 番目のフィールドで閉じるので末尾に `)` が付く。条件つきの ACE は
+        // 後ろに `;(cond))` が続くので付かない。
         t.strip_suffix(')').unwrap_or(t)
     })
+}
+
+/// ACE の文字列のうち trustee（SID）だけを大文字にした形を返す（純関数）。
+/// trustee が取り出せなければ `None`。
+fn with_uppercase_trustee(ace: &str) -> Option<String> {
+    let trustee = ace_trustee(ace)?;
+    // `trustee` は `ace` の部分文字列なので、先頭からの位置はポインタの差で出せる。
+    let start = trustee.as_ptr() as usize - ace.as_ptr() as usize;
+    let end = start + trustee.len();
+    Some(format!(
+        "{}{}{}",
+        &ace[..start],
+        trustee.to_ascii_uppercase(),
+        &ace[end..]
+    ))
 }
 
 /// サービスの今の DACL（`current`）と、Operators の ACE を足して作り直した DACL
@@ -205,9 +247,12 @@ pub fn classify_dacl_change(current: &str, merged: &str, operators_sid: &str) ->
     let operators_set = |aces: &[&str]| {
         let mut set: Vec<String> = Vec::new();
         for ace in aces.iter().filter(|a| is_operators(a)) {
-            let ace = ace.to_ascii_uppercase();
-            if !set.contains(&ace) {
-                set.push(ace);
+            // 大文字小文字を揃えるのは trustee（SID）だけ。残りは文字列そのもので比べる。
+            let Some(normalized) = with_uppercase_trustee(ace) else {
+                continue;
+            };
+            if !set.contains(&normalized) {
+                set.push(normalized);
             }
         }
         set
@@ -555,6 +600,9 @@ mod tests {
             ),
             O::Reordered
         );
+        // 純関数は入力の組を固定しているだけ。実機の `SetEntriesInAclW(SET_ACCESS)` は
+        // Operators への拒否の ACE を消す（win.rs のテストで確認）ので、この拒否の入力は
+        // 「merged にも残った」という仮定の組で、実機では Replaced になる。
         // Operators の継承・拒否・条件つきの ACE だけがあるところへ明示の許可を足した → Added。
         for existing in [
             "(A;ID;CCLCRPWP;;;S-1-5-21-1-2-3-1001)",
@@ -571,6 +619,15 @@ mod tests {
                 "{existing}"
             );
         }
+        // 実機と同じ組: Operators への拒否の ACE が merged で消えた → Replaced。
+        assert_eq!(
+            classify(
+                &format!("D:{sy}(D;;DC;;;S-1-5-21-1-2-3-1001)"),
+                &format!("D:{sy}{ours}"),
+                SID
+            ),
+            O::Replaced
+        );
         // Operators の同じ ACE の重複が 1 つにまとまっただけ → Reordered。
         assert_eq!(
             classify(
@@ -589,6 +646,20 @@ mod tests {
             ),
             O::Reordered
         );
+    }
+
+    #[test]
+    fn grant_service_acl_message_distinguishes_the_outcomes() {
+        use super::{grant_service_acl_message as m, ServiceAclOutcome as O};
+        let all = [O::Added, O::Replaced, O::Reordered, O::AlreadyPresent];
+        let texts: Vec<String> = all.iter().map(|o| m(*o, "Svc", "Grp")).collect();
+        for (i, a) in texts.iter().enumerate() {
+            assert!(a.contains("'Svc'") && a.contains("'Grp'"), "{a}");
+            for b in &texts[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(texts[0].ends_with("を足しました"));
     }
 
     #[test]

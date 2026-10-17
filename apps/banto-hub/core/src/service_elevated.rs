@@ -633,22 +633,9 @@ pub fn grant_service_acl_line(
     service_name: &str,
     outcome: banto_service_elev::ServiceAclOutcome,
 ) -> banto_service_control::ConsoleLine {
-    use banto_service_elev::{ServiceAclOutcome, OPERATORS_SERVICE_SDDL_RIGHTS as RIGHTS};
     let group = crate::service_operators::OPERATORS_GROUP.name;
-    let text = match outcome {
-        ServiceAclOutcome::Added => format!(
-            "banto-hub-elev: サービス '{service_name}' の DACL に '{group}' の ACE（{RIGHTS}: 照会・開始・停止）を足しました"
-        ),
-        ServiceAclOutcome::Replaced => format!(
-            "banto-hub-elev: サービス '{service_name}' の DACL の '{group}' の ACE を、既定の権利（{RIGHTS}: 照会・開始・停止）に置き換えました"
-        ),
-        ServiceAclOutcome::Reordered => format!(
-            "banto-hub-elev: サービス '{service_name}' の DACL には '{group}' の ACE（{RIGHTS}: 照会・開始・停止）が既にあります（DACL を正規の形に整え直しました）"
-        ),
-        ServiceAclOutcome::AlreadyPresent => format!(
-            "banto-hub-elev: サービス '{service_name}' の DACL には '{group}' の ACE（{RIGHTS}: 照会・開始・停止）が既にあります（変更していません）"
-        ),
-    };
+    let body = banto_service_elev::grant_service_acl_message(outcome, service_name, group);
+    let text = format!("banto-hub-elev: {body}");
     banto_service_control::ConsoleLine::Stdout(text)
 }
 
