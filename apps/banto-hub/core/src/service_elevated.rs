@@ -587,8 +587,8 @@ pub fn setup_operators(user: Option<&str>) -> Result<(), ElevatedError> {
 /// [`ElevatedAction::GrantServiceAcl`]の本体（`BantoHub`固定）。モジュール
 /// doc「SDDL」節参照 - [`grant_service_acl_for`]の薄いラッパー（モジュール
 /// doc「S6 申し送りの follow-up」節参照）。`banto-hub-elev.exe
-/// grant-service-acl`（引数無し）はこの関数を呼ぶため、挙動は S6 以前と
-/// 1バイトも変えていない。
+/// grant-service-acl`（引数無し）はこの関数を呼ぶ。付ける ACE は S6 以前と同じ。
+/// 結果（足した・既にある など）を返し、呼び出し側が 1 行出す（#658）。
 #[cfg(windows)]
 pub fn grant_service_acl() -> Result<banto_service_elev::ServiceAclOutcome, ElevatedError> {
     grant_service_acl_for(crate::service_manager::SERVICE_NAME)
