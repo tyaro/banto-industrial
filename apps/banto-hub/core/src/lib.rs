@@ -126,6 +126,11 @@
 //!   一切権限を与えない。呼び出し元は
 //!   [`service_elevated::ElevatedAction::GrantProfileAcl`]（UAC helper 経由）と
 //!   `service-install`
+//! - [`sink_config_prepare`]: `banto-hub-elev prepare-sink-config`（#630 PR-2）。
+//!   banto-hub-sink の設定ファイル（Hub の API キー入り）の置き場
+//!   `%ProgramData%\BantoHub\sink\` を、確かめ終えてから SYSTEM・Administrators だけの
+//!   保護された DACL・所有者 Administrators に整え、中の設定ファイルを整え直し、`.example`
+//!   を差し替える
 //! - [`hub_health`]: T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4）。
 //!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
 //!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」
@@ -209,6 +214,7 @@ pub mod service_manager;
 pub mod service_operators;
 pub mod settings;
 pub mod sink;
+pub mod sink_config_prepare;
 pub mod stream;
 pub mod subscribe_core;
 pub mod system_info;

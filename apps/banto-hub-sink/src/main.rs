@@ -5,7 +5,11 @@
 //!
 //! ## サブコマンド（banto-hub の `bin/banto-hub.rs` と同じ形）
 //!
-//! - 引数なし / `run`: コンソールモード（Ctrl-C で停止）
+//! - 引数なし / `run`: コンソールモード（Ctrl-C で停止）。設定ファイルは
+//!   `%ProgramData%\BantoHub\sink\` か、環境変数 `BANTO_HUB_SINK_CONFIG` が指すファイル
+//!   （どちらも保護されていなければ起動しない - `banto_hub_sink::config` のモジュール doc
+//!   「置き場」、#630）。既定の置き場は SYSTEM と Administrators だけが開けるので、管理者
+//!   として実行する。
 //! - `install`（Windows 専用）: Windows サービスとして登録
 //! - `uninstall`（Windows 専用）: サービス登録を解除
 //! - `run-service`（Windows 専用）: SCM がサービス開始時に呼ぶ内部
@@ -33,7 +37,7 @@
 
 #[cfg(windows)]
 use banto_hub_sink::service;
-use banto_hub_sink::{load_config, run, SidecarOptions, StopRequest};
+use banto_hub_sink::{load_config, run, RunMode, SidecarOptions, StopRequest};
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -58,9 +62,11 @@ fn print_usage() {
     eprintln!("使い方: banto-hub-sink.exe [run|install|uninstall|run-service|grant-service-acl]");
     eprintln!("  （引数なし）/ run  コンソールモードで起動（Ctrl-C で停止）");
     eprintln!(
-        "  設定ファイル（{}）は BANTO_HUB_SINK_CONFIG → %ProgramData%\\BantoHub\\ → exe と\
-         同じディレクトリ の順に探索します",
-        banto_hub_sink::DEFAULT_CONFIG_FILE_NAME
+        "  設定ファイル（{}）は %ProgramData%\\BantoHub\\sink\\ だけを読みます（run では\
+         環境変数 BANTO_HUB_SINK_CONFIG で別のファイルも指せます）。置き場とファイルが\
+         保護されていなければ起動しません（{} で整えます）",
+        banto_hub_sink::DEFAULT_CONFIG_FILE_NAME,
+        banto_hub_sink::config::PREPARE_COMMAND
     );
     #[cfg(windows)]
     {
@@ -83,14 +89,17 @@ fn print_usage() {
 }
 
 fn run_console() {
-    let config = match load_config() {
+    // コンソールの `run` は環境変数の上書きを見るが、指したファイルにも同じ保護の確かめを
+    // かける（#630）。
+    let config = match load_config(RunMode::Console) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("banto-hub-sink: {err}");
+            for line in err.lines() {
+                eprintln!("banto-hub-sink: {line}");
+            }
             eprintln!(
-                "banto-hub-sink: 設定ファイルの雛形は docs/banto-hub-external-db-design.md §5.6、\
-                 探索順は docs/banto-hub-installer-design.md §4.4 と \
-                 このバイナリの README 相当（`banto_hub_sink::config` のモジュール doc）を参照してください"
+                "banto-hub-sink: 置き場と編集の手順は docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」、\
+                 書式は `banto_hub_sink::config` のモジュール doc を参照してください"
             );
             std::process::exit(1);
         }

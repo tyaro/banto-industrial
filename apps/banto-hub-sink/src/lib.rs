@@ -14,9 +14,9 @@
 //!
 //! **設定・UI・監視は Hub が持つ**（§5.2）。このプロセスは状態を持たない:
 //! 起動時に Hub から設定を取得 → 購読 → INSERT を繰り返すだけで、落ちれば
-//! SCM が再起動して設定を取り直す。`banto-hub-sink.toml`（[`config`]、
-//! インストーラ設計 §4.4 の I2 で `env → %ProgramData%\BantoHub\ → exe 隣`
-//! の順に探索するようになった）が持つのは Hub の URL と API キーだけで、
+//! SCM が再起動して設定を取り直す。`banto-hub-sink.toml`（[`config`]。#630 で置き場を
+//! SYSTEM・Administrators だけの `%ProgramData%\BantoHub\sink\` に限り、保護されて
+//! いなければ起動しない）が持つのは Hub の URL と API キーだけで、
 //! それ以外の設定（どのタグをどのテーブルへ、どの周期で）はすべて Hub 側の
 //! `hub_sink_groups`（`banto_hub_core::sink`、S4）にある。
 //!
@@ -38,8 +38,9 @@
 //!   PUT /api/sink/status  ◀─────────── [status] 5秒ごとの状態 push
 //! ```
 //!
-//! - [`config`][]: `env → %ProgramData%\BantoHub\ → exe 隣` の順に探す
-//!   toml（未知キーは拒否、範囲検証、`api_key` は `Debug` にも出さない）。
+//! - [`config`][]: 保護された置き場 `%ProgramData%\BantoHub\sink\` の toml（置き場と
+//!   ファイルを辿らずに確かめてから読む。未知キーは拒否、範囲検証、`api_key` は `Debug` にも
+//!   出さない）。
 //! - [`hub_api`][]: `GET /api/sink/config` / `PUT /api/sink/status`（admin
 //!   スコープの API キー + ループバック運用、§6-15）。
 //! - [`values`][]: banto-tagclient の `TagClientHandle` を1本だけ持ち、全
@@ -73,7 +74,9 @@
 //! - `banto-hub-sink.toml` の `api_key` は**平文**で置かれる（Hub の MQTT
 //!   パスワードと同じ v1 の前提）。`GET /api/sink/config` は DB 接続の
 //!   パスワードを平文で返すため、**Hub と同一マシンのループバック接続**が
-//!   運用前提。
+//!   運用前提。キーを守る境界は置き場の ACL（SYSTEM・Administrators だけ。#630）。
+//!   Hub が止まっている間に一般の利用者がループバックのポートを先に取ると、キーを
+//!   送ってしまう穴はこの ACL では塞がらない（#644）。
 //! - API キーと DB パスワードは**ログにも Hub への status push にも
 //!   出さない**。sqlx のエラーは [`status::sanitize_db_error`] で
 //!   カテゴリ + DB 自身のメッセージだけに縮め、さらに
@@ -102,5 +105,5 @@ pub mod sql;
 pub mod status;
 pub mod values;
 
-pub use config::{load_config, SidecarConfig, DEFAULT_CONFIG_FILE_NAME, ENV_CONFIG_PATH};
+pub use config::{load_config, RunMode, SidecarConfig, DEFAULT_CONFIG_FILE_NAME, ENV_CONFIG_PATH};
 pub use run::{run, SidecarOptions, StopRequest};

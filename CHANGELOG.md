@@ -4,6 +4,11 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ## v0.2.0-alpha.31 — 2026-10-16（アルファ）
 
+- **破壊的変更: banto-hub-sink の設定ファイル（Hub の API キー入り）の置き場を `%ProgramData%\BantoHub\sink\banto-hub-sink.toml` だけにした（#630、2026-10-17 オーナー決定）**。以前の置き場（`%ProgramData%\BantoHub\` の直下・exe の隣）は一般の利用者（`Users`）が読め、ルート直下には一般の利用者が先に同じ名前のファイルを作れた。
+  - 置き場 `sink\` は SYSTEM・Administrators だけ・所有者 Administrators の保護された ACL。新しい固定のアクション `banto-hub-elev.exe prepare-sink-config` が確かめ終えてから作る・整える（一般の利用者が先に作った `sink\` は何も変えずに断る）。中の設定ファイルの所有者と ACL も整え直し（中身は読まない）、`banto-hub-sink.toml.example` はインストールのたびに差し替える。インストーラは NSIS で `.example` を置く代わりにこれを呼ぶ。
+  - サイドカーは**置き場とファイルが保護されていなければ起動しない**（理由を 1 行ずつ出し、`prepare-sink-config` を案内する）。**旧い置き場は読まない。旧い置き場に `banto-hub-sink.toml` があれば、案内を出して起動しない**（旧いファイルを自動で消したり動かしたりはしない）。LocalSystem のサービスは環境変数 `BANTO_HUB_SINK_CONFIG` を見ない（コンソールの `run` だけが見て、指したファイルにも同じ確かめをかける）。
+  - **移し方**: 上書きインストール（または `prepare-sink-config`）の後、管理者のメモ帳で `sink\` の中の `.example` をコピーして `banto-hub-sink.toml` を作り、旧いファイルの内容を写す（移動しない）→ 旧いキーは他の利用者が読めた可能性があるので、Hub で新しいキーを発行して書き、古いキーを失効する → `prepare-sink-config` → 旧いファイルを消す → `BantoHubSink` を開始。設定ファイルを編集するたびに `prepare-sink-config` を実行する（メモ帳で保存すると所有者が編集した管理者になり、そのままでは起動しない）。手順は docs/banto-hub-operations.md §12。Hub が止まっている間のループバックのポートの先取りは #644。
+- banto-hub-sink の外部 DB のユーザーには `INSERT` に加えて `SELECT` が要ることを docs に明記した（起動時と 30 秒ごとの保存先の検査 `SELECT ... LIMIT 0` に使う。#616）。Hub のサービスログで、シミュレーションモードの注意が設定の 1 回の変更で 2〜4 回出ていたのを、同じ文面は続けて出さないようにした（起動時・再び有効にしたとき・文面が変わったとき・10 分以上経った後は出す。#616）。
 - Hub の OPC UA 読み取り専用サーバーを追加。既定は無効・loopback 待受で、管理画面から明示的に有効化できる。SecurityPolicy None / Anonymous のため LAN 公開は明示設定が必要。Hub の実タグだけを公開し、タグ追加・削除・改名・型変更、品質と採取/品質遷移時刻を同期する。文字列タグと試験用サンプルタグは公開しない（#201）。
 - banto-hub のシェル・トレイの health 判定で、`profile.lock` が「アクセス拒否で開けない」ときを「無い・壊れている」と分けた（#626 PR-C）。ワイヤ上の profile-id が一致していれば Healthy として扱い、所有者以外の利用者（Operators だけの利用者・UAC の分割トークンの管理者）でも、profile ディレクトリを保護したあとにサービスの画面へ繋がる。無い・壊れている・ディレクトリなど通常のファイルでない・その他の読み取り失敗は従来どおり「所有者不明」（拒否は、ファイルが在る確かな証拠ではなく、このトークンでは開けないことだけを示す）。`banto-instance-lock` に区別つきの `read_owner_info_detailed` を足した。
 - **banto-hub-elev の `grant-profile-acl` を昇格の境界として作り直した（#626 PR-B、2026-10-16 オーナー決定）**。以前は、昇格したプロセスが呼び出し元の環境変数（`BANTO_HUB_ROOT`・`ProgramData`）でルートを決め、パスで（自動の伝播つきで）書いていたため、profile の owner が昇格した ACL の書き込みを途中・末尾のジャンクションやハードリンクの先、`C:` のような profile-id で任意の場所へ向けられた。**挙動の変化**:

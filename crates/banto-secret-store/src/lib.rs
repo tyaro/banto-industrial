@@ -44,7 +44,10 @@
 //!   確かめ済みのフォルダのハンドルを基準に、子のファイルを辿らずに開いてそのハンドルのまま
 //!   読む `PinnedDir::open_child_file`・保護された DACL と所有者 Administrators を作るのと
 //!   同時に付けて作る `PinnedDir::create_child_file`（失敗したら作ったハンドルで消す）。
-//!   利用者を持たない置き場の判断は [`acl::guard::dir_acl_plan`]。
+//!   利用者を持たない置き場の判断は [`acl::guard::dir_acl_plan`]。#630 PR-2 で、中身を
+//!   求めずに記述子を書く・消す権利で開く `PinnedDir::open_child_file_for_update` と、
+//!   そのハンドルで保護された DACL と所有者を書く `PinnedFile::reset_acl`・消す
+//!   `PinnedFile::delete` を足した（`banto-hub-elev prepare-sink-config` が使う）。
 //! - `impl banto_hub_bootstrap::KeyStore for FileSecretStore<_>`（`src/keystore.rs`）。
 //!
 //! # DPAPI machine スコープの意味と限界（計画書 §6）

@@ -16,10 +16,10 @@
 //! ```
 //!
 //! `<action>`は[`banto_hub_core::service_elevated::ElevatedAction`]が定義
-//! する固定の9種類のみ（`setup-operators`/`grant-service-acl`/
+//! する固定の10種類のみ（`setup-operators`/`grant-service-acl`/
 //! `grant-profile-acl`/`service-install`/`service-uninstall`/
 //! `autostart-enable`/`autostart-disable`/`reset-password`/
-//! `revert-to-commissioning`）- フリーフォームなコマンド文字列は
+//! `revert-to-commissioning`/`prepare-sink-config`（#630 PR-2、引数なし））- フリーフォームなコマンド文字列は
 //! 一切受け付けない（昇格プロセスへ任意コマンドを渡させないための
 //! セキュリティ境界）。`setup-operators`は追加ユーザー名を1個まで、
 //! `grant-service-acl`は`[service-name]`を1個まで（省略時は`BantoHub`固定 -
@@ -69,7 +69,7 @@ fn main() {
 
     let Some(action) = ElevatedAction::parse(action_arg) else {
         eprintln!(
-            "banto-hub-elev: 不明な action '{action_arg}' です（固定の9種類のみ受け付けます）"
+            "banto-hub-elev: 不明な action '{action_arg}' です（固定の10種類のみ受け付けます）"
         );
         print_usage();
         std::process::exit(1);
@@ -109,6 +109,9 @@ fn print_usage() {
     );
     eprintln!(
         "banto-hub-elev:   例: banto-hub-elev.exe revert-to-commissioning [profile-id]（ロックダウン済み→試運転モードへ復帰、profile-id省略時は既定 profile）"
+    );
+    eprintln!(
+        "banto-hub-elev:   例: banto-hub-elev.exe prepare-sink-config（banto-hub-sink の設定ファイルの置き場 %ProgramData%\\BantoHub\\sink\\ を整える。設定ファイルを編集した後にも実行）"
     );
 }
 

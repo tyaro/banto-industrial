@@ -64,13 +64,19 @@
 ; (2) `banto-hub-sink.exe install`（サービス登録のみ、冪等）
 ; (3) `banto-hub-sink.exe grant-service-acl`（同梱の elev 経由で ACE 付与、
 ;     apps/banto-hub-sink/src/service.rs 参照）
-; (4) `%ProgramData%\BantoHub\`（PerMachine では `$APPDATA` が指す先、
-;     上記「`%ProgramData%` の参照方法」節参照）を作成し、
-;     `banto-hub-sink.toml.example` が無ければ配置する。**実ファイルの
-;     `banto-hub-sink.toml` は作らない** - API キーは Hub を起動してから
-;     発行するものなので、インストーラには書けない（§4.4）。複製先の
-;     `.example` 自体の存在で冪等性を判定する（既にあれば上書きしない -
-;     手で調整済みの雛形を誤って戻さないため）。
+; (4) `banto-hub-elev.exe prepare-sink-config`（#630 PR-2、2026-10-17 オーナー
+;     決定）: サイドカーの設定ファイル（Hub の API キー入り）の置き場
+;     `%ProgramData%\BantoHub\sink\` を、確かめ終えてから SYSTEM・Administrators
+;     だけ・所有者 Administrators の保護された DACL で作る（あれば整える）。中に
+;     本物の `banto-hub-sink.toml` があれば所有者と ACL を整え直し（中身は読まない・
+;     変えない）、`banto-hub-sink.toml.example`（exe の隣の同梱物）をインストールの
+;     たびに差し替える。**実ファイルは作らない** - API キーは Hub を起動してから
+;     発行するもの（§4.4）。以前の NSIS の `CreateDirectory`/`CopyFiles` は継承の
+;     DACL（Users が読める）で作ってしまうので使わない。ルート直下の旧い
+;     `.example`・旧い toml には触らない（旧い toml があると sink は起動しない -
+;     docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」）。sink の `install`・
+;     `grant-service-acl` の後、サービスの再開の前に呼ぶ（再開した sink が新しい
+;     置き場を読むように）。
 ; (5) PREINSTALL で止めたものだけ `sc start` で再開する（Hub → Sink の順、
 ;     §4.3「起動していたものだけ再開」）。**新規インストールでは
 ;     $BantoHubWasRunning/$SinkWasRunning が未設定のままなので何も
@@ -264,14 +270,26 @@ Var StopWaitCounter
     DetailPrint "banto-hub: grant-service-acl に失敗しました（終了コード $0）。手動で次を実行してください: $\"$INSTDIR\banto-hub-sink.exe$\" grant-service-acl"
   ${EndIf}
 
-  ; §4.4: ProgramData（PerMachine では $APPDATA が指す - モジュール doc
-  ; 「%ProgramData% の参照方法」節参照）を作成し、サイドカー設定の雛形
-  ; （.example のみ）を配置する。既にあれば上書きしない
-  ; （モジュール doc「POSTINSTALL」節参照）。
-  CreateDirectory "$APPDATA\BantoHub"
-  ${IfNot} ${FileExists} "$APPDATA\BantoHub\banto-hub-sink.toml.example"
-    CopyFiles /SILENT "$INSTDIR\banto-hub-sink.toml.example" "$APPDATA\BantoHub\banto-hub-sink.toml.example"
-    DetailPrint "banto-hub: サイドカー設定の雛形を配置しました: $APPDATA\BantoHub\banto-hub-sink.toml.example （api_key を発行後、banto-hub-sink.toml にリネームしてください）"
+  ; (4) #630: サイドカーの設定ファイルの置き場を elev が確かめてから整え、
+  ; 雛形を差し替える（モジュール doc「POSTINSTALL」節参照）。NSIS では
+  ; 作らない（継承の DACL で作ってしまうため）。
+  DetailPrint "banto-hub: サイドカーの設定ファイルの置き場 (%ProgramData%\BantoHub\sink) を整えています..."
+  ExecWait '"$INSTDIR\banto-hub-elev.exe" prepare-sink-config' $0
+  ${If} $0 != 0
+    DetailPrint "banto-hub: prepare-sink-config に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" prepare-sink-config （docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」参照）"
+  ${Else}
+    DetailPrint "banto-hub: サイドカーの設定ファイルの置き場を整え、雛形 (banto-hub-sink.toml.example) を置きました。管理者のメモ帳で雛形をコピーして banto-hub-sink.toml を作り、編集の後に prepare-sink-config をもう一度実行してください。"
+  ${EndIf}
+
+  ; #630（#655 のレビュー Should 2）: 旧い置き場（ルート直下・exe の隣）に設定ファイルが
+  ; 残っていれば、この版の sink は読まずに起動しない。上書きインストールで (5) が sink を
+  ; 再開しても、すぐ止まるので、インストーラの詳細に移し方を残す。パスは (4) の旧い処理と
+  ; 同じ求め方（PerMachine の $APPDATA = %ProgramData%）と $INSTDIR。旧いファイルには触らない。
+  ${If} ${FileExists} "$APPDATA\BantoHub\banto-hub-sink.toml"
+    DetailPrint "banto-hub: 旧い置き場に設定ファイル ($APPDATA\BantoHub\banto-hub-sink.toml) があります。この版の DB Sink サイドカーは旧い置き場を読まず、残っている間は起動しません。移し方（新しい置き場で作り直し・キーの失効と再発行・旧いファイルの削除）は docs/banto-hub-operations.md §12 を参照してください。上書き前に稼働していた場合も BantoHubSink は再開を試みますが、設定を移すまで止まります。"
+  ${EndIf}
+  ${If} ${FileExists} "$INSTDIR\banto-hub-sink.toml"
+    DetailPrint "banto-hub: 旧い置き場に設定ファイル ($INSTDIR\banto-hub-sink.toml) があります。この版の DB Sink サイドカーは旧い置き場を読まず、残っている間は起動しません。移し方は docs/banto-hub-operations.md §12 を参照してください。上書き前に稼働していた場合も BantoHubSink は再開を試みますが、設定を移すまで止まります。"
   ${EndIf}
 
   ; §7 決定4: PREINSTALL で止めたものだけ再開する（Hub → Sink の順）。

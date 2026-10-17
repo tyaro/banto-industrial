@@ -232,8 +232,11 @@
 			</a>
 			<p class="note">
 				発行直後の画面にしか平文キーは表示されません。コピーしたら
-				<code>banto-hub-sink.toml</code>（<code>%ProgramData%\BantoHub\</code>、インストーラが
-				雛形を用意します。無い場合はサイドカー exe と同じディレクトリでも可）へ設定してください。
+				<code>%ProgramData%\BantoHub\sink\banto-hub-sink.toml</code>
+				へ設定してください（この置き場だけを読みます）。置き場は SYSTEM と Administrators だけが開けるので、管理者のメモ帳で置き場の中の
+				<code>banto-hub-sink.toml.example</code>
+				をコピーして編集し、編集の後に管理者の PowerShell で
+				<code>banto-hub-elev.exe prepare-sink-config</code> を実行してください。置き場とファイルが保護されていないと、サイドカーは起動しません。
 			</p>
 			<div class="config-snippet">
 				<pre>hub_url = "http://127.0.0.1:&lt;Hub のポート&gt;"

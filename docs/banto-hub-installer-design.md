@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
+状態: **I1〜I4 完了（2026-09-07）**。2026-10-17（#630 PR-2）: §4.4・§4.3 の POSTINSTALL (4)・決定 5 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（`banto-hub-elev prepare-sink-config` が整える）に改めた（§4.3 の「`.example` から複製」という実装とのずれも直した）。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。
@@ -28,7 +28,7 @@ v0.2.0-alpha.2 の配布物は、NSIS インストーラ（**Hub 本体のみ**�
 | pre-uninstall              | `banto-hub.exe uninstall`                                                                                                                                                                                                       |
 | 上書き時                   | サービスが稼働中だと exe の差し替えに失敗しうる（停止フック無し）。既存サービスの設定は `install` が冪等なので保持される（T17-4）                                                                                               |
 | elev の能力                | `service-install`（`banto-hub.exe` のサービス登録 → `setup-operators` → `grant-service-acl` → `grant-profile-acl` を一括）、`service-uninstall`、`grant-service-acl [service]`（#316 でサービス名引数化）                       |
-| サイドカー                 | `install` / `uninstall`（冪等、`OnDemand`、LocalSystem）、`grant-service-acl`（同梱 elev を呼ぶ）。設定は **exe 隣の `banto-hub-sink.toml`**（`BANTO_HUB_SINK_CONFIG` で上書き可）                                              |
+| サイドカー                 | `install` / `uninstall`（冪等、`OnDemand`、LocalSystem）、`grant-service-acl`（同梱 elev を呼ぶ）。設定は **`%ProgramData%\BantoHub\sink\banto-hub-sink.toml` だけ**（#630、2026-10-17。§4.4。当初は exe 隣）                   |
 | シェル                     | Tauri v2 の薄いシェル。`frontendDist` は `src-tauri/ui`（静的 1 ページ）。Hub は in-process。`banto-hub-elev.exe` を同ディレクトリで探す。`tauri.conf.json` の `bundle.targets = "all"` だが `cargo tauri build` は使っていない |
 | 版数                       | 4 箇所（workspace、package.json、インストーラの `PRODUCT_VERSION`、`tauri.conf.json` は数値のみ）。NSIS は `0.2.0-alpha.2` のプレリリース識別子を受理（alpha.2 で実証）                                                         |
 | 未決（desktop-plan §16.3） | コード署名（未署名 NSIS は SmartScreen 警告）、自動更新は初版スコープ外。WebView2 の同梱方式は決定 2（`EmbedBootstrapper`）、VC++ ランタイム前提は決定 11（静的リンクで排除、§4.7）で決着                                       |
@@ -60,23 +60,38 @@ v0.2.0-alpha.2 の配布物は、NSIS インストーラ（**Hub 本体のみ**�
 
 ### 4.3 フック（NSIS）
 
-| フック       | 処理                                                                                                                                                                                                                                                                                                                                                     | 備考                                                                                                                                                                                            |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PREINSTALL   | (1) `BantoHubSink` が Running なら停止し、その事実を記録 (2) `BantoHub` が Running なら停止し記録 (3) `banto-hub-shell.exe` が動いていれば終了を促す（single-instance なので `taskkill` で閉じるか、利用者に閉じてもらう案内を出して待つ）                                                                                                               | 稼働中の exe は差し替えられないため必須。**上書きインストールの前提条件**を作る                                                                                                                 |
-| POSTINSTALL  | (1) `banto-hub-elev.exe service-install`（Hub サービス登録 → `BantoHub Operators` 作成と対話ユーザー追加 → サービス ACL → profile ACL） (2) `banto-hub-sink.exe install` (3) `banto-hub-sink.exe grant-service-acl` (4) `%ProgramData%\BantoHub\` を作成し、`banto-hub-sink.toml` が無ければ `.example` から複製 (5) PREINSTALL で停止したサービスを再開 | (1) は現状の `banto-hub.exe install` を置き換え、T17 の「elev 統合未了」を閉じる。いずれも冪等で、既存の起動種別・自動起動設定は変えない（T17-4）。**新規インストールではサービスを起動しない** |
-| PREUNINSTALL | (1) `banto-hub-sink.exe uninstall` (2) `banto-hub-elev.exe service-uninstall`（`banto-hub.exe uninstall` と同等） (3) シェルが動いていれば終了                                                                                                                                                                                                           | `%ProgramData%\BantoHub\` と profile（DB・データ・ログ）は**残す**（現状どおり。§7-7）                                                                                                          |
+| フック       | 処理                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | 備考                                                                                                                                                                                            |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PREINSTALL   | (1) `BantoHubSink` が Running なら停止し、その事実を記録 (2) `BantoHub` が Running なら停止し記録 (3) `banto-hub-shell.exe` が動いていれば終了を促す（single-instance なので `taskkill` で閉じるか、利用者に閉じてもらう案内を出して待つ）                                                                                                                                                                                                                                                                                              | 稼働中の exe は差し替えられないため必須。**上書きインストールの前提条件**を作る                                                                                                                 |
+| POSTINSTALL  | (1) `banto-hub-elev.exe service-install`（Hub サービス登録 → `BantoHub Operators` 作成と対話ユーザー追加 → サービス ACL → profile ACL） (2) `banto-hub-sink.exe install` (3) `banto-hub-sink.exe grant-service-acl` (4) `banto-hub-elev.exe prepare-sink-config`（#630: 保護された置き場 `%ProgramData%\BantoHub\sink\` を確かめてから整え、`.example` を毎回差し替える。本物の toml は作らない。以前の記述「toml が無ければ `.example` から複製」は実装（`.example` だけを置く）と違っていた） (5) PREINSTALL で停止したサービスを再開 | (1) は現状の `banto-hub.exe install` を置き換え、T17 の「elev 統合未了」を閉じる。いずれも冪等で、既存の起動種別・自動起動設定は変えない（T17-4）。**新規インストールではサービスを起動しない** |
+| PREUNINSTALL | (1) `banto-hub-sink.exe uninstall` (2) `banto-hub-elev.exe service-uninstall`（`banto-hub.exe uninstall` と同等） (3) シェルが動いていれば終了                                                                                                                                                                                                                                                                                                                                                                                          | `%ProgramData%\BantoHub\` と profile（DB・データ・ログ）は**残す**（現状どおり。§7-7）                                                                                                          |
 
 フック内の失敗はインストーラを中断せず、`DetailPrint` で手動手順（operations.md の該当節）を案内する（現状の流儀を踏襲）。
 
 ### 4.4 サイドカーの設定ファイルの置き場
 
-現状は exe 隣（`Program Files` 配下）で、書き込みに管理者権限が要る。API キーは Hub を起動してから発行するので、インストーラは書けない。次を提案する。
+**2026-10-17 の形（#630、オーナー決定。破壊的変更）**: 置き場は
+**`%ProgramData%\BantoHub\sink\banto-hub-sink.toml` だけ**。`sink\` は SYSTEM・
+Administrators だけ・所有者 Administrators の保護された DACL で、
+`banto-hub-elev.exe prepare-sink-config` が確かめ終えてから作る（あれば整える）。
+インストーラの POSTINSTALL (4) はこのアクションを呼ぶだけで、NSIS の
+`CreateDirectory`/`CopyFiles`（継承の DACL で作ってしまう）は使わない。`.example` は
+置き場の中にインストールのたびに差し替える。サイドカーは置き場とファイルが保護されて
+いなければ、旧い置き場（ルート直下・exe 隣）にファイルがあれば起動しない。
+LocalSystem のサービスは `BANTO_HUB_SINK_CONFIG` を見ない。手順は
+docs/banto-hub-operations.md §12「サイドカーの初回セットアップ」。
 
-- サイドカーの設定探索を **`BANTO_HUB_SINK_CONFIG` → `%ProgramData%\BantoHub\banto-hub-sink.toml` → exe 隣** の順にする（小さなコード変更、§6 の I2）。
-- インストーラは `%ProgramData%\BantoHub\` を作り、`banto-hub-sink.toml` が無ければ `.example`（`hub_url` と空の `api_key`、ループバック注意のコメント）を置く。**既存ファイルは上書きしない。**
-- シェルの sink 画面（S6）の設定スニペットは、このパスを案内する。
+初回セットアップの流れ: インストール → シェルから Hub を起動 → API キー画面で
+`admin` + `read` のキーを発行 → 管理者のメモ帳で `sink\` の中の `.example` をコピーして
+`banto-hub-sink.toml` を作り、キーを書く → `banto-hub-elev.exe prepare-sink-config` →
+シェルのサービス一覧から `BantoHubSink` を開始。
 
-初回セットアップの流れ: インストール → シェルから Hub を起動 → API キー画面で `admin` + `read` のキーを発行 → `%ProgramData%\BantoHub\banto-hub-sink.toml` に書く → シェルのサービス一覧から `BantoHubSink` を開始。
+**I2（2026-09-07）までの経緯**: 当初は exe 隣（`Program Files` 配下）で、書き込みに
+管理者権限が要り、インストーラは API キーを書けなかった。I2 で探索順を
+`BANTO_HUB_SINK_CONFIG` → `%ProgramData%\BantoHub\banto-hub-sink.toml` → exe 隣 にし、
+インストーラが `%ProgramData%\BantoHub\` を作って `.example` を置く（既存は上書き
+しない）形にしたが、ルート直下・exe 隣とも一般の利用者が読めた（ルート直下は
+一般の利用者が先に同じ名前のファイルを作ることもできた）ため、#630 で上の形に改めた。
 
 ### 4.5 上書きインストールとアンインストール
 
@@ -128,19 +143,19 @@ WebView2（§4.2）と並ぶもう 1 つの実行時前提が **Microsoft Visual
 
 ## 7. オーナー決定項目（2026-09-07 決定済み: 1〜11 すべて推奨どおり）
 
-| #   | 項目                                 | 推奨                                                                                 |
-| --- | ------------------------------------ | ------------------------------------------------------------------------------------ |
-| 1   | 方式（§3）                           | **案 A**（既存ツールの複数バイナリ化）                                               |
-| 2   | WebView2 の導入方式（§4.2）          | **`EmbedBootstrapper`**。完全オフライン版は要望が出てから                            |
-| 3   | ショートカット                       | スタートメニューのみ。デスクトップには作らない                                       |
-| 4   | 上書き時のサービス停止・再開（§4.3） | **自動で停止し、動いていたものだけ再開**                                             |
-| 5   | サイドカー設定の置き場（§4.4）       | **`%ProgramData%\BantoHub\banto-hub-sink.toml`** を優先、exe 隣は後方互換            |
-| 6   | サイドカーのサービス登録（§4.3）     | **インストーラが登録**（起動はしない、Hub と同じ）                                   |
-| 7   | アンインストール時のデータ（§4.5）   | **ProgramData と profile は残す**（現状どおり）                                      |
-| 8   | ビルドスクリプト（§4.6）             | 作る（`scripts/build-release.ps1`）                                                  |
-| 9   | exe 単体配布の継続                   | インストーラと**併記**して続ける（サービス化しない評価用途向け）                     |
-| 10  | 着手時期                             | S7（実 DB 検証）と同じ実機セッションで I4 を消化できるよう、I1〜I3 を先に済ませる    |
-| 11  | VC++ ランタイム（§4.7）              | **`+crt-static` で静的リンク**。redist の同梱はしない（単体 exe 配布を救えないため） |
+| #   | 項目                                 | 推奨                                                                                                                                  |
+| --- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 方式（§3）                           | **案 A**（既存ツールの複数バイナリ化）                                                                                                |
+| 2   | WebView2 の導入方式（§4.2）          | **`EmbedBootstrapper`**。完全オフライン版は要望が出てから                                                                             |
+| 3   | ショートカット                       | スタートメニューのみ。デスクトップには作らない                                                                                        |
+| 4   | 上書き時のサービス停止・再開（§4.3） | **自動で停止し、動いていたものだけ再開**                                                                                              |
+| 5   | サイドカー設定の置き場（§4.4）       | **`%ProgramData%\BantoHub\sink\banto-hub-sink.toml` だけ**（2026-10-17 #630 で改定。当初は ProgramData 直下を優先、exe 隣は後方互換） |
+| 6   | サイドカーのサービス登録（§4.3）     | **インストーラが登録**（起動はしない、Hub と同じ）                                                                                    |
+| 7   | アンインストール時のデータ（§4.5）   | **ProgramData と profile は残す**（現状どおり）                                                                                       |
+| 8   | ビルドスクリプト（§4.6）             | 作る（`scripts/build-release.ps1`）                                                                                                   |
+| 9   | exe 単体配布の継続                   | インストーラと**併記**して続ける（サービス化しない評価用途向け）                                                                      |
+| 10  | 着手時期                             | S7（実 DB 検証）と同じ実機セッションで I4 を消化できるよう、I1〜I3 を先に済ませる                                                     |
+| 11  | VC++ ランタイム（§4.7）              | **`+crt-static` で静的リンク**。redist の同梱はしない（単体 exe 配布を救えないため）                                                  |
 
 ## 8. 実機検証結果（I4、2026-09-07、この開発 PC）
 

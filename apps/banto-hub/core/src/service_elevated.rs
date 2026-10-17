@@ -9,7 +9,7 @@
 //!
 //! ## 固定アクション（[`ElevatedAction`]）
 //!
-//! `banto-hub-elev.exe <action> [args...]`が受け付けるのは次の9種類のみ -
+//! `banto-hub-elev.exe <action> [args...]`が受け付けるのは次の10種類のみ -
 //! フリーフォームのコマンド文字列は一切受け付けない（UAC 昇格した管理者
 //! プロセスに任意コマンドを渡させないためのセキュリティ境界、実装指示の
 //! 「固定アクション」要求そのもの）。**2026-08-31 追加の2種類
@@ -28,6 +28,7 @@
 //! | `autostart-disable`          | `WindowsServiceManager::set_auto_start(false)`                         |
 //! | `reset-password`             | `<username> [profile-id]` - 対象 profile の DB を開き、指定ユーザーのパスワードを標準入力から読んだ新パスワードへ再設定する（下記「ロックダウン回復アクション」節） |
 //! | `revert-to-commissioning`    | `[profile-id]` - 対象 profile をロックダウン済み→試運転モードへ戻す（[`crate::commissioning::revert_to_commissioning`]、下記「ロックダウン回復アクション」節） |
+//! | `prepare-sink-config`        | 引数なし - banto-hub-sink の設定ファイルの置き場 `%ProgramData%\BantoHub\sink\` を確かめ終えてから SYSTEM・Administrators だけに整え、中の設定ファイルの所有者・ACL を整え直し、`.example` を差し替える（[`crate::sink_config_prepare`]、#630 PR-2） |
 //!
 //! ## ロックダウン回復アクション（`reset-password`/`revert-to-commissioning`、
 //! 2026-08-31 オーナー決定・docs/tag-server-design.md §5.6 制約3/4）
@@ -216,7 +217,7 @@
 //!   [`banto_service_elev::OPERATORS_SERVICE_ACCESS_MASK`]・
 //!   [`banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS`]
 //!
-//! **このモジュールに残したもの**（昇格の境界）: 9 つの固定アクション
+//! **このモジュールに残したもの**（昇格の境界）: 固定アクション（#630 PR-2 で 10 個）
 //! （[`ElevatedAction`]）、アクションごとの引数の検証（`run`）、手順の順序
 //! （`service-install`の install → setup-operators → grant-service-acl →
 //! grant-profile-acl）、グループ名と説明文（[`crate::service_operators::OPERATORS_GROUP`]）、
@@ -234,7 +235,7 @@ use thiserror::Error;
 /// `banto-hub-elev.exe <action>`が受け付ける固定アクション。
 ///
 /// フリーフォームの文字列は受け付けない（[`ElevatedAction::parse`]は既知の
-/// 9種類以外`None`を返す）- モジュール doc の「固定アクション」節参照。
+/// 10種類以外`None`を返す）- モジュール doc の「固定アクション」節参照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElevatedAction {
     SetupOperators,
@@ -248,6 +249,9 @@ pub enum ElevatedAction {
     ResetPassword,
     /// 2026-08-31 追加（同上）。
     RevertToCommissioning,
+    /// #630 PR-2（2026-10-17）: banto-hub-sink の設定ファイルの置き場を整える
+    /// （[`crate::sink_config_prepare`]）。引数なし。
+    PrepareSinkConfig,
 }
 
 impl ElevatedAction {
@@ -260,10 +264,11 @@ impl ElevatedAction {
     pub const AUTOSTART_DISABLE: &'static str = "autostart-disable";
     pub const RESET_PASSWORD: &'static str = "reset-password";
     pub const REVERT_TO_COMMISSIONING: &'static str = "revert-to-commissioning";
+    pub const PREPARE_SINK_CONFIG: &'static str = "prepare-sink-config";
 
     /// [`ElevatedAction::as_str`]が返しうる全文字列 - CLI のヘルプ表示・
     /// エラーメッセージ用（`bin/banto-hub-elev.rs`参照）。
-    pub const ALL_NAMES: [&'static str; 9] = [
+    pub const ALL_NAMES: [&'static str; 10] = [
         Self::SETUP_OPERATORS,
         Self::GRANT_SERVICE_ACL,
         Self::GRANT_PROFILE_ACL,
@@ -273,6 +278,7 @@ impl ElevatedAction {
         Self::AUTOSTART_DISABLE,
         Self::RESET_PASSWORD,
         Self::REVERT_TO_COMMISSIONING,
+        Self::PREPARE_SINK_CONFIG,
     ];
 
     /// 大文字小文字を区別する完全一致のみ受け付ける（セキュリティ境界 -
@@ -289,6 +295,7 @@ impl ElevatedAction {
             Self::AUTOSTART_DISABLE => Some(Self::AutostartDisable),
             Self::RESET_PASSWORD => Some(Self::ResetPassword),
             Self::REVERT_TO_COMMISSIONING => Some(Self::RevertToCommissioning),
+            Self::PREPARE_SINK_CONFIG => Some(Self::PrepareSinkConfig),
             _ => None,
         }
     }
@@ -304,6 +311,7 @@ impl ElevatedAction {
             Self::AutostartDisable => Self::AUTOSTART_DISABLE,
             Self::ResetPassword => Self::RESET_PASSWORD,
             Self::RevertToCommissioning => Self::REVERT_TO_COMMISSIONING,
+            Self::PrepareSinkConfig => Self::PREPARE_SINK_CONFIG,
         }
     }
 }
@@ -431,6 +439,13 @@ pub enum ElevatedError {
     /// なかった（#626。理由の行は[`crate::profile_grant`]が先に出している）。
     #[error("banto-hub-elev: '{0}' を中止しました（理由は上の行）")]
     ProfileAclRefused(&'static str),
+    /// `prepare-sink-config` が確かめで断った・書けなかった（#630 PR-2。理由の行は
+    /// [`crate::sink_config_prepare`] が先に出している）。
+    #[error(
+        "banto-hub-elev: '{}' を中止しました（理由は上の行）",
+        ElevatedAction::PREPARE_SINK_CONFIG
+    )]
+    SinkConfigRefused,
     /// `reset-password`・`revert-to-commissioning`の対象の profile を決められない
     /// （profile-id の許可リスト・マシンの環境のルート。#626 の論点 8）。
     #[error(transparent)]
@@ -949,7 +964,21 @@ pub fn run(action: ElevatedAction, args: &[String]) -> Result<(), ElevatedError>
             let profile_id = args.first().map(String::as_str);
             revert_to_commissioning_action(profile_id)
         }
+        ElevatedAction::PrepareSinkConfig => {
+            reject_extra_args(action, args)?;
+            prepare_sink_config()
+        }
     }
+}
+
+/// [`ElevatedAction::PrepareSinkConfig`]の本体（#630 PR-2）。確かめ終えてから置き場・設定
+/// ファイル・雛形を整える（[`crate::sink_config_prepare::prepare_sink_config`]）。
+#[cfg(windows)]
+pub fn prepare_sink_config() -> Result<(), ElevatedError> {
+    use crate::sink_config_prepare::{self, win::WindowsSinkConfigOps};
+    let mut out = print_line;
+    sink_config_prepare::prepare_sink_config(&WindowsSinkConfigOps, &mut out)
+        .map_err(|_| ElevatedError::SinkConfigRefused)
 }
 
 #[cfg(windows)]
@@ -1212,6 +1241,10 @@ mod tests {
             ElevatedAction::parse("revert-to-commissioning"),
             Some(ElevatedAction::RevertToCommissioning)
         );
+        assert_eq!(
+            ElevatedAction::parse("prepare-sink-config"),
+            Some(ElevatedAction::PrepareSinkConfig)
+        );
     }
 
     #[test]
@@ -1243,7 +1276,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), original_len, "ALL_NAMES に重複がある");
-        assert_eq!(original_len, 9, "固定アクションは9種類のはず");
+        assert_eq!(original_len, 10, "固定アクションは10種類のはず");
     }
 
     #[test]

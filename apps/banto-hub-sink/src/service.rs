@@ -81,7 +81,7 @@ use banto_service_control::{
     StopNotice, UninstallError, UninstallOutcome, PRESHUTDOWN_TIMEOUT,
 };
 
-use crate::config::load_config;
+use crate::config::{load_config, RunMode};
 use crate::log::{self, log_err_line, log_line};
 use crate::run::{run, SidecarOptions, StopRequest};
 
@@ -186,10 +186,12 @@ fn install_lines(
                 "{LABEL}:   起動種別: 手動（Demand）"
             )));
             lines.push(ConsoleLine::Stdout(format!(
-                "{LABEL}: 設定ファイル（{}）を %ProgramData%\\BantoHub\\ （インストーラの既定、\
-                 推奨）か exe と同じディレクトリ（後方互換）に置いてから \
-                 `Start-Service {SERVICE_NAME}` してください",
-                crate::config::DEFAULT_CONFIG_FILE_NAME
+                "{LABEL}: 設定ファイル（{}）を %ProgramData%\\BantoHub\\sink\\ に置き（{} で\
+                 置き場を作り、管理者のメモ帳で中の .example をコピーして編集した後に、\
+                 もう一度 {} を実行）、`Start-Service {SERVICE_NAME}` してください",
+                crate::config::DEFAULT_CONFIG_FILE_NAME,
+                crate::config::PREPARE_COMMAND,
+                crate::config::PREPARE_COMMAND
             )));
         }
     }
@@ -369,10 +371,15 @@ impl ServiceProgram for SinkProgram {
     }
 
     fn run(&self, ctx: &ServiceContext) -> ServiceExit {
-        let config = match load_config() {
+        // LocalSystem のサービスは環境変数の上書きを見ない（#630、`config` のモジュール doc
+        // 「置き場」）。置き場とファイルが保護されていなければ、理由を 1 行ずつ出して止める
+        // （設定ファイルが無い・壊れているのと同じ終了コード 2）。
+        let config = match load_config(RunMode::Service) {
             Ok(config) => config,
             Err(err) => {
-                log_err_line(&format!("{LABEL}: {err}"));
+                for line in err.lines() {
+                    log_err_line(&format!("{LABEL}: {line}"));
+                }
                 return ServiceExit::Specific(EXIT_CODE_CONFIG);
             }
         };
@@ -554,7 +561,7 @@ mod tests {
                 ),
                 out("banto-hub-sink:   起動種別: 手動（Demand）"),
                 out(
-                    r"banto-hub-sink: 設定ファイル（banto-hub-sink.toml）を %ProgramData%\BantoHub\ （インストーラの既定、推奨）か exe と同じディレクトリ（後方互換）に置いてから `Start-Service BantoHubSink` してください"
+                    r"banto-hub-sink: 設定ファイル（banto-hub-sink.toml）を %ProgramData%\BantoHub\sink\ に置き（banto-hub-elev.exe prepare-sink-config で置き場を作り、管理者のメモ帳で中の .example をコピーして編集した後に、もう一度 banto-hub-elev.exe prepare-sink-config を実行）、`Start-Service BantoHubSink` してください"
                 ),
             ]
         );

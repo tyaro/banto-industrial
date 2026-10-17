@@ -165,7 +165,7 @@ const PROFILE_ID_RULE: &str =
 
 // --- ルートの文言 ------------------------------------------------------------------
 
-fn well_known_text(root: &Path, refusal: &WellKnownRootRefusal) -> String {
+pub(crate) fn well_known_text(root: &Path, refusal: &WellKnownRootRefusal) -> String {
     match refusal {
         WellKnownRootRefusal::NetworkOrSpecial => format!(
             "Hub のルート（{}）はネットワークの場所か特殊なパス（\\\\…）です。ローカルのドライブのフォルダにしてください",
