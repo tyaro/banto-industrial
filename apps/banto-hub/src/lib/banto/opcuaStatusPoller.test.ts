@@ -83,4 +83,55 @@ describe('OPC UA の状態の読み直し（#634、PR #650 の Codex P2）', () 
 		await vi.advanceTimersByTimeAsync(3000);
 		expect(load).toHaveBeenCalledTimes(1);
 	});
+
+	it('PUT 待ち → stop → PUT 完了の順でも、読み直しは再開しない（#654）', async () => {
+		const load = vi.fn(async () => status('starting'));
+		const onStatus = vi.fn();
+		const poller = new OpcUaStatusPoller({ load, onStatus, onError: vi.fn() });
+		await poller.start();
+		expect(load).toHaveBeenCalledTimes(1);
+
+		// 保存（PUT）を待つあいだに画面を離れる。PUT が返ってから呼ぶ読み直しは何もしない。
+		let finishPut: () => void = () => {};
+		const put = new Promise<void>((resolve) => (finishPut = resolve));
+		const save = (async () => {
+			await put;
+			await poller.refresh();
+		})();
+		poller.stop();
+		finishPut();
+		await save;
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(load).toHaveBeenCalledTimes(1);
+		expect(onStatus).toHaveBeenCalledTimes(1);
+
+		// 再開は明示的な start だけ。
+		await poller.start();
+		expect(load).toHaveBeenCalledTimes(2);
+	});
+
+	it('最初の取得が失敗して状態が無いときも、1 回は読み直す', async () => {
+		const responses: Array<() => Promise<OpcUaStatus>> = [
+			async () => {
+				throw new Error('boom');
+			},
+			async () => {
+				throw new Error('boom again');
+			},
+			async () => status('running')
+		];
+		const load = vi.fn(() => responses.shift()!());
+		const onError = vi.fn();
+		const poller = new OpcUaStatusPoller({ load, onStatus: vi.fn(), onError });
+		await poller.refresh();
+		expect(onError).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(load).toHaveBeenCalledTimes(2);
+		expect(onError).toHaveBeenCalledTimes(2);
+
+		// 読み直しは 1 回だけ（失敗が続いても叩き続けない）。
+		await vi.advanceTimersByTimeAsync(10000);
+		expect(load).toHaveBeenCalledTimes(2);
+	});
 });
