@@ -27,6 +27,12 @@
 //!    報告する（2026-10-15 オーナー決定 D2。以前は報告せずに終わり、SCM には
 //!    最後の状態が残っていた）。
 //!
+//! 本体は起動の途中に [`ServiceContext::report_start_progress`] で START_PENDING
+//! の checkpoint を進められ、開始の引数（`ServiceMain` の argv）は
+//! [`ServiceContext::start_args`] で読める（#623 PR-1d）。Running を報告せずに
+//! [`ServiceExit`] を返すと START_PENDING から直接 STOPPED になる（エンジンを
+//! 動かさずに終わる開始の引数。シェルは Running を見ないので運用中と誤らない）。
+//!
 //! 本体は Stopped を報告できない（報告の口を持たない）。移す前の Hub は
 //! async ブロックの中の `return` が関数を抜けないせいで Stopped を 2 回
 //! 報告しかけ、`StoppedGate`（#330）で止めていたが、本体が終了コードを
@@ -93,6 +99,7 @@
 //! `SetServiceStatus` を差し込むだけ。
 
 use std::any::Any;
+use std::ffi::OsString;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::shutdown::{
@@ -161,6 +168,8 @@ pub trait ServiceProgram: Send + Sync + 'static {
 
     /// 本体。起動できたら [`ServiceContext::report_running`] を呼び、停止の
     /// 合図を待ち、後始末をして終わり方を返す。Stopped はランナーが報告する。
+    /// 起動が長いときは途中で [`ServiceContext::report_start_progress`] を呼ぶ。
+    /// Running を報告せずに返してもよい（START_PENDING から STOPPED へ）。
     fn run(&self, ctx: &ServiceContext) -> ServiceExit;
 }
 
@@ -264,9 +273,40 @@ pub struct ServiceContext {
     shared: Arc<StopShared>,
     reporter: ServiceStatusReporter<ServiceExit>,
     deferred: Arc<Mutex<Vec<Box<dyn Send>>>>,
+    /// `ServiceMain` の argv（[`ServiceContext::start_args`]）。
+    start_args: Arc<Vec<OsString>>,
 }
 
 impl ServiceContext {
+    /// SCM が開始のときに渡した引数（`ServiceMain` の argv）。**先頭
+    /// （`[0]`）はサービス名**で、`StartService` の引数
+    /// （[`crate::ServiceManager::start_with_args`]）は `[1..]`。引数なしの
+    /// 開始（`sc start`・`Start-Service` の既定）では先頭だけ。SCM の外
+    /// （試験）では空。既存の製品は見ない（見ないままで挙動は変わらない）。
+    ///
+    /// **`[1..]` は信頼できない入力**: `SERVICE_START` の権利を持つ人
+    /// （Operators でも）が、どんな語をいくつでも渡せる。決まった値との
+    /// **完全一致だけ**で分岐し、パス・数値・コマンドとして解釈しない。
+    /// 知らない語は無視して通常の開始にするか、断って終える。
+    pub fn start_args(&self) -> &[OsString] {
+        &self.start_args
+    }
+
+    /// 起動の途中（START_PENDING）の進み具合を報告する: checkpoint を 1 つ
+    /// 進め、`wait_hint`（次の報告までの見込み。シェルはこの間「進んで
+    /// いる」と待つ）を載せる。Running を報告する**前**にだけ使える。
+    /// Running・停止が始まった後は何も報告せず `false`（`wait_hint` が 0
+    /// でも `false`）。Running を報告せずに [`ServiceExit`] を返すと
+    /// START_PENDING から直接 STOPPED になる（`relax-only` の道）。
+    ///
+    /// **START_PENDING の間、SCM は STOP を `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`
+    /// （1061）で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
+    /// 長い起動は、止められない時間を延ばす。`wait_hint` は約 49.7 日
+    /// （`u32` のミリ秒）で丸める。
+    pub fn report_start_progress(&self, wait_hint: std::time::Duration) -> bool {
+        self.reporter.report_start_progress(wait_hint)
+    }
+
     /// Running を報告する。起動中に停止が届いていた（または停止が始まって
     /// いた）ら報告せず `false`（受け付けを立てた瞬間に停止へ入るため。
     /// 本体はそのまま停止の処理へ進む）。
@@ -363,7 +403,22 @@ fn debug_test_panic_after_running() {
 /// 登録に失敗したら、その理由をログに書いて `None`（報告の口が無いので
 /// Stopped も報告できない - 移す前と同じ）。それ以外は Stopped に載せた
 /// 終わり方。
-pub fn run_program_with<P, R, F>(mut program: P, register: R) -> Option<ServiceExit>
+pub fn run_program_with<P, R, F>(program: P, register: R) -> Option<ServiceExit>
+where
+    P: ServiceProgram,
+    R: FnOnce(ControlHandler, ErrorLog) -> Result<F, String>,
+    F: Fn(&ServiceStatusPlan, ServiceExit) + Send + Sync + 'static,
+{
+    run_program_with_args(program, Vec::new(), register)
+}
+
+/// [`run_program_with`] に開始の引数（`ServiceMain` の argv）を渡す版
+/// （[`ServiceContext::start_args`] になる）。
+pub fn run_program_with_args<P, R, F>(
+    mut program: P,
+    start_args: Vec<OsString>,
+    register: R,
+) -> Option<ServiceExit>
 where
     P: ServiceProgram,
     R: FnOnce(ControlHandler, ErrorLog) -> Result<F, String>,
@@ -404,6 +459,7 @@ where
         shared,
         reporter: reporter.clone(),
         deferred: Arc::new(Mutex::new(Vec::new())),
+        start_args: Arc::new(start_args),
     };
     let exit = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.run(&ctx))) {
         Ok(exit) => exit,
