@@ -201,10 +201,19 @@ pub fn acquire_for_db(
     let lock_file = canonical.with_file_name(lock_name);
 
     match banto_instance_lock::try_acquire(&mutex_name, &lock_file, host.as_str()) {
-        Ok(guard) => Ok(InstanceGuard {
-            _guard: guard,
-            scope: id,
-        }),
+        Ok(guard) => {
+            // 診断ファイルを書かなかった・作ったファイルを消せなかった理由
+            // （`banto_instance_lock` はログを出さない）。排他は取れているので起動は
+            // 続け、標準エラーに 1 行出す（chronogazer-server は `SetStdHandle` で
+            // ログファイルへ向けているので、サービスでもそこへ残る）。
+            if let Some(warning) = guard.diagnostics_warning() {
+                eprintln!("chronogazer: [WARN] 排他の診断ファイル: {warning}");
+            }
+            Ok(InstanceGuard {
+                _guard: guard,
+                scope: id,
+            })
+        }
         Err(InstanceLockError::AlreadyHeld { owner }) => Err(InstanceLockFailure::AlreadyRunning {
             db: canonical,
             owner,

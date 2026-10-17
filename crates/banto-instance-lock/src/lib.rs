@@ -37,8 +37,10 @@
 //! つぶすので気付かれない）。今は書き・読みとも `diag_file` が辿らずに開き、
 //! 開いたハンドルで「reparse point でない・通常のファイル・リンク数 1・本当の
 //! パスが渡されたパスと同じ」を確かめてから、書くときだけ `set_len(0)` する。
-//! 合わなければ書かない（Windows は排他の実体ではないので致命的にせず
-//! `tracing` に警告を 1 行。非 Windows は flock の対象なので `Io`）・読みは
+//! 合わなければ書かない（Windows は排他の実体ではないので致命的にせず、理由を
+//! [`InstanceLockGuard::diagnostics_warning`] で呼び出し側へ返す。この crate は
+//! ログを出さない - アプリが自分のログに 1 行出す。非 Windows は flock の対象
+//! なので `Io`）・読みは
 //! [`OwnerInfoError::Corrupt`]。この crate は診断ファイルを消さない（ガードの
 //! `Drop` は mutex のハンドル・fd を閉じるだけ。例外は、Windows でこの呼び出しが
 //! 新しく作ったファイルが確かめに合わなかったときで、それはハンドルで消す）。
@@ -99,6 +101,9 @@ pub enum InstanceLockError {
 /// [`try_acquire`] が成功した間だけ生存するガード。
 pub struct InstanceLockGuard {
     lock_file_path: PathBuf,
+    // 診断ファイルを書かなかった・作ったファイルを消せなかった理由（Windows だけ。
+    // 取得の成否には関与しない）。呼び出し側がアプリのログに出す。
+    diagnostics_warning: Option<String>,
     // 非 Windows: このファイルへの `flock(LOCK_EX)` が排他の実体。`File` の
     // `Drop` が fd を閉じる時点でカーネルが自動で unlock する。
     #[cfg(not(windows))]
@@ -111,6 +116,16 @@ impl InstanceLockGuard {
     /// 診断ファイルのパス。
     pub fn lock_file_path(&self) -> &Path {
         &self.lock_file_path
+    }
+
+    /// 取得は成功したが、診断ファイルを書かなかった（リンク・ハードリンク・外を
+    /// 指していた・開けなかった等）、または確かめに合わず作ったファイルを消せな
+    /// かったときの理由。無ければ `None`。**この crate はログを出さない**ので、
+    /// 呼び出し側がアプリのログに 1 行出すこと。排他そのものには影響しない
+    /// （Windows は mutex が取れれば成功）。非 Windows は診断ファイルが flock の
+    /// 対象なので、書けなければ取得が `Io` で失敗し、常に `None`。
+    pub fn diagnostics_warning(&self) -> Option<&str> {
+        self.diagnostics_warning.as_deref()
     }
 }
 
@@ -193,6 +208,7 @@ fn acquire_unix(lock_path: &Path, host_kind: &str) -> Result<InstanceLockGuard, 
 
     Ok(InstanceLockGuard {
         lock_file_path: lock_path.to_path_buf(),
+        diagnostics_warning: None,
         _lock_file: file,
     })
 }
@@ -263,30 +279,35 @@ fn acquire_windows(
     // 診断用ファイル — Windows では排他の実体ではないので、書き込み失敗は
     // 致命的にしない。リンクを辿らずに開き、ハンドルで確かめてから書く
     // （crate doc「診断ファイルはリンクを辿らない」）。
-    write_diagnostics_windows(lock_path, host_kind);
+    let diagnostics_warning = write_diagnostics_windows(lock_path, host_kind);
 
     Ok(InstanceLockGuard {
         lock_file_path: lock_path.to_path_buf(),
+        diagnostics_warning,
         _mutex: WindowsMutexHandle(handle),
     })
 }
 
 /// 診断ファイルへ書く（Windows）。確かめに合わない・開けないときは書かずに
-/// 警告を 1 行出すだけ（排他は mutex が持っている）。
+/// 理由を返すだけ（排他は mutex が持っている。ログは呼び出し側）。
 #[cfg(windows)]
-fn write_diagnostics_windows(lock_path: &Path, host_kind: &str) {
+fn write_diagnostics_windows(lock_path: &Path, host_kind: &str) -> Option<String> {
+    let path = lock_path.display();
     match diag_file::open_for_write(lock_path) {
-        Ok(diag_file::Opened::File(mut file)) => {
-            if let Err(err) = write_owner_info(&mut file, host_kind) {
-                tracing::warn!(path = %lock_path.display(), "診断ファイルを書けませんでした: {err}");
+        Ok((diag_file::Opened::File(mut file), warning)) => {
+            match write_owner_info(&mut file, host_kind) {
+                Ok(()) => warning,
+                Err(err) => Some(format!("診断ファイル {path} を書けませんでした: {err}")),
             }
         }
-        Ok(diag_file::Opened::Refused(refusal)) => {
-            tracing::warn!(path = %lock_path.display(), "診断ファイルを書きません: {refusal}");
+        Ok((diag_file::Opened::Refused(refusal), warning)) => {
+            let mut msg = format!("診断ファイル {path} を書きません: {refusal}");
+            if let Some(warning) = warning {
+                msg.push_str(&format!("（{warning}）"));
+            }
+            Some(msg)
         }
-        Err(err) => {
-            tracing::warn!(path = %lock_path.display(), "診断ファイルを開けませんでした: {err}");
-        }
+        Err(err) => Some(format!("診断ファイル {path} を開けませんでした: {err}")),
     }
 }
 
@@ -868,21 +889,31 @@ mod tests {
     }
 
     /// 取得を試みる。Windows は mutex が排他なので成功する（診断ファイルだけ
-    /// 書かない）。非 Windows は flock の対象そのものなので `Io` で断る。
-    fn acquire_next_to_a_link(tag: &str, lock: &Path) {
+    /// 書かない。理由は `diagnostics_warning()` で返る）。非 Windows は flock の対象
+    /// そのものなので `Io` で断る。Windows では警告（理由）を返す。
+    fn acquire_next_to_a_link(tag: &str, lock: &Path) -> Option<String> {
         let result = try_acquire(&unique_mutex_name(tag), lock, "svc");
         if cfg!(windows) {
-            assert!(
-                result.is_ok(),
-                "Windows は mutex で取れる: {:?}",
-                result.err()
-            );
+            let guard = result.expect("Windows は mutex で取れる");
+            let warning = guard.diagnostics_warning().map(str::to_string);
+            assert!(warning.is_some(), "書かなかった理由が返る");
+            warning
         } else {
             assert!(
                 matches!(result, Err(InstanceLockError::Io(_))),
                 "非 Windows はリンクを断る"
             );
+            None
         }
+    }
+
+    /// ふつうに書けたときは警告が無い。
+    #[test]
+    fn a_normal_acquire_has_no_diagnostics_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_path(&dir, "ok.lock");
+        let guard = try_acquire(&unique_mutex_name("normal"), &lock, "svc").unwrap();
+        assert_eq!(guard.diagnostics_warning(), None);
     }
 
     /// ハードリンクは一般利用者でも作れる（権限が要らない）ので、どの環境でも必ず走る。
@@ -895,7 +926,12 @@ mod tests {
         let lock = lock_path(&dir, "x.lock");
         std::fs::hard_link(&victim, &lock).unwrap();
 
-        acquire_next_to_a_link("hard", &lock);
+        let warning = acquire_next_to_a_link("hard", &lock);
+        if cfg!(windows) {
+            let warning = warning.unwrap();
+            assert!(warning.contains("ハードリンク"), "理由を含む: {warning}");
+            assert!(warning.contains("x.lock"), "パスを含む: {warning}");
+        }
         assert_victim_untouched(&victim);
         let read = read_owner_info_detailed(&lock);
         assert!(
@@ -924,7 +960,11 @@ mod tests {
             return;
         }
 
-        acquire_next_to_a_link("sym", &lock);
+        let warning = acquire_next_to_a_link("sym", &lock);
+        if cfg!(windows) {
+            let warning = warning.unwrap();
+            assert!(warning.contains("リンク"), "理由を含む: {warning}");
+        }
         assert_victim_untouched(&victim);
         let read = read_owner_info_detailed(&lock);
         assert!(
@@ -938,7 +978,7 @@ mod tests {
         std::os::windows::fs::symlink_file(&dangling_target, &dangling).unwrap();
         #[cfg(not(windows))]
         std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
-        acquire_next_to_a_link("dangling", &dangling);
+        let _ = acquire_next_to_a_link("dangling", &dangling);
         assert!(
             !dangling_target.exists(),
             "壊れたリンクの先にファイルを作った"
@@ -967,6 +1007,10 @@ mod tests {
         let lock = junction.join("x.lock");
         let _guard =
             try_acquire(&unique_mutex_name("junction"), &lock, "svc").expect("mutex は取れる");
+        let warning = _guard
+            .diagnostics_warning()
+            .expect("書かなかった理由が返る");
+        assert!(warning.contains("本当の場所"), "理由を含む: {warning}");
         assert_victim_untouched(&victim);
         let read = read_owner_info_detailed(&lock);
         assert!(

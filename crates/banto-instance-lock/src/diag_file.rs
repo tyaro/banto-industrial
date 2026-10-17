@@ -16,7 +16,9 @@
 //!   途中の要素がジャンクション・シンボリックリンクにされていて外へ出た場合を捕まえる。
 //!   確かめた後にだけ `set_len(0)` して書く（ハンドルが指す実体は確かめた後に
 //!   すり替えられない）。この呼び出しで作ったファイルが確かめに合わなければ、
-//!   ハンドルで消す（外に空のファイルを残さない）。
+//!   ハンドルで消す（外に空のファイルを残さない）。消せなかったときは警告の文字列を
+//!   呼び出し側へ返す（`InstanceLockGuard::diagnostics_warning`。この crate は
+//!   ログを出さない - 呼び出し側のアプリが自分のログに 1 行出す）。
 //! - **非 Windows**: `O_NOFOLLOW`（最後の要素のシンボリックリンクを断る）と、開いた
 //!   fd の `fstat` で「通常のファイル・リンク数 1」を確かめる。非 Windows は開発・CI
 //!   用なので、途中のディレクトリのリンクまでは見ない。読みは `O_NONBLOCK` も付ける
@@ -244,7 +246,10 @@ mod windows_impl {
     }
 
     /// 書くために開く。中身は**切り詰めない**（確かめた後に呼ぶ側が `set_len(0)`）。
-    pub(crate) fn open_for_write(path: &Path) -> io::Result<Opened> {
+    ///
+    /// 2 つ目の値は、この呼び出しで作った確かめに合わないファイルを消せなかった
+    /// ときの警告（呼び出し側がアプリのログに出す）。
+    pub(crate) fn open_for_write(path: &Path) -> io::Result<(Opened, Option<String>)> {
         const WRITE: u32 = FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES;
         let (handle, created) = match open_raw(path, WRITE | DELETE, CREATE_NEW) {
             Ok(handle) => (handle, true),
@@ -257,35 +262,38 @@ mod windows_impl {
             Err(err) => return Err(err),
         };
         let refusal = match verify(&handle, path) {
-            Ok(None) => return Ok(Opened::File(File::from(handle))),
+            Ok(None) => return Ok((Opened::File(File::from(handle)), None)),
             Ok(Some(refusal)) => refusal,
             Err(err) => {
                 if created {
-                    delete_created(&handle, path);
+                    if let Some(warning) = delete_created(&handle, path) {
+                        // 確かめ自体が失敗した経路。消せなかったことも理由に足す。
+                        return Err(io::Error::new(err.kind(), format!("{err}（{warning}）")));
+                    }
                 }
                 return Err(err);
             }
         };
-        if created {
+        let warning = if created {
             // 作ったのが外（途中のリンクの先）なら、空のファイルを残さない。
-            delete_created(&handle, path);
-        }
-        Ok(Opened::Refused(refusal))
+            delete_created(&handle, path)
+        } else {
+            None
+        };
+        Ok((Opened::Refused(refusal), warning))
     }
 
     /// この呼び出しで作ったファイルを消す。消せなければ、外に空のファイルが残った
-    /// かもしれないことを本当のパスつきで警告 1 行に出す（黙って捨てない）。
-    fn delete_created(handle: &OwnedHandle, path: &Path) {
-        if let Err(err) = delete_by_handle(handle) {
-            let actual = final_path(handle)
-                .map(|actual| actual.display().to_string())
-                .unwrap_or_else(|_| "(不明)".to_string());
-            tracing::warn!(
-                path = %path.display(),
-                actual = %actual,
-                "確かめに合わなかった診断ファイルを作ったが消せませんでした（空のファイルが残っている可能性があります）: {err}"
-            );
-        }
+    /// かもしれないことを本当のパスつきの警告として返す（黙って捨てない）。
+    fn delete_created(handle: &OwnedHandle, path: &Path) -> Option<String> {
+        let err = delete_by_handle(handle).err()?;
+        let actual = final_path(handle)
+            .map(|actual| actual.display().to_string())
+            .unwrap_or_else(|_| "(不明)".to_string());
+        Some(format!(
+            "確かめに合わなかった診断ファイル {} を作ったが消せませんでした（空のファイルが残っている可能性があります。実際の場所: {actual}）: {err}",
+            path.display()
+        ))
     }
 
     /// 読むために開く（既にあるものだけ）。

@@ -166,7 +166,18 @@ pub fn try_acquire_profile_lock(
     let mutex_name = crate::profile_paths::mutex_name(&paths.profile_id);
 
     match banto_instance_lock::try_acquire(&mutex_name, &lock_path, &host_kind.to_string()) {
-        Ok(guard) => Ok(ProfileLockGuard { guard }),
+        Ok(guard) => {
+            // 診断ファイルを書かなかった・作ったファイルを消せなかった理由
+            // （`banto_instance_lock` はログを出さない）。排他は取れているので
+            // 起動は続け、Hub のログ（サービスモードではログファイルへも写る）に
+            // 1 行出す。
+            if let Some(warning) = guard.diagnostics_warning() {
+                crate::hub_log::log_err_line(&format!(
+                    "banto-hub: [WARN] 排他の診断ファイル: {warning}"
+                ));
+            }
+            Ok(ProfileLockGuard { guard })
+        }
         Err(InstanceLockError::AlreadyHeld { owner }) => Err(ProfileLockError::AlreadyHeld {
             profile_id: paths.profile_id.clone(),
             owner,
