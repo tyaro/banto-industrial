@@ -1057,8 +1057,9 @@ fn service_uninstall<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
             )));
             EXIT_OK
         }
-        // 管理者として動いているので、開けないのはほぼ「未登録」。
-        Err(UninstallError::NotInstalled | UninstallError::Open(_)) => EXIT_PRECONDITION,
+        // 未登録だけが前提不足（先に service-install をすれば解除するものができる）。開けなかった
+        // （権限不足・SCM の不調など。`Open`）は service-install を先にしても直らないので失敗。
+        Err(UninstallError::NotInstalled) => EXIT_PRECONDITION,
         Err(_) => EXIT_FAILED,
     }
 }
@@ -1101,8 +1102,10 @@ fn setup_operators<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
     EXIT_OK
 }
 
-/// `ERROR_SERVICE_DOES_NOT_EXIST`。
-const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+/// `ERROR_SERVICE_DOES_NOT_EXIST`（定義は `banto_service_control` の 1 か所。`ElevError` の
+/// `os_error` は u32）。
+const ERROR_SERVICE_DOES_NOT_EXIST: u32 =
+    banto_service_control::ERROR_SERVICE_DOES_NOT_EXIST as u32;
 
 fn grant_service_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
     match ops.grant_service_acl() {
@@ -1118,6 +1121,15 @@ fn grant_service_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
         Ok(ServiceAclOutcome::Replaced) => {
             out(out_line(&format!(
                 "サービス '{SERVICE_NAME}' の DACL の '{}' の ACE を、既定の権利（{}: 照会・開始・停止）に置き換えました",
+                OPERATORS_GROUP.name,
+                banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
+            )));
+            EXIT_OK
+        }
+        // ACE は既にあるが、DACL の並びが正規でなかったので整え直した（足してはいない）。#658
+        Ok(ServiceAclOutcome::Reordered) => {
+            out(out_line(&format!(
+                "サービス '{SERVICE_NAME}' の DACL には '{}' の ACE（{}: 照会・開始・停止）が既にあります（ACE の並びを整え直しました）",
                 OPERATORS_GROUP.name,
                 banto_service_elev::OPERATORS_SERVICE_SDDL_RIGHTS
             )));

@@ -302,8 +302,22 @@ pub fn grant_service_operators(
     let mut operators_sid = lookup_account_sid(group.name)?
         .ok_or_else(|| ElevError::GroupNotFound(group.name.to_string()))?;
 
+    // 結果の出し分け（消えた ACE が Operators のものか）に使う文字列形式。
+    let sid_text = crate::sid_bytes_to_string(&operators_sid).ok_or_else(|| {
+        ElevError::LookupAccountName {
+            name: group.name.to_string(),
+            // ERROR_INVALID_SID
+            os_error: 1337,
+        }
+    })?;
+
     let scm = open_scm()?;
-    let result = grant_with_scm(scm, service_name, operators_sid.as_mut_ptr() as PSID);
+    let result = grant_with_scm(
+        scm,
+        service_name,
+        operators_sid.as_mut_ptr() as PSID,
+        &sid_text,
+    );
     // SAFETY: `scm` は `open_scm` が返した有効なハンドル。
     unsafe { CloseServiceHandle(scm) };
     result
@@ -322,6 +336,7 @@ fn grant_with_scm(
     scm: SC_HANDLE,
     service_name: &str,
     operators_sid: PSID,
+    sid_text: &str,
 ) -> Result<ServiceAclOutcome, ElevError> {
     let service_wide = to_wide(service_name);
     // SAFETY: `scm` は呼び出し元が開いた有効なハンドル。
@@ -333,7 +348,7 @@ fn grant_with_scm(
         });
     }
 
-    let result = grant_with_service(service, service_name, operators_sid);
+    let result = grant_with_service(service, service_name, operators_sid, sid_text);
     // SAFETY: `service` は直前に `OpenServiceW` が返した有効なハンドル。
     unsafe { CloseServiceHandle(service) };
     result
@@ -343,6 +358,7 @@ fn grant_with_service(
     service: SC_HANDLE,
     service_name: &str,
     operators_sid: PSID,
+    sid_text: &str,
 ) -> Result<ServiceAclOutcome, ElevError> {
     // 1 回目: 必要な大きさの問い合わせ。
     let mut needed: u32 = 0;
@@ -386,7 +402,11 @@ fn grant_with_service(
     let mut new_sd = absolute_sd_with_dacl(&merged)?;
 
     // 足した結果が今と同じなら（既に同じ ACE がある）、書かない。
-    let outcome = outcome_for(sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR, &mut new_sd);
+    let outcome = outcome_for(
+        sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR,
+        &mut new_sd,
+        sid_text,
+    );
     if outcome == ServiceAclOutcome::AlreadyPresent {
         return Ok(outcome);
     }
@@ -415,10 +435,13 @@ fn grant_with_service(
 fn outcome_for(
     current: PSECURITY_DESCRIPTOR,
     new_sd: &mut SECURITY_DESCRIPTOR,
+    operators_sid: &str,
 ) -> ServiceAclOutcome {
     let merged = dacl_sddl_of(new_sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR);
     match (dacl_sddl_of(current), merged) {
-        (Some(current), Some(merged)) => crate::classify_dacl_change(&current, &merged),
+        (Some(current), Some(merged)) => {
+            crate::classify_dacl_change(&current, &merged, operators_sid)
+        }
         _ => ServiceAclOutcome::Added,
     }
 }
@@ -603,10 +626,11 @@ mod tests {
     /// 決める。`existing` は SDDL（`D:P(...)` などの制御フラグ付きも可）。
     fn outcome(existing: &str, sid: &str) -> ServiceAclOutcome {
         let sd = sd_from_sddl(existing);
+        let sid_str = sid;
         let sid = sid_from_str(sid);
         let acl = merged_dacl(sd.0, sid.0).expect("merge");
         let mut new_sd = absolute_sd_with_dacl(&acl).expect("absolute sd");
-        outcome_for(sd.0, &mut new_sd)
+        outcome_for(sd.0, &mut new_sd, sid_str)
     }
 
     #[test]
@@ -622,6 +646,15 @@ mod tests {
         // (c) 同じ相手に別の権利 → Replaced。
         let wider = format!("{EXISTING}(A;;CCDCLCRPWP;;;{OPERATORS})");
         assert_eq!(outcome(&wider, OPERATORS), ServiceAclOutcome::Replaced);
+        // (e) 既にあるが並びが正規でない（許可の後ろに拒否）→ Reordered（足していない）。
+        // `SetEntriesInAclW` は拒否を許可より前に並べ直すので、書く側に倒れる。
+        let ours_ace = crate::operators_ace_sddl(OPERATORS).unwrap();
+        let non_canonical = format!("{with_ours}(D;;CCLC;;;S-1-5-21-1-2-3-3003)");
+        assert_eq!(
+            outcome(&non_canonical, OPERATORS),
+            ServiceAclOutcome::Reordered,
+            "{non_canonical} / {ours_ace}"
+        );
         // (d) 元の記述子に制御フラグが付いていても、既にあれば AlreadyPresent、無ければ Added。
         for flags in ["P", "AI", "PAI"] {
             let existing_with = format!("D:{flags}{}", with_ours.trim_start_matches("D:"));
