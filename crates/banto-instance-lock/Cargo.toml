@@ -20,6 +20,9 @@ sha2 = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # 診断ファイルを辿らずに開いて確かめる（`CreateFileW` +
+    # `FILE_FLAG_OPEN_REPARSE_POINT`・`GetFinalPathNameByHandleW` 等、#623 PR-2）。
+    "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
 

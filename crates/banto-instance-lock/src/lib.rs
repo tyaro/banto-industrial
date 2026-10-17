@@ -21,7 +21,35 @@
 //!   Windows ではロックの正当性そのものは持たない。
 //! - **非 Windows**: `Global\` 名前空間が無いので、診断ファイルへの
 //!   `flock(LOCK_EX|LOCK_NB)` **自体**を排他の実体にする（Linux CI でも
-//!   二重取得の失敗を検証できる）。
+//!   二重取得の失敗を検証できる）。**非 Windows は開発・CI 用**で、特権の
+//!   サービス（root）として一般利用者が書ける場所を扱う運用は想定しない。
+//!   診断ファイルの確かめが最後の要素のリンクとハードリンクだけで、途中の
+//!   ディレクトリのリンクまで見ないのはこの前提による（`diag_file`）。
+//!
+//! # 診断ファイルはリンクを辿らない（#623 PR-2）
+//!
+//! 診断ファイルはデータのルート（ChronoGazer の `<root>`、banto-hub の
+//! `profiles\<id>`。どちらもインストール利用者が「変更」を持つ）に置かれる。
+//! 以前は取得後にパスのまま `create + truncate` で開いていたため、利用者が
+//! そのパスを外のファイルへのシンボリックリンク・ハードリンクにしておく、または
+//! 途中のフォルダをジャンクションにしておくと、**LocalSystem のサービスが外の
+//! ファイルを 0 バイトに切り詰めて書いた**（任意ファイルの破壊。失敗は握り
+//! つぶすので気付かれない）。今は書き・読みとも `diag_file` が辿らずに開き、
+//! 開いたハンドルで「reparse point でない・通常のファイル・リンク数 1・本当の
+//! パスが渡されたパスと同じ」を確かめてから、書くときだけ `set_len(0)` する。
+//! 合わなければ書かない（Windows は排他の実体ではないので致命的にせず、理由を
+//! [`InstanceLockGuard::diagnostics_warning`] で呼び出し側へ返す。この crate は
+//! ログを出さない - アプリが自分のログに 1 行出す。非 Windows は flock の対象
+//! なので `Io`）・読みは
+//! [`OwnerInfoError::Corrupt`]。この crate は診断ファイルを消さない（ガードの
+//! `Drop` は mutex のハンドル・fd を閉じるだけ。例外は、Windows でこの呼び出しが
+//! 新しく作ったファイルが確かめに合わなかったときで、それはハンドルで消す）。
+//!
+//! 渡されたパスの途中にジャンクション・マウントポイント・`subst` があると、
+//! 正当な構成でも本当のパスと食い違って書かれない。呼び出し側は**管理者が
+//! 決める部分（ルート）だけ**を `canonicalize` してから、利用者が「変更」を
+//! 持つ部分を連結して渡すこと（利用者の部分まで解くと、植えられたリンクを
+//! 解いてしまい確かめが無意味になる）。
 //!
 //! ガード（[`InstanceLockGuard`]）を持っている間だけ排他が続く。`Drop` で
 //! 返る（Windows: handle の `CloseHandle`／非 Windows: fd が閉じて自動解放）。
@@ -35,13 +63,15 @@
 //! [`path_scope_id`] が対象パスを正規化して短い安定 ID にする（mutex 名に
 //! `\` や長いパスを入れられないため）。
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod diag_file;
 
 /// 診断ファイルの中身（診断用 JSON）。排他の正当性はこの内容ではなく OS の
 /// 機構（Windows: named mutex／非 Windows: flock）が持つ。
@@ -71,6 +101,9 @@ pub enum InstanceLockError {
 /// [`try_acquire`] が成功した間だけ生存するガード。
 pub struct InstanceLockGuard {
     lock_file_path: PathBuf,
+    // 診断ファイルを書かなかった・作ったファイルを消せなかった理由（Windows だけ。
+    // 取得の成否には関与しない）。呼び出し側がアプリのログに出す。
+    diagnostics_warning: Option<String>,
     // 非 Windows: このファイルへの `flock(LOCK_EX)` が排他の実体。`File` の
     // `Drop` が fd を閉じる時点でカーネルが自動で unlock する。
     #[cfg(not(windows))]
@@ -83,6 +116,16 @@ impl InstanceLockGuard {
     /// 診断ファイルのパス。
     pub fn lock_file_path(&self) -> &Path {
         &self.lock_file_path
+    }
+
+    /// 取得は成功したが、診断ファイルを書かなかった（リンク・ハードリンク・外を
+    /// 指していた・開けなかった等）、または確かめに合わず作ったファイルを消せな
+    /// かったときの理由。無ければ `None`。**この crate はログを出さない**ので、
+    /// 呼び出し側がアプリのログに 1 行出すこと。排他そのものには影響しない
+    /// （Windows は mutex が取れれば成功）。非 Windows は診断ファイルが flock の
+    /// 対象なので、書けなければ取得が `Io` で失敗し、常に `None`。
+    pub fn diagnostics_warning(&self) -> Option<&str> {
+        self.diagnostics_warning.as_deref()
     }
 }
 
@@ -139,13 +182,18 @@ fn acquire_unix(lock_path: &Path, host_kind: &str) -> Result<InstanceLockGuard, 
 
     // `truncate(false)`: `flock` 取得前に既存内容を消さない — 取得に失敗した
     // とき、既存の `OwnerInfo` を診断用に読み直すため。取得成功後の上書きは
-    // `write_owner_info` が明示的に `set_len(0)` する。
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
+    // `write_owner_info` が明示的に `set_len(0)` する。リンクは辿らない
+    // （`O_NOFOLLOW` + fd で通常のファイル・リンク数 1 を確かめる。crate doc
+    // 「診断ファイルはリンクを辿らない」）。ここでは flock の対象そのものなので、
+    // 合わなければ `Io`。
+    let mut file = match diag_file::open_for_lock(lock_path)? {
+        diag_file::Opened::File(file) => file,
+        diag_file::Opened::Refused(refusal) => {
+            return Err(InstanceLockError::Io(std::io::Error::other(
+                refusal.to_string(),
+            )));
+        }
+    };
 
     // `LOCK_NB`: 既に他プロセスが保持していれば即座に `EWOULDBLOCK`（起動処理を
     // 止めない）。
@@ -160,6 +208,7 @@ fn acquire_unix(lock_path: &Path, host_kind: &str) -> Result<InstanceLockGuard, 
 
     Ok(InstanceLockGuard {
         lock_file_path: lock_path.to_path_buf(),
+        diagnostics_warning: None,
         _lock_file: file,
     })
 }
@@ -228,20 +277,38 @@ fn acquire_windows(
     }
 
     // 診断用ファイル — Windows では排他の実体ではないので、書き込み失敗は
-    // 致命的にしない。
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(lock_path)
-    {
-        let _ = write_owner_info(&mut file, host_kind);
-    }
+    // 致命的にしない。リンクを辿らずに開き、ハンドルで確かめてから書く
+    // （crate doc「診断ファイルはリンクを辿らない」）。
+    let diagnostics_warning = write_diagnostics_windows(lock_path, host_kind);
 
     Ok(InstanceLockGuard {
         lock_file_path: lock_path.to_path_buf(),
+        diagnostics_warning,
         _mutex: WindowsMutexHandle(handle),
     })
+}
+
+/// 診断ファイルへ書く（Windows）。確かめに合わない・開けないときは書かずに
+/// 理由を返すだけ（排他は mutex が持っている。ログは呼び出し側）。
+#[cfg(windows)]
+fn write_diagnostics_windows(lock_path: &Path, host_kind: &str) -> Option<String> {
+    let path = lock_path.display();
+    match diag_file::open_for_write(lock_path) {
+        Ok((diag_file::Opened::File(mut file), warning)) => {
+            match write_owner_info(&mut file, host_kind) {
+                Ok(()) => warning,
+                Err(err) => Some(format!("診断ファイル {path} を書けませんでした: {err}")),
+            }
+        }
+        Ok((diag_file::Opened::Refused(refusal), warning)) => {
+            let mut msg = format!("診断ファイル {path} を書きません: {refusal}");
+            if let Some(warning) = warning {
+                msg.push_str(&format!("（{warning}）"));
+            }
+            Some(msg)
+        }
+        Err(err) => Some(format!("診断ファイル {path} を開けませんでした: {err}")),
+    }
 }
 
 fn write_owner_info(file: &mut File, host_kind: &str) -> std::io::Result<()> {
@@ -334,7 +401,9 @@ pub enum OwnerInfoError {
     /// ここへは来ず [`OwnerInfoError::Corrupt`] になる。中身は分からない。
     #[error("診断ファイルへのアクセスが拒否されました: {0}")]
     Denied(std::io::Error),
-    /// 開けて読めたが JSON として解釈できない、または UTF-8 でない。
+    /// 開けて読めたが JSON として解釈できない、または UTF-8 でない。リンク
+    /// （reparse point）・ハードリンクの別名がある・本当のパスが渡されたパスと
+    /// 違う（途中にリンク）ものも、辿って外を読まずにここにする（#623 PR-2）。
     #[error("診断ファイルの中身が壊れています: {0}")]
     Corrupt(String),
     /// 上のいずれでもない I/O エラー（共有違反・デバイスエラー等）。
@@ -345,10 +414,11 @@ pub enum OwnerInfoError {
 /// [`read_owner_info`] の区別つき版。`NotFound`/`PermissionDenied` は
 /// `File::open` の失敗だけから決める（Windows の `ERROR_ACCESS_DENIED` は
 /// `PermissionDenied` に写る）。読み取り中の `InvalidData`（UTF-8 でない）と
-/// JSON の失敗は [`OwnerInfoError::Corrupt`]。
+/// JSON の失敗は [`OwnerInfoError::Corrupt`]。リンクは辿らない（crate doc
+/// 「診断ファイルはリンクを辿らない」。書くときと同じ確かめ）。
 pub fn read_owner_info_detailed(lock_path: &Path) -> Result<OwnerInfo, OwnerInfoError> {
     use std::io::ErrorKind;
-    let mut file = File::open(lock_path).map_err(|e| match e.kind() {
+    let opened = diag_file::open_for_read(lock_path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => OwnerInfoError::Missing,
         // Windows の `File::open` は `FILE_FLAG_BACKUP_SEMANTICS` を付けないので、
         // ディレクトリも `PermissionDenied` になる。辿らない metadata で形を見て、
@@ -363,6 +433,12 @@ pub fn read_owner_info_detailed(lock_path: &Path) -> Result<OwnerInfo, OwnerInfo
         },
         _ => OwnerInfoError::Io(e),
     })?;
+    let mut file = match opened {
+        diag_file::Opened::File(file) => file,
+        diag_file::Opened::Refused(refusal) => {
+            return Err(OwnerInfoError::Corrupt(refusal.to_string()));
+        }
+    };
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .map_err(|e| match e.kind() {
@@ -789,5 +865,210 @@ mod tests {
             path_scope_id(&db).unwrap().0,
             path_scope_id(&alias).unwrap().0
         );
+    }
+
+    // ---- #623 PR-2: 診断ファイルはリンクを辿らない ----
+
+    /// 外のファイル（守るべき中身）。中身は `OwnerInfo` として読める JSON にして、
+    /// 読みが外を辿れば `Ok` で返ってしまう（＝反証で落ちる）形にする。
+    const VICTIM: &str = r#"{"pid":4242,"host_kind":"victim","acquired_at_unix_ms":1}"#;
+
+    fn victim_file(outside: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = outside.path().join(name);
+        std::fs::write(&path, VICTIM).unwrap();
+        path
+    }
+
+    fn assert_victim_untouched(path: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            VICTIM,
+            "外のファイルが書き換えられた: {}",
+            path.display()
+        );
+    }
+
+    /// 取得を試みる。Windows は mutex が排他なので成功する（診断ファイルだけ
+    /// 書かない。理由は `diagnostics_warning()` で返る）。非 Windows は flock の対象
+    /// そのものなので `Io` で断る。Windows では警告（理由）を返す。
+    fn acquire_next_to_a_link(tag: &str, lock: &Path) -> Option<String> {
+        let result = try_acquire(&unique_mutex_name(tag), lock, "svc");
+        if cfg!(windows) {
+            let guard = result.expect("Windows は mutex で取れる");
+            let warning = guard.diagnostics_warning().map(str::to_string);
+            assert!(warning.is_some(), "書かなかった理由が返る");
+            warning
+        } else {
+            assert!(
+                matches!(result, Err(InstanceLockError::Io(_))),
+                "非 Windows はリンクを断る"
+            );
+            None
+        }
+    }
+
+    /// ふつうに書けたときは警告が無い。
+    #[test]
+    fn a_normal_acquire_has_no_diagnostics_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_path(&dir, "ok.lock");
+        let guard = try_acquire(&unique_mutex_name("normal"), &lock, "svc").unwrap();
+        assert_eq!(guard.diagnostics_warning(), None);
+    }
+
+    /// ハードリンクは一般利用者でも作れる（権限が要らない）ので、どの環境でも必ず走る。
+    #[test]
+    fn a_hard_linked_lock_file_does_not_truncate_or_read_the_outside_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // 同じボリュームでないとハードリンクは作れない（tempdir は同じ所の下）。
+        let victim = victim_file(&outside, "victim.json");
+        let lock = lock_path(&dir, "x.lock");
+        std::fs::hard_link(&victim, &lock).unwrap();
+
+        let warning = acquire_next_to_a_link("hard", &lock);
+        if cfg!(windows) {
+            let warning = warning.unwrap();
+            assert!(warning.contains("ハードリンク"), "理由を含む: {warning}");
+            assert!(warning.contains("x.lock"), "パスを含む: {warning}");
+        }
+        assert_victim_untouched(&victim);
+        let read = read_owner_info_detailed(&lock);
+        assert!(
+            matches!(read, Err(OwnerInfoError::Corrupt(_))),
+            "ハードリンク越しに外を読まない: {read:?}"
+        );
+    }
+
+    /// 診断ファイルのパスが外のファイルへのシンボリックリンク。リンクの作成に権限が
+    /// 要る環境（開発者モードでない非管理者）では、手元は skip、`CI` では落とす。
+    #[test]
+    fn a_symlinked_lock_file_does_not_truncate_or_read_the_outside_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = victim_file(&outside, "victim.json");
+        let lock = lock_path(&dir, "x.lock");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&victim, &lock);
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&victim, &lock);
+        if let Err(err) = made {
+            if std::env::var_os("CI").is_some() {
+                panic!("CI でシンボリックリンクを作れない: {err}");
+            }
+            eprintln!("skip: シンボリックリンクを作れません（権限?）: {err}");
+            return;
+        }
+
+        let warning = acquire_next_to_a_link("sym", &lock);
+        if cfg!(windows) {
+            let warning = warning.unwrap();
+            assert!(warning.contains("リンク"), "理由を含む: {warning}");
+        }
+        assert_victim_untouched(&victim);
+        let read = read_owner_info_detailed(&lock);
+        assert!(
+            matches!(read, Err(OwnerInfoError::Corrupt(_))),
+            "シンボリックリンク越しに外を読まない: {read:?}"
+        );
+        // 壊れた（先の無い）リンクでも、先にファイルを作らない。
+        let dangling_target = outside.path().join("not-yet.json");
+        let dangling = lock_path(&dir, "dangling.lock");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&dangling_target, &dangling).unwrap();
+        #[cfg(not(windows))]
+        std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
+        let _ = acquire_next_to_a_link("dangling", &dangling);
+        assert!(
+            !dangling_target.exists(),
+            "壊れたリンクの先にファイルを作った"
+        );
+    }
+
+    /// 途中のフォルダが外へのジャンクション。ジャンクションは権限なしで作れるので
+    /// 必ず走る。既にある外のファイルを書き換えず、無かった名前を外に作り残さない。
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_file_inside_a_junction_does_not_touch_the_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = victim_file(&outside, "x.lock");
+        let junction = dir.path().join("j");
+        let out = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(outside.path())
+            .output()
+            .expect("mklink");
+        assert!(out.status.success(), "mklink /J: {out:?}");
+
+        let lock = junction.join("x.lock");
+        let _guard =
+            try_acquire(&unique_mutex_name("junction"), &lock, "svc").expect("mutex は取れる");
+        let warning = _guard
+            .diagnostics_warning()
+            .expect("書かなかった理由が返る");
+        assert!(warning.contains("本当の場所"), "理由を含む: {warning}");
+        assert_victim_untouched(&victim);
+        let read = read_owner_info_detailed(&lock);
+        assert!(
+            matches!(read, Err(OwnerInfoError::Corrupt(_))),
+            "ジャンクション越しに外を読まない: {read:?}"
+        );
+
+        let fresh = junction.join("fresh.lock");
+        let _guard2 =
+            try_acquire(&unique_mutex_name("junction-new"), &fresh, "svc").expect("mutex は取れる");
+        assert!(
+            !outside.path().join("fresh.lock").exists(),
+            "ジャンクションの先に診断ファイルを作り残した"
+        );
+    }
+
+    /// 8.3 の短い名前を含むパス（GitHub の Windows のランナーの `TEMP` は
+    /// `RUNNER~1` を含む）でも、本当のパスと食い違わずに書ける。短い名前が無い
+    /// ボリューム（8.3 の生成が無効）では確かめられないので skip する。
+    #[cfg(windows)]
+    #[test]
+    fn a_short_name_path_still_writes_the_diagnostics() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let dir = tempfile::tempdir().unwrap();
+        let long_dir = dir.path().join("a long directory name");
+        std::fs::create_dir(&long_dir).unwrap();
+        let wide: Vec<u16> = long_dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `wide` は NUL 終端、`buf` は書ける長さの領域。
+        let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        assert!(len > 0 && len < buf.len(), "GetShortPathNameW");
+        let short_dir = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+        if short_dir == long_dir {
+            eprintln!("skip: このボリュームは 8.3 の短い名前を作らない");
+            return;
+        }
+        let lock = short_dir.join("x.lock");
+        let _guard = try_acquire(&unique_mutex_name("short"), &lock, "svc").unwrap();
+        let owner = read_owner_info_detailed(&lock).expect("短い名前のパスでも読める");
+        assert_eq!(owner.host_kind, "svc");
+    }
+
+    /// 前回の診断ファイルがそのまま残っていれば、確かめて上書きする（既存開きの経路）。
+    #[test]
+    fn an_existing_plain_lock_file_is_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_path(&dir, "x.lock");
+        std::fs::write(&lock, VICTIM).unwrap();
+        let _guard = try_acquire(&unique_mutex_name("existing"), &lock, "svc").unwrap();
+        let owner = read_owner_info_detailed(&lock).unwrap();
+        assert_eq!(owner.host_kind, "svc");
+        assert_eq!(owner.pid, std::process::id());
     }
 }

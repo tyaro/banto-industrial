@@ -55,7 +55,8 @@
 //!    - 一致した場合のみ、二次確認としてこのワークスペースの
 //!      `profile.lock`（[`crate::profile_lock::ProfileOwnerInfo`]、
 //!      所有者 PID・ホスト種別のみを持ち profile-id 自体は持たない -
-//!      `crate::profile_paths`のモジュール doc 参照）を読む -
+//!      `crate::profile_paths`のモジュール doc 参照）を、取得側と同じパス
+//!      （ルートだけを解く [`crate::profile_lock::lock_file_path`]、#623 PR-2）で読む -
 //!      無い・壊れている（形が通常のファイルでない場合を含む）・その他の
 //!      I/O エラーは[`HealthOutcome::MutexOwnerUnknown`]。
 //!      **アクセス拒否（通常のファイルに見えるのに開けない）だけは
@@ -70,7 +71,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::hub_health::{HealthOutcome, HubHealthProbe, ProbeError};
-use crate::profile_lock::{read_owner_info_detailed, OwnerInfoError, LOCK_FILE_NAME};
+use crate::profile_lock::{lock_file_path, read_owner_info_detailed, OwnerInfoError};
 use crate::profile_paths::{resolve_profile_paths, validate_profile_id};
 
 /// probe 全体（TCP 接続 + HTTP 往復）に許すタイムアウト。desktop-plan の
@@ -158,7 +159,8 @@ impl HubHealthProbe for HttpHubHealthProbe {
             Ok(paths) => paths,
             Err(_) => return Ok(HealthOutcome::WrongProfileOrVersion),
         };
-        let lock_path = paths.profile_dir.join(LOCK_FILE_NAME);
+        // 取得側と同じパス（ルートだけを解く。`profile_lock::lock_file_path`）。
+        let lock_path = lock_file_path(&paths);
         Ok(classify_lock_read(
             read_owner_info_detailed(&lock_path),
             version,
@@ -323,7 +325,7 @@ fn extract_wire_profile_id(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile_lock::{try_acquire_profile_lock, HubHostKind};
+    use crate::profile_lock::{try_acquire_profile_lock, HubHostKind, LOCK_FILE_NAME};
     use crate::test_support::TempDir;
     use std::net::{Ipv4Addr, TcpListener};
     use std::thread;
@@ -646,6 +648,41 @@ mod tests {
 
         let probe =
             HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::Healthy {
+                version: "v1".to_string()
+            })
+        );
+    }
+
+    /// #623 PR-2 のレビュー P2-2: Hub のルートがジャンクション（マウント
+    /// ポイント・`subst` と同じく、本当のパスが渡されたパスと食い違う正当な構成）
+    /// でも、取得側が書いた診断ファイルを health が同じパスで読めて `Healthy`。
+    /// ルートを解かないと `MutexOwnerUnknown` になり、Desktop→Service の切り替えが
+    /// 完了扱いにならない（`host_switch` の不変条件 5）。
+    #[cfg(windows)]
+    #[test]
+    fn probe_returns_healthy_when_the_root_is_a_junction() {
+        let base = TempDir::new("http-hub-health-junction-root");
+        let real_root = base.path().join("real-root");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let linked_root = base.path().join("linked-root");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&linked_root)
+            .arg(&real_root)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("mklink");
+        assert!(status.success(), "mklink /J に失敗した");
+
+        let port = spawn_canned_http_server(ok_response(VALID_OPENAPI_BODY));
+        let paths = resolve_profile_paths(&linked_root, "default").expect("valid profile id");
+        let _guard =
+            try_acquire_profile_lock(&paths, HubHostKind::Service).expect("acquire lock ok");
+
+        let probe = HttpHubHealthProbe::with_timeout(linked_root, Duration::from_millis(500));
         assert_eq!(
             probe.probe("default", port),
             Ok(HealthOutcome::Healthy {
