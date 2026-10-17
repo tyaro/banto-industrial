@@ -224,6 +224,17 @@ pub fn install_service(spec: &ServiceSpec) -> Result<InstallOutcome, InstallErro
     })
 }
 
+/// `open_service` の失敗の文言。Win32 の失敗は OS の理由と番号（`(os error 1060)`）を含める
+/// （`windows_service::Error` の表示は "IO error in winapi call" だけで、未登録（1060）など
+/// を呼び出し側が見分けられない。#628）。
+#[cfg(windows)]
+fn describe_open_error(err: &windows_service::Error) -> String {
+    match err {
+        windows_service::Error::Winapi(io) => io.to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// サービスの登録を解除する（管理者権限が必要）。動いていれば先に停止を
 /// 要求する（止まり終わるのは待たない。削除は SCM がハンドルの閉じるのを
 /// 待って完了させる）。
@@ -237,7 +248,7 @@ pub fn uninstall_service(name: &str) -> Result<UninstallOutcome, UninstallError>
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
     let service = manager
         .open_service(name, access)
-        .map_err(|err| UninstallError::Open(err.to_string()))?;
+        .map_err(|err| UninstallError::Open(describe_open_error(&err)))?;
 
     let stop = match service.query_status() {
         Ok(status) if status.current_state != ServiceState::Stopped => match service.stop() {

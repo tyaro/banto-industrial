@@ -120,6 +120,15 @@ pub enum MemberOutcome {
     AlreadyMember,
 }
 
+/// [`grant_service_operators`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAclOutcome {
+    /// このとき ACE を足した（既に別の権利の ACE があれば置き換えた）。
+    Added,
+    /// 既に同じ ACE があった（何も書いていない）。
+    AlreadyPresent,
+}
+
 /// Operators に付けるサービスのアクセス権（`SERVICE_QUERY_CONFIG(0x1) |
 /// SERVICE_QUERY_STATUS(0x4) | SERVICE_START(0x10) | SERVICE_STOP(0x20)`）。
 /// 全 OS でテストできるよう数値で持つ（windows-sys の定数と一致することは

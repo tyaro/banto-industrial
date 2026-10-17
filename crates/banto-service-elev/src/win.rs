@@ -8,8 +8,9 @@ use windows_sys::Win32::NetworkManagement::NetManagement::{
     LOCALGROUP_MEMBERS_INFO_3,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS,
-    TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW, SetEntriesInAclW,
+    EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SDDL_REVISION_1, SET_ACCESS, TRUSTEE_IS_GROUP,
+    TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     CheckTokenMembership, GetSecurityDescriptorDacl, InitializeSecurityDescriptor,
@@ -23,7 +24,8 @@ use windows_sys::Win32::System::Services::{
 
 use crate::{
     classify_group_add_status, classify_member_add_status, is_valid_sid_string, AccountSid,
-    ElevError, GroupOutcome, MemberOutcome, OperatorsGroup, OPERATORS_SERVICE_ACCESS_MASK,
+    ElevError, GroupOutcome, MemberOutcome, OperatorsGroup, ServiceAclOutcome,
+    OPERATORS_SERVICE_ACCESS_MASK,
 };
 
 /// `DACL_SECURITY_INFORMATION`（MSDN で安定して文書化された値。移す前の
@@ -289,10 +291,14 @@ pub fn add_member_sid(group: &OperatorsGroup, sid: &str) -> Result<MemberOutcome
 /// WRITE_DAC)` → `QueryServiceObjectSecurity`（2 段）→
 /// `GetSecurityDescriptorDacl` → `SetEntriesInAclW` → 絶対形式の記述子に
 /// 載せて `SetServiceObjectSecurity`。管理者として動くプロセスから呼ぶ。
+///
+/// 足した結果の DACL が今の DACL と同じ（= 既に同じ ACE があった）なら、書かずに
+/// [`ServiceAclOutcome::AlreadyPresent`] を返す（`SET_ACCESS` が同じ内容に置き換えるだけ
+/// なので、書いても結果は変わらない。出力の「足しました」を嘘にしないため。#628）。
 pub fn grant_service_operators(
     service_name: &str,
     group: &OperatorsGroup,
-) -> Result<(), ElevError> {
+) -> Result<ServiceAclOutcome, ElevError> {
     let mut operators_sid = lookup_account_sid(group.name)?
         .ok_or_else(|| ElevError::GroupNotFound(group.name.to_string()))?;
 
@@ -316,7 +322,7 @@ fn grant_with_scm(
     scm: SC_HANDLE,
     service_name: &str,
     operators_sid: PSID,
-) -> Result<(), ElevError> {
+) -> Result<ServiceAclOutcome, ElevError> {
     let service_wide = to_wide(service_name);
     // SAFETY: `scm` は呼び出し元が開いた有効なハンドル。
     let service = unsafe { OpenServiceW(scm, service_wide.as_ptr(), READ_CONTROL | WRITE_DAC) };
@@ -337,7 +343,7 @@ fn grant_with_service(
     service: SC_HANDLE,
     service_name: &str,
     operators_sid: PSID,
-) -> Result<(), ElevError> {
+) -> Result<ServiceAclOutcome, ElevError> {
     // 1 回目: 必要な大きさの問い合わせ。
     let mut needed: u32 = 0;
     // SAFETY: 長さ 0・null で呼ぶのは Win32 の想定どおり（FALSE を返し `needed` に
@@ -379,6 +385,14 @@ fn grant_with_service(
     let merged = merged_dacl(sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR, operators_sid)?;
     let mut new_sd = absolute_sd_with_dacl(&merged)?;
 
+    // 足した結果が今と同じなら（既に同じ ACE がある）、書かない。SDDL に直せなければ
+    // 比べられないので、これまでどおり書く。
+    let current = dacl_sddl_of(sd_buf.as_mut_ptr() as PSECURITY_DESCRIPTOR);
+    let merged_sddl = dacl_sddl_of(&mut new_sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR);
+    if matches!((&current, &merged_sddl), (Some(a), Some(b)) if a == b) {
+        return Ok(ServiceAclOutcome::AlreadyPresent);
+    }
+
     // SAFETY: `service` は有効なハンドル、`new_sd` は DACL を載せた有効な記述子で、
     // その DACL（`merged`）はこの呼び出しの後まで生きている。
     let ok = unsafe {
@@ -394,7 +408,37 @@ fn grant_with_service(
             os_error: last_error(),
         });
     }
-    Ok(())
+    Ok(ServiceAclOutcome::Added)
+}
+
+/// 記述子 `sd` の DACL を SDDL の文字列にする（比べるため。直せなければ `None`）。
+fn dacl_sddl_of(sd: PSECURITY_DESCRIPTOR) -> Option<String> {
+    let mut out: *mut u16 = std::ptr::null_mut();
+    let mut len: u32 = 0;
+    // SAFETY: `sd` は呼び出し元が持つ有効な記述子。成功すれば `out` は LocalAlloc の文字列。
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut out,
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let out = LocalBox(out.cast());
+    // SAFETY: NUL 終端の UTF-16。
+    let text = unsafe {
+        let p = out.0 as *const u16;
+        let mut n = 0;
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
+    };
+    Some(text)
 }
 
 /// 記述子 `sd` の DACL に Operators の ACE を `SET_ACCESS` で足した新しい ACL
@@ -483,10 +527,7 @@ mod tests {
     //! なので、実際に作る・書き換える経路はここでは動かさない）。
 
     use super::*;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW,
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 
     const OPERATORS: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 
@@ -520,30 +561,7 @@ mod tests {
     }
 
     fn dacl_sddl(sd: &mut SECURITY_DESCRIPTOR) -> String {
-        let mut out: *mut u16 = std::ptr::null_mut();
-        let mut len: u32 = 0;
-        // SAFETY: `sd` は有効な記述子。成功すれば `out` は LocalAlloc の文字列。
-        let ok = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut out,
-                &mut len,
-            )
-        };
-        assert_ne!(ok, 0);
-        let out = LocalBox(out.cast());
-        // SAFETY: NUL 終端の UTF-16。
-        let text = unsafe {
-            let p = out.0 as *const u16;
-            let mut n = 0;
-            while *p.add(n) != 0 {
-                n += 1;
-            }
-            String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
-        };
-        text
+        dacl_sddl_of(sd as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR).expect("SDDL にできる")
     }
 
     /// 本番と同じ `merged_dacl` → `absolute_sd_with_dacl` を通した DACL の SDDL。

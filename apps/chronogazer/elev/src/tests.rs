@@ -13,7 +13,7 @@ use banto_service_control::{
     ConsoleLine, InstallError, InstallKind, InstallOutcome, PreshutdownReport, ServiceManagerError,
     StopAttempt, UninstallError, UninstallOutcome,
 };
-use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome};
+use banto_service_elev::{ElevError, GroupOutcome, MemberOutcome, ServiceAclOutcome};
 use chronogazer_core::paths::DataLayout;
 use chronogazer_core::server_service::{
     InstallReport, InstallUserUnavailable, RootPreparation, SidRecordResult,
@@ -518,7 +518,7 @@ struct Fake {
     installed_sid: RefCell<Option<String>>,
     group: Result<GroupOutcome, ElevError>,
     member: Result<MemberOutcome, ElevError>,
-    service_acl: Result<(), ElevError>,
+    service_acl: Result<ServiceAclOutcome, ElevError>,
     autostart: Result<(), ServiceManagerError>,
     /// 今あるフォルダ（`pin_dir` が返す）。
     dirs: RefCell<BTreeMap<PathBuf, PinnedDirInfo>>,
@@ -600,7 +600,7 @@ impl Fake {
             installed_sid: RefCell::new(None),
             group: Ok(GroupOutcome::Created),
             member: Ok(MemberOutcome::Added),
-            service_acl: Ok(()),
+            service_acl: Ok(ServiceAclOutcome::Added),
             autostart: Ok(()),
             dirs: RefCell::new(BTreeMap::new()),
             final_paths: BTreeMap::new(),
@@ -744,7 +744,7 @@ impl ElevOps for Fake {
         self.record(format!("add_member {}", sid.as_str()));
         self.member.clone()
     }
-    fn grant_service_acl(&self) -> Result<(), ElevError> {
+    fn grant_service_acl(&self) -> Result<ServiceAclOutcome, ElevError> {
         self.record("grant_service_acl".into());
         self.service_acl.clone()
     }
@@ -1251,6 +1251,16 @@ fn grant_service_acl_exit_codes() {
     // 記録は読まない（SID を使わない）。
     assert_eq!(fake.calls(), vec!["grant_service_acl"]);
 
+    // 2 回目: ACE は既にある。「足しました」とは言わない（#628）。
+    let mut again = Fake::new();
+    again.service_acl = Ok(ServiceAclOutcome::AlreadyPresent);
+    let (code, lines) = exec(Action::GrantServiceAcl, &again);
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(
+        lines[0],
+        stdout("chronogazer-elev: サービス 'ChronoGazer' の DACL には 'ChronoGazer Operators' の ACE（CCLCRPWP: 照会・開始・停止）が既にあります（変更していません）")
+    );
+
     for (error, code) in [
         (
             ElevError::GroupNotFound("ChronoGazer Operators".to_string()),
@@ -1432,7 +1442,13 @@ fn service_uninstall_keeps_the_group_and_the_data() {
 
     let mut fake = Fake::new();
     fake.uninstall = Err(UninstallError::Open("os error 1060".to_string()));
-    assert_eq!(exec(Action::ServiceUninstall, &fake).0, EXIT_PRECONDITION);
+    let (code, lines) = exec(Action::ServiceUninstall, &fake);
+    assert_eq!(code, EXIT_PRECONDITION);
+    // 未登録は日本語の案内（OS の英語の理由は出さない。#628）。
+    assert_eq!(
+        lines[0],
+        stderr("chronogazer-elev: サービス 'ChronoGazer' は登録されていません（解除するものがありません）")
+    );
     let mut fake = Fake::new();
     fake.uninstall = Err(UninstallError::Delete {
         stop: StopAttempt::NotRunning,
@@ -1572,8 +1588,25 @@ fn create_uses_service_only_and_user_change_comes_only_after_verify() {
     assert!(!calls
         .iter()
         .any(|c| c.starts_with("create") && c.ends_with(USER)));
-    assert!(lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
-        if t.contains("作りましたが、確かめが通らなかったので残っています"))));
+    // 残っているのは**開いたフォルダの本当の場所**。期待のパスと違うので、期待のパスも添える
+    // （#628 の 4）。
+    let real = PathBuf::from(PF).join("ChronoGazer");
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if *t == format!("chronogazer-elev: データのルート（{}。期待のパスは {}）を作りましたが、確かめが通らなかったので残っています（SYSTEM・Administrators だけが触れる DACL）", real.display(), root_path().display()))),
+        "{lines:#?}"
+    );
+
+    // 本当の場所が期待と同じ場所で、所有者の確かめで断ったときは、期待のパスを重ねて出さない。
+    let mut fake = Fake::new();
+    fake.created_owner = Some(STRANGER.to_string());
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_FAILED, "{lines:#?}");
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if *t == format!("chronogazer-elev: データのルート（{}）を作りましたが、確かめが通らなかったので残っています（SYSTEM・Administrators だけが触れる DACL）", root_path().display()))),
+        "{lines:#?}"
+    );
 }
 
 /// 反証（O2）: 所有者が許す範囲の外（ProgramData に一般の利用者が先に作った）なら 1。

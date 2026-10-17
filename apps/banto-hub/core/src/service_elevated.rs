@@ -1184,6 +1184,7 @@ mod windows_impl {
     /// へ移した。順序・付ける ACE は移す前のまま。
     pub(super) fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
         banto_service_elev::grant_service_operators(service_name, &OPERATORS_GROUP)
+            .map(|_| ())
             .map_err(map_elev_error)
     }
 }

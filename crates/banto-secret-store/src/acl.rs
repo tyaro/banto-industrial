@@ -2275,10 +2275,13 @@ mod imp {
             how,
             ChildHow::OpenFile | ChildHow::OpenFileForUpdate | ChildHow::CreateFile(_)
         );
-        let label = if is_file {
-            "CreateChildFile(name)"
-        } else {
-            "CreateChildDir(name)"
+        // 失敗の文言に出す API の名前。作る経路と開く経路を見分けられるようにする
+        // （開く経路の名前の誤りを `CreateChildDir` と読ませない。#628 / #646 Nit 3）。
+        let label = match how {
+            ChildHow::Create(_) => "CreateChildDir(name)",
+            ChildHow::Open => "OpenChildDir(name)",
+            ChildHow::OpenFile | ChildHow::OpenFileForUpdate => "OpenChildFile(name)",
+            ChildHow::CreateFile(_) => "CreateChildFile(name)",
         };
         // `NtCreateFile` は Win32 の正規化を通らないので、Win32 から見ると別の名前・別の
         // 物になるもの（末尾の `.` と空白・ワイルドカード・予約デバイス名など）も断る
@@ -3510,10 +3513,9 @@ mod tests {
                 "テストの前提: denied.txt は WRITE_DAC | WRITE_OWNER で開けない"
             );
 
+            let access = DirAccess::with_install_user(me.clone());
             let pinned = pin_dir(&dir).unwrap().unwrap();
-            let skips = pinned
-                .reset_acl(&DirAccess::with_install_user(me.clone()), Recurse::Tree)
-                .unwrap();
+            let skips = pinned.reset_acl(&access, Recurse::Tree).unwrap();
             drop(pinned);
 
             let real_dir = read_dir_dacl(&dir).unwrap();
@@ -3521,9 +3523,11 @@ mod tests {
             // 開けない子は飛ばして記録、ほかは書けている。
             assert_eq!(skips.denied.len(), 1, "{skips:?}");
             assert!(skips.denied[0].ends_with("denied.txt"), "{skips:?}");
-            // ほかの子は書けている。
+            // ほかの子は書けている。所有者だけでなく ACE（SYSTEM・Administrators・インストール
+            // 利用者の形、継承しない）まで確かめる（#628 の 7）。
             let normal_dacl = read_dir_dacl(&normal).unwrap();
             assert_eq!(normal_dacl.owner, ADMINISTRATORS_SID, "{normal_dacl:?}");
+            check_file_dacl(&normal_dacl, &access);
             // 開けない子は消せないかもしれない。tempdir の drop の失敗は無視される。
             drop(root);
         }
