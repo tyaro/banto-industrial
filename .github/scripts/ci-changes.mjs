@@ -47,6 +47,9 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/** 共有 crate の置き場の前置き（RULES・`touchesCrates`・`owningPackage` が共有する）。 */
+export const CRATES_PREFIX = 'crates/';
+
 /** 領域フラグ。`full` はすべてを走らせる。 */
 export const AREAS = [
 	'full',
@@ -73,7 +76,7 @@ export const RULES = [
 	{ re: /^\.gitattributes$/, areas: ['full'], why: '改行・属性（全ファイルに効く）' },
 
 	// --- 共有 crate（依存グラフで、そのパッケージと逆依存に絞る。`classify()` 参照）
-	{ re: /^crates\//, areas: ['crates'], why: '共有 crate' },
+	{ re: new RegExp('^' + CRATES_PREFIX), areas: ['crates'], why: '共有 crate' },
 
 	// --- Rust workspace 全体
 	// proto/** は banto-hub-core の build.rs が読む。.cargo/** は cargo 設定、
@@ -186,7 +189,7 @@ export const normalizePath = (raw) => raw.trim().replace(/\\/g, '/');
  * @param {string[]} files
  */
 export function touchesCrates(files) {
-	return files.some((f) => normalizePath(f).startsWith('crates/'));
+	return files.some((f) => normalizePath(f).startsWith(CRATES_PREFIX));
 }
 
 const toSlash = (/** @type {string} */ p) => p.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -237,7 +240,9 @@ export function owningPackage(graph, file) {
 	let best = null;
 	for (const p of graph.packages) {
 		const inside =
-			p.dir === '' ? !file.startsWith('crates/') : file === p.dir || file.startsWith(p.dir + '/');
+			p.dir === ''
+				? !file.startsWith(CRATES_PREFIX)
+				: file === p.dir || file.startsWith(p.dir + '/');
 		if (inside) {
 			if (!best || p.dir.length > best.dir.length) best = p;
 		}
