@@ -218,7 +218,8 @@ api_key = \"bh_dummy.key\"
 ";
     std::fs::write(&config, body).unwrap();
     let me = WindowsSinkConfigOps.current_user_sid().unwrap();
-    icacls(&config, &["/setowner", me.as_str()]);
+    let owner_arg = format!("*{}", me.as_str());
+    icacls(&config, &["/setowner", owner_arg.as_str()]);
     let before = inspect_file(&config).unwrap().unwrap();
     assert_eq!(
         exposure(&before),
