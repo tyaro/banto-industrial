@@ -182,19 +182,41 @@ fn check_file(path: &Path) {
     assert_eq!(dacl.owner, ADMINISTRATORS_SID);
 }
 
-fn icacls(config: &Path, args: &[&str]) {
-    let status = std::process::Command::new("icacls")
-        .arg(config)
+/// 設定ファイルの中身（実際に改行を含むリテラルにしない。checkout の改行の設定で変わらない）。
+const BODY: &[u8] = b"hub_url = \"http://127.0.0.1:8722\"\napi_key = \"bh_dummy.key\"\n";
+
+/// `icacls <path> <args>` を実行する。失敗したら終了コードと出力を載せて落とす
+/// （管理者の CI でしか走らないので、準備の段で落ちても理由が見えるように）。
+fn icacls(path: &Path, args: &[&str]) {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
         .args(args)
-        .stdout(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "icacls {args:?} に失敗した");
+        .output()
+        .expect("icacls を起動できない");
+    assert!(
+        output.status.success(),
+        "icacls {args:?} に失敗した（終了コード {:?}）\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// 所有者を SID の利用者にする。`*` は SID を名前と取り違えさせないための印で、ここで付ける。
+fn set_owner(path: &Path, sid: &str) {
+    icacls(path, &["/setowner", &format!("*{sid}")]);
+}
+
+/// SID の利用者に `rights`（`R` など）を許す ACE を足す。`*` はここで付ける。
+fn grant(path: &Path, sid: &str, rights: &str) {
+    icacls(path, &["/grant", &format!("*{sid}:{rights}")]);
 }
 
 /// 新しい PC 相当: ルート（継承）と置き場（保護）を作り、雛形を置く。2 回目は雛形を差し替え、
-/// 所有者だけが違う設定ファイル（別の管理者がメモ帳で編集した形。DACL は置き場から継承した
+/// 所有者だけが違う設定ファイル（**実行した管理者が所有者**の形。DACL は置き場から継承した
 /// まま）を整え直す（中身は変えない。オーナー決定 その 2）。ルートの DACL は書かない。
+/// 別の管理者が所有者の形（hub_url の警告が出る側）は、CI で別の管理者を用意できないので、
+/// 偽物の表（`../tests.rs`）で固定している。
 #[test]
 fn prepares_the_place_and_replaces_the_example() {
     if !elevated_admin("prepares_the_place_and_replaces_the_example") {
@@ -213,13 +235,9 @@ fn prepares_the_place_and_replaces_the_example() {
     // 置き場の中で作った設定ファイルの所有者を、テストを走らせている利用者に変える（理由は
     // `ForeignOwner` だけ。DACL は継承のまま SYSTEM・Administrators だけ）。
     let config = sink.join(CONFIG_FILE);
-    let body = b"hub_url = \"http://127.0.0.1:8722\"
-api_key = \"bh_dummy.key\"
-";
-    std::fs::write(&config, body).unwrap();
+    std::fs::write(&config, BODY).unwrap();
     let me = WindowsSinkConfigOps.current_user_sid().unwrap();
-    let owner_arg = format!("*{}", me.as_str());
-    icacls(&config, &["/setowner", owner_arg.as_str()]);
+    set_owner(&config, me.as_str());
     let before = inspect_file(&config).unwrap().unwrap();
     assert_eq!(
         exposure(&before),
@@ -233,7 +251,7 @@ api_key = \"bh_dummy.key\"
     check_dir(&sink);
     check_file(&config);
     check_file(&sink.join(EXAMPLE_FILE));
-    assert_eq!(std::fs::read(&config).unwrap(), body, "中身は変えない");
+    assert_eq!(std::fs::read(&config).unwrap(), BODY, "中身は変えない");
     assert_eq!(std::fs::read(sink.join(EXAMPLE_FILE)).unwrap(), EXAMPLE);
     // 所有者は実行した管理者本人（信頼する所有者）なので、hub_url を確かめる警告は出ない。
     assert!(
@@ -260,11 +278,11 @@ fn a_config_readable_by_others_is_refused() {
     assert_eq!(result, Ok(()), "{lines:#?}");
 
     let config = sink.join(CONFIG_FILE);
-    let body = b"hub_url = \"http://127.0.0.1:8722\"
-api_key = \"bh_dummy.key\"
-";
-    std::fs::write(&config, body).unwrap();
-    icacls(&config, &["/grant", "*S-1-5-32-545:R"]);
+    std::fs::write(&config, BODY).unwrap();
+    // 雛形も古いものを置いておく。断った後も書き換えていないこと（確かめ終わるまで書かない）を固定する。
+    let example = sink.join(EXAMPLE_FILE);
+    std::fs::write(&example, b"old").unwrap();
+    grant(&config, "S-1-5-32-545", "R");
     let exposed = inspect_file(&config).unwrap().unwrap();
     assert!(
         !exposure(&exposed).is_empty(),
@@ -274,7 +292,12 @@ api_key = \"bh_dummy.key\"
 
     let (result, lines) = run(&f.ops);
     assert_eq!(result, Err(Refused), "{lines:#?}");
-    assert_eq!(std::fs::read(&config).unwrap(), body, "中身は変えない");
+    assert_eq!(std::fs::read(&config).unwrap(), BODY, "中身は変えない");
+    assert_eq!(
+        std::fs::read(&example).unwrap(),
+        b"old",
+        "雛形も書き換えない"
+    );
     assert_eq!(
         inspect_file(&config).unwrap().unwrap().dacl,
         dacl_before,

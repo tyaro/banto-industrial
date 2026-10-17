@@ -448,10 +448,9 @@ fn checks_everything_before_the_first_write() {
 /// 作った置き場にも、所有者を Administrators にする書き込みをする。
 #[test]
 fn creates_a_missing_root_and_place_relative_to_the_checked_parent() {
-    let ops = FakeOps::new();
+    let mut ops = FakeOps::new();
     ops.dirs.borrow_mut().remove(&root());
     ops.dirs.borrow_mut().remove(&sink());
-    let mut ops = ops;
     ops.files.clear();
     let (result, lines) = run(&ops);
     assert_eq!(result, Ok(()), "{lines:#?}");
@@ -927,9 +926,8 @@ fn config_refusal_table() {
 /// 断ったときも、旧い置き場の知らせを出す（#655 のレビュー Nit 2）。
 #[test]
 fn a_refusal_also_reports_the_legacy_config() {
-    let ops = FakeOps::new();
+    let mut ops = FakeOps::new();
     ops.set_dir(root(), DirEntry::owned_by(EVIL));
-    let mut ops = ops;
     ops.existing.insert(root().join(CONFIG_FILE), Ok(true));
     let (result, lines) = run(&ops);
     assert_eq!(result, Err(Refused));
