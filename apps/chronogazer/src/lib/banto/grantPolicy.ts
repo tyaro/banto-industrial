@@ -157,24 +157,39 @@ export interface LoginEntries {
 	 * PC からの画面）だけ。
 	 */
 	localGrantOptIn: boolean;
+	/**
+	 * ログインの欄の上の「単体ブラウザ（デモ）モードは admin / admin でログインできます」
+	 * （#612）。demo だけ - サービス・LAN の画面（`server`）や Tauri の窓で出すと、その
+	 * アカウントがあるように読めて誤解を招く。初期化済み（または `status` が無い）のとき
+	 * だけ（ログインの欄が出る条件と同じ）。
+	 */
+	demoAccountHint: boolean;
 }
 
 /**
- * ログイン画面の出し分け（純関数）。どれも LAN/サービスの HTTP の画面（`server`
- * モード）だけで、Tauri の窓・demo には出さない（Tauri の窓のログイン不要は M11 の
- * 受け持ち、demo には発行するバックエンドが無い）。`status` が読めなければ何も出さない。
+ * ログイン画面の出し分け（純関数）。資格情報なしの口と初回セットアップの選択は
+ * LAN/サービスの HTTP の画面（`server` モード）だけで、Tauri の窓・demo には出さない
+ * （Tauri の窓のログイン不要は M11 の受け持ち、demo には発行するバックエンドが無い）。
+ * `status` が読めなければ出さない。デモのアカウントの案内は demo だけ（#612）。
  */
 export function loginEntries(
 	mode: 'tauri' | 'server' | 'demo',
 	status: GrantStatus | undefined
 ): LoginEntries {
+	const demoAccountHint = mode === 'demo' && (status === undefined || status.initialized);
 	if (mode !== 'server' || status === undefined) {
-		return { continueAsThisPc: false, continueAsViewer: false, localGrantOptIn: false };
+		return {
+			continueAsThisPc: false,
+			continueAsViewer: false,
+			localGrantOptIn: false,
+			demoAccountHint
+		};
 	}
 	const local = localDesktopAvailable(status);
 	return {
 		continueAsThisPc: status.initialized && local,
 		continueAsViewer: status.grants?.[PUBLIC_VIEWER_GRANT_KIND] === true,
-		localGrantOptIn: !status.initialized && local
+		localGrantOptIn: !status.initialized && local,
+		demoAccountHint
 	};
 }

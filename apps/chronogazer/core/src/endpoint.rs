@@ -30,7 +30,12 @@
 //! ファイル）。pid は再利用されるので、生きていても**そのプロセスが書いたとは
 //! 限らない** - 最終的な確認は probe（`/api/host` の product・scope）が行う。
 //! 終了時は [`clear_endpoint`] が**自分の pid のファイルだけ**消す（別のプロセスが
-//! 書き直したものを消さない）。
+//! 書き直したものを消さない）。消せなかった・読めなかった・壊れていたときは
+//! [`EndpointClear`] で「消した・無い・別のプロセスのもの」と区別して返し、終了の
+//! 側がログとコンソールに 1 行残す（#599。終了コードは変えない）。残ったファイルは
+//! 書いたプロセスが生きていないので、読む側は古いものとして読み飛ばし、次の起動が
+//! 置き換えを試みる。原因が属性・ACL のように続くものなら置き換えも失敗するので、
+//! 1 行には手で消す案内を入れる（[`EndpointClear::diagnostic`]）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -136,19 +141,41 @@ fn write_endpoint_with(
     written
 }
 
+/// `path` を読んだ結果（[`clear_endpoint`] が「無い」「読めない」「所有者を
+/// 確かめられない」を分けるため）。
+enum Loaded {
+    /// ファイルが無い。
+    Missing,
+    /// 読めたが、大きすぎる・JSON として壊れている・値が不正。
+    Unrecognized,
+    Info(EndpointInfo),
+}
+
+/// `path` を読む。無いのは `Ok(Missing)`、開けない・読めないのは `Err`。
+fn load_endpoint(path: &Path) -> std::io::Result<Loaded> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Missing),
+        Err(err) => return Err(err),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_ENDPOINT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ENDPOINT_BYTES {
+        return Ok(Loaded::Unrecognized);
+    }
+    Ok(match serde_json::from_slice::<EndpointInfo>(&bytes) {
+        Ok(info) if info.is_plausible() => Loaded::Info(info),
+        _ => Loaded::Unrecognized,
+    })
+}
+
 /// `path` を読む。無い・読めない・壊れている・値が不正なら `None`。
 pub fn read_endpoint(path: &Path) -> Option<EndpointInfo> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(MAX_ENDPOINT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_ENDPOINT_BYTES {
-        return None;
+    match load_endpoint(path) {
+        Ok(Loaded::Info(info)) => Some(info),
+        _ => None,
     }
-    let info: EndpointInfo = serde_json::from_slice(&bytes).ok()?;
-    info.is_plausible().then_some(info)
 }
 
 /// [`read_endpoint`] に加え、書いたプロセスが生きていなければ `None`
@@ -165,13 +192,87 @@ pub fn read_live_endpoint_with(
     read_endpoint(path).filter(|info| is_alive(info.pid))
 }
 
-/// 終了時の後始末: ファイルの `pid` が `own_pid` のときだけ消す。消したら `true`。
-/// 無い・壊れている・他のプロセスのものなら何もしない（壊れたファイルは次に
-/// 書く側が置き換える）。
-pub fn clear_endpoint(path: &Path, own_pid: u32) -> bool {
-    match read_endpoint(path) {
-        Some(info) if info.pid == own_pid => std::fs::remove_file(path).is_ok(),
-        _ => false,
+/// [`clear_endpoint`] の結果（#599）。「書いていない・既に無い」「別のプロセスのもの
+/// なので残した」と、「消せなかった」「読めなかった」を分ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointClear {
+    /// 自分のファイルを消した。
+    Removed,
+    /// ファイルが無い（書いていない・既に消えている）。
+    Absent,
+    /// 別のプロセス（`pid`）が書いたものなので残した。
+    OtherOwner { pid: u32 },
+    /// 中身を読み取れない（大きすぎる・JSON として壊れている・値が不正）。所有者を
+    /// 確かめられないので消さずに残した（次に書く側が置き換える）。
+    Unrecognized,
+    /// 開けない・読めない（権限・共有違反など）。所有者を確かめられないので消して
+    /// いない。中身は OS のエラーの文。
+    ReadFailed(String),
+    /// 自分のファイルだったが消せなかった（読み取り専用・ACL・共有違反など）。
+    RemoveFailed(String),
+}
+
+impl EndpointClear {
+    /// 終了の後にファイルを残したことを知らせる 1 行（`path` は表示用）。知らせなくて
+    /// よい結果（消した・無い・別のプロセスのもの）は `None`。
+    ///
+    /// 残ったファイルは、読む側（[`read_live_endpoint`]）が書いたプロセスの pid が
+    /// 生きていないので古いものとして読み飛ばし、次の起動の [`write_endpoint`] が
+    /// 置き換えを試みる。そのため終了コードは変えない
+    /// （`server_host::ServerShutdownSummary::exit_code`）。
+    ///
+    /// **自動で直るとは約束しない**（PR #649 の Codex P2）: 消せなかった・読めなかった
+    /// 原因が読み取り専用の属性や ACL のように続くものなら、次の起動の置き換え（rename）
+    /// も同じ理由で失敗し、サーバーは起動時に「書けなかった」の行を出して動き続けるが、
+    /// シェルは古い pid のファイルを断るので生きているポートを見つけられない。そのため
+    /// 文言は「置き換えを試みる・できなければ属性と権限を確かめて手で消す」にし、OS の
+    /// エラーがあれば同じ 1 行に入れる。
+    pub fn diagnostic(&self, path: &Path) -> Option<String> {
+        let path = path.display();
+        let advice = format!(
+            "次の起動で置き換えを試みます。置き換えられないときは、ファイルの属性・権限を確かめて、{path} を手で消してください"
+        );
+        match self {
+            Self::Removed | Self::Absent | Self::OtherOwner { .. } => None,
+            Self::Unrecognized => Some(format!(
+                "接続先のファイル（{path}）の中身を読み取れないため、消さずに残しました。{advice}"
+            )),
+            Self::ReadFailed(err) => Some(format!(
+                "接続先のファイル（{path}）を読めないため、消さずに残しました（{err}）。{advice}"
+            )),
+            Self::RemoveFailed(err) => Some(format!(
+                "接続先のファイル（{path}）を消せませんでした（{err}）。{advice}"
+            )),
+        }
+    }
+}
+
+/// 終了時の後始末: ファイルの `pid` が `own_pid` のときだけ消す（[`EndpointClear`]）。
+/// 無い・壊れている・読めない・他のプロセスのものなら消さない（所有者を確かめられない
+/// ファイルは消さない。壊れたファイルは次に書く側が置き換える）。
+pub fn clear_endpoint(path: &Path, own_pid: u32) -> EndpointClear {
+    clear_endpoint_with(path, own_pid, |path| std::fs::remove_file(path))
+}
+
+/// 削除を差し替えられる版（テストが削除の失敗を注入する）。
+fn clear_endpoint_with(
+    path: &Path,
+    own_pid: u32,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> EndpointClear {
+    match load_endpoint(path) {
+        Err(err) => EndpointClear::ReadFailed(err.to_string()),
+        Ok(Loaded::Missing) => EndpointClear::Absent,
+        Ok(Loaded::Unrecognized) => EndpointClear::Unrecognized,
+        Ok(Loaded::Info(info)) if info.pid != own_pid => {
+            EndpointClear::OtherOwner { pid: info.pid }
+        }
+        Ok(Loaded::Info(_)) => match remove(path) {
+            Ok(()) => EndpointClear::Removed,
+            // 読んだ後に誰かが消した。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EndpointClear::Absent,
+            Err(err) => EndpointClear::RemoveFailed(err.to_string()),
+        },
     }
 }
 
@@ -344,13 +445,151 @@ mod tests {
         let mut other = sample();
         other.pid = std::process::id().wrapping_add(1).max(1);
         write_endpoint(&path, &other).unwrap();
-        assert!(!clear_endpoint(&path, std::process::id()));
+        assert_eq!(
+            clear_endpoint(&path, std::process::id()),
+            EndpointClear::OtherOwner { pid: other.pid }
+        );
         assert!(path.exists(), "他のプロセスのファイルは消さない");
 
         write_endpoint(&path, &sample()).unwrap();
-        assert!(clear_endpoint(&path, std::process::id()));
+        assert_eq!(
+            clear_endpoint(&path, std::process::id()),
+            EndpointClear::Removed
+        );
         assert!(!path.exists());
-        assert!(!clear_endpoint(&path, std::process::id()), "冪等");
+        assert_eq!(
+            clear_endpoint(&path, std::process::id()),
+            EndpointClear::Absent,
+            "冪等"
+        );
+    }
+
+    /// #599: 消せなかったことを「消した・無い」と区別し、知らせる 1 行を作る。
+    /// 知らせなくてよい結果は 1 行を作らない。
+    #[test]
+    fn a_failed_removal_is_reported_and_not_mistaken_for_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        write_endpoint(&path, &sample()).unwrap();
+        let result = clear_endpoint_with(&path, std::process::id(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(
+            matches!(result, EndpointClear::RemoveFailed(_)),
+            "{result:?}"
+        );
+        assert!(path.exists());
+        let line = result.diagnostic(&path).expect("知らせる");
+        assert!(line.contains("消せませんでした"), "{line}");
+        assert!(line.contains(&path.display().to_string()), "{line}");
+
+        // 削除の直前に誰かが消した（NotFound）は「無い」。
+        let raced = clear_endpoint_with(&path, std::process::id(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(raced, EndpointClear::Absent);
+
+        for quiet in [
+            EndpointClear::Removed,
+            EndpointClear::Absent,
+            EndpointClear::OtherOwner { pid: 1 },
+        ] {
+            assert_eq!(quiet.diagnostic(&path), None, "{quiet:?}");
+        }
+    }
+
+    /// PR #649 の Codex P2: 知らせる 1 行は「次の起動で置き換えます」と約束しない。
+    /// 置き換えを試みること・できなければ属性と権限を確かめて手で消すこと・OS の
+    /// エラー（あれば）を同じ 1 行に入れる（golden）。
+    #[test]
+    fn diagnostics_do_not_promise_an_automatic_fix() {
+        let path = PathBuf::from("root").join("run").join(ENDPOINT_FILE_NAME);
+        let shown = path.display().to_string();
+        let advice = format!(
+            "次の起動で置き換えを試みます。置き換えられないときは、ファイルの属性・権限を確かめて、{shown} を手で消してください"
+        );
+        assert_eq!(
+            EndpointClear::RemoveFailed("アクセスが拒否されました。 (os error 5)".to_string())
+                .diagnostic(&path)
+                .unwrap(),
+            format!(
+                "接続先のファイル（{shown}）を消せませんでした（アクセスが拒否されました。 (os error 5)）。{advice}"
+            )
+        );
+        assert_eq!(
+            EndpointClear::ReadFailed("os error 5".to_string())
+                .diagnostic(&path)
+                .unwrap(),
+            format!("接続先のファイル（{shown}）を読めないため、消さずに残しました（os error 5）。{advice}")
+        );
+        assert_eq!(
+            EndpointClear::Unrecognized.diagnostic(&path).unwrap(),
+            format!(
+                "接続先のファイル（{shown}）の中身を読み取れないため、消さずに残しました。{advice}"
+            )
+        );
+        for state in [
+            EndpointClear::RemoveFailed("x".to_string()),
+            EndpointClear::ReadFailed("x".to_string()),
+            EndpointClear::Unrecognized,
+        ] {
+            let line = state.diagnostic(&path).unwrap();
+            assert!(!line.contains("置き換えます"), "{line}");
+        }
+    }
+
+    /// #599: 壊れた・読めないファイルは所有者を確かめられないので消さず、残したことを
+    /// 知らせる。読めないのは「無い」と区別する（同じ名前のフォルダを置いて読めなく
+    /// する。Windows は開けない・それ以外は読めない、のどちらも `ReadFailed`）。
+    #[test]
+    fn unreadable_or_corrupt_files_are_kept_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+        let corrupt = clear_endpoint(&path, std::process::id());
+        assert_eq!(corrupt, EndpointClear::Unrecognized);
+        assert!(path.exists(), "所有者を確かめられないファイルは消さない");
+        assert!(corrupt.diagnostic(&path).is_some());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let unreadable = clear_endpoint(&path, std::process::id());
+        assert!(
+            matches!(unreadable, EndpointClear::ReadFailed(_)),
+            "{unreadable:?}"
+        );
+        assert!(path.exists());
+        assert!(unreadable
+            .diagnostic(&path)
+            .is_some_and(|line| line.contains("読めない")));
+    }
+
+    /// #599: Windows の本物の共有違反（削除の共有を許さずに開いたまま）で消せない。
+    #[cfg(windows)]
+    #[test]
+    fn a_sharing_violation_is_a_failed_removal_on_windows() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        write_endpoint(&path, &sample()).unwrap();
+        // 読みの共有だけ許す（FILE_SHARE_READ = 1）。削除は共有違反になる。
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let result = clear_endpoint(&path, std::process::id());
+        drop(held);
+        assert!(
+            matches!(result, EndpointClear::RemoveFailed(_)),
+            "{result:?}"
+        );
+        assert!(path.exists());
+        assert_eq!(
+            clear_endpoint(&path, std::process::id()),
+            EndpointClear::Removed
+        );
     }
 
     #[test]

@@ -591,11 +591,13 @@ pub struct AuthConfigView {
     /// ログイン不要モード（デスクトップの画面だけに効く。REST では読むだけ）。
     pub disabled: bool,
     pub disabled_role: Role,
-    /// 保存されている `auth.local_grant`（`off`/`viewer`/`editor`/`admin`）。
+    /// 保存されている `auth.local_grant`（`off`/`viewer`/`editor`/`admin`）。`PUT` の
+    /// 応答では**その要求が保存した値**（並行する別の `PUT` の値ではない。#601）。
     pub local_grant: &'static str,
     /// この host が `localDesktop` を発行するか（`chronogazer-server` だけ `true`）。
     pub local_grant_supported: bool,
-    /// 保存されている値で発行するのに再起動が要るか。
+    /// `local_grant` の値で発行するのに再起動が要るか（`PUT` の応答では、その要求が
+    /// 保存した値に対応するもの）。
     pub local_grant_restart_required: bool,
 }
 
@@ -750,8 +752,17 @@ async fn server_settings_put(State(state): State<SettingsAdminState>, req: Reque
 }
 
 async fn auth_view(state: &SettingsAdminState) -> Result<AuthConfigView, BantoError> {
-    let auth = state.settings.auth_config().await?;
     let saved = read_setting(&state.settings).await?;
+    auth_view_for(state, saved).await
+}
+
+/// `saved` を `auth.local_grant` の値とした応答（`PUT` は自分が保存した値で、lock の
+/// 下で組む。#601）。
+async fn auth_view_for(
+    state: &SettingsAdminState,
+    saved: LocalGrantSetting,
+) -> Result<AuthConfigView, BantoError> {
+    let auth = state.settings.auth_config().await?;
     let initialized = state.users.is_initialized().await?;
     Ok(AuthConfigView {
         disabled: auth.disabled,
@@ -832,7 +843,10 @@ async fn auth_settings_apply(
     value: LocalGrantSetting,
     token: Option<String>,
 ) -> Result<AuthConfigView, ApiError> {
-    let revoked = {
+    // 応答は lock の下で、この要求が保存した値から組む（#601: lock を外してから
+    // 読み直していたので、並行する別の `PUT` が後から保存した `localGrant` と
+    // `localGrantRestartRequired` が先の要求の応答に載ることがあった）。
+    let (revoked, view) = {
         let _guard = state.auth_config_lock.lock().await;
         // #392 B2-2 のレビュー: lock を待つ間に失効したトークン（setup の後の失効など）で、
         // setup が保存した `off` を書き戻させない。認可は lock の手前で済んでいるので、
@@ -842,11 +856,14 @@ async fn auth_settings_apply(
         write_setting(&state.settings, value).await?;
         // ADR-0017: 閉じた条件を保存してから失効。値が変わったときだけ（同じ値の保存で
         // 動いているセッションを切らない）。
-        if previous != value {
+        let revoked = if previous != value {
             state.auth.revoke_grant_tokens(&local_desktop_grant_kind())
         } else {
             0
-        }
+        };
+        // 保存・失効は済んでいるので、応答を組めなくても（DB を読めない）保存は
+        // 取り消さない。監査は下で残し、誤りは応答で返す。
+        (revoked, auth_view_for(state, value).await)
     };
     state
         .audit
@@ -864,5 +881,5 @@ async fn auth_settings_apply(
             result: "ok",
         })
         .await;
-    Ok(auth_view(state).await?)
+    Ok(view?)
 }

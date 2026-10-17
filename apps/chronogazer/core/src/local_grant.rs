@@ -131,8 +131,10 @@
 //!
 //! 発行（banto の `grant_router` は監査しない - キオスクの再読み込みで埋もれるため）に
 //! 成功したら `login`（`resource: auth`、`detail: { via: "localGrant" }`、actor は合成の
-//! `localDesktop` と発行した role、`origin: rest`）を残す。デスクトップの自動ログインの
-//! `detail: { via: "autologin" }` と同じ作法。admin 相当になりうる口なので、発行の数は
+//! `localDesktop` と発行した role、`origin: rest`）を残す。kind（percent decode した
+//! パス）と role（起動時の形）は発行の前に決め、発行されたトークンを読み直さない
+//! ので、発行の直後に FIFO で追い出されても発行と監査は 1 対 1（#601）。
+//! デスクトップの自動ログインの `detail: { via: "autologin" }` と同じ作法。admin 相当になりうる口なので、発行の数は
 //! `max_sessions`（[`LOCAL_GRANT_MAX_SESSIONS`]）で小さく抑え、発行のたびに記録する。
 //! その後の操作は普通のセッションと同じく `actor_username: "localDesktop"` で記録される
 //! （identity の名前は kind と同じ。banto-hub の試運転の `commissioning` と同じ綴りの
@@ -575,27 +577,35 @@ pub async fn local_access_middleware(
         }
     }
 
-    // 発行の監査は、生のパスの kind ではなく**発行されたトークンのセッションの kind**で
-    // 判断する（#600 のオーナーレビュー P2）: banto の発行口は `Path<String>` で kind を
+    // 発行の監査は、生のパスの文字列ではなく **percent decode した kind** で判断する
+    // （#600 のオーナーレビュー P2）: banto の発行口は `Path<String>` で kind を
     // percent decode するので、`/api/auth/grant/local%44esktop` でも `localDesktop` が
     // 発行される。生の文字列と比べると、その別表記で発行の監査が抜けていた。
     // （peer と Host の確認は接頭辞 `/api/auth/grant/` で掛けるので別表記でも素通り
     // しない。axum のルーティングは decode しない生のパスで行うので、接頭辞・status・
     // setup・users を別表記にした要求はどのルートにも当たらない。）
+    // 監査に使う kind と role は**発行の前に**決める（#601、[`local_desktop_issue_role`]）:
+    // 以前は応答のトークンをもう一度 `authenticate` してセッションの kind と role を
+    // 読んでいたので、同時の発行で FIFO の上限を超えて先に追い出されたトークンでは
+    // `login` が欠けていた。
     let is_grant_issue = is_post && path.starts_with(GRANT_PREFIX);
+    let issued_role = if is_grant_issue {
+        local_desktop_issue_role(state.access, &path[GRANT_PREFIX.len()..])
+    } else {
+        None
+    };
 
     // 予約名のアカウントがあれば、初期化後の `localDesktop` の発行を説明つきの `409` で
     // 断る（#600 の Copilot レビュー、[`has_reserved_accounts`]）。断る本体は条件の側
     // （status と発行で共有）にあり、ここは理由を伝えるだけ。この PC からの要求だけに
     // 答える（LAN の peer には条件の `403` のまま、アカウントの名前の有無を漏らさない）。
-    // kind は banto と同じく percent decode して比べる（別表記でも同じ説明を返す）。
+    // kind は banto と同じく percent decode して比べる（別表記でも同じ説明を返す）。判定は
+    // 監査と同じ `issued_role`（[`local_desktop_issue_role`]: 発行の POST・この listener が
+    // 発行しうる・decode した kind が `localDesktop`）を使い、1 か所にまとめる（PR #649 の
+    // オーナー Nit 1。挙動は同じ - `may_issue` は起動時の role があることを含む）。
     // 未初期化で起動した後の初期化済み（#392 B2-2 で、設定が `admin` なら開く）も同じ
     // なので、起動時の形は問わない（未初期化の間はアカウントが無く、常に偽）。
-    if is_grant_issue
-        && local
-        && state.access.may_issue()
-        && percent_decode(&path[GRANT_PREFIX.len()..]).as_deref() == Some(LOCAL_DESKTOP_GRANT_KIND)
-    {
+    if local && issued_role.is_some() {
         if let Ok(true) = has_reserved_accounts(&state.users).await {
             return (
                 StatusCode::CONFLICT,
@@ -618,11 +628,9 @@ pub async fn local_access_middleware(
     // 切られても、上流の副作用と後処理は揃って完結する。
     let detached = async move {
         let response = next.run(req).await;
-        let response = if is_grant_issue && response.status().is_success() {
-            audit_issued_grant(&state, response).await
-        } else {
-            response
-        };
+        if let Some(role) = issued_role.filter(|_| response.status().is_success()) {
+            record_grant_login(&state, role.as_str()).await;
+        }
         if is_setup {
             finish_setup(&state, response, setup_opt_in).await
         } else {
@@ -734,41 +742,21 @@ async fn refuse_first_account_by_grant(
     }
 }
 
-/// grant の発行の応答の上限（`{success, token}` だけなので十分に小さい）。
-const GRANT_RESPONSE_LIMIT: usize = 64 * 1024;
-
-/// 発行の成功の応答から発行されたトークンを読み、そのセッションの kind が
-/// `localDesktop` なら監査に残す。応答はそのまま組み直して返す。
-async fn audit_issued_grant(state: &LocalAccessState, response: Response) -> Response {
-    let (parts, body) = response.into_parts();
-    let bytes = match axum::body::to_bytes(body, GRANT_RESPONSE_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            // 読めなければトークンを渡せない（発行は成り立たない）。理由だけ残す。
-            eprintln!("grant の発行の応答を読めませんでした: {err}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody::Other {
-                    message: "grant の発行の応答を読めませんでした".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let token = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| value["token"].as_str().map(str::to_owned));
-    if let Some(token) = token {
-        if let Ok(Some(session)) = state.auth.authenticate(&token).await {
-            if session.grant.as_ref().map(GrantKind::as_str) == Some(LOCAL_DESKTOP_GRANT_KIND) {
-                record_grant_login(state, &session.identity.role).await;
-            }
-        }
+/// `POST /api/auth/grant/<segment>` が `localDesktop` の発行なら、発行するセッションの
+/// role（それ以外は `None`）。kind は banto の発行口（`Path<String>`）と同じく percent
+/// decode して比べ、role はこの listener の起動時の形（[`LocalGrantStart::issued_role`]
+/// = 合成の identity に登録した role）から決める。どちらも発行の時点で決まっていて、
+/// 発行されたトークンを読み直さない（#601。発行の成功の後に FIFO で追い出されても、
+/// 失効しても、発行の監査は 1 対 1）。
+fn local_desktop_issue_role(access: LocalAccess, segment: &str) -> Option<Role> {
+    if !access.may_issue() || percent_decode(segment).as_deref() != Some(LOCAL_DESKTOP_GRANT_KIND) {
+        return None;
     }
-    Response::from_parts(parts, axum::body::Body::from(bytes))
+    access.start.issued_role()
 }
 
-/// 発行の成功を監査に残す（モジュール doc「監査」）。`role` は発行したセッションのもの。
+/// 発行の成功を監査に残す（モジュール doc「監査」）。`role` は発行したセッションのもの
+/// （[`local_desktop_issue_role`]）。
 async fn record_grant_login(state: &LocalAccessState, role: &str) {
     state
         .audit

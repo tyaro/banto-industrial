@@ -422,18 +422,58 @@ fn describe_scm_detail(scm: &ScmObservation) -> String {
     }
 }
 
-/// health の probe の結果の文言（窓）。`None` は probe していない（`Running` でない）。
-pub(crate) fn describe_health(health: Option<&ServiceHealth>) -> String {
+/// 接続先のファイル（文言の中の呼び方）。
+const ENDPOINT_FILE_LABEL: &str = "データの置き場所の run\\endpoint.json";
+
+/// 接続先が見つからないときの、権限の可能性（最後に添える。#612: データの置き場所の
+/// 権限を絞った後（B3-3）のほかの利用者の場合で、まず疑う原因ではない）。
+const ENDPOINT_PERMISSION_HINT: &str =
+    "ほかの利用者として使っているときは、データの置き場所を読む権限が無いこともあります。";
+
+/// health の probe の結果の文言（窓）。`None` は probe していない（SCM が `Running` で
+/// ない。理由は `scm` で言い分け、照会の失敗・未登録を「実行中ではない」と断定しない）。
+/// `EndpointMissing` は `scm` に合わせて原因の並べ方を変え、権限の可能性は最後に回す
+/// （#612。コンソール版を止めた・サービスの起動や停止の途中のほうがずっと多い）。
+pub(crate) fn describe_health(scm: &ScmObservation, health: Option<&ServiceHealth>) -> String {
     match health {
-        None => "サービスが実行中ではないため、接続は確かめていません。".to_string(),
+        None => match scm {
+            ScmObservation::QueryFailed(_) => {
+                "サービスの状態を確認できないため、接続は確かめていません。".to_string()
+            }
+            ScmObservation::State(ScmState::NotInstalled) => {
+                "サービスが登録されていないため、接続は確かめていません。".to_string()
+            }
+            ScmObservation::NotWindows => {
+                "Windows ではないため、接続は確かめていません。".to_string()
+            }
+            ScmObservation::State(ScmState::Running) => {
+                "接続はまだ確かめていません。".to_string()
+            }
+            ScmObservation::State(_) => {
+                "サービスが実行中ではないため、接続は確かめていません。".to_string()
+            }
+        },
         Some(ServiceHealth::Healthy { port, version }) => {
             format!("接続できます（ポート {port}、版 {version}）。")
         }
-        Some(ServiceHealth::EndpointMissing) => concat!(
-            "サービスの接続先（データの置き場所の run\\endpoint.json）が見つかりません。",
-            "サービスが起動の途中か、この利用者にデータの置き場所を読む権限がありません。"
-        )
-        .to_string(),
+        Some(ServiceHealth::EndpointMissing) => match scm {
+            ScmObservation::State(ScmState::Running) => format!(
+                "サービスの接続先（{ENDPOINT_FILE_LABEL}）が見つからないか、書いたプロセスが終わっています。\
+                 サービスが起動か停止の途中のことが多く、そのときは少し待つと自動でつながります。\
+                 続くときは、サービスが別のデータの置き場所を使っているか、接続先を書けなかった\
+                 （理由はサービスのログ）可能性があります。{ENDPOINT_PERMISSION_HINT}"
+            ),
+            ScmObservation::State(ScmState::StartPending) => format!(
+                "サービスが開始の途中のため、接続先（{ENDPOINT_FILE_LABEL}）はまだありません。"
+            ),
+            ScmObservation::State(ScmState::StopPending | ScmState::Stopped) => format!(
+                "サービスが止まっている（停止の途中を含む）ため、接続先（{ENDPOINT_FILE_LABEL}）はありません。"
+            ),
+            _ => format!(
+                "サービスの接続先（{ENDPOINT_FILE_LABEL}）が見つからないか、書いたプロセスが終わっています。\
+                 {ENDPOINT_PERMISSION_HINT}"
+            ),
+        },
         Some(ServiceHealth::Unreachable { port }) => {
             format!("サービスのポート {port} に接続できません。")
         }
@@ -512,7 +552,7 @@ pub(crate) fn fallback_page_view(
         title: title.to_string(),
         message: message.to_string(),
         scm: describe_scm_detail(&state.scm),
-        health: describe_health(state.health.as_ref()),
+        health: describe_health(&state.scm, state.health.as_ref()),
         steps: vec![
             format!(
                 "サービスが実行中になり接続を確かめられると、自動でつなぎます（{} 秒ごとに確かめています）。",
@@ -735,6 +775,10 @@ pub(crate) fn start(app: &AppHandle) {
                 crate::startup::show_fatal(app, format!("画面を作れませんでした: {err}"));
                 return;
             }
+            // #612: 見張りの自動のつなぎ直し（`switch_to_service`）と同じ 1 行を、窓を
+            // 作れた後に 1 回だけ（作れなければ出さない）。画面の読み込みや認証の成功は
+            // 意味しない（つなぎ直しの行と同じ意味）。
+            eprintln!("{}", connected_to_service_line(port));
             crate::legacy_notice::show_once(app, &layout);
             tauri::async_runtime::spawn(monitor(app.clone()));
         }
@@ -973,6 +1017,13 @@ async fn retry(app: AppHandle) {
     }
 }
 
+/// サービスの画面の窓を作れたときのログの 1 行（起動の判定・見張りの自動のつなぎ直し・
+/// 「再試行」で共通。#612）。窓を作れたことだけを表し、画面の読み込みや認証の成功は
+/// 意味しない。
+pub(crate) fn connected_to_service_line(port: u16) -> String {
+    format!("banto: サービスへつなぎました（ポート {port}）")
+}
+
 /// Fallback → Service（見張りの自動の接続・「再試行」）。
 fn switch_to_service(app: &AppHandle, guard: TransitionGuard, port: u16) {
     let visible = window_visible(app, FALLBACK_WINDOW_LABEL);
@@ -987,7 +1038,7 @@ fn switch_to_service(app: &AppHandle, guard: TransitionGuard, port: u16) {
     destroy_window(app, FALLBACK_WINDOW_LABEL);
     guard.finish(ShellView::Service { port });
     crate::tray::refresh(app);
-    eprintln!("banto: サービスへつなぎました（ポート {port}）");
+    eprintln!("{}", connected_to_service_line(port));
     if let Some(shell) = app.try_state::<ShellState>() {
         crate::legacy_notice::show_once(app, &shell.layout);
     }
@@ -1491,30 +1542,83 @@ mod tests {
         assert!(service_window_config(&base, 8721, true).visible);
     }
 
-    /// 文言: すべての health の理由に中身があり、port を名指す理由は port を含む。
+    /// 文言: すべての SCM × health の理由に中身があり、port を名指す理由は port を含む。
     #[test]
     fn health_descriptions() {
-        for health in all_health() {
-            let text = describe_health(health.as_ref());
-            assert!(!text.is_empty());
-            if let Some(
-                ServiceHealth::Healthy { port, .. }
-                | ServiceHealth::Unreachable { port }
-                | ServiceHealth::NotChronoGazer { port }
-                | ServiceHealth::WrongHostKind { port, .. }
-                | ServiceHealth::WrongScope { port },
-            ) = &health
-            {
-                assert!(text.contains(&port.to_string()), "{text}");
+        for scm in all_observations() {
+            for health in all_health() {
+                let text = describe_health(&scm, health.as_ref());
+                assert!(!text.is_empty());
+                if let Some(
+                    ServiceHealth::Healthy { port, .. }
+                    | ServiceHealth::Unreachable { port }
+                    | ServiceHealth::NotChronoGazer { port }
+                    | ServiceHealth::WrongHostKind { port, .. }
+                    | ServiceHealth::WrongScope { port },
+                ) = &health
+                {
+                    assert!(text.contains(&port.to_string()), "{text}");
+                }
+                if health == Some(ServiceHealth::EndpointMissing) {
+                    assert!(text.contains("endpoint.json"), "{scm:?}: {text}");
+                }
             }
         }
-        assert!(describe_health(Some(&ServiceHealth::WrongHostKind {
-            port: 1,
-            kind: "server".to_string()
-        }))
+        assert!(describe_health(
+            &running(),
+            Some(&ServiceHealth::WrongHostKind {
+                port: 1,
+                kind: "server".to_string()
+            })
+        )
         .contains("server"));
-        assert!(describe_health(Some(&ServiceHealth::EndpointMissing)).contains("endpoint.json"));
-        assert!(describe_health(None).contains("確かめていません"));
+        assert!(
+            describe_health(&ScmObservation::State(ScmState::Stopped), None)
+                .contains("確かめていません")
+        );
+    }
+
+    /// #612: 接続先が見つからない（`EndpointMissing`）ときは、SCM の状態に合わせて原因を
+    /// 並べ、権限の可能性は断定せず最後に回す（実行中ではまず起動・停止の途中を挙げる）。
+    /// 照会の失敗・未登録で probe していないときは「実行中ではない」と断定しない。
+    #[test]
+    fn endpoint_missing_puts_the_permission_hint_last_and_never_asserts_it() {
+        let missing = Some(&ServiceHealth::EndpointMissing);
+        let text = describe_health(&running(), missing);
+        let transient = text.find("起動か停止の途中").expect(&text);
+        let permission = text.find("権限").expect(&text);
+        assert!(transient < permission, "{text}");
+        assert!(text.ends_with(ENDPOINT_PERMISSION_HINT), "{text}");
+        assert!(!text.contains("権限がありません"), "断定している: {text}");
+
+        for scm in [
+            ScmObservation::State(ScmState::StartPending),
+            ScmObservation::State(ScmState::StopPending),
+            ScmObservation::State(ScmState::Stopped),
+        ] {
+            let text = describe_health(&scm, missing);
+            assert!(!text.contains("権限"), "{scm:?}: {text}");
+        }
+        for scm in all_observations() {
+            assert!(
+                !describe_health(&scm, missing).contains("権限がありません"),
+                "{scm:?}"
+            );
+        }
+
+        let query_failed = describe_health(&ScmObservation::QueryFailed("x".to_string()), None);
+        assert!(!query_failed.contains("実行中ではない"), "{query_failed}");
+        let not_installed = describe_health(&ScmObservation::State(ScmState::NotInstalled), None);
+        assert!(!not_installed.contains("実行中ではない"), "{not_installed}");
+    }
+
+    /// #612: 起動の判定でサービスの画面を開いたときも、見張りのつなぎ直しと同じ 1 行。
+    #[test]
+    fn the_connected_line_names_the_port() {
+        assert_eq!(
+            connected_to_service_line(8721),
+            "banto: サービスへつなぎました（ポート 8721）"
+        );
     }
 
     #[test]

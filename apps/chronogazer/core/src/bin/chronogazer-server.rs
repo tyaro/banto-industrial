@@ -357,10 +357,20 @@ struct StopController {
 type LineSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// 後始末の本体の結果の記録（本体を走らせた経路 `origin` の名で、本体について
-/// 1 回だけ）。最終の書き出しの失敗と、完了（予算切れでなければ）。予算切れは
-/// エンジンが自分で 1 行出している（`engine::RunningEngine::shutdown`）。
+/// 1 回だけ）。`run\endpoint.json` を残したこと（#599）、最終の書き出しの失敗と、
+/// 完了（予算切れでなければ。endpoint.json を残したときは完了の行にもそう書き、
+/// 「完了しました」だけを残さない）。予算切れはエンジンが自分で 1 行出している
+/// （`engine::RunningEngine::shutdown`）。
 fn body_log_lines(origin: StopOrigin, summary: &ServerShutdownSummary) -> Vec<String> {
     let mut lines = Vec::new();
+    // #599: endpoint.json を残したこと（終了コードは変えない。`exit_code` の doc）。
+    let endpoint_left = summary.endpoint_diagnostic();
+    let left_note = if endpoint_left.is_some() {
+        "。接続先のファイルは残りました"
+    } else {
+        ""
+    };
+    lines.extend(endpoint_left);
     if let Some(err) = &summary.report.collect_stop_error {
         lines.push(format!(
             "{SERVER_LABEL}: 最終の書き出しに失敗しました: {err}"
@@ -368,7 +378,7 @@ fn body_log_lines(origin: StopOrigin, summary: &ServerShutdownSummary) -> Vec<St
     }
     if !summary.report.timed_out {
         lines.push(format!(
-            "{SERVER_LABEL}: 終了の後始末が完了しました（{}）",
+            "{SERVER_LABEL}: 終了の後始末が完了しました（{}{left_note}）",
             origin.label()
         ));
     }
@@ -1216,8 +1226,55 @@ mod tests {
                 listener_stop_abandoned: false,
                 budget: Duration::from_secs(1),
             },
-            endpoint_cleared: true,
+            endpoint: chronogazer_core::endpoint::EndpointClear::Removed,
+            endpoint_file: std::path::PathBuf::from("endpoint.json"),
         }
+    }
+
+    /// #599: endpoint.json を消せなかったら、本体の記録（結果の公開の前に 1 回）に
+    /// その 1 行が入り、完了の行も「残った」と書く（「完了しました」だけにしない）。
+    /// 終了コードは変えない（`ServerShutdownSummary::exit_code` の doc）。消せたときは
+    /// 何も足さない。
+    #[test]
+    fn a_left_endpoint_is_recorded_once_without_changing_the_exit_code() {
+        let once = ExitCleanupOnce::new();
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record: LineSink = {
+            let lines = lines.clone();
+            Arc::new(move |line: &str| lines.lock().unwrap().push(line.to_string()))
+        };
+        let report = run_cleanup(
+            &once,
+            StopOrigin::Close,
+            Duration::from_secs(10),
+            |_| ServerShutdownSummary {
+                endpoint: chronogazer_core::endpoint::EndpointClear::RemoveFailed(
+                    "access denied".to_string(),
+                ),
+                ..finished_summary()
+            },
+            record,
+        );
+        let ExitCleanupReport::RanWork(banto_exit_once::ExitCleanupOutcome::Finished(summary)) =
+            report
+        else {
+            panic!("本体を走らせたはず: {report:?}");
+        };
+        assert_eq!(summary.exit_code(), server_host::EXIT_OK);
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("消せませんでした") && lines[0].contains("access denied"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("完了しました") && lines[1].contains("残りました"),
+            "{lines:?}"
+        );
+
+        let quiet = body_log_lines(StopOrigin::Interrupt, &finished_summary());
+        assert_eq!(quiet.len(), 1, "{quiet:?}");
+        assert!(!quiet[0].contains("残りました"), "{quiet:?}");
     }
 
     /// #598 のレビュー（banto-hub #587 と同じ型）: 後始末の本体の結果の記録は、本体を
