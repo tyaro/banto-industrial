@@ -395,7 +395,8 @@ jobs:
   # `chronogazer-elev` の Windows 専用の再公開の cfg 漏れ）を CI で捕まえられない。昇格
   # まわりの 2 crate の lib を ubuntu で clippy する軽いジョブ。Rust の対象（`rust_args`）に
   # この 2 つのどちらかが入るとき（workspace 全体を含む）だけ走る（`run_linux_clippy`。
-  # 判定は ci-changes.mjs の JOB_PACKAGES）。
+  # 判定は ci-changes.mjs の JOB_PACKAGES）。#623 PR-2 から、`banto-instance-lock` が
+  # 対象に入るときはその clippy・テストもここで走らせる（下の段）。
   linux-clippy:
     name: Rust (linux clippy / 昇格まわり)
     needs: changes
@@ -412,6 +413,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy (chronogazer-elev / banto-hub-core の lib)
         run: cargo clippy -p chronogazer-elev -p banto-hub-core --lib -- -D warnings
+      # #623 PR-2 のレビュー P2-1: `banto-instance-lock` は非 Windows に別の実装
+      # （flock・`O_NOFOLLOW` の診断ファイル）とテストの分岐を持つが、メインの Rust
+      # ジョブは windows-latest なので、ここで走らせないと一度もコンパイル・実行されない。
+      # Rust の対象（`rust_args`）にこの crate が入るとき（workspace 全体を含む）だけ。
+      - name: clippy + test (banto-instance-lock、非 Windows の実装)
+        if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-instance-lock ')
+        run: |
+          cargo clippy -p banto-instance-lock --all-targets -- -D warnings
+          cargo test -p banto-instance-lock
 
   # #468: 旧 `e2e` ジョブ（chronogazer と banto-hub を 1 ジョブで）を 2 つに
   # 分けた。hub だけの変更で chronogazer の build / Playwright を走らせない。

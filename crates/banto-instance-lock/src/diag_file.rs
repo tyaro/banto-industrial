@@ -19,11 +19,17 @@
 //!   ハンドルで消す（外に空のファイルを残さない）。
 //! - **非 Windows**: `O_NOFOLLOW`（最後の要素のシンボリックリンクを断る）と、開いた
 //!   fd の `fstat` で「通常のファイル・リンク数 1」を確かめる。非 Windows は開発・CI
-//!   用なので、途中のディレクトリのリンクまでは見ない。
+//!   用なので、途中のディレクトリのリンクまでは見ない。読みは `O_NONBLOCK` も付ける
+//!   （FIFO だと `open(2)` が書き手を待って戻らないため。開いた後は通常のファイルで
+//!   あることを確かめるので、読みそのものは通常のファイルとして終わる）。
 //!
-//! 途中のジャンクション・`subst`・ネットワークドライブを通るパスを正当に使う構成でも、
-//! 本当のパスが渡されたパスと食い違うので診断ファイルは書かれず、読みは `Corrupt`
-//! になる（排他そのものは Windows では mutex なので影響しない）。
+//! 渡されたパスの途中にジャンクション・マウントポイント・`subst`・ネットワーク
+//! ドライブがあると、本当のパスが渡されたパスと食い違うので診断ファイルは書かれず、
+//! 読みは `Corrupt` になる（排他そのものは Windows では mutex なので影響しない）。
+//! そのため呼び出し側は、**管理者が決める部分（ルート）だけ**を `canonicalize`
+//! してから利用者が「変更」を持つ部分を連結して渡す（banto-hub は Hub のルート、
+//! ChronoGazer は DB の親 = ルート）。利用者が「変更」を持つ部分は解かないので、
+//! そこに植えたリンクはここで捕まる。
 
 use std::fmt;
 use std::fs::File;
@@ -255,16 +261,31 @@ mod windows_impl {
             Ok(Some(refusal)) => refusal,
             Err(err) => {
                 if created {
-                    let _ = delete_by_handle(&handle);
+                    delete_created(&handle, path);
                 }
                 return Err(err);
             }
         };
         if created {
             // 作ったのが外（途中のリンクの先）なら、空のファイルを残さない。
-            let _ = delete_by_handle(&handle);
+            delete_created(&handle, path);
         }
         Ok(Opened::Refused(refusal))
+    }
+
+    /// この呼び出しで作ったファイルを消す。消せなければ、外に空のファイルが残った
+    /// かもしれないことを本当のパスつきで警告 1 行に出す（黙って捨てない）。
+    fn delete_created(handle: &OwnedHandle, path: &Path) {
+        if let Err(err) = delete_by_handle(handle) {
+            let actual = final_path(handle)
+                .map(|actual| actual.display().to_string())
+                .unwrap_or_else(|_| "(不明)".to_string());
+            tracing::warn!(
+                path = %path.display(),
+                actual = %actual,
+                "確かめに合わなかった診断ファイルを作ったが消せませんでした（空のファイルが残っている可能性があります）: {err}"
+            );
+        }
     }
 
     /// 読むために開く（既にあるものだけ）。
@@ -319,11 +340,15 @@ mod unix_impl {
         )
     }
 
+    /// 読むために開く。`O_NONBLOCK` は FIFO で `open(2)` が書き手を待って戻らない
+    /// のを防ぐ（`finish` が通常のファイルでないものを断るので、FIFO は読まずに
+    /// 捨てる）。通常のファイルの `read(2)` は `O_NONBLOCK` でも待たずにそのまま
+    /// 読めるので、読みの扱いは変わらない。
     pub(crate) fn open_for_read(path: &Path) -> io::Result<Opened> {
         finish(
             OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(path),
         )
     }

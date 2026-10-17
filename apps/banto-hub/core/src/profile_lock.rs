@@ -96,13 +96,60 @@ impl ProfileLockGuard {
     }
 }
 
+/// 診断ファイル（`profile.lock`）のパス。取得（[`try_acquire_profile_lock`]）と
+/// health の読み取り（`crate::http_hub_health`）の両方がこれを使う（同じパスに
+/// 書いて、同じパスから読む）。
+///
+/// **Hub のルート（`paths.root`）だけを `canonicalize` してから**
+/// `profiles\<profile-id>\profile.lock` を連結する（#623 PR-2 のレビュー P2-2）。
+/// `banto_instance_lock` は診断ファイルの本当のパスが渡されたパスと同じかを
+/// 確かめるので、管理者が決めたルート（`BANTO_HUB_ROOT` か
+/// `%ProgramData%\BantoHub`）がジャンクション・マウントポイント・`subst` を通る
+/// 正当な構成だと、解かずに渡せば食い違って書かれず、health が
+/// `MutexOwnerUnknown` になる（Desktop→Service の切り替えが完了扱いにならない）。
+/// `profiles\<profile-id>` より下（インストール利用者が「変更」を持つ部分）は
+/// **解かない** - 解くと、利用者が植えたジャンクションを解いてしまい、確かめが
+/// 無意味になる。
+///
+/// ルートを `canonicalize` できない（まだ無い等）ときは、そのまま使う（食い違えば
+/// 書かない・読まない側に倒れる）。Windows の `canonicalize` が付ける `\\?\` は、
+/// ドライブ・UNC の形なら外す（ログ・表示の読みやすさのため。`banto_instance_lock`
+/// はどちらの形でも比べられる）。
+pub fn lock_file_path(paths: &ProfilePaths) -> PathBuf {
+    let root = std::fs::canonicalize(&paths.root)
+        .map(strip_verbatim_prefix)
+        .unwrap_or_else(|_| paths.root.clone());
+    root.join("profiles")
+        .join(&paths.profile_id)
+        .join(LOCK_FILE_NAME)
+}
+
+/// `\\?\C:\...` を `C:\...` に、`\\?\UNC\srv\share\...` を `\\srv\share\...` に
+/// 直す。それ以外（非 Windows の `canonicalize` の結果を含む）はそのまま。
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 /// `paths`が指す profile の排他を取得する。`HubRuntime::start`が DB 初期化
 /// より前に呼ぶ。
 ///
 /// - `profile_dir`/`config`/`data`/`logs`を`create_dir_all`する（初回起動時
 ///   はまだ存在しないため）。
 /// - 排他の取得は [`banto_instance_lock::try_acquire`]（mutex 名は
-///   `Global\BantoHub.<profile-id>`、診断ファイルは`{profile_dir}/profile.lock`）。
+///   `Global\BantoHub.<profile-id>`、診断ファイルは`{profile_dir}/profile.lock`。
+///   パスはルートだけを解いた [`lock_file_path`]）。
 ///   既に保持されていれば[`ProfileLockError::AlreadyHeld`]。
 pub fn try_acquire_profile_lock(
     paths: &ProfilePaths,
@@ -115,7 +162,7 @@ pub fn try_acquire_profile_lock(
     std::fs::create_dir_all(&paths.data_dir)?;
     std::fs::create_dir_all(&paths.logs_dir)?;
 
-    let lock_path: PathBuf = paths.profile_dir.join(LOCK_FILE_NAME);
+    let lock_path: PathBuf = lock_file_path(paths);
     let mutex_name = crate::profile_paths::mutex_name(&paths.profile_id);
 
     match banto_instance_lock::try_acquire(&mutex_name, &lock_path, &host_kind.to_string()) {
@@ -217,5 +264,101 @@ mod tests {
 
         let _second =
             try_acquire_profile_lock(&paths, HubHostKind::Console).expect("reacquire after drop");
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_handles_drive_and_unc_forms_only() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\ProgramData\BantoHub")),
+            PathBuf::from(r"C:\ProgramData\BantoHub")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\srv\share\BantoHub")),
+            PathBuf::from(r"\\srv\share\BantoHub")
+        );
+        // ドライブでも UNC でもない verbatim（ボリューム GUID 等）はそのまま。
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\Volume{x}\BantoHub")),
+            PathBuf::from(r"\\?\Volume{x}\BantoHub")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from("/var/lib/BantoHub")),
+            PathBuf::from("/var/lib/BantoHub")
+        );
+    }
+
+    // ---- #623 PR-2 のレビュー P2-2: ルートだけを解く ----
+
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("mklink");
+        assert!(status.success(), "mklink /J に失敗した");
+    }
+
+    /// 管理者が決めるルートがジャンクション（マウントポイント・`subst` と同じく、
+    /// 本当のパスが渡されたパスと食い違う正当な構成）でも、診断ファイルが書かれ、
+    /// health と同じパス（[`lock_file_path`]）から持ち主が読める。ルートを解かずに
+    /// 渡すと、`banto_instance_lock` の確かめで書かれない（反証で落ちる）。
+    #[cfg(windows)]
+    #[test]
+    fn a_root_reached_through_a_junction_still_gets_the_owner_diagnostics() {
+        let base = TempDir::new("profile-lock-junction-root");
+        let real_root = base.path().join("real-root");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let linked_root = base.path().join("linked-root");
+        junction(&linked_root, &real_root);
+
+        let paths = resolve_profile_paths(&linked_root, "junction-root").expect("valid profile id");
+        let guard = try_acquire_profile_lock(&paths, HubHostKind::Service).expect("acquire ok");
+
+        let lock = lock_file_path(&paths);
+        assert_eq!(guard.lock_file_path(), lock.as_path());
+        let owner = read_owner_info_detailed(&lock).expect("ルートがジャンクションでも読める");
+        assert_eq!(owner.host_kind, "service");
+        assert_eq!(owner.pid, std::process::id());
+        // 実体はジャンクションの先（本当のルート）の下にある。
+        assert!(real_root
+            .join("profiles")
+            .join("junction-root")
+            .join(LOCK_FILE_NAME)
+            .is_file());
+        // 表示用に `\\?\` を外してある。
+        assert!(!lock.to_string_lossy().starts_with(r"\\?\"), "{lock:?}");
+    }
+
+    /// `profiles\<profile-id>`（利用者が「変更」を持つ部分）がジャンクションなら、
+    /// ルートを解いても**そこは解かない**ので、外のファイルを書き換えず・読まない。
+    /// profile のフォルダまで解く実装にすると、外のファイルが書き換わる（反証で落ちる）。
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_below_the_root_is_not_resolved() {
+        const VICTIM: &str = r#"{"pid":4242,"host_kind":"victim","acquired_at_unix_ms":1}"#;
+        let root = TempDir::new("profile-lock-junction-profile");
+        let outside = TempDir::new("profile-lock-junction-profile-outside");
+        let victim = outside.path().join(LOCK_FILE_NAME);
+        std::fs::write(&victim, VICTIM).unwrap();
+        std::fs::create_dir_all(root.path().join("profiles")).unwrap();
+        junction(
+            &root.path().join("profiles").join("junction-profile"),
+            outside.path(),
+        );
+
+        let paths =
+            resolve_profile_paths(root.path(), "junction-profile").expect("valid profile id");
+        let _guard =
+            try_acquire_profile_lock(&paths, HubHostKind::Service).expect("mutex は取れる");
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), VICTIM);
+        let read = read_owner_info_detailed(&lock_file_path(&paths));
+        assert!(
+            matches!(read, Err(OwnerInfoError::Corrupt(_))),
+            "ジャンクション越しに外を読まない: {read:?}"
+        );
     }
 }
