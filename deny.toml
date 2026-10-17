@@ -141,6 +141,16 @@ yanked = "warn"
 # banto-opcua の docs/adr/0001-async-opcua-base.md と同じ期限付き例外とする。
 # 2027-01-15 または Phase 3（証明書・SecurityPolicy）着手時の早い方で見直し、
 # 修正版が出た場合は依存更新後にこの例外を削除する。
+# RUSTSEC-2026-0367・0368・0369 は zip 8.6.0 の展開（ZipArchive::extract など）の advisory。
+# zip は utoipa-swagger-ui の build-dependencies だけで使い、vendored の機能で、同梱の
+# Swagger UI の資産（utoipa-swagger-ui-vendored、Cargo.lock で版を固定）をビルドのときに
+# 展開する。攻撃者が用意した ZIP は展開せず、製品の実行時にも zip は動かない。
+# utoipa-swagger-ui 10.0.1（最新）が zip を 8.6 系に固定しているため上げられない。
+# utoipa-swagger-ui が zip 9 以上に対応したら依存を上げてこの例外を削除する（#651）。
+# 期限は 2027-01-15。
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "Phase 2 uses None/Anonymous without RSA private operations; review by 2027-01-15 or when Phase 3 starts (banto-opcua ADR-0001)." },
+    { id = "RUSTSEC-2026-0367", reason = "zip is only a build-dependency of utoipa-swagger-ui (vendored) and extracts the trusted, lockfile-pinned Swagger UI archive at build time; not used at runtime. Remove when utoipa-swagger-ui supports zip >= 9; review by 2027-01-15 (#651)." },
+    { id = "RUSTSEC-2026-0368", reason = "zip is only a build-dependency of utoipa-swagger-ui (vendored) and extracts the trusted, lockfile-pinned Swagger UI archive at build time; not used at runtime. Remove when utoipa-swagger-ui supports zip >= 9; review by 2027-01-15 (#651)." },
+    { id = "RUSTSEC-2026-0369", reason = "zip is only a build-dependency of utoipa-swagger-ui (vendored) and extracts the trusted, lockfile-pinned Swagger UI archive at build time; not used at runtime. Remove when utoipa-swagger-ui supports zip >= 9; review by 2027-01-15 (#651)." },
 ]
