@@ -114,6 +114,35 @@ pub struct ServiceStatusSummary {
     pub auto_start: bool,
     /// 実行中プロセスの PID（`Running`以外では`None`になりうる）。
     pub pid: Option<u32>,
+    /// SCM の `dwCheckPoint`。`StartPending`／`StopPending` の間、サービスが
+    /// 進むたびに増える（`pending_progress`で「進んでいる」判断に使う）。
+    /// pending でなければ 0。
+    pub checkpoint: u32,
+    /// SCM の `dwWaitHint`。pending の間の、次の進みまでの見込み。
+    /// pending でなければ `Duration::ZERO`。
+    pub wait_hint: Duration,
+}
+
+/// 2 回の照会から、pending（起動中・停止中）が**進んでいる**かを決める
+/// 純関数（シェルが「進んでいる間は待つ」判断に使う）。
+///
+/// 同じ pending の状態のまま `checkpoint` が増えていれば進んでいる。状態が
+/// 変わった（`previous` が pending でなかった）ときは、新しい pending の
+/// 始まりなので進んでいる扱い。`checkpoint` が増えない・戻ったときは止まって
+/// いる（期限を延ばさない）。pending でない `current` は `false`
+/// （待つ必要が無い）。
+pub fn pending_progress(
+    previous: Option<&ServiceStatusSummary>,
+    current: &ServiceStatusSummary,
+) -> bool {
+    let is_pending = |s: &ScmState| matches!(s, ScmState::StartPending | ScmState::StopPending);
+    if !is_pending(&current.state) {
+        return false;
+    }
+    match previous {
+        Some(prev) if prev.state == current.state => current.checkpoint > prev.checkpoint,
+        _ => true,
+    }
 }
 
 /// SCM 操作の失敗を分類したエラー。設計 §4 の契約に沿い、T16-2 の
@@ -209,6 +238,16 @@ pub trait ServiceManager {
     /// （設計 §4「多重クリック対策」）。
     fn start(&self) -> Result<TransitionHandle, ServiceManagerError>;
 
+    /// 引数を渡してサービス開始を要求する（`StartServiceW` の
+    /// `lpServiceArgVectors`。サービスは `ServiceMain` の argv の `[1..]` で
+    /// 受け取る - `ServiceContext::start_args`）。冪等性は[`Self::start`]と
+    /// 同じ（既に`Running`なら要求せず、引数も渡らない）。Operators の権利
+    /// （`START`と`QUERY_STATUS`）だけで呼べる。
+    fn start_with_args(
+        &self,
+        args: &[std::ffi::OsString],
+    ) -> Result<TransitionHandle, ServiceManagerError>;
+
     /// サービス停止を要求する。`start`と同様に冪等。
     fn stop(&self) -> Result<TransitionHandle, ServiceManagerError>;
 
@@ -240,6 +279,12 @@ struct MockState {
     next_error: Option<ServiceManagerError>,
     /// `NotFound`に載せるサービス名（[`MockServiceManager::with_service_name`]）。
     service_name: String,
+    /// 最後に実際に開始した（`Running`にした）ときの引数
+    /// （[`MockServiceManager::last_start_args`]）。
+    last_start_args: Vec<std::ffi::OsString>,
+    /// 照会に載せる pending の進み（[`MockServiceManager::set_pending_progress`]）。
+    checkpoint: u32,
+    wait_hint: Duration,
 }
 
 /// モックが`Running`時に返す固定 PID（実プロセスは存在しないので実際の
@@ -265,6 +310,9 @@ impl MockServiceManager {
                 pid: None,
                 next_error: None,
                 service_name: MOCK_SERVICE_NAME.to_string(),
+                last_start_args: Vec::new(),
+                checkpoint: 0,
+                wait_hint: Duration::ZERO,
             }),
         }
     }
@@ -279,6 +327,9 @@ impl MockServiceManager {
                 pid: None,
                 next_error: None,
                 service_name: MOCK_SERVICE_NAME.to_string(),
+                last_start_args: Vec::new(),
+                checkpoint: 0,
+                wait_hint: Duration::ZERO,
             }),
         }
     }
@@ -311,6 +362,27 @@ impl MockServiceManager {
             .clone()
     }
 
+    /// 最後に実際に開始した（`Running`にした）ときの引数
+    /// （[`ServiceManager::start_with_args`]。`start`は空）。
+    pub fn last_start_args(&self) -> Vec<std::ffi::OsString> {
+        self.state
+            .lock()
+            .expect("mock state mutex poisoned")
+            .last_start_args
+            .clone()
+    }
+
+    /// 状態を pending（`StartPending`／`StopPending`）にし、照会に載せる
+    /// checkpoint と wait hint を設定する（シェルの「進んでいる間は待つ」
+    /// 判断を試すテスト用）。pending でない状態を渡すと checkpoint・wait hint
+    /// は 0 として返す。
+    pub fn set_pending_progress(&self, scm_state: ScmState, checkpoint: u32, wait_hint: Duration) {
+        let mut state = self.state.lock().expect("mock state mutex poisoned");
+        state.scm_state = scm_state;
+        state.checkpoint = checkpoint;
+        state.wait_hint = wait_hint;
+    }
+
     fn take_injected_error(state: &mut MockState) -> Option<ServiceManagerError> {
         state.next_error.take()
     }
@@ -332,10 +404,19 @@ impl ServiceManager for MockServiceManager {
             state: state.scm_state.clone(),
             auto_start: state.auto_start,
             pid: state.pid,
+            checkpoint: state.checkpoint,
+            wait_hint: state.wait_hint,
         })
     }
 
     fn start(&self) -> Result<TransitionHandle, ServiceManagerError> {
+        self.start_with_args(&[])
+    }
+
+    fn start_with_args(
+        &self,
+        args: &[std::ffi::OsString],
+    ) -> Result<TransitionHandle, ServiceManagerError> {
         let mut state = self.state.lock().expect("mock state mutex poisoned");
         if let Some(err) = Self::take_injected_error(&mut state) {
             return Err(err);
@@ -347,6 +428,9 @@ impl ServiceManager for MockServiceManager {
         if state.scm_state != ScmState::Running {
             state.scm_state = ScmState::Running;
             state.pid = Some(MOCK_PID);
+            state.checkpoint = 0;
+            state.wait_hint = Duration::ZERO;
+            state.last_start_args = args.to_vec();
         }
         Ok(TransitionHandle::new(ScmState::Running))
     }
@@ -362,6 +446,8 @@ impl ServiceManager for MockServiceManager {
         if state.scm_state != ScmState::Stopped {
             state.scm_state = ScmState::Stopped;
             state.pid = None;
+            state.checkpoint = 0;
+            state.wait_hint = Duration::ZERO;
         }
         Ok(TransitionHandle::new(ScmState::Stopped))
     }
@@ -550,6 +636,8 @@ mod windows_impl {
                         state: ScmState::NotInstalled,
                         auto_start: false,
                         pid: None,
+                        checkpoint: 0,
+                        wait_hint: std::time::Duration::ZERO,
                     });
                 }
             };
@@ -563,10 +651,19 @@ mod windows_impl {
                 state: map_state(status.current_state),
                 auto_start: matches!(config.start_type, ServiceStartType::AutoStart),
                 pid: status.process_id,
+                checkpoint: status.checkpoint,
+                wait_hint: status.wait_hint,
             })
         }
 
         fn start(&self) -> Result<TransitionHandle, ServiceManagerError> {
+            self.start_with_args(&[])
+        }
+
+        fn start_with_args(
+            &self,
+            args: &[OsString],
+        ) -> Result<TransitionHandle, ServiceManagerError> {
             let manager = open_scm(self.service_name, WinScmAccess::CONNECT)?;
             let access = ServiceAccess::START | ServiceAccess::QUERY_STATUS;
             let service = try_open_service(&manager, self.service_name, access)?
@@ -577,7 +674,7 @@ mod windows_impl {
             // 冪等（設計 §4「多重クリック対策」）。
             if status.current_state != ServiceState::Running {
                 service
-                    .start::<&str>(&[])
+                    .start(args)
                     .map_err(|err| map_win_err(self.service_name, err))?;
             }
             Ok(TransitionHandle::new(ScmState::Running))
@@ -878,6 +975,148 @@ mod tests {
             assert_eq!(status.state, ScmState::NotInstalled);
             assert!(!status.auto_start);
             assert_eq!(status.pid, None);
+            assert_eq!(status.checkpoint, 0);
+            assert_eq!(status.wait_hint, std::time::Duration::ZERO);
+        }
+
+        /// 引数つきの開始も、未登録なら（権限に関わらず）`NotFound`
+        /// （実サービスは開始しない）。
+        #[test]
+        fn start_with_args_on_an_unregistered_service_is_not_found() {
+            let manager = WindowsServiceManager::for_service(
+                "BantoHubDoesNotExist12345",
+                "存在しないテスト用サービス",
+                std::path::PathBuf::new(),
+                vec![],
+            );
+            let err = manager
+                .start_with_args(&["relax-only".into()])
+                .expect_err("未登録は開始できない");
+            assert!(
+                matches!(err, crate::ServiceManagerError::NotFound(_)),
+                "{err:?}"
+            );
+        }
+    }
+
+    fn summary(state: ScmState, checkpoint: u32) -> ServiceStatusSummary {
+        ServiceStatusSummary {
+            state,
+            auto_start: false,
+            pid: None,
+            checkpoint,
+            wait_hint: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn mock_start_with_args_records_the_arguments_and_start_clears_them() {
+        let mock = MockServiceManager::new();
+        mock.start_with_args(&["relax-only".into()]).unwrap();
+        assert_eq!(mock.current_state(), ScmState::Running);
+        assert_eq!(
+            mock.last_start_args(),
+            vec![std::ffi::OsString::from("relax-only")]
+        );
+        // 既に Running なら要求せず、引数も変わらない（`start`と同じ冪等性）。
+        mock.start_with_args(&["other".into()]).unwrap();
+        assert_eq!(
+            mock.last_start_args(),
+            vec![std::ffi::OsString::from("relax-only")]
+        );
+        mock.stop().unwrap();
+        mock.start().unwrap();
+        assert!(mock.last_start_args().is_empty());
+        let missing = MockServiceManager::not_installed();
+        assert!(matches!(
+            missing.start_with_args(&["x".into()]),
+            Err(ServiceManagerError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn mock_query_carries_checkpoint_and_wait_hint_only_while_pending() {
+        let mock = MockServiceManager::new();
+        let idle = mock.query_status().unwrap();
+        assert_eq!((idle.checkpoint, idle.wait_hint), (0, Duration::ZERO));
+        mock.set_pending_progress(ScmState::StartPending, 3, Duration::from_secs(10));
+        let pending = mock.query_status().unwrap();
+        assert_eq!(pending.state, ScmState::StartPending);
+        assert_eq!(
+            (pending.checkpoint, pending.wait_hint),
+            (3, Duration::from_secs(10))
+        );
+        mock.start().unwrap();
+        let running = mock.query_status().unwrap();
+        assert_eq!((running.checkpoint, running.wait_hint), (0, Duration::ZERO));
+    }
+
+    /// (前回, 今回) -> 進んでいるか、の表。
+    #[test]
+    fn pending_progress_table() {
+        use ScmState::*;
+        let table: [(
+            Option<ServiceStatusSummary>,
+            ServiceStatusSummary,
+            bool,
+            &str,
+        ); 9] = [
+            (
+                None,
+                summary(StartPending, 1),
+                true,
+                "最初の観測の pending は進んでいる扱い",
+            ),
+            (
+                Some(summary(StartPending, 1)),
+                summary(StartPending, 2),
+                true,
+                "増えた",
+            ),
+            (
+                Some(summary(StartPending, 2)),
+                summary(StartPending, 2),
+                false,
+                "止まった",
+            ),
+            (
+                Some(summary(StartPending, 3)),
+                summary(StartPending, 2),
+                false,
+                "戻った",
+            ),
+            (
+                Some(summary(Stopped, 0)),
+                summary(StartPending, 1),
+                true,
+                "新しい pending",
+            ),
+            (
+                Some(summary(StartPending, 5)),
+                summary(StopPending, 1),
+                true,
+                "別の pending へ",
+            ),
+            (
+                Some(summary(StopPending, 4)),
+                summary(StopPending, 4),
+                false,
+                "停止も同じ",
+            ),
+            (
+                Some(summary(StartPending, 4)),
+                summary(Running, 0),
+                false,
+                "pending でない",
+            ),
+            (None, summary(Stopped, 0), false, "停止済みは待たない"),
+        ];
+        for (previous, current, expected, why) in table {
+            assert_eq!(
+                pending_progress(previous.as_ref(), &current),
+                expected,
+                "{why}"
+            );
         }
     }
 }
