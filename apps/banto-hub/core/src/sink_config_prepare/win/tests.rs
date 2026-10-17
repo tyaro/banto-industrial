@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use banto_secret_store::acl::guard::{KnownFolders, MachineEnvironment};
 use banto_secret_store::acl::{
-    check_dacl, exposure, inspect_file, read_dir_dacl, ADMINISTRATORS_SID, INHERIT_FLAGS,
+    check_dacl, exposure, inspect_file, read_dir_dacl, Exposure, ADMINISTRATORS_SID, INHERIT_FLAGS,
 };
 use banto_secret_store::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
@@ -182,9 +182,19 @@ fn check_file(path: &Path) {
     assert_eq!(dacl.owner, ADMINISTRATORS_SID);
 }
 
+fn icacls(config: &Path, args: &[&str]) {
+    let status = std::process::Command::new("icacls")
+        .arg(config)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "icacls {args:?} に失敗した");
+}
+
 /// 新しい PC 相当: ルート（継承）と置き場（保護）を作り、雛形を置く。2 回目は雛形を差し替え、
-/// 管理者が作った設定ファイル（継承の DACL・所有者は本人）を整え直す（中身は変えない）。
-/// ルートの DACL は書かない。
+/// 所有者だけが違う設定ファイル（別の管理者がメモ帳で編集した形。DACL は置き場から継承した
+/// まま）を整え直す（中身は変えない。オーナー決定 その 2）。ルートの DACL は書かない。
 #[test]
 fn prepares_the_place_and_replaces_the_example() {
     if !elevated_admin("prepares_the_place_and_replaces_the_example") {
@@ -200,22 +210,20 @@ fn prepares_the_place_and_replaces_the_example() {
     assert_eq!(std::fs::read(sink.join(EXAMPLE_FILE)).unwrap(), EXAMPLE);
     assert!(!read_dir_dacl(&root).unwrap().protected, "ルートは書かない");
 
-    // 管理者が置き場の中で .example をコピーして作った設定ファイル（の代わり。保護されていない
-    // DACL に変えておく）。
+    // 置き場の中で作った設定ファイルの所有者を、テストを走らせている利用者に変える（理由は
+    // `ForeignOwner` だけ。DACL は継承のまま SYSTEM・Administrators だけ）。
     let config = sink.join(CONFIG_FILE);
-    let body = b"hub_url = \"http://127.0.0.1:8722\"\napi_key = \"bh_dummy.key\"\n";
+    let body = b"hub_url = \"http://127.0.0.1:8722\"
+api_key = \"bh_dummy.key\"
+";
     std::fs::write(&config, body).unwrap();
-    let status = std::process::Command::new("icacls")
-        .arg(&config)
-        .args(["/grant", "*S-1-5-32-545:R"])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let exposed = inspect_file(&config).unwrap().unwrap();
-    assert!(
-        !exposure(&exposed).is_empty(),
-        "保護されていない形から始める"
+    let me = WindowsSinkConfigOps.current_user_sid().unwrap();
+    icacls(&config, &["/setowner", me.as_str()]);
+    let before = inspect_file(&config).unwrap().unwrap();
+    assert_eq!(
+        exposure(&before),
+        vec![Exposure::ForeignOwner(me.as_str().to_string())],
+        "所有者だけが違う形から始める"
     );
     std::fs::write(sink.join(EXAMPLE_FILE), b"old").unwrap();
 
@@ -226,6 +234,57 @@ fn prepares_the_place_and_replaces_the_example() {
     check_file(&sink.join(EXAMPLE_FILE));
     assert_eq!(std::fs::read(&config).unwrap(), body, "中身は変えない");
     assert_eq!(std::fs::read(sink.join(EXAMPLE_FILE)).unwrap(), EXAMPLE);
+    // 所有者は実行した管理者本人（信頼する所有者）なので、hub_url を確かめる警告は出ない。
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("所有者と ACL を整えました")),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("hub_url")),
+        "実行した管理者が所有者なら警告しない: {lines:#?}"
+    );
+}
+
+/// 設定ファイルがほかの利用者（Users）へ読み取りを許していたら、何も変えずに断る（Should 1）。
+#[test]
+fn a_config_readable_by_others_is_refused() {
+    if !elevated_admin("a_config_readable_by_others_is_refused") {
+        return;
+    }
+    let f = fixture();
+    let sink = f.program_data.join("BantoHub").join("sink");
+    let (result, lines) = run(&f.ops);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+
+    let config = sink.join(CONFIG_FILE);
+    let body = b"hub_url = \"http://127.0.0.1:8722\"
+api_key = \"bh_dummy.key\"
+";
+    std::fs::write(&config, body).unwrap();
+    icacls(&config, &["/grant", "*S-1-5-32-545:R"]);
+    let exposed = inspect_file(&config).unwrap().unwrap();
+    assert!(
+        !exposure(&exposed).is_empty(),
+        "ほかの利用者に開いた形から始める"
+    );
+    let dacl_before = inspect_file(&config).unwrap().unwrap().dacl;
+
+    let (result, lines) = run(&f.ops);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert_eq!(std::fs::read(&config).unwrap(), body, "中身は変えない");
+    assert_eq!(
+        inspect_file(&config).unwrap().unwrap().dacl,
+        dacl_before,
+        "DACL も変えない"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("失効") && l.contains("発行")),
+        "{lines:#?}"
+    );
 }
 
 /// 置き場がジャンクションなら、先を書き換えずに断る（管理者でなくても走る）。
