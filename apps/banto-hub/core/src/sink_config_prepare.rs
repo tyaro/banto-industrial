@@ -317,14 +317,45 @@ fn create_or_open<O: SinkConfigOps>(
     }
 }
 
-/// 所有者・種類の断りの文言。
-fn dir_refusal_text(label: &str, dir: &Path, refusal: &DataAclRefusal) -> String {
+/// 断りの文言を出す段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirLevel {
+    /// `%ProgramData%\BantoHub`。
+    Root,
+    /// `%ProgramData%\BantoHub\sink`。
+    Sink,
+}
+
+/// 所有者・種類の断りの文言（純関数）。
+///
+/// 所有者で断ったときの案内は段で分ける（2026-10-17 オーナー決定）:
+/// - **ルート**（[`DirLevel::Root`]）: `profile_grant` の `grant-profile-acl` と同じく、所有者を
+///   Administrators に取り直してから再実行する手順（`takeown /a`・`icacls /setowner`）。ルートには
+///   `profiles\` などの本物のデータがあり、消せないため。この操作はルートの DACL を書かない。
+/// - **`sink\`**（[`DirLevel::Sink`]）: 取り直さず、中身を確かめて**消してから**再実行する。一般の
+///   利用者が先に作った `sink\` は、中身（設定ファイル・リンク・ハードリンク）まで相手が用意した
+///   ものでありうる。所有者だけ取り直すと、それを正規の置き場として使い続けることになる
+///   （`prepare-sink-config` は `sink\` の中へ再帰して書かない）。消せば、次の実行が保護された
+///   DACL で作り直す。
+fn dir_refusal_text(level: DirLevel, dir: &Path, refusal: &DataAclRefusal) -> String {
     let reason = match refusal {
         DataAclRefusal::ReparsePoint => "ジャンクションかシンボリックリンク（reparse point）です。リンクの先を書き換えないよう、止めます（リンクを外してから、もう一度実行してください）".to_string(),
         DataAclRefusal::NotADirectory => "フォルダではありません。止めます".to_string(),
-        DataAclRefusal::ForeignOwner(owner) => format!(
-            "所有者（{owner}）が SYSTEM・Administrators・実行した管理者のどれでもありません。一般の利用者が先に作った（乗っ取りの準備の）恐れがあるため、止めます（中身を確かめ、消すか名前を変えてから、もう一度実行してください）"
-        ),
+        DataAclRefusal::ForeignOwner(owner) => match level {
+            DirLevel::Root => format!(
+                "所有者（{owner}）が SYSTEM・Administrators・実行した管理者のどれでもありません。乗っ取りの恐れがあるため、止めます（中身を確かめ、このフォルダの所有者を Administrators に取り直してから（takeown /f \"{}\" /a か icacls \"{}\" /setowner *S-1-5-32-544）、もう一度実行してください）",
+                dir.display(),
+                dir.display()
+            ),
+            DirLevel::Sink => format!(
+                "所有者（{owner}）が SYSTEM・Administrators・実行した管理者のどれでもありません。一般の利用者が先に作った（乗っ取りの準備の）恐れがあるため、何も変えずに止めます（所有者は取り直さず、中身を確かめてから、このフォルダ（{}）を消して、もう一度実行してください。中の設定ファイルは使わず、作り直してください）",
+                dir.display()
+            ),
+        },
+    };
+    let label = match level {
+        DirLevel::Root => "Hub のルート",
+        DirLevel::Sink => "設定ファイルの置き場",
     };
     format!("{label}（{}）は{reason}", dir.display())
 }
@@ -489,7 +520,7 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
         return refuse(
             out,
             &created,
-            dir_refusal_text(root_label, &plan.root, &refusal),
+            dir_refusal_text(DirLevel::Root, &plan.root, &refusal),
         );
     }
 
@@ -526,7 +557,7 @@ pub fn prepare_sink_config<O: SinkConfigOps>(ops: &O, out: Out<'_>) -> Result<()
         return refuse(
             out,
             &created,
-            dir_refusal_text(sink_label, &sink_path, &refusal),
+            dir_refusal_text(DirLevel::Sink, &sink_path, &refusal),
         );
     }
 

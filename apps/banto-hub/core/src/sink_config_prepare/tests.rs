@@ -494,9 +494,9 @@ fn every_refusal_happens_before_any_write() {
             "本当の場所",
         ),
         (
-            "ルートの所有者が一般の利用者",
+            "ルートの所有者が一般の利用者（所有者を取り直す手順を出す）",
             |ops| ops.set_dir(root(), DirEntry::owned_by(EVIL)),
-            "乗っ取り",
+            "/setowner *S-1-5-32-544",
         ),
         (
             "ルートがジャンクション",
@@ -709,4 +709,28 @@ fn every_exposure_has_a_human_text() {
         assert!(!text.is_empty() && text.is_char_boundary(0), "{found:?}");
         assert!(!text.contains("Exposure"), "{text}");
     }
+}
+
+/// 所有者で断ったときの文言の golden（2026-10-17 オーナー決定）: ルートは所有者を
+/// Administrators に取り直す手順、`sink\` は取り直さずに消してから再実行する手順。
+#[test]
+fn foreign_owner_wording_differs_by_level() {
+    let refusal = guard::DataAclRefusal::ForeignOwner(EVIL.to_string());
+    let root_text = dir_refusal_text(DirLevel::Root, &root(), &refusal);
+    assert_eq!(
+        root_text,
+        format!(
+            "Hub のルート（{r}）は所有者（{EVIL}）が SYSTEM・Administrators・実行した管理者のどれでもありません。乗っ取りの恐れがあるため、止めます（中身を確かめ、このフォルダの所有者を Administrators に取り直してから（takeown /f \"{r}\" /a か icacls \"{r}\" /setowner *S-1-5-32-544）、もう一度実行してください）",
+            r = root().display()
+        )
+    );
+    let sink_text = dir_refusal_text(DirLevel::Sink, &sink(), &refusal);
+    assert_eq!(
+        sink_text,
+        format!(
+            "設定ファイルの置き場（{s}）は所有者（{EVIL}）が SYSTEM・Administrators・実行した管理者のどれでもありません。一般の利用者が先に作った（乗っ取りの準備の）恐れがあるため、何も変えずに止めます（所有者は取り直さず、中身を確かめてから、このフォルダ（{s}）を消して、もう一度実行してください。中の設定ファイルは使わず、作り直してください）",
+            s = sink().display()
+        )
+    );
+    assert!(!sink_text.contains("takeown"), "{sink_text}");
 }

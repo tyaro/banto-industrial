@@ -1765,7 +1765,15 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- targe
      整え直し（中身は読まない・変えない）、`banto-hub-sink.toml.example` を
      **インストールのたびに差し替えます**（#630、2026-10-17）。一般の利用者が先に
      作った `sink\`（所有者が SYSTEM・Administrators・実行した管理者以外）は、
-     何も変えずに断ります。ルート直下の旧い `banto-hub-sink.toml.example`
+     何も変えずに断ります。そのときは所有者を取り直さず、中身を確かめてから
+     `sink\` を消して再実行してください（中身ごと相手が用意したものでありうるため。
+     中の設定ファイルは使わず作り直します）。**ルート `%ProgramData%\BantoHub` の
+     所有者**が同じく別の利用者（旧い版を別の管理者がインストールした PC など）の
+     ときも断ります（#626 の `grant-profile-acl` と同じ規則、2026-10-17 オーナー
+     決定）。ルートは消せないので、中身を確かめてから
+     `takeown /f "C:\ProgramData\BantoHub" /a` か
+     `icacls "C:\ProgramData\BantoHub" /setowner *S-1-5-32-544` で所有者を
+     Administrators に取り直し、再実行してください。ルート直下の旧い `banto-hub-sink.toml.example`
      （秘密は入っていません）と旧い `banto-hub-sink.toml` には触りません。
   5. pre-install で止めたものだけ `sc start` で再開します（Hub →
      Sink の順）。**新規インストールでは何も起動しません** - 上書き
