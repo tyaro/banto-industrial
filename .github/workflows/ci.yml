@@ -396,7 +396,8 @@ jobs:
   # まわりの 2 crate の lib を ubuntu で clippy する軽いジョブ。Rust の対象（`rust_args`）に
   # この 2 つのどちらかが入るとき（workspace 全体を含む）だけ走る（`run_linux_clippy`。
   # 判定は ci-changes.mjs の JOB_PACKAGES）。#623 PR-2 から、`banto-instance-lock` が
-  # 対象に入るときはその clippy・テストもここで走らせる（下の段）。
+  # 対象に入るときはその clippy・テストもここで走らせる（下の段）。`banto-safe-root`
+  # （#623 PR-1b のレビュー S-2）も同じ。
   linux-clippy:
     name: Rust (linux clippy / 昇格まわり)
     needs: changes
@@ -422,6 +423,16 @@ jobs:
         run: |
           cargo clippy -p banto-instance-lock --all-targets -- -D warnings
           cargo test -p banto-instance-lock
+      # #623 PR-1b のレビュー S-2: `banto-safe-root` にも非 Windows の分岐（`Mode::Plain`、
+      # `guarded_is_unsupported_off_windows`、`nofollow` の `non_windows_is_unsupported`）が
+      # あるが、依存としてコンパイルされるだけで `-D warnings` もテストも走っていなかった。
+      # dev-dependency の `banto-service-elev` は Windows 専用の依存を `cfg(windows)` に
+      # 閉じていて、Linux でもビルドできる（上の `chronogazer-elev` の clippy が既に通している）。
+      - name: clippy + test (banto-safe-root、非 Windows の実装)
+        if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-safe-root ')
+        run: |
+          cargo clippy -p banto-safe-root --all-targets -- -D warnings
+          cargo test -p banto-safe-root
 
   # #468: 旧 `e2e` ジョブ（chronogazer と banto-hub を 1 ジョブで）を 2 つに
   # 分けた。hub だけの変更で chronogazer の build / Playwright を走らせない。

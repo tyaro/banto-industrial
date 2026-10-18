@@ -660,6 +660,12 @@ pub struct PinnedDir {
     /// 正規の姿）。呼ぶ側が期待のパスと比べる（#392 B3-3b の監査 Must 1）。
     final_path: std::path::PathBuf,
     info: PinnedDirInfo,
+    /// ディレクトリの列挙の位置は**ファイルオブジェクト（このハンドル）に付く**ので、同じ
+    /// ハンドルの列挙（[`PinnedDir::reset_acl`] の再帰の最上段・`ManagedDir::list`）を直列化
+    /// する（#623 PR-1b のレビュー S-1）。重なると列挙位置が混ざり、`reset_acl` が残りの子を
+    /// 書き直さずに `ERROR_NO_MORE_FILES` で「成功」を返してしまう。子の再帰は ID で開いた
+    /// 新しいハンドルなので、取るのは最上段だけでよい。
+    enum_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(windows)]
@@ -699,6 +705,14 @@ impl PinnedDir {
         self.handle.raw()
     }
 
+    /// このハンドルの列挙の直列化（[`PinnedDir`] の `enum_lock`）。`enumerate_dir` をこの
+    /// ハンドルで呼ぶ側は、呼ぶ間これを持つ。
+    pub(crate) fn enum_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.enum_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// 開いたままの**ハンドルから**、今の DACL と所有者を読む（`GetSecurityInfo`。パスを
     /// 使わないので、開いた後に途中の要素をすり替えられても別の場所を読まない。#626 PR-A:
     /// banto-hub の `grant-profile-acl` が、書き直す前に引き継ぐ利用者を決めるため -
@@ -736,6 +750,8 @@ impl PinnedDir {
             return Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory));
         }
         let mut skips = ResetSkips::default();
+        // 再帰の最上段はこのハンドルを列挙する。`ManagedDir::list` と重ならないようにする。
+        let _serial = self.enum_guard();
         imp::set_security_tree(
             self.handle.raw(),
             &self.final_path,
@@ -894,7 +910,7 @@ impl PinnedFile {
     /// 確かめてから読むまでの間に別の物へすり替えられない）。`max_len` バイトを超えるときは
     /// 読まずに断る（`io::ErrorKind::FileTooLarge`）。フォルダは `io::ErrorKind::IsADirectory`、
     /// reparse point は [`AclMismatch::ReparsePoint`] で、読まずに断る。
-    pub fn read_to_end(&self, max_len: usize) -> Result<Vec<u8>> {
+    pub fn read_to_end(&mut self, max_len: usize) -> Result<Vec<u8>> {
         if self.security.is_reparse_point {
             return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
         }
@@ -1893,8 +1909,10 @@ pub(crate) mod imp {
     // SAFETY: カーネルのハンドルはプロセス全体で有効な値で、どのスレッドから使っても・閉じても
     // よい（スレッドに結び付いた状態を持たない）。閉じるのは持ち主の `Drop` だけ。ディレクトリの
     // 列挙の位置のようにファイルオブジェクトに付いた状態を同時に動かす使い方は、呼ぶ側が直列化
-    // する（`ManagedDir::list` は Mutex で包む。#623 PR-1b: サービスがプロセスの終わりまで
-    // 握ったフォルダをスレッドをまたいで使うため）。
+    // する（`PinnedDir` の列挙は `enum_lock` で包む。#623 PR-1b: サービスがプロセスの終わりまで
+    // 握ったフォルダをスレッドをまたいで使うため）。同じく**位置を持つ操作（ファイルの読み・
+    // ディレクトリの列挙）はハンドルを共有して同時に使わない**（`PinnedFile::read_to_end` は
+    // `&mut self`、列挙は `enum_lock`）。
     unsafe impl Send for OwnedHandle {}
     // SAFETY: 上と同じ。`&OwnedHandle` から出来るのは生のハンドルを読むことだけ。
     unsafe impl Sync for OwnedHandle {}
@@ -2048,6 +2066,7 @@ pub(crate) mod imp {
                 is_reparse_point: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
                 owner,
             },
+            enum_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -4618,7 +4637,7 @@ pub(crate) mod tests {
             junction(&root.path().join("link"), outside.path());
             let parent = pin_dir(root.path()).unwrap().unwrap();
 
-            let file = parent.open_child_file("conf.toml").unwrap().unwrap();
+            let mut file = parent.open_child_file("conf.toml").unwrap().unwrap();
             assert_eq!(file.final_path(), parent.final_path().join("conf.toml"));
             assert_eq!(
                 Some(file.security().clone()),
@@ -4663,7 +4682,7 @@ pub(crate) mod tests {
             );
 
             assert!(parent.open_child_file("missing.toml").unwrap().is_none());
-            let sub = parent.open_child_file("sub").unwrap().unwrap();
+            let mut sub = parent.open_child_file("sub").unwrap().unwrap();
             assert!(sub.security().is_dir);
             assert!(matches!(
                 sub.read_to_end(1024),
@@ -4672,7 +4691,7 @@ pub(crate) mod tests {
                     ..
                 })
             ));
-            let link = parent.open_child_file("link").unwrap().unwrap();
+            let mut link = parent.open_child_file("link").unwrap().unwrap();
             assert!(link.security().is_reparse_point, "{link:?}");
             assert_eq!(
                 link.read_to_end(1024),
@@ -4756,7 +4775,7 @@ pub(crate) mod tests {
                 "{result:?}"
             );
             drop(writer);
-            let file = parent.open_child_file("conf.toml").unwrap().unwrap();
+            let mut file = parent.open_child_file("conf.toml").unwrap().unwrap();
             assert_eq!(file.read_to_end(16).unwrap(), b"x");
         }
 
@@ -4834,7 +4853,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
             for place in [&parent, &sink] {
-                let file = place.create_child_file(name, contents).unwrap().unwrap();
+                let mut file = place.create_child_file(name, contents).unwrap().unwrap();
+                assert_eq!(file.read_to_end(1024).unwrap(), contents);
                 assert_eq!(file.final_path(), place.final_path().join(name));
                 let security = file.security();
                 assert!(!security.is_dir && !security.is_reparse_point);
@@ -4843,7 +4863,6 @@ pub(crate) mod tests {
                 assert_eq!(security.dacl.owner, ADMINISTRATORS_SID, "{security:?}");
                 check_file_dacl(&security.dacl, &DirAccess::service_only());
                 assert_eq!(exposure(security), vec![]);
-                assert_eq!(file.read_to_end(1024).unwrap(), contents);
                 assert_eq!(
                     inspect_file(&place.final_path().join(name))
                         .unwrap()
@@ -4853,7 +4872,7 @@ pub(crate) mod tests {
                 drop(file);
                 // 既にあれば作らず、中身も変えない。
                 assert!(place.create_child_file(name, b"other").unwrap().is_none());
-                let again = place.open_child_file(name).unwrap().unwrap();
+                let mut again = place.open_child_file(name).unwrap().unwrap();
                 assert_eq!(again.read_to_end(1024).unwrap(), contents);
             }
             let note = sink.security().unwrap();
@@ -4894,7 +4913,7 @@ pub(crate) mod tests {
                 .open_child_file_for_update("missing")
                 .unwrap()
                 .is_none());
-            let file = parent
+            let mut file = parent
                 .open_child_file_for_update("a.example")
                 .unwrap()
                 .unwrap();

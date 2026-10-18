@@ -67,6 +67,7 @@ pub enum Mode {
     /// 辿らずに開いて握り、ハンドル基準で扱う（Windows のサービス）。
     Guarded,
     /// `std::fs` のまま（デスクトップ・コンソール・非 Windows）。リンクを辿る。
+    /// **サービス（LocalSystem）では使わない**（確かめをしない）。
     Plain,
 }
 
@@ -336,15 +337,13 @@ enum Inner {
 }
 
 /// 握ったルート・管理するフォルダ（設計 §4.3）。[`Mode::Guarded`] では辿らずに開いたハンドルを
-/// 持ち続け、drop で閉じる。スレッドをまたいで使える（一覧は内部で直列化する）。
+/// 持ち続け、drop で閉じる。スレッドをまたいで使える（一覧は握ったハンドルごとに内部で直列化する）。
 pub struct ManagedDir {
     inner: Inner,
     /// 表示用のパス（渡された綴り + 名前。開き直すのには使わない）。
     display: PathBuf,
     /// 本当のパス（Guarded: ハンドルの `GetFinalPathNameByHandleW`、Plain: `canonicalize`）。
     final_path: PathBuf,
-    /// 列挙の位置はファイルオブジェクトに付くので、同じハンドルの一覧を直列化する。
-    list_lock: std::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for ManagedDir {
@@ -363,7 +362,6 @@ impl ManagedDir {
             inner: Inner::Plain,
             display,
             final_path,
-            list_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -374,7 +372,6 @@ impl ManagedDir {
             inner: Inner::Guarded(pinned),
             display,
             final_path,
-            list_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -489,10 +486,8 @@ impl ManagedDir {
     /// 中の一覧（`.`・`..` を除く。順は OS のまま）。Guarded は握ったハンドルを列挙する
     /// （パスを使わない。その場でジャンクションにされても、列挙はこのフォルダそのものを返す）。
     pub fn list(&self) -> Result<Vec<Entry>> {
-        let _serial = self
-            .list_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 列挙の位置はファイルオブジェクトに付くので、Guarded は `win::list` が握ったハンドルの
+        // `PinnedDir::enum_guard` で直列化する（`reset_acl` の再帰とも重ならない。S-1）。
         match &self.inner {
             #[cfg(windows)]
             Inner::Guarded(pinned) => win::list(pinned),

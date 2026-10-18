@@ -123,7 +123,8 @@ fn io_error(op: IoOp, os_error: u32) -> SafeRootError {
 /// ハンドルを基準に決まるので、親のパスを解決し直さない。
 ///
 /// **Win32 の `SetFileInformationByHandle(FileRenameInfo)` は使わない**: 【実測】名前 1 要素・
-/// `RootDirectory` なしで渡すと、kernelbase が名前を**今のプロセスのカレントディレクトリ**基準の
+/// `RootDirectory` なしで渡すと（`FILE_RENAME_INFO` にも `RootDirectory` はあり、それを渡した
+/// 場合は測っていない。測ったのは `RootDirectory` なしだけ）、kernelbase が名前を**今のプロセスのカレントディレクトリ**基準の
 /// パスに直してしまい（Windows 11 26300、2026-10-18。カレントが別のボリュームだと
 /// `ERROR_NOT_SAME_DEVICE`(17)、同じボリュームなら木の外のカレントへ移る）、ハンドル基準に
 /// ならない。ntdll を直接呼び、`RootDirectory` を明示する。

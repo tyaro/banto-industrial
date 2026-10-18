@@ -685,11 +685,15 @@ fn a_held_dir_turned_into_a_junction_does_not_leak() {
             tag: TAG_MOUNT_POINT
         }
     );
+    // 握ったハンドルがジャンクションに変わった後は、作る・書くが失敗する（1921 =
+    // `ERROR_CANT_ACCESS_FILE`。外には何も作られない - 下の snapshot で確かめる）。
     let created = data.create_new("probe");
     eprintln!("note: ジャンクションに変わったハンドルの下の create_new: {created:?}");
+    assert!(created.is_err(), "ジャンクションの下で作れてしまった");
     drop(created);
     let written = data.write_atomic("state.json", b"x");
     eprintln!("note: ジャンクションに変わったハンドルの下の write_atomic: {written:?}");
+    assert!(written.is_err(), "ジャンクションの下で書けてしまった");
     let listed = data.list();
     eprintln!("note: ジャンクションに変わったハンドルの list: {listed:?}");
     if let Ok(listed) = listed {
@@ -788,6 +792,11 @@ fn reset_acl_does_not_rewrite_a_child_moved_out_after_enumeration() {
     );
     crate::acl::imp::BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
     if !admin {
+        // `is_elevated_admin` が `CI` では panic するので、ここへ来るのは手元だけ。
+        // 手元でも `CI` と同じ扱い（管理者でなければ skip を明示）に揃える。
+        if std::env::var_os("CI").is_some() {
+            panic!("CI なのに管理者ではない: 所有者を移す確かめが走らない（{result:?}）");
+        }
         eprintln!("skip: 所有者を移すのは管理者だけ（{result:?}）- CI で確かめる");
         return;
     }
@@ -796,4 +805,98 @@ fn reset_acl_does_not_rewrite_a_child_moved_out_after_enumeration() {
     let after = crate::acl::inspect_file(&moved).unwrap().unwrap();
     assert_eq!(after, before, "木の外へ移された物の記述子を書き換えた");
     assert_eq!(skips, crate::acl::ResetSkips::default(), "外の物を数えた");
+}
+
+/// 同じ握ったハンドルの列挙（`list`・`reset_acl` の再帰の最上段）は直列化される（#623 PR-1b の
+/// レビュー S-1）。列挙の位置はハンドルに付くので、重なると `reset_acl` が残りの子を書き直さずに
+/// 「成功」を返しうる。ロックを持っている間は、どちらも進まない（管理者でなくても確かめられる
+/// 形: `reset_acl` は列挙の前にロックを待つので、失敗するにしても待ってから）。
+#[test]
+fn listing_and_reset_acl_on_the_same_handle_are_serialized() {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"a").unwrap();
+    let root = open_root(&guarded(tree)).unwrap();
+    let pinned = root.pinned().unwrap();
+    let hold = pinned.enum_guard();
+    std::thread::scope(|scope| {
+        let (list_done, list_rx) = channel();
+        let (reset_done, reset_rx) = channel();
+        let dir = root.as_dir();
+        scope.spawn(move || {
+            let _ = dir.list();
+            let _ = list_done.send(());
+        });
+        scope.spawn(move || {
+            let _ = pinned.reset_acl(
+                &DirAccess::with_install_user(me()),
+                crate::acl::Recurse::Tree,
+            );
+            let _ = reset_done.send(());
+        });
+        assert_eq!(
+            list_rx.recv_timeout(Duration::from_millis(500)),
+            Err(RecvTimeoutError::Timeout),
+            "列挙のロックを持っているのに list が進んだ"
+        );
+        assert_eq!(
+            reset_rx.recv_timeout(Duration::from_millis(500)),
+            Err(RecvTimeoutError::Timeout),
+            "列挙のロックを持っているのに reset_acl が進んだ"
+        );
+        drop(hold);
+        list_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        reset_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    });
+}
+
+/// 列挙バッファ（64 KiB）を超える数の子があっても、別スレッドが同じハンドルを `list()` し続けて
+/// いる間の `reset_acl(Tree)` が全部の子を書き直す（S-1）。所有者を移すので管理者でだけ走る。
+#[test]
+fn reset_acl_rewrites_every_child_while_the_same_handle_is_listed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let admin = crate::acl::tests::windows::is_elevated_admin();
+    if !admin {
+        eprintln!("skip: 所有者を移すのは管理者だけ - CI で確かめる");
+        return;
+    }
+    const CHILDREN: usize = 1500;
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    let pad = "x".repeat(64);
+    let names: Vec<String> = (0..CHILDREN).map(|i| format!("{pad}-{i:05}.txt")).collect();
+    for name in &names {
+        std::fs::write(tree.join(name), b"c").unwrap();
+    }
+    let root = open_root(&guarded(tree.clone())).unwrap();
+    let pinned = root.pinned().unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                let listed = root.as_dir().list().unwrap();
+                assert_eq!(listed.len(), CHILDREN, "列挙が欠けた");
+            }
+        });
+        let skips = pinned
+            .reset_acl(
+                &DirAccess::with_install_user(me()),
+                crate::acl::Recurse::Tree,
+            )
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(skips, crate::acl::ResetSkips::default());
+    });
+    for name in &names {
+        let security = crate::acl::inspect_file(&tree.join(name)).unwrap().unwrap();
+        assert_eq!(
+            security.dacl.owner,
+            crate::acl::ADMINISTRATORS_SID,
+            "書き直されなかった子: {name}"
+        );
+    }
 }

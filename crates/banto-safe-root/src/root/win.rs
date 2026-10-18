@@ -168,7 +168,9 @@ pub(super) fn write_atomic(
     // （リンクの名前が消えて一時ファイルの中身になる。リンクの先は辿らない。Windows 11 26300、
     // 2026-10-18）。Fable B-6 の「付け替えは失敗する」は成り立たないので、付け替えに任せずに先に
     // 確かめる。確かめてから付け替えるまでの間に差し替えられても、置き換わるのはリンクの名前
-    // だけ（先へは書かない）。
+    // だけ（先へは書かない）。宛先が**ファイルの** reparse point（WOF の `compact` など）の
+    // ときは、この確かめを通り、ファイルのシンボリックリンク・ハードリンクと同じく名前ごと
+    // 一時ファイルの中身に置き換わる（リンク先へは書かない。意図どおり）。
     if let Some(handle) = child_relative(dir, name, ChildHow::OpenAttributes)? {
         let facts = handle_io::facts(handle.raw())?;
         if facts.is_dir {
@@ -237,6 +239,8 @@ pub(super) fn list(dir: &PinnedDir) -> Result<Vec<Entry>> {
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     };
     let mut entries = Vec::new();
+    // 同じハンドルの列挙（`reset_acl` の再帰を含む）と重ならないようにする。
+    let _serial = dir.enum_guard();
     enumerate_dir(dir.raw_handle(), &mut |raw| {
         entries.push(Entry {
             name: raw.name,
