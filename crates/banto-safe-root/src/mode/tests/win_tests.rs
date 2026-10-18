@@ -92,7 +92,9 @@ fn is_marker_slot(path: &Path) -> bool {
         return false;
     };
     let parent = pinned(parent);
-    let Some(slot) = crate::acl::imp::probe_marker(parent.raw_handle()).unwrap() else {
+    let crate::acl::imp::MarkerProbe::Found(slot) =
+        crate::acl::imp::probe_marker(parent.raw_handle()).unwrap()
+    else {
         return false;
     };
     let own = open_dir(
@@ -2096,4 +2098,119 @@ fn close_tree_treats_a_differently_spelled_marker_as_the_marker() {
             );
         }
     });
+}
+
+// --- オーナーレビュー P2: 印の照会の失敗にも Record の方針 -------------------------------
+
+/// 1 周目は、印の席をフォルダが塞いでいる（`MarkerOccupied`）フォルダでも残りの子の列挙を
+/// 続け、同じフォルダのハードリンク・別のフォルダの問題も一緒に集める（管理者でなくても走る）。
+#[test]
+fn scan_collects_marker_occupied_together_with_the_other_problems() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outside, victim) = outside_with_victim();
+    let root = dir.path().join("root");
+    make_tree(&root);
+    std::fs::create_dir(root.join("logs").join(MARKER_NAME.to_ascii_uppercase())).unwrap();
+    std::fs::hard_link(&victim, root.join("logs").join("zz-hard.txt")).unwrap();
+    junction(&root.join("data").join("jlink"), outside.path());
+    let pinned = pinned(&root);
+    let refusal = pinned.scan_tree(&no_stop, &mut |_| {}).unwrap_err();
+    let ScanRefusal::Problems(problems) = refusal else {
+        panic!("{refusal:?}");
+    };
+    let real = pinned.final_path().to_path_buf();
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert!(
+        problems
+            .iter()
+            .any(|p| matches!(p, TreeProblem::MarkerOccupied { .. })),
+        "{problems:?}"
+    );
+    assert!(
+        problems.iter().any(|p| matches!(
+            p,
+            TreeProblem::Hardlink { path, links: 2 } if path == &real.join("logs").join("zz-hard.txt")
+        )),
+        "同じフォルダの残りの子が集まっていない: {problems:?}"
+    );
+    assert!(
+        problems.iter().any(|p| matches!(
+            p,
+            TreeProblem::ReparsePoint { path, .. } if path == &real.join("data").join("jlink")
+        )),
+        "{problems:?}"
+    );
+    std::fs::remove_dir(root.join("data").join("jlink")).unwrap();
+}
+
+/// オーナーレビュー P2: 印の席が開けない（SYSTEM だけの DACL）でも、`relax_tree` と
+/// `reset_acl(Tree)` は中断せず、その子を `Denied` に記録して兄弟と親（RootLast のルートも）を
+/// 処理する。昇格した非 SYSTEM の管理者（CI）で走る。
+#[test]
+fn relax_and_reset_record_an_unreadable_marker_and_process_the_siblings() {
+    if !is_elevated_admin() {
+        eprintln!("skip: 所有者を移すのは管理者だけ（CI で確かめる）");
+        return;
+    }
+    let mode = mode();
+    for which in ["relax", "reset"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        make_tree(&root);
+        let pinned = pinned(&root);
+        pinned.close_tree(&mode, &no_stop, &mut |_| {}).unwrap();
+        let marker = root.join("data").join(MARKER_NAME);
+        // 管理者を拒否した印（SYSTEM だけ）。属性すら読めないので照会は開けない。
+        crate::acl::tests::windows::set_dacl_sddl(&marker, DENY_ADMINS_SDDL);
+        let denied_path = pinned.final_path().join("data").join(MARKER_NAME);
+        let recorded = if which == "relax" {
+            let report = pinned.relax_tree(&mode, &mut |_| {}).unwrap();
+            assert_eq!(report.written, CLOSED_OBJECTS - 1, "{report:?}");
+            report.skipped
+        } else {
+            let skips = pinned
+                .reset_acl(mode.setting(), crate::acl::Recurse::Tree)
+                .unwrap();
+            assert!(
+                skips.reparse.is_empty() && skips.hardlink.is_empty(),
+                "{skips:?}"
+            );
+            skips
+                .denied
+                .iter()
+                .map(|p| TreeProblem::Denied { path: p.clone() })
+                .collect()
+        };
+        assert_eq!(
+            recorded,
+            vec![TreeProblem::Denied {
+                path: denied_path.clone()
+            }],
+            "{which}"
+        );
+        // 兄弟・親・ルートは設定モードの形に戻っている（印だけは触っていない）。
+        for path in [
+            root.clone(),
+            root.join("data"),
+            root.join("data").join("d1.txt"),
+            root.join("data").join("deep"),
+            root.join("logs").join("l.txt"),
+        ] {
+            let security = inspect_file(&path).unwrap().unwrap();
+            assert_eq!(
+                security.dacl.owner,
+                ADMINISTRATORS_SID,
+                "{which}: {}",
+                path.display()
+            );
+            if security.is_dir {
+                check_dacl(&security.dacl, mode.setting())
+                    .unwrap_or_else(|e| panic!("{which}: {}: {e:?}", path.display()));
+            } else {
+                check_file_shape(&security, mode.setting(), &path);
+            }
+        }
+        // 片付け（親の FILE_DELETE_CHILD で消せる）。
+        std::fs::remove_file(&marker).unwrap();
+    }
 }

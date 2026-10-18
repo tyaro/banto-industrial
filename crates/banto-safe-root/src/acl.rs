@@ -1937,18 +1937,37 @@ pub(crate) mod imp {
     /// その物のファイル ID と種類を返す。無ければ `None`。木を歩く部品は、列挙した子の ID が
     /// この ID と同じかで「印の席」を見分ける（綴りが `.BANTO-SAFE-ROOT` でも同じ物なら印、
     /// 大文字小文字を区別するフォルダで綴りだけ同じ別の物なら印ではない）。
-    pub(crate) fn probe_marker(dir: HANDLE) -> Result<Option<MarkerSlot>> {
-        let Some(handle) =
-            child_relative_handle(dir, crate::mode::MARKER_NAME, ChildHow::OpenAttributes)?
-        else {
-            return Ok(None);
-        };
+    pub(crate) fn probe_marker(dir: HANDLE) -> Result<MarkerProbe> {
+        let handle =
+            match child_relative_handle(dir, crate::mode::MARKER_NAME, ChildHow::OpenAttributes) {
+                Ok(Some(handle)) => handle,
+                Ok(None) => return Ok(MarkerProbe::Absent),
+                // 開けない席は「その子の問題」（オーナーレビュー P2）。木を歩く側は、列挙でその子を
+                // ID で開いたときの `Denied`／`Busy` として記録・中断の方針（`OnSkip`）に載せる。
+                Err(SafeRootError::Io {
+                    os_error: Some(5 | 32 | 33),
+                    ..
+                }) => return Ok(MarkerProbe::Unreadable),
+                Err(error) => return Err(error),
+            };
         let info = info_of(handle.raw())?;
-        Ok(Some(MarkerSlot {
+        Ok(MarkerProbe::Found(MarkerSlot {
             id: file_id_of(handle.raw())?,
             is_dir: info.is_dir,
             path: final_path_of(handle.raw())?,
         }))
+    }
+
+    /// [`probe_marker`] の結果。
+    pub(crate) enum MarkerProbe {
+        /// 席に物が無い。
+        Absent,
+        /// 席の物（ID・種類・本当のパス）。
+        Found(MarkerSlot),
+        /// 席の物を開けない（拒否・使用中）。席の同一性は分からないので、木を歩く側は印として
+        /// 扱わず、列挙でその子を開いたときの `Denied`／`Busy` に任せる（`OnSkip` のとおり記録か
+        /// 中断。`relax_tree`・`reset_acl` は兄弟と親の処理を続ける）。
+        Unreadable,
     }
 
     /// [`place_marker`] が置けなかった理由。
@@ -2270,12 +2289,16 @@ pub(crate) mod imp {
         }
         // 印の席を OS の名前の解決で探す（綴りでは比べない。Fable レビュー M-1）。厳しい確かめ
         // （1 周目・2 周目）では、席をフォルダが塞いでいれば印を置けないので断る。
+        // 席をフォルダが塞いでいれば `MarkerOccupied`（厳しい確かめ）。`Record`（1 周目）では
+        // 記録して**残りの子の列挙は続ける**（1 周目は問題を全部集める。オーナーレビュー P2）。
+        // 席を開けないときは印として扱わず、列挙でその子を開いたときの `Denied`／`Busy` に任せる。
         let marker_id = match probe_marker(dir_handle)? {
-            Some(slot) if walk.strict && slot.is_dir => {
-                return walk.problem(TreeProblem::MarkerOccupied { path: slot.path });
+            MarkerProbe::Found(slot) if walk.strict && slot.is_dir => {
+                walk.problem(TreeProblem::MarkerOccupied { path: slot.path })?;
+                None
             }
-            Some(slot) => Some(slot.id),
-            None => None,
+            MarkerProbe::Found(slot) => Some(slot.id),
+            MarkerProbe::Absent | MarkerProbe::Unreadable => None,
         };
         enumerate_dir(dir_handle, &mut |entry| {
             visit_child(

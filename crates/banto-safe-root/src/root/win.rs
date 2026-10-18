@@ -231,7 +231,9 @@ pub(super) fn remove(dir: &PinnedDir, display: &Path, name: &str) -> Result<bool
     }
     // 開いた物が印の席（OS が `MARKER_NAME` に解決する物）なら、綴りが違っても消さない
     // （`.BANTO-SAFE-ROOT` は大文字小文字を区別しないフォルダでは同じ物。Fable M-1）。
-    if let Some(slot) = crate::acl::imp::probe_marker(dir.raw_handle())? {
+    if let crate::acl::imp::MarkerProbe::Found(slot) =
+        crate::acl::imp::probe_marker(dir.raw_handle())?
+    {
         if slot.id == crate::acl::imp::file_id_of(handle.raw())? {
             return Err(super::invalid_name());
         }
