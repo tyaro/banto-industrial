@@ -1379,6 +1379,7 @@ dependencies = [
 name = "chronogazer-elev"
 version = "0.2.0-alpha.31"
 dependencies = [
+ "banto-instance-lock",
  "banto-safe-root",
  "banto-service-control",
  "banto-service-elev",

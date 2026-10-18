@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::{PinnedDir, PinnedDirInfo};
-use banto_safe_root::{DirAccess, InstallUserSid};
+use banto_safe_root::mode::RelaxReport;
+use banto_safe_root::{DirAccess, InstallUserSid, ModeAccess};
 use banto_service_control::{
     query_service_command_line, read_service_parameter, uninstall_service, ServiceManager,
     ServiceManagerError, UninstallError, UninstallOutcome, WindowsServiceManager,
@@ -38,13 +39,22 @@ impl PinnedDirOps for PinnedDir {
         PinnedDir::final_path(self).to_path_buf()
     }
 
-    fn reset_acl(
-        &self,
-        access: &DirAccess,
-        recurse: banto_safe_root::acl::Recurse,
-    ) -> Result<banto_safe_root::acl::ResetSkips, String> {
-        PinnedDir::reset_acl(self, access, recurse).map_err(|err| err.to_string())
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String> {
+        PinnedDir::relax_tree(self, mode, &mut |_| {}).map_err(|err| err.to_string())
     }
+}
+
+/// A1 の mutex の持ち物（drop で放す）。
+struct HeldMutex(#[allow(dead_code)] banto_instance_lock::NamedMutexGuard);
+
+/// ルート `root` の DB の A1 の mutex を、診断ファイルを書かずに取る（[`ElevOps::hold_instance_mutex`]）。
+pub(crate) fn hold_instance_mutex(root: &Path) -> Result<Option<Box<dyn std::any::Any>>, String> {
+    let name = chronogazer_core::instance_lock::mutex_name_for_db(
+        &root.join(chronogazer_core::paths::DB_FILE_NAME),
+    )
+    .map_err(|err| err.to_string())?;
+    let held = banto_instance_lock::try_hold_named_mutex(&name).map_err(|err| err.to_string())?;
+    Ok(held.map(|guard| Box::new(HeldMutex(guard)) as Box<dyn std::any::Any>))
 }
 
 impl ElevOps for WindowsOps {
@@ -146,6 +156,10 @@ impl ElevOps for WindowsOps {
 
     fn open_child(&self, parent: &PinnedDir, name: &str) -> Result<Option<PinnedDir>, String> {
         parent.open_child_dir(name).map_err(|err| err.to_string())
+    }
+
+    fn hold_instance_mutex(&self, root: &Path) -> Result<Option<Box<dyn std::any::Any>>, String> {
+        hold_instance_mutex(root)
     }
 }
 
@@ -256,6 +270,12 @@ mod tests {
         }
         fn open_child(&self, parent: &PinnedDir, name: &str) -> Result<Option<PinnedDir>, String> {
             WindowsOps.open_child(parent, name)
+        }
+        fn hold_instance_mutex(
+            &self,
+            root: &Path,
+        ) -> Result<Option<Box<dyn std::any::Any>>, String> {
+            WindowsOps.hold_instance_mutex(root)
         }
     }
 

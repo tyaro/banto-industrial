@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use banto_safe_root::acl::{PinnedDirInfo, ResetSkips};
-use banto_safe_root::{DirAccess, InstallUserSid};
+use banto_safe_root::acl::PinnedDirInfo;
+use banto_safe_root::mode::{RelaxReport, TreeProblem};
+use banto_safe_root::{DirAccess, InstallUserSid, ModeAccess};
 use banto_service_control::{
     ConsoleLine, InstallError, InstallKind, InstallOutcome, PreshutdownReport, ServiceManagerError,
     StopAttempt, UninstallError, UninstallOutcome,
@@ -471,7 +472,7 @@ struct FakePinned {
     path: PathBuf,
     final_path: PathBuf,
     info: PinnedDirInfo,
-    reset: Result<ResetSkips, String>,
+    relax: Result<RelaxReport, String>,
     log: Log,
 }
 
@@ -482,21 +483,15 @@ impl PinnedDirOps for FakePinned {
     fn final_path(&self) -> PathBuf {
         self.final_path.clone()
     }
-    fn reset_acl(
-        &self,
-        access: &DirAccess,
-        recurse: banto_safe_root::acl::Recurse,
-    ) -> Result<ResetSkips, String> {
-        let r = match recurse {
-            banto_safe_root::acl::Recurse::Tree => "tree",
-            banto_safe_root::acl::Recurse::ObjectOnly => "object",
-        };
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String> {
         self.log.borrow_mut().push(format!(
-            "reset {} {} {r}",
+            "relax {} {}",
             self.path.display(),
-            access.install_user().map_or("-", InstallUserSid::as_str)
+            mode.setting()
+                .install_user()
+                .map_or("-", InstallUserSid::as_str)
         ));
-        self.reset.clone()
+        self.relax.clone()
     }
 }
 
@@ -535,10 +530,13 @@ struct Fake {
     /// 相対で開いたときだけ見えるフォルダ（`created_owner` が `None` のとき）。
     raced: BTreeMap<PathBuf, PinnedDirInfo>,
     create_error: Option<PathBuf>,
-    reset_error: Option<PathBuf>,
+    relax_error: Option<PathBuf>,
     pin_error: Option<PathBuf>,
-    /// 書き直しのときに飛ばした子（reparse・hardlink）を、そのフォルダに結びつける。
-    reset_skips: BTreeMap<PathBuf, ResetSkips>,
+    /// 書き直しのときに飛ばした物（reparse・hardlink・開けない）を、そのフォルダに結びつける。
+    relax_skips: BTreeMap<PathBuf, Vec<TreeProblem>>,
+    /// A1 の mutex をサービス・デスクトップのエンジンが持っている（`hold_instance_mutex` が
+    /// `None`）。#623 PR-3。
+    mutex_held: bool,
 }
 
 fn root_path() -> PathBuf {
@@ -608,9 +606,10 @@ impl Fake {
             created_owner: Some("S-1-5-32-544".to_string()),
             raced: BTreeMap::new(),
             create_error: None,
-            reset_error: None,
+            relax_error: None,
             pin_error: None,
-            reset_skips: BTreeMap::new(),
+            relax_skips: BTreeMap::new(),
+            mutex_held: false,
         };
         // ルートの親（ProgramData。SYSTEM の所有）。無いルートは、これを開いて確かめてから
         // その下に相対で作る（#642）。
@@ -635,10 +634,13 @@ impl Fake {
             path: dir.to_path_buf(),
             final_path,
             info,
-            reset: if self.reset_error.as_deref() == Some(dir) {
+            relax: if self.relax_error.as_deref() == Some(dir) {
                 Err("os error 5".to_string())
             } else {
-                Ok(self.reset_skips.get(dir).cloned().unwrap_or_default())
+                Ok(RelaxReport {
+                    written: 3,
+                    skipped: self.relax_skips.get(dir).cloned().unwrap_or_default(),
+                })
             },
             log: self.log.clone(),
         }
@@ -799,6 +801,13 @@ impl ElevOps for Fake {
             .or_else(|| self.dirs.borrow().get(&dir).cloned());
         Ok(found.map(|info| self.pinned(&dir, info)))
     }
+    fn hold_instance_mutex(&self, root: &Path) -> Result<Option<Box<dyn std::any::Any>>, String> {
+        self.record(format!("hold-mutex {}", root.display()));
+        if self.mutex_held {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(())))
+    }
 }
 
 /// 実行して、終了コード・出した行・操作の記録（reset はフォルダごとの記録から）を返す。
@@ -808,11 +817,11 @@ fn exec(action: Action, fake: &Fake) -> (i32, Vec<ConsoleLine>) {
     (code, lines)
 }
 
-/// 書き直した（`reset_acl`）フォルダ。
+/// 書き直した（`relax_tree`）フォルダ。
 fn resets(fake: &Fake) -> Vec<String> {
     fake.calls()
         .into_iter()
-        .filter(|call| call.starts_with("reset "))
+        .filter(|call| call.starts_with("relax "))
         .collect()
 }
 
@@ -852,8 +861,10 @@ fn service_install_runs_every_step_in_order() {
             format!("pin {PD}"),
             // 監査 Must: 作るのは SYSTEM・Administrators だけ（利用者 ACE 無し = `-`）。
             format!("create {} -", root.display()),
-            // 確かめが通ってから、利用者の「変更」を付ける（ルートは tree）。
-            format!("reset {} {USER} tree", root.display()),
+            // #623 PR-3: 書く前に A1 を確かめ、確かめが通ってから設定モードの形を書く
+            // （`relax_tree`、下から順にルートを最後に）。
+            format!("hold-mutex {}", root.display()),
+            format!("relax {} {USER}", root.display()),
             format!("install {} {USER} {}", exe_path().display(), root.display()),
             // setup-operators（記録を読み直す）
             "read_install_user".to_string(),
@@ -866,15 +877,15 @@ fn service_install_runs_every_step_in_order() {
             "read_install_user".to_string(),
             format!("check {USER}"),
             "machine_root".to_string(),
-            // ルートは登録の前に作ってあるので、開いて書き直すだけ（tree）。
+            // ルートは登録の前に作ってあるので、開いて確かめるだけ。A1 を確かめてから下を
+            // 用意し、最後に `relax_tree` を 1 回（#623 PR-3）。
             format!("pin {}", root.display()),
-            format!("reset {} {USER} tree", root.display()),
+            format!("hold-mutex {}", root.display()),
             format!("pin {}", secrets().display()),
             // 確かめ済みのルートのハンドルを基準に作る（#642）。
             format!("create {} -", secrets().display()),
-            // secrets はルートの再帰で書かれているので object だけ（監査 Nit 3）。
-            format!("reset {} {USER} object", secrets().display()),
             format!("pin {}", hub_keys().display()),
+            format!("relax {} {USER}", root.display()),
         ]
     );
     // install_with の行は頭を付け替えて出す。
@@ -911,15 +922,13 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     // 開いて確かめた後。
     assert_eq!(calls[5], format!("pin {PD}"));
     assert_eq!(calls[6], format!("create {} -", root_path().display()));
-    // 利用者の「変更」は、本当のパスを確かめた後の reset でだけ付く（記録が無い = 渡した SID）。
-    assert_eq!(
-        calls[7],
-        format!("reset {} {OTHER} tree", root_path().display())
-    );
-    assert!(calls[8].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
+    // 利用者の「変更」は、本当のパスを確かめた後の relax でだけ付く（記録が無い = 渡した SID）。
+    assert_eq!(calls[7], format!("hold-mutex {}", root_path().display()));
+    assert_eq!(calls[8], format!("relax {} {OTHER}", root_path().display()));
+    assert!(calls[9].starts_with(&format!("install {} {OTHER} ", exe_path().display())));
 
     // D2: 違う SID（USER）が既に記録されていれば、登録の後も記録は USER のままなので、
-    // reset で付ける利用者の「変更」も USER。
+    // relax で付ける利用者の「変更」も USER。
     let fake = Fake::new();
     let (code, _) = exec(
         Action::ServiceInstall {
@@ -930,7 +939,7 @@ fn service_install_uses_the_given_sid_after_checking_it_is_an_account() {
     assert_eq!(code, EXIT_OK);
     assert!(fake
         .calls()
-        .contains(&format!("reset {} {USER} tree", root_path().display())));
+        .contains(&format!("relax {} {USER}", root_path().display())));
     // 作るのは SYSTEM・Administrators だけ（利用者 ACE 無し）。
     assert!(fake
         .calls()
@@ -1134,7 +1143,7 @@ fn service_install_stops_at_the_first_failure() {
     // 書き直したのは、登録の前に作ったルート（所有者を移す、監査 B5）だけ（tree）。
     assert_eq!(
         resets(&fake),
-        vec![format!("reset {} {USER} tree", root_path().display())]
+        vec![format!("relax {} {USER}", root_path().display())]
     );
 
     // データの ACL を断った → 1（最後の行は「完了しませんでした」）。
@@ -1174,7 +1183,7 @@ fn later_steps_use_the_recorded_sid_not_the_requested_one() {
         .contains(&format!("create {} -", root_path().display())));
     assert!(fake
         .calls()
-        .contains(&format!("reset {} {OTHER} tree", root_path().display())));
+        .contains(&format!("relax {} {OTHER}", root_path().display())));
     // 監査 Nit 4: 記録の SID を使ったことを 1 行で知らせる（指定（実行した利用者 USER）とは別）。
     assert!(
         lines.iter().any(|l| matches!(l, ConsoleLine::Stdout(t)
@@ -1495,22 +1504,22 @@ fn grant_data_acl_resets_trusted_existing_dirs() {
         .with_dir(hub_keys(), true, false, USER);
     let (code, lines) = exec(Action::GrantDataAcl, &fake);
     assert_eq!(code, EXIT_OK, "{lines:#?}");
-    // ルートは tree、secrets・hub-keys はルートの再帰で済んでいるので object（監査 Nit 3）。
+    // #623 PR-3: 書くのはルートの木の全体に `relax_tree` 1 回（secrets・hub-keys はその中）。
     assert_eq!(
         resets(&fake),
-        vec![
-            format!("reset {} {USER} tree", root_path().display()),
-            format!("reset {} {USER} object", secrets().display()),
-            format!("reset {} {USER} object", hub_keys().display()),
-        ]
+        vec![format!("relax {} {USER}", root_path().display())]
     );
     assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
     assert_eq!(
         lines[2],
         stdout(&format!(
-            r"chronogazer-elev: Hub の API キーの保存先（secrets\hub-keys）: {}（ACL を書き直しました。SYSTEM・Administrators にフル、インストール利用者 {USER} に変更、親から継承しない）",
+            r"chronogazer-elev: Hub の API キーの保存先（secrets\hub-keys）: {}（設定モードの形に書き直しました。SYSTEM・Administrators にフル、インストール利用者 {USER} に変更、所有者 Administrators、親から継承しない）",
             hub_keys().display()
         ))
+    );
+    assert_eq!(
+        lines[3],
+        stdout("chronogazer-elev: データのルート: 下のフォルダ・ファイル 3 件を書き直しました（ルートは最後。印のファイルはそのまま）")
     );
 }
 
@@ -1522,9 +1531,10 @@ fn grant_data_acl_creates_root_and_secrets_but_not_hub_keys() {
     assert_eq!(
         lines,
         vec![
-            stdout(&format!("chronogazer-elev: データのルート: {}（作りました。SYSTEM・Administrators にフル、インストール利用者 {USER} に変更、親から継承しない）", root_path().display())),
-            stdout(&format!("chronogazer-elev: 秘密の置き場（secrets）: {}（作りました。SYSTEM・Administrators にフル、インストール利用者 {USER} に変更、親から継承しない）", secrets().display())),
             stdout(&format!(r"chronogazer-elev: Hub の API キーの保存先（secrets\hub-keys）（{}）はまだありません（エンジンが初めて使うときに作ります）", hub_keys().display())),
+            stdout(&format!("chronogazer-elev: データのルート: {}（作りました。SYSTEM・Administrators にフル、インストール利用者 {USER} に変更、所有者 Administrators、親から継承しない）", root_path().display())),
+            stdout(&format!("chronogazer-elev: 秘密の置き場（secrets）: {}（作りました。SYSTEM・Administrators にフル、インストール利用者 {USER} に変更、所有者 Administrators、親から継承しない）", secrets().display())),
+            stdout("chronogazer-elev: データのルート: 下のフォルダ・ファイル 3 件を書き直しました（ルートは最後。印のファイルはそのまま）"),
             stdout("chronogazer-elev: 'grant-data-acl' が完了しました"),
         ]
     );
@@ -1536,16 +1546,21 @@ fn grant_data_acl_creates_root_and_secrets_but_not_hub_keys() {
 /// 監査 [C]: 書き直しのときに飛ばした子（reparse・hardlink）が、elev の出力に 1 行ずつ出る。
 #[test]
 fn grant_data_acl_reports_each_skipped_child() {
-    let mut skips = ResetSkips::default();
-    skips.reparse.push(root_path().join("data").join("jlink"));
-    skips
-        .hardlink
-        .push(root_path().join("logs").join("hard.txt"));
-    skips
-        .denied
-        .push(root_path().join("data").join("locked.bin"));
+    let skips = vec![
+        TreeProblem::ReparsePoint {
+            path: root_path().join("data").join("jlink"),
+            tag: 0xA000_0003,
+        },
+        TreeProblem::Hardlink {
+            path: root_path().join("logs").join("hard.txt"),
+            links: 2,
+        },
+        TreeProblem::Denied {
+            path: root_path().join("data").join("locked.bin"),
+        },
+    ];
     let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
-    fake.reset_skips.insert(root_path(), skips);
+    fake.relax_skips.insert(root_path(), skips);
     let (code, lines) = exec(Action::GrantDataAcl, &fake);
     assert_eq!(code, EXIT_OK, "{lines:#?}");
     assert!(
@@ -1596,7 +1611,7 @@ fn create_uses_service_only_and_user_change_comes_only_after_verify() {
     assert_eq!(code, EXIT_OK, "{lines:#?}");
     let calls = fake.calls();
     assert!(calls.contains(&format!("create {} -", root_path().display())));
-    assert!(calls.contains(&format!("reset {} {USER} tree", root_path().display())));
+    assert!(calls.contains(&format!("relax {} {USER}", root_path().display())));
     // 利用者付きの create は無い。
     assert!(!calls
         .iter()
@@ -1608,7 +1623,7 @@ fn create_uses_service_only_and_user_change_comes_only_after_verify() {
     assert_eq!(code, EXIT_FAILED);
     let calls = fake.calls();
     assert!(calls.contains(&format!("create {} -", root_path().display())));
-    assert!(!calls.iter().any(|c| c.starts_with("reset")));
+    assert!(!calls.iter().any(|c| c.starts_with("relax")));
     assert!(!calls
         .iter()
         .any(|c| c.starts_with("create") && c.ends_with(USER)));
@@ -1689,8 +1704,8 @@ fn grant_data_acl_refuses_a_real_path_in_a_system_folder() {
     );
 }
 
-/// 反証: `secrets\` がジャンクション・ファイルなら、ルートは直しても `secrets\` から先は
-/// 止める（hub-keys は見ない）。
+/// 反証: `secrets\` がジャンクション・ファイルなら、`secrets\` から先は止める（hub-keys は
+/// 見ない）。ルートにも書かない（書くのは全部を確かめた後。#623 PR-3）。
 #[test]
 fn grant_data_acl_refuses_a_reparse_point_secrets_and_stops() {
     for (is_dir, reparse) in [(true, true), (false, false)] {
@@ -1700,11 +1715,8 @@ fn grant_data_acl_refuses_a_reparse_point_secrets_and_stops() {
             .with_dir(hub_keys(), true, false, USER);
         let (code, lines) = exec(Action::GrantDataAcl, &fake);
         assert_eq!(code, EXIT_FAILED);
-        assert_eq!(
-            resets(&fake),
-            vec![format!("reset {} {USER} tree", root_path().display())],
-            "{lines:#?}"
-        );
+        // #623 PR-3: 書くのは全部を確かめた後なので、secrets で断れば何も書かない。
+        assert!(resets(&fake).is_empty(), "{lines:#?}");
         assert!(!fake
             .calls()
             .contains(&format!("pin {}", hub_keys().display())));
@@ -1756,11 +1768,11 @@ fn a_missing_root_is_created_under_the_checked_parent() {
             format!("pin {}", root.display()),
             format!("pin {PD}"),
             format!("create {} -", root.display()),
-            format!("reset {} {USER} tree", root.display()),
+            format!("hold-mutex {}", root.display()),
             format!("pin {}", secrets().display()),
             format!("create {} -", secrets().display()),
-            format!("reset {} {USER} object", secrets().display()),
             format!("pin {}", hub_keys().display()),
+            format!("relax {} {USER}", root.display()),
         ]
     );
 }
@@ -1888,12 +1900,12 @@ fn a_dir_created_by_someone_else_is_reopened_relative_to_the_parent() {
             format!("pin {PD}"),
             format!("create {} -", root_path().display()),
             format!("open {}", root_path().display()),
-            format!("reset {} {USER} tree", root_path().display()),
+            format!("hold-mutex {}", root_path().display()),
             format!("pin {}", secrets().display()),
             format!("create {} -", secrets().display()),
             format!("open {}", secrets().display()),
-            format!("reset {} {USER} object", secrets().display()),
             format!("pin {}", hub_keys().display()),
+            format!("relax {} {USER}", root_path().display()),
         ]
     );
     assert!(
@@ -1936,13 +1948,20 @@ fn grant_data_acl_failures_are_1_and_stop() {
         .contains(&format!("pin {}", secrets().display())));
 
     let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-18");
-    fake.reset_error = Some(root_path());
+    fake.relax_error = Some(root_path());
     let (code, lines) = exec(Action::GrantDataAcl, &fake);
     assert_eq!(code, EXIT_FAILED);
     assert!(lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t) if t.contains("の ACL を書き直せませんでした: os error 5"))));
-    assert!(!fake
+    // 書くのは全部を確かめた後なので、secrets までは用意している（#623 PR-3）。
+    assert!(fake
         .calls()
         .contains(&format!("pin {}", secrets().display())));
+    assert!(
+        !lines
+            .iter()
+            .any(|l| matches!(l, ConsoleLine::Stdout(t) if t.contains("書き直しました"))),
+        "{lines:#?}"
+    );
 
     let mut fake = Fake::new();
     fake.pin_error = Some(root_path());
@@ -1962,4 +1981,59 @@ fn a_dir_owned_by_the_elevated_admin_is_accepted() {
     fake.me = Ok(sid(ADMIN));
     let (code, lines) = exec(Action::GrantDataAcl, &fake);
     assert_eq!(code, EXIT_OK, "{lines:#?}");
+}
+
+/// #623 PR-3（設計 §3.5）: サービスかデスクトップのエンジンが A1 の mutex を持っていれば、
+/// `grant-data-acl` は**何も書かずに** 1（secrets も作らない）。`service-install` は、ルートを
+/// 作らない（既にある）ときは登録まで進み、データの ACL の手順で同じく 1。ルートを作る
+/// ときは、書く前に確かめて 1（何も登録しない）。
+#[test]
+fn grant_data_acl_refuses_while_the_engine_holds_the_instance_mutex() {
+    let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
+    fake.mutex_held = true;
+    let (code, lines) = exec(Action::GrantDataAcl, &fake);
+    assert_eq!(code, EXIT_FAILED, "{lines:#?}");
+    let calls = fake.calls();
+    assert!(calls.contains(&format!("hold-mutex {}", root_path().display())));
+    assert!(!calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
+    assert!(resets(&fake).is_empty(), "{calls:?}");
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("使用中です") && t.contains("書き直さずに止めます"))),
+        "{lines:#?}"
+    );
+
+    // 反証: 持たれていなければ書く。
+    let fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
+    assert_eq!(exec(Action::GrantDataAcl, &fake).0, EXIT_OK);
+    assert_eq!(resets(&fake).len(), 1);
+
+    // service-install（ルートは既にある）: 登録はするが、データの ACL で 1。
+    let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
+    fake.mutex_held = true;
+    let (code, _) = exec(
+        Action::ServiceInstall {
+            install_user_sid: None,
+        },
+        &fake,
+    );
+    assert_eq!(code, EXIT_FAILED);
+    assert!(fake.calls().iter().any(|c| c.starts_with("install ")));
+    assert!(resets(&fake).is_empty());
+
+    // service-install（ルートを作る）: 書く前に確かめて 1、何も登録しない。
+    let mut fake = Fake::new();
+    fake.mutex_held = true;
+    let (code, lines) = exec(
+        Action::ServiceInstall {
+            install_user_sid: None,
+        },
+        &fake,
+    );
+    assert_eq!(code, EXIT_FAILED, "{lines:#?}");
+    assert!(!fake.calls().iter().any(|c| c.starts_with("install ")));
+    assert!(resets(&fake).is_empty());
+    assert!(lines
+        .iter()
+        .any(|l| matches!(l, ConsoleLine::Stderr(t) if t.contains("（何も登録していません）"))));
 }

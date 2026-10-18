@@ -44,17 +44,23 @@
 //!   とは別）を作り（冪等）、記録したインストール利用者を足す。サービス `ChronoGazer` の
 //!   **既存の DACL に** `(A;;CCLCRPWP;;;<Operators>)` を 1 つ足す（照会・開始・停止
 //!   だけ。`DC`・`WD`・`WO`・`SD` は渡さない - `banto_service_elev` のモジュール doc）。
-//! - **データの ACL**（`grant-data-acl`、O2）: ルート → `secrets\` → `secrets\hub-keys\`
-//!   の順に、[`data_acl_plan`] のとおり作る・書き直す・断る。既にあるフォルダは
-//!   `banto_safe_root::acl::pin_dir` で**辿らずに**開き（持っている間は名前の変更・
-//!   削除ができない）、reparse point（ジャンクション・シンボリックリンクなど）か、
-//!   所有者が SYSTEM・Administrators・インストール利用者・この昇格した利用者のどれでも
-//!   なければ**書き直さずに止める**。書き直すとき（作った直後も）は所有者を
-//!   `BUILTIN\Administrators` に移す（監査 B5、2026-10-16 オーナー決定。インストール
-//!   利用者の「変更」は残る）。Users・Operators には何も付けない。
-//!   中のジャンクションの先を書き換えないこと（伝播は辿らない）は
-//!   `banto_safe_root::acl` のテストが固定する。ハードリンクの扱いは既知の制限
-//!   （同じモジュール doc）。
+//! - **データの ACL**（`grant-data-acl`、O2。#623 PR-3 で**設定モードへの修復**に位置づけを
+//!   変えた - 設計 §3.5）: ルート → `secrets\` → `secrets\hub-keys\` の順に、
+//!   [`data_acl_plan`] のとおり開く・作る・断るを**先に全部済ませ**、それから
+//!   `PinnedDir::relax_tree`（`banto-safe-root`。設定モードの形 = SYSTEM・Administrators に
+//!   フル、インストール利用者に「変更」、所有者 Administrators、保護された DACL）を
+//!   **ルートの木の全体に 1 回**書く。書く順序は**下から、ルートを最後**（サービスの
+//!   「設定モードへ」と同じ `relax_tree`。「ルートが緩んでいる ⇔ 全体が緩み終わった」を
+//!   木を書くすべての書き手で揃える）。印のファイル（`.banto-safe-root`）は印の記述子の
+//!   まま。会った reparse point・ハードリンク・開けない子は飛ばして 1 行ずつ出す。
+//!   既にあるフォルダは `banto_safe_root::acl::pin_dir` で**辿らずに**開き（持っている間は
+//!   名前の変更・削除ができない）、reparse point か、所有者が SYSTEM・Administrators・
+//!   インストール利用者・この昇格した利用者のどれでもなければ**書き直さずに止める**。
+//!   **稼働中は断る**: 書く前に A1 の mutex（`Global\ChronoGazer.<scope>`）を取りにいき
+//!   （`banto_instance_lock::try_hold_named_mutex`。診断ファイルは書かない）、サービスか
+//!   デスクトップのエンジンが持っていれば何も変えずに 1。取れたら**書き終わるまで持つ**
+//!   （確かめてから書くまでの間にサービスが起動しないように）。elev は木を**締めない**
+//!   （締めるのはサービスだけ）。Users・Operators には何も付けない。
 //! - **無いフォルダは、確かめ済みの親のハンドルを基準に相対で作る**（#642。#626 PR-B の
 //!   banto-hub-elev と同じ形）: ルートは、親を辿らずに開いて
 //!   `guard::check_root_parent`（本当のパスの一致・reparse point でないフォルダ・
@@ -98,7 +104,8 @@ use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::PinnedDirInfo;
 use banto_safe_root::guard;
-use banto_safe_root::{DirAccess, InstallUserSid};
+use banto_safe_root::mode::{RelaxReport, TreeProblem};
+use banto_safe_root::{DirAccess, InstallUserSid, ModeAccess};
 use banto_service_control::{ConsoleLine, ServiceManagerError, UninstallError, UninstallOutcome};
 use banto_service_elev::{
     ElevError, GroupOutcome, MemberOutcome, OperatorsGroup, ServiceAclOutcome,
@@ -424,13 +431,10 @@ pub trait PinnedDirOps {
     /// `GetFinalPathNameByHandleW` で解決した本当のパス（途中の要素のジャンクション・
     /// 8.3 の短い名前を辿った後。監査 Must 1）。
     fn final_path(&self) -> PathBuf;
-    /// 開いたままの DACL と所有者を書き、`recurse` が `Tree` なら中の子へ自前で伝える。
-    /// 飛ばした子（reparse point・ハードリンク・開けない）を返す。
-    fn reset_acl(
-        &self,
-        access: &DirAccess,
-        recurse: banto_safe_root::acl::Recurse,
-    ) -> Result<banto_safe_root::acl::ResetSkips, String>;
+    /// 設定モードの形（`mode.setting()`）を、**下から順にルートを最後に**木の全体へ書く
+    /// （`PinnedDir::relax_tree`。#623 PR-3、設計 §3.5）。飛ばした物（reparse point・
+    /// ハードリンク・開けない・使用中）を返す。
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String>;
 }
 
 /// 利用者のアカウントの確かめの失敗（監査 Nit 2）。
@@ -510,6 +514,12 @@ pub trait ElevOps {
     /// 既にあった（`Ok(None)`）フォルダを、パスで開き直さずに開くために使う（#642）。
     fn open_child(&self, parent: &Self::Pinned, name: &str)
         -> Result<Option<Self::Pinned>, String>;
+    /// ルート `root`（本当のパス。既にあること）の DB の A1 の mutex を、**診断ファイルを
+    /// 書かずに**取る（`chronogazer_core::instance_lock::mutex_name_for_db` →
+    /// `banto_instance_lock::try_hold_named_mutex`。#623 PR-3、設計 §3.5）。取れれば
+    /// `Some(持ち物)`（drop まで持つ）、サービス・デスクトップのエンジンが持っていれば
+    /// `None`（elev は何も書かずに断る）。
+    fn hold_instance_mutex(&self, root: &Path) -> Result<Option<Box<dyn std::any::Any>>, String>;
 }
 
 // --- 実行 ---------------------------------------------------------------------------
@@ -930,7 +940,6 @@ fn preflight_root<O: ElevOps>(
     elevated_user: Option<&str>,
     out: Out<'_>,
 ) -> Result<(O::Pinned, Option<O::Pinned>), i32> {
-    let access = DirAccess::with_install_user(install_user.clone());
     let mut root_parent = None;
     let (pinned, created) = match ops.pin_dir(root) {
         Ok(Some(pinned)) => (pinned, false),
@@ -974,12 +983,20 @@ fn preflight_root<O: ElevOps>(
         out(err("（何も登録していません）"));
         return Err(EXIT_FAILED);
     }
-    // 確かめが通ったら、作ったルートに利用者の「変更」を付ける（ハンドルで書く。所有者も
-    // Administrators に。監査 B5）。既にあったルートはここでは変えない（登録の後の
-    // `grant-data-acl` が書き直す）。
+    // 確かめが通ったら、作ったルートに設定モードの形（利用者の「変更」、所有者
+    // Administrators。監査 B5）を書く（`relax_tree`。#623 PR-3）。既にあったルートはここでは
+    // 変えない（登録の後の `grant-data-acl` が書き直す）。書く前に A1 を確かめる（作った
+    // ばかりのルートを持つ者はいないはずだが、書き手は全部同じ約束を通す）。
     if created {
-        match pinned.reset_acl(&access, banto_safe_root::acl::Recurse::Tree) {
-            Ok(skips) => emit_skips(DataDir::Root, &skips, out),
+        let _held = match hold_instance_mutex(ops, &pinned.final_path(), out) {
+            Ok(held) => held,
+            Err(code) => {
+                out(err("（何も登録していません）"));
+                return Err(code);
+            }
+        };
+        match pinned.relax_tree(&mode_for(install_user)) {
+            Ok(report) => emit_skips(DataDir::Root, &report.skipped, out),
             Err(error) => {
                 out(err(&format!(
                     "{}（{}）の所有者と ACL を整えられませんでした: {error}（何も登録していません）",
@@ -991,6 +1008,37 @@ fn preflight_root<O: ElevOps>(
         }
     }
     Ok((pinned, root_parent))
+}
+
+/// 設定モード ⇔ 運用モードの 2 つの形（elev が書くのは設定モードの側だけ）。
+fn mode_for(install_user: &InstallUserSid) -> ModeAccess {
+    ModeAccess::for_users([install_user.clone()]).expect("利用者が 1 人いる")
+}
+
+/// 書く前の A1 の確かめ（設計 §3.5）: サービスかデスクトップのエンジンが動いていれば
+/// 何も書かずに 1。取れたら、呼ぶ側が書き終わるまで持つ。
+fn hold_instance_mutex<O: ElevOps>(
+    ops: &O,
+    real_root: &Path,
+    out: Out<'_>,
+) -> Result<Box<dyn std::any::Any>, i32> {
+    match ops.hold_instance_mutex(real_root) {
+        Ok(Some(held)) => Ok(held),
+        Ok(None) => {
+            out(err(&format!(
+                "データのルート（{}）は使用中です（ChronoGazer のサービスか、デスクトップの記録エンジンが動いています）。ACL を書き直さずに止めます（止めてから、もう一度実行してください）",
+                real_root.display()
+            )));
+            Err(EXIT_FAILED)
+        }
+        Err(error) => {
+            out(err(&format!(
+                "データのルート（{}）の使用中の確かめに失敗しました: {error}。ACL を書き直さずに止めます",
+                real_root.display()
+            )));
+            Err(EXIT_FAILED)
+        }
+    }
 }
 
 /// 断ったとき、**自分で作った**（SYSTEM・Administrators だけの）フォルダが残っていることを
@@ -1016,29 +1064,27 @@ fn left_behind_notice(created: bool, kind: DataDir, expected: &Path, real: &Path
     }
 }
 
-/// 書き直しのときに飛ばした子（reparse point・ハードリンク）を警告の 1 行で報告する
-/// （監査 Must 2。触っていないことを利用者に知らせる）。
-fn emit_skips(kind: DataDir, skips: &banto_safe_root::acl::ResetSkips, out: Out<'_>) {
-    for path in &skips.reparse {
-        out(err(&format!(
-            "{}: 中の {} はジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました",
-            kind.label(),
-            path.display()
-        )));
-    }
-    for path in &skips.hardlink {
-        out(err(&format!(
-            "{}: 中の {} はハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）",
-            kind.label(),
-            path.display()
-        )));
-    }
-    for path in &skips.denied {
-        out(err(&format!(
-            "{}: 中の {} を開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります。監査 Should 1）",
-            kind.label(),
-            path.display()
-        )));
+/// 書き直しのときに飛ばした物（reparse point・ハードリンク・開けない・使用中）を警告の
+/// 1 行ずつで報告する（監査 Must 2・Should 1。触っていないことを利用者に知らせる。飛ばした
+/// 物は今の形のまま残る = 運用モードの形なら締まったまま）。
+fn emit_skips(kind: DataDir, skipped: &[TreeProblem], out: Out<'_>) {
+    for problem in skipped {
+        let why = match problem {
+            TreeProblem::ReparsePoint { .. } => {
+                "ジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました"
+            }
+            TreeProblem::Hardlink { .. } => {
+                "ハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）"
+            }
+            TreeProblem::Denied { .. } => {
+                "開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります。監査 Should 1）"
+            }
+            TreeProblem::Busy { .. } => "使用中で開けなかったので、触らず飛ばしました（そのまま残ります）",
+            TreeProblem::Encrypted { .. }
+            | TreeProblem::TooDeep { .. }
+            | TreeProblem::MarkerOccupied { .. } => "触らず飛ばしました（そのまま残ります）",
+        };
+        out(err(&format!("{}: 中の {problem}。{why}", kind.label())));
     }
 }
 
@@ -1158,12 +1204,13 @@ impl DataDir {
     }
 }
 
-/// 1 つのフォルダを扱う。あれば辿らずに開き、無ければ作る（`create_if_absent`。
+/// 1 つのフォルダを用意する（**書かない**。#623 PR-3 で書く側を [`grant_data_acl`] の
+/// `relax_tree` 1 回に寄せた）。あれば辿らずに開き、無ければ作る（`create_if_absent`。
 /// [`create_in_parent`]: `parent` のハンドルを基準に相対で、#642）か何もしない。そのうえで
-/// 本当のパスと [`data_acl_plan`] のとおり書き直すか止める。開いたフォルダは返して、
+/// 本当のパスと [`data_acl_plan`] のとおり通すか止める。開いたフォルダと作ったかを返して、
 /// 呼ぶ側が全部の手順が終わるまで持つ（下のフォルダを扱う間に名前を変えさせない）。
 #[allow(clippy::too_many_arguments)]
-fn grant_dir<O: ElevOps>(
+fn prepare_dir<O: ElevOps>(
     ops: &O,
     kind: DataDir,
     dir: &Path,
@@ -1173,10 +1220,8 @@ fn grant_dir<O: ElevOps>(
     install_user: &InstallUserSid,
     elevated_user: Option<&str>,
     create_if_absent: bool,
-    recurse: banto_safe_root::acl::Recurse,
     out: Out<'_>,
-) -> Result<Option<O::Pinned>, i32> {
-    let access = DirAccess::with_install_user(install_user.clone());
+) -> Result<Option<(O::Pinned, bool)>, i32> {
     let (pinned, created) = match ops.pin_dir(dir) {
         Ok(Some(pinned)) => (pinned, false),
         Ok(None) if !create_if_absent => {
@@ -1188,7 +1233,7 @@ fn grant_dir<O: ElevOps>(
             return Ok(None);
         }
         // 監査 Must（オーナー案 a）: 作るときは SYSTEM・Administrators だけ。利用者の
-        // 「変更」は、本当のパスを確かめた後の reset で付ける。
+        // 「変更」は、本当のパスを確かめた後の `relax_tree` で付ける。
         Ok(None) => create_in_parent(ops, kind, dir, parent, known, out)?,
         Err(error) => {
             out(err(&format!(
@@ -1211,29 +1256,7 @@ fn grant_dir<O: ElevOps>(
         left_behind_notice(created, kind, expected, &pinned.final_path(), out);
         return Err(EXIT_FAILED);
     }
-    // 確かめが通ったら利用者の「変更」を付ける（作った直後なら SYSTEM・Administrators
-    // だけの DACL に足す。既にあったフォルダはここで期待の形に書き直す）。
-    let skips = pinned.reset_acl(&access, recurse).map_err(|error| {
-        out(err(&format!(
-            "{}（{}）の ACL を書き直せませんでした: {error}",
-            kind.label(),
-            dir.display()
-        )));
-        EXIT_FAILED
-    })?;
-    let what = if created {
-        "作りました"
-    } else {
-        "ACL を書き直しました"
-    };
-    out(out_line(&format!(
-        "{}: {}（{what}。SYSTEM・Administrators にフル、インストール利用者 {} に変更、親から継承しない）",
-        kind.label(),
-        dir.display(),
-        install_user.as_str()
-    )));
-    emit_skips(kind, &skips, out);
-    Ok(Some(pinned))
+    Ok(Some((pinned, created)))
 }
 
 /// 書き直さずに止めたときの 1 行（純関数）。
@@ -1276,92 +1299,106 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
     // ションでも、下を「本当のルート\secrets」と比べれば、別の場所を開かされていたら
     // 気づく。監査 Must 1）。無いフォルダは、確かめ済みの 1 つ上のハンドルを基準に作る
     // （ルートは、辿らずに開いて確かめたルートの親のハンドル。#642）。
+    //
+    // #623 PR-3: **確かめ・作るを全部済ませてから、書くのは `relax_tree` 1 回**（ルートの木の
+    // 全体。下から順にルートを最後に）。書く前に A1 の mutex を取り、書き終わるまで持つ。
     let mut root_parent: Option<O::Pinned> = None;
-    let mut held: Vec<(DataDir, O::Pinned)> = Vec::new();
-    let mut real_root: Option<PathBuf> = None;
-    // ルートは中まで再帰する。`secrets`・`hub-keys` はルートの再帰で既に書かれているので、
-    // その層では対象そのものだけ書く（監査 Nit 3。同じ部分木を最大 3 回書かない）。
-    use banto_safe_root::acl::Recurse;
-    for (kind, dir, create, recurse) in [
-        (
-            DataDir::Root,
-            layout.root().to_path_buf(),
-            true,
-            Recurse::Tree,
-        ),
-        (
-            DataDir::Secrets,
-            layout.secrets_dir(),
-            true,
-            Recurse::ObjectOnly,
-        ),
-        (
-            DataDir::HubKeys,
-            layout.hub_keys_dir(),
-            false,
-            Recurse::ObjectOnly,
-        ),
-    ] {
-        let expected = match kind {
-            DataDir::Root => layout.root().to_path_buf(),
-            DataDir::Secrets => real_root
-                .as_ref()
-                .map_or_else(|| dir.clone(), |r| r.join("secrets")),
-            DataDir::HubKeys => real_root
-                .as_ref()
-                .map_or_else(|| dir.clone(), |r| r.join("secrets").join("hub-keys")),
-        };
-        // 親は種類から明示的に選ぶ（直前に積んだものを親と決め込まない。#646 Nit 2）:
-        // ルートの親はパスで開いて確かめる、secrets の親はルート、hub-keys の親は secrets。
-        let parent_kind = match kind {
-            DataDir::Root => None,
-            DataDir::Secrets => Some(DataDir::Root),
-            DataDir::HubKeys => Some(DataDir::Secrets),
-        };
-        let up = parent_kind.and_then(|want| {
-            held.iter()
-                .find(|(held_kind, _)| *held_kind == want)
-                .map(|(_, pinned)| pinned)
-        });
-        let parent = match (parent_kind, up) {
-            (None, _) => Parent::RootParent(&mut root_parent),
-            (Some(_), Some(up)) => Parent::Pinned(up),
-            // 1 つ上（ルート・secrets）は作るか開けていなければ先に止まっているので、
-            // ここには来ない（来たら止める側に倒す）。
-            (Some(_), None) => {
-                out(err(&format!(
-                    "{}（{}）の 1 つ上のフォルダを開いていません。止めます",
-                    kind.label(),
-                    dir.display()
-                )));
-                return EXIT_FAILED;
-            }
-        };
-        match grant_dir(
-            ops,
-            kind,
-            &dir,
-            &expected,
-            parent,
-            &known,
-            &sid,
-            elevated_user,
-            create,
-            recurse,
-            out,
-        ) {
-            Ok(Some(pinned)) => {
-                if kind == DataDir::Root {
-                    real_root = Some(pinned.final_path());
-                }
-                held.push((kind, pinned));
-            }
-            Ok(None) => {}
-            Err(code) => return code,
+    let (root_pinned, root_created) = match prepare_dir(
+        ops,
+        DataDir::Root,
+        layout.root(),
+        layout.root(),
+        Parent::RootParent(&mut root_parent),
+        &known,
+        &sid,
+        elevated_user,
+        true,
+        out,
+    ) {
+        Ok(Some(found)) => found,
+        Ok(None) => unreachable!("ルートは作る"),
+        Err(code) => return code,
+    };
+    let real_root = root_pinned.final_path();
+    // A1（稼働中は断る）。取れたら `_held` が書き終わるまで持つ。
+    let _held = match hold_instance_mutex(ops, &real_root, out) {
+        Ok(held) => held,
+        Err(code) => {
+            left_behind_notice(root_created, DataDir::Root, layout.root(), &real_root, out);
+            return code;
         }
+    };
+    let secrets = match prepare_dir(
+        ops,
+        DataDir::Secrets,
+        &layout.secrets_dir(),
+        &real_root.join("secrets"),
+        Parent::Pinned(&root_pinned),
+        &known,
+        &sid,
+        elevated_user,
+        true,
+        out,
+    ) {
+        Ok(Some(found)) => found,
+        Ok(None) => unreachable!("secrets は作る"),
+        Err(code) => return code,
+    };
+    let hub_keys = match prepare_dir(
+        ops,
+        DataDir::HubKeys,
+        &layout.hub_keys_dir(),
+        &real_root.join("secrets").join("hub-keys"),
+        Parent::Pinned(&secrets.0),
+        &known,
+        &sid,
+        elevated_user,
+        false,
+        out,
+    ) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    // 書く（1 回。ルートの木の全体、下から順にルートを最後に）。
+    let report = match root_pinned.relax_tree(&mode_for(&sid)) {
+        Ok(report) => report,
+        Err(error) => {
+            out(err(&format!(
+                "{}（{}）の ACL を書き直せませんでした: {error}",
+                DataDir::Root.label(),
+                layout.root().display()
+            )));
+            return EXIT_FAILED;
+        }
+    };
+    let describe = |kind: DataDir, dir: &Path, created: bool| {
+        let what = if created {
+            "作りました"
+        } else {
+            "設定モードの形に書き直しました"
+        };
+        out_line(&format!(
+            "{}: {}（{what}。SYSTEM・Administrators にフル、インストール利用者 {} に変更、所有者 Administrators、親から継承しない）",
+            kind.label(),
+            dir.display(),
+            sid.as_str()
+        ))
+    };
+    out(describe(DataDir::Root, layout.root(), root_created));
+    out(describe(DataDir::Secrets, &layout.secrets_dir(), secrets.1));
+    if let Some((_, created)) = &hub_keys {
+        out(describe(DataDir::HubKeys, &layout.hub_keys_dir(), *created));
     }
-    // 開いた順の逆に閉じる（hub-keys → secrets → ルート → ルートの親）。
-    while held.pop().is_some() {}
+    out(out_line(&format!(
+        "{}: 下のフォルダ・ファイル {} 件を書き直しました（ルートは最後。印のファイルはそのまま）",
+        DataDir::Root.label(),
+        report.written
+    )));
+    emit_skips(DataDir::Root, &report.skipped, out);
+    // 開いた順の逆に閉じる（hub-keys → secrets → ルート → ルートの親）。A1 はその後。
+    drop(hub_keys);
+    drop(secrets);
+    drop(root_pinned);
     drop(root_parent);
     EXIT_OK
 }
