@@ -199,22 +199,40 @@ pub fn after_marker_error(error: &MarkerError) -> (bool, i32) {
     }
 }
 
+/// STOP で、ACL を緩める前にエンジンの tokio のランタイムを終わらせた結果
+/// （#623 PR-3 のオーナーレビュー P1）。
+///
+/// banto の `RunningServer::stop` は 5 秒で終わらなければ `axum::serve` の親タスクを abort して
+/// 戻るが、axum は接続ごとに独立した `tokio::spawn` をしているので、親の abort では接続の
+/// タスクは止まらない。「listener の停止のタスクが終わった」は「要求が全部終わった」を意味
+/// しない。確かな方法は**ランタイムそのものを終わらせる**こと: ランタイムを落とせば接続
+/// ごとのタスクも含めて全部の非同期のタスクが捨てられ、`spawn_blocking` の分も終わるまで
+/// 待つので、以後 LocalSystem が非同期のタスクから木へ書くことは無い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeEnd {
+    /// 上限の中で終わった（非同期のタスクは全部捨て、ブロッキングのタスクも全部終わった）。
+    Finished,
+    /// 上限の中で終わらなかった（ブロッキングの処理が残っている）。
+    StillBusy,
+    /// 試していない（後始末が時間切れで、緩めないことが先に決まっている）。
+    NotAttempted,
+}
+
 /// STOP の後始末の結果から、緩めてよいか（設計 §3.2 の 2。Codex の指摘 P1 とオーナーレビュー P1）:
 /// - 後始末が予算内に終わらなかった（`timed_out`。DB の pool を閉じていない・listener を
 ///   止めるタスクが残っていることがある）なら**緩めない**。
-/// - listener の停止を上限で待ち切れず裏に残した（`listener_stop_abandoned`）なら、その
-///   タスクが終わったのを確かめた（`listener_stops_settled`。
-///   `RunningEngine::await_abandoned_listener_stops`）ときだけ緩める。確かめられなければ
-///   **緩めない**: listener の graceful 停止（最大 5 秒）の間は開いていた要求がまだ届き、
-///   閉じた pool に当たった認証が監査の退避ファイルを利用者の木の下へパスで書きうる。
+/// - エンジンのランタイムを上限の中で終わらせた（[`RuntimeEnd::Finished`]）ときだけ緩める。
+///   終わらせられなければ**緩めない**: 残ったタスク（STOP の前から開いていた要求など）が
+///   閉じた pool に当たると、banto の認証が監査の退避ファイルを利用者の木の下へパスで
+///   書きうる。
 ///
 /// 緩めないときは締めたまま終了コード 5（`relax-only` で戻す）。最終の書き出しの失敗
 /// （`collect_stop_error`）は pool を閉じ終えているので緩めてよい（終了コードは 1）。
 pub fn relax_allowed_after_shutdown(
     report: &crate::engine::ShutdownReport,
-    listener_stops_settled: bool,
+    runtime_end: RuntimeEnd,
 ) -> bool {
-    !report.timed_out && (!report.listener_stop_abandoned || listener_stops_settled)
+    !report.timed_out && runtime_end == RuntimeEnd::Finished
 }
 
 /// 後始末が予算内に終わらなかったので緩めずに終わるときの行。
@@ -224,17 +242,25 @@ pub fn shutdown_incomplete_keeps_tight_line() -> String {
     )
 }
 
-/// listener の停止（裏に残した分）が `waited` の間に終わらなかったので緩めずに終わるときの行。
-pub fn listener_still_open_keeps_tight_line(waited: Duration) -> String {
+/// エンジンのランタイムが `waited` の間に終わらなかったので緩めずに終わるときの行。
+pub fn runtime_still_busy_keeps_tight_line(waited: Duration) -> String {
     format!(
-        "{SERVER_LABEL}: 待ち受けの停止が{}秒待っても終わらなかった（開いたままの要求が残っている可能性）ため、ACL を緩めずに終わります（終了コード {EXIT_LEFT_TIGHT}。運用モードの形のまま。設定モードへは relax-only の開始で戻してください）",
+        "{SERVER_LABEL}: エンジンの非同期ランタイムが{}秒待っても終わらなかった（処理が残っている可能性）ため、ACL を緩めずに終わります（終了コード {EXIT_LEFT_TIGHT}。運用モードの形のまま。設定モードへは relax-only の開始で戻してください）",
         waited.as_secs()
     )
 }
 
-/// listener の停止を裏に残していたが、後から終わったのを確かめたときの行（この後で緩める）。
-pub fn listener_settled_line() -> String {
-    format!("{SERVER_LABEL}: 裏に残していた待ち受けの停止が終わりました（開いていた要求も終了）。")
+/// エンジンのランタイムを終わらせたときの行（この後で緩める）。
+pub fn runtime_finished_line(listener_stop_abandoned: bool) -> String {
+    if listener_stop_abandoned {
+        format!(
+            "{SERVER_LABEL}: エンジンの非同期ランタイムを終わらせました（裏に残していた待ち受けの停止と開いていた要求も止まりました）。"
+        )
+    } else {
+        format!(
+            "{SERVER_LABEL}: エンジンの非同期ランタイムを終わらせました（残りのタスクは無し）。"
+        )
+    }
 }
 
 /// 緩め直しの結果で終了コードを決める: 緩め直せたら `if_relaxed`、`Err` なら 5。
@@ -1111,9 +1137,10 @@ mod tests {
     }
 
     /// Codex の指摘 P1: 後始末が時間切れなら緩めない。最終の書き出しの失敗だけなら緩める。
-    /// オーナーレビュー P1: listener の停止を裏に残したなら、終わったのを確かめたときだけ緩める。
+    /// オーナーレビュー P1: エンジンのランタイムを上限の中で終わらせたときだけ緩める
+    /// （listener の停止を裏に残していたかどうかは関係ない - ランタイムが終われば要求も止まる）。
     #[test]
-    fn relax_is_refused_after_a_timed_out_or_still_open_shutdown() {
+    fn relax_is_refused_after_a_timed_out_shutdown_or_a_still_busy_runtime() {
         use crate::engine::ShutdownReport;
         let done = ShutdownReport {
             completed: Vec::new(),
@@ -1122,43 +1149,48 @@ mod tests {
             listener_stop_abandoned: false,
             budget: Duration::from_secs(15),
         };
-        assert!(relax_allowed_after_shutdown(&done, false));
-        assert!(relax_allowed_after_shutdown(&done, true));
+        assert!(relax_allowed_after_shutdown(&done, RuntimeEnd::Finished));
+        assert!(!relax_allowed_after_shutdown(&done, RuntimeEnd::StillBusy));
+        assert!(!relax_allowed_after_shutdown(
+            &done,
+            RuntimeEnd::NotAttempted
+        ));
         // 最終の書き出しの失敗だけなら緩める。
         assert!(relax_allowed_after_shutdown(
             &ShutdownReport {
                 collect_stop_error: Some("x".to_string()),
                 ..done.clone()
             },
-            false
+            RuntimeEnd::Finished
         ));
-        // 時間切れは、listener が済んでいても緩めない。
+        // 時間切れは、ランタイムが終わっていても緩めない。
         assert!(!relax_allowed_after_shutdown(
             &ShutdownReport {
                 timed_out: true,
                 ..done.clone()
             },
-            true
+            RuntimeEnd::Finished
         ));
-        // listener の停止を裏に残した: 終わったのを確かめたときだけ緩める。
+        // listener の停止を裏に残していても、ランタイムが終われば緩める（終わらなければ緩めない）。
         let abandoned = ShutdownReport {
             listener_stop_abandoned: true,
             ..done
         };
-        assert!(!relax_allowed_after_shutdown(&abandoned, false));
-        assert!(relax_allowed_after_shutdown(&abandoned, true));
+        assert!(relax_allowed_after_shutdown(
+            &abandoned,
+            RuntimeEnd::Finished
+        ));
         assert!(!relax_allowed_after_shutdown(
-            &ShutdownReport {
-                timed_out: true,
-                ..abandoned
-            },
-            true
+            &abandoned,
+            RuntimeEnd::StillBusy
         ));
         assert!(shutdown_incomplete_keeps_tight_line().contains("終了コード 5"));
-        let line = listener_still_open_keeps_tight_line(Duration::from_secs(10));
+        let line = runtime_still_busy_keeps_tight_line(Duration::from_secs(10));
         assert!(line.contains("10秒"), "{line}");
         assert!(line.contains("終了コード 5"), "{line}");
         assert!(line.contains("relax-only"), "{line}");
+        assert!(runtime_finished_line(true).contains("待ち受けの停止"));
+        assert!(!runtime_finished_line(false).contains("待ち受けの停止"));
     }
 
     /// 1 周目の一覧は最初の 20 件と総数。

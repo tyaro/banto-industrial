@@ -694,24 +694,116 @@ async fn a_timed_out_shutdown_on_scm_stop_keeps_the_tree_tight_with_5() {
     assert!(!layout.endpoint_file().exists(), "エンジンを止めていない");
 }
 
-/// オーナーレビュー P1（#623 PR-3）: listener の停止を上限で待ち切れず裏に残した
-/// （`listener_stop_abandoned`）が、`LISTENER_SETTLE_WAIT` 待っても終わったのを確かめられなかった
-/// なら、**緩めずに**締めたまま Stopped(5)（graceful 停止の間に届く要求が、閉じた pool への
-/// 失敗で監査の退避ファイルを利用者の木の下へ書きうる）。「緩め始めます」も `acl:relax` も出ない。
+/// オーナーレビュー P1（#623 PR-3）の再現: STOP の前に `POST /api/auth/login` のヘッダと本文の
+/// 一部だけ送って保留した接続は、banto の listener の停止（5 秒で親を abort）では止まらない。
+/// サービスは緩める前にエンジンのランタイムを終わらせるので、その接続のタスクも捨てられ、
+/// 緩めた後に本文を完了させても要求は処理されず、監査の退避ファイル（`audit-spool\`）が
+/// 利用者の木の下に書かれない（反証: ランタイムを終わらせずに緩める形に戻すと、本文の完了
+/// で認証 → 閉じた pool → `login_failed` の退避が成立して落ちる）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unsettled_listener_stop_on_scm_stop_keeps_the_tree_tight_with_5() {
+async fn a_request_held_open_across_scm_stop_cannot_write_after_relaxing() {
+    use std::io::{Read, Write};
+
     let dir = tempfile::tempdir().unwrap();
     let layout = DataLayout::new(dir.path().join("root"));
     prepare_root_db(&layout, None).await;
     let trace: Trace = Arc::default();
     let acl = FakeAcl::new(trace.clone());
-    let program = program(&layout, &trace, acl);
-    program
-        .fake_listener_stop_abandoned
-        .store(true, Ordering::SeqCst);
-    program
-        .fake_listener_stops_unsettled
-        .store(true, Ordering::SeqCst);
+    let running = spawn(program(&layout, &trace, acl));
+    wait_running(&running).await;
+    let endpoint = read_endpoint(&layout.endpoint_file()).expect("endpoint.json");
+    let _token = setup_admin(endpoint.port).await;
+    let spool_before = spool_files(&layout);
+
+    // ヘッダと本文の一部だけ送って保留する（本物の TCP。keep-alive のまま）。
+    let body = serde_json::json!({"username":"admin","password":"wrong-pass-1"}).to_string();
+    let (head, tail) = body.split_at(10);
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", endpoint.port)).expect("connect");
+    stream
+        .write_all(
+            format!(
+                "POST /api/auth/login HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Banto-Client: banto\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{head}",
+                endpoint.port,
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .expect("write head");
+    stream.flush().unwrap();
+
+    // STOP。ランタイムを終わらせてから緩めて 0 で終わる。
+    let stop_sent = Instant::now();
+    running.send(ScmControlKind::Stop);
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Success));
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Success))
+    );
+    let lines = snapshot(&trace);
+    let finished = index_of(&lines, "非同期ランタイムを終わらせました");
+    let begin = index_of(&lines, "ACL を緩め始めます");
+    let relax = index_of(&lines, "acl:relax");
+    assert!(
+        finished.is_some() && begin.is_some() && relax.is_some(),
+        "{lines:#?}"
+    );
+    assert!(finished < begin && begin < relax, "{lines:#?}");
+
+    // オーナーの再現と同じく、banto の graceful 停止（5 秒）を超えてから本文を完了させる。
+    if let Some(rest) = Duration::from_secs(6).checked_sub(stop_sent.elapsed()) {
+        std::thread::sleep(rest);
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let written = stream
+        .write_all(tail.as_bytes())
+        .and_then(|()| stream.flush());
+    let mut response = Vec::new();
+    let read = stream.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        !text.starts_with("HTTP/1.1"),
+        "緩めた後に要求が処理された（write={written:?}, read={read:?}）: {text}"
+    );
+    // 退避ファイルは増えていない（しばらく見張る - 退避の書き込みは非同期）。
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        spool_files(&layout),
+        spool_before,
+        "緩めた後に監査の退避が書かれた"
+    );
+    assert!(!layout.endpoint_file().exists());
+}
+
+/// `audit-spool\` の下のファイル名（無ければ空）。
+fn spool_files(layout: &DataLayout) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(layout.audit_spool_dir())
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// オーナーレビュー P1（#623 PR-3）: エンジンのランタイムを上限の中で終わらせられなかった
+/// （ブロッキングの処理が残っている）なら、**緩めずに**締めたまま Stopped(5)。「緩め始めます」
+/// も `acl:relax` も出ない。本物のランタイムに、上限（1 秒）より長く眠る `spawn_blocking` を置く。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_that_does_not_end_within_the_wait_keeps_the_tree_tight_with_5() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let mut program = program(&layout, &trace, acl);
+    program.runtime_shutdown_wait = Duration::from_secs(1);
+    *program.fake_blocking_hold.lock().unwrap() = Some(Duration::from_secs(4));
     let running = spawn(program);
     wait_running(&running).await;
     assert!(layout.endpoint_file().exists());
@@ -728,34 +820,38 @@ async fn an_unsettled_listener_stop_on_scm_stop_keeps_the_tree_tight_with_5() {
 
     let lines = snapshot(&trace);
     assert!(
-        index_of(&lines, "待ち受けの停止が").is_some()
+        index_of(&lines, "非同期ランタイムが1秒待っても終わらなかった").is_some()
             && index_of(&lines, "ACL を緩めずに終わります").is_some(),
         "{lines:#?}"
     );
     assert!(
+        index_of(&lines, "非同期ランタイムを終わらせました").is_none(),
+        "{lines:#?}"
+    );
+    assert!(
         index_of(&lines, "ACL を緩め始めます").is_none(),
-        "listener が残りうるのに緩め始めた: {lines:#?}"
+        "ランタイムが残りうるのに緩め始めた: {lines:#?}"
     );
     assert!(
         index_of(&lines, "acl:relax").is_none(),
-        "listener が残りうるのに緩めた: {lines:#?}"
+        "ランタイムが残りうるのに緩めた: {lines:#?}"
     );
     assert!(!layout.endpoint_file().exists(), "エンジンを止めていない");
+    // 置いたブロッキングのタスクが終わるのを待ってから抜ける（後のテストに重ねない）。
+    std::thread::sleep(Duration::from_secs(4));
 }
 
-/// 反証: listener の停止を裏に残していても、後から終わったのを確かめられれば（本物の
-/// エンジンは何も残していない）、確かめた行を出してから緩めて 0。
+/// 反証: ブロッキングの処理が上限の中で終われば、終わらせた行を出してから緩めて 0。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_settled_listener_stop_on_scm_stop_relaxes_and_exits_0() {
+async fn a_runtime_that_ends_within_the_wait_relaxes_and_exits_0() {
     let dir = tempfile::tempdir().unwrap();
     let layout = DataLayout::new(dir.path().join("root"));
     prepare_root_db(&layout, None).await;
     let trace: Trace = Arc::default();
     let acl = FakeAcl::new(trace.clone());
-    let program = program(&layout, &trace, acl);
-    program
-        .fake_listener_stop_abandoned
-        .store(true, Ordering::SeqCst);
+    let mut program = program(&layout, &trace, acl);
+    program.runtime_shutdown_wait = Duration::from_secs(5);
+    *program.fake_blocking_hold.lock().unwrap() = Some(Duration::from_millis(500));
     let running = spawn(program);
     wait_running(&running).await;
 
@@ -767,14 +863,14 @@ async fn a_settled_listener_stop_on_scm_stop_relaxes_and_exits_0() {
         Some(&(ServicePhase::Stopped, ServiceExit::Success))
     );
     let lines = snapshot(&trace);
-    let settled = index_of(&lines, "裏に残していた待ち受けの停止が終わりました");
+    let finished = index_of(&lines, "非同期ランタイムを終わらせました");
     let begin = index_of(&lines, "ACL を緩め始めます");
     let relax = index_of(&lines, "acl:relax");
     assert!(
-        settled.is_some() && begin.is_some() && relax.is_some(),
+        finished.is_some() && begin.is_some() && relax.is_some(),
         "{lines:#?}"
     );
-    assert!(settled < begin && begin < relax, "{lines:#?}");
+    assert!(finished < begin && begin < relax, "{lines:#?}");
     assert!(
         index_of(&lines, "ACL を緩めずに終わります").is_none(),
         "{lines:#?}"

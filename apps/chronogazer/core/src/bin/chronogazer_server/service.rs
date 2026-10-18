@@ -51,9 +51,11 @@
 //!
 //! 新しいバックアップの受け付けを止めて進行中の物の完了を待つ（打ち切らない。待つ間は
 //! `report_stop_progress`、30 分で進めるのをやめる）→ エンジンを止め DB を閉じる
-//! （`StartedServer::shutdown`）→ 見張りを止める → listener の停止を裏に残していたら終わる
-//! のを待つ（最大 `LISTENER_SETTLE_WAIT`。終わらなければ緩めずに 5）→ 最後の行「緩め始めます」
-//! → ログを閉じ、向け直しも外す（NUL へ）→ `relax_tree`（進み具合で `report_stop_progress`）
+//! （`StartedServer::shutdown`）→ 見張りを止める → **エンジンの tokio のランタイムを終わらせる**
+//! （[`BackgroundRuntime::shutdown_within`]。最大 `RUNTIME_SHUTDOWN_WAIT`。接続ごとのタスクも
+//! 含めて非同期のタスクは全部捨て、`spawn_blocking` の分は終わるまで待つ。終わらなければ
+//! 緩めずに 5）→ 最後の行「緩め始めます」→ ログを閉じ、向け直しも外す（NUL へ）→
+//! `relax_tree`（進み具合で `report_stop_progress`。同期の処理なのでランタイムは要らない）
 //! → ハンドルを閉じ A1 を返す → 0（後始末が不完全なら 1）、緩められなければ 5。後始末が
 //! 時間切れなら緩めずに 5。
 //!
@@ -104,15 +106,14 @@ use chronogazer_core::server_host::{
 use chronogazer_core::server_service::{
     acl_changed_line, after_close_abort, after_marker_error, backup_wait_line, close_abort_line,
     exit_after_relax_back, exit_after_scan_refusal, external_data_dir_line, install_result_lines,
-    install_with, listener_settled_line, listener_still_open_keeps_tight_line,
-    mode_switch_begin_line, mode_switch_done_line, no_reader_line, parse_start_args,
+    install_with, mode_switch_begin_line, mode_switch_done_line, no_reader_line, parse_start_args,
     redirection_guard_line, relax_allowed_after_shutdown, relax_begin_line, relax_only_begin_line,
-    scan_refused_lines, service_exit_for, service_flush_wait, service_running_line,
-    service_starting_line, service_stop_budget, service_stop_done_line, service_stop_hint_line,
-    service_stop_reason_line, service_stopped_line, shutdown_incomplete_keeps_tight_line,
-    stop_progress_allowed, stop_signal_label, tampered_line, uninstall_lines,
-    unknown_start_arg_line, StartArgs, INSTALL_USER_SID_VALUE, SERVICE_EXPECTED_STOP,
-    SERVICE_LOG_FLUSH_WAIT,
+    runtime_finished_line, runtime_still_busy_keeps_tight_line, scan_refused_lines,
+    service_exit_for, service_flush_wait, service_running_line, service_starting_line,
+    service_stop_budget, service_stop_done_line, service_stop_hint_line, service_stop_reason_line,
+    service_stopped_line, shutdown_incomplete_keeps_tight_line, stop_progress_allowed,
+    stop_signal_label, tampered_line, uninstall_lines, unknown_start_arg_line, RuntimeEnd,
+    StartArgs, INSTALL_USER_SID_VALUE, SERVICE_EXPECTED_STOP, SERVICE_LOG_FLUSH_WAIT,
 };
 use chronogazer_core::shell_launch::SERVICE_NAME;
 
@@ -137,10 +138,10 @@ type RedirectionGuardSource = Box<dyn Fn() -> RedirectionGuard + Send + Sync>;
 const START_WAIT_HINT: Duration = Duration::from_secs(10);
 /// 進み具合で checkpoint を進める間隔（1 秒ごと。設計 §3.8）。
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
-/// STOP で、裏に残した listener の停止（`ShutdownReport::listener_stop_abandoned`）が終わるのを
-/// 待つ上限（オーナーレビュー P1）。banto の graceful 停止（最大 5 秒）に、適用が slot の lock を
-/// 持っている分の余裕を足した。これを過ぎても終わらなければ緩めずに 5。
-const LISTENER_SETTLE_WAIT: Duration = Duration::from_secs(10);
+/// STOP で、緩める前にエンジンの tokio のランタイムを終わらせるのを待つ上限（オーナーレビュー
+/// P1）。非同期のタスクは終わらせるときに全部捨てるので、待つのは実質 `spawn_blocking` の
+/// 残り（tokio::fs の書き込みなど）。これを過ぎても終わらなければ緩めずに 5。
+const RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 /// 木を歩くスレッドのスタック（`MAX_DEPTH` 64 段 × 4 フレームで足りる大きさ。#681 の S-5）。
 const WALK_STACK: usize = 16 * 1024 * 1024;
 /// 定期の確かめ直しの間隔（設計 §2.9 (d) の案 60 秒）。
@@ -368,14 +369,14 @@ pub(crate) struct ServerProgram {
     /// 経路を、本物のエンジンの予算を使い切らずに踏むため）。
     #[cfg(test)]
     fake_stop_timed_out: AtomicBool,
-    /// テスト専用: STOP の後始末の結果を「listener の停止を待ち切れず裏に残した」に偽る
-    /// （オーナーレビュー P1）。本物のエンジンは残していないので、`fake_listener_stops_unsettled`
-    /// を立てなければ「後から終わったのを確かめた」になり緩める。
+    /// STOP で、緩める前にランタイムを終わらせるのを待つ上限（本番は [`RUNTIME_SHUTDOWN_WAIT`]。
+    /// テストは短くする）。
+    runtime_shutdown_wait: Duration,
+    /// テスト専用: ランタイムを終わらせる直前に、この長さだけ眠るブロッキングのタスク
+    /// （`spawn_blocking`）を置く（オーナーレビュー P1 の「上限の中で終わらなければ締めたまま 5」
+    /// の経路を本物のランタイムで踏むため）。
     #[cfg(test)]
-    fake_listener_stop_abandoned: AtomicBool,
-    /// テスト専用: 裏に残した listener の停止が待っても終わらなかったことに偽る。
-    #[cfg(test)]
-    fake_listener_stops_unsettled: AtomicBool,
+    fake_blocking_hold: Mutex<Option<Duration>>,
 }
 
 /// [`ServerProgram::new`] に渡す部品の組（本番とテストで差し替える物）。
@@ -471,10 +472,9 @@ impl ServerProgram {
             record: Mutex::new(None),
             #[cfg(test)]
             fake_stop_timed_out: AtomicBool::new(false),
+            runtime_shutdown_wait: RUNTIME_SHUTDOWN_WAIT,
             #[cfg(test)]
-            fake_listener_stop_abandoned: AtomicBool::new(false),
-            #[cfg(test)]
-            fake_listener_stops_unsettled: AtomicBool::new(false),
+            fake_blocking_hold: Mutex::new(None),
         }
     }
 
@@ -607,12 +607,13 @@ impl ServerProgram {
         };
         ctx.report_start_progress(START_WAIT_HINT);
 
-        // ランタイム（Stopped の報告の後で、残りのタスクを待たずに落とす）。
+        // ランタイム（STOP では緩める前に終わらせる。それ以外の道では Stopped の報告の後で、
+        // 残りのタスクを待たずに落とす）。
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
         {
-            Ok(runtime) => ctx.hold_until_stopped(BackgroundRuntime(Some(runtime))),
+            Ok(runtime) => ctx.hold_until_stopped(BackgroundRuntime::new(runtime)),
             Err(err) => {
                 eprintln!("{SERVER_LABEL}: 非同期ランタイムを作れませんでした: {err}");
                 return service_exit_for(EXIT_START_FAILED);
@@ -809,15 +810,19 @@ impl ServerProgram {
             key_store: Mutex::new(Some(key_store)),
             opened_log: Mutex::new(Some((log.clone(), Box::new(|_| {}), None))),
         };
-        let started = start::start_server(
-            &runtime,
-            StartSpec {
-                layout: &layout,
-                host: ChronoGazerHost::Service,
-                access: &chronogazer_core::paths::DirAccessSource::Given(mode.operation().clone()),
-            },
-            &hooks,
-        );
+        let started = runtime.with(|runtime| {
+            start::start_server(
+                runtime,
+                StartSpec {
+                    layout: &layout,
+                    host: ChronoGazerHost::Service,
+                    access: &chronogazer_core::paths::DirAccessSource::Given(
+                        mode.operation().clone(),
+                    ),
+                },
+                &hooks,
+            )
+        });
         let Started { server, .. } = match started {
             Ok(started) => started,
             Err(code) => {
@@ -931,55 +936,57 @@ impl ServerProgram {
                     if self.fake_stop_timed_out.load(Ordering::SeqCst) {
                         summary.report.timed_out = true;
                     }
-                    if self.fake_listener_stop_abandoned.load(Ordering::SeqCst) {
-                        summary.report.listener_stop_abandoned = true;
-                    }
                     summary
                 };
                 self.report_shutdown(&summary, Some(notice.signal));
                 // 4. 見張りと定期の確かめ直しを止める。
                 watchers.stop();
-                // 3b. listener の停止を上限（1 秒）で待ち切れず裏に残していたら、終わったのを
-                // 確かめる（オーナーレビュー P1）: listener の graceful 停止は最大 5 秒で、
-                // その間は STOP の前から開いていた要求がまだ届く。閉じた pool に当たった
-                // 認証は監査の退避ファイルを利用者の木の下へパスで書くので、要求が残り
-                // うるうちは緩めない。待つ間も STOP_PENDING の checkpoint は進める。
-                let listener_stops_settled =
-                    if summary.report.listener_stop_abandoned && !summary.report.timed_out {
-                        let settle_started = Instant::now();
-                        let settled = loop {
-                            let settled = runtime.block_on(
-                                server
-                                    .engine()
-                                    .await_abandoned_listener_stops(PROGRESS_INTERVAL),
-                            );
-                            if settled || settle_started.elapsed() >= LISTENER_SETTLE_WAIT {
-                                break settled;
-                            }
-                            if stop_progress_allowed(stop_started.elapsed()) {
-                                ctx.report_stop_progress();
-                            }
-                        };
-                        #[cfg(test)]
-                        let settled =
-                            settled && !self.fake_listener_stops_unsettled.load(Ordering::SeqCst);
-                        if settled {
-                            self.say(&listener_settled_line());
+                // 4b. 緩める前に、エンジンを動かしていた tokio のランタイムを終わらせる
+                // （オーナーレビュー P1）。banto の listener の停止は 5 秒で `axum::serve` の親を
+                // abort して戻るが、接続ごとのタスクは親の abort では止まらない（STOP の前から
+                // 開いていた要求が、本文を送り終えたときに閉じた pool に当たり、banto の認証が
+                // 監査の退避ファイルを利用者の木の下へパスで書きうる）。ランタイムを落とせば
+                // 接続ごとのタスクも含めて非同期のタスクは全部捨てられ、`spawn_blocking` の分は
+                // 終わるまで待つので、以後この本体が非同期のタスクから木へ書くことは無い。
+                // 後始末が時間切れなら、緩めないことは決まっているので試さない。待つ間も
+                // STOP_PENDING の checkpoint は進める。
+                let runtime_end = if summary.report.timed_out {
+                    RuntimeEnd::NotAttempted
+                } else {
+                    #[cfg(test)]
+                    if let Some(hold) = *self
+                        .fake_blocking_hold
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                    {
+                        runtime.with(|runtime| {
+                            runtime.spawn_blocking(move || std::thread::sleep(hold));
+                        });
+                    }
+                    let end = runtime.shutdown_within(self.runtime_shutdown_wait, &mut || {
+                        if stop_progress_allowed(stop_started.elapsed()) {
+                            ctx.report_stop_progress();
                         }
-                        settled
-                    } else {
-                        false
-                    };
+                    });
+                    if end == RuntimeEnd::Finished {
+                        self.say(&runtime_finished_line(
+                            summary.report.listener_stop_abandoned,
+                        ));
+                    }
+                    end
+                };
                 // 後始末が予算内に終わらなかった（pool を閉じていない・listener を止める
-                // タスクが残っている）、または裏に残した listener の停止が終わったのを確かめ
-                // られなかったなら**緩めない**（Codex の指摘 P1・オーナーレビュー P1: エンジンの
-                // 資源や要求が残ったまま利用者の書き込みを戻すと、約束 2 と同時アクセスの防ぎ
-                // に反する）。締めたまま 5 で終わり、デスクトップの案内（relax-only）で戻す。
-                if !relax_allowed_after_shutdown(&summary.report, listener_stops_settled) {
+                // タスクが残っている）、またはランタイムを上限の中で終わらせられなかった
+                // なら**緩めない**（Codex の指摘 P1・オーナーレビュー P1: エンジンの資源や要求が
+                // 残ったまま利用者の書き込みを戻すと、約束 2 と同時アクセスの防ぎに反する）。
+                // 締めたまま 5 で終わり、デスクトップの案内（relax-only）で戻す。
+                if !relax_allowed_after_shutdown(&summary.report, runtime_end) {
                     if summary.report.timed_out {
                         self.say(&shutdown_incomplete_keeps_tight_line());
                     } else {
-                        self.say(&listener_still_open_keeps_tight_line(LISTENER_SETTLE_WAIT));
+                        self.say(&runtime_still_busy_keeps_tight_line(
+                            self.runtime_shutdown_wait,
+                        ));
                     }
                     let exit = service_exit_for(EXIT_LEFT_TIGHT);
                     self.say(&service_stopped_line(exit));
@@ -991,7 +998,8 @@ impl ServerProgram {
                 // 5. 最後の行 → ログを閉じ、向け直しを外す。
                 self.say(&relax_begin_line());
                 self.close_log(log.as_ref(), SERVICE_LOG_FLUSH_WAIT);
-                // 6. 緩める（ここから先は新しく開かず、ログにも書かない）。
+                // 6. 緩める（ここから先は新しく開かず、ログにも書かない。ランタイムは終わって
+                // いるので同期の処理だけ）。
                 let mut last = Instant::now();
                 let mut progress = |_: &Progress| {
                     if last.elapsed() >= PROGRESS_INTERVAL
@@ -1428,22 +1436,76 @@ impl StartHooks for ServiceHooks<'_> {
     }
 }
 
-/// tokio のランタイムを、drop のときに残りのタスクを待たずに落とす入れ物
-/// （`shutdown_background`）。止めたエンジンの残りのタスクで、Stopped を報告した後の
-/// プロセスの終わりを待たせない（コンソールの `mem::forget(runtime)` と同じ扱い）。
-struct BackgroundRuntime(Option<tokio::runtime::Runtime>);
+/// エンジンを動かす tokio のランタイムの入れ物。
+///
+/// - STOP（設定モードへ）では、緩める前に [`Self::shutdown_within`] で**終わらせる**
+///   （オーナーレビュー P1。`relax_tree` は同期の処理なので、ランタイムの外のサービスの
+///   スレッドで走らせられる）。
+/// - それ以外の道（PRESHUTDOWN・改ざん・起動の失敗・panic）では、drop のときに残りの
+///   タスクを待たずに落とす（`shutdown_background`）。止めたエンジンの残りのタスクで、
+///   Stopped を報告した後のプロセスの終わりを待たせない（コンソールの `mem::forget(runtime)`
+///   と同じ扱い）。
+struct BackgroundRuntime(Mutex<Option<tokio::runtime::Runtime>>);
 
-impl std::ops::Deref for BackgroundRuntime {
-    type Target = tokio::runtime::Runtime;
+impl BackgroundRuntime {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self(Mutex::new(Some(runtime)))
+    }
 
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("drop の前だけ使う")
+    /// ランタイムを借りる（[`Self::shutdown_within`] の後は呼ばない）。
+    fn with<T>(&self, f: impl FnOnce(&tokio::runtime::Runtime) -> T) -> T {
+        let guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        f(guard.as_ref().expect("ランタイムを終わらせる前だけ使う"))
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.with(|runtime| runtime.block_on(future))
+    }
+
+    /// ランタイムを終わらせ、`cap` まで待つ。
+    ///
+    /// 終わらせるのは別のスレッドで `drop` する形（tokio の `Runtime` の drop は、非同期の
+    /// タスクを全部捨て、ワーカーと `spawn_blocking` のスレッドが**全部終わるまで**待つ）。
+    /// そのスレッドが `cap` の中で戻れば [`RuntimeEnd::Finished`]: もうこのランタイムで
+    /// 動く物は無い。戻らなければ [`RuntimeEnd::StillBusy`]（ブロッキングの処理が残っている。
+    /// スレッドは放し、プロセスの終わりに任せる）。待つ間は `PROGRESS_INTERVAL` ごとに
+    /// `tick`（STOP_PENDING の checkpoint）。
+    fn shutdown_within(&self, cap: Duration, tick: &mut dyn FnMut()) -> RuntimeEnd {
+        let Some(runtime) = self.0.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+            return RuntimeEnd::Finished;
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("chronogazer-runtime-end".to_string())
+            .spawn(move || {
+                drop(runtime);
+                let _ = done_tx.send(());
+            });
+        if spawned.is_err() {
+            // スレッドを作れなければ終わらせたことにはできない。
+            return RuntimeEnd::StillBusy;
+        }
+        let deadline = Instant::now() + cap;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return RuntimeEnd::StillBusy;
+            }
+            match done_rx.recv_timeout((deadline - now).min(PROGRESS_INTERVAL)) {
+                Ok(()) => return RuntimeEnd::Finished,
+                // 送らずに終わった（drop の途中の panic）: 終わらせたとは言えない。
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return RuntimeEnd::StillBusy;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tick(),
+            }
+        }
     }
 }
 
 impl Drop for BackgroundRuntime {
     fn drop(&mut self) {
-        if let Some(runtime) = self.0.take() {
+        if let Some(runtime) = self.0.get_mut().unwrap_or_else(|p| p.into_inner()).take() {
             runtime.shutdown_background();
         }
     }
