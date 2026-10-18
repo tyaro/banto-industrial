@@ -408,6 +408,28 @@ impl<E: Copy + Send + Sync + 'static> ServiceStatusReporter<E> {
         true
     }
 
+    /// 停止の処理の進み具合を報告する（#623 PR-3、設計 §3.2・§3.8）: STOP_PENDING の
+    /// checkpoint を 1 つ進め、heartbeat が進めてよい上限もそこから 1 刻み延ばす（この報告の
+    /// 後、heartbeat はもう 1 回だけ自分で進められる）。heartbeat は時間で進むだけで処理の進みを
+    /// 見ないので、長い後始末（バックアップの完了の待ち・木の ACL の緩め直し）が**本当に進んで
+    /// いる**間だけ本体が呼ぶ。停止に入っていない（Running・Starting）・Stopped の後は報告せず
+    /// `false`。呼ぶのをやめれば、heartbeat は上限で止まり SCM からは応答なしに見える（固まりを
+    /// 隠さない）。
+    pub fn report_stop_progress(&self) -> bool {
+        let mut state = lock(&self.shared.state);
+        let ReporterPhase::Stopping { checkpoint } = state.phase else {
+            return false;
+        };
+        let next = checkpoint.saturating_add(1);
+        let Some(plan) = stop_pending_status(next, self.shared.wait_hint) else {
+            return false;
+        };
+        state.phase = ReporterPhase::Stopping { checkpoint: next };
+        state.max_checkpoint = state.max_checkpoint.max(next.saturating_add(1));
+        (self.shared.report)(&plan, self.shared.ok_exit);
+        true
+    }
+
     /// Stopped を 1 回だけ報告する。以後は何も報告しない。2 回目は `false`。
     /// heartbeat のスレッドは、ロックを放してから止めて終わりを待つ。
     pub fn report_stopped(&self, exit: E) -> bool {
@@ -781,6 +803,36 @@ mod tests {
             "停止が始まったら出さない"
         );
         reporter.report_stopped(0);
+    }
+
+    /// `report_stop_progress`（#623 PR-3）: 停止の処理の進みで checkpoint を 1 つずつ進め、
+    /// heartbeat の上限もそこから 1 刻み延ばす。Running の間・Stopped の後は報告しない。
+    #[test]
+    fn stop_progress_advances_the_checkpoint_and_extends_the_heartbeat_limit() {
+        // heartbeat の間隔は長く（このテストの間は時間では進まない）、見込み 0 → 上限 1。
+        let (reporter, seen) = recording_reporter(Duration::from_secs(60), Duration::ZERO);
+        assert!(reporter.report_running());
+        assert!(!reporter.report_stop_progress(), "停止の前は報告しない");
+        assert!(reporter.begin_stop());
+        assert_eq!(lock(&reporter.shared.state).max_checkpoint, 1);
+        assert!(reporter.report_stop_progress());
+        assert!(reporter.report_stop_progress());
+        // 2 回進めた（checkpoint 3）ので、heartbeat はもう 1 回（4）まで進んでよい。
+        assert_eq!(lock(&reporter.shared.state).max_checkpoint, 4);
+        assert!(reporter.report_stopped(0));
+        assert!(!reporter.report_stop_progress(), "Stopped の後は報告しない");
+        let pending: Vec<u32> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(plan, _)| plan.phase == ServicePhase::StopPending)
+            .map(|(plan, _)| plan.checkpoint)
+            .collect();
+        assert_eq!(pending, vec![1, 2, 3]);
+        assert_eq!(
+            seen.lock().unwrap().last().map(|(plan, _)| plan.phase),
+            Some(ServicePhase::Stopped)
+        );
     }
 
     #[test]

@@ -307,6 +307,13 @@ impl ServiceContext {
         self.reporter.report_start_progress(wait_hint)
     }
 
+    /// 停止の処理の進み具合を報告する（STOP_PENDING の checkpoint を 1 つ進め、heartbeat の
+    /// 上限を 1 刻み延ばす。`ServiceStatusReporter::report_stop_progress`、#623 PR-3）。
+    /// 停止に入っていない・Stopped の後は `false`。
+    pub fn report_stop_progress(&self) -> bool {
+        self.reporter.report_stop_progress()
+    }
+
     /// Running を報告する。起動中に停止が届いていた（または停止が始まって
     /// いた）ら報告せず `false`（受け付けを立てた瞬間に停止へ入るため。
     /// 本体はそのまま停止の処理へ進む）。
