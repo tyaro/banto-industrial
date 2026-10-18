@@ -49,12 +49,30 @@
 //! 締める前から利用者が開いていたハンドルは、締めた後も開いた時点のアクセスのまま効く。
 //! 空のフォルダを書き込みで開いていたハンドルは、締めた後に `FSCTL_SET_REPARSE_POINT` で
 //! そのフォルダをジャンクションにできる（確かめるのはハンドルのアクセスと「空であること」
-//! だけ）。そこで管理するフォルダに、**利用者が消せない空のファイル**（SYSTEM・Administrators
-//! だけ、所有者 Administrators、利用者の ACE なし）を置く。空でないフォルダは reparse point に
-//! できない。設定モードでも利用者は消せない（「変更」に `FILE_DELETE_CHILD` が無く、印の
-//! ファイル自身に DELETE が無い）。`PinnedDir::ensure_marker` は置いた直後に握ったハンドルで
-//! そのフォルダの reparse 属性を読み直し、印を置く前に reparse にされていたら
-//! [`MarkerError::DirIsReparse`] で止める。緩めても印の記述子は変えない。
+//! だけ）。そこで**木のすべてのフォルダ**に、**利用者が消せない空のファイル**（SYSTEM・
+//! Administrators だけ、所有者 Administrators、利用者の ACE なし）を置く。空でないフォルダは
+//! reparse point にできない。設定モードでも利用者は消せない（「変更」に `FILE_DELETE_CHILD` が
+//! 無く、印のファイル自身に DELETE が無い）。
+//!
+//! - **2 周目**（`close_tree`）は、フォルダに書いた直後・中を列挙する前に印を置く（置けなければ、
+//!   その間に古いハンドルで reparse にされたとみなして止める。Codex P1）。締めた直後のフォルダは
+//!   こうして**空のまま残らない**ので、以後は古いハンドルでも reparse にできない。既にある印
+//!   （前回の運用モードの物・利用者が置いた偽物）は共有 READ だけ・`DELETE` を求めて開き、
+//!   利用者が握っていれば止め（`Busy`）、記述子を印の形に書き直す。
+//! - `PinnedDir::ensure_marker`（管理するフォルダ。締めた後に `open_managed` が作った物のため）は
+//!   同じ部品で置き、直後に握ったハンドルでそのフォルダの reparse 属性を読み直して、印を置く前に
+//!   reparse にされていたら [`MarkerError::DirIsReparse`] で止める。
+//! - 緩めても印の記述子は変えない。印は crate からは消さない（uninstall の昇格ヘルパーが消す）。
+//!
+//! **残る窓**: 締める前に開いた古いハンドルのうち、`WRITE_DAC`（DACL を戻す）・`FILE_WRITE_DATA`
+//! （ファイルの中身）・`DELETE`（消す・木の外へ移す）は印では塞がらない（設計 §2.9 の表。ID で開いた
+//! 物の本当のパスの確かめと、パスで渡す直前の `recheck` で狭める）。実測では、ハンドル経由の
+//! `SetKernelObjectSecurity` による DACL の変更は `ReadDirectoryChangesW(FILE_NOTIFY_CHANGE_SECURITY)`
+//! に通知されない（ハンドルを閉じるまで）ので、見張りはその筋を捕まえられない。
+//!
+//! **既知の制限**: 一度でも運用モードにした木では、すべてのフォルダに印があり、設定モードの
+//! 利用者はフォルダをフォルダごと消せない（中身は消せる）。tstore の日次ファイル・LogPrune・
+//! banto の backup の一覧・audit spool は名前のパターンで選ぶので印を拾わない。
 //!
 //! # 記述子の確かめ直し（`PinnedDir::recheck`、設計 §2.9 (b)(d)）
 //!
@@ -164,8 +182,11 @@ pub enum TreeProblem {
     /// かけたフォルダの中に SYSTEM が作るファイルは SYSTEM の鍵で暗号化され、設定モードに
     /// 戻った利用者が読めなくなる。Fable-2 C-4）。1 周目・2 周目だけ（緩めるときは見ない）。
     Encrypted { path: PathBuf },
-    /// 深さの上限（512 段）を超えた。その下は見ていない。
+    /// 深さの上限（64 段。`acl` の `MAX_DEPTH`）を超えた。その下は見ていない。
     TooDeep { path: PathBuf },
+    /// 印のファイルの名前（[`MARKER_NAME`]）をフォルダが塞いでいて、印を置けない（1 周目・
+    /// 2 周目。利用者が設定モードで作った物）。
+    MarkerOccupied { path: PathBuf },
 }
 
 impl TreeProblem {
@@ -177,7 +198,8 @@ impl TreeProblem {
             | Self::Denied { path }
             | Self::Busy { path, .. }
             | Self::Encrypted { path }
-            | Self::TooDeep { path } => path,
+            | Self::TooDeep { path }
+            | Self::MarkerOccupied { path } => path,
         }
     }
 }
@@ -203,6 +225,11 @@ impl std::fmt::Display for TreeProblem {
             ),
             Self::Encrypted { path } => write!(f, "{}: EFS で暗号化されています", path.display()),
             Self::TooDeep { path } => write!(f, "{}: フォルダの入れ子が深すぎます", path.display()),
+            Self::MarkerOccupied { path } => write!(
+                f,
+                "{}: 印のファイルの名前をフォルダが塞いでいます",
+                path.display()
+            ),
         }
     }
 }
@@ -272,6 +299,9 @@ pub enum MarkerError {
     DirIsReparse { tag: u32 },
     /// [`MARKER_NAME`] の名前に印でない物がある（フォルダ・リンク・ハードリンク）。
     Occupied(Refusal),
+    /// 既にある印を誰かが書き込み・削除の権利で開いている（共有違反 32／ロック違反 33。設定
+    /// モードで利用者が置いた偽の印を握っている筋）。
+    Busy { os_error: u32 },
     /// 作る・書く・読むの失敗。
     Io(SafeRootError),
 }
@@ -284,6 +314,7 @@ impl std::fmt::Display for MarkerError {
                 "フォルダが外からリンク（reparse point、tag {tag:#010x}）に変えられました"
             ),
             Self::Occupied(refusal) => write!(f, "印のファイルの名前が使えません: {refusal}"),
+            Self::Busy { os_error } => write!(f, "印のファイルが使用中です（os error {os_error}）"),
             Self::Io(error) => write!(f, "印のファイルを置けませんでした: {error}"),
         }
     }

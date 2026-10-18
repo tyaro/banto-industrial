@@ -130,7 +130,7 @@
 //!   **開けない子**（利用者が Administrators を拒否した・所有権が無い。`ERROR_ACCESS_DENIED`）は
 //!   特権を有効にせず、触らず飛ばして [`ResetSkips::denied`] に記録する（監査 Should 1。そのまま
 //!   残る）。消えた子は飛ばし、それ以外の失敗は fail closed。ファイルには継承のフラグ（`OICI`）を
-//!   外した記述子を書く（監査 Nit 4。フォルダは `OICI`）。再帰の深さは上限 512 で、超えたら
+//!   外した記述子を書く（監査 Nit 4。フォルダは `OICI`）。再帰の深さは上限 64 で、超えたら
 //!   1 で止める（監査 Nit 1。とても深いフォルダでスタックをあふれさせない）。
 //!   - 【測った事実・自前の再帰】`PinnedDir::reset_acl` は、中の普通の子（孫まで）へ保護された
 //!     DACL と Administrators 所有を書き、子のジャンクションとハードリンクは飛ばして
@@ -878,7 +878,8 @@ impl PinnedDir {
             on_skip: imp::OnSkip::Record,
             order: imp::Order::RootFirst,
             write: None,
-            refuse_encrypted: true,
+            strict: true,
+            place_markers: false,
             stop,
             progress,
             counts: Progress {
@@ -946,7 +947,8 @@ impl PinnedDir {
                 file_sd: &file_sd,
                 marker_sd: &marker_sd,
             }),
-            refuse_encrypted: true,
+            strict: true,
+            place_markers: true,
             stop,
             progress,
             counts: Progress {
@@ -999,7 +1001,8 @@ impl PinnedDir {
                 file_sd: &file_sd,
                 marker_sd: &marker_sd,
             }),
-            refuse_encrypted: false,
+            strict: false,
+            place_markers: false,
             stop: &|| StopSignal::None,
             progress,
             counts: Progress {
@@ -1025,8 +1028,11 @@ impl PinnedDir {
     /// 印のファイル（[`crate::mode::MARKER_NAME`]）を、このフォルダに**無ければ置く**（設計
     /// §2.9 (a)）: 空のファイルを、SYSTEM・Administrators だけ・所有者 Administrators・利用者の
     /// ACE なしの記述子を**作るのと同時に**付けて、握ったハンドル基準で作る。既にあれば、
-    /// ファイル・reparse point でない・リンク数 1 を確かめて記述子を印の形に書き直す（設定モードで
-    /// 管理者が触った場合に揃える）。合わなければ [`crate::mode::MarkerError::Occupied`]。
+    /// 共有 READ だけ・`DELETE` を求めて開き（利用者が書き込み・削除で握っていれば
+    /// [`crate::mode::MarkerError::Busy`]）、ファイル・reparse point でない・リンク数 1 を確かめて
+    /// 記述子を印の形に書き直す（設定モードで管理者・利用者が触った場合に揃える）。合わなければ
+    /// [`crate::mode::MarkerError::Occupied`]。2 周目（`close_tree`）は木の**すべての**フォルダに
+    /// 同じ印を置くので、締めた直後のフォルダでは `Existed` になる。
     ///
     /// 置いた後（既にあった後）に、**握ったこのハンドルで自分の reparse 属性を読み直し**、
     /// reparse point なら [`crate::mode::MarkerError::DirIsReparse`]（印を置く前に、締める前から
@@ -1036,41 +1042,27 @@ impl PinnedDir {
     pub fn ensure_marker(
         &self,
     ) -> std::result::Result<crate::mode::MarkerOutcome, crate::mode::MarkerError> {
-        use crate::mode::{MarkerError, MarkerOutcome, MARKER_NAME};
-        let own_reparse = |fallback: MarkerError| -> MarkerError {
+        use crate::mode::MarkerError;
+        let own_reparse = || -> Option<MarkerError> {
             match crate::handle_io::facts(self.handle.raw()) {
-                Ok(facts) if facts.is_reparse => MarkerError::DirIsReparse {
+                Ok(facts) if facts.is_reparse => Some(MarkerError::DirIsReparse {
                     tag: facts.reparse_tag,
-                },
-                _ => fallback,
+                }),
+                _ => None,
             }
         };
-        let outcome = match imp::create_child_file(self, MARKER_NAME, b"") {
-            Ok(Some(created)) => {
-                drop(created);
-                MarkerOutcome::Created
-            }
-            Ok(None) => {
-                // 既にある。印でない物（フォルダ・リンク・ハードリンク）なら断り、印なら記述子を
-                // 印の形に書き直す（開いたハンドルで属性を読み直してから）。
-                let existing = imp::open_child_file_for_update(self, MARKER_NAME)
-                    .map_err(MarkerError::Io)?
-                    .ok_or_else(|| {
-                        MarkerError::Io(SafeRootError::io(
-                            crate::error::IoOp::OpenFile,
-                            &std::io::Error::from(std::io::ErrorKind::NotFound),
-                        ))
-                    })?;
-                let facts =
-                    crate::handle_io::facts(existing.handle.raw()).map_err(MarkerError::Io)?;
-                if let Some(refusal) = crate::handle_io::file_refusal(&facts) {
-                    return Err(MarkerError::Occupied(refusal));
+        let outcome = match imp::place_marker(self.handle.raw()) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                if let Some(error) = own_reparse() {
+                    return Err(error);
                 }
-                existing.reset_acl().map_err(MarkerError::Io)?;
-                drop(existing);
-                MarkerOutcome::Existed
+                return Err(match failure {
+                    imp::MarkerFailure::Occupied(refusal) => MarkerError::Occupied(refusal),
+                    imp::MarkerFailure::Busy(os_error) => MarkerError::Busy { os_error },
+                    imp::MarkerFailure::Io(error) => MarkerError::Io(error),
+                });
             }
-            Err(error) => return Err(own_reparse(MarkerError::Io(error))),
         };
         let facts = crate::handle_io::facts(self.handle.raw()).map_err(MarkerError::Io)?;
         if facts.is_reparse {
@@ -1903,6 +1895,81 @@ pub(crate) mod imp {
         owned_protected_sd(&DirAccess::service_only(), false)
     }
 
+    /// [`place_marker`] が置けなかった理由。
+    pub(crate) enum MarkerFailure {
+        /// [`crate::mode::MARKER_NAME`] の名前に印でない物（フォルダ・リンク・ハードリンク）がある。
+        Occupied(crate::error::Refusal),
+        /// 既にある印を、誰かが書き込み・削除の権利で開いている（共有違反 32／ロック違反 33。
+        /// 利用者が設定モードで作った偽の印を DELETE のハンドルで握っている筋）。
+        Busy(u32),
+        Io(SafeRootError),
+    }
+
+    /// `parent`（開いているフォルダのハンドル）に印のファイルを置く（設計 §2.9 (a)。
+    /// `PinnedDir::ensure_marker` と 2 周目の [`walk_dir`] が共有）:
+    ///
+    /// - 無ければ、SYSTEM・Administrators だけ・所有者 Administrators・利用者の ACE なしの
+    ///   記述子（[`marker_descriptor`]）を**作るのと同時に**付けて、相対で作る。
+    /// - 作れなかったら、名前がフォルダ・リンク・ハードリンクで塞がっていないかを属性だけで
+    ///   開いて確かめ、塞がっていれば [`MarkerFailure::Occupied`]（`FILE_NON_DIRECTORY_FILE` の
+    ///   作成は、既にあるフォルダでは衝突ではなく拒否（5）になるため）。
+    /// - 既にあれば、**共有 READ だけ・`DELETE` を求めて**開く（利用者が書き込み・削除の権利で
+    ///   握っていれば共有違反 → [`MarkerFailure::Busy`]。設定モードで利用者が置いた偽の印を古い
+    ///   `DELETE` のハンドルで後から消し、フォルダを空にして reparse 化する筋を止める）。開いた
+    ///   ハンドルで属性を読み直して印の形（ファイル・reparse でない・リンク数 1）を確かめ、
+    ///   印の記述子を**そのハンドルで**書き直す（持っている間は誰も新しく握れない）。
+    ///
+    /// 置いた後のフォルダ自身の reparse 属性の読み直しは呼ぶ側。
+    pub(crate) fn place_marker(
+        parent: HANDLE,
+    ) -> std::result::Result<crate::mode::MarkerOutcome, MarkerFailure> {
+        use crate::handle_io::{facts, file_refusal};
+        use crate::mode::{MarkerOutcome, MARKER_NAME};
+        let sd = marker_descriptor().map_err(MarkerFailure::Io)?;
+        match child_relative_handle(parent, MARKER_NAME, ChildHow::CreateFile(Some(&sd))) {
+            Ok(Some(created)) => {
+                drop(created);
+                return Ok(MarkerOutcome::Created);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let occupied =
+                    match child_relative_handle(parent, MARKER_NAME, ChildHow::OpenAttributes) {
+                        Ok(Some(existing)) => {
+                            facts(existing.raw()).ok().and_then(|f| file_refusal(&f))
+                        }
+                        _ => None,
+                    };
+                return Err(match occupied {
+                    Some(refusal) => MarkerFailure::Occupied(refusal),
+                    None => MarkerFailure::Io(error),
+                });
+            }
+        }
+        let existing = match child_relative_handle(parent, MARKER_NAME, ChildHow::OpenFileForUpdate)
+        {
+            Ok(Some(existing)) => existing,
+            Ok(None) => {
+                return Err(MarkerFailure::Io(SafeRootError::io(
+                    IoOp::OpenFile,
+                    &std::io::Error::from(std::io::ErrorKind::NotFound),
+                )))
+            }
+            Err(SafeRootError::Io {
+                os_error: Some(os_error @ (32 | 33)),
+                ..
+            }) => return Err(MarkerFailure::Busy(os_error as u32)),
+            Err(error) => return Err(MarkerFailure::Io(error)),
+        };
+        let info = facts(existing.raw()).map_err(MarkerFailure::Io)?;
+        if let Some(refusal) = file_refusal(&info) {
+            return Err(MarkerFailure::Occupied(refusal));
+        }
+        set_object_security(existing.raw(), &sd).map_err(MarkerFailure::Io)?;
+        drop(existing);
+        Ok(MarkerOutcome::Existed)
+    }
+
     /// 木を歩くときに、締められない・確かめられない物に会ったら止めるか記録して続けるか
     /// （設計 §2.4 の末尾。**既定を置かない** - 取り違えると締めたつもりで穴が残るため、
     /// 呼ぶ側が必ず選ぶ）。
@@ -1942,8 +2009,13 @@ pub(crate) mod imp {
         pub(crate) on_skip: OnSkip,
         pub(crate) order: Order,
         pub(crate) write: Option<WriteSet<'a>>,
-        /// EFS で暗号化された物を問題にするか（1 周目・2 周目は真、緩める・修復は偽）。
-        pub(crate) refuse_encrypted: bool,
+        /// 厳しい確かめ（1 周目・2 周目は真、緩める・修復は偽）: EFS で暗号化された物と、
+        /// [`crate::mode::MARKER_NAME`] の名前のフォルダ（印を置けない）を問題にする。
+        pub(crate) strict: bool,
+        /// フォルダに書いた直後・列挙の前に印のファイルを置く（2 周目だけ。[`place_marker`]。
+        /// 締めた直後に古い書き込みのハンドルで空のフォルダを reparse にされる筋（Codex P1）を、
+        /// 「空のフォルダを残さない」ことで塞ぐ）。
+        pub(crate) place_markers: bool,
         /// 止める合図（各フォルダの境で 1 回見る）。
         pub(crate) stop: &'a dyn Fn() -> StopSignal,
         /// 進み具合の報告（子を開いて数えるごとに 1 回。`examined` は単調に増える。`written` は
@@ -2011,8 +2083,12 @@ pub(crate) mod imp {
     }
 
     /// 自前の再帰の深さの上限（監査 Nit 1。超えた段は見ない・書かない。インストール利用者が
-    /// とても深いフォルダを作ってスタックをあふれさせるのを防ぐ）。
-    const MAX_DEPTH: u32 = 512;
+    /// とても深いフォルダを作ってスタックをあふれさせるのを防ぐ）。#623 PR-1c で 512 から 64 に
+    /// 下げた: 1 段ごとに `walk_dir` → 列挙 → `visit_child` → `visit_opened` の 4 つのフレームを
+    /// 重ねるので、512 段ではサービス・テストの主スレッド（Windows の既定 1 MiB）でデバッグ
+    /// ビルドがあふれた。管理する木（ChronoGazer・Hub）は 4 段以下で、64 段に届く木は利用者が
+    /// 作った入れ子だけ（1 周目が `TooDeep` で断る）。
+    pub(crate) const MAX_DEPTH: u32 = 64;
 
     /// 列挙した子 1 件（[`enumerate_dir`]）。`.`・`..` は含めない。
     pub(crate) struct DirEntryRaw {
@@ -2132,6 +2208,9 @@ pub(crate) mod imp {
                 let sd = set.dir_sd;
                 walk.write(dir_handle, sd, depth > 0)?;
             }
+            if walk.place_markers {
+                place_marker_in_walk(walk, dir_handle, display)?;
+            }
         }
         enumerate_dir(dir_handle, &mut |entry| {
             visit_child(
@@ -2148,6 +2227,52 @@ pub(crate) mod imp {
                 let sd = set.dir_sd;
                 walk.write(dir_handle, sd, depth > 0)?;
             }
+        }
+        Ok(())
+    }
+
+    /// 2 周目: フォルダに書いた直後・列挙の前に印を置き（[`place_marker`]）、置けた後に
+    /// **そのフォルダの属性をハンドルで読み直す**（Codex P1）。締めた後は利用者が名前を作れないが、
+    /// 締める前から開いていた書き込みのハンドルで**空の**フォルダは reparse にできる。印を置いた
+    /// 後は空でないので reparse にできず、印は利用者に消せない。置けなかったときは、その間に
+    /// reparse にされていればそれを理由に（[`TreeProblem::ReparsePoint`]）、印の名前が塞がって
+    /// いれば [`TreeProblem::MarkerOccupied`]、偽の印が握られていれば [`TreeProblem::Busy`]。
+    fn place_marker_in_walk(
+        walk: &mut Walk<'_>,
+        dir_handle: HANDLE,
+        display: &Path,
+    ) -> std::result::Result<(), WalkStop> {
+        let reparse_now = |handle: HANDLE| -> Option<TreeProblem> {
+            match info_of(handle) {
+                Ok(info) if info.is_reparse => Some(TreeProblem::ReparsePoint {
+                    path: display.to_path_buf(),
+                    tag: info.reparse_tag,
+                }),
+                _ => None,
+            }
+        };
+        if let Err(failure) = place_marker(dir_handle) {
+            if let Some(problem) = reparse_now(dir_handle) {
+                return walk.problem(problem);
+            }
+            return match failure {
+                MarkerFailure::Occupied(_) => walk.problem(TreeProblem::MarkerOccupied {
+                    path: display.join(crate::mode::MARKER_NAME),
+                }),
+                MarkerFailure::Busy(os_error) => walk.problem(TreeProblem::Busy {
+                    path: display.join(crate::mode::MARKER_NAME),
+                    os_error,
+                }),
+                MarkerFailure::Io(error) => Err(WalkStop::Io(error)),
+            };
+        }
+        // 置けた後にも読み直す（置けた後は reparse 化できないはずだが、多重の防御）。
+        let info = info_of(dir_handle)?;
+        if info.is_reparse {
+            return walk.problem(TreeProblem::ReparsePoint {
+                path: display.to_path_buf(),
+                tag: info.reparse_tag,
+            });
         }
         Ok(())
     }
@@ -2211,8 +2336,14 @@ pub(crate) mod imp {
                 links: opened.links,
             });
         }
-        if walk.refuse_encrypted && opened.encrypted {
+        if walk.strict && opened.encrypted {
             return walk.problem(TreeProblem::Encrypted {
+                path: display_child.to_path_buf(),
+            });
+        }
+        if walk.strict && opened.is_dir && name == crate::mode::MARKER_NAME {
+            // 印の名前をフォルダが塞いでいる（印を置けない。利用者が設定モードで作った物）。
+            return walk.problem(TreeProblem::MarkerOccupied {
                 path: display_child.to_path_buf(),
             });
         }
@@ -2263,7 +2394,8 @@ pub(crate) mod imp {
                 file_sd: &file_sd,
                 marker_sd: &marker_sd,
             }),
-            refuse_encrypted: false,
+            strict: false,
+            place_markers: false,
             stop: &|| StopSignal::None,
             progress: &mut |_| {},
             counts: Progress::default(),
@@ -2290,6 +2422,7 @@ pub(crate) mod imp {
                 TreeProblem::Denied { path } => skips.denied.push(path),
                 other @ (TreeProblem::Busy { .. }
                 | TreeProblem::Encrypted { .. }
+                | TreeProblem::MarkerOccupied { .. }
                 | TreeProblem::TooDeep { .. }) => return Err(walk_problem_error(other)),
             }
         }
@@ -2956,6 +3089,16 @@ pub(crate) mod imp {
         name: &str,
         how: ChildHow<'_>,
     ) -> Result<Option<OwnedHandle>> {
+        child_relative_handle(parent.handle.raw(), name, how)
+    }
+
+    /// [`child_relative`] の、親を生のハンドルで受ける形（木を歩く部品が、ID で開いた子の
+    /// フォルダに印を置くため。#623 PR-1c の Codex P1）。`parent` は開いているフォルダのハンドル。
+    pub(crate) fn child_relative_handle(
+        parent: HANDLE,
+        name: &str,
+        how: ChildHow<'_>,
+    ) -> Result<Option<OwnedHandle>> {
         use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
         use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_IF;
         use windows_sys::Wdk::Storage::FileSystem::{
@@ -3081,7 +3224,7 @@ pub(crate) mod imp {
         };
         let attributes = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: parent.handle.raw(),
+            RootDirectory: parent,
             ObjectName: &unicode,
             Attributes: OBJ_CASE_INSENSITIVE,
             SecurityDescriptor: descriptor.map_or(std::ptr::null(), |sd| sd.0 as *const _),

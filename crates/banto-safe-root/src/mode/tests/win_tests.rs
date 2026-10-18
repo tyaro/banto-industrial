@@ -126,6 +126,26 @@ fn make_tree(root: &Path) {
 
 /// `make_tree` の物の数（ルートを含む）。
 const TREE_OBJECTS: u64 = 11;
+/// 2 周目の後の物の数: `deep`・`logs` にも印が置かれる（+2）。
+const CLOSED_OBJECTS: u64 = TREE_OBJECTS + 2;
+
+/// 木のすべてのフォルダに印のファイル（ファイル・リンク数 1・利用者の ACE なし）があること。
+fn every_dir_has_a_marker(root: &Path) {
+    for (path, security) in tree_snapshot(root) {
+        let security = security.unwrap_or_else(|| panic!("{} を読めない", path.display()));
+        if security.is_dir && !security.is_reparse_point {
+            let marker = inspect_file(&path.join(MARKER_NAME))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{} に印が無い", path.display()));
+            assert!(!marker.is_dir && marker.links == 1 && !marker.is_reparse_point);
+            assert!(
+                exposure(&marker).is_empty(),
+                "{}: {marker:?}",
+                path.display()
+            );
+        }
+    }
+}
 
 fn outside_with_victim() -> (tempfile::TempDir, PathBuf) {
     let outside = tempfile::tempdir().unwrap();
@@ -614,14 +634,14 @@ fn scan_passes_or_reports_busy_for_a_child_held_with_delete() {
     );
 }
 
-/// 1 周目は 512 段を超える木を `TooDeep` で断る（その下は見ない）。
+/// 1 周目は上限（`MAX_DEPTH` 段）を超える木を `TooDeep` で断る（その下は見ない）。
 #[test]
 fn scan_refuses_a_tree_deeper_than_the_limit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let mut deep = root.clone();
-    for _ in 0..513 {
+    for _ in 0..=crate::acl::imp::MAX_DEPTH {
         deep.push("d");
     }
     std::fs::create_dir_all(&deep).unwrap();
@@ -636,7 +656,12 @@ fn scan_refuses_a_tree_deeper_than_the_limit() {
         "{problems:?}"
     );
     let depth = problems[0].path().components().count() - pinned.final_path().components().count();
-    assert_eq!(depth, 512, "{}", problems[0].path().display());
+    assert_eq!(
+        depth as u32,
+        crate::acl::imp::MAX_DEPTH,
+        "{}",
+        problems[0].path().display()
+    );
 }
 
 /// 1 周目は EFS で暗号化された物を断る（EFS が使えない PC・方針では skip）。
@@ -1045,13 +1070,14 @@ fn close_tree_writes_the_operation_shape_and_a_limited_user_cannot_write_or_rela
     assert_eq!(
         progress,
         Progress {
-            examined: TREE_OBJECTS,
-            written: TREE_OBJECTS
+            examined: CLOSED_OBJECTS,
+            written: CLOSED_OBJECTS
         }
     );
-    assert_eq!(ticks.len() as u64, TREE_OBJECTS - 1, "子 1 つごとに 1 回");
+    assert_eq!(ticks.len() as u64, CLOSED_OBJECTS - 1, "子 1 つごとに 1 回");
     assert!(ticks.windows(2).all(|w| w[0].examined < w[1].examined));
     expect_tree_shape(&root, mode.operation());
+    every_dir_has_a_marker(&root);
     assert_eq!(pinned.recheck(mode.operation()), Ok(()));
     assert!(matches!(
         pinned.recheck(mode.setting()),
@@ -1090,7 +1116,7 @@ fn close_tree_writes_the_operation_shape_and_a_limited_user_cannot_write_or_rela
 
     let mut relax_ticks = 0u64;
     let report = pinned.relax_tree(&mode, &mut |_| relax_ticks += 1).unwrap();
-    assert_eq!(report.written, TREE_OBJECTS);
+    assert_eq!(report.written, CLOSED_OBJECTS);
     assert!(report.skipped.is_empty(), "{report:?}");
     expect_tree_shape(&root, mode.setting());
     assert_eq!(
@@ -1123,7 +1149,8 @@ fn close_tree_writes_the_operation_shape_and_a_limited_user_cannot_write_or_rela
     });
     // 緩い木に対しても冪等。
     let again = pinned.relax_tree(&mode, &mut |_| {}).unwrap();
-    assert_eq!(again.written, TREE_OBJECTS);
+    assert_eq!(again.written, CLOSED_OBJECTS);
+    every_dir_has_a_marker(&root);
     expect_tree_shape(&root, mode.setting());
 }
 
@@ -1173,7 +1200,7 @@ fn close_tree_aborts_on_a_link_planted_between_passes_and_relax_restores_the_set
         })
     );
     assert!(
-        abort.written >= 2 && abort.written < TREE_OBJECTS,
+        abort.written >= 2 && abort.written < CLOSED_OBJECTS,
         "{abort:?}"
     );
     // ルートは締まっている（デスクトップは Operation と見る）。
@@ -1227,9 +1254,9 @@ fn relax_tree_writes_the_root_last() {
     });
     let report = pinned.relax_tree(&mode, &mut |_| {});
     crate::acl::imp::AFTER_CHILD_WRITTEN.with(|hook| *hook.borrow_mut() = None);
-    assert_eq!(report.unwrap().written, TREE_OBJECTS);
+    assert_eq!(report.unwrap().written, CLOSED_OBJECTS);
     let observed = observed.lock().unwrap();
-    assert_eq!(observed.len() as u64, TREE_OBJECTS - 1, "{observed:?}");
+    assert_eq!(observed.len() as u64, CLOSED_OBJECTS - 1, "{observed:?}");
     for (written, seen) in observed.iter() {
         assert_eq!(
             *seen,
@@ -1270,17 +1297,19 @@ fn close_tree_stops_at_a_directory_boundary_and_relax_restores_after_stop() {
         let abort = pinned.close_tree(&mode, &stop, &mut |_| {}).unwrap_err();
         assert_eq!(abort.reason, AbortReason::Stopped(signal), "{signal:?}");
         assert!(
-            abort.written >= 1 && abort.written < TREE_OBJECTS,
+            abort.written >= 1 && abort.written < CLOSED_OBJECTS,
             "{abort:?}"
         );
         // 締めかけ: ルートは締まっている、下の一部（まだ辿っていないフォルダの中）は緩い。
+        // 「緩い」は形で数える（保護されていない = 親から継承したまま。所有者で数えると、管理者が
+        // 作った物は最初から Administrators なので CI で数えられない）。
         assert_eq!(
             classify_mode(&observe_root(&root).unwrap(), &me()),
             ModeObservation::Operation
         );
         let loose = tree_snapshot(&root)
             .into_iter()
-            .filter(|(_, s)| s.as_ref().unwrap().dacl.owner != ADMINISTRATORS_SID)
+            .filter(|(_, s)| !s.as_ref().unwrap().dacl.protected)
             .count();
         assert!(loose > 0, "{signal:?}: 全部締まっている");
         if signal == StopSignal::Stop {
@@ -1344,7 +1373,7 @@ fn a_child_moved_out_after_enumeration_keeps_its_descriptor_in_close_and_relax()
         };
         crate::acl::imp::BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
         assert!(to.exists(), "{phase}: フックが動いていない");
-        assert_eq!(result, Ok(TREE_OBJECTS - 1), "{phase}");
+        assert_eq!(result, Ok(CLOSED_OBJECTS - 1), "{phase}");
         assert_eq!(
             inspect_file(&to).unwrap().unwrap(),
             before,
@@ -1375,6 +1404,24 @@ fn ensure_marker_places_a_marker_and_detects_a_dir_reparsed_before_it() {
     assert!(exposure(&marker).is_empty(), "{marker:?}");
     assert_eq!(marker.dacl.owner, ADMINISTRATORS_SID);
     assert_eq!(held.ensure_marker(), Ok(MarkerOutcome::Existed));
+    // 既にある印を誰かが DELETE で握っていれば `Busy`（偽の印を古いハンドルで消す筋を止める）。
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        };
+        let holder = open_dir(
+            &data.join(MARKER_NAME),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+        )
+        .unwrap();
+        assert_eq!(
+            held.ensure_marker(),
+            Err(MarkerError::Busy { os_error: 32 })
+        );
+        drop(holder);
+        assert_eq!(held.ensure_marker(), Ok(MarkerOutcome::Existed));
+    }
     // 置いた後は、古い書き込みハンドルでも reparse 化できない。
     let old = open_dir(&data, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
     assert_eq!(
@@ -1426,6 +1473,10 @@ fn recheck_notices_a_held_dir_turned_into_a_junction() {
     // 移す（管理者のテスト `close_tree_...` で `Ok` を確かめる）。
     let tightened = dir.path().join("tightened");
     std::fs::create_dir(&tightened).unwrap();
+    // 管理者（CI）が作った物の所有者は Administrators なので、利用者へ移してから。
+    if inspect_file(&tightened).unwrap().unwrap().dacl.owner != me().as_str() {
+        crate::root::win_tests::set_owner_to_me(&tightened);
+    }
     let held_tightened = pinned(&tightened);
     reset_dir_acl(&tightened, &expected).unwrap();
     assert!(matches!(
@@ -1564,10 +1615,17 @@ fn local_system_closes_a_tree_without_take_ownership_privileges() {
     });
     eprintln!("実測（SYSTEM）: {result}");
     assert!(
-        result.contains("\nuser=S-1-5-18\n"),
+        result.lines().any(|line| line == "user=S-1-5-18"),
         "SYSTEM で走っていない: {result}"
     );
-    assert!(result.contains("\nclose=ok"), "{result}");
+    assert!(
+        result.lines().any(|line| line.starts_with("close=ok")),
+        "{result}"
+    );
+    assert!(
+        result.lines().any(|line| line == "root_owner=S-1-5-32-544"),
+        "{result}"
+    );
     expect_tree_shape(&root, mode().operation());
     // 片付け（管理者なので緩められる）。
     pinned(&root).relax_tree(&mode(), &mut |_| {}).unwrap();
@@ -1730,5 +1788,147 @@ fn ten_thousand_files_scan_close_relax_timing() {
     eprintln!(
         "1 周目 + 2 周目 = {:?}（目標 15 秒）",
         scan_time + close_time
+    );
+}
+
+// --- Codex P1: 締めた直後の空のフォルダ（印を全フォルダに置く） ---------------------
+
+/// 1 周目は、印の名前（`MARKER_NAME`）をフォルダが塞いでいれば `MarkerOccupied` で断る
+/// （2 周目で印を置けないため。管理者でなくても走る）。
+#[test]
+fn scan_refuses_a_directory_occupying_the_marker_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    make_tree(&root);
+    std::fs::create_dir(root.join("logs").join(MARKER_NAME)).unwrap();
+    let pinned = pinned(&root);
+    let refusal = pinned.scan_tree(&no_stop, &mut |_| {}).unwrap_err();
+    assert_eq!(
+        refusal,
+        ScanRefusal::Problems(vec![TreeProblem::MarkerOccupied {
+            path: pinned.final_path().join("logs").join(MARKER_NAME)
+        }])
+    );
+}
+
+/// Codex P1: 2 周目は**すべての**フォルダ（印の無かった `logs`・`deep`・空の `data\empty` を含む）に
+/// 印を置くので、締める前から開いていた書き込みのハンドルでも、締めた後に reparse 化できない
+/// （`ERROR_DIR_NOT_EMPTY`）。印は利用者の ACE なし。
+#[test]
+fn close_tree_places_a_marker_in_every_directory_so_old_write_handles_cannot_reparse() {
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    if !is_elevated_admin() {
+        eprintln!("skip: 所有者を移すのは管理者だけ（CI で確かめる）");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (outside, victim) = outside_with_victim();
+    let root = dir.path().join("root");
+    make_tree(&root);
+    let empty = root.join("data").join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let old_empty = open_dir(&empty, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
+    let old_logs = open_dir(
+        &root.join("logs"),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+    .unwrap();
+    let mode = mode();
+    let pinned = pinned(&root);
+    let progress = pinned.close_tree(&mode, &no_stop, &mut |_| {}).unwrap();
+    // 11 + empty + 印 3 つ（deep・logs・empty）。
+    assert_eq!(progress.written, CLOSED_OBJECTS + 2, "{progress:?}");
+    every_dir_has_a_marker(&root);
+    expect_tree_shape(&root, mode.operation());
+    assert_eq!(
+        os_error_of(&set_reparse_on_handle(old_empty.0, outside.path())),
+        Some(DIR_NOT_EMPTY)
+    );
+    assert_eq!(
+        os_error_of(&set_reparse_on_handle(old_logs.0, outside.path())),
+        Some(DIR_NOT_EMPTY)
+    );
+    assert!(!inspect_file(&empty).unwrap().unwrap().is_reparse_point);
+    assert!(victim.exists());
+    // 緩めても印は残り、空だったフォルダも以後は reparse にできない。
+    pinned.relax_tree(&mode, &mut |_| {}).unwrap();
+    every_dir_has_a_marker(&root);
+    assert_eq!(
+        os_error_of(&set_reparse_on_handle(old_empty.0, outside.path())),
+        Some(DIR_NOT_EMPTY)
+    );
+}
+
+/// Codex P1 の窓: フォルダに書いた直後・印を置く前に、古い書き込みのハンドルで reparse に
+/// された（`AFTER_CHILD_WRITTEN` のフックで `empty` を書いた直後に変える）→ 印を置けず、属性の
+/// 読み直しで `ReparsePoint` として止まる（`Io` ではなく理由が分かる形）。緩め直すとジャンクション
+/// だけ飛ばして残りは設定モードの形。外は変わらない。
+#[test]
+fn close_tree_aborts_when_a_dir_is_reparsed_right_after_it_is_tightened() {
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    if !is_elevated_admin() {
+        eprintln!("skip: 所有者を移すのは管理者だけ（CI で確かめる）");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (outside, _victim) = outside_with_victim();
+    let outside_before = tree_snapshot(outside.path());
+    let root = dir.path().join("root");
+    make_tree(&root);
+    let empty = root.join("data").join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let old_empty = open_dir(&empty, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE).unwrap();
+    let mode = mode();
+    let pinned = pinned(&root);
+    let real_empty = pinned.final_path().join("data").join("empty");
+    let swapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (swapped_for_hook, outside_for_hook, old_raw) = (
+        swapped.clone(),
+        outside.path().to_path_buf(),
+        old_empty.0 as usize,
+    );
+    crate::acl::imp::AFTER_CHILD_WRITTEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |handle| {
+            let written = crate::acl::imp::final_path_of(handle).unwrap();
+            if written.file_name().is_some_and(|n| n == "empty")
+                && !swapped_for_hook.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                set_reparse_on_handle(old_raw as HANDLE, &outside_for_hook).unwrap();
+            }
+        }));
+    });
+    let aborted = pinned.close_tree(&mode, &no_stop, &mut |_| {});
+    crate::acl::imp::AFTER_CHILD_WRITTEN.with(|hook| *hook.borrow_mut() = None);
+    assert!(
+        swapped.load(std::sync::atomic::Ordering::SeqCst),
+        "フックが動いていない"
+    );
+    let abort = aborted.unwrap_err();
+    assert_eq!(
+        abort.reason,
+        AbortReason::Problem(TreeProblem::ReparsePoint {
+            path: real_empty.clone(),
+            tag: TAG_MOUNT_POINT
+        })
+    );
+    assert!(!outside.path().join(MARKER_NAME).exists(), "外に印を作った");
+    let report = pinned.relax_tree(&mode, &mut |_| {}).unwrap();
+    assert_eq!(
+        report.skipped,
+        vec![TreeProblem::ReparsePoint {
+            path: real_empty.clone(),
+            tag: TAG_MOUNT_POINT
+        }]
+    );
+    drop(old_empty);
+    std::fs::remove_dir(&empty).unwrap();
+    expect_tree_shape(&root, mode.setting());
+    assert_eq!(
+        tree_snapshot(outside.path()),
+        outside_before,
+        "外が変わった"
     );
 }
