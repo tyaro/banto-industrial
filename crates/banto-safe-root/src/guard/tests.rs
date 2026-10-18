@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::acl::{ObservedAce, ObservedDacl, ACCESS_ALLOWED_ACE_TYPE, FULL_ACCESS_MASK};
+use crate::acl::{
+    ObservedAce, ObservedDacl, ACCESS_ALLOWED_ACE_TYPE, FULL_ACCESS_MASK, MODIFY_ACCESS_MASK,
+};
 
 const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 const OTHER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1002";
