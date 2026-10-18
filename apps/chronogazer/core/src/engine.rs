@@ -209,6 +209,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -467,6 +468,102 @@ pub struct EngineServices {
     /// 最後に一貫して読めた LAN の状態（`GET /api/settings/server` が適用の途中に返す。
     /// `crate::server_admin::LanStatusCache`）。
     pub lan_status: LanStatusCache,
+    /// バックアップの REST の受け付けの門（[`BackupGate`]。#623 PR-3）。
+    pub backup_gate: Arc<BackupGate>,
+}
+
+/// バックアップの REST（`/api/backups` の下の作る・適用する・予約を消す）の受け付けの門
+/// （#623 PR-3、設計 §3.2 の 1）。サービスが STOP で設定モードへ戻すとき、**新しい受け付けを
+/// 止め、進行中の物（`VACUUM INTO`・restore の適用）が終わるのを待つ**ために使う（決定 1。
+/// 打ち切らない）。ルーターの最外の層（[`EngineServices::router`]）が、`GET` 以外の
+/// `/api/backups…` の要求ごとに [`BackupGate::try_enter`] を通す。閉じた後の要求は 503。
+#[derive(Debug, Default)]
+pub struct BackupGate {
+    inflight: AtomicUsize,
+    closed: AtomicBool,
+    idle: tokio::sync::Notify,
+}
+
+/// [`BackupGate::try_enter`] が返す、進行中の印（drop で数を戻す）。
+pub struct BackupGuard(Arc<BackupGate>);
+
+impl Drop for BackupGuard {
+    fn drop(&mut self) {
+        if self.0.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl BackupGate {
+    /// 新しい受け付けを止める（戻さない。止めた後に始まる要求は 503）。
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// 受け付けを止めているか。
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// 進行中の数。
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Acquire)
+    }
+
+    /// 受け付ける（止めていなければ）。印を持っている間が「進行中」。
+    pub fn try_enter(self: &Arc<Self>) -> Option<BackupGuard> {
+        if self.is_closed() {
+            return None;
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        // 数えた後に閉じられていたら、数を戻して断る（閉じた側が「0 になった」を見逃さない）。
+        if self.is_closed() {
+            drop(BackupGuard(self.clone()));
+            return None;
+        }
+        Some(BackupGuard(self.clone()))
+    }
+
+    /// 進行中が 0 になるまで待つ（既に 0 ならすぐ戻る）。
+    pub async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.inflight() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// この要求を門に通すか（純関数）: `/api/backups` と、その下の `GET` 以外。
+    pub fn guards(method: &axum::http::Method, path: &str) -> bool {
+        method != axum::http::Method::GET
+            && (path == "/api/backups" || path.starts_with("/api/backups/"))
+    }
+}
+
+/// [`BackupGate`] をルーターに載せる層。
+fn backup_gate_layer(router: Router, gate: Arc<BackupGate>) -> Router {
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let gate = gate.clone();
+            async move {
+                if !BackupGate::guards(request.method(), request.uri().path()) {
+                    return next.run(request).await;
+                }
+                match gate.try_enter() {
+                    Some(_inflight) => next.run(request).await,
+                    None => axum::response::IntoResponse::into_response((
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "設定モードへ切り替えるため停止中です。バックアップの操作は受け付けません",
+                    )),
+                }
+            }
+        },
+    ))
 }
 
 impl EngineServices {
@@ -500,7 +597,7 @@ impl EngineServices {
             settings_lock: self.settings_lock.clone(),
             log_label: self.log_label,
         };
-        with_security_headers(
+        let router = backup_gate_layer(
             api_router(
                 self.users.clone(),
                 self.settings.clone(),
@@ -516,9 +613,13 @@ impl EngineServices {
                 self.events.clone(),
                 allow_setup,
                 access,
-            )
-            .merge(host_router(self.host.clone()))
-            .merge(static_router::<FrontendAssets>()),
+            ),
+            self.backup_gate.clone(),
+        );
+        with_security_headers(
+            router
+                .merge(host_router(self.host.clone()))
+                .merge(static_router::<FrontendAssets>()),
         )
     }
 }
@@ -548,6 +649,13 @@ impl EngineRuntime {
         let instance_lock =
             acquire_for_db(&cfg.db_path, cfg.host).map_err(EngineStartError::InstanceLock)?;
         Ok(LockedEngine { cfg, instance_lock })
+    }
+
+    /// 呼ぶ側が**既に取った** A1 の排他（握ったルートの中で取った
+    /// `instance_lock::acquire_for_db_in`）を引き継ぐ（サービス。#623 PR-3）。取り直さない。
+    /// `cfg.db_path` はその排他の DB（呼ぶ側の責任）。
+    pub fn lock_with(cfg: EngineConfig, instance_lock: InstanceGuard) -> LockedEngine {
+        LockedEngine { cfg, instance_lock }
     }
 
     /// [`EngineRuntime::open`] と同じだが、起動時の対処が**先に取った** A1 の排他
@@ -607,8 +715,8 @@ impl EngineRuntime {
 
         Ok(OpenedEngine {
             cfg,
-            instance_lock,
             pool,
+            instance_lock,
             applied_restore,
             recovery_note: None,
             loopback: None,
@@ -634,11 +742,14 @@ impl LockedEngine {
 
 /// DB を開けた後・サービスを組む前のエンジン（[`EngineRuntime::open`]）。
 /// デスクトップはここで窓を作る（モジュール doc「B1-2」）。drop すると pool の
-/// ハンドルと A1 の排他を返す（何も起動していない）。
+/// ハンドルと A1 の排他を返す（何も起動していない）。欄は **`pool` を `instance_lock` より
+/// 前**に置く（Rust は宣言順に drop するので、drop でも pool の方が先に手放される。
+/// 接続を同期的に閉じ終えてから排他を返すのは [`OpenedEngine::close`]。#623 PR-3、
+/// 設計 §3.1 の 5 の Fable-2 B-3）。
 pub struct OpenedEngine {
     cfg: EngineConfig,
-    instance_lock: InstanceGuard,
     pool: DbPool,
+    instance_lock: InstanceGuard,
     applied_restore: Option<AppliedRestoreInfo>,
     /// 起動時の対処の窓で選ばれた対処（[`OpenedEngine::with_recovery_note`]）。
     recovery_note: Option<RecoveryNote>,
@@ -667,12 +778,18 @@ impl OpenedEngine {
         self
     }
 
-    /// `start` せずに閉じる: pool を閉じ（ファイルのハンドルを返す）、A1 の
+    /// `start` せずに閉じる: pool を閉じ（ファイルのハンドルを返す）、**それから** A1 の
     /// 排他を返す。drop でも両方返るが、pool の接続は裏で閉じるので、続けて
-    /// DB のファイルを触る（名前を変える）前にはこちらを待つ。
+    /// DB のファイルを触る（名前を変える）前・別の host がすぐ同じ DB を開く前
+    /// （設定モードへ戻るデスクトップ）にはこちらを待つ（#623 PR-3、Fable-2 B-3）。
     pub async fn close(self) {
-        self.pool.close().await;
-        drop(self.instance_lock);
+        let OpenedEngine {
+            pool,
+            instance_lock,
+            ..
+        } = self;
+        pool.close().await;
+        drop(instance_lock);
     }
     /// 開いた pool（`start` の前に設定を読みたい host 用）。
     pub fn pool(&self) -> &DbPool {
@@ -747,8 +864,8 @@ impl OpenedEngine {
     pub async fn start(self) -> Result<RunningEngine, EngineStartError> {
         let OpenedEngine {
             cfg,
-            instance_lock,
             pool,
+            instance_lock,
             applied_restore,
             recovery_note,
             loopback,
@@ -1032,6 +1149,7 @@ impl OpenedEngine {
             settings_lock: Arc::new(AsyncMutex::new(())),
             log_label: label,
             lan_status: Arc::new(std::sync::Mutex::new(None)),
+            backup_gate: Arc::new(BackupGate::default()),
         };
 
         let listen_error = listen_error.or(fallback_error);
@@ -1174,6 +1292,11 @@ impl RunningEngine {
     }
 
     /// LAN の listener の入れ物（デスクトップの `server_apply` が入れ替える）。
+    /// バックアップの REST の受け付けの門（[`BackupGate`]。#623 PR-3）。
+    pub fn backup_gate(&self) -> &Arc<BackupGate> {
+        &self.services.backup_gate
+    }
+
     pub fn server_slot(&self) -> &Arc<ServerSlot> {
         &self.server
     }

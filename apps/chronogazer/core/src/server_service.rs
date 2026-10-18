@@ -43,10 +43,12 @@
 //!   「SCM の STOP」「PRESHUTDOWN」を名指しする（日次ログをコンソールの分と見分ける
 //!   ため。banto-hub の `hub_stop_reason_line` と同じ作法）。
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use banto_safe_root::{DirAccess, InstallUserSid};
+use banto_safe_root::mode::{AbortReason, MarkerError, Progress, ScanRefusal, TreeProblem};
+use banto_safe_root::{DirAccess, InstallUserSid, RedirectionGuard};
 use banto_service_control::{
     preshutdown_console_line, ConsoleLine, InstallError, InstallKind, InstallOutcome, ServiceExit,
     StopAttempt, StopNotice, StopSignal, UninstallError, UninstallOutcome,
@@ -54,7 +56,8 @@ use banto_service_control::{
 
 use crate::paths::{create_root_dir_with, DataLayout};
 use crate::server_host::{
-    EXIT_ALREADY_RUNNING, EXIT_OK, EXIT_SHUTDOWN_INCOMPLETE, INTERRUPT_BUDGET, SERVER_LABEL,
+    EXIT_ALREADY_RUNNING, EXIT_LEFT_TIGHT, EXIT_NOT_OPERATIONAL, EXIT_OK, EXIT_SHUTDOWN_INCOMPLETE,
+    EXIT_START_FAILED, INTERRUPT_BUDGET, SERVER_LABEL,
 };
 use crate::shell_launch::{SERVICE_DISPLAY_NAME, SERVICE_NAME};
 
@@ -86,8 +89,253 @@ pub fn service_exit_for(code: i32) -> ServiceExit {
         EXIT_OK => ServiceExit::Success,
         EXIT_SHUTDOWN_INCOMPLETE => ServiceExit::Specific(1),
         EXIT_ALREADY_RUNNING => ServiceExit::Specific(2),
+        // #623 PR-3（設計 §3.7）: 4・5 は受け皿（3）の前に置く。
+        EXIT_NOT_OPERATIONAL => ServiceExit::Specific(4),
+        EXIT_LEFT_TIGHT => ServiceExit::Specific(5),
         _ => ServiceExit::Specific(3),
     }
+}
+
+// --- 設定モード ⇔ 運用モード（#623 PR-3、設計 §3） ------------------------------------
+
+/// 緩めるだけの開始の引数（`StartService` の引数。設計 §3.3「`relax-only` の配線と手順」）。
+pub const RELAX_ONLY_ARG: &str = "relax-only";
+
+/// 開始の引数の解釈（[`parse_start_args`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartArgs {
+    /// 引数なし: ふつうの開始（運用モードへ締めてエンジンを動かす）。
+    Normal,
+    /// `["relax-only"]` ちょうど: 緩めるだけ（エンジンを動かさず、Running を報告しない）。
+    RelaxOnly,
+    /// それ以外（知らない語・余計な語・`relax-only` の綴り違い）。**何も変えずに断る**
+    /// （終了コード 3。2026-10-18 オーナー決定「PR-3 の前の論点 1」）。中身は表示用。
+    Unknown(String),
+}
+
+/// `ServiceMain` の argv（`ServiceContext::start_args`。先頭はサービス名）を解釈する
+/// （設計 §3.1 の 2）。**引数は信頼できない入力**: 決まった値との完全一致だけで分け、
+/// パス・数値として解釈しない。知らない語を「無視してふつうの開始」にすると、打ち間違い
+/// （`relax_only` など）が逆向き = 締める動きになるので、断る。
+pub fn parse_start_args(args: &[OsString]) -> StartArgs {
+    let rest = args.get(1..).unwrap_or_default();
+    if rest.is_empty() {
+        return StartArgs::Normal;
+    }
+    if rest.len() == 1 && rest[0] == RELAX_ONLY_ARG {
+        return StartArgs::RelaxOnly;
+    }
+    StartArgs::Unknown(
+        rest.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// STOP の後に `report_stop_progress` を呼び続ける上限（30 分。2026-10-18 オーナー決定
+/// 「PR-3 の前の論点 2」）。過ぎたら checkpoint を進めるのをやめる（SCM とシェルからは
+/// 「応答なし」に見える）が、**待ちは打ち切らない**（決定 1 は不変）。
+pub const STOP_PROGRESS_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// STOP の後、`elapsed` だけ経った時点でまだ STOP_PENDING の checkpoint を進めてよいか。
+pub fn stop_progress_allowed(elapsed: Duration) -> bool {
+    elapsed <= STOP_PROGRESS_LIMIT
+}
+
+/// 1 周目が断った後の終了コード（設計 §3.1 の 8）: 見つけた物があれば何も変えずに 4、
+/// I/O の失敗は 3、止める合図（SCM からは来ないが口として）は中止 = 0。
+pub fn exit_after_scan_refusal(refusal: &ScanRefusal) -> i32 {
+    match refusal {
+        ScanRefusal::Problems(_) => EXIT_NOT_OPERATIONAL,
+        ScanRefusal::Io(_) => EXIT_START_FAILED,
+        ScanRefusal::Stopped(_) => EXIT_OK,
+    }
+}
+
+/// 2 周目が止まった後にすること（設計 §3.1 の 9）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbortPlan {
+    /// 締めた分を `relax_tree` で緩め直すか（PRESHUTDOWN なら緩めない）。
+    pub relax_back: bool,
+    /// 緩め直せた（または緩めない）ときの終了コード。
+    pub exit_if_relaxed: i32,
+    /// 緩め直せなかった（締めたまま残る）ときの終了コード。
+    pub exit_if_left_tight: i32,
+}
+
+/// 2 周目が止まった理由から、緩め直すか・終了コードを決める（純関数。設計 §3.1 の 9）:
+/// 想定外の物・I/O → 緩め直して 4（緩め直せなければ 5）、STOP → 緩め直して 0（中止）、
+/// PRESHUTDOWN → 緩めずに 0。
+pub fn after_close_abort(reason: &AbortReason) -> AbortPlan {
+    match reason {
+        AbortReason::Problem(_) | AbortReason::Io(_) => AbortPlan {
+            relax_back: true,
+            exit_if_relaxed: EXIT_NOT_OPERATIONAL,
+            exit_if_left_tight: EXIT_LEFT_TIGHT,
+        },
+        AbortReason::Stopped(banto_safe_root::StopSignal::Preshutdown) => AbortPlan {
+            relax_back: false,
+            exit_if_relaxed: EXIT_OK,
+            exit_if_left_tight: EXIT_OK,
+        },
+        AbortReason::Stopped(_) => AbortPlan {
+            relax_back: true,
+            exit_if_relaxed: EXIT_OK,
+            exit_if_left_tight: EXIT_LEFT_TIGHT,
+        },
+    }
+}
+
+/// 締めた後の管理するフォルダの印の失敗（設計 §3.1 の 10）: `DirIsReparse`・`Occupied`・
+/// `Busy` は締めた後の改ざんとみなし、緩め直して 5（`Tampered`）。`Io` は緩め直して 3。
+/// どちらも緩め直せなければ 5。戻り値は（改ざんか, 緩め直せたときの終了コード）。
+pub fn after_marker_error(error: &MarkerError) -> (bool, i32) {
+    match error {
+        MarkerError::DirIsReparse { .. } | MarkerError::Occupied(_) | MarkerError::Busy { .. } => {
+            (true, EXIT_LEFT_TIGHT)
+        }
+        MarkerError::Io(_) => (false, EXIT_START_FAILED),
+    }
+}
+
+/// 緩め直しの結果で終了コードを決める: 緩め直せたら `if_relaxed`、`Err` なら 5。
+pub fn exit_after_relax_back(relaxed: bool, if_relaxed: i32) -> i32 {
+    if relaxed {
+        if_relaxed
+    } else {
+        EXIT_LEFT_TIGHT
+    }
+}
+
+/// 1 周目が見つけた物の一覧の行（最初の 20 件と総数。設計 §2.3）。
+pub const SCAN_PROBLEMS_SHOWN: usize = 20;
+
+/// 1 周目が断ったときのログの行（設計 §3.1 の 8）。
+pub fn scan_refused_lines(problems: &[TreeProblem]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{SERVER_LABEL}: 運用モードにできません（終了コード {EXIT_NOT_OPERATIONAL}）: データのフォルダに締められない物が {} 件あります。何も変えていません（設定モードのまま）。リンク・ハードリンクは外し、暗号化は解除し、開けないファイルは権限を戻してから（エクスプローラーのプロパティ、または icacls <path> /reset。あなたが所有者なら管理者は要りません）、もう一度運用モードにしてください",
+        problems.len()
+    )];
+    for problem in problems.iter().take(SCAN_PROBLEMS_SHOWN) {
+        lines.push(format!("{SERVER_LABEL}:   {problem}"));
+    }
+    if problems.len() > SCAN_PROBLEMS_SHOWN {
+        lines.push(format!(
+            "{SERVER_LABEL}:   …ほか {} 件",
+            problems.len() - SCAN_PROBLEMS_SHOWN
+        ));
+    }
+    lines
+}
+
+/// Redirection Guard の結果の 1 行（設計 §3.1 の 1・6）。
+pub fn redirection_guard_line(result: RedirectionGuard) -> String {
+    match result {
+        RedirectionGuard::Enabled => {
+            format!("{SERVER_LABEL}: Redirection Guard を有効にしました（非管理者のジャンクションを辿りません）")
+        }
+        RedirectionGuard::Failed { os_error } => format!(
+            "{SERVER_LABEL}: Redirection Guard を有効にできませんでした（os error {os_error}。古い Windows の可能性）。運用モードの ACL で続けます"
+        ),
+        RedirectionGuard::NotWindows => {
+            format!("{SERVER_LABEL}: Redirection Guard はこの OS にはありません")
+        }
+    }
+}
+
+/// 運用モードへの切り替えの開始の行（設計 §3.9。日次ログを開いた直後）。
+pub fn mode_switch_begin_line() -> String {
+    format!("{SERVER_LABEL}: 運用モードへの切り替えを開始します（データのフォルダの ACL を確かめて締めます。締め終わるまで収集は始めません）")
+}
+
+/// 運用モードへの切り替えの完了の行（設計 §3.9。Running を報告した後）。
+pub fn mode_switch_done_line(progress: &Progress, elapsed: Duration) -> String {
+    format!(
+        "{SERVER_LABEL}: 運用モードへの切り替えを完了しました（収集を開始。確かめた物 {} 件・書いた物 {} 件、所要 {:.1} 秒）",
+        progress.examined,
+        progress.written,
+        elapsed.as_secs_f64()
+    )
+}
+
+/// 読み取りを付ける相手を決められないときの行（`NoReader`、設計 §2.7・§3.1 の 7）。
+pub fn no_reader_line() -> String {
+    format!(
+        "{SERVER_LABEL}: 運用モードにできません（終了コード {EXIT_NOT_OPERATIONAL}）: インストール利用者の記録（{INSTALL_USER_SID_LOCATION}）が無いか使えません。何も変えていません。運用モードにするにはインストール利用者の登録が要ります（chronogazer-elev.exe service-install で登録し直してください）"
+    )
+}
+
+/// 2 周目が止まったときの行（設計 §3.1 の 9）。
+pub fn close_abort_line(written: u64, reason: &AbortReason) -> String {
+    let why = match reason {
+        AbortReason::Problem(problem) => format!("締められない物に会いました: {problem}"),
+        AbortReason::Stopped(signal) => format!("止める合図（{signal:?}）を受けました"),
+        AbortReason::Io(error) => format!("書けませんでした: {error}"),
+    };
+    format!("{SERVER_LABEL}: 運用モードへの締めを {written} 件で止めました。{why}")
+}
+
+/// 締めた分を緩め直した結果の行。
+pub fn relaxed_back_line(written: u64, skipped: usize) -> String {
+    format!(
+        "{SERVER_LABEL}: 締めた分を緩め直しました（書いた物 {written} 件、飛ばした物 {skipped} 件）。設定モードのままです"
+    )
+}
+
+/// 緩め直せなかったときの行（締めたまま残る）。
+pub fn relax_back_failed_line(error: &dyn std::fmt::Display) -> String {
+    format!(
+        "{SERVER_LABEL}: 締めた分を緩め直せませんでした（終了コード {EXIT_LEFT_TIGHT}。締まったまま残ります）: {error}。デスクトップの案内から relax-only の開始か、chronogazer-elev.exe grant-data-acl で戻してください"
+    )
+}
+
+/// 締めた後の管理するフォルダで改ざんを見つけたときの行（`Tampered`、設計 §3.1 の 10）。
+pub fn tampered_line(key: &str, error: &MarkerError) -> String {
+    format!(
+        "{SERVER_LABEL}: フォルダ「{key}」が締めた後に外から変えられました（終了コード {EXIT_LEFT_TIGHT}）: {error}。エンジンは動かしません"
+    )
+}
+
+/// 運用中に見張り・定期の確かめ直しが落ちたときの行（`AclChanged`、設計 §2.9 (c)(d)）。
+pub fn acl_changed_line(what: &str) -> String {
+    format!(
+        "{SERVER_LABEL}: 運用中にデータのフォルダの権限が外から変えられました（終了コード {EXIT_LEFT_TIGHT}。締めたまま止まります）: {what}。管理者の icacls・グループポリシーの「ファイル システム」・バックアップソフトの復元が原因なら、それを止めてからサービスを開始してください"
+    )
+}
+
+/// 設定モードへの切り替えで、緩め始める前の**最後の**行（設計 §3.2 の 5。この後は日次ログに
+/// 書かない）。
+pub fn relax_begin_line() -> String {
+    format!("{SERVER_LABEL}: 設定モードへの切り替えのため ACL を緩め始めます（エンジン停止・最終 flush 完了。この後の行はデスクトップのログへ）")
+}
+
+/// `relax-only` で開始したときの行（緩め始める前の最後の行）。
+pub fn relax_only_begin_line() -> String {
+    format!("{SERVER_LABEL}: relax-only で開始しました。エンジンは動かさず、ACL を緩め始めます（この後の行はデスクトップのログへ）")
+}
+
+/// 知らない開始の引数で断るときの行（標準エラー出力。ログはまだ無い）。
+pub fn unknown_start_arg_line(arg: &str) -> String {
+    format!(
+        "{SERVER_LABEL}: 知らない開始の引数です（{arg:?}）。何も変えずに終わります（終了コード {EXIT_START_FAILED}）。緩めるだけの開始は '{RELAX_ONLY_ARG}' だけです"
+    )
+}
+
+/// バックアップの完了を待っている間の 1 分ごとの行（設計 §3.2 の 1）。
+pub fn backup_wait_line(elapsed: Duration) -> String {
+    format!(
+        "{SERVER_LABEL}: 進行中のバックアップ（または復元の適用）の完了を待っています（{} 秒経過。打ち切りません）",
+        elapsed.as_secs()
+    )
+}
+
+/// `data.dir` が外部のときの 1 行（#659。設計 §6.1）。
+pub fn external_data_dir_line(path: &Path) -> String {
+    format!(
+        "{SERVER_LABEL}: データのフォルダ（外部: {}）はリンクの保護と運用モードの ACL の対象外です（#659）",
+        path.display()
+    )
 }
 
 /// 後始末の後に、日次ログの書き出し（向け直しの終わり）を待つ上限。
@@ -702,8 +950,11 @@ mod tests {
         assert_eq!(service_exit_for(1), ServiceExit::Specific(1));
         assert_eq!(service_exit_for(2), ServiceExit::Specific(2));
         assert_eq!(service_exit_for(3), ServiceExit::Specific(3));
+        // #623 PR-3: 4・5 は受け皿の前（反証: 4 の腕を外すと 3 になる）。
+        assert_eq!(service_exit_for(4), ServiceExit::Specific(4));
+        assert_eq!(service_exit_for(5), ServiceExit::Specific(5));
         // それ以外（起動の失敗のはずの値）は 3。
-        for other in [-1, 4, 64] {
+        for other in [-1, 6, 64] {
             assert_eq!(service_exit_for(other), ServiceExit::Specific(3), "{other}");
         }
         // 1 は本体の panic と同じ値（モジュール doc）。
@@ -711,6 +962,133 @@ mod tests {
             service_exit_for(1),
             ServiceExit::Specific(banto_service_control::PANIC_EXIT_CODE)
         );
+    }
+
+    /// #623 PR-3: 開始の引数は決まった値との完全一致だけ。知らない語・余計な語・綴り違いは
+    /// `Unknown`（何も変えずに断る）。
+    #[test]
+    fn start_args_accept_only_the_exact_relax_only_word() {
+        let os = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(parse_start_args(&os(&[])), StartArgs::Normal);
+        assert_eq!(parse_start_args(&os(&["ChronoGazer"])), StartArgs::Normal);
+        assert_eq!(
+            parse_start_args(&os(&["ChronoGazer", "relax-only"])),
+            StartArgs::RelaxOnly
+        );
+        for bad in [
+            vec!["ChronoGazer", "relax_only"],
+            vec!["ChronoGazer", "Relax-Only"],
+            vec!["ChronoGazer", "relax-onlyx"],
+            vec!["ChronoGazer", " relax-only"],
+            vec!["ChronoGazer", "relax-only", "now"],
+            vec!["ChronoGazer", "--relax-only"],
+            vec!["ChronoGazer", ""],
+            vec!["ChronoGazer", "C:\\"],
+        ] {
+            assert!(
+                matches!(parse_start_args(&os(&bad)), StartArgs::Unknown(_)),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            parse_start_args(&os(&["ChronoGazer", "a", "b"])),
+            StartArgs::Unknown("a b".to_string())
+        );
+    }
+
+    /// #623 PR-3: 2 周目が止まった理由ごとの計画と、1 周目・印・緩め直しの終了コード。
+    #[test]
+    fn mode_switch_exit_table() {
+        use banto_safe_root::mode::StopSignal as Tree;
+        use banto_safe_root::{Refusal, SafeRootError};
+        let io = SafeRootError::UnsupportedPlatform;
+        let problem = TreeProblem::Hardlink {
+            path: PathBuf::from("x"),
+            links: 2,
+        };
+        assert_eq!(
+            after_close_abort(&AbortReason::Problem(problem.clone())),
+            AbortPlan {
+                relax_back: true,
+                exit_if_relaxed: 4,
+                exit_if_left_tight: 5
+            }
+        );
+        assert_eq!(
+            after_close_abort(&AbortReason::Io(io.clone())),
+            AbortPlan {
+                relax_back: true,
+                exit_if_relaxed: 4,
+                exit_if_left_tight: 5
+            }
+        );
+        assert_eq!(
+            after_close_abort(&AbortReason::Stopped(Tree::Stop)),
+            AbortPlan {
+                relax_back: true,
+                exit_if_relaxed: 0,
+                exit_if_left_tight: 5
+            }
+        );
+        assert_eq!(
+            after_close_abort(&AbortReason::Stopped(Tree::Preshutdown)),
+            AbortPlan {
+                relax_back: false,
+                exit_if_relaxed: 0,
+                exit_if_left_tight: 0
+            }
+        );
+        assert_eq!(
+            exit_after_scan_refusal(&ScanRefusal::Problems(vec![problem])),
+            4
+        );
+        assert_eq!(exit_after_scan_refusal(&ScanRefusal::Io(io.clone())), 3);
+        assert_eq!(
+            exit_after_scan_refusal(&ScanRefusal::Stopped(Tree::Stop)),
+            0
+        );
+        assert_eq!(
+            after_marker_error(&MarkerError::DirIsReparse { tag: 0xA000_0003 }),
+            (true, 5)
+        );
+        assert_eq!(
+            after_marker_error(&MarkerError::Occupied(Refusal::NotAFile)),
+            (true, 5)
+        );
+        assert_eq!(
+            after_marker_error(&MarkerError::Busy { os_error: 32 }),
+            (true, 5)
+        );
+        assert_eq!(after_marker_error(&MarkerError::Io(io)), (false, 3));
+        assert_eq!(exit_after_relax_back(true, 4), 4);
+        assert_eq!(exit_after_relax_back(true, 0), 0);
+        assert_eq!(exit_after_relax_back(false, 4), 5);
+        assert_eq!(exit_after_relax_back(false, 0), 5);
+        // STOP の後の checkpoint は 30 分まで。
+        assert!(stop_progress_allowed(Duration::ZERO));
+        assert!(stop_progress_allowed(STOP_PROGRESS_LIMIT));
+        assert!(!stop_progress_allowed(
+            STOP_PROGRESS_LIMIT + Duration::from_millis(1)
+        ));
+    }
+
+    /// 1 周目の一覧は最初の 20 件と総数。
+    #[test]
+    fn scan_refusal_lines_show_the_first_twenty_and_the_total() {
+        let problems: Vec<TreeProblem> = (0..25)
+            .map(|i| TreeProblem::Denied {
+                path: PathBuf::from(format!("p{i}")),
+            })
+            .collect();
+        let lines = scan_refused_lines(&problems);
+        assert_eq!(lines.len(), 1 + 20 + 1, "{lines:#?}");
+        assert!(lines[0].contains("25 件"));
+        assert!(lines[0].contains("終了コード 4"));
+        assert!(lines[1].contains("p0"));
+        assert!(lines[20].contains("p19"));
+        assert!(lines[21].contains("ほか 5 件"));
+        let few = scan_refused_lines(&problems[..3]);
+        assert_eq!(few.len(), 4);
     }
 
     fn notice(signal: StopSignal, received_at: Instant) -> StopNotice {

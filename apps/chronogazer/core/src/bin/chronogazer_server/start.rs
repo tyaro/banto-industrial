@@ -26,10 +26,11 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use banto_hub_bootstrap::KeyStore;
 use chronogazer_core::instance_lock::ChronoGazerHost;
 use chronogazer_core::paths::{resolve_data_root_from_env, DataLayout, DirAccessSource};
 use chronogazer_core::server_host::{
-    self, ServerLog, StartedServer, EXIT_START_FAILED, SERVER_LABEL,
+    self, LockedServer, ServerLog, StartFailure, StartedServer, EXIT_START_FAILED, SERVER_LABEL,
 };
 
 use super::{Flush, LineSink, OpenedLog};
@@ -52,6 +53,28 @@ pub(crate) trait StartHooks {
 
     /// DB を開く直前（デバッグビルドの統合テストの待ちの口。既定は何もしない）。
     fn before_open(&self) {}
+
+    /// 順序の 2.（ルートを作って A1 の排他を取る）。既定は `server_host::lock`。サービス
+    /// （#623 PR-3）は、握ったルートの中で先に取った A1 を引き継いだ `LockedServer` を返す。
+    fn lock(
+        &self,
+        layout: DataLayout,
+        host: ChronoGazerHost,
+        access: &DirAccessSource,
+    ) -> Result<LockedServer, StartFailure> {
+        server_host::lock(layout, host, access)
+    }
+
+    /// Hub のキーの保存先。既定はパスで開き、開けなければ `FailedKeyStore` と理由（起動は
+    /// 続ける）。サービス（#623 PR-3）は握った `hub-keys` で開き、開けなければ `Err`（起動を
+    /// 止める）。
+    fn key_store(
+        &self,
+        layout: &DataLayout,
+        access: &DirAccessSource,
+    ) -> Result<(Arc<dyn KeyStore>, Option<String>), String> {
+        Ok(server_host::open_key_store_from(layout, access))
+    }
 }
 
 /// 起動の順序に渡すもの。
@@ -95,7 +118,7 @@ pub(crate) fn start_server(
 
     // 2. A1 の排他だけ（ルートの下に作るのはここから。排他を取れなければ何も
     // 作らない - ログもまだ開いていないので、理由はコンソールだけに出す）。
-    let locked = match server_host::lock(layout.clone(), host, access) {
+    let locked = match hooks.lock(layout.clone(), host, access) {
         Ok(locked) => locked,
         Err(failure) => return Err(report_start_failure(hooks, &failure)),
     };
@@ -157,7 +180,17 @@ pub(crate) fn start_server(
     }
 
     // Hub のキーの保存先（排他を取った後）とエンジン。
-    let (key_store, key_store_error) = server_host::open_key_store_from(layout, access);
+    let (key_store, key_store_error) = match hooks.key_store(layout, access) {
+        Ok(opened) => opened,
+        Err(reason) => {
+            eprintln!(
+                "{SERVER_LABEL}: Hub の API キーの保存先（{}）を開けません: {reason}",
+                layout.hub_keys_dir().display()
+            );
+            runtime.block_on(opened.close());
+            return Err(hooks.finish_start_failure(EXIT_START_FAILED));
+        }
+    };
     if let Some(reason) = key_store_error {
         eprintln!(
             "{SERVER_LABEL}: Hub の API キーの保存先（{}）を使えません。Hub 経由の収集は動きません（PLC の収集は続けます）: {reason}",

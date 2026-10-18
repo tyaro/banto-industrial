@@ -103,6 +103,38 @@ pub fn open_key_store_from(
     }
 }
 
+/// **握った** `secrets\hub-keys\`（`SafeRoot::open_managed` で運用モードの形で作って握った物）を
+/// 保存先にして開く（サービス。#623 PR-3、設計 §6.1）。`FileSecretStore::open_in`: 作らず、
+/// 握ったハンドルで `access`（運用モードの形）を確かめ、以後の読む・書く・消すもハンドル基準。
+/// 開けなければ `Err`（サービスは起動を止める。[`open_key_store`] の「`FailedKeyStore` で
+/// 続ける」はデスクトップ・コンソールだけ）。
+pub fn open_key_store_in(
+    dir: banto_safe_root::ManagedDir,
+    access: banto_safe_root::DirAccess,
+) -> Result<Arc<dyn KeyStore>, String> {
+    open_key_store_in_impl(dir, access)
+}
+
+#[cfg(windows)]
+fn open_key_store_in_impl(
+    dir: banto_safe_root::ManagedDir,
+    access: banto_safe_root::DirAccess,
+) -> Result<Arc<dyn KeyStore>, String> {
+    use banto_secret_store::{DpapiMachine, FileSecretStore};
+
+    FileSecretStore::open_in(dir, access, DpapiMachine)
+        .map(|store| Arc::new(store) as Arc<dyn KeyStore>)
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(not(windows))]
+fn open_key_store_in_impl(
+    _dir: banto_safe_root::ManagedDir,
+    _access: banto_safe_root::DirAccess,
+) -> Result<Arc<dyn KeyStore>, String> {
+    Err(NO_DPAPI.to_string())
+}
+
 fn into_key_store(
     opened: Result<Arc<dyn KeyStore>, String>,
 ) -> (Arc<dyn KeyStore>, Option<String>) {

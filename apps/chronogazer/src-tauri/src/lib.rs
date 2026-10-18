@@ -5197,6 +5197,7 @@ mod tests {
             always_on: None,
             local_grant: chronogazer_core::local_grant::LocalGrantStart::Unsupported,
             settings_lock: Arc::new(AsyncMutex::new(())),
+            backup_gate: Arc::new(chronogazer_core::engine::BackupGate::default()),
             log_label: "banto",
             lan_status: Arc::new(std::sync::Mutex::new(None)),
         }

@@ -995,6 +995,27 @@ fn open_log(layout: &DataLayout) -> Result<OpenedLog, String> {
             return Ok((None, Box::new(|_| {}), None));
         }
     };
+    redirect_opened_log(log)
+}
+
+/// サービス（#623 PR-3）: 握った `logs\` に日次ログを**辿らずに**開き（`ServerLog::open_in`）、
+/// 向け直す。**開けなければ `Err`**（サービスにはコンソールが無く、起動・収集・停止の診断が
+/// 黙って失われるため、起動しない。PR #618 の Codex の指摘）。
+#[cfg(windows)]
+fn open_log_in(dir: Arc<banto_safe_root::ManagedDir>) -> Result<OpenedLog, String> {
+    let path = dir.final_path().to_path_buf();
+    let log = ServerLog::open_in(dir, Arc::new(banto_tstore::SystemClock)).map_err(|err| {
+        format!(
+            "日次ログ（{}）を開けませんでした。Windows サービスにはコンソールが無く、起動・収集・停止の診断が残らないため、起動しません: {err}",
+            path.display()
+        )
+    })?;
+    redirect_opened_log(Arc::new(Mutex::new(log)))
+}
+
+/// 開いた日次ログへ標準出力・標準エラー出力を向け直す（[`open_log`]・[`open_log_in`] で同じ）。
+#[cfg(windows)]
+fn redirect_opened_log(log: Arc<Mutex<ServerLog>>) -> Result<OpenedLog, String> {
     match console::redirect_stdio(log.clone()) {
         Ok(redirect) => {
             let redirect = Arc::new(redirect);

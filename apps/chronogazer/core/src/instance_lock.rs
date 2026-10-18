@@ -168,39 +168,59 @@ impl InstanceGuard {
     }
 }
 
-/// `db_path` の DB を開く前に、その DB の排他を取る。
-pub fn acquire_for_db(
-    db_path: &Path,
+/// `db_path` の DB の排他の単位（mutex 名 `Global\ChronoGazer.<ID>` の `<ID>`）と、正規化した
+/// パス（`banto_instance_lock::path_scope_id`。親を `canonicalize` するので、親は既にあること）。
+/// サービスのルート（`ManagedDir::final_path`）も、デスクトップの `db_path` も、同じ DB なら
+/// 同じ ID になる（排他が噛み合う前提。#623 PR-3）。
+pub fn scope_for_db(db_path: &Path) -> std::io::Result<(String, PathBuf)> {
+    banto_instance_lock::path_scope_id(db_path)
+}
+
+/// `db_path` の DB の A1 の mutex の名前（昇格ヘルパーが、書き直す間だけ同じ mutex を持つ
+/// ために使う。#623 PR-3、設計 §3.5）。
+pub fn mutex_name_for_db(db_path: &Path) -> std::io::Result<String> {
+    let (id, _) = scope_for_db(db_path)?;
+    Ok(mutex_name(&id))
+}
+
+fn mutex_name(id: &str) -> String {
+    format!("Global\\ChronoGazer.{id}")
+}
+
+/// **握ったルート**（`SafeRoot::as_dir()`）の中の DB の排他を取る（サービス。#623 PR-3、
+/// 設計 §3.1 の 5）。排他の単位は [`acquire_for_db`] と同じ（ルートの本当のパス + DB の
+/// ファイル名から作る）。診断ファイルは `banto_instance_lock::try_acquire_in` が握った
+/// フォルダ基準で書く（まだ緩い木でも、辿らないので外へは書かない）。
+pub fn acquire_for_db_in(
+    root: &banto_safe_root::ManagedDir,
     host: ChronoGazerHost,
 ) -> Result<InstanceGuard, InstanceLockFailure> {
-    // DB ファイル自体がシンボリックリンクなら断る（`symlink_metadata` なので壊れた
-    // リンクも見える）。許すと、(a) リンク先がまだ無い間は別名のパスで ID を作り、
-    // `init_db` が実体を作った後の起動は実体のパスで ID を作る、(b) 保留中のリストア
-    // が `rename` で別名のリンク自体を通常ファイルに置き換える、のどちらでも
-    // 「保持しているロック」と「最終的に開く DB」がずれて、2 プロセスが通り抜ける。
-    // 親ディレクトリのリンクは `path_scope_id` が正規化するので許す。
-    if std::fs::symlink_metadata(db_path)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(InstanceLockFailure::SymlinkDbPath {
-            db: db_path.to_path_buf(),
-        });
-    }
-    let (id, canonical) =
-        banto_instance_lock::path_scope_id(db_path).map_err(|source| InstanceLockFailure::Io {
-            db: db_path.to_path_buf(),
-            source,
-        })?;
-    let mutex_name = format!("Global\\ChronoGazer.{id}");
+    let db_path = root.final_path().join(crate::paths::DB_FILE_NAME);
+    let (id, canonical) = scope_for_db(&db_path).map_err(|source| InstanceLockFailure::Io {
+        db: db_path.clone(),
+        source,
+    })?;
     let mut lock_name = canonical
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_default();
     lock_name.push(".instance.lock");
-    let lock_file = canonical.with_file_name(lock_name);
+    let lock_name = lock_name.to_string_lossy().into_owned();
+    into_guard(
+        banto_instance_lock::try_acquire_in(&mutex_name(&id), root, &lock_name, host.as_str()),
+        id,
+        canonical,
+    )
+}
 
-    match banto_instance_lock::try_acquire(&mutex_name, &lock_file, host.as_str()) {
+/// `banto_instance_lock` の結果を [`InstanceGuard`] に写す（[`acquire_for_db`]・
+/// [`acquire_for_db_in`] で同じ）。
+fn into_guard(
+    acquired: Result<InstanceLockGuard, InstanceLockError>,
+    id: String,
+    canonical: PathBuf,
+) -> Result<InstanceGuard, InstanceLockFailure> {
+    match acquired {
         Ok(guard) => {
             // 診断ファイルを書かなかった・作ったファイルを消せなかった理由
             // （`banto_instance_lock` はログを出さない）。排他は取れているので起動は
@@ -223,6 +243,43 @@ pub fn acquire_for_db(
             source,
         }),
     }
+}
+
+/// `db_path` の DB を開く前に、その DB の排他を取る。
+pub fn acquire_for_db(
+    db_path: &Path,
+    host: ChronoGazerHost,
+) -> Result<InstanceGuard, InstanceLockFailure> {
+    // DB ファイル自体がシンボリックリンクなら断る（`symlink_metadata` なので壊れた
+    // リンクも見える）。許すと、(a) リンク先がまだ無い間は別名のパスで ID を作り、
+    // `init_db` が実体を作った後の起動は実体のパスで ID を作る、(b) 保留中のリストア
+    // が `rename` で別名のリンク自体を通常ファイルに置き換える、のどちらでも
+    // 「保持しているロック」と「最終的に開く DB」がずれて、2 プロセスが通り抜ける。
+    // 親ディレクトリのリンクは `path_scope_id` が正規化するので許す。
+    if std::fs::symlink_metadata(db_path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(InstanceLockFailure::SymlinkDbPath {
+            db: db_path.to_path_buf(),
+        });
+    }
+    let (id, canonical) = scope_for_db(db_path).map_err(|source| InstanceLockFailure::Io {
+        db: db_path.to_path_buf(),
+        source,
+    })?;
+    let mut lock_name = canonical
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    lock_name.push(".instance.lock");
+    let lock_file = canonical.with_file_name(lock_name);
+
+    into_guard(
+        banto_instance_lock::try_acquire(&mutex_name(&id), &lock_file, host.as_str()),
+        id,
+        canonical,
+    )
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@
 //! （判定は `crate::service_probe`）。それ以外の理由は Fallback の窓に出すために
 //! 種類ごとに分けて持つ。
 
+use banto_safe_root::ModeObservation;
 use banto_service_control::{ScmState, ServiceManager};
 
 /// SCM 上の ChronoGazer のサービス名（決定 7。B3-2 のサービスの登録と同じ値）。
@@ -122,6 +123,69 @@ pub enum LaunchDecision {
     Desktop { scm: Option<ScmState> },
     /// どちらもせず、状態と対処を見せる。
     Fallback(FallbackInfo),
+    /// Desktop にするはずだったが、データのルートがそれを許さない（#623 PR-3、設計 §3.6）:
+    /// ルートが**運用モードの形**（締まったまま。サービスが落ちた・PRESHUTDOWN で止まった）か、
+    /// ルートをモードの観測に使えない（reparse point・フォルダでない）。どちらも Desktop に
+    /// しない（締まった木でエンジンを起動して分かりにくく失敗するのを防ぐ）。文言・ボタン
+    /// （[運用を再開]・[設定モードに切り替える]）は PR-4。
+    RootBlocked { scm: ScmObservation, why: RootBlock },
+}
+
+/// [`LaunchDecision::RootBlocked`] の理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootBlock {
+    /// ルートの DACL が運用モードの形（[`ModeObservation::Operation`]）。
+    OperationMode,
+    /// ルートをモードの観測に使えない（`observe_root` が断った理由の文言）。
+    Unusable(String),
+}
+
+/// データのルートのモードの観測（デスクトップの利用者の権限で、ルートの DACL を読むだけ。
+/// `banto_safe_root::observe_root` → [`banto_safe_root::classify_mode`]。#623 PR-3、設計 §2.10）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootModeObservation {
+    /// 読めた（無い・開けないも含む。[`ModeObservation`]）。
+    Mode(ModeObservation),
+    /// ルートが reparse point・フォルダでない・読む途中の失敗（理由の文言）。
+    Unusable(String),
+    /// 観測していない（Windows でない）。
+    NotObserved,
+}
+
+impl RootModeObservation {
+    /// Desktop を断る理由（断らないなら `None`）。**断るのは運用モードの形と、ルートを
+    /// 観測に使えないときだけ**（設定モード・無い・どちらの形でもない・自分の ACE が無いは
+    /// Desktop へ進み、`check_writable_dir` が最後の防衛線。Fable-2 A-2）。
+    pub fn blocks_desktop(&self) -> Option<RootBlock> {
+        match self {
+            Self::Mode(ModeObservation::Operation) => Some(RootBlock::OperationMode),
+            Self::Unusable(reason) => Some(RootBlock::Unusable(reason.clone())),
+            Self::Mode(_) | Self::NotObserved => None,
+        }
+    }
+}
+
+/// ルートのモードを観測する（Windows: ルートを読むだけで開き、今の利用者の SID で見分ける。
+/// 非 Windows: [`RootModeObservation::NotObserved`]）。ルートを作らない・書かない。
+pub fn observe_root_mode(root: &std::path::Path) -> RootModeObservation {
+    #[cfg(windows)]
+    {
+        let me = match banto_safe_root::acl::current_user_sid() {
+            Ok(me) => me,
+            Err(err) => return RootModeObservation::Unusable(err.to_string()),
+        };
+        match banto_safe_root::observe_root(root) {
+            Ok(observed) => {
+                RootModeObservation::Mode(banto_safe_root::classify_mode(&observed, &me))
+            }
+            Err(err) => RootModeObservation::Unusable(err.to_string()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        RootModeObservation::NotObserved
+    }
 }
 
 /// probe を打つべきか（`Running` のときだけ）。[`decide`] も同じ述語で probe の
@@ -142,8 +206,29 @@ pub fn observe_scm(manager: &impl ServiceManager) -> ScmObservation {
 }
 
 /// 起動判定（モジュール doc の判定表）。`health` は [`needs_probe`] が真のときだけ
-/// 見る（偽のときに渡された値は無視する）。
-pub fn decide(scm: &ScmObservation, health: Option<&ServiceHealth>) -> LaunchDecision {
+/// 見る（偽のときに渡された値は無視する）。`mode` はデータのルートのモードの観測で、
+/// **Desktop になる組合せだけ**に効く（[`RootModeObservation::blocks_desktop`] なら
+/// [`LaunchDecision::RootBlocked`]。Service・Fallback には影響しない。#623 PR-3）。
+/// 約束に 1 つ足す: **ルートが運用モードの形なら決して Desktop にしない**（O1 の
+/// 「照会の失敗は Desktop」もその中に限る）。
+pub fn decide(
+    scm: &ScmObservation,
+    health: Option<&ServiceHealth>,
+    mode: &RootModeObservation,
+) -> LaunchDecision {
+    match decide_without_mode(scm, health) {
+        LaunchDecision::Desktop { .. } if mode.blocks_desktop().is_some() => {
+            LaunchDecision::RootBlocked {
+                scm: scm.clone(),
+                why: mode.blocks_desktop().expect("上で見た"),
+            }
+        }
+        other => other,
+    }
+}
+
+/// モードを見ない判定表（B2-4a のまま）。
+fn decide_without_mode(scm: &ScmObservation, health: Option<&ServiceHealth>) -> LaunchDecision {
     let state = match scm {
         ScmObservation::NotWindows | ScmObservation::QueryFailed(_) => {
             return LaunchDecision::Desktop { scm: None };
@@ -217,6 +302,56 @@ mod tests {
         ]
     }
 
+    fn no_mode() -> RootModeObservation {
+        RootModeObservation::NotObserved
+    }
+
+    fn all_modes() -> Vec<RootModeObservation> {
+        vec![
+            RootModeObservation::NotObserved,
+            RootModeObservation::Mode(ModeObservation::Setting),
+            RootModeObservation::Mode(ModeObservation::Operation),
+            RootModeObservation::Mode(ModeObservation::NoAccessForMe),
+            RootModeObservation::Mode(ModeObservation::Unexpected(
+                banto_safe_root::AclMismatch::NotProtected,
+            )),
+            RootModeObservation::Mode(ModeObservation::Absent),
+            RootModeObservation::Unusable("リンク".to_string()),
+        ]
+    }
+
+    /// #623 PR-3: モードは Desktop になる組合せにだけ効く。運用モードの形・観測に使えない
+    /// ルートは `RootBlocked`（決して Desktop にしない）、それ以外は何も変えない。
+    #[test]
+    fn mode_blocks_only_the_desktop_outcomes() {
+        for scm in all_observations() {
+            for health in all_health() {
+                let base = decide(&scm, health.as_ref(), &no_mode());
+                for mode in all_modes() {
+                    let got = decide(&scm, health.as_ref(), &mode);
+                    match mode.blocks_desktop() {
+                        Some(why) if matches!(base, LaunchDecision::Desktop { .. }) => {
+                            assert_eq!(
+                                got,
+                                LaunchDecision::RootBlocked {
+                                    scm: scm.clone(),
+                                    why
+                                },
+                                "scm={scm:?} health={health:?} mode={mode:?}"
+                            );
+                        }
+                        _ => assert_eq!(got, base, "scm={scm:?} health={health:?} mode={mode:?}"),
+                    }
+                    assert!(
+                        !(mode == RootModeObservation::Mode(ModeObservation::Operation)
+                            && matches!(got, LaunchDecision::Desktop { .. })),
+                        "運用モードの形で Desktop にした: scm={scm:?} health={health:?}"
+                    );
+                }
+            }
+        }
+    }
+
     fn is_transitional_or_running(scm: &ScmObservation) -> bool {
         matches!(
             scm,
@@ -234,7 +369,7 @@ mod tests {
     fn decision_table_covers_every_combination() {
         for scm in all_observations() {
             for health in all_health() {
-                let got = decide(&scm, health.as_ref());
+                let got = decide(&scm, health.as_ref(), &no_mode());
                 let expected = match (&scm, &health) {
                     (ScmObservation::NotWindows | ScmObservation::QueryFailed(_), _) => {
                         LaunchDecision::Desktop { scm: None }
@@ -273,7 +408,7 @@ mod tests {
             .filter(is_transitional_or_running)
         {
             for health in all_health() {
-                let got = decide(&scm, health.as_ref());
+                let got = decide(&scm, health.as_ref(), &no_mode());
                 assert!(
                     !matches!(got, LaunchDecision::Desktop { .. }),
                     "scm={scm:?} health={health:?} -> {got:?}"
@@ -287,7 +422,7 @@ mod tests {
     fn service_only_when_running_and_healthy() {
         for scm in all_observations() {
             for health in all_health() {
-                let got = decide(&scm, health.as_ref());
+                let got = decide(&scm, health.as_ref(), &no_mode());
                 let running_healthy = scm == ScmObservation::State(ScmState::Running)
                     && matches!(health, Some(ServiceHealth::Healthy { .. }));
                 assert_eq!(
@@ -310,10 +445,10 @@ mod tests {
                 "{scm:?}"
             );
             if !needs_probe(&scm) {
-                let baseline = decide(&scm, None);
+                let baseline = decide(&scm, None, &no_mode());
                 for health in all_health() {
                     assert_eq!(
-                        decide(&scm, health.as_ref()),
+                        decide(&scm, health.as_ref(), &no_mode()),
                         baseline,
                         "{scm:?} {health:?}"
                     );
@@ -326,7 +461,11 @@ mod tests {
     #[test]
     fn query_failure_falls_back_to_desktop() {
         assert_eq!(
-            decide(&ScmObservation::QueryFailed("x".to_string()), None),
+            decide(
+                &ScmObservation::QueryFailed("x".to_string()),
+                None,
+                &no_mode()
+            ),
             LaunchDecision::Desktop { scm: None }
         );
     }
