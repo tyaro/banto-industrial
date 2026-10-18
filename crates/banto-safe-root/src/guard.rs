@@ -44,8 +44,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::acl::{
-    InstallUserSid, ObservedAce, ObservedDacl, PinnedDirInfo, ACCESS_ALLOWED_ACE_TYPE,
-    ADMINISTRATORS_SID, INHERITED_ACE_FLAG, INHERIT_FLAGS, MODIFY_ACCESS_MASK, SYSTEM_SID,
+    InstallUserSid, ObservedAce, ObservedDacl, PinnedDirInfo, UserRight, ACCESS_ALLOWED_ACE_TYPE,
+    ADMINISTRATORS_SID, INHERITED_ACE_FLAG, INHERIT_FLAGS, SYSTEM_SID,
 };
 
 #[cfg(windows)]
@@ -556,8 +556,24 @@ pub struct CarryOver {
 /// 持つ利用者は引き継がない（拒否が消えて権利が広がるため）。
 pub fn plan_carry_over(
     dacl: &ObservedDacl,
+    account: impl FnMut(&InstallUserSid) -> AccountKind,
+) -> CarryOver {
+    plan_carry_over_at_least(dacl, UserRight::Modify, account)
+}
+
+/// [`plan_carry_over`] の、拾う権利の下限を選べる形（#623 PR-1c、設計 §2.2・§2.7）。
+/// [`UserRight::Modify`] なら [`plan_carry_over`] と同じ。[`UserRight::Read`] なら、マスクが
+/// 「読み取りと実行」（`READ_EXECUTE_ACCESS_MASK`）を含む利用者を拾う（「変更」はそれを
+/// 含むので、設定モードの木でも同じ利用者が拾える）。banto-hub の緩めるときの相手
+/// （締まった profile の `Read` の ACE の組）を決めるのに使う。足りない ACE の理由は
+/// どちらでも [`DropReason::LessThanModify`]（「求める権利に足りない」の意味。名前は
+/// 呼ぶ側の `match` を壊さないため据え置き）。
+pub fn plan_carry_over_at_least(
+    dacl: &ObservedDacl,
+    required: UserRight,
     mut account: impl FnMut(&InstallUserSid) -> AccountKind,
 ) -> CarryOver {
+    let required_mask = required.mask();
     let mut plan = CarryOver::default();
     let Some(aces) = &dacl.aces else {
         plan.null_dacl = true;
@@ -606,7 +622,7 @@ pub fn plan_carry_over(
             plan.dropped.push(drop(DropReason::NotTreeWide));
             continue;
         }
-        if ace.mask & MODIFY_ACCESS_MASK != MODIFY_ACCESS_MASK {
+        if ace.mask & required_mask != required_mask {
             plan.dropped.push(drop(DropReason::LessThanModify));
             continue;
         }

@@ -59,7 +59,7 @@ mod win;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(all(test, windows))]
-mod win_tests;
+pub(crate) mod win_tests;
 
 /// 握り方（設計 §4.1）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,9 +281,14 @@ pub enum EntryKind {
 }
 
 /// [`ManagedDir::remove_where`] の対象の候補か（純関数）: ファイル・reparse point でない・
-/// `pred` が名前を選ぶ。候補でも、消す前に開いたハンドルで属性を読み直す（[`ManagedDir::remove`]）。
+/// 印のファイル（[`crate::mode::MARKER_NAME`] の綴り。前さばきで、本当の守りは
+/// [`ManagedDir::remove`] がファイルの同一性で断ること）でない・`pred` が名前を選ぶ。候補でも、
+/// 消す前に開いたハンドルで属性を読み直す（[`ManagedDir::remove`]）。
 pub fn is_removal_candidate(entry: &Entry, pred: &dyn Fn(&str) -> bool) -> bool {
-    entry.kind == EntryKind::File && entry.reparse_tag.is_none() && pred(&entry.name)
+    entry.kind == EntryKind::File
+        && entry.reparse_tag.is_none()
+        && entry.name != crate::mode::MARKER_NAME
+        && pred(&entry.name)
 }
 
 /// [`ManagedDir::remove_where`] の結果。
@@ -476,6 +481,12 @@ impl ManagedDir {
     /// [`SafeRootError::Refused`]（一覧の属性は信じない。Fable B-5）。消すのは開いたハンドルで
     /// （`FileDispositionInfoEx`、POSIX）。
     pub fn remove(&self, name: &str) -> Result<bool> {
+        // 印のファイル（#623 PR-1c）はサービス自身の掃除でも消さない（消えると古いハンドルで
+        // フォルダを reparse point にできるようになる）。綴りはここで、同一性（綴り違いで同じ物を
+        // 指す名前）は Guarded の `win::remove` が開いた後のファイル ID で断る（Fable M-1）。
+        if name == crate::mode::MARKER_NAME {
+            return Err(invalid_name());
+        }
         match &self.inner {
             #[cfg(windows)]
             Inner::Guarded(pinned) => win::remove(pinned, &self.display_of(name), name),
@@ -544,6 +555,61 @@ impl ManagedDir {
             path,
             companions: paths.collect(),
         })
+    }
+
+    /// [`ManagedDir::reopen_path`] に、握ったフォルダの**記述子の確かめ直し**を足したもの
+    /// （設計 §2.9 (b)(d)。運用モードのサービスはこちらを使う）。Guarded は先に
+    /// [`ManagedDir::recheck`]（reparse 属性と、記述子が `expected` = 運用モードの形か）を通し、
+    /// 合わなければ [`crate::mode::RecheckFailure`] を [`SafeRootError::Refused`]（reparse）か
+    /// [`SafeRootError::AclMismatch`]（形）で返す。Plain は確かめずに `reopen_path` と同じ。
+    pub fn reopen_path_checked(
+        &self,
+        name: &str,
+        companions: &[&str],
+        expected: &DirAccess,
+    ) -> Result<ReopenPath> {
+        self.recheck(expected).map_err(|failure| match failure {
+            crate::mode::RecheckFailure::ReparsePoint { tag } => SafeRootError::Refused {
+                path: self.display.clone(),
+                refusal: Refusal::ReparsePoint { tag },
+            },
+            crate::mode::RecheckFailure::NotADirectory => SafeRootError::Refused {
+                path: self.display.clone(),
+                refusal: Refusal::NotADirectory,
+            },
+            crate::mode::RecheckFailure::Acl(mismatch) => SafeRootError::AclMismatch(mismatch),
+            crate::mode::RecheckFailure::Io(error) => error,
+        })?;
+        self.reopen_path(name, companions)
+    }
+
+    /// 握ったフォルダの reparse 属性と記述子をハンドルで読み直し、`expected`（運用モードの形）に
+    /// 通るか確かめる（`PinnedDir::recheck`、設計 §2.9 (b)(d)）。Plain は何も確かめず `Ok`。
+    pub fn recheck(
+        &self,
+        expected: &DirAccess,
+    ) -> std::result::Result<(), crate::mode::RecheckFailure> {
+        match &self.inner {
+            #[cfg(windows)]
+            Inner::Guarded(pinned) => pinned.recheck(expected),
+            Inner::Plain => {
+                let _ = expected;
+                Ok(())
+            }
+        }
+    }
+
+    /// 印のファイル（[`crate::mode::MARKER_NAME`]）を無ければ置き、置いた直後に握ったハンドルで
+    /// 自分の reparse 属性を読み直す（`PinnedDir::ensure_marker`、設計 §2.9 (a)）。Plain は
+    /// 置かない（[`crate::mode::MarkerOutcome::Skipped`]。デスクトップの挙動を変えない）。
+    pub fn ensure_marker(
+        &self,
+    ) -> std::result::Result<crate::mode::MarkerOutcome, crate::mode::MarkerError> {
+        match &self.inner {
+            #[cfg(windows)]
+            Inner::Guarded(pinned) => pinned.ensure_marker(),
+            Inner::Plain => Ok(crate::mode::MarkerOutcome::Skipped),
+        }
     }
 }
 

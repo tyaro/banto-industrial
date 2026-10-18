@@ -215,10 +215,15 @@ fn plain_root_and_managed_dirs_behave_like_std_fs() {
 
     let root = open_root(&plain_spec(dir.path().join("root"))).unwrap();
     assert!(!root.as_dir().is_guarded());
+    // `canonicalize` の結果から verbatim の `\\?\` を外した形（Guarded の本当のパスと同じ形。
+    // #677 のレビュー N-3）。非 Windows では `canonicalize` そのまま。
     assert_eq!(
         root.final_path(),
-        std::fs::canonicalize(dir.path().join("root")).unwrap()
+        crate::nofollow::normalize_expected(
+            &std::fs::canonicalize(dir.path().join("root")).unwrap()
+        )
     );
+    assert!(!root.final_path().to_string_lossy().starts_with(r"\\?\"));
     let set = root
         .open_managed(&[
             spec("logs", None, "logs"),

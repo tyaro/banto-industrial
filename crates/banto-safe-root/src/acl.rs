@@ -130,7 +130,7 @@
 //!   **開けない子**（利用者が Administrators を拒否した・所有権が無い。`ERROR_ACCESS_DENIED`）は
 //!   特権を有効にせず、触らず飛ばして [`ResetSkips::denied`] に記録する（監査 Should 1。そのまま
 //!   残る）。消えた子は飛ばし、それ以外の失敗は fail closed。ファイルには継承のフラグ（`OICI`）を
-//!   外した記述子を書く（監査 Nit 4。フォルダは `OICI`）。再帰の深さは上限 512 で、超えたら
+//!   外した記述子を書く（監査 Nit 4。フォルダは `OICI`）。再帰の深さは上限 64 で、超えたら
 //!   1 で止める（監査 Nit 1。とても深いフォルダでスタックをあふれさせない）。
 //!   - 【測った事実・自前の再帰】`PinnedDir::reset_acl` は、中の普通の子（孫まで）へ保護された
 //!     DACL と Administrators 所有を書き、子のジャンクションとハードリンクは飛ばして
@@ -212,6 +212,10 @@ pub const FULL_ACCESS_MASK: u32 = 0x001F_01FF;
 /// FILE_GENERIC_EXECUTE | DELETE`（`WRITE_DAC`・`WRITE_OWNER` を含まない。
 /// banto-hub の `profile_acl::OWNER_MODIFY_ACCESS_MASK` と同じ値）。
 pub const MODIFY_ACCESS_MASK: u32 = 0x0013_01BF;
+/// NTFS の「読み取りと実行」= `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`（運用モードで
+/// 利用者に残す権利。#623 PR-1c、設計 §2.8）。`FILE_WRITE_ATTRIBUTES` も `DELETE` も含まない
+/// ので、属性の変更（`fsutil file setCaseSensitiveInfo` など）も名前の作成もできない。
+pub const READ_EXECUTE_ACCESS_MASK: u32 = 0x0012_00A9;
 /// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`。
 pub const INHERIT_FLAGS: u8 = 0x03;
 /// `INHERITED_ACE`。
@@ -268,16 +272,44 @@ impl InstallUserSid {
     }
 }
 
+/// 利用者に付ける権利（#623 PR-1c、設計 §2.2）。モードの状態そのものを ACL で表す:
+/// 設定モード = 利用者に「変更」、運用モード = 利用者に「読み取りと実行」。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserRight {
+    /// 「変更」[`MODIFY_ACCESS_MASK`]（設定モード。デスクトップのエンジンが書く）。
+    Modify,
+    /// 「読み取りと実行」[`READ_EXECUTE_ACCESS_MASK`]（運用モード。シェルが
+    /// `run\endpoint.json`・`profile.lock`・ログを読むだけ。名前を作れない）。
+    Read,
+}
+
+impl UserRight {
+    /// この権利のアクセスマスク。
+    pub fn mask(self) -> u32 {
+        match self {
+            Self::Modify => MODIFY_ACCESS_MASK,
+            Self::Read => READ_EXECUTE_ACCESS_MASK,
+        }
+    }
+}
+
 /// ディレクトリに付ける権限の指定。
 ///
-/// 利用者（「変更」を付ける相手）は 0 人（[`DirAccess::service_only`]）・1 人
-/// （[`DirAccess::with_install_user`]）・複数（[`DirAccess::with_install_users`]、#626
-/// PR-A。banto-hub の profile は owner が複数でありうる）。どの形でも DACL は保護され、
-/// SYSTEM・Administrators のフルと、利用者ごとの「変更」がちょうど 1 つずつ並ぶ。
+/// 利用者は 0 人（[`DirAccess::service_only`]）・1 人（[`DirAccess::with_install_user`]）・
+/// 複数（[`DirAccess::with_install_users`]、#626 PR-A。banto-hub の profile は owner が複数で
+/// ありうる）。利用者の権利は [`UserRight`] で、全員に同じものを付ける（「変更」=
+/// 設定モード、「読み取りと実行」= 運用モード。[`DirAccess::with_readers`]・
+/// [`DirAccess::to_right`]。#623 PR-1c）。利用者ごとに権利を違える形は作らない - 木が
+/// 「半分は設定モード・半分は運用モード」になり、`classify_mode` で見分けられなくなるため。
+/// どの形でも DACL は保護され、SYSTEM・Administrators のフルと、利用者ごとの ACE が
+/// ちょうど 1 つずつ並ぶ。利用者が 0 人のとき権利は常に [`UserRight::Modify`] に揃える
+/// （DACL は同じなので、値としても同じにする）。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirAccess {
     /// 重複なし・指定の順。
     install_users: Vec<InstallUserSid>,
+    /// `install_users` の全員に付ける権利。
+    right: UserRight,
 }
 
 impl DirAccess {
@@ -285,6 +317,7 @@ impl DirAccess {
     pub fn service_only() -> Self {
         Self {
             install_users: Vec::new(),
+            right: UserRight::Modify,
         }
     }
 
@@ -293,6 +326,7 @@ impl DirAccess {
     pub fn with_install_user(sid: InstallUserSid) -> Self {
         Self {
             install_users: vec![sid],
+            right: UserRight::Modify,
         }
     }
 
@@ -300,13 +334,42 @@ impl DirAccess {
     /// 同じ SID は 1 つにまとめる（順は最初に現れた順）。空なら [`DirAccess::service_only`]、
     /// 1 人なら [`DirAccess::with_install_user`] と同じ値になる。
     pub fn with_install_users(sids: impl IntoIterator<Item = InstallUserSid>) -> Self {
+        Self::with_right(sids, UserRight::Modify)
+    }
+
+    /// SYSTEM と Administrators に加えて、`sids` の**それぞれに**「読み取りと実行」
+    /// （運用モード。#623 PR-1c、設計 §2.2・§2.8）。重複のまとめ方は
+    /// [`DirAccess::with_install_users`] と同じ。空なら [`DirAccess::service_only`]。
+    pub fn with_readers(sids: impl IntoIterator<Item = InstallUserSid>) -> Self {
+        Self::with_right(sids, UserRight::Read)
+    }
+
+    fn with_right(sids: impl IntoIterator<Item = InstallUserSid>, right: UserRight) -> Self {
         let mut install_users: Vec<InstallUserSid> = Vec::new();
         for sid in sids {
             if !install_users.contains(&sid) {
                 install_users.push(sid);
             }
         }
-        Self { install_users }
+        let right = if install_users.is_empty() {
+            UserRight::Modify
+        } else {
+            right
+        };
+        Self {
+            install_users,
+            right,
+        }
+    }
+
+    /// 同じ利用者で権利だけを替えた値（設定モード ⇔ 運用モードの対。#623 PR-1c）。
+    pub fn to_right(&self, right: UserRight) -> Self {
+        Self::with_right(self.install_users.iter().cloned(), right)
+    }
+
+    /// 利用者に付ける権利（利用者が 0 人なら [`UserRight::Modify`]）。
+    pub fn right(&self) -> UserRight {
+        self.right
     }
 
     /// 利用者が**ちょうど 1 人**のときだけ、その SID（0 人・複数なら `None`。複数を
@@ -330,7 +393,7 @@ impl DirAccess {
             (ADMINISTRATORS_SID.to_owned(), FULL_ACCESS_MASK),
         ];
         for user in &self.install_users {
-            aces.push((user.0.clone(), MODIFY_ACCESS_MASK));
+            aces.push((user.0.clone(), self.right.mask()));
         }
         aces
     }
@@ -338,8 +401,9 @@ impl DirAccess {
     /// 作るとき・直すときに使う SDDL（`D:P` = 保護された DACL）。
     pub fn sddl(&self) -> String {
         let mut sddl = format!("D:P(A;OICI;FA;;;{SYSTEM_SID})(A;OICI;FA;;;{ADMINISTRATORS_SID})");
+        let mask = self.right.mask();
         for user in &self.install_users {
-            sddl.push_str(&format!("(A;OICI;{MODIFY_ACCESS_MASK:#x};;;{})", user.0));
+            sddl.push_str(&format!("(A;OICI;{mask:#x};;;{})", user.0));
         }
         sddl
     }
@@ -408,12 +472,16 @@ pub fn check_dacl(
     if let Some((sid, mask)) = expected.into_iter().next() {
         return Err(AclMismatch::MissingAce { sid, mask });
     }
+    // 所有者として許すのは SYSTEM・Administrators と、**「変更」の利用者だけ**（#623 PR-1c、
+    // 設計 §2.2）。所有者は DACL に関わらず `WRITE_DAC` を持つので、「読み取り」の利用者が
+    // 所有者のままだと運用モードの DACL を本人が戻せる。
     let owner_allowed = observed.owner == SYSTEM_SID
         || observed.owner == ADMINISTRATORS_SID
-        || access
-            .install_users
-            .iter()
-            .any(|user| user.0 == observed.owner);
+        || (access.right == UserRight::Modify
+            && access
+                .install_users
+                .iter()
+                .any(|user| user.0 == observed.owner));
     if !owner_allowed {
         return Err(AclMismatch::DisallowedOwner {
             sid: observed.owner.clone(),
@@ -763,6 +831,270 @@ impl PinnedDir {
     }
 }
 
+/// モードの ACL（#623 PR-1c、[`crate::mode`] のモジュール doc）。どれも握ったハンドルを木の
+/// ルートとして、パスを使わずに歩く。
+#[cfg(windows)]
+impl PinnedDir {
+    /// 木のルートとして扱えるか（reparse point・フォルダでない物には何もしない）。
+    fn as_tree_root(&self) -> Result<()> {
+        if self.info.is_reparse_point {
+            return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
+        }
+        if !self.info.is_dir {
+            return Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory));
+        }
+        Ok(())
+    }
+
+    /// ルート自身が EFS で暗号化されていれば、その問題（1 周目・2 周目の入口）。
+    fn root_encrypted(&self) -> Result<Option<crate::mode::TreeProblem>> {
+        let info = imp::info_of(self.handle.raw())?;
+        Ok(info.encrypted.then(|| crate::mode::TreeProblem::Encrypted {
+            path: self.final_path.clone(),
+        }))
+    }
+
+    /// **1 周目**（読むだけ。設計 §2.3）: 木の全体を辿らずに確かめ、締められない物
+    /// （[`crate::mode::TreeProblem`]）が 1 つでもあれば**何も変えずに**
+    /// [`crate::mode::ScanRefusal::Problems`] で断る（見つけた物を全部並べる）。子は 2 周目と
+    /// 同じ権利で開く（`FILE_READ_ATTRIBUTES` だけだと親の `FILE_LIST_DIRECTORY` から暗黙に
+    /// 開けてしまい、2 周目で開けない子を見落とす）。`stop` は各フォルダの境で見て、
+    /// [`crate::mode::StopSignal::None`] 以外なら何も変えずに
+    /// [`crate::mode::ScanRefusal::Stopped`]。`progress` は物 1 つごと。
+    pub fn scan_tree(
+        &self,
+        stop: &dyn Fn() -> crate::mode::StopSignal,
+        progress: &mut dyn FnMut(&crate::mode::Progress),
+    ) -> std::result::Result<crate::mode::ScanReport, crate::mode::ScanRefusal> {
+        use crate::mode::{Progress, ScanRefusal, ScanReport};
+        self.as_tree_root().map_err(ScanRefusal::Io)?;
+        let mut recorded = Vec::new();
+        if let Some(problem) = self.root_encrypted().map_err(ScanRefusal::Io)? {
+            recorded.push(problem);
+        }
+        let _serial = self.enum_guard();
+        let mut walk = imp::Walk {
+            within: &self.final_path,
+            on_skip: imp::OnSkip::Record,
+            order: imp::Order::RootFirst,
+            write: None,
+            strict: true,
+            place_markers: false,
+            stop,
+            progress,
+            counts: Progress {
+                examined: 1,
+                written: 0,
+            },
+            recorded,
+        };
+        match imp::walk_dir(&mut walk, self.handle.raw(), &self.final_path, 0) {
+            Ok(()) => {}
+            Err(imp::WalkStop::Stopped(signal)) => return Err(ScanRefusal::Stopped(signal)),
+            Err(imp::WalkStop::Io(error)) => return Err(ScanRefusal::Io(error)),
+            Err(imp::WalkStop::Problem(problem)) => {
+                return Err(ScanRefusal::Problems(vec![problem]))
+            }
+        }
+        if !walk.recorded.is_empty() {
+            return Err(ScanRefusal::Problems(walk.recorded));
+        }
+        Ok(ScanReport {
+            examined: walk.counts.examined,
+        })
+    }
+
+    /// **2 周目**（締める。設計 §2.4）: 運用モードの形（`mode.operation()`: 利用者に
+    /// 「読み取りと実行」、所有者 Administrators、保護された DACL）を、**上から順に、締めてから
+    /// 中を列挙して**木の全体へ書く。締められない物に会ったら**その場で止めて**
+    /// [`crate::mode::CloseAbort`]（`written` までは締めてある。呼ぶ側は `relax_tree` で緩め直す。
+    /// PRESHUTDOWN なら緩めない）。印のファイルには印の記述子を書き直す。ID で開いた物は本当の
+    /// パスが木の中であることを確かめてから書く。`stop` は各フォルダの境で見る（ルートに書く
+    /// 前が最初）。成功したら進み具合（確かめた数・書いた数）を返す。
+    ///
+    /// 所有者を Administrators に移すので、LocalSystem・昇格した管理者から呼ぶ（非昇格は
+    /// `ERROR_INVALID_OWNER`(1307) で、ルートにも書かずに止まる）。
+    pub fn close_tree(
+        &self,
+        mode: &crate::mode::ModeAccess,
+        stop: &dyn Fn() -> crate::mode::StopSignal,
+        progress: &mut dyn FnMut(&crate::mode::Progress),
+    ) -> std::result::Result<crate::mode::Progress, crate::mode::CloseAbort> {
+        use crate::mode::{AbortReason, CloseAbort, Progress};
+        let io = |error| CloseAbort {
+            written: 0,
+            reason: AbortReason::Io(error),
+        };
+        self.as_tree_root().map_err(io)?;
+        let operation = mode.operation();
+        imp::ensure_user_account(operation).map_err(io)?;
+        if let Some(problem) = self.root_encrypted().map_err(io)? {
+            return Err(CloseAbort {
+                written: 0,
+                reason: AbortReason::Problem(problem),
+            });
+        }
+        let dir_sd = imp::owned_protected_sd(operation, true).map_err(io)?;
+        let file_sd = imp::owned_protected_sd(operation, false).map_err(io)?;
+        let marker_sd = imp::marker_descriptor().map_err(io)?;
+        let _serial = self.enum_guard();
+        let mut walk = imp::Walk {
+            within: &self.final_path,
+            on_skip: imp::OnSkip::Abort,
+            order: imp::Order::RootFirst,
+            write: Some(imp::WriteSet {
+                dir_sd: &dir_sd,
+                file_sd: &file_sd,
+                marker_sd: &marker_sd,
+            }),
+            strict: true,
+            place_markers: true,
+            stop,
+            progress,
+            counts: Progress {
+                examined: 1,
+                written: 0,
+            },
+            recorded: Vec::new(),
+        };
+        match imp::walk_dir(&mut walk, self.handle.raw(), &self.final_path, 0) {
+            Ok(()) => Ok(walk.counts),
+            Err(stop) => Err(CloseAbort {
+                written: walk.counts.written,
+                reason: match stop {
+                    imp::WalkStop::Problem(problem) => AbortReason::Problem(problem),
+                    imp::WalkStop::Stopped(signal) => AbortReason::Stopped(signal),
+                    imp::WalkStop::Io(error) => AbortReason::Io(error),
+                },
+            }),
+        }
+    }
+
+    /// **緩める**（設計 §2.5）: 設定モードの形（`mode.setting()`: 利用者に「変更」、所有者
+    /// Administrators、保護された DACL）を、**下から順に、ルートを最後に**木の全体へ書く。
+    /// 会った reparse point・ハードリンク・開けない子・使用中の子・深すぎる木は**飛ばして記録し、
+    /// 続ける**（[`crate::mode::RelaxReport::skipped`]。締まったまま残る = 安全側）。印のファイル
+    /// には印の記述子のまま（利用者の ACE を付けない）。止める合図は見ない（途中で止めると
+    /// 「ルートは締まっている・下の一部は緩い」が残るだけで得が無い）。緩い木に対しても冪等。
+    ///
+    /// 昇格ヘルパーの `install`・修復もこれを使う（木を書くすべての書き手が同じ順序を守る
+    /// ことで「ルートが緩んでいる ⇔ 全体が緩み終わった」が成り立つ。設計 §3.5）。
+    pub fn relax_tree(
+        &self,
+        mode: &crate::mode::ModeAccess,
+        progress: &mut dyn FnMut(&crate::mode::Progress),
+    ) -> Result<crate::mode::RelaxReport> {
+        use crate::mode::{Progress, RelaxReport, StopSignal};
+        self.as_tree_root()?;
+        let setting = mode.setting();
+        imp::ensure_user_account(setting)?;
+        let dir_sd = imp::owned_protected_sd(setting, true)?;
+        let file_sd = imp::owned_protected_sd(setting, false)?;
+        let marker_sd = imp::marker_descriptor()?;
+        let _serial = self.enum_guard();
+        let mut walk = imp::Walk {
+            within: &self.final_path,
+            on_skip: imp::OnSkip::Record,
+            order: imp::Order::RootLast,
+            write: Some(imp::WriteSet {
+                dir_sd: &dir_sd,
+                file_sd: &file_sd,
+                marker_sd: &marker_sd,
+            }),
+            strict: false,
+            place_markers: false,
+            stop: &|| StopSignal::None,
+            progress,
+            counts: Progress {
+                examined: 1,
+                written: 0,
+            },
+            recorded: Vec::new(),
+        };
+        match imp::walk_dir(&mut walk, self.handle.raw(), &self.final_path, 0) {
+            Ok(()) => Ok(RelaxReport {
+                written: walk.counts.written,
+                skipped: walk.recorded,
+            }),
+            Err(imp::WalkStop::Io(error)) => Err(error),
+            // `Record` は止めず、`stop` は常に続けるので来ない。
+            Err(other) => Err(SafeRootError::io(
+                crate::error::IoOp::InspectDir,
+                &std::io::Error::other(format!("緩める途中で止まりました（{other:?}）")),
+            )),
+        }
+    }
+
+    /// 印のファイル（[`crate::mode::MARKER_NAME`]）を、このフォルダに**無ければ置く**（設計
+    /// §2.9 (a)）: 空のファイルを、SYSTEM・Administrators だけ・所有者 Administrators・利用者の
+    /// ACE なしの記述子を**作るのと同時に**付けて、握ったハンドル基準で作る。既にあれば、
+    /// 共有 READ だけ・`DELETE` を求めて開き（利用者が書き込み・削除で握っていれば
+    /// [`crate::mode::MarkerError::Busy`]）、ファイル・reparse point でない・リンク数 1 を確かめて
+    /// 記述子を印の形に書き直す（設定モードで管理者・利用者が触った場合に揃える）。合わなければ
+    /// [`crate::mode::MarkerError::Occupied`]。2 周目（`close_tree`）は木の**すべての**フォルダに
+    /// 同じ印を置くので、締めた直後のフォルダでは `Existed` になる。
+    ///
+    /// 置いた後（既にあった後）に、**握ったこのハンドルで自分の reparse 属性を読み直し**、
+    /// reparse point なら [`crate::mode::MarkerError::DirIsReparse`]（印を置く前に、締める前から
+    /// 開いていたハンドルで `FSCTL_SET_REPARSE_POINT` されていた。改ざんとみなして呼ぶ側は
+    /// エンジンを動かさない）。作れなかったときも同じ確かめをして、reparse ならそれを理由にする。
+    /// 空でないフォルダは reparse point にできないので、置いた後は reparse 化されない。
+    pub fn ensure_marker(
+        &self,
+    ) -> std::result::Result<crate::mode::MarkerOutcome, crate::mode::MarkerError> {
+        use crate::mode::MarkerError;
+        let own_reparse = || -> Option<MarkerError> {
+            match crate::handle_io::facts(self.handle.raw()) {
+                Ok(facts) if facts.is_reparse => Some(MarkerError::DirIsReparse {
+                    tag: facts.reparse_tag,
+                }),
+                _ => None,
+            }
+        };
+        let outcome = match imp::place_marker(self.handle.raw()) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                if let Some(error) = own_reparse() {
+                    return Err(error);
+                }
+                return Err(match failure {
+                    imp::MarkerFailure::Occupied(refusal) => MarkerError::Occupied(refusal),
+                    imp::MarkerFailure::Busy(os_error) => MarkerError::Busy { os_error },
+                    imp::MarkerFailure::Io(error) => MarkerError::Io(error),
+                });
+            }
+        };
+        let facts = crate::handle_io::facts(self.handle.raw()).map_err(MarkerError::Io)?;
+        if facts.is_reparse {
+            return Err(MarkerError::DirIsReparse {
+                tag: facts.reparse_tag,
+            });
+        }
+        Ok(outcome)
+    }
+
+    /// 確かめ直し（設計 §2.9 (b)(d)。パスで渡す直前）: 握ったこのハンドルで自分の属性を読み直し
+    /// （reparse point なら [`crate::mode::RecheckFailure::ReparsePoint`]）、記述子を読み直して
+    /// `expected`（運用モードの形）に [`check_dacl`] で通るか確かめる。何も変えない。
+    pub fn recheck(
+        &self,
+        expected: &DirAccess,
+    ) -> std::result::Result<(), crate::mode::RecheckFailure> {
+        use crate::mode::RecheckFailure;
+        let facts = crate::handle_io::facts(self.handle.raw()).map_err(RecheckFailure::Io)?;
+        if facts.is_reparse {
+            return Err(RecheckFailure::ReparsePoint {
+                tag: facts.reparse_tag,
+            });
+        }
+        if !facts.is_dir {
+            return Err(RecheckFailure::NotADirectory);
+        }
+        let dacl = imp::read_dacl_of_handle(self.handle.raw()).map_err(RecheckFailure::Io)?;
+        check_dacl(&dacl, expected).map_err(RecheckFailure::Acl)
+    }
+}
+
 #[cfg(windows)]
 impl PinnedDir {
     /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の子のフォルダを
@@ -1041,6 +1373,7 @@ pub(crate) mod imp {
 
     use super::{check_dacl, DirAccess, ObservedAce, ObservedDacl};
     use crate::error::{AclMismatch, IoOp, Result, SafeRootError};
+    use crate::mode::{Progress, StopSignal, TreeProblem};
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -1301,7 +1634,7 @@ pub(crate) mod imp {
     /// 自己相対の記述子を SDDL から作る。`inheritable` が真なら ACE に `OICI`（フォルダ用）、
     /// 偽なら継承のフラグ無し（ファイル用。監査 Nit 4: ファイルに `(OI)(CI)` が付かない）。
     /// どちらも `O:BA`（所有者 Administrators）と `D:P`（保護された DACL）。
-    fn owned_protected_sd(access: &DirAccess, inheritable: bool) -> Result<LocalBox> {
+    pub(crate) fn owned_protected_sd(access: &DirAccess, inheritable: bool) -> Result<LocalBox> {
         // `access.sddl()` は `D:P(A;OICI;FA;;;SY)...`。ファイルは `OICI` を外す（ACE の
         // フラグ欄だけが OICI なので、文字列の `OICI` を取り除けば継承のフラグ無しになる）。
         let dacl = access.sddl();
@@ -1364,21 +1697,28 @@ pub(crate) mod imp {
         pub(crate) handle: OwnedHandle,
         pub(crate) is_dir: bool,
         pub(crate) is_reparse: bool,
+        /// reparse の tag（reparse point でなければ 0）。
+        pub(crate) reparse_tag: u32,
+        /// `FILE_ATTRIBUTE_ENCRYPTED`（EFS）。
+        pub(crate) encrypted: bool,
         pub(crate) links: u32,
     }
 
-    // `set_security_tree` が再帰のときに子へ書いた直後に呼ぶフック（テスト専用。
-    // 子をその場で reparse point にすり替える反証 (d) に使う）。本番では `None`。
+    // 木を歩く部品（[`walk_dir`]）が子へ書いた直後に呼ぶフック（テスト専用。子をその場で
+    // reparse point にすり替える反証 (d)、まだ締めていない孫にジャンクションを植える反証、
+    // 緩めるときにルートがまだ締まっていることの観測に使う）。本番では `None`。
     #[cfg(test)]
-    pub(super) type AfterChildHook = Box<dyn Fn(HANDLE)>;
+    pub(crate) type AfterChildHook = Box<dyn Fn(HANDLE)>;
     #[cfg(test)]
     thread_local! {
-        pub(super) static AFTER_CHILD_WRITTEN: std::cell::RefCell<Option<AfterChildHook>> =
+        pub(crate) static AFTER_CHILD_WRITTEN: std::cell::RefCell<Option<AfterChildHook>> =
             const { std::cell::RefCell::new(None) };
     }
 
     /// 子を開くときの、DACL と所有者を書ける権利（`pin_dir` と同じ）。`FILE_LIST_DIRECTORY`
-    /// はフォルダの列挙に要る（ファイルでは読み取りになるだけで害はない）。
+    /// はフォルダの列挙に要る（ファイルでは読み取りになるだけで害はない）。1 周目（読むだけ）も
+    /// 同じ権利で開く: `FILE_READ_ATTRIBUTES` だけだと親の `FILE_LIST_DIRECTORY` から暗黙に
+    /// 許されて開けてしまい、2 周目で開けない子を見落とすため（設計 §2.3）。
     fn child_access() -> u32 {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
@@ -1386,23 +1726,59 @@ pub(crate) mod imp {
         READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | WRITE_DAC | WRITE_OWNER
     }
 
-    /// `handle` が指すオブジェクトの属性（ディレクトリか・reparse point か・リンク数）を
+    /// ハンドルから読んだ属性（[`info_of`]）。
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct ObjectInfo {
+        pub(crate) is_dir: bool,
+        pub(crate) is_reparse: bool,
+        /// reparse の tag（reparse point でなければ 0。読めなければ 0 のまま）。
+        pub(crate) reparse_tag: u32,
+        /// `FILE_ATTRIBUTE_ENCRYPTED`。
+        pub(crate) encrypted: bool,
+        pub(crate) links: u32,
+    }
+
+    /// `handle` が指すオブジェクトの属性（ディレクトリか・reparse point か・tag・EFS・リンク数）を
     /// ハンドルから読む。
-    fn info_of(handle: HANDLE) -> Result<(bool, bool, u32)> {
+    pub(crate) fn info_of(handle: HANDLE) -> Result<ObjectInfo> {
         use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_REPARSE_POINT,
+            FileAttributeTagInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
         };
         // SAFETY: 全フィールドが整数の構造体。`handle` は有効。
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
             return Err(api("GetFileInformationByHandle", last_error()));
         }
-        Ok((
-            info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
-            info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
-            info.nNumberOfLinks,
-        ))
+        let is_reparse = info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let mut reparse_tag = 0;
+        if is_reparse {
+            let mut tag = FILE_ATTRIBUTE_TAG_INFO {
+                FileAttributes: 0,
+                ReparseTag: 0,
+            };
+            // SAFETY: `handle` は有効、`tag` は大きさの合う書き込み先。
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    handle,
+                    FileAttributeTagInfo,
+                    (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                    std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+                )
+            };
+            // tag はログで見分けるためだけ。読めなくても reparse point として扱う（0 のまま）。
+            if ok != 0 {
+                reparse_tag = tag.ReparseTag;
+            }
+        }
+        Ok(ObjectInfo {
+            is_dir: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            is_reparse,
+            reparse_tag,
+            encrypted: info.dwFileAttributes & FILE_ATTRIBUTE_ENCRYPTED != 0,
+            links: info.nNumberOfLinks,
+        })
     }
 
     /// [`open_child_by_id`] の結果。
@@ -1411,13 +1787,16 @@ pub(crate) mod imp {
         /// 列挙と開くの間に消えた。**開いた物の本当のパスが木の外**（列挙と開くの間に木の外へ
         /// 移された）ときもこれにする（書かない・数えない。#623 PR-1b、設計 §2.4 の 3）。
         Vanished,
-        /// 開けなかった（利用者が Administrators を拒否した・所有権が無いなど）。触らず飛ばす
-        /// （監査 Should 1。特権は有効にしない）。
+        /// 開けなかった（利用者が Administrators を拒否した・所有権が無いなど。
+        /// `ERROR_ACCESS_DENIED`）。特権は有効にしない。
         Denied,
+        /// 使用中で開けなかった（共有違反 32・ロック違反 33。利用者が `DELETE` を持つハンドルで
+        /// 開いている。#623 PR-1c）。中身は OS のエラー番号。
+        Busy(u32),
     }
 
-    // `handle_child` が列挙の後・ID で開く前に呼ぶフック（テスト専用。子を木の外へ移す反証に
-    // 使う。#623 PR-1b）。本番では `None`。
+    // 子を列挙の後・ID で開く前に呼ぶフック（テスト専用。子を木の外へ移す反証に使う。
+    // #623 PR-1b）。本番では `None`。
     #[cfg(test)]
     pub(crate) type BeforeChildOpenHook = Box<dyn Fn(&Path)>;
     #[cfg(test)]
@@ -1445,7 +1824,8 @@ pub(crate) mod imp {
         within: &Path,
     ) -> Result<ChildOpen> {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND,
+            ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE,
         };
         use windows_sys::Win32::Storage::FileSystem::{
             OpenFileById, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128,
@@ -1481,69 +1861,391 @@ pub(crate) mod imp {
             if os_error == ERROR_ACCESS_DENIED {
                 return Ok(ChildOpen::Denied);
             }
+            if os_error == ERROR_SHARING_VIOLATION || os_error == ERROR_LOCK_VIOLATION {
+                return Ok(ChildOpen::Busy(os_error));
+            }
             return Err(SafeRootError::io(
                 IoOp::InspectDir,
                 &std::io::Error::from_raw_os_error(os_error as i32),
             ));
         }
         let handle = OwnedHandle(handle);
-        let (is_dir, is_reparse, links) = info_of(handle.0)?;
+        let info = info_of(handle.0)?;
         // ハードリンク（ファイルでリンク数 2 以上）は本当のパスに**どれか 1 つの名前**が返り、木の
         // 外の名前のこともあるので、ここでは確かめずにそのまま返す（呼ぶ側は必ず書かずに飛ばす・
-        // 断る。`handle_child` は `ResetSkips::hardlink` に記録する）。それ以外は木の中か確かめる。
-        let hardlink = !is_dir && links >= 2;
+        // 断る）。それ以外は木の中か確かめる。
+        let hardlink = !info.is_dir && info.links >= 2;
         if !hardlink && !crate::guard::is_same_or_inside(&final_path_of(handle.0)?, within) {
             // 列挙と開くの間に木の外へ移された。書かない・数えない（消えたのと同じ）。
             return Ok(ChildOpen::Vanished);
         }
         Ok(ChildOpen::Opened(Opened {
             handle,
-            is_dir,
-            is_reparse,
-            links,
+            is_dir: info.is_dir,
+            is_reparse: info.is_reparse,
+            reparse_tag: info.reparse_tag,
+            encrypted: info.encrypted,
+            links: info.links,
         }))
     }
 
-    /// 開いた**ハンドルで**、そのオブジェクトと中の子へ、保護された DACL と所有者を書く
-    /// （[`super::PinnedDir::reset_acl`]、#392 B3-3b の監査 Must 2・[A]）。
-    ///
-    /// - 対象そのもの: `handle`（呼ぶ側が辿らずに開き、reparse でないことを確かめ済み）に
-    ///   [`set_object_security`]（自動の伝播をしない）で書く。
-    /// - 中の子: **パスを一切使わず**、`handle` を列挙
-    ///   （`GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)`）して得た 128 ビットのファイル ID を、
-    ///   [`open_child_by_id`]（ヒント = 親のハンドル）で辿らずに開き、
-    ///   - **reparse point** は触らず・辿らず、飛ばして [`super::ResetSkips::reparse`] に記録。
-    ///   - **ハードリンク（ファイルでリンク数 2 以上）** は触らず、飛ばして
-    ///     [`super::ResetSkips::hardlink`] に記録（記述子を共有するので、書くと外の名前の
-    ///     アクセスを変える。#624 は「書き換えない」ことだけ解消。その名前の DACL は直らない）。
-    ///   - それ以外は [`set_object_security`] で書き、フォルダなら**その子のハンドルを列挙元
-    ///     として**再帰する。
-    ///
-    /// ハンドルとファイル ID だけで辿るので、確かめてから書くまでの間に子を**その場で**
-    /// ジャンクションにされても、列挙はそのディレクトリ（空）そのものを返し、ID で開くのは
-    /// その object そのもの - リンクの先には決して向かない。`recurse` が偽なら対象そのものだけ
-    /// 書く（監査 Nit 3: すでにルートの再帰で書いた部分木を、`secrets`・`hub-keys` の層で
-    /// 書き直さない）。
-    pub(super) fn set_security_tree(
-        handle: HANDLE,
-        real_dir: &Path,
-        access: &DirAccess,
-        recurse: bool,
-        skips: &mut super::ResetSkips,
-    ) -> Result<()> {
-        ensure_user_account(access)?;
-        let dir_sd = owned_protected_sd(access, true)?;
-        set_object_security(handle, &dir_sd)?;
-        if recurse {
-            let file_sd = owned_protected_sd(access, false)?;
-            propagate(handle, real_dir, real_dir, &dir_sd, &file_sd, 0, skips)?;
-        }
-        Ok(())
+    /// 印のファイル（[`crate::mode::MARKER_NAME`]）用の記述子: SYSTEM・Administrators だけ、
+    /// 継承のフラグなし、所有者 Administrators（利用者の ACE なし。設計 §2.9 (a)）。
+    pub(crate) fn marker_descriptor() -> Result<LocalBox> {
+        owned_protected_sd(&DirAccess::service_only(), false)
     }
 
-    /// 自前の再帰の深さの上限（監査 Nit 1。これを超えたら 1 で止める。インストール利用者が
-    /// とても深いフォルダを作ってスタックをあふれさせるのを防ぐ）。
-    const MAX_DEPTH: u32 = 512;
+    /// `handle` が指す物の 128 ビットのファイル ID（`FileIdInfo`。列挙の `FileIdExtdDirectoryInfo`
+    /// と同じ ID の空間）。
+    pub(crate) fn file_id_of(handle: HANDLE) -> Result<[u8; 16]> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+        };
+        // SAFETY: 全フィールドが整数の構造体（ゼロは有効な値）。
+        let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` は有効、`info` は大きさの合う書き込み先。
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(api(
+                "GetFileInformationByHandleEx(FileIdInfo)",
+                last_error(),
+            ));
+        }
+        Ok(info.FileId.Identifier)
+    }
+
+    /// `dir`（開いているフォルダのハンドル）を、**同じオブジェクト**として開き直す（`NtCreateFile` の
+    /// 空の名前 + `RootDirectory`。パスを使わない）。列挙の位置はファイルオブジェクトに付くので、
+    /// 名前のマスクつきの照会（[`marker_entry`]）を元のハンドルの列挙と混ぜないために使う。
+    fn reopen_dir_for_listing(dir: HANDLE) -> Result<OwnedHandle> {
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        };
+        use windows_sys::Win32::Foundation::{
+            RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, SYNCHRONIZE,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let empty = UNICODE_STRING {
+            Length: 0,
+            MaximumLength: 0,
+            Buffer: std::ptr::null_mut(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: dir,
+            ObjectName: &empty,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: 全フィールドが整数・ポインタの構造体。
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir` は開いているフォルダのハンドル。空の名前はそのオブジェクト自身を開く。
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE
+                    | FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_FOR_BACKUP_INTENT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: NTSTATUS を Win32 のエラーに写すだけ。
+            return Err(api("NtCreateFile(self)", unsafe {
+                RtlNtStatusToDosError(status)
+            }));
+        }
+        Ok(OwnedHandle(handle))
+    }
+
+    /// `dir` の中で、**OS が [`crate::mode::MARKER_NAME`] の名前に解決する子**（印の席）を、
+    /// **その子を開かずに**得る（Fable レビュー M-1・オーナーレビュー P2）: 親を開き直した
+    /// ハンドルに `NtQueryDirectoryFile` を名前のマスク `MARKER_NAME`・1 件だけで問い合わせる。
+    /// 名前の照合は OS のもの（大文字小文字の折り畳み・フォルダごとの大文字小文字の区別）で、
+    /// 要るのは親の `FILE_LIST_DIRECTORY` だけ - **子の DACL では拒否されない**ので、
+    /// 「席を開けないので同一性が分からない」状態が無い。返すのは 128 ビットのファイル ID・
+    /// 列挙の時点の属性・実際の綴り。木を歩く部品は、列挙した子の ID がこの ID と同じかで
+    /// 印の席を見分ける（綴りが `.BANTO-SAFE-ROOT` でも同じ物なら印、大文字小文字を区別する
+    /// フォルダで綴りだけ同じ別の物なら印ではない）。無ければ `None`。
+    pub(crate) fn marker_entry(dir: HANDLE) -> Result<Option<DirEntryRaw>> {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FileIdExtdDirectoryInformation, NtQueryDirectoryFile,
+        };
+        use windows_sys::Win32::Foundation::{
+            RtlNtStatusToDosError, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ID_EXTD_DIR_INFO;
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let listing = reopen_dir_for_listing(dir)?;
+        let name: Vec<u16> = crate::mode::MARKER_NAME.encode_utf16().collect();
+        let mask = UNICODE_STRING {
+            Length: (name.len() * 2) as u16,
+            MaximumLength: (name.len() * 2) as u16,
+            Buffer: name.as_ptr() as *mut u16,
+        };
+        // 8 バイト境界のバッファ（1 件 + 名前）。
+        let mut buffer = vec![0u64; 1024];
+        // SAFETY: 全フィールドが整数・ポインタの構造体。
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `listing` は FILE_LIST_DIRECTORY を持つ、このためだけに開いたハンドル（マスクは
+        // このハンドルに固定され、元のハンドルの列挙には影響しない）。`buffer` は長さつき。
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                listing.raw(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &mut status_block,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                FileIdExtdDirectoryInformation,
+                true,
+                &mask,
+                true,
+            )
+        };
+        if status == STATUS_NO_SUCH_FILE || status == STATUS_NO_MORE_FILES {
+            return Ok(None);
+        }
+        if status < 0 {
+            // SAFETY: NTSTATUS を Win32 のエラーに写すだけ。
+            return Err(api("NtQueryDirectoryFile", unsafe {
+                RtlNtStatusToDosError(status)
+            }));
+        }
+        // SAFETY: 成功したので先頭に 1 件の `FILE_ID_EXTD_DIR_INFO` がある（バッファ内）。
+        let entry = unsafe { &*(buffer.as_ptr() as *const FILE_ID_EXTD_DIR_INFO) };
+        let name_len = entry.FileNameLength as usize / 2;
+        // SAFETY: `FileName` は可変長で `FileNameLength` バイト続く（バッファ内）。
+        let name_u16 = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len) };
+        drop(listing);
+        Ok(Some(DirEntryRaw {
+            name: String::from_utf16_lossy(name_u16),
+            file_id: entry.FileId.Identifier,
+            attributes: entry.FileAttributes,
+            reparse_tag: entry.ReparsePointTag,
+            len: u64::try_from(entry.EndOfFile).unwrap_or(0),
+        }))
+    }
+
+    /// [`place_marker`] が置けなかった理由。
+    pub(crate) enum MarkerFailure {
+        /// [`crate::mode::MARKER_NAME`] の名前に印でない物（フォルダ・リンク・ハードリンク）がある。
+        Occupied(crate::error::Refusal),
+        /// 既にある印を、誰かが書き込み・削除の権利で開いている（共有違反 32／ロック違反 33。
+        /// 利用者が設定モードで作った偽の印を DELETE のハンドルで握っている筋）。
+        Busy(u32),
+        Io(SafeRootError),
+    }
+
+    /// `parent`（開いているフォルダのハンドル）に印のファイルを置く（設計 §2.9 (a)。
+    /// `PinnedDir::ensure_marker` と 2 周目の [`walk_dir`] が共有）:
+    ///
+    /// - 無ければ、SYSTEM・Administrators だけ・所有者 Administrators・利用者の ACE なしの
+    ///   記述子（[`marker_descriptor`]）を**作るのと同時に**付けて、相対で作る。
+    /// - 作れなかったら、名前がフォルダ・リンク・ハードリンクで塞がっていないかを属性だけで
+    ///   開いて確かめ、塞がっていれば [`MarkerFailure::Occupied`]（`FILE_NON_DIRECTORY_FILE` の
+    ///   作成は、既にあるフォルダでは衝突ではなく拒否（5）になるため）。
+    /// - 既にあれば、**共有 READ だけ・`DELETE` を求めて**開く（利用者が書き込み・削除の権利で
+    ///   握っていれば共有違反 → [`MarkerFailure::Busy`]。設定モードで利用者が置いた偽の印を古い
+    ///   `DELETE` のハンドルで後から消し、フォルダを空にして reparse 化する筋を止める）。開いた
+    ///   ハンドルで属性を読み直して印の形（ファイル・reparse でない・リンク数 1）を確かめ、
+    ///   印の記述子を**そのハンドルで**書き直す（持っている間は誰も新しく握れない）。
+    ///
+    /// 置いた後のフォルダ自身の reparse 属性の読み直しは呼ぶ側。
+    pub(crate) fn place_marker(
+        parent: HANDLE,
+    ) -> std::result::Result<crate::mode::MarkerOutcome, MarkerFailure> {
+        use crate::handle_io::{facts, file_refusal};
+        use crate::mode::{MarkerOutcome, MARKER_NAME};
+        let sd = marker_descriptor().map_err(MarkerFailure::Io)?;
+        match child_relative_handle(parent, MARKER_NAME, ChildHow::CreateFile(Some(&sd))) {
+            Ok(Some(created)) => {
+                drop(created);
+                return Ok(MarkerOutcome::Created);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let occupied =
+                    match child_relative_handle(parent, MARKER_NAME, ChildHow::OpenAttributes) {
+                        Ok(Some(existing)) => {
+                            facts(existing.raw()).ok().and_then(|f| file_refusal(&f))
+                        }
+                        _ => None,
+                    };
+                return Err(match occupied {
+                    Some(refusal) => MarkerFailure::Occupied(refusal),
+                    None => MarkerFailure::Io(error),
+                });
+            }
+        }
+        let existing = match child_relative_handle(parent, MARKER_NAME, ChildHow::OpenFileForUpdate)
+        {
+            Ok(Some(existing)) => existing,
+            Ok(None) => {
+                return Err(MarkerFailure::Io(SafeRootError::io(
+                    IoOp::OpenFile,
+                    &std::io::Error::from(std::io::ErrorKind::NotFound),
+                )))
+            }
+            Err(SafeRootError::Io {
+                os_error: Some(os_error @ (32 | 33)),
+                ..
+            }) => return Err(MarkerFailure::Busy(os_error as u32)),
+            Err(error) => return Err(MarkerFailure::Io(error)),
+        };
+        let info = facts(existing.raw()).map_err(MarkerFailure::Io)?;
+        if let Some(refusal) = file_refusal(&info) {
+            return Err(MarkerFailure::Occupied(refusal));
+        }
+        set_object_security(existing.raw(), &sd).map_err(MarkerFailure::Io)?;
+        drop(existing);
+        Ok(MarkerOutcome::Existed)
+    }
+
+    /// 木を歩くときに、締められない・確かめられない物に会ったら止めるか記録して続けるか
+    /// （設計 §2.4 の末尾。**既定を置かない** - 取り違えると締めたつもりで穴が残るため、
+    /// 呼ぶ側が必ず選ぶ）。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum OnSkip {
+        /// その場で止める（2 周目 `close_tree`）。
+        Abort,
+        /// 記録して続ける（1 周目 `scan_tree`、緩める `relax_tree`、昇格ヘルパーの `reset_acl`）。
+        Record,
+    }
+
+    /// フォルダ自身と中身のどちらを先に書くか（設計 §2.4・§2.5）。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Order {
+        /// 上から: フォルダに書いてから中を列挙する（締める。締めた後は利用者が名前を作れない
+        /// ので列挙の結果が増えない）。
+        RootFirst,
+        /// 下から: 中を先に、フォルダ自身を最後に書く（緩める。ルートが最後 - 「ルートが
+        /// 緩んでいる ⇔ 全体が緩み終わった」）。
+        RootLast,
+    }
+
+    /// 書く記述子の組（`None` なら読むだけ）。
+    pub(crate) struct WriteSet<'a> {
+        /// フォルダ用（`OICI`）。
+        pub(crate) dir_sd: &'a LocalBox,
+        /// ファイル用（継承のフラグなし）。
+        pub(crate) file_sd: &'a LocalBox,
+        /// 印のファイル用（[`marker_descriptor`]。どのモードでも変えない）。
+        pub(crate) marker_sd: &'a LocalBox,
+    }
+
+    /// 木を歩く 1 回分の指定と状態（[`walk_dir`]）。
+    pub(crate) struct Walk<'a> {
+        /// 木のルートの本当のパス（ID で開いた物がその中かを確かめる）。
+        pub(crate) within: &'a Path,
+        pub(crate) on_skip: OnSkip,
+        pub(crate) order: Order,
+        pub(crate) write: Option<WriteSet<'a>>,
+        /// 厳しい確かめ（1 周目・2 周目は真、緩める・修復は偽）: EFS で暗号化された物と、
+        /// [`crate::mode::MARKER_NAME`] の名前のフォルダ（印を置けない）を問題にする。
+        pub(crate) strict: bool,
+        /// フォルダに書いた直後・列挙の前に印のファイルを置く（2 周目だけ。[`place_marker`]。
+        /// 締めた直後に古い書き込みのハンドルで空のフォルダを reparse にされる筋（Codex P1）を、
+        /// 「空のフォルダを残さない」ことで塞ぐ）。
+        pub(crate) place_markers: bool,
+        /// 止める合図（各フォルダの境で 1 回見る）。
+        pub(crate) stop: &'a dyn Fn() -> StopSignal,
+        /// 進み具合の報告（子を開いて数えるごとに 1 回。`examined` は単調に増える。`written` は
+        /// その時点までに書いた数で、開いたばかりの子の分は含まない）。
+        pub(crate) progress: &'a mut dyn FnMut(&Progress),
+        pub(crate) counts: Progress,
+        /// [`OnSkip::Record`] で記録した物（会った順）。
+        pub(crate) recorded: Vec<TreeProblem>,
+    }
+
+    /// [`walk_dir`] が止まった理由。
+    #[derive(Debug)]
+    pub(crate) enum WalkStop {
+        /// [`OnSkip::Abort`] で会った物。
+        Problem(TreeProblem),
+        /// 止める合図。
+        Stopped(StopSignal),
+        /// 列挙・開く・書くの失敗。
+        Io(SafeRootError),
+    }
+
+    impl From<SafeRootError> for WalkStop {
+        fn from(error: SafeRootError) -> Self {
+            Self::Io(error)
+        }
+    }
+
+    impl Walk<'_> {
+        fn problem(&mut self, problem: TreeProblem) -> std::result::Result<(), WalkStop> {
+            match self.on_skip {
+                OnSkip::Abort => Err(WalkStop::Problem(problem)),
+                OnSkip::Record => {
+                    self.recorded.push(problem);
+                    Ok(())
+                }
+            }
+        }
+
+        /// `handle` に `sd` を書く。`child` が真なら（ルート以外）書いた直後にテストのフック
+        /// `AFTER_CHILD_WRITTEN` を呼ぶ。
+        fn write(
+            &mut self,
+            handle: HANDLE,
+            sd: &LocalBox,
+            child: bool,
+        ) -> std::result::Result<(), WalkStop> {
+            set_object_security(handle, sd)?;
+            self.counts.written += 1;
+            #[cfg(not(test))]
+            let _ = child;
+            #[cfg(test)]
+            if child {
+                AFTER_CHILD_WRITTEN.with(|hook| {
+                    if let Some(hook) = hook.borrow().as_ref() {
+                        hook(handle);
+                    }
+                });
+            }
+            Ok(())
+        }
+
+        fn tick(&mut self) {
+            (self.progress)(&self.counts);
+        }
+    }
+
+    /// 自前の再帰の深さの上限（監査 Nit 1。超えた段は見ない・書かない。インストール利用者が
+    /// とても深いフォルダを作ってスタックをあふれさせるのを防ぐ）。#623 PR-1c で 512 から 64 に
+    /// 下げた: 1 段ごとに `walk_dir` → 列挙 → `visit_child` → `visit_opened` の 4 つのフレームを
+    /// 重ねるので、512 段ではサービス・テストの主スレッド（Windows の既定 1 MiB）でデバッグ
+    /// ビルドがあふれた。管理する木（ChronoGazer・Hub）は 4 段以下で、64 段に届く木は利用者が
+    /// 作った入れ子だけ（1 周目が `TooDeep` で断る）。
+    pub(crate) const MAX_DEPTH: u32 = 64;
 
     /// 列挙した子 1 件（[`enumerate_dir`]）。`.`・`..` は含めない。
     pub(crate) struct DirEntryRaw {
@@ -1562,12 +2264,13 @@ pub(crate) mod imp {
     /// `dir_handle`（`FILE_LIST_DIRECTORY` を持つフォルダのハンドル）の中を、**パスを使わずに**
     /// 最初から列挙して、子ごとに `each` を呼ぶ（`GetFileInformationByHandleEx` の
     /// `FileIdExtdDirectoryRestartInfo` → `FileIdExtdDirectoryInfo`。`.`・`..` は除く）。
-    /// [`propagate`] と `ManagedDir::list`（#623 PR-1b）で共有する。列挙の位置はファイル
+    /// [`walk_dir`] と `ManagedDir::list`（#623 PR-1b）で共有する。列挙の位置はファイル
     /// オブジェクトに付くので、同じハンドルを同時に列挙しない（呼ぶ側が直列化する）。
-    pub(crate) fn enumerate_dir(
+    /// `each` の失敗の型 `E` はそのまま返す（API の失敗は `From<SafeRootError>` で写す）。
+    pub(crate) fn enumerate_dir<E: From<SafeRootError>>(
         dir_handle: HANDLE,
-        each: &mut dyn FnMut(DirEntryRaw) -> Result<()>,
-    ) -> Result<()> {
+        each: &mut dyn FnMut(DirEntryRaw) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
         use windows_sys::Win32::Storage::FileSystem::{
             FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, GetFileInformationByHandleEx,
@@ -1594,7 +2297,7 @@ pub(crate) mod imp {
                 if e == ERROR_NO_MORE_FILES {
                     return Ok(());
                 }
-                return Err(api("GetFileInformationByHandleEx", e));
+                return Err(api("GetFileInformationByHandleEx", e).into());
             }
             class = FileIdExtdDirectoryInfo; // 2 回目以降は続きから。
             let base = buffer.as_ptr() as *const u8;
@@ -1624,99 +2327,291 @@ pub(crate) mod imp {
         }
     }
 
-    /// `dir_handle` の中を列挙して、各子にハンドルで書く・再帰する（上の doc）。`display` は
-    /// 飛ばした子の報告のための表示用のパス（開くのには使わない）。`within` は木のルートの
-    /// 本当のパス（ID で開いた物がその中かを確かめる。#623 PR-1b）。`dir_sd` はフォルダ用
-    /// （`OICI`）、`file_sd` はファイル用（継承フラグ無し。Nit 4）。
-    #[allow(clippy::too_many_arguments)]
-    fn propagate(
+    /// `dir_handle`（辿らずに開き、reparse point でないフォルダと確かめ済み）の木を歩く
+    /// （設計 §2.3〜§2.5 の共通の部品。`PinnedDir::{scan_tree, close_tree, relax_tree,
+    /// reset_acl}`）。**パスは一切使わない**: 子は親のハンドルを列挙して得た 128 ビットの
+    /// ファイル ID を [`open_child_by_id`] で辿らずに開き、開いた後にハンドルで属性を読み直し、
+    /// 本当のパスが `within` の中であることを確かめてから扱う。フォルダなら**その子のハンドルを
+    /// 列挙元として**再帰する。
+    ///
+    /// - 各フォルダの境（書く前・列挙する前）で `stop` を 1 回見る。
+    /// - [`Order::RootFirst`] はフォルダ自身に書いてから中を列挙する（締める）。
+    ///   [`Order::RootLast`] は中を先に、フォルダ自身を最後に書く（緩める。列挙はまだ締まって
+    ///   いる間に行うので結果は確定している）。
+    /// - reparse point（tag を問わず）・ハードリンク（ファイルでリンク数 2 以上）・開けない・
+    ///   使用中・EFS（`refuse_encrypted`）・深すぎる（[`MAX_DEPTH`]）は [`OnSkip`] のとおり止める
+    ///   か記録する。どれにも書かない・辿らない。消えた子・木の外へ移された子は飛ばす。
+    /// - 書くときは、フォルダに `dir_sd`、ファイルに `file_sd`、印のファイル（名前が
+    ///   [`crate::mode::MARKER_NAME`]・ファイル・リンク数 1）には `marker_sd`。
+    /// - `display` は表示用のパス（開くのには使わない）。`depth` はこのフォルダの段（ルート 0）。
+    ///   ルート自身は数えない（呼ぶ側が `counts.examined` に 1 を入れておく）。
+    pub(crate) fn walk_dir(
+        walk: &mut Walk<'_>,
         dir_handle: HANDLE,
         display: &Path,
-        within: &Path,
-        dir_sd: &LocalBox,
-        file_sd: &LocalBox,
         depth: u32,
-        skips: &mut super::ResetSkips,
-    ) -> Result<()> {
-        if depth >= MAX_DEPTH {
-            return Err(SafeRootError::io(
-                IoOp::InspectDir,
-                &std::io::Error::other(format!(
-                    "フォルダの入れ子が深すぎます（{MAX_DEPTH} 段で打ち切り）"
-                )),
-            ));
+    ) -> std::result::Result<(), WalkStop> {
+        match (walk.stop)() {
+            StopSignal::None => {}
+            signal => return Err(WalkStop::Stopped(signal)),
         }
+        if depth >= MAX_DEPTH {
+            return walk.problem(TreeProblem::TooDeep {
+                path: display.to_path_buf(),
+            });
+        }
+        if walk.order == Order::RootFirst {
+            if let Some(set) = &walk.write {
+                let sd = set.dir_sd;
+                walk.write(dir_handle, sd, depth > 0)?;
+            }
+            if walk.place_markers {
+                place_marker_in_walk(walk, dir_handle, display)?;
+            }
+        }
+        // 印の席を OS の名前の解決で探す（綴りでは比べない。Fable レビュー M-1）。厳しい確かめ
+        // （1 周目・2 周目）では、席をフォルダが塞いでいれば印を置けないので断る。
+        // 印の席（OS が `MARKER_NAME` に解決する子）を、子を開かずに親の列挙で解く（綴りでは
+        // 比べない。席の DACL に依らないので、開けない席を後から開けるようにされても同一性を
+        // 見失わない。Fable M-1・オーナーレビュー P2）。席をフォルダが塞いでいれば
+        // `MarkerOccupied`（厳しい確かめ）。`Record`（1 周目）では記録して残りの子の列挙を続ける。
+        let marker_id = match marker_entry(dir_handle)? {
+            Some(entry)
+                if walk.strict
+                    && entry.attributes
+                        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+                        != 0 =>
+            {
+                walk.problem(TreeProblem::MarkerOccupied {
+                    path: display.join(&entry.name),
+                })?;
+                None
+            }
+            Some(entry) => Some(entry.file_id),
+            None => None,
+        };
         enumerate_dir(dir_handle, &mut |entry| {
-            handle_child(
+            visit_child(
+                walk,
                 dir_handle,
                 &display.join(&entry.name),
-                within,
+                marker_id == Some(entry.file_id),
                 entry.file_id,
-                dir_sd,
-                file_sd,
                 depth,
-                skips,
             )
-        })
+        })?;
+        if walk.order == Order::RootLast {
+            if let Some(set) = &walk.write {
+                let sd = set.dir_sd;
+                walk.write(dir_handle, sd, depth > 0)?;
+            }
+        }
+        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn handle_child(
+    /// 2 周目: フォルダに書いた直後・列挙の前に印を置き（[`place_marker`]）、置けた後に
+    /// **そのフォルダの属性をハンドルで読み直す**（Codex P1）。締めた後は利用者が名前を作れないが、
+    /// 締める前から開いていた書き込みのハンドルで**空の**フォルダは reparse にできる。印を置いた
+    /// 後は空でないので reparse にできず、印は利用者に消せない。置けなかったときは、その間に
+    /// reparse にされていればそれを理由に（[`TreeProblem::ReparsePoint`]）、印の名前が塞がって
+    /// いれば [`TreeProblem::MarkerOccupied`]、偽の印が握られていれば [`TreeProblem::Busy`]。
+    fn place_marker_in_walk(
+        walk: &mut Walk<'_>,
+        dir_handle: HANDLE,
+        display: &Path,
+    ) -> std::result::Result<(), WalkStop> {
+        let reparse_now = |handle: HANDLE| -> Option<TreeProblem> {
+            match info_of(handle) {
+                Ok(info) if info.is_reparse => Some(TreeProblem::ReparsePoint {
+                    path: display.to_path_buf(),
+                    tag: info.reparse_tag,
+                }),
+                _ => None,
+            }
+        };
+        if let Err(failure) = place_marker(dir_handle) {
+            if let Some(problem) = reparse_now(dir_handle) {
+                return walk.problem(problem);
+            }
+            return match failure {
+                MarkerFailure::Occupied(_) => walk.problem(TreeProblem::MarkerOccupied {
+                    path: display.join(crate::mode::MARKER_NAME),
+                }),
+                MarkerFailure::Busy(os_error) => walk.problem(TreeProblem::Busy {
+                    path: display.join(crate::mode::MARKER_NAME),
+                    os_error,
+                }),
+                MarkerFailure::Io(error) => Err(WalkStop::Io(error)),
+            };
+        }
+        // 置けた後にも読み直す（置けた後は reparse 化できないはずだが、多重の防御）。
+        let info = info_of(dir_handle)?;
+        if info.is_reparse {
+            return walk.problem(TreeProblem::ReparsePoint {
+                path: display.to_path_buf(),
+                tag: info.reparse_tag,
+            });
+        }
+        Ok(())
+    }
+
+    /// `is_marker`: この子が親の印の席（[`marker_entry`] の ID と同じ物）か。
+    fn visit_child(
+        walk: &mut Walk<'_>,
         parent: HANDLE,
         display_child: &Path,
-        within: &Path,
+        is_marker: bool,
         file_id: [u8; 16],
-        dir_sd: &LocalBox,
-        file_sd: &LocalBox,
         depth: u32,
-        skips: &mut super::ResetSkips,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), WalkStop> {
         #[cfg(test)]
         BEFORE_CHILD_OPEN.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
                 hook(display_child);
             }
         });
-        let opened = match open_child_by_id(parent, file_id, within)? {
+        let opened = match open_child_by_id(parent, file_id, walk.within)? {
             ChildOpen::Opened(opened) => opened,
             ChildOpen::Vanished => return Ok(()),
             ChildOpen::Denied => {
-                // 開けない子は触らず飛ばして記録（監査 Should 1。特権は有効にしない）。
-                skips.denied.push(display_child.to_path_buf());
-                return Ok(());
+                return walk.problem(TreeProblem::Denied {
+                    path: display_child.to_path_buf(),
+                })
+            }
+            ChildOpen::Busy(os_error) => {
+                return walk.problem(TreeProblem::Busy {
+                    path: display_child.to_path_buf(),
+                    os_error,
+                })
             }
         };
+        walk.counts.examined += 1;
+        // 進み具合は開いて数えた直後に 1 回（フォルダなら中へ下りる前。`written` はこの子の
+        // 分をまだ含まない）。再帰の後に重ねて出すと、同じ `examined` の報告が並ぶ。
+        walk.tick();
+        let result = visit_opened(walk, &opened, display_child, is_marker, depth);
+        drop(opened);
+        result
+    }
+
+    fn visit_opened(
+        walk: &mut Walk<'_>,
+        opened: &Opened,
+        display_child: &Path,
+        is_marker: bool,
+        depth: u32,
+    ) -> std::result::Result<(), WalkStop> {
         if opened.is_reparse {
-            skips.reparse.push(display_child.to_path_buf());
-            return Ok(()); // 触らない・辿らない。
+            // 触らない・辿らない。
+            return walk.problem(TreeProblem::ReparsePoint {
+                path: display_child.to_path_buf(),
+                tag: opened.reparse_tag,
+            });
         }
         if !opened.is_dir && opened.links >= 2 {
-            skips.hardlink.push(display_child.to_path_buf());
-            return Ok(()); // 記述子を共有するので触らない（外の名前のアクセスを変えない）。
+            // 記述子を共有するので触らない（外の名前のアクセスを変えない。#624）。
+            return walk.problem(TreeProblem::Hardlink {
+                path: display_child.to_path_buf(),
+                links: opened.links,
+            });
         }
-        // フォルダは継承つき（OICI）、ファイルは継承フラグ無し（Nit 4）。
-        let sd = if opened.is_dir { dir_sd } else { file_sd };
-        set_object_security(opened.handle.raw(), sd)?;
-        #[cfg(test)]
-        AFTER_CHILD_WRITTEN.with(|hook| {
-            if let Some(hook) = hook.borrow().as_ref() {
-                hook(opened.handle.raw());
-            }
-        });
+        if walk.strict && opened.encrypted {
+            return walk.problem(TreeProblem::Encrypted {
+                path: display_child.to_path_buf(),
+            });
+        }
         if opened.is_dir {
-            // 子のハンドルを列挙元として再帰する（ID とハンドルだけ。パスは使わない）。
-            propagate(
-                opened.handle.raw(),
-                display_child,
-                within,
-                dir_sd,
-                file_sd,
-                depth + 1,
-                skips,
-            )?;
+            // 子のハンドルを列挙元として再帰する（ID とハンドルだけ。パスは使わない）。書く順は
+            // `walk_dir` の中（`Order`）。
+            return walk_dir(walk, opened.handle.raw(), display_child, depth + 1);
         }
-        drop(opened);
+        if let Some(set) = &walk.write {
+            // フォルダは継承つき（OICI）、ファイルは継承フラグ無し（Nit 4）。印の席の物（綴りで
+            // なく ID で見分ける）はどのモードでも印の記述子のまま（設計 §2.5・§2.9 (a)）。
+            let sd = if is_marker {
+                set.marker_sd
+            } else {
+                set.file_sd
+            };
+            walk.write(opened.handle.raw(), sd, true)?;
+        }
         Ok(())
+    }
+
+    /// 開いた**ハンドルで**、そのオブジェクトと中の子へ、保護された DACL と所有者を書く
+    /// （[`super::PinnedDir::reset_acl`]、#392 B3-3b の監査 Must 2・[A]。昇格ヘルパーの修復）。
+    /// [`walk_dir`] を [`OnSkip::Record`]・[`Order::RootFirst`] で使い、reparse point・
+    /// ハードリンク・開けない子は飛ばして [`super::ResetSkips`] に記録する（#626 の「飛ばして
+    /// 報告」）。使用中の子・深すぎる木は今までどおり失敗にする。`recurse` が偽なら対象そのもの
+    /// だけ書く（監査 Nit 3）。
+    pub(super) fn set_security_tree(
+        handle: HANDLE,
+        real_dir: &Path,
+        access: &DirAccess,
+        recurse: bool,
+        skips: &mut super::ResetSkips,
+    ) -> Result<()> {
+        ensure_user_account(access)?;
+        let dir_sd = owned_protected_sd(access, true)?;
+        if !recurse {
+            return set_object_security(handle, &dir_sd);
+        }
+        let file_sd = owned_protected_sd(access, false)?;
+        let marker_sd = marker_descriptor()?;
+        let mut walk = Walk {
+            within: real_dir,
+            on_skip: OnSkip::Record,
+            order: Order::RootFirst,
+            write: Some(WriteSet {
+                dir_sd: &dir_sd,
+                file_sd: &file_sd,
+                marker_sd: &marker_sd,
+            }),
+            strict: false,
+            place_markers: false,
+            stop: &|| StopSignal::None,
+            progress: &mut |_| {},
+            counts: Progress::default(),
+            recorded: Vec::new(),
+        };
+        match walk_dir(&mut walk, handle, real_dir, 0) {
+            Ok(()) => {}
+            Err(WalkStop::Io(error)) => return Err(error),
+            // `Record` は止めず、`stop` は常に続けるので来ない。来たら失敗にする。
+            Err(WalkStop::Problem(problem)) => {
+                return Err(walk_problem_error(problem));
+            }
+            Err(WalkStop::Stopped(_)) => {
+                return Err(SafeRootError::io(
+                    IoOp::InspectDir,
+                    &std::io::Error::other("木の書き直しが途中で止まりました"),
+                ));
+            }
+        }
+        for problem in walk.recorded {
+            match problem {
+                TreeProblem::ReparsePoint { path, .. } => skips.reparse.push(path),
+                TreeProblem::Hardlink { path, .. } => skips.hardlink.push(path),
+                TreeProblem::Denied { path } => skips.denied.push(path),
+                other @ (TreeProblem::Busy { .. }
+                | TreeProblem::Encrypted { .. }
+                | TreeProblem::MarkerOccupied { .. }
+                | TreeProblem::TooDeep { .. }) => return Err(walk_problem_error(other)),
+            }
+        }
+        Ok(())
+    }
+
+    /// [`set_security_tree`] が失敗にする問題を `SafeRootError` に写す（使用中は OS の番号を
+    /// 保つ）。
+    fn walk_problem_error(problem: TreeProblem) -> SafeRootError {
+        match problem {
+            TreeProblem::Busy { os_error, .. } => SafeRootError::io(
+                IoOp::InspectDir,
+                &std::io::Error::from_raw_os_error(os_error as i32),
+            ),
+            other => SafeRootError::io(IoOp::InspectDir, &std::io::Error::other(other.to_string())),
+        }
     }
 
     fn sid_string(sid: PSID) -> Result<String> {
@@ -1765,7 +2660,7 @@ pub(crate) mod imp {
 
     /// 開いたハンドルから DACL と所有者を読む（`GetSecurityInfo`。パスを使わない。
     /// [`super::PinnedDir::read_dacl`]、#626 PR-A）。`handle` は `READ_CONTROL` を持つこと。
-    pub(super) fn read_dacl_of_handle(handle: HANDLE) -> Result<ObservedDacl> {
+    pub(crate) fn read_dacl_of_handle(handle: HANDLE) -> Result<ObservedDacl> {
         use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 
         let mut owner: PSID = std::ptr::null_mut();
@@ -2262,11 +3157,11 @@ pub(crate) mod imp {
     /// 開いたハンドルから [`super::FileSecurity`] を読む（属性・リンク数・所有者・DACL）。
     /// `handle` は `READ_CONTROL | FILE_READ_ATTRIBUTES` を持つこと。
     pub(super) fn security_of_handle(handle: HANDLE) -> Result<super::FileSecurity> {
-        let (is_dir, is_reparse_point, links) = info_of(handle)?;
+        let info = info_of(handle)?;
         Ok(super::FileSecurity {
-            is_dir,
-            is_reparse_point,
-            links,
+            is_dir: info.is_dir,
+            is_reparse_point: info.is_reparse,
+            links: info.links,
             dacl: read_dacl_of_handle(handle)?,
         })
     }
@@ -2364,6 +3259,16 @@ pub(crate) mod imp {
     /// だけ、バックアップの意図は付けない（DACL だけを門にする。#648）。
     pub(crate) fn child_relative(
         parent: &super::PinnedDir,
+        name: &str,
+        how: ChildHow<'_>,
+    ) -> Result<Option<OwnedHandle>> {
+        child_relative_handle(parent.handle.raw(), name, how)
+    }
+
+    /// [`child_relative`] の、親を生のハンドルで受ける形（木を歩く部品が、ID で開いた子の
+    /// フォルダに印を置くため。#623 PR-1c の Codex P1）。`parent` は開いているフォルダのハンドル。
+    pub(crate) fn child_relative_handle(
+        parent: HANDLE,
         name: &str,
         how: ChildHow<'_>,
     ) -> Result<Option<OwnedHandle>> {
@@ -2492,7 +3397,7 @@ pub(crate) mod imp {
         };
         let attributes = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: parent.handle.raw(),
+            RootDirectory: parent,
             ObjectName: &unicode,
             Attributes: OBJ_CASE_INSENSITIVE,
             SecurityDescriptor: descriptor.map_or(std::ptr::null(), |sd| sd.0 as *const _),
@@ -2571,7 +3476,7 @@ pub(crate) mod imp {
         Ok(Some(OwnedHandle(handle)))
     }
 
-    pub(super) fn current_user_sid_string() -> Result<String> {
+    pub(crate) fn current_user_sid_string() -> Result<String> {
         let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: 今のプロセスの疑似ハンドル。成功すれば `token` を閉じる責任を持つ。
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -3866,7 +4771,7 @@ pub(crate) mod tests {
 
         /// `path` の DACL を `D:P(D;;FA;;;BA)(D;;WDWO;;;OW)(A;;FA;;;SY)` にする（Administrators と
         /// OWNER RIGHTS への明示の拒否）。
-        fn deny_everyone_but_system(path: &std::path::Path) {
+        pub(crate) fn deny_everyone_but_system(path: &std::path::Path) {
             use std::os::windows::ffi::OsStrExt;
             use windows_sys::Win32::Foundation::LocalFree;
             use windows_sys::Win32::Security::Authorization::{
@@ -4292,7 +5197,7 @@ pub(crate) mod tests {
         // --- #626 PR-B の再レビュー -------------------------------------------------
 
         /// `path` の DACL を `sddl` にする（テスト専用。自分が所有者の一時フォルダだけ）。
-        fn set_dacl_sddl(path: &std::path::Path, sddl: &str) {
+        pub(crate) fn set_dacl_sddl(path: &std::path::Path, sddl: &str) {
             use std::os::windows::ffi::OsStrExt;
             use windows_sys::Win32::Foundation::LocalFree;
             use windows_sys::Win32::Security::Authorization::{

@@ -312,7 +312,7 @@ fn an_invalid_spec_list_creates_nothing_when_guarded() {
 /// 作ったフォルダの所有者は Administrators になるので、「許さない所有者」の確かめ（利用者
 /// 本人を許さない spec）のために、所有者を利用者本人へ移す。利用者自身の SID へは、昇格した
 /// 管理者なら移せる。
-fn set_owner_to_me(path: &Path) {
+pub(crate) fn set_owner_to_me(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
@@ -725,7 +725,7 @@ fn an_object_moved_out_after_enumeration_is_not_opened() {
     let root = crate::acl::pin_dir(&tree).unwrap().unwrap();
     let sub = root.open_child_dir("sub").unwrap().unwrap();
     let mut ids = Vec::new();
-    enumerate_dir(sub.raw_handle(), &mut |e| {
+    enumerate_dir::<SafeRootError>(sub.raw_handle(), &mut |e| {
         ids.push((e.name, e.file_id));
         Ok(())
     })
@@ -899,4 +899,49 @@ fn reset_acl_rewrites_every_child_while_the_same_handle_is_listed() {
             "書き直されなかった子: {name}"
         );
     }
+}
+
+/// #677 のレビュー N-5: 無いルートの**親も無い**ときは、何も作らずに `ParentAbsent`。
+#[test]
+fn a_root_whose_parent_is_absent_is_refused_without_creating_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let refusal = open_root(&guarded(dir.path().join("nope").join("root"))).unwrap_err();
+    assert_eq!(refusal, RootRefusal::ParentAbsent);
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
+/// #677 のレビュー N-5: 管理するフォルダの所有者が SYSTEM・Administrators・`owners` の
+/// どれでもなければ `ManagedRefusal::ForeignOwner`（ルートの確かめと同じ規則）。管理者（CI）が
+/// 作ったフォルダの所有者は Administrators になるので、所有者を今の利用者へ移してから、今の
+/// 利用者を許さない spec で開く。
+#[test]
+fn a_managed_dir_owned_by_someone_not_allowed_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(root.join("data")).unwrap();
+    if crate::acl::tests::windows::is_elevated_admin() {
+        set_owner_to_me(&root.join("data"));
+    }
+    let opened = open_root(&RootSpec {
+        owners: Vec::new(),
+        ..guarded(root.clone())
+    });
+    let Ok(opened) = opened else {
+        // ルート自身が今の利用者の所有（非管理者が作った）なら、ルートで先に断られる。所有者を
+        // 許す spec でルートを開き直して、管理するフォルダの確かめだけ見る。
+        let opened = open_root(&guarded(root.clone())).unwrap();
+        // ルートの所有者を許す spec では管理するフォルダの所有者（同じ利用者）も許されるので、
+        // ここでは「許す」側を確かめて終える（非管理者では別の所有者を作れない）。
+        opened.open_managed(&[spec("data", None, "data")]).unwrap();
+        return;
+    };
+    let stop = opened
+        .open_managed(&[spec("data", None, "data")])
+        .unwrap_err();
+    assert_eq!(stop.key, "data");
+    assert_eq!(
+        stop.reason,
+        ManagedRefusal::ForeignOwner(me().as_str().to_string())
+    );
 }

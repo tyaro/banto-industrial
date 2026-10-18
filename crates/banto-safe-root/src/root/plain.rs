@@ -37,7 +37,12 @@ pub(super) fn open_root(spec: &RootSpec) -> std::result::Result<ManagedDir, Root
         }
         Err(e) => return Err(root_io(IoOp::InspectDir)(e)),
     }
-    let final_path = std::fs::canonicalize(&spec.expected).map_err(root_io(IoOp::InspectDir))?;
+    // Guarded の本当のパス（`final_path_of`）と同じ DOS 形にする（`canonicalize` は Windows で
+    // `\\?\C:\…` の verbatim 形を返す。`ReopenPath::path()` の形がモードで変わらないように。
+    // #677 のレビュー N-3）。
+    let final_path = crate::nofollow::strip_verbatim(
+        &std::fs::canonicalize(&spec.expected).map_err(root_io(IoOp::InspectDir))?,
+    );
     // 確かめてから作る・正規化するまでの間に、同じ名前へ普通のファイルが作られたかもしれない。
     if !is_dir(&final_path).map_err(root_io(IoOp::InspectDir))? {
         return Err(RootRefusal::Refused(crate::error::Refusal::NotADirectory));
@@ -78,7 +83,9 @@ pub(super) fn open_managed_one(
         }
         Err(e) => return Err(refuse_io(IoOp::InspectDir)(e)),
     }
-    let final_path = std::fs::canonicalize(&path).map_err(refuse_io(IoOp::InspectDir))?;
+    let final_path = crate::nofollow::strip_verbatim(
+        &std::fs::canonicalize(&path).map_err(refuse_io(IoOp::InspectDir))?,
+    );
     // create_dir が AlreadyExists で通った（別のプロセスが普通のファイルを作った）場合と、
     // canonicalize がファイルで成功した場合を、ここで断る。
     if !is_dir(&final_path).map_err(refuse_io(IoOp::InspectDir))? {

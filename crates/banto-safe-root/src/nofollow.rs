@@ -81,8 +81,9 @@ pub fn normalize_expected(path: &Path) -> PathBuf {
         .unwrap_or_else(|| strip_verbatim(&absolute))
 }
 
-/// 先頭の `\\?\`（UNC は `\\?\UNC\` → `\\`）を外す（純関数。`final_path_of` と同じ形にする）。
-fn strip_verbatim(path: &Path) -> PathBuf {
+/// 先頭の `\\?\`（UNC は `\\?\UNC\` → `\\`）を外す（純関数。`final_path_of` と同じ形にする。
+/// `root::plain` の `canonicalize` の結果にも使う - #677 のレビュー N-3）。
+pub(crate) fn strip_verbatim(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))

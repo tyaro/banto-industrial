@@ -23,6 +23,10 @@
 //! - [`nofollow`] モジュール（#623 PR-1b）: パスの版の小さな部品。ファイル 1 つを辿らずに開いて、
 //!   ハンドルで reparse point でない・ファイル・リンク数 1・本当のパスが渡されたパスと同じ、を
 //!   確かめる（`banto-instance-lock` の診断ファイル）。
+//! - [`mode`] モジュール（#623 PR-1c）: 設定モード ⇔ 運用モードの切り替えで、サービス自身が
+//!   木の全体の ACL を締める・緩める部品（`PinnedDir::{scan_tree, close_tree, relax_tree}`、
+//!   印のファイル `ensure_marker`、確かめ直し `recheck`）と、ルートの DACL からモードを
+//!   見分ける純関数（[`classify_mode`]・[`observe_root`]）。2 つの形は [`ModeAccess`]。
 //! - [`redirection`] モジュール（#623 の (3b)）: プロセスの Redirection Guard を有効にする
 //!   （[`enable_redirection_guard`]。配線は各アプリ）。
 //! - [`error`] モジュール: [`SafeRootError`]・[`Refusal`]。文言は製品に依らない中立の形で、
@@ -67,12 +71,18 @@ pub mod error;
 pub mod guard;
 #[cfg(windows)]
 mod handle_io;
+pub mod mode;
 pub mod nofollow;
 pub mod redirection;
 pub mod root;
 
-pub use acl::{DirAccess, InstallUserSid};
+pub use acl::{DirAccess, InstallUserSid, UserRight};
 pub use error::{AclMismatch, IoOp, Refusal, Result, SafeRootError};
+pub use mode::{
+    classify_mode, observe_root, AbortReason, CloseAbort, MarkerError, MarkerOutcome, ModeAccess,
+    ModeObservation, Progress, RecheckFailure, RelaxReport, RootObservation, ScanRefusal,
+    ScanReport, StopSignal, TreeProblem, MARKER_NAME,
+};
 pub use redirection::{enable_redirection_guard, RedirectionGuard};
 pub use root::{
     open_root, ManagedDir, ManagedSet, ManagedSpec, ManagedStop, Mode, ReopenPath, RootRefusal,
