@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use banto_safe_root::DirAccess;
+use banto_safe_root::{DirAccess, ManagedDir};
 
 use crate::error::{CorruptKind, InvalidAccount, IoOp, Result, SecretStoreError};
 use crate::format::{self, MAX_ACCOUNT_LEN, MAX_FILE_LEN, MAX_SECRET_LEN};
@@ -63,6 +63,33 @@ enum DirMode {
     Unchecked,
 }
 
+/// 保存先の置き場（#623 PR-3）。
+enum Location {
+    /// パスで扱う（デスクトップ・コンソール。読む・書く・消すたびにパスで DACL を確かめる）。
+    Path(PathBuf),
+    /// 握ったフォルダ（サービス。`ManagedDir` のハンドル基準で読む・書く・消し、確かめは
+    /// 握ったハンドルの `recheck`。パスを解決し直さない）。
+    Managed(ManagedDir),
+}
+
+impl Location {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            Self::Managed(dir) => dir.final_path(),
+        }
+    }
+}
+
+impl fmt::Debug for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            Self::Managed(dir) => f.debug_tuple("Managed").field(dir).finish(),
+        }
+    }
+}
+
 /// 書き込みの段階（テストで途中の失敗を注入する位置）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WriteStage {
@@ -78,7 +105,7 @@ pub(crate) enum WriteStage {
 /// 直列化はしない（同じ保存先を使うエンジンは A1 の排他で 1 つだけ動く前提。
 /// それでも重なったときは、置き換えが原子的なので「どちらかの値が丸ごと残る」）。
 pub struct FileSecretStore<P: Protector> {
-    dir: PathBuf,
+    dir: Location,
     mode: DirMode,
     protector: P,
     lock: Mutex<()>,
@@ -107,7 +134,26 @@ impl<P: Protector> FileSecretStore<P> {
     pub fn open(dir: impl Into<PathBuf>, access: DirAccess, protector: P) -> Result<Self> {
         let dir = dir.into();
         banto_safe_root::acl::ensure_dir(&dir, &access)?;
-        Ok(Self::with_mode(dir, DirMode::Enforced(access), protector))
+        Ok(Self::with_mode(
+            Location::Path(dir),
+            DirMode::Enforced(access),
+            protector,
+        ))
+    }
+
+    /// **握ったフォルダ**を保存先にする（#623 PR-3、設計 §4.7・§5。サービス）。フォルダは呼ぶ側が
+    /// `SafeRoot::open_managed` で（無ければ運用モードの形で作って）握って渡す。ここでは
+    /// 作らず、握ったハンドルで `access`（運用モードの形）に通るか確かめる（`ManagedDir::recheck`:
+    /// reparse 属性と記述子。`Mode::Plain` は確かめない）。以後の読む・書く・消すは
+    /// ハンドル基準（`open_read`・`write_atomic`・`remove`）で、そのたびに同じ確かめ直しを
+    /// する（設計 §2.9 (d)。パスの `symlink_metadata`・`verify_dir` は使わない）。
+    pub fn open_in(dir: ManagedDir, access: DirAccess, protector: P) -> Result<Self> {
+        recheck(&dir, &access)?;
+        Ok(Self::with_mode(
+            Location::Managed(dir),
+            DirMode::Enforced(access),
+            protector,
+        ))
     }
 
     /// テスト専用: ディレクトリの ACL を確かめずに開く（無ければ普通に作る）。
@@ -116,10 +162,14 @@ impl<P: Protector> FileSecretStore<P> {
     pub fn open_without_acl(dir: impl Into<PathBuf>, protector: P) -> Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))?;
-        Ok(Self::with_mode(dir, DirMode::Unchecked, protector))
+        Ok(Self::with_mode(
+            Location::Path(dir),
+            DirMode::Unchecked,
+            protector,
+        ))
     }
 
-    fn with_mode(dir: PathBuf, mode: DirMode, protector: P) -> Self {
+    fn with_mode(dir: Location, mode: DirMode, protector: P) -> Self {
         Self {
             dir,
             mode,
@@ -130,14 +180,14 @@ impl<P: Protector> FileSecretStore<P> {
         }
     }
 
-    /// 保存先のディレクトリ。
+    /// 保存先のディレクトリ（握った版は本当のパス）。
     pub fn dir(&self) -> &Path {
-        &self.dir
+        self.dir.path()
     }
 
-    /// `account` のファイルのパス。
+    /// `account` のファイルのパス（表示・テスト用。握った版はこのパスで開き直さない）。
     pub fn path_for(&self, account: &str) -> PathBuf {
-        self.dir.join(file_name_for(account))
+        self.dir.path().join(file_name_for(account))
     }
 
     fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -147,9 +197,28 @@ impl<P: Protector> FileSecretStore<P> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 読む・消す前: ディレクトリが無ければ `false`（作らない）、あれば確かめる。
+    /// 確かめる形（`Unchecked` なら `None`）。
+    fn enforced(&self) -> Option<&DirAccess> {
+        match &self.mode {
+            DirMode::Enforced(access) => Some(access),
+            #[cfg(any(test, feature = "test-support"))]
+            DirMode::Unchecked => None,
+        }
+    }
+
+    /// 読む・消す前: ディレクトリが無ければ `false`（作らない）、あれば確かめる。握った版は
+    /// 握ったハンドルで確かめ直す（無くなることは無い - 握っている間は消せない）。
     fn check_existing_dir(&self) -> Result<bool> {
-        match fs::symlink_metadata(&self.dir) {
+        let dir = match &self.dir {
+            Location::Managed(dir) => {
+                if let Some(access) = self.enforced() {
+                    recheck(dir, access)?;
+                }
+                return Ok(true);
+            }
+            Location::Path(dir) => dir,
+        };
+        match fs::symlink_metadata(dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(SecretStoreError::io(IoOp::InspectDir, &e)),
             Ok(_) => {}
@@ -157,7 +226,7 @@ impl<P: Protector> FileSecretStore<P> {
         match &self.mode {
             DirMode::Enforced(access) => {
                 // SID の確かめも含む（open と同じ確かめなので結果は変わらない）。
-                banto_safe_root::acl::verify_dir(&self.dir, access)?
+                banto_safe_root::acl::verify_dir(dir, access)?
             }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {}
@@ -165,15 +234,24 @@ impl<P: Protector> FileSecretStore<P> {
         Ok(true)
     }
 
-    /// 書く前: 無ければ作り（期待の DACL で）、あれば確かめる。
+    /// 書く前: 無ければ作り（期待の DACL で）、あれば確かめる。握った版は作らず確かめ直すだけ。
     fn ensure_dir_for_write(&self) -> Result<()> {
+        let dir = match &self.dir {
+            Location::Managed(dir) => {
+                if let Some(access) = self.enforced() {
+                    recheck(dir, access)?;
+                }
+                return Ok(());
+            }
+            Location::Path(dir) => dir,
+        };
         match &self.mode {
             DirMode::Enforced(access) => {
-                banto_safe_root::acl::ensure_dir(&self.dir, access).map_err(SecretStoreError::from)
+                banto_safe_root::acl::ensure_dir(dir, access).map_err(SecretStoreError::from)
             }
             #[cfg(any(test, feature = "test-support"))]
             DirMode::Unchecked => {
-                fs::create_dir_all(&self.dir).map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))
+                fs::create_dir_all(dir).map_err(|e| SecretStoreError::io(IoOp::CreateDir, &e))
             }
         }
     }
@@ -188,10 +266,16 @@ impl<P: Protector> FileSecretStore<P> {
         if !self.check_existing_dir()? {
             return Ok(None);
         }
-        let file = match File::open(self.path_for(account)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(SecretStoreError::io(IoOp::ReadFile, &e)),
+        let file = match &self.dir {
+            Location::Managed(dir) => match dir.open_read(&file_name_for(account))? {
+                Some(file) => file,
+                None => return Ok(None),
+            },
+            Location::Path(_) => match File::open(self.path_for(account)) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(SecretStoreError::io(IoOp::ReadFile, &e)),
+            },
         };
         let mut bytes = Vec::new();
         file.take(MAX_FILE_LEN as u64 + 1)
@@ -229,7 +313,18 @@ impl<P: Protector> FileSecretStore<P> {
         let _guard = self.guard();
         self.ensure_dir_for_write()?;
         let final_name = file_name_for(account);
-        write_atomic(&self.dir, &final_name, &bytes, |stage| self.inject(stage))
+        match &self.dir {
+            Location::Managed(dir) => {
+                self.inject(WriteStage::TempCreated)
+                    .and_then(|()| self.inject(WriteStage::BeforeReplace))
+                    .map_err(|e| SecretStoreError::io(IoOp::WriteTemp, &e))?;
+                dir.write_atomic(&final_name, &bytes)?;
+                Ok(())
+            }
+            Location::Path(dir) => {
+                write_atomic(dir, &final_name, &bytes, |stage| self.inject(stage))
+            }
+        }
     }
 
     /// `account` の秘密を消す。無ければ `Ok(())`。
@@ -239,10 +334,16 @@ impl<P: Protector> FileSecretStore<P> {
         if !self.check_existing_dir()? {
             return Ok(());
         }
-        match fs::remove_file(self.path_for(account)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(SecretStoreError::io(IoOp::RemoveFile, &e)),
+        match &self.dir {
+            Location::Managed(dir) => {
+                dir.remove(&file_name_for(account))?;
+                Ok(())
+            }
+            Location::Path(_) => match fs::remove_file(self.path_for(account)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(SecretStoreError::io(IoOp::RemoveFile, &e)),
+            },
         }
     }
 
@@ -264,6 +365,25 @@ impl<P: Protector> FileSecretStore<P> {
     pub(crate) fn fail_writes_at(&self, stage: Option<WriteStage>) {
         *self.fail_at.lock().unwrap() = stage;
     }
+}
+
+/// 握ったフォルダの確かめ直し（`ManagedDir::recheck`）を、この crate のエラーに写す。
+fn recheck(dir: &ManagedDir, access: &DirAccess) -> Result<()> {
+    use banto_safe_root::{mode::RecheckFailure, Refusal, SafeRootError};
+    dir.recheck(access).map_err(|failure| {
+        SecretStoreError::from(match failure {
+            RecheckFailure::ReparsePoint { tag } => SafeRootError::Refused {
+                path: dir.path().to_path_buf(),
+                refusal: Refusal::ReparsePoint { tag },
+            },
+            RecheckFailure::NotADirectory => SafeRootError::Refused {
+                path: dir.path().to_path_buf(),
+                refusal: Refusal::NotADirectory,
+            },
+            RecheckFailure::Acl(mismatch) => SafeRootError::AclMismatch(mismatch),
+            RecheckFailure::Io(error) => error,
+        })
+    })
 }
 
 /// 一時ファイルの名前の nonce（同じプロセスの中で重ならない値 + 時刻）。
