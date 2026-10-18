@@ -213,12 +213,58 @@ fn acquire_unix(lock_path: &Path, host_kind: &str) -> Result<InstanceLockGuard, 
     })
 }
 
-#[cfg(windows)]
-fn acquire_windows(
-    name: &str,
-    lock_path: &Path,
+/// 握ったフォルダ（`banto_safe_root::ManagedDir`）の中に診断ファイルを書く版（#623 PR-3。
+/// 設計 §1.4・§3.1 の 5）。排他の実体は [`try_acquire`] と同じ（Windows: named mutex／
+/// 非 Windows: flock）で、違うのは診断ファイルの書き方だけ:
+///
+/// - Windows: `dir.write_atomic(lock_name, …)`（握ったハンドル基準で一時ファイルを作り、
+///   `FileRenameInformationEx` で名前へ付け替える。宛先がフォルダ・ジャンクションなら何も
+///   作らずに断り、シンボリックリンク・ハードリンクの名前は**先を辿らずに**名前だけが
+///   置き換わる）。パスを解決し直さないので、サービス（LocalSystem）がまだ緩い木（締める
+///   前）に書いても外へは出ない。書けなければ理由を
+///   [`InstanceLockGuard::diagnostics_warning`] に残す（排他は mutex が持つ）。
+/// - 非 Windows: 診断ファイルが flock の対象そのものなので、`dir.final_path()` の下のパスで
+///   [`try_acquire`] と同じ経路（`O_NOFOLLOW` + fd の確かめ）。
+///
+/// `lock_name` は名前 1 要素（区切りを含まない）。`ManagedDir` が `Mode::Plain` なら、
+/// `write_atomic` は `std::fs` のまま（デスクトップ・テスト）。
+pub fn try_acquire_in(
+    mutex_name: &str,
+    dir: &banto_safe_root::ManagedDir,
+    lock_name: &str,
     host_kind: &str,
 ) -> Result<InstanceLockGuard, InstanceLockError> {
+    let lock_path = dir.final_path().join(lock_name);
+    #[cfg(windows)]
+    {
+        let mutex = acquire_mutex_windows(mutex_name, &lock_path)?;
+        let diagnostics_warning = match dir.write_atomic(lock_name, &owner_info_json(host_kind)) {
+            Ok(()) => None,
+            Err(err) => Some(format!(
+                "診断ファイル {} を書けませんでした: {err}",
+                lock_path.display()
+            )),
+        };
+        Ok(InstanceLockGuard {
+            lock_file_path: lock_path,
+            diagnostics_warning,
+            _mutex: mutex,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = mutex_name;
+        acquire_unix(&lock_path, host_kind)
+    }
+}
+
+/// 名前付き mutex を取る（Windows。[`try_acquire`]・[`try_acquire_in`] の共通部分）。
+/// `lock_path` は、既に持たれていたときに持ち主の診断を読むためだけに使う（書かない）。
+#[cfg(windows)]
+fn acquire_mutex_windows(
+    name: &str,
+    lock_path: &Path,
+) -> Result<WindowsMutexHandle, InstanceLockError> {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
     };
@@ -275,6 +321,16 @@ fn acquire_windows(
             owner: read_owner_info(lock_path),
         });
     }
+    Ok(WindowsMutexHandle(handle))
+}
+
+#[cfg(windows)]
+fn acquire_windows(
+    name: &str,
+    lock_path: &Path,
+    host_kind: &str,
+) -> Result<InstanceLockGuard, InstanceLockError> {
+    let mutex = acquire_mutex_windows(name, lock_path)?;
 
     // 診断用ファイル — Windows では排他の実体ではないので、書き込み失敗は
     // 致命的にしない。リンクを辿らずに開き、ハンドルで確かめてから書く
@@ -284,7 +340,7 @@ fn acquire_windows(
     Ok(InstanceLockGuard {
         lock_file_path: lock_path.to_path_buf(),
         diagnostics_warning,
-        _mutex: WindowsMutexHandle(handle),
+        _mutex: mutex,
     })
 }
 
@@ -311,16 +367,21 @@ fn write_diagnostics_windows(lock_path: &Path, host_kind: &str) -> Option<String
     }
 }
 
-fn write_owner_info(file: &mut File, host_kind: &str) -> std::io::Result<()> {
+/// 診断ファイルの中身（このプロセスの [`OwnerInfo`] の JSON）。
+fn owner_info_json(host_kind: &str) -> Vec<u8> {
     let info = OwnerInfo {
         pid: std::process::id(),
         host_kind: host_kind.to_string(),
         acquired_at_unix_ms: now_unix_ms(),
     };
-    let json = serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string());
+    serde_json::to_vec_pretty(&info).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+fn write_owner_info(file: &mut File, host_kind: &str) -> std::io::Result<()> {
+    let json = owner_info_json(host_kind);
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    file.write_all(json.as_bytes())?;
+    file.write_all(&json)?;
     file.flush()?;
     Ok(())
 }
@@ -522,8 +583,6 @@ fn process_is_alive_impl(pid: u32) -> bool {
 ///   （ファイル作成前）に取った ID と作成後に取った ID が食い違うため。
 /// - 戻り値の 2 つ目は正規化したパス（診断メッセージ用）。
 pub fn path_scope_id(target: &Path) -> std::io::Result<(String, PathBuf)> {
-    use sha2::{Digest, Sha256};
-
     let file_name = target.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -545,14 +604,43 @@ pub fn path_scope_id(target: &Path) -> std::io::Result<(String, PathBuf)> {
     } else {
         parent.canonicalize()?.join(file_name)
     };
+    Ok((scope_id_of(&canonical), canonical))
+}
 
+/// [`path_scope_id`] の、**末端（ファイル名）を解かない**版（#623 PR-3 の Codex の指摘）。
+/// 親 `parent` だけを `canonicalize` し（作らない。無ければ `Err`）、`file_name` をそのまま
+/// 足して ID にする。
+///
+/// 握ったルート（辿らずに開いて本当のパスを確かめたフォルダ）の中の DB の範囲を決めるとき
+/// に使う。[`path_scope_id`] は既にあるファイルを**全体**で `canonicalize` するので、設定
+/// モードの木で書ける利用者がその瞬間だけ DB をシンボリックリンクにしておくと、リンクの
+/// 先の範囲の ID になり、後で普通のファイルに戻されるとデスクトップ（リンクの DB は断る
+/// ので、常に「親 + 名前」の範囲）と範囲が食い違って A1 が噛み合わなくなる。親が本当の
+/// パスで名前が決まった定数なら、末端を解かなくても同じ DB は同じ ID になる（デスクトップの
+/// 普通のファイルの DB では `canonicalize(全体)` = `canonicalize(親) + 名前`）。
+pub fn path_scope_id_in(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> std::io::Result<(String, PathBuf)> {
+    if file_name.is_empty() || Path::new(file_name).components().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ファイル名が 1 要素ではありません",
+        ));
+    }
+    let canonical = parent.canonicalize()?.join(file_name);
+    Ok((scope_id_of(&canonical), canonical))
+}
+
+/// 正規化したパスから ID を作る（[`path_scope_id`]・[`path_scope_id_in`] で同じ）。
+fn scope_id_of(canonical: &Path) -> String {
+    use sha2::{Digest, Sha256};
     let mut key = canonical.to_string_lossy().into_owned();
     if cfg!(windows) {
         key = key.to_lowercase();
     }
     let digest = Sha256::digest(key.as_bytes());
-    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    Ok((id, canonical))
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -571,6 +659,101 @@ mod tests {
 
     fn lock_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         dir.path().join(name)
+    }
+
+    /// `Mode::Plain` の握ったフォルダ（どの OS でも）。
+    fn plain_root(dir: &tempfile::TempDir) -> banto_safe_root::SafeRoot {
+        banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: dir.path().join("root"),
+            known: banto_safe_root::guard::KnownFolders::default(),
+            owners: Vec::new(),
+            create_access: None,
+            create: true,
+            mode: banto_safe_root::Mode::Plain,
+        })
+        .unwrap()
+    }
+
+    /// #623 PR-3（Codex の指摘）: `path_scope_id_in`（末端を解かない）は、普通のファイルの DB では
+    /// `path_scope_id` と同じ ID。DB がシンボリックリンクのときは `path_scope_id` がリンクの先の
+    /// 範囲になるのに対し、`path_scope_id_in` は親 + 名前の範囲のまま（リンクを張れない環境では
+    /// その部分を飛ばす）。無い親は `Err`（作らない）。
+    #[test]
+    fn scope_id_in_ignores_the_leaf_link_and_matches_the_plain_file_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join("x.sqlite3");
+        let (plain_absent, _) = path_scope_id(&db).unwrap();
+        let (in_absent, canonical) = path_scope_id_in(&root, db.file_name().unwrap()).unwrap();
+        assert_eq!(in_absent, plain_absent, "無い DB");
+        assert_eq!(canonical.file_name().unwrap(), "x.sqlite3");
+        std::fs::write(&db, b"db").unwrap();
+        let (plain_present, _) = path_scope_id(&db).unwrap();
+        assert_eq!(plain_present, plain_absent, "あっても同じ");
+        assert_eq!(
+            path_scope_id_in(&root, db.file_name().unwrap()).unwrap().0,
+            plain_present
+        );
+        // 親が無ければ作らずに Err、名前が 1 要素でなければ Err。
+        assert!(path_scope_id_in(&dir.path().join("nope"), std::ffi::OsStr::new("x")).is_err());
+        assert!(!dir.path().join("nope").exists());
+        assert!(path_scope_id_in(&root, std::ffi::OsStr::new("a/b")).is_err());
+        assert!(path_scope_id_in(&root, std::ffi::OsStr::new("")).is_err());
+
+        // DB をリンクにすると、`path_scope_id` は先の範囲、`path_scope_id_in` は変わらない。
+        let elsewhere = dir.path().join("elsewhere.sqlite3");
+        std::fs::write(&elsewhere, b"other").unwrap();
+        std::fs::remove_file(&db).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&elsewhere, &db).is_ok();
+        #[cfg(not(windows))]
+        let linked = std::os::unix::fs::symlink(&elsewhere, &db).is_ok();
+        if !linked {
+            if std::env::var_os("CI").is_some() {
+                panic!("CI でシンボリックリンクを作れない");
+            }
+            eprintln!("skip: シンボリックリンクを作れない（権限）- CI で確かめる");
+            return;
+        }
+        let (followed, _) = path_scope_id(&db).unwrap();
+        let (unfollowed, _) = path_scope_id_in(&root, db.file_name().unwrap()).unwrap();
+        assert_ne!(
+            followed, plain_present,
+            "全体の canonicalize はリンクの先になる"
+        );
+        assert_eq!(unfollowed, plain_present, "末端を解かない版は変わらない");
+        assert_eq!(followed, path_scope_id(&elsewhere).unwrap().0);
+    }
+
+    /// #623 PR-3: `try_acquire_in` は握ったフォルダの中に診断ファイルを書き、排他の意味は
+    /// `try_acquire` と同じ（同じ名前を 2 回は取れない・放せば取れる・持ち主を読める）。
+    #[test]
+    fn try_acquire_in_writes_the_diagnostics_into_the_held_dir_and_excludes_like_try_acquire() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plain_root(&dir);
+        let name = unique_mutex_name("in");
+        let guard = try_acquire_in(&name, root.as_dir(), "x.lock", "service").expect("取れる");
+        assert_eq!(guard.diagnostics_warning(), None);
+        let path = root.final_path().join("x.lock");
+        assert_eq!(guard.lock_file_path(), path.as_path());
+        let owner = read_owner_info(&path).expect("診断を読める");
+        assert_eq!(owner.host_kind, "service");
+        assert_eq!(owner.pid, std::process::id());
+        // 同じ名前は、パスの版からも握った版からも取れない。
+        assert!(matches!(
+            try_acquire(&name, &path, "desktop"),
+            Err(InstanceLockError::AlreadyHeld { owner: Some(o) }) if o.host_kind == "service"
+        ));
+        assert!(matches!(
+            try_acquire_in(&name, root.as_dir(), "x.lock", "desktop"),
+            Err(InstanceLockError::AlreadyHeld { .. })
+        ));
+        drop(guard);
+        let again =
+            try_acquire_in(&name, root.as_dir(), "x.lock", "desktop").expect("放せば取れる");
+        assert_eq!(read_owner_info(&path).unwrap().host_kind, "desktop");
+        drop(again);
     }
 
     /// #626 PR-B: 診断ファイルを書かずに持つ mutex は、持っている間は [`try_acquire`]・

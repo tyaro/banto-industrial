@@ -361,6 +361,60 @@ fn debug_output_never_contains_the_secret() {
     assert!(shown.contains("FileSecretStore"), "{shown}");
 }
 
+/// 握ったフォルダ（`Mode::Plain`、全 OS）の `open_in`（#623 PR-3）: 読む・書く・消すが
+/// ハンドル基準の `ManagedDir` で動き、一時ファイルを残さない。
+#[test]
+fn open_in_round_trips_through_a_held_plain_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let held = banto_safe_root::open_root(&banto_safe_root::RootSpec {
+        expected: root.path().join("root"),
+        known: banto_safe_root::guard::KnownFolders::default(),
+        owners: Vec::new(),
+        create_access: None,
+        create: true,
+        mode: banto_safe_root::Mode::Plain,
+    })
+    .unwrap();
+    let mut set = held
+        .open_managed(
+            &[banto_safe_root::ManagedSpec {
+                key: "keys",
+                parent: None,
+                name: "keys",
+                create: true,
+            }],
+            None,
+        )
+        .unwrap();
+    let keys = set.take("keys").unwrap();
+    let dir = keys.final_path().to_path_buf();
+    // 確かめは `Mode::Plain` では何もしないので、どの OS でも `service_only` で通る。
+    let s =
+        FileSecretStore::open_in(keys, crate::DirAccess::service_only(), PlainProtector).unwrap();
+    assert_eq!(s.dir(), dir.as_path());
+    assert_eq!(s.load(ACCOUNT_A).unwrap(), None);
+    s.store(ACCOUNT_A, SECRET).unwrap();
+    assert_eq!(entries(&dir), vec![file_name_for(ACCOUNT_A)]);
+    assert_eq!(
+        s.load(ACCOUNT_A).unwrap().as_deref().map(String::as_str),
+        Some(SECRET)
+    );
+    s.store(ACCOUNT_A, "second").unwrap();
+    assert_eq!(
+        s.load(ACCOUNT_A).unwrap().as_deref().map(String::as_str),
+        Some("second")
+    );
+    assert_eq!(
+        entries(&dir),
+        vec![file_name_for(ACCOUNT_A)],
+        "一時ファイルが残った"
+    );
+    s.remove(ACCOUNT_A).unwrap();
+    s.remove(ACCOUNT_A).unwrap();
+    assert!(entries(&dir).is_empty());
+    assert_eq!(s.load(ACCOUNT_A).unwrap(), None);
+}
+
 #[cfg(not(windows))]
 #[test]
 fn opening_with_an_acl_fails_closed_off_windows() {
@@ -515,5 +569,99 @@ mod windows {
 
         // 片付け（所有者は自分なので書き換えられる）。
         reset_dir_acl(&dir, &DirAccess::with_install_user(me)).unwrap();
+    }
+
+    /// 握ったフォルダ（`Mode::Guarded`）の `open_in`（#623 PR-3）: 開くときと読む・書く・消す
+    /// たびに握ったハンドルで記述子を確かめ直し、外から ACL を変えられたら止まる
+    /// （`a_changed_acl_stops_reads_and_writes` の握った版）。確かめは `recheck` なので、
+    /// 期待の形で作ったフォルダは SID の確かめにも通る。
+    #[test]
+    fn open_in_rechecks_the_held_dir_on_every_access() {
+        let root = tempfile::tempdir().unwrap();
+        let held = banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: root.path().join("root"),
+            known: banto_safe_root::guard::KnownFolders::default(),
+            owners: vec![current_user_sid().unwrap()],
+            create_access: None,
+            create: true,
+            mode: banto_safe_root::Mode::Guarded,
+        })
+        .unwrap();
+        // 作るのと同時に保護された記述子（所有者 Administrators）を付けるのは昇格した管理者
+        // だけなので、ここでは継承で作ってから、所有者（自分）として期待の形に書き直す。
+        let mut set = held
+            .open_managed(
+                &[banto_safe_root::ManagedSpec {
+                    key: "keys",
+                    parent: None,
+                    name: "keys",
+                    create: true,
+                }],
+                None,
+            )
+            .unwrap();
+        let keys = set.take("keys").unwrap();
+        // 2 本目は、書き直す前（自分が所有者で `WRITE_DAC` を暗黙に持つ間）に握っておく。
+        let keys_again = set_take_again(&held);
+        let dir = keys.final_path().to_path_buf();
+        reset_dir_acl(&dir, &access()).unwrap();
+        // 運用モードの形を求めると、設定モードの形のフォルダは開く時点で断る。
+        let err = FileSecretStore::open_in(
+            keys_again,
+            access().to_right(banto_safe_root::UserRight::Read),
+            DpapiMachine,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SecretStoreError::Root(SafeRootError::AclMismatch(_))),
+            "{err:?}"
+        );
+        let s = FileSecretStore::open_in(keys, access(), DpapiMachine).unwrap();
+        s.store(ACCOUNT_A, SECRET).unwrap();
+        assert_eq!(
+            s.load(ACCOUNT_A).unwrap().as_deref().map(String::as_str),
+            Some(SECRET)
+        );
+        // 外から形を変える（所有者は自分なので書き換えられる）→ 以後は読まない・書かない・消さない。
+        reset_dir_acl(&dir, &DirAccess::service_only()).unwrap();
+        for err in [
+            s.load(ACCOUNT_A).map(|_| ()).unwrap_err(),
+            s.store(ACCOUNT_A, "x").unwrap_err(),
+            s.remove(ACCOUNT_A).unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    SecretStoreError::Root(SafeRootError::AclMismatch(
+                        AclMismatch::MissingAce { .. }
+                    ))
+                ),
+                "{err:?}"
+            );
+            assert_no_secret(&format!("{err} {err:?}"));
+        }
+        reset_dir_acl(&dir, &access()).unwrap();
+        assert_eq!(
+            s.load(ACCOUNT_A).unwrap().as_deref().map(String::as_str),
+            Some(SECRET)
+        );
+        s.remove(ACCOUNT_A).unwrap();
+        assert!(entries(&dir).is_empty());
+    }
+
+    /// 同じ `keys` をもう 1 本握る（`open_in` の断りを見るため）。
+    fn set_take_again(held: &banto_safe_root::SafeRoot) -> banto_safe_root::ManagedDir {
+        held.open_managed(
+            &[banto_safe_root::ManagedSpec {
+                key: "keys",
+                parent: None,
+                name: "keys",
+                create: false,
+            }],
+            None,
+        )
+        .unwrap()
+        .take("keys")
+        .unwrap()
     }
 }

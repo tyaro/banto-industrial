@@ -105,15 +105,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_hub_bootstrap::KeyStore;
+use banto_safe_root::ManagedDir;
 use banto_server::ServerConfig;
 use banto_tstore::{Clock, LocalDate};
 
-use crate::endpoint::{clear_endpoint, write_endpoint, EndpointClear, EndpointInfo};
-use crate::engine::{
-    EngineConfig, EngineListen, EngineRuntime, EngineStartError, LockedEngine, OpenedEngine,
-    RunningEngine, ShutdownReport,
+use crate::endpoint::{
+    clear_endpoint, clear_endpoint_in, write_endpoint, write_endpoint_in, EndpointClear,
+    EndpointInfo,
 };
-use crate::instance_lock::ChronoGazerHost;
+use crate::engine::{
+    BackupGate, EngineConfig, EngineListen, EngineRuntime, EngineStartError, LockedEngine,
+    OpenedEngine, RunningEngine, ShutdownReport,
+};
+use crate::instance_lock::{ChronoGazerHost, InstanceGuard};
 use crate::paths::{DataLayout, DirAccessSource};
 use crate::settings::{lan_autostart_allowed, AuthSettings, ServerSettings, SettingsService};
 use crate::startup_recovery::{
@@ -143,6 +147,16 @@ pub const EXIT_SHUTDOWN_INCOMPLETE: i32 = 1;
 pub const EXIT_ALREADY_RUNNING: i32 = 2;
 /// 終了コード: それ以外の起動の失敗（B3 のサービスと同じ値）。
 pub const EXIT_START_FAILED: i32 = 3;
+/// 終了コード（サービスだけ。#623 PR-3、設計 §3.7）: 運用モードにできなかった - **何も変えずに
+/// 断った・締めかけて緩め直した**（木にリンク／ハードリンク／EFS／開けない・使用中の子／
+/// 深すぎる／印の名前を塞ぐフォルダがある、読み取りを付ける相手を決められない `NoReader`）。
+/// 木は設定モードのまま。理由の細目は日次ログ。
+pub const EXIT_NOT_OPERATIONAL: i32 = 4;
+/// 終了コード（サービスだけ。#623 PR-3、設計 §3.7）: 締めたまま止まった、またはフォルダが
+/// 外から変えられた（緩められなかった／印を置いた後の改ざん `Tampered`／運用中の記述子の
+/// 変化 `AclChanged`／`relax-only` で相手を決められない）。デスクトップは `relax-only` の開始か
+/// 昇格ヘルパーの修復を案内する。
+pub const EXIT_LEFT_TIGHT: i32 = 5;
 /// 終了コード: 引数が違う。
 pub const EXIT_USAGE: i32 = 64;
 
@@ -391,6 +405,8 @@ pub struct ServerOptions {
 pub struct StartedServer {
     engine: RunningEngine,
     endpoint_file: PathBuf,
+    /// `run\endpoint.json` を握ったフォルダ基準で消す（サービス。#623 PR-3）。
+    run_dir: Option<Arc<ManagedDir>>,
     plan: ListenPlan,
     log_retention_days: Option<u32>,
     endpoint_error: Option<String>,
@@ -466,6 +482,7 @@ pub struct OpenedServer {
     opened: OpenedEngine,
     layout: DataLayout,
     host: ChronoGazerHost,
+    run_dir: Option<Arc<ManagedDir>>,
 }
 
 /// [`lock`] と [`LockedServer::open`] を続けて行う（間に何も挟まないテスト用。
@@ -484,6 +501,52 @@ pub struct LockedServer {
     locked: LockedEngine,
     layout: DataLayout,
     host: ChronoGazerHost,
+    /// `run\endpoint.json` を握ったフォルダ基準で書く・消す（サービス。#623 PR-3）。
+    run_dir: Option<Arc<ManagedDir>>,
+}
+
+/// 握ったルートの中で既に取った A1 の排他と、確かめてから作ったパス（DB は
+/// `ManagedDir::reopen_path_checked`、`data_base` はルートの本当のパス）で
+/// [`LockedServer`] を組む（サービス。#623 PR-3、設計 §3.1 の 5・12）。ルートは作らず、
+/// 排他も取り直さない。`run_dir` は `run\endpoint.json` を書く・消す握ったフォルダ。
+pub fn lock_held(
+    layout: DataLayout,
+    host: ChronoGazerHost,
+    instance_lock: InstanceGuard,
+    db_path: PathBuf,
+    data_base: PathBuf,
+    run_dir: Arc<ManagedDir>,
+) -> LockedServer {
+    let locked = EngineRuntime::lock_with(engine_config(data_base, db_path, host), instance_lock);
+    LockedServer {
+        locked,
+        layout,
+        host,
+        run_dir: Some(run_dir),
+    }
+}
+
+/// `chronogazer-server` のエンジンの設定（[`lock`]・[`lock_held`] で同じ）。
+fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) -> EngineConfig {
+    EngineConfig {
+        data_base,
+        db_path,
+        // 本物は排他を取った後に `OpenedServer::start` が渡す（`with_key_store`）。
+        key_store: Arc::new(FailedKeyStore::new(
+            "Hub の API キーの保存先をまだ開いていません",
+        )),
+        attach_hub: true,
+        host,
+        listen: EngineListen::Disabled,
+        allow_setup: false,
+        seed_viewer_public: false,
+        log_label: SERVER_LABEL,
+        audit_origin: "rest",
+        // 本番と同じ（デスクトップと同じく、保存設定を読めない・保存先に書けない
+        // ときは起動を止める）。
+        store_config_required: true,
+        store_dir_check_required: true,
+    }
 }
 
 impl LockedServer {
@@ -497,6 +560,7 @@ impl LockedServer {
             locked,
             layout,
             host,
+            run_dir,
         } = self;
         let opened = locked
             .open()
@@ -506,6 +570,7 @@ impl LockedServer {
             opened,
             layout,
             host,
+            run_dir,
         })
     }
 }
@@ -537,30 +602,13 @@ pub fn lock(
         });
     }
     let db_path = layout.db_path();
-    let locked = EngineRuntime::lock(EngineConfig {
-        data_base: layout.root().to_path_buf(),
-        db_path,
-        // 本物は排他を取った後に `OpenedServer::start` が渡す（`with_key_store`）。
-        key_store: Arc::new(FailedKeyStore::new(
-            "Hub の API キーの保存先をまだ開いていません",
-        )),
-        attach_hub: true,
-        host,
-        listen: EngineListen::Disabled,
-        allow_setup: false,
-        seed_viewer_public: false,
-        log_label: SERVER_LABEL,
-        audit_origin: "rest",
-        // 本番と同じ（デスクトップと同じく、保存設定を読めない・保存先に書けない
-        // ときは起動を止める）。
-        store_config_required: true,
-        store_dir_check_required: true,
-    })
-    .map_err(|err| failure_from_engine(&err, &layout))?;
+    let locked = EngineRuntime::lock(engine_config(layout.root().to_path_buf(), db_path, host))
+        .map_err(|err| failure_from_engine(&err, &layout))?;
     Ok(LockedServer {
         locked,
         layout,
         host,
+        run_dir: None,
     })
 }
 
@@ -587,9 +635,10 @@ impl OpenedServer {
             opened,
             layout,
             host,
+            run_dir,
         } = self;
         let opened = opened.with_key_store(key_store);
-        start_opened(opened, layout, host).await
+        start_opened(opened, layout, host, run_dir).await
     }
 }
 
@@ -597,6 +646,7 @@ async fn start_opened(
     opened: OpenedEngine,
     layout: DataLayout,
     host: ChronoGazerHost,
+    run_dir: Option<Arc<ManagedDir>>,
 ) -> Result<StartedServer, StartFailure> {
     let settings = opened.settings();
     let read = async {
@@ -634,7 +684,10 @@ async fn start_opened(
         .await
         .map_err(|err| failure_from_engine(&err, &layout))?;
 
-    let endpoint_file = layout.endpoint_file();
+    let endpoint_file = match &run_dir {
+        Some(run) => run.final_path().join(crate::endpoint::ENDPOINT_FILE_NAME),
+        None => layout.endpoint_file(),
+    };
     let endpoint_error = match engine.loopback_addr().await {
         Some(addr) => {
             let info = EndpointInfo::for_current_process(
@@ -642,7 +695,13 @@ async fn start_opened(
                 engine.services().host.scope.clone(),
                 host.as_str(),
             );
-            write_endpoint(&endpoint_file, &info)
+            // サービスは握った `run\` の中にハンドル基準で書く（パスを解決し直さない。
+            // #623 PR-3）。コンソールは今までどおりパス。
+            let written = match &run_dir {
+                Some(run) => write_endpoint_in(run, &info),
+                None => write_endpoint(&endpoint_file, &info),
+            };
+            written
                 .err()
                 .map(|err| format!("{} を書けませんでした: {err}", endpoint_file.display()))
         }
@@ -652,6 +711,7 @@ async fn start_opened(
     Ok(StartedServer {
         engine,
         endpoint_file,
+        run_dir,
         plan,
         log_retention_days: parse_log_retention(retention.as_deref()),
         endpoint_error,
@@ -694,6 +754,26 @@ impl StartedServer {
         &self.endpoint_file
     }
 
+    /// バックアップの REST の受け付けの門（[`BackupGate`]。#623 PR-3、設計 §3.2 の 1）。
+    pub fn backup_gate(&self) -> &Arc<BackupGate> {
+        self.engine.backup_gate()
+    }
+
+    /// 新しいバックアップの受け付けを止め、**進行中のバックアップ（REST の作成・restore の
+    /// 適用）が終わるのを待つ**（決定 1。打ち切らない。#623 PR-3、設計 §3.2 の 1）。待つ間は
+    /// `tick` の間隔ごとに `on_wait(待った時間)` を呼ぶ（呼ぶ側が STOP_PENDING の checkpoint を
+    /// 進め、1 分ごとにログを書く）。何も進行していなければすぐ戻る。
+    pub async fn drain_backups(&self, tick: Duration, on_wait: &mut dyn FnMut(Duration)) {
+        let gate = self.backup_gate();
+        gate.close();
+        let started = std::time::Instant::now();
+        while gate.inflight() > 0 {
+            if tokio::time::timeout(tick, gate.wait_idle()).await.is_err() {
+                on_wait(started.elapsed());
+            }
+        }
+    }
+
     /// 終了。**先に** `run\endpoint.json` を消し（自分の pid のものだけ）、それから
     /// エンジンを止める。どちらも A1 の排他を持ったまま（排他は `StartedServer` の
     /// drop で返る。B1-4 のレビューで残った「終了時の後始末を A1 の保持中に行う」）。
@@ -703,7 +783,10 @@ impl StartedServer {
     /// （`banto_exit_once::ExitCleanupOnce`）。
     pub async fn shutdown(&self, budget: Duration) -> ServerShutdownSummary {
         // 消せなくても（#599）エンジンの停止・最終 flush へ進む。
-        let endpoint = clear_endpoint(&self.endpoint_file, std::process::id());
+        let endpoint = match &self.run_dir {
+            Some(run) => clear_endpoint_in(run, std::process::id()),
+            None => clear_endpoint(&self.endpoint_file, std::process::id()),
+        };
         let report = self.engine.shutdown(budget).await;
         ServerShutdownSummary {
             report,
@@ -759,31 +842,58 @@ pub fn log_files_to_prune<'a>(
 
 /// 古いログファイルの削除の 1 回分（モジュール doc「ログ」）。ログの `Mutex` の外で
 /// 走らせる。
-#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "ログの Mutex を手放してから run か spawn で消す"]
 pub struct LogPrune {
-    dir: PathBuf,
+    dir: LogDir,
     today: LocalDate,
     retention_days: u32,
 }
 
+impl PartialEq for LogPrune {
+    fn eq(&self, other: &Self) -> bool {
+        self.dir.path() == other.dir.path()
+            && self.today == other.today
+            && self.retention_days == other.retention_days
+    }
+}
+
+impl Eq for LogPrune {}
+
+impl std::fmt::Debug for LogPrune {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogPrune")
+            .field("dir", &self.dir.path())
+            .field("today", &self.today)
+            .field("retention_days", &self.retention_days)
+            .finish()
+    }
+}
+
 impl LogPrune {
-    /// このスレッドで消す（列挙と削除に上限は無い。失敗は捨てる）。
+    /// このスレッドで消す（列挙と削除に上限は無い。失敗は捨てる）。握った版は
+    /// `ManagedDir::remove_where`（名前の形で選び、開いた後の属性で確かめ、印のファイルは
+    /// 消さない）。
     pub fn run(self) {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        let names: Vec<String> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect();
-        for name in log_files_to_prune(
-            names.iter().map(String::as_str),
-            self.today,
-            self.retention_days,
-        ) {
-            let _ = std::fs::remove_file(self.dir.join(name));
+        let (today, retention_days) = (self.today, self.retention_days);
+        let is_old =
+            move |name: &str| !log_files_to_prune([name], today, retention_days).is_empty();
+        match &self.dir {
+            LogDir::Managed(dir) => {
+                let _ = dir.remove_where(&is_old);
+            }
+            LogDir::Path(dir) => {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                let names: Vec<String> = entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect();
+                for name in names.iter().filter(|name| is_old(name)) {
+                    let _ = std::fs::remove_file(dir.join(name));
+                }
+            }
         }
     }
 
@@ -797,14 +907,43 @@ impl LogPrune {
     }
 }
 
+/// ログの置き場（#623 PR-3）: パス（コンソール）か、握ったフォルダ（サービス。日次ファイルを
+/// `ManagedDir::open_append` で辿らずに開き、古いファイルは `remove_where` で消す）。
+#[derive(Clone)]
+enum LogDir {
+    Path(PathBuf),
+    Managed(Arc<ManagedDir>),
+}
+
+impl LogDir {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            Self::Managed(dir) => dir.final_path(),
+        }
+    }
+
+    fn open_append(&self, name: &str) -> std::io::Result<File> {
+        match self {
+            Self::Path(dir) => OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(name)),
+            Self::Managed(dir) => dir.open_append(name, true).map_err(std::io::Error::other),
+        }
+    }
+}
+
 /// 日付ごとのログファイル（モジュール doc「ログ」）。書き込みの失敗は捨てる
 /// （ログが書けないことで収集を止めない）。
 pub struct ServerLog {
-    dir: PathBuf,
+    dir: LogDir,
     clock: Arc<dyn Clock>,
     current: Option<(LocalDate, File)>,
     /// `None` の間は消さない（保持日数をまだ読んでいない・無制限）。
     retention_days: Option<u32>,
+    /// [`ServerLog::close`] の後（サービスが ACL を緩め始めた後は書かない。#623 PR-3）。
+    closed: bool,
 }
 
 impl ServerLog {
@@ -812,11 +951,24 @@ impl ServerLog {
     pub fn open(dir: impl Into<PathBuf>, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        Self::start(LogDir::Path(dir), clock)
+    }
+
+    /// 握ったフォルダ（`<root>\logs` を `SafeRoot::open_managed` で握った物）に今日のファイルを
+    /// **辿らずに**開く（`ManagedDir::open_append`: reparse point でない・ファイル・リンク数 1 を
+    /// ハンドルで確かめる。サービス。#623 PR-3、設計 §3.1 の 6）。日跨ぎの新しいファイルも
+    /// 同じく開き、古いファイルの削除は `remove_where`（印のファイルは消さない）。
+    pub fn open_in(dir: Arc<ManagedDir>, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
+        Self::start(LogDir::Managed(dir), clock)
+    }
+
+    fn start(dir: LogDir, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
         let mut log = Self {
             dir,
             clock,
             current: None,
             retention_days: None,
+            closed: false,
         };
         let today = log.today();
         log.current = Some((today, log.open_file(today)?));
@@ -828,10 +980,7 @@ impl ServerLog {
     }
 
     fn open_file(&self, date: LocalDate) -> std::io::Result<File> {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.dir.join(log_file_name(date)))
+        self.dir.open_append(&log_file_name(date))
     }
 
     /// 今書いているファイル。
@@ -841,16 +990,33 @@ impl ServerLog {
             .as_ref()
             .map(|(date, _)| *date)
             .unwrap_or_else(|| self.today());
-        self.dir.join(log_file_name(date))
+        self.dir.path().join(log_file_name(date))
     }
 
     pub fn dir(&self) -> &Path {
-        &self.dir
+        self.dir.path()
+    }
+
+    /// 書くのをやめ、今のファイルを閉じる（サービスが ACL を緩め始める前。以後の
+    /// [`ServerLog::write_line`] は何もしない・新しいファイルも開かない。#623 PR-3、
+    /// 設計 §3.2 の 5）。
+    pub fn close(&mut self) {
+        self.flush();
+        self.current = None;
+        self.closed = true;
+    }
+
+    /// [`ServerLog::close`] の後か。
+    pub fn is_closed(&self) -> bool {
+        self.closed
     }
 
     /// 1 行書く（先頭に時刻）。日付が変わっていれば次のファイルへ移り、古いものの
     /// 削除を返す（ロックを手放してから走らせる。モジュール doc「ログ」）。
     pub fn write_line(&mut self, line: &str) -> Option<LogPrune> {
+        if self.closed {
+            return None;
+        }
         let now_ms = self.clock.now_ms();
         let offset_ms = self.clock.utc_offset_ms();
         let today = LocalDate::from_epoch_ms(now_ms, offset_ms);
@@ -879,6 +1045,9 @@ impl ServerLog {
 
     /// 削除の 1 回分（ファイルシステムには触れない）。保持日数を知らないなら `None`。
     fn prune(&self, today: LocalDate) -> Option<LogPrune> {
+        if self.closed {
+            return None;
+        }
         self.retention_days.map(|retention_days| LogPrune {
             dir: self.dir.clone(),
             today,

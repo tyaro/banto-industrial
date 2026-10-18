@@ -96,6 +96,37 @@ pub fn write_endpoint(path: &Path, info: &EndpointInfo) -> std::io::Result<()> {
     write_endpoint_with(path, info, |_| Ok(()))
 }
 
+/// 握った `run\` の中に**ハンドル基準で**原子的に書く（`ManagedDir::write_atomic`。宛先が
+/// フォルダ・ジャンクションなら断り、パスを解決し直さない。サービス。#623 PR-3）。
+pub fn write_endpoint_in(
+    run: &banto_safe_root::ManagedDir,
+    info: &EndpointInfo,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(info).map_err(std::io::Error::other)?;
+    run.write_atomic(ENDPOINT_FILE_NAME, &bytes)
+        .map_err(std::io::Error::other)
+}
+
+/// 握った `run\` の中の `endpoint.json` を、自分の pid のときだけ消す（読むのも消すのも
+/// ハンドル基準。[`clear_endpoint`] の握った版。サービス。#623 PR-3）。
+pub fn clear_endpoint_in(run: &banto_safe_root::ManagedDir, own_pid: u32) -> EndpointClear {
+    let opened = match run.open_read(ENDPOINT_FILE_NAME) {
+        Ok(Some(file)) => Ok(Some(file)),
+        Ok(None) => Ok(None),
+        Err(err) => Err(std::io::Error::other(err)),
+    };
+    let loaded = match opened {
+        Err(err) => return EndpointClear::ReadFailed(err.to_string()),
+        Ok(None) => Ok(Loaded::Missing),
+        Ok(Some(file)) => parse_endpoint(file),
+    };
+    clear_loaded(loaded, own_pid, || match run.remove(ENDPOINT_FILE_NAME) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Err(err) => Err(std::io::Error::other(err)),
+    })
+}
+
 /// 書き込みの段階。テストが途中の失敗を注入するための印。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -153,12 +184,17 @@ enum Loaded {
 
 /// `path` を読む。無いのは `Ok(Missing)`、開けない・読めないのは `Err`。
 fn load_endpoint(path: &Path) -> std::io::Result<Loaded> {
-    use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Missing),
         Err(err) => return Err(err),
     };
+    parse_endpoint(file)
+}
+
+/// 開いたファイルの中身を読む（大きさの上限・JSON・値の確かめ）。
+fn parse_endpoint(file: std::fs::File) -> std::io::Result<Loaded> {
+    use std::io::Read;
     let mut bytes = Vec::new();
     file.take(MAX_ENDPOINT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_ENDPOINT_BYTES {
@@ -260,14 +296,23 @@ fn clear_endpoint_with(
     own_pid: u32,
     remove: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> EndpointClear {
-    match load_endpoint(path) {
+    clear_loaded(load_endpoint(path), own_pid, || remove(path))
+}
+
+/// 読んだ結果から、消すかどうかを決めて消す（パスの版・握った版で共通）。
+fn clear_loaded(
+    loaded: std::io::Result<Loaded>,
+    own_pid: u32,
+    remove: impl FnOnce() -> std::io::Result<()>,
+) -> EndpointClear {
+    match loaded {
         Err(err) => EndpointClear::ReadFailed(err.to_string()),
         Ok(Loaded::Missing) => EndpointClear::Absent,
         Ok(Loaded::Unrecognized) => EndpointClear::Unrecognized,
         Ok(Loaded::Info(info)) if info.pid != own_pid => {
             EndpointClear::OtherOwner { pid: info.pid }
         }
-        Ok(Loaded::Info(_)) => match remove(path) {
+        Ok(Loaded::Info(_)) => match remove() {
             Ok(()) => EndpointClear::Removed,
             // 読んだ後に誰かが消した。
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => EndpointClear::Absent,

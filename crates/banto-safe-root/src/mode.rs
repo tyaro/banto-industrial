@@ -75,10 +75,13 @@
 //! （ファイルの中身）・`DELETE`（消す・木の外へ移す）は印では塞がらない（設計 §2.9 の表。ID で開いた
 //! 物の本当のパスの確かめと、パスで渡す直前の `recheck` で狭める）。実測（手元 Windows 11 26300、
 //! テスト `an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_is_measured`
-//! が assert で固定）では、ハンドル経由の `SetKernelObjectSecurity` による DACL の変更は
+//! が記録する）では、ハンドル経由の `SetKernelObjectSecurity` による DACL の変更は
 //! `ReadDirectoryChangesW(FILE_NOTIFY_CHANGE_SECURITY)` に**その場では通知されず、そのハンドルを
-//! 閉じたときに遅れて通知される**（パスの `SetNamedSecurityInfoW` は閉じて戻るので直ちに来る）。
-//! 見張りは、古いハンドルを握り続ける相手には閉じるまで反応できない。
+//! 閉じたときに遅れて通知された**（パスの `SetNamedSecurityInfoW` は閉じて戻るので直ちに来る）。
+//! ただし CI（管理者）ではその場で通知が来ることもあった: 通知の有無は OS・環境（負荷・管理者か・
+//! ほかのフィルタドライバ）で変わる観測なので、テストは assert せず記録だけにする（古いハンドルで
+//! DACL を戻せること自体は assert）。見張りは補助で、古いハンドルを握り続ける相手には当てにせず、
+//! 主は印のファイルと定期の確かめ直しで守る。
 //!
 //! **既知の制限**: 一度でも運用モードにした木では、すべてのフォルダに印があり、設定モードの
 //! 利用者はフォルダをフォルダごと消せない（中身は消せる）。tstore の日次ファイル・LogPrune・
@@ -579,6 +582,11 @@ mod imp {
         Err(SafeRootError::UnsupportedPlatform)
     }
 }
+
+#[cfg(windows)]
+mod watch;
+#[cfg(windows)]
+pub use watch::{SecurityWatch, WatchEvent, WatchStop};
 
 #[cfg(test)]
 mod tests;

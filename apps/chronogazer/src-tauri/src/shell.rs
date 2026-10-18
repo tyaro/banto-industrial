@@ -126,7 +126,8 @@ use chronogazer_core::instance_lock::ChronoGazerHost;
 use chronogazer_core::paths::DataLayout;
 use chronogazer_core::service_probe::{probe_service_as, PROBE_TIMEOUT};
 use chronogazer_core::shell_launch::{
-    decide, needs_probe, LaunchDecision, ScmObservation, ServiceHealth,
+    decide, needs_probe, observe_root_mode, LaunchDecision, RootBlock, RootModeObservation,
+    ScmObservation, ServiceHealth,
 };
 use serde::Serialize;
 use tauri::utils::config::WindowConfig;
@@ -286,6 +287,25 @@ pub(crate) fn initial_view(decision: &LaunchDecision) -> ShellView {
             health: info.health.clone(),
             cause: FallbackCause::AtStartup,
         }),
+        // #623 PR-3: ルートが運用モードの形（締まったまま）・観測に使えない → Desktop に
+        // しない。文言・ボタン（[運用を再開]・[設定モードに切り替える]）は PR-4。
+        LaunchDecision::RootBlocked { scm, .. } => ShellView::Fallback(FallbackState {
+            scm: scm.clone(),
+            health: None,
+            cause: FallbackCause::AtStartup,
+        }),
+    }
+}
+
+/// [`LaunchDecision::RootBlocked`] の理由のログの 1 行（PR-4 で画面の文言にする）。
+fn root_block_line(why: &RootBlock) -> String {
+    match why {
+        RootBlock::OperationMode => {
+            "banto: データのフォルダが運用モードのまま（締まったまま）です。この PC の中では記録エンジンを起動しません（サービスを開始するか、relax-only で設定モードへ戻してください）".to_string()
+        }
+        RootBlock::Unusable(reason) => format!(
+            "banto: データのフォルダをモードの観測に使えません（{reason}）。この PC の中では記録エンジンを起動しません"
+        ),
     }
 }
 
@@ -371,8 +391,9 @@ pub(crate) fn on_retry(
     cause: FallbackCause,
     scm: &ScmObservation,
     health: Option<&ServiceHealth>,
+    mode: &RootModeObservation,
 ) -> Step {
-    match decide(scm, health) {
+    match decide(scm, health, mode) {
         LaunchDecision::Service { port } => Step::ToService { port },
         LaunchDecision::Desktop { .. } => Step::ToDesktop,
         LaunchDecision::Fallback(info) => Step::Refresh(FallbackState {
@@ -380,6 +401,14 @@ pub(crate) fn on_retry(
             health: info.health,
             cause,
         }),
+        LaunchDecision::RootBlocked { scm, why } => {
+            eprintln!("{}", root_block_line(&why));
+            Step::Refresh(FallbackState {
+                scm,
+                health: None,
+                cause,
+            })
+        }
     }
 }
 
@@ -711,16 +740,21 @@ fn observe_scm(hooks: &ShellTestHooks) -> ScmObservation {
     }
 }
 
-/// SCM を照会し、`Running` なら probe する（同期。最大 [`PROBE_TIMEOUT`] + 照会）。
-fn observe(layout: &DataLayout, hooks: &ShellTestHooks) -> (ScmObservation, Option<ServiceHealth>) {
+/// SCM を照会し、`Running` なら probe し、データのルートのモードを読む（同期。最大
+/// [`PROBE_TIMEOUT`] + 照会）。モードはデスクトップの権限で DACL を読むだけ（#623 PR-3）。
+fn observe(layout: &DataLayout, hooks: &ShellTestHooks) -> Observed {
     let scm = observe_scm(hooks);
     let health =
         needs_probe(&scm).then(|| probe_service_as(layout, hooks.expected_host(), PROBE_TIMEOUT));
-    (scm, health)
+    let mode = observe_root_mode(layout.root());
+    (scm, health, mode)
 }
 
+/// [`observe`] の結果（SCM・probe・ルートのモード）。
+type Observed = (ScmObservation, Option<ServiceHealth>, RootModeObservation);
+
 /// [`observe`] を tokio のワーカーの外で行う。
-async fn observe_async(app: &AppHandle) -> Option<(ScmObservation, Option<ServiceHealth>)> {
+async fn observe_async(app: &AppHandle) -> Option<Observed> {
     let (layout, hooks) = {
         let shell = app.try_state::<ShellState>()?;
         (shell.layout.clone(), shell.hooks.clone())
@@ -747,8 +781,8 @@ pub(crate) fn start(app: &AppHandle) {
     for line in hooks.log_lines() {
         eprintln!("{line}");
     }
-    let (scm, health) = observe(&layout, &hooks);
-    let decision = decide(&scm, health.as_ref());
+    let (scm, health, mode) = observe(&layout, &hooks);
+    let decision = decide(&scm, health.as_ref(), &mode);
     eprintln!(
         "banto: 起動の判定: サービス={}、判定={}",
         describe_scm_detail(&scm),
@@ -756,6 +790,7 @@ pub(crate) fn start(app: &AppHandle) {
             LaunchDecision::Service { port } => format!("サービスへつなぐ（ポート {port}）"),
             LaunchDecision::Desktop { .. } => "この PC の中で記録エンジンを起動".to_string(),
             LaunchDecision::Fallback(_) => "接続できない状態を表示".to_string(),
+            LaunchDecision::RootBlocked { why, .. } => root_block_line(why),
         }
     );
     let view = initial_view(&decision);
@@ -996,12 +1031,12 @@ async fn retry(app: AppHandle) {
         }
     };
     rerender_fallback(&app, None, true);
-    let Some((scm, health)) = observe_async(&app).await else {
+    let Some((scm, health, mode)) = observe_async(&app).await else {
         drop(guard);
         rerender_fallback(&app, None, false);
         return;
     };
-    match on_retry(current.cause, &scm, health.as_ref()) {
+    match on_retry(current.cause, &scm, health.as_ref(), &mode) {
         Step::ToService { port } => switch_to_service(&app, guard, port),
         Step::ToDesktop => switch_to_desktop(&app, guard).await,
         Step::Refresh(state) => {
@@ -1123,7 +1158,8 @@ async fn monitor(app: AppHandle) {
                 streak,
             } => (view, generation, streak),
         };
-        let Some((scm, health)) = observe_async(&app).await else {
+        // 見張りは Desktop へは移らない（O2・O3）ので、ルートのモードは見ない。
+        let Some((scm, health, _mode)) = observe_async(&app).await else {
             continue;
         };
         let (step, streak) = on_tick(&view, streak, &scm, health.as_ref());
@@ -1359,7 +1395,12 @@ mod tests {
     fn retry_follows_decide() {
         for scm in all_observations() {
             for health in all_health() {
-                let step = on_retry(FallbackCause::ServiceLost, &scm, health.as_ref());
+                let step = on_retry(
+                    FallbackCause::ServiceLost,
+                    &scm,
+                    health.as_ref(),
+                    &RootModeObservation::NotObserved,
+                );
                 let desktop_allowed = matches!(
                     scm,
                     ScmObservation::NotWindows

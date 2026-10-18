@@ -82,8 +82,10 @@ pub struct RootSpec {
     /// （設定モードでデスクトップが作った物の所有者 = インストール利用者。[`Mode::Guarded`]
     /// だけが使う）。
     pub owners: Vec<InstallUserSid>,
-    /// ルート・管理するフォルダを**作るときに**付ける保護された DACL（作るのと同時に付ける）。
-    /// `None` なら親から継承する。既にある物の ACL は変えない・確かめない（PR-1c の範囲）。
+    /// **ルートを**作るときに付ける保護された DACL（作るのと同時に付ける）。`None` なら親から
+    /// 継承する。既にある物の ACL は変えない・確かめない（形は [`crate::mode`] の 2 周目が書く）。
+    /// 管理するフォルダを作るときの記述子は、[`SafeRoot::open_managed`] に**呼ぶたびに**渡す
+    /// （#623 PR-3: 締める前に開く `logs` は設定モードの形、締めた後に開く残りは運用モードの形）。
     pub create_access: Option<DirAccess>,
     /// 無ければ作るか。
     pub create: bool,
@@ -136,7 +138,7 @@ pub struct ManagedSpec {
     pub parent: Option<&'static str>,
     /// 名前 1 要素（[`guard::is_plain_child_name`] に通ること）。製品が渡す。
     pub name: &'static str,
-    /// 無ければ作るか（[`RootSpec::create_access`] を作るのと同時に付ける）。
+    /// 無ければ作るか（[`SafeRoot::open_managed`] の `create_access` を作るのと同時に付ける）。
     pub create: bool,
 }
 
@@ -310,8 +312,9 @@ pub struct RemoveReport {
 /// このパスで後から開き直し、付随のファイルを自分でパスから作る。それでも外へ出ないのは、
 /// **運用モードの間は利用者がこの木に名前を作れない**（ルート全体の ACL。PR-1c・PR-3/5）
 /// からであって、この型の力ではない。フォルダの記述子が運用モードの形かの確かめ直し
-/// （設計 §2.9 (d)）は PR-1c で足す。Redirection Guard は途中のジャンクションの保険
-/// （ハードリンク・シンボリックリンクには効かない）。[`Mode::Plain`] は何も確かめない。
+/// （設計 §2.9 (d)）は [`ManagedDir::reopen_path_checked`]。Redirection Guard は途中の
+/// ジャンクションの保険（ハードリンク・シンボリックリンクには効かない）。[`Mode::Plain`] は
+/// 何も確かめない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReopenPath {
     path: PathBuf,
@@ -631,8 +634,6 @@ pub struct SafeRoot {
     // 読むのは Windows の Guarded の `open_managed` だけ（非 Windows は Plain しか無い）。
     #[cfg_attr(not(windows), allow(dead_code))]
     owners: Vec<InstallUserSid>,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    create_access: Option<DirAccess>,
 }
 
 impl SafeRoot {
@@ -657,12 +658,18 @@ impl SafeRoot {
         self.dir.pinned()
     }
 
-    /// 管理するフォルダを親から順に開いて握る（無ければ `create` の spec だけ作る）。spec の
-    /// 並びは何も開く前に [`check_specs`] で確かめる。どれか 1 つでも開けない・確かめに通らない
-    /// なら止めて、1 つも返さない（設計 §4.1「常に起動を止める」）。
+    /// 管理するフォルダを親から順に開いて握る（無ければ `create` の spec だけ、`create_access`
+    /// の保護された DACL を作るのと同時に付けて作る。`None` なら親から継承）。spec の並びは
+    /// 何も開く前に [`check_specs`] で確かめる。どれか 1 つでも開けない・確かめに通らないなら
+    /// 止めて、1 つも返さない（設計 §4.1「常に起動を止める」）。
+    ///
+    /// `create_access` を**呼ぶたびに**渡すのは（#623 PR-3、設計 §4.7）、締める前に開く `logs` は
+    /// 設定モードの形で作り（断ったとき「設定モードのまま」にする）、締めた後に開く残りは運用
+    /// モードの形で作るため。1 つの値を両方に使うと、どちらかが食い違う。
     pub fn open_managed(
         &self,
         specs: &[ManagedSpec],
+        create_access: Option<&DirAccess>,
     ) -> std::result::Result<ManagedSet, ManagedStop> {
         check_specs(specs)?;
         let mut dirs: Vec<(&'static str, ManagedDir)> = Vec::with_capacity(specs.len());
@@ -677,10 +684,12 @@ impl SafeRoot {
                         .1
                 }
             };
-            let opened = self.open_one(parent, spec).map_err(|reason| ManagedStop {
-                key: spec.key,
-                reason,
-            })?;
+            let opened = self
+                .open_one(parent, spec, create_access)
+                .map_err(|reason| ManagedStop {
+                    key: spec.key,
+                    reason,
+                })?;
             dirs.push((spec.key, opened));
         }
         Ok(ManagedSet { dirs })
@@ -690,17 +699,17 @@ impl SafeRoot {
         &self,
         parent: &ManagedDir,
         spec: &ManagedSpec,
+        create_access: Option<&DirAccess>,
     ) -> std::result::Result<ManagedDir, ManagedRefusal> {
         match &parent.inner {
             #[cfg(windows)]
-            Inner::Guarded(pinned) => win::open_managed_one(
-                pinned,
-                &parent.display,
-                spec,
-                &self.owners,
-                self.create_access.as_ref(),
-            ),
-            Inner::Plain => plain::open_managed_one(parent, spec),
+            Inner::Guarded(pinned) => {
+                win::open_managed_one(pinned, &parent.display, spec, &self.owners, create_access)
+            }
+            Inner::Plain => {
+                let _ = create_access;
+                plain::open_managed_one(parent, spec)
+            }
         }
     }
 }
@@ -725,6 +734,17 @@ impl ManagedSet {
     pub fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.dirs.iter().map(|(k, _)| *k)
     }
+
+    /// key の管理するフォルダを**取り出す**（組から外れる。握ったハンドルを別の持ち主 - 日次ログ・
+    /// 秘密の保存先 - に渡すため。#623 PR-3）。無ければ [`UnknownKey`]。
+    pub fn take(&mut self, key: &str) -> std::result::Result<ManagedDir, UnknownKey> {
+        let index = self
+            .dirs
+            .iter()
+            .position(|(k, _)| *k == key)
+            .ok_or_else(|| UnknownKey(key.to_string()))?;
+        Ok(self.dirs.remove(index).1)
+    }
 }
 
 /// ルートを開いて握る（モジュール doc の 1）。
@@ -739,7 +759,6 @@ pub fn open_root(spec: &RootSpec) -> std::result::Result<SafeRoot, RootRefusal> 
     Ok(SafeRoot {
         dir,
         owners: spec.owners.clone(),
-        create_access: spec.create_access.clone(),
     })
 }
 

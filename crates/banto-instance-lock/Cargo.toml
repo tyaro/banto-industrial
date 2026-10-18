@@ -14,10 +14,13 @@ thiserror = { workspace = true }
 # 作るためのハッシュ（`DefaultHasher` はバージョン間の安定が保証されない）。
 sha2 = { workspace = true }
 
-[target.'cfg(windows)'.dependencies]
 # 診断ファイルを辿らずに開いて確かめる部品（`nofollow::open_file_verified`。#623 PR-2 の
-# 中身を PR-1b で共有 crate へ移した）。非 Windows は自前の `O_NOFOLLOW` の版なので要らない。
+# 中身を PR-1b で共有 crate へ移した）と、握ったフォルダの中に診断ファイルを書く
+# `try_acquire_in` の `ManagedDir`（#623 PR-3。非 Windows は `Mode::Plain` の型だけ使う。
+# 非 Windows の本番の依存は thiserror だけ）。
 banto-safe-root = { path = "../banto-safe-root" }
+
+[target.'cfg(windows)'.dependencies]
 # banto-hub-core が `profile_lock.rs` で使っていたのと同じ 0.61 系・同じ
 # feature（`CreateMutexW`/`OpenMutexW` は `Win32_Security` を要求する）。
 windows-sys = { version = "0.61", features = [

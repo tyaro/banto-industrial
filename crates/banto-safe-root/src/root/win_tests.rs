@@ -104,12 +104,15 @@ fn a_guarded_root_and_managed_dirs_work_end_to_end() {
     assert!(root.as_dir().is_guarded());
     assert!(root.pinned().is_some());
     let set = root
-        .open_managed(&[
-            spec("logs", None, "logs"),
-            spec("run", None, "run"),
-            spec("backups", None, "backups"),
-            spec("backups-db", Some("backups"), "db"),
-        ])
+        .open_managed(
+            &[
+                spec("logs", None, "logs"),
+                spec("run", None, "run"),
+                spec("backups", None, "backups"),
+                spec("backups-db", Some("backups"), "db"),
+            ],
+            None,
+        )
         .unwrap();
     assert!(dir.path().join("root").join("backups").join("db").is_dir());
     let logs = set.get("logs").unwrap();
@@ -184,7 +187,8 @@ fn created_dirs_carry_the_create_access() {
         ..guarded(dir.path().join("root"))
     })
     .unwrap();
-    root.open_managed(&[spec("data", None, "data")]).unwrap();
+    root.open_managed(&[spec("data", None, "data")], Some(&access))
+        .unwrap();
     for path in [
         root.final_path().to_path_buf(),
         root.final_path().join("data"),
@@ -268,7 +272,10 @@ fn a_managed_dir_that_is_a_link_or_a_file_stops_the_whole_set() {
         }
         let before = snapshot(outside.path());
         let stop = root
-            .open_managed(&[spec("logs", None, "logs"), spec("after", None, "after")])
+            .open_managed(
+                &[spec("logs", None, "logs"), spec("after", None, "after")],
+                None,
+            )
             .unwrap_err();
         assert_eq!(
             stop,
@@ -288,7 +295,7 @@ fn a_managed_dir_that_is_a_link_or_a_file_stops_the_whole_set() {
     let root = open_root(&guarded(dir.path().join("root"))).unwrap();
     std::fs::write(root.final_path().join("data"), b"file").unwrap();
     let stop = root
-        .open_managed(&[spec("data", None, "data")])
+        .open_managed(&[spec("data", None, "data")], None)
         .unwrap_err();
     assert_eq!(stop.reason, ManagedRefusal::Refused(Refusal::NotADirectory));
 }
@@ -299,7 +306,7 @@ fn an_invalid_spec_list_creates_nothing_when_guarded() {
     let dir = tempfile::tempdir().unwrap();
     let root = open_root(&guarded(dir.path().join("root"))).unwrap();
     let stop = root
-        .open_managed(&[spec("data", None, "data"), spec("x", None, "nul")])
+        .open_managed(&[spec("data", None, "data"), spec("x", None, "nul")], None)
         .unwrap_err();
     assert_eq!(stop.reason, ManagedRefusal::Spec(SpecProblem::InvalidName));
     assert!(std::fs::read_dir(root.final_path())
@@ -669,7 +676,9 @@ fn a_held_dir_turned_into_a_junction_does_not_leak() {
     let dir = tempfile::tempdir().unwrap();
     let (outside, _victim) = outside_with_victim();
     let root = open_root(&guarded(dir.path().join("root"))).unwrap();
-    let set = root.open_managed(&[spec("data", None, "data")]).unwrap();
+    let set = root
+        .open_managed(&[spec("data", None, "data")], None)
+        .unwrap();
     let data = set.get("data").unwrap();
     let before = snapshot(outside.path());
     if let Err(e) = set_reparse_to(data.final_path(), outside.path()) {
@@ -933,11 +942,13 @@ fn a_managed_dir_owned_by_someone_not_allowed_is_refused() {
         let opened = open_root(&guarded(root.clone())).unwrap();
         // ルートの所有者を許す spec では管理するフォルダの所有者（同じ利用者）も許されるので、
         // ここでは「許す」側を確かめて終える（非管理者では別の所有者を作れない）。
-        opened.open_managed(&[spec("data", None, "data")]).unwrap();
+        opened
+            .open_managed(&[spec("data", None, "data")], None)
+            .unwrap();
         return;
     };
     let stop = opened
-        .open_managed(&[spec("data", None, "data")])
+        .open_managed(&[spec("data", None, "data")], None)
         .unwrap_err();
     assert_eq!(stop.key, "data");
     assert_eq!(

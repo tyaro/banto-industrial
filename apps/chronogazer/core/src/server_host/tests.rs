@@ -485,6 +485,86 @@ async fn start_serves_loopback_writes_the_endpoint_and_shutdown_clears_it() {
     assert!(std::net::TcpStream::connect(addr).is_err());
 }
 
+/// #623 PR-3（設計 §3.2 の 1）: 停止の前に新しいバックアップの受け付けを止め、進行中の物が
+/// 終わるのを**打ち切らずに**待つ（待つ間は刻みごとに呼び返す）。止めた後の `POST /api/backups`
+/// は 503、`GET` は通る。門の対象は `/api/backups` の下の `GET` 以外だけ（純関数）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_backups_waits_for_inflight_work_and_refuses_new_requests() {
+    use crate::engine::BackupGate;
+    use axum::http::Method;
+    for (method, path, guarded) in [
+        (Method::POST, "/api/backups", true),
+        (Method::POST, "/api/backups/restore", true),
+        (Method::POST, "/api/backups/x.sqlite3/restore", true),
+        (Method::DELETE, "/api/backups/pending-restore", true),
+        (Method::GET, "/api/backups", false),
+        (Method::GET, "/api/backups/x.sqlite3", false),
+        (Method::POST, "/api/backupsx", false),
+        (Method::POST, "/api/users", false),
+    ] {
+        assert_eq!(
+            BackupGate::guards(&method, path),
+            guarded,
+            "{method} {path}"
+        );
+    }
+
+    let dir = TempDir::new();
+    prepare_root(dir.path(), &[]).await;
+    let started = start(options(dir.path())).await.expect("start");
+    let addr = started.engine().loopback_addr().await.expect("loopback");
+    let (status, body) = post_setup(&format!("http://{addr}/api/auth/setup")).await;
+    assert_eq!(status, 200, "{body}");
+    let token = body["token"].as_str().expect("token").to_string();
+    let client = reqwest::Client::new();
+    let get_backups = || {
+        client
+            .get(format!("http://{addr}/api/backups"))
+            .header("X-Banto-Client", "banto")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+    };
+    assert_eq!(get_backups().await.unwrap().status(), 200);
+
+    let gate = started.backup_gate().clone();
+    assert!(!gate.is_closed());
+    let inflight = gate.try_enter().expect("開いている間は受け付ける");
+    assert_eq!(gate.inflight(), 1);
+    let waits = std::sync::Mutex::new(Vec::new());
+    let mut on_wait = |elapsed| {
+        waits.lock().unwrap().push(elapsed);
+    };
+    let drain = started.drain_backups(Duration::from_millis(50), &mut on_wait);
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(inflight);
+    };
+    tokio::join!(drain, release);
+    let waits = waits.into_inner().unwrap();
+    assert!(waits.len() >= 2, "待つ間に呼び返されない: {waits:?}");
+    assert!(gate.is_closed());
+    assert_eq!(gate.inflight(), 0);
+    assert!(gate.try_enter().is_none(), "止めた後に受け付けた");
+    // 止めた後の作成は 503、読むのは通る。
+    let created = client
+        .post(format!("http://{addr}/api/backups"))
+        .header("X-Banto-Client", "banto")
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 503);
+    assert_eq!(get_backups().await.unwrap().status(), 200);
+    // 何も進行していなければすぐ戻る。
+    let mut calls = 0;
+    started
+        .drain_backups(Duration::from_millis(50), &mut |_| calls += 1)
+        .await;
+    assert_eq!(calls, 0);
+    let summary = started.shutdown(Duration::from_secs(15)).await;
+    assert_eq!(summary.exit_code(), EXIT_OK);
+}
+
 /// #392 B3-2a: 渡した host の種類（サービス）が、A1 の診断ファイル・`GET /api/host`
 /// の `hostKind`・`run\endpoint.json` の `host_kind` のすべてに届く（コンソールの
 /// `server` の固定ではない）。

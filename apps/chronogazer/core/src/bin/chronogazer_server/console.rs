@@ -335,6 +335,46 @@ fn end_redirect(write: RawHandle, original_out: RawHandle, original_err: RawHand
     }
 }
 
+/// 標準出力・標準エラー出力を `NUL` へ向ける（#623 PR-3、設計 §3.2 の 5）。サービスが
+/// 日次ログを閉じて向け直しを外した後（[`StdioRedirect::finish`] は元のハンドルへ戻す -
+/// Session 0 では無いか無効）、緩めている間の `println!`・`eprintln!` がどこへも届かないことを
+/// はっきりさせる。戻した後の書き手は新しいハンドルへ書く（Rust の標準出力は書くたびに
+/// `GetStdHandle` を読む）。
+pub fn redirect_stdio_to_nul() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let name: Vec<u16> = "NUL".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `name` は NUL 終端。デバイス `NUL` を書き込みで開くだけ。
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // 差し替えは Rust の標準出力・標準エラー出力の lock を持って行う（`end_redirect` と同じ）。
+    let _stdout = std::io::stdout().lock();
+    let _stderr = std::io::stderr().lock();
+    // SAFETY: 開いたハンドルを標準ハンドルに据えるだけ（閉じない - プロセスの終わりまで使う）。
+    let ok = unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, handle) != FALSE
+            && SetStdHandle(STD_ERROR_HANDLE, handle) != FALSE
+    };
+    if !ok {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `bytes` をすべて `handle` へ書く（失敗したら諦める）。
 fn write_all(handle: RawHandle, mut bytes: &[u8]) {
     while !bytes.is_empty() {

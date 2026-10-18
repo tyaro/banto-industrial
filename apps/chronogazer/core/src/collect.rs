@@ -1920,6 +1920,12 @@ impl CollectorService {
         )
     }
 
+    /// 時系列データの置き場（解決した `data.dir`。サービスが外部かどうかをログに出すため。
+    /// #623 PR-3）。
+    pub fn data_dir(&self) -> &Path {
+        &self.inner.ctx.data_dir
+    }
+
     fn build(
         pool: SqlitePool,
         data_dir: PathBuf,

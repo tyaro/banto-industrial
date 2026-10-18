@@ -30,6 +30,9 @@ banto-safe-root = { path = "../../../crates/banto-safe-root" }
 banto-service-control = { path = "../../../crates/banto-service-control" }
 # ローカルグループ・メンバー・サービス DACL の ACE（#392 B3-3a）。
 banto-service-elev = { path = "../../../crates/banto-service-elev" }
+# 書き直す間だけ A1 の mutex を持つ（`try_hold_named_mutex`。#623 PR-3、設計 §3.5）。
+# chronogazer-core が既に依存しているので新しい crate は増えない。
+banto-instance-lock = { path = "../../../crates/banto-instance-lock" }
 
 [target.'cfg(windows)'.dependencies]
 # 既存の 0.61 系（新しい crate は増えない）:

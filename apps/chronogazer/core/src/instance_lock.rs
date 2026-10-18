@@ -168,39 +168,72 @@ impl InstanceGuard {
     }
 }
 
-/// `db_path` の DB を開く前に、その DB の排他を取る。
-pub fn acquire_for_db(
-    db_path: &Path,
+/// `db_path` の DB の排他の単位（mutex 名 `Global\ChronoGazer.<ID>` の `<ID>`）と、正規化した
+/// パス（`banto_instance_lock::path_scope_id`。親を `canonicalize` するので、親は既にあること）。
+/// サービスのルート（`ManagedDir::final_path`）も、デスクトップの `db_path` も、同じ DB なら
+/// 同じ ID になる（排他が噛み合う前提。#623 PR-3）。
+pub fn scope_for_db(db_path: &Path) -> std::io::Result<(String, PathBuf)> {
+    banto_instance_lock::path_scope_id(db_path)
+}
+
+/// 握ったルート（本当のパス）の中の DB の排他の単位。**末端を解かない**
+/// （`banto_instance_lock::path_scope_id_in`。ルートは `canonicalize`、DB の名前は定数）。
+pub fn scope_for_db_in(root: &Path) -> std::io::Result<(String, PathBuf)> {
+    banto_instance_lock::path_scope_id_in(root, std::ffi::OsStr::new(crate::paths::DB_FILE_NAME))
+}
+
+/// `root` の DB の A1 の mutex の名前（昇格ヘルパーが、書き直す間だけ同じ mutex を持つ
+/// ために使う。#623 PR-3、設計 §3.5）。`root` は辿らずに開いて確かめたルートの本当のパス。
+/// 末端（DB）は解かない（[`scope_for_db_in`]）。
+pub fn mutex_name_for_root(root: &Path) -> std::io::Result<String> {
+    let (id, _) = scope_for_db_in(root)?;
+    Ok(mutex_name(&id))
+}
+
+fn mutex_name(id: &str) -> String {
+    format!("Global\\ChronoGazer.{id}")
+}
+
+/// **握ったルート**（`SafeRoot::as_dir()`）の中の DB の排他を取る（サービス。#623 PR-3、
+/// 設計 §3.1 の 5）。排他の単位は [`acquire_for_db`] と同じ ID（ルートの本当のパス + DB の
+/// ファイル名）だが、**末端（DB のファイル名）は解かない**（[`scope_for_db_in`]。Codex の
+/// 指摘: 設定モードの木で書ける利用者が、この呼び出しの間だけ DB をシンボリックリンクに
+/// しておくと、全体を `canonicalize` する版はリンクの先の範囲の mutex になり、後で普通の
+/// ファイルに戻されるとデスクトップと範囲が食い違って A1 が噛み合わなくなる）。デスクトップの
+/// [`acquire_for_db`] はリンクの DB を断るので、普通のファイルでは両者は同じ ID。診断
+/// ファイルは `banto_instance_lock::try_acquire_in` が握ったフォルダ基準で書く（まだ緩い
+/// 木でも、辿らないので外へは書かない）。
+pub fn acquire_for_db_in(
+    root: &banto_safe_root::ManagedDir,
     host: ChronoGazerHost,
 ) -> Result<InstanceGuard, InstanceLockFailure> {
-    // DB ファイル自体がシンボリックリンクなら断る（`symlink_metadata` なので壊れた
-    // リンクも見える）。許すと、(a) リンク先がまだ無い間は別名のパスで ID を作り、
-    // `init_db` が実体を作った後の起動は実体のパスで ID を作る、(b) 保留中のリストア
-    // が `rename` で別名のリンク自体を通常ファイルに置き換える、のどちらでも
-    // 「保持しているロック」と「最終的に開く DB」がずれて、2 プロセスが通り抜ける。
-    // 親ディレクトリのリンクは `path_scope_id` が正規化するので許す。
-    if std::fs::symlink_metadata(db_path)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(InstanceLockFailure::SymlinkDbPath {
-            db: db_path.to_path_buf(),
-        });
-    }
+    let db_path = root.final_path().join(crate::paths::DB_FILE_NAME);
     let (id, canonical) =
-        banto_instance_lock::path_scope_id(db_path).map_err(|source| InstanceLockFailure::Io {
-            db: db_path.to_path_buf(),
+        scope_for_db_in(root.final_path()).map_err(|source| InstanceLockFailure::Io {
+            db: db_path.clone(),
             source,
         })?;
-    let mutex_name = format!("Global\\ChronoGazer.{id}");
     let mut lock_name = canonical
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_default();
     lock_name.push(".instance.lock");
-    let lock_file = canonical.with_file_name(lock_name);
+    let lock_name = lock_name.to_string_lossy().into_owned();
+    into_guard(
+        banto_instance_lock::try_acquire_in(&mutex_name(&id), root, &lock_name, host.as_str()),
+        id,
+        canonical,
+    )
+}
 
-    match banto_instance_lock::try_acquire(&mutex_name, &lock_file, host.as_str()) {
+/// `banto_instance_lock` の結果を [`InstanceGuard`] に写す（[`acquire_for_db`]・
+/// [`acquire_for_db_in`] で同じ）。
+fn into_guard(
+    acquired: Result<InstanceLockGuard, InstanceLockError>,
+    id: String,
+    canonical: PathBuf,
+) -> Result<InstanceGuard, InstanceLockFailure> {
+    match acquired {
         Ok(guard) => {
             // 診断ファイルを書かなかった・作ったファイルを消せなかった理由
             // （`banto_instance_lock` はログを出さない）。排他は取れているので起動は
@@ -223,6 +256,43 @@ pub fn acquire_for_db(
             source,
         }),
     }
+}
+
+/// `db_path` の DB を開く前に、その DB の排他を取る。
+pub fn acquire_for_db(
+    db_path: &Path,
+    host: ChronoGazerHost,
+) -> Result<InstanceGuard, InstanceLockFailure> {
+    // DB ファイル自体がシンボリックリンクなら断る（`symlink_metadata` なので壊れた
+    // リンクも見える）。許すと、(a) リンク先がまだ無い間は別名のパスで ID を作り、
+    // `init_db` が実体を作った後の起動は実体のパスで ID を作る、(b) 保留中のリストア
+    // が `rename` で別名のリンク自体を通常ファイルに置き換える、のどちらでも
+    // 「保持しているロック」と「最終的に開く DB」がずれて、2 プロセスが通り抜ける。
+    // 親ディレクトリのリンクは `path_scope_id` が正規化するので許す。
+    if std::fs::symlink_metadata(db_path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(InstanceLockFailure::SymlinkDbPath {
+            db: db_path.to_path_buf(),
+        });
+    }
+    let (id, canonical) = scope_for_db(db_path).map_err(|source| InstanceLockFailure::Io {
+        db: db_path.to_path_buf(),
+        source,
+    })?;
+    let mut lock_name = canonical
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    lock_name.push(".instance.lock");
+    let lock_file = canonical.with_file_name(lock_name);
+
+    into_guard(
+        banto_instance_lock::try_acquire(&mutex_name(&id), &lock_file, host.as_str()),
+        id,
+        canonical,
+    )
 }
 
 #[cfg(test)]
@@ -309,6 +379,62 @@ mod tests {
             acquire_for_db(&db, ChronoGazerHost::Serve),
             Err(InstanceLockFailure::AlreadyRunning { .. })
         ));
+    }
+
+    /// #623 PR-3（Codex の指摘）: 握ったルートの経路（`acquire_for_db_in`、末端を解かない）と
+    /// デスクトップの経路（`acquire_for_db`）は同じ DB で同じ範囲（`scope`）になり、互いに
+    /// 排他が噛み合う。DB がリンクのときは、デスクトップが断る一方で、握った版の範囲は
+    /// 「ルート + 名前」のまま（リンクの先の範囲にならない）。
+    #[test]
+    fn the_held_root_scope_matches_the_desktop_scope_and_ignores_a_leaf_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join(crate::paths::DB_FILE_NAME);
+        let held = banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: root.clone(),
+            known: banto_safe_root::guard::KnownFolders::default(),
+            owners: Vec::new(),
+            create_access: None,
+            create: false,
+            mode: banto_safe_root::Mode::Plain,
+        })
+        .unwrap();
+        let desktop = acquire_for_db(&db, ChronoGazerHost::Desktop).unwrap();
+        let expected = desktop.scope().to_string();
+        assert_eq!(scope_for_db_in(root.as_path()).unwrap().0, expected);
+        assert_eq!(scope_for_db_in(held.final_path()).unwrap().0, expected);
+        assert_eq!(
+            mutex_name_for_root(held.final_path()).unwrap(),
+            format!("Global\\ChronoGazer.{expected}")
+        );
+        // 同じ範囲なので、握った版はデスクトップが持っている間は取れない。
+        assert!(matches!(
+            acquire_for_db_in(held.as_dir(), ChronoGazerHost::Service),
+            Err(InstanceLockFailure::AlreadyRunning { .. })
+        ));
+        drop(desktop);
+        let service = acquire_for_db_in(held.as_dir(), ChronoGazerHost::Service).unwrap();
+        assert_eq!(service.scope(), expected);
+        assert!(matches!(
+            acquire_for_db(&db, ChronoGazerHost::Desktop),
+            Err(InstanceLockFailure::AlreadyRunning { .. })
+        ));
+        drop(service);
+
+        // DB をリンクにしても、握った版の範囲は変わらない（`path_scope_id` の全体の正規化なら
+        // リンクの先の範囲になる）。
+        let elsewhere = dir.path().join("elsewhere.sqlite3");
+        std::fs::write(&elsewhere, b"other").unwrap();
+        let _ = std::fs::remove_file(&db);
+        if !symlink_file(&elsewhere, &db) {
+            return;
+        }
+        let followed = banto_instance_lock::path_scope_id(&db).unwrap().0;
+        assert_ne!(followed, expected, "全体の正規化はリンクの先になる");
+        assert_eq!(scope_for_db_in(held.final_path()).unwrap().0, expected);
+        let service = acquire_for_db_in(held.as_dir(), ChronoGazerHost::Service).unwrap();
+        assert_eq!(service.scope(), expected);
     }
 
     fn symlink_file(target: &Path, link: &Path) -> bool {
