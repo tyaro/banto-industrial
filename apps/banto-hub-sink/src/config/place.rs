@@ -275,7 +275,7 @@ pub trait PlaceOps {
     /// 開いた時点でハンドルから読んだ属性・リンク数・所有者・DACL。
     fn file_security(&self, file: &Self::File) -> FileSecurity;
     /// 開いたハンドルのまま、先頭から `max_len` バイトまで読む（超えたら理由）。
-    fn read(&self, file: &Self::File, max_len: usize) -> Result<Vec<u8>, String>;
+    fn read(&self, file: &mut Self::File, max_len: usize) -> Result<Vec<u8>, String>;
 }
 
 /// 置き場とファイルを確かめてから読む（モジュール doc「読み方」）。返すのは読んだファイルの
@@ -363,7 +363,7 @@ pub fn read_protected<O: PlaceOps>(
     }
 
     // 3. ファイル（置き場のハンドル基準）。
-    let file = match ops.open_child_file(&dir, &paths.file_name) {
+    let mut file = match ops.open_child_file(&dir, &paths.file_name) {
         Ok(Some(file)) => file,
         Ok(None) if dir_problems.is_empty() => {
             return Err(ConfigError::FileMissing {
@@ -403,7 +403,7 @@ pub fn read_protected<O: PlaceOps>(
     // インストーラが設定を整える・書き換えるときに共有違反になる。ファイル・置き場の
     // ハンドルはこの関数の外へ出さない（返すのはパスと中身だけ）。失敗の経路でも、ここで
     // 返るときに閉じる。
-    let read = ops.read(&file, MAX_CONFIG_BYTES);
+    let read = ops.read(&mut file, MAX_CONFIG_BYTES);
     drop(file);
     drop(dir);
     let bytes = read.map_err(|reason| ConfigError::Unverifiable {
@@ -485,7 +485,7 @@ pub mod win {
             file.security().clone()
         }
 
-        fn read(&self, file: &PinnedFile, max_len: usize) -> Result<Vec<u8>, String> {
+        fn read(&self, file: &mut PinnedFile, max_len: usize) -> Result<Vec<u8>, String> {
             file.read_to_end(max_len).map_err(|err| err.to_string())
         }
     }

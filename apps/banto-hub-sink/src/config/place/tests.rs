@@ -361,7 +361,7 @@ impl PlaceOps for FakeOps {
     fn file_security(&self, file: &FakeFile) -> FileSecurity {
         file.entry.security.clone()
     }
-    fn read(&self, file: &FakeFile, max_len: usize) -> Result<Vec<u8>, String> {
+    fn read(&self, file: &mut FakeFile, max_len: usize) -> Result<Vec<u8>, String> {
         assert_eq!(max_len, MAX_CONFIG_BYTES);
         self.log
             .borrow_mut()
