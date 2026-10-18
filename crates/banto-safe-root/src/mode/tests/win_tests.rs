@@ -2289,3 +2289,60 @@ fn relax_and_reset_keep_the_marker_descriptor_when_its_dacl_opens_late() {
         expect_tree_shape(&root, mode.setting());
     }
 }
+
+/// 見張り（`SecurityWatch`、設計 §2.9 (c)、PR-3）: 何も変わらなければ `Timeout`、パスで子の
+/// DACL を変えると `Changed`（変わった名前）か `Overflow`、別のスレッドの止める合図で
+/// `Stopped`（以後も `Stopped`）。見張り用のハンドルは握ったルートと同じオブジェクト。
+#[test]
+fn the_security_watch_reports_a_path_acl_change_and_stops_on_signal() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    make_tree(&root);
+    let held = pinned(&root);
+    let mut watch = held.watch_security().unwrap();
+    assert_eq!(
+        watch.wait(Duration::from_millis(300)).unwrap(),
+        WatchEvent::Timeout
+    );
+    let child = root.join("data");
+    reset_dir_acl(&child, &DirAccess::with_readers([me()])).unwrap();
+    match watch.wait(Duration::from_secs(5)).unwrap() {
+        WatchEvent::Changed(names) => {
+            // パスの書き直しは中の子へも伝わるので、最初の通知が `data\.banto-safe-root` の
+            // こともある。`data` の下のどれかであればよい。
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name.to_ascii_lowercase().starts_with("data")),
+                "{names:?}"
+            );
+        }
+        WatchEvent::Overflow => {}
+        other => panic!("DACL の変更が見張りに来ない: {other:?}"),
+    }
+    // 伝播の残りの通知（中の子の分）を吸い取ってから、止める合図を試す。
+    loop {
+        match watch.wait(Duration::from_millis(500)).unwrap() {
+            WatchEvent::Changed(_) | WatchEvent::Overflow => continue,
+            WatchEvent::Timeout => break,
+            WatchEvent::Stopped => panic!("止めていないのに Stopped"),
+        }
+    }
+    let stopper = watch.stopper();
+    let signal = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        stopper.stop();
+    });
+    assert_eq!(
+        watch.wait(Duration::from_secs(10)).unwrap(),
+        WatchEvent::Stopped
+    );
+    signal.join().unwrap();
+    assert_eq!(
+        watch.wait(Duration::from_millis(100)).unwrap(),
+        WatchEvent::Stopped
+    );
+    drop(watch);
+    reset_dir_acl(&child, &DirAccess::with_install_user(me())).unwrap();
+}

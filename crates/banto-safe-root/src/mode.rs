@@ -580,5 +580,10 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
+mod watch;
+#[cfg(windows)]
+pub use watch::{SecurityWatch, WatchEvent, WatchStop};
+
 #[cfg(test)]
 mod tests;

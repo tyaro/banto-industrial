@@ -225,11 +225,14 @@ fn plain_root_and_managed_dirs_behave_like_std_fs() {
     );
     assert!(!root.final_path().to_string_lossy().starts_with(r"\\?\"));
     let set = root
-        .open_managed(&[
-            spec("logs", None, "logs"),
-            spec("backups", None, "backups"),
-            spec("backups-db", Some("backups"), "db"),
-        ])
+        .open_managed(
+            &[
+                spec("logs", None, "logs"),
+                spec("backups", None, "backups"),
+                spec("backups-db", Some("backups"), "db"),
+            ],
+            None,
+        )
         .unwrap();
     assert!(dir.path().join("root").join("backups").join("db").is_dir());
     assert_eq!(
@@ -242,10 +245,13 @@ fn plain_root_and_managed_dirs_behave_like_std_fs() {
 
     // 作らない spec の無いフォルダは止まる。
     let stop = root
-        .open_managed(&[ManagedSpec {
-            create: false,
-            ..spec("x", None, "absent")
-        }])
+        .open_managed(
+            &[ManagedSpec {
+                create: false,
+                ..spec("x", None, "absent")
+            }],
+            None,
+        )
         .unwrap_err();
     assert_eq!(stop.reason, ManagedRefusal::Absent);
 
@@ -324,7 +330,10 @@ fn an_invalid_spec_list_creates_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = open_root(&plain_spec(dir.path().join("root"))).unwrap();
     let stop = root
-        .open_managed(&[spec("data", None, "data"), spec("bad", Some("none"), "b")])
+        .open_managed(
+            &[spec("data", None, "data"), spec("bad", Some("none"), "b")],
+            None,
+        )
         .unwrap_err();
     assert_eq!(stop.key, "bad");
     assert!(
@@ -425,10 +434,13 @@ fn a_plain_file_in_place_of_a_directory_is_refused_in_plain_mode() {
     std::fs::write(root.final_path().join("data"), b"file").unwrap();
     for create in [true, false] {
         let stop = root
-            .open_managed(&[ManagedSpec {
-                create,
-                ..spec("data", None, "data")
-            }])
+            .open_managed(
+                &[ManagedSpec {
+                    create,
+                    ..spec("data", None, "data")
+                }],
+                None,
+            )
             .unwrap_err();
         assert_eq!(
             stop.reason,
