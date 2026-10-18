@@ -116,6 +116,9 @@ pub fn record_first_stop(slot: &Mutex<Option<StopNotice>>, signal: StopSignal) -
 /// （`SetServiceStatus` の決まり）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServicePhase {
+    /// 起動の途中（START_PENDING）。制御は受け付けない。`checkpoint` を
+    /// 進めて SCM と待つ側に「進んでいる」と伝える（[`start_pending_status`]）。
+    StartPending,
     /// 制御を受け付ける稼働中。
     Running,
     /// 停止処理の途中。制御は受け付けない。
@@ -138,6 +141,29 @@ pub struct ServiceStatusPlan {
     pub checkpoint: u32,
     /// 次の状態報告までの見込み。非 pending は 0。StopPending は 0 より大きい。
     pub wait_hint: Duration,
+}
+
+/// SCM の `dwWaitHint`（`u32` のミリ秒）に収まる最大の長さ（約 49.7 日）。
+/// `windows-service` は `wait_hint` を `u32` に変換できないと panic する
+/// （報告者の状態のロックを持ったまま）ので、これを超える値は丸める。
+pub const MAX_WAIT_HINT: Duration = Duration::from_millis(u32::MAX as u64);
+
+/// 起動の途中の報告（START_PENDING）。`checkpoint` が 0、または
+/// `wait_hint` が 0 のときは `None`（pending で両方を 0 にすると SCM は
+/// 進捗が無いと扱う）。`wait_hint` は [`MAX_WAIT_HINT`] で丸める。制御は
+/// 受け付けない（Running を報告して初めて受ける）。
+pub fn start_pending_status(checkpoint: u32, wait_hint: Duration) -> Option<ServiceStatusPlan> {
+    if checkpoint == 0 || wait_hint.is_zero() {
+        return None;
+    }
+    let wait_hint = wait_hint.min(MAX_WAIT_HINT);
+    Some(ServiceStatusPlan {
+        phase: ServicePhase::StartPending,
+        accept_stop: false,
+        accept_preshutdown: false,
+        checkpoint,
+        wait_hint,
+    })
 }
 
 /// 稼働中に受け付ける制御。STOP（通常停止）と PRESHUTDOWN（OS の
@@ -257,6 +283,9 @@ struct ReporterShared<E> {
 struct ReporterState {
     phase: ReporterPhase,
     max_checkpoint: u32,
+    /// START_PENDING で最後に報告した checkpoint（0 = まだ報告していない）。
+    /// 単調に増える。
+    start_checkpoint: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +333,7 @@ impl<E: Copy + Send + Sync + 'static> ServiceStatusReporter<E> {
                 state: Mutex::new(ReporterState {
                     phase: ReporterPhase::Starting,
                     max_checkpoint: heartbeat_checkpoint_limit(expected_stop, interval),
+                    start_checkpoint: 0,
                 }),
                 heartbeat: Mutex::new(None),
                 report: Box::new(report),
@@ -318,6 +348,29 @@ impl<E: Copy + Send + Sync + 'static> ServiceStatusReporter<E> {
     pub fn set_expected_stop(&self, expected_stop: Duration) {
         let mut state = lock(&self.shared.state);
         state.max_checkpoint = heartbeat_checkpoint_limit(expected_stop, self.shared.interval);
+    }
+
+    /// 起動の途中（START_PENDING）の進み具合を報告する: checkpoint を 1 つ
+    /// 進め、`wait_hint`（次の報告までの見込み）を載せる。Running を報告
+    /// する前にだけ使える。Running・停止が始まった後・Stopped の後、または
+    /// `wait_hint` が 0 のときは報告せず `false`。checkpoint は単調に増える
+    /// （1 から）。`wait_hint` は [`MAX_WAIT_HINT`] で丸める。
+    ///
+    /// **START_PENDING の間、SCM は STOP を `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`
+    /// （1061）で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
+    /// 長い起動は、止められない時間を延ばす。
+    pub fn report_start_progress(&self, wait_hint: Duration) -> bool {
+        let mut state = lock(&self.shared.state);
+        if state.phase != ReporterPhase::Starting {
+            return false;
+        }
+        let next = state.start_checkpoint.saturating_add(1);
+        let Some(plan) = start_pending_status(next, wait_hint) else {
+            return false;
+        };
+        state.start_checkpoint = next;
+        (self.shared.report)(&plan, self.shared.ok_exit);
+        true
     }
 
     /// Running を報告する。停止が始まった後・Stopped の後は報告せず `false`。
@@ -608,6 +661,7 @@ pub fn service_status_from_plan(
 ) -> windows_service::service::ServiceStatus {
     use windows_service::service::{ServiceState, ServiceStatus};
     let current_state = match plan.phase {
+        ServicePhase::StartPending => ServiceState::StartPending,
         ServicePhase::Running => ServiceState::Running,
         ServicePhase::StopPending => ServiceState::StopPending,
         ServicePhase::Stopped => ServiceState::Stopped,
@@ -645,6 +699,88 @@ mod tests {
             expected_stop,
         );
         (reporter, seen)
+    }
+
+    #[test]
+    fn start_pending_status_clamps_a_wait_hint_beyond_u32_millis() {
+        let huge = Duration::from_secs(u64::MAX / 2);
+        let plan = start_pending_status(1, huge).unwrap();
+        assert_eq!(plan.wait_hint, MAX_WAIT_HINT);
+        assert!(u32::try_from(plan.wait_hint.as_millis()).is_ok());
+        let just_over = MAX_WAIT_HINT + Duration::from_millis(1);
+        assert_eq!(
+            start_pending_status(1, just_over).unwrap().wait_hint,
+            MAX_WAIT_HINT
+        );
+        let fine = Duration::from_secs(5);
+        assert_eq!(start_pending_status(1, fine).unwrap().wait_hint, fine);
+    }
+
+    #[test]
+    fn start_pending_status_needs_a_checkpoint_and_a_wait_hint() {
+        let ten = Duration::from_secs(10);
+        assert_eq!(start_pending_status(0, ten), None);
+        assert_eq!(start_pending_status(1, Duration::ZERO), None);
+        let plan = start_pending_status(2, ten).unwrap();
+        assert_eq!(plan.phase, ServicePhase::StartPending);
+        assert!(!plan.accept_stop && !plan.accept_preshutdown);
+        assert_eq!((plan.checkpoint, plan.wait_hint), (2, ten));
+    }
+
+    /// START_PENDING の checkpoint は 1 から単調に増える。Running の後・
+    /// 停止の後は報告しない。wait hint 0 は報告しない（checkpoint も進めない）。
+    #[test]
+    fn start_progress_is_monotonic_and_only_before_running() {
+        let ten = Duration::from_secs(10);
+        let (reporter, seen) = recording_reporter(Duration::from_secs(60), Duration::ZERO);
+        assert!(!reporter.report_start_progress(Duration::ZERO));
+        assert!(reporter.report_start_progress(ten));
+        assert!(reporter.report_start_progress(ten));
+        assert!(reporter.report_start_progress(ten));
+        assert!(reporter.report_running());
+        assert!(
+            !reporter.report_start_progress(ten),
+            "Running の後は出さない"
+        );
+        let checkpoints: Vec<(ServicePhase, u32)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(plan, _)| (plan.phase, plan.checkpoint))
+            .collect();
+        assert_eq!(
+            checkpoints,
+            vec![
+                (ServicePhase::StartPending, 1),
+                (ServicePhase::StartPending, 2),
+                (ServicePhase::StartPending, 3),
+                (ServicePhase::Running, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn start_progress_is_dropped_once_stopping_and_stopped_follows_without_running() {
+        let ten = Duration::from_secs(10);
+        let (reporter, seen) = recording_reporter(Duration::from_secs(60), Duration::ZERO);
+        assert!(reporter.report_start_progress(ten));
+        // Running を報告せずに Stopped（relax-only の道）。
+        assert!(reporter.report_stopped(7));
+        assert!(!reporter.report_start_progress(ten));
+        assert!(!reporter.report_running());
+        let phases: Vec<ServicePhase> = seen.lock().unwrap().iter().map(|(p, _)| p.phase).collect();
+        assert_eq!(
+            phases,
+            vec![ServicePhase::StartPending, ServicePhase::Stopped]
+        );
+
+        let (reporter, _seen) = recording_reporter(Duration::from_secs(60), Duration::ZERO);
+        assert!(reporter.begin_stop());
+        assert!(
+            !reporter.report_start_progress(ten),
+            "停止が始まったら出さない"
+        );
+        reporter.report_stopped(0);
     }
 
     #[test]

@@ -512,3 +512,84 @@ fn a_held_value_drops_after_stopped_even_when_the_body_panics() {
         "預けたものは Running と Stopped の報告の後で落ちる"
     );
 }
+
+/// 開始の引数（`ServiceMain` の argv）が `ctx.start_args()` に載る。
+/// 引数なしの `run_program_with` では空。
+#[test]
+fn start_args_reach_the_body() {
+    let seen_args: Arc<Mutex<Vec<Vec<OsString>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen_args.clone();
+    let (prog, _errors) = program(move |ctx| {
+        sink.lock().unwrap().push(ctx.start_args().to_vec());
+        ServiceExit::Success
+    });
+    let result = run_program_with_args(
+        prog,
+        vec![OsString::from("TestSvc"), OsString::from("relax-only")],
+        |_handler, _log| Ok(|_plan: &ServiceStatusPlan, _exit: ServiceExit| {}),
+    );
+    assert_eq!(result, Some(ServiceExit::Success));
+    let sink = seen_args.clone();
+    let (prog, _errors) = program(move |ctx| {
+        sink.lock().unwrap().push(ctx.start_args().to_vec());
+        ServiceExit::Success
+    });
+    run_program_with(prog, |_handler, _log| {
+        Ok(|_plan: &ServiceStatusPlan, _exit: ServiceExit| {})
+    });
+    assert_eq!(
+        *seen_args.lock().unwrap(),
+        vec![
+            vec![OsString::from("TestSvc"), OsString::from("relax-only")],
+            Vec::<OsString>::new()
+        ]
+    );
+}
+
+/// relax-only の道: START_PENDING の checkpoint を進め、Running を報告せずに
+/// 返すと、報告は StartPending（単調）から Stopped(コード) だけ。
+#[test]
+fn start_progress_then_return_without_running_goes_start_pending_to_stopped() {
+    let (prog, _errors) = program(|ctx| {
+        assert!(ctx.report_start_progress(Duration::from_secs(10)));
+        assert!(ctx.report_start_progress(Duration::from_secs(10)));
+        ServiceExit::Specific(5)
+    });
+    let (runner, _handler, seen) = spawn_runner(prog);
+    assert_eq!(runner.join().unwrap(), Some(ServiceExit::Specific(5)));
+    let reported: Vec<(ServicePhase, u32)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(plan, _)| (plan.phase, plan.checkpoint))
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            (ServicePhase::StartPending, 1),
+            (ServicePhase::StartPending, 2),
+            (ServicePhase::Stopped, 0),
+        ]
+    );
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Specific(5)))
+    );
+}
+
+/// 起動中に STOP が届いたら `report_start_progress` は出さない（false）。
+#[test]
+fn start_progress_is_refused_after_a_stop() {
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let (prog, _errors) = program(move |ctx| {
+        go_rx.lock().unwrap().recv().unwrap();
+        assert!(!ctx.report_start_progress(Duration::from_secs(10)));
+        ctx.wait_for_stop();
+        ServiceExit::Success
+    });
+    let (runner, handler, _seen) = spawn_runner(prog);
+    assert_eq!(handler(ScmControlKind::Stop), ControlReply::NoError);
+    go_tx.send(()).unwrap();
+    assert_eq!(runner.join().unwrap(), Some(ServiceExit::Success));
+}
