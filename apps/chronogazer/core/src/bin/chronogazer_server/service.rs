@@ -51,9 +51,11 @@
 //!
 //! 新しいバックアップの受け付けを止めて進行中の物の完了を待つ（打ち切らない。待つ間は
 //! `report_stop_progress`、30 分で進めるのをやめる）→ エンジンを止め DB を閉じる
-//! （`StartedServer::shutdown`）→ 見張りを止める → 最後の行「緩め始めます」→ ログを閉じ、
-//! 向け直しも外す（NUL へ）→ `relax_tree`（進み具合で `report_stop_progress`）→ ハンドルを
-//! 閉じ A1 を返す → 0（後始末が不完全なら 1）、緩められなければ 5。
+//! （`StartedServer::shutdown`）→ 見張りを止める → listener の停止を裏に残していたら終わる
+//! のを待つ（最大 `LISTENER_SETTLE_WAIT`。終わらなければ緩めずに 5）→ 最後の行「緩め始めます」
+//! → ログを閉じ、向け直しも外す（NUL へ）→ `relax_tree`（進み具合で `report_stop_progress`）
+//! → ハンドルを閉じ A1 を返す → 0（後始末が不完全なら 1）、緩められなければ 5。後始末が
+//! 時間切れなら緩めずに 5。
 //!
 //! PRESHUTDOWN（OS の終了）・改ざんで止まるとき・異常終了は**締めたまま**（運用モードは
 //! 再起動をまたいで続く。モード = ACL の状態）。
@@ -102,7 +104,8 @@ use chronogazer_core::server_host::{
 use chronogazer_core::server_service::{
     acl_changed_line, after_close_abort, after_marker_error, backup_wait_line, close_abort_line,
     exit_after_relax_back, exit_after_scan_refusal, external_data_dir_line, install_result_lines,
-    install_with, mode_switch_begin_line, mode_switch_done_line, no_reader_line, parse_start_args,
+    install_with, listener_settled_line, listener_still_open_keeps_tight_line,
+    mode_switch_begin_line, mode_switch_done_line, no_reader_line, parse_start_args,
     redirection_guard_line, relax_allowed_after_shutdown, relax_begin_line, relax_only_begin_line,
     scan_refused_lines, service_exit_for, service_flush_wait, service_running_line,
     service_starting_line, service_stop_budget, service_stop_done_line, service_stop_hint_line,
@@ -134,6 +137,10 @@ type RedirectionGuardSource = Box<dyn Fn() -> RedirectionGuard + Send + Sync>;
 const START_WAIT_HINT: Duration = Duration::from_secs(10);
 /// 進み具合で checkpoint を進める間隔（1 秒ごと。設計 §3.8）。
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+/// STOP で、裏に残した listener の停止（`ShutdownReport::listener_stop_abandoned`）が終わるのを
+/// 待つ上限（オーナーレビュー P1）。banto の graceful 停止（最大 5 秒）に、適用が slot の lock を
+/// 持っている分の余裕を足した。これを過ぎても終わらなければ緩めずに 5。
+const LISTENER_SETTLE_WAIT: Duration = Duration::from_secs(10);
 /// 木を歩くスレッドのスタック（`MAX_DEPTH` 64 段 × 4 フレームで足りる大きさ。#681 の S-5）。
 const WALK_STACK: usize = 16 * 1024 * 1024;
 /// 定期の確かめ直しの間隔（設計 §2.9 (d) の案 60 秒）。
@@ -361,6 +368,14 @@ pub(crate) struct ServerProgram {
     /// 経路を、本物のエンジンの予算を使い切らずに踏むため）。
     #[cfg(test)]
     fake_stop_timed_out: AtomicBool,
+    /// テスト専用: STOP の後始末の結果を「listener の停止を待ち切れず裏に残した」に偽る
+    /// （オーナーレビュー P1）。本物のエンジンは残していないので、`fake_listener_stops_unsettled`
+    /// を立てなければ「後から終わったのを確かめた」になり緩める。
+    #[cfg(test)]
+    fake_listener_stop_abandoned: AtomicBool,
+    /// テスト専用: 裏に残した listener の停止が待っても終わらなかったことに偽る。
+    #[cfg(test)]
+    fake_listener_stops_unsettled: AtomicBool,
 }
 
 /// [`ServerProgram::new`] に渡す部品の組（本番とテストで差し替える物）。
@@ -456,6 +471,10 @@ impl ServerProgram {
             record: Mutex::new(None),
             #[cfg(test)]
             fake_stop_timed_out: AtomicBool::new(false),
+            #[cfg(test)]
+            fake_listener_stop_abandoned: AtomicBool::new(false),
+            #[cfg(test)]
+            fake_listener_stops_unsettled: AtomicBool::new(false),
         }
     }
 
@@ -912,17 +931,56 @@ impl ServerProgram {
                     if self.fake_stop_timed_out.load(Ordering::SeqCst) {
                         summary.report.timed_out = true;
                     }
+                    if self.fake_listener_stop_abandoned.load(Ordering::SeqCst) {
+                        summary.report.listener_stop_abandoned = true;
+                    }
                     summary
                 };
                 self.report_shutdown(&summary, Some(notice.signal));
                 // 4. 見張りと定期の確かめ直しを止める。
                 watchers.stop();
+                // 3b. listener の停止を上限（1 秒）で待ち切れず裏に残していたら、終わったのを
+                // 確かめる（オーナーレビュー P1）: listener の graceful 停止は最大 5 秒で、
+                // その間は STOP の前から開いていた要求がまだ届く。閉じた pool に当たった
+                // 認証は監査の退避ファイルを利用者の木の下へパスで書くので、要求が残り
+                // うるうちは緩めない。待つ間も STOP_PENDING の checkpoint は進める。
+                let listener_stops_settled =
+                    if summary.report.listener_stop_abandoned && !summary.report.timed_out {
+                        let settle_started = Instant::now();
+                        let settled = loop {
+                            let settled = runtime.block_on(
+                                server
+                                    .engine()
+                                    .await_abandoned_listener_stops(PROGRESS_INTERVAL),
+                            );
+                            if settled || settle_started.elapsed() >= LISTENER_SETTLE_WAIT {
+                                break settled;
+                            }
+                            if stop_progress_allowed(stop_started.elapsed()) {
+                                ctx.report_stop_progress();
+                            }
+                        };
+                        #[cfg(test)]
+                        let settled =
+                            settled && !self.fake_listener_stops_unsettled.load(Ordering::SeqCst);
+                        if settled {
+                            self.say(&listener_settled_line());
+                        }
+                        settled
+                    } else {
+                        false
+                    };
                 // 後始末が予算内に終わらなかった（pool を閉じていない・listener を止める
-                // タスクが残っている）なら**緩めない**（Codex の指摘 P1: エンジンの資源が残った
-                // まま利用者の書き込みを戻すと、約束 2 と同時アクセスの防ぎに反する）。締めた
-                // まま 5 で終わり、デスクトップの案内（relax-only）で戻す。
-                if !relax_allowed_after_shutdown(&summary.report) {
-                    self.say(&shutdown_incomplete_keeps_tight_line());
+                // タスクが残っている）、または裏に残した listener の停止が終わったのを確かめ
+                // られなかったなら**緩めない**（Codex の指摘 P1・オーナーレビュー P1: エンジンの
+                // 資源や要求が残ったまま利用者の書き込みを戻すと、約束 2 と同時アクセスの防ぎ
+                // に反する）。締めたまま 5 で終わり、デスクトップの案内（relax-only）で戻す。
+                if !relax_allowed_after_shutdown(&summary.report, listener_stops_settled) {
+                    if summary.report.timed_out {
+                        self.say(&shutdown_incomplete_keeps_tight_line());
+                    } else {
+                        self.say(&listener_still_open_keeps_tight_line(LISTENER_SETTLE_WAIT));
+                    }
                     let exit = service_exit_for(EXIT_LEFT_TIGHT);
                     self.say(&service_stopped_line(exit));
                     self.flush(SERVICE_LOG_FLUSH_WAIT);

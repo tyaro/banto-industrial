@@ -1191,6 +1191,7 @@ impl OpenedEngine {
             background: std::sync::Mutex::new(BackgroundTasks {
                 spool_flusher,
                 retention: Arc::new(retention),
+                abandoned_listener_stops: Vec::new(),
             }),
             #[cfg(test)]
             observations: std::sync::Mutex::new(None),
@@ -1219,6 +1220,10 @@ where
 struct BackgroundTasks {
     spool_flusher: Option<JoinHandle<()>>,
     retention: Arc<RetentionTask>,
+    /// [`RunningEngine::shutdown`] が [`listener_stop_cap`] で待つのをやめ、裏に残した
+    /// listener の停止のタスク（[`RunningEngine::await_abandoned_listener_stops`] で後から
+    /// 待てる。#623 PR-3 のオーナーレビュー P1）。
+    abandoned_listener_stops: Vec<JoinHandle<()>>,
 }
 
 /// [`RunningEngine::shutdown`] の手順（[`ShutdownReport::completed`] に、
@@ -1350,6 +1355,9 @@ impl RunningEngine {
 
         let mut collect_stop_error = None;
         let mut listener_stop_abandoned = false;
+        // 待つのをやめたときに裏へ残す停止のタスク（`cleanup` の外に置き、予算切れで
+        // `cleanup` が捨てられても handle を失わない）。
+        let mut stops: Vec<JoinHandle<()>> = Vec::new();
         let cleanup = async {
             // 3. 消費者（LAN、続いて常時の loopback）。
             // 停止は裏のタスクで並べて始め、上限までだけ待つ（モジュール doc の 3.）。
@@ -1360,7 +1368,6 @@ impl RunningEngine {
             // 予算を使い切って最終 flush を飛ばしうる。上限で待つのをやめたタスクは、
             // lock が空き次第そのとき slot にあるもの（適用が置いた新しい listener を
             // 含む）を取り出して止める - 終了の後に listener を残さない。
-            let mut stops = Vec::new();
             for slot in [&self.server, &self.loopback] {
                 let slot = Arc::clone(slot);
                 stops.push(tokio::spawn(async move {
@@ -1416,6 +1423,15 @@ impl RunningEngine {
                 budget.as_secs()
             );
         }
+        // 待ち切れなかった停止のタスクは、後から待てるように残す（済んだ物は捨てる）。
+        stops.retain(|handle| !handle.is_finished());
+        if !stops.is_empty() {
+            self.background
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .abandoned_listener_stops
+                .append(&mut stops);
+        }
         ShutdownReport {
             completed,
             collect_stop_error,
@@ -1423,6 +1439,41 @@ impl RunningEngine {
             listener_stop_abandoned,
             budget,
         }
+    }
+
+    /// [`Self::shutdown`] が [`listener_stop_cap`] で待つのをやめて裏に残した listener の
+    /// 停止のタスク（[`ShutdownReport::listener_stop_abandoned`]）が終わるのを、`cap` まで
+    /// 待つ。**全部終わっていれば `true`**（listener は閉じ、開いていた要求も banto の
+    /// graceful 停止（最大 5 秒）で終わっている = この後に要求が届くことはない）。`cap` で
+    /// 終わらなければ `false`（タスクは残したまま。もう一度呼べば続きを待つ）。残していな
+    /// ければ待たずに `true`。
+    ///
+    /// サービスの STOP（#623 PR-3 のオーナーレビュー P1）は、これが `true` になるまで ACL を
+    /// 緩めない: 残った要求が閉じた pool に当たると、banto の認証が監査の退避ファイルを
+    /// 利用者の木の下へ**パスで**書きうるため。
+    pub async fn await_abandoned_listener_stops(&self, cap: Duration) -> bool {
+        let mut stops = std::mem::take(
+            &mut self
+                .background
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .abandoned_listener_stops,
+        );
+        if stops.is_empty() {
+            return true;
+        }
+        let settled = tokio::time::timeout(cap, futures_util::future::join_all(stops.iter_mut()))
+            .await
+            .is_ok();
+        if !settled {
+            stops.retain(|handle| !handle.is_finished());
+            self.background
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .abandoned_listener_stops
+                .append(&mut stops);
+        }
+        settled
     }
 
     #[cfg(not(test))]
@@ -1748,13 +1799,28 @@ mod tests {
         assert!(report.completed.contains(&ShutdownStep::CollectStopped));
         let lan = engine.server_slot().clone();
 
+        // lock が握られている間は、裏に残した停止のタスクは終わらない（オーナーレビュー P1:
+        // サービスはこれが `true` になるまで緩めない）。
+        assert!(
+            !engine
+                .await_abandoned_listener_stops(Duration::from_millis(300))
+                .await
+        );
+
         // lock が空けば、裏の停止のタスクが残っていた listener を止める。
         let _ = release_tx.send(());
         applier.await.unwrap();
-        wait_until("裏の停止で LAN の slot が空になること", || {
-            lan.inner.try_lock().map(|s| s.is_none()).unwrap_or(false)
-        })
-        .await;
+        assert!(
+            engine
+                .await_abandoned_listener_stops(Duration::from_secs(10))
+                .await
+        );
+        assert!(
+            lan.inner.try_lock().map(|s| s.is_none()).unwrap_or(false),
+            "裏の停止で LAN の slot が空になっていない"
+        );
+        // 残していなければ待たずに `true`。
+        assert!(engine.await_abandoned_listener_stops(Duration::ZERO).await);
 
         drop(engine);
         let pool = init_db(&db_path).await.expect("開き直す");

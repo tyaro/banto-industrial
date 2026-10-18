@@ -199,12 +199,22 @@ pub fn after_marker_error(error: &MarkerError) -> (bool, i32) {
     }
 }
 
-/// STOP の後始末の結果から、緩めてよいか（設計 §3.2 の 2。Codex の指摘 P1）: 後始末が予算内に
-/// 終わらなかった（`timed_out`。DB の pool を閉じていない・listener を止めるタスクが残っている
-/// ことがある）なら**緩めない**（締めたまま終了コード 5、`relax-only` で戻す）。最終の書き出し
-/// の失敗（`collect_stop_error`）は pool を閉じ終えているので緩めてよい（終了コードは 1）。
-pub fn relax_allowed_after_shutdown(report: &crate::engine::ShutdownReport) -> bool {
-    !report.timed_out
+/// STOP の後始末の結果から、緩めてよいか（設計 §3.2 の 2。Codex の指摘 P1 とオーナーレビュー P1）:
+/// - 後始末が予算内に終わらなかった（`timed_out`。DB の pool を閉じていない・listener を
+///   止めるタスクが残っていることがある）なら**緩めない**。
+/// - listener の停止を上限で待ち切れず裏に残した（`listener_stop_abandoned`）なら、その
+///   タスクが終わったのを確かめた（`listener_stops_settled`。
+///   `RunningEngine::await_abandoned_listener_stops`）ときだけ緩める。確かめられなければ
+///   **緩めない**: listener の graceful 停止（最大 5 秒）の間は開いていた要求がまだ届き、
+///   閉じた pool に当たった認証が監査の退避ファイルを利用者の木の下へパスで書きうる。
+///
+/// 緩めないときは締めたまま終了コード 5（`relax-only` で戻す）。最終の書き出しの失敗
+/// （`collect_stop_error`）は pool を閉じ終えているので緩めてよい（終了コードは 1）。
+pub fn relax_allowed_after_shutdown(
+    report: &crate::engine::ShutdownReport,
+    listener_stops_settled: bool,
+) -> bool {
+    !report.timed_out && (!report.listener_stop_abandoned || listener_stops_settled)
 }
 
 /// 後始末が予算内に終わらなかったので緩めずに終わるときの行。
@@ -212,6 +222,19 @@ pub fn shutdown_incomplete_keeps_tight_line() -> String {
     format!(
         "{SERVER_LABEL}: 後始末が予算内に終わらなかった（DB や待ち受けが閉じ切っていない可能性）ため、ACL を緩めずに終わります（終了コード {EXIT_LEFT_TIGHT}。運用モードの形のまま。設定モードへは relax-only の開始で戻してください）"
     )
+}
+
+/// listener の停止（裏に残した分）が `waited` の間に終わらなかったので緩めずに終わるときの行。
+pub fn listener_still_open_keeps_tight_line(waited: Duration) -> String {
+    format!(
+        "{SERVER_LABEL}: 待ち受けの停止が{}秒待っても終わらなかった（開いたままの要求が残っている可能性）ため、ACL を緩めずに終わります（終了コード {EXIT_LEFT_TIGHT}。運用モードの形のまま。設定モードへは relax-only の開始で戻してください）",
+        waited.as_secs()
+    )
+}
+
+/// listener の停止を裏に残していたが、後から終わったのを確かめたときの行（この後で緩める）。
+pub fn listener_settled_line() -> String {
+    format!("{SERVER_LABEL}: 裏に残していた待ち受けの停止が終わりました（開いていた要求も終了）。")
 }
 
 /// 緩め直しの結果で終了コードを決める: 緩め直せたら `if_relaxed`、`Err` なら 5。
@@ -1088,8 +1111,9 @@ mod tests {
     }
 
     /// Codex の指摘 P1: 後始末が時間切れなら緩めない。最終の書き出しの失敗だけなら緩める。
+    /// オーナーレビュー P1: listener の停止を裏に残したなら、終わったのを確かめたときだけ緩める。
     #[test]
-    fn relax_is_refused_after_a_timed_out_shutdown() {
+    fn relax_is_refused_after_a_timed_out_or_still_open_shutdown() {
         use crate::engine::ShutdownReport;
         let done = ShutdownReport {
             completed: Vec::new(),
@@ -1098,17 +1122,43 @@ mod tests {
             listener_stop_abandoned: false,
             budget: Duration::from_secs(15),
         };
-        assert!(relax_allowed_after_shutdown(&done));
-        assert!(relax_allowed_after_shutdown(&ShutdownReport {
-            collect_stop_error: Some("x".to_string()),
+        assert!(relax_allowed_after_shutdown(&done, false));
+        assert!(relax_allowed_after_shutdown(&done, true));
+        // 最終の書き出しの失敗だけなら緩める。
+        assert!(relax_allowed_after_shutdown(
+            &ShutdownReport {
+                collect_stop_error: Some("x".to_string()),
+                ..done.clone()
+            },
+            false
+        ));
+        // 時間切れは、listener が済んでいても緩めない。
+        assert!(!relax_allowed_after_shutdown(
+            &ShutdownReport {
+                timed_out: true,
+                ..done.clone()
+            },
+            true
+        ));
+        // listener の停止を裏に残した: 終わったのを確かめたときだけ緩める。
+        let abandoned = ShutdownReport {
             listener_stop_abandoned: true,
-            ..done.clone()
-        }));
-        assert!(!relax_allowed_after_shutdown(&ShutdownReport {
-            timed_out: true,
             ..done
-        }));
+        };
+        assert!(!relax_allowed_after_shutdown(&abandoned, false));
+        assert!(relax_allowed_after_shutdown(&abandoned, true));
+        assert!(!relax_allowed_after_shutdown(
+            &ShutdownReport {
+                timed_out: true,
+                ..abandoned
+            },
+            true
+        ));
         assert!(shutdown_incomplete_keeps_tight_line().contains("終了コード 5"));
+        let line = listener_still_open_keeps_tight_line(Duration::from_secs(10));
+        assert!(line.contains("10秒"), "{line}");
+        assert!(line.contains("終了コード 5"), "{line}");
+        assert!(line.contains("relax-only"), "{line}");
     }
 
     /// 1 周目の一覧は最初の 20 件と総数。

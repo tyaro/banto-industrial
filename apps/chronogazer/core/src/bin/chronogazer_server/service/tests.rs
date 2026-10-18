@@ -694,6 +694,94 @@ async fn a_timed_out_shutdown_on_scm_stop_keeps_the_tree_tight_with_5() {
     assert!(!layout.endpoint_file().exists(), "エンジンを止めていない");
 }
 
+/// オーナーレビュー P1（#623 PR-3）: listener の停止を上限で待ち切れず裏に残した
+/// （`listener_stop_abandoned`）が、`LISTENER_SETTLE_WAIT` 待っても終わったのを確かめられなかった
+/// なら、**緩めずに**締めたまま Stopped(5)（graceful 停止の間に届く要求が、閉じた pool への
+/// 失敗で監査の退避ファイルを利用者の木の下へ書きうる）。「緩め始めます」も `acl:relax` も出ない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsettled_listener_stop_on_scm_stop_keeps_the_tree_tight_with_5() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let program = program(&layout, &trace, acl);
+    program
+        .fake_listener_stop_abandoned
+        .store(true, Ordering::SeqCst);
+    program
+        .fake_listener_stops_unsettled
+        .store(true, Ordering::SeqCst);
+    let running = spawn(program);
+    wait_running(&running).await;
+    assert!(layout.endpoint_file().exists());
+
+    running.send(ScmControlKind::Stop);
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Specific(5)));
+    let phases = phases(&seen);
+    assert!(has_phase(&seen, ServicePhase::StopPending), "{phases:?}");
+    assert_eq!(
+        phases.last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Specific(5)))
+    );
+
+    let lines = snapshot(&trace);
+    assert!(
+        index_of(&lines, "待ち受けの停止が").is_some()
+            && index_of(&lines, "ACL を緩めずに終わります").is_some(),
+        "{lines:#?}"
+    );
+    assert!(
+        index_of(&lines, "ACL を緩め始めます").is_none(),
+        "listener が残りうるのに緩め始めた: {lines:#?}"
+    );
+    assert!(
+        index_of(&lines, "acl:relax").is_none(),
+        "listener が残りうるのに緩めた: {lines:#?}"
+    );
+    assert!(!layout.endpoint_file().exists(), "エンジンを止めていない");
+}
+
+/// 反証: listener の停止を裏に残していても、後から終わったのを確かめられれば（本物の
+/// エンジンは何も残していない）、確かめた行を出してから緩めて 0。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_listener_stop_on_scm_stop_relaxes_and_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let program = program(&layout, &trace, acl);
+    program
+        .fake_listener_stop_abandoned
+        .store(true, Ordering::SeqCst);
+    let running = spawn(program);
+    wait_running(&running).await;
+
+    running.send(ScmControlKind::Stop);
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Success));
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Success))
+    );
+    let lines = snapshot(&trace);
+    let settled = index_of(&lines, "裏に残していた待ち受けの停止が終わりました");
+    let begin = index_of(&lines, "ACL を緩め始めます");
+    let relax = index_of(&lines, "acl:relax");
+    assert!(
+        settled.is_some() && begin.is_some() && relax.is_some(),
+        "{lines:#?}"
+    );
+    assert!(settled < begin && begin < relax, "{lines:#?}");
+    assert!(
+        index_of(&lines, "ACL を緩めずに終わります").is_none(),
+        "{lines:#?}"
+    );
+    assert!(!layout.endpoint_file().exists());
+}
+
 /// A1 の排他を別のプロセス（ここではデスクトップの印）が持っていれば、ログを開かず・
 /// ルートの下に何も作らず・ACL に触れずに Stopped(2)。Running は報告しない。
 #[test]
@@ -1126,16 +1214,20 @@ async fn a_recheck_failure_during_operation_stops_with_5_and_keeps_the_tree_tigh
     prepare_root_db(&layout, None).await;
     let trace: Trace = Arc::default();
     let acl = FakeAcl::new(trace.clone());
-    acl.recheck_fails_at.store(3, Ordering::SeqCst);
     let running = spawn(test_program(
         &layout,
         Ok(Some(USER.to_string())),
         &trace,
-        acl,
+        Arc::clone(&acl),
         Duration::from_millis(100),
     ));
+    // Running と endpoint を確かめてから失敗を入れる（起動前に予約すると、100ms 間隔の
+    // `wait_running` が Running を見つける前に改ざんでの停止と endpoint の削除まで進み、
+    // 直後の `exists` が偽になることがあった - CI で 1 回）。`recheck_calls` はもう進んで
+    // いるので、次の確かめ直しから失敗する。
     wait_running(&running).await;
     assert!(layout.endpoint_file().exists());
+    acl.recheck_fails_at.store(1, Ordering::SeqCst);
     let seen = running.seen.clone();
     let exit = wait_for("改ざんでの停止", async || {
         phases(&seen)
