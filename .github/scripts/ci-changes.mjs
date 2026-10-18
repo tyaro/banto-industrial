@@ -153,13 +153,18 @@ export const RUST_PACKAGES = {
  * - rust-db-source: `-p banto-hub-core`（db_source）と `-p banto-hub-sink`
  * - linux-clippy: `-p chronogazer-elev -p banto-hub-core --lib`、加えて
  *   `-p banto-instance-lock` の clippy・test（その段は Rust の対象にこの crate が
- *   入るときだけ。ci.yml の段の `if:`）
+ *   入るときだけ。ci.yml の段の `if:`）と、同じく `-p banto-safe-root`
  * - e2e-hub: `-p banto-hub-core --bin banto-hub`
  * - e2e-chronogazer: `-p chronogazer-core`（banto-serve・dev_plc・chronogazer-server）
  */
 export const JOB_PACKAGES = {
 	run_rust_db_source: ['banto-hub-core', 'banto-hub-sink'],
-	run_linux_clippy: ['chronogazer-elev', 'banto-hub-core', 'banto-instance-lock'],
+	run_linux_clippy: [
+		'chronogazer-elev',
+		'banto-hub-core',
+		'banto-instance-lock',
+		'banto-safe-root'
+	],
 	run_e2e_hub: ['banto-hub-core'],
 	run_e2e_chronogazer: ['chronogazer-core']
 };

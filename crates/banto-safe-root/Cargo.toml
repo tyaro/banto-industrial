@@ -1,6 +1,6 @@
 [package]
 name = "banto-safe-root"
-description = "Directory DACL checks and no-follow handle-based helpers for LocalSystem services working under user-writable trees (#623 PR-1a: moved from banto-secret-store)"
+description = "Directory DACL checks and no-follow handle-based helpers for LocalSystem services working under user-writable trees (#623: moved from banto-secret-store in PR-1a; no-follow root/managed-dir I/O in PR-1b)"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -25,7 +25,12 @@ thiserror = { workspace = true }
 #   展開せずに読む）・SHGetKnownFolderPath・CoTaskMemFree（既知のフォルダ）
 # - Wdk_Foundation / Wdk_Storage_FileSystem / Win32_System_IO: `PinnedDir::create_child_dir`
 #   の `NtCreateFile`（確かめ済みの親のハンドルを基準に、子のフォルダを相対で作る。
-#   #626 PR-B の再レビュー 1。ntdll の関数で、新しい crate は増えない）
+#   #626 PR-B の再レビュー 1。ntdll の関数で、新しい crate は増えない）。#623 PR-1b の
+#   `ManagedDir`（`FileRenameInfoEx`・`FileDispositionInfoEx`・`FileAttributeTagInfo`）も
+#   同じ feature の中。
+# - Win32_System_SystemServices: `PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY`（#623 の (3b)、
+#   `redirection::enable_redirection_guard`。`SetProcessMitigationPolicy` は
+#   Win32_System_Threading）
 windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -36,6 +41,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_IO",
     "Win32_System_Registry",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }

@@ -660,6 +660,12 @@ pub struct PinnedDir {
     /// 正規の姿）。呼ぶ側が期待のパスと比べる（#392 B3-3b の監査 Must 1）。
     final_path: std::path::PathBuf,
     info: PinnedDirInfo,
+    /// ディレクトリの列挙の位置は**ファイルオブジェクト（このハンドル）に付く**ので、同じ
+    /// ハンドルの列挙（[`PinnedDir::reset_acl`] の再帰の最上段・`ManagedDir::list`）を直列化
+    /// する（#623 PR-1b のレビュー S-1）。重なると列挙位置が混ざり、`reset_acl` が残りの子を
+    /// 書き直さずに `ERROR_NO_MORE_FILES` で「成功」を返してしまう。子の再帰は ID で開いた
+    /// 新しいハンドルなので、取るのは最上段だけでよい。
+    enum_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(windows)]
@@ -691,6 +697,20 @@ impl PinnedDir {
     /// 開いたハンドルから読んだ属性と所有者。
     pub fn info(&self) -> &PinnedDirInfo {
         &self.info
+    }
+
+    /// 握っている生のハンドル（crate の中の、ハンドル基準の操作だけが使う。閉じない。
+    /// #623 PR-1b の `ManagedDir`）。
+    pub(crate) fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle.raw()
+    }
+
+    /// このハンドルの列挙の直列化（[`PinnedDir`] の `enum_lock`）。`enumerate_dir` をこの
+    /// ハンドルで呼ぶ側は、呼ぶ間これを持つ。
+    pub(crate) fn enum_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.enum_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 開いたままの**ハンドルから**、今の DACL と所有者を読む（`GetSecurityInfo`。パスを
@@ -730,6 +750,8 @@ impl PinnedDir {
             return Err(SafeRootError::AclMismatch(AclMismatch::NotADirectory));
         }
         let mut skips = ResetSkips::default();
+        // 再帰の最上段はこのハンドルを列挙する。`ManagedDir::list` と重ならないようにする。
+        let _serial = self.enum_guard();
         imp::set_security_tree(
             self.handle.raw(),
             &self.final_path,
@@ -888,7 +910,7 @@ impl PinnedFile {
     /// 確かめてから読むまでの間に別の物へすり替えられない）。`max_len` バイトを超えるときは
     /// 読まずに断る（`io::ErrorKind::FileTooLarge`）。フォルダは `io::ErrorKind::IsADirectory`、
     /// reparse point は [`AclMismatch::ReparsePoint`] で、読まずに断る。
-    pub fn read_to_end(&self, max_len: usize) -> Result<Vec<u8>> {
+    pub fn read_to_end(&mut self, max_len: usize) -> Result<Vec<u8>> {
         if self.security.is_reparse_point {
             return Err(SafeRootError::AclMismatch(AclMismatch::ReparsePoint));
         }
@@ -996,7 +1018,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-mod imp {
+pub(crate) mod imp {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
@@ -1031,17 +1053,17 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    fn last_error() -> u32 {
+    pub(crate) fn last_error() -> u32 {
         // SAFETY: 直前の Win32 呼び出しの失敗の理由を読むだけ。
         unsafe { GetLastError() }
     }
 
-    fn api(call: &'static str, os_error: u32) -> SafeRootError {
+    pub(crate) fn api(call: &'static str, os_error: u32) -> SafeRootError {
         SafeRootError::AclApi { call, os_error }
     }
 
     /// `LocalAlloc` で確保された領域を drop で `LocalFree` する。
-    struct LocalBox(*mut core::ffi::c_void);
+    pub(crate) struct LocalBox(*mut core::ffi::c_void);
 
     impl Drop for LocalBox {
         fn drop(&mut self) {
@@ -1337,12 +1359,12 @@ mod imp {
         Ok(())
     }
 
-    /// 辿らずに開いたハンドルの情報（[`open_no_follow`]）。
-    struct Opened {
-        handle: OwnedHandle,
-        is_dir: bool,
-        is_reparse: bool,
-        links: u32,
+    /// 辿らずに開いたハンドルの情報（[`open_child_by_id`]）。
+    pub(crate) struct Opened {
+        pub(crate) handle: OwnedHandle,
+        pub(crate) is_dir: bool,
+        pub(crate) is_reparse: bool,
+        pub(crate) links: u32,
     }
 
     // `set_security_tree` が再帰のときに子へ書いた直後に呼ぶフック（テスト専用。
@@ -1384,20 +1406,44 @@ mod imp {
     }
 
     /// [`open_child_by_id`] の結果。
-    enum ChildOpen {
+    pub(crate) enum ChildOpen {
         Opened(Opened),
-        /// 列挙と開くの間に消えた。
+        /// 列挙と開くの間に消えた。**開いた物の本当のパスが木の外**（列挙と開くの間に木の外へ
+        /// 移された）ときもこれにする（書かない・数えない。#623 PR-1b、設計 §2.4 の 3）。
         Vanished,
         /// 開けなかった（利用者が Administrators を拒否した・所有権が無いなど）。触らず飛ばす
         /// （監査 Should 1。特権は有効にしない）。
         Denied,
     }
 
+    // `handle_child` が列挙の後・ID で開く前に呼ぶフック（テスト専用。子を木の外へ移す反証に
+    // 使う。#623 PR-1b）。本番では `None`。
+    #[cfg(test)]
+    pub(crate) type BeforeChildOpenHook = Box<dyn Fn(&Path)>;
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static BEFORE_CHILD_OPEN: std::cell::RefCell<Option<BeforeChildOpenHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     /// `parent`（ディレクトリのハンドル）の中の 128 ビットのファイル ID を、**パスを使わず**・
     /// 辿らずに開く（`OpenFileById`、`ExtendedFileIdType`、ヒント = 親のハンドル。監査 [A]:
     /// パスで開くと途中の要素のジャンクションを辿るので ID で相対に開く。Nit 2: 128 ビットの
     /// ID で ReFS・Dev Drive でも正しく指す）。
-    fn open_child_by_id(parent: HANDLE, file_id: [u8; 16]) -> Result<ChildOpen> {
+    ///
+    /// **開いた後に、そのハンドルの本当のパスが `within`（木のルートの本当のパス）の中かを
+    /// 確かめ、外なら [`ChildOpen::Vanished`] を返す**（#623 PR-1b、設計 §2.4 の 3。Fable-2 A-3）。
+    /// 【仕様・実測】`OpenFileById` のヒントのハンドルはボリュームを選ぶためだけに使われ、開いた
+    /// 物が今もその親の中にあることは保証されない。列挙の後・開く前に利用者が子を木の外の
+    /// 自分のフォルダへ移すと（子の `DELETE` と移し先の作成の権利だけで足りる）、確かめが無いと
+    /// 木の外の物の記述子を書く（テスト `an_object_moved_out_after_enumeration_is_not_opened`）。
+    /// 確かめは `GetFinalPathNameByHandleW` 1 回（`VOLUME_NAME_DOS`。ドライブ文字の無い
+    /// ボリュームでは失敗して fail closed - 既知の制限）。
+    pub(crate) fn open_child_by_id(
+        parent: HANDLE,
+        file_id: [u8; 16],
+        within: &Path,
+    ) -> Result<ChildOpen> {
         use windows_sys::Win32::Foundation::{
             ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
         };
@@ -1442,6 +1488,14 @@ mod imp {
         }
         let handle = OwnedHandle(handle);
         let (is_dir, is_reparse, links) = info_of(handle.0)?;
+        // ハードリンク（ファイルでリンク数 2 以上）は本当のパスに**どれか 1 つの名前**が返り、木の
+        // 外の名前のこともあるので、ここでは確かめずにそのまま返す（呼ぶ側は必ず書かずに飛ばす・
+        // 断る。`handle_child` は `ResetSkips::hardlink` に記録する）。それ以外は木の中か確かめる。
+        let hardlink = !is_dir && links >= 2;
+        if !hardlink && !crate::guard::is_same_or_inside(&final_path_of(handle.0)?, within) {
+            // 列挙と開くの間に木の外へ移された。書かない・数えない（消えたのと同じ）。
+            return Ok(ChildOpen::Vanished);
+        }
         Ok(ChildOpen::Opened(Opened {
             handle,
             is_dir,
@@ -1482,7 +1536,7 @@ mod imp {
         set_object_security(handle, &dir_sd)?;
         if recurse {
             let file_sd = owned_protected_sd(access, false)?;
-            propagate(handle, real_dir, &dir_sd, &file_sd, 0, skips)?;
+            propagate(handle, real_dir, real_dir, &dir_sd, &file_sd, 0, skips)?;
         }
         Ok(())
     }
@@ -1491,31 +1545,34 @@ mod imp {
     /// とても深いフォルダを作ってスタックをあふれさせるのを防ぐ）。
     const MAX_DEPTH: u32 = 512;
 
-    /// `dir_handle` の中を列挙して、各子にハンドルで書く・再帰する（上の doc）。`display` は
-    /// 飛ばした子の報告のための表示用のパス（開くのには使わない）。`dir_sd` はフォルダ用
-    /// （`OICI`）、`file_sd` はファイル用（継承フラグ無し。Nit 4）。
-    fn propagate(
+    /// 列挙した子 1 件（[`enumerate_dir`]）。`.`・`..` は含めない。
+    pub(crate) struct DirEntryRaw {
+        pub(crate) name: String,
+        /// 128 ビットのファイル ID（[`open_child_by_id`] に渡す）。
+        pub(crate) file_id: [u8; 16],
+        /// 列挙の時点の属性（`FILE_ATTRIBUTE_*`）。**判断には使わない**（列挙と開くの間に
+        /// 差し替えられうる。開いた後にハンドルで読み直す）。表示・分類の下ごしらえ用。
+        pub(crate) attributes: u32,
+        /// 列挙の時点の reparse の tag（reparse point でなければ 0）。
+        pub(crate) reparse_tag: u32,
+        /// 列挙の時点の大きさ（`EndOfFile`）。
+        pub(crate) len: u64,
+    }
+
+    /// `dir_handle`（`FILE_LIST_DIRECTORY` を持つフォルダのハンドル）の中を、**パスを使わずに**
+    /// 最初から列挙して、子ごとに `each` を呼ぶ（`GetFileInformationByHandleEx` の
+    /// `FileIdExtdDirectoryRestartInfo` → `FileIdExtdDirectoryInfo`。`.`・`..` は除く）。
+    /// [`propagate`] と `ManagedDir::list`（#623 PR-1b）で共有する。列挙の位置はファイル
+    /// オブジェクトに付くので、同じハンドルを同時に列挙しない（呼ぶ側が直列化する）。
+    pub(crate) fn enumerate_dir(
         dir_handle: HANDLE,
-        display: &Path,
-        dir_sd: &LocalBox,
-        file_sd: &LocalBox,
-        depth: u32,
-        skips: &mut super::ResetSkips,
+        each: &mut dyn FnMut(DirEntryRaw) -> Result<()>,
     ) -> Result<()> {
         use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
         use windows_sys::Win32::Storage::FileSystem::{
             FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, GetFileInformationByHandleEx,
             FILE_ID_EXTD_DIR_INFO,
         };
-
-        if depth >= MAX_DEPTH {
-            return Err(SafeRootError::io(
-                IoOp::InspectDir,
-                &std::io::Error::other(format!(
-                    "フォルダの入れ子が深すぎます（{MAX_DEPTH} 段で打ち切り）"
-                )),
-            ));
-        }
 
         // 8 バイト境界のバッファ（`FILE_ID_EXTD_DIR_INFO` はポインタ整列が要る）。
         let mut buffer = vec![0u64; 8 * 1024];
@@ -1551,15 +1608,13 @@ mod imp {
                     unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len) };
                 let name = String::from_utf16_lossy(name_u16);
                 if name != "." && name != ".." {
-                    handle_child(
-                        dir_handle,
-                        &display.join(&name),
-                        entry.FileId.Identifier,
-                        dir_sd,
-                        file_sd,
-                        depth,
-                        skips,
-                    )?;
+                    each(DirEntryRaw {
+                        name,
+                        file_id: entry.FileId.Identifier,
+                        attributes: entry.FileAttributes,
+                        reparse_tag: entry.ReparsePointTag,
+                        len: u64::try_from(entry.EndOfFile).unwrap_or(0),
+                    })?;
                 }
                 if entry.NextEntryOffset == 0 {
                     break;
@@ -1569,17 +1624,60 @@ mod imp {
         }
     }
 
+    /// `dir_handle` の中を列挙して、各子にハンドルで書く・再帰する（上の doc）。`display` は
+    /// 飛ばした子の報告のための表示用のパス（開くのには使わない）。`within` は木のルートの
+    /// 本当のパス（ID で開いた物がその中かを確かめる。#623 PR-1b）。`dir_sd` はフォルダ用
+    /// （`OICI`）、`file_sd` はファイル用（継承フラグ無し。Nit 4）。
+    #[allow(clippy::too_many_arguments)]
+    fn propagate(
+        dir_handle: HANDLE,
+        display: &Path,
+        within: &Path,
+        dir_sd: &LocalBox,
+        file_sd: &LocalBox,
+        depth: u32,
+        skips: &mut super::ResetSkips,
+    ) -> Result<()> {
+        if depth >= MAX_DEPTH {
+            return Err(SafeRootError::io(
+                IoOp::InspectDir,
+                &std::io::Error::other(format!(
+                    "フォルダの入れ子が深すぎます（{MAX_DEPTH} 段で打ち切り）"
+                )),
+            ));
+        }
+        enumerate_dir(dir_handle, &mut |entry| {
+            handle_child(
+                dir_handle,
+                &display.join(&entry.name),
+                within,
+                entry.file_id,
+                dir_sd,
+                file_sd,
+                depth,
+                skips,
+            )
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_child(
         parent: HANDLE,
         display_child: &Path,
+        within: &Path,
         file_id: [u8; 16],
         dir_sd: &LocalBox,
         file_sd: &LocalBox,
         depth: u32,
         skips: &mut super::ResetSkips,
     ) -> Result<()> {
-        let opened = match open_child_by_id(parent, file_id)? {
+        #[cfg(test)]
+        BEFORE_CHILD_OPEN.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(display_child);
+            }
+        });
+        let opened = match open_child_by_id(parent, file_id, within)? {
             ChildOpen::Opened(opened) => opened,
             ChildOpen::Vanished => return Ok(()),
             ChildOpen::Denied => {
@@ -1610,6 +1708,7 @@ mod imp {
             propagate(
                 opened.handle.raw(),
                 display_child,
+                within,
                 dir_sd,
                 file_sd,
                 depth + 1,
@@ -1805,12 +1904,31 @@ mod imp {
     }
 
     /// drop で `CloseHandle` するハンドル（[`super::PinnedDir`]）。
-    pub(crate) struct OwnedHandle(HANDLE);
+    pub(crate) struct OwnedHandle(pub(crate) HANDLE);
+
+    // SAFETY: カーネルのハンドルはプロセス全体で有効な値で、どのスレッドから使っても・閉じても
+    // よい（スレッドに結び付いた状態を持たない）。閉じるのは持ち主の `Drop` だけ。ディレクトリの
+    // 列挙の位置のようにファイルオブジェクトに付いた状態を同時に動かす使い方は、呼ぶ側が直列化
+    // する（`PinnedDir` の列挙は `enum_lock` で包む。#623 PR-1b: サービスがプロセスの終わりまで
+    // 握ったフォルダをスレッドをまたいで使うため）。同じく**位置を持つ操作（ファイルの読み・
+    // ディレクトリの列挙）はハンドルを共有して同時に使わない**（`PinnedFile::read_to_end` は
+    // `&mut self`、列挙は `enum_lock`）。
+    unsafe impl Send for OwnedHandle {}
+    // SAFETY: 上と同じ。`&OwnedHandle` から出来るのは生のハンドルを読むことだけ。
+    unsafe impl Sync for OwnedHandle {}
 
     impl OwnedHandle {
         /// 生のハンドル（開いている間だけ使う。閉じない）。
         pub(crate) fn raw(&self) -> HANDLE {
             self.0
+        }
+
+        /// 所有を手放して生のハンドルを返す（`std::fs::File` などへ移すとき。閉じる責任は
+        /// 受け取った側に移る）。
+        pub(crate) fn into_raw(self) -> HANDLE {
+            let handle = self.0;
+            std::mem::forget(self);
+            handle
         }
     }
 
@@ -1825,7 +1943,7 @@ mod imp {
 
     /// 開いたハンドルの本当のパス（`GetFinalPathNameByHandleW`、`VOLUME_NAME_DOS` +
     /// `FILE_NAME_NORMALIZED`）。先頭の `\\?\`（UNC は `\\?\UNC\` → `\\`）を外す。
-    fn final_path_of(handle: HANDLE) -> Result<std::path::PathBuf> {
+    pub(crate) fn final_path_of(handle: HANDLE) -> Result<std::path::PathBuf> {
         use windows_sys::Win32::Storage::FileSystem::{
             GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
         };
@@ -1948,6 +2066,7 @@ mod imp {
                 is_reparse_point: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
                 owner,
             },
+            enum_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -2034,7 +2153,8 @@ mod imp {
     ) -> Result<Option<super::PinnedFile>> {
         // ファイル用（継承のフラグなし）・所有者 Administrators・保護された DACL。
         let descriptor = owned_protected_sd(&DirAccess::service_only(), false)?;
-        let Some(handle) = child_relative(parent, name, ChildHow::CreateFile(&descriptor))? else {
+        let Some(handle) = child_relative(parent, name, ChildHow::CreateFile(Some(&descriptor)))?
+        else {
             return Ok(None);
         };
         // ここから先の失敗は、作ったハンドルで消してから返す（名前で消さない）。
@@ -2079,7 +2199,7 @@ mod imp {
 
     /// 開いたハンドルのファイルを `FileDispositionInfo` で消す印を付ける（閉じたときに消える。
     /// ハンドルは `DELETE` を持つこと。名前で消さないので、別の物を消さない）。
-    fn delete_by_handle(handle: HANDLE) -> Result<()> {
+    pub(crate) fn delete_by_handle(handle: HANDLE) -> Result<()> {
         use windows_sys::Win32::Storage::FileSystem::{
             FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
         };
@@ -2103,7 +2223,7 @@ mod imp {
     }
 
     /// `handle`（`FILE_WRITE_DATA`、同期 I/O）へ `contents` を全部書いて `FlushFileBuffers`。
-    fn write_all_and_flush(handle: HANDLE, contents: &[u8]) -> Result<()> {
+    pub(crate) fn write_all_and_flush(handle: HANDLE, contents: &[u8]) -> Result<()> {
         use std::io::Write;
         use std::os::windows::io::FromRawHandle;
         // 閉じるのは持ち主（OwnedHandle）なので、`File` には持たせない（ManuallyDrop）。
@@ -2204,7 +2324,7 @@ mod imp {
 
     /// [`child_relative`] が作るか開くか（権利・共有・作り方が決まる）。
     #[derive(Clone, Copy)]
-    enum ChildHow<'a> {
+    pub(crate) enum ChildHow<'a> {
         /// フォルダを `FILE_CREATE | FILE_DIRECTORY_FILE` で作る（既にあれば `Ok(None)`）。
         /// `Some` ならその記述子（保護された DACL）を作るのと同時に付ける。
         Create(Option<&'a LocalBox>),
@@ -2219,8 +2339,21 @@ mod imp {
         OpenFileForUpdate,
         /// ファイルを `FILE_CREATE | FILE_NON_DIRECTORY_FILE` で、この記述子を付けて作る
         /// （既にあれば `Ok(None)`。#630）。書き込みと、失敗したときに消すための `DELETE` を
-        /// 求め、共有は読み取りだけ。
-        CreateFile(&'a LocalBox),
+        /// 求め、共有は読み取りだけ。`None` なら記述子を渡さず、親のフォルダから継承する
+        /// （#623 PR-1b の `ManagedDir::create_new`・`write_atomic` の一時ファイル）。
+        CreateFile(Option<&'a LocalBox>),
+        /// 追記で開く（#623 PR-1b の `ManagedDir::open_append`）。`create` なら無ければ作る
+        /// （`FILE_OPEN_IF`）、偽なら `FILE_OPEN`（無ければ `Ok(None)`）。権利は
+        /// `FILE_APPEND_DATA` と属性・記述子の読み取りだけ（`FILE_WRITE_DATA` を持たないので、
+        /// 書き込みは必ず末尾に付く）。共有は読み取りだけ。種類を問わず開き、呼ぶ側が属性で断る。
+        OpenAppend { create: bool },
+        /// 消すために開く（#623 PR-1b の `ManagedDir::remove`）。`DELETE` と属性の読み取り。
+        /// 共有はすべて許す（読んでいる人がいても消せる。POSIX の削除で名前はすぐ消える）。
+        /// 種類を問わず開き、呼ぶ側が**開いた後の**属性で断る。
+        OpenForDelete,
+        /// 属性だけを読むために開く（#623 PR-1b の `ManagedDir::reopen_path`）。中身の権利を
+        /// 求めず、共有はすべて許す（相手の邪魔をしない）。
+        OpenAttributes,
     }
 
     /// 開いている `parent` を `RootDirectory` に、名前 1 要素の子を `NtCreateFile` で作るか
@@ -2229,12 +2362,13 @@ mod imp {
     /// 含む）・共有（削除なし）・バックアップの意図つきで開く。ファイル（`OpenFile`・
     /// `OpenFileForUpdate`・`CreateFile`）は [`ChildHow`] のとおりで、どれも共有は読み取り
     /// だけ、バックアップの意図は付けない（DACL だけを門にする。#648）。
-    fn child_relative(
+    pub(crate) fn child_relative(
         parent: &super::PinnedDir,
         name: &str,
         how: ChildHow<'_>,
     ) -> Result<Option<OwnedHandle>> {
         use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_IF;
         use windows_sys::Wdk::Storage::FileSystem::{
             NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
             FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
@@ -2244,25 +2378,28 @@ mod imp {
             STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
         };
         use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-            FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, READ_CONTROL,
-            SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+            DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
         };
         use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
         /// `ERROR_INVALID_NAME`。
         const ERROR_INVALID_NAME: u32 = 123;
-        let is_file = matches!(
-            how,
-            ChildHow::OpenFile | ChildHow::OpenFileForUpdate | ChildHow::CreateFile(_)
-        );
+        let is_file = !matches!(how, ChildHow::Create(_) | ChildHow::Open);
         // 失敗の文言に出す API の名前。作る経路と開く経路を見分けられるようにする
         // （開く経路の名前の誤りを `CreateChildDir` と読ませない。#628 / #646 Nit 3）。
         let label = match how {
             ChildHow::Create(_) => "CreateChildDir(name)",
             ChildHow::Open => "OpenChildDir(name)",
-            ChildHow::OpenFile | ChildHow::OpenFileForUpdate => "OpenChildFile(name)",
-            ChildHow::CreateFile(_) => "CreateChildFile(name)",
+            ChildHow::OpenFile
+            | ChildHow::OpenFileForUpdate
+            | ChildHow::OpenAppend { create: false }
+            | ChildHow::OpenForDelete
+            | ChildHow::OpenAttributes => "OpenChildFile(name)",
+            ChildHow::CreateFile(_) | ChildHow::OpenAppend { create: true } => {
+                "CreateChildFile(name)"
+            }
         };
         // `NtCreateFile` は Win32 の正規化を通らないので、Win32 から見ると別の名前・別の
         // 物になるもの（末尾の `.` と空白・ワイルドカード・予約デバイス名など）も断る
@@ -2321,11 +2458,36 @@ mod imp {
                 FILE_SHARE_READ,
             ),
             ChildHow::CreateFile(descriptor) => (
-                Some(descriptor),
+                descriptor,
                 FILE_CREATE,
                 FILE_NON_DIRECTORY_FILE,
                 read_access | FILE_WRITE_DATA | DELETE,
                 FILE_SHARE_READ,
+            ),
+            // #623 PR-1b: 作るときも開くときもファイルの指定（`FILE_NON_DIRECTORY_FILE`）を
+            // 付けない - 付けると既にあるフォルダ・ジャンクションが「開けない」の失敗になり、
+            // 呼ぶ側が理由（reparse point の tag）を返せない。属性は開いた後に呼ぶ側が読む。
+            // 作るときに何も付けなければ普通のファイルができる。
+            ChildHow::OpenAppend { create } => (
+                None,
+                if create { FILE_OPEN_IF } else { FILE_OPEN },
+                0,
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_APPEND_DATA | SYNCHRONIZE,
+                FILE_SHARE_READ,
+            ),
+            ChildHow::OpenForDelete => (
+                None,
+                FILE_OPEN,
+                0,
+                READ_CONTROL | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ),
+            ChildHow::OpenAttributes => (
+                None,
+                FILE_OPEN,
+                0,
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ),
         };
         let attributes = OBJECT_ATTRIBUTES {
@@ -2369,7 +2531,14 @@ mod imp {
         };
         let absent = match how {
             ChildHow::Create(_) | ChildHow::CreateFile(_) => status == STATUS_OBJECT_NAME_COLLISION,
-            ChildHow::Open | ChildHow::OpenFile | ChildHow::OpenFileForUpdate => {
+            // 無ければ作るので「無い」は起きない。
+            ChildHow::OpenAppend { create: true } => false,
+            ChildHow::Open
+            | ChildHow::OpenFile
+            | ChildHow::OpenFileForUpdate
+            | ChildHow::OpenAppend { create: false }
+            | ChildHow::OpenForDelete
+            | ChildHow::OpenAttributes => {
                 status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
             }
         };
@@ -2382,14 +2551,20 @@ mod imp {
             // ファイル（#630）は `io::ErrorKind` を残す（sink がアクセス拒否を見分けて案内する
             // ため）。フォルダは今までどおり。
             return Err(match how {
-                ChildHow::OpenFile | ChildHow::OpenFileForUpdate => SafeRootError::io(
+                ChildHow::OpenFile
+                | ChildHow::OpenFileForUpdate
+                | ChildHow::OpenAppend { create: false }
+                | ChildHow::OpenForDelete
+                | ChildHow::OpenAttributes => SafeRootError::io(
                     IoOp::OpenFile,
                     &std::io::Error::from_raw_os_error(os_error as i32),
                 ),
-                ChildHow::CreateFile(_) => SafeRootError::io(
-                    IoOp::CreateFile,
-                    &std::io::Error::from_raw_os_error(os_error as i32),
-                ),
+                ChildHow::CreateFile(_) | ChildHow::OpenAppend { create: true } => {
+                    SafeRootError::io(
+                        IoOp::CreateFile,
+                        &std::io::Error::from_raw_os_error(os_error as i32),
+                    )
+                }
                 ChildHow::Create(_) | ChildHow::Open => api("NtCreateFile", os_error),
             });
         }
@@ -2441,7 +2616,7 @@ mod imp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
@@ -3011,10 +3186,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    mod windows {
+    pub(crate) mod windows {
         use super::super::*;
 
-        fn me() -> InstallUserSid {
+        pub(crate) fn me() -> InstallUserSid {
             current_user_sid().expect("今の利用者の SID")
         }
 
@@ -3022,7 +3197,7 @@ mod tests {
         /// `CI`の環境変数があるのに管理者でなければ panic する（管理者でしか走らない反証が
         /// 黙って飛ばされないように。#626 PR-B の監査 B-3）。手元（`CI`なし）では`false`を
         /// 返し、呼ぶ側が skip する。
-        fn is_elevated_admin() -> bool {
+        pub(crate) fn is_elevated_admin() -> bool {
             let admin = banto_service_elev::is_current_process_admin().unwrap_or(false);
             if !admin && std::env::var_os("CI").is_some() {
                 panic!("CI なのに昇格した管理者ではない（管理者でしか走らない反証が走らない）");
@@ -3241,7 +3416,7 @@ mod tests {
         }
 
         /// ジャンクション（`mklink /J`。管理者でなくても作れる）を作る。
-        fn junction(link: &std::path::Path, target: &std::path::Path) {
+        pub(crate) fn junction(link: &std::path::Path, target: &std::path::Path) {
             let status = std::process::Command::new("cmd")
                 .args(["/C", "mklink", "/J"])
                 .arg(link)
@@ -3835,7 +4010,10 @@ mod tests {
 
         /// `dir` を `target` へのジャンクションにする（`FSCTL_SET_REPARSE_POINT`。`dir` は
         /// 空のフォルダ。テスト専用）。
-        fn set_reparse_to(dir: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+        pub(crate) fn set_reparse_to(
+            dir: &std::path::Path,
+            target: &std::path::Path,
+        ) -> std::io::Result<()> {
             use std::os::windows::ffi::OsStrExt;
             use windows_sys::Win32::Foundation::{
                 CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE,
@@ -4459,7 +4637,7 @@ mod tests {
             junction(&root.path().join("link"), outside.path());
             let parent = pin_dir(root.path()).unwrap().unwrap();
 
-            let file = parent.open_child_file("conf.toml").unwrap().unwrap();
+            let mut file = parent.open_child_file("conf.toml").unwrap().unwrap();
             assert_eq!(file.final_path(), parent.final_path().join("conf.toml"));
             assert_eq!(
                 Some(file.security().clone()),
@@ -4504,7 +4682,7 @@ mod tests {
             );
 
             assert!(parent.open_child_file("missing.toml").unwrap().is_none());
-            let sub = parent.open_child_file("sub").unwrap().unwrap();
+            let mut sub = parent.open_child_file("sub").unwrap().unwrap();
             assert!(sub.security().is_dir);
             assert!(matches!(
                 sub.read_to_end(1024),
@@ -4513,7 +4691,7 @@ mod tests {
                     ..
                 })
             ));
-            let link = parent.open_child_file("link").unwrap().unwrap();
+            let mut link = parent.open_child_file("link").unwrap().unwrap();
             assert!(link.security().is_reparse_point, "{link:?}");
             assert_eq!(
                 link.read_to_end(1024),
@@ -4597,7 +4775,7 @@ mod tests {
                 "{result:?}"
             );
             drop(writer);
-            let file = parent.open_child_file("conf.toml").unwrap().unwrap();
+            let mut file = parent.open_child_file("conf.toml").unwrap().unwrap();
             assert_eq!(file.read_to_end(16).unwrap(), b"x");
         }
 
@@ -4675,7 +4853,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
             for place in [&parent, &sink] {
-                let file = place.create_child_file(name, contents).unwrap().unwrap();
+                let mut file = place.create_child_file(name, contents).unwrap().unwrap();
+                assert_eq!(file.read_to_end(1024).unwrap(), contents);
                 assert_eq!(file.final_path(), place.final_path().join(name));
                 let security = file.security();
                 assert!(!security.is_dir && !security.is_reparse_point);
@@ -4684,7 +4863,6 @@ mod tests {
                 assert_eq!(security.dacl.owner, ADMINISTRATORS_SID, "{security:?}");
                 check_file_dacl(&security.dacl, &DirAccess::service_only());
                 assert_eq!(exposure(security), vec![]);
-                assert_eq!(file.read_to_end(1024).unwrap(), contents);
                 assert_eq!(
                     inspect_file(&place.final_path().join(name))
                         .unwrap()
@@ -4694,7 +4872,7 @@ mod tests {
                 drop(file);
                 // 既にあれば作らず、中身も変えない。
                 assert!(place.create_child_file(name, b"other").unwrap().is_none());
-                let again = place.open_child_file(name).unwrap().unwrap();
+                let mut again = place.open_child_file(name).unwrap().unwrap();
                 assert_eq!(again.read_to_end(1024).unwrap(), contents);
             }
             let note = sink.security().unwrap();
@@ -4735,7 +4913,7 @@ mod tests {
                 .open_child_file_for_update("missing")
                 .unwrap()
                 .is_none());
-            let file = parent
+            let mut file = parent
                 .open_child_file_for_update("a.example")
                 .unwrap()
                 .unwrap();

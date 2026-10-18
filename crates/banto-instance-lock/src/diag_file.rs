@@ -7,7 +7,9 @@
 //! ファイルを 0 バイトに切り詰めて書く**（失敗は握りつぶすので気付かれない）。
 //! ここでは次の順で扱い、確かめに合わないものは書かず・読まずに捨てる:
 //!
-//! - **Windows**: `FILE_FLAG_OPEN_REPARSE_POINT` で開く（最後の要素がリンクなら、
+//! - **Windows**（確かめの本体は `banto_safe_root::nofollow::open_file_verified`。#623 PR-1b で
+//!   共有 crate へ移した。ここは結果を診断ファイルの言葉に写すだけ）:
+//!   `FILE_FLAG_OPEN_REPARSE_POINT` で開く（最後の要素がリンクなら、
 //!   リンクそのものが開く）。新規は `CREATE_NEW`、既にあれば `OPEN_EXISTING` で
 //!   開き直す（`OPEN_ALWAYS`/`CREATE_ALWAYS` のように開く時点で切り詰めない）。
 //!   開いた**ハンドル**で、reparse point でない・ディレクトリでない・リンク数が 1
@@ -86,163 +88,40 @@ pub(crate) use unix_impl::{open_for_lock, open_for_read};
 
 #[cfg(windows)]
 mod windows_impl {
+    //! Windows の確かめは `banto_safe_root::nofollow::open_file_verified`（#623 PR-1b で
+    //! この中身を共有 crate へ移した）。ここは結果を診断ファイルの言葉に写すだけ。
     use super::{Opened, Refusal};
-    use std::fs::File;
     use std::io;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-        GetLongPathNameW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW,
-        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
-    };
+    use banto_safe_root::nofollow::{self, LeftBehind, OpenHow, Verified};
 
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    /// `FILE_FLAG_OPEN_REPARSE_POINT` で開く（最後の要素がリンクでも辿らない）。
-    /// 共有は `std::fs::OpenOptions` の既定と同じ（読み・書き・削除）。
-    fn open_raw(path: &Path, access: u32, disposition: u32) -> io::Result<OwnedHandle> {
-        let wide = wide(path);
-        // SAFETY: `wide` は NUL 終端で呼び出しの間生存する。属性・テンプレートは null。
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                disposition,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `CreateFileW` が返した有効なハンドルで、所有をここで移す。
-        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
-    }
-
-    fn raw(handle: &OwnedHandle) -> HANDLE {
-        handle.as_raw_handle() as HANDLE
-    }
-
-    /// ハンドルが指すものの本当のパス（`\\?\C:\...` 形式）。
-    fn final_path(handle: &OwnedHandle) -> io::Result<PathBuf> {
-        let mut buf = vec![0u16; 512];
-        loop {
-            // SAFETY: `buf` は書ける長さ `buf.len()` の領域。
-            let len = unsafe {
-                GetFinalPathNameByHandleW(
-                    raw(handle),
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-                )
-            } as usize;
-            if len == 0 {
-                return Err(io::Error::last_os_error());
+    impl From<banto_safe_root::Refusal> for Refusal {
+        fn from(refusal: banto_safe_root::Refusal) -> Self {
+            match refusal {
+                banto_safe_root::Refusal::ReparsePoint { .. } => Refusal::ReparsePoint,
+                banto_safe_root::Refusal::NotAFile | banto_safe_root::Refusal::NotADirectory => {
+                    Refusal::NotARegularFile
+                }
+                banto_safe_root::Refusal::HardLinked { links } => Refusal::HardLinked {
+                    links: u64::from(links),
+                },
+                banto_safe_root::Refusal::Elsewhere { actual } => Refusal::Elsewhere { actual },
             }
-            if len < buf.len() {
-                buf.truncate(len);
-                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
-            }
-            // 足りないときは終端を含む必要な長さが返る。
-            buf.resize(len + 1, 0);
         }
     }
 
-    /// 渡されたパスを、比べられる形にする: 絶対パスにして、8.3 の短い名前を長い名前に
-    /// 直す（`GetLongPathNameW` はリンクを解かない - 途中のジャンクションは名前のまま
-    /// 残るので、本当のパスと食い違う）。直せなければ絶対パスのまま（比べて食い違えば
-    /// 書かない側に倒れる）。
-    fn expected_path(path: &Path) -> PathBuf {
-        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let wide = wide(&absolute);
-        let mut buf = vec![0u16; 512];
-        loop {
-            // SAFETY: `wide` は NUL 終端、`buf` は書ける長さ `buf.len()` の領域。
-            let len = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
-                as usize;
-            if len == 0 {
-                return absolute;
-            }
-            if len < buf.len() {
-                buf.truncate(len);
-                return PathBuf::from(std::ffi::OsString::from_wide(&buf));
-            }
-            buf.resize(len + 1, 0);
-        }
-    }
-
-    /// `\\?\`・`\\?\UNC\` の接頭辞を落とし、末尾の区切りを除き、小文字にそろえる
-    /// （NTFS は大文字小文字を区別しない）。
-    pub(super) fn comparable(path: &Path) -> String {
-        let text = path.to_string_lossy();
-        let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            text.into_owned()
-        };
-        text.trim_end_matches('\\').to_lowercase()
-    }
-
-    /// 開いたハンドルを確かめる。合わなければ理由を返す。
-    fn verify(handle: &OwnedHandle, path: &Path) -> io::Result<Option<Refusal>> {
-        // SAFETY: ゼロ埋めは BY_HANDLE_FILE_INFORMATION の有効な値（整数だけの構造体）。
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: 有効なハンドルと、書ける構造体へのポインタ。
-        if unsafe { GetFileInformationByHandle(raw(handle), &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Ok(Some(Refusal::ReparsePoint));
-        }
-        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-            return Ok(Some(Refusal::NotARegularFile));
-        }
-        if info.nNumberOfLinks != 1 {
-            return Ok(Some(Refusal::HardLinked {
-                links: u64::from(info.nNumberOfLinks),
-            }));
-        }
-        let actual = final_path(handle)?;
-        if comparable(&actual) != comparable(&expected_path(path)) {
-            return Ok(Some(Refusal::Elsewhere { actual }));
-        }
-        Ok(None)
-    }
-
-    /// このハンドルで作ったファイルを、ハンドルで消す（パスを解決し直さない）。
-    fn delete_by_handle(handle: &OwnedHandle) -> io::Result<()> {
-        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: 有効なハンドル（`DELETE` 付きで開いた）と、大きさが合う構造体。
-        let ok = unsafe {
-            SetFileInformationByHandle(
-                raw(handle),
-                FileDispositionInfo,
-                (&info as *const FILE_DISPOSITION_INFO).cast(),
-                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+    /// 作ったが確かめに合わず、消せなかったときの警告（呼び出し側がアプリのログに出す）。
+    fn left_behind_warning(path: &Path, left: LeftBehind) -> String {
+        let actual = left
+            .actual
+            .map(|actual| actual.display().to_string())
+            .unwrap_or_else(|| "(不明)".to_string());
+        format!(
+            "確かめに合わなかった診断ファイル {} を作ったが消せませんでした（空のファイルが残っている可能性があります。実際の場所: {actual}）: {}",
+            path.display(),
+            left.error
+        )
     }
 
     /// 書くために開く。中身は**切り詰めない**（確かめた後に呼ぶ側が `set_len(0)`）。
@@ -250,58 +129,23 @@ mod windows_impl {
     /// 2 つ目の値は、この呼び出しで作った確かめに合わないファイルを消せなかった
     /// ときの警告（呼び出し側がアプリのログに出す）。
     pub(crate) fn open_for_write(path: &Path) -> io::Result<(Opened, Option<String>)> {
-        const WRITE: u32 = FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES;
-        let (handle, created) = match open_raw(path, WRITE | DELETE, CREATE_NEW) {
-            Ok(handle) => (handle, true),
-            Err(err)
-                if err.raw_os_error() == Some(ERROR_FILE_EXISTS as i32)
-                    || err.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) =>
-            {
-                (open_raw(path, WRITE, OPEN_EXISTING)?, false)
-            }
-            Err(err) => return Err(err),
-        };
-        let refusal = match verify(&handle, path) {
-            Ok(None) => return Ok((Opened::File(File::from(handle)), None)),
-            Ok(Some(refusal)) => refusal,
-            Err(err) => {
-                if created {
-                    if let Some(warning) = delete_created(&handle, path) {
-                        // 確かめ自体が失敗した経路。消せなかったことも理由に足す。
-                        return Err(io::Error::new(err.kind(), format!("{err}（{warning}）")));
-                    }
-                }
-                return Err(err);
-            }
-        };
-        let warning = if created {
-            // 作ったのが外（途中のリンクの先）なら、空のファイルを残さない。
-            delete_created(&handle, path)
-        } else {
-            None
-        };
-        Ok((Opened::Refused(refusal), warning))
-    }
-
-    /// この呼び出しで作ったファイルを消す。消せなければ、外に空のファイルが残った
-    /// かもしれないことを本当のパスつきの警告として返す（黙って捨てない）。
-    fn delete_created(handle: &OwnedHandle, path: &Path) -> Option<String> {
-        let err = delete_by_handle(handle).err()?;
-        let actual = final_path(handle)
-            .map(|actual| actual.display().to_string())
-            .unwrap_or_else(|_| "(不明)".to_string());
-        Some(format!(
-            "確かめに合わなかった診断ファイル {} を作ったが消せませんでした（空のファイルが残っている可能性があります。実際の場所: {actual}）: {err}",
-            path.display()
-        ))
+        Ok(match nofollow::open_file_verified(path, OpenHow::Write)? {
+            Verified::File { file, .. } => (Opened::File(file), None),
+            Verified::Refused {
+                refusal,
+                left_behind,
+            } => (
+                Opened::Refused(refusal.into()),
+                left_behind.map(|left| left_behind_warning(path, left)),
+            ),
+        })
     }
 
     /// 読むために開く（既にあるものだけ）。
     pub(crate) fn open_for_read(path: &Path) -> io::Result<Opened> {
-        let handle = open_raw(path, FILE_GENERIC_READ, OPEN_EXISTING)?;
-        Ok(match verify(&handle, path)? {
-            None => Opened::File(File::from(handle)),
-            Some(refusal) => Opened::Refused(refusal),
+        Ok(match nofollow::open_file_verified(path, OpenHow::Read)? {
+            Verified::File { file, .. } => Opened::File(file),
+            Verified::Refused { refusal, .. } => Opened::Refused(refusal.into()),
         })
     }
 }
@@ -359,27 +203,5 @@ mod unix_impl {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(path),
         )
-    }
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::windows_impl::comparable;
-    use std::path::Path;
-
-    #[test]
-    fn comparable_drops_verbatim_prefixes_case_and_trailing_separators() {
-        assert_eq!(
-            comparable(Path::new(r"\\?\C:\Data\X.lock")),
-            comparable(Path::new(r"c:\data\x.lock"))
-        );
-        assert_eq!(
-            comparable(Path::new(r"\\?\UNC\srv\share\a")),
-            comparable(Path::new(r"\\SRV\share\a\"))
-        );
-        assert_ne!(
-            comparable(Path::new(r"C:\data\x.lock")),
-            comparable(Path::new(r"C:\outside\x.lock"))
-        );
     }
 }

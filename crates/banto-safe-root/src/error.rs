@@ -24,6 +24,10 @@ pub enum IoOp {
     CreateFile,
     /// 作ったファイルへの書き込みとディスクへの書き出し（同上）。
     WriteFile,
+    /// 書いた一時ファイルの名前を本来の名前へ付け替える（`ManagedDir::write_atomic`、#623 PR-1b）。
+    RenameFile,
+    /// フォルダの中の一覧（`ManagedDir::list`、#623 PR-1b）。
+    ListDir,
 }
 
 impl fmt::Display for IoOp {
@@ -36,6 +40,8 @@ impl fmt::Display for IoOp {
             Self::OpenFile => "ファイルの確認",
             Self::CreateFile => "ファイルの作成",
             Self::WriteFile => "ファイルへの書き込み",
+            Self::RenameFile => "ファイルの名前の付け替え",
+            Self::ListDir => "フォルダの一覧",
         })
     }
 }
@@ -93,6 +99,49 @@ impl fmt::Display for AclMismatch {
     }
 }
 
+/// 辿らずに開いた物が、その用途に使えない理由（#623 PR-1b。`ManagedDir` の操作・
+/// [`crate::nofollow::open_file_verified`]・`open_root`／`open_managed`）。どれも**開いたハンドルから
+/// 読んだ**属性で決める（名前・列挙の時点の属性では決めない）。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    /// reparse point（ジャンクション・シンボリックリンクのほか、WOF（`compact`）・重複除去・
+    /// クラウドのプレースホルダも - tag を問わず断る。fail closed）。`tag` は reparse の tag
+    /// （`IO_REPARSE_TAG_*`。ログで見分けるため。Fable B-4-4）。読めなかったときは 0。
+    ReparsePoint { tag: u32 },
+    /// ファイルを期待したのにフォルダだった。
+    NotAFile,
+    /// フォルダを期待したのにファイルだった。
+    NotADirectory,
+    /// ファイルにハードリンクの別名がある（リンク数が 1 でない）。
+    HardLinked { links: u32 },
+    /// 開いた物の本当のパスが、期待の場所と違う（途中の要素がリンクで外へ出た・木の外へ
+    /// 移された）。
+    Elsewhere { actual: std::path::PathBuf },
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReparsePoint { tag } => {
+                write!(
+                    f,
+                    "リンク（reparse point、tag {tag:#010x}）なので辿りません"
+                )
+            }
+            Self::NotAFile => f.write_str("ファイルではありません（フォルダです）"),
+            Self::NotADirectory => f.write_str("フォルダではありません"),
+            Self::HardLinked { links } => {
+                write!(f, "ハードリンクの別名があります（リンク数 {links}）")
+            }
+            Self::Elsewhere { actual } => write!(
+                f,
+                "本当の場所が期待と違います（途中にリンク: {}）",
+                actual.display()
+            ),
+        }
+    }
+}
+
 /// この crate のすべての失敗。
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -119,6 +168,13 @@ pub enum SafeRootError {
     /// #630）。作ったファイルは消してある。中身は [`crate::acl::exposure`] の理由。
     #[error("作ったファイルが保護されていません（{0:?}）")]
     Exposed(Vec<crate::acl::Exposure>),
+    /// 握ったフォルダの中の名前（または握ったフォルダそのもの）が、その用途に使えない
+    /// （#623 PR-1b）。`path` は表示用（開き直すのには使わない）。
+    #[error("{} は使えません: {refusal}", path.display())]
+    Refused {
+        path: std::path::PathBuf,
+        refusal: Refusal,
+    },
 }
 
 impl SafeRootError {
