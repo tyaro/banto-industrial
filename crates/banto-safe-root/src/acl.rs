@@ -1895,6 +1895,62 @@ pub(crate) mod imp {
         owned_protected_sd(&DirAccess::service_only(), false)
     }
 
+    /// `handle` が指す物の 128 ビットのファイル ID（`FileIdInfo`。列挙の `FileIdExtdDirectoryInfo`
+    /// と同じ ID の空間）。
+    pub(crate) fn file_id_of(handle: HANDLE) -> Result<[u8; 16]> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+        };
+        // SAFETY: 全フィールドが整数の構造体（ゼロは有効な値）。
+        let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` は有効、`info` は大きさの合う書き込み先。
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(api(
+                "GetFileInformationByHandleEx(FileIdInfo)",
+                last_error(),
+            ));
+        }
+        Ok(info.FileId.Identifier)
+    }
+
+    /// `dir`（開いているフォルダのハンドル）の中で、OS が [`crate::mode::MARKER_NAME`] の名前に
+    /// 解決する物（印の席。[`probe_marker`]）。
+    pub(crate) struct MarkerSlot {
+        /// 128 ビットのファイル ID（列挙の子と比べて「これが印の席か」を決める）。
+        pub(crate) id: [u8; 16],
+        pub(crate) is_dir: bool,
+        /// 本当のパス（実際の綴り。理由の表示用）。
+        pub(crate) path: std::path::PathBuf,
+    }
+
+    /// `dir` の中の印の席を、**名前の綴りではなく OS の名前の解決**で探す（Fable レビュー
+    /// M-1）: `MARKER_NAME` を相対に属性だけで開き（`OBJ_CASE_INSENSITIVE`。大文字小文字の
+    /// 折り畳みは NTFS に任せる - `eq_ignore_ascii_case` では非 ASCII の折り畳みを再現できない）、
+    /// その物のファイル ID と種類を返す。無ければ `None`。木を歩く部品は、列挙した子の ID が
+    /// この ID と同じかで「印の席」を見分ける（綴りが `.BANTO-SAFE-ROOT` でも同じ物なら印、
+    /// 大文字小文字を区別するフォルダで綴りだけ同じ別の物なら印ではない）。
+    pub(crate) fn probe_marker(dir: HANDLE) -> Result<Option<MarkerSlot>> {
+        let Some(handle) =
+            child_relative_handle(dir, crate::mode::MARKER_NAME, ChildHow::OpenAttributes)?
+        else {
+            return Ok(None);
+        };
+        let info = info_of(handle.raw())?;
+        Ok(Some(MarkerSlot {
+            id: file_id_of(handle.raw())?,
+            is_dir: info.is_dir,
+            path: final_path_of(handle.raw())?,
+        }))
+    }
+
     /// [`place_marker`] が置けなかった理由。
     pub(crate) enum MarkerFailure {
         /// [`crate::mode::MARKER_NAME`] の名前に印でない物（フォルダ・リンク・ハードリンク）がある。
@@ -2212,12 +2268,21 @@ pub(crate) mod imp {
                 place_marker_in_walk(walk, dir_handle, display)?;
             }
         }
+        // 印の席を OS の名前の解決で探す（綴りでは比べない。Fable レビュー M-1）。厳しい確かめ
+        // （1 周目・2 周目）では、席をフォルダが塞いでいれば印を置けないので断る。
+        let marker_id = match probe_marker(dir_handle)? {
+            Some(slot) if walk.strict && slot.is_dir => {
+                return walk.problem(TreeProblem::MarkerOccupied { path: slot.path });
+            }
+            Some(slot) => Some(slot.id),
+            None => None,
+        };
         enumerate_dir(dir_handle, &mut |entry| {
             visit_child(
                 walk,
                 dir_handle,
                 &display.join(&entry.name),
-                &entry.name,
+                marker_id == Some(entry.file_id),
                 entry.file_id,
                 depth,
             )
@@ -2277,11 +2342,12 @@ pub(crate) mod imp {
         Ok(())
     }
 
+    /// `is_marker`: この子が親の印の席（[`probe_marker`] の ID と同じ物）か。
     fn visit_child(
         walk: &mut Walk<'_>,
         parent: HANDLE,
         display_child: &Path,
-        name: &str,
+        is_marker: bool,
         file_id: [u8; 16],
         depth: u32,
     ) -> std::result::Result<(), WalkStop> {
@@ -2310,7 +2376,7 @@ pub(crate) mod imp {
         // 進み具合は開いて数えた直後に 1 回（フォルダなら中へ下りる前。`written` はこの子の
         // 分をまだ含まない）。再帰の後に重ねて出すと、同じ `examined` の報告が並ぶ。
         walk.tick();
-        let result = visit_opened(walk, &opened, display_child, name, depth);
+        let result = visit_opened(walk, &opened, display_child, is_marker, depth);
         drop(opened);
         result
     }
@@ -2319,7 +2385,7 @@ pub(crate) mod imp {
         walk: &mut Walk<'_>,
         opened: &Opened,
         display_child: &Path,
-        name: &str,
+        is_marker: bool,
         depth: u32,
     ) -> std::result::Result<(), WalkStop> {
         if opened.is_reparse {
@@ -2341,21 +2407,15 @@ pub(crate) mod imp {
                 path: display_child.to_path_buf(),
             });
         }
-        if walk.strict && opened.is_dir && name == crate::mode::MARKER_NAME {
-            // 印の名前をフォルダが塞いでいる（印を置けない。利用者が設定モードで作った物）。
-            return walk.problem(TreeProblem::MarkerOccupied {
-                path: display_child.to_path_buf(),
-            });
-        }
         if opened.is_dir {
             // 子のハンドルを列挙元として再帰する（ID とハンドルだけ。パスは使わない）。書く順は
             // `walk_dir` の中（`Order`）。
             return walk_dir(walk, opened.handle.raw(), display_child, depth + 1);
         }
         if let Some(set) = &walk.write {
-            // フォルダは継承つき（OICI）、ファイルは継承フラグ無し（Nit 4）。印のファイルは
-            // どのモードでも印の記述子のまま（設計 §2.5・§2.9 (a)）。
-            let sd = if name == crate::mode::MARKER_NAME {
+            // フォルダは継承つき（OICI）、ファイルは継承フラグ無し（Nit 4）。印の席の物（綴りで
+            // なく ID で見分ける）はどのモードでも印の記述子のまま（設計 §2.5・§2.9 (a)）。
+            let sd = if is_marker {
                 set.marker_sd
             } else {
                 set.file_sd

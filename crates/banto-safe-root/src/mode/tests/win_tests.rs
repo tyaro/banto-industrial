@@ -674,10 +674,11 @@ fn scan_refuses_an_encrypted_file() {
     let secret = root.join("logs").join("l.txt");
     // SAFETY: NUL 終端のパス。
     if unsafe { EncryptFileW(wide(&secret).as_ptr()) } == 0 {
-        eprintln!(
-            "skip: EncryptFileW が使えない（{}）- EFS が無効の PC",
-            std::io::Error::last_os_error()
-        );
+        let error = std::io::Error::last_os_error();
+        if std::env::var_os("CI").is_some() {
+            panic!("CI で EncryptFileW が使えない（EFS が無効なら理由を doc に書いて明示の skip に）: {error}");
+        }
+        eprintln!("skip: EncryptFileW が使えない（{error}）- EFS が無効の PC");
         return;
     }
     let pinned = pinned(&root);
@@ -928,6 +929,28 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
     std::thread::sleep(Duration::from_millis(300));
     let via_advapi = set_dacl_on_handle_via_advapi(old.0, &setting.sddl());
     let by_advapi = wait(rx);
+    // (b') 古いハンドルを閉じたときに（遅れて）通知が来るか。
+    reset_dir_acl(&child, &readers).unwrap();
+    set_dacl_on_handle(old.0, &setting.sddl()).unwrap();
+    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
+    std::thread::sleep(Duration::from_millis(300));
+    drop(old);
+    let after_close = wait(rx);
+    eprintln!(
+        "実測: 古い WRITE_DAC のハンドルで DACL を変えた後にハンドルを閉じたとき: {after_close:?}"
+    );
+    assert!(
+        by_path.is_some(),
+        "パスの SetNamedSecurityInfoW で通知が来ない"
+    );
+    assert!(
+        after_close.is_some(),
+        "古いハンドルを閉じても通知が来ない（「遅れて来る」の観測が変わった。mode.rs の doc も直す）"
+    );
+    assert!(
+        by_kernel.is_none(),
+        "ハンドルの SetKernelObjectSecurity で通知が来た（設計の前提が変わる。mode.rs の doc も直す）: {by_kernel:?}"
+    );
     eprintln!(
         "実測: 古い WRITE_DAC のハンドルで DACL を戻す = 可。FILE_NOTIFY_CHANGE_SECURITY の通知: パス(SetNamedSecurityInfoW)={by_path:?} ハンドル(SetKernelObjectSecurity)={by_kernel:?} ハンドル(SetSecurityInfo)={via_advapi:?} → {by_advapi:?}"
     );
@@ -938,7 +961,6 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
             "古いハンドルで戻した形"
         );
     }
-    drop(old);
     // (d)(e) ファイル（`a.txt`）の DACL を、パスで・古いハンドル（`SetKernelObjectSecurity`）で
     // 変えたときの通知。
     let file = root.join("a.txt");
@@ -958,9 +980,25 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
     std::thread::sleep(Duration::from_millis(300));
     let file_written = set_dacl_on_handle(old_file.0, &file_sddl);
     let file_by_kernel = wait(rx);
+    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
+    std::thread::sleep(Duration::from_millis(300));
     drop(old_file);
+    let file_after_close = wait(rx);
     eprintln!(
-        "実測: ファイルの DACL の変更の通知: パス(SetFileSecurityW)={file_by_path:?} 古いハンドル(SetKernelObjectSecurity)={file_written:?} → {file_by_kernel:?}"
+        "実測: ファイルの DACL の変更の通知: パス(SetFileSecurityW)={file_by_path:?} 古いハンドル(SetKernelObjectSecurity)={file_written:?} → {file_by_kernel:?} 閉じたとき={file_after_close:?}"
+    );
+    assert!(
+        file_by_path.is_some(),
+        "パスの SetFileSecurityW で通知が来ない"
+    );
+    assert!(file_written.is_ok(), "{file_written:?}");
+    assert!(
+        file_by_kernel.is_none(),
+        "ハンドルの SetKernelObjectSecurity で通知が来た（設計の前提が変わる）: {file_by_kernel:?}"
+    );
+    assert!(
+        file_after_close.is_some(),
+        "ファイルの古いハンドルを閉じても通知が来ない"
     );
 
     // (2) ふつうの書き込みで FILE_NOTIFY_CHANGE_ATTRIBUTES の通知が来るか【要実測】。
@@ -1801,14 +1839,58 @@ fn scan_refuses_a_directory_occupying_the_marker_name() {
     let root = dir.path().join("root");
     make_tree(&root);
     std::fs::create_dir(root.join("logs").join(MARKER_NAME)).unwrap();
+    // 綴り違い（大文字）。OS は同じ名前に解決するので、印を置けない（Fable M-1 の (a)）。
+    let upper = MARKER_NAME.to_ascii_uppercase();
+    std::fs::create_dir(root.join("data").join("deep").join(&upper)).unwrap();
     let pinned = pinned(&root);
     let refusal = pinned.scan_tree(&no_stop, &mut |_| {}).unwrap_err();
-    assert_eq!(
-        refusal,
-        ScanRefusal::Problems(vec![TreeProblem::MarkerOccupied {
-            path: pinned.final_path().join("logs").join(MARKER_NAME)
-        }])
+    let ScanRefusal::Problems(mut problems) = refusal else {
+        panic!("{refusal:?}");
+    };
+    problems.sort_by_key(|p| p.path().to_path_buf());
+    let mut expected = vec![
+        TreeProblem::MarkerOccupied {
+            path: pinned.final_path().join("logs").join(MARKER_NAME),
+        },
+        TreeProblem::MarkerOccupied {
+            path: pinned.final_path().join("data").join("deep").join(&upper),
+        },
+    ];
+    expected.sort_by_key(|p| p.path().to_path_buf());
+    assert_eq!(problems, expected);
+}
+
+/// Fable M-1: `remove` は綴り違いの名前（`.BANTO-SAFE-ROOT`）でも、OS が印の席に解決する物なら
+/// 消さない（ファイル ID で見分ける）。管理者でなくても走る。
+#[test]
+fn remove_refuses_the_marker_by_identity_regardless_of_spelling() {
+    use crate::guard::KnownFolders;
+    use crate::root::{open_root, Mode, RootSpec};
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join(MARKER_NAME), b"").unwrap();
+    std::fs::write(tree.join("other.txt"), b"x").unwrap();
+    let root = open_root(&RootSpec {
+        expected: tree.clone(),
+        known: KnownFolders::default(),
+        owners: vec![me()],
+        create_access: None,
+        create: false,
+        mode: Mode::Guarded,
+    })
+    .unwrap();
+    let upper = MARKER_NAME.to_ascii_uppercase();
+    assert!(
+        root.as_dir().remove(&upper).is_err(),
+        "綴り違いで印を消せた"
     );
+    assert!(root.as_dir().remove(MARKER_NAME).is_err());
+    assert!(tree.join(MARKER_NAME).exists());
+    assert_eq!(root.as_dir().remove("other.txt"), Ok(true));
+    let report = root.as_dir().remove_where(&|_| true).unwrap();
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert!(tree.join(MARKER_NAME).exists());
 }
 
 /// Codex P1: 2 周目は**すべての**フォルダ（印の無かった `logs`・`deep`・空の `data\empty` を含む）に
@@ -1931,4 +2013,65 @@ fn close_tree_aborts_when_a_dir_is_reparsed_right_after_it_is_tightened() {
         outside_before,
         "外が変わった"
     );
+}
+
+/// Fable M-1 の (b): 設定モードで利用者が置いた綴り違いのファイル `logs\.BANTO-SAFE-ROOT` は、
+/// 2 周目で**印として**扱われる（印の記述子・利用者の ACE なし。綴りで見ると普通のファイルとして
+/// 上書きされ、緩めると利用者が消せる印になっていた）。利用者がその偽の印を DELETE で握って
+/// いれば 2 周目は `Busy` で止まる。緩めた後も利用者は綴り違いの名前で消せない。
+#[test]
+fn close_tree_treats_a_differently_spelled_marker_as_the_marker() {
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ};
+    if !is_elevated_admin() {
+        eprintln!("skip: 所有者を移すのは管理者だけ（CI で確かめる）");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    make_tree(&root);
+    let upper = MARKER_NAME.to_ascii_uppercase();
+    let fake = root.join("logs").join(&upper);
+    std::fs::write(&fake, b"fake").unwrap();
+    crate::root::win_tests::set_owner_to_me(&fake);
+    let mode = mode();
+    let pinned = pinned(&root);
+    assert_eq!(
+        pinned.scan_tree(&no_stop, &mut |_| {}),
+        Ok(ScanReport {
+            examined: TREE_OBJECTS + 1
+        })
+    );
+    // 偽の印を DELETE で握っている間は Busy で止まる（締めた分は緩め直せる）。
+    let holder = open_dir(&fake, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ).unwrap();
+    let abort = pinned.close_tree(&mode, &no_stop, &mut |_| {}).unwrap_err();
+    assert_eq!(
+        abort.reason,
+        AbortReason::Problem(TreeProblem::Busy {
+            path: pinned.final_path().join("logs").join(MARKER_NAME),
+            os_error: 32
+        })
+    );
+    pinned.relax_tree(&mode, &mut |_| {}).unwrap();
+    drop(holder);
+    // 放せば締まり、偽の印は印の記述子になる（`logs` に新しい印は作られない = 同じ物）。
+    let progress = pinned.close_tree(&mode, &no_stop, &mut |_| {}).unwrap();
+    assert_eq!(progress.written, CLOSED_OBJECTS, "{progress:?}");
+    let fake_security = inspect_file(&fake).unwrap().unwrap();
+    assert!(exposure(&fake_security).is_empty(), "{fake_security:?}");
+    assert_eq!(fake_security.dacl.owner, ADMINISTRATORS_SID);
+    assert_eq!(std::fs::read_dir(root.join("logs")).unwrap().count(), 2);
+    every_dir_has_a_marker(&root);
+    pinned.relax_tree(&mode, &mut |_| {}).unwrap();
+    expect_tree_shape(&root, mode.setting());
+    as_limited_user(|| {
+        for name in [upper.as_str(), MARKER_NAME] {
+            assert_eq!(
+                std::fs::remove_file(root.join("logs").join(name))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(ACCESS_DENIED),
+                "{name}"
+            );
+        }
+    });
 }

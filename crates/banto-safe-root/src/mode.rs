@@ -62,13 +62,21 @@
 //! - `PinnedDir::ensure_marker`（管理するフォルダ。締めた後に `open_managed` が作った物のため）は
 //!   同じ部品で置き、直後に握ったハンドルでそのフォルダの reparse 属性を読み直して、印を置く前に
 //!   reparse にされていたら [`MarkerError::DirIsReparse`] で止める。
+//! - 印は**綴りではなく OS の名前の解決とファイル ID**で見分ける（Fable レビュー M-1）: 各フォルダで
+//!   `MARKER_NAME` を相対に開いて得た物の ID を、列挙した子の ID と比べる。利用者が
+//!   `.BANTO-SAFE-ROOT` と綴ったフォルダ・ファイルを置いても、フォルダなら 1 周目が
+//!   `MarkerOccupied` で断り、ファイルなら 2 周目が印として扱う（利用者の ACE を付けない）。
+//!   `ManagedDir::remove` も綴り違いの名前で印を消さない。
 //! - 緩めても印の記述子は変えない。印は crate からは消さない（uninstall の昇格ヘルパーが消す）。
 //!
 //! **残る窓**: 締める前に開いた古いハンドルのうち、`WRITE_DAC`（DACL を戻す）・`FILE_WRITE_DATA`
 //! （ファイルの中身）・`DELETE`（消す・木の外へ移す）は印では塞がらない（設計 §2.9 の表。ID で開いた
-//! 物の本当のパスの確かめと、パスで渡す直前の `recheck` で狭める）。実測では、ハンドル経由の
-//! `SetKernelObjectSecurity` による DACL の変更は `ReadDirectoryChangesW(FILE_NOTIFY_CHANGE_SECURITY)`
-//! に通知されない（ハンドルを閉じるまで）ので、見張りはその筋を捕まえられない。
+//! 物の本当のパスの確かめと、パスで渡す直前の `recheck` で狭める）。実測（手元 Windows 11 26300、
+//! テスト `an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_is_measured`
+//! が assert で固定）では、ハンドル経由の `SetKernelObjectSecurity` による DACL の変更は
+//! `ReadDirectoryChangesW(FILE_NOTIFY_CHANGE_SECURITY)` に**その場では通知されず、そのハンドルを
+//! 閉じたときに遅れて通知される**（パスの `SetNamedSecurityInfoW` は閉じて戻るので直ちに来る）。
+//! 見張りは、古いハンドルを握り続ける相手には閉じるまで反応できない。
 //!
 //! **既知の制限**: 一度でも運用モードにした木では、すべてのフォルダに印があり、設定モードの
 //! 利用者はフォルダをフォルダごと消せない（中身は消せる）。tstore の日次ファイル・LogPrune・

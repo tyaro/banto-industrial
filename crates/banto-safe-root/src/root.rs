@@ -281,8 +281,9 @@ pub enum EntryKind {
 }
 
 /// [`ManagedDir::remove_where`] の対象の候補か（純関数）: ファイル・reparse point でない・
-/// 印のファイル（[`crate::mode::MARKER_NAME`]）でない・`pred` が名前を選ぶ。候補でも、消す前に
-/// 開いたハンドルで属性を読み直す（[`ManagedDir::remove`]）。
+/// 印のファイル（[`crate::mode::MARKER_NAME`] の綴り。前さばきで、本当の守りは
+/// [`ManagedDir::remove`] がファイルの同一性で断ること）でない・`pred` が名前を選ぶ。候補でも、
+/// 消す前に開いたハンドルで属性を読み直す（[`ManagedDir::remove`]）。
 pub fn is_removal_candidate(entry: &Entry, pred: &dyn Fn(&str) -> bool) -> bool {
     entry.kind == EntryKind::File
         && entry.reparse_tag.is_none()
@@ -480,8 +481,9 @@ impl ManagedDir {
     /// [`SafeRootError::Refused`]（一覧の属性は信じない。Fable B-5）。消すのは開いたハンドルで
     /// （`FileDispositionInfoEx`、POSIX）。
     pub fn remove(&self, name: &str) -> Result<bool> {
-        // 印のファイル（#623 PR-1c）はサービス自身の掃除でも消さない（名前で断る。消えると
-        // 古いハンドルでフォルダを reparse point にできるようになる）。
+        // 印のファイル（#623 PR-1c）はサービス自身の掃除でも消さない（消えると古いハンドルで
+        // フォルダを reparse point にできるようになる）。綴りはここで、同一性（綴り違いで同じ物を
+        // 指す名前）は Guarded の `win::remove` が開いた後のファイル ID で断る（Fable M-1）。
         if name == crate::mode::MARKER_NAME {
             return Err(invalid_name());
         }

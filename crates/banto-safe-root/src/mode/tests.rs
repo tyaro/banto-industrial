@@ -431,6 +431,7 @@ fn tree_problem_reports_its_path() {
         },
         TreeProblem::Encrypted { path: path.clone() },
         TreeProblem::TooDeep { path: path.clone() },
+        TreeProblem::MarkerOccupied { path: path.clone() },
     ];
     for problem in problems {
         assert_eq!(problem.path(), path.as_path());
