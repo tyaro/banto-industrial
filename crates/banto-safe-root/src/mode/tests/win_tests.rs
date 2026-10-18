@@ -92,9 +92,7 @@ fn is_marker_slot(path: &Path) -> bool {
         return false;
     };
     let parent = pinned(parent);
-    let crate::acl::imp::MarkerProbe::Found(slot) =
-        crate::acl::imp::probe_marker(parent.raw_handle()).unwrap()
-    else {
+    let Some(slot) = crate::acl::imp::marker_entry(parent.raw_handle()).unwrap() else {
         return false;
     };
     let own = open_dir(
@@ -103,7 +101,7 @@ fn is_marker_slot(path: &Path) -> bool {
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     )
     .unwrap();
-    crate::acl::imp::file_id_of(own.0).unwrap() == slot.id
+    crate::acl::imp::file_id_of(own.0).unwrap() == slot.file_id
 }
 
 /// 木の全体が `access` の形（フォルダは OICI、ファイルは継承無し、所有者 Administrators、印の
@@ -2212,5 +2210,82 @@ fn relax_and_reset_record_an_unreadable_marker_and_process_the_siblings() {
         }
         // 片付け（親の FILE_DELETE_CHILD で消せる）。
         std::fs::remove_file(&marker).unwrap();
+    }
+}
+
+/// オーナーレビュー P2（2 件目）: 印（綴り違い `.BANTO-SAFE-ROOT`）を呼び出し元に拒否の DACL に
+/// しておき、親の列挙の後・ID で開く前（`BEFORE_CHILD_OPEN`）に所有者が許可へ変える。後段の
+/// オープンは成功するが、席の同一性は親の列挙で解いているので印として扱われ、`relax_tree`・
+/// `reset_acl(Tree)` の後も印の記述子のまま（利用者の ACE なし・記録なし）。昇格した管理者（CI）。
+#[test]
+fn relax_and_reset_keep_the_marker_descriptor_when_its_dacl_opens_late() {
+    if !is_elevated_admin() {
+        eprintln!("skip: 所有者を移すのは管理者だけ（CI で確かめる）");
+        return;
+    }
+    let mode = mode();
+    let upper = MARKER_NAME.to_ascii_uppercase();
+    for which in ["relax", "reset"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        make_tree(&root);
+        // 設定モードで利用者が置いた綴り違いの印（所有者は利用者）。
+        let fake = root.join("logs").join(&upper);
+        std::fs::write(&fake, b"fake").unwrap();
+        crate::root::win_tests::set_owner_to_me(&fake);
+        let pinned = pinned(&root);
+        pinned.close_tree(&mode, &no_stop, &mut |_| {}).unwrap();
+        assert!(exposure(&inspect_file(&fake).unwrap().unwrap()).is_empty());
+        // 呼び出し元（管理者）を拒否 → 照会のあと、開く直前に許可へ。
+        crate::acl::tests::windows::set_dacl_sddl(&fake, DENY_ADMINS_SDDL);
+        let fake_for_hook = fake.clone();
+        let flipped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipped_for_hook = flipped.clone();
+        crate::acl::imp::BEFORE_CHILD_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |child: &Path| {
+                if child
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(MARKER_NAME))
+                    && child
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .is_some_and(|n| n == "logs")
+                {
+                    crate::acl::tests::windows::set_dacl_sddl(
+                        &fake_for_hook,
+                        "D:P(A;;FA;;;BA)(A;;FA;;;SY)",
+                    );
+                    flipped_for_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        });
+        let result = if which == "relax" {
+            pinned
+                .relax_tree(&mode, &mut |_| {})
+                .map(|r| (r.written, r.skipped.len()))
+                .map_err(|e| format!("{e:?}"))
+        } else {
+            pinned
+                .reset_acl(mode.setting(), crate::acl::Recurse::Tree)
+                .map(|s| (0, s.denied.len() + s.reparse.len() + s.hardlink.len()))
+                .map_err(|e| format!("{e:?}"))
+        };
+        crate::acl::imp::BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            flipped.load(std::sync::atomic::Ordering::SeqCst),
+            "{which}: フックが動いていない"
+        );
+        let (written, skipped) = result.unwrap_or_else(|e| panic!("{which}: {e}"));
+        assert_eq!(skipped, 0, "{which}: 記録された");
+        if which == "relax" {
+            assert_eq!(written, CLOSED_OBJECTS, "{which}");
+        }
+        let after = inspect_file(&fake).unwrap().unwrap();
+        assert!(
+            exposure(&after).is_empty(),
+            "{which}: 印に利用者の ACE が付いた: {after:?}"
+        );
+        assert_eq!(after.dacl.owner, ADMINISTRATORS_SID, "{which}");
+        expect_tree_shape(&root, mode.setting());
     }
 }

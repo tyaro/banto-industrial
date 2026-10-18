@@ -1921,53 +1921,135 @@ pub(crate) mod imp {
         Ok(info.FileId.Identifier)
     }
 
-    /// `dir`（開いているフォルダのハンドル）の中で、OS が [`crate::mode::MARKER_NAME`] の名前に
-    /// 解決する物（印の席。[`probe_marker`]）。
-    pub(crate) struct MarkerSlot {
-        /// 128 ビットのファイル ID（列挙の子と比べて「これが印の席か」を決める）。
-        pub(crate) id: [u8; 16],
-        pub(crate) is_dir: bool,
-        /// 本当のパス（実際の綴り。理由の表示用）。
-        pub(crate) path: std::path::PathBuf,
+    /// `dir`（開いているフォルダのハンドル）を、**同じオブジェクト**として開き直す（`NtCreateFile` の
+    /// 空の名前 + `RootDirectory`。パスを使わない）。列挙の位置はファイルオブジェクトに付くので、
+    /// 名前のマスクつきの照会（[`marker_entry`]）を元のハンドルの列挙と混ぜないために使う。
+    fn reopen_dir_for_listing(dir: HANDLE) -> Result<OwnedHandle> {
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        };
+        use windows_sys::Win32::Foundation::{
+            RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, SYNCHRONIZE,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let empty = UNICODE_STRING {
+            Length: 0,
+            MaximumLength: 0,
+            Buffer: std::ptr::null_mut(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: dir,
+            ObjectName: &empty,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: 全フィールドが整数・ポインタの構造体。
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir` は開いているフォルダのハンドル。空の名前はそのオブジェクト自身を開く。
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE
+                    | FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_FOR_BACKUP_INTENT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: NTSTATUS を Win32 のエラーに写すだけ。
+            return Err(api("NtCreateFile(self)", unsafe {
+                RtlNtStatusToDosError(status)
+            }));
+        }
+        Ok(OwnedHandle(handle))
     }
 
-    /// `dir` の中の印の席を、**名前の綴りではなく OS の名前の解決**で探す（Fable レビュー
-    /// M-1）: `MARKER_NAME` を相対に属性だけで開き（`OBJ_CASE_INSENSITIVE`。大文字小文字の
-    /// 折り畳みは NTFS に任せる - `eq_ignore_ascii_case` では非 ASCII の折り畳みを再現できない）、
-    /// その物のファイル ID と種類を返す。無ければ `None`。木を歩く部品は、列挙した子の ID が
-    /// この ID と同じかで「印の席」を見分ける（綴りが `.BANTO-SAFE-ROOT` でも同じ物なら印、
-    /// 大文字小文字を区別するフォルダで綴りだけ同じ別の物なら印ではない）。
-    pub(crate) fn probe_marker(dir: HANDLE) -> Result<MarkerProbe> {
-        let handle =
-            match child_relative_handle(dir, crate::mode::MARKER_NAME, ChildHow::OpenAttributes) {
-                Ok(Some(handle)) => handle,
-                Ok(None) => return Ok(MarkerProbe::Absent),
-                // 開けない席は「その子の問題」（オーナーレビュー P2）。木を歩く側は、列挙でその子を
-                // ID で開いたときの `Denied`／`Busy` として記録・中断の方針（`OnSkip`）に載せる。
-                Err(SafeRootError::Io {
-                    os_error: Some(5 | 32 | 33),
-                    ..
-                }) => return Ok(MarkerProbe::Unreadable),
-                Err(error) => return Err(error),
-            };
-        let info = info_of(handle.raw())?;
-        Ok(MarkerProbe::Found(MarkerSlot {
-            id: file_id_of(handle.raw())?,
-            is_dir: info.is_dir,
-            path: final_path_of(handle.raw())?,
+    /// `dir` の中で、**OS が [`crate::mode::MARKER_NAME`] の名前に解決する子**（印の席）を、
+    /// **その子を開かずに**得る（Fable レビュー M-1・オーナーレビュー P2）: 親を開き直した
+    /// ハンドルに `NtQueryDirectoryFile` を名前のマスク `MARKER_NAME`・1 件だけで問い合わせる。
+    /// 名前の照合は OS のもの（大文字小文字の折り畳み・フォルダごとの大文字小文字の区別）で、
+    /// 要るのは親の `FILE_LIST_DIRECTORY` だけ - **子の DACL では拒否されない**ので、
+    /// 「席を開けないので同一性が分からない」状態が無い。返すのは 128 ビットのファイル ID・
+    /// 列挙の時点の属性・実際の綴り。木を歩く部品は、列挙した子の ID がこの ID と同じかで
+    /// 印の席を見分ける（綴りが `.BANTO-SAFE-ROOT` でも同じ物なら印、大文字小文字を区別する
+    /// フォルダで綴りだけ同じ別の物なら印ではない）。無ければ `None`。
+    pub(crate) fn marker_entry(dir: HANDLE) -> Result<Option<DirEntryRaw>> {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FileIdExtdDirectoryInformation, NtQueryDirectoryFile,
+        };
+        use windows_sys::Win32::Foundation::{
+            RtlNtStatusToDosError, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ID_EXTD_DIR_INFO;
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let listing = reopen_dir_for_listing(dir)?;
+        let name: Vec<u16> = crate::mode::MARKER_NAME.encode_utf16().collect();
+        let mask = UNICODE_STRING {
+            Length: (name.len() * 2) as u16,
+            MaximumLength: (name.len() * 2) as u16,
+            Buffer: name.as_ptr() as *mut u16,
+        };
+        // 8 バイト境界のバッファ（1 件 + 名前）。
+        let mut buffer = vec![0u64; 1024];
+        // SAFETY: 全フィールドが整数・ポインタの構造体。
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `listing` は FILE_LIST_DIRECTORY を持つ、このためだけに開いたハンドル（マスクは
+        // このハンドルに固定され、元のハンドルの列挙には影響しない）。`buffer` は長さつき。
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                listing.raw(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &mut status_block,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                FileIdExtdDirectoryInformation,
+                true,
+                &mask,
+                true,
+            )
+        };
+        if status == STATUS_NO_SUCH_FILE || status == STATUS_NO_MORE_FILES {
+            return Ok(None);
+        }
+        if status < 0 {
+            // SAFETY: NTSTATUS を Win32 のエラーに写すだけ。
+            return Err(api("NtQueryDirectoryFile", unsafe {
+                RtlNtStatusToDosError(status)
+            }));
+        }
+        // SAFETY: 成功したので先頭に 1 件の `FILE_ID_EXTD_DIR_INFO` がある（バッファ内）。
+        let entry = unsafe { &*(buffer.as_ptr() as *const FILE_ID_EXTD_DIR_INFO) };
+        let name_len = entry.FileNameLength as usize / 2;
+        // SAFETY: `FileName` は可変長で `FileNameLength` バイト続く（バッファ内）。
+        let name_u16 = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_len) };
+        drop(listing);
+        Ok(Some(DirEntryRaw {
+            name: String::from_utf16_lossy(name_u16),
+            file_id: entry.FileId.Identifier,
+            attributes: entry.FileAttributes,
+            reparse_tag: entry.ReparsePointTag,
+            len: u64::try_from(entry.EndOfFile).unwrap_or(0),
         }))
-    }
-
-    /// [`probe_marker`] の結果。
-    pub(crate) enum MarkerProbe {
-        /// 席に物が無い。
-        Absent,
-        /// 席の物（ID・種類・本当のパス）。
-        Found(MarkerSlot),
-        /// 席の物を開けない（拒否・使用中）。席の同一性は分からないので、木を歩く側は印として
-        /// 扱わず、列挙でその子を開いたときの `Denied`／`Busy` に任せる（`OnSkip` のとおり記録か
-        /// 中断。`relax_tree`・`reset_acl` は兄弟と親の処理を続ける）。
-        Unreadable,
     }
 
     /// [`place_marker`] が置けなかった理由。
@@ -2289,16 +2371,24 @@ pub(crate) mod imp {
         }
         // 印の席を OS の名前の解決で探す（綴りでは比べない。Fable レビュー M-1）。厳しい確かめ
         // （1 周目・2 周目）では、席をフォルダが塞いでいれば印を置けないので断る。
-        // 席をフォルダが塞いでいれば `MarkerOccupied`（厳しい確かめ）。`Record`（1 周目）では
-        // 記録して**残りの子の列挙は続ける**（1 周目は問題を全部集める。オーナーレビュー P2）。
-        // 席を開けないときは印として扱わず、列挙でその子を開いたときの `Denied`／`Busy` に任せる。
-        let marker_id = match probe_marker(dir_handle)? {
-            MarkerProbe::Found(slot) if walk.strict && slot.is_dir => {
-                walk.problem(TreeProblem::MarkerOccupied { path: slot.path })?;
+        // 印の席（OS が `MARKER_NAME` に解決する子）を、子を開かずに親の列挙で解く（綴りでは
+        // 比べない。席の DACL に依らないので、開けない席を後から開けるようにされても同一性を
+        // 見失わない。Fable M-1・オーナーレビュー P2）。席をフォルダが塞いでいれば
+        // `MarkerOccupied`（厳しい確かめ）。`Record`（1 周目）では記録して残りの子の列挙を続ける。
+        let marker_id = match marker_entry(dir_handle)? {
+            Some(entry)
+                if walk.strict
+                    && entry.attributes
+                        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+                        != 0 =>
+            {
+                walk.problem(TreeProblem::MarkerOccupied {
+                    path: display.join(&entry.name),
+                })?;
                 None
             }
-            MarkerProbe::Found(slot) => Some(slot.id),
-            MarkerProbe::Absent | MarkerProbe::Unreadable => None,
+            Some(entry) => Some(entry.file_id),
+            None => None,
         };
         enumerate_dir(dir_handle, &mut |entry| {
             visit_child(
@@ -2365,7 +2455,7 @@ pub(crate) mod imp {
         Ok(())
     }
 
-    /// `is_marker`: この子が親の印の席（[`probe_marker`] の ID と同じ物）か。
+    /// `is_marker`: この子が親の印の席（[`marker_entry`] の ID と同じ物）か。
     fn visit_child(
         walk: &mut Walk<'_>,
         parent: HANDLE,
