@@ -490,16 +490,17 @@ impl ServerProgram {
         *self.record.lock().unwrap_or_else(|p| p.into_inner()) = record;
     }
 
-    /// **緩め始める前の最後の仕事**（設計 §3.2 の 5）: 日次ログを閉じ（以後 `write_line` は
-    /// 何もしない）、書き出しを待ち、標準出力・標準エラー出力の向け直しを外して NUL へ向ける。
+    /// **緩め始める前の最後の仕事**（設計 §3.2 の 5）: 書き出しを待ち（向け直しの残りを流しきり）、日次ログを閉じ（以後 `write_line` は
+    /// 何もしない）、標準出力・標準エラー出力の向け直しを外して NUL へ向ける。
     /// これ以後、この本体は `say` も `println!` もしない（しても NUL へ行く）。
     fn close_log(&self, log: Option<&Arc<Mutex<server_host::ServerLog>>>, wait: Duration) {
+        // 先に向け直しを流しきる（`println!` の残りを `ServerLog` がまだ開いている間に書かせる）。
+        self.flush(wait);
         if let Some(log) = log {
             if let Ok(mut log) = log.lock() {
                 log.close();
             }
         }
-        self.flush(wait);
         *self.record.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if let Err(err) = crate::console::redirect_stdio_to_nul() {
             // ここでは何も書けない（書いてはいけない）。標準ハンドルは元に戻っており、

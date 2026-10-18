@@ -543,6 +543,36 @@ fn assert_relaxed_last_and_silent(lines: &[String]) {
     assert_eq!(relax, lines.len() - 1, "緩め始めた後に行がある: {lines:#?}");
 }
 
+/// `close_log` は**向け直しを流しきってから**日次ログを閉じる（Codex の指摘 P2）。閉じる前に
+/// パイプに残っていた出力（`flush` のコールバックが `StdioRedirect::finish` で流す分）がログに
+/// 残り、閉じた後の `write_line` は行を足さない。順を戻す（閉じてから流す）とこのテストが落ちる。
+#[test]
+fn close_log_drains_the_redirect_before_closing_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    let trace: Trace = Arc::default();
+    let program = program(&layout, &trace, FakeAcl::new(trace.clone()));
+    let log = Arc::new(Mutex::new(
+        server_host::ServerLog::open(dir.path().join("logs"), Arc::new(banto_tstore::SystemClock))
+            .unwrap(),
+    ));
+    let path = log.lock().unwrap().current_path();
+    let for_flush = log.clone();
+    program.attach_log(
+        Box::new(move |_| {
+            for_flush.lock().unwrap().write_line("残っていた出力");
+        }),
+        None,
+    );
+    program.close_log(Some(&log), Duration::from_secs(1));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("残っていた出力"), "{text}");
+    // 閉じた後は増えない。
+    log.lock().unwrap().write_line("閉じた後の行");
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, text);
+}
+
 // --- 判定表 ----------------------------------------------------------------------------
 
 /// 運用モードへ → 収集 → SCM の STOP = 設定モードへ。Running の報告は 1 回、締め終わって
