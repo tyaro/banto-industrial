@@ -515,8 +515,9 @@ pub trait ElevOps {
     fn open_child(&self, parent: &Self::Pinned, name: &str)
         -> Result<Option<Self::Pinned>, String>;
     /// ルート `root`（本当のパス。既にあること）の DB の A1 の mutex を、**診断ファイルを
-    /// 書かずに**取る（`chronogazer_core::instance_lock::mutex_name_for_db` →
-    /// `banto_instance_lock::try_hold_named_mutex`。#623 PR-3、設計 §3.5）。取れれば
+    /// 書かずに**取る（`chronogazer_core::instance_lock::mutex_name_for_root`（ルートの
+    /// 本当のパス + DB の名前。末端は解かない）→ `banto_instance_lock::try_hold_named_mutex`。
+    /// #623 PR-3、設計 §3.5）。取れれば
     /// `Some(持ち物)`（drop まで持つ）、サービス・デスクトップのエンジンが持っていれば
     /// `None`（elev は何も書かずに断る）。
     fn hold_instance_mutex(&self, root: &Path) -> Result<Option<Box<dyn std::any::Any>>, String>;

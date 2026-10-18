@@ -103,10 +103,11 @@ use chronogazer_core::server_service::{
     acl_changed_line, after_close_abort, after_marker_error, backup_wait_line, close_abort_line,
     exit_after_relax_back, exit_after_scan_refusal, external_data_dir_line, install_result_lines,
     install_with, mode_switch_begin_line, mode_switch_done_line, no_reader_line, parse_start_args,
-    redirection_guard_line, relax_begin_line, relax_only_begin_line, scan_refused_lines,
-    service_exit_for, service_flush_wait, service_running_line, service_starting_line,
-    service_stop_budget, service_stop_done_line, service_stop_hint_line, service_stop_reason_line,
-    service_stopped_line, stop_progress_allowed, stop_signal_label, tampered_line, uninstall_lines,
+    redirection_guard_line, relax_allowed_after_shutdown, relax_begin_line, relax_only_begin_line,
+    scan_refused_lines, service_exit_for, service_flush_wait, service_running_line,
+    service_starting_line, service_stop_budget, service_stop_done_line, service_stop_hint_line,
+    service_stop_reason_line, service_stopped_line, shutdown_incomplete_keeps_tight_line,
+    stop_progress_allowed, stop_signal_label, tampered_line, uninstall_lines,
     unknown_start_arg_line, StartArgs, INSTALL_USER_SID_VALUE, SERVICE_EXPECTED_STOP,
     SERVICE_LOG_FLUSH_WAIT,
 };
@@ -356,6 +357,10 @@ pub(crate) struct ServerProgram {
     flush: Mutex<Option<Flush>>,
     /// ログを開いた後の、パイプを通さない記録先（[`ServiceProgram::log_error`]）。
     record: Mutex<Option<LineSink>>,
+    /// テスト専用: STOP の後始末の結果を**時間切れ**に偽る（Codex の指摘 P1 の「緩めない」
+    /// 経路を、本物のエンジンの予算を使い切らずに踏むため）。
+    #[cfg(test)]
+    fake_stop_timed_out: AtomicBool,
 }
 
 /// [`ServerProgram::new`] に渡す部品の組（本番とテストで差し替える物）。
@@ -449,6 +454,8 @@ impl ServerProgram {
             recheck_interval: parts.recheck_interval,
             flush: Mutex::new(None),
             record: Mutex::new(None),
+            #[cfg(test)]
+            fake_stop_timed_out: AtomicBool::new(false),
         }
     }
 
@@ -896,10 +903,32 @@ impl ServerProgram {
                     }
                 }));
                 // 2〜3. エンジンを止め、DB を閉じる（`run\endpoint.json` も消す）。
+                #[cfg(not(test))]
                 let summary = runtime.block_on(server.shutdown(budget));
+                #[cfg(test)]
+                let summary = {
+                    let mut summary = runtime.block_on(server.shutdown(budget));
+                    if self.fake_stop_timed_out.load(Ordering::SeqCst) {
+                        summary.report.timed_out = true;
+                    }
+                    summary
+                };
                 self.report_shutdown(&summary, Some(notice.signal));
                 // 4. 見張りと定期の確かめ直しを止める。
                 watchers.stop();
+                // 後始末が予算内に終わらなかった（pool を閉じていない・listener を止める
+                // タスクが残っている）なら**緩めない**（Codex の指摘 P1: エンジンの資源が残った
+                // まま利用者の書き込みを戻すと、約束 2 と同時アクセスの防ぎに反する）。締めた
+                // まま 5 で終わり、デスクトップの案内（relax-only）で戻す。
+                if !relax_allowed_after_shutdown(&summary.report) {
+                    self.say(&shutdown_incomplete_keeps_tight_line());
+                    let exit = service_exit_for(EXIT_LEFT_TIGHT);
+                    self.say(&service_stopped_line(exit));
+                    self.flush(SERVICE_LOG_FLUSH_WAIT);
+                    drop(server);
+                    drop(held);
+                    return exit;
+                }
                 // 5. 最後の行 → ログを閉じ、向け直しを外す。
                 self.say(&relax_begin_line());
                 self.close_log(log.as_ref(), SERVICE_LOG_FLUSH_WAIT);

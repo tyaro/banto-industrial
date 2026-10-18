@@ -620,6 +620,50 @@ async fn runs_as_a_service_tightens_first_and_relaxes_last_on_scm_stop() {
     assert!(stored_row_count(&layout).await > 0, "行が残っていない");
 }
 
+/// Codex の指摘 P1（#623 PR-3）: STOP の後始末が予算内に終わらなかった（`timed_out`。DB の
+/// pool や listener のタスクが残りうる）なら、**緩めずに**締めたまま Stopped(5)。「緩め始めます」
+/// の行も `acl:relax` も出ない（反証は上の `runs_as_a_service_tightens_first_and_relaxes_last_on_scm_stop`:
+/// 時間切れでなければ緩めて 0）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_shutdown_on_scm_stop_keeps_the_tree_tight_with_5() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let program = program(&layout, &trace, acl);
+    program.fake_stop_timed_out.store(true, Ordering::SeqCst);
+    let running = spawn(program);
+    wait_running(&running).await;
+    assert!(layout.endpoint_file().exists());
+
+    running.send(ScmControlKind::Stop);
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Specific(5)));
+    let phases = phases(&seen);
+    assert!(has_phase(&seen, ServicePhase::StopPending), "{phases:?}");
+    assert_eq!(
+        phases.last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Specific(5)))
+    );
+
+    let lines = snapshot(&trace);
+    assert!(
+        index_of(&lines, "ACL を緩めずに終わります").is_some(),
+        "{lines:#?}"
+    );
+    assert!(
+        index_of(&lines, "ACL を緩め始めます").is_none(),
+        "時間切れなのに緩め始めた: {lines:#?}"
+    );
+    assert!(
+        index_of(&lines, "acl:relax").is_none(),
+        "時間切れなのに緩めた: {lines:#?}"
+    );
+    // エンジンは止めている（endpoint.json は消えている）。残るのは ACL の形だけ。
+    assert!(!layout.endpoint_file().exists(), "エンジンを止めていない");
+}
+
 /// A1 の排他を別のプロセス（ここではデスクトップの印）が持っていれば、ログを開かず・
 /// ルートの下に何も作らず・ACL に触れずに Stopped(2)。Running は報告しない。
 #[test]

@@ -199,6 +199,21 @@ pub fn after_marker_error(error: &MarkerError) -> (bool, i32) {
     }
 }
 
+/// STOP の後始末の結果から、緩めてよいか（設計 §3.2 の 2。Codex の指摘 P1）: 後始末が予算内に
+/// 終わらなかった（`timed_out`。DB の pool を閉じていない・listener を止めるタスクが残っている
+/// ことがある）なら**緩めない**（締めたまま終了コード 5、`relax-only` で戻す）。最終の書き出し
+/// の失敗（`collect_stop_error`）は pool を閉じ終えているので緩めてよい（終了コードは 1）。
+pub fn relax_allowed_after_shutdown(report: &crate::engine::ShutdownReport) -> bool {
+    !report.timed_out
+}
+
+/// 後始末が予算内に終わらなかったので緩めずに終わるときの行。
+pub fn shutdown_incomplete_keeps_tight_line() -> String {
+    format!(
+        "{SERVER_LABEL}: 後始末が予算内に終わらなかった（DB や待ち受けが閉じ切っていない可能性）ため、ACL を緩めずに終わります（終了コード {EXIT_LEFT_TIGHT}。運用モードの形のまま。設定モードへは relax-only の開始で戻してください）"
+    )
+}
+
 /// 緩め直しの結果で終了コードを決める: 緩め直せたら `if_relaxed`、`Err` なら 5。
 pub fn exit_after_relax_back(relaxed: bool, if_relaxed: i32) -> i32 {
     if relaxed {
@@ -1070,6 +1085,30 @@ mod tests {
         assert!(!stop_progress_allowed(
             STOP_PROGRESS_LIMIT + Duration::from_millis(1)
         ));
+    }
+
+    /// Codex の指摘 P1: 後始末が時間切れなら緩めない。最終の書き出しの失敗だけなら緩める。
+    #[test]
+    fn relax_is_refused_after_a_timed_out_shutdown() {
+        use crate::engine::ShutdownReport;
+        let done = ShutdownReport {
+            completed: Vec::new(),
+            collect_stop_error: None,
+            timed_out: false,
+            listener_stop_abandoned: false,
+            budget: Duration::from_secs(15),
+        };
+        assert!(relax_allowed_after_shutdown(&done));
+        assert!(relax_allowed_after_shutdown(&ShutdownReport {
+            collect_stop_error: Some("x".to_string()),
+            listener_stop_abandoned: true,
+            ..done.clone()
+        }));
+        assert!(!relax_allowed_after_shutdown(&ShutdownReport {
+            timed_out: true,
+            ..done
+        }));
+        assert!(shutdown_incomplete_keeps_tight_line().contains("終了コード 5"));
     }
 
     /// 1 周目の一覧は最初の 20 件と総数。

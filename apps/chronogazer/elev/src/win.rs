@@ -49,10 +49,8 @@ struct HeldMutex(#[allow(dead_code)] banto_instance_lock::NamedMutexGuard);
 
 /// ルート `root` の DB の A1 の mutex を、診断ファイルを書かずに取る（[`ElevOps::hold_instance_mutex`]）。
 pub(crate) fn hold_instance_mutex(root: &Path) -> Result<Option<Box<dyn std::any::Any>>, String> {
-    let name = chronogazer_core::instance_lock::mutex_name_for_db(
-        &root.join(chronogazer_core::paths::DB_FILE_NAME),
-    )
-    .map_err(|err| err.to_string())?;
+    let name = chronogazer_core::instance_lock::mutex_name_for_root(root)
+        .map_err(|err| err.to_string())?;
     let held = banto_instance_lock::try_hold_named_mutex(&name).map_err(|err| err.to_string())?;
     Ok(held.map(|guard| Box::new(HeldMutex(guard)) as Box<dyn std::any::Any>))
 }

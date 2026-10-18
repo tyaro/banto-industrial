@@ -583,8 +583,6 @@ fn process_is_alive_impl(pid: u32) -> bool {
 ///   （ファイル作成前）に取った ID と作成後に取った ID が食い違うため。
 /// - 戻り値の 2 つ目は正規化したパス（診断メッセージ用）。
 pub fn path_scope_id(target: &Path) -> std::io::Result<(String, PathBuf)> {
-    use sha2::{Digest, Sha256};
-
     let file_name = target.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -606,14 +604,43 @@ pub fn path_scope_id(target: &Path) -> std::io::Result<(String, PathBuf)> {
     } else {
         parent.canonicalize()?.join(file_name)
     };
+    Ok((scope_id_of(&canonical), canonical))
+}
 
+/// [`path_scope_id`] の、**末端（ファイル名）を解かない**版（#623 PR-3 の Codex の指摘）。
+/// 親 `parent` だけを `canonicalize` し（作らない。無ければ `Err`）、`file_name` をそのまま
+/// 足して ID にする。
+///
+/// 握ったルート（辿らずに開いて本当のパスを確かめたフォルダ）の中の DB の範囲を決めるとき
+/// に使う。[`path_scope_id`] は既にあるファイルを**全体**で `canonicalize` するので、設定
+/// モードの木で書ける利用者がその瞬間だけ DB をシンボリックリンクにしておくと、リンクの
+/// 先の範囲の ID になり、後で普通のファイルに戻されるとデスクトップ（リンクの DB は断る
+/// ので、常に「親 + 名前」の範囲）と範囲が食い違って A1 が噛み合わなくなる。親が本当の
+/// パスで名前が決まった定数なら、末端を解かなくても同じ DB は同じ ID になる（デスクトップの
+/// 普通のファイルの DB では `canonicalize(全体)` = `canonicalize(親) + 名前`）。
+pub fn path_scope_id_in(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> std::io::Result<(String, PathBuf)> {
+    if file_name.is_empty() || Path::new(file_name).components().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ファイル名が 1 要素ではありません",
+        ));
+    }
+    let canonical = parent.canonicalize()?.join(file_name);
+    Ok((scope_id_of(&canonical), canonical))
+}
+
+/// 正規化したパスから ID を作る（[`path_scope_id`]・[`path_scope_id_in`] で同じ）。
+fn scope_id_of(canonical: &Path) -> String {
+    use sha2::{Digest, Sha256};
     let mut key = canonical.to_string_lossy().into_owned();
     if cfg!(windows) {
         key = key.to_lowercase();
     }
     let digest = Sha256::digest(key.as_bytes());
-    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    Ok((id, canonical))
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -645,6 +672,58 @@ mod tests {
             mode: banto_safe_root::Mode::Plain,
         })
         .unwrap()
+    }
+
+    /// #623 PR-3（Codex の指摘）: `path_scope_id_in`（末端を解かない）は、普通のファイルの DB では
+    /// `path_scope_id` と同じ ID。DB がシンボリックリンクのときは `path_scope_id` がリンクの先の
+    /// 範囲になるのに対し、`path_scope_id_in` は親 + 名前の範囲のまま（リンクを張れない環境では
+    /// その部分を飛ばす）。無い親は `Err`（作らない）。
+    #[test]
+    fn scope_id_in_ignores_the_leaf_link_and_matches_the_plain_file_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join("x.sqlite3");
+        let (plain_absent, _) = path_scope_id(&db).unwrap();
+        let (in_absent, canonical) = path_scope_id_in(&root, db.file_name().unwrap()).unwrap();
+        assert_eq!(in_absent, plain_absent, "無い DB");
+        assert_eq!(canonical.file_name().unwrap(), "x.sqlite3");
+        std::fs::write(&db, b"db").unwrap();
+        let (plain_present, _) = path_scope_id(&db).unwrap();
+        assert_eq!(plain_present, plain_absent, "あっても同じ");
+        assert_eq!(
+            path_scope_id_in(&root, db.file_name().unwrap()).unwrap().0,
+            plain_present
+        );
+        // 親が無ければ作らずに Err、名前が 1 要素でなければ Err。
+        assert!(path_scope_id_in(&dir.path().join("nope"), std::ffi::OsStr::new("x")).is_err());
+        assert!(!dir.path().join("nope").exists());
+        assert!(path_scope_id_in(&root, std::ffi::OsStr::new("a/b")).is_err());
+        assert!(path_scope_id_in(&root, std::ffi::OsStr::new("")).is_err());
+
+        // DB をリンクにすると、`path_scope_id` は先の範囲、`path_scope_id_in` は変わらない。
+        let elsewhere = dir.path().join("elsewhere.sqlite3");
+        std::fs::write(&elsewhere, b"other").unwrap();
+        std::fs::remove_file(&db).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&elsewhere, &db).is_ok();
+        #[cfg(not(windows))]
+        let linked = std::os::unix::fs::symlink(&elsewhere, &db).is_ok();
+        if !linked {
+            if std::env::var_os("CI").is_some() {
+                panic!("CI でシンボリックリンクを作れない");
+            }
+            eprintln!("skip: シンボリックリンクを作れない（権限）- CI で確かめる");
+            return;
+        }
+        let (followed, _) = path_scope_id(&db).unwrap();
+        let (unfollowed, _) = path_scope_id_in(&root, db.file_name().unwrap()).unwrap();
+        assert_ne!(
+            followed, plain_present,
+            "全体の canonicalize はリンクの先になる"
+        );
+        assert_eq!(unfollowed, plain_present, "末端を解かない版は変わらない");
+        assert_eq!(followed, path_scope_id(&elsewhere).unwrap().0);
     }
 
     /// #623 PR-3: `try_acquire_in` は握ったフォルダの中に診断ファイルを書き、排他の意味は
