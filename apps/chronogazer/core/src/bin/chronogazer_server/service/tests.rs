@@ -35,6 +35,8 @@ const WAIT_LIMIT: Duration = Duration::from_secs(40);
 const JOIN_LIMIT: Duration = Duration::from_secs(60);
 /// 偽の記録（D1）に使う SID（HKLM は読まない）。
 const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+/// 偽の `relax_tree` の中で待たせる上限（テストが放し忘れても本体を止めたままにしない）。
+const RELAX_HOLD_LIMIT: Duration = Duration::from_secs(30);
 
 /// 本体の行と偽の部品の記録を 1 つに集める列。
 type Trace = Arc<Mutex<Vec<String>>>;
@@ -82,6 +84,9 @@ struct FakeAcl {
     /// この回数目の確かめ直しから失敗させる（`0` は失敗させない）。
     recheck_fails_at: AtomicUsize,
     recheck_calls: AtomicUsize,
+    /// 緩めるの中で待たせる（`acl:relax` を記録した後、入ったことを 1 つ目で知らせ、2 つ目で
+    /// 放されるまで待つ。上限は [`RELAX_HOLD_LIMIT`]）。
+    relax_hold: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 impl FakeAcl {
@@ -154,6 +159,11 @@ impl AclOps for FakeAcl {
     ) -> Result<RelaxReport, SafeRootError> {
         push(&self.trace, "acl:relax");
         tick(progress);
+        let hold = self.relax_hold.lock().unwrap().take();
+        if let Some((entered, release)) = hold {
+            let _ = entered.send(());
+            let _ = release.recv_timeout(RELAX_HOLD_LIMIT);
+        }
         if self.relax_fails.load(Ordering::SeqCst) {
             return Err(SafeRootError::UnsupportedPlatform);
         }
@@ -207,7 +217,7 @@ fn test_program(
     ServerProgram::new(ProgramParts {
         layout: Box::new(move || Ok(layout.clone())),
         read_install_user: Box::new(move || install_user.clone()),
-        open_log: Box::new(move |_dir: Arc<ManagedDir>| {
+        open_log: Box::new(move |_dir: Arc<ManagedDir>, _prunes: Arc<LogPrunes>| {
             push(&trace_for_log, "log-opened");
             let flush_trace = trace_for_log.clone();
             let sink_trace = trace_for_log.clone();
@@ -696,10 +706,15 @@ async fn a_timed_out_shutdown_on_scm_stop_keeps_the_tree_tight_with_5() {
 
 /// オーナーレビュー P1（#623 PR-3）の再現: STOP の前に `POST /api/auth/login` のヘッダと本文の
 /// 一部だけ送って保留した接続は、banto の listener の停止（5 秒で親を abort）では止まらない。
-/// サービスは緩める前にエンジンのランタイムを終わらせるので、その接続のタスクも捨てられ、
-/// 緩めた後に本文を完了させても要求は処理されず、監査の退避ファイル（`audit-spool\`）が
-/// 利用者の木の下に書かれない（反証: ランタイムを終わらせずに緩める形に戻すと、本文の完了
-/// で認証 → 閉じた pool → `login_failed` の退避が成立して落ちる）。
+/// サービスは緩める前にエンジンのランタイムを終わらせるので、その接続のタスクも捨てられる。
+///
+/// 退行を直接捉えるため（PR #683 のオーナーの提案）、偽の `relax_tree` の**中で**本体を待たせ、
+/// **緩めている最中に**本文を完了させる。要求は処理されず、監査の退避ファイル（`audit-spool\`）
+/// も利用者の木の下に書かれない。Stopped の後に本文を送る形では、ふつうのランタイムの破棄
+/// （本体の終わり）でも接続が止まるので、「緩める前にランタイムを終わらせる」を省いた退行を
+/// 見分けられなかった（反証: `shutdown_within` の `drop(runtime)` を `mem::forget` にすると、
+/// 本文の完了で要求が処理されて落ちる）。緩め始めた後はプロセスの標準出力・標準エラー出力が
+/// NUL に向くので（`close_log`）、ここで落ちたときは panic の文言が出ず終了コード 101 だけになる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_held_open_across_scm_stop_cannot_write_after_relaxing() {
     use std::io::{Read, Write};
@@ -709,7 +724,13 @@ async fn a_request_held_open_across_scm_stop_cannot_write_after_relaxing() {
     prepare_root_db(&layout, None).await;
     let trace: Trace = Arc::default();
     let acl = FakeAcl::new(trace.clone());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *acl.relax_hold.lock().unwrap() = Some((entered_tx, release_rx));
     let running = spawn(program(&layout, &trace, acl));
+    // `running` より後に束ね直す: 途中で落ちたら先に drop され、偽の `relax_tree` の待ちが
+    // すぐ解ける（`Running` の drop が [`RELAX_HOLD_LIMIT`] まで待たない）。
+    let release_tx = release_tx;
     wait_running(&running).await;
     let endpoint = read_endpoint(&layout.endpoint_file()).expect("endpoint.json");
     let _token = setup_admin(endpoint.port).await;
@@ -731,15 +752,12 @@ async fn a_request_held_open_across_scm_stop_cannot_write_after_relaxing() {
         .expect("write head");
     stream.flush().unwrap();
 
-    // STOP。ランタイムを終わらせてから緩めて 0 で終わる。
+    // STOP。ランタイムを終わらせてから緩め始め、偽の `relax_tree` の中で止まる。
     let stop_sent = Instant::now();
     running.send(ScmControlKind::Stop);
-    let seen = running.seen.clone();
-    assert_eq!(running.join(), Some(ServiceExit::Success));
-    assert_eq!(
-        phases(&seen).last(),
-        Some(&(ServicePhase::Stopped, ServiceExit::Success))
-    );
+    entered_rx
+        .recv_timeout(JOIN_LIMIT)
+        .expect("緩めるところまで来なかった");
     let lines = snapshot(&trace);
     let finished = index_of(&lines, "非同期ランタイムを終わらせました");
     let begin = index_of(&lines, "ACL を緩め始めます");
@@ -750,7 +768,7 @@ async fn a_request_held_open_across_scm_stop_cannot_write_after_relaxing() {
     );
     assert!(finished < begin && begin < relax, "{lines:#?}");
 
-    // オーナーの再現と同じく、banto の graceful 停止（5 秒）を超えてから本文を完了させる。
+    // 緩めている最中に、banto の graceful 停止（5 秒）も超えてから本文を完了させる。
     if let Some(rest) = Duration::from_secs(6).checked_sub(stop_sent.elapsed()) {
         std::thread::sleep(rest);
     }
@@ -765,14 +783,23 @@ async fn a_request_held_open_across_scm_stop_cannot_write_after_relaxing() {
     let text = String::from_utf8_lossy(&response);
     assert!(
         !text.starts_with("HTTP/1.1"),
-        "緩めた後に要求が処理された（write={written:?}, read={read:?}）: {text}"
+        "緩めている最中に要求が処理された（write={written:?}, read={read:?}）: {text}"
     );
     // 退避ファイルは増えていない（しばらく見張る - 退避の書き込みは非同期）。
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(
         spool_files(&layout),
         spool_before,
-        "緩めた後に監査の退避が書かれた"
+        "緩めている最中に監査の退避が書かれた"
+    );
+
+    // 放して、0 で終わる。
+    release_tx.send(()).unwrap();
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Success));
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Success))
     );
     assert!(!layout.endpoint_file().exists());
 }
@@ -789,6 +816,248 @@ fn spool_files(layout: &DataLayout) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+/// #623 PR-3 の後追い: 古いログの削除のスレッド（`logs\` の保持期間の掃除）が STOP の時点で
+/// 走っていたら、終わるのを待ってから緩める（削除は握った `logs\` の子を開いて消すので、緩めと
+/// 重ねない）。偽の削除は STOP を受けた後で放され、終わりを列に記録する（反証: 待ちを省くと
+/// 削除の途中で `acl:relax` が来て落ちる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_log_prune_finishes_before_relaxing() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let program = program(&layout, &trace, acl);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let prune_trace = trace.clone();
+    *program.fake_log_prune.lock().unwrap() = Some(Box::new(move || {
+        push(&prune_trace, "prune:started");
+        let _ = release_rx.recv_timeout(JOIN_LIMIT);
+        push(&prune_trace, "prune:done");
+    }));
+    let running = spawn(program);
+    wait_running(&running).await;
+    wait_for("削除の開始", async || {
+        index_of(&snapshot(&trace), "prune:started").map(|_| ())
+    })
+    .await;
+
+    running.send(ScmControlKind::Stop);
+    // STOP の後も削除が続いている間は緩めない（後始末とランタイムの終わりを越えるまで見る）。
+    wait_for("ランタイムの終わり", async || {
+        index_of(&snapshot(&trace), "非同期ランタイムを終わらせました").map(|_| ())
+    })
+    .await;
+    std::thread::sleep(Duration::from_millis(500));
+    let lines = snapshot(&trace);
+    assert!(
+        index_of(&lines, "acl:relax").is_none(),
+        "削除の途中で緩めた: {lines:#?}"
+    );
+    release_tx.send(()).unwrap();
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Success));
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Success))
+    );
+    let lines = snapshot(&trace);
+    let done = position(&lines, "prune:done");
+    let begin = position(&lines, "ACL を緩め始めます");
+    let relax = position(&lines, "acl:relax");
+    assert!(done < begin && begin < relax, "{lines:#?}");
+}
+
+/// #623 PR-3 の後追い: 古いログの削除が上限（テストは 1 秒）の中で終わらなければ、**緩めずに**
+/// 締めたまま Stopped(5)。「緩め始めます」も `acl:relax` も出ない（反証: 待ちを省くと 0 で
+/// 緩めて落ちる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_prune_that_does_not_end_within_the_wait_keeps_the_tree_tight_with_5() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let mut program = program(&layout, &trace, acl);
+    program.log_prune_wait = Duration::from_secs(1);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let prune_trace = trace.clone();
+    *program.fake_log_prune.lock().unwrap() = Some(Box::new(move || {
+        push(&prune_trace, "prune:started");
+        let _ = release_rx.recv_timeout(JOIN_LIMIT);
+    }));
+    let running = spawn(program);
+    wait_running(&running).await;
+    wait_for("削除の開始", async || {
+        index_of(&snapshot(&trace), "prune:started").map(|_| ())
+    })
+    .await;
+
+    running.send(ScmControlKind::Stop);
+    let seen = running.seen.clone();
+    let exit = running.join();
+    let _ = release_tx.send(());
+    assert_eq!(exit, Some(ServiceExit::Specific(5)));
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Specific(5)))
+    );
+    let lines = snapshot(&trace);
+    assert!(
+        index_of(&lines, "古いログの削除が1秒待っても終わらなかった").is_some(),
+        "{lines:#?}"
+    );
+    assert!(
+        index_of(&lines, "ACL を緩め始めます").is_none(),
+        "{lines:#?}"
+    );
+    assert!(index_of(&lines, "acl:relax").is_none(), "{lines:#?}");
+    // エンジンは止めている（endpoint.json は消えている）。残るのは ACL の形だけ。
+    assert!(!layout.endpoint_file().exists(), "エンジンを止めていない");
+}
+
+/// 本物の日次ログ（`ServerLog::open_in` + `StdioRedirect` の向け直し）で動く本体。時計は
+/// `clock`（テストが日付を進めて、向け直しの書き込みに日付の切り替えを起こさせる）。
+fn real_log_program(
+    layout: &DataLayout,
+    trace: &Trace,
+    acl: Arc<FakeAcl>,
+    clock: Arc<banto_tstore::ManualClock>,
+) -> ServerProgram {
+    let mut program = program(layout, trace, acl);
+    program.open_log = Box::new(move |dir: Arc<ManagedDir>, prunes: Arc<LogPrunes>| {
+        crate::open_log_in_with_clock(dir, prunes, clock.clone())
+    });
+    program
+}
+
+/// 日付の切り替えで起きる削除を保留する（`LogPrunes` の各削除の直前で `release` を待つ）。
+/// 起動時の `set_retention` の分が終わってから差し込む（それは保留しない）。
+async fn hold_rollover_prunes(prunes: &Arc<LogPrunes>, trace: &Trace) -> mpsc::Sender<()> {
+    wait_for(
+        "起動時の古いログの削除の終わり",
+        async || (prunes.running() == 0).then_some(()),
+    )
+    .await;
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let hook_trace = trace.clone();
+    prunes.set_before_run(Some(Arc::new(move || {
+        push(&hook_trace, "prune:started");
+        // 送り口が落ちる（テストが放す）か上限で戻る。
+        let _ = release_rx.lock().unwrap().recv_timeout(JOIN_LIMIT);
+        push(&hook_trace, "prune:released");
+    })));
+    release_tx
+}
+
+/// 今の（`clock` の）日付の日次ログの中身（無ければ空）。
+fn day_log(layout: &DataLayout, clock: &banto_tstore::ManualClock) -> String {
+    use banto_tstore::Clock as _;
+    let date = banto_tstore::LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
+    std::fs::read_to_string(layout.logs_dir().join(server_host::log_file_name(date)))
+        .unwrap_or_default()
+}
+
+fn manual_clock_now() -> Arc<banto_tstore::ManualClock> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    Arc::new(banto_tstore::ManualClock::new(now_ms, 0))
+}
+
+/// Codex の P1・オーナーレビューの P2（#623 PR-3 の後追い）: サービスが日付をまたいだ後の STOP で、
+/// 停止の行（本物の `StdioRedirect::write_through` → `ServerLog::write_line`）が日付の切り替えを
+/// 起こして始めた古いログの削除も、終わるまで緩めない。削除は保留しておき、ランタイムの終わりを
+/// 越えても `acl:relax` が来ないことを見てから放す（反証: 向け直しの削除を追跡する口に通さず
+/// 切り離すと、保留中に緩めて落ちる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_prune_started_by_a_date_rollover_finishes_before_relaxing() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let clock = manual_clock_now();
+    let program = real_log_program(&layout, &trace, acl, clock.clone());
+    let prunes = Arc::clone(&program.log_prunes);
+    let running = spawn(program);
+    wait_running(&running).await;
+    let release = hold_rollover_prunes(&prunes, &trace).await;
+
+    // 日付をまたぐ。STOP の最初の行が新しい日のファイルを開き、削除を返す。
+    clock.advance_ms(86_400_000);
+    running.send(ScmControlKind::Stop);
+    wait_for("日付の切り替えの削除の開始", async || {
+        index_of(&snapshot(&trace), "prune:started").map(|_| ())
+    })
+    .await;
+    wait_for("ランタイムの終わり", async || {
+        day_log(&layout, &clock)
+            .contains("非同期ランタイムを終わらせました")
+            .then_some(())
+    })
+    .await;
+    std::thread::sleep(Duration::from_millis(500));
+    let lines = snapshot(&trace);
+    assert!(
+        index_of(&lines, "acl:relax").is_none(),
+        "日付の切り替えの削除の途中で緩めた: {lines:#?}"
+    );
+    drop(release);
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Success));
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Success))
+    );
+    let lines = snapshot(&trace);
+    assert!(
+        position(&lines, "prune:released") < position(&lines, "acl:relax"),
+        "{lines:#?}"
+    );
+    assert!(day_log(&layout, &clock).contains("ACL を緩め始めます"));
+}
+
+/// 同上で、日付の切り替えの削除が上限（テストは 1 秒）の中で終わらなければ、**緩めずに**締めた
+/// まま Stopped(5)（反証: 追跡を外すと 0 で緩めて落ちる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollover_log_prune_that_does_not_end_within_the_wait_keeps_the_tree_tight_with_5() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = DataLayout::new(dir.path().join("root"));
+    prepare_root_db(&layout, None).await;
+    let trace: Trace = Arc::default();
+    let acl = FakeAcl::new(trace.clone());
+    let clock = manual_clock_now();
+    let mut program = real_log_program(&layout, &trace, acl, clock.clone());
+    program.log_prune_wait = Duration::from_secs(1);
+    let prunes = Arc::clone(&program.log_prunes);
+    let running = spawn(program);
+    wait_running(&running).await;
+    let release = hold_rollover_prunes(&prunes, &trace).await;
+
+    clock.advance_ms(86_400_000);
+    running.send(ScmControlKind::Stop);
+    let seen = running.seen.clone();
+    let exit = running.join();
+    drop(release);
+    assert_eq!(exit, Some(ServiceExit::Specific(5)));
+    assert_eq!(
+        phases(&seen).last(),
+        Some(&(ServicePhase::Stopped, ServiceExit::Specific(5)))
+    );
+    let lines = snapshot(&trace);
+    assert!(index_of(&lines, "prune:started").is_some(), "{lines:#?}");
+    assert!(index_of(&lines, "acl:relax").is_none(), "{lines:#?}");
+    let text = day_log(&layout, &clock);
+    assert!(
+        text.contains("古いログの削除が1秒待っても終わらなかった"),
+        "{text}"
+    );
+    assert!(!text.contains("ACL を緩め始めます"), "{text}");
 }
 
 /// オーナーレビュー P1（#623 PR-3）: エンジンのランタイムを上限の中で終わらせられなかった
@@ -1041,7 +1310,7 @@ fn a_stop_during_the_start_aborts_before_tightening_as_success() {
         }),
         read_install_user: Box::new(|| Ok(Some(USER.to_string()))),
         // ログを開いたところで止まり、テストが STOP を送ってから進む。
-        open_log: Box::new(move |_dir: Arc<ManagedDir>| {
+        open_log: Box::new(move |_dir: Arc<ManagedDir>, _prunes: Arc<LogPrunes>| {
             let _ = opened_tx.send(());
             let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
             Ok((None, Box::new(|_| {}), None))

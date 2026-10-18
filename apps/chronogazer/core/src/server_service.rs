@@ -250,6 +250,16 @@ pub fn runtime_still_busy_keeps_tight_line(waited: Duration) -> String {
     )
 }
 
+/// 古いログの削除（`logs\` の保持期間の掃除のスレッド）が `waited` の間に終わらなかったので
+/// 緩めずに終わるときの行（#623 PR-3 の後追い。掃除は握った `logs\` の子を開いて消すので、
+/// 緩めた後に重ねると約束 2「緩め始めたら新しく開かない」に反する）。
+pub fn log_prune_still_running_keeps_tight_line(waited: Duration) -> String {
+    format!(
+        "{SERVER_LABEL}: 古いログの削除が{}秒待っても終わらなかったため、ACL を緩めずに終わります（終了コード {EXIT_LEFT_TIGHT}。運用モードの形のまま。設定モードへは relax-only の開始で戻してください）",
+        waited.as_secs()
+    )
+}
+
 /// エンジンのランタイムを終わらせたときの行（この後で緩める）。
 pub fn runtime_finished_line(listener_stop_abandoned: bool) -> String {
     if listener_stop_abandoned {
@@ -1191,6 +1201,10 @@ mod tests {
         assert!(line.contains("relax-only"), "{line}");
         assert!(runtime_finished_line(true).contains("待ち受けの停止"));
         assert!(!runtime_finished_line(false).contains("待ち受けの停止"));
+        let line = log_prune_still_running_keeps_tight_line(Duration::from_secs(10));
+        assert!(line.contains("古いログの削除が10秒"), "{line}");
+        assert!(line.contains("終了コード 5"), "{line}");
+        assert!(line.contains("relax-only"), "{line}");
     }
 
     /// 1 周目の一覧は最初の 20 件と総数。

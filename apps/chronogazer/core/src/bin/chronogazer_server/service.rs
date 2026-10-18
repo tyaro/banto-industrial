@@ -54,8 +54,11 @@
 //! （`StartedServer::shutdown`）→ 見張りを止める → **エンジンの tokio のランタイムを終わらせる**
 //! （[`BackgroundRuntime::shutdown_within`]。最大 `RUNTIME_SHUTDOWN_WAIT`。接続ごとのタスクも
 //! 含めて非同期のタスクは全部捨て、`spawn_blocking` の分は終わるまで待つ。終わらなければ
-//! 緩めずに 5）→ 最後の行「緩め始めます」→ ログを閉じ、向け直しも外す（NUL へ）→
-//! `relax_tree`（進み具合で `report_stop_progress`。同期の処理なのでランタイムは要らない）
+//! 緩めずに 5）→ 古いログの削除を封じ（以後の削除は走らせずに捨てる）、起動時の分と日付の
+//! 切り替えで向け直しが起こした分の**全部**の終わりを待つ（[`LogPrunes`]。最大
+//! `LOG_PRUNE_WAIT`。終わらなければ緩めずに 5）→ 最後の行「緩め始めます」→ 向け直しの残りを
+//! 流しきってログを閉じ、向け直しも外す（NUL へ）→ 残っている削除が無いことをもう一度
+//! 確かめる（終わらなければ緩めずに 5）→ `relax_tree`（進み具合で `report_stop_progress`。同期の処理なのでランタイムは要らない）
 //! → ハンドルを閉じ A1 を返す → 0（後始末が不完全なら 1）、緩められなければ 5。後始末が
 //! 時間切れなら緩めずに 5。
 //!
@@ -106,17 +109,19 @@ use chronogazer_core::server_host::{
 use chronogazer_core::server_service::{
     acl_changed_line, after_close_abort, after_marker_error, backup_wait_line, close_abort_line,
     exit_after_relax_back, exit_after_scan_refusal, external_data_dir_line, install_result_lines,
-    install_with, mode_switch_begin_line, mode_switch_done_line, no_reader_line, parse_start_args,
-    redirection_guard_line, relax_allowed_after_shutdown, relax_begin_line, relax_only_begin_line,
-    runtime_finished_line, runtime_still_busy_keeps_tight_line, scan_refused_lines,
-    service_exit_for, service_flush_wait, service_running_line, service_starting_line,
-    service_stop_budget, service_stop_done_line, service_stop_hint_line, service_stop_reason_line,
-    service_stopped_line, shutdown_incomplete_keeps_tight_line, stop_progress_allowed,
-    stop_signal_label, tampered_line, uninstall_lines, unknown_start_arg_line, RuntimeEnd,
-    StartArgs, INSTALL_USER_SID_VALUE, SERVICE_EXPECTED_STOP, SERVICE_LOG_FLUSH_WAIT,
+    install_with, log_prune_still_running_keeps_tight_line, mode_switch_begin_line,
+    mode_switch_done_line, no_reader_line, parse_start_args, redirection_guard_line,
+    relax_allowed_after_shutdown, relax_begin_line, relax_only_begin_line, runtime_finished_line,
+    runtime_still_busy_keeps_tight_line, scan_refused_lines, service_exit_for, service_flush_wait,
+    service_running_line, service_starting_line, service_stop_budget, service_stop_done_line,
+    service_stop_hint_line, service_stop_reason_line, service_stopped_line,
+    shutdown_incomplete_keeps_tight_line, stop_progress_allowed, stop_signal_label, tampered_line,
+    uninstall_lines, unknown_start_arg_line, RuntimeEnd, StartArgs, INSTALL_USER_SID_VALUE,
+    SERVICE_EXPECTED_STOP, SERVICE_LOG_FLUSH_WAIT,
 };
 use chronogazer_core::shell_launch::SERVICE_NAME;
 
+use crate::log_prune::{LogPrunes, PruneJob};
 use crate::start::{self, StartHooks, StartSpec, Started};
 use crate::{Flush, LineSink, OpenedLog};
 
@@ -127,7 +132,9 @@ type LayoutSource = Box<dyn Fn() -> Result<DataLayout, i32> + Send + Sync>;
 type InstallUserReader = Box<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
 /// 握った `logs\` に日次ログを開いて向け直す（本番は `crate::open_log_in`。テストは
 /// テストのプロセスの標準ハンドルを差し替えない偽物）。
-type LogOpener = Box<dyn Fn(Arc<ManagedDir>) -> Result<OpenedLog, String> + Send + Sync>;
+/// 2 つ目は、日付の切り替えで起きる古いログの削除を通す口（[`LogPrunes`]）。
+type LogOpener =
+    Box<dyn Fn(Arc<ManagedDir>, Arc<LogPrunes>) -> Result<OpenedLog, String> + Send + Sync>;
 /// ルートにしてはいけない既知のフォルダ（本番はマシンの既知のフォルダ。テストは空）。
 type KnownFoldersSource = Box<dyn Fn() -> Result<KnownFolders, String> + Send + Sync>;
 /// Redirection Guard を有効にする（本番は `enable_redirection_guard`。テストは呼ばない -
@@ -142,6 +149,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 /// P1）。非同期のタスクは終わらせるときに全部捨てるので、待つのは実質 `spawn_blocking` の
 /// 残り（tokio::fs の書き込みなど）。これを過ぎても終わらなければ緩めずに 5。
 const RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// STOP で、緩める前に古いログの削除の全部（[`LogPrunes`]）の終わりを待つ上限
+/// （#623 PR-3 の後追い）。これを過ぎても終わらなければ緩めずに 5。
+const LOG_PRUNE_WAIT: Duration = Duration::from_secs(10);
 /// 木を歩くスレッドのスタック（`MAX_DEPTH` 64 段 × 4 フレームで足りる大きさ。#681 の S-5）。
 const WALK_STACK: usize = 16 * 1024 * 1024;
 /// 定期の確かめ直しの間隔（設計 §2.9 (d) の案 60 秒）。
@@ -377,6 +387,16 @@ pub(crate) struct ServerProgram {
     /// の経路を本物のランタイムで踏むため）。
     #[cfg(test)]
     fake_blocking_hold: Mutex<Option<Duration>>,
+    /// STOP で、緩める前に古いログの削除の全部の終わりを待つ上限（本番は
+    /// [`LOG_PRUNE_WAIT`]。テストは短くする）。
+    log_prune_wait: Duration,
+    /// サービスで起きる古いログの削除の**全部**（起動時の `set_retention` の分と、日付の
+    /// 切り替えで向け直しが起こす分）を通す口（#623 PR-3 の後追い。[`LogPrunes`]）。
+    log_prunes: Arc<LogPrunes>,
+    /// テスト専用: 古いログの削除の代わりに走らせる処理（テストの偽のログは `ServerLog` を
+    /// 持たないので、本物の削除は起きない。削除が長引く・STOP と重なる経路を踏むため）。
+    #[cfg(test)]
+    fake_log_prune: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// [`ServerProgram::new`] に渡す部品の組（本番とテストで差し替える物）。
@@ -475,6 +495,10 @@ impl ServerProgram {
             runtime_shutdown_wait: RUNTIME_SHUTDOWN_WAIT,
             #[cfg(test)]
             fake_blocking_hold: Mutex::new(None),
+            log_prune_wait: LOG_PRUNE_WAIT,
+            log_prunes: Arc::default(),
+            #[cfg(test)]
+            fake_log_prune: Mutex::new(None),
         }
     }
 
@@ -629,7 +653,8 @@ impl ServerProgram {
                 return service_exit_for(EXIT_START_FAILED);
             }
         };
-        let (log, flush, record) = match (self.open_log)(logs.clone()) {
+        let (log, flush, record) = match (self.open_log)(logs.clone(), Arc::clone(&self.log_prunes))
+        {
             Ok(opened) => opened,
             Err(reason) => {
                 eprintln!("{SERVER_LABEL}: {reason}");
@@ -866,8 +891,18 @@ impl ServerProgram {
         if let Some(external) = external_data_dir(&server, &root) {
             self.say(&external_data_dir_line(&external));
         }
-        if let Some(prune) = log_prune {
-            crate::spawn_log_prune(prune);
+        // 古いログの削除は追跡する口で走らせ、STOP で緩める前に終わりを待つ（#623 PR-3 の
+        // 後追い。[`LogPrunes`]。日付の切り替えで向け直しが起こす削除も同じ口を通る）。
+        let prune_job = log_prune.map(|prune| Box::new(move || prune.run()) as PruneJob);
+        #[cfg(test)]
+        let prune_job = self
+            .fake_log_prune
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .or(prune_job);
+        if let Some(job) = prune_job {
+            self.log_prunes.spawn(job);
         }
         if ctx.stop_notice().is_none() && tamper.get().is_none() {
             runtime.block_on(crate::announce(&server, &service_stop_hint_line()));
@@ -995,9 +1030,51 @@ impl ServerProgram {
                     drop(held);
                     return exit;
                 }
-                // 5. 最後の行 → ログを閉じ、向け直しを外す。
+                // 4c. 古いログの削除の**全部**の終わりを待つ（#623 PR-3 の後追い。Codex の P1・
+                // オーナーレビューの P2）。削除は握った `logs\` の子を名前で開いて消すので
+                // （`ManagedDir::remove_where`）、緩めた後に重ねると約束 2「緩め始めたら新しく
+                // 開かない」に反する。起動時の分だけでなく、日付の切り替えで向け直しが起こした
+                // 分も同じ口（`LogPrunes`）を通っている。先に封じて（以後の削除は走らせずに
+                // 捨てる。この後の行や向け直しの残りが日付の切り替えを起こしても新しい削除は
+                // 始まらない）、走っている全部を待つ。上限の中で終わらなければ緩めずに締めたまま
+                // 5（ランタイムが終わらないときと同じ扱い）。
+                self.log_prunes.seal();
+                let mut prune_tick = || {
+                    if stop_progress_allowed(stop_started.elapsed()) {
+                        ctx.report_stop_progress();
+                    }
+                };
+                let pruned = self.log_prunes.wait_idle(
+                    self.log_prune_wait,
+                    PROGRESS_INTERVAL,
+                    &mut prune_tick,
+                );
+                if !pruned {
+                    self.say(&log_prune_still_running_keeps_tight_line(
+                        self.log_prune_wait,
+                    ));
+                    let exit = service_exit_for(EXIT_LEFT_TIGHT);
+                    self.say(&service_stopped_line(exit));
+                    self.flush(SERVICE_LOG_FLUSH_WAIT);
+                    drop(server);
+                    drop(held);
+                    return exit;
+                }
+                // 5. 最後の行 → 向け直しの残りを流しきってログを閉じ（以後 `write_line` は何も
+                // しない = 新しい削除は起きない）、向け直しを外す。その後でもう一度、残っている
+                // 削除が無いことを確かめる（封じてあるので、ふつうは待たずに通る）。ログは
+                // 閉じたので、ここで終わらなければ行を残さずに締めたまま 5。
                 self.say(&relax_begin_line());
                 self.close_log(log.as_ref(), SERVICE_LOG_FLUSH_WAIT);
+                if !self.log_prunes.wait_idle(
+                    self.log_prune_wait,
+                    PROGRESS_INTERVAL,
+                    &mut prune_tick,
+                ) {
+                    drop(server);
+                    drop(held);
+                    return service_exit_for(EXIT_LEFT_TIGHT);
+                }
                 // 6. 緩める（ここから先は新しく開かず、ログにも書かない。ランタイムは終わって
                 // いるので同期の処理だけ）。
                 let mut last = Instant::now();
@@ -1230,7 +1307,7 @@ impl ServerProgram {
         ctx.report_start_progress(START_WAIT_HINT);
         // `logs` は作らない。開ければログに書く（開けなければログなしで続ける）。
         let log = match self.open_logs(&root, None, false) {
-            Ok(Some(logs)) => match (self.open_log)(logs) {
+            Ok(Some(logs)) => match (self.open_log)(logs, Arc::clone(&self.log_prunes)) {
                 Ok((log, flush, record)) => {
                     self.attach_log(flush, record);
                     log

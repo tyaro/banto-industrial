@@ -93,6 +93,9 @@
 #[path = "chronogazer_server/console.rs"]
 mod console;
 #[cfg(windows)]
+#[path = "chronogazer_server/log_prune.rs"]
+mod log_prune;
+#[cfg(windows)]
 #[path = "chronogazer_server/service.rs"]
 mod service;
 #[path = "chronogazer_server/start.rs"]
@@ -894,28 +897,46 @@ async fn apply_test_port(opened: &server_host::OpenedServer) -> Result<(), Strin
 }
 
 /// 古いログファイルの削除を別のスレッドで走らせる（ログのロックを手放した後に
-/// 呼ぶ。`server_host` のモジュール doc「ログ」）。デバッグビルドだけ、環境変数
-/// `CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS` があれば、削除の前にその ms だけ待つ
-/// （起動後の削除が長引いている最中の終了の統合テスト用。待ちに入ったことを 1 行
-/// 出すので、テストはそれを見てから合図を送る）。
+/// 呼ぶ。`server_host` のモジュール doc「ログ」）。コンソールの経路で、終わりは待たない
+/// （プロセスの終わりで打ち切られてよい）。サービスの中の削除は [`run_log_prune`] で
+/// 追跡する口（[`log_prune::LogPrunes`]）を通す。
 fn spawn_log_prune(prune: server_host::LogPrune) {
+    let job = log_prune_job(prune);
+    let _ = std::thread::Builder::new()
+        .name("chronogazer-log-prune".to_string())
+        .spawn(job);
+}
+
+/// 削除を走らせる: 追跡する口（サービス）があればそれで、無ければ（コンソール）
+/// [`spawn_log_prune`] で切り離して。
+#[cfg(windows)]
+fn run_log_prune(prunes: Option<&Arc<log_prune::LogPrunes>>, prune: server_host::LogPrune) {
+    match prunes {
+        Some(prunes) => {
+            prunes.spawn(log_prune_job(prune));
+        }
+        None => spawn_log_prune(prune),
+    }
+}
+
+/// 削除の 1 回分の仕事。デバッグビルドだけ、環境変数 `CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS`
+/// があれば、削除の前にその ms だけ待つ（起動後の削除が長引いている最中の終了の統合
+/// テスト用。待ちに入ったことを 1 行出すので、テストはそれを見てから合図を送る）。
+fn log_prune_job(prune: server_host::LogPrune) -> Box<dyn FnOnce() + Send> {
     #[cfg(debug_assertions)]
     if let Some(ms) = std::env::var("CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
     {
-        let _ = std::thread::Builder::new()
-            .name("chronogazer-log-prune".to_string())
-            .spawn(move || {
-                eprintln!(
-                    "{SERVER_LABEL}: テスト用にログの古いファイルの削除の前で待ちます（CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS）"
-                );
-                std::thread::sleep(Duration::from_millis(ms));
-                prune.run();
-            });
-        return;
+        return Box::new(move || {
+            eprintln!(
+                "{SERVER_LABEL}: テスト用にログの古いファイルの削除の前で待ちます（CHRONOGAZER_TEST_SLOW_LOG_PRUNE_MS）"
+            );
+            std::thread::sleep(Duration::from_millis(ms));
+            prune.run();
+        });
     }
-    prune.spawn();
+    Box::new(move || prune.run())
 }
 
 /// 待ち受けの案内。`stop_hint` は最後の 1 行（止め方。コンソールは Ctrl-C、
@@ -995,28 +1016,47 @@ fn open_log(layout: &DataLayout) -> Result<OpenedLog, String> {
             return Ok((None, Box::new(|_| {}), None));
         }
     };
-    redirect_opened_log(log)
+    redirect_opened_log(log, None)
 }
 
 /// サービス（#623 PR-3）: 握った `logs\` に日次ログを**辿らずに**開き（`ServerLog::open_in`）、
 /// 向け直す。**開けなければ `Err`**（サービスにはコンソールが無く、起動・収集・停止の診断が
 /// 黙って失われるため、起動しない。PR #618 の Codex の指摘）。
+///
+/// 日付の切り替えで起きる古いログの削除は `prunes`（サービスの追跡する口）を通す
+/// （STOP は緩める前にその全部の終わりを待つ。[`log_prune`]）。
 #[cfg(windows)]
-fn open_log_in(dir: Arc<banto_safe_root::ManagedDir>) -> Result<OpenedLog, String> {
+fn open_log_in(
+    dir: Arc<banto_safe_root::ManagedDir>,
+    prunes: Arc<log_prune::LogPrunes>,
+) -> Result<OpenedLog, String> {
+    open_log_in_with_clock(dir, prunes, Arc::new(banto_tstore::SystemClock))
+}
+
+/// [`open_log_in`] の時計を渡せる形（テストは `ManualClock` で日付の切り替えを起こす）。
+#[cfg(windows)]
+fn open_log_in_with_clock(
+    dir: Arc<banto_safe_root::ManagedDir>,
+    prunes: Arc<log_prune::LogPrunes>,
+    clock: Arc<dyn banto_tstore::Clock>,
+) -> Result<OpenedLog, String> {
     let path = dir.final_path().to_path_buf();
-    let log = ServerLog::open_in(dir, Arc::new(banto_tstore::SystemClock)).map_err(|err| {
+    let log = ServerLog::open_in(dir, clock).map_err(|err| {
         format!(
             "日次ログ（{}）を開けませんでした。Windows サービスにはコンソールが無く、起動・収集・停止の診断が残らないため、起動しません: {err}",
             path.display()
         )
     })?;
-    redirect_opened_log(Arc::new(Mutex::new(log)))
+    redirect_opened_log(Arc::new(Mutex::new(log)), Some(prunes))
 }
 
 /// 開いた日次ログへ標準出力・標準エラー出力を向け直す（[`open_log`]・[`open_log_in`] で同じ）。
 #[cfg(windows)]
-fn redirect_opened_log(log: Arc<Mutex<ServerLog>>) -> Result<OpenedLog, String> {
-    match console::redirect_stdio(log.clone()) {
+fn redirect_opened_log(
+    log: Arc<Mutex<ServerLog>>,
+    prunes: Option<Arc<log_prune::LogPrunes>>,
+) -> Result<OpenedLog, String> {
+    match console::redirect_stdio(log.clone(), prunes) {
         Ok(redirect) => {
             let redirect = Arc::new(redirect);
             let through = Arc::clone(&redirect);

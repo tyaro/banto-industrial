@@ -50,6 +50,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chronogazer_core::server_host::ServerLog;
+
+use crate::log_prune::LogPrunes;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -98,6 +100,9 @@ pub struct StdioRedirect {
     log: Arc<Mutex<ServerLog>>,
     /// コンソールへ写す列（[`StdioRedirect::write_through`] も使う）。
     tee: Option<TeeQueue>,
+    /// 日付の切り替えで起きる古いログの削除を通す口（サービス。コンソールは `None` で
+    /// 切り離して走らせる。`crate::log_prune`）。
+    prunes: Option<Arc<LogPrunes>>,
 }
 
 /// コンソールへ写す列とそのワーカー（#598 の Copilot の指摘）。`finish` で
@@ -155,8 +160,13 @@ impl TeeQueue {
     }
 }
 
-/// 標準出力・標準エラー出力を `log` へ向け直し、元の標準エラー出力にも写す。
-pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedirect> {
+/// 標準出力・標準エラー出力を `log` へ向け直し、元の標準エラー出力にも写す。日付の
+/// 切り替えで起きる古いログの削除は、`prunes` があればそこを通す（サービス。STOP が
+/// 緩める前に終わりを待つ）。無ければ（コンソール）切り離して走らせる。
+pub fn redirect_stdio(
+    log: Arc<Mutex<ServerLog>>,
+    prunes: Option<Arc<LogPrunes>>,
+) -> std::io::Result<StdioRedirect> {
     // SAFETY: 標準ハンドルの取得は副作用が無い。
     let original_out = RawHandle::new(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) });
     let original_err = RawHandle::new(unsafe { GetStdHandle(STD_ERROR_HANDLE) });
@@ -179,11 +189,12 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
     let write = RawHandle::new(write);
 
     let direct_log = Arc::clone(&log);
+    let pump_prunes = prunes.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("server-log".into())
         .spawn(move || {
-            pump(read, &log, pump_tee, done_tx);
+            pump(read, &log, pump_tee, done_tx, pump_prunes.as_ref());
             // SAFETY: 読み取り側はこのスレッドだけが持つ（書き込み側は閉じないので、
             // ふつうはここに来ない）。
             unsafe { CloseHandle(read.get()) };
@@ -233,6 +244,7 @@ pub fn redirect_stdio(log: Arc<Mutex<ServerLog>>) -> std::io::Result<StdioRedire
         finished: AtomicBool::new(false),
         log: direct_log,
         tee: direct_tee,
+        prunes,
     })
 }
 
@@ -246,6 +258,7 @@ fn pump(
     log: &Mutex<ServerLog>,
     tee: Option<SyncSender<String>>,
     done: mpsc::Sender<()>,
+    prunes: Option<&Arc<LogPrunes>>,
 ) {
     let mut buffer = vec![0_u8; 8192];
     let mut pending: Vec<u8> = Vec::new();
@@ -267,10 +280,11 @@ fn pump(
             text.pop();
         }
         // 日付の切り替えで出る古いファイルの削除は、ロックを手放してから別の
-        // スレッドで（上限の無い削除で、終了の最後の行の記録を待たせない）。
+        // スレッドで（上限の無い削除で、終了の最後の行の記録を待たせない）。サービスでは
+        // 追跡する口を通す（STOP が緩める前に終わりを待つ）。
         let prune = log.lock().ok().and_then(|mut log| log.write_line(&text));
         if let Some(prune) = prune {
-            crate::spawn_log_prune(prune);
+            crate::run_log_prune(prunes, prune);
         }
         if let Some(tee) = tee {
             // 溢れた（コンソールが止まっている）・写すスレッドが無いなら捨てる。
@@ -450,7 +464,7 @@ impl StdioRedirect {
             prune
         });
         if let Some(prune) = prune {
-            crate::spawn_log_prune(prune);
+            crate::run_log_prune(self.prunes.as_ref(), prune);
         }
         if let Some(tee) = &self.tee {
             tee.send(line.to_string());
@@ -534,7 +548,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         {
             let log = log.clone();
-            std::thread::spawn(move || pump(read, &log, Some(tee_tx), done_tx));
+            std::thread::spawn(move || pump(read, &log, Some(tee_tx), done_tx, None));
         }
         write_all(write, "一行目\n".as_bytes());
         // 番兵と同じ書き込みで続く行は、番兵の後の行として扱う。
