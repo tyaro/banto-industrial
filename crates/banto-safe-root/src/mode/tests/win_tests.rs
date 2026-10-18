@@ -82,8 +82,30 @@ fn check_file_shape(security: &FileSecurity, access: &DirAccess, what: &Path) {
         .unwrap_or_else(|e| panic!("{}: {e:?}: {security:?}", what.display()));
 }
 
+/// `path` が、その親フォルダの印の席（OS が `MARKER_NAME` に解決する物。綴りではなくファイル
+/// ID で見分ける - 実装と同じ）か。
+fn is_marker_slot(path: &Path) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let parent = pinned(parent);
+    let Some(slot) = crate::acl::imp::probe_marker(parent.raw_handle()).unwrap() else {
+        return false;
+    };
+    let own = open_dir(
+        path,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+    .unwrap();
+    crate::acl::imp::file_id_of(own.0).unwrap() == slot.id
+}
+
 /// 木の全体が `access` の形（フォルダは OICI、ファイルは継承無し、所有者 Administrators、印の
-/// ファイルは利用者の ACE なし）であることを確かめる。
+/// 席の物（綴りを問わず）は利用者の ACE なし）であることを確かめる。
 fn expect_tree_shape(root: &Path, access: &DirAccess) {
     for (path, security) in tree_snapshot(root) {
         let security = security.unwrap_or_else(|| panic!("{} を読めない", path.display()));
@@ -93,7 +115,7 @@ fn expect_tree_shape(root: &Path, access: &DirAccess) {
             "{}: 所有者",
             path.display()
         );
-        if path.file_name().is_some_and(|n| n == MARKER_NAME) && !security.is_dir {
+        if is_marker_slot(&path) && !security.is_dir {
             assert!(
                 exposure(&security).is_empty(),
                 "{}: 印に利用者の ACE: {security:?}",
