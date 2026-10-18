@@ -30,6 +30,9 @@ use chronogazer_core::endpoint::read_endpoint;
 use chronogazer_core::settings::SettingsService;
 
 const WAIT_LIMIT: Duration = Duration::from_secs(40);
+/// 本体が終わるのを待つ上限（[`Running::join`]）。退行して本体が止まらなくなっても（知らない
+/// 引数を通常の開始にしてしまう等）、CI のジョブをハングさせずにはっきり落とすため。
+const JOIN_LIMIT: Duration = Duration::from_secs(60);
 /// 偽の記録（D1）に使う SID（HKLM は読まない）。
 const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 
@@ -266,7 +269,9 @@ fn has_phase(seen: &Seen, wanted: ServicePhase) -> bool {
 struct Running {
     handler: ControlHandler,
     seen: Seen,
-    thread: Option<std::thread::JoinHandle<Option<ServiceExit>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// 本体の結果（スレッドが終わる直前に送る）。
+    done: mpsc::Receiver<Option<ServiceExit>>,
 }
 
 impl Running {
@@ -274,8 +279,29 @@ impl Running {
         assert_eq!((self.handler)(control), ControlReply::NoError);
     }
 
+    /// 本体が終わるのを [`JOIN_LIMIT`] まで待つ。超えたら STOP を送って止めてから、理由
+    /// （そのときの報告の列）を出して落とす（ハングさせない）。
     fn join(mut self) -> Option<ServiceExit> {
-        self.thread.take().unwrap().join().unwrap()
+        match self.done.recv_timeout(JOIN_LIMIT) {
+            Ok(exit) => {
+                let _ = self.thread.take().unwrap().join();
+                exit
+            }
+            Err(_) => {
+                let phases = phases(&self.seen);
+                let _ = (self.handler)(ScmControlKind::Stop);
+                let _ = self.done.recv_timeout(JOIN_LIMIT);
+                let _ = self.thread.take().unwrap().join();
+                panic!(
+                    "本体が {JOIN_LIMIT:?} 以内に終わらなかった（{}）。報告の列: {phases:?}",
+                    if phases.iter().any(|(p, _)| *p == ServicePhase::Running) {
+                        "通常起動して Running のまま"
+                    } else {
+                        "Running を報告せずに止まったまま"
+                    }
+                );
+            }
+        }
     }
 }
 
@@ -301,10 +327,12 @@ fn spawn_with_args(program: ServerProgram, args: &[&str]) -> Running {
         .chain(args.iter().copied())
         .map(OsString::from)
         .collect();
+    let (done_tx, done) = mpsc::channel();
     let thread = {
         let seen = seen.clone();
         std::thread::spawn(move || {
-            run_program_with_args(program, argv, fake_register(handler_tx, seen))
+            let exit = run_program_with_args(program, argv, fake_register(handler_tx, seen));
+            let _ = done_tx.send(exit);
         })
     };
     let handler = handler_rx
@@ -314,6 +342,7 @@ fn spawn_with_args(program: ServerProgram, args: &[&str]) -> Running {
         handler,
         seen,
         thread: Some(thread),
+        done,
     }
 }
 

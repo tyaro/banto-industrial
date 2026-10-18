@@ -918,14 +918,35 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
         rx
     }
 
+    /// 直前の操作（パスの書き直しの中の子への伝播など）の通知が出尽くしてから見張りを
+    /// 始める: 見張りを 1 本張って 500 ms 何も来なくなるまで吸い取り、その後に [`watch`] を
+    /// 張る。固定の sleep だと、負荷のある CI で前の伝播の尻尾を「来ない」はずの測定で拾う
+    /// （#623 PR-3 で隣のテストと同時に走らせたとき 1 回落ちた）。
+    fn watch_quiet(root: &Path, filter: u32) -> std::sync::mpsc::Receiver<Vec<String>> {
+        let held = pin_dir(root).unwrap().unwrap();
+        let mut drain = held.watch_security().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match drain.wait(Duration::from_millis(500)).unwrap() {
+                WatchEvent::Timeout => break,
+                _ if std::time::Instant::now() > deadline => panic!("通知が止まらない"),
+                _ => continue,
+            }
+        }
+        drop(drain);
+        let rx = watch(root, filter);
+        // 見張りの RDCW が出るまで（スレッドの起動）の猶予。
+        std::thread::sleep(Duration::from_millis(100));
+        rx
+    }
+
     let readers = DirAccess::with_readers([me()]);
     let setting = DirAccess::with_install_user(me());
     let wait = |rx: std::sync::mpsc::Receiver<Vec<String>>| -> Option<Vec<String>> {
         rx.recv_timeout(Duration::from_secs(3)).ok()
     };
     // (a) パスで締める（`SetNamedSecurityInfoW`）→ 通知が来るか。
-    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
-    std::thread::sleep(Duration::from_millis(300));
+    let rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_SECURITY);
     // `READ_CONTROL` も持つのは (c) の advapi が伝播のために記述子を読み直すため（WRITE_DAC
     // だけだと 5 で失敗する - これも実測）。
     let old = open_dir(
@@ -937,8 +958,7 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
     reset_dir_acl(&child, &readers).unwrap();
     let by_path = wait(rx);
     // (b) 古い WRITE_DAC のハンドルで戻す（`SetKernelObjectSecurity`）→ 戻せる（assert）・通知が来るか。
-    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
-    std::thread::sleep(Duration::from_millis(300));
+    let rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_SECURITY);
     let written = set_dacl_on_handle(old.0, &setting.sddl());
     assert!(
         written.is_ok(),
@@ -947,15 +967,13 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
     let by_kernel = wait(rx);
     // (c) 古いハンドルで `SetSecurityInfo`（advapi）→ 通知が来るか。
     reset_dir_acl(&child, &readers).unwrap();
-    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
-    std::thread::sleep(Duration::from_millis(300));
+    let rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_SECURITY);
     let via_advapi = set_dacl_on_handle_via_advapi(old.0, &setting.sddl());
     let by_advapi = wait(rx);
     // (b') 古いハンドルを閉じたときに（遅れて）通知が来るか。
     reset_dir_acl(&child, &readers).unwrap();
     set_dacl_on_handle(old.0, &setting.sddl()).unwrap();
-    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
-    std::thread::sleep(Duration::from_millis(300));
+    let rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_SECURITY);
     drop(old);
     let after_close = wait(rx);
     eprintln!(
@@ -988,8 +1006,7 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
     let file = root.join("a.txt");
     let file_sddl = setting.sddl().replace("OICI", "");
     let reader_sddl = readers.sddl().replace("OICI", "");
-    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
-    std::thread::sleep(Duration::from_millis(300));
+    let rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_SECURITY);
     let old_file = open_dir(
         &file,
         WRITE_DAC | READ_CONTROL,
@@ -998,12 +1015,10 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
     .unwrap();
     crate::acl::tests::windows::set_dacl_sddl(&file, &reader_sddl);
     let file_by_path = wait(rx);
-    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
-    std::thread::sleep(Duration::from_millis(300));
+    let rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_SECURITY);
     let file_written = set_dacl_on_handle(old_file.0, &file_sddl);
     let file_by_kernel = wait(rx);
-    let rx = watch(&root, FILE_NOTIFY_CHANGE_SECURITY);
-    std::thread::sleep(Duration::from_millis(300));
+    let rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_SECURITY);
     drop(old_file);
     let file_after_close = wait(rx);
     eprintln!(
@@ -1024,8 +1039,7 @@ fn an_old_write_dac_handle_still_works_after_tightening_and_the_security_watch_i
     );
 
     // (2) ふつうの書き込みで FILE_NOTIFY_CHANGE_ATTRIBUTES の通知が来るか【要実測】。
-    let attr_rx = watch(&root, FILE_NOTIFY_CHANGE_ATTRIBUTES);
-    std::thread::sleep(Duration::from_millis(100));
+    let attr_rx = watch_quiet(&root, FILE_NOTIFY_CHANGE_ATTRIBUTES);
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
