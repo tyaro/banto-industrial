@@ -5,7 +5,8 @@
 #             ├─ frontend-hub           （条件付き）
 #             ├─ frontend-chronogazer   （条件付き）
 #             ├─ rust                   （条件付き。fmt / clippy / doctest。対象は workspace 全体か -p に絞る）
-#             ├─ rust-test              （条件付き。nextest を 3 台にシャーディング。対象は rust と同じ）
+#             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にする。対象は rust と同じ）
+#             │    └─ rust-test         （rust-test-build の後。アーカイブを 3 台にシャーディングして実行）
 #             ├─ rust-db-source         （条件付き。PostgreSQL）
 #             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
 #             ├─ e2e-chronogazer        （条件付き）
@@ -33,17 +34,19 @@
 #   全体 + 両アプリの E2E。root の package.json / pnpm-lock.yaml / lint・format・TS
 #   設定は全 frontend + 両 E2E。
 #
-# テストは rust-test ジョブの cargo-nextest（`--profile ci`、設定は
-# `.config/nextest.toml`）を 3 台のシャードに分けて走らせる（#ci-speed、2026-10-19。
-# それまでは rust ジョブ 1 本で fmt / clippy / nextest / doctest を直列に回し、
-# CI 全体 17〜25 分の大半がここだった）。doctest は nextest で走らないので、
-# rust ジョブが `cargo test --doc` を別の段で回す。rust と rust-test はどちらも
-# `run_rust` と `rust_args`（ci-changes.mjs の出力）を使う。
+# テストは cargo-nextest（`--profile ci`、設定は `.config/nextest.toml`）で走らせる
+# （#ci-speed、2026-10-19。それまでは rust ジョブ 1 本で fmt / clippy / nextest /
+# doctest を直列に回し、CI 全体 17〜25 分の大半がここだった）。rust-test-build が
+# テストバイナリを 1 回だけビルドして nextest archive（artifact `nextest-archive`、
+# 保持 1 日）にし、rust-test が 3 台のシャードでそれを展開して走らせる（ビルドしない。
+# 目的は Windows ランナーの使用時間の削減で、待ち時間は縮まらない）。doctest は nextest
+# で走らないので、rust ジョブが `cargo test --doc` を別の段で回す。rust・
+# rust-test-build はどちらも `run_rust` と `rust_args`（ci-changes.mjs の出力）を使う。
 # デバッグ情報は `CARGO_PROFILE_DEV_DEBUG=line-tables-only` で軽くしている。
-# `--timings` は rust ジョブの clippy と rust-test の nextest ビルドに付け、crate
-# ごとのビルド時間の HTML を artifact（`cargo-timings-clippy`・
-# `cargo-timings-test-<シャード番号>`、14 日）に残す。遅いテストは nextest の
-# junit.xml（artifact `nextest-junit-<シャード番号>`）と SLOW 表示で見る。
+# `--timings` は rust ジョブの clippy と rust-test-build の archive ビルドに付け、crate
+# ごとのビルド時間の HTML を artifact（`cargo-timings-clippy`・`cargo-timings-test`、
+# 14 日）に残す。遅いテストは nextest の junit.xml（artifact
+# `nextest-junit-<シャード番号>`）と SLOW 表示で見る。
 #
 # 将来 `apps/banto-scada` を足すとき:
 #   1. ci-changes.mjs の RULES に `^apps/banto-scada/` → `scada`（E2E を足すなら
@@ -331,23 +334,65 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # #ci-speed（2026-10-19）: 旧 `rust` ジョブから nextest を分け、3 台にシャーディング。
-  # 対象（`rust_args`）と実行条件（`run_rust`）は `rust` ジョブと同じ。
-  # - 各シャードがテストバイナリ全体をビルドする（ビルドは約 3 分）。3 台は並列なので
-  #   壁時計は 1 台分で、増えるのはランナーの使用時間だけ。
+  # #ci-speed（2026-10-19）: 旧 `rust` ジョブから nextest を分けた。ビルドは
+  # `rust-test-build` が 1 回だけ行い（nextest archive）、`rust-test`（3 シャード）は
+  # そのアーカイブを展開してテストを走らせるだけにする。対象（`rust_args`）と実行条件
+  # （`run_rust`）は `rust` ジョブと同じ。
+  # - 目的は Windows ランナーの使用時間の削減。それまでは 3 シャードが同じテスト
+  #   バイナリを各自ビルドしていた（各 3〜4 分 x 3 台）。待ち時間は縮まらない
+  #   （ビルド → テストが直列になる）ことは承知の上で、ビルドの 3 重化をやめる。
+  # - 新しく足した最初の 1 回はキャッシュが外れて、ビルドが長くなる。
+  rust-test-build:
+    name: Rust test build (nextest archive)
+    needs: changes
+    if: needs.changes.outputs.run_rust == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # rust ジョブと同じ（理由はそちらのコメント）。
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # このジョブは 1 本だけなので、保存の有無（main のみ保存するか等）は rust-cache の
+      # 既定の挙動に任せる（`save-if` は付けない）。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
+      # テストバイナリ一式を 1 つのアーカイブにまとめる（実行はしない）。
+      - name: build (nextest archive)
+        run: cargo nextest archive ${{ needs.changes.outputs.rust_args }} --archive-file nextest-archive.tar.zst --timings
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+      # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-test
+          path: target/cargo-timings/cargo-timing-*.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # #ci-speed（2026-10-19）: `rust-test-build` のアーカイブを 3 台にシャーディングして
+  # 走らせる。ビルドはしない（Rust ツールチェーンも rust-cache も使わない）。
   # - `--partition count:N/3` はテストを 1 件ずつ順に各シャードへ配る。`hash:` と違い
   #   件数が均等に近く、バイナリ単位の分け方と違い重い統合テストの偏りが出にくい
   #   （3735 テスト / 78 バイナリ）。
   # - test-groups（.config/nextest.toml の hub-default-mutex・heavy-runtime の直列化）は
   #   シャードの中でだけ効く。シャードは別のランナー（別のマシン）なので、
   #   シャードをまたいでぶつかる共有物（名前付き mutex・固定ポート）はそもそも無い。
-  # - Swatinem/rust-cache は 3 台とも `shared-key: rust-test` で同じキャッシュを読み、
-  #   保存は 1 台（シャード 1）だけにする（同じキーを 3 台が保存し合わない）。保存の
-  #   有無（main のみ保存するか等）は rust-cache の既定の挙動に任せる。このジョブを
-  #   足した最初の 1 回はキャッシュが外れて、ビルドが長くなる。
   rust-test:
     name: Rust test (nextest ${{ matrix.shard }}/3)
-    needs: changes
+    needs: [changes, rust-test-build]
     if: needs.changes.outputs.run_rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
@@ -355,24 +400,30 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3]
-    env:
-      # rust ジョブと同じ（理由はそちらのコメント）。
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      # checkout は `--workspace-remap`（ワークスペースの場所）のために要る。
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rust-test
-          save-if: ${{ matrix.shard == 1 }}
       # テストは cargo-nextest（テスト 1 件 = 1 プロセスで、バイナリをまたいで並列に
       # 走る）。同時に走るとぶつかるテストは .config/nextest.toml の test-groups で
       # 直列にしてある（理由もそこ）。ローカルでも `cargo nextest run` が使える。
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.148
+      - uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive
+      # `cargo nextest` ではなく `cargo-nextest nextest` と直接呼ぶ: リポジトリに
+      # rust-toolchain.toml があり、cargo を経由すると toolchain のダウンロードが走りうる
+      # （アーカイブの実行に Rust は要らない）。
+      # アーカイブは一時ディレクトリでなくワークスペース直下（`--extract-to .`）へ
+      # 展開する。chronogazer_server.rs などが `env!("CARGO_BIN_EXE_<bin>")`（コンパイル時
+      # の絶対パス。例 D:\a\banto-industrial\banto-industrial\target\debug\xxx.exe）で
+      # バイナリを起動するので、展開先の `target/` がビルドした台と同じ絶対パスに
+      # 無いと壊れる。GitHub のランナーは checkout 先が同じパスなので、ワークスペース
+      # 直下へ展開すれば一致する。`--extract-overwrite` は展開先に既存ファイルが
+      # あっても失敗させないため。
       - name: test (nextest)
-        run: cargo nextest run ${{ needs.changes.outputs.rust_args }} --profile ci --partition count:${{ matrix.shard }}/3 --timings
+        run: cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite --profile ci --partition count:${{ matrix.shard }}/3
       # テストごとの所要時間（遅いテスト探し用）。失敗しても残す。
       - name: Upload nextest junit
         if: always()
@@ -380,15 +431,6 @@ jobs:
         with:
           name: nextest-junit-${{ matrix.shard }}
           path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
-          retention-days: 14
-      # crate ごとのビルド時間（nextest のテストビルド）。
-      - name: Upload cargo timings
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cargo-timings-test-${{ matrix.shard }}
-          path: target/cargo-timings/cargo-timing-*.html
           if-no-files-found: ignore
           retention-days: 14
 
@@ -655,6 +697,7 @@ jobs:
       - frontend-hub
       - frontend-chronogazer
       - rust
+      - rust-test-build
       - rust-test
       - rust-db-source
       - linux-clippy
@@ -701,6 +744,7 @@ jobs:
           check frontend-hub run_frontend_hub
           check frontend-chronogazer run_frontend_chronogazer
           check rust run_rust
+          check rust-test-build run_rust
           check rust-test run_rust
           check rust-db-source run_rust_db_source
           check linux-clippy run_linux_clippy

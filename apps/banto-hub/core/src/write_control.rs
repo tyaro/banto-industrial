@@ -1935,7 +1935,11 @@ mod tests {
             for fault in faults {
                 let case = format!("DB enabled={db_enabled} file={initial:?} fault={fault:?}");
                 let dir = tempfile::tempdir().unwrap();
-                let pool = init_db(dir.path().join("registry.sqlite3")).await.unwrap();
+                // #ci-speed（2026-10-19）: テンプレートのコピー経由（init_db_from_template の doc 参照）。
+                let pool = crate::test_support::init_db_from_template(
+                    &dir.path().join("registry.sqlite3"),
+                )
+                .await;
                 let state_file = state_file_path(&dir.path().join("data"));
                 persist_enabled(&pool, db_enabled, None).await.unwrap();
                 std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();

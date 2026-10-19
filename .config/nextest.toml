@@ -1,4 +1,5 @@
-# cargo-nextest の設定（CI の rust-test ジョブが `cargo nextest run --profile ci` で使う。
+# cargo-nextest の設定（CI の rust-test ジョブが、rust-test-build の nextest archive を
+# `cargo-nextest nextest run --archive-file ... --profile ci` で実行するときに使う。
 # ローカルでも `cargo nextest run`（既定プロファイル）が使える）。
 #
 # ## なぜ nextest か

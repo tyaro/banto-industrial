@@ -56,6 +56,43 @@ const RETRY_DELAY: Duration = Duration::from_millis(50);
 // still typically within the first 1-2 attempts).
 const MAX_ATTEMPTS: u32 = 80;
 
+/// マイグレーション済みの空 DB ファイルのバイト列（1 プロセスで 1 回だけ作る）。
+static TEMPLATE_DB: tokio::sync::OnceCell<Vec<u8>> = tokio::sync::OnceCell::const_new();
+
+/// マイグレーション済みのテンプレート DB を `path` にコピーしてから
+/// [`crate::db::init_db`] で開く。`init_db` を毎回ゼロから走らせる代わりに使う。
+///
+/// #ci-speed（2026-10-19）: windows-latest の CI で、`init_db` の全マイグレー
+/// ション（1 本ごとにコミット = ディスクフラッシュ）を毎回走らせる unit test
+/// （`controller::tests::racing_start_and_begin_quit_never_silently_stop_a_new_run`
+/// の 50 回ループ、`write_control::tests::a_failed_or_crashed_resume_always_restarts_stopped`
+/// の 42 ケース）が 140〜150 秒かかった（ローカル Linux では 7〜9 秒。原因は
+/// 仮説で、CI の前後比較で確かめる）。テンプレートは `init_db` で作った後に
+/// `wal_checkpoint(TRUNCATE)` して pool を閉じ、本体ファイルのバイト列だけ保持する
+/// （チェックポイント後なので `-wal` / `-shm` は不要）。各回はそれを書き出して
+/// 本物の `init_db` を通すので、接続設定も検証（旧形式チェック・適用済み
+/// マイグレーションの照合）も本番と同じで、テストが確かめる内容は変わらない。
+pub(crate) async fn init_db_from_template(path: &Path) -> sqlx::SqlitePool {
+    let bytes = TEMPLATE_DB
+        .get_or_init(|| async {
+            let dir = TempDir::new("db-template");
+            let template = dir.path().join("template.sqlite3");
+            let pool = crate::db::init_db(&template)
+                .await
+                .expect("init_db (template)");
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&pool)
+                .await
+                .expect("wal_checkpoint");
+            pool.close().await;
+            std::fs::read(&template).expect("read template db")
+            // `dir` はここで drop され、バイト列を読み終えた後に消える。
+        })
+        .await;
+    std::fs::write(path, bytes).expect("write template db");
+    crate::db::init_db(path).await.expect("init_db (copy)")
+}
+
 /// A fresh temp directory for one unit test, cleaned up on drop. See this
 /// module's doc comment for why `drop` retries and why callers must control
 /// the drop order relative to any `SqlitePool` pointed at a file inside it.
