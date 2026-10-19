@@ -400,6 +400,10 @@ pub(crate) struct AppState {
     /// ページの読み込みが終わるたびに[`reapply_status_text`]が書き直す -
     /// eval が読み込みの前でも後でも、ページを再読み込みしても文言が残る。
     status_text: StdMutex<Option<String>>,
+    /// #661 661-5: プレースホルダ（`ui/index.html`）の URL（起動時の窓の URL）。Hub の画面
+    /// （Service・Desktop）を出している窓を Fallback の画面へ移すときの navigate 先
+    /// （[`apply_startup_outcome`]）。
+    placeholder_url: StdMutex<Option<tauri::Url>>,
     /// #661 661-5: デスクトップのログに書く行（起きた時刻つき）。運用モードの間は profile の
     /// `logs\` に書けないので覚えておき、このアプリの Hub が動き始めてから書く
     /// （[`flush_desktop_log`]）。
@@ -1264,10 +1268,38 @@ fn apply_startup_outcome(
             Some((status, controller))
         }
         StartupOutcome::Fallback(info) => {
+            // 文言を先に持たせてから移る（移った先の読み込みの完了で書き直される）。
             render_fallback(window, &info, state.can_operate_service);
+            let previous = match &*state.view.lock().expect("view mutex poisoned") {
+                ShellView::Desktop => launch_gate::WatchedView::Desktop,
+                ShellView::Service { .. } => launch_gate::WatchedView::Service,
+                ShellView::Fallback(prev) => launch_gate::WatchedView::Fallback(prev.cause),
+            };
+            // Hub の画面を出していた窓は、プレースホルダへ戻さないと文言もボタンも見えない。
+            if launch_gate::needs_placeholder_navigation(previous) {
+                navigate_to_placeholder(app, window);
+            }
             *state.view.lock().expect("view mutex poisoned") = ShellView::Fallback(info);
             None
         }
+    }
+}
+
+/// 窓をプレースホルダ（Fallback の画面）へ戻す。URL は起動時に覚えたもの。
+fn navigate_to_placeholder(app: &AppHandle, window: &WebviewWindow) {
+    let url = app
+        .state::<AppState>()
+        .placeholder_url
+        .lock()
+        .expect("placeholder_url mutex poisoned")
+        .clone();
+    match url {
+        Some(url) => {
+            if let Err(err) = window.navigate(url) {
+                eprintln!("banto-hub-shell: 窓をプレースホルダへ戻せませんでした: {err}");
+            }
+        }
+        None => eprintln!("banto-hub-shell: プレースホルダの URL が分からないため窓を移せません"),
     }
 }
 
@@ -2119,6 +2151,17 @@ fn repair_profile_acl(profile_id: &str) -> Result<(), String> {
 #[cfg(windows)]
 const SERVICE_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// 見張りが Fallback の窓に移す結果（診断は SCM の状態だけ）。
+#[cfg(windows)]
+fn watch_fallback(scm_state: Option<ScmState>, cause: FallbackCause) -> StartupOutcome {
+    StartupOutcome::Fallback(FallbackInfo {
+        scm_state,
+        health: None,
+        desktop_error: None,
+        cause,
+    })
+}
+
 /// サービスの見張り（#661 661-5）: サービスに接続している間にサービスが止まったら（終了コード
 /// 4・5 を含む）、合う Fallback の窓へ移る。止まる途中（StopPending）で一般の窓に移った後も、
 /// 停止に達したら終了コードと profile の形で理由を選び直す（#690）。**Hub は決して起動しない**
@@ -2158,42 +2201,49 @@ fn spawn_service_watch(app: AppHandle) {
         } else {
             ProfileModeObservation::NotObserved
         };
-        let cause = match launch_gate::on_watch_tick(watched, scm.as_ref(), &mode, fault) {
+        let outcome = match launch_gate::on_watch_tick(watched, scm.as_ref(), &mode, fault) {
             launch_gate::WatchStep::Stay => continue,
             launch_gate::WatchStep::ToFallback(cause) | launch_gate::WatchStep::Refresh(cause) => {
-                cause
+                watch_fallback(scm.clone(), cause)
             }
+            // サービスが Running に戻った: health が Healthy なら Service の画面へ戻す。そうでなければ
+            // 理由を直すだけ（直す所が無ければ何もしない）。
+            launch_gate::WatchStep::Reconnect(cause) => {
+                match probe_service_or_fallback(&expected_probe_target()) {
+                    service @ StartupOutcome::Service { .. } => service,
+                    _ if launch_gate::WatchedView::Fallback(cause) == watched => continue,
+                    _ => watch_fallback(scm.clone(), cause),
+                }
+            }
+        };
+        let cause = match &outcome {
+            StartupOutcome::Fallback(info) => Some(info.cause),
+            _ => None,
         };
         // 照会の間に切り替えが始まっていたら任せる（進行中フラグを取ってから適用する）。
         if !host_switch_ipc::try_begin_switch() {
             continue;
         }
         log_line(&format!(
-            "banto-hub-shell: サービスの見張り: サービス {} - 窓 {cause:?}",
+            "banto-hub-shell: サービスの見張り: サービス {} - 窓 {}",
             scm.as_ref()
-                .map_or_else(|| "確認できませんでした".to_string(), ToString::to_string)
+                .map_or_else(|| "確認できませんでした".to_string(), ToString::to_string),
+            cause.map_or_else(|| "Service".to_string(), |cause| format!("{cause:?}"))
         ));
-        if cause == (FallbackCause::OperationStopped { left_tight: true }) {
+        if cause == Some(FallbackCause::OperationStopped { left_tight: true }) {
             push_desktop_log(&app, desktop_log::LOG_LEFT_TIGHT);
         }
         if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-            apply_outcome_and_sync(
-                &app,
-                &window,
-                StartupOutcome::Fallback(FallbackInfo {
-                    scm_state: scm,
-                    health: None,
-                    desktop_error: None,
-                    cause,
-                }),
-            );
+            apply_outcome_and_sync(&app, &window, outcome);
         }
         host_switch_ipc::end_switch();
         // `/status` を開いていれば、理由に合う文言と操作を出す（切り替えの失敗ではないので、
         // 文は窓の見出しだけ）。
         let mut progress = progress_after_apply(&app);
-        progress.phase = "stopped";
-        progress.message = progress.error.clone().unwrap_or_default();
+        if cause.is_some() {
+            progress.phase = "stopped";
+            progress.message = progress.error.clone().unwrap_or_default();
+        }
         emit_done(&app, progress);
     });
 }
@@ -2373,6 +2423,7 @@ pub fn run() {
             can_operate_service: is_current_process_operator().unwrap_or(false)
                 || is_current_process_admin().unwrap_or(false),
             status_text: StdMutex::new(None),
+            placeholder_url: StdMutex::new(None),
             pending_log: StdMutex::new(Vec::new()),
         })
         .setup(|app| {
@@ -2388,6 +2439,11 @@ pub fn run() {
 
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
+            // 窓が最初に読んでいるのはプレースホルダ。サービスが止まったときの navigate 先に覚える。
+            *app.state::<AppState>()
+                .placeholder_url
+                .lock()
+                .expect("placeholder_url mutex poisoned") = window.url().ok();
             let target = expected_probe_target();
             let slot = Arc::clone(&app.state::<AppState>().hub);
             let outcome = decide_startup(&target, &slot);

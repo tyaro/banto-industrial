@@ -239,6 +239,16 @@ pub(crate) enum WatchStep {
     ToFallback(FallbackCause),
     /// Fallback のまま理由を変える。
     Refresh(FallbackCause),
+    /// Fallback の間にサービスが Running に戻った: health を確かめて Healthy なら Service の画面へ
+    /// 戻す。Healthy でなければ、窓は渡した理由（[`carry_cause`] の結果）に直すだけ。
+    Reconnect(FallbackCause),
+}
+
+/// 窓を Fallback の画面（プレースホルダ）へ移す（navigate）必要があるか（純関数）。
+/// Hub の画面（Desktop・Service）を出している窓は、文言を書いても見えないので移す必要がある。
+/// すでに Fallback の窓（プレースホルダ）なら書き換えだけ。
+pub(crate) fn needs_placeholder_navigation(previous: WatchedView) -> bool {
+    !matches!(previous, WatchedView::Fallback(_))
 }
 
 /// 見張りの 1 回（純関数）。**Desktop は決して返さない**（自動では Hub を起動しない）。`mode` は
@@ -266,7 +276,9 @@ pub(crate) fn on_watch_tick(
             } else {
                 carry_cause(current, scm)
             };
-            if next == current {
+            if scm == Some(&ScmState::Running) {
+                WatchStep::Reconnect(next)
+            } else if next == current {
                 WatchStep::Stay
             } else {
                 WatchStep::Refresh(next)
@@ -626,6 +638,51 @@ mod tests {
             ),
             WatchStep::Stay
         );
+    }
+
+    #[test]
+    fn the_window_returns_to_the_service_screen_when_the_service_runs_again() {
+        // Fallback（4・5 の窓も一般の窓も）でサービスが Running に戻ったら、つなぎ直しを試みる。
+        // 渡す理由は、モードの理由を一般に戻したもの。
+        for (cause, carried) in [
+            (FallbackCause::ServiceLost, FallbackCause::ServiceLost),
+            (FallbackCause::General, FallbackCause::General),
+            (FallbackCause::CannotOperate, FallbackCause::General),
+            (
+                FallbackCause::OperationStopped { left_tight: true },
+                FallbackCause::General,
+            ),
+        ] {
+            assert_eq!(
+                on_watch_tick(
+                    WatchedView::Fallback(cause),
+                    Some(&ScmState::Running),
+                    &ProfileModeObservation::NotObserved,
+                    None,
+                ),
+                WatchStep::Reconnect(carried),
+                "{cause:?}"
+            );
+        }
+        // 反証: 止まったまま（Stopped）なら、つなぎ直しは試みない。
+        assert!(!matches!(
+            on_watch_tick(
+                WatchedView::Fallback(FallbackCause::ServiceLost),
+                Some(&ScmState::Stopped),
+                &LOOSE,
+                None,
+            ),
+            WatchStep::Reconnect(_)
+        ));
+    }
+
+    #[test]
+    fn only_hub_screens_need_navigation_to_the_placeholder() {
+        assert!(needs_placeholder_navigation(WatchedView::Service));
+        assert!(needs_placeholder_navigation(WatchedView::Desktop));
+        assert!(!needs_placeholder_navigation(WatchedView::Fallback(
+            FallbackCause::General
+        )));
     }
 
     #[test]
