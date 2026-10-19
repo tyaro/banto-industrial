@@ -20,6 +20,9 @@
 //!   起動（profile の排他・DB を開く）が最後の防衛線（ChronoGazer と同じ）。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::Serialize;
 
 use banto_hub_core::host_switch::{RelaxOnlyOutcome, ServiceFault, SwitchPhase};
 use banto_hub_core::profile_mode::ProfileShape;
@@ -407,8 +410,140 @@ pub(crate) fn cause_page(cause: FallbackCause) -> Option<(&'static str, Vec<&'st
     }
 }
 
+// ---------------------------------------------------------------------------
+// 見張りの結果の鮮度（#706 レビュー）
+// ---------------------------------------------------------------------------
+
+/// 画面（`ShellView`）の世代。画面を書き換えるたびに（どの経路でも）、画面のロックを持ったまま
+/// 進める（[`ViewGeneration::advance`]）。見張りは観測したときの世代を覚えておき、適用の直前に
+/// 今の世代と比べる（[`watch_result_is_fresh`]）。
+///
+/// 画面の種類だけを比べると、観測の後に Service → Desktop → Service と移った場合（ABA）を
+/// 見分けられないので、世代で比べる。
+#[derive(Debug, Default)]
+pub(crate) struct ViewGeneration(AtomicU64);
+
+impl ViewGeneration {
+    pub(crate) fn current(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn advance(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 見張りが観測した画面（世代と種類）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ViewStamp {
+    pub(crate) generation: u64,
+    pub(crate) view: WatchedView,
+}
+
+/// 見張りの結果をまだ適用してよいか（純関数）。観測の後に画面が一度でも変わっていたら
+/// （切り替え・再試行・「設定モードに戻す」）、その結果は古いので捨てる。古い Fallback を適用
+/// すると、切り替えで起動したばかりの Hub まで止める（`apply_startup_outcome` は非 Desktop の
+/// 結果の前に Hub を止める）。
+pub(crate) fn watch_result_is_fresh(observed: ViewStamp, now: ViewStamp) -> bool {
+    observed == now
+}
+
+/// Fallback の窓で、理由が同じでも SCM の状態が変わったら表示を直す（純関数。#706 レビュー）。
+/// 外から STOP すると `StopPending` で Fallback（ServiceLost）に移り、`Stopped` になっても理由は
+/// ServiceLost のままなので、[`on_watch_tick`] だけでは窓の SCM の状態（とトレイの「サービスを
+/// 開始」）が `StopPending` のまま残る。照会に失敗した回（`scm` が `None`）は直さない
+/// （一時的かもしれないので、表示を「確認できませんでした」に揺らさない）。
+pub(crate) fn refresh_on_scm_change(
+    step: WatchStep,
+    view: WatchedView,
+    shown: Option<&ScmState>,
+    scm: Option<&ScmState>,
+) -> WatchStep {
+    match (step, view) {
+        (WatchStep::Stay, WatchedView::Fallback(cause)) if scm.is_some() && scm != shown => {
+            WatchStep::Refresh(cause)
+        }
+        _ => step,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback の窓の操作（#706 レビュー）
+// ---------------------------------------------------------------------------
+
+/// Fallback の窓（プレースホルダ）とトレイに出す操作。`id` はトレイのメニューの id、`command` は
+/// プレースホルダが invoke するコマンド（`build.rs` の ACL と capabilities に載せたもの）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct PageAction {
+    pub(crate) id: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) command: &'static str,
+}
+
+pub(crate) const ACTION_START_SERVICE: PageAction = PageAction {
+    id: "start_service",
+    label: "サービスを開始",
+    command: "switch_to_service",
+};
+pub(crate) const ACTION_RESTORE_SETTING: PageAction = PageAction {
+    id: "restore_setting",
+    label: "設定モードに戻す",
+    command: "restore_setting_mode",
+};
+pub(crate) const ACTION_RETRY: PageAction = PageAction {
+    id: "retry",
+    label: "再試行",
+    command: "retry_startup",
+};
+
+/// Fallback の窓の操作（純関数。トレイと同じ集合・同じ順）。`start_allowed` は
+/// `tray_status::show_start_service_action` の結果（Operators かつ SCM が Stopped で、health が
+/// あいまいでない）。「設定モードに戻す」 は profile が締まったまま止まっている理由だけ
+/// （戻らなければ管理者の許可で修復するので、Operators でなくても出す）。再試行は常に出す。
+pub(crate) fn fallback_actions(cause: FallbackCause, start_allowed: bool) -> Vec<PageAction> {
+    let mut actions = Vec::new();
+    if start_allowed {
+        actions.push(ACTION_START_SERVICE);
+    }
+    if cause.offers_restore() {
+        actions.push(ACTION_RESTORE_SETTING);
+    }
+    actions.push(ACTION_RETRY);
+    actions
+}
+
+// ---------------------------------------------------------------------------
+// 修復の前の root の確かめ（#706 レビュー）
+// ---------------------------------------------------------------------------
+
+/// 昇格ヘルパーの修復（引数なしの `grant-profile-acl`）を起動してよいか（純関数）。ヘルパーは
+/// **マシンの環境**の root（`BANTO_HUB_ROOT`、未設定なら既定）を使い、シェルは**このプロセスの
+/// 環境**で root を解く。両者が違えば、ヘルパーは別の root の default を書き換えてしまうので、
+/// 一致しない・確かめられない（`helper_root` が `Err`）ときは起動せず、手順の案内を返す。
+/// 比べ方はヘルパーの本当のパスの確かめと同じ（[`banto_safe_root::guard::paths_match`]。要素
+/// ごと・大文字小文字を無視・末尾の区切りは要素に現れない）。
+pub(crate) fn check_repair_root(
+    shell_root: &Path,
+    helper_root: Result<&Path, &str>,
+) -> Result<(), String> {
+    let manual = "管理者が banto-hub-elev.exe grant-profile-acl で戻してください";
+    match helper_root {
+        Ok(root) if banto_safe_root::guard::paths_match(shell_root, root) => Ok(()),
+        Ok(root) => Err(format!(
+            "このアプリの Hub のルート（{}）が、管理者の修復が使うルート（{}。マシンの環境変数 BANTO_HUB_ROOT、未設定なら既定）と違うため、修復しませんでした。{manual}",
+            shell_root.display(),
+            root.display()
+        )),
+        Err(reason) => Err(format!(
+            "管理者の修復が使うルートを確かめられなかったため、修復しませんでした（{reason}）。{manual}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn all_states() -> Vec<Option<ScmState>> {
@@ -783,5 +918,118 @@ mod tests {
         assert!(switch_phase_message(&SwitchPhase::AwaitingServiceRelease)
             .is_some_and(|t| t.contains("元に戻しています")));
         assert!(switch_phase_message(&SwitchPhase::Idle).is_none());
+    }
+
+    /// #706 レビュー（Codex P1）: 見張りが Service を観測した後・適用の前に、切り替えで Desktop へ
+    /// 移っていたら、その結果は捨てる。Service → Desktop → Service と戻っていても（ABA）捨てる。
+    #[test]
+    fn a_watch_result_observed_before_the_view_changed_is_dropped() {
+        let generation = ViewGeneration::default();
+        let stamp = |view| ViewStamp {
+            generation: generation.current(),
+            view,
+        };
+        // 1. 見張りが Service の画面を観測する。
+        let observed = stamp(WatchedView::Service);
+        // 反証: 何も変わっていなければ適用してよい。
+        assert!(watch_result_is_fresh(observed, stamp(WatchedView::Service)));
+        // 2〜4. 切り替えが終わって Desktop が起動した（画面を書き換えるたびに世代が進む）。
+        generation.advance();
+        assert!(!watch_result_is_fresh(
+            observed,
+            stamp(WatchedView::Desktop)
+        ));
+        // ABA: その後また Service に戻っても、観測した画面とは別物。
+        generation.advance();
+        assert!(!watch_result_is_fresh(
+            observed,
+            stamp(WatchedView::Service)
+        ));
+    }
+
+    /// #706 レビュー（オーナー P2）: 正常な外部 STOP（StopPending → Stopped/0・緩んだ profile）で、
+    /// 理由は ServiceLost のままでも SCM の状態を直し、トレイの「サービスを開始」が出る。
+    #[test]
+    fn a_clean_external_stop_refreshes_the_scm_state_and_offers_start() {
+        let view = WatchedView::Fallback(FallbackCause::ServiceLost);
+        let scm = Some(&ScmState::Stopped);
+        let step = on_watch_tick(view, scm, &LOOSE, None);
+        assert_eq!(step, WatchStep::Stay, "理由は変わらない");
+        let step = refresh_on_scm_change(step, view, Some(&ScmState::StopPending), scm);
+        assert_eq!(step, WatchStep::Refresh(FallbackCause::ServiceLost));
+        // 直した窓の SCM の状態（Stopped）で、開始の条件を満たす。
+        assert!(crate::tray_status::show_start_service_action(
+            scm, None, true
+        ));
+        assert!(fallback_actions(FallbackCause::ServiceLost, true).contains(&ACTION_START_SERVICE));
+        // 反証: 表示がすでに Stopped なら何もしない。照会に失敗した回も直さない。
+        assert_eq!(
+            refresh_on_scm_change(WatchStep::Stay, view, scm, scm),
+            WatchStep::Stay
+        );
+        assert_eq!(
+            refresh_on_scm_change(WatchStep::Stay, view, Some(&ScmState::StopPending), None),
+            WatchStep::Stay
+        );
+        // Service・Desktop の画面の Stay は変えない（Fallback の窓だけの話）。
+        assert_eq!(
+            refresh_on_scm_change(WatchStep::Stay, WatchedView::Desktop, None, scm),
+            WatchStep::Stay
+        );
+    }
+
+    #[test]
+    fn fallback_actions_match_the_tray_for_each_cause() {
+        let ids = |cause, start| -> Vec<&str> {
+            fallback_actions(cause, start)
+                .iter()
+                .map(|action| action.id)
+                .collect()
+        };
+        assert_eq!(
+            ids(FallbackCause::OperationStopped { left_tight: true }, true),
+            ["start_service", "restore_setting", "retry"]
+        );
+        // Operators でなくても「設定モードに戻す」は出す（修復の UAC が最後の手段）。
+        assert_eq!(
+            ids(FallbackCause::OperationStopped { left_tight: false }, false),
+            ["restore_setting", "retry"]
+        );
+        assert_eq!(ids(FallbackCause::ServiceLost, false), ["retry"]);
+        assert_eq!(
+            ids(FallbackCause::CannotOperate, true),
+            ["start_service", "retry"]
+        );
+        // invoke するコマンドは build.rs の ACL に載せた名前。
+        let build_rs = include_str!("../build.rs");
+        for action in [ACTION_START_SERVICE, ACTION_RESTORE_SETTING, ACTION_RETRY] {
+            assert!(
+                build_rs.contains(&format!("\"{}\"", action.command)),
+                "{action:?}"
+            );
+        }
+    }
+
+    /// #706 レビュー（オーナー P2）: 修復の前に、シェルの root とヘルパーの root（マシンの環境）が
+    /// 一致するかを確かめる。大文字小文字と末尾の区切りは違いにしない。
+    #[test]
+    fn repair_runs_only_when_the_helper_uses_the_same_root() {
+        let base = std::env::temp_dir();
+        let root = base.join("BantoHub");
+        let upper = base.join("BANTOHUB");
+        let trailing = PathBuf::from(format!("{}{}", root.display(), std::path::MAIN_SEPARATOR));
+        assert_eq!(check_repair_root(&root, Ok(&root)), Ok(()));
+        assert_eq!(check_repair_root(&root, Ok(&upper)), Ok(()));
+        assert_eq!(check_repair_root(&root, Ok(&trailing)), Ok(()));
+        // 反証: 別の root・確かめられないときは起動せず、手順を案内する。
+        let other = base.join("other");
+        let refused = check_repair_root(&other, Ok(&root)).expect_err("別の root");
+        assert!(refused.contains("grant-profile-acl"), "{refused}");
+        assert!(refused.contains(&other.display().to_string()), "{refused}");
+        let refused =
+            check_repair_root(&root, Err("マシンの環境変数を読めませんでした")).expect_err("不明");
+        assert!(refused.contains("読めませんでした"), "{refused}");
+        // 中（子）も別物。
+        assert!(check_repair_root(&root.join("default"), Ok(&root)).is_err());
     }
 }

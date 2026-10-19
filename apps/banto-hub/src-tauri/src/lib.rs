@@ -379,6 +379,10 @@ pub(crate) struct AppState {
     /// T16-2: 現在シェルが表示している見え方（[`ShellView`]）。
     /// トレイメニューの再構築・「サービスを開始/停止」「再試行」の分岐に使う。
     pub(crate) view: StdMutex<ShellView>,
+    /// #706 レビュー: [`view`](Self::view) の世代。画面を書き換えるたびに、`view` のロックを
+    /// 持ったまま進める（[`set_view`]）。見張りは観測した世代と適用の直前の世代を比べ、違えば
+    /// 結果を捨てる（[`launch_gate::watch_result_is_fresh`]）。
+    view_generation: launch_gate::ViewGeneration,
     /// T16-2: `is_current_process_operator().unwrap_or(false)`
     /// （実装指示 4.「Operators 委任」）。T16-2 第二スライスで
     /// `is_current_process_admin().unwrap_or(false)`との論理和になった
@@ -399,7 +403,8 @@ pub(crate) struct AppState {
     /// 残っていた（#514、実機の計測で確認）。そこで文言をここに持っておき、
     /// ページの読み込みが終わるたびに[`reapply_status_text`]が書き直す -
     /// eval が読み込みの前でも後でも、ページを再読み込みしても文言が残る。
-    status_text: StdMutex<Option<String>>,
+    /// #706 レビュー: 文言と一緒に、Fallback の窓の操作のボタンも持つ（[`PlaceholderPage`]）。
+    status_text: StdMutex<Option<PlaceholderPage>>,
     /// #661 661-5: プレースホルダ（`ui/index.html`）の URL（起動時の窓の URL）。Hub の画面
     /// （Service・Desktop）を出している窓を Fallback の画面へ移すときの navigate 先
     /// （[`apply_startup_outcome`]）。
@@ -414,8 +419,8 @@ pub(crate) struct AppState {
 /// JS 文字列リテラルへの最小エスケープ。[`show_startup_error`]・
 /// [`render_fallback`] が プレースホルダ (`ui/index.html`) へ
 /// [`WebviewWindow::eval`] でエラー文言を書き込むためだけに使う小さな
-/// ヘルパー - この用途のためだけに `serde_json` 依存を増やさない
-/// （実装指示「serde 等は最小限」）。埋め込む文字列は `HubStartError`
+/// ヘルパー（#706 レビューで操作のボタンを渡すために `serde_json` を通常の依存にしたが、
+/// 文言はこれまでどおりこの関数で埋め込む）。埋め込む文字列は `HubStartError`
 /// （`thiserror` 由来の日本語定型文）や[`tray_status`]の純粋関数が返す
 /// 固定文言由来で、任意の外部入力（HTML/JS インジェクション経路）を
 /// 埋め込むことはない。
@@ -435,11 +440,23 @@ fn js_string_literal(value: &str) -> String {
 /// ことがある）なら`DOMContentLoaded`を待ってから書き込み、それ以外なら
 /// すぐ書き込む。要素が無い文書（navigate した後の Hub の画面など）では
 /// 何もしない - 例外を投げない。
-fn status_text_script(message: &str) -> String {
+///
+/// #706 レビュー: 操作のボタン（`actions`）も渡す。プレースホルダの
+/// `window.__bantoHubRenderActions` が描く（Hub の画面には無いので何もしない）。操作は
+/// [`launch_gate::PageAction`] の固定の値だけで、JSON にして埋め込む。
+fn status_text_script(page: &PlaceholderPage) -> String {
+    let actions = serde_json::to_string(&page.actions).expect("PageAction serializes");
     format!(
-        "(function () {{var message = {};function apply() {{var el = document.getElementById('banto-hub-status');if (el) {{ el.textContent = message; }}}}if (document.readyState === 'loading') {{document.addEventListener('DOMContentLoaded', apply, {{ once: true }});}} else {{ apply(); }}}})();",
-        js_string_literal(message)
+        "(function () {{var message = {};var actions = {actions};function apply() {{var el = document.getElementById('banto-hub-status');if (el) {{ el.textContent = message; }}if (typeof window.__bantoHubRenderActions === 'function') {{ window.__bantoHubRenderActions(actions); }}}}if (document.readyState === 'loading') {{document.addEventListener('DOMContentLoaded', apply, {{ once: true }});}} else {{ apply(); }}}})();",
+        js_string_literal(&page.message)
     )
+}
+
+/// プレースホルダ（`ui/index.html`）に出す中身（#706 レビュー）: 文言と操作のボタン。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlaceholderPage {
+    message: String,
+    actions: Vec<launch_gate::PageAction>,
 }
 
 /// `#banto-hub-status`の文言を書き換える共通ヘルパー（[`show_startup_error`]・
@@ -451,13 +468,26 @@ fn status_text_script(message: &str) -> String {
 /// 文言を保存するので、読み込みの完了がこの保存より前なら eval の時点で
 /// 文書は読み込み済み、後なら完了時の書き直しが保存済みの文言を読む）。
 fn set_status_text(window: &WebviewWindow, message: &str) {
+    set_placeholder_page(
+        window,
+        PlaceholderPage {
+            message: message.to_string(),
+            actions: Vec::new(),
+        },
+    );
+}
+
+/// [`set_status_text`] の、操作のボタンも出す形（#706 レビュー。Fallback の窓 -
+/// [`render_fallback`]）。
+fn set_placeholder_page(window: &WebviewWindow, page: PlaceholderPage) {
+    let script = status_text_script(&page);
     if let Some(state) = window.try_state::<AppState>() {
         *state
             .status_text
             .lock()
-            .expect("status_text mutex poisoned") = Some(message.to_string());
+            .expect("status_text mutex poisoned") = Some(page);
     }
-    if let Err(err) = window.eval(status_text_script(message)) {
+    if let Err(err) = window.eval(script) {
         eprintln!("banto-hub-shell: 画面表示の更新に失敗しました: {err}");
     }
 }
@@ -474,13 +504,13 @@ fn reapply_status_text<R: Runtime>(webview: &Webview<R>, event: PageLoadEvent) {
     let Some(state) = webview.try_state::<AppState>() else {
         return;
     };
-    let message = state
+    let page = state
         .status_text
         .lock()
         .expect("status_text mutex poisoned")
         .clone();
-    if let Some(message) = message {
-        if let Err(err) = webview.eval(status_text_script(&message)) {
+    if let Some(page) = page {
+        if let Err(err) = webview.eval(status_text_script(&page)) {
             eprintln!("banto-hub-shell: 画面表示の更新に失敗しました: {err}");
         }
     }
@@ -524,16 +554,37 @@ fn fallback_message(info: &FallbackInfo, can_operate: bool) -> String {
         lines.push(format!("このアプリでの起動に失敗しました: {err}"));
     }
     lines.push(if can_operate {
-        "タスクトレイからサービスの開始・停止や再試行を操作できます。".to_string()
+        "下のボタンかタスクトレイからサービスの開始・停止や再試行を操作できます。".to_string()
     } else {
-        "サービス操作には 'BantoHub Operators' グループへの参加が必要です。トレイの「再試行」で状態を再確認できます。".to_string()
+        "サービス操作には 'BantoHub Operators' グループへの参加が必要です。下のボタンかトレイの「再試行」で状態を再確認できます。".to_string()
     });
     lines.join("\n")
 }
 
 /// [`decide_startup`]が`StartupOutcome::Fallback`を返したときに呼ぶ表示更新。
 fn render_fallback(window: &WebviewWindow, info: &FallbackInfo, can_operate: bool) {
-    set_status_text(window, &fallback_message(info, can_operate));
+    set_placeholder_page(window, fallback_page(info, can_operate));
+}
+
+/// Fallback の窓の中身（純関数。#706 レビュー）: 文言（[`fallback_message`]）と、理由に合う
+/// 操作（トレイと同じ集合 - [`launch_gate::fallback_actions`]・[`build_fallback_tray_menu`]）。
+fn fallback_page(info: &FallbackInfo, can_operate: bool) -> PlaceholderPage {
+    PlaceholderPage {
+        message: fallback_message(info, can_operate),
+        actions: fallback_actions(info, can_operate),
+    }
+}
+
+/// Fallback の窓とトレイの操作（[`launch_gate::fallback_actions`] に開始の条件を渡す）。
+fn fallback_actions(info: &FallbackInfo, can_operate: bool) -> Vec<launch_gate::PageAction> {
+    launch_gate::fallback_actions(
+        info.cause,
+        tray_status::show_start_service_action(
+            info.scm_state.as_ref(),
+            info.health.as_ref(),
+            can_operate,
+        ),
+    )
 }
 
 /// [`HubRuntime::start`] 成功後、プレースホルダから Hub 自身の管理画面
@@ -1247,7 +1298,7 @@ fn apply_startup_outcome(
             scm_state,
         } => {
             navigate_to_hub(window, &format_host_port(&host, port));
-            *state.view.lock().expect("view mutex poisoned") = ShellView::Service { scm_state };
+            set_view(&state, ShellView::Service { scm_state });
             None
         }
         StartupOutcome::Desktop(started) => {
@@ -1263,7 +1314,7 @@ fn apply_startup_outcome(
             }
             let status = controller.status();
             *state.controller.lock().expect("controller mutex poisoned") = Some(controller.clone());
-            *state.view.lock().expect("view mutex poisoned") = ShellView::Desktop;
+            set_view(&state, ShellView::Desktop);
             navigate_to_hub(window, &addr.to_string());
             Some((status, controller))
         }
@@ -1279,10 +1330,39 @@ fn apply_startup_outcome(
             if launch_gate::needs_placeholder_navigation(previous) {
                 navigate_to_placeholder(app, window);
             }
-            *state.view.lock().expect("view mutex poisoned") = ShellView::Fallback(info);
+            set_view(&state, ShellView::Fallback(info));
             None
         }
     }
+}
+
+/// 画面を書き換え、同じロックの中で世代を進める（#706 レビュー。画面を変える経路はすべてここを
+/// 通る - 切り替え・再試行・「設定モードに戻す」・見張り・起動の判定）。
+fn set_view(state: &AppState, view: ShellView) {
+    let mut current = state.view.lock().expect("view mutex poisoned");
+    *current = view;
+    state.view_generation.advance();
+}
+
+/// 見張りが見る画面と世代、窓に出している SCM の状態（#706 レビュー。同じロックで読む）。
+#[cfg(windows)]
+fn watched_view(state: &AppState) -> (launch_gate::ViewStamp, Option<ScmState>) {
+    let current = state.view.lock().expect("view mutex poisoned");
+    let (view, shown) = match &*current {
+        ShellView::Desktop => (launch_gate::WatchedView::Desktop, None),
+        ShellView::Service { scm_state } => {
+            (launch_gate::WatchedView::Service, Some(scm_state.clone()))
+        }
+        ShellView::Fallback(info) => (
+            launch_gate::WatchedView::Fallback(info.cause),
+            info.scm_state.clone(),
+        ),
+    };
+    let stamp = launch_gate::ViewStamp {
+        generation: state.view_generation.current(),
+        view,
+    };
+    (stamp, shown)
 }
 
 /// 窓をプレースホルダ（Fallback の画面）へ戻す。URL は起動時に覚えたもの。
@@ -1376,27 +1456,23 @@ fn build_service_tray_menu(
 /// Operators かつ SCM が`Stopped`のときだけ
 /// （[`tray_status::show_start_service_action`]、実装指示 3.「Hide start
 /// when health outcomes are ...」）。
+///
+/// #706 レビュー: 操作は Fallback の窓のボタンと同じ集合（[`fallback_actions`]）。
 fn build_fallback_tray_menu(
     app: &AppHandle,
-    scm_state: Option<&ScmState>,
-    health: Option<&HealthOutcome>,
+    info: &FallbackInfo,
     can_operate: bool,
-    cause: FallbackCause,
 ) -> tauri::Result<Menu<Wry>> {
     let status_item = MenuItemBuilder::with_id("status", tray_status::fallback_status_label())
         .enabled(false)
         .build(app)?;
     let mut builder = MenuBuilder::new(app).item(&status_item).separator();
     builder = builder.text("open", "画面を開く");
-    if tray_status::show_start_service_action(scm_state, health, can_operate) {
-        builder = builder.text("start_service", "サービスを開始");
-    }
-    // #661 661-5: profile が締まったまま止まっている窓では「設定モードに戻す」を出す
+    // #661 661-5: profile が締まったまま止まっている窓では「設定モードに戻す」も出る
     // （`relax-only`。戻らなければ管理者の許可で修復するので、Operators でなくても出す）。
-    if cause.offers_restore() {
-        builder = builder.text("restore_setting", "設定モードに戻す");
+    for action in fallback_actions(info, can_operate) {
+        builder = builder.text(action.id, action.label);
     }
-    builder = builder.text("retry", "再試行");
     builder = builder.text("quit", "終了");
     builder.build()
 }
@@ -1430,13 +1506,7 @@ fn tray_content_for_view(
         }
         ShellView::Fallback(info) => {
             let tooltip = tray_status::fallback_tooltip_text();
-            let menu = build_fallback_tray_menu(
-                app,
-                info.scm_state.as_ref(),
-                info.health.as_ref(),
-                can_operate,
-                info.cause,
-            )?;
+            let menu = build_fallback_tray_menu(app, info, can_operate)?;
             Ok((tooltip, menu))
         }
     }
@@ -1511,7 +1581,20 @@ fn apply_outcome_and_sync(app: &AppHandle, window: &WebviewWindow, outcome: Star
 /// 呼ぶだけで、`HostSwitchEngine`は使わない（単なる状態の再評価であり、
 /// 明示的な切替操作ではないため - 「サービスを開始/停止」は
 /// [`run_host_switch`]を使う）。
+///
+/// #706 レビュー: 画面を変えるので、切り替えと同じ進行中フラグを取る（見張りが古い結果を
+/// 適用しないための前提 - [`spawn_service_watch`]）。進行中ならトレイへ知らせて何もしない。
 fn retry_startup(app: &AppHandle) {
+    if !host_switch_ipc::begin_switch_or_warn(app) {
+        return;
+    }
+    retry_startup_locked(app);
+    host_switch_ipc::end_switch();
+}
+
+/// [`retry_startup`] の本体。呼ぶ側が進行中フラグを取ってから呼ぶ（Fallback の窓の [再試行]
+/// - `host_switch_ipc::retry_startup` - も使う）。
+pub(crate) fn retry_startup_locked(app: &AppHandle) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
         return;
     };
@@ -2090,7 +2173,7 @@ fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress
                 push_desktop_log(app, desktop_log::LOG_LEFT_TIGHT);
             }
             emit_running(app, launch_gate::RESTORE_REPAIRING_MESSAGE);
-            match repair_profile_acl(&target.profile_id) {
+            match repair_profile_acl(target) {
                 Ok(()) => {
                     push_desktop_log(app, desktop_log::log_restored_by("管理者の許可で修復"));
                     None
@@ -2129,14 +2212,24 @@ fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress
 /// 昇格ヘルパーで profile の ACL を設定モードの形に直す（`grant-profile-acl`、UAC。呼ぶ
 /// スレッドは終わるまで止まる）。既定の profile は引数なし（対話ユーザー・既定 profile）。
 /// それ以外の profile は利用者の名前を確かに渡せないので、手順を案内して断る。
+///
+/// #706 レビュー: 引数なしの `grant-profile-acl` は**マシンの環境**の root を使う。シェルは
+/// このプロセスの環境で root を解くので、起動する前に両者が一致するかを確かめ、一致しない・
+/// 確かめられないときは起動せずに手順を案内する（[`launch_gate::check_repair_root`]）。
 #[cfg(windows)]
-fn repair_profile_acl(profile_id: &str) -> Result<(), String> {
+fn repair_profile_acl(target: &ProbeTarget) -> Result<(), String> {
+    use banto_hub_core::profile_grant::{PRODUCT_DIR, ROOT_ENV};
     use banto_hub_core::service_elevated::ElevatedAction;
+    use banto_safe_root::guard::{resolve_machine_root, win::RegistryMachineEnvironment};
+    let profile_id = target.profile_id.as_str();
     if profile_id != banto_hub_core::profile_paths::DEFAULT_PROFILE_ID {
         return Err(format!(
             "既定でない profile（{profile_id}）は、管理者が banto-hub-elev.exe grant-profile-acl <利用者> {profile_id} で戻してください"
         ));
     }
+    let helper_root = resolve_machine_root(&RegistryMachineEnvironment, ROOT_ENV, PRODUCT_DIR)
+        .map_err(|error| banto_hub_core::profile_grant::machine_root_text(&error));
+    launch_gate::check_repair_root(&target.root, helper_root.as_deref().map_err(String::as_str))?;
     let elev = host_switch_ipc::resolve_elev_exe().ok_or_else(|| {
         "banto-hub-elev.exe が見つかりません（シェルと同じディレクトリに配置してください）"
             .to_string()
@@ -2178,11 +2271,9 @@ fn spawn_service_watch(app: AppHandle) {
         if host_switch_ipc::is_switching() {
             continue;
         }
-        let watched = match &*state.view.lock().expect("view mutex poisoned") {
-            ShellView::Desktop => launch_gate::WatchedView::Desktop,
-            ShellView::Service { .. } => launch_gate::WatchedView::Service,
-            ShellView::Fallback(info) => launch_gate::WatchedView::Fallback(info.cause),
-        };
+        // 観測した画面の世代を覚えておく（適用の直前に比べる - #706 レビュー）。
+        let (observed, shown_scm) = watched_view(&state);
+        let watched = observed.view;
         // このアプリの Hub が動いている間は見張らない（SCM も照会しない）。
         if watched == launch_gate::WatchedView::Desktop {
             continue;
@@ -2201,7 +2292,11 @@ fn spawn_service_watch(app: AppHandle) {
         } else {
             ProfileModeObservation::NotObserved
         };
-        let outcome = match launch_gate::on_watch_tick(watched, scm.as_ref(), &mode, fault) {
+        let step = launch_gate::on_watch_tick(watched, scm.as_ref(), &mode, fault);
+        // 理由が同じでも SCM の状態が変わったら窓とトレイを直す（#706 レビュー）。
+        let step =
+            launch_gate::refresh_on_scm_change(step, watched, shown_scm.as_ref(), scm.as_ref());
+        let outcome = match step {
             launch_gate::WatchStep::Stay => continue,
             launch_gate::WatchStep::ToFallback(cause) | launch_gate::WatchStep::Refresh(cause) => {
                 watch_fallback(scm.clone(), cause)
@@ -2222,6 +2317,13 @@ fn spawn_service_watch(app: AppHandle) {
         };
         // 照会の間に切り替えが始まっていたら任せる（進行中フラグを取ってから適用する）。
         if !host_switch_ipc::try_begin_switch() {
+            continue;
+        }
+        // #706 レビュー: 観測の後に画面が変わっていたら（切り替えが終わって Desktop が起動した・
+        // 再試行した等）、この結果は古い。適用すると起動したばかりの Hub を止めるので捨てる。
+        // 画面を変える経路は進行中フラグを取るので、フラグを持つ間は世代が進まない。
+        if !launch_gate::watch_result_is_fresh(observed, watched_view(&state).0) {
+            host_switch_ipc::end_switch();
             continue;
         }
         log_line(&format!(
@@ -2390,6 +2492,8 @@ pub fn run() {
             host_switch_ipc::set_service_autostart,
             // #661 661-5: 「設定モードに戻す」（`relax-only` → 戻らなければ昇格ヘルパーの修復）。
             host_switch_ipc::restore_setting_mode,
+            // #706 レビュー: Fallback の窓の [再試行]。
+            host_switch_ipc::retry_startup,
             // S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6）:
             // 「サービス」一覧の BantoHubSink 側（`sink_service_ipc`のモジュール
             // doc参照）。
@@ -2413,6 +2517,7 @@ pub fn run() {
                 desktop_error: None,
                 cause: FallbackCause::General,
             })),
+            view_generation: launch_gate::ViewGeneration::default(),
             // T16-2（実装指示 4.）: Operators 判定はプロセス起動時に一度だけ
             // 確定する（[`AppState::can_operate_service`]のフィールド doc参照）。
             // T16-2 第二スライス: Operators**または** Windows ローカル
@@ -2949,7 +3054,10 @@ mod tests {
     #[test]
     fn status_text_script_waits_for_dom_and_embeds_escaped_message() {
         let message = "起動できませんでした。\nit's \\ok";
-        let script = status_text_script(message);
+        let script = status_text_script(&PlaceholderPage {
+            message: message.to_string(),
+            actions: vec![launch_gate::ACTION_RETRY],
+        });
 
         assert_eq!(script.matches(&js_string_literal(message)).count(), 1);
         assert!(!script.contains('\n'), "生の改行を含まない: {script}");
@@ -2959,6 +3067,45 @@ mod tests {
         assert!(script.contains("if (el) { el.textContent = message; }"));
         assert!(script.starts_with("(function () {"));
         assert!(script.ends_with("})();"));
+        // #706 レビュー: 操作のボタンは JSON で渡し、プレースホルダの描画があるときだけ呼ぶ。
+        assert!(script.contains(
+            r#"var actions = [{"id":"retry","label":"再試行","command":"retry_startup"}];"#
+        ));
+        assert!(script.contains("if (typeof window.__bantoHubRenderActions === 'function')"));
+    }
+
+    /// #706 レビュー（Codex P2）: Fallback の窓（プレースホルダ）にも、理由に合う操作（トレイと
+    /// 同じ集合）を出す。
+    #[test]
+    fn fallback_page_offers_the_actions_that_fit_the_cause() {
+        let ids = |info: &FallbackInfo, can_operate| -> Vec<&'static str> {
+            fallback_page(info, can_operate)
+                .actions
+                .iter()
+                .map(|action| action.id)
+                .collect()
+        };
+        let left_tight = FallbackInfo {
+            scm_state: Some(ScmState::Stopped),
+            health: None,
+            desktop_error: None,
+            cause: FallbackCause::OperationStopped { left_tight: true },
+        };
+        assert_eq!(
+            ids(&left_tight, true),
+            ["start_service", "restore_setting", "retry"]
+        );
+        assert!(fallback_page(&left_tight, true)
+            .message
+            .contains("運用モードのまま残っています"));
+        // 反証: 止まる途中（StopPending）は開始を出さず、一般の窓は再試行だけ。
+        let stopping = FallbackInfo {
+            scm_state: Some(ScmState::StopPending),
+            health: None,
+            desktop_error: None,
+            cause: FallbackCause::ServiceLost,
+        };
+        assert_eq!(ids(&stopping, true), ["retry"]);
     }
 
     /// T16-2: [`expected_probe_target`]は`resolve_profile_paths_from_env`と

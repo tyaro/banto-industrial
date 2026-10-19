@@ -21,8 +21,35 @@
 				text-align: center;
 				padding: 1.5rem;
 			}
+			main > div {
+				max-width: 40rem;
+			}
 			#banto-hub-status {
 				font-size: 1.1rem;
+				white-space: pre-line;
+			}
+			#banto-hub-actions {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.5rem;
+				justify-content: center;
+				margin-top: 1rem;
+			}
+			#banto-hub-actions button {
+				font: inherit;
+				padding: 0.4rem 1rem;
+				border-radius: 4px;
+				border: 1px solid #666;
+				background: #2c2c33;
+				color: #eee;
+				cursor: pointer;
+			}
+			#banto-hub-actions button:disabled {
+				opacity: 0.5;
+				cursor: default;
+			}
+			#banto-hub-action-error {
+				color: #ff9a9a;
 				white-space: pre-line;
 			}
 		</style>
@@ -39,7 +66,71 @@
       文言を書き換えてエラーを表示する（src/lib.rs::show_startup_error 参照）。
     -->
 		<main>
-			<p id="banto-hub-status">起動中…</p>
+			<div>
+				<p id="banto-hub-status">起動中…</p>
+				<!--
+          #706 レビュー: Fallback の窓の操作（トレイと同じ集合）。Rust 側
+          （src/lib.rs::status_text_script）が window.__bantoHubRenderActions へ
+          [{ id, label, command }] を渡す。押すと command を invoke する
+          （capabilities/default.json と build.rs の ACL に載せたコマンドだけ）。
+        -->
+				<div id="banto-hub-actions"></div>
+				<p id="banto-hub-action-error" role="alert"></p>
+			</div>
 		</main>
+		<script>
+			(function () {
+				function describeError(error) {
+					if (typeof error === 'string') return error;
+					if (error && typeof error.message === 'string') return error.message;
+					try {
+						return JSON.stringify(error);
+					} catch (_) {
+						return String(error);
+					}
+				}
+				function invoke(command) {
+					var internals = window.__TAURI_INTERNALS__;
+					if (!internals || typeof internals.invoke !== 'function') {
+						return Promise.reject(
+							'この画面からは操作できません。トレイのメニューを使ってください。'
+						);
+					}
+					return internals.invoke(command, {});
+				}
+				window.__bantoHubRenderActions = function (actions) {
+					var box = document.getElementById('banto-hub-actions');
+					var errorLine = document.getElementById('banto-hub-action-error');
+					if (!box) return;
+					box.textContent = '';
+					if (errorLine) errorLine.textContent = '';
+					(actions || []).forEach(function (action) {
+						var button = document.createElement('button');
+						button.type = 'button';
+						button.textContent = action.label;
+						button.addEventListener('click', function () {
+							var buttons = box.querySelectorAll('button');
+							buttons.forEach(function (b) {
+								b.disabled = true;
+							});
+							if (errorLine) errorLine.textContent = '';
+							invoke(action.command)
+								.catch(function (error) {
+									if (errorLine) {
+										errorLine.textContent =
+											'「' + action.label + '」を実行できませんでした: ' + describeError(error);
+									}
+								})
+								.finally(function () {
+									buttons.forEach(function (b) {
+										b.disabled = false;
+									});
+								});
+						});
+						box.appendChild(button);
+					});
+				};
+			})();
+		</script>
 	</body>
 </html>

@@ -234,6 +234,21 @@ pub fn restore_setting_mode(app: AppHandle, state: State<'_, AppState>) -> Resul
     }
 }
 
+/// #706 レビュー: Fallback の窓（プレースホルダ）の [再試行]。トレイの「再試行」と同じく起動を
+/// 判定し直す（`crate::retry_startup`）。画面を変えるので進行中フラグを取り、判定は別のスレッドで
+/// 走らせる（health の確かめ・Hub の起動で待つため）。
+#[tauri::command]
+pub fn retry_startup(app: AppHandle) -> Result<(), String> {
+    if !begin_switch_or_warn(&app) {
+        return Err("既に切替処理が進行中です".into());
+    }
+    std::thread::spawn(move || {
+        crate::retry_startup_locked(&app);
+        end_switch();
+    });
+    Ok(())
+}
+
 /// 自動起動の ON/OFF。UAC 経由で `banto-hub-elev.exe` を起動する。
 #[tauri::command]
 pub fn set_service_autostart(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {

@@ -41,6 +41,9 @@ banto-desktop-tray = { path = "../../../crates/banto-desktop-tray" }
 # Desktop↔Service 切替ウィザード（`host_switch_status`/`host_switch_progress`
 # invoke 面）の DTO・イベントペイロードのシリアライズ用。
 serde = { workspace = true }
+# #706 レビュー: Fallback の窓（プレースホルダ）へ操作のボタンを JSON で渡す
+# （`status_text_script`）。tauri・core が既に使う workspace の依存で、パッケージは増えない。
+serde_json = { workspace = true }
 # `set_service_autostart` invoke が `banto-hub-elev.exe` を UAC 昇格して
 # 起動する（`ShellExecuteExW`、verb "runas"）。#392 B3-3a で、ここに直接
 # 持っていた Win32 の呼び出し（と `windows-sys` の依存）を共有 crate の
@@ -64,5 +67,4 @@ banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # 増えない。
 [dev-dependencies]
 banto-server = { workspace = true }
-serde_json = { workspace = true }
 
