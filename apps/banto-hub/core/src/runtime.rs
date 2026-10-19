@@ -1453,6 +1453,41 @@ mod tests {
         std::fs::remove_file(&db).expect("閉じた DB は消せる");
     }
 
+    /// #693 レビュー: 監査の保留の場所が普通のファイルでも、握った組を渡した起動は
+    /// 保留なしで続く（`audit_spool` の方針。DB の初期化より前に止まらない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_unusable_audit_spool_runs_without_spool() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-bad-spool");
+        let paths = resolve_profile_paths(dir.path(), "dirs").expect("valid profile id");
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(
+            paths.data_dir.join(crate::audit_spool::SPOOL_DIR_NAME),
+            b"not a directory",
+        )
+        .unwrap();
+        let dirs = plain_profile_dirs(&dir);
+        assert!(dirs.audit_spool.is_none());
+        let config = HubConfig {
+            db_path: dirs
+                .config
+                .path()
+                .join(DB_FILE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "dirs".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let hub = HubRuntime::start_with_profile_dirs(config, dirs)
+            .await
+            .expect("a bad audit-spool must not stop the start");
+        hub.shutdown().await;
+    }
+
     /// #661 661-1: profile の `config\banto-hub.sqlite3` だけを確かめたパスに直し、外の
     /// パス（`BANTO_DB`）はそのまま。`data\` も綴り・本当のパスのどちらでも中とみなす。
     #[test]

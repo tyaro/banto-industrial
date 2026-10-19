@@ -114,7 +114,8 @@ pub const DIR_LOGS: &str = "logs";
 pub const DIR_AUDIT_SPOOL: &str = "audit-spool";
 
 /// profile の中で開いて握るフォルダ（親から順に 1 段ずつ。無ければ作る）。
-pub const PROFILE_MANAGED_SPECS: [ManagedSpec; 4] = [
+/// 監査の保留（[`AUDIT_SPOOL_SPECS`]）は必須にしない（開けなくても起動は続ける）。
+pub const PROFILE_MANAGED_SPECS: [ManagedSpec; 3] = [
     ManagedSpec {
         key: DIR_CONFIG,
         parent: None,
@@ -131,6 +132,19 @@ pub const PROFILE_MANAGED_SPECS: [ManagedSpec; 4] = [
         key: DIR_LOGS,
         parent: None,
         name: "logs",
+        create: true,
+    },
+];
+
+/// 監査の保留の開き方（`data` の下）。必須の組には入れず、別に試して開く
+/// （[`open_profile_dirs`]）。開けなくても従来どおり警告して保留なしで続ける
+/// （[`crate::audit_spool`] の方針）。Guarded（661-2 のサービス）で必須にするかは
+/// 661-2 で決める。
+const AUDIT_SPOOL_SPECS: [ManagedSpec; 2] = [
+    ManagedSpec {
+        key: DIR_DATA,
+        parent: None,
+        name: "data",
         create: true,
     },
     ManagedSpec {
@@ -154,8 +168,8 @@ pub struct ProfileDirs {
     pub data: Arc<ManagedDir>,
     /// `{profile_dir}/logs`。
     pub logs: Arc<ManagedDir>,
-    /// `{profile_dir}/data/audit-spool`。
-    pub audit_spool: Arc<ManagedDir>,
+    /// `{profile_dir}/data/audit-spool`。開けなかったときは `None`（保留なしで続ける）。
+    pub audit_spool: Option<Arc<ManagedDir>>,
 }
 
 /// [`open_profile_dirs`] などの失敗。
@@ -208,7 +222,13 @@ pub fn open_profile_dirs(
     let config = take(DIR_CONFIG);
     let data = take(DIR_DATA);
     let logs = take(DIR_LOGS);
-    let audit_spool = take(DIR_AUDIT_SPOOL);
+    // 監査の保留は必須にしない: 開けなければ `None` で続ける（警告は
+    // `crate::audit_spool::build_audit_service` が保留なしで組むときに出す）。
+    let audit_spool = profile
+        .open_managed(&AUDIT_SPOOL_SPECS, create_access)
+        .ok()
+        .and_then(|mut spool_set| spool_set.take(DIR_AUDIT_SPOOL).ok())
+        .map(Arc::new);
     Ok(ProfileDirs {
         profile: Arc::new(profile),
         config,
@@ -455,6 +475,25 @@ mod tests {
             Ok(_) => panic!("a file in place of logs must be refused"),
         }
         assert!(!paths.profile_dir.join(LOCK_FILE_NAME).exists());
+    }
+
+    /// #693 レビュー: 監査の保留の場所が普通のファイルでも、通常の起動の排他は取れる
+    /// （従来どおり保留なしで続ける。`audit_spool` の方針）。
+    #[test]
+    fn an_unusable_audit_spool_does_not_stop_the_profile_lock() {
+        let root = TempDir::new("profile-lock-bad-spool");
+        let paths = resolve_profile_paths(root.path(), "bad-spool").expect("valid profile id");
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(
+            paths.data_dir.join(crate::audit_spool::SPOOL_DIR_NAME),
+            b"not a directory",
+        )
+        .unwrap();
+
+        let guard = try_acquire_profile_lock(&paths, HubHostKind::Console)
+            .expect("a bad audit-spool must not stop the lock");
+        assert!(guard.dirs().audit_spool.is_none());
+        assert!(guard.dirs().data.path().is_dir());
     }
 
     #[test]
