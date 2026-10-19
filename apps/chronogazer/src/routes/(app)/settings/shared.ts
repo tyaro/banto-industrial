@@ -12,20 +12,21 @@
 import { isProviderError } from '@banto/admin-core';
 import { isAdmin } from '#lib/permissions.js';
 import { sessionStore } from '#lib/session.svelte.js';
+import { errorText, GENERIC_ERROR_TEXT } from './modeSwitch';
 
 /**
  * 元 `+page.svelte` に重複していた `errorMessage()` を1本化しただけで、
  * 判定ロジックは無改変（`ProviderError` の validation field_errors を
  * 優先して表示する。Appearance/Account/Data/Security の各 section が使う）。
  */
-export function errorMessage(err: unknown): string {
+export function errorMessage(err: unknown, fallback: string = GENERIC_ERROR_TEXT): string {
 	if (isProviderError(err)) {
 		if (err.body.kind === 'validation' && err.body.field_errors.length > 0) {
 			return err.body.field_errors.map((fe) => fe.message).join(' / ');
 		}
 		return err.message;
 	}
-	return String(err);
+	return errorText(err, fallback);
 }
 
 /**
