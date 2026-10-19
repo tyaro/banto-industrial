@@ -458,7 +458,17 @@ pub(crate) fn on_tick(
             let next = FallbackState {
                 scm: scm.clone(),
                 health: health.cloned(),
-                cause: carry_cause(current.cause, scm),
+                cause: if current.cause == FallbackCause::ServiceLost
+                    && matches!(scm, ScmObservation::State(ScmState::Stopped))
+                {
+                    // 外から STOP されると `Running → StopPending → Stopped` と観測する。
+                    // StopPending の時点では一般の ServiceLost で Fallback に移るので、停止に
+                    // 達したら終了コードとモードで理由を選び直す（#690 レビュー。4・5 の窓）。
+                    // 他の理由（利用者の操作の後の窓など）は書き換えない。
+                    lost_cause(scm, mode, last_exit)
+                } else {
+                    carry_cause(current.cause, scm)
+                },
             };
             if &next == current {
                 (Step::Stay, 0)
@@ -2334,6 +2344,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 外から STOP されると `Running → StopPending → Stopped` と観測する。StopPending で
+    /// 一般の ServiceLost の Fallback に移った後でも、停止に達したら終了コードで理由を選び直す
+    /// （#690 レビュー）。利用者の操作の後の理由は書き換えない。
+    #[test]
+    fn fallback_reselects_the_cause_when_scm_reaches_stopped() {
+        let pending = ScmObservation::State(ScmState::StopPending);
+        let stopped = ScmObservation::State(ScmState::Stopped);
+        let mode = RootModeObservation::NotObserved;
+        let after_stop = |exit: Option<ServiceExit>| {
+            let (step, _) = on_tick(
+                &ShellView::Service { port: 8721 },
+                0,
+                &pending,
+                None,
+                &mode,
+                None,
+            );
+            let Step::ToFallback(first) = step else {
+                panic!("StopPending で Fallback に移るはず: {step:?}");
+            };
+            assert_eq!(first.cause, FallbackCause::ServiceLost);
+            on_tick(&ShellView::Fallback(first), 0, &stopped, None, &mode, exit).0
+        };
+        let refreshed = |cause| {
+            Step::Refresh(FallbackState {
+                scm: stopped.clone(),
+                health: None,
+                cause,
+            })
+        };
+        assert_eq!(
+            after_stop(Some(ServiceExit::LeftOperation)),
+            refreshed(FallbackCause::OperationStopped { left_tight: true })
+        );
+        assert_eq!(
+            after_stop(Some(ServiceExit::CannotOperate)),
+            refreshed(FallbackCause::CannotOperate)
+        );
+        // 利用者の操作の後などの別の理由は、停止に達しても書き換えない。
+        let current = FallbackState {
+            scm: pending.clone(),
+            health: None,
+            cause: FallbackCause::AtStartup,
+        };
+        let (step, _) = on_tick(
+            &ShellView::Fallback(current),
+            0,
+            &stopped,
+            None,
+            &mode,
+            Some(ServiceExit::LeftOperation),
+        );
+        assert_eq!(step, refreshed(FallbackCause::AtStartup));
     }
 
     fn ids(view: &FallbackPageView) -> Vec<&'static str> {
