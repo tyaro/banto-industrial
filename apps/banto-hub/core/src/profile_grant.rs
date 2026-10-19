@@ -948,7 +948,7 @@ pub fn access_plan(
 /// - 記録が無い・使えない: 指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者の
 ///   アカウント（締めたときの組。締まった DACL の所有者は Administrators で、利用者には
 ///   書き換えられない）。記録が使えない旨を警告にする。利用者のアカウントかを確かめられない
-///   SID は戻さずに警告する。ただし名前を解けないドメインの SID（上と同じ理由）は、外すと
+///   SID は戻さずに警告する。ただし名前を解けないドメインの SID（上と同じ理由）と確かめられない SID は、外すと
 ///   ネットワークが戻っても権限が戻らないので、`Err` で断る（緩めない・記録を書き換えない）。
 pub fn repair_plan(
     user: &InstallUserSid,
@@ -1050,28 +1050,25 @@ pub fn repair_plan(
             if users.contains(&sid) {
                 continue;
             }
-            let failure = match account(&sid) {
+            match account(&sid) {
                 OwnerLookup::User => {
                     lines.push(out_line(&format!(
                         "今の DACL で「読み取りと実行」を持つ利用者 {} に「変更」を戻します",
                         sid.as_str()
                     )));
                     users.push(sid.clone());
-                    None
                 }
                 OwnerLookup::NotAUser => {
                     lines.push(out_line(&format!(
                         "この PC の利用者のアカウントでない SID（グループなど）の ACE（{}）には戻しません",
                         ace_text(ace)
                     )));
-                    None
                 }
                 OwnerLookup::Unmapped { local: true } => {
                     lines.push(out_line(&format!(
                         "この PC のローカルのアカウントにない SID（削除済み）の ACE（{}）には戻しません",
                         ace_text(ace)
                     )));
-                    None
                 }
                 // ドメインの SID の`ERROR_NONE_MAPPED`は一時的な失敗かもしれない（#704）。
                 // 外して進むと、ネットワークが戻っても「変更」が戻らないので、断る。
@@ -1080,17 +1077,13 @@ pub fn repair_plan(
                         "今の DACL で「読み取りと実行」を持つ {} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください",
                         sid.as_str()
                     ));
-                    None
                 }
-                OwnerLookup::LookupFailed(why) => Some(why),
-            };
-            if let Some(why) = failure {
-                warnings += 1;
-                lines.push(err_line(&format!(
-                    "警告: 利用者のアカウントかを確かめられなかったので、{} には戻しません: {why}。名前の解決が戻ってから grant-profile-acl {} {profile_id} を実行してください",
-                    sid.as_str(),
-                    sid.as_str()
-                )));
+                OwnerLookup::LookupFailed(why) => {
+                    refusals.push(format!(
+                        "今の DACL で「読み取りと実行」を持つ {} が利用者のアカウントかを確かめられませんでした: {why}。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください",
+                        sid.as_str()
+                    ));
+                }
             }
         }
     }

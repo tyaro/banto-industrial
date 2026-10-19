@@ -1701,7 +1701,7 @@ fn a_tight_profile_is_relaxed_with_the_recorded_owners() {
 }
 
 /// 修復（記録が無い・使えない）: 指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者の
-/// アカウントで緩め、記録が使えない旨と、確かめられない SID を戻さない旨を警告する。
+/// アカウントで緩め、記録が使えない旨を警告する（確かめられない SID があれば断る。下の別のテスト）。
 #[test]
 fn a_tight_profile_without_a_usable_record_uses_the_named_user_and_the_tight_dacl() {
     type Record = Result<Option<Vec<String>>, String>;
@@ -1716,7 +1716,7 @@ fn a_tight_profile_without_a_usable_record_uses_the_named_user_and_the_tight_dac
     ];
     for (record, reason) in records {
         let ops = FakeOps::new();
-        tight_profile(&ops, &[ALICE, DOMAIN_USERS, DAVE, ME]);
+        tight_profile(&ops, &[ALICE, DOMAIN_USERS, ME]);
         *ops.owners.borrow_mut() = record;
         let (result, lines) = run(&ops, None, None);
         assert_eq!(result, Ok(()), "{reason}: {lines:#?}");
@@ -1733,10 +1733,9 @@ fn a_tight_profile_without_a_usable_record_uses_the_named_user_and_the_tight_dac
                 format!("err banto-hub-elev: 警告: 戻す相手の記録（{OWNERS_AT}）が使えません（{reason}）。指定の利用者 {ME} と、今の DACL で「読み取りと実行」を持つ利用者（締めたときの組）に「変更」を戻します。ほかにも戻す利用者がいれば、grant-profile-acl <利用者> default を続けて実行してください"),
                 format!("out banto-hub-elev: 今の DACL で「読み取りと実行」を持つ利用者 {ALICE} に「変更」を戻します"),
                 format!("out banto-hub-elev: この PC の利用者のアカウントでない SID（グループなど）の ACE（SID {DOMAIN_USERS}・アクセス 0x1200a9・フラグ 0x03）には戻しません"),
-                format!("err banto-hub-elev: 警告: 利用者のアカウントかを確かめられなかったので、{DAVE} には戻しません: RPC が届かない。名前の解決が戻ってから grant-profile-acl {DAVE} default を実行してください"),
                 format!("out banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）を利用者 {ME}・{ALICE} に更新しました"),
                 format!("out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME}・{ALICE} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形で、下から書き profile 自身は最後。書いた数 1）", profile().display()),
-                "err banto-hub-elev: 書き直しは終えましたが、上の警告 2 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
+                "err banto-hub-elev: 書き直しは終えましたが、上の警告 1 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
             ],
             "{reason}"
         );
@@ -1882,6 +1881,29 @@ fn an_unmapped_domain_account_in_the_record_refuses_the_repair() {
     assert!(ops
         .calls()
         .contains(&format!("relax default [{ME},{CAROL}]")));
+}
+
+/// 修復（記録が無く、締まった DACL に確かめられない利用者がいる）: 削除済みと区別できないので、
+/// 外して進まずに断る（緩めない・記録を書き換えない）。反証: 確かめられれば進む。
+#[test]
+fn an_unverifiable_account_in_the_dacl_refuses_the_repair_without_a_record() {
+    let mut ops = FakeOps::new();
+    tight_profile(&ops, &[ALICE, DAVE]);
+    *ops.owners.borrow_mut() = Ok(None);
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(!ops.calls().iter().any(|c| c.starts_with("write_owners")));
+    assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
+    assert_eq!(*ops.owners.borrow(), Ok(None));
+    assert!(lines.contains(&format!(
+        "err banto-hub-elev: 今の DACL で「読み取りと実行」を持つ {DAVE} が利用者のアカウントかを確かめられませんでした: RPC が届かない。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください"
+    )), "{lines:#?}");
+
+    // 反証: 確かめられれば（利用者）、戻して進む。
+    ops.lookups.insert(DAVE.into(), OwnerLookup::User);
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops.calls().iter().any(|c| c.starts_with("relax")));
 }
 
 /// 修復（記録にグループ。#704 レビュー P2）: 照会に成功して利用者でないと分かった SID は、
