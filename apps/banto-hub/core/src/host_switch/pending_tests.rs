@@ -237,6 +237,61 @@ fn service_that_stops_without_running_is_told_apart_by_exit_code() {
 }
 
 #[test]
+fn left_tight_survives_a_failed_start_and_still_blocks_the_desktop() {
+    let scm = Scripted::with_state(stopped_with(5));
+    let mut engine = engine(&scm, HostKind::Offline);
+    // 観測: Stopped/5 で LeftTight。
+    engine.step(SwitchCommand::SwitchToService).unwrap();
+    let (reached, _, _) = faulted(poll(&mut engine));
+    assert_eq!(reached, HostKind::Offline);
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    // 再度 SwitchToService、start が AccessDenied で失敗しても印は消えない。
+    scm.0
+        .starts
+        .borrow_mut()
+        .push_back(Err(ServiceManagerError::AccessDenied));
+    let (_, stage, _) = faulted(engine.step(SwitchCommand::SwitchToService).unwrap());
+    assert_eq!(stage, FaultStage::ServiceStarting);
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    // SwitchToDesktop は SCM を照会し直し、Stopped/5 のままなら Desktop にしない。
+    let (reached, stage, _) = faulted(engine.step(SwitchCommand::SwitchToDesktop).unwrap());
+    assert_eq!(
+        (reached, stage),
+        (HostKind::Offline, FaultStage::AwaitingServiceRelease)
+    );
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    // Stopped/0 になれば進む。
+    scm.set(stopped_with(0));
+    assert_eq!(
+        engine.step(SwitchCommand::SwitchToDesktop).unwrap(),
+        StepOutcome::Completed(HostKind::Desktop)
+    );
+    assert_eq!(engine.state().service_fault, None);
+}
+
+#[test]
+fn left_tight_is_cleared_once_the_service_is_running_and_healthy() {
+    let scm = Scripted::with_state(stopped_with(5));
+    let mut engine = engine(&scm, HostKind::Offline);
+    engine.step(SwitchCommand::SwitchToService).unwrap();
+    faulted(poll(&mut engine));
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    scm.set(summary(ScmState::Running, 0));
+    engine.probe.set_outcome(HealthOutcome::Healthy {
+        version: "1.2.3".to_string(),
+    });
+    engine.step(SwitchCommand::SwitchToService).unwrap();
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    for _ in 0..5 {
+        if poll(&mut engine) == StepOutcome::Completed(HostKind::Service) {
+            break;
+        }
+    }
+    assert_eq!(engine.state().current, HostKind::Service);
+    assert_eq!(engine.state().service_fault, None);
+}
+
+#[test]
 fn service_fault_is_cleared_when_a_new_switch_starts() {
     let scm = Scripted::with_state(summary(ScmState::StartPending, 1));
     let mut engine = engine(&scm, HostKind::Offline);

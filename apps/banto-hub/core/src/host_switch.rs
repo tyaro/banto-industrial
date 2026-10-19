@@ -648,7 +648,12 @@ where
         if !self.can_operate_service {
             return Err(SwitchError::PermissionDenied);
         }
-        self.state.service_fault = None;
+        // LeftTight（締めたまま止まった）は安全が確かめられるまで消さない: start が失敗して
+        // Stopped/5 のままでも、SwitchToDesktop が SCM を照会し直せるように。
+        // 消えるのは Service 完了時と、再要求時の照会で Stopped かつ 5 でないと確かめたとき。
+        if self.state.service_fault != Some(ServiceFault::LeftTight) {
+            self.state.service_fault = None;
+        }
         match self.state.current {
             HostKind::Desktop => match self.desktop.request_stop() {
                 Ok(()) => {
@@ -677,7 +682,6 @@ where
                 if !self.can_operate_service {
                     return Err(SwitchError::PermissionDenied);
                 }
-                self.state.service_fault = None;
                 self.stop_retries = 0;
                 Ok(self.issue_stop())
             }
@@ -827,6 +831,8 @@ where
             self.state.current = HostKind::Service;
             self.state.phase = SwitchPhase::Idle;
             self.phase_deadline = None;
+            // 運用モードに入れたと確かめられたので、締めたまま止まった印を消す。
+            self.state.service_fault = None;
             return StepOutcome::Completed(HostKind::Service);
         }
         if self.timed_out() {
