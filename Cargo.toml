@@ -253,3 +253,19 @@ tokio-stream = "0.1"
 # を 1.98.1 へ引き上げたためこの制約は解消し、同日 dependabot PR #283 で
 # 0.39 系へ移行した。
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+# #ci-speed（2026-10-19）: 暗号まわりの第三者 crate だけ、開発・テストのビルド（dev / test
+# プロファイル）でも最適化する。最適化なし（opt-level 0）だと、パスワードのハッシュ
+# （argon2。banto-admin-services 経由でログイン・ユーザー作成のたびに走る）と OPC UA の
+# RSA 鍵生成（async-opcua-crypto → rsa → num-bigint-dig）が極端に遅く、CI の nextest で
+# ログインや Hub の起動を伴うテストが 1 本数十秒かかっていた（PR #703 の junit）。
+# 自前の crate は対象にしないので、デバッグのしやすさは変わらない。第三者 crate なので
+# ビルドが増えるのはキャッシュが外れたときの 1 回だけ。
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
