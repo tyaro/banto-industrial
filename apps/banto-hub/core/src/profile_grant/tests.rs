@@ -1851,7 +1851,7 @@ fn an_unmapped_domain_account_in_the_record_refuses_the_repair() {
     assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
     assert_eq!(*ops.owners.borrow(), Ok(record));
     assert!(lines.contains(&format!(
-        "err banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の {ALICE} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください。その利用者を外すなら、ドメインで削除済みを確かめてから記録（{OWNERS_AT}）を消して実行すると、今の DACL から組を採り直します（名前を解けない利用者には戻しません）"
+        "err banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の {ALICE} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください"
     )), "{lines:#?}");
 
     // 記録が無いときも、締まった DACL に名前を解けないドメインの利用者がいれば断る
