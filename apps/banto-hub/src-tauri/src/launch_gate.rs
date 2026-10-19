@@ -541,17 +541,48 @@ pub(crate) fn fallback_actions(cause: FallbackCause, start_allowed: bool) -> Vec
 // 修復の前の root の確かめ（#706 レビュー）
 // ---------------------------------------------------------------------------
 
-/// 昇格ヘルパーの修復（引数なしの `grant-profile-acl`）を起動してよいか（純関数）。ヘルパーは
-/// **マシンの環境**の root（`BANTO_HUB_ROOT`、未設定なら既定）を使い、シェルは**このプロセスの
-/// 環境**で root を解く。両者が違えば、ヘルパーは別の root の default を書き換えてしまうので、
-/// 一致しない・確かめられない（`helper_root` が `Err`）ときは起動せず、手順の案内を返す。
-/// 比べ方はヘルパーの本当のパスの確かめと同じ（[`banto_safe_root::guard::paths_match`]。要素
-/// ごと・大文字小文字を無視・末尾の区切りは要素に現れない）。
+/// 修復を断ったときの手順の案内（純関数。#706 レビュー P2）。引数なしの `grant-profile-acl` は
+/// profile-id を省くと default を、利用者を省くと昇格した利用者を選ぶので、どの経路でも勧めず、
+/// 対象の利用者（`user`。得られないときは `<利用者>` とその説明）と `profile_id` を明記する。
+/// `shell_root` が `Some` のときは、先にマシンの環境変数 `BANTO_HUB_ROOT` をシェルの root に
+/// 合わせる手順を前に置く（root の不一致・解けないとき）。
+pub(crate) fn repair_manual(
+    user: Option<&str>,
+    profile_id: &str,
+    shell_root: Option<&Path>,
+) -> String {
+    let (user_arg, user_note) = match user {
+        Some(user) => (user.to_string(), ""),
+        None => (
+            "<利用者>".to_string(),
+            "（<利用者> はこのアプリを使う利用者の名前）",
+        ),
+    };
+    let command =
+        format!("banto-hub-elev.exe grant-profile-acl {user_arg} {profile_id}{user_note}");
+    match shell_root {
+        Some(root) => format!(
+            "先に、マシンの環境変数 BANTO_HUB_ROOT を、このアプリが見ているルート（{}）に合わせてください。そのうえで、管理者が {command} で戻してください",
+            root.display()
+        ),
+        None => format!("管理者が {command} で戻してください"),
+    }
+}
+
+/// 昇格ヘルパーの修復（`grant-profile-acl <利用者> <profile-id>`）を起動してよいか（純関数）。
+/// ヘルパーは**マシンの環境**の root（`BANTO_HUB_ROOT`、未設定なら既定）を使い、シェルは
+/// **このプロセスの環境**で root を解く。両者が違えば、ヘルパーは別の root の profile を書き換えて
+/// しまうので、一致しない・確かめられない（`helper_root` が `Err`）ときは起動せず、root を合わせる
+/// 手順から案内する（[`repair_manual`]）。比べ方はヘルパーの本当のパスの確かめと同じ
+/// （[`banto_safe_root::guard::paths_match`]。要素ごと・大文字小文字を無視・末尾の区切りは要素に
+/// 現れない）。
 pub(crate) fn check_repair_root(
     shell_root: &Path,
     helper_root: Result<&Path, &str>,
+    user: Option<&str>,
+    profile_id: &str,
 ) -> Result<(), String> {
-    let manual = "管理者が banto-hub-elev.exe grant-profile-acl で戻してください";
+    let manual = repair_manual(user, profile_id, Some(shell_root));
     match helper_root {
         Ok(root) if banto_safe_root::guard::paths_match(shell_root, root) => Ok(()),
         Ok(root) => Err(format!(
@@ -581,9 +612,7 @@ pub(crate) fn repair_tokens(
     profile_id: &str,
     action: &str,
 ) -> Result<Vec<String>, String> {
-    let manual = format!(
-        "管理者が banto-hub-elev.exe grant-profile-acl <利用者> {profile_id} で戻してください"
-    );
+    let manual = repair_manual(user_sid.ok(), profile_id, None);
     let sid = user_sid.map_err(|reason| {
         format!("このアプリを動かしている利用者を確かめられなかったため、修復しませんでした（{reason}）。{manual}")
     })?;
@@ -1106,6 +1135,43 @@ mod tests {
         }
     }
 
+    const SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+    /// 断ったときの案内は、利用者と profile-id を明記した `grant-profile-acl <利用者> <profile>`
+    /// であり、引数なし（`grant-profile-acl` の直後が引数でない）の形を含まない。
+    fn assert_guides_target(text: &str, user: &str, profile: &str) {
+        let command = format!("grant-profile-acl {user} {profile}");
+        assert!(text.contains(&command), "{text}");
+        for (index, _) in text.match_indices("grant-profile-acl") {
+            assert!(
+                text[index..].starts_with(&command),
+                "引数なしの案内: {text}"
+            );
+        }
+    }
+
+    /// 純関数 `repair_manual` の反証: 引数なしにならない。root を合わせる手順は前に置く。
+    #[test]
+    fn repair_manual_always_names_user_and_profile() {
+        for (user, profile) in [
+            (Some(SID), "line-2"),
+            (None, "default"),
+            (Some("alice"), "a_b"),
+        ] {
+            for root in [None, Some(Path::new("C:/hub"))] {
+                let text = repair_manual(user, profile, root);
+                assert_guides_target(&text, user.unwrap_or("<利用者>"), profile);
+                if let Some(root) = root {
+                    let env = text.find("BANTO_HUB_ROOT").expect("root を合わせる手順");
+                    assert!(env < text.find("grant-profile-acl").unwrap(), "{text}");
+                    assert!(text.contains(&root.display().to_string()), "{text}");
+                } else {
+                    assert!(!text.contains("BANTO_HUB_ROOT"), "{text}");
+                }
+            }
+        }
+    }
+
     /// #706 レビュー（オーナー P2）: 修復の前に、シェルの root とヘルパーの root（マシンの環境）が
     /// 一致するかを確かめる。大文字小文字と末尾の区切りは違いにしない。
     #[test]
@@ -1114,26 +1180,41 @@ mod tests {
         let root = base.join("BantoHub");
         let upper = base.join("BANTOHUB");
         let trailing = PathBuf::from(format!("{}{}", root.display(), std::path::MAIN_SEPARATOR));
-        assert_eq!(check_repair_root(&root, Ok(&root)), Ok(()));
-        assert_eq!(check_repair_root(&root, Ok(&upper)), Ok(()));
-        assert_eq!(check_repair_root(&root, Ok(&trailing)), Ok(()));
+        assert_eq!(check_repair_root(&root, Ok(&root), None, "line-2"), Ok(()));
+        assert_eq!(check_repair_root(&root, Ok(&upper), None, "line-2"), Ok(()));
+        assert_eq!(
+            check_repair_root(&root, Ok(&trailing), None, "line-2"),
+            Ok(())
+        );
         // 反証: 別の root・確かめられないときは起動せず、手順を案内する。
         let other = base.join("other");
-        let refused = check_repair_root(&other, Ok(&root)).expect_err("別の root");
-        assert!(refused.contains("grant-profile-acl"), "{refused}");
-        assert!(refused.contains(&other.display().to_string()), "{refused}");
         let refused =
-            check_repair_root(&root, Err("マシンの環境変数を読めませんでした")).expect_err("不明");
+            check_repair_root(&other, Ok(&root), Some(SID), "line-2").expect_err("別の root");
+        assert_guides_target(&refused, SID, "line-2");
+        assert!(refused.contains("BANTO_HUB_ROOT"), "{refused}");
+        assert!(refused.contains(&other.display().to_string()), "{refused}");
+        let refused = check_repair_root(
+            &root,
+            Err("マシンの環境変数を読めませんでした"),
+            None,
+            "line-2",
+        )
+        .expect_err("不明");
         assert!(refused.contains("読めませんでした"), "{refused}");
+        assert_guides_target(&refused, "<利用者>", "line-2");
+        assert!(
+            refused.contains("このアプリを使う利用者の名前"),
+            "{refused}"
+        );
+        assert!(refused.contains(&root.display().to_string()), "{refused}");
         // 中（子）も別物。
-        assert!(check_repair_root(&root.join("default"), Ok(&root)).is_err());
+        assert!(check_repair_root(&root.join("default"), Ok(&root), None, "default").is_err());
     }
 
     /// #706 実機確認（オーナー決定）: 既定でも既定でない profile でも、利用者の SID と
     /// profile-id を渡す。SID を得られない・引数に使えない文字があるときは手順を案内する。
     #[test]
     fn repair_passes_the_signed_in_user_sid_and_the_profile() {
-        const SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
         assert_eq!(
             repair_tokens(Ok(SID), "default", "grant-profile-acl"),
             Ok(vec![
@@ -1153,15 +1234,19 @@ mod tests {
         let refused = repair_tokens(Err("トークンを開けません"), "line-2", "grant-profile-acl")
             .expect_err("SID が無い");
         assert!(refused.contains("トークンを開けません"), "{refused}");
+        assert_guides_target(&refused, "<利用者>", "line-2");
         assert!(
-            refused.contains("grant-profile-acl <利用者> line-2"),
+            refused.contains("このアプリを使う利用者の名前"),
             "{refused}"
         );
         // 注入にならない: 空白・引用符・`_` を含む値は渡さない。
         for profile in ["line_2", "a b", "a\"b", "x&calc"] {
             let refused = repair_tokens(Ok(SID), profile, "grant-profile-acl").expect_err(profile);
             assert!(refused.contains("使えない文字"), "{refused}");
+            assert_guides_target(&refused, SID, profile);
         }
-        assert!(repair_tokens(Ok("S-1-5-21 x"), "default", "grant-profile-acl").is_err());
+        let refused = repair_tokens(Ok("S-1-5-21 x"), "default", "grant-profile-acl")
+            .expect_err("SID に空白");
+        assert_guides_target(&refused, "S-1-5-21 x", "default");
     }
 }

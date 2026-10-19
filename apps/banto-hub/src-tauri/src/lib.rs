@@ -2254,7 +2254,7 @@ fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress
 /// 動かしている利用者の SID と profile-id を渡す（[`launch_gate::repair_tokens`]）。SID を
 /// 得られない・引数に使えない文字があるときだけ、手順を案内して断る。
 ///
-/// #706 レビュー: 引数なしの `grant-profile-acl` は**マシンの環境**の root を使う。シェルは
+/// #706 レビュー: `grant-profile-acl` は**マシンの環境**の root を使う。シェルは
 /// このプロセスの環境で root を解くので、起動する前に両者が一致するかを確かめ、一致しない・
 /// 確かめられないときは起動せずに手順を案内する（[`launch_gate::check_repair_root`]）。
 #[cfg(windows)]
@@ -2264,14 +2264,19 @@ fn repair_profile_acl(target: &ProbeTarget) -> Result<(), String> {
     use banto_safe_root::guard::{resolve_machine_root, win::RegistryMachineEnvironment};
     let helper_root = resolve_machine_root(&RegistryMachineEnvironment, ROOT_ENV, PRODUCT_DIR)
         .map_err(|error| banto_hub_core::profile_grant::machine_root_text(&error));
-    launch_gate::check_repair_root(&target.root, helper_root.as_deref().map_err(String::as_str))?;
+    let user_sid = banto_safe_root::acl::current_user_sid().map_err(|err| err.to_string());
+    launch_gate::check_repair_root(
+        &target.root,
+        helper_root.as_deref().map_err(String::as_str),
+        user_sid.as_ref().ok().map(|sid| sid.as_str()),
+        target.profile_id.as_str(),
+    )?;
     let elev = host_switch_ipc::resolve_elev_exe().ok_or_else(|| {
         "banto-hub-elev.exe が見つかりません（シェルと同じディレクトリに配置してください）"
             .to_string()
     })?;
     // #706 実機確認（オーナー決定）: 既定でない profile も、このアプリを動かしている利用者の
     // SID と profile-id を渡して修復する（[`launch_gate::repair_tokens`]）。
-    let user_sid = banto_safe_root::acl::current_user_sid().map_err(|err| err.to_string());
     let tokens = launch_gate::repair_tokens(
         user_sid
             .as_ref()
