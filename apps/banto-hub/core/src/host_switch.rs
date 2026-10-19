@@ -941,7 +941,8 @@ where
             // Stopped は一度確認済み（probe の消失待ちの間）。それでも毎回 SCM を照会し、
             // 回復動作などで動き出していたら Unreachable を受け入れずに待つ。
             if status.state == ScmState::Stopped {
-                return None;
+                // 動き出してから終了コード 5 で止まり直したら、締めたまま残っている。
+                return self.left_tight_fault(&status, "サービスは止まり直しましたが");
             }
             if self.timed_out() {
                 let reason = self.timeout_reason();
@@ -953,16 +954,7 @@ where
         match watch.observe(now, status) {
             WatchStep::Reached(status) => {
                 self.phase_deadline = Some(now + self.phase_timeout);
-                if let Some(kind @ ServiceFault::LeftTight) = service_fault(&status) {
-                    let reason = format!("サービスは止まりましたが: {kind}");
-                    self.state.service_fault = Some(kind);
-                    return Some(self.fault(
-                        FaultStage::AwaitingServiceRelease,
-                        HostKind::Offline,
-                        reason,
-                    ));
-                }
-                None
+                self.left_tight_fault(&status, "サービスは止まりましたが")
             }
             WatchStep::Wait => {
                 self.watch = Some(watch);
@@ -982,6 +974,25 @@ where
                 Some(self.fault_for_current_phase(reason))
             }
         }
+    }
+
+    /// 止まったサービスの終了コードが 5（締めたまま残った）なら、`service_fault`を載せて
+    /// `Offline`で失敗にする。そうでなければ`None`（先へ進んでよい）。
+    fn left_tight_fault(
+        &mut self,
+        status: &ServiceStatusSummary,
+        prefix: &str,
+    ) -> Option<StepOutcome> {
+        let kind @ ServiceFault::LeftTight = service_fault(status)? else {
+            return None;
+        };
+        let reason = format!("{prefix}: {kind}");
+        self.state.service_fault = Some(kind);
+        Some(self.fault(
+            FaultStage::AwaitingServiceRelease,
+            HostKind::Offline,
+            reason,
+        ))
     }
 
     /// Desktop の起動を即座に許可できるか確認する - 許可されれば

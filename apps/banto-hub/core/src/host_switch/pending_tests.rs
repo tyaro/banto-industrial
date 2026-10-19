@@ -9,7 +9,7 @@ use std::rc::Rc;
 use banto_service_control::TransitionHandle;
 
 use super::*;
-use crate::hub_health::MockHubHealthProbe;
+use crate::hub_health::{HealthOutcome, MockHubHealthProbe};
 
 const PHASE: Duration = Duration::from_secs(5);
 
@@ -381,6 +381,28 @@ fn stopped_with_left_tight_does_not_hand_over_to_the_desktop() {
     );
     assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
     assert_eq!(engine.state().current, HostKind::Offline);
+}
+
+#[test]
+fn stopping_again_with_left_tight_after_the_first_stopped_does_not_hand_over() {
+    // 一度 Stopped を見た後に動き出し、終了コード 5 で止まり直した: 締めたまま残っている。
+    let scm = Scripted::with_state(summary(ScmState::StopPending, 1));
+    let mut engine = to_desktop_engine(&scm);
+    engine.probe.set_outcome(HealthOutcome::Healthy {
+        version: "1.2.3".to_string(),
+    });
+    engine.step(SwitchCommand::SwitchToDesktop).unwrap();
+    scm.set(stopped_with(0));
+    assert_eq!(poll(&mut engine), StepOutcome::Waiting);
+    scm.set(summary(ScmState::Running, 0));
+    assert_eq!(poll(&mut engine), StepOutcome::Waiting);
+    scm.set(stopped_with(5));
+    let (reached, stage, _) = faulted(poll(&mut engine));
+    assert_eq!(
+        (reached, stage),
+        (HostKind::Offline, FaultStage::AwaitingServiceRelease)
+    );
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
 }
 
 #[test]
