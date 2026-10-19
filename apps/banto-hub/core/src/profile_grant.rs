@@ -1162,7 +1162,7 @@ fn emit_skips(skips: &ResetSkips, out: Out<'_>) -> usize {
     }
     for path in &skips.moved_out {
         out(err_line(&format!(
-            "警告: profile の中の {} は書き直している最中に profile の外へ移されたので、そのフォルダには書かず飛ばしました（移される前に書いた分は移った先に残ります。#623 S-1）",
+            "警告: profile の中の {} は書き直している最中に profile の外へ移されたので、そのフォルダの中身は書かず飛ばしました（移される前に書いた分は移った先に残ります。修復ではそのフォルダ自身も含みます。#623 S-1）",
             path.display()
         )));
     }

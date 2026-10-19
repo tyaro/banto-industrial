@@ -1556,6 +1556,12 @@ fn a_dir_moved_out_mid_walk_by_an_old_delete_handle_is_noticed_after_its_subtree
         let problem = match (on_skip, result) {
             (OnSkip::Abort, Err(WalkStop::Problem(problem))) => {
                 assert!(walk.recorded.is_empty());
+                // 上から書く形では、移されたフォルダ自身は気づく前に書かれて移った先にある。
+                assert_ne!(
+                    inspect_file(&moved_to).unwrap().unwrap(),
+                    data_before,
+                    "移されたフォルダ自身が書かれていない"
+                );
                 problem
             }
             (OnSkip::Record, Ok(())) => {

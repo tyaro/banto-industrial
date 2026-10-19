@@ -1082,7 +1082,7 @@ fn emit_skips(kind: DataDir, skipped: &[TreeProblem], out: Out<'_>) {
             }
             TreeProblem::Busy { .. } => "使用中で開けなかったので、触らず飛ばしました（そのまま残ります）",
             TreeProblem::MovedOut { .. } => {
-                "書いている最中に木の外へ移されたので、そのフォルダには書かず飛ばしました（移される前に書いた分は移った先に残ります。#623 S-1）"
+                "書いている最中に木の外へ移されたので、そのフォルダの中身は書かず飛ばしました（移される前に書いた分は移った先に残ります。修復ではそのフォルダ自身も含みます。#623 S-1）"
             }
             TreeProblem::Encrypted { .. }
             | TreeProblem::TooDeep { .. }
