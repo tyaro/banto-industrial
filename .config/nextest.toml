@@ -1,4 +1,4 @@
-# cargo-nextest の設定（CI の rust ジョブが `cargo nextest run --profile ci` で使う。
+# cargo-nextest の設定（CI の rust-test ジョブが `cargo nextest run --profile ci` で使う。
 # ローカルでも `cargo nextest run`（既定プロファイル）が使える）。
 #
 # ## なぜ nextest か
@@ -76,7 +76,19 @@ retries = 0
 # 失敗したテストの出力は、その場と最後のまとめの両方に出す。
 failure-output = "immediate-final"
 success-output = "never"
-status-level = "fail"
-final-status-level = "fail"
-# 固まったテストを 10 分で打ち切る（ジョブ全体の timeout-minutes: 45 に巻き込まない）。
-slow-timeout = { period = "120s", terminate-after = 5 }
+# #ci-speed（2026-10-19）: 遅いテストを CI のログで見つけられるようにする。
+# それまでは status-level = "fail" で、どのテストが何秒かがログに出なかった。
+# "slow" にすると、slow-timeout の period を超えたテストの SLOW 行と、最後の
+# まとめの遅いテスト一覧が出る（成功したテストの行は出さない）。全テストの
+# 所要時間は junit.xml（下）に残る。
+status-level = "slow"
+final-status-level = "slow"
+# 固まったテストを 10 分（15s × 40）で打ち切る（ジョブ全体の timeout-minutes: 45 に
+# 巻き込まない）。打ち切りは従来の 120s × 5 と同じ 10 分のまま、period だけ 15 秒に
+# 縮めて、15 秒を超えたテストが SLOW として出るようにした（#ci-speed）。
+slow-timeout = { period = "15s", terminate-after = 40 }
+
+# テストごとの所要時間（#ci-speed）。出力は target/nextest/ci/junit.xml で、
+# ci.yml の rust-test ジョブが artifact（nextest-junit-<シャード番号>）に残す。
+[profile.ci.junit]
+path = "junit.xml"
