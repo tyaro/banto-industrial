@@ -39,6 +39,7 @@
 		type Tag,
 		type CollectionGroup
 	} from '#lib/banto/tagRegistryAdmin.js';
+	import { errorText } from '../settings/modeSwitch';
 	import { listTagThresholds, type TagThresholds } from '#lib/banto/tagThresholdsAdmin.js';
 	import {
 		listDisplayGroups,
@@ -96,7 +97,7 @@
 				? err.body.field_errors.map((fe) => fe.message).join(' / ')
 				: err.message;
 		}
-		return String(err);
+		return errorText(err);
 	}
 
 	async function reloadGroups(): Promise<void> {

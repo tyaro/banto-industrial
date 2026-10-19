@@ -21,6 +21,7 @@
 		canRequest,
 		confirmMessage,
 		requestSwitchToOperation,
+		SWITCH_FAILED_TEXT,
 		type SwitchUiState
 	} from './modeSwitch';
 	import { errorMessage } from './shared';
@@ -36,7 +37,7 @@
 			await requestSwitchToOperation(autoStart);
 			ui = { kind: 'accepted' };
 		} catch (err) {
-			ui = { kind: 'failed', message: errorMessage(err) };
+			ui = { kind: 'failed', message: errorMessage(err, SWITCH_FAILED_TEXT) };
 		}
 	}
 </script>
