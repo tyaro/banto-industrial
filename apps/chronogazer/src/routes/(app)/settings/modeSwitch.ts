@@ -46,7 +46,7 @@ export const OPERATION_MODE_NOTE =
 export function autoStartNote(autoStart: boolean): string {
 	return autoStart
 		? 'Windows を起動するたびに自動で記録を始めます。切り替えるときに、管理者の許可（ユーザーアカウント制御）を 1 回求めます。'
-		: 'Windows を再起動した後は、自動では記録を始めません。ChronoGazer を開いて「運用を再開」を押してください。';
+		: 'Windows を再起動した後は、自動では記録を始めません。ChronoGazer を開いて「運用を再開」を押してください。今が自動開始の設定なら、切り替えるときに手動に戻します（管理者の許可を 1 回求めます）。';
 }
 
 /** 切り替えの前の確認の文（純関数）。 */

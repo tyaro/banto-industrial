@@ -70,6 +70,8 @@ const HEALTH_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 const ELEV_EXE_FILE_NAME: &str = "chronogazer-elev.exe";
 /// elev のアクション: 自動開始（遅延）にする。
 const ELEV_AUTOSTART_ENABLE: &str = "autostart-enable";
+/// elev のアクション: 手動開始に戻す（チェックを外して運用モードへ入るとき）。
+const ELEV_AUTOSTART_DISABLE: &str = "autostart-disable";
 /// elev のアクション: データのフォルダの ACL を設定モードの形に直す（修復）。
 const ELEV_GRANT_DATA_ACL: &str = "grant-data-acl";
 /// `ShellExecuteExW` の「利用者が断った」（`ERROR_CANCELLED`）。
@@ -87,8 +89,9 @@ pub(crate) fn handoff_applies(handoff: Handoff, scm: &ScmObservation) -> bool {
 /// 「運用モードへ」の前の確かめの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OperationPlan {
-    /// 自動開始を elev で設定する（チェックが入っていて、今は手動開始）。
-    pub(crate) enable_auto_start: bool,
+    /// 開始種別を elev で変える先（`Some(true)` = 自動にする、`Some(false)` = 手動に戻す、
+    /// `None` = 今のままでよい）。選んだ値と今の開始種別を比べて決める。
+    pub(crate) set_auto_start: Option<bool>,
 }
 
 /// 「運用モードへ」の前の確かめ（純関数）。サービスが停止中のときだけ進める。`query` は照会の
@@ -108,7 +111,7 @@ pub(crate) fn operation_precheck(
     };
     match summary.state {
         ScmState::Stopped => Ok(OperationPlan {
-            enable_auto_start: auto_start && !summary.auto_start,
+            set_auto_start: (auto_start != summary.auto_start).then_some(auto_start),
         }),
         ScmState::NotInstalled => Err(
             "このPCには常時記録の仕組み（運用モードの部品）が入っていません。ChronoGazer のインストーラで入れてから、もう一度切り替えてください。"
@@ -140,10 +143,16 @@ pub(crate) fn elev_result_message(
 }
 
 /// 自動開始の設定に失敗したときの文（設定画面に出す。純関数）。
-pub(crate) fn auto_start_failure_message(reason: &str) -> String {
-    format!(
-        "{reason}切り替えはしていません。「Windows の起動時に自動で開始する」のチェックを外すと、自動開始なしで切り替えられます（再起動の後は「運用を再開」を押します）。"
-    )
+pub(crate) fn auto_start_failure_message(enable: bool, reason: &str) -> String {
+    if enable {
+        format!(
+            "{reason}切り替えはしていません。「Windows の起動時に自動で開始する」のチェックを外すと、自動開始なしで切り替えられます（再起動の後は「運用を再開」を押します）。"
+        )
+    } else {
+        format!(
+            "{reason}切り替えはしていません。今は Windows の起動時に自動で開始する設定のままです。チェックを入れたまま切り替えるか、もう一度試してください。"
+        )
+    }
 }
 
 /// 「運用モードへ」を断った理由の文（純関数）。
@@ -344,13 +353,18 @@ pub(crate) async fn request_switch_to_operation(
     .await
     .map_err(|err| format!("常時記録の仕組みの状態を確かめられませんでした（{err}）。"))?;
     let plan = operation_precheck(query.as_ref(), auto_start)?;
-    if plan.enable_auto_start {
-        tauri::async_runtime::spawn_blocking(|| run_elev(ELEV_AUTOSTART_ENABLE, "自動開始の設定"))
+    if let Some(enable) = plan.set_auto_start {
+        let (action, what) = if enable {
+            (ELEV_AUTOSTART_ENABLE, "自動開始の設定")
+        } else {
+            (ELEV_AUTOSTART_DISABLE, "自動開始の解除")
+        };
+        tauri::async_runtime::spawn_blocking(move || run_elev(action, what))
             .await
             .map_err(|err| {
-                auto_start_failure_message(&format!("自動開始を設定できませんでした（{err}）。"))
+                auto_start_failure_message(enable, &format!("{what}ができませんでした（{err}）。"))
             })?
-            .map_err(|reason| auto_start_failure_message(&reason))?;
+            .map_err(|reason| auto_start_failure_message(enable, &reason))?;
     }
     let lifecycle = shell::lifecycle(app).ok_or_else(|| "まだ起動の途中です。".to_string())?;
     lifecycle
@@ -520,7 +534,7 @@ pub(crate) fn request_to_setting(app: &AppHandle) {
         };
         match to_setting_route(&scm) {
             ToSettingRoute::Stop => run_to_setting(app, guard, from_service).await,
-            ToSettingRoute::Restore => run_restore_setting(app, guard).await,
+            ToSettingRoute::Restore => run_restore_setting(app, guard, from_service).await,
             ToSettingRoute::Unknown => {
                 drop(guard);
                 shell::rerender_fallback(
@@ -574,7 +588,13 @@ async fn run_to_setting(app: AppHandle, guard: TransitionGuard, from_service: bo
     }
 }
 
-async fn run_restore_setting(app: AppHandle, guard: TransitionGuard) {
+async fn run_restore_setting(app: AppHandle, guard: TransitionGuard, from_service: bool) {
+    // Service の画面から来たときは、切り替えの窓を作れた後に古い Service 窓を閉じる
+    // （`run_to_setting` と同じ。残すと Desktop の main 窓と並んでしまう）。
+    if from_service && !replace_service_window(&app) {
+        drop(guard);
+        return;
+    }
     show_switching(
         &app,
         SwitchDirection::ToSetting,
@@ -876,7 +896,7 @@ mod tests {
         ));
     }
 
-    /// 前の確かめ: 停止中だけ進む。自動開始の elev は、チェックが入っていて今は手動のときだけ。
+    /// 前の確かめ: 停止中だけ進む。自動開始の elev は、選んだ値と今の開始種別が違うときだけ（有効化・解除の両方）。
     #[test]
     fn precheck_allows_only_a_stopped_service_and_plans_auto_start() {
         let stopped_manual = Ok(summary(ScmState::Stopped, false));
@@ -884,19 +904,26 @@ mod tests {
         assert_eq!(
             operation_precheck(Some(&stopped_manual), true),
             Ok(OperationPlan {
-                enable_auto_start: true
+                set_auto_start: Some(true)
             })
         );
         assert_eq!(
             operation_precheck(Some(&stopped_manual), false),
             Ok(OperationPlan {
-                enable_auto_start: false
+                set_auto_start: None
             })
         );
         assert_eq!(
             operation_precheck(Some(&stopped_auto), true),
             Ok(OperationPlan {
-                enable_auto_start: false
+                set_auto_start: None
+            })
+        );
+        // 既に自動で、チェックを外した → 手動に戻す（画面の約束と食い違わせない）。
+        assert_eq!(
+            operation_precheck(Some(&stopped_auto), false),
+            Ok(OperationPlan {
+                set_auto_start: Some(false)
             })
         );
         let not_installed = Ok(summary(ScmState::NotInstalled, false));
@@ -939,7 +966,8 @@ mod tests {
                 .unwrap_err()
                 .contains("os error 2")
         );
-        assert!(auto_start_failure_message("x。").contains("チェックを外す"));
+        assert!(auto_start_failure_message(true, "x。").contains("チェックを外す"));
+        assert!(auto_start_failure_message(false, "x。").contains("自動で開始する設定のまま"));
     }
 
     /// 運用モードへの開始の結果ごとの次の画面: 4 は「運用モードにできませんでした」、5 は
