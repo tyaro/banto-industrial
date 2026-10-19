@@ -930,16 +930,24 @@ where
     /// 期限は段の待ち時間で数え直す）。終了コード 5（締めたまま残った）は、デスクトップに
     /// 渡せない（プロファイルが読み取りだけのまま）ので`Offline`で失敗にする。
     fn poll_service_released(&mut self) -> Option<StepOutcome> {
-        let Some(mut watch) = self.watch.take() else {
-            // Stopped は確認済み（probe の消失待ちの間）。
-            return None;
-        };
         let status = match self.service_manager.query_status() {
             Ok(status) => status,
             Err(err) => {
                 let reason = describe_service_error(&err);
                 return Some(self.fault_for_current_phase(reason));
             }
+        };
+        let Some(mut watch) = self.watch.take() else {
+            // Stopped は一度確認済み（probe の消失待ちの間）。それでも毎回 SCM を照会し、
+            // 回復動作などで動き出していたら Unreachable を受け入れずに待つ。
+            if status.state == ScmState::Stopped {
+                return None;
+            }
+            if self.timed_out() {
+                let reason = self.timeout_reason();
+                return Some(self.fault_for_current_phase(reason));
+            }
+            return Some(StepOutcome::Waiting);
         };
         let now = self.now();
         match watch.observe(now, status) {
@@ -1131,6 +1139,41 @@ mod tests {
         );
         assert_eq!(engine.state().current, HostKind::Desktop);
         assert_eq!(engine.state().phase, SwitchPhase::Idle);
+    }
+
+    // #699 レビュー: 一度 Stopped を観測した後も毎回 SCM を照会する。回復動作などで
+    // サービスが動き出したときの一時的な Unreachable では Desktop へ進まない。
+    #[test]
+    fn service_release_requires_stopped_on_every_poll_after_first_stopped() {
+        let mut engine = engine_with(HostKind::Service, true, Duration::from_secs(5));
+        engine.probe.set_outcome(HealthOutcome::Healthy {
+            version: "1.2.3".to_string(),
+        });
+        engine.step(SwitchCommand::SwitchToDesktop).expect("ok");
+        assert_eq!(engine.state().phase, SwitchPhase::AwaitingServiceRelease);
+
+        // 最初の Stopped を観測（旧 health はまだ応答中）。
+        assert_eq!(
+            engine.step(SwitchCommand::Poll).expect("poll ok"),
+            StepOutcome::Waiting
+        );
+
+        // 回復動作でサービスが再び動き出し、起動途中で probe が Unreachable。
+        engine.service_manager.start().expect("restart");
+        engine.probe.set_outcome(HealthOutcome::Unreachable);
+        assert_eq!(
+            engine.step(SwitchCommand::Poll).expect("poll ok"),
+            StepOutcome::Waiting
+        );
+        assert_eq!(engine.state().current, HostKind::Service);
+        assert_eq!(engine.state().phase, SwitchPhase::AwaitingServiceRelease);
+
+        // 再び Stopped かつ Unreachable になれば進む。
+        engine.service_manager.stop().expect("stop again");
+        assert_eq!(
+            engine.step(SwitchCommand::Poll).expect("poll ok"),
+            StepOutcome::Completed(HostKind::Desktop)
+        );
     }
 
     // 不変条件3: 失敗時に「もう一方を起動したまま戻る」ことがない -
