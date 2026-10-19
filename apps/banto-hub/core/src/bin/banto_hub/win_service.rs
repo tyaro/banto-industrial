@@ -60,17 +60,92 @@
 //! で起動が競合する事故を避ける（docs/tag-server-design.md §8 常駐の
 //! 判断）。`OnDemand`には遅延自動開始の概念が無い（Windows API 仕様）ため
 //! `install`ではこの呼び出しを行わない。
+//!
+//! ## 設定モード ⇔ 運用モード（#661 661-2、2026-10-19）
+//!
+//! docs/banto-hub-t17-design.md §1 の「2026-10-19 オーナー決定（#661）」と、ChronoGazer の
+//! `chronogazer_server/service.rs`（#623 PR-3）を手本にした。サービスが使う profile
+//! （`BANTO_HUB_PROFILE`）の木だけを締める（`{root}` と `profiles\` は開いて本当のパスを
+//! 確かめるだけ）。判定・文言の純関数は `banto_hub_core::profile_mode`、戻す相手の HKLM の
+//! 記録は `banto_hub_core::profile_owners`。
+//!
+//! **2 つの約束**: 締め終わるまで Hub を動かさない（緩い間に LocalSystem が書くのは、辿らずに
+//! 開いたハンドルの診断ファイルとサービスログだけ）。緩め始めたら新しく開かず、ログにも
+//! 書かない。
+//!
+//! 起動（[`HubProgram::run_inner`]）:
+//! 1. Redirection Guard。
+//! 2. 開始の引数（`relax-only` ちょうどなら [`HubProgram::relax_only`]、知らない引数は何も
+//!    変えずに 3）。
+//! 3. 戻す相手を決める（`profile_mode::plan_owners`: 設定モードの形なら DACL から採り、
+//!    運用モードの形なら HKLM の記録を使う）。
+//! 4. profile を辿らずに開いて握る（`Mode::Guarded`、作らない）→ 5. profile の排他（取れなければ
+//!    2）→ 6. `logs` を設定モードの形で開いてサービスログを始め、「運用モードへの切り替えを
+//!    始めます」。
+//! 7. 相手が 0 人なら何も変えずに 4、締まっているのに記録が使えなければ何も変えずに 5。
+//! 8. 1 周目（`scan_tree`。断ったら何も変えずに 4）→ 設定モードの形からなら、ここで HKLM に
+//!    相手を記録する（書けなければ何も変えずに 3）。
+//! 9. 2 周目（`close_tree`。止まったら `relax_tree` で緩め直して 4、緩め直せなければ 5）。
+//! 10. 管理するフォルダ（`config`・`data`・`logs`・`data\audit-spool`。監査の保留も必須）を運用
+//!     モードの形で開き、印を置く（改ざんなら緩め直して 5、I/O なら緩め直して 3）。
+//! 11. Hub を起動（`HubRuntime::start_with_profile_dirs`。排他はこの本体が持つので
+//!     `skip_profile_lock`。設定 DB のパスは運用モードの形を確かめてから渡す）→ Configured の
+//!     収集 → Running →「切り替えを終えました（所要 N 秒）」。`BANTO_DB`・`BANTO_HUB_DATA` が
+//!     profile の外なら 1 行ずつ出す（締めない。既知の制限）。起動に失敗したら Hub を止めて
+//!     から緩め直す（終了コードは 1〜3、緩め直せなければ 5）。
+//!
+//! STOP（設定モードへ）: Hub を止めて設定 DB を閉じる（`shutdown_and_report`。閉じ切れなければ
+//! 緩めずに 5）→ tokio ランタイムを Stopped の報告の前に終える（上限 [`RUNTIME_SHUTDOWN_WAIT`]。
+//! 終わらなければ緩めずに 5）→ 最後の行「緩め始めます」→ サービスログを閉じる → `relax_tree`
+//! → 0／5。**PRESHUTDOWN（OS の終了）・異常終了では緩めない**（運用モードは再起動をまたいで
+//! 続き、次の開始は記録の相手で締め直して動く）。
+//!
+//! `relax-only`: profile を握る（無ければ 0）→ 排他（2）→ `logs` を開ければログ → HKLM の記録で
+//! `relax_tree` → **Running を報告せずに** 0／5（記録が無いのに締まっていれば緩めずに 5）。
+//!
+//! テストは ACL の部品（[`AclOps`]）を偽物にし、`Mode::Plain` の一時 profile の上で、呼ばれた
+//! 順とログの行を 1 つの列にして比べる（ChronoGazer の `FakeAcl` と同じ方式）。
 
-use std::time::Duration;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use banto_hub_core::controller::{CollectionState, RunMode};
-use banto_hub_core::hub_log::{self, log_err_line, log_line};
-use banto_hub_core::profile_lock::{HubHostKind, ProfileLockError};
-use banto_hub_core::profile_paths::{build_hub_config_from_env, resolve_profile_paths_from_env};
-use banto_hub_core::runtime::{HubRuntime, HubStartError};
+use banto_hub_core::hub_log;
+use banto_hub_core::profile_lock::{
+    open_profile_dirs_checked, try_acquire_profile_exclusive, HubHostKind, ProfileLockError,
+    DIR_AUDIT_SPOOL, DIR_CONFIG, DIR_DATA, DIR_LOGS,
+};
+use banto_hub_core::profile_mode::{
+    after_close_abort, after_marker_error, check_stored_owners, close_abort_line,
+    db_not_closed_keeps_tight_line, exit_after_relax_back, exit_after_scan_refusal,
+    mode_switch_begin_line, mode_switch_done_line, no_owners_line, owners_from_dacl_line,
+    owners_from_record_line, owners_record_failed_line, parse_start_args, plan_owners,
+    plan_relax_only, preshutdown_keeps_tight_line, record_unusable_line, redirection_guard_line,
+    relax_allowed_after_shutdown, relax_back_begin_line, relax_begin_line, relax_only_begin_line,
+    relax_only_left_tight_line, relax_only_nothing_line, runtime_still_busy_keeps_tight_line,
+    scan_refused_lines, tampered_line, unknown_start_arg_line, OwnersPlan, RelaxOnlyPlan,
+    StartArgs,
+};
+use banto_hub_core::profile_owners::owners_location;
+use banto_hub_core::profile_paths::{
+    build_hub_config_from_env, external_path_line, is_outside_profile,
+    resolve_profile_paths_from_env, ExternalPath, ProfilePaths,
+};
+use banto_hub_core::runtime::{HubConfig, HubRuntime, HubStartError, RunningHub};
 use banto_hub_core::service_manager::{
     dispatch_failure_lines, run_service, OverrunWatch, ServiceContext, ServiceExit, ServiceProgram,
-    StopSignal,
+    StopSignal, HUB_EXIT_LEFT_TIGHT, HUB_EXIT_PROFILE_LOCK_HELD,
+    HUB_EXIT_RUNTIME_OR_COLLECT_FAILED, HUB_EXIT_START_FAILED,
+};
+use banto_safe_root::guard::{AccountKind, KnownFolders};
+use banto_safe_root::mode::{
+    AbortReason, CloseAbort, MarkerError, MarkerOutcome, Progress, RelaxReport, RootObservation,
+    ScanRefusal, ScanReport, StopSignal as TreeStop,
+};
+use banto_safe_root::{
+    enable_redirection_guard, open_root, DirAccess, InstallUserSid, ManagedDir, ManagedSpec, Mode,
+    ModeAccess, RedirectionGuard, RootSpec, SafeRoot, SafeRootError,
 };
 // T17-0（docs/banto-hub-t17-design.md §3「T17-0」）: サービス名・起動引数は
 // `banto_hub_core::service_manager`（`WindowsServiceManager`が実 SCM 再登録
@@ -84,47 +159,17 @@ pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 /// ログ行と案内の先頭に付ける製品名。
 const LABEL: &str = "banto-hub";
 
-/// SCM へ報告するサービス固有の終了コード（`Stopped`の
-/// `ServiceExitCode::ServiceSpecific(_)`）。`sc query`の
-/// `SERVICE_EXIT_CODE` や`Get-EventLog`から起動失敗の種別を後から区別
-/// できるようにするための診断値（Win32 予約値との衝突は無い - アプリ定義の
-/// 小さい整数）。
-///
-/// - [`EXIT_CODE_RUNTIME_OR_COLLECT_FAILED`]（1）: tokio ランタイムの構築
-///   失敗・「Configured 収集開始失敗」（2026-09-07 の I4 の修正より前から
-///   ある値）。本体の panic も、共有ランナーが同じ 1 で報告する
-///   （`banto_service_control::PANIC_EXIT_CODE`、#392 B3-1 のオーナー決定 D2）。
-/// - [`EXIT_CODE_PROFILE_LOCK_HELD`]（2、2026-09-07 I4 実機検証で新設）:
-///   `HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { .. })` -
-///   既にシェル/別サービスが同じ profile を保持している（Operator の
-///   `sc start`操作ミス等、日常的に起こり得る - バグではない）。
-/// - [`EXIT_CODE_START_FAILED`]（3、同）: 上記以外の`HubStartError`
-///   （DB open 失敗・ポート bind 失敗等）。
-const EXIT_CODE_RUNTIME_OR_COLLECT_FAILED: u32 = 1;
-const EXIT_CODE_PROFILE_LOCK_HELD: u32 = 2;
-const EXIT_CODE_START_FAILED: u32 = 3;
-
 /// [`HubStartError`]から、SCM へ報告する非0 exit code とサービスログへ
 /// 書く診断メッセージを組み立てる純関数（I/O・SCM 呼び出しを一切行わない
 /// ので単体テストできる - 2026-09-07 I4 実機検証で見つかったバグの修正）。
 ///
 /// **観測されたバグ**: サービス本体は以前、`HubRuntime::start`が
-/// 失敗した場合に`panic!`していた（旧 `hub_run::run`の`expect()`群と
-/// 「同等の異常終了」を意図した実装 - 実装指示 T14-1 §6）。しかし
-/// `HubStartError::ProfileLock(AlreadyHeld)`は「シェルが既に profile
-/// ロックを握っている状態で Operator が`sc start BantoHub`した」という
-/// 日常的に起こり得る操作であり、プログラミングバグではない。この`panic!`
-/// は`service_main`の`catch_unwind`に捕まるだけで、`Stopped`が一度も
-/// 報告されないまま処理が終わる - SCM は最後に報告された状態（`register`
-/// 直後の暗黙の`START_PENDING`、checkpoint 0）を信じ続け、`sc query`が
-/// `START_PENDING`のまま固まって見える（実機観察: `taskkill /F`でしか
-/// プロセスを止められなかった）。
-///
-/// この関数はその`panic!`分岐の代わりに、本体（[`HubProgram::run`]）が
-/// `log_err_line`→終了コードを返す（共有ランナーが`Stopped`を報告する）
-/// という、隣の「Configured 収集開始失敗」分岐と同じ作法で失敗を報告
-/// できるようにする（#392 B3-1 以降は、本体が panic しても共有ランナーが
-/// `Stopped`（`ServiceSpecific(1)`）を報告する）。
+/// 失敗した場合に`panic!`していた。`HubStartError::ProfileLock(AlreadyHeld)`は
+/// 「シェルが既に profile ロックを握っている状態で Operator が`sc start BantoHub`
+/// した」という日常的に起こり得る操作であり、プログラミングバグではない。
+/// この関数はその`panic!`分岐の代わりに、本体がログを書いて終了コードを返す
+/// （共有ランナーが`Stopped`を報告する）ための値を作る。終了コードの定数は
+/// `banto_hub_core::service_manager`（`HUB_EXIT_*`、#661 661-2 で lib へ移した）。
 fn describe_start_failure(err: &HubStartError) -> (u32, String) {
     if let HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { profile_id, owner }) = err {
         let owner_desc = owner
@@ -132,14 +177,14 @@ fn describe_start_failure(err: &HubStartError) -> (u32, String) {
             .map(|info| format!("pid={} host_kind={}", info.pid, info.host_kind))
             .unwrap_or_else(|| "unknown".to_string());
         return (
-            EXIT_CODE_PROFILE_LOCK_HELD,
+            HUB_EXIT_PROFILE_LOCK_HELD,
             format!(
                 "banto-hub: 起動に失敗しました - profile '{profile_id}' は既に別プロセスが使用中です（owner: {owner_desc}）"
             ),
         );
     }
     (
-        EXIT_CODE_START_FAILED,
+        HUB_EXIT_START_FAILED,
         format!("banto-hub: 起動に失敗しました: {err}"),
     )
 }
@@ -176,12 +221,35 @@ fn hub_stop_overrun_line() -> &'static str {
     "banto-hub: warn: OS シャットダウンの予算内に最終 flush が終わりませんでした（SCM がプロセスを終了させる可能性があります）"
 }
 
+/// 設定 DB を閉じ終えたときの行（STOP で緩める前の順序の目印）。
+const DB_CLOSED_LINE: &str = "banto-hub: 設定 DB を閉じました";
+/// Hub の tokio ランタイムを終えたときの行（同上）。
+const RUNTIME_FINISHED_LINE: &str =
+    "banto-hub: Hub の非同期ランタイムを終えました（残りのタスクはありません）";
+
 /// 通常の STOP で Hub の停止にかかる見込み。`ServiceStatusReporter` の
 /// heartbeat は、これを 5 秒の刻みで割った回数まで StopPending の
 /// checkpoint を進め、その後は進めない（停止が固まったら、`wait_hint` の
 /// 30 秒の後に SCM が応答なしを報告できるように）。収集停止は打ち切らない
 /// ので、これを超えても停止そのものは続く。
 const HUB_EXPECTED_STOP: Duration = Duration::from_secs(60);
+/// START_PENDING の報告の wait hint。
+const START_WAIT_HINT: Duration = Duration::from_secs(10);
+/// 進み具合で checkpoint を進める間隔。
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+/// STOP で、緩める前に Hub の tokio ランタイムを終えるのを待つ上限。非同期のタスクは
+/// 終えるときに全部捨てるので、待つのは実質 `spawn_blocking` の残り。過ぎたら緩めずに 5。
+const RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// 木を歩くスレッドのスタック（ChronoGazer と同じ。深い木で溢れない大きさ）。
+const WALK_STACK: usize = 16 * 1024 * 1024;
+
+/// 締める前に開く `logs`（設定モードの形で作る）。
+const LOGS_SPEC: ManagedSpec = ManagedSpec {
+    key: DIR_LOGS,
+    parent: None,
+    name: "logs",
+    create: true,
+};
 
 /// `bin/banto-hub.rs`の`install`サブコマンド用引数リテラル。
 pub const INSTALL_ARG: &str = "install";
@@ -211,7 +279,7 @@ pub fn uninstall() {
 /// 想定されていない - Windows の制約）で、製品共通の案内（#392 B3-1 の
 /// オーナー決定 D3）を標準エラー出力に出して終了コード 1。
 pub fn run_service_dispatcher() {
-    if let Err(err) = run_service(HubProgram) {
+    if let Err(err) = run_service(HubProgram::production()) {
         for line in dispatch_failure_lines(LABEL, &err) {
             eprintln!("{line}");
         }
@@ -219,10 +287,917 @@ pub fn run_service_dispatcher() {
     }
 }
 
-/// Hub のサービス本体（共有ランナーに渡す、#392 B3-1）。SCM との
-/// やりとり（制御ハンドラ、Running → StopPending → Stopped の報告、
-/// panic）は共有ランナーが持ち、ここは起動・停止の中身と終了コードだけ。
-struct HubProgram;
+// --- 差し替え口 ------------------------------------------------------------------------
+
+/// profile のパスと Hub の設定（本番は環境変数。テストは一時 profile）。
+type ConfigSource = Box<dyn Fn() -> (ProfilePaths, HubConfig) + Send + Sync>;
+/// HKLM の戻す相手の記録を読む（本番は `profile_owners::read_owners`）。
+type OwnersReader = Box<dyn Fn(&str) -> Result<Option<Vec<String>>, String> + Send + Sync>;
+/// HKLM に戻す相手を記録する（本番は `profile_owners::write_owners`）。
+type OwnersWriter = Box<dyn Fn(&str, &[InstallUserSid]) -> Result<(), String> + Send + Sync>;
+/// ルートにしてはいけない既知のフォルダ。
+type KnownFoldersSource = Box<dyn Fn() -> Result<KnownFolders, String> + Send + Sync>;
+/// Redirection Guard を有効にする（テストは呼ばない - テストのプロセス全体に効くため）。
+type RedirectionGuardSource = Box<dyn Fn() -> RedirectionGuard + Send + Sync>;
+
+/// サービスログ（本番は `hub_log` のサービスログ。テストは行を集める偽物）。
+pub(crate) trait ServiceLog: Send + Sync {
+    /// 握った `logs\` の中にサービスログを辿らずに開く。
+    fn open(&self, logs: &ManagedDir) -> Result<(), String>;
+    /// 1 行（開いていなければ標準出力だけ）。
+    fn line(&self, line: &str);
+    /// エラーの 1 行。
+    fn error(&self, line: &str);
+    /// ディスクへ出す。
+    fn sync(&self);
+    /// ディスクへ出してから閉じる（以後ファイルへは書かない）。
+    fn close(&self);
+}
+
+/// 本番: `hub_log` のサービスログ。
+struct HubServiceLog;
+
+impl ServiceLog for HubServiceLog {
+    fn open(&self, logs: &ManagedDir) -> Result<(), String> {
+        hub_log::enable_service_log_file_in(logs).map_err(|err| err.to_string())
+    }
+
+    fn line(&self, line: &str) {
+        hub_log::log_line(line);
+    }
+
+    fn error(&self, line: &str) {
+        hub_log::log_err_line(line);
+    }
+
+    fn sync(&self) {
+        hub_log::sync_service_log();
+    }
+
+    fn close(&self) {
+        hub_log::close_service_log();
+    }
+}
+
+/// ACL の付け替えの部品（本番は `banto-safe-root`。テストは偽物で、`Mode::Plain` の
+/// profile の上で順序と失敗の注入だけ）。どれもログを出さない。
+pub(crate) trait AclOps: Send + Sync {
+    /// profile の握り方（本番 `Guarded`、テスト `Plain`）。
+    fn root_mode(&self) -> Mode;
+    /// profile を読むだけで開いて記述子を読む（形と、戻す相手を採るため）。
+    fn observe(&self, profile_dir: &Path) -> Result<RootObservation, String>;
+    /// SID が利用者のアカウントか。
+    fn account_kind(&self, sid: &InstallUserSid) -> AccountKind;
+    /// 1 周目。
+    fn scan_tree(
+        &self,
+        root: &SafeRoot,
+        stop: &dyn Fn() -> TreeStop,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<ScanReport, ScanRefusal>;
+    /// 2 周目。
+    fn close_tree(
+        &self,
+        root: &SafeRoot,
+        mode: &ModeAccess,
+        stop: &dyn Fn() -> TreeStop,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<Progress, CloseAbort>;
+    /// 緩める（下から、profile 自身を最後に）。
+    fn relax_tree(
+        &self,
+        root: &SafeRoot,
+        mode: &ModeAccess,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<RelaxReport, SafeRootError>;
+    /// 印のファイル。
+    fn ensure_marker(&self, dir: &ManagedDir) -> Result<MarkerOutcome, MarkerError>;
+}
+
+/// 本番: `banto-safe-root` の部品そのもの。
+struct RealAcl;
+
+impl AclOps for RealAcl {
+    fn root_mode(&self) -> Mode {
+        Mode::Guarded
+    }
+
+    fn observe(&self, profile_dir: &Path) -> Result<RootObservation, String> {
+        banto_safe_root::mode::observe_root(profile_dir).map_err(|err| err.to_string())
+    }
+
+    fn account_kind(&self, sid: &InstallUserSid) -> AccountKind {
+        banto_safe_root::guard::account_kind(sid)
+    }
+
+    fn scan_tree(
+        &self,
+        root: &SafeRoot,
+        stop: &dyn Fn() -> TreeStop,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<ScanReport, ScanRefusal> {
+        root.pinned()
+            .ok_or(ScanRefusal::Io(SafeRootError::UnsupportedPlatform))?
+            .scan_tree(stop, progress)
+    }
+
+    fn close_tree(
+        &self,
+        root: &SafeRoot,
+        mode: &ModeAccess,
+        stop: &dyn Fn() -> TreeStop,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<Progress, CloseAbort> {
+        root.pinned()
+            .ok_or(CloseAbort {
+                written: 0,
+                reason: AbortReason::Io(SafeRootError::UnsupportedPlatform),
+            })?
+            .close_tree(mode, stop, progress)
+    }
+
+    fn relax_tree(
+        &self,
+        root: &SafeRoot,
+        mode: &ModeAccess,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<RelaxReport, SafeRootError> {
+        root.pinned()
+            .ok_or(SafeRootError::UnsupportedPlatform)?
+            .relax_tree(mode, progress)
+    }
+
+    fn ensure_marker(&self, dir: &ManagedDir) -> Result<MarkerOutcome, MarkerError> {
+        dir.ensure_marker()
+    }
+}
+
+/// Hub を動かす tokio ランタイム。**Stopped の報告の前に終える**（`hold_until_stopped` は
+/// 使わない）: STOP では [`Self::shutdown_within`] で終わりを待ち、それ以外の道（PRESHUTDOWN・
+/// 起動の失敗・panic）では drop で残りのタスクを待たずに落とす（`shutdown_background`）。
+struct EngineRuntime(Option<tokio::runtime::Runtime>);
+
+impl EngineRuntime {
+    fn new() -> std::io::Result<Self> {
+        tokio::runtime::Runtime::new().map(|runtime| Self(Some(runtime)))
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.0
+            .as_ref()
+            .expect("ランタイムを終える前だけ使う")
+            .block_on(future)
+    }
+
+    /// ランタイムを終わらせ、`cap` まで待つ（別のスレッドで drop する。tokio の `Runtime`
+    /// の drop は非同期のタスクを全部捨て、`spawn_blocking` の分が終わるまで待つ）。戻れば
+    /// `true`（もうこのランタイムで動く物は無い）。待つ間は `PROGRESS_INTERVAL` ごとに `tick`。
+    fn shutdown_within(&mut self, cap: Duration, tick: &mut dyn FnMut()) -> bool {
+        let Some(runtime) = self.0.take() else {
+            return true;
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("banto-hub-runtime-end".to_string())
+            .spawn(move || {
+                drop(runtime);
+                let _ = done_tx.send(());
+            });
+        if spawned.is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + cap;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            match done_rx.recv_timeout((deadline - now).min(PROGRESS_INTERVAL)) {
+                Ok(()) => return true,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tick(),
+            }
+        }
+    }
+}
+
+impl Drop for EngineRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// Hub のサービス本体（共有ランナーに渡す）。SCM とのやりとり（制御ハンドラ、Running →
+/// StopPending → Stopped の報告、panic）は共有ランナーが持ち、ここは段の順序と終了コード。
+pub(crate) struct HubProgram {
+    config: ConfigSource,
+    read_owners: OwnersReader,
+    write_owners: OwnersWriter,
+    known_folders: KnownFoldersSource,
+    redirection_guard: RedirectionGuardSource,
+    acl: Arc<dyn AclOps>,
+    log: Arc<dyn ServiceLog>,
+    runtime_shutdown_wait: Duration,
+    /// テスト専用: `shutdown_and_report` の `db_closed` を `false` に偽る。
+    #[cfg(test)]
+    fake_db_not_closed: std::sync::atomic::AtomicBool,
+}
+
+/// [`HubProgram::new`] に渡す部品の組（本番とテストで差し替える物）。
+pub(crate) struct ProgramParts {
+    pub config: ConfigSource,
+    pub read_owners: OwnersReader,
+    pub write_owners: OwnersWriter,
+    pub known_folders: KnownFoldersSource,
+    pub redirection_guard: RedirectionGuardSource,
+    pub acl: Arc<dyn AclOps>,
+    pub log: Arc<dyn ServiceLog>,
+}
+
+/// 締めた後の Hub が動いている間に持つ物。
+struct Engine {
+    runtime: EngineRuntime,
+    hub: Option<RunningHub>,
+}
+
+impl HubProgram {
+    fn production() -> Self {
+        Self::new(ProgramParts {
+            config: Box::new(|| {
+                let paths = resolve_profile_paths_from_env();
+                let config = build_hub_config_from_env(HubHostKind::Service);
+                (paths, config)
+            }),
+            read_owners: Box::new(banto_hub_core::profile_owners::read_owners),
+            write_owners: Box::new(banto_hub_core::profile_owners::write_owners),
+            known_folders: Box::new(|| {
+                use banto_safe_root::guard::MachineEnvironment;
+                banto_safe_root::guard::win::RegistryMachineEnvironment.known_folders()
+            }),
+            redirection_guard: Box::new(enable_redirection_guard),
+            acl: Arc::new(RealAcl),
+            log: Arc::new(HubServiceLog),
+        })
+    }
+
+    fn new(parts: ProgramParts) -> Self {
+        Self {
+            config: parts.config,
+            read_owners: parts.read_owners,
+            write_owners: parts.write_owners,
+            known_folders: parts.known_folders,
+            redirection_guard: parts.redirection_guard,
+            acl: parts.acl,
+            log: parts.log,
+            runtime_shutdown_wait: RUNTIME_SHUTDOWN_WAIT,
+            #[cfg(test)]
+            fake_db_not_closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn say(&self, line: &str) {
+        self.log.line(line);
+    }
+
+    /// 1 周目・2 周目・緩めるを**専用のスレッド**（スタックを明示）で走らせる。
+    fn on_walk_thread<T: Send>(&self, name: &str, work: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .stack_size(WALK_STACK)
+                .spawn_scoped(scope, work)
+                .map(|handle| handle.join().expect("木を歩くスレッドが panic した"))
+                .unwrap_or_else(|_| panic!("木を歩くスレッドを作れない（{name}）"))
+        })
+    }
+
+    /// 緩める（ログは閉じてから呼ぶ）。`stopping` なら STOP_PENDING、そうでなければ
+    /// START_PENDING の checkpoint を進める。戻り値は緩められたか。
+    fn relax(
+        &self,
+        ctx: &ServiceContext,
+        root: &SafeRoot,
+        mode: &ModeAccess,
+        stopping: bool,
+    ) -> bool {
+        let mut last = Instant::now();
+        let mut progress = |_: &Progress| {
+            if last.elapsed() >= PROGRESS_INTERVAL {
+                last = Instant::now();
+                if stopping {
+                    ctx.report_stop_progress();
+                } else {
+                    ctx.report_start_progress(START_WAIT_HINT);
+                }
+            }
+        };
+        self.on_walk_thread("banto-hub-relax", || {
+            self.acl.relax_tree(root, mode, &mut progress).is_ok()
+        })
+    }
+
+    /// 締めた分を緩め直して終わる（起動の途中で止まったとき）。最後の行 → ログを閉じる →
+    /// 緩める。緩め直せたら `if_relaxed`、できなければ 5。
+    fn relax_back(
+        &self,
+        ctx: &ServiceContext,
+        root: &SafeRoot,
+        mode: &ModeAccess,
+        why: &str,
+        if_relaxed: u32,
+    ) -> u32 {
+        self.say(&relax_back_begin_line(why, if_relaxed));
+        self.log.close();
+        let relaxed = self.relax(ctx, root, mode, false);
+        exit_after_relax_back(relaxed, if_relaxed)
+    }
+
+    /// 締める前に終わる（何も変えていない、または緩めない）。
+    fn finish_without_relax(&self, code: u32) -> u32 {
+        self.say(&format!(
+            "{LABEL}: Windows サービスを停止しました（終了コード {code}）"
+        ));
+        self.log.close();
+        code
+    }
+
+    /// profile を辿らずに開いて握る（作らない。`{root}`・`profiles\` は本当のパスを確かめる
+    /// だけ）。`owners` は所有者として許す利用者。
+    fn open_profile(
+        &self,
+        paths: &ProfilePaths,
+        owners: &[InstallUserSid],
+    ) -> Result<SafeRoot, String> {
+        let known = (self.known_folders)()
+            .map_err(|reason| format!("既知のフォルダの場所を取れませんでした: {reason}"))?;
+        open_root(&RootSpec {
+            expected: paths.profile_dir.clone(),
+            known,
+            owners: owners.to_vec(),
+            create_access: None,
+            create: false,
+            mode: self.acl.root_mode(),
+        })
+        .map_err(|refusal| refusal.to_string())
+    }
+
+    /// `logs\` を握る（`create` なら無ければ `access` の形で作る）。無くて作らないなら `Ok(None)`。
+    fn open_logs(
+        &self,
+        root: &SafeRoot,
+        access: Option<&DirAccess>,
+        create: bool,
+    ) -> Result<Option<Arc<ManagedDir>>, String> {
+        let spec = ManagedSpec {
+            create,
+            ..LOGS_SPEC
+        };
+        match root.open_managed(&[spec], access) {
+            Ok(mut set) => Ok(Some(Arc::new(set.take(DIR_LOGS).expect("spec にある")))),
+            Err(stop) if matches!(stop.reason, banto_safe_root::root::ManagedRefusal::Absent) => {
+                Ok(None)
+            }
+            Err(stop) => Err(stop.to_string()),
+        }
+    }
+
+    /// Hub を止め、設定 DB を閉じ、ランタイムを終える。緩めてよければ `Ok`、だめなら
+    /// 締めたまま終わる終了コード（5）。`stopping` なら STOP_PENDING の checkpoint を進める。
+    fn stop_engine(
+        &self,
+        ctx: &ServiceContext,
+        mut engine: Engine,
+        stopping: bool,
+    ) -> Result<(), u32> {
+        let db_closed = match engine.hub.take() {
+            Some(hub) => {
+                let report = engine.runtime.block_on(hub.shutdown_and_report());
+                #[cfg(test)]
+                let report = banto_hub_core::runtime::HubShutdownReport {
+                    db_closed: report.db_closed
+                        && !self
+                            .fake_db_not_closed
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                };
+                report.db_closed
+            }
+            None => true,
+        };
+        if db_closed {
+            self.say(DB_CLOSED_LINE);
+        }
+        let mut tick = || {
+            if stopping {
+                ctx.report_stop_progress();
+            } else {
+                ctx.report_start_progress(START_WAIT_HINT);
+            }
+        };
+        // 設定 DB を閉じ切れなくても、ランタイムは終える（Stopped の報告の前に）。
+        let runtime_finished = engine
+            .runtime
+            .shutdown_within(self.runtime_shutdown_wait, &mut tick);
+        if runtime_finished {
+            self.say(RUNTIME_FINISHED_LINE);
+        }
+        if relax_allowed_after_shutdown(db_closed, runtime_finished) {
+            return Ok(());
+        }
+        if !db_closed {
+            self.say(&db_not_closed_keeps_tight_line());
+        } else {
+            self.say(&runtime_still_busy_keeps_tight_line(
+                self.runtime_shutdown_wait,
+            ));
+        }
+        Err(HUB_EXIT_LEFT_TIGHT)
+    }
+
+    /// 起動の途中（締めた後）で Hub を動かさずに終わる: Hub を止めてから緩め直す
+    /// （PRESHUTDOWN が来ていれば緩めない）。
+    fn abandon_start(
+        &self,
+        ctx: &ServiceContext,
+        engine: Engine,
+        root: &SafeRoot,
+        mode: &ModeAccess,
+        code: u32,
+    ) -> u32 {
+        if let Err(left_tight) = self.stop_engine(ctx, engine, false) {
+            return self.finish_without_relax(left_tight);
+        }
+        if is_preshutdown(ctx) {
+            self.say(&preshutdown_keeps_tight_line());
+            return self.finish_without_relax(code);
+        }
+        self.relax_back(ctx, root, mode, "Hub を動かさずに終わるため", code)
+    }
+
+    fn run_inner(&self, ctx: &ServiceContext) -> u32 {
+        ctx.set_expected_stop(HUB_EXPECTED_STOP);
+        // 1. Redirection Guard（結果はログを開いた後に 1 行）。
+        let redirection = (self.redirection_guard)();
+
+        // 2. 開始の引数（信頼できない入力。決まった値との完全一致だけ）。
+        match parse_start_args(ctx.start_args()) {
+            StartArgs::Normal => {}
+            StartArgs::RelaxOnly => return self.relax_only(ctx),
+            StartArgs::Unknown(arg) => {
+                self.log.error(&unknown_start_arg_line(&arg));
+                return HUB_EXIT_START_FAILED;
+            }
+        }
+
+        // 3. 戻す相手（設定モードの形なら DACL から採る・運用モードの形なら記録を使う）。
+        let (paths, config) = (self.config)();
+        let observation = match self.acl.observe(&paths.profile_dir) {
+            Ok(observation) => observation,
+            Err(reason) => {
+                self.log.error(&format!(
+                    "{LABEL}: profile のフォルダ（{}）を確かめられませんでした（何も変えていません）: {reason}",
+                    paths.profile_dir.display()
+                ));
+                return HUB_EXIT_START_FAILED;
+            }
+        };
+        let stored = check_stored_owners((self.read_owners)(&paths.profile_id));
+        let plan = plan_owners(&observation, stored, |sid| self.acl.account_kind(sid));
+        let location = owners_location(&paths.profile_id);
+        let refusal_line = |plan: &OwnersPlan| match plan {
+            OwnersPlan::NoOwners(reason) => Some(no_owners_line(reason)),
+            OwnersPlan::RecordUnusable(reason) => Some(record_unusable_line(reason, &location)),
+            OwnersPlan::FromDacl(_) | OwnersPlan::FromRecord(_) => None,
+        };
+
+        // 4. profile（辿らずに開いて握る。作らない）。
+        let root = match self.open_profile(&paths, plan.owners()) {
+            Ok(root) => Arc::new(root),
+            Err(reason) => {
+                // 相手が決まらないなら、開けない理由より先にそちらを返す（何も変えていない）。
+                if let (Some(code), Some(line)) = (plan.refusal_exit(), refusal_line(&plan)) {
+                    self.log.error(&line);
+                    return code;
+                }
+                self.log.error(&format!(
+                    "{LABEL}: profile のフォルダ（{}）を使えません（何も変えていません）: {reason}",
+                    paths.profile_dir.display()
+                ));
+                return HUB_EXIT_START_FAILED;
+            }
+        };
+
+        // 5. profile の排他（取れなければ何も開かずに 2）。
+        let exclusive = match try_acquire_profile_exclusive(&paths, HubHostKind::Service, &root) {
+            Ok(exclusive) => exclusive,
+            Err(err) => {
+                let code = match err {
+                    ProfileLockError::AlreadyHeld { .. } => HUB_EXIT_PROFILE_LOCK_HELD,
+                    _ => HUB_EXIT_START_FAILED,
+                };
+                self.log.error(&format!(
+                    "{LABEL}: 起動に失敗しました（何も変えていません）: {err}"
+                ));
+                return code;
+            }
+        };
+        ctx.report_start_progress(START_WAIT_HINT);
+
+        // 6. サービスログ（`logs\` を設定モードの形で握る。相手が決まらないなら作らない）。
+        let mode = ModeAccess::for_users(plan.owners().to_vec());
+        let logs = match self.open_logs(
+            &root,
+            mode.as_ref().map(ModeAccess::setting),
+            mode.is_some(),
+        ) {
+            Ok(logs) => logs,
+            Err(reason) => {
+                if let (Some(code), Some(line)) = (plan.refusal_exit(), refusal_line(&plan)) {
+                    self.log.error(&line);
+                    return code;
+                }
+                self.log.error(&format!(
+                    "{LABEL}: ログの置き場（logs）を開けませんでした（何も変えていません）: {reason}"
+                ));
+                return HUB_EXIT_START_FAILED;
+            }
+        };
+        if let Some(logs) = &logs {
+            if let Err(reason) = self.log.open(logs) {
+                self.log.error(&format!(
+                    "{LABEL}: サービスログを開けませんでした（何も変えていません）: {reason}"
+                ));
+                if plan.refusal_exit().is_none() {
+                    return HUB_EXIT_START_FAILED;
+                }
+            }
+        }
+        let switch_started = Instant::now();
+        self.say(&redirection_guard_line(redirection));
+        self.say(&mode_switch_begin_line());
+
+        // 7. 相手が決まらない: 何も変えずに 4（0 人）／5（締まっているのに記録が使えない）。
+        let (Some(mode), None) = (mode, plan.refusal_exit()) else {
+            let line = refusal_line(&plan).expect("決まらないときは行がある");
+            self.say(&line);
+            let code = plan.refusal_exit().expect("決まらない");
+            drop(exclusive);
+            return self.finish_without_relax(code);
+        };
+        match &plan {
+            OwnersPlan::FromDacl(owners) => {
+                self.say(&owners_from_dacl_line(owners.len(), &location))
+            }
+            OwnersPlan::FromRecord(owners) => {
+                self.say(&owners_from_record_line(owners.len(), &location))
+            }
+            _ => {}
+        }
+
+        // 8. 1 周目（読むだけ。断ったら何も変えずに 4）。
+        let stop = || tree_stop(ctx);
+        let progress = Throttle::new(ctx);
+        let scanned = self.on_walk_thread("banto-hub-scan", || {
+            self.acl.scan_tree(&root, &stop, &mut progress.callback())
+        });
+        match scanned {
+            Ok(report) => self.say(&format!(
+                "{LABEL}: profile を確かめました（{} 件。締められない物はありません）",
+                report.examined
+            )),
+            Err(refusal) => {
+                match &refusal {
+                    ScanRefusal::Problems(problems) => {
+                        for line in scan_refused_lines(problems) {
+                            self.say(&line);
+                        }
+                    }
+                    ScanRefusal::Io(error) => self.say(&format!(
+                        "{LABEL}: profile を確かめられませんでした（終了コード {HUB_EXIT_START_FAILED}。何も変えていません）: {error}"
+                    )),
+                    ScanRefusal::Stopped(signal) => self.say(&format!(
+                        "{LABEL}: 確かめている途中で止める合図（{signal:?}）を受けたため、何も変えずに起動を中止します"
+                    )),
+                }
+                return self.finish_without_relax(exit_after_scan_refusal(&refusal));
+            }
+        }
+
+        // 8b. 設定モードの形から締めるときだけ、締める直前に相手を HKLM に記録する（運用
+        // モードの形からの再開では書かない = 記録を空や採り直しで上書きしない）。
+        if let OwnersPlan::FromDacl(owners) = &plan {
+            if let Err(error) = (self.write_owners)(&paths.profile_id, owners) {
+                self.say(&owners_record_failed_line(&error));
+                return self.finish_without_relax(HUB_EXIT_START_FAILED);
+            }
+        }
+
+        // 9. 2 周目（締める。止まったら緩め直して 4／5）。
+        let closed = self.on_walk_thread("banto-hub-close", || {
+            self.acl
+                .close_tree(&root, &mode, &stop, &mut progress.callback())
+        });
+        let tightened = match closed {
+            Ok(progress) => progress,
+            Err(CloseAbort { written, reason }) => {
+                self.say(&close_abort_line(written, &reason));
+                let plan = after_close_abort(&reason);
+                if !plan.relax_back {
+                    self.say(&preshutdown_keeps_tight_line());
+                    return self.finish_without_relax(plan.exit_if_relaxed);
+                }
+                return self.relax_back(
+                    ctx,
+                    &root,
+                    &mode,
+                    "運用モードにできませんでした",
+                    plan.exit_if_relaxed,
+                );
+            }
+        };
+        self.say(&format!(
+            "{LABEL}: profile を運用モードの形に締めました（確かめた物 {} 件・書いた物 {} 件）",
+            tightened.examined, tightened.written
+        ));
+
+        // 10. 管理するフォルダ（運用モードの形で作る。監査の保留も必須）と印。
+        let dirs = match open_profile_dirs_checked(root.clone(), mode.operation()) {
+            Ok(dirs) => dirs,
+            Err(error) => {
+                return self.relax_back(
+                    ctx,
+                    &root,
+                    &mode,
+                    &format!("管理するフォルダを開けませんでした: {error}"),
+                    HUB_EXIT_START_FAILED,
+                );
+            }
+        };
+        let spool = dirs
+            .audit_spool
+            .clone()
+            .expect("open_profile_dirs_checked は監査の保留を必ず開く");
+        let marked: [(&str, &ManagedDir); 4] = [
+            (DIR_CONFIG, dirs.config.as_ref()),
+            (DIR_DATA, dirs.data.as_ref()),
+            (DIR_LOGS, dirs.logs.as_ref()),
+            (DIR_AUDIT_SPOOL, spool.as_ref()),
+        ];
+        for (key, dir) in marked {
+            if let Err(error) = self.acl.ensure_marker(dir) {
+                let (tampered, exit) = after_marker_error(&error);
+                let why = if tampered {
+                    tampered_line(key, &error)
+                } else {
+                    format!("フォルダ「{key}」に印を置けませんでした: {error}")
+                };
+                return self.relax_back(ctx, &root, &mode, &why, exit);
+            }
+        }
+        ctx.report_start_progress(START_WAIT_HINT);
+
+        // 11. Hub を起動（排他はこの本体が持つ。外のパスは 1 行ずつ）。
+        let mut config = config;
+        config.skip_profile_lock = true;
+        let external = external_lines(&paths, &config, root.final_path());
+        let runtime = match EngineRuntime::new() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                return self.relax_back(
+                    ctx,
+                    &root,
+                    &mode,
+                    &format!("tokio ランタイムの構築に失敗しました: {err}"),
+                    HUB_EXIT_RUNTIME_OR_COLLECT_FAILED,
+                );
+            }
+        };
+        let mut engine = Engine { runtime, hub: None };
+        let started = engine
+            .runtime
+            .block_on(HubRuntime::start_with_profile_dirs(config, dirs));
+        let hub = match started {
+            Ok(hub) => hub,
+            Err(err) => {
+                let (code, message) = describe_start_failure(&err);
+                self.say(&message);
+                return self.abandon_start(ctx, engine, &root, &mode, code);
+            }
+        };
+        let controller = hub.controller();
+        engine.hub = Some(hub);
+        // 終了の受付（#392 A2 レビュー）の印を立てるのは `shutdown_and_report` だけで、それは
+        // この開始より後に呼ばれるため、ここで `Err` になる経路は今は無い。
+        let collect = match engine
+            .runtime
+            .block_on(controller.start(RunMode::Configured))
+        {
+            Ok(status) if status.state == CollectionState::Running => None,
+            Ok(status) => Some(format!("{:?}", status.last_error)),
+            Err(refused) => Some(refused.to_string()),
+        };
+        if let Some(reason) = collect {
+            self.say(&format!(
+                "{LABEL}: Configured 収集の開始に失敗しました: {reason}"
+            ));
+            return self.abandon_start(
+                ctx,
+                engine,
+                &root,
+                &mode,
+                HUB_EXIT_RUNTIME_OR_COLLECT_FAILED,
+            );
+        }
+        // 起動中に STOP / PRESHUTDOWN が来ていたら Running を報告しない（そのまま停止へ）。
+        if ctx.report_running() {
+            self.say("banto-hub: Windows サービスとして起動しました");
+        }
+        self.say(&mode_switch_done_line(&tightened, switch_started.elapsed()));
+        for line in external {
+            self.say(&line);
+        }
+
+        // 止める合図を待つ。
+        let notice = ctx.wait_for_stop();
+        self.say(&hub_stop_reason_line(notice.signal));
+        self.log.sync();
+
+        if notice.signal == StopSignal::OsPreshutdown {
+            // PRESHUTDOWN: 締めたまま（運用モードは再起動をまたいで続く）。収集の停止は
+            // 打ち切らず、作業予算を超えたら警告を 1 行書いてログをディスクへ出す。
+            let overrun = notice.os_work_deadline().map(|deadline| {
+                let log = self.log.clone();
+                OverrunWatch::spawn(deadline, move || {
+                    log.error(hub_stop_overrun_line());
+                    log.sync();
+                })
+            });
+            if let Some(hub) = engine.hub.take() {
+                let _ = engine.runtime.block_on(hub.shutdown_and_report());
+            }
+            if let Some(watch) = overrun {
+                watch.finish();
+            }
+            self.say(&hub_stop_done_line(notice.signal));
+            self.say(&preshutdown_keeps_tight_line());
+            // ランタイムは残りのタスクを待たずに落とす（Stopped の報告の前）。
+            drop(engine);
+            drop(exclusive);
+            return self.finish_without_relax(0);
+        }
+
+        // STOP = 設定モードへ: Hub を止めて設定 DB を閉じる → ランタイムを終える → 最後の行 →
+        // ログを閉じる → 緩める。
+        if let Err(left_tight) = self.stop_engine(ctx, engine, true) {
+            drop(exclusive);
+            return self.finish_without_relax(left_tight);
+        }
+        self.say(&hub_stop_done_line(notice.signal));
+        self.say(&relax_begin_line());
+        self.log.close();
+        let relaxed = self.relax(ctx, &root, &mode, true);
+        // 握った profile と排他は緩め終えてから放す。
+        drop(root);
+        drop(exclusive);
+        exit_after_relax_back(relaxed, 0)
+    }
+
+    /// 緩めるだけの開始（`relax-only`）。Running を報告しない。DACL からは採らず、HKLM の
+    /// 記録だけを使う。
+    fn relax_only(&self, ctx: &ServiceContext) -> u32 {
+        let (paths, _config) = (self.config)();
+        let location = owners_location(&paths.profile_id);
+        let observation = match self.acl.observe(&paths.profile_dir) {
+            Ok(observation) => observation,
+            Err(reason) => {
+                self.log.error(&format!(
+                    "{LABEL}: relax-only: profile のフォルダ（{}）を確かめられませんでした: {reason}",
+                    paths.profile_dir.display()
+                ));
+                return HUB_EXIT_START_FAILED;
+            }
+        };
+        let stored = check_stored_owners((self.read_owners)(&paths.profile_id));
+        let plan = plan_relax_only(&observation, stored);
+        let owners = match &plan {
+            RelaxOnlyPlan::Relax(owners) => owners.clone(),
+            RelaxOnlyPlan::NothingToRelax | RelaxOnlyPlan::LeftTight(_) => Vec::new(),
+        };
+        let root = match self.open_profile(&paths, &owners) {
+            Ok(root) => root,
+            Err(reason) => {
+                return match &plan {
+                    RelaxOnlyPlan::NothingToRelax => 0,
+                    RelaxOnlyPlan::LeftTight(why) => {
+                        self.log.error(&relax_only_left_tight_line(why, &location));
+                        HUB_EXIT_LEFT_TIGHT
+                    }
+                    RelaxOnlyPlan::Relax(_) => {
+                        self.log.error(&format!(
+                            "{LABEL}: relax-only: profile のフォルダ（{}）を使えません: {reason}",
+                            paths.profile_dir.display()
+                        ));
+                        HUB_EXIT_START_FAILED
+                    }
+                };
+            }
+        };
+        // 排他（デスクトップの Hub が動いている間には緩めない）。
+        let exclusive = match try_acquire_profile_exclusive(&paths, HubHostKind::Service, &root) {
+            Ok(exclusive) => exclusive,
+            Err(err) => {
+                self.log
+                    .error(&format!("{LABEL}: relax-only を始められません: {err}"));
+                return match err {
+                    ProfileLockError::AlreadyHeld { .. } => HUB_EXIT_PROFILE_LOCK_HELD,
+                    _ => HUB_EXIT_START_FAILED,
+                };
+            }
+        };
+        ctx.report_start_progress(START_WAIT_HINT);
+        // `logs` は作らない。開ければログに書く（開けなければログなしで続ける）。
+        if let Ok(Some(logs)) = self.open_logs(&root, None, false) {
+            let _ = self.log.open(&logs);
+        }
+        let exit = match plan {
+            RelaxOnlyPlan::NothingToRelax => {
+                self.say(&relax_only_nothing_line());
+                self.finish_without_relax(0)
+            }
+            RelaxOnlyPlan::LeftTight(why) => {
+                self.say(&relax_only_left_tight_line(&why, &location));
+                self.finish_without_relax(HUB_EXIT_LEFT_TIGHT)
+            }
+            RelaxOnlyPlan::Relax(owners) => {
+                let mode = ModeAccess::for_users(owners).expect("記録は空でない");
+                self.say(&relax_only_begin_line());
+                self.log.close();
+                let relaxed = self.relax(ctx, &root, &mode, false);
+                exit_after_relax_back(relaxed, 0)
+            }
+        };
+        drop(root);
+        drop(exclusive);
+        exit
+    }
+}
+
+/// `BANTO_DB`・`BANTO_HUB_DATA` が profile の外なら、その旨の行（締めない。#659 と合わせて
+/// 決める既知の制限）。
+fn external_lines(paths: &ProfilePaths, config: &HubConfig, profile_final: &Path) -> Vec<String> {
+    let mut lines = Vec::new();
+    let db = Path::new(&config.db_path);
+    if is_outside_profile(db, &paths.profile_dir, profile_final) {
+        lines.push(external_path_line(ExternalPath::Db, db));
+    }
+    if let Some(data) = &config.data_dir_override {
+        if is_outside_profile(data, &paths.profile_dir, profile_final) {
+            lines.push(external_path_line(ExternalPath::DataDir, data));
+        }
+    }
+    lines
+}
+
+/// 起動の途中で OS の終了（PRESHUTDOWN）を受けていたか。
+fn is_preshutdown(ctx: &ServiceContext) -> bool {
+    ctx.stop_notice()
+        .is_some_and(|notice| notice.signal == StopSignal::OsPreshutdown)
+}
+
+/// SCM の止める合図を木を歩く部品の合図に写す。
+fn tree_stop(ctx: &ServiceContext) -> TreeStop {
+    match ctx.stop_notice().map(|notice| notice.signal) {
+        None => TreeStop::None,
+        Some(StopSignal::ServiceStop) => TreeStop::Stop,
+        Some(StopSignal::OsPreshutdown) => TreeStop::Preshutdown,
+    }
+}
+
+/// 進み具合のコールバックを間引いて START_PENDING の checkpoint を進める（1 秒ごと）。
+struct Throttle<'a> {
+    ctx: &'a ServiceContext,
+    last: Mutex<Instant>,
+}
+
+impl<'a> Throttle<'a> {
+    fn new(ctx: &'a ServiceContext) -> Self {
+        Self {
+            ctx,
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn callback(&self) -> impl FnMut(&Progress) + '_ {
+        move |_| {
+            let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+            if last.elapsed() >= PROGRESS_INTERVAL {
+                *last = Instant::now();
+                self.ctx.report_start_progress(START_WAIT_HINT);
+            }
+        }
+    }
+}
 
 impl ServiceProgram for HubProgram {
     fn service_name(&self) -> &str {
@@ -233,261 +1208,22 @@ impl ServiceProgram for HubProgram {
         LABEL
     }
 
-    /// ログファイル（このファイルのモジュール doc、`hub_log`のモジュール
-    /// doc 参照）- `HubRuntime::start`（T14-1、`banto_hub_core::runtime`）が
-    /// 最初の1行を出すより前、制御ハンドラの登録より前に開いておく。
-    ///
-    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）:
-    /// `resolve_profile_paths_from_env`で profile の`logs_dir`（既定値）を
-    /// 先に解決する - `run`の`build_hub_config_from_env`と同じ env
-    /// （`BANTO_HUB_ROOT`/`BANTO_HUB_PROFILE`）を読むので、同一プロセス内で
-    /// 両者が食い違うことはない。
-    fn open_log(&mut self) {
-        let log_dir = hub_log::resolve_service_log_dir(&resolve_profile_paths_from_env().logs_dir);
-        let log_path = log_dir.join(hub_log::SERVICE_LOG_FILE_NAME);
-        if let Err(err) = hub_log::enable_service_log_file(&log_path) {
-            eprintln!(
-                "banto-hub: サービスログファイル {} を開けませんでした: {err}",
-                log_path.display()
-            );
-        }
-    }
+    // `open_log` は使わない（#661 661-2）: サービスログは profile を辿らずに開いて握り、
+    // 排他を取った後（`run_inner` の 6）に、握った `logs\` の中に開く。それより前の失敗は
+    // 標準エラー出力だけ（サービスでは届かない）で、終了コードで区別する。
 
     fn log_error(&self, line: &str) {
-        log_err_line(line);
+        self.log.error(line);
     }
 
     fn run(&self, ctx: &ServiceContext) -> ServiceExit {
-        // Hub の停止（収集停止・tstore の flush・broker・HTTP）の見込み。
-        // heartbeat はこれを 5 秒の刻みで割った回数まで checkpoint を進める。
-        ctx.set_expected_stop(HUB_EXPECTED_STOP);
-
-        let runtime = match tokio::runtime::Runtime::new() {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                log_err_line(&format!(
-                    "banto-hub: tokio ランタイムの構築に失敗しました: {err}"
-                ));
-                return ServiceExit::Specific(EXIT_CODE_RUNTIME_OR_COLLECT_FAILED);
-            }
-        };
-        // ランタイムは先に預け、Stopped の報告の後で落とす（移す前と同じ
-        // 順序）。`block_on` の中で panic しても、手元の参照がアンワインドで
-        // 落ちるだけで、ランタイム自体の drop は Stopped の後になる
-        // （`banto_service_control::ServiceContext::hold_until_stopped`）。
-        let runtime = ctx.hold_until_stopped(runtime);
-
-        // env 読み取り（T14-1 でホスト側へ移設、T17-1 で3ホスト共通の
-        // `banto_hub_core::profile_paths::build_hub_config_from_env`へ一本化 -
-        // このファイルのモジュール doc 参照）は同期処理なので、ランタイムへ
-        // 入る前に済ませる。
-        let config = build_hub_config_from_env(HubHostKind::Service);
-        let exit = runtime.block_on(async move {
-            // 起動に失敗したら panic せず、ログを書いて終了コードを返す
-            // （2026-09-07 I4 実機検証のバグの修正、[`describe_start_failure`]）。
-            // `Stopped`は共有ランナーが返した終了コードで 1 回だけ報告する
-            // （#392 B3-1 で`StoppedGate`（#330）は不要になった - 本体は
-            // 報告の口を持たない）。
-            let hub = match HubRuntime::start(config).await {
-                Ok(hub) => hub,
-                Err(err) => {
-                    let (exit_code, message) = describe_start_failure(&err);
-                    log_err_line(&message);
-                    return ServiceExit::Specific(exit_code);
-                }
-            };
-            // 終了の受付（#392 A2 レビュー）の印を立てるのは、サービスのプロセスでは
-            // `RunningHub::shutdown` だけで、それはこの開始より後に呼ばれるため、
-            // ここで `Err` になる経路は今は無い。来ても「開始できなかった」ことに
-            // 変わりはないので、下の失敗と同じ作法で止める。
-            let start_status = match hub.controller().start(RunMode::Configured).await {
-                Ok(status) => status,
-                Err(refused) => {
-                    log_err_line(&format!(
-                        "banto-hub: Configured 収集の開始に失敗しました: {refused}"
-                    ));
-                    hub.shutdown().await;
-                    return ServiceExit::Specific(EXIT_CODE_RUNTIME_OR_COLLECT_FAILED);
-                }
-            };
-            if start_status.state != CollectionState::Running {
-                log_err_line(&format!(
-                    "banto-hub: Configured 収集の開始に失敗しました: {:?}",
-                    start_status.last_error
-                ));
-                hub.shutdown().await;
-                return ServiceExit::Specific(EXIT_CODE_RUNTIME_OR_COLLECT_FAILED);
-            }
-            // 起動中に STOP / PRESHUTDOWN が来ていたら Running を報告しない
-            // （受理フラグを立てた瞬間に停止へ入る）。
-            if ctx.report_running() {
-                log_line("banto-hub: Windows サービスとして起動しました");
-            }
-            let notice = ctx.stopped().await;
-            log_line(&hub_stop_reason_line(notice.signal));
-            hub_log::sync_service_log();
-            // OS の PRESHUTDOWN の作業予算を超えたら警告を 1 行書いてログを
-            // ディスクへ出す（停止は打ち切らない）。
-            let overrun = notice.os_work_deadline().map(|deadline| {
-                OverrunWatch::spawn(deadline, || {
-                    log_err_line(hub_stop_overrun_line());
-                    hub_log::sync_service_log();
-                })
-            });
-            // 通常の STOP も OS の PRESHUTDOWN も、収集の停止は打ち切らない
-            // （tstore の最終 flush を abort しない）。OS 側の上限は SCM の
-            // PRESHUTDOWN 待ち時間で、超えたら上の見張りが警告を残す。
-            hub.shutdown().await;
-            // `finish` は見張りのスレッドの終わりを同期で待つが、待つのは
-            // 「合図を受けて抜けるまで」（または警告の 1 行とログの書き出し）
-            // だけで短い。停止の最後の段で、このランタイムで他に進める
-            // タスクも無いので、ワーカーを少し止めても構わない。
-            if let Some(watch) = overrun {
-                watch.finish();
-            }
-            log_line(&hub_stop_done_line(notice.signal));
-            hub_log::sync_service_log();
-            ServiceExit::Success
-        });
-
-        // 起動失敗で終わった場合は「停止しました」を出さない - 起動できて
-        // いないのだから誤解を招く。
-        if exit == ServiceExit::Success {
-            log_line("banto-hub: Windows サービスを停止しました");
+        match self.run_inner(ctx) {
+            0 => ServiceExit::Success,
+            code => ServiceExit::Specific(code),
         }
-        exit
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use banto_hub_core::profile_lock::{try_acquire_profile_lock, ProfileOwnerInfo};
-    use banto_hub_core::profile_paths::resolve_profile_paths;
-    use banto_hub_core::runtime::HubConfig;
-
-    #[test]
-    fn describe_start_failure_reports_profile_lock_with_owner_diagnostics() {
-        let err = HubStartError::ProfileLock(ProfileLockError::AlreadyHeld {
-            profile_id: "default".to_string(),
-            owner: Some(ProfileOwnerInfo {
-                pid: 4242,
-                host_kind: "shell".to_string(),
-                acquired_at_unix_ms: 0,
-            }),
-        });
-
-        let (exit_code, message) = describe_start_failure(&err);
-
-        assert_eq!(exit_code, EXIT_CODE_PROFILE_LOCK_HELD);
-        assert!(message.contains("default"), "message: {message}");
-        assert!(message.contains("4242"), "message: {message}");
-        assert!(message.contains("shell"), "message: {message}");
-    }
-
-    #[test]
-    fn describe_start_failure_reports_profile_lock_with_unknown_owner() {
-        let err = HubStartError::ProfileLock(ProfileLockError::AlreadyHeld {
-            profile_id: "default".to_string(),
-            owner: None,
-        });
-
-        let (exit_code, message) = describe_start_failure(&err);
-
-        assert_eq!(exit_code, EXIT_CODE_PROFILE_LOCK_HELD);
-        assert!(message.contains("unknown"), "message: {message}");
-    }
-
-    #[test]
-    fn describe_start_failure_reports_generic_code_for_other_start_errors() {
-        let err = HubStartError::UnsafeCommissioningBind("test diagnostic message".to_string());
-
-        let (exit_code, message) = describe_start_failure(&err);
-
-        assert_eq!(exit_code, EXIT_CODE_START_FAILED);
-        assert!(
-            message.contains("test diagnostic message"),
-            "message: {message}"
-        );
-    }
-
-    /// 通常の STOP と OS の PRESHUTDOWN をログで区別する（実機確認の目印）。
-    #[test]
-    fn hub_stop_lines_distinguish_scm_stop_from_os_preshutdown() {
-        let stop = hub_stop_reason_line(StopSignal::ServiceStop);
-        assert!(stop.contains("SCM の STOP"), "{stop}");
-        assert!(stop.contains("最終 flush"), "{stop}");
-        let os = hub_stop_reason_line(StopSignal::OsPreshutdown);
-        assert!(os.contains("OS のシャットダウン"), "{os}");
-        assert!(os.contains("PRESHUTDOWN"), "{os}");
-
-        assert!(hub_stop_done_line(StopSignal::ServiceStop).contains("SCM の STOP"));
-        assert!(hub_stop_done_line(StopSignal::OsPreshutdown).contains("PRESHUTDOWN"));
-        let overrun = hub_stop_overrun_line();
-        assert!(overrun.contains("warn"), "{overrun}");
-        assert!(overrun.contains("予算"), "{overrun}");
-    }
-
-    /// 2026-09-07 I4 実機検証で見つかったバグの回帰テスト:
-    /// `HubProgram::run`が呼ぶのと同じ`HubRuntime::start`を、シェルが
-    /// 既に profile ロックを保持している状態で叩くと、`START_PENDING`の
-    /// まま固まらず即座（5秒未満）に`HubStartError::ProfileLock(AlreadyHeld)`
-    /// で返ることを確認する - `windows-service`クレートの SCM 連携
-    /// （`service_control_handler::register`等）は実サービスプロセスの
-    /// スレッドでしか呼べないため単体テストできない（このファイルの
-    /// モジュール doc 参照）が、SCM 連携より前段の「起動処理そのもの」は
-    /// この形で検証できる。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hub_runtime_start_fails_fast_when_profile_lock_already_held() {
-        let unique = format!(
-            "win-service-lock-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(unique);
-        let profile_id = "locked";
-
-        let paths = resolve_profile_paths(&root, profile_id).expect("valid profile id");
-        // シェルが既にこの profile を握っている状態を模す（バグ報告の
-        // 観測条件そのもの: `host_kind: shell`のロック保持中に service が
-        // 起動しようとする）。
-        let _existing_lock = try_acquire_profile_lock(&paths, HubHostKind::Shell)
-            .expect("first acquire should succeed");
-
-        let config = HubConfig {
-            db_path: root.join("registry.sqlite3").to_string_lossy().into_owned(),
-            allow_setup: false,
-            port_override: Some(0),
-            bind_override: Some("127.0.0.1".to_string()),
-            data_dir_override: Some(root.join("data")),
-            profile_id: profile_id.to_string(),
-            host_kind: HubHostKind::Service,
-            skip_profile_lock: false,
-        };
-
-        // `HubRuntime::start`の profile root 解決は`BANTO_HUB_ROOT`を読む
-        // （`crate::runtime`のモジュール doc「T17-1 での唯一の例外」節と
-        // 同じ仕組み、`banto_hub_core::runtime`のテストが使うのと同じ手法）。
-        std::env::set_var("BANTO_HUB_ROOT", root.to_string_lossy().as_ref());
-        let outcome = tokio::time::timeout(Duration::from_secs(5), HubRuntime::start(config)).await;
-        std::env::remove_var("BANTO_HUB_ROOT");
-
-        let result = outcome.expect(
-            "HubRuntime::start must return within 5s instead of hanging like the observed bug",
-        );
-        match result {
-            Err(err @ HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { .. })) => {
-                let (exit_code, _message) = describe_start_failure(&err);
-                assert_eq!(exit_code, EXIT_CODE_PROFILE_LOCK_HELD);
-            }
-            Err(other) => panic!("expected ProfileLock(AlreadyHeld), got: {other}"),
-            Ok(hub) => {
-                hub.shutdown().await;
-                panic!("expected HubRuntime::start to fail while the profile lock is held");
-            }
-        }
-    }
-}
+#[path = "win_service_tests.rs"]
+mod tests;

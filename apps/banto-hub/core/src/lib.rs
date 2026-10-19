@@ -115,6 +115,9 @@
 //!   profile 排他 - Windows は`Global\BantoHub.<profile-id>`named mutex、
 //!   非 Windows は profile ディレクトリの`flock`自体を排他の実体にする
 //!   （[`profile_lock::try_acquire_profile_lock`]）
+//! - [`profile_mode`]・[`profile_owners`]: #661 661-2。サービスが profile を運用モードの
+//!   形に締めてから動き、止めたら緩める段の判定・文言（純関数）と、緩めるときに「変更」を
+//!   戻す相手の HKLM の記録（REG_MULTI_SZ）の読み書き（661-3 の昇格ヘルパーも使う）
 //! - [`profile_grant`]: profile ACL（docs/banto-hub-desktop-plan.md §11）。
 //!   LocalSystem（Windows サービス）が先に作成した profile ディレクトリ・DB が
 //!   対話ユーザーから readonly になる実機不具合（docs/banto-hub-t16-design.md
@@ -204,6 +207,8 @@ pub mod opcua;
 pub mod pending_changes;
 pub mod profile_grant;
 pub mod profile_lock;
+pub mod profile_mode;
+pub mod profile_owners;
 pub mod profile_paths;
 pub mod read_path;
 pub mod rest;
