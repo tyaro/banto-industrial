@@ -24,6 +24,7 @@
 //! （`banto_service_control` の `Parameters` のテストと同じ形）。
 
 use crate::profile_paths::validate_profile_id;
+#[cfg(windows)]
 use banto_safe_root::InstallUserSid;
 
 /// 記録の値の名前。

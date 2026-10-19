@@ -465,6 +465,14 @@ pub fn unknown_start_arg_line(arg: &str) -> String {
     )
 }
 
+/// 運用中に profile の権限が外から変えられた（見張り・定期の確かめ直し）ので、締めたまま
+/// 止まる行（ChronoGazer の `acl_changed_line` と同じ扱い）。
+pub fn acl_changed_line(what: &str) -> String {
+    format!(
+        "{LABEL}: 運用中に profile の権限が外から変えられました（終了コード {HUB_EXIT_LEFT_TIGHT}。締めたまま止まります）: {what}。管理者の icacls・グループポリシーの「ファイル システム」・バックアップソフトの復元が原因なら、それを止めてから {REPAIR_HINT}"
+    )
+}
+
 /// 設定 DB を閉じ切れなかったので緩めずに終わる行。
 pub fn db_not_closed_keeps_tight_line() -> String {
     format!(

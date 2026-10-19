@@ -85,6 +85,41 @@ struct FakeAcl {
     scan: Mutex<Option<ScanRefusal>>,
     close: Mutex<Option<AbortReason>>,
     relax_fails: AtomicBool,
+    /// 確かめ直しを失敗させる。
+    recheck_fails: AtomicBool,
+    /// 見張りを立てられなくする。
+    watch_fails: AtomicBool,
+    /// 偽の見張りに変化を報告させる。
+    watch_changed: Arc<AtomicBool>,
+}
+
+/// [`SecurityWatcher`] の偽物（`changed` が立つと変化を 1 回報告する）。
+struct FakeWatcher {
+    changed: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl SecurityWatcher for FakeWatcher {
+    fn wait(&mut self, timeout: Duration) -> Result<WatchEvent, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.stopped.load(Ordering::SeqCst) {
+                return Ok(WatchEvent::Stopped);
+            }
+            if self.changed.load(Ordering::SeqCst) {
+                return Ok(WatchEvent::Changed(vec!["config".to_string()]));
+            }
+            if Instant::now() >= deadline {
+                return Ok(WatchEvent::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stopper(&self) -> Box<dyn Fn() + Send + Sync> {
+        let stopped = self.stopped.clone();
+        Box::new(move || stopped.store(true, Ordering::SeqCst))
+    }
 }
 
 impl FakeAcl {
@@ -95,6 +130,9 @@ impl FakeAcl {
             scan: Mutex::new(None),
             close: Mutex::new(None),
             relax_fails: AtomicBool::new(false),
+            recheck_fails: AtomicBool::new(false),
+            watch_fails: AtomicBool::new(false),
+            watch_changed: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -178,6 +216,26 @@ impl AclOps for FakeAcl {
             .unwrap_or_default();
         push(&self.trace, format!("acl:marker {name}"));
         Ok(MarkerOutcome::Created)
+    }
+
+    fn recheck(&self, _dir: &ManagedDir, _expected: &DirAccess) -> Result<(), RecheckFailure> {
+        if self.recheck_fails.load(Ordering::SeqCst) {
+            push(&self.trace, "acl:recheck-failed");
+            return Err(RecheckFailure::NotADirectory);
+        }
+        Ok(())
+    }
+
+    fn watch(&self, _root: &SafeRoot) -> Result<Option<Box<dyn SecurityWatcher>>, String> {
+        if self.watch_fails.load(Ordering::SeqCst) {
+            push(&self.trace, "acl:watch-failed");
+            return Err("偽の見張りの失敗".to_string());
+        }
+        push(&self.trace, "acl:watch");
+        Ok(Some(Box::new(FakeWatcher {
+            changed: self.watch_changed.clone(),
+            stopped: Arc::new(AtomicBool::new(false)),
+        })))
     }
 }
 
@@ -562,6 +620,80 @@ fn an_unclosed_db_keeps_the_profile_tight_with_5() {
     assert!(has(&lines, RUNTIME_FINISHED_LINE), "{lines:#?}");
     assert!(!has(&lines, "acl:relax"), "{lines:#?}");
     assert!(!has(&lines, "緩め始めます"), "{lines:#?}");
+}
+
+// --- 運用中の見張り（#697 レビュー: 締める前からの `WRITE_DAC` のハンドルでの書き戻し） ---
+
+/// 運用中の改ざんで止まったときの共通の確かめ: 5・緩めない・Hub と設定 DB は止めた。
+fn assert_left_tight_after_tamper(fx: &Fixture, running: Running, cause: &str) {
+    assert_eq!(running.join(), Some(ServiceExit::Specific(5)));
+    let lines = fx.lines();
+    assert_in_order(
+        &lines,
+        &[
+            "acl:watch",
+            "Windows サービスとして起動しました",
+            "運用中に profile の権限が外から変えられました",
+            DB_CLOSED_LINE,
+            RUNTIME_FINISHED_LINE,
+            "log-closed",
+        ],
+    );
+    assert!(has(&lines, cause), "{lines:#?}");
+    assert!(!has(&lines, "acl:relax"), "{lines:#?}");
+    assert!(!has(&lines, "緩め始めます"), "{lines:#?}");
+    assert_silent_after_log_closed(&lines);
+}
+
+/// 見張りが変化を報告したら、Hub を止め・設定 DB を閉じ・緩めずに 5。
+#[test]
+fn a_watched_acl_change_stops_with_5_without_relaxing() {
+    let fx = Fixture::new("watch-change", loose(), None);
+    let running = spawn(fx.program());
+    running.wait_running();
+    fx.acl.watch_changed.store(true, Ordering::SeqCst);
+    assert_left_tight_after_tamper(&fx, running, "見張りが変化を見つけました（config）");
+}
+
+/// 定期の確かめ直しが失敗したら、緩めずに 5。
+#[test]
+fn a_failed_recheck_stops_with_5_without_relaxing() {
+    let fx = Fixture::new("recheck", loose(), None);
+    let mut program = fx.program();
+    program.recheck_interval = Duration::from_millis(50);
+    let running = spawn(program);
+    running.wait_running();
+    fx.acl.recheck_fails.store(true, Ordering::SeqCst);
+    assert_left_tight_after_tamper(&fx, running, "acl:recheck-failed");
+    assert!(has(&fx.lines(), "定期の確かめ直しで「profile」が"));
+}
+
+/// 見張りを立てられなければ、Hub を動かさずに緩め直して 3（ChronoGazer と同じ扱い）。
+#[test]
+fn a_watch_that_cannot_start_relaxes_back_before_the_hub_runs() {
+    let fx = Fixture::new("watch-fail", loose(), None);
+    fx.acl.watch_fails.store(true, Ordering::SeqCst);
+    let running = spawn(fx.program());
+    assert_eq!(
+        running.join(),
+        Some(ServiceExit::Specific(HUB_EXIT_START_FAILED))
+    );
+    let lines = fx.lines();
+    assert_in_order(
+        &lines,
+        &[
+            &format!("acl:close {USER}"),
+            "acl:marker audit-spool",
+            "acl:watch-failed",
+            "セキュリティの見張りを始められませんでした",
+            "log-closed",
+            &format!("acl:relax {USER}"),
+        ],
+    );
+    assert!(
+        !has(&lines, "Windows サービスとして起動しました"),
+        "{lines:#?}"
+    );
 }
 
 // --- 戻す相手 ------------------------------------------------------------------------

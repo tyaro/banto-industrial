@@ -87,7 +87,10 @@
 //!    相手を記録する（書けなければ何も変えずに 3）。
 //! 9. 2 周目（`close_tree`。止まったら `relax_tree` で緩め直して 4、緩め直せなければ 5）。
 //! 10. 管理するフォルダ（`config`・`data`・`logs`・`data\audit-spool`。監査の保留も必須）を運用
-//!     モードの形で開き、印を置く（改ざんなら緩め直して 5、I/O なら緩め直して 3）。
+//!     モードの形で開き、印を置く（改ざんなら緩め直して 5、I/O なら緩め直して 3）。続けて
+//!     見張り（`SecurityWatch`）と定期の確かめ直し（`recheck`、60 秒）を立てる（立てられなければ
+//!     緩め直して 3）。運用中にどちらかが落ちたら、Hub を止め・設定 DB を閉じ・**締めたまま** 5
+//!     （締める前から開かれていた `WRITE_DAC` のハンドルでの書き戻しに備える。#697 レビュー）。
 //! 11. Hub を起動（`HubRuntime::start_with_profile_dirs`。排他はこの本体が持つので
 //!     `skip_profile_lock`。設定 DB のパスは運用モードの形を確かめてから渡す）→ Configured の
 //!     収集 → Running →「切り替えを終えました（所要 N 秒）」。`BANTO_DB`・`BANTO_HUB_DATA` が
@@ -117,7 +120,7 @@ use banto_hub_core::profile_lock::{
     DIR_AUDIT_SPOOL, DIR_CONFIG, DIR_DATA, DIR_LOGS,
 };
 use banto_hub_core::profile_mode::{
-    after_close_abort, after_marker_error, check_stored_owners, close_abort_line,
+    acl_changed_line, after_close_abort, after_marker_error, check_stored_owners, close_abort_line,
     db_not_closed_keeps_tight_line, exit_after_relax_back, exit_after_scan_refusal,
     mode_switch_begin_line, mode_switch_done_line, no_owners_line, owners_from_dacl_line,
     owners_from_record_line, owners_record_failed_line, parse_start_args, plan_owners,
@@ -140,8 +143,8 @@ use banto_hub_core::service_manager::{
 };
 use banto_safe_root::guard::{AccountKind, KnownFolders};
 use banto_safe_root::mode::{
-    AbortReason, CloseAbort, MarkerError, MarkerOutcome, Progress, RelaxReport, RootObservation,
-    ScanRefusal, ScanReport, StopSignal as TreeStop,
+    AbortReason, CloseAbort, MarkerError, MarkerOutcome, Progress, RecheckFailure, RelaxReport,
+    RootObservation, ScanRefusal, ScanReport, StopSignal as TreeStop, WatchEvent,
 };
 use banto_safe_root::{
     enable_redirection_guard, open_root, DirAccess, InstallUserSid, ManagedDir, ManagedSpec, Mode,
@@ -240,6 +243,10 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 /// STOP で、緩める前に Hub の tokio ランタイムを終えるのを待つ上限。非同期のタスクは
 /// 終えるときに全部捨てるので、待つのは実質 `spawn_blocking` の残り。過ぎたら緩めずに 5。
 const RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// 運用中の定期の確かめ直しの間隔（ChronoGazer と同じ 60 秒）。
+const RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// 止める合図と改ざんの印を待つ刻み。
+const WAIT_POLL: Duration = Duration::from_millis(200);
 /// 木を歩くスレッドのスタック（ChronoGazer と同じ。深い木で溢れない大きさ）。
 const WALK_STACK: usize = 16 * 1024 * 1024;
 
@@ -372,6 +379,30 @@ pub(crate) trait AclOps: Send + Sync {
     ) -> Result<RelaxReport, SafeRootError>;
     /// 印のファイル。
     fn ensure_marker(&self, dir: &ManagedDir) -> Result<MarkerOutcome, MarkerError>;
+    /// 確かめ直し（握ったフォルダが運用モードの形のままか）。
+    fn recheck(&self, dir: &ManagedDir, expected: &DirAccess) -> Result<(), RecheckFailure>;
+    /// セキュリティの変化の見張り。`None` なら見張らない（テスト）。
+    fn watch(&self, root: &SafeRoot) -> Result<Option<Box<dyn SecurityWatcher>>, String>;
+}
+
+/// セキュリティの変化の見張り（本番は `banto_safe_root::mode::SecurityWatch`。ChronoGazer の
+/// `chronogazer_server/service.rs` と同じ差し替え口）。
+pub(crate) trait SecurityWatcher: Send {
+    /// 次の変化を `timeout` まで待つ。
+    fn wait(&mut self, timeout: Duration) -> Result<WatchEvent, String>;
+    /// 別のスレッドから止める口。
+    fn stopper(&self) -> Box<dyn Fn() + Send + Sync>;
+}
+
+impl SecurityWatcher for banto_safe_root::mode::SecurityWatch {
+    fn wait(&mut self, timeout: Duration) -> Result<WatchEvent, String> {
+        banto_safe_root::mode::SecurityWatch::wait(self, timeout).map_err(|err| err.to_string())
+    }
+
+    fn stopper(&self) -> Box<dyn Fn() + Send + Sync> {
+        let stop = banto_safe_root::mode::SecurityWatch::stopper(self);
+        Box::new(move || stop.stop())
+    }
 }
 
 /// 本番: `banto-safe-root` の部品そのもの。
@@ -429,6 +460,58 @@ impl AclOps for RealAcl {
 
     fn ensure_marker(&self, dir: &ManagedDir) -> Result<MarkerOutcome, MarkerError> {
         dir.ensure_marker()
+    }
+
+    fn recheck(&self, dir: &ManagedDir, expected: &DirAccess) -> Result<(), RecheckFailure> {
+        dir.recheck(expected)
+    }
+
+    fn watch(&self, root: &SafeRoot) -> Result<Option<Box<dyn SecurityWatcher>>, String> {
+        let pinned = root.pinned().ok_or("profile を握っていません")?;
+        let watch = pinned.watch_security().map_err(|err| err.to_string())?;
+        Ok(Some(Box::new(watch)))
+    }
+}
+
+/// 改ざん（見張り・定期の確かめ直し）の印。最初の 1 件だけ残す。
+#[derive(Default)]
+struct Tamper(Mutex<Option<String>>);
+
+impl Tamper {
+    fn set(&self, what: String) {
+        let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(what);
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// 運用中の見張りと定期の確かめ直し。drop で止める（緩める前に必ず止める）。
+struct Watchers {
+    stop_watch: Option<Box<dyn Fn() + Send + Sync>>,
+    stop_recheck: Option<std::sync::mpsc::Sender<()>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Watchers {
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop_watch.take() {
+            stop();
+        }
+        self.stop_recheck.take();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Watchers {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -500,6 +583,8 @@ pub(crate) struct HubProgram {
     acl: Arc<dyn AclOps>,
     log: Arc<dyn ServiceLog>,
     runtime_shutdown_wait: Duration,
+    /// 運用中の定期の確かめ直しの間隔（本番は [`RECHECK_INTERVAL`]。テストは短くする）。
+    recheck_interval: Duration,
     /// テスト専用: `shutdown_and_report` の `db_closed` を `false` に偽る。
     #[cfg(test)]
     fake_db_not_closed: std::sync::atomic::AtomicBool,
@@ -514,6 +599,12 @@ pub(crate) struct ProgramParts {
     pub redirection_guard: RedirectionGuardSource,
     pub acl: Arc<dyn AclOps>,
     pub log: Arc<dyn ServiceLog>,
+}
+
+/// 運用中に見張る物（握った profile と、運用モードの形で開いた管理するフォルダ）。
+struct WatchedDirs {
+    root: Arc<SafeRoot>,
+    dirs: [(&'static str, Arc<ManagedDir>); 4],
 }
 
 /// 締めた後の Hub が動いている間に持つ物。
@@ -552,6 +643,7 @@ impl HubProgram {
             acl: parts.acl,
             log: parts.log,
             runtime_shutdown_wait: RUNTIME_SHUTDOWN_WAIT,
+            recheck_interval: RECHECK_INTERVAL,
             #[cfg(test)]
             fake_db_not_closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -974,6 +1066,33 @@ impl HubProgram {
             }
         };
         let mut engine = Engine { runtime, hub: None };
+
+        // 11a. 見張りと定期の確かめ直し（Hub を動かす前に立てる。締める前から開かれていた
+        // `WRITE_DAC` のハンドルで書き戻されても、運用中に気づいて締めたまま止まる）。
+        let watched = WatchedDirs {
+            root: root.clone(),
+            dirs: [
+                (DIR_CONFIG, dirs.config.clone()),
+                (DIR_DATA, dirs.data.clone()),
+                (DIR_LOGS, dirs.logs.clone()),
+                (DIR_AUDIT_SPOOL, spool.clone()),
+            ],
+        };
+        let tamper = Arc::new(Tamper::default());
+        let mut watchers = match self.start_watchers(&watched, mode.operation(), tamper.clone()) {
+            Ok(watchers) => watchers,
+            Err(reason) => {
+                drop(engine);
+                return self.relax_back(
+                    ctx,
+                    &root,
+                    &mode,
+                    &format!("セキュリティの見張りを始められませんでした: {reason}"),
+                    HUB_EXIT_START_FAILED,
+                );
+            }
+        };
+
         let started = engine
             .runtime
             .block_on(HubRuntime::start_with_profile_dirs(config, dirs));
@@ -982,6 +1101,7 @@ impl HubProgram {
             Err(err) => {
                 let (code, message) = describe_start_failure(&err);
                 self.say(&message);
+                watchers.stop();
                 return self.abandon_start(ctx, engine, &root, &mode, code);
             }
         };
@@ -1001,6 +1121,7 @@ impl HubProgram {
             self.say(&format!(
                 "{LABEL}: Configured 収集の開始に失敗しました: {reason}"
             ));
+            watchers.stop();
             return self.abandon_start(
                 ctx,
                 engine,
@@ -1018,8 +1139,26 @@ impl HubProgram {
             self.say(&line);
         }
 
-        // 止める合図を待つ。
-        let notice = ctx.wait_for_stop();
+        // 止める合図（SCM）か改ざんの印を待つ。
+        let notice = loop {
+            if let Some(notice) = ctx.stop_notice() {
+                break Some(notice);
+            }
+            if tamper.get().is_some() {
+                break None;
+            }
+            std::thread::sleep(WAIT_POLL);
+        };
+        watchers.stop();
+        let Some(notice) = notice else {
+            // 改ざん: Hub を止め、設定 DB を閉じ、**緩めずに** 5（閉じ切れなくても 5）。
+            self.say(&acl_changed_line(&tamper.get().unwrap_or_default()));
+            // 停止に入っていないので STOP_PENDING の checkpoint は進まない（`report_stop_progress`
+            // は `false` を返すだけ）。
+            let _ = self.stop_engine(ctx, engine, true);
+            drop(exclusive);
+            return self.finish_without_relax(HUB_EXIT_LEFT_TIGHT);
+        };
         self.say(&hub_stop_reason_line(notice.signal));
         self.log.sync();
 
@@ -1061,6 +1200,77 @@ impl HubProgram {
         drop(root);
         drop(exclusive);
         exit_after_relax_back(relaxed, 0)
+    }
+
+    /// 見張り（`SecurityWatch`）と定期の確かめ直しを始める（ChronoGazer の
+    /// `start_watchers` と同じ形）。変化・確かめ直しの失敗は `tamper` に最初の 1 件を残す。
+    fn start_watchers(
+        &self,
+        watched: &WatchedDirs,
+        expected: &DirAccess,
+        tamper: Arc<Tamper>,
+    ) -> Result<Watchers, String> {
+        let mut watchers = Watchers {
+            stop_watch: None,
+            stop_recheck: None,
+            threads: Vec::new(),
+        };
+        if let Some(mut watch) = self.acl.watch(&watched.root)? {
+            watchers.stop_watch = Some(watch.stopper());
+            let tamper = tamper.clone();
+            let thread = std::thread::Builder::new()
+                .name("banto-hub-acl-watch".to_string())
+                .spawn(move || loop {
+                    match watch.wait(Duration::from_secs(1)) {
+                        Ok(WatchEvent::Timeout) => continue,
+                        Ok(WatchEvent::Stopped) => return,
+                        Ok(WatchEvent::Changed(names)) => {
+                            tamper.set(format!(
+                                "見張りが変化を見つけました（{}）",
+                                names.join(", ")
+                            ));
+                            return;
+                        }
+                        Ok(WatchEvent::Overflow) => {
+                            tamper.set("見張りの通知があふれました（名前は不明）".to_string());
+                            return;
+                        }
+                        Err(err) => {
+                            tamper.set(format!("見張りが失敗しました: {err}"));
+                            return;
+                        }
+                    }
+                })
+                .map_err(|err| err.to_string())?;
+            watchers.threads.push(thread);
+        }
+        // 定期の確かめ直し（握った profile と管理するフォルダ）。
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        watchers.stop_recheck = Some(stop_tx);
+        let interval = self.recheck_interval;
+        let expected = expected.clone();
+        let root = watched.root.clone();
+        let dirs = watched.dirs.clone();
+        let acl = self.acl.clone();
+        let thread = std::thread::Builder::new()
+            .name("banto-hub-acl-recheck".to_string())
+            .spawn(move || loop {
+                match stop_rx.recv_timeout(interval) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => return,
+                }
+                let targets = std::iter::once(("profile", root.as_dir()))
+                    .chain(dirs.iter().map(|(key, dir)| (*key, dir.as_ref())));
+                for (key, dir) in targets {
+                    if let Err(failure) = acl.recheck(dir, &expected) {
+                        tamper.set(format!("定期の確かめ直しで「{key}」が {failure}"));
+                        return;
+                    }
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        watchers.threads.push(thread);
+        Ok(watchers)
     }
 
     /// 緩めるだけの開始（`relax-only`）。Running を報告しない。DACL からは採らず、HKLM の
