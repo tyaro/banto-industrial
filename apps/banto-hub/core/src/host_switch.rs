@@ -692,7 +692,31 @@ where
                 self.stop_retries = 0;
                 Ok(self.issue_stop())
             }
-            HostKind::Offline => Ok(self.attempt_desktop_start()),
+            HostKind::Offline => {
+                // 締めたまま止まった後の再要求: 終了コード 5 のままなら Desktop に渡さない
+                // （relax-only で緩めて 0 になっていれば通す）。照会に失敗したら安全側で失敗。
+                if self.state.service_fault == Some(ServiceFault::LeftTight) {
+                    match self.service_manager.query_status() {
+                        Ok(status) => {
+                            if let Some(out) =
+                                self.left_tight_fault(&status, "再要求時に SCM を確かめ直しました")
+                            {
+                                return Ok(out);
+                            }
+                            self.state.service_fault = None;
+                        }
+                        Err(err) => {
+                            let reason = format!("再要求時の SCM 照会に失敗しました: {err}");
+                            return Ok(self.fault(
+                                FaultStage::AwaitingServiceRelease,
+                                HostKind::Offline,
+                                reason,
+                            ));
+                        }
+                    }
+                }
+                Ok(self.attempt_desktop_start())
+            }
             HostKind::Desktop => unreachable!("already handled above"),
         }
     }
