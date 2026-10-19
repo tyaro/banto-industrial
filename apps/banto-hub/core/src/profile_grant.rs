@@ -34,11 +34,25 @@
 //! - **書き込みは共有の部品だけ**: profile は`banto_safe_root::acl::pin_dir`で辿らずに
 //!   開き、本当のパス（`final_path`）を「本当の`profiles` + id」と比べ、
 //!   `guard::data_acl_plan`（reparse point・フォルダでない・見知らぬ所有者を断る）を
-//!   通ってから、`PinnedDir::reset_acl(.., Recurse::Tree)`でハンドルに書く（自動の伝播を
-//!   使わず、子は ID とハンドルで辿り、reparse point・ハードリンク・開けない子は飛ばして
-//!   報告する）。無い profile は SYSTEM・Administrators だけの保護された DACL で作り
-//!   （`DirAccess::service_only`）、確かめた後に`reset_acl`で利用者の「変更」を付ける
+//!   通ってから、`PinnedDir::relax_tree`でハンドルに書く（#661 661-3。**下から順に、profile
+//!   自身を最後に**書く。サービスの「設定モードへ」と同じ書き方で、「profile が緩んでいる ⇔
+//!   全体が緩み終わった」を木を書くすべての書き手で揃える。自動の伝播を使わず、子は ID と
+//!   ハンドルで辿り、reparse point・ハードリンク・開けない・使用中の子は飛ばして報告する）。
+//!   無い profile は SYSTEM・Administrators だけの保護された DACL で作り
+//!   （`DirAccess::service_only`）、確かめた後に`relax_tree`で利用者の「変更」を付ける
 //!   （#622 の Must と同じ形）。
+//! - **戻す相手の記録を書いてから緩める**（#661 661-3）: 緩める組を HKLM の`Owners`
+//!   （`crate::profile_owners`）に書いてから`relax_tree`する（サービスが締めたまま落ちた
+//!   profile の修復の経路でもある）。サービスが登録されていなければ書かずに 1 行知らせる
+//!   （デスクトップだけで使うときは要らない）。書けなければ ACL を変えずに断る。
+//! - **締まったまま残った profile の修復**（[`repair_plan`]）: profile が運用モードの形なら
+//!   DACL から「変更」の利用者は採れない（読み取りと実行だけ）。記録が使えればその組 +
+//!   指定の利用者、使えなければ指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者
+//!   （締めたときの組。締まった DACL は利用者には書き換えられない）で緩め、その旨を警告する。
+//!   記録の SID は 1 つずつ利用者のアカウントかを確かめ（[`OwnerLookup`]）、グループと
+//!   この PC のローカルの削除済みは警告して外す。確かめられない SID と、名前を解けない
+//!   ドメインの SID（`ERROR_NONE_MAPPED` はネットワークのタイムアウトでも返るので、削除済みと
+//!   決められない）があれば、記録が無いときの DACL からの採り直しでも断る（#704 レビュー）。
 //! - **DACL の形**（論点 1）: 保護された DACL（`D:P`）に SYSTEM・Administrators のフル、
 //!   利用者ごとの「変更」（`0x1301BF`）、所有者は Administrators。親からは継承しない。
 //! - **足していく意味を保つ**（論点 4 (b)）: 書き直す前の DACL を開いたハンドルから読み
@@ -75,17 +89,20 @@
 use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::{
-    ObservedAce, ObservedDacl, PinnedDirInfo, ResetSkips, ACCESS_ALLOWED_ACE_TYPE, INHERIT_FLAGS,
-    MODIFY_ACCESS_MASK,
+    ObservedAce, ObservedDacl, PinnedDirInfo, ACCESS_ALLOWED_ACE_TYPE, ADMINISTRATORS_SID,
+    INHERIT_FLAGS, MODIFY_ACCESS_MASK, READ_EXECUTE_ACCESS_MASK, SYSTEM_SID,
 };
 use banto_safe_root::guard::{
     self, AccountKind, CarryOver, DataAclRefusal, DirState, DropReason, KnownFolders,
     MachineEnvironment, MachineRootError, RealPathRefusal, RootFormProblem, WellKnownRootRefusal,
 };
+use banto_safe_root::mode::{ModeAccess, RelaxReport, RootObservation, TreeProblem};
 use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 use thiserror::Error;
 
+use crate::profile_mode::{check_stored_owners, profile_shape, ProfileShape, StoredOwners};
+use crate::profile_owners::owners_location;
 use crate::profile_paths::{is_reserved_device_name, resolve_profile_paths, ProfilePaths};
 
 #[cfg(windows)]
@@ -254,23 +271,30 @@ pub fn resolve_target_profile(
 }
 
 /// [`open_target_profile`] が開いて持っているもの（DB を閉じるまで持つ。drop で閉じる）。
-pub struct HeldTarget<P, F> {
+pub struct HeldTarget<P, F, H> {
     /// ルート → `profiles\` → profile → `config\` の順（閉じるのは逆の順）。
     dirs: Vec<P>,
     file: Option<F>,
+    /// profile の排他（Hub と同じ mutex。#661 661-3）。最後に放す。
+    hold: Option<H>,
 }
 
-impl<P, F> Drop for HeldTarget<P, F> {
+impl<P, F, H> Drop for HeldTarget<P, F, H> {
     fn drop(&mut self) {
         self.file.take();
         while self.dirs.pop().is_some() {}
+        self.hold.take();
     }
 }
 
 /// [`open_target_profile`] が返すもの（対象のパスと、DB を閉じるまで持つもの）。
 pub type OpenedTarget<O> = (
     ProfilePaths,
-    HeldTarget<<O as HubElevOps>::Pinned, <O as HubElevOps>::HeldFile>,
+    HeldTarget<
+        <O as HubElevOps>::Pinned,
+        <O as HubElevOps>::HeldFile,
+        <O as HubElevOps>::ProfileHold,
+    >,
 );
 
 /// [`open_target_profile`] の失敗。
@@ -283,12 +307,18 @@ pub enum OpenTargetError {
     /// 辿らずに開いた結果、使えない（ジャンクション・本当のパスの不一致・ハードリンクなど）。
     /// 中身は理由の文言。
     Unsafe(String),
+    /// profile が使用中（Hub のサービスかアプリが profile の mutex を持っている。#661 661-3）。
+    /// 中身は profile-id。
+    InUse(String),
 }
 
 /// `reset-password`・`revert-to-commissioning`の対象の DB を、**開く前に**辿らずに開いて
 /// 確かめ、持ったままにする（#626 PR-B の監査 B-5、2026-10-16 オーナー決定）。
 ///
 /// 1. [`resolve_target_profile`]（許可リストの profile-id・マシンの環境のルート）。
+///    続けて profile の mutex（Hub と同じもの）を取り、DB を閉じるまで持つ（#661 661-3。
+///    稼働中の Hub の DB を開かない・その間に Hub を起動させない）。取れなければ
+///    [`OpenTargetError::InUse`] で、何も開かない。
 /// 2. ルート → `profiles\` → profile → `config\` を順に`pin_dir`し、それぞれの本当の
 ///    パスが「1 つ上の本当のパス + 名前」と同じ場所で既知のフォルダに当たらないこと、
 ///    reparse point でなくフォルダであることを確かめる（profile の中に`config`の
@@ -305,6 +335,16 @@ pub fn open_target_profile<O: HubElevOps>(
 ) -> Result<OpenedTarget<O>, OpenTargetError> {
     let paths =
         resolve_target_profile(ops.machine_env(), profile_id).map_err(OpenTargetError::Target)?;
+    let hold = match ops.hold_profile(&paths.profile_id) {
+        Ok(Some(hold)) => hold,
+        Ok(None) => return Err(OpenTargetError::InUse(paths.profile_id.clone())),
+        Err(error) => {
+            return Err(OpenTargetError::Unsafe(format!(
+                "profile '{}' が使用中かを確かめられませんでした: {error}。DB を開かずに止めます",
+                paths.profile_id
+            )))
+        }
+    };
     let known = ops.machine_env().known_folders().map_err(|error| {
         OpenTargetError::Target(TargetError::Root(machine_root_text(
             &MachineRootError::KnownFoldersUnavailable(error),
@@ -318,6 +358,7 @@ pub fn open_target_profile<O: HubElevOps>(
     let mut held = HeldTarget {
         dirs: Vec::new(),
         file: None,
+        hold: Some(hold),
     };
     let levels: [(PathBuf, Option<&str>); 4] = [
         (paths.root.clone(), None),
@@ -415,9 +456,10 @@ pub trait PinnedProfileDir {
     fn final_path(&self) -> PathBuf;
     /// 開いたハンドルから今の DACL と所有者を読む（読むだけ）。
     fn read_dacl(&self) -> Result<ObservedDacl, String>;
-    /// 開いたハンドルで保護された DACL と所有者（Administrators）を書き、中の子へ自前で
-    /// 伝える（`Recurse::Tree`）。飛ばした子を返す。
-    fn reset_acl_tree(&self, access: &DirAccess) -> Result<ResetSkips, String>;
+    /// 設定モードの形（`mode.setting()`: 保護された DACL、利用者に「変更」、所有者
+    /// Administrators）を、**下から順に、このフォルダ自身を最後に**木の全体へ書く
+    /// （`PinnedDir::relax_tree`。#661 661-3）。飛ばした物を返す。
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String>;
 }
 
 /// フォルダの作り方（[`HubElevOps::create_dir`]）。
@@ -427,6 +469,46 @@ pub enum CreateHow {
     Inherit,
     /// SYSTEM・Administrators だけの保護された DACL（profile）。
     ServiceOnly,
+}
+
+/// 戻す相手の記録の SID を照会した結果（[`repair_plan`] 用。#704 レビュー P2）。
+///
+/// 共有の [`AccountKind`] は `ERROR_NONE_MAPPED` もグループも [`AccountKind::NotAUser`] に
+/// まとめる（ChronoGazer と Hub のほかの経路はそれで足りるので変えない）。ところが
+/// `LookupAccountSidW` は、ドメインの SID ではネットワークのタイムアウトでも
+/// `ERROR_NONE_MAPPED` を返す（Microsoft の仕様の Remarks）ので、それだけで削除済みと決めて
+/// 記録から外すと、一時的な名前解決の失敗で有効なドメインの利用者の権限を消してしまう。
+/// ローカルのアカウントのドメイン（マシンの SID）に属する SID の照会はローカルの SAM だけで
+/// 済みネットワークは関わらないので、そちらだけを削除済みと扱う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerLookup {
+    /// 利用者のアカウント（`SidTypeUser`）。
+    User,
+    /// 照会に成功し、利用者のアカウントではない（グループ・別名など）。
+    NotAUser,
+    /// 名前を解けなかった（`ERROR_NONE_MAPPED`）。`local` は、SID がこの PC のローカルの
+    /// アカウントのドメイン（[`is_in_account_domain`]）に属するか。
+    Unmapped {
+        /// ローカルのアカウントのドメインに属する（= 削除済みと決めてよい）。
+        local: bool,
+    },
+    /// 確かめられなかった（RPC 不達・マシンの SID を読めないなど）。中身は理由。
+    LookupFailed(String),
+}
+
+/// `sid` が、アカウントのドメインの SID `domain` の直下のアカウント（`<domain>-<RID>`）か
+/// （純関数）。ローカルのアカウントのドメイン（マシンの SID、`S-1-5-21-a-b-c`）を渡し、
+/// 名前を解けなかった SID がこの PC のローカルのものかを決める（[`OwnerLookup::Unmapped`]）。
+/// 大文字・小文字は区別しない。
+pub fn is_in_account_domain(sid: &str, domain: &str) -> bool {
+    let (sid, domain) = (sid.to_ascii_uppercase(), domain.to_ascii_uppercase());
+    let Some(rest) = sid.strip_prefix(domain.as_str()) else {
+        return false;
+    };
+    let Some(rid) = rest.strip_prefix('-') else {
+        return false;
+    };
+    !domain.is_empty() && !rid.is_empty() && rid.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `banto-hub-elev`が OS に対してする操作（Windows の実装は`win::WindowsHubElevOps`。
@@ -445,6 +527,11 @@ pub trait HubElevOps {
     fn lookup_account_sid(&self, name: &str) -> Result<Option<String>, String>;
     /// SID がこの PC の利用者のアカウント（`SidTypeUser`）か（`LookupAccountSidW`）。
     fn account_kind(&self, sid: &InstallUserSid) -> AccountKind;
+    /// 戻す相手の記録の SID を、[`HubElevOps::account_kind`] より細かく照会する
+    /// （[`repair_plan`] 用。名前を解けなかったことと、照会に成功して利用者でないことを分け、
+    /// 解けなかった SID がこの PC のローカルのアカウントのドメインに属するかも返す。#704
+    /// レビュー P2）。
+    fn owner_lookup(&self, sid: &InstallUserSid) -> OwnerLookup;
     /// [`HubElevOps::hold_profile`] が返す、持っている間だけ有効な profile の排他。
     type ProfileHold;
     /// profile の mutex（`Global\BantoHub.<id>`、Hub と同じもの）を**取って持つ**
@@ -474,6 +561,25 @@ pub trait HubElevOps {
     /// 削除なし - 持っている間は名前の変更・削除・すり替えができない）。無ければ`Ok(None)`。
     /// `reset-password`・`revert-to-commissioning`が DB を開く前に使う（#626 PR-B の監査 B-5）。
     fn pin_file(&self, path: &Path) -> Result<Option<(Self::HeldFile, FileFacts)>, String>;
+    /// HKLM の戻す相手の記録（`crate::profile_owners::read_owners`）を読む。無ければ
+    /// `Ok(None)`。
+    fn read_owners(&self, profile_id: &str) -> Result<Option<Vec<String>>, String>;
+    /// 戻す相手の記録を書く（`crate::profile_owners::write_owners`。空は呼ぶ側が渡さない）。
+    /// サービスが登録されていなければ書かずに [`OwnersWrite::NotRegistered`]。
+    fn write_owners(
+        &self,
+        profile_id: &str,
+        owners: &[InstallUserSid],
+    ) -> Result<OwnersWrite, String>;
+}
+
+/// [`HubElevOps::write_owners`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnersWrite {
+    /// 書いた。
+    Written,
+    /// サービスが登録されていないので書かなかった（`Services\BantoHub`のキーを作らない）。
+    NotRegistered,
 }
 
 /// [`HubElevOps::pin_file`] で開いたファイルの、ハンドルから読んだ情報。
@@ -824,6 +930,174 @@ pub fn access_plan(
     }
 }
 
+/// 締まったまま残った profile（運用モードの形）を緩める組を決める（純関数。#661 661-3、
+/// モジュール doc「締まったまま残った profile の修復」）。DACL から「変更」の利用者は採れない
+/// （読み取りと実行だけ）ので、[`access_plan`] の代わりに使う。
+///
+/// - 記録（`stored`）が使える: 記録の組 + 指定の利用者（`user`）。記録の SID は形しか確かめて
+///   いない（[`check_stored_owners`]）ので、1 つずつ `account` で確かめる。照会に成功して
+///   利用者のアカウントでない SID（グループなど、[`OwnerLookup::NotAUser`]）と、名前を解けない
+///   ローカルの SID（この PC で削除済み、[`OwnerLookup::Unmapped`] の `local`）は警告して外す
+///   （残すと緩めるときの全利用者の確かめで断られ、修復で戻せなくなる。#704 レビュー）。
+///   外した結果、記録の組が指定の利用者だけになっても、そのまま指定の利用者で進める（記録は
+///   締めたときの組なので、今の DACL の「読み取りと実行」の利用者に頼っても同じ顔ぶれになる）。
+///   確かめられない SID（[`OwnerLookup::LookupFailed`]）と、名前を解けないローカルでない SID
+///   （ドメインの利用者。`ERROR_NONE_MAPPED` はネットワークのタイムアウトでも返る。#704
+///   レビュー P2）があれば、削除済みと区別できないので黙って落とさず、`Err`（知らせる行）で
+///   断る（緩めない・記録を書き換えない）。
+/// - 記録が無い・使えない: 指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者の
+///   アカウント（締めたときの組。締まった DACL の所有者は Administrators で、利用者には
+///   書き換えられない）。記録が使えない旨を警告にする。利用者のアカウントかを確かめられない
+///   SID は戻さずに警告する。ただし名前を解けないドメインの SID（上と同じ理由）と確かめられない SID は、外すと
+///   ネットワークが戻っても権限が戻らないので、`Err` で断る（緩めない・記録を書き換えない）。
+pub fn repair_plan(
+    user: &InstallUserSid,
+    profile_id: &str,
+    dacl: &ObservedDacl,
+    stored: StoredOwners,
+    mut account: impl FnMut(&InstallUserSid) -> OwnerLookup,
+) -> Result<AccessPlan, Vec<ConsoleLine>> {
+    let location = owners_location(profile_id);
+    let mut lines = vec![out_line(&format!(
+        "profile '{profile_id}' は運用モードの形（締まったまま）です。設定モードの形に戻します（修復）"
+    ))];
+    let mut warnings = 0;
+    let mut users = vec![user.clone()];
+    let reason = match stored {
+        StoredOwners::Valid(owners) => {
+            // 記録の SID を 1 つずつ確かめる（指定の利用者は確かめ済み）。確かめられない SID が
+            // 1 つでもあれば、外さずに断る。
+            let mut kept = Vec::new();
+            let mut dropped = Vec::new();
+            let mut refusals = Vec::new();
+            for sid in owners {
+                if sid == *user {
+                    kept.push(sid);
+                    continue;
+                }
+                match account(&sid) {
+                    OwnerLookup::User => kept.push(sid),
+                    OwnerLookup::NotAUser => dropped.push(format!(
+                        "警告: 戻す相手の記録（{location}）の {} はこの PC の利用者のアカウントではありません（グループなど）。記録から外し、「変更」は戻しません",
+                        sid.as_str()
+                    )),
+                    OwnerLookup::Unmapped { local: true } => dropped.push(format!(
+                        "警告: 戻す相手の記録（{location}）の {} はこの PC のローカルのアカウントにありません（削除済み）。記録から外し、「変更」は戻しません",
+                        sid.as_str()
+                    )),
+                    OwnerLookup::Unmapped { local: false } => refusals.push(format!(
+                        "戻す相手の記録（{location}）の {} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください",
+                        sid.as_str()
+                    )),
+                    OwnerLookup::LookupFailed(why) => refusals.push(format!(
+                        "戻す相手の記録（{location}）の {} が利用者のアカウントかを確かめられませんでした: {why}。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください",
+                        sid.as_str()
+                    )),
+                }
+            }
+            if !refusals.is_empty() {
+                lines.extend(refusals.iter().map(|text| err_line(text)));
+                return Err(lines);
+            }
+            for text in &dropped {
+                warnings += 1;
+                lines.push(err_line(text));
+            }
+            if !kept.is_empty() {
+                lines.push(out_line(&format!(
+                    "戻す相手の記録（{location}）の利用者 {} に「変更」を戻します",
+                    kept.iter()
+                        .map(InstallUserSid::as_str)
+                        .collect::<Vec<_>>()
+                        .join("・")
+                )));
+            }
+            if !kept.contains(user) {
+                lines.push(out_line(&format!(
+                    "指定の利用者 {} も足します",
+                    user.as_str()
+                )));
+            }
+            users.extend(kept);
+            None
+        }
+        StoredOwners::Missing => Some("記録がありません".to_string()),
+        StoredOwners::Unusable(reason) => Some(reason),
+    };
+    let mut refusals = Vec::new();
+    if let Some(reason) = reason {
+        warnings += 1;
+        lines.push(err_line(&format!(
+            "警告: 戻す相手の記録（{location}）が使えません（{reason}）。指定の利用者 {} と、今の DACL で「読み取りと実行」を持つ利用者（締めたときの組）に「変更」を戻します。ほかにも戻す利用者がいれば、grant-profile-acl <利用者> {profile_id} を続けて実行してください",
+            user.as_str()
+        )));
+        for ace in dacl.aces.iter().flatten() {
+            let tight_user_ace = ace.ace_type == ACCESS_ALLOWED_ACE_TYPE
+                && ace.flags == INHERIT_FLAGS
+                && ace.mask == READ_EXECUTE_ACCESS_MASK
+                && ace.sid != SYSTEM_SID
+                && ace.sid != ADMINISTRATORS_SID;
+            if !tight_user_ace {
+                continue;
+            }
+            let Ok(sid) = InstallUserSid::parse(&ace.sid) else {
+                lines.push(out_line(&format!(
+                    "利用者のアカウントでない SID の ACE（{}）には戻しません",
+                    ace_text(ace)
+                )));
+                continue;
+            };
+            if users.contains(&sid) {
+                continue;
+            }
+            match account(&sid) {
+                OwnerLookup::User => {
+                    lines.push(out_line(&format!(
+                        "今の DACL で「読み取りと実行」を持つ利用者 {} に「変更」を戻します",
+                        sid.as_str()
+                    )));
+                    users.push(sid.clone());
+                }
+                OwnerLookup::NotAUser => {
+                    lines.push(out_line(&format!(
+                        "この PC の利用者のアカウントでない SID（グループなど）の ACE（{}）には戻しません",
+                        ace_text(ace)
+                    )));
+                }
+                OwnerLookup::Unmapped { local: true } => {
+                    lines.push(out_line(&format!(
+                        "この PC のローカルのアカウントにない SID（削除済み）の ACE（{}）には戻しません",
+                        ace_text(ace)
+                    )));
+                }
+                // ドメインの SID の`ERROR_NONE_MAPPED`は一時的な失敗かもしれない（#704）。
+                // 外して進むと、ネットワークが戻っても「変更」が戻らないので、断る。
+                OwnerLookup::Unmapped { local: false } => {
+                    refusals.push(format!(
+                        "今の DACL で「読み取りと実行」を持つ {} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください",
+                        sid.as_str()
+                    ));
+                }
+                OwnerLookup::LookupFailed(why) => {
+                    refusals.push(format!(
+                        "今の DACL で「読み取りと実行」を持つ {} が利用者のアカウントかを確かめられませんでした: {why}。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください",
+                        sid.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    if !refusals.is_empty() {
+        lines.extend(refusals.iter().map(|text| err_line(text)));
+        return Err(lines);
+    }
+    Ok(AccessPlan {
+        access: DirAccess::with_install_users(users),
+        lines,
+        warnings,
+    })
+}
+
 // --- 書き直し ----------------------------------------------------------------------
 
 /// 扱うフォルダの段（行の文言）。
@@ -1141,32 +1415,31 @@ fn open_level<O: HubElevOps>(
     Ok(pinned)
 }
 
-fn emit_skips(skips: &ResetSkips, out: Out<'_>) -> usize {
-    for path in &skips.reparse {
-        out(err_line(&format!(
-            "警告: profile の中の {} はジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました",
-            path.display()
-        )));
+fn emit_skips(skipped: &[TreeProblem], out: Out<'_>) -> usize {
+    for problem in skipped {
+        let why = match problem {
+            TreeProblem::ReparsePoint { .. } => {
+                "ジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました"
+            }
+            TreeProblem::Hardlink { .. } => {
+                "ハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）"
+            }
+            TreeProblem::Denied { .. } => {
+                "開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります）"
+            }
+            TreeProblem::Busy { .. } => {
+                "使用中で開けなかったので、触らず飛ばしました（そのまま残ります）"
+            }
+            TreeProblem::MovedOut { .. } => {
+                "書いている最中に profile の外へ移されたので、そのフォルダは書かず飛ばしました（移される前に書いた中身は移った先に残ります。#623 S-1）"
+            }
+            TreeProblem::Encrypted { .. }
+            | TreeProblem::TooDeep { .. }
+            | TreeProblem::MarkerOccupied { .. } => "触らず飛ばしました（そのまま残ります）",
+        };
+        out(err_line(&format!("警告: profile の中の {problem}。{why}")));
     }
-    for path in &skips.hardlink {
-        out(err_line(&format!(
-            "警告: profile の中の {} はハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）",
-            path.display()
-        )));
-    }
-    for path in &skips.denied {
-        out(err_line(&format!(
-            "警告: profile の中の {} を開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります）",
-            path.display()
-        )));
-    }
-    for path in &skips.moved_out {
-        out(err_line(&format!(
-            "警告: profile の中の {} は書き直している最中に profile の外へ移されたので、そのフォルダの中身は書かず飛ばしました（移される前に書いた分は移った先に残ります。修復ではそのフォルダ自身も含みます。#623 S-1）",
-            path.display()
-        )));
-    }
-    skips.reparse.len() + skips.hardlink.len() + skips.denied.len() + skips.moved_out.len()
+    skipped.len()
 }
 
 /// 書き直し（計画 §3.2 の 5〜12）。[`preflight`] を通った値で、稼働中かを確かめた後に
@@ -1282,12 +1555,55 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
         created.notice(out);
         return Err(GrantStop::Refused);
     }
-    let plan = access_plan(&pre.user, id, &dacl, &carry);
+    // 締まったまま残った profile（運用モードの形）は修復の経路（#661 661-3）。DACL から
+    // 「変更」の利用者は採れないので、記録（無ければ「読み取りと実行」の利用者）を使う。
+    let plan = if profile_shape(&RootObservation::Present(dacl.clone())) == ProfileShape::Tight {
+        let stored = check_stored_owners(ops.read_owners(id));
+        match repair_plan(&pre.user, id, &dacl, stored, |sid| ops.owner_lookup(sid)) {
+            Ok(plan) => plan,
+            Err(lines) => {
+                for line in lines {
+                    out(line);
+                }
+                created.notice(out);
+                return Err(GrantStop::Refused);
+            }
+        }
+    } else {
+        access_plan(&pre.user, id, &dacl, &carry)
+    };
     for line in plan.lines {
         out(line);
     }
-    let skips = match profile.reset_acl_tree(&plan.access) {
-        Ok(skips) => skips,
+    let Some(mode) = ModeAccess::for_users(plan.access.install_users().iter().cloned()) else {
+        // 指定の利用者が必ず入るので来ない（型の網羅のため）。
+        out(err_line("緩める利用者が 0 人です。書き直さずに止めます"));
+        created.notice(out);
+        return Err(GrantStop::Refused);
+    };
+    let users: Vec<&str> = mode.users().iter().map(InstallUserSid::as_str).collect();
+    // 戻す相手の記録を書いてから緩める（#661 661-3。サービスが次に締めて緩めるときの組を、
+    // ここで緩める組に揃える）。書けなければ ACL を変えない。
+    let location = owners_location(id);
+    match ops.write_owners(id, mode.users()) {
+        Ok(OwnersWrite::Written) => out(out_line(&format!(
+            "戻す相手の記録（{location}）を利用者 {} に更新しました",
+            users.join("・")
+        ))),
+        Ok(OwnersWrite::NotRegistered) => out(out_line(&format!(
+            "サービス {} が登録されていないので、戻す相手の記録（{location}）は書きません（デスクトップだけで使うときは要りません）",
+            crate::service_manager::SERVICE_NAME
+        ))),
+        Err(error) => {
+            out(err_line(&format!(
+                "戻す相手の記録（{location}）を書けませんでした: {error}。ACL は変えていません"
+            )));
+            created.notice(out);
+            return Err(GrantStop::Refused);
+        }
+    }
+    let report = match profile.relax_tree(&mode) {
+        Ok(report) => report,
         Err(error) => {
             out(err_line(&format!(
                 "profile（{}）の ACL を書き直せませんでした: {error}",
@@ -1297,23 +1613,18 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
             return Err(GrantStop::Refused);
         }
     };
-    let users: Vec<&str> = plan
-        .access
-        .install_users()
-        .iter()
-        .map(InstallUserSid::as_str)
-        .collect();
     let what = if created.0.iter().any(|(level, _)| *level == Level::Profile) {
         "作りました"
     } else {
         "ACL を書き直しました"
     };
     out(out_line(&format!(
-        "profile '{id}'（{}）: {what}（SYSTEM・Administrators にフル、利用者 {} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形）",
+        "profile '{id}'（{}）: {what}（SYSTEM・Administrators にフル、利用者 {} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形で、下から書き profile 自身は最後。書いた数 {}）",
         profile_dir.display(),
-        users.join("・")
+        users.join("・"),
+        report.written
     )));
-    let warnings = plan.warnings + emit_skips(&skips, out);
+    let warnings = plan.warnings + emit_skips(&report.skipped, out);
     if warnings > 0 {
         out(err_line(&format!(
             "書き直しは終えましたが、上の警告 {warnings} 件（飛ばした子・落とした ACE など）を確かめてください"

@@ -1,7 +1,7 @@
 # banto-hub T17 詳細設計（SCM 管理・profile・UAC・インストーラ再設計）
 
 作成日: 2026-08-10
-状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。2026-10-18: §1 の末尾に「設定モード ⇔ 運用モード」のオーナー決定（#623・#661。T17-3 の切り替えのときにサービス自身が ACL を付け替える）を記録。2026-10-19: 同じ所に #661 の当てはめ（締める範囲・戻す相手の記録・STOP の順序・PR の分け方）のオーナー決定を記録。同日: 661-2（サービスの締める・緩める本体）を実装し、§1 の末尾に「#661 661-2 実装メモ」を足した（実機確認は未）。#697 のレビューで運用中の見張り（`SecurityWatch`・`recheck`）を足した。2026-10-20: 661-5（シェルと画面）を実装し、§1 の末尾に「#661 661-5 実装メモ」を足した（実機確認は未）。
+状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。2026-10-18: §1 の末尾に「設定モード ⇔ 運用モード」のオーナー決定（#623・#661。T17-3 の切り替えのときにサービス自身が ACL を付け替える）を記録。2026-10-19: 同じ所に #661 の当てはめ（締める範囲・戻す相手の記録・STOP の順序・PR の分け方）のオーナー決定を記録。同日: 661-2（サービスの締める・緩める本体）を実装し、§1 の末尾に「#661 661-2 実装メモ」を足した（実機確認は未）。#697 のレビューで運用中の見張り（`SecurityWatch`・`recheck`）を足した。2026-10-20: 661-5（シェルと画面）を実装し、§1 の末尾に「#661 661-5 実装メモ」を足した（実機確認は未）。 2026-10-20: 661-3（昇格ヘルパー）を実装し、§1 の末尾に「#661 661-3 実装メモ」を足した（実機確認は未）。
 2026-10-17: §12 の #626 の決定 11（#630 の分離）に、#630 の結果（サイドカーの設定の
 置き場を保護された `sink\` に分けた）を 1 行足した。
 T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
@@ -165,6 +165,17 @@ Desktop Hub 起動までのフル E2E は任意の追加確認として残す。
 - **サービスログの開き方の変更**: 共有ランナーの `open_log`（開始の直後）では開かず、profile を握って排他を取った後に握った `logs\` の中に開く。それより前の失敗（profile を開けない・排他）は標準エラー出力だけで、終了コードで区別する。`BANTO_HUB_DATA` を設定していてもサービスログは profile の `logs\` に書く（`resolve_service_log_dir` は使わない）。
 - **既知の制限**: profile の外の `BANTO_DB`・`BANTO_HUB_DATA` は 1 行出すだけで締めない（#659 と合わせて決める）。`{root}` か `profiles\` がジャンクションだと profile の本当のパスが期待と食い違い、起動を断る（3）。相手が 0 人で profile の所有者が利用者のときは profile を握れないので、ログを書かずに 4 だけを返す。実機確認は未（661-5 の画面と合わせて行う）。
 
+**#661 661-3 実装メモ**（2026-10-20。`apps/banto-hub/core/src/profile_grant.rs` の `grant_steps`・`repair_plan`・`open_target_profile`、Windows の実装は `profile_grant/win.rs`、記録は `profile_owners.rs`。手本は ChronoGazer の elev の `grant-data-acl`）
+
+- **書き方**: `grant-profile-acl`（と `service-install` の最後の手順）は、確かめ・作るを済ませてから profile の木に `relax_tree` を 1 回（下から順に、profile 自身を最後に。印のファイルは印の記述子のまま）。飛ばした物（リンク・ハードリンク・開けない・使用中・移された）は 1 行ずつ警告にする（締まったまま残る = 安全側）。`HubElevOps` の `reset_acl_tree` は `relax_tree`（`ModeAccess` を受ける）に置き換えた。
+- **戻す相手の記録**: 緩める組（`ModeAccess::users`）を `relax_tree` の**前に** HKLM の `Owners` に書く（661-2 の `write_owners`。空は書かない・サービスのキーは作らない）。書けなければ ACL を変えずに断る（終了コード 1）。サービスが登録されていなければ（`profile_owners::service_registered`）書かずに 1 行知らせて緩めるのは続ける（デスクトップだけで使うとき）。
+- **採る組**（サービスの `plan_owners` と同じ規則に揃える）: profile が設定モードの形（緩んでいる）なら、これまでどおり指定の利用者 + DACL から `plan_carry_over` で引き継ぐ利用者。記録は読まない（DACL が勝ち、記録はその組で上書きする）。
+- **修復（profile が運用モードの形のまま残っている）**: DACL から「変更」の利用者は採れないので `repair_plan` を使う。記録が使えれば（`check_stored_owners` の `Valid`）記録の組 + 指定の利用者。**記録が無い・空・読めないときは、指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者のアカウント（締めたときの組）**で緩め、記録が使えない旨を警告する（締まった DACL の所有者は Administrators で、利用者には書き換えられないので、締めたときの組として信じてよい）。利用者のアカウントかを確かめられない SID は戻さずに警告する。
+- **記録の利用者の確かめ（#704 レビュー）**: 記録の SID は形しか確かめていない（`check_stored_owners`）ので、`repair_plan` は 1 つずつ `account_kind` で確かめる。削除済み（`ERROR_NONE_MAPPED`）・グループは警告して外し、外した後の組（+ 指定の利用者）で `Owners` を書いて緩める（外した結果が指定の利用者だけになっても、今の DACL の「読み取りと実行」の利用者には頼らない）。確かめられない SID（ドメインに届かないなど）があれば、削除済みと区別できないので緩めず・記録も書き換えずに断る。
+- **名前を解けないドメインの利用者（#704 レビュー P2）**: `LookupAccountSidW` の `ERROR_NONE_MAPPED` はネットワークのタイムアウトでも返る（Microsoft の仕様の Remarks）ので、それだけで削除済みと決めない。`repair_plan` は Hub 側の `owner_lookup`（`OwnerLookup`。共有の `AccountKind`・`account_kind` は ChronoGazer にも効くので変えない）で、照会に成功して利用者でない（グループなど）→ 警告して外す、名前を解けずに SID がこの PC のローカルのアカウントのドメイン（マシンの SID、`LsaQueryInformationPolicy(PolicyAccountDomainInformation)`）に属する → 削除済みとして警告して外す、名前を解けずにローカルでない（ドメイン）→ 記録も ACL も変えずに断る（ドメインに届くようになってから再実行、と案内。記録を消しても DACL から採り直す経路が同じ SID で断るので、記録を消す案内はしない）。記録が無いときの DACL からの採り直しでも、解けないドメインの利用者がいれば同じく断る（外して進むと、ネットワークが戻っても「変更」が戻らないため）。
+- **排他**: `reset-password`・`revert-to-commissioning` は、対象を開く前（`open_target_profile` の最初）に profile の mutex（`Global\BantoHub.<id>`、`grant-profile-acl` と同じ `hold_profile`）を取り、DB を閉じるまで持つ。持たれていれば何も開かずに `ElevatedError::ProfileInUse`（文言は `grant-profile-acl` の使用中と同じ形、終了コード 1）。確かめられなければ開かずに断る。
+- **実機確認で見る点**（661-5 と合わせて）: 運用モードのまま止めたサービスの profile に `grant-profile-acl` をかけて設定モードの形に戻ること（記録あり・記録を消した場合）、HKLM の `Owners` が書き換わること、稼働中に `reset-password`・`revert-to-commissioning` が「使用中」で断ること。
+
 **#661 661-5 実装メモ**（2026-10-20。判定と文言の純関数は `apps/banto-hub/src-tauri/src/launch_gate.rs`、配線は同じ crate の `lib.rs`（`decide_startup`・`run_host_switch`・`run_restore_setting`・`spawn_service_watch`）、デスクトップのログは `apps/banto-hub/core/src/desktop_log.rs`。手本は ChronoGazer の #623 PR-4・#686〜#690）
 
 - **起動の判定（#699 レビューの宿題）**: Desktop になる組合せ（SCM が Stopped・NotInstalled・照会の失敗）では、`HubRuntime::start` の前に profile の形を見る（`launch_gate::observe_profile_mode` → `banto_safe_root::mode::observe_root` → `profile_mode::profile_shape`。profile を読むだけで開き、作らない）。運用モードの形（`Tight`）なら Desktop に進まず Fallback の窓「運用モード（停止中）です」（最後の終了コードが 5 なら「運用モードのまま残っています」）、観測に使えない（リンクなど）なら「profile のフォルダを使えません」。断るのはこの 2 つだけで、緩んだ・無い・読めない（自分の ACE が無い）は Desktop へ進む（Hub の起動が最後の防衛線。ChronoGazer と同じ）。終了コードは文言を選ぶためだけに使う（形が緩んでいれば 5 が残っていても Desktop）。判定は `launch_gate::plan_startup`（純関数）。
@@ -173,7 +184,7 @@ Desktop Hub 起動までのフル E2E は任意の追加確認として残す。
 - **終了コード 4・5 の窓**: 切り替えの失敗は `HostSwitchState::service_fault` から（4 →「運用モードにできませんでした」、5 →「運用モードのまま残っています」）。サービスに接続している間・Fallback の間は 5 秒ごとに SCM を見張り（`spawn_service_watch`、切り替えの間は休む）、止まったら `launch_gate::lost_cause`（4・5・形）で窓を選ぶ。StopPending で一般の「サービスが止まりました」に移った後も、Stopped に達したら選び直す（#690）。見張りは Hub を決して起動しない。モードの窓はサービスが動き出したら一般に戻す。
 - **`/status`**: 「切り替えの間は収集が止まります。」の一言、段ごとの進み具合（`switch_phase_message`。締める・緩める間は checkpoint が進む限り同じ文が出る）、Fallback の理由（`fallbackCause`）に合う見出しと本文、`leftTight`・`operationStopped` なら [設定モードに戻す]。invoke のエラーは `describeInvokeError`（文字列・`Error`・`message` を持つオブジェクト、それ以外は中立の文。#688）。
 - **デスクトップのログ**: `logs\banto-hub-desktop-YYYY-MM-DD.log`（profile の `logs\`）に、設定モードへの切り替え（サービスの停止・[設定モードに戻す]）の開始・完了、戻せた手段、終了コード 5 の案内を起きた時刻で書く。運用モードの間は書けないので、行はシェルが覚えておき（`AppState::pending_log`）、このアプリの Hub が動き始めてから書く。同じ行をシェルのログにも出す。
-- **既知の制限**: Service の画面のままサービスが止まると、窓は Hub の画面（応答しない）のままで、文言はトレイと `/status`（開いていれば）に出る（プレースホルダへ戻す navigate はしていない）。見張りは SCM の状態だけを見る（health の不調では移らない）。実機確認は未。
+- **サービスが止まったときの窓**: 見張り（5 秒ごと、`spawn_service_watch`）が Service の画面でサービスの停止（4・5・外からの STOP・落ちた）を見たら、窓を起動時のプレースホルダの URL（`AppState::placeholder_url`）へ navigate し直し、理由に合う見出しと [設定モードに戻す] などを出す（Hub の画面を出している窓は `launch_gate::needs_placeholder_navigation`、`apply_startup_outcome` の Fallback の枝）。Fallback に移った後に Stopped で理由を選び直したら（#690）画面も書き換える。Fallback の間にサービスが Running に戻ったら（`WatchStep::Reconnect`）health を確かめ、Healthy なら Service の画面へ戻す（Healthy でなければ窓はそのまま、モードの理由だけ一般に直す）。**Hub は決して起動しない**。見張りは SCM の状態だけを見る（health の不調では Service から移らない）。実機確認は未。
 
 ## 2. 現行コード棚卸し
 

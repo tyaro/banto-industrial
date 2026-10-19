@@ -16,18 +16,19 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::{
-    check_dacl, read_dir_dacl, ObservedDacl, PinnedDir, PinnedDirInfo, ResetSkips,
-    ADMINISTRATORS_SID, INHERIT_FLAGS,
+    check_dacl, read_dir_dacl, ObservedDacl, PinnedDir, PinnedDirInfo, ADMINISTRATORS_SID,
+    INHERIT_FLAGS,
 };
 use banto_safe_root::guard::{KnownFolders, MachineEnvironment};
+use banto_safe_root::mode::{ModeAccess, RelaxReport};
 use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 
 use super::super::{
     grant_profile_acl, open_target_profile, preflight, AccountKind, CreateHow, FileFacts,
-    HubElevOps, OpenTargetError, PinnedProfileDir, Refused,
+    HubElevOps, OpenTargetError, OwnerLookup, OwnersWrite, PinnedProfileDir, Refused,
 };
-use super::{RegistryMachineEnvironment, WindowsHubElevOps};
+use super::{account_domain_sid, owner_lookup, RegistryMachineEnvironment, WindowsHubElevOps};
 
 fn me() -> InstallUserSid {
     banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")
@@ -102,11 +103,11 @@ impl PinnedProfileDir for Hooked {
     fn read_dacl(&self) -> Result<ObservedDacl, String> {
         PinnedProfileDir::read_dacl(&self.inner)
     }
-    fn reset_acl_tree(&self, access: &DirAccess) -> Result<ResetSkips, String> {
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String> {
         if let Some(hook) = self.hook.borrow_mut().take() {
             hook();
         }
-        self.inner.reset_acl_tree(access)
+        PinnedProfileDir::relax_tree(&self.inner, mode)
     }
 }
 
@@ -147,6 +148,9 @@ impl HubElevOps for TempOps {
     }
     fn account_kind(&self, sid: &InstallUserSid) -> AccountKind {
         WindowsHubElevOps.account_kind(sid)
+    }
+    fn owner_lookup(&self, sid: &InstallUserSid) -> OwnerLookup {
+        WindowsHubElevOps.owner_lookup(sid)
     }
     type ProfileHold = ();
     fn hold_profile(&self, _profile_id: &str) -> Result<Option<()>, String> {
@@ -196,6 +200,17 @@ impl HubElevOps for TempOps {
     type HeldFile = super::HeldFile;
     fn pin_file(&self, path: &Path) -> Result<Option<(super::HeldFile, FileFacts)>, String> {
         WindowsHubElevOps.pin_file(path)
+    }
+    // HKLM には触らない（記録は無く、サービスは登録されていない扱い）。
+    fn read_owners(&self, _profile_id: &str) -> Result<Option<Vec<String>>, String> {
+        Ok(None)
+    }
+    fn write_owners(
+        &self,
+        _profile_id: &str,
+        _owners: &[InstallUserSid],
+    ) -> Result<OwnersWrite, String> {
+        Ok(OwnersWrite::NotRegistered)
     }
 }
 
@@ -801,4 +816,32 @@ fn a_root_parent_swapped_before_create_does_not_leak() {
     assert_eq!((snapshot(&watched), listing(&outside)), before);
     assert!(!outside.join("BantoHub").exists());
     let _ = std::fs::remove_dir(&root_parent);
+}
+
+/// #704 レビュー P2: 今の利用者（CI のランナー・開発機ともローカルの利用者）の SID は、この PC の
+/// ローカルのアカウントのドメイン（マシンの SID）に属すると判定される。反証: 同じ RID で別の
+/// ドメインにした SID は属さない。照会に成功する今の利用者は`User`、名前の無いローカルの SID
+/// （使われない RID）は`Unmapped { local: true }`、名前の無い別のドメインの SID は
+/// `Unmapped { local: false }`。
+#[test]
+fn the_current_local_user_is_in_the_account_domain() {
+    let domain = account_domain_sid().expect("この PC のアカウントのドメインの SID");
+    let me = me();
+    assert!(
+        super::super::is_in_account_domain(me.as_str(), &domain),
+        "{} は {domain} に属するはず",
+        me.as_str()
+    );
+    assert!(!super::super::is_in_account_domain(
+        me.as_str(),
+        "S-1-5-21-1-2-3"
+    ));
+    assert_eq!(owner_lookup(&me), OwnerLookup::User);
+    let unused = InstallUserSid::parse(&format!("{domain}-987654")).expect("SID");
+    assert_eq!(owner_lookup(&unused), OwnerLookup::Unmapped { local: true });
+    let foreign = InstallUserSid::parse("S-1-5-21-1-2-3-987654").expect("SID");
+    assert_eq!(
+        owner_lookup(&foreign),
+        OwnerLookup::Unmapped { local: false }
+    );
 }
