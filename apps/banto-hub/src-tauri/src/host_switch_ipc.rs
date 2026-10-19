@@ -157,7 +157,7 @@ pub fn switch_to_service(app: AppHandle, state: State<'_, AppState>) -> Result<(
         &app,
         HostSwitchProgressEvent {
             phase: "starting".into(),
-            message: "サービスへの切替を開始しています…".into(),
+            message: "運用モードへの切り替えを始めています…".into(),
             done: false,
             error: None,
             fallback_cause: None,
@@ -188,7 +188,7 @@ pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(
         &app,
         HostSwitchProgressEvent {
             phase: "starting".into(),
-            message: "アプリへの切替を開始しています…".into(),
+            message: "設定モードへの切り替えを始めています…".into(),
             done: false,
             error: None,
             fallback_cause: None,

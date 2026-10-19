@@ -488,7 +488,24 @@ fn set_placeholder_page(window: &WebviewWindow, page: PlaceholderPage) {
             .expect("status_text mutex poisoned") = Some(page);
     }
     if let Err(err) = window.eval(script) {
-        eprintln!("banto-hub-shell: 画面表示の更新に失敗しました: {err}");
+        report_shell_error(
+            window.app_handle(),
+            format!("画面表示の更新に失敗しました: {err}"),
+        );
+    }
+}
+
+/// シェルの失敗の行（#706 実機確認）。release は GUI のサブシステム（`windows_subsystem =
+/// "windows"`）で標準エラー出力がどこにも残らないので、Windows ではデスクトップのログにも残す
+/// （[`push_desktop_log`]。運用モードの間は profile に書けないので覚えておき、設定モードに
+/// 戻ってから [`flush_desktop_log`] が書く）。
+fn report_shell_error<R: Runtime>(app: &AppHandle<R>, text: impl Into<String>) {
+    #[cfg(windows)]
+    push_desktop_log(app, text);
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        log_err_line(&format!("banto-hub-shell: {}", text.into()));
     }
 }
 
@@ -497,13 +514,23 @@ fn set_placeholder_page(window: &WebviewWindow, page: PlaceholderPage) {
 /// 文言を書き直す。初回の読み込みより前に[`set_status_text`]の eval が
 /// 走って捨てられた場合と、プレースホルダを再読み込みした場合の両方を
 /// 拾う。文言が無い（Hub の画面へ navigate した後など）ときは何もしない。
-fn reapply_status_text<R: Runtime>(webview: &Webview<R>, event: PageLoadEvent) {
+///
+/// #706 実機確認: 読み込んだのがプレースホルダなら、その URL を navigate 先として覚え直す
+/// （[`AppState::placeholder_url`]。`useHttpsScheme` などで起動時に組み立てた URL と違っても、
+/// 実際に読めた URL を使う）。
+fn reapply_status_text<R: Runtime>(webview: &Webview<R>, url: &tauri::Url, event: PageLoadEvent) {
     if event != PageLoadEvent::Finished || webview.label() != MAIN_WINDOW_LABEL {
         return;
     }
     let Some(state) = webview.try_state::<AppState>() else {
         return;
     };
+    if launch_gate::is_placeholder_url(url) {
+        *state
+            .placeholder_url
+            .lock()
+            .expect("placeholder_url mutex poisoned") = Some(url.clone());
+    }
     let page = state
         .status_text
         .lock()
@@ -511,7 +538,10 @@ fn reapply_status_text<R: Runtime>(webview: &Webview<R>, event: PageLoadEvent) {
         .clone();
     if let Some(page) = page {
         if let Err(err) = webview.eval(status_text_script(&page)) {
-            eprintln!("banto-hub-shell: 画面表示の更新に失敗しました: {err}");
+            report_shell_error(
+                webview.app_handle(),
+                format!("画面表示の更新に失敗しました: {err}"),
+            );
         }
     }
 }
@@ -523,7 +553,7 @@ fn reapply_status_text<R: Runtime>(webview: &Webview<R>, event: PageLoadEvent) {
 /// （URL 組み立て失敗等、[`FallbackInfo`]を経由しない即時エラー表示）用 -
 /// 通常の SCM/health 判定に基づく fallback は[`render_fallback`]を使う。
 fn show_startup_error(window: &WebviewWindow, message: &str) {
-    eprintln!("banto-hub-shell: {message}");
+    report_shell_error(window.app_handle(), message);
     let display =
         format!("起動できませんでした。\n{message}\n\nトレイメニューから終了してください。");
     set_status_text(window, &display);
@@ -1365,7 +1395,8 @@ fn watched_view(state: &AppState) -> (launch_gate::ViewStamp, Option<ScmState>) 
     (stamp, shown)
 }
 
-/// 窓をプレースホルダ（Fallback の画面）へ戻す。URL は起動時に覚えたもの。
+/// 窓をプレースホルダ（Fallback の画面）へ戻す。URL は起動時に組み立て、プレースホルダを
+/// 読み込むたびに覚え直したもの（[`launch_gate::placeholder_url`]・[`reapply_status_text`]）。
 fn navigate_to_placeholder(app: &AppHandle, window: &WebviewWindow) {
     let url = app
         .state::<AppState>()
@@ -1375,11 +1406,14 @@ fn navigate_to_placeholder(app: &AppHandle, window: &WebviewWindow) {
         .clone();
     match url {
         Some(url) => {
-            if let Err(err) = window.navigate(url) {
-                eprintln!("banto-hub-shell: 窓をプレースホルダへ戻せませんでした: {err}");
+            if let Err(err) = window.navigate(url.clone()) {
+                report_shell_error(
+                    app,
+                    format!("窓をプレースホルダ（{url}）へ戻せませんでした: {err}"),
+                );
             }
         }
-        None => eprintln!("banto-hub-shell: プレースホルダの URL が分からないため窓を移せません"),
+        None => report_shell_error(app, "プレースホルダの URL が分からないため窓を移せません"),
     }
 }
 
@@ -2030,7 +2064,7 @@ fn emit_done(app: &AppHandle, progress: SwitchProgress) {
 /// デスクトップのログに書く行を、起きた時刻で覚えておく（#661 661-5。書くのは
 /// [`flush_desktop_log`]）。シェルのログ（標準エラー出力）にも同じ行を出す。
 #[cfg(windows)]
-fn push_desktop_log(app: &AppHandle, text: impl Into<String>) {
+fn push_desktop_log<R: Runtime>(app: &AppHandle<R>, text: impl Into<String>) {
     let entry = DesktopLogEntry::now_system(text);
     log_line(&format!("banto-hub-shell: {}", entry.text));
     if let Some(state) = app.try_state::<AppState>() {
@@ -2151,10 +2185,15 @@ pub(crate) fn run_restore_setting(app: &AppHandle) {
 fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress {
     let manager = build_service_manager();
     let outcome = relax_only_and_wait(&manager, &RealClock, SWITCH_TIMINGS);
-    log_line(&format!(
-        "banto-hub-shell: 設定モードに戻す（relax-only）: {outcome:?}"
-    ));
-    let failed = match launch_gate::after_relax(&outcome) {
+    let after = launch_gate::after_relax(&outcome);
+    let relax_line = format!("設定モードに戻す（relax-only）: {outcome:?}");
+    if matches!(after, AfterRelax::Decide) {
+        log_line(&format!("banto-hub-shell: {relax_line}"));
+    } else {
+        // #706 実機確認: 失敗はデスクトップのログにも残す（GUI では標準出力が見えない）。
+        push_desktop_log(app, relax_line);
+    }
+    let failed = match after {
         AfterRelax::Decide => {
             push_desktop_log(app, desktop_log::log_restored_by("relax-only"));
             None
@@ -2186,6 +2225,7 @@ fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress
         }
     };
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        report_shell_error(app, "設定モードに戻す: メインウィンドウが見つかりません");
         return progress_after_apply(app);
     };
     let outcome = match failed {
@@ -2278,6 +2318,7 @@ fn spawn_service_watch(app: AppHandle) {
         if watched == launch_gate::WatchedView::Desktop {
             continue;
         }
+        let mut scm_error = None;
         let (scm, fault) = match build_service_manager().query_status() {
             Ok(status) => {
                 let fault = (status.state == ScmState::Stopped)
@@ -2285,7 +2326,10 @@ fn spawn_service_watch(app: AppHandle) {
                     .flatten();
                 (Some(status.state), fault)
             }
-            Err(_) => (None, None),
+            Err(err) => {
+                scm_error = Some(err.to_string());
+                (None, None)
+            }
         };
         let mode = if scm == Some(ScmState::Stopped) {
             launch_gate::observe_profile_mode(&expected_probe_target().profile_dir)
@@ -2326,12 +2370,21 @@ fn spawn_service_watch(app: AppHandle) {
             host_switch_ipc::end_switch();
             continue;
         }
-        log_line(&format!(
-            "banto-hub-shell: サービスの見張り: サービス {} - 窓 {}",
-            scm.as_ref()
-                .map_or_else(|| "確認できませんでした".to_string(), ToString::to_string),
-            cause.map_or_else(|| "Service".to_string(), |cause| format!("{cause:?}"))
-        ));
+        // #706 実機確認: GUI では標準出力が見えないので、デスクトップのログにも残す。
+        push_desktop_log(
+            &app,
+            format!(
+                "サービスの見張り: サービス {} - 窓 {}",
+                scm.as_ref().map_or_else(
+                    || format!(
+                        "確認できませんでした（{}）",
+                        scm_error.as_deref().unwrap_or("不明")
+                    ),
+                    ToString::to_string
+                ),
+                cause.map_or_else(|| "Service".to_string(), |cause| format!("{cause:?}"))
+            ),
+        );
         if cause == Some(FallbackCause::OperationStopped { left_tight: true }) {
             push_desktop_log(&app, desktop_log::LOG_LEFT_TIGHT);
         }
@@ -2367,7 +2420,7 @@ fn stop_service(app: &AppHandle) {
         app,
         host_switch_ipc::HostSwitchProgressEvent {
             phase: "starting".into(),
-            message: "アプリへの切替を開始しています…".into(),
+            message: "設定モードへの切り替えを始めています…".into(),
             done: false,
             error: None,
             fallback_cause: None,
@@ -2394,7 +2447,7 @@ fn start_service(app: &AppHandle) {
         app,
         host_switch_ipc::HostSwitchProgressEvent {
             phase: "starting".into(),
-            message: "サービスへの切替を開始しています…".into(),
+            message: "運用モードへの切り替えを始めています…".into(),
             done: false,
             error: None,
             fallback_cause: None,
@@ -2484,7 +2537,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         // #514: プレースホルダの読み込みが終わったら、起動判定が先に書いた
         // 文言（`AppState::status_text`）を書き直す（[`reapply_status_text`]）。
-        .on_page_load(|webview, payload| reapply_status_text(webview, payload.event()))
+        .on_page_load(|webview, payload| {
+            reapply_status_text(webview, payload.url(), payload.event())
+        })
         .invoke_handler(tauri::generate_handler![
             host_switch_ipc::host_switch_status,
             host_switch_ipc::switch_to_service,
@@ -2544,11 +2599,22 @@ pub fn run() {
 
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
-            // 窓が最初に読んでいるのはプレースホルダ。サービスが止まったときの navigate 先に覚える。
+            // サービスが止まったときの navigate 先（プレースホルダ）。#706 実機確認: ここで
+            // `window.url()` を読むと、最初の読み込みが確定する前なので `about:blank` が返る
+            // （WebView2 の Source）。窓の設定から組み立て、読み込みの完了で覚え直す
+            // （[`reapply_status_text`]）。
+            let use_https = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|config| config.label == MAIN_WINDOW_LABEL)
+                .is_some_and(|config| config.use_https_scheme);
             *app.state::<AppState>()
                 .placeholder_url
                 .lock()
-                .expect("placeholder_url mutex poisoned") = window.url().ok();
+                .expect("placeholder_url mutex poisoned") =
+                Some(launch_gate::placeholder_url(cfg!(windows), use_https));
             let target = expected_probe_target();
             let slot = Arc::clone(&app.state::<AppState>().hub);
             let outcome = decide_startup(&target, &slot);

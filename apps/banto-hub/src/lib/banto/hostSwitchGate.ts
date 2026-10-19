@@ -38,7 +38,7 @@ export function isPreflightOk(
 }
 
 /**
- * 「サービスへ切り替えて開始」を有効にしてよいか。
+ * 「運用モードに切り替える」（サービスへ切り替えて開始）を有効にしてよいか。
  * Desktop または fallback（Offline）から Service へ。
  */
 export function canSwitchToService(input: HostSwitchGateInput): boolean {
@@ -49,7 +49,7 @@ export function canSwitchToService(input: HostSwitchGateInput): boolean {
 }
 
 /**
- * 「サービスを停止してアプリで開く」を有効にしてよいか。
+ * 「設定モードに戻す」（サービスを停止してこのアプリで Hub を起動）を有効にしてよいか。
  */
 export function canSwitchToDesktop(input: HostSwitchGateInput): boolean {
 	if (!input.isLocalShell || !input.isAdmin || !input.canOperate) return false;

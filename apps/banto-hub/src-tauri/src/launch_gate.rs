@@ -254,6 +254,31 @@ pub(crate) fn needs_placeholder_navigation(previous: WatchedView) -> bool {
     !matches!(previous, WatchedView::Fallback(_))
 }
 
+/// プレースホルダ（`frontendDist` の `ui/index.html`）の URL を組み立てる（純関数。#706 実機確認）。
+///
+/// 起動の `setup` で `window.url()` を覚えると、WebView2 は最初の読み込みが確定する前なので
+/// `about:blank` を返し、サービスが止まったときにそこへ移って窓が真っ黒になった。tauri.conf.json に
+/// `devUrl` は無く、窓の `url` も既定（`index.html`）なので、dev でも release でも Tauri の組み込みの
+/// プロトコルから配られる。Windows（WebView2）は `http(s)://tauri.localhost`（`useHttpsScheme`）、
+/// それ以外は `tauri://localhost`（Tauri 2 の `protocol::origin` と同じ）。
+pub(crate) fn placeholder_url(windows: bool, use_https_scheme: bool) -> tauri::Url {
+    let origin = match (windows, use_https_scheme) {
+        (true, true) => "https://tauri.localhost",
+        (true, false) => "http://tauri.localhost",
+        (false, _) => "tauri://localhost",
+    };
+    tauri::Url::parse(&format!("{origin}/index.html")).expect("固定の URL は常に正しい")
+}
+
+/// その URL がプレースホルダ（組み込みのプロトコルで配るページ）か（純関数。#706 実機確認）。
+/// `about:blank`・Hub の画面（`http://127.0.0.1:…`）は違う - navigate 先として覚えない。
+pub(crate) fn is_placeholder_url(url: &tauri::Url) -> bool {
+    matches!(
+        (url.scheme(), url.host_str()),
+        ("tauri", Some("localhost")) | ("http" | "https", Some("tauri.localhost"))
+    )
+}
+
 /// 見張りの 1 回（純関数）。**Desktop は決して返さない**（自動では Hub を起動しない）。`mode` は
 /// SCM が停止のときだけ見る（それ以外は観測しなくてよい - 呼び出し側は `NotObserved` を渡せる）。
 ///
@@ -370,15 +395,15 @@ pub(crate) fn cause_page(cause: FallbackCause) -> Option<(&'static str, Vec<&'st
             "サービスが止まりました",
             vec![
                 "接続していたサービスが止まりました。このアプリでは自動で Hub を起動しません。",
-                "トレイの「再試行」で状態を確かめ直します。",
+                "下のボタンかトレイの「再試行」で状態を確かめ直します。",
             ],
         )),
         FallbackCause::OperationStopped { left_tight: false } => Some((
             "運用モード（停止中）です",
             vec![
                 "サービス（運用モード）が止まっています。profile のファイルは保護されたままなので、このアプリでは Hub を起動しません。",
-                "運用を続けるときは、トレイの「サービスを開始」を押します。",
-                "設定を変えるときは、トレイの「設定モードに戻す」を押します。ファイルの保護を外し、このアプリで Hub を起動します。",
+                "運用を続けるときは、下のボタンかトレイの「サービスを開始」を押します。",
+                "設定を変えるときは、下のボタンかトレイの「設定モードに戻す」を押します。ファイルの保護を外し、このアプリで Hub を起動します。",
                 PAUSE_NOTE,
             ],
         )),
@@ -386,8 +411,8 @@ pub(crate) fn cause_page(cause: FallbackCause) -> Option<(&'static str, Vec<&'st
             "運用モードのまま残っています",
             vec![
                 "サービスが、profile のファイルの保護を外せないまま止まりました（終了コード 5）。このアプリでは Hub を起動しません。",
-                "トレイの「設定モードに戻す」で保護を外します。それで戻らないときは、管理者の許可（ユーザーアカウント制御）を求めて直します。",
-                "運用を続けるときは、トレイの「サービスを開始」を押します。",
+                "下のボタンかトレイの「設定モードに戻す」で保護を外します。それで戻らないときは、管理者の許可（ユーザーアカウント制御）を求めて直します。",
+                "運用を続けるときは、下のボタンかトレイの「サービスを開始」を押します。",
                 service_log,
                 PAUSE_NOTE,
             ],
@@ -397,14 +422,14 @@ pub(crate) fn cause_page(cause: FallbackCause) -> Option<(&'static str, Vec<&'st
             vec![
                 "profile のファイルを保護できなかったため、運用モードに切り替えませんでした（終了コード 4）。ファイルは変わっておらず、設定モードのままです。",
                 service_log,
-                "トレイの「再試行」で、このアプリで Hub を起動し直します。",
+                "下のボタンかトレイの「再試行」で、このアプリで Hub を起動し直します。",
             ],
         )),
         FallbackCause::ProfileUnusable => Some((
             "profile のフォルダを使えません",
             vec![
                 "profile のフォルダがリンク（ジャンクション）になっているなど、安全に使えない状態です。このアプリでは Hub を起動しません。",
-                "管理者に確かめてもらい、直した後にトレイの「再試行」を押します。",
+                "管理者に確かめてもらい、直した後に下のボタンかトレイの「再試行」を押します。",
             ],
         )),
     }
@@ -818,6 +843,43 @@ mod tests {
         assert!(!needs_placeholder_navigation(WatchedView::Fallback(
             FallbackCause::General
         )));
+    }
+
+    #[test]
+    fn placeholder_url_follows_the_platform_and_scheme() {
+        assert_eq!(
+            placeholder_url(true, false).as_str(),
+            "http://tauri.localhost/index.html"
+        );
+        assert_eq!(
+            placeholder_url(true, true).as_str(),
+            "https://tauri.localhost/index.html"
+        );
+        assert_eq!(
+            placeholder_url(false, false).as_str(),
+            "tauri://localhost/index.html"
+        );
+        for windows in [true, false] {
+            for https in [true, false] {
+                assert!(is_placeholder_url(&placeholder_url(windows, https)));
+            }
+        }
+    }
+
+    #[test]
+    fn blank_and_hub_pages_are_not_the_placeholder() {
+        for url in [
+            "about:blank",
+            "http://127.0.0.1:18722/",
+            "http://127.0.0.1:18722/status",
+            "http://localhost:18722/",
+            "https://example.tauri.localhost.evil/",
+        ] {
+            let url = tauri::Url::parse(url).unwrap();
+            assert!(!is_placeholder_url(&url), "{url}");
+        }
+        let reloaded = tauri::Url::parse("http://tauri.localhost/").unwrap();
+        assert!(is_placeholder_url(&reloaded));
     }
 
     #[test]

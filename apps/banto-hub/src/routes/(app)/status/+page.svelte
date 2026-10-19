@@ -518,8 +518,8 @@
 	// をそのまま表示専用の1行として流用し、BantoHubSink（外部 DB 連携 S5 の
 	// サイドカー）だけをこのセクション固有に start/stop する
 	// （`sinkServiceShell.ts`のモジュール doc参照）。BantoHub 自体の
-	// 起動・停止は上のカードが持つ「サービスへ切り替えて開始」/
-	// 「サービスを停止してアプリで開く」（ホスト切替、意味が異なる）に
+	// 起動・停止は上のカードが持つ「運用モードに切り替える」/
+	// 「設定モードに戻す」（ホスト切替、意味が異なる）に
 	// 委ねる - このセクションで二重の操作導線は作らない。
 	let sinkService: SinkServiceStatus | null = $state(null);
 	let sinkServiceBusy = $state(false);
@@ -665,7 +665,7 @@
 		hostSwitchError = null;
 		hostProgress = {
 			phase: 'starting',
-			message: 'サービスへの切替を開始しています…',
+			message: '運用モードへの切り替えを始めています…',
 			done: false,
 			error: null
 		};
@@ -683,7 +683,7 @@
 		hostSwitchError = null;
 		hostProgress = {
 			phase: 'starting',
-			message: 'アプリへの切替を開始しています…',
+			message: '設定モードへの切り替えを始めています…',
 			done: false,
 			error: null
 		};
@@ -1188,15 +1188,15 @@
 			{/if}
 		{:else}
 			<dl class="summary">
-				<dt>現在の状態</dt>
+				<dt>サービスの状態</dt>
 				<dd>{scmStateLabel(hostSwitch.scmState)}</dd>
-				<dt>シェル表示</dt>
+				<dt>モード</dt>
 				<dd>
 					{hostSwitch.view === 'desktop'
-						? 'アプリ'
+						? '設定モード（このアプリで Hub を動かしています）'
 						: hostSwitch.view === 'service'
-							? 'サービス接続'
-							: 'フォールバック'}
+							? '運用モード（サービスで Hub を動かしています）'
+							: 'Hub が動いていません'}
 				</dd>
 			</dl>
 
@@ -1236,10 +1236,10 @@
 
 			<div class="write-control-actions">
 				<button type="button" onclick={handleSwitchToService} disabled={!allowSwitchToService}>
-					サービスへ切り替えて開始
+					運用モードに切り替える
 				</button>
 				<button type="button" onclick={handleSwitchToDesktop} disabled={!allowSwitchToDesktop}>
-					サービスを停止してアプリで開く
+					設定モードに戻す
 				</button>
 			</div>
 
