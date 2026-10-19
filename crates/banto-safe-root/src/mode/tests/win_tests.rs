@@ -1449,6 +1449,198 @@ fn a_child_moved_out_after_enumeration_keeps_its_descriptor_in_close_and_relax()
     }
 }
 
+// --- #623 S-1: 書いている最中に古い DELETE のハンドルで木の外へ移されたフォルダ -------------
+
+/// 木の外のフォルダ `outside` の中の `name` へ、古い `DELETE` のハンドル `held` で付け替える
+/// （利用者が締める前から握っていたハンドルの筋。ID で開く歩き方とは共有違反にならない）。
+fn move_out_with_old_handle(held: HANDLE, outside: &Path, name: &str) {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let target = open_dir(
+        outside,
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+    .unwrap();
+    crate::handle_io::rename_replace(held, target.0, name).unwrap();
+}
+
+/// `root\data` を `DELETE` で握る（締める前から開いていた形）。
+fn hold_data_with_delete(root: &Path) -> Owned {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    open_dir(
+        &root.join("data"),
+        DELETE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+    .unwrap()
+}
+
+/// `data` の最初の子を開く前に、`held` で `data` を `outside\s1-moved` へ移すフックを付ける。
+/// 返り値は「移したか」。
+fn hook_move_data_out(held: HANDLE, outside: &Path) -> std::rc::Rc<std::cell::Cell<bool>> {
+    let moved = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (moved_for_hook, outside) = (moved.clone(), outside.to_path_buf());
+    crate::acl::imp::BEFORE_CHILD_OPEN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |child: &Path| {
+            let in_data = child
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "data");
+            if in_data && !moved_for_hook.replace(true) {
+                move_out_with_old_handle(held, &outside, "s1-moved");
+            }
+        }));
+    });
+    moved
+}
+
+/// #623 S-1（実測 2026-10-19、管理者でない利用者）: 書いている最中のフォルダを古い `DELETE` の
+/// ハンドルで木の外へ移されたら、部分木を書いた後の確かめで見つける。所有者を自分にした記述子で
+/// [`crate::acl::imp::walk_dir`] を直接回すので、管理者でなくても走る（`close_tree` を通す形は
+/// 次のテスト）。
+/// - 止める（2 周目の形、上から）: `MovedOut` で止まる。
+/// - 記録して続ける（緩めるの形、下から）: 記録し、移されたフォルダ自身には書かない。
+#[test]
+fn a_dir_moved_out_mid_walk_by_an_old_delete_handle_is_noticed_after_its_subtree() {
+    use crate::acl::imp::{self, OnSkip, Order, Walk, WalkStop, WriteSet};
+    let me = me();
+    let dacl = format!(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})",
+        me.as_str()
+    );
+    let dir_sd = imp::sd_from_sddl(&format!("O:{}{dacl}", me.as_str())).unwrap();
+    let file_dacl = dacl.replace("OICI", "");
+    let file_sd = imp::sd_from_sddl(&format!("O:{}{file_dacl}", me.as_str())).unwrap();
+    let marker_sd = imp::sd_from_sddl(&format!("O:{}{file_dacl}", me.as_str())).unwrap();
+    for (on_skip, order) in [
+        (OnSkip::Abort, Order::RootFirst),
+        (OnSkip::Record, Order::RootLast),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        make_tree(&root);
+        let pinned = pinned(&root);
+        let real = pinned.final_path().to_path_buf();
+        let held = hold_data_with_delete(&root);
+        let data_before = inspect_file(&root.join("data")).unwrap().unwrap();
+        let x_before = inspect_file(&root.join("data").join("deep").join("x.txt"))
+            .unwrap()
+            .unwrap();
+        let moved = hook_move_data_out(held.0, outside.path());
+        let mut walk = Walk {
+            within: &real,
+            on_skip,
+            order,
+            write: Some(WriteSet {
+                dir_sd: &dir_sd,
+                file_sd: &file_sd,
+                marker_sd: &marker_sd,
+            }),
+            strict: false,
+            place_markers: false,
+            stop: &|| StopSignal::None,
+            progress: &mut |_| {},
+            counts: Progress::default(),
+            recorded: Vec::new(),
+        };
+        let result = imp::walk_dir(&mut walk, pinned.raw_handle(), &real, 0);
+        crate::acl::imp::BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(moved.get(), "{on_skip:?}: フックが動いていない");
+        let moved_to = outside.path().join("s1-moved");
+        assert!(moved_to.is_dir(), "{on_skip:?}: 移っていない");
+        let problem = match (on_skip, result) {
+            (OnSkip::Abort, Err(WalkStop::Problem(problem))) => {
+                assert!(walk.recorded.is_empty());
+                // 上から書く形では、移されたフォルダ自身は気づく前に書かれて移った先にある。
+                assert_ne!(
+                    inspect_file(&moved_to).unwrap().unwrap(),
+                    data_before,
+                    "移されたフォルダ自身が書かれていない"
+                );
+                problem
+            }
+            (OnSkip::Record, Ok(())) => {
+                assert_eq!(walk.recorded.len(), 1, "{:?}", walk.recorded);
+                let problem = walk.recorded.remove(0);
+                // 下から書く形では、移されたフォルダ自身に書く前に見つけるので、書かない。
+                assert_eq!(
+                    inspect_file(&moved_to).unwrap().unwrap(),
+                    data_before,
+                    "移されたフォルダに書いた"
+                );
+                problem
+            }
+            (_, other) => panic!("{on_skip:?}: 確かめが無い（{other:?}）"),
+        };
+        match &problem {
+            TreeProblem::MovedOut { path, now } => {
+                assert_eq!(path, &real.join("data"), "{on_skip:?}");
+                assert!(now.ends_with("s1-moved"), "{on_skip:?}: {now:?}");
+                assert!(!crate::guard::is_same_or_inside(now, &real), "{now:?}");
+            }
+            other => panic!("{on_skip:?}: {other:?}"),
+        }
+        // 移された後に開く子は木の外と判断して書かない（`open_child_by_id` の確かめ）。
+        assert_eq!(
+            inspect_file(&moved_to.join("deep").join("x.txt"))
+                .unwrap()
+                .unwrap(),
+            x_before,
+            "{on_skip:?}: 移された後に開いた孫に書いた"
+        );
+        drop(held);
+    }
+}
+
+/// #623 S-1: `close_tree` は、締めている最中に古い `DELETE` のハンドルで木の外へ移された
+/// フォルダを `MovedOut` で止め、呼ぶ側は `relax_tree` で木の中を緩め直せる。移された先に
+/// 移される前に書いた分（そのフォルダ自身・印）は戻らない（doc の既知の制限）。
+#[test]
+fn close_tree_aborts_when_a_dir_is_moved_out_by_an_old_delete_handle() {
+    if !is_elevated_admin() {
+        eprintln!("skip: 所有者を移すのは管理者だけ（CI で確かめる）");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    make_tree(&root);
+    let mode = mode();
+    let pinned = pinned(&root);
+    let real = pinned.final_path().to_path_buf();
+    let held = hold_data_with_delete(&root);
+    let moved = hook_move_data_out(held.0, outside.path());
+    let aborted = pinned.close_tree(&mode, &no_stop, &mut |_| {});
+    crate::acl::imp::BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+    drop(held);
+    assert!(moved.get(), "フックが動いていない");
+    let moved_to = outside.path().join("s1-moved");
+    let abort = aborted.expect_err("木の外へ移されたのに締め終えた");
+    match &abort.reason {
+        AbortReason::Problem(TreeProblem::MovedOut { path, now }) => {
+            assert_eq!(path, &real.join("data"));
+            assert!(now.ends_with("s1-moved"), "{now:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(abort.written >= 2, "{abort:?}");
+    let moved_after_close = inspect_file(&moved_to).unwrap().unwrap();
+    // 緩め直す: 木の中（`data` の無い木）は設定モードの形に戻り、移された先には触らない。
+    let report = pinned.relax_tree(&mode, &mut |_| {}).unwrap();
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    expect_tree_shape(&root, mode.setting());
+    assert_eq!(
+        inspect_file(&moved_to).unwrap().unwrap(),
+        moved_after_close,
+        "緩め直しが木の外に書いた"
+    );
+}
+
 /// 設計 §8 PR-1c の 7 の後半: `ensure_marker` は印を置き（利用者の ACE なし・所有者
 /// Administrators・リンク数 1）、2 回目は `Existed`。印を置く前に古いハンドルで reparse に
 /// されたフォルダは `DirIsReparse` で止める。`MARKER_NAME` にフォルダがあれば `Occupied`。
