@@ -159,6 +159,20 @@ pub fn sync_service_log() {
     let _ = file.sync_data();
 }
 
+/// サービスログをディスクへ出してから閉じる（#661 661-2）。以後 [`log_line`]/
+/// [`log_err_line`] はファイルへ書かない（標準出力・標準エラー出力だけ。サービスでは
+/// どこにも届かない）。サービスが profile の ACL を緩め始める前の最後の仕事
+/// （緩め始めたら profile の中へ書かない）。開いていなければ何もしない。
+pub fn close_service_log() {
+    let Some(slot) = SERVICE_LOG_FILE.get() else {
+        return;
+    };
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(file) = guard.take() {
+        let _ = file.sync_data();
+    }
+}
+
 /// `println!`相当 + （サービスモードのみ）ログファイルへのミラー。
 pub fn log_line(msg: &str) {
     println!("{msg}");

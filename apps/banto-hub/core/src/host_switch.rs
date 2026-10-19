@@ -74,17 +74,10 @@ use crate::hub_health::{HealthOutcome, HubHealthProbe};
 use crate::service_manager::{
     describe_service_error, service_exit_with, PendingWatch, ScmState, ServiceEnd, ServiceManager,
     ServiceManagerError, ServiceStatusSummary, SwitchTimings, WatchStep, DEFAULT_OVERALL_LIMIT,
-    MAX_STOP_RETRIES,
+    HUB_EXIT_LEFT_TIGHT, HUB_EXIT_NOT_OPERATIONAL, MAX_STOP_RETRIES,
 };
 // 緩めるだけの開始（`relax-only`）の口は共有 crate の型をそのまま使う（#661 661-4）。
 pub use crate::service_manager::{RealClock, RelaxOnlyOutcome, SwitchClock};
-
-/// サービスの終了コード 4: 運用モードにできなかった（何も変えずに断った・締めかけて緩め直した）。
-/// サービス側（`bin/banto_hub/win_service.rs`）の値と同じ。
-pub const SERVICE_EXIT_CANNOT_OPERATE: u32 = 4;
-
-/// サービスの終了コード 5: 締めたまま止まった（緩められなかった）。サービス側の値と同じ。
-pub const SERVICE_EXIT_LEFT_TIGHT: u32 = 5;
 
 /// 緩めるだけの開始でサービスに渡す引数（サービス側が受ける値）。
 pub const RELAX_ONLY_ARG: &str = "relax-only";
@@ -122,11 +115,7 @@ impl std::fmt::Display for ServiceFault {
 
 /// 止まったサービスの終了コードを [`ServiceFault`] に読む（純関数。4・5 以外は`None`）。
 pub fn service_fault(summary: &ServiceStatusSummary) -> Option<ServiceFault> {
-    match service_exit_with(
-        summary,
-        SERVICE_EXIT_CANNOT_OPERATE,
-        SERVICE_EXIT_LEFT_TIGHT,
-    ) {
+    match service_exit_with(summary, HUB_EXIT_NOT_OPERATIONAL, HUB_EXIT_LEFT_TIGHT) {
         ServiceEnd::CannotOperate => Some(ServiceFault::CannotOperate),
         ServiceEnd::LeftOperation => Some(ServiceFault::LeftTight),
         ServiceEnd::Clean | ServiceEnd::Other { .. } => None,
@@ -147,8 +136,8 @@ pub fn relax_only_and_wait(
         clock,
         timings,
         RELAX_ONLY_ARG,
-        SERVICE_EXIT_CANNOT_OPERATE,
-        SERVICE_EXIT_LEFT_TIGHT,
+        HUB_EXIT_NOT_OPERATIONAL,
+        HUB_EXIT_LEFT_TIGHT,
     )
 }
 

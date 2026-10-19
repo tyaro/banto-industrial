@@ -36,7 +36,12 @@
 //!   （[`win_service::uninstall`]）
 //! - `run-service`（Windows専用）: SCM がサービス開始時に呼ぶ内部
 //!   エントリポイント（[`win_service::run_service_dispatcher`]）。人間が
-//!   直接叩く想定ではない
+//!   直接叩く想定ではない。#661 661-2 から、サービスは profile を運用モードの
+//!   形に締めてから Hub を動かし、STOP で緩める。サービスの**開始の引数**
+//!   （`sc start BantoHub relax-only`・`Start-Service` の `-ArgumentList` 相当。
+//!   コマンドラインの引数ではない）に `relax-only` ちょうどを渡すと、Hub を
+//!   動かさずに緩めるだけで止まる（締めたまま残ったときの戻し方。それ以外の
+//!   開始の引数は何も変えずに終了コード 3）
 //!
 //! 実行手順は docs/banto-hub-operations.md 参照。
 //!
@@ -101,6 +106,8 @@ fn print_usage() {
         eprintln!("  install       Windows サービスとして登録（管理者権限が必要）");
         eprintln!("  uninstall     サービス登録を解除（管理者権限が必要）");
         eprintln!("  run-service   SCM 専用の内部エントリポイント（直接実行しないでください）");
+        eprintln!("                サービスの開始の引数に relax-only を渡すと、Hub を動かさずに");
+        eprintln!("                profile の ACL を緩めるだけで止まる（例: sc start BantoHub relax-only）");
     }
     #[cfg(not(windows))]
     {
