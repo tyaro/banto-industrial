@@ -312,10 +312,15 @@ pub fn try_acquire_profile_lock_in(
     host_kind: HubHostKind,
     dirs: ProfileDirs,
 ) -> Result<ProfileLockGuard, ProfileLockError> {
-    let lock_path: PathBuf = lock_file_path(paths);
     let mutex_name = crate::profile_paths::mutex_name(&paths.profile_id);
 
-    match banto_instance_lock::try_acquire(&mutex_name, &lock_path, &host_kind.to_string()) {
+    // 診断ファイルは、握った profile のハンドル経由で書く（パスで開き直さない。#693 レビュー）。
+    match banto_instance_lock::try_acquire_in(
+        &mutex_name,
+        dirs.profile.as_dir(),
+        LOCK_FILE_NAME,
+        &host_kind.to_string(),
+    ) {
         Ok(guard) => {
             // 診断ファイルを書かなかった・作ったファイルを消せなかった理由
             // （`banto_instance_lock` はログを出さない）。排他は取れているので
@@ -385,6 +390,20 @@ mod tests {
             try_acquire_profile_lock_in(&paths, HubHostKind::Shell, dirs),
             Err(ProfileLockError::AlreadyHeld { .. })
         ));
+    }
+
+    /// #693 レビュー: 診断ファイルは握った profile の `final_path` の下に書かれる。
+    #[test]
+    fn diagnostics_file_is_written_under_the_held_profile() {
+        let root = TempDir::new("profile-lock-held-profile");
+        let paths = resolve_profile_paths(root.path(), "held-profile").expect("valid profile id");
+        let dirs = open_profile_dirs(&plain_profile_root_spec(&paths), None).expect("open dirs");
+        let expected = dirs.profile.final_path().join(LOCK_FILE_NAME);
+
+        let guard =
+            try_acquire_profile_lock_in(&paths, HubHostKind::Service, dirs).expect("acquire ok");
+        assert_eq!(guard.lock_file_path(), expected.as_path());
+        assert!(expected.is_file());
     }
 
     /// profile の中のフォルダの場所が普通のファイルなら、排他を取る前に断る
@@ -543,8 +562,8 @@ mod tests {
     }
 
     /// `profiles\<profile-id>`（利用者が「変更」を持つ部分）がジャンクションなら、
-    /// ルートを解いても**そこは解かない**ので、外のファイルを書き換えず・読まない。
-    /// profile のフォルダまで解く実装にすると、外のファイルが書き換わる（反証で落ちる）。
+    /// 握る側（`Mode::Guarded`）は辿らずに断り、外のファイルを書き換えない・読まない
+    /// （診断ファイルは握った profile 経由で書くので、`Plain` は意図どおりリンクを辿る）。
     #[cfg(windows)]
     #[test]
     fn a_junction_below_the_root_is_not_resolved() {
@@ -561,8 +580,12 @@ mod tests {
 
         let paths =
             resolve_profile_paths(root.path(), "junction-profile").expect("valid profile id");
-        let _guard =
-            try_acquire_profile_lock(&paths, HubHostKind::Service).expect("mutex は取れる");
+        let mut spec = plain_profile_root_spec(&paths);
+        spec.mode = Mode::Guarded;
+        assert!(
+            open_profile_dirs(&spec, None).is_err(),
+            "Guarded はジャンクションの profile を辿らず断る"
+        );
 
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), VICTIM);
         let read = read_owner_info_detailed(&lock_file_path(&paths));

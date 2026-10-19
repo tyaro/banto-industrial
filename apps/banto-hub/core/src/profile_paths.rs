@@ -35,7 +35,7 @@
 //! - 旧 `./banto-hub.sqlite3`／`./data`からの自動移行は行わない
 //!   （desktop-plan §11「黙って移動しない」、本スライスのスコープ外）。
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
@@ -154,12 +154,13 @@ pub fn resolve_profile_paths(
 /// `profile_final` は握った profile の本当のパス（`banto_safe_root::SafeRoot::final_path`）で、
 /// どちらかの下なら中とみなす（要素単位の前方一致。`profiles\a` と `profiles\ab` は別）。
 ///
-/// 相対パスは外とみなす（どこを基準に開くかは呼ぶ時点のカレントディレクトリ次第で、
+/// `..` を含むパスも外とみなす（安全側）。相対パスは外とみなす（どこを基準に開くかは呼ぶ時点のカレントディレクトリ次第で、
 /// profile のリンクの保護と運用モードの ACL の範囲に入るとは言えないため）。外のパスは
 /// 辿らない作り方・ACL の付け替えの対象外で、サービスはその旨をログに 1 行出す
 /// （[`external_path_line`]。呼ぶのは 661-2）。
 pub fn is_outside_profile(path: &Path, profile_dir: &Path, profile_final: &Path) -> bool {
-    if !path.is_absolute() {
+    // `..` を含むパスは、字面の前方一致が実体と食い違う（`/profile/../outside`）ので外とみなす。
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return true;
     }
     !(path.starts_with(profile_dir) || path.starts_with(profile_final))
@@ -538,6 +539,17 @@ mod tests {
         assert!(is_outside_profile(&sibling.join("data"), &spelled, &real));
         assert!(is_outside_profile(&base.join("elsewhere"), &spelled, &real));
         assert!(is_outside_profile(Path::new("data"), &spelled, &real));
+        // `..` で抜けるパスは、字面が profile の下でも外。
+        assert!(is_outside_profile(
+            &spelled.join("..").join("outside"),
+            &spelled,
+            &real
+        ));
+        assert!(is_outside_profile(
+            &real.join("data").join("..").join(".."),
+            &spelled,
+            &real
+        ));
         assert!(is_outside_profile(
             Path::new("./banto-hub.sqlite3"),
             &spelled,

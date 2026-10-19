@@ -296,7 +296,7 @@ enum StartupOutcome {
         scm_state: ScmState,
     },
     /// デスクトップホストとして起動できた。
-    Desktop(StartedHub),
+    Desktop(Box<StartedHub>),
     /// fallback 画面を表示する。
     Fallback(FallbackInfo),
 }
@@ -1099,7 +1099,7 @@ fn attempt_desktop_start(
     match tauri::async_runtime::block_on(HubRuntime::start(build_hub_config_from_env(
         HubHostKind::Shell,
     ))) {
-        Ok(hub) => StartupOutcome::Desktop(StartedHub { hub, ticket }),
+        Ok(hub) => StartupOutcome::Desktop(Box::new(StartedHub { hub, ticket })),
         Err(err) => {
             // 起動できなかった - 札を返す（終了が待っていればここで起きる）。
             drop(ticket);
@@ -1169,7 +1169,8 @@ fn apply_startup_outcome(
             *state.view.lock().expect("view mutex poisoned") = ShellView::Service { scm_state };
             None
         }
-        StartupOutcome::Desktop(StartedHub { hub, ticket }) => {
+        StartupOutcome::Desktop(started) => {
+            let StartedHub { hub, ticket } = *started;
             let addr = hub.local_addr();
             let controller = hub.controller();
             // 先に置く（置けなければ画面を Hub へ移さない）。置けなかったのは

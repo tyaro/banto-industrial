@@ -513,6 +513,18 @@ static STATE_FILE_WRITE_LOCK: SyncMutex<()> = SyncMutex::new(());
 #[cfg(test)]
 static BLOCKED_STATE_WRITES: SyncMutex<Vec<PathBuf>> = SyncMutex::new(Vec::new());
 
+/// 状態ファイルの親フォルダ。親が空（`BANTO_HUB_DATA` が空文字で、パスがファイル名だけ）
+/// ならカレントディレクトリ（`.`）に読み替える（以前は current dir として動いていた）。
+fn state_file_parent(path: &Path) -> Option<&Path> {
+    path.parent().map(|dir| {
+        if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        }
+    })
+}
+
 /// パスで渡された状態ファイルに書く。親のフォルダを `Mode::Plain` で開いて (無ければ
 /// 作る。以前の `create_dir_all` と同じ)、[`write_state_in_blocking`] に渡す。
 fn write_state_file_blocking(
@@ -522,9 +534,7 @@ fn write_state_file_blocking(
 ) -> std::io::Result<()> {
     let invalid =
         |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_string());
-    let dir = path
-        .parent()
-        .ok_or_else(|| invalid("親ディレクトリがありません"))?;
+    let dir = state_file_parent(path).ok_or_else(|| invalid("親ディレクトリがありません"))?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1435,6 +1445,17 @@ pub async fn persist_enabled(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_parent_of_state_file_reads_as_current_dir() {
+        // `BANTO_HUB_DATA=""` → `state_file_path("")` はファイル名だけのパス。
+        let bare = state_file_path(Path::new(""));
+        assert_eq!(state_file_parent(&bare), Some(Path::new(".")));
+        assert_eq!(
+            state_file_parent(Path::new("data/state.json")),
+            Some(Path::new("data"))
+        );
+    }
+
     use super::*;
     use crate::db::{init_db, migrate_memory};
     use std::sync::Arc;
