@@ -138,6 +138,7 @@ Desktop Hub 起動までのフル E2E は任意の追加確認として残す。
 **2026-10-19 オーナー決定（#661）: banto-hub への当てはめ**（ChronoGazer の #623 PR-1〜PR-4 と #686〜#690 を手本にする）
 
 - **締める範囲**: サービスが使う profile（`BANTO_HUB_PROFILE`）の木だけを締める。`{root}` と `profiles\` は開いて本当のパスと所有者を確かめるだけで、DACL は書かない。
+- **profile の外（`BANTO_DB`・`BANTO_HUB_DATA`）**: 2026-10-18 の決定どおり、この PR 群では締めない（ChronoGazer の外部の `data.dir` と同じ扱い）。運用モードに入るときにサービスの日次ログへ「profile の外に書く設定です（締めません）」と 1 行出し、既知の制限として残す。これらの値はサービスの環境（管理者だけが書ける）で決まるが、指す先のフォルダを利用者が書き換えられる場合は穴が残る。断る（運用モードに入れない）か、管理者が登録したフォルダだけ締めるかは #659 と合わせて決める。
 - **戻す相手の記録**: 締める直前に profile の DACL から owner の組（明示・継承する「変更」以上の利用者）を決め、HKLM `SYSTEM\CurrentControlSet\Services\BantoHub\Parameters\Profiles\<id>\Owners`（REG_MULTI_SZ）に書いてから締める。緩めるときはそこから読む（締めたまま落ちた後は DACL から読めないため）。profile の中のファイルや設定 DB には置かない（設定モードの利用者が書き換えられる）。`grant-profile-acl` も同じ値を更新する。
 - **相手が 0 人のとき**: ChronoGazer と同じく、何も変えずに終了コード 4（運用モードにできない）で断り、`grant-profile-acl` を案内する。
 - **終了コード**: ChronoGazer と同じく 4 = 運用モードにできなかった、5 = 締めたまま残った、を足す。`relax-only`（開始の引数）で緩めるだけの起動を受ける。
