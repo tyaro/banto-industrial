@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-19（§2-2 の nextest の項を更新（続き: #ci-speed でテストのビルドを rust-test-build ジョブの nextest archive 1 回にまとめ、rust-test はそれを展開して実行するだけにした）: #ci-speed で CI のテストを rust ジョブから rust-test ジョブ（3 台のシャード）へ分けた。doctest は rust-test-build ジョブで archive 作成後に回す。rust ジョブは fmt / clippy のみで名前も「Rust (fmt / clippy)」に変えた）。2026-10-18（§2-3 に「共有 crate の公開 API の形を変えたら `cargo check --workspace --all-targets` で呼び出し側まで確かめる」を追加。#677 で `banto-hub-sink` の呼び出し側を見落として Windows CI がコンパイルエラーで落ちた）2026-10-17（§5 の「OPC UA 設定の有効化 PUT は初回起動に時間がかかる」を #634 に合わせて書き換えた。PUT は保存して起動を始めたらすぐ返り、起動の完了は `GET /api/opcua-status` で待つ。PUT の上限は他と同じ 10 秒に戻した）2026-10-16（§5 に「外から来た名前をパスに join する前に、Windows で別の場所を指しうるもの（`:`・予約名・末尾の `.` と空白）を断る」を追加。#626 の調査で、profile-id の `C:` が `Path::join` でドライブ相対のパスになり、昇格した `grant-profile-acl` が C: の今のフォルダを書き換えうる穴を見つけた）2026-10-16（§2 に「CI は cargo nextest で走る。プロセス内の直列化は効かないので、同時に走るとぶつかるテストは `.config/nextest.toml` の test-groups へ」を追加。CI の rust ジョブを cargo-nextest に替えたことに伴う）
+最終更新: 2026-10-20（#661 の実機確認で踏んだ事故 5 件を §2・§3・§5 に追加。WebView2 の `window.url()`、release の Tauri の標準エラー出力、実機スクリプトの文字コードと `[y/N]`、GUI の画面遷移、同名の既存サービス）。2026-10-19（§2-2 の nextest の項を更新（続き: #ci-speed でテストのビルドを rust-test-build ジョブの nextest archive 1 回にまとめ、rust-test はそれを展開して実行するだけにした）: #ci-speed で CI のテストを rust ジョブから rust-test ジョブ（3 台のシャード）へ分けた。doctest は rust-test-build ジョブで archive 作成後に回す。rust ジョブは fmt / clippy のみで名前も「Rust (fmt / clippy)」に変えた）。2026-10-18（§2-3 に「共有 crate の公開 API の形を変えたら `cargo check --workspace --all-targets` で呼び出し側まで確かめる」を追加。#677 で `banto-hub-sink` の呼び出し側を見落として Windows CI がコンパイルエラーで落ちた）2026-10-17（§5 の「OPC UA 設定の有効化 PUT は初回起動に時間がかかる」を #634 に合わせて書き換えた。PUT は保存して起動を始めたらすぐ返り、起動の完了は `GET /api/opcua-status` で待つ。PUT の上限は他と同じ 10 秒に戻した）2026-10-16（§5 に「外から来た名前をパスに join する前に、Windows で別の場所を指しうるもの（`:`・予約名・末尾の `.` と空白）を断る」を追加。#626 の調査で、profile-id の `C:` が `Path::join` でドライブ相対のパスになり、昇格した `grant-profile-acl` が C: の今のフォルダを書き換えうる穴を見つけた）2026-10-16（§2 に「CI は cargo nextest で走る。プロセス内の直列化は効かないので、同時に走るとぶつかるテストは `.config/nextest.toml` の test-groups へ」を追加。CI の rust ジョブを cargo-nextest に替えたことに伴う）
 2026-10-16（§2 に「新規ディレクトリ・ファイルを追加したら git add 後に ci-changes 分類テストを実行する」を追加。#632 で新設 interop/ の分類登録を忘れて changes と ci-gate が失敗した。網羅テストは git ls-files を見るため、追加ファイルをステージした後に実行する）
 2026-10-16（§5 に「OPC UA 設定の有効化 PUT は起動完了を待つため長めの上限を明示する」を追加。PR #627 の Windows CI で初回起動が 10 秒を超え、起動経路には一時 RSA 鍵生成も含まれる）
 2026-10-16（§2 に「Cargo の生成物は cargo/rustc/linker が動いていないことを確認してから掃除する」を追加。#201 の検証中、リンク中に `target/debug/examples` を消して欠けた object によりテストが失敗した）
@@ -77,6 +77,7 @@
    - [ ] **`@banto/*` の git 依存を上げるとき `pnpm-lock.yaml` を手で書き換えない**（Cargo.lock と逆）。SHA・specifier だけ直すと `packages:` の `version:` が旧版のまま残り、pnpm は「lock は最新」と判断して再解決しない。ストアを再利用する `pnpm install --frozen-lockfile`（CI のキャッシュ復元・別 checkout）が `ERR_PNPM_UNEXPECTED_PKG_CONTENT_IN_STORE`（lock の 5.0.0 と実 manifest の 5.1.0 の食い違い）で落ちる。#515 のオーナーレビュー P2、2026-10-07。対処: `packages:`/`snapshots:` の `@banto/*` 項目を消してから `pnpm install --no-frozen-lockfile` で再生成し、各 `version:` が取得元の実 `package.json` と一致することを確認する。
 10. [ ] **push したら、その head に対して CI の run が実際に起動したか確認する**（`gh run list --branch <branch> --limit 5`）。**PR がコンフリクトしていると GitHub はマージ ref を作れず、`on: pull_request` の CI / Supply Chain は起動しない**（Copilot のレビューは別イベントなので走り続け、気付きにくい）。起動していなければ `gh pr view <n> --json mergeable` を疑い、main を取り込んで解決する。**ローカルで緑でも、CI が走っていなければ緑ではない。**
 11. [ ] **実機で Tauri のシェル（`src-tauri`）を動かす確認は、試験専用の identifier でビルドし、`CHRONOGAZER_ROOT` を作業用のフォルダに向ける**。`APPDATA`・`LOCALAPPDATA` の環境変数を差し替えても、Tauri の `app_local_data_dir()`・`app_data_dir()`・WebView2 のデータは Windows の既知のフォルダの API で解決されるので**隔離されない**（2026-10-15、#392 B2-4b の実機確認: 試験が旧データの案内の既読の印をオーナーの実際の `%LOCALAPPDATA%\dev.tyaro.chronogazer` に作った。オーナー許可で削除済み）。identifier はビルド時に `TAURI_CONFIG='{"identifier":"dev.tyaro.chronogazer.<試験名>"}'` で上書きする（#585 の A2 の実機確認と同じ）。終わったら試験用の identifier のフォルダ（`%APPDATA%`・`%LOCALAPPDATA%` の下）と作業用のルートを消す。
+12. [ ] **実機を確かめる前に、同じサービス名の本物がすでに入っていないかを見る**（`sc query <名前>`・`sc qc <名前>`）。入っていれば、止める・外す手順と戻し方を先に決めてから進める。作業用のルートに `service-install` すると、同じ名前の本物のサービスを上書きしうる（#661 の実機確認）。
 
 ## 3. E2E の罠（全部踏んだ）
 
@@ -86,6 +87,7 @@
 - [ ] 狭幅の検証は `400x800`（ツリー退避）と `880x800`（ペインが出る狭幅）を使い分ける。
 - [ ] **E2E だけ落ちるときは実装のバグを疑う**（過去 2 回とも実バグだった）。テストを緩めない。
 - [ ] **CI でだけ落ちるフレークは、まず失敗時のアーティファクト（`error-context.md` の DOM・`test-failed-1.png`・trace）で「落ちた瞬間の状態」を見る**。#399 は「共有 page の幅の戻し忘れ」と見立てられていたが、trace のビューポートは 400x800 のままで、実際は**製品のバグ**だった: サイドバーの `visibility` を**開く側でも** 0.2s 遷移させていたため、開いてから最初のアニメーションフレームが進むまで計算値が `hidden` のままになり、Esc の層判定（`escLayering.ts`）がサイドバーを見落とした。遅いランナーでしか踏まず、ローカルのキー入力では 20/20 通る。**開く遷移に `visibility` を載せない**（閉じる側だけ）。再現は「クリック → DOM 反映 → キー」を `page.evaluate` の 1 タスク内で行うと決定的に取れる（テスト 31b）。
+- [ ] **実機確認のスクリプトで、外部の exe の出力は `[Console]::OutputEncoding` を UTF-8 にしてから読む**（Rust の exe は UTF-8 で出すが、PowerShell は既定のコードページで読んで文字化けし、文言の判定が外れる）。`[y/N]` を出すコマンドは標準入力で答えを渡す（渡さないと待ち続ける）。判定の NG は、製品の不具合とスクリプトの誤りを分けてから数える（#661 の 1 回目は 4 件が文字化けだった）。
 
 ## 4. docs の同期（PR で docs を触ったら）
 
@@ -126,6 +128,9 @@
 - [ ] **並行テストの時間切れは、書き手が終わっていないことと読み手の欠落とを分ける**。`banto-tsquery` の `concurrent_reads_during_writes_never_corrupt_or_error` は、読み手が壊れていなくても 50 flush が 10 秒に収まらないと「46 件で打ち切り」になる（windows-latest、#605 の CI run 38620658017）。上限はハング用にし、書き手が終わったあとの読みで全件が見えることを確かめる。
 - [ ] **外から来た名前（profile-id など）をパスに join する前に、Windows で別の場所を指しうるものを断る**。Windows の `Path::join` は**ドライブの接頭辞を持つ要素（`C:`・`x:y`）で前を捨てる**ので、`root.join("profiles").join("C:")` は `C:`（C: の今のフォルダ = ドライブ相対）になる。`/`・`\`・`..` を断るだけでは足りない。`:`（代替データストリームも）・予約デバイス名（`NUL`・`COM1`、`nul.txt` も）・末尾の `.` と空白（Win32 の正規化で落ちる）も断り、昇格の境界では許可リスト（英数字・`_`・`-`）にする（#626、2026-10-16: `grant-profile-acl <user> C:` が昇格したプロセスの C: の今のフォルダを再帰で書き換えうる経路だった。`profile_paths::validate_profile_id`・`profile_grant::validate_strict_profile_id`）。
 - [ ] **OPC UA の listener の起動は時間がかかる場合がある（初回 10 秒超）。起動の完了は `GET /api/opcua-status` で待つ**。`opcua_admin_settings_round_trip_and_reconfigure_listener` は Windows CI で初回 listener 起動が 10 秒を超えた（PR #627、run 38871877894）。起動経路には一時 RSA 鍵生成も含まれるが、タイムアウトの直接原因と確定したわけではない。#634（2026-10-17）で `PUT /api/opcua-settings` は保存して起動を始めたらすぐ返る形にしたので、**PUT の上限は他と同じ 10 秒**にし、起動済み（`running`）を状態の API のポーリングで待つ。その待ちにだけ長めの有限上限（60 秒、ハング検出用）を与え、`failed` なら理由を出して落とす。PUT の 200 を「listener が待ち受けている」と読まない（interop の `smoke.py` も同じ）。
+- [ ] **Tauri（WebView2）の `setup` の中の `window.url()` は、最初の読み込みが確定する前だと `about:blank` を返す**。戻り先の URL として覚えると、後でそこへ移ったときに窓が真っ黒になる。URL は窓の設定（`useHttpsScheme` など）から組み立てるか、読み込み完了で覚え、`about:blank` は覚えない（#661 661-5、#706 e7bf3478）。
+- [ ] **release の Tauri は `windows_subsystem = "windows"` で標準エラー出力が見えない**。`eprintln!` だけの失敗は release で消える。画面の更新・見張り・復旧の失敗は、プロファイルのログのファイルにも残す（#706 の `report_shell_error`）。
+- [ ] **GUI の画面遷移（`navigate`・窓の URL の切り替え）は、モックや偽の部品で全部通っても実機でしか分からなかった**。画面を変える経路は、実機で「止める・外から状態を変える・戻る」を一巡させる（#661 661-5 は単体テスト全緑・レビュー多数でも、サービス停止で窓が真っ黒だった）。
 
 ## 6. PR とマージの運用
 
