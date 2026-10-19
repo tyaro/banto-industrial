@@ -71,7 +71,75 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::hub_health::{HealthOutcome, HubHealthProbe};
-use crate::service_manager::{describe_service_error, ScmState, ServiceManager};
+use crate::service_manager::{
+    describe_service_error, service_exit_with, PendingWatch, ScmState, ServiceEnd, ServiceManager,
+    ServiceManagerError, ServiceStatusSummary, SwitchTimings, WatchStep, DEFAULT_OVERALL_LIMIT,
+    HUB_EXIT_LEFT_TIGHT, HUB_EXIT_NOT_OPERATIONAL, MAX_STOP_RETRIES,
+};
+// 緩めるだけの開始（`relax-only`）の口は共有 crate の型をそのまま使う（#661 661-4）。
+pub use crate::service_manager::{RealClock, RelaxOnlyOutcome, SwitchClock};
+
+/// 緩めるだけの開始でサービスに渡す引数（サービス側が受ける値）。
+pub const RELAX_ONLY_ARG: &str = "relax-only";
+
+/// 本番の待ち時間（段 15 秒・照会 250ms は `src-tauri` の `HOST_SWITCH_PHASE_TIMEOUT`・
+/// `HOST_SWITCH_POLL_INTERVAL` と同じ。全体 30 分は ChronoGazer と同じ）。checkpoint が進む間は
+/// 段の期限を延ばし、全体の上限で止める（[`HostSwitchEngine`]・[`relax_only_and_wait`]）。
+pub const SWITCH_TIMINGS: SwitchTimings = SwitchTimings {
+    poll: Duration::from_millis(250),
+    phase: Duration::from_secs(15),
+    overall: DEFAULT_OVERALL_LIMIT,
+};
+
+/// サービスが Running を経ずに（または停止の結果として）自分で止まった理由のうち、画面が
+/// 「運用モードにできない」「締めたまま残った」と案内を分けるもの（終了コード 4・5）。
+/// [`HostSwitchState::service_fault`]に載る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceFault {
+    /// 終了コード 4: 運用モードにできなかった。モードは設定モードのまま。
+    CannotOperate,
+    /// 終了コード 5: 締めたまま残った。モードは運用モードのまま（緩めるには `relax-only`）。
+    LeftTight,
+}
+
+impl std::fmt::Display for ServiceFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceFault::CannotOperate => {
+                write!(f, "運用モードにできませんでした（終了コード 4）")
+            }
+            ServiceFault::LeftTight => write!(f, "運用モードのまま残りました（終了コード 5）"),
+        }
+    }
+}
+
+/// 止まったサービスの終了コードを [`ServiceFault`] に読む（純関数。4・5 以外は`None`）。
+pub fn service_fault(summary: &ServiceStatusSummary) -> Option<ServiceFault> {
+    match service_exit_with(summary, HUB_EXIT_NOT_OPERATIONAL, HUB_EXIT_LEFT_TIGHT) {
+        ServiceEnd::CannotOperate => Some(ServiceFault::CannotOperate),
+        ServiceEnd::LeftOperation => Some(ServiceFault::LeftTight),
+        ServiceEnd::Clean | ServiceEnd::Other { .. } => None,
+    }
+}
+
+/// 緩めるだけの開始（`relax-only`）: `start_with_args(["relax-only"])`（Stopped のときだけ。
+/// Operators なら UAC なし）→ `Ok` の**後に**照会を始め、最初の Stopped を完了と見る。結果は
+/// [`RelaxOnlyOutcome::Done`]の終了の理由（`Clean` = 0 緩めた、`LeftOperation` = 5 締めたまま）。
+/// 画面への配線は 661-5。
+pub fn relax_only_and_wait(
+    manager: &impl ServiceManager,
+    clock: &impl SwitchClock,
+    timings: SwitchTimings,
+) -> RelaxOnlyOutcome {
+    banto_service_control::relax_only_and_wait(
+        manager,
+        clock,
+        timings,
+        RELAX_ONLY_ARG,
+        HUB_EXIT_NOT_OPERATIONAL,
+        HUB_EXIT_LEFT_TIGHT,
+    )
+}
 
 /// 定常状態として観測される実行ホスト（desktop-plan §16.3
 /// 「実行ホストは offline/desktop/service の3値」）。
@@ -128,12 +196,21 @@ impl std::fmt::Display for FaultStage {
 /// 切替の進行段階（`Idle`は「進行中でない」を表す - 定常状態そのものは
 /// [`HostSwitchState::current`]が持つ）。
 ///
-/// `DesktopStopping`/`ServiceStopping`は「停止要求を発行した瞬間」を表す -
-/// この実装では要求自体が同期 API（[`DesktopHostControl::request_stop`]/
-/// [`ServiceManager::stop`]）なので、成功時は同じ`step`呼び出し内で即座に
-/// 次段（`AwaitingDesktopRelease`/`AwaitingServiceRelease`）へ進み、外部からは
-/// 定常観測されない。要求自体が失敗した場合にのみ[`FaultStage::DesktopStopping`]/
-/// [`FaultStage::ServiceStopping`]として`Faulted`に残る。
+/// `DesktopStopping`は「停止要求を発行した瞬間」を表す -
+/// この実装では要求自体が同期 API（[`DesktopHostControl::request_stop`]）なので、
+/// 成功時は同じ`step`呼び出し内で即座に次段（`AwaitingDesktopRelease`）へ進み、
+/// 外部からは定常観測されない。要求自体が失敗した場合にのみ
+/// [`FaultStage::DesktopStopping`]として`Faulted`に残る。
+///
+/// `ServiceStopping`は、サービスの STOP が 1061／1052 で断られた間（権限の設定の途中 =
+/// 「切り替え中」。#661 661-4）だけ観測される待ちで、STOP が受け付けられれば同じ`step`内で
+/// `AwaitingServiceRelease`へ進む。
+///
+/// SCM の pending を待つ段（`ServiceStarting`・`ServiceStopping`・`AwaitingServiceRelease`）は、
+/// checkpoint が進む間は期限を延ばし（[`PendingWatch`]）、止まったまま段の待ち時間を過ぎるか
+/// 全体の上限（[`DEFAULT_OVERALL_LIMIT`]）を超えたら失敗にする。`ServiceStarting`で Running を
+/// 経ずに Stopped になったときは終了コードで分け、4 は[`ServiceFault::CannotOperate`]、
+/// 5 は[`ServiceFault::LeftTight`]を[`HostSwitchState::service_fault`]に載せて`Faulted`にする。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitchPhase {
     Idle,
@@ -147,7 +224,8 @@ pub enum SwitchPhase {
     ServiceStarting,
     /// probe Healthy 待ち（[`HubHealthProbe::probe`]をポーリング）。
     AwaitingServiceHealth,
-    /// SCM `stop()`発行中（`DesktopStopping`と同じ理由で通常は観測されない）。
+    /// SCM `stop()`が 1061／1052 で断られ、切り替え中（START_PENDING／STOP_PENDING）が
+    /// 終わるのを待つ。Running に戻ったら STOP を出し直す（[`MAX_STOP_RETRIES`]回まで）。
     ServiceStopping,
     /// `Stopped` + 旧 health 消失待ち。
     AwaitingServiceRelease,
@@ -175,6 +253,9 @@ pub struct HostSwitchState {
     /// `AwaitingServiceRelease`で更新）。fallback UI が「別 profile/version」
     /// 「mutex 所有者不明」等の文言を出す材料（不変条件5、モジュール doc）。
     pub last_health: Option<HealthOutcome>,
+    /// サービスが自分で止まった理由が終了コード 4・5 だったとき（[`ServiceFault`]）。
+    /// 新しい`SwitchTo*`の受け付けで消える。`Faulted`の`reason`にも文言は入る。
+    pub service_fault: Option<ServiceFault>,
 }
 
 /// [`HostSwitchEngine::step`]へ渡すコマンド。
@@ -371,6 +452,15 @@ where
     /// 現在の待ち段階の期限（`Idle`/`Faulted`では`None`）。
     phase_deadline: Option<Instant>,
     state: HostSwitchState,
+    /// 段の待ちの全体の上限（checkpoint が進み続けてもこれで止める。既定 30 分）。
+    overall_limit: Duration,
+    /// SCM の pending を待つ段（`ServiceStarting`・`ServiceStopping`・`AwaitingServiceRelease`）の
+    /// 待ち。checkpoint が進む間は期限を延ばす（[`PendingWatch`]）。
+    watch: Option<PendingWatch>,
+    /// 1061／1052 で断られた STOP を出し直した回数（[`MAX_STOP_RETRIES`]まで）。
+    stop_retries: u32,
+    /// テストが時計を進めるための差（本番は常に 0）。
+    clock_offset: Duration,
 }
 
 impl<M, P, D> HostSwitchEngine<M, P, D>
@@ -393,8 +483,18 @@ where
                 current: config.initial_host,
                 phase: SwitchPhase::Idle,
                 last_health: None,
+                service_fault: None,
             },
+            overall_limit: DEFAULT_OVERALL_LIMIT,
+            watch: None,
+            stop_retries: 0,
+            clock_offset: Duration::ZERO,
         }
+    }
+
+    /// 全体の上限を変える（既定 [`DEFAULT_OVERALL_LIMIT`]）。
+    pub fn set_overall_limit(&mut self, value: Duration) {
+        self.overall_limit = value;
     }
 
     pub fn state(&self) -> &HostSwitchState {
@@ -428,15 +528,51 @@ where
         )
     }
 
+    fn now(&self) -> Instant {
+        Instant::now() + self.clock_offset
+    }
+
     fn enter_phase(&mut self, phase: SwitchPhase) {
-        self.phase_deadline = Some(Instant::now() + self.phase_timeout);
+        let now = self.now();
+        self.phase_deadline = Some(now + self.phase_timeout);
+        let target = match phase {
+            SwitchPhase::ServiceStarting => Some(ScmState::Running),
+            SwitchPhase::ServiceStopping | SwitchPhase::AwaitingServiceRelease => {
+                Some(ScmState::Stopped)
+            }
+            _ => None,
+        };
+        self.watch = target.map(|target| {
+            PendingWatch::new(
+                target,
+                now,
+                SwitchTimings {
+                    poll: Duration::ZERO,
+                    phase: self.phase_timeout,
+                    overall: self.overall_limit,
+                },
+            )
+        });
         self.state.phase = phase;
     }
 
     fn timed_out(&self) -> bool {
         match self.phase_deadline {
-            Some(deadline) => Instant::now() >= deadline,
+            Some(deadline) => self.now() >= deadline,
             None => false,
+        }
+    }
+
+    /// 1 回の観測が`Stalled`／`OverallTimeout`だったときの失敗の文言。
+    fn watch_expiry_reason(&self, step: &WatchStep) -> String {
+        match step {
+            WatchStep::OverallTimeout => {
+                format!("全体の上限 {:?} を超えました", self.overall_limit)
+            }
+            _ => format!(
+                "checkpoint が進まないまま {:?} を過ぎました（サービスが固まった可能性）",
+                self.phase_timeout
+            ),
         }
     }
 
@@ -449,6 +585,7 @@ where
     fn fault(&mut self, stage: FaultStage, reached: HostKind, reason: String) -> StepOutcome {
         self.state.current = reached;
         self.phase_deadline = None;
+        self.watch = None;
         self.state.phase = SwitchPhase::Faulted {
             stage,
             reason: reason.clone(),
@@ -511,6 +648,12 @@ where
         if !self.can_operate_service {
             return Err(SwitchError::PermissionDenied);
         }
+        // LeftTight（締めたまま止まった）は安全が確かめられるまで消さない: start が失敗して
+        // Stopped/5 のままでも、SwitchToDesktop が SCM を照会し直せるように。
+        // 消えるのは Service 完了時と、再要求時の照会で Stopped かつ 0（緩め終えた）と確かめたとき。
+        if self.state.service_fault != Some(ServiceFault::LeftTight) {
+            self.state.service_fault = None;
+        }
         match self.state.current {
             HostKind::Desktop => match self.desktop.request_stop() {
                 Ok(()) => {
@@ -539,18 +682,60 @@ where
                 if !self.can_operate_service {
                     return Err(SwitchError::PermissionDenied);
                 }
-                match self.service_manager.stop() {
-                    Ok(_handle) => {
-                        self.enter_phase(SwitchPhase::AwaitingServiceRelease);
-                        Ok(StepOutcome::Progressed)
-                    }
-                    Err(err) => {
-                        let reason = describe_service_error(&err);
-                        Ok(self.fault(FaultStage::ServiceStopping, HostKind::Service, reason))
+                self.stop_retries = 0;
+                Ok(self.issue_stop())
+            }
+            HostKind::Offline => {
+                // 締めたまま止まった後の再要求: 終了コード 0（relax-only で緩め終えた）を
+                // 見たときだけ Desktop に渡す。5 はもちろん、4・その他の値も「緩んだ」とは
+                // 確かめられないので LeftTight を保つ。照会に失敗したら安全側で失敗。
+                if self.state.service_fault == Some(ServiceFault::LeftTight) {
+                    match self.service_manager.query_status() {
+                        Ok(status) => {
+                            // 止まっていない（動き出している）なら Desktop に渡さない（二重接続）。
+                            if status.state != ScmState::Stopped {
+                                let reason =
+                                    format!("サービスが止まっていません: {:?}", status.state);
+                                return Ok(self.fault(
+                                    FaultStage::AwaitingServiceRelease,
+                                    HostKind::Offline,
+                                    reason,
+                                ));
+                            }
+                            if let Some(out) =
+                                self.left_tight_fault(&status, "再要求時に SCM を確かめ直しました")
+                            {
+                                return Ok(out);
+                            }
+                            let end = service_exit_with(
+                                &status,
+                                HUB_EXIT_NOT_OPERATIONAL,
+                                HUB_EXIT_LEFT_TIGHT,
+                            );
+                            if end != ServiceEnd::Clean {
+                                let reason = format!(
+                                    "再要求時に SCM を確かめ直しました: 締めたまま止まった後、緩め終えた印（終了コード 0）がありません（{end:?}）"
+                                );
+                                return Ok(self.fault(
+                                    FaultStage::AwaitingServiceRelease,
+                                    HostKind::Offline,
+                                    reason,
+                                ));
+                            }
+                            self.state.service_fault = None;
+                        }
+                        Err(err) => {
+                            let reason = format!("再要求時の SCM 照会に失敗しました: {err}");
+                            return Ok(self.fault(
+                                FaultStage::AwaitingServiceRelease,
+                                HostKind::Offline,
+                                reason,
+                            ));
+                        }
                     }
                 }
+                Ok(self.attempt_desktop_start())
             }
-            HostKind::Offline => Ok(self.attempt_desktop_start()),
             HostKind::Desktop => unreachable!("already handled above"),
         }
     }
@@ -568,7 +753,8 @@ where
             // 要求発行自体は同期 API なので `step` 内で即座に次段へ進み、
             // `Poll` 単独でここへ来ることは実運用上は起きない
             // （モジュール doc「DesktopStopping/ServiceStopping」節）。
-            SwitchPhase::DesktopStopping | SwitchPhase::ServiceStopping => StepOutcome::Waiting,
+            SwitchPhase::DesktopStopping => StepOutcome::Waiting,
+            SwitchPhase::ServiceStopping => self.poll_service_stopping(),
             SwitchPhase::AwaitingDesktopRelease => self.poll_awaiting_desktop_release(),
             SwitchPhase::ServiceStarting => self.poll_service_starting(),
             SwitchPhase::AwaitingServiceHealth => self.poll_awaiting_service_health(),
@@ -610,26 +796,44 @@ where
         StepOutcome::Waiting
     }
 
+    /// START_PENDING の間は checkpoint が進む限り待つ（[`PendingWatch`]）。Running を経ずに
+    /// Stopped になったら終了コードで分ける（4 = 運用モードにできない、5 = 締めたまま残った。
+    /// どちらでもなければ従来どおり予期しない状態）。
     fn poll_service_starting(&mut self) -> StepOutcome {
-        match self.service_manager.query_status() {
-            Ok(status) if status.state == ScmState::Running => {
+        let status = match self.service_manager.query_status() {
+            Ok(status) => status,
+            Err(err) => {
+                let reason = describe_service_error(&err);
+                return self.fault_for_current_phase(reason);
+            }
+        };
+        let now = self.now();
+        let Some(watch) = self.watch.as_mut() else {
+            return StepOutcome::Waiting;
+        };
+        match watch.observe(now, status) {
+            WatchStep::Reached(_) => {
                 self.enter_phase(SwitchPhase::AwaitingServiceHealth);
                 StepOutcome::Progressed
             }
-            Ok(status) if status.state == ScmState::StartPending => {
-                if self.timed_out() {
-                    let reason = self.timeout_reason();
-                    self.fault_for_current_phase(reason)
-                } else {
-                    StepOutcome::Waiting
+            WatchStep::Wait => StepOutcome::Waiting,
+            WatchStep::Unexpected(status) => {
+                if status.state == ScmState::Stopped {
+                    if let Some(kind) = service_fault(&status) {
+                        let reason = format!("サービスは Running にならずに止まりました: {kind}");
+                        // LeftTight を持っている間は軽い印（4）で上書きしない: 締まったまま
+                        // 断った再開が 4 を返しても、緩んだとは確かめられていない。
+                        if self.state.service_fault != Some(ServiceFault::LeftTight) {
+                            self.state.service_fault = Some(kind);
+                        }
+                        return self.fault_for_current_phase(reason);
+                    }
                 }
-            }
-            Ok(status) => {
                 let reason = format!("予期しない SCM 状態です: {}", status.state);
                 self.fault_for_current_phase(reason)
             }
-            Err(err) => {
-                let reason = describe_service_error(&err);
+            step @ (WatchStep::Stalled | WatchStep::OverallTimeout) => {
+                let reason = self.watch_expiry_reason(&step);
                 self.fault_for_current_phase(reason)
             }
         }
@@ -647,6 +851,8 @@ where
             self.state.current = HostKind::Service;
             self.state.phase = SwitchPhase::Idle;
             self.phase_deadline = None;
+            // 運用モードに入れたと確かめられたので、締めたまま止まった印を消す。
+            self.state.service_fault = None;
             return StepOutcome::Completed(HostKind::Service);
         }
         if self.timed_out() {
@@ -662,19 +868,8 @@ where
     /// 不変条件2: SCM `Stopped` **かつ** probe が`Unreachable`（旧 health
     /// 消失、mutex 解放の代替確認）を確認するまで Desktop 起動許可へ進まない。
     fn poll_awaiting_service_release(&mut self) -> StepOutcome {
-        let status = match self.service_manager.query_status() {
-            Ok(status) => status,
-            Err(err) => {
-                let reason = describe_service_error(&err);
-                return self.fault_for_current_phase(reason);
-            }
-        };
-        if status.state != ScmState::Stopped {
-            if self.timed_out() {
-                let reason = self.timeout_reason();
-                return self.fault_for_current_phase(reason);
-            }
-            return StepOutcome::Waiting;
+        if let Some(step) = self.poll_service_released() {
+            return step;
         }
 
         let health = self.probe.probe(&self.expected_profile, self.expected_port);
@@ -692,6 +887,161 @@ where
             return self.fault_for_current_phase(reason);
         }
         StepOutcome::Waiting
+    }
+
+    /// STOP を発行する。受け付けられたら`AwaitingServiceRelease`、1061／1052 で断られたら
+    /// [`Self::stop_refused`]。
+    fn issue_stop(&mut self) -> StepOutcome {
+        match self.service_manager.stop() {
+            Ok(_handle) => {
+                self.enter_phase(SwitchPhase::AwaitingServiceRelease);
+                StepOutcome::Progressed
+            }
+            Err(
+                err @ (ServiceManagerError::CannotAcceptControl
+                | ServiceManagerError::InvalidControl),
+            ) => self.stop_refused(err),
+            Err(err) => {
+                let reason = describe_service_error(&err);
+                self.fault(FaultStage::ServiceStopping, HostKind::Service, reason)
+            }
+        }
+    }
+
+    /// STOP が 1061（`CannotAcceptControl`）か 1052（`InvalidControl`）で断られた。権限の設定の
+    /// 途中（START_PENDING／STOP_PENDING）は失敗にせず「切り替え中」として`ServiceStopping`で
+    /// 待つ。1052 は照会し直した状態で分ける: 切り替え中・Running（起動が終わった競合）は待って
+    /// 出し直し（[`MAX_STOP_RETRIES`]回まで）、Stopped は結果を取りに`AwaitingServiceRelease`へ。
+    fn stop_refused(&mut self, err: ServiceManagerError) -> StepOutcome {
+        if matches!(err, ServiceManagerError::InvalidControl) {
+            match self.service_manager.query_status() {
+                Ok(status) => match status.state {
+                    ScmState::Stopped => {
+                        self.enter_phase(SwitchPhase::AwaitingServiceRelease);
+                        return StepOutcome::Progressed;
+                    }
+                    ScmState::StartPending | ScmState::StopPending | ScmState::Running => {}
+                    _ => {
+                        let reason = describe_service_error(&err);
+                        return self.fault(FaultStage::ServiceStopping, HostKind::Service, reason);
+                    }
+                },
+                Err(_) => {
+                    let reason = describe_service_error(&err);
+                    return self.fault(FaultStage::ServiceStopping, HostKind::Service, reason);
+                }
+            }
+        }
+        if self.stop_retries >= MAX_STOP_RETRIES {
+            let reason = describe_service_error(&err);
+            return self.fault(FaultStage::ServiceStopping, HostKind::Service, reason);
+        }
+        self.stop_retries += 1;
+        self.enter_phase(SwitchPhase::ServiceStopping);
+        StepOutcome::Progressed
+    }
+
+    /// `ServiceStopping`（STOP を断られて切り替え中を待っている）。Stopped になれば結果を取りに
+    /// `AwaitingServiceRelease`へ、Running に戻ったら STOP を出し直す、pending の間は
+    /// checkpoint が進む限り待つ。
+    fn poll_service_stopping(&mut self) -> StepOutcome {
+        let status = match self.service_manager.query_status() {
+            Ok(status) => status,
+            Err(err) => {
+                let reason = describe_service_error(&err);
+                return self.fault_for_current_phase(reason);
+            }
+        };
+        let now = self.now();
+        let Some(watch) = self.watch.as_mut() else {
+            return StepOutcome::Waiting;
+        };
+        match watch.observe(now, status) {
+            WatchStep::Reached(_) => {
+                self.enter_phase(SwitchPhase::AwaitingServiceRelease);
+                StepOutcome::Progressed
+            }
+            WatchStep::Wait => StepOutcome::Waiting,
+            WatchStep::Unexpected(status) if status.state == ScmState::Running => self.issue_stop(),
+            WatchStep::Unexpected(status) => {
+                let reason = format!("予期しない SCM 状態です: {}", status.state);
+                self.fault_for_current_phase(reason)
+            }
+            step @ (WatchStep::Stalled | WatchStep::OverallTimeout) => {
+                let reason = self.watch_expiry_reason(&step);
+                self.fault_for_current_phase(reason)
+            }
+        }
+    }
+
+    /// `AwaitingServiceRelease`の前半: SCM が`Stopped`になるまで、STOP_PENDING の間は
+    /// checkpoint が進む限り待つ。`Stopped`が確認できたら`None`（probe の確認へ進む。以後の
+    /// 期限は段の待ち時間で数え直す）。終了コード 5（締めたまま残った）は、デスクトップに
+    /// 渡せない（プロファイルが読み取りだけのまま）ので`Offline`で失敗にする。
+    fn poll_service_released(&mut self) -> Option<StepOutcome> {
+        let status = match self.service_manager.query_status() {
+            Ok(status) => status,
+            Err(err) => {
+                let reason = describe_service_error(&err);
+                return Some(self.fault_for_current_phase(reason));
+            }
+        };
+        let Some(mut watch) = self.watch.take() else {
+            // Stopped は一度確認済み（probe の消失待ちの間）。それでも毎回 SCM を照会し、
+            // 回復動作などで動き出していたら Unreachable を受け入れずに待つ。
+            if status.state == ScmState::Stopped {
+                // 動き出してから終了コード 5 で止まり直したら、締めたまま残っている。
+                return self.left_tight_fault(&status, "サービスは止まり直しましたが");
+            }
+            if self.timed_out() {
+                let reason = self.timeout_reason();
+                return Some(self.fault_for_current_phase(reason));
+            }
+            return Some(StepOutcome::Waiting);
+        };
+        let now = self.now();
+        match watch.observe(now, status) {
+            WatchStep::Reached(status) => {
+                self.phase_deadline = Some(now + self.phase_timeout);
+                self.left_tight_fault(&status, "サービスは止まりましたが")
+            }
+            WatchStep::Wait => {
+                self.watch = Some(watch);
+                Some(StepOutcome::Waiting)
+            }
+            // Running など（STOP を受け付けたのに戻った）は、従来どおり段の期限まで待つ。
+            WatchStep::Unexpected(_) => {
+                self.watch = Some(watch);
+                if self.timed_out() {
+                    let reason = self.timeout_reason();
+                    return Some(self.fault_for_current_phase(reason));
+                }
+                Some(StepOutcome::Waiting)
+            }
+            step @ (WatchStep::Stalled | WatchStep::OverallTimeout) => {
+                let reason = self.watch_expiry_reason(&step);
+                Some(self.fault_for_current_phase(reason))
+            }
+        }
+    }
+
+    /// 止まったサービスの終了コードが 5（締めたまま残った）なら、`service_fault`を載せて
+    /// `Offline`で失敗にする。そうでなければ`None`（先へ進んでよい）。
+    fn left_tight_fault(
+        &mut self,
+        status: &ServiceStatusSummary,
+        prefix: &str,
+    ) -> Option<StepOutcome> {
+        let kind @ ServiceFault::LeftTight = service_fault(status)? else {
+            return None;
+        };
+        let reason = format!("{prefix}: {kind}");
+        self.state.service_fault = Some(kind);
+        Some(self.fault(
+            FaultStage::AwaitingServiceRelease,
+            HostKind::Offline,
+            reason,
+        ))
     }
 
     /// Desktop の起動を即座に許可できるか確認する - 許可されれば
@@ -849,6 +1199,41 @@ mod tests {
         );
         assert_eq!(engine.state().current, HostKind::Desktop);
         assert_eq!(engine.state().phase, SwitchPhase::Idle);
+    }
+
+    // #699 レビュー: 一度 Stopped を観測した後も毎回 SCM を照会する。回復動作などで
+    // サービスが動き出したときの一時的な Unreachable では Desktop へ進まない。
+    #[test]
+    fn service_release_requires_stopped_on_every_poll_after_first_stopped() {
+        let mut engine = engine_with(HostKind::Service, true, Duration::from_secs(5));
+        engine.probe.set_outcome(HealthOutcome::Healthy {
+            version: "1.2.3".to_string(),
+        });
+        engine.step(SwitchCommand::SwitchToDesktop).expect("ok");
+        assert_eq!(engine.state().phase, SwitchPhase::AwaitingServiceRelease);
+
+        // 最初の Stopped を観測（旧 health はまだ応答中）。
+        assert_eq!(
+            engine.step(SwitchCommand::Poll).expect("poll ok"),
+            StepOutcome::Waiting
+        );
+
+        // 回復動作でサービスが再び動き出し、起動途中で probe が Unreachable。
+        engine.service_manager.start().expect("restart");
+        engine.probe.set_outcome(HealthOutcome::Unreachable);
+        assert_eq!(
+            engine.step(SwitchCommand::Poll).expect("poll ok"),
+            StepOutcome::Waiting
+        );
+        assert_eq!(engine.state().current, HostKind::Service);
+        assert_eq!(engine.state().phase, SwitchPhase::AwaitingServiceRelease);
+
+        // 再び Stopped かつ Unreachable になれば進む。
+        engine.service_manager.stop().expect("stop again");
+        assert_eq!(
+            engine.step(SwitchCommand::Poll).expect("poll ok"),
+            StepOutcome::Completed(HostKind::Desktop)
+        );
     }
 
     // 不変条件3: 失敗時に「もう一方を起動したまま戻る」ことがない -
@@ -1147,3 +1532,6 @@ mod tests {
         assert_eq!(engine.state().current, HostKind::Desktop);
     }
 }
+
+#[cfg(test)]
+mod pending_tests;

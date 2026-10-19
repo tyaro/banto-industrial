@@ -51,7 +51,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use banto_service_control::{
-    pending_progress, ScmState, ServiceManager, ServiceManagerError, ServiceStatusSummary,
+    relax_only_and_wait as shared_relax_only_and_wait, service_exit_with, wait_for_state, ScmState,
+    ServiceManager, ServiceManagerError, ServiceStatusSummary, Waited,
+};
+// 待ち方の部品は banto-service-control に移した（#661 661-4。banto-hub と共有）。呼び元の
+// 参照（`chronogazer_core::mode_switch::...`）は変えない。
+pub use banto_service_control::{
+    PendingWatch, RealClock, SwitchClock, SwitchTimings, WatchStep, MAX_STOP_RETRIES,
 };
 use banto_tstore::Clock;
 
@@ -60,47 +66,17 @@ use crate::server_host::{
 };
 use crate::server_service::RELAX_ONLY_ARG;
 
-/// `dwWin32ExitCode` がサービス固有の終了コードを指す印（`ERROR_SERVICE_SPECIFIC_ERROR`）。
-const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
-
-/// 1061／1052 で断られた STOP を出し直す回数の上限（その間は Running になるのを待つ）。
-pub const MAX_STOP_RETRIES: u32 = 3;
-
 // ---------------------------------------------------------------------------
 // 終了コード
 // ---------------------------------------------------------------------------
 
-/// 止まったサービスの終了の理由（照会の `win32_exit_code`・`service_specific_exit_code`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceExit {
-    /// 正常に止まった（`relax-only` なら緩め終わった）。
-    Clean,
-    /// 4: 運用モードにできなかった（リンク・ハードリンクなど。何も変えずに断った・締めかけて
-    /// 緩め直した。理由はサービスの日次ログ）。モードは設定モードのまま。
-    CannotOperate,
-    /// 5: 締めたまま止まった（緩められなかった・フォルダが外から変えられた）。モードは
-    /// 運用モードのまま。
-    LeftOperation,
-    /// それ以外（OS のエラー・ほかのサービス固有の値）。
-    Other { win32: u32, specific: u32 },
-}
+// 共有 crate では `ServiceEnd`（runner の `ServiceExit` と別物）。ここでは従来の名前で使う。
+pub use banto_service_control::ServiceEnd as ServiceExit;
 
-/// 照会の結果から終了の理由を読む（純関数）。Stopped でない照会に使っても値は読むが、
-/// 意味を持つのは Stopped のときだけ。
+/// 照会の結果から終了の理由を読む（純関数。4 = 運用モードにできなかった、5 = 締めたまま残った）。
+/// Stopped でない照会に使っても値は読むが、意味を持つのは Stopped のときだけ。
 pub fn service_exit(summary: &ServiceStatusSummary) -> ServiceExit {
-    match summary.win32_exit_code {
-        0 => ServiceExit::Clean,
-        ERROR_SERVICE_SPECIFIC_ERROR => match summary.service_specific_exit_code {
-            0 => ServiceExit::Clean,
-            code if code == EXIT_NOT_OPERATIONAL as u32 => ServiceExit::CannotOperate,
-            code if code == EXIT_LEFT_TIGHT as u32 => ServiceExit::LeftOperation,
-            specific => ServiceExit::Other {
-                win32: ERROR_SERVICE_SPECIFIC_ERROR,
-                specific,
-            },
-        },
-        win32 => ServiceExit::Other { win32, specific: 0 },
-    }
+    service_exit_with(summary, EXIT_NOT_OPERATIONAL as u32, EXIT_LEFT_TIGHT as u32)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,17 +127,6 @@ impl SwitchStage {
 // 待ち方
 // ---------------------------------------------------------------------------
 
-/// 待ちの時間。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SwitchTimings {
-    /// 照会の間隔。
-    pub poll: Duration,
-    /// 段の待ち時間（checkpoint が止まってからこれと wait hint の大きい方を過ぎたら失敗）。
-    pub phase: Duration,
-    /// 全体の上限（checkpoint が進み続けても、これを超えたら失敗）。
-    pub overall: Duration,
-}
-
 /// 本番の待ち時間（段 15 秒は banto-hub の `HOST_SWITCH_PHASE_TIMEOUT` と同じ。全体 30 分は
 /// PR-1 設計書 §3.6 の案）。
 pub const DEFAULT_TIMINGS: SwitchTimings = SwitchTimings {
@@ -169,107 +134,6 @@ pub const DEFAULT_TIMINGS: SwitchTimings = SwitchTimings {
     phase: Duration::from_secs(15),
     overall: Duration::from_secs(30 * 60),
 };
-
-/// 1 回の観測の結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WatchStep {
-    /// まだ待つ。
-    Wait,
-    /// 目標の状態になった。
-    Reached(ServiceStatusSummary),
-    /// 目標でも途中（pending）でもない状態になった（Running を待つ間に止まった、など）。
-    Unexpected(ServiceStatusSummary),
-    /// checkpoint が止まったまま段の期限を過ぎた（サービスが固まった）。
-    Stalled,
-    /// 全体の上限を超えた。
-    OverallTimeout,
-}
-
-/// checkpoint が進む間は期限を延ばす待ち（モジュール doc「待ち方」）。純粋な状態機械で、
-/// 時刻は呼び出し側が渡す。
-#[derive(Debug, Clone)]
-pub struct PendingWatch {
-    target: ScmState,
-    started: Instant,
-    deadline: Instant,
-    timings: SwitchTimings,
-    previous: Option<ServiceStatusSummary>,
-}
-
-impl PendingWatch {
-    /// `target`（Running か Stopped）まで待ち始める。
-    pub fn new(target: ScmState, now: Instant, timings: SwitchTimings) -> Self {
-        Self {
-            target,
-            started: now,
-            deadline: now + timings.phase,
-            timings,
-            previous: None,
-        }
-    }
-
-    /// 照会の結果を 1 つ渡す。
-    pub fn observe(&mut self, now: Instant, summary: ServiceStatusSummary) -> WatchStep {
-        if summary.state == self.target {
-            return WatchStep::Reached(summary);
-        }
-        if !matches!(
-            summary.state,
-            ScmState::StartPending | ScmState::StopPending
-        ) {
-            return WatchStep::Unexpected(summary);
-        }
-        if pending_progress(self.previous.as_ref(), &summary) {
-            self.deadline = now + self.timings.phase.max(summary.wait_hint);
-        }
-        self.previous = Some(summary);
-        self.expired(now)
-    }
-
-    /// 照会に失敗したとき（進んでいない扱い。期限だけ確かめる）。
-    pub fn observe_failure(&mut self, now: Instant) -> WatchStep {
-        self.expired(now)
-    }
-
-    fn expired(&self, now: Instant) -> WatchStep {
-        if now.saturating_duration_since(self.started) >= self.timings.overall {
-            WatchStep::OverallTimeout
-        } else if now > self.deadline {
-            WatchStep::Stalled
-        } else {
-            WatchStep::Wait
-        }
-    }
-}
-
-/// 時刻と眠り（本番は [`RealClock`]、テストは眠ると進む偽の時計）。
-pub trait SwitchClock {
-    fn now(&self) -> Instant;
-    fn sleep(&self, duration: Duration);
-}
-
-/// 本物の時計。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RealClock;
-
-impl SwitchClock for RealClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
-}
-
-/// 待った結果（目標の手前で終わった理由を含む）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Waited {
-    Reached(ServiceStatusSummary),
-    Unexpected(ServiceStatusSummary),
-    Stalled,
-    TimedOut,
-}
 
 /// `target` まで照会を繰り返す。段階は pending の種類で知らせる。
 fn wait_for(
@@ -280,29 +144,15 @@ fn wait_for(
     progress: &mut dyn FnMut(SwitchStage),
     pending_stage: impl Fn(&ScmState) -> Option<SwitchStage>,
 ) -> Waited {
-    let mut watch = PendingWatch::new(target, clock.now(), timings);
     let mut shown: Option<SwitchStage> = None;
-    loop {
-        let step = match manager.query_status() {
-            Ok(summary) => {
-                if let Some(stage) = pending_stage(&summary.state) {
-                    if shown != Some(stage) {
-                        shown = Some(stage);
-                        progress(stage);
-                    }
-                }
-                watch.observe(clock.now(), summary)
+    wait_for_state(manager, clock, timings, target, &mut |state| {
+        if let Some(stage) = pending_stage(state) {
+            if shown != Some(stage) {
+                shown = Some(stage);
+                progress(stage);
             }
-            Err(_) => watch.observe_failure(clock.now()),
-        };
-        match step {
-            WatchStep::Wait => clock.sleep(timings.poll),
-            WatchStep::Reached(summary) => return Waited::Reached(summary),
-            WatchStep::Unexpected(summary) => return Waited::Unexpected(summary),
-            WatchStep::Stalled => return Waited::Stalled,
-            WatchStep::OverallTimeout => return Waited::TimedOut,
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -454,27 +304,10 @@ pub fn stop_service_and_wait(
     }
 }
 
-/// 緩めるだけの開始（`relax-only`）の結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelaxOnlyOutcome {
-    /// 止まった（終了の理由つき。`Clean` なら緩め終わった、`LeftOperation` なら緩められない）。
-    Done(ServiceExit),
-    /// サービスが停止中ではなかった（要求は出していない。値は今の状態）。
-    NotStopped(ScmState),
-    /// サービスが登録されていない（elev の修復だけが使える）。
-    NotInstalled,
-    /// 開始を頼めなかった（権限が無い・その他）。
-    Refused(String),
-    /// 途中で別の状態になった（Running になった・未登録など）。
-    Unexpected(ScmState),
-    /// checkpoint が止まったまま期限を過ぎた。
-    Stalled,
-    /// 全体の上限を超えた。
-    TimedOut,
-}
+pub use banto_service_control::RelaxOnlyOutcome;
 
 /// 緩めるだけの開始: `start_with_args(["relax-only"])` → `Ok` の**後に**照会を始め、最初の
-/// Stopped を完了と見る（モジュール doc「3 つの道」）。
+/// Stopped を完了と見る（モジュール doc「3 つの道」。実体は banto-service-control）。
 pub fn relax_only_and_wait(
     manager: &impl ServiceManager,
     clock: &impl SwitchClock,
@@ -482,25 +315,14 @@ pub fn relax_only_and_wait(
     progress: &mut dyn FnMut(SwitchStage),
 ) -> RelaxOnlyOutcome {
     progress(SwitchStage::RelaxingPermissions);
-    match manager.start_with_args(&[std::ffi::OsString::from(RELAX_ONLY_ARG)]) {
-        Ok(_) => {}
-        Err(ServiceManagerError::InvalidState(state)) => {
-            return RelaxOnlyOutcome::NotStopped(state);
-        }
-        Err(ServiceManagerError::AlreadyRunning) => {
-            return RelaxOnlyOutcome::NotStopped(ScmState::Running);
-        }
-        Err(ServiceManagerError::NotFound(_)) => return RelaxOnlyOutcome::NotInstalled,
-        Err(err) => return RelaxOnlyOutcome::Refused(err.to_string()),
-    }
-    match wait_for(manager, clock, timings, ScmState::Stopped, progress, |_| {
-        None
-    }) {
-        Waited::Reached(summary) => RelaxOnlyOutcome::Done(service_exit(&summary)),
-        Waited::Unexpected(summary) => RelaxOnlyOutcome::Unexpected(summary.state),
-        Waited::Stalled => RelaxOnlyOutcome::Stalled,
-        Waited::TimedOut => RelaxOnlyOutcome::TimedOut,
-    }
+    shared_relax_only_and_wait(
+        manager,
+        clock,
+        timings,
+        RELAX_ONLY_ARG,
+        EXIT_NOT_OPERATIONAL as u32,
+        EXIT_LEFT_TIGHT as u32,
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -734,6 +734,29 @@ fn a_tight_profile_resumes_with_the_record_without_rewriting_it() {
     assert_eq!(*fx.stored.lock().unwrap(), Some(vec![other.to_string()]));
 }
 
+/// 締まった形 + 有効な記録から再開して 1 周目が断ったら、何も変えずに 5（#699 レビュー
+/// P2）。4（緩んだまま）と返すと、呼び出し側が締まったままの profile で Desktop を許す。
+#[test]
+fn a_scan_refusal_while_resuming_tight_stops_with_5_without_changes() {
+    let fx = Fixture::new("resume-scan", tight(), Some(&[USER]));
+    *fx.acl.scan.lock().unwrap() = Some(ScanRefusal::Problems(vec![TreeProblem::MovedOut {
+        path: PathBuf::from("a"),
+        now: PathBuf::from("b"),
+    }]));
+    let running = spawn(fx.program());
+    let seen = running.seen.clone();
+    assert_eq!(running.join(), Some(ServiceExit::Specific(5)));
+    assert!(!has_phase(&seen, ServicePhase::Running));
+    let lines = fx.lines();
+    assert!(has(&lines, "締められない物が 1 件"), "{lines:#?}");
+    assert!(has(&lines, "締まったまま"), "{lines:#?}");
+    assert!(!has(&lines, "設定モードのまま"), "{lines:#?}");
+    for absent in ["owners:write", "acl:close", "acl:relax"] {
+        assert!(!has(&lines, absent), "{absent}: {lines:#?}");
+    }
+    assert_eq!(*fx.stored.lock().unwrap(), Some(vec![USER.to_string()]));
+}
+
 /// 締まっているのに記録が無いなら、何も変えずに 5（修復を案内する）。
 #[test]
 fn a_tight_profile_without_a_record_stops_with_5() {

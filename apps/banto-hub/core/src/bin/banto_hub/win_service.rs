@@ -947,7 +947,9 @@ impl HubProgram {
             _ => {}
         }
 
-        // 8. 1 周目（読むだけ。断ったら何も変えずに 4）。
+        // 8. 1 周目（読むだけ。断ったら何も変えずに 4。締まった形から再開していたなら、
+        // 何も変えていなくても締まったままなので 5）。
+        let from_tight = matches!(plan, OwnersPlan::FromRecord(_));
         let stop = || tree_stop(ctx);
         let progress = Throttle::new(ctx);
         let scanned = self.on_walk_thread("banto-hub-scan", || {
@@ -959,20 +961,26 @@ impl HubProgram {
                 report.examined
             )),
             Err(refusal) => {
+                let code = exit_after_scan_refusal(&refusal, from_tight);
+                let state = if from_tight {
+                    "何も変えていません。profile は締まったまま＝運用モードの形のままです"
+                } else {
+                    "何も変えていません"
+                };
                 match &refusal {
                     ScanRefusal::Problems(problems) => {
-                        for line in scan_refused_lines(problems) {
+                        for line in scan_refused_lines(problems, from_tight) {
                             self.say(&line);
                         }
                     }
                     ScanRefusal::Io(error) => self.say(&format!(
-                        "{LABEL}: profile を確かめられませんでした（終了コード {HUB_EXIT_START_FAILED}。何も変えていません）: {error}"
+                        "{LABEL}: profile を確かめられませんでした（終了コード {code}。{state}）: {error}"
                     )),
                     ScanRefusal::Stopped(signal) => self.say(&format!(
-                        "{LABEL}: 確かめている途中で止める合図（{signal:?}）を受けたため、何も変えずに起動を中止します"
+                        "{LABEL}: 確かめている途中で止める合図（{signal:?}）を受けたため、起動を中止します（終了コード {code}。{state}）"
                     )),
                 }
-                return self.finish_without_relax(exit_after_scan_refusal(&refusal));
+                return self.finish_without_relax(code);
             }
         }
 

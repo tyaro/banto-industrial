@@ -66,6 +66,7 @@ mod install;
 mod parameters;
 mod runner;
 mod shutdown;
+mod switch_wait;
 pub use install::*;
 // 公開しているのは Windows だけの関数（非 Windows では空の再公開になり、
 // `unused_imports` で clippy が落ちる）。
@@ -73,6 +74,7 @@ pub use install::*;
 pub use parameters::*;
 pub use runner::*;
 pub use shutdown::*;
+pub use switch_wait::*;
 
 /// SCM 上のサービス状態（desktop-plan §9.9 のフォールバック UI が判定する
 /// 「サービス: 停止/実行中」「STOP_PENDING」等はこの enum の値そのもの -
