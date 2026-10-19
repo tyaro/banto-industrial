@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-10-18（§2-3 に「共有 crate の公開 API の形を変えたら `cargo check --workspace --all-targets` で呼び出し側まで確かめる」を追加。#677 で `banto-hub-sink` の呼び出し側を見落として Windows CI がコンパイルエラーで落ちた）2026-10-17（§5 の「OPC UA 設定の有効化 PUT は初回起動に時間がかかる」を #634 に合わせて書き換えた。PUT は保存して起動を始めたらすぐ返り、起動の完了は `GET /api/opcua-status` で待つ。PUT の上限は他と同じ 10 秒に戻した）2026-10-16（§5 に「外から来た名前をパスに join する前に、Windows で別の場所を指しうるもの（`:`・予約名・末尾の `.` と空白）を断る」を追加。#626 の調査で、profile-id の `C:` が `Path::join` でドライブ相対のパスになり、昇格した `grant-profile-acl` が C: の今のフォルダを書き換えうる穴を見つけた）2026-10-16（§2 に「CI は cargo nextest で走る。プロセス内の直列化は効かないので、同時に走るとぶつかるテストは `.config/nextest.toml` の test-groups へ」を追加。CI の rust ジョブを cargo-nextest に替えたことに伴う）
+最終更新: 2026-10-19（§2-2 の nextest の項を更新: #ci-speed で CI のテストを rust ジョブから rust-test ジョブ（3 台のシャード）へ分けた。doctest は rust ジョブに残る）。2026-10-18（§2-3 に「共有 crate の公開 API の形を変えたら `cargo check --workspace --all-targets` で呼び出し側まで確かめる」を追加。#677 で `banto-hub-sink` の呼び出し側を見落として Windows CI がコンパイルエラーで落ちた）2026-10-17（§5 の「OPC UA 設定の有効化 PUT は初回起動に時間がかかる」を #634 に合わせて書き換えた。PUT は保存して起動を始めたらすぐ返り、起動の完了は `GET /api/opcua-status` で待つ。PUT の上限は他と同じ 10 秒に戻した）2026-10-16（§5 に「外から来た名前をパスに join する前に、Windows で別の場所を指しうるもの（`:`・予約名・末尾の `.` と空白）を断る」を追加。#626 の調査で、profile-id の `C:` が `Path::join` でドライブ相対のパスになり、昇格した `grant-profile-acl` が C: の今のフォルダを書き換えうる穴を見つけた）2026-10-16（§2 に「CI は cargo nextest で走る。プロセス内の直列化は効かないので、同時に走るとぶつかるテストは `.config/nextest.toml` の test-groups へ」を追加。CI の rust ジョブを cargo-nextest に替えたことに伴う）
 2026-10-16（§2 に「新規ディレクトリ・ファイルを追加したら git add 後に ci-changes 分類テストを実行する」を追加。#632 で新設 interop/ の分類登録を忘れて changes と ci-gate が失敗した。網羅テストは git ls-files を見るため、追加ファイルをステージした後に実行する）
 2026-10-16（§5 に「OPC UA 設定の有効化 PUT は起動完了を待つため長めの上限を明示する」を追加。PR #627 の Windows CI で初回起動が 10 秒を超え、起動経路には一時 RSA 鍵生成も含まれる）
 2026-10-16（§2 に「Cargo の生成物は cargo/rustc/linker が動いていないことを確認してから掃除する」を追加。#201 の検証中、リンク中に `target/debug/examples` を消して欠けた object によりテストが失敗した）
@@ -56,7 +56,7 @@
 
 1. [ ] **`cargo fmt --all --check`** — **一番忘れる。#385 はこれだけで CI が落ちた。**
 2. [ ] `cargo test -p <触ったクレート>`
-   - [ ] **CI の rust ジョブはテストを `cargo nextest run`（テスト 1 件 = 1 プロセスで並列）で走らせる**（2026-10-16、doctest だけ `cargo test --doc`）。ローカルでも `cargo nextest run` が使える。**`static LOCK: Mutex` の「同じプロセス内の直列化」はプロセスが別になるので効かない**。プロセスをまたいで共有するもの（名前付き mutex・固定ポート・固定パス）を使うテストを足したら、`.config/nextest.toml` の test-groups に入れる（洗い出した範囲と理由もそこ）。
+   - [ ] **CI の rust-test ジョブはテストを `cargo nextest run`（テスト 1 件 = 1 プロセスで並列。3 台のシャードに分けて実行）で走らせる**（2026-10-16、#ci-speed で 2026-10-19 に rust ジョブから分離。doctest だけ rust ジョブの `cargo test --doc`）。ローカルでも `cargo nextest run` が使える。**`static LOCK: Mutex` の「同じプロセス内の直列化」はプロセスが別になるので効かない**。プロセスをまたいで共有するもの（名前付き mutex・固定ポート・固定パス）を使うテストを足したら、`.config/nextest.toml` の test-groups に入れる（洗い出した範囲と理由もそこ）。
    - [ ] **容量を空けるための `target` 掃除は cargo/rustc/linker が動いていないことを確かめてから行う**。#201 の検証中、別リポジトリと共有した target の `debug/examples` をリンク中に削除し、必要な object がなくなってテストのリンクが失敗した（2026-10-16）。
 3. [ ] `cargo clippy -p <触ったクレート> --all-targets -- -D warnings`
    - [ ] **共有 crate の公開 API の形（引数の型・`&self`→`&mut self`・戻り値・可視性）を変えたら、`cargo check --workspace --all-targets` で呼び出し側まで確かめる**（2026-10-18、#677）。`-p <触ったクレート>` に絞った検証は呼び出し側を見ない。`PinnedFile::read_to_end` を `&mut self` にしたとき、実装担当が「本番の呼び出し側は無い」と報告し、監査も通ったが、`banto-hub-sink` の設定の読み込みが使っていて Windows CI がコンパイルエラーで落ちた。呼び出し側の有無は報告を信じず grep と全体の check で確かめる。
