@@ -1,7 +1,7 @@
 # banto-hub T17 詳細設計（SCM 管理・profile・UAC・インストーラ再設計）
 
 作成日: 2026-08-10
-状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。2026-10-18: §1 の末尾に「設定モード ⇔ 運用モード」のオーナー決定（#623・#661。T17-3 の切り替えのときにサービス自身が ACL を付け替える）を記録。2026-10-19: 同じ所に #661 の当てはめ（締める範囲・戻す相手の記録・STOP の順序・PR の分け方）のオーナー決定を記録。同日: 661-2（サービスの締める・緩める本体）を実装し、§1 の末尾に「#661 661-2 実装メモ」を足した（実機確認は未）。#697 のレビューで運用中の見張り（`SecurityWatch`・`recheck`）を足した。
+状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。2026-10-18: §1 の末尾に「設定モード ⇔ 運用モード」のオーナー決定（#623・#661。T17-3 の切り替えのときにサービス自身が ACL を付け替える）を記録。2026-10-19: 同じ所に #661 の当てはめ（締める範囲・戻す相手の記録・STOP の順序・PR の分け方）のオーナー決定を記録。同日: 661-2（サービスの締める・緩める本体）を実装し、§1 の末尾に「#661 661-2 実装メモ」を足した（実機確認は未）。#697 のレビューで運用中の見張り（`SecurityWatch`・`recheck`）を足した。 2026-10-20: 661-3（昇格ヘルパー）を実装し、§1 の末尾に「#661 661-3 実装メモ」を足した（実機確認は未）。
 2026-10-17: §12 の #626 の決定 11（#630 の分離）に、#630 の結果（サイドカーの設定の
 置き場を保護された `sink\` に分けた）を 1 行足した。
 T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
@@ -163,6 +163,15 @@ Desktop Hub 起動までのフル E2E は任意の追加確認として残す。
 - **監査の保留は Guarded では必須**（`open_profile_dirs_checked` の `SERVICE_PROFILE_MANAGED_SPECS`）: 1 周目が木の全体を確かめた後なので、開けないのは I/O か改ざんで、黙って保留なしで動かすより緩め直して止める方が安全。`data` は 1 回だけ握る（661-1 の別に試す形の二重の握りは、Guarded のフォルダのハンドルが共有の読み書きを許し `DELETE` を求めないので衝突しないが、使わない）。
 - **サービスログの開き方の変更**: 共有ランナーの `open_log`（開始の直後）では開かず、profile を握って排他を取った後に握った `logs\` の中に開く。それより前の失敗（profile を開けない・排他）は標準エラー出力だけで、終了コードで区別する。`BANTO_HUB_DATA` を設定していてもサービスログは profile の `logs\` に書く（`resolve_service_log_dir` は使わない）。
 - **既知の制限**: profile の外の `BANTO_DB`・`BANTO_HUB_DATA` は 1 行出すだけで締めない（#659 と合わせて決める）。`{root}` か `profiles\` がジャンクションだと profile の本当のパスが期待と食い違い、起動を断る（3）。相手が 0 人で profile の所有者が利用者のときは profile を握れないので、ログを書かずに 4 だけを返す。実機確認は未（661-5 の画面と合わせて行う）。
+
+**#661 661-3 実装メモ**（2026-10-20。`apps/banto-hub/core/src/profile_grant.rs` の `grant_steps`・`repair_plan`・`open_target_profile`、Windows の実装は `profile_grant/win.rs`、記録は `profile_owners.rs`。手本は ChronoGazer の elev の `grant-data-acl`）
+
+- **書き方**: `grant-profile-acl`（と `service-install` の最後の手順）は、確かめ・作るを済ませてから profile の木に `relax_tree` を 1 回（下から順に、profile 自身を最後に。印のファイルは印の記述子のまま）。飛ばした物（リンク・ハードリンク・開けない・使用中・移された）は 1 行ずつ警告にする（締まったまま残る = 安全側）。`HubElevOps` の `reset_acl_tree` は `relax_tree`（`ModeAccess` を受ける）に置き換えた。
+- **戻す相手の記録**: 緩める組（`ModeAccess::users`）を `relax_tree` の**前に** HKLM の `Owners` に書く（661-2 の `write_owners`。空は書かない・サービスのキーは作らない）。書けなければ ACL を変えずに断る（終了コード 1）。サービスが登録されていなければ（`profile_owners::service_registered`）書かずに 1 行知らせて緩めるのは続ける（デスクトップだけで使うとき）。
+- **採る組**（サービスの `plan_owners` と同じ規則に揃える）: profile が設定モードの形（緩んでいる）なら、これまでどおり指定の利用者 + DACL から `plan_carry_over` で引き継ぐ利用者。記録は読まない（DACL が勝ち、記録はその組で上書きする）。
+- **修復（profile が運用モードの形のまま残っている）**: DACL から「変更」の利用者は採れないので `repair_plan` を使う。記録が使えれば（`check_stored_owners` の `Valid`）記録の組 + 指定の利用者。**記録が無い・空・読めないときは、指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者のアカウント（締めたときの組）**で緩め、記録が使えない旨を警告する（締まった DACL の所有者は Administrators で、利用者には書き換えられないので、締めたときの組として信じてよい）。利用者のアカウントかを確かめられない SID は戻さずに警告する。
+- **排他**: `reset-password`・`revert-to-commissioning` は、対象を開く前（`open_target_profile` の最初）に profile の mutex（`Global\BantoHub.<id>`、`grant-profile-acl` と同じ `hold_profile`）を取り、DB を閉じるまで持つ。持たれていれば何も開かずに `ElevatedError::ProfileInUse`（文言は `grant-profile-acl` の使用中と同じ形、終了コード 1）。確かめられなければ開かずに断る。
+- **実機確認で見る点**（661-5 と合わせて）: 運用モードのまま止めたサービスの profile に `grant-profile-acl` をかけて設定モードの形に戻ること（記録あり・記録を消した場合）、HKLM の `Owners` が書き換わること、稼働中に `reset-password`・`revert-to-commissioning` が「使用中」で断ること。
 
 ## 2. 現行コード棚卸し
 

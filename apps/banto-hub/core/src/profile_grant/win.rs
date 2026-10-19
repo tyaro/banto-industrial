@@ -4,14 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
-use banto_safe_root::acl::{ObservedDacl, PinnedDir, PinnedDirInfo, ResetSkips};
+use banto_safe_root::acl::{ObservedDacl, PinnedDir, PinnedDirInfo};
 use banto_safe_root::guard::{self, AccountKind};
+use banto_safe_root::mode::{ModeAccess, RelaxReport};
 use banto_safe_root::{DirAccess, InstallUserSid};
 
 /// マシンの環境を HKLM と既知のフォルダから読む（このプロセスの環境変数は読まない）。
 pub use banto_safe_root::guard::win::RegistryMachineEnvironment;
 
-use super::{CreateHow, FileFacts, HubElevOps, PinnedProfileDir};
+use super::{CreateHow, FileFacts, HubElevOps, OwnersWrite, PinnedProfileDir};
 
 /// 本番の操作。
 pub struct WindowsHubElevOps;
@@ -29,9 +30,9 @@ impl PinnedProfileDir for PinnedDir {
         PinnedDir::read_dacl(self).map_err(|err| err.to_string())
     }
 
-    fn reset_acl_tree(&self, access: &DirAccess) -> Result<ResetSkips, String> {
-        PinnedDir::reset_acl(self, access, banto_safe_root::acl::Recurse::Tree)
-            .map_err(|err| err.to_string())
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String> {
+        // 進み具合は出さない（昇格ヘルパーは一度に書き切る）。
+        PinnedDir::relax_tree(self, mode, &mut |_| {}).map_err(|err| err.to_string())
     }
 }
 
@@ -107,6 +108,21 @@ impl HubElevOps for WindowsHubElevOps {
 
     fn open_child(&self, parent: &PinnedDir, name: &str) -> Result<Option<PinnedDir>, String> {
         parent.open_child_dir(name).map_err(|err| err.to_string())
+    }
+
+    fn read_owners(&self, profile_id: &str) -> Result<Option<Vec<String>>, String> {
+        crate::profile_owners::read_owners(profile_id)
+    }
+
+    fn write_owners(
+        &self,
+        profile_id: &str,
+        owners: &[InstallUserSid],
+    ) -> Result<OwnersWrite, String> {
+        if !crate::profile_owners::service_registered()? {
+            return Ok(OwnersWrite::NotRegistered);
+        }
+        crate::profile_owners::write_owners(profile_id, owners).map(|()| OwnersWrite::Written)
     }
 }
 

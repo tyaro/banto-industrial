@@ -16,16 +16,17 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use banto_safe_root::acl::{
-    check_dacl, read_dir_dacl, ObservedDacl, PinnedDir, PinnedDirInfo, ResetSkips,
-    ADMINISTRATORS_SID, INHERIT_FLAGS,
+    check_dacl, read_dir_dacl, ObservedDacl, PinnedDir, PinnedDirInfo, ADMINISTRATORS_SID,
+    INHERIT_FLAGS,
 };
 use banto_safe_root::guard::{KnownFolders, MachineEnvironment};
+use banto_safe_root::mode::{ModeAccess, RelaxReport};
 use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 
 use super::super::{
     grant_profile_acl, open_target_profile, preflight, AccountKind, CreateHow, FileFacts,
-    HubElevOps, OpenTargetError, PinnedProfileDir, Refused,
+    HubElevOps, OpenTargetError, OwnersWrite, PinnedProfileDir, Refused,
 };
 use super::{RegistryMachineEnvironment, WindowsHubElevOps};
 
@@ -102,11 +103,11 @@ impl PinnedProfileDir for Hooked {
     fn read_dacl(&self) -> Result<ObservedDacl, String> {
         PinnedProfileDir::read_dacl(&self.inner)
     }
-    fn reset_acl_tree(&self, access: &DirAccess) -> Result<ResetSkips, String> {
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String> {
         if let Some(hook) = self.hook.borrow_mut().take() {
             hook();
         }
-        self.inner.reset_acl_tree(access)
+        PinnedProfileDir::relax_tree(&self.inner, mode)
     }
 }
 
@@ -196,6 +197,17 @@ impl HubElevOps for TempOps {
     type HeldFile = super::HeldFile;
     fn pin_file(&self, path: &Path) -> Result<Option<(super::HeldFile, FileFacts)>, String> {
         WindowsHubElevOps.pin_file(path)
+    }
+    // HKLM には触らない（記録は無く、サービスは登録されていない扱い）。
+    fn read_owners(&self, _profile_id: &str) -> Result<Option<Vec<String>>, String> {
+        Ok(None)
+    }
+    fn write_owners(
+        &self,
+        _profile_id: &str,
+        _owners: &[InstallUserSid],
+    ) -> Result<OwnersWrite, String> {
+        Ok(OwnersWrite::NotRegistered)
     }
 }
 

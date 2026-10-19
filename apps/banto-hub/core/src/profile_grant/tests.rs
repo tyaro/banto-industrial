@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use banto_safe_root::acl::{
-    ObservedAce, ObservedDacl, PinnedDirInfo, ResetSkips, ADMINISTRATORS_SID, FULL_ACCESS_MASK,
-    MODIFY_ACCESS_MASK, SYSTEM_SID,
+    ObservedAce, ObservedDacl, PinnedDirInfo, ADMINISTRATORS_SID, FULL_ACCESS_MASK,
+    MODIFY_ACCESS_MASK, READ_EXECUTE_ACCESS_MASK, SYSTEM_SID,
 };
 use banto_safe_root::guard::{AccountKind, KnownFolders, MachineEnvironment, MachineRootError};
+use banto_safe_root::mode::{ModeAccess, RelaxReport, TreeProblem};
 use banto_safe_root::{DirAccess, InstallUserSid};
 use banto_service_control::ConsoleLine;
 
@@ -77,7 +78,7 @@ struct FakeDir {
     /// 開いたときの本当のパス（`None`ならパスそのもの）。
     final_path: Option<PathBuf>,
     dacl: Result<ObservedDacl, String>,
-    reset: Result<ResetSkips, String>,
+    relax: Result<RelaxReport, String>,
 }
 
 impl FakeDir {
@@ -94,7 +95,10 @@ impl FakeDir {
                 owner: owner.to_string(),
                 aces: Some(Vec::new()),
             }),
-            reset: Ok(ResetSkips::default()),
+            relax: Ok(RelaxReport {
+                written: 1,
+                skipped: Vec::new(),
+            }),
         }
     }
 }
@@ -123,16 +127,18 @@ impl PinnedProfileDir for FakePinned {
             .push(format!("read_dacl {}", name(&self.path)));
         self.dir.dacl.clone()
     }
-    fn reset_acl_tree(&self, access: &DirAccess) -> Result<ResetSkips, String> {
-        let users: Vec<&str> = access
-            .install_users()
-            .iter()
-            .map(InstallUserSid::as_str)
-            .collect();
+    fn relax_tree(&self, mode: &ModeAccess) -> Result<RelaxReport, String> {
+        // 書く形は設定モードの形（利用者に「変更」）。下から・自身を最後に書くのは
+        // `PinnedDir::relax_tree`（banto-safe-root）の中で、そのテストが受け持つ。
+        assert_eq!(
+            mode.setting(),
+            &DirAccess::with_install_users(mode.users().iter().cloned())
+        );
+        let users: Vec<&str> = mode.users().iter().map(InstallUserSid::as_str).collect();
         self.log
             .borrow_mut()
-            .push(format!("reset {} [{}]", name(&self.path), users.join(",")));
-        self.dir.reset.clone()
+            .push(format!("relax {} [{}]", name(&self.path), users.join(",")));
+        self.dir.relax.clone()
     }
 }
 
@@ -168,6 +174,10 @@ struct FakeOps {
     relative_only: RefCell<HashMap<PathBuf, FakeDir>>,
     /// `pin_file`が開けるファイル。
     files: RefCell<HashMap<PathBuf, FileFacts>>,
+    /// HKLM の戻す相手の記録（`read_owners`が返し、`write_owners`が書き換える）。
+    owners: RefCell<Result<Option<Vec<String>>, String>>,
+    /// サービスが登録されているか（`Err`は`write_owners`の失敗）。
+    registered: Result<bool, String>,
     log: Log,
 }
 
@@ -225,6 +235,8 @@ impl FakeOps {
             appear_on_create: RefCell::new(HashMap::new()),
             relative_only: RefCell::new(HashMap::new()),
             files: RefCell::new(HashMap::new()),
+            owners: RefCell::new(Ok(None)),
+            registered: Ok(true),
             log: Rc::new(RefCell::new(Vec::new())),
         };
         for dir in [root(), profiles(), profile()] {
@@ -352,6 +364,30 @@ impl HubElevOps for FakeOps {
             dir: made,
             log: self.log.clone(),
         }))
+    }
+    fn read_owners(&self, profile_id: &str) -> Result<Option<Vec<String>>, String> {
+        self.log
+            .borrow_mut()
+            .push(format!("read_owners {profile_id}"));
+        self.owners.borrow().clone()
+    }
+    fn write_owners(
+        &self,
+        profile_id: &str,
+        owners: &[InstallUserSid],
+    ) -> Result<OwnersWrite, String> {
+        assert!(!owners.is_empty(), "空の組を書こうとした");
+        let items: Vec<String> = owners.iter().map(|s| s.as_str().to_string()).collect();
+        self.log
+            .borrow_mut()
+            .push(format!("write_owners {profile_id} [{}]", items.join(",")));
+        match self.registered.clone()? {
+            true => {
+                *self.owners.borrow_mut() = Ok(Some(items));
+                Ok(OwnersWrite::Written)
+            }
+            false => Ok(OwnersWrite::NotRegistered),
+        }
     }
     fn open_child(&self, parent: &FakePinned, name_: &str) -> Result<Option<FakePinned>, String> {
         let dir = parent.path.join(name_);
@@ -622,7 +658,7 @@ fn service_install_registers_then_grants() {
     );
     assert!(result.is_ok(), "{:#?}", texts(lines));
     assert_eq!(ops.calls()[0], "register");
-    assert!(ops.calls().iter().any(|c| c.starts_with("reset default")));
+    assert!(ops.calls().iter().any(|c| c.starts_with("relax default")));
 
     let ops = FakeOps::new();
     let result = service_install(&ops, || Err("登録できない"), &mut |_| {});
@@ -665,7 +701,8 @@ fn normal_run_opens_in_order_and_holds_until_the_end() {
             "pin profiles",
             "pin default",
             "read_dacl default",
-            &format!("reset default [{ME}]"),
+            &format!("write_owners default [{ME}]"),
+            &format!("relax default [{ME}]"),
             "drop default",
             "drop profiles",
             "drop BantoHub",
@@ -675,11 +712,15 @@ fn normal_run_opens_in_order_and_holds_until_the_end() {
     let profile_dir = profile();
     assert_eq!(
         lines,
-        vec![format!(
-            "out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形）",
-            profile_dir.display()
-        )]
+        vec![
+            format!("out banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）を利用者 {ME} に更新しました"),
+            format!(
+                "out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形で、下から書き profile 自身は最後。書いた数 1）",
+                profile_dir.display()
+            ),
+        ]
     );
+    assert_eq!(*ops.owners.borrow(), Ok(Some(vec![ME.to_string()])));
 }
 
 /// 無いものは作る: ルート・profiles は親から継承する普通のフォルダ、profile は
@@ -704,7 +745,8 @@ fn missing_dirs_are_created_then_checked_then_reset() {
             "pin line-2",
             "create line-2 under profiles ServiceOnly",
             "read_dacl line-2",
-            &format!("reset line-2 [{ALICE}]"),
+            &format!("write_owners line-2 [{ALICE}]"),
+            &format!("relax line-2 [{ALICE}]"),
             "drop line-2",
             "drop profiles",
             "drop BantoHub",
@@ -712,7 +754,7 @@ fn missing_dirs_are_created_then_checked_then_reset() {
             "drop hold line-2",
         ]
     );
-    assert!(lines[0].contains(": 作りました（"), "{lines:#?}");
+    assert!(lines[1].contains(": 作りました（"), "{lines:#?}");
 }
 
 /// 作った後に確かめが通らない（作った直後にすり替えられた・見知らぬ所有者）なら、
@@ -726,7 +768,7 @@ fn created_then_refused_leaves_a_notice_and_does_not_reset() {
         .insert(profile(), FakeDir::owned_by(EVIL));
     let (result, lines) = run(&ops, None, None);
     assert_eq!(result, Err(Refused), "{lines:#?}");
-    assert!(!ops.calls().iter().any(|c| c.starts_with("reset")));
+    assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
     assert!(!ops.calls().iter().any(|c| c.starts_with("read_dacl")));
     assert!(lines.iter().any(|l| l.contains(EVIL)), "{lines:#?}");
     assert_eq!(
@@ -780,7 +822,8 @@ fn a_level_created_by_someone_else_is_reopened_relative_to_the_parent() {
             // パスで開き直さない（`pin default`は 1 回だけ）。
             "open default under profiles",
             "read_dacl default",
-            &format!("reset default [{ME}]"),
+            &format!("write_owners default [{ME}]"),
+            &format!("relax default [{ME}]"),
             "drop default",
             "drop profiles",
             "drop BantoHub",
@@ -788,7 +831,7 @@ fn a_level_created_by_someone_else_is_reopened_relative_to_the_parent() {
         ]
     );
     // 自分で作ったものではないので「作りました」ではない。
-    assert!(lines[0].contains(": ACL を書き直しました（"), "{lines:#?}");
+    assert!(lines[1].contains(": ACL を書き直しました（"), "{lines:#?}");
 
     // ルートの段（親はルートの親のハンドル）も同じ。
     let ops = FakeOps::new();
@@ -878,7 +921,7 @@ fn each_refusal_branch_is_reachable() {
         let (result, lines) = run(&ops, None, None);
         assert_eq!(result, Err(Refused), "{label}: {lines:#?}");
         assert!(
-            !ops.calls().iter().any(|c| c.starts_with("reset")),
+            !ops.calls().iter().any(|c| c.starts_with("relax")),
             "{label}"
         );
         assert!(
@@ -889,7 +932,7 @@ fn each_refusal_branch_is_reachable() {
 
     // 書けない: 書き直しを試みて失敗を出す（成功の行は出さない）。
     let ops = FakeOps::new();
-    ops.dirs.borrow_mut().get_mut(&profile()).unwrap().reset = Err("1307".into());
+    ops.dirs.borrow_mut().get_mut(&profile()).unwrap().relax = Err("1307".into());
     let (result, lines) = run(&ops, None, None);
     assert_eq!(result, Err(Refused));
     assert!(lines
@@ -955,11 +998,29 @@ fn carry_over_lines_golden() {
                 ace(0, 0x03, MODIFY_ACCESS_MASK, DAVE),
             ]),
         });
-        dir.reset = Ok(ResetSkips {
-            reparse: vec![profile().join("x")],
-            hardlink: vec![profile().join("f.txt")],
-            denied: vec![profile().join("locked")],
-            moved_out: vec![profile().join("moved")],
+        dir.relax = Ok(RelaxReport {
+            written: 5,
+            skipped: vec![
+                TreeProblem::ReparsePoint {
+                    path: profile().join("x"),
+                    tag: 0xA000_0003,
+                },
+                TreeProblem::Hardlink {
+                    path: profile().join("f.txt"),
+                    links: 2,
+                },
+                TreeProblem::Denied {
+                    path: profile().join("locked"),
+                },
+                TreeProblem::Busy {
+                    path: profile().join("busy"),
+                    os_error: 32,
+                },
+                TreeProblem::MovedOut {
+                    path: profile().join("moved"),
+                    now: abs("elsewhere"),
+                },
+            ],
         });
     }
     // 所有者 CAROL を許すため、実行した管理者を CAROL にする。
@@ -969,7 +1030,10 @@ fn carry_over_lines_golden() {
     assert_eq!(result, Ok(()), "{lines:#?}");
     assert!(ops
         .calls()
-        .contains(&format!("reset default [{ME},{ALICE}]")));
+        .contains(&format!("relax default [{ME},{ALICE}]")));
+    assert!(ops
+        .calls()
+        .contains(&format!("write_owners default [{ME},{ALICE}]")));
     let p = profile();
     let expected = vec![
         format!("out banto-hub-elev: 今の DACL に「変更」を持つ利用者 {ALICE} を引き継ぎます"),
@@ -983,12 +1047,14 @@ fn carry_over_lines_golden() {
         format!("out banto-hub-elev: 「変更」に足りない ACE（SID {ME}・アクセス 0x1200a9・フラグ 0x03。読み取りだけなど）は引き継ぎません"),
         format!("out banto-hub-elev: この PC の利用者のアカウントでない SID（グループなど）の ACE（SID {DOMAIN_USERS}・アクセス 0x1301bf・フラグ 0x03）は引き継ぎません"),
         format!("err banto-hub-elev: 警告: 利用者のアカウントかを確かめられなかったので、ACE（SID {DAVE}・アクセス 0x1301bf・フラグ 0x03）を引き継ぎません: RPC が届かない。この相手は書き直した後にこの profile を開けなくなります。名前の解決が戻ってから grant-profile-acl {DAVE} default を実行してください"),
-        format!("out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME}・{ALICE} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形）", p.display()),
-        format!("err banto-hub-elev: 警告: profile の中の {} はジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました", p.join("x").display()),
-        format!("err banto-hub-elev: 警告: profile の中の {} はハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）", p.join("f.txt").display()),
-        format!("err banto-hub-elev: 警告: profile の中の {} を開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります）", p.join("locked").display()),
-        format!("err banto-hub-elev: 警告: profile の中の {} は書き直している最中に profile の外へ移されたので、そのフォルダの中身は書かず飛ばしました（移される前に書いた分は移った先に残ります。修復ではそのフォルダ自身も含みます。#623 S-1）", p.join("moved").display()),
-        "err banto-hub-elev: 書き直しは終えましたが、上の警告 9 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
+        format!("out banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）を利用者 {ME}・{ALICE} に更新しました"),
+        format!("out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME}・{ALICE} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形で、下から書き profile 自身は最後。書いた数 5）", p.display()),
+        format!("err banto-hub-elev: 警告: profile の中の {}: リンク（reparse point、tag 0xa0000003）。ジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました", p.join("x").display()),
+        format!("err banto-hub-elev: 警告: profile の中の {}: ハードリンクの別名があります（リンク数 2）。ハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）", p.join("f.txt").display()),
+        format!("err banto-hub-elev: 警告: profile の中の {}: 開けません（アクセス拒否）。開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります）", p.join("locked").display()),
+        format!("err banto-hub-elev: 警告: profile の中の {}: 使用中で開けません（os error 32）。使用中で開けなかったので、触らず飛ばしました（そのまま残ります）", p.join("busy").display()),
+        format!("err banto-hub-elev: 警告: profile の中の {}: 書いている最中に木の外（{}）へ移されました。書いている最中に profile の外へ移されたので、そのフォルダは書かず飛ばしました（移される前に書いた中身は移った先に残ります。#623 S-1）", p.join("moved").display(), abs("elsewhere").display()),
+        "err banto-hub-elev: 書き直しは終えましたが、上の警告 10 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
     ];
     assert_eq!(lines, expected);
 }
@@ -1005,7 +1071,7 @@ fn a_null_dacl_is_reported() {
     let (result, lines) = run(&ops, None, None);
     assert_eq!(result, Ok(()));
     assert!(lines[0].contains("null"), "{lines:#?}");
-    assert!(ops.calls().contains(&format!("reset default [{ME}]")));
+    assert!(ops.calls().contains(&format!("relax default [{ME}]")));
     assert!(lines.last().unwrap().contains("警告 1 件"));
 }
 
@@ -1164,7 +1230,7 @@ fn deny_aces_block_carry_over_and_warn_for_the_named_user() {
     });
     let (result, lines) = run(&ops, None, None);
     assert_eq!(result, Ok(()), "{lines:#?}");
-    assert!(ops.calls().contains(&format!("reset default [{ME}]")));
+    assert!(ops.calls().contains(&format!("relax default [{ME}]")));
     let named = format!(
         "err banto-hub-elev: 警告: 指定の利用者 {ME} には拒否の ACE がありましたが、指定どおり「変更」を付けます（拒否は消えます）"
     );
@@ -1260,8 +1326,9 @@ fn target_ops() -> FakeOps {
     ops
 }
 
-/// 正常: ルート → profiles → profile → config → DB の順に辿らずに開き、持ったまま返す
-/// （閉じるのは返したものを drop したとき、逆の順）。
+/// 正常: profile の mutex を取り（#661 661-3）、ルート → profiles → profile → config →
+/// DB の順に辿らずに開き、持ったまま返す（閉じるのは返したものを drop したとき、逆の順。
+/// mutex は最後）。
 #[test]
 fn open_target_profile_pins_every_level_and_holds_until_dropped() {
     let ops = target_ops();
@@ -1270,6 +1337,7 @@ fn open_target_profile_pins_every_level_and_holds_until_dropped() {
     assert_eq!(
         ops.calls(),
         vec![
+            "in_use default",
             "pin BantoHub",
             "pin profiles",
             "pin default",
@@ -1279,15 +1347,42 @@ fn open_target_profile_pins_every_level_and_holds_until_dropped() {
     );
     drop(held);
     assert_eq!(
-        ops.calls()[5..],
+        ops.calls()[6..],
         [
             "drop banto-hub.sqlite3",
             "drop config",
             "drop default",
             "drop profiles",
-            "drop BantoHub"
+            "drop BantoHub",
+            "drop hold default"
         ]
     );
+}
+
+/// #661 661-3: `reset-password`・`revert-to-commissioning`は、profile が使用中（Hub の
+/// サービスかアプリが mutex を持っている）なら何も開かずに断る（稼働中の DB を開かない）。
+/// 確かめられないときも開かずに断る。
+#[test]
+fn open_target_profile_refuses_a_profile_in_use_before_opening_anything() {
+    let mut ops = target_ops();
+    ops.in_use = Ok(true);
+    assert!(matches!(
+        open_target_profile(&ops, None),
+        Err(OpenTargetError::InUse(id)) if id == "default"
+    ));
+    assert_eq!(ops.calls(), vec!["in_use default"]);
+
+    let mut ops = target_ops();
+    ops.in_use = Err("CreateMutexW が失敗".to_string());
+    match open_target_profile(&ops, None) {
+        Err(OpenTargetError::Unsafe(text)) => {
+            assert!(text.contains("使用中かを確かめられませんでした"), "{text}");
+            assert!(text.contains("CreateMutexW が失敗"), "{text}");
+        }
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("通ってしまった"),
+    }
+    assert_eq!(ops.calls(), vec!["in_use default"]);
 }
 
 /// 断る: config がジャンクション・途中の段の本当のパスが違う（すり替え）・DB が
@@ -1468,7 +1563,7 @@ fn unknown_or_unreadable_aces_refuse_and_conditional_allows_are_not_carried() {
         });
         let (result, lines) = run(&ops, None, None);
         assert_eq!(result, Err(Refused), "{blocked:?}: {lines:#?}");
-        assert!(!ops.calls().iter().any(|c| c.starts_with("reset")));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
         assert!(
             lines
                 .iter()
@@ -1485,7 +1580,7 @@ fn unknown_or_unreadable_aces_refuse_and_conditional_allows_are_not_carried() {
     });
     let (result, lines) = run(&ops, None, None);
     assert_eq!(result, Ok(()), "{lines:#?}");
-    assert!(ops.calls().contains(&format!("reset default [{ME}]")));
+    assert!(ops.calls().contains(&format!("relax default [{ME}]")));
     assert!(
         lines
             .iter()
@@ -1501,9 +1596,148 @@ fn the_profile_mutex_is_held_until_the_rewrite_ends() {
     let (result, _) = run(&ops, None, None);
     assert_eq!(result, Ok(()));
     let calls = ops.calls();
-    let reset = calls.iter().position(|c| c.starts_with("reset")).unwrap();
+    let reset = calls.iter().position(|c| c.starts_with("relax")).unwrap();
     let released = calls.iter().position(|c| c == "drop hold default").unwrap();
     assert_eq!(calls[0], "in_use default");
     assert!(released > reset, "{calls:?}");
     assert_eq!(released, calls.len() - 1, "{calls:?}");
+}
+
+// --- #661 661-3: 戻す相手の記録・締まったまま残った profile の修復 -------------------
+
+const OWNERS_AT: &str =
+    r"HKLM\SYSTEM\CurrentControlSet\Services\BantoHub\Parameters\Profiles\default\Owners";
+
+/// 運用モードの形（締まっている）の profile の DACL（利用者は「読み取りと実行」だけ）。
+fn tight_profile(ops: &FakeOps, users: &[&str]) {
+    let mut aces = vec![
+        ace(0, 0x03, FULL_ACCESS_MASK, SYSTEM_SID),
+        ace(0, 0x03, FULL_ACCESS_MASK, ADMINISTRATORS_SID),
+    ];
+    for user in users {
+        aces.push(ace(0, 0x03, READ_EXECUTE_ACCESS_MASK, user));
+    }
+    let mut dirs = ops.dirs.borrow_mut();
+    let dir = dirs.get_mut(&profile()).unwrap();
+    dir.info.owner = ADMINISTRATORS_SID.into();
+    dir.dacl = Ok(ObservedDacl {
+        protected: true,
+        owner: ADMINISTRATORS_SID.into(),
+        aces: Some(aces),
+    });
+}
+
+/// 記録を書けない（権限・レジストリの失敗）なら、ACL を変えずに断る。サービスが登録されて
+/// いなければ記録は書かずに知らせ、緩めるのは続ける（デスクトップだけで使うとき）。
+#[test]
+fn the_owners_record_is_written_before_relaxing_or_the_run_is_refused() {
+    let mut ops = FakeOps::new();
+    ops.registered = Err("記録を書く権限がありません".to_string());
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
+    assert_eq!(
+        lines.last().unwrap(),
+        &format!("err banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）を書けませんでした: 記録を書く権限がありません。ACL は変えていません")
+    );
+
+    let mut ops = FakeOps::new();
+    ops.registered = Ok(false);
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops.calls().contains(&format!("relax default [{ME}]")));
+    assert_eq!(
+        lines[0],
+        format!("out banto-hub-elev: サービス BantoHub が登録されていないので、戻す相手の記録（{OWNERS_AT}）は書きません（デスクトップだけで使うときは要りません）")
+    );
+    assert_eq!(*ops.owners.borrow(), Ok(None));
+}
+
+/// 修復（記録あり）: 締まったまま残った profile は、DACL からではなく記録の組 + 指定の
+/// 利用者で緩め、記録もその組に書き直す。
+#[test]
+fn a_tight_profile_is_relaxed_with_the_recorded_owners() {
+    let ops = FakeOps::new();
+    tight_profile(&ops, &[ALICE, BOB]);
+    *ops.owners.borrow_mut() = Ok(Some(vec![ALICE.to_string()]));
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert_eq!(
+        ops.calls()[4..8],
+        [
+            "read_dacl default".to_string(),
+            "read_owners default".to_string(),
+            format!("write_owners default [{ME},{ALICE}]"),
+            format!("relax default [{ME},{ALICE}]"),
+        ]
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "out banto-hub-elev: profile 'default' は運用モードの形（締まったまま）です。設定モードの形に戻します（修復）".to_string(),
+            format!("out banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の利用者 {ALICE} に「変更」を戻します"),
+            format!("out banto-hub-elev: 指定の利用者 {ME} も足します"),
+            format!("out banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）を利用者 {ME}・{ALICE} に更新しました"),
+            format!("out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME}・{ALICE} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形で、下から書き profile 自身は最後。書いた数 1）", profile().display()),
+        ]
+    );
+    assert_eq!(
+        *ops.owners.borrow(),
+        Ok(Some(vec![ME.to_string(), ALICE.to_string()]))
+    );
+}
+
+/// 修復（記録が無い・使えない）: 指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者の
+/// アカウントで緩め、記録が使えない旨と、確かめられない SID を戻さない旨を警告する。
+#[test]
+fn a_tight_profile_without_a_usable_record_uses_the_named_user_and_the_tight_dacl() {
+    type Record = Result<Option<Vec<String>>, String>;
+    let records: Vec<(Record, &str)> = vec![
+        (Ok(None), "記録がありません"),
+        (Ok(Some(Vec::new())), "記録が空です"),
+        (
+            Ok(Some(vec!["S-1-1-0".to_string()])),
+            "記録に利用者の SID でない値があります（\"S-1-1-0\"）",
+        ),
+        (Err("読めない".to_string()), "読めない"),
+    ];
+    for (record, reason) in records {
+        let ops = FakeOps::new();
+        tight_profile(&ops, &[ALICE, DOMAIN_USERS, DAVE, ME]);
+        *ops.owners.borrow_mut() = record;
+        let (result, lines) = run(&ops, None, None);
+        assert_eq!(result, Ok(()), "{reason}: {lines:#?}");
+        assert!(ops
+            .calls()
+            .contains(&format!("write_owners default [{ME},{ALICE}]")));
+        assert!(ops
+            .calls()
+            .contains(&format!("relax default [{ME},{ALICE}]")));
+        assert_eq!(
+            lines,
+            vec![
+                "out banto-hub-elev: profile 'default' は運用モードの形（締まったまま）です。設定モードの形に戻します（修復）".to_string(),
+                format!("err banto-hub-elev: 警告: 戻す相手の記録（{OWNERS_AT}）が使えません（{reason}）。指定の利用者 {ME} と、今の DACL で「読み取りと実行」を持つ利用者（締めたときの組）に「変更」を戻します。ほかにも戻す利用者がいれば、grant-profile-acl <利用者> default を続けて実行してください"),
+                format!("out banto-hub-elev: 今の DACL で「読み取りと実行」を持つ利用者 {ALICE} に「変更」を戻します"),
+                format!("out banto-hub-elev: この PC の利用者のアカウントでない SID（グループなど）の ACE（SID {DOMAIN_USERS}・アクセス 0x1200a9・フラグ 0x03）には戻しません"),
+                format!("err banto-hub-elev: 警告: 利用者のアカウントかを確かめられなかったので、{DAVE} には戻しません: RPC が届かない。名前の解決が戻ってから grant-profile-acl {DAVE} default を実行してください"),
+                format!("out banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）を利用者 {ME}・{ALICE} に更新しました"),
+                format!("out banto-hub-elev: profile 'default'（{}）: ACL を書き直しました（SYSTEM・Administrators にフル、利用者 {ME}・{ALICE} に変更、所有者は Administrators、親から継承しない。中のフォルダ・ファイルも同じ形で、下から書き profile 自身は最後。書いた数 1）", profile().display()),
+                "err banto-hub-elev: 書き直しは終えましたが、上の警告 2 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
+            ],
+            "{reason}"
+        );
+    }
+}
+
+/// 設定モードの形（緩んでいる）なら記録は読まず、DACL から採った組 + 指定の利用者を記録に
+/// 書く（記録を書き換えても DACL の組が勝つ）。
+#[test]
+fn a_loose_profile_ignores_the_record_and_rewrites_it() {
+    let ops = FakeOps::new();
+    *ops.owners.borrow_mut() = Ok(Some(vec![BOB.to_string()]));
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(!ops.calls().iter().any(|c| c.starts_with("read_owners")));
+    assert_eq!(*ops.owners.borrow(), Ok(Some(vec![ME.to_string()])));
 }
