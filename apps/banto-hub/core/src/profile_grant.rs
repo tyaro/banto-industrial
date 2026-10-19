@@ -1160,7 +1160,13 @@ fn emit_skips(skips: &ResetSkips, out: Out<'_>) -> usize {
             path.display()
         )));
     }
-    skips.reparse.len() + skips.hardlink.len() + skips.denied.len()
+    for path in &skips.moved_out {
+        out(err_line(&format!(
+            "警告: profile の中の {} は書き直している最中に profile の外へ移されたので、そのフォルダには書かず飛ばしました（移される前に書いた分は移った先に残ります。#623 S-1）",
+            path.display()
+        )));
+    }
+    skips.reparse.len() + skips.hardlink.len() + skips.denied.len() + skips.moved_out.len()
 }
 
 /// 書き直し（計画 §3.2 の 5〜12）。[`preflight`] を通った値で、稼働中かを確かめた後に

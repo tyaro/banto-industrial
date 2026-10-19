@@ -1081,6 +1081,9 @@ fn emit_skips(kind: DataDir, skipped: &[TreeProblem], out: Out<'_>) {
                 "開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります。監査 Should 1）"
             }
             TreeProblem::Busy { .. } => "使用中で開けなかったので、触らず飛ばしました（そのまま残ります）",
+            TreeProblem::MovedOut { .. } => {
+                "書いている最中に木の外へ移されたので、そのフォルダには書かず飛ばしました（移される前に書いた分は移った先に残ります。#623 S-1）"
+            }
             TreeProblem::Encrypted { .. }
             | TreeProblem::TooDeep { .. }
             | TreeProblem::MarkerOccupied { .. } => "触らず飛ばしました（そのまま残ります）",

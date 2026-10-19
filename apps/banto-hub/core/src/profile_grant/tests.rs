@@ -959,6 +959,7 @@ fn carry_over_lines_golden() {
             reparse: vec![profile().join("x")],
             hardlink: vec![profile().join("f.txt")],
             denied: vec![profile().join("locked")],
+            moved_out: vec![profile().join("moved")],
         });
     }
     // 所有者 CAROL を許すため、実行した管理者を CAROL にする。
@@ -986,7 +987,8 @@ fn carry_over_lines_golden() {
         format!("err banto-hub-elev: 警告: profile の中の {} はジャンクションかシンボリックリンクなので、辿らず・触らず飛ばしました", p.join("x").display()),
         format!("err banto-hub-elev: 警告: profile の中の {} はハードリンク（ほかの名前と中身を共有）なので、触らず飛ばしました（#624）", p.join("f.txt").display()),
         format!("err banto-hub-elev: 警告: profile の中の {} を開けなかったので、触らず飛ばしました（所有者が Administrators を拒否しているなど。そのまま残ります）", p.join("locked").display()),
-        "err banto-hub-elev: 書き直しは終えましたが、上の警告 8 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
+        format!("err banto-hub-elev: 警告: profile の中の {} は書き直している最中に profile の外へ移されたので、そのフォルダには書かず飛ばしました（移される前に書いた分は移った先に残ります。#623 S-1）", p.join("moved").display()),
+        "err banto-hub-elev: 書き直しは終えましたが、上の警告 9 件（飛ばした子・落とした ACE など）を確かめてください".to_string(),
     ];
     assert_eq!(lines, expected);
 }
