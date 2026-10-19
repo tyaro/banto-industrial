@@ -200,6 +200,12 @@ pub enum ServiceManagerError {
     /// #623 PR-4）。
     #[error("サービスは開始や停止の途中のため、今はこの操作を受け付けられません")]
     CannotAcceptControl,
+    /// サービスが今その制御を受け付けない（`ERROR_INVALID_SERVICE_CONTROL`、1052。
+    /// 開始の途中（START_PENDING）は `controls_accepted` が空なので、SCM は STOP を 1061 ではなく
+    /// こちらで断ることもある（#623 実機確認）。状態によっては本当に無効な制御なので、
+    /// 呼び出し側は `query_status` で START_PENDING / STOP_PENDING かを見てから待つ。
+    #[error("サービスは今この制御を受け付けません")]
+    InvalidControl,
 }
 
 /// start/stop/restart が返す、非同期な SCM 状態遷移の薄いハンドル。
@@ -595,6 +601,8 @@ mod windows_impl {
     const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
     /// Win32 エラーコード（`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`。#623 PR-4）。
     const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
+    /// Win32 エラーコード（`ERROR_INVALID_SERVICE_CONTROL`。締めている間の STOP の実測）。
+    const ERROR_INVALID_SERVICE_CONTROL: i32 = 1052;
     /// Win32 エラーコード（`ERROR_SERVICE_SPECIFIC_ERROR`。
     /// `dwServiceSpecificExitCode` を使う印）。
     const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
@@ -647,6 +655,9 @@ mod windows_impl {
                 Some(ERROR_SERVICE_ALREADY_RUNNING) => return ServiceManagerError::AlreadyRunning,
                 Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
                     return ServiceManagerError::CannotAcceptControl;
+                }
+                Some(ERROR_INVALID_SERVICE_CONTROL) => {
+                    return ServiceManagerError::InvalidControl;
                 }
                 _ => {}
             }
@@ -1035,6 +1046,7 @@ mod tests {
             ServiceManagerError::Other("os error 5".to_string()),
             ServiceManagerError::AlreadyRunning,
             ServiceManagerError::CannotAcceptControl,
+            ServiceManagerError::InvalidControl,
         ];
         for err in &all {
             let text = err.to_string();
@@ -1049,6 +1061,23 @@ mod tests {
             ServiceManagerError::NotFound("ChronoGazer".to_string()).to_string(),
             "サービス 'ChronoGazer' が見つかりません（未登録の可能性）"
         );
+    }
+
+    /// 締めている間の STOP の 1061・1052 は種類に写る（1052 は #623 実機確認）。
+    #[cfg(windows)]
+    #[test]
+    fn map_win_err_maps_stop_refusals_to_kinds() {
+        use crate::ServiceManagerError as E;
+        let map = |code: i32| {
+            crate::windows_impl::map_win_err(
+                "X",
+                windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code)),
+            )
+        };
+        assert!(matches!(map(1061), E::CannotAcceptControl));
+        assert!(matches!(map(1052), E::InvalidControl));
+        assert!(matches!(map(1056), E::AlreadyRunning));
+        assert!(matches!(map(87), E::Other(_)));
     }
 
     // `WindowsServiceManager::for_service`のパラメータ化を、非破壊な

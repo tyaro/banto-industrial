@@ -22,7 +22,8 @@
 //!   経ずに止まったら、照会の終了コードで理由を分ける（[`ServiceExit`]: 4 = 運用モードに
 //!   できなかった、5 = 締めたまま残った）。
 //! - **設定モードへ**（[`stop_service_and_wait`]）: `stop` → Stopped まで待つ。START_PENDING の
-//!   間は SCM が STOP を 1061（[`ServiceManagerError::CannotAcceptControl`]）で断るので、
+//!   間は SCM が STOP を 1061（[`ServiceManagerError::CannotAcceptControl`]）か
+//!   1052（[`ServiceManagerError::InvalidControl`]。START_PENDING／STOP_PENDING のときだけ）で断るので、
 //!   失敗にせず Running になるのを待って出し直す（[`MAX_STOP_RETRIES`] 回まで）。
 //! - **緩めるだけの開始**（[`relax_only_and_wait`]）: `start_with_args(["relax-only"])`
 //!   （Stopped のときだけ、Operators なら UAC なし）→ **`Ok` が返った後に照会を始め**、最初の
@@ -62,7 +63,7 @@ use crate::server_service::RELAX_ONLY_ARG;
 /// `dwWin32ExitCode` がサービス固有の終了コードを指す印（`ERROR_SERVICE_SPECIFIC_ERROR`）。
 const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
 
-/// 1061 で断られた STOP を出し直す回数の上限（その間は Running になるのを待つ）。
+/// 1061／1052 で断られた STOP を出し直す回数の上限（その間は Running になるのを待つ）。
 pub const MAX_STOP_RETRIES: u32 = 3;
 
 // ---------------------------------------------------------------------------
@@ -117,7 +118,7 @@ pub enum SwitchStage {
     WaitingForService,
     /// サービスに停止を頼んでいる。
     StoppingService,
-    /// 権限の設定の途中で停止を断られたので、終わるのを待っている（1061）。
+    /// 権限の設定の途中で停止を断られたので、終わるのを待っている（1061／1052）。
     WaitingForTightening,
     /// サービスがデータのフォルダの権限を設定モードの形に戻している（STOP_PENDING・
     /// `relax-only` の START_PENDING）。
@@ -375,7 +376,7 @@ pub enum StopOutcome {
     TimedOut,
 }
 
-/// 設定モードへ: サービスを止め、Stopped まで待つ。1061（権限の設定の途中）は Running に
+/// 設定モードへ: サービスを止め、Stopped まで待つ。1061／1052（権限の設定の途中）は Running に
 /// なるのを待って出し直す（モジュール doc「3 つの道」）。
 pub fn stop_service_and_wait(
     manager: &impl ServiceManager,
@@ -384,12 +385,41 @@ pub fn stop_service_and_wait(
     progress: &mut dyn FnMut(SwitchStage),
 ) -> StopOutcome {
     let mut retries = 0;
+    let mut resent_on_running = false;
     loop {
         progress(SwitchStage::StoppingService);
         match manager.stop() {
             Ok(_) => break,
             Err(ServiceManagerError::NotFound(_)) => return StopOutcome::NotInstalled,
-            Err(ServiceManagerError::CannotAcceptControl) if retries < MAX_STOP_RETRIES => {
+            Err(
+                err @ (ServiceManagerError::CannotAcceptControl
+                | ServiceManagerError::InvalidControl),
+            ) => {
+                let can_wait = retries < MAX_STOP_RETRIES;
+                let wait = match err {
+                    ServiceManagerError::CannotAcceptControl => can_wait,
+                    // 1052 は、照会し直した状態で分ける。締めている間（START_PENDING。
+                    // `controls_accepted` が空）か止まりかけ（STOP_PENDING）は「切り替え中」。
+                    // 1052 の後に起動が終わった・失敗した競合は、Stopped なら結果、Running なら
+                    // STOP を 1 回だけ出し直す。
+                    _ => match manager.query_status() {
+                        Ok(summary) => match summary.state {
+                            ScmState::StartPending | ScmState::StopPending => can_wait,
+                            ScmState::Stopped => {
+                                return StopOutcome::Stopped(service_exit(&summary));
+                            }
+                            ScmState::Running if !resent_on_running => {
+                                resent_on_running = true;
+                                continue;
+                            }
+                            _ => false,
+                        },
+                        Err(_) => false,
+                    },
+                };
+                if !wait {
+                    return StopOutcome::StopFailed(err.to_string());
+                }
                 retries += 1;
                 progress(SwitchStage::WaitingForTightening);
                 match wait_for(manager, clock, timings, ScmState::Running, progress, |_| {
