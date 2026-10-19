@@ -300,7 +300,7 @@ impl ServiceContext {
     /// START_PENDING から直接 STOPPED になる（`relax-only` の道）。
     ///
     /// **START_PENDING の間、SCM は STOP を `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`
-    /// （1061）で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
+    /// か 1052 で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
     /// 長い起動は、止められない時間を延ばす。`wait_hint` は約 49.7 日
     /// （`u32` のミリ秒）で丸める。
     pub fn report_start_progress(&self, wait_hint: std::time::Duration) -> bool {
