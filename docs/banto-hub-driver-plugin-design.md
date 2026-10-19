@@ -430,3 +430,51 @@ LocalSystem のサービスが利用者由来のファイルを展開する経�
 | R4   | 併用で比べ、使えると判断したプロトコルから移行する（Q3）                                                                                                                     | なし       |
 
 R1 は WASM と無関係に 12.1 の 1（散らばったプロトコルの分岐）を減らすので、プラグイン計画を保留したままでも単独で価値がある。
+
+### 12.6 R1 の CI 上の利点: ドライバ API で依存を逆転する（2026-10-19 検討）
+
+R1 は WASM と無関係に、**ドライバだけの変更で CI を短くする**利点がある。
+
+**今の依存（2026-10-19 に `cargo metadata` で確認）**:
+
+```
+banto-plc（SLMP / Modbus の実装と共通の型が同居）
+  ├─ banto-collect ─┬─ chronogazer-core ── chronogazer
+  │                 └─ banto-hub-core
+  ├─ banto-broker ──── banto-hub-core
+  └─ banto-plc-write ─ banto-broker
+banto-hub-core は banto-plc を直接も使う（Address・DataType・TagValue・ReadRequest など）
+```
+
+型と実装が同じ crate にあるため、ドライバの中身だけを変えても `banto-hub-core` と `chronogazer-core` が作り直される。2026-10-19 に CI の判定（`.github/scripts/ci-changes.mjs`）へ変更ファイルの例を渡して確かめた結果:
+
+| 変更したもの                                                  | Rust の対象                                                  | E2E                |
+| ------------------------------------------------------------- | ------------------------------------------------------------ | ------------------ |
+| `crates/banto-plc`                                            | 10 パッケージ（`banto-hub-core`・`chronogazer-core` を含む） | Hub と ChronoGazer |
+| `crates/banto-plc-write`                                      | 5 パッケージ（`banto-hub-core` を含む）                      | Hub                |
+| `crates/banto-broker`                                         | 4 パッケージ（`banto-hub-core` を含む）                      | Hub                |
+| 別リポジトリのドライバの版上げ（`Cargo.toml` / `Cargo.lock`） | `--workspace`                                                | Hub と ChronoGazer |
+
+同日の cargo timings（main への push のフル CI 3 回）では、CI の長さを決める Windows の `rust` ジョブ（17〜25 分）の大半が nextest で、ビルドの CPU 時間の約 45% が `banto-hub-core`（統合テストのバイナリ約 20 本）だった。つまり今は、ドライバだけの変更でも実質的にほぼ全体の CI が走る。
+
+**依存を逆転した形**:
+
+```
+banto-driver-api（型と trait だけ。ロジックなし）
+  ├─ banto-collect / banto-broker ── banto-hub-core / chronogazer-core   ← API にだけ依存
+  └─ 各ドライバ（SLMP / Modbus / KV ...）                                ← API にだけ依存
+
+banto-drivers（組み立て役: 組み込みドライバの一覧）
+  └─ アプリのバイナリ（banto-hub・chronogazer）だけがこれに依存
+```
+
+ドライバを変えたときの CI の対象は、そのドライバ・`banto-drivers`・アプリのバイナリ crate だけになり、`banto-hub-core` と `chronogazer-core` のテスト（偽のドライバで動く）は対象から外れる。Windows の `rust` ジョブは数分程度に縮むと見込む（推定。ドライバと組み立て役のテストの量による）。E2E は組み立て後のバイナリを使うので走らせ続ける（そのための CI の判定の変更は条件 6）。別ジョブで並列なので全体の長さは決めない。
+
+**成り立たせる条件**:
+
+1. **API の crate を小さく、動かさない**。API を変えると全部に波及するので、置くのは型と trait だけにする。
+2. **アドレスを不透明にする（12.2 の 4）**。今の `Address` enum（`ModbusRef` / `Slmp`）を API に移すと、プロトコルを足すたびに API が変わり、毎回全体が走る。API には「ドライバ ID + 正規化した文字列」（と `area` 等の解釈結果）だけを置き、解釈はドライバに任せる。
+3. **接続部を差し込み式にする**。`banto-collect` には既に `ClientFactory` の差し込み口がある。broker の固定の登録表 `DRIVERS` を、組み立て役から渡せる形に変える。
+4. **適合テストを API の crate が提供する**。どのドライバも満たすべき振る舞い（エラーの致命 / 非致命の分類、結果の件数と順序、分割受信・遅延応答など）のテスト一式を API の crate に置き、各ドライバの CI で走らせる。アプリ側の統合テストが偽のドライバになる分、実ドライバの確認はこの適合テストと E2E で担保する。
+5. **共通の型を API へ移す**。`DataType`・`TagValue`・`ReadRequest` 系・エラーの分類を `banto-plc` から API の crate へ移す。
+6. **CI の判定を組み立て役に合わせて直す**。今の判定（`.github/scripts/ci-changes.mjs` の `JOB_PACKAGES`）は、Hub / ChronoGazer の E2E を `banto-hub-core` / `chronogazer-core` への逆依存の到達で選ぶ。依存を逆転してドライバが core から外れると、ドライバだけの変更では**両方の E2E も対象から外れてしまい**、実ドライバの確認を E2E に任せる前提が崩れる。E2E の対象判定を、実際にドライバを組み込む組み立て役（`banto-drivers`）とアプリのバイナリの package に合わせて更新し、「ドライバだけの変更 → core のテストは対象外・両方の E2E は対象」を確かめる判定の回帰テスト（`ci-changes.test.mjs`）を足す。
