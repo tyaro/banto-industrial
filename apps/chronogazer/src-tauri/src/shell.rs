@@ -313,6 +313,30 @@ pub(crate) fn root_blocked_cause(why: &RootBlock, last_exit: Option<ServiceExit>
     }
 }
 
+/// Service の画面の見張りが「サービスが止まった」を見つけたときの Fallback の理由（純関数。
+/// #687）。起動の判定（[`decide`]・[`root_blocked_cause`]）と同じ表で選ぶ。SCM が停止のときだけ
+/// 終了コードを見る: 4 → [`FallbackCause::CannotOperate`]、5 → `OperationStopped { left_tight: true }`、
+/// それ以外はルートのモードの観察を [`decide`] に通し、運用モードの形のまま停止なら
+/// `OperationStopped { left_tight: false }`・観測に使えないなら `RootUnusable`、どちらでもなければ
+/// 一般の [`FallbackCause::ServiceLost`]。
+pub(crate) fn lost_cause(
+    scm: &ScmObservation,
+    mode: &RootModeObservation,
+    last_exit: Option<ServiceExit>,
+) -> FallbackCause {
+    if !matches!(scm, ScmObservation::State(ScmState::Stopped)) {
+        return FallbackCause::ServiceLost;
+    }
+    match last_exit {
+        Some(ServiceExit::CannotOperate) => FallbackCause::CannotOperate,
+        Some(ServiceExit::LeftOperation) => FallbackCause::OperationStopped { left_tight: true },
+        _ => match decide(scm, None, mode) {
+            LaunchDecision::RootBlocked { why, .. } => root_blocked_cause(&why, last_exit),
+            _ => FallbackCause::ServiceLost,
+        },
+    }
+}
+
 /// Fallback の画面に出す状態。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FallbackState {
@@ -391,6 +415,8 @@ pub(crate) fn on_tick(
     streak: u32,
     scm: &ScmObservation,
     health: Option<&ServiceHealth>,
+    mode: &RootModeObservation,
+    last_exit: Option<ServiceExit>,
 ) -> (Step, u32) {
     let health = if needs_probe(scm) { health } else { None };
     match view {
@@ -407,7 +433,7 @@ pub(crate) fn on_tick(
             let fallback = FallbackState {
                 scm: scm.clone(),
                 health: health.cloned(),
-                cause: FallbackCause::ServiceLost,
+                cause: lost_cause(scm, mode, last_exit),
             };
             if !unhealthy_but_maybe_transient {
                 // 止まった・遷移中・未登録: すぐに Fallback（O2）。
@@ -432,7 +458,17 @@ pub(crate) fn on_tick(
             let next = FallbackState {
                 scm: scm.clone(),
                 health: health.cloned(),
-                cause: carry_cause(current.cause, scm),
+                cause: if current.cause == FallbackCause::ServiceLost
+                    && matches!(scm, ScmObservation::State(ScmState::Stopped))
+                {
+                    // 外から STOP されると `Running → StopPending → Stopped` と観測する。
+                    // StopPending の時点では一般の ServiceLost で Fallback に移るので、停止に
+                    // 達したら終了コードとモードで理由を選び直す（#690 レビュー。4・5 の窓）。
+                    // 他の理由（利用者の操作の後の窓など）は書き換えない。
+                    lost_cause(scm, mode, last_exit)
+                } else {
+                    carry_cause(current.cause, scm)
+                },
             };
             if &next == current {
                 (Step::Stay, 0)
@@ -1473,11 +1509,11 @@ async fn monitor(app: AppHandle) {
                 streak,
             } => (view, generation, streak),
         };
-        // 見張りは Desktop へは移らない（O2・O3）ので、ルートのモードは見ない。
-        let Some((scm, health, _mode, _exit)) = observe_async(&app).await else {
+        // 見張りは Desktop へは移らないが、止まった理由の窓は起動の判定と同じ表で選ぶ（#687）。
+        let Some((scm, health, mode, exit)) = observe_async(&app).await else {
             continue;
         };
-        let (step, streak) = on_tick(&view, streak, &scm, health.as_ref());
+        let (step, streak) = on_tick(&view, streak, &scm, health.as_ref(), &mode, exit);
         match step {
             Step::Stay => gate.record_streak(generation, streak),
             Step::Refresh(state) => {
@@ -1585,7 +1621,14 @@ mod tests {
             for scm in all_observations() {
                 for health in all_health() {
                     for streak in 0..=UNHEALTHY_LIMIT {
-                        let (step, _) = on_tick(&view, streak, &scm, health.as_ref());
+                        let (step, _) = on_tick(
+                            &view,
+                            streak,
+                            &scm,
+                            health.as_ref(),
+                            &RootModeObservation::NotObserved,
+                            None,
+                        );
                         assert_ne!(
                             step,
                             Step::ToDesktop,
@@ -1604,7 +1647,14 @@ mod tests {
         for scm in all_observations() {
             for health in all_health() {
                 for streak in 0..UNHEALTHY_LIMIT {
-                    let (step, next) = on_tick(&view, streak, &scm, health.as_ref());
+                    let (step, next) = on_tick(
+                        &view,
+                        streak,
+                        &scm,
+                        health.as_ref(),
+                        &RootModeObservation::NotObserved,
+                        None,
+                    );
                     let is_running = scm == running();
                     let considered = if is_running { health.clone() } else { None };
                     let healthy_same_port = is_running && considered == Some(healthy(8721));
@@ -1636,15 +1686,50 @@ mod tests {
     fn two_consecutive_unhealthy_ticks_fall_back() {
         let view = ShellView::Service { port: 8721 };
         let bad = ServiceHealth::Unreachable { port: 8721 };
-        let (step, streak) = on_tick(&view, 0, &running(), Some(&bad));
+        let (step, streak) = on_tick(
+            &view,
+            0,
+            &running(),
+            Some(&bad),
+            &RootModeObservation::NotObserved,
+            None,
+        );
         assert_eq!((step, streak), (Step::Stay, 1));
-        let (step, streak) = on_tick(&view, streak, &running(), Some(&healthy(8721)));
+        let (step, streak) = on_tick(
+            &view,
+            streak,
+            &running(),
+            Some(&healthy(8721)),
+            &RootModeObservation::NotObserved,
+            None,
+        );
         assert_eq!((step, streak), (Step::Stay, 0));
-        let (_, streak) = on_tick(&view, streak, &running(), Some(&bad));
-        let (step, _) = on_tick(&view, streak, &running(), Some(&bad));
+        let (_, streak) = on_tick(
+            &view,
+            streak,
+            &running(),
+            Some(&bad),
+            &RootModeObservation::NotObserved,
+            None,
+        );
+        let (step, _) = on_tick(
+            &view,
+            streak,
+            &running(),
+            Some(&bad),
+            &RootModeObservation::NotObserved,
+            None,
+        );
         assert!(matches!(step, Step::ToFallback(_)), "{step:?}");
         // 止まったら 1 回目ですぐ。
-        let (step, _) = on_tick(&view, 0, &ScmObservation::State(ScmState::Stopped), None);
+        let (step, _) = on_tick(
+            &view,
+            0,
+            &ScmObservation::State(ScmState::Stopped),
+            None,
+            &RootModeObservation::NotObserved,
+            None,
+        );
         assert!(matches!(step, Step::ToFallback(_)), "{step:?}");
     }
 
@@ -1658,7 +1743,14 @@ mod tests {
             };
             for scm in all_observations() {
                 for health in all_health() {
-                    let (step, next) = on_tick(&view, 1, &scm, health.as_ref());
+                    let (step, next) = on_tick(
+                        &view,
+                        1,
+                        &scm,
+                        health.as_ref(),
+                        &RootModeObservation::NotObserved,
+                        None,
+                    );
                     assert_eq!(next, 0);
                     let considered = if scm == running() {
                         health.clone()
@@ -1697,7 +1789,14 @@ mod tests {
         for scm in all_observations() {
             for health in all_health() {
                 assert_eq!(
-                    on_tick(&ShellView::Desktop, 1, &scm, health.as_ref()),
+                    on_tick(
+                        &ShellView::Desktop,
+                        1,
+                        &scm,
+                        health.as_ref(),
+                        &RootModeObservation::NotObserved,
+                        None
+                    ),
                     (Step::Stay, 0)
                 );
             }
@@ -2161,6 +2260,8 @@ mod tests {
                 0,
                 &ScmObservation::State(ScmState::StartPending),
                 None,
+                &RootModeObservation::NotObserved,
+                None,
             );
             match step {
                 Step::Refresh(state) => assert_eq!(state.cause, FallbackCause::AtStartup),
@@ -2172,6 +2273,132 @@ mod tests {
             carry_cause(FallbackCause::ServiceLost, &running()),
             FallbackCause::ServiceLost
         );
+    }
+
+    /// #687: 運用中に止まったと見張りが判断したときの窓の選び方（終了コード 0・4・5 ×
+    /// ルートのモードの観察）。起動の判定（`initial_view`）と同じ窓になる。
+    #[test]
+    fn service_lost_picks_the_launch_window() {
+        let stopped = ScmObservation::State(ScmState::Stopped);
+        let modes = [
+            operation_mode(),
+            RootModeObservation::Mode(banto_safe_root::ModeObservation::Setting),
+            RootModeObservation::Unusable("リンク".to_string()),
+            RootModeObservation::NotObserved,
+        ];
+        let exits = [
+            None,
+            Some(ServiceExit::Clean),
+            Some(ServiceExit::CannotOperate),
+            Some(ServiceExit::LeftOperation),
+            Some(ServiceExit::Other {
+                win32: 1,
+                specific: 0,
+            }),
+        ];
+        for mode in &modes {
+            for exit in exits {
+                let expected = match (exit, mode) {
+                    (Some(ServiceExit::CannotOperate), _) => FallbackCause::CannotOperate,
+                    (Some(ServiceExit::LeftOperation), _) => {
+                        FallbackCause::OperationStopped { left_tight: true }
+                    }
+                    (_, RootModeObservation::Mode(banto_safe_root::ModeObservation::Operation)) => {
+                        FallbackCause::OperationStopped { left_tight: false }
+                    }
+                    (_, RootModeObservation::Unusable(_)) => FallbackCause::RootUnusable,
+                    _ => FallbackCause::ServiceLost,
+                };
+                assert_eq!(
+                    lost_cause(&stopped, mode, exit),
+                    expected,
+                    "{mode:?} {exit:?}"
+                );
+                // on_tick（見張り）も同じ理由で Fallback へ移る。
+                let (step, _) = on_tick(
+                    &ShellView::Service { port: 8721 },
+                    0,
+                    &stopped,
+                    None,
+                    mode,
+                    exit,
+                );
+                assert_eq!(
+                    step,
+                    Step::ToFallback(FallbackState {
+                        scm: stopped.clone(),
+                        health: None,
+                        cause: expected,
+                    }),
+                    "{mode:?} {exit:?}"
+                );
+            }
+        }
+        // 停止でなければ（遷移中・照会の失敗・実行中）終了コードもモードも見ない。
+        for scm in all_observations() {
+            if scm != stopped {
+                assert_eq!(
+                    lost_cause(&scm, &operation_mode(), Some(ServiceExit::LeftOperation)),
+                    FallbackCause::ServiceLost,
+                    "{scm:?}"
+                );
+            }
+        }
+    }
+
+    /// 外から STOP されると `Running → StopPending → Stopped` と観測する。StopPending で
+    /// 一般の ServiceLost の Fallback に移った後でも、停止に達したら終了コードで理由を選び直す
+    /// （#690 レビュー）。利用者の操作の後の理由は書き換えない。
+    #[test]
+    fn fallback_reselects_the_cause_when_scm_reaches_stopped() {
+        let pending = ScmObservation::State(ScmState::StopPending);
+        let stopped = ScmObservation::State(ScmState::Stopped);
+        let mode = RootModeObservation::NotObserved;
+        let after_stop = |exit: Option<ServiceExit>| {
+            let (step, _) = on_tick(
+                &ShellView::Service { port: 8721 },
+                0,
+                &pending,
+                None,
+                &mode,
+                None,
+            );
+            let Step::ToFallback(first) = step else {
+                panic!("StopPending で Fallback に移るはず: {step:?}");
+            };
+            assert_eq!(first.cause, FallbackCause::ServiceLost);
+            on_tick(&ShellView::Fallback(first), 0, &stopped, None, &mode, exit).0
+        };
+        let refreshed = |cause| {
+            Step::Refresh(FallbackState {
+                scm: stopped.clone(),
+                health: None,
+                cause,
+            })
+        };
+        assert_eq!(
+            after_stop(Some(ServiceExit::LeftOperation)),
+            refreshed(FallbackCause::OperationStopped { left_tight: true })
+        );
+        assert_eq!(
+            after_stop(Some(ServiceExit::CannotOperate)),
+            refreshed(FallbackCause::CannotOperate)
+        );
+        // 利用者の操作の後などの別の理由は、停止に達しても書き換えない。
+        let current = FallbackState {
+            scm: pending.clone(),
+            health: None,
+            cause: FallbackCause::AtStartup,
+        };
+        let (step, _) = on_tick(
+            &ShellView::Fallback(current),
+            0,
+            &stopped,
+            None,
+            &mode,
+            Some(ServiceExit::LeftOperation),
+        );
+        assert_eq!(step, refreshed(FallbackCause::AtStartup));
     }
 
     fn ids(view: &FallbackPageView) -> Vec<&'static str> {
