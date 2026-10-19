@@ -1,7 +1,7 @@
 # banto-hub 外部 DB 連携 設計: DB Source（#228）と DB Sink（#229）
 
 作成日: 2026-09-06
-状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S6 は完了**。2026-10-19: §9 に対応 DB を増やすときの構成の選択肢（汎用の値の取り込み口 + サイドカー、ODBC。未決定）と、サイドカーを分けない理由（CI 実測）を追記。2026-10-18: §5.6 に #630 の実機確認の結果（手順 1〜7 すべて期待どおり）を追記。2026-10-17: §5.6 の設定ファイルの置き場を #630 の形（`%ProgramData%\BantoHub\sink\` だけ・保護されていなければ起動しない）に更新し、§5.3・§6-7 の DB ユーザーの権限を「INSERT と SELECT」に訂正した（#616）。2026-10-15: §5.6 に、応答しない Hub と DB でも停止予算の中で停止まで進むことを追記。2026-10-14: §5.6 に OS シャットダウン（#589）の停止予算を追記。（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、S6 = #313、docs #302 / #304 / #307 / #308 / #312）。**残りは S7（実 DB 検証、オーナー同席。手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)）**。S6 の申し送り: `BantoHubSink` への Operators 向けサービス ACL 付与は #316 で対応済み（`banto-hub-sink grant-service-acl` が同梱の `banto-hub-elev` を呼ぶ）、シェルからの start / stop は実サービス未検証（S7 で確認）。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。**2026-09-30: Sink の購読は安定 ID ではなく `external_name` で行う（安定 ID は DB 行用。オーナー決定、scada-design.md §9.6、§5.2）。**コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
+状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S6 は完了**。2026-10-19: §9 に対応 DB を増やすときの構成の選択肢（汎用の値の取り込み口 + サイドカー、ODBC。未決定）と、サイドカーを分けない理由（CI 実測）を追記。同日、**§9.5 で案 A の採用と、破壊的変更を許す場合の形（取り込み口を `push` ドライバとして収集に通す・設定の正は Hub・併用してから移行）をオーナー決定**（着手時期は未定）。2026-10-18: §5.6 に #630 の実機確認の結果（手順 1〜7 すべて期待どおり）を追記。2026-10-17: §5.6 の設定ファイルの置き場を #630 の形（`%ProgramData%\BantoHub\sink\` だけ・保護されていなければ起動しない）に更新し、§5.3・§6-7 の DB ユーザーの権限を「INSERT と SELECT」に訂正した（#616）。2026-10-15: §5.6 に、応答しない Hub と DB でも停止予算の中で停止まで進むことを追記。2026-10-14: §5.6 に OS シャットダウン（#589）の停止予算を追記。（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、S6 = #313、docs #302 / #304 / #307 / #308 / #312）。**残りは S7（実 DB 検証、オーナー同席。手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)）**。S6 の申し送り: `BantoHubSink` への Operators 向けサービス ACL 付与は #316 で対応済み（`banto-hub-sink grant-service-acl` が同梱の `banto-hub-elev` を呼ぶ）、シェルからの start / stop は実サービス未検証（S7 で確認）。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。**2026-09-30: Sink の購読は安定 ID ではなく `external_name` で行う（安定 ID は DB 行用。オーナー決定、scada-design.md §9.6、§5.2）。**コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
 対象: Issue [#228](https://github.com/tyaro/banto-industrial/issues/228)（外部 RDB の値をタグ空間へ取り込む Source）と [#229](https://github.com/tyaro/banto-industrial/issues/229)（タグ値を外部 RDB へ保存する Sink / Logger）。**2 件はペアで 1 設計**とし、DB 接続エンティティを共有する。
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース。§2 非スコープの「ロガー作らない」決定を本書 §2.1 で扱う）、[banto-hub-t20-design.md](banto-hub-t20-design.md)（値表現と read-on-demand の先例）、[banto-hub-t21-design.md](banto-hub-t21-design.md)（構成操作の MCP と監査の型）、[plan.md](plan.md) §1（「外部時系列DB読み出し・保存」は 3〜4 案件で再利用される共通資産）。
@@ -259,9 +259,9 @@ S0 / S1 / S4 は実機不要。S2 / S5 の統合テストは CI で PostgreSQL �
 - [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md) / [banto-hub-t21-design.md](banto-hub-t21-design.md)（MCP ツールの追加時）
 - [banto-tagclient-design.md](banto-tagclient-design.md)（`value_source` に `db` を足す場合の互換性の注記）
 
-## 9. 対応 DB を増やすときの構成の選択肢（2026-10-19 検討・未決定）
+## 9. 対応 DB を増やすときの構成の選択肢（2026-10-19 検討。案 A を §9.5 で採用）
 
-PostgreSQL 以外（SQL Server・Oracle・MySQL 等）に広げるとき、Hub 本体への埋め込みを増やさずに済む方法の検討。採否は未決定。
+PostgreSQL 以外（SQL Server・Oracle・MySQL 等）に広げるとき、Hub 本体への埋め込みを増やさずに済む方法の検討。**案 A は §9.5 で採用を決定**（2026-10-19 オーナー決定）。案 B（ODBC をブリッジ側で使うか）と §9.4 のサイドカーの置き場所は未決定。
 
 ### 9.1 今の状況
 
@@ -296,3 +296,25 @@ PostgreSQL 以外（SQL Server・Oracle・MySQL 等）に広げるとき、Hub �
 ### 9.4 サイドカーを別リポジトリに分けるか（2026-10-19 の CI 実測）
 
 分けても CI はほとんど短くならない。同日の cargo timings（main への push のフル CI 3 回）で、CI の長さを決める Windows の `rust` ジョブ（17〜25 分）の大半は nextest の実行で、`banto-hub-sink` 自体のビルドは CPU 時間で約 24 秒だった。sink のテストが重いのは、統合テスト（`tests/sidecar.rs`）が Hub をプロセス内に立てるための dev-dependency `banto-hub-core` による。分けると Hub の API（tagclient と取り込み口）を版付きの契約として扱う手間と、インストーラがサイドカーの成果物を取ってくる手間が増える。**サイドカーは本リポジトリに置いたまま**にするのが妥当と考える（本節の他と同じく未決定）。
+
+### 9.5 案 A の採用と、破壊的変更を許す場合の形（2026-10-19 オーナー決定）
+
+**決定**: 対応 DB を増やす構成は **案 A（汎用の値の取り込み口 + Source もサイドカー）を採用**する。形は [banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md) §12（破壊的変更を許す構成）に収める前提で詰め、下の Q1〜Q4 はいずれも推奨案で決定した。着手時期は §12 と同じく未定。
+
+**形**:
+
+1. **取り込み口は「外部から値を受け取るセッション型ドライバ」`push` にする**。§12 の `DriverRegistry` に登録する 1 種類のドライバで、1 接続 = 送り手 1 つ（DB ブリッジの DB 接続 1 本など）。ChronoGazer の `hub` 接続（`banto-collect` の `ExternalSource`）も同じ種類で、違いは値を取りに行くか送り込まれるかだけ。
+2. **値は収集（collector）を通す（Q1）**。今の `db_source` は収集を通らず `ServerTagStore` へ直接書き、停止時の Bad 化・監督（supervisor）を独自に持つ。`push` 接続は収集の外部ソースにし、Running / Stopped との連動・周期ごとの記録・品質の分類（`classify_external`）・接続 / 切断の事象（`LinkTracker`）を PLC と同じ扱いにする。
+3. **タグは普通のドライバのタグにする**。`tag_kind="db"` は廃止。アドレスは送り手が決めるキー（文字列）。
+4. **認証は接続に縛った専用の権限**: API キーの scope に `ingest:{接続}` を足し、そのキーはその接続のタグにしか値を送れない。PLC への書き込みではないので `write_path` の関門（`writable`・受付トグル等）は通さない。代わりに、接続単位の監査（接続・切断・認証失敗・未知のキーの拒否）と、1 回の量・頻度の上限を持つ。
+5. **送り方**: ブリッジ向けに WebSocket の常時接続（つながっている間はリンク Live）、スクリプト等の簡単な送り手向けに REST の一括送信。中身は「キー・値・品質（Good / Stale / Bad）・任意で発生時刻」。v1 の値は数値と bool のみ。
+6. **品質**: `classify_external` の分類をそのまま使う。WebSocket の切断から一定時間・REST の送り手の無通信が一定時間・収集の停止で Bad。
+7. **DB の設定の正は Hub（Q2）**。今の Sink（`GET /api/sink/config`）と同じくブリッジが Hub から設定を取りに来る。ブリッジ固有の設定（接続先・SQL・列の対応）は `push` 接続の `settings`（JSON）の中のブリッジが定義する区画に置き、UI・監査・設定パッケージを Hub に一本化する。DB のパスワードは平文をやめて `banto-secret-store` に置く。
+8. **書き込みの方向は v1 では持たない（Q4）**。`push` のタグへの書き込み（Hub → ブリッジ → DB）は作らない。
+
+**壊れるものと移行（Q3: 併用してから消す）**:
+
+- Hub から外すもの: `db_source` 一式、接続の種類 `postgres`、タグ種別 `db`、グループの `query_sql`。
+- 既存の設定はマイグレーションで「`push` 接続 + タグ + ブリッジの設定」へ変換する。
+- `banto-hub-sink` を Source と Sink の両方を担う **DB ブリッジ**に広げる。
+- §12.3 と同じく、Hub 内の PostgreSQL Source とブリッジ版を**併用**し、ブリッジ版で使えると判断してから Hub 内の実装を消す。

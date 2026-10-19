@@ -69,9 +69,12 @@ on:
     branches: [main]
   pull_request:
 
+# #ci-speed（2026-10-19）: 取り消すのは PR の古い実行だけ。main の実行は最後まで走らせる。
+# main を取り消すとジョブ末尾の rust-cache 保存に届かず、main のキャッシュが
+# 作り直されないまま全 PR がキャッシュ無しでビルドする（run 39319407775 で実際に起きた）。
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -301,6 +304,8 @@ jobs:
           components: rustfmt, clippy
       # `cache-workspace-crates` は見送った（#638 レビュー: rust-cache のキーにソースの中身が入らず、完全一致の復元では保存されない。checkout で更新時刻も新しくなり、自前の crate は結局ビルドし直しになる）。
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # rustfmt only parses/reformats - no compilation, so it always covers
       # every workspace member (cheap), whatever the clippy/test scope below.
       - name: fmt
@@ -353,11 +358,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # このジョブは 1 本だけなので、保存の有無（main のみ保存するか等）は rust-cache の
-      # 既定の挙動に任せる（`save-if` は付けない）。
+      # #ci-speed（2026-10-19）: キャッシュの保存は main だけ（全 rust-cache 共通）。
+      # PR も保存すると 1 本約 1GB の Windows キャッシュでリポジトリの上限 10GB に
+      # すぐ届き、main のキャッシュが消されて PR がキャッシュ無しになった
+      # （19:22 に完全一致したキーが 20:04 には消えていた）。PR は main のキャッシュを読む。
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.148
@@ -486,6 +494,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # 統合テスト（実 PostgreSQL に対する正常/NULL/未対応型/0行/クエリ
       # エラー/接続断/構成変更/状態API/書き込み拒否）。
       - name: test (db_source integration)
@@ -524,6 +534,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: clippy (chronogazer-elev / banto-hub-core の lib)
         run: cargo clippy -p chronogazer-elev -p banto-hub-core --lib -- -D warnings
       # #623 PR-2 のレビュー P2-1: `banto-instance-lock` は非 Windows に別の実装
@@ -583,6 +595,8 @@ jobs:
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # e2e/playwright.config.ts's webServer launches this binary directly
       # (not `cargo run`) - it must already exist before `pnpm e2e` below.
@@ -666,6 +680,8 @@ jobs:
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # e2e/banto-hub.playwright.config.ts's webServer launches this binary
       # directly - must exist before `pnpm e2e:banto-hub` below. banto-hub
