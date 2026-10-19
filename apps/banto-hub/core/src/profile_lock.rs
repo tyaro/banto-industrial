@@ -314,13 +314,24 @@ pub fn try_acquire_profile_lock_in(
 ) -> Result<ProfileLockGuard, ProfileLockError> {
     let mutex_name = crate::profile_paths::mutex_name(&paths.profile_id);
 
-    // 診断ファイルは、握った profile のハンドル経由で書く（パスで開き直さない。#693 レビュー）。
-    match banto_instance_lock::try_acquire_in(
-        &mutex_name,
-        dirs.profile.as_dir(),
-        LOCK_FILE_NAME,
-        &host_kind.to_string(),
-    ) {
+    // 握っている（Guarded）ときだけ、握った profile のハンドル経由で診断ファイルを書く。
+    // Plain はリンクを辿るので、握っていないときはルートだけ解いて下は辿らないパスで
+    // 書く（profile がジャンクションでも外へ書かない。#623 PR-2、#693）。
+    let result = if dirs.config.is_guarded() {
+        banto_instance_lock::try_acquire_in(
+            &mutex_name,
+            dirs.profile.as_dir(),
+            LOCK_FILE_NAME,
+            &host_kind.to_string(),
+        )
+    } else {
+        banto_instance_lock::try_acquire(
+            &mutex_name,
+            &lock_file_path(paths),
+            &host_kind.to_string(),
+        )
+    };
+    match result {
         Ok(guard) => {
             // 診断ファイルを書かなかった・作ったファイルを消せなかった理由
             // （`banto_instance_lock` はログを出さない）。排他は取れているので
@@ -392,12 +403,33 @@ mod tests {
         ));
     }
 
-    /// #693 レビュー: 診断ファイルは握った profile の `final_path` の下に書かれる。
+    /// #693: 握っていない（Plain）profile の診断ファイルは、ルートだけ解いたパスに書かれる。
     #[test]
-    fn diagnostics_file_is_written_under_the_held_profile() {
+    fn plain_diagnostics_file_is_written_at_the_resolved_path() {
+        let root = TempDir::new("profile-lock-plain-path");
+        let paths = resolve_profile_paths(root.path(), "plain-profile").expect("valid profile id");
+        let dirs = open_profile_dirs(&plain_profile_root_spec(&paths), None).expect("open dirs");
+        assert!(!dirs.config.is_guarded());
+
+        let guard =
+            try_acquire_profile_lock_in(&paths, HubHostKind::Service, dirs).expect("acquire ok");
+        assert_eq!(guard.lock_file_path(), lock_file_path(&paths).as_path());
+        assert!(lock_file_path(&paths).is_file());
+    }
+
+    /// #693: 握った（Guarded）profile の診断ファイルは、握ったハンドルの下に書かれる。
+    #[cfg(windows)]
+    #[test]
+    fn guarded_diagnostics_file_is_written_under_the_held_profile() {
         let root = TempDir::new("profile-lock-held-profile");
         let paths = resolve_profile_paths(root.path(), "held-profile").expect("valid profile id");
-        let dirs = open_profile_dirs(&plain_profile_root_spec(&paths), None).expect("open dirs");
+        std::fs::create_dir_all(root.path().join("profiles")).unwrap();
+        let mut spec = plain_profile_root_spec(&paths);
+        spec.mode = Mode::Guarded;
+        // Guarded は所有者を SYSTEM・Administrators・指定の利用者に限る。今の利用者を許す。
+        spec.owners = vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")];
+        let dirs = open_profile_dirs(&spec, None).expect("open dirs");
+        assert!(dirs.config.is_guarded());
         let expected = dirs.profile.final_path().join(LOCK_FILE_NAME);
 
         let guard =
@@ -562,8 +594,8 @@ mod tests {
     }
 
     /// `profiles\<profile-id>`（利用者が「変更」を持つ部分）がジャンクションなら、
-    /// 握る側（`Mode::Guarded`）は辿らずに断り、外のファイルを書き換えない・読まない
-    /// （診断ファイルは握った profile 経由で書くので、`Plain` は意図どおりリンクを辿る）。
+    /// ルートを解いても**そこは解かない**ので、外のファイルを書き換えず・読まない。
+    /// profile のフォルダまで解く実装にすると、外のファイルが書き換わる（反証で落ちる）。
     #[cfg(windows)]
     #[test]
     fn a_junction_below_the_root_is_not_resolved() {
@@ -580,12 +612,8 @@ mod tests {
 
         let paths =
             resolve_profile_paths(root.path(), "junction-profile").expect("valid profile id");
-        let mut spec = plain_profile_root_spec(&paths);
-        spec.mode = Mode::Guarded;
-        assert!(
-            open_profile_dirs(&spec, None).is_err(),
-            "Guarded はジャンクションの profile を辿らず断る"
-        );
+        let _guard =
+            try_acquire_profile_lock(&paths, HubHostKind::Service).expect("mutex は取れる");
 
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), VICTIM);
         let read = read_owner_info_detailed(&lock_file_path(&paths));
