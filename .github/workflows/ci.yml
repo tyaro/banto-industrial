@@ -4,8 +4,8 @@
 #   changes ──┬─ lint-format            （必ず。repo 全体の ESLint + Prettier）
 #             ├─ frontend-hub           （条件付き）
 #             ├─ frontend-chronogazer   （条件付き）
-#             ├─ rust                   （条件付き。fmt / clippy / doctest。対象は workspace 全体か -p に絞る）
-#             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にする。対象は rust と同じ）
+#             ├─ rust                   （条件付き。fmt / clippy。対象は workspace 全体か -p に絞る）
+#             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にし、doctest も回す。対象は rust と同じ）
 #             │    └─ rust-test         （rust-test-build の後。アーカイブを 3 台にシャーディングして実行）
 #             ├─ rust-db-source         （条件付き。PostgreSQL）
 #             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
@@ -40,7 +40,9 @@
 # テストバイナリを 1 回だけビルドして nextest archive（artifact `nextest-archive`、
 # 保持 1 日）にし、rust-test が 3 台のシャードでそれを展開して走らせる（ビルドしない。
 # 目的は Windows ランナーの使用時間の削減で、待ち時間は縮まらない）。doctest は nextest
-# で走らないので、rust ジョブが `cargo test --doc` を別の段で回す。rust・
+# で走らないので、rust-test-build が archive 作成後に `cargo test --doc` を回す
+# （archive ビルドでコンパイル済みの lib を再利用でき、rust ジョブで test プロファイルを
+# もう 1 回フルビルドするより速い。rust ジョブの所要時間が最長だった）。rust・
 # rust-test-build はどちらも `run_rust` と `rust_args`（ci-changes.mjs の出力）を使う。
 # デバッグ情報は `CARGO_PROFILE_DEV_DEBUG=line-tables-only` で軽くしている。
 # `--timings` は rust ジョブの clippy と rust-test-build の archive ビルドに付け、crate
@@ -269,7 +271,7 @@ jobs:
         run: pnpm --filter chronogazer build
 
   rust:
-    name: Rust (fmt / clippy / doctest)
+    name: Rust (fmt / clippy)
     needs: changes
     if: needs.changes.outputs.run_rust == 'true'
     runs-on: windows-latest
@@ -291,7 +293,7 @@ jobs:
     # saves (and PRs restore) stays a full-workspace cache.
     #
     # #ci-speed（2026-10-19）: nextest は下の `rust-test` ジョブへ分けた。このジョブは
-    # fmt / clippy / doctest だけを回す。
+    # fmt / clippy だけを回す（doctest は rust-test-build）。
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -320,9 +322,6 @@ jobs:
       # Tauri/WebView2 dependency build time is acceptable.
       - name: clippy
         run: cargo clippy ${{ needs.changes.outputs.rust_args }} --all-targets --timings -- -D warnings
-      # nextest は doctest を走らせない（nextest は rust-test ジョブ）。
-      - name: test (doctest)
-        run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
       # crate ごとのビルド時間（clippy の check ビルド）。`--timings` は追加のビルドを
       # しない（ビルドの二重化なし）。失敗しても残す。
       - name: Upload cargo timings
@@ -343,7 +342,7 @@ jobs:
   #   （ビルド → テストが直列になる）ことは承知の上で、ビルドの 3 重化をやめる。
   # - 新しく足した最初の 1 回はキャッシュが外れて、ビルドが長くなる。
   rust-test-build:
-    name: Rust test build (nextest archive)
+    name: Rust test build (nextest archive / doctest)
     needs: changes
     if: needs.changes.outputs.run_rust == 'true'
     runs-on: windows-latest
@@ -372,6 +371,14 @@ jobs:
           path: nextest-archive.tar.zst
           if-no-files-found: error
           retention-days: 1
+      # nextest は doctest を走らせない。archive のビルドでコンパイル済みの lib を
+      # 再利用できるので、rust ジョブで test プロファイルをもう 1 回フルビルドせず
+      # ここで回す。シャードはこのジョブを待つので doctest の分だけ開始が遅れる
+      # （実測: doctest 本体は約 5 秒 + doc のコンパイル）。archive のアップロードを
+      # 先に済ませてから回す。doctest が落ちるとこのジョブが失敗し、シャードは
+      # 走らない（ci-gate も赤になるので見落としはしない）。
+      - name: test (doctest)
+        run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings
         if: always()
