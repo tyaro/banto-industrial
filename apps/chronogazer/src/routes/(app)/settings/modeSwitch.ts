@@ -87,3 +87,28 @@ export function canRequest(state: SwitchUiState): boolean {
 export async function requestSwitchToOperation(autoStart: boolean): Promise<void> {
 	await invoke('switch_to_operation_mode', { autoStart });
 }
+
+/** 取り出せない形のエラーに出す一般の文言（`[object Object]` を画面に出さない）。 */
+export const UNKNOWN_ERROR_TEXT = '切り替えに失敗しました。もう一度お試しください。';
+
+/**
+ * Tauri の invoke が reject する値から、画面に出す文を取り出す（純関数）。Rust の
+ * `BantoError` は `{ kind: 'bad_request', message: '…' }` のオブジェクトで届き、検証の
+ * エラーは `{ kind: 'validation', field_errors: [{ message }] }`。文字列・`Error` も受ける。
+ * どれでも取り出せなければ一般の文言を返す。
+ */
+export function errorText(err: unknown): string {
+	if (typeof err === 'string') return err.trim() === '' ? UNKNOWN_ERROR_TEXT : err;
+	if (err instanceof Error) return err.message.trim() === '' ? UNKNOWN_ERROR_TEXT : err.message;
+	if (typeof err === 'object' && err !== null) {
+		const o = err as { message?: unknown; field_errors?: unknown };
+		if (typeof o.message === 'string' && o.message.trim() !== '') return o.message;
+		if (Array.isArray(o.field_errors)) {
+			const texts = o.field_errors
+				.map((fe) => (fe as { message?: unknown } | null)?.message)
+				.filter((m): m is string => typeof m === 'string' && m.trim() !== '');
+			if (texts.length > 0) return texts.join(' / ');
+		}
+	}
+	return UNKNOWN_ERROR_TEXT;
+}

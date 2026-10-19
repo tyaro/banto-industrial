@@ -12,6 +12,7 @@
 import { isProviderError } from '@banto/admin-core';
 import { isAdmin } from '#lib/permissions.js';
 import { sessionStore } from '#lib/session.svelte.js';
+import { errorText } from './modeSwitch';
 
 /**
  * 元 `+page.svelte` に重複していた `errorMessage()` を1本化しただけで、
@@ -25,7 +26,7 @@ export function errorMessage(err: unknown): string {
 		}
 		return err.message;
 	}
-	return String(err);
+	return errorText(err);
 }
 
 /**

@@ -9,6 +9,8 @@ const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
 import {
+	errorText,
+	UNKNOWN_ERROR_TEXT,
 	AUTO_START_DEFAULT,
 	AUTO_START_LABEL,
 	CURRENT_MODE_NOTE,
@@ -91,5 +93,34 @@ describe('requestSwitchToOperation', () => {
 	it('断られたら reject する（理由は呼び出し側が出す）', async () => {
 		invokeMock.mockRejectedValue(new Error('管理者の許可を得られませんでした'));
 		await expect(requestSwitchToOperation(true)).rejects.toThrow('管理者の許可');
+	});
+});
+
+describe('errorText（invoke の reject の形）', () => {
+	const cases: [string, unknown, string][] = [
+		['BantoError（bad_request）', { kind: 'bad_request', message: '断られました' }, '断られました'],
+		['BantoError（other）', { kind: 'other', message: '失敗' }, '失敗'],
+		[
+			'validation',
+			{
+				kind: 'validation',
+				field_errors: [
+					{ field: 'a', message: 'A' },
+					{ field: 'b', message: 'B' }
+				]
+			},
+			'A / B'
+		],
+		['文字列', '文字列の理由', '文字列の理由'],
+		['Error', new Error('エラーの理由'), 'エラーの理由'],
+		['message の無いオブジェクト', { kind: 'unauthorized' }, UNKNOWN_ERROR_TEXT],
+		['空のオブジェクト', {}, UNKNOWN_ERROR_TEXT],
+		['空文字', '', UNKNOWN_ERROR_TEXT],
+		['null', null, UNKNOWN_ERROR_TEXT],
+		['数値', 42, UNKNOWN_ERROR_TEXT]
+	];
+	it.each(cases)('%s', (_n, input, expected) => {
+		expect(errorText(input)).toBe(expected);
+		expect(errorText(input)).not.toContain('[object Object]');
 	});
 });
