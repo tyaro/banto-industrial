@@ -712,16 +712,16 @@ mod tests {
     use super::*;
     use crate::broker_glue::{BrokerSimRegistry, HubSessions};
     use crate::computed::{ComputedEngine, ServerTagStore};
-    use crate::db::init_db;
     use banto_collect::{CollectorOptions, RegistrySnapshot};
     use banto_tstore::SystemClock;
     use std::time::Duration;
 
     async fn controller_env() -> (crate::test_support::TempDir, Arc<CollectionController>) {
         let dir = crate::test_support::TempDir::new("collection-controller");
-        let pool = init_db(&dir.path().join("registry.sqlite3"))
-            .await
-            .expect("init_db");
+        // #ci-speed（2026-10-19）: マイグレーション済みテンプレートのコピー経由
+        // （`test_support::init_db_from_template` の doc を参照）。
+        let pool =
+            crate::test_support::init_db_from_template(&dir.path().join("registry.sqlite3")).await;
         let manager = Arc::new(CollectorManager::new(
             pool,
             dir.path().join("data"),
@@ -1149,6 +1149,7 @@ mod tests {
             };
             let started = start.await.expect("join start");
             let at_quit = quit.await.expect("join quit");
+            let start_accepted = started.is_ok();
             match started {
                 Ok(status) => {
                     assert_eq!(status.state, CollectionState::Running);
@@ -1161,6 +1162,13 @@ mod tests {
                     assert!(!busy(&at_quit));
                     assert_eq!(controller.status().state, CollectionState::Stopped);
                 }
+            }
+            // #ci-speed（2026-10-19）: 開始が通ると収集が Running のまま
+            // SQLite を開いていて、Windows では `_dir` の drop が毎回
+            // 削除リトライを使い切っているとみられる（CI の前後比較で確かめる
+            // 仮説）。次の回へ進む前に止めて解放する。
+            if start_accepted {
+                controller.stop().await;
             }
         }
     }
