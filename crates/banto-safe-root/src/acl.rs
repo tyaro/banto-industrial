@@ -715,6 +715,10 @@ pub struct ResetSkips {
     /// 開けなかった子（利用者が Administrators を拒否した・所有権が無いなど）。特権を
     /// 有効にせず、触らず飛ばした（#392 B3-3b の監査 Should 1）。そのまま残る。
     pub denied: Vec<std::path::PathBuf>,
+    /// 書いている最中に木の外へ移されたフォルダ（部分木を書いた後の確かめで見つけた。#623 S-1）。
+    /// 移される前に書いた分（そのフォルダ自身と中の一部）は移った先に残る。中身は移された後は
+    /// 木の外と判断して書かない。
+    pub moved_out: Vec<std::path::PathBuf>,
 }
 
 /// パスを**辿らずに**開き、持っている間は消す・名前を変えることを誰にもさせない
@@ -1663,6 +1667,30 @@ pub(crate) mod imp {
         Ok(LocalBox(sd))
     }
 
+    /// テスト用: 任意の SDDL から自己相対の記述子を作る（管理者でなくても書ける、所有者が自分の
+    /// 記述子で [`walk_dir`] を直接回す。#623 S-1）。
+    #[cfg(test)]
+    pub(crate) fn sd_from_sddl(sddl: &str) -> Result<LocalBox> {
+        let sddl = wide_str(sddl);
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `sddl` は NUL 終端。成功すれば `sd` は LocalAlloc の領域（LocalBox が解放）。
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(api(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                last_error(),
+            ));
+        }
+        Ok(LocalBox(sd))
+    }
+
     /// 開いたハンドルの**そのオブジェクトだけ**に、所有者（Administrators）と保護された DACL を
     /// 書く（`SetKernelObjectSecurity`、#392 B3-3b の監査 Must 2）。`SetNamedSecurityInfoW` や
     /// `SetSecurityInfo` と違い、**自動の継承の伝播をしない**（advapi がユーザーモードで木を
@@ -2400,13 +2428,57 @@ pub(crate) mod imp {
                 depth,
             )
         })?;
-        if walk.order == Order::RootLast {
+        // 書く歩き方では、ルート以外のフォルダの部分木を書き終えたら、そのフォルダがまだ木の中に
+        // あるかを確かめ直す（#623 S-1。緩めるは自身に書く前）。
+        let inside = if depth > 0 && walk.write.is_some() {
+            recheck_inside(walk, dir_handle, display)?
+        } else {
+            true
+        };
+        if walk.order == Order::RootLast && inside {
             if let Some(set) = &walk.write {
                 let sd = set.dir_sd;
                 walk.write(dir_handle, sd, depth > 0)?;
             }
         }
         Ok(())
+    }
+
+    /// フォルダ（`dir_handle`、木のルート以外）の本当のパスを読み直し、まだ `walk.within` の中かを
+    /// 確かめる（#623 S-1、2026-10-19 オーナー決定「おすすめで」）。外なら
+    /// [`TreeProblem::MovedOut`] を [`OnSkip`] のとおりに扱い（2 周目は止める、緩める・修復は
+    /// 記録して続ける）、`Ok(false)` を返す（呼ぶ側はそのフォルダ自身に書かない）。
+    ///
+    /// 【実測 2026-10-19、管理者でない利用者】[`open_child_by_id`] の確かめは**開いた時点**の
+    /// ものなので、締める前から握っていた古い `DELETE` のハンドル（ID で開くと共有違反に
+    /// ならない）で、書いている最中のフォルダを木の外の自分のフォルダへ移せた。移された後に
+    /// 開く孫は [`open_child_by_id`] が木の外と判断して書かないが、移される前に書いたそのフォルダ
+    /// 自身・印・中の一部は移った先に残り、確かめが無いと 2 周目は成功していた。
+    ///
+    /// **塞がるもの**: 書き終えた木の中に、木の外へ出た物を残したまま「締め終えた」としない
+    /// （2 周目は止めて緩め直す）。緩めるは移されたフォルダ自身に設定モードの形を書かない。
+    /// **塞がらないもの**: (1) 移された先に書いてしまった分（移される前に書いたそのフォルダ自身・
+    /// 印、移される前に開いて移された後に書いた子。締める向きの書き込みで、利用者が古い `DELETE`
+    /// のハンドルで動かせた物に限る。戻せない - 緩め直すのは木の中だけ）。(2) 緩めるで、この確かめ
+    /// とそのフォルダ自身への書き込みの間に移される窓（締めるでは確かめの後にそのフォルダへ書く
+    /// ことは無い）。(3) 確かめの後に移されること自体（書き終えた後の移動で、LocalSystem はもう
+    /// 書かない）。ルートは `PinnedDir` が `DELETE` を共有せずに握っている。確かめは `GetFinalPathNameByHandleW` をフォルダ 1 つにつき 1 回（ファイルには
+    /// 足さない）。ドライブ文字の無いボリュームでは失敗して fail closed（[`open_child_by_id`]
+    /// と同じ既知の制限）。
+    fn recheck_inside(
+        walk: &mut Walk<'_>,
+        dir_handle: HANDLE,
+        display: &Path,
+    ) -> std::result::Result<bool, WalkStop> {
+        let now = final_path_of(dir_handle)?;
+        if crate::guard::is_same_or_inside(&now, walk.within) {
+            return Ok(true);
+        }
+        walk.problem(TreeProblem::MovedOut {
+            path: display.to_path_buf(),
+            now,
+        })?;
+        Ok(false)
     }
 
     /// 2 周目: フォルダに書いた直後・列挙の前に印を置き（[`place_marker`]）、置けた後に
@@ -2593,6 +2665,7 @@ pub(crate) mod imp {
                 TreeProblem::ReparsePoint { path, .. } => skips.reparse.push(path),
                 TreeProblem::Hardlink { path, .. } => skips.hardlink.push(path),
                 TreeProblem::Denied { path } => skips.denied.push(path),
+                TreeProblem::MovedOut { path, .. } => skips.moved_out.push(path),
                 other @ (TreeProblem::Busy { .. }
                 | TreeProblem::Encrypted { .. }
                 | TreeProblem::MarkerOccupied { .. }
