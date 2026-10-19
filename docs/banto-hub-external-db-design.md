@@ -259,9 +259,9 @@ S0 / S1 / S4 は実機不要。S2 / S5 の統合テストは CI で PostgreSQL �
 - [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md) / [banto-hub-t21-design.md](banto-hub-t21-design.md)（MCP ツールの追加時）
 - [banto-tagclient-design.md](banto-tagclient-design.md)（`value_source` に `db` を足す場合の互換性の注記）
 
-## 9. 対応 DB を増やすときの構成の選択肢（2026-10-19 検討・未決定）
+## 9. 対応 DB を増やすときの構成の選択肢（2026-10-19 検討。案 A を §9.5 で採用）
 
-PostgreSQL 以外（SQL Server・Oracle・MySQL 等）に広げるとき、Hub 本体への埋め込みを増やさずに済む方法の検討。採否は未決定。
+PostgreSQL 以外（SQL Server・Oracle・MySQL 等）に広げるとき、Hub 本体への埋め込みを増やさずに済む方法の検討。**案 A は §9.5 で採用を決定**（2026-10-19 オーナー決定）。案 B（ODBC をブリッジ側で使うか）と §9.4 のサイドカーの置き場所は未決定。
 
 ### 9.1 今の状況
 
