@@ -1,11 +1,12 @@
 # banto-hub ドライバプラグイン設計（WASM）
 
 作成日: 2026-10-19
-状態: **Draft・オーナー決定待ち（2026-10-19）**。実装は未着手。§2 は 2026-10-19 のオーナーとの議論で合意した方向、§10 は未決事項。
+状態: **Draft・オーナー決定待ち（2026-10-19）**。実装は未着手。§2 の D1〜D6 は 2026-10-19 のオーナーとの議論で出た方向で、**本書の承認をもって決定**とする（承認後に日付付きの決定記録へ移す）。§11 は未決事項。2026-10-19 に上位モデルの監査を受け、指摘（現状記述の誤り・broker 構造・WIT の読み取り単位・同梱 UI と展開経路の安全・レジストリ変更）を反映済み。
 対象: PLC ドライバ（メーカー固有のプロトコルと登録 UI）を、banto-hub 本体を再ビルド・再リリースせずに追加・更新できるようにする。
 関連: [tag-server-design.md](tag-server-design.md) §3.4（PLC 通信ドライバとの関係）・§3.4.1（新しい PLC ドライバの置き場所、#438）・§4（タグ空間のセマンティクス）・§6（書き込み）、
 [banto-hub-t17-design.md](banto-hub-t17-design.md)（サービス・profile・UAC）、
 [banto-hub-redundancy-design.md](banto-hub-redundancy-design.md)、
+[h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（エラーの構造化）、
 [banto-hub-external-db-design.md](banto-hub-external-db-design.md)（Source のプロセス内実装の前例）。
 
 ---
@@ -16,11 +17,15 @@
 
 PLC ドライバは banto-hub のバイナリにコンパイル時に同梱される Rust クレートである（tag-server-design.md §3.4）。
 
-- ワイヤ層: `banto-plc` の `PlcClient` trait（`connect` / `read_batch` / `disconnect`）。実装は Modbus TCP（`crates/banto-plc/src/modbus/`）と SLMP（`tyaro/slmp` をタグ参照）。
-- 種別の選択: `banto-collect` の `Protocol` enum（`ModbusTcp` / `Slmp`）と `ProtocolConfig`。
-- 再接続・バックオフ・品質判定: `banto-collect`。読み書きの単一セッション直列化: `banto-broker`。書き込み: `banto-plc-write`。
+- ワイヤ層: `banto-plc` の `PlcClient` trait（`connect` / `read_batch` / `disconnect`）。読み取り単位は `ReadRequest { address, data_type }` と `StringReadRequest { address, words, encoding }`（`crates/banto-plc/src/types.rs`）。実装は Modbus TCP（`crates/banto-plc/src/modbus/`）と SLMP（`tyaro/slmp` をタグ参照）。
+- 種別の選択: `banto-collect` の公開 enum `Protocol`（`ModbusTcp` / `Slmp`）と `ClientProtocol`。banto-hub はこれらを網羅的に `match` しているため、種別を enum に足すと Hub 側にも影響が出る（`crates/banto-collect/src/config.rs`）。内部の `ProtocolConfig` は `pub(crate)` で、`hub` 接続用の `External` も持つ。
+- **Hub の読み取りは broker のセッションに相乗りする**。1 接続 = 1 ソケットで、`hub_client_factory` は SLMP / Modbus とも `BrokerReadClient` に流す（`apps/banto-hub/core/src/broker_glue.rs`）。これは 1 対 1 接続しか許さない機器で収集が全滅した #337 の対策（tag-server-design.md §6）。broker のセッションは `CollectorManager` の外で生き続ける。
+- broker のドライバ境界は `BrokerSession`（`read_batch` / `write_batch` / `disconnect`、`Err = 接続致命`。`crates/banto-broker/src/session.rs`）。
+- 再接続・バックオフ・品質判定: `banto-collect`。書き込み: `banto-plc-write`。書き込みの関門: `apps/banto-hub/core/src/write_path.rs`。
 - 書き込み可能な領域: `banto-plc-address`（プロトコルの事実としての `is_writable`）。
-- UI: `apps/banto-hub/src` にプロトコルごとの分岐（`ConnectionDrawer.svelte` の `form.protocol === 'slmp'` 等）と、Rust 側を**手で書き写した**アドレス表（`slmpDeviceTable.ts`。正本は `crates/banto-plc/src/slmp/address.rs`）を持つ。
+- シミュレーション: `BrokerSimRegistry::resolve`（`broker_glue.rs`）は `protocol == "modbus-tcp"` 以外をすべて SLMP シミュレータに倒す。シミュレーション中の書き込みは拒否せずシミュレータへ反映する（#363、2026-09-15 オーナー決定）。
+- レジストリ: `plc_connections.protocol` は SQL の `CHECK (protocol IN ('modbus-tcp','slmp','virtual','postgres','hub'))`（migration 0019）と `ALLOWED_PROTOCOLS`（`crates/banto-tags/src/plc_connection.rs`）で固定。接続設定は固定列で、`postgres` の `password` は平文で保存している。
+- UI: `apps/banto-hub/src` にプロトコルごとの分岐（`ConnectionDrawer.svelte` の `form.protocol === 'slmp'` 等）と、Rust 側を**手で書き写した**アドレス表（`slmpDeviceTable.ts`。正本は `crates/banto-plc/src/slmp/address.rs`）を持つ。設定パッケージの検証も `protocol` を固定値で見る（`configPackage.ts`）。
 
 ### 1.2 課題
 
@@ -28,46 +33,56 @@ PLC ドライバは banto-hub のバイナリにコンパイル時に同梱さ�
 2. **UI のアドレス処理が Rust と TS の二重管理**。T20-④（bit サフィックスの基数を10進→16進へ是正、2026-09-04）では両方を直した。
 3. §3.4.1（2026-10-18、#438）でワイヤ層は別リポジトリに出す方針になり CI の重さは軽減されるが、**配布単位は Hub のまま**で 1 は解消しない。
 
-## 2. 方向（2026-10-19 オーナーとの議論）
+## 2. 方向（2026-10-19 オーナーとの議論。本書の承認で決定）
 
-検討した選択肢と結論:
+検討した選択肢:
 
-| 方式                                    | 本体の再ビルド不要 | サービス運用（LocalSystem）での安全性                                                      | 障害の分離                       | 書き込みの安全契約                         | 判定                                             |
-| --------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------ | -------------------------------- | ------------------------------------------ | ------------------------------------------------ |
-| 静的リンク（現状）                      | ×                  | ◎                                                                                          | ×（同一プロセス）                | ◎（broker・write path がそのまま）         | 主力ドライバは当面このまま                       |
-| 別プロセス（kt_iot_hub 型: exe + gRPC） | ○                  | △（子プロセスが LocalSystem を継承、登録 UI は Session 0 で出せない、localhost gRPC 認証） | ◎                                | △（IPC 越しに作り直し）                    | x86/COM 等のベンダー部品に限る（本書対象外）     |
-| DLL（動的リンク）                       | ○                  | ×（DLL planting の典型的な攻撃面）                                                         | ×                                | ○                                          | 不採用（Rust に安定 ABI なし、async が越えない） |
-| **WASM（wasmtime Component Model）**    | ○                  | ◎（サンドボックス。ファイル・ネットワークに触れない）                                      | ○（trap で捕捉、Hub は落ちない） | ◎（broker・write path・関門は Hub に残る） | **採用方向**                                     |
+| 方式                                    | 本体の再ビルド不要 | サービス運用（LocalSystem）での安全性                                                                                                                                           | 障害の分離                       | 書き込みの安全契約                         | 判定                                             |
+| --------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------------ | ------------------------------------------------ |
+| 静的リンク（現状）                      | ×                  | ◎                                                                                                                                                                               | ×（同一プロセス）                | ◎（broker・write path がそのまま）         | 主力ドライバは当面このまま                       |
+| 別プロセス（kt_iot_hub 型: exe + gRPC） | ○                  | △（子プロセスが LocalSystem を継承する。サービス化した場合は登録 UI を Session 0 から出せない。localhost gRPC は認証なし - kt_iot_hub 自身のレビューも指摘、Named Pipe 案あり） | ◎                                | △（IPC 越しに作り直し）                    | x86/COM 等のベンダー部品に限る（本書対象外、Q8） |
+| DLL（動的リンク）                       | ○                  | ×（DLL planting の典型的な攻撃面）                                                                                                                                              | ×                                | ○                                          | 不採用（Rust に安定 ABI なし、async が越えない） |
+| **WASM（wasmtime Component Model）**    | ○                  | ◎（サンドボックス。ファイル・ネットワークに触れない。ただし置き場所の書き込み経路は DLL と同じ厳しさで守る - §7）                                                               | ○（trap で捕捉、Hub は落ちない） | ◎（broker・write path・関門は Hub に残る） | **採用方向**                                     |
 
-合意した要点:
+kt_iot_hub はデスクトップアプリ（利用者の権限で動く）なので別プロセス方式が素直に成り立つ。banto-hub はサービス（LocalSystem）で動くため、同じ形をそのまま持ち込めない。
+
+方向:
 
 - **D1**: 本体と別に追加・更新したいプロトコルドライバは **WASM プラグイン**にする。
 - **D2**: PLC メーカーごとに登録 UI が異なるため、**プラグインはメーカー固有の Web UI を同梱する**ことを標準とする（汎用フォームだけでは足りない）。
 - **D3**: ただしアドレス関数・設定検証は **WASM 側に必須**とする。REST・MCP・タグ CSV 取り込み・設定パッケージ・未適用キューの適用は iframe の UI を通らないため、サーバー側で同じ検証が要る。
 - **D4**: Hub はプラグインを**動的に発見・導入・更新**し、Hub の再起動を要しない。
-- **D5**: 書き込みの安全判断（タグの `writable`・API キーの `write` スコープ・受付トグル・頻度制限・監査・シミュレーション拒否・broker の直列化）は **Hub に残す**。プラグインが宣言する「書き込み可能な領域」はプロトコルの事実であって安全判断ではない（`banto-plc-address` の `is_writable` と同じ位置づけ）。
+- **D5**: 書き込みの安全判断（タグの `writable`・API キーの `write` スコープ・受付トグル・頻度制限・監査・broker の直列化。`write_path.rs` のゲート群）は **Hub に残す**。プラグインが宣言する「書き込み可能な領域」はプロトコルの事実であって安全判断ではない（`banto-plc-address` の `is_writable` と同じ位置づけ）。
 - **D6**: プラグインはフレームを組み立てる側なので Hub はフレームの意味までは検証できない。これは静的リンクのクレートを信頼するのと同種の信頼であり、**出所の保証（署名・保護された置き場所・プラグイン側リポジトリのレビューと CI）**で担保する。
 
 ## 3. 全体構成
 
 ```
 ┌──────────────────────── banto-hub（サービス, LocalSystem） ────────────────────────┐
-│ 収集（banto-collect）  品質判定  broker（直列化）  書き込みの関門・監査              │
-│ ソケット / タイムアウト / 再接続        ← I/O はすべて Hub が持つ                     │
+│ 収集（banto-collect）→ BrokerReadClient → banto-broker（1 接続 = 1 セッション）       │
+│                                            └ WasmSession（BrokerSession 実装）       │
+│                                               ソケット / タイムアウト / 再接続は Hub  │
+│ 品質判定・スケーリング・書き込みの関門・監査（write_path.rs）                        │
 │                                                                                   │
-│ Plugin Manager: 発見・署名検証・コンパイル・有効/無効・更新/ロールバック            │
+│ Plugin Manager: 発見・署名検証・展開・コンパイル・有効/無効・更新/ロールバック      │
 │   ├─ wasmtime Engine ── driver.wasm（サンドボックス、WASI なし）                    │
 │   │                      フレーム組み立て / 応答解析 / アドレス関数 / 設定検証       │
-│   └─ 静的配信 /plugins/<id>/<ver>/ui/ ── iframe（sandbox）で表示                   │
+│   └─ 静的配信 /plugins/<id>/<ver>/ui/ ── iframe（sandbox + 応答 CSP sandbox）        │
 │                                          postMessage ブリッジ（範囲を絞った API）   │
 └───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-| 層            | 担当                                                                                            |
-| ------------- | ----------------------------------------------------------------------------------------------- |
-| Hub（不変）   | 収集・品質・broker・書き込みの関門・監査・トランスポート I/O・プラグイン管理・iframe の sandbox |
-| `driver.wasm` | フレームの組み立てと解析・アドレス関数・設定の検証（純粋な計算のみ）                            |
-| `ui/`（同梱） | メーカー固有の接続設定・タグ登録画面                                                            |
+| 層            | 担当                                                                                                  |
+| ------------- | ----------------------------------------------------------------------------------------------------- |
+| Hub（不変）   | 収集・品質・スケーリング・broker・書き込みの関門・監査・トランスポート I/O・プラグイン管理・UI の隔離 |
+| `driver.wasm` | フレームの組み立てと解析・アドレス関数・設定の検証（純粋な計算のみ）                                  |
+| `ui/`（同梱） | メーカー固有の接続設定・タグ登録画面                                                                  |
+
+### 3.1 broker への組み込み
+
+- Hub では WASM ドライバを **`banto-broker` の `BrokerSession` 実装（`WasmSession`）** として P1 から入れる。読み取りも書き込みも同じセッションに相乗りし、#337 の「1 接続 = 1 ソケット」を崩さない。
+- `banto-collect` 直結の経路（`ClientProtocol` / `default_client_factory`）は ChronoGazer 用で、P5 で扱う。
+- プラグインの更新時に作り直す単位は「**broker セッション + そのプラグインを使う接続の収集タスク**」。他の接続には触れない。
 
 ## 4. パッケージとマニフェスト
 
@@ -76,176 +91,236 @@ PLC ドライバは banto-hub のバイナリにコンパイル時に同梱さ�
 1 ファイル `<id>-<version>.bantoplugin`（zip）:
 
 ```
-manifest.json
-driver.wasm
-ui/            index.html ほか（任意だが D2 により標準）
-signature      パッケージ内容のダイジェストに対する署名
+manifest.json   ┐
+driver.wasm     ├ 署名の対象（エントリ名と内容の正規化ダイジェスト、§7.1）
+ui/...          ┘
+signature       上記に対する Ed25519 署名（自身は対象外）
 ```
 
 ### 4.2 manifest.json（v1）
 
-| 項目              | 必須 | 内容                                                                          |
-| ----------------- | ---- | ----------------------------------------------------------------------------- |
-| `manifestVersion` | ○    | `1`                                                                           |
-| `id`              | ○    | プロトコル ID。`[a-z0-9][a-z0-9-]*`。レジストリの `protocol` 列にそのまま入る |
-| `version`         | ○    | SemVer                                                                        |
-| `hubApi`          | ○    | 対応する WIT インターフェースのメジャー版（例: `"1"`）                        |
-| `displayName`     | ○    | UI 表示名（例: `KEYENCE KV ホストリンク`）                                    |
-| `vendor`          |      | 作成者                                                                        |
-| `transports`      | ○    | 必要なトランスポート（`tcp` / `udp`。`serial` は §10 Q6）                     |
-| `capabilities`    | ○    | `read` / `write` / `browse` 等。Hub はここにない操作を呼ばない                |
-| `ui`              |      | 同梱 UI のエントリ（例: `ui/index.html`）                                     |
+| 項目              | 必須 | 内容                                                                        |
+| ----------------- | ---- | --------------------------------------------------------------------------- |
+| `manifestVersion` | ○    | `1`                                                                         |
+| `id`              | ○    | プロトコル ID。`[a-z0-9][a-z0-9-]*`。レジストリの `protocol` 列に入る（§5） |
+| `version`         | ○    | SemVer                                                                      |
+| `hubApi`          | ○    | 対応する WIT インターフェースのメジャー版（例: `"1"`）                      |
+| `displayName`     | ○    | UI 表示名（例: `KEYENCE KV ホストリンク`）                                  |
+| `vendor`          |      | 作成者                                                                      |
+| `transports`      | ○    | v1 は `tcp` のみ（UDP・シリアルは Q6）                                      |
+| `capabilities`    | ○    | `read` / `write`。world の選択（§6.4）と一致させる                          |
+| `ui`              |      | 同梱 UI のエントリ（例: `ui/index.html`）                                   |
 
 **組み込みの ID（`modbus-tcp` / `slmp` / `postgres` / `hub` / `virtual` 等）はプラグインで上書きできない**。同じ ID のプラグインは導入時に拒否する。
 
-## 5. WASM インターフェース（WIT の叩き台）
+## 5. レジストリと既存機能の変更
 
-設計原則:
+- **`protocol` 列**: SQL の `CHECK` と `ALLOWED_PROTOCOLS` を緩め、組み込みの ID に加えて「導入済みプラグインの ID」を受け付ける。SQL 側は `CHECK` を外し（migration）、検証は `banto-tags` の Rust 側に一本化する。
+- **プラグイン固有の設定**: `plc_connections.settings`（JSON）列を足す。共通の列（`host` / `port` / `word_order` / タイムアウト等）は従来どおり固定列。`word_order` はプラグインへ設定として渡す（§6.2）。
+- **秘密値**: `config.secret-keys` が返すキーの値は、平文の列には置かず `banto-secret-store`（DPAPI の machine スコープ）に保存する。REST・MCP・UI・設定パッケージ・監査ログでは伏せる（既存の `passwordSet` と同じ見せ方）。既存の `postgres` の平文保存の扱いは本書の範囲外。
+- **検証の注入**: `banto-tags` は `banto-plc` に依存しない方針（`banto-plc-address` の lib.rs 参照）を守り、`PlcConnectionService` / タグの検証にプラグイン検証のコールバックを渡す形にする。
+- **設定パッケージ**: `protocol` の許容値を導入済みプラグインに広げ、必要なプラグインの `(id, version)` を記録する。取り込み先に足りないプラグインがあれば、**取り込み前に一覧で断る**（取り込みは 1 トランザクションの全件検証なので、部分取り込みはしない）。
+- **未適用キュー**: 適用時に、プラグインの有無と版を再検証する（キューに積んだ時点と版が変わっていれば検証し直す）。
+- **冗長化**: 設定世代の fingerprint に「必要プラグインの `(id, version)` 集合」を含め、両系で揃っていることを確かめる。
+- **シミュレーション**: v1 ではプラグイン接続の `simulation = true` を**項目エラーで断る**（`virtual` と同じ扱い）。`BrokerSimRegistry::resolve` の既定が SLMP シミュレータに倒れるため、そのままではプラグインのフレームを SLMP シミュレータへ投げてしまう。全シミュレーション運転時は、プラグイン接続は起動しない。プラグイン側にシミュレータ（応答を組み立てる側）を持たせるかは Q9。
+- **接続テスト**: 保存前の疎通確認（`POST /api/plc-connections/test` 相当）は、`handshake` のステップ列を流して成功するかで判定する。
+
+## 6. WASM インターフェース（WIT の叩き台）
+
+### 6.1 原則
 
 - **I/O は Hub が持つ**。プラグインはソケットに触れず、「送るバイト列」と「受け取ったバイト列の解釈」だけを担う。WASI は与えない（ファイル・ネットワーク・時刻・乱数なし）。
 - 要求-応答型のプロトコル（SLMP / Modbus / KV ホストリンク / FINS 等）を前提にする。接続時のハンドシェイク（FINS/TCP のノードアドレス交換、EtherNet/IP のセッション登録等）は**ステップ列**として表す。
-- 1 回の呼び出しは同期・短時間。Hub は epoch interruption と fuel で上限を課し、超過・trap は**その接続の致命エラー**として扱う（broker の `Err = 接続致命` の契約に合わせる）。
+- **エラーの既定は致命**（`PlcError::is_connection_fatal` と同じ）。プラグインが `item-error` と分類したものだけが非致命（そのタグだけ Bad）で、それ以外の失敗・trap・タイムアウト・上限超過はすべて接続致命として broker の `Err = 接続致命` の契約に写す。エラーは文言のパースで分類しない（h9 の教訓）。
+- タイムアウト・未接続は Hub 側で起きるので WIT には出てこない。応答待ちのタイムアウトは従来どおり接続致命。
+- **生値は Hub へ**: スケーリングは Hub 側（`banto-collect`）に残す。しきい値は Hub が持たない（#533、2026-10-08 オーナー決定。使う側の設定）。文字列はプラグインが `bytes` を返し、エンコーディング（SJIS / UTF-8）のデコードは Hub が従来どおり行う。
+
+### 6.2 WIT
 
 ```wit
 package banto:driver@1.0.0;
 
 interface types {
   record setting { key: string, value: string }
-  variant value { bool(bool), int(s64), uint(u64), float(f64), text(string), bytes(list<u8>) }
-  // 非致命（そのタグだけ Bad）と致命（接続を張り直す）を型で分ける（h9 の教訓）
-  variant item-error { device(string), unsupported(string) }
+  variant value { %bool(bool), int(s64), uint(u64), float(f64), bytes(list<u8>) }
+  // 非致命（そのタグだけ Bad）。これ以外はすべて接続致命（§6.1）
+  variant item-error { device(device-error), unsupported(string) }
+  record device-error { code: u32, message: string }
   variant fatal-error { framing(string), protocol(string), invalid-config(string) }
+  // 読み書きの単位。現行の ReadRequest / StringReadRequest に合わせる
+  record tag-spec {
+    address: string,
+    data-type: string,          // Hub のデータ型名（bit / int16 / uint32 / float32 / string ...）
+    string-words: option<u32>,  // 文字列のときの語数
+  }
 }
 
 interface session {
   use types.{setting, fatal-error};
-  resource connection {
-    constructor(settings: list<setting>);
-    // 接続直後のハンドシェイク。空なら不要。
-    handshake: func() -> result<list<step>, fatal-error>;
+  // 終端の決め方。none = 応答を待たない送信
+  variant frame-rule {
+    none,
+    fixed(u32),
+    length-prefixed(prefix-spec),
+    terminator(list<u8>),
+    plugin-decides,
   }
-  // Hub が実行する 1 往復。expect は応答の終端判定に使う。
-  record step { send: list<u8>, expect: frame-rule }
-  variant frame-rule { length-prefixed(prefix-spec), terminator(list<u8>), fixed(u32), plugin-decides }
   record prefix-spec { offset: u32, width: u8, big-endian: bool, adjust: s32 }
-  // plugin-decides のとき Hub が逐次呼ぶ: 受信済みバッファが 1 応答として完結したか
-  is-complete: func(conn: borrow<connection>, buf: list<u8>) -> result<option<u32>, fatal-error>;
+  // Hub が実行する 1 往復。受信が max-len を超えたら接続致命
+  record step { send: list<u8>, expect: frame-rule, max-len: u32 }
+
+  resource connection {
+    // settings には共通列（word_order 等）とプラグイン固有の設定の両方が入る
+    create: static func(settings: list<setting>) -> result<connection, fatal-error>;
+    // 接続直後のハンドシェイク。空なら不要。接続テストにも使う
+    handshake: func() -> result<list<step>, fatal-error>;
+    // plugin-decides のとき Hub が受信のたびに呼ぶ: 完結していればその長さ
+    is-complete: func(buf: list<u8>) -> result<option<u32>, fatal-error>;
+  }
 }
 
 interface read {
-  use types.{value, item-error, fatal-error};
+  use types.{tag-spec, value, item-error, fatal-error};
   use session.{connection, step};
-  // 読み取り計画: アドレス群を往復単位にまとめる（banto-plc の planning 相当）
-  plan: func(conn: borrow<connection>, addresses: list<string>) -> result<list<planned>, fatal-error>;
-  record planned { step: step, covers: list<u32> }   // covers = addresses の添字
+  record planned { step: step, covers: list<u32> }   // covers = specs の添字
+  // 読み取り計画（banto-plc の planning 相当）。ワード順は connection の設定で決まる
+  plan: func(conn: borrow<connection>, specs: list<tag-spec>) -> result<list<planned>, fatal-error>;
   decode: func(conn: borrow<connection>, p: planned, response: list<u8>)
     -> result<list<result<value, item-error>>, fatal-error>;
 }
 
 interface write {
-  use types.{value, item-error, fatal-error};
+  use types.{tag-spec, value, item-error, fatal-error};
   use session.{connection, step};
-  record write-item { address: string, value: value }
-  encode: func(conn: borrow<connection>, items: list<write-item>) -> result<list<step>, fatal-error>;
-  check: func(conn: borrow<connection>, response: list<u8>) -> result<list<result<_, item-error>>, fatal-error>;
+  record write-item { spec: tag-spec, value: value }
+  record planned-write { step: step, covers: list<u32> }   // covers = items の添字
+  encode: func(conn: borrow<connection>, items: list<write-item>) -> result<list<planned-write>, fatal-error>;
+  check: func(conn: borrow<connection>, p: planned-write, response: list<u8>)
+    -> result<list<result<_, item-error>>, fatal-error>;
 }
 
 interface address {
   // D3: REST・MCP・CSV・設定パッケージ・UI が同じ関数を使う
-  record parsed { canonical: string, area: string, writable-area: bool, bit: option<u8>, word-count: u32 }
+  record parsed {
+    canonical: string,
+    area: string,
+    writable-area: bool,      // プロトコルの事実（D5）。書き込み許可の判断には使わない
+    bit: option<u8>,          // 記法はプラグインの文法に従う（SLMP なら .0〜.F の16進、T20-④）
+    word-count: u32,
+  }
   parse: func(text: string, data-type: string) -> result<parsed, string>;
   // 連続登録・オフセットコピー用: n 個先のアドレス
   offset: func(canonical: string, data-type: string, n: s64) -> result<string, string>;
-  help: func(locale: string) -> string;
+  help: func() -> string;
 }
 
 interface config {
   use types.{setting};
   record field-error { key: string, message: string }
   validate: func(settings: list<setting>) -> list<field-error>;
-  // 秘密として扱う設定キー（パスワード等）。Hub は監査・エクスポートで伏せる
+  // 秘密として扱う設定キー（パスワード等）。§5 の保存先へ
   secret-keys: func() -> list<string>;
 }
 
-world driver {
-  export session; export read; export address; export config;
-  export write;   // capabilities に write があるときだけ Hub が呼ぶ
-}
+// WIT の export は必須なので、書き込みの有無で world を分ける
+world driver    { export session; export read; export address; export config; }
+world driver-rw { include driver; export write; }
 ```
 
 補足:
 
-- `value` と Hub のデータ型（スケーリング・ワード順・文字列）の対応は、既存の `banto-plc` のデコード規則と突き合わせて §9 の P0 で確定する。**スケーリングと閾値は Hub 側**（`banto-collect`）に残し、プラグインは生値を返す。
-- `writable-area` はプロトコルの事実（D5）。Hub はタグ登録時の早期エラーに使うだけで、書き込み許可の判断には使わない。
-- 品質判定（Stale・Bad）は Hub が行う（tag-server-design.md §4）。プラグインの `item-error` / `fatal-error` はその入力。
+- 文言（`help`・`field-error.message`・`device-error.message`）は v1 では日本語固定（Hub の UI と同じ）。多言語化は扱わない。
+- データ型名・ワード順・bit 記法と既存の `banto-plc` のデコード規則の突き合わせは P0 で行い、組み込み版と同じ値になることを完了条件にする。
 
-## 6. 発見・導入・更新
+### 6.3 インスタンスと並行性
 
-### 6.1 置き場所
+wasmtime の `Store` は並行に使えないため、用途ごとに分ける:
 
-- `%ProgramData%\BantoHub\plugins\<id>\<version>\`（展開済みのパッケージ）。
-- ACL は管理者とサービスだけが書き込める保護された DACL。作成と検証は `banto-safe-root` の部品（辿らずに開く `pin_dir`、`acl::guard`）を使う。
+- **接続用**: 接続ごとに 1 つの `Store` とインスタンスを持ち、その broker セッションのタスクが専有する。trap したらインスタンスを破棄し、次の再接続で作り直す（線形メモリの状態を持ち越さない）。
+- **検証用**（`address` / `config`）: REST・MCP・CSV・UI ブリッジから並行に呼ばれるので、状態を持たないインスタンスのプールで処理する。trap は検証エラーとして返し、接続には影響させない。
 
-### 6.2 導入経路
+### 6.4 リソース上限
 
-- **標準: Hub の管理 UI / admin REST からのアップロード**。管理者ロールのみ。Hub（サービス）が署名を検証し、自分で 6.1 へ展開する。現場の利用者がフォルダを触る必要がなく、ACL も崩れない。
-- 導入・削除・有効化・ロールバックは監査ログに記録する。
-- ロックダウン中の扱いは tag-server-design.md §5.6 の管理面と同じ（§10 Q7）。
+- 実行時間は **epoch interruption** で区切る（fuel は使わない。計測は P0）。超過は接続用なら接続致命、検証用なら検証エラー。
+- 線形メモリに上限を設ける。受信バッファは `step.max-len` で上限を持つ（`plugin-decides` で完結しないまま伸び続けることを防ぐ）。
 
-### 6.3 発見
+## 7. 発見・導入・更新
 
-- 起動時に 6.1 を走査し、各バージョンについて マニフェスト検証 → 署名検証 → `hubApi` 照合 → WASM のコンパイル を行う。
+### 7.1 導入（アップロードと展開）
+
+LocalSystem のサービスが利用者由来のファイルを展開する経路なので、DLL を却下したのと同じ厳しさで守る。
+
+1. 導入は Hub の管理 UI / 管理 REST（`/api/plugins`、管理者ロールのみ）からのアップロードだけ。現場の利用者がフォルダを触る経路は作らない。
+2. アップロードは展開せずにサービス専有の staging に受け取る。サイズに上限を設ける。
+3. **署名を検証するまで一切展開しない**。署名の対象は「全エントリの名前と内容」の正規化ダイジェスト（`signature` 自身を除く）。
+4. エントリ名は許可リスト（英数字・`-`・`_`・`.`・`/` の相対パスのみ。`..`・絶対パス・ドライブ指定・`:`・予約名を断る）。展開後の合計サイズとエントリ数にも上限を設ける。
+5. 展開は `banto-safe-root` の `root`（`open_root` / `SafeRoot` / `ManagedDir`）でハンドル基準に行い、完成した staging を `<id>\<version>\` へ原子的に置き換える。
+6. 導入・削除・有効化・ロールバックは監査ログに記録する。
+7. ロックダウン中の扱いは Q7。
+
+### 7.2 置き場所
+
+- `%ProgramData%\BantoHub\plugins\<id>\<version>\`（展開済み）。
+- 管理者とサービスだけが書き込める保護された DACL。作成と確かめは `banto-safe-root` の部品（`acl::pin_dir`、`guard`、`root`）を使う。
+
+### 7.3 発見
+
+- 起動時に 7.2 を走査し、各バージョンについて マニフェスト検証 → **署名の再検証** → `hubApi` 照合 → 失効の確認（§9）→ WASM のコンパイル を行う。
 - 導入・更新時はその場で登録し、Hub の再起動を要しない。
-- 一覧 API `GET /api/v1/plugins` で、プラグインごとの状態（有効 / 無効とその理由: 署名不正・API 版不一致・コンパイル失敗・ID 衝突）を返す。
+- 一覧 API `GET /api/plugins`（管理面）で、プラグインごとの状態（有効 / 無効とその理由: 署名不正・API 版不一致・コンパイル失敗・ID 衝突・失効）を返す。
 
-### 6.4 更新とロールバック
+### 7.4 更新とロールバック
 
-- **有効なバージョンはプラグイン ID ごとに 1 つ**（Hub 全体の設定）。接続ごとのバージョン固定は v1 では持たない（§10 Q4）。
-- 更新時は、そのプラグインを使う接続のタスクだけを作り直す（`Collector::apply_config` の差分適用）。他の接続には触れない。
-- 直前のバージョンは残し、管理 UI から 1 操作で戻せる。
+- **有効なバージョンはプラグイン ID ごとに 1 つ**（Hub 全体の設定）。接続ごとのバージョン固定は v1 では持たない（Q4）。
+- 更新時は §3.1 の単位（broker セッション + 収集タスク）だけを作り直す。
+- 直前のバージョンは残し、管理 UI から 1 操作で戻せる。ただし失効した版（§9）には戻せない。
 
-### 6.5 プラグインが無いとき
+### 7.5 プラグインが無いとき
 
 - 接続・グループ・タグの設定は残す。その接続は「ドライバ未導入」状態で起動せず、タグの品質は Bad。
 - 設定を消したり別プロトコルに読み替えたりしない。
-- タグ登録（REST・MCP・CSV）は D3 の検証ができないため、そのプロトコル配下では拒否する。
+- タグ登録（REST・MCP・CSV）は D3 の検証ができないため、そのプロトコル配下では断る。設定パッケージは §5 のとおり取り込み前に断る。
 
-## 7. 同梱 UI（iframe）
+## 8. 同梱 UI（iframe）
 
-- Hub が `/plugins/<id>/<version>/ui/` で静的配信し、接続設定・タグ登録の画面で iframe として表示する。
-- `sandbox="allow-scripts"`（`allow-same-origin` を付けない）と専用の CSP（外部への接続禁止）を付ける。プラグインの UI は Hub の Cookie・API トークン・DOM に触れない。
-- Hub とは `postMessage` のブリッジだけでやりとりする。ブリッジが公開する操作（v1 案）:
-  - 現在の接続設定の取得・保存の**提案**（保存は Hub 側のフォームで確定）
+- Hub が `/plugins/<id>/<version>/ui/` で静的に配信し、接続設定・タグ登録の画面で iframe として表示する。配信は管理 UI のセッションで認証する。
+- **トップレベルで直接開かれても隔離が効くように、応答ヘッダで隔離する**。埋め込む側の `sandbox` 属性だけでは、URL を直接開かれたときに Hub のオリジンで動いてしまい、管理 UI がブラウザに持つトークンと管理 REST に届く。プラグイン UI の応答には次を付ける:
+  - `Content-Security-Policy: sandbox allow-scripts; default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; form-action 'none'; frame-ancestors 'self'`
+- 埋め込む側にも `sandbox="allow-scripts"`（`allow-same-origin` は付けない）を付ける。Hub 本体の CSP（`hub_security_headers`）に `frame-src 'self'` を明示する。
+- Hub とは `postMessage` のブリッジだけでやりとりする。sandbox 化した文書の `event.origin` は `"null"` になるため、相手は **`event.source === iframe.contentWindow`** で確かめ、応答はその `event.source` にだけ返す。
+- ブリッジが公開する操作（v1 案）:
+  - 現在の接続設定の取得（秘密値は伏せる）と、保存の**提案**（保存は Hub 側のフォームで確定）
   - `address.parse` / `address.offset` / `config.validate` の呼び出し（D3 と同じ関数）
   - タグ登録案の提出 → **Hub 側のプレビューと確定**を経て既存の登録経路（検証・未適用キュー・監査）へ
-- 秘密の設定値（`config.secret-keys`）は UI へ平文で返さない。
 - デスクトップシェル（banto-hub-shell の WebView）でもブラウザでも同じに動く。別プロセスを起動しないので、サービス運用の Session 0 問題はない。
 
-## 8. 信頼と署名
+## 9. 信頼・署名・失効
 
 - 署名は Ed25519。検証鍵は Hub のビルドに埋め込み、鍵の更新に備えて複数を許す。
-- v1 で受け入れるのは**自社の鍵で署名したプラグインのみ**。第三者製の受け入れは §10 Q2。
+- v1 で受け入れるのは**自社の鍵で署名したプラグインのみ**。第三者製の受け入れは Q2。
 - プラグインのソースは別リポジトリ（§3.4.1 と同じ）に置き、通常のレビューと CI（ワイヤ層のテスト・モックでの分割受信・不正応答・無応答・切断）を通したものだけを署名する。
-- WASM のリソース上限: メモリ上限・epoch interruption・fuel を Hub が設定する。超過は接続の致命エラー。
+- **失効**: 漏洩した鍵や欠陥のある版に備え、「失効した鍵」と「プラグインごとの最低許容版」の一覧を持つ。ロールバック（§7.4）は署名済みの脆弱な旧版へ戻す経路にもなりうるため、失効した版には戻せないようにする。一覧の配り方（Hub の更新に同梱するか、別に署名付きで配るか）は Q10。
 
-## 9. 段階計画（案）
+## 10. 段階計画（案）
 
-| 段階 | 内容                                                                                                                                                     | 完了条件                                                               |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| P0   | スパイク: wasmtime 組み込みのサイズ・ビルド時間・性能を測る。Modbus TCP を WASM で書き直し、組み込み版と同じ実機・シミュレータで読み取りを比較。WIT 確定 | 計測値と WIT v1 を本書に記録しオーナー判断                             |
-| P1   | Hub 側ランタイム: Plugin Manager（手動配置のみ）、`banto-collect` に WASM 接続種別、読み取りのみ                                                         | シミュレータで組み込み版と同じ値・品質                                 |
-| P2   | 導入・発見: アップロード、署名検証、保護された置き場所、一覧 API、更新とロールバック、監査                                                               | 再起動なしで導入・更新・ロールバック                                   |
-| P3   | UI: アドレス関数・設定検証を REST・MCP・CSV へ配線（D3）、iframe 配信とブリッジ                                                                          | プラグインの UI から接続とタグを登録でき、REST・MCP でも同じ検証が効く |
-| P4   | 書き込み: `write` を broker 経由で配線。Hub の関門・監査はそのまま                                                                                       | 既存の書き込み系テストと同じ観点を WASM 接続で通す                     |
-| P5   | 周辺: 設定パッケージへの必要プラグインの記録、冗長化の両系照合、ChronoGazer での読み込み                                                                 | 各文書へ反映                                                           |
+| 段階 | 内容                                                                                                                                                                                                                            | 完了条件                                                                 |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| P0   | スパイク: wasmtime 組み込みのサイズ・ビルド時間（Windows CI を含む）・性能を測り、`cargo deny`（依存ツリー・ライセンス）を確認する。Modbus TCP を WASM で書き直し、組み込み版と同じ実機・シミュレータで読み取りを比較。WIT 確定 | 計測値と WIT v1 を本書に記録し、組み込み版と同じ値（ワード順・型を含む） |
+| P1   | Hub 側ランタイム: Plugin Manager（手動配置のみ）、`WasmSession`（`BrokerSession` 実装）で読み取り、レジストリ変更（§5 の `protocol`・`settings`・シミュレーションの拒否）                                                       | 組み込み版と同じ値・品質、broker の 1 接続 = 1 ソケットを保つ            |
+| P2   | 導入・発見: アップロード、署名の検証、安全な展開（§7.1）、保護された置き場所、一覧 API、更新とロールバック、失効、監査                                                                                                          | 再起動なしで導入・更新・ロールバック、不正なパッケージを展開前に断る     |
+| P3   | UI: アドレス関数・設定検証を REST・MCP・CSV へ配線（D3）、秘密値の保存、iframe の配信とブリッジ（§8）                                                                                                                           | プラグインの UI から接続とタグを登録でき、REST・MCP でも同じ検証が効く   |
+| P4   | 書き込み: `driver-rw` の `write` を `WasmSession::write_batch` に配線。Hub の関門・監査はそのまま                                                                                                                               | 既存の書き込み系テストと同じ観点を WASM 接続で通す                       |
+| P5   | 周辺: 設定パッケージ・未適用キュー・冗長化の fingerprint（§5）、ChronoGazer（`banto-collect` 直結の経路）での読み込み                                                                                                           | 各文書へ反映                                                             |
 
-## 10. 未決事項（オーナー判断）
+## 11. 未決事項（オーナー判断）
 
 - **Q1**: KEYENCE KV（#438）を最初のプラグインにするか、§3.4.1 のとおり組み込みで進めるか。
-- **Q2**: 第三者（SI・メーカー）製プラグインを受け入れるか。受け入れるなら鍵の発行、読み取り専用への制限、UI ブリッジのさらなる制限が要る。
+- **Q2**: 第三者（SI・メーカー）製プラグインを受け入れるか。受け入れるなら鍵の発行、読み取り専用（`driver` world のみ）への制限、UI ブリッジのさらなる制限が要る。
 - **Q3**: 既存の SLMP / Modbus TCP をプラグインへ移すか（P0 の比較結果を見て判断）。
 - **Q4**: 接続ごとのバージョン固定が必要か（v1 は Hub 全体で 1 バージョン）。
 - **Q5**: タグの browse（PLC からのシンボル一覧取得）を v1 に入れるか。入れるなら `browse` インターフェースと、UI ブリッジからのオンライン操作の扱いを追加設計する。
-- **Q6**: シリアル（RS-232C/485）トランスポートを対象にするか。
+- **Q6**: UDP・シリアル（RS-232C/485）のトランスポートを対象にするか（v1 は TCP のみ。UDP ではデータグラム境界が終端になる）。
 - **Q7**: ロックダウン中のプラグイン導入・更新を許すか（管理面の他操作と同じ扱いにするか）。
 - **Q8**: x86 / COM / デスクトップ前提のベンダー部品（JoyWatcher・OPC DA 等）向けの別プロセス枠を別途設計するか（本書の対象外）。
+- **Q9**: プラグイン接続のシミュレーションを提供するか（v1 は断る）。提供するなら WIT にシミュレータ（応答を組み立てる側）のインターフェースを足す。
+- **Q10**: 失効一覧の配り方（Hub の更新に同梱するか、署名付きで別に配るか）。

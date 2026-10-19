@@ -289,7 +289,9 @@ FA-Server の「タグ空間」に相当するものは **`banto-collect` の
 
 FA-Server の「通信ドライバ」に相当するのは `banto-plc`（I2/I2a）の
 プロトコル実装であり、**hub のバイナリにコンパイル時に同梱される Rust
-クレート**（プラグインや別プロセスではない）。関係は次の一方向の層構造:
+クレート**（プラグインや別プロセスではない）。本体を再ビルドせずにドライバを
+追加・更新する WASM プラグイン案は [banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)
+で検討中（2026-10-19 Draft・オーナー決定待ち。決定までは本節が正）。関係は次の一方向の層構造:
 
 ```
 banto-hub ──> banto-collect (I3b) ──> banto-plc (I2)  ──> ワイヤ
