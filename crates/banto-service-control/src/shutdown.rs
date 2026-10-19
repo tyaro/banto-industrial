@@ -357,7 +357,7 @@ impl<E: Copy + Send + Sync + 'static> ServiceStatusReporter<E> {
     /// （1 から）。`wait_hint` は [`MAX_WAIT_HINT`] で丸める。
     ///
     /// **START_PENDING の間、SCM は STOP を `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`
-    /// （1061）で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
+    /// か 1052 で断り、PRESHUTDOWN も届けない**（`ControlService` の文書）。
     /// 長い起動は、止められない時間を延ばす。
     pub fn report_start_progress(&self, wait_hint: Duration) -> bool {
         let mut state = lock(&self.shared.state);
