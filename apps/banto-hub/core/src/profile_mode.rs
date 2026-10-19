@@ -263,8 +263,13 @@ pub fn plan_relax_only(observation: &RootObservation, stored: StoredOwners) -> R
 // --- 段ごとの終了コード ----------------------------------------------------------------
 
 /// 1 周目が断った後の終了コード: 見つけた物があれば何も変えずに 4、I/O は 3、止める合図は
-/// 中止 = 0。
-pub fn exit_after_scan_refusal(refusal: &ScanRefusal) -> u32 {
+/// 中止 = 0。ただし締まった形から再開していたとき（`from_tight`）は、何も変えていなくても
+/// profile は締まったままなので、理由によらず 5（4 は「緩んだまま」、0 は「緩んでいる」と
+/// 読まれ、呼び出し側が Desktop を許してしまうため）。
+pub fn exit_after_scan_refusal(refusal: &ScanRefusal, from_tight: bool) -> u32 {
+    if from_tight {
+        return HUB_EXIT_LEFT_TIGHT;
+    }
     match refusal {
         ScanRefusal::Problems(_) => HUB_EXIT_NOT_OPERATIONAL,
         ScanRefusal::Io(_) => HUB_EXIT_START_FAILED,
@@ -394,12 +399,21 @@ pub fn owners_record_failed_line(error: &str) -> String {
     )
 }
 
-/// 1 周目が断ったときの行。
-pub fn scan_refused_lines(problems: &[TreeProblem]) -> Vec<String> {
-    let mut lines = vec![format!(
-        "{LABEL}: 運用モードにできません（終了コード {HUB_EXIT_NOT_OPERATIONAL}）: profile に締められない物が {} 件あります。何も変えていません（設定モードのまま）。リンク・ハードリンクは外し、暗号化は解除し、開けないファイルは権限を戻してから、もう一度運用モードにしてください",
-        problems.len()
-    )];
+/// 1 周目が断ったときの行。`from_tight` は締まった形から再開していたか（そのときは
+/// 「設定モードのまま」と書かず、締まったまま 5 で終わると書く）。
+pub fn scan_refused_lines(problems: &[TreeProblem], from_tight: bool) -> Vec<String> {
+    let first = if from_tight {
+        format!(
+            "{LABEL}: 運用モードで再開できません（終了コード {HUB_EXIT_LEFT_TIGHT}）: profile に締められない物が {} 件あります。何も変えていません（profile は締まったまま＝運用モードの形のまま）。リンク・ハードリンクは外し、暗号化は解除し、開けないファイルは権限を戻してから、もう一度開始してください。設定モードに戻すなら{REPAIR_HINT}",
+            problems.len()
+        )
+    } else {
+        format!(
+            "{LABEL}: 運用モードにできません（終了コード {HUB_EXIT_NOT_OPERATIONAL}）: profile に締められない物が {} 件あります。何も変えていません（設定モードのまま）。リンク・ハードリンクは外し、暗号化は解除し、開けないファイルは権限を戻してから、もう一度運用モードにしてください",
+            problems.len()
+        )
+    };
+    let mut lines = vec![first];
     for problem in problems.iter().take(SCAN_PROBLEMS_SHOWN) {
         lines.push(format!("{LABEL}:   {problem}"));
     }
@@ -700,19 +714,28 @@ mod tests {
     #[test]
     fn exits_per_stage() {
         assert_eq!(
-            exit_after_scan_refusal(&ScanRefusal::Problems(vec![])),
+            exit_after_scan_refusal(&ScanRefusal::Problems(vec![]), false),
             HUB_EXIT_NOT_OPERATIONAL
         );
         assert_eq!(
-            exit_after_scan_refusal(&ScanRefusal::Io(
-                banto_safe_root::SafeRootError::UnsupportedPlatform
-            )),
+            exit_after_scan_refusal(
+                &ScanRefusal::Io(banto_safe_root::SafeRootError::UnsupportedPlatform),
+                false
+            ),
             HUB_EXIT_START_FAILED
         );
         assert_eq!(
-            exit_after_scan_refusal(&ScanRefusal::Stopped(TreeStop::Stop)),
+            exit_after_scan_refusal(&ScanRefusal::Stopped(TreeStop::Stop), false),
             0
         );
+        // 締まった形から再開して断ったら、理由によらず締まったまま 5。
+        for refusal in [
+            ScanRefusal::Problems(vec![]),
+            ScanRefusal::Io(banto_safe_root::SafeRootError::UnsupportedPlatform),
+            ScanRefusal::Stopped(TreeStop::Stop),
+        ] {
+            assert_eq!(exit_after_scan_refusal(&refusal, true), HUB_EXIT_LEFT_TIGHT);
+        }
         let io = AbortReason::Io(banto_safe_root::SafeRootError::UnsupportedPlatform);
         assert_eq!(
             after_close_abort(&io),
@@ -754,6 +777,9 @@ mod tests {
         )
         .contains("所要 1.5 秒"));
         let many: Vec<TreeProblem> = Vec::new();
-        assert_eq!(scan_refused_lines(&many).len(), 1);
+        assert_eq!(scan_refused_lines(&many, false).len(), 1);
+        let tight = scan_refused_lines(&many, true);
+        assert!(tight[0].contains("終了コード 5"), "{tight:?}");
+        assert!(!tight[0].contains("設定モードのまま"), "{tight:?}");
     }
 }

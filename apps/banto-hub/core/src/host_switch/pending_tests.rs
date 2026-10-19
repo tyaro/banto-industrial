@@ -269,6 +269,42 @@ fn left_tight_survives_a_failed_start_and_still_blocks_the_desktop() {
     assert_eq!(engine.state().service_fault, None);
 }
 
+/// #699 レビュー P2: LeftTight の後の再開が受理され、締まった形のまま 4 で止まっても、
+/// LeftTight を CannotOperate で上書きせず、SwitchToDesktop の再要求で Desktop にしない。
+#[test]
+fn left_tight_survives_a_resume_that_stops_with_4_and_still_blocks_the_desktop() {
+    let scm = Scripted::with_state(stopped_with(5));
+    let mut engine = engine(&scm, HostKind::Offline);
+    engine.step(SwitchCommand::SwitchToService).unwrap();
+    faulted(poll(&mut engine));
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    // 再開が受理され、Running にならずに 4 で止まった。
+    scm.set(summary(ScmState::StartPending, 1));
+    assert_eq!(
+        engine.step(SwitchCommand::SwitchToService).unwrap(),
+        StepOutcome::Progressed
+    );
+    scm.set(stopped_with(4));
+    let (reached, _, _) = faulted(poll(&mut engine));
+    assert_eq!(reached, HostKind::Offline);
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    // SwitchToDesktop の再要求: Stopped/4 は「緩め終えた」印ではないので渡さない。
+    let (reached, stage, _) = faulted(engine.step(SwitchCommand::SwitchToDesktop).unwrap());
+    assert_eq!(
+        (reached, stage),
+        (HostKind::Offline, FaultStage::AwaitingServiceRelease)
+    );
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    assert_eq!(engine.state().current, HostKind::Offline);
+    // relax-only で緩め終えて Stopped/0 になれば通る。
+    scm.set(stopped_with(0));
+    assert_eq!(
+        engine.step(SwitchCommand::SwitchToDesktop).unwrap(),
+        StepOutcome::Completed(HostKind::Desktop)
+    );
+    assert_eq!(engine.state().service_fault, None);
+}
+
 #[test]
 fn left_tight_is_cleared_once_the_service_is_running_and_healthy() {
     let scm = Scripted::with_state(stopped_with(5));

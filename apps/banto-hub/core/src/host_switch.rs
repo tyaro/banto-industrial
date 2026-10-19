@@ -650,7 +650,7 @@ where
         }
         // LeftTight（締めたまま止まった）は安全が確かめられるまで消さない: start が失敗して
         // Stopped/5 のままでも、SwitchToDesktop が SCM を照会し直せるように。
-        // 消えるのは Service 完了時と、再要求時の照会で Stopped かつ 5 でないと確かめたとき。
+        // 消えるのは Service 完了時と、再要求時の照会で Stopped かつ 0（緩め終えた）と確かめたとき。
         if self.state.service_fault != Some(ServiceFault::LeftTight) {
             self.state.service_fault = None;
         }
@@ -686,8 +686,9 @@ where
                 Ok(self.issue_stop())
             }
             HostKind::Offline => {
-                // 締めたまま止まった後の再要求: 終了コード 5 のままなら Desktop に渡さない
-                // （relax-only で緩めて 0 になっていれば通す）。照会に失敗したら安全側で失敗。
+                // 締めたまま止まった後の再要求: 終了コード 0（relax-only で緩め終えた）を
+                // 見たときだけ Desktop に渡す。5 はもちろん、4・その他の値も「緩んだ」とは
+                // 確かめられないので LeftTight を保つ。照会に失敗したら安全側で失敗。
                 if self.state.service_fault == Some(ServiceFault::LeftTight) {
                     match self.service_manager.query_status() {
                         Ok(status) => {
@@ -705,6 +706,21 @@ where
                                 self.left_tight_fault(&status, "再要求時に SCM を確かめ直しました")
                             {
                                 return Ok(out);
+                            }
+                            let end = service_exit_with(
+                                &status,
+                                HUB_EXIT_NOT_OPERATIONAL,
+                                HUB_EXIT_LEFT_TIGHT,
+                            );
+                            if end != ServiceEnd::Clean {
+                                let reason = format!(
+                                    "再要求時に SCM を確かめ直しました: 締めたまま止まった後、緩め終えた印（終了コード 0）がありません（{end:?}）"
+                                );
+                                return Ok(self.fault(
+                                    FaultStage::AwaitingServiceRelease,
+                                    HostKind::Offline,
+                                    reason,
+                                ));
                             }
                             self.state.service_fault = None;
                         }
@@ -805,7 +821,11 @@ where
                 if status.state == ScmState::Stopped {
                     if let Some(kind) = service_fault(&status) {
                         let reason = format!("サービスは Running にならずに止まりました: {kind}");
-                        self.state.service_fault = Some(kind);
+                        // LeftTight を持っている間は軽い印（4）で上書きしない: 締まったまま
+                        // 断った再開が 4 を返しても、緩んだとは確かめられていない。
+                        if self.state.service_fault != Some(ServiceFault::LeftTight) {
+                            self.state.service_fault = Some(kind);
+                        }
                         return self.fault_for_current_phase(reason);
                     }
                 }
