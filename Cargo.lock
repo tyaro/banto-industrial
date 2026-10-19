@@ -776,6 +776,7 @@ version = "0.2.0-alpha.31"
 dependencies = [
  "banto-desktop-tray",
  "banto-hub-core",
+ "banto-safe-root",
  "banto-server",
  "banto-service-elev",
  "serde",

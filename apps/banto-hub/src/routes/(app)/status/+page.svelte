@@ -84,14 +84,19 @@
 	import {
 		canSwitchToDesktop,
 		canSwitchToService,
+		canRestoreSettingMode,
 		canToggleAutostart,
+		fallbackNotice,
 		hostSwitchDisabledReason,
+		PAUSE_NOTE,
 		type HostSwitchGateInput
 	} from '#lib/banto/hostSwitchGate.js';
 	import {
+		describeInvokeError,
 		getHostSwitchStatus,
 		isLocalShell,
 		listenHostSwitchProgress,
+		restoreSettingMode,
 		setServiceAutostart,
 		switchToDesktop,
 		switchToService,
@@ -504,14 +509,17 @@
 	let hostProgress: HostSwitchProgress | null = $state(null);
 	let hostSwitchError: string | null = $state(null);
 	let autostartBusy = $state(false);
+	// #661 661-5: 最後に終わった切替・見張りが知らせた Fallback の理由（`leftTight` など）。
+	// シェルの状態（`hostSwitch.fallbackCause`）が来たらそちらを正とする。
+	let hostFallbackCause: string | null = $state(null);
 
 	// --- サービス一覧（S6、docs/banto-hub-external-db-design.md §5.5・§7 row
 	// S6、ローカルシェル限定）: BantoHub は上の hostSwitch カードが持つ状態
 	// をそのまま表示専用の1行として流用し、BantoHubSink（外部 DB 連携 S5 の
 	// サイドカー）だけをこのセクション固有に start/stop する
 	// （`sinkServiceShell.ts`のモジュール doc参照）。BantoHub 自体の
-	// 起動・停止は上のカードが持つ「サービスへ切り替えて開始」/
-	// 「サービスを停止してアプリで開く」（ホスト切替、意味が異なる）に
+	// 起動・停止は上のカードが持つ「運用モードに切り替える」/
+	// 「設定モードに戻す」（ホスト切替、意味が異なる）に
 	// 委ねる - このセクションで二重の操作導線は作らない。
 	let sinkService: SinkServiceStatus | null = $state(null);
 	let sinkServiceBusy = $state(false);
@@ -617,8 +625,9 @@
 		}
 		try {
 			hostSwitch = await getHostSwitchStatus();
+			hostFallbackCause = hostSwitch.fallbackCause ?? null;
 		} catch (err) {
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 		}
 	}
 
@@ -635,6 +644,7 @@
 			hostProgress = ev;
 			if (ev.error) hostSwitchError = ev.error;
 			if (ev.done) {
+				hostFallbackCause = ev.fallbackCause ?? null;
 				hostSwitchBusy = false;
 				void refreshHostSwitch();
 				void poll();
@@ -655,7 +665,7 @@
 		hostSwitchError = null;
 		hostProgress = {
 			phase: 'starting',
-			message: 'サービスへの切替を開始しています…',
+			message: '運用モードへの切り替えを始めています…',
 			done: false,
 			error: null
 		};
@@ -663,7 +673,7 @@
 			await switchToService();
 		} catch (err) {
 			hostSwitchBusy = false;
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 			toastStore.push('error', hostSwitchError);
 		}
 	}
@@ -673,7 +683,7 @@
 		hostSwitchError = null;
 		hostProgress = {
 			phase: 'starting',
-			message: 'アプリへの切替を開始しています…',
+			message: '設定モードへの切り替えを始めています…',
 			done: false,
 			error: null
 		};
@@ -681,7 +691,7 @@
 			await switchToDesktop();
 		} catch (err) {
 			hostSwitchBusy = false;
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 			toastStore.push('error', hostSwitchError);
 		}
 	}
@@ -705,11 +715,42 @@
 			toastStore.push('success', enabled ? '自動起動を有効にしました' : '自動起動を無効にしました');
 			await refreshHostSwitch();
 		} catch (err) {
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 			toastStore.push('error', hostSwitchError);
 			await refreshHostSwitch();
 		} finally {
 			autostartBusy = false;
+		}
+	}
+
+	// #661 661-5: 締まったまま止まっているときの [設定モードに戻す]。
+	const hostNotice = $derived(fallbackNotice(hostFallbackCause));
+	const allowRestoreSetting = $derived(canRestoreSettingMode(gate, hostFallbackCause));
+
+	async function handleRestoreSettingMode(): Promise<void> {
+		const ok = window.confirm(
+			`profile のファイルの保護を外し、設定モード（このアプリで Hub を動かす形）に戻します。
+
+` +
+				`${PAUSE_NOTE}
+` +
+				`戻らないときは、続けて Windows の管理者の許可（UAC）が求められます。`
+		);
+		if (!ok) return;
+		hostSwitchBusy = true;
+		hostSwitchError = null;
+		hostProgress = {
+			phase: 'starting',
+			message: '設定モードに戻しています…',
+			done: false,
+			error: null
+		};
+		try {
+			await restoreSettingMode();
+		} catch (err) {
+			hostSwitchBusy = false;
+			hostSwitchError = describeInvokeError(err);
+			toastStore.push('error', hostSwitchError);
 		}
 	}
 </script>
@@ -1147,15 +1188,15 @@
 			{/if}
 		{:else}
 			<dl class="summary">
-				<dt>現在の状態</dt>
+				<dt>サービスの状態</dt>
 				<dd>{scmStateLabel(hostSwitch.scmState)}</dd>
-				<dt>シェル表示</dt>
+				<dt>モード</dt>
 				<dd>
 					{hostSwitch.view === 'desktop'
-						? 'アプリ'
+						? '設定モード（このアプリで Hub を動かしています）'
 						: hostSwitch.view === 'service'
-							? 'サービス接続'
-							: 'フォールバック'}
+							? '運用モード（サービスで Hub を動かしています）'
+							: 'Hub が動いていません'}
 				</dd>
 			</dl>
 
@@ -1169,16 +1210,36 @@
 				<p class="config-error">切替エラー: {hostSwitchError}</p>
 			{/if}
 
+			{#if hostNotice}
+				<div class="config-error" role="alert">
+					<p><strong>{hostNotice.title}</strong></p>
+					<p>{hostNotice.message}</p>
+					{#if hostNotice.offerRestore}
+						<div class="write-control-actions">
+							<button
+								type="button"
+								onclick={handleRestoreSettingMode}
+								disabled={!allowRestoreSetting}
+							>
+								設定モードに戻す
+							</button>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<p class="note">{PAUSE_NOTE}</p>
+
 			{#if disabledReason && !allowSwitchToService && !allowSwitchToDesktop}
 				<p class="note">{disabledReason}</p>
 			{/if}
 
 			<div class="write-control-actions">
 				<button type="button" onclick={handleSwitchToService} disabled={!allowSwitchToService}>
-					サービスへ切り替えて開始
+					運用モードに切り替える
 				</button>
 				<button type="button" onclick={handleSwitchToDesktop} disabled={!allowSwitchToDesktop}>
-					サービスを停止してアプリで開く
+					設定モードに戻す
 				</button>
 			</div>
 

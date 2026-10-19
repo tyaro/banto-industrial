@@ -21,6 +21,10 @@ fn main() {
             "sink_service_status",
             "sink_service_start",
             "sink_service_stop",
+            // #661 661-5: [設定モードに戻す]（`host_switch_ipc::restore_setting_mode`）。
+            "restore_setting_mode",
+            // #706 レビュー: Fallback の窓（プレースホルダ）の [再試行]。
+            "retry_startup",
         ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }

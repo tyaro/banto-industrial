@@ -46,6 +46,9 @@ pub struct HostSwitchStatusDto {
     pub view: String,
     /// 切替トランザクション進行中か。
     pub switching: bool,
+    /// #661 661-5: Fallback の理由（`launch_gate::FallbackCause::key`。`leftTight` など）。
+    /// 一般の Fallback・Fallback でないときは`null`。
+    pub fallback_cause: Option<String>,
 }
 
 /// [`host_switch_progress`]イベントのペイロード。
@@ -60,6 +63,9 @@ pub struct HostSwitchProgressEvent {
     pub done: bool,
     /// 失敗時の理由（成功時は`null`）。
     pub error: Option<String>,
+    /// #661 661-5: 終わって Fallback になったときの理由（[`HostSwitchStatusDto::fallback_cause`]
+    /// と同じ名前）。画面が「運用モードのまま残っています」と 「設定モードに戻す」 を選ぶ。
+    pub fallback_cause: Option<String>,
 }
 
 /// 切替開始を試みる。既に進行中なら`false`。
@@ -67,6 +73,12 @@ pub(crate) fn try_begin_switch() -> bool {
     SWITCHING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
+}
+
+/// 切替（「設定モードに戻す」・見張りの適用を含む）が進行中か。
+#[cfg(windows)]
+pub(crate) fn is_switching() -> bool {
+    SWITCHING.load(Ordering::SeqCst)
 }
 
 /// 切替終了時に呼ぶ。
@@ -91,6 +103,7 @@ pub(crate) fn begin_switch_or_warn(app: &AppHandle) -> bool {
                 message: "既に切替処理が進行中です".into(),
                 done: true,
                 error: Some("既に切替処理が進行中です".into()),
+                fallback_cause: None,
             },
         );
         false
@@ -100,10 +113,10 @@ pub(crate) fn begin_switch_or_warn(app: &AppHandle) -> bool {
 /// SCM / ビュー / 権限のスナップショットを返す。
 #[tauri::command]
 pub fn host_switch_status(state: State<'_, AppState>) -> HostSwitchStatusDto {
-    let view = match &*state.view.lock().expect("view mutex poisoned") {
-        ShellView::Desktop => "desktop".to_string(),
-        ShellView::Service { .. } => "service".to_string(),
-        ShellView::Fallback(_) => "fallback".to_string(),
+    let (view, fallback_cause) = match &*state.view.lock().expect("view mutex poisoned") {
+        ShellView::Desktop => ("desktop".to_string(), None),
+        ShellView::Service { .. } => ("service".to_string(), None),
+        ShellView::Fallback(info) => ("fallback".to_string(), info.cause.key().map(str::to_string)),
     };
     let (scm_state, auto_start) = query_scm_summary();
     HostSwitchStatusDto {
@@ -112,6 +125,7 @@ pub fn host_switch_status(state: State<'_, AppState>) -> HostSwitchStatusDto {
         can_operate: state.can_operate_service,
         view,
         switching: SWITCHING.load(Ordering::SeqCst),
+        fallback_cause,
     }
 }
 
@@ -143,9 +157,10 @@ pub fn switch_to_service(app: AppHandle, state: State<'_, AppState>) -> Result<(
         &app,
         HostSwitchProgressEvent {
             phase: "starting".into(),
-            message: "サービスへの切替を開始しています…".into(),
+            message: "運用モードへの切り替えを始めています…".into(),
             done: false,
             error: None,
+            fallback_cause: None,
         },
     );
     #[cfg(windows)]
@@ -173,9 +188,10 @@ pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(
         &app,
         HostSwitchProgressEvent {
             phase: "starting".into(),
-            message: "アプリへの切替を開始しています…".into(),
+            message: "設定モードへの切り替えを始めています…".into(),
             done: false,
             error: None,
+            fallback_cause: None,
         },
     );
     #[cfg(windows)]
@@ -188,6 +204,49 @@ pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(
         end_switch();
         Err("Windows 専用です".into())
     }
+}
+
+/// #661 661-5: 「設定モードに戻す」。サービスを `relax-only` で開始して profile の権限を戻し
+/// （Operators は UAC なし）、戻らなければ昇格ヘルパーの修復（`grant-profile-acl`、UAC）を
+/// 起動する。結果は進捗イベントで知らせる（`crate::run_restore_setting`）。権限は問わない
+/// （Operators でなければ修復の UAC が最後の手段）。このアプリで Hub が動いている間
+/// （設定モード）は断る。
+#[tauri::command]
+pub fn restore_setting_mode(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if matches!(
+        *state.view.lock().expect("view mutex poisoned"),
+        ShellView::Desktop
+    ) {
+        return Err("既に設定モードです（このアプリで Hub が動いています）".into());
+    }
+    if !begin_switch_or_warn(&app) {
+        return Err("既に切替処理が進行中です".into());
+    }
+    #[cfg(windows)]
+    {
+        crate::run_restore_setting(&app);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        end_switch();
+        Err("Windows 専用です".into())
+    }
+}
+
+/// #706 レビュー: Fallback の窓（プレースホルダ）の [再試行]。トレイの「再試行」と同じく起動を
+/// 判定し直す（`crate::retry_startup`）。画面を変えるので進行中フラグを取り、判定は別のスレッドで
+/// 走らせる（health の確かめ・Hub の起動で待つため）。
+#[tauri::command]
+pub fn retry_startup(app: AppHandle) -> Result<(), String> {
+    if !begin_switch_or_warn(&app) {
+        return Err("既に切替処理が進行中です".into());
+    }
+    std::thread::spawn(move || {
+        crate::retry_startup_locked(&app);
+        end_switch();
+    });
+    Ok(())
 }
 
 /// 自動起動の ON/OFF。UAC 経由で `banto-hub-elev.exe` を起動する。
@@ -265,7 +324,7 @@ fn run_elev_uac(elev: &Path, action: &str) -> Result<(), String> {
 /// - 引数の形が違う（`InvalidToken`）は、渡すのが固定のアクション名だけなので
 ///   この経路では起きない。万一のときは共有 crate の文言をそのまま出す。
 #[cfg(any(windows, test))]
-fn elev_result_message(
+pub(crate) fn elev_result_message(
     result: Result<u32, banto_service_elev::launch::LaunchError>,
 ) -> Result<(), String> {
     use banto_service_elev::launch::LaunchError;

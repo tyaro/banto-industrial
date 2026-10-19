@@ -41,6 +41,9 @@ banto-desktop-tray = { path = "../../../crates/banto-desktop-tray" }
 # Desktop↔Service 切替ウィザード（`host_switch_status`/`host_switch_progress`
 # invoke 面）の DTO・イベントペイロードのシリアライズ用。
 serde = { workspace = true }
+# #706 レビュー: Fallback の窓（プレースホルダ）へ操作のボタンを JSON で渡す
+# （`status_text_script`）。tauri・core が既に使う workspace の依存で、パッケージは増えない。
+serde_json = { workspace = true }
 # `set_service_autostart` invoke が `banto-hub-elev.exe` を UAC 昇格して
 # 起動する（`ShellExecuteExW`、verb "runas"）。#392 B3-3a で、ここに直接
 # 持っていた Win32 の呼び出し（と `windows-sys` の依存）を共有 crate の
@@ -51,6 +54,11 @@ serde = { workspace = true }
 # target を限らない依存にしている（Win32 の部分は crate の中で
 # `#[cfg(windows)]`）。
 banto-service-elev = { path = "../../../crates/banto-service-elev" }
+# #661 661-5: Desktop へ進む前に profile の形（運用モードの形か）を、profile を読むだけで
+# 開いて見る（`launch_gate::observe_profile_mode` → `banto_safe_root::mode::observe_root`。
+# 判定はサービス本体と同じ `banto_hub_core::profile_mode::profile_shape`）。core が既に使う
+# workspace の crate で、パッケージは増えない。
+banto-safe-root = { path = "../../../crates/banto-safe-root" }
 
 # #505 のテスト専用: 窓の CSP（`tauri.conf.json`）が Hub の応答の CSP（banto の
 # `CONTENT_SECURITY_POLICY`）に Tauri の IPC を足しただけか、banto の
@@ -59,5 +67,4 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # 増えない。
 [dev-dependencies]
 banto-server = { workspace = true }
-serde_json = { workspace = true }
 

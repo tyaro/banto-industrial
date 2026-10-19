@@ -19,6 +19,8 @@ export type HostSwitchStatus = {
 	canOperate: boolean;
 	view: 'desktop' | 'service' | 'fallback' | string;
 	switching: boolean;
+	/** #661 661-5: Fallback の理由（`leftTight` など。一般・Fallback でないときは null）。 */
+	fallbackCause?: string | null;
 };
 
 /** `host_switch_progress` イベントのペイロード。 */
@@ -27,7 +29,33 @@ export type HostSwitchProgress = {
 	message: string;
 	done: boolean;
 	error: string | null;
+	/** #661 661-5: 終わって Fallback になったときの理由（`HostSwitchStatus.fallbackCause` と同じ名前）。 */
+	fallbackCause?: string | null;
 };
+
+/** invoke のエラーを文字列にできないときの中立の文（#688 で `[object Object]` が出た）。 */
+export const INVOKE_ERROR_FALLBACK =
+	'シェルの操作に失敗しました（詳しくはシェルのログを確かめてください）';
+
+/**
+ * invoke のエラーを画面に出す文にする（純関数）。Tauri の command は `Err(String)` を文字列で
+ * 返すが、ランタイムの失敗は `Error` やオブジェクトで来ることがある。`message` が文字列なら
+ * それを、文字列ならそのまま使い、どちらでもなければ（空・`[object Object]` になるもの）
+ * 中立の文を返す。
+ */
+export function describeInvokeError(
+	err: unknown,
+	fallback: string = INVOKE_ERROR_FALLBACK
+): string {
+	if (typeof err === 'string') {
+		return err.trim() === '' ? fallback : err;
+	}
+	if (err !== null && typeof err === 'object' && 'message' in err) {
+		const message = (err as { message: unknown }).message;
+		if (typeof message === 'string' && message.trim() !== '') return message;
+	}
+	return fallback;
+}
 
 /** True inside the Tauri webview（シェルの WebView）。 */
 export function isLocalShell(): boolean {
@@ -47,6 +75,14 @@ export async function switchToService(): Promise<void> {
 /** Service → Desktop。 */
 export async function switchToDesktop(): Promise<void> {
 	await invoke('switch_to_desktop');
+}
+
+/**
+ * #661 661-5: [設定モードに戻す]。サービスを relax-only で開始して profile の権限を戻し、
+ * 戻らなければ管理者の許可（UAC）で修復する。結果は進捗イベントで届く。
+ */
+export async function restoreSettingMode(): Promise<void> {
+	await invoke('restore_setting_mode');
 }
 
 /**
