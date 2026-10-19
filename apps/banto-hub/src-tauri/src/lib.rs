@@ -2250,8 +2250,9 @@ fn restore_setting_body(app: &AppHandle, target: &ProbeTarget) -> SwitchProgress
 }
 
 /// 昇格ヘルパーで profile の ACL を設定モードの形に直す（`grant-profile-acl`、UAC。呼ぶ
-/// スレッドは終わるまで止まる）。既定の profile は引数なし（対話ユーザー・既定 profile）。
-/// それ以外の profile は利用者の名前を確かに渡せないので、手順を案内して断る。
+/// スレッドは終わるまで止まる）。#706 実機確認（オーナー決定）: どの profile も、このアプリを
+/// 動かしている利用者の SID と profile-id を渡す（[`launch_gate::repair_tokens`]）。SID を
+/// 得られない・引数に使えない文字があるときだけ、手順を案内して断る。
 ///
 /// #706 レビュー: 引数なしの `grant-profile-acl` は**マシンの環境**の root を使う。シェルは
 /// このプロセスの環境で root を解くので、起動する前に両者が一致するかを確かめ、一致しない・
@@ -2261,12 +2262,6 @@ fn repair_profile_acl(target: &ProbeTarget) -> Result<(), String> {
     use banto_hub_core::profile_grant::{PRODUCT_DIR, ROOT_ENV};
     use banto_hub_core::service_elevated::ElevatedAction;
     use banto_safe_root::guard::{resolve_machine_root, win::RegistryMachineEnvironment};
-    let profile_id = target.profile_id.as_str();
-    if profile_id != banto_hub_core::profile_paths::DEFAULT_PROFILE_ID {
-        return Err(format!(
-            "既定でない profile（{profile_id}）は、管理者が banto-hub-elev.exe grant-profile-acl <利用者> {profile_id} で戻してください"
-        ));
-    }
     let helper_root = resolve_machine_root(&RegistryMachineEnvironment, ROOT_ENV, PRODUCT_DIR)
         .map_err(|error| banto_hub_core::profile_grant::machine_root_text(&error));
     launch_gate::check_repair_root(&target.root, helper_root.as_deref().map_err(String::as_str))?;
@@ -2274,10 +2269,19 @@ fn repair_profile_acl(target: &ProbeTarget) -> Result<(), String> {
         "banto-hub-elev.exe が見つかりません（シェルと同じディレクトリに配置してください）"
             .to_string()
     })?;
-    host_switch_ipc::elev_result_message(banto_service_elev::launch::run_elevated(
-        &elev,
-        &[ElevatedAction::GRANT_PROFILE_ACL],
-    ))
+    // #706 実機確認（オーナー決定）: 既定でない profile も、このアプリを動かしている利用者の
+    // SID と profile-id を渡して修復する（[`launch_gate::repair_tokens`]）。
+    let user_sid = banto_safe_root::acl::current_user_sid().map_err(|err| err.to_string());
+    let tokens = launch_gate::repair_tokens(
+        user_sid
+            .as_ref()
+            .map(|sid| sid.as_str())
+            .map_err(String::as_str),
+        target.profile_id.as_str(),
+        ElevatedAction::GRANT_PROFILE_ACL,
+    )?;
+    let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    host_switch_ipc::elev_result_message(banto_service_elev::launch::run_elevated(&elev, &tokens))
 }
 
 /// サービスの見張りの間隔（#661 661-5。Service の画面・Fallback の窓の間だけ SCM を照会する）。

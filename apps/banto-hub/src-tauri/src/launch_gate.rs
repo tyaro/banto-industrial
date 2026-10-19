@@ -565,6 +565,40 @@ pub(crate) fn check_repair_root(
     }
 }
 
+/// 修復（`banto-hub-elev.exe grant-profile-acl <利用者の SID> <profile-id>`）に渡す引数を組み立てる
+/// （純関数。#706 実機確認のオーナー決定: 既定でない profile も UAC で修復する）。
+///
+/// 利用者は**このアプリを動かしている利用者の SID**（`user_sid`。ヘルパーは名前か SID を受け、
+/// SID は大文字の `S-1-` の形で受ける）。省くとヘルパーは**昇格したトークンの利用者**を使うので、
+/// 別の管理者の資格情報で UAC に答えると、その管理者に付けてしまう - 既定の profile でも SID を
+/// 渡す。SID を得られないときは起動せずに手順を案内する。
+///
+/// 引数は `ShellExecuteExW` の 1 本のコマンドラインになるので、トークンの形（英数字と `-`。
+/// [`banto_service_elev::launch::is_valid_token`]）でなければ渡さない（profile-id は `_` を
+/// 許すので、`_` を含む profile は手順の案内になる）。
+pub(crate) fn repair_tokens(
+    user_sid: Result<&str, &str>,
+    profile_id: &str,
+    action: &str,
+) -> Result<Vec<String>, String> {
+    let manual = format!(
+        "管理者が banto-hub-elev.exe grant-profile-acl <利用者> {profile_id} で戻してください"
+    );
+    let sid = user_sid.map_err(|reason| {
+        format!("このアプリを動かしている利用者を確かめられなかったため、修復しませんでした（{reason}）。{manual}")
+    })?;
+    let tokens = vec![action.to_string(), sid.to_string(), profile_id.to_string()];
+    if let Some(bad) = tokens
+        .iter()
+        .find(|token| !banto_service_elev::launch::is_valid_token(token))
+    {
+        return Err(format!(
+            "修復に渡す引数（{bad}）に使えない文字（英数字と '-' 以外）があるため、修復しませんでした。{manual}"
+        ));
+    }
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1093,5 +1127,41 @@ mod tests {
         assert!(refused.contains("読めませんでした"), "{refused}");
         // 中（子）も別物。
         assert!(check_repair_root(&root.join("default"), Ok(&root)).is_err());
+    }
+
+    /// #706 実機確認（オーナー決定）: 既定でも既定でない profile でも、利用者の SID と
+    /// profile-id を渡す。SID を得られない・引数に使えない文字があるときは手順を案内する。
+    #[test]
+    fn repair_passes_the_signed_in_user_sid_and_the_profile() {
+        const SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        assert_eq!(
+            repair_tokens(Ok(SID), "default", "grant-profile-acl"),
+            Ok(vec![
+                "grant-profile-acl".to_string(),
+                SID.to_string(),
+                "default".to_string()
+            ])
+        );
+        assert_eq!(
+            repair_tokens(Ok(SID), "line-2", "grant-profile-acl"),
+            Ok(vec![
+                "grant-profile-acl".to_string(),
+                SID.to_string(),
+                "line-2".to_string()
+            ])
+        );
+        let refused = repair_tokens(Err("トークンを開けません"), "line-2", "grant-profile-acl")
+            .expect_err("SID が無い");
+        assert!(refused.contains("トークンを開けません"), "{refused}");
+        assert!(
+            refused.contains("grant-profile-acl <利用者> line-2"),
+            "{refused}"
+        );
+        // 注入にならない: 空白・引用符・`_` を含む値は渡さない。
+        for profile in ["line_2", "a b", "a\"b", "x&calc"] {
+            let refused = repair_tokens(Ok(SID), profile, "grant-profile-acl").expect_err(profile);
+            assert!(refused.contains("使えない文字"), "{refused}");
+        }
+        assert!(repair_tokens(Ok("S-1-5-21 x"), "default", "grant-profile-acl").is_err());
     }
 }
