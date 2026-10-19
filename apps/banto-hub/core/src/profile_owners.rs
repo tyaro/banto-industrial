@@ -106,6 +106,18 @@ pub fn write_owners(profile_id: &str, owners: &[InstallUserSid]) -> Result<(), S
     )
 }
 
+/// サービス `BantoHub` が登録されているか（`Services\BantoHub` のキーがあるか。#661 661-3。
+/// 昇格ヘルパーの `grant-profile-acl` は、登録されていなければ記録を書かない）。
+#[cfg(windows)]
+pub fn service_registered() -> Result<bool, String> {
+    use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    registry::service_key_exists_in(
+        HKEY_LOCAL_MACHINE,
+        SERVICES_KEY,
+        crate::service_manager::SERVICE_NAME,
+    )
+}
+
 #[cfg(windows)]
 mod registry {
     use std::ffi::OsStr;
@@ -118,7 +130,7 @@ mod registry {
     };
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-        KEY_CREATE_SUB_KEY, KEY_SET_VALUE, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE,
+        KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE,
         RRF_RT_REG_MULTI_SZ,
     };
 
@@ -217,6 +229,33 @@ mod registry {
             }
         }
         Err("戻す相手の記録を読めませんでした（読む間に変わり続けました）".to_string())
+    }
+
+    /// [`super::service_registered`] の本体（[`read_owners_in`] と同じ形）。
+    pub(super) fn service_key_exists_in(
+        root: HKEY,
+        services_path: &str,
+        service: &str,
+    ) -> Result<bool, String> {
+        if service.is_empty() || service.contains('\\') || service.contains('\0') {
+            return Err(format!("サービス名が不正です: {service:?}"));
+        }
+        let path = wide(&format!(r"{services_path}\{service}"));
+        let mut key: HKEY = std::ptr::null_mut();
+        // SAFETY: パスは NUL 終端の UTF-16 で、呼び出しが返るまで生きている。`key` は成功
+        // したときだけ書かれ、`Key` が閉じる。
+        let status = unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
+        match status {
+            ERROR_SUCCESS => {
+                drop(Key(key));
+                Ok(true)
+            }
+            code if is_missing(code) => Ok(false),
+            code => Err(format!(
+                "サービスのレジストリのキーを確かめられませんでした: {}",
+                os_error(code)
+            )),
+        }
     }
 
     /// [`super::write_owners`] の本体（[`read_owners_in`] と同じ形）。
@@ -419,7 +458,16 @@ mod registry {
             )
             .unwrap_err();
             assert!(err.contains("登録されていません"), "{err}");
+            assert_eq!(
+                service_key_exists_in(HKEY_CURRENT_USER, &services.0, "BantoHub"),
+                Ok(false)
+            );
             services.register("BantoHub");
+            assert_eq!(
+                service_key_exists_in(HKEY_CURRENT_USER, &services.0, "BantoHub"),
+                Ok(true)
+            );
+            assert!(service_key_exists_in(HKEY_CURRENT_USER, &services.0, r"a\b").is_err());
             let err = write_owners_in(HKEY_CURRENT_USER, &services.0, "BantoHub", "default", &[])
                 .unwrap_err();
             assert!(err.contains("0 人"), "{err}");

@@ -454,6 +454,14 @@ pub enum ElevatedError {
     /// パスの不一致などで使えない（#626 PR-B の監査 B-5。DB を開かない）。
     #[error("banto-hub-elev: {0}")]
     ProfileTargetUnsafe(String),
+    /// `reset-password`・`revert-to-commissioning`の対象の profile が使用中（Hub のサービスか
+    /// アプリが profile の mutex を持っている。#661 661-3。稼働中の DB を開かない）。文言は
+    /// `grant-profile-acl`の使用中と同じ形。
+    #[error(
+        "banto-hub-elev: profile '{id}' は使用中です（Hub のサービスかアプリが開いています - {mutex}）。サービスとアプリを止めてから、もう一度実行してください。何も変えていません",
+        mutex = crate::profile_paths::mutex_name(.id)
+    )]
+    ProfileInUse { id: String },
     /// `reset-password`/`revert-to-commissioning`対象 profile の DB
     /// （`crate::db::init_db`）・アプリ層サービス（`UsersService`/
     /// `CommissioningService`/`AuditLogService`）から返るエラーをそのまま
@@ -819,7 +827,9 @@ fn set_autostart(enabled: bool) -> Result<(), ElevatedError> {
 ///
 /// DB を開く**前に**、ルート → `profiles\` → profile → `config\` と DB のファイルを辿らずに
 /// 開いて確かめ（本当のパス・reparse point・ハードリンク）、返したものを DB を閉じるまで
-/// 持つ（#626 PR-B の監査 B-5、[`crate::profile_grant::open_target_profile`]）。DB ファイルが
+/// 持つ（#626 PR-B の監査 B-5、[`crate::profile_grant::open_target_profile`]）。その前に
+/// profile の mutex（Hub と同じもの）を取って同じく持ち、取れなければ
+/// [`ElevatedError::ProfileInUse`] で何も開かない（#661 661-3）。DB ファイルが
 /// 実在しない場合は [`ElevatedError::ProfileDbNotFound`]で早期に拒否する。
 #[cfg(windows)]
 fn resolve_target_profile_paths(
@@ -833,6 +843,7 @@ fn resolve_target_profile_paths(
         OpenTargetError::Target(error) => ElevatedError::ProfileTarget(error),
         OpenTargetError::DbNotFound(path) => ElevatedError::ProfileDbNotFound(path),
         OpenTargetError::Unsafe(reason) => ElevatedError::ProfileTargetUnsafe(reason),
+        OpenTargetError::InUse(id) => ElevatedError::ProfileInUse { id },
     })
 }
 
@@ -1831,6 +1842,12 @@ mod tests {
             (
                 ElevatedError::ProfileTargetUnsafe("y".to_string()),
                 "banto-hub-elev: y",
+            ),
+            (
+                ElevatedError::ProfileInUse {
+                    id: "default".to_string(),
+                },
+                "banto-hub-elev: profile 'default' は使用中です（Hub のサービスかアプリが開いています - Global\\BantoHub.default）。サービスとアプリを止めてから、もう一度実行してください。何も変えていません",
             ),
             (
                 ElevatedError::ProfileId(crate::profile_paths::ProfileIdError::Empty),
