@@ -378,7 +378,7 @@ fn stop_waits_for_relaxing_and_reads_the_exit_code() {
     }
 }
 
-/// 締めている間の STOP は 1061 で断られる。失敗にせず Running を待って出し直す。
+/// 締めている間の STOP は 1061（か 1052）で断られる。失敗にせず Running を待って出し直す。
 #[test]
 fn stop_refused_with_1061_waits_for_running_then_stops_again() {
     let scm = ScriptedScm::new(vec![
@@ -410,6 +410,45 @@ fn stop_refused_with_1061_takes_the_stop_on_its_own_as_the_result() {
         stop_service_and_wait(&scm, &FakeClock::new(), T, &mut |_| {}),
         StopOutcome::Stopped(ServiceExit::CannotOperate)
     );
+    assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 1);
+}
+
+/// START_PENDING の STOP は 1052 でも断られる（実機）。1061 と同じに待って出し直す。
+#[test]
+fn stop_refused_with_1052_while_start_pending_waits_for_running_then_stops_again() {
+    let scm = ScriptedScm::new(vec![
+        summary(ScmState::StartPending, 4),
+        summary(ScmState::StartPending, 5),
+        summary(ScmState::Running, 0),
+        summary(ScmState::StopPending, 1),
+        stopped_with(0),
+    ])
+    .with_stops(vec![Err(ServiceManagerError::InvalidControl), Ok(())]);
+    let outcome = stop_service_and_wait(&scm, &FakeClock::new(), T, &mut |_| {});
+    assert_eq!(outcome, StopOutcome::Stopped(ServiceExit::Clean));
+    assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 2);
+}
+
+#[test]
+fn stop_refused_with_1052_while_start_pending_takes_the_stop_on_its_own_as_the_result() {
+    let scm = ScriptedScm::new(vec![summary(ScmState::StartPending, 1), stopped_with(4)])
+        .with_stops(vec![Err(ServiceManagerError::InvalidControl)]);
+    assert_eq!(
+        stop_service_and_wait(&scm, &FakeClock::new(), T, &mut |_| {}),
+        StopOutcome::Stopped(ServiceExit::CannotOperate)
+    );
+    assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 1);
+}
+
+/// START_PENDING でも STOP_PENDING でもない 1052（Running なのに断られた等）は失敗にする。
+#[test]
+fn stop_refused_with_1052_while_running_is_a_failure() {
+    let scm = ScriptedScm::new(vec![summary(ScmState::Running, 0)])
+        .with_stops(vec![Err(ServiceManagerError::InvalidControl)]);
+    assert!(matches!(
+        stop_service_and_wait(&scm, &FakeClock::new(), T, &mut |_| {}),
+        StopOutcome::StopFailed(_)
+    ));
     assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 1);
 }
 

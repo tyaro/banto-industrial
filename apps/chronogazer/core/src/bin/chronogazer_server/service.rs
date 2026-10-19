@@ -45,7 +45,7 @@
 //!     `reopen_path_checked`、`run\endpoint.json` は握った `run\` にハンドル基準、Hub のキーは
 //!     `FileSecretStore::open_in`。動き始めたら Running を報告し、完了の行（件数・所要時間）。
 //! 13. 4〜12 の間は START_PENDING の checkpoint を進める（`report_start_progress`、1 秒ごと）。
-//!     この間 SCM は STOP を 1061 で断る。
+//!     この間 SCM は STOP を 1061／1052 で断る。
 //!
 //! # 停止（SCM の STOP = 設定モードへ。設計 §3.2）
 //!
