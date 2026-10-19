@@ -105,6 +105,18 @@
 //!   tokio のワーカーを塞がないよう `spawn_blocking` で行う。SCM が `Running` でない
 //!   間は probe しない（`needs_probe`）。
 //!
+//! # 設定モード ⇔ 運用モード（#623 PR-4、[`crate::switch`]）
+//!
+//! Fallback の窓は理由（[`FallbackCause`]）ごとに文言とボタンを変える: ルートが運用モードの形で
+//! SCM が停止（`RootBlocked`）なら「運用モード（停止中）」と [運用を再開]・[設定モードに切り替える]、
+//! 最後の停止の終了コードが 5 なら「運用モードのまま残っています」と [設定モードに戻す]、運用
+//! モードへの切り替えでサービスが 4 で止まったら「運用モードにできませんでした（理由はログ）」と
+//! [設定モードで続ける]（= 「再試行」。`decide` の表を通る）。切り替えの最中は同じ窓に
+//! 「切り替えの間は収集が止まります」と段階を出す（[`switching_page_view`]）。ボタンの処理と
+//! 切り替えの順序は [`crate::switch`]、札はライフサイクルの表の「モードの切り替えの札」の行。
+//! 見張り・「再試行」の判定は今までどおり `decide` の表を通る（[`carry_cause`] は SCM が停止で
+//! なくなったら理由を「起動の判定で」に戻すだけ）。
+//!
 //! # デバッグビルドだけの確認の口（O7）
 //!
 //! 実機で「Running → 接続」を確かめるため、**デバッグビルドだけ**次の環境変数を読む
@@ -123,6 +135,7 @@ use std::time::Duration;
 
 use banto_service_control::ScmState;
 use chronogazer_core::instance_lock::ChronoGazerHost;
+use chronogazer_core::mode_switch::{DesktopLogEntry, ServiceExit, SwitchStage};
 use chronogazer_core::paths::DataLayout;
 use chronogazer_core::service_probe::{probe_service_as, PROBE_TIMEOUT};
 use chronogazer_core::shell_launch::{
@@ -253,6 +266,51 @@ pub(crate) enum FallbackCause {
     AtStartup,
     /// Service の画面の見張りで（「サービスが止まりました」、O2）。
     ServiceLost,
+    /// データのルートが運用モードの形で、SCM は停止（`RootBlock::OperationMode`。#623 PR-4）。
+    /// `left_tight` は最後の停止の終了コードが 5（締めたまま残った）。
+    OperationStopped { left_tight: bool },
+    /// データのルートをモードの観測に使えない（リンクなど。`RootBlock::Unusable`）。
+    RootUnusable,
+    /// 運用モードへの切り替えで、サービスが 4（運用モードにできなかった）で止まった。
+    /// ファイルは変わっておらず、設定モードのまま。
+    CannotOperate,
+}
+
+impl FallbackCause {
+    /// モードに関わる理由か（SCM が停止でなくなったら意味を失う - [`carry_cause`]）。
+    fn is_mode_cause(self) -> bool {
+        matches!(
+            self,
+            Self::OperationStopped { .. } | Self::RootUnusable | Self::CannotOperate
+        )
+    }
+}
+
+/// 見張り・「再試行」で Fallback のまま表示を更新するときの理由（純関数）。モードに関わる理由は、
+/// SCM が実行中・開始や停止の途中になったら「起動の判定で」に戻す（誰かが運用を再開した・
+/// 設定モードへの切り替えが別に始まったのに「停止中」と出し続けない）。
+pub(crate) fn carry_cause(cause: FallbackCause, scm: &ScmObservation) -> FallbackCause {
+    let moving = matches!(
+        scm,
+        ScmObservation::State(
+            ScmState::Running | ScmState::StartPending | ScmState::StopPending | ScmState::Other(_)
+        )
+    );
+    if cause.is_mode_cause() && moving {
+        FallbackCause::AtStartup
+    } else {
+        cause
+    }
+}
+
+/// [`LaunchDecision::RootBlocked`] の理由から Fallback の理由を選ぶ（純関数）。
+pub(crate) fn root_blocked_cause(why: &RootBlock, last_exit: Option<ServiceExit>) -> FallbackCause {
+    match why {
+        RootBlock::OperationMode => FallbackCause::OperationStopped {
+            left_tight: last_exit == Some(ServiceExit::LeftOperation),
+        },
+        RootBlock::Unusable(_) => FallbackCause::RootUnusable,
+    }
 }
 
 /// Fallback の画面に出す状態。
@@ -277,8 +335,9 @@ pub(crate) enum ShellView {
     Fallback(FallbackState),
 }
 
-/// 起動の判定から最初の画面を決める。
-pub(crate) fn initial_view(decision: &LaunchDecision) -> ShellView {
+/// 起動の判定から最初の画面を決める。`last_exit` は SCM が停止のときの最後の終了の理由
+/// （ルートが運用モードの形のときの文言を選ぶ。#623 PR-4）。
+pub(crate) fn initial_view(decision: &LaunchDecision, last_exit: Option<ServiceExit>) -> ShellView {
     match decision {
         LaunchDecision::Service { port } => ShellView::Service { port: *port },
         LaunchDecision::Desktop { .. } => ShellView::Desktop,
@@ -288,20 +347,20 @@ pub(crate) fn initial_view(decision: &LaunchDecision) -> ShellView {
             cause: FallbackCause::AtStartup,
         }),
         // #623 PR-3: ルートが運用モードの形（締まったまま）・観測に使えない → Desktop に
-        // しない。文言・ボタン（[運用を再開]・[設定モードに切り替える]）は PR-4。
-        LaunchDecision::RootBlocked { scm, .. } => ShellView::Fallback(FallbackState {
+        // しない。PR-4: 理由ごとの文言・ボタン（[運用を再開]・[設定モードに切り替える]）。
+        LaunchDecision::RootBlocked { scm, why } => ShellView::Fallback(FallbackState {
             scm: scm.clone(),
             health: None,
-            cause: FallbackCause::AtStartup,
+            cause: root_blocked_cause(why, last_exit),
         }),
     }
 }
 
-/// [`LaunchDecision::RootBlocked`] の理由のログの 1 行（PR-4 で画面の文言にする）。
+/// [`LaunchDecision::RootBlocked`] の理由のログの 1 行（画面の文言は [`fallback_page_view`]）。
 fn root_block_line(why: &RootBlock) -> String {
     match why {
         RootBlock::OperationMode => {
-            "banto: データのフォルダが運用モードのまま（締まったまま）です。この PC の中では記録エンジンを起動しません（サービスを開始するか、relax-only で設定モードへ戻してください）".to_string()
+            "banto: データのフォルダが運用モードのまま（締まったまま）です。この PC の中では記録エンジンを起動しません（窓の「運用を再開」か「設定モードに切り替える」）".to_string()
         }
         RootBlock::Unusable(reason) => format!(
             "banto: データのフォルダをモードの観測に使えません（{reason}）。この PC の中では記録エンジンを起動しません"
@@ -373,7 +432,7 @@ pub(crate) fn on_tick(
             let next = FallbackState {
                 scm: scm.clone(),
                 health: health.cloned(),
-                cause: current.cause,
+                cause: carry_cause(current.cause, scm),
             };
             if &next == current {
                 (Step::Stay, 0)
@@ -387,26 +446,34 @@ pub(crate) fn on_tick(
 /// Fallback の「再試行」（O3）。起動と同じ `decide`（遷移中・`Running` なら Desktop に
 /// しない、照会の失敗は Desktop - O1）で決める。Fallback のままなら必ず
 /// [`Step::Refresh`]（「まだ接続できません」を出すため）。
+///
+/// #623 PR-4: 設定モードへの切り替え（サービスの停止・緩めるだけの開始・elev の修復）の後に
+/// Desktop へ進むかも、この同じ判定で決める（[`crate::switch`]）。`last_exit` は SCM が停止の
+/// ときの最後の終了の理由（ルートが運用モードの形のときの文言）。
 pub(crate) fn on_retry(
     cause: FallbackCause,
     scm: &ScmObservation,
     health: Option<&ServiceHealth>,
     mode: &RootModeObservation,
+    last_exit: Option<ServiceExit>,
 ) -> Step {
     match decide(scm, health, mode) {
         LaunchDecision::Service { port } => Step::ToService { port },
         LaunchDecision::Desktop { .. } => Step::ToDesktop,
-        LaunchDecision::Fallback(info) => Step::Refresh(FallbackState {
-            scm: ScmObservation::State(info.scm),
-            health: info.health,
-            cause,
-        }),
+        LaunchDecision::Fallback(info) => {
+            let scm = ScmObservation::State(info.scm);
+            Step::Refresh(FallbackState {
+                cause: carry_cause(cause, &scm),
+                scm,
+                health: info.health,
+            })
+        }
         LaunchDecision::RootBlocked { scm, why } => {
             eprintln!("{}", root_block_line(&why));
             Step::Refresh(FallbackState {
                 scm,
                 health: None,
-                cause,
+                cause: root_blocked_cause(&why, last_exit),
             })
         }
     }
@@ -533,6 +600,68 @@ pub(crate) struct FallbackPageView {
     pub(crate) logs_path: String,
     pub(crate) notice: Option<String>,
     pub(crate) busy: bool,
+    /// ボタン（左から。#623 PR-4 で理由ごとに変えるようにした）。
+    pub(crate) actions: Vec<PageAction>,
+    /// 処理中の段階の 1 行（`busy` のときに「確かめています…」の代わりに出す）。
+    pub(crate) stage: Option<String>,
+}
+
+/// Fallback の窓のボタン（`id` は `/__shell/<id>` - [`fallback_navigation`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PageAction {
+    pub(crate) id: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) primary: bool,
+}
+
+const fn action(id: &'static str, label: &'static str, primary: bool) -> PageAction {
+    PageAction { id, label, primary }
+}
+
+/// 切り替えの間は収集が止まる（オーナー決定。切り替えの画面に必ず出す）。
+pub(crate) const PAUSE_NOTE: &str = "切り替えの間は収集が止まります。";
+
+/// 切り替えの向き（[`switching_page_view`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchDirection {
+    ToOperation,
+    ToSetting,
+}
+
+/// 切り替えの最中の窓の表示（純関数。#623 PR-4）。ボタンは出さず（`busy`）、段階を出す。
+pub(crate) fn switching_page_view(
+    direction: SwitchDirection,
+    stage: SwitchStage,
+    logs_dir: &Path,
+) -> FallbackPageView {
+    let (title, message) = match direction {
+        SwitchDirection::ToOperation => (
+            "運用モードへ切り替えています",
+            format!("このPCで常時記録する形（運用モード）に切り替えています。{PAUSE_NOTE}"),
+        ),
+        SwitchDirection::ToSetting => (
+            "設定モードへ切り替えています",
+            format!(
+                "この画面で記録し設定を変えられる形（設定モード）に切り替えています。{PAUSE_NOTE}"
+            ),
+        ),
+    };
+    FallbackPageView {
+        title: title.to_string(),
+        message,
+        scm: String::new(),
+        health: String::new(),
+        steps: vec![
+            "記録のファイルが多いと、ファイルの権限の設定に数分かかることがあります。進んでいる間は待ち続けます。".to_string(),
+            "この窓を閉じても切り替えは続きます（トレイの「開く」で戻せます）。".to_string(),
+        ],
+        logs_path: logs_dir.display().to_string(),
+        notice: None,
+        busy: true,
+        actions: Vec::new(),
+        stage: Some(format!("{}…", stage.label())),
+    }
 }
 
 impl FallbackPageView {
@@ -543,7 +672,7 @@ impl FallbackPageView {
         format!("window.__CHRONOGAZER_SHELL_FALLBACK__ = {json};")
     }
 
-    fn render_script(&self) -> String {
+    pub(crate) fn render_script(&self) -> String {
         let json = serde_json::to_string(self).expect("FallbackPageView serializes");
         format!(
             "window.__chronogazerShellFallback && window.__chronogazerShellFallback.render({json});"
@@ -558,9 +687,12 @@ pub(crate) fn fallback_page_view(
     notice: Option<String>,
     busy: bool,
 ) -> FallbackPageView {
+    if let Some(view) = mode_page_view(state, logs_dir, notice.clone(), busy) {
+        return view;
+    }
     let title = match state.cause {
         FallbackCause::ServiceLost => "サービスが止まりました",
-        FallbackCause::AtStartup => "記録エンジン（サービス）に接続できません",
+        _ => "記録エンジン（サービス）に接続できません",
     };
     let message = match (state.cause, &state.scm) {
         (FallbackCause::ServiceLost, _) => {
@@ -598,7 +730,107 @@ pub(crate) fn fallback_page_view(
         logs_path: logs_dir.display().to_string(),
         notice,
         busy,
+        actions: default_actions(&state.scm),
+        stage: None,
     }
+}
+
+/// 起動の判定・見張りの Fallback のボタン。サービスが動いている（実行中・開始や停止の途中）間は
+/// [設定モードに切り替える] も出す（#623 PR-4）。
+fn default_actions(scm: &ScmObservation) -> Vec<PageAction> {
+    let mut actions = vec![action("retry", "再試行", true)];
+    if matches!(
+        scm,
+        ScmObservation::State(ScmState::Running | ScmState::StartPending | ScmState::StopPending)
+    ) {
+        actions.push(action("to-setting", "設定モードに切り替える", false));
+    }
+    actions.push(action("open-logs", "ログのフォルダを開く", false));
+    actions.push(action("quit", "終了", false));
+    actions
+}
+
+/// モードに関わる理由の窓（#623 PR-4。それ以外は `None`）。
+fn mode_page_view(
+    state: &FallbackState,
+    logs_dir: &Path,
+    notice: Option<String>,
+    busy: bool,
+) -> Option<FallbackPageView> {
+    let logs_step = "原因はログ（下のフォルダの chronogazer-server-日付.log）で確かめられます。";
+    let (title, message, steps, actions): (&str, &str, Vec<&str>, Vec<PageAction>) =
+        match state.cause {
+            FallbackCause::OperationStopped { left_tight: false } => (
+                "運用モード（停止中）です",
+                "このPCで常時記録する仕組み（運用モード）が止まっています。記録のファイルは保護されたままなので、この画面では記録を始めません。",
+                vec![
+                    "「運用を再開」で常時記録を再び始めます（Windows の起動時の自動開始にしていないときは、再起動の後にこれを押します）。",
+                    "設定を変えるときは「設定モードに切り替える」を押します。ファイルの保護を外し、この画面で記録を始めます。",
+                    PAUSE_NOTE,
+                ],
+                vec![
+                    action("resume-operation", "運用を再開", true),
+                    action("to-setting", "設定モードに切り替える", false),
+                    action("open-logs", "ログのフォルダを開く", false),
+                    action("quit", "終了", false),
+                ],
+            ),
+            FallbackCause::OperationStopped { left_tight: true } => (
+                "運用モードのまま残っています",
+                "常時記録の仕組みが、記録のファイルの保護を外せないまま止まりました（終了コード 5）。この画面では記録を始めません。",
+                vec![
+                    "「設定モードに戻す」で保護を外します。それで戻らないときは、管理者の許可（ユーザーアカウント制御）を求めて直します。",
+                    "常時記録を続けるときは「運用を再開」を押します。",
+                    logs_step,
+                    PAUSE_NOTE,
+                ],
+                vec![
+                    action("to-setting", "設定モードに戻す", true),
+                    action("resume-operation", "運用を再開", false),
+                    action("open-logs", "ログのフォルダを開く", false),
+                    action("quit", "終了", false),
+                ],
+            ),
+            FallbackCause::CannotOperate => (
+                "運用モードにできませんでした",
+                "記録のファイルを保護できなかったため（理由はログ）、運用モードに切り替えませんでした。ファイルは変わっておらず、設定モードのままです。",
+                vec![
+                    "ログ（下のフォルダの chronogazer-server-日付.log）に、保護できなかったファイル（リンクなど）の一覧があります。",
+                    "「設定モードで続ける」を押すと、この画面で記録を再開します。",
+                ],
+                vec![
+                    action("retry", "設定モードで続ける", true),
+                    action("open-logs", "ログのフォルダを開く", false),
+                    action("quit", "終了", false),
+                ],
+            ),
+            FallbackCause::RootUnusable => (
+                "データのフォルダを使えません",
+                "データのフォルダがリンク（ジャンクション）になっているなど、安全に使えない状態です。この画面では記録を始めません。",
+                vec![
+                    "データのフォルダ（既定は C:\\ProgramData\\ChronoGazer）がリンクになっていないか、管理者に確かめてもらってください。",
+                    "直した後に「再試行」を押します。",
+                ],
+                vec![
+                    action("retry", "再試行", true),
+                    action("open-logs", "ログのフォルダを開く", false),
+                    action("quit", "終了", false),
+                ],
+            ),
+            FallbackCause::AtStartup | FallbackCause::ServiceLost => return None,
+        };
+    Some(FallbackPageView {
+        title: title.to_string(),
+        message: message.to_string(),
+        scm: describe_scm_detail(&state.scm),
+        health: describe_health(&state.scm, state.health.as_ref()),
+        steps: steps.into_iter().map(str::to_string).collect(),
+        logs_path: logs_dir.display().to_string(),
+        notice,
+        busy,
+        actions,
+        stage: None,
+    })
 }
 
 /// 「再試行」で Fallback のままだったときの知らせ。
@@ -619,6 +851,10 @@ pub(crate) enum ShellAction {
     Retry,
     OpenLogs,
     Quit,
+    /// [運用を再開]（#623 PR-4）。
+    ResumeOperation,
+    /// [設定モードに切り替える]・[設定モードに戻す]（#623 PR-4）。
+    ToSetting,
 }
 
 /// Fallback の窓が移ろうとした先の扱い。
@@ -640,6 +876,8 @@ pub(crate) fn fallback_navigation(url: &Url) -> FallbackNavigation {
             "retry" => FallbackNavigation::Action(ShellAction::Retry),
             "open-logs" => FallbackNavigation::Action(ShellAction::OpenLogs),
             "quit" => FallbackNavigation::Action(ShellAction::Quit),
+            "resume-operation" => FallbackNavigation::Action(ShellAction::ResumeOperation),
+            "to-setting" => FallbackNavigation::Action(ShellAction::ToSetting),
             _ => FallbackNavigation::Deny,
         };
     }
@@ -682,7 +920,11 @@ pub(crate) fn service_window_config(base: &WindowConfig, port: u16, visible: boo
 /// [`crate::lifecycle::Lifecycle`]（`run()` が manage する）が持つ。
 pub(crate) struct ShellState {
     pub(crate) layout: DataLayout,
-    hooks: ShellTestHooks,
+    pub(crate) hooks: ShellTestHooks,
+    /// まだ書けていないデスクトップのログの行（設定モードへの切り替えの「開始」など。運用モードの
+    /// 間は `logs\` に書けないので、起きた時刻で覚えておき、設定モードになってから書く。
+    /// [`crate::switch`]、#623 PR-4）。
+    pub(crate) pending_log: std::sync::Mutex<Vec<DesktopLogEntry>>,
 }
 
 /// ライフサイクルの状態機械（`run()` が manage する。無ければ `None`）。
@@ -712,8 +954,15 @@ pub(crate) fn launch_may_proceed(app: &AppHandle) -> bool {
         .unwrap_or(true)
 }
 
-/// SCM を照会する（Windows だけ。それ以外は [`ScmObservation::NotWindows`]）。
-fn observe_scm(hooks: &ShellTestHooks) -> ScmObservation {
+/// シェルが使う SCM（Windows は本物、それ以外は「未登録」の偽物 - 切り替えは Windows だけ）。
+#[cfg(windows)]
+pub(crate) type ShellScm = banto_service_control::WindowsServiceManager;
+/// シェルが使う SCM（Windows 以外は「未登録」の偽物）。
+#[cfg(not(windows))]
+pub(crate) type ShellScm = banto_service_control::MockServiceManager;
+
+/// SCM の照会・開始・停止に使う manager（確認の口のサービス名を反映する）。
+pub(crate) fn service_manager(hooks: &ShellTestHooks) -> ShellScm {
     #[cfg(windows)]
     {
         use banto_service_control::WindowsServiceManager;
@@ -725,36 +974,62 @@ fn observe_scm(hooks: &ShellTestHooks) -> ScmObservation {
             SERVICE_NAME => SERVICE_NAME,
             custom => NAME.get_or_init(|| Box::leak(custom.to_string().into_boxed_str())),
         };
-        let manager = WindowsServiceManager::for_service(
+        WindowsServiceManager::for_service(
             name,
             SERVICE_DISPLAY_NAME,
             std::env::current_exe().unwrap_or_default(),
             Vec::new(),
-        );
-        chronogazer_core::shell_launch::observe_scm(&manager)
+        )
     }
     #[cfg(not(windows))]
     {
         let _ = hooks;
-        ScmObservation::NotWindows
+        banto_service_control::MockServiceManager::not_installed()
+    }
+}
+
+/// SCM を照会する（Windows だけ。それ以外は [`ScmObservation::NotWindows`]）。停止なら最後の
+/// 終了の理由も返す（#623 PR-4）。
+fn observe_scm(hooks: &ShellTestHooks) -> (ScmObservation, Option<ServiceExit>) {
+    #[cfg(windows)]
+    {
+        use banto_service_control::ServiceManager;
+        match service_manager(hooks).query_status() {
+            Ok(summary) => {
+                let exit = (summary.state == ScmState::Stopped)
+                    .then(|| chronogazer_core::mode_switch::service_exit(&summary));
+                (ScmObservation::State(summary.state), exit)
+            }
+            Err(err) => (ScmObservation::QueryFailed(err.to_string()), None),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hooks;
+        (ScmObservation::NotWindows, None)
     }
 }
 
 /// SCM を照会し、`Running` なら probe し、データのルートのモードを読む（同期。最大
 /// [`PROBE_TIMEOUT`] + 照会）。モードはデスクトップの権限で DACL を読むだけ（#623 PR-3）。
 fn observe(layout: &DataLayout, hooks: &ShellTestHooks) -> Observed {
-    let scm = observe_scm(hooks);
+    let (scm, exit) = observe_scm(hooks);
     let health =
         needs_probe(&scm).then(|| probe_service_as(layout, hooks.expected_host(), PROBE_TIMEOUT));
     let mode = observe_root_mode(layout.root());
-    (scm, health, mode)
+    (scm, health, mode, exit)
 }
 
-/// [`observe`] の結果（SCM・probe・ルートのモード）。
-type Observed = (ScmObservation, Option<ServiceHealth>, RootModeObservation);
+/// [`observe`] の結果（SCM・probe・ルートのモード・停止なら最後の終了の理由）。
+pub(crate) type Observed = (
+    ScmObservation,
+    Option<ServiceHealth>,
+    RootModeObservation,
+    Option<ServiceExit>,
+);
 
 /// [`observe`] を tokio のワーカーの外で行う。
-async fn observe_async(app: &AppHandle) -> Option<Observed> {
+pub(crate) async fn observe_async(app: &AppHandle) -> Option<Observed> {
     let (layout, hooks) = {
         let shell = app.try_state::<ShellState>()?;
         (shell.layout.clone(), shell.hooks.clone())
@@ -781,7 +1056,19 @@ pub(crate) fn start(app: &AppHandle) {
     for line in hooks.log_lines() {
         eprintln!("{line}");
     }
-    let (scm, health, mode) = observe(&layout, &hooks);
+    let (scm, health, mode, last_exit) = observe(&layout, &hooks);
+    // #623 PR-4: 設定画面の「運用モードへ」から引き継いだ（前のプロセスはエンジンを止めて終わった）。
+    // SCM が停止のときだけ続ける（それ以外は今の状態をふつうに判定する）。
+    let handoff_args: Vec<String> = std::env::args().skip(1).collect();
+    let handoff =
+        chronogazer_core::mode_switch::parse_handoff(handoff_args.iter().map(String::as_str));
+    let continue_handoff = crate::switch::handoff_applies(handoff, &scm);
+    if handoff.to_operation && !continue_handoff {
+        eprintln!(
+            "banto: 運用モードへの切り替えを引き継ぎましたが、サービスが停止中ではないため続けません（サービス: {}）",
+            describe_scm_detail(&scm)
+        );
+    }
     let decision = decide(&scm, health.as_ref(), &mode);
     eprintln!(
         "banto: 起動の判定: サービス={}、判定={}",
@@ -793,13 +1080,22 @@ pub(crate) fn start(app: &AppHandle) {
             LaunchDecision::RootBlocked { why, .. } => root_block_line(why),
         }
     );
-    let view = initial_view(&decision);
+    let view = if continue_handoff {
+        ShellView::Fallback(FallbackState {
+            scm: scm.clone(),
+            health: None,
+            cause: FallbackCause::AtStartup,
+        })
+    } else {
+        initial_view(&decision, last_exit)
+    };
     if let Some(lifecycle) = lifecycle(app) {
         lifecycle.start(view.clone());
     }
     app.manage(ShellState {
         layout: layout.clone(),
         hooks,
+        pending_log: std::sync::Mutex::new(Vec::new()),
     });
 
     match view {
@@ -819,12 +1115,23 @@ pub(crate) fn start(app: &AppHandle) {
         }
         ShellView::Fallback(state) => {
             let tray_ok = install_tray_logged(app);
-            let page = fallback_page_view(&state, &layout.logs_dir(), None, false);
+            let page = if continue_handoff {
+                switching_page_view(
+                    SwitchDirection::ToOperation,
+                    SwitchStage::StartingService,
+                    &layout.logs_dir(),
+                )
+            } else {
+                fallback_page_view(&state, &layout.logs_dir(), None, false)
+            };
             if let Err(err) = open_fallback_window(app, &page, true, tray_ok) {
                 crate::startup::show_fatal(app, format!("画面を作れませんでした: {err}"));
                 return;
             }
             tauri::async_runtime::spawn(monitor(app.clone()));
+            if continue_handoff {
+                crate::switch::request_resume_operation(app);
+            }
         }
     }
 }
@@ -884,7 +1191,7 @@ fn open_service_window(
 }
 
 /// Fallback の窓を作る（既にあれば描き直す）。
-fn open_fallback_window(
+pub(crate) fn open_fallback_window(
     app: &AppHandle,
     page: &FallbackPageView,
     visible: bool,
@@ -925,7 +1232,7 @@ fn open_fallback_window(
 }
 
 /// Fallback の窓を、今の画面の状態で描き直す（Fallback でなければ何もしない）。
-fn rerender_fallback(app: &AppHandle, notice: Option<String>, busy: bool) {
+pub(crate) fn rerender_fallback(app: &AppHandle, notice: Option<String>, busy: bool) {
     let Some(shell) = app.try_state::<ShellState>() else {
         return;
     };
@@ -942,13 +1249,13 @@ fn rerender_fallback(app: &AppHandle, notice: Option<String>, busy: bool) {
 }
 
 /// 窓が見えているか（無ければ偽）。
-fn window_visible(app: &AppHandle, label: &str) -> bool {
+pub(crate) fn window_visible(app: &AppHandle, label: &str) -> bool {
     app.get_webview_window(label)
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false)
 }
 
-fn destroy_window(app: &AppHandle, label: &str) {
+pub(crate) fn destroy_window(app: &AppHandle, label: &str) {
     if let Some(window) = app.get_webview_window(label) {
         if let Err(err) = window.destroy() {
             eprintln!("banto: 窓（{label}）を閉じられませんでした: {err}");
@@ -962,6 +1269,8 @@ fn handle_action(app: &AppHandle, action: ShellAction) {
         ShellAction::Retry => request_retry(app),
         ShellAction::OpenLogs => open_logs(app),
         ShellAction::Quit => crate::tray::request_quit(app),
+        ShellAction::ResumeOperation => crate::switch::request_resume_operation(app),
+        ShellAction::ToSetting => crate::switch::request_to_setting(app),
     }
 }
 
@@ -1031,14 +1340,16 @@ async fn retry(app: AppHandle) {
         }
     };
     rerender_fallback(&app, None, true);
-    let Some((scm, health, mode)) = observe_async(&app).await else {
+    let Some((scm, health, mode, last_exit)) = observe_async(&app).await else {
         drop(guard);
         rerender_fallback(&app, None, false);
         return;
     };
-    match on_retry(current.cause, &scm, health.as_ref(), &mode) {
+    match on_retry(current.cause, &scm, health.as_ref(), &mode, last_exit) {
         Step::ToService { port } => switch_to_service(&app, guard, port),
-        Step::ToDesktop => switch_to_desktop(&app, guard).await,
+        Step::ToDesktop => {
+            switch_to_desktop(&app, guard).await;
+        }
         Step::Refresh(state) => {
             let notice = still_unavailable_notice(&state);
             guard.finish(ShellView::Fallback(state));
@@ -1059,8 +1370,8 @@ pub(crate) fn connected_to_service_line(port: u16) -> String {
     format!("banto: サービスへつなぎました（ポート {port}）")
 }
 
-/// Fallback → Service（見張りの自動の接続・「再試行」）。
-fn switch_to_service(app: &AppHandle, guard: TransitionGuard, port: u16) {
+/// Fallback → Service（見張りの自動の接続・「再試行」・運用モードへの切り替え）。
+pub(crate) fn switch_to_service(app: &AppHandle, guard: TransitionGuard, port: u16) {
     let visible = window_visible(app, FALLBACK_WINDOW_LABEL);
     let hide_on_close = crate::tray::installed(app);
     if let Err(err) = open_service_window(app, port, visible, hide_on_close) {
@@ -1102,12 +1413,13 @@ fn switch_to_fallback(app: &AppHandle, guard: TransitionGuard, state: FallbackSt
     crate::tray::refresh(app);
 }
 
-/// Fallback → Desktop（「再試行」だけ、O3）。起動に失敗したら今までのエラーの窓・
-/// 対処の窓（fallback には戻さない）。
-async fn switch_to_desktop(app: &AppHandle, guard: TransitionGuard) {
+/// Fallback → Desktop（「再試行」・設定モードへの切り替え、O3）。起動に失敗したら今までの
+/// エラーの窓・対処の窓（fallback には戻さない）。エンジンが動き始めたら `true`
+/// （設定モードへの切り替えの「完了」をデスクトップのログに書くため。#623 PR-4）。
+pub(crate) async fn switch_to_desktop(app: &AppHandle, guard: TransitionGuard) -> bool {
     let layout = match app.try_state::<ShellState>() {
         Some(shell) => shell.layout.clone(),
-        None => return,
+        None => return false,
     };
     let paths = match crate::startup::LaunchPaths::prepare(layout) {
         Ok(paths) => paths,
@@ -1116,27 +1428,30 @@ async fn switch_to_desktop(app: &AppHandle, guard: TransitionGuard) {
             destroy_window(app, FALLBACK_WINDOW_LABEL);
             guard.finish(ShellView::Desktop);
             crate::tray::refresh(app);
-            return;
+            return false;
         }
     };
-    match crate::launch_desktop(app, &paths, crate::startup::Prelude::None).await {
+    let started = match crate::launch_desktop(app, &paths, crate::startup::Prelude::None).await {
         Ok(()) => {
             destroy_window(app, FALLBACK_WINDOW_LABEL);
             guard.finish(ShellView::Desktop);
+            true
         }
         // 終了に入った: エンジンは `launch_desktop` が止めた。窓はそのまま（プロセスが
         // 終わる）。
         Err(crate::startup::LaunchError::Exiting) => {
             drop(guard);
-            return;
+            return false;
         }
         Err(err) => {
             crate::startup::show_failure(app, &paths, err).await;
             destroy_window(app, FALLBACK_WINDOW_LABEL);
             guard.finish(ShellView::Desktop);
+            false
         }
-    }
+    };
     crate::tray::refresh(app);
+    started
 }
 
 /// 見張り（モジュール doc「並行」）。`setup()` から 1 回だけ起こす。
@@ -1159,7 +1474,7 @@ async fn monitor(app: AppHandle) {
             } => (view, generation, streak),
         };
         // 見張りは Desktop へは移らない（O2・O3）ので、ルートのモードは見ない。
-        let Some((scm, health, _mode)) = observe_async(&app).await else {
+        let Some((scm, health, _mode, _exit)) = observe_async(&app).await else {
             continue;
         };
         let (step, streak) = on_tick(&view, streak, &scm, health.as_ref());
@@ -1400,6 +1715,7 @@ mod tests {
                     &scm,
                     health.as_ref(),
                     &RootModeObservation::NotObserved,
+                    None,
                 );
                 let desktop_allowed = matches!(
                     scm,
@@ -1431,19 +1747,20 @@ mod tests {
     #[test]
     fn initial_view_follows_decision() {
         assert_eq!(
-            initial_view(&LaunchDecision::Service { port: 1 }),
+            initial_view(&LaunchDecision::Service { port: 1 }, None),
             ShellView::Service { port: 1 }
         );
         assert_eq!(
-            initial_view(&LaunchDecision::Desktop { scm: None }),
+            initial_view(&LaunchDecision::Desktop { scm: None }, None),
             ShellView::Desktop
         );
-        let view = initial_view(&LaunchDecision::Fallback(
-            chronogazer_core::shell_launch::FallbackInfo {
+        let view = initial_view(
+            &LaunchDecision::Fallback(chronogazer_core::shell_launch::FallbackInfo {
                 scm: ScmState::StartPending,
                 health: None,
-            },
-        ));
+            }),
+            None,
+        );
         assert_eq!(
             view,
             ShellView::Fallback(fallback(
@@ -1740,6 +2057,265 @@ mod tests {
             TrayMode::Fallback {
                 scm: "開始中".to_string()
             }
+        );
+    }
+
+    // ---- #623 PR-4: 設定モード ⇔ 運用モード ----
+
+    fn operation_mode() -> RootModeObservation {
+        RootModeObservation::Mode(banto_safe_root::ModeObservation::Operation)
+    }
+
+    /// 約束: ルートが運用モードの形なら、どの SCM・probe・最後の終了の理由でも「再試行」
+    /// （設定モードへの切り替えの後の判定も同じ関数）は決して Desktop にしない。
+    #[test]
+    fn retry_never_goes_to_desktop_in_operation_mode() {
+        for scm in all_observations() {
+            for health in all_health() {
+                for exit in [
+                    None,
+                    Some(ServiceExit::Clean),
+                    Some(ServiceExit::CannotOperate),
+                    Some(ServiceExit::LeftOperation),
+                ] {
+                    let step = on_retry(
+                        FallbackCause::AtStartup,
+                        &scm,
+                        health.as_ref(),
+                        &operation_mode(),
+                        exit,
+                    );
+                    assert_ne!(step, Step::ToDesktop, "scm={scm:?} health={health:?}");
+                }
+            }
+        }
+    }
+
+    /// ルートが運用モードの形で SCM が停止: 最後の終了の理由が 5 なら「運用モードのまま残って
+    /// います」、それ以外は「運用モード（停止中）」。リンクのルートは別の理由。
+    #[test]
+    fn root_blocked_picks_the_mode_cause() {
+        let stopped = ScmObservation::State(ScmState::Stopped);
+        for (exit, left_tight) in [
+            (None, false),
+            (Some(ServiceExit::Clean), false),
+            (Some(ServiceExit::LeftOperation), true),
+        ] {
+            let step = on_retry(
+                FallbackCause::ServiceLost,
+                &stopped,
+                None,
+                &operation_mode(),
+                exit,
+            );
+            let Step::Refresh(state) = step else {
+                panic!("{step:?}")
+            };
+            assert_eq!(state.cause, FallbackCause::OperationStopped { left_tight });
+            let view = initial_view(&decide(&stopped, None, &operation_mode()), exit);
+            assert_eq!(
+                view,
+                ShellView::Fallback(fallback(
+                    stopped.clone(),
+                    FallbackCause::OperationStopped { left_tight }
+                ))
+            );
+        }
+        assert_eq!(
+            root_blocked_cause(&RootBlock::Unusable("link".into()), None),
+            FallbackCause::RootUnusable
+        );
+    }
+
+    /// モードの理由は、SCM が動き出したら「起動の判定で」に戻す（見張りの表示の更新も）。
+    #[test]
+    fn mode_causes_fall_back_to_startup_once_the_service_moves() {
+        let causes = [
+            FallbackCause::OperationStopped { left_tight: false },
+            FallbackCause::OperationStopped { left_tight: true },
+            FallbackCause::RootUnusable,
+            FallbackCause::CannotOperate,
+        ];
+        for cause in causes {
+            for scm in all_observations() {
+                let moving = matches!(
+                    scm,
+                    ScmObservation::State(
+                        ScmState::Running
+                            | ScmState::StartPending
+                            | ScmState::StopPending
+                            | ScmState::Other(_)
+                    )
+                );
+                let expected = if moving {
+                    FallbackCause::AtStartup
+                } else {
+                    cause
+                };
+                assert_eq!(carry_cause(cause, &scm), expected, "{cause:?} {scm:?}");
+            }
+            let view =
+                ShellView::Fallback(fallback(ScmObservation::State(ScmState::Stopped), cause));
+            let (step, _) = on_tick(
+                &view,
+                0,
+                &ScmObservation::State(ScmState::StartPending),
+                None,
+            );
+            match step {
+                Step::Refresh(state) => assert_eq!(state.cause, FallbackCause::AtStartup),
+                other => panic!("{other:?}"),
+            }
+        }
+        // ふつうの理由はそのまま。
+        assert_eq!(
+            carry_cause(FallbackCause::ServiceLost, &running()),
+            FallbackCause::ServiceLost
+        );
+    }
+
+    fn ids(view: &FallbackPageView) -> Vec<&'static str> {
+        view.actions.iter().map(|action| action.id).collect()
+    }
+
+    fn primary(view: &FallbackPageView) -> &'static str {
+        view.actions
+            .iter()
+            .find(|action| action.primary)
+            .map(|action| action.label)
+            .expect("primary があること")
+    }
+
+    /// 理由ごとの窓の文言とボタン（終了コード 4・5・停止中の運用モード）。
+    #[test]
+    fn mode_pages_offer_the_right_buttons() {
+        let logs = PathBuf::from(r"C:\ProgramData\ChronoGazer\logs");
+        let stopped = ScmObservation::State(ScmState::Stopped);
+
+        let paused = fallback_page_view(
+            &fallback(
+                stopped.clone(),
+                FallbackCause::OperationStopped { left_tight: false },
+            ),
+            &logs,
+            None,
+            false,
+        );
+        assert_eq!(paused.title, "運用モード（停止中）です");
+        assert_eq!(primary(&paused), "運用を再開");
+        assert_eq!(
+            ids(&paused),
+            vec!["resume-operation", "to-setting", "open-logs", "quit"]
+        );
+        assert!(paused.steps.iter().any(|s| s == PAUSE_NOTE));
+
+        let left = fallback_page_view(
+            &fallback(
+                stopped.clone(),
+                FallbackCause::OperationStopped { left_tight: true },
+            ),
+            &logs,
+            None,
+            false,
+        );
+        assert_eq!(left.title, "運用モードのまま残っています");
+        assert_eq!(primary(&left), "設定モードに戻す");
+        assert_eq!(ids(&left)[0], "to-setting");
+        assert!(left.message.contains("終了コード 5"));
+
+        let cannot = fallback_page_view(
+            &fallback(stopped.clone(), FallbackCause::CannotOperate),
+            &logs,
+            None,
+            false,
+        );
+        assert_eq!(cannot.title, "運用モードにできませんでした");
+        assert!(cannot.message.contains("理由はログ"));
+        assert_eq!(primary(&cannot), "設定モードで続ける");
+        assert_eq!(ids(&cannot), vec!["retry", "open-logs", "quit"]);
+
+        let unusable = fallback_page_view(
+            &fallback(stopped.clone(), FallbackCause::RootUnusable),
+            &logs,
+            None,
+            false,
+        );
+        assert_eq!(unusable.title, "データのフォルダを使えません");
+        assert!(!ids(&unusable).contains(&"to-setting"));
+
+        // ふつうの Fallback: サービスが動いている間だけ [設定モードに切り替える] を出す。
+        let unhealthy = fallback_page_view(
+            &FallbackState {
+                scm: running(),
+                health: Some(ServiceHealth::Unreachable { port: 8721 }),
+                cause: FallbackCause::AtStartup,
+            },
+            &logs,
+            None,
+            false,
+        );
+        assert_eq!(
+            ids(&unhealthy),
+            vec!["retry", "to-setting", "open-logs", "quit"]
+        );
+        let gone = fallback_page_view(
+            &fallback(stopped, FallbackCause::ServiceLost),
+            &logs,
+            None,
+            false,
+        );
+        assert_eq!(ids(&gone), vec!["retry", "open-logs", "quit"]);
+    }
+
+    /// 切り替えの最中の窓: 収集が止まることを一言出し、ボタンは出さず、段階を出す。
+    #[test]
+    fn switching_page_says_collection_pauses_and_shows_the_stage() {
+        let logs = PathBuf::from(r"C:\ProgramData\ChronoGazer\logs");
+        for direction in [SwitchDirection::ToOperation, SwitchDirection::ToSetting] {
+            let view = switching_page_view(direction, SwitchStage::TighteningPermissions, &logs);
+            assert!(view.message.contains(PAUSE_NOTE), "{}", view.message);
+            assert!(view.busy);
+            assert!(view.actions.is_empty());
+            assert_eq!(
+                view.stage.as_deref(),
+                Some("ファイルの権限を設定しています…")
+            );
+            assert!(view.scm.is_empty() && view.health.is_empty());
+        }
+        assert_eq!(
+            switching_page_view(
+                SwitchDirection::ToOperation,
+                SwitchStage::StartingService,
+                &logs
+            )
+            .title,
+            "運用モードへ切り替えています"
+        );
+        assert_eq!(
+            switching_page_view(
+                SwitchDirection::ToSetting,
+                SwitchStage::StoppingService,
+                &logs
+            )
+            .title,
+            "設定モードへ切り替えています"
+        );
+    }
+
+    #[test]
+    fn fallback_navigation_knows_the_mode_buttons() {
+        let url = |path: &str| Url::parse(&format!("http://tauri.localhost{path}")).unwrap();
+        assert_eq!(
+            fallback_navigation(&url("/__shell/resume-operation")),
+            FallbackNavigation::Action(ShellAction::ResumeOperation)
+        );
+        assert_eq!(
+            fallback_navigation(&url("/__shell/to-setting")),
+            FallbackNavigation::Action(ShellAction::ToSetting)
+        );
+        assert_eq!(
+            fallback_navigation(&url("/__shell/To-Setting")),
+            FallbackNavigation::Deny
         );
     }
 }

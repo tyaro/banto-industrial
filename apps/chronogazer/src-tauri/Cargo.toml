@@ -69,6 +69,10 @@ banto-hub-bootstrap = { path = "../../../crates/banto-hub-bootstrap" }
 # `WindowsServiceManager` を作る）。`chronogazer-core` が既に使っている同じ path crate
 # で、Cargo.lock にパッケージは増えない。
 banto-service-control = { path = "../../../crates/banto-service-control" }
+# #623 PR-4: 設定モード ⇔ 運用モードの切り替えで、昇格ヘルパー `chronogazer-elev.exe` を UAC で
+# 起動する（`launch::run_elevated`。自動開始・ACL の修復）。workspace の path crate で、
+# Cargo.lock にパッケージは増えない。
+banto-service-elev = { path = "../../../crates/banto-service-elev" }
 
 # `#[tokio::test]` for this crate's own unit tests (spec M14: the
 # `change_own_password` audit-recording test) - the runtime/macros features

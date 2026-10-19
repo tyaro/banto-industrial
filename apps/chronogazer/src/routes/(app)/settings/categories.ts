@@ -15,7 +15,7 @@ import { redirect } from '@sveltejs/kit';
 import { resolveAppPath, type AppPath } from '#lib/navigation.js';
 
 export type SettingsCategoryId =
-	'appearance' | 'account' | 'connectivity' | 'data' | 'security' | 'hub' | 'collect';
+	'appearance' | 'account' | 'connectivity' | 'data' | 'security' | 'hub' | 'collect' | 'mode';
 
 export interface SettingsCategory {
 	id: SettingsCategoryId;
@@ -36,7 +36,9 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
 	// ナビの最後に足す（既存カテゴリの順序は変えない）。**admin 限定ではない** -
 	// 状態の読み取りは viewer 以上なので、操作を出さないだけで閲覧はできる
 	// （`+layout.ts` の `visible.collect` とその doc 参照）。
-	{ id: 'collect', path: '/settings/collect', label: '収集' }
+	{ id: 'collect', path: '/settings/collect', label: '収集' },
+	// #623 PR-4: 設定モード ⇔ 運用モードの切り替え（Tauri のデスクトップの窓・admin だけ）。
+	{ id: 'mode', path: '/settings/mode', label: '運用モード' }
 ];
 
 /**

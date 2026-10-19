@@ -11,7 +11,8 @@
 			（AppState は manage されていない）。表示する内容は Rust 側が
 			initialization_script で window.__CHRONOGAZER_SHELL_FALLBACK__ に入れ、
 			描き直すときは window.__chronogazerShellFallback.render(...) を呼ぶ。
-			ボタンは /__shell/<retry|open-logs|quit> へ移ろうとすることで Rust に
+			ボタン（#623 PR-4 から Rust が理由ごとに渡す）は /__shell/<id>
+			（retry・open-logs・quit・resume-operation・to-setting）へ移ろうとすることで Rust に
 			知らせる（Rust が on_navigation で受け取って移動を取り消す）。
 			文言はすべて textContent で入れる（パスなどが HTML として解釈されない）。
 		-->
@@ -135,18 +136,14 @@
 		<div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
 		<p class="muted" id="busy" role="status" aria-live="polite" hidden>確かめています…</p>
 
-		<dl>
+		<dl id="status">
 			<dt>サービスの状態</dt>
 			<dd id="scm"></dd>
 			<dt>接続の確認</dt>
 			<dd id="health"></dd>
 		</dl>
 
-		<div class="actions">
-			<button type="button" class="primary" id="retry">再試行</button>
-			<button type="button" id="open-logs">ログのフォルダを開く</button>
-			<button type="button" id="quit">終了</button>
-		</div>
+		<div class="actions" id="actions"></div>
 
 		<h2>どうすればよいか</h2>
 		<ul id="steps"></ul>
@@ -183,12 +180,35 @@
 					window.location.href = '/__shell/' + action;
 				}
 
+				// ボタンは Rust が理由ごとに渡す（#623 PR-4。id は /__shell/<id>）。ログを開く・
+				// 終了は処理中の印を付けない（押しても窓の状態は変わらない）。
+				function renderActions(actions) {
+					var box = el('actions');
+					box.textContent = '';
+					(actions || []).forEach(function (action) {
+						var button = document.createElement('button');
+						button.type = 'button';
+						button.textContent = action.label;
+						if (action.primary) {
+							button.className = 'primary';
+						}
+						button.onclick = function () {
+							send(action.id, action.id !== 'open-logs' && action.id !== 'quit');
+						};
+						box.appendChild(button);
+					});
+				}
+
 				function render(view) {
 					document.title = 'ChronoGazer — ' + view.title;
 					el('title').textContent = view.title;
 					el('message').textContent = view.message;
 					el('scm').textContent = view.scm;
 					el('health').textContent = view.health;
+					// 切り替えの最中は状態の表を出さない（段階は下の行）。
+					el('status').hidden = !view.scm && !view.health;
+					el('busy').textContent = view.stage || '確かめています…';
+					renderActions(view.actions);
 					el('logs-path').textContent = view.logsPath || '';
 					var notice = el('notice');
 					notice.textContent = view.notice || '';
@@ -203,15 +223,6 @@
 					setBusy(!!view.busy);
 				}
 
-				el('retry').onclick = function () {
-					send('retry', true);
-				};
-				el('open-logs').onclick = function () {
-					send('open-logs', false);
-				};
-				el('quit').onclick = function () {
-					send('quit', false);
-				};
 				window.__chronogazerShellFallback = { render: render };
 
 				var initial = window.__CHRONOGAZER_SHELL_FALLBACK__;
@@ -220,6 +231,7 @@
 				} else {
 					el('message').textContent =
 						'記録エンジン（サービス）に接続できません。詳しくは標準エラー出力を確認してください。';
+					renderActions([{ id: 'quit', label: '終了', primary: true }]);
 				}
 			})();
 		</script>

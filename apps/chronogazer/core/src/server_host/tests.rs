@@ -247,6 +247,42 @@ fn log_file_names_round_trip_and_only_the_exact_shape_parses() {
     }
 }
 
+/// #623 PR-4: デスクトップのログ（設定モードの間、`chronogazer-desktop-YYYY-MM-DD.log`）も同じ
+/// 形で読み、同じ保持日数で消す（サービスの `LogPrune` の対象に足した）。
+#[test]
+fn desktop_log_files_parse_and_are_pruned_with_the_same_retention() {
+    let date = LocalDate::new(2026, 10, 3);
+    assert_eq!(
+        desktop_log_file_name(date),
+        "chronogazer-desktop-2026-10-03.log"
+    );
+    assert_eq!(
+        parse_log_file_date(&desktop_log_file_name(date)),
+        Some(date)
+    );
+    assert_eq!(
+        parse_log_file_date("chronogazer-desktop-2026-02-30.log"),
+        None
+    );
+    assert_eq!(
+        parse_log_file_date("chronogazer-desktop-2026-10-03.txt"),
+        None
+    );
+    let today = LocalDate::new(2026, 10, 13);
+    let names = [
+        "chronogazer-desktop-2026-10-13.log",
+        "chronogazer-desktop-2026-09-13.log",
+        "chronogazer-server-2026-09-13.log",
+    ];
+    assert_eq!(
+        log_files_to_prune(names.iter().copied(), today, 30),
+        vec![
+            "chronogazer-desktop-2026-09-13.log".to_string(),
+            "chronogazer-server-2026-09-13.log".to_string(),
+        ]
+    );
+}
+
 #[test]
 fn prune_keeps_retention_days_including_today_and_ignores_foreign_names() {
     let today = LocalDate::new(2026, 10, 13);

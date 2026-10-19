@@ -1322,6 +1322,7 @@ dependencies = [
  "banto-safe-root",
  "banto-server",
  "banto-service-control",
+ "banto-service-elev",
  "chronogazer-core",
  "futures-util",
  "keyring",

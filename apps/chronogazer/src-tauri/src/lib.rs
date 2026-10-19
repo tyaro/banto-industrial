@@ -82,6 +82,8 @@ mod legacy_notice;
 mod shell;
 // #392（2026-10-12）: 起動に失敗したときの「エラーの窓と対処の選択」。
 mod startup;
+// #623 PR-4: 設定モード ⇔ 運用モードの切り替えの配線（設定画面・トレイ・Fallback の窓）。
+mod switch;
 mod tray;
 
 use banto_core::{BantoError, FieldError, ListParams};
@@ -679,6 +681,21 @@ async fn record_ok(
             result: "ok",
         })
         .await;
+}
+
+/// 設定画面の「運用モードに切り替える」（#623 PR-4、[`switch::request_switch_to_operation`]）。
+/// admin だけ（サービスの開始と自動開始の設定を伴う）。受け付けたら `Ok`（この後プロセスは
+/// 記録エンジンを止めて終わり、新しいシェルが続ける）。断った理由は `BadRequest` の文で返す。
+#[tauri::command]
+async fn switch_to_operation_mode(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    auto_start: bool,
+) -> Result<(), BantoError> {
+    require_role(&state, Role::Admin, "settings").await?;
+    switch::request_switch_to_operation(&app, auto_start)
+        .await
+        .map_err(BantoError::BadRequest)
 }
 
 /// Smoke-test command used by the frontend to verify the bridge.
@@ -4663,6 +4680,24 @@ async fn abandon_after_window_failure(
 }
 
 pub fn run() {
+    // #623 PR-4: 設定画面の「運用モードへ」から引き継いだ新しいシェルは、前のプロセス（記録
+    // エンジンを止めて終わる途中）が終わるのを待ってから始める。single-instance の判定（下の
+    // プラグイン）より前に待たないと、前のプロセスへ引数を渡して自分が終わってしまう。
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let handoff = chronogazer_core::mode_switch::parse_handoff(args.iter().map(String::as_str));
+        if let Some(pid) = handoff.wait_pid {
+            if !chronogazer_core::mode_switch::wait_for_process_exit(
+                pid,
+                chronogazer_core::mode_switch::HANDOFF_WAIT_LIMIT,
+            ) {
+                eprintln!(
+                    "banto: 前の ChronoGazer（pid {pid}）が {} 秒以内に終わりませんでした。そのまま起動します",
+                    chronogazer_core::mode_switch::HANDOFF_WAIT_LIMIT.as_secs()
+                );
+            }
+        }
+    }
     tauri::Builder::default()
         // #392 A2: 2 つ目の起動は既存の窓を前に出し、2 つ目のプロセスは
         // プラグインの setup の中で（下の `setup()`・A1 の排他・DB に触れる前に）
@@ -4707,6 +4742,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ping,
+            switch_to_operation_mode,
             auth_status,
             auth_setup,
             auth_login,

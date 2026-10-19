@@ -46,7 +46,7 @@ describe('SETTINGS_CATEGORIES', () => {
 		expect(new Set(labels).size).toBe(SETTINGS_CATEGORIES.length);
 	});
 
-	it('#383 段階2b（C-3b）で足した「収集」カテゴリが末尾にあり、既存の並びを崩していない', () => {
+	it('#623 PR-4 で足した「運用モード」カテゴリが末尾にあり、既存の並び（「収集」まで）を崩していない', () => {
 		expect(SETTINGS_CATEGORIES.map((category) => category.id)).toEqual([
 			'appearance',
 			'account',
@@ -54,12 +54,18 @@ describe('SETTINGS_CATEGORIES', () => {
 			'data',
 			'security',
 			'hub',
-			'collect'
+			'collect',
+			'mode'
 		]);
-		expect(SETTINGS_CATEGORIES.at(-1)).toEqual({
+		expect(SETTINGS_CATEGORIES.at(-2)).toEqual({
 			id: 'collect',
 			path: '/settings/collect',
 			label: '収集'
+		});
+		expect(SETTINGS_CATEGORIES.at(-1)).toEqual({
+			id: 'mode',
+			path: '/settings/mode',
+			label: '運用モード'
 		});
 	});
 });

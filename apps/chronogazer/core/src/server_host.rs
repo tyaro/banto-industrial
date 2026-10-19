@@ -168,6 +168,11 @@ pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
 pub const LOG_FILE_PREFIX: &str = "chronogazer-server-";
 /// ログのファイル名の拡張子。
 pub const LOG_FILE_SUFFIX: &str = ".log";
+/// デスクトップ（シェル）が設定モードの間に書くログのファイル名の接頭辞
+/// （`chronogazer-desktop-YYYY-MM-DD.log`。#623 PR-4、2026-10-18 オーナー決定 (3)）。
+/// 書くのは `crate::mode_switch::append_desktop_log`。古いファイルはサービスのログと同じ
+/// 保持日数で [`LogPrune`] が消す（[`parse_log_file_date`] が両方の形を受ける）。
+pub const DESKTOP_LOG_FILE_PREFIX: &str = "chronogazer-desktop-";
 
 // --- ルート -------------------------------------------------------------------
 
@@ -800,18 +805,28 @@ impl StartedServer {
 
 /// ログのファイル名（`chronogazer-server-YYYY-MM-DD.log`）。
 pub fn log_file_name(date: LocalDate) -> String {
+    dated_log_file_name(LOG_FILE_PREFIX, date)
+}
+
+/// デスクトップのログのファイル名（`chronogazer-desktop-YYYY-MM-DD.log`。#623 PR-4）。
+pub fn desktop_log_file_name(date: LocalDate) -> String {
+    dated_log_file_name(DESKTOP_LOG_FILE_PREFIX, date)
+}
+
+fn dated_log_file_name(prefix: &str, date: LocalDate) -> String {
     format!(
-        "{LOG_FILE_PREFIX}{:04}-{:02}-{:02}{LOG_FILE_SUFFIX}",
+        "{prefix}{:04}-{:02}-{:02}{LOG_FILE_SUFFIX}",
         date.year, date.month, date.day
     )
 }
 
-/// [`log_file_name`] の逆。形がちょうど一致するものだけ（それ以外は `None` で、
-/// 消す対象にしない）。
+/// [`log_file_name`]・[`desktop_log_file_name`] の逆。形がちょうど一致するものだけ（それ以外は
+/// `None` で、消す対象にしない）。
 pub fn parse_log_file_date(name: &str) -> Option<LocalDate> {
-    let middle = name
-        .strip_prefix(LOG_FILE_PREFIX)?
-        .strip_suffix(LOG_FILE_SUFFIX)?;
+    let rest = name
+        .strip_prefix(LOG_FILE_PREFIX)
+        .or_else(|| name.strip_prefix(DESKTOP_LOG_FILE_PREFIX))?;
+    let middle = rest.strip_suffix(LOG_FILE_SUFFIX)?;
     let bytes = middle.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;

@@ -89,6 +89,8 @@
 //! | 対処の窓のボタン（注 1）                           | go     | go      | go      | go      | go      | go      | go     | go     | rbusy  | rbusy   | go      | go     | go     | go     | go     |
 //! | 対処の窓の処理の終わり                             | ok     | ok      | ok      | ok      | ok      | ok      | ok     | ok     | ok     | ok      | ok      | ok     | ok     | ok     | ok     |
 //! | 対処の窓の ×                                       | go     | go      | go      | go      | go      | go      | go     | go     | rbusy  | rbusy   | go      | go     | go     | go     | go     |
+//! | 運用モードへ（設定画面。注 3）                     | nodesk | go      | go      | nodesk  | nodesk  | conf    | busy   | busy   | rec    | rbusy   | quit    | quit   | exit   | exit   | exit   |
+//! | モードの切り替えの札（注 4）                       | nosvc  | nosvc   | nosvc   | go      | go      | go      | busy   | busy   | busy   | nosvc   | quit    | quit   | exit   | exit   | exit   |
 //!
 //! 表の注:
 //!
@@ -116,6 +118,19 @@
 //!   **エンジンを置く出来事でしか作られない**（約束のテストで確かめる）。`ExitBegin` に
 //!   「この組が無い」という `debug_assert!` は置けない（対処の後の起動の最中に OS の終了が
 //!   来ると正当にこの組になる）。
+//!
+//! - **注 3（運用モードへ、#623 PR-4）**: 設定画面の「運用モードへ切り替える」。この PC の中の
+//!   エンジンは A1 の排他をプロセスの終わりまで持つ（`DesktopEngine` は外せない）ので、
+//!   切り替えは**終了と同じ**: 許すと終了が確定し（`quit = Quitting`、確認ダイアログの同意と
+//!   同じ印）、後始末（エンジンの停止と最終 flush）の後に新しいシェルへ続きを渡してプロセスを
+//!   終える（`chronogazer_core::mode_switch` の「引き継ぎ」）。Desktop の画面のときだけ（`nodesk`）。
+//!   確認中・復旧中・対処の窓の処理中・移り変わり中・終了の後は断る（終了の行と同じ理由）。
+//!   「Desktop から他の画面へは移らない」の約束はそのまま（移るのは新しいプロセス）。
+//! - **注 4（モードの切り替えの札、#623 PR-4）**: トレイの「設定モードに切り替える」、Fallback の窓の
+//!   [運用を再開]・[設定モードに切り替える]・[設定モードに戻す]、引き継いだ新しいシェルの
+//!   「運用モードへ」の続き。札の種類は移り変わり（`Transition`）で、Service・Fallback の画面の
+//!   ときだけ（`nosvc`。Desktop は上の注 3 の道）。終了が確定した後は始めない（`quit`。サービスへ
+//!   開始・停止を出してから終了が走ると、切り替えが途中で見捨てられる）。
 //!
 //! 表に出てこない約束（テスト `invariants_hold_from_every_state` が印のすべての組で
 //! 確かめる）:
@@ -471,6 +486,10 @@ pub(crate) enum Event {
     RecoveryActionSettled,
     /// 対処の窓の ×。
     RecoveryWindowClose,
+    /// 設定画面の「運用モードへ切り替える」（モジュール doc の表の注 3。#623 PR-4）。
+    SwitchToOperation,
+    /// モードの切り替えの札（モジュール doc の表の注 4。#623 PR-4）。
+    ModeSwitch,
 }
 
 /// 断った理由。
@@ -496,6 +515,10 @@ pub(crate) enum Refusal {
     RecoveryBusy,
     /// エンジンが置かれている（復旧の札を出さない。モジュール doc の表の注 2）。
     EngineRunning,
+    /// 今の画面が Desktop ではない（運用モードへの切り替えは Desktop から。注 3）。
+    NotDesktop,
+    /// 今の画面が Service・Fallback ではない（モードの切り替えの札。注 4）。
+    NotServiceSide,
 }
 
 /// 終了の確認の答えの結果。
@@ -741,6 +764,44 @@ pub(crate) fn step(state: &LifecycleState, event: &Event) -> (LifecycleState, De
                 Decision::Proceed
             }
         }
+        Event::SwitchToOperation => {
+            if state.exiting {
+                Decision::Refused(Refusal::Exiting)
+            } else if state.quit == QuitPhase::Quitting {
+                Decision::Refused(Refusal::AlreadyQuitting)
+            } else if state.quit == QuitPhase::Confirming {
+                Decision::Refused(Refusal::AlreadyConfirming)
+            } else if state.ticket == Ticket::Recovery {
+                Decision::Refused(Refusal::RecoveryInProgress)
+            } else if state.ticket != Ticket::None {
+                Decision::Refused(Refusal::Busy)
+            } else if state.recovery_action {
+                Decision::Refused(Refusal::RecoveryBusy)
+            } else if state.view != Some(ShellView::Desktop) {
+                Decision::Refused(Refusal::NotDesktop)
+            } else {
+                // 終了の確定と同じ印（注 3）。以後は新しい復旧も窓を開くことも断る。
+                next.quit = QuitPhase::Quitting;
+                Decision::Proceed
+            }
+        }
+        Event::ModeSwitch => {
+            if state.exiting {
+                Decision::Refused(Refusal::Exiting)
+            } else if state.quit == QuitPhase::Quitting {
+                Decision::Refused(Refusal::AlreadyQuitting)
+            } else if state.ticket != Ticket::None {
+                Decision::Refused(Refusal::Busy)
+            } else if !matches!(
+                state.view,
+                Some(ShellView::Service { .. } | ShellView::Fallback(_))
+            ) {
+                Decision::Refused(Refusal::NotServiceSide)
+            } else {
+                next.ticket = Ticket::Transition;
+                Decision::Proceed
+            }
+        }
     };
     (next, decision)
 }
@@ -951,6 +1012,29 @@ impl Lifecycle {
             Some(ShellView::Fallback(state)) => Ok((guard, state)),
             // 札がある間は画面が変わらないので来ない（来ても札を返して断る）。
             _ => Err(Refusal::NotFallback),
+        }
+    }
+
+    /// 設定画面の「運用モードへ切り替える」（表の注 3）。許したら終了が確定している（呼び出し側は
+    /// 後始末へ進み、新しいシェルへ続きを渡してプロセスを終える）。
+    pub(crate) fn begin_switch_to_operation(&self) -> Result<(), Refusal> {
+        match self.apply(Event::SwitchToOperation) {
+            Decision::Proceed => Ok(()),
+            Decision::Refused(refusal) => Err(refusal),
+            other => unreachable!("SwitchToOperation decides Proceed or Refused: {other:?}"),
+        }
+    }
+
+    /// モードの切り替えの札（表の注 4。Service・Fallback の画面のときだけ）。札と、札を取った
+    /// 時点の画面を返す。
+    pub(crate) fn begin_mode_switch(
+        self: &Arc<Self>,
+    ) -> Result<(TransitionGuard, ShellView), Refusal> {
+        let guard = self.ticket(Event::ModeSwitch)?;
+        match guard.view() {
+            Some(view) => Ok((guard, view)),
+            // 札を取れたのは Service・Fallback のときだけなので来ない。
+            None => Err(Refusal::NotServiceSide),
         }
     }
 
@@ -1277,6 +1361,8 @@ mod tests {
             Decision::Refused(Refusal::Quitting) => "qing",
             Decision::Refused(Refusal::RecoveryBusy) => "rbusy",
             Decision::Refused(Refusal::EngineRunning) => "eng",
+            Decision::Refused(Refusal::NotDesktop) => "nodesk",
+            Decision::Refused(Refusal::NotServiceSide) => "nosvc",
             Decision::Proceed => "go",
             Decision::Observe { .. } => "obs",
             Decision::SkipTick => "skip",
@@ -1338,6 +1424,8 @@ mod tests {
             ("対処の窓のボタン", Event::RecoveryAction, ["go", "go", "go", "go", "go", "go", "go", "go", "rbusy", "rbusy", "go", "go", "go", "go", "go"]),
             ("対処の窓の処理の終わり", Event::RecoveryActionSettled, ["ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok"]),
             ("対処の窓の ×", Event::RecoveryWindowClose, ["go", "go", "go", "go", "go", "go", "go", "go", "rbusy", "rbusy", "go", "go", "go", "go", "go"]),
+            ("運用モードへ（設定画面）", Event::SwitchToOperation, ["nodesk", "go", "go", "nodesk", "nodesk", "conf", "busy", "busy", "rec", "rbusy", "quit", "quit", "exit", "exit", "exit"]),
+            ("モードの切り替えの札", Event::ModeSwitch, ["nosvc", "nosvc", "nosvc", "go", "go", "go", "busy", "busy", "busy", "nosvc", "quit", "quit", "exit", "exit", "exit"]),
         ]
     }
 
@@ -1483,6 +1571,8 @@ mod tests {
             Event::RecoveryAction,
             Event::RecoveryActionSettled,
             Event::RecoveryWindowClose,
+            Event::SwitchToOperation,
+            Event::ModeSwitch,
         ];
         for view in all_views().into_iter().flatten() {
             events.push(Event::Started(view.clone()));
@@ -1505,6 +1595,7 @@ mod tests {
                 | Event::Retry
                 | Event::RecoveryRelaunch
                 | Event::RecoveryBegin
+                | Event::ModeSwitch
         )
     }
 
@@ -1567,9 +1658,10 @@ mod tests {
                 if state.ticket == Ticket::None && next.ticket != Ticket::None {
                     let expected = match event {
                         Event::RecoveryBegin => Ticket::Recovery,
-                        Event::MonitorApply { .. } | Event::Retry | Event::RecoveryRelaunch => {
-                            Ticket::Transition
-                        }
+                        Event::MonitorApply { .. }
+                        | Event::Retry
+                        | Event::RecoveryRelaunch
+                        | Event::ModeSwitch => Ticket::Transition,
                         _ => panic!("札を出す出来事ではない: {at}"),
                     };
                     assert_eq!(next.ticket, expected, "{at}");
@@ -1613,6 +1705,24 @@ mod tests {
                             "{at}"
                         );
                     }
+                }
+                // 運用モードへ（注 3）は Desktop の画面で、札・確認・復旧が無いときだけ許し、
+                // 許したら終了が確定する。モードの切り替えの札（注 4）は Desktop・画面の前では出ない。
+                if event == Event::SwitchToOperation && decision == Decision::Proceed {
+                    assert_eq!(state.view, Some(ShellView::Desktop), "{at}");
+                    assert_eq!(state.ticket, Ticket::None, "{at}");
+                    assert_eq!(state.quit, QuitPhase::Idle, "{at}");
+                    assert_eq!(next.quit, QuitPhase::Quitting, "{at}");
+                }
+                if event == Event::ModeSwitch && decision == Decision::Proceed {
+                    assert!(
+                        matches!(
+                            state.view,
+                            Some(ShellView::Service { .. } | ShellView::Fallback(_))
+                        ),
+                        "{at}"
+                    );
+                    assert_ne!(state.quit, QuitPhase::Quitting, "{at}");
                 }
                 if decision == Decision::QuitAnswer(QuitAnswerOutcome::Proceed) {
                     assert_eq!(state.quit, QuitPhase::Confirming, "{at}");
