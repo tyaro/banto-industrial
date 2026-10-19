@@ -135,6 +135,11 @@ pub fn describe_service_error(err: &ServiceManagerError) -> String {
         ServiceManagerError::InvalidState(state) => format!(
             "banto-hub: サービスは {state} のため、引数つきの開始は要求できません（停止中のときだけ）"
         ),
+        // #623 PR-4 で種類に分けた 1056・1061。それまでは `Other` の os error の文言だった
+        // ので、同じ「操作に失敗しました」の形で中身だけ読める文にする。
+        ServiceManagerError::AlreadyRunning | ServiceManagerError::CannotAcceptControl => {
+            format!("banto-hub: サービス操作に失敗しました: {err}")
+        }
     }
 }
 

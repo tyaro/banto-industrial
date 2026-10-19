@@ -191,6 +191,15 @@ pub enum ServiceManagerError {
     /// 値は照会した現在の状態）。要求は出していない。
     #[error("サービスは {0} のため、引数つきの開始は要求できません（停止中のときだけ）")]
     InvalidState(ScmState),
+    /// 開始を出したが、サービスは既に開始していた（`ERROR_SERVICE_ALREADY_RUNNING`、
+    /// 1056。照会と開始の間に別の操作が入った。#623 PR-4）。
+    #[error("サービスは既に開始しています")]
+    AlreadyRunning,
+    /// サービスが今その制御を受け付けない（`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`、1061。
+    /// 開始の途中（START_PENDING）の STOP など。呼び出し側は失敗にせず待って出し直せる。
+    /// #623 PR-4）。
+    #[error("サービスは開始や停止の途中のため、今はこの操作を受け付けられません")]
+    CannotAcceptControl,
 }
 
 /// start/stop/restart が返す、非同期な SCM 状態遷移の薄いハンドル。
@@ -582,6 +591,10 @@ mod windows_impl {
     use crate::ERROR_SERVICE_DOES_NOT_EXIST;
     /// Win32 エラーコード（`ERROR_ACCESS_DENIED`）。
     const ERROR_ACCESS_DENIED: i32 = 5;
+    /// Win32 エラーコード（`ERROR_SERVICE_ALREADY_RUNNING`。#623 PR-4）。
+    const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+    /// Win32 エラーコード（`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`。#623 PR-4）。
+    const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
     /// Win32 エラーコード（`ERROR_SERVICE_SPECIFIC_ERROR`。
     /// `dwServiceSpecificExitCode` を使う印）。
     const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
@@ -631,6 +644,10 @@ mod windows_impl {
                     return ServiceManagerError::NotFound(service_name.to_string());
                 }
                 Some(ERROR_ACCESS_DENIED) => return ServiceManagerError::AccessDenied,
+                Some(ERROR_SERVICE_ALREADY_RUNNING) => return ServiceManagerError::AlreadyRunning,
+                Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
+                    return ServiceManagerError::CannotAcceptControl;
+                }
                 _ => {}
             }
         }
@@ -1016,6 +1033,8 @@ mod tests {
             ServiceManagerError::AccessDenied,
             ServiceManagerError::Timeout(Duration::from_secs(3)),
             ServiceManagerError::Other("os error 5".to_string()),
+            ServiceManagerError::AlreadyRunning,
+            ServiceManagerError::CannotAcceptControl,
         ];
         for err in &all {
             let text = err.to_string();

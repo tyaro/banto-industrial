@@ -38,6 +38,8 @@ pub mod key_store;
 // #392 B2-1: この PC からの接続を通す grant `localDesktop`（peer と Host の両方が
 // loopback、未初期化なら admin、初期化後は設定 `auth.local_grant`）。
 pub mod local_grant;
+// #623 PR-4: 設定モード ⇔ 運用モードの切り替えの SCM の扱いと待ち方・デスクトップのログ・引き継ぎ。
+pub mod mode_switch;
 // #392 B1-4: データのルート（`CHRONOGAZER_ROOT`、既定 `%ProgramData%\ChronoGazer`）と
 // その下の配置、旧データの場所。B1-5 の `chronogazer-server` が使う（デスクトップは
 // B2-4 で寄せる）。
