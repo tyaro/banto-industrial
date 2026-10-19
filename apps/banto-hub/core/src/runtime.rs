@@ -137,7 +137,7 @@
 //! `manager`より先に、のくだり）と揃えたのも同じ理由 - eval ループは
 //! `manager`の、prune ループは settings/data_dir の読み取り専用消費者。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -174,9 +174,10 @@ use crate::hub::CollectorManager;
 use crate::hub_log::{log_err_line, log_line};
 use crate::mqtt::MqttPublisher;
 use crate::profile_lock::{
-    try_acquire_profile_lock, HubHostKind, ProfileLockError, ProfileLockGuard,
+    try_acquire_profile_lock, try_acquire_profile_lock_in, HubHostKind, ProfileDirs,
+    ProfileDirsError, ProfileLockError, ProfileLockGuard,
 };
-use crate::profile_paths::{resolve_hub_root, resolve_profile_paths};
+use crate::profile_paths::{resolve_hub_root, resolve_profile_paths, DB_FILE_NAME};
 use crate::rest::{api_router_with_controller, opcua_settings_router, user_auth_state};
 use crate::settings::{HubSettingsExt, SettingsService, DEFAULT_PORT};
 use crate::subscribe_core::EVAL_TICK_MS;
@@ -298,6 +299,34 @@ impl HubRuntime {
     /// 「起動シーケンス」節参照）。返った後、呼び出し側（ホスト）は自分の
     /// 停止トリガーを待ってから[`RunningHub::shutdown`]を呼ぶこと。
     pub async fn start(config: HubConfig) -> Result<RunningHub, HubStartError> {
+        Self::start_inner(config, None).await
+    }
+
+    /// [`Self::start`] の、開いて握った profile のフォルダの組（`dirs`）を受け取る版
+    /// （#661 661-1。661-2 のサービスが `Mode::Guarded` で開いた組を渡す）。
+    ///
+    /// - 排他は `dirs` を渡して取る（`crate::profile_lock::try_acquire_profile_lock_in`。
+    ///   `skip_profile_lock` なら取らない）。
+    /// - 設定 DB が profile の `config\banto-hub.sqlite3` なら、`dirs.config` で確かめた
+    ///   パス（`ManagedDir::reopen_path`。付随の `-wal`・`-shm`・`-journal` も）を sqlx に
+    ///   渡す。データのフォルダが profile の `data\` なら `dirs.data` の本当のパスを使い、
+    ///   書き込み受付の状態ファイルは `dirs.data` のハンドル基準で書く
+    ///   （`WriteControl::restore_in`）。
+    /// - それ以外（`BANTO_DB`・`BANTO_HUB_DATA`・設定 DB の `data.dir` が profile の外）は
+    ///   渡されたパスのまま使う（[`crate::profile_paths::is_outside_profile`]。ログの
+    ///   1 行は 661-2 で出す）。sqlx・tstore・banto の監査の保留はパスしか取らないので、
+    ///   確かめた後もパスで渡す（ChronoGazer と同じ受け入れ）。
+    pub async fn start_with_profile_dirs(
+        config: HubConfig,
+        dirs: ProfileDirs,
+    ) -> Result<RunningHub, HubStartError> {
+        Self::start_inner(config, Some(dirs)).await
+    }
+
+    async fn start_inner(
+        config: HubConfig,
+        given_dirs: Option<ProfileDirs>,
+    ) -> Result<RunningHub, HubStartError> {
         let HubConfig {
             db_path,
             allow_setup,
@@ -325,9 +354,20 @@ impl HubRuntime {
             );
             let guard = resolve_profile_paths(&root, &profile_id)
                 .map_err(ProfileLockError::from)
-                .and_then(|paths| try_acquire_profile_lock(&paths, host_kind))
+                .and_then(|paths| match &given_dirs {
+                    Some(dirs) => try_acquire_profile_lock_in(&paths, host_kind, dirs.clone()),
+                    None => try_acquire_profile_lock(&paths, host_kind),
+                })
                 .map_err(HubStartError::ProfileLock)?;
             Some(guard)
+        };
+
+        // #661 661-1: 握った組を渡されたときだけ、profile の中の設定 DB は確かめたパスで
+        // 開く（`start` の経路 = デスクトップ・コンソールは以前と同じパスのまま）。
+        let db_path = match &given_dirs {
+            Some(dirs) => profile_db_path(dirs, db_path)
+                .map_err(|err| HubStartError::ProfileLock(ProfileLockError::Dirs(err)))?,
+            None => db_path,
         };
 
         let pool = init_db(&db_path).await.map_err(|err| match err {
@@ -366,6 +406,16 @@ impl HubRuntime {
         let port: u16 = port_override.unwrap_or(server_config.port);
         let bind = bind_override.unwrap_or(server_config.bind);
         let data_dir = data_dir_override.unwrap_or_else(|| PathBuf::from(store_config.data_dir));
+        // #661 661-1: profile の `data\` なら、握ったフォルダの本当のパスに揃え、状態ファイルは
+        // そのハンドルで書く。外（`BANTO_HUB_DATA` など）はパスのまま。
+        let held_data = given_dirs
+            .as_ref()
+            .filter(|dirs| is_profile_dir(&data_dir, &dirs.data))
+            .map(|dirs| dirs.data.clone());
+        let data_dir = match &held_data {
+            Some(dir) => dir.final_path().to_path_buf(),
+            None => data_dir,
+        };
 
         // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・
         // 応答しない監査はデータディレクトリの保留ファイルに退避し、`record` は
@@ -613,7 +663,10 @@ impl HubRuntime {
             },
             write_state_file.display()
         ));
-        let write_control = Arc::new(WriteControl::restore(write_decision, write_state_file));
+        let write_control = Arc::new(match held_data {
+            Some(dir) => WriteControl::restore_in(write_decision, dir),
+            None => WriteControl::restore(write_decision, write_state_file),
+        });
         let controller = Arc::new(CollectionController::new(manager.clone()));
         let write_audit = WriteAuditService::new(pool.clone());
 
@@ -788,7 +841,9 @@ impl HubRuntime {
             eval_handle,
             prune_handle,
             audit_spool_handle,
+            pool,
             _profile_lock: profile_lock,
+            _profile_dirs: given_dirs,
         })
     }
 }
@@ -936,7 +991,26 @@ pub struct RunningHub {
     /// close（`flock`自動解放）を行う。`skip_profile_lock: true`で構築した
     /// 場合は`None`。
     _profile_lock: Option<ProfileLockGuard>,
+    /// 設定 DB の pool（#661 661-1）。[`RunningHub::shutdown`] の最後に閉じる
+    /// （[`RunningHub::shutdown_and_report`]）。
+    pool: SqlitePool,
+    /// [`HubRuntime::start_with_profile_dirs`] に渡された握ったフォルダの組（#661 661-1。
+    /// 排他を取ったときは `_profile_lock` も同じハンドルを持つ）。`start` では `None`。
+    _profile_dirs: Option<ProfileDirs>,
 }
+
+/// [`RunningHub::shutdown_and_report`] の結果（#661 661-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HubShutdownReport {
+    /// 設定 DB の pool を [`DB_CLOSE_TIMEOUT`] のうちに閉じ終えたか。`false` なら、
+    /// どこかが接続を返さずに上限を過ぎた（661-2 のサービスは ACL を緩める前に見る）。
+    pub db_closed: bool,
+}
+
+/// 停止の最後に設定 DB の pool を閉じるのを待つ上限（#661 661-1）。`close` は貸し出し中の
+/// 接続が返るのを待つので、返らない接続があっても停止を止めない。デスクトップの終了の
+/// 予算（15 秒）の中に収まる長さ。
+pub const DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl RunningHub {
     /// axum サーバーの実バインドアドレス（`port: 0`で OS にポートを
@@ -962,7 +1036,17 @@ impl RunningHub {
     /// このモジュール doc の「シャットダウン順序」節どおりに teardown する。
     /// 呼び出し側（ホスト）は自分の停止トリガー（Ctrl-C / SCM Stop /
     /// トレイ）を待ってからこれを呼ぶこと。
+    ///
+    /// 最後に設定 DB の pool を閉じる（#661 661-1。結果が要るときは
+    /// [`Self::shutdown_and_report`]）。
     pub async fn shutdown(self) {
+        let _ = self.shutdown_and_report().await;
+    }
+
+    /// [`Self::shutdown`] と同じ順で畳み、最後に設定 DB の pool を閉じて（上限
+    /// [`DB_CLOSE_TIMEOUT`]）、閉じ終えたかを返す（#661 661-1。661-2 のサービスは、
+    /// 閉じ終えてから ACL を緩める）。
+    pub async fn shutdown_and_report(self) -> HubShutdownReport {
         log_line("banto-hub: shutting down");
         // #392 A2 レビュー（2026-10-12）: 終了の受付の**取り消せない**印を立て、以降の収集の
         // 開始（REST/MCP はこの関数の最後の `server.stop()` まで受け付けて
@@ -1013,7 +1097,45 @@ impl RunningHub {
         // comment ("シャットダウン順序").
         self.sim_registry.shutdown().await;
         self.server.stop().await;
+        // #661 661-1: 書き手（サーバー・収集・監査の流し込み）を止めた後に、設定 DB を
+        // 閉じる（WAL を畳んでファイルを離す）。返らない接続があっても上限で切り上げる。
+        let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, self.pool.close())
+            .await
+            .is_ok();
+        if !db_closed {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 設定 DB を {} 秒のうちに閉じ終えられませんでした（返らない接続があります）",
+                DB_CLOSE_TIMEOUT.as_secs()
+            ));
+        }
+        HubShutdownReport { db_closed }
     }
+}
+
+/// 設定 DB のパス（#661 661-1、[`HubRuntime::start_with_profile_dirs`]）。profile の
+/// `config\banto-hub.sqlite3`（渡された綴りか本当のパス）なら、`dirs.config` で確かめた
+/// パスに直す（付随の `-wal`・`-shm`・`-journal` も確かめる）。それ以外（`BANTO_DB` が
+/// profile の外など）はそのまま返す。
+fn profile_db_path(dirs: &ProfileDirs, db_path: String) -> Result<String, ProfileDirsError> {
+    let path = Path::new(&db_path);
+    let in_config = path == dirs.config.path().join(DB_FILE_NAME)
+        || path == dirs.config.final_path().join(DB_FILE_NAME);
+    if !in_config {
+        return Ok(db_path);
+    }
+    let checked = dirs
+        .config
+        .reopen_path(DB_FILE_NAME, &["-wal", "-shm", "-journal"])
+        .map_err(|error| ProfileDirsError::Reopen {
+            name: DB_FILE_NAME.to_string(),
+            error,
+        })?;
+    Ok(checked.into_path().to_string_lossy().into_owned())
+}
+
+/// `path` が握ったフォルダ `dir` そのもの（渡された綴りか本当のパス）か（#661 661-1）。
+fn is_profile_dir(path: &Path, dir: &banto_safe_root::ManagedDir) -> bool {
+    path == dir.path() || path == dir.final_path()
 }
 
 /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): create the reserved
@@ -1293,6 +1415,105 @@ mod tests {
         assert_ne!(addr.port(), 0, "the OS should have assigned a real port");
 
         hub.shutdown().await;
+    }
+
+    fn plain_profile_dirs(dir: &crate::test_support::TempDir) -> ProfileDirs {
+        let paths = resolve_profile_paths(dir.path(), "dirs").expect("valid profile id");
+        crate::profile_lock::open_profile_dirs(
+            &crate::profile_lock::plain_profile_root_spec(&paths),
+            None,
+        )
+        .expect("open dirs")
+    }
+
+    /// #661 661-1: 握った組を渡して起動し、止めると設定 DB を閉じ終える（閉じた後は
+    /// DB のファイルを消せる - Windows では開いたままだと消せない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_profile_dirs_then_shutdown_closes_the_db() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-profile-dirs");
+        let dirs = plain_profile_dirs(&dir);
+        let db = dirs.config.path().join(DB_FILE_NAME);
+        let config = HubConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "dirs".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+
+        let hub = HubRuntime::start_with_profile_dirs(config, dirs.clone())
+            .await
+            .expect("start with profile dirs");
+        let report = hub.shutdown_and_report().await;
+        assert!(report.db_closed, "{report:?}");
+        assert!(db.is_file());
+        std::fs::remove_file(&db).expect("閉じた DB は消せる");
+    }
+
+    /// #693 レビュー: 監査の保留の場所が普通のファイルでも、握った組を渡した起動は
+    /// 保留なしで続く（`audit_spool` の方針。DB の初期化より前に止まらない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_unusable_audit_spool_runs_without_spool() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-bad-spool");
+        let paths = resolve_profile_paths(dir.path(), "dirs").expect("valid profile id");
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(
+            paths.data_dir.join(crate::audit_spool::SPOOL_DIR_NAME),
+            b"not a directory",
+        )
+        .unwrap();
+        let dirs = plain_profile_dirs(&dir);
+        assert!(dirs.audit_spool.is_none());
+        let config = HubConfig {
+            db_path: dirs
+                .config
+                .path()
+                .join(DB_FILE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "dirs".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let hub = HubRuntime::start_with_profile_dirs(config, dirs)
+            .await
+            .expect("a bad audit-spool must not stop the start");
+        hub.shutdown().await;
+    }
+
+    /// #661 661-1: profile の `config\banto-hub.sqlite3` だけを確かめたパスに直し、外の
+    /// パス（`BANTO_DB`）はそのまま。`data\` も綴り・本当のパスのどちらでも中とみなす。
+    #[test]
+    fn profile_paths_are_rewritten_only_inside_the_profile() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-profile-db-path");
+        let dirs = plain_profile_dirs(&dir);
+
+        let inside = dirs.config.path().join(DB_FILE_NAME);
+        let rewritten =
+            profile_db_path(&dirs, inside.to_string_lossy().into_owned()).expect("inside");
+        assert_eq!(
+            PathBuf::from(&rewritten),
+            dirs.config.final_path().join(DB_FILE_NAME)
+        );
+
+        let outside = dir.path().join("elsewhere.sqlite3");
+        let kept = outside.to_string_lossy().into_owned();
+        assert_eq!(profile_db_path(&dirs, kept.clone()).unwrap(), kept);
+        assert_eq!(
+            profile_db_path(&dirs, "./banto-hub.sqlite3".to_string()).unwrap(),
+            "./banto-hub.sqlite3"
+        );
+
+        assert!(is_profile_dir(dirs.data.path(), &dirs.data));
+        assert!(is_profile_dir(dirs.data.final_path(), &dirs.data));
+        assert!(!is_profile_dir(&dir.path().join("data"), &dirs.data));
     }
 
     /// オプションの OPC UA が bind に失敗しても REST/Hub は起動する。

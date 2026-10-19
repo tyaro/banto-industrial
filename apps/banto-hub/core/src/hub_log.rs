@@ -52,8 +52,27 @@ pub fn enable_service_log_file(path: &Path) -> std::io::Result<()> {
         }
     }
     let file = OpenOptions::new().create(true).append(true).open(path)?;
+    enable_service_log_file_from(file);
+    Ok(())
+}
+
+/// 開いたファイル（追記で開いた物）を、以後 [`log_line`]/[`log_err_line`] が書く先にする
+/// （#661 661-1）。前に開いていたファイルは閉じる。パスを持たないので、辿らずに開いた
+/// ファイル（`banto_safe_root::ManagedDir::open_append`）をそのまま渡せる。
+pub fn enable_service_log_file_from(file: File) {
     let slot = SERVICE_LOG_FILE.get_or_init(|| Mutex::new(None));
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(file);
+}
+
+/// 握った `logs\`（`crate::profile_lock::ProfileDirs::logs`）の中の
+/// [`SERVICE_LOG_FILE_NAME`] を、そのハンドルを基準に追記で開いて（無ければ作る）
+/// [`enable_service_log_file_from`] に渡す（#661 661-1。サービスから呼ぶのは 661-2）。
+/// `Mode::Guarded` の `dir` なら、名前がリンク・フォルダのときは開かずに断る。
+pub fn enable_service_log_file_in(
+    dir: &banto_safe_root::ManagedDir,
+) -> banto_safe_root::Result<()> {
+    let file = dir.open_append(SERVICE_LOG_FILE_NAME, true)?;
+    enable_service_log_file_from(file);
     Ok(())
 }
 
@@ -228,5 +247,28 @@ mod tests {
         // タイムスタンプの角括弧が付いていること（フォーマット自体は
         // 上の format_timestamp のテストで別途検証済み）。
         assert!(contents.contains('['));
+
+        // #661 661-1: 握ったフォルダ基準の版は、以後の行をそのフォルダのファイルへ向け直す
+        // （同じプロセスグローバルを使うので、このテストケースの中で続けて確かめる）。
+        let held = tmp.join("held");
+        let root = banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: held.clone(),
+            known: Default::default(),
+            owners: Vec::new(),
+            create_access: None,
+            create: true,
+            mode: banto_safe_root::Mode::Plain,
+        })
+        .expect("Plain のルート");
+        assert!(enable_service_log_file_in(root.as_dir()).is_ok());
+        log_line("test line three");
+        let held_contents =
+            std::fs::read_to_string(held.join(SERVICE_LOG_FILE_NAME)).expect("held log file");
+        assert!(held_contents.contains("test line three"));
+        let first = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !first.contains("test line three"),
+            "向け直した後は前のファイルに書かない"
+        );
     }
 }
