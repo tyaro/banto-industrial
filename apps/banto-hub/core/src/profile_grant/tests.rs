@@ -1855,11 +1855,26 @@ fn an_unmapped_domain_account_in_the_record_refuses_the_repair() {
         "err banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の {ALICE} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください。その利用者を外すなら、ドメインで削除済みを確かめてから記録（{OWNERS_AT}）を消して実行すると、今の DACL から組を採り直します（名前を解けない利用者には戻しません）"
     )), "{lines:#?}");
 
-    // 反証: 記録が無ければ今の DACL から組を採り直し、名前を解けないドメインの利用者には
-    // 戻さずに警告する（ほかの利用者で進む）。
+    // 記録が無いときも、締まった DACL に名前を解けないドメインの利用者がいれば断る
+    // （緩めない・記録を書き換えない）。
     let mut ops = FakeOps::new();
     ops.lookups
         .insert(ALICE.into(), OwnerLookup::Unmapped { local: false });
+    tight_profile(&ops, &[ALICE, CAROL]);
+    *ops.owners.borrow_mut() = Ok(None);
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(!ops.calls().iter().any(|c| c.starts_with("write_owners")));
+    assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
+    assert_eq!(*ops.owners.borrow(), Ok(None));
+    assert!(lines.contains(&format!(
+        "err banto-hub-elev: 今の DACL で「読み取りと実行」を持つ {ALICE} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください"
+    )), "{lines:#?}");
+
+    // 反証: 同じ SID がローカル（削除済み）なら、記録が無くても戻さずに警告して進む。
+    let mut ops = FakeOps::new();
+    ops.lookups
+        .insert(ALICE.into(), OwnerLookup::Unmapped { local: true });
     tight_profile(&ops, &[ALICE, CAROL]);
     *ops.owners.borrow_mut() = Ok(None);
     let (result, lines) = run(&ops, None, None);
@@ -1867,9 +1882,6 @@ fn an_unmapped_domain_account_in_the_record_refuses_the_repair() {
     assert!(ops
         .calls()
         .contains(&format!("relax default [{ME},{CAROL}]")));
-    assert!(lines.contains(&format!(
-        "err banto-hub-elev: 警告: 利用者のアカウントかを確かめられなかったので、{ALICE} には戻しません: 名前を解けません（ドメインに届かないなど。削除済みとは決められません）。名前の解決が戻ってから grant-profile-acl {ALICE} default を実行してください"
-    )), "{lines:#?}");
 }
 
 /// 修復（記録にグループ。#704 レビュー P2）: 照会に成功して利用者でないと分かった SID は、

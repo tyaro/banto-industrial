@@ -52,7 +52,7 @@
 //!   記録の SID は 1 つずつ利用者のアカウントかを確かめ（[`OwnerLookup`]）、グループと
 //!   この PC のローカルの削除済みは警告して外す。確かめられない SID と、名前を解けない
 //!   ドメインの SID（`ERROR_NONE_MAPPED` はネットワークのタイムアウトでも返るので、削除済みと
-//!   決められない）があれば断る（#704 レビュー）。
+//!   決められない）があれば、記録が無いときの DACL からの採り直しでも断る（#704 レビュー）。
 //! - **DACL の形**（論点 1）: 保護された DACL（`D:P`）に SYSTEM・Administrators のフル、
 //!   利用者ごとの「変更」（`0x1301BF`）、所有者は Administrators。親からは継承しない。
 //! - **足していく意味を保つ**（論点 4 (b)）: 書き直す前の DACL を開いたハンドルから読み
@@ -948,7 +948,8 @@ pub fn access_plan(
 /// - 記録が無い・使えない: 指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者の
 ///   アカウント（締めたときの組。締まった DACL の所有者は Administrators で、利用者には
 ///   書き換えられない）。記録が使えない旨を警告にする。利用者のアカウントかを確かめられない
-///   SID は戻さずに警告する。
+///   SID は戻さずに警告する。ただし名前を解けないドメインの SID（上と同じ理由）は、外すと
+///   ネットワークが戻っても権限が戻らないので、`Err` で断る（緩めない・記録を書き換えない）。
 pub fn repair_plan(
     user: &InstallUserSid,
     profile_id: &str,
@@ -1023,6 +1024,7 @@ pub fn repair_plan(
         StoredOwners::Missing => Some("記録がありません".to_string()),
         StoredOwners::Unusable(reason) => Some(reason),
     };
+    let mut refusals = Vec::new();
     if let Some(reason) = reason {
         warnings += 1;
         lines.push(err_line(&format!(
@@ -1071,12 +1073,15 @@ pub fn repair_plan(
                     )));
                     None
                 }
-                // ドメインの SID の`ERROR_NONE_MAPPED`は一時的な失敗かもしれない（#704
-                // レビュー P2）。確かめられないものと同じく、戻さずに警告する。
-                OwnerLookup::Unmapped { local: false } => Some(
-                    "名前を解けません（ドメインに届かないなど。削除済みとは決められません）"
-                        .to_string(),
-                ),
+                // ドメインの SID の`ERROR_NONE_MAPPED`は一時的な失敗かもしれない（#704）。
+                // 外して進むと、ネットワークが戻っても「変更」が戻らないので、断る。
+                OwnerLookup::Unmapped { local: false } => {
+                    refusals.push(format!(
+                        "今の DACL で「読み取りと実行」を持つ {} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください",
+                        sid.as_str()
+                    ));
+                    None
+                }
                 OwnerLookup::LookupFailed(why) => Some(why),
             };
             if let Some(why) = failure {
@@ -1088,6 +1093,10 @@ pub fn repair_plan(
                 )));
             }
         }
+    }
+    if !refusals.is_empty() {
+        lines.extend(refusals.iter().map(|text| err_line(text)));
+        return Err(lines);
     }
     Ok(AccessPlan {
         access: DirAccess::with_install_users(users),
