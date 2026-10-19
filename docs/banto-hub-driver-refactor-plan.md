@@ -1,7 +1,7 @@
 # banto-hub ドライバ基盤の改造計画
 
 作成日: 2026-10-19
-状態: **計画（2026-10-19 オーナー決定の方針）・未着手**。段の順番・受け皿の範囲・シリアル対応は決定済み。最初の対象は手元にある MELSEC と Modbus（§7 Q1）。Q3（crates.io に公開する）・Q4（シリアルは COM ポート直結とシリアル - Ethernet 変換器）も決定済み。Q2（ドライバの置き場所: R1〜R2b は本リポジトリ、API の公開後は公式ドライバを別リポジトリへ）も決定済みで、§7 に未決事項は残っていない。
+状態: **計画（2026-10-19 オーナー決定の方針）・未着手**。段の順番・受け皿の範囲・シリアル対応は決定済み。最初の対象は手元にある MELSEC と Modbus（§7 Q1）。Q3（crates.io に公開する）・Q4（シリアルは COM ポート直結とシリアル - Ethernet 変換器）も決定済み。Q2（ドライバの置き場所: R1〜R2b は本リポジトリ、API の公開後は公式ドライバを別リポジトリへ）も決定済み。§7 の Q1〜Q4 の大方針は決まっており、最初のシリアルドライバ（Modbus RTU が候補）や COM ポートの扱いの詳細は R2b 以降で詰める。
 対象: banto-hub（と ChronoGazer）のドライバまわりの構造を、**ドライバを 100 種類規模で増やせる形**に組み替える。WASM プラグインは**受け皿だけ先に作り、WASM 本体は後回し**にする。
 関連: [banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)（WASM プラグインの設計。§12 が本計画の元になった構成案）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §9.5（外部 DB の取り込み口 `push`）、[tag-server-design.md](tag-server-design.md) §3.4 / §3.4.1（今のドライバの置き場所）。
 
