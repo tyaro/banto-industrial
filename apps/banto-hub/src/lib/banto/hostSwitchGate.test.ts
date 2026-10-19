@@ -3,9 +3,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+	canRestoreSettingMode,
 	canSwitchToDesktop,
 	canSwitchToService,
 	canToggleAutostart,
+	fallbackNotice,
 	hostSwitchDisabledReason,
 	isPreflightOk,
 	type HostSwitchGateInput
@@ -78,5 +80,46 @@ describe('hostSwitchDisabledReason', () => {
 
 	it('操作可能なら null', () => {
 		expect(hostSwitchDisabledReason(base)).toBeNull();
+	});
+});
+
+describe('fallbackNotice（#661 661-5）', () => {
+	it('締まったまま止まった（5）は「運用モードのまま残っています」と [設定モードに戻す]', () => {
+		const notice = fallbackNotice('leftTight');
+		expect(notice?.title).toBe('運用モードのまま残っています');
+		expect(notice?.message).toContain('終了コード 5');
+		expect(notice?.offerRestore).toBe(true);
+	});
+
+	it('運用モード（停止中）も戻せる', () => {
+		expect(fallbackNotice('operationStopped')?.offerRestore).toBe(true);
+	});
+
+	it('4・使えない・止まっただけは戻す操作を出さない', () => {
+		const cannot = fallbackNotice('cannotOperate');
+		expect(cannot?.title).toBe('運用モードにできませんでした');
+		expect(cannot?.message).toContain('設定モードのまま');
+		expect(cannot?.offerRestore).toBe(false);
+		expect(fallbackNotice('profileUnusable')?.offerRestore).toBe(false);
+		expect(fallbackNotice('serviceLost')?.offerRestore).toBe(false);
+	});
+
+	it('一般・知らない名前は null', () => {
+		expect(fallbackNotice(null)).toBeNull();
+		expect(fallbackNotice(undefined)).toBeNull();
+		expect(fallbackNotice('somethingNew')).toBeNull();
+	});
+});
+
+describe('canRestoreSettingMode（#661 661-5）', () => {
+	it('ローカルシェルで締まったままなら、Operators でなくても押せる', () => {
+		expect(canRestoreSettingMode({ ...base, canOperate: false }, 'leftTight')).toBe(true);
+	});
+
+	it('切替中・非シェル・戻す理由でないときは押せない', () => {
+		expect(canRestoreSettingMode({ ...base, switching: true }, 'leftTight')).toBe(false);
+		expect(canRestoreSettingMode({ ...base, isLocalShell: false }, 'leftTight')).toBe(false);
+		expect(canRestoreSettingMode(base, 'cannotOperate')).toBe(false);
+		expect(canRestoreSettingMode(base, null)).toBe(false);
 	});
 });

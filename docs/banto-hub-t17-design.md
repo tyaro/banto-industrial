@@ -1,7 +1,7 @@
 # banto-hub T17 詳細設計（SCM 管理・profile・UAC・インストーラ再設計）
 
 作成日: 2026-08-10
-状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。2026-10-18: §1 の末尾に「設定モード ⇔ 運用モード」のオーナー決定（#623・#661。T17-3 の切り替えのときにサービス自身が ACL を付け替える）を記録。2026-10-19: 同じ所に #661 の当てはめ（締める範囲・戻す相手の記録・STOP の順序・PR の分け方）のオーナー決定を記録。同日: 661-2（サービスの締める・緩める本体）を実装し、§1 の末尾に「#661 661-2 実装メモ」を足した（実機確認は未）。#697 のレビューで運用中の見張り（`SecurityWatch`・`recheck`）を足した。
+状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。2026-10-18: §1 の末尾に「設定モード ⇔ 運用モード」のオーナー決定（#623・#661。T17-3 の切り替えのときにサービス自身が ACL を付け替える）を記録。2026-10-19: 同じ所に #661 の当てはめ（締める範囲・戻す相手の記録・STOP の順序・PR の分け方）のオーナー決定を記録。同日: 661-2（サービスの締める・緩める本体）を実装し、§1 の末尾に「#661 661-2 実装メモ」を足した（実機確認は未）。#697 のレビューで運用中の見張り（`SecurityWatch`・`recheck`）を足した。2026-10-20: 661-5（シェルと画面）を実装し、§1 の末尾に「#661 661-5 実装メモ」を足した（実機確認は未）。
 2026-10-17: §12 の #626 の決定 11（#630 の分離）に、#630 の結果（サイドカーの設定の
 置き場を保護された `sink\` に分けた）を 1 行足した。
 T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
@@ -164,6 +164,16 @@ Desktop Hub 起動までのフル E2E は任意の追加確認として残す。
 - **監査の保留は Guarded では必須**（`open_profile_dirs_checked` の `SERVICE_PROFILE_MANAGED_SPECS`）: 1 周目が木の全体を確かめた後なので、開けないのは I/O か改ざんで、黙って保留なしで動かすより緩め直して止める方が安全。`data` は 1 回だけ握る（661-1 の別に試す形の二重の握りは、Guarded のフォルダのハンドルが共有の読み書きを許し `DELETE` を求めないので衝突しないが、使わない）。
 - **サービスログの開き方の変更**: 共有ランナーの `open_log`（開始の直後）では開かず、profile を握って排他を取った後に握った `logs\` の中に開く。それより前の失敗（profile を開けない・排他）は標準エラー出力だけで、終了コードで区別する。`BANTO_HUB_DATA` を設定していてもサービスログは profile の `logs\` に書く（`resolve_service_log_dir` は使わない）。
 - **既知の制限**: profile の外の `BANTO_DB`・`BANTO_HUB_DATA` は 1 行出すだけで締めない（#659 と合わせて決める）。`{root}` か `profiles\` がジャンクションだと profile の本当のパスが期待と食い違い、起動を断る（3）。相手が 0 人で profile の所有者が利用者のときは profile を握れないので、ログを書かずに 4 だけを返す。実機確認は未（661-5 の画面と合わせて行う）。
+
+**#661 661-5 実装メモ**（2026-10-20。判定と文言の純関数は `apps/banto-hub/src-tauri/src/launch_gate.rs`、配線は同じ crate の `lib.rs`（`decide_startup`・`run_host_switch`・`run_restore_setting`・`spawn_service_watch`）、デスクトップのログは `apps/banto-hub/core/src/desktop_log.rs`。手本は ChronoGazer の #623 PR-4・#686〜#690）
+
+- **起動の判定（#699 レビューの宿題）**: Desktop になる組合せ（SCM が Stopped・NotInstalled・照会の失敗）では、`HubRuntime::start` の前に profile の形を見る（`launch_gate::observe_profile_mode` → `banto_safe_root::mode::observe_root` → `profile_mode::profile_shape`。profile を読むだけで開き、作らない）。運用モードの形（`Tight`）なら Desktop に進まず Fallback の窓「運用モード（停止中）です」（最後の終了コードが 5 なら「運用モードのまま残っています」）、観測に使えない（リンクなど）なら「profile のフォルダを使えません」。断るのはこの 2 つだけで、緩んだ・無い・読めない（自分の ACE が無い）は Desktop へ進む（Hub の起動が最後の防衛線。ChronoGazer と同じ）。終了コードは文言を選ぶためだけに使う（形が緩んでいれば 5 が残っていても Desktop）。判定は `launch_gate::plan_startup`（純関数）。
+- **同じ判定を通す経路**: 起動・トレイの「再試行」・切り替え（`HostSwitchEngine` が Desktop を許した後も `decide_startup` をもう一度通す）・[設定モードに戻す] の後。これで新しい engine（シェルの起動し直し）、PRESHUTDOWN の後の 0、scan より前の 2・3 で締まったままでも Desktop にしない。
+- **[設定モードに戻す]**（トレイの Fallback の窓と `/status`。invoke `restore_setting_mode`）: `host_switch::relax_only_and_wait`（Operators は UAC なし）→ 0 なら起動の判定 → Desktop。5・未登録・権限が無い・固まった等は昇格ヘルパーの修復 `banto-hub-elev.exe grant-profile-acl`（UAC）を起動し、成功なら同じ判定、失敗なら「運用モードのまま残っています」に理由を添える（ChronoGazer の `after_relax` と同じ表）。サービスが動いていれば何も変えずに知らせるだけ。既定でない profile は利用者の名前を確かに渡せないので、修復は手順の案内で断る。Operators でなくても出す（修復の UAC が最後の手段）。
+- **終了コード 4・5 の窓**: 切り替えの失敗は `HostSwitchState::service_fault` から（4 →「運用モードにできませんでした」、5 →「運用モードのまま残っています」）。サービスに接続している間・Fallback の間は 5 秒ごとに SCM を見張り（`spawn_service_watch`、切り替えの間は休む）、止まったら `launch_gate::lost_cause`（4・5・形）で窓を選ぶ。StopPending で一般の「サービスが止まりました」に移った後も、Stopped に達したら選び直す（#690）。見張りは Hub を決して起動しない。モードの窓はサービスが動き出したら一般に戻す。
+- **`/status`**: 「切り替えの間は収集が止まります。」の一言、段ごとの進み具合（`switch_phase_message`。締める・緩める間は checkpoint が進む限り同じ文が出る）、Fallback の理由（`fallbackCause`）に合う見出しと本文、`leftTight`・`operationStopped` なら [設定モードに戻す]。invoke のエラーは `describeInvokeError`（文字列・`Error`・`message` を持つオブジェクト、それ以外は中立の文。#688）。
+- **デスクトップのログ**: `logs\banto-hub-desktop-YYYY-MM-DD.log`（profile の `logs\`）に、設定モードへの切り替え（サービスの停止・[設定モードに戻す]）の開始・完了、戻せた手段、終了コード 5 の案内を起きた時刻で書く。運用モードの間は書けないので、行はシェルが覚えておき（`AppState::pending_log`）、このアプリの Hub が動き始めてから書く。同じ行をシェルのログにも出す。
+- **既知の制限**: Service の画面のままサービスが止まると、窓は Hub の画面（応答しない）のままで、文言はトレイと `/status`（開いていれば）に出る（プレースホルダへ戻す navigate はしていない）。見張りは SCM の状態だけを見る（health の不調では移らない）。実機確認は未。
 
 ## 2. 現行コード棚卸し
 

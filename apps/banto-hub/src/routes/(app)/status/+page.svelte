@@ -84,14 +84,19 @@
 	import {
 		canSwitchToDesktop,
 		canSwitchToService,
+		canRestoreSettingMode,
 		canToggleAutostart,
+		fallbackNotice,
 		hostSwitchDisabledReason,
+		PAUSE_NOTE,
 		type HostSwitchGateInput
 	} from '#lib/banto/hostSwitchGate.js';
 	import {
+		describeInvokeError,
 		getHostSwitchStatus,
 		isLocalShell,
 		listenHostSwitchProgress,
+		restoreSettingMode,
 		setServiceAutostart,
 		switchToDesktop,
 		switchToService,
@@ -504,6 +509,9 @@
 	let hostProgress: HostSwitchProgress | null = $state(null);
 	let hostSwitchError: string | null = $state(null);
 	let autostartBusy = $state(false);
+	// #661 661-5: 最後に終わった切替・見張りが知らせた Fallback の理由（`leftTight` など）。
+	// シェルの状態（`hostSwitch.fallbackCause`）が来たらそちらを正とする。
+	let hostFallbackCause: string | null = $state(null);
 
 	// --- サービス一覧（S6、docs/banto-hub-external-db-design.md §5.5・§7 row
 	// S6、ローカルシェル限定）: BantoHub は上の hostSwitch カードが持つ状態
@@ -617,8 +625,9 @@
 		}
 		try {
 			hostSwitch = await getHostSwitchStatus();
+			hostFallbackCause = hostSwitch.fallbackCause ?? null;
 		} catch (err) {
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 		}
 	}
 
@@ -635,6 +644,7 @@
 			hostProgress = ev;
 			if (ev.error) hostSwitchError = ev.error;
 			if (ev.done) {
+				hostFallbackCause = ev.fallbackCause ?? null;
 				hostSwitchBusy = false;
 				void refreshHostSwitch();
 				void poll();
@@ -663,7 +673,7 @@
 			await switchToService();
 		} catch (err) {
 			hostSwitchBusy = false;
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 			toastStore.push('error', hostSwitchError);
 		}
 	}
@@ -681,7 +691,7 @@
 			await switchToDesktop();
 		} catch (err) {
 			hostSwitchBusy = false;
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 			toastStore.push('error', hostSwitchError);
 		}
 	}
@@ -705,11 +715,42 @@
 			toastStore.push('success', enabled ? '自動起動を有効にしました' : '自動起動を無効にしました');
 			await refreshHostSwitch();
 		} catch (err) {
-			hostSwitchError = errorMessage(err);
+			hostSwitchError = describeInvokeError(err);
 			toastStore.push('error', hostSwitchError);
 			await refreshHostSwitch();
 		} finally {
 			autostartBusy = false;
+		}
+	}
+
+	// #661 661-5: 締まったまま止まっているときの [設定モードに戻す]。
+	const hostNotice = $derived(fallbackNotice(hostFallbackCause));
+	const allowRestoreSetting = $derived(canRestoreSettingMode(gate, hostFallbackCause));
+
+	async function handleRestoreSettingMode(): Promise<void> {
+		const ok = window.confirm(
+			`profile のファイルの保護を外し、設定モード（このアプリで Hub を動かす形）に戻します。
+
+` +
+				`${PAUSE_NOTE}
+` +
+				`戻らないときは、続けて Windows の管理者の許可（UAC）が求められます。`
+		);
+		if (!ok) return;
+		hostSwitchBusy = true;
+		hostSwitchError = null;
+		hostProgress = {
+			phase: 'starting',
+			message: '設定モードに戻しています…',
+			done: false,
+			error: null
+		};
+		try {
+			await restoreSettingMode();
+		} catch (err) {
+			hostSwitchBusy = false;
+			hostSwitchError = describeInvokeError(err);
+			toastStore.push('error', hostSwitchError);
 		}
 	}
 </script>
@@ -1168,6 +1209,26 @@
 			{#if hostSwitchError}
 				<p class="config-error">切替エラー: {hostSwitchError}</p>
 			{/if}
+
+			{#if hostNotice}
+				<div class="config-error" role="alert">
+					<p><strong>{hostNotice.title}</strong></p>
+					<p>{hostNotice.message}</p>
+					{#if hostNotice.offerRestore}
+						<div class="write-control-actions">
+							<button
+								type="button"
+								onclick={handleRestoreSettingMode}
+								disabled={!allowRestoreSetting}
+							>
+								設定モードに戻す
+							</button>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<p class="note">{PAUSE_NOTE}</p>
 
 			{#if disabledReason && !allowSwitchToService && !allowSwitchToDesktop}
 				<p class="note">{disabledReason}</p>

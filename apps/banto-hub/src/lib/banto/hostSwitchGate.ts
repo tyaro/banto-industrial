@@ -88,3 +88,72 @@ export function hostSwitchDisabledReason(input: HostSwitchGateInput): string | n
 	}
 	return null;
 }
+
+/** #661 661-5: 切り替えの一言（シェルの窓・確認と同じ文）。 */
+export const PAUSE_NOTE = '切り替えの間は収集が止まります。';
+
+/** #661 661-5: Fallback の理由ごとの文言と操作。 */
+export type FallbackNotice = {
+	title: string;
+	message: string;
+	/** [設定モードに戻す] を出すか。 */
+	offerRestore: boolean;
+};
+
+/**
+ * シェルが知らせた Fallback の理由（`fallbackCause`）から文言を選ぶ（純関数）。知らない名前・
+ * 一般（null）は null（従来の表示だけ）。シェルの `launch_gate::cause_page` と同じ表。
+ */
+export function fallbackNotice(cause: string | null | undefined): FallbackNotice | null {
+	switch (cause) {
+		case 'leftTight':
+			return {
+				title: '運用モードのまま残っています',
+				message:
+					'サービスが、profile のファイルの保護を外せないまま止まりました（終了コード 5）。このアプリでは Hub を起動しません。「設定モードに戻す」で保護を外します。それで戻らないときは、管理者の許可（ユーザーアカウント制御）を求めて直します。',
+				offerRestore: true
+			};
+		case 'operationStopped':
+			return {
+				title: '運用モード（停止中）です',
+				message:
+					'サービス（運用モード）が止まっています。profile のファイルは保護されたままなので、このアプリでは Hub を起動しません。設定を変えるときは「設定モードに戻す」を押します。',
+				offerRestore: true
+			};
+		case 'cannotOperate':
+			return {
+				title: '運用モードにできませんでした',
+				message:
+					'profile のファイルを保護できなかったため、運用モードに切り替えませんでした（終了コード 4）。ファイルは変わっておらず、設定モードのままです。理由はサービスのログにあります。トレイの「再試行」で、このアプリで Hub を起動し直します。',
+				offerRestore: false
+			};
+		case 'profileUnusable':
+			return {
+				title: 'profile のフォルダを使えません',
+				message:
+					'profile のフォルダがリンク（ジャンクション）になっているなど、安全に使えない状態です。管理者に確かめてもらい、直した後にトレイの「再試行」を押します。',
+				offerRestore: false
+			};
+		case 'serviceLost':
+			return {
+				title: 'サービスが止まりました',
+				message:
+					'接続していたサービスが止まりました。このアプリでは自動で Hub を起動しません。トレイの「再試行」で状態を確かめ直します。',
+				offerRestore: false
+			};
+		default:
+			return null;
+	}
+}
+
+/**
+ * [設定モードに戻す] を押せるか（純関数）。ローカルシェルで、理由が締まったまま止まっている
+ * ときだけ。Operators でなくても押せる（戻らなければ管理者の許可で修復する）。切替中は不可。
+ */
+export function canRestoreSettingMode(
+	input: HostSwitchGateInput,
+	cause: string | null | undefined
+): boolean {
+	if (!input.isLocalShell || input.switching) return false;
+	return fallbackNotice(cause)?.offerRestore === true;
+}

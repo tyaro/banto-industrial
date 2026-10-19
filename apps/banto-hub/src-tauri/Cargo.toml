@@ -51,6 +51,11 @@ serde = { workspace = true }
 # target を限らない依存にしている（Win32 の部分は crate の中で
 # `#[cfg(windows)]`）。
 banto-service-elev = { path = "../../../crates/banto-service-elev" }
+# #661 661-5: Desktop へ進む前に profile の形（運用モードの形か）を、profile を読むだけで
+# 開いて見る（`launch_gate::observe_profile_mode` → `banto_safe_root::mode::observe_root`。
+# 判定はサービス本体と同じ `banto_hub_core::profile_mode::profile_shape`）。core が既に使う
+# workspace の crate で、パッケージは増えない。
+banto-safe-root = { path = "../../../crates/banto-safe-root" }
 
 # #505 のテスト専用: 窓の CSP（`tauri.conf.json`）が Hub の応答の CSP（banto の
 # `CONTENT_SECURITY_POLICY`）に Tauri の IPC を足しただけか、banto の
