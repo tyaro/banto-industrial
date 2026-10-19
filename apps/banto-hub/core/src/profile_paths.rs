@@ -45,6 +45,9 @@ use crate::runtime::HubConfig;
 /// profile-id の既定値。env `BANTO_HUB_PROFILE`が空／未設定のとき使う。
 pub const DEFAULT_PROFILE_ID: &str = "default";
 
+/// profile の設定 DB のファイル名（`{profile_dir}/config/` の中）。
+pub const DB_FILE_NAME: &str = "banto-hub.sqlite3";
+
 /// `<profile-id>`の検証エラー（空文字列、パス区切り文字、`..`、`:`、予約名、
 /// 末尾の`.`・空白）。
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -139,11 +142,49 @@ pub fn resolve_profile_paths(
     Ok(ProfilePaths {
         root: root.to_path_buf(),
         profile_id: profile_id.to_string(),
-        db_path: profile_dir.join("config").join("banto-hub.sqlite3"),
+        db_path: profile_dir.join("config").join(DB_FILE_NAME),
         data_dir: profile_dir.join("data"),
         logs_dir: profile_dir.join("logs"),
         profile_dir,
     })
+}
+
+/// #661 661-1: `path`（`BANTO_DB`・`BANTO_HUB_DATA` などで外から渡されたパス）が
+/// profile の**外**か（純関数。ファイルシステムに触れない）。`profile_dir` は渡された綴り、
+/// `profile_final` は握った profile の本当のパス（`banto_safe_root::SafeRoot::final_path`）で、
+/// どちらかの下なら中とみなす（要素単位の前方一致。`profiles\a` と `profiles\ab` は別）。
+///
+/// 相対パスは外とみなす（どこを基準に開くかは呼ぶ時点のカレントディレクトリ次第で、
+/// profile のリンクの保護と運用モードの ACL の範囲に入るとは言えないため）。外のパスは
+/// 辿らない作り方・ACL の付け替えの対象外で、サービスはその旨をログに 1 行出す
+/// （[`external_path_line`]。呼ぶのは 661-2）。
+pub fn is_outside_profile(path: &Path, profile_dir: &Path, profile_final: &Path) -> bool {
+    if !path.is_absolute() {
+        return true;
+    }
+    !(path.starts_with(profile_dir) || path.starts_with(profile_final))
+}
+
+/// profile の外にあるもの（[`external_path_line`] の文言の切り替え）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalPath {
+    /// 設定 DB（`BANTO_DB`）。
+    Db,
+    /// データのフォルダ（`BANTO_HUB_DATA`、または設定 DB の `data.dir`）。
+    DataDir,
+}
+
+/// profile の外のパスを使うときにログに出す 1 行（#661 661-1。ChronoGazer の
+/// `external_data_dir_line` 相当。呼ぶのは 661-2 のサービス）。
+pub fn external_path_line(kind: ExternalPath, path: &Path) -> String {
+    let what = match kind {
+        ExternalPath::Db => "設定 DB",
+        ExternalPath::DataDir => "データのフォルダ",
+    };
+    format!(
+        "banto-hub: {what}（外部: {}）は profile の外にあり、リンクの保護と運用モードの ACL の対象外です（#661）",
+        path.display()
+    )
 }
 
 /// `Global\BantoHub.<profile-id>`（desktop-plan §16.2 で命名決定済み）。
@@ -478,6 +519,45 @@ mod tests {
             resolve_hub_root_impl(true, None, None, None, None),
             PathBuf::from(r"C:\ProgramData").join("BantoHub")
         );
+    }
+
+    /// #661 661-1: 渡された綴りか本当のパスの下なら中、それ以外・相対パスは外。
+    #[test]
+    fn is_outside_profile_matches_by_components_of_either_spelling() {
+        // どの OS でも絶対パスになる基準（純関数なので存在しなくてよい）。
+        let base = std::env::temp_dir();
+        let spelled = base.join("hub-root").join("profiles").join("default");
+        let real = base.join("real-root").join("profiles").join("default");
+
+        let db = spelled.join("config").join(DB_FILE_NAME);
+        assert!(!is_outside_profile(&db, &spelled, &real));
+        assert!(!is_outside_profile(&real.join("data"), &spelled, &real));
+        assert!(!is_outside_profile(&spelled, &spelled, &real));
+
+        let sibling = base.join("hub-root").join("profiles").join("default2");
+        assert!(is_outside_profile(&sibling.join("data"), &spelled, &real));
+        assert!(is_outside_profile(&base.join("elsewhere"), &spelled, &real));
+        assert!(is_outside_profile(Path::new("data"), &spelled, &real));
+        assert!(is_outside_profile(
+            Path::new("./banto-hub.sqlite3"),
+            &spelled,
+            &real
+        ));
+    }
+
+    #[test]
+    fn external_path_line_names_what_and_where() {
+        let path = std::env::temp_dir().join("external-data");
+        let data = external_path_line(ExternalPath::DataDir, &path);
+        assert!(
+            data.starts_with("banto-hub: データのフォルダ（外部: "),
+            "{data}"
+        );
+        assert!(data.contains(&path.display().to_string()), "{data}");
+        assert!(data.contains("ACL の対象外"), "{data}");
+        assert!(data.contains("#661"), "{data}");
+        let db = external_path_line(ExternalPath::Db, &path);
+        assert!(db.starts_with("banto-hub: 設定 DB（外部: "), "{db}");
     }
 
     #[test]

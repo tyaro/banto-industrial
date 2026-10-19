@@ -235,13 +235,14 @@
 //!
 //! ### ファイルの書き込み中に落ちた場合
 //!
-//! 一時ファイル (`<名前>.tmp`) に書いて `sync_all` し、`rename` で置き換える
-//! (Unix では親ディレクトリも `sync_all`)。途中で落ちても、状態ファイルは
-//! 前の内容か新しい内容のどちらかで、半端な内容は残らない。残った一時
-//! ファイルは読まず、次の書き込みで上書きする。一時ファイルの名前は 1 つ
-//! なので、同じプロセスの書き込みどうしは作成 → rename を
-//! `STATE_FILE_WRITE_LOCK` で直列にする (他方の書きかけの一時ファイルを
-//! rename しない)。
+//! 共有 crate `banto_safe_root` の `ManagedDir::write_atomic` で書く (#661 661-1):
+//! 一時ファイル (`.<名前>.tmp-<nonce>`。書き込みごとに違う名前を新しく作る) に
+//! 書いて `sync` し、付け替えで置き換える (Unix では親ディレクトリも `sync_all`)。
+//! 途中で落ちても、状態ファイルは前の内容か新しい内容のどちらかで、半端な内容は
+//! 残らない。残った一時ファイルは読まない (以前の `<名前>.tmp` も同じ)。同じ
+//! プロセスの書き込みどうしは `STATE_FILE_WRITE_LOCK` で直列にする。サービスが
+//! 握った profile の `data\` に置くとき ([`WriteControl::restore_in`]) は、その
+//! ハンドルを基準に書く。
 //!
 //! [`WriteControl::was_enabled_before_restart`] は「起動時に復元した値」を
 //! 指す名称として残す (外部クライアント Thermal Monitor が
@@ -249,13 +250,13 @@
 //! ため、フィールド名・REST フィールド名とも互換のため変更しない)。
 
 use std::future::Future;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use banto_core::BantoError;
+use banto_safe_root::{open_root, ManagedDir, Mode, RootSpec};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::collections::VecDeque;
@@ -481,22 +482,84 @@ async fn write_state_record(
     .map_err(|err| format!("{}: {err}", path.display()))?
 }
 
-/// 状態ファイルの書き込み (一時ファイルの作成 → rename) を直列にする
-/// ([`write_state_file_blocking`])。
+/// [`write_state_record`] の、握ったフォルダ `dir` の中の [`STATE_FILE_NAME`] に書く版
+/// (#661 661-1)。
+async fn write_state_record_in(
+    dir: &Arc<ManagedDir>,
+    record: FileRecord,
+    actor: Option<&str>,
+) -> Result<(), String> {
+    let dir = dir.clone();
+    let shown = state_file_path(dir.final_path());
+    let actor = actor.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        write_state_in_blocking(&dir, STATE_FILE_NAME, record, actor.as_deref())
+            .map_err(|err| format!("{}: {err}", shown.display()))
+    })
+    .await
+    .map_err(|err| format!("{STATE_FILE_NAME}: {err}"))?
+}
+
+/// 状態ファイルの書き込み (一時ファイルの作成 → 付け替え) を直列にする
+/// ([`write_state_in_blocking`])。一時ファイルの名前は書き込みごとに違うので、
+/// 他方の書きかけを付け替えることはもう無いが、同じプロセスの書き込みが重ならない
+/// ようにはしておく (順序までは守らない - このモジュール doc「呼び出し側が future を
+/// 捨てても」)。
 static STATE_FILE_WRITE_LOCK: SyncMutex<()> = SyncMutex::new(());
 
+/// テスト用: 状態ファイルへの書き込みだけを失敗させるパス (状態ファイル自体は
+/// そのまま読める)。一時ファイルの名前が書き込みごとに変わったので (#661 661-1)、
+/// 以前のように一時ファイルの場所をふさいでは失敗させられない。
+#[cfg(test)]
+static BLOCKED_STATE_WRITES: SyncMutex<Vec<PathBuf>> = SyncMutex::new(Vec::new());
+
+/// パスで渡された状態ファイルに書く。親のフォルダを `Mode::Plain` で開いて (無ければ
+/// 作る。以前の `create_dir_all` と同じ)、[`write_state_in_blocking`] に渡す。
 fn write_state_file_blocking(
     path: &Path,
     record: FileRecord,
     actor: Option<&str>,
 ) -> std::io::Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "親ディレクトリがありません",
-        )
-    })?;
-    std::fs::create_dir_all(dir)?;
+    let invalid =
+        |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_string());
+    let dir = path
+        .parent()
+        .ok_or_else(|| invalid("親ディレクトリがありません"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("ファイル名がありません"))?;
+    let root = open_root(&RootSpec {
+        expected: dir.to_path_buf(),
+        known: Default::default(),
+        owners: Vec::new(),
+        create_access: None,
+        create: true,
+        mode: Mode::Plain,
+    })
+    .map_err(std::io::Error::other)?;
+    write_state_in_blocking(root.as_dir(), name, record, actor)
+}
+
+/// 握ったフォルダ `dir` の中の `name` を原子的に置き換える (`ManagedDir::write_atomic`:
+/// 一時ファイル → `sync` → 付け替え。Guarded はハンドル基準で、名前がフォルダ・リンクなら
+/// 断る)。このモジュール doc「ファイルの書き込み中に落ちた場合」参照。
+fn write_state_in_blocking(
+    dir: &ManagedDir,
+    name: &str,
+    record: FileRecord,
+    actor: Option<&str>,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let blocked = lock_ignoring_poison(&BLOCKED_STATE_WRITES);
+        if blocked
+            .iter()
+            .any(|p| *p == dir.path().join(name) || *p == dir.final_path().join(name))
+        {
+            return Err(std::io::Error::other("テストで書き込みをふさいだ"));
+        }
+    }
     let changed_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -512,28 +575,12 @@ fn write_state_file_blocking(
     }
     let body = serde_json::to_vec_pretty(&body).map_err(std::io::Error::other)?;
 
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    // 一時ファイルの名前は 1 つなので、同じプロセスの書き込みどうしは
-    // 作成 → rename を直列にする (捨てられた future の書き込みが後の書き込みと
-    // 重なっても、他方の書きかけの一時ファイルを rename しない。順序までは
-    // 守らない - このモジュール doc「呼び出し側が future を捨てても」)。
     let _serialized = lock_ignoring_poison(&STATE_FILE_WRITE_LOCK);
-    let result = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result?;
+    dir.write_atomic(name, &body)
+        .map_err(std::io::Error::other)?;
     #[cfg(unix)]
     {
-        if let Ok(dir_handle) = std::fs::File::open(dir) {
+        if let Ok(dir_handle) = std::fs::File::open(dir.final_path()) {
             let _ = dir_handle.sync_all();
         }
     }
@@ -554,6 +601,9 @@ pub struct WriteControl {
     /// 状態ファイル。`None` は状態ファイルを持たない構成 ([`Self::new`]、
     /// 他機能のテスト用) - そのときは DB だけに保存する (#433 より前の挙動)。
     state_file: Option<PathBuf>,
+    /// 状態ファイルを置く握ったフォルダ (#661 661-1、[`Self::restore_in`])。`Some` なら
+    /// 書き込みはこのハンドルを基準にする (`state_file` は読み取りと表示に使う)。
+    state_dir: Option<Arc<ManagedDir>>,
     /// 停止の世代と、`op_lock` に並んでいる停止の数。ライブフラグの切り替えは
     /// このロックの中で行う (このモジュール doc「ロック順序」「並んでいる停止が
     /// あれば、再開は始めない」)。
@@ -801,11 +851,23 @@ impl WriteControl {
         Self::build(decision.enabled, Some(state_file), decision.warning)
     }
 
+    /// [`Self::restore`] の、状態ファイルを握ったフォルダ (`data_dir`) の中に置く版
+    /// (#661 661-1)。書き込みは `data_dir` のハンドルを基準にした原子的な置き換え
+    /// (`ManagedDir::write_atomic`)。読み取り・表示のパスは
+    /// `data_dir.final_path()` + [`STATE_FILE_NAME`]。
+    pub fn restore_in(decision: StartupDecision, data_dir: Arc<ManagedDir>) -> Self {
+        let path = state_file_path(data_dir.final_path());
+        let mut control = Self::build(decision.enabled, Some(path), decision.warning);
+        control.state_dir = Some(data_dir);
+        control
+    }
+
     fn build(enabled: bool, state_file: Option<PathBuf>, warning: Option<String>) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
             was_enabled_before_restart: enabled,
             state_file,
+            state_dir: None,
             stop_state: SyncMutex::new(StopState::default()),
             stop_signal: Notify::new(),
             op_lock: AsyncMutex::new(()),
@@ -1026,7 +1088,10 @@ impl WriteControl {
         // 1. 状態ファイルに「再開の途中」(停止扱い) を書く。書けなければ
         //    DB には触れずにやめる (停止の記録を DB から消さない)。
         if let Some(path) = &self.state_file {
-            if let Err(err) = write_state_record(path, FileRecord::ResumePending, actor).await {
+            if let Err(err) = self
+                .write_record(path, FileRecord::ResumePending, actor)
+                .await
+            {
                 let change = WriteControlChange {
                     requested_enabled: true,
                     db: Err(NOT_SAVED_FILE_FAILED.to_string()),
@@ -1259,9 +1324,28 @@ impl WriteControl {
     }
 
     async fn persist_file(&self, enabled: bool, actor: Option<&str>) -> Option<Result<(), String>> {
+        let record = if enabled {
+            FileRecord::Enabled
+        } else {
+            FileRecord::Disabled
+        };
         match &self.state_file {
             None => None,
-            Some(path) => Some(write_state_file(path, enabled, actor).await),
+            Some(path) => Some(self.write_record(path, record, actor).await),
+        }
+    }
+
+    /// 状態ファイルに書く。握ったフォルダがあればそのハンドル基準 (#661 661-1)、
+    /// 無ければパスから。
+    async fn write_record(
+        &self,
+        path: &Path,
+        record: FileRecord,
+        actor: Option<&str>,
+    ) -> Result<(), String> {
+        match &self.state_dir {
+            Some(dir) => write_state_record_in(dir, record, actor).await,
+            None => write_state_record(path, record, actor).await,
         }
     }
 
@@ -1424,12 +1508,11 @@ mod tests {
         write_state_file(&path, true, None).await.unwrap();
         assert_eq!(read_state_file(&path).await, FileStartupState::Enabled);
 
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        assert!(
-            !PathBuf::from(tmp).exists(),
-            "no temporary file is left behind"
-        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [STATE_FILE_NAME], "no temporary file is left behind");
 
         for broken in [
             &b""[..],
@@ -1450,21 +1533,75 @@ mod tests {
     }
 
     /// 途中で落ちて一時ファイルだけが残った状態は、状態ファイルの内容に
-    /// 影響しない (読むのは本体だけ。次の書き込みで一時ファイルを上書きする)。
+    /// 影響しない (読むのは本体だけ。次の書き込みは別の名前の一時ファイルを作るので、
+    /// 残った物に邪魔されない)。以前の形の `<名前>.tmp` も同じ。
     #[tokio::test]
-    async fn a_leftover_temporary_file_is_ignored_and_overwritten() {
+    async fn a_leftover_temporary_file_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = state_file_path(dir.path());
         write_state_file(&path, false, None).await.unwrap();
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, b"{\"format\":1,\"writeEnab").unwrap();
+        let mut old_style = path.as_os_str().to_owned();
+        old_style.push(".tmp");
+        let leftovers = [
+            dir.path()
+                .join(banto_safe_root::root::temp_name(STATE_FILE_NAME, 7).unwrap()),
+            PathBuf::from(old_style),
+        ];
+        for tmp in &leftovers {
+            std::fs::write(tmp, b"{\"format\":1,\"writeEnab").unwrap();
+        }
 
         assert_eq!(read_state_file(&path).await, FileStartupState::Disabled);
         write_state_file(&path, true, None).await.unwrap();
         assert_eq!(read_state_file(&path).await, FileStartupState::Enabled);
-        assert!(!tmp.exists());
+        for tmp in &leftovers {
+            assert!(
+                tmp.exists(),
+                "残った一時ファイルは読みも消しもしない: {tmp:?}"
+            );
+        }
+    }
+
+    /// #661 661-1: 握ったフォルダを渡した `WriteControl` は、そのフォルダの中の
+    /// 状態ファイルへ書き、パスで読める (以前の `restore` と同じ中身)。
+    #[tokio::test]
+    async fn restore_in_writes_the_state_file_through_the_held_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = init_db(dir.path().join("registry.sqlite3")).await.unwrap();
+        let root = open_root(&RootSpec {
+            expected: dir.path().to_path_buf(),
+            known: Default::default(),
+            owners: Vec::new(),
+            create_access: None,
+            create: false,
+            mode: Mode::Plain,
+        })
+        .unwrap();
+        let spec = banto_safe_root::ManagedSpec {
+            key: "data",
+            parent: None,
+            name: "data",
+            create: true,
+        };
+        let held = Arc::new(
+            root.open_managed(&[spec], None)
+                .unwrap()
+                .take("data")
+                .unwrap(),
+        );
+        let path = state_file_path(held.final_path());
+        let control = WriteControl::restore_in(load_startup_decision(&pool, &path).await, held);
+        assert_eq!(control.state_file(), Some(path.as_path()));
+
+        let stopped = control.set_enabled(&pool, false, Some("admin")).await;
+        assert!(
+            stopped.succeeded() && stopped.file_error().is_none(),
+            "{stopped:?}"
+        );
+        assert_eq!(read_state_file(&path).await, FileStartupState::Disabled);
+        let resumed = control.set_enabled(&pool, true, Some("admin")).await;
+        assert!(resumed.succeeded(), "{resumed:?}");
+        assert_eq!(read_state_file(&path).await, FileStartupState::Enabled);
     }
 
     /// 「再開の途中」の形式と互換 (#439 レビュー P1-1): `resumePending` の無い
@@ -1521,12 +1658,11 @@ mod tests {
         path
     }
 
-    /// 状態ファイルの一時ファイルの場所をディレクトリにして、状態ファイルへの
-    /// 書き込みだけを失敗させる (状態ファイル自体はそのまま読める)。
+    /// 状態ファイルへの書き込みだけを失敗させる (状態ファイル自体はそのまま読める)。
+    /// 一時ファイルの名前が書き込みごとに変わるので (#661 661-1)、テスト用の口
+    /// (`BLOCKED_STATE_WRITES`) でふさぐ。
     fn block_state_file_writes(state_file: &Path) {
-        let mut tmp = state_file.as_os_str().to_owned();
-        tmp.push(".tmp");
-        std::fs::create_dir_all(PathBuf::from(tmp)).unwrap();
+        lock_ignoring_poison(&BLOCKED_STATE_WRITES).push(state_file.to_path_buf());
     }
 
     // --- 停止・再開 -----------------------------------------------------------

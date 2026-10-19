@@ -14,15 +14,32 @@
 //!   （`{profile_dir}/profile.lock`）・JSON の形は移行前と同一で、既存の
 //!   インストール（サービス版が持つ mutex、残っている `profile.lock`）と
 //!   そのまま噛み合う。
-//! - profile ディレクトリ一式（`config`/`data`/`logs`）の作成。
+//! - profile ディレクトリ一式（`config`/`data`/`logs`/`data/audit-spool`）を開いて握る
+//!   （[`ProfileDirs`]・[`open_profile_dirs`]）。
 //! - 失敗に profile-id を載せる（[`ProfileLockError::AlreadyHeld`]）。
 //!
 //! 仕組みの詳細（3 層の役割、LocalSystem 保持時の `ERROR_ACCESS_DENIED`
 //! 対策など）は `banto_instance_lock` の crate doc を参照。
+//!
+//! ## profile をハンドルで受け取る（#661 661-1）
+//!
+//! profile のフォルダは共有 crate `banto_safe_root` で開く（[`open_profile_dirs`]:
+//! `open_root` → `open_managed`）。デスクトップ・コンソールは [`Mode::Plain`]（`std::fs`
+//! のまま。締めない・リンクを確かめない）で、作るフォルダも作り方も以前の
+//! `create_dir_all` と同じ（`data/audit-spool` を排他の前に作るのだけが早まった）。
+//! 661-2 のサービスは `Mode::Guarded`（辿らずに開いて握る）の [`RootSpec`] で開いた組を
+//! [`try_acquire_profile_lock_in`] と `crate::runtime::HubRuntime::start_with_profile_dirs`
+//! に渡す。握った組は [`ProfileLockGuard`] が排他と一緒に持ち、`RunningHub` の drop で
+//! 閉じる。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use banto_instance_lock::{InstanceLockError, InstanceLockGuard};
+use banto_safe_root::{
+    open_root, DirAccess, ManagedDir, ManagedSpec, ManagedStop, Mode, RootRefusal, RootSpec,
+    SafeRoot,
+};
 use thiserror::Error;
 
 use crate::profile_paths::ProfilePaths;
@@ -79,6 +96,126 @@ pub enum ProfileLockError {
     /// profile 関連の失敗を統一的に扱えるようにするため）。
     #[error("banto-hub: profile id が不正です: {0}")]
     InvalidProfile(#[from] crate::profile_paths::ProfileIdError),
+    /// profile のフォルダを開けなかった・確かめに通らなかった（#661 661-1。
+    /// [`open_profile_dirs`]）。
+    #[error("banto-hub: {0}")]
+    Dirs(#[from] ProfileDirsError),
+}
+
+/// profile の中の管理するフォルダの key（[`PROFILE_MANAGED_SPECS`]、#661 661-1）。
+/// `{profile_dir}/config`。
+pub const DIR_CONFIG: &str = "config";
+/// `{profile_dir}/data`。
+pub const DIR_DATA: &str = "data";
+/// `{profile_dir}/logs`。
+pub const DIR_LOGS: &str = "logs";
+/// `{profile_dir}/data/audit-spool`（監査の保留。名前は
+/// [`crate::audit_spool::SPOOL_DIR_NAME`]）。
+pub const DIR_AUDIT_SPOOL: &str = "audit-spool";
+
+/// profile の中で開いて握るフォルダ（親から順に 1 段ずつ。無ければ作る）。
+pub const PROFILE_MANAGED_SPECS: [ManagedSpec; 4] = [
+    ManagedSpec {
+        key: DIR_CONFIG,
+        parent: None,
+        name: "config",
+        create: true,
+    },
+    ManagedSpec {
+        key: DIR_DATA,
+        parent: None,
+        name: "data",
+        create: true,
+    },
+    ManagedSpec {
+        key: DIR_LOGS,
+        parent: None,
+        name: "logs",
+        create: true,
+    },
+    ManagedSpec {
+        key: DIR_AUDIT_SPOOL,
+        parent: Some(DIR_DATA),
+        name: crate::audit_spool::SPOOL_DIR_NAME,
+        create: true,
+    },
+];
+
+/// 握った profile のフォルダの組（#661 661-1）。[`open_profile_dirs`] が作り、
+/// [`ProfileLockGuard`] と `crate::runtime::RunningHub` が持つ。複製は同じハンドルを
+/// 共有する（`Arc`）。
+#[derive(Debug, Clone)]
+pub struct ProfileDirs {
+    /// `{root}/profiles/<profile-id>`。
+    pub profile: Arc<SafeRoot>,
+    /// `{profile_dir}/config`（設定 DB）。
+    pub config: Arc<ManagedDir>,
+    /// `{profile_dir}/data`（tstore・書き込み受付の状態ファイル）。
+    pub data: Arc<ManagedDir>,
+    /// `{profile_dir}/logs`。
+    pub logs: Arc<ManagedDir>,
+    /// `{profile_dir}/data/audit-spool`。
+    pub audit_spool: Arc<ManagedDir>,
+}
+
+/// [`open_profile_dirs`] などの失敗。
+#[derive(Debug, Error)]
+pub enum ProfileDirsError {
+    /// profile のフォルダそのものを開けない（`open_root`）。
+    #[error("profile のフォルダ（{}）を開けませんでした: {refusal}", path.display())]
+    Root { path: PathBuf, refusal: RootRefusal },
+    /// profile の中のフォルダを開けない（`open_managed`）。
+    #[error("profile の中の{0}")]
+    Managed(#[from] ManagedStop),
+    /// 開き直す相手（SQLite など）に渡すパスを確かめられない（`reopen_path`）。
+    #[error("profile の中の「{name}」のパスを確かめられませんでした: {error}")]
+    Reopen {
+        name: String,
+        error: banto_safe_root::SafeRootError,
+    },
+}
+
+/// デスクトップ・コンソールの profile の開き方（[`Mode::Plain`]: `std::fs` のまま、
+/// 無ければ作る）。以前の `create_dir_all` と同じ物を同じ所に作る。
+pub fn plain_profile_root_spec(paths: &ProfilePaths) -> RootSpec {
+    RootSpec {
+        expected: paths.profile_dir.clone(),
+        known: Default::default(),
+        owners: Vec::new(),
+        create_access: None,
+        create: true,
+        mode: Mode::Plain,
+    }
+}
+
+/// profile のフォルダを `spec` で開いて握り、その中の [`PROFILE_MANAGED_SPECS`] を
+/// 親から順に開いて握る（無ければ `create_access` の形で作る。`None` なら親から継承）。
+/// 1 つでも開けなければ何も返さない。
+pub fn open_profile_dirs(
+    spec: &RootSpec,
+    create_access: Option<&DirAccess>,
+) -> Result<ProfileDirs, ProfileDirsError> {
+    let profile = open_root(spec).map_err(|refusal| ProfileDirsError::Root {
+        path: spec.expected.clone(),
+        refusal,
+    })?;
+    let mut set = profile.open_managed(&PROFILE_MANAGED_SPECS, create_access)?;
+    let mut take = |key: &str| {
+        set.take(key)
+            .map(Arc::new)
+            .expect("PROFILE_MANAGED_SPECS に並べた key は開いてある")
+    };
+    let config = take(DIR_CONFIG);
+    let data = take(DIR_DATA);
+    let logs = take(DIR_LOGS);
+    let audit_spool = take(DIR_AUDIT_SPOOL);
+    Ok(ProfileDirs {
+        profile: Arc::new(profile),
+        config,
+        data,
+        logs,
+        audit_spool,
+    })
 }
 
 /// `try_acquire_profile_lock`が成功した間だけ生存するガード。
@@ -86,9 +223,16 @@ pub enum ProfileLockError {
 /// 共有 crate のガードが OS レベルの排他を返す。
 pub struct ProfileLockGuard {
     guard: InstanceLockGuard,
+    /// 排他と一緒に持つ、握った profile のフォルダ（#661 661-1）。
+    dirs: ProfileDirs,
 }
 
 impl ProfileLockGuard {
+    /// 握った profile のフォルダの組（#661 661-1）。
+    pub fn dirs(&self) -> &ProfileDirs {
+        &self.dirs
+    }
+
     /// 診断ファイル（`profile.lock`）の絶対パス - fallback UI（T16-2）が
     /// 「mutex: 所有者不明」等の表示に使う所有者情報の在り処として参照する想定。
     pub fn lock_file_path(&self) -> &Path {
@@ -145,23 +289,29 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 /// `paths`が指す profile の排他を取得する。`HubRuntime::start`が DB 初期化
 /// より前に呼ぶ。
 ///
-/// - `profile_dir`/`config`/`data`/`logs`を`create_dir_all`する（初回起動時
-///   はまだ存在しないため）。
-/// - 排他の取得は [`banto_instance_lock::try_acquire`]（mutex 名は
-///   `Global\BantoHub.<profile-id>`、診断ファイルは`{profile_dir}/profile.lock`。
-///   パスはルートだけを解いた [`lock_file_path`]）。
-///   既に保持されていれば[`ProfileLockError::AlreadyHeld`]。
+/// - profile のフォルダ一式を [`Mode::Plain`] で開く（[`open_profile_dirs`]。初回起動時
+///   はまだ存在しないので作る。作る物は以前の `create_dir_all` と同じ）。
+/// - 排他の取得は [`try_acquire_profile_lock_in`]。
 pub fn try_acquire_profile_lock(
     paths: &ProfilePaths,
     host_kind: HubHostKind,
 ) -> Result<ProfileLockGuard, ProfileLockError> {
-    std::fs::create_dir_all(&paths.profile_dir)?;
-    if let Some(config_dir) = paths.db_path.parent() {
-        std::fs::create_dir_all(config_dir)?;
-    }
-    std::fs::create_dir_all(&paths.data_dir)?;
-    std::fs::create_dir_all(&paths.logs_dir)?;
+    let dirs = open_profile_dirs(&plain_profile_root_spec(paths), None)?;
+    try_acquire_profile_lock_in(paths, host_kind, dirs)
+}
 
+/// 開いて握った profile のフォルダの組（`dirs`）を受け取って、排他を取得する
+/// （#661 661-1。661-2 のサービスは `Mode::Guarded` で開いた組を渡す）。
+///
+/// 排他の取得は [`banto_instance_lock::try_acquire`]（mutex 名は
+/// `Global\BantoHub.<profile-id>`、診断ファイルは`{profile_dir}/profile.lock`。
+/// パスはルートだけを解いた [`lock_file_path`]）。既に保持されていれば
+/// [`ProfileLockError::AlreadyHeld`]（`dirs` は閉じる）。
+pub fn try_acquire_profile_lock_in(
+    paths: &ProfilePaths,
+    host_kind: HubHostKind,
+    dirs: ProfileDirs,
+) -> Result<ProfileLockGuard, ProfileLockError> {
     let lock_path: PathBuf = lock_file_path(paths);
     let mutex_name = crate::profile_paths::mutex_name(&paths.profile_id);
 
@@ -176,7 +326,7 @@ pub fn try_acquire_profile_lock(
                     "banto-hub: [WARN] 排他の診断ファイル: {warning}"
                 ));
             }
-            Ok(ProfileLockGuard { guard })
+            Ok(ProfileLockGuard { guard, dirs })
         }
         Err(InstanceLockError::AlreadyHeld { owner }) => Err(ProfileLockError::AlreadyHeld {
             profile_id: paths.profile_id.clone(),
@@ -197,7 +347,7 @@ mod tests {
         let root = TempDir::new("profile-lock-layout");
         let paths = resolve_profile_paths(root.path(), "creates-dirs").expect("valid profile id");
 
-        let _guard =
+        let guard =
             try_acquire_profile_lock(&paths, HubHostKind::Console).expect("first acquire ok");
 
         assert!(paths.profile_dir.is_dir());
@@ -205,6 +355,55 @@ mod tests {
         assert!(paths.logs_dir.is_dir());
         assert!(paths.db_path.parent().unwrap().is_dir());
         assert!(paths.profile_dir.join(LOCK_FILE_NAME).is_file());
+        // #661 661-1: 監査の保留のフォルダも作り、握った組を排他と一緒に持つ。
+        assert!(paths
+            .data_dir
+            .join(crate::audit_spool::SPOOL_DIR_NAME)
+            .is_dir());
+        let dirs = guard.dirs();
+        assert!(
+            !dirs.config.is_guarded(),
+            "デスクトップ・コンソールは Plain"
+        );
+        assert_eq!(dirs.config.path(), paths.db_path.parent().unwrap());
+        assert_eq!(dirs.data.path(), paths.data_dir.as_path());
+        assert_eq!(dirs.logs.path(), paths.logs_dir.as_path());
+        assert_eq!(dirs.profile.path(), paths.profile_dir.as_path());
+    }
+
+    /// #661 661-1: 開いた組を受け取る版も、同じ排他を取る（2 回目は `AlreadyHeld`）。
+    #[test]
+    fn try_acquire_profile_lock_in_takes_opened_dirs() {
+        let root = TempDir::new("profile-lock-opened-dirs");
+        let paths = resolve_profile_paths(root.path(), "opened-dirs").expect("valid profile id");
+        let dirs = open_profile_dirs(&plain_profile_root_spec(&paths), None).expect("open dirs");
+
+        let guard = try_acquire_profile_lock_in(&paths, HubHostKind::Service, dirs.clone())
+            .expect("first acquire ok");
+        assert!(Arc::ptr_eq(&guard.dirs().data, &dirs.data));
+        assert!(matches!(
+            try_acquire_profile_lock_in(&paths, HubHostKind::Shell, dirs),
+            Err(ProfileLockError::AlreadyHeld { .. })
+        ));
+    }
+
+    /// profile の中のフォルダの場所が普通のファイルなら、排他を取る前に断る
+    /// （以前の `create_dir_all` の失敗と同じ所で止まる）。
+    #[test]
+    fn a_file_in_place_of_a_managed_dir_is_refused_before_locking() {
+        let root = TempDir::new("profile-lock-file-in-place");
+        let paths = resolve_profile_paths(root.path(), "file-in-place").expect("valid profile id");
+        std::fs::create_dir_all(&paths.profile_dir).unwrap();
+        std::fs::write(&paths.logs_dir, b"not a directory").unwrap();
+
+        match try_acquire_profile_lock(&paths, HubHostKind::Console) {
+            Err(ProfileLockError::Dirs(ProfileDirsError::Managed(stop))) => {
+                assert_eq!(stop.key, DIR_LOGS);
+            }
+            Err(other) => panic!("expected Dirs(Managed), got {other}"),
+            Ok(_) => panic!("a file in place of logs must be refused"),
+        }
+        assert!(!paths.profile_dir.join(LOCK_FILE_NAME).exists());
     }
 
     #[test]
