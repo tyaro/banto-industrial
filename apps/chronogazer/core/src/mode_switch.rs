@@ -385,6 +385,7 @@ pub fn stop_service_and_wait(
     progress: &mut dyn FnMut(SwitchStage),
 ) -> StopOutcome {
     let mut retries = 0;
+    let mut resent_on_running = false;
     loop {
         progress(SwitchStage::StoppingService);
         match manager.stop() {
@@ -393,15 +394,32 @@ pub fn stop_service_and_wait(
             Err(
                 err @ (ServiceManagerError::CannotAcceptControl
                 | ServiceManagerError::InvalidControl),
-            ) if retries < MAX_STOP_RETRIES
-                && (matches!(err, ServiceManagerError::CannotAcceptControl)
-                        // 1052 は、締めている間（START_PENDING。`controls_accepted` が空）か
-                        // 止まりかけ（STOP_PENDING）のときだけ「切り替え中」とみなす。
-                        || matches!(
-                            manager.query_status().map(|s| s.state),
-                            Ok(ScmState::StartPending | ScmState::StopPending)
-                        )) =>
-            {
+            ) => {
+                let can_wait = retries < MAX_STOP_RETRIES;
+                let wait = match err {
+                    ServiceManagerError::CannotAcceptControl => can_wait,
+                    // 1052 は、照会し直した状態で分ける。締めている間（START_PENDING。
+                    // `controls_accepted` が空）か止まりかけ（STOP_PENDING）は「切り替え中」。
+                    // 1052 の後に起動が終わった・失敗した競合は、Stopped なら結果、Running なら
+                    // STOP を 1 回だけ出し直す。
+                    _ => match manager.query_status() {
+                        Ok(summary) => match summary.state {
+                            ScmState::StartPending | ScmState::StopPending => can_wait,
+                            ScmState::Stopped => {
+                                return StopOutcome::Stopped(service_exit(&summary));
+                            }
+                            ScmState::Running if !resent_on_running => {
+                                resent_on_running = true;
+                                continue;
+                            }
+                            _ => false,
+                        },
+                        Err(_) => false,
+                    },
+                };
+                if !wait {
+                    return StopOutcome::StopFailed(err.to_string());
+                }
                 retries += 1;
                 progress(SwitchStage::WaitingForTightening);
                 match wait_for(manager, clock, timings, ScmState::Running, progress, |_| {

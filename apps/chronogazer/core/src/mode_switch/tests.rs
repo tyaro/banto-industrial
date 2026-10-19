@@ -440,15 +440,45 @@ fn stop_refused_with_1052_while_start_pending_takes_the_stop_on_its_own_as_the_r
     assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 1);
 }
 
-/// START_PENDING でも STOP_PENDING でもない 1052（Running なのに断られた等）は失敗にする。
+/// 1052 の直後に起動が終わっていた（Running）: STOP を 1 回だけ出し直す。
 #[test]
-fn stop_refused_with_1052_while_running_is_a_failure() {
-    let scm = ScriptedScm::new(vec![summary(ScmState::Running, 0)])
-        .with_stops(vec![Err(ServiceManagerError::InvalidControl)]);
+fn stop_refused_with_1052_then_running_resends_the_stop_once() {
+    let scm = ScriptedScm::new(vec![
+        summary(ScmState::Running, 0),
+        summary(ScmState::StopPending, 1),
+        stopped_with(0),
+    ])
+    .with_stops(vec![Err(ServiceManagerError::InvalidControl), Ok(())]);
+    assert_eq!(
+        stop_service_and_wait(&scm, &FakeClock::new(), T, &mut |_| {}),
+        StopOutcome::Stopped(ServiceExit::Clean)
+    );
+    assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 2);
+}
+
+/// 再送でも 1052 なら、そのとき初めて失敗にする（繰り返さない）。
+#[test]
+fn stop_refused_with_1052_while_running_twice_is_a_failure() {
+    let scm = ScriptedScm::new(vec![summary(ScmState::Running, 0)]).with_stops(vec![
+        Err(ServiceManagerError::InvalidControl),
+        Err(ServiceManagerError::InvalidControl),
+    ]);
     assert!(matches!(
         stop_service_and_wait(&scm, &FakeClock::new(), T, &mut |_| {}),
         StopOutcome::StopFailed(_)
     ));
+    assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 2);
+}
+
+/// 1052 の直後の照会が Stopped（pending を挟まない）: その結果を返す。
+#[test]
+fn stop_refused_with_1052_then_stopped_returns_that_result() {
+    let scm = ScriptedScm::new(vec![stopped_with(4)])
+        .with_stops(vec![Err(ServiceManagerError::InvalidControl)]);
+    assert_eq!(
+        stop_service_and_wait(&scm, &FakeClock::new(), T, &mut |_| {}),
+        StopOutcome::Stopped(ServiceExit::CannotOperate)
+    );
     assert_eq!(scm.calls().iter().filter(|c| **c == Call::Stop).count(), 1);
 }
 
