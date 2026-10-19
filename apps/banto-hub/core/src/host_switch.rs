@@ -687,6 +687,16 @@ where
                 if self.state.service_fault == Some(ServiceFault::LeftTight) {
                     match self.service_manager.query_status() {
                         Ok(status) => {
+                            // 止まっていない（動き出している）なら Desktop に渡さない（二重接続）。
+                            if status.state != ScmState::Stopped {
+                                let reason =
+                                    format!("サービスが止まっていません: {:?}", status.state);
+                                return Ok(self.fault(
+                                    FaultStage::AwaitingServiceRelease,
+                                    HostKind::Offline,
+                                    reason,
+                                ));
+                            }
                             if let Some(out) =
                                 self.left_tight_fault(&status, "再要求時に SCM を確かめ直しました")
                             {

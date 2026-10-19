@@ -391,7 +391,17 @@ fn stopped_with_left_tight_does_not_hand_over_to_the_desktop() {
     assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
     assert_eq!(engine.state().current, HostKind::Offline);
 
-    // relax-only で緩めて終了コードが 0 になったら通る。
+    // サービスが動き出していたら（終了コードが 5 でなくても）Desktop には渡さない。
+    scm.set(summary(ScmState::Running, 0));
+    let (reached, stage, _) = faulted(engine.step(SwitchCommand::SwitchToDesktop).unwrap());
+    assert_eq!(
+        (reached, stage),
+        (HostKind::Offline, FaultStage::AwaitingServiceRelease)
+    );
+    assert_eq!(engine.state().service_fault, Some(ServiceFault::LeftTight));
+    assert_eq!(engine.state().current, HostKind::Offline);
+
+    // relax-only で緩めて、止まって終了コードが 0 になったら通る。
     scm.set(stopped_with(0));
     assert_eq!(
         engine.step(SwitchCommand::SwitchToDesktop).unwrap(),
