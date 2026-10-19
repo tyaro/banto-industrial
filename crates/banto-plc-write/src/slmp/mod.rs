@@ -31,7 +31,7 @@
 //! Everything else - `Framing`, `Timeout`, `NotConnected`, `Io` - is fatal:
 //! [`execute_slmp_writes`] returns `Err`, and the owner drops the session.
 //! H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12) moved this crate
-//! onto the owner's `slmp` fork (0.2.0, git dependency - see the workspace
+//! onto the owner's `slmp` fork (0.2.1, git dependency - see the workspace
 //! `Cargo.toml`), whose `SlmpError` exposes `Device` as a real enum variant,
 //! so [`classify_slmp_error`] tells the two apart with a plain structural
 //! `match` - no message-text parsing anywhere in this module any more. The
