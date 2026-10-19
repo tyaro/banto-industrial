@@ -4,6 +4,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ## v0.2.0-alpha.31 — 2026-10-16（アルファ）
 
+- **修正（ChronoGazer のシェル。#687、#623 の実機確認 2026-10-19）**: 運用モードで動いている間にサービスが終了コード 4・5 で止まったとき、最初に一般の「サービスが止まりました」の窓が出ていたのを、最初から終了コードに合った窓（5 →「運用モードのまま残っています」[設定モードに戻す]・[運用を再開]、4 →「運用モードにできませんでした」、運用モードの形のまま停止 →「運用モード（停止中）です」）にした。判定は起動のときと同じ表。
 - **修正（ChronoGazer の設定画面。#623 の実機確認、2026-10-19）**: 「運用モードに切り替える」が断られたとき、赤字に `[object Object]` と出ていた。Tauri の invoke は Rust の `BantoError` を `{ kind, message }` のオブジェクトで返すのに、画面が文字列にそのまま変換していた。`errorText()` で `message`（検証エラーは `field_errors` の文）を取り出し、取り出せない形でも一般の文言を出す。設定画面の共通の `errorMessage()` とグループ画面にも同じ受け取りを入れた。
 - **修正（ChronoGazer のシェル・`banto-service-control`。#623 実機確認、2026-10-19）: 締めている間（START_PENDING）の STOP が 1061 でなく 1052（`ERROR_INVALID_SERVICE_CONTROL`）で断られても、トレイの「設定モードへ」が権限の失敗と表示せず、Running を待って出し直すようにした。** `ServiceManagerError` に `InvalidControl`（1052）を足した（網羅の `match` は腕を足す必要がある。workspace の中は banto-hub の `describe_service_error` だけ）。1052 は START_PENDING／STOP_PENDING のときは待って出し直し、直後の照会が Stopped ならその結果を取り、Running なら STOP を 1 回だけ出し直す（それでも 1052 なら失敗）。
 - **挙動の変更（ChronoGazer のシェル。#623 PR-4、2026-10-19）: 設定モード ⇔ 運用モードを画面から切り替えられるようにした**（設計は docs/chronogazer-service-design.md §4 の「#623 PR-4 の実装メモ」）。
