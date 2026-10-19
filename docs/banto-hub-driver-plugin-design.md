@@ -1,7 +1,7 @@
 # banto-hub ドライバプラグイン設計（WASM）
 
 作成日: 2026-10-19
-状態: **計画のみ・実装保留（2026-10-19 オーナー決定、§2.1）**。ただし受け皿は [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) で先に作る（2026-10-19 オーナー決定）。実装は未着手で、着手時期は未定。着手する場合も一括移行はせず、組み込みドライバとの併用期間を経て判断する。§2 の D1〜D6 は 2026-10-19 のオーナーとの議論で出た方向で、**本書の承認をもって決定**とする（承認後に日付付きの決定記録へ移す）。§11 は未決事項、§12 は破壊的変更を許す場合の構成案（2026-10-19 検討・未決定。ただし外部 DB の取り込み口 `push` の形は external-db-design §9.5 でオーナー決定）（Q11 は 2026-10-19 オーナー決定で解決済み）。2026-10-19 に上位モデルの監査を受け、指摘（現状記述の誤り・broker 構造・WIT の読み取り単位・同梱 UI と展開経路の安全・レジストリ変更）を反映済み。同日の Codex レビュー（ハンドシェイクを応答依存で進める・有効化前の preflight・fingerprint に内容のダイジェスト・同梱 UI の配信の認証）と、オーナーのレビュー（プラグイン固有のアドレスを broker まで運ぶ経路 §3.2、ハンドシェイクの拒否応答）も反映済み。
+状態: **計画のみ・実装保留（2026-10-19 オーナー決定、§2.1）**。ただし受け皿は [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) で先に作る（2026-10-19 オーナー決定）。実装は未着手で、着手時期は未定。着手する場合も一括移行はせず、組み込みドライバとの併用期間を経て判断する。§2 の D1〜D6 は 2026-10-19 のオーナーとの議論で出た方向で、**本書の承認をもって決定**とする（承認後に日付付きの決定記録へ移す）。§11 は未決事項、§12 は破壊的変更を許す場合の構成案（2026-10-19 検討・未決定。ただし外部 DB の取り込み口 `push` の形は external-db-design §9.5 でオーナー決定）（Q11 は 2026-10-19 オーナー決定で解決済み）。2026-10-19 に上位モデルの監査を受け、指摘（現状記述の誤り・broker 構造・WIT の読み取り単位・同梱 UI と展開経路の安全・レジストリ変更）を反映済み。同日の Codex レビュー（ハンドシェイクを応答依存で進める・有効化前の preflight・fingerprint に内容のダイジェスト・同梱 UI の配信の認証）と、オーナーのレビュー（プラグイン固有のアドレスを broker まで運ぶ経路 §3.2、ハンドシェイクの拒否応答）も反映済み。同日、§6.2 の WIT を R1 の詳細設計 [banto-driver-api-design.md](banto-driver-api-design.md) §9.2 に合わせて改訂し、§12.6 に「R1 の時点の CI の姿」を補足した。
 対象: PLC ドライバ（メーカー固有のプロトコルと登録 UI）を、banto-hub 本体を再ビルド・再リリースせずに追加・更新できるようにする。
 関連: [tag-server-design.md](tag-server-design.md) §3.4（PLC 通信ドライバとの関係）・§3.4.1（新しい PLC ドライバの置き場所、#438）・§4（タグ空間のセマンティクス）・§6（書き込み）、
 [banto-hub-t17-design.md](banto-hub-t17-design.md)（サービス・profile・UAC）、
@@ -163,14 +163,18 @@ package banto:driver@1.0.0;
 interface types {
   record setting { key: string, value: string }
   variant value { %bool(bool), int(s64), uint(u64), float(f64), bytes(list<u8>) }
-  // 非致命（そのタグだけ Bad）。これ以外はすべて接続致命（§6.1）
-  variant item-error { device(device-error), unsupported(string) }
+  // 非致命（そのタグだけ Bad）。これ以外はすべて接続致命（§6.1）。
+  // rejected = プラグイン自身が断った・確認で不一致を見つけた（同じワードの同じビットへ true / false が同時、
+  // RMW の確認読みの不一致）。機器の拒否（device）でも設定の不整合（unsupported）でもない非致命
+  variant item-error { device(device-error), unsupported(string), rejected(string) }
   record device-error { code: u32, message: string }
   variant fatal-error { framing(string), protocol(string), invalid-config(string) }
   // 読み書きの単位。現行の ReadRequest / StringReadRequest に合わせる
   record tag-spec {
     address: string,
-    data-type: string,          // Hub のデータ型名（bit / int16 / uint32 / float32 / string ...）
+    // Hub のデータ型名。綴りは banto-plc の DataType の Display と同じ
+    // （bit / i16 / u16 / i32 / u32 / f32 / i64 / u64 / f64）と "string"
+    data-type: string,
     string-words: option<u32>,  // 文字列のときの語数
   }
 }
@@ -185,9 +189,13 @@ interface session {
     terminator(list<u8>),
     plugin-decides,
   }
-  record prefix-spec { offset: u32, width: u8, big-endian: bool, adjust: s32 }
+  // 長さ欄の読み方。SLMP の ASCII フレームは長さ欄が ASCII の 16 進
+  enum prefix-encoding { binary, ascii-hex, ascii-dec }
+  record prefix-spec { offset: u32, width: u8, big-endian: bool, adjust: s32, encoding: prefix-encoding }
   // Hub が実行する 1 往復。受信が max-len を超えたら接続致命
   record step { send: list<u8>, expect: frame-rule, max-len: u32 }
+  // is-complete の答え。discard(n) = 先頭の n バイトはごみ（RS-485 の自己エコー・前の応答の残り）、捨てて続ける
+  variant frame-check { incomplete, complete(u32), discard(u32) }
 
   resource connection {
     // settings には共通列（word_order 等）とプラグイン固有の設定の両方が入る
@@ -199,8 +207,10 @@ interface session {
     // セッション登録失敗等）なら fatal-error を返し、接続成功とはみなさない。
     // fixed / length-prefixed の step でも応答は必ずここへ渡す。接続テストにも使う
     handshake-next: func(prev-response: option<list<u8>>) -> result<option<step>, fatal-error>;
-    // plugin-decides のとき Hub が受信のたびに呼ぶ: 完結していればその長さ
-    is-complete: func(buf: list<u8>) -> result<option<u32>, fatal-error>;
+    // 切断の直前に送る step（EtherNet/IP の UnRegisterSession 等）。応答は待たない。無ければ none
+    farewell: func() -> option<step>;
+    // plugin-decides のとき Hub が受信のたびに呼ぶ。step は今待っている応答の step
+    is-complete: func(step: step, buf: list<u8>) -> result<frame-check, fatal-error>;
   }
 }
 
@@ -210,17 +220,22 @@ interface read {
   record planned { step: step, covers: list<u32> }   // covers = specs の添字
   // 読み取り計画（banto-plc の planning 相当）。ワード順は connection の設定で決まる
   plan: func(conn: borrow<connection>, specs: list<tag-spec>) -> result<list<planned>, fatal-error>;
-  decode: func(conn: borrow<connection>, p: planned, response: list<u8>)
+  // specs は plan に渡したものと同じ。planned は step と covers しか持たないので、
+  // 同じアドレス・同じフレームを u32 と f32 で読み分けるには specs[covers[i]].data-type が要る
+  decode: func(conn: borrow<connection>, p: planned, specs: list<tag-spec>, response: list<u8>)
     -> result<list<result<value, item-error>>, fatal-error>;
 }
 
 interface write {
   use types.{tag-spec, value, item-error, fatal-error};
   use session.{connection, step};
+  // value は Hub が bool / float / bytes の 3 つだけで渡す（int / uint は使わない）。
+  // 整数型への丸めと範囲の検査はプラグイン側（banto-plc-write の encode と同じ規則）
   record write-item { spec: tag-spec, value: value }
   record planned-write { step: step, covers: list<u32> }   // covers = items の添字
   encode: func(conn: borrow<connection>, items: list<write-item>) -> result<list<planned-write>, fatal-error>;
-  check: func(conn: borrow<connection>, p: planned-write, response: list<u8>)
+  // items は encode に渡したものと同じ
+  check: func(conn: borrow<connection>, p: planned-write, items: list<write-item>, response: list<u8>)
     -> result<list<result<_, item-error>>, fatal-error>;
 }
 
@@ -233,9 +248,10 @@ interface address {
     bit: option<u8>,          // 記法はプラグインの文法に従う（SLMP なら .0〜.F の16進、T20-④）
     word-count: u32,
   }
-  parse: func(text: string, data-type: string) -> result<parsed, string>;
+  // string-words は data-type が "string" のときの語数（word-count を決めるために要る）
+  parse: func(text: string, data-type: string, string-words: option<u32>) -> result<parsed, string>;
   // 連続登録・オフセットコピー用: n 個先のアドレス
-  offset: func(canonical: string, data-type: string, n: s64) -> result<string, string>;
+  offset: func(canonical: string, data-type: string, string-words: option<u32>, n: s64) -> result<string, string>;
   help: func() -> string;
 }
 
@@ -256,6 +272,9 @@ world driver-rw { include driver; export write; }
 
 - 文言（`help`・`field-error.message`・`device-error.message`）は v1 では日本語固定（Hub の UI と同じ）。多言語化は扱わない。
 - データ型名・ワード順・bit 記法と既存の `banto-plc` のデコード規則の突き合わせは P0 で行い、組み込み版と同じ値になることを完了条件にする。
+- 2026-10-19: [banto-driver-api-design.md](banto-driver-api-design.md) §9.2 の対応表に合わせて直した（`item-error.rejected`・`prefix-encoding`・`frame-check`・`farewell`・`decode` / `check` に `specs` / `items`・`address.parse` / `offset` に `string-words`・`data-type` の綴り）。Rust の trait と WIT は同じ PR で直す。
+- RS-485 のマルチドロップの局番は `parsed` に持たせず、接続の `settings`（`unit_id` / `station`）で渡す。1 つのポートを複数の局で共有するときの直列化は Hub が持つ（api-design §8。局番のモデルを 1 つにするため）。
+- `borrow<connection>` は可変性を区別しない。接続は 1 つのタスクが専有するので、`plan` / `encode` が接続の中の採番（Modbus TCP のトランザクション ID 等）を進めてよい（Rust 側は `&mut self`、api-design §4.2）。
 
 ### 6.3 インスタンスと並行性
 
@@ -469,6 +488,8 @@ banto-driver-api（型と trait だけ。ロジックなし）
 banto-drivers（組み立て役: 組み込みドライバの一覧）
   └─ アプリのバイナリ（banto-hub・chronogazer）だけがこれに依存
 ```
+
+（2026-10-19 補足、api-design Q2: **これは R2b の後の姿**。R1 の時点では、core が `banto-drivers` を dev-dependency で持つので薄いアダプター crate の変更でも core が対象に残り、`banto-plc` の実装本体の変更は今までどおり core と ChronoGazer に届く。core が外れるのは R2b-0、実装本体の分は R2b-2 / R2b-3 の後。下の条件 4 の「API の crate が提供する」は別 crate `banto-driver-conformance`、条件 5 の `ReadRequest` 系は R2b-2 で `TagSpec` に替わる。詳細は [banto-driver-api-design.md](banto-driver-api-design.md) §2.5・§13）
 
 ドライバを変えたときの CI の対象は、そのドライバ・`banto-drivers`・アプリのバイナリ crate だけになり、`banto-hub-core` と `chronogazer-core` のテスト（偽のドライバで動く）は対象から外れる。Windows の `rust` ジョブは数分程度に縮むと見込む（推定。ドライバと組み立て役のテストの量による）。E2E は組み立て後のバイナリを使うので走らせ続ける（そのための CI の判定の変更は条件 6）。別ジョブで並列なので全体の長さは決めない。
 
