@@ -170,6 +170,7 @@ Desktop Hub 起動までのフル E2E は任意の追加確認として残す。
 - **戻す相手の記録**: 緩める組（`ModeAccess::users`）を `relax_tree` の**前に** HKLM の `Owners` に書く（661-2 の `write_owners`。空は書かない・サービスのキーは作らない）。書けなければ ACL を変えずに断る（終了コード 1）。サービスが登録されていなければ（`profile_owners::service_registered`）書かずに 1 行知らせて緩めるのは続ける（デスクトップだけで使うとき）。
 - **採る組**（サービスの `plan_owners` と同じ規則に揃える）: profile が設定モードの形（緩んでいる）なら、これまでどおり指定の利用者 + DACL から `plan_carry_over` で引き継ぐ利用者。記録は読まない（DACL が勝ち、記録はその組で上書きする）。
 - **修復（profile が運用モードの形のまま残っている）**: DACL から「変更」の利用者は採れないので `repair_plan` を使う。記録が使えれば（`check_stored_owners` の `Valid`）記録の組 + 指定の利用者。**記録が無い・空・読めないときは、指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者のアカウント（締めたときの組）**で緩め、記録が使えない旨を警告する（締まった DACL の所有者は Administrators で、利用者には書き換えられないので、締めたときの組として信じてよい）。利用者のアカウントかを確かめられない SID は戻さずに警告する。
+- **記録の利用者の確かめ（#704 レビュー）**: 記録の SID は形しか確かめていない（`check_stored_owners`）ので、`repair_plan` は 1 つずつ `account_kind` で確かめる。削除済み（`ERROR_NONE_MAPPED`）・グループは警告して外し、外した後の組（+ 指定の利用者）で `Owners` を書いて緩める（外した結果が指定の利用者だけになっても、今の DACL の「読み取りと実行」の利用者には頼らない）。確かめられない SID（ドメインに届かないなど）があれば、削除済みと区別できないので緩めず・記録も書き換えずに断る。
 - **排他**: `reset-password`・`revert-to-commissioning` は、対象を開く前（`open_target_profile` の最初）に profile の mutex（`Global\BantoHub.<id>`、`grant-profile-acl` と同じ `hold_profile`）を取り、DB を閉じるまで持つ。持たれていれば何も開かずに `ElevatedError::ProfileInUse`（文言は `grant-profile-acl` の使用中と同じ形、終了コード 1）。確かめられなければ開かずに断る。
 - **実機確認で見る点**（661-5 と合わせて）: 運用モードのまま止めたサービスの profile に `grant-profile-acl` をかけて設定モードの形に戻ること（記録あり・記録を消した場合）、HKLM の `Owners` が書き換わること、稼働中に `reset-password`・`revert-to-commissioning` が「使用中」で断ること。
 

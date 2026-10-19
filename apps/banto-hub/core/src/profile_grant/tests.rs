@@ -1741,3 +1741,78 @@ fn a_loose_profile_ignores_the_record_and_rewrites_it() {
     assert!(!ops.calls().iter().any(|c| c.starts_with("read_owners")));
     assert_eq!(*ops.owners.borrow(), Ok(Some(vec![ME.to_string()])));
 }
+
+/// 修復（記録に削除済みの利用者。#704 レビュー）: 記録の SID は形しか確かめていないので、
+/// 削除済みの Alice（`ERROR_NONE_MAPPED` = `NotAUser`）が残る。Bob を指定して実行すると、
+/// Alice は警告して外し、Bob で緩め、記録も Bob に書き直す（残すと緩めるときの全利用者の
+/// 確かめで断られ、修復で戻せない）。記録の組が空になっても今の DACL の「読み取りと実行」の
+/// 利用者（Carol）には頼らず、指定の利用者だけで進める。
+#[test]
+fn a_deleted_account_in_the_record_is_dropped_with_a_warning() {
+    let mut ops = FakeOps::new();
+    ops.names
+        .insert("bob".to_string(), Ok(Some(BOB.to_string())));
+    ops.kinds.remove(ALICE);
+    tight_profile(&ops, &[ALICE, CAROL]);
+    *ops.owners.borrow_mut() = Ok(Some(vec![ALICE.to_string()]));
+    let (result, lines) = run(&ops, Some("bob"), None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops
+        .calls()
+        .contains(&format!("write_owners default [{BOB}]")));
+    assert!(ops.calls().contains(&format!("relax default [{BOB}]")));
+    assert_eq!(*ops.owners.borrow(), Ok(Some(vec![BOB.to_string()])));
+    assert_eq!(
+        lines[..3],
+        [
+            "out banto-hub-elev: profile 'default' は運用モードの形（締まったまま）です。設定モードの形に戻します（修復）".to_string(),
+            format!("err banto-hub-elev: 警告: 戻す相手の記録（{OWNERS_AT}）の {ALICE} はこの PC の利用者のアカウントではありません（削除済み・グループなど）。記録から外し、「変更」は戻しません"),
+            format!("out banto-hub-elev: 指定の利用者 {BOB} も足します"),
+        ],
+        "{lines:#?}"
+    );
+    assert!(
+        lines.last().unwrap().contains("上の警告 1 件"),
+        "{lines:#?}"
+    );
+
+    // 反証: 記録に有効な利用者（Carol）が並んでいれば、外すのは削除済みの Alice だけ。
+    let mut ops = FakeOps::new();
+    ops.names
+        .insert("bob".to_string(), Ok(Some(BOB.to_string())));
+    ops.kinds.remove(ALICE);
+    tight_profile(&ops, &[ALICE, CAROL]);
+    *ops.owners.borrow_mut() = Ok(Some(vec![ALICE.to_string(), CAROL.to_string()]));
+    let (result, lines) = run(&ops, Some("bob"), None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops
+        .calls()
+        .contains(&format!("relax default [{BOB},{CAROL}]")));
+    assert_eq!(
+        *ops.owners.borrow(),
+        Ok(Some(vec![BOB.to_string(), CAROL.to_string()]))
+    );
+    assert!(lines.contains(&format!(
+        "out banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の利用者 {CAROL} に「変更」を戻します"
+    )));
+}
+
+/// 修復（記録の SID を確かめられない。#704 レビュー）: ドメインに届かないなどの一時的な
+/// 失敗は削除済みと区別できないので、黙って落とさずに断る（緩めない・記録を書き換えない）。
+#[test]
+fn an_unverifiable_account_in_the_record_refuses_the_repair() {
+    let mut ops = FakeOps::new();
+    ops.names
+        .insert("bob".to_string(), Ok(Some(BOB.to_string())));
+    tight_profile(&ops, &[ALICE, DAVE]);
+    let record = Some(vec![ALICE.to_string(), DAVE.to_string()]);
+    *ops.owners.borrow_mut() = Ok(record.clone());
+    let (result, lines) = run(&ops, Some("bob"), None);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(!ops.calls().iter().any(|c| c.starts_with("write_owners")));
+    assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
+    assert_eq!(*ops.owners.borrow(), Ok(record));
+    assert!(lines.contains(&format!(
+        "err banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の {DAVE} が利用者のアカウントかを確かめられませんでした: RPC が届かない。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください"
+    )), "{lines:#?}");
+}

@@ -49,6 +49,8 @@
 //!   DACL から「変更」の利用者は採れない（読み取りと実行だけ）。記録が使えればその組 +
 //!   指定の利用者、使えなければ指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者
 //!   （締めたときの組。締まった DACL は利用者には書き換えられない）で緩め、その旨を警告する。
+//!   記録の SID は 1 つずつ利用者のアカウントかを確かめ、削除済み・グループは警告して外す。
+//!   確かめられない SID があれば断る（#704 レビュー）。
 //! - **DACL の形**（論点 1）: 保護された DACL（`D:P`）に SYSTEM・Administrators のフル、
 //!   利用者ごとの「変更」（`0x1301BF`）、所有者は Administrators。親からは継承しない。
 //! - **足していく意味を保つ**（論点 4 (b)）: 書き直す前の DACL を開いたハンドルから読み
@@ -885,7 +887,15 @@ pub fn access_plan(
 /// モジュール doc「締まったまま残った profile の修復」）。DACL から「変更」の利用者は採れない
 /// （読み取りと実行だけ）ので、[`access_plan`] の代わりに使う。
 ///
-/// - 記録（`stored`）が使える: 記録の組 + 指定の利用者（`user`）。
+/// - 記録（`stored`）が使える: 記録の組 + 指定の利用者（`user`）。記録の SID は形しか確かめて
+///   いない（[`check_stored_owners`]）ので、1 つずつ `account` で確かめる。利用者のアカウントで
+///   ない SID（削除済み = `ERROR_NONE_MAPPED`・グループなど、[`AccountKind::NotAUser`]）は警告して
+///   外す（残すと緩めるときの全利用者の確かめで断られ、修復で戻せなくなる。#704 レビュー）。
+///   外した結果、記録の組が指定の利用者だけになっても、そのまま指定の利用者で進める（記録は
+///   締めたときの組なので、今の DACL の「読み取りと実行」の利用者に頼っても同じ顔ぶれになる）。
+///   確かめられない SID（[`AccountKind::LookupFailed`]。ドメインに届かないなど）があれば、
+///   削除済みと区別できないので黙って落とさず、`Err`（知らせる行）で断る（緩めない・記録を
+///   書き換えない）。
 /// - 記録が無い・使えない: 指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者の
 ///   アカウント（締めたときの組。締まった DACL の所有者は Administrators で、利用者には
 ///   書き換えられない）。記録が使えない旨を警告にする。利用者のアカウントかを確かめられない
@@ -896,7 +906,7 @@ pub fn repair_plan(
     dacl: &ObservedDacl,
     stored: StoredOwners,
     mut account: impl FnMut(&InstallUserSid) -> AccountKind,
-) -> AccessPlan {
+) -> Result<AccessPlan, Vec<ConsoleLine>> {
     let location = owners_location(profile_id);
     let mut lines = vec![out_line(&format!(
         "profile '{profile_id}' は運用モードの形（締まったまま）です。設定モードの形に戻します（修復）"
@@ -905,21 +915,54 @@ pub fn repair_plan(
     let mut users = vec![user.clone()];
     let reason = match stored {
         StoredOwners::Valid(owners) => {
-            lines.push(out_line(&format!(
-                "戻す相手の記録（{location}）の利用者 {} に「変更」を戻します",
-                owners
-                    .iter()
-                    .map(InstallUserSid::as_str)
-                    .collect::<Vec<_>>()
-                    .join("・")
-            )));
-            if !owners.contains(user) {
+            // 記録の SID を 1 つずつ確かめる（指定の利用者は確かめ済み）。確かめられない SID が
+            // 1 つでもあれば、外さずに断る。
+            let mut kept = Vec::new();
+            let mut dropped = Vec::new();
+            let mut unknown = Vec::new();
+            for sid in owners {
+                if sid == *user {
+                    kept.push(sid);
+                    continue;
+                }
+                match account(&sid) {
+                    AccountKind::User => kept.push(sid),
+                    AccountKind::NotAUser => dropped.push(sid),
+                    AccountKind::LookupFailed(why) => unknown.push((sid, why)),
+                }
+            }
+            if !unknown.is_empty() {
+                for (sid, why) in &unknown {
+                    lines.push(err_line(&format!(
+                        "戻す相手の記録（{location}）の {} が利用者のアカウントかを確かめられませんでした: {why}。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください",
+                        sid.as_str()
+                    )));
+                }
+                return Err(lines);
+            }
+            for sid in &dropped {
+                warnings += 1;
+                lines.push(err_line(&format!(
+                    "警告: 戻す相手の記録（{location}）の {} はこの PC の利用者のアカウントではありません（削除済み・グループなど）。記録から外し、「変更」は戻しません",
+                    sid.as_str()
+                )));
+            }
+            if !kept.is_empty() {
+                lines.push(out_line(&format!(
+                    "戻す相手の記録（{location}）の利用者 {} に「変更」を戻します",
+                    kept.iter()
+                        .map(InstallUserSid::as_str)
+                        .collect::<Vec<_>>()
+                        .join("・")
+                )));
+            }
+            if !kept.contains(user) {
                 lines.push(out_line(&format!(
                     "指定の利用者 {} も足します",
                     user.as_str()
                 )));
             }
-            users.extend(owners);
+            users.extend(kept);
             None
         }
         StoredOwners::Missing => Some("記録がありません".to_string()),
@@ -973,11 +1016,11 @@ pub fn repair_plan(
             }
         }
     }
-    AccessPlan {
+    Ok(AccessPlan {
         access: DirAccess::with_install_users(users),
         lines,
         warnings,
-    }
+    })
 }
 
 // --- 書き直し ----------------------------------------------------------------------
@@ -1441,7 +1484,16 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
     // 「変更」の利用者は採れないので、記録（無ければ「読み取りと実行」の利用者）を使う。
     let plan = if profile_shape(&RootObservation::Present(dacl.clone())) == ProfileShape::Tight {
         let stored = check_stored_owners(ops.read_owners(id));
-        repair_plan(&pre.user, id, &dacl, stored, |sid| ops.account_kind(sid))
+        match repair_plan(&pre.user, id, &dacl, stored, |sid| ops.account_kind(sid)) {
+            Ok(plan) => plan,
+            Err(lines) => {
+                for line in lines {
+                    out(line);
+                }
+                created.notice(out);
+                return Err(GrantStop::Refused);
+            }
+        }
     } else {
         access_plan(&pre.user, id, &dacl, &carry)
     };
