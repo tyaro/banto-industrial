@@ -66,10 +66,12 @@
 //! | 態       | 1 行目（押せない）                     | 項目                                 |
 //! | -------- | -------------------------------------- | ------------------------------------ |
 //! | Desktop  | 収集の状態（A2 のまま）                | 開く・終了                           |
-//! | Service  | 「サービス: 実行中」                   | 開く・終了（サービスは止まりません） |
+//! | Service  | 「サービス: 実行中」                   | 開く・設定モードに切り替える・終了（サービスは止まりません） |
 //! | Fallback | 「サービス: <状態>（接続できません）」 | 開く・再試行・終了                   |
 //!
-//! サービスの開始・停止はトレイに出さない（O4、B2-5）。Service の「終了」は確認の文で
+//! サービスの開始・停止はトレイに出さない（O4、B2-5）。#623 PR-4 で Service の態にだけ
+//! 「設定モードに切り替える」を足した（確かめてから `crate::switch` がサービスを止めて
+//! 緩め終わるのを待ち、この PC の中のエンジンへ移る）。運用モードへは設定画面から。Service の「終了」は確認の文で
 //! 「サービスは止まらず収集を続ける」と知らせる。Fallback の「終了」は止めるものが
 //! 無いので確認しない（**判断**。ただし確認の答えと同じ受付（`Lifecycle::answer_quit`）を通すので、
 //! 「再試行」で Desktop が起動し終えて収集中になっていれば、収集中の文言で確かめ直す）。
@@ -191,6 +193,12 @@ pub(crate) fn menu_spec(mode: &TrayMode, label: &str) -> Vec<MenuEntry> {
             MenuEntry::Status("サービス: 実行中".to_string()),
             MenuEntry::Separator,
             open,
+            // #623 PR-4: 運用モード → 設定モード（サービスの画面にはシェルのコマンドが無いので
+            // トレイが受け持つ。確かめてから `crate::switch`）。
+            MenuEntry::Item {
+                id: "to-setting",
+                text: "設定モードに切り替える",
+            },
             MenuEntry::Item {
                 id: "quit",
                 text: "終了（サービスは止まりません）",
@@ -353,6 +361,7 @@ pub(crate) fn install(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => open_main_window(app),
             "retry" => crate::shell::request_retry(app),
+            "to-setting" => crate::switch::request_to_setting_from_tray(app),
             "quit" => request_quit(app),
             _ => {}
         });
@@ -398,6 +407,11 @@ fn tray_may_apply(app: &AppHandle, quitting_label: bool) -> bool {
     crate::shell::lifecycle(app)
         .map(|lifecycle| lifecycle.tray_may_apply(quitting_label))
         .unwrap_or(true)
+}
+
+/// 終了処理中の 1 行をトレイに出す（運用モードへの切り替えでプロセスを終えるとき。#623 PR-4）。
+pub(crate) fn show_quitting_status(app: &AppHandle, text: &str) {
+    post_spec(app, vec![MenuEntry::Status(text.to_string())], true);
 }
 
 /// 窓を戻す（トレイの「開く」・左クリック・2 つ目の起動）。終了処理に
@@ -701,12 +715,16 @@ mod tests {
             service[0],
             MenuEntry::Status("サービス: 実行中".to_string())
         );
+        // #623 PR-4: 運用モード → 設定モードの切り替えだけを足した（開始・停止そのものは
+        // 出さない - O4）。
         assert_eq!(
             items(&service),
-            vec![("open", "開く"), ("quit", "終了（サービスは止まりません）")]
+            vec![
+                ("open", "開く"),
+                ("to-setting", "設定モードに切り替える"),
+                ("quit", "終了（サービスは止まりません）")
+            ]
         );
-        // サービスの開始・停止は出さない（O4）。
-        assert_eq!(items(&service).len(), 2);
 
         let fallback = menu_spec(
             &TrayMode::Fallback {

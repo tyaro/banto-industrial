@@ -943,7 +943,9 @@ pub(crate) fn refused_notice(refused: crate::lifecycle::Refusal) -> &'static str
         | Refusal::AlreadyQuitting
         | Refusal::Quitting
         | Refusal::RecoveryBusy
-        | Refusal::EngineRunning => {
+        | Refusal::EngineRunning
+        | Refusal::NotDesktop
+        | Refusal::NotServiceSide => {
             "別の処理の途中です。しばらくしてから、もう一度選んでください。"
         }
     }

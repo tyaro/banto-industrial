@@ -49,6 +49,11 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   稼働状態はそれとは性質が違う（`COLLECT_READ_ROLE` の Rust doc と同じ
  *   考え方）。
  *
+ * - `mode`（#623 PR-4、新設）: `tauri && admin`。設定モード ⇔ 運用モードの切り替えは
+ *   この PC の中で記録している Tauri の窓からだけ行う（サービスの画面（運用モード）には
+ *   シェルのコマンドが無く、設定モードへはトレイの「設定モードに切り替える」で戻る）。
+ *   サービスの開始・自動開始の設定を伴うので admin に限る。
+ *
  * 認証モードの変更後の再計算: `canManageAuthMode()` は
  * `sessionStore.authDisabled`（エスケープハッチ、spec M11）を参照するため、
  * admin 未満のロールでログイン不要モードを OFF に戻すと結果が変わる - この
@@ -84,7 +89,8 @@ export async function load({ parent }) {
 		data: admin && (isAuditLogAvailable() || isBackupsAvailable()),
 		security: (tauri && canManageAuthMode()) || (server && admin && localGrantSupported),
 		hub: admin,
-		collect: true
+		collect: true,
+		mode: tauri && admin
 	};
 
 	return { categories: SETTINGS_CATEGORIES.filter((category) => visible[category.id]) };
