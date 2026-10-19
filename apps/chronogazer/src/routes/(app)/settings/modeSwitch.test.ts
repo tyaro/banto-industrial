@@ -10,7 +10,8 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
 import {
 	errorText,
-	UNKNOWN_ERROR_TEXT,
+	GENERIC_ERROR_TEXT,
+	SWITCH_FAILED_TEXT,
 	AUTO_START_DEFAULT,
 	AUTO_START_LABEL,
 	CURRENT_MODE_NOTE,
@@ -113,14 +114,28 @@ describe('errorText（invoke の reject の形）', () => {
 		],
 		['文字列', '文字列の理由', '文字列の理由'],
 		['Error', new Error('エラーの理由'), 'エラーの理由'],
-		['message の無いオブジェクト', { kind: 'unauthorized' }, UNKNOWN_ERROR_TEXT],
-		['空のオブジェクト', {}, UNKNOWN_ERROR_TEXT],
-		['空文字', '', UNKNOWN_ERROR_TEXT],
-		['null', null, UNKNOWN_ERROR_TEXT],
-		['数値', 42, UNKNOWN_ERROR_TEXT]
+		['message の無いオブジェクト', { kind: 'unauthorized' }, GENERIC_ERROR_TEXT],
+		['空のオブジェクト', {}, GENERIC_ERROR_TEXT],
+		['空文字', '', GENERIC_ERROR_TEXT],
+		['null', null, GENERIC_ERROR_TEXT],
+		['数値', 42, GENERIC_ERROR_TEXT]
 	];
 	it.each(cases)('%s', (_n, input, expected) => {
 		expect(errorText(input)).toBe(expected);
 		expect(errorText(input)).not.toContain('[object Object]');
+	});
+
+	// 取り出せないときの文言は呼ぶ側の文脈で決まる（切り替え以外の失敗を「切り替え」と言わない）。
+	it.each([
+		['既定（文脈なし）', undefined, GENERIC_ERROR_TEXT],
+		['切り替えの画面', SWITCH_FAILED_TEXT, SWITCH_FAILED_TEXT],
+		['別の文脈', '読み込みに失敗しました。', '読み込みに失敗しました。']
+	])('取り出せないとき: %s', (_n, fallback, expected) => {
+		expect(errorText({}, fallback)).toBe(expected);
+		expect(errorText('', fallback)).toBe(expected);
+		expect(errorText({ message: '理由' }, fallback)).toBe('理由');
+	});
+	it('一般の文言は「切り替え」を含まない', () => {
+		expect(GENERIC_ERROR_TEXT).not.toContain('切り替え');
 	});
 });
