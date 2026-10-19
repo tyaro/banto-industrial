@@ -162,6 +162,8 @@ struct FakeOps {
     me: Result<InstallUserSid, String>,
     names: HashMap<String, Result<Option<String>, String>>,
     kinds: HashMap<String, AccountKind>,
+    /// `owner_lookup`の結果（無ければ`kinds`から: 利用者・グループなど・確かめられない）。
+    lookups: HashMap<String, OwnerLookup>,
     in_use: Result<bool, String>,
     dirs: RefCell<HashMap<PathBuf, FakeDir>>,
     /// `create_dir`が作るフォルダ（既定は Administrators 所有。すり替えの再現に使う）。
@@ -229,6 +231,7 @@ impl FakeOps {
             me: Ok(sid(ME)),
             names,
             kinds,
+            lookups: HashMap::new(),
             in_use: Ok(false),
             dirs: RefCell::new(HashMap::new()),
             on_create: RefCell::new(HashMap::new()),
@@ -300,6 +303,16 @@ impl HubElevOps for FakeOps {
             .get(sid.as_str())
             .cloned()
             .unwrap_or(AccountKind::NotAUser)
+    }
+    fn owner_lookup(&self, sid: &InstallUserSid) -> OwnerLookup {
+        if let Some(found) = self.lookups.get(sid.as_str()) {
+            return found.clone();
+        }
+        match self.account_kind(sid) {
+            AccountKind::User => OwnerLookup::User,
+            AccountKind::NotAUser => OwnerLookup::NotAUser,
+            AccountKind::LookupFailed(why) => OwnerLookup::LookupFailed(why),
+        }
     }
     type ProfileHold = FakeFile;
     fn hold_profile(&self, profile_id: &str) -> Result<Option<FakeFile>, String> {
@@ -1743,7 +1756,7 @@ fn a_loose_profile_ignores_the_record_and_rewrites_it() {
 }
 
 /// 修復（記録に削除済みの利用者。#704 レビュー）: 記録の SID は形しか確かめていないので、
-/// 削除済みの Alice（`ERROR_NONE_MAPPED` = `NotAUser`）が残る。Bob を指定して実行すると、
+/// この PC のローカルで削除済みの Alice（ローカルの SID の`ERROR_NONE_MAPPED`）が残る。Bob を指定して実行すると、
 /// Alice は警告して外し、Bob で緩め、記録も Bob に書き直す（残すと緩めるときの全利用者の
 /// 確かめで断られ、修復で戻せない）。記録の組が空になっても今の DACL の「読み取りと実行」の
 /// 利用者（Carol）には頼らず、指定の利用者だけで進める。
@@ -1752,7 +1765,8 @@ fn a_deleted_account_in_the_record_is_dropped_with_a_warning() {
     let mut ops = FakeOps::new();
     ops.names
         .insert("bob".to_string(), Ok(Some(BOB.to_string())));
-    ops.kinds.remove(ALICE);
+    ops.lookups
+        .insert(ALICE.into(), OwnerLookup::Unmapped { local: true });
     tight_profile(&ops, &[ALICE, CAROL]);
     *ops.owners.borrow_mut() = Ok(Some(vec![ALICE.to_string()]));
     let (result, lines) = run(&ops, Some("bob"), None);
@@ -1766,7 +1780,7 @@ fn a_deleted_account_in_the_record_is_dropped_with_a_warning() {
         lines[..3],
         [
             "out banto-hub-elev: profile 'default' は運用モードの形（締まったまま）です。設定モードの形に戻します（修復）".to_string(),
-            format!("err banto-hub-elev: 警告: 戻す相手の記録（{OWNERS_AT}）の {ALICE} はこの PC の利用者のアカウントではありません（削除済み・グループなど）。記録から外し、「変更」は戻しません"),
+            format!("err banto-hub-elev: 警告: 戻す相手の記録（{OWNERS_AT}）の {ALICE} はこの PC のローカルのアカウントにありません（削除済み）。記録から外し、「変更」は戻しません"),
             format!("out banto-hub-elev: 指定の利用者 {BOB} も足します"),
         ],
         "{lines:#?}"
@@ -1780,7 +1794,8 @@ fn a_deleted_account_in_the_record_is_dropped_with_a_warning() {
     let mut ops = FakeOps::new();
     ops.names
         .insert("bob".to_string(), Ok(Some(BOB.to_string())));
-    ops.kinds.remove(ALICE);
+    ops.lookups
+        .insert(ALICE.into(), OwnerLookup::Unmapped { local: true });
     tight_profile(&ops, &[ALICE, CAROL]);
     *ops.owners.borrow_mut() = Ok(Some(vec![ALICE.to_string(), CAROL.to_string()]));
     let (result, lines) = run(&ops, Some("bob"), None);
@@ -1815,4 +1830,84 @@ fn an_unverifiable_account_in_the_record_refuses_the_repair() {
     assert!(lines.contains(&format!(
         "err banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の {DAVE} が利用者のアカウントかを確かめられませんでした: RPC が届かない。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください"
     )), "{lines:#?}");
+}
+
+/// 修復（記録に名前を解けないドメインの利用者。#704 レビュー P2）: ドメインの SID の
+/// `ERROR_NONE_MAPPED`はネットワークのタイムアウトでも返るので、削除済みと決めずに断る
+/// （緩めない・記録を書き換えない）。反証: 同じ SID がローカルなら外して進む（上の
+/// `a_deleted_account_in_the_record_is_dropped_with_a_warning`）。
+#[test]
+fn an_unmapped_domain_account_in_the_record_refuses_the_repair() {
+    let mut ops = FakeOps::new();
+    ops.names
+        .insert("bob".to_string(), Ok(Some(BOB.to_string())));
+    ops.lookups
+        .insert(ALICE.into(), OwnerLookup::Unmapped { local: false });
+    tight_profile(&ops, &[ALICE, CAROL]);
+    let record = Some(vec![ALICE.to_string(), CAROL.to_string()]);
+    *ops.owners.borrow_mut() = Ok(record.clone());
+    let (result, lines) = run(&ops, Some("bob"), None);
+    assert_eq!(result, Err(Refused), "{lines:#?}");
+    assert!(!ops.calls().iter().any(|c| c.starts_with("write_owners")));
+    assert!(!ops.calls().iter().any(|c| c.starts_with("relax")));
+    assert_eq!(*ops.owners.borrow(), Ok(record));
+    assert!(lines.contains(&format!(
+        "err banto-hub-elev: 戻す相手の記録（{OWNERS_AT}）の {ALICE} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください。その利用者を外すなら、ドメインで削除済みを確かめてから記録（{OWNERS_AT}）を消して実行すると、今の DACL から組を採り直します（名前を解けない利用者には戻しません）"
+    )), "{lines:#?}");
+
+    // 反証: 記録が無ければ今の DACL から組を採り直し、名前を解けないドメインの利用者には
+    // 戻さずに警告する（ほかの利用者で進む）。
+    let mut ops = FakeOps::new();
+    ops.lookups
+        .insert(ALICE.into(), OwnerLookup::Unmapped { local: false });
+    tight_profile(&ops, &[ALICE, CAROL]);
+    *ops.owners.borrow_mut() = Ok(None);
+    let (result, lines) = run(&ops, None, None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops
+        .calls()
+        .contains(&format!("relax default [{ME},{CAROL}]")));
+    assert!(lines.contains(&format!(
+        "err banto-hub-elev: 警告: 利用者のアカウントかを確かめられなかったので、{ALICE} には戻しません: 名前を解けません（ドメインに届かないなど。削除済みとは決められません）。名前の解決が戻ってから grant-profile-acl {ALICE} default を実行してください"
+    )), "{lines:#?}");
+}
+
+/// 修復（記録にグループ。#704 レビュー P2）: 照会に成功して利用者でないと分かった SID は、
+/// ローカルかどうかに関わらず警告して外す（従来どおり）。
+#[test]
+fn a_group_in_the_record_is_dropped_with_a_warning() {
+    let mut ops = FakeOps::new();
+    ops.names
+        .insert("bob".to_string(), Ok(Some(BOB.to_string())));
+    tight_profile(&ops, &[CAROL]);
+    *ops.owners.borrow_mut() = Ok(Some(vec![DOMAIN_USERS.to_string(), CAROL.to_string()]));
+    let (result, lines) = run(&ops, Some("bob"), None);
+    assert_eq!(result, Ok(()), "{lines:#?}");
+    assert!(ops
+        .calls()
+        .contains(&format!("relax default [{BOB},{CAROL}]")));
+    assert_eq!(
+        *ops.owners.borrow(),
+        Ok(Some(vec![BOB.to_string(), CAROL.to_string()]))
+    );
+    assert!(lines.contains(&format!(
+        "err banto-hub-elev: 警告: 戻す相手の記録（{OWNERS_AT}）の {DOMAIN_USERS} はこの PC の利用者のアカウントではありません（グループなど）。記録から外し、「変更」は戻しません"
+    )), "{lines:#?}");
+}
+
+/// ローカルのアカウントのドメインの直下（`<domain>-<RID>`）だけを属するとみなす（#704
+/// レビュー P2）。
+#[test]
+fn is_in_account_domain_matches_only_direct_accounts() {
+    let domain = "S-1-5-21-1-2-3";
+    assert!(is_in_account_domain("S-1-5-21-1-2-3-1001", domain));
+    assert!(is_in_account_domain("s-1-5-21-1-2-3-500", domain));
+    // 前方一致だけの別のドメイン・RID が無い・深すぎる・数字でない。
+    assert!(!is_in_account_domain("S-1-5-21-1-2-33-1001", domain));
+    assert!(!is_in_account_domain("S-1-5-21-1-2-3", domain));
+    assert!(!is_in_account_domain("S-1-5-21-1-2-3-", domain));
+    assert!(!is_in_account_domain("S-1-5-21-1-2-3-4-1001", domain));
+    assert!(!is_in_account_domain("S-1-5-21-1-2-3-x", domain));
+    assert!(!is_in_account_domain("S-1-5-21-9-9-9-1001", domain));
+    assert!(!is_in_account_domain("S-1-5-21-1-2-3-1001", ""));
 }

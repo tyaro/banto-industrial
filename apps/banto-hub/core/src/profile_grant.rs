@@ -49,8 +49,10 @@
 //!   DACL から「変更」の利用者は採れない（読み取りと実行だけ）。記録が使えればその組 +
 //!   指定の利用者、使えなければ指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者
 //!   （締めたときの組。締まった DACL は利用者には書き換えられない）で緩め、その旨を警告する。
-//!   記録の SID は 1 つずつ利用者のアカウントかを確かめ、削除済み・グループは警告して外す。
-//!   確かめられない SID があれば断る（#704 レビュー）。
+//!   記録の SID は 1 つずつ利用者のアカウントかを確かめ（[`OwnerLookup`]）、グループと
+//!   この PC のローカルの削除済みは警告して外す。確かめられない SID と、名前を解けない
+//!   ドメインの SID（`ERROR_NONE_MAPPED` はネットワークのタイムアウトでも返るので、削除済みと
+//!   決められない）があれば断る（#704 レビュー）。
 //! - **DACL の形**（論点 1）: 保護された DACL（`D:P`）に SYSTEM・Administrators のフル、
 //!   利用者ごとの「変更」（`0x1301BF`）、所有者は Administrators。親からは継承しない。
 //! - **足していく意味を保つ**（論点 4 (b)）: 書き直す前の DACL を開いたハンドルから読み
@@ -469,6 +471,46 @@ pub enum CreateHow {
     ServiceOnly,
 }
 
+/// 戻す相手の記録の SID を照会した結果（[`repair_plan`] 用。#704 レビュー P2）。
+///
+/// 共有の [`AccountKind`] は `ERROR_NONE_MAPPED` もグループも [`AccountKind::NotAUser`] に
+/// まとめる（ChronoGazer と Hub のほかの経路はそれで足りるので変えない）。ところが
+/// `LookupAccountSidW` は、ドメインの SID ではネットワークのタイムアウトでも
+/// `ERROR_NONE_MAPPED` を返す（Microsoft の仕様の Remarks）ので、それだけで削除済みと決めて
+/// 記録から外すと、一時的な名前解決の失敗で有効なドメインの利用者の権限を消してしまう。
+/// ローカルのアカウントのドメイン（マシンの SID）に属する SID の照会はローカルの SAM だけで
+/// 済みネットワークは関わらないので、そちらだけを削除済みと扱う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerLookup {
+    /// 利用者のアカウント（`SidTypeUser`）。
+    User,
+    /// 照会に成功し、利用者のアカウントではない（グループ・別名など）。
+    NotAUser,
+    /// 名前を解けなかった（`ERROR_NONE_MAPPED`）。`local` は、SID がこの PC のローカルの
+    /// アカウントのドメイン（[`is_in_account_domain`]）に属するか。
+    Unmapped {
+        /// ローカルのアカウントのドメインに属する（= 削除済みと決めてよい）。
+        local: bool,
+    },
+    /// 確かめられなかった（RPC 不達・マシンの SID を読めないなど）。中身は理由。
+    LookupFailed(String),
+}
+
+/// `sid` が、アカウントのドメインの SID `domain` の直下のアカウント（`<domain>-<RID>`）か
+/// （純関数）。ローカルのアカウントのドメイン（マシンの SID、`S-1-5-21-a-b-c`）を渡し、
+/// 名前を解けなかった SID がこの PC のローカルのものかを決める（[`OwnerLookup::Unmapped`]）。
+/// 大文字・小文字は区別しない。
+pub fn is_in_account_domain(sid: &str, domain: &str) -> bool {
+    let (sid, domain) = (sid.to_ascii_uppercase(), domain.to_ascii_uppercase());
+    let Some(rest) = sid.strip_prefix(domain.as_str()) else {
+        return false;
+    };
+    let Some(rid) = rest.strip_prefix('-') else {
+        return false;
+    };
+    !domain.is_empty() && !rid.is_empty() && rid.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// `banto-hub-elev`が OS に対してする操作（Windows の実装は`win::WindowsHubElevOps`。
 /// テストは偽物）。
 pub trait HubElevOps {
@@ -485,6 +527,11 @@ pub trait HubElevOps {
     fn lookup_account_sid(&self, name: &str) -> Result<Option<String>, String>;
     /// SID がこの PC の利用者のアカウント（`SidTypeUser`）か（`LookupAccountSidW`）。
     fn account_kind(&self, sid: &InstallUserSid) -> AccountKind;
+    /// 戻す相手の記録の SID を、[`HubElevOps::account_kind`] より細かく照会する
+    /// （[`repair_plan`] 用。名前を解けなかったことと、照会に成功して利用者でないことを分け、
+    /// 解けなかった SID がこの PC のローカルのアカウントのドメインに属するかも返す。#704
+    /// レビュー P2）。
+    fn owner_lookup(&self, sid: &InstallUserSid) -> OwnerLookup;
     /// [`HubElevOps::hold_profile`] が返す、持っている間だけ有効な profile の排他。
     type ProfileHold;
     /// profile の mutex（`Global\BantoHub.<id>`、Hub と同じもの）を**取って持つ**
@@ -888,14 +935,16 @@ pub fn access_plan(
 /// （読み取りと実行だけ）ので、[`access_plan`] の代わりに使う。
 ///
 /// - 記録（`stored`）が使える: 記録の組 + 指定の利用者（`user`）。記録の SID は形しか確かめて
-///   いない（[`check_stored_owners`]）ので、1 つずつ `account` で確かめる。利用者のアカウントで
-///   ない SID（削除済み = `ERROR_NONE_MAPPED`・グループなど、[`AccountKind::NotAUser`]）は警告して
-///   外す（残すと緩めるときの全利用者の確かめで断られ、修復で戻せなくなる。#704 レビュー）。
+///   いない（[`check_stored_owners`]）ので、1 つずつ `account` で確かめる。照会に成功して
+///   利用者のアカウントでない SID（グループなど、[`OwnerLookup::NotAUser`]）と、名前を解けない
+///   ローカルの SID（この PC で削除済み、[`OwnerLookup::Unmapped`] の `local`）は警告して外す
+///   （残すと緩めるときの全利用者の確かめで断られ、修復で戻せなくなる。#704 レビュー）。
 ///   外した結果、記録の組が指定の利用者だけになっても、そのまま指定の利用者で進める（記録は
 ///   締めたときの組なので、今の DACL の「読み取りと実行」の利用者に頼っても同じ顔ぶれになる）。
-///   確かめられない SID（[`AccountKind::LookupFailed`]。ドメインに届かないなど）があれば、
-///   削除済みと区別できないので黙って落とさず、`Err`（知らせる行）で断る（緩めない・記録を
-///   書き換えない）。
+///   確かめられない SID（[`OwnerLookup::LookupFailed`]）と、名前を解けないローカルでない SID
+///   （ドメインの利用者。`ERROR_NONE_MAPPED` はネットワークのタイムアウトでも返る。#704
+///   レビュー P2）があれば、削除済みと区別できないので黙って落とさず、`Err`（知らせる行）で
+///   断る（緩めない・記録を書き換えない）。
 /// - 記録が無い・使えない: 指定の利用者 + 今の DACL で「読み取りと実行」を持つ利用者の
 ///   アカウント（締めたときの組。締まった DACL の所有者は Administrators で、利用者には
 ///   書き換えられない）。記録が使えない旨を警告にする。利用者のアカウントかを確かめられない
@@ -905,7 +954,7 @@ pub fn repair_plan(
     profile_id: &str,
     dacl: &ObservedDacl,
     stored: StoredOwners,
-    mut account: impl FnMut(&InstallUserSid) -> AccountKind,
+    mut account: impl FnMut(&InstallUserSid) -> OwnerLookup,
 ) -> Result<AccessPlan, Vec<ConsoleLine>> {
     let location = owners_location(profile_id);
     let mut lines = vec![out_line(&format!(
@@ -919,33 +968,39 @@ pub fn repair_plan(
             // 1 つでもあれば、外さずに断る。
             let mut kept = Vec::new();
             let mut dropped = Vec::new();
-            let mut unknown = Vec::new();
+            let mut refusals = Vec::new();
             for sid in owners {
                 if sid == *user {
                     kept.push(sid);
                     continue;
                 }
                 match account(&sid) {
-                    AccountKind::User => kept.push(sid),
-                    AccountKind::NotAUser => dropped.push(sid),
-                    AccountKind::LookupFailed(why) => unknown.push((sid, why)),
-                }
-            }
-            if !unknown.is_empty() {
-                for (sid, why) in &unknown {
-                    lines.push(err_line(&format!(
+                    OwnerLookup::User => kept.push(sid),
+                    OwnerLookup::NotAUser => dropped.push(format!(
+                        "警告: 戻す相手の記録（{location}）の {} はこの PC の利用者のアカウントではありません（グループなど）。記録から外し、「変更」は戻しません",
+                        sid.as_str()
+                    )),
+                    OwnerLookup::Unmapped { local: true } => dropped.push(format!(
+                        "警告: 戻す相手の記録（{location}）の {} はこの PC のローカルのアカウントにありません（削除済み）。記録から外し、「変更」は戻しません",
+                        sid.as_str()
+                    )),
+                    OwnerLookup::Unmapped { local: false } => refusals.push(format!(
+                        "戻す相手の記録（{location}）の {} の名前を解けませんでした（この PC のローカルのアカウントではないので、ドメインに届かないだけか削除済みかを決められません）。緩めずに止めます（記録も書き換えません）。ドメインに届くようになってから、もう一度実行してください。その利用者を外すなら、ドメインで削除済みを確かめてから記録（{location}）を消して実行すると、今の DACL から組を採り直します（名前を解けない利用者には戻しません）",
+                        sid.as_str()
+                    )),
+                    OwnerLookup::LookupFailed(why) => refusals.push(format!(
                         "戻す相手の記録（{location}）の {} が利用者のアカウントかを確かめられませんでした: {why}。削除済みかを決められないので、緩めずに止めます（記録も書き換えません）。名前の解決が戻ってから、もう一度実行してください",
                         sid.as_str()
-                    )));
+                    )),
                 }
+            }
+            if !refusals.is_empty() {
+                lines.extend(refusals.iter().map(|text| err_line(text)));
                 return Err(lines);
             }
-            for sid in &dropped {
+            for text in &dropped {
                 warnings += 1;
-                lines.push(err_line(&format!(
-                    "警告: 戻す相手の記録（{location}）の {} はこの PC の利用者のアカウントではありません（削除済み・グループなど）。記録から外し、「変更」は戻しません",
-                    sid.as_str()
-                )));
+                lines.push(err_line(text));
             }
             if !kept.is_empty() {
                 lines.push(out_line(&format!(
@@ -993,26 +1048,44 @@ pub fn repair_plan(
             if users.contains(&sid) {
                 continue;
             }
-            match account(&sid) {
-                AccountKind::User => {
+            let failure = match account(&sid) {
+                OwnerLookup::User => {
                     lines.push(out_line(&format!(
                         "今の DACL で「読み取りと実行」を持つ利用者 {} に「変更」を戻します",
                         sid.as_str()
                     )));
-                    users.push(sid);
+                    users.push(sid.clone());
+                    None
                 }
-                AccountKind::NotAUser => lines.push(out_line(&format!(
-                    "この PC の利用者のアカウントでない SID（グループなど）の ACE（{}）には戻しません",
-                    ace_text(ace)
-                ))),
-                AccountKind::LookupFailed(why) => {
-                    warnings += 1;
-                    lines.push(err_line(&format!(
-                        "警告: 利用者のアカウントかを確かめられなかったので、{} には戻しません: {why}。名前の解決が戻ってから grant-profile-acl {} {profile_id} を実行してください",
-                        sid.as_str(),
-                        sid.as_str()
+                OwnerLookup::NotAUser => {
+                    lines.push(out_line(&format!(
+                        "この PC の利用者のアカウントでない SID（グループなど）の ACE（{}）には戻しません",
+                        ace_text(ace)
                     )));
+                    None
                 }
+                OwnerLookup::Unmapped { local: true } => {
+                    lines.push(out_line(&format!(
+                        "この PC のローカルのアカウントにない SID（削除済み）の ACE（{}）には戻しません",
+                        ace_text(ace)
+                    )));
+                    None
+                }
+                // ドメインの SID の`ERROR_NONE_MAPPED`は一時的な失敗かもしれない（#704
+                // レビュー P2）。確かめられないものと同じく、戻さずに警告する。
+                OwnerLookup::Unmapped { local: false } => Some(
+                    "名前を解けません（ドメインに届かないなど。削除済みとは決められません）"
+                        .to_string(),
+                ),
+                OwnerLookup::LookupFailed(why) => Some(why),
+            };
+            if let Some(why) = failure {
+                warnings += 1;
+                lines.push(err_line(&format!(
+                    "警告: 利用者のアカウントかを確かめられなかったので、{} には戻しません: {why}。名前の解決が戻ってから grant-profile-acl {} {profile_id} を実行してください",
+                    sid.as_str(),
+                    sid.as_str()
+                )));
             }
         }
     }
@@ -1484,7 +1557,7 @@ fn grant_steps<O: HubElevOps>(ops: &O, pre: &Preflight, out: Out<'_>) -> Result<
     // 「変更」の利用者は採れないので、記録（無ければ「読み取りと実行」の利用者）を使う。
     let plan = if profile_shape(&RootObservation::Present(dacl.clone())) == ProfileShape::Tight {
         let stored = check_stored_owners(ops.read_owners(id));
-        match repair_plan(&pre.user, id, &dacl, stored, |sid| ops.account_kind(sid)) {
+        match repair_plan(&pre.user, id, &dacl, stored, |sid| ops.owner_lookup(sid)) {
             Ok(plan) => plan,
             Err(lines) => {
                 for line in lines {

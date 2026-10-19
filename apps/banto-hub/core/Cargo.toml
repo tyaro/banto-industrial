@@ -278,9 +278,16 @@ path = "src/bin/banto-hub-elev.rs"
 # #661 661-2: `Win32_System_Registry`を追加した - `profile_owners.rs`が戻す相手の記録
 # （HKLM `...\Services\BantoHub\Parameters\Profiles\<id>\Owners`、REG_MULTI_SZ）を
 # 読み書きする（`RegOpenKeyExW`・`RegCreateKeyExW`・`RegSetValueExW`・`RegGetValueW`）。
+#
+# #704 レビュー P2: `Win32_Security_Authentication_Identity`・`Win32_Security_Authorization`
+# を追加した - `profile_grant::win::owner_lookup`が記録の SID を照会し
+# （`ConvertStringSidToSidW`・`LookupAccountSidW`）、名前を解けなければこの PC のアカウントの
+# ドメインの SID（`LsaOpenPolicy`・`LsaQueryInformationPolicy`・`ConvertSidToStringSidW`）と比べる。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",

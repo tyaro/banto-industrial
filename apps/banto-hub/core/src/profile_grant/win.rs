@@ -12,7 +12,10 @@ use banto_safe_root::{DirAccess, InstallUserSid};
 /// マシンの環境を HKLM と既知のフォルダから読む（このプロセスの環境変数は読まない）。
 pub use banto_safe_root::guard::win::RegistryMachineEnvironment;
 
-use super::{CreateHow, FileFacts, HubElevOps, OwnersWrite, PinnedProfileDir};
+use super::{
+    is_in_account_domain, CreateHow, FileFacts, HubElevOps, OwnerLookup, OwnersWrite,
+    PinnedProfileDir,
+};
 
 /// 本番の操作。
 pub struct WindowsHubElevOps;
@@ -49,6 +52,168 @@ pub fn hold_profile_mutex(
         .map_err(|err| format!("{name} を取れませんでした: {err}"))
 }
 
+/// 戻す相手の記録の SID を照会する（[`OwnerLookup`]。#704 レビュー P2）。
+/// `LookupAccountSidW`が名前を解けなかった（`ERROR_NONE_MAPPED`）ときは、SID がこの PC の
+/// ローカルのアカウントのドメイン（[`account_domain_sid`]）に属するかを添える。共有の
+/// `guard::account_kind`は`ERROR_NONE_MAPPED`とグループを分けないので、ここで別に照会する
+/// （共有 crate を変えると ChronoGazer の経路にも効くため、Hub 側に置く）。
+pub fn owner_lookup(sid: &InstallUserSid) -> OwnerLookup {
+    match lookup_sid_use(sid.as_str()) {
+        Ok(Some(kind)) if kind == windows_sys::Win32::Security::SidTypeUser => OwnerLookup::User,
+        Ok(Some(_)) => OwnerLookup::NotAUser,
+        Ok(None) => match account_domain_sid() {
+            Ok(domain) => OwnerLookup::Unmapped {
+                local: is_in_account_domain(sid.as_str(), &domain),
+            },
+            Err(why) => OwnerLookup::LookupFailed(format!(
+                "名前を解けず、この PC のアカウントのドメインの SID も読めませんでした: {why}"
+            )),
+        },
+        Err(why) => OwnerLookup::LookupFailed(why),
+    }
+}
+
+/// `LocalAlloc`の領域（`ConvertStringSidToSidW`・`ConvertSidToStringSidW`の結果）を手放す。
+struct LocalBox(*mut core::ffi::c_void);
+
+impl Drop for LocalBox {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: LocalAlloc の領域で、ほかに解放する所は無い。
+            unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+        }
+    }
+}
+
+fn os_error(api: &str, code: u32) -> String {
+    format!(
+        "{api} が失敗しました: {}",
+        std::io::Error::from_raw_os_error(code as i32)
+    )
+}
+
+/// SID の文字列を`LookupAccountSidW`で照会し、種類（`SID_NAME_USE`）を返す。名前を
+/// 解けない（`ERROR_NONE_MAPPED`）なら`Ok(None)`、それ以外の失敗は`Err`。
+fn lookup_sid_use(text: &str) -> Result<Option<i32>, String> {
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::{LookupAccountSidW, PSID, SID_NAME_USE};
+
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let mut sid: PSID = std::ptr::null_mut();
+    // SAFETY: `wide`は NUL 終端。成功すれば`sid`は LocalAlloc の領域。
+    if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 {
+        // SAFETY: 直前の API の失敗の理由を読むだけ。
+        let code = unsafe { GetLastError() };
+        return Err(os_error("ConvertStringSidToSidW", code));
+    }
+    let sid = LocalBox(sid);
+    let (mut name_len, mut domain_len) = (256u32, 256u32);
+    // 長さが足りなければ、返った長さで 1 回だけ取り直す。
+    for _ in 0..2 {
+        let mut name = vec![0u16; name_len as usize];
+        let mut domain = vec![0u16; domain_len as usize];
+        let mut kind: SID_NAME_USE = 0;
+        // SAFETY: バッファは長さとともに渡す。名前そのものは使わず、種類だけ見る。
+        let ok = unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                sid.0,
+                name.as_mut_ptr(),
+                &mut name_len,
+                domain.as_mut_ptr(),
+                &mut domain_len,
+                &mut kind,
+            )
+        };
+        if ok != 0 {
+            return Ok(Some(kind));
+        }
+        // SAFETY: 直前の API の失敗の理由を読むだけ。
+        let code = unsafe { GetLastError() };
+        match code {
+            ERROR_NONE_MAPPED => return Ok(None),
+            ERROR_INSUFFICIENT_BUFFER => continue,
+            _ => return Err(os_error("LookupAccountSidW", code)),
+        }
+    }
+    Err(os_error("LookupAccountSidW", ERROR_INSUFFICIENT_BUFFER))
+}
+
+/// この PC のローカルのアカウントのドメインの SID（マシンの SID、`S-1-5-21-a-b-c`）を
+/// `LsaQueryInformationPolicy(PolicyAccountDomainInformation)`で読む。
+pub fn account_domain_sid() -> Result<String, String> {
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        LsaClose, LsaFreeMemory, LsaNtStatusToWinError, LsaOpenPolicy, LsaQueryInformationPolicy,
+        PolicyAccountDomainInformation, LSA_OBJECT_ATTRIBUTES, POLICY_ACCOUNT_DOMAIN_INFO,
+        POLICY_VIEW_LOCAL_INFORMATION,
+    };
+
+    // SAFETY: 全部 0 の LSA_OBJECT_ATTRIBUTES は LsaOpenPolicy の求める形（Length 以外は予約）。
+    let mut attributes: LSA_OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    attributes.Length = std::mem::size_of::<LSA_OBJECT_ATTRIBUTES>() as u32;
+    let mut policy = 0isize;
+    // SAFETY: 引数は有効な領域。成功すれば`policy`は LsaClose で閉じる。
+    let status = unsafe {
+        LsaOpenPolicy(
+            std::ptr::null(),
+            &attributes,
+            POLICY_VIEW_LOCAL_INFORMATION as u32,
+            &mut policy,
+        )
+    };
+    if status != 0 {
+        // SAFETY: NTSTATUS を Win32 のエラーに直すだけ。
+        let code = unsafe { LsaNtStatusToWinError(status) };
+        return Err(os_error("LsaOpenPolicy", code));
+    }
+    let mut buffer: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `policy`は開いたハンドル。成功すれば`buffer`は LsaFreeMemory で手放す。
+    let status =
+        unsafe { LsaQueryInformationPolicy(policy, PolicyAccountDomainInformation, &mut buffer) };
+    let result = if status != 0 {
+        // SAFETY: NTSTATUS を Win32 のエラーに直すだけ。
+        let code = unsafe { LsaNtStatusToWinError(status) };
+        Err(os_error("LsaQueryInformationPolicy", code))
+    } else {
+        // SAFETY: 成功した PolicyAccountDomainInformation の`buffer`は
+        // POLICY_ACCOUNT_DOMAIN_INFO。
+        let domain_sid = unsafe { (*(buffer as *const POLICY_ACCOUNT_DOMAIN_INFO)).DomainSid };
+        let converted = sid_to_string(domain_sid);
+        // SAFETY: LsaQueryInformationPolicy が確保した領域（`domain_sid`はもう使わない）。
+        unsafe { LsaFreeMemory(buffer) };
+        converted
+    };
+    // SAFETY: 開いたハンドルを閉じる。
+    unsafe { LsaClose(policy) };
+    result
+}
+
+/// SID を文字列（`S-1-...`）にする（`ConvertSidToStringSidW`）。
+fn sid_to_string(sid: windows_sys::Win32::Security::PSID) -> Result<String, String> {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    if sid.is_null() {
+        return Err("この PC のアカウントのドメインの SID がありません".to_string());
+    }
+    let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `sid`は有効な SID。成功すれば`text`は LocalAlloc の NUL 終端の文字列。
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        // SAFETY: 直前の API の失敗の理由を読むだけ。
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        return Err(os_error("ConvertSidToStringSidW", code));
+    }
+    let text = LocalBox(text.cast());
+    let start = text.0 as *const u16;
+    // SAFETY: NUL 終端の文字列を終端の手前まで読む。
+    let len = (0..).take_while(|&i| unsafe { *start.add(i) } != 0).count();
+    // SAFETY: 長さ`len`の領域は上で読めた。`text`はこの関数の終わりまで生きている。
+    let slice = unsafe { std::slice::from_raw_parts(start, len) };
+    Ok(String::from_utf16_lossy(slice))
+}
+
 impl HubElevOps for WindowsHubElevOps {
     type Env = RegistryMachineEnvironment;
     type Pinned = PinnedDir;
@@ -69,6 +234,10 @@ impl HubElevOps for WindowsHubElevOps {
 
     fn account_kind(&self, sid: &InstallUserSid) -> AccountKind {
         guard::account_kind(sid)
+    }
+
+    fn owner_lookup(&self, sid: &InstallUserSid) -> OwnerLookup {
+        owner_lookup(sid)
     }
 
     type ProfileHold = banto_instance_lock::NamedMutexGuard;
