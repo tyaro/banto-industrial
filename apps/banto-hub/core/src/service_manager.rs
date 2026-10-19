@@ -107,6 +107,25 @@ pub const SINK_SERVICE_DISPLAY_NAME: &str = "banto-hub DB Sink サイドカー";
 /// サービス登録を再構築するときの両方が使う。
 pub const RUN_SERVICE_ARG: &str = "run-service";
 
+/// `BantoHub` サービスが SCM へ報告するサービス固有の終了コード（`Stopped` の
+/// `ServiceSpecific(n)`。`sc query` の `SERVICE_EXIT_CODE`）。1〜3 は以前から
+/// `bin/banto_hub/win_service.rs` にあった値（2026-09-07 の I4）、4・5 は #661 661-2 で
+/// 足した（ChronoGazer の #623 と同じ意味。デスクトップの切り替えの判定が見る）。
+///
+/// 1: tokio ランタイムを作れない・Configured の収集を始められない（本体の panic も
+/// 共有ランナーが 1 で報告する）。
+pub const HUB_EXIT_RUNTIME_OR_COLLECT_FAILED: u32 = 1;
+/// 2: 既に別のプロセス（シェル・別のサービス）が同じ profile を使っている。
+pub const HUB_EXIT_PROFILE_LOCK_HELD: u32 = 2;
+/// 3: 上のどれでもない起動の失敗（DB を開けない・待ち受けの失敗・知らない開始の引数など）。
+pub const HUB_EXIT_START_FAILED: u32 = 3;
+/// 4: 運用モードにできなかった（締められない物がある・戻す相手が 0 人など）。profile は
+/// 設定モードの形のまま（何も変えていないか、締めた分を緩め直した）。
+pub const HUB_EXIT_NOT_OPERATIONAL: u32 = 4;
+/// 5: 締めたまま残った（緩め直せない・緩めてよい条件がそろわない・戻す相手の記録が
+/// 使えない）。`relax-only` の開始か `banto-hub-elev grant-profile-acl` で戻す。
+pub const HUB_EXIT_LEFT_TIGHT: u32 = 5;
+
 pub use banto_service_control::*;
 
 /// [`ServiceManagerError`]を banto-hub の利用者に見せる文言にする。

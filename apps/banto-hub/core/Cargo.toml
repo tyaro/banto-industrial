@@ -274,12 +274,17 @@ path = "src/bin/banto-hub-elev.rs"
 # #392 B3-3b（監査 C4）: `Win32_System_LibraryLoader`を追加した -
 # `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`（`banto-hub-elev`の
 # `main`の先頭で、昇格したプロセスの DLL の探し先を System32 に限る）。
+#
+# #661 661-2: `Win32_System_Registry`を追加した - `profile_owners.rs`が戻す相手の記録
+# （HKLM `...\Services\BantoHub\Parameters\Profiles\<id>\Owners`、REG_MULTI_SZ）を
+# 読み書きする（`RegOpenKeyExW`・`RegCreateKeyExW`・`RegSetValueExW`・`RegGetValueW`）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }

@@ -1123,13 +1123,19 @@ fn profile_db_path(dirs: &ProfileDirs, db_path: String) -> Result<String, Profil
     if !in_config {
         return Ok(db_path);
     }
-    let checked = dirs
-        .config
-        .reopen_path(DB_FILE_NAME, &["-wal", "-shm", "-journal"])
-        .map_err(|error| ProfileDirsError::Reopen {
-            name: DB_FILE_NAME.to_string(),
-            error,
-        })?;
+    const COMPANIONS: [&str; 3] = ["-wal", "-shm", "-journal"];
+    // #661 661-2: 運用モードの形に締めた組（サービス）なら、渡す直前に `config` の記述子が
+    // その形かを確かめる（締めた後に外から変えられていたら渡さない）。
+    let checked = match &dirs.checked_access {
+        Some(expected) => dirs
+            .config
+            .reopen_path_checked(DB_FILE_NAME, &COMPANIONS, expected),
+        None => dirs.config.reopen_path(DB_FILE_NAME, &COMPANIONS),
+    }
+    .map_err(|error| ProfileDirsError::Reopen {
+        name: DB_FILE_NAME.to_string(),
+        error,
+    })?;
     Ok(checked.into_path().to_string_lossy().into_owned())
 }
 

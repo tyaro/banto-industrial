@@ -138,8 +138,8 @@ pub const PROFILE_MANAGED_SPECS: [ManagedSpec; 3] = [
 
 /// 監査の保留の開き方（`data` の下）。必須の組には入れず、別に試して開く
 /// （[`open_profile_dirs`]）。開けなくても従来どおり警告して保留なしで続ける
-/// （[`crate::audit_spool`] の方針）。Guarded（661-2 のサービス）で必須にするかは
-/// 661-2 で決める。
+/// （[`crate::audit_spool`] の方針）。サービスの運用モード（661-2）は必須にする
+/// （[`SERVICE_PROFILE_MANAGED_SPECS`]）。
 const AUDIT_SPOOL_SPECS: [ManagedSpec; 2] = [
     ManagedSpec {
         key: DIR_DATA,
@@ -147,6 +147,23 @@ const AUDIT_SPOOL_SPECS: [ManagedSpec; 2] = [
         name: "data",
         create: true,
     },
+    ManagedSpec {
+        key: DIR_AUDIT_SPOOL,
+        parent: Some(DIR_DATA),
+        name: crate::audit_spool::SPOOL_DIR_NAME,
+        create: true,
+    },
+];
+
+/// サービスが運用モードの形に締めた後に開くフォルダ（#661 661-2）。監査の保留も**必須**:
+/// 締める前の 1 周目が木の全体を確かめた後なので、ここで開けないのは I/O の失敗か締めた後の
+/// 改ざんで、黙って保留なしで動かすより、緩め直して止める方が安全（ChronoGazer の
+/// `audit-spool` も管理するフォルダの必須の 1 つ）。`data` を親として 1 回だけ並べる
+/// （661-1 の別に試す形のように `data` を 2 回握らない）。
+pub const SERVICE_PROFILE_MANAGED_SPECS: [ManagedSpec; 4] = [
+    PROFILE_MANAGED_SPECS[0],
+    PROFILE_MANAGED_SPECS[1],
+    PROFILE_MANAGED_SPECS[2],
     ManagedSpec {
         key: DIR_AUDIT_SPOOL,
         parent: Some(DIR_DATA),
@@ -170,6 +187,10 @@ pub struct ProfileDirs {
     pub logs: Arc<ManagedDir>,
     /// `{profile_dir}/data/audit-spool`。開けなかったときは `None`（保留なしで続ける）。
     pub audit_spool: Option<Arc<ManagedDir>>,
+    /// 運用モードの形（#661 661-2。[`open_profile_dirs_checked`] だけが `Some`）。`Some` なら
+    /// 設定 DB のパスは、渡す直前に `config` の記述子がこの形かを確かめてから渡す
+    /// （`ManagedDir::reopen_path_checked`）。
+    pub checked_access: Option<DirAccess>,
 }
 
 /// [`open_profile_dirs`] などの失敗。
@@ -235,6 +256,35 @@ pub fn open_profile_dirs(
         data,
         logs,
         audit_spool,
+        checked_access: None,
+    })
+}
+
+/// サービスが運用モードの形に締め終えた profile（`profile`、`Mode::Guarded` で握った物）の
+/// 中の [`SERVICE_PROFILE_MANAGED_SPECS`] を開いて握る（#661 661-2）。無ければ運用モードの
+/// 形（`operation`）で作る。監査の保留も必須で、1 つでも開けなければ何も返さない。返した組の
+/// [`ProfileDirs::checked_access`] は `operation`。
+pub fn open_profile_dirs_checked(
+    profile: Arc<SafeRoot>,
+    operation: &DirAccess,
+) -> Result<ProfileDirs, ProfileDirsError> {
+    let mut set = profile.open_managed(&SERVICE_PROFILE_MANAGED_SPECS, Some(operation))?;
+    let mut take = |key: &str| {
+        set.take(key)
+            .map(Arc::new)
+            .expect("SERVICE_PROFILE_MANAGED_SPECS に並べた key は開いてある")
+    };
+    let config = take(DIR_CONFIG);
+    let data = take(DIR_DATA);
+    let logs = take(DIR_LOGS);
+    let audit_spool = take(DIR_AUDIT_SPOOL);
+    Ok(ProfileDirs {
+        profile,
+        config,
+        data,
+        logs,
+        audit_spool: Some(audit_spool),
+        checked_access: Some(operation.clone()),
     })
 }
 
@@ -258,6 +308,13 @@ impl ProfileLockGuard {
     pub fn lock_file_path(&self) -> &Path {
         self.guard.lock_file_path()
     }
+}
+
+/// profile のフォルダ（ルート）だけを握った段で取った排他（#661 661-2）。サービスは
+/// 締める前に取り、緩め終えるまで持つ（drop で返す）。中の組は持たない（サービスは
+/// 締めた後に [`open_profile_dirs_checked`] で開き、`skip_profile_lock` の起動に渡す）。
+pub struct ProfileExclusive {
+    _guard: InstanceLockGuard,
 }
 
 /// 診断ファイル（`profile.lock`）のパス。取得（[`try_acquire_profile_lock`]）と
@@ -332,15 +389,34 @@ pub fn try_acquire_profile_lock_in(
     host_kind: HubHostKind,
     dirs: ProfileDirs,
 ) -> Result<ProfileLockGuard, ProfileLockError> {
+    let guard = acquire_guard(paths, host_kind, &dirs.profile)?;
+    Ok(ProfileLockGuard { guard, dirs })
+}
+
+/// 握った profile のフォルダ（`profile`）だけで排他を取る（#661 661-2。中のフォルダはまだ
+/// 開かない）。取り方・失敗は [`try_acquire_profile_lock_in`] と同じ。
+pub fn try_acquire_profile_exclusive(
+    paths: &ProfilePaths,
+    host_kind: HubHostKind,
+    profile: &SafeRoot,
+) -> Result<ProfileExclusive, ProfileLockError> {
+    acquire_guard(paths, host_kind, profile).map(|guard| ProfileExclusive { _guard: guard })
+}
+
+fn acquire_guard(
+    paths: &ProfilePaths,
+    host_kind: HubHostKind,
+    profile: &SafeRoot,
+) -> Result<InstanceLockGuard, ProfileLockError> {
     let mutex_name = crate::profile_paths::mutex_name(&paths.profile_id);
 
     // 握っている（Guarded）ときだけ、握った profile のハンドル経由で診断ファイルを書く。
     // Plain はリンクを辿るので、握っていないときはルートだけ解いて下は辿らないパスで
     // 書く（profile がジャンクションでも外へ書かない。#623 PR-2、#693）。
-    let result = if dirs.config.is_guarded() {
+    let result = if profile.as_dir().is_guarded() {
         banto_instance_lock::try_acquire_in(
             &mutex_name,
-            dirs.profile.as_dir(),
+            profile.as_dir(),
             LOCK_FILE_NAME,
             &host_kind.to_string(),
         )
@@ -362,7 +438,7 @@ pub fn try_acquire_profile_lock_in(
                     "banto-hub: [WARN] 排他の診断ファイル: {warning}"
                 ));
             }
-            Ok(ProfileLockGuard { guard, dirs })
+            Ok(guard)
         }
         Err(InstanceLockError::AlreadyHeld { owner }) => Err(ProfileLockError::AlreadyHeld {
             profile_id: paths.profile_id.clone(),
