@@ -232,11 +232,14 @@ interface write {
   // value は Hub が bool / float / bytes の 3 つだけで渡す（int / uint は使わない）。
   // 整数型への丸めと範囲の検査はプラグイン側（banto-plc-write の encode と同じ規則）
   record write-item { spec: tag-spec, value: value }
-  record planned-write { step: step, covers: list<u32> }   // covers = items の添字
-  encode: func(conn: borrow<connection>, items: list<write-item>) -> result<list<planned-write>, fatal-error>;
-  // items は encode に渡したものと同じ
-  check: func(conn: borrow<connection>, p: planned-write, items: list<write-item>, response: list<u8>)
-    -> result<list<result<_, item-error>>, fatal-error>;
+  record planned-write { step: step, covers: list<u32> }   // covers = この step が関わる items の添字（ログ・監査用）
+  variant write-progress { send(planned-write), done(list<result<_, item-error>>) }
+  // 書き込みは状態機械（api-design §4.2.1、2026-10-19 レビュー指摘で encode / check から変更）。
+  // 1 回の論理書き込みにつき、最初は prev-response = none、以降は直前の step の応答。items はその間ずっと同じ。
+  // ワード内ビットの RMW（今の値を読む → 書き戻す → 確認読み）を、読んだ値に応じた書き戻しのフレームで表すため。
+  // done までホストは同じ接続に他の要求を挟まない。step 数には上限があり、超えたら致命。
+  write-next: func(conn: borrow<connection>, items: list<write-item>, prev-response: option<list<u8>>)
+    -> result<write-progress, fatal-error>;
 }
 
 interface address {
