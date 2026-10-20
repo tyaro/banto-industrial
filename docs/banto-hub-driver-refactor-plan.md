@@ -1,7 +1,7 @@
 # banto-hub ドライバ基盤の改造計画
 
 作成日: 2026-10-19
-状態: **計画（2026-10-19 オーナー決定の方針）・未着手**。段の順番・受け皿の範囲・シリアル対応は決定済み。最初の対象は手元にある MELSEC と Modbus（§7 Q1）。Q3（crates.io に公開する）・Q4（シリアルは COM ポート直結とシリアル - Ethernet 変換器）も決定済み。Q2（ドライバの置き場所: R1〜R2b は本リポジトリ、API の公開後は公式ドライバを別リポジトリへ）も決定済み。§7 の Q1〜Q4 の大方針は決まっており、最初のシリアルドライバ（Modbus RTU が候補）や COM ポートの扱いの詳細は R2b 以降で詰める。 2026-10-19: §8 に P0 の作業指示、付録 A に P0-2 の棚卸しの結果を追加（P0-2 は完了）。SLMP の分割受信は `tyaro/slmp` v0.2.1 で解消（§6・§8.3）。同日、R1 の詳細設計 [banto-driver-api-design.md](banto-driver-api-design.md) に合わせて §4 の R1-1・R1-3〜R1-7 の文言を直し、R2b-0（旧 R1-7b）を足した。
+状態: **計画（2026-10-19 オーナー決定の方針）・P0-2・P0-3 完了、他は未着手**。段の順番・受け皿の範囲・シリアル対応は決定済み。最初の対象は手元にある MELSEC と Modbus（§7 Q1）。Q3（crates.io に公開する）・Q4（シリアルは COM ポート直結とシリアル - Ethernet 変換器）も決定済み。Q2（ドライバの置き場所: R1〜R2b は本リポジトリ、API の公開後は公式ドライバを別リポジトリへ）も決定済み。§7 の Q1〜Q4 の大方針は決まっており、最初のシリアルドライバ（Modbus RTU が候補）や COM ポートの扱いの詳細は R2b 以降で詰める。 2026-10-19: §8 に P0 の作業指示、付録 A に P0-2 の棚卸しの結果を追加（P0-2 は完了）。SLMP の分割受信は `tyaro/slmp` v0.2.1 で解消（§6・§8.3）。2026-10-20: P0-3 完了（振る舞いを固定するテスト 6 件とシミュレータの新モードを足し、§8.3 に対応表を載せた）。同日、R1 の詳細設計 [banto-driver-api-design.md](banto-driver-api-design.md) に合わせて §4 の R1-1・R1-3〜R1-7 の文言を直し、R2b-0（旧 R1-7b）を足した。
 対象: banto-hub（と ChronoGazer）のドライバまわりの構造を、**ドライバを 100 種類規模で増やせる形**に組み替える。WASM プラグインは**受け皿だけ先に作り、WASM 本体は後回し**にする。
 関連: [banto-driver-api-design.md](banto-driver-api-design.md)（R1 の詳細設計: 型・trait・レジストリ・PR の分け方）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)（WASM プラグインの設計。§12 が本計画の元になった構成案）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §9.5（外部 DB の取り込み口 `push`）、[tag-server-design.md](tag-server-design.md) §3.4 / §3.4.1（今のドライバの置き場所）。
 
@@ -196,6 +196,37 @@ external-db-design §9.5 の形で作る。
 **確かめ方**: `cargo test -p banto-plc -p banto-collect`、`cargo clippy -p banto-plc -p banto-collect --all-targets -- -D warnings`。シミュレータに足すモードは既存のテストの振る舞いを変えない（既定は今のまま）。
 
 **完了条件**: 上の 6 つのテストが通り、付録 A のどの振る舞いがどのテストで固定されているかの対応表を本書に足す。
+
+**完了（2026-10-20）**: 上の 6 つのテストを足した。シミュレータの新しいモードはすべて既定で OFF（`Simulator::set_response_chunking` は Modbus・SLMP の両方、`hold_next_response`・`set_wrong_transaction_id` は Modbus）で、既存のテストの振る舞いは変わらない。本番コードの変更はなく、テストが本物の不具合を見つけることもなかった。行番号は目安で、R2b の各 PR は着手時に再確認する。
+
+**対応表（振る舞い → 固定しているテスト）**:
+
+足した 6 件（`crates/banto-plc/src/` は略して `plc/`）:
+
+| #   | 振る舞い                                                                             | テスト（ファイル:行）                                                                                                                                                                                                                                                    |
+| --- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | Modbus: 分割して届いた応答を 1 つの応答として読む                                    | `a_response_split_across_segments_is_read_as_one_response`（`plc/modbus/integration_tests.rs:323`。1・3・7・8 バイトずつ、各 2 回）                                                                                                                                      |
+| 2a  | Modbus: 遅れて届いた古い応答を次の要求の値に使わない                                 | `a_late_response_after_a_timeout_is_never_returned_as_a_later_value`（同 `:376`、クライアント。次は致命の `NotConnected`、再接続後は新しい値）／`a_late_response_on_a_reused_stream_is_a_fatal_protocol_error`（同 `:408`、同じ stream を使い続けると致命の `Protocol`） |
+| 2b  | Modbus: トランザクション ID の違う応答は致命エラー                                   | `a_response_with_the_wrong_transaction_id_is_fatal`（同 `:458`）                                                                                                                                                                                                         |
+| 3   | Modbus: 閉じたポートへの接続は失敗し、ハングせず `NotConnected` のまま               | `connect_to_a_closed_port_fails_without_hanging`（同 `:485`）                                                                                                                                                                                                            |
+| 4   | Modbus: 型の混ざった一括読み取り。文字列は今どおり `Bad`（`UnsupportedCombination`） | `read_batch_mixed_reads_numerics_and_keeps_strings_bad`（同 `:520`。`plan_batch_requests` + `execute_modbus_reads` を実ソケットで）                                                                                                                                      |
+| 5   | 収集単体で 1 接続 = 1 ソケット                                                       | `collection_over_several_periods_uses_exactly_one_socket`（`crates/banto-collect/tests/integration.rs:1595`。値が Good で読めたうえで、数周期後も `connection_count() == 1`）                                                                                            |
+| 6   | SLMP: 分割して届いた応答を 1 つの応答として読む（`slmp` v0.2.1）                     | `a_response_split_across_segments_is_read_as_one_response`（`plc/slmp/integration_tests.rs:1163`。1・5・13 バイトずつ、各 2 回）                                                                                                                                         |
+
+既にあった振る舞い（付録 A の調査結果の範囲）:
+
+| 振る舞い                                | テスト（ファイル:行）                                                                                                                                                                                                           |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 応答タイムアウトで接続を壊す            | Modbus `plc/modbus/integration_tests.rs:173`、SLMP `plc/slmp/integration_tests.rs:554`                                                                                                                                          |
+| 途中切断で接続を壊す                    | Modbus `plc/modbus/integration_tests.rs:194`、SLMP `plc/slmp/integration_tests.rs:583`                                                                                                                                          |
+| 再接続（クライアント単体）              | Modbus `plc/modbus/integration_tests.rs:230`、SLMP `plc/slmp/integration_tests.rs:651`・`:678`                                                                                                                                  |
+| 再接続と値の復帰（収集）                | `crates/banto-collect/tests/integration.rs:646`（Modbus、切断中は NULL 行）・`:734`（Modbus、復帰）・`:867`・`:956`（SLMP 同様）                                                                                                |
+| バックオフ                              | `crates/banto-collect/src/task.rs:1273`・`:1278`・`:1287`・`:1299`、`crates/banto-broker/src/lib.rs:1437`・`:1442`・`:1452`                                                                                                     |
+| 致命 / 非致命の分類                     | `plc/error.rs:166`・`:199`、SLMP `plc/slmp/mod.rs:847`・`:891`、SLMP `plc/slmp/integration_tests.rs:384`（終了コードは非致命）・`:456`（壊れたフレームは致命）、Modbus `plc/modbus/integration_tests.rs:97`（例外応答は非致命） |
+| #337 の 1 接続 = 1 ソケット（Hub 経由） | `apps/banto-hub/core/tests/integration.rs:1155`                                                                                                                                                                                 |
+| ワード順（#334）                        | `plc/decode.rs:215`〜`:301`、SLMP `plc/slmp/integration_tests.rs:139`、収集の経路 `crates/banto-collect/tests/integration.rs:386`、`crates/banto-collect/src/task.rs:2013`〜`:2031`                                             |
+| 文字列のエンコーディング                | `plc/decode.rs:529`〜`:589`、SLMP `plc/slmp/integration_tests.rs:1015`（UTF-8）・`:1057`（同じバイト列を Shift-JIS で読むと別の文字列）                                                                                         |
+| ビットアドレス                          | Modbus `plc/modbus/integration_tests.rs:42`（コイル・ディスクリート入力）、SLMP `plc/slmp/integration_tests.rs:87`・`:113`（ワード内ビット）、`plc/decode.rs:389`〜`:418`、収集 `crates/banto-collect/tests/integration.rs:533` |
 
 ## 付録 A. プロトコル名の分岐の棚卸し（2026-10-19、P0-2）
 

@@ -1151,3 +1151,65 @@ async fn a_mixed_batch_decodes_each_string_request_independently() {
         "UTF-8 span decodes correctly in the same batch"
     );
 }
+
+// --- split responses (P0-3 #6, docs/banto-hub-driver-refactor-plan.md §8.3) -----
+
+/// P0-3 #6: a response that reaches the client in several TCP segments - split
+/// inside the 13-byte header, across the header/body boundary, and one byte at
+/// a time - is still read as one response with the right values, and the
+/// connection stays usable afterwards (no stray bytes left in the stream).
+/// Needs `slmp` >= 0.2.1 (0.2.0 answered `LengthMismatch` for a split frame).
+#[tokio::test]
+async fn a_response_split_across_segments_is_read_as_one_response() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 0, 42);
+    sim.set_word(SlmpDevice::D, 1, 0xFFFF);
+    sim.set_words(SlmpDevice::D, 2, &[0x0002, 0x0001]);
+    sim.set_bit(SlmpDevice::M, 0, true);
+
+    let mut client = SlmpClient::new(SlmpConfig {
+        // The whole split response must fit inside the timeout, with a wide
+        // margin: 1-byte chunks x ~25 bytes x 2ms is ~50ms.
+        response_timeout: Duration::from_secs(5),
+        ..fast_config(&sim)
+    });
+    client.connect().await.expect("connect");
+
+    let requests = [
+        req("D0", DataType::U16),
+        req("D1", DataType::I16),
+        req("D2", DataType::U32),
+        req("M0", DataType::Bit),
+    ];
+    for chunk in [1usize, 5, 13] {
+        sim.set_response_chunking(Some((chunk, Duration::from_millis(2))));
+        // Twice per chunk size: the second read proves the stream is still
+        // aligned to a request boundary after a split response.
+        for _ in 0..2 {
+            let results = client
+                .read_batch(&requests)
+                .await
+                .unwrap_or_else(|e| panic!("chunk={chunk}: read_batch failed: {e:?}"));
+            assert_eq!(
+                results[0],
+                ReadResult::Value(TagValue::F64(42.0)),
+                "chunk={chunk}"
+            );
+            assert_eq!(
+                results[1],
+                ReadResult::Value(TagValue::F64(-1.0)),
+                "chunk={chunk}"
+            );
+            assert_eq!(
+                results[2],
+                ReadResult::Value(TagValue::F64(0x0001_0002_u32 as f64)),
+                "chunk={chunk}"
+            );
+            assert_eq!(
+                results[3],
+                ReadResult::Value(TagValue::Bit(true)),
+                "chunk={chunk}"
+            );
+        }
+    }
+}
