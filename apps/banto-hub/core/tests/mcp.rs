@@ -2530,6 +2530,48 @@ async fn create_group_under_a_postgres_connection_requires_query_sql() {
     assert_eq!(payload["created"]["querySql"], json!("SELECT a FROM v1"));
 }
 
+/// 2026-10-19 オーナー決定（migration 0022）: グループ名は接続内で一意。
+/// MCP の `create_group` で別の接続の下に同じ名前を作れ、同じ接続の下では
+/// `name` の項目エラーとして返る（`isError: true`、文言にスコープが出る）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_group_name_is_unique_per_connection() {
+    let app = test_app("group-name-per-connection").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_a = create_test_connection(&app, "line-a", 15111).await;
+    let conn_b = create_test_connection(&app, "line-b", 15112).await;
+
+    for conn_id in [conn_a, conn_b] {
+        let (status, body) = mcp_post(
+            &app.router,
+            Some(&admin_key),
+            tools_call(
+                "create_group",
+                json!({ "name": "fast", "plcConnectionId": conn_id, "periodMs": 1000 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+    }
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_group",
+            json!({ "name": "fast", "plcConnectionId": conn_a, "periodMs": 1000 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("name") && text.contains("この接続内では既に使用されています"),
+        "{text}"
+    );
+}
+
 /// Copilot 指摘（PR #268）の回帰防止:`update_group`版。`enabled`を省いた
 /// 入力が`missing_fields`で拒否され、対象行が一切変化しないことを確認
 /// する（[`update_connection_missing_field_is_rejected_and_row_unchanged`]

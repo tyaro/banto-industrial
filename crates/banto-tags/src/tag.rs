@@ -1259,8 +1259,9 @@ const FK_MESSAGE: &str = "指定された収集グループが見つかりませ
 /// `{connection}.{group}.{tag}` の合成（`banto-hub-core::hub::build_catalog_from`）
 /// であり末端のタグ名まで全体一意にする必要はなく、同型装置を複数台つないで
 /// 同じ PLC アドレス（＝同じタグ名）を使う構成を許すための変更 - よって
-/// `crate::support::NAME_ALREADY_USED`（`plc_connections`/`collection_groups`
-/// 用、今も全体一意）とは異なる、スコープを明示した文言にする。
+/// `crate::support::NAME_ALREADY_USED`（`plc_connections` 用、今も全体一意）
+/// とは異なる、スコープを明示した文言にする（`collection_groups` も 0022 で
+/// 接続内一意になり、同じ形の文言を持つ - 2026-10-19 オーナー決定）。
 const NAME_ALREADY_USED_IN_GROUP: &str = "この収集グループ内では既に使用されています";
 
 /// Shared by [`TagService::create`] and [`TagService::create_batch`] (T11-1)
