@@ -492,9 +492,11 @@ pub struct TagMap {
     /// tag name (design's own hub.rs sketch: "catalog の安定順(connection,
     /// group, tag の名前順)"). Each external name appears **once**.
     ///
-    /// `collection_groups.name`/`plc_connections.name` are each globally
-    /// `UNIQUE`, and `tags.name` is `UNIQUE(collection_group_id, name)`
-    /// (migration 0011), but names may contain `.`, so two different
+    /// `plc_connections.name` is globally `UNIQUE`,
+    /// `collection_groups.name` is `UNIQUE(plc_connection_id, name)`
+    /// (migration 0022, 2026-10-19) and `tags.name` is
+    /// `UNIQUE(collection_group_id, name)` (migration 0011), so the triple
+    /// `(connection, group, tag)` is unique; but names may contain `.`, so two different
     /// `(connection, group, tag)` triples can still join to the same
     /// external name (`a.b`/`c`/`d` and `a`/`b.c`/`d` are both `a.b.c.d`,
     /// #635). Since 2026-10-17 the registry writes reject a write that
@@ -3180,8 +3182,8 @@ mod tests {
     /// 緩和」の回帰防止: `tags.name` が2つのグループで重複していても、
     /// `external_name` は `{connection}.{group}.{tag}` の合成のまま従来どおり
     /// 組み立てられ、かつグループをまたいで衝突しないこと -
-    /// 「`collection_groups.name`/`plc_connections.name` は今もグローバルに
-    /// `UNIQUE` だから、同じタグ名でもグループが違えば外部名は衝突しない」
+    /// 「`plc_connections.name` はグローバルに `UNIQUE`、グループ名は接続内で
+    /// `UNIQUE`（0022）だから、同じタグ名でもグループが違えば外部名は衝突しない」
     /// ことを、実際に `build_catalog_from` を通して確かめる（名前にドットを
     /// 含むときの重なりは #635、`build_catalog_from_detects_an_existing_dotted_name_collision`）。
     /// DB を経由しない純粋関数テスト
@@ -3351,6 +3353,24 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// 2026-10-19 オーナー決定（migration 0022、グループ名は接続内で一意）の
+    /// 回帰防止: 2 つの接続がどちらも「fast」グループを持ち、その下に同じ名前の
+    /// タグがあっても、外部名は接続名で分かれ、重なり（#635）として数えない。
+    #[test]
+    fn build_catalog_from_keeps_same_named_groups_under_two_connections_apart() {
+        let snapshot = named_snapshot(
+            &[(1, "line1"), (2, "line2")],
+            &[(10, 1, "fast"), (20, 2, "fast")],
+            &[(100, 10, "D100"), (200, 20, "D100")],
+        );
+        let map = build_catalog_from(&snapshot).expect("build_catalog_from");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("line1.fast.D100").expect("line1").ids, (1, 10, 100));
+        assert_eq!(map.get("line2.fast.D100").expect("line2").ids, (2, 20, 200));
+        assert!(map.collisions().is_empty());
+        assert!(external_name_collisions(&snapshot).is_empty());
     }
 
     /// #635: 接続「a.b」/グループ「c」/タグ「d」と 接続「a」/グループ「b.c」/タグ「d」は

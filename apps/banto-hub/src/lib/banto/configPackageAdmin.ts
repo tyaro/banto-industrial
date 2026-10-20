@@ -27,6 +27,10 @@ import {
 } from './sinkGroupsAdmin';
 import {
 	buildConfigPackage,
+	configPackageGroupKey,
+	configPackageTagKey,
+	describeConfigPackageTagRef,
+	planByKey,
 	planByName,
 	serializeConfigPackage,
 	type ConfigPackage,
@@ -64,12 +68,52 @@ function buildConnectionMap(connections: readonly PlcConnection[]): Map<string, 
 	return new Map(connections.map((connection) => [connection.name, connection]));
 }
 
-function buildGroupMap(groups: readonly CollectionGroup[]): Map<string, CollectionGroup> {
-	return new Map(groups.map((group) => [group.name, group]));
+/**
+ * 版 2（2026-10-19 オーナー決定: グループ名は接続内で一意）: 現在の環境の
+ * グループ・タグを、パッケージと同じキー（`configPackageGroupKey`/
+ * `configPackageTagKey`）で引けるようにする。接続名・グループ名は id から
+ * 引く。引けない行（孤児）はキーを持たない（`undefined`）。
+ */
+interface RegistryKeys {
+	groupKey(group: CollectionGroup): string | undefined;
+	tagKey(tag: Tag): string | undefined;
 }
 
-function buildTagMap(tags: readonly Tag[]): Map<string, Tag> {
-	return new Map(tags.map((tag) => [tag.name, tag]));
+function registryKeys(
+	connections: readonly PlcConnection[],
+	groups: readonly CollectionGroup[]
+): RegistryKeys {
+	const connectionNameById = new Map(connections.map((c) => [c.id, c.name]));
+	const groupById = new Map(groups.map((g) => [g.id, g]));
+	const groupKey = (group: CollectionGroup): string | undefined => {
+		const connectionName = connectionNameById.get(group.plcConnectionId);
+		return connectionName === undefined
+			? undefined
+			: configPackageGroupKey(connectionName, group.name);
+	};
+	return {
+		groupKey,
+		tagKey(tag: Tag): string | undefined {
+			const group = groupById.get(tag.collectionGroupId);
+			if (!group) return undefined;
+			const connectionName = connectionNameById.get(group.plcConnectionId);
+			return connectionName === undefined
+				? undefined
+				: configPackageTagKey(connectionName, group.name, tag.name);
+		}
+	};
+}
+
+function buildKeyedMap<T>(
+	items: readonly T[],
+	key: (item: T) => string | undefined
+): Map<string, T> {
+	const map = new Map<string, T>();
+	for (const item of items) {
+		const k = key(item);
+		if (k !== undefined) map.set(k, item);
+	}
+	return map;
 }
 
 /** S6: `sinkGroups`の plan/apply 用（`buildConnectionMap`等と同じ形）。 */
@@ -88,12 +132,36 @@ function collectConnectionNames(
 	return names;
 }
 
-function collectGroupNames(current: readonly CollectionGroup[], pkg: ConfigPackage): Set<string> {
-	const names = new Set(current.map((group) => group.name));
-	for (const group of pkg.collectionGroups) {
-		names.add(group.name);
+function collectGroupKeys(
+	current: readonly CollectionGroup[],
+	keys: RegistryKeys,
+	pkg: ConfigPackage
+): Set<string> {
+	const result = new Set<string>();
+	for (const group of current) {
+		const key = keys.groupKey(group);
+		if (key !== undefined) result.add(key);
 	}
-	return names;
+	for (const group of pkg.collectionGroups) {
+		result.add(configPackageGroupKey(group.plcConnectionName, group.name));
+	}
+	return result;
+}
+
+function collectTagKeys(
+	current: readonly Tag[],
+	keys: RegistryKeys,
+	pkg: ConfigPackage
+): Set<string> {
+	const result = new Set<string>();
+	for (const tag of current) {
+		const key = keys.tagKey(tag);
+		if (key !== undefined) result.add(key);
+	}
+	for (const tag of pkg.tags) {
+		result.add(configPackageTagKey(tag.plcConnectionName, tag.collectionGroupName, tag.name));
+	}
+	return result;
 }
 
 function resolveMqttCredentials(
@@ -176,14 +244,27 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 		getGrpcSettings()
 	]);
 
+	const keys = registryKeys(currentConnections, currentGroups);
 	const currentConnectionNames = collectConnectionNames(currentConnections, pkg);
-	const currentGroupNames = collectGroupNames(currentGroups, pkg);
+	const currentGroupKeys = collectGroupKeys(currentGroups, keys, pkg);
 	const connectionPlans = planByName(
 		pkg.plcConnections,
 		currentConnections.filter((connection: PlcConnection) => !isVirtualConnection(connection))
 	);
-	const groupPlans = planByName(pkg.collectionGroups, currentGroups);
-	const tagPlans = planByName(pkg.tags, currentTags);
+	// 版 2: グループは (接続名, グループ名)、タグは (接続名, グループ名, タグ名) で
+	// 突き合わせる（グループ名は接続内でのみ一意 - 2026-10-19 オーナー決定）。
+	const groupPlans = planByKey(
+		pkg.collectionGroups,
+		currentGroups,
+		(group) => configPackageGroupKey(group.plcConnectionName, group.name),
+		keys.groupKey
+	);
+	const tagPlans = planByKey(
+		pkg.tags,
+		currentTags,
+		(tag) => configPackageTagKey(tag.plcConnectionName, tag.collectionGroupName, tag.name),
+		keys.tagKey
+	);
 	const sinkGroupPlans = planByName(pkg.sinkGroups, currentSinkGroups);
 	const warnings: string[] = [];
 
@@ -195,27 +276,32 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 		}
 	}
 	for (const tag of pkg.tags) {
-		if (!currentGroupNames.has(tag.collectionGroupName)) {
+		if (
+			!currentGroupKeys.has(configPackageGroupKey(tag.plcConnectionName, tag.collectionGroupName))
+		) {
 			warnings.push(
-				`tag '${tag.name}' の group '${tag.collectionGroupName}' は現在の環境で見つかりません`
+				`tag '${tag.name}' の接続 '${tag.plcConnectionName}' のグループ '${tag.collectionGroupName}' は現在の環境で見つかりません`
 			);
 		}
 	}
-	// S6: sink group が参照する接続・タグ名が現在の環境に存在するか
+	// S6: sink group が参照する接続・タグが現在の環境に存在するか
 	// （このパッケージ内で作成される予定のものも許容 - `currentConnectionNames`
 	// は`collectConnectionNames`がパッケージ内の名前も既に足し込んでいる）。
-	const currentTagNames = new Set(currentTags.map((tag) => tag.name));
-	for (const tag of pkg.tags) currentTagNames.add(tag.name);
+	const currentTagKeys = collectTagKeys(currentTags, keys, pkg);
 	for (const sinkGroup of pkg.sinkGroups) {
 		if (!currentConnectionNames.has(sinkGroup.dbConnectionName)) {
 			warnings.push(
 				`sink group '${sinkGroup.name}' の接続 '${sinkGroup.dbConnectionName}' は現在の環境で見つかりません`
 			);
 		}
-		for (const tagName of sinkGroup.tagNames) {
-			if (!currentTagNames.has(tagName)) {
+		for (const ref of sinkGroup.tags) {
+			if (
+				!currentTagKeys.has(
+					configPackageTagKey(ref.plcConnectionName, ref.collectionGroupName, ref.tagName)
+				)
+			) {
 				warnings.push(
-					`sink group '${sinkGroup.name}' のタグ '${tagName}' は現在の環境で見つかりません`
+					`sink group '${sinkGroup.name}' のタグ '${describeConfigPackageTagRef(ref)}' は現在の環境で見つかりません`
 				);
 			}
 		}
@@ -306,7 +392,23 @@ async function applyConfigPackageInner(
 		}
 	}
 
-	const groupByName = buildGroupMap(currentGroups);
+	// 版 2: 現在の環境のグループ・タグをパッケージと同じキーで引く。接続名は
+	// 取り込みで変わらない（接続は名前で突き合わせる）ので、取り込み前の
+	// 接続一覧から引いた名前のままでよい。
+	const keys = registryKeys(currentConnections, currentGroups);
+	const groupPlan = planByKey(
+		pkg.collectionGroups,
+		currentGroups,
+		(group) => configPackageGroupKey(group.plcConnectionName, group.name),
+		keys.groupKey
+	);
+	const tagPlan = planByKey(
+		pkg.tags,
+		currentTags,
+		(tag) => configPackageTagKey(tag.plcConnectionName, tag.collectionGroupName, tag.name),
+		keys.tagKey
+	);
+	const groupByKey = buildKeyedMap(currentGroups, keys.groupKey);
 	for (const group of pkg.collectionGroups) {
 		const connection = connectionByName.get(group.plcConnectionName);
 		if (!connection) {
@@ -328,22 +430,25 @@ async function applyConfigPackageInner(
 			// 「pkg の値をそのまま転記する」扱い。
 			querySql: group.querySql
 		};
-		const existing = groupByName.get(group.name);
+		const groupKey = configPackageGroupKey(group.plcConnectionName, group.name);
+		const existing = groupByKey.get(groupKey);
 		if (existing) {
 			const updated = await updateCollectionGroup(existing.id, input);
-			groupByName.set(updated.name, updated);
+			groupByKey.set(groupKey, updated);
 		} else {
 			const created = await createCollectionGroup(input);
-			groupByName.set(created.name, created);
+			groupByKey.set(groupKey, created);
 		}
 	}
 
-	const tagByName = buildTagMap(currentTags);
+	const tagByKey = buildKeyedMap(currentTags, keys.tagKey);
 	for (const tag of pkg.tags) {
-		const group = groupByName.get(tag.collectionGroupName);
+		const group = groupByKey.get(
+			configPackageGroupKey(tag.plcConnectionName, tag.collectionGroupName)
+		);
 		if (!group) {
 			warnings.push(
-				`tag '${tag.name}' の group '${tag.collectionGroupName}' を解決できませんでした`
+				`tag '${tag.name}' の接続 '${tag.plcConnectionName}' のグループ '${tag.collectionGroupName}' を解決できませんでした`
 			);
 			continue;
 		}
@@ -366,22 +471,23 @@ async function applyConfigPackageInner(
 			expression: tag.expression,
 			retain: tag.retain
 		};
-		const existing = tagByName.get(tag.name);
+		const tagKey = configPackageTagKey(tag.plcConnectionName, tag.collectionGroupName, tag.name);
+		const existing = tagByKey.get(tagKey);
 		if (existing) {
 			const updated = await updateTag(existing.id, {
 				...input,
 				expectedRevision: existing.revision
 			});
-			tagByName.set(updated.name, updated);
+			tagByKey.set(tagKey, updated);
 		} else {
 			const created = await createTag(input);
-			tagByName.set(created.name, created);
+			tagByKey.set(tagKey, created);
 		}
 	}
 
 	// S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group
 	// はタグ・接続の両方を参照するため、上の両ループ（`connectionByName`/
-	// `tagByName`が最新化済み）の**後**に適用する - `collectionGroups`が
+	// `tagByKey`が最新化済み）の**後**に適用する - `collectionGroups`が
 	// `connectionByName`の後に来るのと同じ順序の理由。
 	const sinkGroupByName = buildSinkGroupMap(currentSinkGroups);
 	for (const sinkGroup of pkg.sinkGroups) {
@@ -394,10 +500,14 @@ async function applyConfigPackageInner(
 		}
 		const tagIds: number[] = [];
 		let missingTag = false;
-		for (const tagName of sinkGroup.tagNames) {
-			const tag = tagByName.get(tagName);
+		for (const ref of sinkGroup.tags) {
+			const tag = tagByKey.get(
+				configPackageTagKey(ref.plcConnectionName, ref.collectionGroupName, ref.tagName)
+			);
 			if (!tag) {
-				warnings.push(`sink group '${sinkGroup.name}' のタグ '${tagName}' を解決できませんでした`);
+				warnings.push(
+					`sink group '${sinkGroup.name}' のタグ '${describeConfigPackageTagRef(ref)}' を解決できませんでした`
+				);
 				missingTag = true;
 				continue;
 			}
@@ -454,18 +564,12 @@ async function applyConfigPackageInner(
 				).length
 			},
 			collectionGroups: {
-				create: pkg.collectionGroups.filter(
-					(group) => !currentGroups.some((current) => current.name === group.name)
-				).length,
-				update: pkg.collectionGroups.filter((group) =>
-					currentGroups.some((current) => current.name === group.name)
-				).length
+				create: groupPlan.create.length,
+				update: groupPlan.update.length
 			},
 			tags: {
-				create: pkg.tags.filter((tag) => !currentTags.some((current) => current.name === tag.name))
-					.length,
-				update: pkg.tags.filter((tag) => currentTags.some((current) => current.name === tag.name))
-					.length
+				create: tagPlan.create.length,
+				update: tagPlan.update.length
 			},
 			sinkGroups: {
 				create: pkg.sinkGroups.filter(

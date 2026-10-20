@@ -1,7 +1,7 @@
 # banto-hub MCP リファレンス（MES / ゲートウェイ実装者向け）
 
 作成日: 2026-09-05
-状態: **現行**。2026-10-14（#605）: 接続ツールに `cpuType`（`Q` / `R`、省略時の作成は R、`update_connection` の省略は既存を保つ）。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
+状態: **現行**。2026-10-19: §2 の「グループ名は全体で一意」を「接続内で一意」に直した（banto-tags migration 0022、オーナー決定。`create_group`/`update_group` の重複は `name` の項目エラー「この接続内では既に使用されています」）。2026-10-14（#605）: 接続ツールに `cpuType`（`Q` / `R`、省略時の作成は R、`update_connection` の省略は既存を保つ）。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
 2026-10-09 に #533 で `create_tag` / `update_tag` からしきい値（`thresholdH`〜`thresholdLl`）を外した（§6。値付きで送ると入力エラー、`update_tag` の必須項目からも外した）。
 2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み、2026-09-06 に T21
 管理面を含む 31 ツール全数を実機で end-to-end 検証済み（結果は §9）。2026-09-06 に外部 DB 連携（[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5.2）で `test_saved_connection`（32 ツール目）・接続の `database`/`username`/`password`・グループの `querySql`・`db` tag_kind を同期。S4 で Sink グループ管理の 5 ツール追加で 37 ツール、2026-09-15 の `check_expression`（#342 段階A）で **38 ツール**となる。構成補助（管理面）ツールは §6。
@@ -44,7 +44,9 @@ API キーは発行時に**スコープの明示列挙**を持つ（`banto_hub_c
 | `read:{connection}.{group}.*`      | グループ単位の読み取り                                     |
 | `write:{connection}.{group}.{tag}` | 単一タグの書き込み（**ワイルドカード不可・明示列挙のみ**） |
 
-- 外部名は常に `{connection}.{group}.{tag}` の3セグメント。**グループ名は全体で一意**。
+- 外部名は常に `{connection}.{group}.{tag}` の3セグメント。接続名は全体で一意、**グループ名は接続内で一意**
+  （2026-10-19 オーナー決定。別の接続には同じ名前のグループを置ける）、タグ名はグループ内で一意なので、
+  外部名は全体で一意。
 - write スコープにワイルドカードは使えない（レシピで複数タグへ書くなら、その全タグを
   個別に列挙する）。
 

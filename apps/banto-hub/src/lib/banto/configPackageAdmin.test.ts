@@ -21,6 +21,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ConfigPackage } from './configPackage';
 import { parseConfigPackage } from './configPackage';
+import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
 
 // `vi.mock` ファクトリはファイル先頭に hoist されるため、参照するクラスは
 // `vi.hoisted` で一緒に巻き上げる必要がある（通常の top-level const/class
@@ -96,7 +97,7 @@ import {
 } from './configPackageAdmin';
 
 const pkg: ConfigPackage = {
-	schemaVersion: 1,
+	schemaVersion: 2,
 	product: 'banto-hub',
 	exportedAt: '2026-08-12T00:00:00.000Z',
 	excludedSecrets: [],
@@ -125,6 +126,7 @@ const pkg: ConfigPackage = {
 	tags: [
 		{
 			name: 'tag1',
+			plcConnectionName: 'plc1',
 			collectionGroupName: 'group1',
 			address: 'D3000',
 			dataType: 'i16',
@@ -166,6 +168,60 @@ const currentMqtt = {
 	qos: 1 as const,
 	minIntervalMs: 1000
 };
+
+function plcConnection(id: number, name: string): PlcConnection {
+	return {
+		id,
+		name,
+		protocol: 'modbus-tcp',
+		host: '192.168.11.200',
+		port: 502,
+		unitId: 1,
+		enabled: true,
+		simulation: false,
+		wordOrder: 'low_high',
+		cpuType: 'R',
+		database: null,
+		username: null,
+		passwordSet: false
+	};
+}
+
+function collectionGroup(id: number, name: string, plcConnectionId: number): CollectionGroup {
+	return {
+		id,
+		name,
+		plcConnectionId,
+		periodMs: 1000,
+		enabled: true,
+		defaultWritable: true,
+		querySql: null
+	};
+}
+
+function registryTag(id: number, name: string, collectionGroupId: number): Tag {
+	return {
+		id,
+		name,
+		collectionGroupId,
+		address: 'D3000',
+		dataType: 'i16',
+		stringLength: null,
+		stringEncoding: 'utf8',
+		rawLo: null,
+		rawHi: null,
+		engLo: null,
+		engHi: null,
+		unit: null,
+		decimals: 0,
+		enabled: true,
+		writable: false,
+		tagKind: 'plc',
+		expression: null,
+		retain: false,
+		revision: 3
+	};
+}
 
 beforeEach(() => {
 	vi.mocked(listPlcConnections).mockReset().mockResolvedValue([]);
@@ -718,12 +774,16 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 				tableName: 'public.tag_history',
 				storeBad: false,
 				enabled: true,
-				tagNames: ['temp01']
+				tags: [{ plcConnectionName: 'plc1', collectionGroupName: 'group1', tagName: 'temp01' }]
 			}
 		]
 	};
 
+	// 版 2: sink のタグ参照は (接続名, グループ名, タグ名) で引くので、既存の
+	// タグの所属グループ・接続も現在の環境に置く。
 	function seedPgConnectionAndTag(): void {
+		vi.mocked(listPlcConnections).mockResolvedValue([plcConnection(2, 'plc1')]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([collectionGroup(1, 'group1', 2)]);
 		vi.mocked(createPlcConnection).mockResolvedValue({
 			id: 1,
 			name: 'pg1',
@@ -887,7 +947,9 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 				{
 					...pkgWithSinkGroup.sinkGroups[0],
 					dbConnectionName: 'no-such-connection',
-					tagNames: ['no-such-tag']
+					tags: [
+						{ plcConnectionName: 'plc1', collectionGroupName: 'group1', tagName: 'no-such-tag' }
+					]
 				}
 			]
 		};
@@ -899,7 +961,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 	});
 });
 
-describe('applyConfigPackage: cpuType を持たない旧パッケージ（#605）', () => {
+describe('applyConfigPackage: cpuType は必須（#605、版 2）', () => {
 	const slmpConn = {
 		id: 7,
 		name: 'plcq',
@@ -916,44 +978,239 @@ describe('applyConfigPackage: cpuType を持たない旧パッケージ（#605�
 		passwordSet: false
 	};
 
-	function legacyPackage(name: string): ConfigPackage {
-		const legacy = {
-			...pkg,
-			plcConnections: [
-				{
-					name,
-					protocol: 'slmp',
-					host: '10.0.0.8',
-					port: 5007,
-					unitId: 0,
-					enabled: true,
-					simulation: false,
-					wordOrder: 'low_high'
-				}
-			],
-			collectionGroups: [],
-			tags: []
+	function slmpPackage(name: string, cpuType?: string): string {
+		const connection: Record<string, unknown> = {
+			name,
+			protocol: 'slmp',
+			host: '10.0.0.8',
+			port: 5007,
+			unitId: 0,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high'
 		};
-		return parseConfigPackage(JSON.stringify(legacy));
+		if (cpuType !== undefined) connection.cpuType = cpuType;
+		return JSON.stringify({ ...pkg, plcConnections: [connection], collectionGroups: [], tags: [] });
 	}
 
-	it('既存の Q 接続の更新に cpuType を載せない（サーバーが既存の Q を保つ）', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([slmpConn]);
-		vi.mocked(updatePlcConnection).mockResolvedValue(slmpConn);
-		await applyConfigPackage(legacyPackage('plcq'));
-		const sent = vi.mocked(updatePlcConnection).mock.calls[0][1];
-		expect(sent.cpuType).toBeUndefined();
+	it('cpuType を持たない接続のパッケージは、取り込む前の読み込みで項目の場所を示して拒否する', () => {
+		expect(() => parseConfigPackage(slmpPackage('plcq'))).toThrow(
+			/plcConnections\[0\]\.cpuType は Q \/ R/
+		);
 	});
 
-	it('新しい接続の作成にも cpuType を載せない（サーバーの既定 R になる）', async () => {
+	it('パッケージの cpuType をそのまま更新に載せる（既存の Q 接続を R に戻さない）', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([slmpConn]);
+		vi.mocked(updatePlcConnection).mockResolvedValue(slmpConn);
+		await applyConfigPackage(parseConfigPackage(slmpPackage('plcq', 'Q')));
+		const sent = vi.mocked(updatePlcConnection).mock.calls[0][1];
+		expect(sent.cpuType).toBe('Q');
+	});
+
+	it('新しい接続の作成にもパッケージの cpuType を載せる', async () => {
 		vi.mocked(createPlcConnection).mockResolvedValue({
 			...slmpConn,
 			id: 8,
 			name: 'plcnew',
 			cpuType: 'R'
 		});
-		await applyConfigPackage(legacyPackage('plcnew'));
+		await applyConfigPackage(parseConfigPackage(slmpPackage('plcnew', 'R')));
 		const sent = vi.mocked(createPlcConnection).mock.calls[0][0];
-		expect(sent.cpuType).toBeUndefined();
+		expect(sent.cpuType).toBe('R');
+	});
+});
+
+// --- 版 2（2026-10-19 オーナー決定: グループ名は接続内で一意）: グループは
+// (接続名, グループ名)、タグは (接続名, グループ名, タグ名) で既存と突き合わせる。
+// 名前だけで突き合わせると、別の接続の同名グループを更新して接続を付け替えたり、
+// 別のグループの同名タグを動かしたりしてしまう。
+
+describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合わせる', () => {
+	const tagTemplate = pkg.tags[0];
+
+	it('2 つの接続の同名グループ・同名タグを別々に扱う（既存は更新、もう一方は作成）', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([
+			plcConnection(1, 'plc1'),
+			plcConnection(2, 'plc2')
+		]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([collectionGroup(10, 'group1', 1)]);
+		vi.mocked(listTags).mockResolvedValue([registryTag(100, 'tag1', 10)]);
+		vi.mocked(updatePlcConnection).mockImplementation(async (id, input) =>
+			plcConnection(id, input.name)
+		);
+		vi.mocked(updateCollectionGroup).mockImplementation(async (id, input) =>
+			collectionGroup(id, input.name, input.plcConnectionId)
+		);
+		vi.mocked(createCollectionGroup).mockImplementation(async (input) =>
+			collectionGroup(20, input.name, input.plcConnectionId)
+		);
+		vi.mocked(updateTag).mockImplementation(async (id, input) =>
+			registryTag(id, input.name, input.collectionGroupId)
+		);
+		vi.mocked(createTag).mockImplementation(async (input) =>
+			registryTag(200, input.name, input.collectionGroupId)
+		);
+
+		const twoLines: ConfigPackage = {
+			...pkg,
+			plcConnections: [
+				{ ...pkg.plcConnections[0], name: 'plc1' },
+				{ ...pkg.plcConnections[0], name: 'plc2' }
+			],
+			collectionGroups: [
+				{ ...pkg.collectionGroups[0], plcConnectionName: 'plc1' },
+				{ ...pkg.collectionGroups[0], plcConnectionName: 'plc2' }
+			],
+			tags: [
+				{ ...tagTemplate, plcConnectionName: 'plc1' },
+				{ ...tagTemplate, plcConnectionName: 'plc2' }
+			]
+		};
+		// パッケージとして妥当（同じ名前でも接続が違えば重複ではない）。
+		expect(() => parseConfigPackage(JSON.stringify(twoLines))).not.toThrow();
+
+		const inspection = await inspectConfigPackage(twoLines);
+		expect(inspection.counts.collectionGroups).toEqual({ create: 1, update: 1 });
+		expect(inspection.counts.tags).toEqual({ create: 1, update: 1 });
+		expect(inspection.warnings).toEqual([]);
+
+		const summary = await applyConfigPackage(twoLines);
+
+		// plc1 の group1 は既存（id 10）を同じ接続のまま更新、plc2 の group1 は新規作成。
+		expect(updateCollectionGroup).toHaveBeenCalledTimes(1);
+		expect(updateCollectionGroup).toHaveBeenCalledWith(
+			10,
+			expect.objectContaining({ name: 'group1', plcConnectionId: 1 })
+		);
+		expect(createCollectionGroup).toHaveBeenCalledTimes(1);
+		expect(createCollectionGroup).toHaveBeenCalledWith(
+			expect.objectContaining({ name: 'group1', plcConnectionId: 2 })
+		);
+		// tag1 も同じ: plc1 側は既存（id 100）を更新、plc2 側は新しいグループ（id 20）に作成。
+		expect(updateTag).toHaveBeenCalledTimes(1);
+		expect(updateTag).toHaveBeenCalledWith(
+			100,
+			expect.objectContaining({ name: 'tag1', collectionGroupId: 10, expectedRevision: 3 })
+		);
+		expect(createTag).toHaveBeenCalledTimes(1);
+		expect(createTag).toHaveBeenCalledWith(
+			expect.objectContaining({ name: 'tag1', collectionGroupId: 20 })
+		);
+		expect(summary.counts.collectionGroups).toEqual({ create: 1, update: 1 });
+		expect(summary.counts.tags).toEqual({ create: 1, update: 1 });
+		expect(summary.warnings).toEqual([]);
+	});
+
+	it('1 つの接続の 2 つのグループに同名タグがあれば、グループごとに突き合わせる', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([plcConnection(1, 'plc1')]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([
+			collectionGroup(10, 'group1', 1),
+			collectionGroup(11, 'group2', 1)
+		]);
+		vi.mocked(listTags).mockResolvedValue([registryTag(100, 'tag1', 10)]);
+		vi.mocked(updatePlcConnection).mockImplementation(async (id, input) =>
+			plcConnection(id, input.name)
+		);
+		vi.mocked(updateCollectionGroup).mockImplementation(async (id, input) =>
+			collectionGroup(id, input.name, input.plcConnectionId)
+		);
+		vi.mocked(updateTag).mockImplementation(async (id, input) =>
+			registryTag(id, input.name, input.collectionGroupId)
+		);
+		vi.mocked(createTag).mockImplementation(async (input) =>
+			registryTag(101, input.name, input.collectionGroupId)
+		);
+
+		const twoGroups: ConfigPackage = {
+			...pkg,
+			collectionGroups: [pkg.collectionGroups[0], { ...pkg.collectionGroups[0], name: 'group2' }],
+			tags: [tagTemplate, { ...tagTemplate, collectionGroupName: 'group2' }]
+		};
+
+		const summary = await applyConfigPackage(twoGroups);
+
+		expect(updateTag).toHaveBeenCalledTimes(1);
+		expect(updateTag).toHaveBeenCalledWith(
+			100,
+			expect.objectContaining({ name: 'tag1', collectionGroupId: 10 })
+		);
+		expect(createTag).toHaveBeenCalledTimes(1);
+		expect(createTag).toHaveBeenCalledWith(
+			expect.objectContaining({ name: 'tag1', collectionGroupId: 11 })
+		);
+		expect(summary.counts.tags).toEqual({ create: 1, update: 1 });
+	});
+
+	it('sink group のタグ参照は、同名タグのうち接続・グループが一致するものへ解決する', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([
+			plcConnection(1, 'plc1'),
+			plcConnection(2, 'plc2'),
+			{ ...plcConnection(3, 'pg1'), protocol: 'postgres', passwordSet: true }
+		]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([
+			collectionGroup(10, 'group1', 1),
+			collectionGroup(20, 'group1', 2)
+		]);
+		vi.mocked(listTags).mockResolvedValue([
+			registryTag(100, 'temp01', 10),
+			registryTag(200, 'temp01', 20)
+		]);
+		vi.mocked(createSinkGroup).mockImplementation(async (input) => ({ id: 9, ...input }));
+
+		const sinkOnly: ConfigPackage = {
+			...pkg,
+			plcConnections: [],
+			collectionGroups: [],
+			tags: [],
+			sinkGroups: [
+				{
+					name: 'line2-log',
+					dbConnectionName: 'pg1',
+					mode: 'interval',
+					intervalMs: 1000,
+					tableName: 'public.tag_history',
+					storeBad: false,
+					enabled: true,
+					tags: [{ plcConnectionName: 'plc2', collectionGroupName: 'group1', tagName: 'temp01' }]
+				}
+			]
+		};
+
+		const inspection = await inspectConfigPackage(sinkOnly);
+		expect(inspection.warnings).toEqual([]);
+
+		await applyConfigPackage(sinkOnly);
+		expect(createSinkGroup).toHaveBeenCalledWith(
+			expect.objectContaining({ dbConnectionId: 3, tagIds: [200] })
+		);
+	});
+
+	it('参照先のタグが現在の環境に無ければ、接続・グループ・タグの組で warning を出す', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([plcConnection(1, 'plc1')]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([collectionGroup(10, 'group1', 1)]);
+		vi.mocked(listTags).mockResolvedValue([registryTag(100, 'temp01', 10)]);
+
+		const inspection = await inspectConfigPackage({
+			...pkg,
+			plcConnections: [],
+			collectionGroups: [],
+			tags: [],
+			sinkGroups: [
+				{
+					name: 'log',
+					dbConnectionName: 'plc1',
+					mode: 'interval',
+					intervalMs: 1000,
+					tableName: 'public.tag_history',
+					storeBad: false,
+					enabled: true,
+					// 同名のタグはあるが、別の接続（plc2）を指している。
+					tags: [{ plcConnectionName: 'plc2', collectionGroupName: 'group1', tagName: 'temp01' }]
+				}
+			]
+		});
+		expect(inspection.warnings).toEqual([
+			"sink group 'log' のタグ 'plc2 / group1 / temp01' は現在の環境で見つかりません"
+		]);
 	});
 });

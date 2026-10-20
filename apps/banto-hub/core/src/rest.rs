@@ -10956,6 +10956,90 @@ mod tests {
         assert_ne!(status_body["connections"][0]["status"], "unused");
     }
 
+    /// 2026-10-19 オーナー決定（migration 0022）: グループ名は接続内で一意。
+    /// REST で別の接続の下に同じ名前のグループを作れ、同じ接続の下では
+    /// 作れない。別の接続へ移す更新が移り先の同名と重なれば `name` の項目
+    /// エラー（422）になり、行は動かない。
+    #[tokio::test]
+    async fn collection_group_names_are_unique_per_connection_over_rest() {
+        let env = test_env().await;
+        let (router, token) = (&env.router, env.admin_token.as_str());
+        let mut conn_ids = Vec::new();
+        for (name, port) in [("line-per-conn-a", 15101), ("line-per-conn-b", 15102)] {
+            let (status, conn) = admin_post(
+                router,
+                "/api/plc-connections",
+                token,
+                json!({ "name": name, "host": "127.0.0.1", "port": port }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{conn:?}");
+            conn_ids.push(conn["id"].as_i64().unwrap());
+        }
+        let (a, b) = (conn_ids[0], conn_ids[1]);
+
+        let (status, ga) = admin_post(
+            router,
+            "/api/collection-groups",
+            token,
+            json!({ "name": "fast", "plcConnectionId": a, "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ga:?}");
+        let (status, gb) = admin_post(
+            router,
+            "/api/collection-groups",
+            token,
+            json!({ "name": "fast", "plcConnectionId": b, "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "same name under another connection: {gb:?}"
+        );
+
+        let (status, body) = admin_post(
+            router,
+            "/api/collection-groups",
+            token,
+            json!({ "name": "fast", "plcConnectionId": a, "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["field_errors"][0]["field"], "name", "{body:?}");
+        assert_eq!(
+            body["field_errors"][0]["message"], "この接続内では既に使用されています",
+            "{body:?}"
+        );
+
+        let gb_id = gb["id"].as_i64().unwrap();
+        let (status, body) = admin_put(
+            router,
+            &format!("/api/collection-groups/{gb_id}"),
+            token,
+            json!({
+                "name": "fast",
+                "plcConnectionId": a,
+                "periodMs": 1000,
+                "enabled": true,
+                "defaultWritable": true,
+                "querySql": null,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["field_errors"][0]["field"], "name", "{body:?}");
+        let still = CollectionGroupService::new(env.pool.clone())
+            .get(gb_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            still.plc_connection_id, b,
+            "a refused move leaves the row in place"
+        );
+    }
+
     /// #635（2026-10-17 オーナー決定 案 A）: 接続・グループ・タグの作成と改名で、
     /// ドットを含む名前をつないだ外部名が既存のタグと重なれば 422 で断り、
     /// どの既存のタグと重なるかを文言で示す。断った書き込みは残らない。
@@ -14916,7 +15000,8 @@ mod tests {
 
     /// 実機で再現した不具合の修正2（2026-08-31 オーナー報告）: pending change
     /// の適用が validation エラー（名前の重複）で失敗したとき、
-    /// `failure_reason` にフィールド単位の詳細（`name: 既に使用されています`）
+    /// `failure_reason` にフィールド単位の詳細（`name: この接続内では既に使用されています`、
+    /// グループ名は 2026-10-19 から接続内で一意 - migration 0022）
     /// が含まれることを確認する。修正前は `BantoError` の `Display`
     /// （`thiserror`）が種別ごとの定型文だけ（`Validation` は常に
     /// `"validation failed"`）だったため、`pending change の適用に失敗
@@ -15029,7 +15114,8 @@ mod tests {
             "failure_reason should include field-level detail, not just the generic BantoError Display: {failure_reason}"
         );
         assert!(
-            failure_reason.contains("name") && failure_reason.contains("既に使用されています"),
+            failure_reason.contains("name")
+                && failure_reason.contains("この接続内では既に使用されています"),
             "failure_reason should say which field failed and why: {failure_reason}"
         );
     }

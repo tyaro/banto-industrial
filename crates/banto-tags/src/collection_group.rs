@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::plc_connection::{HUB_PROTOCOL, POSTGRES_PROTOCOL};
-use crate::support::{map_write_error, max_length_message, required_message, NAME_ALREADY_USED};
+use crate::support::{map_write_error, max_length_message, required_message};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
 /// §3.1: "標準 1s / 選択肢 100ms・200ms・500ms・2s・5s・10s・1min") - mirrors
@@ -279,6 +279,16 @@ const COLUMNS: &str =
     "id, name, plc_connection_id, period_ms, enabled, default_writable, query_sql";
 const FK_MESSAGE: &str = "指定されたPLC接続が見つかりません";
 
+/// UNIQUE-violation message for `collection_groups.name`, which is unique
+/// **per connection** as of migration 0022 (`UNIQUE(plc_connection_id, name)`,
+/// 2026-10-19 オーナー決定 - 接続内で一意). Mirrors `tag.rs`'s
+/// `NAME_ALREADY_USED_IN_GROUP`: the scope is spelled out so a user who sees
+/// the same name accepted under another connection is not confused. An
+/// update that moves a group to another connection (`plcConnectionId`
+/// changed) can collide in the destination - that is the same constraint and
+/// gets the same `name` field error.
+const NAME_ALREADY_USED_IN_CONNECTION: &str = "この接続内では既に使用されています";
+
 /// Service layer for the `collection_groups` resource.
 #[derive(Clone)]
 pub struct CollectionGroupService {
@@ -364,7 +374,7 @@ impl CollectionGroupService {
             map_write_error(
                 err,
                 "name",
-                NAME_ALREADY_USED,
+                NAME_ALREADY_USED_IN_CONNECTION,
                 "plcConnectionId",
                 FK_MESSAGE,
             )
@@ -404,7 +414,7 @@ impl CollectionGroupService {
             map_write_error(
                 err,
                 "name",
-                NAME_ALREADY_USED,
+                NAME_ALREADY_USED_IN_CONNECTION,
                 "plcConnectionId",
                 FK_MESSAGE,
             )
@@ -458,7 +468,7 @@ impl CollectionGroupService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", NAME_ALREADY_USED, "plcConnectionId", FK_MESSAGE),
+            other => map_write_error(other, "name", NAME_ALREADY_USED_IN_CONNECTION, "plcConnectionId", FK_MESSAGE),
         })
     }
 
@@ -511,7 +521,7 @@ impl CollectionGroupService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", NAME_ALREADY_USED, "plcConnectionId", FK_MESSAGE),
+            other => map_write_error(other, "name", NAME_ALREADY_USED_IN_CONNECTION, "plcConnectionId", FK_MESSAGE),
         })
     }
 
@@ -833,10 +843,137 @@ mod tests {
         match err {
             BantoError::Validation { field_errors } => {
                 assert_eq!(field_errors[0].field, "name");
-                assert_eq!(field_errors[0].message, "既に使用されています");
+                assert_eq!(
+                    field_errors[0].message,
+                    "この接続内では既に使用されています"
+                );
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// A second connection for the per-connection uniqueness tests below.
+    async fn second_connection(plc_svc: &PlcConnectionService) -> i64 {
+        plc_svc
+            .create(PlcConnectionInput {
+                name: "PLC2".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "10.0.0.2".to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// 2026-10-19 オーナー決定（migration 0022）: グループ名は接続内で一意。
+    /// 別の接続の下なら同じ名前を付けられる（作成・トランザクション版とも）。
+    #[tokio::test]
+    async fn same_name_is_accepted_under_two_connections() {
+        let (plc_svc, svc, conn_a) = setup().await;
+        let conn_b = second_connection(&plc_svc).await;
+        let a = svc.create(sample_input("fast", conn_a)).await.unwrap();
+        let b = svc
+            .create(sample_input("fast", conn_b))
+            .await
+            .expect("same name under another connection should be accepted");
+        assert_ne!(a.id, b.id);
+        assert_eq!(b.plc_connection_id, conn_b);
+
+        // The transactional path behaves the same (and still refuses a
+        // duplicate within one connection).
+        let mut tx = svc.pool.begin().await.unwrap();
+        let conn_c = {
+            let created = plc_svc
+                .create_tx(
+                    &mut tx,
+                    PlcConnectionInput {
+                        name: "PLC3".to_string(),
+                        protocol: "modbus-tcp".to_string(),
+                        host: "10.0.0.3".to_string(),
+                        port: 502,
+                        unit_id: 1,
+                        enabled: true,
+                        simulation: false,
+                        word_order: "low_high".to_string(),
+                        cpu_type: None,
+                        database: None,
+                        username: None,
+                        password: None,
+                    },
+                )
+                .await
+                .unwrap();
+            created.id
+        };
+        svc.create_tx(&mut tx, sample_input("fast", conn_c))
+            .await
+            .expect("create_tx under a third connection");
+        let err = svc
+            .create_tx(&mut tx, sample_input("fast", conn_c))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "name");
+                assert_eq!(field_errors[0].message, NAME_ALREADY_USED_IN_CONNECTION);
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    /// Moving a group to another connection that already has a group of the
+    /// same name collides in the destination: `name` field error (both the
+    /// pool and the transactional update). Renaming it on the way in works.
+    #[tokio::test]
+    async fn update_moving_into_a_connection_that_has_the_name_is_a_name_error() {
+        let (plc_svc, svc, conn_a) = setup().await;
+        let conn_b = second_connection(&plc_svc).await;
+        svc.create(sample_input("fast", conn_a)).await.unwrap();
+        let moving = svc.create(sample_input("fast", conn_b)).await.unwrap();
+
+        let err = svc
+            .update(moving.id, sample_input("fast", conn_a))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors.len(), 1);
+                assert_eq!(field_errors[0].field, "name");
+                assert_eq!(field_errors[0].message, NAME_ALREADY_USED_IN_CONNECTION);
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        let mut tx = svc.pool.begin().await.unwrap();
+        let err = svc
+            .update_tx(&mut tx, moving.id, sample_input("fast", conn_a))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "name");
+                assert_eq!(field_errors[0].message, NAME_ALREADY_USED_IN_CONNECTION);
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        tx.rollback().await.unwrap();
+
+        let moved = svc
+            .update(moving.id, sample_input("fast2", conn_a))
+            .await
+            .expect("moving under a fresh name is fine");
+        assert_eq!(moved.plc_connection_id, conn_a);
+        assert_eq!(svc.get(moving.id).await.unwrap().name, "fast2");
     }
 
     #[tokio::test]
@@ -1350,5 +1487,273 @@ mod tests {
                 "{current:?} -> {new:?}"
             );
         }
+    }
+
+    // --- migration 0022 (collection_groups: 全体一意 → 接続内一意) ----------
+
+    const TAG_ROW_SQL: &str = "SELECT quote(id) || '|' || quote(name) || '|' || \
+         quote(collection_group_id) || '|' || quote(address) || '|' || quote(data_type) || '|' || \
+         quote(string_length) || '|' || quote(raw_lo) || '|' || quote(raw_hi) || '|' || \
+         quote(eng_lo) || '|' || quote(eng_hi) || '|' || quote(unit) || '|' || \
+         quote(decimals) || '|' || quote(enabled) || '|' || quote(writable) || '|' || \
+         quote(tag_kind) || '|' || quote(expression) || '|' || quote(retain) || '|' || \
+         quote(revision) || '|' || quote(string_encoding) FROM tags ORDER BY id";
+    const GROUP_ROW_SQL: &str = "SELECT quote(id) || '|' || quote(name) || '|' || \
+         quote(plc_connection_id) || '|' || quote(period_ms) || '|' || quote(enabled) || '|' || \
+         quote(default_writable) || '|' || quote(query_sql) FROM collection_groups ORDER BY id";
+
+    /// Migration 0022 rebuilds `collection_groups` with
+    /// `UNIQUE(plc_connection_id, name)` (2026-10-19 オーナー決定). Run the
+    /// real migrator up to 0021 on a populated database, then
+    /// [`crate::migrate`] - what an app does on its next startup. Every group
+    /// and tag row comes back column for column with its id, every
+    /// AUTOINCREMENT position survives (a deleted group's id is not reused),
+    /// FKs still restrict in both directions, the index and both 0020
+    /// triggers exist and still fire, and the new uniqueness scope holds: the
+    /// same name under another connection is accepted, under the same
+    /// connection refused.
+    #[tokio::test]
+    async fn migration_0022_preserves_rows_sequence_triggers_and_foreign_keys() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.dangerous_set_table_name(crate::MIGRATIONS_TABLE);
+        migrator
+            .run_to(21, &pool)
+            .await
+            .expect("migrate up to 0021");
+
+        for sql in [
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+             simulation, word_order, cpu_type) \
+             VALUES (1, 'Line1', 'slmp', '192.168.1.10', 5007, 3, 0, 1, 'high_low', 'Q')",
+            "INSERT INTO plc_connections (id, name, protocol, host, port, database, username, \
+             password) VALUES (2, 'ERP', 'postgres', '10.0.0.50', 5432, 'erp', 'reader', 's')",
+            "INSERT INTO plc_connections (id, name, protocol, host, port) \
+             VALUES (3, 'Hub', 'hub', '', 0)",
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled, \
+             default_writable) VALUES (4, 'G1', 1, 2000, 0, 0)",
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled, \
+             default_writable, query_sql) VALUES (5, 'Q1', 2, 5000, 1, 1, 'SELECT 1 AS v')",
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms) \
+             VALUES (6, 'H', 3, 1000)",
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms) \
+             VALUES (7, 'Gone', 1, 1000)",
+            "DELETE FROM collection_groups WHERE id = 7",
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, string_length, \
+             raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled, writable, tag_kind, \
+             expression, retain, revision, string_encoding) VALUES (11, 'T1', 4, 'D100', \
+             'string', 8, 0, 100, 0, 50, 'degC', 2, 0, 1, 'plc', NULL, 1, 3, 'shift_jis')",
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, tag_kind) \
+             VALUES (12, 'V', 5, 'v', 'f64', 'db')",
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type) \
+             VALUES (13, 't', 6, 'L1.fast.t', 'f64')",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("seed failed ({sql}): {e}"));
+        }
+        let groups_before: Vec<String> = sqlx::query_scalar(GROUP_ROW_SQL)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let tags_before: Vec<String> = sqlx::query_scalar(TAG_ROW_SQL)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let sequences_before: Vec<(String, i64)> =
+            sqlx::query_as("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(sequences_before.contains(&("collection_groups".to_string(), 7)));
+        assert_eq!(groups_before.len(), 3);
+        assert_eq!(tags_before.len(), 3);
+
+        migrate(&pool).await.expect("0022 should apply");
+
+        let groups_after: Vec<String> = sqlx::query_scalar(GROUP_ROW_SQL)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let tags_after: Vec<String> = sqlx::query_scalar(TAG_ROW_SQL)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(groups_after, groups_before);
+        assert_eq!(tags_after, tags_before);
+        let sequences_after: Vec<(String, i64)> =
+            sqlx::query_as("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sequences_after, sequences_before);
+
+        // Column order is what `COLUMNS` / `SELECT *` consumers expect.
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('collection_groups')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "name",
+                "plc_connection_id",
+                "period_ms",
+                "enabled",
+                "default_writable",
+                "query_sql"
+            ]
+        );
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(violations.is_empty(), "dangling FKs: {violations:?}");
+
+        let objects: Vec<(String, String)> = sqlx::query_as(
+            "SELECT type, name FROM sqlite_master \
+             WHERE (type = 'index' AND name LIKE 'idx_%') OR type = 'trigger' ORDER BY type, name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let objects: Vec<(&str, &str)> = objects
+            .iter()
+            .map(|(t, n)| (t.as_str(), n.as_str()))
+            .collect();
+        assert_eq!(
+            objects,
+            vec![
+                ("index", "idx_collection_groups_plc_connection_id"),
+                ("index", "idx_plc_connections_single_hub"),
+                ("index", "idx_tags_collection_group_id"),
+                ("trigger", "tags_hub_external_name_unique_insert"),
+                ("trigger", "tags_hub_external_name_unique_update"),
+            ]
+        );
+
+        // The 0020 triggers still fire (insert and update).
+        let err = sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('t2', 6, 'L1.fast.t', 'f64')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("banto_tags: hub external name already registered"),
+            "{err}"
+        );
+        sqlx::query(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type) \
+             VALUES (14, 't3', 6, 'L1.fast.u', 'f64')",
+        )
+        .execute(&pool)
+        .await
+        .expect("a different external name is fine");
+        let err = sqlx::query("UPDATE tags SET address = 'L1.fast.t' WHERE id = 14")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("banto_tags: hub external name already registered"),
+            "{err}"
+        );
+
+        // New uniqueness scope.
+        sqlx::query(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms) \
+             VALUES (NULL, 'G1', 3, 1000)",
+        )
+        .execute(&pool)
+        .await
+        .expect("same group name under another connection is accepted");
+        let err = sqlx::query(
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+             VALUES ('G1', 1, 1000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(
+            err.as_database_error()
+                .is_some_and(|e| e.is_unique_violation()),
+            "{err}"
+        );
+
+        // FKs still restrict in both directions.
+        assert!(
+            sqlx::query(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+                 VALUES ('orphan', 999, 1000)"
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "group -> connection FK"
+        );
+        assert!(
+            sqlx::query("DELETE FROM plc_connections WHERE id = 1")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "a connection with groups cannot be deleted"
+        );
+        assert!(
+            sqlx::query("DELETE FROM collection_groups WHERE id = 4")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "a group with tags cannot be deleted (tags' FK points at the rebuilt table)"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('orphan', 999, 'D1', 'i16')"
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "tag -> group FK"
+        );
+
+        // The deleted group's id 7 is not reused (the one inserted above got 8).
+        let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM collection_groups")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(max_id, 8);
+    }
+
+    /// 0022 on a database with no groups at all: nothing to park or copy,
+    /// and the result has the new scope.
+    #[tokio::test]
+    async fn migration_0022_applies_to_an_empty_registry() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.dangerous_set_table_name(crate::MIGRATIONS_TABLE);
+        migrator
+            .run_to(21, &pool)
+            .await
+            .expect("migrate up to 0021");
+        migrate(&pool).await.expect("0022 should apply");
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'collection_groups'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(sql.contains("UNIQUE (plc_connection_id, name)"), "{sql}");
+        assert!(!sql.contains("name TEXT NOT NULL UNIQUE"), "{sql}");
     }
 }

@@ -5,6 +5,7 @@ import {
 	CONFIG_PACKAGE_SCHEMA_VERSION,
 	buildConfigPackage,
 	parseConfigPackage,
+	planByKey,
 	planByName,
 	serializeConfigPackage,
 	type ConfigPackage
@@ -224,6 +225,7 @@ describe('configPackage', () => {
 		expect(pkg.tags).toEqual([
 			{
 				name: 'tag-a',
+				plcConnectionName: 'line-a',
 				collectionGroupName: 'group-a',
 				address: 'D100',
 				dataType: 'i16',
@@ -243,6 +245,7 @@ describe('configPackage', () => {
 			},
 			{
 				name: 'tag-calc',
+				plcConnectionName: 'calc',
 				collectionGroupName: 'group-calc',
 				address: '',
 				dataType: 'i16',
@@ -290,7 +293,8 @@ describe('configPackage', () => {
 						name: 'group-calc',
 						plcConnectionName: 'calc',
 						periodMs: 1000,
-						enabled: true
+						enabled: true,
+						defaultWritable: true
 					}
 				],
 				tags: []
@@ -302,42 +306,38 @@ describe('configPackage', () => {
 	});
 
 	it('parseConfigPackage は不正な schemaVersion を拒否する', () => {
-		const text = JSON.stringify({ ...makePackage(), schemaVersion: 2 }, null, 2);
+		const text = JSON.stringify({ ...makePackage(), schemaVersion: 3 }, null, 2);
 		expect(() => parseConfigPackage(text)).toThrow(/schemaVersion/);
 	});
 
-	// --- P3-b（監査指摘 2026-08-12）: wordOrder は旧スキーマの構成パッケージ
-	// （この列を持たない）を読めなければならない - CONFIG_PACKAGE_SCHEMA_VERSION
-	// は据え置きのまま追加した後方互換フィールドなので、既存のエクスポート済み
-	// ファイルは wordOrder を一切含まない。
+	// 2026-10-19 オーナー決定: 版 1（グループ・タグを名前だけで参照する形式）は
+	// 読まない（互換性は持たない）。版 1 の形のままのパッケージは、参照が曖昧で
+	// なくても版で断る。
+	it('parseConfigPackage は版 1 のパッケージを未対応の版として拒否する', () => {
+		const pkg = makePackage();
+		const v1 = {
+			...pkg,
+			schemaVersion: 1,
+			tags: pkg.tags.map(({ plcConnectionName: _c, ...rest }) => rest)
+		};
+		expect(() => parseConfigPackage(JSON.stringify(v1))).toThrow(
+			/schemaVersion 1 は未対応です（期待値: 2）。古い版の構成パッケージは読み込めません/
+		);
+	});
 
-	// 2026-09-08 オーナー決定（issue #325 の作業中に発覚した既存バグ）: 省略時の
-	// 既定はプロトコル依存になった。modbus-tcp は high_low - 旧パッケージが
-	// 書き出された当時、収集経路は Modbus のこの列を無視して HighLow で動いて
-	// いたので、high_low を埋めるほうが当時の実挙動と一致する（migration 0017 の
-	// backfill と同じ「実態への同期」）。
-	it('parseConfigPackage は wordOrder を持たない旧 modbus パッケージを high_low 既定で受け入れる', () => {
+	// --- 版 2（2026-10-20 オーナー決定）: 版 1 の間に足した項目（wordOrder・cpuType・
+	// defaultWritable・stringEncoding・sinkGroups）は必須。欠けたパッケージは
+	// 項目の場所を示して断り、既定値で黙って埋めない。
+
+	it('parseConfigPackage は wordOrder を持たない接続を、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutWordOrder = {
 			...pkg,
 			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => rest)
 		};
-		expect(withoutWordOrder.plcConnections[0].protocol).toBe('modbus-tcp');
-		const parsed = parseConfigPackage(JSON.stringify(withoutWordOrder));
-		expect(parsed.plcConnections[0].wordOrder).toBe('high_low');
-	});
-
-	it('parseConfigPackage は wordOrder を持たない旧 slmp パッケージを low_high 既定で受け入れる', () => {
-		const pkg = makePackage();
-		const withoutWordOrder = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => ({
-				...rest,
-				protocol: 'slmp'
-			}))
-		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutWordOrder));
-		expect(parsed.plcConnections[0].wordOrder).toBe('low_high');
+		expect(() => parseConfigPackage(JSON.stringify(withoutWordOrder))).toThrow(
+			/plcConnections\[0\]\.wordOrder は low_high \/ high_low/
+		);
 	});
 
 	it('parseConfigPackage は不正な wordOrder を拒否する', () => {
@@ -349,17 +349,22 @@ describe('configPackage', () => {
 		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
 	});
 
-	// #605: cpuType は旧パッケージには無い。省略は undefined のまま（作成は R、更新は既存を保つ）。
-	// 明示した Q は往復する。
-	// 未知の値は拒否する（R へ黙って倒さない）。
-	it('parseConfigPackage は cpuType を持たない旧パッケージを undefined のまま受け入れる（R を入れない）', () => {
+	// #605 + 版 2: cpuType は必須（省略・null は拒否。R を入れて既存の Q 接続を
+	// 戻してしまうことがない）。明示した Q は往復する。未知の値も拒否する。
+	it('parseConfigPackage は cpuType を持たない接続を、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutCpu = {
 			...pkg,
 			plcConnections: pkg.plcConnections.map(({ cpuType: _cpuType, ...rest }) => rest)
 		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutCpu));
-		expect(parsed.plcConnections[0].cpuType).toBeUndefined();
+		expect(() => parseConfigPackage(JSON.stringify(withoutCpu))).toThrow(
+			/plcConnections\[0\]\.cpuType は Q \/ R/
+		);
+		const withNullCpu = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map((c) => ({ ...c, cpuType: null }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withNullCpu))).toThrow(/cpuType/);
 	});
 
 	it('buildConfigPackage/parseConfigPackage は SLMP 接続の cpuType Q を往復する', () => {
@@ -414,12 +419,9 @@ describe('configPackage', () => {
 		expect(parsed.plcConnections[0].wordOrder).toBe('high_low');
 	});
 
-	// --- T19 S1-b（UX-34、2026-09-02 オーナー決定）: defaultWritable は
-	// wordOrder と同じ理由で旧スキーマの構成パッケージ（この項目を持たない）
-	// を読めなければならない - CONFIG_PACKAGE_SCHEMA_VERSION は据え置きの
-	// まま追加した後方互換フィールド。
+	// --- T19 S1-b（UX-34）+ 版 2: defaultWritable は必須。
 
-	it('parseConfigPackage は defaultWritable を持たない旧パッケージを true 既定で受け入れる', () => {
+	it('parseConfigPackage は defaultWritable を持たないグループを、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutDefaultWritable = {
 			...pkg,
@@ -427,8 +429,9 @@ describe('configPackage', () => {
 				({ defaultWritable: _defaultWritable, ...rest }) => rest
 			)
 		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutDefaultWritable));
-		expect(parsed.collectionGroups[0].defaultWritable).toBe(true);
+		expect(() => parseConfigPackage(JSON.stringify(withoutDefaultWritable))).toThrow(
+			/collectionGroups\[0\]\.defaultWritable/
+		);
 	});
 
 	it('parseConfigPackage は不正な defaultWritable を拒否する', () => {
@@ -462,14 +465,15 @@ describe('configPackage', () => {
 		expect(parsed.tags[0].stringEncoding).toBe('shift_jis');
 	});
 
-	it('parseConfigPackage は stringEncoding を持たない旧パッケージを utf8 既定で受け入れる', () => {
+	it('parseConfigPackage は stringEncoding を持たないタグを、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutStringEncoding = {
 			...pkg,
 			tags: pkg.tags.map(({ stringEncoding: _stringEncoding, ...rest }) => rest)
 		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutStringEncoding));
-		expect(parsed.tags[0].stringEncoding).toBe('utf8');
+		expect(() => parseConfigPackage(JSON.stringify(withoutStringEncoding))).toThrow(
+			/tags\[0\]\.stringEncoding は utf8 または shift_jis/
+		);
 	});
 
 	it('parseConfigPackage は不正な stringEncoding を拒否する', () => {
@@ -486,13 +490,13 @@ describe('configPackage', () => {
 	// --- #533（2026-10-08 オーナー決定「しきい値は使う側（記録計・SCADA）が
 	// 持つ設定で、Hub は持たない」）: export はしきい値を書かず、値付きの
 	// しきい値を持つ旧パッケージは取り込みを断る（`null`・項目なしは通す）。
-	// `CONFIG_PACKAGE_SCHEMA_VERSION` は 1 のまま。
+	// （#533 の時点では版 1。版 2 は 2026-10-19 にグループ・タグの参照を変えたため。）
 
 	it('#533: buildConfigPackage はタグのしきい値を書かない', () => {
 		const pkg = makePackage();
 		const text = serializeConfigPackage(pkg);
 		expect(text).not.toContain('threshold');
-		expect(CONFIG_PACKAGE_SCHEMA_VERSION).toBe(1);
+		expect(CONFIG_PACKAGE_SCHEMA_VERSION).toBe(2);
 	});
 
 	it('#533: parseConfigPackage は しきい値が null の旧パッケージを受け入れ、しきい値を持ち込まない', () => {
@@ -686,14 +690,20 @@ describe('configPackage', () => {
 				tableName: 'public.tag_history',
 				storeBad: false,
 				enabled: true,
-				tagNames: ['tag-a', 'tag-db']
+				tags: [
+					{ plcConnectionName: 'line-a', collectionGroupName: 'group-a', tagName: 'tag-a' },
+					{ plcConnectionName: 'pg-a', collectionGroupName: 'group-pg', tagName: 'tag-db' }
+				]
 			}
 		]);
 	});
 
-	it('S6: sinkGroups を省略した buildConfigPackage 呼び出しは空配列になる（後方互換）', () => {
+	it('S6: sinkGroups を省略した buildConfigPackage 呼び出しは空配列になり、export に sinkGroups が書かれる', () => {
 		const pkg = makePackage();
 		expect(pkg.sinkGroups).toEqual([]);
+		const raw = JSON.parse(serializeConfigPackage(pkg)) as Record<string, unknown>;
+		expect(raw.sinkGroups).toEqual([]);
+		expect(parseConfigPackage(serializeConfigPackage(pkg)).sinkGroups).toEqual([]);
 	});
 
 	it('S6: sink group を含むパッケージは serializeConfigPackage/parseConfigPackage で往復できる', () => {
@@ -708,16 +718,17 @@ describe('configPackage', () => {
 		});
 		const parsed = parseConfigPackage(serializeConfigPackage(original));
 		expect(parsed).toEqual(original);
-		expect(parsed.sinkGroups[0].tagNames).toEqual(['tag-a', 'tag-db']);
+		expect(parsed.sinkGroups[0].tags.map((ref) => ref.tagName)).toEqual(['tag-a', 'tag-db']);
 	});
 
-	it('S6: parseConfigPackage は sinkGroups キーを持たない旧パッケージを空配列として受け入れる（後方互換）', () => {
+	it('S6: parseConfigPackage は sinkGroups キーを持たないパッケージを拒否する', () => {
 		const pkg = makePackage();
 		const raw = JSON.parse(serializeConfigPackage(pkg)) as Record<string, unknown>;
 		delete raw.sinkGroups;
 		expect(raw.sinkGroups).toBeUndefined();
-		const parsed = parseConfigPackage(JSON.stringify(raw));
-		expect(parsed.sinkGroups).toEqual([]);
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(
+			/sinkGroups は配列である必要があります/
+		);
 	});
 
 	it('S6: parseConfigPackage は不正な sinkGroups.mode を拒否する', () => {
@@ -767,8 +778,138 @@ describe('configPackage', () => {
 		const raw = JSON.parse(serializeConfigPackage(original)) as {
 			sinkGroups: Array<Record<string, unknown>>;
 		};
-		raw.sinkGroups[0].tagNames = ['no-such-tag'];
-		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(/tag/);
+		raw.sinkGroups[0].tags = [
+			{ plcConnectionName: 'line-a', collectionGroupName: 'group-a', tagName: 'no-such-tag' }
+		];
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(
+			/sinkGroups\[0\]\.tags\[0\].*line-a \/ group-a \/ no-such-tag/
+		);
+	});
+
+	it('S6: parseConfigPackage は形の崩れた sinkGroups.tags の参照を拒否する', () => {
+		const original = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, DB_GROUP],
+			tags: [BASE_TAG, DB_TAG],
+			sinkGroups: [SINK_GROUP],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-07T00:00:00.000Z'
+		});
+		const raw = JSON.parse(serializeConfigPackage(original)) as {
+			sinkGroups: Array<Record<string, unknown>>;
+		};
+		// 版 1 の `tagNames`（名前だけ）の形は受け付けない。
+		delete raw.sinkGroups[0].tags;
+		raw.sinkGroups[0].tagNames = ['tag-a'];
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(/sinkGroups\[0\]\.tags/);
+		raw.sinkGroups[0].tags = [{ collectionGroupName: 'group-a', tagName: 'tag-a' }];
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(
+			/sinkGroups\[0\]\.tags\[0\]\.plcConnectionName/
+		);
+	});
+
+	// --- 版 2（2026-10-19 オーナー決定: グループ名は接続内で一意）----------------
+
+	const LINE_B: PlcConnection = { ...BASE_CONNECTION, id: 4, name: 'line-b', port: 503 };
+	const GROUP_A_ON_B: CollectionGroup = { ...BASE_GROUP, id: 13, plcConnectionId: LINE_B.id };
+	const TAG_A_ON_B: Tag = { ...BASE_TAG, id: 103, collectionGroupId: GROUP_A_ON_B.id };
+
+	it('版 2: 2 つの接続に同じ名前のグループ・同じ名前のタグがあっても往復でき、sink の参照も区別できる', () => {
+		const original = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, LINE_B, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, GROUP_A_ON_B],
+			tags: [BASE_TAG, TAG_A_ON_B],
+			sinkGroups: [{ ...SINK_GROUP, tagIds: [TAG_A_ON_B.id] }],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-10-19T00:00:00.000Z'
+		});
+		expect(original.collectionGroups.map((g) => [g.plcConnectionName, g.name])).toEqual([
+			['line-a', 'group-a'],
+			['line-b', 'group-a']
+		]);
+		expect(original.tags.map((t) => [t.plcConnectionName, t.collectionGroupName, t.name])).toEqual([
+			['line-a', 'group-a', 'tag-a'],
+			['line-b', 'group-a', 'tag-a']
+		]);
+		expect(original.sinkGroups[0].tags).toEqual([
+			{ plcConnectionName: 'line-b', collectionGroupName: 'group-a', tagName: 'tag-a' }
+		]);
+		const parsed = parseConfigPackage(serializeConfigPackage(original));
+		expect(parsed).toEqual(original);
+	});
+
+	it('版 2: 1 つの接続の 2 つのグループに同じ名前のタグがあっても往復できる', () => {
+		const groupB: CollectionGroup = { ...BASE_GROUP, id: 14, name: 'group-b' };
+		const tagInB: Tag = { ...BASE_TAG, id: 104, collectionGroupId: groupB.id };
+		const original = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION],
+			collectionGroups: [BASE_GROUP, groupB],
+			tags: [BASE_TAG, tagInB],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-10-19T00:00:00.000Z'
+		});
+		const parsed = parseConfigPackage(serializeConfigPackage(original));
+		expect(parsed).toEqual(original);
+		expect(parsed.tags.map((t) => t.collectionGroupName)).toEqual(['group-a', 'group-b']);
+	});
+
+	it('版 2: 同じ接続に同じ名前のグループが 2 つあるパッケージは拒否する', () => {
+		const pkg = makePackage();
+		const dup = { ...pkg, collectionGroups: [pkg.collectionGroups[0], pkg.collectionGroups[0]] };
+		expect(() => parseConfigPackage(JSON.stringify(dup))).toThrow(
+			/collectionGroups\[1\] は 接続 'line-a' のグループ 'group-a' と重複しています/
+		);
+	});
+
+	it('版 2: 同じグループに同じ名前のタグが 2 つあるパッケージは拒否する', () => {
+		const pkg = makePackage();
+		const dup = { ...pkg, tags: [pkg.tags[0], pkg.tags[1], pkg.tags[0]] };
+		expect(() => parseConfigPackage(JSON.stringify(dup))).toThrow(
+			/tags\[2\] は 接続 'line-a' のグループ 'group-a' のタグ 'tag-a' と重複しています/
+		);
+	});
+
+	it('版 2: タグの所属は接続名とグループ名の組で解決する（別の接続の同名グループには付かない）', () => {
+		const pkg = makePackage();
+		const wrong = {
+			...pkg,
+			tags: [{ ...pkg.tags[0], plcConnectionName: 'calc' }]
+		};
+		expect(() => parseConfigPackage(JSON.stringify(wrong))).toThrow(
+			/tags\[0\]\.collectionGroupName: .*接続 'calc' のグループ 'group-a' が見つかりません/
+		);
+		const missing = {
+			...pkg,
+			tags: pkg.tags.map(({ plcConnectionName: _c, ...rest }) => rest)
+		};
+		expect(() => parseConfigPackage(JSON.stringify(missing))).toThrow(
+			/tags\[0\]\.plcConnectionName は文字列である必要があります/
+		);
+	});
+
+	it('planByKey は指定したキーで create/update を分け、キーの無い既存行は照合しない', () => {
+		const plan = planByKey(
+			[
+				{ conn: 'a', name: 'g' },
+				{ conn: 'b', name: 'g' }
+			],
+			[
+				{ id: 1, key: JSON.stringify(['b', 'g']) as string | undefined },
+				{ id: 2, key: undefined }
+			],
+			(item) => JSON.stringify([item.conn, item.name]),
+			(item) => item.key
+		);
+		expect(plan.create).toEqual([{ conn: 'a', name: 'g' }]);
+		expect(plan.update).toEqual([
+			{
+				incoming: { conn: 'b', name: 'g' },
+				existing: { id: 1, key: JSON.stringify(['b', 'g']) }
+			}
+		]);
 	});
 
 	it('planByName は name ベースで create/update を分ける', () => {

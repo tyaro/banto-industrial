@@ -20,18 +20,21 @@ pub(crate) fn range_message(min: i64, max: i64) -> String {
 }
 
 /// UNIQUE-violation message for entities whose `name` stays globally unique
-/// (`plc_connections`, `collection_groups`) - unchanged text, kept here as a
-/// named constant now that [`map_write_error`] takes the message as a
-/// parameter instead of hard-coding it (so both call sites share one string
-/// literal rather than repeating it).
+/// (`plc_connections` only, since migration 0022 made `collection_groups.name`
+/// unique per connection - that module has its own scoped message,
+/// `NAME_ALREADY_USED_IN_CONNECTION`, 2026-10-19 オーナー決定) - unchanged
+/// text, kept here as a named constant now that [`map_write_error`] takes the
+/// message as a parameter instead of hard-coding it.
 pub(crate) const NAME_ALREADY_USED: &str = "既に使用されています";
 
 /// Map a write-time `sqlx::Error` into a friendly `BantoError::Validation`
 /// for the two constraint violations this crate's schema can hit: a UNIQUE
-/// violation on `name` (`plc_connections.name`/`collection_groups.name` are
-/// each globally `UNIQUE`; `tags.name` is `UNIQUE(collection_group_id, name)`
-/// as of migration 0011 - グループ内一意, 2026-08-31 オーナー決定 - so its
-/// caller passes a message that says so instead of the generic one), and a
+/// violation on `name` (`plc_connections.name` is globally `UNIQUE`;
+/// `collection_groups.name` is `UNIQUE(plc_connection_id, name)` as of
+/// migration 0022 - 接続内一意, 2026-10-19 オーナー決定 - and `tags.name` is
+/// `UNIQUE(collection_group_id, name)` as of migration 0011 - グループ内一意,
+/// 2026-08-31 オーナー決定 - so those two callers pass a message that says so
+/// instead of the generic one), and a
 /// FOREIGN KEY violation on a parent id (`collection_groups.plc_connection_id`,
 /// `tags.collection_group_id`). Anything else falls back to
 /// `banto_storage::storage_error` (spec: "name一意（DB制約+わかりやすい
@@ -39,8 +42,9 @@ pub(crate) const NAME_ALREADY_USED: &str = "既に使用されています";
 /// error message presentable).
 ///
 /// `unique_message` lets each caller phrase the UNIQUE-violation message to
-/// match its own uniqueness scope (`tags` is now group-scoped, the other two
-/// entities stay global) without this shared helper hard-coding either.
+/// match its own uniqueness scope (`tags` is group-scoped, `collection_groups`
+/// connection-scoped, `plc_connections` global) without this shared helper
+/// hard-coding any of them.
 ///
 /// `fk_field`/`fk_message` are ignored (and can be anything) for entities
 /// with no foreign key column, e.g. `plc_connections` - a FOREIGN KEY
