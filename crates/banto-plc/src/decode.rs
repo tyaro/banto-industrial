@@ -7,28 +7,12 @@
 use crate::error::PlcError;
 use crate::types::{DataType, StringEncoding, TagValue};
 
-/// Which register holds the high 16 bits of a 32-bit value, or (since the
-/// 64-bit `I64`/`U64`/`F64` types, owner decision 2026-09-08) the highest 16
-/// bits of a 4-register 64-bit value (docs/plan.md I2 §5). Byte order
-/// *within* a register is fixed by Modbus itself (big-endian) and is not a
-/// parameter - only the order of the register group varies by device, which
-/// is what this controls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WordOrder {
-    /// First register (lowest offset) holds the highest word - the
-    /// Modbus/IEEE convention and this crate's default. For a 4-register
-    /// value this means `regs[0]` is the most significant word and
-    /// `regs[3]` the least significant.
-    #[default]
-    HighLow,
-    /// First register holds the lowest word - common on drives/instruments
-    /// that treat the register group as a little-endian machine word. For a
-    /// 4-register value this reverses the whole group: `regs[3]` is the
-    /// most significant word and `regs[0]` the least significant. The
-    /// Omron KM-D1-ETN power meter (KANC-718B §12.5) uses this ordering for
-    /// its `f64` measurement registers.
-    LowHigh,
-}
+/// Which register holds the high 16 bits of a 32-bit value (or the highest
+/// 16 bits of a 4-register 64-bit value) - `banto_driver_api::WordOrder`,
+/// re-exported at its pre-R1-1 path (`banto_plc::decode::WordOrder`). Only the
+/// enum moved (docs/banto-driver-api-design.md §3.1); combining registers per
+/// order (`combine_u32` / `combine_u64`) stays here.
+pub use banto_driver_api::WordOrder;
 
 /// Combine two registers into a `u32` per `order`.
 fn combine_u32(regs: [u16; 2], order: WordOrder) -> u32 {

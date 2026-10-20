@@ -35,6 +35,13 @@ const G = {
 	packages: [
 		{ name: 'banto-plc-address', dir: 'crates/banto-plc-address', deps: [] },
 		{ name: 'banto-tags', dir: 'crates/banto-tags', deps: ['banto-plc-address'] },
+		// R1-1: 公開するドライバ API（依存ゼロ）と、その型を再輸出する banto-plc。
+		{ name: 'banto-driver-api', dir: 'crates/banto-driver-api', deps: [] },
+		{
+			name: 'banto-plc',
+			dir: 'crates/banto-plc',
+			deps: ['banto-driver-api', 'banto-plc-address']
+		},
 		{ name: 'banto-instance-lock', dir: 'crates/banto-instance-lock', deps: [] },
 		{ name: 'banto-rtsp', dir: 'crates/banto-rtsp', deps: [] },
 		{ name: 'banto-tagclient', dir: 'crates/banto-tagclient', deps: [] },
@@ -125,6 +132,7 @@ const ALL = {
 	run_frontend_chronogazer: true,
 	run_rust: true,
 	rust_args: '--workspace',
+	run_driver_api: true,
 	run_rust_db_source: true,
 	run_linux_clippy: true,
 	run_e2e_hub: true,
@@ -137,6 +145,7 @@ const NONE = {
 	run_frontend_chronogazer: false,
 	run_rust: false,
 	rust_args: '',
+	run_driver_api: false,
 	run_rust_db_source: false,
 	run_linux_clippy: false,
 	run_e2e_hub: false,
@@ -305,6 +314,21 @@ const TABLE = [
 			run_linux_clippy: true,
 			run_e2e_chronogazer: true
 		}
+	],
+	[
+		'banto-driver-api（R1-1 の公開 crate。MSRV / semver の driver-api ジョブが走る）',
+		['crates/banto-driver-api/src/types.rs', 'crates/banto-driver-api/CHANGELOG.md'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: '-p banto-driver-api -p banto-plc',
+			run_driver_api: true
+		}
+	],
+	[
+		'banto-driver-api の逆依存（banto-plc）だけの変更では driver-api ジョブは走らない',
+		['crates/banto-plc/src/decode.rs'],
+		{ ...NONE, run_rust: true, rust_args: '-p banto-plc' }
 	],
 	[
 		'逆依存の無い crate はその crate だけ',
@@ -723,6 +747,25 @@ test('実グラフ: 主な crate の逆依存が期待のパッケージを含�
 		for (const u of users) assert.ok(got.has(u), `${crate} の逆依存に ${u} が無い`);
 		assert.ok(got.size < g.packages.length, `${crate} の逆依存が workspace 全体になった`);
 	}
+});
+
+test('実グラフ: banto-driver-api は依存ゼロで、変更すると driver-api ジョブが走る', () => {
+	const g = real();
+	const api = g.packages.find((p) => p.name === 'banto-driver-api');
+	assert.ok(api, 'banto-driver-api が workspace に無い');
+	assert.deepEqual(
+		api.deps,
+		[],
+		'banto-driver-api に workspace の依存ができた（公開できなくなる）'
+	);
+	assert.ok(reverseDeps(g, ['banto-driver-api']).has('banto-plc'));
+	const jobs = classify({
+		event: 'pull_request',
+		files: ['crates/banto-driver-api/src/lib.rs'],
+		graph: g
+	}).jobs;
+	assert.equal(jobs.run_driver_api, true);
+	assert.equal(jobs.run_rust, true);
 });
 
 test('実グラフ: crates/ の下の追跡ファイルはすべてどれかのパッケージに属する', (t) => {

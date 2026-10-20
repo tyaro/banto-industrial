@@ -3,95 +3,20 @@
 
 use crate::address::Address;
 
-/// A tag's wire data type. Mirrors `banto-tags::ALLOWED_DATA_TYPES`
-/// (`"bit" | "i16" | "u16" | "i32" | "u32" | "f32" | "i64" | "u64" | "f64"`)
-/// one-for-one by design - this crate does not depend on `banto-tags` (I2
-/// does not depend on I1 in docs/plan.md's dependency graph; I3 is the one
-/// that bridges them), so the correspondence is kept in sync by convention
-/// and by [`DataType::parse`]'s tests rather than a shared type.
-///
-/// This crate decodes bytes off the wire and does not know which
-/// `PlcConnection` protocol a tag belongs to - `register_span` and
-/// [`crate::decode::decode_register_value`] treat every variant here
-/// (including `I64`/`U64`/`F64`) the same regardless of protocol. Whether a
-/// given data type is *allowed to be registered* for a given protocol is a
-/// `banto-tags` decision, not this crate's: `banto-tags` restricts
-/// `I64`/`U64`/`F64` to Modbus connections (owner decision, 2026-09-08) by
-/// checking the connection's protocol at tag-registration time, so in
-/// practice these three variants never reach the SLMP decode path even
-/// though nothing in this crate itself enforces that.
-///
-/// `I64`/`U64` values are widened to [`TagValue::F64`] like every other
-/// numeric type (see that type's doc comment) - integers beyond
-/// `2^53` lose precision once represented as `f64`. This is an accepted
-/// limitation (owner decision, 2026-09-08), not a bug: a KM-D1-ETN-class
-/// instrument's readings never approach that magnitude in practice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DataType {
-    Bit,
-    I16,
-    U16,
-    I32,
-    U32,
-    F32,
-    I64,
-    U64,
-    F64,
-}
-
-impl DataType {
-    /// Parse `banto-tags::Tag::data_type`'s string form. A convenience for
-    /// I3's glue code (not used by this crate itself); returns `None` rather
-    /// than a `PlcError` because an unrecognized string here is a
-    /// `banto-tags` schema/`CHECK`-constraint bug, not a runtime PLC
-    /// condition - callers should treat it as a programmer error, not
-    /// something to fold into a per-tag `ReadResult::Bad`.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "bit" => Some(DataType::Bit),
-            "i16" => Some(DataType::I16),
-            "u16" => Some(DataType::U16),
-            "i32" => Some(DataType::I32),
-            "u32" => Some(DataType::U32),
-            "f32" => Some(DataType::F32),
-            "i64" => Some(DataType::I64),
-            "u64" => Some(DataType::U64),
-            "f64" => Some(DataType::F64),
-            _ => None,
-        }
-    }
-
-    /// How many consecutive registers this type occupies (v1: bit types
-    /// live in the coil/discrete-input area instead and this method is
-    /// never called for them by [`crate::planning::plan_requests`] - see
-    /// `element_span`'s doc comment there for why `Bit` still needs *a*
-    /// answer rather than panicking).
-    pub(crate) fn register_span(self) -> u16 {
-        match self {
-            DataType::Bit => 1,
-            DataType::I16 | DataType::U16 => 1,
-            DataType::I32 | DataType::U32 | DataType::F32 => 2,
-            DataType::I64 | DataType::U64 | DataType::F64 => 4,
-        }
-    }
-}
-
-impl std::fmt::Display for DataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            DataType::Bit => "bit",
-            DataType::I16 => "i16",
-            DataType::U16 => "u16",
-            DataType::I32 => "i32",
-            DataType::U32 => "u32",
-            DataType::F32 => "f32",
-            DataType::I64 => "i64",
-            DataType::U64 => "u64",
-            DataType::F64 => "f64",
-        };
-        f.write_str(s)
-    }
-}
+// R1-1 (docs/banto-driver-api-design.md §3.1): the value/data-type vocabulary
+// moved to the published, dependency-free `banto-driver-api` crate so that
+// drivers outside this repository can share it. Re-exported here under the
+// old names and paths (`banto_plc::types::DataType`, `banto_plc::PlcValue`, ...)
+// so no caller changed. They are deliberately not `#[non_exhaustive]` - callers
+// outside that crate (`banto-plc-write`'s encoder, banto-hub's write path)
+// match on them exhaustively. `DataType::register_span` moved with the type
+// (an inherent method can only live in the type's crate) and is now `pub`;
+// this crate's planners and decoder call it unchanged. The tests that covered
+// only these items (`data_type_parse_*`, `register_span_*`) moved with them.
+/// The string-capable superset of [`TagValue`] - `banto_driver_api::Value`
+/// under its pre-R1-1 name. See that type's documentation.
+pub use banto_driver_api::Value as PlcValue;
+pub use banto_driver_api::{DataType, StringEncoding, TagValue};
 
 /// One tag to read: where, and how to interpret it. Cheap to construct in
 /// bulk (`Copy`) - a collection group's poll cycle builds one of these per
@@ -100,24 +25,6 @@ impl std::fmt::Display for DataType {
 pub struct ReadRequest {
     pub address: Address,
     pub data_type: DataType,
-}
-
-/// A decoded reading, always widened to `f64` for numeric types (docs/plan.md
-/// I2 §1: "数値は最終的にf64へ") - the scaling step (`banto-tags::scale_raw`)
-/// and every downstream consumer (trend charts, thresholds) works in `f64`
-/// regardless of the tag's wire width, so there is no reason to carry
-/// `i16`/`u32`/`f32` past this crate's boundary. `Bit` stays a `bool`
-/// because "scaled bit" is not a meaningful concept (recorder-requirements.md
-/// has no scaling story for bit tags).
-///
-/// `I64`/`U64` values are widened into this same `f64` unchanged (owner
-/// decision, 2026-09-08: no new variant for 64-bit integers) - values beyond
-/// `2^53` lose precision as a result. See [`DataType`]'s doc comment for why
-/// this is accepted rather than fixed.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TagValue {
-    Bit(bool),
-    F64(f64),
 }
 
 /// The outcome for one [`ReadRequest`] within a [`crate::client::PlcClient::read_batch`]
@@ -144,46 +51,6 @@ pub enum ReadResult {
 // / [`PlcValue`] / [`BatchReadResult`] - that wraps the existing numeric types
 // unchanged; the numeric-only API keeps its exact shape and the S2 broker can
 // move to the batch API to mix numeric and string reads in one call.
-
-/// Character encoding used to decode a [`StringReadRequest`]'s word span off
-/// the wire (T20 ①b, docs/banto-hub-t20-design.md §3.1, read-on-demand -
-/// mirrors ①a's write-side [`StringWriteRequest::encoding`] one-for-one).
-/// Selects which `encoding_rs` table `decode.rs::decode_string_value` uses;
-/// the byte-packing convention itself (low byte first within each word -
-/// MELSEC's storage convention) is unaffected by this choice, exactly as
-/// [`crate::decode::WordOrder`] only ever governs 32-bit/64-bit numeric word
-/// order, never a string's byte order within a word.
-///
-/// **Defined here, not in `banto-plc-write`, even though ①a's
-/// `StringWriteRequest` needed the identical enum first**: `banto-plc-write`
-/// depends on `banto-plc` (never the reverse - see `banto-plc-write/Cargo.toml`'s
-/// module doc), so only this crate can hold a type both directions share.
-/// `banto-plc-write` now re-exports this one (`pub use banto_plc::StringEncoding`
-/// in its `lib.rs`) instead of defining its own - the wire-visible name
-/// `banto_plc_write::StringEncoding` is unchanged for every ①a call site
-/// (relay-wright's `writer.rs`/`monitor.rs`, `banto-broker`'s driver/examples),
-/// so none of them needed to change for this move.
-///
-/// **Why this crate's Shift-JIS-only read behaviour predates this enum**:
-/// every site that already built a [`StringReadRequest`] before T20 ①b
-/// (relay-wright's `apps/relay-wright/core/src/engine/poller.rs`, this
-/// crate's own planner/integration tests, `banto-broker`'s example/tests)
-/// read Shift-JIS unconditionally. Adding this field to the struct
-/// necessarily touches every one of those call sites (Rust struct literals
-/// cannot omit a new field), so the owner decision ("relay-wright の挙動を
-/// 変えないこと") is kept the same way ①a kept it on the write side: every
-/// pre-existing site passes [`StringEncoding::ShiftJis`] explicitly, never a
-/// silently-assumed default. Only `apps/banto-hub`'s read-on-demand path
-/// (new in this slice) ever passes [`StringEncoding::Utf8`], and only when
-/// the registered tag's `banto_tags::Tag::string_encoding` says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StringEncoding {
-    /// The hub's default for newly registered string tags (matches ①a's
-    /// write-side default).
-    Utf8,
-    /// This crate's pre-T20 read behaviour, and relay-wright's only encoding.
-    ShiftJis,
-}
 
 /// One MELSEC string tag to read: where, how many consecutive 16-bit word
 /// devices it occupies (`banto-tags::Tag::string_length`; SJIS capacity =
@@ -223,84 +90,10 @@ impl From<ReadRequest> for BatchReadRequest {
     }
 }
 
-/// A decoded reading that can also carry a string - the string-capable
-/// superset of [`TagValue`], used by the mixed-batch API only. Not `Copy`
-/// (a `String` cannot be), which is exactly why it is a separate type; see
-/// the module-level note above.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PlcValue {
-    Bit(bool),
-    F64(f64),
-    /// Shift-JIS text decoded from the tag's word span, trimmed at the first
-    /// NUL terminator (so trailing 0x00 padding never survives into the
-    /// value).
-    Str(String),
-}
-
-impl From<TagValue> for PlcValue {
-    fn from(value: TagValue) -> Self {
-        match value {
-            TagValue::Bit(b) => PlcValue::Bit(b),
-            TagValue::F64(v) => PlcValue::F64(v),
-        }
-    }
-}
-
-impl PlcValue {
-    /// The numeric/bit projection, `None` for a string - the bridge back to
-    /// the legacy [`TagValue`]-shaped API where a string can never appear.
-    pub fn as_tag_value(&self) -> Option<TagValue> {
-        match self {
-            PlcValue::Bit(b) => Some(TagValue::Bit(*b)),
-            PlcValue::F64(v) => Some(TagValue::F64(*v)),
-            PlcValue::Str(_) => None,
-        }
-    }
-}
-
 /// The outcome for one [`BatchReadRequest`] within a mixed batch - the
 /// string-capable twin of [`ReadResult`], with the identical `Bad` semantics.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BatchReadResult {
     Value(PlcValue),
     Bad(crate::error::PlcError),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn data_type_parse_round_trips_every_banto_tags_string() {
-        // Kept in sync with banto-tags::ALLOWED_DATA_TYPES by hand (see this
-        // module's doc comment) - this test is the tripwire: if someone adds
-        // a data type to banto-tags without adding it here, this list (not a
-        // shared constant) is what has to be remembered to update, and this
-        // test at least proves the reverse direction (Display) matches too.
-        for s in [
-            "bit", "i16", "u16", "i32", "u32", "f32", "i64", "u64", "f64",
-        ] {
-            let dt = DataType::parse(s).unwrap_or_else(|| panic!("{s} should parse"));
-            assert_eq!(dt.to_string(), s);
-        }
-    }
-
-    #[test]
-    fn data_type_parse_rejects_unknown_string() {
-        assert_eq!(DataType::parse("i128"), None);
-        assert_eq!(DataType::parse("f16"), None);
-        assert_eq!(DataType::parse(""), None);
-    }
-
-    #[test]
-    fn register_span_is_one_for_16_bit_two_for_32_bit_and_four_for_64_bit() {
-        assert_eq!(DataType::I16.register_span(), 1);
-        assert_eq!(DataType::U16.register_span(), 1);
-        assert_eq!(DataType::I32.register_span(), 2);
-        assert_eq!(DataType::U32.register_span(), 2);
-        assert_eq!(DataType::F32.register_span(), 2);
-        assert_eq!(DataType::I64.register_span(), 4);
-        assert_eq!(DataType::U64.register_span(), 4);
-        assert_eq!(DataType::F64.register_span(), 4);
-    }
 }

@@ -156,8 +156,12 @@ export const RUST_PACKAGES = {
  *   入るときだけ。ci.yml の段の `if:`）と、同じく `-p banto-safe-root`
  * - e2e-hub: `-p banto-hub-core --bin banto-hub`
  * - e2e-chronogazer: `-p chronogazer-core`（banto-serve・dev_plc・chronogazer-server）
+ * - driver-api: `-p banto-driver-api`（MSRV の check・`--all-features` の clippy / test・
+ *   cargo-semver-checks。R1-1、docs/banto-driver-api-design.md §9.1）。R1-2 で
+ *   `banto-driver-conformance` を足す
  */
 export const JOB_PACKAGES = {
+	run_driver_api: ['banto-driver-api'],
 	run_rust_db_source: ['banto-hub-core', 'banto-hub-sink'],
 	run_linux_clippy: [
 		'chronogazer-elev',
@@ -380,6 +384,7 @@ export function derive(a, crateAffected = []) {
 						.sort()
 						.map((p) => `-p ${p}`)
 						.join(' '),
+		run_driver_api: rustWorkspace || hits('run_driver_api'),
 		run_rust_db_source: rustWorkspace || a.hub || a.hub_sink || hits('run_rust_db_source'),
 		run_linux_clippy: rustWorkspace || hits('run_linux_clippy'),
 		run_e2e_hub: rustWorkspace || a.frontend_all || a.hub || a.e2e_hub || hits('run_e2e_hub'),
