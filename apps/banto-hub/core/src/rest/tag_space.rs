@@ -10,17 +10,16 @@
 use super::{
     api_key_rejection_response, api_key_verdict, bearer_token, broadcast,
     connections_with_collected_groups, effective_simulation_for_tag, extract_ws_protocol_token,
-    forbidden_response, get, is_supported_protocol, json, middleware, post,
-    session_token_cannot_write_response, unauthorized_response, v1_events, v1_write_value,
-    v1_write_values_batch, value_source_for_tag, ApiError, ApiKeyContext, ApiKeysService,
-    ApplyReport, Arc, AsyncMutex, AuditEntry, AuditLogService, AuthState, BantoError,
-    BrokerConnectionStatus, CollectionController, CollectionGroupService, CollectionState,
-    CollectionStatus, CollectorManager, ComputedEngine, ConnectionStatus, Db, Deserialize,
-    Extension, HubSettingsExt, IntoResponse, Json, ListParams, Method, MqttPublisher, Path,
-    PlcConnectionService, Query, Response, Router, RunMode, Serialize, ServerEvent,
-    SettingsService, SinkStatusSnapshot, SinkStatusStore, State, StatusCode, SystemInfoSampler,
-    SystemInfoSnapshot, TagEntry, TagMap, ToSchema, WriteAuditService, WriteControl,
-    WriteRateLimiter, WriteState,
+    forbidden_response, get, json, middleware, post, session_token_cannot_write_response,
+    unauthorized_response, v1_events, v1_write_value, v1_write_values_batch, value_source_for_tag,
+    ApiError, ApiKeyContext, ApiKeysService, ApplyReport, Arc, AsyncMutex, AuditEntry,
+    AuditLogService, AuthState, BantoError, BrokerConnectionStatus, CollectionController,
+    CollectionGroupService, CollectionState, CollectionStatus, CollectorManager, ComputedEngine,
+    ConnectionStatus, Db, Deserialize, Extension, HubSettingsExt, IntoResponse, Json, ListParams,
+    Method, MqttPublisher, Path, PlcConnectionService, Query, Response, Router, RunMode, Serialize,
+    ServerEvent, SettingsService, SinkStatusSnapshot, SinkStatusStore, State, StatusCode,
+    SystemInfoSampler, SystemInfoSnapshot, TagEntry, TagMap, ToSchema, WriteAuditService,
+    WriteControl, WriteRateLimiter, WriteState,
 };
 
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
@@ -880,7 +879,7 @@ pub(crate) struct StatusResponse {
 /// catalog) so a connection with zero tags still appears.
 ///
 /// T2-2/#131 (docs/tag-server-design.md §6-5, 2026-08-05 決定): a
-/// broker-managed connection's status (per `banto_broker::is_supported_protocol`;
+/// broker-managed connection's status (per `HubSessions::is_broker_managed`;
 /// `"slmp"` and, as of #131, 2026-09-01, `"modbus-tcp"` too) comes from
 /// [`crate::hub::CollectorManager::broker_status`] (the broker's own
 /// `ConnState`) instead of `banto_collect`'s own status map - see
@@ -929,10 +928,11 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
         .grpc_config()
         .await?;
 
+    let sessions = state.manager.sessions();
     let entries: Vec<ConnectionStatusEntry> = connections
         .into_iter()
         .map(|conn| {
-            let (status_str, attempt) = if is_supported_protocol(&conn.protocol) {
+            let (status_str, attempt) = if sessions.is_broker_managed(&conn.protocol) {
                 // T19 S2-a (UX-48): a connection with no enabled collection
                 // group gets no broker session pre-synced at all (see
                 // `CollectorManager::sync_broker_sessions_from`'s doc comment),

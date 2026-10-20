@@ -649,6 +649,7 @@ dependencies = [
 name = "banto-broker"
 version = "0.2.0-alpha.32"
 dependencies = [
+ "banto-driver-api",
  "banto-plc",
  "banto-plc-write",
  "banto-tags",

@@ -4,7 +4,7 @@
 //! can share that same session ("読み書き単一セッション").
 //!
 //! **#131 (2026-09-01) update**: this is no longer SLMP-only. `banto-broker`
-//! also has a `"modbus-tcp"` driver (`banto_broker::is_supported_protocol`),
+//! also has a `"modbus-tcp"` driver (`HubSessions::is_broker_managed`),
 //! and this module's write/status surface
 //! (`HubSessions::write_broker_handle_peek`,
 //! `CollectorManager::broker_status`) is wired generically for any
@@ -183,8 +183,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_broker::{
-    BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerSupervisor, ReadOnlyHandle,
-    SessionDirectory,
+    BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerSupervisor, DriverTable,
+    ReadOnlyHandle, SessionDirectory,
 };
 use banto_plc::{
     BatchReadRequest, BatchReadResult, BoxFuture, PlcClient, PlcError, PlcValue, ReadRequest,
@@ -395,7 +395,7 @@ impl PlcClient for BrokerReadClient {
 /// `crate::hub::CollectorManager::rebuild` now performs a full sync each
 /// call - `ensure_connection` for every currently-enabled connection whose
 /// protocol the broker manages (unchanged, additive - as of #131,
-/// 2026-09-01, this is `banto_broker::is_supported_protocol`, i.e. `"slmp"`
+/// 2026-09-01, this is [`HubSessions::is_broker_managed`], i.e. `"slmp"`
 /// and `"modbus-tcp"`, not just SLMP), THEN [`HubSessions::remove`] for every
 /// connection id this directory still tracks (via
 /// [`banto_broker::SessionDirectory::connection_ids`]) that is no longer in
@@ -432,6 +432,11 @@ impl PlcClient for BrokerReadClient {
 /// transition-lock discipline.
 pub struct HubSessions {
     directory: SessionDirectory,
+    /// The same [`DriverTable`] the supervisor below was spawned with (R1-3a,
+    /// docs/banto-driver-api-design.md §4.4) - kept here so
+    /// [`Self::is_broker_managed`] answers from exactly the table
+    /// [`Self::ensure_connection`] dispatches through.
+    drivers: DriverTable,
     /// `Some` until [`Self::shutdown`] consumes it (`BrokerSupervisor::shutdown`
     /// takes `self` by value) - guarded by an async mutex rather than
     /// `std::sync::Mutex` because `shutdown` itself is `.await`-heavy (drains
@@ -447,18 +452,36 @@ impl HubSessions {
     /// [`Self::ensure_connection`] grows on demand as `CollectorManager`
     /// discovers broker-managed connections during its first (and every
     /// later) rebuild.
+    ///
+    /// R1-3a: the driver table is [`DriverTable::builtin`] (`"slmp"` and
+    /// `"modbus-tcp"`, the same pair as before); R1-3b injects it from the
+    /// composition root instead (docs/banto-driver-api-design.md §6.4).
     pub fn new(backoff: banto_broker::BackoffConfig) -> Self {
-        let supervisor = BrokerSupervisor::spawn(&[], backoff)
+        let drivers = DriverTable::builtin();
+        let supervisor = BrokerSupervisor::spawn(&[], backoff, drivers.clone())
             .expect("spawning a broker supervisor with zero connections cannot fail");
         let directory = supervisor.directory();
         Self {
             directory,
+            drivers,
             supervisor: AsyncMutex::new(Some(supervisor)),
         }
     }
 
+    /// Whether the broker manages connections of `protocol` - i.e. whether
+    /// [`Self::ensure_connection`] would spawn a session for one rather than
+    /// reject it with [`BrokerError::UnsupportedProtocol`]. The single source
+    /// of truth for every "is this a broker-managed connection" gate in this
+    /// crate (session sync in `CollectorManager`, the read-now and write
+    /// protocol gates, `/api/v1/status`) - R1-3a replaced the former free
+    /// function in `banto_broker` with this, answered from the same
+    /// [`DriverTable`] the supervisor dispatches through.
+    pub fn is_broker_managed(&self, protocol: &str) -> bool {
+        self.drivers.is_supported(protocol)
+    }
+
     /// The handle for `conn` (must be a protocol the broker manages -
-    /// `banto_broker::is_supported_protocol`, currently `"slmp"` and
+    /// [`Self::is_broker_managed`], currently `"slmp"` and
     /// `"modbus-tcp"`), spawning its broker task on first sight and reusing
     /// the same live session on every later call for the same connection id -
     /// see this struct's "Session sync policy" doc section.

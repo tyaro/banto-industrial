@@ -38,8 +38,8 @@
 //!    定義上の拒否)
 //! 3. 実効 enabled == false → [`WriteRejection::TagDisabled`]
 //! 4. 接続のプロトコルに broker ドライバが登録されていない →
-//!    [`WriteRejection::UnsupportedProtocol`](`banto_broker::is_supported_protocol`/
-//!    `banto_broker::DRIVERS` が唯一の正 - #131（2026-09-01）以降、slmp と
+//!    [`WriteRejection::UnsupportedProtocol`](`HubSessions::is_broker_managed`/
+//!    `banto_broker::DriverTable` が唯一の正 - #131（2026-09-01）以降、slmp と
 //!    modbus-tcp の両方がこのゲートを通過する。Modbus は Numeric（数値/
 //!    ビット、FC5/6/15/16）のみ対応、String は broker 側で per-request Bad
 //!    になる）
@@ -154,7 +154,6 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use banto_broker::is_supported_protocol;
 use banto_collect::Quality;
 use banto_core::BantoError;
 use banto_plc::{Address, DataType, TagValue as PlcTagValue};
@@ -648,8 +647,8 @@ async fn resolve_write_target(
     // [`write_target_detail`] が使う。
 
     // gate 4: 接続のプロトコルに broker ドライバが登録されていなければ
-    // 非対応(#131、2026-09-01: `banto_broker::is_supported_protocol`/
-    // `banto_broker::DRIVERS` が唯一の正 - 現状 slmp と modbus-tcp の両方が
+    // 非対応(#131、2026-09-01: `HubSessions::is_broker_managed`/
+    // `banto_broker::DriverTable` が唯一の正 - 現状 slmp と modbus-tcp の両方が
     // 登録済みなので、このゲートを実際に通過できないのは未登録プロトコル
     // だけになった。banto-tags の `ALLOWED_PROTOCOLS` は `"virtual"` も
     // 許可しているが、`"virtual"` 接続配下には PLC 種別タグを作成できない
@@ -673,7 +672,7 @@ async fn resolve_write_target(
             .get(connection_id)
             .await
             .map_err(map_registry_error)?;
-        if !is_supported_protocol(&conn.protocol) {
+        if !deps.manager.sessions().is_broker_managed(&conn.protocol) {
             return Err(WriteRejection::UnsupportedProtocol);
         }
         Some(conn)

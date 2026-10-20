@@ -51,7 +51,7 @@
 //! sync policy」参照）。T7-2 で `banto_broker::SessionDirectory::remove` が
 //! 追加されたことを受け、[`CollectorManager::rebuild`] は毎回「追加 +
 //! 削除」の完全同期を行う: レジストリの現在の有効な broker 管理対象プロト
-//! コル接続集合（#131、2026-09-01: `banto_broker::is_supported_protocol` -
+//! コル接続集合（#131、2026-09-01: `HubSessions::is_broker_managed` -
 //! 現状 slmp と modbus-tcp。以前は slmp のみだった）を
 //! `ensure_connection`（従来どおり）した後、**Collector 側のコミットが
 //! 成功した後で**（= 削除対象接続の collect タスクが既に停止済みである
@@ -196,9 +196,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{broadcast, watch};
 
-use banto_broker::{
-    is_supported_protocol, BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle,
-};
+use banto_broker::{BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle};
 use banto_collect::{
     build_config_from, connections_with_collected_groups, ApplyReport, CollectEvent, Collector,
     CollectorOptions, ConnectionStatus, CurrentReading, CurrentSample, CurrentValuesHandle,
@@ -1458,8 +1456,8 @@ impl CollectorManager {
 
         // T2-2/T7-2/#131 (docs/tag-server-design.md §6-5/§4.3): additive
         // ensure_connection (unchanged from T2-2, now covers every
-        // broker-managed protocol - `banto_broker::is_supported_protocol`,
-        // not just SLMP) plus the set of tracked ids that are no longer
+        // broker-managed protocol - `HubSessions::is_broker_managed`, not
+        // just SLMP) plus the set of tracked ids that are no longer
         // wanted - see `Self::sync_broker_sessions_from`'s doc comment.
         // Deliberately unconditional (runs even when `config.group_count()
         // == 0` just below) - independent of whether the resulting
@@ -1797,7 +1795,7 @@ impl CollectorManager {
     /// §1): additive `ensure_connection` (unchanged from T2-2) over
     /// `self.sessions`'s broker tasks against the registry's current
     /// enabled-and-broker-managed-protocol connection set (`#131`,
-    /// 2026-09-01: `banto_broker::is_supported_protocol` - `"slmp"` and
+    /// 2026-09-01: `HubSessions::is_broker_managed` - `"slmp"` and
     /// `"modbus-tcp"` today), returning the `"conn:{id}"`-keyed handle map
     /// [`crate::broker_glue::hub_client_factory`] needs, the connection ids
     /// `self.sessions` still tracks that are NOT in that set (deleted from
@@ -1988,7 +1986,7 @@ impl CollectorManager {
         // `crate::broker_glue::hub_client_factory`'s doc comment.
         for conn in snapshot.connections.iter().filter(|c| {
             c.enabled
-                && is_supported_protocol(&c.protocol)
+                && self.sessions.is_broker_managed(&c.protocol)
                 && collectible_connection_ids.contains(&c.id)
         }) {
             wanted_ids.insert(conn.id);
@@ -2007,7 +2005,7 @@ impl CollectorManager {
 
             // #337 (2026-09-08): there used to be a `if conn.protocol ==
             // "slmp"` filter here, deliberately narrower than the
-            // `is_supported_protocol` filter above, building a separate
+            // `is_broker_managed` filter above, building a separate
             // `read_routed_keys` set. Its reason: `hub_client_factory`'s
             // `ModbusTcp` arm read through banto-collect's own direct
             // `ModbusTcpClient` (#131 moved only Modbus writes/status onto
@@ -2157,7 +2155,7 @@ impl CollectorManager {
     /// T2-2/#131 (docs/tag-server-design.md §6-5): the broker's own
     /// connection status for a broker-managed connection, or `None` if no
     /// broker session has ever been started for it (never a protocol the
-    /// broker manages - `banto_broker::is_supported_protocol` - or no
+    /// broker manages - `HubSessions::is_broker_managed` - or no
     /// rebuild has run yet). Used by `crate::rest`'s `/api/v1/status` handler
     /// in place of [`Self::connection_status`] for connections whose
     /// protocol the broker manages (as of #131, 2026-09-01: `"slmp"` and

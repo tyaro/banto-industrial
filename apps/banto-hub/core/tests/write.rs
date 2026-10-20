@@ -852,7 +852,7 @@ async fn gate_disabled_tag_is_409_tag_disabled() {
 /// 5, formerly a literal `conn.protocol != "slmp"` check) with a 501. That
 /// premise is now false - `banto_broker` registered a `"modbus-tcp"` driver
 /// (#131), `write_path::execute_write`'s protocol gate is now
-/// `banto_broker::is_supported_protocol`, and a Modbus tag no longer trips it
+/// `HubSessions::is_broker_managed`, and a Modbus tag no longer trips it
 /// at all. Renamed (matching how `crates/banto-broker`'s own
 /// `supervisor_rejects_a_modbus_tcp_connection` was renamed to
 /// `supervisor_rejects_an_unsupported_protocol_connection` in the same PR)
@@ -902,7 +902,7 @@ async fn gate_modbus_connection_now_passes_the_protocol_gate_and_fails_only_at_t
 /// gate (gate 5) still rejects a connection whose protocol has no
 /// `banto_broker` driver - proven here with `"virtual"`
 /// (`banto_tags::ALLOWED_PROTOCOLS` allows it at the registry layer, but
-/// `banto_broker::is_supported_protocol` does not, so it is a genuine
+/// `HubSessions::is_broker_managed` does not, so it is a genuine
 /// still-unsupported protocol string, unlike `"modbus-tcp"` above). A `plc`
 /// tag cannot normally be placed under any `"virtual"`-protocol connection
 /// (`banto_tags::tag::validate_tag_kind_placement` rejects it unconditionally

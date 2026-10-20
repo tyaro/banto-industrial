@@ -25,7 +25,7 @@
 //!    [`ReadNowRejection::NotPlcBacked`]。cache 読みを使うべき)
 //! 3. 接続のプロトコルに broker ドライバが登録されていない →
 //!    [`ReadNowRejection::UnsupportedProtocol`](①a の gate 5 と同じ
-//!    `banto_broker::is_supported_protocol` が唯一の正)
+//!    `HubSessions::is_broker_managed` が唯一の正)
 //! 4. peek handle が無い(収集停止中等、新規にはダイヤルしない) →
 //!    [`ReadNowRejection::NoSession`]
 //! 5. broker からの応答が per-request Bad、または `handle.read` 自体が
@@ -54,7 +54,6 @@
 //! 同じ理由)。ビットも(cache 読みと同じく、`banto_collect::task::record_group`
 //! 参照)スケーリングしない。
 
-use banto_broker::is_supported_protocol;
 use banto_core::BantoError;
 use banto_plc::{
     Address, BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, StringReadRequest,
@@ -177,7 +176,7 @@ pub async fn execute_read_now(
         .map_err(map_registry_error)?;
 
     // gate 3: ①a の gate 5 と同じプロトコルゲート。
-    if !is_supported_protocol(&conn.protocol) {
+    if !manager.sessions().is_broker_managed(&conn.protocol) {
         return Err(ReadNowRejection::UnsupportedProtocol);
     }
 
