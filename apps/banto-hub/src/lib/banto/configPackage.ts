@@ -21,11 +21,26 @@ import type { MqttSettings } from './mqttSettingsAdmin';
 import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
 
 /**
- * #533（2026-10-08）でタグのしきい値（`thresholdH`/`thresholdHh`/`thresholdL`/
- * `thresholdLl`）を外したが、版は 1 のまま: export は書かなくなり、取り込みは
- * 項目なし・`null` を通し、値付きは拒否する（`rejectTagThresholds`）。
+ * 版 2（2026-10-19 オーナー決定）: 収集グループ名が「接続内で一意」になった
+ * （banto-tags の migration 0022）ので、名前だけの参照では同じ名前のグループ・
+ * タグを区別できない。グループは `(plcConnectionName, name)`、タグは
+ * `(plcConnectionName, collectionGroupName, name)` で識別し、sink group の
+ * タグ参照も同じ 3 つ組（`ConfigPackageTagRef`）にした。
+ *
+ * **版 1 のパッケージは読まない**（互換性は持たない - 同日のオーナー決定）。
+ * `parseConfigPackage` は版 1 を「未対応の版」として断り、今の banto-hub で
+ * 書き出し直すよう案内する。export は常に版 2 を書く。版 1 の間に足した
+ * 「省略を許す」項目（`wordOrder`・`cpuType`・`defaultWritable`・
+ * `stringEncoding`・`querySql`・`database`/`username`・`sinkGroups`）の
+ * 扱いは版 2 でも変えていない（下の各 `expect*` の doc の「旧パッケージ」は
+ * 版 1 の時代の記述）。
+ *
+ * （版 1 の時代の経緯: #533（2026-10-08）でタグのしきい値（`thresholdH`/
+ * `thresholdHh`/`thresholdL`/`thresholdLl`）を外した。export は書かず、取り込みは
+ * 項目なし・`null` を通し、値付きは拒否する（`rejectTagThresholds`）- 版 2 でも
+ * 同じ。）
  */
-export const CONFIG_PACKAGE_SCHEMA_VERSION = 1 as const;
+export const CONFIG_PACKAGE_SCHEMA_VERSION = 2 as const;
 export const CONFIG_PACKAGE_PRODUCT = 'banto-hub' as const;
 
 export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
@@ -61,8 +76,46 @@ export interface ConfigPackageCollectionGroup extends Omit<
 	plcConnectionName: string;
 }
 
+/**
+ * 版 2: タグは所属グループの接続名も持つ - グループ名は接続内でしか一意でない
+ * （2026-10-19 オーナー決定）ので、`collectionGroupName` だけではどのグループか
+ * 決まらない。パッケージ内のタグは `(plcConnectionName, collectionGroupName,
+ * name)` で一意（タグ名はグループ内で一意、migration 0011）。
+ */
 export interface ConfigPackageTag extends Omit<TagInput, 'collectionGroupId' | 'expectedRevision'> {
+	plcConnectionName: string;
 	collectionGroupName: string;
+}
+
+/**
+ * 版 2: sink group などがタグを指す参照。外部名（`接続.グループ.タグ`）の文字列に
+ * しないのは、名前に `.` を含められて文字列としては曖昧になりうるため（#635）。
+ */
+export interface ConfigPackageTagRef {
+	plcConnectionName: string;
+	collectionGroupName: string;
+	tagName: string;
+}
+
+/**
+ * パッケージ内・現在の環境の両方で、グループ・タグを照合するキー。名前に
+ * どんな文字が入っても区切りが曖昧にならないよう JSON の配列にする。
+ */
+export function configPackageGroupKey(plcConnectionName: string, groupName: string): string {
+	return JSON.stringify([plcConnectionName, groupName]);
+}
+
+export function configPackageTagKey(
+	plcConnectionName: string,
+	groupName: string,
+	tagName: string
+): string {
+	return JSON.stringify([plcConnectionName, groupName, tagName]);
+}
+
+/** エラー・警告の文言用（`接続 / グループ / タグ`）。 */
+export function describeConfigPackageTagRef(ref: ConfigPackageTagRef): string {
+	return `${ref.plcConnectionName} / ${ref.collectionGroupName} / ${ref.tagName}`;
 }
 
 export type ConfigPackageMqttSettings = Omit<MqttSettings, 'username'>;
@@ -73,8 +126,9 @@ export type ConfigPackageGrpcSettings = GrpcSettings;
  * Sink group 1件分 - `SinkGroup`から`id`/`dbConnectionId`/`tagIds`
  * （数値 id、環境をまたぐと再現できない）を除き、代わりに**名前で**参照する
  * （`ConfigPackageCollectionGroup::plcConnectionName`と同じ考え方 - タグの
- * 参照は他のエンティティ（`ConfigPackageTag`）と同じく`name`をキーにする
- * ことで、タグ id が環境間で異なっても import 側で解決できる）。
+ * 参照は`ConfigPackageTag`と同じ `接続名・グループ名・タグ名` の 3 つ組
+ * （版 2、`ConfigPackageTagRef`）をキーにすることで、タグ id が環境間で
+ * 異なっても import 側で解決できる）。
  * `storeBad`/`enabled`/`mode`/`intervalMs`/`tableName`は秘密情報を含まない
  * ためそのまま export する（`CONFIG_PACKAGE_EXCLUDED_SECRETS`に追加項目は
  * 無い - sink group 自体に資格情報は無く、参照する DB 接続のパスワードは
@@ -88,7 +142,8 @@ export interface ConfigPackageSinkGroup {
 	tableName: string;
 	storeBad: boolean;
 	enabled: boolean;
-	tagNames: string[];
+	/** 版 2: 名前だけの `tagNames` から 3 つ組の参照へ（`ConfigPackageTagRef`）。 */
+	tags: ConfigPackageTagRef[];
 }
 
 export interface ConfigPackage {
@@ -393,9 +448,10 @@ function sanitizeGroup(
 	};
 }
 
-function sanitizeTag(input: Tag, groupName: string): ConfigPackageTag {
+function sanitizeTag(input: Tag, connectionName: string, groupName: string): ConfigPackageTag {
 	return {
 		name: input.name,
+		plcConnectionName: connectionName,
 		collectionGroupName: groupName,
 		address: input.address,
 		dataType: input.dataType,
@@ -419,7 +475,7 @@ function sanitizeTag(input: Tag, groupName: string): ConfigPackageTag {
  * S6: `SinkGroup`（GET応答、`dbConnectionId`/`tagIds`は数値 id）から export
  * 用の形へ詰め替える。`dbConnectionName`は呼び出し元（`buildConfigPackage`）
  * が解決済みの接続名を渡す - `sanitizeGroup`が`connectionName`を引数で
- * 受け取るのと同じ形。`tagIds`は`tagNameById`で名前へ変換し、解決できない
+ * 受け取るのと同じ形。`tagIds`は`tagRefById`で 3 つ組の参照へ変換し、解決できない
  * id（`hub_sink_group_tags`の孤児許容 - `crate::sink`のモジュール doc「FK を
  * 張らない理由」参照。タグ削除時は能動的にクリーンアップされるため、
  * export 時点でこの分岐へ入ることは通常無い）は黙って読み飛ばす -
@@ -428,7 +484,7 @@ function sanitizeTag(input: Tag, groupName: string): ConfigPackageTag {
 function sanitizeSinkGroup(
 	input: SinkGroup,
 	dbConnectionName: string,
-	tagNameById: ReadonlyMap<number, string>
+	tagRefById: ReadonlyMap<number, ConfigPackageTagRef>
 ): ConfigPackageSinkGroup {
 	return {
 		name: input.name,
@@ -438,9 +494,9 @@ function sanitizeSinkGroup(
 		tableName: input.tableName,
 		storeBad: input.storeBad,
 		enabled: input.enabled,
-		tagNames: input.tagIds
-			.map((tagId) => tagNameById.get(tagId))
-			.filter((name): name is string => name !== undefined)
+		tags: input.tagIds
+			.map((tagId) => tagRefById.get(tagId))
+			.filter((ref): ref is ConfigPackageTagRef => ref !== undefined)
 	};
 }
 
@@ -462,7 +518,6 @@ export function buildConfigPackage(input: {
 		input.plcConnections.map((connection) => [connection.id, connection])
 	);
 	const groupById = new Map(input.collectionGroups.map((group) => [group.id, group]));
-	const tagNameById = new Map(input.tags.map((tag) => [tag.id, tag.name]));
 
 	const collectionGroups = input.collectionGroups.map((group) => {
 		const connection = connectionById.get(group.plcConnectionId);
@@ -474,6 +529,7 @@ export function buildConfigPackage(input: {
 		return sanitizeGroup(group, connection.name);
 	});
 
+	const tagRefById = new Map<number, ConfigPackageTagRef>();
 	const tags = input.tags.map((tag) => {
 		const group = groupById.get(tag.collectionGroupId);
 		if (!group) {
@@ -481,7 +537,18 @@ export function buildConfigPackage(input: {
 				`tag '${tag.name}' の collectionGroupId=${tag.collectionGroupId} に対応する group が見つかりません`
 			);
 		}
-		return sanitizeTag(tag, group.name);
+		const connection = connectionById.get(group.plcConnectionId);
+		if (!connection) {
+			throw new ConfigPackageParseError(
+				`tag '${tag.name}' のグループ '${group.name}' の接続 id=${group.plcConnectionId} に対応する connection が見つかりません`
+			);
+		}
+		tagRefById.set(tag.id, {
+			plcConnectionName: connection.name,
+			collectionGroupName: group.name,
+			tagName: tag.name
+		});
+		return sanitizeTag(tag, connection.name, group.name);
 	});
 
 	const sinkGroups = (input.sinkGroups ?? []).map((group) => {
@@ -491,7 +558,7 @@ export function buildConfigPackage(input: {
 				`sink group '${group.name}' の接続 id=${group.dbConnectionId} に対応する connection が見つかりません`
 			);
 		}
-		return sanitizeSinkGroup(group, connection.name, tagNameById);
+		return sanitizeSinkGroup(group, connection.name, tagRefById);
 	});
 
 	return {
@@ -651,6 +718,7 @@ function parseTags(raw: unknown): ConfigPackageTag[] {
 		rejectTagThresholds(item, index);
 		return {
 			name: expectString(item.name, `tags[${index}].name`),
+			plcConnectionName: expectString(item.plcConnectionName, `tags[${index}].plcConnectionName`),
 			collectionGroupName: expectString(
 				item.collectionGroupName,
 				`tags[${index}].collectionGroupName`
@@ -695,9 +763,9 @@ function parseSinkGroups(raw: unknown): ConfigPackageSinkGroup[] {
 				`sinkGroups[${index}].mode は interval / on_change のいずれかである必要があります`
 			);
 		}
-		const tagNamesRaw = item.tagNames;
-		if (!Array.isArray(tagNamesRaw)) {
-			throw new ConfigPackageParseError(`sinkGroups[${index}].tagNames は配列である必要があります`);
+		const tagsRaw = item.tags;
+		if (!Array.isArray(tagsRaw)) {
+			throw new ConfigPackageParseError(`sinkGroups[${index}].tags は配列である必要があります`);
 		}
 		return {
 			name: expectString(item.name, `sinkGroups[${index}].name`),
@@ -710,9 +778,15 @@ function parseSinkGroups(raw: unknown): ConfigPackageSinkGroup[] {
 			tableName: expectString(item.tableName, `sinkGroups[${index}].tableName`),
 			storeBad: expectBoolean(item.storeBad, `sinkGroups[${index}].storeBad`),
 			enabled: expectBoolean(item.enabled, `sinkGroups[${index}].enabled`),
-			tagNames: tagNamesRaw.map((value, tagIndex) =>
-				expectString(value, `sinkGroups[${index}].tagNames[${tagIndex}]`)
-			)
+			tags: tagsRaw.map((value, tagIndex) => {
+				const path = `sinkGroups[${index}].tags[${tagIndex}]`;
+				const ref = expectRecord(value, path);
+				return {
+					plcConnectionName: expectString(ref.plcConnectionName, `${path}.plcConnectionName`),
+					collectionGroupName: expectString(ref.collectionGroupName, `${path}.collectionGroupName`),
+					tagName: expectString(ref.tagName, `${path}.tagName`)
+				};
+			})
 		};
 	});
 }
@@ -741,54 +815,99 @@ function parseGrpc(raw: unknown): ConfigPackageGrpcSettings {
 	};
 }
 
+/**
+ * 版 2: キーで重複を断る。`describe` は文言で重複した組を示す。
+ */
+function ensureUniqueKeys<T>(
+	items: readonly T[],
+	path: string,
+	key: (item: T) => string,
+	describe: (item: T) => string
+): void {
+	const seen = new Set<string>();
+	items.forEach((item, index) => {
+		const k = key(item);
+		if (seen.has(k)) {
+			throw new ConfigPackageParseError(
+				`${path}[${index}] は ${describe(item)} と重複しています（${path} の中で同じものは 1 つだけです）`
+			);
+		}
+		seen.add(k);
+	});
+}
+
 function validateReferences(pkg: ConfigPackage): void {
 	ensureUniqueNames(pkg.plcConnections, 'plcConnections');
-	ensureUniqueNames(pkg.collectionGroups, 'collectionGroups');
-	ensureUniqueNames(pkg.tags, 'tags');
+	// 2026-10-19 オーナー決定: グループ名は接続内で一意、タグ名はグループ内で一意。
+	ensureUniqueKeys(
+		pkg.collectionGroups,
+		'collectionGroups',
+		(group) => configPackageGroupKey(group.plcConnectionName, group.name),
+		(group) => `接続 '${group.plcConnectionName}' のグループ '${group.name}'`
+	);
+	ensureUniqueKeys(
+		pkg.tags,
+		'tags',
+		(tag) => configPackageTagKey(tag.plcConnectionName, tag.collectionGroupName, tag.name),
+		(tag) =>
+			`接続 '${tag.plcConnectionName}' のグループ '${tag.collectionGroupName}' のタグ '${tag.name}'`
+	);
 	ensureUniqueNames(pkg.sinkGroups, 'sinkGroups');
 
 	const connectionNames = new Set(pkg.plcConnections.map((connection) => connection.name));
 	connectionNames.add('calc');
 	connectionNames.add('mem');
-	for (const group of pkg.collectionGroups) {
+	pkg.collectionGroups.forEach((group, index) => {
 		if (!connectionNames.has(group.plcConnectionName)) {
 			throw new ConfigPackageParseError(
-				`collectionGroups '${group.name}' が参照する connection '${group.plcConnectionName}' が見つかりません`
+				`collectionGroups[${index}].plcConnectionName: グループ '${group.name}' が参照する connection '${group.plcConnectionName}' が見つかりません`
 			);
 		}
-	}
-	const groupNames = new Set(pkg.collectionGroups.map((group) => group.name));
-	for (const tag of pkg.tags) {
-		if (!groupNames.has(tag.collectionGroupName)) {
+	});
+	const groupKeys = new Set(
+		pkg.collectionGroups.map((group) => configPackageGroupKey(group.plcConnectionName, group.name))
+	);
+	pkg.tags.forEach((tag, index) => {
+		if (!groupKeys.has(configPackageGroupKey(tag.plcConnectionName, tag.collectionGroupName))) {
 			throw new ConfigPackageParseError(
-				`tags '${tag.name}' が参照する group '${tag.collectionGroupName}' が見つかりません`
+				`tags[${index}].collectionGroupName: タグ '${tag.name}' が参照する接続 '${tag.plcConnectionName}' のグループ '${tag.collectionGroupName}' が見つかりません`
 			);
 		}
-	}
+	});
 
-	// S6: sink group が参照する接続・タグ名がパッケージ内で解決できること。
-	const tagNames = new Set(pkg.tags.map((tag) => tag.name));
-	for (const sinkGroup of pkg.sinkGroups) {
+	// S6: sink group が参照する接続・タグがパッケージ内で解決できること。
+	const tagKeys = new Set(
+		pkg.tags.map((tag) =>
+			configPackageTagKey(tag.plcConnectionName, tag.collectionGroupName, tag.name)
+		)
+	);
+	pkg.sinkGroups.forEach((sinkGroup, index) => {
 		if (!connectionNames.has(sinkGroup.dbConnectionName)) {
 			throw new ConfigPackageParseError(
-				`sinkGroups '${sinkGroup.name}' が参照する connection '${sinkGroup.dbConnectionName}' が見つかりません`
+				`sinkGroups[${index}].dbConnectionName: sink group '${sinkGroup.name}' が参照する connection '${sinkGroup.dbConnectionName}' が見つかりません`
 			);
 		}
-		for (const tagName of sinkGroup.tagNames) {
-			if (!tagNames.has(tagName)) {
+		sinkGroup.tags.forEach((ref, tagIndex) => {
+			if (
+				!tagKeys.has(
+					configPackageTagKey(ref.plcConnectionName, ref.collectionGroupName, ref.tagName)
+				)
+			) {
 				throw new ConfigPackageParseError(
-					`sinkGroups '${sinkGroup.name}' が参照する tag '${tagName}' が見つかりません`
+					`sinkGroups[${index}].tags[${tagIndex}]: sink group '${sinkGroup.name}' が参照する tag '${describeConfigPackageTagRef(ref)}' が見つかりません`
 				);
 			}
-		}
-	}
+		});
+	});
 }
 
 export function parseConfigPackage(text: string): ConfigPackage {
 	const root = expectRecord(JSON.parse(stripBom(text)), 'root');
 	if (root.schemaVersion !== CONFIG_PACKAGE_SCHEMA_VERSION) {
+		// 版 1（2026-10-19 より前の export）は読まない - 互換性は持たない
+		// （オーナー決定、`CONFIG_PACKAGE_SCHEMA_VERSION` の doc）。
 		throw new ConfigPackageParseError(
-			`schemaVersion ${String(root.schemaVersion)} は未対応です（期待値: ${CONFIG_PACKAGE_SCHEMA_VERSION}）`
+			`schemaVersion ${String(root.schemaVersion)} は未対応です（期待値: ${CONFIG_PACKAGE_SCHEMA_VERSION}）。古い版の構成パッケージは読み込めません。今の banto-hub で書き出し直してください`
 		);
 	}
 	if (root.product !== CONFIG_PACKAGE_PRODUCT) {
@@ -816,21 +935,45 @@ export function parseConfigPackage(text: string): ConfigPackage {
 	return pkg;
 }
 
-export function planByName<TIncoming extends { name: string }, TExisting extends { name: string }>(
-	incoming: readonly TIncoming[],
-	existing: readonly TExisting[]
-): {
+export interface ConfigPackagePlan<TIncoming, TExisting> {
 	create: TIncoming[];
 	update: Array<{ incoming: TIncoming; existing: TExisting }>;
 	missing: TIncoming[];
-} {
-	const existingByName = new Map(existing.map((item) => [item.name, item]));
+}
+
+/**
+ * 版 2: キーで突き合わせる（グループは `configPackageGroupKey`、タグは
+ * `configPackageTagKey`）。`planByName` はキーが `name` の場合。
+ */
+export function planByKey<TIncoming, TExisting>(
+	incoming: readonly TIncoming[],
+	existing: readonly TExisting[],
+	incomingKey: (item: TIncoming) => string,
+	existingKey: (item: TExisting) => string | undefined
+): ConfigPackagePlan<TIncoming, TExisting> {
+	const existingByKey = new Map<string, TExisting>();
+	for (const item of existing) {
+		const key = existingKey(item);
+		if (key !== undefined) existingByKey.set(key, item);
+	}
 	const create: TIncoming[] = [];
 	const update: Array<{ incoming: TIncoming; existing: TExisting }> = [];
 	for (const item of incoming) {
-		const hit = existingByName.get(item.name);
+		const hit = existingByKey.get(incomingKey(item));
 		if (hit) update.push({ incoming: item, existing: hit });
 		else create.push(item);
 	}
 	return { create, update, missing: create };
+}
+
+export function planByName<TIncoming extends { name: string }, TExisting extends { name: string }>(
+	incoming: readonly TIncoming[],
+	existing: readonly TExisting[]
+): ConfigPackagePlan<TIncoming, TExisting> {
+	return planByKey(
+		incoming,
+		existing,
+		(item) => item.name,
+		(item) => item.name
+	);
 }
