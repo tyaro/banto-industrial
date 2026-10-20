@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **I1〜I4 完了（2026-09-07）**。2026-10-17（#630 PR-2）: §4.4・§4.3 の POSTINSTALL (4)・決定 5 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（`banto-hub-elev prepare-sink-config` が整える）に改めた（§4.3 の「`.example` から複製」という実装とのずれも直した）。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
+状態: **I1〜I4 完了（2026-09-07）**。2026-10-20: §8.6 に alpha.32（migration 0022・設定パッケージ版 2）の実機の DB の複製での確認を追記。2026-10-17（#630 PR-2）: §4.4・§4.3 の POSTINSTALL (4)・決定 5 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（`banto-hub-elev prepare-sink-config` が整える）に改めた（§4.3 の「`.example` から複製」という実装とのずれも直した）。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。
@@ -226,3 +226,19 @@ WebView2（§4.2）と並ぶもう 1 つの実行時前提が **Microsoft Visual
 | 8   | サービスの停止                              | **合格**。`SERVICE_EXIT_CODE = 0`、ログに `Windows サービスを停止しました`                                                                                                                                                                |
 
 補足: 以前の対話モードのインストールで作られていた公開デスクトップのショートカット（`BantoHub.lnk`）は、今回の silent の上書きで削除された（§4.1 補足の設計どおり。スタートメニューのショートカットは残る）。シェルの GUI の描画は、この確認では見ていない。
+
+### 8.6 alpha.32（migration 0022・設定パッケージ版 2）の実機の DB の複製での確認（2026-10-20、この開発 PC）
+
+alpha.32（タグ `v0.2.0-alpha.32` = `4cb6b44`、#718）は DB の形が変わり（banto-tags migration 0022: 収集グループ名を接続内で一意に）、元に戻せない。そこで公開の前に、**alpha.31 で使っている本番の `default` プロファイルの `config\` と `data\` を別フォルダへ複製**し、本番のサービスを止めた状態で、main の `banto-hub.exe`（コンソール、`--features embed-ui`）を `BANTO_DB`・`BANTO_HUB_DATA`・`PORT=8733` で複製に向けて起動して確かめた。本番の DB には触れていない。
+
+| #   | 確かめたこと                                                 | 結果     |
+| --- | ------------------------------------------------------------ | -------- |
+| 1   | 起動時に migration 0022 が当たり、起動できる                 | **合格** |
+| 2   | ログインでき、接続・グループ・タグがそのまま見える           | **合格** |
+| 3   | 収集が今までどおり動く                                       | **合格** |
+| 4   | 別の接続に既存と同じ名前のグループを作れる                   | **合格** |
+| 5   | 新しい画面で設定パッケージ（版 2）を書き出し、取り込み直せる | **合格** |
+
+**踏んだこと**: 最初は画面を建て直さずに `cargo build --features embed-ui` だけで起動したため、手元に残っていた alpha.31 の画面が埋め込まれ、取り込みで「collectionGroups に重複した name 'group1' が含まれています」（版 1 の画面の検査）が出た。`pnpm --filter banto-hub build` で画面を建て直してから `banto-hub` をビルドし直し、ブラウザを Ctrl+Shift+R で読み直すと解消した。`scripts/build-release.ps1` は既定で画面を先に建て直すので、`-SkipFrontend` を付けない通常のリリースビルドでは起きない。
+
+その後、オーナーがタグ `v0.2.0-alpha.32`（= `4cb6b44`）を付けた（2026-10-20）。その後、`scripts/build-release.ps1` で作った配布物 6 点（4 exe・インストーラ・`SHA256SUMS.txt`）を添付した GitHub Release を公開した（2026-10-20 02:21 UTC、https://github.com/tyaro/banto-industrial/releases/tag/v0.2.0-alpha.32 ）。インストーラでの本番の上書き更新の確認は本節では記録していない。
