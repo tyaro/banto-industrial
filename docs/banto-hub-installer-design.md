@@ -241,4 +241,4 @@ alpha.32（タグ `v0.2.0-alpha.32` = `4cb6b44`、#718）は DB の形が変わ�
 
 **踏んだこと**: 最初は画面を建て直さずに `cargo build --features embed-ui` だけで起動したため、手元に残っていた alpha.31 の画面が埋め込まれ、取り込みで「collectionGroups に重複した name 'group1' が含まれています」（版 1 の画面の検査）が出た。`pnpm --filter banto-hub build` で画面を建て直してから `banto-hub` をビルドし直し、ブラウザを Ctrl+Shift+R で読み直すと解消した。`scripts/build-release.ps1` は既定で画面を先に建て直すので、`-SkipFrontend` を付けない通常のリリースビルドでは起きない。
 
-その後、オーナーがタグ `v0.2.0-alpha.32`（= `4cb6b44`）を付けた（2026-10-20）。GitHub の Release（配布物の添付）は、本節を書いた時点（2026-10-20 02:15 UTC）では一覧に無かった。インストーラでの本番の上書き更新の確認は本節では記録していない。
+その後、オーナーがタグ `v0.2.0-alpha.32`（= `4cb6b44`）を付けた（2026-10-20）。その後、`scripts/build-release.ps1` で作った配布物 6 点（4 exe・インストーラ・`SHA256SUMS.txt`）を添付した GitHub Release を公開した（2026-10-20 02:21 UTC、https://github.com/tyaro/banto-industrial/releases/tag/v0.2.0-alpha.32 ）。インストーラでの本番の上書き更新の確認は本節では記録していない。
