@@ -70,6 +70,13 @@ banto-collect = { path = "../../../crates/banto-collect" }
 # ClientFactory injection seam hands out, and HubSessions owns the session
 # directory outside CollectorManager.
 banto-broker = { path = "../../../crates/banto-broker" }
+# R1-3b: `HubDrivers`（`broker_glue.rs`）が `DriverRegistry` を持つ。
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.1.0" }
+# R1-3b: bin banto-hub が core パッケージ内にあるため一時的に normal。R1-7a で
+# banto-hub-host へ移し core は dev のみに戻す（2026-10-20 オーナー決定）。
+# `banto_drivers` を参照してよいのは bin（`src/bin/`）とテストだけ。core のライブラリ
+# 本体は `HubDrivers` を注入で受け取るだけにする（docs/banto-driver-api-design.md §6.4）。
+banto-drivers = { path = "../../../crates/banto-drivers" }
 # I5 (T2-4, docs/tag-server-design.md §6): the write primitive - rest.rs's
 # POST /api/v1/values/{tag} builds a banto_plc_write::BatchWriteRequest and
 # submits it through banto_broker::BrokerHandle::write (which itself depends

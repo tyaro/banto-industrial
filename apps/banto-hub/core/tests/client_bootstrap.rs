@@ -142,7 +142,10 @@ async fn test_app(label: &str) -> TestApp {
         SessionValidation::lookup(user_session_lookup(verify_users_lookup)),
     );
 
-    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+    let sessions = Arc::new(HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+        common::hub_drivers(),
+    ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(

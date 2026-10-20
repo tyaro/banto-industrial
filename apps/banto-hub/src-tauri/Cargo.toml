@@ -17,6 +17,10 @@ tauri-build = { version = "2", features = [] }
 # T16-0 設計 §4.1: HubRuntime を埋め込むだけ - 独自 frontendDist/invoke API は
 # 持たない（design P3・実装指示「二重 UI は作らない」）。
 banto-hub-core = { path = "../core" }
+# R1-3b: `HubConfig.drivers` に詰める組み込みドライバ一式（`builtin()`）。
+# コアは具体的なドライバを知らず、シェルが組み立てて注入する
+# （docs/banto-driver-api-design.md §6.4）。
+banto-drivers = { path = "../../../crates/banto-drivers" }
 # トレイアイコン（design §4.3）用に `tray-icon` feature を有効化する - tauri
 # crate の既定 feature には含まれない（chronogazer も #392 A2 でトレイを
 # 使うようになり、同じ feature を有効にしている）。

@@ -39,6 +39,7 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::broker_glue::HubDrivers;
 use crate::profile_lock::HubHostKind;
 use crate::runtime::HubConfig;
 
@@ -304,10 +305,11 @@ pub fn resolve_profile_paths_from_env() -> ProfilePaths {
 /// が返す絶対パス（`{root}/profiles/<profile-id>/config/banto-hub.sqlite3`・
 /// `.../data/`）- `crate::runtime::DEFAULT_DB_PATH`（後方互換のため残した
 /// 相対パス定数）はここでは使わない。
-pub fn build_hub_config_from_env(host_kind: HubHostKind) -> HubConfig {
+pub fn build_hub_config_from_env(host_kind: HubHostKind, drivers: HubDrivers) -> HubConfig {
     let paths = resolve_profile_paths_from_env();
 
     HubConfig {
+        drivers,
         db_path: std::env::var("BANTO_DB")
             .unwrap_or_else(|_| paths.db_path.to_string_lossy().into_owned()),
         allow_setup: std::env::var("BANTO_ALLOW_SETUP")

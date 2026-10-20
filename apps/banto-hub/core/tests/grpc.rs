@@ -251,7 +251,10 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
         .await
         .expect("admin login");
 
-    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+    let sessions = Arc::new(HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+        common::hub_drivers(),
+    ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(

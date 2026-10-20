@@ -1,0 +1,19 @@
+# R1-3b（docs/banto-driver-api-design.md §2・§6.3・§6.4・§10）: ホスト（banto-hub の
+# bin・shell・sink のテスト）が組み立てるドライバ一式 `Builtin`。ドライバを増やす・
+# 差し替えるときに触る場所を、この crate 1 つにする。内部 crate（`publish = false`）。
+# R1-4 でドライバ本体が別 crate へ出ても、ホストはここだけを見る。
+[package]
+name = "banto-drivers"
+description = "R1-3b: ホストが注入する組み込みドライバ一式（broker の DriverTable・収集の ClientFactory・DriverRegistry）(docs/banto-driver-api-design.md §6)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
+banto-broker = { path = "../banto-broker" }
+banto-collect = { path = "../banto-collect" }
+
+[dev-dependencies]
+banto-plc = { path = "../banto-plc" }

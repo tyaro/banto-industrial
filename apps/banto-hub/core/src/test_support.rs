@@ -137,3 +137,15 @@ impl Drop for TempDir {
         }
     }
 }
+
+/// R1-3b: the built-in drivers as the `HubDrivers` a unit test injects into
+/// `HubSessions::new` / `HubConfig` (docs/banto-driver-api-design.md §6.4).
+/// `src` tests keep running the real SLMP / Modbus drivers until R2b-0.
+pub(crate) fn test_drivers() -> crate::broker_glue::HubDrivers {
+    let builtin = banto_drivers::builtin();
+    crate::broker_glue::HubDrivers::new(
+        std::sync::Arc::new(builtin.registry),
+        builtin.broker,
+        builtin.client_factory,
+    )
+}

@@ -43,6 +43,9 @@ const G = {
 			dir: 'crates/banto-driver-conformance',
 			deps: ['banto-driver-api']
 		},
+		// R1-3b: ホストが注入する組み込みドライバ一式。bin（core パッケージ内）・shell・
+		// sink のテストが使う（G には写していない broker / collect にも依存する）。
+		{ name: 'banto-drivers', dir: 'crates/banto-drivers', deps: ['banto-driver-api'] },
 		{
 			name: 'banto-plc',
 			dir: 'crates/banto-plc',
@@ -92,6 +95,8 @@ const G = {
 			name: 'banto-hub-core',
 			dir: 'apps/banto-hub/core',
 			deps: [
+				'banto-driver-api',
+				'banto-drivers',
 				'banto-instance-lock',
 				'banto-safe-root',
 				'banto-service-control',
@@ -102,13 +107,14 @@ const G = {
 		{
 			name: 'banto-hub-shell',
 			dir: 'apps/banto-hub/src-tauri',
-			deps: ['banto-hub-core', 'banto-service-elev']
+			deps: ['banto-drivers', 'banto-hub-core', 'banto-service-elev']
 		},
 		{
 			name: 'banto-hub-sink',
 			dir: 'apps/banto-hub-sink',
-			// banto-hub-core・banto-tags は dev-dependency。
+			// banto-drivers・banto-hub-core・banto-tags は dev-dependency。
 			deps: [
+				'banto-drivers',
 				'banto-hub-core',
 				'banto-safe-root',
 				'banto-service-control',
@@ -322,12 +328,16 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-driver-api（R1-1 の公開 crate。MSRV / semver の driver-api ジョブが走る）',
+		'banto-driver-api（R1-1 の公開 crate。MSRV / semver の driver-api ジョブが走る。R1-3b から core が直接依存するので hub 側も走る）',
 		['crates/banto-driver-api/src/types.rs', 'crates/banto-driver-api/CHANGELOG.md'],
 		{
 			...NONE,
 			run_rust: true,
-			rust_args: '-p banto-driver-api -p banto-driver-conformance -p banto-plc',
+			rust_args:
+				'-p banto-driver-api -p banto-driver-conformance -p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink -p banto-plc',
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true,
 			run_driver_api: true
 		}
 	],
@@ -342,6 +352,18 @@ const TABLE = [
 			run_rust: true,
 			rust_args: '-p banto-driver-conformance',
 			run_driver_api: true
+		}
+	],
+	[
+		'banto-drivers（R1-3b の内部 crate）は hub の 3 パッケージが使う。公開 crate ではないので driver-api ジョブは走らない',
+		['crates/banto-drivers/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: '-p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink',
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true
 		}
 	],
 	[

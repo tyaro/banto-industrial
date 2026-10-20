@@ -35,7 +35,10 @@ fn slmp_conn_with_cpu(id: i64, cpu: &str) -> banto_tags::PlcConnection {
 /// 要求の Q と一致して通ってしまうが、handle の CPU（R）で比べるので断られる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_cpu_check_uses_the_handle_generation_not_the_latest_published_cpu() {
-    let sessions = crate::broker_glue::HubSessions::new(banto_broker::BackoffConfig::default());
+    let sessions = crate::broker_glue::HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+        crate::test_support::test_drivers(),
+    );
     let registry = crate::broker_glue::BrokerSimRegistry::new();
     let old = slmp_conn_with_cpu(1, "R");
     registry.resolve(&old).await;

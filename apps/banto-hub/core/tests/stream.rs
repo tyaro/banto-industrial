@@ -254,6 +254,7 @@ async fn test_app_with(
 
     let sessions = std::sync::Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
+        common::hub_drivers(),
     ));
     let sim_registry = std::sync::Arc::new(banto_hub_core::broker_glue::BrokerSimRegistry::new());
     let computed = std::sync::Arc::new(ComputedEngine::new(std::sync::Arc::new(

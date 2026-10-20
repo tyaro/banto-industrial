@@ -186,12 +186,88 @@ use banto_broker::{
     BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerSupervisor, DriverTable,
     ReadOnlyHandle, SessionDirectory,
 };
+use banto_driver_api::DriverRegistry;
 use banto_plc::{
     BatchReadRequest, BatchReadResult, BoxFuture, PlcClient, PlcError, PlcValue, ReadRequest,
     ReadResult, TagValue,
 };
 use banto_tags::PlcConnection;
 use tokio::sync::{watch, Mutex as AsyncMutex};
+
+/// The drivers the host injects into the engine (R1-3b,
+/// docs/banto-driver-api-design.md §6.4): the driver registry, the broker's
+/// protocol -> dial table, and the factory for direct collection clients.
+///
+/// This crate never names a concrete driver: the composition root (the
+/// `banto-hub` bin, the shell, tests) builds this from
+/// `banto_drivers::builtin()` and hands it in through `HubConfig::drivers` /
+/// [`HubSessions::new`]. Cheap to clone.
+#[derive(Clone)]
+pub struct HubDrivers {
+    pub registry: Arc<DriverRegistry>,
+    pub broker: DriverTable,
+    pub client_factory: banto_collect::ClientFactory,
+}
+
+impl HubDrivers {
+    pub fn new(
+        registry: Arc<DriverRegistry>,
+        broker: DriverTable,
+        client_factory: banto_collect::ClientFactory,
+    ) -> Self {
+        Self {
+            registry,
+            broker,
+            client_factory,
+        }
+    }
+
+    /// No drivers: an empty broker table (every connection is rejected as
+    /// [`BrokerError::UnsupportedProtocol`]) and a client factory whose
+    /// clients answer every call with [`PlcError::NotConnected`].
+    pub fn none() -> Self {
+        let client_factory: banto_collect::ClientFactory =
+            Arc::new(|_spec: &banto_collect::ClientSpec| -> Box<dyn PlcClient> {
+                Box::new(NoDriverClient)
+            });
+        Self {
+            registry: Arc::new(DriverRegistry::new()),
+            broker: DriverTable::new(vec![]).expect("an empty driver table has no duplicates"),
+            client_factory,
+        }
+    }
+}
+
+impl std::fmt::Debug for HubDrivers {
+    // `ClientFactory` is a closure and not `Debug`, so list what can be shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubDrivers")
+            .field("registry", &self.registry)
+            .field("broker", &self.broker)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The client [`HubDrivers::none`] hands out: never connected, every call
+/// fails with [`PlcError::NotConnected`].
+struct NoDriverClient;
+
+impl PlcClient for NoDriverClient {
+    fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+        Box::pin(async { Err(PlcError::NotConnected) })
+    }
+
+    fn read_batch<'a>(
+        &'a mut self,
+        _requests: &'a [ReadRequest],
+    ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
+        Box::pin(async { Err(PlcError::NotConnected) })
+    }
+
+    fn disconnect(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
 
 /// How long [`BrokerReadClient::connect`] waits for a broker session that is
 /// currently [`BrokerConnectionStatus::Reconnecting`] to come back before it
@@ -436,7 +512,7 @@ pub struct HubSessions {
     /// docs/banto-driver-api-design.md §4.4) - kept here so
     /// [`Self::is_broker_managed`] answers from exactly the table
     /// [`Self::ensure_connection`] dispatches through.
-    drivers: DriverTable,
+    drivers: HubDrivers,
     /// `Some` until [`Self::shutdown`] consumes it (`BrokerSupervisor::shutdown`
     /// takes `self` by value) - guarded by an async mutex rather than
     /// `std::sync::Mutex` because `shutdown` itself is `.await`-heavy (drains
@@ -453,12 +529,10 @@ impl HubSessions {
     /// discovers broker-managed connections during its first (and every
     /// later) rebuild.
     ///
-    /// R1-3a: the driver table is [`DriverTable::builtin`] (`"slmp"` and
-    /// `"modbus-tcp"`, the same pair as before); R1-3b injects it from the
-    /// composition root instead (docs/banto-driver-api-design.md §6.4).
-    pub fn new(backoff: banto_broker::BackoffConfig) -> Self {
-        let drivers = DriverTable::builtin();
-        let supervisor = BrokerSupervisor::spawn(&[], backoff, drivers.clone())
+    /// R1-3b: the driver table comes from the composition root as part of
+    /// `drivers` (docs/banto-driver-api-design.md §6.4), not from this crate.
+    pub fn new(backoff: banto_broker::BackoffConfig, drivers: HubDrivers) -> Self {
+        let supervisor = BrokerSupervisor::spawn(&[], backoff, drivers.broker.clone())
             .expect("spawning a broker supervisor with zero connections cannot fail");
         let directory = supervisor.directory();
         Self {
@@ -477,7 +551,12 @@ impl HubSessions {
     /// function in `banto_broker` with this, answered from the same
     /// [`DriverTable`] the supervisor dispatches through.
     pub fn is_broker_managed(&self, protocol: &str) -> bool {
-        self.drivers.is_supported(protocol)
+        self.drivers.broker.is_supported(protocol)
+    }
+
+    /// The drivers this directory was built with (R1-3b).
+    pub fn drivers(&self) -> &HubDrivers {
+        &self.drivers
     }
 
     /// The handle for `conn` (must be a protocol the broker manages -
@@ -813,8 +892,9 @@ impl Default for BrokerSimRegistry {
 /// `broker_handles` is keyed by - see `crate::hub::CollectorManager`'s
 /// session-sync step) gets a [`BrokerReadClient`] reading through that
 /// connection's shared broker session; only the defensive fallback for a
-/// connection somehow missing from `broker_handles` gets banto-collect's own
-/// `default_client_factory` - the same direct `ModbusTcpClient`/`SlmpClient`
+/// connection somehow missing from `broker_handles` gets the injected
+/// `HubDrivers::client_factory` (R1-3b; `banto_collect::default_client_factory`
+/// for the built-in drivers) - the same direct `ModbusTcpClient`/`SlmpClient`
 /// construction every non-hub caller still gets.
 ///
 /// **Modbus TCP collection reads moved onto the broker session (#337,
@@ -856,8 +936,10 @@ impl Default for BrokerSimRegistry {
 /// `modbus_collection_uses_exactly_one_socket`.
 pub fn hub_client_factory(
     broker_handles: Arc<HashMap<String, ReadOnlyHandle>>,
+    sessions: &HubSessions,
 ) -> banto_collect::ClientFactory {
-    let default = banto_collect::default_client_factory();
+    // R1-3b: the injected direct-client factory (`HubDrivers::client_factory`).
+    let default = sessions.drivers().client_factory.clone();
     Arc::new(
         move |spec: &banto_collect::ClientSpec| -> Box<dyn PlcClient> {
             match spec.protocol {
@@ -929,7 +1011,10 @@ mod tests {
         let sim = Simulator::start().await;
         let conn = slmp_conn(1, sim.addr.port());
 
-        let sessions = HubSessions::new(banto_broker::BackoffConfig::default());
+        let sessions = HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            crate::test_support::test_drivers(),
+        );
         sessions
             .ensure_connection(&conn)
             .expect("ensure_connection should spawn a session");
@@ -979,7 +1064,10 @@ mod tests {
         use banto_plc::{Address, BatchReadRequest, DataType, ReadRequest};
 
         let sim = Simulator::start().await;
-        let sessions = HubSessions::new(banto_broker::BackoffConfig::default());
+        let sessions = HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            crate::test_support::test_drivers(),
+        );
         let registry = BrokerSimRegistry::new();
         let mut conn = slmp_conn(1, sim.addr.port());
 
@@ -1068,7 +1156,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn modbus_reads_route_through_the_broker_handle_like_slmp() {
         let sim = Simulator::start().await;
-        let sessions = HubSessions::new(banto_broker::BackoffConfig::default());
+        let sessions = HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            crate::test_support::test_drivers(),
+        );
 
         // A closed port: nothing will ever answer here, for either client.
         let dead_port = {
@@ -1090,7 +1181,7 @@ mod tests {
             handles.insert(format!("conn:{}", conn.id), handle.read_only());
         }
 
-        let factory = hub_client_factory(Arc::new(handles));
+        let factory = hub_client_factory(Arc::new(handles), &sessions);
 
         // SLMP, live simulator: the broker session comes up on its own, so
         // the routed `BrokerReadClient` reports success.

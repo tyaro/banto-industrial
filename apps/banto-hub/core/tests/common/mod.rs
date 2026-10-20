@@ -213,3 +213,17 @@ pub fn shutdown_test_app(manager: &CollectorManager, pool: &SqlitePool) {
         });
     }));
 }
+
+/// R1-3b: the built-in drivers as the `HubDrivers` an integration test
+/// injects into `HubSessions::new` / `HubConfig`
+/// (docs/banto-driver-api-design.md §6.4). Integration tests keep running the
+/// real SLMP / Modbus drivers until R2b-0.
+#[allow(dead_code)]
+pub fn hub_drivers() -> banto_hub_core::broker_glue::HubDrivers {
+    let builtin = banto_drivers::builtin();
+    banto_hub_core::broker_glue::HubDrivers::new(
+        std::sync::Arc::new(builtin.registry),
+        builtin.broker,
+        builtin.client_factory,
+    )
+}

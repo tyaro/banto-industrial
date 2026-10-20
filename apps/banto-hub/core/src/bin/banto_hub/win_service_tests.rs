@@ -351,6 +351,7 @@ impl Fixture {
         HubProgram::new(ProgramParts {
             config: Box::new(move || {
                 let config = HubConfig {
+                    drivers: crate::hub_drivers(),
                     db_path: paths.db_path.to_string_lossy().into_owned(),
                     allow_setup: false,
                     port_override: Some(0),
@@ -908,6 +909,7 @@ async fn hub_runtime_start_fails_fast_when_profile_lock_already_held() {
         try_acquire_profile_lock(&paths, HubHostKind::Shell).expect("first acquire should succeed");
 
     let config = HubConfig {
+        drivers: crate::hub_drivers(),
         db_path: root
             .0
             .join("registry.sqlite3")
