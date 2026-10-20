@@ -142,7 +142,7 @@ impl PlcError {
     /// which is the safe direction to be wrong in - a needless reconnect costs
     /// one poll cycle, whereas decoding a desynchronized stream produces
     /// plausible-looking wrong readings.
-    pub(crate) fn is_connection_fatal(&self) -> bool {
+    pub fn is_connection_fatal(&self) -> bool {
         !matches!(
             self,
             PlcError::ModbusException { .. }
