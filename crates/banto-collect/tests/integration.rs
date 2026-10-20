@@ -1590,6 +1590,8 @@ async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
 /// that is actually reading values (so "zero sockets" cannot pass) and keeps
 /// polling for several periods must have made exactly one accept on the
 /// simulator - a second socket, even an immediately-closed one, is counted.
+/// The test changes the simulator value several times and waits for each new
+/// Good value, so a collector that stops after the first poll cannot pass.
 /// Some real Modbus/TCP servers (Omron KM-D1-ETN) take a single client only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collection_over_several_periods_uses_exactly_one_socket() {
@@ -1626,20 +1628,30 @@ async fn collection_over_several_periods_uses_exactly_one_socket() {
     let current = collector.current_values();
     assert!(
         wait_until(Duration::from_secs(10), || async {
-            current.get("tag:1").map(|s| s.value) == Some(Some(4321.0))
+            current.get("tag:1").map(|s| (s.value, s.quality))
+                == Some((Some(4321.0), Quality::Good))
         })
         .await,
-        "collector should read the simulator value"
+        "collector should read the simulator value as Good"
     );
 
-    // Let ~8 more periods run; a reconnect-per-tick or a second (e.g.
-    // status-probe) socket would show up as an extra accept.
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert_eq!(
-        current.get("tag:1").map(|s| s.value),
-        Some(Some(4321.0)),
-        "still reading after the wait"
-    );
+    // Change the simulator value several times and wait for each new value to
+    // arrive as Good. The current-values cache keeps the last value and only
+    // ages to Stale, so re-checking an unchanged value cannot prove polling
+    // continued; a collector that stops after the first poll cannot pass
+    // this. A reconnect-per-tick or a second (e.g. status-probe) socket would
+    // show up as an extra accept below.
+    for v in [1111u16, 2222, 3333] {
+        sim.set_holding_register(0, v);
+        assert!(
+            wait_until(Duration::from_secs(10), || async {
+                current.get("tag:1").map(|s| (s.value, s.quality))
+                    == Some((Some(f64::from(v)), Quality::Good))
+            })
+            .await,
+            "collector should keep polling and read the updated value {v} as Good"
+        );
+    }
     assert_eq!(
         sim.connection_count(),
         1,
