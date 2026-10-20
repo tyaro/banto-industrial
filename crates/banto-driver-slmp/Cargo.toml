@@ -36,3 +36,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # tests/broker.rs: broker 経由の読み書きを in-process の SLMP シミュレータで確かめる
 # （broker の単体テストから移したもの。§4.4 の表）。
 banto-plc-write = { path = "../banto-plc-write", features = ["simulator"] }
+# R1-5（§7.3）: tests/conformance.rs。適合テスト一式と、そのピアになる banto-plc の
+# SLMP シミュレータ（`slmp/simulator.rs`）。
+banto-driver-conformance = { path = "../banto-driver-conformance" }
+banto-plc = { path = "../banto-plc", features = ["simulator"] }

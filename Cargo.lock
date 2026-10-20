@@ -717,6 +717,7 @@ version = "0.1.0"
 dependencies = [
  "banto-broker",
  "banto-driver-api",
+ "banto-driver-conformance",
  "banto-plc",
  "banto-plc-write",
  "banto-tags",
@@ -729,6 +730,7 @@ version = "0.1.0"
 dependencies = [
  "banto-broker",
  "banto-driver-api",
+ "banto-driver-conformance",
  "banto-plc",
  "banto-plc-write",
  "banto-tags",

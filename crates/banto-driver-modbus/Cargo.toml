@@ -36,3 +36,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "ne
 # src/session.rs の単体テストと tests/broker.rs: in-process の Modbus TCP シミュレータ
 # （broker の単体テストから移したもの。§4.4 の表）。
 banto-plc-write = { path = "../banto-plc-write", features = ["simulator"] }
+# R1-5（§7.3）: tests/conformance.rs。適合テスト一式と、そのピアになる banto-plc の
+# Modbus TCP シミュレータ（`modbus/simulator.rs`）。
+banto-driver-conformance = { path = "../banto-driver-conformance" }
+banto-plc = { path = "../banto-plc", features = ["simulator"] }
