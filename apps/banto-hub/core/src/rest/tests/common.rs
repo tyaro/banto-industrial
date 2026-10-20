@@ -501,3 +501,58 @@ pub(super) async fn seed_scope_fixture(router: &Router, admin_token: &str) {
     .await;
     assert_eq!(status, StatusCode::OK, "{tag:?}");
 }
+
+pub(super) fn session_request(
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> HttpRequest<Body> {
+    let mut builder = HttpRequest::builder()
+        .method(method)
+        .uri(path)
+        .header(CLIENT_HEADER.0, CLIENT_HEADER.1);
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+pub(super) async fn session_call(
+    router: &Router,
+    request: HttpRequest<Body>,
+) -> (StatusCode, serde_json::Value) {
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+pub(super) async fn session_login(router: &Router, username: &str, remember: bool) -> String {
+    let (status, body) = session_call(
+        router,
+        session_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": username, "password": "password123", "remember": remember })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("login for {username} returned no token: {body}"))
+        .to_string()
+}
