@@ -53,7 +53,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -111,6 +113,32 @@ struct State {
     /// How many wire *write* commands (FC5/6/15/16) have been served - test
     /// support, exposed as [`Simulator::write_command_count`].
     write_commands: usize,
+    /// P0-3: when set, every response is written `chunk` bytes at a time with
+    /// a `delay` between chunks (and `TCP_NODELAY`, so each chunk really is
+    /// its own segment) - a response that reaches the client split across
+    /// several `read()`s. Default `None`: one `write_all`, as before.
+    chunking: Option<(usize, Duration)>,
+    /// P0-3: when set, the *next* response (one-shot) is built but not sent
+    /// until its [`LateResponseGate`] is released - a response that arrives
+    /// after the client's response timeout.
+    hold_next: Option<Arc<AtomicBool>>,
+    /// P0-3: when set, every response carries a transaction id different
+    /// from the request's (`request id + 1`, wrapping).
+    wrong_transaction_id: bool,
+}
+
+/// Handle returned by [`Simulator::hold_next_response`]. The held response is
+/// written only after [`LateResponseGate::release`], so a test decides
+/// *exactly* when the "late" response hits the wire instead of racing a
+/// sleep against the client's timeout.
+#[derive(Clone)]
+pub struct LateResponseGate(Arc<AtomicBool>);
+
+impl LateResponseGate {
+    /// Let the held response go out now.
+    pub fn release(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// A running simulator instance. Dropping this does *not* stop the server
@@ -311,6 +339,34 @@ impl Simulator {
         self.state.lock().unwrap().hang = false;
     }
 
+    /// Send every response in pieces of `chunk` bytes with `delay` between
+    /// them (P0-3, docs/banto-hub-driver-refactor-plan.md §8.3 #1) - so the
+    /// client sees one MBAP response arrive over several `read()`s, as it can
+    /// on a real network. Off by default; `None` turns it back off.
+    pub fn set_response_chunking(&self, chunking: Option<(usize, Duration)>) {
+        if let Some((chunk, _)) = chunking {
+            assert!(chunk > 0, "chunk size must be at least 1 byte");
+        }
+        self.state.lock().unwrap().chunking = chunking;
+    }
+
+    /// Hold back the *next* response (any connection, one-shot) until the
+    /// returned gate is released (P0-3 #2: a response that arrives after the
+    /// client already timed out). The response content is fixed when the
+    /// request is served, so it reflects the register values of that moment
+    /// even if a test changes them before releasing.
+    pub fn hold_next_response(&self) -> LateResponseGate {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.state.lock().unwrap().hold_next = Some(flag.clone());
+        LateResponseGate(flag)
+    }
+
+    /// Answer every request with a transaction id that is not the request's
+    /// (P0-3 #2). `false` turns it back off.
+    pub fn set_wrong_transaction_id(&self, on: bool) {
+        self.state.lock().unwrap().wrong_transaction_id = on;
+    }
+
     /// How many connections this simulator has accepted in total, including
     /// ones that have since closed - the `connections` field is append-only
     /// (see its own doc comment), so this counts sockets ever accepted, not
@@ -364,9 +420,40 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
             std::future::pending::<()>().await;
         }
 
-        let response = build_response(&state, transaction_id, unit_id, &pdu);
-        if stream.write_all(&response).await.is_err() {
-            return;
+        let mut response = build_response(&state, transaction_id, unit_id, &pdu);
+
+        let (hold, chunking, wrong_tid) = {
+            let mut st = state.lock().unwrap();
+            (st.hold_next.take(), st.chunking, st.wrong_transaction_id)
+        };
+        if wrong_tid {
+            let wrong = transaction_id.wrapping_add(1).to_be_bytes();
+            response[0] = wrong[0];
+            response[1] = wrong[1];
+        }
+        if let Some(gate) = hold {
+            while !gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        match chunking {
+            None => {
+                if stream.write_all(&response).await.is_err() {
+                    return;
+                }
+            }
+            Some((chunk, delay)) => {
+                let _ = stream.set_nodelay(true);
+                let mut pieces = response.chunks(chunk).peekable();
+                while let Some(piece) = pieces.next() {
+                    if stream.write_all(piece).await.is_err() || stream.flush().await.is_err() {
+                        return;
+                    }
+                    if pieces.peek().is_some() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
         }
     }
 }

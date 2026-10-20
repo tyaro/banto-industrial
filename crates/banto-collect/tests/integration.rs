@@ -1583,6 +1583,85 @@ async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
     assert_eq!(count_events(&pool, "collection_stopped").await, 1);
 }
 
+/// P0-3 #5 (docs/banto-hub-driver-refactor-plan.md §8.3): one connection = one
+/// socket at the collection engine level. Mirrors banto-hub's #337 test
+/// (`apps/banto-hub/core/tests/integration.rs`
+/// `modbus_collection_uses_exactly_one_socket`), minus the Hub: a collector
+/// that is actually reading values (so "zero sockets" cannot pass) and keeps
+/// polling for several periods must have made exactly one accept on the
+/// simulator - a second socket, even an immediately-closed one, is counted.
+/// The test changes the simulator value several times and waits for each new
+/// Good value, so a collector that stops after the first poll cannot pass.
+/// Some real Modbus/TCP servers (Omron KM-D1-ETN) take a single client only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collection_over_several_periods_uses_exactly_one_socket() {
+    let _serial = TEST_SERIAL.lock().await;
+    let env = TempEnv::new("one-socket");
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 4321); // 40001
+    let pool = open_registry(&env).await;
+    let conn = PlcConnectionService::new(pool.clone())
+        .create(conn_input("PLC1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(pool.clone())
+        .create(group_input("G1", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+
+    // Collection is really happening: a Good value has been read.
+    let current = collector.current_values();
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current.get("tag:1").map(|s| (s.value, s.quality))
+                == Some((Some(4321.0), Quality::Good))
+        })
+        .await,
+        "collector should read the simulator value as Good"
+    );
+
+    // Change the simulator value several times and wait for each new value to
+    // arrive as Good. The current-values cache keeps the last value and only
+    // ages to Stale, so re-checking an unchanged value cannot prove polling
+    // continued; a collector that stops after the first poll cannot pass
+    // this. A reconnect-per-tick or a second (e.g. status-probe) socket would
+    // show up as an extra accept below.
+    for v in [1111u16, 2222, 3333] {
+        sim.set_holding_register(0, v);
+        assert!(
+            wait_until(Duration::from_secs(10), || async {
+                current.get("tag:1").map(|s| (s.value, s.quality))
+                    == Some((Some(f64::from(v)), Quality::Good))
+            })
+            .await,
+            "collector should keep polling and read the updated value {v} as Good"
+        );
+    }
+    assert_eq!(
+        sim.connection_count(),
+        1,
+        "a collecting connection must occupy exactly one socket"
+    );
+
+    collector.stop().await.unwrap();
+    sim.stop();
+}
+
 /// #588: a TCP listener that accepts every connection and never answers -
 /// a PLC that stopped responding. Every accepted socket is kept open (and
 /// never read) for the listener task's life; returns its port.

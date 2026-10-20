@@ -303,3 +303,287 @@ async fn performance_smoke_256_tags_x_1000_read_batch_calls() {
          (100ms/cycle target, recorder-requirements.md §3.1)"
     );
 }
+
+// --- P0-3 (docs/banto-hub-driver-refactor-plan.md §8.3): behaviours pinned
+// before the I/O is unified in R2b-3 ------------------------------------------
+
+/// Config for the tests that need a response to take a while to arrive:
+/// a generous response timeout so only the behaviour under test can fail.
+fn patient_config(sim: &Simulator) -> ModbusTcpConfig {
+    ModbusTcpConfig {
+        response_timeout: Duration::from_secs(5),
+        ..fast_config(sim)
+    }
+}
+
+/// P0-3 #1: a response that reaches the client in several TCP segments -
+/// split inside the 7-byte MBAP header, across the header/PDU boundary, and
+/// one byte at a time - is read as one response with the right values.
+#[tokio::test]
+async fn a_response_split_across_segments_is_read_as_one_response() {
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 42);
+    sim.set_holding_register(1, 0xFFFF);
+    sim.set_holding_registers(2, &[0x0001, 0x0002]);
+    sim.set_coil(0, true);
+
+    let mut client = ModbusTcpClient::new(patient_config(&sim));
+    client.connect().await.unwrap();
+
+    let requests = [
+        req(AddressArea::HoldingRegister, 0, DataType::U16),
+        req(AddressArea::HoldingRegister, 1, DataType::I16),
+        req(AddressArea::HoldingRegister, 2, DataType::U32),
+        req(AddressArea::Coil, 0, DataType::Bit),
+    ];
+    for chunk in [1usize, 3, 7, 8] {
+        sim.set_response_chunking(Some((chunk, Duration::from_millis(2))));
+        // Twice: the second read proves the stream is still aligned.
+        for _ in 0..2 {
+            let results = client
+                .read_batch(&requests)
+                .await
+                .unwrap_or_else(|e| panic!("chunk={chunk}: read_batch failed: {e:?}"));
+            assert_eq!(
+                results[0],
+                ReadResult::Value(TagValue::F64(42.0)),
+                "chunk={chunk}"
+            );
+            assert_eq!(
+                results[1],
+                ReadResult::Value(TagValue::F64(-1.0)),
+                "chunk={chunk}"
+            );
+            assert_eq!(
+                results[2],
+                ReadResult::Value(TagValue::F64(0x0001_0002_u32 as f64)),
+                "chunk={chunk}"
+            );
+            assert_eq!(
+                results[3],
+                ReadResult::Value(TagValue::Bit(true)),
+                "chunk={chunk}"
+            );
+        }
+    }
+}
+
+/// P0-3 #2 (a), client level: the response to a timed-out request arrives
+/// later. The timeout tears the connection down, so the next call is a fatal
+/// `NotConnected`, never the stale value; after a fresh `connect()` the read
+/// returns the *current* value, not the one the late response carried.
+#[tokio::test]
+async fn a_late_response_after_a_timeout_is_never_returned_as_a_later_value() {
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 1);
+    let gate = sim.hold_next_response(); // the response carrying `1` is held
+
+    let mut client = ModbusTcpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+    let requests = [req(AddressArea::HoldingRegister, 0, DataType::I16)];
+
+    let err = client.read_batch(&requests).await.unwrap_err();
+    assert!(matches!(err, PlcError::ResponseTimeout), "got {err:?}");
+    assert!(err.is_connection_fatal());
+
+    // The PLC now answers the old request, and the register has moved on.
+    sim.set_holding_register(0, 2);
+    gate.release();
+
+    let err = client.read_batch(&requests).await.unwrap_err();
+    assert!(matches!(err, PlcError::NotConnected), "got {err:?}");
+    assert!(err.is_connection_fatal());
+
+    client.connect().await.expect("reconnect");
+    let results = client.read_batch(&requests).await.unwrap();
+    assert_eq!(results[0], ReadResult::Value(TagValue::F64(2.0)));
+}
+
+/// P0-3 #2 (a), stream level: if the caller keeps using the *same* stream
+/// after a timeout (the broker session does not tear it down itself), the
+/// late response to request N sits in front of the response to N+1. It must
+/// be rejected as a fatal transaction-id mismatch, never returned as the
+/// value of N+1.
+#[tokio::test]
+async fn a_late_response_on_a_reused_stream_is_a_fatal_protocol_error() {
+    use crate::plan_requests;
+
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 1);
+    let gate = sim.hold_next_response();
+
+    let config = fast_config(&sim);
+    let mut stream = super::dial_modbus(&config).await.unwrap();
+    let mut next_tid = 0u16;
+    let outcome = plan_requests(&[req(AddressArea::HoldingRegister, 0, DataType::I16)]);
+
+    let err = super::execute_modbus_reads(
+        &mut stream,
+        1,
+        Duration::from_millis(100),
+        &mut next_tid,
+        &outcome,
+        1,
+        crate::decode::WordOrder::HighLow,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, PlcError::ResponseTimeout), "got {err:?}");
+
+    sim.set_holding_register(0, 2);
+    gate.release(); // the stale response (tid 0, value 1) is now on the wire
+
+    let err = super::execute_modbus_reads(
+        &mut stream,
+        1,
+        Duration::from_secs(5),
+        &mut next_tid,
+        &outcome,
+        1,
+        crate::decode::WordOrder::HighLow,
+    )
+    .await
+    .expect_err("the stale response must not be accepted");
+    match &err {
+        PlcError::Protocol(msg) => assert!(msg.contains("transaction id mismatch"), "{msg}"),
+        other => panic!("expected Protocol(transaction id mismatch), got {other:?}"),
+    }
+    assert!(err.is_connection_fatal());
+}
+
+/// P0-3 #2 (b): a response whose transaction id is not the request's is a
+/// fatal protocol error (`error.rs` `Protocol`, connection-fatal), and the
+/// client tears the connection down.
+#[tokio::test]
+async fn a_response_with_the_wrong_transaction_id_is_fatal() {
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 9);
+    sim.set_wrong_transaction_id(true);
+
+    let mut client = ModbusTcpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+    let requests = [req(AddressArea::HoldingRegister, 0, DataType::I16)];
+
+    let err = client.read_batch(&requests).await.unwrap_err();
+    match &err {
+        PlcError::Protocol(msg) => assert!(msg.contains("transaction id mismatch"), "{msg}"),
+        other => panic!("expected Protocol(transaction id mismatch), got {other:?}"),
+    }
+    assert!(err.is_connection_fatal());
+
+    let err = client.read_batch(&requests).await.unwrap_err();
+    assert!(matches!(err, PlcError::NotConnected), "got {err:?}");
+}
+
+/// P0-3 #3: connecting to a port nobody listens on fails (refused or timed
+/// out) without hanging, and leaves the client `NotConnected`. Same shape as
+/// `slmp/integration_tests.rs`'s `connect_to_a_closed_port_fails_without_hanging`,
+/// except the closed port is made by binding and dropping a plain listener
+/// (immediately and deterministically closed) instead of relying on an aborted
+/// simulator task having released its port.
+#[tokio::test]
+async fn connect_to_a_closed_port_fails_without_hanging() {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let mut client = ModbusTcpClient::new(ModbusTcpConfig {
+        host: "127.0.0.1".to_string(),
+        port,
+        connect_timeout: Duration::from_millis(300),
+        ..Default::default()
+    });
+    let err = client
+        .connect()
+        .await
+        .expect_err("connecting to a closed port should fail");
+    assert!(
+        matches!(err, PlcError::Connection(_) | PlcError::ConnectTimeout(_)),
+        "got {err:?}"
+    );
+    assert!(matches!(
+        client
+            .read_batch(&[req(AddressArea::HoldingRegister, 0, DataType::I16)])
+            .await,
+        Err(PlcError::NotConnected)
+    ));
+}
+
+/// P0-3 #4: the Modbus equivalent of SLMP's `read_batch_mixed_*`. The mixed
+/// front door (`plan_batch_requests`, what the broker's Modbus driver calls)
+/// run over a real socket: numeric and bit requests of several kinds are read
+/// in one call and come back at their original positions; string requests
+/// are, as today, `Bad(UnsupportedCombination)` without touching the wire or
+/// costing their batch-mates a reading.
+#[tokio::test]
+async fn read_batch_mixed_reads_numerics_and_keeps_strings_bad() {
+    use crate::decode::WordOrder;
+    use crate::plan_batch_requests;
+    use crate::types::{BatchReadRequest, StringEncoding, StringReadRequest};
+
+    let sim = Simulator::start().await;
+    // Registers under the string request too: if the string were (wrongly)
+    // read, it would not be Bad.
+    sim.set_holding_registers(0, &[0x4142, 0x4344, 0x0000, 0x0000]);
+    sim.set_holding_register(10, 7);
+    sim.set_holding_registers(20, &[0x0001, 0x0002]);
+    sim.set_input_register(0, 100);
+    sim.set_coil(5, true);
+
+    let sreq = |offset: u16, words: u16| {
+        BatchReadRequest::String(StringReadRequest {
+            address: Address::ModbusRef {
+                area: AddressArea::HoldingRegister,
+                offset,
+                bit: None,
+            },
+            words,
+            encoding: StringEncoding::ShiftJis,
+        })
+    };
+    let requests = [
+        sreq(0, 4),
+        BatchReadRequest::Numeric(req(AddressArea::HoldingRegister, 10, DataType::I16)),
+        BatchReadRequest::Numeric(req(AddressArea::HoldingRegister, 20, DataType::U32)),
+        BatchReadRequest::Numeric(req(AddressArea::InputRegister, 0, DataType::U16)),
+        sreq(30, 2),
+        BatchReadRequest::Numeric(req(AddressArea::Coil, 5, DataType::Bit)),
+    ];
+
+    let config = fast_config(&sim);
+    let mut stream = super::dial_modbus(&config).await.unwrap();
+    let mut next_tid = 0u16;
+    let outcome = plan_batch_requests(&requests);
+    let results = super::execute_modbus_reads(
+        &mut stream,
+        1,
+        Duration::from_secs(5),
+        &mut next_tid,
+        &outcome,
+        requests.len(),
+        WordOrder::HighLow,
+    )
+    .await
+    .expect("the whole call is Ok");
+
+    assert_eq!(results.len(), requests.len());
+    for string_index in [0usize, 4] {
+        match &results[string_index] {
+            ReadResult::Bad(PlcError::UnsupportedCombination { area, data_type }) => {
+                assert_eq!(area, "modbus-tcp");
+                assert_eq!(data_type, "string");
+            }
+            other => {
+                panic!("expected Bad(UnsupportedCombination) at {string_index}, got {other:?}")
+            }
+        }
+    }
+    assert_eq!(results[1], ReadResult::Value(TagValue::F64(7.0)));
+    assert_eq!(
+        results[2],
+        ReadResult::Value(TagValue::F64(0x0001_0002_u32 as f64))
+    );
+    assert_eq!(results[3], ReadResult::Value(TagValue::F64(100.0)));
+    assert_eq!(results[5], ReadResult::Value(TagValue::Bit(true)));
+}

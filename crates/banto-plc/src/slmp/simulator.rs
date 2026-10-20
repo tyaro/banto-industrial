@@ -52,6 +52,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -117,6 +118,11 @@ struct State {
     /// #605: 直前に受け取った要求のサブコマンド。Q のワード読みは `0x0000`、
     /// R のワード読みは `0x0002`（ビットはそれぞれ `0x0001` / `0x0003`）。
     last_subcommand: Option<u16>,
+    /// P0-3: when set, every response is written `chunk` bytes at a time with
+    /// a `delay` between chunks (and `TCP_NODELAY`) - a response that reaches
+    /// the client split across several `read()`s. Default `None`: one
+    /// `write_all`, as before.
+    chunking: Option<(usize, Duration)>,
 }
 
 /// A running simulator instance. Dropping this does *not* stop the server (the
@@ -327,6 +333,17 @@ impl Simulator {
         self.state.lock().unwrap().malformed = false;
     }
 
+    /// Send every response in pieces of `chunk` bytes with `delay` between
+    /// them (P0-3, docs/banto-hub-driver-refactor-plan.md §8.3 #6) - so the
+    /// client sees one SLMP response arrive over several `read()`s, as it can
+    /// on a real network. Off by default; `None` turns it back off.
+    pub fn set_response_chunking(&self, chunking: Option<(usize, Duration)>) {
+        if let Some((chunk, _)) = chunking {
+            assert!(chunk > 0, "chunk size must be at least 1 byte");
+        }
+        self.state.lock().unwrap().chunking = chunking;
+    }
+
     /// Stop responding to any request on any connection (existing or future)
     /// until [`Simulator::stop_hanging`] is called - for exercising the
     /// client's response timeout.
@@ -408,8 +425,25 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
             area_id,
         };
         let response = build_response(&state, &route, &command);
-        if stream.write_all(&response).await.is_err() {
-            return;
+        let chunking = state.lock().unwrap().chunking;
+        match chunking {
+            None => {
+                if stream.write_all(&response).await.is_err() {
+                    return;
+                }
+            }
+            Some((chunk, delay)) => {
+                let _ = stream.set_nodelay(true);
+                let mut pieces = response.chunks(chunk).peekable();
+                while let Some(piece) = pieces.next() {
+                    if stream.write_all(piece).await.is_err() || stream.flush().await.is_err() {
+                        return;
+                    }
+                    if pieces.peek().is_some() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
         }
     }
 }
