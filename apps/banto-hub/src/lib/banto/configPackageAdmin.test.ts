@@ -961,7 +961,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 	});
 });
 
-describe('applyConfigPackage: cpuType を持たない旧パッケージ（#605）', () => {
+describe('applyConfigPackage: cpuType は必須（#605、版 2）', () => {
 	const slmpConn = {
 		id: 7,
 		name: 'plcq',
@@ -978,45 +978,45 @@ describe('applyConfigPackage: cpuType を持たない旧パッケージ（#605�
 		passwordSet: false
 	};
 
-	function legacyPackage(name: string): ConfigPackage {
-		const legacy = {
-			...pkg,
-			plcConnections: [
-				{
-					name,
-					protocol: 'slmp',
-					host: '10.0.0.8',
-					port: 5007,
-					unitId: 0,
-					enabled: true,
-					simulation: false,
-					wordOrder: 'low_high'
-				}
-			],
-			collectionGroups: [],
-			tags: []
+	function slmpPackage(name: string, cpuType?: string): string {
+		const connection: Record<string, unknown> = {
+			name,
+			protocol: 'slmp',
+			host: '10.0.0.8',
+			port: 5007,
+			unitId: 0,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high'
 		};
-		return parseConfigPackage(JSON.stringify(legacy));
+		if (cpuType !== undefined) connection.cpuType = cpuType;
+		return JSON.stringify({ ...pkg, plcConnections: [connection], collectionGroups: [], tags: [] });
 	}
 
-	it('既存の Q 接続の更新に cpuType を載せない（サーバーが既存の Q を保つ）', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([slmpConn]);
-		vi.mocked(updatePlcConnection).mockResolvedValue(slmpConn);
-		await applyConfigPackage(legacyPackage('plcq'));
-		const sent = vi.mocked(updatePlcConnection).mock.calls[0][1];
-		expect(sent.cpuType).toBeUndefined();
+	it('cpuType を持たない接続のパッケージは、取り込む前の読み込みで項目の場所を示して拒否する', () => {
+		expect(() => parseConfigPackage(slmpPackage('plcq'))).toThrow(
+			/plcConnections\[0\]\.cpuType は Q \/ R/
+		);
 	});
 
-	it('新しい接続の作成にも cpuType を載せない（サーバーの既定 R になる）', async () => {
+	it('パッケージの cpuType をそのまま更新に載せる（既存の Q 接続を R に戻さない）', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([slmpConn]);
+		vi.mocked(updatePlcConnection).mockResolvedValue(slmpConn);
+		await applyConfigPackage(parseConfigPackage(slmpPackage('plcq', 'Q')));
+		const sent = vi.mocked(updatePlcConnection).mock.calls[0][1];
+		expect(sent.cpuType).toBe('Q');
+	});
+
+	it('新しい接続の作成にもパッケージの cpuType を載せる', async () => {
 		vi.mocked(createPlcConnection).mockResolvedValue({
 			...slmpConn,
 			id: 8,
 			name: 'plcnew',
 			cpuType: 'R'
 		});
-		await applyConfigPackage(legacyPackage('plcnew'));
+		await applyConfigPackage(parseConfigPackage(slmpPackage('plcnew', 'R')));
 		const sent = vi.mocked(createPlcConnection).mock.calls[0][0];
-		expect(sent.cpuType).toBeUndefined();
+		expect(sent.cpuType).toBe('R');
 	});
 });
 

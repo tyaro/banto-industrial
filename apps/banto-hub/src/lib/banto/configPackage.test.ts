@@ -293,7 +293,8 @@ describe('configPackage', () => {
 						name: 'group-calc',
 						plcConnectionName: 'calc',
 						periodMs: 1000,
-						enabled: true
+						enabled: true,
+						defaultWritable: true
 					}
 				],
 				tags: []
@@ -324,38 +325,19 @@ describe('configPackage', () => {
 		);
 	});
 
-	// --- P3-b（監査指摘 2026-08-12）: wordOrder は旧スキーマの構成パッケージ
-	// （この列を持たない）を読めなければならない - CONFIG_PACKAGE_SCHEMA_VERSION
-	// は据え置きのまま追加した後方互換フィールドなので、既存のエクスポート済み
-	// ファイルは wordOrder を一切含まない。
+	// --- 版 2（2026-10-20 オーナー決定）: 版 1 の間に足した項目（wordOrder・cpuType・
+	// defaultWritable・stringEncoding・sinkGroups）は必須。欠けたパッケージは
+	// 項目の場所を示して断り、既定値で黙って埋めない。
 
-	// 2026-09-08 オーナー決定（issue #325 の作業中に発覚した既存バグ）: 省略時の
-	// 既定はプロトコル依存になった。modbus-tcp は high_low - 旧パッケージが
-	// 書き出された当時、収集経路は Modbus のこの列を無視して HighLow で動いて
-	// いたので、high_low を埋めるほうが当時の実挙動と一致する（migration 0017 の
-	// backfill と同じ「実態への同期」）。
-	it('parseConfigPackage は wordOrder を持たない旧 modbus パッケージを high_low 既定で受け入れる', () => {
+	it('parseConfigPackage は wordOrder を持たない接続を、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutWordOrder = {
 			...pkg,
 			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => rest)
 		};
-		expect(withoutWordOrder.plcConnections[0].protocol).toBe('modbus-tcp');
-		const parsed = parseConfigPackage(JSON.stringify(withoutWordOrder));
-		expect(parsed.plcConnections[0].wordOrder).toBe('high_low');
-	});
-
-	it('parseConfigPackage は wordOrder を持たない旧 slmp パッケージを low_high 既定で受け入れる', () => {
-		const pkg = makePackage();
-		const withoutWordOrder = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => ({
-				...rest,
-				protocol: 'slmp'
-			}))
-		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutWordOrder));
-		expect(parsed.plcConnections[0].wordOrder).toBe('low_high');
+		expect(() => parseConfigPackage(JSON.stringify(withoutWordOrder))).toThrow(
+			/plcConnections\[0\]\.wordOrder は low_high \/ high_low/
+		);
 	});
 
 	it('parseConfigPackage は不正な wordOrder を拒否する', () => {
@@ -367,17 +349,22 @@ describe('configPackage', () => {
 		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
 	});
 
-	// #605: cpuType は旧パッケージには無い。省略は undefined のまま（作成は R、更新は既存を保つ）。
-	// 明示した Q は往復する。
-	// 未知の値は拒否する（R へ黙って倒さない）。
-	it('parseConfigPackage は cpuType を持たない旧パッケージを undefined のまま受け入れる（R を入れない）', () => {
+	// #605 + 版 2: cpuType は必須（省略・null は拒否。R を入れて既存の Q 接続を
+	// 戻してしまうことがない）。明示した Q は往復する。未知の値も拒否する。
+	it('parseConfigPackage は cpuType を持たない接続を、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutCpu = {
 			...pkg,
 			plcConnections: pkg.plcConnections.map(({ cpuType: _cpuType, ...rest }) => rest)
 		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutCpu));
-		expect(parsed.plcConnections[0].cpuType).toBeUndefined();
+		expect(() => parseConfigPackage(JSON.stringify(withoutCpu))).toThrow(
+			/plcConnections\[0\]\.cpuType は Q \/ R/
+		);
+		const withNullCpu = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map((c) => ({ ...c, cpuType: null }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withNullCpu))).toThrow(/cpuType/);
 	});
 
 	it('buildConfigPackage/parseConfigPackage は SLMP 接続の cpuType Q を往復する', () => {
@@ -432,12 +419,9 @@ describe('configPackage', () => {
 		expect(parsed.plcConnections[0].wordOrder).toBe('high_low');
 	});
 
-	// --- T19 S1-b（UX-34、2026-09-02 オーナー決定）: defaultWritable は
-	// wordOrder と同じ理由で旧スキーマの構成パッケージ（この項目を持たない）
-	// を読めなければならない - CONFIG_PACKAGE_SCHEMA_VERSION は据え置きの
-	// まま追加した後方互換フィールド。
+	// --- T19 S1-b（UX-34）+ 版 2: defaultWritable は必須。
 
-	it('parseConfigPackage は defaultWritable を持たない旧パッケージを true 既定で受け入れる', () => {
+	it('parseConfigPackage は defaultWritable を持たないグループを、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutDefaultWritable = {
 			...pkg,
@@ -445,8 +429,9 @@ describe('configPackage', () => {
 				({ defaultWritable: _defaultWritable, ...rest }) => rest
 			)
 		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutDefaultWritable));
-		expect(parsed.collectionGroups[0].defaultWritable).toBe(true);
+		expect(() => parseConfigPackage(JSON.stringify(withoutDefaultWritable))).toThrow(
+			/collectionGroups\[0\]\.defaultWritable/
+		);
 	});
 
 	it('parseConfigPackage は不正な defaultWritable を拒否する', () => {
@@ -480,14 +465,15 @@ describe('configPackage', () => {
 		expect(parsed.tags[0].stringEncoding).toBe('shift_jis');
 	});
 
-	it('parseConfigPackage は stringEncoding を持たない旧パッケージを utf8 既定で受け入れる', () => {
+	it('parseConfigPackage は stringEncoding を持たないタグを、項目の場所を示して拒否する', () => {
 		const pkg = makePackage();
 		const withoutStringEncoding = {
 			...pkg,
 			tags: pkg.tags.map(({ stringEncoding: _stringEncoding, ...rest }) => rest)
 		};
-		const parsed = parseConfigPackage(JSON.stringify(withoutStringEncoding));
-		expect(parsed.tags[0].stringEncoding).toBe('utf8');
+		expect(() => parseConfigPackage(JSON.stringify(withoutStringEncoding))).toThrow(
+			/tags\[0\]\.stringEncoding は utf8 または shift_jis/
+		);
 	});
 
 	it('parseConfigPackage は不正な stringEncoding を拒否する', () => {
@@ -712,9 +698,12 @@ describe('configPackage', () => {
 		]);
 	});
 
-	it('S6: sinkGroups を省略した buildConfigPackage 呼び出しは空配列になる（後方互換）', () => {
+	it('S6: sinkGroups を省略した buildConfigPackage 呼び出しは空配列になり、export に sinkGroups が書かれる', () => {
 		const pkg = makePackage();
 		expect(pkg.sinkGroups).toEqual([]);
+		const raw = JSON.parse(serializeConfigPackage(pkg)) as Record<string, unknown>;
+		expect(raw.sinkGroups).toEqual([]);
+		expect(parseConfigPackage(serializeConfigPackage(pkg)).sinkGroups).toEqual([]);
 	});
 
 	it('S6: sink group を含むパッケージは serializeConfigPackage/parseConfigPackage で往復できる', () => {
@@ -732,13 +721,14 @@ describe('configPackage', () => {
 		expect(parsed.sinkGroups[0].tags.map((ref) => ref.tagName)).toEqual(['tag-a', 'tag-db']);
 	});
 
-	it('S6: parseConfigPackage は sinkGroups キーを持たない旧パッケージを空配列として受け入れる（後方互換）', () => {
+	it('S6: parseConfigPackage は sinkGroups キーを持たないパッケージを拒否する', () => {
 		const pkg = makePackage();
 		const raw = JSON.parse(serializeConfigPackage(pkg)) as Record<string, unknown>;
 		delete raw.sinkGroups;
 		expect(raw.sinkGroups).toBeUndefined();
-		const parsed = parseConfigPackage(JSON.stringify(raw));
-		expect(parsed.sinkGroups).toEqual([]);
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(
+			/sinkGroups は配列である必要があります/
+		);
 	});
 
 	it('S6: parseConfigPackage は不正な sinkGroups.mode を拒否する', () => {

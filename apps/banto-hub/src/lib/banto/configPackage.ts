@@ -29,11 +29,15 @@ import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
  *
  * **版 1 のパッケージは読まない**（互換性は持たない - 同日のオーナー決定）。
  * `parseConfigPackage` は版 1 を「未対応の版」として断り、今の banto-hub で
- * 書き出し直すよう案内する。export は常に版 2 を書く。版 1 の間に足した
- * 「省略を許す」項目（`wordOrder`・`cpuType`・`defaultWritable`・
- * `stringEncoding`・`querySql`・`database`/`username`・`sinkGroups`）の
- * 扱いは版 2 でも変えていない（下の各 `expect*` の doc の「旧パッケージ」は
- * 版 1 の時代の記述）。
+ * 書き出し直すよう案内する。export は常に版 2 を書く。
+ *
+ * **版 1 の「省略を許す」措置も外した**（2026-10-20 オーナー決定）: 版 1 の間に
+ * 後から足した項目（`wordOrder`・`cpuType`・`defaultWritable`・`stringEncoding`・
+ * `sinkGroups`）は、版 2 では**必須**で、欠けたパッケージは項目の場所
+ * （`plcConnections[0].wordOrder` など）を示して断る。省略時の既定値で
+ * 黙って埋めない（取り込み側の挙動が export した側の意図と食い違うのを防ぐ）。
+ * 接続の `database`/`username` とグループの `querySql` は postgres 接続でだけ
+ * 意味を持つので、省略／`null` を通す（版 1 とは無関係の、項目の性質）。
  *
  * （版 1 の時代の経緯: #533（2026-10-08）でタグのしきい値（`thresholdH`/
  * `thresholdHh`/`thresholdL`/`thresholdLl`）を外した。export は書かず、取り込みは
@@ -67,7 +71,10 @@ export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
  * 「うっかり詰め忘れる」ではなく「そもそも代入できない」という形で
  * コンパイル時に保証する。
  */
-export type ConfigPackagePlcConnection = Omit<PlcConnectionInput, 'password'>;
+export type ConfigPackagePlcConnection = Omit<PlcConnectionInput, 'password' | 'cpuType'> & {
+	/** 版 2 では必須（REST の作成・更新と違い「省略は既存を保つ」を持たない）。 */
+	cpuType: CpuType;
+};
 
 export interface ConfigPackageCollectionGroup extends Omit<
 	CollectionGroupInput,
@@ -157,12 +164,8 @@ export interface ConfigPackage {
 	mqtt: ConfigPackageMqttSettings;
 	grpc: ConfigPackageGrpcSettings;
 	/**
-	 * S6: 旧スキーマ（この項目を持たないパッケージ）との後方互換のため、
-	 * パース後は常に配列（空配列を含む）で埋める - `parseConfigPackage`の
-	 * `parseSinkGroups`が省略時に`[]`へフォールバックする
-	 * （`expectWordOrder`等と同じ「後方互換な追加フィールドはバージョンを
-	 * 上げない」方針、実装指示6「old packages without the key still
-	 * import」）。
+	 * S6: DB Sink group。版 2 では必須（sink group が無い環境の export も
+	 * 空配列を書く）。項目が無いパッケージは `parseSinkGroups` が断る。
 	 */
 	sinkGroups: ConfigPackageSinkGroup[];
 }
@@ -301,45 +304,25 @@ function expectNullableNumber(value: unknown, path: string): number | null {
 }
 
 /**
- * #605: `cpuType` は旧パッケージには無い。省略と `null` は `undefined` のまま
- * 返す（作成は R、更新は既存の値を保つ。REST/MCP の「省略は既存を保つ」と
- * 同じ。ここで `"R"` を入れると、既存の Q 接続を同名の旧パッケージの取り込みが
- * R に戻してしまう）。`"Q"` / `"R"` はそのまま。それ以外は拒否する
- * （R へ黙って倒さない）。
+ * `cpuType`（#605）は版 2 では必須で、`Q` / `R` のいずれか。省略・`null` は
+ * 断る（REST の作成・更新は省略を許し「更新は既存の値を保つ」が、パッケージは
+ * 常に export が全項目を書くので、ここで既定の `R` を入れると既存の Q 接続を
+ * R に戻してしまう）。
  */
-function expectCpuType(value: unknown, path: string): CpuType | undefined {
-	if (value === undefined || value === null) return undefined;
+function expectCpuType(value: unknown, path: string): CpuType {
 	if (value === 'Q' || value === 'R') return value;
 	throw new ConfigPackageParseError(`${path} は Q / R のいずれかである必要があります`);
 }
 
 /**
- * P3-b（監査指摘 2026-08-12）: `wordOrder` は既存のエクスポート済み構成
- * パッケージ（この列を持たない旧スキーマ）にはまだ存在しない可能性がある
- * ので、`expectString` 等と違い省略を許容する — 省略時はバックエンドの既定
- * （`banto_tags::plc_connection::default_word_order`、`"low_high"`）と同じ
- * 値にフォールバックし、旧パッケージのインポートを壊さない
- * （`CONFIG_PACKAGE_SCHEMA_VERSION` は据え置き — 後方互換な追加フィールド
- * なのでバージョンを上げる理由がない）。値が存在する場合は
- * `low_high`/`high_low` のいずれかであることを検証する。
- *
- * 2026-09-08 オーナー決定（issue #325 の作業中に発覚した既存バグの修正）で
- * ワード順はプロトコル依存になった: modbus-tcp は `high_low`、それ以外は
- * `low_high`。省略時フォールバックも**同じくプロトコル依存**にしてある。
- *
- * ここを無条件 `low_high` にしてはいけない理由: 省略が起きるのは
- * 「`wordOrder` 自体を一度も知らない極めて古いパッケージ」だが、そのパッケージが
- * 書き出された当時、modbus-tcp 接続の収集経路は列を無視して `HighLow` で
- * 動いていた（`banto-collect` の取りこぼし）。つまり当時の実挙動は
- * `high_low` であり、`low_high` を埋めるとインポート時に静かに挙動が反転して
- * しまう。migration 0017 が既存 modbus 行を `high_low` へ backfill するのと
- * 全く同じ「実態への同期」をここでも行う。
+ * P3-b（監査指摘 2026-08-12）: `wordOrder` は版 2 では必須で、`low_high` /
+ * `high_low` のいずれか。省略は断る（版 1 の間は省略時にプロトコル依存の既定
+ * 値を入れていたが、2026-10-20 のオーナー決定で外した。export は常に書く）。
  *
  * この関数が返す型名は元 `SlmpWordOrder` から `WordOrder` に改名した
  * （SLMP専用ではなくなったため）。
  */
-function expectWordOrder(value: unknown, path: string, protocol: PlcProtocol): WordOrder {
-	if (value === undefined) return protocol === 'modbus-tcp' ? 'high_low' : 'low_high';
+function expectWordOrder(value: unknown, path: string): WordOrder {
 	if (value === 'low_high' || value === 'high_low') return value;
 	throw new ConfigPackageParseError(
 		`${path} は low_high / high_low のいずれかである必要があります`
@@ -347,32 +330,19 @@ function expectWordOrder(value: unknown, path: string, protocol: PlcProtocol): W
 }
 
 /**
- * `stringEncoding` は既存のエクスポート済み構成パッケージ（この項目を
- * 持たない旧スキーマ）にはまだ存在しない可能性があるので、
- * `expectWordOrder` と同じ理由で省略を許容する — 省略時は既定値
- * `'utf8'` にフォールバックし、旧パッケージのインポートを壊さない
- * （`CONFIG_PACKAGE_SCHEMA_VERSION` は据え置き — 後方互換な追加
- * フィールドなのでバージョンを上げる理由がない）。値が存在する場合は
- * `utf8`/`shift_jis` のいずれかであることを検証する。
+ * `stringEncoding` は版 2 では必須で、`utf8` / `shift_jis` のいずれか
+ * （省略・`null` は断る。export は常に書く）。
  */
 function expectStringEncoding(value: unknown, path: string): StringEncoding {
-	if (value === undefined || value === null) return 'utf8';
 	if (value === 'utf8' || value === 'shift_jis') return value;
 	throw new ConfigPackageParseError(`${path} は utf8 または shift_jis のいずれかです`);
 }
 
 /**
- * T19 S1-b（UX-34、2026-09-02 オーナー決定）: `defaultWritable` は既存の
- * エクスポート済み構成パッケージ（この項目を持たない旧スキーマ）には
- * まだ存在しない可能性があるので、`expectWordOrder` と同じ理由で省略を
- * 許容する — 省略時はバックエンドの既定（`banto_tags::collection_group::
- * default_writable_true`、`true`）と同じ値にフォールバックし、旧
- * パッケージのインポートを壊さない（`CONFIG_PACKAGE_SCHEMA_VERSION` は
- * 据え置き — 後方互換な追加フィールドなのでバージョンを上げる理由が
- * ない）。値が存在する場合は真偽値であることを検証する。
+ * T19 S1-b（UX-34、2026-09-02 オーナー決定）: `defaultWritable` は版 2 では
+ * 必須の真偽値（省略は断る）。
  */
 function expectDefaultWritable(value: unknown, path: string): boolean {
-	if (value === undefined) return true;
 	return expectBoolean(value, path);
 }
 
@@ -395,8 +365,8 @@ function filterVirtualConnections(connections: readonly PlcConnection[]): PlcCon
  * みを持つ）から export 用の形へ詰め替える。`database`/`username`は
  * postgres 以外では常に`null`（`PlcConnectionResponse::from`参照）なので、
  * そのまま`undefined`に変換して非 postgres 接続の export 形を変えない
- * （既存スキーマとの互換 - 後述`parsePlcConnections`の後方互換ルール
- * 参照）。`password`はそもそも入力に存在しない（`PlcConnection`型に
+ * （`database`/`username`は postgres 接続でだけ意味を持つ項目で、
+ * 省略を許す - `expectOptionalString`参照）。`password`はそもそも入力に存在しない（`PlcConnection`型に
  * フィールド自体が無い）ため、詰め忘れようがない。
  */
 function sanitizeConnection(input: PlcConnection): ConfigPackagePlcConnection {
@@ -507,9 +477,8 @@ export function buildConfigPackage(input: {
 	mqtt: MqttSettings;
 	grpc: GrpcSettings;
 	/**
-	 * S6（実装指示6）: 省略時は`[]`（sink group を持たない環境からの
-	 * export と同じ形になる - `parseConfigPackage`側の後方互換フォール
-	 * バックと対称）。
+	 * S6（実装指示6）: 省略時は`[]`（sink group を持たない環境でも、
+	 * export は`sinkGroups: []`を必ず書く - 版 2 では項目が必須）。
 	 */
 	sinkGroups?: readonly SinkGroup[];
 	exportedAt?: string;
@@ -592,15 +561,11 @@ export function serializeConfigPackage(pkg: ConfigPackage): string {
 }
 
 /**
- * S1（docs/banto-hub-external-db-design.md §4.1）: `database`/`username`は
- * 既存のエクスポート済み構成パッケージ（この列を持たない旧スキーマ、
- * または postgres 以外の接続）にはまだ存在しない可能性があるので、
- * `expectWordOrder`と同じ理由で省略を許容する - 省略/`null`時は
- * `undefined`にフォールバックし、旧パッケージのインポートを壊さない
- * （`CONFIG_PACKAGE_SCHEMA_VERSION`は据え置き - 後方互換な追加
- * フィールドなのでバージョンを上げる理由がない、#264の
- * `expectStringEncoding`と同じ判断）。値が存在する場合は文字列であることを
- * 検証する（postgres での必須チェックは`plcConnectionForm.ts
+ * S1（docs/banto-hub-external-db-design.md §4.1）: `database`/`username`と
+ * （S3）`querySql`は postgres 接続（配下のグループ）でだけ意味を持ち、サーバーは
+ * 他のプロトコルでの指定を拒否する。このため版 2 でも省略／`null` を通し、
+ * `undefined`にする（版 1 の互換とは無関係の、項目の性質）。値が存在する場合は
+ * 文字列であることを検証する（postgres での必須チェックは`plcConnectionForm.ts
  * ::validatePostgresFields`と同じ内容をここでは行わない - configPackage の
  * パースは「形として妥当か」だけを見て、実際の作成/更新時のサーバー側
  * バリデーションに委ねる。他の`ConfigPackage*`パーサーも同じ方針
@@ -640,7 +605,7 @@ function parsePlcConnections(raw: unknown): ConfigPackagePlcConnection[] {
 			unitId: expectInteger(item.unitId, `plcConnections[${index}].unitId`),
 			enabled: expectBoolean(item.enabled, `plcConnections[${index}].enabled`),
 			simulation: expectBoolean(item.simulation, `plcConnections[${index}].simulation`),
-			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`, protocol),
+			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`),
 			cpuType: expectCpuType(item.cpuType, `plcConnections[${index}].cpuType`),
 			database: expectOptionalString(item.database, `plcConnections[${index}].database`),
 			username: expectOptionalString(item.username, `plcConnections[${index}].username`)
@@ -666,14 +631,9 @@ function parseCollectionGroups(raw: unknown): ConfigPackageCollectionGroup[] {
 				item.defaultWritable,
 				`collectionGroups[${index}].defaultWritable`
 			),
-			// S3: `querySql`は既存のエクスポート済み構成パッケージ（この項目を
-			// 持たない旧スキーマ、または postgres 以外の接続配下のグループ）
-			// にはまだ存在しない可能性があるので、`database`/`username`
-			// （S1、`expectOptionalString`）と同じ理由で省略を許容する -
-			// 省略/`null`時は`undefined`にフォールバックする（postgres 配下
-			// での必須チェックはここでは行わない - `expectOptionalString`の
-			// doc comment と同じ方針、実際の作成/更新時のサーバー側
-			// バリデーションに委ねる）。
+			// S3: `querySql`は postgres 接続配下のグループでだけ意味を持つので、
+			// `database`/`username`（S1、`expectOptionalString`）と同じく省略／
+			// `null`を通す（必須チェックはサーバー側に委ねる）。
 			querySql: expectOptionalString(item.querySql, `collectionGroups[${index}].querySql`)
 		};
 	});
@@ -695,8 +655,8 @@ const REMOVED_TAG_THRESHOLD_KEYS = [
  * 黙って捨てずに取り込みを断る（REST の `TagPayload::reject_thresholds` と
  * 同じ考え方 - 捨てると、取り込んだ側は警報が設定できたと思い込む）。
  * 項目が無い・`null`（#533 より前の export で、しきい値を設定していなかった
- * タグ）は通す - `CONFIG_PACKAGE_SCHEMA_VERSION` は 1 のまま（項目を外した
- * だけで、しきい値を使っていない旧パッケージはそのまま取り込める）。
+ * タグ）は通す - 版 2 でも同じ（項目を外しただけで、しきい値を設定していなかった
+ * タグはそのまま取り込める）。
  */
 function rejectTagThresholds(item: Record<string, unknown>, index: number): void {
 	for (const key of REMOVED_TAG_THRESHOLD_KEYS) {
@@ -743,15 +703,10 @@ function parseTags(raw: unknown): ConfigPackageTag[] {
 }
 
 /**
- * S6（実装指示6「old packages without the key still import」）:
- * `sinkGroups`は既存のエクスポート済み構成パッケージ（この項目を持たない
- * 旧スキーマ）にはまだ存在しない可能性があるので、`querySql`/`database`と
- * 同じ理由で省略を許容する - 省略時は`[]`にフォールバックする
- * （`CONFIG_PACKAGE_SCHEMA_VERSION`は据え置き - 後方互換な追加フィールド
- * なのでバージョンを上げる理由がない）。
+ * S6（実装指示6）: `sinkGroups`は版 2 では必須の配列（sink group が無くても
+ * 空配列）。項目が無いパッケージは断る。
  */
 function parseSinkGroups(raw: unknown): ConfigPackageSinkGroup[] {
-	if (raw === undefined) return [];
 	if (!Array.isArray(raw)) {
 		throw new ConfigPackageParseError('sinkGroups は配列である必要があります');
 	}
