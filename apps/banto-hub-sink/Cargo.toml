@@ -65,6 +65,9 @@ banto-service-elev = { path = "../../crates/banto-service-elev" }
 # 本番のサイドカーは Hub に HTTP で繋ぐだけで、この依存は dev 限定
 # （配布バイナリには入らない）。
 banto-hub-core = { path = "../banto-hub/core" }
+# R1-3b: 統合テストが `HubSessions::new` に渡す `HubDrivers` を `builtin()` から
+# 組み立てる。sink の本番コードは Hub に HTTP で繋ぐだけでドライバを使わないので dev 限定。
+banto-drivers = { path = "../../crates/banto-drivers" }
 banto-server = { workspace = true }
 banto-tags = { path = "../../crates/banto-tags" }
 banto-tstore = { path = "../../crates/banto-tstore" }

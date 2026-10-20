@@ -46,6 +46,8 @@
 # R1-2: crates/banto-driver-conformance (banto-driver-api のドライバの適合テスト一式。
 # API と同じく crates.io へ公開する crate で、独自の版 0.1.0。API には path + version で
 # 依存する. docs/banto-driver-api-design.md §2.2・§7).
+# R1-3b: crates/banto-drivers (ホストが注入する組み込みドライバ一式 `builtin()`。
+# 内部 crate. docs/banto-driver-api-design.md §6).
 [workspace]
 resolver = "2"
 members = [
@@ -53,6 +55,7 @@ members = [
     "crates/banto-plc-address",
     "crates/banto-driver-api",
     "crates/banto-driver-conformance",
+    "crates/banto-drivers",
     "crates/banto-plc",
     "crates/banto-plc-write",
     "crates/banto-tstore",

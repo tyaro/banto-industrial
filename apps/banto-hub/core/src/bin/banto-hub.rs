@@ -77,9 +77,22 @@
 #[path = "banto_hub/win_service.rs"]
 mod win_service;
 
+use banto_hub_core::broker_glue::HubDrivers;
 use banto_hub_core::profile_lock::HubHostKind;
 use banto_hub_core::profile_paths::build_hub_config_from_env;
 use banto_hub_core::runtime::HubRuntime;
+
+/// R1-3b: この bin が組み立てる組み込みドライバ一式（コンソール・Windows サービス
+/// 共通）。コアは `HubDrivers` を注入で受け取るだけで具体的なドライバを知らない
+/// （docs/banto-driver-api-design.md §6.4）。
+fn hub_drivers() -> HubDrivers {
+    let builtin = banto_drivers::builtin();
+    HubDrivers::new(
+        std::sync::Arc::new(builtin.registry),
+        builtin.broker,
+        builtin.client_factory,
+    )
+}
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -123,7 +136,7 @@ fn print_usage() {
 fn run_console() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
     runtime.block_on(async {
-        let config = build_hub_config_from_env(HubHostKind::Console);
+        let config = build_hub_config_from_env(HubHostKind::Console, hub_drivers());
         // 旧 `hub_run::run`はここで `expect("init_db should succeed")`等の
         // 4箇所が panic していた（設計 §2「現行コード地図」）。T14-1 で
         // `Result`化した分、コンソールでは同等の異常終了（panic ではないが

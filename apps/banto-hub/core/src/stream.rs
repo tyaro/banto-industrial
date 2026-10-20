@@ -1420,7 +1420,10 @@ pub(crate) mod tests {
             dir.path().join("data"),
             Arc::new(SystemClock),
             CollectorOptions::default(),
-            Arc::new(HubSessions::new(banto_broker::BackoffConfig::default())),
+            Arc::new(HubSessions::new(
+                banto_broker::BackoffConfig::default(),
+                crate::test_support::test_drivers(),
+            )),
             Arc::new(BrokerSimRegistry::new()),
             Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
         ));

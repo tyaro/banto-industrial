@@ -618,7 +618,7 @@ impl HubProgram {
         Self::new(ProgramParts {
             config: Box::new(|| {
                 let paths = resolve_profile_paths_from_env();
-                let config = build_hub_config_from_env(HubHostKind::Service);
+                let config = build_hub_config_from_env(HubHostKind::Service, crate::hub_drivers());
                 (paths, config)
             }),
             read_owners: Box::new(banto_hub_core::profile_owners::read_owners),

@@ -105,6 +105,17 @@ struct PgTarget {
     url: String,
 }
 
+/// R1-3b: the built-in drivers as the `HubDrivers` `HubSessions::new` takes
+/// (docs/banto-driver-api-design.md §6.4).
+fn banto_drivers_helper() -> banto_hub_core::broker_glue::HubDrivers {
+    let builtin = banto_drivers::builtin();
+    banto_hub_core::broker_glue::HubDrivers::new(
+        Arc::new(builtin.registry),
+        builtin.broker,
+        builtin.client_factory,
+    )
+}
+
 fn pg_target() -> Option<PgTarget> {
     let url = std::env::var("BANTO_TEST_PG_URL").ok()?;
     let options: PgConnectOptions = url
@@ -293,7 +304,10 @@ async fn test_app() -> TestApp {
         .await
         .expect("admin login");
 
-    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+    let sessions = Arc::new(HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+        banto_drivers_helper(),
+    ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(

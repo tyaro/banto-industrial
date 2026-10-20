@@ -202,6 +202,9 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// - このモジュール doc の「環境変数の読み取り位置」節参照。
 #[derive(Debug, Clone)]
 pub struct HubConfig {
+    /// 注入されるドライバ一式（R1-3b、docs/banto-driver-api-design.md §6.4）。
+    /// ホスト（bin・shell・テスト）が `banto_drivers::builtin()` から組み立てる。
+    pub drivers: crate::broker_glue::HubDrivers,
     /// DB ファイルパス。旧 `BANTO_DB` env（既定 [`DEFAULT_DB_PATH`]）。
     pub db_path: String,
     /// `POST /api/auth/setup`を許可するか。旧 `BANTO_ALLOW_SETUP=="1"`。
@@ -328,6 +331,7 @@ impl HubRuntime {
         given_dirs: Option<ProfileDirs>,
     ) -> Result<RunningHub, HubStartError> {
         let HubConfig {
+            drivers,
             db_path,
             allow_setup,
             port_override,
@@ -508,7 +512,10 @@ impl HubRuntime {
         // so this binary can call `sessions.shutdown()` after
         // `manager.shutdown()` on the way out - see this module's doc
         // comment ("シャットダウン順序").
-        let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+        let sessions = Arc::new(HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            drivers,
+        ));
 
         // T9-2 (docs/ux-plan.md §1): constructed here, OUTSIDE
         // `CollectorManager`, for the same reason `sessions` is - a
@@ -1396,6 +1403,7 @@ mod tests {
         let data_dir = dir.path().join("data");
 
         let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -1440,6 +1448,7 @@ mod tests {
         let dirs = plain_profile_dirs(&dir);
         let db = dirs.config.path().join(DB_FILE_NAME);
         let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path: db.to_string_lossy().into_owned(),
             allow_setup: false,
             port_override: Some(0),
@@ -1474,6 +1483,7 @@ mod tests {
         let dirs = plain_profile_dirs(&dir);
         assert!(dirs.audit_spool.is_none());
         let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path: dirs
                 .config
                 .path()
@@ -1546,6 +1556,7 @@ mod tests {
         pool.close().await;
 
         let hub = HubRuntime::start(HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -1639,6 +1650,7 @@ mod tests {
             .expect("setup admin");
         pool.close().await;
         let hub = HubRuntime::start(HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -1774,6 +1786,7 @@ mod tests {
         pool.close().await;
 
         let hub = HubRuntime::start(HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -2067,6 +2080,7 @@ mod tests {
         pool.close().await;
 
         let hub = HubRuntime::start(HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -2546,6 +2560,7 @@ mod tests {
         let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
         let busy = holder.local_addr().unwrap().port();
         let make = |port: u16| HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path: dir
                 .path()
                 .join("registry.sqlite3")
@@ -2591,6 +2606,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -2766,6 +2782,7 @@ Host: {addr}
         let data_dir = dir.path().join("data");
 
         let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -2809,6 +2826,7 @@ Host: {addr}
         let data_dir = dir.path().join("data");
 
         let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -2850,6 +2868,7 @@ Host: {addr}
             .to_string_lossy()
             .into_owned();
         let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
             db_path,
             allow_setup: false,
             port_override: Some(0),
@@ -2985,7 +3004,10 @@ Host: {addr}
             data_dir.to_path_buf(),
             clock,
             CollectorOptions::default(),
-            Arc::new(HubSessions::new(banto_broker::BackoffConfig::default())),
+            Arc::new(HubSessions::new(
+                banto_broker::BackoffConfig::default(),
+                crate::test_support::test_drivers(),
+            )),
             Arc::new(BrokerSimRegistry::new()),
             Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
         )

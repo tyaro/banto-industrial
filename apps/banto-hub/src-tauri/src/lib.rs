@@ -239,6 +239,7 @@ use banto_desktop_tray::{
     ConfirmPrompt, ExitCleanupOnce, ExitCleanupOutcome, ExitCleanupReport, QuitAdmission,
     QuitAnswerDecision, QuitGate, QuitRequestDecision, TrayHint,
 };
+use banto_hub_core::broker_glue::HubDrivers;
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
 #[cfg(windows)]
 use banto_hub_core::host_switch::{
@@ -276,6 +277,17 @@ mod hub_slot;
 mod launch_gate;
 mod sink_service_ipc;
 mod tray_status;
+
+/// R1-3b: このシェルが組み立てて `HubConfig.drivers` に注入する組み込みドライバ一式。
+/// コアは具体的なドライバを知らない（docs/banto-driver-api-design.md §6.4）。
+fn hub_drivers() -> HubDrivers {
+    let builtin = banto_drivers::builtin();
+    HubDrivers::new(
+        std::sync::Arc::new(builtin.registry),
+        builtin.broker,
+        builtin.client_factory,
+    )
+}
 
 /// メインウィンドウのラベル - `tauri.conf.json` の `app.windows[0].label` と
 /// 一致させること。
@@ -1259,6 +1271,7 @@ fn attempt_desktop_start(
     // `tauri::async_runtime::block_on`で待つのと同じ流儀）。
     match tauri::async_runtime::block_on(HubRuntime::start(build_hub_config_from_env(
         HubHostKind::Shell,
+        hub_drivers(),
     ))) {
         Ok(hub) => StartupOutcome::Desktop(Box::new(StartedHub { hub, ticket })),
         Err(err) => {
@@ -3062,7 +3075,7 @@ mod tests {
     /// env を書き換えずに profile 既定パスとの一致を確認できる）。
     #[test]
     fn build_hub_config_from_env_reflects_or_defaults_each_key() {
-        let config = build_hub_config_from_env(HubHostKind::Shell);
+        let config = build_hub_config_from_env(HubHostKind::Shell, hub_drivers());
         let expected_paths = resolve_profile_paths_from_env();
 
         match std::env::var("BANTO_DB") {

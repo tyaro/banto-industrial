@@ -784,6 +784,7 @@ mod tests {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
+            crate::test_support::test_drivers(),
         ));
         let sim_registry = Arc::new(crate::broker_glue::BrokerSimRegistry::new());
         let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(

@@ -397,7 +397,10 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("admin login");
 
-    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+    let sessions = Arc::new(HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+        common::hub_drivers(),
+    ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
@@ -526,7 +529,10 @@ async fn all_simulation_test_app(label: &str) -> AllSimulationTestApp {
         .await
         .expect("admin login");
 
-    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+    let sessions = Arc::new(HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+        common::hub_drivers(),
+    ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(

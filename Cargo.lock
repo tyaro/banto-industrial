@@ -713,6 +713,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-drivers"
+version = "0.1.0"
+dependencies = [
+ "banto-broker",
+ "banto-collect",
+ "banto-driver-api",
+ "banto-plc",
+]
+
+[[package]]
 name = "banto-exit-once"
 version = "0.1.0"
 
@@ -746,6 +756,8 @@ dependencies = [
  "banto-broker",
  "banto-collect",
  "banto-core",
+ "banto-driver-api",
+ "banto-drivers",
  "banto-expr",
  "banto-instance-lock",
  "banto-opcua-server",
@@ -792,6 +804,7 @@ name = "banto-hub-shell"
 version = "0.2.0-alpha.32"
 dependencies = [
  "banto-desktop-tray",
+ "banto-drivers",
  "banto-hub-core",
  "banto-safe-root",
  "banto-server",
@@ -812,6 +825,7 @@ dependencies = [
  "axum 0.8.9",
  "banto-broker",
  "banto-collect",
+ "banto-drivers",
  "banto-hub-core",
  "banto-safe-root",
  "banto-server",

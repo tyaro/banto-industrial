@@ -635,6 +635,7 @@ mod tests {
             banto_collect::CollectorOptions::default(),
             Arc::new(crate::broker_glue::HubSessions::new(
                 banto_broker::BackoffConfig::default(),
+                crate::test_support::test_drivers(),
             )),
             Arc::new(crate::broker_glue::BrokerSimRegistry::new()),
             computed,

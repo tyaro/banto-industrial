@@ -1577,7 +1577,7 @@ impl CollectorManager {
         // above, falling back to a direct client only when a connection is
         // defensively missing from the handle map
         // (`crate::broker_glue::hub_client_factory`'s doc comment).
-        let factory = hub_client_factory(Arc::new(broker_handles));
+        let factory = hub_client_factory(Arc::new(broker_handles), &self.sessions);
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(collector) = collector_guard.as_mut() {
@@ -2450,7 +2450,7 @@ impl CollectorManager {
             return Ok(());
         }
 
-        let factory = hub_client_factory(Arc::new(broker_handles));
+        let factory = hub_client_factory(Arc::new(broker_handles), &self.sessions);
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(message) = self.take_injected_apply_failure() {
@@ -2679,7 +2679,10 @@ mod tests {
         let db_path = dir.path().join("registry.sqlite3");
         let pool = init_db(&db_path).await.expect("init_db");
         let data_dir = dir.path().join("data");
-        let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+        let sessions = Arc::new(HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            crate::test_support::test_drivers(),
+        ));
         let sim_registry = Arc::new(BrokerSimRegistry::new());
         let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
         let manager = CollectorManager::new(
@@ -2711,7 +2714,10 @@ mod tests {
         let db_path = dir.path().join("registry.sqlite3");
         let pool = init_db(&db_path).await.expect("init_db");
         let data_dir = dir.path().join("data");
-        let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+        let sessions = Arc::new(HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            crate::test_support::test_drivers(),
+        ));
         let sim_registry = Arc::new(BrokerSimRegistry::new());
         let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
         let manager = CollectorManager::new(
