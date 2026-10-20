@@ -37,6 +37,12 @@ const G = {
 		{ name: 'banto-tags', dir: 'crates/banto-tags', deps: ['banto-plc-address'] },
 		// R1-1: 公開するドライバ API（依存ゼロ）と、その型を再輸出する banto-plc。
 		{ name: 'banto-driver-api', dir: 'crates/banto-driver-api', deps: [] },
+		// R1-2: 公開する適合テスト一式（API にだけ依存）。
+		{
+			name: 'banto-driver-conformance',
+			dir: 'crates/banto-driver-conformance',
+			deps: ['banto-driver-api']
+		},
 		{
 			name: 'banto-plc',
 			dir: 'crates/banto-plc',
@@ -321,7 +327,20 @@ const TABLE = [
 		{
 			...NONE,
 			run_rust: true,
-			rust_args: '-p banto-driver-api -p banto-plc',
+			rust_args: '-p banto-driver-api -p banto-driver-conformance -p banto-plc',
+			run_driver_api: true
+		}
+	],
+	[
+		'banto-driver-conformance（R1-2 の公開 crate。逆依存は無く、driver-api ジョブが走る）',
+		[
+			'crates/banto-driver-conformance/src/frame.rs',
+			'crates/banto-driver-conformance/CHANGELOG.md'
+		],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: '-p banto-driver-conformance',
 			run_driver_api: true
 		}
 	],
@@ -749,7 +768,7 @@ test('実グラフ: 主な crate の逆依存が期待のパッケージを含�
 	}
 });
 
-test('実グラフ: banto-driver-api は依存ゼロで、変更すると driver-api ジョブが走る', () => {
+test('実グラフ: banto-driver-api は依存ゼロ、conformance は API だけに依存し、変更すると driver-api ジョブが走る', () => {
 	const g = real();
 	const api = g.packages.find((p) => p.name === 'banto-driver-api');
 	assert.ok(api, 'banto-driver-api が workspace に無い');
@@ -759,6 +778,22 @@ test('実グラフ: banto-driver-api は依存ゼロで、変更すると driver
 		'banto-driver-api に workspace の依存ができた（公開できなくなる）'
 	);
 	assert.ok(reverseDeps(g, ['banto-driver-api']).has('banto-plc'));
+	// R1-2: 適合テスト一式も公開するので、workspace の依存は API だけ。
+	const conformance = g.packages.find((p) => p.name === 'banto-driver-conformance');
+	assert.ok(conformance, 'banto-driver-conformance が workspace に無い');
+	assert.deepEqual(
+		conformance.deps,
+		['banto-driver-api'],
+		'banto-driver-conformance に API 以外の workspace の依存ができた（公開できなくなる）'
+	);
+	assert.equal(
+		classify({
+			event: 'pull_request',
+			files: ['crates/banto-driver-conformance/src/lib.rs'],
+			graph: g
+		}).jobs.run_driver_api,
+		true
+	);
 	const jobs = classify({
 		event: 'pull_request',
 		files: ['crates/banto-driver-api/src/lib.rs'],

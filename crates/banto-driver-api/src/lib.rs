@@ -1,5 +1,5 @@
 //! banto-driver-api: the driver boundary of banto-hub / ChronoGazer - types
-//! (and, from R1-2, traits) only (docs/banto-driver-api-design.md,
+//! and traits only (docs/banto-driver-api-design.md,
 //! docs/banto-hub-driver-refactor-plan.md §4 R1).
 //!
 //! This crate is the one place a PLC/instrument driver and the host (Hub's
@@ -49,6 +49,31 @@
 //! - [`error`]: [`ItemError`] / [`DeviceError`] / [`FatalError`]
 //! - [`settings`]: ordered, duplicate-free connection settings ([`Settings`])
 //!   and the shared key names ([`settings::keys`])
+//! - [`driver`]: the static half every driver implements ([`DriverBase`]:
+//!   identity, settings validation, address functions) with
+//!   [`DriverDescriptor`] / [`Capabilities`] / [`Transport`] /
+//!   [`AddressError`] (R1-2, design §4.1)
+//! - [`frame`]: frame-type drivers, which build and parse bytes while the
+//!   host's engine owns the transport ([`FrameDriver`] /
+//!   [`FrameConnection`], [`Step`] / [`FrameRule`] / [`Planned`], the write
+//!   state machine [`WriteProgress`]; R1-2, design §4.2, §4.2.1)
+//! - [`session`]: session-type drivers, which own their I/O
+//!   ([`SessionDriver`] / [`Session`], [`BoxFuture`]; R1-2, design §5)
+//! - [`registry`]: [`DriverRegistry`], driver id → [`DriverEntry`] of a
+//!   [`DriverKind`] (R1-2, design §6.1)
+//!
+//! ## Traits: what R1 implements
+//!
+//! In R1 no production driver is a [`FrameDriver`] or [`SessionDriver`]:
+//! Modbus TCP / SLMP implement only [`DriverBase`] and are registered as
+//! [`DriverKind::HostBound`], their I/O still wired by `banto-broker`
+//! (design §4.4). The traits are exercised by the separate conformance crate
+//! `banto-driver-conformance` (a reference frame driver, a fake session
+//! driver and the harness, design §7), which a third-party driver uses to
+//! check itself without a Hub.
+//!
+//! Adding a trait method *with* a default implementation is not breaking;
+//! adding one without is (design §9.1).
 //!
 //! Every public item is also re-exported at the crate root.
 //!
@@ -62,12 +87,25 @@
 #![forbid(unsafe_code)]
 
 pub mod address;
+pub mod driver;
 pub mod error;
+pub mod frame;
+pub mod registry;
+pub mod session;
 pub mod settings;
 pub mod types;
 
 pub use address::{DriverAddress, DriverId, InvalidDriverId};
+pub use driver::{
+    AddressError, Capabilities, DriverBase, DriverDescriptor, Transport, API_VERSION,
+};
 pub use error::{DeviceError, FatalError, ItemError};
+pub use frame::{
+    FrameCheck, FrameConnection, FrameDriver, FrameRule, Planned, PrefixEncoding, PrefixSpec, Step,
+    WriteProgress,
+};
+pub use registry::{DriverEntry, DriverKind, DriverRegistry, RegistryError};
+pub use session::{BoxFuture, ConnectContext, Session, SessionDriver};
 pub use settings::{keys, DuplicateKey, FieldError, Setting, Settings};
 pub use types::{
     DataType, RawValue, StringEncoding, TagKind, TagSpec, TagValue, Value, WordOrder, WriteItem,

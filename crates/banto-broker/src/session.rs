@@ -58,16 +58,25 @@
 //! ([`banto_plc::BoxFuture`], reused rather than redefined) so this trait
 //! stays object-safe and [`crate::ConnState::Connected`] can hold a plain
 //! `Box<dyn BrokerSession>` regardless of which driver produced it.
+//!
+//! ## Visibility (R1-2, docs/banto-driver-api-design.md §2.3)
+//!
+//! [`BrokerSession`], [`SessionError`] and [`Connector`] are `pub` (re-exported
+//! at the crate root) so that a driver crate outside this one
+//! (`banto-driver-modbus` / `banto-driver-slmp`, R1-4a) can implement a
+//! session and hand the broker a `Connector`. Everything that runs them -
+//! `TaskEntry`, `spawn_task_with_connector`, the job loop - stays private:
+//! a driver supplies the session, the broker owns the task.
 
 use banto_plc::{BatchReadRequest, BatchReadResult, BoxFuture};
 use banto_plc_write::{BatchWriteRequest, WriteResult};
 
 /// A live PLC session, owning one connection-level resource (for
-/// [`crate::slmp_driver::SlmpSession`], one `slmp::SLMPClient` socket) and
+/// `slmp_driver::SlmpSession`, one `slmp::SLMPClient` socket) and
 /// exposing both read and write over it. See this module's doc comment for
 /// the full contract, especially the `Err` = connection-fatal rule every
 /// implementation must uphold.
-pub(crate) trait BrokerSession: Send {
+pub trait BrokerSession: Send {
     /// Execute one read batch against this session. `Ok` carries exactly
     /// `requests.len()` results in `requests` order, each either a decoded
     /// value or a per-request `Bad` outcome - see this module's doc comment
@@ -85,7 +94,7 @@ pub(crate) trait BrokerSession: Send {
     ) -> BoxFuture<'a, Result<Vec<WriteResult>, SessionError>>;
 
     /// Close this session's underlying connection gracefully. Called once,
-    /// from [`crate::run_broker_task`]'s shutdown path, on whatever session
+    /// from `run_broker_task`'s shutdown path, on whatever session
     /// happened to be live when the task was asked to stop - never called
     /// concurrently with (or after) a `read_batch`/`write_batch` call.
     fn disconnect(&mut self) -> BoxFuture<'_, ()>;
@@ -95,12 +104,12 @@ pub(crate) trait BrokerSession: Send {
 /// return on a connection-fatal failure - see this module's doc comment for
 /// the contract. Carries only a display message (the underlying
 /// `PlcError`/`PlcWriteError`/driver-specific error's own `to_string()`)
-/// because that is all [`crate::run_broker_task`] ever does with it -
+/// because that is all `run_broker_task` ever does with it -
 /// `BrokerError::ConnectionFailed { reason, .. }` - so there is nothing to
 /// gain from preserving a richer, protocol-specific error type this far up
 /// the stack.
 #[derive(Debug, Clone)]
-pub(crate) struct SessionError(pub(crate) String);
+pub struct SessionError(pub String);
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -111,18 +120,18 @@ impl std::fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 /// A reusable "dial a fresh session" step for one broker task, boxed so
-/// [`crate::run_broker_task`] can hold and repeatedly call it (on every
+/// `run_broker_task` can hold and repeatedly call it (on every
 /// reconnect attempt) without knowing which driver or config type produced
-/// it. `Arc` (not `Box`) because [`crate::ConnEvent::Due`]'s handling clones
+/// it. `Arc` (not `Box`) because `ConnEvent::Due`'s handling clones
 /// it into a spawned sub-task on every attempt - see
-/// [`crate::connect_attempt`] - while the original stays owned by the task
+/// `connect_attempt` - while the original stays owned by the task
 /// loop for the next attempt after that. `Fn` (not `FnOnce`) for the same
 /// reason: a failed attempt must be retryable, not consumed.
 ///
 /// Each driver builds its own `Connector` from its own config type (e.g.
-/// [`crate::slmp_driver::connector`] from a `SlmpConfig`) - the closure is
-/// what erases that type difference, so [`crate::spawn_task`]'s generic
+/// `slmp_driver::connector` from a `SlmpConfig`) - the closure is
+/// what erases that type difference, so `spawn_task`'s generic
 /// pieces (`ConnState`, `run_broker_task`) never need to know it.
-pub(crate) type Connector = std::sync::Arc<
+pub type Connector = std::sync::Arc<
     dyn Fn() -> BoxFuture<'static, Result<Box<dyn BrokerSession>, String>> + Send + Sync,
 >;

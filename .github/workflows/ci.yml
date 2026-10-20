@@ -9,7 +9,7 @@
 #             │    └─ rust-test         （rust-test-build の後。アーカイブを 3 台にシャーディングして実行）
 #             ├─ rust-db-source         （条件付き。PostgreSQL）
 #             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
-#             ├─ driver-api             （条件付き。公開する banto-driver-api の MSRV・features・semver）
+#             ├─ driver-api             （条件付き。公開する banto-driver-api・conformance の MSRV・features・semver）
 #             ├─ e2e-chronogazer        （条件付き）
 #             └─ e2e-hub                （条件付き）
 #   ci-gate（必ず。if: always()）: 上の全ジョブを見て、failure / cancelled、または
@@ -560,24 +560,26 @@ jobs:
           cargo clippy -p banto-safe-root --all-targets -- -D warnings
           cargo test -p banto-safe-root
 
-  # R1-1（docs/banto-driver-api-design.md §9.1）: crates.io へ公開する
-  # `banto-driver-api` の互換性を守る軽いジョブ（ubuntu）。この crate が Rust の対象に
-  # 入るとき（= この crate 自身の変更か、workspace 全体のとき。依存ゼロなので他の
-  # crate の変更では届かない）だけ走る（`run_driver_api`。判定は ci-changes.mjs の
+  # R1-1 / R1-2（docs/banto-driver-api-design.md §2.2・§9.1）: crates.io へ公開する
+  # `banto-driver-api` と `banto-driver-conformance`（API の適合テスト一式。API に
+  # path + version で依存）の互換性を守る軽いジョブ（ubuntu）。どちらかが Rust の対象に
+  # 入るとき（= どちらか自身の変更か、workspace 全体のとき。API の変更は逆依存の
+  # conformance も対象に入れる）だけ走る（`run_driver_api`。判定は ci-changes.mjs の
   # JOB_PACKAGES）。
-  # - MSRV: `Cargo.toml` の `rust-version`（1.85）で check する。リポジトリの
+  # - MSRV: `Cargo.toml` の `rust-version`（1.85、2 つとも同じ）で check する。リポジトリの
   #   rust-toolchain.toml（1.98.1）が `rustup default` より優先されるので、
   #   `RUSTUP_TOOLCHAIN` で上書きする。`rust-version` を上げるときは、この版と
   #   `dtolnay/rust-toolchain@<版>` も同じ PR で上げる（minor を上げ CHANGELOG に書く）。
-  # - `--all-features`（feature `serde`）の clippy / test: workspace の中にこの feature を
-  #   有効にする crate は無いので、rust / rust-test ジョブでは一度もコンパイルされない。
-  # - cargo-semver-checks: 基準は `banto-driver-api-v*` の最も新しいタグ
-  #   （crates/banto-driver-api/CHANGELOG.md の「タグの名前」）。最初の 0.1.0 のタグが
-  #   できるまでは飛ばす。minor を上げる PR（破壊を意図する）では
-  #   `check-release` が破壊を報告しないことを確かめる（0.x の minor は破壊を許す）。
-  # R1-2 で `-p banto-driver-conformance` を足す（MSRV の check と semver-checks）。
+  # - `--all-features`（API の feature `serde`）の clippy / test: workspace の中にこの
+  #   feature を有効にする crate は無いので、rust / rust-test ジョブでは一度もコンパイル
+  #   されない。
+  # - cargo-semver-checks: crate ごとに、基準は `<crate 名>-v*` の最も新しいタグ
+  #   （各 crate の CHANGELOG.md の「タグの名前」。`banto-driver-api-v*` /
+  #   `banto-driver-conformance-v*`）。その crate の最初のタグができるまでは飛ばす。
+  #   minor を上げる PR（破壊を意図する）では `check-release` が破壊を報告しないことを
+  #   確かめる（0.x の minor は破壊を許す）。
   driver-api:
-    name: Rust (banto-driver-api / MSRV・features・semver)
+    name: Rust (banto-driver-api・conformance / MSRV・features・semver)
     needs: changes
     if: needs.changes.outputs.run_driver_api == 'true'
     runs-on: ubuntu-latest
@@ -598,8 +600,8 @@ jobs:
           RUSTUP_TOOLCHAIN: '1.85'
         run: |
           cargo --version
-          cargo check -p banto-driver-api
-          cargo check -p banto-driver-api --all-features
+          cargo check -p banto-driver-api -p banto-driver-conformance
+          cargo check -p banto-driver-api -p banto-driver-conformance --all-features
       # ここからはリポジトリのピン（rust-toolchain.toml）で回す。
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: |
@@ -607,19 +609,25 @@ jobs:
           cargo --version
       - name: clippy + test (--all-features)
         run: |
-          cargo clippy -p banto-driver-api --all-targets --all-features -- -D warnings
-          cargo test -p banto-driver-api --all-features
+          cargo clippy -p banto-driver-api -p banto-driver-conformance --all-targets --all-features -- -D warnings
+          cargo test -p banto-driver-api -p banto-driver-conformance --all-features
       - name: cargo-semver-checks
         run: |
           set -euo pipefail
-          base=$(git tag --list 'banto-driver-api-v*' --sort=-v:refname | head -n 1)
-          if [ -z "$base" ]; then
-            echo "::notice::banto-driver-api-v* のタグがまだ無いので cargo-semver-checks を飛ばす（最初の公開まで）"
-            exit 0
-          fi
-          echo "baseline: $base"
-          cargo install cargo-semver-checks --locked
-          cargo semver-checks check-release -p banto-driver-api --baseline-rev "$base"
+          installed=false
+          for pkg in banto-driver-api banto-driver-conformance; do
+            base=$(git tag --list "${pkg}-v*" --sort=-v:refname | head -n 1)
+            if [ -z "$base" ]; then
+              echo "::notice::${pkg}-v* のタグがまだ無いので ${pkg} の cargo-semver-checks を飛ばす（最初の公開まで）"
+              continue
+            fi
+            echo "${pkg} baseline: $base"
+            if [ "$installed" = false ]; then
+              cargo install cargo-semver-checks --locked
+              installed=true
+            fi
+            cargo semver-checks check-release -p "$pkg" --baseline-rev "$base"
+          done
 
   # #468: 旧 `e2e` ジョブ（chronogazer と banto-hub を 1 ジョブで）を 2 つに
   # 分けた。hub だけの変更で chronogazer の build / Playwright を走らせない。

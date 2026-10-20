@@ -704,6 +704,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-driver-conformance"
+version = "0.1.0"
+dependencies = [
+ "banto-driver-api",
+ "tokio",
+]
+
+[[package]]
 name = "banto-exit-once"
 version = "0.1.0"
 
