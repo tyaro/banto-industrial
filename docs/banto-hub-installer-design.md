@@ -246,6 +246,6 @@ alpha.32（タグ `v0.2.0-alpha.32` = `4cb6b44`、#718）は DB の形が変わ�
 **本番の更新（2026-10-20、この開発 PC）**: 本番を alpha.31 から alpha.32 に上げた。
 
 - 1 回目は画面がすぐ消えて開けなかった。`C:\Program Files\BantoHub` には `uninstall.exe`（版 `0.2.0-alpha.2`、当日の日付）と 9/7 の古い `banto-hub.exe` しかなく、`banto-hub-shell.exe`・`banto-hub-elev.exe`・`banto-hub-sink.exe` が無かった。アンインストールの登録も無かった。シェルの exe が無いので、起動しても何も出なかった。
-- 原因は、alpha.2 の Release のページの `BantoHub_0.2.0-alpha.2_x64-setup.exe`（7 MB）を使った可能性が高い（アンインストーラの版が alpha.2 だった。全 Release が Pre-release なので、一覧で版を取り違えやすい）。alpha.32 のインストーラ（27 MB、`SHA256SUMS.txt` と一致）の不具合ではない。
+- 原因は、alpha.2 の Release のページの `BantoHub_0.2.0-alpha.2_x64-setup.exe`（7 MB）を使った可能性が高い（アンインストーラの版が alpha.2 だった。全 Release が Pre-release なので、一覧で版を取り違えやすい）。alpha.32 のインストーラ（27 MB）で実行し直した後は正常に動いたので、今回の事象は旧版の取り違えによると考えられる（SHA256 の一致は配布物との同一性を示すもので、不具合がないことの証明ではない）。
 - alpha.32 のインストーラを管理者で実行し直すと直った。画面の版は `0.2.0-alpha.32`、既存の 4 接続（calc・mem・plc_slmp・plc_q）は残り、収集も動いた（migration 0022 は本番の DB にもこのとき当たった）。
 - 教訓: 配布物は Release の版（ファイル名の版）を確かめてから使う。更新前の DB のバックアップは、この取り違えでも戻せるよう必ず取る。
