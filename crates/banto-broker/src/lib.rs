@@ -231,7 +231,7 @@ mod modbus_driver;
 mod session;
 mod slmp_driver;
 
-use session::{BrokerSession, Connector, SessionError};
+pub use session::{BrokerSession, Connector, SessionError};
 
 /// The protocol string identifying the SLMP driver ([`slmp_driver`]) in
 /// [`DRIVERS`] (see the module doc's "Protocol abstraction" section).

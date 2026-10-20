@@ -1,0 +1,28 @@
+# R1-2（docs/banto-driver-api-design.md §2.2・§7・§10）: `banto-driver-api` の trait を
+# 実装したドライバを、Hub なしで確かめる適合テスト一式。crates.io へ公開する。
+# API crate の feature にしない（Q1、決定）: tokio・模擬のピア・`assert` の補助を
+# 持つので、API を依存ゼロに保つため別 crate にした。
+#
+# API には `{ path, version }` の両方で依存する（公開時に path が落ち version だけ
+# 残る。§1.3）。この crate 単独の `cargo publish --dry-run` は API が crates.io に
+# 無い間は失敗するので、検証は必ず
+# `cargo publish --dry-run -p banto-driver-api -p banto-driver-conformance`。
+# API の minor が上がったら、この crate の版と依存の `version` も合わせて上げる（§9.1）。
+#
+# `rust-version` は API と同じ MSRV。CI の `driver-api` ジョブがこの版で check する。
+[package]
+name = "banto-driver-conformance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = true
+description = "banto-driver-api のドライバの適合テスト: ハーネス・偽ドライバ・障害を挟む TCP 中継"
+repository = "https://github.com/tyaro/banto-industrial"
+readme = false
+
+[dependencies]
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
+# §2.2 の 5 つだけ。`FaultProxy`（net・io-util・time・rt）と、テスト・例の
+# `#[tokio::test]` / `#[tokio::main]`（macros・rt）。
+tokio = { version = "1", features = ["rt", "time", "net", "io-util", "macros"] }

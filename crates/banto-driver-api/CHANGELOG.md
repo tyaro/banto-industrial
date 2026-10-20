@@ -7,7 +7,7 @@ banto-hub / ChronoGazer のドライバの境界（型と trait）の crate の�
 
 ## 0.1.0 — 未公開
 
-R1-1（docs/banto-driver-api-design.md §10）。最初の版。型だけ（trait と `DriverRegistry` は R1-2 で足す）。MSRV は Rust 1.85。必須の依存はなし（`serde` は feature で任意）。
+R1-1・R1-2（docs/banto-driver-api-design.md §10）。最初の版。R1-1 で型を、R1-2 で trait と `DriverRegistry` を入れた。MSRV は Rust 1.85。必須の依存はなし（`serde` は feature で任意）。
 
 ### `banto-plc` から移した型（`#[non_exhaustive]` なし）
 
@@ -33,3 +33,13 @@ R1-1（docs/banto-driver-api-design.md §10）。最初の版。型だけ（trai
 ### feature `serde`
 
 すべての公開する値の型に `Serialize` / `Deserialize` を付ける。列挙の綴りは snake_case（`DataType` は `"i16"` 等で `parse` / `Display` と同じ、`WordOrder` は `"high_low"` / `"low_high"`、`StringEncoding` は `"utf8"` / `"shift_jis"`）。`DriverId` は文字列、`Settings` は `{ key, value }` の配列で、読み込みでも文法と重複キーを確かめる。
+
+### trait と `DriverRegistry`（R1-2）
+
+- `driver`: `DriverBase`（`descriptor` / `validate_config` / `secret_keys`（既定は空）/ `parse_address` / `offset_address` / `address_help`）・`DriverDescriptor`（`new` は `transports = [Tcp]`・`api_version = API_VERSION`。`with_vendor` / `with_transports`）・`Capabilities`（`new` / `READ_ONLY` / `READ_WRITE`）・`Transport`（`Tcp` / `Serial` / `SerialOverTcp`）・`AddressError`（`new` / `message`）・`API_VERSION = 1`。`DriverId` は R1-1 のまま `address` にあり、ルートの再輸出も変わらない。
+- `frame`: フレーム型の `FrameDriver`（`create_connection`）と `FrameConnection`（`handshake_next` / `farewell`（既定は無し）/ `is_complete` / `plan_read` / `decode_read` / `write_next`（既定は `FatalError::Protocol` で断る））。`Step`・`FrameRule`（`None` / `Fixed` / `LengthPrefixed` / `Terminator` / `DriverDecides`）・`PrefixSpec`（`new` は `Binary`。`with_encoding`）・`PrefixEncoding`・`Planned`・`FrameCheck`（`Incomplete` / `Complete { len }` / `Discard`）・`WriteProgress`（`Send` / `Done`）。書き込みは `write_next` の状態機械（§4.2.1）。
+- `session`: セッション型の `SessionDriver`（`connect`）と `Session`（`read_batch` / `write_batch`（既定は `FatalError::Protocol` で断る）/ `disconnect`）・`ConnectContext`・`BoxFuture`（`banto_plc::BoxFuture` と同じ定義。std だけ）。
+- `registry`: `DriverRegistry`（`new` / `register` / `get` / `contains` / `ids` / `len` / `is_empty`。同じ id の登録は `RegistryError::DuplicateId`）・`DriverEntry`（`frame` / `session` / `host_bound` / `base` / `descriptor` / `kind`）・`DriverKind`（`Frame` / `Session` / `HostBound`）。**`DriverKind::HostBound` は R1 限定で、R2b-3 で消す（そのときは minor を上げる破壊）**。
+- 新しい型はすべて `#[non_exhaustive]`。struct はコンストラクタで作る。trait に既定実装つきのメソッドを足すのは破壊ではなく、既定実装の無いメソッドを足すのは破壊。
+- feature `serde`: 値の型（`DriverDescriptor`・`Capabilities`・`Transport`・`FrameRule`・`PrefixSpec`・`PrefixEncoding`・`Step`・`Planned`・`FrameCheck`・`WriteProgress`）にも `Serialize` / `Deserialize` を付けた（列挙は snake_case）。trait・`DriverRegistry`・`ConnectContext`・エラーの型には付けない。
+- MSRV 1.85 には trait の upcasting（1.86）が無いので、`DriverEntry::base` は内部で `DriverBase` を転送する包みを持つ（公開の形には出ない。MSRV を 1.86 以上にしたら外せる）。

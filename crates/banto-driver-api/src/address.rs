@@ -4,12 +4,13 @@
 //! R1 keeps `banto_plc::Address` as the request type: a closed two-protocol
 //! enum cannot be API without breaking on every new protocol
 //! (docs/banto-driver-api-design.md §3.3). [`DriverAddress`] runs *alongside*
-//! it: in R1 it is only produced by a driver's address parser (R1-2's
-//! `DriverBase::parse_address`) for the conformance tests and the R2b-2
+//! it: in R1 it is only produced by a driver's address parser
+//! ([`DriverBase::parse_address`](crate::DriverBase::parse_address)) for the conformance tests and the R2b-2
 //! migration check; the production read/write paths do not pass through it
 //! until R2b-2.
 //!
-//! [`DriverId`] is defined here (rather than with R1-2's `DriverDescriptor`)
+//! [`DriverId`] is defined here (rather than with
+//! [`DriverDescriptor`](crate::DriverDescriptor) in [`crate::driver`])
 //! because [`DriverAddress::driver`] needs it from R1-1 on.
 
 use std::fmt;
@@ -22,7 +23,7 @@ use std::fmt;
 /// grammar is a breaking change (design §9.1).
 ///
 /// `Borrow<str>` lets a `BTreeMap<DriverId, _>` be looked up with a `&str`
-/// (R1-2's registry, design §6.1); this is sound because `Ord` / `Eq` /
+/// ([`DriverRegistry`](crate::DriverRegistry), design §6.1); this is sound because `Ord` / `Eq` /
 /// `Hash` are those of the inner string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(

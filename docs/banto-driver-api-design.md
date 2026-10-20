@@ -543,7 +543,7 @@ loop {
 
 ### 4.3 R1 での使われ方
 
-**R1 では `FrameDriver` / `FrameConnection` を実装するドライバは無い**（Modbus / SLMP は §4.4）。R1-2 で trait と、適合テストのための**参照実装**（`banto-driver-conformance` の `examples/echo_driver.rs`: 固定長フレームで echo する最小のフレーム型ドライバ。plugin-design §10 P1 の「組み込みにないアドレス文法を持つテスト用プラグイン」の前身）を入れ、trait が実装可能であることとハーネスの手順を固める。
+**R1 では `FrameDriver` / `FrameConnection` を実装するドライバは無い**（Modbus / SLMP は §4.4）。R1-2 で trait と、適合テストのための**参照実装**（`banto-driver-conformance` の `fake::echo::EchoFrameDriver`: 固定長フレームで echo する最小のフレーム型ドライバ。plugin-design §10 P1 の「組み込みにないアドレス文法を持つテスト用プラグイン」の前身）を入れ、trait が実装可能であることとハーネスの手順を固める。§7.4 の偽ドライバと同じものなので、本体は crate の `fake::echo` に置き、`examples/echo_driver.rs` はそれに `frame::run_all` を掛ける実行例にした（R1-2）。設定 `framing` で `Fixed` / `LengthPrefixed` / `DriverDecides` を選べ、ハンドシェイク・ワード内ビットの RMW（`write_next`）も持つ。
 
 ### 4.4 R1 のアダプター: Modbus / SLMP をどう載せるか
 
@@ -772,7 +772,9 @@ async fn conforms() {
 }
 ```
 
-- `frame::run_all(driver: &dyn FrameDriver, fixtures: &StaticFixtures, peer: &mut dyn Responder) -> Vec<Failure>`: `Responder { fn reply(&mut self, request: &[u8]) -> Reply }`、`Reply { Bytes(Vec<u8>) | Chunks(Vec<Vec<u8>>, Duration) | Silence | Close }`。ハーネスが §4.2 の手順を実行し C1〜C12 を順に走らせ、失敗した項目を一覧で返す（`Failure { id: &'static str, detail: String }`。`Result` ではなく `Vec` で返すのは 1 回の実行で全部の失敗を見るため）。
+- `frame::run_all(driver: &dyn FrameDriver, fixtures: &FrameFixtures, peer: &mut dyn Responder) -> Vec<Failure>`: `Responder { fn on_connect(&mut self) {} fn reply(&mut self, request: &[u8]) -> Reply; fn reply_broken(&mut self, request: &[u8]) -> Option<Reply> { None } }`、`Reply { Bytes(Vec<u8>) | Chunks(Vec<Vec<u8>>, Duration) | Silence | Close }`。ハーネスが §4.2 の手順を実行し C1〜C7・C9〜C12 を順に走らせ（C8 はセッション型だけ）、失敗した項目を一覧で返す（`Failure { id: &'static str, detail: String }`。`Result` ではなく `Vec` で返すのは 1 回の実行で全部の失敗を見るため）。
+  - **R1-2 の実装で直した点**（`StaticFixtures` だけでは走らせられなかったため）: (1) fixtures は `FrameFixtures { statics: StaticFixtures, reads: Vec<ReadCase { text, kind, expected: RawValue }>, refused, unsupported, writes: Vec<WriteCase { text, kind, value }>, noise, max_string_words, response_timeout }`。C3 の「同じアドレス・別の型」とその他の値の照合には期待値が、C4 には機器が断る入力と型の合わない入力が、C10 には離れた書き込みが、C9 の `Discard` には先頭のごみが要る。(2) `create_connection` に渡す設定が要るので、`StaticFixtures` に `settings`（最小の正しい設定。C2 もこれを使う）を足した。`offsets` の期待は `Option<String>`（`None` = 失敗すべき）。(3) `Responder` に既定つきの `on_connect`（接続ごとの状態を捨てる。C7 の「持ち越さない」をピアが確かめる）と `reply_broken`（C4 の壊れたフレーム。ハーネスはプロトコルを知らないので、ピアが作る）を足した。(4) 障害（分割・遅延・伸び続ける応答・先頭のごみ・途中の切断）はハーネスが仮想の時刻で起こす（実時間を使わないので決定的）。
+  - `static_checks` は `&dyn DriverBase` ではなく `<D: DriverBase + ?Sized>(driver: &D, ..)`。MSRV 1.85 には trait の upcasting（1.86）が無く、`&dyn FrameDriver` を `&dyn DriverBase` に変えられないため（`&dyn DriverBase` もそのまま渡せる）。同じ理由で `DriverEntry` は内部に `DriverBase` を転送する包みを持つ（公開の形は §6.1 のまま）。
 - `session::run_all(driver: &dyn SessionDriver, settings: &Settings, fixtures: &SessionFixtures, peer: &mut dyn Responder) -> Vec<Failure>`: ハーネスが `tokio::net::TcpListener` を 127.0.0.1 の空きポートに立て、`Responder` に委ねる。Hub のコードは一切要らない。
 - `session::run_all_against(driver, settings, fixtures, peer: SocketAddr, faults: FaultProxy) -> Vec<Failure>`: **ピアが既に TCP サーバーとして立っている**とき（`banto-plc` の Modbus シミュレータ・SLMP シミュレータは `Responder` ではなく TCP サーバー）に使う。`FaultProxy` は 127.0.0.1 の空きポートで listen してピアへ中継し、遅延・分割・切断・応答の差し替え（先頭 n バイトを書き換える）・accept の計数を挟む。
 - `banto_driver_conformance::static_checks(driver: &dyn DriverBase, fixtures: &StaticFixtures) -> Vec<Failure>`（C1・C2 だけ。tokio 不要）。
