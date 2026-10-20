@@ -1,5 +1,5 @@
-//! The SLMP [`crate::session::BrokerSession`] implementation - the only
-//! driver [`crate::DRIVERS`] registers today. See `lib.rs`'s module doc
+//! The SLMP [`crate::session::BrokerSession`] implementation - the first
+//! driver [`crate::DriverTable::builtin`] registers. See `lib.rs`'s module doc
 //! ("Protocol abstraction (I9 / Issue #130)") for why this crate is
 //! organized as a generic job loop/reconnect state machine plus a
 //! per-protocol driver module like this one, and `session.rs`'s module doc
@@ -66,8 +66,9 @@ impl BrokerSession for SlmpSession {
 }
 
 /// Build this connection's [`Connector`] from its [`SlmpConfig`] (see
-/// [`crate::slmp_config_for`]) - the SLMP entry [`crate::DRIVERS`] dispatches
-/// to via [`crate::spawn_task`].
+/// [`crate::slmp_config_for`]) - what the SLMP entry of
+/// [`crate::DriverTable::builtin`] ([`crate::dial_slmp`]) dials, and
+/// [`crate::spawn_task_with_connector`] then runs.
 ///
 /// Dials through [`banto_plc::dial_slmp`], the one shared implementation of
 /// the connect sequence (build a bare `slmp::SLMPClient` from

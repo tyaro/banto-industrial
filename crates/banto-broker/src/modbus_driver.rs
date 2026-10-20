@@ -1,5 +1,5 @@
 //! The Modbus TCP [`crate::session::BrokerSession`] implementation - the
-//! second driver [`crate::DRIVERS`] registers (#131, 2026-09-01). See
+//! second driver [`crate::DriverTable::builtin`] registers (#131, 2026-09-01). See
 //! `lib.rs`'s module doc ("Protocol abstraction (I9 / Issue #130)") for why
 //! this crate is organized as a generic job loop/reconnect state machine plus
 //! a per-protocol driver module like this one, and `session.rs`'s module doc
@@ -190,8 +190,9 @@ impl BrokerSession for ModbusSession {
 }
 
 /// Build this connection's [`Connector`] from its [`ModbusTcpConfig`] (see
-/// [`crate::modbus_config_for`]) - the `"modbus-tcp"` entry [`crate::DRIVERS`]
-/// dispatches to via [`crate::spawn_task_with_connector`].
+/// [`crate::modbus_config_for`]) - what the `"modbus-tcp"` entry of
+/// [`crate::DriverTable::builtin`] ([`crate::dial_modbus`]) dials, and
+/// [`crate::spawn_task_with_connector`] then runs.
 ///
 /// Dials through [`banto_plc::dial_modbus`], the one shared implementation of
 /// the Modbus TCP connect sequence (H9 transport 共通化,

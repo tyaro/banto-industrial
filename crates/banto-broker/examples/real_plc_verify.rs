@@ -38,7 +38,7 @@
 
 use std::time::Duration;
 
-use banto_broker::{BackoffConfig, BrokerError, BrokerSupervisor};
+use banto_broker::{BackoffConfig, BrokerError, BrokerSupervisor, DriverTable};
 use banto_plc::{
     Address, BatchReadRequest, BatchReadResult, DataType, PlcClient, PlcValue, ReadRequest,
     ReadResult, SlmpClient, SlmpConfig, SlmpCpu, StringReadRequest, TagValue,
@@ -876,8 +876,12 @@ async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
         password: None,
     };
 
-    let supervisor = BrokerSupervisor::spawn(&[connection], BackoffConfig::default())
-        .map_err(|e| format!("broker spawn 失敗: {e}"))?;
+    let supervisor = BrokerSupervisor::spawn(
+        &[connection],
+        BackoffConfig::default(),
+        DriverTable::builtin(),
+    )
+    .map_err(|e| format!("broker spawn 失敗: {e}"))?;
     let handle = supervisor
         .handle(1)
         .ok_or_else(|| "broker handle が見つかりません".to_string())?;

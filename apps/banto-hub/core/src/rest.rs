@@ -93,7 +93,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use banto_broker::{is_supported_protocol, BrokerConnectionStatus, BrokerError};
+use banto_broker::{BrokerConnectionStatus, BrokerError};
 use banto_collect::{
     build_config_from, connections_with_collected_groups, ApplyReport, ConnectionStatus, Quality,
     RegistrySnapshot,
