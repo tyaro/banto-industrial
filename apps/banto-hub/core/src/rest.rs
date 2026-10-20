@@ -11969,6 +11969,129 @@ mod tests {
         );
     }
 
+    /// axum 0.8 の `Router` はルート一覧を返す公開 API を持たないので、`Debug`
+    /// 出力（`path_router.routes` の `RouteId(n): MethodRouter { get: Route, .. }`
+    /// と `node` の `RouteId(n): "/path"`）から「METHOD path」を復元する。
+    /// `fallback_router` 以降は読まない。形式が変わって 1 本も取れなければ
+    /// 呼び出し側の assert が落ちる（axum を上げたときはここを見直す）。
+    fn route_list_from_debug(router: &Router) -> Vec<String> {
+        const METHODS: [&str; 9] = [
+            "get", "head", "delete", "options", "patch", "post", "put", "trace", "connect",
+        ];
+        let dump = format!("{router:#?}");
+        let dump = dump.split("fallback_router:").next().unwrap();
+        let (routes_part, node_part) = dump
+            .split_once("        node: Node {")
+            .expect("Router Debug に node が無い");
+        let id_of = |lines: &mut std::iter::Peekable<std::str::Lines>| -> Option<u32> {
+            // `RouteId(` の次の行が `N,`
+            let n = lines.next()?.trim().trim_end_matches(',').to_string();
+            n.parse().ok()
+        };
+        // id -> メソッド一覧
+        let mut methods: std::collections::BTreeMap<u32, Vec<&str>> = Default::default();
+        let mut lines = routes_part.lines().peekable();
+        let mut current: Option<u32> = None;
+        while let Some(line) = lines.next() {
+            let t = line.trim();
+            if t == "RouteId(" {
+                current = id_of(&mut lines);
+                if let Some(id) = current {
+                    methods.entry(id).or_default();
+                }
+                continue;
+            }
+            if let Some(id) = current {
+                for m in METHODS {
+                    if let Some(rest) = t.strip_prefix(&format!("{m}: ")) {
+                        if rest != "None," {
+                            methods.get_mut(&id).unwrap().push(m);
+                        }
+                    }
+                }
+            }
+        }
+        // id -> パス
+        let mut paths: std::collections::BTreeMap<u32, String> = Default::default();
+        let mut lines = node_part.lines().peekable();
+        let mut pending: Option<u32> = None;
+        while let Some(line) = lines.next() {
+            let t = line.trim();
+            if t == "RouteId(" {
+                pending = id_of(&mut lines);
+                continue;
+            }
+            if let (Some(id), Some(rest)) = (pending, t.strip_prefix("): \"")) {
+                if let Some(path) = rest.strip_suffix("\",") {
+                    paths.insert(id, path.to_string());
+                    pending = None;
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (id, ms) in &methods {
+            let path = paths
+                .get(id)
+                .unwrap_or_else(|| panic!("RouteId({id}) のパスが node に無い"));
+            for m in ms {
+                out.push(format!("{} {path}", m.to_uppercase()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// `api_router`（本番の `api_router_with_controller` と同じ
+    /// `api_router_with_controller_mode` の合成）と `opcua_settings_router` が登録する「METHOD path」の
+    /// 全一覧を、コミット済みスナップショット（`tests/snapshots/routes.txt`、
+    /// ソート済み・1 行 1 ルート）と完全一致で比較する。rest.rs を子モジュールへ
+    /// 分割する間に、ルートが増減・変更していないことを検知するためのテスト
+    /// （docs/banto-hub-driver-refactor-plan.md §8.1）。`HEAD` は axum が `GET`
+    /// から暗黙に扱うので一覧には出ない。再生成は
+    /// `UPDATE_ROUTES_SNAPSHOT=1 cargo test -p banto-hub-core routes_snapshot`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routes_snapshot_matches() {
+        let env = test_env().await;
+        let mut routes = route_list_from_debug(&env.router);
+        // `/api/opcua-*` は `HubRuntime`（runtime.rs）が `api_router_with_controller`
+        // とは別に組んで merge するので、同じ手順で別に取って足す。
+        let users = UsersService::new(Db::Sqlite(env.pool.clone()));
+        let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
+        let (tx, _rx) = tokio_broadcast::channel(16);
+        let opcua_router = opcua_settings_router(
+            env.manager.clone(),
+            crate::opcua::OpcUaPublisher::new(env.manager.clone()),
+            audit.clone(),
+            user_auth_state(users, audit),
+            tx,
+        );
+        routes.extend(route_list_from_debug(&opcua_router));
+        routes.sort();
+        assert!(
+            routes.len() > 50 && routes.contains(&"GET /api/status".to_string()),
+            "ルート一覧の復元に失敗（axum の Debug 形式が変わった可能性）: {} 本",
+            routes.len()
+        );
+        let mut actual = routes.join("\n");
+        actual.push('\n');
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("snapshots")
+            .join("routes.txt");
+        if matches!(std::env::var("UPDATE_ROUTES_SNAPSHOT").as_deref(), Ok("1")) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, actual).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .expect("snapshot missing; run with UPDATE_ROUTES_SNAPSHOT=1")
+            .replace("\r\n", "\n");
+        assert!(
+            actual == expected,
+            "route list differs from tests/snapshots/routes.txt; review the diff and regenerate with UPDATE_ROUTES_SNAPSHOT=1\n--- actual ---\n{actual}"
+        );
+    }
+
     /// `GET /api/v1/swagger-ui/`（末尾スラッシュあり）は認証不要で 200 の
     /// Swagger UI HTML を返し、それが読み込む `swagger-initializer.js`
     /// （同じく認証不要）が `/api/v1/openapi.json` を指すよう設定されている
