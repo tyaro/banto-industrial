@@ -8,6 +8,12 @@ publish.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+# R1-1 (docs/banto-driver-api-design.md §3.1): `DataType`・`TagValue`・`PlcValue`
+# (= `banto_driver_api::Value`)・`StringEncoding`・`WordOrder` are defined in the
+# published driver API crate and re-exported from `types.rs` / `decode.rs` under
+# their old names, so every caller of `banto_plc::*` is unchanged. `path` and
+# `version` both, the form a published crate's path dependency takes.
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
 # T19 S1-b0: `AddressArea`'s definition (including `is_writable()`) now lives
 # in this dependency-free sibling crate, shared with `banto-tags`/
 # `banto-plc-write` - see its module doc. `src/address.rs` re-exports it so

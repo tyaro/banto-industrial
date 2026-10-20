@@ -40,11 +40,15 @@
 # #623 PR-1a: crates/banto-safe-root (banto-secret-store の `acl`・`guard` を移した。
 # 利用者が触れうるフォルダの木を LocalSystem が辿らずに扱う、製品に依らない部品。
 # 本番の依存は windows-sys・thiserror だけ).
+# R1-1: crates/banto-driver-api (ドライバの境界の型だけを持つ、crates.io へ公開する
+# crate。独自の版 0.1.0 と `publish = true`。banto-plc が共通の型をここから再輸出する.
+# docs/banto-driver-api-design.md §2.1).
 [workspace]
 resolver = "2"
 members = [
     "crates/banto-tags",
     "crates/banto-plc-address",
+    "crates/banto-driver-api",
     "crates/banto-plc",
     "crates/banto-plc-write",
     "crates/banto-tstore",

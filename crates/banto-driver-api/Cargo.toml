@@ -1,0 +1,34 @@
+# R1-1（docs/banto-driver-api-design.md §2.1・§10）: banto-hub / ChronoGazer の
+# ドライバの境界にある型だけを持つ、crates.io へ公開する crate。ワークスペースの
+# 版（`version.workspace`）とは切り離し、0.x の minor を破壊の単位にする
+# （§9.1。alpha は使わない）。必須の依存はゼロ - tokio・thiserror・banto-* に
+# 依存しない（`Display` は手で書く）。`serde` は feature で任意。
+#
+# `rust-version` は §9.1 の MSRV。CI の `driver-api` ジョブが
+# `dtolnay/rust-toolchain@1.85` + `RUSTUP_TOOLCHAIN` でこの版の check を回す。
+# 上げるときは minor を上げ、CHANGELOG.md に書く。
+[package]
+name = "banto-driver-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = true
+description = "banto-hub / ChronoGazer のドライバの境界: 型と trait だけ"
+repository = "https://github.com/tyaro/banto-industrial"
+readme = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+# 公開する型すべてに Serialize / Deserialize を付ける。列挙の綴りは snake_case
+# （`DataType` は `"i16"` 等で `DataType::parse` / `Display` と同じ、`WordOrder` は
+# `settings::keys::WORD_ORDER` の値 `"high_low"` / `"low_high"` と同じ）。
+# 不変条件を持つ型（`DriverId` の文法、`Settings` の重複キーなし）は、読み込みでも
+# 同じ検査を通す（`try_from`）。
+serde = ["dep:serde"]
+
+[dev-dependencies]
+# `serde` feature の往復テストだけが使う（`cargo test -p banto-driver-api --all-features`）。
+serde_json = "1"
