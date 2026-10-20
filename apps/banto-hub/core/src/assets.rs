@@ -11,7 +11,8 @@
 //!
 //! 実フロントエンドが用意できたら: `pnpm --filter banto-hub build`
 //! （`apps/banto-hub/build` を生成）→
-//! `cargo build -p banto-hub-core --features embed-ui`。
+//! `cargo build -p banto-hub-host --bin banto-hub --features embed-ui`（bin は R1-7a で
+//! `banto-hub-host` へ移った。その `embed-ui` はこの crate の `embed-ui` へ転送する）。
 
 #[cfg(feature = "embed-ui")]
 use banto_server::guess_mime;

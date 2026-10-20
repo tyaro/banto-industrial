@@ -65,8 +65,8 @@ try {
 
     # --- (c)(d)(e) 4バイナリのリリースビルド（順序は installer/src/main.rs
     # の使い方コメントと同じ） ---
-    Invoke-Native 'cargo build --release -p banto-hub-core --bin banto-hub --bin banto-hub-elev --features embed-ui' {
-        cargo build --release -p banto-hub-core --bin banto-hub --bin banto-hub-elev --features embed-ui
+    Invoke-Native 'cargo build --release -p banto-hub-host --bin banto-hub --bin banto-hub-elev --features embed-ui' {
+        cargo build --release -p banto-hub-host --bin banto-hub --bin banto-hub-elev --features embed-ui
     }
     Invoke-Native 'cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui' {
         cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui

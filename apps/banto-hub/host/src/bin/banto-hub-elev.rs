@@ -1,7 +1,7 @@
 //! T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格
 //! ヘルパー `banto-hub-elev.exe`。
 //!
-//! `apps/banto-hub/core/banto-hub-elev.manifest`（`build.rs`が
+//! `apps/banto-hub/host/banto-hub-elev.manifest`（`build.rs`が
 //! `embed_resource::compile_for`でこのバイナリにだけリンクする。
 //! `Cargo.toml`の`[[bin]]`セクション参照）で
 //! `requestedExecutionLevel level="requireAdministrator"`を埋め込んでいる

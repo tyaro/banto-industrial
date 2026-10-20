@@ -16,7 +16,7 @@
 リポジトリルートから実行する:
 
 ```sh
-cargo build --locked -p banto-hub-core --bin banto-hub
+cargo build --locked -p banto-hub-host --bin banto-hub
 python3.12 -m venv /tmp/banto-hub-opcua-interop-venv
 /tmp/banto-hub-opcua-interop-venv/bin/python -m pip install -r interop/opcua/requirements.txt
 /tmp/banto-hub-opcua-interop-venv/bin/python interop/opcua/smoke.py target/debug/banto-hub

@@ -45,6 +45,15 @@
 //!
 //! 実行手順は docs/banto-hub-operations.md 参照。
 //!
+//! ## package（R1-7a）
+//!
+//! このファイルと `banto-hub-elev.rs`・`banto_hub/` は、R1-7a
+//! （docs/banto-driver-api-design.md §2.4）で `banto-hub-core` の `src/bin/` から
+//! この package（`banto-hub-host`、`apps/banto-hub/host`）へ移した。組み込みドライバ
+//! （`banto-drivers`）を normal で持つのはこの package で、`banto-hub-core` のライブラリは
+//! [`HubDrivers`] を注入で受け取るだけ（§6.4）。ビルドは
+//! `cargo build -p banto-hub-host --bin banto-hub [--features embed-ui]`。
+//!
 //! ## クロスプラットフォームビルドについて
 //!
 //! banto-hub 自体は Windows 専用前提（設計 §8、tstore と同じ）だが、この
@@ -76,6 +85,12 @@
 #[cfg(windows)]
 #[path = "banto_hub/win_service.rs"]
 mod win_service;
+
+// R1-7a: `banto-hub-elev` のマニフェストの埋め込みを確かめるテスト（置き場所の理由は
+// そのファイルのモジュール doc）。
+#[cfg(test)]
+#[path = "../manifest_tests.rs"]
+mod manifest_tests;
 
 use banto_hub_core::broker_glue::HubDrivers;
 use banto_hub_core::profile_lock::HubHostKind;

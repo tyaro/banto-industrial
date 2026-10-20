@@ -140,9 +140,11 @@ export const RULES = [
  * - hub: banto-hub-sink は banto-hub-core を dev-dependency に持つ。
  *   crates/banto-tagclient のテスト（src/close.rs）は
  *   apps/banto-hub/core/src/stream.rs を include_str! で読む。
+ *   banto-hub-host は bin `banto-hub`・`banto-hub-elev` の package（R1-7a、
+ *   docs/banto-driver-api-design.md §2.4）。
  */
 export const RUST_PACKAGES = {
-	hub: ['banto-hub-core', 'banto-hub-shell', 'banto-hub-sink', 'banto-tagclient'],
+	hub: ['banto-hub-core', 'banto-hub-host', 'banto-hub-shell', 'banto-hub-sink', 'banto-tagclient'],
 	chronogazer: ['chronogazer-core', 'chronogazer', 'chronogazer-elev'],
 	hub_sink: ['banto-hub-sink']
 };
@@ -151,10 +153,12 @@ export const RUST_PACKAGES = {
  * Rust の対象（`-p` に並ぶパッケージ）にこれらのどれかが入ったら走らせるジョブ。
  * 各ジョブが build / test するパッケージ（ci.yml の各ジョブの cargo の `-p`）。
  * - rust-db-source: `-p banto-hub-core`（db_source）と `-p banto-hub-sink`
- * - linux-clippy: `-p chronogazer-elev -p banto-hub-core --lib`、加えて
+ * - linux-clippy: `-p chronogazer-elev -p banto-hub-core --lib`、`-p banto-hub-host
+ *   --all-targets`（R1-7a で bin が移った先）、加えて
  *   `-p banto-instance-lock` の clippy・test（その段は Rust の対象にこの crate が
  *   入るときだけ。ci.yml の段の `if:`）と、同じく `-p banto-safe-root`
- * - e2e-hub: `-p banto-hub-core --bin banto-hub`
+ * - e2e-hub: `-p banto-hub-host --bin banto-hub`（R1-7a。core の変更は host が
+ *   core に依存するので逆依存で拾う）
  * - e2e-chronogazer: `-p chronogazer-core`（banto-serve・dev_plc・chronogazer-server）
  * - driver-api: `-p banto-driver-api -p banto-driver-conformance`（MSRV の check・
  *   `--all-features` の clippy / test・cargo-semver-checks。R1-1・R1-2、
@@ -166,10 +170,11 @@ export const JOB_PACKAGES = {
 	run_linux_clippy: [
 		'chronogazer-elev',
 		'banto-hub-core',
+		'banto-hub-host',
 		'banto-instance-lock',
 		'banto-safe-root'
 	],
-	run_e2e_hub: ['banto-hub-core'],
+	run_e2e_hub: ['banto-hub-host'],
 	run_e2e_chronogazer: ['chronogazer-core']
 };
 

@@ -8,7 +8,8 @@
 //! [`crate::service_elevated`] 参照）は `service-install`/`service-uninstall`
 //! アクションで同じ SCM 登録・登録解除ロジックを実行する必要がある。
 //! `banto-hub-elev.exe` は `banto-hub.exe` とは別のバイナリターゲット
-//! （どちらも `apps/banto-hub/core` パッケージの `[[bin]]`）であり、
+//! （どちらも当時は `apps/banto-hub/core` パッケージの `[[bin]]`。R1-7a で
+//! `apps/banto-hub/host`（`banto-hub-host`）へ移した）であり、
 //! `src/bin/banto_hub/win_service.rs` は `banto-hub.exe` 側の crate root
 //! （`src/bin/banto-hub.rs`）だけが `mod win_service;` する非公開モジュール
 //! なので、そのままでは `banto-hub-elev.exe` から呼べない。この lib crate

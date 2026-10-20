@@ -7,12 +7,12 @@
  * `e2e/playwright.config.ts`（ChronoGazer 用）を踏襲した「LAN/REST-mode の
  * 実サーバーに対する smoke/DOM テスト」で、モックした frontend ではない。
  * banto-hub は Tauri を使わない headless axum サーバー専用アプリ
- * （設計 §3.1）なので、`webServer` は `apps/banto-hub/core`（crate 名
- * `banto-hub-core`）の `banto-hub` バイナリをそのまま起動する
+ * （設計 §3.1）なので、`webServer` は `apps/banto-hub/host`（package 名
+ * `banto-hub-host`）の `banto-hub` バイナリをそのまま起動する
  * （`cargo run` ではなく既にビルド済みのバイナリ — 起動をほぼ瞬時にし、
  * テスト実行中の不意な再コンパイルを避ける、chronogazer 側と同じ理由）。
  * `pnpm --filter banto-hub build` と
- * `cargo build -p banto-hub-core --bin banto-hub --features embed-ui` は
+ * `cargo build -p banto-hub-host --bin banto-hub --features embed-ui` は
  * このファイルの外（README/CI ワークフロー）で先に実行しておくこと。
  *
  * chronogazer の `playwright.config.ts`/`smoke.spec.ts` とはポート・
@@ -185,7 +185,7 @@ export default defineConfig({
 				PORT: String(PORT),
 				BANTO_BIND: '127.0.0.1',
 				BANTO_DB: dbPath,
-				// apps/banto-hub/core/src/bin/banto-hub.rs: POST /api/auth/setup は
+				// apps/banto-hub/host/src/bin/banto-hub.rs: POST /api/auth/setup は
 				// 明示的に opt-in しないと 403 になる - 初回セットアップ画面の
 				// シナリオに必要。
 				BANTO_ALLOW_SETUP: '1'

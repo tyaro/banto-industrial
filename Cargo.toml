@@ -82,6 +82,7 @@ members = [
     "apps/chronogazer/elev",
     "apps/chronogazer/src-tauri",
     "apps/banto-hub/core",
+    "apps/banto-hub/host",
     "apps/banto-hub/src-tauri",
     "apps/banto-hub-sink",
 ]

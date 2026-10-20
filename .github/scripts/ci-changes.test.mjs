@@ -43,7 +43,7 @@ const G = {
 			dir: 'crates/banto-driver-conformance',
 			deps: ['banto-driver-api']
 		},
-		// R1-3b: ホストが注入する組み込みドライバ一式。bin（core パッケージ内）・shell・
+		// R1-3b: ホストが注入する組み込みドライバ一式。bin（R1-7a から banto-hub-host）・shell・
 		// sink のテストが使う（G には写していない broker / collect にも依存する）。
 		// R1-4a: broker の表の 2 行を、下の 2 つのドライバ crate の `dial` で組む。
 		{
@@ -115,6 +115,8 @@ const G = {
 		{
 			name: 'banto-hub-core',
 			dir: 'apps/banto-hub/core',
+			// R1-7a: banto-drivers は dev-dependency だけ（bin が banto-hub-host へ移った。
+			// src 内の単体テストと tests/ が実ドライバを使う。R2b-0 で外す）。
 			deps: [
 				'banto-driver-api',
 				'banto-drivers',
@@ -124,6 +126,12 @@ const G = {
 				'banto-service-elev',
 				'banto-tags'
 			]
+		},
+		// R1-7a: bin `banto-hub`・`banto-hub-elev` の package。banto-drivers を normal で持つ。
+		{
+			name: 'banto-hub-host',
+			dir: 'apps/banto-hub/host',
+			deps: ['banto-drivers', 'banto-hub-core', 'banto-safe-root']
 		},
 		{
 			name: 'banto-hub-shell',
@@ -185,7 +193,8 @@ const NONE = {
 	run_e2e_chronogazer: false
 };
 
-const HUB_RUST = '-p banto-hub-core -p banto-hub-shell -p banto-hub-sink -p banto-tagclient';
+const HUB_RUST =
+	'-p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-tagclient';
 const CHRONO_RUST = '-p chronogazer -p chronogazer-core -p chronogazer-elev';
 
 /** [名前, 変更ファイル, 期待するジョブ] */
@@ -238,6 +247,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-hub-core',
+				'-p banto-hub-host',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink',
 				'-p banto-tags',
@@ -259,6 +269,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-hub-core',
+				'-p banto-hub-host',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink',
 				'-p banto-instance-lock',
@@ -291,6 +302,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-hub-core',
+				'-p banto-hub-host',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink',
 				'-p banto-safe-root',
@@ -313,6 +325,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-hub-core',
+				'-p banto-hub-host',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink',
 				'-p banto-safe-root',
@@ -355,7 +368,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink -p banto-plc',
+				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -372,7 +385,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink',
+				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -380,12 +393,13 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-drivers（R1-3b の内部 crate）は hub の 3 パッケージが使う。公開 crate ではないので driver-api ジョブは走らない',
+		'banto-drivers（R1-3b の内部 crate）は hub の 4 パッケージが使う（R1-7a から host は normal、core・sink は dev）。公開 crate ではないので driver-api ジョブは走らない',
 		['crates/banto-drivers/src/lib.rs'],
 		{
 			...NONE,
 			run_rust: true,
-			rust_args: '-p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink',
+			rust_args:
+				'-p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
@@ -421,6 +435,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-hub-core',
+				'-p banto-hub-host',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink',
 				'-p banto-secret-store',
@@ -540,6 +555,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args: [
 				'-p banto-hub-core',
+				'-p banto-hub-host',
 				'-p banto-hub-shell',
 				'-p banto-hub-sink',
 				'-p banto-tagclient',

@@ -13,23 +13,23 @@ FA-Server 型の独立タグサーバー。産業用 PLC（Modbus TCP / MELSEC S
 
 ## 起動方法
 
-唯一の起動経路は `banto-hub` バイナリ（クレート `banto-hub-core`、
-`core/src/bin/banto-hub.rs`）。
+唯一の起動経路は `banto-hub` バイナリ（パッケージ `banto-hub-host`、
+`host/src/bin/banto-hub.rs`。本体のライブラリは `banto-hub-core`）。
 
 ```sh
 # 管理UIの静的ビルドを埋め込まずに起動（REST/WS/MQTT/gRPC の動作確認用。
 # 管理UI自体はプレースホルダページになる）
-cargo run -p banto-hub-core --bin banto-hub
+cargo run -p banto-hub-host --bin banto-hub
 
 # 管理UIも含めて動かす場合は、先にフロントエンドをビルドしてから
 # embed-ui feature を付けて起動する
 pnpm --filter banto-hub build
-cargo run -p banto-hub-core --bin banto-hub --features embed-ui
+cargo run -p banto-hub-host --bin banto-hub --features embed-ui
 ```
 
 引数なしはコンソールモード（Ctrl-C で停止）。Windows では
 `banto-hub.exe install` / `uninstall` / `run-service` でサービス化もできる
-（`core/src/bin/banto_hub/win_service.rs`。手順は
+（`host/src/bin/banto_hub/win_service.rs`。手順は
 [../../docs/banto-hub-operations.md](../../docs/banto-hub-operations.md) の
 「Windows サービス化」節を参照）。
 
@@ -76,7 +76,7 @@ Python `asyncua==1.1.8` の独立クライアントで、実 Hub の OPC UA endp
 次のコマンドはリポジトリルートから実行する。
 
 ```sh
-cargo build --locked -p banto-hub-core --bin banto-hub
+cargo build --locked -p banto-hub-host --bin banto-hub
 python3.12 -m venv /tmp/banto-hub-opcua-interop-venv
 /tmp/banto-hub-opcua-interop-venv/bin/python -m pip install -r interop/opcua/requirements.txt
 /tmp/banto-hub-opcua-interop-venv/bin/python interop/opcua/smoke.py target/debug/banto-hub

@@ -85,7 +85,7 @@ REST / WebSocket / MQTT / gRPC の4経路で外部へ公開する「タグサー
 ## 1. 起動・環境変数
 
 banto-hub の唯一の起動経路は `banto-hub.exe`（ビルド元:
-`apps/banto-hub/core/src/bin/banto-hub.rs`）です。Tauri シェルはなく、
+`apps/banto-hub/host/src/bin/banto-hub.rs`）です。Tauri シェルはなく、
 このバイナリを直接実行するだけでサーバー・管理 UI・収集エンジンすべてが
 起動します。
 
@@ -1722,8 +1722,8 @@ T5-2 で始まり、I1（docs/banto-hub-installer-design.md、2026-09-07）で
 # 1. フロントエンド（UI）
 pnpm --filter banto-hub build
 
-# 2. Hub 本体・elev（同じ banto-hub-core クレートの2バイナリ）
-cargo build --release -p banto-hub-core --bin banto-hub --bin banto-hub-elev --features embed-ui
+# 2. Hub 本体・elev（同じ banto-hub-host パッケージの2バイナリ）
+cargo build --release -p banto-hub-host --bin banto-hub --bin banto-hub-elev --features embed-ui
 
 # 3. デスクトップシェル
 cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui

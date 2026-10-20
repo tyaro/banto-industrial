@@ -14,7 +14,9 @@ default = []
 # without requiring `pnpm --filter banto-hub build` to have run first. T0
 # ships no admin-UI frontend yet (docs/tag-server-design.md T0 scope) - this
 # feature flag/`assets.rs` module is only the placeholder wiring for when one
-# lands.
+# lands. R1-7a: the `banto-hub` binary lives in `banto-hub-host`, whose own
+# `embed-ui` feature forwards here (`cargo build -p banto-hub-host --bin
+# banto-hub --features embed-ui`).
 embed-ui = ["dep:rust-embed"]
 
 [dependencies]
@@ -72,11 +74,6 @@ banto-collect = { path = "../../../crates/banto-collect" }
 banto-broker = { path = "../../../crates/banto-broker" }
 # R1-3b: `HubDrivers`（`broker_glue.rs`）が `DriverRegistry` を持つ。
 banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.1.0" }
-# R1-3b: bin banto-hub が core パッケージ内にあるため一時的に normal。R1-7a で
-# banto-hub-host へ移し core は dev のみに戻す（2026-10-20 オーナー決定）。
-# `banto_drivers` を参照してよいのは bin（`src/bin/`）とテストだけ。core のライブラリ
-# 本体は `HubDrivers` を注入で受け取るだけにする（docs/banto-driver-api-design.md §6.4）。
-banto-drivers = { path = "../../../crates/banto-drivers" }
 # I5 (T2-4, docs/tag-server-design.md §6): the write primitive - rest.rs's
 # POST /api/v1/values/{tag} builds a banto_plc_write::BatchWriteRequest and
 # submits it through banto_broker::BrokerHandle::write (which itself depends
@@ -143,13 +140,8 @@ tonic-prost-build = { workspace = true }
 # システム protoc に依存しない自己完結ビルドのため（workspace Cargo.toml の
 # コメント参照）。
 protoc-bin-vendored = { workspace = true }
-# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: build.rs が
-# `banto-hub-elev.exe`にだけ`requireAdministrator`マニフェストを埋め込む
-# （`compile_for`は指定した`[[bin]]`名にのみ`cargo:rustc-link-arg-bin`を
-# 発行するため、`banto-hub`本体やテストバイナリには影響しない）。
-# Cargo.lock には既に`embed-resource 3.0.11`が（Tauri の`tauri-build`経由で）
-# 存在しており、新規バージョン系列は増えない。
-embed-resource = "3.0"
+# `banto-hub-elev.exe` の `requireAdministrator` マニフェストの埋め込み
+# （`embed-resource`）は R1-7a で bin と一緒に `banto-hub-host` へ移した。
 
 [dev-dependencies]
 async-opcua = { git = "https://github.com/tyaro/async-opcua", rev = "60c4f9d72218d78177e59c70a03db7fddcf9d857", default-features = false, features = ["client"] }
@@ -187,11 +179,17 @@ banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
 # (write through the broker, then read the value back through the same
 # session - see that test's module doc).
 banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simulator"] }
+# R1-3b / R1-7a: `src/test_support.rs::test_drivers` と `tests/common/mod.rs` が
+# `banto_drivers::builtin()` で実ドライバを組み立てる（テストだけ）。core のライブラリ
+# 本体は `HubDrivers` を注入で受け取るだけで、具体的なドライバを知らない
+# （docs/banto-driver-api-design.md §6.4）。bin が組み立てる normal の依存は
+# `banto-hub-host` 側にある。R2b-0 で core の dev-dependency からも外す（§2.4）。
+banto-drivers = { path = "../../../crates/banto-drivers" }
 # T3（docs/tag-server-design.md §5.3）: tests/mqtt.rs が in-process ブローカー
 # として起動する組み込み MQTT ブローカー。rumqttc と同じ bytebeamio/rumqtt
 # リポジトリ・同時期リリースの系列（0.25.x クライアント / 0.20.x ブローカー）
 # を選び、Cargo.lock に無関係な世代を増やさない。`banto-hub-core` のテストの
-# みが使う - 本番の `bin/banto-hub.rs` は外部ブローカーへ接続するクライアント
+# みが使う - 本番の bin `banto-hub`（`banto-hub-host`）は外部ブローカーへ接続するクライアント
 # モードのみ（組み込みブローカーは §10-4 の判断待ち、実装しない）。
 rumqttd = { version = "0.20", default-features = false }
 
@@ -213,23 +211,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
-
-[[bin]]
-name = "banto-hub"
-path = "src/bin/banto-hub.rs"
-
-# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格ヘルパー
-# - `setup-operators`/`grant-service-acl`/`grant-profile-acl`/
-# `service-install`/`service-uninstall`/`autostart-enable`/
-# `autostart-disable`の7アクションのみを受け付ける薄い CLI（本体は
-# `src/service_elevated.rs`、`crate::service_elevated`参照）。
-# `grant-profile-acl`は profile ACL 追加スライス（docs/banto-hub-desktop-plan.md
-# §11、#626 で`src/profile_grant.rs`に作り直した）で追加した。`banto-hub-elev.manifest`
-# （`requireAdministrator`、`build.rs`が embed-resource でこのバイナリにだけ
-# リンクする）により、実行するだけで OS が UAC 昇格プロンプトを出す。
-[[bin]]
-name = "banto-hub-elev"
-path = "src/bin/banto-hub-elev.rs"
 
 # T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）の
 # Windows サービス化で使っていた `windows-service` クレートは、#392 B3-1 で
@@ -278,9 +259,8 @@ path = "src/bin/banto-hub-elev.rs"
 # 標準入力から読む際、コンソールのエコーを一時的に止めるため。新しい
 # クレートは増えず、既存の`windows-sys`0.61系列に feature を足すだけ）。
 #
-# #392 B3-3b（監査 C4）: `Win32_System_LibraryLoader`を追加した -
-# `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`（`banto-hub-elev`の
-# `main`の先頭で、昇格したプロセスの DLL の探し先を System32 に限る）。
+# #392 B3-3b（監査 C4）で足した`Win32_System_LibraryLoader`（`banto-hub-elev`の
+# `main`の`SetDefaultDllDirectories`）は、R1-7a で bin と一緒に`banto-hub-host`へ移した。
 #
 # #661 661-2: `Win32_System_Registry`を追加した - `profile_owners.rs`が戻す相手の記録
 # （HKLM `...\Services\BantoHub\Parameters\Profiles\<id>\Owners`、REG_MULTI_SZ）を
@@ -297,7 +277,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
-    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",

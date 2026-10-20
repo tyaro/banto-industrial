@@ -3,7 +3,7 @@
 //!
 //! **banto-hub と同じ共有ランナー・同じ登録の手順**を使う: サブコマンドは
 //! `install` / `uninstall` / `run-service`。#392 B3-1 で、それまで banto-hub
-//! （`apps/banto-hub/core/src/bin/banto_hub/win_service.rs` と
+//! （`apps/banto-hub/host/src/bin/banto_hub/win_service.rs` と
 //! `apps/banto-hub/core/src/service_install.rs`）の写しだった SCM の手順を
 //! 共有 crate `banto-service-control` へ移した: 本体は `SinkProgram`
 //! （`ServiceProgram`）として `run_service` に渡し、登録・解除は
@@ -48,7 +48,7 @@
 //! grant-service-acl` サブコマンドの本体 - **SDDL/ACE を組み立てる Win32
 //! コードはこのクレートに一切持たない**（banto-hub と同じ実装を複製しない）。
 //! 代わりに、同じ MSI で隣にインストールされる `banto-hub-elev.exe`
-//! （`apps/banto-hub/core/src/bin/banto-hub-elev.rs`、
+//! （`apps/banto-hub/host/src/bin/banto-hub-elev.rs`、
 //! `requireAdministrator` マニフェスト済み）を
 //! `grant-service-acl BantoHubSink`（[`SERVICE_NAME`]をそのまま渡す）
 //! 引数付きの子プロセスとして起動するだけ - 実際の ACE は
@@ -101,7 +101,7 @@ pub const RUN_SERVICE_ARG: &str = "run-service";
 pub const GRANT_SERVICE_ACL_ARG: &str = "grant-service-acl";
 
 /// 同じ MSI で隣にインストールされる UAC 昇格ヘルパーの実行ファイル名
-/// （`apps/banto-hub/core/src/bin/banto-hub-elev.rs`）。モジュール doc
+/// （`apps/banto-hub/host/src/bin/banto-hub-elev.rs`）。モジュール doc
 /// 「サービス ACL の付与」節参照。
 pub const ELEV_EXE_NAME: &str = "banto-hub-elev.exe";
 

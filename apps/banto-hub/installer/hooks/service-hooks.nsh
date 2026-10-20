@@ -114,7 +114,7 @@
 ;
 ; シェルを終了し、サイドカー→Hub の順でサービス登録を解除する。
 ; `banto-hub-elev.exe` が見つからない壊れたインストールに備えて
-; `banto-hub.exe uninstall`（同等の処理、apps/banto-hub/core/src/bin/
+; `banto-hub.exe uninstall`（同等の処理、apps/banto-hub/host/src/bin/
 ; banto_hub/win_service.rs 参照）へのフォールバックを持つ。
 ; `%ProgramData%\BantoHub\`（DB・サイドカー設定）とサービスログは
 ; **削除しない**（§4.5「アンインストール」・オーナー決定 §7-7 - 再

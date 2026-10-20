@@ -15,8 +15,11 @@
 //! ## Rules
 //!
 //! - **Only a host may depend on this crate** - a bin, or test code. Engine
-//!   library code (`banto-hub-core`'s `src/*.rs` outside `src/bin/` and
-//!   `#[cfg(test)]`) must not reference it (2026-10-20 owner decision, §6.4).
+//!   library code (`banto-hub-core`'s `src/*.rs` outside `#[cfg(test)]`) must
+//!   not reference it (2026-10-20 owner decision, §6.4). Since R1-7a the
+//!   `banto-hub` bin lives in `banto-hub-host`, which is the only normal
+//!   dependent on the Hub side; `banto-hub-core` keeps this crate as a
+//!   dev-dependency only (until R2b-0).
 //! - **No copies.** [`Builtin::client_factory`] *is*
 //!   `banto_collect::default_client_factory()`: re-building the
 //!   `ClientSpec` -> client mapping here would silently drop fields exactly

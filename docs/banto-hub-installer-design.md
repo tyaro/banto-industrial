@@ -105,7 +105,7 @@ docs/banto-hub-operations.md §12「サイドカーの初回セットアップ�
 
 ```powershell
 pnpm --filter banto-hub build
-cargo build --release -p banto-hub-core --bin banto-hub --bin banto-hub-elev --features embed-ui
+cargo build --release -p banto-hub-host --bin banto-hub --bin banto-hub-elev --features embed-ui
 cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui
 cargo build --release -p banto-hub-sink
 cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
