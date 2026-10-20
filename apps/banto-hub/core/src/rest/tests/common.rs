@@ -428,3 +428,76 @@ pub(super) async fn v1_put(
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
 }
+
+/// admin 系ルーター(CSRF ヘッダ必須)への `POST` - `issue_api_key` と
+/// `line1.fast.temp01`/`line1.fast.temp02`/`line2.slow.press01` の3タグを
+/// 別接続・別グループで作る(admin REST 経由 - I1 の書き込みハンドラは
+/// 成功のたびに `CollectorManager::rebuild` を自動で呼ぶので、明示的な
+/// rebuild 呼び出しは不要、このモジュールの doc comment「I1 CRUD 書き
+/// 込み後の再構築」参照)。catalog は registry の読み取りだけで完結する
+/// (`crate::hub::build_catalog`)ため、実際に PLC へ繋がらないポートでも
+/// rebuild は成功しカタログへ反映される -
+/// `tags_create_via_admin_router_rebuilds_the_catalog` と同じ判断。
+pub(super) async fn seed_scope_fixture(router: &Router, admin_token: &str) {
+    let (status, conn1) = admin_post(
+        router,
+        "/api/plc-connections",
+        admin_token,
+        json!({ "name": "line1", "host": "127.0.0.1", "port": 15101 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{conn1:?}");
+    let (status, group1) = admin_post(
+        router,
+        "/api/collection-groups",
+        admin_token,
+        json!({ "name": "fast", "plcConnectionId": conn1["id"], "periodMs": 100 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{group1:?}");
+    for (name, address) in [("temp01", "40001"), ("temp02", "40003")] {
+        let (status, tag) = admin_post(
+            router,
+            "/api/tags",
+            admin_token,
+            json!({
+                "name": name,
+                "collectionGroupId": group1["id"],
+                "address": address,
+                "dataType": "i16",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+    }
+
+    let (status, conn2) = admin_post(
+        router,
+        "/api/plc-connections",
+        admin_token,
+        json!({ "name": "line2", "host": "127.0.0.1", "port": 15102 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{conn2:?}");
+    let (status, group2) = admin_post(
+        router,
+        "/api/collection-groups",
+        admin_token,
+        json!({ "name": "slow", "plcConnectionId": conn2["id"], "periodMs": 1000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{group2:?}");
+    let (status, tag) = admin_post(
+        router,
+        "/api/tags",
+        admin_token,
+        json!({
+            "name": "press01",
+            "collectionGroupId": group2["id"],
+            "address": "40001",
+            "dataType": "i16",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tag:?}");
+}
