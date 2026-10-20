@@ -948,36 +948,22 @@ pub fn hub_client_factory(
     let default = sessions.drivers().client_factory.clone();
     Arc::new(
         move |spec: &banto_collect::ClientSpec| -> Box<dyn PlcClient> {
-            match spec.protocol {
-                banto_collect::ClientProtocol::Slmp => {
-                    match broker_handles.get(&spec.connection_key) {
-                        Some(handle) => Box::new(BrokerReadClient::new(handle.clone())),
-                        // Defensive only: every enabled SLMP connection was
-                        // ensure_connection'd (and inserted here) earlier in the
-                        // same rebuild, before this factory was built - see
-                        // `crate::hub::CollectorManager::rebuild`. Falling back to
-                        // the default direct SlmpClient rather than panicking
-                        // means a task still runs (degraded to an unshared
-                        // session) instead of the whole connection silently
-                        // never collecting.
-                        None => default(spec),
-                    }
-                }
-                // #337: same shape as the SLMP arm above, including the same
-                // defensive fallback - a Modbus connection missing from
-                // `broker_handles` (only possible if its `ensure_connection`
-                // failed earlier in the same rebuild) still collects through
-                // its own direct socket rather than silently not collecting
-                // at all. That fallback is the one path that can still open a
-                // second socket, and it is strictly better than no collection
-                // for a device that does allow it; for a 1対1 device it
-                // simply fails the same way it would have anyway.
-                banto_collect::ClientProtocol::ModbusTcp => {
-                    match broker_handles.get(&spec.connection_key) {
-                        Some(handle) => Box::new(BrokerReadClient::new(handle.clone())),
-                        None => default(spec),
-                    }
-                }
+            // One lookup for every protocol (R1-4c: this no longer dispatches
+            // on `spec.protocol`; removing `ClientProtocol` itself is R2b).
+            // SLMP and Modbus TCP connections alike read through their shared
+            // broker session (#337, 1 接続 = 1 ソケット). The fallback is
+            // defensive only: every enabled broker-managed connection was
+            // ensure_connection'd (and inserted here) earlier in the same
+            // rebuild, before this factory was built - see
+            // `crate::hub::CollectorManager::rebuild`. Falling back to the
+            // injected direct client rather than panicking means a task still
+            // runs, degraded to an unshared session or socket, instead of the
+            // whole connection silently never collecting. That fallback is the
+            // one path that can still open a second socket; for a 1対1 device
+            // it simply fails the same way it would have anyway.
+            match broker_handles.get(&spec.connection_key) {
+                Some(handle) => Box::new(BrokerReadClient::new(handle.clone())),
+                None => default(spec),
             }
         },
     )
