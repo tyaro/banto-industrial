@@ -1198,13 +1198,14 @@ pub fn fixtures(framing: &str) -> FrameFixtures {
         .refused("W5000", n(U16))
         .unsupported("W10.3", n(U16))
         .unsupported("W0", n(Bit))
-        .write("W200", n(U16), Value::F64(7.0))
-        .write("W300.5", n(Bit), Value::Bit(true))
-        .write("W400", n(F32), Value::F64(2.5))
+        .write("W200", n(U16), Value::F64(7.0), RawValue::Uint(7))
+        .write("W300.5", n(Bit), Value::Bit(true), RawValue::Bool(true))
+        .write("W400", n(F32), Value::F64(2.5), RawValue::Float(2.5))
         .write(
             "W500",
             TagKind::string(2, StringEncoding::Utf8),
             Value::Str("ab".into()),
+            RawValue::Bytes(b"ab\0\0".to_vec()),
         )
         .noise(vec![0x00, 0x11, 0x22, 0x33])
 }

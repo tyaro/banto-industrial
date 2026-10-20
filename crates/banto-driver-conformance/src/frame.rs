@@ -19,9 +19,25 @@
 //! | C6 | a response arriving after the timeout fails that read (`Timeout`) and is never taken as the next read's: the next read runs on a new connection and gets its own value |
 //! | C7 | after the peer closes, a new connection (new `create_connection`, new handshake) reads correctly, twice; a handshake ends within 32 steps |
 //! | C9 | a response that keeps growing never yields the expected values and ends fatally (`max_len` / timeout); `fixtures.noise` before a `DriverDecides` response is discarded; `Complete` / `Discard` stay within the buffer; steps are receivable (`Fixed(n)` within `max_len`, ...) |
-//! | C10 | (`capabilities.write` only) all of `fixtures.writes` - pairwise non-adjacent addresses - written as one batch succeed, no write step covers two of them, and each reads back as written; the step count stays within `3 × items + 8` (C16) |
+//! | C10 | (`capabilities.write` only) all of `fixtures.writes` - pairwise non-adjacent addresses - written as one batch succeed, no write step covers two of them, and each reads back as its `expected` value; the step count stays within `3 × items + 8` (C16) |
 //! | C11 | 1,000 random byte strings (fixed seed, up to `max_len`, at most 4 KiB) into `decode_read`, `is_complete` (for `DriverDecides` steps) and `handshake_next` never panic |
 //! | C12 | a string of 0 words, or of `fixtures.max_string_words + 1`, is `ItemError::Unsupported` (or refused by `parse_address`) |
+//!
+//! ## Comparing a value with its expected one
+//!
+//! C3's reads, C10's read-backs (and C9's "must not yield the expected
+//! value") compare what the driver decoded with the fixture's expected
+//! [`RawValue`] by **one rule that depends on the tag's [`TagKind`]**:
+//!
+//! | Kind | Match when |
+//! | --- | --- |
+//! | `Numeric(Bit)` | both `Bool` and equal |
+//! | `Numeric(F32)` | both `Float` and bit-equal **after rounding each to `f32`** (an `F32` tag holds the written value rounded) |
+//! | `Numeric(F64)` | both `Float` and **bit-equal** (`f64::to_bits`: no tolerance; a NaN matches the same NaN, `0.0` does not match `-0.0`) |
+//! | the integer types | both `Int` or both `Uint`, and equal |
+//! | `Str { words, .. }` | both `Bytes`; the decoded bytes are at most `words × 2` long, and the two are equal **up to their first NUL** (the host's decode rule: it cuts there, so padding after the NUL - or none at all - is the same string). The bytes are compared as given, never re-encoded: the fixture states them in the tag's `encoding` (design §3.2) |
+//!
+//! Anything else (a variant that does not fit the kind) is a mismatch.
 //!
 //! C8 (one socket per connection) is session-type only, and the write
 //! state-machine checks C13-C16 need a word-bit fixture set that arrives with
@@ -33,8 +49,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 use banto_driver_api::{
-    FatalError, FrameCheck, FrameDriver, FrameRule, ItemError, RawValue, StringEncoding, TagKind,
-    TagSpec, Value, WriteItem,
+    DataType, FatalError, FrameCheck, FrameDriver, FrameRule, ItemError, RawValue, StringEncoding,
+    TagKind, TagSpec, Value, WriteItem,
 };
 
 use crate::{Failure, StaticFixtures};
@@ -83,7 +99,8 @@ pub struct ReadCase {
     pub text: String,
     /// How to read it.
     pub kind: TagKind,
-    /// What the driver must decode.
+    /// What the driver must decode, compared by the kind's rule (see the
+    /// [module docs](self#comparing-a-value-with-its-expected-one)).
     pub expected: RawValue,
 }
 
@@ -98,7 +115,7 @@ impl ReadCase {
     }
 }
 
-/// A write the responder accepts.
+/// A write the responder accepts, and what reading it back gives.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteCase {
@@ -108,15 +125,24 @@ pub struct WriteCase {
     pub kind: TagKind,
     /// What to write.
     pub value: Value,
+    /// What the driver must decode when it reads `text` as `kind` after the
+    /// write, compared by the kind's rule like [`ReadCase::expected`] (see
+    /// the [module docs](self#comparing-a-value-with-its-expected-one)). The
+    /// harness does not derive it from `value`: a string's bytes are in the
+    /// tag's encoding (`"あ"` in Shift_JIS is `Bytes(vec![0x82, 0xA0])`),
+    /// which the harness does not encode.
+    pub expected: RawValue,
 }
 
 impl WriteCase {
-    /// Writing `value` to `text` as `kind` succeeds.
-    pub fn new(text: &str, kind: TagKind, value: Value) -> Self {
+    /// Writing `value` to `text` as `kind` succeeds, and reading it back
+    /// gives `expected`.
+    pub fn new(text: &str, kind: TagKind, value: Value, expected: RawValue) -> Self {
         WriteCase {
             text: text.to_owned(),
             kind,
             value,
+            expected,
         }
     }
 }
@@ -181,9 +207,11 @@ impl FrameFixtures {
         self
     }
 
-    /// Add a write (keep the addresses pairwise non-adjacent).
-    pub fn write(mut self, text: &str, kind: TagKind, value: Value) -> Self {
-        self.writes.push(WriteCase::new(text, kind, value));
+    /// Add a write and what reading it back gives (keep the addresses
+    /// pairwise non-adjacent).
+    pub fn write(mut self, text: &str, kind: TagKind, value: Value, expected: RawValue) -> Self {
+        self.writes
+            .push(WriteCase::new(text, kind, value, expected));
         self
     }
 
@@ -288,7 +316,7 @@ impl Cx<'_, '_, '_> {
                 let mut ok = true;
                 for (&i, got) in idx.iter().zip(&values) {
                     let case = self.reads[i].case;
-                    if got.as_ref() != Ok(&case.expected) {
+                    if !matches!(got, Ok(raw) if raw_matches(&case.kind, raw, &case.expected)) {
                         ok = false;
                         self.fail(
                             id,
@@ -511,7 +539,9 @@ impl Cx<'_, '_, '_> {
     fn c9_bounded_receive(&mut self) {
         self.engine.once = Some(Once::Endless);
         if let Ok(values) = self.engine.read(&[self.reads[0].spec.clone()]) {
-            if values.first().map(Result::as_ref) == Some(Ok(&self.reads[0].case.expected)) {
+            let case = self.reads[0].case;
+            if matches!(values.first(), Some(Ok(raw)) if raw_matches(&case.kind, raw, &case.expected))
+            {
                 self.fail(
                     "C9",
                     format!("完結しないまま伸び続ける応答から値を作った: {values:?}"),
@@ -589,13 +619,13 @@ impl Cx<'_, '_, '_> {
         match self.engine.read(&specs) {
             Ok(values) => {
                 for (w, got) in self.fixtures.writes.iter().zip(&values) {
-                    let ok = matches!(got, Ok(raw) if raw_matches(raw, &w.value));
+                    let ok = matches!(got, Ok(raw) if raw_matches(&w.kind, raw, &w.expected));
                     if !ok {
                         self.fail(
                             "C10",
                             format!(
-                                "{:?} に {:?} を書いた後の読み取りが {got:?}",
-                                w.text, w.value
+                                "{:?}（{:?}）に {:?} を書いた後の読み取りが {got:?}（期待は {:?}）",
+                                w.text, w.kind, w.value, w.expected
                             ),
                         );
                     }
@@ -734,20 +764,41 @@ impl Cx<'_, '_, '_> {
     }
 }
 
-/// Whether a decoded raw value is what was written.
-fn raw_matches(raw: &RawValue, value: &Value) -> bool {
-    match (raw, value) {
-        (RawValue::Bool(a), Value::Bit(b)) => a == b,
-        (RawValue::Int(a), Value::F64(b)) => *a as f64 == *b,
-        (RawValue::Uint(a), Value::F64(b)) => *a as f64 == *b,
-        // An F32 tag holds the written value rounded to f32.
-        (RawValue::Float(a), Value::F64(b)) => a == b || *a as f32 == *b as f32,
-        (RawValue::Bytes(a), Value::Str(s)) => {
-            let end = a.iter().position(|&b| b == 0).unwrap_or(a.len());
-            &a[..end] == s.as_bytes()
+/// Whether `got`, decoded as `kind`, is the fixture's `expected` - the one
+/// rule for C3, C9 and C10 (the table in the module docs). Taking the kind
+/// is the point: `f32` rounding is tolerated only for an `F32` tag, and a
+/// string's bytes are compared as given (in the tag's encoding), never
+/// against a UTF-8 rendering of the written text.
+fn raw_matches(kind: &TagKind, got: &RawValue, expected: &RawValue) -> bool {
+    match (kind, got, expected) {
+        (TagKind::Numeric(DataType::Bit), RawValue::Bool(g), RawValue::Bool(e)) => g == e,
+        (TagKind::Numeric(DataType::F32), RawValue::Float(g), RawValue::Float(e)) => {
+            (*g as f32).to_bits() == (*e as f32).to_bits()
+        }
+        (TagKind::Numeric(DataType::F64), RawValue::Float(g), RawValue::Float(e)) => {
+            g.to_bits() == e.to_bits()
+        }
+        (TagKind::Numeric(t), RawValue::Int(g), RawValue::Int(e))
+            if !matches!(t, DataType::Bit | DataType::F32 | DataType::F64) =>
+        {
+            g == e
+        }
+        (TagKind::Numeric(t), RawValue::Uint(g), RawValue::Uint(e))
+            if !matches!(t, DataType::Bit | DataType::F32 | DataType::F64) =>
+        {
+            g == e
+        }
+        (TagKind::Str { words, .. }, RawValue::Bytes(g), RawValue::Bytes(e)) => {
+            g.len() <= usize::from(*words) * 2 && up_to_nul(g) == up_to_nul(e)
         }
         _ => false,
     }
+}
+
+/// `bytes` up to (not including) the first NUL: what the host decodes.
+fn up_to_nul(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    &bytes[..end]
 }
 
 /// A tiny fixed-seed PRNG (xorshift64): C11 must be reproducible and the
@@ -768,5 +819,87 @@ impl XorShift {
     fn bytes(&mut self, max: usize) -> Vec<u8> {
         let len = (self.next() % (max as u64 + 1)) as usize;
         (0..len).map(|_| self.next() as u8).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_matches_follows_the_kind() {
+        use DataType::*;
+        use RawValue::*;
+        let n = TagKind::numeric;
+        let sjis = TagKind::string(2, StringEncoding::ShiftJis);
+        let f32_of = |v: f64| Float(f64::from(v as f32));
+        // (kind, got, expected, match)
+        let table: Vec<(TagKind, RawValue, RawValue, bool)> = vec![
+            (n(Bit), Bool(true), Bool(true), true),
+            (n(Bit), Bool(false), Bool(true), false),
+            (n(Bit), Uint(1), Bool(true), false),
+            // F32: rounding to f32 is tolerated, nothing more.
+            (n(F32), f32_of(0.1), Float(0.1), true),
+            (n(F32), Float(2.5), Float(2.5), true),
+            (n(F32), f32_of(0.1), Float(0.2), false),
+            (n(F32), Uint(0x3FC0_0000), Float(1.5), false),
+            // F64: bit-equal.
+            (n(F64), Float(1.0), Float(1.000_000_000_1), false),
+            (n(F64), f32_of(0.1), Float(0.1), false),
+            (n(F64), Float(0.1), Float(0.1), true),
+            (n(F64), Float(f64::NAN), Float(f64::NAN), true),
+            (n(F64), Float(-0.0), Float(0.0), false),
+            // Integers: same variant, equal.
+            (n(U16), Uint(7), Uint(7), true),
+            (n(U16), Uint(7), Uint(8), false),
+            (n(U16), Int(7), Uint(7), false),
+            (n(I32), Int(-100_000), Int(-100_000), true),
+            (n(I16), Float(-1.0), Int(-1), false),
+            // Strings: as given, up to the first NUL, within the span.
+            (
+                sjis.clone(),
+                Bytes(vec![0x82, 0xA0, 0, 0]),
+                Bytes(vec![0x82, 0xA0]),
+                true,
+            ),
+            (
+                sjis.clone(),
+                Bytes(vec![0x82, 0xA0, 0, 0x41]),
+                Bytes(vec![0x82, 0xA0, 0, 0]),
+                true,
+            ),
+            (
+                sjis.clone(),
+                Bytes(vec![0x82, 0xA0]),
+                Bytes(vec![0x82, 0xA0, 0, 0]),
+                true,
+            ),
+            (
+                sjis.clone(),
+                Bytes(vec![0x82, 0xA0, 0, 0]),
+                Bytes("あ".as_bytes().to_vec()),
+                false,
+            ),
+            (
+                sjis.clone(),
+                Bytes(vec![0x82, 0xA0, 0, 0, 0]),
+                Bytes(vec![0x82, 0xA0]),
+                false,
+            ),
+            (
+                sjis.clone(),
+                Bytes(b"abcd".to_vec()),
+                Bytes(b"abc".to_vec()),
+                false,
+            ),
+            (sjis, Uint(0xA082), Bytes(vec![0x82, 0xA0]), false),
+        ];
+        for (kind, got, expected, want) in table {
+            assert_eq!(
+                raw_matches(&kind, &got, &expected),
+                want,
+                "{kind:?}: {got:?} vs {expected:?}"
+            );
+        }
     }
 }

@@ -337,3 +337,176 @@ fn the_same_bit_set_and_cleared_is_rejected_without_touching_the_word() {
     assert_eq!(steps, 0);
     assert_eq!(peer.word('W', 7), Some(0x0100));
 }
+
+/// Echo with every write item passed through `rewrite` first (reads are
+/// untouched): a driver that writes something other than it was asked to.
+struct RewriteWrites(EchoFrameDriver, fn(WriteItem) -> WriteItem);
+
+impl DriverBase for RewriteWrites {
+    fn descriptor(&self) -> &DriverDescriptor {
+        self.0.descriptor()
+    }
+    fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
+        self.0.validate_config(settings)
+    }
+    fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
+        self.0.parse_address(text, kind)
+    }
+    fn offset_address(&self, c: &str, kind: &TagKind, n: i64) -> Result<String, AddressError> {
+        self.0.offset_address(c, kind, n)
+    }
+    fn address_help(&self) -> String {
+        self.0.address_help()
+    }
+}
+
+impl FrameDriver for RewriteWrites {
+    fn create_connection(
+        &self,
+        settings: &Settings,
+    ) -> Result<Box<dyn FrameConnection>, FatalError> {
+        Ok(Box::new(RewriteConn(
+            self.0.create_connection(settings)?,
+            self.1,
+        )))
+    }
+}
+
+struct RewriteConn(Box<dyn FrameConnection>, fn(WriteItem) -> WriteItem);
+
+impl FrameConnection for RewriteConn {
+    fn handshake_next(&mut self, prev: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
+        self.0.handshake_next(prev)
+    }
+    fn is_complete(&self, step: &Step, buf: &[u8]) -> Result<FrameCheck, FatalError> {
+        self.0.is_complete(step, buf)
+    }
+    fn plan_read(&mut self, specs: &[TagSpec]) -> Result<Vec<Planned>, FatalError> {
+        self.0.plan_read(specs)
+    }
+    fn decode_read(
+        &self,
+        planned: &Planned,
+        specs: &[TagSpec],
+        response: &[u8],
+    ) -> Result<Vec<Result<RawValue, ItemError>>, FatalError> {
+        self.0.decode_read(planned, specs, response)
+    }
+    fn write_next(
+        &mut self,
+        items: &[WriteItem],
+        prev: Option<&[u8]>,
+    ) -> Result<WriteProgress, FatalError> {
+        let items: Vec<WriteItem> = items.iter().cloned().map(self.1).collect();
+        self.0.write_next(&items, prev)
+    }
+}
+
+/// "あ" in Shift_JIS, the only character the tests below need (the crate
+/// takes no encoding dependency).
+const SJIS_A: [u8; 2] = [0x82, 0xA0];
+
+/// Writes a two-word Shift_JIS string as the bytes a Shift_JIS device holds:
+/// echo itself writes UTF-8 only, so the string becomes the `U32` whose
+/// words (high word first, echo's default order) are those bytes, low byte
+/// of each word first.
+fn shift_jis_as_words(mut item: WriteItem) -> WriteItem {
+    use banto_driver_api::{DataType, StringEncoding, Value};
+    if let (
+        TagKind::Str {
+            words: 2,
+            encoding: StringEncoding::ShiftJis,
+        },
+        Value::Str(s),
+    ) = (&item.spec.kind, &item.value)
+    {
+        assert_eq!(s, "あ", "the test knows one Shift_JIS character");
+        let word0 = u16::from_le_bytes(SJIS_A);
+        item.spec.kind = TagKind::numeric(DataType::U32);
+        item.value = Value::F64(f64::from(u32::from(word0) << 16));
+    }
+    item
+}
+
+/// Writes every `F64` at `f32` precision.
+fn f64_as_f32(mut item: WriteItem) -> WriteItem {
+    use banto_driver_api::{DataType, Value};
+    if let (TagKind::Numeric(DataType::F64), Value::F64(v)) = (&item.spec.kind, &item.value) {
+        item.value = Value::F64(f64::from(*v as f32));
+    }
+    item
+}
+
+/// Echo's fixtures plus a Shift_JIS string write, an `F64` that `f32`
+/// cannot hold and an `F32` that it rounds (all apart from the others).
+fn fixtures_with_kind_sensitive_writes() -> frame::FrameFixtures {
+    use banto_driver_api::{DataType, StringEncoding, Value};
+    echo::fixtures(FRAMING_FIXED)
+        .write(
+            "W600",
+            TagKind::string(2, StringEncoding::ShiftJis),
+            Value::Str("あ".into()),
+            // The device's bytes, in the tag's encoding; the padding NULs
+            // may be left out.
+            RawValue::Bytes(SJIS_A.to_vec()),
+        )
+        .write(
+            "W700",
+            TagKind::numeric(DataType::F64),
+            Value::F64(1.000_000_000_1),
+            RawValue::Float(1.000_000_000_1),
+        )
+        .write(
+            "W800",
+            TagKind::numeric(DataType::F32),
+            Value::F64(0.1),
+            // What was meant; the tag holds 0.1f32 and that is a match.
+            RawValue::Float(0.1),
+        )
+}
+
+#[tokio::test]
+async fn a_shift_jis_string_write_read_back_as_its_bytes_passes_c10() {
+    let mut peer = EchoResponder::with_sample_data();
+    let failures = frame::run_all(
+        &RewriteWrites(EchoFrameDriver::new(), shift_jis_as_words),
+        &fixtures_with_kind_sensitive_writes(),
+        &mut peer,
+    )
+    .await;
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert_eq!(
+        peer.word('W', 600),
+        Some(u16::from_le_bytes(SJIS_A)),
+        "the device holds the Shift_JIS bytes"
+    );
+}
+
+#[tokio::test]
+async fn an_f64_write_degraded_to_f32_fails_c10() {
+    let mut peer = EchoResponder::with_sample_data();
+    let failures = frame::run_all(
+        &RewriteWrites(EchoFrameDriver::new(), |i| {
+            f64_as_f32(shift_jis_as_words(i))
+        }),
+        &fixtures_with_kind_sensitive_writes(),
+        &mut peer,
+    )
+    .await;
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert_caught(Bug::FloatAsBits, &failures, "C10", "\"W700\"");
+}
+
+#[tokio::test]
+async fn an_f32_write_rounded_to_f32_passes_c10() {
+    // The same fixtures with an honest driver: 0.1 comes back as 0.1f32 at
+    // the F32 tag and is still a match; the F64 comes back exactly.
+    let mut peer = EchoResponder::with_sample_data();
+    let failures = frame::run_all(
+        &RewriteWrites(EchoFrameDriver::new(), shift_jis_as_words),
+        &fixtures_with_kind_sensitive_writes(),
+        &mut peer,
+    )
+    .await;
+    assert!(failures.is_empty(), "{failures:#?}");
+}
