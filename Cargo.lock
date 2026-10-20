@@ -654,7 +654,6 @@ dependencies = [
  "banto-plc-write",
  "banto-tags",
  "futures-util",
- "slmp",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -713,13 +712,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-driver-modbus"
+version = "0.1.0"
+dependencies = [
+ "banto-broker",
+ "banto-driver-api",
+ "banto-plc",
+ "banto-plc-write",
+ "banto-tags",
+ "tokio",
+]
+
+[[package]]
+name = "banto-driver-slmp"
+version = "0.1.0"
+dependencies = [
+ "banto-broker",
+ "banto-driver-api",
+ "banto-plc",
+ "banto-plc-write",
+ "banto-tags",
+ "slmp",
+ "tokio",
+]
+
+[[package]]
 name = "banto-drivers"
 version = "0.1.0"
 dependencies = [
  "banto-broker",
  "banto-collect",
  "banto-driver-api",
+ "banto-driver-modbus",
+ "banto-driver-slmp",
  "banto-plc",
+ "banto-plc-write",
+ "banto-tags",
+ "tokio",
 ]
 
 [[package]]

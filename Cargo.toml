@@ -48,6 +48,9 @@
 # 依存する. docs/banto-driver-api-design.md §2.2・§7).
 # R1-3b: crates/banto-drivers (ホストが注入する組み込みドライバ一式 `builtin()`。
 # 内部 crate. docs/banto-driver-api-design.md §6).
+# R1-4a: crates/banto-driver-slmp, crates/banto-driver-modbus (banto-broker から
+# SLMP / Modbus TCP のドライバ（`BrokerSession` の実装と `dial`）を移した内部 crate。
+# broker はこれらに依存しない. docs/banto-driver-api-design.md §2.3・§4.4).
 [workspace]
 resolver = "2"
 members = [
@@ -56,6 +59,8 @@ members = [
     "crates/banto-driver-api",
     "crates/banto-driver-conformance",
     "crates/banto-drivers",
+    "crates/banto-driver-slmp",
+    "crates/banto-driver-modbus",
     "crates/banto-plc",
     "crates/banto-plc-write",
     "crates/banto-tstore",

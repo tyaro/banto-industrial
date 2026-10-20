@@ -26,11 +26,10 @@
 //! `crate::engine::broker::`, with zero behavioral change); relay-wright
 //! itself was archived on 2026-09-24 (`archive/relay-wright-2026-09-24`,
 //! see docs/plan.md) with its construct-and-drive-the-whole-stack behavior
-//! left to this crate's own `#[cfg(test)]` suite below and
-//! `modbus_driver`'s.
+//! left to this crate's own `#[cfg(test)]` suite below and the driver
+//! crates' own tests (`banto-driver-slmp` / `banto-driver-modbus`, R1-4a).
 //!
-//! ## Protocol abstraction (I9 / Issue #130, 2026-09-01) and the one driver
-//! registered today
+//! ## Protocol abstraction (I9 / Issue #130, 2026-09-01) and the drivers
 //!
 //! This crate used to speak MELSEC SLMP exclusively, hardcoded throughout.
 //! Since #130, read/write execution against a live session is behind a small
@@ -54,21 +53,26 @@
 //! table entry only builds the [`Connector`] (plus the SLMP CPU type for
 //! [`BrokerHandle::slmp_cpu`]) - spawning the task, `TaskEntry` and the job
 //! loop stay in this crate, because a driver outside it cannot construct
-//! them. [`DriverTable::builtin`] is the bridge until R1-4a moves the two
-//! drivers below out into their own crates: it holds exactly the two entries
-//! the old `DRIVERS` held, dialing exactly as before.
+//! them.
 //!
-//! Two drivers are registered as of #131 (2026-09-01): `"slmp"`
-//! ([`slmp_driver`] module, wrapping `banto_plc`'s
+//! R1-4a (docs/banto-driver-api-design.md §4.4): the two drivers themselves
+//! no longer live here either. This crate does not depend on any driver -
+//! not even as a dev-dependency - and has no built-in table any more (the
+//! R1-3a bridge `DriverTable::builtin()` is gone). The composition root
+//! (`banto-drivers`' `builtin().broker`) registers `"slmp"`
+//! (`banto-driver-slmp`, wrapping `banto_plc`'s
 //! `plan_slmp_batch`/`execute_slmp_batch_reads` and `banto_plc_write`'s
-//! `plan_slmp_write_batch`/`execute_slmp_writes` behind
-//! [`slmp_driver::SlmpSession`] - moved out of this file's job loop by #130,
-//! not changed), and `"modbus-tcp"` ([`modbus_driver`] module, wrapping
+//! `plan_slmp_write_batch`/`execute_slmp_writes` behind its `SlmpSession` -
+//! moved out of this file's job loop by #130, then out of this crate by
+//! R1-4a, not changed) and `"modbus-tcp"` (`banto-driver-modbus`, wrapping
 //! `banto_plc`'s `plan_batch_requests`/`execute_modbus_reads` and
 //! `banto_plc_write`'s `plan_modbus_writes`/`execute_modbus_writes` behind
-//! [`modbus_driver::ModbusSession`] - #131's own addition, landed in the same
-//! PR as this paragraph's update). Every other `protocol` value is still
-//! rejected with [`BrokerError::UnsupportedProtocol`] (see
+//! its `ModbusSession` - #131's own addition). This crate's own unit tests
+//! drive the job loop with an in-memory fake session (`#[cfg(test)] mod
+//! fake`); the tests that pin down a protocol's behaviour *through* the
+//! broker live in each driver crate's `tests/broker.rs`. Every `protocol`
+//! value without a table entry is rejected with
+//! [`BrokerError::UnsupportedProtocol`] (see
 //! [`DriverTable::is_supported`] for the single source of truth on which
 //! protocol strings are registered in a given table). This refactor was tracked
 //! since docs/tag-server-design.md §6 item 7 as **I9**, "Modbus 書き込み
@@ -93,7 +97,7 @@
 //! ## Message shape and how serialization is guaranteed
 //!
 //! Each connection's task ([`BrokerSupervisor::spawn`] / the internal
-//! `spawn_task`) owns exactly one `Box<dyn session::BrokerSession>` and a
+//! `spawn_task_with_connector`) owns exactly one `Box<dyn session::BrokerSession>` and a
 //! `tokio::sync::mpsc::Receiver<Job>`. [`Job`] has two variants -
 //! `Read`/`Write` - each carrying its owned request `Vec` and a
 //! `tokio::sync::oneshot::Sender` for the reply. The task's main loop takes
@@ -135,7 +139,7 @@
 //! [`session::Connector`], built once per connection and called again on
 //! every reconnect attempt) rather than this file calling a
 //! protocol-specific connect function directly - see [`connect_attempt`].
-//! For the one driver registered today, [`slmp_driver::connector`] dials
+//! For the SLMP driver, `banto-driver-slmp`'s connector dials
 //! through [`banto_plc::dial_slmp`], the one shared implementation of the
 //! connect sequence (build a bare `slmp::SLMPClient` from
 //! `SlmpConfig::to_wire_props()`, wire the two per-crate timeouts, wrap the
@@ -146,10 +150,10 @@
 //! `dial_slmp`'s own doc comment (H9 transport 共通化,
 //! docs/improvement-plan.md §H9) - exactly what this file's own
 //! `connect_attempt` did inline before #130 moved the SLMP-specific half of
-//! it into [`slmp_driver::connector`]. What still differs here, and is not
+//! it into the SLMP driver's connector. What still differs here, and is not
 //! shareable, is what happens to the client *after* the dial - see "Why a new
 //! trait" above for why this broker wraps it in its own session type
-//! ([`slmp_driver::SlmpSession`]) rather than handing it to `SlmpClient`'s or
+//! (`banto-driver-slmp`'s `SlmpSession`) rather than handing it to `SlmpClient`'s or
 //! `SlmpWriteClient`'s own private `Option<slmp::SLMPClient>`.
 //!
 //! ## Queued-request-while-down policy: fail fast, never queue
@@ -185,7 +189,7 @@
 //! [`write_batch`][session::BrokerSession::write_batch] completely: `Err`
 //! means connection-fatal, full stop, and any per-device failure must already
 //! be folded into `Ok(Vec<_>)` by the time it gets here. For
-//! [`slmp_driver::SlmpSession`] that split is inherited for free: both
+//! `banto-driver-slmp`'s `SlmpSession` that split is inherited for free: both
 //! `banto_plc::execute_slmp_batch_reads` and
 //! `banto_plc_write::execute_slmp_writes` already enforce it internally (a
 //! device-side SLMP end code becomes a `Bad`/per-target failure folded into
@@ -234,34 +238,24 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use banto_driver_api::DriverId;
-use banto_plc::{BatchReadRequest, BatchReadResult, SlmpConfig, SlmpCpu, WordOrder};
+use banto_plc::{BatchReadRequest, BatchReadResult, SlmpCpu, WordOrder};
 use banto_plc_write::{BatchWriteRequest, WriteResult};
 use banto_tags::PlcConnection;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-mod modbus_driver;
+#[cfg(test)]
+mod fake;
 mod session;
-mod slmp_driver;
 
 pub use session::{BrokerSession, Connector, SessionError};
 
-/// The protocol string identifying the SLMP driver ([`slmp_driver`]) in
-/// [`DriverTable::builtin`] (see the module doc's "Protocol abstraction"
-/// section).
-const SLMP_PROTOCOL: &str = "slmp";
-
-/// The protocol string identifying the Modbus TCP driver ([`modbus_driver`])
-/// in [`DriverTable::builtin`] (#131, 2026-09-01) - see the module doc's
-/// "Protocol abstraction" section.
-const MODBUS_PROTOCOL: &str = "modbus-tcp";
-
 /// Parse [`PlcConnection::word_order`]'s wire string into the
-/// [`WordOrder`] [`SlmpConfig::word_order`] wants (P3-b, 監査指摘
+/// [`WordOrder`] `banto_plc::SlmpConfig::word_order` wants (P3-b, 監査指摘
 /// 2026-08-12: this function replacing the old hardcoded
 /// `..SlmpConfig::default()` is the fix). Falls back to
-/// [`WordOrder::LowHigh`] - [`SlmpConfig::default`]'s own value, so an
+/// [`WordOrder::LowHigh`] - `SlmpConfig::default`'s own value, so an
 /// unrecognized string behaves exactly as every connection did before this
 /// column existed - rather than propagating an error, because
 /// `banto_tags::plc_connection::ALLOWED_WORD_ORDERS` plus the SQL `CHECK`
@@ -269,83 +263,20 @@ const MODBUS_PROTOCOL: &str = "modbus-tcp";
 /// normal CRUD; this is defense in depth for a hand-edited or
 /// pre-migration-0010 database row, not a path this broker expects to take
 /// in practice.
-fn parse_word_order(value: &str) -> WordOrder {
+///
+/// `pub` since R1-4a (docs/banto-driver-api-design.md §4.4): both driver
+/// crates' config builders (`banto-driver-slmp`'s `slmp_config_for` and
+/// `banto-driver-modbus`'s `modbus_config_for`) call this one function, as
+/// they did when they lived in this crate - kept here, not copied into each
+/// driver, so the two protocols' fallback cannot drift apart. The broker
+/// itself no longer calls it.
+pub fn parse_word_order(value: &str) -> WordOrder {
     match value {
         "high_low" => WordOrder::HighLow,
         // "low_high" and anything unrecognized both land here - see this
         // fn's own doc comment for why an unrecognized value fails open to
         // the historical default rather than erroring.
         _ => WordOrder::LowHigh,
-    }
-}
-
-/// Build [`ensure_connection`][SessionDirectory::ensure_connection]'s
-/// [`SlmpConfig`] from `conn` - factored out of that method so
-/// `word_order_reflects_the_connections_own_setting_not_the_default` below
-/// can exercise the field mapping directly, without spawning a real broker
-/// task or dialing a socket. `port` is taken pre-validated (already an
-/// [`Result::Ok`] `u16` by the time the caller has one) rather than
-/// re-deriving it from `conn.port` here, matching that caller's existing
-/// order of operations.
-fn slmp_config_for(conn: &PlcConnection, port: u16) -> SlmpConfig {
-    SlmpConfig {
-        host: conn.host.clone(),
-        port,
-        // P3-b (監査指摘 2026-08-12): previously `..SlmpConfig::default()`
-        // alone, which fixed every session to `WordOrder::LowHigh` regardless
-        // of what the connection actually specified - a device needing
-        // `WordOrder::HighLow` would silently get byte-swapped u32/f32 values
-        // with no error anywhere. See `parse_word_order`'s doc comment for
-        // the fallback this now goes through.
-        word_order: parse_word_order(&conn.word_order),
-        // #605: `cpu_type` 列（migration 0021）。未認識の文字列は R
-        // （この列を足す前の `SlmpConfig::default().cpu`）。CHECK があるので
-        // 通常の CRUD では Q/R 以外は来ない。
-        cpu: parse_cpu_type(&conn.cpu_type),
-        ..SlmpConfig::default()
-    }
-}
-
-/// #605: `"Q"` だけ [`SlmpCpu::Q`]。それ以外は [`SlmpCpu::R`]。
-fn parse_cpu_type(value: &str) -> SlmpCpu {
-    match value {
-        "Q" => SlmpCpu::Q,
-        _ => SlmpCpu::R,
-    }
-}
-
-/// Build [`ensure_connection`][SessionDirectory::ensure_connection]'s
-/// [`banto_plc::ModbusTcpConfig`] from `conn` - the Modbus twin of
-/// [`slmp_config_for`], factored out for the same test-without-a-socket
-/// reason.
-///
-/// `unit_id`: `banto_tags::PlcConnection::unit_id` is registry-validated to
-/// `0..=255` at input time (`banto-tags`'s `MIN_UNIT_ID..=MAX_UNIT_ID`), so
-/// `conn.unit_id: i64` always fits `u8` for any row that passed normal CRUD -
-/// the `unwrap_or_else` fallback to `ModbusTcpConfig::default().unit_id` is
-/// defense-in-depth for a hand-edited/pre-migration row, exactly the same
-/// fail-open posture [`parse_word_order`] documents for `word_order`, not a
-/// path expected in practice.
-///
-/// `word_order`: reuses [`parse_word_order`] (the *same* helper
-/// [`slmp_config_for`] uses, not a duplicate) even though
-/// [`banto_plc::ModbusTcpConfig::default`]'s own `word_order` is
-/// [`WordOrder::HighLow`] - the opposite of [`SlmpConfig::default`]'s
-/// `WordOrder::LowHigh`. `parse_word_order`'s fallback to `WordOrder::LowHigh`
-/// on an unrecognized string is unconditional regardless of which protocol
-/// calls it; this matches `banto_plc_write::modbus::ModbusWriteClient`'s
-/// already-documented behavior of taking the connection's configured order
-/// through this same shared `word_order` column, so a hand-edited/
-/// pre-migration Modbus row fails open to `LowHigh` too, not to
-/// `ModbusTcpConfig::default()`'s `HighLow`.
-fn modbus_config_for(conn: &PlcConnection, port: u16) -> banto_plc::ModbusTcpConfig {
-    banto_plc::ModbusTcpConfig {
-        host: conn.host.clone(),
-        port,
-        unit_id: u8::try_from(conn.unit_id)
-            .unwrap_or_else(|_| banto_plc::ModbusTcpConfig::default().unit_id),
-        word_order: parse_word_order(&conn.word_order),
-        ..banto_plc::ModbusTcpConfig::default()
     }
 }
 
@@ -415,9 +346,9 @@ pub enum BrokerError {
     TaskGone { connection_id: i64 },
 
     /// [`BrokerSupervisor::spawn`] was given a connection whose `protocol`
-    /// has no entry in its [`DriverTable`] - with [`DriverTable::builtin`]
-    /// (#131, 2026-09-01), that means anything other than `"slmp"` or
-    /// `"modbus-tcp"`. Such a connection is rejected outright rather than
+    /// has no entry in its [`DriverTable`] - with `banto-drivers`'
+    /// `builtin().broker` (#131, 2026-09-01; R1-4a), that means anything
+    /// other than `"slmp"` or `"modbus-tcp"`. Such a connection is rejected outright rather than
     /// silently skipped, so a caller relying on `.handle(id)` finds out
     /// immediately at startup rather than discovering a missing handle later
     /// as an unexplained `None`.
@@ -425,7 +356,8 @@ pub enum BrokerError {
     /// The "slmp, modbus-tcp" list below is hand-written rather than derived
     /// from the table at the `#[error(...)]` site (a `thiserror` format
     /// string cannot call a function), so it must be kept in sync with
-    /// [`DriverTable::builtin`] by hand if a third driver is ever added.
+    /// `banto-drivers`' `builtin().broker` by hand if a third driver is ever
+    /// added.
     #[error("接続 {connection_id} のプロトコル {protocol} はブローカー未対応です（対応: slmp, modbus-tcp）")]
     UnsupportedProtocol {
         connection_id: i64,
@@ -834,49 +766,11 @@ impl DriverTable {
     pub fn ids(&self) -> impl Iterator<Item = &DriverId> {
         self.entries.iter().map(|(id, _)| id)
     }
-
-    /// R1-3a only - the bridge until R1-4a: the two drivers that still live
-    /// in this crate, `"slmp"` ([`dial_slmp`]) and `"modbus-tcp"`
-    /// ([`dial_modbus`]) - exactly the entries the old `const DRIVERS` held,
-    /// in the same order. R1-4a moves both drivers into their own crates
-    /// and deletes this (docs/banto-driver-api-design.md §4.4, §10).
-    #[doc(hidden)]
-    pub fn builtin() -> Self {
-        let id = |s: &str| DriverId::new(s).expect("builtin driver ids are valid");
-        Self::new(vec![
-            (id(SLMP_PROTOCOL), dial_slmp as DialFn),
-            (id(MODBUS_PROTOCOL), dial_modbus as DialFn),
-        ])
-        .expect("builtin driver ids are distinct")
-    }
 }
 
 impl std::fmt::Debug for DriverTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.ids()).finish()
-    }
-}
-
-/// [`DialFn`] for `"slmp"`: build this connection's [`SlmpConfig`] (see
-/// [`slmp_config_for`]) and wrap it as a [`slmp_driver::connector`] - what
-/// the former `spawn_slmp_driver` did before handing the connector to the
-/// task, including recording the CPU type for [`BrokerHandle::slmp_cpu`].
-fn dial_slmp(conn: &PlcConnection, port: u16) -> DriverDial {
-    let config = slmp_config_for(conn, port);
-    let cpu = config.cpu;
-    DriverDial {
-        connector: slmp_driver::connector(config),
-        slmp_cpu: Some(cpu),
-    }
-}
-
-/// [`DialFn`] for `"modbus-tcp"` (#131, 2026-09-01): build this
-/// connection's [`banto_plc::ModbusTcpConfig`] (see [`modbus_config_for`])
-/// and wrap it as a [`modbus_driver::connector`]. No SLMP CPU type.
-fn dial_modbus(conn: &PlcConnection, port: u16) -> DriverDial {
-    DriverDial {
-        connector: modbus_driver::connector(modbus_config_for(conn, port)),
-        slmp_cpu: None,
     }
 }
 
@@ -920,10 +814,10 @@ impl SessionDirectory {
     /// running yet (see the struct doc's on-demand policy). Rejects a
     /// connection whose `protocol` has no entry in this directory's
     /// [`DriverTable`] with [`BrokerError::UnsupportedProtocol`] - with
-    /// [`DriverTable::builtin`], `"slmp"` and `"modbus-tcp"` are the two
-    /// registered (see the module doc's "Protocol abstraction" section), so
-    /// this still rejects everything else exactly as it did when this was a
-    /// direct `!= SLMP_PROTOCOL` check.
+    /// `banto-drivers`' `builtin().broker`, `"slmp"` and `"modbus-tcp"` are
+    /// the two registered (see the module doc's "Protocol abstraction"
+    /// section), so this still rejects everything else exactly as it did when
+    /// this was a direct `!= SLMP_PROTOCOL` check.
     pub fn ensure_connection(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
         let dial = self.drivers.dial_for(&conn.protocol).ok_or_else(|| {
             BrokerError::UnsupportedProtocol {
@@ -1061,9 +955,10 @@ impl BrokerSupervisor {
     ///
     /// `drivers` (R1-3a, docs/banto-driver-api-design.md §4.4) decides which
     /// protocols this supervisor - and every [`SessionDirectory`] clone it
-    /// hands out - can spawn a task for, and how each one dials. Pass
-    /// [`DriverTable::builtin`] for the `"slmp"` / `"modbus-tcp"` pair the
-    /// broker has always served.
+    /// hands out - can spawn a task for, and how each one dials. A host passes
+    /// `banto-drivers`' `builtin().broker` for the `"slmp"` / `"modbus-tcp"`
+    /// pair the broker has always served (R1-4a: this crate no longer has a
+    /// built-in table of its own).
     pub fn spawn(
         connections: &[PlcConnection],
         backoff: BackoffConfig,
@@ -1147,8 +1042,8 @@ impl BrokerSupervisor {
 /// Build one connection's `(handle, task)` pair from an already-built
 /// [`Connector`] - the protocol-agnostic core
 /// [`SessionDirectory::ensure_connection`] calls with whatever connector its
-/// [`DriverTable`] entry dialed (and the unit tests' `spawn_task` with an
-/// SLMP one), factored out (#131, 2026-09-01) so a second driver did not
+/// [`DriverTable`] entry dialed (and this crate's unit tests with a
+/// `fake::connector`), factored out (#131, 2026-09-01) so a second driver did not
 /// need its own copy of this bookkeeping. `slmp_cpu` starts `None`; the
 /// caller fills it from [`DriverDial::slmp_cpu`]. `shutdown_rx` is the
 /// task's clone of the supervisor-wide shutdown trigger (see
@@ -1188,28 +1083,6 @@ fn spawn_task_with_connector(
             stop_tx,
             join_handle: task,
         },
-    )
-}
-
-/// SLMP-specific wrapper over [`spawn_task_with_connector`], kept only so
-/// this crate's own unit tests that pass a bare [`SlmpConfig`] directly
-/// (bypassing `PlcConnection`/`ensure_connection` entirely) keep working
-/// unchanged after #131 generalized the underlying spawn logic to any
-/// protocol's [`Connector`]. Test-only since R1-3a (the production path is
-/// [`SessionDirectory::ensure_connection`] + [`DriverTable::builtin`]'s SLMP
-/// entry); R1-4a deletes it (docs/banto-driver-api-design.md §4.4).
-#[cfg(test)]
-fn spawn_task(
-    connection_id: i64,
-    config: SlmpConfig,
-    backoff: BackoffConfig,
-    shutdown_rx: watch::Receiver<bool>,
-) -> (BrokerHandle, TaskEntry) {
-    spawn_task_with_connector(
-        connection_id,
-        slmp_driver::connector(config),
-        backoff,
-        shutdown_rx,
     )
 }
 
@@ -1256,7 +1129,7 @@ async fn next_conn_event(state: &mut ConnState) -> ConnEvent {
 /// Call `connector` once (see the module doc's "Reconnect / backoff policy"
 /// section) - the generic half of what a pre-#130 single `connect_attempt`
 /// did inline for SLMP specifically; the protocol-specific half now lives in
-/// each driver's own `Connector` (e.g. [`slmp_driver::connector`]).
+/// each driver's own `Connector` (e.g. `banto-driver-slmp`'s).
 async fn connect_attempt(connector: Connector) -> Result<Box<dyn BrokerSession>, String> {
     connector().await
 }
@@ -1426,15 +1299,22 @@ async fn run_broker_task(
 
 #[cfg(test)]
 mod tests {
+    //! R1-4a (docs/banto-driver-api-design.md §4.4): the tests left here are
+    //! the protocol-independent ones, and they run on [`crate::fake`] - an
+    //! in-memory session - instead of the SLMP simulator, because this crate
+    //! no longer contains (or depends on) a real driver. The tests that pin
+    //! down SLMP / Modbus behaviour through the broker moved to
+    //! `banto-driver-slmp/tests/broker.rs` and
+    //! `banto-driver-modbus/tests/broker.rs`.
+
     use std::time::Duration;
 
-    use banto_plc::{Address, DataType, PlcValue, ReadRequest, StringReadRequest, TagValue};
-    use banto_plc_write::slmp::simulator::Simulator;
-    use banto_plc_write::{StringWriteRequest, WriteRequest};
+    use banto_plc::{Address, DataType, PlcValue, ReadRequest, TagValue};
+    use banto_plc_write::WriteRequest;
     use futures_util::future::join_all;
-    use tokio::io::AsyncReadExt;
 
     use super::*;
+    use crate::fake::{self, FakePlc};
 
     fn conn(id: i64, protocol: &str, host: &str, port: u16) -> PlcConnection {
         PlcConnection {
@@ -1455,17 +1335,11 @@ mod tests {
         }
     }
 
-    /// Short timeouts pointed at `sim`, for tests that do not need the
-    /// default 1s/3s timeouts and want fast failure detection (the
-    /// backoff/reconnect test).
-    fn fast_config(sim: &Simulator) -> SlmpConfig {
-        SlmpConfig {
-            host: sim.addr.ip().to_string(),
-            port: sim.addr.port(),
-            connect_timeout: Duration::from_millis(300),
-            response_timeout: Duration::from_millis(150),
-            ..Default::default()
-        }
+    /// The table every table-driven test below uses: the fake driver under
+    /// the `"slmp"` id (the old tests' `DriverTable::builtin()` connections
+    /// were all `"slmp"`).
+    fn fake_table() -> DriverTable {
+        DriverTable::new(vec![(driver_id("slmp"), fake::dial as DialFn)]).expect("one entry")
     }
 
     /// A numeric read request wrapped as the `Numeric` case of the mixed batch
@@ -1477,17 +1351,6 @@ mod tests {
         })
     }
 
-    /// A string read request, the `String` case of the mixed batch. T20 ①b:
-    /// Shift-JIS explicitly (this broker's test simulator seeds strings via
-    /// `Simulator::set_string`, which is Shift-JIS-only).
-    fn sreq(raw: &str, words: u16) -> BatchReadRequest {
-        BatchReadRequest::String(StringReadRequest {
-            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-            words,
-            encoding: banto_plc::StringEncoding::ShiftJis,
-        })
-    }
-
     fn wreq(raw: &str, data_type: DataType, value: TagValue) -> BatchWriteRequest {
         BatchWriteRequest::Numeric(WriteRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
@@ -1496,26 +1359,9 @@ mod tests {
         })
     }
 
-    fn swreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
-        BatchWriteRequest::String(StringWriteRequest {
-            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-            words,
-            value: value.to_string(),
-            encoding: banto_plc_write::StringEncoding::ShiftJis,
-        })
-    }
-
-    /// T8 (docs/tag-server-design.md §6.1) bit-in-word write request.
-    fn bwreq(raw: &str, value: bool) -> BatchWriteRequest {
-        BatchWriteRequest::BitInWord {
-            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-            value,
-        }
-    }
-
-    /// Poll `handle.read` until the session comes up (real time - connecting
-    /// to a loopback simulator settles in low single-digit milliseconds) or a
-    /// generous deadline elapses, so tests don't race the connect task that
+    /// Poll `handle.read` until the session comes up (real time - the fake
+    /// connects at once, but the connect still runs in a background task) or
+    /// a generous deadline elapses, so tests don't race the connect task that
     /// starts in the background the instant a broker is spawned.
     async fn read_once_connected(
         handle: &BrokerHandle,
@@ -1566,9 +1412,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // P3-b (監査指摘 2026-08-12): word_order wiring - `slmp_config_for` must
-    // reflect the connection's own `word_order`, not silently fix every
-    // session to `SlmpConfig::default()`'s `WordOrder::LowHigh`.
+    // P3-b (監査指摘 2026-08-12): word_order wiring. `parse_word_order` is
+    // shared by both driver crates' config builders (their own tests check
+    // the wiring into `SlmpConfig` / `ModbusTcpConfig`).
     // -----------------------------------------------------------------
 
     #[test]
@@ -1587,118 +1433,24 @@ mod tests {
         assert_eq!(parse_word_order(""), WordOrder::LowHigh);
     }
 
-    /// The regression test for the audit finding itself: `slmp_config_for`
-    /// must carry the connection's own `word_order` into the `SlmpConfig` it
-    /// builds, not the old `..SlmpConfig::default()`-only shape that fixed
-    /// every session to `WordOrder::LowHigh` regardless of what the
-    /// connection specified.
-    #[test]
-    fn word_order_reflects_the_connections_own_setting_not_the_default() {
-        let mut c = conn(1, "slmp", "127.0.0.1", 5007);
-
-        c.word_order = "high_low".to_string();
-        assert_eq!(
-            slmp_config_for(&c, 5007).word_order,
-            WordOrder::HighLow,
-            "a connection asking for high_low must not silently get the default"
-        );
-
-        c.word_order = "low_high".to_string();
-        assert_eq!(slmp_config_for(&c, 5007).word_order, WordOrder::LowHigh);
-    }
-
-    /// #605: `cpu_type` はセッションのフレーム形式になる。既定の行（`"R"`）は
-    /// この列を足す前と同じ [`SlmpCpu::R`]。`"Q"` は Q フレーム。未知の文字列は
-    /// R に倒す（CHECK を通らない手編集行向け）。
-    #[test]
-    fn slmp_config_for_maps_cpu_type_q_and_r() {
-        let mut c = conn(1, "slmp", "10.0.0.5", 5007);
-        assert_eq!(slmp_config_for(&c, 5007).cpu, SlmpCpu::R);
-
-        c.cpu_type = "Q".to_string();
-        assert_eq!(slmp_config_for(&c, 5007).cpu, SlmpCpu::Q);
-
-        c.cpu_type = "L".to_string();
-        assert_eq!(slmp_config_for(&c, 5007).cpu, SlmpCpu::R);
-    }
-
-    /// Every other [`SlmpConfig`] field `slmp_config_for` does not set stays
-    /// exactly [`SlmpConfig::default`]'s value. CPU 種別は #605 で接続列に
-    /// 出した。アクセスルートとタイマーは今も既定のまま（他局指定は範囲外）。
-    #[test]
-    fn slmp_config_for_only_overrides_host_port_word_order_and_cpu() {
-        let c = conn(1, "slmp", "10.0.0.5", 5007);
-        let config = slmp_config_for(&c, 5007);
-        let default = SlmpConfig::default();
-        assert_eq!(config.host, "10.0.0.5");
-        assert_eq!(config.port, 5007);
-        assert_eq!(config.word_order, WordOrder::LowHigh);
-        assert_eq!(config.cpu, SlmpCpu::R);
-        assert_eq!(config.connect_timeout, default.connect_timeout);
-        assert_eq!(config.response_timeout, default.response_timeout);
-        assert_eq!(config.network_id, default.network_id);
-        assert_eq!(config.pc_id, default.pc_id);
-        assert_eq!(config.io_id, default.io_id);
-        assert_eq!(config.area_id, default.area_id);
-        assert_eq!(config.serial_id, default.serial_id);
-        assert_eq!(config.cpu_timer, default.cpu_timer);
-    }
-
-    /// #605: 接続の `cpu_type` が、broker の読み取りと書き込みの両方で
-    /// シミュレータに届くサブコマンドになる。Q のワードは `0x0000`、R は `0x0002`。
-    /// 既定のまま（このテストを R 固定に戻す）だと Q の断言が落ちる。
-    #[tokio::test]
-    async fn cpu_type_selects_the_slmp_subcommand_for_read_and_write() {
-        for (cpu_type, word_sub) in [("R", 0x0002u16), ("Q", 0x0000u16)] {
-            let sim = Simulator::start().await;
-            let mut c = conn(1, "slmp", "127.0.0.1", sim.addr.port());
-            c.cpu_type = cpu_type.to_string();
-            let supervisor =
-                BrokerSupervisor::spawn(&[c], BackoffConfig::default(), DriverTable::builtin())
-                    .expect("spawn");
-            let handle = supervisor.handle(1).expect("handle");
-            let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
-            assert_eq!(
-                sim.last_subcommand(),
-                Some(word_sub),
-                "{cpu_type} の読み取りサブコマンド"
-            );
-            handle
-                .write(vec![wreq("D0", DataType::U16, TagValue::F64(1.0))])
-                .await
-                .expect("write");
-            assert_eq!(
-                sim.last_subcommand(),
-                Some(word_sub),
-                "{cpu_type} の書き込みサブコマンド"
-            );
-            supervisor.shutdown().await;
-            sim.stop();
-        }
-    }
-
     // -----------------------------------------------------------------
     // Supervisor
     // -----------------------------------------------------------------
 
     /// Renamed from `supervisor_rejects_a_modbus_tcp_connection` (#131,
     /// 2026-09-01): that test's premise is now wrong - `"modbus-tcp"` is a
-    /// registered protocol (now in [`DriverTable::builtin`]) as of this PR,
-    /// no longer rejected. The property this test guards (an unregistered
-    /// protocol string is rejected outright, not silently skipped) is
-    /// unchanged, so it is kept with a made-up unsupported protocol string
-    /// instead of dropped.
+    /// registered protocol as of that PR, no longer rejected. The property
+    /// this test guards (an unregistered protocol string is rejected
+    /// outright, not silently skipped) is unchanged, so it is kept with a
+    /// made-up unsupported protocol string instead of dropped.
     #[tokio::test]
     async fn supervisor_rejects_an_unsupported_protocol_connection() {
         let connections = [conn(1, "bogus-protocol", "127.0.0.1", 502)];
-        let err = match BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        ) {
-            Ok(_) => panic!("an unregistered protocol must be rejected"),
-            Err(e) => e,
-        };
+        let err =
+            match BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table()) {
+                Ok(_) => panic!("an unregistered protocol must be rejected"),
+                Err(e) => e,
+            };
         assert_eq!(
             err,
             BrokerError::UnsupportedProtocol {
@@ -1716,12 +1468,18 @@ mod tests {
         DriverId::new(s).expect("valid driver id")
     }
 
-    /// The bridge table holds exactly the two drivers the old `const
-    /// DRIVERS` held, in the same order - the "same set of protocols the
-    /// broker manages" invariant of R1-3a.
+    /// A table holds exactly the ids it was built with, in order, and
+    /// answers `is_supported` / `dial_for` for nothing else. (R1-4a: the
+    /// broker half of the former `builtin_table_registers_exactly_slmp_and_modbus_tcp`;
+    /// that the built-in table *is* `["slmp", "modbus-tcp"]` is now checked
+    /// where it is built, in `banto-drivers`.)
     #[test]
-    fn builtin_table_registers_exactly_slmp_and_modbus_tcp() {
-        let table = DriverTable::builtin();
+    fn driver_table_registers_exactly_the_given_ids() {
+        let table = DriverTable::new(vec![
+            (driver_id("slmp"), fake::dial as DialFn),
+            (driver_id("modbus-tcp"), fake::dial as DialFn),
+        ])
+        .expect("distinct ids");
         let ids: Vec<&str> = table.ids().map(DriverId::as_str).collect();
         assert_eq!(ids, ["slmp", "modbus-tcp"]);
         assert!(table.is_supported("slmp"));
@@ -1738,29 +1496,12 @@ mod tests {
     #[test]
     fn driver_table_rejects_a_repeated_id() {
         let err = DriverTable::new(vec![
-            (driver_id("slmp"), dial_slmp as DialFn),
-            (driver_id("modbus-tcp"), dial_modbus as DialFn),
-            (driver_id("slmp"), dial_modbus as DialFn),
+            (driver_id("slmp"), fake::dial as DialFn),
+            (driver_id("modbus-tcp"), fake::dial as DialFn),
+            (driver_id("slmp"), fake::dial as DialFn),
         ])
         .expect_err("a repeated id must be rejected");
         assert_eq!(err, DuplicateDriverId(driver_id("slmp")));
-    }
-
-    /// The SLMP entry records the connection's CPU type for
-    /// `BrokerHandle::slmp_cpu` (#605) exactly as the old
-    /// `spawn_slmp_driver` did; the Modbus entry records none.
-    #[test]
-    fn builtin_dials_carry_the_slmp_cpu_only_for_slmp() {
-        let table = DriverTable::builtin();
-        let slmp = table.dial_for("slmp").expect("slmp entry");
-        let mut c = conn(1, "slmp", "127.0.0.1", 5000);
-        c.cpu_type = "Q".to_string();
-        assert_eq!(slmp(&c, 5000).slmp_cpu, Some(SlmpCpu::Q));
-        c.cpu_type = "R".to_string();
-        assert_eq!(slmp(&c, 5000).slmp_cpu, Some(SlmpCpu::R));
-        let modbus = table.dial_for("modbus-tcp").expect("modbus-tcp entry");
-        let dial = modbus(&conn(2, "modbus-tcp", "127.0.0.1", 502), 502);
-        assert_eq!(dial.slmp_cpu, None);
     }
 
     /// The supervisor dispatches through the table it was given, not a
@@ -1768,7 +1509,7 @@ mod tests {
     /// with the same error an unknown protocol gets.
     #[tokio::test]
     async fn supervisor_consults_the_injected_table() {
-        let only_modbus = DriverTable::new(vec![(driver_id("modbus-tcp"), dial_modbus as DialFn)])
+        let only_modbus = DriverTable::new(vec![(driver_id("modbus-tcp"), fake::dial as DialFn)])
             .expect("one entry");
         let connections = [conn(1, "slmp", "127.0.0.1", 5000)];
         let err = match BrokerSupervisor::spawn(&connections, BackoffConfig::default(), only_modbus)
@@ -1785,52 +1526,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn supervisor_hands_out_a_handle_per_modbus_tcp_connection() {
-        let sim = banto_plc_write::modbus::simulator::Simulator::start().await;
-        let connections = [conn(7, "modbus-tcp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("a modbus-tcp connection should spawn");
-        assert_eq!(supervisor.connection_count(), 1);
-        assert!(supervisor.handle(7).is_some());
-        assert!(supervisor.handle(999).is_none());
-        supervisor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn supervisor_hands_out_a_handle_per_slmp_connection() {
-        let sim = Simulator::start().await;
-        let connections = [conn(7, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("all-slmp connections should spawn");
-        assert_eq!(supervisor.connection_count(), 1);
-        assert!(supervisor.handle(7).is_some());
-        assert!(supervisor.handle(999).is_none());
-        supervisor.shutdown().await;
-    }
-
     // -----------------------------------------------------------------
     // Session removal (T7-2 backlog item, 2026-08-05)
     // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn remove_untracks_a_connection() {
-        let sim = Simulator::start().await;
-        let connections = [conn(7, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("all-slmp connections should spawn");
+        let connections = [conn(7, "slmp", "127.0.0.1", 5000)];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
+                .expect("all-slmp connections should spawn");
         let directory = supervisor.directory();
         assert_eq!(directory.connection_ids(), vec![7]);
 
@@ -1851,7 +1556,7 @@ mod tests {
     async fn remove_is_false_and_idempotent_for_an_untracked_connection() {
         let directory = SessionDirectory::new(
             BackoffConfig::default(),
-            DriverTable::builtin(),
+            fake_table(),
             std::sync::Arc::new(watch::channel(false).0),
         );
         assert!(!directory.remove(42), "nothing was ever tracked for id 42");
@@ -1860,14 +1565,10 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_connection_after_remove_spawns_a_fresh_session() {
-        let sim = Simulator::start().await;
-        let connections = [conn(7, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("all-slmp connections should spawn");
+        let connections = [conn(7, "slmp", "127.0.0.1", 5000)];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
+                .expect("all-slmp connections should spawn");
         let directory = supervisor.directory();
 
         directory.remove(7);
@@ -1878,7 +1579,7 @@ mod tests {
         // brand new session exactly like the very first ensure_connection
         // did.
         let fresh = directory
-            .ensure_connection(&conn(7, "slmp", "127.0.0.1", sim.addr.port()))
+            .ensure_connection(&conn(7, "slmp", "127.0.0.1", 5000))
             .expect("re-ensuring a removed connection should spawn a fresh session");
         assert_eq!(directory.connection_count(), 1);
         let _ = read_once_connected(&fresh, vec![rreq("D0", DataType::U16)]).await;
@@ -1887,168 +1588,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Read, write, and read-after-write over one shared session
+    // Many requests over one shared session
     // -----------------------------------------------------------------
 
     #[tokio::test]
-    async fn read_returns_simulated_device_values() {
-        let sim = Simulator::start().await;
-        sim.set_word(banto_plc::SlmpDevice::D, 100, 4321);
-        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("spawn");
-        let handle = supervisor.handle(1).expect("handle");
-
-        let results = read_once_connected(&handle, vec![rreq("D100", DataType::U16)]).await;
-        assert_eq!(results, vec![BatchReadResult::Value(PlcValue::F64(4321.0))]);
-
-        supervisor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn write_then_read_reflects_the_write_over_the_single_session() {
-        let sim = Simulator::start().await;
-        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("spawn");
-        let handle = supervisor.handle(1).expect("handle");
-
-        // Wait for the session to come up using an innocuous read, then
-        // write and read back - the read-after-write proof that both
-        // directions share the one session (a separate session would still
-        // pass this if it happened to hit the same simulator process, but a
-        // wrong shared-client bug - e.g. two independent slmp::SLMPClients -
-        // would still read the simulator's real state correctly too; what
-        // this test actually pins down together with `only_one_broker_task_..`
-        // below is that a single broker task and a single wire round trip
-        // serve both).
-        let _ = read_once_connected(&handle, vec![rreq("D200", DataType::U16)]).await;
-
-        let write_results = handle
-            .write(vec![wreq("D200", DataType::U16, TagValue::F64(777.0))])
-            .await
-            .expect("write should succeed");
-        assert_eq!(write_results, vec![WriteResult::Ok]);
-
-        let read_results = handle
-            .read(vec![rreq("D200", DataType::U16)])
-            .await
-            .expect("read should succeed");
-        assert_eq!(
-            read_results,
-            vec![BatchReadResult::Value(PlcValue::F64(777.0))]
-        );
-
-        supervisor.shutdown().await;
-    }
-
-    /// T8 E2E (docs/tag-server-design.md §6.1): a `BitInWord` write submitted
-    /// through `BrokerHandle::write` - exactly the same entry point
-    /// `write_then_read_reflects_the_write_over_the_single_session` above
-    /// uses for an ordinary write - runs its full read/modify/write/confirm
-    /// RMW sequence inside the one `Job::Write` this broker already knows how
-    /// to service, and the result is visible to a normal follow-up read. This
-    /// is the "broker needs no code changes" claim (§6.1, this crate's own
-    /// module doc's "Why SLMP-only" section) demonstrated rather than merely
-    /// asserted: `banto-broker`'s source has not changed to make this pass -
-    /// only `banto-plc-write`'s planner/executor did.
-    #[tokio::test]
-    async fn bit_in_word_write_through_the_broker_lands_and_reads_back() {
-        let sim = Simulator::start().await;
-        sim.set_word(banto_plc::SlmpDevice::D, 300, 0x1234);
-        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("spawn");
-        let handle = supervisor.handle(1).expect("handle");
-
-        // Wait for the session to come up, same as the ordinary-write test.
-        let _ = read_once_connected(&handle, vec![rreq("D300", DataType::U16)]).await;
-
-        // bit 0 is clear in the seed word (0x1234) - set it.
-        let write_results = handle
-            .write(vec![bwreq("D300.0", true)])
-            .await
-            .expect("bit-in-word write should succeed");
-        assert_eq!(write_results, vec![WriteResult::Ok]);
-
-        // The bit landed, and every other bit of the seed word survived -
-        // read back both as a whole word and as the individual bit tag.
-        let read_results = handle
-            .read(vec![
-                rreq("D300", DataType::U16),
-                rreq("D300.0", DataType::Bit),
-            ])
-            .await
-            .expect("read should succeed");
-        assert_eq!(
-            read_results,
-            vec![
-                BatchReadResult::Value(PlcValue::F64(0x1235 as f64)),
-                BatchReadResult::Value(PlcValue::Bit(true)),
-            ]
-        );
-
-        supervisor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn string_write_then_read_round_trips_over_the_single_session() {
-        // S2 文字列タグ: a mixed-batch string write lands in the simulator and
-        // reads back as the same text (NUL-trimmed), proving the broker speaks
-        // the string path end to end.
-        let sim = Simulator::start().await;
-        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("spawn");
-        let handle = supervisor.handle(1).expect("handle");
-
-        // Wait for the session, then write a 4-word (8-byte) string to D300.
-        let _ = read_once_connected(&handle, vec![sreq("D300", 4)]).await;
-
-        let write_results = handle
-            .write(vec![swreq("D300", 4, "OK")])
-            .await
-            .expect("string write should succeed");
-        assert_eq!(write_results, vec![WriteResult::Ok]);
-
-        let read_results = handle
-            .read(vec![sreq("D300", 4)])
-            .await
-            .expect("string read should succeed");
-        assert_eq!(
-            read_results,
-            vec![BatchReadResult::Value(PlcValue::Str("OK".to_string()))]
-        );
-
-        supervisor.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn serialized_concurrent_requests_do_not_corrupt_each_other() {
-        let sim = Simulator::start().await;
-        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("spawn");
+        let connections = [conn(1, "slmp", "127.0.0.1", 5000)];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
+                .expect("spawn");
         let handle = supervisor.handle(1).expect("handle");
 
         // Wait for the session before firing the concurrent burst, so every
@@ -2107,35 +1655,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_while_disconnected_fails_fast_not_a_hang() {
-        // A loopback port nothing listens on: bind then immediately drop, so
-        // the port is real but guaranteed closed - `connect()` gets a prompt
-        // refusal rather than this test depending on an unallocated port
-        // staying free.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("local_addr").port();
-        drop(listener);
+        // A device that refuses every connect attempt (the old test's
+        // loopback port nothing listens on): `connect()` gets a prompt
+        // refusal and the task sits in backoff.
+        let plc = FakePlc::new();
+        plc.refuse_connections(true);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (handle, task) = spawn_task(
-            1,
-            SlmpConfig {
-                host: "127.0.0.1".to_string(),
-                port,
-                connect_timeout: Duration::from_secs(3),
-                ..Default::default()
-            },
-            BackoffConfig::default(),
-            shutdown_rx,
-        );
+        let (handle, task) =
+            spawn_task_with_connector(1, plc.connector(), BackoffConfig::default(), shutdown_rx);
 
         let outcome = tokio::time::timeout(
             Duration::from_millis(200),
             handle.read(vec![rreq("D0", DataType::U16)]),
         )
         .await
-        .expect("must fail fast, not hang for the full connect_timeout");
+        .expect("must fail fast, not hang until the next connect attempt");
         assert_eq!(outcome, Err(BrokerError::Disconnected { connection_id: 1 }));
 
         drop(handle);
@@ -2144,23 +1679,21 @@ mod tests {
 
     #[tokio::test]
     async fn fatal_error_triggers_reconnect_and_later_requests_succeed() {
-        let sim = Simulator::start().await;
-        let config = fast_config(&sim);
+        let plc = FakePlc::new();
         let backoff = BackoffConfig {
             base: Duration::from_millis(20),
             cap: Duration::from_millis(100),
             factor: 2,
         };
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (handle, task) = spawn_task(1, config, backoff, shutdown_rx);
+        let (handle, task) = spawn_task_with_connector(1, plc.connector(), backoff, shutdown_rx);
 
-        // Establish the session, then make the simulator unresponsive: the
-        // next request times out (connection-fatal per
-        // `banto_plc_write::execute_slmp_writes`'s classification of
-        // `slmp::SlmpError::Timeout`), which must fail that request AND drop
-        // into reconnect-backoff.
+        // Establish the session, then make the next request fail
+        // connection-fatally (the old test hung the simulator so the request
+        // timed out): that must fail that request AND drop into
+        // reconnect-backoff.
         let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
-        sim.hang();
+        plc.fail_next_call();
 
         let hung = handle.read(vec![rreq("D0", DataType::U16)]).await;
         assert!(
@@ -2171,13 +1704,12 @@ mod tests {
                     ..
                 })
             ),
-            "a response timeout mid-request should fail that request as connection-fatal: {hung:?}"
+            "a connection-fatal error mid-request should fail that request as connection-fatal: {hung:?}"
         );
 
-        // Recover: the simulator answers again, and the backoff loop must
-        // reconnect on its own with no outside intervention.
-        sim.stop_hanging();
-        sim.set_word(banto_plc::SlmpDevice::D, 400, 55);
+        // Recover: the backoff loop must reconnect on its own with no outside
+        // intervention.
+        plc.set_word("D400", 55);
         let recovered = read_once_connected(&handle, vec![rreq("D400", DataType::U16)]).await;
         assert_eq!(recovered, vec![BatchReadResult::Value(PlcValue::F64(55.0))]);
 
@@ -2191,15 +1723,10 @@ mod tests {
 
     #[tokio::test]
     async fn status_watch_observes_connected_then_reconnecting_after_stop() {
-        // spawn_task (not BrokerSupervisor) so `fast_config` timeouts apply -
-        // `BrokerSupervisor`/`SessionDirectory::ensure_connection` always
-        // build `SlmpConfig::default()` internally, which is fine for the
-        // other tests but would make this one wait out the default 1s
-        // response_timeout if the severed connection ever needed it.
-        let sim = Simulator::start().await;
-        let config = fast_config(&sim);
+        let plc = FakePlc::new();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (handle, task) = spawn_task(1, config, BackoffConfig::default(), shutdown_rx);
+        let (handle, task) =
+            spawn_task_with_connector(1, plc.connector(), BackoffConfig::default(), shutdown_rx);
         let mut status = handle.status_watch();
 
         // Wait for the session to come up (via a read, like the other tests)
@@ -2210,11 +1737,12 @@ mod tests {
             .await
             .expect("status watch should report Connected once the session is up");
 
-        // Sever the simulator's listener/connections entirely (unlike
-        // `hang()`, this closes the socket outright) - the in-flight read
-        // below must fail connection-fatally, dropping the task into
-        // Backoff/Reconnecting, which the watch must reflect.
-        sim.stop();
+        // Take the device away entirely (the old test's `sim.stop()`): the
+        // in-flight read below must fail connection-fatally, dropping the
+        // task into Backoff/Reconnecting, which the watch must reflect - and
+        // reconnecting keeps failing.
+        plc.refuse_connections(true);
+        plc.fail_next_call();
 
         let _ = handle.read(vec![rreq("D0", DataType::U16)]).await;
         status
@@ -2228,14 +1756,10 @@ mod tests {
 
     #[tokio::test]
     async fn status_watch_observes_stopped_on_shutdown() {
-        let sim = Simulator::start().await;
-        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("spawn");
+        let connections = [conn(1, "slmp", "127.0.0.1", 5000)];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
+                .expect("spawn");
         let handle = supervisor.handle(1).expect("handle");
         let mut status = handle.status_watch();
 
@@ -2256,16 +1780,15 @@ mod tests {
 
     #[tokio::test]
     async fn session_directory_stop_and_join_stops_only_the_requested_task() {
+        // Port 0: the fake refuses to connect (the old test's unconnectable
+        // port), so both tasks sit in backoff.
         let connections = [
             conn(1, "slmp", "127.0.0.1", 0),
             conn(2, "slmp", "127.0.0.1", 0),
         ];
-        let supervisor = BrokerSupervisor::spawn(
-            &connections,
-            BackoffConfig::default(),
-            DriverTable::builtin(),
-        )
-        .expect("spawn");
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
+                .expect("spawn");
         let directory = supervisor.directory();
         // Keep a clone alive to prove that stop-and-join does not depend on
         // every caller dropping its BrokerHandle first.
@@ -2289,38 +1812,18 @@ mod tests {
 
     #[tokio::test]
     async fn stop_and_join_aborts_an_inflight_connect_attempt() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("local_addr").port();
-        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
-        let server_task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let _ = accepted_tx.send(());
-            let mut bytes = Vec::new();
-            let _ = socket.read_to_end(&mut bytes).await;
-            let _ = closed_tx.send(());
-        });
+        // A connect attempt that never finishes (the old test: a listener
+        // that accepts and then never answers, under a 30s connect timeout).
+        let (connector, mut started_rx, mut dropped_rx) = fake::hanging_connector();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let directory = SessionDirectory::new(
             BackoffConfig::default(),
-            DriverTable::builtin(),
+            fake_table(),
             std::sync::Arc::new(shutdown_tx),
         );
-        let (handle, task) = spawn_task(
-            9,
-            SlmpConfig {
-                host: "127.0.0.1".to_string(),
-                port,
-                connect_timeout: Duration::from_secs(30),
-                response_timeout: Duration::from_secs(30),
-                ..Default::default()
-            },
-            BackoffConfig::default(),
-            shutdown_rx,
-        );
+        let (handle, task) =
+            spawn_task_with_connector(9, connector, BackoffConfig::default(), shutdown_rx);
         directory
             .handles
             .lock()
@@ -2332,21 +1835,19 @@ mod tests {
             .expect("session directory poisoned")
             .insert(9, task);
 
-        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
             .await
-            .expect("connect attempt should reach the local listener")
-            .expect("listener task should stay alive");
+            .expect("connect attempt should start")
+            .expect("connector should stay alive");
         let stopped = tokio::time::timeout(Duration::from_secs(1), directory.stop_and_join(9))
             .await
-            .expect("stop_and_join should not wait for connect_timeout");
+            .expect("stop_and_join should not wait for the connect attempt");
         assert!(stopped, "connection should be tracked");
-        tokio::time::timeout(Duration::from_secs(1), closed_rx)
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
             .await
-            .expect("aborting the connect attempt should close its socket")
-            .expect("listener task should observe the close");
+            .expect("aborting the connect attempt should drop it")
+            .expect("connector should stay alive");
 
         drop(handle);
-        server_task.abort();
-        let _ = server_task.await;
     }
 }

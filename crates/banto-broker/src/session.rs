@@ -37,7 +37,7 @@
 //! [`crate::ConnState::Backoff`], failing the in-flight request with
 //! [`crate::BrokerError::ConnectionFailed`] - see `lib.rs`'s module doc,
 //! "Reconnect / backoff policy" and "The `Err` contract every `BrokerSession`
-//! implementation must uphold". [`slmp_driver::SlmpSession`][crate::slmp_driver::SlmpSession]
+//! implementation must uphold". `banto-driver-slmp`'s `SlmpSession`
 //! gets this for free because `banto_plc::execute_slmp_batch_reads` and
 //! `banto_plc_write::execute_slmp_writes` already enforce the split
 //! internally (a device-side SLMP end code becomes a per-request `Bad`; only
@@ -72,7 +72,7 @@ use banto_plc::{BatchReadRequest, BatchReadResult, BoxFuture};
 use banto_plc_write::{BatchWriteRequest, WriteResult};
 
 /// A live PLC session, owning one connection-level resource (for
-/// `slmp_driver::SlmpSession`, one `slmp::SLMPClient` socket) and
+/// `banto-driver-slmp`'s `SlmpSession`, one `slmp::SLMPClient` socket) and
 /// exposing both read and write over it. See this module's doc comment for
 /// the full contract, especially the `Err` = connection-fatal rule every
 /// implementation must uphold.
@@ -129,8 +129,8 @@ impl std::error::Error for SessionError {}
 /// reason: a failed attempt must be retryable, not consumed.
 ///
 /// Each driver builds its own `Connector` from its own config type (e.g.
-/// `slmp_driver::connector` from a `SlmpConfig`) - the closure is
-/// what erases that type difference, so `spawn_task`'s generic
+/// `banto-driver-slmp`'s connector from a `SlmpConfig`) - the closure is
+/// what erases that type difference, so `spawn_task_with_connector`'s generic
 /// pieces (`ConnState`, `run_broker_task`) never need to know it.
 pub type Connector = std::sync::Arc<
     dyn Fn() -> BoxFuture<'static, Result<Box<dyn BrokerSession>, String>> + Send + Sync,

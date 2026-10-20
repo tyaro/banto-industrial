@@ -38,10 +38,9 @@ banto-plc = { path = "../banto-plc" }
 # banto-plc に加えてこちらにも依存する（banto-plc-write 自身が banto-plc に
 # 依存する片方向の関係はそのまま - 循環はない）。
 banto-plc-write = { path = "../banto-plc-write" }
-# bare `slmp::SLMPClient` を直接保持・再接続する（`banto_plc::SlmcClient` は
-# 私有ソケットに read/write 両方を通す継ぎ目を持たないため - 詳細は
-# src/lib.rs 冒頭 doc の「なぜ connect を再実装するか」節）。
-slmp = { workspace = true }
+# R1-4a: `slmp`（bare `slmp::SLMPClient` を持つ SLMP セッション）への直接の依存は、
+# SLMP ドライバと一緒に `banto-driver-slmp` へ移した。broker はドライバ crate に
+# 依存しない（dev-dependency でもしない。docs/banto-driver-api-design.md §2.3）。
 thiserror = { workspace = true }
 # 接続毎に1タスク(`spawn`)、mpsc でジョブを直列化(`sync`)、バックオフの
 # タイマ・接続/応答タイムアウト(`time`)。banto-collect の task.rs と同じ
@@ -54,7 +53,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "te
 # ユニットテストの並行書き込みバーストで `join_all` を使う（旧 broker.rs の
 # テストと同じ理由）。
 futures-util = { workspace = true }
-# ブローカーの単体テストは banto-plc-write の in-process SLMP シミュレータ
-# （読み書き両対応）を相手にする。旧 broker.rs のテストがそうしていたのを
-# そのまま移設。
-banto-plc-write = { path = "../banto-plc-write", features = ["simulator"] }
+# R1-4a: ブローカーの単体テストは in-memory の偽セッション（src/fake.rs）を相手に
+# する。SLMP / Modbus のシミュレータで broker 越しの振る舞いを見るテストは、
+# 各ドライバ crate の tests/broker.rs へ移した（docs/banto-driver-api-design.md §4.4）。
