@@ -174,9 +174,10 @@ impl DriverBase for ModbusDriver {
     /// - The result is the canonical 6-digit form (`400002`, not `40002`;
     ///   Q8 = A). The same address, written the way the registry will store
     ///   it.
-    /// - A bit suffix (`40001.3`) is refused, as the TypeScript does (its
-    ///   regex does not match), instead of walking the bit axis the way
-    ///   SLMP does.
+    /// - A bit suffix (`40001.3`) is refused for `n != 0`, as the TypeScript
+    ///   does (its regex does not match), instead of walking the bit axis the
+    ///   way SLMP does. `n = 0` returns the canonical address unchanged, bit
+    ///   suffix included (conformance check C1).
     fn offset_address(
         &self,
         canonical: &str,
@@ -192,6 +193,9 @@ impl DriverBase for ModbusDriver {
         let (area, offset, bit) = address
             .as_modbus_ref()
             .expect("Address::parse always yields a ModbusRef");
+        if n == 0 {
+            return Ok(address.to_string());
+        }
         if bit.is_some() {
             return Err(AddressError::new(format!(
                 "ビット指定付きのアドレス {canonical:?} は連番にできません"
@@ -564,6 +568,20 @@ mod tests {
                 "{text:?} must be refused"
             );
         }
+    }
+
+    /// Regression (conformance check C1): `n = 0` on a bit-suffixed canonical
+    /// address returns it unchanged, while a non-zero step is still refused.
+    #[test]
+    fn offset_zero_accepts_a_bit_address_as_canonical() {
+        let bit = kind(DataType::Bit);
+        let canonical = ModbusDriver
+            .parse_address("40001.3", &bit)
+            .unwrap()
+            .canonical;
+        assert_eq!(canonical, "400001.3");
+        assert_eq!(offset(&canonical, &bit, 0).unwrap(), canonical);
+        assert!(offset(&canonical, &bit, 1).is_err());
     }
 
     // ------------------------------------------------------------------
