@@ -5,27 +5,36 @@
 //! The driver connects to [`FaultProxy::local_addr`] instead of the peer.
 //! Every accepted connection is relayed to the peer, and on the way back
 //! the proxy can delay responses, deliver them in small pieces (C5), replace
-//! the start of the k-th response (a broken frame for C4, a wrong check read
-//! for C14), and drop every live connection (C7). It records what the
-//! driver sent (C13 compares the written-back frames) and counts accepted
-//! connections (C8: one socket per connection).
+//! the start of the k-th response or patch bytes anywhere in it (a broken
+//! frame for C4, a wrong check read for C14, a device refusal for C15), hold
+//! the k-th response back past the driver's timeout (C6), cut the k-th
+//! response off halfway and close (C4), and drop every live connection (C7).
+//! It records what the driver sent (C13 compares the written-back frames)
+//! and counts its requests independently of TCP segmentation (C15),
+//! counts accepted connections (C8: one socket per connection) and counts
+//! the responses it delivered (so a test can wait for a late one).
 //!
 //! A "response" is one read from the peer's socket. Simulators answer one
 //! request with one write, so on loopback this is one response; a test that
 //! needs exact boundaries should send one request at a time.
 //!
-//! R1-2 builds the relay and its faults; R1-5's `session::run_all_against`
-//! drives Modbus / SLMP simulators through it.
+//! R1-2 built the relay and its faults; R1-5 added the one-shot
+//! [`patch_response`](Faults::patch_response),
+//! [`hold_response`](Faults::hold_response) and
+//! [`cut_response`](Faults::cut_response), [`FaultProxy::delivered_count`]
+//! and [`FaultProxy::close_all`] for
+//! [`session::run_all_against`](crate::session::run_all_against), which
+//! drives the Modbus / SLMP simulators through it.
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 
 /// What the proxy does to responses (peer → driver). Requests are relayed
 /// untouched (and recorded).
@@ -41,6 +50,19 @@ pub struct Faults {
     /// `(k, bytes)`: overwrite the first bytes of the k-th response from now
     /// (0 = the next one) with `bytes`, once.
     pub replace: Option<(usize, Vec<u8>)>,
+    /// `(k, offset, bytes)`: overwrite the bytes of the k-th response from now
+    /// starting at `offset` with `bytes` (what does not fit is dropped), once.
+    /// Unlike [`replace`](Self::replace) it can leave a header that echoes
+    /// the request (a transaction or serial id) intact.
+    pub patch: Option<(usize, usize, Vec<u8>)>,
+    /// `(k, d)`: hold only the k-th response from now back for `d` (on top
+    /// of [`delay`](Self::delay)), once - a response that arrives after the
+    /// driver's timeout.
+    pub hold: Option<(usize, Duration)>,
+    /// `(k, n)`: deliver only the first `n` bytes of the k-th response from
+    /// now and then close the connection, once - the peer going away in the
+    /// middle of a response.
+    pub cut: Option<(usize, usize)>,
 }
 
 impl Faults {
@@ -77,6 +99,31 @@ impl Faults {
             ..self
         }
     }
+
+    /// Overwrite the `k`-th response from now at `offset` with `bytes`.
+    pub fn patch_response(self, k: usize, offset: usize, bytes: Vec<u8>) -> Self {
+        Faults {
+            patch: Some((k, offset, bytes)),
+            ..self
+        }
+    }
+
+    /// Hold only the `k`-th response from now back for `d`.
+    pub fn hold_response(self, k: usize, d: Duration) -> Self {
+        Faults {
+            hold: Some((k, d)),
+            ..self
+        }
+    }
+
+    /// Deliver the first `n` bytes of the `k`-th response from now, then
+    /// close the connection.
+    pub fn cut_response(self, k: usize, n: usize) -> Self {
+        Faults {
+            cut: Some((k, n)),
+            ..self
+        }
+    }
 }
 
 #[derive(Default)]
@@ -85,8 +132,12 @@ struct Shared {
     /// Responses seen since `faults` was last set (for `replace`).
     responses_since_set: AtomicUsize,
     accepts: AtomicUsize,
+    /// Responses written to the driver in full.
+    delivered: AtomicUsize,
+    /// Requests counted by turn (see [`FaultProxy::request_count`]).
+    request_turns: AtomicUsize,
     requests: Mutex<Vec<Vec<u8>>>,
-    live: Mutex<Vec<AbortHandle>>,
+    live: Mutex<Vec<JoinHandle<()>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -133,15 +184,53 @@ impl FaultProxy {
     }
 
     /// Everything the driver sent, one entry per read from its socket.
+    ///
+    /// An entry is a TCP read, not a request frame: one request may arrive
+    /// in several entries. Count requests with
+    /// [`request_count`](Self::request_count).
     pub fn requests(&self) -> Vec<Vec<u8>> {
         lock(&self.shared.requests).clone()
     }
 
+    /// How many requests the driver has sent, counted by **turn**: on each
+    /// connection, the first bytes from the driver after the peer answered
+    /// (or after connecting) start a new request, and every further byte
+    /// before the peer's next answer belongs to the same one. So a request
+    /// split over several TCP segments counts once, with no knowledge of the
+    /// protocol's framing. Assumes a request / response driver (one request
+    /// in flight); requests pipelined before an answer count as one.
+    pub fn request_count(&self) -> usize {
+        self.shared.request_turns.load(Ordering::SeqCst)
+    }
+
+    /// How many responses the proxy has delivered to the driver in full
+    /// (a cut or undeliverable response does not count).
+    pub fn delivered_count(&self) -> usize {
+        self.shared.delivered.load(Ordering::SeqCst)
+    }
+
     /// Close every relayed connection now (the driver sees the peer
     /// disconnect). New connections are still accepted.
+    ///
+    /// The relays stop asynchronously; [`close_all`](Self::close_all) also
+    /// waits until they have.
     pub fn disconnect_all(&self) {
         for h in lock(&self.shared.live).drain(..) {
             h.abort();
+        }
+    }
+
+    /// [`disconnect_all`](Self::disconnect_all), and return once every
+    /// relayed socket is closed - so the driver's next request cannot still
+    /// reach the peer through a relay that has not stopped yet.
+    pub async fn close_all(&self) {
+        let live: Vec<JoinHandle<()>> = lock(&self.shared.live).drain(..).collect();
+        for h in &live {
+            h.abort();
+        }
+        for h in live {
+            // `Err` is the cancellation we asked for.
+            let _ = h.await;
         }
     }
 }
@@ -162,7 +251,7 @@ async fn accept_loop(listener: TcpListener, upstream: SocketAddr, shared: Arc<Sh
         let task = tokio::spawn(relay(client, upstream, Arc::clone(&shared)));
         let mut live = lock(&shared.live);
         live.retain(|h| !h.is_finished());
-        live.push(task.abort_handle());
+        live.push(task);
     }
 }
 
@@ -176,6 +265,10 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
     let _ = peer.set_nodelay(true);
     let (mut client_rx, mut client_tx) = client.into_split();
     let (mut peer_rx, mut peer_tx) = peer.into_split();
+    // Set when the peer has answered: the driver's next bytes start a new
+    // request (`FaultProxy::request_count`).
+    let new_turn = AtomicBool::new(true);
+    let new_turn = &new_turn;
 
     let requests = {
         let shared = Arc::clone(&shared);
@@ -186,6 +279,9 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
                     Ok(0) | Err(_) => return,
                     Ok(n) => n,
                 };
+                if new_turn.swap(false, Ordering::SeqCst) {
+                    shared.request_turns.fetch_add(1, Ordering::SeqCst);
+                }
                 lock(&shared.requests).push(buf[..n].to_vec());
                 if peer_tx.write_all(&buf[..n]).await.is_err() {
                     return;
@@ -200,8 +296,11 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
+            new_turn.store(true, Ordering::SeqCst);
             let mut response = buf[..n].to_vec();
             let index = shared.responses_since_set.fetch_add(1, Ordering::SeqCst);
+            let mut hold = Duration::ZERO;
+            let mut cut = None;
             let faults = {
                 let mut f = lock(&shared.faults);
                 if matches!(&f.replace, Some((k, _)) if *k == index) {
@@ -210,10 +309,31 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
                         response[..m].copy_from_slice(&bytes[..m]);
                     }
                 }
+                if matches!(&f.patch, Some((k, _, _)) if *k == index) {
+                    if let Some((_, offset, bytes)) = f.patch.take() {
+                        for (i, b) in bytes.into_iter().enumerate() {
+                            if let Some(slot) = response.get_mut(offset + i) {
+                                *slot = b;
+                            }
+                        }
+                    }
+                }
+                if matches!(&f.hold, Some((k, _)) if *k == index) {
+                    if let Some((_, d)) = f.hold.take() {
+                        hold = d;
+                    }
+                }
+                if matches!(&f.cut, Some((k, _)) if *k == index) {
+                    cut = f.cut.take().map(|(_, n)| n);
+                }
                 f.clone()
             };
-            if !faults.delay.is_zero() {
-                tokio::time::sleep(faults.delay).await;
+            let wait = faults.delay + hold;
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            if let Some(n) = cut {
+                response.truncate(n);
             }
             let piece = faults.split.unwrap_or(response.len()).max(1);
             for (i, chunk) in response.chunks(piece).enumerate() {
@@ -225,6 +345,11 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
                 }
                 let _ = client_tx.flush().await;
             }
+            if cut.is_some() {
+                // Close both sockets halfway through the response.
+                return;
+            }
+            shared.delivered.fetch_add(1, Ordering::SeqCst);
         }
     };
     // Either direction ending ends the connection.
@@ -332,6 +457,124 @@ mod tests {
         let (got, _) = round_trip(&mut c, b"b", 3).await;
         assert_eq!(got, b"<b>");
         assert_eq!(proxy.accept_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn patch_hold_and_cut_apply_once_to_the_kth_response() {
+        let proxy = FaultProxy::start(bracket_server().await).await.unwrap();
+        let mut c = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        c.set_nodelay(true).unwrap();
+
+        // Patch: bytes 2.. of the response after next, once; what does not
+        // fit is dropped.
+        proxy.set_faults(Faults::new().patch_response(1, 2, b"XYZ".to_vec()));
+        assert_eq!(round_trip(&mut c, b"ab", 4).await.0, b"<ab>");
+        assert_eq!(round_trip(&mut c, b"ab", 4).await.0, b"<aXY");
+        assert_eq!(round_trip(&mut c, b"ab", 4).await.0, b"<ab>");
+        assert_eq!(proxy.delivered_count(), 3);
+
+        // Hold: only the next response waits.
+        proxy.set_faults(Faults::new().hold_response(0, Duration::from_millis(200)));
+        c.write_all(b"h").await.unwrap();
+        let mut buf = [0u8; 8];
+        let early = tokio::time::timeout(Duration::from_millis(50), c.read(&mut buf)).await;
+        assert!(early.is_err(), "the held response is not there yet");
+        assert_eq!(round_trip(&mut c, b"", 3).await.0, b"<h>");
+        assert_eq!(round_trip(&mut c, b"i", 3).await.0, b"<i>");
+        assert_eq!(proxy.delivered_count(), 5);
+
+        // Cut: two bytes of the next response, then the connection closes.
+        proxy.set_faults(Faults::new().cut_response(0, 2));
+        c.write_all(b"cut").await.unwrap();
+        let mut got = Vec::new();
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+                .await
+                .expect("closed in time")
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, b"<c");
+        assert_eq!(
+            proxy.delivered_count(),
+            5,
+            "a cut response is not delivered"
+        );
+    }
+
+    /// A peer that answers every 4-byte request with `"<" + request + ">"`
+    /// (framed: it waits for all 4 bytes).
+    async fn fixed4_server() -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut req = [0u8; 4];
+                    while s.read_exact(&mut req).await.is_ok() {
+                        let mut out = vec![b'<'];
+                        out.extend_from_slice(&req);
+                        out.push(b'>');
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// One request split over two TCP writes (two reads at the proxy) is
+    /// one request; the next request after the answer is another.
+    #[tokio::test]
+    async fn request_count_ignores_tcp_segmentation() {
+        let proxy = FaultProxy::start(fixed4_server().await).await.unwrap();
+        let mut c = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        c.set_nodelay(true).unwrap();
+        c.write_all(b"ab").await.unwrap();
+        // Make sure the proxy saw the first half on its own before sending
+        // the second (so they really are two reads).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while proxy.requests().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first half not relayed"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let (got, _) = round_trip(&mut c, b"cd", 6).await;
+        assert_eq!(got, b"<abcd>");
+        assert_eq!(proxy.requests(), vec![b"ab".to_vec(), b"cd".to_vec()]);
+        assert_eq!(proxy.request_count(), 1, "one request in two segments");
+        let (got, _) = round_trip(&mut c, b"efgh", 6).await;
+        assert_eq!(got, b"<efgh>");
+        assert_eq!(proxy.request_count(), 2);
+        // A second connection starts with a new request too.
+        let mut c2 = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let _ = round_trip(&mut c2, b"ijkl", 6).await;
+        assert_eq!(proxy.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn close_all_returns_after_the_relays_are_gone() {
+        let proxy = FaultProxy::start(bracket_server().await).await.unwrap();
+        let mut c = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let _ = round_trip(&mut c, b"a", 3).await;
+        proxy.close_all().await;
+        // The relay is gone, so this request cannot be answered.
+        let _ = c.write_all(b"b").await;
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect("closed in time")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "nothing relayed after close_all");
+        assert_eq!(proxy.accept_count(), 1);
     }
 
     #[tokio::test]

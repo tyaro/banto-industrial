@@ -55,8 +55,18 @@ const G = {
 		// dev-dependency。banto-plc・banto-tags・broker・plc-write にも依存するが、G には写して
 		// いない（banto-plc / banto-tags の行の期待を R1-6 まで揺らさないため。banto-drivers が
 		// broker / collect を写していないのと同じ扱い）。
-		{ name: 'banto-driver-modbus', dir: 'crates/banto-driver-modbus', deps: ['banto-driver-api'] },
-		{ name: 'banto-driver-slmp', dir: 'crates/banto-driver-slmp', deps: ['banto-driver-api'] },
+		// R1-5: tests/conformance.rs の dev-dependency で適合テスト一式に依存する（dev の辺も
+		// 推移的に辿るので、conformance の変更でドライバ → banto-drivers → hub まで走る）。
+		{
+			name: 'banto-driver-modbus',
+			dir: 'crates/banto-driver-modbus',
+			deps: ['banto-driver-api', 'banto-driver-conformance']
+		},
+		{
+			name: 'banto-driver-slmp',
+			dir: 'crates/banto-driver-slmp',
+			deps: ['banto-driver-api', 'banto-driver-conformance']
+		},
 		{
 			name: 'banto-plc',
 			dir: 'crates/banto-plc',
@@ -353,7 +363,7 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-driver-conformance（R1-2 の公開 crate。逆依存は無く、driver-api ジョブが走る）',
+		'banto-driver-conformance（R1-2 の公開 crate。driver-api ジョブが走る。R1-5 から Modbus / SLMP のドライバが dev-dependency で使うので、その逆依存の hub 側も走る）',
 		[
 			'crates/banto-driver-conformance/src/frame.rs',
 			'crates/banto-driver-conformance/CHANGELOG.md'
@@ -361,7 +371,11 @@ const TABLE = [
 		{
 			...NONE,
 			run_rust: true,
-			rust_args: '-p banto-driver-conformance',
+			rust_args:
+				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink',
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true,
 			run_driver_api: true
 		}
 	],

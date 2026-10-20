@@ -45,13 +45,33 @@
 //!   read-modify-write) with its peer, and
 //!   [`FakeSessionDriver`](fake::session::FakeSessionDriver), a session-type
 //!   driver over an in-memory map whose next call can be made fatal.
-//! - [`proxy::FaultProxy`]: a TCP relay on 127.0.0.1 that splits, delays
-//!   and rewrites responses, drops connections and counts accepts - for
-//!   session-type drivers whose peer is a real TCP server (a simulator).
+//! - [`session::run_all_against`] (C1-C8, C12-C15): a session-type driver
+//!   ([`SessionDriver`](banto_driver_api::SessionDriver)) against a peer that
+//!   is already a TCP server (a device simulator), through a
+//!   [`proxy::FaultProxy`]. The harness plays the host (one session, a
+//!   fatal error drops it) in real time with bounded waits; the faults
+//!   (split, held back, rewritten and cut-off responses, dropped
+//!   connections) are injected by the proxy.
+//! - [`proxy::FaultProxy`]: a TCP relay on 127.0.0.1 that splits, delays,
+//!   holds back, rewrites and cuts off responses, drops connections and
+//!   counts accepts - for session-type drivers whose peer is a real TCP
+//!   server (a simulator).
 //!
-//! The session-side harness (`session::run_all_against`, C1-C8 and C12-C15
-//! through `FaultProxy`) and the Modbus / SLMP fixtures arrive in R1-5
-//! (design §7.3, §10).
+//! A session-type driver's test looks like this (R1-5 runs the Modbus / SLMP
+//! drivers this way, design §7.3):
+//!
+//! ```no_run
+//! # use banto_driver_api::SessionDriver;
+//! use banto_driver_conformance::proxy::FaultProxy;
+//! use banto_driver_conformance::session::{self, SessionFixtures};
+//!
+//! # async fn conforms(driver: &dyn SessionDriver, fixtures: SessionFixtures, peer: std::net::SocketAddr) {
+//! // `peer`: your device simulator, already listening; `fixtures`: what it holds.
+//! let proxy = FaultProxy::start(peer).await.unwrap();
+//! let failures = session::run_all_against(driver, &fixtures, &proxy).await;
+//! assert!(failures.is_empty(), "{failures:#?}");
+//! # }
+//! ```
 //!
 //! ## Writing fixtures
 //!
@@ -69,6 +89,7 @@ use banto_driver_api::{Settings, TagKind};
 pub mod fake;
 pub mod frame;
 pub mod proxy;
+pub mod session;
 mod statics;
 
 pub use statics::static_checks;

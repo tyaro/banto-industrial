@@ -54,6 +54,8 @@ mod session;
 
 pub use base::{driver, SlmpDriver};
 pub use classify::{classify_read, classify_write};
+#[doc(hidden)]
+pub use session::connector;
 
 /// The protocol string (`PlcConnection::protocol`) this driver serves - the
 /// id `banto-drivers` registers [`dial`] under.
@@ -81,7 +83,12 @@ pub fn dial(conn: &PlcConnection, port: u16) -> DriverDial {
 /// [`Result::Ok`] `u16` by the time the caller has one) rather than
 /// re-deriving it from `conn.port` here, matching the broker's existing
 /// order of operations (moved from `banto-broker` by R1-4a, unchanged).
-pub(crate) fn slmp_config_for(conn: &PlcConnection, port: u16) -> SlmpConfig {
+///
+/// `#[doc(hidden)] pub` (R1-5) only for this crate's `tests/conformance.rs`
+/// (the dev-only `LegacySession` builds its config exactly as [`dial`]
+/// does); not part of the crate's API.
+#[doc(hidden)]
+pub fn slmp_config_for(conn: &PlcConnection, port: u16) -> SlmpConfig {
     SlmpConfig {
         host: conn.host.clone(),
         port,

@@ -90,7 +90,12 @@ impl BrokerSession for SlmpSession {
 /// reconnect attempt) and cloned into each individual connect attempt's
 /// `'static` future - mirrors the pre-#130 `tokio::spawn(connect_attempt(
 /// config.clone()))` call site, just moved one layer down.
-pub(crate) fn connector(config: SlmpConfig) -> Connector {
+///
+/// `#[doc(hidden)] pub` (R1-5) only so that this crate's `tests/conformance.rs`
+/// can build a session with the conformance harness's timeouts; not part of
+/// the crate's API.
+#[doc(hidden)]
+pub fn connector(config: SlmpConfig) -> Connector {
     std::sync::Arc::new(move || {
         let config = config.clone();
         Box::pin(async move {

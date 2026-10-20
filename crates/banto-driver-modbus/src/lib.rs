@@ -54,6 +54,8 @@ mod session;
 
 pub use base::{driver, ModbusDriver};
 pub use classify::{classify_read, classify_write};
+#[doc(hidden)]
+pub use session::connector;
 
 /// The protocol string (`PlcConnection::protocol`) this driver serves - the
 /// id `banto-drivers` registers [`dial`] under.
@@ -96,7 +98,12 @@ pub fn dial(conn: &PlcConnection, port: u16) -> DriverDial {
 /// of taking the connection's configured order through this same shared
 /// `word_order` column, so a hand-edited/pre-migration Modbus row fails open
 /// to `LowHigh` too, not to `ModbusTcpConfig::default()`'s `HighLow`.
-pub(crate) fn modbus_config_for(conn: &PlcConnection, port: u16) -> ModbusTcpConfig {
+///
+/// `#[doc(hidden)] pub` (R1-5) only for this crate's `tests/conformance.rs`
+/// (the dev-only `LegacySession` builds its config exactly as [`dial`]
+/// does); not part of the crate's API.
+#[doc(hidden)]
+pub fn modbus_config_for(conn: &PlcConnection, port: u16) -> ModbusTcpConfig {
     ModbusTcpConfig {
         host: conn.host.clone(),
         port,

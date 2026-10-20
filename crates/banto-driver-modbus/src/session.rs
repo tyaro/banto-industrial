@@ -207,7 +207,12 @@ impl BrokerSession for ModbusSession {
 /// `banto-broker`'s `session.rs` module doc, "Why one trait with both `read_batch` and
 /// `write_batch`", and [`ModbusSession::next_transaction_id`]'s own doc
 /// comment.
-pub(crate) fn connector(config: ModbusTcpConfig) -> Connector {
+///
+/// `#[doc(hidden)] pub` (R1-5) only so that this crate's `tests/conformance.rs`
+/// can build a session with the conformance harness's timeouts; not part of
+/// the crate's API.
+#[doc(hidden)]
+pub fn connector(config: ModbusTcpConfig) -> Connector {
     std::sync::Arc::new(move || {
         let config = config.clone();
         Box::pin(async move {

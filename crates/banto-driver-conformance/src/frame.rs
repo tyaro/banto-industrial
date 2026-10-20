@@ -39,9 +39,10 @@
 //!
 //! Anything else (a variant that does not fit the kind) is a mismatch.
 //!
-//! C8 (one socket per connection) is session-type only, and the write
-//! state-machine checks C13-C16 need a word-bit fixture set that arrives with
-//! R1-5 / R2b-3 (design §7.3).
+//! C8 (one socket per connection) is session-type only
+//! ([`session::run_all_against`](crate::session::run_all_against), which
+//! also runs C13-C15 for session-type drivers since R1-5); the frame-type
+//! write state-machine checks C13-C16 arrive with R2b-3 (design §7.3).
 
 mod engine;
 
