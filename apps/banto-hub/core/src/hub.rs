@@ -3029,11 +3029,41 @@ mod tests {
         .await
         .expect("create trigger");
 
+        // 時計を進める前に、書き手が 1 日目宛ての未書き込みの行を持つまで待つ。
+        // トリガー後に最初の標本が溜まる前に進めると、切り替えの flush が空振りで
+        // 成功して 1 日目のファイルが閉じられ、剪定が自前の `side` 接続の掴む
+        // ファイルを消そうとして落ちる（Windows CI の os error 32 のフレーク）。
+        // `flush` は行があれば失敗し（バッファは減らさない）、無ければ何もせず
+        // 成功するので、失敗を待てば「失敗する行を持っている」が確かめられる。
+        let writer = manager
+            .collector
+            .lock()
+            .await
+            .as_ref()
+            .expect("収集が走っている")
+            .writer_handle()
+            .borrow()
+            .clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while writer.flush().await.is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "1 日目宛ての行が溜まるはず"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
         // 3 日進める。日付の切り替え前の flush が失敗し続けるので、書き手は
-        // 1 日目のファイルを開いたまま、行を持ち続ける。
+        // 1 日目のファイルを開いたまま、行を持ち続ける。行を持った後なので、
+        // 切り替えがいつ試みられても失敗し、この sleep は試みを待つだけ。
         clock.advance_ms(3 * 86_400_000);
         let today = local_today(clock.as_ref());
         tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            writer.flush().await.is_err(),
+            "切り替えに失敗して行を持ったまま"
+        );
+        drop(writer);
 
         let report = manager.prune_data_files(1, today).await.expect("prune");
         assert!(report.deleted.is_empty(), "開いている日付は消さない");
