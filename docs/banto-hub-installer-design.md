@@ -239,6 +239,6 @@ alpha.32（タグ `v0.2.0-alpha.32` = `4cb6b44`、#718）は DB の形が変わ�
 | 4   | 別の接続に既存と同じ名前のグループを作れる                   | **合格** |
 | 5   | 新しい画面で設定パッケージ（版 2）を書き出し、取り込み直せる | **合格** |
 
-**踏んだこと**: 最初は画面を建て直さずに `cargo build --features embed-ui` だけで起動したため、手元に残っていた alpha.31 の画面が埋め込まれ、取り込みで「collectionGroups に重複した name 'group1' が含まれています」（版 1 の画面の検査）が出た。`pnpm --filter banto-hub build` で画面を建て直してから `banto-hub` をビルドし直し、ブラウザを Ctrl+Shift+R で読み直すと解消した。`scripts/build-release.ps1` は画面のビルドを含むので、配布物では起きない。
+**踏んだこと**: 最初は画面を建て直さずに `cargo build --features embed-ui` だけで起動したため、手元に残っていた alpha.31 の画面が埋め込まれ、取り込みで「collectionGroups に重複した name 'group1' が含まれています」（版 1 の画面の検査）が出た。`pnpm --filter banto-hub build` で画面を建て直してから `banto-hub` をビルドし直し、ブラウザを Ctrl+Shift+R で読み直すと解消した。`scripts/build-release.ps1` は既定で画面を先に建て直すので、`-SkipFrontend` を付けない通常のリリースビルドでは起きない。
 
-その後、オーナーが `scripts/build-release.ps1` でビルドした配布物を v0.2.0-alpha.32 として公開した（2026-10-20）。インストーラでの本番の上書き更新の確認は本節では記録していない。
+その後、オーナーがタグ `v0.2.0-alpha.32`（= `4cb6b44`）を付けた（2026-10-20）。GitHub の Release（配布物の添付）は、本節を書いた時点（2026-10-20 02:15 UTC）では一覧に無かった。インストーラでの本番の上書き更新の確認は本節では記録していない。
