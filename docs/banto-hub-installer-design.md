@@ -241,4 +241,11 @@ alpha.32（タグ `v0.2.0-alpha.32` = `4cb6b44`、#718）は DB の形が変わ�
 
 **踏んだこと**: 最初は画面を建て直さずに `cargo build --features embed-ui` だけで起動したため、手元に残っていた alpha.31 の画面が埋め込まれ、取り込みで「collectionGroups に重複した name 'group1' が含まれています」（版 1 の画面の検査）が出た。`pnpm --filter banto-hub build` で画面を建て直してから `banto-hub` をビルドし直し、ブラウザを Ctrl+Shift+R で読み直すと解消した。`scripts/build-release.ps1` は既定で画面を先に建て直すので、`-SkipFrontend` を付けない通常のリリースビルドでは起きない。
 
-その後、オーナーがタグ `v0.2.0-alpha.32`（= `4cb6b44`）を付けた（2026-10-20）。その後、`scripts/build-release.ps1` で作った配布物 6 点（4 exe・インストーラ・`SHA256SUMS.txt`）を添付した GitHub Release を公開した（2026-10-20 02:21 UTC、https://github.com/tyaro/banto-industrial/releases/tag/v0.2.0-alpha.32 ）。インストーラでの本番の上書き更新の確認は本節では記録していない。
+その後、オーナーがタグ `v0.2.0-alpha.32`（= `4cb6b44`）を付けた（2026-10-20）。その後、`scripts/build-release.ps1` で作った配布物 6 点（4 exe・インストーラ・`SHA256SUMS.txt`）を添付した GitHub Release を公開した（2026-10-20 02:21 UTC、https://github.com/tyaro/banto-industrial/releases/tag/v0.2.0-alpha.32 ）。インストーラでの本番の上書き更新は下の「本番の更新」。
+
+**本番の更新（2026-10-20、この開発 PC）**: 本番を alpha.31 から alpha.32 に上げた。
+
+- 1 回目は画面がすぐ消えて開けなかった。`C:\Program Files\BantoHub` には `uninstall.exe`（版 `0.2.0-alpha.2`、当日の日付）と 9/7 の古い `banto-hub.exe` しかなく、`banto-hub-shell.exe`・`banto-hub-elev.exe`・`banto-hub-sink.exe` が無かった。アンインストールの登録も無かった。シェルの exe が無いので、起動しても何も出なかった。
+- 原因は、alpha.2 の Release のページの `BantoHub_0.2.0-alpha.2_x64-setup.exe`（7 MB）を使った可能性が高い（アンインストーラの版が alpha.2 だった。全 Release が Pre-release なので、一覧で版を取り違えやすい）。alpha.32 のインストーラ（27 MB）で実行し直した後は正常に動いたので、今回の事象は旧版の取り違えによると考えられる（SHA256 の一致は配布物との同一性を示すもので、不具合がないことの証明ではない）。
+- alpha.32 のインストーラを管理者で実行し直すと直った。画面の版は `0.2.0-alpha.32`、既存の 4 接続（calc・mem・plc_slmp・plc_q）は残り、収集も動いた（migration 0022 は本番の DB にもこのとき当たった）。
+- 教訓: 配布物は Release の版（ファイル名の版）を確かめてから使う。更新前の DB のバックアップは、この取り違えでも戻せるよう必ず取る。
