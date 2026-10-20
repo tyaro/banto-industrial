@@ -9,7 +9,8 @@
 //! frame for C4, a wrong check read for C14, a device refusal for C15), hold
 //! the k-th response back past the driver's timeout (C6), cut the k-th
 //! response off halfway and close (C4), and drop every live connection (C7).
-//! It records what the driver sent (C13 compares the written-back frames),
+//! It records what the driver sent (C13 compares the written-back frames)
+//! and counts its requests independently of TCP segmentation (C15),
 //! counts accepted connections (C8: one socket per connection) and counts
 //! the responses it delivered (so a test can wait for a late one).
 //!
@@ -27,7 +28,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -133,6 +134,8 @@ struct Shared {
     accepts: AtomicUsize,
     /// Responses written to the driver in full.
     delivered: AtomicUsize,
+    /// Requests counted by turn (see [`FaultProxy::request_count`]).
+    request_turns: AtomicUsize,
     requests: Mutex<Vec<Vec<u8>>>,
     live: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -181,8 +184,23 @@ impl FaultProxy {
     }
 
     /// Everything the driver sent, one entry per read from its socket.
+    ///
+    /// An entry is a TCP read, not a request frame: one request may arrive
+    /// in several entries. Count requests with
+    /// [`request_count`](Self::request_count).
     pub fn requests(&self) -> Vec<Vec<u8>> {
         lock(&self.shared.requests).clone()
+    }
+
+    /// How many requests the driver has sent, counted by **turn**: on each
+    /// connection, the first bytes from the driver after the peer answered
+    /// (or after connecting) start a new request, and every further byte
+    /// before the peer's next answer belongs to the same one. So a request
+    /// split over several TCP segments counts once, with no knowledge of the
+    /// protocol's framing. Assumes a request / response driver (one request
+    /// in flight); requests pipelined before an answer count as one.
+    pub fn request_count(&self) -> usize {
+        self.shared.request_turns.load(Ordering::SeqCst)
     }
 
     /// How many responses the proxy has delivered to the driver in full
@@ -247,6 +265,10 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
     let _ = peer.set_nodelay(true);
     let (mut client_rx, mut client_tx) = client.into_split();
     let (mut peer_rx, mut peer_tx) = peer.into_split();
+    // Set when the peer has answered: the driver's next bytes start a new
+    // request (`FaultProxy::request_count`).
+    let new_turn = AtomicBool::new(true);
+    let new_turn = &new_turn;
 
     let requests = {
         let shared = Arc::clone(&shared);
@@ -257,6 +279,9 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
                     Ok(0) | Err(_) => return,
                     Ok(n) => n,
                 };
+                if new_turn.swap(false, Ordering::SeqCst) {
+                    shared.request_turns.fetch_add(1, Ordering::SeqCst);
+                }
                 lock(&shared.requests).push(buf[..n].to_vec());
                 if peer_tx.write_all(&buf[..n]).await.is_err() {
                     return;
@@ -271,6 +296,7 @@ async fn relay(client: TcpStream, upstream: SocketAddr, shared: Arc<Shared>) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
+            new_turn.store(true, Ordering::SeqCst);
             let mut response = buf[..n].to_vec();
             let index = shared.responses_since_set.fetch_add(1, Ordering::SeqCst);
             let mut hold = Duration::ZERO;
@@ -477,6 +503,61 @@ mod tests {
             5,
             "a cut response is not delivered"
         );
+    }
+
+    /// A peer that answers every 4-byte request with `"<" + request + ">"`
+    /// (framed: it waits for all 4 bytes).
+    async fn fixed4_server() -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut req = [0u8; 4];
+                    while s.read_exact(&mut req).await.is_ok() {
+                        let mut out = vec![b'<'];
+                        out.extend_from_slice(&req);
+                        out.push(b'>');
+                        if s.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// One request split over two TCP writes (two reads at the proxy) is
+    /// one request; the next request after the answer is another.
+    #[tokio::test]
+    async fn request_count_ignores_tcp_segmentation() {
+        let proxy = FaultProxy::start(fixed4_server().await).await.unwrap();
+        let mut c = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        c.set_nodelay(true).unwrap();
+        c.write_all(b"ab").await.unwrap();
+        // Make sure the proxy saw the first half on its own before sending
+        // the second (so they really are two reads).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while proxy.requests().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first half not relayed"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let (got, _) = round_trip(&mut c, b"cd", 6).await;
+        assert_eq!(got, b"<abcd>");
+        assert_eq!(proxy.requests(), vec![b"ab".to_vec(), b"cd".to_vec()]);
+        assert_eq!(proxy.request_count(), 1, "one request in two segments");
+        let (got, _) = round_trip(&mut c, b"efgh", 6).await;
+        assert_eq!(got, b"<efgh>");
+        assert_eq!(proxy.request_count(), 2);
+        // A second connection starts with a new request too.
+        let mut c2 = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let _ = round_trip(&mut c2, b"ijkl", 6).await;
+        assert_eq!(proxy.request_count(), 3);
     }
 
     #[tokio::test]

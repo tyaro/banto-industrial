@@ -43,6 +43,9 @@ use banto_plc_write::{
 use banto_tags::PlcConnection;
 
 /// The protocol's parser for a canonical address.
+/// A word address of this protocol (for the tests below).
+const WORD: &str = "D100";
+
 fn parse(canonical: &str) -> Result<Address, PlcError> {
     Address::parse_slmp(canonical)
 }
@@ -168,10 +171,34 @@ enum Prep<R> {
 }
 
 /// Fill `prepared`'s slots from `results` (one per `Request`, in order).
+///
+/// If the inner `BrokerSession` broke its count contract (`results` is not
+/// one per `Request`), the mismatch is **passed on, not hidden**: the
+/// output is the item errors followed by every inner result, so its length
+/// differs from the caller's request count exactly as the inner one did,
+/// and the harness's own count check reports it as C3 ("N 件の要求に M 件の
+/// 結果"). A `FatalError` instead would read as an ordinary connection
+/// failure (and would even satisfy the checks that expect one, C4 / C6 /
+/// C7), and a panic would abort the whole run with every other check
+/// unreported.
 fn stitch<R, T>(
     prepared: Vec<Prep<R>>,
     results: Vec<Result<T, ItemError>>,
 ) -> Vec<Result<T, ItemError>> {
+    let requested = prepared
+        .iter()
+        .filter(|p| matches!(p, Prep::Request(_)))
+        .count();
+    if results.len() != requested {
+        return prepared
+            .into_iter()
+            .filter_map(|p| match p {
+                Prep::Item(e) => Some(Err(e)),
+                Prep::Request(_) => None,
+            })
+            .chain(results)
+            .collect();
+    }
     let mut results = results.into_iter();
     prepared
         .into_iter()
@@ -179,7 +206,7 @@ fn stitch<R, T>(
             Prep::Item(e) => Err(e),
             Prep::Request(_) => results
                 .next()
-                .unwrap_or_else(|| Err(ItemError::Rejected("結果が足りない".into()))),
+                .expect("one result per request (counted above)"),
         })
         .collect()
 }
@@ -357,4 +384,56 @@ fn fatal_errors_round_trip_through_their_text() {
     ] {
         assert_eq!(plc_write_error_from(&e.to_string()), e);
     }
+}
+
+/// A `BrokerSession` that breaks the count contract: one result more than
+/// requested, for reads and writes.
+struct OneTooMany;
+
+impl BrokerSession for OneTooMany {
+    fn read_batch<'a>(
+        &'a mut self,
+        requests: &'a [BatchReadRequest],
+    ) -> BoxFuture<'a, Result<Vec<BatchReadResult>, banto_broker::SessionError>> {
+        let n = requests.len() + 1;
+        Box::pin(async move { Ok(vec![BatchReadResult::Value(Value::F64(1.0)); n]) })
+    }
+    fn write_batch<'a>(
+        &'a mut self,
+        requests: &'a [BatchWriteRequest],
+    ) -> BoxFuture<'a, Result<Vec<WriteResult>, banto_broker::SessionError>> {
+        let n = requests.len() + 1;
+        Box::pin(async move { Ok(vec![WriteResult::Ok; n]) })
+    }
+    fn disconnect(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// The adapter passes an inner count violation on (so the harness reports
+/// C3) instead of trimming it to the request count.
+#[tokio::test]
+async fn an_extra_inner_result_is_not_hidden() {
+    let kind = TagKind::numeric(banto_plc::DataType::U16);
+    let spec = TagSpec::new(LegacyDriver.parse_address(WORD, &kind).unwrap(), kind);
+    // One request plus one item error that never reaches the inner session.
+    let bad = TagSpec::new(
+        LegacyDriver
+            .parse_address(WORD, &TagKind::numeric(banto_plc::DataType::Bit))
+            .unwrap(),
+        TagKind::numeric(banto_plc::DataType::Bit),
+    );
+    let mut s = LegacySession {
+        inner: Box::new(OneTooMany),
+    };
+    let specs = [spec.clone(), spec.clone()];
+    let got = s.read_batch(&specs).await.unwrap();
+    assert_eq!(got.len(), specs.len() + 1, "{got:?}");
+    let items = [
+        WriteItem::new(spec.clone(), Value::F64(1.0)),
+        WriteItem::new(bad, Value::Str("x".into())),
+    ];
+    let got = s.write_batch(&items).await.unwrap();
+    assert_eq!(got.len(), items.len() + 1, "{got:?}");
+    assert!(matches!(got[0], Err(ItemError::Unsupported(_))), "{got:?}");
 }
