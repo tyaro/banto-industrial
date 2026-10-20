@@ -515,7 +515,11 @@ loop {
             if steps > max_steps(items.len()) { return Err(FatalError::Protocol("書き込みの手順が上限を超えた".into())); }
             prev = Some(send_and_receive(&planned.step)?);   // 応答待ちの規則は読み取りと同じ（§4.2 の手順 (2)(3)）
         }
-        WriteProgress::Done(results) => { assert_eq!(results.len(), items.len()); return Ok(results); }
+        WriteProgress::Done(results) => {
+            // 件数の食い違いはドライバの契約違反。panic させず致命として接続を切る
+            if results.len() != items.len() { return Err(FatalError::Protocol("書き込みの結果の件数が要求と合わない".into())); }
+            return Ok(results);
+        }
     }
 }
 ```
