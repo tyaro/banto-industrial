@@ -65,6 +65,7 @@ struct State {
     /// performing the request, for injecting CPU-side refusals on either a read
     /// or a write.
     end_codes: HashMap<(SlmpDevice, u32), u16>,
+    /// Emit responses with a corrupted response code (see [`frame`]).
     malformed: bool,
     hang: bool,
     /// T8 (docs/tag-server-design.md §6.1) RMW test support: how many bulk
@@ -240,8 +241,8 @@ impl Simulator {
             .insert((device, number), xor_mask);
     }
 
-    /// Answer with a frame whose declared data length disagrees with its actual
-    /// payload, so the wrapped crate rejects it as a framing error.
+    /// Answer with a frame whose response code is corrupted (length correct),
+    /// so the wrapped crate rejects it as a framing error.
     pub fn emit_malformed_frames(&self) {
         self.state.lock().unwrap().malformed = true;
     }
@@ -487,17 +488,24 @@ fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec
 }
 
 /// Assemble a 4E binary response frame. `end_code` of `0` means success.
-/// `malformed` corrupts the declared data length so the wrapped crate's
-/// length-consistency check fails.
+/// `malformed` corrupts the response code (with a correct length) so the
+/// wrapped crate's response validation fails.
 fn frame(route: &Route, end_code: u16, payload: &[u8], malformed: bool) -> Vec<u8> {
     const RESPONSE_CODE: [u8; 2] = [0xD4, 0x00];
-    let mut data_len = (2 + payload.len()) as u16;
-    if malformed {
-        data_len = data_len.wrapping_add(1);
-    }
+    let data_len = (2 + payload.len()) as u16;
+    // slmp 0.2.1 reads exactly the declared length, so a length that lies
+    // would now wait for a byte that never comes and time out instead of
+    // failing framing. Corrupt the response code instead and keep the length
+    // correct: the full frame is read and `validate_response` rejects it with
+    // `FramingError::UnexpectedField`.
+    let response_code = if malformed {
+        [0xD4, 0xFF]
+    } else {
+        RESPONSE_CODE
+    };
 
     let mut out = Vec::with_capacity(FRAME_PREFIX_LEN + payload.len());
-    out.extend_from_slice(&RESPONSE_CODE);
+    out.extend_from_slice(&response_code);
     out.extend_from_slice(&route.serial_id.to_le_bytes());
     out.extend_from_slice(&[0x00, 0x00]);
     out.push(route.network_id);

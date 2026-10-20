@@ -103,8 +103,8 @@ struct State {
     /// data, for injecting CPU-side refusals (the SLMP analogue of
     /// `modbus/simulator.rs`'s `exceptions`).
     end_codes: HashMap<(SlmpDevice, u32), u16>,
-    /// When set, every response is emitted with a data-length field that
-    /// disagrees with the bytes actually sent. Exists to exercise the *other*
+    /// When set, every response is emitted with a corrupted response code
+    /// (`[0xD4, 0xFF]`) and a correct length. Exists to exercise the *other*
     /// half of the end-code/framing pair: a framing failure
     /// (`slmp::SlmpError::Framing(_)`), which must be classified
     /// connection-fatal even though the pre-H9 wrapped crate used to report
@@ -316,9 +316,9 @@ impl Simulator {
             .remove(&(device, start_number));
     }
 
-    /// Answer every request with a frame whose declared data length disagrees
-    /// with its actual payload, so the wrapped crate rejects it as a framing
-    /// error rather than reading an end code out of it.
+    /// Answer every request with a frame whose response code is corrupted
+    /// (length correct), so the wrapped crate rejects it as a framing error
+    /// rather than reading an end code out of it.
     pub fn emit_malformed_frames(&self) {
         self.state.lock().unwrap().malformed = true;
     }
@@ -592,18 +592,25 @@ fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec
 /// Assemble a 4E binary response frame. `end_code` of `0` means success;
 /// anything else is a CPU-side refusal and carries no payload.
 ///
-/// `malformed` deliberately corrupts the declared data length so the wrapped
-/// crate's length-consistency check fails - see [`State::malformed`].
+/// `malformed` deliberately corrupts the response code (with a correct length)
+/// so the wrapped crate's response validation fails - see [`State::malformed`].
 fn frame(route: &Route, end_code: u16, payload: &[u8], malformed: bool) -> Vec<u8> {
     const RESPONSE_CODE: [u8; 2] = [0xD4, 0x00];
     // The response's length field counts the end code plus the payload.
-    let mut data_len = (2 + payload.len()) as u16;
-    if malformed {
-        data_len = data_len.wrapping_add(1);
-    }
+    let data_len = (2 + payload.len()) as u16;
+    // slmp 0.2.1 reads exactly the declared length, so a length that lies
+    // would now wait for a byte that never comes and time out instead of
+    // failing framing. Corrupt the response code instead and keep the length
+    // correct: the full frame is read and `validate_response` rejects it with
+    // `FramingError::UnexpectedField`.
+    let response_code = if malformed {
+        [0xD4, 0xFF]
+    } else {
+        RESPONSE_CODE
+    };
 
     let mut out = Vec::with_capacity(FRAME_PREFIX_LEN + payload.len());
-    out.extend_from_slice(&RESPONSE_CODE);
+    out.extend_from_slice(&response_code);
     out.extend_from_slice(&route.serial_id.to_le_bytes());
     out.extend_from_slice(&[0x00, 0x00]);
     out.push(route.network_id);

@@ -5646,8 +5646,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slmp"
-version = "0.2.0"
-source = "git+https://github.com/tyaro/slmp?tag=v0.2.0#aa9ef49672ad182c443c3c7c897ed982634c7abb"
+version = "0.2.1"
+source = "git+https://github.com/tyaro/slmp?tag=v0.2.1#40a2f1d9cd4e7eb641423284e0678e81200b91a6"
 dependencies = [
  "encoding_rs",
  "serde",

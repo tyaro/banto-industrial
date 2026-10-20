@@ -115,7 +115,10 @@ tokio = { version = "1" }
 # 構造化マッチに置き換わっており、文言パースは完全削除済み(§H9 受け入れ
 # 条件)。tag 参照で固定(deny.toml の `required-git-spec = "tag"` と同じ
 # 再現性方針)。
-slmp = { git = "https://github.com/tyaro/slmp", tag = "v0.2.0" }
+# 2026-10-19: v0.2.1 へ上げた（応答が TCP で分割して届いても 1 フレームとして
+# 読む。それまでは単発の read() で受けていたため、分割すると Framing の致命
+# エラーで切断・再接続していた。docs/banto-hub-driver-refactor-plan.md §8.3）。
+slmp = { git = "https://github.com/tyaro/slmp", tag = "v0.2.1" }
 # S1 (relay-wright plan, 文字列タグ): Shift-JIS encode/decode for MELSEC string
 # devices - banto-plc's string read decode and banto-plc-write's string write
 # encode. Pinned to the exact version the `slmp` crate above already depends on

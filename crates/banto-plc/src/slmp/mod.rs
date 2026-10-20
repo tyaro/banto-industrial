@@ -51,7 +51,7 @@
 //! crate's error *message text* (crates.io `slmp` 0.1.x reported everything as
 //! `std::io::Error`, exposing the end code no other way). H9
 //! (docs/h9-slmp-structured-error-spec.md, 2026-08-12) replaced that with the
-//! git dependency on the owner's fork (`slmp` 0.2.0, see the workspace
+//! git dependency on the owner's fork (`slmp` 0.2.1, see the workspace
 //! `Cargo.toml`), which exposes `SlmpError::Device { end_code }` as its own
 //! enum variant - [`classify_slmp_error`] is now a plain structural `match`,
 //! no string parsing anywhere in this module. The coupling to the wrapped

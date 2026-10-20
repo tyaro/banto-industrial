@@ -336,7 +336,7 @@ async fn a_malformed_frame_is_fatal_and_tears_down_the_connection() {
             &[slmp::TypedData::U16(1)],
         )
         .await
-        .expect_err("a length-inconsistent frame must surface as an Err");
+        .expect_err("a malformed (corrupted response code) frame must surface as an Err");
     assert!(
         matches!(raw_err, slmp::SlmpError::Framing(_)),
         "expected SlmpError::Framing(_), got {raw_err:?}"
@@ -349,7 +349,7 @@ async fn a_malformed_frame_is_fatal_and_tears_down_the_connection() {
     let err = client
         .write_batch(&[word("D0", DataType::U16, 1.0)])
         .await
-        .expect_err("a length-inconsistent frame must fail the whole call");
+        .expect_err("a malformed (corrupted response code) frame must fail the whole call");
     assert!(matches!(err, PlcWriteError::Protocol(_)), "got {err:?}");
     assert!(err.is_connection_fatal());
 

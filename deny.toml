@@ -105,7 +105,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # banto-core / banto-storage / banto-server(Cargo.toml 参照、tag = "v1.1.0")と、
-# slmp(Cargo.toml 参照、tag = "v0.2.0" - H9、docs/h9-slmp-structured-error-spec.md、
+# slmp(Cargo.toml 参照、tag = "v0.2.1" - H9、docs/h9-slmp-structured-error-spec.md、
 # 2026-08-12: crates.io 版 0.1.x はエラーを std::io::Error 一本化でしか露出せず、
 # 構造化エラー(SlmpError::{Device,Framing,Timeout,NotConnected,Io})を実装した
 # オーナーのフォークへ移行)を許可する。".git" 有無はどちらでも cargo 側の
