@@ -18,10 +18,11 @@ banto-collect = { path = "../banto-collect" }
 # R1-4a: `builtin().broker` の 2 行（`("slmp", ..)`・`("modbus-tcp", ..)`）。
 banto-driver-slmp = { path = "../banto-driver-slmp" }
 banto-driver-modbus = { path = "../banto-driver-modbus" }
+# R1-4b: `settings_from_connection(&PlcConnection)`、トリップワイヤ（`ALLOWED_PROTOCOLS`）。
+banto-tags = { path = "../banto-tags" }
 
 [dev-dependencies]
 banto-plc = { path = "../banto-plc" }
 # examples/real_plc_verify.rs（R1-4a で banto-broker から移した実機検証ツール）。
 banto-plc-write = { path = "../banto-plc-write" }
-banto-tags = { path = "../banto-tags" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

@@ -30,16 +30,30 @@
 //! in-memory fake; the tests that pin down SLMP's behaviour *through* the
 //! broker live in this crate's `tests/broker.rs`.
 //!
-//! ## Not here yet
+//! ## The `banto-driver-api` side (R1-4b)
 //!
-//! The `banto-driver-api` side (`DriverBase`: identity, settings validation,
-//! `parse_address` over `Address::parse_slmp`, the `cpu` setting) is R1-4b.
+//! - [`SlmpDriver`] / [`driver`] (`base.rs`): the [`banto_driver_api::DriverBase`]
+//!   implementation - identity, `validate_config`, the `cpu` setting (#605), `parse_address`
+//!   over `Address::parse_slmp`, and `offset_address` / `address_help` ported from the
+//!   TypeScript (`continuousRegistration.ts`, `tagAddressHelp.ts`). The
+//!   composition root registers it as `DriverKind::HostBound`: the I/O stays
+//!   behind [`dial`].
+//! - [`classify_read`] / [`classify_write`] (`classify.rs`): the §3.4 table
+//!   from `PlcError` / `PlcWriteError` to `ItemError` / `FatalError`.
+//!
+//! Neither is on the production path in R1 (design §3.3, §6.2): only the
+//! tripwire and conformance tests read them.
 
 use banto_broker::{parse_word_order, DriverDial};
 use banto_plc::{SlmpConfig, SlmpCpu};
 use banto_tags::PlcConnection;
 
+mod base;
+mod classify;
 mod session;
+
+pub use base::{driver, SlmpDriver};
+pub use classify::{classify_read, classify_write};
 
 /// The protocol string (`PlcConnection::protocol`) this driver serves - the
 /// id `banto-drivers` registers [`dial`] under.

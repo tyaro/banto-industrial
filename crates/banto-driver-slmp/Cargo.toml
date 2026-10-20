@@ -4,7 +4,8 @@
 # （`("slmp", banto_driver_slmp::dial)`）として、組み立て役 `banto-drivers` が注入する。
 # 依存の向きはドライバ → broker だけ（broker はこの crate に dev-dependency でも
 # 依存しない。循環と二重コンパイルを避ける）。内部 crate（`publish = false`）。
-# `DriverBase` の実装（`banto-driver-api`）は R1-4b で足す。
+# R1-4b: `DriverBase` の実装（`src/base.rs`）と `classify_read` / `classify_write`
+# （`src/classify.rs`）を足した（`banto-driver-api` は通常の依存）。
 [package]
 name = "banto-driver-slmp"
 description = "R1-4a: SLMP ドライバ（banto-broker の BrokerSession 実装と dial）(docs/banto-driver-api-design.md §4.4)"
@@ -14,6 +15,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# R1-4b: `DriverBase` の実装・`ItemError` / `FatalError`（`src/base.rs`・`src/classify.rs`）と、
+# tests/broker.rs の `DriverTable::new` のキー（`DriverId`）。
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
 # `BrokerSession` / `Connector` / `SessionError` / `DriverDial`（R1-2 / R1-3a で pub）。
 banto-broker = { path = "../banto-broker" }
 # 読み取りの計画・実行（`plan_slmp_batch` / `execute_slmp_batch_reads`）と
@@ -28,9 +32,6 @@ banto-tags = { path = "../banto-tags" }
 slmp = { workspace = true }
 
 [dev-dependencies]
-# tests/broker.rs: `DriverTable::new` のキー（`DriverId`）。`DriverBase` を実装する R1-4b で
-# 通常の依存になる。
-banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # tests/broker.rs: broker 経由の読み書きを in-process の SLMP シミュレータで確かめる
 # （broker の単体テストから移したもの。§4.4 の表）。

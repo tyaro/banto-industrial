@@ -202,6 +202,11 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 /// `banto-hub` bin, the shell, tests) builds this from
 /// `banto_drivers::builtin()` and hands it in through `HubConfig::drivers` /
 /// [`HubSessions::new`]. Cheap to clone.
+///
+/// `registry` is `builtin().registry` (R1-4b: `modbus-tcp` / `slmp` as
+/// `HostBound` entries, the same ids as `broker`). R1 reads it nowhere on the
+/// production path (design §6.2: `broker.is_supported` stays the gate); only
+/// `banto-drivers`' tripwire tests do.
 #[derive(Clone)]
 pub struct HubDrivers {
     pub registry: Arc<DriverRegistry>,
