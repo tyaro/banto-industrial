@@ -1,0 +1,37 @@
+# R1-4a（docs/banto-driver-api-design.md §2.3・§4.4・§10）: MELSEC SLMP の R1 の
+# 薄いアダプター。`banto-broker` の `src/slmp_driver.rs` と `slmp_config_for` を
+# `git mv` で移したもの（中身は不変）。broker の `DriverTable` の 1 行
+# （`("slmp", banto_driver_slmp::dial)`）として、組み立て役 `banto-drivers` が注入する。
+# 依存の向きはドライバ → broker だけ（broker はこの crate に dev-dependency でも
+# 依存しない。循環と二重コンパイルを避ける）。内部 crate（`publish = false`）。
+# `DriverBase` の実装（`banto-driver-api`）は R1-4b で足す。
+[package]
+name = "banto-driver-slmp"
+description = "R1-4a: SLMP ドライバ（banto-broker の BrokerSession 実装と dial）(docs/banto-driver-api-design.md §4.4)"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `BrokerSession` / `Connector` / `SessionError` / `DriverDial`（R1-2 / R1-3a で pub）。
+banto-broker = { path = "../banto-broker" }
+# 読み取りの計画・実行（`plan_slmp_batch` / `execute_slmp_batch_reads`）と
+# `dial_slmp`・`SlmpConfig`。
+banto-plc = { path = "../banto-plc" }
+# 書き込みの計画・実行（`plan_slmp_write_batch` / `execute_slmp_writes`）。
+banto-plc-write = { path = "../banto-plc-write" }
+# 接続定義の型（`PlcConnection`）。`dial` の引数。
+banto-tags = { path = "../banto-tags" }
+# セッションが持つ bare `slmp::SLMPClient`（broker から移した理由は
+# banto-broker の src/lib.rs 冒頭 doc の「Why a new trait」節）。
+slmp = { workspace = true }
+
+[dev-dependencies]
+# tests/broker.rs: `DriverTable::new` のキー（`DriverId`）。`DriverBase` を実装する R1-4b で
+# 通常の依存になる。
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# tests/broker.rs: broker 経由の読み書きを in-process の SLMP シミュレータで確かめる
+# （broker の単体テストから移したもの。§4.4 の表）。
+banto-plc-write = { path = "../banto-plc-write", features = ["simulator"] }

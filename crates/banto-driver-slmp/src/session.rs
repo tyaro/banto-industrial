@@ -1,17 +1,18 @@
-//! The SLMP [`crate::session::BrokerSession`] implementation - the first
-//! driver [`crate::DriverTable::builtin`] registers. See `lib.rs`'s module doc
-//! ("Protocol abstraction (I9 / Issue #130)") for why this crate is
-//! organized as a generic job loop/reconnect state machine plus a
-//! per-protocol driver module like this one, and `session.rs`'s module doc
-//! for the trait contract this module must uphold.
+//! The SLMP [`banto_broker::BrokerSession`] implementation (moved here from
+//! `banto-broker`'s `src/slmp_driver.rs` by R1-4a,
+//! docs/banto-driver-api-design.md §4.4 - unchanged). See `banto-broker`'s
+//! module doc ("Protocol abstraction (I9 / Issue #130)") for why the broker
+//! is organized as a generic job loop/reconnect state machine plus a
+//! per-protocol driver like this one, and `banto-broker`'s `session.rs`
+//! module doc for the trait contract this module must uphold.
 //!
 //! [`SlmpSession`] is a thin adapter: it owns exactly the bare
-//! `slmp::SLMPClient` [`crate::ConnState::Connected`] held directly before
-//! this refactor, plus the `word_order` that client's decode/encode side
+//! `slmp::SLMPClient` the broker's `ConnState::Connected` held directly before
+//! #130, plus the `word_order` that client's decode/encode side
 //! needs, and forwards `read_batch`/`write_batch` to the same
 //! `banto_plc::plan_slmp_batch` / `execute_slmp_batch_reads` and
 //! `banto_plc_write::plan_slmp_write_batch` / `execute_slmp_writes` calls
-//! [`crate::run_broker_task`]'s job loop used to make directly - moved here,
+//! the broker's job loop used to make directly - moved here,
 //! not changed, so this extraction is behavior-preserving by construction.
 
 use banto_plc::{
@@ -20,7 +21,7 @@ use banto_plc::{
 };
 use banto_plc_write::{execute_slmp_writes, plan_slmp_write_batch, BatchWriteRequest, WriteResult};
 
-use crate::session::{BrokerSession, Connector, SessionError};
+use banto_broker::{BrokerSession, Connector, SessionError};
 
 /// One live SLMP session: a bare `slmp::SLMPClient` plus the `word_order`
 /// its 32-bit numeric decode/encode needs (`word_order` does not affect
@@ -28,8 +29,8 @@ use crate::session::{BrokerSession, Connector, SessionError};
 /// Not boxed internally (unlike the pre-#130 `ConnState::Connected(Box<
 /// slmp::SLMPClient>)`): `Box<dyn BrokerSession>` already puts this whole
 /// struct - large receive buffer included - on the heap, so a second,
-/// SLMP-specific `Box` here would be redundant. See `lib.rs`'s `ConnState`
-/// doc comment.
+/// SLMP-specific `Box` here would be redundant. See `banto-broker`'s
+/// `ConnState` doc comment.
 pub(crate) struct SlmpSession {
     client: slmp::SLMPClient,
     word_order: WordOrder,
@@ -66,9 +67,9 @@ impl BrokerSession for SlmpSession {
 }
 
 /// Build this connection's [`Connector`] from its [`SlmpConfig`] (see
-/// [`crate::slmp_config_for`]) - what the SLMP entry of
-/// [`crate::DriverTable::builtin`] ([`crate::dial_slmp`]) dials, and
-/// [`crate::spawn_task_with_connector`] then runs.
+/// [`crate::slmp_config_for`]) - what [`crate::dial`] (this driver's
+/// `banto_broker::DriverTable` entry) hands the broker, which then runs it in
+/// the connection's broker task.
 ///
 /// Dials through [`banto_plc::dial_slmp`], the one shared implementation of
 /// the connect sequence (build a bare `slmp::SLMPClient` from
@@ -82,8 +83,8 @@ impl BrokerSession for SlmpSession {
 /// shareable, is what happens to the client *after* the dial: this broker
 /// wraps it in [`SlmpSession`] rather than handing it to `SlmpClient`'s or
 /// `SlmpWriteClient`'s own private `Option<slmp::SLMPClient>`, so `read_batch`
-/// and `write_batch` can borrow the *same* session - see `session.rs`'s
-/// module doc, "Why one trait with both `read_batch` and `write_batch`".
+/// and `write_batch` can borrow the *same* session - see `banto-broker`'s
+/// `session.rs` module doc, "Why one trait with both `read_batch` and `write_batch`".
 ///
 /// `config` is captured by the returned closure (called again on every
 /// reconnect attempt) and cloned into each individual connect attempt's

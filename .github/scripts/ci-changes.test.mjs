@@ -45,7 +45,18 @@ const G = {
 		},
 		// R1-3b: ホストが注入する組み込みドライバ一式。bin（core パッケージ内）・shell・
 		// sink のテストが使う（G には写していない broker / collect にも依存する）。
-		{ name: 'banto-drivers', dir: 'crates/banto-drivers', deps: ['banto-driver-api'] },
+		// R1-4a: broker の表の 2 行を、下の 2 つのドライバ crate の `dial` で組む。
+		{
+			name: 'banto-drivers',
+			dir: 'crates/banto-drivers',
+			deps: ['banto-driver-api', 'banto-driver-modbus', 'banto-driver-slmp']
+		},
+		// R1-4a: banto-broker から移した SLMP / Modbus TCP のドライバ（内部 crate）。driver-api は
+		// dev-dependency。banto-plc・banto-tags・broker・plc-write にも依存するが、G には写して
+		// いない（banto-plc / banto-tags の行の期待を R1-6 まで揺らさないため。banto-drivers が
+		// broker / collect を写していないのと同じ扱い）。
+		{ name: 'banto-driver-modbus', dir: 'crates/banto-driver-modbus', deps: ['banto-driver-api'] },
+		{ name: 'banto-driver-slmp', dir: 'crates/banto-driver-slmp', deps: ['banto-driver-api'] },
 		{
 			name: 'banto-plc',
 			dir: 'crates/banto-plc',
@@ -334,7 +345,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-api -p banto-driver-conformance -p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink -p banto-plc',
+				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-shell -p banto-hub-sink -p banto-plc',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,

@@ -1,7 +1,8 @@
 # R1-3b（docs/banto-driver-api-design.md §2・§6.3・§6.4・§10）: ホスト（banto-hub の
 # bin・shell・sink のテスト）が組み立てるドライバ一式 `Builtin`。ドライバを増やす・
 # 差し替えるときに触る場所を、この crate 1 つにする。内部 crate（`publish = false`）。
-# R1-4 でドライバ本体が別 crate へ出ても、ホストはここだけを見る。
+# R1-4a でドライバ本体が別 crate（banto-driver-slmp / -modbus）へ出た。ホストは
+# 今もここだけを見る。
 [package]
 name = "banto-drivers"
 description = "R1-3b: ホストが注入する組み込みドライバ一式（broker の DriverTable・収集の ClientFactory・DriverRegistry）(docs/banto-driver-api-design.md §6)"
@@ -14,6 +15,13 @@ publish.workspace = true
 banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
 banto-broker = { path = "../banto-broker" }
 banto-collect = { path = "../banto-collect" }
+# R1-4a: `builtin().broker` の 2 行（`("slmp", ..)`・`("modbus-tcp", ..)`）。
+banto-driver-slmp = { path = "../banto-driver-slmp" }
+banto-driver-modbus = { path = "../banto-driver-modbus" }
 
 [dev-dependencies]
 banto-plc = { path = "../banto-plc" }
+# examples/real_plc_verify.rs（R1-4a で banto-broker から移した実機検証ツール）。
+banto-plc-write = { path = "../banto-plc-write" }
+banto-tags = { path = "../banto-tags" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

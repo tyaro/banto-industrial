@@ -26,9 +26,9 @@
 //! ## 実行方法
 //!
 //! ```text
-//! cargo run -p banto-broker --example real_plc_verify
-//! REAL_PLC_CONFIRM_WRITE=1 cargo run -p banto-broker --example real_plc_verify
-//! cargo run -p banto-broker --example real_plc_verify -- --host 192.168.1.50 --port 5007 --cpu q --safe-d 1000-1099 --safe-m 200-299
+//! cargo run -p banto-drivers --example real_plc_verify
+//! REAL_PLC_CONFIRM_WRITE=1 cargo run -p banto-drivers --example real_plc_verify
+//! cargo run -p banto-drivers --example real_plc_verify -- --host 192.168.1.50 --port 5007 --cpu q --safe-d 1000-1099 --safe-m 200-299
 //! ```
 //!
 //! `--cpu q` などで既定の R 機から外れたときは、書き込みだけでなく読み取りも
@@ -38,7 +38,8 @@
 
 use std::time::Duration;
 
-use banto_broker::{BackoffConfig, BrokerError, BrokerSupervisor, DriverTable};
+use banto_broker::{BackoffConfig, BrokerError, BrokerSupervisor};
+use banto_drivers::builtin;
 use banto_plc::{
     Address, BatchReadRequest, BatchReadResult, DataType, PlcClient, PlcValue, ReadRequest,
     ReadResult, SlmpClient, SlmpConfig, SlmpCpu, StringReadRequest, TagValue,
@@ -876,12 +877,9 @@ async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
         password: None,
     };
 
-    let supervisor = BrokerSupervisor::spawn(
-        &[connection],
-        BackoffConfig::default(),
-        DriverTable::builtin(),
-    )
-    .map_err(|e| format!("broker spawn 失敗: {e}"))?;
+    let supervisor =
+        BrokerSupervisor::spawn(&[connection], BackoffConfig::default(), builtin().broker)
+            .map_err(|e| format!("broker spawn 失敗: {e}"))?;
     let handle = supervisor
         .handle(1)
         .ok_or_else(|| "broker handle が見つかりません".to_string())?;

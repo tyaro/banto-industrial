@@ -1,18 +1,19 @@
-//! The Modbus TCP [`crate::session::BrokerSession`] implementation - the
-//! second driver [`crate::DriverTable::builtin`] registers (#131, 2026-09-01). See
-//! `lib.rs`'s module doc ("Protocol abstraction (I9 / Issue #130)") for why
-//! this crate is organized as a generic job loop/reconnect state machine plus
-//! a per-protocol driver module like this one, and `session.rs`'s module doc
-//! for the trait contract this module must uphold - especially the `Err` =
-//! connection-fatal rule, which (unlike [`crate::slmp_driver::SlmpSession`])
+//! The Modbus TCP [`banto_broker::BrokerSession`] implementation (#131,
+//! 2026-09-01; moved here from `banto-broker`'s `src/modbus_driver.rs` by
+//! R1-4a, docs/banto-driver-api-design.md §4.4 - unchanged). See
+//! `banto-broker`'s module doc ("Protocol abstraction (I9 / Issue #130)") for
+//! why the broker is organized as a generic job loop/reconnect state machine
+//! plus a per-protocol driver like this one, and [`banto_broker::BrokerSession`]'s
+//! module doc for the trait contract this module must uphold - especially the
+//! `Err` = connection-fatal rule, which (unlike `banto-driver-slmp`'s `SlmpSession`)
 //! this driver does **not** get for free: `banto_plc::execute_modbus_reads`
 //! and `banto_plc_write::execute_modbus_writes` already fold a Modbus
 //! exception response into a per-request `Bad`, but the manual `String`/
 //! `BitInWord` splitting [`ModbusSession::write_batch`] does below is new
 //! code this driver is responsible for getting right.
 //!
-//! [`ModbusSession`] mirrors [`crate::slmp_driver::SlmpSession`]'s shape: it
-//! owns the one live `TcpStream` [`crate::ConnState::Connected`] holds for a
+//! [`ModbusSession`] mirrors `banto-driver-slmp`'s `SlmpSession` shape: it
+//! owns the one live `TcpStream` the broker's `ConnState::Connected` holds for a
 //! Modbus connection, plus everything `banto_plc::execute_modbus_reads` and
 //! `banto_plc_write::execute_modbus_writes` need between calls. See
 //! [`ModbusSession::next_transaction_id`]'s own doc comment for the single
@@ -31,12 +32,12 @@ use banto_plc_write::{
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::session::{BrokerSession, Connector, SessionError};
+use banto_broker::{BrokerSession, Connector, SessionError};
 
 /// One live Modbus TCP session: a bare `TcpStream` plus everything
 /// `banto_plc::execute_modbus_reads`/`banto_plc_write::execute_modbus_writes`
 /// need between calls. Not boxed internally, for the same reason
-/// [`crate::slmp_driver::SlmpSession`] is not: `Box<dyn BrokerSession>`
+/// `banto-driver-slmp`'s `SlmpSession` is not: `Box<dyn BrokerSession>`
 /// already puts this whole struct on the heap.
 pub(crate) struct ModbusSession {
     stream: TcpStream,
@@ -66,8 +67,8 @@ pub(crate) struct ModbusSession {
     /// counter instead of the request rate.
     ///
     /// [`ModbusSession`] is the single owner of the one physical `TcpStream`
-    /// for this connection's whole lifetime (this crate's core invariant -
-    /// see `lib.rs`'s "Message shape and how serialization is guaranteed"
+    /// for this connection's whole lifetime (the broker's core invariant -
+    /// see `banto-broker`'s "Message shape and how serialization is guaranteed"
     /// section: one `Box<dyn BrokerSession>` per connection, and read/write
     /// jobs never run concurrently against it), so keeping exactly one
     /// `next_transaction_id` field here - threaded by `&mut` into both
@@ -190,9 +191,9 @@ impl BrokerSession for ModbusSession {
 }
 
 /// Build this connection's [`Connector`] from its [`ModbusTcpConfig`] (see
-/// [`crate::modbus_config_for`]) - what the `"modbus-tcp"` entry of
-/// [`crate::DriverTable::builtin`] ([`crate::dial_modbus`]) dials, and
-/// [`crate::spawn_task_with_connector`] then runs.
+/// [`crate::modbus_config_for`]) - what [`crate::dial`] (this driver's
+/// `banto_broker::DriverTable` entry) hands the broker, which then runs it in
+/// the connection's broker task.
 ///
 /// Dials through [`banto_plc::dial_modbus`], the one shared implementation of
 /// the Modbus TCP connect sequence (H9 transport 共通化,
@@ -203,7 +204,7 @@ impl BrokerSession for ModbusSession {
 /// `ModbusTcpClient`'s or `ModbusWriteClient`'s own private
 /// `Option<TcpStream>`, so `read_batch` and `write_batch` can borrow the
 /// *same* session and share the *same* transaction-id counter - see
-/// `session.rs`'s module doc, "Why one trait with both `read_batch` and
+/// `banto-broker`'s `session.rs` module doc, "Why one trait with both `read_batch` and
 /// `write_batch`", and [`ModbusSession::next_transaction_id`]'s own doc
 /// comment.
 pub(crate) fn connector(config: ModbusTcpConfig) -> Connector {

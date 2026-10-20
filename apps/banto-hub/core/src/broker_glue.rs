@@ -921,10 +921,11 @@ impl Default for BrokerSimRegistry {
 /// through a 1-second reconnect/immediate-disconnect loop (observed with a
 /// TCP proxy). Sharing one session - which is the whole reason the broker
 /// exists ("読み書き単一セッション", §6-5) - is what fixes it, and Modbus
-/// needs no new machinery for it: `banto_broker`'s `ModbusSession`
+/// needs no new machinery for it: the broker's `ModbusSession`
 /// implements `BrokerSession::read_batch` with the very same
 /// `plan_batch_requests` + `execute_modbus_reads` pair the direct
-/// `ModbusTcpClient` uses (`crates/banto-broker/src/modbus_driver.rs`), so
+/// `ModbusTcpClient` uses (`crates/banto-driver-modbus/src/session.rs`, moved
+/// out of `banto-broker` by R1-4a), so
 /// coil/discrete-input/word-bit/32bit/64bit reads all decode identically.
 ///
 /// **The tradeoff this accepts**: collection reads and writes for one Modbus
