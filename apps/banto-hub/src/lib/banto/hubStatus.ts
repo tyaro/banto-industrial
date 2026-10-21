@@ -34,6 +34,7 @@
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
+import type { SecretStorageEntry } from './secretStorageView';
 
 /** `GET /api/status` の `connections` 配列1件分。サーバーは
  * `simulation`/`configuredSimulation`/`effectiveSimulation` も返すが、この
@@ -119,6 +120,10 @@ export interface DbSourceStatusEntry {
 	restarts: number;
 	last_restart_reason: string | null;
 	groups: DbSourceGroupStatusEntry[];
+	/** R2b-1e: 保存したパスワードを読めないとき `unreadable`。古いサーバーは返さない。 */
+	password_state?: 'unreadable' | null;
+	/** R2b-1e: 読めない理由（`missing`/`undecryptable`/`invalid`）。 */
+	password_unreadable_reason?: 'missing' | 'undecryptable' | 'invalid' | null;
 }
 
 /**
@@ -251,6 +256,8 @@ export interface StatusResponse {
 	ingest: IngestStatusEntry[];
 	/** S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: DB Sink サイドカーの運転状態。 */
 	sink: SinkStatusEntry;
+	/** R2b-1e（接続設定の設計 §5.8・§6.5）: 秘密値の保存方式と警告。古いサーバーは返さない。 */
+	secret_storage?: SecretStorageEntry;
 }
 
 /** サーバーの camelCase 応答（`AdminDbSourceGroupStatusEntry`）の生形。 */
@@ -295,6 +302,16 @@ interface RawDbSourceStatusEntry {
 	restarts: number;
 	lastRestartReason: string | null;
 	groups: RawDbSourceGroupStatusEntry[];
+	passwordState?: 'unreadable' | null;
+	passwordUnreadableReason?: 'missing' | 'undecryptable' | 'invalid' | null;
+}
+
+/** サーバーの camelCase 応答（`AdminSecretStorageEntry`）の生形。 */
+interface RawSecretStorageEntry {
+	scheme: string;
+	plaintextWarning: string | null;
+	plaintextRemaining: number;
+	plaintextRemainingWarning: string | null;
 }
 
 /** サーバーの camelCase 応答（`AdminIngestSenderStatusEntry`）の生形。 */
@@ -357,6 +374,8 @@ interface RawStatusResponse {
 	/** R2a-2e。古いサーバーは返さないので省略を許す（空配列として扱う）。 */
 	ingest?: RawIngestStatusEntry[];
 	sink: RawSinkStatusEntry;
+	/** R2b-1e。古いサーバーは返さないので省略を許す。 */
+	secretStorage?: RawSecretStorageEntry;
 }
 
 /** R2a-2e: `ingest` 1 件を snake_case の公開形へ。 */
@@ -434,7 +453,9 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 				last_ok_at: group.lastOkAt,
 				last_error: group.lastError,
 				row_count_last: group.rowCountLast
-			}))
+			})),
+			password_state: entry.passwordState ?? null,
+			password_unreadable_reason: entry.passwordUnreadableReason ?? null
 		})),
 		ingest: (raw.ingest ?? []).map(fromRawIngestStatus),
 		sink: {
@@ -450,7 +471,15 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 				last_flush_at: group.lastFlushAt,
 				last_error: group.lastError
 			}))
-		}
+		},
+		secret_storage: raw.secretStorage
+			? {
+					scheme: raw.secretStorage.scheme,
+					plaintext_warning: raw.secretStorage.plaintextWarning ?? null,
+					plaintext_remaining: raw.secretStorage.plaintextRemaining ?? 0,
+					plaintext_remaining_warning: raw.secretStorage.plaintextRemainingWarning ?? null
+				}
+			: undefined
 	};
 }
 
