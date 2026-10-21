@@ -112,40 +112,58 @@ async fn pending_apply_rejects_a_queued_hub_connection() {
     assert_eq!(rows, 0);
 }
 
-// --- R2a-2a: `push` 接続（docs/banto-hub-ingest-design.md §3.1） -------------
+// --- R2a-2a / R2a-1c: `push` 接続（docs/banto-hub-ingest-design.md §3.1・§4.2） ----
 //
-// REST は `push` を `hub` のように入口で断らない（Hub が作る種類、§1.4）。ただし受信
-// （`IngestHub`）を収集に繋ぐのは R2a-1c で、それまで Hub の preflight は厳格版の
-// `build_config_from`（`PushSource::Unavailable`）なので、**有効な** `push` 接続は
-// `pushSourceUnavailable` で保存前に断られる（収集全体を止める行を作らない）。
-// 無効な行は作れる。R2a-1c が Hub を `PushSource::Available` に替えたら、この
-// テストの「有効は 422」を「有効も 200」に書き換えること。
+// REST は `push` を `hub` のように入口で断らない（Hub が作る種類、§1.4）。R2a-2a の
+// 時点では受信（`IngestHub`）が収集に繋がっておらず、preflight（厳格版の
+// `build_config_from`、`PushSource::Unavailable`）が**有効な** `push` 接続を
+// `pushSourceUnavailable` で断っていた。R2a-1c で Hub の計画と preflight を
+// `crate::ingest::build_hub_config`（`PushSource::Available`）に替えたので、有効な
+// `push` 接続も保存でき、収集に載る。
 
-/// 有効な `push` 接続の作成は preflight（`configuration`）で断られ何も書かない。
-/// 無効なら作れ、host/port は正規化される。REST の更新は `settings` を運ばないので、
-/// 保存済みの `settings` を消さない（`PlcConnectionInput::settings` の「省略は保つ」）。
+/// 有効な `push` 接続も作れる（R2a-1c で preflight の拒否を外した）。無効でも作れ、
+/// host/port は正規化される。REST の更新は `settings` を運ばないので、保存済みの
+/// `settings` を消さない（`PlcConnectionInput::settings` の「省略は保つ」）。有効へ
+/// 戻す更新も通る。
 #[tokio::test]
-async fn push_connections_are_held_back_by_preflight_until_the_receiver_exists() {
+async fn push_connections_are_accepted_by_preflight_now_that_the_receiver_exists() {
     let env = test_env().await;
 
     let (status, body) = admin_post(
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "bridge-1", "protocol": "push", "host": "", "port": 0 }),
+        json!({ "name": "bridge-0", "protocol": "push", "host": "", "port": 0 }),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
-    assert_eq!(
-        body["field_errors"][0]["field"], "configuration",
-        "{body:?}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["protocol"], "push");
+    assert_eq!(body["enabled"], true);
     let rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE protocol = 'push'")
             .fetch_one(&env.pool)
             .await
             .unwrap();
-    assert_eq!(rows, 0);
+    assert_eq!(rows, 1);
+    // 収集に載る形（グループとタグ）まで preflight を通る。
+    let (status, group) = admin_post(
+        &env.router,
+        "/api/collection-groups",
+        &env.admin_token,
+        json!({ "name": "g", "plcConnectionId": body["id"], "periodMs": 1000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{group:?}");
+    let (status, tag) = admin_post(
+        &env.router,
+        "/api/tags",
+        &env.admin_token,
+        json!({ "name": "temp", "collectionGroupId": group["id"],
+                "address": " line1.temp ", "dataType": "f32" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tag:?}");
+    assert_eq!(tag["address"], "line1.temp");
 
     let (status, conn) = admin_post(
         &env.router,
@@ -191,9 +209,6 @@ async fn push_connections_are_held_back_by_preflight_until_the_receiver_exists()
                 "enabled": true }),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
-    assert_eq!(
-        body["field_errors"][0]["field"], "configuration",
-        "{body:?}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["enabled"], true);
 }

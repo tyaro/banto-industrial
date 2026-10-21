@@ -10,7 +10,9 @@
 //! 動く**唯一の**もう1つの機構、`crate::db_source::DbSourceEngine` の
 //! 起動・停止点でもある（`CollectionController::db_source` のフィールド
 //! doc comment に、なぜ `CollectorManager` 側ではなくここなのかを書いて
-//! ある）。
+//! ある）。R2a-1c（docs/banto-hub-ingest-design.md §4.5）からは、取り込み口
+//! `push` の受信側 `crate::ingest::IngestHub` の保持値の破棄と epoch も同じ
+//! 遷移に連動する（`CollectionController::ingest` のフィールド doc comment）。
 //!
 //! # 終了の受付（#392 A2 レビュー、2026-10-12）
 //!
@@ -62,6 +64,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db_source::DbSourceEngine;
 use crate::hub::CollectorManager;
+use crate::ingest::IngestHub;
 
 /// A collection lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -172,6 +175,13 @@ pub struct CollectionController {
     /// `commit_catalog` が担当し、走行中なら接続単位の差分で task を
     /// 作り直す - `crate::db_source` のモジュール doc comment 参照）。
     db_source: Arc<DbSourceEngine>,
+    /// R2a-1c（docs/banto-hub-ingest-design.md §4.5）: 取り込み口 `push` の受信側
+    /// （[`CollectorManager::ingest_hub`] の複製）。`db_source` と同じ理由でここから
+    /// 呼ぶ: 収集の**遷移**（[`Self::start_locked`] / [`Self::stop_locked`]）だけが
+    /// 保持値を捨てて epoch を進めてよく、稼働中の再適用
+    /// （[`Self::commit_catalog_and_apply_live`] → `apply_run`）では進めない（値は
+    /// 連続している）。呼ぶ順序はそれぞれの呼び出し点のコメント。
+    ingest: Arc<IngestHub>,
     state: Mutex<ControllerState>,
     transition: AsyncMutex<()>,
     /// #341 レビュー対応2（2026-09-14）: `transition` を保持しているのが
@@ -222,9 +232,11 @@ impl CollectionController {
         };
         let (status_tx, _status_rx) = watch::channel(initial);
         let db_source = manager.db_source_engine();
+        let ingest = manager.ingest_hub();
         Self {
             manager,
             db_source,
+            ingest,
             state: Mutex::new(ControllerState {
                 state: CollectionState::Stopped,
                 mode: RunMode::Configured,
@@ -611,6 +623,13 @@ impl CollectionController {
         }
         self.publish_status();
 
+        // R2a-1c（§4.5「停止前の Good を開始後に戻さない」）: `apply_run` **より前**に
+        // ブリッジの接続の保持値を捨てて epoch を進める。`apply_run` が立てる外部
+        // 接続のタスクは最初の tick を待たずにすぐスナップショットを取って記録する
+        // （`banto_collect` の `run_external_connection`）ので、後に置くと停止中に
+        // 保持した値・停止の前に問い合わせた値が新しい収集の Good として tstore に
+        // 書かれうる。`collecting: true` はまだ知らせない（下の started の枝）。
+        self.ingest.on_collection_starting();
         let result = self.manager.apply_run(mode).await;
 
         let mut state = self
@@ -638,6 +657,10 @@ impl CollectionController {
         // 変わらない」の裏返しで、そもそも Running になっていない。
         if started {
             self.db_source.start();
+            // R2a-1c（§4.5、2026-10-21 再レビュー P2）: Running が確定してから
+            // 送り手へ `state { collecting: true, epoch }` を知らせる。`Faulted` では
+            // 知らせない - ブリッジは `collecting: false` のまま DB へ問い合わせない。
+            self.ingest.on_collection_started();
         }
         self.publish_status();
         Ok(self.status())
@@ -661,6 +684,12 @@ impl CollectionController {
         // これが返った時点で読み手が古い Good を見ることはない。
         self.db_source.stop().await;
         self.manager.stop().await;
+        // R2a-1c（§4.5）: `manager.stop()` の**後**（収集のタスクが join された後）に
+        // 全 `push` 接続の保持値を捨て、ブリッジの接続は epoch を進めて
+        // `state { collecting: false }` を知らせる。`db_source.stop()` と同じく
+        // 「タスクを止めてから捨てる」順序なので、捨てるまでの間に古い Good が
+        // 記録されることも無い。
+        self.ingest.on_collection_stopped();
         self.manager.advance_running_revision();
         let mut state = self
             .state

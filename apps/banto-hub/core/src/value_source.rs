@@ -17,6 +17,11 @@
 //!   しない）。それ以外の既定は `"computed"`。
 //! - `internal`: 常に `"internal"`。
 //! - `db`（2026-09-06、外部 DB 連携 S2）: 常に `"db"`。
+//! - `push` 接続の `plc` タグ（R2a-1c、docs/banto-hub-ingest-design.md §3.3・
+//!   §12 Q14）: 常に `"push"`、`effective_simulation = false`。送り手が送った値で、
+//!   実機の読み取りでもシミュレータの値でもない（`AllSimulation` は Modbus / SLMP
+//!   の接続だけをシミュレータへ切り替え、`push` は受けた値のまま -
+//!   `crate::hub::runtime_snapshot_for_mode`）。
 
 use std::collections::HashSet;
 
@@ -51,7 +56,8 @@ fn effective_simulation_for_tag_inner(
 ) -> bool {
     match entry.tag_kind.as_str() {
         banto_tags::PLC_TAG_KIND => {
-            entry.enabled
+            !entry.push
+                && entry.enabled
                 && runtime.state == CollectionState::Running
                 && (entry.simulation || runtime.mode == RunMode::AllSimulation)
         }
@@ -96,6 +102,9 @@ pub(crate) fn value_source_for_tag(
     computed: &ComputedEngine,
 ) -> &'static str {
     match entry.tag_kind.as_str() {
+        // R2a-1c（§12 Q14）: 送り手が送った値。シミュレーションの判定より先に見る
+        // （`AllSimulation` でも `push` の値はシミュレータの値ではない）。
+        banto_tags::PLC_TAG_KIND if entry.push => "push",
         banto_tags::PLC_TAG_KIND if effective_simulation_for_tag(entry, runtime, map, computed) => {
             "simulation"
         }
