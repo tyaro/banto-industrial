@@ -1035,6 +1035,17 @@ fn api_router_with_controller_mode(
             api_keys.clone(),
             audit.clone(),
         ))
+        // R2a-2d（docs/banto-hub-ingest-design.md §6.1）: 同じ取り込み口の WebSocket の
+        // 送信口 `GET /api/v1/ingest/{id}/stream`。REST と同じ認証の層（経路は `ws`）を
+        // `route_layer` で被せ、upgrade は層を通った後。`Sec-WebSocket-Protocol` からの
+        // トークンの取り出し（`extract_ws_protocol_token`）の対象には入れない。
+        .merge(crate::ingest::ws::ingest_ws_router(
+            manager.ingest_hub(),
+            manager.clock(),
+            auth.clone(),
+            api_keys.clone(),
+            audit.clone(),
+        ))
         .merge(tag_space_router(
             manager,
             controller,

@@ -1198,3 +1198,128 @@ async fn push_tags_report_the_push_value_source() {
     }
     env.finish().await;
 }
+
+// --- WebSocket の登録（R2a-2d、モジュールの doc「WebSocket の 1 本の制限」） -------
+
+/// 1 接続に 1 本: 2 本目の登録で 1 本目に `Superseded` が届き、1 本目からの値・`ping` は
+/// もう入らない（`NotCurrent`）。1 本目の後片付け（`Drop`）は 2 本目の登録を消さない。
+/// commit は改名では閉じさせず、無効化で `ConnectionChanged`、`push` でなくなると
+/// `ConnectionChanged`、削除で `ConnectionRemoved`。その後の登録は断る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_sessions_are_one_per_connection_and_ended_by_commit() {
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    let env = env("ingest-ws-sessions").await;
+    let conn = env.push_connection("P", None).await;
+    let group = env.group(conn, "g", 1000).await;
+    env.tag(group, "t", "k", "f32").await;
+    let bare = env.push_connection("Bare", None).await;
+    env.commit().await;
+    let hub = env.ingest.clone();
+
+    let (mut first, info) = hub.open_ws_session(conn).unwrap();
+    assert_eq!(info.name, "P");
+    assert!(!info.collecting);
+    assert_eq!(first.ended.try_recv(), Err(TryRecvError::Empty));
+    let (mut second, _) = hub.open_ws_session(conn).unwrap();
+    assert_eq!(first.ended.try_recv(), Ok(WsEnd::Superseded));
+    assert_eq!(
+        hub.apply_ws(&first, None, &[value("k", 1.0)], env.now_ms()),
+        Err(WsRefusal::NotCurrent)
+    );
+    assert_eq!(
+        hub.ping_ws(&first, None, env.now_ms()),
+        Err(WsRefusal::NotCurrent)
+    );
+    assert_eq!(
+        hub.apply_ws(&second, None, &[value("k", 2.0)], env.now_ms())
+            .unwrap()
+            .accepted,
+        1
+    );
+    drop(first);
+    assert!(hub.has_ws_session(conn));
+    // REST（番号なし）は WS の有無に関わらず受ける（§13-7）。
+    assert_eq!(
+        env.apply(conn, None, &[value("k", 3.0)]).unwrap().accepted,
+        1
+    );
+
+    // 改名では閉じない（束縛は id）。
+    env.sql(&format!(
+        "UPDATE plc_connections SET name = 'P2' WHERE id = {conn}"
+    ))
+    .await;
+    env.commit().await;
+    assert_eq!(second.ended.try_recv(), Err(TryRecvError::Empty));
+    assert!(hub.ping_ws(&second, None, env.now_ms()).is_ok());
+
+    // 無効化で ConnectionChanged。登録は外れ、無効の間は開けない。
+    env.sql(&format!(
+        "UPDATE plc_connections SET enabled = 0 WHERE id = {conn}"
+    ))
+    .await;
+    env.commit().await;
+    assert_eq!(second.ended.try_recv(), Ok(WsEnd::ConnectionChanged));
+    assert!(!hub.has_ws_session(conn));
+    assert_eq!(
+        hub.open_ws_session(conn).map(|_| ()),
+        Err(ApplyRefusal::ConnectionDisabled)
+    );
+    drop(second);
+
+    // `push` でなくなる（タグの無い接続）: ConnectionChanged。
+    let (mut on_bare, _) = hub.open_ws_session(bare).unwrap();
+    env.sql(&format!(
+        "UPDATE plc_connections SET protocol = 'modbus-tcp', host = '127.0.0.1', port = 502, \
+         enabled = 0 WHERE id = {bare}"
+    ))
+    .await;
+    env.commit().await;
+    assert_eq!(on_bare.ended.try_recv(), Ok(WsEnd::ConnectionChanged));
+
+    // 削除で ConnectionRemoved。その後は開けない。
+    env.sql(&format!(
+        "UPDATE plc_connections SET enabled = 1 WHERE id = {conn}"
+    ))
+    .await;
+    env.commit().await;
+    let (mut third, _) = hub.open_ws_session(conn).unwrap();
+    env.sql("DELETE FROM tags").await;
+    env.sql("DELETE FROM collection_groups").await;
+    env.sql(&format!("DELETE FROM plc_connections WHERE id = {conn}"))
+        .await;
+    env.commit().await;
+    assert_eq!(third.ended.try_recv(), Ok(WsEnd::ConnectionRemoved));
+    assert_eq!(
+        hub.open_ws_session(conn).map(|_| ()),
+        Err(ApplyRefusal::UnknownConnection)
+    );
+    drop(third);
+    drop(on_bare);
+    env.finish().await;
+}
+
+/// `open_ws_session` の `state` は開いた時点の値を既読にしてあり、その後の変化だけが
+/// 届く（`welcome` と `state` の間で通知を取りこぼさず、重ねもしない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ws_session_sees_only_state_changes_after_it_opened() {
+    let env = env("ingest-ws-state").await;
+    let conn = env.push_connection("P", None).await;
+    let group = env.group(conn, "g", 100).await;
+    env.tag(group, "t", "k", "f32").await;
+    env.commit().await;
+    env.start().await;
+    env.stop().await;
+
+    let (mut session, info) = env.ingest.open_ws_session(conn).unwrap();
+    assert!(!info.collecting);
+    assert!(!session.state.has_changed().unwrap());
+    env.start().await;
+    assert!(session.state.has_changed().unwrap());
+    let state = *session.state.borrow_and_update();
+    assert!(state.collecting);
+    assert_eq!(state.epoch, info.epoch);
+    drop(session);
+    env.finish().await;
+}

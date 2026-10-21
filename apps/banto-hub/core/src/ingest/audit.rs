@@ -1,5 +1,5 @@
 //! 送信口の監査（R2a-2c、docs/banto-hub-ingest-design.md §8）。REST と R2a-2d の
-//! WebSocket が同じ関数で記録する。
+//! WebSocket（`super::ws`）が同じ関数で記録する。
 //!
 //! `AuditLogService::record`（DB が応答しないときは保留ファイルへ退避、
 //! `crate::audit_spool`）を使う。`origin` は `"ingest"`、`resource` は `"ingest"`
@@ -16,6 +16,8 @@
 //! | 認証の失敗 | `denied` | 失効・期限切れ・トリップのキー（`resource: "api_keys"`）、`missing_ingest_scope`・`unknown_connection`（`resource: "ingest"`）。存在しないキーは記録しない。**キーごとに 1 時間に 100 行**、超えた分は数だけを 1 行（[`KeyDenialThrottle`]） |
 //! | 未知のキー | `ingest_unknown_key` | (接続, キー) ごとに 1 時間に 1 回。1 時間に 100 キーを超えた分は数だけを 1 行（[`UnknownKeyThrottle`]） |
 //! | 上限の超過 | `ingest_limit_exceeded` / `ingest_limit_cleared` | 超過の始まりと終わりの端だけ（`super::limits`）。**接続ごとに 1 時間に 20 組**、超えた分は組の数だけを 1 行（[`LimitEdgeThrottle`]） |
+//! | WS の接続 | `ingest_connected`（`result: "ok"`） | WS を開いたとき（R2a-2d。REST は記録しない） |
+//! | WS の切断 | `ingest_disconnected`（`result: "ok"`） | WS を閉じたとき。`reason` と受け付けた件数（R2a-2d） |
 //!
 //! ## 監査の行の間引き（2026-10-21 オーナー決定、§8）
 //!
@@ -144,6 +146,8 @@ pub struct IngestAuditRow {
     pub resource: &'static str,
     pub entity_id: String,
     pub detail: Value,
+    /// 監査の `result`（拒否・未知のキー・上限は `denied`、WS の接続・切断は `ok`）。
+    pub result: &'static str,
 }
 
 impl IngestAuditRow {
@@ -154,6 +158,7 @@ impl IngestAuditRow {
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
             detail: ctx.detail(json!({ "reason": reason })),
+            result: "denied",
         }
     }
 
@@ -179,6 +184,7 @@ impl IngestAuditRow {
                 "peer": peer,
                 "transport": transport.as_str(),
             }),
+            result: "denied",
         }
     }
 
@@ -200,6 +206,7 @@ impl IngestAuditRow {
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
             detail,
+            result: "denied",
         }
     }
 
@@ -219,6 +226,7 @@ impl IngestAuditRow {
                 "suppressed": record.suppressed.count,
                 "window_start_ms": record.suppressed.window_start_ms,
             }),
+            result: "denied",
         }
     }
 
@@ -252,6 +260,41 @@ impl IngestAuditRow {
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
             detail,
+            result: "denied",
+        }
+    }
+
+    /// WS を開いた（`ingest_connected`、R2a-2d）。REST は記録しない（要求ごとになる）。
+    pub fn connected(ctx: &IngestAuditContext) -> Self {
+        Self {
+            action: "ingest_connected",
+            resource: RESOURCE,
+            entity_id: ctx.connection_id.to_string(),
+            detail: ctx.detail(json!({})),
+            result: "ok",
+        }
+    }
+
+    /// WS を閉じた（`ingest_disconnected`、R2a-2d）。`reason` は §8 の綴り
+    /// （`client_closed` / `superseded` / `revoked` / `connection_changed` /
+    /// `connection_removed` / `backpressure` / `message_too_big`）、`revoked` のときは
+    /// `revoked_reason`（`api_key_revoked` 等）。`accepted` はこの WS で受け付けた件数。
+    pub fn disconnected(
+        ctx: &IngestAuditContext,
+        reason: &'static str,
+        revoked_reason: Option<&'static str>,
+        accepted: u64,
+    ) -> Self {
+        let mut extra = json!({ "reason": reason, "accepted": accepted });
+        if let (Some(revoked), Value::Object(map)) = (revoked_reason, &mut extra) {
+            map.insert("revoked_reason".into(), json!(revoked));
+        }
+        Self {
+            action: "ingest_disconnected",
+            resource: RESOURCE,
+            entity_id: ctx.connection_id.to_string(),
+            detail: ctx.detail(extra),
+            result: "ok",
         }
     }
 }
@@ -274,7 +317,7 @@ pub async fn record(audit: &AuditLogService, rows: Vec<IngestAuditRow>) {
                     entity_id: Some(&row.entity_id),
                     detail: Some(row.detail),
                     origin: ORIGIN,
-                    result: "denied",
+                    result: row.result,
                 })
                 .await;
         }
@@ -1117,5 +1160,35 @@ mod tests {
         assert_eq!(rows[2].detail["kind"], "items_per_sec");
         assert_eq!(rows[3].action, "ingest_limit_cleared");
         assert_eq!(rows[3].detail["rejected"], 3);
+        for row in &rows {
+            assert_eq!(row.result, "denied");
+        }
+    }
+
+    /// WS の接続・切断（R2a-2d）は `result: "ok"`。切断は理由と受け付けた件数だけで、
+    /// 値は載らない。`revoked` のときだけ理由文が付く。
+    #[test]
+    fn ws_session_rows_are_ok_and_carry_reason_and_count() {
+        let ctx = IngestAuditContext {
+            transport: Transport::Ws,
+            ..ctx()
+        };
+        let connected = IngestAuditRow::connected(&ctx);
+        assert_eq!(
+            (connected.action, connected.result, connected.resource),
+            ("ingest_connected", "ok", "ingest")
+        );
+        assert_eq!(connected.detail["transport"], "ws");
+        let closed = IngestAuditRow::disconnected(&ctx, "superseded", None, 42);
+        assert_eq!(
+            (closed.action, closed.result),
+            ("ingest_disconnected", "ok")
+        );
+        assert_eq!(closed.detail["reason"], "superseded");
+        assert_eq!(closed.detail["accepted"], 42);
+        assert!(closed.detail.get("revoked_reason").is_none());
+        let revoked = IngestAuditRow::disconnected(&ctx, "revoked", Some("api_key_revoked"), 0);
+        assert_eq!(revoked.detail["revoked_reason"], "api_key_revoked");
+        assert_eq!(revoked.entity_id, "12");
     }
 }
