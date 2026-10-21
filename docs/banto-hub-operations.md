@@ -2002,7 +2002,7 @@ Hub で失効してから消してください）。
 
 ```powershell
 $env:SOAK_DURATION_SECS = "259200"
-cargo test -p banto-hub-core --test soak -- --ignored --nocapture
+cargo test -p banto-hub-host --test soak -- --ignored --nocapture
 ```
 
 `--nocapture` を付けると、収集行数・WS `data` 受信数・MQTT publish
