@@ -149,7 +149,13 @@ impl ExternalSnapshot {
 /// the held values. It reports [`ExternalLink::Live`] only when the values it
 /// returns are the source's current ones.
 pub trait ExternalSource: Send + Sync {
-    fn snapshot(&self) -> ExternalSnapshot;
+    /// `connection_key` is the asking connection's `ConnectionPlan.key`
+    /// (`"conn:{id}"`): one source serves every external connection of a
+    /// collector, and each connection task asks with its own key (and keeps
+    /// its own [`LinkTracker`]), so the connections' link states are
+    /// independent. A source with a single link (ChronoGazer's Hub
+    /// subscription) may ignore it.
+    fn snapshot(&self, connection_key: &str) -> ExternalSnapshot;
 }
 
 /// What one tag becomes on one tick (the result of [`classify_external`]).
