@@ -61,7 +61,10 @@ pub const SERVER_STATEMENT_TIMEOUT: Duration = crate::poll::MAX_QUERY_TIMEOUT;
 ///   設定より優先されるので、DBA がロールに設定した、より厳しい値も 30 秒に
 ///   上書きされる。また PgBouncer など一部のプーラーは、
 ///   `ignore_startup_parameters = options` が無いと `options` を起動パラメータ
-///   として拒否する。
+///   として拒否する。その設定で接続が通っても、プーラーは `options` を捨てる
+///   ので**サーバー側の 30 秒の上限は掛からない**（接続を通すことと、上限が
+///   バックエンドに掛かることは別）。プーラー経由では `SHOW statement_timeout`
+///   で確かめる。
 ///
 /// `application_name` は呼び出し側が決める（DBA が `pg_stat_activity` で
 /// 「どのプロセスのどの接続か」を見分けるため。Hub は
