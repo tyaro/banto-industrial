@@ -14,6 +14,10 @@ use super::{
     Router, SingleValueResponse, State, StatusResponse, SwaggerUi, TagEntry, ValueEntry,
     ValuesResponse, WriteValueRequest, WriteValueResponse,
 };
+// R2a-2c（docs/banto-hub-ingest-design.md §6.2）: 取り込み口の REST の送信口。
+use crate::ingest::rest::{__path_v1_ingest_values, IngestRejectedItem, IngestValuesResponse};
+use crate::ingest::validate::IngestValuesMessage;
+use crate::ingest::IngestItem;
 
 // --- OpenAPI 自動生成（設計 §5.1・§10-6、2026-08-04 決定） ------------------
 //
@@ -28,7 +32,7 @@ use super::{
     info(
         title = "banto-hub タグ空間 API",
         version = "v1",
-        description = "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。"
+        description = "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。"
     ),
     paths(
         v1_tags,
@@ -39,6 +43,7 @@ use super::{
         v1_write_values_batch,
         v1_status,
         v1_events,
+        v1_ingest_values,
     ),
     components(schemas(
         TagEntry,
@@ -60,6 +65,10 @@ use super::{
         BatchWriteValueRequest,
         BatchWriteEntryResponse,
         BatchWriteValuesResponse,
+        IngestValuesMessage,
+        IngestItem,
+        IngestValuesResponse,
+        IngestRejectedItem,
     ))
 )]
 pub(super) struct ApiDoc;

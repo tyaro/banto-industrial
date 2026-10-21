@@ -1021,6 +1021,20 @@ fn api_router_with_controller_mode(
             api_keys.clone(),
             auth.clone(),
         ))
+        // R2a-2c（docs/banto-hub-ingest-design.md §6.2）: 取り込み口 `push` の REST の
+        // 送信口 `POST /api/v1/ingest/{id}/values`。`tag_space_router`（`read` を要求する
+        // `require_tag_space_auth`）の下には置かず、専用の認証の層
+        // （`crate::ingest::auth::require_ingest_auth`、API キーの `ingest:#{id}` だけ）と、
+        // このルートだけの本文の上限（1 MiB）を持つ。CSRF レイヤー（`admin`）の外側
+        // （`/api/v1/*` と同じ扱い）。受信側は収集と同じ `IngestHub`
+        // （`manager.ingest_hub()`）。
+        .merge(crate::ingest::rest::ingest_rest_router(
+            manager.ingest_hub(),
+            manager.clock(),
+            auth.clone(),
+            api_keys.clone(),
+            audit.clone(),
+        ))
         .merge(tag_space_router(
             manager,
             controller,

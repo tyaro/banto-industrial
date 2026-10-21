@@ -363,6 +363,125 @@
         ],
         "type": "object"
       },
+      "IngestItem": {
+        "description": "1 件の値。",
+        "properties": {
+          "key": {
+            "description": "タグのキー（送り手が決めた文字列。大文字小文字を区別）。",
+            "type": "string"
+          },
+          "q": {
+            "description": "品質: `good`（省略時）/ `stale` / `bad`。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "t": {
+            "description": "発生時刻（epoch ms、任意）。鮮度・記録の時刻には使わない。",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "v": {
+            "description": "値: 数値・bool（1 / 0）・null。`q` が `good`（省略を含む）なら null は不可。\n`bit` のタグは 0・1・bool だけ。"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      "IngestRejectedItem": {
+        "description": "件ごとに断った 1 件（§6.3）。",
+        "properties": {
+          "code": {
+            "description": "`unknown_key` / `inactive_key` / `not_in_bridge_set` / `duplicate_key` /\n`invalid_value` / `invalid_quality` / `invalid_time`",
+            "type": "string"
+          },
+          "index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "key",
+          "code"
+        ],
+        "type": "object"
+      },
+      "IngestValuesMessage": {
+        "description": "値のメッセージ 1 つ（REST の本文・WebSocket の `values` の中身）。知らない\nフィールドは読み飛ばす。",
+        "properties": {
+          "epoch": {
+            "description": "接続の世代。DB ブリッジの接続では必須で、今の epoch と違えば 409\n`stale_epoch`。一般の送り手では任意（付ければ同じく照合する）。",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "items": {
+            "description": "値（1,000 件まで）。",
+            "items": {
+              "$ref": "#/components/schemas/IngestItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "IngestValuesResponse": {
+        "description": "200 の本文（§6.2）。",
+        "properties": {
+          "accepted": {
+            "description": "受け付けた件数。",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "collecting": {
+            "description": "収集が Running か。停止中も受け付ける（値は収集の開始後に記録される）。",
+            "type": "boolean"
+          },
+          "epoch": {
+            "description": "この接続の今の epoch。ブリッジの接続は次の要求にこれを付ける。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rejected": {
+            "description": "件ごとに断ったもの（メッセージの中の位置・キー・理由）。",
+            "items": {
+              "$ref": "#/components/schemas/IngestRejectedItem"
+            },
+            "type": "array"
+          },
+          "stale_timeout_ms": {
+            "description": "この接続の送り手の途絶の判定時間。これより短い間隔で送る。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accepted",
+          "rejected",
+          "collecting",
+          "epoch",
+          "stale_timeout_ms"
+        ],
+        "type": "object"
+      },
       "LastApplyEntry": {
         "description": "`GET /api/v1/status` の `last_apply`（T7-2、設計 §4.3実装指示「ApplyReport\nの内容を...`/api/v1/status` に出す」）: 直近の `apply_config` 呼び出しの\n結果 - どの接続が追加/削除/入れ替え/無変更だったか、tstore writer が\nローテートしたか。[`banto_collect::ApplyReport`] のワイヤ表現（同クレート\n側は `ToSchema`/`Serialize` を持たない内部型のため、ここで DTO 化する -\nこのファイルの他の DTO（[`ConnectionStatusEntry`] 等）と同じ流儀）。",
         "properties": {
@@ -951,7 +1070,7 @@
     }
   },
   "info": {
-    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。",
+    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -1011,6 +1130,74 @@
         "summary": "`GET /api/v1/events` - range query over `collect_events`, newest first,\ndefault `limit` 100 (clamped to a sane range so a misbehaving client\ncannot force an unbounded scan).",
         "tags": [
           "tag-space"
+        ]
+      }
+    },
+    "/api/v1/ingest/{id}/values": {
+      "post": {
+        "operationId": "v1_ingest_values",
+        "parameters": [
+          {
+            "description": "push 接続の id（10 進の正規形。改名しても変わらない）",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestValuesMessage"
+              }
+            }
+          },
+          "description": "1 MiB まで・1,000 件まで",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestValuesResponse"
+                }
+              }
+            },
+            "description": "受け付けた（一部を断っても 200。件ごとの結果は rejected[]）"
+          },
+          "400": {
+            "description": "invalid_message（JSON・形の誤り）"
+          },
+          "401": {
+            "description": "トークンなし・キーが存在しない / 失効 / 期限切れ"
+          },
+          "403": {
+            "description": "missing_ingest_scope / session_token_cannot_ingest / key_tripped"
+          },
+          "404": {
+            "description": "unknown_connection（パスの形の誤り・接続が無い・push でない）"
+          },
+          "409": {
+            "description": "connection_disabled / stale_epoch（本文の epoch は今の epoch）"
+          },
+          "413": {
+            "description": "body_too_large（本文が 1 MiB を超えた）"
+          },
+          "422": {
+            "description": "too_many_items（1 メッセージ 1,000 件を超えた）"
+          },
+          "429": {
+            "description": "rate_limited（接続ごとの頻度の上限。Retry-After）"
+          }
+        },
+        "summary": "値の一括送信（§6.2）。",
+        "tags": [
+          "ingest"
         ]
       }
     },

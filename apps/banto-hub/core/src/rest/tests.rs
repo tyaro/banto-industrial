@@ -7,6 +7,7 @@ mod common;
 mod general;
 mod hub_connection;
 mod i3_router;
+mod ingest;
 mod postgres_connections;
 mod session_revocation;
 mod sink;
