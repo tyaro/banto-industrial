@@ -13,11 +13,15 @@
 //!    axum の `Json` は使わない（形の誤りが 422 になり、件数の 422
 //!    `too_many_items` と区別できなくなるため）。`Content-Type` は見ない。
 //! 4. 上限（[`IngestHub::admit`]、REST と WS で共有のバケット）: 422
-//!    `too_many_items` / 429 `rate_limited`（`Retry-After`）。超過の端を監査。
+//!    `too_many_items` / 429 `rate_limited`（`Retry-After`）。超過の端を監査
+//!    （接続ごとに 1 時間に 20 組まで、`super::audit::LimitEdgeThrottle`）。
 //! 5. 反映（[`IngestHub::apply`]、1 回の書き込みロック）: 409 `stale_epoch`
 //!    （ブリッジの接続で epoch が無い・古い）、それ以外は 200 と件ごとの結果
 //!    （一部を断っても 200。T20-3a の一括書き込みと同じ）。未知のキーを監査
 //!    （間引き、[`super::audit::UnknownKeyThrottle`]）。
+//!
+//! 層の後で接続が消えた（commit と競った）`unknown_connection` の監査は
+//! [`super::audit::refusal_rows`]（キーごとの間引きを通す、WS と共有）。
 //!
 //! 2〜5 で断ったものは何も反映せず、`last_seen_ms`（§4.3 の Live）も進めない。
 //! 4 で断ったメッセージは頻度のバケットのメッセージを 1 つ使う（`super::limits` の
@@ -42,7 +46,7 @@ use utoipa::ToSchema;
 use crate::api_keys::ApiKeysService;
 use crate::audit::AuditLogService;
 
-use super::audit::{self as ingest_audit, IngestAuditContext, IngestAuditRow, Transport};
+use super::audit::{self as ingest_audit, IngestAuditRow, Transport};
 use super::auth::{error_response, require_ingest_auth, IngestAuthState, IngestCaller};
 use super::limits::{LimitKind, PUSH_LIMITS};
 use super::validate::parse_values_message;
@@ -147,21 +151,6 @@ fn refusal_response(refusal: ApplyRefusal) -> Response {
     }
 }
 
-/// 認証の層を通った後で接続が消えた（commit と競った）ときの監査（§6 の表の
-/// `unknown_connection` と同じ行。名前の控えは無い）。
-fn refusal_audit_rows(ctx: &IngestAuditContext, refusal: ApplyRefusal) -> Vec<IngestAuditRow> {
-    match refusal {
-        ApplyRefusal::UnknownConnection => {
-            let ctx = IngestAuditContext {
-                connection_name: None,
-                ..ctx.clone()
-            };
-            vec![IngestAuditRow::denied(&ctx, refusal.as_str())]
-        }
-        ApplyRefusal::ConnectionDisabled | ApplyRefusal::StaleEpoch { .. } => Vec::new(),
-    }
-}
-
 /// 値の一括送信（§6.2）。
 #[utoipa::path(
     post,
@@ -225,7 +214,8 @@ pub async fn v1_ingest_values(
     let admission = match state.ingest.admit(conn_id, message.items.len(), now_ms) {
         Ok(admission) => admission,
         Err(refusal) => {
-            ingest_audit::record(&state.audit, refusal_audit_rows(&ctx, refusal)).await;
+            let rows = ingest_audit::refusal_rows(&state.ingest, &ctx, refusal, now_ms);
+            ingest_audit::record(&state.audit, rows).await;
             return refusal_response(refusal);
         }
     };
@@ -268,7 +258,12 @@ pub async fn v1_ingest_values(
         Ok(ack) => ack,
         Err(refusal) => {
             let mut rows = edge_rows;
-            rows.extend(refusal_audit_rows(&ctx, refusal));
+            rows.extend(ingest_audit::refusal_rows(
+                &state.ingest,
+                &ctx,
+                refusal,
+                now_ms,
+            ));
             ingest_audit::record(&state.audit, rows).await;
             return refusal_response(refusal);
         }

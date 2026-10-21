@@ -7,7 +7,8 @@
 //!   送れない。
 //! - 上限の境界値（1,000 件・1 MiB・メッセージと件数のバケット）。
 //! - 監査の行（`denied`・`ingest_unknown_key` の抑制・`ingest_limit_exceeded` の端・
-//!   値を載せない）。
+//!   値を載せない）。照合できたキーの `denied` の間引き（キーごとに 1 時間に 100 行、
+//!   窓が明けた後の成功した要求で抑えた数を 1 行、2026-10-21 オーナー決定）。
 //!
 //! 時計は `ManualClock`（バケットの補充と未知のキーの 1 時間の窓を決定的にする）。
 //! 収集は開始しない（`IngestHub::apply` は停止中も受ける、§4.5 Q11）。
@@ -715,4 +716,60 @@ async fn unknown_key_audit_is_throttled_and_carries_no_values() {
         assert!(!text.contains("98765"), "値が監査に載った: {text}");
         assert!(detail.get("v").is_none() && detail.get("items").is_none());
     }
+}
+
+/// 照合できたキーの `denied` の間引き（2026-10-21 オーナー決定、§8）: スコープの無い
+/// 接続へ送り続けるキーの行は 1 時間に 100 行まで。窓が明けた後、そのキーの**成功した**
+/// 要求（拒否でない観測）で抑えた数を 1 行出す（1 回だけ）。
+#[tokio::test]
+async fn key_denials_are_capped_per_key_and_flushed_by_a_later_success() {
+    let clock = Arc::new(ManualClock::new(1_000_000, 0));
+    let env = test_env_with_clock(clock.clone()).await;
+    let a = push_connection(&env, "Bridge1", true).await;
+    let b = push_connection(&env, "Bridge2", true).await;
+    let (key_id, key) = key_with(&env, "only-b", &[&format!("ingest:#{b}")]).await;
+
+    for n in 0..105 {
+        let sent = send_json(&env.router, a, &key, one_item()).await;
+        assert_eq!(sent.status, StatusCode::FORBIDDEN, "{n}");
+        assert_eq!(sent.body["error"], "missing_ingest_scope");
+    }
+    let rows = ingest_audit_rows(&env).await;
+    assert_eq!(rows.len(), 100);
+    assert!(rows
+        .iter()
+        .all(|(action, resource, entity, detail)| action == "denied"
+            && resource == "ingest"
+            && entity.as_deref() == Some(a.to_string().as_str())
+            && detail["reason"] == "missing_ingest_scope"
+            && detail["api_key_id"] == key_id));
+
+    // 窓の中の成功では出さない。
+    let ok = send_json(&env.router, b, &key, one_item()).await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+    assert_eq!(ingest_audit_rows(&env).await.len(), 100);
+
+    clock.advance_ms(3_600_000);
+    let ok = send_json(&env.router, b, &key, one_item()).await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+    let rows = ingest_audit_rows(&env).await;
+    assert_eq!(rows.len(), 101);
+    let (action, resource, entity, detail) = &rows[100];
+    assert_eq!(action, "denied");
+    assert_eq!(resource, "api_keys");
+    assert_eq!(entity.as_deref(), Some(key_id.to_string().as_str()));
+    assert_eq!(
+        detail,
+        &json!({ "reason": "suppressed", "api_key_id": key_id, "api_key_name": "only-b",
+                 "suppressed": 5, "window_start_ms": 1_000_000 })
+    );
+
+    // 二度は出さない。新しい窓ではまた記録する。
+    let ok = send_json(&env.router, b, &key, one_item()).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert_eq!(ingest_audit_rows(&env).await.len(), 101);
+    let denied = send_json(&env.router, a, &key, one_item()).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    assert_eq!(ingest_audit_rows(&env).await.len(), 102);
+    assert_eq!(env.manager.ingest_hub().tracked_key_denials(), 1);
 }
