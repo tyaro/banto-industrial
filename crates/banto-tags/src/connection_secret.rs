@@ -47,10 +47,11 @@ use crate::settings_json::{is_secret_ref, SECRET_REF_KEY};
 /// `lower(hex(randomblob(16)))`、Hub の `secrets::SECRET_REF_LEN` と同じ）。
 pub const SECRET_REF_LEN: usize = 32;
 
-/// 封印の方式 `plain-v1`（blob = UTF-8 の平文。非 Windows と R2b-1d の全 OS、設計 §5.8）。
+/// 封印の方式 `plain-v1`（blob = UTF-8 の平文。Windows 以外の既定、設計 §5.8）。
 pub const SCHEME_PLAIN_V1: &str = "plain-v1";
 
-/// 封印の方式 `dpapi-machine-v1`（blob = DPAPI の machine スコープの暗号文、R2b-1e）。
+/// 封印の方式 `dpapi-machine-v1`（blob = DPAPI の machine スコープの暗号文。R2b-1e から
+/// Windows の既定）。
 pub const SCHEME_DPAPI_MACHINE_V1: &str = "dpapi-machine-v1";
 
 /// `postgres` の秘密のキー（設計 §3.2。`apps/banto-hub/core/src/db_source/driver.rs` の

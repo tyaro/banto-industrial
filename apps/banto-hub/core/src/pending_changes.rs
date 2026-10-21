@@ -4,10 +4,28 @@
 //! このモジュールは「反映エンジン」ではなく「保存・状態遷移・取得」の責務に
 //! 限定する。実行構成への適用（preflight + apply_run）や controller 連携は
 //! `crate::rest`/`crate::controller` 側が後続スライスで担う。
+//!
+//! # 接続のパスワードを平文で持たない（R2b-1e、docs/banto-hub-connection-settings-design.md §5.3）
+//!
+//! `plc_connections.create` / `.update` のペイロード（`{"input": PlcConnectionPayload}`）は
+//! パスワードを持ちうる。R2b-1d までは平文の `input.password` のまま保存していた。R2b-1e から:
+//!
+//! | 場面 | ペイロードの `input` |
+//! | ---- | -------------------- |
+//! | 積む（[`PendingChangesService::create_pending`]、REST・MCP の全入口がここを通る） | 非空の `password` を封印して `sealedPassword`（`crate::secrets::sealed_password_json`）に替える。空文字（消す）と省略・`null`（保つ）はそのまま（秘密ではない） |
+//! | 取り消し・失敗・再投入 | ペイロードごと動く（封印した値のまま。孤児にならない） |
+//! | `applied` / `canceled` へ移す（[`PendingChangesService::mark_applied`]・[`PendingChangesService::cancel_pending`]） | **同じトランザクションで** `password` と `sealedPassword` を外して `passwordSet` に替える（履歴の行に平文も blob も残さない。`plain-v1` の blob は平文そのもの） |
+//! | 応答の写し（`crate::rest` の `redact_pending_change_for_response`） | [`redact_queued_password`]: `password` / `sealedPassword` を外して `passwordSet` |
+//! | 起動時の後処理（`crate::upgrade::secrets_upkeep`） | 未適用（`pending`・`applying`・`failed`）の平文の `password` を封印、`plain-v1` の `sealedPassword` を（protector があれば）封印し直す、履歴から両方を外す |
+//!
+//! 封印は [`crate::secrets::ConnectionSecrets::platform_default`]（Windows は DPAPI）。
 
-use banto_core::BantoError;
+use banto_core::{BantoError, FieldError};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sqlx::SqlitePool;
+
+use crate::secrets::{ConnectionSecrets, SecretError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,7 +149,16 @@ impl PendingChangesService {
         requested_by_username: Option<&str>,
         requested_by_role: Option<&str>,
     ) -> Result<PendingChange, BantoError> {
-        let payload_json = serde_json::to_string(payload).map_err(|err| {
+        // R2b-1e（設計 §5.3）: 接続のパスワードは積む時点で封印する（平文をキューに置かない）。
+        let mut payload = payload.clone();
+        seal_queued_password(&ConnectionSecrets::platform_default(), source, &mut payload)
+            .map_err(|error| BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "password".to_string(),
+                    message: error.to_string(),
+                }],
+            })?;
+        let payload_json = serde_json::to_string(&payload).map_err(|err| {
             BantoError::Other(format!("payload のシリアライズに失敗しました: {err}"))
         })?;
         let id: i64 = sqlx::query_scalar(
@@ -221,7 +248,15 @@ impl PendingChangesService {
     /// 2026-08-12）: 適用時のフィンガープリント不一致で failed になった
     /// 提案を破棄して再作成する運用上の復旧手段。applying/applied からの
     /// キャンセルは引き続き不可。
+    ///
+    /// R2b-1e: `canceled` へ移すのと同じトランザクションで、接続のペイロードから
+    /// `password` と `sealedPassword` を外して `passwordSet` に替える（このモジュールの doc）。
     pub async fn cancel_pending(&self, id: i64) -> Result<PendingChange, BantoError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(banto_storage::storage_error)?;
         let row: Option<PendingRow> = sqlx::query_as(
             "UPDATE pending_changes
              SET
@@ -245,13 +280,17 @@ impl PendingChangesService {
         .bind(id)
         .bind(PendingChangeState::Pending.as_str())
         .bind(PendingChangeState::Failed.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(banto_storage::storage_error)?;
 
         if let Some(row) = row {
+            // R2b-1e（設計 §5.3）: 履歴へ移すのと同じトランザクションでパスワードを外す。
+            let row = strip_history_row(&mut tx, row).await?;
+            tx.commit().await.map_err(banto_storage::storage_error)?;
             return row_to_pending(row);
         }
+        drop(tx);
 
         let current = self.get(id).await?;
         if current.state == PendingChangeState::Canceled {
@@ -348,7 +387,14 @@ impl PendingChangesService {
         )))
     }
 
+    /// R2b-1e: `applied` へ移すのと同じトランザクションで、接続のペイロードから
+    /// `password` と `sealedPassword` を外して `passwordSet` に替える（このモジュールの doc）。
     pub async fn mark_applied(&self, id: i64) -> Result<PendingChange, BantoError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(banto_storage::storage_error)?;
         let row: Option<PendingRow> = sqlx::query_as(
             "UPDATE pending_changes
              SET
@@ -372,13 +418,17 @@ impl PendingChangesService {
         .bind(PendingChangeState::Applied.as_str())
         .bind(id)
         .bind(PendingChangeState::Applying.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(banto_storage::storage_error)?;
 
         if let Some(row) = row {
+            // R2b-1e（設計 §5.3）: 履歴へ移すのと同じトランザクションでパスワードを外す。
+            let row = strip_history_row(&mut tx, row).await?;
+            tx.commit().await.map_err(banto_storage::storage_error)?;
             return row_to_pending(row);
         }
+        drop(tx);
 
         let current = self.get(id).await?;
         Err(BantoError::Other(format!(
@@ -426,6 +476,168 @@ impl PendingChangesService {
             current.state.as_str()
         )))
     }
+}
+
+/// 履歴（`applied` / `canceled`）へ移した直後の行のペイロードからパスワードを外して書き戻す
+/// （呼び出し側のトランザクションの中で）。書き換えたら返す行のペイロードも替える。
+async fn strip_history_row(
+    tx: &mut sqlx::SqliteConnection,
+    mut row: PendingRow,
+) -> Result<PendingRow, BantoError> {
+    let (id, _, ref source, ref payload_text, ..) = row;
+    let Ok(mut payload) = serde_json::from_str::<Value>(payload_text) else {
+        // 読めないペイロードは触らない（`row_to_pending` が同じ理由で失敗を返す）。
+        return Ok(row);
+    };
+    if !strip_queued_password(source, &mut payload) {
+        return Ok(row);
+    }
+    let text = serde_json::to_string(&payload)
+        .map_err(|err| BantoError::Other(format!("payload のシリアライズに失敗しました: {err}")))?;
+    sqlx::query("UPDATE pending_changes SET payload = ? WHERE id = ?")
+        .bind(&text)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    row.3 = text;
+    Ok(row)
+}
+
+// ---- 接続のパスワードのペイロードの扱い（R2b-1e、このモジュールの doc） ---------------------
+
+/// パスワードを持ちうる source（`plc_connections.create` / `.update`）。
+pub const CONNECTION_PASSWORD_SOURCES: [&str; 2] =
+    ["plc_connections.create", "plc_connections.update"];
+
+/// ペイロードの `input` の封印したパスワードのキー（`crate::secrets::sealed_password_json`）。
+pub const SEALED_PASSWORD_FIELD: &str = "sealedPassword";
+const PASSWORD_FIELD: &str = "password";
+const PASSWORD_SET_FIELD: &str = "passwordSet";
+
+/// `source` がパスワードを持ちうる接続の作成・更新か。
+pub fn is_connection_password_source(source: &str) -> bool {
+    CONNECTION_PASSWORD_SOURCES.contains(&source)
+}
+
+fn connection_input_mut<'a>(
+    source: &str,
+    payload: &'a mut Value,
+) -> Option<&'a mut Map<String, Value>> {
+    if !is_connection_password_source(source) {
+        return None;
+    }
+    payload.get_mut("input").and_then(Value::as_object_mut)
+}
+
+/// 積む時点・起動時の後処理（設計 §5.3・§6.5）: `input.password` が非空の文字列なら、
+/// `secrets` で封印して `input.sealedPassword` に替え、`password` を外す。書き換えたら
+/// `true`。空文字（消す）・`null`・省略（保つ）は秘密ではないのでそのまま。
+///
+/// 封印に失敗したら（大きすぎる・乱数源・DPAPI の失敗）ペイロードは変えずに `Err`（値は
+/// 載せない）。
+pub fn seal_queued_password(
+    secrets: &ConnectionSecrets,
+    source: &str,
+    payload: &mut Value,
+) -> Result<bool, SecretError> {
+    let Some(input) = connection_input_mut(source, payload) else {
+        return Ok(false);
+    };
+    let sealed = match input.get(PASSWORD_FIELD) {
+        Some(Value::String(plain)) if !plain.is_empty() => {
+            secrets.seal(banto_tags::PASSWORD_KEY, plain)?
+        }
+        _ => return Ok(false),
+    };
+    input.remove(PASSWORD_FIELD);
+    input.insert(
+        SEALED_PASSWORD_FIELD.to_string(),
+        crate::secrets::sealed_password_json(&sealed),
+    );
+    Ok(true)
+}
+
+/// 起動時の後処理（設計 §6.5、2026-10-21 レビュー P2-3）: `input.sealedPassword` が
+/// `plain-v1` で、`secrets` に protector があれば、**同じ参照のまま**封印し直す。書き換えたら
+/// `true`。protector が無い・`plain-v1` でない・`sealedPassword` が無いなら `false`。
+/// 形が違う・開けないなら `Err`（ペイロードは変えない）。
+pub fn reseal_queued_password(
+    secrets: &ConnectionSecrets,
+    source: &str,
+    payload: &mut Value,
+) -> Result<bool, SecretError> {
+    let Some(input) = connection_input_mut(source, payload) else {
+        return Ok(false);
+    };
+    let Some(value) = input.get(SEALED_PASSWORD_FIELD) else {
+        return Ok(false);
+    };
+    let sealed = crate::secrets::parse_sealed_password(value)?;
+    let Some(resealed) = secrets.reseal_plain(banto_tags::PASSWORD_KEY, &sealed)? else {
+        return Ok(false);
+    };
+    input.insert(
+        SEALED_PASSWORD_FIELD.to_string(),
+        crate::secrets::sealed_password_json(&resealed),
+    );
+    Ok(true)
+}
+
+/// `input` に `password` か `sealedPassword` があれば外して `passwordSet` に替える。
+/// `passwordSet` は、封印した値があれば `true`、`password` が文字列なら非空かどうか、
+/// `null` なら作成は `false`・更新は `null`（「保つ」）、それ以外の値は `false`。
+fn strip_input(source: &str, input: &mut Map<String, Value>) -> bool {
+    let password = input.remove(PASSWORD_FIELD);
+    let sealed = input.remove(SEALED_PASSWORD_FIELD);
+    if password.is_none() && sealed.is_none() {
+        return false;
+    }
+    let password_set = if sealed.is_some() {
+        Value::Bool(true)
+    } else {
+        match password {
+            Some(Value::String(plain)) => Value::Bool(!plain.is_empty()),
+            None | Some(Value::Null) => absent_password_set(source),
+            // 文字列でない不正な値（本来は起こらない）も、値そのものは外へ出さない。
+            Some(_) => Value::Bool(false),
+        }
+    };
+    input.insert(PASSWORD_SET_FIELD.to_string(), password_set);
+    true
+}
+
+/// パスワードの指定が無いときの `passwordSet`: 作成は `false`（無し）、更新は `null`
+/// （「今のパスワードを保つ」。この提案は今の保存状態を持たないので true/false にしない）。
+fn absent_password_set(source: &str) -> Value {
+    if source == "plc_connections.create" {
+        Value::Bool(false)
+    } else {
+        Value::Null
+    }
+}
+
+/// 履歴へ移すとき・起動時の後処理（設計 §5.3・§6.5）: `input` から `password` と
+/// `sealedPassword` の**両方**を外して `passwordSet` に替える。書き換えたら `true`。
+pub fn strip_queued_password(source: &str, payload: &mut Value) -> bool {
+    match connection_input_mut(source, payload) {
+        Some(input) => strip_input(source, input),
+        None => false,
+    }
+}
+
+/// 応答の写し（S1a レビュー対応、R2b-1e で封印した値にも広げた）: `password` と
+/// `sealedPassword` を外して `passwordSet` を出す。どちらも無ければ、`passwordSet` が
+/// 既にある（履歴へ移すときに替えた）ならそのまま、無ければ作成は `false`・更新は `null`。
+/// DB の行は変えない（写しにだけ掛ける）。それ以外の source はそのまま返す。
+pub fn redact_queued_password(source: &str, payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    if let Some(input) = connection_input_mut(source, &mut payload) {
+        if !strip_input(source, input) && !input.contains_key(PASSWORD_SET_FIELD) {
+            input.insert(PASSWORD_SET_FIELD.to_string(), absent_password_set(source));
+        }
+    }
+    payload
 }
 
 #[cfg(test)]
@@ -677,5 +889,204 @@ mod tests {
         assert!(err
             .to_string()
             .contains("pending 状態以外の提案はキャンセルできません"));
+    }
+
+    // ---- R2b-1e（docs/banto-hub-connection-settings-design.md §5.3）--------------------
+
+    const QUEUED_SECRET: &str = "TOPSECRET-queue-pw-5d1e";
+
+    fn create_payload(password: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "input": {
+            "name": "pg", "protocol": "postgres", "host": "db", "port": 5432,
+            "database": "erp", "username": "reader", "password": password
+        }})
+    }
+
+    async fn raw_payload(svc: &PendingChangesService, id: i64) -> String {
+        sqlx::query_scalar("SELECT payload FROM pending_changes WHERE id = ?")
+            .bind(id)
+            .fetch_one(&svc.pool)
+            .await
+            .unwrap()
+    }
+
+    /// 積む時点で封印する: 非空の `password` は `sealedPassword` に替わり、DB の行にも
+    /// 平文が無い。空文字（消す）・`null`（保つ）・接続以外の source はそのまま。
+    #[tokio::test]
+    async fn create_pending_seals_a_connection_password_before_storing_it() {
+        let svc = service().await;
+        let created = svc
+            .create_pending(
+                "plc_connections.create",
+                &create_payload(serde_json::json!(QUEUED_SECRET)),
+                1,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let input = &created.payload["input"];
+        assert!(input.get("password").is_none(), "{input}");
+        let sealed = crate::secrets::parse_sealed_password(&input["sealedPassword"]).unwrap();
+        assert_eq!(
+            sealed.scheme,
+            crate::secrets::ConnectionSecrets::platform_default().seal_scheme()
+        );
+        assert_eq!(
+            crate::secrets::ConnectionSecrets::platform_default()
+                .open(banto_tags::PASSWORD_KEY, &sealed)
+                .unwrap()
+                .as_str(),
+            QUEUED_SECRET
+        );
+        if cfg!(windows) {
+            assert!(!raw_payload(&svc, created.id).await.contains(QUEUED_SECRET));
+        }
+        // The plaintext itself never sits under `password` in the stored row.
+        let raw: serde_json::Value =
+            serde_json::from_str(&raw_payload(&svc, created.id).await).unwrap();
+        assert!(raw["input"].get("password").is_none());
+
+        for (source, payload) in [
+            (
+                "plc_connections.update",
+                create_payload(serde_json::json!("")),
+            ),
+            (
+                "plc_connections.update",
+                create_payload(serde_json::Value::Null),
+            ),
+            (
+                "tags.create",
+                serde_json::json!({ "input": { "password": QUEUED_SECRET } }),
+            ),
+        ] {
+            let created = svc
+                .create_pending(source, &payload, 1, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(created.payload, payload, "{source}");
+        }
+    }
+
+    /// 履歴（`applied`・`canceled`）へ移すと、同じトランザクションで `sealedPassword` と
+    /// `password` が外れて `passwordSet` に替わる（DB の行に平文も blob も残らない）。
+    /// `failed` は未適用なので封印した値のまま。
+    #[tokio::test]
+    async fn moving_to_applied_or_canceled_strips_the_sealed_password() {
+        let svc = service().await;
+        let queue = |svc: &PendingChangesService| {
+            let svc = svc.clone();
+            async move {
+                svc.create_pending(
+                    "plc_connections.create",
+                    &create_payload(serde_json::json!(QUEUED_SECRET)),
+                    1,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let applied = queue(&svc).await;
+        svc.start_applying(applied.id).await.unwrap();
+        let done = svc.mark_applied(applied.id).await.unwrap();
+        let canceled = queue(&svc).await;
+        let gone = svc.cancel_pending(canceled.id).await.unwrap();
+        for row in [&done, &gone] {
+            let input = &row.payload["input"];
+            assert!(input.get("sealedPassword").is_none(), "{input}");
+            assert!(input.get("password").is_none(), "{input}");
+            assert_eq!(input["passwordSet"], serde_json::json!(true));
+            let raw = raw_payload(&svc, row.id).await;
+            assert!(!raw.contains("sealedPassword"), "{raw}");
+            assert!(!raw.contains(QUEUED_SECRET), "{raw}");
+            assert_eq!(svc.get(row.id).await.unwrap().payload, row.payload);
+        }
+
+        let failed = queue(&svc).await;
+        svc.start_applying(failed.id).await.unwrap();
+        let failed = svc.mark_failed(failed.id, "boom").await.unwrap();
+        assert!(failed.payload["input"].get("sealedPassword").is_some());
+        // failed -> canceled strips it too.
+        let canceled = svc.cancel_pending(failed.id).await.unwrap();
+        assert!(canceled.payload["input"].get("sealedPassword").is_none());
+        assert_eq!(
+            canceled.payload["input"]["passwordSet"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// 応答の写し: `password` も `sealedPassword` も外し、`passwordSet` を出す（作成・更新の
+    /// tri-state）。履歴へ移すときに入れた `passwordSet` はそのまま（もう一度掛けても同じ）。
+    #[test]
+    fn redact_queued_password_hides_plaintext_and_sealed_values() {
+        let sealed = crate::secrets::sealed_password_json(
+            &crate::secrets::ConnectionSecrets::new(None)
+                .seal(banto_tags::PASSWORD_KEY, QUEUED_SECRET)
+                .unwrap(),
+        );
+        let cases = [
+            (
+                "plc_connections.create",
+                serde_json::json!({ "sealedPassword": sealed.clone() }),
+                serde_json::json!(true),
+            ),
+            (
+                "plc_connections.update",
+                serde_json::json!({ "sealedPassword": sealed.clone() }),
+                serde_json::json!(true),
+            ),
+            (
+                "plc_connections.create",
+                serde_json::json!({ "password": QUEUED_SECRET }),
+                serde_json::json!(true),
+            ),
+            (
+                "plc_connections.update",
+                serde_json::json!({ "password": "" }),
+                serde_json::json!(false),
+            ),
+            (
+                "plc_connections.update",
+                serde_json::json!({ "password": null }),
+                serde_json::Value::Null,
+            ),
+            (
+                "plc_connections.update",
+                serde_json::json!({}),
+                serde_json::Value::Null,
+            ),
+            (
+                "plc_connections.create",
+                serde_json::json!({}),
+                serde_json::json!(false),
+            ),
+            (
+                "plc_connections.update",
+                serde_json::json!({ "passwordSet": true }),
+                serde_json::json!(true),
+            ),
+        ];
+        for (source, input, want) in cases {
+            let payload = serde_json::json!({ "input": input });
+            let redacted = redact_queued_password(source, &payload);
+            let text = redacted.to_string();
+            assert!(!text.contains(QUEUED_SECRET), "{text}");
+            assert!(!text.contains("sealedPassword"), "{text}");
+            assert_eq!(redacted["input"]["passwordSet"], want, "{source} {payload}");
+            assert_eq!(
+                redact_queued_password(source, &redacted),
+                redacted,
+                "idempotent"
+            );
+        }
+        // Other sources are returned as they are.
+        let other = serde_json::json!({ "input": { "password": "x" } });
+        assert_eq!(redact_queued_password("tags.create", &other), other);
     }
 }

@@ -146,7 +146,29 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
     let mut last_delay: Option<Duration> = None;
 
     loop {
-        match connect(&plan).await {
+        // R2b-1e (design §5.2・§5.4): the plan holds the sealed password; it is opened here,
+        // right before dialling, and dropped once the pool is up. If it cannot be opened
+        // (it opened when the plan was built - this is a DPAPI failure in between), the
+        // connection is **not** dialled with an empty password: its tags read Bad, its
+        // status reads「パスワード: 読めません」, and only the opening is retried with the
+        // usual backoff - never a connection attempt.
+        let password = match open_password(&plan) {
+            Ok(password) => password,
+            Err(reason) => {
+                mark_all_bad(&plan, &deps);
+                attempt = attempt.saturating_add(1);
+                let message = super::plan::unreadable_password_message(reason);
+                deps.status.update_connection(plan.connection_id, |status| {
+                    record_connection_failure(status, DbConnectionState::Error, attempt, message);
+                    status.password_unreadable = Some(reason);
+                });
+                wait_before_retry(&plan, &deps, attempt, &mut last_delay).await;
+                continue;
+            }
+        };
+        let connected = connect(&plan, &password).await;
+        drop(password);
+        match connected {
             Ok(pool) => {
                 if attempt > 0 {
                     deps.log.line(&format!(
@@ -160,6 +182,7 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
                     status.state = DbConnectionState::Connected;
                     status.consecutive_failures = 0;
                     status.last_error = None;
+                    status.password_unreadable = None;
                 });
 
                 let failure = poll_forever(&pool, &plan, &deps).await;
@@ -204,31 +227,58 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
             }
         }
 
-        let delay = backoff_delay(attempt);
-        // §4.2 末尾: 初回失敗時とバックオフ段階が変わったときだけ warn。
-        if last_delay != Some(delay) {
-            deps.log.err_line(&format!(
-                "banto-hub: [WARN] DB Source: 接続 {} への再接続を {} 秒後に再試行します（{} 回目の失敗）",
-                plan.connection_name,
-                delay.as_secs_f64(),
-                attempt
-            ));
-            last_delay = Some(delay);
-        }
-        tokio::time::sleep(delay).await;
+        wait_before_retry(&plan, &deps, attempt, &mut last_delay).await;
+    }
+}
+
+/// 再接続（またはパスワードの開封）の前のバックオフ。§4.2 末尾: 初回失敗時とバックオフ
+/// 段階が変わったときだけ warn。
+async fn wait_before_retry(
+    plan: &DbConnectionPlan,
+    deps: &TaskDeps,
+    attempt: u32,
+    last_delay: &mut Option<Duration>,
+) {
+    let delay = backoff_delay(attempt);
+    if *last_delay != Some(delay) {
+        deps.log.err_line(&format!(
+            "banto-hub: [WARN] DB Source: 接続 {} への再接続を {} 秒後に再試行します（{} 回目の失敗）",
+            plan.connection_name,
+            delay.as_secs_f64(),
+            attempt
+        ));
+        *last_delay = Some(delay);
+    }
+    tokio::time::sleep(delay).await;
+}
+
+/// 計画の封印したパスワードを開く（R2b-1e、設計 §5.2）。無ければ空（パスワード無しで
+/// 繋ぐ）。開けなければ読めない理由（空に潰さない）。
+fn open_password(
+    plan: &DbConnectionPlan,
+) -> Result<zeroize::Zeroizing<String>, crate::secrets::UnreadableReason> {
+    match &plan.password {
+        None => Ok(zeroize::Zeroizing::new(String::new())),
+        Some(sealed) => crate::secrets::ConnectionSecrets::platform_default()
+            .open(banto_tags::PASSWORD_KEY, sealed)
+            .map_err(|error| {
+                error
+                    .unreadable_reason()
+                    .unwrap_or(crate::secrets::UnreadableReason::Undecryptable)
+            }),
     }
 }
 
 /// プールを張り、各グループの SQL を1回だけ describe して実行形へ解決する
 /// までを行う。describe が**文の失敗**で落ちたグループは
 /// 「SQL を投げない（全タグ Bad）」形で保持し、接続そのものは生かす。
-async fn connect(plan: &DbConnectionPlan) -> Result<PgPool, PgFailure> {
+async fn connect(plan: &DbConnectionPlan, password: &str) -> Result<PgPool, PgFailure> {
     let options = pg_connect_options(
         &plan.host,
         plan.port,
         &plan.database,
         &plan.username,
-        &plan.password,
+        password,
         &plan.connection_name,
     );
     PgPoolOptions::new()
@@ -754,7 +804,7 @@ mod tests {
             port: 5432,
             database: "erp".to_string(),
             username: "reader".to_string(),
-            password: "pw".to_string(),
+            password: None,
             groups: vec![DbGroupPlan {
                 group_id: 5,
                 group_name: "q1".to_string(),
@@ -914,6 +964,7 @@ mod tests {
             consecutive_failures: 0,
             restarts: 0,
             last_restart_reason: None,
+            password_unreadable: None,
             groups: Vec::new(),
         };
 

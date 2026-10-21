@@ -4,9 +4,10 @@
 //! と `push` の `settings` の REST の形（既定のままなら `null`）と未適用キューの指紋の互換。
 //!
 //! 「読めない」は 2 通りを作る: 秘密値の行を生の SQL で消す（`missing`）、行の方式を
-//! この PC で開けない `dpapi-machine-v1` に書き換える（`undecryptable`。R2b-1d の Hub は
-//! protector を持たない）。PR #777 のオーナーレビュー P2 で 3 通り目: `settings.password` を
-//! 形の違う参照（`{"$secret": 123}`）に書き換える（`invalid`）。
+//! この PC で開けない `dpapi-machine-v1`（blob は 1 バイトの壊れた値）に書き換える
+//! （`undecryptable`。protector の無い PC でも、R2b-1e の Windows の DPAPI でも開けない）。
+//! PR #777 のオーナーレビュー P2 で 3 通り目: `settings.password` を形の違う参照
+//! （`{"$secret": 123}`）に書き換える（`invalid`）。
 
 use super::super::*;
 use super::common::{
@@ -147,7 +148,7 @@ async fn testing_a_saved_connection_with_an_unreadable_password_does_not_connect
         assert_eq!(status, StatusCode::OK, "{body:?}");
         assert_eq!(body["ok"], json!(false), "{body:?}");
         let error = body["error"].as_str().unwrap();
-        assert!(error.contains("パスワードを読めません"), "{error}");
+        assert!(error.contains("パスワード: 読めません"), "{error}");
         // The reason, not the closed port (1)'s connection failure: the password check
         // comes first and nothing is dialled.
         assert!(error.contains(reason), "{error}");

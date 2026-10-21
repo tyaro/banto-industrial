@@ -411,6 +411,21 @@ impl HubRuntime {
                 InitDbError::Storage(err) => HubStartError::InitDb(err),
             })?;
 
+        // R2b-1e（設計 §6.1 の 3・§6.5・§5.8、毎回の起動・冪等）: 秘密値の後処理。Windows は
+        // `plain-v1` の行と未適用キューを DPAPI で封印し直し、履歴の行からパスワードを外し、
+        // 清掃待ちの印があれば VACUUM する。どの失敗も起動を止めない（行は今の守りのまま
+        // 残り、状態の画面に出る。次の起動でやり直す）。Windows 以外は平文（`plain-v1`）で
+        // 保存していることをログに 1 行出す。
+        let connection_secrets = crate::secrets::ConnectionSecrets::platform_default();
+        if connection_secrets.seal_scheme() == crate::secrets::SecretScheme::PlainV1 {
+            log_err_line(&format!(
+                "banto-hub: [WARN] {}（postgres 接続のパスワードは DB に plain-v1 で置きます）",
+                crate::secrets::PLAINTEXT_STORAGE_WARNING
+            ));
+        }
+        let upkeep = crate::upgrade::secrets_upkeep(&pool, &connection_secrets).await;
+        crate::upgrade::log_upkeep(&upkeep);
+
         // R2b-1d（設計 §5.3 の最後の行、毎回の起動）: 秘密値の行と `settings` の参照の
         // 突き合わせ。参照があって行が無い接続はログに出す（読む側は `Unreadable {
         // Missing }` として空のパスワードで繋がない）。参照の無い行は消す。失敗しても

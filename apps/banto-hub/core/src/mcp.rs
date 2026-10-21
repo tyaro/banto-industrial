@@ -626,7 +626,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "password": {
                         "type": ["string", "null"],
-                        "description": "protocol: postgres 接続のパスワード。Hub が封印して保存する(平文の列には置かない。Windows 以外と R2b-1e までは封印の方式が plain-v1)。応答には値を返さず passwordSet / passwordState だけを返す。省略/null は「パスワード無し」。他プロトコルでは null。",
+                        "description": "protocol: postgres 接続のパスワード。Hub が封印して保存する(平文の列には置かない。Windows は DPAPI(machine スコープ)で封印、Windows 以外は plain-v1(平文)。未適用キューにも封印した値だけを置く)。応答には値を返さず passwordSet / passwordState だけを返す。省略/null は「パスワード無し」。他プロトコルでは null。",
                     },
                     "settings": {
                         "type": ["object", "null"],

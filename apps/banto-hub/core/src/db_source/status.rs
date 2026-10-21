@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::RwLock;
 
 use super::plan::DbSourcePlan;
+use crate::secrets::UnreadableReason;
 
 /// 1接続の運転状態（§4.2 の再接続モデルの外から見える面）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,10 @@ pub struct DbConnectionStatus {
     /// リテラル文字列（`expect` のメッセージ等）だけで、資格情報を
     /// 含まない（`crate::db_source` の doc comment「資格情報の扱い」）。
     pub last_restart_reason: Option<String>,
+    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.5）: パスワードを読めないので
+    /// 起こしていない（または開封に失敗した）接続の理由。それ以外は `None`。状態の画面の
+    /// `passwordState: "unreadable"`・`passwordUnreadableReason` になる（`crate::rest`）。
+    pub password_unreadable: Option<UnreadableReason>,
     pub groups: Vec<DbGroupStatus>,
 }
 
@@ -172,6 +177,7 @@ impl DbSourceStatusStore {
                     // （`DbConnectionStatus::restarts` の doc comment）。
                     restarts: 0,
                     last_restart_reason: None,
+                    password_unreadable: None,
                     groups: conn
                         .groups
                         .iter()
@@ -187,7 +193,7 @@ impl DbSourceStatusStore {
             );
         }
         // R2b-1d（設計 §5.4・§5.5）: パスワードを読めない接続は、収集の状態に依らず
-        // `error`「パスワードを読めません」（構成上の事実。タスクは起動しないので再試行も
+        // `error`「パスワード: 読めません」と理由（構成上の事実。タスクは起動しないので再試行も
         // しない）。
         // PR #777 review P2: a connection the registry refuses (`plan.excluded`) the same
         // way, with the exclusion's wording.
@@ -206,6 +212,7 @@ impl DbSourceStatusStore {
                     consecutive_failures: 0,
                     restarts: 0,
                     last_restart_reason: None,
+                    password_unreadable: conn.password_unreadable,
                     groups: conn
                         .groups
                         .iter()
@@ -235,6 +242,7 @@ impl DbSourceStatusStore {
                     consecutive_failures: 0,
                     restarts: 0,
                     last_restart_reason: None,
+                    password_unreadable: None,
                     groups: Vec::new(),
                 },
             );
@@ -281,7 +289,7 @@ mod tests {
                 port: 5432,
                 database: "erp".to_string(),
                 username: "reader".to_string(),
-                password: "pw".to_string(),
+                password: None,
                 groups: vec![DbGroupPlan {
                     group_id: 5,
                     group_name: "q1".to_string(),

@@ -18,7 +18,7 @@ pub(super) async fn stored_password(pool: &sqlx::SqlitePool, id: i64) -> Option<
     let conn = service.get(id).await.unwrap();
     let rows = service.secret_rows(id).await.unwrap();
     crate::secrets::open_connection_secret(
-        &crate::secrets::r2b1d_connection_secrets(),
+        &crate::secrets::ConnectionSecrets::platform_default(),
         &conn,
         banto_tags::PASSWORD_KEY,
         &rows,

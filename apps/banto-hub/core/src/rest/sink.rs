@@ -358,7 +358,7 @@ async fn build_sink_config_response(
             .get_with_secret_rows(connection_id)
             .await?;
         let password = match crate::secrets::open_connection_secret(
-            &crate::secrets::r2b1d_connection_secrets(),
+            &crate::secrets::ConnectionSecrets::platform_default(),
             &conn,
             banto_tags::PASSWORD_KEY,
             &rows,

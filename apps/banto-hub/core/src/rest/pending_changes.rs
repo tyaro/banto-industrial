@@ -49,6 +49,43 @@ struct PendingChangeWithId {
     id: i64,
 }
 
+/// R2b-1e（docs/banto-hub-connection-settings-design.md §5.3）: `plc_connections.create` /
+/// `.update` のキューのペイロードの `input`。REST・MCP の入力の形（[`PlcConnectionPayload`]）に、
+/// 積む時点で封印したパスワード（`sealedPassword`、`crate::secrets::sealed_password_json`）が
+/// 加わる。`sealedPassword` は**キューの中だけ**の欄で、REST・MCP の入力の型
+/// （[`PlcConnectionPayload`]）は受けない（外から封印した値を差し込ませない）。
+#[derive(Debug, Deserialize)]
+struct QueuedPlcConnectionPayload {
+    #[serde(flatten)]
+    payload: PlcConnectionPayload,
+    #[serde(default, rename = "sealedPassword")]
+    sealed_password: Option<serde_json::Value>,
+}
+
+impl QueuedPlcConnectionPayload {
+    /// 入力と封印した値に分ける。封印した値の形が違えば `password` の項目エラー（値は
+    /// 載せない）。
+    fn into_parts(
+        self,
+    ) -> Result<(PlcConnectionPayload, Option<crate::secrets::SealedSecret>), PendingApplyError>
+    {
+        let sealed = match self.sealed_password {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                crate::secrets::parse_sealed_password(&value).map_err(|err| {
+                    PendingApplyError::Api(ApiError(BantoError::Validation {
+                        field_errors: vec![FieldError {
+                            field: "password".to_string(),
+                            message: format!("未適用キューの封印したパスワードを読めません: {err}"),
+                        }],
+                    }))
+                })?,
+            ),
+        };
+        Ok((self.payload, sealed))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PendingChangeWithIdAndInput<T> {
     id: i64,
@@ -268,17 +305,20 @@ async fn execute_pending_apply(
 
     let resource = match pending.source.as_str() {
         "plc_connections.create" => {
-            let body: PendingChangeWithInput<PlcConnectionPayload> =
+            let body: PendingChangeWithInput<QueuedPlcConnectionPayload> =
                 decode_pending_payload(pending)?;
-            reject_hub_connection_protocol(&body.input)
+            let (input, sealed) = body.input.into_parts()?;
+            reject_hub_connection_protocol(&input)
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
+            // R2b-1e: the password sealed at enqueue time is passed on sealed (never
+            // opened back to plaintext here); an old row's plaintext is sealed now.
             state
                 .plc_connections
                 .create_tx(
                     &mut tx,
-                    body.input
-                        .into_input()
+                    input
+                        .into_input_with_sealed(sealed)
                         .map_err(ApiError)
                         .map_err(PendingApplyError::Api)?,
                 )
@@ -288,9 +328,10 @@ async fn execute_pending_apply(
             "plc_connections"
         }
         "plc_connections.update" => {
-            let body: PendingChangeWithIdAndInput<PlcConnectionPayload> =
+            let body: PendingChangeWithIdAndInput<QueuedPlcConnectionPayload> =
                 decode_pending_payload(pending)?;
-            reject_hub_connection_protocol(&body.input)
+            let (input, sealed) = body.input.into_parts()?;
+            reject_hub_connection_protocol(&input)
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
             if let Some(expected) = &pending.base_fingerprint {
@@ -322,8 +363,8 @@ async fn execute_pending_apply(
                 .update_tx(
                     &mut tx,
                     body.id,
-                    body.input
-                        .into_input()
+                    input
+                        .into_input_with_sealed(sealed)
                         .map_err(ApiError)
                         .map_err(PendingApplyError::Api)?,
                 )

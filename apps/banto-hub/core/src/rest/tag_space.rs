@@ -716,6 +716,13 @@ pub(super) struct DbSourceStatusEntry {
     pub(super) restarts: u32,
     pub(super) last_restart_reason: Option<String>,
     pub(super) groups: Vec<DbSourceGroupStatusEntry>,
+    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.5）: パスワードを読めない接続の
+    /// 理由（`crate::db_source::DbConnectionStatus::password_unreadable`）。**`/api/v1/status`
+    /// には出さない**（機械クライアント向けの形は R2b-7 まで変えない。`last_error` に文言は
+    /// 載る）。管理系の `GET /api/status` だけが `passwordState`・`passwordUnreadableReason`
+    /// として出す（`rest/admin_status.rs`）。
+    #[serde(skip)]
+    pub(super) password_unreadable: Option<crate::secrets::UnreadableReason>,
 }
 
 /// [`DbSourceStatusEntry`] のグループ1件分。
@@ -741,6 +748,7 @@ impl From<crate::db_source::DbConnectionStatus> for DbSourceStatusEntry {
             consecutive_failures: status.consecutive_failures,
             restarts: status.restarts,
             last_restart_reason: status.last_restart_reason,
+            password_unreadable: status.password_unreadable,
             groups: status
                 .groups
                 .into_iter()

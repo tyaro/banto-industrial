@@ -245,7 +245,7 @@ pub(crate) fn build_sources(
         let ingest_allowed = caller.is_some_and(|ctx| ctx.can_ingest(conn.id));
         let password = if ingest_allowed {
             match crate::secrets::open_connection_secret(
-                &crate::secrets::r2b1d_connection_secrets(),
+                &crate::secrets::ConnectionSecrets::platform_default(),
                 db,
                 banto_tags::PASSWORD_KEY,
                 secret_rows,

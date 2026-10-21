@@ -135,55 +135,29 @@ pub(super) struct QueuedPendingChangeResponse {
     message: String,
 }
 
-/// S1a レビュー対応（`docs/banto-hub-external-db-design.md`§2.2、
-/// `banto_tags::PlcConnection::password`の doc comment「外部呼び出し元へ
-/// 決してシリアライズしない」）: `pending_changes.payload`列は
-/// `plc_connections.create`/`.update`の`PlcConnectionPayload`をそのまま
-/// JSON 化して保存する（`queue_pending_registry_change`/`crate::mcp`の
-/// `tool_create_connection`/`tool_update_connection`参照）ため、`password`
-/// を含みうる。**DB に保存する値・`decode_pending_payload`/
-/// `execute_pending_apply`が適用時に読む値は一切変更しない**（適用には
-/// 平文パスワードそのものが必要）- この関数は外部へ返す直前のコピーにだけ
-/// 適用する。
+/// S1a レビュー対応（`docs/banto-hub-external-db-design.md`§2.2）: `pending_changes.payload`
+/// 列の `plc_connections.create`/`.update` は接続のパスワードを持ちうる。R2b-1e
+/// （docs/banto-hub-connection-settings-design.md §5.3）から、積む時点で封印した値
+/// （`input.sealedPassword`）に替え、履歴（`applied`/`canceled`）へ移すときに外す
+/// （`crate::pending_changes` のモジュール doc）。この関数は外部へ返す直前の写しにだけ掛け、
+/// **DB の行は変えない**。
 ///
-/// `payload.input.password`を取り除き、代わりに`passwordSet`を挿入する:
-/// - `"plc_connections.create"`: `password`が非空文字列なら`true`、
-///   省略/`null`/空文字列なら`false`
-///   （`banto_tags::plc_connection`の`stored_password_for_create`と同じ
-///   「`None`も空文字列も『まだ無し』」の扱い）。
-/// - `"plc_connections.update"`: **tri-state** - 非空文字列なら`true`
-///   （置き換え）、空文字列なら`false`（消去）、省略/`null`なら`null`
-///   （`stored_password_for_update`の「`None`は現在のパスワードを維持」の
-///   意味をそのまま反映 - この pending change 自体は「今の保存状態」を
-///   持たないので、`true`/`false`のどちらでもなく`null`とする。現在値は
-///   `GET /api/plc-connections/{id}`の`passwordSet`で別途確認できる）。
+/// `payload.input.password` と `payload.input.sealedPassword` を取り除き、代わりに
+/// `passwordSet` を入れる（`crate::pending_changes::redact_queued_password`）:
+/// - `"plc_connections.create"`: 封印した値があるか `password` が非空なら `true`、
+///   省略/`null`/空文字列なら `false`。
+/// - `"plc_connections.update"`: **tri-state** - 封印した値（置き換え）なら `true`、
+///   空文字列（消去）なら `false`、省略/`null`（現在のパスワードを維持）なら `null`
+///   （この pending change 自体は「今の保存状態」を持たないので、`true`/`false` の
+///   どちらでもなく `null` とする。現在値は `GET /api/plc-connections/{id}` の
+///   `passwordSet` で別途確認できる）。
+/// - 履歴へ移すときに替えた `passwordSet` はそのまま。
 ///
 /// それ以外の`source`（`"plc_connections.delete"`、`collection_groups.*`、
 /// `tags.*`）は無変更でそのまま返す - password を持ちうるのは
 /// `plc_connections.create`/`.update`の2つだけ。
 fn redact_pending_payload(source: &str, payload: &serde_json::Value) -> serde_json::Value {
-    if source != "plc_connections.create" && source != "plc_connections.update" {
-        return payload.clone();
-    }
-    let mut payload = payload.clone();
-    let Some(input) = payload.get_mut("input").and_then(|v| v.as_object_mut()) else {
-        return payload;
-    };
-    let password_set = match input.remove("password") {
-        None | Some(serde_json::Value::Null) => {
-            if source == "plc_connections.create" {
-                serde_json::Value::Bool(false)
-            } else {
-                serde_json::Value::Null
-            }
-        }
-        Some(serde_json::Value::String(s)) => serde_json::Value::Bool(!s.is_empty()),
-        // 文字列でない不正な値が来た場合(本来は起こらない)も、少なくとも
-        // 平文パスワードそのものを外に漏らさないことだけは保つ。
-        Some(_) => serde_json::Value::Bool(false),
-    };
-    input.insert("passwordSet".to_string(), password_set);
-    payload
+    crate::pending_changes::redact_queued_password(source, payload)
 }
 
 /// [`redact_pending_payload`]を`PendingChange`全体に適用したコピーを返す -

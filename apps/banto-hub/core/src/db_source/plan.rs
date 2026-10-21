@@ -21,14 +21,16 @@
 //! [`banto_collect::RegistrySnapshot`] を受け取り、`tag_key`
 //! （`"tag:{id}"`）だけを `crate::hub` と同じ規約で自前に組み立てる。
 //!
-//! ## 平文パスワードの扱い
+//! ## パスワードの扱い（R2b-1e、docs/banto-hub-connection-settings-design.md §5.2・§5.4）
 //!
-//! [`DbConnectionPlan`] は §2.2 の決定どおり平文パスワードを保持する。
-//! そのため [`DbConnectionPlan`] の `Debug` は**手書き**で、`password` を
-//! `"<redacted>"` に置き換える - `#[derive(Debug)]` のままだと、plan を
-//! そのままログや `panic!` メッセージに出した瞬間にパスワードが漏れる
-//! （S1a のレビューで `PlcConnection::password` について同じ指摘が2箇所
-//! 出ている）。
+//! [`DbConnectionPlan`] は平文のパスワードを**持たない**。持つのは封印した行
+//! （[`crate::secrets::SealedSecret`]、参照・方式・blob）だけで、ポーリングタスクが接続を
+//! 張る直前に開く（`crate::db_source::task`、平文は `Zeroizing`）。計画を組む時点で一度
+//! 開けることを確かめ（平文はすぐ捨てる）、読めない接続は [`DbSourcePlan::unreadable`] に
+//! 回す（タスクを起こさない = 再試行でも繋ぎに行かない）。checklist §5「平文の資格情報は、
+//! それを持つ層の外に出さない」。`Debug` は手書きで、封印した値も `"<sealed>"` に置き換える
+//! （`plain-v1` の blob は平文そのもの。`SealedSecret` の `Debug` も blob を出さないが、
+//! 計画の `Debug` は参照も出さない）。
 
 use std::fmt;
 
@@ -36,7 +38,7 @@ use banto_collect::{ExclusionReason, RegistrySnapshot};
 use banto_driver_api::DriverRegistry;
 use banto_tags::{DB_TAG_KIND, POSTGRES_PROTOCOL};
 
-use crate::secrets::UnreadableReason;
+use crate::secrets::{SealedSecret, UnreadableReason};
 
 /// 1回の commit で engine が受け取る計画一式。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -51,7 +53,7 @@ pub struct DbSourcePlan {
     /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: 有効で回す
     /// グループもあるが、**パスワードを読めない**接続（秘密値の行が無い・この PC で
     /// 開けない）。タスクを起動せず（再試行でも繋ぎに行かない）、状態表示はその接続だけ
-    /// `error`「パスワードを読めません」、配下のタグは Bad（[`crate::db_source::DbSourceEngine`]
+    /// `error`「パスワード: 読めません」、配下のタグは Bad（[`crate::db_source::DbSourceEngine`]
     /// が書く）。空のパスワードで繋がない（`trust` 認証の DB なら別の資格で繋がって
     /// しまう、checklist §5「エラーを空に潰さない」）。
     pub unreadable: Vec<UnreadableDbConnection>,
@@ -71,6 +73,9 @@ pub struct BlockedDbConnection<'a> {
     pub connection_id: i64,
     pub connection_name: &'a str,
     pub groups: &'a [DbGroupPlan],
+    /// パスワードを読めないので外した接続ならその理由（[`DbSourcePlan::unreadable`]）。
+    /// レジストリで外した接続（[`DbSourcePlan::excluded`]）は `None`。
+    pub password_unreadable: Option<UnreadableReason>,
 }
 
 impl DbSourcePlan {
@@ -83,6 +88,7 @@ impl DbSourcePlan {
                     connection_id: conn.connection_id,
                     connection_name: &conn.connection_name,
                     groups: &conn.groups,
+                    password_unreadable: Some(conn.reason),
                 },
                 unreadable_password_message(conn.reason),
             )
@@ -93,6 +99,7 @@ impl DbSourcePlan {
                     connection_id: conn.connection_id,
                     connection_name: &conn.connection_name,
                     groups: &conn.groups,
+                    password_unreadable: None,
                 },
                 conn.reason.message(),
             )
@@ -130,13 +137,16 @@ pub struct UnreadableDbConnection {
     pub groups: Vec<DbGroupPlan>,
 }
 
-/// R2b-1d（設計 §5.5）: パスワードを読めない接続の理由の文言（状態の画面の
-/// `dbSource` 節・接続のテストの `error`）。秘密値を含まない。
+/// 設計 §5.5: パスワードを読めない接続の文言の本体（ドロワーの表示と同じ、R2b-1e）。
+pub const UNREADABLE_PASSWORD_MESSAGE: &str =
+    "パスワード: 読めません（この PC で再入力してください）";
+
+/// パスワードを読めない接続の理由の文言（状態の画面の `dbSource` 節の `lastError`・接続の
+/// テストの `error`）: [`UNREADABLE_PASSWORD_MESSAGE`] に理由の綴り（`missing` /
+/// `undecryptable` / `invalid`）を添える。状態の画面は理由を別の欄
+/// （`passwordUnreadableReason`）にも出す。秘密値を含まない。
 pub fn unreadable_password_message(reason: UnreadableReason) -> String {
-    format!(
-        "パスワードを読めません（{}）。接続の編集でパスワードを入れ直してください。",
-        reason.as_str()
-    )
+    format!("{UNREADABLE_PASSWORD_MESSAGE}（理由: {}）", reason.as_str())
 }
 
 /// 1接続分（= tokio task 1本、`PgPool` 1つ）。
@@ -148,9 +158,10 @@ pub struct DbConnectionPlan {
     pub port: u16,
     pub database: String,
     pub username: String,
-    /// 平文（§2.2）。このモジュールの doc comment「平文パスワードの扱い」
-    /// 節のとおり `Debug` には出さない。
-    pub password: String,
+    /// 封印したパスワード（R2b-1e）。`None` はパスワード無し（postgres のパスワードは
+    /// 任意）。平文はタスクが接続を張る直前に開く（このモジュールの doc comment
+    /// 「パスワードの扱い」節）。`Debug` には出さない。
+    pub password: Option<SealedSecret>,
     pub groups: Vec<DbGroupPlan>,
 }
 
@@ -163,7 +174,14 @@ impl fmt::Debug for DbConnectionPlan {
             .field("port", &self.port)
             .field("database", &self.database)
             .field("username", &self.username)
-            .field("password", &"<redacted>")
+            .field(
+                "password",
+                &self
+                    .password
+                    .as_ref()
+                    .map(|_| "<sealed>")
+                    .unwrap_or("<none>"),
+            )
             .field("groups", &self.groups)
             .finish()
     }
@@ -385,20 +403,20 @@ pub fn build_plan(
             continue;
         }
 
-        // R2b-1d (design §5.4・§5.5): the password is opened from the sealed row the
-        // snapshot carries. No password set = connect without one (a postgres password is
-        // optional). One that is set but cannot be read is **not** collapsed to an empty
-        // password: the connection is not started (no task, so no retry dials it either),
-        // its status reads「パスワードを読めません」 and its tags read Bad.
-        // TODO(R2b-1e): hold the sealed row in the plan and open it at connect time
-        // (design §5.4's table); the plan carries the opened value as before for now.
-        let password = match crate::secrets::open_connection_secret(
-            &crate::secrets::r2b1d_connection_secrets(),
+        // Design §5.4・§5.5 (R2b-1e): the plan holds the sealed row, not the plaintext - it
+        // is opened right before connecting (`task::run_connection`). Here it is opened
+        // once to check it is readable (the plaintext is dropped at once). No password set =
+        // connect without one (a postgres password is optional). One that is set but cannot
+        // be read is **not** collapsed to an empty password: the connection is not started
+        // (no task, so no retry dials it either), its status reads「パスワード: 読めません」
+        // and its tags read Bad.
+        let password = match crate::secrets::sealed_connection_secret(
+            &crate::secrets::ConnectionSecrets::platform_default(),
             conn,
             banto_tags::PASSWORD_KEY,
             &snapshot.secrets,
         ) {
-            Ok(password) => password.map_or_else(String::new, |plain| plain.as_str().to_owned()),
+            Ok(password) => password,
             Err(reason) => {
                 unreadable.push(UnreadableDbConnection {
                     connection_id: conn.id,
@@ -629,12 +647,12 @@ mod tests {
         assert!(err.contains("ポート"), "{err}");
     }
 
-    /// R2b-1d (design §5.4): the plan opens the sealed password; a connection with no
-    /// password connects without one; one whose reference has no readable row is not
-    /// started (listed as unreadable with its reason) - never dialled with an empty
-    /// password.
+    /// Design §5.4 (R2b-1d, R2b-1e): the plan holds the sealed password row (never the
+    /// plaintext) after checking it opens; a connection with no password connects without
+    /// one; one whose reference has no readable row is not started (listed as unreadable
+    /// with its reason) - never dialled with an empty password.
     #[test]
-    fn build_plan_opens_the_sealed_password_and_never_collapses_an_unreadable_one() {
+    fn build_plan_holds_the_sealed_password_and_never_collapses_an_unreadable_one() {
         let snapshot = RegistrySnapshot {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
@@ -642,13 +660,25 @@ mod tests {
             secrets: secret_rows(),
         };
         let plan = build_plan(&snapshot, &registry()).unwrap();
-        assert_eq!(plan.connections[0].password, "s3cret");
+        let sealed = plan.connections[0]
+            .password
+            .as_ref()
+            .expect("the sealed row is held");
+        assert_eq!(sealed.r#ref.as_str(), PW_REF);
+        assert_eq!(
+            crate::secrets::ConnectionSecrets::platform_default()
+                .open("password", sealed)
+                .unwrap()
+                .as_str(),
+            "s3cret",
+            "opened only at connect time, from the sealed row"
+        );
 
         let mut no_password = snapshot.clone();
         no_password.connections[0].settings.remove("password");
         no_password.secrets.clear();
         let plan = build_plan(&no_password, &registry()).unwrap();
-        assert_eq!(plan.connections[0].password, "");
+        assert_eq!(plan.connections[0].password, None);
 
         for broken in [
             // The row is missing.
@@ -814,7 +844,7 @@ mod tests {
     async fn a_malformed_reference_written_by_raw_sql_never_plans_a_task() {
         let pool = crate::db::init_db_memory().await.unwrap();
         let service = banto_tags::PlcConnectionService::with_registry(pool.clone(), registry());
-        let secrets = crate::secrets::r2b1d_connection_secrets();
+        let secrets = crate::secrets::ConnectionSecrets::platform_default();
         let conn = service
             .create(banto_tags::PlcConnectionInput {
                 name: "erp".to_string(),
@@ -893,6 +923,7 @@ mod tests {
             !rendered.contains("s3cret"),
             "the plan's Debug must never carry the plaintext password: {rendered}"
         );
-        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains(PW_REF), "{rendered}");
+        assert!(rendered.contains("<sealed>"), "{rendered}");
     }
 }

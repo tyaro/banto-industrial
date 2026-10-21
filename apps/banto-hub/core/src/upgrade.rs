@@ -1,5 +1,5 @@
-//! 起動時の DB の移行の前後処理（R2b-1d、docs/banto-hub-connection-settings-design.md
-//! §6.1 の 2-b・§6.3・§6.4・§6.6、§5.3 の最後の行）。
+//! 起動時の DB の移行の前後処理（R2b-1d・R2b-1e、docs/banto-hub-connection-settings-design.md
+//! §6.1 の 2-b・§6.3・§6.4・§6.5・§6.6、§5.3 の最後の行）。
 //!
 //! migration `0025`（`banto-tags`、接続設定を `settings` の JSON と秘密の表へ移す）は
 //! **戻せない**（0025 を当てた DB は 0001〜0024 の migrator では開けない）。そこで Hub は
@@ -19,11 +19,10 @@
 //!         （UpgradeError::Preflight → HubStartError::ConnectionSettingsPreflight）。
 //!         DB は一切変わらない
 //!      4. バックアップ（§6.4）: パスワードを除いて VACUUM した `.bak`
-//!      5. 清掃待ちの印 `secrets.vacuum_pending = true`（§6.5 の注。VACUUM そのものは
-//!         R2b-1e）
+//!      5. 清掃待ちの印 `secrets.vacuum_pending = true`（§6.5 の注）
 //! 2-c  banto_tags::migrate（0025 を含む）→ banto_collect::migrate（crate::db）
-//!      → 秘密の行と参照の整合の確認（[`check_secret_integrity`]、crate::runtime が
-//!         毎回の起動で呼ぶ）
+//! 3    秘密値の後処理（[`secrets_upkeep`]、R2b-1e、crate::runtime が毎回の起動で呼ぶ）
+//!      → 秘密の行と参照の整合の確認（[`check_secret_integrity`]、毎回の起動）
 //! ```
 //!
 //! **予行をバックアップより先にした理由**（§6.1 の図はバックアップ → 予行の順に書いて
@@ -61,10 +60,36 @@
 //! から `.bak` へ `rename` する。平文を含みうるのは `.partial` の名前のものだけで、
 //! 途中で落ちれば次の起動の掃除（2-b の 1）で消える（§6.6）。完成した `.bak` は消さない。
 //!
+//! # 秘密値の後処理（§6.5・§6.6、R2b-1e、毎回の起動・冪等）
+//!
+//! [`secrets_upkeep`] = [`rewrite_secrets`]（工程 1）→ [`vacuum_if_pending`]（工程 2）。
+//!
+//! 1. `BEGIN IMMEDIATE` の 1 トランザクションで（[`rewrite_secrets`]）:
+//!    - (a) protector があるとき（Windows の DPAPI）、`plc_connection_secrets` の `plain-v1`
+//!      の行を開いて**同じ参照のまま**封印し直す（entropy は参照とキー）。
+//!    - (b) 未適用（`pending`・`applying`・`failed`）の `plc_connections.create` / `.update` の
+//!      ペイロードの平文の `password` を封印した `sealedPassword` に替える。
+//!    - (c) 同じ 3 つの状態の `plain-v1` の `sealedPassword` を、protector があれば封印し直す。
+//!    - (d) 履歴（`applied`・`canceled`）のペイロードから `password` と `sealedPassword` の
+//!      両方を外して `passwordSet` に替える。
+//!    - (e) 1 つでも書き換えたら、**同じトランザクションで**清掃待ちの印を立てる。何も
+//!      書き換えなければ何も書かない（印も立てない）。
+//!
+//!    1 件の封印し直し・封印の失敗（DPAPI の失敗・壊れた値）は起動を止めない: その行は
+//!    そのまま残し（平文の守りは今と同じ）、[`UpkeepReport::failures`] に数える。状態の画面は
+//!    [`plaintext_remaining`] で「移行待ちの秘密値が平文で残っています」を出す。
+//! 2. 印があるときだけ、トランザクションの外で（[`vacuum_if_pending`]）
+//!    `PRAGMA wal_checkpoint(TRUNCATE)` → `VACUUM` → `PRAGMA wal_checkpoint(TRUNCATE)`
+//!    （WAL の DB では `VACUUM` の結果はまず WAL に入り、本体の古いページは次の checkpoint まで
+//!    残るので、後ろの checkpoint で本体を書き換えて切り詰める）→ 印を消す。どれかが失敗
+//!    したり checkpoint が終わり切らなければ印を残し、次の起動でやり直す（§6.6）。
+//!
+//! 工程 1 の途中で落ちればトランザクションごと戻り、次の起動でやり直す。工程 1 の commit の
+//! 後・工程 2 の前に落ちても、印が同じトランザクションで立っているので次の起動で
+//! `VACUUM` だけやり直す（印は「清掃がまだ」を表す。完了の印ではない、§6.5 の 2）。
+//!
 //! # しないこと
 //!
-//! - Windows での `plain-v1` → `dpapi-machine-v1` の封印し直し・未適用キューの封印・
-//!   `VACUUM` と清掃待ちの印を消すこと（§6.5、R2b-1e）。ここは印を**立てる**だけ。
 //! - ChronoGazer の DB の起動（§6.7）。掃除・未適用の検出・バックアップの部品は
 //!   `banto_tags::upgrade` に置き、ここはそれを呼ぶ（予行と preflight はレジストリを持つ Hub だけ）。
 
@@ -91,7 +116,9 @@ pub use banto_tags::upgrade::{
 /// 予行の写しの末尾（`{DRYRUN_PREFIX}{nonce}{DRYRUN_SUFFIX}`）。
 const DRYRUN_SUFFIX: &str = ".sqlite3";
 
-/// 清掃待ちの印（Hub の `settings` 表、§6.5 の 2）。R2b-1d は立てるだけ。
+/// 清掃待ちの印（Hub の `settings` 表、§6.5 の 2）。立てるのは [`set_vacuum_pending`]
+/// （0025 の前）と [`rewrite_secrets`]（書き換えと同じトランザクション）、消すのは
+/// [`vacuum_if_pending`]（`VACUUM` と checkpoint が済んだ後）。
 pub const VACUUM_PENDING_KEY: &str = "secrets.vacuum_pending";
 
 /// preflight の 1 行（断った行・報告だけの行）。`errors` は人が読む文言で、秘密値を
@@ -302,7 +329,7 @@ pub struct UpgradeOutcome {
 /// 2-b の 5（§6.5 の注）: 0025 が DROP する旧表の平文が空きページと WAL に残るので、
 /// migrate の**前**に清掃待ちの印を立てる（0025 は banto-tags の migrator の
 /// トランザクションなので同じトランザクションにできない。先に立てておけば migrate の
-/// 直後に落ちても印は残る）。印を見て `VACUUM` し、消すのは R2b-1e。
+/// 直後に落ちても印は残る）。印を見て `VACUUM` し、消すのは [`vacuum_if_pending`]。
 pub async fn set_vacuum_pending(pool: &SqlitePool) -> Result<(), UpgradeError> {
     sqlx::query(
         "INSERT INTO settings (key, value) VALUES (?, 'true') \
@@ -748,6 +775,351 @@ pub fn log_integrity(report: &IntegrityReport) {
         log_line(&format!(
             "banto-hub: 参照する接続の無い秘密値の行（接続 #{}・{}）を消しました",
             orphan.connection_id, orphan.key
+        ));
+    }
+}
+
+// ---- 秘密値の後処理（§6.5・§6.6、R2b-1e） ------------------------------------------------
+
+/// 未適用キューの状態（封印する・封印し直す側）。
+const UNAPPLIED_STATES: [&str; 3] = ["pending", "applying", "failed"];
+/// 履歴の状態（パスワードを外す側）。
+const HISTORY_STATES: [&str; 2] = ["applied", "canceled"];
+
+/// 後処理の工程 1 で、封印し直し・封印に失敗した 1 件。値・blob は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpkeepFailure {
+    /// `"plc_connection_secrets"`（`id` は接続 id）か `"pending_changes"`（`id` はキューの id）。
+    pub table: &'static str,
+    pub id: i64,
+    /// 失敗の理由（`crate::secrets::SecretError` の文言など。秘密値を含まない）。
+    pub error: String,
+}
+
+/// 秘密値の後処理の結果（[`secrets_upkeep`]）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpkeepReport {
+    /// (a) `plain-v1` から封印し直した秘密の行の数。
+    pub resealed_rows: usize,
+    /// (b) 平文の `password` を封印したキューの行の数。
+    pub sealed_queue: usize,
+    /// (c) `plain-v1` の `sealedPassword` を封印し直したキューの行の数。
+    pub resealed_queue: usize,
+    /// (d) `password` / `sealedPassword` を外した履歴の行の数。
+    pub stripped_history: usize,
+    /// 封印し直し・封印に失敗して、そのまま残した行（起動は止めない）。
+    pub failures: Vec<UpkeepFailure>,
+    /// 工程 1 の DB の失敗（トランザクションごと戻った。次の起動でやり直す）。
+    pub rewrite_error: Option<String>,
+    /// 工程 2 で `VACUUM` を済ませて印を消した。
+    pub vacuumed: bool,
+    /// 工程 2 の失敗（印は残る。次の起動でやり直す）。
+    pub vacuum_error: Option<String>,
+}
+
+impl UpkeepReport {
+    /// 工程 1 で何か書き換えたか（= 同じトランザクションで清掃待ちの印を立てたか）。
+    pub fn rewrote(&self) -> bool {
+        self.resealed_rows + self.sealed_queue + self.resealed_queue + self.stripped_history > 0
+    }
+}
+
+/// 秘密値の後処理（§6.5、`crate::runtime` が毎回の起動の手順 3 で呼ぶ。冪等）。工程 1
+/// （[`rewrite_secrets`]）→ 工程 2（[`vacuum_if_pending`]）。どの失敗も起動を止めない:
+/// 結果（[`UpkeepReport`]）に載せて返し、呼び出し側がログに出す（[`log_upkeep`]）。工程 1 が
+/// DB の失敗で戻っても、前の起動から残った印があれば工程 2 は行う。
+pub async fn secrets_upkeep(
+    pool: &SqlitePool,
+    secrets: &crate::secrets::ConnectionSecrets,
+) -> UpkeepReport {
+    let mut report = match rewrite_secrets(pool, secrets).await {
+        Ok(report) => report,
+        Err(err) => UpkeepReport {
+            rewrite_error: Some(err.to_string()),
+            ..UpkeepReport::default()
+        },
+    };
+    match vacuum_if_pending(pool).await {
+        Ok(vacuumed) => report.vacuumed = vacuumed,
+        Err(err) => report.vacuum_error = Some(err.to_string()),
+    }
+    report
+}
+
+/// 工程 1（§6.5 の 1、このモジュールの doc の (a)〜(e)）。`BEGIN IMMEDIATE` の 1 トランザク
+/// ションで書き換え、何か書き換えたら同じトランザクションで清掃待ちの印を立てる。書き換える
+/// ものが無ければ何も書かない。
+pub async fn rewrite_secrets(
+    pool: &SqlitePool,
+    secrets: &crate::secrets::ConnectionSecrets,
+) -> Result<UpkeepReport, BantoError> {
+    rewrite_secrets_inner(pool, secrets, false).await
+}
+
+/// テスト用（§9 の冪等）: 工程 1 の書き換えと印までを済ませてから、commit の**前**に失敗
+/// する（プロセスが落ちたのと同じ。トランザクションは戻る）。
+#[cfg(test)]
+pub(crate) async fn rewrite_secrets_failing_before_commit(
+    pool: &SqlitePool,
+    secrets: &crate::secrets::ConnectionSecrets,
+) -> Result<UpkeepReport, BantoError> {
+    rewrite_secrets_inner(pool, secrets, true).await
+}
+
+async fn rewrite_secrets_inner(
+    pool: &SqlitePool,
+    secrets: &crate::secrets::ConnectionSecrets,
+    fail_before_commit: bool,
+) -> Result<UpkeepReport, BantoError> {
+    use crate::pending_changes::{
+        reseal_queued_password, seal_queued_password, strip_queued_password,
+    };
+    use crate::secrets::{SealedSecret, SecretScheme};
+
+    let storage = banto_storage::storage_error;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(storage)?;
+    let mut report = UpkeepReport::default();
+
+    // (a) plain-v1 の秘密の行を、protector があれば同じ参照のまま封印し直す。
+    if secrets.seal_scheme() != SecretScheme::PlainV1 {
+        let rows: Vec<banto_tags::StoredSecretRow> = sqlx::query_as(
+            "SELECT ref, connection_id, key, scheme, blob FROM plc_connection_secrets \
+             WHERE scheme = ? ORDER BY connection_id, key",
+        )
+        .bind(SecretScheme::PlainV1.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage)?;
+        for row in rows {
+            let resealed = SealedSecret::from_row(&row.sealed)
+                .and_then(|sealed| secrets.reseal_plain(&row.key, &sealed));
+            match resealed {
+                Ok(Some(resealed)) => {
+                    sqlx::query(
+                        "UPDATE plc_connection_secrets SET scheme = ?, blob = ? WHERE ref = ?",
+                    )
+                    .bind(resealed.scheme.as_str())
+                    .bind(resealed.blob.as_slice())
+                    .bind(resealed.r#ref.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage)?;
+                    report.resealed_rows += 1;
+                }
+                Ok(None) => {}
+                Err(err) => report.failures.push(UpkeepFailure {
+                    table: "plc_connection_secrets",
+                    id: row.connection_id,
+                    error: err.to_string(),
+                }),
+            }
+        }
+    }
+
+    // (b)〜(d) 接続の作成・更新のキューの行。
+    let queue: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT id, state, source, payload FROM pending_changes \
+         WHERE source IN (?, ?) ORDER BY id",
+    )
+    .bind(crate::pending_changes::CONNECTION_PASSWORD_SOURCES[0])
+    .bind(crate::pending_changes::CONNECTION_PASSWORD_SOURCES[1])
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(storage)?;
+    for (id, state, source, text) in queue {
+        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&text) else {
+            report.failures.push(UpkeepFailure {
+                table: "pending_changes",
+                id,
+                error: "ペイロードが JSON として読めません".to_string(),
+            });
+            continue;
+        };
+        let mut changed = false;
+        if UNAPPLIED_STATES.contains(&state.as_str()) {
+            // (b) 平文の password → sealedPassword（Windows は DPAPI、他は plain-v1）。
+            match seal_queued_password(secrets, &source, &mut payload) {
+                Ok(true) => {
+                    report.sealed_queue += 1;
+                    changed = true;
+                }
+                Ok(false) => {}
+                Err(err) => report.failures.push(UpkeepFailure {
+                    table: "pending_changes",
+                    id,
+                    error: err.to_string(),
+                }),
+            }
+            // (c) plain-v1 の sealedPassword を封印し直す（protector があるときだけ）。
+            match reseal_queued_password(secrets, &source, &mut payload) {
+                Ok(true) => {
+                    report.resealed_queue += 1;
+                    changed = true;
+                }
+                Ok(false) => {}
+                Err(err) => report.failures.push(UpkeepFailure {
+                    table: "pending_changes",
+                    id,
+                    error: err.to_string(),
+                }),
+            }
+        } else if HISTORY_STATES.contains(&state.as_str())
+            && strip_queued_password(&source, &mut payload)
+        {
+            // (d) 履歴から password と sealedPassword の両方を外す。
+            report.stripped_history += 1;
+            changed = true;
+        }
+        if changed {
+            let text = serde_json::to_string(&payload)
+                .map_err(|err| BantoError::Other(format!("payload のシリアライズ: {err}")))?;
+            sqlx::query("UPDATE pending_changes SET payload = ? WHERE id = ?")
+                .bind(text)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+        }
+    }
+
+    // (e) 平文を空きページへ追い出しうる書き込みと同じトランザクションで印を立てる。
+    if report.rewrote() {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, 'true') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(VACUUM_PENDING_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
+    }
+    if fail_before_commit {
+        drop(tx);
+        return Err(BantoError::Other(
+            "テストで注入した失敗（後処理の commit の前）".to_string(),
+        ));
+    }
+    tx.commit().await.map_err(storage)?;
+    Ok(report)
+}
+
+/// 工程 2（§6.5 の 2）: 清掃待ちの印があるときだけ、`PRAGMA wal_checkpoint(TRUNCATE)` →
+/// `VACUUM` → `PRAGMA wal_checkpoint(TRUNCATE)` を 1 本の接続で行い、済んだら印を消す。
+/// 印が無ければ何もせず `Ok(false)`。後ろの checkpoint が終わり切らない（他の接続が読んで
+/// いる）・どれかが失敗したら印を残して `Err`（次の起動でやり直す）。
+pub async fn vacuum_if_pending(pool: &SqlitePool) -> Result<bool, BantoError> {
+    let storage = banto_storage::storage_error;
+    let mut conn = pool.acquire().await.map_err(storage)?;
+    let mark: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(VACUUM_PENDING_KEY)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(storage)?;
+    if mark.as_deref() != Some("true") {
+        return Ok(false);
+    }
+    // 前の checkpoint: WAL に残った古いフレーム（平文を含みうる）を本体へ移して切り詰める。
+    // 終わり切らなくても、後ろの checkpoint が終われば WAL は空になる。
+    wal_checkpoint_truncate(&mut conn).await?;
+    sqlx::query("VACUUM")
+        .execute(&mut *conn)
+        .await
+        .map_err(storage)?;
+    // 後ろの checkpoint: WAL の DB では VACUUM の結果は WAL に入り、本体の空きページの古い
+    // 中身は checkpoint まで残る。ここで本体を書き換えて切り詰める。
+    if !wal_checkpoint_truncate(&mut conn).await? {
+        return Err(BantoError::Other(
+            "VACUUM の後の WAL の切り詰めが終わりませんでした（他の接続が DB を読んでいます）"
+                .to_string(),
+        ));
+    }
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(VACUUM_PENDING_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(storage)?;
+    Ok(true)
+}
+
+/// `PRAGMA wal_checkpoint(TRUNCATE)`。終わり切ったら `true`（WAL でない DB も `true`）。
+async fn wal_checkpoint_truncate(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+) -> Result<bool, BantoError> {
+    let (busy, _log, _checkpointed): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    Ok(busy == 0)
+}
+
+/// 状態の画面の「移行待ちの秘密値が平文で残っています」（§6.5 の最後・§8 の 9）の件数:
+/// protector があるのに（Windows）`plain-v1` のままの秘密の行と、未適用キューの平文の
+/// `password` か `plain-v1` の `sealedPassword` を持つ行。protector が無い（Windows 以外）
+/// なら平文は既定なので 0（そちらは「秘密値を平文で保存しています」の警告で出す）。
+pub async fn plaintext_remaining(
+    pool: &SqlitePool,
+    secrets: &crate::secrets::ConnectionSecrets,
+) -> Result<u64, BantoError> {
+    use crate::secrets::SecretScheme;
+    if secrets.seal_scheme() == SecretScheme::PlainV1 {
+        return Ok(0);
+    }
+    let storage = banto_storage::storage_error;
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plc_connection_secrets WHERE scheme = ?")
+            .bind(SecretScheme::PlainV1.as_str())
+            .fetch_one(pool)
+            .await
+            .map_err(storage)?;
+    let queue: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_changes \
+         WHERE source IN (?, ?) AND state IN ('pending', 'applying', 'failed') \
+         AND json_valid(payload) \
+         AND ((json_type(payload, '$.input.password') = 'text' \
+               AND json_extract(payload, '$.input.password') <> '') \
+              OR json_extract(payload, '$.input.sealedPassword.scheme') = ?)",
+    )
+    .bind(crate::pending_changes::CONNECTION_PASSWORD_SOURCES[0])
+    .bind(crate::pending_changes::CONNECTION_PASSWORD_SOURCES[1])
+    .bind(SecretScheme::PlainV1.as_str())
+    .fetch_one(pool)
+    .await
+    .map_err(storage)?;
+    Ok(u64::try_from(rows + queue).unwrap_or(0))
+}
+
+/// [`secrets_upkeep`] の結果をログに出す（値・参照・blob は出さない）。
+pub fn log_upkeep(report: &UpkeepReport) {
+    if report.rewrote() {
+        log_line(&format!(
+            "banto-hub: 秘密値の後処理: 封印し直した秘密の行 {} 件、未適用キューの封印 {} 件・\
+             封印し直し {} 件、履歴の行から外した値 {} 件",
+            report.resealed_rows,
+            report.sealed_queue,
+            report.resealed_queue,
+            report.stripped_history
+        ));
+    }
+    for failure in &report.failures {
+        log_err_line(&format!(
+            "banto-hub: [WARN] 秘密値の後処理: {} の #{} を封印し直せませんでした（平文のまま\
+             残します。次の起動でもう一度試します）: {}",
+            failure.table, failure.id, failure.error
+        ));
+    }
+    if let Some(err) = &report.rewrite_error {
+        log_err_line(&format!(
+            "banto-hub: [WARN] 秘密値の後処理に失敗しました（何も変えていません。次の起動で\
+             もう一度試します）: {err}"
+        ));
+    }
+    if report.vacuumed {
+        log_line("banto-hub: 秘密値の後処理: DB の空きページと WAL を清掃しました（VACUUM）");
+    }
+    if let Some(err) = &report.vacuum_error {
+        log_err_line(&format!(
+            "banto-hub: [WARN] DB の清掃（VACUUM）に失敗しました。次の起動でもう一度試します: {err}"
         ));
     }
 }

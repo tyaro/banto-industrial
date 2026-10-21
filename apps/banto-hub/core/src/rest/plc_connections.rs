@@ -107,7 +107,8 @@ pub struct PlcConnectionPayload {
     /// 同じ省略時ルール。
     #[serde(default)]
     pub username: Option<String>,
-    /// S1: `protocol: "postgres"` 接続のパスワード（平文保存、§2.2）。
+    /// S1: `protocol: "postgres"` 接続のパスワード。R2b-1d から入口で封印して秘密の表に
+    /// 置く（R2b-1e: Windows は DPAPI、それ以外は `plain-v1`。平文の列は無い）。
     /// **create と update で意味が異なる** -
     /// `banto_tags::PlcConnectionInput::password`の doc comment 参照:
     /// - create: 省略/`null`/空文字列はいずれも「パスワード無し」。
@@ -135,16 +136,16 @@ impl PlcConnectionPayload {
     /// banto-tags の入力に写す。R2b-1d（docs/banto-hub-connection-settings-design.md §5.3）
     /// から、`password` の平文は**ここで封印**して `PlcConnectionInput::secrets` に載せる
     /// （banto-tags は平文を受けない）。tri-state は [`crate::secrets::password_changes`]:
-    /// 省略・`null` は `Keep`、空文字は `Clear`、値は `Set(封印した値)`。封印は R2b-1d では
-    /// 全 OS で `plain-v1`（[`crate::secrets::r2b1d_connection_secrets`]、R2b-1e で
-    /// DPAPI）。封印に失敗したとき（大きすぎる値・乱数源の失敗）は `password` の項目
-    /// エラーで、値は載せない。
+    /// 省略・`null` は `Keep`、空文字は `Clear`、値は `Set(封印した値)`。封印は
+    /// [`crate::secrets::ConnectionSecrets::platform_default`]（R2b-1e: Windows は DPAPI の
+    /// `dpapi-machine-v1`、それ以外は `plain-v1`）。封印に失敗したとき（大きすぎる値・乱数源・
+    /// DPAPI の失敗）は `password` の項目エラーで、値は載せない。
     ///
-    /// 未適用キューは今どおり平文の `password` を持ち、適用の時点でここを通って封印される
-    /// （設計 §10 の R2b-1d。積む時点の封印は R2b-1e）。
+    /// 未適用キューは R2b-1e から積む時点で封印した値（`sealedPassword`）を持ち、適用は
+    /// [`Self::into_input_with_sealed`] を通る。
     pub(crate) fn into_input(self) -> Result<PlcConnectionInput, BantoError> {
         let secrets = crate::secrets::password_changes(
-            &crate::secrets::r2b1d_connection_secrets(),
+            &crate::secrets::ConnectionSecrets::platform_default(),
             self.password.as_deref(),
         )
         .map_err(|error| BantoError::Validation {
@@ -153,6 +154,56 @@ impl PlcConnectionPayload {
                 message: error.to_string(),
             }],
         })?;
+        self.into_input_with(secrets)
+    }
+
+    /// 未適用キューの適用（R2b-1e、設計 §5.3）: 積む時点で封印した `sealed` があれば、それを
+    /// **平文に戻さず** `SecretChange::Set` として渡す（参照は封印したときのもの。新しい行を
+    /// 足すので、同じ参照の行が既にあれば DB の主キーが断り、適用は失敗する）。無ければ
+    /// [`Self::into_input`]（空文字の「消す」・省略の「保つ」と、R2b-1e の前に積んだ平文の
+    /// `password` の行）。
+    ///
+    /// `sealed` と非空の `password` が両方ある・`sealed` がこの PC で開けない（別の PC で
+    /// 積んだ・壊れた）なら `password` の項目エラー（読めない値で接続を書き換えない）。
+    pub(crate) fn into_input_with_sealed(
+        self,
+        sealed: Option<crate::secrets::SealedSecret>,
+    ) -> Result<PlcConnectionInput, BantoError> {
+        let Some(sealed) = sealed else {
+            return self.into_input();
+        };
+        let password_error = |message: &str| BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "password".to_string(),
+                message: message.to_string(),
+            }],
+        };
+        if self.password.is_some() {
+            return Err(password_error(
+                "未適用キューの提案に平文と封印したパスワードの両方があります",
+            ));
+        }
+        if crate::secrets::ConnectionSecrets::platform_default()
+            .open(banto_tags::PASSWORD_KEY, &sealed)
+            .is_err()
+        {
+            return Err(password_error(
+                "未適用キューの提案のパスワードをこの PC で読めません（提案を破棄して、\
+                 パスワードを入れ直して作り直してください）",
+            ));
+        }
+        let mut secrets = banto_tags::SecretChanges::new();
+        secrets.insert(
+            banto_tags::PASSWORD_KEY.to_owned(),
+            banto_tags::SecretChange::Set(sealed.into()),
+        );
+        self.into_input_with(secrets)
+    }
+
+    fn into_input_with(
+        self,
+        secrets: banto_tags::SecretChanges,
+    ) -> Result<PlcConnectionInput, BantoError> {
         Ok(PlcConnectionInput {
             name: self.name,
             protocol: self.protocol,
@@ -270,7 +321,7 @@ impl PlcConnectionResponse {
     /// `passwordSet` を `passwordState == "set"` にする（設計 §5.5）。
     pub fn with_secret_rows(conn: PlcConnection, rows: &[banto_tags::StoredSecretRow]) -> Self {
         let state = crate::secrets::secret_state(
-            &crate::secrets::r2b1d_connection_secrets(),
+            &crate::secrets::ConnectionSecrets::platform_default(),
             &conn,
             banto_tags::PASSWORD_KEY,
             rows,
