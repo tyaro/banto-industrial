@@ -65,6 +65,20 @@
 //! [`BridgeSupervisor::shutdown`] は全 source に止める合図を送り、各 source は close 1000 を
 //! 送って問い合わせのタスクの終わりを待つ。待つのは呼び出し側が渡した予算まで
 //! （[`crate::run`] の停止の予算の中）。送れなかった周期は捨てる（flush は無い）。
+//!
+//! 予算内に終わらなかったら（応答しない DB で問い合わせが上限まで掛かっている、など）、
+//! ブリッジのタスク（監督・source・問い合わせ）を**手放さずに** `abort` し、全部の future が
+//! 落ちたことを確かめてから戻る（[`BridgeTasks`]。PR #764 の Codex レビュー P2）。handle を
+//! 落として切り離すと、`run` の後で runtime が落ちるときに sqlx の操作・プールの後始末の途中で
+//! 止まり、それが「止まった」ことを誰も確かめない（implementation-checklist §5「待ちを時間
+//! 切れで落とすときは handle を手放さない」）。`abort` の待ちの分は予算から先に取り分けて
+//! おくので、全体は予算を超えない。
+//!
+//! ## 問い合わせは source ごとに 1 本（PR #764 の Codex レビュー P2）
+//!
+//! 接続 id ごとに枠（[`tokio::sync::Semaphore`] の許可 1 つ）を 1 つ持ち、問い合わせのタスクは
+//! 枠を持っている間だけ動く（[`session`] の「問い合わせは 1 本ずつ」）。監督が設定の変更で
+//! source を作り直したときも、新しい source は古い source の問い合わせが終わるまで枠を取れない。
 
 pub mod budget;
 pub mod outbox;
@@ -78,8 +92,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{watch, Notify};
-use tokio::task::JoinHandle;
+use tokio::sync::{watch, Notify, Semaphore};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 
 use crate::config::SidecarConfig;
@@ -177,10 +191,115 @@ pub fn plan_sources(
     plan
 }
 
+/// ブリッジのタスク（監督・source・問い合わせ）の台帳。止める予算を超えたときに、全部を
+/// `abort` して、全部の future が落ちる（= 取り消しが届いた）まで待つために使う
+/// （このモジュールの doc「止め方」）。
+///
+/// 数えるのは future の生き死に: [`Self::spawn`] は future に印（[`TaskGuard`]）を持たせ、
+/// 印は future が終わったときも `abort` で落とされたときも落ちる。`abort` の後に起こされた
+/// タスク（`abort` と同時に動いていた親が起こした子）もすぐ `abort` する。
+#[derive(Clone, Default)]
+pub struct BridgeTasks {
+    inner: Arc<TasksInner>,
+}
+
+#[derive(Default)]
+struct TasksInner {
+    state: Mutex<TasksState>,
+    idle: Notify,
+}
+
+#[derive(Default)]
+struct TasksState {
+    live: usize,
+    aborts: Vec<AbortHandle>,
+    aborting: bool,
+}
+
+/// [`BridgeTasks`] の印（future と一緒に落ちる）。
+struct TaskGuard(Arc<TasksInner>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        let mut state = lock(&self.0.state);
+        state.live -= 1;
+        if state.live == 0 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl BridgeTasks {
+    /// 台帳に載せてタスクを起こす。
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let mut state = lock(&self.inner.state);
+        state.live += 1;
+        let guard = TaskGuard(self.inner.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            future.await
+        });
+        state.aborts.retain(|abort| !abort.is_finished());
+        if state.aborting {
+            handle.abort();
+        }
+        state.aborts.push(handle.abort_handle());
+        handle
+    }
+
+    /// 台帳の全部のタスクを `abort` する（以後に起こされるものも）。
+    pub fn abort_all(&self) {
+        let mut state = lock(&self.inner.state);
+        state.aborting = true;
+        for abort in &state.aborts {
+            abort.abort();
+        }
+    }
+
+    /// 台帳の全部のタスクの future が落ちるまで待つ。
+    pub async fn wait_idle(&self) {
+        loop {
+            let notified = self.inner.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lock(&self.inner.state).live == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 生きているタスクの数（テスト用）。
+    pub fn live(&self) -> usize {
+        lock(&self.inner.state).live
+    }
+}
+
+/// [`BridgeSupervisor::shutdown`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeStop {
+    /// 予算内に全部のタスクが終わった。
+    Stopped,
+    /// 予算内に終わらなかったので、全部を `abort` し、全部の future が落ちたのを確かめた。
+    Aborted,
+    /// `abort` しても取り分けた時間内に落ちきらなかった（タスクがスレッドを塞いでいる）。
+    /// handle は落とすので、残りは runtime の終わりに任せる。
+    Detached,
+}
+
+/// [`BridgeSupervisor::shutdown`] が予算から `abort` の待ちのために取り分ける時間
+/// （予算の 4 分の 1 まで）。`abort` された future は次の poll で落ちるので、ふつうは一瞬。
+const ABORT_JOIN_RESERVE: Duration = Duration::from_millis(500);
+
 /// ブリッジ全体（[`crate::run`] が 1 つ起こす）。
 pub struct BridgeSupervisor {
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
+    tasks: BridgeTasks,
     statuses: Arc<Mutex<BTreeMap<i64, Arc<Mutex<SourceStatus>>>>>,
 }
 
@@ -188,6 +307,7 @@ impl BridgeSupervisor {
     /// 監督のタスクを起こす。戻り値の `Err` は HTTP クライアントを作れないときだけ。
     pub fn spawn(config: &SidecarConfig) -> Result<Self, HubApiError> {
         let hub = HubApi::new(config)?;
+        let tasks = BridgeTasks::default();
         let (stop_tx, stop_rx) = watch::channel(false);
         let statuses = Arc::new(Mutex::new(BTreeMap::new()));
         let (generation_tx, generation_rx) = watch::channel(0u64);
@@ -203,6 +323,8 @@ impl BridgeSupervisor {
             fetch_started: Arc::new(AtomicU64::new(0)),
             generation_tx,
             generation_rx,
+            tasks: tasks.clone(),
+            poller_slots: HashMap::new(),
             running: HashMap::new(),
             retiring: Vec::new(),
             statuses: statuses.clone(),
@@ -210,10 +332,11 @@ impl BridgeSupervisor {
             logged_error: None,
             attempt: 0,
         };
-        let task = tokio::spawn(supervisor.run(stop_rx));
+        let task = tasks.spawn(supervisor.run(stop_rx));
         Ok(Self {
             stop_tx,
             task,
+            tasks,
             statuses,
         })
     }
@@ -226,11 +349,41 @@ impl BridgeSupervisor {
             .collect()
     }
 
-    /// 止めて、`limit` まで終わりを待つ。期限内に終わったら `true`。
-    pub async fn shutdown(mut self, limit: Duration) -> bool {
+    /// 止めて、`limit` まで終わりを待つ。終わらなければ、ブリッジのタスクを全部 `abort` して、
+    /// 全部の future が落ちるまで待つ（handle は最後まで手放さない。このモジュールの doc
+    /// 「止め方」）。全体で `limit` を超えない: `abort` の待ちの分（[`ABORT_JOIN_RESERVE`]、
+    /// `limit` の 4 分の 1 まで）を先に取り分け、合図で待つのは残りまで。
+    pub async fn shutdown(self, limit: Duration) -> BridgeStop {
         let _ = self.stop_tx.send(true);
-        tokio::time::timeout(limit, &mut self.task).await.is_ok()
+        stop_or_abort(self.task, &self.tasks, limit).await
     }
+}
+
+/// 台帳の全部のタスク（監督の `task` を含む）の終わりを `limit` まで待ち、終わらなければ
+/// 全部を `abort` して落ちるまで待つ（[`BridgeSupervisor::shutdown`] の本体。テストのために
+/// 分けた）。`task` は最後まで持ち、全部の future が落ちてから（か取り分けの時間切れで）落とす。
+async fn stop_or_abort(task: JoinHandle<()>, tasks: &BridgeTasks, limit: Duration) -> BridgeStop {
+    let reserve = ABORT_JOIN_RESERVE.min(limit / 4);
+    let graceful = limit.saturating_sub(reserve);
+    let outcome = if tokio::time::timeout(graceful, tasks.wait_idle())
+        .await
+        .is_ok()
+    {
+        BridgeStop::Stopped
+    } else {
+        tasks.abort_all();
+        task.abort();
+        if tokio::time::timeout(reserve, tasks.wait_idle())
+            .await
+            .is_ok()
+        {
+            BridgeStop::Aborted
+        } else {
+            BridgeStop::Detached
+        }
+    };
+    drop(task);
+    outcome
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -250,6 +403,10 @@ struct Supervisor {
     fetch_started: Arc<AtomicU64>,
     generation_tx: watch::Sender<u64>,
     generation_rx: watch::Receiver<u64>,
+    tasks: BridgeTasks,
+    /// 接続 id ごとの問い合わせの枠（このモジュールの doc「問い合わせは source ごとに 1 本」）。
+    /// source を作り直しても同じ枠を渡す。
+    poller_slots: HashMap<i64, Arc<Semaphore>>,
     running: HashMap<i64, SourceHandle>,
     /// 止めたが終わりをまだ確かめていない source（手放さない）。
     retiring: Vec<SourceHandle>,
@@ -357,6 +514,11 @@ impl Supervisor {
             }
         }
 
+        // 枠は、Hub の設定に残っている id と、まだ問い合わせが枠を持っている id の分だけ残す。
+        self.poller_slots.retain(|id, slot| {
+            desired.iter().any(|s| s.connection_id == *id) || slot.available_permits() == 0
+        });
+
         let mut statuses = lock(&self.statuses);
         statuses.retain(|id, _| desired.iter().any(|s| s.connection_id == *id));
         let parked_ids: Vec<i64> = plan.parked.iter().map(|(id, _, _)| *id).collect();
@@ -387,6 +549,11 @@ impl Supervisor {
                 source.name,
                 source.queries.len()
             ));
+            let poller_slot = self
+                .poller_slots
+                .entry(id)
+                .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                .clone();
             let ctx = session::SourceContext {
                 ws_url: ingest_ws_url(&self.hub_url, id),
                 api_key: self.api_key.clone(),
@@ -394,6 +561,8 @@ impl Supervisor {
                 refresh: self.refresh.clone(),
                 fetch_started: self.fetch_started.clone(),
                 config_generation: self.generation_rx.clone(),
+                tasks: self.tasks.clone(),
+                poller_slot,
             };
             let handle = SourceHandle::spawn(source, ctx);
             statuses.insert(id, handle.shared_status());
@@ -517,5 +686,67 @@ mod tests {
         assert_eq!(plan.stop, vec![1]);
         assert!(plan.start.is_empty());
         assert_eq!(parked_reason(&source(1, "a")), None);
+    }
+
+    /// future が落ちたら数える（取り消しが届いたかの印）。
+    struct DropCount(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropCount {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// PR #764 の Codex レビュー P2: 予算内に止まらないブリッジ（監督が、合図を無視して
+    /// 終わらない子のタスクを待ち続ける）は、handle を手放さずに全部 `abort` し、全部の future
+    /// が落ちてから戻る。全体は予算を超えない。`abort` の後に起こされたタスクもすぐ落ちる。
+    #[tokio::test]
+    async fn a_bridge_that_misses_the_budget_is_aborted_and_joined_before_returning() {
+        let tasks = BridgeTasks::default();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let children = tasks.clone();
+        let flag = dropped.clone();
+        let supervisor = tasks.spawn(async move {
+            let _parent = DropCount(flag.clone());
+            let child = children.spawn(async move {
+                let _child = DropCount(flag);
+                std::future::pending::<()>().await;
+            });
+            let _ = child.await;
+        });
+        tokio::task::yield_now().await;
+        let limit = Duration::from_millis(400);
+        let started = Instant::now();
+        let stop = stop_or_abort(supervisor, &tasks, limit).await;
+        let elapsed = started.elapsed();
+        assert_eq!(stop, BridgeStop::Aborted);
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            2,
+            "every future must be dropped before shutdown returns"
+        );
+        assert_eq!(tasks.live(), 0);
+        assert!(elapsed < limit + Duration::from_millis(200), "{elapsed:?}");
+
+        // `abort` の後に起こされたタスクもすぐ落ちる。
+        let late = tasks.spawn(std::future::pending::<()>());
+        tokio::time::timeout(Duration::from_secs(1), tasks.wait_idle())
+            .await
+            .expect("a task spawned after abort_all is aborted too");
+        assert!(late.await.unwrap_err().is_cancelled());
+    }
+
+    /// 予算内に全部が終われば `Stopped`（`abort` しない）。
+    #[tokio::test]
+    async fn a_bridge_that_stops_in_time_is_not_aborted() {
+        let tasks = BridgeTasks::default();
+        let children = tasks.clone();
+        let supervisor = tasks.spawn(async move {
+            let child = children.spawn(tokio::time::sleep(Duration::from_millis(50)));
+            child.await.unwrap();
+        });
+        let stop = stop_or_abort(supervisor, &tasks, Duration::from_secs(5)).await;
+        assert_eq!(stop, BridgeStop::Stopped);
+        assert_eq!(tasks.live(), 0);
     }
 }

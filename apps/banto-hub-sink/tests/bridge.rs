@@ -63,7 +63,7 @@ use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
-use banto_hub_sink::source::{BridgeSupervisor, SourceState, SourceStatus};
+use banto_hub_sink::source::{BridgeStop, BridgeSupervisor, SourceState, SourceStatus};
 use banto_hub_sink::SidecarConfig;
 use banto_server::{start, AuthState, Identity, ServerConfig, SessionValidation};
 use banto_tags::{
@@ -821,7 +821,10 @@ async fn bridge_delivers_values_and_follows_collection_ws_and_db_outages() {
     );
 
     // --- 停止: WS を閉じ、DB のセッションも残さない ----------------------------
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     let gone = wait_until(WAIT, || async {
         bridge_sessions(&admin, &source_name).await == 0
     })
@@ -926,7 +929,10 @@ async fn a_bridge_without_the_ingest_scope_never_runs() {
     assert!(status.last_status.unwrap_or_default().contains("権限なし"));
     assert_eq!(status.sent_messages, 0);
 
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     app.shutdown().await;
     role.drop_role(&admin).await;
     admin.close().await;
@@ -1008,7 +1014,10 @@ async fn an_unreachable_db_sends_bad_and_reports_it() {
     let status = hub.sender_status(push.id).unwrap_or_default();
     assert!(!status.contains(&role.password), "{status}");
 
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     app.shutdown().await;
     role.drop_role(&admin).await;
     admin.close().await;
@@ -1326,7 +1335,10 @@ async fn a_config_change_while_disconnected_is_fetched_before_sending() {
     let next = fake_next_values(&mut ws).await;
     assert_eq!(k1(&next).0, Some(2.5), "{next}");
 
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     role.drop_role(&admin).await;
     admin.close().await;
 }
@@ -1367,7 +1379,10 @@ async fn a_config_change_before_the_first_welcome_is_fetched_before_sending() {
     );
     assert_eq!(k1(values.last().unwrap()), (Some(2.5), "good".into(), 1));
 
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     role.drop_role(&admin).await;
     admin.close().await;
 }
@@ -1407,7 +1422,10 @@ async fn a_failing_post_welcome_fetch_keeps_the_bridge_silent() {
     let (_, closed) = fake_values_until(&mut ws, |v| k1(v) == (Some(1.5), "good".into(), 1)).await;
     assert!(!closed);
 
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     role.drop_role(&admin).await;
     admin.close().await;
 }
@@ -1446,7 +1464,10 @@ async fn an_unchanged_config_resumes_promptly_after_a_reconnect() {
     assert_eq!(status.sessions, 2, "{status:?}");
     assert_eq!(status.state, SourceState::Running, "{status:?}");
 
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     role.drop_role(&admin).await;
     admin.close().await;
 }

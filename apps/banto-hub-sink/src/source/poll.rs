@@ -84,6 +84,13 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 止まり続けないよう掛ける。超えたら接続の失敗として張り直す。
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 止める合図を受けた問い合わせのタスクが終わるまでの上限の見積もり: 飛行中の 1 本
+/// （接続 [`POOL_ACQUIRE_TIMEOUT`]・describe [`DESCRIBE_TIMEOUT`]・クエリ
+/// [`banto_db_source::poll::MAX_QUERY_TIMEOUT`] の長い方 = 30 秒）+ プールを閉じる余裕 10 秒。
+/// これを過ぎた止めたタスクは、送り手（[`super::session`] の「問い合わせは 1 本ずつ」）が
+/// `abort` して落ちるのを待ってから次のタスクに枠を渡す。
+pub const STOPPED_POLLER_BOUND: Duration = Duration::from_secs(30 + 10);
+
 /// `pg_stat_activity` の `application_name` の接頭辞（DBA が Hub 内の Source
 /// （`banto-hub-db-source {接続名}`）・Sink（`banto-hub-sink`）と見分けるため）。
 pub const APPLICATION_NAME_PREFIX: &str = "banto-hub-sink-bridge";
@@ -1085,6 +1092,15 @@ mod tests {
             let _ = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&admin).await;
         }
         admin.close().await;
+    }
+
+    /// 止めたタスクの上限の見積もりは、飛行中の 1 本のどの上限より長い。
+    #[test]
+    fn the_stopped_poller_bound_covers_every_in_flight_limit() {
+        let longest = POOL_ACQUIRE_TIMEOUT
+            .max(DESCRIBE_TIMEOUT)
+            .max(banto_db_source::poll::MAX_QUERY_TIMEOUT);
+        assert!(STOPPED_POLLER_BOUND >= longest + Duration::from_secs(5));
     }
 
     #[test]

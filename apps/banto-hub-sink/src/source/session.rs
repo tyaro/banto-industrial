@@ -75,6 +75,24 @@
 //! 合図で止めて終わりを待つ（`abort` しない。[`super::poll`] の「止め方」）。止める側が
 //! 待てる時間は呼び出し側（[`super::SourceHandle::stop`]）が決める。
 //!
+//! ## 問い合わせは 1 本ずつ（PR #764 の Codex レビュー P2）
+//!
+//! `state` の epoch・`collecting` の変化、`config_changed`、WS の張り直しで問い合わせの
+//! タスクを作り直すとき、止めたタスク（`retiring`）は飛行中の describe・クエリを上限
+//! （30 秒）まで終えてからプールを閉じる。その間に次のタスク（と次のプール）を起こすと、
+//! 遷移を繰り返すたびに同じ source の重い SQL と接続が DB 上に積み重なる。そこで、問い合わせの
+//! タスクは**接続 id ごとの枠**（[`SourceContext::poller_slot`]、許可 1 つ）を持っている間だけ
+//! 動かす: 枠はタスクの future が持ち、終わる（か `abort` で落ちる）と空く。次のタスクは枠が
+//! 空くまで起こさず、状態は [`SourceState::WaitingForRetire`]。待つのは WS のループの中の
+//! 1 つの分岐（`select!`）で、受信・`ping`・`state`・close は待たせない。止めたタスクが
+//! [`STOPPED_POLLER_BOUND`]（飛行中の 1 本の上限 + 余裕）を過ぎても終わらなければ、`abort` して
+//! 落ちるのを待ってから枠を渡す（`retiring` の handle は最後まで手放さない）。
+//!
+//! 枠は監督が接続 id ごとに 1 つ持ち、source を作り直しても同じ枠を渡す（古い source の
+//! 問い合わせが終わるまで新しい source は問い合わせを始めない）。待っている間も、
+//! `collecting: false` は Idle、設定の取り直しの待ちは AwaitingConfig が優先し、epoch は
+//! 枠が空いたときの最新のもので始める。失敗の列（全キー `bad`）は送信待ちに残る。
+//!
 //! ## 資格情報
 //!
 //! API キーは upgrade の要求のヘッダ（`set_sensitive`）にだけ載せる。ログ・`status`・
@@ -89,7 +107,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -104,12 +122,13 @@ use crate::hub_api::BridgeSourceConfig;
 use crate::log::{log_err_line, log_line};
 use crate::source::budget::SendBudget;
 use crate::source::outbox::Outbox;
-use crate::source::poll::{run_poller, PollEvent, PollerSpec, QueryPlan};
+use crate::source::poll::{run_poller, PollEvent, PollerSpec, QueryPlan, STOPPED_POLLER_BOUND};
 use crate::source::split::split_cycle;
 use crate::source::wire::{
     parse_server_message, ping_message, status_message, values_message, ServerMessage, ValueItem,
     WireLimits,
 };
+use crate::source::BridgeTasks;
 use crate::status::Redactor;
 
 /// upgrade（TCP の接続と HTTP の握手）の上限。
@@ -151,6 +170,9 @@ pub enum SourceState {
     Running,
     /// 設定の取り直しを待っている（`welcome` の直後と `config_changed` の後。問い合わせない）。
     AwaitingConfig,
+    /// 収集中だが、止めた問い合わせのタスクの終わりを待っている（問い合わせは source ごとに
+    /// 1 本。このモジュールの doc「問い合わせは 1 本ずつ」）。
+    WaitingForRetire,
     /// WS が切れた・張れない。バックオフしている。
     Backoff,
     /// Hub がこのキーでは送れないと断った（403）か、設定の `ingestAllowed` が `false`。
@@ -168,6 +190,7 @@ impl SourceState {
             Self::Idle => "idle",
             Self::Running => "running",
             Self::AwaitingConfig => "awaiting_config",
+            Self::WaitingForRetire => "waiting_for_retire",
             Self::Backoff => "backoff",
             Self::NoPermission => "no_permission",
             Self::DbDisabled => "db_disabled",
@@ -222,6 +245,10 @@ pub struct SourceContext {
     /// source は「取り直しを頼んだ時点の [`Self::fetch_started`] より後に始まった取得」が
     /// 終わるまで待つ - 頼む前から走っていた取得（古い設定を返しうる）で再開しない。
     pub config_generation: watch::Receiver<u64>,
+    /// ブリッジのタスクの台帳（止める予算を超えたら全部 `abort` する、[`super`] の「止め方」）。
+    pub tasks: BridgeTasks,
+    /// この接続 id の問い合わせの枠（許可 1 つ。このモジュールの doc「問い合わせは 1 本ずつ」）。
+    pub poller_slot: Arc<Semaphore>,
 }
 
 /// 動いている source 1 つ。
@@ -240,7 +267,8 @@ impl SourceHandle {
             name: config.name.clone(),
             ..SourceStatus::default()
         }));
-        let task = tokio::spawn(run_source(config.clone(), ctx, stop_rx, status.clone()));
+        let tasks = ctx.tasks.clone();
+        let task = tasks.spawn(run_source(config.clone(), ctx, stop_rx, status.clone()));
         Self {
             config,
             stop_tx,
@@ -362,6 +390,13 @@ struct Poller {
     handle: JoinHandle<()>,
 }
 
+/// 止める合図を送った問い合わせのタスク（終わりを確かめるまで手放さない）。
+struct RetiringPoller {
+    handle: JoinHandle<()>,
+    /// これを過ぎても終わらなければ `abort` する（[`STOPPED_POLLER_BOUND`]）。
+    abort_at: Instant,
+}
+
 /// source のタスクの本体。
 async fn run_source(
     config: BridgeSourceConfig,
@@ -429,8 +464,8 @@ struct Runtime {
     status: Arc<Mutex<SourceStatus>>,
     budget: Option<SendBudget>,
     seq: u64,
-    /// 止めたが終わりをまだ確かめていない問い合わせのタスク（手放さない）。
-    retiring: Vec<JoinHandle<()>>,
+    /// 止めたが終わりをまだ確かめていない問い合わせのタスク（手放さない）。止めた順。
+    retiring: Vec<RetiringPoller>,
     /// 直前にログに出した upgrade の失敗（同じものを繰り返し出さない）。
     logged_connect_error: Option<ConnectError>,
     /// 設定の取り直しを待っている（`welcome` の直後・`config_changed` を受けた）。値は取り直しを
@@ -497,16 +532,41 @@ impl Runtime {
     fn retire(&mut self, poller: &mut Option<Poller>) {
         if let Some(poller) = poller.take() {
             let _ = poller.stop_tx.send(true);
-            self.retiring.push(poller.handle);
+            self.retiring.push(RetiringPoller {
+                handle: poller.handle,
+                abort_at: Instant::now() + STOPPED_POLLER_BOUND,
+            });
         }
-        self.retiring.retain(|handle| !handle.is_finished());
+        self.retiring
+            .retain(|retiring| !retiring.handle.is_finished());
     }
 
-    fn start_poller(&mut self, epoch: u64) -> (Poller, mpsc::Receiver<PollEvent>) {
+    /// 枠（[`SourceContext::poller_slot`]）が空いていれば問い合わせのタスクを起こす。空いて
+    /// いなければ（止めたタスクがまだ動いている）起こさずに `false`。
+    fn try_start_poller(&mut self, s: &mut SessionState, epoch: u64) -> bool {
+        let Ok(permit) = self.ctx.poller_slot.clone().try_acquire_owned() else {
+            return false;
+        };
+        let (poller, rx) = self.start_poller(epoch, permit);
+        s.poller = Some(poller);
+        s.events = Some(rx);
+        true
+    }
+
+    fn start_poller(
+        &mut self,
+        epoch: u64,
+        permit: OwnedSemaphorePermit,
+    ) -> (Poller, mpsc::Receiver<PollEvent>) {
         let (tx, rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = watch::channel(false);
         let spec = PollerSpec::new(&self.config.name, &self.config.db, &self.config.queries);
-        let handle = tokio::spawn(run_poller(spec, tx, stop_rx, self.ctx.redactor.clone()));
+        let redactor = self.ctx.redactor.clone();
+        // 枠はタスクの future が持つ: 終わったときも `abort` で落ちたときも空く。
+        let handle = self.ctx.tasks.spawn(async move {
+            let _permit = permit;
+            run_poller(spec, tx, stop_rx, redactor).await;
+        });
         self.update(|s| {
             s.pollers_started += 1;
             s.epoch = Some(epoch);
@@ -514,11 +574,22 @@ impl Runtime {
         (Poller { stop_tx, handle }, rx)
     }
 
+    fn log_retire_aborted(&self) {
+        log_err_line(&format!(
+            "banto-hub-sink: warn: {}: 止めた問い合わせのタスクが {} 秒以内に終わらなかったため打ち切りました",
+            self.label(),
+            STOPPED_POLLER_BOUND.as_secs()
+        ));
+    }
+
     /// 止めた後: 問い合わせのタスクの終わりを待つ（合図は送ってある。上限は呼び出し側が
-    /// [`SourceHandle::stop`] で掛ける）。
+    /// [`SourceHandle::stop`] で掛ける。[`STOPPED_POLLER_BOUND`] を過ぎたものは `abort` して
+    /// 落ちるまで待つ）。
     async fn finish(mut self) {
-        for handle in self.retiring.drain(..) {
-            let _ = handle.await;
+        while !self.retiring.is_empty() {
+            if settle_retiring(&mut self.retiring).await {
+                self.log_retire_aborted();
+            }
         }
         self.set_state(SourceState::Stopped);
     }
@@ -620,6 +691,11 @@ impl Runtime {
         let end = loop {
             let now = Instant::now();
             let status_pending = s.compose_status(&self.status) != s.reported_status;
+            // 問い合わせのタスクを起こしたいのに、枠が空いていない（止めたタスクを待っている）。
+            let waiting_for_slot = collecting
+                && self.awaiting_config.is_none()
+                && s.poller.is_none()
+                && s.poller_restart_at.is_none();
             let wake_at = s.next_wake(
                 now,
                 ping_interval,
@@ -636,6 +712,10 @@ impl Runtime {
                     // 監督が居なくなったら止まる（閉じたチャンネルで空回りしない）。
                     if changed.is_ok() { Event::ConfigConfirmed } else { Event::Stop }
                 }
+                aborted = settle_retiring(&mut self.retiring), if !self.retiring.is_empty() => {
+                    Event::Retired { aborted }
+                }
+                _ = self.ctx.poller_slot.acquire(), if waiting_for_slot => Event::SlotFree,
                 _ = tokio::time::sleep_until(wake_at) => Event::Timer,
             };
             match event {
@@ -801,6 +881,16 @@ impl Runtime {
                         self.resume(&mut s, collecting, epoch);
                     }
                 }
+                Event::Retired { aborted } => {
+                    // 枠が空けば `SlotFree` で次のタスクを起こす。
+                    if aborted {
+                        self.log_retire_aborted();
+                    }
+                }
+                Event::SlotFree => {
+                    // 止めたタスクが終わって枠が空いた: 今の `collecting`・epoch で起こす。
+                    self.resume(&mut s, collecting, epoch);
+                }
                 Event::Timer => {
                     if let Err(reason) = self
                         .on_timer(&mut s, &mut ws_tx, epoch, collecting, ping_interval)
@@ -829,10 +919,10 @@ impl Runtime {
             self.set_state(SourceState::AwaitingConfig);
             return;
         }
-        if s.poller.is_none() && s.poller_restart_at.is_none() {
-            let (poller, rx) = self.start_poller(epoch);
-            s.poller = Some(poller);
-            s.events = Some(rx);
+        if s.poller.is_none() && s.poller_restart_at.is_none() && !self.try_start_poller(s, epoch) {
+            // 止めたタスクがまだ枠を持っている（このモジュールの doc「問い合わせは 1 本ずつ」）。
+            self.set_state(SourceState::WaitingForRetire);
+            return;
         }
         self.set_state(SourceState::Running);
     }
@@ -850,10 +940,12 @@ impl Runtime {
         // タスクの異常からの作り直し。
         if s.poller_restart_at.is_some_and(|at| now >= at) {
             s.poller_restart_at = None;
-            if collecting && self.awaiting_config.is_none() && s.poller.is_none() {
-                let (poller, rx) = self.start_poller(epoch);
-                s.poller = Some(poller);
-                s.events = Some(rx);
+            if collecting
+                && self.awaiting_config.is_none()
+                && s.poller.is_none()
+                && !self.try_start_poller(s, epoch)
+            {
+                self.set_state(SourceState::WaitingForRetire);
             }
         }
         // values（バケットが許すだけ）。
@@ -1005,7 +1097,33 @@ enum Event {
     PollerEnded(Result<(), JoinError>),
     Polled(Option<PollEvent>),
     ConfigConfirmed,
+    /// 止めた問い合わせのタスクが終わった（`aborted` は上限を過ぎて `abort` した）。
+    Retired {
+        aborted: bool,
+    },
+    /// 枠が空いた（次の問い合わせのタスクを起こせる）。
+    SlotFree,
     Timer,
+}
+
+/// 止めた問い合わせのタスクのうち最も古い 1 つの終わりを待ち、`retiring` から外す。
+/// `abort_at` を過ぎたら `abort` して、落ちるまで待つ（handle は最後まで手放さない）。
+/// `abort` したら `true`。途中で落とされても（`select!` の別の分岐）、handle は `retiring` に
+/// 残るので、次の呼び出しが続きから待つ。
+async fn settle_retiring(retiring: &mut Vec<RetiringPoller>) -> bool {
+    let Some(first) = retiring.first_mut() else {
+        return std::future::pending().await;
+    };
+    let aborted = match tokio::time::timeout_at(first.abort_at, &mut first.handle).await {
+        Ok(_) => false,
+        Err(_) => {
+            first.handle.abort();
+            let _ = (&mut first.handle).await;
+            true
+        }
+    };
+    retiring.remove(0);
+    aborted
 }
 
 async fn join_poller(poller: &mut Option<Poller>) -> Result<(), JoinError> {
@@ -1479,6 +1597,8 @@ mod tests {
                 refresh: refresh.clone(),
                 fetch_started: fetch_started.clone(),
                 config_generation: generation_rx,
+                tasks: BridgeTasks::default(),
+                poller_slot: Arc::new(Semaphore::new(1)),
             },
             FakeSupervisor {
                 refresh,
@@ -1782,5 +1902,286 @@ mod tests {
         assert!(!detail.contains("pw-unit"), "{detail}");
         assert!(!detail.contains("bh_unit_test_key"), "{detail}");
         assert!(handle.stop(Duration::from_secs(5)).await.is_ok());
+    }
+
+    // --- 実 PostgreSQL（`BANTO_TEST_PG_URL`）: 問い合わせは source ごとに 1 本 ---------------
+    //
+    // 表を `ACCESS EXCLUSIVE` で掴んで最初の問い合わせのタスクの describe を止め、その間に
+    // 遷移（epoch・`collecting`・`config_changed`・WS の張り直し）を起こす。止めたタスクが
+    // 終わるまで次のタスク（と次のプール）を起こさないことを、`pg_stat_activity` のこの
+    // source のセッションの数（≤ 1）で確かめる（PR #764 の Codex レビュー P2）。
+
+    use crate::source::poll::APPLICATION_NAME_PREFIX;
+    use sqlx::postgres::{PgConnectOptions, PgPool};
+
+    /// 動いている問い合わせのタスク 1 本のプールの接続の上限（`poll` の `POOL_MAX_CONNECTIONS`）。
+    /// 飛行中で止まっている describe は 1 接続だけを使う。
+    const ONE_POOL: i64 = 2;
+
+    struct PgLockFixture {
+        admin: PgPool,
+        role: String,
+        table: String,
+        source: BridgeSourceConfig,
+        application_name: String,
+    }
+
+    impl PgLockFixture {
+        async fn new(tag: &str) -> Option<Self> {
+            let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+                eprintln!("skipped: BANTO_TEST_PG_URL unset");
+                return None;
+            };
+            let options: PgConnectOptions = url.parse().expect("BANTO_TEST_PG_URL");
+            let admin = PgPool::connect(&url).await.expect("connect test pg");
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            // `application_name` は 63 バイトで切られるので短くする。
+            let suffix = format!("{tag}_{}_{}", std::process::id(), nanos % 1_000_000_000);
+            let role = format!("one_poller_{suffix}");
+            let password = format!("pw-{suffix}");
+            let table = format!("one_poller_t_{suffix}");
+            for sql in [
+                format!("CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'"),
+                format!("CREATE TABLE \"{table}\" (a float8)"),
+                format!("GRANT SELECT ON \"{table}\" TO \"{role}\""),
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(&admin)
+                    .await
+                    .expect("setup");
+            }
+            let name = format!("op-{suffix}");
+            let source = BridgeSourceConfig {
+                connection_id: 7,
+                name: name.clone(),
+                stale_timeout_ms: 3_000,
+                config_fingerprint: "sha256:00".to_string(),
+                ingest_allowed: true,
+                queries: vec![BridgeQueryConfig {
+                    name: "q".to_string(),
+                    period_ms: 500,
+                    sql: format!("SELECT a FROM \"{table}\""),
+                    columns: vec![BridgeColumnConfig {
+                        column: "a".to_string(),
+                        key: "k1".to_string(),
+                    }],
+                }],
+                db: BridgeDbConfig {
+                    id: 1,
+                    name: "pg".to_string(),
+                    enabled: true,
+                    host: options.get_host().to_string(),
+                    port: i64::from(options.get_port()),
+                    database: Some(options.get_database().unwrap_or("postgres").to_string()),
+                    username: Some(role.clone()),
+                    password: Some(password),
+                },
+            };
+            Some(Self {
+                admin,
+                role,
+                table,
+                source,
+                application_name: format!("{APPLICATION_NAME_PREFIX} {name}"),
+            })
+        }
+
+        /// 表を掴む（describe を止める）。commit で放す。
+        async fn lock_table(&self) -> sqlx::Transaction<'static, sqlx::Postgres> {
+            let mut lock = self.admin.begin().await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE \"{}\" IN ACCESS EXCLUSIVE MODE",
+                self.table
+            )))
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+            lock
+        }
+
+        /// この source の DB のセッションの数（`lock_waiters` は掴んだ表を待っている数）。
+        async fn sessions(&self, lock_waiters: bool) -> i64 {
+            let sql = if lock_waiters {
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'"
+            } else {
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1"
+            };
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(&self.application_name)
+                .fetch_one(&self.admin)
+                .await
+                .unwrap()
+        }
+
+        /// 最初のタスクの describe が掴んだ表を待つまで。
+        async fn wait_for_lock_waiter(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.sessions(true).await == 0 {
+                if Instant::now() >= deadline {
+                    let names: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+                        "SELECT application_name, wait_event_type FROM pg_stat_activity",
+                    )
+                    .fetch_all(&self.admin)
+                    .await
+                    .unwrap();
+                    panic!("the describe never waited on the lock: {names:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// `within` の間、セッションの数が `limit` を超えないことを確かめ続ける（WS は読み捨てる）。
+        /// 見た最大の数を返す。
+        async fn assert_sessions_at_most(
+            &self,
+            hub: &mut FakeHub,
+            within: Duration,
+            limit: i64,
+        ) -> i64 {
+            let deadline = Instant::now() + within;
+            let mut max = 0;
+            while Instant::now() < deadline {
+                max = max.max(self.check_sessions(limit).await);
+                let _ = hub.values_within(Duration::from_millis(50)).await;
+            }
+            max
+        }
+
+        /// セッションの数を数え、`limit` を超えていたら中身を出して落とす。
+        async fn check_sessions(&self, limit: i64) -> i64 {
+            let sessions = self.sessions(false).await;
+            if sessions > limit {
+                let rows: Option<String> = sqlx::query_scalar(
+                    "SELECT string_agg(concat_ws(' ', pid, state, wait_event_type, left(query, 120)), '; ') FROM pg_stat_activity WHERE application_name = $1",
+                )
+                .bind(&self.application_name)
+                .fetch_one(&self.admin)
+                .await
+                .unwrap();
+                panic!("{sessions} DB sessions for one source (limit {limit}): {rows:?}");
+            }
+            sessions
+        }
+
+        /// `epoch` の `values` が届くまで、セッションの数がプール 1 つ分（最大 2 接続）を
+        /// 超えないことを確かめ続ける。
+        async fn next_values_of_epoch(&self, hub: &mut FakeHub, epoch: u64) -> Value {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                assert!(Instant::now() < deadline, "no values with epoch {epoch}");
+                self.check_sessions(ONE_POOL).await;
+                for value in hub.values_within(Duration::from_millis(100)).await {
+                    if value["epoch"] == json!(epoch) {
+                        return value;
+                    }
+                }
+            }
+        }
+
+        async fn cleanup(self) {
+            for sql in [
+                format!("DROP TABLE IF EXISTS \"{}\"", self.table),
+                format!("DROP ROLE IF EXISTS \"{}\"", self.role),
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(&self.admin)
+                    .await;
+            }
+            self.admin.close().await;
+        }
+    }
+
+    /// 問い合わせのタスクの describe が飛行中に epoch が変わっても、そのタスクが終わる
+    /// （掴んだ表を放す）まで次のタスクもプールも起こさない（DB のセッションは 1 つまで）。
+    /// 終わったら、待っている間の最新の epoch で 1 本だけ起こして送る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transition_waits_for_the_in_flight_poller_before_opening_another_pool() {
+        let Some(pg) = PgLockFixture::new("transition").await else {
+            return;
+        };
+        let lock = pg.lock_table().await;
+        let (listener, url) = fake_hub().await;
+        let (ctx, supervisor) = context(&url);
+        let handle = SourceHandle::spawn(pg.source.clone(), ctx);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 1).await;
+        supervisor.refetch().await;
+        pg.wait_for_lock_waiter().await;
+
+        // describe が飛行中に epoch が進む: 止めたタスクを待つ。
+        hub.state(true, 2, false).await;
+        let max = pg
+            .assert_sessions_at_most(&mut hub, Duration::from_secs(2), 1)
+            .await;
+        assert_eq!(max, 1, "the retired poller is still in flight");
+        let status = handle.status();
+        assert_eq!(status.state, SourceState::WaitingForRetire, "{status:?}");
+        assert_eq!(status.pollers_started, 1, "{status:?}");
+
+        // 表を放す: 止めたタスクは describe を終えてプールを閉じ、次のタスクが epoch 2 で送る。
+        lock.commit().await.unwrap();
+        let values = pg.next_values_of_epoch(&mut hub, 2).await;
+        assert_eq!(values["items"][0]["key"], json!("k1"), "{values}");
+        let status = handle.status();
+        assert_eq!(status.pollers_started, 2, "{status:?}");
+        assert_eq!(status.state, SourceState::Running, "{status:?}");
+
+        assert!(handle.stop(Duration::from_secs(10)).await.is_ok());
+        pg.cleanup().await;
+    }
+
+    /// 飛行中に遷移を何度も重ねても（epoch・`collecting: false`・`config_changed`・WS の
+    /// 張り直し）、問い合わせのタスクは積み重ならない（DB のセッションは 1 つまで）。表を
+    /// 放したら、次のタスクを 1 本だけ、最後の epoch で起こす。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_transitions_never_stack_pollers() {
+        let Some(pg) = PgLockFixture::new("repeated").await else {
+            return;
+        };
+        let lock = pg.lock_table().await;
+        let (listener, url) = fake_hub().await;
+        let (ctx, supervisor) = context(&url);
+        let handle = SourceHandle::spawn(pg.source.clone(), ctx);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 1).await;
+        supervisor.refetch().await;
+        pg.wait_for_lock_waiter().await;
+
+        for epoch in 2..=4 {
+            hub.state(true, epoch, false).await;
+        }
+        hub.state(false, 5, false).await;
+        hub.state(true, 6, false).await;
+        hub.state(true, 7, true).await;
+        supervisor.refetch().await;
+        pg.assert_sessions_at_most(&mut hub, Duration::from_millis(1_500), 1)
+            .await;
+        assert_eq!(handle.status().state, SourceState::WaitingForRetire);
+
+        // WS の張り直し（close なし）を挟む。
+        drop(hub);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 8).await;
+        supervisor.refetch().await;
+        pg.assert_sessions_at_most(&mut hub, Duration::from_millis(1_500), 1)
+            .await;
+        let status = handle.status();
+        assert_eq!(status.state, SourceState::WaitingForRetire, "{status:?}");
+        assert_eq!(status.pollers_started, 1, "{status:?}");
+        assert_eq!(status.sessions, 2, "{status:?}");
+
+        lock.commit().await.unwrap();
+        pg.next_values_of_epoch(&mut hub, 8).await;
+        pg.assert_sessions_at_most(&mut hub, Duration::from_millis(1_000), ONE_POOL)
+            .await;
+        let status = handle.status();
+        assert_eq!(status.pollers_started, 2, "{status:?}");
+        assert_eq!(status.state, SourceState::Running, "{status:?}");
+
+        assert!(handle.stop(Duration::from_secs(10)).await.is_ok());
+        pg.cleanup().await;
     }
 }

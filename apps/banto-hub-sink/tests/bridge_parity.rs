@@ -96,7 +96,7 @@ use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
-use banto_hub_sink::source::{BridgeSupervisor, SourceStatus};
+use banto_hub_sink::source::{BridgeStop, BridgeSupervisor, SourceStatus};
 use banto_hub_sink::SidecarConfig;
 use banto_server::{start, AuthState, Identity, ServerConfig, SessionValidation};
 use banto_tags::{
@@ -929,7 +929,10 @@ impl Fixture {
 
     async fn finish(mut self) {
         if let Some(bridge) = self.bridge.take() {
-            assert!(bridge.shutdown(Duration::from_secs(10)).await);
+            assert_eq!(
+                bridge.shutdown(Duration::from_secs(10)).await,
+                BridgeStop::Stopped
+            );
         }
         self.app.shutdown().await;
         self.role.drop_role(&self.admin).await;
@@ -1411,7 +1414,10 @@ async fn parity_8_a_stopped_bridge_goes_bad_after_the_timeout() {
     let recorder = fixture.record("a");
     let stopped_at = tokio::time::Instant::now();
     let bridge = fixture.bridge.take().unwrap();
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     let went_bad = wait_until(Duration::from_millis(stale_timeout_ms) + WAIT, || async {
         fixture.pair("a").1 == BAD
     })
@@ -1656,7 +1662,10 @@ async fn parity_9_three_queries_at_the_registration_limit() {
     assert_eq!(reading(1_800), good(2.5));
     assert_eq!(reading(1_900), good(1.0));
 
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    assert_eq!(
+        bridge.shutdown(Duration::from_secs(10)).await,
+        BridgeStop::Stopped
+    );
     app.shutdown().await;
     role.drop_role(&admin).await;
     admin.close().await;
