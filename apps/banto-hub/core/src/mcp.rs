@@ -594,11 +594,11 @@ fn tool_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "接続名(一意)。" },
                     "protocol": {
                         "type": "string",
-                        "enum": ["modbus-tcp", "slmp", "postgres"],
-                        "description": "既定値 modbus-tcp。postgres は外部 DB 連携 S1 (database/username 必須)。",
+                        "enum": ["modbus-tcp", "slmp", "postgres", "push"],
+                        "description": "既定値 modbus-tcp。postgres は外部 DB 連携 S1 (database/username 必須)。push は外部の送り手が値を送り込む取り込み口（docs/banto-hub-ingest-design.md §3）で、host/port/unitId/wordOrder/simulation は無視され正規化される（host は空文字列、port は 0 などの固定値になる）。",
                     },
-                    "host": { "type": "string", "description": "接続先ホスト名/IP。" },
-                    "port": { "type": "integer", "description": "接続先ポート番号。" },
+                    "host": { "type": "string", "description": "接続先ホスト名/IP。必須（push でも省略できない。push では無視されるので空文字列を送る）。" },
+                    "port": { "type": "integer", "description": "接続先ポート番号。必須（push でも省略できない。push では無視されるので 0 を送る）。" },
                     "unitId": { "type": "integer", "description": "既定値 1。postgres では無視される(既定値で固定)。" },
                     "enabled": { "type": "boolean", "description": "既定値 true。" },
                     "simulation": {
@@ -627,6 +627,10 @@ fn tool_definitions() -> Vec<Value> {
                         "type": ["string", "null"],
                         "description": "protocol: postgres 接続のパスワード(平文保存)。省略/null は「パスワード無し」。他プロトコルでは null。",
                     },
+                    "settings": {
+                        "type": ["object", "null"],
+                        "description": "protocol: push 専用の設定（他プロトコルでは省略/null。指定すると検証エラー）。キーは stale_timeout_ms（送り手が黙ってから Down とみなすまでのミリ秒、1000〜3600000、既定 10000）と bridge（DB ブリッジ: kind は \"db\" 固定、db_connection_id は読み先の postgres 接続の id、queries は name/period_ms/sql/columns[column,key] の配列）。未知のキーはどの階層でも拒否する。banto_tags::push::validate_push_settings で検証され、不正な項目は settings.* の項目名つきで返る。省略は既定（stale_timeout_ms 10000・ブリッジ無し）。",
+                    },
                 },
                 "required": ["name", "host", "port"],
                 "additionalProperties": false,
@@ -653,7 +657,7 @@ fn tool_definitions() -> Vec<Value> {
         // (admin スコープ必須・有効化ガードなし)。
         json!({
             "name": "update_connection",
-            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。cpuType だけは省略でき、省略すると既存の CPU 種別を保つ。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。cpuType と settings は省略でき、省略すると既存の値を保つ（settings は push 接続専用。null も同じく保つ）。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -661,11 +665,11 @@ fn tool_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "接続名(一意)。" },
                     "protocol": {
                         "type": "string",
-                        "enum": ["modbus-tcp", "slmp", "postgres"],
-                        "description": "modbus-tcp、slmp、または postgres。",
+                        "enum": ["modbus-tcp", "slmp", "postgres", "push"],
+                        "description": "modbus-tcp、slmp、postgres、または push（外部の送り手が値を送り込む取り込み口、docs/banto-hub-ingest-design.md §3。host/port/unitId/wordOrder/simulation は無視され正規化される）。",
                     },
-                    "host": { "type": "string", "description": "接続先ホスト名/IP。" },
-                    "port": { "type": "integer", "description": "接続先ポート番号。" },
+                    "host": { "type": "string", "description": "接続先ホスト名/IP。必須（push でも省略できない。push では無視されるので空文字列を送る）。" },
+                    "port": { "type": "integer", "description": "接続先ポート番号。必須（push でも省略できない。push では無視されるので 0 を送る）。" },
                     "unitId": { "type": "integer", "description": "Modbus のユニット ID。postgres では無視される。" },
                     "enabled": { "type": "boolean", "description": "接続を有効にするか。" },
                     "simulation": {
@@ -693,6 +697,10 @@ fn tool_definitions() -> Vec<Value> {
                     "password": {
                         "type": ["string", "null"],
                         "description": "protocol: postgres 接続のパスワード。null は「現在のパスワードを変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」(banto_tags::PlcConnectionInput::password のtri-state PATCH意味論)。他プロトコルでは null。",
+                    },
+                    "settings": {
+                        "type": ["object", "null"],
+                        "description": "protocol: push 専用の設定（他プロトコルでは省略/null。指定すると検証エラー）。キーは stale_timeout_ms（1000〜3600000、既定 10000）と bridge（DB ブリッジ: kind は \"db\" 固定、db_connection_id は読み先の postgres 接続の id、queries は name/period_ms/sql/columns[column,key] の配列）。未知のキーはどの階層でも拒否する。banto_tags::push::validate_push_settings で検証され、不正な項目は settings.* の項目名つきで返る。省略または null は「保存済みの設定を保つ」（この項目を知らないクライアントが push の設定を消さない）、オブジェクトは置き換え、{} は既定に戻してブリッジを外す。必須キーには含めない。",
                     },
                 },
                 "required": [
@@ -2180,7 +2188,8 @@ fn require_all_fields(arguments: &Value, required: &[&str]) -> Option<Value> {
 
 /// [`tool_update_connection`]の必須キー一覧 - `PlcConnectionPayload`の
 /// wire フィールド（camelCase）全部 + `id`。inputSchema の
-/// `update_connection.required`と同期させること。
+/// `update_connection.required`と同期させること。`cpuType`と`settings`は
+/// 「省略で既存の値を保つ」任意項目なので含めない（知らないクライアントが消さない）。
 ///
 /// S1（docs/banto-hub-external-db-design.md §4.1）: `database`/`username`/
 /// `password`を追加。`password`はキーの**存在**だけを要求する

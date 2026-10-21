@@ -5419,3 +5419,421 @@ async fn create_tag_rejects_a_dotted_external_name_collision() {
     );
     assert_eq!(tags_row_count(&app).await, before_rows);
 }
+
+// --- push 接続の settings（docs/banto-hub-ingest-design.md §3.1・§3.2） -----------
+
+/// 読み先の postgres 接続を 1 つ作り、その id を返す（ブリッジの `db_connection_id`）。
+async fn create_bridge_source_postgres(app: &TestApp, name: &str) -> i64 {
+    PlcConnectionService::new(app.pool.clone())
+        .create(banto_tags::PlcConnectionInput {
+            name: name.to_string(),
+            protocol: "postgres".to_string(),
+            host: "10.0.0.50".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            cpu_type: None,
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            password: None,
+            settings: None,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+/// DB ブリッジ付きの push の `settings`（最小の正しい形）。
+fn push_bridge_settings(db_connection_id: i64, stale_timeout_ms: u64) -> Value {
+    json!({
+        "stale_timeout_ms": stale_timeout_ms,
+        "bridge": {
+            "kind": "db",
+            "db_connection_id": db_connection_id,
+            "queries": [{
+                "name": "line1",
+                "period_ms": 1000,
+                "sql": "SELECT temp FROM line1",
+                "columns": [{ "column": "temp", "key": "line1.temp" }],
+            }],
+        },
+    })
+}
+
+/// `update_connection` の push 用の全項目指定（`settings` は呼び出し側が足す）。
+fn push_update_args(id: i64, name: &str) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "protocol": "push",
+        "host": "",
+        "port": 0,
+        "unitId": 1,
+        "enabled": true,
+        "simulation": false,
+        "wordOrder": "low_high",
+        "database": null,
+        "username": null,
+        "password": null,
+    })
+}
+
+/// 成功した tool 呼び出しの本文（JSON）を取り出す。
+fn tool_ok_payload(status: StatusCode, body: &Value) -> Value {
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// `list_connections` から `id` の接続の `settings` を返す。
+async fn listed_settings(app: &TestApp, key: &str, id: i64) -> Value {
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(key),
+        tools_call("list_connections", json!({})),
+    )
+    .await;
+    let payload = tool_ok_payload(status, &body);
+    payload["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("connection {id} listed: {payload:?}"))["settings"]
+        .clone()
+}
+
+/// push 接続を `settings`（stale_timeout_ms + DB ブリッジ）付きで作ると、応答にも
+/// `list_connections` にも同じ `settings` が出て、host/port は正規化される。
+///
+/// 反証（2026-10-21 実施）: `PlcConnectionPayload` → `PlcConnectionInput` の
+/// `settings: payload.settings` を `settings: None` にすると、応答の `settings` が
+/// null になり落ちる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_connection_push_with_settings_round_trips_through_list() {
+    let app = test_app("mcp-push-create").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let db_id = create_bridge_source_postgres(&app, "erp-db").await;
+    let settings = push_bridge_settings(db_id, 30_000);
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({
+                "name": "sender",
+                "protocol": "push",
+                "host": "",
+                "port": 0,
+                "settings": settings,
+            }),
+        ),
+    )
+    .await;
+    let payload = tool_ok_payload(status, &body);
+    assert_eq!(payload["created"]["protocol"], "push", "{payload:?}");
+    assert_eq!(payload["created"]["host"], "", "{payload:?}");
+    assert_eq!(payload["created"]["port"], 0, "{payload:?}");
+    assert_eq!(payload["created"]["settings"], settings, "{payload:?}");
+    let id = payload["created"]["id"].as_i64().unwrap();
+
+    assert_eq!(listed_settings(&app, &admin_key, id).await, settings);
+}
+
+/// `update_connection` の `settings`: 省略・`null` は保存済みを保つ、オブジェクトは
+/// 置き換え、`{}` でブリッジが外れる（既定に戻る）。
+///
+/// 反証（2026-10-21 実施）: 同じく `settings: payload.settings` を `settings: None`
+/// にすると、置き換え・`{}` の段階で変更が反映されず落ちる（create も落ちる）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_connection_push_settings_omitted_null_object_and_empty() {
+    let app = test_app("mcp-push-update").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let db_id = create_bridge_source_postgres(&app, "erp-db").await;
+    let original = push_bridge_settings(db_id, 30_000);
+    let created = PlcConnectionService::new(app.pool.clone())
+        .create(banto_tags::PlcConnectionInput {
+            name: "sender".to_string(),
+            protocol: "push".to_string(),
+            host: String::new(),
+            port: 0,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            cpu_type: None,
+            database: None,
+            username: None,
+            password: None,
+            settings: Some(original.clone()),
+        })
+        .await
+        .unwrap();
+    let id = created.id;
+
+    // 省略 -> 保つ（名前だけ変わる）。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_connection", push_update_args(id, "sender-2")),
+    )
+    .await;
+    let payload = tool_ok_payload(status, &body);
+    assert_eq!(payload["updated"]["name"], "sender-2", "{payload:?}");
+    assert_eq!(payload["updated"]["settings"], original, "{payload:?}");
+    assert_eq!(listed_settings(&app, &admin_key, id).await, original);
+
+    // null -> 保つ。
+    let mut args = push_update_args(id, "sender-2");
+    args["settings"] = Value::Null;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_connection", args),
+    )
+    .await;
+    let payload = tool_ok_payload(status, &body);
+    assert_eq!(payload["updated"]["settings"], original, "{payload:?}");
+    assert_eq!(listed_settings(&app, &admin_key, id).await, original);
+
+    // 別のオブジェクト -> 置き換え。
+    let replaced = json!({ "stale_timeout_ms": 5_000 });
+    let mut args = push_update_args(id, "sender-2");
+    args["settings"] = replaced.clone();
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_connection", args),
+    )
+    .await;
+    let payload = tool_ok_payload(status, &body);
+    assert_eq!(payload["updated"]["settings"], replaced, "{payload:?}");
+    assert_eq!(listed_settings(&app, &admin_key, id).await, replaced);
+
+    // いったんブリッジを戻し、`{}` で外れる。
+    let mut args = push_update_args(id, "sender-2");
+    args["settings"] = original.clone();
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_connection", args),
+    )
+    .await;
+    tool_ok_payload(status, &body);
+    let mut args = push_update_args(id, "sender-2");
+    args["settings"] = json!({});
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_connection", args),
+    )
+    .await;
+    let payload = tool_ok_payload(status, &body);
+    assert_eq!(payload["updated"]["settings"], json!({}), "{payload:?}");
+    let listed = listed_settings(&app, &admin_key, id).await;
+    assert_eq!(listed, json!({}));
+    assert!(listed.get("bridge").is_none(), "{listed:?}");
+}
+
+/// 不正な `settings` は tool error（項目名つき）で断り、レジストリは変わらない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() {
+    let app = test_app("mcp-push-invalid").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let pg_id = create_bridge_source_postgres(&app, "erp-db").await;
+    let slmp_id = create_test_connection(&app, "plc1", 15093).await;
+    let missing_id = 99_999;
+    let rows_before = plc_connections_row_count(&app).await;
+
+    // (protocol, settings, エラーに含まれるべき項目名)
+    let cases: Vec<(&str, Value, &str)> = vec![
+        ("push", json!({ "bogus": 1 }), "settings"),
+        (
+            "push",
+            json!({ "stale_timeout_ms": 10 }),
+            "settings.stale_timeout_ms",
+        ),
+        (
+            "push",
+            json!({ "stale_timeout_ms": 3_600_001 }),
+            "settings.stale_timeout_ms",
+        ),
+        ("push", json!("text"), "settings"),
+        ("push", json!([1]), "settings"),
+        (
+            "modbus-tcp",
+            json!({ "stale_timeout_ms": 5_000 }),
+            "settings",
+        ),
+        (
+            "push",
+            push_bridge_settings(missing_id, 10_000),
+            "settings.bridge.db_connection_id",
+        ),
+        (
+            "push",
+            push_bridge_settings(slmp_id, 10_000),
+            "settings.bridge.db_connection_id",
+        ),
+    ];
+    for (protocol, settings, field) in cases {
+        let (host, port) = if protocol == "push" {
+            ("", 0)
+        } else {
+            ("127.0.0.1", 502)
+        };
+        let (status, body) = mcp_post(
+            &app.router,
+            Some(&admin_key),
+            tools_call(
+                "create_connection",
+                json!({
+                    "name": "bad",
+                    "protocol": protocol,
+                    "host": host,
+                    "port": port,
+                    "settings": settings.clone(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["result"]["isError"], true, "{settings:?}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(field), "{settings:?}: {text}");
+        assert!(!text.contains("validation failed"), "{text}");
+        assert_eq!(
+            plc_connections_row_count(&app).await,
+            rows_before,
+            "不正な settings は何も作ってはいけない: {settings:?}"
+        );
+    }
+    // 対照: postgres 接続を指す正しいブリッジは通る（上の拒否は指し先だけで決まる）。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({
+                "name": "ok-bridge",
+                "protocol": "push",
+                "host": "",
+                "port": 0,
+                "settings": push_bridge_settings(pg_id, 10_000),
+            }),
+        ),
+    )
+    .await;
+    tool_ok_payload(status, &body);
+
+    // update も同じ: 既存の push 接続は不正な settings で変わらない。
+    let good = json!({ "stale_timeout_ms": 20_000 });
+    let created = PlcConnectionService::new(app.pool.clone())
+        .create(banto_tags::PlcConnectionInput {
+            name: "sender".to_string(),
+            protocol: "push".to_string(),
+            host: String::new(),
+            port: 0,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            cpu_type: None,
+            database: None,
+            username: None,
+            password: None,
+            settings: Some(good.clone()),
+        })
+        .await
+        .unwrap();
+    for (settings, field) in [
+        (
+            json!({ "stale_timeout_ms": 10 }),
+            "settings.stale_timeout_ms",
+        ),
+        (json!({ "bogus": true }), "settings"),
+        (json!("text"), "settings"),
+        (
+            push_bridge_settings(missing_id, 10_000),
+            "settings.bridge.db_connection_id",
+        ),
+        (
+            push_bridge_settings(slmp_id, 10_000),
+            "settings.bridge.db_connection_id",
+        ),
+    ] {
+        let mut args = push_update_args(created.id, "sender-renamed");
+        args["settings"] = settings.clone();
+        let (status, body) = mcp_post(
+            &app.router,
+            Some(&admin_key),
+            tools_call("update_connection", args),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["result"]["isError"], true, "{settings:?}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(field), "{settings:?}: {text}");
+        let stored = PlcConnectionService::new(app.pool.clone())
+            .get(created.id)
+            .await
+            .unwrap();
+        assert_eq!(stored.name, "sender", "{settings:?}");
+        assert_eq!(stored.settings, Some(good.clone()), "{settings:?}");
+        assert_eq!(listed_settings(&app, &admin_key, created.id).await, good);
+    }
+}
+
+/// tools/list: `create_connection`/`update_connection` の inputSchema に `push` と
+/// `settings` があり、`update_connection.required` に `settings` は無い。
+/// `test_connection` の protocol は変わらず push を含まない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_tool_schemas_advertise_push_and_settings() {
+    let app = test_app("tools-list-push-settings").await;
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+
+    let (status, body) = mcp_post(&app.router, Some(&key), rpc("tools/list", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    let find = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+    };
+    for name in ["create_connection", "update_connection"] {
+        let schema = &find(name)["inputSchema"];
+        let protocols = schema["properties"]["protocol"]["enum"].as_array().unwrap();
+        assert!(
+            protocols.iter().any(|p| p == "push"),
+            "{name}: {protocols:?}"
+        );
+        let settings = &schema["properties"]["settings"];
+        assert_eq!(
+            settings["type"],
+            json!(["object", "null"]),
+            "{name}: {settings:?}"
+        );
+        assert!(settings["description"]
+            .as_str()
+            .unwrap()
+            .contains("stale_timeout_ms"));
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().all(|k| k != "settings"),
+            "{name}: {required:?}"
+        );
+        assert!(required.iter().any(|k| k == "host"), "{name}: {required:?}");
+        assert!(required.iter().any(|k| k == "port"), "{name}: {required:?}");
+    }
+    let test_protocols = find("test_connection")["inputSchema"]["properties"]["protocol"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(
+        test_protocols.iter().all(|p| p != "push"),
+        "{test_protocols:?}"
+    );
+}
