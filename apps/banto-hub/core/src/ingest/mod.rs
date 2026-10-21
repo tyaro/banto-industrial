@@ -81,7 +81,7 @@ use banto_tags::{
     PUSH_PROTOCOL,
 };
 use banto_tstore::Clock;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokio::sync::watch;
 
@@ -96,16 +96,22 @@ pub fn build_hub_config(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, 
 
 /// 1 件の値（§6.1・§6.2 の `items[]` の 1 要素）。形だけを持ち、中身の検証は
 /// [`IngestHub::apply`]（[`validate_item`]）が件ごとに行う。`v` が無いのと
-/// `null` は同じ。`q` が無ければ `good`。
+/// `null` は同じ。`q` が無ければ `good`。`q` / `t` の明示的な `null` は省略と
+/// 区別し、それぞれ `invalid_quality` / `invalid_time`（[`validate_item`]）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct IngestItem {
     pub key: String,
     #[serde(default)]
     pub v: Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     pub q: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     pub t: Option<Value>,
+}
+
+/// 省略（`default` で `None`）と明示的な `null`（`Some(Value::Null)`）を区別する。
+fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 impl IngestItem {
@@ -605,7 +611,8 @@ impl IngestHub {
     /// `commit_catalog`）。`push` 接続の追加・削除と、キーの集合・送る集合・
     /// `stale_timeout_ms` の更新。登録から消えたキー・無効になったキーの保持値は
     /// 捨てる（キーの改名で古い値が残らない）。ブリッジの設定・有効が変わった接続は
-    /// [`commit_effect`] の表に従う。
+    /// [`commit_effect`] の表に従う。データ型が変わったキーの保持値も捨てる（型が
+    /// 変われば `bit` の検証などが変わり、古い値は新しい型の値ではない）。
     ///
     /// 設計（§4.2）の `commit(map, snapshot)` の `map` は取らない: キー・有効・型は
     /// すべて `snapshot` から決まり、catalog（外部名で引く表）は外部名の重なり
@@ -627,8 +634,16 @@ impl IngestHub {
                         != config.bridge.as_ref().map(|b| &b.fingerprint);
                     {
                         let mut held = write(&old.shared.held);
-                        held.values
-                            .retain(|key, _| config.keys.get(key).is_some_and(|info| info.active));
+                        held.values.retain(|key, _| {
+                            config.keys.get(key).is_some_and(|info| {
+                                info.active
+                                    && old
+                                        .config
+                                        .keys
+                                        .get(key)
+                                        .is_some_and(|o| o.data_type == info.data_type)
+                            })
+                        });
                     }
                     old.shared.apply_effect(effect, collecting, bridge_changed);
                     old.shared.clone()

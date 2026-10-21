@@ -241,6 +241,30 @@ fn the_item_validation_table() {
     }
 }
 
+/// `q` / `t` の明示的な `null` は省略と区別する（JSON から読んだ形で）。
+#[test]
+fn explicit_null_quality_and_time_are_rejected_but_omitted_are_accepted() {
+    let judge = |text: &str| {
+        let item: IngestItem = serde_json::from_str(text).expect("item");
+        validate_item(&item, "f64")
+    };
+    assert_eq!(
+        judge(r#"{"key":"k","v":12.5,"q":null}"#),
+        Err(RejectCode::InvalidQuality)
+    );
+    assert_eq!(
+        judge(r#"{"key":"k","v":12.5,"t":null}"#),
+        Err(RejectCode::InvalidTime)
+    );
+    assert_eq!(
+        judge(r#"{"key":"k","v":12.5}"#),
+        Ok(ExternalReading {
+            value: Some(12.5),
+            quality: ExternalQuality::Good
+        })
+    );
+}
+
 #[test]
 fn connection_keys_parse_only_the_conn_form() {
     assert_eq!(parse_connection_key("conn:12"), Some(12));
@@ -589,6 +613,37 @@ async fn apply_judges_each_item_and_refuses_whole_messages() {
         Err(ApplyRefusal::UnknownConnection)
     );
     assert!(env.ingest.subscribe_state(9_999).is_none());
+    env.finish().await;
+}
+
+/// データ型が変わったキーの保持値は commit で捨てる（型違いの古い値を、収集の
+/// 開始後に新しい型の Good として見せない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_drops_the_held_value_of_a_key_whose_data_type_changed() {
+    let env = env("ingest-type-change").await;
+    let conn = env.push_connection("sender", None).await;
+    let group = env.group(conn, "g", 100).await;
+    let tag = env.tag(group, "k", "k", "f64").await;
+    let hub = IngestHub::new(Arc::new(ManualClock::new(1_000_000, 0)));
+    hub.commit(&RegistrySnapshot::load(&env.pool).await.unwrap());
+    let key = format!("conn:{conn}");
+
+    let ack = hub
+        .apply(conn, None, &[value("k", 42.5)], 1_000_000)
+        .unwrap();
+    assert_eq!(ack.accepted, 1, "{ack:?}");
+    assert_eq!(hub.connection_info(conn).unwrap().held_values, 1);
+
+    env.sql(&format!(
+        "UPDATE tags SET data_type = 'bit' WHERE id = {tag}"
+    ))
+    .await;
+    hub.commit(&RegistrySnapshot::load(&env.pool).await.unwrap());
+    assert_eq!(hub.connection_info(conn).unwrap().held_values, 0);
+
+    hub.on_collection_starting();
+    hub.on_collection_started();
+    assert_eq!(hub.snapshot(&key).reading("k"), None);
     env.finish().await;
 }
 
